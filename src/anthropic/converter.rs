@@ -86,7 +86,9 @@ pub fn map_model(model: &str) -> Option<String> {
         } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-sonnet-4.5".to_string())
         } else {
-            None
+            // 无显式版本号的 sonnet（如 claude-sonnet-4-20250514、claude-3-5-sonnet）
+            // 回退到 4.5，避免标准客户端被 UnsupportedModel 拒绝（对齐参照实现）
+            Some("claude-sonnet-4.5".to_string())
         }
     } else if model_lower.contains("opus") {
         if model_lower.contains("4-5") || model_lower.contains("4.5") {
@@ -98,7 +100,8 @@ pub fn map_model(model: &str) -> Option<String> {
         } else if model_lower.contains("4-8") || model_lower.contains("4.8") {
             Some("claude-opus-4.8".to_string())
         } else {
-            None
+            // 无显式版本号的 opus（如 claude-opus-4-20250514）回退到 4.6（对齐参照实现）
+            Some("claude-opus-4.6".to_string())
         }
     } else if model_lower.contains("haiku") {
         Some("claude-haiku-4.5".to_string())

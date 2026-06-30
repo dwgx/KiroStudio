@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
+use crate::kiro::affinity::UserAffinityManager;
 use crate::kiro::cooldown::{CooldownManager, CooldownReason};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
@@ -536,6 +537,10 @@ pub struct MultiTokenManager {
     rate_limiter: RateLimiter,
     /// 是否启用速率限制
     rate_limit_enabled: bool,
+    /// 会话亲和性管理器（防关联：同一会话粘同一凭据）
+    affinity: UserAffinityManager,
+    /// 是否启用会话亲和性
+    affinity_enabled: bool,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -656,6 +661,7 @@ impl MultiTokenManager {
         let load_balancing_mode = config.load_balancing_mode.clone();
         let cooldown_enabled = config.cooldown_enabled;
         let rate_limit_enabled = config.rate_limit_enabled;
+        let affinity_enabled = config.affinity_enabled;
         let rate_limit_config = RateLimitConfig {
             daily_max_requests: config.rate_limit_daily_max,
             min_interval_ms: config.rate_limit_min_interval_ms,
@@ -676,6 +682,8 @@ impl MultiTokenManager {
             cooldown_enabled,
             rate_limiter: RateLimiter::new(rate_limit_config),
             rate_limit_enabled,
+            affinity: UserAffinityManager::new(),
+            affinity_enabled,
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -715,7 +723,11 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
+    fn select_next_credential(
+        &self,
+        model: Option<&str>,
+        user_id: Option<&str>,
+    ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
 
         // 检查是否是 opus 模型
@@ -750,25 +762,55 @@ impl MultiTokenManager {
             return None;
         }
 
+        // 会话亲和性：若该会话已绑定某凭据且当前可用，优先复用，让同一对话粘同一账号
+        if self.affinity_enabled {
+            if let Some(uid) = user_id {
+                if let Some(bound_id) = self.affinity.get(uid) {
+                    if let Some(entry) = available.iter().find(|e| e.id == bound_id) {
+                        tracing::debug!(user_id = %uid, credential_id = %bound_id, "亲和性复用凭据");
+                        // 续期，使持续活跃的会话不因 TTL 到期而解绑
+                        self.affinity.touch(uid);
+                        return Some((entry.id, entry.credentials.clone()));
+                    }
+                    // 绑定的凭据已不可用（禁用/冷却/限流），解绑后按常规策略重选
+                    tracing::debug!(
+                        user_id = %uid,
+                        credential_id = %bound_id,
+                        "亲和性绑定的凭据当前不可用，重新选择"
+                    );
+                }
+            }
+        }
+
         let mode = self.load_balancing_mode.lock().clone();
         let mode = mode.as_str();
 
-        match mode {
+        let selected = match mode {
             "balanced" => {
                 // Least-Used 策略：选择成功次数最少的凭据
                 // 平局时按优先级排序（数字越小优先级越高）
-                let entry = available
+                available
                     .iter()
-                    .min_by_key(|e| (e.success_count, e.credentials.priority))?;
-
-                Some((entry.id, entry.credentials.clone()))
+                    .min_by_key(|e| (e.success_count, e.credentials.priority))
+                    .map(|e| (e.id, e.credentials.clone()))
             }
             _ => {
                 // priority 模式（默认）：选择优先级最高的
-                let entry = available.iter().min_by_key(|e| e.credentials.priority)?;
-                Some((entry.id, entry.credentials.clone()))
+                available
+                    .iter()
+                    .min_by_key(|e| e.credentials.priority)
+                    .map(|e| (e.id, e.credentials.clone()))
+            }
+        };
+
+        // 新选中的凭据与会话建立绑定，使后续同会话请求复用
+        if self.affinity_enabled {
+            if let (Some(uid), Some((id, _))) = (user_id, &selected) {
+                self.affinity.set(uid, *id);
             }
         }
+
+        selected
     }
 
     /// 获取 API 调用上下文
@@ -781,7 +823,12 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
+    /// - `user_id`: 可选的会话标识（取自请求 conversationId），用于会话亲和性
+    pub async fn acquire_context(
+        &self,
+        model: Option<&str>,
+        user_id: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -815,7 +862,7 @@ impl MultiTokenManager {
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model);
+                    let mut best = self.select_next_credential(model, user_id);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
@@ -834,7 +881,7 @@ impl MultiTokenManager {
                                 }
                             }
                             drop(entries);
-                            best = self.select_next_credential(model);
+                            best = self.select_next_credential(model, user_id);
                         }
                     }
 
@@ -1552,6 +1599,10 @@ impl MultiTokenManager {
             } else {
                 entry.disabled_reason = Some(DisabledReason::Manual);
             }
+        }
+        // 禁用凭据时清除其会话亲和性绑定，避免后续请求重选时反复尝试已禁用凭据
+        if disabled {
+            self.affinity.remove_by_credential(id);
         }
         // 持久化更改
         self.persist_credentials()?;
@@ -2401,7 +2452,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         // 应触发自愈：重置失败计数并重新启用，避免必须重启进程
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let ctx = manager.acquire_context(None, None).await.unwrap();
         assert!(ctx.token == "t1" || ctx.token == "t2");
         assert_eq!(manager.available_count(), 2);
     }
@@ -2423,9 +2474,74 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
 
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let ctx = manager.acquire_context(None, None).await.unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "good-token");
+    }
+
+    #[tokio::test]
+    async fn test_affinity_sticks_session_to_same_credential_in_balanced() {
+        // balanced 模式下，同一 session 的连续请求应粘在同一凭据上
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.affinity_enabled = true;
+
+        let mut c1 = KiroCredentials::default();
+        c1.priority = 0;
+        c1.access_token = Some("tok1".to_string());
+        c1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut c2 = KiroCredentials::default();
+        c2.priority = 1;
+        c2.access_token = Some("tok2".to_string());
+        c2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(config, vec![c1, c2], None, None, false).unwrap();
+
+        // 首次请求绑定某凭据
+        let first = manager
+            .acquire_context(None, Some("session-A"))
+            .await
+            .unwrap();
+        let bound = first.id;
+        // 同会话后续多次请求应始终命中同一凭据，即便 balanced 的 least-used 会倾向另一个
+        for _ in 0..5 {
+            let ctx = manager
+                .acquire_context(None, Some("session-A"))
+                .await
+                .unwrap();
+            assert_eq!(ctx.id, bound, "同会话应粘在同一凭据");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_affinity_disabled_falls_back_to_normal_selection() {
+        // 关闭亲和性时不应固定，balanced 的 least-used 应能切换凭据
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.affinity_enabled = false;
+
+        let mut c1 = KiroCredentials::default();
+        c1.priority = 0;
+        c1.access_token = Some("tok1".to_string());
+        c1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut c2 = KiroCredentials::default();
+        c2.priority = 1;
+        c2.access_token = Some("tok2".to_string());
+        c2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(config, vec![c1, c2], None, None, false).unwrap();
+
+        // 第一次成功后 success_count 增加，least-used 应在第二次切到另一个凭据
+        let first = manager
+            .acquire_context(None, Some("session-A"))
+            .await
+            .unwrap();
+        manager.report_success(first.id);
+        let second = manager
+            .acquire_context(None, Some("session-A"))
+            .await
+            .unwrap();
+        assert_ne!(first.id, second.id, "关闭亲和性后应按 least-used 切换");
     }
 
     #[test]
@@ -2468,7 +2584,7 @@ mod tests {
         }
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None).await.err().unwrap().to_string();
+        let err = manager.acquire_context(None, None).await.err().unwrap().to_string();
         assert!(
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",
@@ -2508,7 +2624,7 @@ mod tests {
         manager.report_quota_exhausted(2);
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None).await.err().unwrap().to_string();
+        let err = manager.acquire_context(None, None).await.err().unwrap().to_string();
         assert!(
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",

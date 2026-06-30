@@ -320,6 +320,7 @@ pub struct ConfigSnapshotResponse {
     pub rate_limit_enabled: bool,
     pub rate_limit_daily_max: u32,
     pub rate_limit_min_interval_ms: u64,
+    pub affinity_enabled: bool,
     /// 是否配置了全局代理（不回传明文）
     pub has_proxy: bool,
     pub proxy_url: Option<String>,

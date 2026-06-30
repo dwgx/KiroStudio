@@ -344,6 +344,7 @@ impl AdminService {
             rate_limit_enabled: config.rate_limit_enabled,
             rate_limit_daily_max: config.rate_limit_daily_max,
             rate_limit_min_interval_ms: config.rate_limit_min_interval_ms,
+            affinity_enabled: config.affinity_enabled,
             has_proxy: config.proxy_url.is_some(),
             proxy_url: config.proxy_url.clone(),
             has_admin_key: config

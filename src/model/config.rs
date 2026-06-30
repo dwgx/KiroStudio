@@ -130,6 +130,14 @@ pub struct Config {
     #[serde(default = "default_rate_limit_min_interval_ms")]
     pub rate_limit_min_interval_ms: u64,
 
+    /// 是否启用会话亲和性（同一会话尽量复用同一凭据，默认 true）
+    ///
+    /// 防关联用：让同一对话粘在同一账号上，避免单次会话散落到多个账号引发关联。
+    /// key 取自请求 metadata.user_id 提取的 session UUID（无 session 时随机，不命中即正常轮换）。
+    /// 主要在 balanced 模式下生效；priority 模式本就固定单凭据，影响甚微。
+    #[serde(default = "default_affinity_enabled")]
+    pub affinity_enabled: bool,
+
     /// 网页上号回调基地址（可选）
     ///
     /// - 不配置：本地回调模式，后端在本机临时端口接收 OAuth 回调（仅本机浏览器可达）。
@@ -193,6 +201,10 @@ fn default_cooldown_enabled() -> bool {
     true
 }
 
+fn default_affinity_enabled() -> bool {
+    true
+}
+
 fn default_rate_limit_daily() -> u32 {
     500
 }
@@ -230,6 +242,7 @@ impl Default for Config {
             rate_limit_enabled: false,
             rate_limit_daily_max: default_rate_limit_daily(),
             rate_limit_min_interval_ms: default_rate_limit_min_interval_ms(),
+            affinity_enabled: default_affinity_enabled(),
             callback_base_url: None,
             config_path: None,
         }
