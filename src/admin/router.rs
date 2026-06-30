@@ -8,8 +8,9 @@ use axum::{
 use super::{
     handlers::{
         add_credential, delete_credential, force_refresh_token, get_all_credentials,
-        get_credential_balance, get_load_balancing_mode, reset_failure_count,
+        get_credential_balance, get_load_balancing_mode, poll_social_login, reset_failure_count,
         set_credential_disabled, set_credential_priority, set_load_balancing_mode,
+        social_callback, start_social_login,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -33,7 +34,8 @@ use super::{
 /// - `x-api-key` header
 /// - `Authorization: Bearer <token>` header
 pub fn create_admin_router(state: AdminState) -> Router {
-    Router::new()
+    // 鉴权路由：所有管理操作 + 网页上号的 start/poll
+    let authed = Router::new()
         .route(
             "/credentials",
             get(get_all_credentials).post(add_credential),
@@ -48,9 +50,15 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),
         )
+        .route("/auth/social/start", post(start_social_login))
+        .route("/auth/social/poll/{session_id}", post(poll_social_login))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,
-        ))
-        .with_state(state)
+        ));
+
+    // 公开路由：远程模式 OAuth 回调（浏览器无 admin key，靠 OAuth state 关联会话）
+    let public = Router::new().route("/auth/callback", get(social_callback));
+
+    authed.merge(public).with_state(state)
 }

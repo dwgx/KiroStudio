@@ -257,3 +257,44 @@ impl AdminErrorResponse {
         Self::new("internal_error", message)
     }
 }
+
+// ============ 网页上号（Social OAuth）============
+
+/// 发起网页上号请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartSocialLoginRequest {
+    /// 新凭据优先级（默认 100）
+    #[serde(default = "default_login_priority")]
+    pub priority: u32,
+    /// 可选自定义出站代理（不填继承全局）
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+}
+
+fn default_login_priority() -> u32 {
+    100
+}
+
+/// 发起网页上号响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartSocialLoginResponse {
+    pub session_id: String,
+    /// 供用户在浏览器打开的 Kiro 登录地址
+    pub portal_url: String,
+}
+
+/// 轮询网页上号响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PollSocialLoginResponse {
+    /// pending | done | error
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}

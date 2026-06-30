@@ -44,3 +44,30 @@ pub struct IdcRefreshResponse {
     #[serde(default)]
     pub profile_arn: Option<String>,
 }
+
+// ============ Social (Portal) 网页登录流程 ============
+
+/// Social token 交换请求体（PKCE）
+#[derive(Debug, Serialize)]
+pub struct SocialCreateTokenRequest {
+    pub code: String,
+    pub code_verifier: String,
+    pub redirect_uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invitation_code: Option<String>,
+}
+
+/// Social token 响应体
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SocialCreateTokenResponse {
+    pub access_token: String,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub expires_in: Option<i64>,
+    #[serde(default)]
+    pub profile_arn: Option<String>,
+}
