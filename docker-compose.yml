@@ -1,9 +1,10 @@
 services:
-  kiro-rs:
-    # 使用国内镜像
-    # image: ghcr.nju.edu.cn/${IMAGE_OWNER:-hank9999}/kiro-rs:${IMAGE_TAG:-latest}
-    image: ghcr.io/${IMAGE_OWNER:-hank9999}/kiro-rs:${IMAGE_TAG:-latest}
-    container_name: kiro-rs
+  kirostudio:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: kirostudio:latest
+    container_name: kirostudio
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
