@@ -11,8 +11,9 @@ import {
   getLoadBalancingMode,
   setLoadBalancingMode,
   getConfigSnapshot,
+  updateConfig,
 } from '@/api/credentials'
-import type { AddCredentialRequest } from '@/types/api'
+import type { AddCredentialRequest, UpdateConfigRequest } from '@/types/api'
 
 // 查询凭据列表
 export function useCredentials() {
@@ -28,6 +29,18 @@ export function useConfigSnapshot() {
   return useQuery({
     queryKey: ['config-snapshot'],
     queryFn: getConfigSnapshot,
+  })
+}
+
+// 更新服务端配置
+export function useUpdateConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: UpdateConfigRequest) => updateConfig(req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['config-snapshot'] })
+      queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
+    },
   })
 }
 

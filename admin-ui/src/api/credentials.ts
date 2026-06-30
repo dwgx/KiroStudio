@@ -12,6 +12,8 @@ import type {
   StartSocialLoginResponse,
   PollSocialLoginResponse,
   ConfigSnapshotResponse,
+  UpdateConfigRequest,
+  UpdateConfigResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -128,5 +130,13 @@ export async function pollSocialLogin(
 // 获取服务端配置快照（敏感字段脱敏）
 export async function getConfigSnapshot(): Promise<ConfigSnapshotResponse> {
   const { data } = await api.get<ConfigSnapshotResponse>('/config')
+  return data
+}
+
+// 更新服务端配置（仅提交的字段被修改）
+export async function updateConfig(
+  req: UpdateConfigRequest
+): Promise<UpdateConfigResponse> {
+  const { data } = await api.put<UpdateConfigResponse>('/config', req)
   return data
 }

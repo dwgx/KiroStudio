@@ -18,7 +18,7 @@ use crate::kiro::auth::social::OAuthCallbackData;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, ConfigSnapshotResponse,
     CredentialStatusItem, CredentialsStatusResponse, LoadBalancingModeResponse,
-    SetLoadBalancingModeRequest,
+    SetLoadBalancingModeRequest, UpdateConfigRequest, UpdateConfigResponse,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -377,6 +377,227 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         Ok(LoadBalancingModeResponse { mode: req.mode })
+    }
+
+    /// 更新服务端配置并持久化到 config.json
+    ///
+    /// 仅提交的字段被修改。`loadBalancingMode` 立即生效，其余字段需重启进程后生效，
+    /// 通过响应的 `restart_fields` 告知前端。敏感字段不在此开放。
+    pub fn update_config(
+        &self,
+        req: UpdateConfigRequest,
+    ) -> Result<UpdateConfigResponse, AdminServiceError> {
+        let config_path = self
+            .token_manager
+            .config()
+            .config_path()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| {
+                AdminServiceError::InternalError(
+                    "配置文件路径未知，无法保存配置".to_string(),
+                )
+            })?;
+
+        // 从磁盘重新加载，避免覆盖进程外的改动
+        let mut config = crate::model::config::Config::load(&config_path)
+            .map_err(|e| AdminServiceError::InternalError(format!("加载配置失败: {}", e)))?;
+
+        let mut restart_fields: Vec<String> = Vec::new();
+
+        // —— 需重启生效的字段 ——
+        if let Some(v) = req.host {
+            let v = v.trim().to_string();
+            if v.is_empty() {
+                return Err(AdminServiceError::InvalidCredential(
+                    "host 不能为空".to_string(),
+                ));
+            }
+            if v != config.host {
+                config.host = v;
+                restart_fields.push("host".into());
+            }
+        }
+        if let Some(v) = req.port {
+            if v == 0 {
+                return Err(AdminServiceError::InvalidCredential(
+                    "port 必须是 1-65535".to_string(),
+                ));
+            }
+            if v != config.port {
+                config.port = v;
+                restart_fields.push("port".into());
+            }
+        }
+        if let Some(v) = req.region {
+            let v = v.trim().to_string();
+            if !v.is_empty() && v != config.region {
+                config.region = v;
+                restart_fields.push("region".into());
+            }
+        }
+        if let Some(v) = req.kiro_version {
+            let v = v.trim().to_string();
+            if !v.is_empty() && v != config.kiro_version {
+                config.kiro_version = v;
+                restart_fields.push("kiroVersion".into());
+            }
+        }
+        if let Some(v) = req.system_version {
+            let v = v.trim().to_string();
+            if !v.is_empty() && v != config.system_version {
+                config.system_version = v;
+                restart_fields.push("systemVersion".into());
+            }
+        }
+        if let Some(v) = req.node_version {
+            let v = v.trim().to_string();
+            if !v.is_empty() && v != config.node_version {
+                config.node_version = v;
+                restart_fields.push("nodeVersion".into());
+            }
+        }
+        if let Some(v) = req.tls_backend {
+            let backend = match v.as_str() {
+                "rustls" => crate::model::config::TlsBackend::Rustls,
+                "native-tls" => crate::model::config::TlsBackend::NativeTls,
+                _ => {
+                    return Err(AdminServiceError::InvalidCredential(
+                        "tlsBackend 必须是 'rustls' 或 'native-tls'".to_string(),
+                    ));
+                }
+            };
+            if backend != config.tls_backend {
+                config.tls_backend = backend;
+                restart_fields.push("tlsBackend".into());
+            }
+        }
+        if let Some(v) = req.default_endpoint {
+            let v = v.trim().to_string();
+            if !v.is_empty() && v != config.default_endpoint {
+                if !self.known_endpoints.is_empty() && !self.known_endpoints.contains(&v) {
+                    return Err(AdminServiceError::InvalidCredential(format!(
+                        "未知 endpoint '{}'，可用: {}",
+                        v,
+                        {
+                            let mut names: Vec<_> = self.known_endpoints.iter().cloned().collect();
+                            names.sort();
+                            names.join(", ")
+                        }
+                    )));
+                }
+                config.default_endpoint = v;
+                restart_fields.push("defaultEndpoint".into());
+            }
+        }
+        if let Some(v) = req.extract_thinking {
+            if v != config.extract_thinking {
+                config.extract_thinking = v;
+                restart_fields.push("extractThinking".into());
+            }
+        }
+        if let Some(v) = req.cooldown_enabled {
+            if v != config.cooldown_enabled {
+                config.cooldown_enabled = v;
+                restart_fields.push("cooldownEnabled".into());
+            }
+        }
+        if let Some(v) = req.rate_limit_enabled {
+            if v != config.rate_limit_enabled {
+                config.rate_limit_enabled = v;
+                restart_fields.push("rateLimitEnabled".into());
+            }
+        }
+        if let Some(v) = req.rate_limit_daily_max {
+            if v != config.rate_limit_daily_max {
+                config.rate_limit_daily_max = v;
+                restart_fields.push("rateLimitDailyMax".into());
+            }
+        }
+        if let Some(v) = req.rate_limit_min_interval_ms {
+            if v != config.rate_limit_min_interval_ms {
+                config.rate_limit_min_interval_ms = v;
+                restart_fields.push("rateLimitMinIntervalMs".into());
+            }
+        }
+        if let Some(v) = req.affinity_enabled {
+            if v != config.affinity_enabled {
+                config.affinity_enabled = v;
+                restart_fields.push("affinityEnabled".into());
+            }
+        }
+        if let Some(v) = req.proxy_url {
+            let trimmed = v.trim();
+            let new_val = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+            if new_val != config.proxy_url {
+                config.proxy_url = new_val;
+                restart_fields.push("proxyUrl".into());
+            }
+        }
+        if let Some(v) = req.callback_base_url {
+            let trimmed = v.trim();
+            let new_val = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.trim_end_matches('/').to_string())
+            };
+            if new_val != config.callback_base_url {
+                config.callback_base_url = new_val;
+                restart_fields.push("callbackBaseUrl".into());
+            }
+        }
+
+        // —— 立即生效的字段：负载均衡模式 ——
+        let mut lb_changed = false;
+        if let Some(mode) = req.load_balancing_mode {
+            if mode != "priority" && mode != "balanced" {
+                return Err(AdminServiceError::InvalidCredential(
+                    "loadBalancingMode 必须是 'priority' 或 'balanced'".to_string(),
+                ));
+            }
+            config.load_balancing_mode = mode;
+            lb_changed = true;
+        }
+
+        // 持久化（一次写盘）
+        config
+            .save()
+            .map_err(|e| AdminServiceError::InternalError(format!("保存配置失败: {}", e)))?;
+
+        // 负载均衡模式立即应用到运行时
+        if lb_changed {
+            self.token_manager
+                .set_load_balancing_mode(config.load_balancing_mode.clone())
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        }
+
+        let restart_required = !restart_fields.is_empty();
+        let message = if restart_required {
+            format!(
+                "已保存。{} 个字段需重启服务后生效。",
+                restart_fields.len()
+            )
+        } else if lb_changed {
+            "已保存并立即生效。".to_string()
+        } else {
+            "无改动。".to_string()
+        };
+
+        tracing::info!(
+            "配置已更新（需重启字段: {:?}, 负载均衡变更: {}）",
+            restart_fields,
+            lb_changed
+        );
+
+        Ok(UpdateConfigResponse {
+            success: true,
+            message,
+            restart_required,
+            restart_fields,
+        })
     }
 
     /// 强制刷新指定凭据的 Token

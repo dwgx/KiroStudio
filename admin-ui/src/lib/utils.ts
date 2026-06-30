@@ -6,6 +6,43 @@ export function cn(...inputs: ClassValue[]) {
 }
 
 /**
+ * 复制文本到剪贴板
+ *
+ * 优先使用 navigator.clipboard（仅安全上下文：HTTPS/localhost 可用），
+ * 在非安全上下文（HTTP 部署）自动回退到 textarea + execCommand('copy')。
+ * 返回是否成功。
+ */
+export async function copyToClipboard(text: string): Promise<boolean> {
+  // 安全上下文：优先用现代 API
+  if (typeof navigator !== 'undefined' && navigator.clipboard && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(text)
+      return true
+    } catch {
+      // 落到下面的 fallback
+    }
+  }
+
+  // 非安全上下文 fallback：隐藏 textarea + execCommand
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.setAttribute('readonly', '')
+    ta.style.position = 'fixed'
+    ta.style.top = '-9999px'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.focus()
+    ta.select()
+    const ok = document.execCommand('copy')
+    document.body.removeChild(ta)
+    return ok
+  } catch {
+    return false
+  }
+}
+
+/**
  * 解析后端错误响应，提取用户友好的错误信息
  */
 export interface ParsedError {
