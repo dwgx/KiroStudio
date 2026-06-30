@@ -20,9 +20,11 @@ import type { BalanceResponse } from '@/types/api'
 
 interface DashboardProps {
   onLogout: () => void
+  /** 内嵌到多页框架时为 true：隐藏自身顶栏，操作按钮移入工具行 */
+  embedded?: boolean
 }
 
-export function Dashboard({ onLogout }: DashboardProps) {
+export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
@@ -511,7 +513,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
   if (isLoading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-background">
+      <div className={embedded ? "flex items-center justify-center py-24" : "min-h-screen flex items-center justify-center bg-background"}>
         <div className="text-center">
           <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary mx-auto mb-4"></div>
           <p className="text-muted-foreground">加载中...</p>
@@ -522,7 +524,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
   if (error) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-background p-4">
+      <div className={embedded ? "flex items-center justify-center py-24 p-4" : "min-h-screen flex items-center justify-center bg-background p-4"}>
         <Card className="w-full max-w-md">
           <CardContent className="pt-6 text-center">
             <div className="text-red-500 mb-4">加载失败</div>
@@ -538,8 +540,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
   }
 
   return (
-    <div className="min-h-screen bg-background">
-      {/* 顶部导航 */}
+    <div className={embedded ? "" : "min-h-screen bg-background"}>
+      {/* 顶部导航（仅独立模式显示；内嵌时由 AppShell 提供） */}
+      {!embedded && (
       <header className="sticky top-0 z-50 w-full border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
         <div className="container flex h-14 items-center justify-between px-4 md:px-8">
           <div className="flex items-center gap-2">
@@ -568,9 +571,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
           </div>
         </div>
       </header>
+      )}
 
       {/* 主内容 */}
-      <main className="container mx-auto px-4 md:px-8 py-6">
+      <main className={embedded ? "" : "container mx-auto px-4 md:px-8 py-6"}>
         {/* 统计卡片 */}
         <div className="grid gap-4 md:grid-cols-3 mb-6">
           <Card>
@@ -622,7 +626,23 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 </div>
               )}
             </div>
-            <div className="flex gap-2">
+            <div className="flex gap-2 flex-wrap">
+              {embedded && (
+                <>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleToggleLoadBalancing}
+                    disabled={isLoadingMode || isSettingMode}
+                    title="切换负载均衡模式"
+                  >
+                    {isLoadingMode ? '加载中...' : (loadBalancingData?.mode === 'priority' ? '优先级模式' : '均衡负载')}
+                  </Button>
+                  <Button variant="outline" size="sm" onClick={handleRefresh} title="刷新列表">
+                    <RefreshCw className="h-4 w-4" />
+                  </Button>
+                </>
+              )}
               {selectedIds.size > 0 && (
                 <>
                   <Button onClick={handleBatchVerify} size="sm" variant="outline">

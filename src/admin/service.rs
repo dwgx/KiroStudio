@@ -16,8 +16,9 @@ use super::social_login::SocialLoginManager;
 pub use super::social_login::{PollResult, StartResult};
 use crate::kiro::auth::social::OAuthCallbackData;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    AddCredentialRequest, AddCredentialResponse, BalanceResponse, ConfigSnapshotResponse,
+    CredentialStatusItem, CredentialsStatusResponse, LoadBalancingModeResponse,
+    SetLoadBalancingModeRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -304,6 +305,57 @@ impl AdminService {
     pub fn get_load_balancing_mode(&self) -> LoadBalancingModeResponse {
         LoadBalancingModeResponse {
             mode: self.token_manager.get_load_balancing_mode(),
+        }
+    }
+
+    /// 获取服务端配置快照（敏感字段脱敏）
+    pub fn get_config_snapshot(&self) -> ConfigSnapshotResponse {
+        let config = self.token_manager.config();
+
+        let tls_backend = match config.tls_backend {
+            crate::model::config::TlsBackend::Rustls => "rustls",
+            crate::model::config::TlsBackend::NativeTls => "native-tls",
+        }
+        .to_string();
+
+        let mut endpoint_names: Vec<String> = self.known_endpoints.iter().cloned().collect();
+        endpoint_names.sort();
+
+        let callback_mode = if config.callback_base_url.is_some() {
+            "remote"
+        } else {
+            "local"
+        }
+        .to_string();
+
+        ConfigSnapshotResponse {
+            host: config.host.clone(),
+            port: config.port,
+            region: config.region.clone(),
+            kiro_version: config.kiro_version.clone(),
+            system_version: config.system_version.clone(),
+            node_version: config.node_version.clone(),
+            tls_backend,
+            load_balancing_mode: self.token_manager.get_load_balancing_mode(),
+            default_endpoint: config.default_endpoint.clone(),
+            endpoint_names,
+            extract_thinking: config.extract_thinking,
+            cooldown_enabled: config.cooldown_enabled,
+            rate_limit_enabled: config.rate_limit_enabled,
+            rate_limit_daily_max: config.rate_limit_daily_max,
+            rate_limit_min_interval_ms: config.rate_limit_min_interval_ms,
+            has_proxy: config.proxy_url.is_some(),
+            proxy_url: config.proxy_url.clone(),
+            has_admin_key: config
+                .admin_api_key
+                .as_ref()
+                .map(|k| !k.trim().is_empty())
+                .unwrap_or(false),
+            callback_mode,
+            callback_base_url: config.callback_base_url.clone(),
+            config_path: config
+                .config_path()
+                .map(|p| p.display().to_string()),
         }
     }
 

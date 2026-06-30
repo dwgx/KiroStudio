@@ -298,3 +298,36 @@ pub struct PollSocialLoginResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
+
+// ============ 服务端配置快照（设置页只读展示 + 部分可改）============
+
+/// 服务端配置快照（敏感字段脱敏后返回）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigSnapshotResponse {
+    pub host: String,
+    pub port: u16,
+    pub region: String,
+    pub kiro_version: String,
+    pub system_version: String,
+    pub node_version: String,
+    pub tls_backend: String,
+    pub load_balancing_mode: String,
+    pub default_endpoint: String,
+    pub endpoint_names: Vec<String>,
+    pub extract_thinking: bool,
+    pub cooldown_enabled: bool,
+    pub rate_limit_enabled: bool,
+    pub rate_limit_daily_max: u32,
+    pub rate_limit_min_interval_ms: u64,
+    /// 是否配置了全局代理（不回传明文）
+    pub has_proxy: bool,
+    pub proxy_url: Option<String>,
+    /// 是否配置了 admin key（不回传明文）
+    pub has_admin_key: bool,
+    /// 回调模式：local（本地端口）/ remote（公网回调）
+    pub callback_mode: String,
+    pub callback_base_url: Option<String>,
+    /// 配置文件路径（运行时只读元数据）
+    pub config_path: Option<String>,
+}
