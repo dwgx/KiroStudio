@@ -137,3 +137,32 @@ export interface ConfigSnapshotResponse {
   callbackBaseUrl?: string
   configPath?: string
 }
+
+// 更新服务端配置请求（所有字段可选，仅提交的字段被修改）
+export interface UpdateConfigRequest {
+  host?: string
+  port?: number
+  region?: string
+  kiroVersion?: string
+  systemVersion?: string
+  nodeVersion?: string
+  tlsBackend?: string
+  loadBalancingMode?: string
+  defaultEndpoint?: string
+  extractThinking?: boolean
+  cooldownEnabled?: boolean
+  rateLimitEnabled?: boolean
+  rateLimitDailyMax?: number
+  rateLimitMinIntervalMs?: number
+  affinityEnabled?: boolean
+  proxyUrl?: string
+  callbackBaseUrl?: string
+}
+
+// 更新服务端配置响应
+export interface UpdateConfigResponse {
+  success: boolean
+  message: string
+  restartRequired: boolean
+  restartFields: string[]
+}

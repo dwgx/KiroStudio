@@ -332,3 +332,46 @@ pub struct ConfigSnapshotResponse {
     /// 配置文件路径（运行时只读元数据）
     pub config_path: Option<String>,
 }
+
+/// 更新服务端配置请求
+///
+/// 所有字段可选：仅提交的字段被修改并持久化到 config.json。
+/// 敏感字段（admin key / api key / 代理密码）不在此开放。
+/// 除 `load_balancing_mode` 立即生效外，其余字段需重启进程后生效。
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateConfigRequest {
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub region: Option<String>,
+    pub kiro_version: Option<String>,
+    pub system_version: Option<String>,
+    pub node_version: Option<String>,
+    /// "rustls" | "native-tls"
+    pub tls_backend: Option<String>,
+    /// "priority" | "balanced"（立即生效）
+    pub load_balancing_mode: Option<String>,
+    pub default_endpoint: Option<String>,
+    pub extract_thinking: Option<bool>,
+    pub cooldown_enabled: Option<bool>,
+    pub rate_limit_enabled: Option<bool>,
+    pub rate_limit_daily_max: Option<u32>,
+    pub rate_limit_min_interval_ms: Option<u64>,
+    pub affinity_enabled: Option<bool>,
+    /// 全局代理地址；传空字符串表示清除
+    pub proxy_url: Option<String>,
+    /// 网页上号回调基地址；传空字符串表示清除（回退本地模式）
+    pub callback_base_url: Option<String>,
+}
+
+/// 更新服务端配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateConfigResponse {
+    pub success: bool,
+    pub message: String,
+    /// 是否有字段需要重启才能生效
+    pub restart_required: bool,
+    /// 需要重启才生效的已改字段名（前端用于提示）
+    pub restart_fields: Vec<String>,
+}
