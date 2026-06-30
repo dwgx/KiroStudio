@@ -258,3 +258,15 @@ fn html_escape(s: &str) -> String {
 pub async fn get_config(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.service.get_config_snapshot())
 }
+
+/// PUT /api/admin/config
+/// 更新服务端配置（仅提交的字段被修改并持久化）
+pub async fn update_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<super::types::UpdateConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.update_config(payload) {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}

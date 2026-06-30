@@ -10,7 +10,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { startSocialLogin, pollSocialLogin } from '@/api/credentials'
-import { extractErrorMessage } from '@/lib/utils'
+import { copyToClipboard, extractErrorMessage } from '@/lib/utils'
 import type { StartSocialLoginResponse } from '@/types/api'
 
 interface SocialLoginDialogProps {
@@ -92,8 +92,7 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
       })
       setSession(resp)
       setStep('waiting')
-      // 自动打开登录页
-      window.open(resp.portalUrl, '_blank', 'noopener,noreferrer')
+      // 不自动打开网页：用户在 waiting 步骤手动点「打开登录页」
       poll(resp.sessionId)
     } catch (err) {
       toast.error(extractErrorMessage(err))
@@ -102,13 +101,18 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
     }
   }
 
+  const handleOpenLogin = () => {
+    if (!session) return
+    window.open(session.portalUrl, '_blank', 'noopener,noreferrer')
+  }
+
   const handleCopy = async () => {
     if (!session) return
-    try {
-      await navigator.clipboard.writeText(session.portalUrl)
+    const ok = await copyToClipboard(session.portalUrl)
+    if (ok) {
       toast.success('登录链接已复制')
-    } catch {
-      toast.error('复制失败，请手动复制')
+    } else {
+      toast.error('复制失败，请手动选中链接复制')
     }
   }
 
@@ -156,14 +160,18 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
         {step === 'waiting' && session && (
           <div className="space-y-4 py-2">
             <p className="text-sm text-muted-foreground">
-              已打开登录页。若没弹出，请复制下方链接到浏览器手动打开，登录后自动完成。
+              点「打开登录页」在新标签页登录 Kiro 账号；登录完成后此处会自动检测并入池。
+              若按钮被浏览器拦截，请复制下方链接手动打开。
             </p>
             <div className="flex items-center gap-2">
-              <Input readOnly value={session.portalUrl} className="text-xs" />
+              <Input readOnly value={session.portalUrl} className="text-xs" onFocus={(e) => e.currentTarget.select()} />
               <Button type="button" variant="outline" onClick={handleCopy}>
                 复制
               </Button>
             </div>
+            <Button type="button" className="w-full" onClick={handleOpenLogin}>
+              打开登录页
+            </Button>
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
               <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-primary" />
               等待浏览器完成登录…
