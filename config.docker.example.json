@@ -1,0 +1,9 @@
+{
+  "host": "0.0.0.0",
+  "port": 8990,
+  "apiKey": "sk-kiro-CHANGE-ME-to-a-strong-random-key",
+  "adminApiKey": "sk-admin-CHANGE-ME-to-a-strong-random-key",
+  "tlsBackend": "rustls",
+  "region": "us-east-1",
+  "defaultEndpoint": "ide"
+}
