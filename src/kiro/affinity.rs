@@ -1,11 +1,11 @@
 //! 用户亲和性管理模块
 //!
-//! 记录 user_id 与 credential_id 的绑定关系，
-//! 使连续对话尽量使用同一凭据
+//! 记录 user_id（会话 conversationId）与 credential_id 的绑定关系，
+//! 使连续对话尽量使用同一凭据，降低单会话散落到多账号的关联风险。
 //!
-//! 注：当前网关尚未引入 per-request user_id，本模块已就绪但暂未接线，
-//! 待会话级路由落地后启用（见 docs/RESILIENCE.md）。
-#![allow(dead_code)]
+//! 已接线到 MultiTokenManager::select_next_credential：
+//! key 取自请求 conversationId（由 converter 从 metadata.user_id 派生）。
+//! 由 config.affinity_enabled 控制（默认开）。
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
