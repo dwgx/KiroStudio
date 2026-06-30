@@ -12,6 +12,9 @@ use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 
 use super::error::AdminServiceError;
+use super::social_login::SocialLoginManager;
+pub use super::social_login::{PollResult, StartResult};
+use crate::kiro::auth::social::OAuthCallbackData;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
     CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
@@ -38,6 +41,8 @@ pub struct AdminService {
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
+    /// 网页上号会话管理器
+    social_login: SocialLoginManager,
 }
 
 impl AdminService {
@@ -52,11 +57,33 @@ impl AdminService {
         let balance_cache = Self::load_balance_cache_from(&cache_path);
 
         Self {
+            social_login: SocialLoginManager::new(token_manager.clone()),
             token_manager,
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
         }
+    }
+
+    /// 发起网页上号，返回 portal_url + session_id
+    pub fn start_social_login(
+        &self,
+        priority: u32,
+        proxy_url: Option<String>,
+    ) -> Result<StartResult, AdminServiceError> {
+        self.social_login
+            .start(priority, proxy_url)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))
+    }
+
+    /// 轮询网页上号会话状态
+    pub async fn poll_social_login(&self, session_id: &str) -> PollResult {
+        self.social_login.poll(session_id).await
+    }
+
+    /// 远程模式：公网回调路由投递 OAuth 回调
+    pub fn deliver_social_callback(&self, data: OAuthCallbackData) -> bool {
+        self.social_login.deliver_callback(data)
     }
 
     /// 获取所有凭据状态

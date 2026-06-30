@@ -130,6 +130,15 @@ pub struct Config {
     #[serde(default = "default_rate_limit_min_interval_ms")]
     pub rate_limit_min_interval_ms: u64,
 
+    /// 网页上号回调基地址（可选）
+    ///
+    /// - 不配置：本地回调模式，后端在本机临时端口接收 OAuth 回调（仅本机浏览器可达）。
+    /// - 配置为公网地址（如 `https://kiro.example.com`）：远程回调模式，
+    ///   浏览器回调打到 `{callbackBaseUrl}/api/admin/auth/callback`，适合 Docker/服务器部署。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callback_base_url: Option<String>,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -221,6 +230,7 @@ impl Default for Config {
             rate_limit_enabled: false,
             rate_limit_daily_max: default_rate_limit_daily(),
             rate_limit_min_interval_ms: default_rate_limit_min_interval_ms(),
+            callback_base_url: None,
             config_path: None,
         }
     }
