@@ -140,3 +140,113 @@ pub async fn set_load_balancing_mode(
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
+
+// ============ 网页上号（Social OAuth）============
+
+use super::service::PollResult;
+use super::types::{
+    PollSocialLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse,
+};
+use crate::kiro::auth::social::OAuthCallbackData;
+use axum::extract::Query;
+use std::collections::HashMap;
+
+/// POST /api/admin/auth/social/start
+/// 发起网页上号，返回 portal_url 供浏览器登录
+pub async fn start_social_login(
+    State(state): State<AdminState>,
+    Json(payload): Json<StartSocialLoginRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .start_social_login(payload.priority, payload.proxy_url)
+    {
+        Ok(result) => Json(StartSocialLoginResponse {
+            session_id: result.session_id,
+            portal_url: result.portal_url,
+        })
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/auth/social/poll/:session_id
+/// 轮询登录状态；完成时凭据已自动加入池
+pub async fn poll_social_login(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    let resp = match state.service.poll_social_login(&session_id).await {
+        PollResult::Pending => PollSocialLoginResponse {
+            status: "pending".to_string(),
+            credential_id: None,
+            email: None,
+            message: None,
+        },
+        PollResult::Done {
+            credential_id,
+            email,
+        } => PollSocialLoginResponse {
+            status: "done".to_string(),
+            credential_id: Some(credential_id),
+            email,
+            message: None,
+        },
+        PollResult::Error(msg) => PollSocialLoginResponse {
+            status: "error".to_string(),
+            credential_id: None,
+            email: None,
+            message: Some(msg),
+        },
+    };
+    Json(resp)
+}
+
+/// GET /api/admin/auth/callback
+/// 远程回调模式：浏览器 OAuth 回调落点（**无需鉴权**，由 state 关联会话）
+pub async fn social_callback(
+    State(state): State<AdminState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    use axum::http::header;
+    use axum::response::Html;
+
+    // 有 error 参数 → 失败页
+    if let Some(err) = params.get("error_description").or_else(|| params.get("error")) {
+        let body = format!(
+            "<html><head><meta charset='utf-8'><title>登录失败</title></head><body style='font-family:sans-serif;text-align:center;padding:60px'><h2>&#10007; 登录失败</h2><p>{}</p><p style='color:#888;font-size:13px'>请关闭此标签页并重试。</p></body></html>",
+            html_escape(err)
+        );
+        return ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], Html(body));
+    }
+
+    let code = params.get("code").cloned().unwrap_or_default();
+    let oauth_state = params.get("state").cloned().unwrap_or_default();
+    let login_option = params.get("login_option").cloned().unwrap_or_default();
+
+    let delivered = if code.is_empty() {
+        false
+    } else {
+        state.service.deliver_social_callback(OAuthCallbackData {
+            code,
+            login_option,
+            path: "/api/admin/auth/callback".to_string(),
+            state: oauth_state,
+        })
+    };
+
+    let body = if delivered {
+        "<html><head><meta charset='utf-8'><title>登录成功</title></head><body style='font-family:sans-serif;text-align:center;padding:60px'><h2>&#10003; 登录成功</h2><p>Token 已更新，请返回 Kiro Admin UI。</p><p style='color:#888;font-size:13px'>此标签页可以关闭。</p></body></html>".to_string()
+    } else {
+        "<html><head><meta charset='utf-8'><title>登录异常</title></head><body style='font-family:sans-serif;text-align:center;padding:60px'><h2>登录会话未匹配</h2><p>可能已超时，请返回 Admin UI 重新发起。</p></body></html>".to_string()
+    };
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], Html(body))
+}
+
+/// 极简 HTML 转义，避免回调错误信息注入
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
