@@ -109,6 +109,27 @@ pub struct Config {
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
 
+    /// 是否启用失败冷却（429/认证失败等后短暂跳过该凭据，默认 true）
+    ///
+    /// 纯本地反应式调度：仅在凭据已出错时跳过它一段时间，无副作用，建议常开。
+    #[serde(default = "default_cooldown_enabled")]
+    pub cooldown_enabled: bool,
+
+    /// 是否启用拟人速率限制（每凭据每日上限 + 请求间隔，默认 false）
+    ///
+    /// 防关联用：模拟人类节奏。注意默认间隔 1s/请求会拖慢单用户高频工具调用，
+    /// 故默认关闭；多账号轮换或在意关联风险时再开。配合 `rate_limit_*` 微调。
+    #[serde(default)]
+    pub rate_limit_enabled: bool,
+
+    /// 速率限制：每凭据每日最大请求数（仅 rate_limit_enabled 时生效，默认 500）
+    #[serde(default = "default_rate_limit_daily")]
+    pub rate_limit_daily_max: u32,
+
+    /// 速率限制：最小请求间隔毫秒（仅 rate_limit_enabled 时生效，默认 1000）
+    #[serde(default = "default_rate_limit_min_interval_ms")]
+    pub rate_limit_min_interval_ms: u64,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -159,6 +180,18 @@ fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
 
+fn default_cooldown_enabled() -> bool {
+    true
+}
+
+fn default_rate_limit_daily() -> u32 {
+    500
+}
+
+fn default_rate_limit_min_interval_ms() -> u64 {
+    1000
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -184,6 +217,10 @@ impl Default for Config {
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
+            cooldown_enabled: default_cooldown_enabled(),
+            rate_limit_enabled: false,
+            rate_limit_daily_max: default_rate_limit_daily(),
+            rate_limit_min_interval_ms: default_rate_limit_min_interval_ms(),
             config_path: None,
         }
     }

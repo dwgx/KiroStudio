@@ -227,6 +227,8 @@ impl KiroProvider {
                         continue;
                     }
                     tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
+                    // 刷新失败 = 认证态有问题，加一段冷却让调度避开它
+                    self.token_manager.report_auth_cooldown(ctx.id);
                 }
 
                 let has_available = self.token_manager.report_failure(ctx.id);
@@ -413,6 +415,8 @@ impl KiroProvider {
                         continue;
                     }
                     tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
+                    // 刷新失败 = 认证态有问题，加一段冷却让调度避开它
+                    self.token_manager.report_auth_cooldown(ctx.id);
                 }
 
                 let has_available = self.token_manager.report_failure(ctx.id);
@@ -444,6 +448,11 @@ impl KiroProvider {
                     status,
                     body
                 );
+                // 429 限流：给该凭据设置短冷却，让调度优先换用其它凭据
+                // （仍不禁用、不计永久失败，冷却到期自动恢复）
+                if status.as_u16() == 429 {
+                    self.token_manager.report_rate_limited(ctx.id);
+                }
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败: {} {}",
                     api_type,
