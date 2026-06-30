@@ -1,0 +1,37 @@
+# 参考库：11 个外部项目的本地副本，不纳入本仓库
+/reference/
+
+# 凭据与密钥（绝不提交）
+*.env
+.env*
+credentials.json
+config.json
+*.key
+*.pem
+secrets/
+
+# 数据库
+*.db
+*.sqlite
+*.sqlite3
+
+# Rust
+/target/
+**/target/
+Cargo.lock.bak
+
+# Node / 前端
+node_modules/
+dist/
+build/
+.vite/
+
+# 系统/编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
+
+# CodeGraph 索引（本地产物）
+.codegraph/
