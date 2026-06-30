@@ -1,6 +1,28 @@
 # 上号方案 —— 网页 OAuth 上 Kiro 号（基于真实源码，2026-06-30）
 
 > 目标(用户)：网页后台点登录就上号，不手动粘 token。
+
+## ✅ 实现状态（2026-07-01 更新）：已落地，走 Portal PKCE 路线
+
+**最终采用的不是本文档原设计的 AWS SSO device flow，而是 ZyphrZero 的 Portal PKCE OAuth**
+——更简单、已实跑验证、且支持远程部署。原 device flow 设计（第 1~3 节）保留作背景参考。
+
+实际实现（移植自 `reference/ZyphrZero__kiro.rs/src/kiro/auth/social.rs`）：
+- 流程：生成 PKCE → 打开 `https://app.kiro.dev/signin?...` → 用户浏览器登录
+  → 回调带 code → 用 code+verifier 换 token（`prod.us-east-1.auth.desktop.kiro.dev/oauth/token`）→ 入池。
+- **两种回调模式**：本地（临时 TCP 端口，本机浏览器）/ 远程（配 `callbackBaseUrl`，
+  公网 `GET /api/admin/auth/callback`，适合 Docker）。
+- 后端：`src/kiro/auth/social.rs`（PKCE/回调/换token）+ `src/admin/social_login.rs`（会话管理）。
+- API：`POST /auth/social/start`、`POST /auth/social/poll/:id`（鉴权）、`GET /auth/callback`（公开）。
+- 前端：`admin-ui/src/components/social-login-dialog.tsx`，仪表盘「网页上号」按钮。
+- 仅实现 Social（个人账号）。IDC（企业 SSO）+ 下方 device flow 暂未移植，按需再做。
+
+冒烟验证：start 返回真实 portalUrl+PKCE challenge；无 key 401；callback 公开 200；前后端构建全过。
+
+---
+
+## （以下为原 AWS SSO device flow 设计，未采用，留作背景）
+
 > 依据：Quorinex/Kiro-Go `auth/sso_token.go`（已读源码，MIT，学思路重写 Rust）。
 > hank9999 **无此功能**（搜 oauth/authorize/callback 命中 0），是 KiroStudio 的新建增量。
 
