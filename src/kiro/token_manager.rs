@@ -17,12 +17,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
+use crate::kiro::cooldown::{CooldownManager, CooldownReason};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
+use crate::kiro::rate_limiter::{RateLimitConfig, RateLimiter};
 use crate::model::config::Config;
 
 /// 检查 Token 是否在指定时间内过期
@@ -526,6 +528,14 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// 失败冷却管理器（反应式：凭据出错后短暂跳过）
+    cooldown: CooldownManager,
+    /// 是否启用冷却
+    cooldown_enabled: bool,
+    /// 拟人速率限制器（防关联：每日上限 + 请求间隔）
+    rate_limiter: RateLimiter,
+    /// 是否启用速率限制
+    rate_limit_enabled: bool,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -644,6 +654,13 @@ impl MultiTokenManager {
             .unwrap_or(0);
 
         let load_balancing_mode = config.load_balancing_mode.clone();
+        let cooldown_enabled = config.cooldown_enabled;
+        let rate_limit_enabled = config.rate_limit_enabled;
+        let rate_limit_config = RateLimitConfig {
+            daily_max_requests: config.rate_limit_daily_max,
+            min_interval_ms: config.rate_limit_min_interval_ms,
+            ..RateLimitConfig::default()
+        };
         let manager = Self {
             config,
             proxy,
@@ -655,6 +672,10 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            cooldown: CooldownManager::new(),
+            cooldown_enabled,
+            rate_limiter: RateLimiter::new(rate_limit_config),
+            rate_limit_enabled,
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -711,6 +732,14 @@ impl MultiTokenManager {
                 }
                 // 如果是 opus 模型，需要检查订阅等级
                 if is_opus && !e.credentials.supports_opus() {
+                    return false;
+                }
+                // 冷却中的凭据跳过（反应式：仅在出错后短暂跳过）
+                if self.cooldown_enabled && !self.cooldown.is_available(e.id) {
+                    return false;
+                }
+                // 速率受限的凭据跳过（拟人节流：每日上限/请求间隔/退避）
+                if self.rate_limit_enabled && self.rate_limiter.check_rate_limit(e.id).is_err() {
                     return false;
                 }
                 true
@@ -828,6 +857,15 @@ impl MultiTokenManager {
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
                 Ok(ctx) => {
+                    // 记录一次速率获取（递增每日计数 + 标记本次请求时间，驱动最小间隔）
+                    if self.rate_limit_enabled {
+                        if let Err(wait) = self.rate_limiter.try_acquire(id) {
+                            tracing::debug!("凭据 #{} 速率受限，需等待 {:?}，重新选择", id, wait);
+                            // 该凭据本轮不可用，换下一个；select 已会过滤它
+                            attempt_count += 1;
+                            continue;
+                        }
+                    }
                     return Ok(ctx);
                 }
                 Err(e) => {
@@ -1139,6 +1177,13 @@ impl MultiTokenManager {
                 );
             }
         }
+        // 成功：清除冷却并记录速率成功（重置连续失败/退避）
+        if self.cooldown_enabled {
+            self.cooldown.clear_cooldown(id);
+        }
+        if self.rate_limit_enabled {
+            self.rate_limiter.record_success(id);
+        }
         self.save_stats_debounced();
     }
 
@@ -1198,8 +1243,36 @@ impl MultiTokenManager {
 
             entries.iter().any(|e| !e.disabled)
         };
+        // 记录速率失败（驱动指数退避）
+        if self.rate_limit_enabled {
+            self.rate_limiter.record_failure(id, None);
+        }
         self.save_stats_debounced();
         result
+    }
+
+    /// 报告凭据触发上游瞬态限流（429/5xx）
+    ///
+    /// 不禁用凭据、不计入永久失败，仅设置一段短冷却让调度暂时跳过它，
+    /// 配合 provider 的退避重试，避免反复打同一个正在限流的凭据。
+    pub fn report_rate_limited(&self, id: u64) {
+        if self.cooldown_enabled {
+            let dur = self.cooldown.set_cooldown(id, CooldownReason::RateLimitExceeded);
+            tracing::warn!("凭据 #{} 触发限流，冷却 {:?}", id, dur);
+        }
+        if self.rate_limit_enabled {
+            self.rate_limiter.record_failure(id, Some("rate limited"));
+        }
+    }
+
+    /// 报告凭据认证失败，设置较长冷却（配合 force-refresh 失败后调用）
+    pub fn report_auth_cooldown(&self, id: u64) {
+        if self.cooldown_enabled {
+            let dur = self
+                .cooldown
+                .set_cooldown(id, CooldownReason::AuthenticationFailed);
+            tracing::warn!("凭据 #{} 认证失败，冷却 {:?}", id, dur);
+        }
     }
 
     /// 报告指定凭据额度已用尽
