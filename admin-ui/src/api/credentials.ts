@@ -11,6 +11,7 @@ import type {
   StartSocialLoginRequest,
   StartSocialLoginResponse,
   PollSocialLoginResponse,
+  ConfigSnapshotResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -121,5 +122,11 @@ export async function pollSocialLogin(
   sessionId: string
 ): Promise<PollSocialLoginResponse> {
   const { data } = await api.post<PollSocialLoginResponse>(`/auth/social/poll/${sessionId}`)
+  return data
+}
+
+// 获取服务端配置快照（敏感字段脱敏）
+export async function getConfigSnapshot(): Promise<ConfigSnapshotResponse> {
+  const { data } = await api.get<ConfigSnapshotResponse>('/config')
   return data
 }

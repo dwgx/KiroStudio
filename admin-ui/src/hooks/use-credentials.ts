@@ -10,6 +10,7 @@ import {
   deleteCredential,
   getLoadBalancingMode,
   setLoadBalancingMode,
+  getConfigSnapshot,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 
@@ -19,6 +20,14 @@ export function useCredentials() {
     queryKey: ['credentials'],
     queryFn: getCredentials,
     refetchInterval: 30000, // 每 30 秒刷新一次
+  })
+}
+
+// 查询服务端配置快照
+export function useConfigSnapshot() {
+  return useQuery({
+    queryKey: ['config-snapshot'],
+    queryFn: getConfigSnapshot,
   })
 }
 

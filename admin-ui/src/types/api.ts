@@ -109,3 +109,30 @@ export interface PollSocialLoginResponse {
   email?: string
   message?: string
 }
+
+// ============ 服务端配置快照 ============
+
+// 服务端配置（敏感字段已脱敏）
+export interface ConfigSnapshotResponse {
+  host: string
+  port: number
+  region: string
+  kiroVersion: string
+  systemVersion: string
+  nodeVersion: string
+  tlsBackend: string
+  loadBalancingMode: string
+  defaultEndpoint: string
+  endpointNames: string[]
+  extractThinking: boolean
+  cooldownEnabled: boolean
+  rateLimitEnabled: boolean
+  rateLimitDailyMax: number
+  rateLimitMinIntervalMs: number
+  hasProxy: boolean
+  proxyUrl?: string
+  hasAdminKey: boolean
+  callbackMode: string
+  callbackBaseUrl?: string
+  configPath?: string
+}
