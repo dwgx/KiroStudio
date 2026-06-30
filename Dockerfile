@@ -1,10 +1,10 @@
 FROM node:22-alpine AS frontend-builder
 
 WORKDIR /app/admin-ui
-COPY admin-ui/package.json admin-ui/package-lock.json admin-ui/.npmrc ./
-RUN npm ci
+COPY admin-ui/package.json admin-ui/pnpm-lock.yaml admin-ui/.npmrc admin-ui/pnpm-workspace.yaml ./
+RUN npm install -g pnpm && pnpm install --frozen-lockfile
 COPY admin-ui ./
-RUN npm run build
+RUN pnpm build
 
 FROM rust:1.92-alpine AS builder
 
