@@ -72,6 +72,7 @@
 - [ ] Anthropic 出口（`/v1/messages` + `/cc/v1`）跑通
 - [ ] 账号池 priority/balanced + token 自动刷新回写 + 多级 Region
 - [ ] 机器码注入 + 凭据级代理（hank9999 已有，验证并保留）
+- [ ] ★ **网页 OAuth 上 Kiro 号**（hank9999 无，新建）：参考 Quorinex/Kiro-Go `auth/sso_token.go` 的 AWS SSO/OIDC device flow，重写成 Rust。**先验证纯浏览器 OAuth 跳转能否做到**（见 DISCUSSION Q9）
 - [ ] 韧性合并：cherry-pick M-JYuan(exclude_ids/雷暴防护/balance刷新) + Foxfishc(Overage/429) + ZyphrZero(traces.db)
 - [ ] 本地 SQLite 存储落地（凭据从 credentials.json → SQLite，预留加密接口）
 - [ ] Docker 化：Dockerfile + docker-compose，能在 Linux 跑起来
