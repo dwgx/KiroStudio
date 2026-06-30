@@ -137,6 +137,7 @@ export function SettingsPage() {
         <CardContent className="py-0">
           <Row label="冷却机制" value={<BoolBadge on={config.cooldownEnabled} />} />
           <Row label="速率限制" value={<BoolBadge on={config.rateLimitEnabled} />} />
+          <Row label="会话亲和性" value={<BoolBadge on={config.affinityEnabled} />} />
           <Row label="每日上限" value={config.rateLimitDailyMax > 0 ? config.rateLimitDailyMax : '无限制'} />
           <Row label="最小请求间隔" value={`${config.rateLimitMinIntervalMs} ms`} />
         </CardContent>

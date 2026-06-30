@@ -129,6 +129,7 @@ export interface ConfigSnapshotResponse {
   rateLimitEnabled: boolean
   rateLimitDailyMax: number
   rateLimitMinIntervalMs: number
+  affinityEnabled: boolean
   hasProxy: boolean
   proxyUrl?: string
   hasAdminKey: boolean

@@ -134,7 +134,7 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let ctx = match self.token_manager.acquire_context(None).await {
+            let ctx = match self.token_manager.acquire_context(None, None).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -291,10 +291,16 @@ impl KiroProvider {
 
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
+        // 提取会话标识（conversationId）用于会话亲和性
+        let session_id = Self::extract_session_id_from_request(request_body);
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let ctx = match self
+                .token_manager
+                .acquire_context(model.as_deref(), session_id.as_deref())
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -511,6 +517,21 @@ impl KiroProvider {
             .get("currentMessage")?
             .get("userInputMessage")?
             .get("modelId")?
+            .as_str()
+            .map(|s| s.to_string())
+    }
+
+    /// 从请求体中提取会话标识（conversationId），用于会话亲和性
+    ///
+    /// conversationId 由 converter 从原始 metadata.user_id 的 session UUID 派生；
+    /// 无真实 session 时为随机 UUID（每次不同，自然不命中亲和性，等价于常规轮换）。
+    fn extract_session_id_from_request(request_body: &str) -> Option<String> {
+        use serde_json::Value;
+
+        let json: Value = serde_json::from_str(request_body).ok()?;
+
+        json.get("conversationState")?
+            .get("conversationId")?
             .as_str()
             .map(|s| s.to_string())
     }
