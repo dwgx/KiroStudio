@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { storage } from '@/lib/storage'
 import { LoginPage } from '@/components/login-page'
-import { Dashboard } from '@/components/dashboard'
+import { AppShell } from '@/components/app-shell'
 import { Toaster } from '@/components/ui/sonner'
 
 function App() {
@@ -25,7 +25,7 @@ function App() {
   return (
     <>
       {isLoggedIn ? (
-        <Dashboard onLogout={handleLogout} />
+        <AppShell onLogout={handleLogout} />
       ) : (
         <LoginPage onLogin={handleLogin} />
       )}

@@ -250,3 +250,11 @@ fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
 }
+
+// ============ 服务端配置 ============
+
+/// GET /api/admin/config
+/// 返回服务端配置快照（敏感字段已脱敏）
+pub async fn get_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_config_snapshot())
+}
