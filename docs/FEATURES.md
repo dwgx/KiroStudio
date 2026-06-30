@@ -40,6 +40,7 @@
 |---|---|---|
 | 多鉴权:OAuth/BuilderId/Social/Enterprise-IdC/API Key | H/CG | |
 | token 自动刷新 + 回写凭据(SQLite) | 全部 | |
+| ★ 网页 OAuth 上 Kiro 号（device flow，凭据自动入库） | KG参考/本项目新建 | hank9999 无此功能；参考 Kiro-Go `auth/sso_token.go` AWS SSO/OIDC device flow 重写为 Rust。替代手动粘 token |
 | 双向 token 同步(监听 IDE token 反向回写) | CG | 避免被强制登出（思路，自用按需） |
 | 多源导入:OAuth / Token / JSON / kiro-cli / IDE本地 | CG + 我们PR#135 | CLI 导入逻辑可复用 PR#135 |
 | 客户端 API Key 分发 | Z | 给下游 AI 客户端分发可控 key |
