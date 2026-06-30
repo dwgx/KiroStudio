@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2 } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, LogIn } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -9,6 +9,7 @@ import { Badge } from '@/components/ui/badge'
 import { CredentialCard } from '@/components/credential-card'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
+import { SocialLoginDialog } from '@/components/social-login-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
@@ -25,6 +26,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
+  const [socialLoginOpen, setSocialLoginOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
@@ -690,7 +692,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 <Upload className="h-4 w-4 mr-2" />
                 批量导入
               </Button>
-              <Button onClick={() => setAddDialogOpen(true)} size="sm">
+              <Button onClick={() => setSocialLoginOpen(true)} size="sm" variant="default">
+                <LogIn className="h-4 w-4 mr-2" />
+                网页上号
+              </Button>
+              <Button onClick={() => setAddDialogOpen(true)} size="sm" variant="outline">
                 <Plus className="h-4 w-4 mr-2" />
                 添加凭据
               </Button>
@@ -758,6 +764,16 @@ export function Dashboard({ onLogout }: DashboardProps) {
       <AddCredentialDialog
         open={addDialogOpen}
         onOpenChange={setAddDialogOpen}
+      />
+
+      {/* 网页上号对话框 */}
+      <SocialLoginDialog
+        open={socialLoginOpen}
+        onOpenChange={setSocialLoginOpen}
+        onSuccess={() => {
+          queryClient.invalidateQueries({ queryKey: ['credentials'] })
+          refetch()
+        }}
       />
 
       {/* 批量导入对话框 */}

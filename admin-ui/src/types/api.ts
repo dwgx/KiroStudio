@@ -87,3 +87,25 @@ export interface AddCredentialResponse {
   credentialId: number
   email?: string
 }
+
+// ============ 网页上号（Social OAuth）============
+
+// 发起网页上号请求
+export interface StartSocialLoginRequest {
+  priority?: number
+  proxyUrl?: string
+}
+
+// 发起网页上号响应
+export interface StartSocialLoginResponse {
+  sessionId: string
+  portalUrl: string
+}
+
+// 轮询网页上号响应
+export interface PollSocialLoginResponse {
+  status: 'pending' | 'done' | 'error'
+  credentialId?: number
+  email?: string
+  message?: string
+}

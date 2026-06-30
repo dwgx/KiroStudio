@@ -35,3 +35,7 @@ Thumbs.db
 
 # CodeGraph 索引（本地产物）
 .codegraph/
+
+# npm 工件（本项目用 pnpm）
+admin-ui/package-lock.json
+*.tsbuildinfo
