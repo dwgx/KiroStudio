@@ -345,7 +345,7 @@ async fn handle_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let (response, meta) = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -356,8 +356,8 @@ async fn handle_stream_request(
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
 
-    // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events);
+    // 创建 SSE 流（流结束时用 meta + 最终 usage 埋点一条成功记录）
+    let stream = create_sse_stream(response, ctx, initial_events, meta);
 
     // 返回 SSE 响应
     Response::builder()
@@ -367,6 +367,25 @@ async fn handle_stream_request(
         .header(header::CONNECTION, "keep-alive")
         .body(Body::from_stream(stream))
         .unwrap()
+}
+
+/// 流结束时，用 provider 元数据 + StreamContext 最终 usage 埋点一条成功记录
+fn emit_stream_usage(ctx: &StreamContext, meta: &crate::kiro::provider::CallMeta) {
+    let usage = ctx.resolved_usage();
+    let mut record = crate::usage::RequestRecord::new(
+        Uuid::new_v4().to_string(),
+        meta.model.clone().unwrap_or_else(|| ctx.model.clone()),
+    );
+    record.credential_id = Some(meta.credential_id);
+    record.session_id = meta.session_id.clone();
+    record.is_streaming = meta.is_streaming;
+    record.input_tokens = usage.input_tokens;
+    record.output_tokens = usage.output_tokens;
+    record.credits_used = usage.credits_used;
+    record.latency_ms = meta.latency_ms;
+    record.retries = meta.retries;
+    record.outcome = crate::usage::RequestOutcome::Success;
+    crate::usage::emit_record(record);
 }
 
 /// Ping 事件间隔（25秒）
@@ -382,6 +401,7 @@ fn create_sse_stream(
     response: reqwest::Response,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
+    meta: crate::kiro::provider::CallMeta,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -394,8 +414,8 @@ fn create_sse_stream(
     let body_stream = response.bytes_stream();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS))),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), meta),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, meta)| async move {
             if finished {
                 return None;
             }
@@ -432,7 +452,7 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, meta)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
@@ -442,7 +462,8 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            emit_stream_usage(&ctx, &meta);
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, meta)))
                         }
                         None => {
                             // 流结束，发送最终事件
@@ -451,7 +472,8 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            emit_stream_usage(&ctx, &meta);
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, meta)))
                         }
                     }
                 }
@@ -459,7 +481,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, meta)))
                 }
             }
         },
@@ -481,7 +503,7 @@ async fn handle_non_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api(request_body).await {
+    let (response, meta) = match provider.call_api(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -514,6 +536,8 @@ async fn handle_non_stream_request(
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
+    // 从 meteringEvent 解析的真实 credit 消耗量
+    let mut credits_used: Option<f64> = None;
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
@@ -582,6 +606,9 @@ async fn handle_non_stream_request(
                                 actual_input_tokens
                             );
                         }
+                        Event::Metering(metering) => {
+                            credits_used = Some(credits_used.unwrap_or(0.0) + metering.usage);
+                        }
                         Event::Exception { exception_type, .. } => {
                             if exception_type == "ContentLengthExceededException" {
                                 stop_reason = "max_tokens".to_string();
@@ -637,6 +664,24 @@ async fn handle_non_stream_request(
 
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
     let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
+
+    // 用量埋点：非流式成功记录
+    {
+        let mut record = crate::usage::RequestRecord::new(
+            Uuid::new_v4().to_string(),
+            meta.model.clone().unwrap_or_else(|| model.to_string()),
+        );
+        record.credential_id = Some(meta.credential_id);
+        record.session_id = meta.session_id.clone();
+        record.is_streaming = meta.is_streaming;
+        record.input_tokens = final_input_tokens;
+        record.output_tokens = output_tokens;
+        record.credits_used = credits_used;
+        record.latency_ms = meta.latency_ms;
+        record.retries = meta.retries;
+        record.outcome = crate::usage::RequestOutcome::Success;
+        crate::usage::emit_record(record);
+    }
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -861,7 +906,7 @@ async fn handle_stream_request_buffered(
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let (response, meta) = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -869,8 +914,8 @@ async fn handle_stream_request_buffered(
     // 创建缓冲流处理上下文
     let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
 
-    // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx);
+    // 创建缓冲 SSE 流（流结束时用 meta + 最终 usage 埋点）
+    let stream = create_buffered_sse_stream(response, ctx, meta);
 
     // 返回 SSE 响应
     Response::builder()
@@ -892,6 +937,7 @@ async fn handle_stream_request_buffered(
 fn create_buffered_sse_stream(
     response: reqwest::Response,
     ctx: BufferedStreamContext,
+    meta: crate::kiro::provider::CallMeta,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
 
@@ -902,8 +948,9 @@ fn create_buffered_sse_stream(
             EventStreamDecoder::new(),
             false,
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
+            meta,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, meta)| async move {
             if finished {
                 return None;
             }
@@ -918,7 +965,7 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, meta)));
                     }
 
                     // 然后处理数据流
@@ -953,7 +1000,8 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                                emit_buffered_usage(&ctx, &meta);
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, meta)));
                             }
                             None => {
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
@@ -962,7 +1010,8 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                                emit_buffered_usage(&ctx, &meta);
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, meta)));
                             }
                         }
                     }
@@ -971,4 +1020,23 @@ fn create_buffered_sse_stream(
         },
     )
     .flatten()
+}
+
+/// 缓冲流结束时埋点一条成功记录
+fn emit_buffered_usage(ctx: &BufferedStreamContext, meta: &crate::kiro::provider::CallMeta) {
+    let usage = ctx.resolved_usage();
+    let mut record = crate::usage::RequestRecord::new(
+        Uuid::new_v4().to_string(),
+        meta.model.clone().unwrap_or_default(),
+    );
+    record.credential_id = Some(meta.credential_id);
+    record.session_id = meta.session_id.clone();
+    record.is_streaming = meta.is_streaming;
+    record.input_tokens = usage.input_tokens;
+    record.output_tokens = usage.output_tokens;
+    record.credits_used = usage.credits_used;
+    record.latency_ms = meta.latency_ms;
+    record.retries = meta.retries;
+    record.outcome = crate::usage::RequestOutcome::Success;
+    crate::usage::emit_record(record);
 }

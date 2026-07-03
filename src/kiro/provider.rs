@@ -25,6 +25,26 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
 
+/// 一次成功调用的元数据（随响应回传给上层，供用量统计埋点关联）
+///
+/// provider 层掌握凭据/重试/延迟，但看不到最终 usage/credits（流式消费后才知道）；
+/// 上层拿到本结构后与 `StreamContext::resolved_usage()` 合并即可产出完整记录。
+#[derive(Debug, Clone)]
+pub struct CallMeta {
+    /// 实际服务该请求的凭据 ID
+    pub credential_id: u64,
+    /// 请求模型名（从请求体解析，可能为 None）
+    pub model: Option<String>,
+    /// 会话标识（conversationId）
+    pub session_id: Option<String>,
+    /// 是否流式
+    pub is_streaming: bool,
+    /// 本次成功前经历的重试次数（0 表示首次即成功）
+    pub retries: u32,
+    /// 从进入调用到拿到成功响应头的耗时（毫秒）
+    pub latency_ms: u64,
+}
+
 /// Kiro API Provider
 ///
 /// 核心组件，负责与 Kiro API 通信
@@ -111,12 +131,18 @@ impl KiroProvider {
     /// 发送非流式 API 请求
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
-    pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    pub async fn call_api(
+        &self,
+        request_body: &str,
+    ) -> anyhow::Result<(reqwest::Response, CallMeta)> {
         self.call_api_with_retry(request_body, false).await
     }
 
     /// 发送流式 API 请求
-    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    pub async fn call_api_stream(
+        &self,
+        request_body: &str,
+    ) -> anyhow::Result<(reqwest::Response, CallMeta)> {
         self.call_api_with_retry(request_body, true).await
     }
 
@@ -282,7 +308,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         is_stream: bool,
-    ) -> anyhow::Result<reqwest::Response> {
+    ) -> anyhow::Result<(reqwest::Response, CallMeta)> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -293,6 +319,11 @@ impl KiroProvider {
         let model = Self::extract_model_from_request(request_body);
         // 提取会话标识（conversationId）用于会话亲和性
         let session_id = Self::extract_session_id_from_request(request_body);
+
+        // 用量埋点：记录进入调用的时刻与最后服务的凭据/失败分类
+        let call_started = std::time::Instant::now();
+        let mut last_credential_id: Option<u64> = None;
+        let mut last_outcome = crate::usage::RequestOutcome::OtherError;
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
@@ -338,6 +369,8 @@ impl KiroProvider {
                 .header("Connection", "close");
             let request = endpoint.decorate_api(base, &rctx);
 
+            last_credential_id = Some(ctx.id);
+
             let response = match request.send().await {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -350,6 +383,7 @@ impl KiroProvider {
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
                     last_error = Some(e.into());
+                    last_outcome = crate::usage::RequestOutcome::NetworkError;
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
@@ -362,7 +396,15 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
-                return Ok(response);
+                let meta = CallMeta {
+                    credential_id: ctx.id,
+                    model: model.clone(),
+                    session_id: session_id.clone(),
+                    is_streaming: is_stream,
+                    retries: attempt as u32,
+                    latency_ms: call_started.elapsed().as_millis() as u64,
+                };
+                return Ok((response, meta));
             }
 
             // 失败响应：先从响应头提取 Retry-After（body 消费后头就没了），再读取 body
@@ -383,16 +425,17 @@ impl KiroProvider {
                     body
                 );
 
+                last_outcome = crate::usage::RequestOutcome::QuotaExhausted;
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if !has_available {
-                    anyhow::bail!(
+                    last_error = Some(anyhow::anyhow!(
                         "{} API 请求失败（所有凭据已用尽）: {} {}",
                         api_type,
                         status,
                         body
-                    );
+                    ));
+                    break;
                 }
-
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败: {} {}",
                     api_type,
@@ -412,14 +455,16 @@ impl KiroProvider {
                     status,
                     body
                 );
+                last_outcome = crate::usage::RequestOutcome::AccountSuspended;
                 let has_available = self.token_manager.report_account_suspended(ctx.id);
                 if !has_available {
-                    anyhow::bail!(
+                    last_error = Some(anyhow::anyhow!(
                         "{} API 请求失败（账户被封禁且所有凭据已用尽）: {} {}",
                         api_type,
                         status,
                         body
-                    );
+                    ));
+                    break;
                 }
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败（账户被暂停）: {} {}",
@@ -432,7 +477,14 @@ impl KiroProvider {
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                last_outcome = crate::usage::RequestOutcome::BadRequest;
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败: {} {}",
+                    api_type,
+                    status,
+                    body
+                ));
+                break;
             }
 
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
@@ -458,14 +510,16 @@ impl KiroProvider {
                     self.token_manager.report_auth_cooldown(ctx.id);
                 }
 
+                last_outcome = crate::usage::RequestOutcome::AuthFailed;
                 let has_available = self.token_manager.report_failure(ctx.id);
                 if !has_available {
-                    anyhow::bail!(
+                    last_error = Some(anyhow::anyhow!(
                         "{} API 请求失败（所有凭据已用尽）: {} {}",
                         api_type,
                         status,
                         body
-                    );
+                    ));
+                    break;
                 }
 
                 last_error = Some(anyhow::anyhow!(
@@ -490,11 +544,14 @@ impl KiroProvider {
                 // 429 限流：给该凭据设置短冷却，让调度优先换用其它凭据
                 // （仍不禁用、不计永久失败，冷却到期自动恢复）
                 if status.as_u16() == 429 {
+                    last_outcome = crate::usage::RequestOutcome::RateLimited;
                     // 优先用上游给出的精确重置时间：响应头 Retry-After 优先，其次错误 body
                     let retry_after = retry_after_header
                         .or_else(|| endpoint.extract_retry_after_secs(&body));
                     self.token_manager
                         .report_rate_limited_with_retry_after(ctx.id, retry_after);
+                } else {
+                    last_outcome = crate::usage::RequestOutcome::ServerError;
                 }
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败: {} {}",
@@ -510,7 +567,14 @@ impl KiroProvider {
 
             // 其他 4xx - 通常为请求/配置问题：直接返回，不计入凭据失败
             if status.is_client_error() {
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                last_outcome = crate::usage::RequestOutcome::BadRequest;
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败: {} {}",
+                    api_type,
+                    status,
+                    body
+                ));
+                break;
             }
 
             // 兜底：当作可重试的瞬态错误处理（不切换凭据）
@@ -521,6 +585,7 @@ impl KiroProvider {
                 status,
                 body
             );
+            last_outcome = crate::usage::RequestOutcome::OtherError;
             last_error = Some(anyhow::anyhow!(
                 "{} API 请求失败: {} {}",
                 api_type,
@@ -532,14 +597,27 @@ impl KiroProvider {
             }
         }
 
-        // 所有重试都失败
-        Err(last_error.unwrap_or_else(|| {
+        // 所有重试都失败：埋点一条失败记录后返回错误
+        let final_error = last_error.unwrap_or_else(|| {
             anyhow::anyhow!(
                 "{} API 请求失败：已达到最大重试次数（{}次）",
                 api_type,
                 max_retries
             )
-        }))
+        });
+        let mut fail_record = crate::usage::RequestRecord::new(
+            uuid::Uuid::new_v4().to_string(),
+            model.clone().unwrap_or_default(),
+        );
+        fail_record.credential_id = last_credential_id;
+        fail_record.session_id = session_id.clone();
+        fail_record.is_streaming = is_stream;
+        fail_record.latency_ms = call_started.elapsed().as_millis() as u64;
+        fail_record.outcome = last_outcome;
+        fail_record.error_message = Some(final_error.to_string());
+        crate::usage::emit_record(fail_record);
+
+        Err(final_error)
     }
 
     /// 从请求体中提取模型信息

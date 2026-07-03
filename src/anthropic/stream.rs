@@ -1206,6 +1206,11 @@ impl BufferedStreamContext {
         }
     }
 
+    /// 返回本次请求解析出的最终用量（供用量统计埋点使用）
+    pub fn resolved_usage(&self) -> ResolvedUsage {
+        self.inner.resolved_usage()
+    }
+
     /// 处理 Kiro 事件并缓冲结果
     ///
     /// 复用 StreamContext 的事件处理逻辑，但把结果缓存而不是立即发送。
