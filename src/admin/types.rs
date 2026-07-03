@@ -329,6 +329,12 @@ pub struct ConfigSnapshotResponse {
     /// 回调模式：local（本地端口）/ remote（公网回调）
     pub callback_mode: String,
     pub callback_base_url: Option<String>,
+    // ---- 反代安全（批次3）----
+    pub cors_allowed_origins: Vec<String>,
+    pub ip_allowlist: Vec<String>,
+    pub trust_forwarded_header: bool,
+    pub ingress_rate_limit_per_min: u32,
+    pub max_body_bytes: usize,
     /// 配置文件路径（运行时只读元数据）
     pub config_path: Option<String>,
 }
@@ -362,6 +368,17 @@ pub struct UpdateConfigRequest {
     pub proxy_url: Option<String>,
     /// 网页上号回调基地址；传空字符串表示清除（回退本地模式）
     pub callback_base_url: Option<String>,
+    // ---- 反代安全（批次3，均需重启生效）----
+    /// CORS 允许来源列表（整表替换）
+    pub cors_allowed_origins: Option<Vec<String>>,
+    /// 入口 IP 白名单（CIDR/单 IP，整表替换）
+    pub ip_allowlist: Option<Vec<String>>,
+    /// 是否信任 X-Forwarded-For
+    pub trust_forwarded_header: Option<bool>,
+    /// 入口每-IP 每分钟限流（0=关闭）
+    pub ingress_rate_limit_per_min: Option<u32>,
+    /// 请求体最大字节数
+    pub max_body_bytes: Option<usize>,
 }
 
 /// 更新服务端配置响应

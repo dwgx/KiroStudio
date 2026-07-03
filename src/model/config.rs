@@ -161,6 +161,34 @@ pub struct Config {
     #[serde(default = "default_usage_retention_days")]
     pub usage_retention_days: i64,
 
+    // ============ 反代安全（批次3）============
+    /// CORS 允许来源列表。空 = 允许任意来源（`Access-Control-Allow-Origin: *`，
+    /// 保持向后兼容公开 API 场景）。非空时仅回显命中列表的 Origin，凭据请求也受控。
+    /// 例：`["https://app.example.com", "http://localhost:5173"]`
+    #[serde(default)]
+    pub cors_allowed_origins: Vec<String>,
+
+    /// 入口 IP 白名单（CIDR 或单 IP）。空 = 不限制。命中才放行，否则 403。
+    /// 支持 IPv4/IPv6 CIDR，例：`["127.0.0.1/32", "10.0.0.0/8", "::1/128"]`。
+    /// 客户端 IP 取 TCP 连接对端；若在反代后需按 `trust_forwarded_header` 取 XFF。
+    #[serde(default)]
+    pub ip_allowlist: Vec<String>,
+
+    /// 是否信任 `X-Forwarded-For` / `X-Real-IP` 头来判定客户端 IP（默认 false）。
+    /// **仅当本服务确实部署在可信反代（nginx/traefik）之后才可开启**，
+    /// 否则客户端可伪造该头绕过 IP 白名单与限流。
+    #[serde(default)]
+    pub trust_forwarded_header: bool,
+
+    /// 入口每-IP 限流：每分钟最大请求数。0 = 不限流（默认 0）。
+    /// 固定窗口计数，超限返回 429。与凭据级 `rate_limit_*` 相互独立。
+    #[serde(default)]
+    pub ingress_rate_limit_per_min: u32,
+
+    /// 请求体最大字节数（默认 50MiB）。防止超大 body 打爆内存。
+    #[serde(default = "default_max_body_bytes")]
+    pub max_body_bytes: usize,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -239,6 +267,10 @@ fn default_usage_retention_days() -> i64 {
     30
 }
 
+fn default_max_body_bytes() -> usize {
+    50 * 1024 * 1024
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -273,6 +305,11 @@ impl Default for Config {
             usage_enabled: default_usage_enabled(),
             usage_data_dir: default_usage_data_dir(),
             usage_retention_days: default_usage_retention_days(),
+            cors_allowed_origins: Vec::new(),
+            ip_allowlist: Vec::new(),
+            trust_forwarded_header: false,
+            ingress_rate_limit_per_min: 0,
+            max_body_bytes: default_max_body_bytes(),
             config_path: None,
         }
     }
