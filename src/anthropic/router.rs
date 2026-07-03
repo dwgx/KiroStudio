@@ -9,13 +9,12 @@ use axum::{
 
 use crate::kiro::provider::KiroProvider;
 
+use crate::common::security::build_cors_layer;
+
 use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
-    middleware::{AppState, auth_middleware, cors_layer},
+    middleware::{AppState, auth_middleware},
 };
-
-/// 请求体最大大小限制 (50MB)
-const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 
 /// 创建 Anthropic API 路由
 ///
@@ -38,6 +37,8 @@ pub fn create_router_with_provider(
     api_key: impl Into<String>,
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
+    cors_allowed_origins: &[String],
+    max_body_bytes: usize,
 ) -> Router {
     let mut state = AppState::new(api_key, extract_thinking);
     if let Some(provider) = kiro_provider {
@@ -67,7 +68,7 @@ pub fn create_router_with_provider(
     Router::new()
         .nest("/v1", v1_routes)
         .nest("/cc/v1", cc_v1_routes)
-        .layer(cors_layer())
-        .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
+        .layer(build_cors_layer(cors_allowed_origins))
+        .layer(DefaultBodyLimit::max(max_body_bytes))
         .with_state(state)
 }

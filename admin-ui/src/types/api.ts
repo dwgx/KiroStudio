@@ -135,6 +135,12 @@ export interface ConfigSnapshotResponse {
   hasAdminKey: boolean
   callbackMode: string
   callbackBaseUrl?: string
+  // 反代安全（批次3）
+  corsAllowedOrigins: string[]
+  ipAllowlist: string[]
+  trustForwardedHeader: boolean
+  ingressRateLimitPerMin: number
+  maxBodyBytes: number
   configPath?: string
 }
 
@@ -157,6 +163,12 @@ export interface UpdateConfigRequest {
   affinityEnabled?: boolean
   proxyUrl?: string
   callbackBaseUrl?: string
+  // 反代安全（批次3，整表替换语义）
+  corsAllowedOrigins?: string[]
+  ipAllowlist?: string[]
+  trustForwardedHeader?: boolean
+  ingressRateLimitPerMin?: number
+  maxBodyBytes?: number
 }
 
 // 更新服务端配置响应

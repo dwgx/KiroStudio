@@ -59,20 +59,4 @@ pub async fn auth_middleware(
     }
 }
 
-/// CORS 中间件层
-///
-/// **安全说明**：当前配置允许所有来源（Any），这是为了支持公开 API 服务。
-/// 如果需要更严格的安全控制，请根据实际需求配置具体的允许来源、方法和头信息。
-///
-/// # 配置说明
-/// - `allow_origin(Any)`: 允许任何来源的请求
-/// - `allow_methods(Any)`: 允许任何 HTTP 方法
-/// - `allow_headers(Any)`: 允许任何请求头
-pub fn cors_layer() -> tower_http::cors::CorsLayer {
-    use tower_http::cors::{Any, CorsLayer};
-
-    CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any)
-}
+// CORS 层构建已迁移至 `crate::common::security::build_cors_layer`（支持来源白名单）。

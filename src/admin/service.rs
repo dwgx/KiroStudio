@@ -354,6 +354,11 @@ impl AdminService {
                 .unwrap_or(false),
             callback_mode,
             callback_base_url: config.callback_base_url.clone(),
+            cors_allowed_origins: config.cors_allowed_origins.clone(),
+            ip_allowlist: config.ip_allowlist.clone(),
+            trust_forwarded_header: config.trust_forwarded_header,
+            ingress_rate_limit_per_min: config.ingress_rate_limit_per_min,
+            max_body_bytes: config.max_body_bytes,
             config_path: config
                 .config_path()
                 .map(|p| p.display().to_string()),
@@ -547,6 +552,51 @@ impl AdminService {
             if new_val != config.callback_base_url {
                 config.callback_base_url = new_val;
                 restart_fields.push("callbackBaseUrl".into());
+            }
+        }
+
+        // —— 反代安全（批次3，均需重启生效）——
+        if let Some(v) = req.cors_allowed_origins {
+            // 去空白、去空项，保持整表替换语义
+            let cleaned: Vec<String> =
+                v.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            if cleaned != config.cors_allowed_origins {
+                config.cors_allowed_origins = cleaned;
+                restart_fields.push("corsAllowedOrigins".into());
+            }
+        }
+        if let Some(v) = req.ip_allowlist {
+            let cleaned: Vec<String> =
+                v.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            // 校验每条 CIDR 合法，非法直接拒绝（避免静默丢弃导致白名单形同虚设）
+            for entry in &cleaned {
+                if let Err(e) = crate::common::security::validate_cidr(entry) {
+                    return Err(AdminServiceError::InvalidCredential(format!(
+                        "ipAllowlist 条目 '{entry}' 非法: {e}"
+                    )));
+                }
+            }
+            if cleaned != config.ip_allowlist {
+                config.ip_allowlist = cleaned;
+                restart_fields.push("ipAllowlist".into());
+            }
+        }
+        if let Some(v) = req.trust_forwarded_header {
+            if v != config.trust_forwarded_header {
+                config.trust_forwarded_header = v;
+                restart_fields.push("trustForwardedHeader".into());
+            }
+        }
+        if let Some(v) = req.ingress_rate_limit_per_min {
+            if v != config.ingress_rate_limit_per_min {
+                config.ingress_rate_limit_per_min = v;
+                restart_fields.push("ingressRateLimitPerMin".into());
+            }
+        }
+        if let Some(v) = req.max_body_bytes {
+            if v != config.max_body_bytes {
+                config.max_body_bytes = v;
+                restart_fields.push("maxBodyBytes".into());
             }
         }
 

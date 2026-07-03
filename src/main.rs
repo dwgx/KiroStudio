@@ -180,6 +180,8 @@ async fn main() {
         &api_key,
         Some(kiro_provider),
         config.extract_thinking,
+        &config.cors_allowed_origins,
+        config.max_body_bytes,
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -237,8 +239,44 @@ async fn main() {
         tracing::info!("  GET  /admin");
     }
 
+    // 入口安全层（IP 白名单 + 每-IP 限流）。两者都未配置时不挂载中间件，零开销。
+    let app = match common::security::SecurityState::from_config(
+        &config.ip_allowlist,
+        config.ingress_rate_limit_per_min,
+        config.trust_forwarded_header,
+    ) {
+        Some(sec_state) => {
+            if sec_state.allowlist.is_active() {
+                tracing::info!(
+                    "入口 IP 白名单已启用（{} 条规则）",
+                    config.ip_allowlist.len()
+                );
+            }
+            if sec_state.rate_limiter.is_active() {
+                tracing::info!(
+                    "入口限流已启用：{} 请求/分钟/IP",
+                    config.ingress_rate_limit_per_min
+                );
+            }
+            if config.trust_forwarded_header {
+                tracing::warn!("已信任 X-Forwarded-For：仅当位于可信反代之后才应开启");
+            }
+            app.layer(axum::middleware::from_fn_with_state(
+                sec_state,
+                common::security::security_middleware,
+            ))
+        }
+        None => app,
+    };
+
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    // into_make_service_with_connect_info 让中间件可通过 ConnectInfo 拿到对端 IP
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }
 
 /// 装配用量统计管道：打开 SQLite、构造 JSONL 统计、冷启动重放、启动保留清理任务。
