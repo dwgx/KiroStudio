@@ -23,6 +23,7 @@ mod router;
 mod service;
 mod social_login;
 pub mod types;
+mod usage_handlers;
 
 pub use middleware::AdminState;
 pub use router::create_admin_router;

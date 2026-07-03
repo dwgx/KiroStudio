@@ -18,6 +18,14 @@ use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
 use model::arg::Args;
 use model::config::Config;
+use usage::{TraceDb, UsageStats};
+
+/// admin 查询侧共享的用量 sink 句柄
+#[derive(Clone)]
+pub struct UsageHandles {
+    pub stats: Arc<UsageStats>,
+    pub trace_db: Arc<TraceDb>,
+}
 
 #[tokio::main]
 async fn main() {
@@ -149,6 +157,15 @@ async fn main() {
         config.default_endpoint.clone(),
     );
 
+    // 初始化用量统计管道（可选）：装配 trace_db + usage_stats 两个 sink
+    // 返回给 admin 侧共享的实例句柄（未启用时为 None）
+    let usage_handles = if config.usage_enabled {
+        init_usage_pipeline(&config)
+    } else {
+        tracing::info!("用量统计未启用（usage_enabled=false）");
+        None
+    };
+
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
         api_url: config.count_tokens_api_url.clone(),
@@ -180,7 +197,12 @@ async fn main() {
         } else {
             let admin_service =
                 admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
-            let admin_state = admin::AdminState::new(admin_key, admin_service);
+            let mut admin_state = admin::AdminState::new(admin_key, admin_service);
+            // 注入用量查询句柄（未启用统计时为 None，端点返回 503）
+            if let Some(handles) = &usage_handles {
+                admin_state = admin_state
+                    .with_usage(handles.stats.clone(), handles.trace_db.clone());
+            }
             let admin_app = admin::create_admin_router(admin_state);
 
             // 创建 Admin UI 路由
@@ -217,4 +239,66 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+/// 装配用量统计管道：打开 SQLite、构造 JSONL 统计、冷启动重放、启动保留清理任务。
+///
+/// 任一 sink 初始化失败都不致命——记录告警并退化（返回 None 或跳过该 sink），
+/// 保证统计侧故障绝不阻断主服务启动。
+fn init_usage_pipeline(config: &Config) -> Option<UsageHandles> {
+    use std::path::PathBuf;
+
+    let data_dir = PathBuf::from(&config.usage_data_dir);
+    if let Err(e) = std::fs::create_dir_all(&data_dir) {
+        tracing::error!(
+            "创建用量数据目录失败 {}: {}，用量统计已禁用",
+            data_dir.display(),
+            e
+        );
+        return None;
+    }
+
+    // trace_db：SQLite 明细
+    let trace_db = match TraceDb::open(&data_dir.join("traces.db")) {
+        Ok(db) => Arc::new(db),
+        Err(e) => {
+            tracing::error!("打开用量 SQLite 失败: {:#}，用量统计已禁用", e);
+            return None;
+        }
+    };
+
+    // usage_stats：JSONL + 内存预聚合，冷启动重放最近日志恢复聚合
+    let stats = Arc::new(UsageStats::new(data_dir.clone()));
+    stats.rebuild_from_logs();
+
+    // 注册进异步管道（trait 对象，供 worker 分发）
+    usage::init_pipeline(vec![
+        trace_db.clone() as Arc<dyn usage::UsageSink>,
+        stats.clone() as Arc<dyn usage::UsageSink>,
+    ]);
+
+    // 保留清理任务：启动清理一次 + 每 6 小时清理一次过期明细
+    let retention_days = config.usage_retention_days;
+    let cleanup_db = trace_db.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+        loop {
+            ticker.tick().await;
+            match cleanup_db.retention_cleanup(retention_days) {
+                Ok(n) if n > 0 => tracing::info!("用量明细保留清理：删除 {} 条过期记录", n),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("用量明细保留清理失败: {:#}", e),
+            }
+        }
+    });
+
+    tracing::info!(
+        "用量统计已启用：目录={} 保留={}天",
+        data_dir.display(),
+        retention_days
+    );
+    Some(UsageHandles {
+        stats,
+        trace_db,
+    })
 }

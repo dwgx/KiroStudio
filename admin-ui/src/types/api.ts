@@ -166,3 +166,78 @@ export interface UpdateConfigResponse {
   restartRequired: boolean
   restartFields: string[]
 }
+
+// ============ 用量统计（snake_case，与后端 usage 模块序列化一致）============
+
+// 某个时间窗口的汇总
+export interface WindowSummary {
+  requests: number
+  success: number
+  failure: number
+  success_rate: number
+  input_tokens: number
+  output_tokens: number
+  total_tokens: number
+  credits_used: number
+  avg_latency_ms: number
+}
+
+// 概览：24h / 7d / 30d 三窗口
+export interface UsageOverview {
+  last_24h: WindowSummary
+  last_7d: WindowSummary
+  last_30d: WindowSummary
+}
+
+// 时间序列点
+export interface SeriesPoint {
+  ts_ms: number
+  requests: number
+  success: number
+  failure: number
+  input_tokens: number
+  output_tokens: number
+  credits_used: number
+  avg_latency_ms: number
+}
+
+// 按模型/凭据分组统计
+export interface GroupStat {
+  key: string
+  requests: number
+  success_rate: number
+  input_tokens: number
+  output_tokens: number
+  credits_used: number
+  avg_latency_ms: number
+}
+
+// 请求结果分类
+export type RequestOutcome =
+  | 'success'
+  | 'rate_limited'
+  | 'auth_failed'
+  | 'quota_exhausted'
+  | 'account_suspended'
+  | 'server_error'
+  | 'bad_request'
+  | 'network_error'
+  | 'other_error'
+
+// 单条请求明细
+export interface RequestRecord {
+  request_id: string
+  ts_ms: number
+  credential_id: number | null
+  model: string
+  is_streaming: boolean
+  input_tokens: number
+  output_tokens: number
+  credits_used: number | null
+  latency_ms: number
+  first_token_ms: number | null
+  outcome: RequestOutcome
+  retries: number
+  error_message: string | null
+  session_id: string | null
+}
