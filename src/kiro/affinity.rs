@@ -80,11 +80,15 @@ impl UserAffinityManager {
         map.retain(|_, entry| entry.credential_id != credential_id);
     }
 
-    /// 清理过期条目
-    #[allow(dead_code)]
+    /// 清理过期条目（由后台定时任务周期调用，防止空闲 session 无界堆积）
     pub fn cleanup(&self) {
         let mut map = self.affinity.lock();
         let ttl = self.ttl;
+        let before = map.len();
         map.retain(|_, entry| entry.last_used.elapsed() < ttl);
+        let removed = before - map.len();
+        if removed > 0 {
+            tracing::debug!(removed, remaining = map.len(), "亲和性定时清理");
+        }
     }
 }
