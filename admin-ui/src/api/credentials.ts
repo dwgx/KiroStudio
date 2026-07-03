@@ -11,6 +11,9 @@ import type {
   StartSocialLoginRequest,
   StartSocialLoginResponse,
   PollSocialLoginResponse,
+  StartIdcLoginRequest,
+  StartIdcLoginResponse,
+  PollIdcLoginResponse,
   ConfigSnapshotResponse,
   UpdateConfigRequest,
   UpdateConfigResponse,
@@ -125,6 +128,39 @@ export async function pollSocialLogin(
 ): Promise<PollSocialLoginResponse> {
   const { data } = await api.post<PollSocialLoginResponse>(`/auth/social/poll/${sessionId}`)
   return data
+}
+
+// 发起 IDC 上号（AWS SSO device code flow）
+export async function startIdcLogin(
+  req: StartIdcLoginRequest
+): Promise<StartIdcLoginResponse> {
+  const { data } = await api.post<StartIdcLoginResponse>('/auth/idc/start', {
+    start_url: req.startUrl,
+    region: req.region,
+    priority: req.priority,
+    proxy_url: req.proxyUrl,
+  })
+  // 后端返回 snake_case，前端用 camelCase
+  return {
+    sessionId: (data as any).session_id ?? data.sessionId,
+    verificationUri: (data as any).verification_uri ?? data.verificationUri,
+    verificationUriComplete: (data as any).verification_uri_complete ?? data.verificationUriComplete,
+    userCode: (data as any).user_code ?? data.userCode,
+    expiresIn: (data as any).expires_in ?? data.expiresIn,
+  }
+}
+
+// 轮询 IDC 上号状态
+export async function pollIdcLogin(
+  sessionId: string
+): Promise<PollIdcLoginResponse> {
+  const { data } = await api.post<PollIdcLoginResponse>(`/auth/idc/poll/${sessionId}`)
+  // 后端返回 snake_case
+  return {
+    status: data.status,
+    credentialId: (data as any).credential_id ?? data.credentialId,
+    message: data.message,
+  }
 }
 
 // 获取服务端配置快照（敏感字段脱敏）

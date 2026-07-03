@@ -110,6 +110,29 @@ export interface PollSocialLoginResponse {
   message?: string
 }
 
+// ============ IDC 上号（AWS SSO Device Code）============
+
+export interface StartIdcLoginRequest {
+  startUrl: string
+  region?: string
+  priority?: number
+  proxyUrl?: string
+}
+
+export interface StartIdcLoginResponse {
+  sessionId: string
+  verificationUri: string
+  verificationUriComplete?: string
+  userCode: string
+  expiresIn: number
+}
+
+export interface PollIdcLoginResponse {
+  status: 'pending' | 'done' | 'expired' | 'error'
+  credentialId?: number
+  message?: string
+}
+
 // ============ 服务端配置快照 ============
 
 // 服务端配置（敏感字段已脱敏）
