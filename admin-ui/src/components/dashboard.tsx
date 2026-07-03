@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, LogIn } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, LogIn, Cloud } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -10,6 +10,7 @@ import { CredentialCard } from '@/components/credential-card'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { SocialLoginDialog } from '@/components/social-login-dialog'
+import { IdcLoginDialog } from '@/components/idc-login-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
@@ -29,6 +30,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [socialLoginOpen, setSocialLoginOpen] = useState(false)
+  const [idcLoginOpen, setIdcLoginOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
@@ -716,6 +718,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 <LogIn className="h-4 w-4 mr-2" />
                 网页上号
               </Button>
+              <Button onClick={() => setIdcLoginOpen(true)} size="sm" variant="default">
+                <Cloud className="h-4 w-4 mr-2" />
+                IDC 上号
+              </Button>
               <Button onClick={() => setAddDialogOpen(true)} size="sm" variant="outline">
                 <Plus className="h-4 w-4 mr-2" />
                 添加凭据
@@ -790,6 +796,16 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       <SocialLoginDialog
         open={socialLoginOpen}
         onOpenChange={setSocialLoginOpen}
+        onSuccess={() => {
+          queryClient.invalidateQueries({ queryKey: ['credentials'] })
+          refetch()
+        }}
+      />
+
+      {/* IDC 上号对话框 */}
+      <IdcLoginDialog
+        open={idcLoginOpen}
+        onOpenChange={setIdcLoginOpen}
         onSuccess={() => {
           queryClient.invalidateQueries({ queryKey: ['credentials'] })
           refetch()
