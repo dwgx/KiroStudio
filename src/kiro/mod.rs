@@ -9,4 +9,5 @@ pub mod model;
 pub mod parser;
 pub mod provider;
 pub mod rate_limiter;
+pub mod refresh_loop;
 pub mod token_manager;

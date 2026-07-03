@@ -141,6 +141,10 @@ export interface ConfigSnapshotResponse {
   trustForwardedHeader: boolean
   ingressRateLimitPerMin: number
   maxBodyBytes: number
+  // 主动 token 预刷新（批次4.4）
+  proactiveTokenRefresh: boolean
+  tokenRefreshLeadMinutes: number
+  tokenRefreshIntervalSecs: number
   configPath?: string
 }
 
@@ -169,6 +173,10 @@ export interface UpdateConfigRequest {
   trustForwardedHeader?: boolean
   ingressRateLimitPerMin?: number
   maxBodyBytes?: number
+  // 主动 token 预刷新（批次4.4）
+  proactiveTokenRefresh?: boolean
+  tokenRefreshLeadMinutes?: number
+  tokenRefreshIntervalSecs?: number
 }
 
 // 更新服务端配置响应

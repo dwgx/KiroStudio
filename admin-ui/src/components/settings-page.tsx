@@ -34,6 +34,10 @@ interface FormState {
   trustForwardedHeader: boolean
   ingressRateLimitPerMin: string
   maxBodyBytes: string
+  // 主动 token 预刷新（批次4.4）
+  proactiveTokenRefresh: boolean
+  tokenRefreshLeadMinutes: string
+  tokenRefreshIntervalSecs: string
 }
 
 // 多行文本 <-> 字符串列表（去空白、去空行）
@@ -77,6 +81,9 @@ function toForm(c: ConfigSnapshotResponse): FormState {
     trustForwardedHeader: c.trustForwardedHeader,
     ingressRateLimitPerMin: String(c.ingressRateLimitPerMin),
     maxBodyBytes: String(c.maxBodyBytes),
+    proactiveTokenRefresh: c.proactiveTokenRefresh,
+    tokenRefreshLeadMinutes: String(c.tokenRefreshLeadMinutes),
+    tokenRefreshIntervalSecs: String(c.tokenRefreshIntervalSecs),
   }
 }
 
@@ -150,6 +157,12 @@ export function SettingsPage() {
     if (Number.isFinite(ingress) && ingress !== config.ingressRateLimitPerMin) d.ingressRateLimitPerMin = ingress
     const maxBody = Number(form.maxBodyBytes)
     if (Number.isFinite(maxBody) && maxBody !== config.maxBodyBytes) d.maxBodyBytes = maxBody
+    // 主动 token 预刷新
+    if (form.proactiveTokenRefresh !== config.proactiveTokenRefresh) d.proactiveTokenRefresh = form.proactiveTokenRefresh
+    const lead = Number(form.tokenRefreshLeadMinutes)
+    if (Number.isFinite(lead) && lead !== config.tokenRefreshLeadMinutes) d.tokenRefreshLeadMinutes = lead
+    const interval2 = Number(form.tokenRefreshIntervalSecs)
+    if (Number.isFinite(interval2) && interval2 !== config.tokenRefreshIntervalSecs) d.tokenRefreshIntervalSecs = interval2
     return d
   }, [config, form])
 
@@ -383,6 +396,24 @@ export function SettingsPage() {
           </Field>
           <Field label="请求体上限 (字节)" hint="默认 52428800（50MiB）。超限返回 413（需重启生效）">
             <Input className={inputCls} type="number" value={form.maxBodyBytes} onChange={(e) => set('maxBodyBytes', e.target.value)} />
+          </Field>
+        </CardContent>
+      </Card>
+
+      {/* 主动 token 预刷新（需重启） */}
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="text-base">主动 token 预刷新</CardTitle>
+        </CardHeader>
+        <CardContent className="py-0">
+          <Field label="启用预刷新" hint="后台提前刷新将过期的 token，把刷新移出请求热路径、削掉突发（需重启生效）">
+            <Switch checked={form.proactiveTokenRefresh} onCheckedChange={(v) => set('proactiveTokenRefresh', v)} />
+          </Field>
+          <Field label="提前量 (分钟)" hint="token 剩余有效期低于此值即后台刷新（需重启生效）">
+            <Input className={inputCls} type="number" value={form.tokenRefreshLeadMinutes} onChange={(e) => set('tokenRefreshLeadMinutes', e.target.value)} disabled={!form.proactiveTokenRefresh} />
+          </Field>
+          <Field label="扫描间隔 (秒)" hint="后台扫描周期，最小 5 秒（需重启生效）">
+            <Input className={inputCls} type="number" value={form.tokenRefreshIntervalSecs} onChange={(e) => set('tokenRefreshIntervalSecs', e.target.value)} disabled={!form.proactiveTokenRefresh} />
           </Field>
         </CardContent>
       </Card>

@@ -150,6 +150,19 @@ async fn main() {
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
+
+    // 主动 token 预刷新（批次4.4）：后台提前刷将过期的 token，把刷新移出请求热路径。
+    // 仅对可刷新凭据生效；未启用则退回请求时按需刷新。
+    if config.proactive_token_refresh {
+        kiro::refresh_loop::spawn(
+            token_manager.clone(),
+            config.token_refresh_lead_minutes,
+            config.token_refresh_interval_secs,
+        );
+    } else {
+        tracing::info!("主动 token 预刷新未启用（proactive_token_refresh=false）");
+    }
+
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),

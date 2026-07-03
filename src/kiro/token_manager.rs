@@ -2045,6 +2045,22 @@ impl MultiTokenManager {
     ///
     /// 无条件调用上游 API 重新获取 access token，不检查是否过期。
     /// 适用于排查问题、Token 异常但未过期、主动更新凭据状态等场景。
+    /// 列出需要「主动预刷新」的凭据 id（批次4.4）。
+    ///
+    /// 判据：未禁用 + 非 API Key（API Key 无需刷新）+ 有 refresh_token +
+    /// token 将在 `lead_minutes` 分钟内过期。返回的 id 交由后台 loop 逐个刷新。
+    pub fn credentials_due_for_refresh(&self, lead_minutes: i64) -> Vec<u64> {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .filter(|e| !e.disabled)
+            .filter(|e| !e.credentials.is_api_key_credential())
+            .filter(|e| e.credentials.refresh_token.is_some())
+            .filter(|e| is_token_expiring_within(&e.credentials, lead_minutes).unwrap_or(false))
+            .map(|e| e.id)
+            .collect()
+    }
+
     pub async fn force_refresh_token_for(&self, id: u64) -> anyhow::Result<()> {
         let credentials = {
             let entries = self.entries.lock();
@@ -2210,6 +2226,40 @@ mod tests {
             result,
             "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
         );
+    }
+
+    #[test]
+    fn test_credentials_due_for_refresh_selects_expiring_only() {
+        // 长度 >=100 的假 refresh_token，绕过 validate_refresh_token 截断判据
+        let rt = "r".repeat(120);
+
+        // #1 即将过期（8 分钟）→ 应入选
+        let mut expiring = KiroCredentials::default();
+        expiring.refresh_token = Some(rt.clone());
+        expiring.expires_at = Some((Utc::now() + Duration::minutes(8)).to_rfc3339());
+
+        // #2 仍充裕（1 小时）→ 不入选
+        let mut fresh = KiroCredentials::default();
+        fresh.refresh_token = Some(rt.clone());
+        fresh.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        // #3 API Key 凭据 → 永不入选
+        let mut api_key = KiroCredentials::default();
+        api_key.kiro_api_key = Some("ksk_test_key_123".to_string());
+        api_key.auth_method = Some("api_key".to_string());
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![expiring, fresh, api_key],
+            None,
+            None,
+            true,
+        )
+        .expect("构造 manager");
+
+        let due = manager.credentials_due_for_refresh(10);
+        // 仅 #1（id 从 1 起分配）
+        assert_eq!(due, vec![1], "只应选中将在 10 分钟内过期的可刷新凭据");
     }
 
     #[tokio::test]

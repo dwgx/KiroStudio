@@ -189,6 +189,20 @@ pub struct Config {
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
 
+    // ============ 主动 token 预刷新（批次4.4）============
+    /// 是否启用后台主动预刷新：在 token 过期前后台刷新，削掉首个请求的刷新延迟与突发。
+    /// 默认 true。关闭后退回原有「请求时按需刷新」行为。
+    #[serde(default = "default_true")]
+    pub proactive_token_refresh: bool,
+
+    /// 预刷新提前量（分钟）：token 剩余有效期低于此值即后台刷新（默认 10）。
+    #[serde(default = "default_refresh_lead_minutes")]
+    pub token_refresh_lead_minutes: i64,
+
+    /// 后台预刷新扫描间隔（秒，默认 60）。
+    #[serde(default = "default_refresh_interval_secs")]
+    pub token_refresh_interval_secs: u64,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -271,6 +285,18 @@ fn default_max_body_bytes() -> usize {
     50 * 1024 * 1024
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_refresh_lead_minutes() -> i64 {
+    10
+}
+
+fn default_refresh_interval_secs() -> u64 {
+    60
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -310,6 +336,9 @@ impl Default for Config {
             trust_forwarded_header: false,
             ingress_rate_limit_per_min: 0,
             max_body_bytes: default_max_body_bytes(),
+            proactive_token_refresh: default_true(),
+            token_refresh_lead_minutes: default_refresh_lead_minutes(),
+            token_refresh_interval_secs: default_refresh_interval_secs(),
             config_path: None,
         }
     }
