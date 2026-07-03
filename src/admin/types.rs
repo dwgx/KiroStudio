@@ -335,6 +335,10 @@ pub struct ConfigSnapshotResponse {
     pub trust_forwarded_header: bool,
     pub ingress_rate_limit_per_min: u32,
     pub max_body_bytes: usize,
+    // ---- 主动 token 预刷新（批次4.4）----
+    pub proactive_token_refresh: bool,
+    pub token_refresh_lead_minutes: i64,
+    pub token_refresh_interval_secs: u64,
     /// 配置文件路径（运行时只读元数据）
     pub config_path: Option<String>,
 }
@@ -379,6 +383,10 @@ pub struct UpdateConfigRequest {
     pub ingress_rate_limit_per_min: Option<u32>,
     /// 请求体最大字节数
     pub max_body_bytes: Option<usize>,
+    // ---- 主动 token 预刷新（批次4.4，需重启生效）----
+    pub proactive_token_refresh: Option<bool>,
+    pub token_refresh_lead_minutes: Option<i64>,
+    pub token_refresh_interval_secs: Option<u64>,
 }
 
 /// 更新服务端配置响应
