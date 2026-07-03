@@ -9,6 +9,30 @@ use uuid::Uuid;
 
 use crate::kiro::model::events::Event;
 
+/// Prompt 缓存记账明细（由 [`crate::anthropic::cache_tracker`] 推算，注入响应 usage）
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CacheUsageBreakdown {
+    pub cache_creation_input_tokens: i32,
+    pub cache_read_input_tokens: i32,
+    pub cache_creation_5m_input_tokens: i32,
+    pub cache_creation_1h_input_tokens: i32,
+}
+
+/// 将总输入 token 转为 Anthropic usage 的 input_tokens 口径（剔除 cache 读写）
+///
+/// Anthropic 语义：`usage.input_tokens` 只计「未命中缓存、非本次新建缓存」的部分，
+/// cache_read / cache_creation 单独列出。
+pub(crate) fn billed_input_tokens(
+    input_tokens: i32,
+    cache_creation_input_tokens: i32,
+    cache_read_input_tokens: i32,
+) -> i32 {
+    input_tokens
+        .saturating_sub(cache_creation_input_tokens)
+        .saturating_sub(cache_read_input_tokens)
+        .max(0)
+}
+
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
 /// UTF-8字符可能占用1-4个字节，直接按字节位置切片可能会切在多字节字符中间导致panic。
@@ -454,10 +478,14 @@ impl SseStateManager {
     }
 
     /// 生成最终事件序列
+    ///
+    /// `input_tokens` 已是 billed 口径（剔除 cache 读写）；`cache_usage` 存在时
+    /// 额外注入 cache_read / cache_creation 字段。
     pub fn generate_final_events(
         &mut self,
         input_tokens: i32,
         output_tokens: i32,
+        cache_usage: Option<CacheUsageBreakdown>,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
@@ -478,6 +506,20 @@ impl SseStateManager {
         // 发送 message_delta
         if !self.message_delta_sent {
             self.message_delta_sent = true;
+            let mut usage_json = json!({
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens
+            });
+            if let Some(cache_usage) = cache_usage {
+                usage_json["cache_creation_input_tokens"] =
+                    json!(cache_usage.cache_creation_input_tokens);
+                usage_json["cache_read_input_tokens"] =
+                    json!(cache_usage.cache_read_input_tokens);
+                usage_json["cache_creation"] = json!({
+                    "ephemeral_5m_input_tokens": cache_usage.cache_creation_5m_input_tokens,
+                    "ephemeral_1h_input_tokens": cache_usage.cache_creation_1h_input_tokens
+                });
+            }
             events.push(SseEvent::new(
                 "message_delta",
                 json!({
@@ -486,10 +528,7 @@ impl SseStateManager {
                         "stop_reason": self.get_stop_reason(),
                         "stop_sequence": null
                     },
-                    "usage": {
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens
-                    }
+                    "usage": usage_json
                 }),
             ));
         }
@@ -528,8 +567,10 @@ pub struct StreamContext {
     pub model: String,
     /// 消息 ID
     pub message_id: String,
-    /// 输入 tokens（估算值）
+    /// 输入 tokens（估算值，未剔除 cache）
     pub input_tokens: i32,
+    /// prompt 缓存记账明细（可选，注入响应 usage）
+    pub cache_usage: Option<CacheUsageBreakdown>,
     /// 从 contextUsageEvent 计算的实际输入 tokens
     pub context_input_tokens: Option<i32>,
     /// 输出 tokens 累计
@@ -570,6 +611,7 @@ impl StreamContext {
             model: model.into(),
             message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
             input_tokens,
+            cache_usage: None,
             context_input_tokens: None,
             output_tokens: 0,
             credits_used: None,
@@ -585,8 +627,34 @@ impl StreamContext {
         }
     }
 
+    /// 设置 prompt 缓存记账明细（在生成初始事件前调用）
+    pub fn set_cache_usage(&mut self, cache_usage: Option<CacheUsageBreakdown>) {
+        self.cache_usage = cache_usage;
+    }
+
     /// 生成 message_start 事件
+    ///
+    /// `input_tokens` 采用 billed 口径（剔除 cache 读写），并在有缓存记账时
+    /// 注入 cache_read / cache_creation 字段。
     pub fn create_message_start_event(&self) -> serde_json::Value {
+        let billed = self
+            .cache_usage
+            .map(|c| {
+                billed_input_tokens(
+                    self.input_tokens,
+                    c.cache_creation_input_tokens,
+                    c.cache_read_input_tokens,
+                )
+            })
+            .unwrap_or(self.input_tokens);
+        let mut usage = json!({
+            "input_tokens": billed,
+            "output_tokens": 1
+        });
+        if let Some(c) = self.cache_usage {
+            usage["cache_creation_input_tokens"] = json!(c.cache_creation_input_tokens);
+            usage["cache_read_input_tokens"] = json!(c.cache_read_input_tokens);
+        }
         json!({
             "type": "message_start",
             "message": {
@@ -597,10 +665,7 @@ impl StreamContext {
                 "model": self.model,
                 "stop_reason": null,
                 "stop_sequence": null,
-                "usage": {
-                    "input_tokens": self.input_tokens,
-                    "output_tokens": 1
-                }
+                "usage": usage
             }
         })
     }
@@ -1157,12 +1222,24 @@ impl StreamContext {
 
         // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
         let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
+        // 剔除 cache 读写，得到 Anthropic usage 的 input_tokens 口径
+        let billed = self
+            .cache_usage
+            .map(|c| {
+                billed_input_tokens(
+                    final_input_tokens,
+                    c.cache_creation_input_tokens,
+                    c.cache_read_input_tokens,
+                )
+            })
+            .unwrap_or(final_input_tokens);
 
         // 生成最终事件
-        events.extend(
-            self.state_manager
-                .generate_final_events(final_input_tokens, self.output_tokens),
-        );
+        events.extend(self.state_manager.generate_final_events(
+            billed,
+            self.output_tokens,
+            self.cache_usage,
+        ));
         events
     }
 }
@@ -1211,6 +1288,11 @@ impl BufferedStreamContext {
         self.inner.resolved_usage()
     }
 
+    /// 设置 prompt 缓存记账明细（在处理事件前调用）
+    pub fn set_cache_usage(&mut self, cache_usage: Option<CacheUsageBreakdown>) {
+        self.inner.set_cache_usage(cache_usage);
+    }
+
     /// 处理 Kiro 事件并缓冲结果
     ///
     /// 复用 StreamContext 的事件处理逻辑，但把结果缓存而不是立即发送。
@@ -1250,13 +1332,30 @@ impl BufferedStreamContext {
             .inner
             .context_input_tokens
             .unwrap_or(self.estimated_input_tokens);
+        // 剔除 cache 读写得到 billed 口径（与 message_delta 保持一致）
+        let cache_usage = self.inner.cache_usage;
+        let billed = cache_usage
+            .map(|c| {
+                billed_input_tokens(
+                    final_input_tokens,
+                    c.cache_creation_input_tokens,
+                    c.cache_read_input_tokens,
+                )
+            })
+            .unwrap_or(final_input_tokens);
 
-        // 更正 message_start 事件中的 input_tokens
+        // 更正 message_start 事件中的 input_tokens（并补齐 cache 字段）
         for event in &mut self.event_buffer {
             if event.event == "message_start" {
                 if let Some(message) = event.data.get_mut("message") {
                     if let Some(usage) = message.get_mut("usage") {
-                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
+                        usage["input_tokens"] = serde_json::json!(billed);
+                        if let Some(c) = cache_usage {
+                            usage["cache_creation_input_tokens"] =
+                                serde_json::json!(c.cache_creation_input_tokens);
+                            usage["cache_read_input_tokens"] =
+                                serde_json::json!(c.cache_read_input_tokens);
+                        }
                     }
                 }
             }

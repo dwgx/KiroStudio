@@ -37,10 +37,17 @@ pub fn create_router_with_provider(
     api_key: impl Into<String>,
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
+    prompt_cache_enabled: bool,
+    prompt_cache_ttl_seconds: u64,
     cors_allowed_origins: &[String],
     max_body_bytes: usize,
 ) -> Router {
-    let mut state = AppState::new(api_key, extract_thinking);
+    let mut state = AppState::with_prompt_cache(
+        api_key,
+        extract_thinking,
+        prompt_cache_enabled,
+        prompt_cache_ttl_seconds,
+    );
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }

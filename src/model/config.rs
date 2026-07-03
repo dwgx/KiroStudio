@@ -138,6 +138,19 @@ pub struct Config {
     #[serde(default = "default_affinity_enabled")]
     pub affinity_enabled: bool,
 
+    /// 是否启用 prompt 缓存记账（默认 true）
+    ///
+    /// Kiro 上游不回传 Anthropic 的 cache_read / cache_creation 记账字段。
+    /// 开启后，网关侧维护本地影子缓存表，按凭据推算并注入这些字段，
+    /// 让下游客户端（Claude Code 等）能显示缓存命中情况。
+    /// 这是估算展示，非真实计费（真实计费以 meteringEvent 为准）。
+    #[serde(default = "default_prompt_cache_enabled")]
+    pub prompt_cache_enabled: bool,
+
+    /// prompt 缓存记账的最大 TTL 秒数（默认 3600，支持 5m/1h 断点）
+    #[serde(default = "default_prompt_cache_ttl_seconds")]
+    pub prompt_cache_ttl_seconds: u64,
+
     /// 网页上号回调基地址（可选）
     ///
     /// - 不配置：本地回调模式，后端在本机临时端口接收 OAuth 回调（仅本机浏览器可达）。
@@ -269,6 +282,14 @@ fn default_rate_limit_min_interval_ms() -> u64 {
     1000
 }
 
+fn default_prompt_cache_enabled() -> bool {
+    true
+}
+
+fn default_prompt_cache_ttl_seconds() -> u64 {
+    3600
+}
+
 fn default_usage_enabled() -> bool {
     true
 }
@@ -327,6 +348,8 @@ impl Default for Config {
             rate_limit_daily_max: default_rate_limit_daily(),
             rate_limit_min_interval_ms: default_rate_limit_min_interval_ms(),
             affinity_enabled: default_affinity_enabled(),
+            prompt_cache_enabled: default_prompt_cache_enabled(),
+            prompt_cache_ttl_seconds: default_prompt_cache_ttl_seconds(),
             callback_base_url: None,
             usage_enabled: default_usage_enabled(),
             usage_data_dir: default_usage_data_dir(),

@@ -208,6 +208,8 @@ async fn main() {
         &api_key,
         Some(kiro_provider),
         config.extract_thinking,
+        config.prompt_cache_enabled,
+        config.prompt_cache_ttl_seconds,
         &config.cors_allowed_origins,
         config.max_body_bytes,
     );
