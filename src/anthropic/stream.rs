@@ -510,6 +510,17 @@ impl SseStateManager {
 use super::converter::get_context_window_size;
 
 /// 流处理上下文
+/// 一次请求解析出的最终用量快照（供用量统计埋点消费）
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedUsage {
+    /// 输入 tokens（优先精确值，回退估算）
+    pub input_tokens: i32,
+    /// 输出 tokens
+    pub output_tokens: i32,
+    /// 上游返回的真实 credit 消耗量（无 meteringEvent 时为 None）
+    pub credits_used: Option<f64>,
+}
+
 pub struct StreamContext {
     /// SSE 状态管理器
     pub state_manager: SseStateManager,
@@ -523,6 +534,8 @@ pub struct StreamContext {
     pub context_input_tokens: Option<i32>,
     /// 输出 tokens 累计
     pub output_tokens: i32,
+    /// 从 meteringEvent 解析的真实 credit 消耗量（上游给出，token 估算无法替代）
+    pub credits_used: Option<f64>,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
@@ -559,6 +572,7 @@ impl StreamContext {
             input_tokens,
             context_input_tokens: None,
             output_tokens: 0,
+            credits_used: None,
             tool_block_indices: HashMap::new(),
             tool_name_map,
             thinking_enabled,
@@ -661,6 +675,17 @@ impl StreamContext {
                 tracing::error!("收到错误事件: {} - {}", error_code, error_message);
                 Vec::new()
             }
+            Event::Metering(metering) => {
+                // 记录上游返回的真实 credit 消耗量（累加，兼容单请求多次计费事件）
+                self.credits_used =
+                    Some(self.credits_used.unwrap_or(0.0) + metering.usage);
+                tracing::debug!(
+                    "收到 meteringEvent: {} {}",
+                    metering.usage,
+                    metering.unit
+                );
+                Vec::new()
+            }
             Event::Exception {
                 exception_type,
                 message,
@@ -673,6 +698,19 @@ impl StreamContext {
                 Vec::new()
             }
             _ => Vec::new(),
+        }
+    }
+
+    /// 返回本次请求已解析出的最终用量（供统计埋点使用）
+    ///
+    /// - `input_tokens` 优先用 contextUsageEvent 计算的精确值，回退到估算
+    /// - `output_tokens` 为流式累计
+    /// - `credits_used` 为 meteringEvent 的真实计费量（可能为 None）
+    pub fn resolved_usage(&self) -> ResolvedUsage {
+        ResolvedUsage {
+            input_tokens: self.context_input_tokens.unwrap_or(self.input_tokens),
+            output_tokens: self.output_tokens,
+            credits_used: self.credits_used,
         }
     }
 
