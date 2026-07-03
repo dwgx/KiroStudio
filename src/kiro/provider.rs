@@ -195,8 +195,7 @@ impl KiroProvider {
                 .client_for(&ctx.credentials)?
                 .post(&url)
                 .body(body)
-                .header("content-type", "application/json")
-                .header("Connection", "close");
+                .header("content-type", "application/json");
             let request = endpoint.decorate_mcp(base, &rctx);
 
             let response = match request.send().await {
@@ -365,8 +364,7 @@ impl KiroProvider {
                 .client_for(&ctx.credentials)?
                 .post(&url)
                 .body(body)
-                .header("content-type", "application/json")
-                .header("Connection", "close");
+                .header("content-type", "application/json");
             let request = endpoint.decorate_api(base, &rctx);
 
             last_credential_id = Some(ctx.id);
