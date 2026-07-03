@@ -18,6 +18,7 @@
 
 mod error;
 mod handlers;
+mod idc_login;
 mod middleware;
 mod router;
 mod service;

@@ -12,8 +12,10 @@ use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 
 use super::error::AdminServiceError;
+use super::idc_login::IdcLoginManager;
 use super::social_login::SocialLoginManager;
 pub use super::social_login::{PollResult, StartResult};
+use super::idc_login::{IdcPollResult, IdcStartResult};
 use crate::kiro::auth::social::OAuthCallbackData;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, ConfigSnapshotResponse,
@@ -44,6 +46,8 @@ pub struct AdminService {
     known_endpoints: HashSet<String>,
     /// 网页上号会话管理器
     social_login: SocialLoginManager,
+    /// IDC 上号会话管理器
+    idc_login: IdcLoginManager,
 }
 
 impl AdminService {
@@ -59,6 +63,7 @@ impl AdminService {
 
         Self {
             social_login: SocialLoginManager::new(token_manager.clone()),
+            idc_login: IdcLoginManager::new(token_manager.clone()),
             token_manager,
             balance_cache: Mutex::new(balance_cache),
             cache_path,
@@ -85,6 +90,25 @@ impl AdminService {
     /// 远程模式：公网回调路由投递 OAuth 回调
     pub fn deliver_social_callback(&self, data: OAuthCallbackData) -> bool {
         self.social_login.deliver_callback(data)
+    }
+
+    /// 发起 IDC (AWS SSO) 上号
+    pub async fn start_idc_login(
+        &self,
+        start_url: &str,
+        region: &str,
+        priority: u32,
+        proxy_url: Option<String>,
+    ) -> Result<IdcStartResult, AdminServiceError> {
+        self.idc_login
+            .start(start_url, region, priority, proxy_url)
+            .await
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))
+    }
+
+    /// 轮询 IDC 上号会话
+    pub async fn poll_idc_login(&self, session_id: &str) -> IdcPollResult {
+        self.idc_login.poll(session_id).await
     }
 
     /// 获取所有凭据状态
