@@ -21,11 +21,46 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
+use super::cache_tracker::{CacheProfile, CacheTracker};
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
-use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
+use super::stream::{BufferedStreamContext, CacheUsageBreakdown, SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
 use super::websearch;
+
+/// prompt 缓存记账所需的上下文（跟踪器 + 本次请求的缓存画像）
+///
+/// 在调用上游前构建 profile，上游返回真实 `credential_id` 后再 compute + update。
+struct CacheAccounting {
+    tracker: std::sync::Arc<CacheTracker>,
+    profile: CacheProfile,
+}
+
+impl CacheAccounting {
+    /// 若启用了 prompt 缓存记账，则基于请求构建本次缓存画像
+    fn build(state: &AppState, payload: &MessagesRequest, total_input_tokens: i32) -> Option<Self> {
+        if !state.prompt_cache_enabled {
+            return None;
+        }
+        let profile = state.cache_tracker.build_profile(payload, total_input_tokens);
+        Some(Self {
+            tracker: state.cache_tracker.clone(),
+            profile,
+        })
+    }
+
+    /// 上游返回后：按真实 credential_id 推算缓存记账并写回缓存表
+    fn resolve(&self, credential_id: u64) -> CacheUsageBreakdown {
+        let result = self.tracker.compute(credential_id, &self.profile);
+        self.tracker.update(credential_id, &self.profile);
+        CacheUsageBreakdown {
+            cache_creation_input_tokens: result.cache_creation_input_tokens,
+            cache_read_input_tokens: result.cache_read_input_tokens,
+            cache_creation_5m_input_tokens: result.cache_creation_5m_input_tokens,
+            cache_creation_1h_input_tokens: result.cache_creation_1h_input_tokens,
+        }
+    }
+}
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
@@ -308,6 +343,9 @@ pub async fn post_messages(
         payload.tools.as_deref(),
     ) as i32;
 
+    // 构建 prompt 缓存画像（只读借用 payload，需在其被消费前）
+    let cache_accounting = CacheAccounting::build(&state, &payload, input_tokens);
+
     // 检查是否启用了thinking
     let thinking_enabled = payload
         .thinking
@@ -326,12 +364,13 @@ pub async fn post_messages(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            cache_accounting,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, cache_accounting).await
     }
 }
 
@@ -343,6 +382,7 @@ async fn handle_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    cache_accounting: Option<CacheAccounting>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let (response, meta) = match provider.call_api_stream(request_body).await {
@@ -350,8 +390,12 @@ async fn handle_stream_request(
         Err(e) => return map_provider_error(e),
     };
 
+    // 按真实命中的 credential_id 推算缓存记账
+    let cache_usage = cache_accounting.map(|acc| acc.resolve(meta.credential_id));
+
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    ctx.set_cache_usage(cache_usage);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -501,12 +545,16 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    cache_accounting: Option<CacheAccounting>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let (response, meta) = match provider.call_api(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
+
+    // 按真实命中的 credential_id 推算缓存记账
+    let cache_usage = cache_accounting.map(|acc| acc.resolve(meta.credential_id));
 
     // 读取响应体
     let body_bytes = match response.bytes().await {
@@ -665,6 +713,17 @@ async fn handle_non_stream_request(
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
     let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
 
+    // 剔除 cache 读写得到 billed 口径（仅用于回给下游客户端的响应；内部用量埋点仍用总量）
+    let billed_input_tokens = cache_usage
+        .map(|c| {
+            super::stream::billed_input_tokens(
+                final_input_tokens,
+                c.cache_creation_input_tokens,
+                c.cache_read_input_tokens,
+            )
+        })
+        .unwrap_or(final_input_tokens);
+
     // 用量埋点：非流式成功记录
     {
         let mut record = crate::usage::RequestRecord::new(
@@ -683,6 +742,20 @@ async fn handle_non_stream_request(
         crate::usage::emit_record(record);
     }
 
+    // 构建 usage（有缓存记账时补齐 cache 字段）
+    let mut usage = json!({
+        "input_tokens": billed_input_tokens,
+        "output_tokens": output_tokens
+    });
+    if let Some(c) = cache_usage {
+        usage["cache_creation_input_tokens"] = json!(c.cache_creation_input_tokens);
+        usage["cache_read_input_tokens"] = json!(c.cache_read_input_tokens);
+        usage["cache_creation"] = json!({
+            "ephemeral_5m_input_tokens": c.cache_creation_5m_input_tokens,
+            "ephemeral_1h_input_tokens": c.cache_creation_1h_input_tokens
+        });
+    }
+
     // 构建 Anthropic 响应
     let response_body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
@@ -692,10 +765,7 @@ async fn handle_non_stream_request(
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": {
-            "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens
-        }
+        "usage": usage
     });
 
     (StatusCode::OK, Json(response_body)).into_response()
@@ -866,6 +936,9 @@ pub async fn post_messages_cc(
         payload.tools.as_deref(),
     ) as i32;
 
+    // 构建 prompt 缓存画像（只读借用 payload，需在其被消费前）
+    let cache_accounting = CacheAccounting::build(&state, &payload, input_tokens);
+
     // 检查是否启用了thinking
     let thinking_enabled = payload
         .thinking
@@ -884,12 +957,13 @@ pub async fn post_messages_cc(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            cache_accounting,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, cache_accounting).await
     }
 }
 
@@ -904,6 +978,7 @@ async fn handle_stream_request_buffered(
     estimated_input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    cache_accounting: Option<CacheAccounting>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let (response, meta) = match provider.call_api_stream(request_body).await {
@@ -911,8 +986,12 @@ async fn handle_stream_request_buffered(
         Err(e) => return map_provider_error(e),
     };
 
+    // 按真实命中的 credential_id 推算缓存记账
+    let cache_usage = cache_accounting.map(|acc| acc.resolve(meta.credential_id));
+
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    let mut ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    ctx.set_cache_usage(cache_usage);
 
     // 创建缓冲 SSE 流（流结束时用 meta + 最终 usage 埋点）
     let stream = create_buffered_sse_stream(response, ctx, meta);

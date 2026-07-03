@@ -224,6 +224,51 @@ fn count_all_tokens_local(
     total.max(1)
 }
 
+/// 单个工具定义的估算 token 成本（与本地 count_all_tokens 的工具估算口径解耦，
+/// 供缓存记账按块累计使用）
+pub(crate) const TOKENS_PER_TOOL: u64 = 150;
+
+/// 计算系统消息的 tokens（缓存记账用，仅计文本）
+pub(crate) fn count_system_message_tokens(message: &SystemMessage) -> u64 {
+    count_tokens(&message.text)
+}
+
+/// 计算工具定义的 tokens（缓存记账用，固定成本估算）
+pub(crate) fn count_tool_definition_tokens(_tool: &Tool) -> u64 {
+    TOKENS_PER_TOOL
+}
+
+/// 计算消息内容块的 tokens（缓存记账用）
+///
+/// 递归处理 string / array / object 三种形态；object 走 [`estimate_content_block_tokens`]。
+pub(crate) fn count_message_content_tokens(value: &serde_json::Value) -> u64 {
+    match value {
+        serde_json::Value::Null => 0,
+        serde_json::Value::String(s) => count_tokens(s),
+        serde_json::Value::Array(arr) => arr.iter().map(count_message_content_tokens).sum(),
+        serde_json::Value::Object(obj) => estimate_content_block_tokens(obj),
+        _ => 0,
+    }
+}
+
+/// 估算单个内容块对象的 tokens：按 text / thinking / input / content 优先级取值
+fn estimate_content_block_tokens(obj: &serde_json::Map<String, serde_json::Value>) -> u64 {
+    if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
+        return count_tokens(text);
+    }
+    if let Some(thinking) = obj.get("thinking").and_then(|v| v.as_str()) {
+        return count_tokens(thinking);
+    }
+    if let Some(input) = obj.get("input") {
+        let json = serde_json::to_string(input).unwrap_or_default();
+        return count_tokens(&json);
+    }
+    if let Some(content) = obj.get("content") {
+        return count_message_content_tokens(content);
+    }
+    0
+}
+
 /// 估算输出 tokens
 pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
     let mut total = 0;

@@ -151,6 +151,8 @@ where
         {
             Ok(Some(vec![SystemMessage {
                 text: value.to_string(),
+                block_type: None,
+                cache_control: None,
             }]))
         }
 
@@ -195,10 +197,33 @@ pub struct Message {
     pub content: serde_json::Value,
 }
 
+/// 缓存控制（Anthropic prompt caching）
+///
+/// 客户端在 system 块 / tool / message content 块上通过 `cache_control` 声明缓存断点。
+/// 网关据此做本地影子缓存记账（见 [`super::cache_tracker`]），推算 cache_read /
+/// cache_creation 注入回响应 usage。
+///
+/// **注意**：此字段仅供网关内部记账，绝不透传给 Kiro 上游——上游请求体由
+/// `converter` 独立按字段重建（见 `converter::convert_tools` / 系统块拼接），
+/// 不序列化整个 `MessagesRequest`，故加此字段不影响发往上游的报文。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CacheControl {
+    #[serde(rename = "type")]
+    pub cache_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
+}
+
 /// 系统消息
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SystemMessage {
     pub text: String,
+    /// 块类型（如 "text"），Anthropic 数组格式 system 块携带
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub block_type: Option<String>,
+    /// 缓存断点声明（仅供网关本地缓存记账，不透传上游）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 /// 工具定义
@@ -223,6 +248,9 @@ pub struct Tool {
     /// 最大使用次数（仅 WebSearch 工具）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_uses: Option<i32>,
+    /// 缓存断点声明（仅供网关本地缓存记账，不透传上游）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 /// 内容块
