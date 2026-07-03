@@ -89,6 +89,13 @@ pub(crate) fn validate_refresh_token(credentials: &KiroCredentials) -> anyhow::R
     Ok(())
 }
 
+/// 持锁刷新的结果：真正刷新了，还是因二次检查发现无需刷新而跳过。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshOutcome {
+    Refreshed,
+    Skipped,
+}
+
 /// Refresh Token 永久失效错误
 ///
 /// 当服务端返回 400 + `invalid_grant` 时，表示 refreshToken 已被撤销或过期，
@@ -2041,6 +2048,14 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 清理会话亲和性 map 中超过 TTL 的空闲条目（由 main 的后台定时任务周期调用）。
+    ///
+    /// affinity map 的 key 是客户端可控的 session id，仅靠 get() 惰性删除无法回收
+    /// 「不再出现的 session」，长跑会内存泄漏。未启用亲和性时 map 恒空，调用无害。
+    pub fn cleanup_affinity(&self) {
+        self.affinity.cleanup();
+    }
+
     /// 强制刷新指定凭据的 Token（Admin API）
     ///
     /// 无条件调用上游 API 重新获取 access token，不检查是否过期。
@@ -2061,7 +2076,59 @@ impl MultiTokenManager {
             .collect()
     }
 
+    /// 强制刷新指定凭据的 Token（admin 手动强刷）。
+    ///
+    /// 无条件刷新；错误直接返回给调用方（admin 侧）展示，不在此累计失败/禁用。
     pub async fn force_refresh_token_for(&self, id: u64) -> anyhow::Result<()> {
+        self.refresh_token_locked(id, None).await.map(|_| ())
+    }
+
+    /// 后台主动预刷新指定凭据（批次4.4）。
+    ///
+    /// 与 [`force_refresh_token_for`] 的区别有二：
+    /// 1. **条件刷新**：拿到 refresh_lock 后二次确认 token 仍将在 `lead_minutes`
+    ///    内过期才刷新——请求路径的按需刷新可能在我们等锁期间已刷好，此时跳过，
+    ///    避免重刷刚刷好的 token（多打一次上游 refresh、与「削峰」目标相悖）。
+    /// 2. **失败处置**：刷新失败按错误类型累计失败计数 / 禁用坏凭据，与请求路径
+    ///    [`try_ensure_token`] 的失败处置一致，坏号不必等真实请求命中才被处置。
+    pub async fn prefetch_refresh_token_for(&self, id: u64, lead_minutes: i64) {
+        match self.refresh_token_locked(id, Some(lead_minutes)).await {
+            Ok(RefreshOutcome::Refreshed) => tracing::info!("预刷新凭据 #{} 成功", id),
+            Ok(RefreshOutcome::Skipped) => {
+                tracing::debug!("预刷新凭据 #{} 跳过（已被请求路径刷新）", id)
+            }
+            Err(e) => {
+                if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+                    tracing::warn!("预刷新凭据 #{} refreshToken 永久失效，禁用: {}", id, e);
+                    self.report_refresh_token_invalid(id);
+                } else {
+                    tracing::warn!("预刷新凭据 #{} 失败（交由请求路径重试）: {}", id, e);
+                    self.report_refresh_failure(id);
+                }
+            }
+        }
+    }
+
+    /// 持锁刷新的共享实现。`conditional_lead` 为 `Some(min)` 时，拿锁后二次确认
+    /// token 仍将在 `min` 分钟内过期才刷新，否则返回 [`RefreshOutcome::Skipped`]；
+    /// 为 `None` 时无条件刷新（admin 强刷）。
+    async fn refresh_token_locked(
+        &self,
+        id: u64,
+        conditional_lead: Option<i64>,
+    ) -> anyhow::Result<RefreshOutcome> {
+        // 快速存在性检查（无锁）
+        {
+            let entries = self.entries.lock();
+            if !entries.iter().any(|e| e.id == id) {
+                anyhow::bail!("凭据不存在: {}", id);
+            }
+        }
+
+        // 获取刷新锁防止并发刷新
+        let _guard = self.refresh_lock.lock().await;
+
+        // 拿锁后读取当前凭据：请求路径或其它预刷新可能在等锁期间已刷新
         let credentials = {
             let entries = self.entries.lock();
             entries
@@ -2071,10 +2138,13 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
 
-        // 获取刷新锁防止并发刷新
-        let _guard = self.refresh_lock.lock().await;
+        // 条件刷新（后台预刷新）：token 已不再将过期 → 跳过，避免重复刷新
+        if let Some(lead) = conditional_lead {
+            if !is_token_expiring_within(&credentials, lead).unwrap_or(false) {
+                return Ok(RefreshOutcome::Skipped);
+            }
+        }
 
-        // 无条件调用 refresh_token
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
         let new_creds =
             refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
@@ -2090,11 +2160,11 @@ impl MultiTokenManager {
 
         // 持久化
         if let Err(e) = self.persist_credentials() {
-            tracing::warn!("强制刷新 Token 后持久化失败: {}", e);
+            tracing::warn!("刷新 Token 后持久化失败: {}", e);
         }
 
-        tracing::info!("凭据 #{} Token 已强制刷新", id);
-        Ok(())
+        tracing::info!("凭据 #{} Token 已刷新", id);
+        Ok(RefreshOutcome::Refreshed)
     }
 
     /// 获取负载均衡模式（Admin API）
@@ -2260,6 +2330,35 @@ mod tests {
         let due = manager.credentials_due_for_refresh(10);
         // 仅 #1（id 从 1 起分配）
         assert_eq!(due, vec![1], "只应选中将在 10 分钟内过期的可刷新凭据");
+    }
+
+    #[tokio::test]
+    async fn test_prefetch_skips_when_token_not_expiring() {
+        // token 还有 1 小时才过期 → 预刷新的条件检查应在任何网络调用前跳过
+        let rt = "r".repeat(120);
+        let mut fresh = KiroCredentials::default();
+        fresh.refresh_token = Some(rt);
+        fresh.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![fresh],
+            None,
+            None,
+            true,
+        )
+        .expect("构造 manager");
+
+        // conditional_lead=Some(10)：token 不在 10 分钟内过期 → Skipped，不触发刷新
+        let outcome = manager
+            .refresh_token_locked(1, Some(10))
+            .await
+            .expect("跳过路径不应返回错误");
+        assert_eq!(
+            outcome,
+            RefreshOutcome::Skipped,
+            "token 未临近过期时预刷新应跳过而非发起刷新"
+        );
     }
 
     #[tokio::test]
