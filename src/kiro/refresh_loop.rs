@@ -5,10 +5,12 @@
 //! 间隔扫描，提前 `lead_minutes` 把将过期的 token 刷掉，把刷新从热路径移走。
 //!
 //! 设计取舍：
-//! - 复用 [`MultiTokenManager::force_refresh_token_for`]，其内部已持 refresh_lock，
-//!   与请求路径的按需刷新互斥，不会重复刷新或竞态。
+//! - 复用 [`MultiTokenManager::prefetch_refresh_token_for`]，其内部持 refresh_lock，
+//!   与请求路径的按需刷新互斥；且拿锁后二次确认 token 仍将过期才刷新，避免重刷
+//!   请求路径刚刷好的 token。
 //! - 逐个（顺序）刷新而非并发，避免同一时刻对上游打出刷新突发（本就是要削的峰）。
-//! - 单张凭据刷新失败只告警、不中断整轮；失败计数/禁用由 manager 内部既有逻辑处理。
+//! - 单张凭据刷新失败：由 prefetch_refresh_token_for 内部按错误类型累计失败计数 /
+//!   禁用坏凭据（与请求路径处置一致），本 loop 不中断整轮。
 //! - 收到停机信号即退出（由 tokio::select! 在调用侧或 interval 上体现）。
 
 use std::sync::Arc;
@@ -53,9 +55,7 @@ async fn run_once(manager: &MultiTokenManager, lead_minutes: i64) {
     }
     tracing::debug!("预刷新：{} 张凭据将过期，开始逐个刷新", due.len());
     for id in due {
-        match manager.force_refresh_token_for(id).await {
-            Ok(()) => tracing::info!("预刷新凭据 #{} 成功", id),
-            Err(e) => tracing::warn!("预刷新凭据 #{} 失败（交由请求路径重试）: {}", id, e),
-        }
+        // 条件刷新 + 失败处置均在 prefetch_refresh_token_for 内部完成
+        manager.prefetch_refresh_token_for(id, lead_minutes).await;
     }
 }
