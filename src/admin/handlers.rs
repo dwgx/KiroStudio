@@ -5,6 +5,7 @@ use axum::{
     extract::{Path, State},
     response::IntoResponse,
 };
+use serde::Deserialize;
 
 use super::{
     middleware::AdminState,
@@ -249,6 +250,73 @@ fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+// ============ IDC (AWS SSO) 上号 ============
+
+use super::idc_login::IdcPollResult;
+
+/// POST /api/admin/auth/idc/start
+/// 发起 IDC device code 上号
+pub async fn start_idc_login(
+    State(state): State<AdminState>,
+    Json(payload): Json<StartIdcLoginRequest>,
+) -> impl IntoResponse {
+    let region = payload.region.as_deref().unwrap_or("us-east-1");
+    match state
+        .service
+        .start_idc_login(&payload.start_url, region, payload.priority, payload.proxy_url)
+        .await
+    {
+        Ok(result) => Json(serde_json::json!({
+            "session_id": result.session_id,
+            "verification_uri": result.verification_uri,
+            "verification_uri_complete": result.verification_uri_complete,
+            "user_code": result.user_code,
+            "expires_in": result.expires_in,
+        }))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/auth/idc/poll/:session_id
+/// 轮询 IDC 上号状态
+pub async fn poll_idc_login(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    let resp = match state.service.poll_idc_login(&session_id).await {
+        IdcPollResult::Pending => serde_json::json!({
+            "status": "pending",
+        }),
+        IdcPollResult::Done { credential_id } => serde_json::json!({
+            "status": "done",
+            "credential_id": credential_id,
+        }),
+        IdcPollResult::Expired => serde_json::json!({
+            "status": "expired",
+            "message": "授权已超时，请重新发起",
+        }),
+        IdcPollResult::Error(msg) => serde_json::json!({
+            "status": "error",
+            "message": msg,
+        }),
+    };
+    Json(resp)
+}
+
+#[derive(Deserialize)]
+pub struct StartIdcLoginRequest {
+    pub start_url: String,
+    pub region: Option<String>,
+    #[serde(default = "default_priority")]
+    pub priority: u32,
+    pub proxy_url: Option<String>,
+}
+
+fn default_priority() -> u32 {
+    100
 }
 
 // ============ 服务端配置 ============

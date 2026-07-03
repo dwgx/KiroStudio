@@ -11,6 +11,7 @@ use super::{
         get_credential_balance, get_load_balancing_mode, get_config, poll_social_login,
         reset_failure_count, set_credential_disabled, set_credential_priority,
         set_load_balancing_mode, social_callback, start_social_login, update_config,
+        start_idc_login, poll_idc_login,
     },
     middleware::{AdminState, admin_auth_middleware},
     usage_handlers::{
@@ -57,6 +58,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/config", get(get_config).put(update_config))
         .route("/auth/social/start", post(start_social_login))
         .route("/auth/social/poll/{session_id}", post(poll_social_login))
+        .route("/auth/idc/start", post(start_idc_login))
+        .route("/auth/idc/poll/{session_id}", post(poll_idc_login))
         // 用量统计查询（只读）
         .route("/usage/overview", get(usage_overview))
         .route("/usage/timeseries", get(usage_timeseries))
