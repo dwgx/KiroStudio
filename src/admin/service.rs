@@ -359,6 +359,9 @@ impl AdminService {
             trust_forwarded_header: config.trust_forwarded_header,
             ingress_rate_limit_per_min: config.ingress_rate_limit_per_min,
             max_body_bytes: config.max_body_bytes,
+            proactive_token_refresh: config.proactive_token_refresh,
+            token_refresh_lead_minutes: config.token_refresh_lead_minutes,
+            token_refresh_interval_secs: config.token_refresh_interval_secs,
             config_path: config
                 .config_path()
                 .map(|p| p.display().to_string()),
@@ -597,6 +600,26 @@ impl AdminService {
             if v != config.max_body_bytes {
                 config.max_body_bytes = v;
                 restart_fields.push("maxBodyBytes".into());
+            }
+        }
+
+        // —— 主动 token 预刷新（批次4.4，需重启生效）——
+        if let Some(v) = req.proactive_token_refresh {
+            if v != config.proactive_token_refresh {
+                config.proactive_token_refresh = v;
+                restart_fields.push("proactiveTokenRefresh".into());
+            }
+        }
+        if let Some(v) = req.token_refresh_lead_minutes {
+            if v != config.token_refresh_lead_minutes {
+                config.token_refresh_lead_minutes = v;
+                restart_fields.push("tokenRefreshLeadMinutes".into());
+            }
+        }
+        if let Some(v) = req.token_refresh_interval_secs {
+            if v != config.token_refresh_interval_secs {
+                config.token_refresh_interval_secs = v;
+                restart_fields.push("tokenRefreshIntervalSecs".into());
             }
         }
 
