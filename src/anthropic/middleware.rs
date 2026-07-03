@@ -1,6 +1,7 @@
 //! Anthropic API 中间件
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     body::Body,
@@ -13,6 +14,7 @@ use axum::{
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 
+use super::cache_tracker::CacheTracker;
 use super::types::ErrorResponse;
 
 /// 应用共享状态
@@ -25,15 +27,33 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
+    /// prompt 缓存记账是否启用
+    pub prompt_cache_enabled: bool,
+    /// prompt 缓存影子跟踪器（按凭据分桶）
+    pub cache_tracker: Arc<CacheTracker>,
 }
 
 impl AppState {
     /// 创建新的应用状态
     pub fn new(api_key: impl Into<String>, extract_thinking: bool) -> Self {
+        Self::with_prompt_cache(api_key, extract_thinking, true, 3600)
+    }
+
+    /// 创建带 prompt 缓存配置的应用状态
+    pub fn with_prompt_cache(
+        api_key: impl Into<String>,
+        extract_thinking: bool,
+        prompt_cache_enabled: bool,
+        prompt_cache_ttl_seconds: u64,
+    ) -> Self {
         Self {
             api_key: api_key.into(),
             kiro_provider: None,
             extract_thinking,
+            prompt_cache_enabled,
+            cache_tracker: Arc::new(CacheTracker::new(Duration::from_secs(
+                prompt_cache_ttl_seconds,
+            ))),
         }
     }
 
