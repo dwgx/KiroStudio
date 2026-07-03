@@ -13,6 +13,10 @@ use super::{
         set_load_balancing_mode, social_callback, start_social_login, update_config,
     },
     middleware::{AdminState, admin_auth_middleware},
+    usage_handlers::{
+        usage_by_credential, usage_by_model, usage_overview, usage_rate, usage_recent,
+        usage_timeseries,
+    },
 };
 
 /// 创建 Admin API 路由
@@ -53,6 +57,13 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/config", get(get_config).put(update_config))
         .route("/auth/social/start", post(start_social_login))
         .route("/auth/social/poll/{session_id}", post(poll_social_login))
+        // 用量统计查询（只读）
+        .route("/usage/overview", get(usage_overview))
+        .route("/usage/timeseries", get(usage_timeseries))
+        .route("/usage/by-model", get(usage_by_model))
+        .route("/usage/by-credential", get(usage_by_credential))
+        .route("/usage/recent", get(usage_recent))
+        .route("/usage/rate", get(usage_rate))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,

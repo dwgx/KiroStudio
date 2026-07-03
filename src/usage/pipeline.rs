@@ -10,6 +10,7 @@
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::OnceLock;
 
 use tokio::sync::mpsc;
@@ -41,8 +42,9 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// 初始化用量管道并启动后台 worker。
 ///
-/// `sinks` 为下游接收端集合。应在应用启动时调用一次；重复调用被忽略。
-pub fn init(sinks: Vec<Box<dyn UsageSink>>) {
+/// `sinks` 为下游接收端集合，用 `Arc` 持有以便调用方（如 admin 查询）共享同一实例。
+/// 应在应用启动时调用一次；重复调用被忽略。
+pub fn init(sinks: Vec<Arc<dyn UsageSink>>) {
     let (tx, mut rx) = mpsc::channel::<RequestRecord>(CHANNEL_CAPACITY);
 
     if PIPELINE
@@ -128,8 +130,8 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         // 注册一个 panic sink 和一个计数 sink，验证 panic 被隔离且不影响后续 sink
         init(vec![
-            Box::new(PanicSink),
-            Box::new(CountingSink {
+            Arc::new(PanicSink),
+            Arc::new(CountingSink {
                 count: count.clone(),
             }),
         ]);

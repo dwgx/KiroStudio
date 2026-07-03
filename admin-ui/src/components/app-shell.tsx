@@ -2,7 +2,7 @@ import { useState, lazy, Suspense } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { storage } from '@/lib/storage'
 import { Button } from '@/components/ui/button'
-import { Server, Activity, Settings as SettingsIcon, Moon, Sun, LogOut } from 'lucide-react'
+import { Server, Activity, BarChart3, Settings as SettingsIcon, Moon, Sun, LogOut } from 'lucide-react'
 
 const Dashboard = lazy(() =>
   import('@/components/dashboard').then((m) => ({ default: m.Dashboard }))
@@ -10,14 +10,18 @@ const Dashboard = lazy(() =>
 const OverviewPage = lazy(() =>
   import('@/components/overview-page').then((m) => ({ default: m.OverviewPage }))
 )
+const UsagePage = lazy(() =>
+  import('@/components/usage-page').then((m) => ({ default: m.UsagePage }))
+)
 const SettingsPage = lazy(() =>
   import('@/components/settings-page').then((m) => ({ default: m.SettingsPage }))
 )
 
-type Tab = 'overview' | 'credentials' | 'settings'
+type Tab = 'overview' | 'usage' | 'credentials' | 'settings'
 
 const TABS: { key: Tab; label: string; icon: React.ReactNode }[] = [
   { key: 'overview', label: '概览', icon: <Activity className="h-4 w-4" /> },
+  { key: 'usage', label: '用量统计', icon: <BarChart3 className="h-4 w-4" /> },
   { key: 'credentials', label: '凭据管理', icon: <Server className="h-4 w-4" /> },
   { key: 'settings', label: '设置', icon: <SettingsIcon className="h-4 w-4" /> },
 ]
@@ -91,6 +95,7 @@ export function AppShell({ onLogout }: AppShellProps) {
           }
         >
           {tab === 'overview' && <OverviewPage />}
+          {tab === 'usage' && <UsagePage />}
           {tab === 'credentials' && <Dashboard onLogout={onLogout} embedded />}
           {tab === 'settings' && <SettingsPage />}
         </Suspense>

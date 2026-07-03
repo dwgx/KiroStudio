@@ -147,6 +147,20 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub callback_base_url: Option<String>,
 
+    /// 是否启用用量统计（请求埋点 + SQLite/JSONL 落盘 + 内存预聚合，默认 true）
+    ///
+    /// 关闭后热路径的埋点管道不初始化，`emit_record` 静默丢弃，零开销。
+    #[serde(default = "default_usage_enabled")]
+    pub usage_enabled: bool,
+
+    /// 用量数据目录（SQLite 与 JSONL 落盘位置，默认 "data/usage"）
+    #[serde(default = "default_usage_data_dir")]
+    pub usage_data_dir: String,
+
+    /// 用量明细（SQLite traces）保留天数，超期后台清理（默认 30）
+    #[serde(default = "default_usage_retention_days")]
+    pub usage_retention_days: i64,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -213,6 +227,18 @@ fn default_rate_limit_min_interval_ms() -> u64 {
     1000
 }
 
+fn default_usage_enabled() -> bool {
+    true
+}
+
+fn default_usage_data_dir() -> String {
+    "data/usage".to_string()
+}
+
+fn default_usage_retention_days() -> i64 {
+    30
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -244,6 +270,9 @@ impl Default for Config {
             rate_limit_min_interval_ms: default_rate_limit_min_interval_ms(),
             affinity_enabled: default_affinity_enabled(),
             callback_base_url: None,
+            usage_enabled: default_usage_enabled(),
+            usage_data_dir: default_usage_data_dir(),
+            usage_retention_days: default_usage_retention_days(),
             config_path: None,
         }
     }
