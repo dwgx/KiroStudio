@@ -28,6 +28,29 @@ interface FormState {
   affinityEnabled: boolean
   proxyUrl: string
   callbackBaseUrl: string
+  // 反代安全（批次3）：列表用换行分隔的多行文本承载
+  corsAllowedOrigins: string
+  ipAllowlist: string
+  trustForwardedHeader: boolean
+  ingressRateLimitPerMin: string
+  maxBodyBytes: string
+}
+
+// 多行文本 <-> 字符串列表（去空白、去空行）
+function linesToList(s: string): string[] {
+  return s
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0)
+}
+
+function listToLines(list: string[]): string {
+  return list.join('\n')
+}
+
+// 比较两个字符串列表是否等价（顺序敏感）
+function sameList(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((v, i) => v === b[i])
 }
 
 function toForm(c: ConfigSnapshotResponse): FormState {
@@ -49,6 +72,11 @@ function toForm(c: ConfigSnapshotResponse): FormState {
     affinityEnabled: c.affinityEnabled,
     proxyUrl: c.proxyUrl ?? '',
     callbackBaseUrl: c.callbackBaseUrl ?? '',
+    corsAllowedOrigins: listToLines(c.corsAllowedOrigins ?? []),
+    ipAllowlist: listToLines(c.ipAllowlist ?? []),
+    trustForwardedHeader: c.trustForwardedHeader,
+    ingressRateLimitPerMin: String(c.ingressRateLimitPerMin),
+    maxBodyBytes: String(c.maxBodyBytes),
   }
 }
 
@@ -112,6 +140,16 @@ export function SettingsPage() {
     if (form.affinityEnabled !== config.affinityEnabled) d.affinityEnabled = form.affinityEnabled
     if (form.proxyUrl.trim() !== (config.proxyUrl ?? '')) d.proxyUrl = form.proxyUrl.trim()
     if (form.callbackBaseUrl.trim() !== (config.callbackBaseUrl ?? '')) d.callbackBaseUrl = form.callbackBaseUrl.trim()
+    // 反代安全
+    const origins = linesToList(form.corsAllowedOrigins)
+    if (!sameList(origins, config.corsAllowedOrigins ?? [])) d.corsAllowedOrigins = origins
+    const allowlist = linesToList(form.ipAllowlist)
+    if (!sameList(allowlist, config.ipAllowlist ?? [])) d.ipAllowlist = allowlist
+    if (form.trustForwardedHeader !== config.trustForwardedHeader) d.trustForwardedHeader = form.trustForwardedHeader
+    const ingress = Number(form.ingressRateLimitPerMin)
+    if (Number.isFinite(ingress) && ingress !== config.ingressRateLimitPerMin) d.ingressRateLimitPerMin = ingress
+    const maxBody = Number(form.maxBodyBytes)
+    if (Number.isFinite(maxBody) && maxBody !== config.maxBodyBytes) d.maxBodyBytes = maxBody
     return d
   }, [config, form])
 
@@ -301,6 +339,51 @@ export function SettingsPage() {
             }
           />
           <ReadonlyRow label="Admin Key" value={<Badge variant={config.hasAdminKey ? 'default' : 'secondary'}>{config.hasAdminKey ? '已设置' : '未设置'}</Badge>} />
+        </CardContent>
+      </Card>
+
+      {/* 反代安全（需重启） */}
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="text-base">反代安全</CardTitle>
+        </CardHeader>
+        <CardContent className="py-0">
+          <Field
+            label="CORS 允许来源"
+            hint="每行一个来源，如 https://app.example.com。留空=允许任意来源（公开 API，需重启生效）"
+          >
+            <textarea
+              className="flex min-h-[72px] w-full max-w-[260px] rounded-md border border-input bg-background px-3 py-2 font-mono text-xs ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              value={form.corsAllowedOrigins}
+              onChange={(e) => set('corsAllowedOrigins', e.target.value)}
+              placeholder="留空=允许任意来源"
+              spellCheck={false}
+            />
+          </Field>
+          <Field
+            label="IP 白名单"
+            hint="每行一条 CIDR 或单 IP，如 10.0.0.0/8、127.0.0.1。留空=不限制。非法条目保存时会被拒绝（需重启生效）"
+          >
+            <textarea
+              className="flex min-h-[72px] w-full max-w-[260px] rounded-md border border-input bg-background px-3 py-2 font-mono text-xs ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              value={form.ipAllowlist}
+              onChange={(e) => set('ipAllowlist', e.target.value)}
+              placeholder="留空=不限制"
+              spellCheck={false}
+            />
+          </Field>
+          <Field
+            label="信任 X-Forwarded-For"
+            hint="仅当部署在可信反代（nginx 等）之后才开启，否则客户端可伪造 IP 绕过白名单（需重启生效）"
+          >
+            <Switch checked={form.trustForwardedHeader} onCheckedChange={(v) => set('trustForwardedHeader', v)} />
+          </Field>
+          <Field label="入口限流 (次/分钟/IP)" hint="0 表示关闭。超限返回 429（需重启生效）">
+            <Input className={inputCls} type="number" value={form.ingressRateLimitPerMin} onChange={(e) => set('ingressRateLimitPerMin', e.target.value)} />
+          </Field>
+          <Field label="请求体上限 (字节)" hint="默认 52428800（50MiB）。超限返回 413（需重启生效）">
+            <Input className={inputCls} type="number" value={form.maxBodyBytes} onChange={(e) => set('maxBodyBytes', e.target.value)} />
+          </Field>
         </CardContent>
       </Card>
 
