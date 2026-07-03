@@ -15,8 +15,9 @@ use super::base::EventPayload;
 ///
 /// # 设计说明
 ///
-/// 此结构体只保留实际使用的 `content` 字段，其他 API 返回的字段
-/// 通过 `#[serde(flatten)]` 捕获到 `extra` 中，确保反序列化不会失败。
+/// 此结构体只保留实际使用的 `content` 字段。serde 默认会忽略 JSON 中
+/// 未声明的字段，因此其他 API 返回的字段被自动丢弃，反序列化不会失败，
+/// 同时避免为每个高频流式帧额外分配一个捕获用的 map。
 ///
 /// # 示例
 ///
@@ -33,12 +34,6 @@ pub struct AssistantResponseEvent {
     /// 响应内容片段
     #[serde(default)]
     pub content: String,
-
-    /// 捕获其他未使用的字段，确保反序列化兼容性
-    #[serde(flatten)]
-    #[serde(skip_serializing)]
-    #[allow(dead_code)]
-    extra: serde_json::Value,
 }
 
 impl EventPayload for AssistantResponseEvent {
@@ -51,7 +46,6 @@ impl Default for AssistantResponseEvent {
     fn default() -> Self {
         Self {
             content: String::new(),
-            extra: serde_json::Value::Null,
         }
     }
 }
