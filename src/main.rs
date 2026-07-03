@@ -163,6 +163,21 @@ async fn main() {
         tracing::info!("主动 token 预刷新未启用（proactive_token_refresh=false）");
     }
 
+    // 会话亲和性定时清理：affinity map 的 key 是客户端可控的 session id，
+    // 仅靠 get() 惰性删除无法回收「不再出现的 session」，长跑会内存泄漏。
+    // 每 5 分钟主动 retain 掉超过 TTL 的空闲条目（interval 用 Skip 防唤醒后连刷）。
+    {
+        let affinity_mgr = token_manager.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5 * 60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                affinity_mgr.cleanup_affinity();
+            }
+        });
+    }
+
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),

@@ -7,13 +7,17 @@
 //!
 //! 该模块在应用启动时通过 [`init`] 装配一次。未初始化时 [`record`] 静默丢弃，
 //! 便于测试与「统计未启用」场景。
+//!
+//! **线程模型**：worker 跑在一个专用的 `std::thread` 上，而非 tokio 异步线程池。
+//! sink 内部会做同步阻塞 IO（SQLite `execute`、文件 `writeln!`）——若跑在 tokio
+//! worker 线程上，慢盘/fsync 抖动会阻塞该线程、侵蚀 tokio 线程池，把延迟传导回请求
+//! 路径。用独立 OS 线程承载阻塞 IO，兑现「统计侧故障绝不回传到请求路径」的承诺。
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::OnceLock;
-
-use tokio::sync::mpsc;
 
 use super::record::RequestRecord;
 
@@ -33,7 +37,7 @@ pub trait UsageSink: Send + Sync {
 const CHANNEL_CAPACITY: usize = 10_000;
 
 struct Pipeline {
-    tx: mpsc::Sender<RequestRecord>,
+    tx: mpsc::SyncSender<RequestRecord>,
     dropped: &'static AtomicU64,
 }
 
@@ -45,7 +49,8 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 /// `sinks` 为下游接收端集合，用 `Arc` 持有以便调用方（如 admin 查询）共享同一实例。
 /// 应在应用启动时调用一次；重复调用被忽略。
 pub fn init(sinks: Vec<Arc<dyn UsageSink>>) {
-    let (tx, mut rx) = mpsc::channel::<RequestRecord>(CHANNEL_CAPACITY);
+    // 有界同步通道：满时 try_send 立即失败（丢弃 + 计数），绝不阻塞热路径。
+    let (tx, rx) = mpsc::sync_channel::<RequestRecord>(CHANNEL_CAPACITY);
 
     if PIPELINE
         .set(Pipeline {
@@ -58,21 +63,29 @@ pub fn init(sinks: Vec<Arc<dyn UsageSink>>) {
         return;
     }
 
-    tokio::spawn(async move {
-        tracing::info!("用量管道 worker 启动，已注册 {} 个 sink", sinks.len());
-        while let Some(record) = rx.recv().await {
-            for sink in &sinks {
-                // 隔离每个 sink 的 panic，避免拖垮 worker 与其它 sink
-                let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    sink.on_record(&record);
-                }));
-                if result.is_err() {
-                    tracing::error!("用量 sink `{}` 处理记录时 panic（已隔离）", sink.name());
+    // 专用 OS 线程承载阻塞 IO，与 tokio 异步线程池隔离。
+    let spawned = std::thread::Builder::new()
+        .name("usage-pipeline".into())
+        .spawn(move || {
+            tracing::info!("用量管道 worker 启动，已注册 {} 个 sink", sinks.len());
+            // rx.recv() 阻塞等待，通道所有发送端关闭后返回 Err，worker 退出。
+            while let Ok(record) = rx.recv() {
+                for sink in &sinks {
+                    // 隔离每个 sink 的 panic，避免拖垮 worker 与其它 sink
+                    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                        sink.on_record(&record);
+                    }));
+                    if result.is_err() {
+                        tracing::error!("用量 sink `{}` 处理记录时 panic（已隔离）", sink.name());
+                    }
                 }
             }
-        }
-        tracing::info!("用量管道 worker 退出（通道关闭）");
-    });
+            tracing::info!("用量管道 worker 退出（通道关闭）");
+        });
+
+    if let Err(e) = spawned {
+        tracing::error!("用量管道 worker 线程启动失败：{e}");
+    }
 }
 
 /// 提交一条请求记录到管道（热路径调用，非阻塞）。

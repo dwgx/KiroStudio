@@ -245,12 +245,12 @@ pub async fn post_messages(
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
-        // 估算输入 tokens
+        // 估算输入 tokens（只读计数，传引用避免深拷贝整个对话历史）
         let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
+            &payload.model,
+            payload.system.as_deref(),
+            &payload.messages,
+            payload.tools.as_deref(),
         ) as i32;
 
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
@@ -300,12 +300,12 @@ pub async fn post_messages(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
-    // 估算输入 tokens
+    // 估算输入 tokens（只读计数，传引用避免深拷贝整个对话历史）
     let input_tokens = token::count_all_tokens(
-        payload.model.clone(),
-        payload.system,
-        payload.messages,
-        payload.tools,
+        &payload.model,
+        payload.system.as_deref(),
+        &payload.messages,
+        payload.tools.as_deref(),
     ) as i32;
 
     // 检查是否启用了thinking
@@ -752,10 +752,10 @@ pub async fn count_tokens(
     );
 
     let total_tokens = token::count_all_tokens(
-        payload.model,
-        payload.system,
-        payload.messages,
-        payload.tools,
+        &payload.model,
+        payload.system.as_deref(),
+        &payload.messages,
+        payload.tools.as_deref(),
     ) as i32;
 
     Json(CountTokensResponse {
@@ -803,12 +803,12 @@ pub async fn post_messages_cc(
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
-        // 估算输入 tokens
+        // 估算输入 tokens（只读计数，传引用避免深拷贝整个对话历史）
         let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
+            &payload.model,
+            payload.system.as_deref(),
+            &payload.messages,
+            payload.tools.as_deref(),
         ) as i32;
 
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
@@ -858,12 +858,12 @@ pub async fn post_messages_cc(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
-    // 估算输入 tokens
+    // 估算输入 tokens（只读计数，传引用避免深拷贝整个对话历史）
     let input_tokens = token::count_all_tokens(
-        payload.model.clone(),
-        payload.system,
-        payload.messages,
-        payload.tools,
+        &payload.model,
+        payload.system.as_deref(),
+        &payload.messages,
+        payload.tools.as_deref(),
     ) as i32;
 
     // 检查是否启用了thinking

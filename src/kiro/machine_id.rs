@@ -16,6 +16,25 @@ use crate::model::config::Config;
 /// key 为 `credentials.id`；无 id 的凭据共享同一个兜底值（正常流程不会出现）。
 static FALLBACK_MACHINE_IDS: OnceLock<Mutex<HashMap<Option<u64>, String>>> = OnceLock::new();
 
+/// 派生 machineId 缓存（缓存 SHA256 派生结果，进程内复用）
+///
+/// 仅缓存需要 SHA256 派生的两条路径（API Key / refreshToken）；显式 machineId
+/// 与兜底路径不走此缓存。key 为 `credentials.id`，但**命中要求派生输入完全一致**：
+/// 缓存条目连同派生材料一起存下，查询时比对 `prefix + material`，任一不同即视为
+/// 未命中并重算覆盖。这样即便 refreshToken 轮换（派生材料变化），也绝不会返回旧值。
+/// 热路径（同一请求的多次重试 attempt）材料不变，用一次 memcmp 替代 SHA256+分配。
+static DERIVED_MACHINE_IDS: OnceLock<Mutex<HashMap<Option<u64>, DerivedEntry>>> = OnceLock::new();
+
+/// 派生缓存条目：记录派生材料以保证缓存 key 覆盖全部输入
+struct DerivedEntry {
+    /// 派生前缀标签（"KiroAPIKey/" 或 "KotlinNativeAPI/"），区分两条互斥路径
+    prefix: &'static str,
+    /// 派生材料（kiroApiKey 或 refreshToken 原文），用于命中比对
+    material: String,
+    /// 派生结果（64 字符十六进制）
+    value: String,
+}
+
 /// 标准化 machineId 格式
 ///
 /// 支持以下格式：
@@ -71,18 +90,44 @@ pub fn generate_from_credentials(credentials: &KiroCredentials, config: &Config)
         // API Key 凭据：基于 kiroApiKey 派生
         if let Some(ref api_key) = credentials.kiro_api_key {
             if !api_key.is_empty() {
-                return sha256_hex(&format!("KiroAPIKey/{}", api_key));
+                return cached_derive(credentials.id, "KiroAPIKey/", api_key);
             }
         }
     } else if let Some(ref refresh_token) = credentials.refresh_token {
         // OAuth 凭据：基于 refreshToken 派生
         if !refresh_token.is_empty() {
-            return sha256_hex(&format!("KotlinNativeAPI/{}", refresh_token));
+            return cached_derive(credentials.id, "KotlinNativeAPI/", refresh_token);
         }
     }
 
     // 兜底：走派生流程生成随机 machineId，按凭据 id 进程内稳定
     fallback_machine_id(credentials)
+}
+
+/// 派生 machineId 并按凭据 id 缓存 SHA256 结果。
+///
+/// 命中条件：同一 `id` 下缓存条目的 `prefix` 与 `material` 均与本次一致——
+/// 只要派生材料（api_key / refresh_token）或路径变化就重算并覆盖，因此缓存
+/// key 实质覆盖了派生的全部输入，绝不会返回过期值。
+fn cached_derive(id: Option<u64>, prefix: &'static str, material: &str) -> String {
+    let cache = DERIVED_MACHINE_IDS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = cache.lock();
+    if let Some(entry) = map.get(&id) {
+        if entry.prefix == prefix && entry.material == material {
+            return entry.value.clone();
+        }
+    }
+
+    let value = sha256_hex(&format!("{}{}", prefix, material));
+    map.insert(
+        id,
+        DerivedEntry {
+            prefix,
+            material: material.to_string(),
+            value: value.clone(),
+        },
+    );
+    value
 }
 
 /// 为缺失派生材料的凭据生成兜底 machineId
