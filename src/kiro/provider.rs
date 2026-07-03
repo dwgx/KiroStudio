@@ -365,7 +365,12 @@ impl KiroProvider {
                 return Ok(response);
             }
 
-            // 失败响应：读取 body 用于日志/错误信息
+            // 失败响应：先从响应头提取 Retry-After（body 消费后头就没了），再读取 body
+            let retry_after_header = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<u64>().ok());
             let body = response.text().await.unwrap_or_default();
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
@@ -390,6 +395,34 @@ impl KiroProvider {
 
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败: {} {}",
+                    api_type,
+                    status,
+                    body
+                ));
+                continue;
+            }
+
+            // 账户被暂停/封禁：不论状态码，body 命中 suspend 信号即直接禁用并转移
+            // （不可自动恢复，等待人工处理，避免反复打已封的号）
+            if endpoint.is_account_suspended(&body) {
+                tracing::error!(
+                    "API 请求失败（账户被暂停/封禁，禁用凭据并切换，尝试 {}/{}）: {} {}",
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    body
+                );
+                let has_available = self.token_manager.report_account_suspended(ctx.id);
+                if !has_available {
+                    anyhow::bail!(
+                        "{} API 请求失败（账户被封禁且所有凭据已用尽）: {} {}",
+                        api_type,
+                        status,
+                        body
+                    );
+                }
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败（账户被暂停）: {} {}",
                     api_type,
                     status,
                     body
@@ -457,7 +490,11 @@ impl KiroProvider {
                 // 429 限流：给该凭据设置短冷却，让调度优先换用其它凭据
                 // （仍不禁用、不计永久失败，冷却到期自动恢复）
                 if status.as_u16() == 429 {
-                    self.token_manager.report_rate_limited(ctx.id);
+                    // 优先用上游给出的精确重置时间：响应头 Retry-After 优先，其次错误 body
+                    let retry_after = retry_after_header
+                        .or_else(|| endpoint.extract_retry_after_secs(&body));
+                    self.token_manager
+                        .report_rate_limited_with_retry_after(ctx.id, retry_after);
                 }
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败: {} {}",

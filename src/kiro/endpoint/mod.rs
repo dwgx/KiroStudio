@@ -54,6 +54,19 @@ pub trait KiroEndpoint: Send + Sync {
     fn is_bearer_token_invalid(&self, body: &str) -> bool {
         default_is_bearer_token_invalid(body)
     }
+
+    /// 判断响应体是否表示"账户被暂停/封禁"（直接禁用，不自动恢复）
+    fn is_account_suspended(&self, body: &str) -> bool {
+        default_is_account_suspended(body)
+    }
+
+    /// 从错误响应中提取上游给出的重置时间（秒）
+    ///
+    /// 某些上游把真实重置时间放在 body 里（如 `resets_in_seconds` / `resets_at` epoch），
+    /// 而非 `Retry-After` 头。有则据此设定精确冷却，避免盲目退避浪费。
+    fn extract_retry_after_secs(&self, body: &str) -> Option<u64> {
+        default_extract_retry_after_secs(body)
+    }
 }
 
 /// 装饰请求时可用的上下文
@@ -101,6 +114,64 @@ pub fn default_is_bearer_token_invalid(body: &str) -> bool {
     body.contains("The bearer token included in the request is invalid")
 }
 
+/// 默认的账户暂停/封禁判断逻辑
+///
+/// 参考 Kiro-Go `account_failover.go` 的错误分类经验：
+/// 识别上游明确的 suspend/ban/disable 信号（大小写不敏感），
+/// 命中即视为不可自动恢复，应直接禁用凭据等待人工处理。
+pub fn default_is_account_suspended(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    // 明确的封禁/暂停/停用信号
+    const SUSPEND_KEYWORDS: &[&str] = &[
+        "temporarily_suspended",
+        "account suspended",
+        "account_suspended",
+        "account has been suspended",
+        "account disabled",
+        "account_disabled",
+        "account is disabled",
+        "permanently banned",
+        "has been banned",
+    ];
+    SUSPEND_KEYWORDS.iter().any(|kw| lower.contains(kw))
+}
+
+/// 默认的"从错误 body 提取重置秒数"逻辑
+///
+/// 优先识别相对秒数（`resets_in_seconds` / `retry_after`），
+/// 其次识别绝对 epoch（`resets_at`，秒级时间戳）并换算为剩余秒数。
+/// 同时兼容顶层与嵌套 `error.*` 两种位置。
+pub fn default_extract_retry_after_secs(body: &str) -> Option<u64> {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+
+    // 相对秒数字段（顶层或 error.* 下）
+    for key in ["resets_in_seconds", "retry_after", "retryAfter"] {
+        if let Some(secs) = value
+            .get(key)
+            .or_else(|| value.pointer(&format!("/error/{key}")))
+            .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
+        {
+            return Some(secs);
+        }
+    }
+
+    // 绝对 epoch（秒）字段
+    for key in ["resets_at", "resetsAt"] {
+        if let Some(epoch) = value
+            .get(key)
+            .or_else(|| value.pointer(&format!("/error/{key}")))
+            .and_then(|v| v.as_i64())
+        {
+            let now = chrono::Utc::now().timestamp();
+            if epoch > now {
+                return Some((epoch - now) as u64);
+            }
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,5 +200,55 @@ mod tests {
             "The bearer token included in the request is invalid"
         ));
         assert!(!default_is_bearer_token_invalid("unrelated error"));
+    }
+
+    #[test]
+    fn test_default_is_account_suspended() {
+        assert!(default_is_account_suspended(
+            r#"{"reason":"TEMPORARILY_SUSPENDED"}"#
+        ));
+        assert!(default_is_account_suspended(
+            "Your account has been suspended due to suspicious activity"
+        ));
+        assert!(default_is_account_suspended(
+            r#"{"message":"account_disabled"}"#
+        ));
+        // 普通限流不应被误判为暂停
+        assert!(!default_is_account_suspended(
+            r#"{"reason":"MONTHLY_REQUEST_COUNT"}"#
+        ));
+        assert!(!default_is_account_suspended("too many requests"));
+    }
+
+    #[test]
+    fn test_extract_retry_after_relative_seconds() {
+        assert_eq!(
+            default_extract_retry_after_secs(r#"{"resets_in_seconds":120}"#),
+            Some(120)
+        );
+        assert_eq!(
+            default_extract_retry_after_secs(r#"{"error":{"retry_after":45}}"#),
+            Some(45)
+        );
+    }
+
+    #[test]
+    fn test_extract_retry_after_absolute_epoch() {
+        let future = chrono::Utc::now().timestamp() + 300;
+        let body = format!(r#"{{"resets_at":{future}}}"#);
+        let got = default_extract_retry_after_secs(&body).unwrap();
+        // 允许少量执行耗时误差
+        assert!((295..=300).contains(&got), "got {got}");
+    }
+
+    #[test]
+    fn test_extract_retry_after_absent() {
+        assert_eq!(default_extract_retry_after_secs(r#"{"message":"x"}"#), None);
+        assert_eq!(default_extract_retry_after_secs("not json"), None);
+        // 过去的 epoch 不返回
+        assert_eq!(
+            default_extract_retry_after_secs(r#"{"resets_at":1000}"#),
+            None
+        );
     }
 }

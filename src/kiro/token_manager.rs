@@ -430,6 +430,8 @@ enum DisabledReason {
     TooManyRefreshFailures,
     /// 额度已用尽（如 MONTHLY_REQUEST_COUNT）
     QuotaExceeded,
+    /// 账户被上游暂停/封禁（不可自动恢复，等待人工处理）
+    AccountSuspended,
     /// Refresh Token 永久失效（服务端返回 invalid_grant）
     InvalidRefreshToken,
     /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
@@ -1242,6 +1244,7 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_failure(&self, id: u64) -> bool {
+        let mut disabled_now = false;
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -1269,6 +1272,7 @@ impl MultiTokenManager {
             if failure_count >= MAX_FAILURES_PER_CREDENTIAL {
                 entry.disabled = true;
                 entry.disabled_reason = Some(DisabledReason::TooManyFailures);
+                disabled_now = true;
                 tracing::error!("凭据 #{} 已连续失败 {} 次，已被禁用", id, failure_count);
 
                 // 切换到优先级最高的可用凭据
@@ -1290,6 +1294,10 @@ impl MultiTokenManager {
 
             entries.iter().any(|e| !e.disabled)
         };
+        // 凭据被自动禁用时，清除其会话亲和性绑定，避免后续请求反复重选到已禁用凭据
+        if disabled_now {
+            self.affinity.remove_by_credential(id);
+        }
         // 记录速率失败（驱动指数退避）
         if self.rate_limit_enabled {
             self.rate_limiter.record_failure(id, None);
@@ -1298,14 +1306,33 @@ impl MultiTokenManager {
         result
     }
 
-    /// 报告凭据触发上游瞬态限流（429/5xx）
+    /// 报告凭据触发上游瞬态限流（429/5xx），可携带上游给出的精确重置秒数。
     ///
     /// 不禁用凭据、不计入永久失败，仅设置一段短冷却让调度暂时跳过它，
     /// 配合 provider 的退避重试，避免反复打同一个正在限流的凭据。
-    pub fn report_rate_limited(&self, id: u64) {
+    ///
+    /// `retry_after_secs` 来自响应头 `Retry-After` 或错误 body（如 `resets_in_seconds`）。
+    /// 有则据此设定精确冷却，避免盲目指数退避浪费；无则回退到分级递增冷却。
+    pub fn report_rate_limited_with_retry_after(&self, id: u64, retry_after_secs: Option<u64>) {
         if self.cooldown_enabled {
-            let dur = self.cooldown.set_cooldown(id, CooldownReason::RateLimitExceeded);
-            tracing::warn!("凭据 #{} 触发限流，冷却 {:?}", id, dur);
+            let dur = match retry_after_secs {
+                Some(secs) if secs > 0 => self.cooldown.set_cooldown_with_duration(
+                    id,
+                    CooldownReason::RateLimitExceeded,
+                    Some(std::time::Duration::from_secs(secs)),
+                ),
+                _ => self.cooldown.set_cooldown(id, CooldownReason::RateLimitExceeded),
+            };
+            tracing::warn!(
+                "凭据 #{} 触发限流，冷却 {:?}{}",
+                id,
+                dur,
+                if retry_after_secs.is_some() {
+                    "（上游指定）"
+                } else {
+                    ""
+                }
+            );
         }
         if self.rate_limit_enabled {
             self.rate_limiter.record_failure(id, Some("rate limited"));
@@ -1368,6 +1395,62 @@ impl MultiTokenManager {
                 false
             }
         };
+        // 额度用尽已禁用该凭据，清除其会话亲和性绑定
+        self.affinity.remove_by_credential(id);
+        self.save_stats_debounced();
+        result
+    }
+
+    /// 报告指定凭据被上游暂停/封禁。
+    ///
+    /// 与额度用尽类似立即禁用并切换，但原因标记为 `AccountSuspended`
+    /// （不可自动恢复，等待人工处理），并设置长冷却。
+    /// 返回是否还有可用凭据可继续重试。
+    pub fn report_account_suspended(&self, id: u64) -> bool {
+        let result = {
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
+
+            let entry = match entries.iter_mut().find(|e| e.id == id) {
+                Some(e) => e,
+                None => return entries.iter().any(|e| !e.disabled),
+            };
+
+            if entry.disabled {
+                return entries.iter().any(|e| !e.disabled);
+            }
+
+            entry.disabled = true;
+            entry.disabled_reason = Some(DisabledReason::AccountSuspended);
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+            entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+
+            tracing::error!("凭据 #{} 被上游暂停/封禁，已禁用（等待人工处理）", id);
+
+            if let Some(next) = entries
+                .iter()
+                .filter(|e| !e.disabled)
+                .min_by_key(|e| e.credentials.priority)
+            {
+                *current_id = next.id;
+                tracing::info!(
+                    "已切换到凭据 #{}（优先级 {}）",
+                    next.id,
+                    next.credentials.priority
+                );
+                true
+            } else {
+                tracing::error!("所有凭据均已禁用！");
+                false
+            }
+        };
+        // 设置长冷却（不可自动恢复原因）
+        if self.cooldown_enabled {
+            self.cooldown
+                .set_cooldown(id, CooldownReason::AccountSuspended);
+        }
+        // 封禁已禁用该凭据，清除其会话亲和性绑定
+        self.affinity.remove_by_credential(id);
         self.save_stats_debounced();
         result
     }
@@ -1570,6 +1653,7 @@ impl MultiTokenManager {
                         DisabledReason::TooManyFailures => "TooManyFailures",
                         DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
                         DisabledReason::QuotaExceeded => "QuotaExceeded",
+                        DisabledReason::AccountSuspended => "AccountSuspended",
                         DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
                         DisabledReason::InvalidConfig => "InvalidConfig",
                     }.to_string()),
@@ -2609,6 +2693,67 @@ mod tests {
         // 再禁用第二个后，无可用凭据
         assert!(!manager.report_quota_exhausted(2));
         assert_eq!(manager.available_count(), 0);
+    }
+
+    #[test]
+    fn test_multi_token_manager_report_account_suspended() {
+        let config = Config::default();
+        let cred1 = KiroCredentials::default();
+        let cred2 = KiroCredentials::default();
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        assert_eq!(manager.available_count(), 2);
+
+        // 封禁凭据 1：立即禁用并切换，仍有凭据 2 可用
+        assert!(manager.report_account_suspended(1));
+        assert_eq!(manager.available_count(), 1);
+
+        // 封禁凭据 2 后无可用凭据
+        assert!(!manager.report_account_suspended(2));
+        assert_eq!(manager.available_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_account_suspended_is_not_auto_recovered() {
+        // 封禁属不可自动恢复原因：即使全部凭据被封，acquire_context 也不应把它们复活
+        let config = Config::default();
+        let cred1 = KiroCredentials::default();
+
+        let manager = MultiTokenManager::new(config, vec![cred1], None, None, false).unwrap();
+        assert!(!manager.report_account_suspended(1));
+        assert_eq!(manager.available_count(), 0);
+
+        // 封禁的凭据不应被自动恢复机制复活
+        let ctx = manager.acquire_context(None, None).await;
+        assert!(
+            ctx.is_err(),
+            "被封禁的凭据不应自动恢复为可用（AccountSuspended 不可自动恢复）"
+        );
+    }
+
+    #[test]
+    fn test_account_suspended_clears_affinity() {
+        // 验证 G-7 闭环：封禁凭据时清除其会话亲和性绑定
+        let config = Config::default();
+        let cred1 = KiroCredentials::default();
+        let cred2 = KiroCredentials::default();
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        // 建立会话 -> 凭据1 的亲和绑定
+        manager.affinity.set("session-abc", 1);
+        assert_eq!(manager.affinity.get("session-abc"), Some(1));
+
+        // 封禁凭据1后，亲和绑定应被清除，不再指向已封的号
+        manager.report_account_suspended(1);
+        assert_eq!(
+            manager.affinity.get("session-abc"),
+            None,
+            "封禁凭据后应清除其会话亲和性绑定"
+        );
     }
 
     #[tokio::test]
