@@ -9,6 +9,19 @@ use uuid::Uuid;
 
 use crate::kiro::model::events::Event;
 
+/// thinking 块的 signature 占位字符串。
+///
+/// Anthropic 协议下，流式 `{type:"thinking"}` 块结束前必须发一个 `signature_delta`
+/// 事件，SDK 会把它聚合进 thinking 块的 `signature` 字段。客户端（Claude Code）在
+/// 下一轮把该 assistant 消息回传时会本地校验 thinking 块必须带**非空** signature，
+/// 否则抛出 `The content[].thinking in the thinking mode must be passed back to the API`。
+///
+/// 上游 Kiro 不是 Anthropic 服务端，不下发真实签名，因此这里发一个非空占位字符串以
+/// 满足客户端本地校验。该占位符只在客户端 ↔ kiro.rs 之间存在：回传时 converter 只读
+/// `block.thinking`，`ContentBlock` 无 signature 字段且未 deny_unknown_fields，serde
+/// 静默丢弃客户端回传的假签名，故永不转发给 Kiro。
+pub(super) const THINKING_SIGNATURE_PLACEHOLDER: &str = "kiro-rs-thinking-signature";
+
 /// Prompt 缓存记账明细（由 [`crate::anthropic::cache_tracker`] 推算，注入响应 usage）
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CacheUsageBreakdown {
@@ -894,7 +907,9 @@ impl StreamContext {
                     if let Some(thinking_index) = self.thinking_block_index {
                         // 先发送空的 thinking_delta
                         events.push(self.create_thinking_delta_event(thinking_index, ""));
-                        // 再发送 content_block_stop
+                        // 再发送 signature_delta（满足客户端 thinking 模式本地校验）
+                        events.push(self.create_signature_delta_event(thinking_index));
+                        // 最后发送 content_block_stop
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
                         {
@@ -1019,6 +1034,25 @@ impl StreamContext {
         )
     }
 
+    /// 创建 signature_delta 事件
+    ///
+    /// thinking 块流式结束前（`content_block_stop` 之前）必须发一个 signature_delta，
+    /// 携带非空占位签名，满足客户端 thinking 模式下的本地校验。详见
+    /// [`THINKING_SIGNATURE_PLACEHOLDER`]。
+    fn create_signature_delta_event(&self, index: i32) -> SseEvent {
+        SseEvent::new(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {
+                    "type": "signature_delta",
+                    "signature": THINKING_SIGNATURE_PLACEHOLDER
+                }
+            }),
+        )
+    }
+
     /// 处理工具使用事件
     fn process_tool_use(
         &mut self,
@@ -1050,7 +1084,9 @@ impl StreamContext {
                 if let Some(thinking_index) = self.thinking_block_index {
                     // 先发送空的 thinking_delta
                     events.push(self.create_thinking_delta_event(thinking_index, ""));
-                    // 再发送 content_block_stop
+                    // 再发送 signature_delta（满足客户端 thinking 模式本地校验）
+                    events.push(self.create_signature_delta_event(thinking_index));
+                    // 最后发送 content_block_stop
                     if let Some(stop_event) =
                         self.state_manager.handle_content_block_stop(thinking_index)
                     {
@@ -1163,9 +1199,10 @@ impl StreamContext {
                         }
                     }
 
-                    // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
+                    // 关闭 thinking 块：先发送空的 thinking_delta，再发 signature_delta，最后 content_block_stop
                     if let Some(thinking_index) = self.thinking_block_index {
                         events.push(self.create_thinking_delta_event(thinking_index, ""));
+                        events.push(self.create_signature_delta_event(thinking_index));
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
                         {
@@ -1193,7 +1230,9 @@ impl StreamContext {
                     if let Some(thinking_index) = self.thinking_block_index {
                         // 先发送空的 thinking_delta
                         events.push(self.create_thinking_delta_event(thinking_index, ""));
-                        // 再发送 content_block_stop
+                        // 再发送 signature_delta（满足客户端 thinking 模式本地校验）
+                        events.push(self.create_signature_delta_event(thinking_index));
+                        // 最后发送 content_block_stop
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
                         {
@@ -2126,6 +2165,46 @@ mod tests {
         assert_eq!(
             message_delta.data["delta"]["stop_reason"], "tool_use",
             "stop_reason should be tool_use when tool_use is present"
+        );
+    }
+
+    /// B3 回归：流式 thinking 块结束前必须发一个非空 signature_delta，且排在
+    /// content_block_stop 之前。否则客户端下一轮回传时本地校验失败报错
+    /// "The content[].thinking in the thinking mode must be passed back"。
+    #[test]
+    fn test_thinking_block_emits_signature_delta_before_stop() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>\n\nHello"));
+        all_events.extend(ctx.generate_final_events());
+
+        let thinking_index = ctx
+            .thinking_block_index
+            .expect("thinking block index should exist");
+
+        // 存在一个非空 signature_delta，index 指向 thinking 块
+        let pos_sig = all_events.iter().position(|e| {
+            e.event == "content_block_delta"
+                && e.data["delta"]["type"] == "signature_delta"
+                && e.data["delta"]["signature"]
+                    .as_str()
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false)
+                && e.data["index"].as_i64() == Some(thinking_index as i64)
+        });
+        assert!(pos_sig.is_some(), "应发出非空 signature_delta");
+
+        // signature_delta 必须排在 thinking 块的 content_block_stop 之前
+        let pos_stop = all_events.iter().position(|e| {
+            e.event == "content_block_stop"
+                && e.data["index"].as_i64() == Some(thinking_index as i64)
+        });
+        assert!(pos_stop.is_some(), "thinking 块应被关闭");
+        assert!(
+            pos_sig.unwrap() < pos_stop.unwrap(),
+            "signature_delta 必须排在 content_block_stop 之前"
         );
     }
 }
