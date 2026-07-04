@@ -216,6 +216,29 @@ pub struct Config {
     #[serde(default = "default_refresh_interval_secs")]
     pub token_refresh_interval_secs: u64,
 
+    // ============ Admin UI 登录页 ============
+    /// 登录页是否显示随机背景图（默认 true）。关闭后登录页用纯渐变背景，
+    /// 不再请求外部图源。此项立即生效（登录页每次加载时读取）。
+    #[serde(default = "default_true")]
+    pub login_background_enabled: bool,
+
+    // ============ 余额同步（A6：温和的周期性余额刷新）============
+    /// 后台温和刷新余额缓存的间隔（秒）。`0` = 禁用（默认 1800 = 30 分钟）。
+    ///
+    /// 封号红线：绝不在启动/挂载时批量拉；后台任务用长间隔、逐个刷新且每个之间
+    /// 留有间隔（分散节奏），只刷未禁用的号，仅更新缓存供展示，绝不做主动禁用。
+    /// 安全第一：可保守设为 0 禁用，由用户在设置里自行开启。
+    ///
+    /// 热重载批次(HR)会把它做成可热调，本批先作为需重启字段。
+    #[serde(default = "default_balance_refresh_interval_secs")]
+    pub balance_refresh_interval_secs: u64,
+
+    // ============ 凭据回收站 ============
+    /// 回收站保留天数：软删除的凭据超过此天数后由后台任务彻底清理（默认 30）。
+    /// `0` 表示永久保留，不自动清理。
+    #[serde(default = "default_trash_retention_days")]
+    pub trash_retention_days: u32,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -318,6 +341,14 @@ fn default_refresh_interval_secs() -> u64 {
     60
 }
 
+fn default_trash_retention_days() -> u32 {
+    30
+}
+
+fn default_balance_refresh_interval_secs() -> u64 {
+    1800
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -362,6 +393,9 @@ impl Default for Config {
             proactive_token_refresh: default_true(),
             token_refresh_lead_minutes: default_refresh_lead_minutes(),
             token_refresh_interval_secs: default_refresh_interval_secs(),
+            login_background_enabled: default_true(),
+            trash_retention_days: default_trash_retention_days(),
+            balance_refresh_interval_secs: default_balance_refresh_interval_secs(),
             config_path: None,
         }
     }
