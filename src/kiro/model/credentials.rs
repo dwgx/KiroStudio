@@ -116,6 +116,25 @@ fn is_zero(value: &u32) -> bool {
     *value == 0
 }
 
+/// 回收站条目：软删除的凭据及其删除元数据
+///
+/// 删除凭据不再物理丢弃，而是包成 `TrashEntry` 移入独立回收站存储，
+/// 可原样恢复（含 id/refreshToken 等全部字段）或彻底删除。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrashEntry {
+    /// 被删除的完整凭据（含 id，可原样恢复回凭据池）
+    pub credentials: KiroCredentials,
+    /// 删除时间（RFC3339 格式）
+    pub deleted_at: String,
+    /// 删除前累计的 API 调用成功次数（恢复时一并还原）
+    #[serde(default)]
+    pub success_count: u64,
+    /// 删除前最后一次 API 调用时间（恢复时一并还原）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<String>,
+}
+
 fn canonicalize_auth_method_value(value: &str) -> &str {
     if value.eq_ignore_ascii_case("builder-id") || value.eq_ignore_ascii_case("iam") {
         "idc"
@@ -271,6 +290,25 @@ impl KiroCredentials {
                 .as_deref()
                 .map(|m| m.eq_ignore_ascii_case("api_key") || m.eq_ignore_ascii_case("apikey"))
                 .unwrap_or(false)
+    }
+
+    /// 获取 Web Portal Idp 标识（用于 Cookie: `Idp=<idp>`）
+    ///
+    /// KiroStudio 的凭据结构没有独立 `idp` 字段，这里按 `auth_method` 推断：
+    /// - social（或未标注）→ "Google"（绝大多数 social 用户为 Google 登录）
+    /// - idc / api_key → 留空（这两种凭据不参与 app.kiro.dev Web Portal 接口）
+    ///
+    /// 仅用于 overage 开关等 Web Portal 调用；返回空串表示该凭据不支持。
+    pub fn effective_idp(&self) -> &str {
+        match self
+            .auth_method
+            .as_deref()
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("social") | None => "Google",
+            _ => "",
+        }
     }
 }
 

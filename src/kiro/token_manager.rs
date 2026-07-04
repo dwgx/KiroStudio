@@ -12,7 +12,7 @@ use tokio::sync::Mutex as TokioMutex;
 
 use std::collections::HashMap;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
@@ -20,7 +20,7 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::affinity::UserAffinityManager;
 use crate::kiro::cooldown::{CooldownManager, CooldownReason};
 use crate::kiro::machine_id;
-use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::credentials::{KiroCredentials, TrashEntry};
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
@@ -498,6 +498,34 @@ pub struct CredentialEntrySnapshot {
     pub endpoint: Option<String>,
 }
 
+/// 回收站条目快照（用于 Admin API 读取，不含敏感明文）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrashSnapshot {
+    /// 凭据唯一 ID
+    pub id: u64,
+    /// 优先级
+    pub priority: u32,
+    /// 认证方式
+    pub auth_method: Option<String>,
+    /// 用户邮箱
+    pub email: Option<String>,
+    /// kiroApiKey 的脱敏展示（仅 API Key 凭据）
+    pub masked_api_key: Option<String>,
+    /// refreshToken 的 SHA-256 哈希（仅 OAuth 凭据）
+    pub refresh_token_hash: Option<String>,
+    /// kiroApiKey 的 SHA-256 哈希（仅 API Key 凭据）
+    pub api_key_hash: Option<String>,
+    /// 端点名称
+    pub endpoint: Option<String>,
+    /// 删除时间（RFC3339 格式）
+    pub deleted_at: String,
+    /// 删除前累计成功次数
+    pub success_count: u64,
+    /// 删除前最后一次调用时间
+    pub last_used_at: Option<String>,
+}
+
 /// 凭据管理器状态快照
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -521,6 +549,11 @@ pub struct MultiTokenManager {
     proxy: Option<ProxyConfig>,
     /// 凭据条目列表
     entries: Mutex<Vec<CredentialEntry>>,
+    /// 回收站（软删除的凭据）
+    ///
+    /// 删除凭据时物理移出 `entries` 并推入此处，让其从调度池彻底消失，
+    /// 无需在各处 filter(!disabled) 补条件；可恢复或彻底删除。
+    trash: Mutex<Vec<TrashEntry>>,
     /// 当前活动凭据 ID
     current_id: Mutex<u64>,
     /// Token 刷新锁，确保同一时间只有一个刷新操作
@@ -554,6 +587,69 @@ const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 
+/// 原子写入文件：先写同目录临时文件 + 尽力 fsync，再 rename 覆盖目标
+///
+/// 相比 `std::fs::write` 的裸覆盖，本函数避免"写到一半崩溃 / 磁盘满"导致
+/// 目标文件被截断清空（refreshToken/clientSecret 属不可再生资产，绝不能丢）。
+///
+/// 关键点：
+/// - 临时文件放在目标 **同目录**（保证同一文件系统，`rename` 才是原子的）；
+/// - 若 `path` 是软链，先 `canonicalize` 拿到真实路径再 rename，避免把软链
+///   本身替换成普通文件（canonicalize 对不存在的目标会失败，此时说明是首次
+///   写入，直接用原 path）；
+/// - Windows 下 `rename` 覆盖已存在文件是支持的，但目标被占用可能失败——
+///   失败时回退到直接 `write` 并记 warn，绝不让整体持久化失败。
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    // 解析真实目标路径：软链要写到它指向的真身；不存在（首次写入）则用原 path
+    let target: PathBuf = match std::fs::canonicalize(path) {
+        Ok(real) => real,
+        Err(_) => path.to_path_buf(),
+    };
+
+    let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = target
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("credentials");
+    // 同目录下的隐藏临时文件。文件名带 pid + 进程内单调递增序号，
+    // 既避免跨进程碰撞，也避免同进程内两个并发持久化争抢同一 tmp 互相截断。
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{}.{}.{}.tmp", file_name, std::process::id(), seq));
+
+    // 写入临时文件并尽力落盘
+    let write_tmp = || -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.flush()?;
+        // 尽力 sync，失败不致命（部分平台/文件系统可能不支持）
+        let _ = f.sync_all();
+        Ok(())
+    };
+
+    if let Err(e) = write_tmp() {
+        // 临时文件都写不出，清理残留后回退到直接写
+        let _ = std::fs::remove_file(&tmp);
+        tracing::warn!("原子写临时文件失败，回退直接写: {:?}: {}", tmp, e);
+        return std::fs::write(&target, bytes);
+    }
+
+    // rename 覆盖目标（原子替换）
+    match std::fs::rename(&tmp, &target) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Windows 下目标被句柄占用等场景可能失败：回退直接写，别让持久化整体失败
+            tracing::warn!("原子 rename 失败，回退直接写: {:?} -> {:?}: {}", tmp, target, e);
+            let result = std::fs::write(&target, bytes);
+            // 清理残留临时文件
+            let _ = std::fs::remove_file(&tmp);
+            result
+        }
+    }
+}
+
 /// API 调用上下文
 ///
 /// 绑定特定凭据的调用上下文，确保 token、credentials 和 id 的一致性
@@ -566,6 +662,21 @@ pub struct CallContext {
     pub credentials: KiroCredentials,
     /// 访问 Token
     pub token: String,
+}
+
+/// Web Portal API 调用上下文（用于 app.kiro.dev overage 接口）
+///
+/// 与 [`CallContext`] 的区别：本上下文携带 Web Portal 所需的 idp + profileArn，
+/// 不参与负载均衡选择，仅供显式的单号 overage 开/关调用使用。
+pub struct WebPortalContext {
+    /// 凭据 ID（便于上层日志关联）
+    #[allow(dead_code)]
+    pub id: u64,
+    pub token: String,
+    pub idp: String,
+    pub profile_arn: Option<String>,
+    pub proxy: Option<ProxyConfig>,
+    pub tls_backend: crate::model::config::TlsBackend,
 }
 
 impl MultiTokenManager {
@@ -677,6 +788,7 @@ impl MultiTokenManager {
             config,
             proxy,
             entries: Mutex::new(entries),
+            trash: Mutex::new(Vec::new()),
             current_id: Mutex::new(initial_id),
             refresh_lock: TokioMutex::new(()),
             credentials_path,
@@ -704,12 +816,27 @@ impl MultiTokenManager {
         // 加载持久化的统计数据（success_count, last_used_at）
         manager.load_stats();
 
+        // 加载回收站（trash.json；不存在则空）
+        manager.load_trash();
+
         Ok(manager)
     }
 
     /// 获取配置的引用
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// 导出指定 ID 凭据的原始 KiroCredentials（用于 Admin 令牌下载）
+    ///
+    /// 返回可直接重新导入本系统的完整凭据（含 refreshToken/clientId 等敏感字段）。
+    /// 调用方（Admin 层）必须已通过鉴权。
+    pub fn export_credential(&self, id: u64) -> Option<KiroCredentials> {
+        self.entries
+            .lock()
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.credentials.clone())
     }
 
     /// 获取凭据总数
@@ -836,7 +963,12 @@ impl MultiTokenManager {
         user_id: Option<&str>,
     ) -> anyhow::Result<CallContext> {
         let total = self.total_count();
-        let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
+        // 内层尝试预算需与 provider 层的外层重试预算同量级放开：
+        // 以可用凭据数为下限，保证内层不会在外层遍历完所有可用号之前就先耗尽。
+        // （历史上仅 total*MAX_FAILURES，当可用数因禁用波动大时可能过紧）
+        let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize)
+            .max(self.available_count())
+            .max(1);
         let mut attempt_count = 0;
 
         loop {
@@ -1100,12 +1232,13 @@ impl MultiTokenManager {
         // 序列化为 pretty JSON
         let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
 
-        // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
+        // 原子写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
         if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| std::fs::write(path, &json))
+            tokio::task::block_in_place(|| write_atomic(path, json.as_bytes()))
                 .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
         } else {
-            std::fs::write(path, &json).with_context(|| format!("回写凭据文件失败: {:?}", path))?;
+            write_atomic(path, json.as_bytes())
+                .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
         }
 
         tracing::debug!("已回写凭据到文件: {:?}", path);
@@ -1117,6 +1250,79 @@ impl MultiTokenManager {
         self.credentials_path
             .as_ref()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    }
+
+    /// 回收站文件路径（cache_dir/trash.json）
+    fn trash_path(&self) -> Option<PathBuf> {
+        self.cache_dir().map(|d| d.join("trash.json"))
+    }
+
+    /// 从磁盘加载回收站（trash.json）
+    ///
+    /// 仅多凭据格式才有持久化文件；单凭据格式下回收站为纯内存态。
+    /// 文件不存在或解析失败时静默回退为空。
+    fn load_trash(&self) {
+        if !self.is_multiple_format {
+            return;
+        }
+        let path = match self.trash_path() {
+            Some(p) => p,
+            None => return,
+        };
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return, // 首次运行时文件不存在
+        };
+        if content.trim().is_empty() {
+            return;
+        }
+        let items: Vec<TrashEntry> = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("解析回收站失败，将忽略: {}", e);
+                return;
+            }
+        };
+        let count = items.len();
+        *self.trash.lock() = items;
+        tracing::info!("已从回收站加载 {} 条已删除凭据", count);
+    }
+
+    /// 将回收站持久化到磁盘（仿 persist_credentials）
+    ///
+    /// # Returns
+    /// - `Ok(true)` - 成功写入文件
+    /// - `Ok(false)` - 跳过写入（非多凭据格式或无路径配置）
+    /// - `Err(_)` - 写入失败
+    fn persist_trash(&self) -> anyhow::Result<bool> {
+        use anyhow::Context;
+
+        // 仅多凭据格式才回写（单凭据格式下回收站仅内存态）
+        if !self.is_multiple_format {
+            return Ok(false);
+        }
+
+        let path = match self.trash_path() {
+            Some(p) => p,
+            None => return Ok(false),
+        };
+
+        let items: Vec<TrashEntry> = self.trash.lock().clone();
+
+        // 序列化为 pretty JSON
+        let json = serde_json::to_string_pretty(&items).context("序列化回收站失败")?;
+
+        // 原子写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(|| write_atomic(&path, json.as_bytes()))
+                .with_context(|| format!("回写回收站文件失败: {:?}", path))?;
+        } else {
+            write_atomic(&path, json.as_bytes())
+                .with_context(|| format!("回写回收站文件失败: {:?}", path))?;
+        }
+
+        tracing::debug!("已回写回收站到文件: {:?}", path);
+        Ok(true)
     }
 
     /// 统计数据文件路径
@@ -1181,7 +1387,7 @@ impl MultiTokenManager {
 
         match serde_json::to_string_pretty(&stats) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
+                if let Err(e) = write_atomic(&path, json.as_bytes()) {
                     tracing::warn!("保存统计缓存失败: {}", e);
                 } else {
                     *self.last_stats_save_at.lock() = Some(Instant::now());
@@ -1850,6 +2056,82 @@ impl MultiTokenManager {
         Ok(usage_limits)
     }
 
+    /// 获取指定凭据的 Web Portal 调用上下文（token / idp / profileArn / proxy）。
+    ///
+    /// 只读语义：不改动凭据的业务状态，但为保证 token 有效会在过期时触发一次刷新
+    /// （与 `get_usage_limits_for` 一致的刷新流程），刷新成功会持久化新 token。
+    ///
+    /// 仅 social 凭据支持（idp 可推断为 Google）；API Key / IdC 凭据会直接报错。
+    pub async fn web_portal_context_for(&self, id: u64) -> anyhow::Result<WebPortalContext> {
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
+        if credentials.is_api_key_credential() {
+            anyhow::bail!("API Key 凭据不支持 Web Portal 接口（overage 开关仅限 social 凭据）");
+        }
+
+        // 需要有效 token：过期或即将过期则先刷新（复用 get_usage_limits_for 的双检锁流程）
+        let needs_refresh = is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
+        let final_creds = if needs_refresh {
+            let _guard = self.refresh_lock.lock().await;
+            let current = {
+                let entries = self.entries.lock();
+                entries
+                    .iter()
+                    .find(|e| e.id == id)
+                    .map(|e| e.credentials.clone())
+                    .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+            };
+            if is_token_expired(&current) || is_token_expiring_soon(&current) {
+                let effective_proxy = current.effective_proxy(self.proxy.as_ref());
+                let new_creds =
+                    refresh_token(&current, &self.config, effective_proxy.as_ref()).await?;
+                {
+                    let mut entries = self.entries.lock();
+                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                        entry.credentials = new_creds.clone();
+                    }
+                }
+                if let Err(e) = self.persist_credentials() {
+                    tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
+                }
+                new_creds
+            } else {
+                current
+            }
+        } else {
+            credentials
+        };
+
+        let token = final_creds
+            .access_token
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?;
+        let profile_arn = final_creds
+            .profile_arn
+            .clone()
+            .filter(|s| !s.trim().is_empty());
+        let idp = final_creds.effective_idp().to_string();
+        if idp.is_empty() {
+            anyhow::bail!("凭据不支持 Web Portal（仅 social 凭据可开关 overage）");
+        }
+        let proxy = final_creds.effective_proxy(self.proxy.as_ref());
+        Ok(WebPortalContext {
+            id,
+            token,
+            idp,
+            profile_arn,
+            proxy,
+            tls_backend: self.config.tls_backend,
+        })
+    }
+
     /// 深度验活：发送最小 generateAssistantResponse 请求检测账号 suspend 状态
     ///
     /// getUsageLimits 不检查 suspend，只有真实对话请求才能检测。
@@ -2065,9 +2347,18 @@ impl MultiTokenManager {
         };
 
         // 4. 分配新 ID
+        //    【红线】必须扫描 entries ∪ trash 的 id 并集取 max+1，
+        //    否则回收站里的 id 会与新加凭据撞号，恢复时冲突。
         let new_id = {
             let entries = self.entries.lock();
-            entries.iter().map(|e| e.id).max().unwrap_or(0) + 1
+            let trash = self.trash.lock();
+            let max_entry = entries.iter().map(|e| e.id).max().unwrap_or(0);
+            let max_trash = trash
+                .iter()
+                .filter_map(|t| t.credentials.id)
+                .max()
+                .unwrap_or(0);
+            max_entry.max(max_trash) + 1
         };
 
         // 5. 设置 ID 并保留用户输入的元数据
@@ -2113,18 +2404,18 @@ impl MultiTokenManager {
         Ok(new_id)
     }
 
-    /// 删除凭据（Admin API）
+    /// 删除凭据（Admin API）——软删除，移入回收站
     ///
     /// # 前置条件
     /// - 凭据必须已禁用（disabled = true）
     ///
     /// # 行为
-    /// 1. 验证凭据存在
-    /// 2. 验证凭据已禁用
-    /// 3. 从 entries 移除
-    /// 4. 如果删除的是当前凭据，切换到优先级最高的可用凭据
-    /// 5. 如果删除后没有凭据，将 current_id 重置为 0
-    /// 6. 持久化到文件
+    /// 1. 验证凭据存在且已禁用
+    /// 2. 从 entries 物理移出（让其从调度池彻底消失）
+    /// 3. 包成 TrashEntry 推入回收站
+    /// 4. 如果删除的是当前凭据，切换到优先级最高的可用凭据；删空则 current_id 重置为 0
+    /// 5. 先 persist_trash() 成功，再 persist_credentials()（双文件一致性，避免真丢号）
+    /// 6. 回写统计数据
     ///
     /// # 返回
     /// - `Ok(())` - 删除成功
@@ -2133,14 +2424,14 @@ impl MultiTokenManager {
         let was_current = {
             let mut entries = self.entries.lock();
 
-            // 查找凭据
-            let entry = entries
+            // 查找凭据位置
+            let idx = entries
                 .iter()
-                .find(|e| e.id == id)
+                .position(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
 
             // 检查是否已禁用
-            if !entry.disabled {
+            if !entries[idx].disabled {
                 anyhow::bail!("只能删除已禁用的凭据（请先禁用凭据 #{}）", id);
             }
 
@@ -2148,11 +2439,22 @@ impl MultiTokenManager {
             let current_id = *self.current_id.lock();
             let was_current = current_id == id;
 
-            // 删除凭据
-            entries.retain(|e| e.id != id);
+            // 物理移出 entries，包成 TrashEntry 推入回收站
+            let removed = entries.remove(idx);
+            let mut cred = removed.credentials;
+            cred.id = Some(removed.id); // 确保 id 落在凭据内，便于恢复
+            self.trash.lock().push(TrashEntry {
+                credentials: cred,
+                deleted_at: Utc::now().to_rfc3339(),
+                success_count: removed.success_count,
+                last_used_at: removed.last_used_at,
+            });
 
             was_current
         };
+
+        // 清除被删凭据的会话亲和性绑定，避免后续重选时命中已移出的凭据
+        self.affinity.remove_by_credential(id);
 
         // 如果删除的是当前凭据，切换到优先级最高的可用凭据
         if was_current {
@@ -2169,14 +2471,199 @@ impl MultiTokenManager {
             }
         }
 
-        // 持久化更改
+        // 双文件一致性：先落盘回收站，成功后再回写凭据池。
+        // 若回收站落盘失败则立刻回滚（把凭据放回 entries），避免真丢号。
+        if let Err(e) = self.persist_trash() {
+            let restored = {
+                let mut trash = self.trash.lock();
+                trash.pop().map(|t| t.credentials)
+            };
+            if let Some(cred) = restored {
+                let mut entries = self.entries.lock();
+                entries.push(CredentialEntry {
+                    id,
+                    credentials: cred,
+                    failure_count: 0,
+                    refresh_failure_count: 0,
+                    disabled: true,
+                    disabled_reason: Some(DisabledReason::Manual),
+                    success_count: 0,
+                    last_used_at: None,
+                });
+            }
+            return Err(e.context("回收站落盘失败，已回滚删除操作"));
+        }
+
+        // 持久化凭据池（移除后的结果）
         self.persist_credentials()?;
 
         // 立即回写统计数据，清除已删除凭据的残留条目
         self.save_stats();
 
-        tracing::info!("已删除凭据 #{}", id);
+        tracing::info!("已将凭据 #{} 移入回收站", id);
         Ok(())
+    }
+
+    /// 列出回收站中的所有已删除凭据（Admin API）
+    pub fn list_trash(&self) -> Vec<TrashSnapshot> {
+        self.trash
+            .lock()
+            .iter()
+            .map(|t| {
+                let c = &t.credentials;
+                let is_api_key = c.is_api_key_credential();
+                TrashSnapshot {
+                    id: c.id.unwrap_or(0),
+                    priority: c.priority,
+                    auth_method: if is_api_key {
+                        Some("api_key".to_string())
+                    } else {
+                        c.auth_method.as_deref().map(|m| {
+                            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam")
+                            {
+                                "idc".to_string()
+                            } else {
+                                m.to_string()
+                            }
+                        })
+                    },
+                    email: c.email.clone(),
+                    masked_api_key: if is_api_key {
+                        c.kiro_api_key.as_deref().map(mask_api_key)
+                    } else {
+                        None
+                    },
+                    refresh_token_hash: if is_api_key {
+                        None
+                    } else {
+                        c.refresh_token.as_deref().map(sha256_hex)
+                    },
+                    api_key_hash: if is_api_key {
+                        c.kiro_api_key.as_deref().map(sha256_hex)
+                    } else {
+                        None
+                    },
+                    endpoint: c.endpoint.clone(),
+                    deleted_at: t.deleted_at.clone(),
+                    success_count: t.success_count,
+                    last_used_at: t.last_used_at.clone(),
+                }
+            })
+            .collect()
+    }
+
+    /// 从回收站恢复凭据（Admin API）
+    ///
+    /// 【红线】恢复前做 refreshToken/kiroApiKey 哈希去重校验，若 entries 里
+    /// 已存在同 refreshToken/apiKey 的凭据则拒绝恢复。恢复后凭据回到 entries，
+    /// id 保持不变，并还原删除前的统计数据。
+    pub fn restore_credential(&self, id: u64) -> anyhow::Result<()> {
+        // 去重校验 + 移出回收站 + 放回凭据池，全程在同时持有两锁的临界区内完成。
+        // 【锁序红线】统一为 entries → trash（与 delete_credential/add_credential 一致），
+        // 避免与它们构成 ABBA 死锁。整段临界区内不做任何 .await / IO。
+        {
+            let mut entries = self.entries.lock();
+            let mut trash = self.trash.lock();
+
+            let idx = trash
+                .iter()
+                .position(|t| t.credentials.id == Some(id))
+                .ok_or_else(|| anyhow::anyhow!("回收站中不存在凭据: {}", id))?;
+
+            // 去重校验：与现有 entries 比对 refreshToken / kiroApiKey 哈希
+            let cred = &trash[idx].credentials;
+            if cred.is_api_key_credential() {
+                if let Some(new_hash) = cred.kiro_api_key.as_deref().map(sha256_hex) {
+                    let dup = entries.iter().any(|e| {
+                        e.credentials.kiro_api_key.as_deref().map(sha256_hex).as_deref()
+                            == Some(new_hash.as_str())
+                    });
+                    if dup {
+                        anyhow::bail!("凭据已存在（kiroApiKey 重复），无法恢复");
+                    }
+                }
+            } else if let Some(new_hash) = cred.refresh_token.as_deref().map(sha256_hex) {
+                let dup = entries.iter().any(|e| {
+                    e.credentials.refresh_token.as_deref().map(sha256_hex).as_deref()
+                        == Some(new_hash.as_str())
+                });
+                if dup {
+                    anyhow::bail!("凭据已存在（refreshToken 重复），无法恢复");
+                }
+            }
+
+            // 校验通过：正式移出回收站，放回凭据池
+            // id 不变，恢复为已禁用状态（避免刚恢复即被调度，交由 Admin 手动启用）
+            let restored_entry = trash.remove(idx);
+            let mut cred = restored_entry.credentials;
+            cred.id = Some(id);
+            cred.disabled = true;
+            entries.push(CredentialEntry {
+                id,
+                credentials: cred,
+                failure_count: 0,
+                refresh_failure_count: 0,
+                disabled: true,
+                disabled_reason: Some(DisabledReason::Manual),
+                success_count: restored_entry.success_count,
+                last_used_at: restored_entry.last_used_at,
+            });
+        }
+
+        // 双文件一致性：先落盘凭据池，再落盘回收站
+        self.persist_credentials()?;
+        if let Err(e) = self.persist_trash() {
+            tracing::warn!("恢复凭据 #{} 后回写回收站失败: {}", id, e);
+        }
+        self.save_stats();
+
+        tracing::info!("已从回收站恢复凭据 #{}（恢复为禁用态）", id);
+        Ok(())
+    }
+
+    /// 从回收站彻底删除凭据（Admin API，不可恢复）
+    pub fn purge_credential(&self, id: u64) -> anyhow::Result<()> {
+        {
+            let mut trash = self.trash.lock();
+            let idx = trash
+                .iter()
+                .position(|t| t.credentials.id == Some(id))
+                .ok_or_else(|| anyhow::anyhow!("回收站中不存在凭据: {}", id))?;
+            trash.remove(idx);
+        }
+        self.persist_trash()?;
+        tracing::info!("已从回收站彻底删除凭据 #{}", id);
+        Ok(())
+    }
+
+    /// 清理回收站中超过保留期的条目（由后台定时任务周期调用）
+    ///
+    /// `retention_days == 0` 表示永久保留，直接返回 0。
+    /// 返回被清理的条目数量。
+    pub fn purge_expired_trash(&self, retention_days: u32) -> usize {
+        if retention_days == 0 {
+            return 0; // 永久保留
+        }
+        let cutoff = Utc::now() - Duration::days(retention_days as i64);
+        let removed = {
+            let mut trash = self.trash.lock();
+            let before = trash.len();
+            trash.retain(|t| {
+                // 无法解析删除时间的条目保守保留（不误删）
+                match DateTime::parse_from_rfc3339(&t.deleted_at) {
+                    Ok(dt) => dt.with_timezone(&Utc) > cutoff,
+                    Err(_) => true,
+                }
+            });
+            before - trash.len()
+        };
+        if removed > 0 {
+            if let Err(e) = self.persist_trash() {
+                tracing::warn!("清理过期回收站后回写失败: {}", e);
+            }
+            tracing::info!("回收站保留清理：彻底删除 {} 条过期凭据", removed);
+        }
+        removed
     }
 
     /// 清理会话亲和性 map 中超过 TTL 的空闲条目（由 main 的后台定时任务周期调用）。
@@ -2359,6 +2846,41 @@ impl Drop for MultiTokenManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_write_atomic_writes_content_and_no_tmp_residue() {
+        let dir = std::env::temp_dir().join(format!("kiro-atomic-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("credentials.json");
+
+        write_atomic(&path, b"hello-atomic").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello-atomic");
+
+        // 目录下不应残留 .credentials.json.*.tmp
+        let has_tmp = std::fs::read_dir(&dir).unwrap().any(|e| {
+            e.ok()
+                .and_then(|e| e.file_name().into_string().ok())
+                .map(|n| n.ends_with(".tmp"))
+                .unwrap_or(false)
+        });
+        assert!(!has_tmp, "临时文件不应残留");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_write_atomic_overwrites_existing_file() {
+        let dir = std::env::temp_dir().join(format!("kiro-atomic-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("data.json");
+
+        std::fs::write(&path, b"old-content-longer").unwrap();
+        write_atomic(&path, b"new").unwrap();
+        // 覆盖后内容必须是新内容，不能残留旧内容尾巴
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn test_is_token_expired_with_expired_token() {
@@ -3209,5 +3731,245 @@ mod tests {
 
         assert_eq!(credentials.effective_auth_region(&config), "auth-only");
         assert_eq!(credentials.effective_api_region(&config), "api-only");
+    }
+
+    // ============ 凭据回收站测试 ============
+
+    /// 软删除后：凭据不在 entries、在 trash
+    #[test]
+    fn test_delete_moves_credential_to_trash() {
+        let config = Config::default();
+        let mut c1 = KiroCredentials::default();
+        c1.refresh_token = Some("refresh-1".to_string());
+        let mut c2 = KiroCredentials::default();
+        c2.refresh_token = Some("refresh-2".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![c1, c2], None, None, false).unwrap();
+
+        // 必须先禁用才能删除
+        manager.set_disabled(1, true).unwrap();
+        manager.delete_credential(1).unwrap();
+
+        // 不在 entries
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.total, 1);
+        assert!(snapshot.entries.iter().all(|e| e.id != 1));
+
+        // 在 trash
+        let trash = manager.list_trash();
+        assert_eq!(trash.len(), 1);
+        assert_eq!(trash[0].id, 1);
+        assert!(!trash[0].deleted_at.is_empty());
+    }
+
+    /// 删除未禁用凭据应被拒绝，且不进入回收站
+    #[test]
+    fn test_delete_requires_disabled() {
+        let config = Config::default();
+        let mut c1 = KiroCredentials::default();
+        c1.refresh_token = Some("refresh-1".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![c1], None, None, false).unwrap();
+
+        let err = manager.delete_credential(1).unwrap_err().to_string();
+        assert!(err.contains("只能删除已禁用的凭据"), "实际: {}", err);
+        assert_eq!(manager.list_trash().len(), 0);
+        assert_eq!(manager.total_count(), 1);
+    }
+
+    /// 恢复后：回 entries 且 id 不变
+    #[test]
+    fn test_restore_returns_to_entries_id_unchanged() {
+        let config = Config::default();
+        let mut c1 = KiroCredentials::default();
+        c1.refresh_token = Some("refresh-1".to_string());
+        let mut c2 = KiroCredentials::default();
+        c2.refresh_token = Some("refresh-2".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![c1, c2], None, None, false).unwrap();
+
+        manager.set_disabled(2, true).unwrap();
+        manager.delete_credential(2).unwrap();
+        assert_eq!(manager.list_trash().len(), 1);
+
+        // 恢复
+        manager.restore_credential(2).unwrap();
+
+        // 回到 entries，id 保持 2
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.total, 2);
+        let restored = snapshot.entries.iter().find(|e| e.id == 2);
+        assert!(restored.is_some(), "id=2 应回到 entries");
+        // 恢复为禁用态
+        assert!(restored.unwrap().disabled);
+        // 回收站已清空该条目
+        assert_eq!(manager.list_trash().len(), 0);
+    }
+
+    /// 恢复重复 refreshToken 被拒
+    #[test]
+    fn test_restore_duplicate_refresh_token_rejected() {
+        let config = Config::default();
+        // 两个凭据故意使用相同 refreshToken
+        let mut c1 = KiroCredentials::default();
+        c1.refresh_token = Some("same-refresh".to_string());
+        let mut c2 = KiroCredentials::default();
+        c2.refresh_token = Some("same-refresh".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![c1, c2], None, None, false).unwrap();
+
+        // 删除 id=1（进入回收站）；id=2 仍在 entries，持有相同 refreshToken
+        manager.set_disabled(1, true).unwrap();
+        manager.delete_credential(1).unwrap();
+
+        // 恢复 id=1 应因 refreshToken 与 id=2 重复而被拒
+        let err = manager.restore_credential(1).unwrap_err().to_string();
+        assert!(err.contains("refreshToken 重复"), "实际: {}", err);
+        // 仍留在回收站，未误入 entries
+        assert_eq!(manager.list_trash().len(), 1);
+        assert_eq!(manager.total_count(), 1);
+    }
+
+    /// new_id 分配跳过 trash 里的 id，防撞号
+    #[tokio::test]
+    async fn test_new_id_skips_trash_id() {
+        let config = Config::default();
+        // 用 API Key 凭据，add_credential 无需网络刷新
+        let mut c1 = KiroCredentials::default();
+        c1.auth_method = Some("api_key".to_string());
+        c1.kiro_api_key = Some("ksk_first_credential_key".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![c1], None, None, false).unwrap();
+
+        // 删除 id=1 → 进回收站，entries 空
+        manager.set_disabled(1, true).unwrap();
+        manager.delete_credential(1).unwrap();
+        assert_eq!(manager.total_count(), 0);
+        assert_eq!(manager.list_trash().len(), 1);
+
+        // 新增凭据：即便 entries 为空，new_id 也须跳过回收站里的 id=1
+        let mut new_cred = KiroCredentials::default();
+        new_cred.auth_method = Some("api_key".to_string());
+        new_cred.kiro_api_key = Some("ksk_second_credential_key".to_string());
+        let new_id = manager.add_credential(new_cred).await.unwrap();
+
+        assert_eq!(new_id, 2, "new_id 必须跳过回收站里的 id=1");
+    }
+
+    /// purge：从回收站彻底删除后不可恢复
+    #[test]
+    fn test_purge_removes_from_trash() {
+        let config = Config::default();
+        let mut c1 = KiroCredentials::default();
+        c1.refresh_token = Some("refresh-1".to_string());
+        let mut c2 = KiroCredentials::default();
+        c2.refresh_token = Some("refresh-2".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![c1, c2], None, None, false).unwrap();
+
+        manager.set_disabled(1, true).unwrap();
+        manager.delete_credential(1).unwrap();
+        assert_eq!(manager.list_trash().len(), 1);
+
+        manager.purge_credential(1).unwrap();
+        assert_eq!(manager.list_trash().len(), 0);
+
+        // 已彻底删除，恢复应报不存在
+        let err = manager.restore_credential(1).unwrap_err().to_string();
+        assert!(err.contains("回收站中不存在"), "实际: {}", err);
+    }
+
+    /// purge_expired_trash：按保留期清理，0 表示永久保留
+    #[test]
+    fn test_purge_expired_trash_retention() {
+        let config = Config::default();
+        let mut c1 = KiroCredentials::default();
+        c1.refresh_token = Some("refresh-1".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![c1], None, None, false).unwrap();
+
+        manager.set_disabled(1, true).unwrap();
+        manager.delete_credential(1).unwrap();
+
+        // 把删除时间改成 40 天前
+        {
+            let mut trash = manager.trash.lock();
+            trash[0].deleted_at = (Utc::now() - Duration::days(40)).to_rfc3339();
+        }
+
+        // retention=0：永久保留，不清理
+        assert_eq!(manager.purge_expired_trash(0), 0);
+        assert_eq!(manager.list_trash().len(), 1);
+
+        // retention=30：40 天前的条目应被清理
+        assert_eq!(manager.purge_expired_trash(30), 1);
+        assert_eq!(manager.list_trash().len(), 0);
+    }
+
+    /// trash.json 持久化往返：多凭据格式下删除落盘，重建后回收站仍在
+    #[test]
+    fn test_trash_persists_and_reloads() {
+        let dir = std::env::temp_dir().join(format!("kiro-trash-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cred_path = dir.join("credentials.json");
+        std::fs::write(
+            &cred_path,
+            r#"[{"id":1,"refreshToken":"refresh-1"},{"id":2,"refreshToken":"refresh-2"}]"#,
+        )
+        .unwrap();
+
+        let creds = vec![
+            {
+                let mut c = KiroCredentials::default();
+                c.id = Some(1);
+                c.refresh_token = Some("refresh-1".to_string());
+                c
+            },
+            {
+                let mut c = KiroCredentials::default();
+                c.id = Some(2);
+                c.refresh_token = Some("refresh-2".to_string());
+                c
+            },
+        ];
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            creds,
+            None,
+            Some(cred_path.clone()),
+            true,
+        )
+        .unwrap();
+
+        manager.set_disabled(1, true).unwrap();
+        manager.delete_credential(1).unwrap();
+
+        // trash.json 应已写入
+        let trash_file = dir.join("trash.json");
+        assert!(trash_file.exists(), "trash.json 应已落盘");
+
+        // 用同一凭据文件重建 manager（此时 credentials.json 已移除 id=1）
+        let reload_creds =
+            crate::kiro::model::credentials::CredentialsConfig::load(&cred_path)
+                .unwrap()
+                .into_sorted_credentials();
+        let manager2 = MultiTokenManager::new(
+            Config::default(),
+            reload_creds,
+            None,
+            Some(cred_path.clone()),
+            true,
+        )
+        .unwrap();
+
+        // 回收站从磁盘恢复
+        let trash = manager2.list_trash();
+        assert_eq!(trash.len(), 1);
+        assert_eq!(trash[0].id, 1);
+        // entries 只剩 id=2
+        assert_eq!(manager2.total_count(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
