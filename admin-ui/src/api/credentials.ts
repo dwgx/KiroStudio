@@ -108,6 +108,13 @@ export async function deleteCredential(id: number): Promise<SuccessResponse> {
   return data
 }
 
+// 导出凭据完整对象（原始 KiroCredentials，camelCase，含 refreshToken/kiroApiKey 等）
+// 字段随认证方式不同而不同，前端按拿到的对象处理，不假设某字段一定存在。
+export async function exportCredential(id: number): Promise<Record<string, unknown>> {
+  const { data } = await api.get<Record<string, unknown>>(`/credentials/${id}/export`)
+  return data
+}
+
 // 获取负载均衡模式
 export async function getLoadBalancingMode(): Promise<{ mode: 'priority' | 'balanced' }> {
   const { data } = await api.get<{ mode: 'priority' | 'balanced' }>('/config/load-balancing')
