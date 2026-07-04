@@ -88,6 +88,12 @@ export async function getCredentialBalance(id: number): Promise<BalanceResponse>
   return data
 }
 
+// 深度验活（真实 API 调用检测 suspend）
+export async function deepVerifyCredential(id: number): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/verify`)
+  return data
+}
+
 // 添加新凭据
 export async function addCredential(
   req: AddCredentialRequest
