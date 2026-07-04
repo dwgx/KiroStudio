@@ -40,3 +40,9 @@ Thumbs.db
 admin-ui/package-lock.json
 *.tsbuildinfo
 .playwright-mcp/
+
+# 临时部署产物
+*.tar.gz
+data/
+ui-mockups/
+*.txt.dproj.txt
