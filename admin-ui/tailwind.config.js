@@ -1,12 +1,15 @@
 /** @type {import('tailwindcss').Config} */
 export default {
-  darkMode: 'class',
   content: [
     './index.html',
     './src/**/*.{js,ts,jsx,tsx}',
   ],
   theme: {
     extend: {
+      fontFamily: {
+        sans: ['Inter', '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'system-ui', 'sans-serif'],
+        mono: ['JetBrains Mono', 'SF Mono', 'Fira Code', 'monospace'],
+      },
       colors: {
         border: 'hsl(var(--border))',
         input: 'hsl(var(--input))',
@@ -43,9 +46,25 @@ export default {
         },
       },
       borderRadius: {
-        lg: 'var(--radius)',
-        md: 'calc(var(--radius) - 2px)',
-        sm: 'calc(var(--radius) - 4px)',
+        lg: 'calc(var(--radius) + 4px)',
+        md: 'var(--radius)',
+        sm: 'calc(var(--radius) - 2px)',
+      },
+      transitionTimingFunction: {
+        'out-expo': 'cubic-bezier(0.25, 0.46, 0.45, 0.94)',
+      },
+      transitionDuration: {
+        '150': '150ms',
+        '200': '200ms',
+      },
+      keyframes: {
+        'pulse-dot': {
+          '0%, 100%': { opacity: '1' },
+          '50%': { opacity: '0.5' },
+        },
+      },
+      animation: {
+        'pulse-dot': 'pulse-dot 2s ease-in-out infinite',
       },
     },
   },
