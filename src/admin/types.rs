@@ -64,8 +64,48 @@ pub struct CredentialStatusItem {
     pub endpoint: String,
 }
 
-// ============ 操作请求 ============
+// ============ 凭据回收站 ============
 
+/// 回收站列表响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrashListResponse {
+    /// 回收站条目总数
+    pub total: usize,
+    /// 已删除凭据列表（按删除时间倒序）
+    pub trash: Vec<TrashItemResponse>,
+}
+
+/// 单个回收站条目（不含敏感明文）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrashItemResponse {
+    /// 凭据唯一 ID（恢复时保持不变）
+    pub id: u64,
+    /// 优先级
+    pub priority: u32,
+    /// 认证方式
+    pub auth_method: Option<String>,
+    /// 用户邮箱
+    pub email: Option<String>,
+    /// kiroApiKey 的脱敏展示（仅 API Key 凭据）
+    pub masked_api_key: Option<String>,
+    /// refreshToken 的 SHA-256 哈希（仅 OAuth 凭据，用于前端去重展示）
+    pub refresh_token_hash: Option<String>,
+    /// kiroApiKey 的 SHA-256 哈希（仅 API Key 凭据）
+    pub api_key_hash: Option<String>,
+    /// 端点名称
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// 删除时间（RFC3339 格式）
+    pub deleted_at: String,
+    /// 删除前累计成功次数
+    pub success_count: u64,
+    /// 删除前最后一次调用时间（RFC3339 格式）
+    pub last_used_at: Option<String>,
+}
+
+// ============ 操作请求 ============
 /// 启用/禁用凭据请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -168,14 +208,49 @@ pub struct BalanceResponse {
     pub subscription_title: Option<String>,
     /// 当前使用量
     pub current_usage: f64,
-    /// 使用限额
+    /// 使用限额（base，不含 overage）
     pub usage_limit: f64,
-    /// 剩余额度
+    /// 剩余额度（overage 感知：overage 开启时含 overage cap）
     pub remaining: f64,
-    /// 使用百分比
+    /// 使用百分比（基于 effective_limit 计算）
     pub usage_percentage: f64,
     /// 下次重置时间（Unix 时间戳）
     pub next_reset_at: Option<f64>,
+    /// 是否开启超额（Online Overage）。serde default 兼容旧磁盘缓存。
+    #[serde(default)]
+    pub overage_enabled: bool,
+    /// 超额上限（overage cap）。未开启时为 0。serde default 兼容旧磁盘缓存。
+    #[serde(default)]
+    pub overage_cap: f64,
+    /// 有效使用限额（base + overage cap）。serde default 兼容旧磁盘缓存。
+    #[serde(default)]
+    pub effective_limit: f64,
+}
+
+// ============ 批量缓存余额（A10）============
+
+/// 单条已缓存余额快照（含缓存时间戳，供前端判断新鲜度）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedBalanceItem {
+    /// 缓存的余额数据
+    #[serde(flatten)]
+    pub balance: BalanceResponse,
+    /// 缓存写入时间（Unix 秒），前端据此判断新鲜度
+    pub cached_at: f64,
+}
+
+/// 批量已缓存余额响应
+///
+/// 仅返回【已缓存】凭据的快照，只读缓存，绝不触发任何上游调用。
+/// 缓存未命中的凭据不出现在 balances 中（前端可按需单独拉取）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedBalancesResponse {
+    /// 已缓存的凭据数量
+    pub total: usize,
+    /// id -> 缓存余额快照
+    pub balances: std::collections::HashMap<u64, CachedBalanceItem>,
 }
 
 // ============ 负载均衡配置 ============
@@ -339,6 +414,11 @@ pub struct ConfigSnapshotResponse {
     pub proactive_token_refresh: bool,
     pub token_refresh_lead_minutes: i64,
     pub token_refresh_interval_secs: u64,
+    // ---- Admin UI 登录页 ----
+    pub login_background_enabled: bool,
+    // ---- 余额同步（A6）----
+    /// 后台温和余额刷新间隔（秒，0=禁用）
+    pub balance_refresh_interval_secs: u64,
     /// 配置文件路径（运行时只读元数据）
     pub config_path: Option<String>,
 }
@@ -387,6 +467,11 @@ pub struct UpdateConfigRequest {
     pub proactive_token_refresh: Option<bool>,
     pub token_refresh_lead_minutes: Option<i64>,
     pub token_refresh_interval_secs: Option<u64>,
+    // ---- Admin UI 登录页（立即生效）----
+    pub login_background_enabled: Option<bool>,
+    // ---- 余额同步（A6，需重启生效）----
+    /// 后台温和余额刷新间隔（秒，0=禁用）
+    pub balance_refresh_interval_secs: Option<u64>,
 }
 
 /// 更新服务端配置响应
