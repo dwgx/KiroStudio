@@ -15,7 +15,7 @@ use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
 
-use super::types::{ContentBlock, MessagesRequest};
+use super::types::{ContentBlock, ImageSource, MessagesRequest};
 
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
 ///
@@ -74,6 +74,33 @@ When the Write or Edit tool has content size limits, always comply silently. \
 Never suggest bypassing these limits via alternative tools. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
+
+/// Claude Code 归因头前缀。
+///
+/// CC 会把形如 `x-anthropic-billing-header: cc_version=...;cch=...` 的归因头放在
+/// system 消息的**第一块**。其中 `cc_version`、`cch` 等字段每次请求都会漂移，
+/// 而这一块位于整个 prompt 的最前端。上游 Bedrock prefix cache 要求前缀逐字节一致
+/// 才命中（第 N 字节变化则其后全部失效），因此这一块的漂移会让上游缓存命中率≈0。
+pub(super) const BILLING_HEADER_PREFIX: &str = "x-anthropic-billing-header:";
+
+/// 归一化后的固定占位符，替换整行漂移的归因头，稳定住转发给上游的 prompt 前缀。
+pub(super) const BILLING_HEADER_PLACEHOLDER: &str = "__anthropic_billing_header__";
+
+/// 归一化 Claude Code 的归因头文本块。
+///
+/// 若 `text` 以归因头前缀开头（该块整行都是每请求漂移的归因字段），折叠成固定占位符；
+/// 否则原样返回。此函数同时供两处调用：
+/// 1. [`build_history`] 的 system 拼接路径——归一化**转发给上游**的字节，稳定缓存前缀；
+/// 2. [`super::cache_tracker`] 的影子指纹计算——本就归一化，保持两侧一致。
+///
+/// 归一化保守：只折叠确定每请求漂移的归因头整块，不触碰其余稳定的 system 内容。
+pub(super) fn canonicalize_billing_header(text: &str) -> &str {
+    if text.starts_with(BILLING_HEADER_PREFIX) {
+        BILLING_HEADER_PLACEHOLDER
+    } else {
+        text
+    }
+}
 
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 /// 严格对照版本号
@@ -344,9 +371,27 @@ fn determine_chat_trigger_type(_req: &MessagesRequest) -> String {
     "MANUAL".to_string()
 }
 
+/// 历史图片去重上限。
+///
+/// 历史中被"上浮"到顶层 images 的图片总数上限，防止多轮对话里累积的截图 base64
+/// 把请求体撑爆（与"400 Input too long"防护对齐）。仅约束历史去重路径，当前轮图片
+/// （dedup 为 None）不受此限、永远保留。
+const MAX_TOTAL_IMAGES: usize = 20;
+
 /// 处理消息内容，提取文本、图片和工具结果
 fn process_message_content(
     content: &serde_json::Value,
+) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
+    // 当前轮消息不做去重（dedup 为 None），本轮所有图片永远保留
+    process_message_content_dedup(content, None)
+}
+
+/// 与 [`process_message_content`] 相同，但当 `dedup` 为 `Some` 时按 SHA256 对图片去重：
+/// 同一张图（base64 完全一致）在历史多轮中反复出现时只在首次保留，之后替换为占位符文本，
+/// 避免同一截图跨多轮反复以 base64 重发而烧 token。
+fn process_message_content_dedup(
+    content: &serde_json::Value,
+    mut dedup: Option<&mut std::collections::HashSet<String>>,
 ) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
     let mut text_parts = Vec::new();
     let mut images = Vec::new();
@@ -366,15 +411,21 @@ fn process_message_content(
                             }
                         }
                         "image" => {
-                            if let Some(source) = block.source {
-                                if let Some(format) = get_image_format(&source.media_type) {
-                                    images.push(KiroImage::from_base64(format, source.data));
-                                }
+                            if let Some(source) = block.source
+                                && let Some(placeholder) =
+                                    extract_kiro_image(&source, &mut dedup, &mut images)
+                            {
+                                // 去重/超额命中时补占位符文本，保证图片语义不至于完全消失
+                                text_parts.push(placeholder);
                             }
                         }
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
-                                let result_content = extract_tool_result_content(&block.content);
+                                let result_content = extract_tool_result_content(
+                                    &block.content,
+                                    &mut dedup,
+                                    &mut images,
+                                );
                                 let is_error = block.is_error.unwrap_or(false);
 
                                 let mut result = if is_error {
@@ -413,18 +464,76 @@ fn get_image_format(media_type: &str) -> Option<String> {
     }
 }
 
+/// 把一个 image 块的 source 转成 `KiroImage` 并上浮到顶层 `images`。
+///
+/// tool_result 内的图片与顶层 image 块走同一条转换链（mime 校验 + SHA256 去重 + 上浮），
+/// 因为上游 Kiro 的 `ToolResult` 没有 image 字段，图片只能走 `userInputMessage.images[]`
+/// 顶层通道。
+///
+/// 返回值：
+/// - `Some(placeholder)`：历史去重命中、或历史图片数超过 [`MAX_TOTAL_IMAGES`] 上限，图片被省略；
+/// - `None`：图片已上浮到 `images`，或 media_type 不支持（无法转换）。
+fn extract_kiro_image(
+    source: &ImageSource,
+    dedup: &mut Option<&mut std::collections::HashSet<String>>,
+    images: &mut Vec<KiroImage>,
+) -> Option<String> {
+    // media_type 不支持时无声跳过（与旧行为一致，不补占位符）
+    let format = get_image_format(&source.media_type)?;
+
+    // 历史去重：只在 dedup 为 Some（历史路径）时生效，当前轮图片永远保留
+    if let Some(seen) = dedup.as_deref_mut() {
+        let mut hasher = Sha256::new();
+        hasher.update(source.data.as_bytes());
+        let digest = format!("{:x}", hasher.finalize());
+
+        if !seen.insert(digest) {
+            // 已见过同一张图：省略 base64，返回去重占位符
+            return Some("[image omitted: identical to an earlier screenshot]".to_string());
+        }
+        // 首次见到但已超过历史图片配额：撤销刚插入的指纹，返回超额占位符
+        if seen.len() > MAX_TOTAL_IMAGES {
+            return Some("[image omitted: too many images in history]".to_string());
+        }
+    }
+
+    images.push(KiroImage::from_base64(format, source.data.clone()));
+    None
+}
+
 /// 提取工具结果内容
-fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
+///
+/// 文本元素保留为 tool_result 占位符文本；`type=="image"` 的块被提取成 `KiroImage`
+/// 并上浮到顶层 `images`（上游 `ToolResult` 无 image 字段，图片只能走顶层通道）。
+/// 若某个 tool_result 只有图片没有文本，则用占位符文本 "[image attached]"。
+fn extract_tool_result_content(
+    content: &Option<serde_json::Value>,
+    dedup: &mut Option<&mut std::collections::HashSet<String>>,
+    images: &mut Vec<KiroImage>,
+) -> String {
     match content {
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(serde_json::Value::Array(arr)) => {
             let mut parts = Vec::new();
+            let mut had_image = false;
             for item in arr {
                 if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
                     parts.push(text.to_string());
+                } else if item.get("type").and_then(|v| v.as_str()) == Some("image")
+                    && let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone())
+                    && let Some(source) = block.source
+                {
+                    had_image = true;
+                    if let Some(placeholder) = extract_kiro_image(&source, dedup, images) {
+                        parts.push(placeholder);
+                    }
                 }
             }
-            parts.join("\n")
+            if parts.is_empty() && had_image {
+                "[image attached]".to_string()
+            } else {
+                parts.join("\n")
+            }
         }
         Some(v) => v.to_string(),
         None => String::new(),
@@ -553,7 +662,6 @@ fn remove_orphaned_tool_uses(
 
 /// Kiro API 工具名称最大长度限制
 const TOOL_NAME_MAX_LEN: usize = 63;
-
 /// 生成确定性短名称：截断前缀 + "_" + 8 位 SHA256 hex
 fn shorten_tool_name(name: &str) -> String {
     let mut hasher = Sha256::new();
@@ -587,6 +695,19 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut Ha
 
     tools
         .iter()
+        // 剥离 web_search 类工具：纯 web_search 请求走独立 MCP 分支（见 handlers 前置
+        // 的 has_web_search_tool 判定），不会到这里；但"常规工具 + web_search 混合"
+        // 会走常规转换路径，若把 web_search 原样下发给 Kiro 会触发 400 Improperly
+        // formed request。这里双保险过滤：tool_type 以 "web_search" 开头、或 name 为
+        // "web_search" 的条目一律跳过，其余工具正常转换。
+        .filter(|t| {
+            let is_web_search = t
+                .tool_type
+                .as_deref()
+                .is_some_and(|ty| ty.starts_with("web_search"))
+                || t.name == "web_search";
+            !is_web_search
+        })
         .map(|t| {
             let mut description = t.description.clone();
 
@@ -662,9 +783,11 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
 
     // 1. 处理系统消息
     if let Some(ref system) = req.system {
+        // 归一化每一块 system 文本：把 CC 归因头（第一块，每请求漂移）折叠成占位符，
+        // 稳定住转发给上游的 prompt 前缀，避免 Bedrock prefix cache 因归因头漂移而 0 命中。
         let system_content: String = system
             .iter()
-            .map(|s| s.text.clone())
+            .map(|s| canonicalize_billing_header(&s.text).to_string())
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -707,6 +830,8 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
     // 收集并配对消息
     let mut user_buffer: Vec<&super::types::Message> = Vec::new();
     let mut assistant_buffer: Vec<&super::types::Message> = Vec::new();
+    // 跨整个历史的图片 SHA256 去重集合：同一张图只在首次出现时保留 base64
+    let mut image_dedup: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for i in 0..history_end_index {
         let msg = &messages[i];
@@ -722,7 +847,7 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
         } else if msg.role == "assistant" {
             // 先处理累积的 user 消息
             if !user_buffer.is_empty() {
-                let merged_user = merge_user_messages(&user_buffer, model_id)?;
+                let merged_user = merge_user_messages(&user_buffer, model_id, &mut image_dedup)?;
                 history.push(Message::User(merged_user));
                 user_buffer.clear();
             }
@@ -739,7 +864,7 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
 
     // 处理结尾的孤立 user 消息
     if !user_buffer.is_empty() {
-        let merged_user = merge_user_messages(&user_buffer, model_id)?;
+        let merged_user = merge_user_messages(&user_buffer, model_id, &mut image_dedup)?;
         history.push(Message::User(merged_user));
 
         // 自动配对一个 "OK" 的 assistant 响应
@@ -754,13 +879,15 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
 fn merge_user_messages(
     messages: &[&super::types::Message],
     model_id: &str,
+    dedup: &mut std::collections::HashSet<String>,
 ) -> Result<HistoryUserMessage, ConversionError> {
     let mut content_parts = Vec::new();
     let mut all_images = Vec::new();
     let mut all_tool_results = Vec::new();
 
     for msg in messages {
-        let (text, images, tool_results) = process_message_content(&msg.content)?;
+        let (text, images, tool_results) =
+            process_message_content_dedup(&msg.content, Some(dedup))?;
         if !text.is_empty() {
             content_parts.push(text);
         }
@@ -908,6 +1035,86 @@ mod tests {
                 .unwrap()
                 .contains("sonnet")
         );
+        assert!(
+            map_model("claude-3-5-sonnet-20241022")
+                .unwrap()
+                .contains("sonnet")
+        );
+    }
+
+    /// T1 回归：带每请求漂移 cc_version/cch 的归因头，归一化后 system 转发字节应相同。
+    #[test]
+    fn test_billing_header_canonicalized_in_forwarded_system() {
+        use super::super::types::{Message as AnthropicMessage, SystemMessage};
+
+        let mk_req = |header: &str| MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+            }],
+            stream: false,
+            system: Some(vec![
+                SystemMessage {
+                    text: header.to_string(),
+                    block_type: Some("text".to_string()),
+                    cache_control: None,
+                },
+                SystemMessage {
+                    text: "You are a helpful assistant.".to_string(),
+                    block_type: Some("text".to_string()),
+                    cache_control: None,
+                },
+            ]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        // 两个请求的归因头 cc_version / cch 不同（每请求漂移）
+        let req_a = mk_req("x-anthropic-billing-header: cc_version=1.0.0;cch=aaaaaaaa");
+        let req_b = mk_req("x-anthropic-billing-header: cc_version=2.5.9;cch=zzzzzzzz");
+
+        // build_history 的第一条 user 消息即拼接后的 system 内容
+        let extract_system = |req: &MessagesRequest| -> String {
+            let history =
+                build_history(req, &req.messages, "claude-sonnet-4.5", &mut HashMap::new())
+                    .unwrap();
+            match &history[0] {
+                Message::User(u) => u.user_input_message.content.clone(),
+                _ => panic!("首条历史应为 system 对应的 user 消息"),
+            }
+        };
+
+        let sys_a = extract_system(&req_a);
+        let sys_b = extract_system(&req_b);
+
+        // 归一化后前缀稳定：两个请求转发给上游的 system 字节完全相同
+        assert_eq!(sys_a, sys_b, "归因头归一化后 system 转发字节应一致");
+        // 占位符出现在最前端，漂移字段不再泄漏到转发字节里
+        assert!(sys_a.starts_with(BILLING_HEADER_PLACEHOLDER));
+        assert!(!sys_a.contains("cc_version"));
+        assert!(sys_a.contains("You are a helpful assistant."));
+    }
+
+    #[test]
+    fn test_billing_header_non_matching_untouched() {
+        // 保守性：非归因头开头的 system 内容不应被改动
+        assert_eq!(
+            canonicalize_billing_header("You are a helpful assistant."),
+            "You are a helpful assistant."
+        );
+        assert_eq!(
+            canonicalize_billing_header("x-anthropic-billing-header: cc_version=1;cch=x"),
+            BILLING_HEADER_PLACEHOLDER
+        );
+    }
+
+    #[test]
+    fn test_map_model_sonnet_variants() {
         assert!(
             map_model("claude-3-5-sonnet-20241022")
                 .unwrap()
@@ -1125,6 +1332,56 @@ mod tests {
         let tools = &result.conversation_state.current_message.user_input_message
             .user_input_message_context.tools;
         assert_eq!(tools[0].tool_specification.name, *short);
+    }
+
+    #[test]
+    fn test_convert_tools_strips_web_search_in_mixed_list() {
+        use super::super::types::Tool as AnthropicTool;
+
+        let mk = |name: &str, ty: Option<&str>| AnthropicTool {
+            name: name.to_string(),
+            description: String::new(),
+            input_schema: std::collections::HashMap::new(),
+            tool_type: ty.map(|s| s.to_string()),
+            max_uses: None,
+            cache_control: None,
+        };
+
+        // web_search（带 type）+ 常规工具混合：web_search 应被剥离
+        let tools = Some(vec![
+            mk("web_search", Some("web_search_20250305")),
+            mk("Read", None),
+            mk("Write", None),
+        ]);
+        let mut map = HashMap::new();
+        let converted = convert_tools(&tools, &mut map);
+
+        let names: Vec<&str> = converted
+            .iter()
+            .map(|t| t.tool_specification.name.as_str())
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"Read"));
+        assert!(names.contains(&"Write"));
+        assert!(!names.iter().any(|n| *n == "web_search"));
+    }
+
+    #[test]
+    fn test_convert_tools_regular_tool_unaffected() {
+        use super::super::types::Tool as AnthropicTool;
+
+        let tools = Some(vec![AnthropicTool {
+            name: "Read".to_string(),
+            description: String::new(),
+            input_schema: std::collections::HashMap::new(),
+            tool_type: None,
+            max_uses: None,
+            cache_control: None,
+        }]);
+        let mut map = HashMap::new();
+        let converted = convert_tools(&tools, &mut map);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].tool_specification.name, "Read");
     }
 
     #[test]
@@ -1794,5 +2051,163 @@ mod tests {
             }
         }
         assert!(found_tool_use, "合并后的 assistant 消息应包含 tool_use");
+    }
+
+    // === B1 回归：tool_result 内的图片上浮到顶层 images ===
+
+    /// 1x1 PNG 的 base64（测试用）
+    const TINY_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+
+    #[test]
+    fn test_tool_result_image_lifts_to_top_level() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // user 提问 -> assistant tool_use -> user tool_result（含 image + text）
+        let req = MessagesRequest {
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("take a screenshot"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tool-1", "name": "screenshot", "input": {}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tool-1", "content": [
+                            {"type": "text", "text": "here is the screen"},
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": TINY_PNG_B64}}
+                        ]}
+                    ]),
+                },
+                // 追加一轮当前 user 消息，让上一轮 tool_result 进入历史（走去重/上浮路径）
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("what do you see?"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+
+        // 图片应从历史 tool_result 上浮到某条历史 user 消息的顶层 images
+        let mut found_image = false;
+        let mut tool_result_text_ok = false;
+        for msg in &result.conversation_state.history {
+            if let Message::User(u) = msg {
+                for img in &u.user_input_message.images {
+                    if img.format == "png" && img.source.bytes == TINY_PNG_B64 {
+                        found_image = true;
+                    }
+                }
+                // tool_result 只保留文本，base64 不应出现在 tool_result content 里
+                for tr in &u.user_input_message.user_input_message_context.tool_results {
+                    if tr.tool_use_id == "tool-1" {
+                        let text = tr.content[0].get("text").and_then(|v| v.as_str()).unwrap_or("");
+                        assert_eq!(text, "here is the screen");
+                        assert!(!text.contains(TINY_PNG_B64), "tool_result 不应含 base64");
+                        tool_result_text_ok = true;
+                    }
+                }
+            }
+        }
+        assert!(found_image, "tool_result 内的图片应上浮到顶层 images");
+        assert!(tool_result_text_ok, "应找到保留文本的 tool_result");
+    }
+
+    #[test]
+    fn test_tool_result_text_only_unchanged() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // 纯文本 tool_result：回归不变，不应产生任何顶层图片
+        let req = MessagesRequest {
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("read the file"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tool-1", "name": "read", "input": {"path": "/a.txt"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tool-1", "content": "file content"}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("thanks"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        for msg in &result.conversation_state.history {
+            if let Message::User(u) = msg {
+                assert!(
+                    u.user_input_message.images.is_empty(),
+                    "纯文本 tool_result 不应产生顶层图片"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_current_message_image_always_kept() {
+        // 当前轮消息（非历史）图片永远保留，不去重
+        let content = serde_json::json!([
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": TINY_PNG_B64}},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": TINY_PNG_B64}}
+        ]);
+        let (_text, images, _tr) = process_message_content(&content).unwrap();
+        // 当前轮 dedup 为 None，两张相同图片都保留
+        assert_eq!(images.len(), 2, "当前轮相同图片应全部保留");
+    }
+
+    #[test]
+    fn test_history_image_dedup() {
+        // 历史路径：同一张图跨消息重复出现，只保留首次
+        let mut dedup = std::collections::HashSet::new();
+        let content = serde_json::json!([
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": TINY_PNG_B64}}
+        ]);
+
+        let (_t1, imgs1, _) =
+            process_message_content_dedup(&content, Some(&mut dedup)).unwrap();
+        assert_eq!(imgs1.len(), 1, "首次出现应保留图片");
+
+        let (text2, imgs2, _) =
+            process_message_content_dedup(&content, Some(&mut dedup)).unwrap();
+        assert!(imgs2.is_empty(), "重复图片不应再次上浮");
+        assert!(
+            text2.contains("identical to an earlier screenshot"),
+            "重复图片应替换为去重占位符"
+        );
     }
 }
