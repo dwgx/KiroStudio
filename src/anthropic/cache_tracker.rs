@@ -394,6 +394,9 @@ fn flatten_cacheable_blocks(payload: &MessagesRequest) -> Vec<PendingBlock> {
 
 /// 归一化 system 文本块：把 Claude Code 的 `x-anthropic-billing-header:` 归因头
 /// 折叠成固定占位符，避免每次请求归因头轻微漂移（版本号/随机 cch）就打破缓存前缀。
+///
+/// 复用 [`super::converter::canonicalize_billing_header`]，与转发路径保持同一套归一化规则，
+/// 确保影子指纹计算与实际转发给上游的字节一致。
 fn canonicalize_system_block_for_cache(value: &mut serde_json::Value) {
     let Some(obj) = value.as_object_mut() else {
         return;
@@ -411,14 +414,12 @@ fn canonicalize_system_block_for_cache(value: &mut serde_json::Value) {
     let Some(text) = obj.get("text").and_then(|v| v.as_str()) else {
         return;
     };
-    if !text.starts_with("x-anthropic-billing-header:") {
-        return;
+    let canonical = super::converter::canonicalize_billing_header(text);
+    // 只有实际发生折叠（返回占位符）时才改写，避免无谓的字符串分配。
+    if !std::ptr::eq(canonical, text) {
+        let canonical = canonical.to_string();
+        obj.insert("text".to_string(), serde_json::Value::String(canonical));
     }
-
-    obj.insert(
-        "text".to_string(),
-        serde_json::Value::String("__anthropic_billing_header__".to_string()),
-    );
 }
 
 fn flatten_message_blocks(message_index: usize, message: &Message) -> Vec<PendingBlock> {
