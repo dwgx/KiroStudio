@@ -12,6 +12,7 @@ export default {
       },
       colors: {
         border: 'hsl(var(--border))',
+        'border-hover': 'var(--border-hover)',
         input: 'hsl(var(--input))',
         ring: 'hsl(var(--ring))',
         background: 'hsl(var(--background))',
@@ -51,20 +52,43 @@ export default {
         sm: 'calc(var(--radius) - 2px)',
       },
       transitionTimingFunction: {
-        'out-expo': 'cubic-bezier(0.25, 0.46, 0.45, 0.94)',
+        // 更有"分量感"的缓动：起步快、收尾稳
+        'out-expo': 'cubic-bezier(0.16, 1, 0.3, 1)',
+        'out-quint': 'cubic-bezier(0.22, 1, 0.36, 1)',
       },
       transitionDuration: {
         '150': '150ms',
         '200': '200ms',
+        '250': '250ms',
+        '400': '400ms',
       },
       keyframes: {
         'pulse-dot': {
           '0%, 100%': { opacity: '1' },
           '50%': { opacity: '0.5' },
         },
+        // 命中脉冲：请求打到某凭据方块时的一次性高亮，快速衰减（克制、Linear 式）
+        'hit-flash': {
+          '0%': { opacity: '0' },
+          '18%': { opacity: '0.9' },
+          '100%': { opacity: '0' },
+        },
+        // 当前活跃：极轻微的常驻边缘高光起伏（安静，不发光爆炸）
+        'idle-glow': {
+          '0%, 100%': { boxShadow: '0 0 0 0 hsl(var(--primary) / 0.0)' },
+          '50%': { boxShadow: '0 0 0 2px hsl(var(--primary) / 0.25)' },
+        },
+        // 数值/内容出现时的轻微上浮淡入
+        'rise-in': {
+          '0%': { opacity: '0', transform: 'translateY(4px)' },
+          '100%': { opacity: '1', transform: 'translateY(0)' },
+        },
       },
       animation: {
         'pulse-dot': 'pulse-dot 2s ease-in-out infinite',
+        'hit-flash': 'hit-flash 0.7s cubic-bezier(0.16, 1, 0.3, 1) both',
+        'idle-glow': 'idle-glow 3.2s ease-in-out infinite',
+        'rise-in': 'rise-in 0.35s cubic-bezier(0.16, 1, 0.3, 1) both',
       },
     },
   },

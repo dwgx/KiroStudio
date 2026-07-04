@@ -1,12 +1,13 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, LogIn } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, LogIn, Database, Zap } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { CredentialCard } from '@/components/credential-card'
+import { StatCard } from '@/components/ui/stat-card'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { LoginDialog } from '@/components/login-dialog'
@@ -69,6 +70,12 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     const credential = data?.credentials.find(c => c.id === id)
     return Boolean(credential?.disabled)
   }).length
+
+  // 当前活跃凭据及其余额（用于 KPI 卡展示简要状态）
+  const currentCredential = data?.currentId
+    ? data.credentials.find(c => c.id === data.currentId)
+    : undefined
+  const currentBalance = data?.currentId ? balanceMap.get(data.currentId) ?? null : null
 
   // 当凭据列表变化时重置到第一页
   useEffect(() => {
@@ -579,39 +586,45 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       <main className={embedded ? "" : "container mx-auto px-4 md:px-8 py-6"}>
         {/* 统计卡片 */}
         <div className="grid gap-4 md:grid-cols-3 mb-6">
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
-                凭据总数
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold">{data?.total || 0}</div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
-                可用凭据
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold text-green-600">{data?.available || 0}</div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
-                当前活跃
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold flex items-center gap-2">
-                #{data?.currentId || '-'}
-                <Badge variant="success">活跃</Badge>
-              </div>
-            </CardContent>
-          </Card>
+          <StatCard
+            label="凭据总数"
+            value={data?.total ?? 0}
+            hint={`${disabledCredentialCount} 个已禁用`}
+            icon={Database}
+            accent="neutral"
+          />
+          <StatCard
+            label="可用凭据"
+            value={data?.available ?? 0}
+            hint={data && data.total > 0 ? `占总数 ${Math.round((data.available / data.total) * 100)}%` : '暂无凭据'}
+            icon={CheckCircle2}
+            accent="success"
+          />
+          <StatCard
+            label="当前活跃"
+            value={data?.currentId ? `#${data.currentId}` : '—'}
+            icon={Zap}
+            accent={data?.currentId ? 'primary' : 'neutral'}
+            hint={
+              data?.currentId ? (
+                <span className="flex items-center gap-1.5">
+                  <span className="relative flex h-2 w-2">
+                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary/60" />
+                    <span className="relative inline-flex h-2 w-2 rounded-full bg-primary" />
+                  </span>
+                  <span className="truncate">
+                    {currentCredential?.email
+                      ? currentCredential.email
+                      : currentBalance?.subscriptionTitle
+                        ? currentBalance.subscriptionTitle
+                        : '正在处理请求'}
+                  </span>
+                </span>
+              ) : (
+                '暂无活跃凭据'
+              )
+            }
+          />
         </div>
 
         {/* 凭据列表 */}

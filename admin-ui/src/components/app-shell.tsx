@@ -56,7 +56,7 @@ export function AppShell({ onLogout }: AppShellProps) {
   }
 
   return (
-    <div className="min-h-screen bg-[#0a0a0a] text-[#ededed]">
+    <div className="min-h-screen bg-[#0a0a0a] text-[#ededed]" translate="no">
       {/* Sidebar */}
       <aside className="fixed top-0 left-0 bottom-0 w-[240px] border-r border-[#2e2e2e] flex flex-col z-40">
         {/* Logo */}
@@ -79,11 +79,11 @@ export function AppShell({ onLogout }: AppShellProps) {
                 onClick={() => setTab(item.key)}
                 className={`
                   relative flex items-center gap-3 px-3 py-2 rounded-md text-sm font-medium
-                  transition-all duration-150
+                  transition-all duration-250 ease-out-expo
                   ${
                     tab === item.key
                       ? 'bg-[rgba(0,112,243,0.12)] text-[#ededed] border-l-2 border-l-[#0070f3] pl-[10px]'
-                      : 'text-[#888] hover:bg-[#1a1a1a] hover:text-[#ededed] border-l-2 border-l-transparent pl-[10px]'
+                      : 'text-[#888] hover:bg-[#1a1a1a] hover:text-[#ededed] hover:translate-x-0.5 border-l-2 border-l-transparent pl-[10px]'
                   }
                 `}
               >
@@ -113,17 +113,17 @@ export function AppShell({ onLogout }: AppShellProps) {
 
         {/* Footer */}
         <div className="px-5 py-4 border-t border-[#2e2e2e]">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <span className="relative flex h-2 w-2">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex min-w-0 items-center gap-2" translate="no">
+              <span className="relative flex h-2 w-2 shrink-0">
                 <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#50e3c2] opacity-75" />
                 <span className="relative inline-flex rounded-full h-2 w-2 bg-[#50e3c2]" />
               </span>
-              <span className="text-xs text-[#888]">网关在线</span>
+              <span className="min-w-0 truncate whitespace-nowrap text-xs text-[#888]">网关在线</span>
             </div>
             <button
               onClick={handleLogout}
-              className="p-1.5 rounded-md text-[#666] hover:text-[#ededed] hover:bg-[#1a1a1a] transition-all duration-150"
+              className="shrink-0 p-1.5 rounded-md text-[#666] hover:text-[#ededed] hover:bg-[#1a1a1a] transition-all duration-200 ease-out-expo"
               title="退出登录"
             >
               <LogOut className="h-4 w-4" />
