@@ -686,9 +686,13 @@ async fn handle_non_stream_request(
             super::stream::extract_thinking_from_complete_text(&text_content);
 
         if let Some(thinking_text) = thinking {
+            // 补 signature 占位符：客户端 thinking 模式下本地校验 thinking 块必须带非空
+            // signature，非流式组装时同样需要（回传时 converter 只读 thinking，占位符被
+            // serde 静默丢弃，不会转发给 Kiro）。详见 stream::THINKING_SIGNATURE_PLACEHOLDER。
             content.push(json!({
                 "type": "thinking",
-                "thinking": thinking_text
+                "thinking": thinking_text,
+                "signature": super::stream::THINKING_SIGNATURE_PLACEHOLDER
             }));
         }
 
