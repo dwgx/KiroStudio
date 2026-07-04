@@ -27,6 +27,9 @@ export interface CredentialStatusItem {
   refreshFailureCount: number
   disabledReason?: string
   endpoint: string
+  /** Overage（超额）开关：KIRO Pro+ 开启后可突破 base 额度（付费）。
+      后端 BE-overage 批次落地前为只读展示；字段缺省视为未知/关闭。 */
+  overageEnabled?: boolean
 }
 
 // 余额响应

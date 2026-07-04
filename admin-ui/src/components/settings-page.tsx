@@ -7,6 +7,8 @@ import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { useConfigSnapshot, useUpdateConfig } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
+import { RegionSelect } from '@/components/ui/region-select'
+import { NumberStepper } from '@/components/ui/number-stepper'
 import type { ConfigSnapshotResponse, UpdateConfigRequest } from '@/types/api'
 
 // 可编辑表单的本地状态（字符串化便于受控输入）
@@ -261,10 +263,12 @@ export function SettingsPage() {
             <Input className={inputCls} value={form.host} onChange={(e) => set('host', e.target.value)} />
           </Field>
           <Field label="端口 port" hint="需重启生效">
-            <Input className={inputCls} type="number" value={form.port} onChange={(e) => set('port', e.target.value)} />
+            <NumberStepper value={Number(form.port) || 0} onChange={(v) => set('port', String(v))} min={1} max={65535} className="w-28" aria-label="端口" />
           </Field>
           <Field label="区域 region" hint="需重启生效">
-            <Input className={inputCls} value={form.region} onChange={(e) => set('region', e.target.value)} />
+            <div className="w-[260px]">
+              <RegionSelect value={form.region} onChange={(v) => set('region', v)} />
+            </div>
           </Field>
           <Field label="TLS 后端" hint="需重启生效">
             <div className="flex gap-2">
@@ -317,10 +321,10 @@ export function SettingsPage() {
             <Switch checked={form.rateLimitEnabled} onCheckedChange={(v) => set('rateLimitEnabled', v)} />
           </Field>
           <Field label="每日上限" hint="0 表示无限制（需重启生效）">
-            <Input className={inputCls} type="number" value={form.rateLimitDailyMax} onChange={(e) => set('rateLimitDailyMax', e.target.value)} disabled={!form.rateLimitEnabled} />
+            <NumberStepper value={Number(form.rateLimitDailyMax) || 0} onChange={(v) => set('rateLimitDailyMax', String(v))} min={0} step={10} className="w-28" disabled={!form.rateLimitEnabled} aria-label="每日上限" />
           </Field>
           <Field label="最小请求间隔 (ms)" hint="需重启生效">
-            <Input className={inputCls} type="number" value={form.rateLimitMinIntervalMs} onChange={(e) => set('rateLimitMinIntervalMs', e.target.value)} disabled={!form.rateLimitEnabled} />
+            <NumberStepper value={Number(form.rateLimitMinIntervalMs) || 0} onChange={(v) => set('rateLimitMinIntervalMs', String(v))} min={0} step={100} className="w-28" disabled={!form.rateLimitEnabled} aria-label="最小请求间隔" />
           </Field>
           <Field label="会话亲和性" hint="同一会话尽量复用同一凭据（需重启生效）">
             <Switch checked={form.affinityEnabled} onCheckedChange={(v) => set('affinityEnabled', v)} />
@@ -392,7 +396,7 @@ export function SettingsPage() {
             <Switch checked={form.trustForwardedHeader} onCheckedChange={(v) => set('trustForwardedHeader', v)} />
           </Field>
           <Field label="入口限流 (次/分钟/IP)" hint="0 表示关闭。超限返回 429（需重启生效）">
-            <Input className={inputCls} type="number" value={form.ingressRateLimitPerMin} onChange={(e) => set('ingressRateLimitPerMin', e.target.value)} />
+            <NumberStepper value={Number(form.ingressRateLimitPerMin) || 0} onChange={(v) => set('ingressRateLimitPerMin', String(v))} min={0} step={10} className="w-28" aria-label="入口限流" />
           </Field>
           <Field label="请求体上限 (字节)" hint="默认 52428800（50MiB）。超限返回 413（需重启生效）">
             <Input className={inputCls} type="number" value={form.maxBodyBytes} onChange={(e) => set('maxBodyBytes', e.target.value)} />
@@ -410,10 +414,10 @@ export function SettingsPage() {
             <Switch checked={form.proactiveTokenRefresh} onCheckedChange={(v) => set('proactiveTokenRefresh', v)} />
           </Field>
           <Field label="提前量 (分钟)" hint="token 剩余有效期低于此值即后台刷新（需重启生效）">
-            <Input className={inputCls} type="number" value={form.tokenRefreshLeadMinutes} onChange={(e) => set('tokenRefreshLeadMinutes', e.target.value)} disabled={!form.proactiveTokenRefresh} />
+            <NumberStepper value={Number(form.tokenRefreshLeadMinutes) || 0} onChange={(v) => set('tokenRefreshLeadMinutes', String(v))} min={0} className="w-28" disabled={!form.proactiveTokenRefresh} aria-label="提前量分钟" />
           </Field>
           <Field label="扫描间隔 (秒)" hint="后台扫描周期，最小 5 秒（需重启生效）">
-            <Input className={inputCls} type="number" value={form.tokenRefreshIntervalSecs} onChange={(e) => set('tokenRefreshIntervalSecs', e.target.value)} disabled={!form.proactiveTokenRefresh} />
+            <NumberStepper value={Number(form.tokenRefreshIntervalSecs) || 0} onChange={(v) => set('tokenRefreshIntervalSecs', String(v))} min={5} step={5} className="w-28" disabled={!form.proactiveTokenRefresh} aria-label="扫描间隔秒" />
           </Field>
         </CardContent>
       </Card>
@@ -422,17 +426,20 @@ export function SettingsPage() {
         除负载均衡模式立即生效外，其余字段保存后需重启服务才生效。敏感字段（API/Admin 密钥、代理密码）出于安全不在此显示与修改，请在配置文件中维护。
       </p>
 
-      {/* 底部保存栏 */}
-      <div className="fixed bottom-0 left-0 right-0 border-t bg-background/95 backdrop-blur px-6 py-3 flex items-center justify-end gap-3">
-        <span className="text-sm text-muted-foreground mr-auto">
-          {dirty ? `${Object.keys(diff).length} 项改动待保存` : '无改动'}
-        </span>
-        <Button variant="outline" onClick={handleReset} disabled={!dirty || isSaving}>
-          撤销
-        </Button>
-        <Button onClick={handleSave} disabled={!dirty || isSaving}>
-          {isSaving ? '保存中…' : '保存'}
-        </Button>
+      {/* 底部保存栏：仅覆盖 main 内容区（left-[240px] 避开 240px 侧栏，
+          否则会盖住侧栏底部“网关在线”状态条造成重叠）；z-30 低于侧栏 z-40。 */}
+      <div className="fixed bottom-0 left-0 right-0 z-30 border-t bg-background/95 px-6 py-3 backdrop-blur md:left-[240px]">
+        <div className="mx-auto flex max-w-[1200px] items-center justify-end gap-3">
+          <span className="mr-auto text-sm text-muted-foreground">
+            {dirty ? `${Object.keys(diff).length} 项改动待保存` : '无改动'}
+          </span>
+          <Button variant="outline" onClick={handleReset} disabled={!dirty || isSaving}>
+            撤销
+          </Button>
+          <Button onClick={handleSave} disabled={!dirty || isSaving}>
+            {isSaving ? '保存中…' : '保存'}
+          </Button>
+        </div>
       </div>
     </div>
   )
