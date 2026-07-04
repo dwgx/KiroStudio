@@ -1,8 +1,15 @@
 import { useState, lazy, Suspense } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { storage } from '@/lib/storage'
-import { Button } from '@/components/ui/button'
-import { Server, Activity, BarChart3, Settings as SettingsIcon, Moon, Sun, LogOut } from 'lucide-react'
+import {
+  LayoutDashboard,
+  Key,
+  BarChart3,
+  Settings,
+  LogIn,
+  LogOut,
+} from 'lucide-react'
+import { LoginDialog } from '@/components/login-dialog'
 
 const Dashboard = lazy(() =>
   import('@/components/dashboard').then((m) => ({ default: m.Dashboard }))
@@ -17,14 +24,21 @@ const SettingsPage = lazy(() =>
   import('@/components/settings-page').then((m) => ({ default: m.SettingsPage }))
 )
 
-type Tab = 'overview' | 'usage' | 'credentials' | 'settings'
+type Tab = 'overview' | 'credentials' | 'usage' | 'settings'
 
-const TABS: { key: Tab; label: string; icon: React.ReactNode }[] = [
-  { key: 'overview', label: '概览', icon: <Activity className="h-4 w-4" /> },
+const NAV_ITEMS: { key: Tab; label: string; icon: React.ReactNode }[] = [
+  { key: 'overview', label: '概览', icon: <LayoutDashboard className="h-4 w-4" /> },
+  { key: 'credentials', label: '凭据管理', icon: <Key className="h-4 w-4" /> },
   { key: 'usage', label: '用量统计', icon: <BarChart3 className="h-4 w-4" /> },
-  { key: 'credentials', label: '凭据管理', icon: <Server className="h-4 w-4" /> },
-  { key: 'settings', label: '设置', icon: <SettingsIcon className="h-4 w-4" /> },
+  { key: 'settings', label: '设置', icon: <Settings className="h-4 w-4" /> },
 ]
+
+const TAB_TITLES: Record<Tab, string> = {
+  overview: '概览',
+  credentials: '凭据管理',
+  usage: '用量统计',
+  settings: '设置',
+}
 
 interface AppShellProps {
   onLogout: () => void
@@ -32,15 +46,8 @@ interface AppShellProps {
 
 export function AppShell({ onLogout }: AppShellProps) {
   const [tab, setTab] = useState<Tab>('overview')
-  const [darkMode, setDarkMode] = useState(() =>
-    typeof window !== 'undefined' && document.documentElement.classList.contains('dark')
-  )
+  const [loginOpen, setLoginOpen] = useState(false)
   const queryClient = useQueryClient()
-
-  const toggleDarkMode = () => {
-    setDarkMode(!darkMode)
-    document.documentElement.classList.toggle('dark')
-  }
 
   const handleLogout = () => {
     storage.removeApiKey()
@@ -49,57 +56,112 @@ export function AppShell({ onLogout }: AppShellProps) {
   }
 
   return (
-    <div className="min-h-screen bg-background">
-      {/* 全局顶栏 */}
-      <header className="sticky top-0 z-50 w-full border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
-        <div className="container mx-auto flex h-14 items-center justify-between gap-4 px-4 md:px-8">
-          <div className="flex items-center gap-2 shrink-0">
-            <Server className="h-5 w-5" />
-            <span className="font-semibold">Kiro Admin</span>
-          </div>
+    <div className="min-h-screen bg-[#0a0a0a] text-[#ededed]">
+      {/* Sidebar */}
+      <aside className="fixed top-0 left-0 bottom-0 w-[240px] border-r border-[#2e2e2e] flex flex-col z-40">
+        {/* Logo */}
+        <div className="px-5 pt-6 pb-4">
+          <h1 className="text-xl font-bold bg-gradient-to-r from-[#0070f3] to-[#7928ca] bg-clip-text text-transparent">
+            KiroStudio
+          </h1>
+          <p className="text-xs text-[#666] mt-1">Admin Panel v0.1.0</p>
+        </div>
 
-          {/* 标签导航 */}
-          <nav className="flex items-center gap-1 overflow-x-auto">
-            {TABS.map((t) => (
-              <Button
-                key={t.key}
-                size="sm"
-                variant={tab === t.key ? 'default' : 'ghost'}
-                className="h-8 gap-1.5 px-3"
-                onClick={() => setTab(t.key)}
+        {/* Main Nav */}
+        <div className="px-3 flex-1">
+          <p className="text-[11px] font-medium text-[#666] uppercase tracking-wider px-3 mb-2">
+            主菜单
+          </p>
+          <nav className="flex flex-col gap-0.5">
+            {NAV_ITEMS.map((item) => (
+              <button
+                key={item.key}
+                onClick={() => setTab(item.key)}
+                className={`
+                  relative flex items-center gap-3 px-3 py-2 rounded-md text-sm font-medium
+                  transition-all duration-150
+                  ${
+                    tab === item.key
+                      ? 'bg-[rgba(0,112,243,0.12)] text-[#ededed] border-l-2 border-l-[#0070f3] pl-[10px]'
+                      : 'text-[#888] hover:bg-[#1a1a1a] hover:text-[#ededed] border-l-2 border-l-transparent pl-[10px]'
+                  }
+                `}
               >
-                {t.icon}
-                <span className="text-sm">{t.label}</span>
-              </Button>
+                {item.icon}
+                {item.label}
+              </button>
             ))}
           </nav>
 
-          <div className="flex items-center gap-1 shrink-0">
-            <Button variant="ghost" size="icon" onClick={toggleDarkMode} title="切换主题">
-              {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
-            </Button>
-            <Button variant="ghost" size="icon" onClick={handleLogout} title="退出登录">
-              <LogOut className="h-5 w-5" />
-            </Button>
+          {/* Divider */}
+          <div className="border-t border-[#2e2e2e] my-4" />
+
+          {/* Quick Actions */}
+          <p className="text-[11px] font-medium text-[#666] uppercase tracking-wider px-3 mb-2">
+            快捷操作
+          </p>
+          <div className="flex flex-col gap-0.5">
+            <button
+              onClick={() => setLoginOpen(true)}
+              className="flex items-center gap-3 px-3 py-2 rounded-md text-sm text-[#888] hover:bg-[#1a1a1a] hover:text-[#ededed] transition-all duration-150"
+            >
+              <LogIn className="h-4 w-4" />
+              上号
+            </button>
           </div>
         </div>
-      </header>
 
-      {/* 主内容区 */}
-      <main className="container mx-auto px-4 md:px-8 py-6">
-        <Suspense
-          fallback={
-            <div className="flex items-center justify-center py-24">
-              <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-primary" />
+        {/* Footer */}
+        <div className="px-5 py-4 border-t border-[#2e2e2e]">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <span className="relative flex h-2 w-2">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#50e3c2] opacity-75" />
+                <span className="relative inline-flex rounded-full h-2 w-2 bg-[#50e3c2]" />
+              </span>
+              <span className="text-xs text-[#888]">网关在线</span>
             </div>
-          }
-        >
-          {tab === 'overview' && <OverviewPage />}
-          {tab === 'usage' && <UsagePage />}
-          {tab === 'credentials' && <Dashboard onLogout={onLogout} embedded />}
-          {tab === 'settings' && <SettingsPage />}
-        </Suspense>
+            <button
+              onClick={handleLogout}
+              className="p-1.5 rounded-md text-[#666] hover:text-[#ededed] hover:bg-[#1a1a1a] transition-all duration-150"
+              title="退出登录"
+            >
+              <LogOut className="h-4 w-4" />
+            </button>
+          </div>
+        </div>
+      </aside>
+
+      {/* Main Content */}
+      <main className="ml-[240px] min-h-screen">
+        {/* Page Header */}
+        <div className="border-b border-[#2e2e2e] px-8 py-5">
+          <h2 className="text-lg font-semibold text-[#ededed]">{TAB_TITLES[tab]}</h2>
+        </div>
+
+        {/* Page Content */}
+        <div className="max-w-[1200px] mx-auto px-8 py-8">
+          <Suspense
+            fallback={
+              <div className="flex items-center justify-center py-24">
+                <div className="animate-spin rounded-full h-8 w-8 border-2 border-[#2e2e2e] border-t-[#0070f3]" />
+              </div>
+            }
+          >
+            {tab === 'overview' && <OverviewPage />}
+            {tab === 'usage' && <UsagePage />}
+            {tab === 'credentials' && <Dashboard onLogout={onLogout} embedded />}
+            {tab === 'settings' && <SettingsPage />}
+          </Suspense>
+        </div>
       </main>
+
+      {/* Dialogs */}
+      <LoginDialog
+        open={loginOpen}
+        onOpenChange={setLoginOpen}
+        onSuccess={() => queryClient.invalidateQueries({ queryKey: ['credentials'] })}
+      />
     </div>
   )
 }
