@@ -1850,6 +1850,140 @@ impl MultiTokenManager {
         Ok(usage_limits)
     }
 
+    /// 深度验活：发送最小 generateAssistantResponse 请求检测账号 suspend 状态
+    ///
+    /// getUsageLimits 不检查 suspend，只有真实对话请求才能检测。
+    /// 发送一个会被服务端拒绝（空 conversationState）的请求，
+    /// 只要返回 400（格式错误）而非 403（suspend）即表示凭据存活。
+    pub async fn deep_verify_credential(&self, id: u64) -> anyhow::Result<()> {
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
+        let token = if credentials.is_api_key_credential() {
+            credentials
+                .kiro_api_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?
+        } else {
+            let needs_refresh =
+                is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
+            if needs_refresh {
+                let _guard = self.refresh_lock.lock().await;
+                let current_creds = {
+                    let entries = self.entries.lock();
+                    entries
+                        .iter()
+                        .find(|e| e.id == id)
+                        .map(|e| e.credentials.clone())
+                        .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+                };
+                if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
+                    let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
+                    let new_creds =
+                        refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
+                            .await?;
+                    {
+                        let mut entries = self.entries.lock();
+                        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                            entry.credentials = new_creds.clone();
+                        }
+                    }
+                    if let Err(e) = self.persist_credentials() {
+                        tracing::warn!("深度验活刷新后持久化失败: {}", e);
+                    }
+                    new_creds
+                        .access_token
+                        .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?
+                } else {
+                    current_creds
+                        .access_token
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
+                }
+            } else {
+                credentials
+                    .access_token
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
+            }
+        };
+
+        let region = credentials.effective_api_region(&self.config);
+        let host = format!("q.{}.amazonaws.com", region);
+        let url = format!("https://{}/generateAssistantResponse", host);
+        let machine_id = machine_id::generate_from_credentials(&credentials, &self.config);
+        let kiro_version = &self.config.kiro_version;
+        let os_name = &self.config.system_version;
+        let node_version = &self.config.node_version;
+
+        let user_agent = format!(
+            "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
+            os_name, node_version, kiro_version, machine_id
+        );
+        let x_amz_user_agent = format!("aws-sdk-js/1.0.34 KiroIDE-{}-{}", kiro_version, machine_id);
+
+        // 构建最小请求体（故意不合法，只为触发 suspend 检查）
+        let mut body = serde_json::json!({
+            "conversationState": {
+                "conversationId": uuid::Uuid::new_v4().to_string(),
+                "currentMessage": {
+                    "userInputMessage": {
+                        "content": "hi"
+                    }
+                }
+            }
+        });
+        if let Some(ref arn) = credentials.profile_arn {
+            body["profileArn"] = serde_json::Value::String(arn.clone());
+        }
+
+        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        let client = build_client(effective_proxy.as_ref(), 30, self.config.tls_backend)?;
+
+        let mut request = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("x-amzn-codewhisperer-optout", "true")
+            .header("x-amz-user-agent", &x_amz_user_agent)
+            .header("user-agent", &user_agent)
+            .header("host", &host)
+            .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+            .header("amz-sdk-request", "attempt=1; max=1")
+            .header("Authorization", format!("Bearer {}", token));
+
+        if credentials.is_api_key_credential() {
+            request = request.header("tokentype", "API_KEY");
+        }
+
+        let response = request.body(body.to_string()).send().await?;
+        let status = response.status();
+
+        // 403 = suspended 或权限问题
+        if status.as_u16() == 403 {
+            let body_text = response.text().await.unwrap_or_default();
+            if body_text.contains("suspended") {
+                bail!("账号已被封禁 (suspended): {}", body_text);
+            }
+            bail!("权限被拒绝 (403): {}", body_text);
+        }
+
+        // 401 = token 无效
+        if status.as_u16() == 401 {
+            let body_text = response.text().await.unwrap_or_default();
+            bail!("Token 无效 (401): {}", body_text);
+        }
+
+        // 400 = 请求格式错误（预期的，说明凭据有效，只是请求体不完整）
+        // 200/其他 = 凭据有效
+        Ok(())
+    }
+
     /// 添加新凭据（Admin API）
     ///
     /// # 流程
