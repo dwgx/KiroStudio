@@ -22,8 +22,26 @@ use parking_lot::Mutex;
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
-/// 总重试次数硬上限（避免无限重试）
-const MAX_TOTAL_RETRIES: usize = 9;
+/// 总重试次数绝对硬上限（避免无限重试）
+///
+/// 注意：这只是一个安全上限，不再作为固定的重试预算。真正的预算由
+/// [`compute_max_retries`] 依据凭据总数 / 可用数动态计算，保证每个可用
+/// 凭据至少能被摸到一次（历史上写死 9 会让凭据 >3 时后面的号一次没试就报错）。
+const ABSOLUTE_MAX_TOTAL_RETRIES: usize = 64;
+
+/// 计算本次调用允许的总重试次数（动态预算）
+///
+/// - `total`：凭据总数
+/// - `available`：当前未禁用（可用）凭据数
+///
+/// 预算 = `(total * MAX_RETRIES_PER_CREDENTIAL)`，但以 `available` 做下限，
+/// 数学上保证每个可用凭据至少被尝试一次；上限为 `ABSOLUTE_MAX_TOTAL_RETRIES`，
+/// 但当可用凭据数超过该上限时仍以 `available` 为准，绝不因硬上限漏掉可用号。
+fn compute_max_retries(total: usize, available: usize) -> usize {
+    (total * MAX_RETRIES_PER_CREDENTIAL)
+        .max(available)
+        .min(ABSOLUTE_MAX_TOTAL_RETRIES.max(available))
+}
 
 /// 一次成功调用的元数据（随响应回传给上层，供用量统计埋点关联）
 ///
@@ -154,7 +172,8 @@ impl KiroProvider {
     /// 内部方法：带重试逻辑的 MCP API 调用
     async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count();
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
+        let max_retries =
+            compute_max_retries(total_credentials, self.token_manager.available_count());
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
 
@@ -301,15 +320,16 @@ impl KiroProvider {
     ///
     /// 重试策略：
     /// - 每个凭据最多重试 MAX_RETRIES_PER_CREDENTIAL 次
-    /// - 总重试次数 = min(凭据数量 × 每凭据重试次数, MAX_TOTAL_RETRIES)
-    /// - 硬上限 9 次，避免无限重试
+    /// - 总重试预算由 [`compute_max_retries`] 动态计算：以可用凭据数为下限，
+    ///   保证每个可用凭据至少被摸一次；以 ABSOLUTE_MAX_TOTAL_RETRIES 为安全上限
     async fn call_api_with_retry(
         &self,
         request_body: &str,
         is_stream: bool,
     ) -> anyhow::Result<(reqwest::Response, CallMeta)> {
         let total_credentials = self.token_manager.total_count();
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
+        let max_retries =
+            compute_max_retries(total_credentials, self.token_manager.available_count());
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
@@ -660,3 +680,48 @@ impl KiroProvider {
         Duration::from_millis(backoff.saturating_add(jitter))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_max_retries_covers_every_available_credential() {
+        // total=10 available=10：预算至少 10，保证每个可用凭据都能被摸一次
+        let r = compute_max_retries(10, 10);
+        assert!(r >= 10, "10 个可用凭据应至少允许 10 次尝试，实际 {}", r);
+
+        // 常规按 total*MAX_RETRIES_PER_CREDENTIAL 走
+        assert_eq!(compute_max_retries(10, 10), 10 * MAX_RETRIES_PER_CREDENTIAL);
+    }
+
+    #[test]
+    fn test_compute_max_retries_small_pool() {
+        // total=3：不小于 3（也就是 3*3=9）
+        assert!(compute_max_retries(3, 3) >= 3);
+        assert_eq!(compute_max_retries(3, 3), 3 * MAX_RETRIES_PER_CREDENTIAL);
+
+        // 只有 1 个凭据仍至少能试 1 次
+        assert!(compute_max_retries(1, 1) >= 1);
+    }
+
+    #[test]
+    fn test_compute_max_retries_respects_absolute_upper_bound() {
+        // 巨量凭据：预算不超过 ABSOLUTE_MAX.max(available)
+        let total = 1000usize;
+        let available = 1000usize;
+        let r = compute_max_retries(total, available);
+        assert!(r <= ABSOLUTE_MAX_TOTAL_RETRIES.max(available));
+        // available <= ABSOLUTE_MAX 时封顶到 ABSOLUTE_MAX
+        assert_eq!(compute_max_retries(100, 50), ABSOLUTE_MAX_TOTAL_RETRIES);
+    }
+
+    #[test]
+    fn test_compute_max_retries_available_exceeds_absolute_cap() {
+        // 可用凭据数超过绝对上限时，仍以 available 为下限，不因硬上限漏掉可用号
+        let available = ABSOLUTE_MAX_TOTAL_RETRIES + 20;
+        let r = compute_max_retries(available, available);
+        assert!(r >= available, "可用数超上限时预算仍应 >= available");
+    }
+}
+
