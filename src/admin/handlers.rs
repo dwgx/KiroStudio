@@ -123,6 +123,22 @@ pub async fn force_refresh_token(
     }
 }
 
+/// POST /api/admin/credentials/:id/verify
+/// 深度验活（发真实 API 请求检测 suspend）
+pub async fn deep_verify_credential(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.deep_verify_credential(id).await {
+        Ok(_) => Json(SuccessResponse::new(format!(
+            "凭据 #{} 验活通过",
+            id
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// GET /api/admin/config/load-balancing
 /// 获取负载均衡模式
 pub async fn get_load_balancing_mode(State(state): State<AdminState>) -> impl IntoResponse {

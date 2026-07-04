@@ -705,6 +705,14 @@ impl AdminService {
             .map_err(|e| self.classify_balance_error(e, id))
     }
 
+    /// 深度验活：通过实际 API 调用检测账号 suspend 状态
+    pub async fn deep_verify_credential(&self, id: u64) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .deep_verify_credential(id)
+            .await
+            .map_err(|e| self.classify_balance_error(e, id))
+    }
+
     // ============ 余额缓存持久化 ============
 
     fn load_balance_cache_from(cache_path: &Option<PathBuf>) -> HashMap<u64, CachedBalance> {

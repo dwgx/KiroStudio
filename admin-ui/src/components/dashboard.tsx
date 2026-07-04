@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, LogIn, Cloud } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, LogIn } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -9,13 +9,12 @@ import { Badge } from '@/components/ui/badge'
 import { CredentialCard } from '@/components/credential-card'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
-import { SocialLoginDialog } from '@/components/social-login-dialog'
-import { IdcLoginDialog } from '@/components/idc-login-dialog'
+import { LoginDialog } from '@/components/login-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
-import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
+import { getCredentialBalance, forceRefreshToken, deepVerifyCredential } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
 
@@ -29,8 +28,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
-  const [socialLoginOpen, setSocialLoginOpen] = useState(false)
-  const [idcLoginOpen, setIdcLoginOpen] = useState(false)
+  const [loginOpen, setLoginOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
@@ -449,6 +447,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       })
 
       try {
+        // 深度验活：发真实 API 请求检测 suspend 状态
+        await deepVerifyCredential(id)
         const balance = await getCredentialBalance(id)
         successCount++
 
@@ -714,13 +714,9 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 <Upload className="h-4 w-4 mr-2" />
                 批量导入
               </Button>
-              <Button onClick={() => setSocialLoginOpen(true)} size="sm" variant="default">
+              <Button onClick={() => setLoginOpen(true)} size="sm" variant="default">
                 <LogIn className="h-4 w-4 mr-2" />
-                网页上号
-              </Button>
-              <Button onClick={() => setIdcLoginOpen(true)} size="sm" variant="default">
-                <Cloud className="h-4 w-4 mr-2" />
-                IDC 上号
+                上号
               </Button>
               <Button onClick={() => setAddDialogOpen(true)} size="sm" variant="outline">
                 <Plus className="h-4 w-4 mr-2" />
@@ -792,20 +788,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         onOpenChange={setAddDialogOpen}
       />
 
-      {/* 网页上号对话框 */}
-      <SocialLoginDialog
-        open={socialLoginOpen}
-        onOpenChange={setSocialLoginOpen}
-        onSuccess={() => {
-          queryClient.invalidateQueries({ queryKey: ['credentials'] })
-          refetch()
-        }}
-      />
-
-      {/* IDC 上号对话框 */}
-      <IdcLoginDialog
-        open={idcLoginOpen}
-        onOpenChange={setIdcLoginOpen}
+      {/* 上号对话框 */}
+      <LoginDialog
+        open={loginOpen}
+        onOpenChange={setLoginOpen}
         onSuccess={() => {
           queryClient.invalidateQueries({ queryKey: ['credentials'] })
           refetch()

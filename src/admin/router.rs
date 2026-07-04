@@ -7,9 +7,9 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, delete_credential, force_refresh_token, get_all_credentials,
-        get_credential_balance, get_load_balancing_mode, get_config, poll_social_login,
-        reset_failure_count, set_credential_disabled, set_credential_priority,
+        add_credential, deep_verify_credential, delete_credential, force_refresh_token,
+        get_all_credentials, get_credential_balance, get_load_balancing_mode, get_config,
+        poll_social_login, reset_failure_count, set_credential_disabled, set_credential_priority,
         set_load_balancing_mode, social_callback, start_social_login, update_config,
         start_idc_login, poll_idc_login,
     },
@@ -50,6 +50,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/priority", post(set_credential_priority))
         .route("/credentials/{id}/reset", post(reset_failure_count))
         .route("/credentials/{id}/refresh", post(force_refresh_token))
+        .route("/credentials/{id}/verify", post(deep_verify_credential))
         .route("/credentials/{id}/balance", get(get_credential_balance))
         .route(
             "/config/load-balancing",
