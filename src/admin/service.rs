@@ -20,7 +20,8 @@ use crate::kiro::auth::social::OAuthCallbackData;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, ConfigSnapshotResponse,
     CredentialStatusItem, CredentialsStatusResponse, LoadBalancingModeResponse,
-    SetLoadBalancingModeRequest, UpdateConfigRequest, UpdateConfigResponse,
+    SetLoadBalancingModeRequest, TrashItemResponse, TrashListResponse, UpdateConfigRequest,
+    UpdateConfigResponse,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -184,6 +185,36 @@ impl AdminService {
             .map_err(|e| self.classify_error(e, id))
     }
 
+    /// 读取单号 overage 状态（实时查询上游 Web Portal，只读）
+    pub async fn overage_status(
+        &self,
+        id: u64,
+    ) -> Result<crate::kiro::overage::OverageStatus, AdminServiceError> {
+        crate::kiro::overage::overage_status(&self.token_manager, id)
+            .await
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 开启单号 overage（⚠️ 触发真实按量付费）。幂等。
+    pub async fn enable_overage(
+        &self,
+        id: u64,
+    ) -> Result<crate::kiro::overage::OverageStatus, AdminServiceError> {
+        crate::kiro::overage::set_overage(&self.token_manager, id, true)
+            .await
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 关闭单号 overage。幂等。
+    pub async fn disable_overage(
+        &self,
+        id: u64,
+    ) -> Result<crate::kiro::overage::OverageStatus, AdminServiceError> {
+        crate::kiro::overage::set_overage(&self.token_manager, id, false)
+            .await
+            .map_err(|e| self.classify_error(e, id))
+    }
+
     /// 获取凭据余额（带缓存）
     pub async fn get_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
         // 先查缓存
@@ -225,11 +256,16 @@ impl AdminService {
             .await
             .map_err(|e| self.classify_balance_error(e, id))?;
 
+        // overage（超额）感知：开了 Online Overage 的号 base 耗尽后仍有额度，
+        // 用 effective 变体（base + overage cap）计算 remaining/百分比，避免展示失真。
+        let overage_enabled = usage.overage_enabled();
+        let overage_cap = usage.overage_cap_for(overage_enabled);
         let current_usage = usage.current_usage();
         let usage_limit = usage.usage_limit();
-        let remaining = (usage_limit - current_usage).max(0.0);
-        let usage_percentage = if usage_limit > 0.0 {
-            (current_usage / usage_limit * 100.0).min(100.0)
+        let effective_limit = usage.effective_usage_limit_for(overage_enabled);
+        let remaining = usage.effective_remaining_for(overage_enabled);
+        let usage_percentage = if effective_limit > 0.0 {
+            (current_usage / effective_limit * 100.0).min(100.0)
         } else {
             0.0
         };
@@ -242,7 +278,96 @@ impl AdminService {
             remaining,
             usage_percentage,
             next_reset_at: usage.next_date_reset,
+            overage_enabled,
+            overage_cap,
+            effective_limit,
         })
+    }
+
+    /// 批量读取【已缓存】的凭据余额快照（A10）
+    ///
+    /// 严守封号红线：只读 balance_cache，绝不触发任何上游 getUsageLimits 调用。
+    /// 缓存未命中或已过期的凭据不出现在结果中（前端可按需单独拉取）。
+    pub fn get_cached_balances(&self) -> super::types::CachedBalancesResponse {
+        use super::types::{CachedBalanceItem, CachedBalancesResponse};
+
+        let now = Utc::now().timestamp() as f64;
+        let cache = self.balance_cache.lock();
+        let balances: HashMap<u64, CachedBalanceItem> = cache
+            .iter()
+            .filter(|(_, c)| (now - c.cached_at) < BALANCE_CACHE_TTL_SECS as f64)
+            .map(|(id, c)| {
+                (
+                    *id,
+                    CachedBalanceItem {
+                        balance: c.data.clone(),
+                        cached_at: c.cached_at,
+                    },
+                )
+            })
+            .collect();
+
+        CachedBalancesResponse {
+            total: balances.len(),
+            balances,
+        }
+    }
+
+    /// 温和地周期性刷新所有【未禁用】凭据的余额缓存（A6）
+    ///
+    /// 严守封号红线：
+    /// - 逐个刷新，每个之间 sleep `spacing_secs` 秒，绝不并发一次性打所有号。
+    /// - 只刷未禁用的号。
+    /// - 仅更新缓存供展示，绝不因 remaining 低就自动禁用凭据（不做主动禁用）。
+    ///
+    /// 由 main.rs 的后台任务按长间隔调用（默认 30 分钟）。
+    pub async fn refresh_all_balances_gently(&self, spacing_secs: u64) {
+        // 取未禁用凭据 id 快照（只读，不持锁跨 await）
+        let ids: Vec<u64> = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .filter(|e| !e.disabled)
+            .map(|e| e.id)
+            .collect();
+
+        if ids.is_empty() {
+            return;
+        }
+
+        tracing::info!("后台温和余额刷新开始：{} 个未禁用凭据", ids.len());
+        let spacing = std::time::Duration::from_secs(spacing_secs.max(1));
+
+        for (idx, id) in ids.iter().enumerate() {
+            // 分散节奏：从第二个开始，每个之间先 sleep，避免一瞬间并发打多个号
+            if idx > 0 {
+                tokio::time::sleep(spacing).await;
+            }
+
+            match self.fetch_balance(*id).await {
+                Ok(balance) => {
+                    {
+                        let mut cache = self.balance_cache.lock();
+                        cache.insert(
+                            *id,
+                            CachedBalance {
+                                cached_at: Utc::now().timestamp() as f64,
+                                data: balance,
+                            },
+                        );
+                    }
+                    self.save_balance_cache();
+                    tracing::debug!("后台温和余额刷新：凭据 #{} 已更新缓存", id);
+                }
+                Err(e) => {
+                    // 单个失败不影响整体节奏；仅更新缓存展示，不做任何禁用动作
+                    tracing::warn!("后台温和余额刷新：凭据 #{} 刷新失败（忽略）: {}", id, e);
+                }
+            }
+        }
+
+        tracing::info!("后台温和余额刷新完成");
     }
 
     /// 添加新凭据
@@ -325,9 +450,61 @@ impl AdminService {
         Ok(())
     }
 
+    /// 列出回收站中的已删除凭据
+    pub fn list_trash(&self) -> TrashListResponse {
+        let mut items: Vec<TrashItemResponse> = self
+            .token_manager
+            .list_trash()
+            .into_iter()
+            .map(|t| TrashItemResponse {
+                id: t.id,
+                priority: t.priority,
+                auth_method: t.auth_method,
+                email: t.email,
+                masked_api_key: t.masked_api_key,
+                refresh_token_hash: t.refresh_token_hash,
+                api_key_hash: t.api_key_hash,
+                endpoint: t.endpoint,
+                deleted_at: t.deleted_at,
+                success_count: t.success_count,
+                last_used_at: t.last_used_at,
+            })
+            .collect();
+
+        // 最近删除的排在前面
+        items.sort_by(|a, b| b.deleted_at.cmp(&a.deleted_at));
+
+        TrashListResponse {
+            total: items.len(),
+            trash: items,
+        }
+    }
+
+    /// 从回收站恢复凭据
+    pub fn restore_credential(&self, id: u64) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .restore_credential(id)
+            .map_err(|e| self.classify_trash_error(e, id))
+    }
+
+    /// 从回收站彻底删除凭据（不可恢复）
+    pub fn purge_credential(&self, id: u64) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .purge_credential(id)
+            .map_err(|e| self.classify_trash_error(e, id))?;
+
+        // 清理彻底删除凭据的余额缓存残留
+        {
+            let mut cache = self.balance_cache.lock();
+            cache.remove(&id);
+        }
+        self.save_balance_cache();
+
+        Ok(())
+    }
+
     /// 获取负载均衡模式
-    pub fn get_load_balancing_mode(&self) -> LoadBalancingModeResponse {
-        LoadBalancingModeResponse {
+    pub fn get_load_balancing_mode(&self) -> LoadBalancingModeResponse {        LoadBalancingModeResponse {
             mode: self.token_manager.get_load_balancing_mode(),
         }
     }
@@ -386,6 +563,8 @@ impl AdminService {
             proactive_token_refresh: config.proactive_token_refresh,
             token_refresh_lead_minutes: config.token_refresh_lead_minutes,
             token_refresh_interval_secs: config.token_refresh_interval_secs,
+            login_background_enabled: config.login_background_enabled,
+            balance_refresh_interval_secs: config.balance_refresh_interval_secs,
             config_path: config
                 .config_path()
                 .map(|p| p.display().to_string()),
@@ -647,6 +826,14 @@ impl AdminService {
             }
         }
 
+        // —— 余额同步（A6，需重启生效）——
+        if let Some(v) = req.balance_refresh_interval_secs {
+            if v != config.balance_refresh_interval_secs {
+                config.balance_refresh_interval_secs = v;
+                restart_fields.push("balanceRefreshIntervalSecs".into());
+            }
+        }
+
         // —— 立即生效的字段：负载均衡模式 ——
         let mut lb_changed = false;
         if let Some(mode) = req.load_balancing_mode {
@@ -711,6 +898,16 @@ impl AdminService {
             .deep_verify_credential(id)
             .await
             .map_err(|e| self.classify_balance_error(e, id))
+    }
+
+    /// 导出指定凭据的原始 JSON（用于 Admin 令牌下载）
+    ///
+    /// 返回可直接重新导入本系统的完整 KiroCredentials（camelCase）。
+    /// 包含 refreshToken 等敏感字段，仅经 Admin 鉴权后可调用。
+    pub fn export_credential(&self, id: u64) -> Result<KiroCredentials, AdminServiceError> {
+        self.token_manager
+            .export_credential(id)
+            .ok_or(AdminServiceError::NotFound { id })
     }
 
     // ============ 余额缓存持久化 ============
@@ -855,6 +1052,18 @@ impl AdminService {
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
         } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据") {
+            AdminServiceError::InvalidCredential(msg)
+        } else {
+            AdminServiceError::InternalError(msg)
+        }
+    }
+
+    /// 分类回收站操作错误（restore / purge）
+    fn classify_trash_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
+        let msg = e.to_string();
+        if msg.contains("回收站中不存在") {
+            AdminServiceError::NotFound { id }
+        } else if msg.contains("凭据已存在") || msg.contains("重复") {
             AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)

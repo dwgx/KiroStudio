@@ -83,6 +83,50 @@ pub async fn get_credential_balance(
     }
 }
 
+/// GET /api/admin/credentials/:id/overage
+/// 读取单号 overage 状态（实时查询上游，只读）
+pub async fn get_overage_status(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.overage_status(id).await {
+        Ok(status) => Json(status).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/overage/enable
+/// 开启单号 overage —— ⚠️ 触发真实按量付费。幂等。
+///
+/// 计费安全：仅响应显式的单号请求，不做自动/批量开启；操作会写审计日志。
+pub async fn enable_overage(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.enable_overage(id).await {
+        Ok(status) => Json(status).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/overage/disable
+/// 关闭单号 overage。幂等。
+pub async fn disable_overage(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.disable_overage(id).await {
+        Ok(status) => Json(status).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/credentials/balances/cached
+/// 批量读取【已缓存】的凭据余额（只读缓存，不触发任何上游调用）
+pub async fn get_cached_balances(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_cached_balances())
+}
+
 /// POST /api/admin/credentials
 /// 添加新凭据
 pub async fn add_credential(
@@ -107,10 +151,48 @@ pub async fn delete_credential(
     }
 }
 
+/// GET /api/admin/credentials/trash
+/// 列出回收站中的已删除凭据
+pub async fn list_trash(State(state): State<AdminState>) -> impl IntoResponse {
+    let response = state.service.list_trash();
+    Json(response)
+}
+
+/// POST /api/admin/credentials/trash/:id/restore
+/// 从回收站恢复凭据（恢复为禁用态，id 不变）
+pub async fn restore_credential(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.restore_credential(id) {
+        Ok(_) => Json(SuccessResponse::new(format!(
+            "凭据 #{} 已从回收站恢复（当前为禁用态，可手动启用）",
+            id
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// DELETE /api/admin/credentials/trash/:id
+/// 从回收站彻底删除凭据（不可恢复）
+pub async fn purge_credential(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.purge_credential(id) {
+        Ok(_) => Json(SuccessResponse::new(format!(
+            "凭据 #{} 已从回收站彻底删除",
+            id
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/credentials/:id/refresh
 /// 强制刷新凭据 Token
-pub async fn force_refresh_token(
-    State(state): State<AdminState>,
+pub async fn force_refresh_token(    State(state): State<AdminState>,
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     match state.service.force_refresh_token(id).await {
@@ -135,6 +217,18 @@ pub async fn deep_verify_credential(
             id
         )))
         .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/credentials/:id/export
+/// 导出指定凭据的原始 JSON（令牌下载，含敏感字段）
+pub async fn export_credential(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.export_credential(id) {
+        Ok(cred) => Json(cred).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

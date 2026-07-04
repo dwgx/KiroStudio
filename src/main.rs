@@ -178,6 +178,21 @@ async fn main() {
         });
     }
 
+    // 凭据回收站保留清理：软删除的凭据超过 trash_retention_days 后彻底清理。
+    // 0 表示永久保留（purge_expired_trash 内部直接短路）。每 6 小时扫描一次。
+    {
+        let trash_mgr = token_manager.clone();
+        let retention_days = config.trash_retention_days;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                trash_mgr.purge_expired_trash(retention_days);
+            }
+        });
+    }
+
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),
@@ -235,6 +250,36 @@ async fn main() {
                 admin_state = admin_state
                     .with_usage(handles.stats.clone(), handles.trace_db.clone());
             }
+
+            // A6：温和的周期性余额刷新（严格受控）。
+            // 封号红线：绝不在启动/挂载时批量拉——这里只 spawn 一个后台任务，
+            // 首轮也要等满一个完整间隔才开始，且逐个刷新、每个之间留间隔（分散节奏），
+            // 只刷未禁用的号，仅更新缓存供展示，绝不做主动禁用。
+            // 0 = 禁用（安全默认之一）。本批作为需重启字段。
+            let balance_interval = config.balance_refresh_interval_secs;
+            if balance_interval > 0 {
+                let balance_service = admin_state.service.clone();
+                tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(
+                        std::time::Duration::from_secs(balance_interval),
+                    );
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    // 跳过第一次立即触发的 tick，避免启动即批量拉（封号红线）
+                    ticker.tick().await;
+                    loop {
+                        ticker.tick().await;
+                        // 每个号之间 sleep 4 秒，分散节奏
+                        balance_service.refresh_all_balances_gently(4).await;
+                    }
+                });
+                tracing::info!(
+                    "后台温和余额刷新已启用：间隔 {} 秒（逐个刷新，每个间隔 4 秒，不做主动禁用）",
+                    balance_interval
+                );
+            } else {
+                tracing::info!("后台温和余额刷新未启用（balance_refresh_interval_secs=0）");
+            }
+
             let admin_app = admin::create_admin_router(admin_state);
 
             // 创建 Admin UI 路由

@@ -7,9 +7,11 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, deep_verify_credential, delete_credential, force_refresh_token,
-        get_all_credentials, get_credential_balance, get_load_balancing_mode, get_config,
-        poll_social_login, reset_failure_count, set_credential_disabled, set_credential_priority,
+        add_credential, deep_verify_credential, delete_credential, disable_overage,
+        enable_overage, export_credential, force_refresh_token, get_all_credentials,
+        get_cached_balances, get_credential_balance, get_load_balancing_mode, get_config,
+        get_overage_status, list_trash, purge_credential, poll_social_login, reset_failure_count,
+        restore_credential, set_credential_disabled, set_credential_priority,
         set_load_balancing_mode, social_callback, start_social_login, update_config,
         start_idc_login, poll_idc_login,
     },
@@ -46,12 +48,23 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_all_credentials).post(add_credential),
         )
         .route("/credentials/{id}", delete(delete_credential))
+        // 凭据回收站（静态段 trash 与 {id} 同层共存，matchit 静态段优先匹配）
+        .route("/credentials/trash", get(list_trash))
+        .route("/credentials/trash/{id}/restore", post(restore_credential))
+        .route("/credentials/trash/{id}", delete(purge_credential))
         .route("/credentials/{id}/disabled", post(set_credential_disabled))
         .route("/credentials/{id}/priority", post(set_credential_priority))
         .route("/credentials/{id}/reset", post(reset_failure_count))
         .route("/credentials/{id}/refresh", post(force_refresh_token))
         .route("/credentials/{id}/verify", post(deep_verify_credential))
         .route("/credentials/{id}/balance", get(get_credential_balance))
+        // 单号 overage 真开关（⚠️ enable 触发真实按量付费；仅响应显式单号请求）
+        .route("/credentials/{id}/overage", get(get_overage_status))
+        .route("/credentials/{id}/overage/enable", post(enable_overage))
+        .route("/credentials/{id}/overage/disable", post(disable_overage))
+        // 批量已缓存余额（只读缓存，不触发上游）。静态段 balances 与 {id} 同层，matchit 静态优先。
+        .route("/credentials/balances/cached", get(get_cached_balances))
+        .route("/credentials/{id}/export", get(export_credential))
         .route(
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),
