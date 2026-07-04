@@ -13,8 +13,8 @@ export function cn(...inputs: ClassValue[]) {
  * 返回是否成功。
  */
 export async function copyToClipboard(text: string): Promise<boolean> {
-  // 安全上下文：优先用现代 API
-  if (typeof navigator !== 'undefined' && navigator.clipboard && window.isSecureContext) {
+  // 优先尝试现代 API（部分浏览器在 HTTP + 用户手势下也可用）
+  if (typeof navigator !== 'undefined' && navigator.clipboard) {
     try {
       await navigator.clipboard.writeText(text)
       return true
@@ -23,19 +23,21 @@ export async function copyToClipboard(text: string): Promise<boolean> {
     }
   }
 
-  // 非安全上下文 fallback：隐藏 textarea + execCommand
+  // fallback：隐藏 textarea + execCommand
+  // 挂在当前 dialog 内部以绕过 Radix focus trap
   try {
+    const container = document.querySelector('[role="dialog"]') || document.body
     const ta = document.createElement('textarea')
     ta.value = text
     ta.setAttribute('readonly', '')
     ta.style.position = 'fixed'
     ta.style.top = '-9999px'
     ta.style.opacity = '0'
-    document.body.appendChild(ta)
+    container.appendChild(ta)
     ta.focus()
     ta.select()
     const ok = document.execCommand('copy')
-    document.body.removeChild(ta)
+    container.removeChild(ta)
     return ok
   } catch {
     return false
