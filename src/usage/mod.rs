@@ -14,6 +14,8 @@ pub mod trace_db;
 pub mod usage_stats;
 
 pub use pipeline::{init as init_pipeline, record as emit_record, UsageSink};
-pub use record::{RequestOutcome, RequestRecord};
+pub use record::{
+    classify_device, parse_client_browser, parse_client_os, RequestOutcome, RequestRecord,
+};
 pub use trace_db::TraceDb;
 pub use usage_stats::UsageStats;

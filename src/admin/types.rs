@@ -46,6 +46,10 @@ pub struct CredentialStatusItem {
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// 订阅等级标题（如 "Kiro Pro"）。随凭据持久化，重启后即可展示，
+    /// 无需等待首次余额刷新；后台温和刷新时会顺带更新。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_title: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -62,6 +66,10 @@ pub struct CredentialStatusItem {
     pub disabled_reason: Option<String>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
+    /// 当前在途（in-flight）请求数（实时负载，用于观测均衡是否生效）
+    pub inflight: u32,
+    /// 最近 60 秒滚动窗口内的请求数（RPM 观测）
+    pub rpm: u32,
 }
 
 // ============ 凭据回收站 ============
@@ -126,6 +134,8 @@ pub struct SetPriorityRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddCredentialRequest {
+    pub access_token: Option<String>,
+
     /// 刷新令牌（OAuth 凭据必填，API Key 凭据不需要）
     pub refresh_token: Option<String>,
 
@@ -138,6 +148,16 @@ pub struct AddCredentialRequest {
 
     /// OIDC Client Secret（IdC 认证需要）
     pub client_secret: Option<String>,
+
+    pub token_endpoint: Option<String>,
+
+    pub issuer_url: Option<String>,
+
+    pub scopes: Option<String>,
+
+    pub profile_arn: Option<String>,
+
+    pub expires_at: Option<String>,
 
     /// 优先级（可选，默认 0）
     #[serde(default)]
@@ -484,4 +504,73 @@ pub struct UpdateConfigResponse {
     pub restart_required: bool,
     /// 需要重启才生效的已改字段名（前端用于提示）
     pub restart_fields: Vec<String>,
+}
+
+// ============ 存储统计 / 清理（运维）============
+
+/// 单个数据分区的占用统计
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoragePartition {
+    /// 分区键（与清理 target 一致）：traces | usage_jsonl | trash | bg_cache
+    pub key: String,
+    /// 展示名（中文）
+    pub label: String,
+    /// 占用字节数（内存分区为常驻内存字节）
+    pub bytes: u64,
+    /// 条目/文件数（trace 为行数，usage_jsonl 为文件数，trash 为条目数，bg_cache 为张数）
+    pub items: u64,
+    /// 落盘路径（内存分区为 None）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// 是否为纯内存分区（无落盘，清理即释放内存）
+    pub in_memory: bool,
+}
+
+/// 存储统计响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageStatsResponse {
+    /// 各分区占用明细
+    pub partitions: Vec<StoragePartition>,
+    /// 落盘分区字节合计（不含纯内存分区）
+    pub total_disk_bytes: u64,
+    /// 统计是否可用（用量统计未启用时 trace/jsonl 分区缺失）
+    pub usage_enabled: bool,
+}
+
+/// 存储清理请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageCleanupRequest {
+    /// 清理目标（白名单枚举）：traces | usage_jsonl | trash | bg_cache | all
+    pub target: String,
+    /// 保留天数：删除早于 N 天前的数据。省略时按各分区的配置默认保留期。
+    #[serde(default)]
+    pub older_than_days: Option<i64>,
+}
+
+/// 单个分区的清理结果
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageCleanupItem {
+    /// 分区键
+    pub key: String,
+    /// 清理的条目/文件数
+    pub removed: u64,
+    /// 释放的字节数（不可精确统计时为 0）
+    pub freed_bytes: u64,
+    /// 说明（如跳过原因）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// 存储清理响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageCleanupResponse {
+    pub success: bool,
+    pub message: String,
+    /// 各分区清理明细
+    pub results: Vec<StorageCleanupItem>,
 }
