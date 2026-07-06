@@ -60,6 +60,24 @@ pub trait KiroEndpoint: Send + Sync {
         default_is_account_suspended(body)
     }
 
+    /// 判断响应体是否表示"账户级临时风控限速"（非永久封禁）
+    ///
+    /// 上游对高频/可疑活动会返回带 `suspicious activity` + `temporary` 信号的响应，
+    /// 这类是**临时限速**而非永久封号。必须在 [`is_account_suspended`] 之前判定，
+    /// 否则含 "account has been suspended ... suspicious activity" 的临时限速文案
+    /// 会被误判成永久封禁、白冻一个还能用的号 86400 秒。命中时只设短冷却 + failover。
+    fn is_temporary_rate_limit(&self, body: &str) -> bool {
+        default_is_temporary_rate_limit(body)
+    }
+
+    /// 判断响应体是否表示"客户端请求校验错误"（重试/换号都无意义，立即终止）
+    ///
+    /// 典型如 `TOOL_USE_RESULT_MISMATCH`：多轮工具结果与上文不匹配，是请求构造
+    /// 问题，换号重试只会重复失败并浪费配额。
+    fn is_client_validation_error(&self, body: &str) -> bool {
+        default_is_client_validation_error(body)
+    }
+
     /// 从错误响应中提取上游给出的重置时间（秒）
     ///
     /// 某些上游把真实重置时间放在 body 里（如 `resets_in_seconds` / `resets_at` epoch），
@@ -134,6 +152,42 @@ pub fn default_is_account_suspended(body: &str) -> bool {
         "has been banned",
     ];
     SUSPEND_KEYWORDS.iter().any(|kw| lower.contains(kw))
+}
+
+/// 默认的"账户级临时风控限速"判断逻辑（v4-2.1）
+///
+/// 判据：body 同时命中「可疑活动信号」**且**「临时/限速信号」。两者都要求，
+/// 才不会把真正的永久封禁误判成临时限速——这是防误冻的关键边界。
+///
+/// 上游对触发风控的高频账户常返回类似
+/// `"...suspicious activity... temporary rate limits applied..."` 的文案，
+/// 这类应只设短冷却 + 立即 failover，绝不当永久封禁冻 24 小时。
+pub fn default_is_temporary_rate_limit(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+
+    // 可疑活动信号（风控触发的标志）
+    const SUSPICIOUS_SIGNALS: &[&str] = &["suspicious activity", "unusual activity"];
+    // 临时/限速信号（表明是限速而非永久封）
+    const TEMPORARY_SIGNALS: &[&str] = &[
+        "temporary limits",
+        "temporary limit",
+        "temporary rate",
+        "temporarily limited",
+        "temporarily rate",
+        "rate limits applied",
+        "rate limit applied",
+    ];
+
+    let has_suspicious = SUSPICIOUS_SIGNALS.iter().any(|kw| lower.contains(kw));
+    let has_temporary = TEMPORARY_SIGNALS.iter().any(|kw| lower.contains(kw));
+    has_suspicious && has_temporary
+}
+
+/// 默认的"客户端请求校验错误"判断逻辑（v4-2.2）
+///
+/// 命中即视为请求构造问题：立即终止，换号/重试都无意义。
+pub fn default_is_client_validation_error(body: &str) -> bool {
+    body.contains("TOOL_USE_RESULT_MISMATCH")
 }
 
 /// 默认的"从错误 body 提取重置秒数"逻辑
@@ -218,6 +272,53 @@ mod tests {
             r#"{"reason":"MONTHLY_REQUEST_COUNT"}"#
         ));
         assert!(!default_is_account_suspended("too many requests"));
+    }
+
+    #[test]
+    fn test_temporary_rate_limit_requires_both_signals() {
+        // 同时含可疑活动 + 临时限速 → 临时风控（非永久封）
+        assert!(default_is_temporary_rate_limit(
+            "We detected suspicious activity and applied temporary limits to your account"
+        ));
+        assert!(default_is_temporary_rate_limit(
+            r#"{"message":"unusual activity detected, temporary rate limits applied"}"#
+        ));
+        // 只有可疑活动、没有临时信号 → 不算临时限速（可能是真封禁）
+        assert!(!default_is_temporary_rate_limit(
+            "account suspended due to suspicious activity"
+        ));
+        // 只有限速信号、没有可疑活动 → 不算（普通限速走 429 路径即可）
+        assert!(!default_is_temporary_rate_limit("temporary limits applied"));
+        // 完全无关
+        assert!(!default_is_temporary_rate_limit("too many requests"));
+    }
+
+    #[test]
+    fn test_temporary_rate_limit_precedence_over_suspension() {
+        // ⚠️ 防误冻核心边界：一段"临时限速但文案里带 suspended"的 body，
+        // is_temporary_rate_limit 必须命中（provider 会先判它，从而只设短冷却）。
+        // 同时该 body 也会被 is_account_suspended 命中——正因如此顺序才关键。
+        let body =
+            "Your account has been suspended due to suspicious activity. temporary limits applied, try again later.";
+        assert!(
+            default_is_temporary_rate_limit(body),
+            "临时风控文案必须先被识别为临时限速"
+        );
+        assert!(
+            default_is_account_suspended(body),
+            "该文案也含 suspend 关键词——正是需要靠判定顺序避免误冻的场景"
+        );
+    }
+
+    #[test]
+    fn test_client_validation_error_detects_tool_mismatch() {
+        assert!(default_is_client_validation_error(
+            r#"{"reason":"TOOL_USE_RESULT_MISMATCH","message":"..."}"#
+        ));
+        assert!(!default_is_client_validation_error(
+            r#"{"reason":"MONTHLY_REQUEST_COUNT"}"#
+        ));
+        assert!(!default_is_client_validation_error("some other error"));
     }
 
     #[test]
