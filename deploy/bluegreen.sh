@@ -4,9 +4,9 @@
 set -u
 STAGE="${1:-verify}"
 TMP_PORT=8995
-LIVE_BIN="/root/kiro-rs/kiro-rs-linux-x86_64/kiro-rs"
-LIVE_CFG="/root/kiro-rs/kiro-rs-linux-x86_64/config.json"
-LIVE_CREDS="/root/kiro-rs/kiro-rs-linux-x86_64/credentials.json"
+LIVE_BIN="/home/dwgx_user/KiroStudio/kirostudio"
+LIVE_CFG="/home/dwgx_user/KiroStudio/config/config.json"
+LIVE_CREDS="/home/dwgx_user/KiroStudio/config/credentials.json"
 NEW_BIN="/tmp/kirostudio-new"
 ADMIN_KEY="sk-dwgx-admin"
 
@@ -58,15 +58,15 @@ elif [ "$STAGE" = "promote" ]; then
   echo "=== 蓝绿阶段2：切换主服务(先备份→stop→cp→start) ==="
   [ -f "$NEW_BIN" ] || { echo "FAIL: $NEW_BIN 不存在"; exit 1; }
   ts=$(date +%Y%m%d-%H%M%S)
-  sudo cp "$LIVE_BIN" "/tmp/kiro-rs.bak.$ts" && echo "已备份旧二进制到 /tmp/kiro-rs.bak.$ts"
-  sudo systemctl stop kiro-rs && echo "已停主服务"
+  sudo cp "$LIVE_BIN" "/tmp/kirostudio.bak.$ts" && echo "已备份旧二进制到 /tmp/kirostudio.bak.$ts"
+  sudo systemctl stop kirostudio && echo "已停主服务"
   sudo cp "$NEW_BIN" "$LIVE_BIN" && sudo chmod +x "$LIVE_BIN" && echo "已替换"
-  sudo systemctl start kiro-rs && sleep 3
-  if sudo systemctl is-active --quiet kiro-rs; then
+  sudo systemctl start kirostudio && sleep 3
+  if sudo systemctl is-active --quiet kirostudio; then
     echo "=== 主服务已切换并存活 ✓ ==="
     curl -s -o /dev/null -w "8990 models=%{http_code}\n" -H "x-api-key: sk-test" http://localhost:8990/v1/models
   else
-    echo "=== 主服务启动失败！回滚：sudo cp /tmp/kiro-rs.bak.$ts $LIVE_BIN && sudo systemctl start kiro-rs ==="
+    echo "=== 主服务启动失败！回滚：sudo cp /tmp/kirostudio.bak.$ts $LIVE_BIN && sudo systemctl start kirostudio ==="
     exit 1
   fi
 else
