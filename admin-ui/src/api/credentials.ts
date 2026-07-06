@@ -3,6 +3,7 @@ import { storage } from '@/lib/storage'
 import type {
   CredentialsStatusResponse,
   BalanceResponse,
+  CachedBalancesResponse,
   SuccessResponse,
   SetDisabledRequest,
   SetPriorityRequest,
@@ -82,9 +83,16 @@ export async function forceRefreshToken(
   return data
 }
 
-// 获取凭据余额
+// 获取凭据余额（按需，hover 时触发；会向上游拉取，注意封号红线勿批量并发）
 export async function getCredentialBalance(id: number): Promise<BalanceResponse> {
   const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`)
+  return data
+}
+
+// 批量读取【已缓存】的余额快照（只读缓存，绝不触发上游调用，安全用于概览/状态条）。
+// 后端后台每 30 分钟温和刷新一次缓存，这里返回最近已知值 + cachedAt 新鲜度。
+export async function getCachedBalances(): Promise<CachedBalancesResponse> {
+  const { data } = await api.get<CachedBalancesResponse>('/credentials/balances/cached')
   return data
 }
 

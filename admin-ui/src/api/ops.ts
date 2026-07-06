@@ -1,0 +1,44 @@
+import axios from 'axios'
+import { storage } from '@/lib/storage'
+import type {
+  SuccessResponse,
+  StorageStatsResponse,
+  StorageCleanupRequest,
+  StorageCleanupResponse,
+} from '@/types/api'
+
+// 复用与 credentials/usage 相同的 baseURL 与鉴权拦截
+const api = axios.create({
+  baseURL: '/api/admin',
+  headers: { 'Content-Type': 'application/json' },
+})
+
+api.interceptors.request.use((config) => {
+  const apiKey = storage.getApiKey()
+  if (apiKey) {
+    config.headers['x-api-key'] = apiKey
+  }
+  return config
+})
+
+// 一键重启服务（detached，systemctl restart）。
+// ⚠️ 重启瞬间本服务断连是预期行为——本次请求可能因连接中断而抛错，调用方需容忍。
+export async function restartService(): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>('/service/restart')
+  return data
+}
+
+// 分区存储统计（trace.db / usage jsonl / trash / 背景图内存池）
+export async function getStorageStats(): Promise<StorageStatsResponse> {
+  const { data } = await api.get<StorageStatsResponse>('/storage/stats')
+  return data
+}
+
+// 按 target + 可选保留天数清理存储（不可逆）。
+// 后端请求体为 camelCase（target / olderThanDays）。
+export async function cleanupStorage(
+  req: StorageCleanupRequest
+): Promise<StorageCleanupResponse> {
+  const { data } = await api.post<StorageCleanupResponse>('/storage/cleanup', req)
+  return data
+}

@@ -6,6 +6,7 @@ import {
   resetCredentialFailure,
   forceRefreshToken,
   getCredentialBalance,
+  getCachedBalances,
   addCredential,
   deleteCredential,
   getLoadBalancingMode,
@@ -51,6 +52,19 @@ export function useCredentialBalance(id: number | null) {
     queryFn: () => getCredentialBalance(id!),
     enabled: id !== null,
     retry: false, // 余额查询失败时不重试（避免重复请求被封禁的账号）
+  })
+}
+
+// 批量读取【已缓存】的余额快照（只读后端缓存，绝不触发上游调用 = 不封号）。
+// 卡片挂载即自动加载，让余额/订阅/额度无需手动点“查询信息”即显示。
+// 后端后台每 30 分钟温和刷新缓存，这里跟随凭据列表节奏温和轮询即可。
+export function useCachedBalances() {
+  return useQuery({
+    queryKey: ['cached-balances'],
+    queryFn: getCachedBalances,
+    // 缓存端点只读、零上游，可比凭据列表更从容地刷新（5 分钟一次足够反映后台 30 分钟刷新）。
+    refetchInterval: 300000,
+    staleTime: 60000,
   })
 }
 

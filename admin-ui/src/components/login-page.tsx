@@ -170,9 +170,29 @@ export function LoginPage({ onLogin }: LoginPageProps) {
           </button>
         </form>
 
-        {/* Footer */}
+        {/* Footer：dwgx 指向作者 GitHub 主页 */}
         <p className="text-center mt-6" style={{ fontSize: '11px', color: '#555' }}>
-          Powered by dwgx
+          Powered by{' '}
+          <a
+            href="https://github.com/dwgx"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="hover:underline"
+            style={{
+              color: '#0070f3',
+              fontWeight: 600,
+              textUnderlineOffset: '2px',
+              transition: 'color 150ms ease',
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.color = '#3b93ff'
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.color = '#0070f3'
+            }}
+          >
+            dwgx
+          </a>
         </p>
       </div>
     </div>
