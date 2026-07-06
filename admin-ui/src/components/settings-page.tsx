@@ -1,15 +1,53 @@
 import { useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
+import {
+  Server,
+  Database,
+  Trash,
+  Activity,
+  ChevronDown,
+  ChevronUp,
+  RotateCcw,
+  Loader,
+  AlertTriangle,
+} from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogFooter,
+  DialogTitle,
+  DialogDescription,
+} from '@/components/ui/dialog'
+import { Skeleton } from '@/components/ui/skeleton'
+import { StatCard } from '@/components/ui/stat-card'
 import { useConfigSnapshot, useUpdateConfig } from '@/hooks/use-credentials'
+import { useRestartService, useStorageStats, useCleanupStorage } from '@/hooks/use-ops'
+import { useUsageClients } from '@/hooks/use-usage'
 import { extractErrorMessage } from '@/lib/utils'
 import { RegionSelect } from '@/components/ui/region-select'
 import { NumberStepper } from '@/components/ui/number-stepper'
-import type { ConfigSnapshotResponse, UpdateConfigRequest } from '@/types/api'
+import type {
+  ConfigSnapshotResponse,
+  UpdateConfigRequest,
+  StoragePartition,
+  StorageCleanupTarget,
+  ClientRpm,
+} from '@/types/api'
+
+// 人性化字节数：1536 → "1.5 KB"，0 → "0 B"（1024 进制）。
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
+  const v = bytes / Math.pow(1024, i)
+  return `${i === 0 ? String(v) : v.toFixed(1)} ${units[i]}`
+}
 
 // 可编辑表单的本地状态（字符串化便于受控输入）
 interface FormState {
@@ -108,6 +146,380 @@ function ReadonlyRow({ label, value, mono }: { label: string; value: React.React
       <span className="text-sm text-muted-foreground shrink-0">{label}</span>
       <span className={`text-sm text-right break-all ${mono ? 'font-mono text-xs' : ''}`}>{value}</span>
     </div>
+  )
+}
+
+/* ============ 通用二次确认弹框 ============ */
+// 危险操作前的确认：标题 + 描述 + 可选额外内容（如保留天数输入），确认色可选危险红。
+function ConfirmDialog({
+  open,
+  onOpenChange,
+  title,
+  description,
+  confirmLabel = '确定',
+  destructive = false,
+  loading = false,
+  onConfirm,
+  children,
+}: {
+  open: boolean
+  onOpenChange: (v: boolean) => void
+  title: string
+  description: React.ReactNode
+  confirmLabel?: string
+  destructive?: boolean
+  loading?: boolean
+  onConfirm: () => void
+  children?: React.ReactNode
+}) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-md">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            {destructive && <AlertTriangle className="h-4 w-4 text-red-400" />}
+            {title}
+          </DialogTitle>
+          <DialogDescription>{description}</DialogDescription>
+        </DialogHeader>
+        {children}
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={loading}>
+            取消
+          </Button>
+          <Button
+            variant={destructive ? 'destructive' : 'default'}
+            onClick={onConfirm}
+            disabled={loading}
+          >
+            {loading ? '处理中…' : confirmLabel}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+/* ============ 1. 服务管理：一键重启 ============ */
+function ServiceManagementCard() {
+  const [confirmOpen, setConfirmOpen] = useState(false)
+  const { mutate: restart, isPending } = useRestartService()
+
+  const handleConfirm = () => {
+    restart(undefined, {
+      // 重启会掐断本次连接，成功/失败都当作"已发起"提示——真正结果看服务是否恢复。
+      onSuccess: (resp) => {
+        toast.success(resp.message || '重启中，数秒后恢复')
+        setConfirmOpen(false)
+      },
+      onError: () => {
+        // 连接被重启中断而抛错属预期，仍提示已发起
+        toast.warning('重启中，数秒后恢复（本次连接已中断，属正常）')
+        setConfirmOpen(false)
+      },
+    })
+  }
+
+  return (
+    <Card>
+      <CardHeader className="pb-2">
+        <CardTitle className="text-base flex items-center gap-2">
+          <Server className="h-4 w-4 text-muted-foreground" />
+          服务管理
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <p className="text-sm text-muted-foreground">
+          一键重启网关服务。重启瞬间会短暂断服数秒，期间请求失败——Claude Code 自身也走本网关，务必确认无进行中的关键请求。
+        </p>
+        <Button variant="destructive" size="sm" onClick={() => setConfirmOpen(true)} disabled={isPending}>
+          <RotateCcw className="mr-1.5 h-4 w-4" />
+          一键重启服务
+        </Button>
+      </CardContent>
+
+      <ConfirmDialog
+        open={confirmOpen}
+        onOpenChange={setConfirmOpen}
+        title="确认重启服务？"
+        description="重启会导致网关短暂断服数秒，期间所有请求失败（含正在进行的对话）。数秒后自动恢复。确定继续？"
+        confirmLabel="确认重启"
+        destructive
+        loading={isPending}
+        onConfirm={handleConfirm}
+      />
+    </Card>
+  )
+}
+
+/* ============ 2. 分区存储统计 + 清理 ============ */
+// 分区键 → 是否需要保留天数输入（bg_cache/trash 是全清，无时间维度更自然，但后端也接受 olderThanDays）
+const CLEANABLE_KEYS: StorageCleanupTarget[] = ['traces', 'usage_jsonl', 'trash', 'bg_cache']
+
+function StoragePartitionRow({
+  p,
+  onCleanup,
+}: {
+  p: StoragePartition
+  onCleanup: (p: StoragePartition) => void
+}) {
+  const cleanable = (CLEANABLE_KEYS as string[]).includes(p.key)
+  return (
+    <div className="flex items-center justify-between gap-4 border-b border-border/40 py-3 last:border-0">
+      <div className="min-w-0">
+        <div className="flex items-center gap-2 text-sm">
+          <span className="truncate">{p.label}</span>
+          {p.inMemory && (
+            <Badge variant="outline" className="text-[10px]">
+              内存
+            </Badge>
+          )}
+        </div>
+        {p.path && (
+          <div className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground" title={p.path}>
+            {p.path}
+          </div>
+        )}
+      </div>
+      <div className="flex shrink-0 items-center gap-4">
+        <div className="text-right">
+          <div className="text-sm font-semibold tabular-nums">{formatBytes(p.bytes)}</div>
+          <div className="text-[11px] text-muted-foreground tabular-nums">{p.items} 项</div>
+        </div>
+        {cleanable && (
+          <Button variant="outline" size="sm" onClick={() => onCleanup(p)}>
+            <Trash className="mr-1 h-3.5 w-3.5" />
+            清理
+          </Button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function StorageStatsCard() {
+  const { data, isLoading, error, refetch } = useStorageStats()
+  const { mutate: cleanup, isPending } = useCleanupStorage()
+
+  // 清理弹框状态：target 分区 + 可选保留天数（空=按配置默认保留期）
+  const [target, setTarget] = useState<StoragePartition | null>(null)
+  const [keepDays, setKeepDays] = useState<string>('')
+
+  const openCleanup = (p: StoragePartition) => {
+    setTarget(p)
+    setKeepDays('')
+  }
+
+  // 时间维度仅对落盘按天数据有意义（traces / usage_jsonl）；trash/bg_cache 为全清
+  const supportsDays = target ? target.key === 'traces' || target.key === 'usage_jsonl' : false
+
+  const handleConfirm = () => {
+    if (!target) return
+    const days = keepDays.trim() === '' ? undefined : Number(keepDays)
+    cleanup(
+      {
+        target: target.key as StorageCleanupTarget,
+        olderThanDays: supportsDays && Number.isFinite(days) ? days : undefined,
+      },
+      {
+        onSuccess: (resp) => {
+          toast.success(resp.message)
+          setTarget(null)
+        },
+        onError: (err) => toast.error(extractErrorMessage(err)),
+      }
+    )
+  }
+
+  return (
+    <Card>
+      <CardHeader className="pb-2 flex-row items-center justify-between space-y-0">
+        <CardTitle className="text-base flex items-center gap-2">
+          <Database className="h-4 w-4 text-muted-foreground" />
+          存储占用
+        </CardTitle>
+        <Button variant="outline" size="sm" onClick={() => refetch()} disabled={isLoading}>
+          刷新
+        </Button>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {isLoading ? (
+          <div className="space-y-3">
+            <Skeleton className="h-14 w-full" />
+            <Skeleton className="h-14 w-full" />
+            <Skeleton className="h-14 w-full" />
+          </div>
+        ) : error ? (
+          <div className="py-4 text-center text-sm text-red-400">
+            加载存储统计失败：{extractErrorMessage(error)}
+          </div>
+        ) : data ? (
+          <>
+            <StatCard
+              label="落盘占用合计"
+              value={formatBytes(data.totalDiskBytes)}
+              icon={Database}
+              accent="primary"
+              hint={data.usageEnabled ? '用量统计已启用' : '用量统计未启用（部分分区缺失）'}
+            />
+            <div>
+              {data.partitions.map((p) => (
+                <StoragePartitionRow key={p.key} p={p} onCleanup={openCleanup} />
+              ))}
+              {data.partitions.length === 0 && (
+                <p className="py-4 text-center text-sm text-muted-foreground">暂无可统计的分区</p>
+              )}
+            </div>
+          </>
+        ) : null}
+      </CardContent>
+
+      <ConfirmDialog
+        open={target !== null}
+        onOpenChange={(v) => !v && setTarget(null)}
+        title={`清理「${target?.label ?? ''}」？`}
+        description={
+          <span>
+            此操作<strong className="text-red-400">不可逆</strong>，将永久删除对应数据。
+            {supportsDays
+              ? '可指定保留天数：仅删除早于该天数的数据；留空按服务配置的默认保留期。'
+              : '该分区为整体清理，将清空全部内容。'}
+          </span>
+        }
+        confirmLabel="确认清理"
+        destructive
+        loading={isPending}
+        onConfirm={handleConfirm}
+      >
+        {supportsDays && (
+          <div className="flex items-center justify-between gap-3 rounded-md border border-border/60 bg-secondary/30 px-3 py-2">
+            <span className="text-sm">保留天数</span>
+            <div className="flex items-center gap-2">
+              <Input
+                className="w-24 text-right"
+                type="number"
+                min={0}
+                value={keepDays}
+                onChange={(e) => setKeepDays(e.target.value)}
+                placeholder="默认"
+              />
+              <span className="text-xs text-muted-foreground">天</span>
+            </div>
+          </div>
+        )}
+      </ConfirmDialog>
+    </Card>
+  )
+}
+
+/* ============ 3. per 客户端/窗口 RPM 面板 ============ */
+function ClientRow({ c }: { c: ClientRpm }) {
+  const [expanded, setExpanded] = useState(false)
+  const canExpand = c.sessions.length > 0
+  return (
+    <div className="border-b border-border/40 last:border-0">
+      <div
+        className={`flex items-center justify-between gap-4 py-3 ${canExpand ? 'cursor-pointer hover:bg-secondary/40' : ''} rounded-md px-2 transition-colors`}
+        onClick={() => canExpand && setExpanded((v) => !v)}
+      >
+        <div className="flex min-w-0 items-center gap-2">
+          {canExpand ? (
+            expanded ? (
+              <ChevronUp className="h-4 w-4 shrink-0 text-muted-foreground" />
+            ) : (
+              <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />
+            )
+          ) : (
+            <span className="w-4 shrink-0" />
+          )}
+          <div className="min-w-0">
+            <div className="truncate font-mono text-sm" title={c.clientKey}>
+              {c.clientIp ?? c.clientKey}
+            </div>
+            {c.device && (
+              <div className="mt-0.5 text-[11px] text-muted-foreground">{c.device}</div>
+            )}
+          </div>
+        </div>
+        <div className="flex shrink-0 items-center gap-5">
+          <div className="text-right">
+            <div className="text-sm font-semibold tabular-nums">{c.rpm}</div>
+            <div className="text-[11px] text-muted-foreground">RPM</div>
+          </div>
+          <Badge variant="outline" className="text-[11px]">
+            {c.activeSessions} 窗口
+          </Badge>
+        </div>
+      </div>
+      {expanded && canExpand && (
+        <div className="mb-2 ml-6 space-y-1 rounded-md border border-border/40 bg-secondary/20 p-2">
+          {c.sessions.map((s) => (
+            <div key={s.sessionId} className="flex items-center justify-between gap-3 text-xs">
+              <span className="truncate font-mono text-muted-foreground" title={s.sessionId}>
+                {s.sessionId}
+              </span>
+              <span className="shrink-0 tabular-nums">
+                <span className="font-semibold">{s.rpm}</span>
+                <span className="text-muted-foreground"> RPM</span>
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function ClientRpmCard() {
+  const { data, isLoading, error, isFetching } = useUsageClients()
+
+  const totalRpm = useMemo(() => (data ?? []).reduce((s, c) => s + c.rpm, 0), [data])
+  const totalWindows = useMemo(
+    () => (data ?? []).reduce((s, c) => s + c.activeSessions, 0),
+    [data]
+  )
+
+  return (
+    <Card>
+      <CardHeader className="pb-2 flex-row items-center justify-between space-y-0">
+        <CardTitle className="text-base flex items-center gap-2">
+          <Activity className="h-4 w-4 text-muted-foreground" />
+          客户端 RPM
+          {isFetching && <Loader className="h-3.5 w-3.5 animate-spin text-muted-foreground" />}
+        </CardTitle>
+        <span className="text-xs text-muted-foreground">每 30 秒刷新（读本地统计）</span>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="grid grid-cols-3 gap-3">
+          <StatCard label="客户端数" value={data?.length ?? 0} accent="neutral" />
+          <StatCard label="合计 RPM" value={totalRpm} accent="primary" />
+          <StatCard label="活跃窗口" value={totalWindows} accent="success" />
+        </div>
+
+        {isLoading ? (
+          <div className="space-y-3">
+            <Skeleton className="h-12 w-full" />
+            <Skeleton className="h-12 w-full" />
+            <Skeleton className="h-12 w-full" />
+          </div>
+        ) : error ? (
+          <div className="py-4 text-center text-sm text-red-400">
+            加载客户端 RPM 失败：{extractErrorMessage(error)}
+          </div>
+        ) : data && data.length > 0 ? (
+          <div>
+            <p className="mb-1 px-2 text-xs text-muted-foreground">
+              点击展开查看每个窗口（session）的 RPM
+            </p>
+            {data.map((c) => (
+              <ClientRow key={c.clientKey} c={c} />
+            ))}
+          </div>
+        ) : (
+          <p className="py-6 text-center text-sm text-muted-foreground">当前无活跃客户端</p>
+        )}
+      </CardContent>
+    </Card>
   )
 }
 
@@ -219,11 +631,16 @@ export function SettingsPage() {
   return (
     <div className="space-y-6 pb-24">
       <div className="flex items-center justify-between">
-        <h2 className="text-xl font-semibold">设置</h2>
+        <h2 className="text-xl font-semibold text-gradient-brand">设置</h2>
         <Button variant="outline" size="sm" onClick={() => refetch()} disabled={isSaving}>
           刷新
         </Button>
       </div>
+
+      {/* 运维：服务管理 / 存储 / 客户端 RPM（对接已就绪后端端点） */}
+      <ServiceManagementCard />
+      <StorageStatsCard />
+      <ClientRpmCard />
 
       {/* 负载均衡（立即生效） */}
       <Card>

@@ -8,6 +8,8 @@ export function authLabel(method: string | null | undefined): string {
       return 'Social（个人）'
     case 'idc':
       return 'IdC（企业 SSO）'
+    case 'external_idp':
+      return 'External IdP'
     case 'api_key':
       return 'API Key'
     default:
@@ -22,6 +24,8 @@ export function authShortLabel(method: string | null | undefined): string {
       return '个人'
     case 'idc':
       return '企业 SSO'
+    case 'external_idp':
+      return 'External IdP'
     case 'api_key':
       return 'API Key'
     default:

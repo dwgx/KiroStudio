@@ -92,3 +92,352 @@
   scrollbar-width: thin;
   scrollbar-color: #2e2e2e transparent;
 }
+
+/* ============================================================
+   本批共享工具类地基（供其它前端 agent 复用，勿各自造轮子）
+   金属质感三件套：品牌渐变文字 + 厚重金属卡 + 金属按压反馈
+   ============================================================ */
+@layer components {
+  /* 品牌渐变文字：左上蓝 → 右下紫，用于各页标题 */
+  .text-gradient-brand {
+    background: linear-gradient(135deg, #0070f3, #7928ca);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    -webkit-text-fill-color: transparent;
+    font-weight: 600;
+  }
+
+  /* 金属厚重卡片：
+     斜向深色渐变模拟从左上到右下的金属反光面，
+     顶部 1px 内高光（inset）像金属被顶光照到的锐利高光边，
+     两层外阴影（近实、远柔）把卡片从背景里"抬"出厚度。 */
+  .card-metal {
+    background: linear-gradient(145deg, #1e1e20 0%, #171719 55%, #131315 100%);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: var(--radius);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.06),
+      0 1px 3px rgba(0, 0, 0, 0.4),
+      0 4px 12px rgba(0, 0, 0, 0.25);
+  }
+
+  /* 金属按压卡片：在 .card-metal 观感基础上加"手指轻压下沉"的交互。
+     hover 下沉 1px 且外阴影收敛变浅（更贴桌面），active 再沉 1px。
+     绝不 scale、绝不 inset 凹陷、绝不上浮（无 translateY 负值）。 */
+  .card-metal-press {
+    background: linear-gradient(145deg, #1e1e20 0%, #171719 55%, #131315 100%);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: var(--radius);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.06),
+      0 1px 3px rgba(0, 0, 0, 0.4),
+      0 4px 12px rgba(0, 0, 0, 0.25);
+    cursor: default;
+    transition:
+      transform 180ms cubic-bezier(0.16, 1, 0.3, 1),
+      box-shadow 180ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  .card-metal-press:hover {
+    transform: translateY(1px);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.05),
+      0 1px 2px rgba(0, 0, 0, 0.35),
+      0 2px 6px rgba(0, 0, 0, 0.2);
+  }
+
+  .card-metal-press:active {
+    transform: translateY(2px);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.04),
+      0 1px 1px rgba(0, 0, 0, 0.3),
+      0 1px 3px rgba(0, 0, 0, 0.18);
+  }
+
+  /* motion-reduce 兜底：偏好减少动效时不位移、不过渡 */
+  @media (prefers-reduced-motion: reduce) {
+    .card-metal-press {
+      transition: none;
+    }
+    .card-metal-press:hover,
+    .card-metal-press:active {
+      transform: none;
+    }
+  }
+}
+
+/* ============================================================
+   骨架屏微光（shimmer）—— 供 Skeleton 组件使用
+   底色为暗色低亮度块，一道斜向高光条以 background-position 平移扫过。
+   本项目未装 tailwindcss-animate，动画一律手写 @keyframes。
+   仅在文件末尾追加，避免与他人改动冲突。
+   ============================================================ */
+@keyframes shimmer {
+  0% {
+    background-position: -160% 0;
+  }
+  100% {
+    background-position: 160% 0;
+  }
+}
+
+.animate-shimmer {
+  background-color: hsl(0 0% 12%);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.06) 45%,
+    rgba(255, 255, 255, 0.1) 50%,
+    rgba(255, 255, 255, 0.06) 55%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+  background-repeat: no-repeat;
+  animation: shimmer 1.6s ease-in-out infinite;
+}
+
+/* ============================================================
+   Dialog 进出场（上号弹卡开关动画）
+   打开：遮罩淡入 + 卡片淡入 + 轻微放大(0.96→1)并上移(8px→0)。
+   关闭：反向——卡片淡出 + 缩小 + 下沉，遮罩淡出。
+   由 dialog.tsx 的 data-[state=open]/[closed] 挂载对应工具类。
+   ============================================================ */
+@keyframes dialog-overlay-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes dialog-overlay-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+@keyframes dialog-content-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, calc(-50% + 8px)) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+}
+@keyframes dialog-content-out {
+  from {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translate(-50%, calc(-50% + 8px)) scale(0.96);
+  }
+}
+
+.dialog-overlay-anim[data-state='open'] {
+  animation: dialog-overlay-in 200ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.dialog-overlay-anim[data-state='closed'] {
+  animation: dialog-overlay-out 160ms ease-in;
+}
+.dialog-content-anim[data-state='open'] {
+  animation: dialog-content-in 220ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.dialog-content-anim[data-state='closed'] {
+  animation: dialog-content-out 170ms ease-in;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-shimmer {
+    animation: none;
+  }
+  .dialog-overlay-anim[data-state='open'],
+  .dialog-overlay-anim[data-state='closed'],
+  .dialog-content-anim[data-state='open'],
+  .dialog-content-anim[data-state='closed'] {
+    animation: none;
+  }
+}
+
+/* ============================================================
+   号池可视化三视图（GlowGrid / OrbitRing / StatusBars）专用动效。
+   多数用到每元素基色变量 --glow-rgb（形如 "16 185 129"）；
+   Tailwind keyframes 无法读元素级 CSS 变量，故在此手写。
+   全部在 prefers-reduced-motion 下降级为静态。仅文件末尾追加。
+   ============================================================ */
+
+/* GlowGrid —— 健康号常驻“呼吸”辉光：外发光强度极缓起伏，克制不刺眼 */
+@keyframes glow-idle-soft {
+  0%, 100% { box-shadow: 0 0 5px 0 rgb(var(--glow-rgb) / 0.28); }
+  50%      { box-shadow: 0 0 12px 1px rgb(var(--glow-rgb) / 0.5); }
+}
+.animate-idle-glow-soft {
+  animation: glow-idle-soft 3.6s ease-in-out infinite;
+}
+
+/* GlowGrid —— 命中扫光：一道白色高光自上而下扫过灯体一次 */
+@keyframes glow-sweep {
+  0%   { opacity: 0; transform: translateY(-100%); }
+  22%  { opacity: 0.85; }
+  100% { opacity: 0; transform: translateY(100%); }
+}
+.animate-glow-sweep {
+  animation: glow-sweep 0.75s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* GlowGrid —— 命中外辉光骤亮再衰减（叠在呼吸之上，体现请求流入的“闪”） */
+@keyframes glow-burst {
+  0%   { box-shadow: 0 0 4px 0 rgb(var(--glow-rgb) / 0.4); }
+  20%  { box-shadow: 0 0 20px 3px rgb(var(--glow-rgb) / 0.85); }
+  100% { box-shadow: 0 0 4px 0 rgb(var(--glow-rgb) / 0); }
+}
+.animate-glow-burst {
+  animation: glow-burst 0.75s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* OrbitRing —— 活跃节点 → 中心的脉冲连线：快速亮起后淡出 */
+@keyframes orbit-link {
+  0%   { opacity: 0; }
+  25%  { opacity: 0.8; }
+  100% { opacity: 0; }
+}
+.animate-orbit-link {
+  animation: orbit-link 0.85s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* OrbitRing —— 命中涟漪：节点外一圈向外扩散并淡出（以节点自身为中心缩放） */
+@keyframes orbit-ripple {
+  0%   { opacity: 0.9; transform: scale(1); }
+  100% { opacity: 0; transform: scale(3.2); }
+}
+.animate-orbit-ripple {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: orbit-ripple 0.9s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* StatusBars —— 命中横向扫光：高光带从左掠到右一次 */
+@keyframes bar-sweep {
+  0%   { opacity: 0; transform: translateX(-120%); }
+  20%  { opacity: 1; }
+  100% { opacity: 0; transform: translateX(420%); }
+}
+.animate-bar-sweep {
+  animation: bar-sweep 0.8s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-idle-glow-soft,
+  .animate-glow-sweep,
+  .animate-glow-burst,
+  .animate-orbit-link,
+  .animate-orbit-ripple,
+  .animate-bar-sweep {
+    animation: none;
+  }
+}
+
+/* ============================================================
+   GlowGrid 质感升级：双层呼吸 / 命中辉光脉冲 / 涟漪光环 / 在途边缘流光。
+   全部读元素级基色变量 --glow-rgb（形如 "16 185 129"）；仅文件末尾追加。
+   ============================================================ */
+
+/* 双层呼吸辉光：内芯（小 blur，稳而亮）+ 外晕（大 blur，缓慢起伏扩散）。
+   周期由组件按健康/在途改写 animationDuration（健康沉稳 / 有失败略急 / 在途更快）。 */
+@keyframes glow-idle-rich {
+  0%, 100% {
+    box-shadow:
+      0 0 4px 0 rgb(var(--glow-rgb) / 0.55),
+      0 0 9px 0 rgb(var(--glow-rgb) / 0.2);
+  }
+  50% {
+    box-shadow:
+      0 0 6px 0 rgb(var(--glow-rgb) / 0.72),
+      0 0 20px 2px rgb(var(--glow-rgb) / 0.45);
+  }
+}
+.animate-idle-glow-rich {
+  animation: glow-idle-rich 3.6s ease-in-out infinite;
+}
+
+/* 命中辉光脉冲：内芯一记白闪 + 外晕基色骤亮，随后衰减归零。 */
+@keyframes glow-burst-rich {
+  0% {
+    box-shadow:
+      0 0 0 0 rgb(255 255 255 / 0),
+      0 0 4px 0 rgb(var(--glow-rgb) / 0.4);
+  }
+  18% {
+    box-shadow:
+      0 0 8px 1px rgb(255 255 255 / 0.85),
+      0 0 24px 4px rgb(var(--glow-rgb) / 0.9);
+  }
+  100% {
+    box-shadow:
+      0 0 0 0 rgb(255 255 255 / 0),
+      0 0 4px 0 rgb(var(--glow-rgb) / 0);
+  }
+}
+.animate-glow-burst-rich {
+  animation: glow-burst-rich 0.8s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* 命中涟漪光环：以灯体为中心的细描边环向外扩散并淡出（不裁剪，允许溢出）。 */
+@keyframes glow-ripple-ring {
+  0% {
+    opacity: 0.85;
+    transform: scale(0.9);
+    box-shadow: 0 0 0 1px rgb(var(--glow-rgb) / 0.9);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(2.1);
+    box-shadow: 0 0 0 1px rgb(var(--glow-rgb) / 0);
+  }
+}
+.animate-glow-ripple-ring {
+  transform-origin: center;
+  animation: glow-ripple-ring 0.85s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* 在途边缘流光：一段亮弧沿灯体边框持续巡游。
+   用 @property 注册可动画角度，让 conic 渐变旋转而元素本身不转（圆角不会跟着歪）。
+   mask 取 border-box 减 content-box → 只显现 1px 边框环。不支持 @property 的浏览器
+   角度停在初始值 → 退化为一段静态亮弧，仍可用；motion-reduce 直接隐藏。 */
+@property --beam-angle {
+  syntax: '<angle>';
+  inherits: false;
+  initial-value: 0deg;
+}
+@keyframes border-beam {
+  to {
+    --beam-angle: 360deg;
+  }
+}
+.animate-border-beam {
+  padding: 1px;
+  background: conic-gradient(
+    from var(--beam-angle),
+    transparent 0deg,
+    transparent 268deg,
+    rgb(var(--glow-rgb) / 0.9) 320deg,
+    rgb(255 255 255 / 0.95) 348deg,
+    transparent 360deg
+  );
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  animation: border-beam 2.2s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-idle-glow-rich,
+  .animate-glow-burst-rich,
+  .animate-glow-ripple-ring,
+  .animate-border-beam {
+    animation: none;
+  }
+}

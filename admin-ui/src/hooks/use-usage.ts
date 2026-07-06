@@ -5,6 +5,8 @@ import {
   getUsageByModel,
   getUsageByCredential,
   getUsageRecent,
+  getUsageClients,
+  getUsageThroughput,
 } from '@/api/usage'
 
 // 统计页整体每 30 秒自动刷新
@@ -59,6 +61,30 @@ export function useUsageRecentLive(limit = 60) {
     queryKey: ['usage', 'recent-live', limit],
     queryFn: () => getUsageRecent(limit),
     refetchInterval: () => (typeof document !== 'undefined' && document.hidden ? false : LIVE_RECENT_MS),
+    refetchIntervalInBackground: false,
+  })
+}
+
+// per 客户端/窗口 RPM 面板：30s 轮询（读本地内存统计，零上游、无封号风险）。
+// 页面隐藏时暂停轮询省资源。
+export function useUsageClients() {
+  return useQuery({
+    queryKey: ['usage', 'clients'],
+    queryFn: getUsageClients,
+    refetchInterval: () => (typeof document !== 'undefined' && document.hidden ? false : REFETCH_MS),
+    refetchIntervalInBackground: false,
+  })
+}
+
+// 趋势图流动粒子专用：4s 短轮询 /usage/throughput（读本地内存环，零上游、无封号风险）。
+// 页面隐藏（切走标签页）时暂停轮询省资源；重新可见时 react-query 借 focus 事件自动复轮。
+const THROUGHPUT_MS = 4000
+
+export function useUsageThroughput() {
+  return useQuery({
+    queryKey: ['usage', 'throughput'],
+    queryFn: getUsageThroughput,
+    refetchInterval: () => (typeof document !== 'undefined' && document.hidden ? false : THROUGHPUT_MS),
     refetchIntervalInBackground: false,
   })
 }

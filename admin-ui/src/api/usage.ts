@@ -5,6 +5,8 @@ import type {
   SeriesPoint,
   GroupStat,
   RequestRecord,
+  ClientRpm,
+  ThroughputSnapshot,
 } from '@/types/api'
 
 // 复用与 credentials 相同的 baseURL 与鉴权拦截
@@ -54,5 +56,18 @@ export async function getUsageRecent(limit = 100): Promise<RequestRecord[]> {
   const { data } = await api.get<RequestRecord[]>('/usage/recent', {
     params: { limit },
   })
+  return data
+}
+
+// per 客户端/窗口 RPM（发起方维度：谁开了几个窗口各打多少 RPM）
+export async function getUsageClients(): Promise<ClientRpm[]> {
+  const { data } = await api.get<ClientRpm[]>('/usage/clients')
+  return data
+}
+
+// 全局实时吞吐快照（最近 60 秒速率 + 逐秒桶）：读本地内存环，零上游、无封号风险。
+// 供趋势图渲染「沿曲线流动的发光粒子」。
+export async function getUsageThroughput(): Promise<ThroughputSnapshot> {
+  const { data } = await api.get<ThroughputSnapshot>('/usage/throughput')
   return data
 }
