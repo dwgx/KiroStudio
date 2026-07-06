@@ -9,11 +9,14 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
+use tokio::time::sleep;
 
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -22,10 +25,12 @@ use crate::kiro::cooldown::{CooldownManager, CooldownReason};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::{KiroCredentials, TrashEntry};
 use crate::kiro::model::token_refresh::{
-    IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
+    ExternalIdpRefreshResponse, IdcRefreshRequest, IdcRefreshResponse, RefreshRequest,
+    RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::kiro::rate_limiter::{RateLimitConfig, RateLimiter};
+use crate::kiro::scheduling::{InflightGuard, RpmTracker};
 use crate::model::config::Config;
 
 /// 检查 Token 是否在指定时间内过期
@@ -138,7 +143,9 @@ pub(crate) async fn refresh_token(
         }
     });
 
-    if auth_method.eq_ignore_ascii_case("idc")
+    if credentials.is_external_idp_credential() {
+        refresh_external_idp_token(credentials, config, proxy).await
+    } else if auth_method.eq_ignore_ascii_case("idc")
         || auth_method.eq_ignore_ascii_case("builder-id")
         || auth_method.eq_ignore_ascii_case("iam")
     {
@@ -230,7 +237,139 @@ async fn refresh_social_token(
     Ok(new_credentials)
 }
 
-/// 刷新 IdC Token (AWS SSO OIDC)
+/// 校验 External IdP 的 token_endpoint 只能指向合法的 Microsoft 登录域。
+///
+/// token_endpoint/issuer_url 来自凭据，服务端会直接向其 POST（含 refresh_token/
+/// client_secret）。若不校验，可被诱导 SSRF 或把凭据发往攻击者域。这里强制：
+/// - scheme 必须是 https；
+/// - host 必须是 `login.microsoftonline.com` / `.us` / `.cn`（或其子域）；
+/// - 拒绝 userinfo(`@`) 混淆、IP 字面量。
+fn validate_microsoft_token_endpoint(endpoint: &str) -> anyhow::Result<()> {
+    let rest = endpoint
+        .strip_prefix("https://")
+        .ok_or_else(|| anyhow::anyhow!("External IdP token_endpoint 必须为 https"))?;
+    // authority = 到第一个 / ? # 之前
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // 拒绝 userinfo 混淆（user@evil.com）
+    if authority.contains('@') {
+        bail!("External IdP token_endpoint 含非法 userinfo: {}", endpoint);
+    }
+    // 去掉端口
+    let host = authority.split(':').next().unwrap_or("").to_ascii_lowercase();
+    if host.is_empty() {
+        bail!("External IdP token_endpoint 缺少主机: {}", endpoint);
+    }
+    const ALLOWED_SUFFIXES: &[&str] = &[
+        "login.microsoftonline.com",
+        "login.microsoftonline.us",
+        "login.partner.microsoftonline.cn",
+        "login.chinacloudapi.cn",
+    ];
+    let ok = ALLOWED_SUFFIXES
+        .iter()
+        .any(|s| host == *s || host.ends_with(&format!(".{s}")));
+    if !ok {
+        bail!(
+            "External IdP token_endpoint 主机不在 Microsoft 登录域白名单内: {}",
+            host
+        );
+    }
+    Ok(())
+}
+
+/// 刷新 External IdP Token（Microsoft Entra / Azure AD，OAuth2 refresh_token）
+async fn refresh_external_idp_token(
+    credentials: &KiroCredentials,
+    config: &Config,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<KiroCredentials> {
+    tracing::info!("正在刷新 External IdP Token...");
+
+    let refresh_token = credentials.refresh_token.as_ref().unwrap();
+    let client_id = credentials
+        .client_id
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("External IdP 刷新需要 clientId"))?;
+
+    let token_endpoint = if let Some(endpoint) = credentials.token_endpoint.as_deref() {
+        endpoint.to_string()
+    } else {
+        let issuer = credentials
+            .issuer_url
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("External IdP 刷新需要 tokenEndpoint 或 issuerUrl"))?
+            .trim_end_matches('/');
+        if issuer.ends_with("/v2.0") {
+            format!("{}/token", issuer)
+        } else {
+            format!("{}/oauth2/v2.0/token", issuer)
+        }
+    };
+
+    // 安全（SSRF）：token_endpoint / issuer_url 来自凭据（可被写凭据的 admin 污染），
+    // 服务端会直接 POST 它。限制只能指向合法的 Microsoft 登录域，防止被诱导把
+    // client_id/refresh_token 之类发到攻击者服务器，或拿网关当跳板打内网。
+    validate_microsoft_token_endpoint(&token_endpoint)?;
+
+    let mut form = vec![
+        ("client_id", client_id.to_string()),
+        ("grant_type", "refresh_token".to_string()),
+        ("refresh_token", refresh_token.to_string()),
+    ];
+    if let Some(scopes) = credentials.scopes.as_ref().filter(|s| !s.trim().is_empty()) {
+        form.push(("scope", scopes.to_string()));
+    }
+    if let Some(client_secret) = credentials
+        .client_secret
+        .as_ref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        form.push(("client_secret", client_secret.to_string()));
+    }
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+    let response = client
+        .post(&token_endpoint)
+        .header("Accept", "application/json")
+        .form(&form)
+        .send()
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        if status.as_u16() == 400 && body_text.contains("invalid_grant") {
+            return Err(RefreshTokenInvalidError {
+                message: format!("External IdP refreshToken 已失效 (invalid_grant): {}", body_text),
+            }
+            .into());
+        }
+        let error_msg = match status.as_u16() {
+            401 => "External IdP 凭证已过期或无效，需要重新认证",
+            403 => "External IdP 权限不足，无法刷新 Token",
+            429 => "External IdP 请求过于频繁，已被限流",
+            500..=599 => "External IdP 服务暂时不可用",
+            _ => "External IdP Token 刷新失败",
+        };
+        bail!("{}: {} {}", error_msg, status, body_text);
+    }
+
+    let data: ExternalIdpRefreshResponse = response.json().await?;
+    let mut new_credentials = credentials.clone();
+    new_credentials.access_token = Some(data.access_token);
+
+    if let Some(new_refresh_token) = data.refresh_token {
+        new_credentials.refresh_token = Some(new_refresh_token);
+    }
+
+    if let Some(expires_in) = data.expires_in {
+        let expires_at = Utc::now() + Duration::seconds(expires_in);
+        new_credentials.expires_at = Some(expires_at.to_rfc3339());
+    }
+
+    Ok(new_credentials)
+}
+
 async fn refresh_idc_token(
     credentials: &KiroCredentials,
     config: &Config,
@@ -378,6 +517,8 @@ pub(crate) async fn get_usage_limits(
 
     if credentials.is_api_key_credential() {
         request = request.header("tokentype", "API_KEY");
+    } else if credentials.is_external_idp_credential() {
+        request = request.header("tokentype", "EXTERNAL_IDP");
     }
 
     let response = request.send().await?;
@@ -421,6 +562,13 @@ struct CredentialEntry {
     success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
+    /// 当前在途（in-flight）请求数
+    ///
+    /// 选号时 +1（在选号临界区内原子完成），请求真正处理完（SSE 流被下游消费完
+    /// / 客户端断开 / 非流式读毕）时随 [`InflightGuard`] Drop 而 -1。
+    /// balanced 选号按此升序，把并发流量分摊到在飞请求最少的号，根治惊群热点。
+    /// 用 `Arc` 是为了让守卫直接持有计数器、与条目生命周期解耦（见 [`crate::kiro::scheduling`] 的 REF-1 说明）。
+    inflight: Arc<AtomicU32>,
 }
 
 /// 禁用原因
@@ -479,6 +627,8 @@ pub struct CredentialEntrySnapshot {
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// 订阅等级标题（如 "Kiro Pro"），随凭据持久化，重启后仍可展示
+    pub subscription_title: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -496,6 +646,10 @@ pub struct CredentialEntrySnapshot {
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// 当前在途（in-flight）请求数（实时负载，用于观测均衡效果）
+    pub inflight: u32,
+    /// 最近 60 秒滚动窗口内的请求数（RPM 观测）
+    pub rpm: u32,
 }
 
 /// 回收站条目快照（用于 Admin API 读取，不含敏感明文）
@@ -580,10 +734,17 @@ pub struct MultiTokenManager {
     affinity: UserAffinityManager,
     /// 是否启用会话亲和性
     affinity_enabled: bool,
+    /// RPM 滚动窗口追踪器（balanced 选号时对接近 RPM 上限的号降权）
+    rpm: RpmTracker,
+    /// 每凭据 RPM 软上限（0 = 不限制）
+    rpm_limit: u32,
 }
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
+/// 所有号只是临时冷却/限流（会自动恢复）时，最多在网关内等待多久再重选，
+/// 避免瞬时全忙就立刻返回“所有凭据均已禁用”。inflight 繁忙不计入等待。
+const MAX_TRANSIENT_WAIT_SECS: u64 = 180;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 
@@ -619,9 +780,27 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = dir.join(format!(".{}.{}.{}.tmp", file_name, std::process::id(), seq));
 
-    // 写入临时文件并尽力落盘
+    // 写入临时文件并尽力落盘。
+    // 安全：凭据文件含 refreshToken/clientSecret/kiroApiKey 等活凭证，绝不能 world-readable。
+    // Unix 下创建即以 0600（仅属主可读写）打开临时文件，rename 后目标继承该权限，
+    // 杜绝默认 umask 造成的 0644 本地泄露。
     let write_tmp = || -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut f = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&tmp)?
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::File::create(&tmp)?
+            }
+        };
         f.write_all(bytes)?;
         f.flush()?;
         // 尽力 sync，失败不致命（部分平台/文件系统可能不支持）
@@ -633,16 +812,24 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         // 临时文件都写不出，清理残留后回退到直接写
         let _ = std::fs::remove_file(&tmp);
         tracing::warn!("原子写临时文件失败，回退直接写: {:?}: {}", tmp, e);
-        return std::fs::write(&target, bytes);
+        std::fs::write(&target, bytes)?;
+        restrict_permissions(&target);
+        return Ok(());
     }
 
-    // rename 覆盖目标（原子替换）
+    // rename 覆盖目标（原子替换）。目标继承临时文件的 0600 权限。
     match std::fs::rename(&tmp, &target) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            restrict_permissions(&target);
+            Ok(())
+        }
         Err(e) => {
             // Windows 下目标被句柄占用等场景可能失败：回退直接写，别让持久化整体失败
             tracing::warn!("原子 rename 失败，回退直接写: {:?} -> {:?}: {}", tmp, target, e);
             let result = std::fs::write(&target, bytes);
+            if result.is_ok() {
+                restrict_permissions(&target);
+            }
             // 清理残留临时文件
             let _ = std::fs::remove_file(&tmp);
             result
@@ -650,11 +837,31 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
 }
 
+/// 将文件权限收紧为仅属主可读写（Unix 0600）；非 Unix 无操作。
+///
+/// 敏感凭据文件的纵深防护：即便走了 `fs::write` 回退路径（默认受 umask 影响可能 0644），
+/// 也把最终文件权限拉回 0600，失败仅告警不致命。
+fn restrict_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            tracing::warn!("收紧文件权限失败 {:?}: {}", path, e);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
 /// API 调用上下文
 ///
 /// 绑定特定凭据的调用上下文，确保 token、credentials 和 id 的一致性
 /// 用于解决并发调用时 current_id 竞态问题
-#[derive(Clone)]
+///
+/// 不实现 `Clone`：持有 [`InflightGuard`]，clone 会导致在途计数被重复 +1。
+/// 单次调用内独占，成功时把 guard 移交给 `CallMeta` 随响应流存活。
 pub struct CallContext {
     /// 凭据 ID（用于 report_success/report_failure）
     pub id: u64,
@@ -662,6 +869,9 @@ pub struct CallContext {
     pub credentials: KiroCredentials,
     /// 访问 Token
     pub token: String,
+    /// 在途请求守卫：本上下文存活期间该凭据的 inflight 计数 +1，Drop 时 -1。
+    /// 选号命中时创建；成功后随 `CallMeta` 移交给响应流，直到流真正消费完才析构。
+    pub inflight: InflightGuard,
 }
 
 /// Web Portal API 调用上下文（用于 app.kiro.dev overage 接口）
@@ -731,6 +941,7 @@ impl MultiTokenManager {
                     },
                     success_count: 0,
                     last_used_at: None,
+                    inflight: Arc::new(AtomicU32::new(0)),
                 }
             })
             .collect();
@@ -779,6 +990,7 @@ impl MultiTokenManager {
         let cooldown_enabled = config.cooldown_enabled;
         let rate_limit_enabled = config.rate_limit_enabled;
         let affinity_enabled = config.affinity_enabled;
+        let rpm_limit = config.credential_rpm_limit;
         let rate_limit_config = RateLimitConfig {
             daily_max_requests: config.rate_limit_daily_max,
             min_interval_ms: config.rate_limit_min_interval_ms,
@@ -802,6 +1014,8 @@ impl MultiTokenManager {
             rate_limit_enabled,
             affinity: UserAffinityManager::new(),
             affinity_enabled,
+            rpm: RpmTracker::new(),
+            rpm_limit,
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -849,18 +1063,27 @@ impl MultiTokenManager {
         self.entries.lock().iter().filter(|e| !e.disabled).count()
     }
 
-    /// 根据负载均衡模式选择下一个凭据
+    /// 根据负载均衡模式选择下一个凭据，并原子性地占用一个在途名额
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
-    /// - balanced 模式：均衡选择可用凭据
+    /// - balanced 模式：按 `(rpm 饱和, 在途数, 成功数, 优先级)` 升序选择——
+    ///   优先挑"RPM 未饱和 + 当前在飞请求最少"的号，把并发流量分摊到多个账号。
+    ///
+    /// **并发正确性**：候选读取（含 inflight/rpm 计数）、选中、`inflight += 1`、
+    /// `rpm.record` 全部在同一把 `entries.lock()` 临界区内完成，保证两个并发请求
+    /// 不会同时选中同一个"最空闲"的号（第一个在释放锁前已把它的 inflight +1，
+    /// 第二个看到的就是更新后的值）。这是根治惊群/Top5 热点的关键。
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    ///
+    /// # 返回
+    /// 命中则返回 `(id, credentials, 在途守卫)`，守卫 Drop 时把该号 inflight -1。
     fn select_next_credential(
         &self,
         model: Option<&str>,
         user_id: Option<&str>,
-    ) -> Option<(u64, KiroCredentials)> {
+    ) -> Option<(u64, KiroCredentials, InflightGuard)> {
         let entries = self.entries.lock();
 
         // 检查是否是 opus 模型
@@ -869,8 +1092,9 @@ impl MultiTokenManager {
             .unwrap_or(false);
 
         // 过滤可用凭据
-        let available: Vec<_> = entries
+        let available: Vec<&CredentialEntry> = entries
             .iter()
+            .filter(|e| self.is_entry_selectable(e, is_opus))
             .filter(|e| {
                 if e.disabled {
                     return false;
@@ -903,7 +1127,7 @@ impl MultiTokenManager {
                         tracing::debug!(user_id = %uid, credential_id = %bound_id, "亲和性复用凭据");
                         // 续期，使持续活跃的会话不因 TTL 到期而解绑
                         self.affinity.touch(uid);
-                        return Some((entry.id, entry.credentials.clone()));
+                        return Some(self.commit_selection(entry));
                     }
                     // 绑定的凭据已不可用（禁用/冷却/限流），解绑后按常规策略重选
                     tracing::debug!(
@@ -920,30 +1144,123 @@ impl MultiTokenManager {
 
         let selected = match mode {
             "balanced" => {
-                // Least-Used 策略：选择成功次数最少的凭据
-                // 平局时按优先级排序（数字越小优先级越高）
+                // 按 (rpm 饱和, 在途数, 成功数, 优先级) 升序：
+                // 先避开 RPM 已饱和的号（软降权，非硬跳过），再挑在飞请求最少的，
+                // 再按终身成功数（Least-Used）与优先级平局兜底。
                 available
                     .iter()
-                    .min_by_key(|e| (e.success_count, e.credentials.priority))
-                    .map(|e| (e.id, e.credentials.clone()))
+                    .min_by_key(|e| {
+                        (
+                            self.is_rpm_saturated(e.id),
+                            e.inflight.load(Ordering::Acquire),
+                            e.success_count,
+                            e.credentials.priority,
+                        )
+                    })
+                    .copied()
             }
             _ => {
                 // priority 模式（默认）：选择优先级最高的
                 available
                     .iter()
                     .min_by_key(|e| e.credentials.priority)
-                    .map(|e| (e.id, e.credentials.clone()))
+                    .copied()
             }
         };
 
+        let selected = selected?;
+
         // 新选中的凭据与会话建立绑定，使后续同会话请求复用
         if self.affinity_enabled {
-            if let (Some(uid), Some((id, _))) = (user_id, &selected) {
-                self.affinity.set(uid, *id);
+            if let Some(uid) = user_id {
+                self.affinity.set(uid, selected.id);
             }
         }
 
-        selected
+        Some(self.commit_selection(selected))
+    }
+
+    /// 提交一次选号：在持有 `entries` 锁的前提下原子占用在途名额并记录 RPM。
+    ///
+    /// 必须在 `select_next_credential` 的 `entries.lock()` 临界区内调用，
+    /// 以保证 `inflight += 1` 相对其它并发选号是原子可见的。
+    fn is_entry_selectable(&self, entry: &CredentialEntry, is_opus: bool) -> bool {
+        if entry.disabled {
+            return false;
+        }
+        if is_opus && !entry.credentials.supports_opus() {
+            return false;
+        }
+        if self.cooldown_enabled && !self.cooldown.is_available(entry.id) {
+            return false;
+        }
+        if self.rate_limit_enabled && self.rate_limiter.check_rate_limit(entry.id).is_err() {
+            return false;
+        }
+        // ⚠️ inflight 绝不作为「可选性」的硬门槛。
+        // 本项目的调度设计是：inflight（在飞请求数）只进 select_next_credential 的
+        // 排序键——优先选在飞最少的号，把并发自然分摊；号不够时并发落到同一号由
+        // RPM 软降权调节，而不是把请求卡在网关里排队干等。
+        // （历史上曾被硬编码 inflight < 1 阻塞成"每号同时只 1 个请求"，多客户端下
+        //  多余请求全排队 = 假性限流、体感极慢。此处恢复为不阻塞。）
+        true
+    }
+
+    fn transient_wait_duration(&self, model: Option<&str>) -> Option<StdDuration> {
+        let is_opus = model
+            .map(|m| m.to_lowercase().contains("opus"))
+            .unwrap_or(false);
+        let entries = self.entries.lock();
+        let mut has_candidate = false;
+        let mut waits = Vec::new();
+
+        for entry in entries.iter() {
+            if entry.disabled {
+                continue;
+            }
+            if is_opus && !entry.credentials.supports_opus() {
+                continue;
+            }
+
+            has_candidate = true;
+
+            if self.cooldown_enabled {
+                if let Some((_reason, remaining)) = self.cooldown.check_cooldown(entry.id) {
+                    waits.push(remaining);
+                    continue;
+                }
+            }
+
+            if self.rate_limit_enabled {
+                if let Err(wait) = self.rate_limiter.check_rate_limit(entry.id) {
+                    waits.push(wait);
+                    continue;
+                }
+            }
+
+            // 注意：不再因 inflight「繁忙」而等待——inflight 不是阻塞门槛，
+            // 只要该号未禁用/未冷却/未限流，就是当下可选的候选（并发直接落它）。
+            // 走到这里说明有一个立即可用的候选，无需等待。
+        }
+
+        if !has_candidate {
+            return None;
+        }
+
+        // 只有当所有候选都在冷却/限流(将来会自动恢复)时才等待其中最短的那个；
+        // 若存在立即可用候选(waits 为空)则不等待。
+        waits.into_iter().min()
+    }
+
+    fn commit_selection(&self, entry: &CredentialEntry) -> (u64, KiroCredentials, InflightGuard) {
+        let guard = InflightGuard::acquire(entry.inflight.clone());
+        self.rpm.record(entry.id);
+        (entry.id, entry.credentials.clone(), guard)
+    }
+
+    /// 该凭据在滚动 60 秒窗口内是否已达 RPM 软上限（rpm_limit == 0 时恒为 false）
+    fn is_rpm_saturated(&self, id: u64) -> bool {
+        self.rpm_limit > 0 && self.rpm.count(id) >= self.rpm_limit
     }
 
     /// 获取 API 调用上下文
@@ -970,6 +1287,10 @@ impl MultiTokenManager {
             .max(self.available_count())
             .max(1);
         let mut attempt_count = 0;
+        let wait_started = Instant::now();
+        let is_opus = model
+            .map(|m| m.to_lowercase().contains("opus"))
+            .unwrap_or(false);
 
         loop {
             if attempt_count >= max_attempts {
@@ -980,11 +1301,13 @@ impl MultiTokenManager {
                 );
             }
 
-            let (id, credentials) = {
+            let (id, credentials, inflight) = {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
                 // balanced 模式：每次请求都重新均衡选择，不固定 current_id
                 // priority 模式：优先使用 current_id 指向的凭据
+                // 命中时在同一 entries 锁内占用在途名额（commit_selection），
+                // 保证 inflight 计数相对并发选号原子可见。
                 let current_hit = if is_balanced {
                     None
                 } else {
@@ -992,8 +1315,8 @@ impl MultiTokenManager {
                     let current_id = *self.current_id.lock();
                     entries
                         .iter()
-                        .find(|e| e.id == current_id && !e.disabled)
-                        .map(|e| (e.id, e.credentials.clone()))
+                        .find(|e| e.id == current_id && self.is_entry_selectable(e, is_opus))
+                        .map(|e| self.commit_selection(e))
                 };
 
                 if let Some(hit) = current_hit {
@@ -1023,12 +1346,25 @@ impl MultiTokenManager {
                         }
                     }
 
-                    if let Some((new_id, new_creds)) = best {
+                    if let Some((new_id, new_creds, guard)) = best {
                         // 更新 current_id
                         let mut current_id = self.current_id.lock();
                         *current_id = new_id;
-                        (new_id, new_creds)
+                        (new_id, new_creds, guard)
                     } else {
+                        if let Some(wait) = self.transient_wait_duration(model) {
+                            if wait_started.elapsed() < StdDuration::from_secs(MAX_TRANSIENT_WAIT_SECS) {
+                                let wait = wait
+                                    .max(StdDuration::from_millis(250))
+                                    .min(StdDuration::from_secs(5));
+                                tracing::warn!(
+                                    "所有可用凭据暂时繁忙或冷却中，等待 {:?} 后重试，避免直接返回所有凭据禁用",
+                                    wait
+                                );
+                                sleep(wait).await;
+                                continue;
+                            }
+                        }
                         let entries = self.entries.lock();
                         // 注意：必须在 bail! 之前计算 available_count，
                         // 因为 available_count() 会尝试获取 entries 锁，
@@ -1039,8 +1375,8 @@ impl MultiTokenManager {
                 }
             };
 
-            // 尝试获取/刷新 Token
-            match self.try_ensure_token(id, &credentials).await {
+            // 尝试获取/刷新 Token（成功则把在途守卫移入 CallContext 随请求存活）
+            match self.try_ensure_token(id, &credentials, inflight).await {
                 Ok(ctx) => {
                     // 记录一次速率获取（递增每日计数 + 标记本次请求时间，驱动最小间隔）
                     if self.rate_limit_enabled {
@@ -1104,10 +1440,13 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID，用于更新正确的条目
     /// * `credentials` - 凭据信息
+    /// * `inflight` - 选号时占用的在途守卫；成功则移入 `CallContext` 随请求存活，
+    ///   失败则随本函数返回而 Drop（该次尝试不再在途，inflight -1）。
     async fn try_ensure_token(
         &self,
         id: u64,
         credentials: &KiroCredentials,
+        inflight: InflightGuard,
     ) -> anyhow::Result<CallContext> {
         // API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需刷新
         if credentials.is_api_key_credential() {
@@ -1119,6 +1458,7 @@ impl MultiTokenManager {
                 id,
                 credentials: credentials.clone(),
                 token,
+                inflight,
             });
         }
 
@@ -1188,6 +1528,7 @@ impl MultiTokenManager {
             id,
             credentials: creds,
             token,
+            inflight,
         })
     }
 
@@ -1853,6 +2194,7 @@ impl MultiTokenManager {
                         None
                     },
                     email: e.credentials.email.clone(),
+                    subscription_title: e.credentials.subscription_title.clone(),
                     success_count: e.success_count,
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
@@ -1868,6 +2210,8 @@ impl MultiTokenManager {
                         DisabledReason::InvalidConfig => "InvalidConfig",
                     }.to_string()),
                     endpoint: e.credentials.endpoint.clone(),
+                    inflight: e.inflight.load(Ordering::Acquire),
+                    rpm: self.rpm.count(e.id),
                 })
                 .collect(),
             current_id,
@@ -2221,7 +2565,8 @@ impl MultiTokenManager {
                 }
             }
         });
-        if let Some(ref arn) = credentials.profile_arn {
+        if credentials.should_send_profile_arn() {
+            let arn = credentials.profile_arn.as_ref().unwrap();
             body["profileArn"] = serde_json::Value::String(arn.clone());
         }
 
@@ -2241,6 +2586,8 @@ impl MultiTokenManager {
 
         if credentials.is_api_key_credential() {
             request = request.header("tokentype", "API_KEY");
+        } else if credentials.is_external_idp_credential() {
+            request = request.header("tokentype", "EXTERNAL_IDP");
         }
 
         let response = request.body(body.to_string()).send().await?;
@@ -2394,6 +2741,7 @@ impl MultiTokenManager {
                 disabled_reason: None,
                 success_count: 0,
                 last_used_at: None,
+                inflight: Arc::new(AtomicU32::new(0)),
             });
         }
 
@@ -2489,6 +2837,7 @@ impl MultiTokenManager {
                     disabled_reason: Some(DisabledReason::Manual),
                     success_count: 0,
                     last_used_at: None,
+                    inflight: Arc::new(AtomicU32::new(0)),
                 });
             }
             return Err(e.context("回收站落盘失败，已回滚删除操作"));
@@ -2607,6 +2956,7 @@ impl MultiTokenManager {
                 disabled_reason: Some(DisabledReason::Manual),
                 success_count: restored_entry.success_count,
                 last_used_at: restored_entry.last_used_at,
+                inflight: Arc::new(AtomicU32::new(0)),
             });
         }
 
@@ -2672,6 +3022,15 @@ impl MultiTokenManager {
     /// 「不再出现的 session」，长跑会内存泄漏。未启用亲和性时 map 恒空，调用无害。
     pub fn cleanup_affinity(&self) {
         self.affinity.cleanup();
+    }
+
+    /// 清理 RPM 滚动窗口中不再活跃的凭据 id 条目（由后台定时任务周期调用）。
+    ///
+    /// RPM map 的 key 是凭据 id，惰性剔除只发生在被再次选中时；长期不再被选中的
+    /// 号（如已删除）其空 Vec 条目需主动回收，避免无界堆积。未配置 RPM 上限时
+    /// map 仍会因每次选号 record 而增长，故无条件清理。
+    pub fn cleanup_scheduling(&self) {
+        self.rpm.cleanup();
     }
 
     /// 强制刷新指定凭据的 Token（Admin API）
@@ -2949,6 +3308,30 @@ mod tests {
             result,
             "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
         );
+    }
+
+    /// SSRF 回归：External IdP token_endpoint 只放行 Microsoft 登录域，其余一律拒绝。
+    #[test]
+    fn test_validate_microsoft_token_endpoint() {
+        // 合法：官方域及其租户子路径
+        for ok in [
+            "https://login.microsoftonline.com/9d76.../oauth2/v2.0/token",
+            "https://login.microsoftonline.us/tid/oauth2/v2.0/token",
+            "https://login.partner.microsoftonline.cn/tid/oauth2/v2.0/token",
+        ] {
+            assert!(validate_microsoft_token_endpoint(ok).is_ok(), "应放行: {ok}");
+        }
+        // 非法：攻击者域 / 内网 / http / userinfo 混淆 / 相似域后缀伪装
+        for bad in [
+            "https://evil.com/token",
+            "https://192.168.11.4/token",
+            "http://login.microsoftonline.com/token", // 非 https
+            "https://login.microsoftonline.com@evil.com/token", // userinfo 混淆
+            "https://login.microsoftonline.com.evil.com/token", // 后缀伪装
+            "https://notmicrosoftonline.com/token",
+        ] {
+            assert!(validate_microsoft_token_endpoint(bad).is_err(), "应拒绝: {bad}");
+        }
     }
 
     #[test]
@@ -3365,6 +3748,112 @@ mod tests {
         assert_eq!(ctx.token, "good-token");
     }
 
+    /// 构造 N 个都带有效 token（无需刷新）的 balanced 管理器
+    fn make_balanced_manager(n: usize) -> MultiTokenManager {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        // 关闭亲和性：本组测试要验证纯负载分摊，不要 session 粘性干扰
+        config.affinity_enabled = false;
+        let creds: Vec<KiroCredentials> = (0..n)
+            .map(|i| {
+                let mut c = KiroCredentials::default();
+                c.priority = i as u32;
+                c.access_token = Some(format!("tok-{}", i));
+                c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+                c
+            })
+            .collect();
+        MultiTokenManager::new(config, creds, None, None, false).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_inflight_spreads_concurrent_load_no_thundering_herd() {
+        // 惊群回归：持有多个未完成请求的上下文（guard 未 Drop）时，
+        // balanced 选号必须把后续请求分摊到不同的号，而不是全部扑向同一个。
+        let manager = make_balanced_manager(3);
+
+        // 连续获取 3 个上下文且都不释放（模拟 3 个并发在途请求）
+        let c1 = manager.acquire_context(None, None).await.unwrap();
+        let c2 = manager.acquire_context(None, None).await.unwrap();
+        let c3 = manager.acquire_context(None, None).await.unwrap();
+
+        // 三个在途请求应分别落在 3 个不同的凭据上（inflight 升序天然分摊）
+        let mut ids = [c1.id, c2.id, c3.id];
+        ids.sort_unstable();
+        assert_eq!(ids, [1, 2, 3], "3 个并发在途请求应分摊到 3 个不同的号，实际 {:?}", ids);
+    }
+
+    #[tokio::test]
+    async fn test_inflight_guard_release_frees_credential_for_reuse() {
+        // 单个号：拿到上下文后 inflight=1，释放后归零，可被再次选中且负载记账正确
+        let manager = make_balanced_manager(1);
+
+        {
+            let _ctx = manager.acquire_context(None, None).await.unwrap();
+            let snap = manager.snapshot();
+            let e = snap.entries.iter().find(|e| e.id == 1).unwrap();
+            assert_eq!(e.inflight, 1, "持有上下文时 inflight 应为 1");
+        }
+        // 上下文出作用域 → guard Drop → inflight -1
+        let snap = manager.snapshot();
+        let e = snap.entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(e.inflight, 0, "释放后 inflight 应归零");
+    }
+
+    #[tokio::test]
+    async fn test_inflight_prefers_least_loaded_after_releases() {
+        // 先让 #1 背上 2 个未完成请求，再取一次：应避开 #1，选到空闲的号
+        let manager = make_balanced_manager(2);
+
+        // 手动制造 #1 高在途：直接对其计数器加压（等价于两个未完成请求都落在 #1）
+        // 通过连续 acquire 并保留：第一次可能落 #1 或 #2，用显式方式验证升序即可
+        let held_a = manager.acquire_context(None, None).await.unwrap();
+        let first_id = held_a.id;
+        let held_b = manager.acquire_context(None, None).await.unwrap();
+        let second_id = held_b.id;
+        // 两个在途分属不同号
+        assert_ne!(first_id, second_id);
+
+        // 释放第二个号的请求 → 它变回空闲；下一次选号应命中刚释放的那个
+        drop(held_b);
+        let next = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(
+            next.id, second_id,
+            "释放后应优先选回在途最少（=0）的号 #{}，实际 #{}",
+            second_id, next.id
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rpm_saturation_deprioritizes_credential() {
+        // 配置 RPM 软上限=2：把 #1 打到饱和后，选号应降权 #1、优先未饱和的 #2
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.affinity_enabled = false;
+        config.credential_rpm_limit = 2;
+
+        let mut c1 = KiroCredentials::default();
+        c1.priority = 0; // 优先级更高，若无 RPM 降权会被优先选中
+        c1.access_token = Some("tok1".to_string());
+        c1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut c2 = KiroCredentials::default();
+        c2.priority = 1;
+        c2.access_token = Some("tok2".to_string());
+        c2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(config, vec![c1, c2], None, None, false).unwrap();
+
+        // 把 #1 的 RPM 打到软上限（record 2 次），并立即释放在途避免 inflight 干扰
+        manager.rpm.record(1);
+        manager.rpm.record(1);
+        assert!(manager.is_rpm_saturated(1), "#1 应已 RPM 饱和");
+        assert!(!manager.is_rpm_saturated(2), "#2 未饱和");
+
+        // 选号：#1 虽优先级更高，但 RPM 饱和被降权 → 应选未饱和的 #2
+        let ctx = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(ctx.id, 2, "RPM 饱和的 #1 应被降权，改选未饱和的 #2");
+    }
+
     #[tokio::test]
     async fn test_affinity_sticks_session_to_same_credential_in_balanced() {
         // balanced 模式下，同一 session 的连续请求应粘在同一凭据上
@@ -3389,6 +3878,7 @@ mod tests {
             .await
             .unwrap();
         let bound = first.id;
+        drop(first);
         // 同会话后续多次请求应始终命中同一凭据，即便 balanced 的 least-used 会倾向另一个
         for _ in 0..5 {
             let ctx = manager

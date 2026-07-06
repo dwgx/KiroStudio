@@ -11,7 +11,12 @@ use crate::http_client::ProxyConfig;
 use crate::model::config::Config;
 
 /// Kiro OAuth 凭证
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+///
+/// ⚠️ 安全：**刻意不派生 `Debug`**，改为手写脱敏实现（见下方 `impl Debug`）。
+/// `access_token`/`refresh_token`/`client_secret`/`kiro_api_key`/`proxy_password`
+/// 属可直接复用的活凭证，一旦被 `{:?}` 打进日志即等于泄露。派生 Debug 会输出全部
+/// 明文——这里统一在类型层面脱敏，杜绝任何调用点（日志/错误链）意外泄密。
+#[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct KiroCredentials {
     /// 凭据唯一标识符（自增 ID）
@@ -20,31 +25,49 @@ pub struct KiroCredentials {
 
     /// 访问令牌
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "access_token")]
     pub access_token: Option<String>,
 
     /// 刷新令牌
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "refresh_token")]
     pub refresh_token: Option<String>,
 
     /// Profile ARN
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "profile_arn")]
     pub profile_arn: Option<String>,
 
     /// 过期时间 (RFC3339 格式)
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "expires_at", alias = "expired")]
     pub expires_at: Option<String>,
 
     /// 认证方式 (social / idc)
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "auth_method")]
     pub auth_method: Option<String>,
 
     /// OIDC Client ID (IdC 认证需要)
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "client_id")]
     pub client_id: Option<String>,
 
     /// OIDC Client Secret (IdC 认证需要)
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "client_secret")]
     pub client_secret: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "token_endpoint")]
+    pub token_endpoint: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "issuer_url")]
+    pub issuer_url: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<String>,
 
     /// 凭据优先级（数字越小优先级越高，默认为 0）
     #[serde(default)]
@@ -67,6 +90,7 @@ pub struct KiroCredentials {
     /// 凭据级 Machine ID 配置（可选）
     /// 未配置时回退到 config.json 的 machineId；都未配置时由 refreshToken 派生
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "machine_id")]
     pub machine_id: Option<String>,
 
     /// 用户邮箱（从 Anthropic API 获取）
@@ -111,6 +135,48 @@ pub struct KiroCredentials {
     pub endpoint: Option<String>,
 }
 
+/// 脱敏展示敏感字段：有值 → `"<set:N>"`（标注长度便于排障但不泄露内容），无值 → `None`。
+fn mask_secret(v: &Option<String>) -> String {
+    match v {
+        Some(s) => format!("<set:{}>", s.len()),
+        None => "None".to_string(),
+    }
+}
+
+/// 手写脱敏 Debug：可识别字段（id/auth/email/endpoint 等）正常显示，
+/// 敏感凭证字段一律打码为 `<set:N>`，绝不输出明文。
+impl std::fmt::Debug for KiroCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KiroCredentials")
+            .field("id", &self.id)
+            .field("auth_method", &self.auth_method)
+            .field("email", &self.email)
+            .field("endpoint", &self.endpoint)
+            .field("priority", &self.priority)
+            .field("disabled", &self.disabled)
+            .field("region", &self.region)
+            .field("auth_region", &self.auth_region)
+            .field("api_region", &self.api_region)
+            .field("expires_at", &self.expires_at)
+            .field("subscription_title", &self.subscription_title)
+            .field("has_profile_arn", &self.profile_arn.is_some())
+            .field("machine_id", &self.machine_id)
+            .field("proxy_url", &self.proxy_url)
+            // —— 敏感字段一律脱敏 ——
+            .field("access_token", &mask_secret(&self.access_token))
+            .field("refresh_token", &mask_secret(&self.refresh_token))
+            .field("client_id", &mask_secret(&self.client_id))
+            .field("client_secret", &mask_secret(&self.client_secret))
+            .field("token_endpoint", &self.token_endpoint)
+            .field("issuer_url", &self.issuer_url)
+            .field("scopes", &self.scopes)
+            .field("kiro_api_key", &mask_secret(&self.kiro_api_key))
+            .field("proxy_username", &mask_secret(&self.proxy_username))
+            .field("proxy_password", &mask_secret(&self.proxy_password))
+            .finish()
+    }
+}
+
 /// 判断是否为零（用于跳过序列化）
 fn is_zero(value: &u32) -> bool {
     *value == 0
@@ -140,6 +206,13 @@ fn canonicalize_auth_method_value(value: &str) -> &str {
         "idc"
     } else if value.eq_ignore_ascii_case("api_key") || value.eq_ignore_ascii_case("apikey") {
         "api_key"
+    } else if value.eq_ignore_ascii_case("external-idp")
+        || value.eq_ignore_ascii_case("externalidp")
+        || value.eq_ignore_ascii_case("azure")
+        || value.eq_ignore_ascii_case("azuread")
+        || value.eq_ignore_ascii_case("azure_ad")
+    {
+        "external_idp"
     } else {
         value
     }
@@ -299,6 +372,28 @@ impl KiroCredentials {
     /// - idc / api_key → 留空（这两种凭据不参与 app.kiro.dev Web Portal 接口）
     ///
     /// 仅用于 overage 开关等 Web Portal 调用；返回空串表示该凭据不支持。
+    pub fn should_send_profile_arn(&self) -> bool {
+        if self.profile_arn.is_none() {
+            return false;
+        }
+
+        !self.is_external_idp_credential()
+    }
+
+    pub fn is_external_idp_credential(&self) -> bool {
+        self.auth_method
+            .as_deref()
+            .map(|m| {
+                m.eq_ignore_ascii_case("external_idp")
+                    || m.eq_ignore_ascii_case("external-idp")
+                    || m.eq_ignore_ascii_case("externalidp")
+                    || m.eq_ignore_ascii_case("azure")
+                    || m.eq_ignore_ascii_case("azuread")
+                    || m.eq_ignore_ascii_case("azure_ad")
+            })
+            .unwrap_or(false)
+    }
+
     pub fn effective_idp(&self) -> &str {
         match self
             .auth_method
@@ -327,6 +422,40 @@ impl KiroCredentials {
 mod tests {
     use super::*;
     use crate::model::config::Config;
+
+    /// 安全回归：Debug 输出绝不含敏感凭证明文（防 HIGH-1 日志泄露复发）。
+    #[test]
+    fn test_debug_masks_secrets() {
+        let mut c = KiroCredentials::default();
+        c.id = Some(7);
+        c.email = Some("u@example.com".to_string());
+        c.access_token = Some("AT_SECRET_PLAINTEXT_123".to_string());
+        c.refresh_token = Some("RT_SECRET_PLAINTEXT_456".to_string());
+        c.client_secret = Some("CS_SECRET_PLAINTEXT_789".to_string());
+        c.kiro_api_key = Some("ksk_SECRET_PLAINTEXT".to_string());
+        c.proxy_password = Some("PROXY_PASS_SECRET".to_string());
+
+        let dbg = format!("{:?}", c);
+
+        // 明文密钥绝不出现
+        for leaked in [
+            "AT_SECRET_PLAINTEXT_123",
+            "RT_SECRET_PLAINTEXT_456",
+            "CS_SECRET_PLAINTEXT_789",
+            "ksk_SECRET_PLAINTEXT",
+            "PROXY_PASS_SECRET",
+        ] {
+            assert!(
+                !dbg.contains(leaked),
+                "Debug 输出泄露了敏感明文 {leaked}: {dbg}"
+            );
+        }
+        // 非敏感可识别字段仍可见，便于排障
+        assert!(dbg.contains("u@example.com"), "email 应可见");
+        assert!(dbg.contains("id: Some(7)"), "id 应可见");
+        // 敏感字段以脱敏形式标注（<set:N>）
+        assert!(dbg.contains("<set:"), "敏感字段应以 <set:N> 脱敏标注");
+    }
 
     #[test]
     fn test_from_json() {
@@ -368,6 +497,9 @@ mod tests {
             auth_method: Some("social".to_string()),
             client_id: None,
             client_secret: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
             priority: 0,
             region: None,
             auth_region: None,
@@ -486,6 +618,9 @@ mod tests {
             auth_method: None,
             client_id: None,
             client_secret: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
             priority: 0,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
@@ -517,6 +652,9 @@ mod tests {
             auth_method: None,
             client_id: None,
             client_secret: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
             priority: 0,
             region: None,
             auth_region: None,
@@ -631,6 +769,9 @@ mod tests {
             auth_method: Some("social".to_string()),
             client_id: None,
             client_secret: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
             priority: 3,
             region: Some("us-west-2".to_string()),
             auth_region: None,
