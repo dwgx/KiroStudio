@@ -4,4 +4,7 @@
 
 mod router;
 
-pub use router::create_admin_ui_router;
+pub use router::{
+    bg_pool_stats, clear_bg_pool, create_admin_ui_router, set_login_background_enabled,
+    spawn_bg_prefetch,
+};
