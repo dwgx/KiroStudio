@@ -17,10 +17,10 @@ use crate::kiro::model::events::Event;
 /// 否则抛出 `The content[].thinking in the thinking mode must be passed back to the API`。
 ///
 /// 上游 Kiro 不是 Anthropic 服务端，不下发真实签名，因此这里发一个非空占位字符串以
-/// 满足客户端本地校验。该占位符只在客户端 ↔ kiro.rs 之间存在：回传时 converter 只读
+/// 满足客户端本地校验。该占位符只在客户端 ↔ KiroStudio 之间存在：回传时 converter 只读
 /// `block.thinking`，`ContentBlock` 无 signature 字段且未 deny_unknown_fields，serde
 /// 静默丢弃客户端回传的假签名，故永不转发给 Kiro。
-pub(super) const THINKING_SIGNATURE_PLACEHOLDER: &str = "kiro-rs-thinking-signature";
+pub(super) const THINKING_SIGNATURE_PLACEHOLDER: &str = "kirostudio-thinking-signature";
 
 /// Prompt 缓存记账明细（由 [`crate::anthropic::cache_tracker`] 推算，注入响应 usage）
 #[derive(Debug, Clone, Copy)]

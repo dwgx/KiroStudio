@@ -13,6 +13,7 @@ use axum::{
 
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
+use crate::model::config::CompressionConfig;
 
 use super::cache_tracker::CacheTracker;
 use super::types::ErrorResponse;
@@ -31,6 +32,8 @@ pub struct AppState {
     pub prompt_cache_enabled: bool,
     /// prompt 缓存影子跟踪器（按凭据分桶）
     pub cache_tracker: Arc<CacheTracker>,
+    /// 输入压缩配置（转换后发上游前，超阈值时压缩请求体）
+    pub compression: Arc<CompressionConfig>,
 }
 
 impl AppState {
@@ -54,7 +57,14 @@ impl AppState {
             cache_tracker: Arc::new(CacheTracker::new(Duration::from_secs(
                 prompt_cache_ttl_seconds,
             ))),
+            compression: Arc::new(CompressionConfig::default()),
         }
+    }
+
+    /// 设置输入压缩配置
+    pub fn with_compression(mut self, compression: CompressionConfig) -> Self {
+        self.compression = Arc::new(compression);
+        self
     }
 
     /// 设置 KiroProvider

@@ -138,6 +138,15 @@ pub struct Config {
     #[serde(default = "default_affinity_enabled")]
     pub affinity_enabled: bool,
 
+    /// 每凭据 RPM（每分钟请求数）软上限（默认 0 = 不限制）
+    ///
+    /// 调度用：balanced 选号时，滚动 60 秒窗口内请求数达到该上限的凭据会被
+    /// **降权**（排到未饱和的凭据之后），而非硬性跳过——避免全部凭据都饱和时
+    /// 把可用池清空导致请求直接失败。仅在 balanced 模式选号排序时参考。
+    /// 与 `rate_limit_*`（拟人节流，硬跳过）互补：本项只影响多号间的负载分摊。
+    #[serde(default)]
+    pub credential_rpm_limit: u32,
+
     /// 是否启用 prompt 缓存记账（默认 true）
     ///
     /// Kiro 上游不回传 Anthropic 的 cache_read / cache_creation 记账字段。
@@ -239,9 +248,92 @@ pub struct Config {
     #[serde(default = "default_trash_retention_days")]
     pub trash_retention_days: u32,
 
+    // ============ 输入压缩管道（吸收自 Foxfishc__kiro.rs，MIT，致谢）============
+    /// 转换后发上游前的输入压缩配置。
+    ///
+    /// 背景：Kiro 上游对请求体大小有硬限制（实测约 5MiB 会触发 400）。开启后，
+    /// 网关在序列化 Kiro 请求体后测量大小，仅当超过 `trigger_bytes` 才跑压缩管道
+    /// （空白折叠 + 大 tool_result 智能截断），压缩后再发上游，压缩后仍超限才透传 400。
+    /// 保守设计：默认阈值高（只在快超限时才压），且可整体关闭。
+    #[serde(default)]
+    pub compression: CompressionConfig,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
+}
+
+/// 输入压缩配置
+///
+/// 控制请求体在协议转换完成后、发送到上游前的多层压缩策略。
+/// 所有阈值均可通过配置文件调整。
+///
+/// 当前实现两层（收益最大、风险最小）：
+/// 1. 空白压缩：折叠连续空行、移除行尾空格（近乎无损）。
+/// 3. tool_result 智能截断：超长工具结果保留头 N 行 + 尾 M 行，中间以占位符省略。
+///
+/// TODO(后续批次)：thinking 块丢弃/截断、tool_use input 截断、历史轮次截断，
+/// 以及截断后 tool_use/tool_result 跨消息配对修复（参考 Fox compressor.rs 的
+/// compress_thinking_pass / compress_tool_use_inputs_pass / compress_history_pass /
+/// repair_tool_pairing_pass）。这些层风险更高（可能破坏配对/丢历史），暂缓。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompressionConfig {
+    /// 总开关，默认 true（但受 `trigger_bytes` 高阈值保护，平时不触发）
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// 触发阈值（字节）：序列化后的 Kiro 请求体超过此大小才启动压缩，默认 4MiB。
+    ///
+    /// 保守：上游硬限制约 5MiB，这里留足安全余量，只在请求快超限时才压，
+    /// 避免对正常小请求做任何有损处理，把对模型输出质量的影响降到最低。
+    #[serde(default = "default_compression_trigger_bytes")]
+    pub trigger_bytes: usize,
+
+    /// 空白压缩开关（连续空行折叠、行尾空格移除），默认 true
+    #[serde(default = "default_true")]
+    pub whitespace_compression: bool,
+
+    /// tool_result 截断阈值（字符数），默认 8000；`0` = 关闭该层
+    #[serde(default = "default_tool_result_max_chars")]
+    pub tool_result_max_chars: usize,
+
+    /// tool_result 智能截断保留头部行数，默认 80
+    #[serde(default = "default_tool_result_head_lines")]
+    pub tool_result_head_lines: usize,
+
+    /// tool_result 智能截断保留尾部行数，默认 40
+    #[serde(default = "default_tool_result_tail_lines")]
+    pub tool_result_tail_lines: usize,
+}
+
+fn default_compression_trigger_bytes() -> usize {
+    4 * 1024 * 1024
+}
+
+fn default_tool_result_max_chars() -> usize {
+    8000
+}
+
+fn default_tool_result_head_lines() -> usize {
+    80
+}
+
+fn default_tool_result_tail_lines() -> usize {
+    40
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            trigger_bytes: default_compression_trigger_bytes(),
+            whitespace_compression: default_true(),
+            tool_result_max_chars: default_tool_result_max_chars(),
+            tool_result_head_lines: default_tool_result_head_lines(),
+            tool_result_tail_lines: default_tool_result_tail_lines(),
+        }
+    }
 }
 
 fn default_host() -> String {
@@ -379,6 +471,7 @@ impl Default for Config {
             rate_limit_daily_max: default_rate_limit_daily(),
             rate_limit_min_interval_ms: default_rate_limit_min_interval_ms(),
             affinity_enabled: default_affinity_enabled(),
+            credential_rpm_limit: 0,
             prompt_cache_enabled: default_prompt_cache_enabled(),
             prompt_cache_ttl_seconds: default_prompt_cache_ttl_seconds(),
             callback_base_url: None,
@@ -396,6 +489,7 @@ impl Default for Config {
             login_background_enabled: default_true(),
             trash_retention_days: default_trash_retention_days(),
             balance_refresh_interval_secs: default_balance_refresh_interval_secs(),
+            compression: CompressionConfig::default(),
             config_path: None,
         }
     }
@@ -449,6 +543,15 @@ impl Config {
 
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
         fs::write(path, content).with_context(|| format!("写入配置文件失败: {}", path.display()))?;
+        // 安全：config.json 明文含 adminApiKey / proxyPassword，收紧为仅属主可读写（Unix 0600），
+        // 避免默认 umask 造成的 world-readable 泄露。失败仅告警不致命。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+                tracing::warn!("收紧配置文件权限失败 {}: {}", path.display(), e);
+            }
+        }
         Ok(())
     }
 }

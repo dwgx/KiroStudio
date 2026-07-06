@@ -28,7 +28,11 @@ const KIRO_API_BASE: &str = "https://app.kiro.dev/service/KiroWebPortalService/o
 const KIRO_HOME_URL: &str = "https://app.kiro.dev/";
 const SMITHY_PROTOCOL: &str = "rpc-v2-cbor";
 const AMZ_SDK_REQUEST: &str = "attempt=1; max=1";
-const X_AMZ_USER_AGENT: &str = "aws-sdk-js/1.0.0 kiro-rs/1.0.0";
+// 对齐项目其它上游端点的 KiroIDE 指纹（ide.rs / token_manager.rs / idc.rs），
+// 去掉移植遗留的 "kiro-rs" 中转身份字样以改善防关联；该头仅作 AWS SDK 遥测用途，
+// 不参与 app.kiro.dev 的鉴权（身份走 Authorization Bearer + Cookie，写操作走 X-CSRF-Token），
+// 故值可安全替换（本模块作用域拿不到 kiro_version/machine_id，采用裸后缀，同 idc.rs）。
+const X_AMZ_USER_AGENT: &str = "aws-sdk-js/1.0.0 KiroIDE";
 
 /// 调用写操作（如 UpdateBillingPreferences）必需的 CSRF 会话上下文
 ///

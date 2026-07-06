@@ -45,6 +45,16 @@ pub struct IdcRefreshResponse {
     pub profile_arn: Option<String>,
 }
 
+/// External IdP token refresh response (Microsoft Entra ID / OAuth2 form flow).
+#[derive(Debug, Deserialize)]
+pub struct ExternalIdpRefreshResponse {
+    pub access_token: String,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    #[serde(default)]
+    pub expires_in: Option<i64>,
+}
+
 // ============ Social (Portal) 网页登录流程 ============
 
 /// Social token 交换请求体（PKCE）
