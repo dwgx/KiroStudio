@@ -11,5 +11,6 @@ pub mod parser;
 pub mod provider;
 pub mod rate_limiter;
 pub mod refresh_loop;
+pub mod scheduling;
 pub mod token_manager;
 pub mod web_portal;
