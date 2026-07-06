@@ -47,7 +47,6 @@ fn compute_max_retries(total: usize, available: usize) -> usize {
 ///
 /// provider 层掌握凭据/重试/延迟，但看不到最终 usage/credits（流式消费后才知道）；
 /// 上层拿到本结构后与 `StreamContext::resolved_usage()` 合并即可产出完整记录。
-#[derive(Debug, Clone)]
 pub struct CallMeta {
     /// 实际服务该请求的凭据 ID
     pub credential_id: u64,
@@ -61,6 +60,16 @@ pub struct CallMeta {
     pub retries: u32,
     /// 从进入调用到拿到成功响应头的耗时（毫秒）
     pub latency_ms: u64,
+    /// 在途请求守卫：随本 meta（进而随响应流）存活，直到 SSE 流被下游完全消费、
+    /// 或客户端断开、或非流式响应读毕后才 Drop → 该凭据 inflight -1。
+    /// 因此 inflight 反映"真正还在处理中"的请求数，而非"已拿到响应头"的数。
+    ///
+    /// 不参与 `Debug`（`InflightGuard` 无 Debug）；`CallMeta` 因此不再派生 `Debug`/`Clone`。
+    ///
+    /// 仅为 RAII 而持有、从不读取：其唯一作用是在 `CallMeta`（进而响应流）析构时
+    /// 触发 `Drop` 把 inflight -1，故 `#[allow(dead_code)]` 而非移除。
+    #[allow(dead_code)]
+    pub inflight: crate::kiro::scheduling::InflightGuard,
 }
 
 /// Kiro API Provider
@@ -334,10 +343,9 @@ impl KiroProvider {
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
 
-        // 尝试从请求体中提取模型信息
-        let model = Self::extract_model_from_request(request_body);
-        // 提取会话标识（conversationId）用于会话亲和性
-        let session_id = Self::extract_session_id_from_request(request_body);
+        // 一次解析同时取出模型信息与会话标识（conversationId），避免热路径上对
+        // 整个请求体做两次全量 serde_json::from_str（大请求体尤其昂贵）。
+        let (model, session_id) = Self::extract_model_and_session(request_body);
 
         // 用量埋点：记录进入调用的时刻与最后服务的凭据/失败分类
         let call_started = std::time::Instant::now();
@@ -421,6 +429,8 @@ impl KiroProvider {
                     is_streaming: is_stream,
                     retries: attempt as u32,
                     latency_ms: call_started.elapsed().as_millis() as u64,
+                    // 移交在途守卫：从此随响应流存活，流真正消费完才 -1
+                    inflight: ctx.inflight,
                 };
                 return Ok((response, meta));
             }
@@ -432,6 +442,57 @@ impl KiroProvider {
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.trim().parse::<u64>().ok());
             let body = response.text().await.unwrap_or_default();
+
+            // 客户端请求校验错误（如 TOOL_USE_RESULT_MISMATCH）：请求构造问题，
+            // 换号/重试都只会重复失败并浪费配额，立即终止（不计凭据失败）。
+            if endpoint.is_client_validation_error(&body) {
+                tracing::warn!(
+                    "API 请求失败（客户端请求校验错误，不重试）: {} {}",
+                    status,
+                    body
+                );
+                last_outcome = crate::usage::RequestOutcome::BadRequest;
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败（请求校验错误）: {} {}",
+                    api_type,
+                    status,
+                    body
+                ));
+                break;
+            }
+
+            // 账户级临时风控限速（suspicious activity + temporary limits）：
+            // ⚠️ 必须在 is_account_suspended 之前判定，否则含 "suspended...suspicious
+            // activity" 的临时限速文案会被误判成永久封禁，白冻一个还能用的号 24h。
+            // 处置：只设短冷却 + 立即 failover，不禁用、不计永久失败。
+            if endpoint.is_temporary_rate_limit(&body) {
+                tracing::warn!(
+                    "API 请求失败（账户临时风控限速，非永久封禁；短冷却后 failover，尝试 {}/{}）: {} {}",
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    body
+                );
+                last_outcome = crate::usage::RequestOutcome::RateLimited;
+                // 优先用上游给出的精确重置时间，否则回退到 RateLimitExceeded 的分级短冷却
+                let retry_after =
+                    retry_after_header.or_else(|| endpoint.extract_retry_after_secs(&body));
+                self.token_manager
+                    .report_rate_limited_with_retry_after(ctx.id, retry_after);
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败（临时风控限速）: {} {}",
+                    api_type,
+                    status,
+                    body
+                ));
+                if attempt + 1 < max_retries {
+                    sleep(Self::retry_delay(attempt)).await;
+                }
+                continue;
+            }
+
+            // 注：524 网关超时（Cloudflare 等）落入下方通用 5xx 分支即按可重试瞬态
+            // 错误处理（不禁用、退避后换号），无需单列——与通用路径行为一致。
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
@@ -638,35 +699,42 @@ impl KiroProvider {
         Err(final_error)
     }
 
-    /// 从请求体中提取模型信息
+    /// 从请求体中一次性提取模型信息与会话标识（conversationId）。
     ///
-    /// 尝试解析 JSON 请求体，提取 conversationState.currentMessage.userInputMessage.modelId
-    fn extract_model_from_request(request_body: &str) -> Option<String> {
+    /// 热路径优化（P0-A）：原先 `extract_model_from_request` 与
+    /// `extract_session_id_from_request` 各自对整个请求体做一次全量
+    /// `serde_json::from_str`，一次调用要解析两遍。合并成解析一次 `Value`、
+    /// 再取两个字段，行为完全等价但只付出一次解析开销。
+    ///
+    /// - model：`conversationState.currentMessage.userInputMessage.modelId`
+    /// - session：`conversationState.conversationId`（由 converter 从原始
+    ///   metadata.user_id 的 session UUID 派生；无真实 session 时为随机 UUID，
+    ///   每次不同，自然不命中亲和性，等价于常规轮换）。
+    ///
+    /// 请求体解析失败（非法 JSON）时两者都返回 None，与旧实现一致。
+    fn extract_model_and_session(request_body: &str) -> (Option<String>, Option<String>) {
         use serde_json::Value;
 
-        let json: Value = serde_json::from_str(request_body).ok()?;
+        let json: Value = match serde_json::from_str(request_body) {
+            Ok(v) => v,
+            Err(_) => return (None, None),
+        };
 
-        json.get("conversationState")?
-            .get("currentMessage")?
-            .get("userInputMessage")?
-            .get("modelId")?
-            .as_str()
-            .map(|s| s.to_string())
-    }
+        let conversation_state = json.get("conversationState");
 
-    /// 从请求体中提取会话标识（conversationId），用于会话亲和性
-    ///
-    /// conversationId 由 converter 从原始 metadata.user_id 的 session UUID 派生；
-    /// 无真实 session 时为随机 UUID（每次不同，自然不命中亲和性，等价于常规轮换）。
-    fn extract_session_id_from_request(request_body: &str) -> Option<String> {
-        use serde_json::Value;
+        let model = conversation_state
+            .and_then(|cs| cs.get("currentMessage"))
+            .and_then(|m| m.get("userInputMessage"))
+            .and_then(|u| u.get("modelId"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
-        let json: Value = serde_json::from_str(request_body).ok()?;
+        let session_id = conversation_state
+            .and_then(|cs| cs.get("conversationId"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
-        json.get("conversationState")?
-            .get("conversationId")?
-            .as_str()
-            .map(|s| s.to_string())
+        (model, session_id)
     }
 
     fn retry_delay(attempt: usize) -> Duration {
@@ -722,6 +790,50 @@ mod tests {
         let available = ABSOLUTE_MAX_TOTAL_RETRIES + 20;
         let r = compute_max_retries(available, available);
         assert!(r >= available, "可用数超上限时预算仍应 >= available");
+    }
+
+    #[test]
+    fn test_extract_model_and_session_both_present() {
+        // 一次解析应同时取出 modelId 与 conversationId（与旧双解析等价）
+        let body = r#"{
+            "conversationState": {
+                "conversationId": "sess-123",
+                "currentMessage": {
+                    "userInputMessage": { "modelId": "claude-sonnet-4" }
+                }
+            }
+        }"#;
+        let (model, session) = KiroProvider::extract_model_and_session(body);
+        assert_eq!(model.as_deref(), Some("claude-sonnet-4"));
+        assert_eq!(session.as_deref(), Some("sess-123"));
+    }
+
+    #[test]
+    fn test_extract_model_and_session_partial() {
+        // 只有 conversationId、无 modelId：model=None、session=Some
+        let only_session = r#"{"conversationState":{"conversationId":"s1"}}"#;
+        let (model, session) = KiroProvider::extract_model_and_session(only_session);
+        assert_eq!(model, None);
+        assert_eq!(session.as_deref(), Some("s1"));
+
+        // 只有 modelId、无 conversationId：model=Some、session=None
+        let only_model = r#"{"conversationState":{"currentMessage":{"userInputMessage":{"modelId":"m"}}}}"#;
+        let (model, session) = KiroProvider::extract_model_and_session(only_model);
+        assert_eq!(model.as_deref(), Some("m"));
+        assert_eq!(session, None);
+    }
+
+    #[test]
+    fn test_extract_model_and_session_invalid_json() {
+        // 非法 JSON：两者都为 None（与旧实现一致，不 panic）
+        let (model, session) = KiroProvider::extract_model_and_session("not json");
+        assert_eq!(model, None);
+        assert_eq!(session, None);
+
+        // 合法 JSON 但缺 conversationState：两者都为 None
+        let (model, session) = KiroProvider::extract_model_and_session(r#"{"foo":"bar"}"#);
+        assert_eq!(model, None);
+        assert_eq!(session, None);
     }
 }
 

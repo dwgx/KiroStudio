@@ -82,15 +82,32 @@ async fn main() {
 
     tracing::info!("已加载 {} 个凭据配置", credentials_list.len());
 
-    // 获取第一个凭据用于日志显示
+    // 获取第一个凭据用于日志显示。
+    // 安全：只打印非敏感可识别字段；KiroCredentials 的 Debug 已在类型层脱敏，
+    // 此处再显式收窄，双保险杜绝 refreshToken/clientSecret/kiroApiKey 明文入日志。
     let first_credentials = credentials_list.first().cloned().unwrap_or_default();
-    tracing::debug!("主凭证: {:?}", first_credentials);
+    tracing::debug!(
+        "主凭证概览: id={:?}, auth_method={:?}, email={:?}, endpoint={:?}",
+        first_credentials.id,
+        first_credentials.auth_method,
+        first_credentials.email,
+        first_credentials.endpoint
+    );
 
     // 获取 API Key
+    // 安全：不仅要求 apiKey 存在，还要求非空白字符串。
+    // 否则 apiKey="" 会导致 auth_middleware 里 constant_time_eq(key, "") 对
+    // 任意空 key（如 `x-api-key:` 或 `Authorization: Bearer `）返回 true，
+    // 造成整个 /v1 网关 fail-open、匿名可直接消耗上游凭据。
+    // 与下方 admin_api_key 的空值防护保持对称。
     let api_key = config.api_key.clone().unwrap_or_else(|| {
         tracing::error!("配置文件中未设置 apiKey");
         std::process::exit(1);
     });
+    if api_key.trim().is_empty() {
+        tracing::error!("配置文件中 apiKey 为空，拒绝以无鉴权方式启动");
+        std::process::exit(1);
+    }
 
     // 构建代理配置
     let proxy_config = config.proxy_url.as_ref().map(|url| {
@@ -174,6 +191,8 @@ async fn main() {
             loop {
                 ticker.tick().await;
                 affinity_mgr.cleanup_affinity();
+                // 顺带回收 RPM 滚动窗口里不再活跃的凭据条目（共用同一 5 分钟 tick）
+                affinity_mgr.cleanup_scheduling();
             }
         });
     }
@@ -192,6 +211,10 @@ async fn main() {
             }
         });
     }
+
+    // 登录页背景图预取：启动即拉一批到内存池，之后后台定时补充。
+    // 请求命中内存字节秒回，不再在登录页热路径实时打图源。关闭时不 spawn。
+    admin_ui::spawn_bg_prefetch(config.login_background_enabled);
 
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),
@@ -227,6 +250,7 @@ async fn main() {
         config.prompt_cache_ttl_seconds,
         &config.cors_allowed_origins,
         config.max_body_bytes,
+        config.compression.clone(),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -298,7 +322,15 @@ async fn main() {
     // 启动服务器
     let addr = format!("{}:{}", config.host, config.port);
     tracing::info!("启动 Anthropic API 端点: {}", addr);
-    tracing::info!("API Key: {}***", &api_key[..(api_key.len() / 2)]);
+    // 只打印固定短前缀 + 长度指纹，不按比例暴露密钥（半个密钥会显著降低爆破熵）
+    {
+        let masked = if api_key.len() > 8 {
+            format!("{}…{}", &api_key[..4], &api_key[api_key.len() - 2..])
+        } else {
+            "***".to_string()
+        };
+        tracing::info!("API Key 已加载: {} (len={})", masked, api_key.len());
+    }
     tracing::info!("可用 API:");
     tracing::info!("  GET  /v1/models");
     tracing::info!("  POST /v1/messages");
@@ -431,6 +463,26 @@ fn init_usage_pipeline(config: &Config) -> Option<UsageHandles> {
                 Ok(_) => {}
                 Err(e) => tracing::warn!("用量明细保留清理失败: {:#}", e),
             }
+        }
+    });
+
+    // 客户端/窗口聚合定时回收：by_session/by_client/session_meta/client_sessions
+    // 的 key 是客户端可控的 session_id（UUID）/ client_ip，原先仅靠概览页查询时
+    // 惰性 prune。若长时间无人打开概览页，这些 map 会随不断变化的 session 无界增长
+    // （中高危内存泄漏）。每 5 分钟主动回收一次窗口外的条目。
+    // interval 用 Skip 防止唤醒后连刷；纯内存操作，零上游调用（不碰封号红线）。
+    let cleanup_stats = stats.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5 * 60));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            let (sessions, clients) = cleanup_stats.cleanup_client_stats();
+            tracing::debug!(
+                "用量客户端聚合回收完成：存活 session={} client={}",
+                sessions,
+                clients
+            );
         }
     });
 
