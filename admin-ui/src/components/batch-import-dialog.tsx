@@ -20,15 +20,35 @@ interface BatchImportDialogProps {
 
 interface CredentialInput {
   refreshToken?: string
+  refresh_token?: string
+  accessToken?: string
+  access_token?: string
   clientId?: string
+  client_id?: string
   clientSecret?: string
+  client_secret?: string
+  tokenEndpoint?: string
+  token_endpoint?: string
+  issuerUrl?: string
+  issuer_url?: string
+  scopes?: string
+  profileArn?: string
+  profile_arn?: string
+  expiresAt?: string
+  expires_at?: string
+  expired?: string
   region?: string
   authRegion?: string
+  auth_region?: string
   apiRegion?: string
+  api_region?: string
   priority?: number
   machineId?: string
+  machine_id?: string
   kiroApiKey?: string
+  kiro_api_key?: string
   authMethod?: string
+  auth_method?: string
   endpoint?: string
 }
 
@@ -41,6 +61,50 @@ interface VerificationResult {
   credentialId?: number
   rollbackStatus?: 'success' | 'failed' | 'skipped'
   rollbackError?: string
+}
+
+const pickString = (...values: unknown[]): string | undefined => {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim()) {
+      return value.trim()
+    }
+  }
+  return undefined
+}
+
+const normalizeAuthMethod = (value: string | undefined): 'social' | 'idc' | 'external_idp' | 'api_key' | undefined => {
+  if (!value) return undefined
+  const normalized = value.trim().toLowerCase().replace(/-/g, '_')
+  if (normalized === 'apikey') return 'api_key'
+  if (normalized === 'externalidp' || normalized === 'external_idp' || normalized === 'azuread' || normalized === 'azure_ad') {
+    return 'external_idp'
+  }
+  if (normalized === 'idc' || normalized === 'builder_id' || normalized === 'iam') return 'idc'
+  if (normalized === 'social') return 'social'
+  return undefined
+}
+
+const normalizeCredentialInput = (raw: CredentialInput): CredentialInput => {
+  const method = normalizeAuthMethod(pickString(raw.authMethod, raw.auth_method))
+  return {
+    refreshToken: pickString(raw.refreshToken, raw.refresh_token),
+    accessToken: pickString(raw.accessToken, raw.access_token),
+    clientId: pickString(raw.clientId, raw.client_id),
+    clientSecret: pickString(raw.clientSecret, raw.client_secret),
+    tokenEndpoint: pickString(raw.tokenEndpoint, raw.token_endpoint),
+    issuerUrl: pickString(raw.issuerUrl, raw.issuer_url),
+    scopes: pickString(raw.scopes),
+    profileArn: pickString(raw.profileArn, raw.profile_arn),
+    expiresAt: pickString(raw.expiresAt, raw.expires_at, raw.expired),
+    region: pickString(raw.region),
+    authRegion: pickString(raw.authRegion, raw.auth_region, raw.region),
+    apiRegion: pickString(raw.apiRegion, raw.api_region),
+    priority: typeof raw.priority === 'number' ? raw.priority : undefined,
+    machineId: pickString(raw.machineId, raw.machine_id),
+    kiroApiKey: pickString(raw.kiroApiKey, raw.kiro_api_key),
+    authMethod: method,
+    endpoint: pickString(raw.endpoint),
+  }
 }
 
 
@@ -89,7 +153,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     let credentials: CredentialInput[]
     try {
       const parsed = JSON.parse(jsonInput)
-      credentials = Array.isArray(parsed) ? parsed : [parsed]
+      credentials = (Array.isArray(parsed) ? parsed : [parsed]).map(normalizeCredentialInput)
     } catch (error) {
       toast.error('JSON 格式错误: ' + extractErrorMessage(error))
       return
@@ -266,20 +330,38 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           const token = cred.refreshToken!.trim()
           const clientId = cred.clientId?.trim() || undefined
           const clientSecret = cred.clientSecret?.trim() || undefined
-          const authMethod = clientId && clientSecret ? 'idc' : 'social'
+          const tokenEndpoint = cred.tokenEndpoint?.trim() || undefined
+          const explicitMethod = normalizeAuthMethod(cred.authMethod)
+          const authMethod = explicitMethod === 'external_idp' || tokenEndpoint
+            ? 'external_idp'
+            : clientId && clientSecret
+              ? 'idc'
+              : explicitMethod === 'idc'
+                ? 'idc'
+                : 'social'
 
           // idc 模式下必须同时提供 clientId 和 clientSecret
-          if (authMethod === 'social' && (clientId || clientSecret)) {
+          if (authMethod === 'idc' && (!clientId || !clientSecret)) {
             throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
+          }
+
+          if (authMethod === 'external_idp' && (!clientId || !tokenEndpoint)) {
+            throw new Error('external_idp 需要 clientId 和 tokenEndpoint')
           }
 
           const addedCred = await addCredential({
             refreshToken: token,
             authMethod,
+            accessToken: cred.accessToken?.trim() || undefined,
+            profileArn: cred.profileArn?.trim() || undefined,
+            expiresAt: cred.expiresAt?.trim() || undefined,
             authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
             apiRegion: cred.apiRegion?.trim() || undefined,
             clientId,
             clientSecret,
+            tokenEndpoint: authMethod === 'external_idp' ? tokenEndpoint : undefined,
+            issuerUrl: authMethod === 'external_idp' ? cred.issuerUrl?.trim() || undefined : undefined,
+            scopes: authMethod === 'external_idp' ? cred.scopes?.trim() || undefined : undefined,
             priority: cred.priority || 0,
             machineId: cred.machineId?.trim() || undefined,
             endpoint: cred.endpoint?.trim() || undefined,

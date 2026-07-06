@@ -61,7 +61,7 @@ export function AppShell({ onLogout }: AppShellProps) {
       <aside className="fixed top-0 left-0 bottom-0 w-[240px] border-r border-[#2e2e2e] flex flex-col z-40">
         {/* Logo */}
         <div className="px-5 pt-6 pb-4">
-          <h1 className="text-xl font-bold bg-gradient-to-r from-[#0070f3] to-[#7928ca] bg-clip-text text-transparent">
+          <h1 className="text-xl font-bold text-gradient-brand">
             KiroStudio
           </h1>
           <p className="text-xs text-[#666] mt-1">Admin Panel v0.1.0</p>
@@ -113,22 +113,14 @@ export function AppShell({ onLogout }: AppShellProps) {
 
         {/* Footer */}
         <div className="px-5 py-4 border-t border-[#2e2e2e]">
-          <div className="flex items-center justify-between gap-2">
-            <div className="flex min-w-0 items-center gap-2" translate="no">
-              <span className="relative flex h-2 w-2 shrink-0">
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#50e3c2] opacity-75" />
-                <span className="relative inline-flex rounded-full h-2 w-2 bg-[#50e3c2]" />
-              </span>
-              <span className="min-w-0 truncate whitespace-nowrap text-xs text-[#888]">网关在线</span>
-            </div>
-            <button
-              onClick={handleLogout}
-              className="shrink-0 p-1.5 rounded-md text-[#666] hover:text-[#ededed] hover:bg-[#1a1a1a] transition-all duration-200 ease-out-expo"
-              title="退出登录"
-            >
-              <LogOut className="h-4 w-4" />
-            </button>
-          </div>
+          <button
+            onClick={handleLogout}
+            className="flex w-full items-center justify-center gap-2 px-3 py-2 rounded-md text-sm text-[#888] hover:text-[#ededed] hover:bg-[#1a1a1a] transition-all duration-200 ease-out-expo"
+            title="退出登录"
+          >
+            <LogOut className="h-4 w-4" />
+            退出登录
+          </button>
         </div>
       </aside>
 
@@ -136,7 +128,7 @@ export function AppShell({ onLogout }: AppShellProps) {
       <main className="ml-[240px] min-h-screen">
         {/* Page Header */}
         <div className="border-b border-[#2e2e2e] px-8 py-5">
-          <h2 className="text-lg font-semibold text-[#ededed]">{TAB_TITLES[tab]}</h2>
+          <h2 className="text-lg font-semibold text-gradient-brand">{TAB_TITLES[tab]}</h2>
         </div>
 
         {/* Page Content */}
