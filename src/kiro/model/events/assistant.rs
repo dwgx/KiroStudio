@@ -22,7 +22,7 @@ use super::base::EventPayload;
 /// # 示例
 ///
 /// ```rust
-/// use kiro_rs::kiro::model::events::AssistantResponseEvent;
+/// use kirostudio::kiro::model::events::AssistantResponseEvent;
 ///
 /// let json = r#"{"content":"Hello, world!"}"#;
 /// let event: AssistantResponseEvent = serde_json::from_str(json).unwrap();
