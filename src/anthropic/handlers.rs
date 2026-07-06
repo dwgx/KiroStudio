@@ -28,6 +28,70 @@ use super::stream::{BufferedStreamContext, CacheUsageBreakdown, SseEvent, Stream
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
 use super::websearch;
 
+/// 从入站请求头提取客户端 IP（仅头部来源，不含连接层回退）。
+///
+/// 优先级：`x-forwarded-for` 首段（逗号分割，取最靠近客户端的第一跳）→
+/// `x-real-ip` → 都没有则 `None`。反代场景下这两个头即客户端真实 IP；直连
+/// 无反代时头缺失，由 [`ClientInfo::from_headers_with_peer`] 回退到 TCP 对端地址。
+fn extract_client_ip(headers: &axum::http::HeaderMap) -> Option<String> {
+    // x-forwarded-for: "client, proxy1, proxy2" —— 取第一段
+    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        if let Some(first) = xff.split(',').next() {
+            let ip = first.trim();
+            if !ip.is_empty() {
+                return Some(ip.to_string());
+            }
+        }
+    }
+    // x-real-ip: 单个 IP
+    if let Some(real) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+        let ip = real.trim();
+        if !ip.is_empty() {
+            return Some(ip.to_string());
+        }
+    }
+    None
+}
+
+/// 请求来源的客户端画像（设备类型 + IP + 细分 OS + 浏览器），
+/// 一并沿用量埋点路径传递，避免多参数散落。
+#[derive(Clone, Default)]
+struct ClientInfo {
+    device: Option<String>,
+    ip: Option<String>,
+    os: Option<String>,
+    browser: Option<String>,
+}
+
+impl ClientInfo {
+    /// 从入站请求头 + TCP 对端地址一次性解析设备/IP/OS/浏览器。
+    ///
+    /// IP 取值优先级：`x-forwarded-for` / `x-real-ip`（反代场景）→ TCP 连接对端
+    /// 地址（直连 8990 无反代头时的回退）。peer 取自 axum 的 `ConnectInfo<SocketAddr>`，
+    /// 仅取 IP 部分（丢弃端口），拿不到则为 None。
+    fn from_headers_with_peer(
+        headers: &axum::http::HeaderMap,
+        peer: Option<std::net::SocketAddr>,
+    ) -> Self {
+        let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
+        let ip = extract_client_ip(headers).or_else(|| peer.map(|a| a.ip().to_string()));
+        Self {
+            device: crate::usage::classify_device(ua),
+            ip,
+            os: crate::usage::parse_client_os(ua),
+            browser: crate::usage::parse_client_browser(ua),
+        }
+    }
+
+    /// 把画像字段写入一条用量记录
+    fn apply(&self, record: &mut crate::usage::RequestRecord) {
+        record.client_device = self.device.clone();
+        record.client_ip = self.ip.clone();
+        record.client_os = self.os.clone();
+        record.client_browser = self.browser.clone();
+    }
+}
+
 /// prompt 缓存记账所需的上下文（跟踪器 + 本次请求的缓存画像）
 ///
 /// 在调用上游前构建 profile，上游返回真实 `credential_id` 后再 compute + update。
@@ -60,6 +124,41 @@ impl CacheAccounting {
             cache_creation_1h_input_tokens: result.cache_creation_1h_input_tokens,
         }
     }
+}
+
+/// 构建发往上游的 Kiro 请求体（含输入压缩）。
+///
+/// 流程：先序列化测量大小；仅当启用压缩且体积超过 `trigger_bytes` 时，对
+/// `ConversationState` 跑压缩管道（空白折叠 + tool_result 智能截断）再重新序列化。
+///
+/// 保守设计：默认阈值高（4MiB），正常小请求零处理；压缩后仍可能超上游硬限制，
+/// 那种情况不再本地判死，交由上游返回 400，再由 [`map_provider_error`] 透传给客户端。
+fn build_kiro_request_body(
+    conversation_state: crate::kiro::model::requests::conversation::ConversationState,
+    compression: &crate::model::config::CompressionConfig,
+) -> Result<String, serde_json::Error> {
+    let mut kiro_request = KiroRequest {
+        conversation_state,
+        profile_arn: None,
+    };
+
+    let body = serde_json::to_string(&kiro_request)?;
+
+    if compression.enabled && body.len() > compression.trigger_bytes {
+        let before = body.len();
+        let stats = super::compressor::compress(&mut kiro_request.conversation_state, compression);
+        let compressed = serde_json::to_string(&kiro_request)?;
+        tracing::info!(
+            before_bytes = before,
+            after_bytes = compressed.len(),
+            saved_bytes = stats.total_saved(),
+            trigger_bytes = compression.trigger_bytes,
+            "请求体超过压缩阈值，已执行输入压缩"
+        );
+        return Ok(compressed);
+    }
+
+    Ok(body)
 }
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
@@ -248,6 +347,8 @@ pub async fn get_models() -> impl IntoResponse {
 /// 创建消息（对话）
 pub async fn post_messages(
     State(state): State<AppState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -257,6 +358,9 @@ pub async fn post_messages(
         message_count = %payload.messages.len(),
         "Received POST /v1/messages request"
     );
+
+    // 从入站请求头 + TCP 对端地址识别来源画像（设备/IP/OS/浏览器，用于「最近请求」展示）
+    let client = ClientInfo::from_headers_with_peer(&headers, Some(peer));
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
@@ -276,9 +380,9 @@ pub async fn post_messages(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
-    // 检查是否为 WebSearch 请求
-    if websearch::has_web_search_tool(&payload) {
-        tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
+    // 检查是否应本地处理 WebSearch 请求（tool_choice 强制 / 纯 web_search 单工具 / Claude Code 前缀）
+    if websearch::should_handle_websearch_request(&payload) {
+        tracing::info!("检测到 WebSearch 请求，路由到本地 WebSearch 处理");
 
         // 估算输入 tokens（只读计数，传引用避免深拷贝整个对话历史）
         let input_tokens = token::count_all_tokens(
@@ -289,6 +393,13 @@ pub async fn post_messages(
         ) as i32;
 
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+    }
+
+    // 混合工具场景：请求带 web_search 但未显式触发搜索，剔除 web_search 后走常规转发，
+    // 避免把 web_search 原样下发给 Kiro 触发 400 Improperly formed request。
+    if websearch::has_web_search_tool(&payload) {
+        tracing::info!("检测到混合工具列表中的 web_search，剔除后转发上游");
+        websearch::strip_web_search_tools(&mut payload);
     }
 
     // 转换请求
@@ -312,13 +423,11 @@ pub async fn post_messages(
         }
     };
 
-    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
-    let kiro_request = KiroRequest {
-        conversation_state: conversion_result.conversation_state,
-        profile_arn: None,
-    };
-
-    let request_body = match serde_json::to_string(&kiro_request) {
+    // 构建 Kiro 请求体（发上游前，超阈值时执行输入压缩；profile_arn 由 provider 层注入）
+    let request_body = match build_kiro_request_body(
+        conversion_result.conversation_state,
+        &state.compression,
+    ) {
         Ok(body) => body,
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
@@ -365,12 +474,13 @@ pub async fn post_messages(
             thinking_enabled,
             tool_name_map,
             cache_accounting,
+            client,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, cache_accounting).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, cache_accounting, client).await
     }
 }
 
@@ -383,6 +493,7 @@ async fn handle_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     cache_accounting: Option<CacheAccounting>,
+    client: ClientInfo,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let (response, meta) = match provider.call_api_stream(request_body).await {
@@ -401,7 +512,7 @@ async fn handle_stream_request(
     let initial_events = ctx.generate_initial_events();
 
     // 创建 SSE 流（流结束时用 meta + 最终 usage 埋点一条成功记录）
-    let stream = create_sse_stream(response, ctx, initial_events, meta);
+    let stream = create_sse_stream(response, ctx, initial_events, meta, client);
 
     // 返回 SSE 响应
     Response::builder()
@@ -414,7 +525,11 @@ async fn handle_stream_request(
 }
 
 /// 流结束时，用 provider 元数据 + StreamContext 最终 usage 埋点一条成功记录
-fn emit_stream_usage(ctx: &StreamContext, meta: &crate::kiro::provider::CallMeta) {
+fn emit_stream_usage(
+    ctx: &StreamContext,
+    meta: &crate::kiro::provider::CallMeta,
+    client: &ClientInfo,
+) {
     let usage = ctx.resolved_usage();
     let mut record = crate::usage::RequestRecord::new(
         Uuid::new_v4().to_string(),
@@ -429,6 +544,7 @@ fn emit_stream_usage(ctx: &StreamContext, meta: &crate::kiro::provider::CallMeta
     record.latency_ms = meta.latency_ms;
     record.retries = meta.retries;
     record.outcome = crate::usage::RequestOutcome::Success;
+    client.apply(&mut record);
     crate::usage::emit_record(record);
 }
 
@@ -446,6 +562,7 @@ fn create_sse_stream(
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
     meta: crate::kiro::provider::CallMeta,
+    client: ClientInfo,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -458,8 +575,8 @@ fn create_sse_stream(
     let body_stream = response.bytes_stream();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), meta),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, meta)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), meta, client),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, meta, client)| async move {
             if finished {
                 return None;
             }
@@ -496,7 +613,7 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, meta)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, meta, client)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
@@ -506,8 +623,8 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            emit_stream_usage(&ctx, &meta);
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, meta)))
+                            emit_stream_usage(&ctx, &meta, &client);
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, meta, client)))
                         }
                         None => {
                             // 流结束，发送最终事件
@@ -516,8 +633,8 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            emit_stream_usage(&ctx, &meta);
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, meta)))
+                            emit_stream_usage(&ctx, &meta, &client);
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, meta, client)))
                         }
                     }
                 }
@@ -525,7 +642,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, meta)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, meta, client)))
                 }
             }
         },
@@ -546,6 +663,7 @@ async fn handle_non_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     cache_accounting: Option<CacheAccounting>,
+    client: ClientInfo,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let (response, meta) = match provider.call_api(request_body).await {
@@ -743,6 +861,7 @@ async fn handle_non_stream_request(
         record.latency_ms = meta.latency_ms;
         record.retries = meta.retries;
         record.outcome = crate::usage::RequestOutcome::Success;
+        client.apply(&mut record);
         crate::usage::emit_record(record);
     }
 
@@ -844,6 +963,8 @@ pub async fn count_tokens(
 /// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
 pub async fn post_messages_cc(
     State(state): State<AppState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -853,6 +974,9 @@ pub async fn post_messages_cc(
         message_count = %payload.messages.len(),
         "Received POST /cc/v1/messages request"
     );
+
+    // 从入站请求头 + TCP 对端地址识别来源画像（设备/IP/OS/浏览器，用于「最近请求」展示）
+    let client = ClientInfo::from_headers_with_peer(&headers, Some(peer));
 
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
@@ -873,9 +997,9 @@ pub async fn post_messages_cc(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
-    // 检查是否为 WebSearch 请求
-    if websearch::has_web_search_tool(&payload) {
-        tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
+    // 检查是否应本地处理 WebSearch 请求（tool_choice 强制 / 纯 web_search 单工具 / Claude Code 前缀）
+    if websearch::should_handle_websearch_request(&payload) {
+        tracing::info!("检测到 WebSearch 请求，路由到本地 WebSearch 处理");
 
         // 估算输入 tokens（只读计数，传引用避免深拷贝整个对话历史）
         let input_tokens = token::count_all_tokens(
@@ -886,6 +1010,13 @@ pub async fn post_messages_cc(
         ) as i32;
 
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+    }
+
+    // 混合工具场景：请求带 web_search 但未显式触发搜索，剔除 web_search 后走常规转发，
+    // 避免把 web_search 原样下发给 Kiro 触发 400 Improperly formed request。
+    if websearch::has_web_search_tool(&payload) {
+        tracing::info!("检测到混合工具列表中的 web_search，剔除后转发上游");
+        websearch::strip_web_search_tools(&mut payload);
     }
 
     // 转换请求
@@ -909,13 +1040,11 @@ pub async fn post_messages_cc(
         }
     };
 
-    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
-    let kiro_request = KiroRequest {
-        conversation_state: conversion_result.conversation_state,
-        profile_arn: None,
-    };
-
-    let request_body = match serde_json::to_string(&kiro_request) {
+    // 构建 Kiro 请求体（发上游前，超阈值时执行输入压缩；profile_arn 由 provider 层注入）
+    let request_body = match build_kiro_request_body(
+        conversion_result.conversation_state,
+        &state.compression,
+    ) {
         Ok(body) => body,
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
@@ -962,12 +1091,13 @@ pub async fn post_messages_cc(
             thinking_enabled,
             tool_name_map,
             cache_accounting,
+            client,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, cache_accounting).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, cache_accounting, client).await
     }
 }
 
@@ -983,6 +1113,7 @@ async fn handle_stream_request_buffered(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     cache_accounting: Option<CacheAccounting>,
+    client: ClientInfo,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let (response, meta) = match provider.call_api_stream(request_body).await {
@@ -998,7 +1129,7 @@ async fn handle_stream_request_buffered(
     ctx.set_cache_usage(cache_usage);
 
     // 创建缓冲 SSE 流（流结束时用 meta + 最终 usage 埋点）
-    let stream = create_buffered_sse_stream(response, ctx, meta);
+    let stream = create_buffered_sse_stream(response, ctx, meta, client);
 
     // 返回 SSE 响应
     Response::builder()
@@ -1021,6 +1152,7 @@ fn create_buffered_sse_stream(
     response: reqwest::Response,
     ctx: BufferedStreamContext,
     meta: crate::kiro::provider::CallMeta,
+    client: ClientInfo,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
 
@@ -1032,8 +1164,9 @@ fn create_buffered_sse_stream(
             false,
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
             meta,
+            client,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, meta)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, meta, client)| async move {
             if finished {
                 return None;
             }
@@ -1048,7 +1181,7 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, meta)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, meta, client)));
                     }
 
                     // 然后处理数据流
@@ -1083,8 +1216,8 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                emit_buffered_usage(&ctx, &meta);
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, meta)));
+                                emit_buffered_usage(&ctx, &meta, &client);
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, meta, client)));
                             }
                             None => {
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
@@ -1093,8 +1226,8 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                emit_buffered_usage(&ctx, &meta);
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, meta)));
+                                emit_buffered_usage(&ctx, &meta, &client);
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, meta, client)));
                             }
                         }
                     }
@@ -1106,7 +1239,11 @@ fn create_buffered_sse_stream(
 }
 
 /// 缓冲流结束时埋点一条成功记录
-fn emit_buffered_usage(ctx: &BufferedStreamContext, meta: &crate::kiro::provider::CallMeta) {
+fn emit_buffered_usage(
+    ctx: &BufferedStreamContext,
+    meta: &crate::kiro::provider::CallMeta,
+    client: &ClientInfo,
+) {
     let usage = ctx.resolved_usage();
     let mut record = crate::usage::RequestRecord::new(
         Uuid::new_v4().to_string(),
@@ -1121,5 +1258,6 @@ fn emit_buffered_usage(ctx: &BufferedStreamContext, meta: &crate::kiro::provider
     record.latency_ms = meta.latency_ms;
     record.retries = meta.retries;
     record.outcome = crate::usage::RequestOutcome::Success;
+    client.apply(&mut record);
     crate::usage::emit_record(record);
 }

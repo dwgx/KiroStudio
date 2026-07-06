@@ -33,6 +33,7 @@ use super::{
 /// - `kiro_provider`: 可选的 KiroProvider，用于调用上游 API
 
 /// 创建带有 KiroProvider 的 Anthropic API 路由
+#[allow(clippy::too_many_arguments)]
 pub fn create_router_with_provider(
     api_key: impl Into<String>,
     kiro_provider: Option<KiroProvider>,
@@ -41,13 +42,15 @@ pub fn create_router_with_provider(
     prompt_cache_ttl_seconds: u64,
     cors_allowed_origins: &[String],
     max_body_bytes: usize,
+    compression: crate::model::config::CompressionConfig,
 ) -> Router {
     let mut state = AppState::with_prompt_cache(
         api_key,
         extract_thinking,
         prompt_cache_enabled,
         prompt_cache_ttl_seconds,
-    );
+    )
+    .with_compression(compression);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }
