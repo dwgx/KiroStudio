@@ -127,3 +127,24 @@ pub async fn usage_rate(
         None => stats_disabled(),
     }
 }
+
+/// GET /api/admin/usage/clients
+/// 下游客户端 RPM 视图：每个客户端（按 IP/设备分组）当前 RPM + 活跃窗口数 + 各窗口 RPM。
+/// 与 by-credential（选号维度）正交，这是**发起方**维度。
+pub async fn usage_clients(State(state): State<AdminState>) -> impl IntoResponse {
+    match &state.usage_stats {
+        Some(stats) => Json(stats.clients()).into_response(),
+        None => stats_disabled(),
+    }
+}
+
+/// GET /api/admin/usage/throughput
+/// 全局实时吞吐快照：当前 RPM / RPS / tokens 每秒 + 最近 60 秒逐秒桶。
+/// 供前端把趋势图渲染成会流动的粒子（密度∝RPS，速度∝tokens/s）。
+/// 只读内存聚合，零上游调用。
+pub async fn usage_throughput(State(state): State<AdminState>) -> impl IntoResponse {
+    match &state.usage_stats {
+        Some(stats) => Json(stats.throughput()).into_response(),
+        None => stats_disabled(),
+    }
+}

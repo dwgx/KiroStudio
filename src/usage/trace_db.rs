@@ -42,10 +42,38 @@ impl TraceDb {
         .context("配置 SQLite PRAGMA 失败")?;
 
         Self::init_schema(&conn)?;
+        Self::migrate_schema(&conn)?;
 
         Ok(TraceDb {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// 增量迁移：为旧库补齐新增列（幂等）。
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` 不会给已存在的表加列，因此历史库升级后
+    /// 缺少新字段。这里用 `ALTER TABLE ... ADD COLUMN` 补列，并吞掉「列已存在」
+    /// 错误（duplicate column），保证：新库/旧库都能得到完整表结构、不丢历史数据、
+    /// 反复启动也安全。
+    fn migrate_schema(conn: &Connection) -> Result<()> {
+        // 逐条尝试新增列；已存在则忽略 "duplicate column name" 错误
+        let add_columns = [
+            "ALTER TABLE traces ADD COLUMN client_device TEXT",
+            "ALTER TABLE traces ADD COLUMN client_ip TEXT",
+            "ALTER TABLE traces ADD COLUMN client_os TEXT",
+            "ALTER TABLE traces ADD COLUMN client_browser TEXT",
+        ];
+        for sql in add_columns {
+            if let Err(e) = conn.execute(sql, []) {
+                let msg = e.to_string().to_lowercase();
+                // rusqlite/sqlite 对已存在列报 "duplicate column name: ..."
+                if msg.contains("duplicate column") {
+                    continue;
+                }
+                return Err(e).with_context(|| format!("迁移 traces 表失败: {sql}"));
+            }
+        }
+        Ok(())
     }
 
     /// 建表 + 建索引（幂等，IF NOT EXISTS）。
@@ -65,7 +93,11 @@ impl TraceDb {
                 outcome        TEXT NOT NULL,
                 retries        INTEGER NOT NULL,
                 error_message  TEXT,
-                session_id     TEXT
+                session_id     TEXT,
+                client_device  TEXT,
+                client_ip      TEXT,
+                client_os      TEXT,
+                client_browser TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_traces_ts_ms ON traces(ts_ms);
             CREATE INDEX IF NOT EXISTS idx_traces_credential_id ON traces(credential_id);
@@ -85,8 +117,9 @@ impl TraceDb {
             "INSERT OR REPLACE INTO traces (
                 request_id, ts_ms, credential_id, model, is_streaming,
                 input_tokens, output_tokens, credits_used, latency_ms, first_token_ms,
-                outcome, retries, error_message, session_id
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                outcome, retries, error_message, session_id, client_device,
+                client_ip, client_os, client_browser
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 record.request_id,
                 record.ts_ms,
@@ -102,6 +135,10 @@ impl TraceDb {
                 record.retries as i64,
                 record.error_message,
                 record.session_id,
+                record.client_device,
+                record.client_ip,
+                record.client_os,
+                record.client_browser,
             ],
         )
         .context("INSERT traces 失败")?;
@@ -114,7 +151,8 @@ impl TraceDb {
         let mut stmt = conn.prepare(
             "SELECT request_id, ts_ms, credential_id, model, is_streaming,
                     input_tokens, output_tokens, credits_used, latency_ms, first_token_ms,
-                    outcome, retries, error_message, session_id
+                    outcome, retries, error_message, session_id, client_device,
+                    client_ip, client_os, client_browser
              FROM traces
              ORDER BY ts_ms DESC
              LIMIT ?1",
@@ -126,6 +164,15 @@ impl TraceDb {
             out.push(r.context("读取 traces 行失败")?);
         }
         Ok(out)
+    }
+
+    /// 统计 traces 表当前总行数（供 admin 存储统计展示）。
+    pub fn count(&self) -> Result<u64> {
+        let conn = self.conn.lock();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM traces", [], |row| row.get(0))
+            .context("统计 traces 行数失败")?;
+        Ok(n.max(0) as u64)
     }
 
     /// 删除 ts_ms 早于 `keep_days` 天前的记录，返回删除行数。
@@ -180,6 +227,10 @@ fn row_to_record(row: &Row<'_>) -> rusqlite::Result<RequestRecord> {
         retries: retries as u32,
         error_message: row.get(12)?,
         session_id: row.get(13)?,
+        client_device: row.get(14)?,
+        client_ip: row.get(15)?,
+        client_os: row.get(16)?,
+        client_browser: row.get(17)?,
     })
 }
 
@@ -254,6 +305,10 @@ mod tests {
         rec.retries = 1;
         rec.error_message = Some("none".to_string());
         rec.session_id = Some("conv-1".to_string());
+        rec.client_device = Some("claude-code".to_string());
+        rec.client_ip = Some("203.0.113.7".to_string());
+        rec.client_os = Some("Windows".to_string());
+        rec.client_browser = Some("Chrome 120".to_string());
         rec
     }
 
@@ -282,6 +337,10 @@ mod tests {
         assert_eq!(back.retries, 1);
         assert_eq!(back.error_message, Some("none".to_string()));
         assert_eq!(back.session_id, Some("conv-1".to_string()));
+        assert_eq!(back.client_device, Some("claude-code".to_string()));
+        assert_eq!(back.client_ip, Some("203.0.113.7".to_string()));
+        assert_eq!(back.client_os, Some("Windows".to_string()));
+        assert_eq!(back.client_browser, Some("Chrome 120".to_string()));
     }
 
     #[test]
@@ -379,5 +438,68 @@ mod tests {
         assert_eq!(back.first_token_ms, None);
         assert_eq!(back.error_message, None);
         assert_eq!(back.session_id, None);
+        assert_eq!(back.client_device, None);
+        assert_eq!(back.client_ip, None);
+        assert_eq!(back.client_os, None);
+        assert_eq!(back.client_browser, None);
+    }
+
+    /// 模拟旧库（无 client_device 列 + 已有历史数据），验证迁移幂等且不丢数据。
+    #[test]
+    fn test_migration_adds_client_device_to_legacy_db() {
+        let tmp = TempDbPath::new("migrate");
+
+        // 1) 手工建一张「旧版」traces 表：故意不含 client_device 列，并塞一条历史记录
+        {
+            let conn = Connection::open(tmp.path()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE traces (
+                    request_id     TEXT PRIMARY KEY,
+                    ts_ms          INTEGER NOT NULL,
+                    credential_id  INTEGER,
+                    model          TEXT NOT NULL,
+                    is_streaming   INTEGER NOT NULL,
+                    input_tokens   INTEGER NOT NULL,
+                    output_tokens  INTEGER NOT NULL,
+                    credits_used   REAL,
+                    latency_ms     INTEGER NOT NULL,
+                    first_token_ms INTEGER,
+                    outcome        TEXT NOT NULL,
+                    retries        INTEGER NOT NULL,
+                    error_message  TEXT,
+                    session_id     TEXT
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO traces (
+                    request_id, ts_ms, credential_id, model, is_streaming,
+                    input_tokens, output_tokens, credits_used, latency_ms, first_token_ms,
+                    outcome, retries, error_message, session_id
+                ) VALUES ('legacy', 42, 7, 'm', 0, 1, 2, NULL, 10, NULL, 'success', 0, NULL, NULL)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // 2) 用 TraceDb::open 打开旧库 → 触发迁移
+        let db = TraceDb::open(tmp.path()).unwrap();
+
+        // 历史数据仍在，且新列读回为 None（旧行没有该值）
+        let got = db.recent(10).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].request_id, "legacy");
+        assert_eq!(got[0].client_device, None);
+
+        // 3) 迁移后可正常写入带 device 的新记录并读回
+        db.on_record(&sample_record("new-with-device", 100));
+        let got = db.recent(10).unwrap();
+        let rec = got.iter().find(|r| r.request_id == "new-with-device").unwrap();
+        assert_eq!(rec.client_device, Some("claude-code".to_string()));
+
+        // 4) 再次 open 同一库，迁移应幂等（不因列已存在而报错）
+        drop(db);
+        let db2 = TraceDb::open(tmp.path()).unwrap();
+        assert_eq!(db2.recent(10).unwrap().len(), 2);
     }
 }

@@ -1,7 +1,7 @@
 //! Admin API 业务逻辑服务
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -20,12 +20,28 @@ use crate::kiro::auth::social::OAuthCallbackData;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, ConfigSnapshotResponse,
     CredentialStatusItem, CredentialsStatusResponse, LoadBalancingModeResponse,
-    SetLoadBalancingModeRequest, TrashItemResponse, TrashListResponse, UpdateConfigRequest,
+    SetLoadBalancingModeRequest, StorageCleanupItem, StorageCleanupResponse, StoragePartition,
+    StorageStatsResponse, TrashItemResponse, TrashListResponse, UpdateConfigRequest,
     UpdateConfigResponse,
 };
+use crate::usage::TraceDb;
 
-/// 余额缓存过期时间（秒），5 分钟
+/// 余额缓存【新鲜度】阈值（秒），5 分钟。
+/// 仅用于 `get_balance` 的按需（hover）路径：决定是否需要重新向上游拉取。
+/// 注意：这【不是】展示缓存的丢弃阈值——展示用 `BALANCE_CACHE_DISPLAY_MAX_AGE_SECS`。
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
+
+/// 余额缓存【展示保留】上限（秒），7 天。
+///
+/// 关键修复（对齐 Foxfishc 的“重启后余额缓存不丢”目标，但契合我方单一数据源架构）：
+/// 展示路径（启动加载 + 批量缓存端点）绝不能用 5 分钟的新鲜度阈值去丢弃条目，
+/// 否则会出现两个症状：
+///   1. 重启后磁盘缓存几乎必然 >5 分钟 → 被丢弃 → 前端显示“未知”；
+///   2. 后台温和刷新间隔为 30 分钟，但展示缓存 5 分钟后即被过滤 →
+///      每 30 分钟里有 25 分钟批量端点返回空 → 前端长期“未知”。
+/// 因此展示缓存保留最近 7 天的最后已知值，并把 `cached_at` 交给前端判断新鲜度
+/// （前端展示“截至 X 分钟前”而非直接抹掉数字）。超过 7 天才丢弃，避免无界陈旧。
+const BALANCE_CACHE_DISPLAY_MAX_AGE_SECS: i64 = 7 * 24 * 3600;
 
 /// 缓存的余额条目（含时间戳）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,6 +149,7 @@ impl AdminService {
                 api_key_hash: entry.api_key_hash,
                 masked_api_key: entry.masked_api_key,
                 email: entry.email,
+                subscription_title: entry.subscription_title,
                 success_count: entry.success_count,
                 last_used_at: entry.last_used_at.clone(),
                 has_proxy: entry.has_proxy,
@@ -140,6 +157,8 @@ impl AdminService {
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
                 endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+                inflight: entry.inflight,
+                rpm: entry.rpm,
             })
             .collect();
 
@@ -287,7 +306,12 @@ impl AdminService {
     /// 批量读取【已缓存】的凭据余额快照（A10）
     ///
     /// 严守封号红线：只读 balance_cache，绝不触发任何上游 getUsageLimits 调用。
-    /// 缓存未命中或已过期的凭据不出现在结果中（前端可按需单独拉取）。
+    ///
+    /// 修复：返回最近 7 天内的最后已知值（不再用 5 分钟新鲜度阈值过滤）。
+    /// 后台温和刷新间隔为 30 分钟，若这里仍按 5 分钟丢弃，前端每 30 分钟只有 5 分钟
+    /// 能看到数字。改为按【展示保留上限】过滤，并把 `cached_at` 交给前端标注新鲜度
+    /// （“截至 X 分钟前”），让余额/订阅等级“慢慢自动更新”且重启不丢。
+    /// 仅陈旧超过 7 天的条目才不返回（前端可按需单独 hover 拉取）。
     pub fn get_cached_balances(&self) -> super::types::CachedBalancesResponse {
         use super::types::{CachedBalanceItem, CachedBalancesResponse};
 
@@ -295,7 +319,7 @@ impl AdminService {
         let cache = self.balance_cache.lock();
         let balances: HashMap<u64, CachedBalanceItem> = cache
             .iter()
-            .filter(|(_, c)| (now - c.cached_at) < BALANCE_CACHE_TTL_SECS as f64)
+            .filter(|(_, c)| (now - c.cached_at) < BALANCE_CACHE_DISPLAY_MAX_AGE_SECS as f64)
             .map(|(id, c)| {
                 (
                     *id,
@@ -392,13 +416,16 @@ impl AdminService {
         let email = req.email.clone();
         let new_cred = KiroCredentials {
             id: None,
-            access_token: None,
+            access_token: req.access_token,
             refresh_token: req.refresh_token,
-            profile_arn: None,
-            expires_at: None,
+            profile_arn: req.profile_arn,
+            expires_at: req.expires_at,
             auth_method: Some(req.auth_method),
             client_id: req.client_id,
             client_secret: req.client_secret,
+            token_endpoint: req.token_endpoint,
+            issuer_url: req.issuer_url,
+            scopes: req.scopes,
             priority: req.priority,
             region: req.region,
             auth_region: req.auth_region,
@@ -834,6 +861,16 @@ impl AdminService {
             }
         }
 
+        // —— 立即生效的字段：登录页背景开关 ——
+        // 关闭时 random-bg 立即返回 null、后台预取轮次也会自我短路，不需重启。
+        let mut login_bg_changed: Option<bool> = None;
+        if let Some(v) = req.login_background_enabled {
+            if v != config.login_background_enabled {
+                config.login_background_enabled = v;
+                login_bg_changed = Some(v);
+            }
+        }
+
         // —— 立即生效的字段：负载均衡模式 ——
         let mut lb_changed = false;
         if let Some(mode) = req.load_balancing_mode {
@@ -856,6 +893,11 @@ impl AdminService {
             self.token_manager
                 .set_load_balancing_mode(config.load_balancing_mode.clone())
                 .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        }
+
+        // 登录页背景开关立即应用到运行时镜像（下一次 random-bg / 预取轮次即生效）
+        if let Some(v) = login_bg_changed {
+            crate::admin_ui::set_login_background_enabled(v);
         }
 
         let restart_required = !restart_fields.is_empty();
@@ -910,6 +952,299 @@ impl AdminService {
             .ok_or(AdminServiceError::NotFound { id })
     }
 
+    /// 一键重启本服务（detached，spawn 后立即返回，实际重启延迟约 1 秒）。
+    ///
+    /// 通过 `systemd-run` 在**独立瞬态单元**里执行 `systemctl restart kirostudio`：
+    /// - systemd-run 使重启命令脱离本服务自身的 cgroup。否则 `systemctl restart`
+    ///   停止旧实例时会按 control-group KillMode 把正在执行重启的命令一起杀掉，
+    ///   导致重启半途夭折。放进独立瞬态单元后重启命令不受影响。
+    /// - `--no-block` 立即返回不阻塞；`sleep 1` 给 HTTP 200 响应留出 flush 时间
+    ///   （重启会杀掉本进程，响应必须先发出去）。
+    /// - 命令全部为**静态字面量**，不拼接任何用户输入，杜绝命令注入。
+    /// - 依赖服务账户具备免密 sudo（部署铁律已配置）；`sudo -n` 非交互，缺权限即失败。
+    ///
+    /// spawn 本身是瞬时同步操作，其成功/失败可在响应前如实返回；真正的 restart
+    /// 在 detached 子进程里 1 秒后才发生。
+    pub fn restart_service(&self) -> Result<(), AdminServiceError> {
+        // sh -c 串起 sleep + systemd-run；child 句柄丢弃后进程继续运行
+        //（tokio kill_on_drop 默认 false，不会因 drop 而被杀）。
+        let script = "sleep 1 && sudo -n systemd-run --no-block --collect \
+                      systemctl restart kirostudio";
+        tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .spawn()
+            .map(|_child| {
+                tracing::warn!(
+                    "收到一键重启请求，约 1 秒后执行 systemctl restart kirostudio（本进程将被替换）"
+                );
+            })
+            .map_err(|e| {
+                AdminServiceError::InternalError(format!("发起服务重启失败: {}", e))
+            })
+    }
+
+    // ============ 存储统计 / 清理（运维）============
+
+    /// 用量数据目录（SQLite traces.db 与 usage-*.jsonl 所在目录）。
+    fn usage_data_dir(&self) -> PathBuf {
+        PathBuf::from(&self.token_manager.config().usage_data_dir)
+    }
+
+    /// 统计一个文件（含 SQLite 的 -wal/-shm 附属文件）的总字节数。
+    fn file_size_bytes(path: &Path) -> u64 {
+        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// 分区磁盘统计：trace.db / usage jsonl / trash.json / 背景图内存池。
+    ///
+    /// 路径全部从现有 config 派生，绝不接受请求传入路径（防目录穿越）。
+    /// `trace_db` 由调用方（handler）从 AdminState 注入；未启用统计时为 None，
+    /// 相应分区不出现在结果中。
+    pub fn storage_stats(&self, trace_db: Option<&Arc<TraceDb>>) -> StorageStatsResponse {
+        let mut partitions: Vec<StoragePartition> = Vec::new();
+        let mut total_disk_bytes: u64 = 0;
+        let usage_enabled = self.token_manager.config().usage_enabled;
+        let data_dir = self.usage_data_dir();
+
+        // 1) traces：SQLite 明细（含 WAL/SHM 附属文件）
+        if let Some(db) = trace_db {
+            let db_path = data_dir.join("traces.db");
+            let mut bytes = Self::file_size_bytes(&db_path);
+            for ext in ["-wal", "-shm"] {
+                let mut side = db_path.clone().into_os_string();
+                side.push(ext);
+                bytes += Self::file_size_bytes(Path::new(&side));
+            }
+            let items = db.count().unwrap_or(0);
+            total_disk_bytes += bytes;
+            partitions.push(StoragePartition {
+                key: "traces".to_string(),
+                label: "请求明细 (SQLite)".to_string(),
+                bytes,
+                items,
+                path: Some(db_path.display().to_string()),
+                in_memory: false,
+            });
+        }
+
+        // 2) usage_jsonl：按天分文件的 JSONL
+        if usage_enabled {
+            let (bytes, files) = Self::scan_usage_jsonl(&data_dir);
+            total_disk_bytes += bytes;
+            partitions.push(StoragePartition {
+                key: "usage_jsonl".to_string(),
+                label: "用量日志 (JSONL)".to_string(),
+                bytes,
+                items: files,
+                path: Some(data_dir.display().to_string()),
+                in_memory: false,
+            });
+        }
+
+        // 3) trash：凭据回收站
+        if let Some(trash_path) = self.token_manager.cache_dir().map(|d| d.join("trash.json")) {
+            let bytes = Self::file_size_bytes(&trash_path);
+            let items = self.token_manager.list_trash().len() as u64;
+            total_disk_bytes += bytes;
+            partitions.push(StoragePartition {
+                key: "trash".to_string(),
+                label: "凭据回收站".to_string(),
+                bytes,
+                items,
+                path: Some(trash_path.display().to_string()),
+                in_memory: false,
+            });
+        }
+
+        // 4) bg_cache：登录页背景图内存池（无落盘，统计常驻内存）
+        let (bg_count, bg_bytes) = crate::admin_ui::bg_pool_stats();
+        partitions.push(StoragePartition {
+            key: "bg_cache".to_string(),
+            label: "登录背景图缓存 (内存)".to_string(),
+            bytes: bg_bytes,
+            items: bg_count as u64,
+            path: None,
+            in_memory: true,
+        });
+
+        StorageStatsResponse {
+            partitions,
+            total_disk_bytes,
+            usage_enabled,
+        }
+    }
+
+    /// 扫描目录下 `usage-*.jsonl`，返回 (总字节数, 文件数)。
+    fn scan_usage_jsonl(dir: &Path) -> (u64, u64) {
+        let mut bytes = 0u64;
+        let mut files = 0u64;
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let is_jsonl = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("usage-") && n.ends_with(".jsonl"))
+                    .unwrap_or(false);
+                if is_jsonl {
+                    bytes += Self::file_size_bytes(&path);
+                    files += 1;
+                }
+            }
+        }
+        (bytes, files)
+    }
+
+    /// 自定义清理：按 target 白名单 + 可选时间窗口清理数据。
+    ///
+    /// 安全：target 为固定枚举，路径全部从 config 派生，绝不接受任意路径（防穿越）。
+    /// - traces：复用 [`TraceDb::retention_cleanup`]（keep_days）
+    /// - usage_jsonl：按文件名日期删除早于 keep_days 的日文件
+    /// - trash：复用 [`MultiTokenManager::purge_expired_trash`]
+    /// - bg_cache：清空内存池
+    /// - all：以上全部
+    pub fn storage_cleanup(
+        &self,
+        target: &str,
+        older_than_days: Option<i64>,
+        trace_db: Option<&Arc<TraceDb>>,
+    ) -> Result<StorageCleanupResponse, AdminServiceError> {
+        // 白名单校验：非法 target 直接 400
+        let valid = matches!(
+            target,
+            "traces" | "usage_jsonl" | "trash" | "bg_cache" | "all"
+        );
+        if !valid {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "非法清理目标 '{}'，允许: traces | usage_jsonl | trash | bg_cache | all",
+                target
+            )));
+        }
+
+        let do_all = target == "all";
+        let mut results: Vec<StorageCleanupItem> = Vec::new();
+
+        // traces
+        if do_all || target == "traces" {
+            results.push(self.cleanup_traces(older_than_days, trace_db));
+        }
+        // usage_jsonl
+        if do_all || target == "usage_jsonl" {
+            results.push(self.cleanup_usage_jsonl(older_than_days));
+        }
+        // trash
+        if do_all || target == "trash" {
+            results.push(self.cleanup_trash(older_than_days));
+        }
+        // bg_cache
+        if do_all || target == "bg_cache" {
+            let n = crate::admin_ui::clear_bg_pool() as u64;
+            results.push(StorageCleanupItem {
+                key: "bg_cache".to_string(),
+                removed: n,
+                freed_bytes: 0,
+                note: Some("已清空背景图内存池".to_string()),
+            });
+        }
+
+        let removed_total: u64 = results.iter().map(|r| r.removed).sum();
+        Ok(StorageCleanupResponse {
+            success: true,
+            message: format!("清理完成，共移除 {} 项", removed_total),
+            results,
+        })
+    }
+
+    /// 清理 traces：keep_days 未指定时用 config.usage_retention_days。
+    fn cleanup_traces(
+        &self,
+        older_than_days: Option<i64>,
+        trace_db: Option<&Arc<TraceDb>>,
+    ) -> StorageCleanupItem {
+        let Some(db) = trace_db else {
+            return StorageCleanupItem {
+                key: "traces".to_string(),
+                removed: 0,
+                freed_bytes: 0,
+                note: Some("用量统计未启用，跳过".to_string()),
+            };
+        };
+        let keep_days = older_than_days.unwrap_or(self.token_manager.config().usage_retention_days);
+        match db.retention_cleanup(keep_days) {
+            Ok(n) => StorageCleanupItem {
+                key: "traces".to_string(),
+                removed: n as u64,
+                freed_bytes: 0,
+                note: Some(format!("删除 {} 天前的明细", keep_days)),
+            },
+            Err(e) => StorageCleanupItem {
+                key: "traces".to_string(),
+                removed: 0,
+                freed_bytes: 0,
+                note: Some(format!("清理失败: {}", e)),
+            },
+        }
+    }
+
+    /// 清理 usage_jsonl：删除文件名日期早于 keep_days 的日文件（keep_days<=0 删全部）。
+    fn cleanup_usage_jsonl(&self, older_than_days: Option<i64>) -> StorageCleanupItem {
+        let keep_days = older_than_days.unwrap_or(self.token_manager.config().usage_retention_days);
+        let dir = self.usage_data_dir();
+        // 保留窗口起点日期（UTC）：文件名日期早于此的被删
+        let cutoff = chrono::Utc::now().date_naive() - chrono::Duration::days(keep_days.max(0));
+        let mut removed = 0u64;
+        let mut freed = 0u64;
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = match path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                // 仅匹配 usage-YYYY-MM-DD.jsonl
+                let is_jsonl = name.starts_with("usage-") && name.ends_with(".jsonl");
+                if !is_jsonl {
+                    continue;
+                }
+                let date_part = &name["usage-".len()..name.len() - ".jsonl".len()];
+                let file_date = match chrono::NaiveDate::parse_from_str(date_part, "%Y-%m-%d") {
+                    Ok(d) => d,
+                    Err(_) => continue, // 文件名不含合法日期，保守跳过
+                };
+                if file_date < cutoff {
+                    let size = Self::file_size_bytes(&path);
+                    if std::fs::remove_file(&path).is_ok() {
+                        removed += 1;
+                        freed += size;
+                    }
+                }
+            }
+        }
+        StorageCleanupItem {
+            key: "usage_jsonl".to_string(),
+            removed,
+            freed_bytes: freed,
+            note: Some(format!("删除 {} 天前的日文件", keep_days)),
+        }
+    }
+
+    /// 清理 trash：keep_days 未指定时用 config.trash_retention_days。
+    fn cleanup_trash(&self, older_than_days: Option<i64>) -> StorageCleanupItem {
+        // trash 保留期为 u32 天；older_than_days 为负时按 0（全部清）处理
+        let keep_days: u32 = match older_than_days {
+            Some(d) => d.max(0) as u32,
+            None => self.token_manager.config().trash_retention_days,
+        };
+        let n = self.token_manager.purge_expired_trash(keep_days) as u64;
+        StorageCleanupItem {
+            key: "trash".to_string(),
+            removed: n,
+            freed_bytes: 0,
+            note: Some(format!("清理 {} 天前的回收站条目（0=永久保留不清）", keep_days)),
+        }
+    }
+
     // ============ 余额缓存持久化 ============
 
     fn load_balance_cache_from(cache_path: &Option<PathBuf>) -> HashMap<u64, CachedBalance> {
@@ -936,8 +1271,10 @@ impl AdminService {
         map.into_iter()
             .filter_map(|(k, v)| {
                 let id = k.parse::<u64>().ok()?;
-                // 丢弃超过 TTL 的条目
-                if (now - v.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
+                // 修复：启动恢复用【展示保留上限】(7 天)，而非 5 分钟新鲜度阈值。
+                // 这样重启后仍能立刻显示上次的余额数字（前端据 cached_at 标注新鲜度），
+                // 而不是因为磁盘缓存 >5 分钟就整批丢成“未知”。只有陈旧到 7 天才丢弃。
+                if (now - v.cached_at) < BALANCE_CACHE_DISPLAY_MAX_AGE_SECS as f64 {
                     Some((id, v))
                 } else {
                     None
@@ -1068,5 +1405,62 @@ impl AdminService {
         } else {
             AdminServiceError::InternalError(msg)
         }
+    }
+}
+
+#[cfg(test)]
+mod balance_cache_tests {
+    use super::*;
+
+    fn make_cached(id: u64, cached_at: f64) -> (String, CachedBalance) {
+        (
+            id.to_string(),
+            CachedBalance {
+                cached_at,
+                data: BalanceResponse {
+                    id,
+                    subscription_title: Some("Kiro Pro".to_string()),
+                    current_usage: 10.0,
+                    usage_limit: 100.0,
+                    remaining: 90.0,
+                    usage_percentage: 10.0,
+                    next_reset_at: None,
+                    overage_enabled: false,
+                    overage_cap: 0.0,
+                    effective_limit: 100.0,
+                },
+            },
+        )
+    }
+
+    /// 回归测试：启动恢复必须保留“陈旧但仍在展示保留期内”的余额缓存，
+    /// 而不是用 5 分钟新鲜度阈值把它整批丢成“未知”（这正是重启后余额消失的根因）。
+    #[test]
+    fn load_keeps_stale_but_within_display_window() {
+        let dir = std::env::temp_dir().join(format!("ks_bal_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kiro_balance_cache.json");
+
+        let now = Utc::now().timestamp() as f64;
+        // 1 小时前写入：远超 5 分钟新鲜度阈值，但远在 7 天展示保留期内
+        let stale = now - 3600.0;
+        // 8 天前写入：超过展示保留期，应被丢弃
+        let ancient = now - (8.0 * 24.0 * 3600.0);
+
+        let mut map: HashMap<String, CachedBalance> = HashMap::new();
+        let (k1, v1) = make_cached(1, stale);
+        let (k2, v2) = make_cached(2, ancient);
+        map.insert(k1, v1);
+        map.insert(k2, v2);
+        std::fs::write(&path, serde_json::to_string(&map).unwrap()).unwrap();
+
+        let loaded = AdminService::load_balance_cache_from(&Some(path.clone()));
+
+        // 陈旧但在展示窗口内 → 保留（重启后前端仍能显示上次数字）
+        assert!(loaded.contains_key(&1), "陈旧但在 7 天内的缓存必须保留");
+        // 超过展示窗口 → 丢弃（避免无界陈旧）
+        assert!(!loaded.contains_key(&2), "超过 7 天的缓存应被丢弃");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

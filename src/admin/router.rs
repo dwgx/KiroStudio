@@ -11,14 +11,14 @@ use super::{
         enable_overage, export_credential, force_refresh_token, get_all_credentials,
         get_cached_balances, get_credential_balance, get_load_balancing_mode, get_config,
         get_overage_status, list_trash, purge_credential, poll_social_login, reset_failure_count,
-        restore_credential, set_credential_disabled, set_credential_priority,
-        set_load_balancing_mode, social_callback, start_social_login, update_config,
-        start_idc_login, poll_idc_login,
+        restart_service, restore_credential, set_credential_disabled, set_credential_priority,
+        set_load_balancing_mode, social_callback, start_social_login, storage_cleanup,
+        storage_stats, update_config, start_idc_login, poll_idc_login,
     },
     middleware::{AdminState, admin_auth_middleware},
     usage_handlers::{
-        usage_by_credential, usage_by_model, usage_overview, usage_rate, usage_recent,
-        usage_timeseries,
+        usage_by_credential, usage_by_model, usage_clients, usage_overview, usage_rate,
+        usage_recent, usage_throughput, usage_timeseries,
     },
 };
 
@@ -81,6 +81,14 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/usage/by-credential", get(usage_by_credential))
         .route("/usage/recent", get(usage_recent))
         .route("/usage/rate", get(usage_rate))
+        // 下游客户端 RPM 视图（谁开了几个窗口、各打多少）
+        .route("/usage/clients", get(usage_clients))
+        // 全局实时吞吐（最近 60 秒逐秒桶，供前端画流动粒子）
+        .route("/usage/throughput", get(usage_throughput))
+        // 运维：一键重启 + 存储统计/清理
+        .route("/service/restart", post(restart_service))
+        .route("/storage/stats", get(storage_stats))
+        .route("/storage/cleanup", post(storage_cleanup))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,

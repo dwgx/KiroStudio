@@ -429,6 +429,44 @@ fn default_priority() -> u32 {
     100
 }
 
+// ============ 运维：一键重启 / 存储统计与清理 ============
+
+/// POST /api/admin/service/restart
+/// 一键重启本服务（detached）。先返回 200，再由脱离子进程约 1 秒后执行 systemctl restart。
+///
+/// ⚠️ 重启瞬间本服务断连是预期行为（Claude Code 自己也走 8990，会短暂中断）。
+pub async fn restart_service(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.restart_service() {
+        Ok(_) => Json(SuccessResponse::new(
+            "重启已发起，数秒后服务恢复（本次连接会短暂中断，属正常）",
+        ))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/storage/stats
+/// 分区磁盘/内存占用统计（trace.db / usage jsonl / trash / 背景图内存池）
+pub async fn storage_stats(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.storage_stats(state.trace_db.as_ref()))
+}
+
+/// POST /api/admin/storage/cleanup
+/// 按 target 白名单 + 可选时间窗口清理数据（路径全部从 config 派生，防穿越）
+pub async fn storage_cleanup(
+    State(state): State<AdminState>,
+    Json(payload): Json<super::types::StorageCleanupRequest>,
+) -> impl IntoResponse {
+    match state.service.storage_cleanup(
+        &payload.target,
+        payload.older_than_days,
+        state.trace_db.as_ref(),
+    ) {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 // ============ 服务端配置 ============
 
 /// GET /api/admin/config

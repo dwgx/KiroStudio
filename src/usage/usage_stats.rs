@@ -33,6 +33,11 @@ const DEFAULT_HOURLY_POINTS: usize = 48;
 /// 概览默认返回的天序列点数
 const DEFAULT_DAILY_POINTS: usize = 30;
 
+/// 全局实时吞吐环：逐秒桶数量（覆盖最近 60 秒滚动窗口）
+const THROUGHPUT_BUCKETS: usize = 60;
+/// 全局实时吞吐桶时长（秒）
+const THROUGHPUT_BUCKET_SECS: i64 = 1;
+
 const HOUR_MS: i64 = 3_600_000;
 const DAY_MS: i64 = 86_400_000;
 
@@ -168,6 +173,24 @@ impl CredRateRing {
         }
         out
     }
+
+    /// 最近 60 秒（当前桶 + 上一桶，每桶 30 秒）的请求数，即 RPM 近似值。
+    fn rpm(&self, now_slot: i64) -> u32 {
+        let mut sum = 0u32;
+        for s in [now_slot, now_slot - 1] {
+            let idx = s.rem_euclid(RATE_BUCKETS as i64) as usize;
+            if self.slots[idx] == s {
+                sum += self.counts[idx];
+            }
+        }
+        sum
+    }
+
+    /// 该环内任一桶的最大时间标签（绝对 30 秒编号），用于判断是否仍活跃。
+    /// 无任何写入时返回 -1。
+    fn max_slot(&self) -> i64 {
+        self.slots.iter().copied().max().unwrap_or(-1)
+    }
 }
 
 /// 速率环集合（per-credential）。credential_id 为 None 的记录不计入速率。
@@ -192,6 +215,156 @@ impl RateRing {
     }
 }
 
+/// 全局实时吞吐环形缓冲：**跨全部凭据/客户端**的逐秒滚动窗口。
+///
+/// 与 [`RateRing`]（per-credential，选号维度）、[`ClientAgg`]（下游发起方维度）正交：
+/// 这里只关心「整个网关此刻流动得多快」，供前端把趋势图画成会流动的粒子——
+/// 粒子密度 ∝ 每秒请求数，粒子速度 ∝ 每秒 tokens 吞吐。
+///
+/// [`THROUGHPUT_BUCKETS`] 个桶各覆盖 [`THROUGHPUT_BUCKET_SECS`] 秒（默认 60×1 秒 = 最近 60 秒）。
+/// 桶按「绝对秒编号取模」定位，写入前比对时间标签，过期则清零，O(1) 滚动、固定内存。
+/// 纯内存累加，零上游调用。
+#[derive(Debug)]
+struct GlobalThroughputRing {
+    /// 每桶的绝对秒编号（-1 表示未使用）
+    slots: [i64; THROUGHPUT_BUCKETS],
+    /// 每桶请求计数
+    requests: [u32; THROUGHPUT_BUCKETS],
+    /// 每桶 tokens（input+output）累计
+    tokens: [u64; THROUGHPUT_BUCKETS],
+}
+
+impl Default for GlobalThroughputRing {
+    fn default() -> Self {
+        GlobalThroughputRing {
+            slots: [-1; THROUGHPUT_BUCKETS],
+            requests: [0; THROUGHPUT_BUCKETS],
+            tokens: [0; THROUGHPUT_BUCKETS],
+        }
+    }
+}
+
+impl GlobalThroughputRing {
+    /// 在 `slot`（绝对秒编号）对应桶累加一条记录的请求数与 tokens。
+    fn bump(&mut self, slot: i64, tokens: u64) {
+        let idx = slot.rem_euclid(THROUGHPUT_BUCKETS as i64) as usize;
+        if self.slots[idx] != slot {
+            // 桶被新的一秒复用，先清零再累加（环形覆盖）
+            self.slots[idx] = slot;
+            self.requests[idx] = 0;
+            self.tokens[idx] = 0;
+        }
+        self.requests[idx] += 1;
+        self.tokens[idx] = self.tokens[idx].saturating_add(tokens);
+    }
+
+    /// 以 `now_slot` 为最新桶，返回最近 [`THROUGHPUT_BUCKETS`] 个桶（从旧到新）。
+    /// 已过期（时间标签不在窗口内）的桶以 0 值补齐，保证前端连续绘图。
+    fn recent(&self, now_slot: i64) -> Vec<ThroughputBucket> {
+        let mut out = Vec::with_capacity(THROUGHPUT_BUCKETS);
+        let start = now_slot - (THROUGHPUT_BUCKETS as i64 - 1);
+        for s in start..=now_slot {
+            let idx = s.rem_euclid(THROUGHPUT_BUCKETS as i64) as usize;
+            let (requests, tokens) = if self.slots[idx] == s {
+                (self.requests[idx], self.tokens[idx])
+            } else {
+                (0, 0)
+            };
+            out.push(ThroughputBucket {
+                // 桶起始时间（Unix 毫秒，对齐到秒）
+                ts_ms: s * THROUGHPUT_BUCKET_SECS * 1000,
+                requests,
+                tokens,
+            });
+        }
+        out
+    }
+}
+
+/// 单个 session（窗口）的附加元信息，供客户端聚合时归组与展示。
+#[derive(Debug, Clone, Default)]
+struct SessionMeta {
+    /// 所属客户端 key（client_ip 优先，回退 device）
+    client_key: String,
+    /// 客户端 IP（可能为 None）
+    client_ip: Option<String>,
+    /// 设备类型
+    device: Option<String>,
+}
+
+/// 下游客户端 / 窗口维度的滚动速率聚合。
+///
+/// 与 [`RateRing`]（per-credential，选号维度）正交：这里按**下游发起方**统计。
+/// - `by_session`：按 session_id（窗口 UUID）的速率环
+/// - `by_client`：按客户端 key（client_ip 优先，回退 device）的速率环
+/// - `session_meta` / `client_sessions`：维护 client ⇄ session 的归组关系
+///
+/// 复用 [`CredRateRing`] 的环形桶（20×30 秒 = 最近 10 分钟），O(1) 滚动。
+/// 查询时按时间窗口惰性剔除不再活跃的 session/client，避免长跑内存无界增长。
+#[derive(Debug, Default)]
+struct ClientAgg {
+    by_session: HashMap<String, CredRateRing>,
+    by_client: HashMap<String, CredRateRing>,
+    session_meta: HashMap<String, SessionMeta>,
+    client_sessions: HashMap<String, std::collections::HashSet<String>>,
+}
+
+impl ClientAgg {
+    /// 从一条记录派生客户端 key：client_ip 优先，回退 device，都无则 "unknown"。
+    fn client_key_of(r: &RequestRecord) -> String {
+        r.client_ip
+            .clone()
+            .or_else(|| r.client_device.clone())
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    /// 累加一条记录到客户端/窗口速率环。
+    fn bump(&mut self, r: &RequestRecord, slot: i64) {
+        let client_key = Self::client_key_of(r);
+
+        // 客户端维度速率环
+        self.by_client
+            .entry(client_key.clone())
+            .or_insert_with(CredRateRing::new)
+            .bump(slot);
+
+        // 窗口维度：仅在有 session_id 时统计（无窗口标识的请求不计入窗口拆分）
+        if let Some(sid) = r.session_id.clone() {
+            self.by_session
+                .entry(sid.clone())
+                .or_insert_with(CredRateRing::new)
+                .bump(slot);
+            self.session_meta.entry(sid.clone()).or_default();
+            let meta = self.session_meta.get_mut(&sid).unwrap();
+            meta.client_key = client_key.clone();
+            meta.client_ip = r.client_ip.clone();
+            meta.device = r.client_device.clone();
+            self.client_sessions
+                .entry(client_key)
+                .or_default()
+                .insert(sid);
+        }
+    }
+
+    /// 惰性剔除窗口外（max_slot < now_slot-(RATE_BUCKETS-1)）不再活跃的条目。
+    fn prune(&mut self, now_slot: i64) {
+        let oldest = now_slot - (RATE_BUCKETS as i64 - 1);
+        self.by_session.retain(|_, r| r.max_slot() >= oldest);
+        self.by_client.retain(|_, r| r.max_slot() >= oldest);
+        // session_meta / client_sessions 与存活的 session/client 对齐
+        let live_sessions: std::collections::HashSet<String> =
+            self.by_session.keys().cloned().collect();
+        let live_clients: std::collections::HashSet<String> =
+            self.by_client.keys().cloned().collect();
+        self.session_meta.retain(|sid, _| live_sessions.contains(sid));
+        for sids in self.client_sessions.values_mut() {
+            sids.retain(|sid| live_sessions.contains(sid));
+        }
+        self.client_sessions
+            .retain(|ck, sids| !sids.is_empty() || live_clients.contains(ck));
+    }
+}
+
 /// 全部内存聚合状态（受一把锁保护）
 struct Inner {
     /// 小时环形桶
@@ -204,6 +377,10 @@ struct Inner {
     by_credential: HashMap<u64, Aggregate>,
     /// per-credential 速率环
     rate: RateRing,
+    /// 下游客户端 / 窗口维度的滚动速率聚合（Task5）
+    client_agg: ClientAgg,
+    /// 全局实时吞吐环（逐秒滚动 60 秒，供前端画流动粒子）
+    throughput: GlobalThroughputRing,
 }
 
 impl Inner {
@@ -214,6 +391,8 @@ impl Inner {
             by_model: HashMap::new(),
             by_credential: HashMap::new(),
             rate: RateRing::default(),
+            client_agg: ClientAgg::default(),
+            throughput: GlobalThroughputRing::default(),
         }
     }
 
@@ -244,11 +423,20 @@ impl Inner {
         self.by_model.entry(r.model.clone()).or_default().add(r);
 
         // 按凭据累计 + 速率环
+        let rate_slot = r.ts_ms.div_euclid(RATE_BUCKET_SECS * 1000);
         if let Some(cid) = r.credential_id {
             self.by_credential.entry(cid).or_default().add(r);
-            let rate_slot = r.ts_ms.div_euclid(RATE_BUCKET_SECS * 1000);
             self.rate.bump(cid, rate_slot);
         }
+
+        // 下游客户端 / 窗口维度速率（与 credential 速率共用同一 30 秒桶编号）
+        self.client_agg.bump(r, rate_slot);
+
+        // 全局实时吞吐（逐秒桶）：请求数 + tokens(input+output)。
+        // token 计数取非负，避免异常负值污染吞吐。
+        let sec_slot = r.ts_ms.div_euclid(THROUGHPUT_BUCKET_SECS * 1000);
+        let tokens = (r.input_tokens.max(0) as u64) + (r.output_tokens.max(0) as u64);
+        self.throughput.bump(sec_slot, tokens);
     }
 }
 
@@ -354,6 +542,68 @@ impl GroupStat {
             avg_latency_ms: a.avg_latency_ms(),
         }
     }
+}
+
+/// 单个活跃窗口（session）的 RPM 视图
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRpm {
+    /// 窗口标识（session_id / conversationId）
+    pub session_id: String,
+    /// 该窗口最近 60 秒请求数（RPM）
+    pub rpm: u32,
+}
+
+/// 单个下游客户端的 RPM 视图（按 client_ip 优先，回退 device 分组）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientRpm {
+    /// 客户端分组键（client_ip 优先，回退 device）
+    pub client_key: String,
+    /// 客户端 IP（可能为 None）
+    pub client_ip: Option<String>,
+    /// 设备类型（如 claude-code）
+    pub device: Option<String>,
+    /// 该客户端最近 60 秒请求数（RPM，聚合其所有窗口）
+    pub rpm: u32,
+    /// 活跃窗口数（distinct session_id，近 10 分钟内有请求）
+    pub active_sessions: usize,
+    /// 各活跃窗口的 RPM（按 RPM 降序）
+    pub sessions: Vec<SessionRpm>,
+}
+
+/// 全局实时吞吐的单个逐秒桶
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThroughputBucket {
+    /// 桶起始时间（Unix 毫秒，对齐到秒）
+    pub ts_ms: i64,
+    /// 该秒的请求数
+    pub requests: u32,
+    /// 该秒的 tokens（input+output）吞吐
+    pub tokens: u64,
+}
+
+/// 全局实时吞吐快照：当前速率 + 最近 60 秒逐秒桶。
+///
+/// 供前端把趋势图渲染成会流动的粒子：
+/// - `current_rpm`：最近 60 秒总请求数（每分钟请求数近似）
+/// - `current_rps`：最近 60 秒请求数 / 60，用作粒子**密度**
+/// - `current_tokens_per_sec`：最近 60 秒 tokens 总量 / 60，用作粒子**速度**
+/// - `recent_buckets`：最近 60 秒逐秒明细（从旧到新，空秒补 0），供细粒度动画
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThroughputSnapshot {
+    /// 最近 60 秒总请求数（RPM 近似）
+    pub current_rpm: u32,
+    /// 最近 60 秒平均每秒请求数（粒子密度）
+    pub current_rps: f64,
+    /// 最近 60 秒平均每秒 tokens 吞吐（粒子速度）
+    pub current_tokens_per_sec: f64,
+    /// 窗口时长（秒），前端据此换算速率
+    pub window_secs: u32,
+    /// 最近 60 秒逐秒桶（从旧到新，空秒补 0）
+    pub recent_buckets: Vec<ThroughputBucket>,
 }
 
 /// 用量统计 sink：JSONL 落盘 + 内存环形预聚合
@@ -631,6 +881,121 @@ impl UsageStats {
         let inner = self.inner.lock();
         inner.rate.recent(credential_id, now_slot)
     }
+
+    /// 下游客户端 RPM 视图：每个客户端当前 RPM + 活跃窗口数 + 各窗口 RPM。
+    ///
+    /// 按 client_ip（优先）或 device 分组；窗口按 session_id 拆分。仅返回近 10 分钟内
+    /// 有活动的客户端/窗口（查询时惰性 prune 掉过期条目）。按客户端 RPM 降序。
+    pub fn clients(&self) -> Vec<ClientRpm> {
+        self.clients_at(chrono::Utc::now().timestamp_millis())
+    }
+
+    /// 客户端 RPM 视图（可注入基准时间，便于测试）
+    pub fn clients_at(&self, now_ms: i64) -> Vec<ClientRpm> {
+        let now_slot = now_ms.div_euclid(RATE_BUCKET_SECS * 1000);
+        let mut inner = self.inner.lock();
+        // 查询时机做惰性回收，避免不再活跃的窗口/客户端长期滞留
+        inner.client_agg.prune(now_slot);
+
+        let mut out: Vec<ClientRpm> = Vec::with_capacity(inner.client_agg.by_client.len());
+        for (client_key, ring) in &inner.client_agg.by_client {
+            let rpm = ring.rpm(now_slot);
+            // 该客户端名下的活跃窗口
+            let mut sessions: Vec<SessionRpm> = Vec::new();
+            if let Some(sids) = inner.client_agg.client_sessions.get(client_key) {
+                for sid in sids {
+                    if let Some(sring) = inner.client_agg.by_session.get(sid) {
+                        let s_rpm = sring.rpm(now_slot);
+                        // 近 10 分钟内该窗口任一桶存活即视为活跃
+                        if sring.max_slot() >= now_slot - (RATE_BUCKETS as i64 - 1) {
+                            sessions.push(SessionRpm {
+                                session_id: sid.clone(),
+                                rpm: s_rpm,
+                            });
+                        }
+                    }
+                }
+            }
+            sessions.sort_by(|a, b| b.rpm.cmp(&a.rpm).then(a.session_id.cmp(&b.session_id)));
+
+            // 取该 client 任一窗口的 meta 补充 ip/device（无窗口时为 None）
+            let (client_ip, device) = inner
+                .client_agg
+                .client_sessions
+                .get(client_key)
+                .and_then(|sids| sids.iter().next())
+                .and_then(|sid| inner.client_agg.session_meta.get(sid))
+                .map(|m| (m.client_ip.clone(), m.device.clone()))
+                .unwrap_or((None, None));
+
+            out.push(ClientRpm {
+                client_key: client_key.clone(),
+                client_ip,
+                device,
+                rpm,
+                active_sessions: sessions.len(),
+                sessions,
+            });
+        }
+        out.sort_by(|a, b| b.rpm.cmp(&a.rpm).then(a.client_key.cmp(&b.client_key)));
+        out
+    }
+
+    /// 主动回收客户端/窗口维度聚合里不再活跃的条目（后台定时调用）。
+    ///
+    /// `by_session` / `by_client` / `session_meta` / `client_sessions` 四张 map 的 key
+    /// 是**客户端可控**的 session_id（UUID）与 client_ip。它们原本只在查询端点
+    /// [`clients_at`] 里惰性 `prune`；若长时间无人打开概览页，这些 map 会随不断变化的
+    /// session_id 无界增长（中高危内存泄漏）。
+    ///
+    /// 本方法把同一套窗口剔除逻辑（[`ClientAgg::prune`]）搬到后台定时任务里主动执行，
+    /// 与 [`clients_at`] 完全一致：剔除 max_slot 落在 `[now_slot-(RATE_BUCKETS-1), now_slot]`
+    /// 窗口之外的 session/client，并同步清理 meta / 归组关系。
+    ///
+    /// 线程安全：与所有查询/写入路径共用同一把 `inner` 锁，短临界区内完成回收。
+    /// 返回回收后仍存活的 (session 数, client 数)，便于调用方按需记日志。
+    pub fn cleanup_client_stats(&self) -> (usize, usize) {
+        self.cleanup_client_stats_at(chrono::Utc::now().timestamp_millis())
+    }
+
+    /// 客户端聚合回收（可注入基准时间，便于测试）
+    pub fn cleanup_client_stats_at(&self, now_ms: i64) -> (usize, usize) {
+        let now_slot = now_ms.div_euclid(RATE_BUCKET_SECS * 1000);
+        let mut inner = self.inner.lock();
+        inner.client_agg.prune(now_slot);
+        (
+            inner.client_agg.by_session.len(),
+            inner.client_agg.by_client.len(),
+        )
+    }
+
+    /// 全局实时吞吐快照：最近 60 秒逐秒桶 + 当前 RPM / RPS / tokens 每秒。
+    ///
+    /// 只读内存聚合，零上游调用（封号红线）。供前端画数据流动粒子。
+    pub fn throughput(&self) -> ThroughputSnapshot {
+        self.throughput_at(chrono::Utc::now().timestamp_millis())
+    }
+
+    /// 吞吐快照（可注入基准时间，便于测试）
+    pub fn throughput_at(&self, now_ms: i64) -> ThroughputSnapshot {
+        let now_slot = now_ms.div_euclid(THROUGHPUT_BUCKET_SECS * 1000);
+        let inner = self.inner.lock();
+        let buckets = inner.throughput.recent(now_slot);
+        drop(inner);
+
+        let total_requests: u64 = buckets.iter().map(|b| b.requests as u64).sum();
+        let total_tokens: u64 = buckets.iter().map(|b| b.tokens).sum();
+        let window_secs = THROUGHPUT_BUCKETS as u32; // 桶数 × 1 秒
+        let w = window_secs as f64;
+
+        ThroughputSnapshot {
+            current_rpm: total_requests.min(u32::MAX as u64) as u32,
+            current_rps: total_requests as f64 / w,
+            current_tokens_per_sec: total_tokens as f64 / w,
+            window_secs,
+            recent_buckets: buckets,
+        }
+    }
 }
 
 impl UsageSink for UsageStats {
@@ -795,6 +1160,90 @@ mod tests {
         assert_eq!(later, vec![0u32; RATE_BUCKETS]);
     }
 
+    /// 构造一条带客户端画像的记录（含 session_id / client_ip / device）
+    fn rec_client(
+        offset_ms: i64,
+        session: Option<&str>,
+        ip: Option<&str>,
+        device: Option<&str>,
+    ) -> RequestRecord {
+        let mut r = rec(offset_ms, Some(1), "m", RequestOutcome::Success, 1, 1);
+        r.session_id = session.map(|s| s.to_string());
+        r.client_ip = ip.map(|s| s.to_string());
+        r.client_device = device.map(|s| s.to_string());
+        r
+    }
+
+    #[test]
+    fn test_clients_rpm_by_ip_and_sessions() {
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        // 客户端 A(1.1.1.1) 开两个窗口：w1 打 2 条，w2 打 1 条（均在近 60 秒内）
+        s.on_record(&rec_client(0, Some("w1"), Some("1.1.1.1"), Some("claude-code")));
+        s.on_record(&rec_client(1_000, Some("w1"), Some("1.1.1.1"), Some("claude-code")));
+        s.on_record(&rec_client(2_000, Some("w2"), Some("1.1.1.1"), Some("claude-code")));
+        // 客户端 B(2.2.2.2) 一个窗口 1 条
+        s.on_record(&rec_client(0, Some("w3"), Some("2.2.2.2"), Some("claude-code")));
+
+        // now 落在同一 30 秒桶，60 秒 RPM 覆盖以上全部
+        let clients = s.clients_at(BASE_MS + 2_000);
+        assert_eq!(clients.len(), 2, "应聚合出两个客户端");
+
+        // A 排第一（RPM=3），两个活跃窗口
+        let a = &clients[0];
+        assert_eq!(a.client_key, "1.1.1.1");
+        assert_eq!(a.client_ip.as_deref(), Some("1.1.1.1"));
+        assert_eq!(a.rpm, 3);
+        assert_eq!(a.active_sessions, 2);
+        // 窗口按 RPM 降序：w1(2) 在前
+        assert_eq!(a.sessions[0].session_id, "w1");
+        assert_eq!(a.sessions[0].rpm, 2);
+        assert_eq!(a.sessions[1].rpm, 1);
+
+        let b = &clients[1];
+        assert_eq!(b.client_key, "2.2.2.2");
+        assert_eq!(b.rpm, 1);
+        assert_eq!(b.active_sessions, 1);
+    }
+
+    #[test]
+    fn test_cleanup_client_stats_reclaims_stale_entries() {
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        // 两个客户端各开一个窗口
+        s.on_record(&rec_client(0, Some("w1"), Some("1.1.1.1"), Some("claude-code")));
+        s.on_record(&rec_client(0, Some("w2"), Some("2.2.2.2"), Some("claude-code")));
+
+        // 窗口内回收：条目仍活跃，四张 map 都应保留
+        let (sessions, clients) = s.cleanup_client_stats_at(BASE_MS);
+        assert_eq!(sessions, 2, "窗口内 session 不应被回收");
+        assert_eq!(clients, 2, "窗口内 client 不应被回收");
+
+        // 10 分钟后回收：全部过期，四张 map 应清空（这是无查询时也能回收的关键）
+        let (sessions, clients) = s.cleanup_client_stats_at(BASE_MS + 11 * 60 * 1000);
+        assert_eq!(sessions, 0, "过期 session 应被后台回收");
+        assert_eq!(clients, 0, "过期 client 应被后台回收");
+    }
+
+    #[test]
+    fn test_clients_prune_stale_window() {
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        s.on_record(&rec_client(0, Some("old"), Some("9.9.9.9"), Some("claude-code")));
+        // 10 分钟后查询：旧窗口/客户端应被 prune 掉
+        let later = s.clients_at(BASE_MS + 11 * 60 * 1000);
+        assert!(later.is_empty(), "过期窗口应被回收，结果为空");
+    }
+
+    #[test]
+    fn test_clients_ip_fallback_to_device() {
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        // 无 IP，回退用 device 作为分组键
+        s.on_record(&rec_client(0, Some("w1"), None, Some("claude-code")));
+        let clients = s.clients_at(BASE_MS);
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].client_key, "claude-code");
+        assert_eq!(clients[0].client_ip, None);
+        assert_eq!(clients[0].device.as_deref(), Some("claude-code"));
+    }
+
     #[test]
     fn test_jsonl_write_and_rebuild() {
         // 用唯一临时目录，落盘后新建实例重放，聚合应一致
@@ -877,6 +1326,53 @@ mod tests {
         assert!(serde_json::to_string(&s.timeseries_daily_at(BASE_MS, 5)).is_ok());
         assert!(serde_json::to_string(&s.by_model()).is_ok());
         assert!(serde_json::to_string(&s.by_credential()).is_ok());
+        assert!(serde_json::to_string(&s.throughput_at(BASE_MS)).is_ok());
+    }
+
+    #[test]
+    fn test_throughput_ring_basic() {
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        // 同一秒 2 条（各 tokens=15），下一秒 1 条（tokens=3），跨全部凭据聚合
+        s.on_record(&rec(0, Some(1), "m", RequestOutcome::Success, 10, 5));
+        s.on_record(&rec(500, Some(2), "m", RequestOutcome::Success, 10, 5));
+        s.on_record(&rec(1_000, Some(3), "m", RequestOutcome::Success, 2, 1));
+
+        let snap = s.throughput_at(BASE_MS + 1_000);
+        // 桶数固定 60，从旧到新，空秒补 0
+        assert_eq!(snap.recent_buckets.len(), THROUGHPUT_BUCKETS);
+        assert_eq!(snap.window_secs, THROUGHPUT_BUCKETS as u32);
+        // 最新桶（now 秒）：1 条请求，3 tokens
+        let last = snap.recent_buckets.last().unwrap();
+        assert_eq!(last.requests, 1);
+        assert_eq!(last.tokens, 3);
+        assert_eq!(last.ts_ms, BASE_MS + 1_000);
+        // 上一桶：2 条请求，30 tokens
+        let prev = &snap.recent_buckets[THROUGHPUT_BUCKETS - 2];
+        assert_eq!(prev.requests, 2);
+        assert_eq!(prev.tokens, 30);
+        // 窗口内合计：3 请求 / 33 tokens
+        assert_eq!(snap.current_rpm, 3);
+        assert!((snap.current_rps - 3.0 / 60.0).abs() < 1e-9);
+        assert!((snap.current_tokens_per_sec - 33.0 / 60.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_throughput_ring_expiry_and_overwrite() {
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        s.on_record(&rec(0, Some(1), "m", RequestOutcome::Success, 100, 100));
+        // 时间前进到窗口之外（>60 秒），旧数据不再出现
+        let later = s.throughput_at(BASE_MS + 120_000);
+        assert_eq!(later.current_rpm, 0);
+        assert_eq!(later.current_tokens_per_sec, 0.0);
+        assert!(later.recent_buckets.iter().all(|b| b.requests == 0 && b.tokens == 0));
+
+        // 相隔恰好一整圈（60 秒）落入同一桶但 slot 不同 → 清零覆盖，不叠加旧值
+        let ring_span = THROUGHPUT_BUCKETS as i64 * THROUGHPUT_BUCKET_SECS * 1000;
+        s.on_record(&rec(ring_span, Some(1), "m", RequestOutcome::Success, 7, 0));
+        let snap = s.throughput_at(BASE_MS + ring_span);
+        assert_eq!(snap.current_rpm, 1, "只应看到新记录");
+        let last = snap.recent_buckets.last().unwrap();
+        assert_eq!(last.tokens, 7);
     }
 }
 
