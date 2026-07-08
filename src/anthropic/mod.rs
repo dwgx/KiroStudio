@@ -32,4 +32,6 @@ mod stream;
 pub mod types;
 mod websearch;
 
+pub use cache_tracker::cache_stats_snapshot;
+pub use handlers::set_collect_client_fingerprint;
 pub use router::create_router_with_provider;

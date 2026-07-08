@@ -75,10 +75,22 @@ pub fn create_router_with_provider(
             auth_middleware,
         ));
 
+    // 请求体上限：0 = 不限制（dwgx：没必要限制，可显式填 0 完全放开）。
+    // ⚠️ 注意：/v1 与 /cc/v1 的请求体是 **buffered**（JsonExtractor 一次性读入内存），
+    // 不是流式——设 0（disable）等于允许任意大 body 全量入内存，理论上有 OOM 敞口。
+    // 因此默认值保留 256MiB 大软上限（default_max_body_bytes），既远超正常请求（上游
+    // compression 4MiB 就触发、~5MiB 就 400），又挡住恶意超大 body 打死进程。想彻底放开的
+    // 用户可显式把 maxBodyBytes 设为 0。
+    let body_limit_layer = if max_body_bytes == 0 {
+        DefaultBodyLimit::disable()
+    } else {
+        DefaultBodyLimit::max(max_body_bytes)
+    };
+
     Router::new()
         .nest("/v1", v1_routes)
         .nest("/cc/v1", cc_v1_routes)
         .layer(build_cors_layer(cors_allowed_origins))
-        .layer(DefaultBodyLimit::max(max_body_bytes))
+        .layer(body_limit_layer)
         .with_state(state)
 }
