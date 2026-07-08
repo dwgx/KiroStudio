@@ -24,7 +24,10 @@ struct IdcSession {
     oidc_client: OidcClient,
     device_auth: DeviceAuth,
     priority: u32,
+    /// 出站代理（OIDC 请求用；自定义优先，否则继承全局）。
     proxy: Option<ProxyConfig>,
+    /// 上号时**显式填的**代理（仅此项持久化到新凭据；global 回落不持久化）。
+    custom_proxy: Option<ProxyConfig>,
     created_at: Instant,
 }
 
@@ -73,7 +76,17 @@ impl IdcLoginManager {
             }
             p
         });
-        let proxy = proxy_url.map(|u| ProxyConfig::new(&u)).or(global_proxy);
+        // 用户可能把账密内嵌 URL（socks5://user:pass@host:port）——拆出账密独立设置，
+        // 否则 SOCKS5 无法认证。custom_proxy 仅持久化到凭据；OAuth 请求用 effective proxy。
+        let custom_proxy = proxy_url.filter(|u| !u.trim().is_empty()).map(|u| {
+            let (clean, user, pass) = crate::http_client::split_proxy_credentials(&u);
+            let mut p = ProxyConfig::new(clean);
+            if let (Some(user), Some(pass)) = (user, pass) {
+                p = p.with_auth(user, pass);
+            }
+            p
+        });
+        let proxy = custom_proxy.clone().or(global_proxy);
 
         let oidc_client =
             idc::register_client(region, &config, proxy.as_ref()).await?;
@@ -102,6 +115,7 @@ impl IdcLoginManager {
             device_auth,
             priority,
             proxy,
+            custom_proxy,
             created_at: Instant::now(),
         });
 
@@ -165,10 +179,12 @@ impl IdcLoginManager {
                     api_region: None,
                     machine_id: None,
                     email: None,
+                    name: None,
                     subscription_title: None,
-                    proxy_url: None,
-                    proxy_username: None,
-                    proxy_password: None,
+                    // 上号时显式填的代理持久化到该凭据（拆好账密），global 回落不持久化。
+                    proxy_url: session.custom_proxy.as_ref().map(|p| p.url.clone()),
+                    proxy_username: session.custom_proxy.as_ref().and_then(|p| p.username.clone()),
+                    proxy_password: session.custom_proxy.as_ref().and_then(|p| p.password.clone()),
                     disabled: false,
                     kiro_api_key: None,
                     endpoint: None,

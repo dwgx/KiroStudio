@@ -12,6 +12,9 @@ use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 
 use super::error::AdminServiceError;
+use super::external_idp_login::{
+    ExternalIdpLeg1Result, ExternalIdpLeg2Result, ExternalIdpLoginManager, ExternalIdpStartResult,
+};
 use super::idc_login::IdcLoginManager;
 use super::social_login::SocialLoginManager;
 pub use super::social_login::{PollResult, StartResult};
@@ -52,6 +55,95 @@ struct CachedBalance {
     data: BalanceResponse,
 }
 
+/// 限流 insights 中单个凭据的冷却明细（只读快照）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CooldownDetail {
+    /// 冷却原因（中文描述，如"速率限制"）
+    pub reason: String,
+    /// 剩余冷却时间（毫秒）
+    pub remaining_ms: u64,
+    /// 连续触发次数
+    pub trigger_count: u32,
+}
+
+/// 限流 insights 单条（每号一条），零上游只读内存快照。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitInsight {
+    /// 凭据 ID
+    pub id: u64,
+    /// 最近 60 秒滚动窗口内的选号次数（RPM）
+    pub rpm: u32,
+    /// 每凭据 RPM 软上限（0 = 不限制）
+    pub rpm_limit: u32,
+    /// 是否已达软上限（rpm_limit>0 且 rpm>=rpm_limit）
+    pub rpm_saturated: bool,
+    /// 当前在途请求数
+    pub inflight: u32,
+    /// 是否已禁用（禁用号不参与调度，UI 应显示"已禁用"而非"畅通"）
+    pub disabled: bool,
+    /// 冷却明细；未冷却时为 null
+    pub cooldown: Option<CooldownDetail>,
+    /// 近期 429 次数（取自速率限制冷却的连续触发计数，零上游）
+    pub recent429: u32,
+    /// 中文推断文案（如"#54 冷却中（速率限制）剩22s，已触发3次""畅通"）
+    pub insight_text: String,
+}
+
+/// SSE 实时流中单个凭据的轻量快照
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveCred {
+    /// 凭据 ID
+    pub id: u64,
+    /// 最近 60 秒 RPM
+    pub rpm: u32,
+    /// 当前在途请求数
+    pub inflight: u32,
+    /// 是否正在冷却
+    pub cooling_down: bool,
+    /// 冷却剩余毫秒；未冷却时为 null
+    pub cooldown_remaining_ms: Option<u64>,
+}
+
+/// 根据 rpm / 冷却状态推断中文限流文案（纯本地计算，零上游）。
+fn build_insight_text(
+    id: u64,
+    rpm: u32,
+    rpm_limit: u32,
+    saturated: bool,
+    disabled: bool,
+    cooldown: Option<&crate::kiro::cooldown::CooldownInfo>,
+) -> String {
+    use crate::kiro::cooldown::CooldownReason;
+
+    if disabled {
+        return format!("#{id} 已禁用（不参与调度）");
+    }
+
+    if let Some(c) = cooldown {
+        // 向上取整到秒，避免展示"剩 0s"却仍在冷却
+        let secs = c.remaining_ms.div_ceil(1000);
+        if c.reason == CooldownReason::RateLimitExceeded {
+            return format!(
+                "#{id} 冷却中（速率限制）剩{secs}s，已触发{}次",
+                c.trigger_count
+            );
+        }
+        return format!("#{id} 冷却中（{}）剩{secs}s", c.reason.description());
+    }
+
+    if saturated {
+        return format!("#{id} 近60s {rpm}/{rpm_limit} 已达软上限，建议分流");
+    }
+    // 接近软上限（>=80%）也提示，便于提前分流
+    if rpm_limit > 0 && (rpm as u64) * 5 >= (rpm_limit as u64) * 4 {
+        return format!("#{id} 近60s {rpm}/{rpm_limit} 接近软上限，建议分流");
+    }
+    "畅通".to_string()
+}
+
 /// Admin 服务
 ///
 /// 封装所有 Admin API 的业务逻辑
@@ -65,6 +157,8 @@ pub struct AdminService {
     social_login: SocialLoginManager,
     /// IDC 上号会话管理器
     idc_login: IdcLoginManager,
+    /// 外部 IdP（Microsoft）上号会话管理器
+    external_idp_login: ExternalIdpLoginManager,
 }
 
 impl AdminService {
@@ -81,6 +175,7 @@ impl AdminService {
         Self {
             social_login: SocialLoginManager::new(token_manager.clone()),
             idc_login: IdcLoginManager::new(token_manager.clone()),
+            external_idp_login: ExternalIdpLoginManager::new(token_manager.clone()),
             token_manager,
             balance_cache: Mutex::new(balance_cache),
             cache_path,
@@ -128,15 +223,60 @@ impl AdminService {
         self.idc_login.poll(session_id).await
     }
 
+    /// 外部 IdP（Microsoft）上号 · 第 1 步：生成 signin URL。
+    pub fn start_external_idp_login(
+        &self,
+        priority: u32,
+        proxy_url: Option<String>,
+    ) -> Result<ExternalIdpStartResult, AdminServiceError> {
+        self.external_idp_login
+            .start(priority, proxy_url)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))
+    }
+
+    /// 外部 IdP 上号 · 第 2 步：粘回 portal 回调 URL，返回 IdP authorize URL。
+    pub async fn submit_external_idp_leg1(
+        &self,
+        session_id: &str,
+        pasted_url: &str,
+    ) -> Result<ExternalIdpLeg1Result, AdminServiceError> {
+        self.external_idp_login
+            .submit_leg1(session_id, pasted_url)
+            .await
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))
+    }
+
+    /// 外部 IdP 上号 · 第 3 步：粘回授权回调 URL，换 token 入池。
+    pub async fn submit_external_idp_leg2(
+        &self,
+        session_id: &str,
+        pasted_url: &str,
+    ) -> Result<ExternalIdpLeg2Result, AdminServiceError> {
+        self.external_idp_login
+            .submit_leg2(session_id, pasted_url)
+            .await
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))
+    }
+
     /// 获取所有凭据状态
     pub fn get_all_credentials(&self) -> CredentialsStatusResponse {
         let snapshot = self.token_manager.snapshot();
         let default_endpoint = self.token_manager.config().default_endpoint.clone();
 
+        // 当前冷却快照（429/限流感官）：按凭据 id 建表,合并进每张卡的状态。
+        let cooldowns: std::collections::HashMap<u64, crate::kiro::cooldown::CooldownInfo> = self
+            .token_manager
+            .cooldown_snapshot()
+            .into_iter()
+            .map(|c| (c.credential_id, c))
+            .collect();
+
         let mut credentials: Vec<CredentialStatusItem> = snapshot
             .entries
             .into_iter()
-            .map(|entry| CredentialStatusItem {
+            .map(|entry| {
+                let cd = cooldowns.get(&entry.id);
+                CredentialStatusItem {
                 id: entry.id,
                 priority: entry.priority,
                 disabled: entry.disabled,
@@ -159,6 +299,11 @@ impl AdminService {
                 endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
                 inflight: entry.inflight,
                 rpm: entry.rpm,
+                name: entry.name,
+                cooling_down: cd.is_some(),
+                cooldown_remaining_ms: cd.map(|c| c.remaining_ms),
+                cooldown_reason: cd.map(|c| c.reason.description().to_string()),
+                }
             })
             .collect();
 
@@ -171,6 +316,102 @@ impl AdminService {
             current_id: snapshot.current_id,
             credentials,
         }
+    }
+
+    /// 限流 insights（BE-A2）：每号一条只读快照，供前端限流健康抽屉展示。
+    ///
+    /// 数据全部取自内存：token_manager 快照（rpm/inflight）、cooldown 快照（冷却明细/
+    /// 连续触发次数），以及 config 的每凭据 RPM 软上限。**零上游调用**（封号红线）。
+    /// 列表按 rpm 降序、id 升序，方便前端把最热的号排在前面。
+    pub fn ratelimit_insights(&self) -> Vec<RateLimitInsight> {
+        let snapshot = self.token_manager.snapshot();
+        let rpm_limit = self.token_manager.config().credential_rpm_limit;
+
+        // 冷却快照：按 id 建表，合并进每条 insight
+        let cooldowns: std::collections::HashMap<u64, crate::kiro::cooldown::CooldownInfo> = self
+            .token_manager
+            .cooldown_snapshot()
+            .into_iter()
+            .map(|c| (c.credential_id, c))
+            .collect();
+
+        let mut out: Vec<RateLimitInsight> = snapshot
+            .entries
+            .into_iter()
+            .map(|e| {
+                let cd = cooldowns.get(&e.id);
+                // 火力全开判定:配了软上限就按上限;没配上限(credential_rpm_limit=0,线上默认)时,
+                // 用固定高水位 30/min 兜底——否则 rpm_limit=0 会让 saturated 恒 false,火焰永不触发。
+                const SATURATION_FALLBACK_RPM: u32 = 30;
+                let saturated = if rpm_limit > 0 {
+                    e.rpm >= rpm_limit
+                } else {
+                    e.rpm >= SATURATION_FALLBACK_RPM
+                };
+                // recent429：速率限制类冷却的连续触发计数近似"近期 429 次数"（零上游）；
+                // 非速率限制冷却或无冷却则为 0。
+                let recent429 = cd
+                    .filter(|c| {
+                        c.reason == crate::kiro::cooldown::CooldownReason::RateLimitExceeded
+                    })
+                    .map(|c| c.trigger_count)
+                    .unwrap_or(0);
+                let insight_text =
+                    build_insight_text(e.id, e.rpm, rpm_limit, saturated, e.disabled, cd);
+                RateLimitInsight {
+                    id: e.id,
+                    rpm: e.rpm,
+                    rpm_limit,
+                    rpm_saturated: saturated && !e.disabled,
+                    inflight: e.inflight,
+                    disabled: e.disabled,
+                    cooldown: cd.map(|c| CooldownDetail {
+                        reason: c.reason.description().to_string(),
+                        remaining_ms: c.remaining_ms,
+                        trigger_count: c.trigger_count,
+                    }),
+                    recent429,
+                    insight_text,
+                }
+            })
+            .collect();
+
+        out.sort_by(|a, b| b.rpm.cmp(&a.rpm).then(a.id.cmp(&b.id)));
+        out
+    }
+
+    /// SSE 实时流的一帧轻量快照（BE-A2）：全局 inflight/rpm + 每号精简状态。
+    ///
+    /// 只读内存零上游。吞吐部分由 SSE handler 侧从 usage_stats 补充（此处只出凭据维度）。
+    pub fn live_creds(&self) -> (u32, u32, Vec<LiveCred>) {
+        let snapshot = self.token_manager.snapshot();
+        let cooldowns: std::collections::HashMap<u64, crate::kiro::cooldown::CooldownInfo> = self
+            .token_manager
+            .cooldown_snapshot()
+            .into_iter()
+            .map(|c| (c.credential_id, c))
+            .collect();
+
+        let mut global_inflight: u32 = 0;
+        let mut global_rpm: u32 = 0;
+        let creds: Vec<LiveCred> = snapshot
+            .entries
+            .into_iter()
+            .map(|e| {
+                global_inflight = global_inflight.saturating_add(e.inflight);
+                global_rpm = global_rpm.saturating_add(e.rpm);
+                let cd = cooldowns.get(&e.id);
+                LiveCred {
+                    id: e.id,
+                    rpm: e.rpm,
+                    inflight: e.inflight,
+                    cooling_down: cd.is_some(),
+                    cooldown_remaining_ms: cd.map(|c| c.remaining_ms),
+                }
+            })
+            .collect();
+
+        (global_inflight, global_rpm, creds)
     }
 
     /// 设置凭据禁用状态
@@ -195,6 +436,34 @@ impl AdminService {
         self.token_manager
             .set_priority(id, priority)
             .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 设置凭据自定义别名/备注（传 None 或空清除）
+    pub fn set_credential_name(
+        &self,
+        id: u64,
+        name: Option<String>,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_credential_name(id, name)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    pub fn set_credential_proxy(
+        &self,
+        id: u64,
+        proxy_url: Option<String>,
+        proxy_username: Option<String>,
+        proxy_password: Option<String>,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_credential_proxy(id, proxy_url, proxy_username, proxy_password)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 批量清空回收站（ids 为空清空全部）。返回成功清除数。
+    pub fn purge_trash_batch(&self, ids: Option<Vec<u64>>) -> usize {
+        self.token_manager.purge_trash_batch(ids)
     }
 
     /// 重置失败计数并重新启用
@@ -305,7 +574,7 @@ impl AdminService {
 
     /// 批量读取【已缓存】的凭据余额快照（A10）
     ///
-    /// 严守封号红线：只读 balance_cache，绝不触发任何上游 getUsageLimits 调用。
+    /// 为降低账号被上游限流的风险：只读 balance_cache，绝不触发任何上游 getUsageLimits 调用。
     ///
     /// 修复：返回最近 7 天内的最后已知值（不再用 5 分钟新鲜度阈值过滤）。
     /// 后台温和刷新间隔为 30 分钟，若这里仍按 5 分钟丢弃，前端每 30 分钟只有 5 分钟
@@ -339,7 +608,7 @@ impl AdminService {
 
     /// 温和地周期性刷新所有【未禁用】凭据的余额缓存（A6）
     ///
-    /// 严守封号红线：
+    /// 为降低账号被上游限流的风险：
     /// - 逐个刷新，每个之间 sleep `spacing_secs` 秒，绝不并发一次性打所有号。
     /// - 只刷未禁用的号。
     /// - 仅更新缓存供展示，绝不因 remaining 低就自动禁用凭据（不做主动禁用）。
@@ -412,6 +681,26 @@ impl AdminService {
             }
         }
 
+        // 代理输入规整：URL 里可能内嵌账密（socks5://user:pass@host:port）——拆出干净 URL 与账密，
+        // 独立账密字段优先，缺省时回退 URL 内嵌值。避免密码明文留 URL + 保证 SOCKS5 能认证。
+        let (proxy_url, proxy_username, proxy_password) = match req
+            .proxy_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(raw) => {
+                let (clean, inline_user, inline_pass) =
+                    crate::http_client::split_proxy_credentials(raw);
+                (
+                    Some(clean),
+                    req.proxy_username.clone().filter(|s| !s.is_empty()).or(inline_user),
+                    req.proxy_password.clone().filter(|s| !s.is_empty()).or(inline_pass),
+                )
+            }
+            None => (None, None, None),
+        };
+
         // 构建凭据对象
         let email = req.email.clone();
         let new_cred = KiroCredentials {
@@ -432,10 +721,11 @@ impl AdminService {
             api_region: req.api_region,
             machine_id: req.machine_id,
             email: req.email,
+            name: req.name,
             subscription_title: None, // 将在首次获取使用额度时自动更新
-            proxy_url: req.proxy_url,
-            proxy_username: req.proxy_username,
-            proxy_password: req.proxy_password,
+            proxy_url,
+            proxy_username,
+            proxy_password,
             disabled: false, // 新添加的凭据默认启用
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
@@ -592,6 +882,7 @@ impl AdminService {
             token_refresh_interval_secs: config.token_refresh_interval_secs,
             login_background_enabled: config.login_background_enabled,
             balance_refresh_interval_secs: config.balance_refresh_interval_secs,
+            collect_client_fingerprint: config.collect_client_fingerprint,
             config_path: config
                 .config_path()
                 .map(|p| p.display().to_string()),
@@ -775,6 +1066,21 @@ impl AdminService {
                 restart_fields.push("proxyUrl".into());
             }
         }
+        // 代理账密：前端出于安全不回显已存值,只在非空时更新;显式传空串表示清除。
+        if let Some(v) = req.proxy_username {
+            let new_val = if v.trim().is_empty() { None } else { Some(v.trim().to_string()) };
+            if new_val != config.proxy_username {
+                config.proxy_username = new_val;
+                restart_fields.push("proxyUsername".into());
+            }
+        }
+        if let Some(v) = req.proxy_password {
+            let new_val = if v.is_empty() { None } else { Some(v) };
+            if new_val != config.proxy_password {
+                config.proxy_password = new_val;
+                restart_fields.push("proxyPassword".into());
+            }
+        }
         if let Some(v) = req.callback_base_url {
             let trimmed = v.trim();
             let new_val = if trimmed.is_empty() {
@@ -871,6 +1177,16 @@ impl AdminService {
             }
         }
 
+        // —— 立即生效的字段：指纹采集开关（隐私）——
+        // 关闭后热路径不再解析 device/ip/os/browser，用量记录留空；无需重启。
+        let mut fingerprint_changed: Option<bool> = None;
+        if let Some(v) = req.collect_client_fingerprint {
+            if v != config.collect_client_fingerprint {
+                config.collect_client_fingerprint = v;
+                fingerprint_changed = Some(v);
+            }
+        }
+
         // —— 立即生效的字段：负载均衡模式 ——
         let mut lb_changed = false;
         if let Some(mode) = req.load_balancing_mode {
@@ -900,13 +1216,19 @@ impl AdminService {
             crate::admin_ui::set_login_background_enabled(v);
         }
 
+        // 指纹采集开关立即应用到热路径运行时镜像（下一个请求即生效）
+        if let Some(v) = fingerprint_changed {
+            crate::anthropic::set_collect_client_fingerprint(v);
+        }
+
+        let immediate_changed = lb_changed || login_bg_changed.is_some() || fingerprint_changed.is_some();
         let restart_required = !restart_fields.is_empty();
         let message = if restart_required {
             format!(
                 "已保存。{} 个字段需重启服务后生效。",
                 restart_fields.len()
             )
-        } else if lb_changed {
+        } else if immediate_changed {
             "已保存并立即生效。".to_string()
         } else {
             "无改动。".to_string()
@@ -952,36 +1274,27 @@ impl AdminService {
             .ok_or(AdminServiceError::NotFound { id })
     }
 
-    /// 一键重启本服务（detached，spawn 后立即返回，实际重启延迟约 1 秒）。
+    /// 一键重启本服务（spawn 后立即返回，实际退出延迟约 1 秒，systemd 3s 内自动拉起）。
     ///
-    /// 通过 `systemd-run` 在**独立瞬态单元**里执行 `systemctl restart kirostudio`：
-    /// - systemd-run 使重启命令脱离本服务自身的 cgroup。否则 `systemctl restart`
-    ///   停止旧实例时会按 control-group KillMode 把正在执行重启的命令一起杀掉，
-    ///   导致重启半途夭折。放进独立瞬态单元后重启命令不受影响。
-    /// - `--no-block` 立即返回不阻塞；`sleep 1` 给 HTTP 200 响应留出 flush 时间
-    ///   （重启会杀掉本进程，响应必须先发出去）。
-    /// - 命令全部为**静态字面量**，不拼接任何用户输入，杜绝命令注入。
-    /// - 依赖服务账户具备免密 sudo（部署铁律已配置）；`sudo -n` 非交互，缺权限即失败。
-    ///
-    /// spawn 本身是瞬时同步操作，其成功/失败可在响应前如实返回；真正的 restart
-    /// 在 detached 子进程里 1 秒后才发生。
+    /// **实现方式：优雅自退，让 systemd 自动重启——不需要任何提权。**
+    /// 根因（2026-07-08 定位）：systemd unit 设了 `NoNewPrivileges=true`，它会**永久禁止**
+    /// 本进程及其子进程通过 setuid 提权，于是旧实现的 `sudo -n systemd-run ...` 静默失败
+    /// （后台收到请求、打了日志，但 sudo 无法提权 → 什么都没发生 = "点了没反应"）。
+    /// 由于 unit 配了 `Restart=always` + `RestartSec=3`，进程**只要退出**（任意退出码），
+    /// systemd 就会在 3 秒内自动重新拉起。因此这里改为：延迟 1 秒（给 HTTP 200 flush 时间）
+    /// 后 `std::process::exit(0)`，完全绕开 sudo/NoNewPrivileges，稳定可靠。
+    /// 若将来 unit 去掉 Restart=always，此法失效——但当前部署（见 kirostudio.service）已配置。
     pub fn restart_service(&self) -> Result<(), AdminServiceError> {
-        // sh -c 串起 sleep + systemd-run；child 句柄丢弃后进程继续运行
-        //（tokio kill_on_drop 默认 false，不会因 drop 而被杀）。
-        let script = "sleep 1 && sudo -n systemd-run --no-block --collect \
-                      systemctl restart kirostudio";
-        tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(script)
-            .spawn()
-            .map(|_child| {
-                tracing::warn!(
-                    "收到一键重启请求，约 1 秒后执行 systemctl restart kirostudio（本进程将被替换）"
-                );
-            })
-            .map_err(|e| {
-                AdminServiceError::InternalError(format!("发起服务重启失败: {}", e))
-            })
+        tracing::warn!(
+            "收到一键重启请求，约 1 秒后进程自退，由 systemd（Restart=always）在 3 秒内自动拉起"
+        );
+        // detached 异步任务：睡 1 秒让本次 HTTP 200 响应先 flush 给前端，再退出触发 systemd 重启。
+        tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            tracing::warn!("一键重启：进程即将退出，交由 systemd 自动拉起");
+            std::process::exit(0);
+        });
+        Ok(())
     }
 
     // ============ 存储统计 / 清理（运维）============
@@ -1170,7 +1483,11 @@ impl AdminService {
                 note: Some("用量统计未启用，跳过".to_string()),
             };
         };
-        let keep_days = older_than_days.unwrap_or(self.token_manager.config().usage_retention_days);
+        // older_than_days 为负会让 retention_cleanup 的 cutoff 落到未来 → 删光全部明细。
+        // 与 usage_jsonl/trash 分支口径一致，下限钳到 0（0=删早于此刻的全部历史，非负安全）。
+        let keep_days = older_than_days
+            .unwrap_or(self.token_manager.config().usage_retention_days)
+            .max(0);
         match db.retention_cleanup(keep_days) {
             Ok(n) => StorageCleanupItem {
                 key: "traces".to_string(),
@@ -1405,6 +1722,73 @@ impl AdminService {
         } else {
             AdminServiceError::InternalError(msg)
         }
+    }
+}
+
+#[cfg(test)]
+mod insight_text_tests {
+    use super::*;
+    use crate::kiro::cooldown::{CooldownInfo, CooldownReason};
+
+    /// 无冷却 + 未饱和 → "畅通"
+    #[test]
+    fn insight_clear() {
+        assert_eq!(build_insight_text(1, 3, 50, false, false, None), "畅通");
+    }
+
+    /// 速率限制冷却中：含"冷却中（速率限制）剩Ns，已触发K次"，剩余毫秒向上取整到秒
+    #[test]
+    fn insight_rate_limit_cooldown() {
+        let cd = CooldownInfo {
+            credential_id: 54,
+            reason: CooldownReason::RateLimitExceeded,
+            started_at_ms: 0,
+            remaining_ms: 21_500, // 向上取整应为 22s
+            trigger_count: 3,
+        };
+        let text = build_insight_text(54, 40, 50, false, false, Some(&cd));
+        assert_eq!(text, "#54 冷却中（速率限制）剩22s，已触发3次");
+    }
+
+    /// 非速率限制冷却：走通用分支（不带触发次数）
+    #[test]
+    fn insight_other_cooldown() {
+        let cd = CooldownInfo {
+            credential_id: 7,
+            reason: CooldownReason::ServerError,
+            started_at_ms: 0,
+            remaining_ms: 5_000,
+            trigger_count: 1,
+        };
+        let text = build_insight_text(7, 0, 50, false, false, Some(&cd));
+        assert_eq!(text, "#7 冷却中（服务器错误）剩5s");
+    }
+
+    /// 已达软上限 → "已达软上限，建议分流"
+    #[test]
+    fn insight_saturated() {
+        let text = build_insight_text(54, 50, 50, true, false, None);
+        assert_eq!(text, "#54 近60s 50/50 已达软上限，建议分流");
+    }
+
+    /// 接近软上限（>=80%）但未饱和 → "接近软上限，建议分流"
+    #[test]
+    fn insight_near_saturation() {
+        // 40/50 = 80%
+        let text = build_insight_text(54, 40, 50, false, false, None);
+        assert_eq!(text, "#54 近60s 40/50 接近软上限，建议分流");
+    }
+
+    /// rpm_limit=0（不限制）时永不判为接近上限，恒"畅通"
+    #[test]
+    fn insight_no_limit_always_clear() {
+        assert_eq!(build_insight_text(9, 999, 0, false, false, None), "畅通");
+    }
+
+    /// 已禁用号:显示"已禁用"而非"畅通"(即便有 RPM/未冷却)
+    #[test]
+    fn insight_disabled() {
+        assert_eq!(build_insight_text(54, 0, 50, false, true, None), "#54 已禁用（不参与调度）");
     }
 }
 
