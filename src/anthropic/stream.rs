@@ -285,6 +285,22 @@ impl SseEvent {
             serde_json::to_string(&self.data).unwrap_or_default()
         )
     }
+
+    /// 构造 Anthropic 规范的 SSE `error` 事件。
+    ///
+    /// 上游流中途失败(读流 Err)时用它显式告知客户端"本次响应未正常完成"，
+    /// 而非把截断的输出当作 message_stop 正常收尾——后者会让 Claude Code 把半截结果当成功，
+    /// 不触发重试。发了 error 事件，客户端(Claude Code)才会按 overloaded/api_error 退避重试。
+    /// 形如 `{"type":"error","error":{"type":"overloaded_error","message":"..."}}`。
+    pub fn error_event(error_type: &str, message: impl Into<String>) -> Self {
+        Self::new(
+            "error",
+            serde_json::json!({
+                "type": "error",
+                "error": { "type": error_type, "message": message.into() },
+            }),
+        )
+    }
 }
 
 /// 内容块状态
@@ -571,6 +587,10 @@ pub struct ResolvedUsage {
     pub output_tokens: i32,
     /// 上游返回的真实 credit 消耗量（无 meteringEvent 时为 None）
     pub credits_used: Option<f64>,
+    /// 本次命中缓存读取的 tokens（无缓存记账时为 0）
+    pub cache_read_tokens: i32,
+    /// 本次新建缓存写入的 tokens（无缓存记账时为 0）
+    pub cache_creation_tokens: i32,
 }
 
 pub struct StreamContext {
@@ -789,6 +809,11 @@ impl StreamContext {
             input_tokens: self.context_input_tokens.unwrap_or(self.input_tokens),
             output_tokens: self.output_tokens,
             credits_used: self.credits_used,
+            cache_read_tokens: self.cache_usage.map(|c| c.cache_read_input_tokens).unwrap_or(0),
+            cache_creation_tokens: self
+                .cache_usage
+                .map(|c| c.cache_creation_input_tokens)
+                .unwrap_or(0),
         }
     }
 

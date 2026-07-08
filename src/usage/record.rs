@@ -70,6 +70,14 @@ pub struct RequestRecord {
     pub input_tokens: i32,
     /// 输出 tokens
     pub output_tokens: i32,
+    /// 本次命中缓存读取的 tokens（cache_read_input_tokens；无缓存记账时为 0）。
+    /// serde default，兼容早于本字段的历史 JSONL（缺字段视为 0）。
+    #[serde(default)]
+    pub cache_read_tokens: i32,
+    /// 本次新建缓存写入的 tokens（cache_creation_input_tokens；无缓存记账时为 0）。
+    /// serde default，兼容早于本字段的历史 JSONL（缺字段视为 0）。
+    #[serde(default)]
+    pub cache_creation_tokens: i32,
     /// 上游返回的真实 credit 消耗量（无 meteringEvent 时为 None）
     pub credits_used: Option<f64>,
     /// 端到端延迟（毫秒）
@@ -105,6 +113,8 @@ impl RequestRecord {
             is_streaming: false,
             input_tokens: 0,
             output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
             credits_used: None,
             latency_ms: 0,
             first_token_ms: None,
