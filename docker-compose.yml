@@ -1,3 +1,17 @@
+# ============================================================================
+# KiroStudio Docker Compose
+#
+# 快速开始：
+#   1. cp .env.example .env       # 复制环境变量模板
+#   2. 编辑 .env 改端口（可选）
+#   3. 准备 config/config.json 与 config/credentials.json（见 config.example.json）
+#      或直接运行 ./install.sh 自动生成
+#   4. docker compose up -d --build
+#
+# 说明：
+#   - 宿主端口由 .env 的 KIROSTUDIO_PORT 控制（默认 8990），容器内固定 8990。
+#   - config 目录挂载到宿主 ./config，配置与凭据持久化、可热更新。
+# ============================================================================
 services:
   kirostudio:
     build:
@@ -5,10 +19,19 @@ services:
       dockerfile: Dockerfile
     image: kirostudio:latest
     container_name: kirostudio
+    # 允许容器内访问宿主机服务（如本机代理），Linux 上映射 host-gateway
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
-      - "8991:8990"
+      # 宿主端口:容器端口。改宿主端口只需在 .env 里设 KIROSTUDIO_PORT
+      - "${KIROSTUDIO_PORT:-8990}:8990"
     volumes:
-      - ./config/:/app/config/
+      # 配置与凭据持久化目录（config.json / credentials.json / 用量数据）
+      - ./config:/app/config
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8990/admin"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
