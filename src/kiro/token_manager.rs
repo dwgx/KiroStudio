@@ -469,6 +469,10 @@ async fn refresh_idc_token(
     Ok(new_credentials)
 }
 
+/// BuilderId / IdC 账号无自带 profileArn 时的默认回退值（与 Kiro IDE 一致）。
+pub(crate) const DEFAULT_BUILDER_ID_PROFILE_ARN: &str =
+    "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
+
 /// 获取使用额度信息
 pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
@@ -478,24 +482,38 @@ pub(crate) async fn get_usage_limits(
 ) -> anyhow::Result<UsageLimitsResponse> {
     tracing::debug!("正在获取使用额度信息...");
 
-    // 优先级：凭据.api_region > config.api_region > config.region
-    let region = credentials.effective_api_region(config);
-    let host = format!("q.{}.amazonaws.com", region);
+    // Region 优先级（与 Kiro IDE 一致）：profileArn 第 4 段 > 凭据 region/auth_region > config。
+    let region = credentials
+        .profile_arn
+        .as_deref()
+        .and_then(|arn| arn.split(':').nth(3))
+        .filter(|r| !r.is_empty())
+        .or(credentials.region.as_deref())
+        .or(credentials.auth_region.as_deref())
+        .unwrap_or_else(|| credentials.effective_api_region(config));
+    // Kiro management API（已迁移，旧 q.{region}.amazonaws.com 停用）
+    let host = format!("management.{}.kiro.dev", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     let kiro_version = &config.kiro_version;
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
-    // 构建 URL
+    // 构建 URL（含 isEmailRequired=true，与 Kiro IDE 一致）
     let mut url = format!(
-        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
+        "https://{}/getUsageLimits?isEmailRequired=true&origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
         host
     );
 
-    // profileArn 是可选的
-    if let Some(profile_arn) = &credentials.profile_arn {
-        url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
-    }
+    // profileArn：有值就用，没有则回退到默认 BuilderId profileArn（与 Kiro IDE 一致）。
+    let effective_profile_arn = credentials
+        .profile_arn
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(DEFAULT_BUILDER_ID_PROFILE_ARN);
+    url.push_str(&format!(
+        "&profileArn={}",
+        urlencoding::encode(effective_profile_arn)
+    ));
 
     // 构建 User-Agent headers
     let user_agent = format!(
