@@ -1,0 +1,16 @@
+# 构建上下文瘦身：避免把宿主产物 / 密钥 / 依赖塞进镜像层
+# Rust 构建产物
+/target
+# 前端依赖与构建产物（镜像内会重新安装与构建）
+admin-ui/node_modules
+admin-ui/dist
+# 本地运行时数据与私密文件（严禁进镜像）
+/config
+/data
+config.json
+credentials.json
+.env
+# 版本控制与杂项
+.git
+.gitignore
+*.log

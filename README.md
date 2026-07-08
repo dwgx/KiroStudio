@@ -1,119 +1,281 @@
+<div align="center">
+
 # KiroStudio
 
-Rust/Axum 写的 LLM 网关，把 Anthropic Messages 协议翻译到 Kiro / AWS Q。前端 admin-ui（React）在编译期用 rust-embed 直接嵌进二进制，所以最终产物是**单个可执行文件**，不依赖外部静态资源目录。
+**高性能 Anthropic 协议网关 —— 把 Anthropic Messages 请求转发到 Kiro / AWS Q，并附带一套现代化管理面板。**
 
-## 目录
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-2024-orange.svg)](https://www.rust-lang.org/)
+[![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)](#从源码构建)
 
-- [本地开发](#本地开发)
-- [部署](#部署)
-  - [1. 发布出包](#1-发布出包)
-  - [2. 服务器一键部署](#2-服务器一键部署)
-  - [3. 谨慎部署（可选）](#3-谨慎部署可选)
-  - [4. 回滚](#4-回滚)
-  - [5. 配置](#5-配置)
+</div>
 
-## 本地开发
+---
 
-后端（会读 `config/config.json` 与 `config/credentials.json`，也可用 `-c` / `--credentials` 指定）：
+KiroStudio 用 Rust / Axum 编写，接收标准 **Anthropic Messages API** 请求，转换后转发到 **Kiro / AWS Q** 上游，并把上游响应翻译回 Anthropic 格式。任何兼容 Anthropic 协议的客户端（Claude Code、各类 SDK、自研应用）都可以把 `base_url` 指向本网关直接使用。
+
+前端管理面板（React + Vite）在编译期通过 `rust-embed` 嵌入二进制，**最终产物是单个可执行文件**，不依赖任何外部静态资源目录，拷贝即可运行。
+
+## 致谢
+
+本项目基于 [**hank9999/kiro.rs**](https://github.com/hank9999/kiro.rs)（MIT License）深度魔改与增强，在原项目「Anthropic ↔ Kiro 协议转换」核心之上做了大量工程化扩展。感谢原作者 [hank9999](https://github.com/hank9999) 打下的基础。
+
+相较原项目，主要增强点：
+
+- **多凭据智能调度** —— 负载均衡、故障转移、失败冷却、会话亲和、RPM 软限流
+- **入口安全层** —— API Key 鉴权、CORS 白名单、IP 白名单（CIDR）、每-IP 限流、请求体大小限制
+- **SSRF 防护** —— 出站地址校验，拦截指向内网/回环的请求
+- **输入压缩管道** —— 请求体接近上游硬限制时自动压缩（空白折叠 + 超长 tool_result 智能截断）
+- **多种上号方式** —— Social / IAM Identity Center (IdC) / External IdP，面板内网页上号
+- **实时用量统计** —— 请求埋点、SQLite 落盘、按模型/凭据/客户端聚合、设备识别
+- **现代化管理面板** —— 概览、凭据管理、用量分析、系统设置
+- **一键部署** —— Docker Compose、预编译静态二进制、systemd 服务脚本
+
+## 特性
+
+| 能力 | 说明 |
+| --- | --- |
+| 协议转换 | Anthropic Messages `POST /v1/messages` ↔ Kiro / AWS Q，支持流式与非流式、工具调用、thinking 块、图片输入 |
+| 多账号调度 | 多凭据负载均衡（priority / balanced 两种模式）、故障自动转移、失败冷却、会话亲和 |
+| 管理面板 | React 面板内置于二进制：概览、凭据管理、用量分析、系统设置 |
+| 网页上号 | 面板内完成 Social / IdC / External IdP 授权，凭据自动落库 |
+| 用量统计 | 请求级埋点，按模型 / 凭据 / 客户端聚合，客户端设备识别，SQLite 落盘可保留 N 天 |
+| 入口安全 | API Key 鉴权、CORS 白名单、IP 白名单、每-IP 限流、请求体大小限制、凭据日志脱敏 |
+| 部署简单 | 单二进制、Docker 一键起、GitHub Release 预编译产物、systemd 脚本 |
+
+## 快速开始
+
+推荐用 Docker，无需本地 Rust / Node 环境。
+
+### Docker（推荐）
 
 ```bash
-cargo run                                   # 用默认配置路径
-cargo run -- -c config/config.json --credentials config/credentials.json
-cargo test                                  # 跑测试
+git clone https://github.com/dwgx/KiroStudio.git
+cd KiroStudio
+
+# 准备配置：复制示例并改成你自己的 key
+mkdir -p config
+cp config.docker.example.json config/config.json
+cp credentials.example.social.json config/credentials.json   # 按你的上号方式选择示例
+
+# 起服务
+docker compose up -d
 ```
 
-前端在 `admin-ui/`，开发时单独热更，改完 `pnpm build` 产物才会被 rust-embed 嵌入：
+默认映射到宿主机 **8991** 端口（容器内 8990，见 `docker-compose.yml`）。启动后访问 `http://localhost:8991/admin` 打开管理面板。
+
+### 预编译二进制（GitHub Release）
+
+从 [Releases](https://github.com/dwgx/KiroStudio/releases) 下载对应平台的静态二进制（Linux x86_64 为 `kirostudio-linux-x86_64`，纯 rustls、静态链接、无运行时依赖）：
 
 ```bash
+# 下载并校验
+curl -LO https://github.com/dwgx/KiroStudio/releases/latest/download/kirostudio-linux-x86_64
+curl -LO https://github.com/dwgx/KiroStudio/releases/latest/download/kirostudio-linux-x86_64.sha256
+sha256sum -c kirostudio-linux-x86_64.sha256
+chmod +x kirostudio-linux-x86_64
+
+# 准备配置后运行
+./kirostudio-linux-x86_64 -c config/config.json --credentials config/credentials.json
+```
+
+### 从源码构建
+
+需要 Rust（2024 edition）、Node 20+、pnpm 9+。前端必须先构建产出 `admin-ui/dist`，`rust-embed` 才能在编译期嵌入：
+
+```bash
+# 1. 构建前端
 cd admin-ui
-pnpm install
-pnpm dev                                     # 本地热更，代理到后端
-pnpm build                                   # 出 dist/，供 cargo build 嵌入
+pnpm install --frozen-lockfile
+pnpm build
+cd ..
+
+# 2. 构建后端（纯 rustls 发布构建）
+cargo build --release --no-default-features
+
+# 3. 运行
+./target/release/kirostudio -c config/config.json --credentials config/credentials.json
 ```
 
-## 部署
+## 配置
 
-架构上是单二进制，部署就是「换文件 + 重启 systemd」。生产跑在服务器上的 `kirostudio.service`（`Restart=always`，开机自启），主端口 **8990**。
-
-> ⚠️ 8990 是 Claude Code 自己走的网关，是命脉。换二进制会有几秒中断，改核心逻辑或不放心时走[谨慎部署](#3-谨慎部署可选)。
-
-### 1. 发布出包
-
-打 tag 推上去，GitHub Actions 自动编译 musl 静态二进制并发到 Releases：
+KiroStudio 读取两份文件：`config.json`（服务与安全配置）和 `credentials.json`（上游登录凭据）。默认在工作目录下查找，也可用命令行参数指定：
 
 ```bash
-git tag v0.2.0
-git push --tags
+kirostudio -c <config.json 路径> --credentials <credentials.json 路径>
 ```
 
-产物：`kirostudio-linux-x86_64`（纯 rustls、静态链接，`cargo build --release --no-default-features` + 前端 `pnpm build` 嵌入）。
+### config.json
 
-### 2. 服务器一键部署
-
-首次装 systemd unit（只跑一次）：
-
-```bash
-bash deploy/install-service.sh
-```
-
-之后每次升级，只需在服务器上：
-
-```bash
-bash deploy/deploy.sh          # 拉最新 release → 替换二进制 → 重启 → 健康检查 → 失败自动回滚
-```
-
-`deploy.sh` 会先备份当前二进制为 `.bak`，替换后做健康检查（`/v1/models`、`/admin`、admin API），任一步失败自动 `cp` 回备份并重启，保证服务不断。
-
-### 3. 谨慎部署（可选）
-
-改了核心链路、上线前想加一道保险时用两阶段蓝绿。新二进制先放到服务器 `/tmp/kirostudio-new`，然后：
-
-```bash
-bash deploy/bluegreen.sh verify     # 阶段1：临时端口 8995 起新实例做健康检查，完全不碰 8990
-bash deploy/bluegreen.sh promote    # 阶段2：确认无误后才备份→停→替换→起主服务
-```
-
-`verify` 用主服务 config 的副本（改端口 + 只读一份 credentials 副本，避免与主服务争写），跑一轮健康探针并确认进程无 panic；只有你亲眼确认通过，才手动 `promote`。
-
-### 4. 回滚
-
-- **自动**：`deploy.sh` 部署失败会自动回滚到 `.bak` 备份并重启，无需干预。
-- **手动**：
-
-```bash
-sudo cp /tmp/kirostudio.bak.<时间戳> /home/dwgx_user/KiroStudio/kirostudio
-sudo systemctl restart kirostudio
-sudo systemctl is-active kirostudio      # 确认已恢复
-```
-
-`promote` 失败时会直接把可用的回滚命令打印在终端，照抄即可。
-
-### 5. 配置
-
-两份文件放在服务器 `/home/dwgx_user/KiroStudio/config/`（本地开发放 `config/`），仓库里有 `config.example.json` 和 `credentials.example.*.json` 可参考。
-
-`config/config.json`：
+最小可用配置：
 
 ```json
 {
   "host": "127.0.0.1",
   "port": 8990,
-  "apiKey": "<客户端调用网关用的 key>",
-  "adminApiKey": "<admin 后台/接口用的 key>",
+  "apiKey": "sk-换成你自己的强随机-客户端密钥",
+  "adminApiKey": "sk-换成你自己的强随机-管理密钥",
   "tlsBackend": "rustls",
   "region": "us-east-1",
   "defaultEndpoint": "ide"
 }
 ```
 
-- `apiKey`：外部客户端（含 Claude Code）调 `/v1/*` 时带的 key。
-- `adminApiKey`：admin-ui 与 `/api/admin/*` 用的 key，务必与 `apiKey` 不同。
-- `tlsBackend` 固定 `rustls`（对应发布二进制的 `--no-default-features` 纯 rustls 构建）。
-- 密钥请用你自己的真实值，别提交进仓库。
+常用字段：
 
-`config/credentials.json`：Kiro/AWS Q 的登录凭据（IdC / social / api_key 多种格式，见 `credentials.example.*.json`）。含刷新令牌，**权限必须 600**：
+| 字段 | 默认 | 说明 |
+| --- | --- | --- |
+| `host` | `127.0.0.1` | 监听地址。Docker/对外暴露时设 `0.0.0.0` |
+| `port` | `8080` | 监听端口。**自定义端口改这里** |
+| `apiKey` | 无（必填） | 客户端调用 `/v1/*` 时携带的密钥。为空会拒绝启动，避免无鉴权 |
+| `adminApiKey` | 无 | 管理面板 / `/api/admin/*` 的密钥，**务必与 `apiKey` 不同** |
+| `region` | `us-east-1` | 上游区域，可用 `authRegion` / `apiRegion` 分别覆盖 |
+| `tlsBackend` | `rustls` | TLS 后端，发布二进制固定 `rustls` |
+| `defaultEndpoint` | `ide` | 凭据未显式指定 endpoint 时使用的默认端点 |
+| `loadBalancingMode` | `priority` | 多凭据调度模式：`priority`（按优先级）或 `balanced`（均衡） |
+| `proxyUrl` | 无 | 出站代理，支持 `http://` / `https://` / `socks5://` |
+
+安全相关（对外部署建议开启）：
+
+| 字段 | 默认 | 说明 |
+| --- | --- | --- |
+| `corsAllowedOrigins` | `[]`（任意） | CORS 允许来源列表，非空时仅回显命中的 Origin |
+| `ipAllowlist` | `[]`（不限） | 入口 IP 白名单，支持 IPv4/IPv6 CIDR，如 `["10.0.0.0/8"]` |
+| `trustForwardedHeader` | `false` | 是否信任 `X-Forwarded-For`，**仅在可信反代之后才可开** |
+| `ingressRateLimitPerMin` | `0`（不限） | 每-IP 每分钟最大请求数，超限返回 429 |
+| `maxBodyBytes` | `52428800`（50 MiB） | 请求体最大字节数 |
+
+调度与用量：
+
+| 字段 | 默认 | 说明 |
+| --- | --- | --- |
+| `cooldownEnabled` | `true` | 凭据出错后短暂跳过（失败冷却） |
+| `affinityEnabled` | `true` | 会话亲和，同一会话尽量复用同一凭据（balanced 下生效） |
+| `credentialRpmLimit` | `0`（不限） | 每凭据 RPM 软上限，达到后降权而非硬跳过 |
+| `usageEnabled` | `true` | 用量统计埋点与落盘 |
+| `usageDataDir` | `data/usage` | 用量数据目录 |
+| `usageRetentionDays` | `30` | 用量明细保留天数 |
+
+> 完整字段与默认值以 `src/model/config.rs` 为准；未列出的字段均有安全的内置默认值。
+
+### credentials.json
+
+上游登录凭据，支持单对象或数组（多凭据）两种格式。凭据含刷新令牌，**权限务必收紧为 600**：
 
 ```bash
-chmod 600 /home/dwgx_user/KiroStudio/config/credentials.json
+chmod 600 config/credentials.json
 ```
+
+仓库提供多份示例，按你的上号方式选用：
+
+- `credentials.example.social.json` —— Social 登录
+- `credentials.example.idc.json` —— IAM Identity Center (IdC)
+- `credentials.example.apikey.json` —— Kiro API Key
+- `credentials.example.multiple.json` —— 多凭据数组（含 `priority` / `disabled` / `endpoint`）
+
+也可以不手写凭据文件，直接在管理面板里[网页上号](#上号)。
+
+## 使用引导
+
+### 打开管理面板
+
+浏览器访问 `http://<host>:<port>/admin`，用 `adminApiKey` 登录。面板包含四个主要区域：
+
+- **概览** —— 服务状态、凭据健康、实时请求速率与用量总览
+- **凭据** —— 查看/添加/禁用/删除凭据、优先级、余额、故障计数、导出
+- **用量** —— 按时间、模型、凭据、客户端维度的用量分析与设备识别
+- **设置** —— 在线调整服务配置
+
+### 上号
+
+进入「凭据」页，点击添加凭据，选择上号方式：
+
+- **Social** —— 走浏览器 OAuth 授权，面板轮询完成后自动落库
+- **IdC（IAM Identity Center）** —— 填入 IdC 参数完成设备授权流程
+- **External IdP** —— 外部身份提供方登录
+
+Docker / 服务器部署时，若浏览器无法直连后端本机回调端口，请在 `config.json` 设置 `callbackBaseUrl` 为可公网访问的地址（如 `https://kiro.example.com`），网页回调会打到 `{callbackBaseUrl}/api/admin/auth/callback`。
+
+### 客户端接入
+
+任何 Anthropic 协议客户端把 base URL 指向本网关、API Key 用 `config.json` 里的 `apiKey` 即可。
+
+以 **Claude Code** 为例：
+
+```bash
+export ANTHROPIC_BASE_URL="http://localhost:8990"
+export ANTHROPIC_API_KEY="sk-你的-apiKey"
+claude
+```
+
+直接调用 API：
+
+```bash
+# 列出模型
+curl http://localhost:8990/v1/models \
+  -H "x-api-key: sk-你的-apiKey"
+
+# 创建消息
+curl http://localhost:8990/v1/messages \
+  -H "x-api-key: sk-你的-apiKey" \
+  -H "content-type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-20250514",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "你好"}]
+  }'
+```
+
+主要端点：
+
+| 端点 | 说明 |
+| --- | --- |
+| `GET /v1/models` | 可用模型列表 |
+| `POST /v1/messages` | 创建消息（流式 / 非流式） |
+| `POST /v1/messages/count_tokens` | 计算 token 数 |
+| `POST /cc/v1/messages` | Claude Code 兼容端点（流式时机略有差异） |
+| `GET /admin` | 管理面板 |
+
+认证支持 `x-api-key` 头或 `Authorization: Bearer <token>` 头。
+
+## 目录结构
+
+```
+KiroStudio/
+├── src/
+│   ├── main.rs            # 入口：加载配置/凭据，装配路由与后台任务
+│   ├── model/             # 配置与命令行参数模型
+│   ├── anthropic/         # Anthropic 协议入站：路由、鉴权、handlers、流式
+│   ├── kiro/              # Kiro/AWS Q 上游：协议转换、凭据、token 管理、调度
+│   ├── admin/             # 管理 API：凭据管理、上号、用量查询、配置
+│   ├── admin_ui/          # 面板静态资源服务（rust-embed 嵌入 dist）
+│   ├── usage/             # 用量埋点、聚合、SQLite/JSONL 落盘
+│   └── common/            # 安全（CORS/IP/限流）、SSRF 防护等公共组件
+├── admin-ui/              # React + Vite 管理面板前端
+├── deploy/                # systemd 安装 / 部署 / 蓝绿脚本
+├── Dockerfile
+├── docker-compose.yml
+└── config.example.json    # 配置示例
+```
+
+## 开发
+
+```bash
+# 后端
+cargo run -- -c config/config.json --credentials config/credentials.json
+cargo test                                   # 运行测试
+
+# 前端（独立热更，代理到后端；改完 pnpm build 才会被嵌入）
+cd admin-ui
+pnpm install
+pnpm dev
+```
+
+参与贡献请阅读 [CONTRIBUTING.md](./CONTRIBUTING.md)。
+
+## License
+
+本项目基于 [MIT License](./LICENSE) 开源，Copyright (c) 2026 dwgx。
+
+衍生自 [hank9999/kiro.rs](https://github.com/hank9999/kiro.rs)（MIT License, Copyright (c) 2026 hank9999），原始许可声明一并保留于 [LICENSE](./LICENSE) 文件中。
 
