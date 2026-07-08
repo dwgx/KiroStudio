@@ -58,6 +58,8 @@ docs/TODO-*
 docs/BACKLOG.md
 docs/DISCUSSION.md
 PROMPT.md
+docs/PROMPT-*
+PROMPT-*.md
 /research/
 
 # Claude Code agent 配置/记忆（本地私有，不公开）

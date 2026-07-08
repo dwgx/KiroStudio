@@ -100,7 +100,8 @@ pub async fn usage_recent(
     let Some(db) = &state.trace_db else {
         return stats_disabled();
     };
-    let limit = query.limit.unwrap_or(100).clamp(1, 1000);
+    // 上限放宽到 5000（前端"最近请求"支持切换 200/500/1000/全部；"全部"传大值取满窗）。
+    let limit = query.limit.unwrap_or(100).clamp(1, 5000);
     match db.recent(limit) {
         Ok(records) => Json(records).into_response(),
         Err(e) => {
