@@ -2,34 +2,48 @@ import type { CredentialStatusItem } from '@/types/api'
 import { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider } from '@/components/ui/tooltip'
 import type { CellActivity } from '@/components/overview/StatusHeatmap'
 import { healthOf, HEALTH_RGB, HEALTH_LABEL, CredTooltipBody, EmptyPool } from '@/components/overview/credViz'
+import './glow-grid.css'
 
 export interface GlowGridProps {
   credentials: CredentialStatusItem[]
-  /** credential_id -> 实时活动；发现新命中时该格泛起高光扫过 + 涟漪光环（体现请求流入 / 并发）。 */
+  /** credential_id -> 实时活动；发现新命中时该核心瞬间点亮再衰减并向相邻核心扩散一圈微光涟漪（体现算力被激活）。 */
   activity?: Map<number, CellActivity>
   className?: string
 }
 
-/** 统一圆角：灯体本身与各覆盖层（扫光/辉光/涟漪/边缘流光）必须一致，否则圆角处会露边。 */
-const R = 'rounded-[10px]'
+/** 统一圆角：核心本体与各覆盖层（呼吸/命中闪/涟漪）保持一致，避免圆角处露边。 */
+const R = 'rounded-[4px]'
 
-/** 呼吸辉光节奏：在途号更快（像加速心跳）、有失败号略急促、健康号沉稳。 */
-function glowDuration(health: 'healthy' | 'warn' | 'disabled', busy: boolean): string {
-  if (busy) return '1.5s'
-  if (health === 'warn') return '2.6s'
-  return '3.6s'
+/** 呼吸周期：健康沉稳偏慢、有失败略促、在途更快（像算力负载抬升时脉动加快）。 */
+function breatheDuration(health: 'healthy' | 'warn' | 'disabled', busy: boolean): string {
+  if (busy) return '2s'
+  if (health === 'warn') return '3s'
+  return '4.4s'
 }
 
 /**
- * GlowGrid —— 发光网格（服务器机柜“通道指示灯墙”）。
+ * 由凭据 id 派生一个确定性的呼吸相位偏移（0~-1 个周期内）。
+ * 让整墙核心此起彼伏地脉动而非齐刷刷同步，观感更像真实算力阵列；
+ * 纯函数无随机，重渲染不跳变。
+ */
+function breatheDelay(id: number): string {
+  // 取 id 的伪散列落到 [0,1)，映射成负延迟（动画像已运行了一段）。
+  const frac = ((id * 2654435761) % 1000) / 1000
+  return `-${(frac * 4).toFixed(2)}s`
+}
+
+/**
+ * GlowGrid —— GPU / CUDA 核心阵列（算力墙点阵）。
  *
- * 质感要点：
- * - 灯体：顶部高光斑 + 基色径向渐变 + 内凹描边，像一颗嵌进面板的透镜指示灯。
- * - 常驻呼吸：双层辉光（内芯亮而稳 + 外晕缓慢扩散起伏），健康沉稳 / 有失败略急促。
- * - 命中：三重叠加——白色扫光掠过 + 内芯白闪外晕骤亮的辉光脉冲 + 自中心向外扩散的涟漪光环。
- * - 在途（inflight>0）：一道细亮弧沿边缘持续巡游（边缘流光）+ 呼吸加速，一眼看出谁在处理请求。
- * - hover：轻微放大浮起 + 外辉光增强，tooltip 展示免费字段（不含 balance，封号红线）。
- * 纯 CSS/SVG + Radix Tooltip，无图表库；motion-reduce 全面降级为静态色块。
+ * 观感要点：
+ * - 阵列：小而密的方块核心规整排布，像 GPU die 上的 SM / CUDA 核心墙，一格 = 一个号。
+ * - 底光：健康色作核心底光，做低频呼吸（健康沉稳 / 有失败略促 / 在途更快）；禁用号哑光无呼吸。
+ * - 命中：请求流过该号时对应核心瞬间点亮成高亮（白芯 + 基色晕）再衰减，
+ *   并向相邻核心扩散一圈微光涟漪 —— “算力被激活点亮”的实感。由真实 activity 事件驱动，不常驻。
+ * - 当前活跃：安静的品牌色描边环。
+ * - hover：轻微浮起 + 外辉光增强，tooltip 展示免费字段（不含 balance，避免触发上游风控）。
+ * 纯 CSS/SVG + Radix Tooltip，无图表库；命中/涟漪用 key 重挂载单次重放（不常驻）；
+ * 常驻仅低频呼吸（opacity）；数百核心不卡；motion-reduce 全面降级为静态色块。
  */
 export function GlowGrid({ credentials, activity, className }: GlowGridProps) {
   if (credentials.length === 0) {
@@ -40,8 +54,8 @@ export function GlowGrid({ credentials, activity, className }: GlowGridProps) {
     <TooltipProvider delayDuration={80}>
       <div className={className}>
         <div
-          className="grid gap-2.5"
-          style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(36px, 1fr))' }}
+          className="grid gap-1.5"
+          style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(22px, 1fr))' }}
         >
           {credentials.map((c) => {
             const h = healthOf(c)
@@ -55,68 +69,63 @@ export function GlowGrid({ credentials, activity, className }: GlowGridProps) {
               <Tooltip key={c.id}>
                 <TooltipTrigger asChild>
                   <div
-                    className={`group relative aspect-square cursor-pointer ${R} transition-transform duration-200 ease-out-expo hover:z-10 hover:-translate-y-0.5 hover:scale-[1.14]`}
+                    className={`group relative aspect-square cursor-pointer ${R} transition-transform duration-200 ease-out hover:z-10 hover:-translate-y-0.5 hover:scale-[1.18]`}
                     style={{
-                      // 灯体：顶部一枚白色高光斑（透镜反光）叠在基色径向渐变上；禁用号只留哑光斜面。
+                      // 核心本体：基色斜面渐变 + 内凹描边，像 die 上一枚微小的算力单元。
+                      // 底光的“亮”交给独立呼吸层调 opacity（GPU 合成，不重绘本体）。
                       background: lit
-                        ? `radial-gradient(circle at 50% 32%, rgb(255 255 255 / 0.3), transparent 44%), radial-gradient(circle at 50% 40%, rgb(${rgb} / 0.95), rgb(${rgb} / 0.5) 62%, rgb(${rgb} / 0.28))`
-                        : `linear-gradient(150deg, rgb(${rgb} / 0.5), rgb(${rgb} / 0.22))`,
-                      border: `1px solid rgb(${rgb} / ${lit ? 0.55 : 0.35})`,
-                      // 内凹描边 + 上缘高光 + 下缘暗角，做出“嵌进面板”的物理厚度；外辉光交给独立呼吸层。
+                        ? `linear-gradient(150deg, rgb(${rgb} / 0.42), rgb(${rgb} / 0.16))`
+                        : `linear-gradient(150deg, rgb(${rgb} / 0.45), rgb(${rgb} / 0.2))`,
+                      border: `1px solid rgb(${rgb} / ${lit ? 0.5 : 0.32})`,
                       boxShadow: lit
-                        ? `inset 0 1px 0 rgb(255 255 255 / 0.2), inset 0 -2px 4px rgb(0 0 0 / 0.35), inset 0 0 0 1px rgb(${rgb} / 0.15)`
-                        : `inset 0 1px 0 rgb(255 255 255 / 0.04), inset 0 0 8px rgb(0 0 0 / 0.45)`,
+                        ? `inset 0 1px 0 rgb(255 255 255 / 0.14), inset 0 -1px 2px rgb(0 0 0 / 0.35)`
+                        : `inset 0 1px 0 rgb(255 255 255 / 0.03), inset 0 0 6px rgb(0 0 0 / 0.45)`,
                     }}
                   >
-                    {/* 常驻呼吸辉光（独立层）：双层——内芯稳 + 外晕扩散起伏；在途/有失败改节奏。 */}
+                    {/* 常驻底光呼吸（独立层，只动 opacity）：健康色内发光低频起伏；禁用号无呼吸。 */}
                     {lit && (
                       <span
-                        className={`pointer-events-none absolute inset-0 ${R} animate-idle-glow-rich motion-reduce:hidden`}
-                        style={{ ['--glow-rgb' as string]: rgb, animationDuration: glowDuration(h, busy) }}
+                        className={`gg-core-breathe pointer-events-none absolute inset-0 ${R}`}
+                        style={{
+                          background: `radial-gradient(circle at 50% 42%, rgb(${rgb} / 0.9), rgb(${rgb} / 0.32) 70%, transparent)`,
+                          boxShadow: `0 0 6px 0 rgb(${rgb} / 0.5)`,
+                          ['--gg-dur' as string]: breatheDuration(h, busy),
+                          ['--gg-delay' as string]: breatheDelay(c.id),
+                        }}
                       />
                     )}
-                    {/* 灯体内层（圆角裁剪）：顶部反光斑 + 命中扫光都限制在灯体内。 */}
+                    {/* 顶部一枚白色高光斑（透镜反光），hover 时加强，做出核心的物理厚度。 */}
                     <span className={`pointer-events-none absolute inset-0 overflow-hidden ${R}`}>
-                      <span className="absolute inset-x-1 top-1 h-1/3 rounded-full bg-white/15 blur-[2px] transition-opacity duration-200 group-hover:bg-white/30" />
-                      {hit && (
-                        <span
-                          key={act!.pulse}
-                          className="absolute inset-0 animate-glow-sweep bg-gradient-to-b from-white/90 via-white/25 to-transparent motion-reduce:hidden"
-                        />
-                      )}
+                      <span className="absolute inset-x-0.5 top-0.5 h-1/3 rounded-full bg-white/12 blur-[1.5px] transition-opacity duration-200 group-hover:bg-white/28" />
                     </span>
-                    {/* 在途：细亮弧沿边缘巡游（conic + border-only 遮罩），克制不刺眼。 */}
-                    {busy && (
-                      <span
-                        className={`pointer-events-none absolute inset-0 ${R} animate-border-beam motion-reduce:hidden`}
-                        style={{ ['--glow-rgb' as string]: rgb }}
-                      />
-                    )}
                     {/* hover 外辉光增强（透明→显现，避免常驻炫光）。 */}
                     {lit && (
                       <span
                         className={`pointer-events-none absolute inset-0 ${R} opacity-0 transition-opacity duration-200 group-hover:opacity-100 motion-reduce:transition-none`}
-                        style={{ boxShadow: `0 0 18px 2px rgb(${rgb} / 0.55), 0 6px 14px rgb(0 0 0 / 0.45)` }}
+                        style={{ boxShadow: `0 0 12px 1px rgb(${rgb} / 0.6), 0 4px 10px rgb(0 0 0 / 0.45)` }}
                       />
                     )}
                     {/* 当前活跃：安静的品牌色描边环。 */}
                     {c.isCurrent && (
                       <span className={`pointer-events-none absolute inset-0 ${R} ring-1 ring-primary/70 ring-offset-1 ring-offset-card`} />
                     )}
-                    {/* 命中辉光脉冲（不裁剪）：内芯白闪 + 外晕骤亮再衰减。 */}
+                    {/* 命中点亮闪（不裁剪）：核心被算力激活，白芯 + 基色晕瞬间点亮再衰减，单次重放。 */}
                     {hit && lit && (
                       <span
-                        key={`burst-${act!.pulse}`}
-                        className={`pointer-events-none absolute inset-0 ${R} animate-glow-burst-rich motion-reduce:hidden`}
-                        style={{ ['--glow-rgb' as string]: rgb }}
+                        key={`flash-${act!.pulse}`}
+                        className={`gg-core-flash pointer-events-none absolute inset-0 ${R} motion-reduce:hidden`}
+                        style={{
+                          background: `radial-gradient(circle at 50% 42%, rgb(255 255 255 / 0.95), rgb(${rgb} / 0.6) 60%, transparent)`,
+                          boxShadow: `0 0 14px 2px rgb(${rgb} / 0.85)`,
+                        }}
                       />
                     )}
-                    {/* 命中涟漪光环（不裁剪）：自中心向外扩散一圈并淡出，“数据打进来了”的实感。 */}
+                    {/* 命中涟漪微光（不裁剪）：自本核心向外扩散一圈细描边并淡出，波及相邻核心。 */}
                     {hit && lit && (
                       <span
                         key={`ripple-${act!.pulse}`}
-                        className={`pointer-events-none absolute inset-0 ${R} animate-glow-ripple-ring motion-reduce:hidden`}
-                        style={{ ['--glow-rgb' as string]: rgb }}
+                        className={`gg-core-ripple pointer-events-none absolute inset-0 ${R} motion-reduce:hidden`}
+                        style={{ boxShadow: `0 0 0 1px rgb(${rgb} / 0.9)` }}
                       />
                     )}
                   </div>
@@ -133,7 +142,7 @@ export function GlowGrid({ credentials, activity, className }: GlowGridProps) {
           {(['healthy', 'warn', 'disabled'] as const).map((k) => (
             <span key={k} className="flex items-center gap-1.5">
               <span
-                className="h-2.5 w-2.5 rounded-full"
+                className="h-2.5 w-2.5 rounded-[3px]"
                 style={{
                   background: `rgb(${HEALTH_RGB[k]} / 0.9)`,
                   boxShadow: k !== 'disabled' ? `0 0 6px rgb(${HEALTH_RGB[k]} / 0.6)` : 'none',
@@ -143,16 +152,19 @@ export function GlowGrid({ credentials, activity, className }: GlowGridProps) {
             </span>
           ))}
           <span className="flex items-center gap-1.5">
-            <span className={`h-2.5 w-2.5 rounded-full bg-transparent ring-1 ring-primary/70`} /> 当前活跃
+            <span className={`h-2.5 w-2.5 rounded-[3px] bg-transparent ring-1 ring-primary/70`} /> 当前活跃
           </span>
           <span className="flex items-center gap-1.5">
             <span
-              className={`relative h-2.5 w-2.5 rounded-[4px]`}
+              className="relative h-2.5 w-2.5 rounded-[3px]"
               style={{ background: `rgb(${HEALTH_RGB.healthy} / 0.25)` }}
             >
               <span
-                className={`absolute inset-0 rounded-[4px] animate-border-beam motion-reduce:hidden`}
-                style={{ ['--glow-rgb' as string]: HEALTH_RGB.healthy }}
+                className="gg-core-breathe absolute inset-0 rounded-[3px]"
+                style={{
+                  background: `radial-gradient(circle at 50% 42%, rgb(${HEALTH_RGB.healthy} / 0.9), transparent 70%)`,
+                  ['--gg-dur' as string]: '2s',
+                }}
               />
             </span>
             处理中

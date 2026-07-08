@@ -1,4 +1,5 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useState, useEffect, useRef } from 'react'
+import { createPortal } from 'react-dom'
 import {
   Activity,
   CalendarDays,
@@ -17,17 +18,18 @@ import {
   Braces,
   Globe,
   HelpCircle,
+  Search,
+  X,
+  ChevronLeft,
+  ChevronRight,
+  ChevronDown,
+  Server,
   type LucideIcon,
 } from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
+import { Select } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
-import {
-  Tooltip,
-  TooltipTrigger,
-  TooltipContent,
-  TooltipProvider,
-} from '@/components/ui/tooltip'
 import { StatCard, type StatAccent } from '@/components/ui/stat-card'
 import { RadialGauge } from '@/components/overview/RadialGauge'
 import { AreaTrendChart } from '@/components/overview/AreaTrendChart'
@@ -37,11 +39,13 @@ import {
   useUsageByModel,
   useUsageByCredential,
   useUsageRecent,
+  useUsageMachines,
 } from '@/hooks/use-usage'
 import type {
   WindowSummary,
   SeriesPoint,
   GroupStat,
+  MachineRpm,
   RequestRecord,
   RequestOutcome,
 } from '@/types/api'
@@ -413,6 +417,105 @@ function DeviceDistribution({ rows }: { rows: RequestRecord[] }) {
   )
 }
 
+/* ============ 按机器分组（以 IP 为主键；同一会话漫游换 IP 才合并）============ */
+
+// 一台机器一张卡:设备指纹 + 见过的所有 IP + RPM + 活跃窗口(可展开看各窗口 RPM)。
+// 与「按设备」的区别:这里同一台机器换 IP(DHCP/VPN)不拆分,IP 只作列表展示。
+function MachineBreakdown({
+  machines,
+  sessionFilter,
+  onPickSession,
+}: {
+  machines: MachineRpm[]
+  sessionFilter: string | null
+  onPickSession: (sessionId: string) => void
+}) {
+  // 多开手风琴：改用 Set，可同时展开多台机器（dwgx：不要开一个收起上一个）。
+  const [openKeys, setOpenKeys] = useState<Set<string>>(new Set())
+  const toggle = (k: string) =>
+    setOpenKeys((prev) => {
+      const next = new Set(prev)
+      next.has(k) ? next.delete(k) : next.add(k)
+      return next
+    })
+  if (machines.length === 0) {
+    return <p className="text-sm text-muted-foreground">暂无机器数据（近 10 分钟无活跃窗口）</p>
+  }
+  // 按 RPM 降序,正在打的排前面。
+  const sorted = [...machines].sort((a, b) => b.rpm - a.rpm)
+  return (
+    <div className="space-y-2">
+      {sorted.map((m) => {
+        const open = openKeys.has(m.machineKey)
+        const label = [m.device, m.os, m.browser].filter(Boolean).join(' · ') || '未知设备'
+        return (
+          <div key={m.machineKey} className="rounded-lg border border-border bg-secondary/30">
+            <button
+              onClick={() => toggle(m.machineKey)}
+              className="flex w-full items-center gap-2.5 px-3 py-2 text-left"
+            >
+              <ChevronDown className={`h-3.5 w-3.5 shrink-0 text-muted-foreground/50 transition-transform ${open ? '' : '-rotate-90'}`} />
+              <Monitor className="h-4 w-4 shrink-0 text-muted-foreground" />
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-xs font-medium text-foreground">{label}</div>
+                <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground">
+                  <span className="tabular-nums">{m.activeSessions} 活跃窗口</span>
+                  <span>·</span>
+                  <span title="这台机器见过的所有 IP（换 IP 也不拆分）">{m.ips.length} 个 IP</span>
+                </div>
+              </div>
+              {m.rpm > 0 && (
+                <span className="shrink-0 rounded bg-sky-500/10 px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-sky-300/90">
+                  {m.rpm}<span className="text-[8px] text-sky-300/60">/m</span>
+                </span>
+              )}
+            </button>
+            {open && (
+              <div className="border-t border-border/50 px-3 py-2.5 text-[11px]">
+                <div className="mb-2">
+                  <div className="mb-1 text-muted-foreground">见过的 IP</div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {m.ips.length === 0 ? (
+                      <span className="text-muted-foreground/60">—</span>
+                    ) : (
+                      m.ips.map((ip) => (
+                        <span key={ip} className="rounded bg-secondary px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-foreground">{ip}</span>
+                      ))
+                    )}
+                  </div>
+                </div>
+                {m.sessions.length > 0 && (
+                  <div>
+                    <div className="mb-1 text-muted-foreground">活跃窗口 RPM<span className="ml-1 text-muted-foreground/50">（点击可筛选最近请求）</span></div>
+                    <div className="space-y-1">
+                      {m.sessions.map((s) => {
+                        const picked = sessionFilter === s.sessionId
+                        return (
+                          <button
+                            key={s.sessionId}
+                            onClick={() => onPickSession(s.sessionId)}
+                            title={picked ? '已按此会话筛选最近请求（再点取消）' : '按此会话筛选最近请求'}
+                            className={`flex w-full items-center justify-between gap-2 rounded px-1.5 py-1 text-left transition-colors ${
+                              picked ? 'bg-sky-500/15 ring-1 ring-sky-500/40' : 'hover:bg-secondary/60'
+                            }`}
+                          >
+                            <span className={`truncate font-mono text-[10px] ${picked ? 'text-sky-200' : 'text-muted-foreground/80'}`}>{s.sessionId}</span>
+                            <span className="shrink-0 font-mono tabular-nums text-sky-300/90">{s.rpm}/m</span>
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 /* ============ 结果徽标 ============ */
 
 const OUTCOME_LABEL: Record<RequestOutcome, string> = {
@@ -518,62 +621,309 @@ function RequestDetail({ record: r }: { record: RequestRecord }) {
   )
 }
 
-// 列：时间 / 模型 / 设备(带图标徽标) / 凭据 / 结果 / In-Out / 延迟。
-// 行悬停高亮，并平滑弹出该请求的完整详情浮层——不用点就能 hover 看全每条请求。
+// 内联展开详情:横向铺开(像上面的表格 bar,左到右),响应式网格自然折成 4-5 行。
+// dwgx:左键展开不要竖卡片,要"和上面 bar 一样在下面铺开几行"。
+function RequestDetailSpread({ record: r }: { record: RequestRecord }) {
+  const dev = deviceMeta(r.client_device)
+  const deviceLine = [dev.label, r.client_os, r.client_browser].filter(Boolean).join(' · ')
+  const cacheR = (r as { cache_read_tokens?: number }).cache_read_tokens
+  const cacheW = (r as { cache_creation_tokens?: number }).cache_creation_tokens
+  // 字段项:label + value,自动流式排布(auto-fill 网格,窄屏少列宽屏多列,自然铺成几行)。
+  const items: { label: string; value: React.ReactNode; mono?: boolean }[] = [
+    { label: '时间', value: new Date(r.ts_ms).toLocaleString() },
+    { label: '模型', value: r.model, mono: false },
+    { label: '结果', value: <OutcomeBadge outcome={r.outcome} />, mono: false },
+    { label: '凭据', value: r.credential_id != null ? `#${r.credential_id}` : '—' },
+    { label: '设备', value: deviceLine || '—', mono: false },
+    { label: '客户端 IP', value: r.client_ip || '—' },
+    { label: 'Token 入/出', value: `${r.input_tokens.toLocaleString()} / ${r.output_tokens.toLocaleString()}` },
+    ...(cacheR != null || cacheW != null ? [{ label: '缓存 读/写', value: `${(cacheR ?? 0).toLocaleString()} / ${(cacheW ?? 0).toLocaleString()}` }] : []),
+    ...(r.credits_used != null ? [{ label: 'Credits', value: r.credits_used.toFixed(2) }] : []),
+    { label: '延迟', value: `${r.latency_ms.toLocaleString()}ms${r.first_token_ms != null ? ` · 首字 ${r.first_token_ms.toLocaleString()}ms` : ''}` },
+    { label: '重试 / 流式', value: `${r.retries} 次 · ${r.is_streaming ? '是' : '否'}` },
+    ...(r.session_id ? [{ label: '会话窗口', value: r.session_id }] : []),
+    { label: '请求 ID', value: r.request_id },
+  ]
+  return (
+    <div className="animate-rise-in">
+      <div
+        className="grid gap-x-6 gap-y-2.5"
+        style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))' }}
+      >
+        {items.map((it, i) => (
+          <div key={i} className="flex flex-col gap-0.5 min-w-0">
+            <span className="text-[10px] uppercase tracking-wide text-muted-foreground/70">{it.label}</span>
+            <span className={`truncate text-xs text-foreground ${it.mono === false ? '' : 'tabular-nums'}`} title={typeof it.value === 'string' ? it.value : undefined}>
+              {it.value}
+            </span>
+          </div>
+        ))}
+      </div>
+      {r.error_message && (
+        <div className="mt-2.5 rounded border border-red-500/20 bg-red-500/5 px-2.5 py-1.5">
+          <span className="text-[10px] uppercase tracking-wide text-red-400/70">错误信息</span>
+          <div className="mt-0.5 break-all text-xs text-red-400">{r.error_message}</div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// 右键浮窗：跟随鼠标定位（fixed + clamp 防出界），展示整条请求详情。点外部/Esc 关闭。
+function RequestPopover({ record, x, y, onClose }: { record: RequestRecord; x: number; y: number; onClose: () => void }) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    const onDown = () => onClose()
+    window.addEventListener('keydown', onKey)
+    // 延迟挂 pointerdown,避免触发浮窗的这次右键点击立刻把它关掉。
+    const t = setTimeout(() => window.addEventListener('pointerdown', onDown), 0)
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      window.removeEventListener('pointerdown', onDown)
+      clearTimeout(t)
+    }
+  }, [onClose])
+  // clamp:估算浮窗尺寸,右/下越界则向左/上翻。
+  const W = 300, H = 380
+  const left = Math.min(x + 14, window.innerWidth - W - 8)
+  const top = Math.min(y + 14, window.innerHeight - H - 8)
+  return createPortal(
+    <div
+      className="fixed z-50 rounded-lg border border-border bg-popover px-3 py-2.5 shadow-xl animate-rise-in"
+      style={{ left: Math.max(8, left), top: Math.max(8, top) }}
+      onPointerDown={(e) => e.stopPropagation()}
+      onContextMenu={(e) => e.preventDefault()}
+    >
+      <RequestDetail record={record} />
+      <div className="mt-2 border-t border-border/60 pt-1.5 text-center text-[10px] text-muted-foreground">点击别处或按 Esc 关闭</div>
+    </div>,
+    document.body,
+  )
+}
+
+// 列：时间 / 模型 / 设备 / 凭据 / 结果 / In-Out / 延迟。
+// 交互(dwgx):左键点击行=行下方内联展开详情(手风琴);右键行=跟随鼠标浮窗看全部。
 function RecentTable({ rows }: { rows: RequestRecord[] }) {
+  // 多开手风琴：改用 Set，可同时展开多行详情（dwgx：不要开一个收起上一个）。
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set())
+  const toggleRow = (id: string) =>
+    setExpandedIds((prev) => {
+      const next = new Set(prev)
+      next.has(id) ? next.delete(id) : next.add(id)
+      return next
+    })
+  const [popover, setPopover] = useState<{ record: RequestRecord; x: number; y: number } | null>(null)
+
   if (rows.length === 0) {
     return <p className="text-sm text-muted-foreground">暂无请求记录</p>
   }
   return (
-    <TooltipProvider delayDuration={120} skipDelayDuration={300}>
-      <div className="overflow-x-auto">
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="border-b border-border text-xs text-muted-foreground">
-              <th className="py-2 pr-3 text-left font-medium">时间</th>
-              <th className="py-2 pr-3 text-left font-medium">模型</th>
-              <th className="py-2 pr-3 text-left font-medium">设备</th>
-              <th className="py-2 pr-3 text-right font-medium">凭据</th>
-              <th className="py-2 pr-3 text-center font-medium">结果</th>
-              <th className="py-2 pr-3 text-right font-medium">In/Out</th>
-              <th className="py-2 text-right font-medium">延迟</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((r) => (
-              <Tooltip key={r.request_id}>
-                <TooltipTrigger asChild>
-                  <tr className="cursor-default border-b border-border/40 transition-colors last:border-0 hover:bg-secondary/40 data-[state=delayed-open]:bg-secondary/60">
-                    <td className="whitespace-nowrap py-2 pr-3 tabular-nums text-muted-foreground">
+    <div className="overflow-x-auto">
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="border-b border-border text-xs text-muted-foreground">
+            <th className="py-2 pr-3 text-left font-medium">时间</th>
+            <th className="py-2 pr-3 text-left font-medium">模型</th>
+            <th className="py-2 pr-3 text-left font-medium">设备</th>
+            <th className="py-2 pr-3 text-right font-medium">凭据</th>
+            <th className="py-2 pr-3 text-center font-medium">结果</th>
+            <th className="py-2 pr-3 text-right font-medium">In/Out</th>
+            <th className="py-2 text-right font-medium">延迟</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => {
+            const open = expandedIds.has(r.request_id)
+            return (
+              <>
+                <tr
+                  key={r.request_id}
+                  className={`cursor-pointer border-b border-border/40 transition-colors last:border-0 hover:bg-secondary/40 ${open ? 'bg-secondary/60' : ''}`}
+                  onClick={() => toggleRow(r.request_id)}
+                  onContextMenu={(e) => { e.preventDefault(); setPopover({ record: r, x: e.clientX, y: e.clientY }) }}
+                  title="左键展开详情 · 右键浮窗看全部"
+                >
+                  <td className="whitespace-nowrap py-2 pr-3 tabular-nums text-muted-foreground">
+                    <span className="inline-flex items-center gap-1">
+                      <ChevronDown className={`h-3 w-3 shrink-0 transition-transform ${open ? '' : '-rotate-90'} text-muted-foreground/50`} />
                       {new Date(r.ts_ms).toLocaleString()}
-                    </td>
-                    <td className="max-w-[160px] truncate py-2 pr-3">{r.model}</td>
-                    <td className="py-2 pr-3 align-top">
-                      <DeviceCell record={r} />
-                    </td>
-                    <td className="py-2 pr-3 text-right tabular-nums text-muted-foreground">
-                      {r.credential_id != null ? `#${r.credential_id}` : '—'}
-                    </td>
-                    <td className="py-2 pr-3 text-center">
-                      <OutcomeBadge outcome={r.outcome} />
-                    </td>
-                    <td className="py-2 pr-3 text-right tabular-nums">
-                      {r.input_tokens}/{r.output_tokens}
-                    </td>
-                    <td className="py-2 text-right tabular-nums text-muted-foreground">
-                      {r.latency_ms}ms
+                    </span>
+                  </td>
+                  <td className="max-w-[160px] truncate py-2 pr-3">{r.model}</td>
+                  <td className="py-2 pr-3 align-top"><DeviceCell record={r} /></td>
+                  <td className="py-2 pr-3 text-right tabular-nums text-muted-foreground">
+                    {r.credential_id != null ? `#${r.credential_id}` : '—'}
+                  </td>
+                  <td className="py-2 pr-3 text-center"><OutcomeBadge outcome={r.outcome} /></td>
+                  <td className="py-2 pr-3 text-right tabular-nums">{r.input_tokens}/{r.output_tokens}</td>
+                  <td className="py-2 text-right tabular-nums text-muted-foreground">{r.latency_ms}ms</td>
+                </tr>
+                {open && (
+                  <tr key={`${r.request_id}-detail`} className="border-b border-border/40 bg-secondary/20">
+                    <td colSpan={7} className="px-3 py-3">
+                      <RequestDetailSpread record={r} />
                     </td>
                   </tr>
-                </TooltipTrigger>
-                <TooltipContent side="left" align="start" className="px-3 py-2.5">
-                  <RequestDetail record={r} />
-                </TooltipContent>
-              </Tooltip>
-            ))}
-          </tbody>
-        </table>
+                )}
+              </>
+            )
+          })}
+        </tbody>
+      </table>
+      {popover && (
+        <RequestPopover record={popover.record} x={popover.x} y={popover.y} onClose={() => setPopover(null)} />
+      )}
+    </div>
+  )
+}
+
+// 最近请求面板:搜索 + 按 IP 筛选 + 每 IP 总计 + 分页,包裹 RecentTable。
+const PAGE_SIZE = 20
+
+function RecentRequestsPanel({
+  rows,
+  sessionFilter,
+  onClearSession,
+}: {
+  rows: RequestRecord[]
+  // 会话预选联动（T3）：由父级传入的当前会话过滤（点机器分组里的会话行设置），null=不筛。
+  sessionFilter?: string | null
+  onClearSession?: () => void
+}) {
+  const [query, setQuery] = useState('')
+  const [ipFilter, setIpFilter] = useState<string | null>(null)
+  const [page, setPage] = useState(0)
+
+  // 可筛选的 IP 列表(去重,按出现次数降序),供下拉筛选。
+  const ipOptions = useMemo(() => {
+    const m = new Map<string, number>()
+    for (const r of rows) {
+      const ip = r.client_ip || ''
+      if (ip) m.set(ip, (m.get(ip) ?? 0) + 1)
+    }
+    return [...m.entries()].sort((a, b) => b[1] - a[1]).map(([ip]) => ip)
+  }, [rows])
+
+  // 过滤:先按 IP,再按搜索词(model/ip/凭据/request_id/error/session/device 全文)。
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    return rows.filter((r) => {
+      if (sessionFilter && r.session_id !== sessionFilter) return false
+      if (ipFilter && (r.client_ip || '') !== ipFilter) return false
+      if (!q) return true
+      const hay = [
+        r.model, r.client_ip, r.client_device, r.client_os, r.client_browser,
+        r.credential_id != null ? `#${r.credential_id}` : '', r.request_id,
+        r.session_id, r.error_message, r.outcome,
+      ].filter(Boolean).join(' ').toLowerCase()
+      return hay.includes(q)
+    })
+  }, [rows, query, ipFilter, sessionFilter])
+
+  // 当前筛选集的总计(条数/成功失败/token/缓存读写)。
+  const totals = useMemo(() => {
+    let ok = 0, fail = 0, inTok = 0, outTok = 0, cacheR = 0, cacheW = 0
+    for (const r of filtered) {
+      if (r.outcome === 'success') ok++; else fail++
+      inTok += r.input_tokens || 0
+      outTok += r.output_tokens || 0
+      cacheR += (r as { cache_read_tokens?: number }).cache_read_tokens || 0
+      cacheW += (r as { cache_creation_tokens?: number }).cache_creation_tokens || 0
+    }
+    return { count: filtered.length, ok, fail, inTok, outTok, cacheR, cacheW }
+  }, [filtered])
+
+  // 筛选/搜索变化时回到第一页。
+  useEffect(() => { setPage(0) }, [query, ipFilter, sessionFilter])
+
+  const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE))
+  const clampedPage = Math.min(page, pageCount - 1)
+  const paged = filtered.slice(clampedPage * PAGE_SIZE, clampedPage * PAGE_SIZE + PAGE_SIZE)
+
+  const fmtNum = (n: number) => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n))
+
+  return (
+    <div className="space-y-3">
+      {/* 工具栏:搜索 + IP 筛选 */}
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="relative flex-1 min-w-[180px]">
+          <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="搜索模型 / IP / 凭据 / 请求ID / 错误…"
+            className="h-8 w-full rounded-md border border-border bg-secondary/40 pl-8 pr-7 text-xs outline-none focus:border-border-hover"
+          />
+          {query && (
+            <button onClick={() => setQuery('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground" aria-label="清除搜索">
+              <X className="h-3.5 w-3.5" />
+            </button>
+          )}
+        </div>
+        {ipOptions.length > 0 && (
+          <div className="flex items-center gap-1.5">
+            <Server className="h-3.5 w-3.5 text-muted-foreground" />
+            <Select
+              value={ipFilter ?? ''}
+              onChange={(v) => setIpFilter(v || null)}
+              className="w-36"
+              aria-label="按 IP 筛选"
+              options={[{ value: '', label: '全部 IP' }, ...ipOptions.map((ip) => ({ value: ip, label: ip }))]}
+            />
+          </div>
+        )}
       </div>
-    </TooltipProvider>
+
+      {/* 当前筛选集总计 */}
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-md bg-secondary/30 px-3 py-2 text-[11px] tabular-nums text-muted-foreground">
+        <span>共 <span className="font-medium text-foreground">{totals.count}</span> 条</span>
+        <span className="text-emerald-400">成功 {totals.ok}</span>
+        {totals.fail > 0 && <span className="text-red-400">失败 {totals.fail}</span>}
+        <span>In/Out {fmtNum(totals.inTok)}/{fmtNum(totals.outTok)}</span>
+        <span title="缓存读 token 总计">缓存读 {fmtNum(totals.cacheR)}</span>
+        <span title="缓存写(建立) token 总计">缓存写 {fmtNum(totals.cacheW)}</span>
+        {ipFilter && <span className="text-primary">· 已筛 {ipFilter}</span>}
+        {sessionFilter && (
+          <button
+            onClick={onClearSession}
+            title="清除会话筛选"
+            className="inline-flex items-center gap-1 rounded bg-sky-500/15 px-1.5 py-0.5 text-sky-300 ring-1 ring-sky-500/30 hover:bg-sky-500/25"
+          >
+            <span>· 会话 {sessionFilter.slice(0, 8)}…</span>
+            <X className="h-3 w-3" />
+          </button>
+        )}
+      </div>
+
+      {filtered.length === 0 ? (
+        <p className="py-4 text-center text-sm text-muted-foreground">无匹配请求</p>
+      ) : (
+        <RecentTable rows={paged} />
+      )}
+
+      {/* 分页 */}
+      {pageCount > 1 && (
+        <div className="flex items-center justify-between text-xs text-muted-foreground">
+          <span className="tabular-nums">第 {clampedPage + 1} / {pageCount} 页</span>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => setPage(Math.max(0, clampedPage - 1))}
+              disabled={clampedPage === 0}
+              className="inline-flex h-7 items-center gap-1 rounded border border-border px-2 disabled:opacity-40 hover:bg-secondary/40"
+            >
+              <ChevronLeft className="h-3.5 w-3.5" /> 上一页
+            </button>
+            <button
+              onClick={() => setPage(Math.min(pageCount - 1, clampedPage + 1))}
+              disabled={clampedPage >= pageCount - 1}
+              className="inline-flex h-7 items-center gap-1 rounded border border-border px-2 disabled:opacity-40 hover:bg-secondary/40"
+            >
+              下一页 <ChevronRight className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -656,12 +1006,22 @@ function trimSeries(points: SeriesPoint[], granularity: 'hourly' | 'daily'): Ser
 //  5. 最近请求明细表（含设备列）——最近发生了什么、每条来自哪台设备
 export function UsagePage() {
   const [granularity, setGranularity] = useState<'hourly' | 'daily'>('hourly')
+  // 会话预选联动（T3）：点机器分组里的会话行 → 设此 filter → 最近请求按该会话过滤 + 滚动定位。
+  const [sessionFilter, setSessionFilter] = useState<string | null>(null)
+  const recentPanelRef = useRef<HTMLDivElement>(null)
+  const onPickSession = (sessionId: string) => {
+    setSessionFilter((prev) => (prev === sessionId ? null : sessionId)) // 再点同一会话=取消
+    // 定位到最近请求面板，让联动结果立刻可见。
+    requestAnimationFrame(() => recentPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }))
+  }
   const overview = useUsageOverview()
   const timeseries = useUsageTimeseries(granularity)
   const byModel = useUsageByModel()
   const byCredential = useUsageByCredential()
   // 拉够多条（200）以便按设备聚合出有代表性的分布
   const recent = useUsageRecent(200)
+  // 机器维度聚合（按设备指纹分组，IP 变化不拆分）——后端 /usage/machines。
+  const machines = useUsageMachines()
 
   // 裁剪后的趋势数据（去空桶后铺满宽度），据此算峰值/活跃桶/合计小指标
   const chartSeries = useMemo(
@@ -841,12 +1201,30 @@ export function UsagePage() {
         </Card>
       </div>
 
-      {/* 4) 最近请求明细（含设备列） */}
+      {/* 3.5) 按机器分组：同一台机器换 IP 也不拆分（设备指纹 + 会话粘滞） */}
       <Card className="p-5">
+        <SectionTitle
+          hint={machines.isLoading ? '加载中…' : `${(machines.data ?? []).length} 台机器 · 按 IP，同会话漫游合并`}
+        >
+          按机器（IP / 客户端）
+        </SectionTitle>
+        {machines.isLoading ? <RankListSkeleton /> : <MachineBreakdown machines={machines.data ?? []} sessionFilter={sessionFilter} onPickSession={onPickSession} />}
+      </Card>
+
+      {/* 4) 最近请求明细（搜索 + 按IP筛选 + 会话联动筛选 + 每IP总计 + 分页 + 左键展开/右键浮窗） */}
+      <Card className="p-5" ref={recentPanelRef}>
         <SectionTitle hint={recent.isLoading ? '加载中…' : `最近 ${recentRows.length} 条`}>
           最近请求
         </SectionTitle>
-        {recent.isLoading ? <RecentTableSkeleton /> : <RecentTable rows={recentRows} />}
+        {recent.isLoading ? (
+          <RecentTableSkeleton />
+        ) : (
+          <RecentRequestsPanel
+            rows={recentRows}
+            sessionFilter={sessionFilter}
+            onClearSession={() => setSessionFilter(null)}
+          />
+        )}
       </Card>
     </div>
   )

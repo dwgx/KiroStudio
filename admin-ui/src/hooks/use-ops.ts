@@ -3,11 +3,13 @@ import {
   restartService,
   getStorageStats,
   cleanupStorage,
+  checkUpdate,
+  performUpdate,
 } from '@/api/ops'
 import type { StorageCleanupRequest } from '@/types/api'
 
 // 一键重启服务。
-// ⚠️ 重启会中断本次连接，请求可能抛错——调用方在 onError 里也当作"已发起"处理更稳妥，
+// 注意：重启会中断本次连接，请求可能抛错——调用方在 onError 里也当作"已发起"处理更稳妥，
 // 但这里保持透明，把成功/失败如实抛给调用方决定文案。
 export function useRestartService() {
   return useMutation({
@@ -31,5 +33,19 @@ export function useCleanupStorage() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['storage-stats'] })
     },
+  })
+}
+
+// 检查更新（手动触发，不自动轮询——拉 GitHub 有网络代价）。
+export function useCheckUpdate() {
+  return useMutation({
+    mutationFn: checkUpdate,
+  })
+}
+
+// 一键升级。成功后服务自动重启，请求可能因断连抛错，调用方当"已发起"处理。
+export function usePerformUpdate() {
+  return useMutation({
+    mutationFn: (version?: string) => performUpdate(version),
   })
 }

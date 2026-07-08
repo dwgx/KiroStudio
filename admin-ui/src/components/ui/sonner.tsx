@@ -3,103 +3,171 @@ import { CheckCircle2, XCircle, AlertTriangle, Info } from 'lucide-react'
 
 type ToasterProps = React.ComponentProps<typeof Sonner>
 
-// 全站 toast 视觉重设计（呼应 .card-metal 的金属质感）：
-// - 暗色金属磨砂基底：斜向渐变 + 顶部 1px 内高光 + 两层外阴影 + 背景模糊
-// - 四态语义色（成功绿/错误红/警告琥珀/信息蓝）以「左侧竖条 + 图标圆底」克制呈现，不辣眼
-// - 标题清晰、描述次级色，层级分明
-// - 进出场沿用 sonner 自带丝滑动画，motion-reduce 下关闭过渡
-// 说明：所有样式 scope 在 .toaster-metal 之下，只影响本 Toaster，不污染全局。
+// 全站 toast 视觉与行为「重写」（dwgx：notification 需重写）：
+// 从旧「金属左竖条」改为**语义色顶部描边 + 发光图标章 + 底部倒计时进度条**的现代通知卡。
+// - 基底：更干净的暗色玻璃（单层斜向渐变 + 背景模糊 + 柔和外阴影），不再堆金属高光。
+// - 顶部一道语义色渐变描边（成功绿/错误红/警告琥珀/信息蓝），比左竖条更醒目、更成体系。
+// - 图标做成「发光圆角章」：语义色前景 + 同色柔光环，替代旧的扁平淡底。
+// - 底部一条语义色**倒计时进度条**：随 toast 剩余时长收缩到 0，直观知道何时消失（hover 暂停时也随之停）。
+// - 标题清晰、描述次级；完整换行不截断。竖直平铺 expand + visibleToasts，多条不遮挡。
+// - 关闭按钮常驻右上、低调 hover 提亮；进出场用 sonner 自带动画，motion-reduce 关过渡+进度条。
+// 说明：样式全部 scope 在 .toaster-glow 之下，只影响本 Toaster，不污染全局。
 const TOAST_CSS = `
-.toaster-metal [data-sonner-toast] {
-  --metal-accent: rgba(255, 255, 255, 0.16);
-  position: relative;
-  background: linear-gradient(145deg, rgba(32,32,35,0.94) 0%, rgba(24,24,26,0.94) 55%, rgba(19,19,21,0.95) 100%);
-  border: 1px solid rgba(255, 255, 255, 0.07);
-  border-radius: 12px;
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.07),
-    0 1px 3px rgba(0, 0, 0, 0.45),
-    0 10px 30px -6px rgba(0, 0, 0, 0.5);
-  -webkit-backdrop-filter: blur(14px) saturate(1.2);
-  backdrop-filter: blur(14px) saturate(1.2);
-  padding: 14px 16px 14px 18px;
-  color: #ededed;
-  overflow: hidden;
+.toaster-glow[data-sonner-toaster] {
+  --width: 400px;
+  --gap: 13px;
+  --border-radius: 14px;
 }
 
-/* 左侧语义竖条：随 data-type 换色，带一点同色柔光 */
-.toaster-metal [data-sonner-toast]::before {
+.toaster-glow [data-sonner-toast] {
+  --tone: #8b8f98;
+  --tone-soft: rgba(139, 143, 152, 0.16);
+  position: relative;
+  width: 100%;
+  min-width: 320px;
+  max-width: 440px;
+  overflow: hidden;
+  background:
+    linear-gradient(155deg, rgba(30, 30, 34, 0.95) 0%, rgba(21, 21, 24, 0.96) 100%);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.4),
+    0 14px 40px -10px rgba(0, 0, 0, 0.6),
+    0 0 24px -12px var(--tone);
+  -webkit-backdrop-filter: blur(16px) saturate(1.25);
+  backdrop-filter: blur(16px) saturate(1.25);
+  padding: 15px 42px 16px 16px;
+  color: #ededed;
+  align-items: flex-start;
+}
+
+/* 展开态下即便非最前一条也全不透明，杜绝后面看不清 */
+.toaster-glow [data-sonner-toast][data-expanded="true"][data-front="false"],
+.toaster-glow [data-sonner-toast][data-expanded="true"][data-front="false"][data-styled="true"] > * {
+  opacity: 1;
+}
+
+/* 顶部语义色渐变描边：中间实、两端淡出，比左竖条更成体系 */
+.toaster-glow [data-sonner-toast]::before {
   content: '';
   position: absolute;
   left: 0;
-  top: 10px;
-  bottom: 10px;
-  width: 3px;
-  border-radius: 0 3px 3px 0;
-  background: var(--metal-accent);
-  box-shadow: 0 0 10px -1px var(--metal-accent);
+  right: 0;
+  top: 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, var(--tone) 22%, var(--tone) 78%, transparent);
+  opacity: 0.9;
 }
-.toaster-metal [data-sonner-toast][data-type="success"] { --metal-accent: #50e3c2; }
-.toaster-metal [data-sonner-toast][data-type="error"]   { --metal-accent: #f5554e; }
-.toaster-metal [data-sonner-toast][data-type="warning"] { --metal-accent: #f5a623; }
-.toaster-metal [data-sonner-toast][data-type="info"]    { --metal-accent: #3b93ff; }
 
-/* 图标：圆角淡色底 + 语义色前景，做出「克制的图标底色」 */
-.toaster-metal [data-sonner-toast] [data-icon] {
-  width: 26px;
-  height: 26px;
+/* 底部倒计时进度条：从满宽收缩到 0，时长 = toast duration；hover 暂停时动画一并暂停 */
+.toaster-glow [data-sonner-toast]::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 2px;
+  width: 100%;
+  transform-origin: left center;
+  background: linear-gradient(90deg, var(--tone), color-mix(in srgb, var(--tone) 55%, transparent));
+  animation: toast-countdown var(--toast-duration, 4000ms) linear forwards;
+}
+.toaster-glow [data-sonner-toast]:hover::after {
+  animation-play-state: paused;
+}
+/* 常驻/加载态（无自动消失）不显示倒计时条 */
+.toaster-glow [data-sonner-toast][data-type="loading"]::after {
+  display: none;
+}
+
+@keyframes toast-countdown {
+  from { transform: scaleX(1); }
+  to   { transform: scaleX(0); }
+}
+
+.toaster-glow [data-sonner-toast][data-type="success"] { --tone: #34e0b4; --tone-soft: rgba(52, 224, 180, 0.18); }
+.toaster-glow [data-sonner-toast][data-type="error"]   { --tone: #ff5c54; --tone-soft: rgba(255, 92, 84, 0.18); }
+.toaster-glow [data-sonner-toast][data-type="warning"] { --tone: #ffb020; --tone-soft: rgba(255, 176, 32, 0.18); }
+.toaster-glow [data-sonner-toast][data-type="info"]    { --tone: #4c9dff; --tone-soft: rgba(76, 157, 255, 0.18); }
+
+/* 图标：发光圆角章——语义色前景 + 同色柔光环 */
+.toaster-glow [data-sonner-toast] [data-icon] {
+  width: 28px;
+  height: 28px;
   margin-right: 12px;
+  margin-top: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--metal-accent) 15%, transparent);
-  color: var(--metal-accent);
+  border-radius: 9px;
+  background: var(--tone-soft);
+  color: var(--tone);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--tone) 30%, transparent), 0 0 14px -4px var(--tone);
   flex-shrink: 0;
 }
-.toaster-metal [data-sonner-toast] [data-icon] svg {
+.toaster-glow [data-sonner-toast] [data-icon] svg {
   width: 16px;
   height: 16px;
 }
 
-/* 文案层级：标题清晰、描述次级色 */
-.toaster-metal [data-sonner-toast] [data-title] {
+.toaster-glow [data-sonner-toast] [data-content] {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.toaster-glow [data-sonner-toast] [data-title] {
   font-size: 13.5px;
   font-weight: 600;
   letter-spacing: -0.01em;
-  color: #f2f2f2;
-  line-height: 1.35;
+  color: #f4f4f5;
+  line-height: 1.4;
+  white-space: normal;
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
-.toaster-metal [data-sonner-toast] [data-description] {
+.toaster-glow [data-sonner-toast] [data-description] {
   font-size: 12.5px;
-  color: #9a9a9a;
-  line-height: 1.45;
-  margin-top: 2px;
+  color: #a0a0a6;
+  line-height: 1.5;
+  margin-top: 3px;
+  white-space: normal;
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
-/* 关闭按钮：默认低调，hover 提亮 */
-.toaster-metal [data-sonner-toast] [data-close-button] {
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+/* 关闭按钮：常驻右上角，低调 hover 提亮 */
+.toaster-glow [data-sonner-toast] [data-close-button] {
+  --toast-close-button-start: unset;
+  --toast-close-button-end: 0;
+  --toast-close-button-transform: translate(35%, -35%);
+  left: unset;
+  right: 0;
+  width: 20px;
+  height: 20px;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.09);
   color: #b5b5b5;
-  transition: background 150ms ease, color 150ms ease;
+  transition: background 150ms ease, color 150ms ease, transform 150ms ease;
 }
-.toaster-metal [data-sonner-toast] [data-close-button]:hover {
-  background: rgba(255, 255, 255, 0.1);
+.toaster-glow [data-sonner-toast] [data-close-button]:hover {
+  background: rgba(255, 255, 255, 0.12);
   color: #ffffff;
 }
 
-/* 动作/取消按钮：跟随整体圆角与字重 */
-.toaster-metal [data-sonner-toast] [data-button] {
-  border-radius: 7px;
+.toaster-glow [data-sonner-toast] [data-button] {
+  border-radius: 8px;
   font-weight: 500;
 }
 
-/* 偏好减少动效时关闭过渡（进出场位移交给 sonner，其本身也遵循该偏好） */
 @media (prefers-reduced-motion: reduce) {
-  .toaster-metal [data-sonner-toast],
-  .toaster-metal [data-sonner-toast] [data-close-button] {
+  .toaster-glow [data-sonner-toast],
+  .toaster-glow [data-sonner-toast] [data-close-button] {
     transition: none !important;
+  }
+  .toaster-glow [data-sonner-toast]::after {
+    animation: none !important;
+    display: none;
   }
 }
 `
@@ -110,7 +178,17 @@ const Toaster = ({ ...props }: ToasterProps) => {
       <style>{TOAST_CSS}</style>
       <Sonner
         theme="dark"
-        className="toaster-metal"
+        className="toaster-glow"
+        // 竖直平铺展开：多条通知条条完整可见，不被折叠成堆叠隐藏后面内容
+        expand
+        // 同时可见数量提到 6：批量操作时后续通知也能露出，不至于全排队看不到
+        visibleToasts={6}
+        // 每条右上角常驻关闭按钮，用户可手动清掉
+        closeButton
+        // 条目之间留出明显间隔
+        gap={14}
+        // 合理默认时长（毫秒）；sonner 悬停自动暂停计时，保留该行为
+        duration={4000}
         // 统一图标（lucide），配合上面的 [data-icon] 圆底呈现语义色
         icons={{
           success: <CheckCircle2 strokeWidth={2.25} />,

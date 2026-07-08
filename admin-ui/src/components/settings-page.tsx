@@ -1,15 +1,28 @@
-import { useEffect, useMemo, useState } from 'react'
+import { createContext, useContext, useEffect, useMemo, useState } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import {
   Server,
   Database,
   Trash,
+  Trash2,
   Activity,
   ChevronDown,
   ChevronUp,
   RotateCcw,
+  RefreshCw,
   Loader,
+  Loader2,
   AlertTriangle,
+  Search,
+  Fingerprint,
+  ShieldCheck,
+  SlidersHorizontal,
+  Download,
+  FileJson,
+  KeyRound,
+  ClipboardCopy,
+  X,
 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -25,11 +38,19 @@ import {
   DialogDescription,
 } from '@/components/ui/dialog'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Checkbox } from '@/components/ui/checkbox'
 import { StatCard } from '@/components/ui/stat-card'
-import { useConfigSnapshot, useUpdateConfig } from '@/hooks/use-credentials'
-import { useRestartService, useStorageStats, useCleanupStorage } from '@/hooks/use-ops'
+import { useConfigSnapshot, useUpdateConfig, useCredentials } from '@/hooks/use-credentials'
+import { useRestartService, useStorageStats, useCleanupStorage, useCheckUpdate, usePerformUpdate } from '@/hooks/use-ops'
 import { useUsageClients } from '@/hooks/use-usage'
-import { extractErrorMessage } from '@/lib/utils'
+import {
+  exportCredential,
+  listTrash,
+  restoreCredential,
+  purgeCredential,
+  purgeTrashBatch,
+} from '@/api/credentials'
+import { extractErrorMessage, copyToClipboard } from '@/lib/utils'
 import { RegionSelect } from '@/components/ui/region-select'
 import { NumberStepper } from '@/components/ui/number-stepper'
 import type {
@@ -38,6 +59,7 @@ import type {
   StoragePartition,
   StorageCleanupTarget,
   ClientRpm,
+  TrashItem,
 } from '@/types/api'
 
 // 人性化字节数：1536 → "1.5 KB"，0 → "0 B"（1024 进制）。
@@ -47,6 +69,119 @@ function formatBytes(bytes: number): string {
   const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
   const v = bytes / Math.pow(1024, i)
   return `${i === 0 ? String(v) : v.toFixed(1)} ${units[i]}`
+}
+
+// 触发浏览器下载一段 JSON（Blob + a.download），用于令牌导出。
+function downloadJson(filename: string, data: unknown) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
+}
+
+// 友好相对时间："X 秒/分钟/小时/天 前"。无法解析时回退原字符串。
+function timeAgo(iso: string | null | undefined): string {
+  if (!iso) return '—'
+  const t = new Date(iso).getTime()
+  if (!Number.isFinite(t)) return iso
+  const diff = Date.now() - t
+  if (diff < 0) return '刚刚'
+  const sec = Math.floor(diff / 1000)
+  if (sec < 60) return `${sec} 秒前`
+  const min = Math.floor(sec / 60)
+  if (min < 60) return `${min} 分钟前`
+  const hour = Math.floor(min / 60)
+  if (hour < 24) return `${hour} 小时前`
+  const day = Math.floor(hour / 24)
+  if (day < 30) return `${day} 天前`
+  const month = Math.floor(day / 30)
+  if (month < 12) return `${month} 个月前`
+  return `${Math.floor(month / 12)} 年前`
+}
+
+/* ============ 分区导航 + 搜索 基础设施 ============ */
+
+// 设置分区（顶部 tab）。id 用于 tab 切换与卡片归属；label 为中文标题。
+type SectionId = 'basic' | 'security' | 'scheduling' | 'storage' | 'service' | 'privacy' | 'export' | 'trash'
+
+const SECTIONS: { id: SectionId; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
+  { id: 'basic', label: '基础', icon: SlidersHorizontal },
+  { id: 'security', label: '安全', icon: ShieldCheck },
+  { id: 'scheduling', label: '调度', icon: Activity },
+  { id: 'storage', label: '存储', icon: Database },
+  { id: 'service', label: '服务管理', icon: Server },
+  { id: 'privacy', label: '隐私', icon: Fingerprint },
+  { id: 'export', label: '令牌导出', icon: Download },
+  { id: 'trash', label: '回收站', icon: Trash2 },
+]
+
+// 每张卡片的可搜索索引（标题 + 关键词）。既驱动搜索命中，也用于判断“无匹配”空态。
+// keywords 覆盖该卡片内所有设置项的文案，保证按关键词能跨区定位。
+const CARD_INDEX: { section: SectionId; title: string; keywords: string[] }[] = [
+  { section: 'basic', title: '服务信息', keywords: ['监听地址', 'host', '端口', 'port', '区域', 'region', 'tls 后端', 'rustls', 'native-tls', '默认 endpoint', '配置文件'] },
+  { section: 'basic', title: '客户端伪装', keywords: ['kiro 版本', '系统版本', 'node 版本', '提取 thinking', 'thinking'] },
+  { section: 'basic', title: '网络与上号', keywords: ['全局代理', 'proxy', '上号回调地址', 'callback', '回调模式', 'admin key'] },
+  { section: 'security', title: '反代安全', keywords: ['cors 允许来源', 'ip 白名单', 'cidr', '信任 x-forwarded-for', 'xff', '入口限流', '请求体上限', '413', '429'] },
+  { section: 'scheduling', title: '负载均衡模式', keywords: ['负载均衡', '优先级模式', '均衡负载', 'priority', 'balanced'] },
+  { section: 'scheduling', title: '防关联 / 限流', keywords: ['冷却机制', '速率限制', '每日上限', '最小请求间隔', '会话亲和性', 'affinity'] },
+  { section: 'scheduling', title: '主动 token 预刷新', keywords: ['启用预刷新', '提前量', '扫描间隔', 'token 刷新'] },
+  { section: 'storage', title: '存储占用', keywords: ['存储', '清理', '落盘', '分区', 'traces', 'usage', 'trash', 'bg_cache', '磁盘'] },
+  { section: 'service', title: '服务管理', keywords: ['一键重启', '重启服务', 'restart'] },
+  { section: 'service', title: '客户端 RPM', keywords: ['客户端 rpm', '窗口', 'session', '吞吐', '活跃客户端'] },
+  { section: 'privacy', title: '隐私 / 客户端指纹', keywords: ['采集下游客户端指纹', '设备', 'ip', '系统', '浏览器', '隐私', 'fingerprint'] },
+  { section: 'export', title: '令牌导出', keywords: ['令牌导出', '凭据 json', '导出单个', '导出全部', 'token 导出', 'export'] },
+  { section: 'trash', title: '回收站', keywords: ['回收站', '已删除', '清空', '恢复', 'trash'] },
+]
+
+// 搜索上下文：query 为小写去空白后的关键词，'' 表示未搜索。
+const SearchContext = createContext<{ query: string }>({ query: '' })
+// 当前激活的分区 tab（未搜索时按此过滤卡片显示）。
+const ActiveSectionContext = createContext<SectionId>('basic')
+
+// 高亮命中片段（大小写不敏感，只高亮首个命中）。
+function Highlight({ text }: { text: string }) {
+  const { query } = useContext(SearchContext)
+  if (!query) return <>{text}</>
+  const idx = text.toLowerCase().indexOf(query)
+  if (idx === -1) return <>{text}</>
+  return (
+    <>
+      {text.slice(0, idx)}
+      <mark className="rounded bg-yellow-400/30 px-0.5 text-inherit">{text.slice(idx, idx + query.length)}</mark>
+      {text.slice(idx + query.length)}
+    </>
+  )
+}
+
+// 卡片可见性 + 搜索上下文闸门：
+// - 未搜索：仅当卡片所属分区 == 当前激活 tab 时显示。
+// - 搜索中：标题命中则整卡显示（内部设置项全部展示）；仅关键词命中则显示卡片但把 query 下传，
+//   让内部 Field/ReadonlyRow 自行过滤，只留匹配项；都不命中则整卡隐藏。
+function SectionGate({
+  section,
+  title,
+  keywords = [],
+  children,
+}: {
+  section: SectionId
+  title: string
+  keywords?: string[]
+  children: React.ReactNode
+}) {
+  const { query } = useContext(SearchContext)
+  const active = useContext(ActiveSectionContext)
+  if (query) {
+    const titleMatch = title.toLowerCase().includes(query)
+    const kwMatch = keywords.some((k) => k.toLowerCase().includes(query))
+    if (!titleMatch && !kwMatch) return null
+    return <SearchContext.Provider value={{ query: titleMatch ? '' : query }}>{children}</SearchContext.Provider>
+  }
+  return section === active ? <>{children}</> : null
 }
 
 // 可编辑表单的本地状态（字符串化便于受控输入）
@@ -67,6 +202,8 @@ interface FormState {
   rateLimitMinIntervalMs: string
   affinityEnabled: boolean
   proxyUrl: string
+  proxyUsername: string
+  proxyPassword: string
   callbackBaseUrl: string
   // 反代安全（批次3）：列表用换行分隔的多行文本承载
   corsAllowedOrigins: string
@@ -115,6 +252,9 @@ function toForm(c: ConfigSnapshotResponse): FormState {
     rateLimitMinIntervalMs: String(c.rateLimitMinIntervalMs),
     affinityEnabled: c.affinityEnabled,
     proxyUrl: c.proxyUrl ?? '',
+    // 代理账密出于安全后端不下发,UI 留空占位:留空=不改,填了=更新。
+    proxyUsername: '',
+    proxyPassword: '',
     callbackBaseUrl: c.callbackBaseUrl ?? '',
     corsAllowedOrigins: listToLines(c.corsAllowedOrigins ?? []),
     ipAllowlist: listToLines(c.ipAllowlist ?? []),
@@ -127,12 +267,20 @@ function toForm(c: ConfigSnapshotResponse): FormState {
   }
 }
 
-// 一行可编辑/只读项布局
+// 搜索命中判定：query 为空恒真；否则 label/hint 任一包含 query 才算命中（用于逐项过滤）。
+function rowMatches(query: string, label: string, hint?: string): boolean {
+  if (!query) return true
+  return label.toLowerCase().includes(query) || (hint?.toLowerCase().includes(query) ?? false)
+}
+
+// 一行可编辑/只读项布局。搜索态下若本项不命中则隐藏，命中则高亮 label。
 function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
+  const { query } = useContext(SearchContext)
+  if (!rowMatches(query, label, hint)) return null
   return (
     <div className="flex items-start justify-between gap-4 py-3 border-b last:border-0">
       <div className="shrink-0 min-w-[40%]">
-        <div className="text-sm">{label}</div>
+        <div className="text-sm"><Highlight text={label} /></div>
         {hint && <div className="text-xs text-muted-foreground mt-0.5">{hint}</div>}
       </div>
       <div className="flex-1 flex justify-end">{children}</div>
@@ -141,9 +289,11 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
 }
 
 function ReadonlyRow({ label, value, mono }: { label: string; value: React.ReactNode; mono?: boolean }) {
+  const { query } = useContext(SearchContext)
+  if (!rowMatches(query, label)) return null
   return (
     <div className="flex items-start justify-between gap-4 py-2 border-b last:border-0">
-      <span className="text-sm text-muted-foreground shrink-0">{label}</span>
+      <span className="text-sm text-muted-foreground shrink-0"><Highlight text={label} /></span>
       <span className={`text-sm text-right break-all ${mono ? 'font-mono text-xs' : ''}`}>{value}</span>
     </div>
   )
@@ -200,22 +350,51 @@ function ConfirmDialog({
   )
 }
 
-/* ============ 1. 服务管理：一键重启 ============ */
+/* ============ 1. 服务管理：一键重启 + OTA 更新 ============ */
 function ServiceManagementCard() {
   const [confirmOpen, setConfirmOpen] = useState(false)
   const { mutate: restart, isPending } = useRestartService()
+  // OTA 更新：检查 + 一键升级
+  const { mutate: checkUpd, isPending: checking, data: updInfo } = useCheckUpdate()
+  const { mutate: performUpd, isPending: upgrading } = usePerformUpdate()
+  const [upgradeConfirm, setUpgradeConfirm] = useState(false)
 
   const handleConfirm = () => {
     restart(undefined, {
       // 重启会掐断本次连接，成功/失败都当作"已发起"提示——真正结果看服务是否恢复。
       onSuccess: (resp) => {
-        toast.success(resp.message || '重启中，数秒后恢复')
+        toast.success(resp.message || '重启中，约 3 秒后自动恢复')
         setConfirmOpen(false)
       },
       onError: () => {
         // 连接被重启中断而抛错属预期，仍提示已发起
-        toast.warning('重启中，数秒后恢复（本次连接已中断，属正常）')
+        toast.warning('重启中，约 3 秒后自动恢复（本次连接已中断，属正常）')
         setConfirmOpen(false)
+      },
+    })
+  }
+
+  const handleCheck = () => {
+    checkUpd(undefined, {
+      onSuccess: (r) => {
+        if (r.error) toast.error(`检查更新失败：${r.error}`)
+        else if (r.has_update) toast.success(`发现新版本 ${r.latest_version}（当前 ${r.local_version}）`)
+        else toast.success(`已是最新版本 ${r.local_version}`)
+      },
+      onError: (e) => toast.error(`检查更新失败：${(e as Error).message}`),
+    })
+  }
+
+  const handleUpgrade = () => {
+    performUpd(undefined, {
+      onSuccess: (r) => {
+        toast.success(r.message || '升级中，数秒后自动重启恢复')
+        setUpgradeConfirm(false)
+      },
+      onError: () => {
+        // 升级成功后会自动重启导致本次连接中断，抛错也当"已发起"
+        toast.warning('升级已发起，若成功将自动重启（本次连接可能中断，属正常）')
+        setUpgradeConfirm(false)
       },
     })
   }
@@ -225,28 +404,80 @@ function ServiceManagementCard() {
       <CardHeader className="pb-2">
         <CardTitle className="text-base flex items-center gap-2">
           <Server className="h-4 w-4 text-muted-foreground" />
-          服务管理
+          <Highlight text="服务管理" />
         </CardTitle>
       </CardHeader>
       <CardContent className="space-y-3">
         <p className="text-sm text-muted-foreground">
-          一键重启网关服务。重启瞬间会短暂断服数秒，期间请求失败——Claude Code 自身也走本网关，务必确认无进行中的关键请求。
+          一键重启网关服务。重启瞬间会短暂断服数秒，期间请求失败——若有客户端正经由本网关，务必确认无进行中的关键请求。重启后约 3 秒自动恢复。
         </p>
         <Button variant="destructive" size="sm" onClick={() => setConfirmOpen(true)} disabled={isPending}>
           <RotateCcw className="mr-1.5 h-4 w-4" />
           一键重启服务
         </Button>
+
+        {/* OTA 更新：检查 GitHub 最新版本 + 一键升级（多镜像回退 + sha256 校验 + 换二进制 + 自动重启） */}
+        <div className="border-t pt-3 space-y-2">
+          <p className="text-sm text-muted-foreground">
+            从 GitHub 检查并一键升级到最新版本（多镜像加速 + sha256 校验，升级后自动重启）。
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button variant="outline" size="sm" onClick={handleCheck} disabled={checking || upgrading}>
+              {checking ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-1.5 h-4 w-4" />}
+              检查更新
+            </Button>
+            {updInfo && !updInfo.error && (
+              <span className="text-xs text-muted-foreground">
+                当前 <span className="font-mono">{updInfo.local_version}</span>
+                {updInfo.latest_version && (
+                  <> · 最新 <span className="font-mono">{updInfo.latest_version}</span></>
+                )}
+              </span>
+            )}
+            {updInfo?.has_update && (
+              <Button size="sm" onClick={() => setUpgradeConfirm(true)} disabled={upgrading}>
+                {upgrading ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <RotateCcw className="mr-1.5 h-4 w-4" />}
+                升级到 {updInfo.latest_version}
+              </Button>
+            )}
+          </div>
+          {/* commit 快照：展示"这版改了啥"（GitHub compare API 拉的 commit 列表），升级前先看清改动 */}
+          {updInfo?.has_update && updInfo.commits.length > 0 && (
+            <div className="mt-1 rounded-md border border-border/60 bg-secondary/30 p-2">
+              <div className="mb-1 text-xs font-medium text-muted-foreground">
+                本次更新包含 {updInfo.commits.length} 个提交：
+              </div>
+              <ul className="max-h-40 space-y-0.5 overflow-y-auto text-xs">
+                {updInfo.commits.map((c) => (
+                  <li key={c.sha} className="flex items-baseline gap-2">
+                    <span className="shrink-0 font-mono text-[10px] text-primary/80">{c.sha}</span>
+                    <span className="min-w-0 flex-1 truncate text-muted-foreground" title={c.title}>{c.title}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
       </CardContent>
 
       <ConfirmDialog
         open={confirmOpen}
         onOpenChange={setConfirmOpen}
         title="确认重启服务？"
-        description="重启会导致网关短暂断服数秒，期间所有请求失败（含正在进行的对话）。数秒后自动恢复。确定继续？"
+        description="重启会导致网关短暂断服数秒，期间所有请求失败（含正在进行的对话）。约 3 秒后自动恢复。确定继续？"
         confirmLabel="确认重启"
         destructive
         loading={isPending}
         onConfirm={handleConfirm}
+      />
+      <ConfirmDialog
+        open={upgradeConfirm}
+        onOpenChange={setUpgradeConfirm}
+        title={`确认升级到 ${updInfo?.latest_version ?? '最新版本'}？`}
+        description="将从 GitHub 下载新二进制、校验 sha256 后替换并自动重启。重启期间短暂断服数秒。确定继续？"
+        confirmLabel="确认升级"
+        loading={upgrading}
+        onConfirm={handleUpgrade}
       />
     </Card>
   )
@@ -336,7 +567,7 @@ function StorageStatsCard() {
       <CardHeader className="pb-2 flex-row items-center justify-between space-y-0">
         <CardTitle className="text-base flex items-center gap-2">
           <Database className="h-4 w-4 text-muted-foreground" />
-          存储占用
+          <Highlight text="存储占用" />
         </CardTitle>
         <Button variant="outline" size="sm" onClick={() => refetch()} disabled={isLoading}>
           刷新
@@ -484,7 +715,7 @@ function ClientRpmCard() {
       <CardHeader className="pb-2 flex-row items-center justify-between space-y-0">
         <CardTitle className="text-base flex items-center gap-2">
           <Activity className="h-4 w-4 text-muted-foreground" />
-          客户端 RPM
+          <Highlight text="客户端 RPM" />
           {isFetching && <Loader className="h-3.5 w-3.5 animate-spin text-muted-foreground" />}
         </CardTitle>
         <span className="text-xs text-muted-foreground">每 30 秒刷新（读本地统计）</span>
@@ -523,11 +754,528 @@ function ClientRpmCard() {
   )
 }
 
+/* ============ 4. 隐私：下游客户端指纹采集开关（立即生效） ============ */
+// 独立于底部批量保存：切换即调用 updateConfig，立即生效、无需重启。
+function PrivacyCard() {
+  const { data: config } = useConfigSnapshot()
+  const { mutate: save, isPending } = useUpdateConfig()
+
+  // 缺省视为开启（后端字段可能尚未下发时不误显示为关闭）
+  const enabled = config?.collectClientFingerprint ?? true
+
+  const toggle = (v: boolean) => {
+    save(
+      { collectClientFingerprint: v },
+      {
+        onSuccess: () =>
+          toast.success(v ? '已开启下游客户端指纹采集' : '已关闭下游客户端指纹采集，不再采集与存储'),
+        onError: (err) => toast.error(extractErrorMessage(err)),
+      }
+    )
+  }
+
+  return (
+    <Card>
+      <CardHeader className="pb-2">
+        <CardTitle className="text-base flex items-center gap-2">
+          <Fingerprint className="h-4 w-4 text-muted-foreground" />
+          <Highlight text="隐私 / 客户端指纹" />
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="py-0">
+        <Field
+          label="采集下游客户端指纹（设备/IP/系统/浏览器）"
+          hint="关闭后不再采集、不存储下游客户端的设备/IP/系统/浏览器信息，隐私性更好（不影响请求转发与用量统计）"
+        >
+          <Switch checked={enabled} disabled={isPending} onCheckedChange={toggle} />
+        </Field>
+      </CardContent>
+    </Card>
+  )
+}
+
+/* ============ 5. 令牌导出：单个 / 全部凭据 JSON 下载 ============ */
+function TokenExportCard() {
+  const { data: creds, isLoading, error, refetch } = useCredentials()
+  // 记录正在导出的凭据 id（单个），以及“导出全部”进行中标志，避免重复点击。
+  const [exportingId, setExportingId] = useState<number | null>(null)
+  const [exportingAll, setExportingAll] = useState(false)
+
+  const list = creds?.credentials ?? []
+
+  const stamp = () => new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
+
+  // 导出单个凭据完整 JSON 文件（可重新导入）。
+  const exportOne = async (id: number) => {
+    setExportingId(id)
+    try {
+      const obj = await exportCredential(id)
+      downloadJson(`credential-${id}-${stamp()}.json`, obj)
+      toast.success(`已导出凭据 #${id}`)
+    } catch (err) {
+      toast.error(extractErrorMessage(err))
+    } finally {
+      setExportingId(null)
+    }
+  }
+
+  // 仅导出 refreshToken 纯文本（API Key 凭据不含此字段）。
+  const exportRefreshTokenOne = async (id: number) => {
+    setExportingId(id)
+    try {
+      const obj = await exportCredential(id)
+      const token = obj.refreshToken
+      if (typeof token !== 'string' || !token) {
+        toast.error('该凭据不包含 refreshToken（可能是 API Key 凭据）')
+        return
+      }
+      const blob = new Blob([token], { type: 'text/plain' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `credential-${id}-refreshtoken-${stamp()}.txt`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+      toast.success(`已导出 #${id} 的 refreshToken`)
+    } catch (err) {
+      toast.error(extractErrorMessage(err))
+    } finally {
+      setExportingId(null)
+    }
+  }
+
+  // 复制单个凭据完整 JSON 到剪贴板。
+  const copyOne = async (id: number) => {
+    setExportingId(id)
+    try {
+      const obj = await exportCredential(id)
+      const ok = await copyToClipboard(JSON.stringify(obj, null, 2))
+      if (ok) {
+        toast.success(`已复制 #${id} 凭据 JSON 到剪贴板`)
+      } else {
+        toast.error('复制失败，请重试')
+      }
+    } catch (err) {
+      toast.error(extractErrorMessage(err))
+    } finally {
+      setExportingId(null)
+    }
+  }
+
+  // 导出全部：逐个串行拉取（避免并发压上游导出端点），打包成数组一次性下载。
+  const exportAll = async () => {
+    if (list.length === 0) return
+    setExportingAll(true)
+    try {
+      const all: Record<string, unknown>[] = []
+      for (const c of list) {
+        all.push(await exportCredential(c.id))
+      }
+      downloadJson(`credentials-all-${stamp()}.json`, all)
+      toast.success(`已导出全部 ${all.length} 个凭据`)
+    } catch (err) {
+      toast.error(extractErrorMessage(err))
+    } finally {
+      setExportingAll(false)
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader className="pb-2 flex-row items-center justify-between space-y-0">
+        <CardTitle className="text-base flex items-center gap-2">
+          <Download className="h-4 w-4 text-muted-foreground" />
+          <Highlight text="令牌导出" />
+        </CardTitle>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={exportAll}
+          disabled={exportingAll || isLoading || list.length === 0}
+        >
+          {exportingAll ? (
+            <Loader className="mr-1.5 h-4 w-4 animate-spin" />
+          ) : (
+            <Download className="mr-1.5 h-4 w-4" />
+          )}
+          导出全部（{list.length}）
+        </Button>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <p className="text-sm text-muted-foreground">
+          导出凭据令牌：完整 JSON（可重新导入）、仅 refreshToken 纯文本、或复制到剪贴板。
+          含 refreshToken / kiroApiKey 等敏感字段，请妥善保管、勿外泄。
+        </p>
+        {isLoading ? (
+          <div className="space-y-2">
+            <Skeleton className="h-10 w-full" />
+            <Skeleton className="h-10 w-full" />
+          </div>
+        ) : error ? (
+          <div className="py-3 text-center text-sm text-red-400">
+            加载凭据列表失败：{extractErrorMessage(error)}
+            <Button variant="outline" size="sm" className="ml-2" onClick={() => refetch()}>
+              重试
+            </Button>
+          </div>
+        ) : list.length === 0 ? (
+          <p className="py-4 text-center text-sm text-muted-foreground">暂无凭据可导出</p>
+        ) : (
+          <div>
+            {list.map((c) => (
+              <div
+                key={c.id}
+                className="flex items-center justify-between gap-4 border-b border-border/40 py-2.5 last:border-0"
+              >
+                <div className="min-w-0">
+                  <div className="truncate text-sm">
+                    #{c.id}
+                    {c.email ? ` · ${c.email}` : ''}
+                  </div>
+                  <div className="mt-0.5 text-[11px] text-muted-foreground">
+                    {c.subscriptionTitle || c.authMethod || '凭据'}
+                  </div>
+                </div>
+                <div className="flex shrink-0 items-center gap-1.5">
+                  {exportingId === c.id ? (
+                    <div className="flex h-8 items-center px-2 text-xs text-muted-foreground">
+                      <Loader className="mr-1 h-3.5 w-3.5 animate-spin" />
+                      导出中
+                    </div>
+                  ) : (
+                    <>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => exportOne(c.id)}
+                        disabled={exportingAll}
+                        title="下载完整凭据 JSON（可重新导入）"
+                      >
+                        <FileJson className="mr-1 h-3.5 w-3.5" />
+                        JSON
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="icon"
+                        className="h-8 w-8"
+                        onClick={() => exportRefreshTokenOne(c.id)}
+                        disabled={exportingAll}
+                        title="仅下载 refreshToken 纯文本"
+                      >
+                        <KeyRound className="h-3.5 w-3.5" />
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="icon"
+                        className="h-8 w-8"
+                        onClick={() => copyOne(c.id)}
+                        disabled={exportingAll}
+                        title="复制完整 JSON 到剪贴板"
+                      >
+                        <ClipboardCopy className="h-3.5 w-3.5" />
+                      </Button>
+                    </>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+/* ============ 6. 回收站：已删除凭据的恢复 / 永久清除 ============ */
+// 待确认的危险操作：单条永久删除 / 清空选中 / 清空全部。
+type TrashConfirm =
+  | { kind: 'one'; item: TrashItem }
+  | { kind: 'selected'; ids: number[] }
+  | { kind: 'all' }
+
+// 回收站单行：勾选 + 元信息 + 恢复 / 永久删除。
+function TrashRow({
+  item,
+  checked,
+  onToggle,
+  onRestore,
+  onPurge,
+  busy,
+}: {
+  item: TrashItem
+  checked: boolean
+  onToggle: (v: boolean) => void
+  onRestore: () => void
+  onPurge: () => void
+  busy: boolean
+}) {
+  return (
+    <div className="flex items-center justify-between gap-4 border-b border-border/40 py-2.5 last:border-0">
+      <div className="flex min-w-0 items-center gap-3">
+        <Checkbox
+          checked={checked}
+          onCheckedChange={(v) => onToggle(v === true)}
+          aria-label={`选择 #${item.id}`}
+        />
+        <div className="min-w-0">
+          <div className="truncate text-sm">
+            #{item.id}
+            {item.email ? ` · ${item.email}` : ''}
+          </div>
+          <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground">
+            <span>{item.authMethod || '凭据'}</span>
+            <span>·</span>
+            <span title={item.deletedAt}>删除于 {timeAgo(item.deletedAt)}</span>
+            <span>·</span>
+            <span>成功 {item.successCount} 次</span>
+          </div>
+        </div>
+      </div>
+      <div className="flex shrink-0 items-center gap-2">
+        <Button variant="outline" size="sm" onClick={onRestore} disabled={busy}>
+          <RotateCcw className="mr-1 h-3.5 w-3.5" />
+          恢复
+        </Button>
+        <Button variant="destructive" size="sm" onClick={onPurge} disabled={busy}>
+          <Trash className="mr-1 h-3.5 w-3.5" />
+          永久删除
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+function TrashCard() {
+  const queryClient = useQueryClient()
+  const { data, isLoading, error, refetch, isFetching } = useQuery({
+    queryKey: ['trash'],
+    queryFn: listTrash,
+    refetchInterval: 30000,
+  })
+
+  const list = useMemo(() => data?.trash ?? [], [data])
+
+  // 本地勾选态；随列表变化剔除已不存在的 id。
+  const [selected, setSelected] = useState<Set<number>>(new Set())
+  useEffect(() => {
+    setSelected((prev) => {
+      const valid = new Set(list.map((t) => t.id))
+      const next = new Set<number>()
+      prev.forEach((id) => valid.has(id) && next.add(id))
+      return next.size === prev.size ? prev : next
+    })
+  }, [list])
+
+  const [confirm, setConfirm] = useState<TrashConfirm | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  const allChecked = list.length > 0 && selected.size === list.length
+  const someChecked = selected.size > 0 && !allChecked
+
+  const toggleAll = (v: boolean) => {
+    setSelected(v ? new Set(list.map((t) => t.id)) : new Set())
+  }
+
+  const toggleOne = (id: number, v: boolean) => {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (v) next.add(id)
+      else next.delete(id)
+      return next
+    })
+  }
+
+  const invalidate = () => {
+    queryClient.invalidateQueries({ queryKey: ['trash'] })
+    queryClient.invalidateQueries({ queryKey: ['credentials'] })
+  }
+
+  // 恢复无需二次确认（非破坏性）。
+  const handleRestore = async (item: TrashItem) => {
+    setBusy(true)
+    try {
+      await restoreCredential(item.id)
+      toast.success(`已恢复凭据 #${item.id}`)
+      invalidate()
+    } catch (err) {
+      toast.error(extractErrorMessage(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  // 执行已确认的破坏性操作。
+  const runConfirmed = async () => {
+    if (!confirm) return
+    setBusy(true)
+    try {
+      if (confirm.kind === 'one') {
+        await purgeCredential(confirm.item.id)
+        toast.success(`已永久删除凭据 #${confirm.item.id}`)
+      } else if (confirm.kind === 'selected') {
+        await purgeTrashBatch(confirm.ids)
+        toast.success(`已永久删除选中的 ${confirm.ids.length} 项`)
+      } else {
+        await purgeTrashBatch()
+        toast.success('已清空回收站')
+      }
+      setSelected(new Set())
+      setConfirm(null)
+      invalidate()
+    } catch (err) {
+      toast.error(extractErrorMessage(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const total = data?.total ?? list.length
+
+  const confirmTitle =
+    confirm?.kind === 'one'
+      ? `永久删除凭据 #${confirm.item.id}？`
+      : confirm?.kind === 'selected'
+        ? `永久删除选中的 ${confirm.ids.length} 项？`
+        : '清空整个回收站？'
+
+  return (
+    <Card>
+      <CardHeader className="pb-2 flex-row items-center justify-between space-y-0">
+        <CardTitle className="text-base flex items-center gap-2">
+          <Trash2 className="h-4 w-4 text-muted-foreground" />
+          <Highlight text="回收站" />
+          {isFetching && <Loader className="h-3.5 w-3.5 animate-spin text-muted-foreground" />}
+        </CardTitle>
+        <Button variant="outline" size="sm" onClick={() => refetch()} disabled={isLoading}>
+          刷新
+        </Button>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <p className="text-sm text-muted-foreground">
+          已删除的凭据暂存于此，可恢复回号池或永久清除。永久删除后<strong className="text-red-400">无法恢复</strong>。
+        </p>
+
+        {isLoading ? (
+          <div className="space-y-2">
+            <Skeleton className="h-12 w-full" />
+            <Skeleton className="h-12 w-full" />
+            <Skeleton className="h-12 w-full" />
+          </div>
+        ) : error ? (
+          <div className="py-4 text-center text-sm text-red-400">
+            加载回收站失败：{extractErrorMessage(error)}
+            <Button variant="outline" size="sm" className="ml-2" onClick={() => refetch()}>
+              重试
+            </Button>
+          </div>
+        ) : list.length === 0 ? (
+          <div className="flex flex-col items-center gap-2 py-12 text-center text-sm text-muted-foreground">
+            <Trash2 className="h-8 w-8 opacity-40" />
+            回收站为空
+          </div>
+        ) : (
+          <>
+            {/* 工具栏：全选 + 批量操作 */}
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-border/60 bg-secondary/30 px-3 py-2">
+              <label className="flex cursor-pointer items-center gap-2 text-sm">
+                <Checkbox
+                  checked={allChecked ? true : someChecked ? 'indeterminate' : false}
+                  onCheckedChange={(v) => toggleAll(v === true)}
+                  aria-label="全选"
+                />
+                <span>
+                  全选
+                  {selected.size > 0 && (
+                    <span className="ml-1 text-muted-foreground">（已选 {selected.size} / {total}）</span>
+                  )}
+                </span>
+              </label>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="destructive"
+                  size="sm"
+                  disabled={selected.size === 0 || busy}
+                  onClick={() => setConfirm({ kind: 'selected', ids: Array.from(selected) })}
+                >
+                  <Trash className="mr-1 h-3.5 w-3.5" />
+                  清空选中
+                </Button>
+                <Button
+                  variant="destructive"
+                  size="sm"
+                  disabled={busy}
+                  onClick={() => setConfirm({ kind: 'all' })}
+                >
+                  <Trash2 className="mr-1 h-3.5 w-3.5" />
+                  清空全部
+                </Button>
+              </div>
+            </div>
+
+            <div>
+              {list.map((item) => (
+                <TrashRow
+                  key={item.id}
+                  item={item}
+                  checked={selected.has(item.id)}
+                  onToggle={(v) => toggleOne(item.id, v)}
+                  onRestore={() => handleRestore(item)}
+                  onPurge={() => setConfirm({ kind: 'one', item })}
+                  busy={busy}
+                />
+              ))}
+            </div>
+          </>
+        )}
+      </CardContent>
+
+      <ConfirmDialog
+        open={confirm !== null}
+        onOpenChange={(v) => !v && setConfirm(null)}
+        title={confirmTitle}
+        description={
+          <span>
+            此操作将<strong className="text-red-400">永久删除，无法恢复</strong>。
+            {confirm?.kind === 'all'
+              ? '回收站内全部条目都会被清除。'
+              : '删除后无法再从回收站找回。'}
+          </span>
+        }
+        confirmLabel="确认永久删除"
+        destructive
+        loading={busy}
+        onConfirm={runConfirmed}
+      />
+    </Card>
+  )
+}
+
 export function SettingsPage() {
   const { data: config, isLoading, error, refetch } = useConfigSnapshot()
   const { mutate: save, isPending: isSaving } = useUpdateConfig()
 
   const [form, setForm] = useState<FormState | null>(null)
+
+  // 分区导航当前 tab + 搜索关键词（纯前端）。
+  const [activeSection, setActiveSection] = useState<SectionId>('basic')
+  const [searchRaw, setSearchRaw] = useState('')
+  const query = searchRaw.trim().toLowerCase()
+
+  // 搜索态下命中的分区集合（用于结果提示条的“命中 N 个分区”与空态判断）。
+  const matchedSections = useMemo(() => {
+    if (!query) return new Set<SectionId>()
+    const s = new Set<SectionId>()
+    for (const c of CARD_INDEX) {
+      if (c.title.toLowerCase().includes(query) || c.keywords.some((k) => k.includes(query))) {
+        s.add(c.section)
+      }
+    }
+    return s
+  }, [query])
+
+  const hasAnyMatch = matchedSections.size > 0
 
   // 配置加载/刷新后，重置表单基线
   useEffect(() => {
@@ -560,6 +1308,9 @@ export function SettingsPage() {
     if (Number.isFinite(interval) && interval !== config.rateLimitMinIntervalMs) d.rateLimitMinIntervalMs = interval
     if (form.affinityEnabled !== config.affinityEnabled) d.affinityEnabled = form.affinityEnabled
     if (form.proxyUrl.trim() !== (config.proxyUrl ?? '')) d.proxyUrl = form.proxyUrl.trim()
+    // 代理账密:后端不下发(安全),故只在用户填了内容时才发送(留空=保持不变)。
+    if (form.proxyUsername.trim() !== '') d.proxyUsername = form.proxyUsername.trim()
+    if (form.proxyPassword !== '') d.proxyPassword = form.proxyPassword
     if (form.callbackBaseUrl.trim() !== (config.callbackBaseUrl ?? '')) d.callbackBaseUrl = form.callbackBaseUrl.trim()
     // 反代安全
     const origins = linesToList(form.corsAllowedOrigins)
@@ -629,23 +1380,102 @@ export function SettingsPage() {
   const inputCls = 'max-w-[260px] text-right'
 
   return (
+    <SearchContext.Provider value={{ query }}>
+    <ActiveSectionContext.Provider value={activeSection}>
     <div className="space-y-6 pb-24">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-4">
         <h2 className="text-xl font-semibold text-gradient-brand">设置</h2>
-        <Button variant="outline" size="sm" onClick={() => refetch()} disabled={isSaving}>
-          刷新
-        </Button>
+        <div className="flex items-center gap-2">
+          {/* 搜索：跨区定位设置项，命中即高亮/过滤 */}
+          <div className="relative">
+            <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              className="w-56 pl-8 pr-8"
+              value={searchRaw}
+              onChange={(e) => setSearchRaw(e.target.value)}
+              placeholder="搜索设置项…"
+              aria-label="搜索设置项"
+            />
+            {searchRaw && (
+              <button
+                type="button"
+                onClick={() => setSearchRaw('')}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                aria-label="清除搜索"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            )}
+          </div>
+          <Button variant="outline" size="sm" onClick={() => refetch()} disabled={isSaving}>
+            刷新
+          </Button>
+        </div>
       </div>
 
-      {/* 运维：服务管理 / 存储 / 客户端 RPM（对接已就绪后端端点） */}
-      <ServiceManagementCard />
-      <StorageStatsCard />
-      <ClientRpmCard />
+      {/* 分区导航 tab：搜索态下隐藏（改为跨区展示命中项） */}
+      {!query && (
+        <div className="flex flex-wrap gap-2 border-b pb-3">
+          {SECTIONS.map((s) => {
+            const Icon = s.icon
+            const isActive = s.id === activeSection
+            return (
+              <Button
+                key={s.id}
+                variant={isActive ? 'default' : 'outline'}
+                size="sm"
+                onClick={() => setActiveSection(s.id)}
+              >
+                <Icon className="mr-1.5 h-4 w-4" />
+                {s.label}
+              </Button>
+            )
+          })}
+        </div>
+      )}
 
-      {/* 负载均衡（立即生效） */}
+      {/* 搜索态提示条 */}
+      {query && (
+        <p className="text-sm text-muted-foreground">
+          {hasAnyMatch
+            ? `“${searchRaw.trim()}” 的匹配结果（命中 ${matchedSections.size} 个分区）`
+            : `没有匹配“${searchRaw.trim()}”的设置项`}
+        </p>
+      )}
+
+      {/* 服务管理分区：一键重启 */}
+      <SectionGate section="service" title="服务管理" keywords={['一键重启', '重启服务', 'restart']}>
+        <ServiceManagementCard />
+      </SectionGate>
+      {/* 存储分区：占用统计 + 清理 */}
+      <SectionGate section="storage" title="存储占用" keywords={['存储', '清理', '落盘', '分区', 'traces', 'usage', 'trash', 'bg_cache', '磁盘']}>
+        <StorageStatsCard />
+      </SectionGate>
+      {/* 服务管理分区：客户端 RPM */}
+      <SectionGate section="service" title="客户端 RPM" keywords={['客户端 rpm', '窗口', 'session', '吞吐', '活跃客户端']}>
+        <ClientRpmCard />
+      </SectionGate>
+
+      {/* 隐私分区：客户端指纹采集开关（立即生效） */}
+      <SectionGate section="privacy" title="隐私 / 客户端指纹" keywords={['采集下游客户端指纹', '设备', 'ip', '系统', '浏览器', '隐私', 'fingerprint']}>
+        <PrivacyCard />
+      </SectionGate>
+
+      {/* 令牌导出分区：单个 / 全部凭据 JSON 下载 */}
+      <SectionGate section="export" title="令牌导出" keywords={['令牌导出', '凭据 json', '导出单个', '导出全部', 'token 导出', 'export']}>
+        <TokenExportCard />
+      </SectionGate>
+
+      {/* 回收站分区：已删除凭据的恢复 / 永久清除 */}
+      <SectionGate section="trash" title="回收站" keywords={['回收站', '已删除', '清空', '恢复', 'trash']}>
+        <TrashCard />
+      </SectionGate>
+
+      {/* 调度分区：负载均衡（立即生效） */}
+      <SectionGate section="scheduling" title="负载均衡模式" keywords={['负载均衡', '优先级模式', '均衡负载', 'priority', 'balanced']}>
       <Card>
         <CardHeader className="pb-2">
-          <CardTitle className="text-base">负载均衡模式</CardTitle>
+          <CardTitle className="text-base"><Highlight text="负载均衡模式" /></CardTitle>
         </CardHeader>
         <CardContent className="space-y-3">
           <p className="text-sm text-muted-foreground">
@@ -669,11 +1499,13 @@ export function SettingsPage() {
           </div>
         </CardContent>
       </Card>
+      </SectionGate>
 
-      {/* 服务信息（需重启） */}
+      {/* 基础分区：服务信息（需重启） */}
+      <SectionGate section="basic" title="服务信息" keywords={['监听地址', 'host', '端口', 'port', '区域', 'region', 'tls 后端', 'rustls', 'native-tls', '默认 endpoint', '配置文件']}>
       <Card>
         <CardHeader className="pb-2">
-          <CardTitle className="text-base">服务信息</CardTitle>
+          <CardTitle className="text-base"><Highlight text="服务信息" /></CardTitle>
         </CardHeader>
         <CardContent className="py-0">
           <Field label="监听地址 host" hint="需重启生效">
@@ -703,11 +1535,13 @@ export function SettingsPage() {
           {config.configPath && <ReadonlyRow label="配置文件" value={config.configPath} mono />}
         </CardContent>
       </Card>
+      </SectionGate>
 
-      {/* 客户端伪装（需重启） */}
+      {/* 基础分区：客户端伪装（需重启） */}
+      <SectionGate section="basic" title="客户端伪装" keywords={['kiro 版本', '系统版本', 'node 版本', '提取 thinking', 'thinking']}>
       <Card>
         <CardHeader className="pb-2">
-          <CardTitle className="text-base">客户端伪装</CardTitle>
+          <CardTitle className="text-base"><Highlight text="客户端伪装" /></CardTitle>
         </CardHeader>
         <CardContent className="py-0">
           <Field label="Kiro 版本" hint="需重启生效">
@@ -724,11 +1558,13 @@ export function SettingsPage() {
           </Field>
         </CardContent>
       </Card>
+      </SectionGate>
 
-      {/* 防关联 / 限流（需重启） */}
+      {/* 调度分区：防关联 / 限流（需重启） */}
+      <SectionGate section="scheduling" title="防关联 / 限流" keywords={['冷却机制', '速率限制', '每日上限', '最小请求间隔', '会话亲和性', 'affinity']}>
       <Card>
         <CardHeader className="pb-2">
-          <CardTitle className="text-base">防关联 / 限流</CardTitle>
+          <CardTitle className="text-base"><Highlight text="防关联 / 限流" /></CardTitle>
         </CardHeader>
         <CardContent className="py-0">
           <Field label="冷却机制" hint="失败后短暂跳过该凭据（需重启生效）">
@@ -748,15 +1584,23 @@ export function SettingsPage() {
           </Field>
         </CardContent>
       </Card>
+      </SectionGate>
 
-      {/* 网络与上号（需重启） */}
+      {/* 基础分区：网络与上号（需重启） */}
+      <SectionGate section="basic" title="网络与上号" keywords={['全局代理', 'proxy', '上号回调地址', 'callback', '回调模式', 'admin key']}>
       <Card>
         <CardHeader className="pb-2">
-          <CardTitle className="text-base">网络与上号</CardTitle>
+          <CardTitle className="text-base"><Highlight text="网络与上号" /></CardTitle>
         </CardHeader>
         <CardContent className="py-0">
           <Field label="全局代理" hint="http(s)://host:port 或 socks5://host:port，留空清除（需重启生效）">
             <Input className="max-w-[260px] font-mono text-xs" value={form.proxyUrl} onChange={(e) => set('proxyUrl', e.target.value)} placeholder="未配置" />
+          </Field>
+          <Field label="代理用户名" hint="需认证的代理才填。留空=不修改（后端出于安全不回显已存值，需重启生效）">
+            <Input className="max-w-[260px] font-mono text-xs" value={form.proxyUsername} onChange={(e) => set('proxyUsername', e.target.value)} placeholder="留空不改" autoComplete="off" />
+          </Field>
+          <Field label="代理密码" hint="需认证的代理才填。留空=不修改（后端出于安全不回显，需重启生效）">
+            <Input type="password" className="max-w-[260px] font-mono text-xs" value={form.proxyPassword} onChange={(e) => set('proxyPassword', e.target.value)} placeholder="留空不改" autoComplete="new-password" />
           </Field>
           <Field
             label="上号回调地址"
@@ -775,11 +1619,13 @@ export function SettingsPage() {
           <ReadonlyRow label="Admin Key" value={<Badge variant={config.hasAdminKey ? 'default' : 'secondary'}>{config.hasAdminKey ? '已设置' : '未设置'}</Badge>} />
         </CardContent>
       </Card>
+      </SectionGate>
 
-      {/* 反代安全（需重启） */}
+      {/* 安全分区：反代安全（需重启） */}
+      <SectionGate section="security" title="反代安全" keywords={['cors 允许来源', 'ip 白名单', 'cidr', '信任 x-forwarded-for', 'xff', '入口限流', '请求体上限', '413', '429']}>
       <Card>
         <CardHeader className="pb-2">
-          <CardTitle className="text-base">反代安全</CardTitle>
+          <CardTitle className="text-base"><Highlight text="反代安全" /></CardTitle>
         </CardHeader>
         <CardContent className="py-0">
           <Field
@@ -815,16 +1661,18 @@ export function SettingsPage() {
           <Field label="入口限流 (次/分钟/IP)" hint="0 表示关闭。超限返回 429（需重启生效）">
             <NumberStepper value={Number(form.ingressRateLimitPerMin) || 0} onChange={(v) => set('ingressRateLimitPerMin', String(v))} min={0} step={10} className="w-28" aria-label="入口限流" />
           </Field>
-          <Field label="请求体上限 (字节)" hint="默认 52428800（50MiB）。超限返回 413（需重启生效）">
-            <Input className={inputCls} type="number" value={form.maxBodyBytes} onChange={(e) => set('maxBodyBytes', e.target.value)} />
+          <Field label="请求体上限 (字节)" hint="0 = 不限制（推荐，大请求体走流式转发不占内存）。非 0 时超限返回 413（需重启生效）">
+            <NumberStepper value={Number(form.maxBodyBytes) || 0} onChange={(v) => set('maxBodyBytes', String(v))} min={0} step={1048576} className="w-40" aria-label="请求体上限（字节，0=不限制）" />
           </Field>
         </CardContent>
       </Card>
+      </SectionGate>
 
-      {/* 主动 token 预刷新（需重启） */}
+      {/* 调度分区：主动 token 预刷新（需重启） */}
+      <SectionGate section="scheduling" title="主动 token 预刷新" keywords={['启用预刷新', '提前量', '扫描间隔', 'token 刷新']}>
       <Card>
         <CardHeader className="pb-2">
-          <CardTitle className="text-base">主动 token 预刷新</CardTitle>
+          <CardTitle className="text-base"><Highlight text="主动 token 预刷新" /></CardTitle>
         </CardHeader>
         <CardContent className="py-0">
           <Field label="启用预刷新" hint="后台提前刷新将过期的 token，把刷新移出请求热路径、削掉突发（需重启生效）">
@@ -838,10 +1686,20 @@ export function SettingsPage() {
           </Field>
         </CardContent>
       </Card>
+      </SectionGate>
 
-      <p className="text-xs text-muted-foreground">
-        除负载均衡模式立即生效外，其余字段保存后需重启服务才生效。敏感字段（API/Admin 密钥、代理密码）出于安全不在此显示与修改，请在配置文件中维护。
-      </p>
+      {/* 搜索且全无匹配时的空态 */}
+      {query && !hasAnyMatch && (
+        <div className="py-16 text-center text-sm text-muted-foreground">
+          未找到匹配的设置项，换个关键词试试。
+        </div>
+      )}
+
+      {!query && (
+        <p className="text-xs text-muted-foreground">
+          除负载均衡模式与隐私开关立即生效外，其余字段保存后需重启服务才生效。敏感字段（API/Admin 密钥、代理账密）出于安全不回显已存值：代理账密留空表示保持不变，填入则更新；API/Admin 密钥仍请在配置文件中维护。
+        </p>
+      )}
 
       {/* 底部保存栏：仅覆盖 main 内容区（left-[240px] 避开 240px 侧栏，
           否则会盖住侧栏底部“网关在线”状态条造成重叠）；z-30 低于侧栏 z-40。 */}
@@ -859,5 +1717,7 @@ export function SettingsPage() {
         </div>
       </div>
     </div>
+    </ActiveSectionContext.Provider>
+    </SearchContext.Provider>
   )
 }

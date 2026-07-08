@@ -6,7 +6,9 @@ import type {
   GroupStat,
   RequestRecord,
   ClientRpm,
+  MachineRpm,
   ThroughputSnapshot,
+  RateLimitInsight,
 } from '@/types/api'
 
 // 复用与 credentials 相同的 baseURL 与鉴权拦截
@@ -62,6 +64,18 @@ export async function getUsageRecent(limit = 100): Promise<RequestRecord[]> {
 // per 客户端/窗口 RPM（发起方维度：谁开了几个窗口各打多少 RPM）
 export async function getUsageClients(): Promise<ClientRpm[]> {
   const { data } = await api.get<ClientRpm[]>('/usage/clients')
+  return data
+}
+
+// 机器维度 RPM（按设备指纹分组，IP 变化不拆分；IP 仅作见过列表）
+export async function getUsageMachines(): Promise<MachineRpm[]> {
+  const { data } = await api.get<MachineRpm[]>('/usage/machines')
+  return data
+}
+
+// 限流健康：每号 RPM/软上限/冷却/近期429/中文推断（只读内存零上游）
+export async function getRatelimitInsights(): Promise<RateLimitInsight[]> {
+  const { data } = await api.get<RateLimitInsight[]>('/ratelimit/insights')
   return data
 }
 

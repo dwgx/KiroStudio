@@ -22,7 +22,7 @@ api.interceptors.request.use((config) => {
 })
 
 // 一键重启服务（detached，systemctl restart）。
-// ⚠️ 重启瞬间本服务断连是预期行为——本次请求可能因连接中断而抛错，调用方需容忍。
+// 注意：重启瞬间本服务断连是预期行为——本次请求可能因连接中断而抛错，调用方需容忍。
 export async function restartService(): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>('/service/restart')
   return data
@@ -40,5 +40,40 @@ export async function cleanupStorage(
   req: StorageCleanupRequest
 ): Promise<StorageCleanupResponse> {
   const { data } = await api.post<StorageCleanupResponse>('/storage/cleanup', req)
+  return data
+}
+
+// OTA 更新检查结果（后端 snake_case，见 admin/update.rs UpdateCheckResult）。
+export interface CommitSnapshot {
+  sha: string
+  title: string
+  date: string | null
+}
+
+export interface UpdateCheckResult {
+  has_update: boolean
+  local_version: string
+  latest_version: string | null
+  available_versions: string[]
+  commits: CommitSnapshot[]
+  error: string | null
+}
+
+export interface UpdatePerformResult {
+  success: boolean
+  message: string
+  updated: boolean
+  target_version: string | null
+}
+
+// 检查更新（只读，多镜像回退拉 GitHub tags）。
+export async function checkUpdate(): Promise<UpdateCheckResult> {
+  const { data } = await api.get<UpdateCheckResult>('/update/check')
+  return data
+}
+
+// 一键升级（下载→sha256→替换→重启）。成功后服务会自动重启，请求可能因断连抛错，调用方容忍。
+export async function performUpdate(version?: string): Promise<UpdatePerformResult> {
+  const { data } = await api.post<UpdatePerformResult>('/update/perform', version ? { version } : {})
   return data
 }

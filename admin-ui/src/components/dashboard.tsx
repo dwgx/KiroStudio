@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, LogIn, Database, Zap } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Trash2, RotateCcw, CheckCircle2, Database, Zap, Ban, Power } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -10,12 +10,9 @@ import { CredentialCard } from '@/components/credential-card'
 import { StatCard } from '@/components/ui/stat-card'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
-import { LoginDialog } from '@/components/login-dialog'
-import { BatchImportDialog } from '@/components/batch-import-dialog'
-import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
-import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
-import { getCredentialBalance, forceRefreshToken, deepVerifyCredential } from '@/api/credentials'
+import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useSetDisabled } from '@/hooks/use-credentials'
+import { getCredentialBalance, getCachedBalances, forceRefreshToken, deepVerifyCredential } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
 
@@ -25,13 +22,59 @@ interface DashboardProps {
   embedded?: boolean
 }
 
+/**
+ * 文本过长时横向滚动（跑马灯），短文本静态显示——用于"当前活跃"卡片的邮箱：
+ * 长邮箱不再截断成省略号，而是在原地缓慢来回滚动看全。
+ * 测量内容宽 vs 容器宽，仅溢出时挂 .marquee-scrolling 并按溢出量算位移/时长。
+ */
+function ScrollOnOverflow({ text, className }: { text: string; className?: string }) {
+  const boxRef = useRef<HTMLSpanElement>(null)
+  const innerRef = useRef<HTMLSpanElement>(null)
+  const [shift, setShift] = useState(0)
+
+  useEffect(() => {
+    const box = boxRef.current
+    const inner = innerRef.current
+    if (!box || !inner) return
+    const measure = () => {
+      const overflow = inner.scrollWidth - box.clientWidth
+      // +8px 间隔，滚到底能完整看到末尾字符；不溢出则不滚。
+      setShift(overflow > 1 ? overflow + 8 : 0)
+    }
+    measure()
+    const ro = new ResizeObserver(measure)
+    ro.observe(box)
+    ro.observe(inner)
+    return () => ro.disconnect()
+  }, [text])
+
+  // 位移越大滚得越久，保持匀速观感（约 40px/s，clamp 到 [6s, 20s]）。
+  const duration = Math.min(20, Math.max(6, shift / 40))
+
+  return (
+    <span ref={boxRef} className={`block overflow-hidden ${className ?? ''}`}>
+      <span
+        ref={innerRef}
+        className={`inline-block whitespace-nowrap ${shift > 0 ? 'marquee-scrolling' : ''}`}
+        style={
+          shift > 0
+            ? ({
+                ['--marquee-shift' as string]: `${shift}px`,
+                ['--marquee-duration' as string]: `${duration}s`,
+              } as React.CSSProperties)
+            : undefined
+        }
+      >
+        {text}
+      </span>
+    </span>
+  )
+}
+
 export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
-  const [loginOpen, setLoginOpen] = useState(false)
-  const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
-  const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
   const [verifying, setVerifying] = useState(false)
@@ -57,6 +100,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const { data, isLoading, error, refetch } = useCredentials()
   const { mutate: deleteCredential } = useDeleteCredential()
   const { mutate: resetFailure } = useResetFailure()
+  const { mutateAsync: setDisabledAsync } = useSetDisabled()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
 
@@ -137,15 +181,17 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     onLogout()
   }
 
-  // 选择管理
+  // 选择管理：选中只通过卡片左上角勾选框，永远是加/减选（多选语义）。
   const toggleSelect = (id: number) => {
-    const newSelected = new Set(selectedIds)
-    if (newSelected.has(id)) {
-      newSelected.delete(id)
-    } else {
-      newSelected.add(id)
-    }
-    setSelectedIds(newSelected)
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) {
+        next.delete(id)
+      } else {
+        next.add(id)
+      }
+      return next
+    })
   }
 
   const deselectAll = () => {
@@ -257,6 +303,41 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     deselectAll()
   }
 
+  // 批量启用 / 禁用：对选中项统一设为目标状态（逐个调用，跳过已是目标态的）
+  const handleBatchSetDisabled = async (disabled: boolean) => {
+    if (selectedIds.size === 0) {
+      toast.error(disabled ? '请先选择要禁用的凭据' : '请先选择要启用的凭据')
+      return
+    }
+    const targetIds = Array.from(selectedIds).filter(id => {
+      const cred = data?.credentials.find(c => c.id === id)
+      return cred && cred.disabled !== disabled
+    })
+    if (targetIds.length === 0) {
+      toast.error(disabled ? '选中的凭据都已是禁用状态' : '选中的凭据都已是启用状态')
+      return
+    }
+
+    let successCount = 0
+    let failCount = 0
+    for (const id of targetIds) {
+      try {
+        await setDisabledAsync({ id, disabled })
+        successCount++
+      } catch {
+        failCount++
+      }
+    }
+
+    const action = disabled ? '禁用' : '启用'
+    if (failCount === 0) {
+      toast.success(`成功${action} ${successCount} 个凭据`)
+    } else {
+      toast.warning(`${action}：成功 ${successCount} 个，失败 ${failCount} 个`)
+    }
+    deselectAll()
+  }
+
   // 批量刷新 Token
   const handleBatchForceRefresh = async () => {
     if (selectedIds.size === 0) {
@@ -351,7 +432,9 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     deselectAll()
   }
 
-  // 查询当前页凭据信息（逐个查询，避免瞬时并发）
+  // 查询当前页凭据信息（只读已缓存余额快照，一次拉取、绝不触发上游调用）。
+  // 封号红线：绝不批量主动拉 per-account balance。后端后台每 30 分钟温和刷新缓存，
+  // 这里读的是最近已知值 + cachedAt 新鲜度，零上游、零风控风险。
   const handleQueryCurrentPageInfo = async () => {
     if (currentCredentials.length === 0) {
       toast.error('当前页没有可查询的凭据')
@@ -370,46 +453,36 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     setQueryingInfo(true)
     setQueryInfoProgress({ current: 0, total: ids.length })
 
-    let successCount = 0
-    let failCount = 0
+    try {
+      // 单次拉取全部已缓存余额快照（后端只读缓存，不打上游）。
+      const { balances } = await getCachedBalances()
 
-    for (let i = 0; i < ids.length; i++) {
-      const id = ids[i]
+      // 命中的（id, 缓存快照）对——在 setState 之外算好，避免依赖更新器执行时机。
+      const hits = ids
+        .map(id => [id, balances[String(id)]] as const)
+        .filter(([, cached]) => !!cached)
 
-      setLoadingBalanceIds(prev => {
-        const next = new Set(prev)
-        next.add(id)
+      setBalanceMap(prev => {
+        const next = new Map(prev)
+        for (const [id, cached] of hits) {
+          next.set(id, cached)
+        }
         return next
       })
 
-      try {
-        const balance = await getCredentialBalance(id)
-        successCount++
+      setQueryInfoProgress({ current: ids.length, total: ids.length })
 
-        setBalanceMap(prev => {
-          const next = new Map(prev)
-          next.set(id, balance)
-          return next
-        })
-      } catch (error) {
-        failCount++
-      } finally {
-        setLoadingBalanceIds(prev => {
-          const next = new Set(prev)
-          next.delete(id)
-          return next
-        })
+      const hitCount = hits.length
+      const missCount = ids.length - hitCount
+      if (missCount === 0) {
+        toast.success(`已读取缓存余额：${hitCount}/${ids.length}`)
+      } else {
+        toast.warning(`已读取缓存余额：${hitCount}/${ids.length}（${missCount} 个尚无缓存，后台会温和刷新）`)
       }
-
-      setQueryInfoProgress({ current: i + 1, total: ids.length })
-    }
-
-    setQueryingInfo(false)
-
-    if (failCount === 0) {
-      toast.success(`查询完成：成功 ${successCount}/${ids.length}`)
-    } else {
-      toast.warning(`查询完成：成功 ${successCount} 个，失败 ${failCount} 个`)
+    } catch (error) {
+      toast.error('读取缓存余额失败')
+    } finally {
+      setQueryingInfo(false)
     }
   }
 
@@ -607,18 +680,21 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
             accent={data?.currentId ? 'primary' : 'neutral'}
             hint={
               data?.currentId ? (
-                <span className="flex items-center gap-1.5">
-                  <span className="relative flex h-2 w-2">
+                <span className="flex min-w-0 items-center gap-1.5">
+                  <span className="relative flex h-2 w-2 shrink-0">
                     <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary/60" />
                     <span className="relative inline-flex h-2 w-2 rounded-full bg-primary" />
                   </span>
-                  <span className="truncate">
-                    {currentCredential?.email
-                      ? currentCredential.email
-                      : currentBalance?.subscriptionTitle
-                        ? currentBalance.subscriptionTitle
-                        : '正在处理请求'}
-                  </span>
+                  <ScrollOnOverflow
+                    className="min-w-0 flex-1"
+                    text={
+                      currentCredential?.email
+                        ? currentCredential.email
+                        : currentBalance?.subscriptionTitle
+                          ? currentBalance.subscriptionTitle
+                          : '正在处理请求'
+                    }
+                  />
                 </span>
               ) : (
                 '暂无活跃凭据'
@@ -629,17 +705,25 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
 
         {/* 凭据列表 */}
         <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-4">
+          {/* 工具栏：固定横向 flex-wrap + 最小高度，选中前后结构稳定不跳动 */}
+          <div className="flex flex-wrap items-center justify-between gap-3 min-h-[2.5rem]">
+            <div className="flex items-center gap-3">
               <h2 className="text-xl font-semibold">凭据管理</h2>
-              {selectedIds.size > 0 && (
-                <div className="flex items-center gap-2">
-                  <Badge variant="secondary">已选择 {selectedIds.size} 个</Badge>
-                  <Button onClick={deselectAll} size="sm" variant="ghost">
-                    取消选择
-                  </Button>
-                </div>
-              )}
+              {/* 选中信息固定占位：选中数为 0 时也占位，避免整块横竖流向跳动 */}
+              <div className="flex items-center gap-2 min-h-[2rem]">
+                {selectedIds.size > 0 ? (
+                  <>
+                    <Badge variant="secondary">已选择 {selectedIds.size} 个</Badge>
+                    <Button onClick={deselectAll} size="sm" variant="ghost">
+                      取消选择
+                    </Button>
+                  </>
+                ) : (
+                  <span className="text-sm text-muted-foreground">
+                    勾选复选框 或 Ctrl+左键 选择；右键卡片打开设置
+                  </span>
+                )}
+              </div>
             </div>
             <div className="flex gap-2 flex-wrap">
               {embedded && (
@@ -676,6 +760,26 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   <Button onClick={handleBatchResetFailure} size="sm" variant="outline">
                     <RotateCcw className="h-4 w-4 mr-2" />
                     恢复异常
+                  </Button>
+                  <Button
+                    onClick={() => handleBatchSetDisabled(true)}
+                    size="sm"
+                    variant="outline"
+                    disabled={selectedIds.size - selectedDisabledCount === 0}
+                    title={selectedIds.size - selectedDisabledCount === 0 ? '选中的凭据都已禁用' : undefined}
+                  >
+                    <Ban className="h-4 w-4 mr-2" />
+                    批量禁用
+                  </Button>
+                  <Button
+                    onClick={() => handleBatchSetDisabled(false)}
+                    size="sm"
+                    variant="outline"
+                    disabled={selectedDisabledCount === 0}
+                    title={selectedDisabledCount === 0 ? '选中的凭据都已启用' : undefined}
+                  >
+                    <Power className="h-4 w-4 mr-2" />
+                    批量启用
                   </Button>
                   <Button
                     onClick={handleBatchDelete}
@@ -719,19 +823,9 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   清除已禁用
                 </Button>
               )}
-              <Button onClick={() => setKamImportDialogOpen(true)} size="sm" variant="outline">
-                <FileUp className="h-4 w-4 mr-2" />
-                Kiro Account Manager 导入
-              </Button>
-              <Button onClick={() => setBatchImportDialogOpen(true)} size="sm" variant="outline">
-                <Upload className="h-4 w-4 mr-2" />
-                批量导入
-              </Button>
-              <Button onClick={() => setLoginOpen(true)} size="sm" variant="default">
-                <LogIn className="h-4 w-4 mr-2" />
-                上号
-              </Button>
-              <Button onClick={() => setAddDialogOpen(true)} size="sm" variant="outline">
+              {/* KAM 导入 / 批量导入 / 上号 已合并进「添加凭据」弹框的分页（手动/导入粘贴/上号），
+                  这里只保留单一入口，简化工具栏。 */}
+              <Button onClick={() => setAddDialogOpen(true)} size="sm" variant="default">
                 <Plus className="h-4 w-4 mr-2" />
                 添加凭据
               </Button>
@@ -795,32 +889,11 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         onOpenChange={setBalanceDialogOpen}
       />
 
-      {/* 添加凭据对话框 */}
+      {/* 添加凭据对话框（已合并 手动添加 / 导入粘贴 / 上号 三种模式，
+          原独立的 上号 / 批量导入 / KAM 导入 弹框已并入此处） */}
       <AddCredentialDialog
         open={addDialogOpen}
         onOpenChange={setAddDialogOpen}
-      />
-
-      {/* 上号对话框 */}
-      <LoginDialog
-        open={loginOpen}
-        onOpenChange={setLoginOpen}
-        onSuccess={() => {
-          queryClient.invalidateQueries({ queryKey: ['credentials'] })
-          refetch()
-        }}
-      />
-
-      {/* 批量导入对话框 */}
-      <BatchImportDialog
-        open={batchImportDialogOpen}
-        onOpenChange={setBatchImportDialogOpen}
-      />
-
-      {/* KAM 账号导入对话框 */}
-      <KamImportDialog
-        open={kamImportDialogOpen}
-        onOpenChange={setKamImportDialogOpen}
       />
 
       {/* 批量验活对话框 */}

@@ -441,3 +441,69 @@
     animation: none;
   }
 }
+
+/* 溢出横向滚动跑马灯（仅"当前活跃"卡片邮箱过长时用）：
+   在头尾各留一段间隔平滑循环。仅在 JS 测得内容溢出时挂 .marquee-scrolling，
+   短文本静态不滚。位移量走 CSS 变量 --marquee-shift（= 内容宽 - 容器宽 + 间隔）。 */
+@keyframes marquee-x {
+  0%,
+  8% {
+    transform: translateX(0);
+  }
+  92%,
+  100% {
+    transform: translateX(calc(-1 * var(--marquee-shift, 0px)));
+  }
+}
+.marquee-scrolling {
+  animation: marquee-x var(--marquee-duration, 8s) linear infinite alternate;
+}
+@media (prefers-reduced-motion: reduce) {
+  .marquee-scrolling {
+    animation: none;
+  }
+}
+
+/* 发光网格「传奇光环」：一圈旋转的 conic 光晕环绕灯体持续缓慢旋转，
+   像老魔兽/传奇里脚下的旋转法阵光圈。用 @property 动画角度让 conic 转、
+   元素不转（圆角不歪）；ring 用 mask 只显现一圈环。读元素级基色 --glow-rgb。
+   仅健康/有失败(lit)灯体挂；motion-reduce 停成静态柔环。 */
+@property --aura-angle {
+  syntax: '<angle>';
+  inherits: false;
+  initial-value: 0deg;
+}
+@keyframes legend-aura-spin {
+  to {
+    --aura-angle: 360deg;
+  }
+}
+.animate-legend-aura {
+  /* 光环略大于灯体，罩在灯体外圈 */
+  padding: 2px;
+  background: conic-gradient(
+    from var(--aura-angle),
+    transparent 0deg,
+    rgb(var(--glow-rgb) / 0.05) 60deg,
+    rgb(var(--glow-rgb) / 0.55) 140deg,
+    rgb(255 255 255 / 0.85) 172deg,
+    rgb(var(--glow-rgb) / 0.55) 200deg,
+    rgb(var(--glow-rgb) / 0.05) 300deg,
+    transparent 360deg
+  );
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  filter: blur(0.4px);
+  animation: legend-aura-spin 4.5s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .animate-legend-aura {
+    animation: none;
+  }
+}

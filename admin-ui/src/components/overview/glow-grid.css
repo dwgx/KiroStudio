@@ -1,0 +1,77 @@
+/* ============================================================
+   GlowGrid —— GPU/CUDA 核心阵列(算力墙点阵)专属动画。
+   仅本组件使用，独立于全局 index.css，避免多人协作时撞车。
+   设计取向：小而密的方块核心，健康色作底光低频呼吸；请求流过时
+   对应核心瞬间点亮再衰减，并向相邻核心扩散一圈微光涟漪。
+   全部只动 opacity / transform（GPU 合成），数百核心不常驻重绘。
+   读元素级基色变量 --gg-rgb（形如 "16 185 129"）。
+   ============================================================ */
+
+/* 核心底光低频呼吸：只调底光层透明度，不触发布局/重排。
+   周期(--gg-dur)与相位(--gg-delay)由组件按健康态/在途改写，
+   错相位让整墙像真实算力阵列此起彼伏地脉动，而非齐刷刷同步。 */
+.gg-core-breathe {
+  opacity: 0.5; /* 动画停用(motion-reduce)时的静态亮度 */
+  animation: gg-breathe var(--gg-dur, 4s) ease-in-out infinite;
+  animation-delay: var(--gg-delay, 0s);
+  will-change: opacity;
+}
+@keyframes gg-breathe {
+  0%,
+  100% {
+    opacity: 0.34;
+  }
+  50% {
+    opacity: 0.66;
+  }
+}
+
+/* 命中：核心被算力激活，瞬间点亮成高亮(白芯+基色晕)再衰减，单次重放。
+   由组件用 activity.pulse 作 React key 重挂载触发。 */
+.gg-core-flash {
+  animation: gg-flash 0.72s cubic-bezier(0.16, 1, 0.3, 1) both;
+  will-change: opacity, transform;
+}
+@keyframes gg-flash {
+  0% {
+    opacity: 0;
+    transform: scale(0.94);
+  }
+  14% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1);
+  }
+}
+
+/* 命中涟漪：自被点亮的核心向外扩散一圈细描边微光并淡出，
+   缩放到远大于自身 → 波及相邻核心，读作“算力被点亮扩散”。
+   不裁剪(允许溢出覆盖邻格)，单次重放。 */
+.gg-core-ripple {
+  transform-origin: center;
+  animation: gg-ripple 0.86s cubic-bezier(0.16, 1, 0.3, 1) both;
+  will-change: opacity, transform;
+}
+@keyframes gg-ripple {
+  0% {
+    opacity: 0.7;
+    transform: scale(0.8);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(2.6);
+  }
+}
+
+/* 无障碍：尊重系统“减少动态效果”。呼吸停在静态亮度，闪/涟漪由组件
+   额外 motion-reduce:hidden 兜底（此处再关一层动画双保险）。 */
+@media (prefers-reduced-motion: reduce) {
+  .gg-core-breathe,
+  .gg-core-flash,
+  .gg-core-ripple {
+    animation: none;
+  }
+}

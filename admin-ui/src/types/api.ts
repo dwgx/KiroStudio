@@ -36,6 +36,37 @@ export interface CredentialStatusItem {
   /** Overage（超额）开关：KIRO Pro+ 开启后可突破 base 额度（付费）。
       后端 BE-overage 批次落地前为只读展示；字段缺省视为未知/关闭。 */
   overageEnabled?: boolean
+  /** 用户自定义别名/备注（卡片展示优先于 email/#id）。 */
+  name?: string
+  /** 是否正处于冷却中（429/限流/服务错误后短暂跳过调度）。 */
+  coolingDown?: boolean
+  /** 冷却剩余毫秒（coolingDown 为 true 时有效）。 */
+  cooldownRemainingMs?: number
+  /** 冷却原因（如「速率限制」「服务错误」）。 */
+  cooldownReason?: string
+}
+
+// 回收站条目（不含敏感明文）
+export interface TrashItem {
+  id: number
+  priority: number
+  authMethod: string | null
+  email: string | null
+  maskedApiKey?: string | null
+  refreshTokenHash?: string | null
+  apiKeyHash?: string | null
+  endpoint?: string
+  /** 删除时间（RFC3339） */
+  deletedAt: string
+  /** 删除前累计成功次数 */
+  successCount: number
+  /** 删除前最后调用时间 */
+  lastUsedAt: string | null
+}
+
+export interface TrashListResponse {
+  total: number
+  trash: TrashItem[]
 }
 
 // 余额响应
@@ -56,7 +87,7 @@ export interface BalanceResponse {
 }
 
 // 单条已缓存余额快照（后端 CachedBalanceItem：balance 字段被 serde flatten 到顶层，
-// 再加一个 cachedAt）。用于概览/状态条按需展示，绝不触发上游调用（封号红线）。
+// 再加一个 cachedAt）。用于概览/状态条按需展示，绝不触发上游调用（避免触发上游风控）。
 export interface CachedBalanceItem extends BalanceResponse {
   /** 缓存写入时间（Unix 秒），前端据此显示“截至 X 分钟前”并判断新鲜度。 */
   cachedAt: number
@@ -169,6 +200,37 @@ export interface PollIdcLoginResponse {
   message?: string
 }
 
+// ============ 微软 SSO 上号（External IdP · 三步引导）============
+// 全程零本机运行：用户只需在浏览器里复制地址栏 URL 粘回，本机不装/不跑任何程序。
+
+// 第 1 步：发起外部 IdP 上号请求
+export interface StartExternalIdpLoginRequest {
+  priority?: number
+  proxyUrl?: string
+}
+
+// 第 1 步响应：拿到会话 id + Kiro 登录地址
+export interface StartExternalIdpLoginResponse {
+  sessionId: string
+  signinUrl: string
+}
+
+// 第 2 / 3 步：把浏览器地址栏整串 URL 粘回
+export interface ExternalIdpPasteRequest {
+  sessionId: string
+  url: string
+}
+
+// 第 2 步响应：拿到微软授权地址
+export interface ExternalIdpLeg1Response {
+  authorizeUrl: string
+}
+
+// 第 3 步响应：换 token 入池成功，返回新凭据 id
+export interface ExternalIdpLeg2Response {
+  credentialId: number
+}
+
 // ============ 服务端配置快照 ============
 
 // 服务端配置（敏感字段已脱敏）
@@ -204,6 +266,8 @@ export interface ConfigSnapshotResponse {
   proactiveTokenRefresh: boolean
   tokenRefreshLeadMinutes: number
   tokenRefreshIntervalSecs: number
+  // 隐私：是否采集下游客户端指纹（设备/IP/系统/浏览器）。立即生效，无需重启。缺省视为开启。
+  collectClientFingerprint?: boolean
   configPath?: string
 }
 
@@ -225,6 +289,8 @@ export interface UpdateConfigRequest {
   rateLimitMinIntervalMs?: number
   affinityEnabled?: boolean
   proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
   callbackBaseUrl?: string
   // 反代安全（批次3，整表替换语义）
   corsAllowedOrigins?: string[]
@@ -236,6 +302,8 @@ export interface UpdateConfigRequest {
   proactiveTokenRefresh?: boolean
   tokenRefreshLeadMinutes?: number
   tokenRefreshIntervalSecs?: number
+  // 隐私：采集下游客户端指纹开关（立即生效，无需重启）
+  collectClientFingerprint?: boolean
 }
 
 // 更新服务端配置响应
@@ -385,6 +453,8 @@ export interface ClientRpm {
   sessions: SessionRpm[]
 }
 
+// 注:CooldownDetail / RateLimitInsight 已在本文件后半定义(限流健康用),此处不重复。
+
 // 单条请求明细
 export interface RequestRecord {
   request_id: string
@@ -410,6 +480,32 @@ export interface RequestRecord {
   client_os?: string | null
   /** 客户端浏览器（后端解析 UA）：如 "Chrome 120"/"Edge 120"/"Safari"，非浏览器客户端为 null */
   client_browser?: string | null
+  /** 从缓存复用、省下的输入 token（cache_read_input_tokens）。后端 BE-A1 补，缺省 0。 */
+  cache_read_tokens?: number
+  /** 写入缓存的输入 token（cache_creation_input_tokens）。后端 BE-A1 补，缺省 0。 */
+  cache_creation_tokens?: number
+}
+
+// 单台机器（按设备指纹分组，IP 变化不拆分）的 RPM 视图（对接 GET /usage/machines）。
+// 与 ClientRpm（按 IP 分组）的关键区别：分组主键是设备画像派生的 machineKey（不含 IP），
+// 同一机器换 IP（DHCP/VPN/NAT）仍合并为一组，IP 只作 ips 列表展示。
+export interface MachineRpm {
+  /** 机器分组键（设备画像派生：device|os|browser 拼接，稳定标识一台机器） */
+  machineKey: string
+  /** 设备类型（如 claude-code） */
+  device?: string | null
+  /** 操作系统细分（如 Windows） */
+  os?: string | null
+  /** 浏览器 + 版本（非浏览器为 null） */
+  browser?: string | null
+  /** 这台机器见过的所有 IP（升序去重） */
+  ips: string[]
+  /** 该机器最近 60 秒请求数（RPM，聚合其所有窗口） */
+  rpm: number
+  /** 活跃窗口数（distinct session_id，近 10 分钟内有请求） */
+  activeSessions: number
+  /** 各活跃窗口的 RPM（后端已按 RPM 降序） */
+  sessions: SessionRpm[]
 }
 
 /** 逐秒吞吐桶（GET /usage/throughput 的 recentBuckets 元素，后端 camelCase） */
@@ -439,4 +535,55 @@ export interface ThroughputSnapshot {
   windowSecs: number
   /** 最近 60 秒逐秒桶（从旧到新，空秒补 0） */
   recentBuckets: ThroughputBucket[]
+}
+
+// 影子 prompt 缓存记账累计统计（GET /usage/cache）：网关侧为下游复现的 Anthropic
+// 风格缓存命中,进程级累计,只读零上游。
+export interface CacheStatsSnapshot {
+  /** 参与缓存记账的请求总数 */
+  requests: number
+  /** 至少命中一次缓存读（cache_read>0）的请求数 */
+  hits: number
+  /** 累计 cache_read_input_tokens（从缓存复用、省下的输入 token） */
+  cacheReadTokens: number
+  /** 累计 cache_creation_input_tokens（写入缓存的输入 token） */
+  cacheCreationTokens: number
+  /** 命中率（hits / requests，0~1）；requests 为 0 时为 0 */
+  hitRate: number
+}
+
+// ============ 限流健康 insights（对接 GET /api/admin/ratelimit/insights） ============
+// 后端 service.rs 的 RateLimitInsight / CooldownDetail（serde camelCase）。
+// 全部取自内存快照（token_manager + cooldown + config 软上限），零上游、无封号风险。
+
+// 单个凭据的冷却明细（未冷却时整体为 null）
+export interface CooldownDetail {
+  /** 冷却原因（中文描述，如「速率限制」「服务器错误」） */
+  reason: string
+  /** 剩余冷却时间（毫秒） */
+  remainingMs: number
+  /** 连续触发次数 */
+  triggerCount: number
+}
+
+// 每号一条限流健康快照（后端按 rpm 降序、id 升序）
+export interface RateLimitInsight {
+  /** 凭据 ID */
+  id: number
+  /** 最近 60 秒滚动窗口内的选号次数（RPM） */
+  rpm: number
+  /** 每凭据 RPM 软上限（0 = 不限制） */
+  rpmLimit: number
+  /** 是否已达软上限（rpmLimit>0 且 rpm>=rpmLimit） */
+  rpmSaturated: boolean
+  /** 当前在途请求数 */
+  inflight: number
+  /** 是否已禁用（禁用号显示"已禁用"而非"畅通"） */
+  disabled?: boolean
+  /** 冷却明细；未冷却时为 null */
+  cooldown: CooldownDetail | null
+  /** 近期 429 次数（取自速率限制冷却的连续触发计数，零上游） */
+  recent429: number
+  /** 中文推断文案（如「#54 冷却中（速率限制）剩22s，已触发3次」「畅通」） */
+  insightText: string
 }

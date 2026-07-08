@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
-import { KeyRound } from 'lucide-react'
+import { KeyRound, Loader2 } from 'lucide-react'
 import { storage } from '@/lib/storage'
+import { getLoadBalancingMode, setSuppressAuthReload } from '@/api/credentials'
 
 interface LoginPageProps {
   onLogin: (apiKey: string) => void
@@ -10,6 +11,9 @@ export function LoginPage({ onLogin }: LoginPageProps) {
   const [apiKey, setApiKey] = useState('')
   const [bgLoaded, setBgLoaded] = useState(false)
   const [bgUrl, setBgUrl] = useState<string | null>(null)
+  // 登录校验态：verifying=校验中(转圈)、error=就地错误文案（错密钥秒失败，不再进面板死转圈）
+  const [verifying, setVerifying] = useState(false)
+  const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
     const savedKey = storage.getApiKey()
@@ -52,11 +56,26 @@ export function LoginPage({ onLogin }: LoginPageProps) {
     return () => { cancelled = true }
   }, [])
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (apiKey.trim()) {
-      storage.setApiKey(apiKey.trim())
-      onLogin(apiKey.trim())
+    const key = apiKey.trim()
+    if (!key || verifying) return
+    setError(null)
+    setVerifying(true)
+    // 临时写入 key，让 axios 拦截器带上它去打一个**只读、不触上游**的端点校验（GET /config/load-balancing）。
+    // 200 才真正进面板；401/错误则清掉 key + 就地报错——错密钥秒失败，不再乐观放行后死转圈。
+    storage.setApiKey(key)
+    setSuppressAuthReload(true) // 校验期间抑制拦截器自动 reload，让错误就地展示
+    try {
+      await getLoadBalancingMode()
+      onLogin(key)
+    } catch (err) {
+      storage.removeApiKey()
+      const status = (err as { response?: { status?: number } })?.response?.status
+      setError(status === 401 || status === 403 ? '密钥无效，请重新输入' : '无法连接服务，请稍后重试')
+    } finally {
+      setSuppressAuthReload(false)
+      setVerifying(false)
     }
   }
 
@@ -125,7 +144,8 @@ export function LoginPage({ onLogin }: LoginPageProps) {
               type="password"
               placeholder="输入管理密钥"
               value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
+              onChange={(e) => { setApiKey(e.target.value); if (error) setError(null) }}
+              disabled={verifying}
               className="w-full outline-none"
               style={{
                 padding: '10px 14px',
@@ -145,10 +165,21 @@ export function LoginPage({ onLogin }: LoginPageProps) {
             />
           </div>
 
+          {/* 就地错误文案：错密钥秒显示，不再进面板转圈 */}
+          {error && (
+            <p
+              className="mb-3 text-center"
+              style={{ fontSize: '12px', color: '#f5554e', fontWeight: 500 }}
+              role="alert"
+            >
+              {error}
+            </p>
+          )}
+
           <button
             type="submit"
-            disabled={!apiKey.trim()}
-            className="w-full cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+            disabled={!apiKey.trim() || verifying}
+            className="flex w-full items-center justify-center gap-2 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
             style={{
               padding: '10px 0',
               fontSize: '14px',
@@ -166,7 +197,8 @@ export function LoginPage({ onLogin }: LoginPageProps) {
               e.currentTarget.style.boxShadow = 'none'
             }}
           >
-            登录
+            {verifying && <Loader2 style={{ width: '15px', height: '15px' }} className="animate-spin" />}
+            {verifying ? '校验中…' : '登录'}
           </button>
         </form>
 

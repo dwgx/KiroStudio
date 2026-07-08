@@ -29,6 +29,7 @@ function App() {
       ) : (
         <LoginPage onLogin={handleLogin} />
       )}
+      {/* 通知栈挂载点：展开平铺 / 可见 6 条 / 常驻关闭按钮等行为在 Toaster 组件内统一配置，此处仅定位到右上角 */}
       <Toaster position="top-right" />
     </>
   )

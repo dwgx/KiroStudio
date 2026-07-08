@@ -6,7 +6,9 @@ import {
   getUsageByCredential,
   getUsageRecent,
   getUsageClients,
+  getUsageMachines,
   getUsageThroughput,
+  getRatelimitInsights,
 } from '@/api/usage'
 
 // 统计页整体每 30 秒自动刷新
@@ -76,6 +78,16 @@ export function useUsageClients() {
   })
 }
 
+// 机器维度 RPM 面板：30s 轮询（读本地内存,零上游）。按设备指纹分组,IP 变化不拆分。
+export function useUsageMachines() {
+  return useQuery({
+    queryKey: ['usage', 'machines'],
+    queryFn: getUsageMachines,
+    refetchInterval: () => (typeof document !== 'undefined' && document.hidden ? false : REFETCH_MS),
+    refetchIntervalInBackground: false,
+  })
+}
+
 // 趋势图流动粒子专用：4s 短轮询 /usage/throughput（读本地内存环，零上游、无封号风险）。
 // 页面隐藏（切走标签页）时暂停轮询省资源；重新可见时 react-query 借 focus 事件自动复轮。
 const THROUGHPUT_MS = 4000
@@ -85,6 +97,18 @@ export function useUsageThroughput() {
     queryKey: ['usage', 'throughput'],
     queryFn: getUsageThroughput,
     refetchInterval: () => (typeof document !== 'undefined' && document.hidden ? false : THROUGHPUT_MS),
+    refetchIntervalInBackground: false,
+  })
+}
+
+// 限流健康 insights：10s 轮询（读本地内存,零上游,无封号风险）。隐藏页暂停。
+const INSIGHTS_MS = 10000
+
+export function useRatelimitInsights() {
+  return useQuery({
+    queryKey: ['usage', 'ratelimit-insights'],
+    queryFn: getRatelimitInsights,
+    refetchInterval: () => (typeof document !== 'undefined' && document.hidden ? false : INSIGHTS_MS),
     refetchIntervalInBackground: false,
   })
 }
