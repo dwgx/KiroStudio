@@ -67,12 +67,12 @@ export function StatCard({
     // 金属厚重卡：复用 .card-metal-press（金属渐变背景 + 厚重阴影，hover 时轻微下压、阴影收敛，不缩放不凹陷）
     // motion-reduce 下由 .card-metal-press 的媒体查询自动取消位移
     <div className={cn('card-metal-press p-5', className)}>
-      <div className="flex items-start justify-between">
+      <div className="flex items-start justify-between gap-3">
         <div className="min-w-0 space-y-2">
           <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
             {label}
           </p>
-          <div className={cn('text-3xl font-bold leading-none tracking-tight tabular-nums', styles.value)}>
+          <div className={cn('truncate text-3xl font-bold leading-none tracking-tight tabular-nums', styles.value)}>
             {value}
           </div>
         </div>

@@ -362,8 +362,10 @@ export function AreaTrendChart({ points, height = 280, showRate = false, granula
   const wrapRef = useRef<HTMLDivElement>(null)
   const tipRef = useRef<HTMLDivElement>(null)
   const [width, setWidth] = useState(600)
-  // 鼠标在图内的实时 x（px）；null 表示未 hover。高亮点/导引线/tooltip 全部由它驱动。
+  // 鼠标在图内的实时 x/y（px，相对容器）；null 表示未 hover。
+  // 高亮点/导引线沿曲线用 x 驱动；tooltip 用 x+y 一起驱动，实时跟在鼠标右下角。
   const [mouseX, setMouseX] = useState<number | null>(null)
+  const [mouseY, setMouseY] = useState<number | null>(null)
   // tooltip 气泡实测尺寸（px），用于按真实半宽/高做边缘 clamp，避免溢出图容器
   const [tipSize, setTipSize] = useState({ w: 120, h: 56 })
   const fmtLabel = granularity === 'daily' ? fmtDay : fmtHour
@@ -405,11 +407,18 @@ export function AreaTrendChart({ points, height = 280, showRate = false, granula
     const reqs = pts.map((p) => p.requests)
     const rawMax = Math.max(1, ...reqs)
     const rawMin = Math.min(...reqs, rawMax)
-    // 自适应纵向放大：基线取 min 下方留 15% 余量，顶部 max 上方留 12%
     const span = Math.max(1, rawMax - rawMin)
-    const lo = Math.max(0, rawMin - span * 0.15)
-    const hi = rawMax + span * 0.12
-    const range = Math.max(1, hi - lo)
+    // 收敛式纵向映射：让「数据占图高的比例」贴近真实波动比例，而不是无脑撑满。
+    // prop = 波动幅度 / 峰值（真实起伏占比）；据此决定数据带该占多少图高：
+    //   小基数大起伏(prop 大)→ 放大观察撑到 ~80%；大基数小波动(prop 小)→ 只占约 15~30%，
+    //   避免把微小波动视觉夸大成满屏起伏（此前固定占 ~79%，与真实比例脱节）。
+    const prop = span / rawMax
+    const visualFrac = Math.max(0.15, Math.min(0.8, 0.15 + prop * 1.5))
+    // 数据带该占的图高比例 → 反推总量程；余量偏向下方（约 0.7）保留“浮在基座上”的观感。
+    const range = Math.max(1, span / visualFrac)
+    const extra = range - span
+    const lo = Math.max(0, rawMin - extra * 0.7)
+    const hi = lo + range
 
     const x = (i: number) => PAD_X + (n <= 1 ? 0 : (i / (n - 1)) * (width - PAD_X * 2))
     const y = (v: number) => PAD_T + (1 - (v - lo) / range) * innerH
@@ -480,8 +489,12 @@ export function AreaTrendChart({ points, height = 280, showRate = false, granula
   const onMove = (e: React.MouseEvent<SVGRectElement>) => {
     const rect = (e.currentTarget as SVGRectElement).getBoundingClientRect()
     setMouseX(e.clientX - rect.left)
+    setMouseY(e.clientY - rect.top)
   }
-  const onLeave = () => setMouseX(null)
+  const onLeave = () => {
+    setMouseX(null)
+    setMouseY(null)
+  }
 
   return (
     <div ref={wrapRef} className={className} style={{ width: '100%', position: 'relative' }}>
@@ -614,18 +627,23 @@ export function AreaTrendChart({ points, height = 280, showRate = false, granula
         <rect x="0" y="0" width={width} height={height} fill="transparent" onMouseMove={onMove} onMouseLeave={onLeave} />
       </svg>
 
-      {/* hover tooltip（HTML 覆盖层）：
+      {/* hover tooltip（HTML 覆盖层）：实时跟在鼠标指针的右下角。
           外层「跟随层」用 transform:translate3d 承载鼠标位移——GPU 合成、只动 transform，
           配合短 ease-out 过渡实现丝滑滑行（transition-[left,top] 走布局回流，不够顺）。
           内层「内容层」独占 animate-rise-in 入场动画，避免和跟随位移的 transform 抢占同一通道。
-          left/top 归零，定位完全交给 translate3d；tx 内已扣除半宽实现水平居中（不再用 -translate-x-1/2，
-          否则会和 rise-in 的 translateY 冲突）。x/y 均按实测尺寸 clamp 在图容器内。 */}
-      {nearest && clampedMouseX !== null && (() => {
-        const halfW = tipSize.w / 2
-        // 水平：以鼠标 x 为中心，左右不超出容器
-        const tx = Math.max(0, Math.min(width - tipSize.w, clampedMouseX - halfW))
-        // 垂直：浮在曲线高亮点上方 14px，顶部不越界
-        const ty = Math.max(0, Math.min(height - tipSize.h, (hoverY ?? nearest.y) - tipSize.h - 14))
+          left/top 归零，定位完全交给 translate3d。
+          定位规则：默认落在鼠标右下角（+OFFSET）；右侧放不下就翻到鼠标左侧、下方放不下就翻到上方，
+          最后再按实测尺寸 clamp 兜底，保证气泡始终不出图容器。数值仍取最近数据点。 */}
+      {nearest && mouseX !== null && mouseY !== null && (() => {
+        const OFFSET = 14
+        // 水平：默认鼠标右侧 +OFFSET；右越界则翻到左侧（mouseX - 宽 - OFFSET）
+        let tx = mouseX + OFFSET
+        if (tx + tipSize.w > width) tx = mouseX - tipSize.w - OFFSET
+        tx = Math.max(0, Math.min(width - tipSize.w, tx))
+        // 垂直：默认鼠标下方 +OFFSET；下越界则翻到上方（mouseY - 高 - OFFSET）
+        let ty = mouseY + OFFSET
+        if (ty + tipSize.h > height) ty = mouseY - tipSize.h - OFFSET
+        ty = Math.max(0, Math.min(height - tipSize.h, ty))
         return (
           <div
             ref={tipRef}
