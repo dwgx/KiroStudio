@@ -37,8 +37,11 @@ struct SocialSession {
     auth_endpoint: String,
     /// 新凭据的优先级
     priority: u32,
-    /// 代理（继承全局或自定义）
+    /// 出站代理（换 token 的 OAuth 请求用；自定义优先，否则继承全局）
     proxy: Option<ProxyConfig>,
+    /// 上号时**显式填入**的自定义代理（仅此项持久化到新凭据；global 回落不持久化，
+    /// 避免把全局代理钉死在凭据上、后续改全局失效）。None=没填，继承全局。
+    custom_proxy: Option<ProxyConfig>,
     /// 创建时间，用于 TTL 清理
     created_at: Instant,
     /// 本地模式：持有回调服务器句柄，drop 时释放端口
@@ -102,7 +105,18 @@ impl SocialLoginManager {
             }
             p
         });
-        let proxy = proxy_url.map(|u| ProxyConfig::new(&u)).or(global_proxy);
+        // 用户可能把账密内嵌进 URL（socks5://user:pass@host:port）——拆出账密，否则登录
+        // 走的代理无法认证。拆分后干净 URL + 独立账密交给 ProxyConfig。
+        let custom_proxy = proxy_url.map(|u| {
+            let (clean, user, pass) = crate::http_client::split_proxy_credentials(&u);
+            let mut p = ProxyConfig::new(clean);
+            if let (Some(user), Some(pass)) = (user, pass) {
+                p = p.with_auth(user, pass);
+            }
+            p
+        });
+        // OAuth 请求用的出站代理：自定义优先，否则继承全局。
+        let proxy = custom_proxy.clone().or(global_proxy);
 
         let (code_verifier, code_challenge) = social::generate_pkce();
         let state = uuid::Uuid::new_v4().to_string();
@@ -143,6 +157,7 @@ impl SocialLoginManager {
             auth_endpoint,
             priority,
             proxy,
+            custom_proxy,
             created_at: Instant::now(),
             _server_handle: server_handle,
             callback_rx: Mutex::new(Some(callback_rx)),
@@ -222,6 +237,18 @@ impl SocialLoginManager {
             }
         };
 
+        // 上号时**显式填的**代理要持久化到该凭据（否则登录用了代理、之后请求却回落全局代理，
+        // 表现为“上号输入的代理没有自动加入”）。只持久化 custom_proxy（用户填的），
+        // 不持久化 global 回落（避免把全局代理钉死在凭据上）。已是拆好账密的 ProxyConfig。
+        let (proxy_url, proxy_username, proxy_password) = match &session.custom_proxy {
+            Some(p) => (
+                Some(p.url.clone()),
+                p.username.clone(),
+                p.password.clone(),
+            ),
+            None => (None, None, None),
+        };
+
         // 构建并加入凭据池
         let new_cred = KiroCredentials {
             id: None,
@@ -241,10 +268,11 @@ impl SocialLoginManager {
             api_region: None,
             machine_id: None,
             email: None,
+            name: None,
             subscription_title: None,
-            proxy_url: None,
-            proxy_username: None,
-            proxy_password: None,
+            proxy_url,
+            proxy_username,
+            proxy_password,
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
