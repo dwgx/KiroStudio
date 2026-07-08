@@ -97,6 +97,11 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
 
+    /// 用户自定义别名/备注（管理员在面板设置，用于卡片展示，优先于 email/#id）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "alias")]
+    pub name: Option<String>,
+
     /// 订阅等级（KIRO PRO+ / KIRO FREE 等）
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
@@ -143,6 +148,12 @@ fn mask_secret(v: &Option<String>) -> String {
     }
 }
 
+/// 代理 URL 脱敏：剥掉内嵌 `user:pass@` 段（旧数据/直接输入可能带），仅留 scheme+host。
+/// 用 split_proxy_credentials 拆出干净 URL（内部已处理 scheme/最后一个@/IPv6）。
+fn mask_proxy_url(url: &str) -> String {
+    crate::http_client::split_proxy_credentials(url).0
+}
+
 /// 手写脱敏 Debug：可识别字段（id/auth/email/endpoint 等）正常显示，
 /// 敏感凭证字段一律打码为 `<set:N>`，绝不输出明文。
 impl std::fmt::Debug for KiroCredentials {
@@ -161,7 +172,8 @@ impl std::fmt::Debug for KiroCredentials {
             .field("subscription_title", &self.subscription_title)
             .field("has_profile_arn", &self.profile_arn.is_some())
             .field("machine_id", &self.machine_id)
-            .field("proxy_url", &self.proxy_url)
+            // proxy_url 可能残留内嵌账密（旧数据/直接输入）——Debug 脱敏 userinfo 段防泄漏。
+            .field("proxy_url", &self.proxy_url.as_deref().map(mask_proxy_url))
             // —— 敏感字段一律脱敏 ——
             .field("access_token", &mask_secret(&self.access_token))
             .field("refresh_token", &mask_secret(&self.refresh_token))
@@ -314,10 +326,15 @@ impl KiroCredentials {
         match self.proxy_url.as_deref() {
             Some(url) if url.eq_ignore_ascii_case(Self::PROXY_DIRECT) => None,
             Some(url) => {
-                let mut proxy = ProxyConfig::new(url);
-                if let (Some(username), Some(password)) =
-                    (&self.proxy_username, &self.proxy_password)
-                {
+                // URL 里可能内嵌账密（socks5://user:pass@host:port）——拆出干净 URL 与内嵌账密。
+                // 显式 proxy_username/proxy_password 字段优先；缺失时回退用 URL 内嵌的账密。
+                // 保证无论用户把账密填在独立字段还是直接写进 URL，都能正确认证。
+                let (clean_url, inline_user, inline_pass) =
+                    crate::http_client::split_proxy_credentials(url);
+                let mut proxy = ProxyConfig::new(clean_url);
+                let username = self.proxy_username.clone().or(inline_user);
+                let password = self.proxy_password.clone().or(inline_pass);
+                if let (Some(username), Some(password)) = (username, password) {
                     proxy = proxy.with_auth(username, password);
                 }
                 Some(proxy)
@@ -506,6 +523,7 @@ mod tests {
             api_region: None,
             machine_id: None,
             email: None,
+            name: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
@@ -627,6 +645,7 @@ mod tests {
             api_region: None,
             machine_id: None,
             email: None,
+            name: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
@@ -661,6 +680,7 @@ mod tests {
             api_region: None,
             machine_id: None,
             email: None,
+            name: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
@@ -778,6 +798,7 @@ mod tests {
             api_region: None,
             machine_id: Some("c".repeat(64)),
             email: None,
+            name: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
@@ -999,6 +1020,33 @@ mod tests {
 
         let result = creds.effective_proxy(Some(&global));
         assert_eq!(result, Some(ProxyConfig::new("socks5://cred:1080")));
+    }
+
+    #[test]
+    fn test_effective_proxy_inline_credentials_in_url() {
+        // 账密内嵌 URL（dwgx 场景）：effective_proxy 应拆出账密走 with_auth，
+        // 干净 URL 不含账密。
+        let mut creds = KiroCredentials::default();
+        creds.proxy_url = Some("socks5://dwgxsocks:Dwgxnbnb0705@38.244.34.185:1080".to_string());
+
+        let result = creds.effective_proxy(None).unwrap();
+        assert_eq!(result.url, "socks5://38.244.34.185:1080");
+        assert_eq!(result.username, Some("dwgxsocks".to_string()));
+        assert_eq!(result.password, Some("Dwgxnbnb0705".to_string()));
+    }
+
+    #[test]
+    fn test_effective_proxy_explicit_fields_override_inline() {
+        // 独立账密字段优先于 URL 内嵌值。
+        let mut creds = KiroCredentials::default();
+        creds.proxy_url = Some("socks5://inlineuser:inlinepass@host:1080".to_string());
+        creds.proxy_username = Some("explicit".to_string());
+        creds.proxy_password = Some("explicitpass".to_string());
+
+        let result = creds.effective_proxy(None).unwrap();
+        assert_eq!(result.url, "socks5://host:1080");
+        assert_eq!(result.username, Some("explicit".to_string()));
+        assert_eq!(result.password, Some("explicitpass".to_string()));
     }
 
     #[test]
