@@ -9,7 +9,9 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { NumberStepper } from '@/components/ui/number-stepper'
 import { startIdcLogin, pollIdcLogin } from '@/api/credentials'
+import { CheckCircle2 } from 'lucide-react'
 import { copyToClipboard, extractErrorMessage } from '@/lib/utils'
 
 interface IdcLoginDialogProps {
@@ -191,13 +193,13 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialog
               <label className="text-sm font-medium" htmlFor="idcPriority">
                 优先级
               </label>
-              <Input
-                id="idcPriority"
-                type="number"
-                value={priority}
-                onChange={(e) => setPriority(e.target.value)}
-                placeholder="100"
+              <NumberStepper
+                value={Number(priority) || 0}
+                onChange={(n) => setPriority(String(n))}
+                min={0}
                 disabled={isStarting}
+                className="w-full"
+                aria-label="优先级"
               />
               <p className="text-xs text-muted-foreground">数字越小优先级越高</p>
             </div>
@@ -243,7 +245,7 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialog
 
         {step === 'done' && (
           <div className="space-y-3 py-4 text-center">
-            <div className="text-3xl">✓</div>
+            <CheckCircle2 className="mx-auto h-12 w-12 text-green-600 dark:text-green-400" />
             <p className="text-sm font-medium">IDC 上号成功</p>
             <p className="text-xs text-muted-foreground">凭据已加入池</p>
           </div>

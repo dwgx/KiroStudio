@@ -100,7 +100,7 @@ export function StatusHeatmap({ credentials, activity, className }: StatusHeatma
                       最近命中：{act ? fmtAgo(act.lastTs) : '近 24h 无'}
                     </div>
                     {/* TODO(BE-balance): 额度/积分待接后端批量缓存端点 cached-balances，
-                        本批 hover 仅展示 credentials 免费字段，不在此拉 per-account balance（封号红线）。 */}
+                        本批 hover 仅展示 credentials 免费字段，不在此拉 per-account balance（避免触发上游风控）。 */}
                   </div>
                 </TooltipContent>
               </Tooltip>

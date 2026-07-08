@@ -6,6 +6,7 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { CheckCircle2, XCircle, Loader2, MoreHorizontal, Lightbulb } from 'lucide-react'
 
 export interface VerifyResult {
   id: number
@@ -94,11 +95,11 @@ export function BatchVerifyDialog({
                         </Badge>
                       )}
                     </div>
-                    <span>
-                      {result.status === 'success' && '✓'}
-                      {result.status === 'failed' && '✗'}
-                      {result.status === 'verifying' && '⏳'}
-                      {result.status === 'pending' && '⋯'}
+                    <span className="inline-flex items-center">
+                      {result.status === 'success' && <CheckCircle2 className="h-4 w-4 text-green-600 dark:text-green-400" />}
+                      {result.status === 'failed' && <XCircle className="h-4 w-4 text-red-600 dark:text-red-400" />}
+                      {result.status === 'verifying' && <Loader2 className="h-4 w-4 animate-spin text-blue-600 dark:text-blue-400" />}
+                      {result.status === 'pending' && <MoreHorizontal className="h-4 w-4 text-muted-foreground" />}
                     </span>
                   </div>
                   {result.error && (
@@ -113,8 +114,9 @@ export function BatchVerifyDialog({
 
           {/* 提示信息 */}
           {verifying && (
-            <p className="text-xs text-muted-foreground">
-              💡 验活过程中每次请求间隔 2 秒，防止被封号。你可以关闭此窗口，验活会在后台继续进行。
+            <p className="flex items-start gap-1.5 text-xs text-muted-foreground">
+              <Lightbulb className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span>验活过程中每次请求间隔 2 秒，防止被封号。你可以关闭此窗口，验活会在后台继续进行。</span>
             </p>
           )}
         </div>

@@ -9,7 +9,9 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { NumberStepper } from '@/components/ui/number-stepper'
 import { startSocialLogin, pollSocialLogin } from '@/api/credentials'
+import { CheckCircle2 } from 'lucide-react'
 import { copyToClipboard, extractErrorMessage } from '@/lib/utils'
 import type { StartSocialLoginResponse } from '@/types/api'
 
@@ -132,13 +134,13 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
               <label className="text-sm font-medium" htmlFor="priority">
                 优先级
               </label>
-              <Input
-                id="priority"
-                type="number"
-                value={priority}
-                onChange={(e) => setPriority(e.target.value)}
-                placeholder="100"
+              <NumberStepper
+                value={Number(priority) || 0}
+                onChange={(n) => setPriority(String(n))}
+                min={0}
                 disabled={isStarting}
+                className="w-full"
+                aria-label="优先级"
               />
               <p className="text-xs text-muted-foreground">数字越小优先级越高</p>
             </div>
@@ -181,7 +183,7 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
 
         {step === 'done' && (
           <div className="space-y-3 py-4 text-center">
-            <div className="text-3xl">✓</div>
+            <CheckCircle2 className="mx-auto h-12 w-12 text-green-600 dark:text-green-400" />
             <p className="text-sm font-medium">上号成功</p>
             {resultEmail && (
               <p className="text-xs text-muted-foreground">{resultEmail}</p>
