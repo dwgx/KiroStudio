@@ -39,6 +39,7 @@ const DISABLED_REASON_MAP: Record<string, string> = {
   TooManyFailures: '失败次数过多',
   QuotaExceeded: '额度耗尽',
   AccountSuspended: '账号封禁',
+  SuspiciousActivityAuto: '风控自动禁用',
   InvalidRefreshToken: '刷新令牌失效',
   InvalidConfig: '配置无效',
   TooManyRefreshFailures: '刷新失败过多',

@@ -9,6 +9,13 @@ const queryClient = new QueryClient({
     queries: {
       staleTime: 5000,
       refetchOnWindowFocus: false,
+      // 4xx（鉴权/请求错误）不重试——秒失败，不再默认 retry=3 指数退避拖 ~7s（登录卡顿成因）。
+      // 5xx/网络错误最多重试 1 次。
+      retry: (failureCount, error) => {
+        const status = (error as { response?: { status?: number } })?.response?.status
+        if (status && status >= 400 && status < 500) return false
+        return failureCount < 1
+      },
     },
   },
 })
