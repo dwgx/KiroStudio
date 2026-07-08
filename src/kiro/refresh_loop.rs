@@ -13,17 +13,21 @@
 //!   禁用坏凭据（与请求路径处置一致），本 loop 不中断整轮。
 //! - 收到停机信号即退出（由 tokio::select! 在调用侧或 interval 上体现）。
 
-use std::sync::Arc;
+use std::sync::Weak;
 use std::time::Duration;
 
 use crate::kiro::token_manager::MultiTokenManager;
 
-/// 启动后台预刷新任务。返回的 `JoinHandle` 由调用方持有（通常直接 detach）。
+/// 启动后台预刷新任务。返回的 `JoinHandle` 由调用方（token_manager 的 TIER2 任务槽）
+/// 持有，以便配置变更时 abort + respawn。
 ///
 /// `lead_minutes` 提前量、`interval_secs` 扫描间隔均来自配置。若两者为 0 或
 /// 上层未启用，则不应调用本函数。
+///
+/// 持 `Weak<MultiTokenManager>`（非 Arc）：manager 被 drop 后 upgrade 失败即退出循环，
+/// 不构成引用环（句柄反向存在 manager 内）。
 pub fn spawn(
-    manager: Arc<MultiTokenManager>,
+    manager: Weak<MultiTokenManager>,
     lead_minutes: i64,
     interval_secs: u64,
 ) -> tokio::task::JoinHandle<()> {
@@ -42,7 +46,12 @@ pub fn spawn(
 
         loop {
             ticker.tick().await;
-            run_once(&manager, lead_minutes).await;
+            // manager 已被 drop（进程停机路径）→ 退出循环
+            let Some(mgr) = manager.upgrade() else {
+                tracing::debug!("token_manager 已释放，预刷新任务退出");
+                break;
+            };
+            run_once(&mgr, lead_minutes).await;
         }
     })
 }

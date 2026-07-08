@@ -21,12 +21,18 @@ sudo tee "$UNIT" >/dev/null <<EOF
 Description=KiroStudio (Anthropic <-> Kiro API 网关)
 After=network-online.target
 Wants=network-online.target
+# 二级止损：60s 内启动超 10 次则 systemd 暂停自动重启（回滚决策仍以守卫的文件计数为准）。
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Service]
 Type=simple
 User=$USER_NAME
 Group=$USER_NAME
 WorkingDirectory=$WORKDIR
+# OTA crashloop 回滚守卫：每次启动前跑，检测新版启动即崩则自动回滚 .bak 旧版（阶段A）。
+# 以 - 前缀声明「失败不阻断启动」（守卫内部也 fail-safe exit 0，双保险）。
+ExecStartPre=-$WORKDIR/deploy/rollback-guard.sh
 ExecStart=$BIN -c config/config.json --credentials config/credentials.json
 Restart=always
 RestartSec=3
