@@ -147,6 +147,17 @@ pub struct Config {
     #[serde(default)]
     pub credential_rpm_limit: u32,
 
+    /// 全池冷却时是否"快速失败"：当所有可用凭据都在冷却/风控中，立即返回 429+Retry-After
+    /// 让客户端(Claude Code)自己退避重试，而不是在网关内硬扛等待。默认 true。
+    /// 客户端退避比网关反复选号温和，也减少对被风控号的零星试探（吸收其它 kiro.rs fork 做法）。
+    #[serde(default = "default_all_cooling_fast_fail")]
+    pub all_cooling_fast_fail: bool,
+
+    /// 是否在凭据持续可疑活动风控(连续触发达阈值)时自动禁用它（移出调度，避免继续砸加重风控/触发封禁）。
+    /// 默认 true。禁用后可人工或自愈重新启用。
+    #[serde(default = "default_auto_disable_suspicious")]
+    pub auto_disable_suspicious: bool,
+
     /// 是否启用 prompt 缓存记账（默认 true）
     ///
     /// Kiro 上游不回传 Anthropic 的 cache_read / cache_creation 记账字段。
@@ -182,6 +193,15 @@ pub struct Config {
     /// 用量明细（SQLite traces）保留天数，超期后台清理（默认 30）
     #[serde(default = "default_usage_retention_days")]
     pub usage_retention_days: i64,
+
+    /// 是否采集下游客户端指纹（设备类型 / IP / OS / 浏览器，默认 true）
+    ///
+    /// 隐私开关：关闭后热路径不再从入站请求头/连接对端解析这些字段，
+    /// 用量记录里的 client_device/client_ip/client_os/client_browser 全部留空，
+    /// 落盘与前端展示都拿不到指纹信息（session_id 维度的 RPM 聚合不受影响）。
+    /// 立即生效（运行时镜像），无需重启。
+    #[serde(default = "default_collect_client_fingerprint")]
+    pub collect_client_fingerprint: bool,
 
     // ============ 反代安全（批次3）============
     /// CORS 允许来源列表。空 = 允许任意来源（`Access-Control-Allow-Origin: *`，
@@ -234,7 +254,7 @@ pub struct Config {
     // ============ 余额同步（A6：温和的周期性余额刷新）============
     /// 后台温和刷新余额缓存的间隔（秒）。`0` = 禁用（默认 1800 = 30 分钟）。
     ///
-    /// 封号红线：绝不在启动/挂载时批量拉；后台任务用长间隔、逐个刷新且每个之间
+    /// 为避免触发上游风控：绝不在启动/挂载时批量拉；后台任务用长间隔、逐个刷新且每个之间
     /// 留有间隔（分散节奏），只刷未禁用的号，仅更新缓存供展示，绝不做主动禁用。
     /// 安全第一：可保守设为 0 禁用，由用户在设置里自行开启。
     ///
@@ -377,6 +397,14 @@ fn default_extract_thinking() -> bool {
     true
 }
 
+fn default_all_cooling_fast_fail() -> bool {
+    true
+}
+
+fn default_auto_disable_suspicious() -> bool {
+    true
+}
+
 fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
@@ -417,8 +445,14 @@ fn default_usage_retention_days() -> i64 {
     30
 }
 
+fn default_collect_client_fingerprint() -> bool {
+    true
+}
+
 fn default_max_body_bytes() -> usize {
-    50 * 1024 * 1024
+    // 256MiB 大软上限：远超正常请求（上游 compression 4MiB 触发、~5MiB 就 400），
+    // 又挡住恶意超大 body 打死进程。想彻底放开可显式设 0（= 不限制，见 anthropic/router.rs）。
+    256 * 1024 * 1024
 }
 
 fn default_true() -> bool {
@@ -472,12 +506,15 @@ impl Default for Config {
             rate_limit_min_interval_ms: default_rate_limit_min_interval_ms(),
             affinity_enabled: default_affinity_enabled(),
             credential_rpm_limit: 0,
+            all_cooling_fast_fail: default_all_cooling_fast_fail(),
+            auto_disable_suspicious: default_auto_disable_suspicious(),
             prompt_cache_enabled: default_prompt_cache_enabled(),
             prompt_cache_ttl_seconds: default_prompt_cache_ttl_seconds(),
             callback_base_url: None,
             usage_enabled: default_usage_enabled(),
             usage_data_dir: default_usage_data_dir(),
             usage_retention_days: default_usage_retention_days(),
+            collect_client_fingerprint: default_collect_client_fingerprint(),
             cors_allowed_origins: Vec::new(),
             ip_allowlist: Vec::new(),
             trust_forwarded_header: false,
