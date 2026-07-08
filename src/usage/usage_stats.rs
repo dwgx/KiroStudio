@@ -292,6 +292,24 @@ struct SessionMeta {
     device: Option<String>,
 }
 
+/// 单台「机器」的画像元信息（机器维度聚合用）。
+///
+/// 机器身份由**设备画像**（device/os/browser）派生，与 IP 解耦：IP 只作为
+/// 「这台机器见过的 IP 列表」记录，不参与分组，从而 IP 变化（DHCP/VPN/NAT）时
+/// 同一台机器仍合并为一组。device/os/browser 采用「首见填充」（仅当当前为空时写入），
+/// 让先出现的画像定义机器，后续记录只补齐缺失字段，避免同 session 画像抖动改写。
+#[derive(Debug, Clone, Default)]
+struct MachineMeta {
+    /// 设备类型（如 claude-code）
+    device: Option<String>,
+    /// 操作系统细分（如 Windows）
+    os: Option<String>,
+    /// 浏览器 + 版本（非浏览器为 None）
+    browser: Option<String>,
+    /// 这台机器见过的所有 IP（去重集合）
+    ips: std::collections::HashSet<String>,
+}
+
 /// 下游客户端 / 窗口维度的滚动速率聚合。
 ///
 /// 与 [`RateRing`]（per-credential，选号维度）正交：这里按**下游发起方**统计。
@@ -307,6 +325,18 @@ struct ClientAgg {
     by_client: HashMap<String, CredRateRing>,
     session_meta: HashMap<String, SessionMeta>,
     client_sessions: HashMap<String, std::collections::HashSet<String>>,
+
+    // ---- 机器指纹维度（by_client 的 IP 主键会因 IP 变化把同一台机器拆开，
+    //      这里改用设备画像派生的稳定 machine_key，IP 仅作「见过的 IP」记录）----
+    /// 机器维度速率环（key = machine_key）
+    by_machine: HashMap<String, CredRateRing>,
+    /// 机器画像元信息（首见填充 + 见过 IP 集合）
+    machine_meta: HashMap<String, MachineMeta>,
+    /// machine ⇄ session 归组关系
+    machine_sessions: HashMap<String, std::collections::HashSet<String>>,
+    /// session_id → machine_key 粘滞映射：一旦某 session 归属某机器，
+    /// 后续该 session 记录即便换 IP / 画像细节抖动仍归原机器（防拆分）。
+    session_machine: HashMap<String, String>,
 }
 
 impl ClientAgg {
@@ -316,6 +346,32 @@ impl ClientAgg {
             .clone()
             .or_else(|| r.client_device.clone())
             .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    /// 从一条记录派生**机器 key**：以 client_ip 为主键（每个 IP = 一台机器）。
+    ///
+    /// ⚠️ 修正(2026-07-08):原设计用 device|os|browser 画像做 key、不含 IP,想实现"换 IP 也合并"。
+    /// 但 **Claude Code 所有客户端的 device/os/browser 完全相同**(都是 claude-code),导致 N 台不同
+    /// 机器(不同 IP)全被合并成 1 台——南辕北辙(dwgx:完全错了)。Claude Code 不提供稳定 per-机器
+    /// 指纹,**IP 才是区分真实机器的唯一信号**。故机器分组回到以 IP 为主键;真正的"换 IP 合并"由
+    /// **session 粘滞**处理(同一 session_id 换 IP 才合并,对应 DHCP/漫游),见 bump() 的 session_machine。
+    /// device 仅在无 IP 时兜底,画像(os/browser)只作展示。
+    ///
+    /// 三者皆空时回退 `"unknown"`（与 device 的 unknown 兜底口径一致）。拼接用 `|`
+    /// 分隔并对空字段留空段，保证同画像稳定映射到同一 key。
+    fn machine_key_of(r: &RequestRecord) -> String {
+        // 以 IP 为主键(每个 IP = 一台真实机器);无 IP 时回退 device;都无则 unknown。
+        if let Some(ip) = r.client_ip.as_deref() {
+            if !ip.is_empty() {
+                return ip.to_string();
+            }
+        }
+        if let Some(dev) = r.client_device.as_deref() {
+            if !dev.is_empty() {
+                return dev.to_string();
+            }
+        }
+        "unknown".to_string()
     }
 
     /// 累加一条记录到客户端/窗口速率环。
@@ -344,6 +400,48 @@ impl ClientAgg {
                 .or_default()
                 .insert(sid);
         }
+
+        // ---- 机器指纹维度 ----
+        // session 粘滞：该 session 已归属某机器时沿用原 machine_key（即便本条换了 IP /
+        // 画像细节抖动也不改判），否则按当前画像派生。修复同机器被拆分。
+        let machine_key = match r
+            .session_id
+            .as_ref()
+            .and_then(|sid| self.session_machine.get(sid))
+        {
+            Some(mk) => mk.clone(),
+            None => Self::machine_key_of(r),
+        };
+
+        self.by_machine
+            .entry(machine_key.clone())
+            .or_insert_with(CredRateRing::new)
+            .bump(slot);
+
+        // 机器画像：device/os/browser 首见填充（仅当前为空才写，让首现画像定义机器），
+        // IP 累积进「见过的 IP」集合。
+        let mm = self.machine_meta.entry(machine_key.clone()).or_default();
+        if mm.device.is_none() {
+            mm.device = r.client_device.clone();
+        }
+        if mm.os.is_none() {
+            mm.os = r.client_os.clone();
+        }
+        if mm.browser.is_none() {
+            mm.browser = r.client_browser.clone();
+        }
+        if let Some(ip) = r.client_ip.clone() {
+            mm.ips.insert(ip);
+        }
+
+        // 机器 ⇄ session 归组 + 粘滞映射（首次归属即固定，后续沿用）
+        if let Some(sid) = r.session_id.clone() {
+            self.machine_sessions
+                .entry(machine_key.clone())
+                .or_default()
+                .insert(sid.clone());
+            self.session_machine.entry(sid).or_insert(machine_key);
+        }
     }
 
     /// 惰性剔除窗口外（max_slot < now_slot-(RATE_BUCKETS-1)）不再活跃的条目。
@@ -351,17 +449,32 @@ impl ClientAgg {
         let oldest = now_slot - (RATE_BUCKETS as i64 - 1);
         self.by_session.retain(|_, r| r.max_slot() >= oldest);
         self.by_client.retain(|_, r| r.max_slot() >= oldest);
+        self.by_machine.retain(|_, r| r.max_slot() >= oldest);
         // session_meta / client_sessions 与存活的 session/client 对齐
         let live_sessions: std::collections::HashSet<String> =
             self.by_session.keys().cloned().collect();
         let live_clients: std::collections::HashSet<String> =
             self.by_client.keys().cloned().collect();
+        let live_machines: std::collections::HashSet<String> =
+            self.by_machine.keys().cloned().collect();
         self.session_meta.retain(|sid, _| live_sessions.contains(sid));
         for sids in self.client_sessions.values_mut() {
             sids.retain(|sid| live_sessions.contains(sid));
         }
         self.client_sessions
             .retain(|ck, sids| !sids.is_empty() || live_clients.contains(ck));
+
+        // 机器维度：画像/归组与存活机器 + 存活 session 对齐
+        self.machine_meta
+            .retain(|mk, _| live_machines.contains(mk));
+        for sids in self.machine_sessions.values_mut() {
+            sids.retain(|sid| live_sessions.contains(sid));
+        }
+        self.machine_sessions
+            .retain(|mk, sids| !sids.is_empty() || live_machines.contains(mk));
+        // session_machine 粘滞映射仅保留存活 session，避免随 session_id 无界增长
+        self.session_machine
+            .retain(|sid, _| live_sessions.contains(sid));
     }
 }
 
@@ -565,6 +678,32 @@ pub struct ClientRpm {
     /// 设备类型（如 claude-code）
     pub device: Option<String>,
     /// 该客户端最近 60 秒请求数（RPM，聚合其所有窗口）
+    pub rpm: u32,
+    /// 活跃窗口数（distinct session_id，近 10 分钟内有请求）
+    pub active_sessions: usize,
+    /// 各活跃窗口的 RPM（按 RPM 降序）
+    pub sessions: Vec<SessionRpm>,
+}
+
+/// 单台机器（按设备指纹分组，IP 变化不拆分）的 RPM 视图。
+///
+/// 与 [`ClientRpm`]（按 IP 分组）的关键区别：分组主键是**设备画像派生的
+/// machine_key**（不含 IP），IP 只作 [`ips`] 列表展示；同一 session 一旦归属某机器，
+/// 后续换 IP 仍归该机器。供前端「机器指纹分组」视图使用。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineRpm {
+    /// 机器分组键（设备画像派生，稳定标识一台机器）
+    pub machine_key: String,
+    /// 设备类型（如 claude-code）
+    pub device: Option<String>,
+    /// 操作系统细分（如 Windows）
+    pub os: Option<String>,
+    /// 浏览器 + 版本（非浏览器为 None）
+    pub browser: Option<String>,
+    /// 这台机器见过的所有 IP（升序去重）
+    pub ips: Vec<String>,
+    /// 该机器最近 60 秒请求数（RPM，聚合其所有窗口）
     pub rpm: u32,
     /// 活跃窗口数（distinct session_id，近 10 分钟内有请求）
     pub active_sessions: usize,
@@ -941,6 +1080,72 @@ impl UsageStats {
         out
     }
 
+    /// 机器指纹 RPM 视图：按设备画像分组的每台机器当前 RPM + 见过的 IP + 活跃窗口。
+    ///
+    /// 与 [`clients`] 的关键区别：分组主键是设备画像派生的 machine_key（不含 IP），
+    /// 因此同一台机器换 IP（DHCP/VPN/NAT）仍合并为一组；IP 作为 [`MachineRpm::ips`]
+    /// 列表展示。仅返回近 10 分钟内有活动的机器/窗口（查询时惰性 prune）。按 RPM 降序。
+    pub fn machines(&self) -> Vec<MachineRpm> {
+        self.machines_at(chrono::Utc::now().timestamp_millis())
+    }
+
+    /// 机器指纹 RPM 视图（可注入基准时间，便于测试）
+    pub fn machines_at(&self, now_ms: i64) -> Vec<MachineRpm> {
+        let now_slot = now_ms.div_euclid(RATE_BUCKET_SECS * 1000);
+        let mut inner = self.inner.lock();
+        inner.client_agg.prune(now_slot);
+
+        let mut out: Vec<MachineRpm> = Vec::with_capacity(inner.client_agg.by_machine.len());
+        for (machine_key, ring) in &inner.client_agg.by_machine {
+            let rpm = ring.rpm(now_slot);
+            // 该机器名下的活跃窗口
+            let mut sessions: Vec<SessionRpm> = Vec::new();
+            if let Some(sids) = inner.client_agg.machine_sessions.get(machine_key) {
+                for sid in sids {
+                    if let Some(sring) = inner.client_agg.by_session.get(sid) {
+                        let s_rpm = sring.rpm(now_slot);
+                        if sring.max_slot() >= now_slot - (RATE_BUCKETS as i64 - 1) {
+                            sessions.push(SessionRpm {
+                                session_id: sid.clone(),
+                                rpm: s_rpm,
+                            });
+                        }
+                    }
+                }
+            }
+            sessions.sort_by(|a, b| b.rpm.cmp(&a.rpm).then(a.session_id.cmp(&b.session_id)));
+
+            // 机器画像 + 见过的 IP（升序，便于前端稳定展示）
+            let (device, os, browser, mut ips) = inner
+                .client_agg
+                .machine_meta
+                .get(machine_key)
+                .map(|m| {
+                    (
+                        m.device.clone(),
+                        m.os.clone(),
+                        m.browser.clone(),
+                        m.ips.iter().cloned().collect::<Vec<String>>(),
+                    )
+                })
+                .unwrap_or((None, None, None, Vec::new()));
+            ips.sort();
+
+            out.push(MachineRpm {
+                machine_key: machine_key.clone(),
+                device,
+                os,
+                browser,
+                ips,
+                rpm,
+                active_sessions: sessions.len(),
+                sessions,
+            });
+        }
+        out.sort_by(|a, b| b.rpm.cmp(&a.rpm).then(a.machine_key.cmp(&b.machine_key)));
+        out
+    }
+
     /// 主动回收客户端/窗口维度聚合里不再活跃的条目（后台定时调用）。
     ///
     /// `by_session` / `by_client` / `session_meta` / `client_sessions` 四张 map 的 key
@@ -971,7 +1176,7 @@ impl UsageStats {
 
     /// 全局实时吞吐快照：最近 60 秒逐秒桶 + 当前 RPM / RPS / tokens 每秒。
     ///
-    /// 只读内存聚合，零上游调用（封号红线）。供前端画数据流动粒子。
+    /// 只读内存聚合，零上游调用（避免触发上游风控）。供前端画数据流动粒子。
     pub fn throughput(&self) -> ThroughputSnapshot {
         self.throughput_at(chrono::Utc::now().timestamp_millis())
     }
@@ -1244,6 +1449,113 @@ mod tests {
         assert_eq!(clients[0].device.as_deref(), Some("claude-code"));
     }
 
+    /// 构造一条带完整机器画像（session/ip/device/os/browser）的记录
+    fn rec_machine(
+        offset_ms: i64,
+        session: Option<&str>,
+        ip: Option<&str>,
+        device: Option<&str>,
+        os: Option<&str>,
+        browser: Option<&str>,
+    ) -> RequestRecord {
+        let mut r = rec_client(offset_ms, session, ip, device);
+        r.client_os = os.map(|s| s.to_string());
+        r.client_browser = browser.map(|s| s.to_string());
+        r
+    }
+
+    #[test]
+    fn test_machines_different_ip_no_session_are_separate() {
+        // 修正后语义:IP 为主键。不同 IP 且无 session 关联 = 不同机器(即便 Claude Code 画像相同)。
+        // 这正是修复"7 个不同 IP 被合并成 1 台"的核心。
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        s.on_record(&rec_machine(0, Some("w1"), Some("192.168.11.23"), Some("claude-code"), Some("Windows"), None));
+        s.on_record(&rec_machine(1_000, Some("w2"), Some("10.0.0.9"), Some("claude-code"), Some("Windows"), None));
+
+        let machines = s.machines_at(BASE_MS + 1_000);
+        assert_eq!(machines.len(), 2, "不同 IP 且无 session 关联应是两台机器(画像相同也不合并)");
+    }
+
+    #[test]
+    fn test_machines_same_ip_is_one_machine() {
+        // 同一 IP = 同一台机器(IP 是主键)。IP 相同即便画像不同也归一台,该 IP 见过的画像取首现。
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        s.on_record(&rec_machine(0, Some("w1"), Some("1.1.1.1"), Some("claude-code"), Some("Windows"), None));
+        s.on_record(&rec_machine(0, Some("w2"), Some("1.1.1.1"), Some("claude-code"), Some("Windows"), None));
+
+        let machines = s.machines_at(BASE_MS);
+        assert_eq!(machines.len(), 1, "同一 IP 应是一台机器");
+        assert_eq!(machines[0].rpm, 2);
+        assert_eq!(machines[0].ips, vec!["1.1.1.1".to_string()]);
+    }
+
+    #[test]
+    fn test_machines_session_sticky_across_ip_change() {
+        // 同一 session 一旦归属某机器，后续该 session 记录即便换 IP、
+        // 甚至画像细节缺失，仍归原机器（防止 session 迁移把机器拆开）。
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        // 首条：完整画像，session=w1 归属 claude-code|Windows| 机器
+        s.on_record(&rec_machine(
+            0,
+            Some("w1"),
+            Some("1.1.1.1"),
+            Some("claude-code"),
+            Some("Windows"),
+            None,
+        ));
+        // 同 session 换 IP 且画像字段缺失（os=None）——若按当前画像会派生出不同 key，
+        // 但粘滞映射应让它仍归原机器。
+        s.on_record(&rec_machine(
+            1_000,
+            Some("w1"),
+            Some("2.2.2.2"),
+            Some("claude-code"),
+            None,
+            None,
+        ));
+
+        let machines = s.machines_at(BASE_MS + 1_000);
+        assert_eq!(machines.len(), 1, "同 session 换 IP 应仍归同一台机器");
+        let m = &machines[0];
+        assert_eq!(m.rpm, 2);
+        assert_eq!(m.active_sessions, 1);
+        assert_eq!(m.ips, vec!["1.1.1.1".to_string(), "2.2.2.2".to_string()]);
+    }
+
+    #[test]
+    fn test_machines_prune_stale() {
+        // 过期机器应被 prune（与 clients 一致），10 分钟后查询为空。
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        s.on_record(&rec_machine(
+            0,
+            Some("w1"),
+            Some("9.9.9.9"),
+            Some("claude-code"),
+            Some("Windows"),
+            None,
+        ));
+        let later = s.machines_at(BASE_MS + 11 * 60 * 1000);
+        assert!(later.is_empty(), "过期机器应被回收");
+    }
+
+    #[test]
+    fn test_record_cache_tokens_roundtrip_and_default() {
+        // 新增 cache 字段应能序列化/反序列化，且旧 JSONL（缺字段）回退 0。
+        let mut r = rec(0, Some(1), "m", RequestOutcome::Success, 10, 5);
+        r.cache_read_tokens = 128;
+        r.cache_creation_tokens = 64;
+        let json = serde_json::to_string(&r).unwrap();
+        let back: RequestRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.cache_read_tokens, 128);
+        assert_eq!(back.cache_creation_tokens, 64);
+
+        // 缺字段的历史行：serde default 回退 0，不报错
+        let legacy = r#"{"request_id":"x","ts_ms":0,"credential_id":null,"model":"m","is_streaming":false,"input_tokens":1,"output_tokens":1,"credits_used":null,"latency_ms":0,"first_token_ms":null,"outcome":"success","retries":0,"error_message":null,"session_id":null,"client_device":null,"client_ip":null,"client_os":null,"client_browser":null}"#;
+        let legacy_rec: RequestRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(legacy_rec.cache_read_tokens, 0);
+        assert_eq!(legacy_rec.cache_creation_tokens, 0);
+    }
+
     #[test]
     fn test_jsonl_write_and_rebuild() {
         // 用唯一临时目录，落盘后新建实例重放，聚合应一致
@@ -1327,6 +1639,8 @@ mod tests {
         assert!(serde_json::to_string(&s.by_model()).is_ok());
         assert!(serde_json::to_string(&s.by_credential()).is_ok());
         assert!(serde_json::to_string(&s.throughput_at(BASE_MS)).is_ok());
+        assert!(serde_json::to_string(&s.clients_at(BASE_MS)).is_ok());
+        assert!(serde_json::to_string(&s.machines_at(BASE_MS)).is_ok());
     }
 
     #[test]
