@@ -106,7 +106,7 @@ pub async fn set_overage(
 
     // 轮询回查：上游写入未必对 GetUserUsageAndLimits 立即生效，单次回查可能读到
     // 旧值。每 1 秒回查一次、最多 10 秒；命中目标即返回，超时返回当前值 + note 标注。
-    // 注：这仍是显式单号操作触发的按需回查（非周期主动巡检），不违反封号红线。
+    // 注：这仍是显式单号操作触发的按需回查（非周期主动巡检），不会增加上游限流风险。
     let started = std::time::Instant::now();
     let mut attempt: u32 = 0;
     loop {
