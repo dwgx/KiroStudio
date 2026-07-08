@@ -1,9 +1,31 @@
 {
-  "host": "127.0.0.1",
+  // 监听地址。Docker 部署必须为 "0.0.0.0" 才能对外访问；
+  // 仅本机直跑可用 "127.0.0.1"。
+  "host": "0.0.0.0",
+
+  // 监听端口（容器内端口）。Docker 下保持 8990，对外端口由 .env 的 KIROSTUDIO_PORT 映射。
   "port": 8990,
-  "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
+
+  // 客户端调用网关的密钥（下游 Claude Code / SDK 用）。
+  // 请求头 x-api-key 或 Authorization: Bearer 携带。务必改成强随机值。
+  "apiKey": "sk-kiro-CHANGE-ME-to-a-strong-random-key",
+
+  // 管理面板（/admin）与 Admin API 的登录密钥。务必改成强随机值，勿与 apiKey 相同。
+  "adminApiKey": "sk-admin-CHANGE-ME-to-a-strong-random-key",
+
+  // TLS 后端。Docker 镜像为纯 rustls 构建，此处固定 "rustls"。
   "tlsBackend": "rustls",
+
+  // 上游 AWS 区域。默认 us-east-1，一般无需改动。
   "region": "us-east-1",
-  "adminApiKey": "sk-admin-your-secret-key",
-  "defaultEndpoint": "ide"
+
+  // 默认上游端点，"ide" 或 "cli"。凭据未显式指定 endpoint 时使用。
+  "defaultEndpoint": "ide",
+
+  // 负载均衡模式："priority"（按优先级，默认）或 "balanced"（多号均衡分摊）。
+  "loadBalancingMode": "priority",
+
+  // 网页上号回调基地址（可选）。服务器/Docker 部署且需网页 OAuth 上号时，
+  // 填公网可达地址如 "https://kiro.example.com"；本机部署留空即可。
+  "callbackBaseUrl": ""
 }
