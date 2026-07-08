@@ -47,3 +47,18 @@ data/
 ui-mockups/
 *.txt.dproj.txt
 tmp-import*/
+
+# 本地专用文档：不进公开 repo。
+# 可公开的纯技术文档单独列白名单在下方。
+docs/HANDOFF-*
+docs/PLAN-*
+docs/DESIGN-M365-*
+docs/RESEARCH-*
+docs/TODO-*
+docs/BACKLOG.md
+docs/DISCUSSION.md
+PROMPT.md
+/research/
+
+# Claude Code agent 配置/记忆（本地私有，不公开）
+.claude/
