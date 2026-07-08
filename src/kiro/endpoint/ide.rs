@@ -1,10 +1,13 @@
 //! Kiro IDE 端点
 //!
-//! 对应 Kiro IDE 客户端目前使用的 AWS CodeWhisperer 端点：
-//! - API: `https://q.{api_region}.amazonaws.com/generateAssistantResponse`
-//! - MCP: `https://q.{api_region}.amazonaws.com/mcp`
+//! 对应 Kiro IDE 客户端目前使用的端点（已随 Kiro 迁移到 kiro.dev；旧的
+//! `q.{region}.amazonaws.com` 已停用）：
+//! - API: `https://runtime.{region}.kiro.dev/generateAssistantResponse`
+//! - MCP: `https://runtime.{region}.kiro.dev/mcp`
 //!
-//! 请求头使用 aws-sdk-js User-Agent 标识。请求体会在根对象上注入 `profileArn`。
+//! region 优先从凭据 `profileArn` 的第 4 段提取（与 Kiro IDE 一致），回退到凭据/config region。
+//! 请求头使用 aws-sdk-js User-Agent 标识。请求体按凭据类型条件注入 `profileArn`
+//! （Enterprise/external_idp 不注入，见 `should_send_profile_arn`）。
 
 use reqwest::RequestBuilder;
 use uuid::Uuid;
@@ -23,11 +26,24 @@ impl IdeEndpoint {
     }
 
     fn api_region<'a>(&self, ctx: &'a RequestContext<'_>) -> &'a str {
-        ctx.credentials.effective_api_region(ctx.config)
+        // Region 优先从 profileArn 第 4 段提取（arn:aws:codewhisperer:{region}:...，与 Kiro IDE 一致），
+        // 回退到凭据 region / auth_region / config region。
+        if let Some(ref arn) = ctx.credentials.profile_arn {
+            if let Some(region) = arn.split(':').nth(3) {
+                if !region.is_empty() {
+                    return region;
+                }
+            }
+        }
+        ctx.credentials
+            .region
+            .as_deref()
+            .or(ctx.credentials.auth_region.as_deref())
+            .unwrap_or_else(|| ctx.credentials.effective_api_region(ctx.config))
     }
 
     fn host(&self, ctx: &RequestContext<'_>) -> String {
-        format!("q.{}.amazonaws.com", self.api_region(ctx))
+        format!("runtime.{}.kiro.dev", self.api_region(ctx))
     }
 
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
@@ -61,13 +77,13 @@ impl KiroEndpoint for IdeEndpoint {
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
         format!(
-            "https://q.{}.amazonaws.com/generateAssistantResponse",
+            "https://runtime.{}.kiro.dev/generateAssistantResponse",
             self.api_region(ctx)
         )
     }
 
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!("https://q.{}.amazonaws.com/mcp", self.api_region(ctx))
+        format!("https://runtime.{}.kiro.dev/mcp", self.api_region(ctx))
     }
 
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
