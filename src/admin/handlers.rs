@@ -55,6 +55,74 @@ pub async fn set_credential_priority(
     }
 }
 
+/// POST /api/admin/credentials/:id/name
+/// 设置凭据自定义别名/备注（传空清除）
+pub async fn set_credential_name(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetNameRequest>,
+) -> impl IntoResponse {
+    match state.service.set_credential_name(id, payload.name.clone()) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 别名已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/proxy
+/// 设置单个凭据代理（立即生效、无需重启）
+pub async fn set_credential_proxy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetProxyRequest>,
+) -> impl IntoResponse {
+    match state.service.set_credential_proxy(
+        id,
+        payload.proxy_url.clone(),
+        payload.proxy_username.clone(),
+        payload.proxy_password.clone(),
+    ) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 代理已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/trash/purge
+/// 批量清空回收站（body.ids 为空则清空全部）。不可恢复。
+pub async fn purge_trash_batch(
+    State(state): State<AdminState>,
+    Json(payload): Json<PurgeTrashRequest>,
+) -> impl IntoResponse {
+    let n = state.service.purge_trash_batch(payload.ids);
+    Json(SuccessResponse::new(format!("已永久清除 {} 个回收站条目", n)))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetNameRequest {
+    /// 别名/备注;传 null 或空字符串清除
+    pub name: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetProxyRequest {
+    /// 代理 URL;传 null/空清除(回退全局),"direct" 表示强制不走代理
+    pub proxy_url: Option<String>,
+    /// 代理用户名;None 不改,空清除
+    #[serde(default)]
+    pub proxy_username: Option<String>,
+    /// 代理密码;None 不改,空清除
+    #[serde(default)]
+    pub proxy_password: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurgeTrashRequest {
+    /// 要清除的回收站条目 id;为空/缺省则清空全部
+    #[serde(default)]
+    pub ids: Option<Vec<u64>>,
+}
+
 /// POST /api/admin/credentials/:id/reset
 /// 重置失败计数并重新启用
 pub async fn reset_failure_count(
@@ -425,6 +493,79 @@ pub struct StartIdcLoginRequest {
     pub proxy_url: Option<String>,
 }
 
+/// POST /api/admin/auth/external-idp/start
+/// 外部 IdP（Microsoft）上号 · 第 1 步：返回 session_id + Kiro signin URL。
+pub async fn start_external_idp_login(
+    State(state): State<AdminState>,
+    Json(payload): Json<StartExternalIdpLoginRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .start_external_idp_login(payload.priority, payload.proxy_url)
+    {
+        Ok(result) => Json(serde_json::json!({
+            "sessionId": result.session_id,
+            "signinUrl": result.signin_url,
+        }))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/auth/external-idp/leg1
+/// 第 2 步：粘回 portal 回调 URL，返回 IdP authorize URL。
+pub async fn external_idp_leg1(
+    State(state): State<AdminState>,
+    Json(payload): Json<ExternalIdpPasteRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .submit_external_idp_leg1(&payload.session_id, &payload.url)
+        .await
+    {
+        Ok(result) => Json(serde_json::json!({
+            "authorizeUrl": result.authorize_url,
+        }))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/auth/external-idp/leg2
+/// 第 3 步：粘回授权回调 URL，换 token 入池。
+pub async fn external_idp_leg2(
+    State(state): State<AdminState>,
+    Json(payload): Json<ExternalIdpPasteRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .submit_external_idp_leg2(&payload.session_id, &payload.url)
+        .await
+    {
+        Ok(result) => Json(serde_json::json!({
+            "credentialId": result.credential_id,
+        }))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartExternalIdpLoginRequest {
+    #[serde(default = "default_priority")]
+    pub priority: u32,
+    pub proxy_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalIdpPasteRequest {
+    pub session_id: String,
+    /// 用户粘回的浏览器地址栏整串 URL（或 query 片段）。
+    pub url: String,
+}
+
 fn default_priority() -> u32 {
     100
 }
@@ -434,7 +575,7 @@ fn default_priority() -> u32 {
 /// POST /api/admin/service/restart
 /// 一键重启本服务（detached）。先返回 200，再由脱离子进程约 1 秒后执行 systemctl restart。
 ///
-/// ⚠️ 重启瞬间本服务断连是预期行为（Claude Code 自己也走 8990，会短暂中断）。
+/// ⚠️ 重启瞬间本服务断连是预期行为（网关自身流量可能也经由本端点，重启会短暂中断）。
 pub async fn restart_service(State(state): State<AdminState>) -> impl IntoResponse {
     match state.service.restart_service() {
         Ok(_) => Json(SuccessResponse::new(
@@ -485,4 +626,41 @@ pub async fn update_config(
         Ok(resp) => Json(resp).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
+}
+
+// ============ OTA 自更新（GitHub 版本检查 + 一键升级）============
+
+/// GET /api/admin/update/check
+/// 检查是否有新版本（多镜像回退拉 GitHub tags，semver 比较；只读、不改任何文件）。
+pub async fn check_update(State(_state): State<AdminState>) -> impl IntoResponse {
+    Json(super::update::check_for_updates().await)
+}
+
+/// POST /api/admin/update/perform
+/// 一键升级：下载新二进制 + sha256 校验 + 备份 + 原子替换，成功后触发一键重启拉起新版本。
+/// body 可选 `{ "version": "v1.2.3" }`（不传=升级到最新）。
+pub async fn perform_update(
+    State(state): State<AdminState>,
+    Json(payload): Json<UpdatePerformRequest>,
+) -> impl IntoResponse {
+    match super::update::perform_update(payload.version).await {
+        Ok(result) => {
+            // 替换成功且确有更新 → 复用一键重启（exit(0)→systemd 拉起新二进制）。
+            if result.updated {
+                let _ = state.service.restart_service();
+            }
+            Json(result).into_response()
+        }
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "success": false, "message": format!("升级失败: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize, Default)]
+pub struct UpdatePerformRequest {
+    #[serde(default)]
+    pub version: Option<String>,
 }

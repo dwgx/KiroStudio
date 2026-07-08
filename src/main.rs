@@ -216,6 +216,10 @@ async fn main() {
     // 请求命中内存字节秒回，不再在登录页热路径实时打图源。关闭时不 spawn。
     admin_ui::spawn_bg_prefetch(config.login_background_enabled);
 
+    // 指纹采集开关：把配置写入热路径运行时镜像（默认 true）。关闭后不采集
+    // 下游客户端 device/ip/os/browser。admin 改开关时会立即改写此镜像。
+    anthropic::set_collect_client_fingerprint(config.collect_client_fingerprint);
+
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),
@@ -276,7 +280,7 @@ async fn main() {
             }
 
             // A6：温和的周期性余额刷新（严格受控）。
-            // 封号红线：绝不在启动/挂载时批量拉——这里只 spawn 一个后台任务，
+            // 为避免触发上游风控：绝不在启动/挂载时批量拉——这里只 spawn 一个后台任务，
             // 首轮也要等满一个完整间隔才开始，且逐个刷新、每个之间留间隔（分散节奏），
             // 只刷未禁用的号，仅更新缓存供展示，绝不做主动禁用。
             // 0 = 禁用（安全默认之一）。本批作为需重启字段。
@@ -288,7 +292,7 @@ async fn main() {
                         std::time::Duration::from_secs(balance_interval),
                     );
                     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                    // 跳过第一次立即触发的 tick，避免启动即批量拉（封号红线）
+                    // 跳过第一次立即触发的 tick，避免启动即批量拉（降低上游限流风险）
                     ticker.tick().await;
                     loop {
                         ticker.tick().await;
@@ -470,7 +474,7 @@ fn init_usage_pipeline(config: &Config) -> Option<UsageHandles> {
     // 的 key 是客户端可控的 session_id（UUID）/ client_ip，原先仅靠概览页查询时
     // 惰性 prune。若长时间无人打开概览页，这些 map 会随不断变化的 session 无界增长
     // （中高危内存泄漏）。每 5 分钟主动回收一次窗口外的条目。
-    // interval 用 Skip 防止唤醒后连刷；纯内存操作，零上游调用（不碰封号红线）。
+    // interval 用 Skip 防止唤醒后连刷；纯内存操作，零上游调用（不增加上游限流风险）。
     let cleanup_stats = stats.clone();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5 * 60));

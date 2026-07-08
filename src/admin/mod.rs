@@ -17,6 +17,7 @@
 //! ```
 
 mod error;
+mod external_idp_login;
 mod handlers;
 mod idc_login;
 mod middleware;
@@ -24,6 +25,7 @@ mod router;
 mod service;
 mod social_login;
 pub mod types;
+mod update;
 mod usage_handlers;
 
 pub use middleware::AdminState;
