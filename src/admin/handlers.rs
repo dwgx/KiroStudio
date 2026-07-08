@@ -636,6 +636,14 @@ pub async fn check_update(State(_state): State<AdminState>) -> impl IntoResponse
     Json(super::update::check_for_updates().await)
 }
 
+/// GET /api/admin/update/status
+/// OTA 观测（只读）：读 exe 同目录的 .health/.bak/*.failed 标记，报告本版是否已稳定确认、
+/// 回滚点是否还在、是否发生过自动回滚。供前端在一键升级后轮询显示「已升级到 vX」或
+/// 「升级失败已自动回滚」。
+pub async fn update_status(State(_state): State<AdminState>) -> impl IntoResponse {
+    Json(crate::common::health_marker::read_status())
+}
+
 /// POST /api/admin/update/perform
 /// 一键升级：下载新二进制 + sha256 校验 + 备份 + 原子替换，成功后触发一键重启拉起新版本。
 /// body 可选 `{ "version": "v1.2.3" }`（不传=升级到最新）。

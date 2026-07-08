@@ -34,4 +34,5 @@ mod websearch;
 
 pub use cache_tracker::cache_stats_snapshot;
 pub use handlers::set_collect_client_fingerprint;
+pub use handlers::set_extract_thinking;
 pub use router::create_router_with_provider;

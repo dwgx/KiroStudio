@@ -158,6 +158,9 @@ pub fn classify_device(ua: Option<&str>) -> Option<String> {
         || lower.contains("anthropic")
     {
         "claude-code"
+    } else if lower.contains("opencode") {
+        // OpenCode（开源 TUI 编码助手）：独立客户端类,前端展示为 OpenCode 品牌图标。
+        "opencode"
     } else if lower.contains("curl") {
         "curl"
     } else if lower.contains("python-requests") || lower.contains("python") {
@@ -333,6 +336,18 @@ mod tests {
         assert_eq!(
             classify_device(Some("Claude-Code/2.0")),
             Some("claude-code".to_string())
+        );
+    }
+
+    #[test]
+    fn test_classify_device_opencode() {
+        assert_eq!(
+            classify_device(Some("opencode/0.3.1")),
+            Some("opencode".to_string())
+        );
+        assert_eq!(
+            classify_device(Some("OpenCode/1.0 (linux)")),
+            Some("opencode".to_string())
         );
     }
 

@@ -44,16 +44,17 @@ pub fn create_router_with_provider(
     max_body_bytes: usize,
     compression: crate::model::config::CompressionConfig,
 ) -> Router {
-    let mut state = AppState::with_prompt_cache(
-        api_key,
-        extract_thinking,
-        prompt_cache_enabled,
-        prompt_cache_ttl_seconds,
-    )
-    .with_compression(compression);
+    let mut state = AppState::with_cache_ttl(api_key, prompt_cache_ttl_seconds);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }
+
+    // TIER3 配置热重载：把热路径开关/压缩配置播种进进程级镜像（handler 读镜像而非固化 state）。
+    // 之后 admin 改配置调对应 setter 即时生效、无需重启（extract_thinking / prompt_cache_enabled /
+    // compression 三项）。prompt_cache_ttl 仍固化进 CacheTracker，属诚实边界保留重启。
+    super::handlers::set_extract_thinking(extract_thinking);
+    super::handlers::set_prompt_cache_enabled(prompt_cache_enabled);
+    super::handlers::set_compression(compression);
 
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()

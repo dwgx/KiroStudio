@@ -9,6 +9,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 use std::collections::HashMap;
@@ -19,10 +20,11 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::time::{Duration as StdDuration, Instant};
 
+use arc_swap::ArcSwap;
+
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::affinity::UserAffinityManager;
-use crate::kiro::cooldown::{CooldownManager, CooldownReason};
-use crate::kiro::machine_id;
+use crate::kiro::cooldown::{CooldownManager, CooldownReason};use crate::kiro::machine_id;
 use crate::kiro::model::credentials::{KiroCredentials, TrashEntry};
 use crate::kiro::model::token_refresh::{
     ExternalIdpRefreshResponse, IdcRefreshRequest, IdcRefreshResponse, RefreshRequest,
@@ -31,6 +33,7 @@ use crate::kiro::model::token_refresh::{
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::kiro::rate_limiter::{RateLimitConfig, RateLimiter};
 use crate::kiro::scheduling::{InflightGuard, RpmTracker};
+use crate::kiro::health::HealthTracker;
 use crate::model::config::Config;
 
 /// 检查 Token 是否在指定时间内过期
@@ -704,7 +707,9 @@ pub struct ManagerSnapshot {
 /// 支持多个凭据的管理，实现固定优先级 + 故障转移策略
 /// 故障统计基于 API 调用结果，而非 Token 刷新结果
 pub struct MultiTokenManager {
-    config: Config,
+    /// 服务端配置（ArcSwap：admin 改配置后 reload_config 原子热切,读端 load() 无锁近零成本，
+    /// 不重启即生效。热路径每请求读的标量另存原子镜像,避免 O(N) 次建 Guard）。
+    config: ArcSwap<Config>,
     proxy: Option<ProxyConfig>,
     /// 凭据条目列表
     entries: Mutex<Vec<CredentialEntry>>,
@@ -729,24 +734,29 @@ pub struct MultiTokenManager {
     stats_dirty: AtomicBool,
     /// 失败冷却管理器（反应式：凭据出错后短暂跳过）
     cooldown: CooldownManager,
-    /// 是否启用冷却
-    cooldown_enabled: bool,
+    /// 是否启用冷却（原子镜像,reload 热更）
+    cooldown_enabled: AtomicBool,
     /// 拟人速率限制器（防关联：每日上限 + 请求间隔）
     rate_limiter: RateLimiter,
-    /// 是否启用速率限制
-    rate_limit_enabled: bool,
+    /// 是否启用速率限制（原子镜像,reload 热更）
+    rate_limit_enabled: AtomicBool,
     /// 会话亲和性管理器（防关联：同一会话粘同一凭据）
     affinity: UserAffinityManager,
-    /// 是否启用会话亲和性
-    affinity_enabled: bool,
+    /// 是否启用会话亲和性（原子镜像,reload 热更）
+    affinity_enabled: AtomicBool,
     /// RPM 滚动窗口追踪器（balanced 选号时对接近 RPM 上限的号降权）
     rpm: RpmTracker,
-    /// 每凭据 RPM 软上限（0 = 不限制）
-    rpm_limit: u32,
-    /// 全池冷却时是否快速失败（立即返回 429+Retry-After 让客户端退避，而非网关内硬扛）。
-    all_cooling_fast_fail: bool,
-    /// 是否在凭据持续可疑活动风控(trigger_count 达阈值)时自动禁用它。
-    auto_disable_suspicious: bool,
+    /// 号池/族级健康评分 + 熔断半开渐进放回（balanced 选号 p_avail 权重 + 429 后逐步试探放回）。
+    health: HealthTracker,
+    /// 每凭据 RPM 软上限（0 = 不限制）（原子镜像,reload 热更）
+    rpm_limit: AtomicU32,
+    /// 全池冷却时是否快速失败（立即返回 429+Retry-After 让客户端退避，而非网关内硬扛）。（原子镜像,reload 热更）
+    all_cooling_fast_fail: AtomicBool,
+    /// 是否在凭据持续可疑活动风控(trigger_count 达阈值)时自动禁用它。（原子镜像,reload 热更）
+    auto_disable_suspicious: AtomicBool,
+    /// 主动 token 预刷新后台任务句柄（TIER2 热重载：改配置后 abort + respawn 即时生效不重启）。
+    /// None = 当前未运行（proactive_token_refresh=false 或尚未启动）。
+    refresh_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -1011,7 +1021,7 @@ impl MultiTokenManager {
             ..RateLimitConfig::default()
         };
         let manager = Self {
-            config,
+            config: ArcSwap::from_pointee(config),
             proxy,
             entries: Mutex::new(entries),
             trash: Mutex::new(Vec::new()),
@@ -1023,15 +1033,17 @@ impl MultiTokenManager {
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
             cooldown: CooldownManager::new(),
-            cooldown_enabled,
+            cooldown_enabled: AtomicBool::new(cooldown_enabled),
             rate_limiter: RateLimiter::new(rate_limit_config),
-            rate_limit_enabled,
+            rate_limit_enabled: AtomicBool::new(rate_limit_enabled),
             affinity: UserAffinityManager::new(),
-            affinity_enabled,
+            affinity_enabled: AtomicBool::new(affinity_enabled),
             rpm: RpmTracker::new(),
-            rpm_limit,
-            all_cooling_fast_fail,
-            auto_disable_suspicious,
+            health: HealthTracker::new(),
+            rpm_limit: AtomicU32::new(rpm_limit),
+            all_cooling_fast_fail: AtomicBool::new(all_cooling_fast_fail),
+            auto_disable_suspicious: AtomicBool::new(auto_disable_suspicious),
+            refresh_task: Mutex::new(None),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -1052,9 +1064,76 @@ impl MultiTokenManager {
         Ok(manager)
     }
 
-    /// 获取配置的引用
-    pub fn config(&self) -> &Config {
-        &self.config
+    /// 获取当前配置快照（Arc<Config>，load_full 只 +1 引用计数,不深拷贝）。
+    /// 字段访问经 Arc 自动 deref;把 config 当 `&Config` 传函数时用 `&*cfg` 或 `&cfg`。
+    pub fn config(&self) -> Arc<Config> {
+        self.config.load_full()
+    }
+
+    /// 热重载配置（admin 改配置存盘后调用）：重新解析 config 文件,原子换 ArcSwap +
+    /// 刷新所有热路径原子镜像 + rate_limiter。解析失败直接返回 Err（零副作用,保留旧配置）。
+    /// TIER1 运行时字段（冷却/限流/亲和/RPM上限/快失败/自动禁用/负载均衡）即时生效不重启;
+    /// proxy/tls/端口/adminkey 等固化项仍需重启（见 docs/RESEARCH-HOTRELOAD-ARCH-0708）。
+    pub fn reload_config(&self) -> anyhow::Result<()> {
+        let path = {
+            let cur = self.config.load();
+            cur.config_path()
+                .ok_or_else(|| anyhow::anyhow!("无 config 文件路径,无法热重载"))?
+                .to_path_buf()
+        };
+        let new = Config::load(&path)?; // 解析失败 → return Err,不动任何状态
+        // 刷新热路径原子镜像
+        self.cooldown_enabled
+            .store(new.cooldown_enabled, Ordering::Relaxed);
+        self.rate_limit_enabled
+            .store(new.rate_limit_enabled, Ordering::Relaxed);
+        self.affinity_enabled
+            .store(new.affinity_enabled, Ordering::Relaxed);
+        self.rpm_limit
+            .store(new.credential_rpm_limit, Ordering::Relaxed);
+        self.all_cooling_fast_fail
+            .store(new.all_cooling_fast_fail, Ordering::Relaxed);
+        self.auto_disable_suspicious
+            .store(new.auto_disable_suspicious, Ordering::Relaxed);
+        *self.load_balancing_mode.lock() = new.load_balancing_mode.clone();
+        self.rate_limiter.update_config(RateLimitConfig {
+            daily_max_requests: new.rate_limit_daily_max,
+            min_interval_ms: new.rate_limit_min_interval_ms,
+            ..RateLimitConfig::default()
+        });
+        // 最后原子换整份配置（源真值,供冷/温读点 load() 取新值）
+        self.config.store(Arc::new(new));
+        tracing::info!("配置已热重载（TIER1 运行时字段即时生效;proxy/tls/端口等固化项仍需重启）");
+        Ok(())
+    }
+
+    /// 重挂主动 token 预刷新后台任务（TIER2 热重载）。
+    ///
+    /// 读当前 config 的 `proactive_token_refresh`/`token_refresh_lead_minutes`/
+    /// `token_refresh_interval_secs`，abort 旧任务后按需 spawn 新任务：
+    /// - 启动时调用一次（替代 main.rs 原内联 detached spawn，让任务"从启动即受管"）；
+    /// - admin 改这三个字段后调用 → 间隔/提前量/开关即时生效，无需重启。
+    ///
+    /// 任务体持 `Weak<Self>`：manager 被 drop 后下一轮 upgrade 失败即自我退出，
+    /// 不构成 Arc 引用环（句柄存在 self 内，闭包只借弱引用）。
+    /// 幂等：重复调用先 abort 旧句柄再重建，不会累积多个循环。
+    pub fn respawn_refresh_task(self: &Arc<Self>) {
+        let cfg = self.config();
+        let mut slot = self.refresh_task.lock();
+        // 先杀旧任务（若有），无论开关如何都先停，避免旧间隔残留
+        if let Some(old) = slot.take() {
+            old.abort();
+        }
+        if !cfg.proactive_token_refresh {
+            tracing::info!("主动 token 预刷新未启用（proactive_token_refresh=false），后台任务不运行");
+            return;
+        }
+        let handle = crate::kiro::refresh_loop::spawn(
+            Arc::downgrade(self),
+            cfg.token_refresh_lead_minutes,
+            cfg.token_refresh_interval_secs,
+        );
+        *slot = Some(handle);
     }
 
     /// 导出指定 ID 凭据的原始 KiroCredentials（用于 Admin 令牌下载）
@@ -1082,7 +1161,7 @@ impl MultiTokenManager {
     /// 获取当前所有处于冷却中的凭据快照（供 admin 面板展示 429/限流感官）。
     /// 冷却未启用时返回空。
     pub fn cooldown_snapshot(&self) -> Vec<crate::kiro::cooldown::CooldownInfo> {
-        if !self.cooldown_enabled {
+        if !self.cooldown_enabled.load(Ordering::Relaxed) {
             return Vec::new();
         }
         self.cooldown.get_all_cooldowns()
@@ -1130,7 +1209,7 @@ impl MultiTokenManager {
         }
 
         // 会话亲和性：若该会话已绑定某凭据且当前可用，优先复用，让同一对话粘同一账号
-        if self.affinity_enabled {
+        if self.affinity_enabled.load(Ordering::Relaxed) {
             if let Some(uid) = user_id {
                 if let Some(bound_id) = self.affinity.get(uid) {
                     if let Some(entry) = available.iter().find(|e| e.id == bound_id) {
@@ -1154,20 +1233,27 @@ impl MultiTokenManager {
 
         let selected = match mode {
             "balanced" => {
-                // 按 (rpm 饱和, 在途数, 近 60s RPM, 终身成功数, 优先级) 升序：
-                // ① 先避开 RPM 已饱和的号（软降权，非硬跳过）；
-                // ② 再挑在飞请求最少的（分摊并发）；
-                // ③ ⭐再挑**近 60s 实际负载（RPM）最少**的——真正的"分流"关键：
-                //    让流量均匀铺到所有号，每号 RPM 降到 ~1/N，直接降低账户级可疑活动的触发频率（防封）。
-                // ④ 终身成功数（Least-Used）与优先级仅作平局兜底。
-                //
-                // 为何不是终身 success_count 主导：那会让新号（终身计数低）被持续灌到追平老号为止，
-                // 把负载**集中**在少数号上（老号闲置、新号被打爆）——既让部分号"不动"，又抬高单号 RPM
-                // 触发风控，与防封目标背道而驰。改用滚动窗口 RPM 主导即真正的即时均衡。
+                // 自适应分流排序键（升序 min_by_key）：
+                // ① ⭐**健康分档 neg_p_bucket**（首要）：p_avail = 熔断门×健康×(1-RPM压力)×(1-负载),
+                //    量化成 0..100 桶取负 → p_avail 越高排越前。熔断 Open 的号/族 p_avail=0 自然沉底、
+                //    半开期按 admit_prob 概率软降权(试探性放回)、健康差的号被压后。族键连坐:M365 同租户
+                //    共享一个 health(整族一起沉),IdC/social 各自 cred:{id} 独立(坚强兜底不受连坐)。
+                // ② rpm 饱和(硬软上限)③在途④近60s RPM⑤终身成功数⑥优先级:同健康档内的精细分流兜底。
+                // p_avail 已内含 rpm 压力/在途,②③④作同档兜底仍保留(粒度更细+rpm_limit=0 时 p_avail 不含压力)。
                 available
                     .iter()
                     .min_by_key(|e| {
+                        let key = e.credentials.family_key(e.id);
+                        let p = self.health.p_avail(
+                            &key,
+                            self.rpm.count(e.id),
+                            e.inflight.load(Ordering::Acquire),
+                            self.rpm_limit.load(Ordering::Relaxed),
+                        );
+                        // p_avail(0..1) → 0..100 桶,取负作升序首键(高 p 排前)。同桶内再走下面细分。
+                        let neg_p_bucket = -((p * 100.0) as i64);
                         (
+                            neg_p_bucket,
                             self.is_rpm_saturated(e.id),
                             e.inflight.load(Ordering::Acquire),
                             self.rpm.count(e.id),
@@ -1189,7 +1275,7 @@ impl MultiTokenManager {
         let selected = selected?;
 
         // 新选中的凭据与会话建立绑定，使后续同会话请求复用
-        if self.affinity_enabled {
+        if self.affinity_enabled.load(Ordering::Relaxed) {
             if let Some(uid) = user_id {
                 self.affinity.set(uid, selected.id);
             }
@@ -1209,10 +1295,10 @@ impl MultiTokenManager {
         if is_opus && !entry.credentials.supports_opus() {
             return false;
         }
-        if self.cooldown_enabled && !self.cooldown.is_available(entry.id) {
+        if self.cooldown_enabled.load(Ordering::Relaxed) && !self.cooldown.is_available(entry.id) {
             return false;
         }
-        if self.rate_limit_enabled && self.rate_limiter.check_rate_limit(entry.id).is_err() {
+        if self.rate_limit_enabled.load(Ordering::Relaxed) && self.rate_limiter.check_rate_limit(entry.id).is_err() {
             return false;
         }
         // ⚠️ inflight 绝不作为「可选性」的硬门槛。
@@ -1242,14 +1328,14 @@ impl MultiTokenManager {
 
             has_candidate = true;
 
-            if self.cooldown_enabled {
+            if self.cooldown_enabled.load(Ordering::Relaxed) {
                 if let Some((_reason, remaining)) = self.cooldown.check_cooldown(entry.id) {
                     waits.push(remaining);
                     continue;
                 }
             }
 
-            if self.rate_limit_enabled {
+            if self.rate_limit_enabled.load(Ordering::Relaxed) {
                 if let Err(wait) = self.rate_limiter.check_rate_limit(entry.id) {
                     waits.push(wait);
                     continue;
@@ -1278,7 +1364,8 @@ impl MultiTokenManager {
 
     /// 该凭据在滚动 60 秒窗口内是否已达 RPM 软上限（rpm_limit == 0 时恒为 false）
     fn is_rpm_saturated(&self, id: u64) -> bool {
-        self.rpm_limit > 0 && self.rpm.count(id) >= self.rpm_limit
+        let lim = self.rpm_limit.load(Ordering::Relaxed);
+        lim > 0 && self.rpm.count(id) >= lim
     }
 
     /// 获取 API 调用上下文
@@ -1376,7 +1463,7 @@ impl MultiTokenManager {
                             // 客户端退避比网关反复选号温和,也减少对被风控号的零星试探。
                             // 只有"马上(≤2s)就能恢复"的瞬时繁忙才短等一下,避免把秒级抖动也甩给客户端。
                             const FAST_FAIL_THRESHOLD: StdDuration = StdDuration::from_secs(2);
-                            if self.all_cooling_fast_fail && wait > FAST_FAIL_THRESHOLD {
+                            if self.all_cooling_fast_fail.load(Ordering::Relaxed) && wait > FAST_FAIL_THRESHOLD {
                                 let retry_after = wait.as_secs().max(1);
                                 let entries = self.entries.lock();
                                 let available = entries.iter().filter(|e| !e.disabled).count();
@@ -1418,7 +1505,7 @@ impl MultiTokenManager {
             match self.try_ensure_token(id, &credentials, inflight).await {
                 Ok(ctx) => {
                     // 记录一次速率获取（递增每日计数 + 标记本次请求时间，驱动最小间隔）
-                    if self.rate_limit_enabled {
+                    if self.rate_limit_enabled.load(Ordering::Relaxed) {
                         if let Err(wait) = self.rate_limiter.try_acquire(id) {
                             tracing::debug!("凭据 #{} 速率受限，需等待 {:?}，重新选择", id, wait);
                             // 该凭据本轮不可用，换下一个；select 已会过滤它
@@ -1521,8 +1608,9 @@ impl MultiTokenManager {
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                 // 确实需要刷新
                 let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
+                let cfg = self.config.load_full();
                 let new_creds =
-                    refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
+                    refresh_token(&current_creds, &cfg, effective_proxy.as_ref()).await?;
 
                 if is_token_expired(&new_creds) {
                     anyhow::bail!("刷新后的 Token 仍然无效或已过期");
@@ -1802,6 +1890,7 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_success(&self, id: u64) {
+        let fam = self.family_key_of(id);
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
@@ -1817,13 +1906,27 @@ impl MultiTokenManager {
             }
         }
         // 成功：清除冷却并记录速率成功（重置连续失败/退避）
-        if self.cooldown_enabled {
+        if self.cooldown_enabled.load(Ordering::Relaxed) {
             self.cooldown.clear_cooldown(id);
         }
-        if self.rate_limit_enabled {
+        if self.rate_limit_enabled.load(Ordering::Relaxed) {
             self.rate_limiter.record_success(id);
         }
+        // 健康：成功抬 ewma_success、衰减 ewma_429;半开期连续成功 AIMD 逐步放回直至全开。
+        // 键用 family_key（族/号同口径），锁外调用（health 独立 Mutex，避免与 entries 锁嵌套）。
+        self.health.on_success(&fam);
         self.save_stats_debounced();
+    }
+
+    /// 按 id 取该凭据的 family_key（M365 号→族键连坐；IdC/social→cred:{id} 独立）。
+    /// 找不到该 id（已删除等）时回退 `cred:{id}`，保证 health 键始终可用。
+    fn family_key_of(&self, id: u64) -> String {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.credentials.family_key(e.id))
+            .unwrap_or_else(|| format!("cred:{id}"))
     }
 
     /// 报告指定凭据 API 调用失败
@@ -1889,7 +1992,7 @@ impl MultiTokenManager {
             self.affinity.remove_by_credential(id);
         }
         // 记录速率失败（驱动指数退避）
-        if self.rate_limit_enabled {
+        if self.rate_limit_enabled.load(Ordering::Relaxed) {
             self.rate_limiter.record_failure(id, None);
         }
         self.save_stats_debounced();
@@ -1904,7 +2007,7 @@ impl MultiTokenManager {
     /// `retry_after_secs` 来自响应头 `Retry-After` 或错误 body（如 `resets_in_seconds`）。
     /// 有则据此设定精确冷却，避免盲目指数退避浪费；无则回退到分级递增冷却。
     pub fn report_rate_limited_with_retry_after(&self, id: u64, retry_after_secs: Option<u64>) {
-        if self.cooldown_enabled {
+        if self.cooldown_enabled.load(Ordering::Relaxed) {
             // 有 Retry-After：按上游指定时长冷却，但钳制上限，避免上游给超大 resets_at
             // （如「本月配额，几天后重置」）把号冻几天——那类应走配额耗尽禁用，不该塞进短冷却。
             const MAX_RETRY_AFTER_COOLDOWN_SECS: u64 = 600;
@@ -1933,9 +2036,12 @@ impl MultiTokenManager {
                 }
             );
         }
-        if self.rate_limit_enabled {
+        if self.rate_limit_enabled.load(Ordering::Relaxed) {
             self.rate_limiter.record_failure(id, Some("rate limited"));
         }
+        // 健康：裸 429 走单号 health（family_key 对 IdC 是 cred:{id};对 M365 是族键——
+        // 但普通 429 不像 suspicious 那样整族连坐,这里仍按该号自己的键累计即可,连续达阈值单号跳闸）。
+        self.health.on_429(&self.family_key_of(id));
     }
 
     /// 报告凭据触发**账户级可疑活动风控**（`suspicious activity`+`temporary limits`）。
@@ -1946,7 +2052,7 @@ impl MultiTokenManager {
     /// 立刻再限，反复砸只会加重可疑度、把账户推向真封禁。此处让该号**真正退避**，
     /// 冷却期内不参与选号，等调查窗口过去自愈。不禁用、不计永久失败、不改发往上游字节。
     pub fn report_suspicious_activity(&self, id: u64) {
-        if self.cooldown_enabled {
+        if self.cooldown_enabled.load(Ordering::Relaxed) {
             let dur = self
                 .cooldown
                 .set_cooldown(id, CooldownReason::SuspiciousActivity);
@@ -1956,11 +2062,17 @@ impl MultiTokenManager {
                 dur
             );
 
+            // ⭐健康/族级连坐：M365 账户族级风控——同一租户的号共享 family_key,
+            // 一个号触发 suspicious 就让**整族**进熔断 Open(用 cooldown 给的硬窗 dur 作 backoff),
+            // 选号时同族其它号 p_avail=0 一起沉底、不再逐个砸(治雪崩)。IdC/social 的 cred:{id}
+            // 只连坐它自己(键独立),坚强兜底不受影响。冷却硬窗过后 health 走半开渐进放回。
+            self.health.report_family_suspicious(&self.family_key_of(id), dur);
+
             // 自动禁用(dwgx:账户不行了就自动禁用)：连续可疑活动触发达阈值,说明该号已被 Kiro 盯死、
             // 冷却也顶格(30min)仍反复被限——继续放它参与调度只会不停砸、加重风控甚至触发真封禁。
             // 达阈值即自动禁用并标注 SuspiciousActivityAuto(可人工/自愈重新启用),把它移出轮转。
             const AUTO_DISABLE_TRIGGER: u32 = 10;
-            if self.auto_disable_suspicious && self.cooldown.trigger_count(id) >= AUTO_DISABLE_TRIGGER {
+            if self.auto_disable_suspicious.load(Ordering::Relaxed) && self.cooldown.trigger_count(id) >= AUTO_DISABLE_TRIGGER {
                 let mut entries = self.entries.lock();
                 if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                     if !entry.disabled {
@@ -1977,14 +2089,14 @@ impl MultiTokenManager {
                 }
             }
         }
-        if self.rate_limit_enabled {
+        if self.rate_limit_enabled.load(Ordering::Relaxed) {
             self.rate_limiter.record_failure(id, Some("suspicious activity"));
         }
     }
 
     /// 报告凭据认证失败，设置较长冷却（配合 force-refresh 失败后调用）
     pub fn report_auth_cooldown(&self, id: u64) {
-        if self.cooldown_enabled {
+        if self.cooldown_enabled.load(Ordering::Relaxed) {
             let dur = self
                 .cooldown
                 .set_cooldown(id, CooldownReason::AuthenticationFailed);
@@ -2088,7 +2200,7 @@ impl MultiTokenManager {
             }
         };
         // 设置长冷却（不可自动恢复原因）
-        if self.cooldown_enabled {
+        if self.cooldown_enabled.load(Ordering::Relaxed) {
             self.cooldown
                 .set_cooldown(id, CooldownReason::AccountSuspended);
         }
@@ -2501,8 +2613,9 @@ impl MultiTokenManager {
 
                 if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                     let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
+                    let cfg = self.config.load_full();
                     let new_creds =
-                        refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
+                        refresh_token(&current_creds, &cfg, effective_proxy.as_ref())
                             .await?;
                     {
                         let mut entries = self.entries.lock();
@@ -2539,7 +2652,8 @@ impl MultiTokenManager {
         };
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let usage_limits = get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
+        let cfg = self.config.load_full();
+        let usage_limits = get_usage_limits(&credentials, &cfg, &token, effective_proxy.as_ref()).await?;
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {
@@ -2609,8 +2723,9 @@ impl MultiTokenManager {
             };
             if is_token_expired(&current) || is_token_expiring_soon(&current) {
                 let effective_proxy = current.effective_proxy(self.proxy.as_ref());
+                let cfg = self.config.load_full();
                 let new_creds =
-                    refresh_token(&current, &self.config, effective_proxy.as_ref()).await?;
+                    refresh_token(&current, &cfg, effective_proxy.as_ref()).await?;
                 {
                     let mut entries = self.entries.lock();
                     if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
@@ -2647,7 +2762,7 @@ impl MultiTokenManager {
             idp,
             profile_arn,
             proxy,
-            tls_backend: self.config.tls_backend,
+            tls_backend: self.config.load().tls_backend,
         })
     }
 
@@ -2686,8 +2801,9 @@ impl MultiTokenManager {
                 };
                 if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                     let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
+                    let cfg = self.config.load_full();
                     let new_creds =
-                        refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
+                        refresh_token(&current_creds, &cfg, effective_proxy.as_ref())
                             .await?;
                     {
                         let mut entries = self.entries.lock();
@@ -2715,13 +2831,14 @@ impl MultiTokenManager {
             }
         };
 
-        let region = credentials.effective_api_region(&self.config);
+        let cfg = self.config.load();
+        let region = credentials.effective_api_region(&cfg);
         let host = format!("q.{}.amazonaws.com", region);
         let url = format!("https://{}/generateAssistantResponse", host);
-        let machine_id = machine_id::generate_from_credentials(&credentials, &self.config);
-        let kiro_version = &self.config.kiro_version;
-        let os_name = &self.config.system_version;
-        let node_version = &self.config.node_version;
+        let machine_id = machine_id::generate_from_credentials(&credentials, &cfg);
+        let kiro_version = &cfg.kiro_version;
+        let os_name = &cfg.system_version;
+        let node_version = &cfg.node_version;
 
         let user_agent = format!(
             "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
@@ -2746,7 +2863,7 @@ impl MultiTokenManager {
         }
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let client = build_client(effective_proxy.as_ref(), 30, self.config.tls_backend)?;
+        let client = build_client(effective_proxy.as_ref(), 30, self.config.load().tls_backend)?;
 
         let mut request = client
             .post(&url)
@@ -2865,7 +2982,8 @@ impl MultiTokenManager {
             new_cred.clone()
         } else {
             let effective_proxy = new_cred.effective_proxy(self.proxy.as_ref());
-            refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?
+            let cfg = self.config.load_full();
+            refresh_token(&new_cred, &cfg, effective_proxy.as_ref()).await?
         };
 
         // 4. 分配新 ID
@@ -3206,6 +3324,7 @@ impl MultiTokenManager {
     /// map 仍会因每次选号 record 而增长，故无条件清理。
     pub fn cleanup_scheduling(&self) {
         self.rpm.cleanup();
+        self.health.cleanup();
     }
 
     /// 强制刷新指定凭据的 Token（Admin API）
@@ -3298,8 +3417,9 @@ impl MultiTokenManager {
         }
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        let cfg = self.config.load_full();
         let new_creds =
-            refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
+            refresh_token(&credentials, &cfg, effective_proxy.as_ref()).await?;
 
         // 更新 entries 中对应凭据
         {
@@ -3327,7 +3447,7 @@ impl MultiTokenManager {
     fn persist_load_balancing_mode(&self, mode: &str) -> anyhow::Result<()> {
         use anyhow::Context;
 
-        let config_path = match self.config.config_path() {
+        let config_path = match self.config.load().config_path() {
             Some(path) => path.to_path_buf(),
             None => {
                 tracing::warn!("配置文件路径未知，负载均衡模式仅在当前进程生效: {}", mode);
@@ -3939,6 +4059,80 @@ mod tests {
             })
             .collect();
         MultiTokenManager::new(config, creds, None, None, false).unwrap()
+    }
+
+    // ===== TIER2 配置热重载：后台任务 abort+respawn 回归 =====
+
+    /// 造一个可控 proactive_token_refresh 的单号 manager（带有效 token）。
+    fn make_manager_with_proactive(proactive: bool) -> Arc<MultiTokenManager> {
+        let mut config = Config::default();
+        config.proactive_token_refresh = proactive;
+        config.token_refresh_interval_secs = 5;
+        let mut c = KiroCredentials::default();
+        c.priority = 0;
+        c.access_token = Some("tok-0".to_string());
+        c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        Arc::new(MultiTokenManager::new(config, vec![c], None, None, false).unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_respawn_refresh_task_disabled_stores_no_handle() {
+        // proactive=false：respawn 后任务槽应为空（不起后台任务）
+        let mgr = make_manager_with_proactive(false);
+        mgr.respawn_refresh_task();
+        assert!(
+            mgr.refresh_task.lock().is_none(),
+            "proactive_token_refresh=false 时不应存在任务句柄"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_respawn_refresh_task_enabled_stores_handle() {
+        // proactive=true：respawn 后任务槽应持有一个运行中的句柄
+        let mgr = make_manager_with_proactive(true);
+        mgr.respawn_refresh_task();
+        let slot = mgr.refresh_task.lock();
+        let handle = slot.as_ref().expect("proactive=true 应存在任务句柄");
+        assert!(!handle.is_finished(), "新起的预刷新任务应在运行中");
+    }
+
+    #[tokio::test]
+    async fn test_respawn_refresh_task_idempotent_aborts_old() {
+        // 幂等：重复 respawn 应 abort 旧任务、只保留一个新句柄（不泄漏累积）
+        let mgr = make_manager_with_proactive(true);
+        mgr.respawn_refresh_task();
+        // 取出旧句柄的克隆引用用于观测（AbortHandle 不便克隆，改为记录 abort 后 is_finished）
+        let old_finished_before = {
+            let slot = mgr.refresh_task.lock();
+            slot.as_ref().unwrap().is_finished()
+        };
+        assert!(!old_finished_before, "第一次 respawn 的任务应在运行");
+
+        // 第二次 respawn：内部会 abort 旧任务并换新句柄
+        mgr.respawn_refresh_task();
+        // 让被 abort 的旧任务有机会真正结束
+        tokio::task::yield_now().await;
+        let slot = mgr.refresh_task.lock();
+        let handle = slot.as_ref().expect("重挂后应仍有一个任务句柄");
+        assert!(!handle.is_finished(), "重挂后的新任务应在运行中");
+    }
+
+    #[tokio::test]
+    async fn test_respawn_refresh_task_toggle_off_aborts() {
+        // 开→关：先起任务，再把 proactive 改 false 并 respawn，句柄应清空
+        let mgr = make_manager_with_proactive(true);
+        mgr.respawn_refresh_task();
+        assert!(mgr.refresh_task.lock().is_some(), "开启后应有句柄");
+
+        // 原子换成关闭态的 config（模拟 reload_config 后再 respawn）
+        let mut off = (*mgr.config()).clone();
+        off.proactive_token_refresh = false;
+        mgr.config.store(Arc::new(off));
+        mgr.respawn_refresh_task();
+        assert!(
+            mgr.refresh_task.lock().is_none(),
+            "关闭 proactive 后 respawn 应清空任务句柄"
+        );
     }
 
     #[tokio::test]

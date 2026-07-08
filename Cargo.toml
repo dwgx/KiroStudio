@@ -13,6 +13,7 @@ strip = true
 
 [dependencies]
 axum = "0.8"
+arc-swap = "1"  # 配置热重载：Config 存 ArcSwap,改配置原子热切、读端无锁近零成本
 tokio = { version = "1.0", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "socks", "rustls-tls-webpki-roots", "rustls-tls-native-roots", "http2", "system-proxy", "charset"] }
 serde = { version = "1.0", features = ["derive"] }

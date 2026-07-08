@@ -13,7 +13,6 @@ use axum::{
 
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
-use crate::model::config::CompressionConfig;
 
 use super::cache_tracker::CacheTracker;
 use super::types::ErrorResponse;
@@ -26,45 +25,30 @@ pub struct AppState {
     /// Kiro Provider（可选，用于实际 API 调用）
     /// 内部使用 MultiTokenManager，已支持线程安全的多凭据管理
     pub kiro_provider: Option<Arc<KiroProvider>>,
-    /// 是否开启非流式响应的 thinking 块提取
-    pub extract_thinking: bool,
-    /// prompt 缓存记账是否启用
-    pub prompt_cache_enabled: bool,
     /// prompt 缓存影子跟踪器（按凭据分桶）
     pub cache_tracker: Arc<CacheTracker>,
-    /// 输入压缩配置（转换后发上游前，超阈值时压缩请求体）
-    pub compression: Arc<CompressionConfig>,
 }
 
-impl AppState {
-    /// 创建新的应用状态
-    pub fn new(api_key: impl Into<String>, extract_thinking: bool) -> Self {
-        Self::with_prompt_cache(api_key, extract_thinking, true, 3600)
-    }
+// 注：`extract_thinking` / `prompt_cache_enabled` / `compression` 三项已迁出 AppState
+// （TIER3 配置热重载）：它们现由 handlers.rs 的进程级原子/ArcSwap 镜像承载，admin 改配置调
+// setter 即时生效、无需重启。AppState 只保留真正随请求走且无需热更的共享句柄。
 
-    /// 创建带 prompt 缓存配置的应用状态
-    pub fn with_prompt_cache(
+impl AppState {
+    /// 创建应用状态。
+    ///
+    /// `prompt_cache_ttl_seconds` 固化进 `CacheTracker`（缓存表容忍的最长 TTL，运行时改它需
+    /// 重建 tracker 丢缓存，属诚实边界保留重启）。其余热更开关由 handlers 镜像承载，不进 AppState。
+    pub fn with_cache_ttl(
         api_key: impl Into<String>,
-        extract_thinking: bool,
-        prompt_cache_enabled: bool,
         prompt_cache_ttl_seconds: u64,
     ) -> Self {
         Self {
             api_key: api_key.into(),
             kiro_provider: None,
-            extract_thinking,
-            prompt_cache_enabled,
             cache_tracker: Arc::new(CacheTracker::new(Duration::from_secs(
                 prompt_cache_ttl_seconds,
             ))),
-            compression: Arc::new(CompressionConfig::default()),
         }
-    }
-
-    /// 设置输入压缩配置
-    pub fn with_compression(mut self, compression: CompressionConfig) -> Self {
-        self.compression = Arc::new(compression);
-        self
     }
 
     /// 设置 KiroProvider

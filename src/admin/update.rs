@@ -350,8 +350,12 @@ pub async fn perform_update(target: Option<String>) -> anyhow::Result<UpdatePerf
         perm.set_mode(0o755);
         tokio::fs::set_permissions(&new, perm).await?;
     }
-    // 备份现役 exe（供启动自检失败回滚），再用 .new 原子覆盖
-    let _ = tokio::fs::copy(&exe, &bak).await; // 备份失败不阻断，仅告警
+    // 备份现役 exe（供启动自检失败时 systemd ExecStartPre 回滚兜底）。
+    // ⚠️ 备份失败必须 abort：若无 .bak 就 rename 替换，回滚网彻底失效（崩了没得回滚）。
+    // fail-safe 优于 fail-open——宁可本次不升级，也不留一个无回滚点的替换。
+    tokio::fs::copy(&exe, &bak).await.map_err(|e| {
+        anyhow::anyhow!("备份现役二进制到 {bak:?} 失败，已中止升级（不留无回滚点的替换）: {e}")
+    })?;
     tokio::fs::rename(&new, &exe).await?;
     tracing::warn!("[Update] 二进制已替换为 {tag}（备份在 {bak:?}），待重启生效");
 

@@ -4,6 +4,7 @@ pub mod affinity;
 pub mod auth;
 pub mod cooldown;
 pub mod endpoint;
+pub mod health;
 pub mod machine_id;
 pub mod model;
 pub mod overage;

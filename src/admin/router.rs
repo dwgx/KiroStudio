@@ -17,7 +17,7 @@ use super::{
         set_load_balancing_mode, social_callback, start_social_login, storage_cleanup,
         storage_stats, update_config, start_idc_login, poll_idc_login,
         start_external_idp_login, external_idp_leg1, external_idp_leg2,
-        check_update, perform_update,
+        check_update, perform_update, update_status,
     },
     middleware::{AdminState, admin_auth_middleware},
     usage_handlers::{
@@ -112,6 +112,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
         // OTA 自更新：GitHub 版本检查 + 一键升级（下载→sha256→替换→重启）
         .route("/update/check", get(check_update))
         .route("/update/perform", post(perform_update))
+        // OTA 观测：读 .health/.bak/*.failed 标记，显示升级是否稳定确认 / 是否发生过回滚
+        .route("/update/status", get(update_status))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,
