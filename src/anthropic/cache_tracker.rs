@@ -17,6 +17,7 @@
 //! Anthropic「前缀完全一致才可复用」的语义。
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -80,6 +81,48 @@ pub struct CacheTracker {
     max_supported_ttl: Duration,
 }
 
+/// 影子缓存记账的进程级累计统计（供 admin 展示"缓存确实生效"的命中率）。
+///
+/// 生产进程只有一个 CacheTracker，但 admin 侧（AdminState）拿不到它的 Arc，
+/// 故把累计计数放进程级 static，`record_stats` 写、`cache_stats_snapshot` 读。
+static CACHE_STAT_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static CACHE_STAT_HITS: AtomicU64 = AtomicU64::new(0);
+static CACHE_STAT_READ_TOKENS: AtomicU64 = AtomicU64::new(0);
+static CACHE_STAT_CREATION_TOKENS: AtomicU64 = AtomicU64::new(0);
+
+/// 影子缓存记账的累计统计快照（返回给 Admin API / 前端可视化）。
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheStatsSnapshot {
+    /// 参与缓存记账的请求总数
+    pub requests: u64,
+    /// 至少命中一次缓存读（cache_read>0）的请求数
+    pub hits: u64,
+    /// 累计 cache_read_input_tokens
+    pub cache_read_tokens: u64,
+    /// 累计 cache_creation_input_tokens
+    pub cache_creation_tokens: u64,
+    /// 命中率（hits / requests，0~1）；requests 为 0 时为 0
+    pub hit_rate: f64,
+}
+
+/// 读取进程级累计缓存统计快照（只读，零上游）。供 admin 端点调用。
+pub fn cache_stats_snapshot() -> CacheStatsSnapshot {
+    let requests = CACHE_STAT_REQUESTS.load(Ordering::Relaxed);
+    let hits = CACHE_STAT_HITS.load(Ordering::Relaxed);
+    CacheStatsSnapshot {
+        requests,
+        hits,
+        cache_read_tokens: CACHE_STAT_READ_TOKENS.load(Ordering::Relaxed),
+        cache_creation_tokens: CACHE_STAT_CREATION_TOKENS.load(Ordering::Relaxed),
+        hit_rate: if requests > 0 {
+            hits as f64 / requests as f64
+        } else {
+            0.0
+        },
+    }
+}
+
 impl CacheTracker {
     pub fn new(max_supported_ttl: Duration) -> Self {
         Self {
@@ -87,6 +130,20 @@ impl CacheTracker {
                 by_credential: HashMap::new(),
             }),
             max_supported_ttl,
+        }
+    }
+
+    /// 累计一次请求的缓存记账结果到进程级统计（在 compute 后调用，供命中率可视化）。
+    pub fn record_stats_public(&self, result: &CacheResult) {
+        CACHE_STAT_REQUESTS.fetch_add(1, Ordering::Relaxed);
+        if result.cache_read_input_tokens > 0 {
+            CACHE_STAT_HITS.fetch_add(1, Ordering::Relaxed);
+            CACHE_STAT_READ_TOKENS
+                .fetch_add(result.cache_read_input_tokens as u64, Ordering::Relaxed);
+        }
+        if result.cache_creation_input_tokens > 0 {
+            CACHE_STAT_CREATION_TOKENS
+                .fetch_add(result.cache_creation_input_tokens as u64, Ordering::Relaxed);
         }
     }
 
@@ -821,5 +878,39 @@ mod tests {
         let result = tracker.compute(1, &profile2);
 
         assert!(result.cache_read_input_tokens > 0);
+    }
+
+    /// record_stats_public 累加逻辑：命中(read>0)计一次 hit + 累加 read/creation tokens；
+    /// 未命中只累加 creation。命中率 = hits/requests。
+    /// 注：统计是进程级 static，跨用例累加，故只断言"增量"关系不断言绝对值。
+    #[test]
+    fn test_cache_stats_accounting() {
+        let tracker = CacheTracker::new(Duration::from_secs(3600));
+        let before = cache_stats_snapshot();
+
+        // 一次命中
+        tracker.record_stats_public(&CacheResult {
+            cache_read_input_tokens: 100,
+            cache_creation_input_tokens: 20,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        });
+        // 一次未命中（只创建）
+        tracker.record_stats_public(&CacheResult {
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 50,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        });
+
+        let after = cache_stats_snapshot();
+        assert_eq!(after.requests - before.requests, 2, "两次请求");
+        assert_eq!(after.hits - before.hits, 1, "仅一次命中");
+        assert_eq!(after.cache_read_tokens - before.cache_read_tokens, 100);
+        assert_eq!(
+            after.cache_creation_tokens - before.cache_creation_tokens,
+            70
+        );
+        assert!((0.0..=1.0).contains(&after.hit_rate));
     }
 }

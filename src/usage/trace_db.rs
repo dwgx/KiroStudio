@@ -62,6 +62,9 @@ impl TraceDb {
             "ALTER TABLE traces ADD COLUMN client_ip TEXT",
             "ALTER TABLE traces ADD COLUMN client_os TEXT",
             "ALTER TABLE traces ADD COLUMN client_browser TEXT",
+            // 缓存读写 tokens（历史库补列，默认 0，兼容旧数据）
+            "ALTER TABLE traces ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE traces ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0",
         ];
         for sql in add_columns {
             if let Err(e) = conn.execute(sql, []) {
@@ -97,7 +100,9 @@ impl TraceDb {
                 client_device  TEXT,
                 client_ip      TEXT,
                 client_os      TEXT,
-                client_browser TEXT
+                client_browser TEXT,
+                cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
+                cache_creation_tokens INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_traces_ts_ms ON traces(ts_ms);
             CREATE INDEX IF NOT EXISTS idx_traces_credential_id ON traces(credential_id);
@@ -118,8 +123,8 @@ impl TraceDb {
                 request_id, ts_ms, credential_id, model, is_streaming,
                 input_tokens, output_tokens, credits_used, latency_ms, first_token_ms,
                 outcome, retries, error_message, session_id, client_device,
-                client_ip, client_os, client_browser
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                client_ip, client_os, client_browser, cache_read_tokens, cache_creation_tokens
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 record.request_id,
                 record.ts_ms,
@@ -139,6 +144,8 @@ impl TraceDb {
                 record.client_ip,
                 record.client_os,
                 record.client_browser,
+                record.cache_read_tokens,
+                record.cache_creation_tokens,
             ],
         )
         .context("INSERT traces 失败")?;
@@ -152,7 +159,7 @@ impl TraceDb {
             "SELECT request_id, ts_ms, credential_id, model, is_streaming,
                     input_tokens, output_tokens, credits_used, latency_ms, first_token_ms,
                     outcome, retries, error_message, session_id, client_device,
-                    client_ip, client_os, client_browser
+                    client_ip, client_os, client_browser, cache_read_tokens, cache_creation_tokens
              FROM traces
              ORDER BY ts_ms DESC
              LIMIT ?1",
@@ -231,6 +238,8 @@ fn row_to_record(row: &Row<'_>) -> rusqlite::Result<RequestRecord> {
         client_ip: row.get(15)?,
         client_os: row.get(16)?,
         client_browser: row.get(17)?,
+        cache_read_tokens: row.get(18)?,
+        cache_creation_tokens: row.get(19)?,
     })
 }
 

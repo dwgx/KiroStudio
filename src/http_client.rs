@@ -36,6 +36,64 @@ impl ProxyConfig {
     }
 }
 
+/// 从原始代理输入中拆出 URL 与内嵌的账号密码。
+///
+/// 用户上号/编辑代理时常把账密直接写进 URL（如
+/// `socks5://user:pass@38.244.34.185:1080`），但下游 reqwest 的 SOCKS5 代理不会可靠地
+/// 从 URL 里提取 userinfo 做认证；必须拆成独立的 username/password 交给 `Proxy::basic_auth`。
+/// 本函数把内嵌 `user:pass@` 从 host 前剥离、做百分号解码，返回 **不含账密的干净 URL** 与
+/// 拆出的账密，供各上号/设置路径统一规整（凭据、OAuth 登录、全局代理都走它）。
+///
+/// 兼容的格式（“各种格式可识别”）：
+/// - `scheme://user:pass@host:port`（内嵌账密，dwgx 的场景）
+/// - `scheme://user@host:port`（仅用户名）
+/// - `scheme://host:port`（无账密）
+/// - 无 scheme 的 `user:pass@host:port` / `host:port`（原样保留 host 段，仅剥账密）
+/// - `direct`（原样返回，语义=显式不走代理）与空串（原样）
+/// - host（IPv6 用 `[::1]:1080` 形式）不含 `@`，故按最后一个 `@` 分隔 userinfo 不会误伤。
+///
+/// 返回 `(clean_url, username, password)`。若无内嵌账密则后两者为 `None`，`clean_url` 与
+/// 去空白后的输入一致。
+pub fn split_proxy_credentials(raw: &str) -> (String, Option<String>, Option<String>) {
+    let trimmed = raw.trim();
+    // direct / 空：原样返回（direct 语义由上层判定，空视为清除）。
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("direct") {
+        return (trimmed.to_string(), None, None);
+    }
+
+    // 拆 scheme://rest；无 scheme 时 scheme_prefix 为空，rest 为整串。
+    let (scheme_prefix, rest) = match trimmed.split_once("://") {
+        Some((scheme, rest)) => (format!("{scheme}://"), rest),
+        None => (String::new(), trimmed),
+    };
+
+    // host 段不含 '@'，故 userinfo 与 host 的分隔符是**最后一个** '@'
+    // （即便密码里含 '@' 也能正确切分）。
+    let (userinfo, hostport) = match rest.rsplit_once('@') {
+        Some((ui, hp)) => (Some(ui), hp),
+        None => (None, rest),
+    };
+
+    let clean_url = format!("{scheme_prefix}{hostport}");
+
+    let (username, password) = match userinfo {
+        None => (None, None),
+        Some(ui) => {
+            // userinfo = user[:pass]；两段都做百分号解码（内嵌账密可能被 URL 编码）。
+            let (u, p) = match ui.split_once(':') {
+                Some((u, p)) => (u, Some(p)),
+                None => (ui, None),
+            };
+            let dec = |s: &str| urlencoding::decode(s).map(|c| c.into_owned()).unwrap_or_else(|_| s.to_string());
+            let user = if u.is_empty() { None } else { Some(dec(u)) };
+            let pass = p.and_then(|p| if p.is_empty() { None } else { Some(dec(p)) });
+            (user, pass)
+        }
+    };
+
+    (clean_url, username, password)
+}
+
 /// 构建 HTTP Client
 ///
 /// # Arguments
@@ -100,6 +158,51 @@ mod tests {
         assert_eq!(config.url, "socks5://127.0.0.1:1080");
         assert_eq!(config.username, Some("user".to_string()));
         assert_eq!(config.password, Some("pass".to_string()));
+    }
+
+    #[test]
+    fn test_split_proxy_inline_credentials() {
+        // dwgx 的真实输入：账密内嵌在 socks5 URL 里。
+        let (url, user, pass) =
+            split_proxy_credentials("socks5://dwgxsocks:Dwgxnbnb0705@38.244.34.185:1080");
+        assert_eq!(url, "socks5://38.244.34.185:1080");
+        assert_eq!(user, Some("dwgxsocks".to_string()));
+        assert_eq!(pass, Some("Dwgxnbnb0705".to_string()));
+    }
+
+    #[test]
+    fn test_split_proxy_various_formats() {
+        // 仅用户名
+        let (u, user, pass) = split_proxy_credentials("http://onlyuser@host:3128");
+        assert_eq!(u, "http://host:3128");
+        assert_eq!(user, Some("onlyuser".to_string()));
+        assert_eq!(pass, None);
+
+        // 无账密
+        let (u, user, pass) = split_proxy_credentials("socks5://1.2.3.4:1080");
+        assert_eq!(u, "socks5://1.2.3.4:1080");
+        assert!(user.is_none() && pass.is_none());
+
+        // 无 scheme + 内嵌账密
+        let (u, user, pass) = split_proxy_credentials("user:pass@1.2.3.4:1080");
+        assert_eq!(u, "1.2.3.4:1080");
+        assert_eq!(user, Some("user".to_string()));
+        assert_eq!(pass, Some("pass".to_string()));
+
+        // 密码含 @（按最后一个 @ 分隔，不误伤）
+        let (u, user, pass) = split_proxy_credentials("socks5://user:p@ss@host:1080");
+        assert_eq!(u, "socks5://host:1080");
+        assert_eq!(user, Some("user".to_string()));
+        assert_eq!(pass, Some("p@ss".to_string()));
+
+        // 百分号编码的账密解码
+        let (_u, user, pass) = split_proxy_credentials("http://us%40er:p%3Ass@host:3128");
+        assert_eq!(user, Some("us@er".to_string()));
+        assert_eq!(pass, Some("p:ss".to_string()));
+
+        // direct / 空 原样
+        assert_eq!(split_proxy_credentials("direct").0, "direct");
+        assert_eq!(split_proxy_credentials("  ").0, "");
     }
 
     #[test]

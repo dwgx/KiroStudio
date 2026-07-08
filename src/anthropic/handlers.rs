@@ -53,6 +53,23 @@ fn extract_client_ip(headers: &axum::http::HeaderMap) -> Option<String> {
     None
 }
 
+/// 指纹采集开关的运行时镜像（`config.collect_client_fingerprint`）。
+///
+/// 热路径 [`ClientInfo::from_headers_with_peer`] 拿不到 config，故用一个进程级
+/// AtomicBool 镜像：main 启动时按配置写入，admin 改开关时立即改写，无需重启。
+/// 默认 true（与配置默认一致）。
+static COLLECT_CLIENT_FINGERPRINT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// 设置指纹采集开关（供 main 启动接线 / admin 更新配置时立即生效调用）。
+pub fn set_collect_client_fingerprint(enabled: bool) {
+    COLLECT_CLIENT_FINGERPRINT.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn collect_client_fingerprint() -> bool {
+    COLLECT_CLIENT_FINGERPRINT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// 请求来源的客户端画像（设备类型 + IP + 细分 OS + 浏览器），
 /// 一并沿用量埋点路径传递，避免多参数散落。
 #[derive(Clone, Default)]
@@ -69,10 +86,16 @@ impl ClientInfo {
     /// IP 取值优先级：`x-forwarded-for` / `x-real-ip`（反代场景）→ TCP 连接对端
     /// 地址（直连 8990 无反代头时的回退）。peer 取自 axum 的 `ConnectInfo<SocketAddr>`，
     /// 仅取 IP 部分（丢弃端口），拿不到则为 None。
+    ///
+    /// 隐私开关：`collect_client_fingerprint` 关闭时直接返回全空画像，
+    /// 热路径不解析任何指纹字段，用量记录不落这些信息。
     fn from_headers_with_peer(
         headers: &axum::http::HeaderMap,
         peer: Option<std::net::SocketAddr>,
     ) -> Self {
+        if !collect_client_fingerprint() {
+            return Self::default();
+        }
         let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
         let ip = extract_client_ip(headers).or_else(|| peer.map(|a| a.ip().to_string()));
         Self {
@@ -116,6 +139,7 @@ impl CacheAccounting {
     /// 上游返回后：按真实 credential_id 推算缓存记账并写回缓存表
     fn resolve(&self, credential_id: u64) -> CacheUsageBreakdown {
         let result = self.tracker.compute(credential_id, &self.profile);
+        self.tracker.record_stats_public(&result);
         self.tracker.update(credential_id, &self.profile);
         CacheUsageBreakdown {
             cache_creation_input_tokens: result.cache_creation_input_tokens,
@@ -164,6 +188,28 @@ fn build_kiro_request_body(
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
+
+    // 全池冷却快速失败：token_manager 全池都在冷却时会带 retry_after_secs=N 快速 bail。
+    // 这里透传成标准 429 + Retry-After 头，让客户端(Claude Code)按其自身退避策略重试——
+    // 比网关内硬扛温和，也减少对被风控号的试探。
+    if let Some(secs) = err_str
+        .split("retry_after_secs=")
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|d| d.parse::<u64>().ok())
+    {
+        let retry_after = secs.clamp(1, 300);
+        tracing::warn!(retry_after_secs = retry_after, "全池冷却，返回 429 + Retry-After 让客户端退避");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, retry_after.to_string())],
+            Json(ErrorResponse::new(
+                "rate_limit_error",
+                "All credentials are temporarily cooling down. Please retry after the indicated delay.",
+            )),
+        )
+            .into_response();
+    }
 
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
     if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
@@ -540,6 +586,8 @@ fn emit_stream_usage(
     record.is_streaming = meta.is_streaming;
     record.input_tokens = usage.input_tokens;
     record.output_tokens = usage.output_tokens;
+    record.cache_read_tokens = usage.cache_read_tokens;
+    record.cache_creation_tokens = usage.cache_creation_tokens;
     record.credits_used = usage.credits_used;
     record.latency_ms = meta.latency_ms;
     record.retries = meta.retries;
@@ -617,9 +665,14 @@ fn create_sse_stream(
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
-                            // 发送最终事件并结束
-                            let final_events = ctx.generate_final_events();
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
+                            // 上游流中途失败：先发一个 SSE error 事件显式告知客户端"本次未正常完成"，
+                            // 再补最终事件收尾。否则 Claude Code 会把截断输出当作正常 message_stop=成功，不重试。
+                            let mut events = vec![SseEvent::error_event(
+                                "api_error",
+                                format!("上游响应流中断: {}", e),
+                            )];
+                            events.extend(ctx.generate_final_events());
+                            let bytes: Vec<Result<Bytes, Infallible>> = events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
@@ -857,6 +910,9 @@ async fn handle_non_stream_request(
         record.is_streaming = meta.is_streaming;
         record.input_tokens = final_input_tokens;
         record.output_tokens = output_tokens;
+        record.cache_read_tokens = cache_usage.map(|c| c.cache_read_input_tokens).unwrap_or(0);
+        record.cache_creation_tokens =
+            cache_usage.map(|c| c.cache_creation_input_tokens).unwrap_or(0);
         record.credits_used = credits_used;
         record.latency_ms = meta.latency_ms;
         record.retries = meta.retries;
@@ -1210,8 +1266,13 @@ fn create_buffered_sse_stream(
                             }
                             Some(Err(e)) => {
                                 tracing::error!("读取响应流失败: {}", e);
-                                // 发生错误，完成处理并返回所有事件
-                                let all_events = ctx.finish_and_get_all_events();
+                                // 上游流中途失败：先发 SSE error 事件显式告知"本次未正常完成"，
+                                // 再补齐已缓冲事件收尾。否则 Claude Code 把截断输出当成功、不重试。
+                                let mut all_events = vec![SseEvent::error_event(
+                                    "api_error",
+                                    format!("上游响应流中断: {}", e),
+                                )];
+                                all_events.extend(ctx.finish_and_get_all_events());
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -1254,6 +1315,8 @@ fn emit_buffered_usage(
     record.is_streaming = meta.is_streaming;
     record.input_tokens = usage.input_tokens;
     record.output_tokens = usage.output_tokens;
+    record.cache_read_tokens = usage.cache_read_tokens;
+    record.cache_creation_tokens = usage.cache_creation_tokens;
     record.credits_used = usage.credits_used;
     record.latency_ms = meta.latency_ms;
     record.retries = meta.retries;
