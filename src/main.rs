@@ -170,15 +170,9 @@ async fn main() {
 
     // 主动 token 预刷新（批次4.4）：后台提前刷将过期的 token，把刷新移出请求热路径。
     // 仅对可刷新凭据生效；未启用则退回请求时按需刷新。
-    if config.proactive_token_refresh {
-        kiro::refresh_loop::spawn(
-            token_manager.clone(),
-            config.token_refresh_lead_minutes,
-            config.token_refresh_interval_secs,
-        );
-    } else {
-        tracing::info!("主动 token 预刷新未启用（proactive_token_refresh=false）");
-    }
+    // TIER2 热重载：spawn 交由 token_manager 的受管任务槽（respawn_refresh_task），
+    // 启动即受管，admin 改 proactive/lead/interval 后 abort+respawn 即时生效不重启。
+    token_manager.respawn_refresh_task();
 
     // 会话亲和性定时清理：affinity map 的 key 是客户端可控的 session id，
     // 仅靠 get() 惰性删除无法回收「不再出现的 session」，长跑会内存泄漏。
@@ -280,33 +274,12 @@ async fn main() {
             }
 
             // A6：温和的周期性余额刷新（严格受控）。
-            // 为避免触发上游风控：绝不在启动/挂载时批量拉——这里只 spawn 一个后台任务，
-            // 首轮也要等满一个完整间隔才开始，且逐个刷新、每个之间留间隔（分散节奏），
-            // 只刷未禁用的号，仅更新缓存供展示，绝不做主动禁用。
-            // 0 = 禁用（安全默认之一）。本批作为需重启字段。
-            let balance_interval = config.balance_refresh_interval_secs;
-            if balance_interval > 0 {
-                let balance_service = admin_state.service.clone();
-                tokio::spawn(async move {
-                    let mut ticker = tokio::time::interval(
-                        std::time::Duration::from_secs(balance_interval),
-                    );
-                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                    // 跳过第一次立即触发的 tick，避免启动即批量拉（降低上游限流风险）
-                    ticker.tick().await;
-                    loop {
-                        ticker.tick().await;
-                        // 每个号之间 sleep 4 秒，分散节奏
-                        balance_service.refresh_all_balances_gently(4).await;
-                    }
-                });
-                tracing::info!(
-                    "后台温和余额刷新已启用：间隔 {} 秒（逐个刷新，每个间隔 4 秒，不做主动禁用）",
-                    balance_interval
-                );
-            } else {
-                tracing::info!("后台温和余额刷新未启用（balance_refresh_interval_secs=0）");
-            }
+            // 为避免触发上游风控：绝不在启动/挂载时批量拉——后台任务首轮也要等满一个
+            // 完整间隔才开始，且逐个刷新、每个之间留间隔（分散节奏），只刷未禁用的号，
+            // 仅更新缓存供展示，绝不做主动禁用。0 = 禁用（安全默认之一）。
+            // TIER2 热重载：spawn 交由 AdminService 的受管任务槽（respawn_balance_task），
+            // 启动即受管，admin 改 balanceRefreshIntervalSecs 后 abort+respawn 即时生效不重启。
+            admin_state.service.respawn_balance_task();
 
             let admin_app = admin::create_admin_router(admin_state);
 
@@ -381,6 +354,11 @@ async fn main() {
     };
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    // OTA 回滚兜底（阶段A）：bind 成功即越过 config/凭据/端口三道启动门 → 清零启动计数器
+    // （向 systemd ExecStartPre 守卫脚本表明「非 crashloop」），并 spawn 稳定 30s 后写 .health
+    // + 删 .bak 回滚点的确认任务。详见 common::health_marker + deploy/rollback-guard.sh。
+    common::health_marker::clear_boot_attempts();
+    common::health_marker::spawn_health_confirm(env!("CARGO_PKG_VERSION").to_string());
     // into_make_service_with_connect_info 让中间件可通过 ConnectInfo 拿到对端 IP
     // with_graceful_shutdown：收到 SIGTERM/Ctrl-C 后停止接新连接，等在途请求（含 SSE 流）drain
     axum::serve(

@@ -1553,7 +1553,7 @@ export function SettingsPage() {
           <Field label="Node 版本" hint="需重启生效">
             <Input className={inputCls} value={form.nodeVersion} onChange={(e) => set('nodeVersion', e.target.value)} />
           </Field>
-          <Field label="提取 thinking" hint="非流式响应解析 thinking 块（需重启生效）">
+          <Field label="提取 thinking" hint="非流式响应解析 thinking 块（保存即时生效，无需重启）">
             <Switch checked={form.extractThinking} onCheckedChange={(v) => set('extractThinking', v)} />
           </Field>
         </CardContent>
@@ -1567,19 +1567,19 @@ export function SettingsPage() {
           <CardTitle className="text-base"><Highlight text="防关联 / 限流" /></CardTitle>
         </CardHeader>
         <CardContent className="py-0">
-          <Field label="冷却机制" hint="失败后短暂跳过该凭据（需重启生效）">
+          <Field label="冷却机制" hint="失败后短暂跳过该凭据（保存即时生效，无需重启）">
             <Switch checked={form.cooldownEnabled} onCheckedChange={(v) => set('cooldownEnabled', v)} />
           </Field>
-          <Field label="速率限制" hint="拟人节奏：每日上限 + 请求间隔（需重启生效）">
+          <Field label="速率限制" hint="拟人节奏：每日上限 + 请求间隔（保存即时生效，无需重启）">
             <Switch checked={form.rateLimitEnabled} onCheckedChange={(v) => set('rateLimitEnabled', v)} />
           </Field>
-          <Field label="每日上限" hint="0 表示无限制（需重启生效）">
+          <Field label="每日上限" hint="0 表示无限制（保存即时生效，无需重启）">
             <NumberStepper value={Number(form.rateLimitDailyMax) || 0} onChange={(v) => set('rateLimitDailyMax', String(v))} min={0} step={10} className="w-28" disabled={!form.rateLimitEnabled} aria-label="每日上限" />
           </Field>
-          <Field label="最小请求间隔 (ms)" hint="需重启生效">
+          <Field label="最小请求间隔 (ms)" hint="保存即时生效，无需重启">
             <NumberStepper value={Number(form.rateLimitMinIntervalMs) || 0} onChange={(v) => set('rateLimitMinIntervalMs', String(v))} min={0} step={100} className="w-28" disabled={!form.rateLimitEnabled} aria-label="最小请求间隔" />
           </Field>
-          <Field label="会话亲和性" hint="同一会话尽量复用同一凭据（需重启生效）">
+          <Field label="会话亲和性" hint="同一会话尽量复用同一凭据（保存即时生效，无需重启）">
             <Switch checked={form.affinityEnabled} onCheckedChange={(v) => set('affinityEnabled', v)} />
           </Field>
         </CardContent>
@@ -1668,20 +1668,20 @@ export function SettingsPage() {
       </Card>
       </SectionGate>
 
-      {/* 调度分区：主动 token 预刷新（需重启） */}
+      {/* 调度分区：主动 token 预刷新（TIER2 热重载：保存即时生效，无需重启） */}
       <SectionGate section="scheduling" title="主动 token 预刷新" keywords={['启用预刷新', '提前量', '扫描间隔', 'token 刷新']}>
       <Card>
         <CardHeader className="pb-2">
           <CardTitle className="text-base"><Highlight text="主动 token 预刷新" /></CardTitle>
         </CardHeader>
         <CardContent className="py-0">
-          <Field label="启用预刷新" hint="后台提前刷新将过期的 token，把刷新移出请求热路径、削掉突发（需重启生效）">
+          <Field label="启用预刷新" hint="后台提前刷新将过期的 token，把刷新移出请求热路径、削掉突发（保存即时生效，无需重启）">
             <Switch checked={form.proactiveTokenRefresh} onCheckedChange={(v) => set('proactiveTokenRefresh', v)} />
           </Field>
-          <Field label="提前量 (分钟)" hint="token 剩余有效期低于此值即后台刷新（需重启生效）">
+          <Field label="提前量 (分钟)" hint="token 剩余有效期低于此值即后台刷新（保存即时生效，无需重启）">
             <NumberStepper value={Number(form.tokenRefreshLeadMinutes) || 0} onChange={(v) => set('tokenRefreshLeadMinutes', String(v))} min={0} className="w-28" disabled={!form.proactiveTokenRefresh} aria-label="提前量分钟" />
           </Field>
-          <Field label="扫描间隔 (秒)" hint="后台扫描周期，最小 5 秒（需重启生效）">
+          <Field label="扫描间隔 (秒)" hint="后台扫描周期，最小 5 秒（保存即时生效，无需重启）">
             <NumberStepper value={Number(form.tokenRefreshIntervalSecs) || 0} onChange={(v) => set('tokenRefreshIntervalSecs', String(v))} min={5} step={5} className="w-28" disabled={!form.proactiveTokenRefresh} aria-label="扫描间隔秒" />
           </Field>
         </CardContent>
