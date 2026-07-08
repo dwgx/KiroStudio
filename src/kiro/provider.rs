@@ -22,6 +22,10 @@ use parking_lot::Mutex;
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
+/// 小号池阈值：号池 <= 此值时，每号重试次数降为 1（见 [`compute_max_retries`]）。
+/// 小池下重试只会反复砸同几个号，被限流时多打几次纯属加重冷却，不如各摸一次即透传。
+const SMALL_POOL_THRESHOLD: usize = 3;
+
 /// 总重试次数绝对硬上限（避免无限重试）
 ///
 /// 注意：这只是一个安全上限，不再作为固定的重试预算。真正的预算由
@@ -29,16 +33,36 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 /// 凭据至少能被摸到一次（历史上写死 9 会让凭据 >3 时后面的号一次没试就报错）。
 const ABSOLUTE_MAX_TOTAL_RETRIES: usize = 64;
 
+/// 单个入站请求的重试墙钟预算（秒）。
+///
+/// ⚠️ 关键防雪崩闸门：小号池下，一个卡住的请求会在每次重试时抢到刚出冷却的号、
+/// 又打 429、又把它冷却，如此在 acquire_context 的等待循环（最长 180s）× 多次
+/// 重试之间反复横跳，一个请求就能把整池长时间压死（表现为「没有新入站却一直 429
+/// / 繁忙」）。这里给单请求一个总时长上限：超时就停止重试、把最后的错误（通常是
+/// 429）透传给客户端，让客户端自己退避，而不是继续拖垮整池。取值需覆盖一次正常
+/// 大请求的排队+响应，又不至于长到能扫冷全池。
+const MAX_REQUEST_RETRY_BUDGET_SECS: u64 = 45;
+
 /// 计算本次调用允许的总重试次数（动态预算）
 ///
 /// - `total`：凭据总数
 /// - `available`：当前未禁用（可用）凭据数
 ///
-/// 预算 = `(total * MAX_RETRIES_PER_CREDENTIAL)`，但以 `available` 做下限，
+/// 预算 = `(total * per_cred)`，但以 `available` 做下限，
 /// 数学上保证每个可用凭据至少被尝试一次；上限为 `ABSOLUTE_MAX_TOTAL_RETRIES`，
 /// 但当可用凭据数超过该上限时仍以 `available` 为准，绝不因硬上限漏掉可用号。
+///
+/// **小号池降重试**：号池很小（`total <= SMALL_POOL_THRESHOLD`）时，每号重试次数降为 1。
+/// 因为小池下重试循环只会反复选到同几个号——被限流时多打几次纯属反复砸、加重冷却，
+/// 不如让每个号各摸一次就把上游错误透传给客户端（客户端自身有退避重试，比网关内反复砸温和）。
+/// 号多时行为完全不变（仍 `MAX_RETRIES_PER_CREDENTIAL`）。
 fn compute_max_retries(total: usize, available: usize) -> usize {
-    (total * MAX_RETRIES_PER_CREDENTIAL)
+    let per_cred = if total <= SMALL_POOL_THRESHOLD {
+        1
+    } else {
+        MAX_RETRIES_PER_CREDENTIAL
+    };
+    (total * per_cred)
         .max(available)
         .min(ABSOLUTE_MAX_TOTAL_RETRIES.max(available))
 }
@@ -341,6 +365,12 @@ impl KiroProvider {
             compute_max_retries(total_credentials, self.token_manager.available_count());
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        // 本次请求重试链内「已因 429 冷却过」的凭据集合。防止同一个请求的一条重试链
+        // 反复砸同一个号、把同一次限流事件当成多次独立事件累加 trigger_count / 指数延长冷却
+        // （根因：小号池下重试循环反复选到同两个号，单请求就把 trigger_count 刷到 7、冷却 15→72s，
+        //  自造雪崩）。首次 429 才设冷却，同链再 429 只换号 failover，不重复惩罚。
+        // 跨请求（新请求 = 新集合）仍正常累加，保留「持续被限流的号冷却渐长」的合理行为。
+        let mut rate_limited_this_call: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         // 一次解析同时取出模型信息与会话标识（conversationId），避免热路径上对
@@ -353,6 +383,21 @@ impl KiroProvider {
         let mut last_outcome = crate::usage::RequestOutcome::OtherError;
 
         for attempt in 0..max_retries {
+            // 墙钟闸门：单请求重试总时长超预算就停止（把最后错误透传给客户端，
+            // 让它自己退避）。防止一个卡住的请求在小号池里反复扫冷全池、把偶发 429
+            // 拖成持续雪崩。首次尝试(attempt==0)不受此限，保证至少打一次。
+            if attempt > 0
+                && call_started.elapsed() >= std::time::Duration::from_secs(MAX_REQUEST_RETRY_BUDGET_SECS)
+            {
+                tracing::warn!(
+                    "单请求重试已达墙钟预算 {}s（尝试 {}/{}），停止重试并透传上游错误，避免拖垮整池",
+                    MAX_REQUEST_RETRY_BUDGET_SECS,
+                    attempt,
+                    max_retries
+                );
+                break;
+            }
+
             // 获取调用上下文（绑定 index、credentials、token）
             let ctx = match self
                 .token_manager
@@ -361,6 +406,12 @@ impl KiroProvider {
             {
                 Ok(c) => c,
                 Err(e) => {
+                    // 全池冷却快速失败(带 retry_after_secs / "冷却")归类为 RateLimited,
+                    // 用量明细显示"限流"而非扎眼的"其它错误"(dwgx:那些其它错误 0/0 很恶心)。
+                    let es = e.to_string();
+                    if es.contains("retry_after_secs=") || es.contains("冷却") {
+                        last_outcome = crate::usage::RequestOutcome::RateLimited;
+                    }
                     last_error = Some(e);
                     continue;
                 }
@@ -474,13 +525,19 @@ impl KiroProvider {
                     body
                 );
                 last_outcome = crate::usage::RequestOutcome::RateLimited;
-                // 优先用上游给出的精确重置时间，否则回退到 RateLimitExceeded 的分级短冷却
-                let retry_after =
-                    retry_after_header.or_else(|| endpoint.extract_retry_after_secs(&body));
-                self.token_manager
-                    .report_rate_limited_with_retry_after(ctx.id, retry_after);
+                // 账户级可疑活动风控：走分钟级退避（report_suspicious_activity），而非普通
+                // 429 的 15s 瞬时冷却。本请求链内该号首次触发才设冷却；再次触发只 failover，
+                // 不重复惩罚（同 rate_limited_this_call 去重，避免一条链把号砸进更深风控）。
+                if rate_limited_this_call.insert(ctx.id) {
+                    self.token_manager.report_suspicious_activity(ctx.id);
+                } else {
+                    tracing::debug!(
+                        "凭据 #{} 本请求链内已因风控冷却过，再次触发仅 failover，不重复惩罚",
+                        ctx.id
+                    );
+                }
                 last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败（临时风控限速）: {} {}",
+                    "{} API 请求失败（账户级可疑活动风控，分钟级退避）: {} {}",
                     api_type,
                     status,
                     body
@@ -627,8 +684,17 @@ impl KiroProvider {
                     // 优先用上游给出的精确重置时间：响应头 Retry-After 优先，其次错误 body
                     let retry_after = retry_after_header
                         .or_else(|| endpoint.extract_retry_after_secs(&body));
-                    self.token_manager
-                        .report_rate_limited_with_retry_after(ctx.id, retry_after);
+                    // 本请求链内该号首次 429 才设冷却；再次 429 只换号 failover，不重复累加
+                    // trigger_count / 延长冷却（见 rate_limited_this_call 定义处的根因说明）。
+                    if rate_limited_this_call.insert(ctx.id) {
+                        self.token_manager
+                            .report_rate_limited_with_retry_after(ctx.id, retry_after);
+                    } else {
+                        tracing::debug!(
+                            "凭据 #{} 本请求链内已冷却过，再次 429 仅换号 failover，不重复惩罚",
+                            ctx.id
+                        );
+                    }
                 } else {
                     last_outcome = crate::usage::RequestOutcome::ServerError;
                 }
@@ -765,12 +831,18 @@ mod tests {
 
     #[test]
     fn test_compute_max_retries_small_pool() {
-        // total=3：不小于 3（也就是 3*3=9）
-        assert!(compute_max_retries(3, 3) >= 3);
-        assert_eq!(compute_max_retries(3, 3), 3 * MAX_RETRIES_PER_CREDENTIAL);
-
+        // 小号池降重试：total<=SMALL_POOL_THRESHOLD 时每号只重试 1 次，
+        // 每个号各摸一次即透传上游错误，避免在小池上反复砸同几个号加重冷却。
+        assert_eq!(compute_max_retries(3, 3), 3, "3 号池应每号只摸 1 次 = 3");
+        assert_eq!(compute_max_retries(2, 2), 2, "2 号池应每号只摸 1 次 = 2");
         // 只有 1 个凭据仍至少能试 1 次
-        assert!(compute_max_retries(1, 1) >= 1);
+        assert_eq!(compute_max_retries(1, 1), 1);
+
+        // 刚过小池阈值（total=4）恢复常规 total*MAX_RETRIES_PER_CREDENTIAL。
+        assert_eq!(compute_max_retries(4, 4), 4 * MAX_RETRIES_PER_CREDENTIAL);
+
+        // 小池但部分禁用：available 做下限，仍保证可用号被摸到。
+        assert!(compute_max_retries(3, 2) >= 2);
     }
 
     #[test]
