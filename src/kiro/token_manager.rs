@@ -244,7 +244,7 @@ async fn refresh_social_token(
 /// - scheme 必须是 https；
 /// - host 必须是 `login.microsoftonline.com` / `.us` / `.cn`（或其子域）；
 /// - 拒绝 userinfo(`@`) 混淆、IP 字面量。
-fn validate_microsoft_token_endpoint(endpoint: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_microsoft_token_endpoint(endpoint: &str) -> anyhow::Result<()> {
     let rest = endpoint
         .strip_prefix("https://")
         .ok_or_else(|| anyhow::anyhow!("External IdP token_endpoint 必须为 https"))?;
@@ -584,6 +584,9 @@ enum DisabledReason {
     QuotaExceeded,
     /// 账户被上游暂停/封禁（不可自动恢复，等待人工处理）
     AccountSuspended,
+    /// 持续可疑活动风控——反复被 Kiro 限流(trigger_count 高)后自动禁用,避免继续砸加重风控/触发真封禁。
+    /// 属"自动禁用",可由自愈逻辑或人工重新启用。
+    SuspiciousActivityAuto,
     /// Refresh Token 永久失效（服务端返回 invalid_grant）
     InvalidRefreshToken,
     /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
@@ -627,6 +630,8 @@ pub struct CredentialEntrySnapshot {
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// 用户自定义别名/备注（卡片展示优先于 email/#id）
+    pub name: Option<String>,
     /// 订阅等级标题（如 "Kiro Pro"），随凭据持久化，重启后仍可展示
     pub subscription_title: Option<String>,
     /// API 调用成功次数
@@ -738,13 +743,20 @@ pub struct MultiTokenManager {
     rpm: RpmTracker,
     /// 每凭据 RPM 软上限（0 = 不限制）
     rpm_limit: u32,
+    /// 全池冷却时是否快速失败（立即返回 429+Retry-After 让客户端退避，而非网关内硬扛）。
+    all_cooling_fast_fail: bool,
+    /// 是否在凭据持续可疑活动风控(trigger_count 达阈值)时自动禁用它。
+    auto_disable_suspicious: bool,
 }
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
-/// 所有号只是临时冷却/限流（会自动恢复）时，最多在网关内等待多久再重选，
-/// 避免瞬时全忙就立刻返回“所有凭据均已禁用”。inflight 繁忙不计入等待。
-const MAX_TRANSIENT_WAIT_SECS: u64 = 180;
+/// 所有号只是临时冷却/限流（会自动恢复）时，单次选号最多在网关内等待多久再放弃。
+/// 避免瞬时全忙就立刻返回“所有凭据均已禁用”；但也不能太长——否则一个请求的一次
+/// 选号就阻塞数分钟，叠加上层重试会反复扫冷全池（雪崩）。取 20s：够扛过一次
+/// burst 软限流的自愈，又不至于让单请求长期霸占等待。上层 provider 另有 45s
+/// 墙钟总预算兜底。
+const MAX_TRANSIENT_WAIT_SECS: u64 = 20;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 
@@ -991,6 +1003,8 @@ impl MultiTokenManager {
         let rate_limit_enabled = config.rate_limit_enabled;
         let affinity_enabled = config.affinity_enabled;
         let rpm_limit = config.credential_rpm_limit;
+        let all_cooling_fast_fail = config.all_cooling_fast_fail;
+        let auto_disable_suspicious = config.auto_disable_suspicious;
         let rate_limit_config = RateLimitConfig {
             daily_max_requests: config.rate_limit_daily_max,
             min_interval_ms: config.rate_limit_min_interval_ms,
@@ -1016,6 +1030,8 @@ impl MultiTokenManager {
             affinity_enabled,
             rpm: RpmTracker::new(),
             rpm_limit,
+            all_cooling_fast_fail,
+            auto_disable_suspicious,
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -1063,6 +1079,15 @@ impl MultiTokenManager {
         self.entries.lock().iter().filter(|e| !e.disabled).count()
     }
 
+    /// 获取当前所有处于冷却中的凭据快照（供 admin 面板展示 429/限流感官）。
+    /// 冷却未启用时返回空。
+    pub fn cooldown_snapshot(&self) -> Vec<crate::kiro::cooldown::CooldownInfo> {
+        if !self.cooldown_enabled {
+            return Vec::new();
+        }
+        self.cooldown.get_all_cooldowns()
+    }
+
     /// 根据负载均衡模式选择下一个凭据，并原子性地占用一个在途名额
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
@@ -1091,28 +1116,13 @@ impl MultiTokenManager {
             .map(|m| m.to_lowercase().contains("opus"))
             .unwrap_or(false);
 
-        // 过滤可用凭据
+        // 过滤可用凭据：可选性判定统一收敛到 is_entry_selectable
+        // （disabled / opus 订阅 / 冷却 / 限流）。历史上此处曾在其后再挂一个
+        // 逐字段重复的 filter（inflight 改动残留），锁临界区内重复判定 + config 克隆
+        // 翻倍；已合并为单次 filter。
         let available: Vec<&CredentialEntry> = entries
             .iter()
             .filter(|e| self.is_entry_selectable(e, is_opus))
-            .filter(|e| {
-                if e.disabled {
-                    return false;
-                }
-                // 如果是 opus 模型，需要检查订阅等级
-                if is_opus && !e.credentials.supports_opus() {
-                    return false;
-                }
-                // 冷却中的凭据跳过（反应式：仅在出错后短暂跳过）
-                if self.cooldown_enabled && !self.cooldown.is_available(e.id) {
-                    return false;
-                }
-                // 速率受限的凭据跳过（拟人节流：每日上限/请求间隔/退避）
-                if self.rate_limit_enabled && self.rate_limiter.check_rate_limit(e.id).is_err() {
-                    return false;
-                }
-                true
-            })
             .collect();
 
         if available.is_empty() {
@@ -1144,15 +1154,23 @@ impl MultiTokenManager {
 
         let selected = match mode {
             "balanced" => {
-                // 按 (rpm 饱和, 在途数, 成功数, 优先级) 升序：
-                // 先避开 RPM 已饱和的号（软降权，非硬跳过），再挑在飞请求最少的，
-                // 再按终身成功数（Least-Used）与优先级平局兜底。
+                // 按 (rpm 饱和, 在途数, 近 60s RPM, 终身成功数, 优先级) 升序：
+                // ① 先避开 RPM 已饱和的号（软降权，非硬跳过）；
+                // ② 再挑在飞请求最少的（分摊并发）；
+                // ③ ⭐再挑**近 60s 实际负载（RPM）最少**的——真正的"分流"关键：
+                //    让流量均匀铺到所有号，每号 RPM 降到 ~1/N，直接降低账户级可疑活动的触发频率（防封）。
+                // ④ 终身成功数（Least-Used）与优先级仅作平局兜底。
+                //
+                // 为何不是终身 success_count 主导：那会让新号（终身计数低）被持续灌到追平老号为止，
+                // 把负载**集中**在少数号上（老号闲置、新号被打爆）——既让部分号"不动"，又抬高单号 RPM
+                // 触发风控，与防封目标背道而驰。改用滚动窗口 RPM 主导即真正的即时均衡。
                 available
                     .iter()
                     .min_by_key(|e| {
                         (
                             self.is_rpm_saturated(e.id),
                             e.inflight.load(Ordering::Acquire),
+                            self.rpm.count(e.id),
                             e.success_count,
                             e.credentials.priority,
                         )
@@ -1353,12 +1371,33 @@ impl MultiTokenManager {
                         (new_id, new_creds, guard)
                     } else {
                         if let Some(wait) = self.transient_wait_duration(model) {
+                            // 全池快速失败(吸收 fork 做法):当最短恢复时间较长(>2s,典型是冷却/风控)时,
+                            // 不在网关内硬扛,立即带 retry_after_secs 透传,让客户端(Claude Code)自己退避重试。
+                            // 客户端退避比网关反复选号温和,也减少对被风控号的零星试探。
+                            // 只有"马上(≤2s)就能恢复"的瞬时繁忙才短等一下,避免把秒级抖动也甩给客户端。
+                            const FAST_FAIL_THRESHOLD: StdDuration = StdDuration::from_secs(2);
+                            if self.all_cooling_fast_fail && wait > FAST_FAIL_THRESHOLD {
+                                let retry_after = wait.as_secs().max(1);
+                                let entries = self.entries.lock();
+                                let available = entries.iter().filter(|e| !e.disabled).count();
+                                drop(entries);
+                                tracing::warn!(
+                                    "所有可用凭据均在冷却，最短恢复 {}s，快速返回 429+Retry-After 让客户端退避（不在网关内硬扛）",
+                                    retry_after
+                                );
+                                anyhow::bail!(
+                                    "所有凭据均在冷却（{}/{}）retry_after_secs={}",
+                                    available,
+                                    total,
+                                    retry_after
+                                );
+                            }
                             if wait_started.elapsed() < StdDuration::from_secs(MAX_TRANSIENT_WAIT_SECS) {
                                 let wait = wait
                                     .max(StdDuration::from_millis(250))
-                                    .min(StdDuration::from_secs(5));
+                                    .min(StdDuration::from_secs(2));
                                 tracing::warn!(
-                                    "所有可用凭据暂时繁忙或冷却中，等待 {:?} 后重试，避免直接返回所有凭据禁用",
+                                    "所有可用凭据暂时繁忙，短等 {:?} 后重试",
                                     wait
                                 );
                                 sleep(wait).await;
@@ -1866,13 +1905,22 @@ impl MultiTokenManager {
     /// 有则据此设定精确冷却，避免盲目指数退避浪费；无则回退到分级递增冷却。
     pub fn report_rate_limited_with_retry_after(&self, id: u64, retry_after_secs: Option<u64>) {
         if self.cooldown_enabled {
+            // 有 Retry-After：按上游指定时长冷却，但钳制上限，避免上游给超大 resets_at
+            // （如「本月配额，几天后重置」）把号冻几天——那类应走配额耗尽禁用，不该塞进短冷却。
+            const MAX_RETRY_AFTER_COOLDOWN_SECS: u64 = 600;
             let dur = match retry_after_secs {
                 Some(secs) if secs > 0 => self.cooldown.set_cooldown_with_duration(
                     id,
                     CooldownReason::RateLimitExceeded,
-                    Some(std::time::Duration::from_secs(secs)),
+                    Some(std::time::Duration::from_secs(
+                        secs.min(MAX_RETRY_AFTER_COOLDOWN_SECS),
+                    )),
                 ),
-                _ => self.cooldown.set_cooldown(id, CooldownReason::RateLimitExceeded),
+                // 裸 429（无 Retry-After，通常是瞬时 burst）：固定基线冷却，不指数升级。
+                // 用分级递增会把几秒自愈的 burst 拖成几十秒长冷却、进而压垮小号池（自造雪崩）。
+                _ => self
+                    .cooldown
+                    .set_transient_cooldown(id, CooldownReason::RateLimitExceeded),
             };
             tracing::warn!(
                 "凭据 #{} 触发限流，冷却 {:?}{}",
@@ -1887,6 +1935,50 @@ impl MultiTokenManager {
         }
         if self.rate_limit_enabled {
             self.rate_limiter.record_failure(id, Some("rate limited"));
+        }
+    }
+
+    /// 报告凭据触发**账户级可疑活动风控**（`suspicious activity`+`temporary limits`）。
+    ///
+    /// 与普通 429 的关键区别：走 [`CooldownReason::SuspiciousActivity`] 的**分钟级冷却**
+    /// （基线 3min，递增至上限 30min），而非普通限速的 15s 瞬时冷却。
+    /// 原因：可疑活动是账户级风控、持续数分钟且 Kiro 正在"调查"——15s 后重新入池会被
+    /// 立刻再限，反复砸只会加重可疑度、把账户推向真封禁。此处让该号**真正退避**，
+    /// 冷却期内不参与选号，等调查窗口过去自愈。不禁用、不计永久失败、不改发往上游字节。
+    pub fn report_suspicious_activity(&self, id: u64) {
+        if self.cooldown_enabled {
+            let dur = self
+                .cooldown
+                .set_cooldown(id, CooldownReason::SuspiciousActivity);
+            tracing::warn!(
+                "凭据 #{} 触发账户级可疑活动风控，冷却 {:?}（分钟级退避，避免反复砸加重风控/触发封禁）",
+                id,
+                dur
+            );
+
+            // 自动禁用(dwgx:账户不行了就自动禁用)：连续可疑活动触发达阈值,说明该号已被 Kiro 盯死、
+            // 冷却也顶格(30min)仍反复被限——继续放它参与调度只会不停砸、加重风控甚至触发真封禁。
+            // 达阈值即自动禁用并标注 SuspiciousActivityAuto(可人工/自愈重新启用),把它移出轮转。
+            const AUTO_DISABLE_TRIGGER: u32 = 10;
+            if self.auto_disable_suspicious && self.cooldown.trigger_count(id) >= AUTO_DISABLE_TRIGGER {
+                let mut entries = self.entries.lock();
+                if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                    if !entry.disabled {
+                        entry.disabled = true;
+                        entry.disabled_reason = Some(DisabledReason::SuspiciousActivityAuto);
+                        tracing::warn!(
+                            "凭据 #{} 连续可疑活动风控达 {} 次，自动禁用（SuspiciousActivityAuto），移出调度避免继续加重风控",
+                            id,
+                            AUTO_DISABLE_TRIGGER
+                        );
+                        drop(entries);
+                        let _ = self.persist_credentials();
+                    }
+                }
+            }
+        }
+        if self.rate_limit_enabled {
+            self.rate_limiter.record_failure(id, Some("suspicious activity"));
         }
     }
 
@@ -2194,6 +2286,7 @@ impl MultiTokenManager {
                         None
                     },
                     email: e.credentials.email.clone(),
+                    name: e.credentials.name.clone(),
                     subscription_title: e.credentials.subscription_title.clone(),
                     success_count: e.success_count,
                     last_used_at: e.last_used_at.clone(),
@@ -2206,6 +2299,7 @@ impl MultiTokenManager {
                         DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
                         DisabledReason::QuotaExceeded => "QuotaExceeded",
                         DisabledReason::AccountSuspended => "AccountSuspended",
+                        DisabledReason::SuspiciousActivityAuto => "SuspiciousActivityAuto",
                         DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
                         DisabledReason::InvalidConfig => "InvalidConfig",
                     }.to_string()),
@@ -2265,6 +2359,87 @@ impl MultiTokenManager {
         // 持久化更改
         self.persist_credentials()?;
         Ok(())
+    }
+
+    /// 设置凭据自定义别名/备注（Admin API）。传空字符串清除别名。
+    pub fn set_credential_name(&self, id: u64, name: Option<String>) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            // 去空白;空则清除
+            entry.credentials.name = name
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 设置单个凭据的代理（Admin API）。proxy_url 传空/None 清除(回退全局代理);
+    /// "direct" 表示该号强制不走代理。username/password 为 None 时不改动、Some("")清除。
+    ///
+    /// 代理**立即生效、无需重启**：provider 每次 acquire 都按 `effective_proxy` 现取现建 client
+    /// （见 provider.rs），改到 entry 上即下次请求生效。
+    pub fn set_credential_proxy(
+        &self,
+        id: u64,
+        proxy_url: Option<String>,
+        proxy_username: Option<String>,
+        proxy_password: Option<String>,
+    ) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            // URL 里可能内嵌账密（socks5://user:pass@host:port）——落库前拆出，
+            // 存干净 URL + 独立账密字段：①避免密码明文留在 proxy_url（Debug 不脱敏会泄漏）
+            // ②reqwest SOCKS5 需要独立账密才能认证。URL 内嵌账密仅在显式账密参数缺省时采用。
+            let (clean_url, inline_user, inline_pass) = match proxy_url
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                Some(raw) => {
+                    let (u, iu, ip) = crate::http_client::split_proxy_credentials(&raw);
+                    (Some(u), iu, ip)
+                }
+                None => (None, None, None),
+            };
+            entry.credentials.proxy_url = clean_url;
+            // 账密:显式参数 None=不改;Some(空)=清除;Some(非空)=更新;
+            // 显式参数缺省(None)时,若 URL 内嵌了账密则采用内嵌值。
+            match proxy_username {
+                Some(u) => entry.credentials.proxy_username = Some(u).filter(|s| !s.is_empty()),
+                None if inline_user.is_some() => entry.credentials.proxy_username = inline_user,
+                None => {}
+            }
+            match proxy_password {
+                Some(p) => entry.credentials.proxy_password = Some(p).filter(|s| !s.is_empty()),
+                None if inline_pass.is_some() => entry.credentials.proxy_password = inline_pass,
+                None => {}
+            }
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 批量清空回收站中的指定凭据（无 ids 时清空全部）。返回成功清除数。
+    pub fn purge_trash_batch(&self, ids: Option<Vec<u64>>) -> usize {
+        let target_ids: Vec<u64> = match ids {
+            Some(list) if !list.is_empty() => list,
+            _ => self.list_trash().into_iter().map(|t| t.id).collect(),
+        };
+        let mut purged = 0;
+        for id in target_ids {
+            if self.purge_credential(id).is_ok() {
+                purged += 1;
+            }
+        }
+        purged
     }
 
     /// 重置凭据失败计数并重新启用（Admin API）
@@ -3822,6 +3997,36 @@ mod tests {
             "释放后应优先选回在途最少（=0）的号 #{}，实际 #{}",
             second_id, next.id
         );
+    }
+
+    #[tokio::test]
+    async fn test_balanced_spreads_by_recent_rpm_not_lifetime_success() {
+        // ⭐分流回归：balanced 应按**近 60s RPM**（即时负载）均衡分摊，而非终身 success_count。
+        // 线上真实症状：#53/#54 终身 6000+、#56/#58/#59 终身几百，若按终身计数选号会持续
+        // 只灌新号（把负载集中在 1-2 个号，老号闲置=部分号"不动"，且单号 RPM 高触发风控）。
+        // 正确行为：串行放号应轮流命中不同的号（每次都选近窗 RPM 最少者），负载均匀铺开。
+        let manager = make_balanced_manager(3);
+
+        // 模拟 #1 已被大量使用（终身成功数很高），但当前窗口无负载。
+        // 用 rpm.record 制造近窗负载差异，验证选号看的是"当下 RPM"而非"终身总量"。
+        // 先给 #1 记 3 次近窗命中（当前最忙），#2 记 1 次，#3 记 0 次。
+        manager.rpm.record(1);
+        manager.rpm.record(1);
+        manager.rpm.record(1);
+        manager.rpm.record(2);
+
+        // 立即放号（不保留在途，避免 inflight 干扰）：应选近窗 RPM 最少的 #3。
+        let c = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(
+            c.id, 3,
+            "应选近 60s RPM 最少的 #3（0 次），而非按终身或优先级，实际 #{}",
+            c.id
+        );
+        drop(c); // 释放在途；此次放号已给 #3 记了 1 次 RPM（commit_selection），#3 现为 1 次
+
+        // 现在窗口负载：#1=3、#2=1、#3=1。再放一次应命中 #2 或 #3（并列最少=1），绝不选最忙的 #1。
+        let c2 = manager.acquire_context(None, None).await.unwrap();
+        assert_ne!(c2.id, 1, "最忙的 #1（近窗 3 次）不应被选中，实际 #{}", c2.id);
     }
 
     #[tokio::test]
