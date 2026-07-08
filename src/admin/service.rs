@@ -7,6 +7,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use tokio::task::JoinHandle;
 
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
@@ -159,6 +160,9 @@ pub struct AdminService {
     idc_login: IdcLoginManager,
     /// 外部 IdP（Microsoft）上号会话管理器
     external_idp_login: ExternalIdpLoginManager,
+    /// 后台温和余额刷新任务句柄（TIER2 热重载：改 balanceRefreshIntervalSecs 后 abort+respawn
+    /// 即时生效不重启）。None = 当前未运行（间隔=0 或尚未启动）。
+    balance_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl AdminService {
@@ -180,6 +184,7 @@ impl AdminService {
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
+            balance_task: Mutex::new(None),
         }
     }
 
@@ -663,6 +668,53 @@ impl AdminService {
         tracing::info!("后台温和余额刷新完成");
     }
 
+    /// 重挂后台温和余额刷新任务（TIER2 热重载）。
+    ///
+    /// 读当前 config 的 `balance_refresh_interval_secs`，abort 旧任务后按需 spawn 新任务：
+    /// - 启动时调用一次（替代 main.rs 原内联 detached spawn，让任务"从启动即受管"）；
+    /// - admin 改 `balanceRefreshIntervalSecs` 后调用 → 间隔即时生效，无需重启；
+    /// - 间隔=0 表示禁用，仅 abort 不重建。
+    ///
+    /// 任务体持 `Weak<Self>`：AdminService 被 drop 后下一轮 upgrade 失败即自我退出，
+    /// 不构成 Arc 引用环（句柄存在 self 内，闭包只借弱引用）。
+    /// 幂等：重复调用先 abort 旧句柄再重建，不会累积多个循环。
+    /// 保留原有防风控节奏：首轮等满一个完整间隔才开始，逐个刷新每个间隔 4 秒。
+    pub fn respawn_balance_task(self: &Arc<Self>) {
+        let interval = self.token_manager.config().balance_refresh_interval_secs;
+        let mut slot = self.balance_task.lock();
+        // 先杀旧任务（若有），无论间隔如何都先停，避免旧间隔残留
+        if let Some(old) = slot.take() {
+            old.abort();
+        }
+        if interval == 0 {
+            tracing::info!("后台温和余额刷新未启用（balance_refresh_interval_secs=0）");
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let handle = tokio::spawn(async move {
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(interval));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // 跳过第一次立即触发的 tick，避免启动/重挂即批量拉（降低上游限流风险）
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                // service 已被 drop（进程停机路径）→ 退出循环
+                let Some(svc) = weak.upgrade() else {
+                    tracing::debug!("AdminService 已释放，余额刷新任务退出");
+                    break;
+                };
+                // 每个号之间 sleep 4 秒，分散节奏
+                svc.refresh_all_balances_gently(4).await;
+            }
+        });
+        *slot = Some(handle);
+        tracing::info!(
+            "后台温和余额刷新已启用：间隔 {} 秒（逐个刷新，每个间隔 4 秒，不做主动禁用）",
+            interval
+        );
+    }
+
     /// 添加新凭据
     pub async fn add_credential(
         &self,
@@ -910,10 +962,12 @@ impl AdminService {
 
     /// 更新服务端配置并持久化到 config.json
     ///
-    /// 仅提交的字段被修改。`loadBalancingMode` 立即生效，其余字段需重启进程后生效，
-    /// 通过响应的 `restart_fields` 告知前端。敏感字段不在此开放。
+    /// 仅提交的字段被修改。TIER1（冷却/限流/亲和/RPM/负载均衡）改后 reload_config 即时生效；
+    /// TIER2（主动预刷新开关/提前量/间隔、余额刷新间隔）改后 abort+respawn 后台任务即时生效；
+    /// 其余固化项（host/port/proxy/tls 等）需重启，通过响应的 `restart_fields` 告知前端。
+    /// 敏感字段不在此开放。
     pub fn update_config(
-        &self,
+        self: &Arc<Self>,
         req: UpdateConfigRequest,
     ) -> Result<UpdateConfigResponse, AdminServiceError> {
         let config_path = self
@@ -932,6 +986,13 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(format!("加载配置失败: {}", e)))?;
 
         let mut restart_fields: Vec<String> = Vec::new();
+        // TIER1 运行时字段是否有变更 → save 后统一 reload_config 热应用（不重启即生效）。
+        let mut hot_changed = false;
+        // TIER2 后台任务字段是否有变更 → save+reload 后 respawn 对应任务（不重启即生效）。
+        let mut refresh_task_changed = false;
+        let mut balance_task_changed = false;
+        // TIER3 AppState 热更字段：extract_thinking 改后调 handlers setter 即时生效（不重启）。
+        let mut extract_thinking_changed: Option<bool> = None;
 
         // —— 需重启生效的字段 ——
         if let Some(v) = req.host {
@@ -1018,40 +1079,43 @@ impl AdminService {
                 restart_fields.push("defaultEndpoint".into());
             }
         }
+        // —— 提取 thinking 开关（TIER3 AppState 热更：改后调 handlers setter 即时生效不重启）——
         if let Some(v) = req.extract_thinking {
             if v != config.extract_thinking {
                 config.extract_thinking = v;
-                restart_fields.push("extractThinking".into());
+                extract_thinking_changed = Some(v);
             }
         }
+        // —— TIER1 运行时热更字段：改完 reload_config 即时生效,不进 restart_fields ——
+        // （冷却/限流开关/每日上限/间隔/亲和性;由下方统一 reload_config 一并热应用）
         if let Some(v) = req.cooldown_enabled {
             if v != config.cooldown_enabled {
                 config.cooldown_enabled = v;
-                restart_fields.push("cooldownEnabled".into());
+                hot_changed = true;
             }
         }
         if let Some(v) = req.rate_limit_enabled {
             if v != config.rate_limit_enabled {
                 config.rate_limit_enabled = v;
-                restart_fields.push("rateLimitEnabled".into());
+                hot_changed = true;
             }
         }
         if let Some(v) = req.rate_limit_daily_max {
             if v != config.rate_limit_daily_max {
                 config.rate_limit_daily_max = v;
-                restart_fields.push("rateLimitDailyMax".into());
+                hot_changed = true;
             }
         }
         if let Some(v) = req.rate_limit_min_interval_ms {
             if v != config.rate_limit_min_interval_ms {
                 config.rate_limit_min_interval_ms = v;
-                restart_fields.push("rateLimitMinIntervalMs".into());
+                hot_changed = true;
             }
         }
         if let Some(v) = req.affinity_enabled {
             if v != config.affinity_enabled {
                 config.affinity_enabled = v;
-                restart_fields.push("affinityEnabled".into());
+                hot_changed = true;
             }
         }
         if let Some(v) = req.proxy_url {
@@ -1139,31 +1203,31 @@ impl AdminService {
             }
         }
 
-        // —— 主动 token 预刷新（批次4.4，需重启生效）——
+        // —— 主动 token 预刷新（批次4.4，TIER2 后台任务热更：改后 respawn 即时生效不重启）——
         if let Some(v) = req.proactive_token_refresh {
             if v != config.proactive_token_refresh {
                 config.proactive_token_refresh = v;
-                restart_fields.push("proactiveTokenRefresh".into());
+                refresh_task_changed = true;
             }
         }
         if let Some(v) = req.token_refresh_lead_minutes {
             if v != config.token_refresh_lead_minutes {
                 config.token_refresh_lead_minutes = v;
-                restart_fields.push("tokenRefreshLeadMinutes".into());
+                refresh_task_changed = true;
             }
         }
         if let Some(v) = req.token_refresh_interval_secs {
             if v != config.token_refresh_interval_secs {
                 config.token_refresh_interval_secs = v;
-                restart_fields.push("tokenRefreshIntervalSecs".into());
+                refresh_task_changed = true;
             }
         }
 
-        // —— 余额同步（A6，需重启生效）——
+        // —— 余额同步（A6，TIER2 后台任务热更：改后 respawn 即时生效不重启）——
         if let Some(v) = req.balance_refresh_interval_secs {
             if v != config.balance_refresh_interval_secs {
                 config.balance_refresh_interval_secs = v;
-                restart_fields.push("balanceRefreshIntervalSecs".into());
+                balance_task_changed = true;
             }
         }
 
@@ -1187,8 +1251,7 @@ impl AdminService {
             }
         }
 
-        // —— 立即生效的字段：负载均衡模式 ——
-        let mut lb_changed = false;
+        // —— 立即生效的字段：负载均衡模式（并入 TIER1 统一 reload 热应用）——
         if let Some(mode) = req.load_balancing_mode {
             if mode != "priority" && mode != "balanced" {
                 return Err(AdminServiceError::InvalidCredential(
@@ -1196,7 +1259,7 @@ impl AdminService {
                 ));
             }
             config.load_balancing_mode = mode;
-            lb_changed = true;
+            hot_changed = true;
         }
 
         // 持久化（一次写盘）
@@ -1204,11 +1267,22 @@ impl AdminService {
             .save()
             .map_err(|e| AdminServiceError::InternalError(format!("保存配置失败: {}", e)))?;
 
-        // 负载均衡模式立即应用到运行时
-        if lb_changed {
-            self.token_manager
-                .set_load_balancing_mode(config.load_balancing_mode.clone())
-                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        // TIER1 运行时字段统一热重载（冷却/限流/亲和/RPM上限/快失败/自动禁用/负载均衡即时生效,
+        // 不重启）。reload_config 从盘重读并原子刷新所有运行时镜像。失败仅告警(已存盘,重启即生效)。
+        // TIER2 字段变更也需先 reload：respawn 任务读的是 token_manager.config()（ArcSwap），
+        // 若不 reload，新间隔/开关不会进 ArcSwap，respawn 会读到旧值。
+        if hot_changed || refresh_task_changed || balance_task_changed {
+            if let Err(e) = self.token_manager.reload_config() {
+                tracing::warn!("配置已存盘但热重载失败,下次重启生效: {}", e);
+            }
+        }
+
+        // TIER2 后台任务热重挂（读已 reload 的最新 config，abort 旧任务 + 按需 respawn）。
+        if refresh_task_changed {
+            self.token_manager.respawn_refresh_task();
+        }
+        if balance_task_changed {
+            self.respawn_balance_task();
         }
 
         // 登录页背景开关立即应用到运行时镜像（下一次 random-bg / 预取轮次即生效）
@@ -1221,7 +1295,17 @@ impl AdminService {
             crate::anthropic::set_collect_client_fingerprint(v);
         }
 
-        let immediate_changed = lb_changed || login_bg_changed.is_some() || fingerprint_changed.is_some();
+        // TIER3：thinking 提取开关立即应用到热路径进程级镜像（下一个非流式请求即生效）
+        if let Some(v) = extract_thinking_changed {
+            crate::anthropic::set_extract_thinking(v);
+        }
+
+        let immediate_changed = hot_changed
+            || refresh_task_changed
+            || balance_task_changed
+            || login_bg_changed.is_some()
+            || fingerprint_changed.is_some()
+            || extract_thinking_changed.is_some();
         let restart_required = !restart_fields.is_empty();
         let message = if restart_required {
             format!(
@@ -1229,15 +1313,18 @@ impl AdminService {
                 restart_fields.len()
             )
         } else if immediate_changed {
-            "已保存并立即生效。".to_string()
+            "已保存并立即生效（无需重启）。".to_string()
         } else {
             "无改动。".to_string()
         };
 
         tracing::info!(
-            "配置已更新（需重启字段: {:?}, 负载均衡变更: {}）",
+            "配置已更新（需重启字段: {:?}, TIER1热更: {}, TIER2重挂: 预刷新={} 余额={}, TIER3: thinking={:?}）",
             restart_fields,
-            lb_changed
+            hot_changed,
+            refresh_task_changed,
+            balance_task_changed,
+            extract_thinking_changed
         );
 
         Ok(UpdateConfigResponse {

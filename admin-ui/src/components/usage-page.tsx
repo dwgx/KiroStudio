@@ -8,7 +8,6 @@ import {
   Clock,
   TrendingUp,
   Coins,
-  Bot,
   TerminalSquare,
   Terminal,
   Monitor,
@@ -26,6 +25,7 @@ import {
   Server,
   type LucideIcon,
 } from 'lucide-react'
+import { ClaudeCodeIcon, OpenCodeIcon } from '@/components/overview/brand-icons'
 import { Card } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Select } from '@/components/ui/select'
@@ -69,7 +69,8 @@ function accentForRate(rate: number | null): StatAccent {
 
 // 单个设备的展示元数据。className 全部写成静态完整字符串，确保 Tailwind 打包时不被裁剪。
 interface DeviceMeta {
-  icon: LucideIcon
+  // 图标组件：lucide 通用图标或自定义品牌 SVG（brand-icons.tsx），二者接口兼容（接收 className）
+  icon: React.ComponentType<{ className?: string }>
   label: string
   // 徽标 tinted 底色（低饱和背景 + 同色文字 + 细边框）
   badge: string
@@ -80,12 +81,19 @@ interface DeviceMeta {
 // 规范取值 → 元数据。取值集合与后端 classify_device 契约一致。
 const DEVICE_META: Record<string, DeviceMeta> = {
   'claude-code': {
-    icon: Bot,
+    icon: ClaudeCodeIcon,
     label: 'Claude Code',
     // Anthropic 品牌橙：anthropic 官方 SDK 的 UA 后端归入 claude-code 类，故此项用品牌暖橙。
     // 用 8 位 hex（含 alpha）而非 /opacity 修饰符，避开非标准步进值被裁剪。
     badge: 'border-[#d9775740] bg-[#d9775720] text-[#e79c82]',
     bar: '#d97757',
+  },
+  opencode: {
+    icon: OpenCodeIcon,
+    label: 'OpenCode',
+    // OpenCode 品牌黑白极简：暗色中性徽标 + 浅灰文字。
+    badge: 'border-neutral-400/25 bg-neutral-400/10 text-neutral-200',
+    bar: '#a3a3a3',
   },
   curl: {
     icon: TerminalSquare,
@@ -669,7 +677,8 @@ function RequestDetailSpread({ record: r }: { record: RequestRecord }) {
   )
 }
 
-// 右键浮窗：跟随鼠标定位（fixed + clamp 防出界），展示整条请求详情。点外部/Esc 关闭。
+// 右键浮窗：锚定到文档位置（absolute + pageX/pageY），随页面滚动一起滚走，不固定跟随视口。
+// clamp 防右/下越界。展示整条请求详情。点外部/Esc 关闭。
 function RequestPopover({ record, x, y, onClose }: { record: RequestRecord; x: number; y: number; onClose: () => void }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
@@ -683,14 +692,17 @@ function RequestPopover({ record, x, y, onClose }: { record: RequestRecord; x: n
       clearTimeout(t)
     }
   }, [onClose])
-  // clamp:估算浮窗尺寸,右/下越界则向左/上翻。
+  // clamp:估算浮窗尺寸,右/下越界则向左/上翻。x/y 是文档坐标(pageX/pageY),
+  // 越界判断用视口宽高 + 当前滚动量换算,保证首次定位不出屏。
   const W = 300, H = 380
-  const left = Math.min(x + 14, window.innerWidth - W - 8)
-  const top = Math.min(y + 14, window.innerHeight - H - 8)
+  const maxLeft = window.scrollX + window.innerWidth - W - 8
+  const maxTop = window.scrollY + window.innerHeight - H - 8
+  const left = Math.max(window.scrollX + 8, Math.min(x + 14, maxLeft))
+  const top = Math.max(window.scrollY + 8, Math.min(y + 14, maxTop))
   return createPortal(
     <div
-      className="fixed z-50 rounded-lg border border-border bg-popover px-3 py-2.5 shadow-xl animate-rise-in"
-      style={{ left: Math.max(8, left), top: Math.max(8, top) }}
+      className="absolute z-50 rounded-lg border border-border bg-popover px-3 py-2.5 shadow-xl animate-rise-in"
+      style={{ left, top }}
       onPointerDown={(e) => e.stopPropagation()}
       onContextMenu={(e) => e.preventDefault()}
     >
@@ -740,7 +752,7 @@ function RecentTable({ rows }: { rows: RequestRecord[] }) {
                   key={r.request_id}
                   className={`cursor-pointer border-b border-border/40 transition-colors last:border-0 hover:bg-secondary/40 ${open ? 'bg-secondary/60' : ''}`}
                   onClick={() => toggleRow(r.request_id)}
-                  onContextMenu={(e) => { e.preventDefault(); setPopover({ record: r, x: e.clientX, y: e.clientY }) }}
+                  onContextMenu={(e) => { e.preventDefault(); setPopover({ record: r, x: e.pageX, y: e.pageY }) }}
                   title="左键展开详情 · 右键浮窗看全部"
                 >
                   <td className="whitespace-nowrap py-2 pr-3 tabular-nums text-muted-foreground">
@@ -1018,8 +1030,9 @@ export function UsagePage() {
   const timeseries = useUsageTimeseries(granularity)
   const byModel = useUsageByModel()
   const byCredential = useUsageByCredential()
-  // 拉够多条（200）以便按设备聚合出有代表性的分布
-  const recent = useUsageRecent(200)
+  // 最近请求条数（dwgx：可切换,不止 200）。"全部"取后端上限 5000。
+  const [recentLimit, setRecentLimit] = useState<number>(200)
+  const recent = useUsageRecent(recentLimit)
   // 机器维度聚合（按设备指纹分组，IP 变化不拆分）——后端 /usage/machines。
   const machines = useUsageMachines()
 
@@ -1211,11 +1224,29 @@ export function UsagePage() {
         {machines.isLoading ? <RankListSkeleton /> : <MachineBreakdown machines={machines.data ?? []} sessionFilter={sessionFilter} onPickSession={onPickSession} />}
       </Card>
 
-      {/* 4) 最近请求明细（搜索 + 按IP筛选 + 会话联动筛选 + 每IP总计 + 分页 + 左键展开/右键浮窗） */}
+      {/* 4) 最近请求明细（搜索 + 按IP筛选 + 会话联动筛选 + 每IP总计 + 分页 + 左键展开/右键浮窗 + 条数切换） */}
       <Card className="p-5" ref={recentPanelRef}>
-        <SectionTitle hint={recent.isLoading ? '加载中…' : `最近 ${recentRows.length} 条`}>
-          最近请求
-        </SectionTitle>
+        <div className="mb-4 flex items-center justify-between gap-3">
+          <h3 className="text-sm font-medium text-foreground">最近请求</h3>
+          <div className="flex shrink-0 items-center gap-2">
+            <span className="text-xs text-muted-foreground">
+              {recent.isLoading ? '加载中…' : `${recentRows.length} 条`}
+            </span>
+            {/* 条数切换：200/500/1000/全部(取后端上限 5000)。dwgx：不止最近 200 条 */}
+            <Select
+              value={String(recentLimit)}
+              onChange={(v) => setRecentLimit(Number(v))}
+              className="w-28"
+              aria-label="最近请求条数"
+              options={[
+                { value: '200', label: '最近 200' },
+                { value: '500', label: '最近 500' },
+                { value: '1000', label: '最近 1000' },
+                { value: '5000', label: '全部' },
+              ]}
+            />
+          </div>
+        </div>
         {recent.isLoading ? (
           <RecentTableSkeleton />
         ) : (

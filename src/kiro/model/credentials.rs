@@ -411,6 +411,40 @@ impl KiroCredentials {
             .unwrap_or(false)
     }
 
+    /// 账户族键（family_key）—— 限流/健康的分组单位（见 docs/DESIGN-M365-FAMILY-RATELIMIT-0708.md）。
+    ///
+    /// M365 external_idp 号的上游限速是**租户/账户族级连坐**：同一 M365 租户的多个号，
+    /// 一个被 suspicious 429 = 整族被限。故这些号共享一个族键（冷却/健康按族统一处置，
+    /// 不再逐个号砸），族键取 issuer_url 里的 tenant GUID；解析不到则回退 profileArn 的
+    /// AWS 账户号（日志实证同租户号 AWS account-id 同构，可互为兜底）。
+    ///
+    /// IdC(AWS SSO)/social(Google)/api_key **没有 M365 租户身份、限速模型不同（坚强、独立）**，
+    /// 各自 `cred:{id}` 独立成族——M365 的族连坐永不波及它们（键无 `m365:`/`aws:` 前缀），
+    /// 雪崩时作坚强兜底号。`id` 传入调用方（entry）的不可变 id。
+    pub fn family_key(&self, id: u64) -> String {
+        if self.is_external_idp_credential() {
+            // ① issuer_url: https://login.microsoftonline.com/{tenant}/v2.0 → m365:{tenant}
+            if let Some(issuer) = self.issuer_url.as_deref() {
+                if let Some(rest) = issuer.split("login.microsoftonline.com/").nth(1) {
+                    let tenant = rest.split('/').next().unwrap_or("").trim();
+                    if !tenant.is_empty() {
+                        return format!("m365:{tenant}");
+                    }
+                }
+            }
+            // ② 兜底: profileArn arn:aws:codewhisperer:region:{account}:profile/xxx → aws:{account}
+            if let Some(arn) = self.profile_arn.as_deref() {
+                let parts: Vec<&str> = arn.split(':').collect();
+                // arn:aws:codewhisperer:{region}:{account}:profile/{id} → 索引 4 = account
+                if parts.len() >= 5 && !parts[4].is_empty() {
+                    return format!("aws:{}", parts[4]);
+                }
+            }
+        }
+        // ③ 非 M365（IdC/social/api_key）或解析失败：各自独立成族
+        format!("cred:{id}")
+    }
+
     pub fn effective_idp(&self) -> &str {
         match self
             .auth_method
@@ -1011,6 +1045,41 @@ mod tests {
     }
 
     // ============ 凭据级代理优先级测试 ============
+
+    #[test]
+    fn test_family_key_m365_by_tenant() {
+        // 同一 M365 租户的两个 external_idp 号 → 同一族键（整族连坐）
+        // 注：租户 GUID 用占位假值（脱敏，不含真实账户标识）。
+        let mut a = KiroCredentials::default();
+        a.auth_method = Some("external_idp".to_string());
+        a.issuer_url = Some("https://login.microsoftonline.com/00000000-0000-0000-0000-000000000001/v2.0".to_string());
+        let mut b = KiroCredentials::default();
+        b.auth_method = Some("external_idp".to_string());
+        b.issuer_url = Some("https://login.microsoftonline.com/00000000-0000-0000-0000-000000000001/v2.0".to_string());
+        assert_eq!(a.family_key(53), "m365:00000000-0000-0000-0000-000000000001");
+        assert_eq!(a.family_key(53), b.family_key(54), "同租户号必须同族键");
+    }
+
+    #[test]
+    fn test_family_key_m365_falls_back_to_aws_account() {
+        // issuer 缺失但有 profileArn → aws:{account}（AWS 账户号用占位假值，脱敏）
+        let mut c = KiroCredentials::default();
+        c.auth_method = Some("external_idp".to_string());
+        c.profile_arn = Some("arn:aws:codewhisperer:us-east-1:000000000000:profile/EXAMPLE".to_string());
+        assert_eq!(c.family_key(53), "aws:000000000000");
+    }
+
+    #[test]
+    fn test_family_key_idc_independent() {
+        // IdC 号无 issuer → cred:{id} 独立成族（坚强兜底,不并入 m365 连坐）
+        let mut idc = KiroCredentials::default();
+        idc.auth_method = Some("idc".to_string());
+        assert_eq!(idc.family_key(61), "cred:61");
+        // social 同理独立
+        let mut soc = KiroCredentials::default();
+        soc.auth_method = Some("social".to_string());
+        assert_eq!(soc.family_key(70), "cred:70");
+    }
 
     #[test]
     fn test_effective_proxy_credential_overrides_global() {

@@ -70,6 +70,62 @@ fn collect_client_fingerprint() -> bool {
     COLLECT_CLIENT_FINGERPRINT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// —— TIER3 配置热重载：AppState 曾固化的热路径开关改用进程级原子镜像 ——
+///
+/// `AppState` 是 `#[derive(Clone)]`、建路由时按值烘焙，一旦服务栈建成便不可变。
+/// 沿用 [`COLLECT_CLIENT_FINGERPRINT`] 已验证的范式，把 admin 可热改的开关搬到
+/// 进程级 static 原子镜像：main 启动写入、admin 改配置立即改写、handler 热路径读镜像，
+/// 全程无需重启、无锁近零成本。initial 默认与 config 默认一致。
+///
+/// 注意：`prompt_cache_ttl_seconds` 固化进 `CacheTracker::max_supported_ttl`，运行时改它
+/// 需重建 tracker 丢弃已有缓存表（得不偿失），属诚实边界保留重启，故不设镜像；这里只热更
+/// `prompt_cache_enabled` 开关（关闭即停止记账）。
+static EXTRACT_THINKING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static PROMPT_CACHE_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// 设置非流式 thinking 提取开关（main 启动接线 / admin 热更调用，立即生效）。
+pub fn set_extract_thinking(enabled: bool) {
+    EXTRACT_THINKING.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 设置 prompt 缓存记账开关（main 启动接线 / admin 热更调用，立即生效）。
+pub fn set_prompt_cache_enabled(enabled: bool) {
+    PROMPT_CACHE_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn extract_thinking_enabled() -> bool {
+    EXTRACT_THINKING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn prompt_cache_enabled() -> bool {
+    PROMPT_CACHE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 输入压缩配置的进程级镜像（TIER3 热更）。
+///
+/// `CompressionConfig` 非标量（阈值 + 开关），用 `ArcSwap` 承载：admin 改配置时整份原子换、
+/// handler 热路径 `load_full()` 拿 `Arc` 快照（无锁近零成本）。`OnceLock` 惰性初始化，
+/// main 启动即 `set_compression` 写入真配置；未初始化时回退默认（与 config 默认一致）。
+static COMPRESSION: std::sync::OnceLock<arc_swap::ArcSwap<crate::model::config::CompressionConfig>> =
+    std::sync::OnceLock::new();
+
+fn compression_cell() -> &'static arc_swap::ArcSwap<crate::model::config::CompressionConfig> {
+    COMPRESSION.get_or_init(|| {
+        arc_swap::ArcSwap::from_pointee(crate::model::config::CompressionConfig::default())
+    })
+}
+
+/// 设置输入压缩配置（main 启动接线 / admin 热更调用，立即生效，下个请求即读到新值）。
+pub fn set_compression(compression: crate::model::config::CompressionConfig) {
+    compression_cell().store(std::sync::Arc::new(compression));
+}
+
+fn current_compression() -> std::sync::Arc<crate::model::config::CompressionConfig> {
+    compression_cell().load_full()
+}
+
 /// 请求来源的客户端画像（设备类型 + IP + 细分 OS + 浏览器），
 /// 一并沿用量埋点路径传递，避免多参数散落。
 #[derive(Clone, Default)]
@@ -126,7 +182,7 @@ struct CacheAccounting {
 impl CacheAccounting {
     /// 若启用了 prompt 缓存记账，则基于请求构建本次缓存画像
     fn build(state: &AppState, payload: &MessagesRequest, total_input_tokens: i32) -> Option<Self> {
-        if !state.prompt_cache_enabled {
+        if !prompt_cache_enabled() {
             return None;
         }
         let profile = state.cache_tracker.build_profile(payload, total_input_tokens);
@@ -472,7 +528,7 @@ pub async fn post_messages(
     // 构建 Kiro 请求体（发上游前，超阈值时执行输入压缩；profile_arn 由 provider 层注入）
     let request_body = match build_kiro_request_body(
         conversion_result.conversation_state,
-        &state.compression,
+        &current_compression(),
     ) {
         Ok(body) => body,
         Err(e) => {
@@ -525,7 +581,7 @@ pub async fn post_messages(
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = state.extract_thinking && thinking_enabled;
+        let extract_thinking = extract_thinking_enabled() && thinking_enabled;
         handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, cache_accounting, client).await
     }
 }
@@ -1099,7 +1155,7 @@ pub async fn post_messages_cc(
     // 构建 Kiro 请求体（发上游前，超阈值时执行输入压缩；profile_arn 由 provider 层注入）
     let request_body = match build_kiro_request_body(
         conversion_result.conversation_state,
-        &state.compression,
+        &current_compression(),
     ) {
         Ok(body) => body,
         Err(e) => {
@@ -1152,7 +1208,7 @@ pub async fn post_messages_cc(
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = state.extract_thinking && thinking_enabled;
+        let extract_thinking = extract_thinking_enabled() && thinking_enabled;
         handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, cache_accounting, client).await
     }
 }
@@ -1323,4 +1379,47 @@ fn emit_buffered_usage(
     record.outcome = crate::usage::RequestOutcome::Success;
     client.apply(&mut record);
     crate::usage::emit_record(record);
+}
+
+#[cfg(test)]
+mod tier3_hotreload_tests {
+    //! TIER3 配置热重载回归：AppState 曾固化的热路径开关改用进程级镜像后，
+    //! setter 写入应被对应 getter（handler 热路径读点）立即读到，证明改配置即时生效。
+    //!
+    //! 注意：镜像是进程级 static，测试间共享同一份。这些测试各自操作**不同的**镜像，
+    //! 且末尾恢复默认，避免串扰；不并发断言同一镜像的中间态。
+    use super::*;
+
+    #[test]
+    fn test_extract_thinking_mirror_roundtrip() {
+        set_extract_thinking(true);
+        assert!(extract_thinking_enabled(), "set true 后热路径应读到 true");
+        set_extract_thinking(false);
+        assert!(!extract_thinking_enabled(), "set false 后热路径应读到 false");
+    }
+
+    #[test]
+    fn test_prompt_cache_enabled_mirror_roundtrip() {
+        set_prompt_cache_enabled(false);
+        assert!(!prompt_cache_enabled(), "set false 后热路径应停止记账");
+        set_prompt_cache_enabled(true);
+        assert!(prompt_cache_enabled(), "set true 后热路径应恢复记账");
+    }
+
+    #[test]
+    fn test_compression_mirror_roundtrip() {
+        use crate::model::config::CompressionConfig;
+        let mut c = CompressionConfig::default();
+        // 翻转 enabled 以可观测地区分（不依赖具体默认值，只验证 setter→getter 传递）
+        c.enabled = !c.enabled;
+        let flipped = c.enabled;
+        set_compression(c);
+        assert_eq!(
+            current_compression().enabled,
+            flipped,
+            "set_compression 后热路径应读到新的 compression 快照"
+        );
+        // 复位默认，避免影响其它测试
+        set_compression(CompressionConfig::default());
+    }
 }
