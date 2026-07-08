@@ -1,0 +1,74 @@
+/* ============================================================
+   StatusBars 灵动负载条 —— 每号一排均衡器竖条 = 实时 RPM 负载表(不是装饰循环!)。
+   设计哲学(dwgx):动画只由真实请求/真实 RPM 驱动,绝不常驻假循环。
+   - 竖条高度(scaleY)= 当前负载档位;RPM 越高峰值越高、跳动越快(像音频均衡器起伏)。
+   - 空闲(RPM 0 且无在途)= 竖条压平静止,不挂任何动画(GPU 不空转)。
+   - 每个真实请求(pulse)= 一道明亮能量流从左掠到右并淡出(替代旧的呆板小圆点横飞)。
+   仅本组件顶部 import;@keyframes 只放这里,不碰全局 index.css。
+   动画走 transform/opacity(GPU 合成);motion-reduce 退化为静态档位条。
+   ============================================================ */
+
+/* 算力格子本体:加减(点亮/熄灭)走 transition(仅亮灭淡入淡出,无 scale=保持凌晨满格观感)。
+   transition-duration/delay 由行内按填充前沿距离错峰给出;真正的“计算跳动”走下方 flicker 动画。 */
+.sbar-cell {
+  border-radius: 1px;
+  will-change: opacity;
+  transition-property: background-color, box-shadow, opacity;
+  transition-timing-function: ease;
+}
+
+/* 点亮格子的算力微闪:在 --cell-lo 与 --cell-hi 之间做 opacity 起伏(像 SM 上的核心在跑 warp)。
+   每格相位/深度/速度不同(行内 --cell-* + 负 delay 错峰)→ 整阵此起彼伏地闪动而非齐刷刷,
+   越忙(RPM/在途越高)时长越短 = 闪得越快。 */
+@keyframes sbar-cell-flicker {
+  0% {
+    opacity: var(--cell-lo, 0.45);
+  }
+  100% {
+    opacity: var(--cell-hi, 1);
+  }
+}
+
+.sbar-cell-run {
+  animation-name: sbar-cell-flicker;
+  animation-iteration-count: infinite;
+  animation-direction: alternate;
+  animation-timing-function: ease-in-out;
+}
+
+/* 请求点火波:一格从暗骤亮再回落。overlay 层每格按“列”错峰(行内 animation-delay)
+   → 一道点火波自左向右穿过整个算力阵(替代旧的单调光束),体现一次真实请求点亮算力。
+   key=pulse 触发整层重挂载 → 每个请求只重放一次。 */
+@keyframes sbar-cell-ignite {
+  0% {
+    opacity: 0;
+    transform: scale(0.65);
+  }
+  35% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1);
+  }
+}
+
+.sbar-cell-ignite {
+  border-radius: 1px;
+  animation: sbar-cell-ignite var(--ignite-dur, 0.5s) cubic-bezier(0.22, 1, 0.36, 1) both;
+  will-change: opacity, transform;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sbar-cell {
+    transition: none;
+  }
+  .sbar-cell-run {
+    animation: none;
+  }
+  .sbar-cell-ignite {
+    animation: none;
+    display: none;
+  }
+}
