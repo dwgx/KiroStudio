@@ -5,7 +5,7 @@ import { authLabel, disabledReasonLabel } from '@/lib/i18n-labels'
 // ============================================================
 // 号池可视化三视图（GlowGrid / OrbitRing / StatusBars）共用的
 // 纯逻辑与展示碎片，集中一处避免各视图重复造轮子。
-// 只读 credentials 免费字段 + activity，绝不在此拉 balance（封号红线）。
+// 只读 credentials 免费字段 + activity，绝不在此拉 balance（避免触发上游风控）。
 // ============================================================
 
 /** 凭据健康三态：健康 / 有失败但仍启用 / 已禁用。 */
@@ -56,7 +56,7 @@ export function statusText(c: CredentialStatusItem): string {
 /**
  * 三视图共用的 tooltip 正文（放进 <TooltipContent> 内）。
  * 展示号免费字段：#id / email / 鉴权 / 成功·失败 / 状态 / 最近命中 / 在途。
- * 不含任何 balance / 额度字段（待后端批量缓存端点，封号红线）。
+ * 不含任何 balance / 额度字段（待后端批量缓存端点，避免触发上游风控）。
  */
 export function CredTooltipBody({
   c,
@@ -83,7 +83,7 @@ export function CredTooltipBody({
         <div className="text-primary">在途：{c.inflight}</div>
       )}
       {/* TODO(BE-balance): 额度/积分待后端批量缓存端点 cached-balances；
-          本视图 hover 仅展示免费字段，绝不在此拉 per-account balance（封号红线）。 */}
+          本视图 hover 仅展示免费字段，绝不在此拉 per-account balance（避免触发上游风控）。 */}
     </div>
   )
 }
