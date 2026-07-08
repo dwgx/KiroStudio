@@ -70,6 +70,17 @@ pub struct CredentialStatusItem {
     pub inflight: u32,
     /// 最近 60 秒滚动窗口内的请求数（RPM 观测）
     pub rpm: u32,
+    /// 用户自定义别名/备注（卡片展示优先于 email/#id）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// 是否正处于冷却中（429/限流/服务错误后短暂跳过）
+    pub cooling_down: bool,
+    /// 冷却剩余毫秒（cooling_down 为 true 时有效）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_remaining_ms: Option<u64>,
+    /// 冷却原因（如「速率限制」「服务错误」）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_reason: Option<String>,
 }
 
 // ============ 凭据回收站 ============
@@ -179,6 +190,10 @@ pub struct AddCredentialRequest {
 
     /// 用户邮箱（可选，用于前端显示）
     pub email: Option<String>,
+
+    /// 用户自定义别名/备注（可选，卡片展示优先于 email/#id）
+    #[serde(default)]
+    pub name: Option<String>,
 
     /// 凭据级代理 URL（可选，特殊值 "direct" 表示不使用代理）
     pub proxy_url: Option<String>,
@@ -439,6 +454,9 @@ pub struct ConfigSnapshotResponse {
     // ---- 余额同步（A6）----
     /// 后台温和余额刷新间隔（秒，0=禁用）
     pub balance_refresh_interval_secs: u64,
+    // ---- 隐私 ----
+    /// 是否采集下游客户端指纹（device/ip/os/browser，立即生效）
+    pub collect_client_fingerprint: bool,
     /// 配置文件路径（运行时只读元数据）
     pub config_path: Option<String>,
 }
@@ -470,6 +488,12 @@ pub struct UpdateConfigRequest {
     pub affinity_enabled: Option<bool>,
     /// 全局代理地址；传空字符串表示清除
     pub proxy_url: Option<String>,
+    /// 全局代理认证用户名；出于安全前端不回显已存值，仅在非空时更新
+    #[serde(default)]
+    pub proxy_username: Option<String>,
+    /// 全局代理认证密码；出于安全前端不回显已存值，仅在非空时更新
+    #[serde(default)]
+    pub proxy_password: Option<String>,
     /// 网页上号回调基地址；传空字符串表示清除（回退本地模式）
     pub callback_base_url: Option<String>,
     // ---- 反代安全（批次3，均需重启生效）----
@@ -492,6 +516,9 @@ pub struct UpdateConfigRequest {
     // ---- 余额同步（A6，需重启生效）----
     /// 后台温和余额刷新间隔（秒，0=禁用）
     pub balance_refresh_interval_secs: Option<u64>,
+    // ---- 隐私（立即生效）----
+    /// 是否采集下游客户端指纹（device/ip/os/browser）
+    pub collect_client_fingerprint: Option<bool>,
 }
 
 /// 更新服务端配置响应
