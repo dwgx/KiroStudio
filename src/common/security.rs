@@ -207,8 +207,13 @@ pub fn client_ip(req: &Request<Body>, peer: Option<SocketAddr>, trust_forwarded:
     if trust_forwarded {
         if let Some(xff) = req.headers().get("x-forwarded-for") {
             if let Ok(s) = xff.to_str() {
-                if let Some(first) = s.split(',').next() {
-                    if let Ok(ip) = first.trim().parse::<IpAddr>() {
+                // 安全(H2):取**最右**段,不是最左。XFF 是各级代理依次追加的链
+                // (client, proxy1, proxy2, ...),最左是客户端**可任意伪造**的值——取最左
+                // 会让攻击者发 `X-Forwarded-For: <白名单IP>` 绕过 IP 白名单,或每次换伪造 IP
+                // 绕过每-IP 限流。只有**最右**那段是紧邻本服务的可信反代追加的、不可伪造。
+                // (前提:本服务确实位于可信反代之后才开 trust_forwarded;默认关。)
+                if let Some(last) = s.split(',').next_back() {
+                    if let Ok(ip) = last.trim().parse::<IpAddr>() {
                         return Some(ip);
                     }
                 }

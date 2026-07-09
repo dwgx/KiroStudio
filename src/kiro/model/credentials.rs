@@ -333,18 +333,42 @@ impl KiroCredentials {
 
     /// 获取有效的 Auth Region（用于 Token 刷新）
     /// 优先级：凭据.auth_region > 凭据.region > config.auth_region > config.region
+    /// 仅接受命中 SUPPORTED_KIRO_REGIONS 白名单的 region 字符串,否则 None。
+    ///
+    /// 安全(H3/M1):凭据的 region/auth_region/api_region 字段来自不可信来源——本工具核心
+    /// 用途就是导入他人分享/第三方的 Kiro 凭据 JSON。这些字符串会被 format! 拼进上游 host
+    /// (prod.{region}.auth.desktop.kiro.dev / runtime.{region}.kiro.dev / management.{region}.kiro.dev /
+    /// oidc.{region}.amazonaws.com)。若不校验,污染值(如 "evil.com/")会拼出攻击者可控 host,
+    /// 刷新时把明文 refresh_token/Bearer POST 到攻击者服务器 = 凭据外泄/中间人。
+    /// 与 region_from_profile_arn 同口径:只放行已知 AWS region,不命中即回退 config。
+    fn sanitized_region(region: &str) -> Option<&str> {
+        if SUPPORTED_KIRO_REGIONS.contains(&region) {
+            Some(region)
+        } else {
+            None
+        }
+    }
+
+    /// region 是否在白名单内（供 admin 上号入口等外部校验用,如 idc region 参数）。
+    pub fn is_supported_region(region: &str) -> bool {
+        SUPPORTED_KIRO_REGIONS.contains(&region)
+    }
+
     pub fn effective_auth_region<'a>(&'a self, config: &'a Config) -> &'a str {
+        // 凭据 region 字段先过白名单(防污染拼坏 host),不命中回退 config。
         self.auth_region
             .as_deref()
-            .or(self.region.as_deref())
+            .and_then(Self::sanitized_region)
+            .or_else(|| self.region.as_deref().and_then(Self::sanitized_region))
             .unwrap_or(config.effective_auth_region())
     }
 
     /// 获取有效的 API Region（用于 API 请求）
-    /// 优先级：凭据.api_region > config.api_region > config.region
+    /// 优先级：凭据.api_region（过白名单） > config.api_region > config.region
     pub fn effective_api_region<'a>(&'a self, config: &'a Config) -> &'a str {
         self.api_region
             .as_deref()
+            .and_then(Self::sanitized_region)
             .unwrap_or(config.effective_api_region())
     }
 
@@ -364,12 +388,16 @@ impl KiroCredentials {
         {
             return region;
         }
+        // 凭据 region/auth_region 字段先过白名单(H3:防污染值拼坏 host 泄漏 token),
+        // 不命中回退 config（config 由部署方掌控,视为可信）。
         self.region
             .as_deref()
-            .filter(|r| !r.is_empty())
-            .or(self.auth_region.as_deref().filter(|r| !r.is_empty()))
+            .and_then(Self::sanitized_region)
+            .or_else(|| self.auth_region.as_deref().and_then(Self::sanitized_region))
             .unwrap_or_else(|| self.effective_api_region(config))
     }
+
+    // (安全回归测试 test_region_field_rejects_polluted 见 mod tests,验证污染 region 被白名单挡下)
 
     /// 从 profileArn 严格解析 region:必须形如
     /// `arn:aws:codewhisperer:{region}:{account}:profile/{id}` 且 region 命中白名单,
@@ -643,13 +671,29 @@ mod tests {
     }
 
     #[test]
-    fn test_effective_profile_arn_external_idp_none() {
-        // external_idp(M365)带 profileArn 反而 403,必须返回 None 不发
+    fn test_effective_profile_arn_external_idp() {
+        // kiro.dev 迁移后 external_idp 号**必须**带自己租户的真实 profileArn
+        //（缺了 400 profileArn is required）。
+        // ① 有真实 arn → 用它。
         let mut ext = KiroCredentials::default();
         ext.auth_method = Some("external_idp".to_string());
         ext.profile_arn = Some("arn:aws:codewhisperer:us-east-1:222:profile/X".to_string());
-        assert_eq!(ext.effective_profile_arn(), None, "external_idp 绝不发 profileArn");
-        assert!(!ext.should_send_profile_arn());
+        assert_eq!(
+            ext.effective_profile_arn().as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:222:profile/X"),
+            "external_idp 有真实 arn 应使用它"
+        );
+        assert!(ext.should_send_profile_arn());
+
+        // ② 缺 arn → 返回 None（绝不套 idc 的默认 BuilderId 占位 ARN，那会 403）；
+        //    真实 arn 由 refresh 后动态 ListAvailableProfiles 解析补上。
+        let mut ext_no_arn = KiroCredentials::default();
+        ext_no_arn.auth_method = Some("external_idp".to_string());
+        assert_eq!(
+            ext_no_arn.effective_profile_arn(),
+            None,
+            "external_idp 缺真实 arn 应返回 None（不套默认占位 ARN）"
+        );
     }
 
     #[test]
@@ -664,6 +708,32 @@ mod tests {
         c.profile_arn =
             Some("arn:aws:codewhisperer:ap-northeast-1:1:profile/X".to_string());
         assert_eq!(c.effective_upstream_region(&config), "ap-northeast-1");
+    }
+
+    /// 安全回归(H3):被污染的凭据 region/auth_region 字段(来自不可信导入的凭据 JSON)
+    /// 不得原样进入上游 host——必须过 SUPPORTED_KIRO_REGIONS 白名单,不命中回退可信 config。
+    #[test]
+    fn test_region_field_rejects_polluted() {
+        let mut config = Config::default();
+        config.region = "us-east-1".to_string();
+        config.auth_region = Some("us-east-1".to_string());
+        config.api_region = Some("us-east-1".to_string());
+
+        let mut c = KiroCredentials::default();
+        // 攻击者投毒:把 region 拼成能劫持 host 的字符串
+        c.region = Some("evil.attacker.com/".to_string());
+        c.auth_region = Some("169.254.169.254".to_string());
+        c.api_region = Some("x-injected".to_string());
+
+        // 三个入口都不得吐出污染值,一律回退可信 config
+        assert_eq!(c.effective_upstream_region(&config), "us-east-1");
+        assert_eq!(c.effective_auth_region(&config), "us-east-1");
+        assert_eq!(c.effective_api_region(&config), "us-east-1");
+        // 合法 region 仍正常放行
+        c.region = Some("eu-west-1".to_string());
+        assert_eq!(c.effective_upstream_region(&config), "eu-west-1");
+        assert!(KiroCredentials::is_supported_region("eu-west-1"));
+        assert!(!KiroCredentials::is_supported_region("evil.com/"));
     }
 
     /// 安全回归：Debug 输出绝不含敏感凭证明文（防 HIGH-1 日志泄露复发）。
@@ -1138,10 +1208,10 @@ mod tests {
         config.auth_region = Some("config-auth-region".to_string());
 
         let mut creds = KiroCredentials::default();
-        creds.region = Some("cred-region".to_string());
-        creds.auth_region = Some("cred-auth-region".to_string());
+        creds.region = Some("eu-central-1".to_string());
+        creds.auth_region = Some("eu-west-1".to_string());
 
-        assert_eq!(creds.effective_auth_region(&config), "cred-auth-region");
+        assert_eq!(creds.effective_auth_region(&config), "eu-west-1");
     }
 
     #[test]
@@ -1151,10 +1221,10 @@ mod tests {
         config.auth_region = Some("config-auth-region".to_string());
 
         let mut creds = KiroCredentials::default();
-        creds.region = Some("cred-region".to_string());
+        creds.region = Some("eu-central-1".to_string());
         // auth_region 未设置
 
-        assert_eq!(creds.effective_auth_region(&config), "cred-region");
+        assert_eq!(creds.effective_auth_region(&config), "eu-central-1");
     }
 
     #[test]
@@ -1188,9 +1258,9 @@ mod tests {
         config.api_region = Some("config-api-region".to_string());
 
         let mut creds = KiroCredentials::default();
-        creds.api_region = Some("cred-api-region".to_string());
+        creds.api_region = Some("ap-southeast-1".to_string());
 
-        assert_eq!(creds.effective_api_region(&config), "cred-api-region");
+        assert_eq!(creds.effective_api_region(&config), "ap-southeast-1");
     }
 
     #[test]
@@ -1233,11 +1303,11 @@ mod tests {
         config.region = "default".to_string();
 
         let mut creds = KiroCredentials::default();
-        creds.auth_region = Some("auth-only".to_string());
-        creds.api_region = Some("api-only".to_string());
+        creds.auth_region = Some("eu-west-2".to_string());
+        creds.api_region = Some("ap-northeast-2".to_string());
 
-        assert_eq!(creds.effective_auth_region(&config), "auth-only");
-        assert_eq!(creds.effective_api_region(&config), "api-only");
+        assert_eq!(creds.effective_auth_region(&config), "eu-west-2");
+        assert_eq!(creds.effective_api_region(&config), "ap-northeast-2");
     }
 
     // ============ 凭据级代理优先级测试 ============
