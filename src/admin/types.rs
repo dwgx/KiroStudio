@@ -442,6 +442,8 @@ pub struct ConfigSnapshotResponse {
     pub default_endpoint: String,
     pub endpoint_names: Vec<String>,
     pub extract_thinking: bool,
+    /// 是否剥离转发给上游的 system 环境噪音（省 token / 提缓存命中 / 降关联，立即生效）
+    pub strip_env_noise: bool,
     pub cooldown_enabled: bool,
     pub rate_limit_enabled: bool,
     pub rate_limit_daily_max: u32,
@@ -469,6 +471,8 @@ pub struct ConfigSnapshotResponse {
     pub token_refresh_interval_secs: u64,
     // ---- Admin UI 登录页 ----
     pub login_background_enabled: bool,
+    /// 登录页背景图是否走 R18 图源（立即生效）
+    pub login_background_r18: bool,
     // ---- 余额同步（A6）----
     /// 后台温和余额刷新间隔（秒，0=禁用）
     pub balance_refresh_interval_secs: u64,
@@ -499,6 +503,7 @@ pub struct UpdateConfigRequest {
     pub load_balancing_mode: Option<String>,
     pub default_endpoint: Option<String>,
     pub extract_thinking: Option<bool>,
+    pub strip_env_noise: Option<bool>,
     pub cooldown_enabled: Option<bool>,
     pub rate_limit_enabled: Option<bool>,
     pub rate_limit_daily_max: Option<u32>,
@@ -532,6 +537,8 @@ pub struct UpdateConfigRequest {
     pub token_refresh_interval_secs: Option<u64>,
     // ---- Admin UI 登录页（立即生效）----
     pub login_background_enabled: Option<bool>,
+    /// 登录页背景图是否走 R18 图源（立即生效）
+    pub login_background_r18: Option<bool>,
     // ---- 余额同步（A6，需重启生效）----
     /// 后台温和余额刷新间隔（秒，0=禁用）
     pub balance_refresh_interval_secs: Option<u64>,
@@ -619,4 +626,72 @@ pub struct StorageCleanupResponse {
     pub message: String,
     /// 各分区清理明细
     pub results: Vec<StorageCleanupItem>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_config_deserializes_login_background_r18() {
+        // 前端以 camelCase 提交 loginBackgroundR18，应正确落到 snake_case 字段。
+        let json = r#"{"loginBackgroundR18": false}"#;
+        let req: UpdateConfigRequest = serde_json::from_str(json).expect("反序列化应成功");
+        assert_eq!(req.login_background_r18, Some(false));
+        // 未提交的字段应为 None（仅改动字段才更新）。
+        assert_eq!(req.login_background_enabled, None);
+    }
+
+    #[test]
+    fn update_config_omits_login_background_r18_when_absent() {
+        // 请求体不含该字段时应为 None，不会误改。
+        let req: UpdateConfigRequest = serde_json::from_str("{}").expect("空对象应成功");
+        assert_eq!(req.login_background_r18, None);
+    }
+
+    #[test]
+    fn config_snapshot_serializes_login_background_r18() {
+        // 快照以 camelCase 下发，前端据此渲染开关初值。
+        let snap = ConfigSnapshotResponse {
+            host: "127.0.0.1".into(),
+            port: 8080,
+            region: "us-east-1".into(),
+            kiro_version: "0.0.0".into(),
+            system_version: "sys".into(),
+            node_version: "node".into(),
+            tls_backend: "rustls".into(),
+            load_balancing_mode: "priority".into(),
+            default_endpoint: "ide".into(),
+            endpoint_names: vec![],
+            extract_thinking: true,
+            cooldown_enabled: true,
+            rate_limit_enabled: false,
+            rate_limit_daily_max: 500,
+            rate_limit_min_interval_ms: 1000,
+            affinity_enabled: true,
+            priority_in_balanced: false,
+            has_proxy: false,
+            proxy_url: None,
+            has_admin_key: false,
+            callback_mode: "local".into(),
+            callback_base_url: None,
+            cors_allowed_origins: vec![],
+            ip_allowlist: vec![],
+            trust_forwarded_header: false,
+            ingress_rate_limit_per_min: 0,
+            max_body_bytes: 0,
+            proactive_token_refresh: true,
+            token_refresh_lead_minutes: 10,
+            token_refresh_interval_secs: 60,
+            login_background_enabled: true,
+            login_background_r18: false,
+            balance_refresh_interval_secs: 1800,
+            collect_client_fingerprint: true,
+            strip_env_noise: true,
+            config_path: None,
+        };
+        let s = serde_json::to_string(&snap).expect("序列化应成功");
+        assert!(s.contains("\"loginBackgroundR18\":false"));
+        assert!(s.contains("\"loginBackgroundEnabled\":true"));
+    }
 }

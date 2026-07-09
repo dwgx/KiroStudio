@@ -86,13 +86,37 @@ pub async fn usage_by_credential(State(state): State<AdminState>) -> impl IntoRe
 /// recent traces 查询参数
 #[derive(Debug, Deserialize)]
 pub struct RecentQuery {
-    /// 返回条数上限（默认 100，最大 1000）
+    /// 返回条数上限。语义见 [`resolve_recent_limit`]：
+    /// - 缺省 → 默认 100 条
+    /// - 0    → 前端"全部"，取到硬上限 [`MAX_RECENT_LIMIT`] 为止
+    /// - 其它 → 裁剪到 [1, MAX_RECENT_LIMIT]
     #[serde(default)]
     pub limit: Option<usize>,
 }
 
+/// 最近请求明细返回条数的硬上限（兜底：全量查询也不至于把服务/前端拖垮）。
+///
+/// dwgx 需求「最近请求支持真全部」：前端"全部"选项传 `limit=0`，服务端解释为
+/// 「取到该硬上限为止」。5 万条对本地 SQLite 单次查询与 JSON 序列化均可控，
+/// 而前端表格采用分页渲染（每页 20 行），故不存在 DOM 爆炸；此上限仅是极端场景
+/// 的内存/带宽兜底。
+pub const MAX_RECENT_LIMIT: usize = 50_000;
+
+/// 解析「最近请求」的实际取数条数（纯函数，便于单测）。
+///
+/// - `None`（缺省参数）→ 默认 100 条
+/// - `Some(0)` → 前端"全部"，取到硬上限 [`MAX_RECENT_LIMIT`]
+/// - `Some(n)` → 裁剪到 `[1, MAX_RECENT_LIMIT]`
+pub fn resolve_recent_limit(limit: Option<usize>) -> usize {
+    match limit {
+        None => 100,
+        Some(0) => MAX_RECENT_LIMIT,
+        Some(n) => n.clamp(1, MAX_RECENT_LIMIT),
+    }
+}
+
 /// GET /api/admin/usage/recent?limit=N
-/// 最近 N 条请求明细（按时间倒序）
+/// 最近 N 条请求明细（按时间倒序）。`limit=0` 表示"全部"（取到硬上限）。
 pub async fn usage_recent(
     State(state): State<AdminState>,
     Query(query): Query<RecentQuery>,
@@ -100,8 +124,7 @@ pub async fn usage_recent(
     let Some(db) = &state.trace_db else {
         return stats_disabled();
     };
-    // 上限放宽到 5000（前端"最近请求"支持切换 200/500/1000/全部；"全部"传大值取满窗）。
-    let limit = query.limit.unwrap_or(100).clamp(1, 5000);
+    let limit = resolve_recent_limit(query.limit);
     match db.recent(limit) {
         Ok(records) => Json(records).into_response(),
         Err(e) => {
@@ -248,8 +271,40 @@ pub async fn stream_live(
     });
 
     Sse::new(stream).keep_alive(
+        // 保活心跳（占位，逻辑不变）
         KeepAlive::new()
             .interval(Duration::from_secs(15))
             .text("keep-alive"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_recent_limit, MAX_RECENT_LIMIT};
+
+    #[test]
+    fn test_resolve_recent_limit_default_when_absent() {
+        // 缺省参数 → 默认 100 条
+        assert_eq!(resolve_recent_limit(None), 100);
+    }
+
+    #[test]
+    fn test_resolve_recent_limit_zero_means_all() {
+        // limit=0 是前端"全部"的约定 → 取到硬上限
+        assert_eq!(resolve_recent_limit(Some(0)), MAX_RECENT_LIMIT);
+    }
+
+    #[test]
+    fn test_resolve_recent_limit_normal_values_pass_through() {
+        assert_eq!(resolve_recent_limit(Some(1)), 1);
+        assert_eq!(resolve_recent_limit(Some(200)), 200);
+        assert_eq!(resolve_recent_limit(Some(5000)), 5000);
+    }
+
+    #[test]
+    fn test_resolve_recent_limit_clamped_to_hard_cap() {
+        // 超过硬上限（含旧的 5000 之上）一律裁剪到 MAX_RECENT_LIMIT，防拖垮服务
+        assert_eq!(resolve_recent_limit(Some(MAX_RECENT_LIMIT + 1)), MAX_RECENT_LIMIT);
+        assert_eq!(resolve_recent_limit(Some(usize::MAX)), MAX_RECENT_LIMIT);
+    }
 }

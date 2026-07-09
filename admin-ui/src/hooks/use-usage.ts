@@ -9,6 +9,7 @@ import {
   getUsageMachines,
   getUsageThroughput,
   getRatelimitInsights,
+  getUsageCache,
 } from '@/api/usage'
 
 // 统计页整体每 30 秒自动刷新
@@ -109,6 +110,17 @@ export function useRatelimitInsights() {
     queryKey: ['usage', 'ratelimit-insights'],
     queryFn: getRatelimitInsights,
     refetchInterval: () => (typeof document !== 'undefined' && document.hidden ? false : INSIGHTS_MS),
+    refetchIntervalInBackground: false,
+  })
+}
+
+// 影子缓存命中率快照：随统计页整体 30s 轮询（读进程级 static 计数,零上游、无封号风险）。
+// 隐藏页暂停轮询省资源;重新可见时 react-query 借 focus 事件自动复轮。
+export function useUsageCache() {
+  return useQuery({
+    queryKey: ['usage', 'cache'],
+    queryFn: getUsageCache,
+    refetchInterval: () => (typeof document !== 'undefined' && document.hidden ? false : REFETCH_MS),
     refetchIntervalInBackground: false,
   })
 }

@@ -247,6 +247,7 @@ export interface ConfigSnapshotResponse {
   defaultEndpoint: string
   endpointNames: string[]
   extractThinking: boolean
+  stripEnvNoise: boolean
   cooldownEnabled: boolean
   rateLimitEnabled: boolean
   rateLimitDailyMax: number
@@ -268,6 +269,10 @@ export interface ConfigSnapshotResponse {
   proactiveTokenRefresh: boolean
   tokenRefreshLeadMinutes: number
   tokenRefreshIntervalSecs: number
+  // Admin UI 登录页：是否显示随机背景图（立即生效，无需重启）。缺省视为开启。
+  loginBackgroundEnabled?: boolean
+  // Admin UI 登录页：背景图是否走 R18 图源（立即生效，无需重启）。缺省视为开启。
+  loginBackgroundR18?: boolean
   // 隐私：是否采集下游客户端指纹（设备/IP/系统/浏览器）。立即生效，无需重启。缺省视为开启。
   collectClientFingerprint?: boolean
   configPath?: string
@@ -285,6 +290,7 @@ export interface UpdateConfigRequest {
   loadBalancingMode?: string
   defaultEndpoint?: string
   extractThinking?: boolean
+  stripEnvNoise?: boolean
   cooldownEnabled?: boolean
   rateLimitEnabled?: boolean
   rateLimitDailyMax?: number
@@ -305,6 +311,10 @@ export interface UpdateConfigRequest {
   proactiveTokenRefresh?: boolean
   tokenRefreshLeadMinutes?: number
   tokenRefreshIntervalSecs?: number
+  // Admin UI 登录页：显示背景图开关（立即生效，无需重启）
+  loginBackgroundEnabled?: boolean
+  // Admin UI 登录页：R18 图源开关（立即生效，无需重启）
+  loginBackgroundR18?: boolean
   // 隐私：采集下游客户端指纹开关（立即生效，无需重启）
   collectClientFingerprint?: boolean
 }
