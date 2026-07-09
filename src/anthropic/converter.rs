@@ -390,6 +390,147 @@ pub(super) fn canonicalize_billing_header(text: &str) -> &str {
     }
 }
 
+/// 环境噪音剥离开关的运行时镜像（`config.strip_env_noise`，TIER3 热更）。
+///
+/// 归一化路径（[`canonicalize_system_text`]）拿不到 config，故沿用
+/// [`super::handlers`] 已验证的进程级原子镜像范式：main 启动按配置写入、admin 改开关
+/// 立即改写、归一化热路径读镜像，无需重启、无锁近零成本。默认 true（与 config 默认一致）。
+///
+/// **关键**：转发字节路径（[`build_history`]）与影子指纹路径
+/// （[`super::cache_tracker`]）都经由 [`canonicalize_system_text`] 读同一镜像，
+/// 保证两侧对同一 system 块施加**完全一致**的变换，记账与真实缓存不脱节。
+static STRIP_ENV_NOISE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// 设置环境噪音剥离开关（main 启动接线 / admin 热更调用，立即生效，下个请求即读到新值）。
+pub fn set_strip_env_noise(enabled: bool) {
+    STRIP_ENV_NOISE.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn strip_env_noise_enabled() -> bool {
+    STRIP_ENV_NOISE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 归一化单个 system 文本块：折叠归因头 + （开关开启时）剥离环境噪音。
+///
+/// Claude Code 每次请求都会在 system 里携带「每次漂移」的环境上下文（工作目录/日期/
+/// 平台的 `<env>` 块、`gitStatus:`、`Recent commits:`、模型名行等）。这些漂移行位于
+/// prompt 前缀，只要变一个字节，上游 Bedrock prefix cache 其后全部失效（命中率≈0），
+/// 且它们是关联「这是 Claude Code」的强指纹。剥离它们同时省 token、提命中率、降关联风险。
+///
+/// 返回 [`std::borrow::Cow`]：未发生任何改写时借用原串零分配；发生折叠/剥离时返回改写副本。
+/// 该函数是转发字节与影子指纹两条路径的**唯一**归一化入口，确保两侧字节一致。
+///
+/// 保守原则：只剥离「确定每请求漂移」的整块 / 整行，绝不触碰稳定的 system 正文
+/// （如工具说明、身份声明、任务指令）。
+pub(super) fn canonicalize_system_text(text: &str) -> std::borrow::Cow<'_, str> {
+    // 1. 归因头整块 → 固定占位符（无条件，历史行为）
+    let folded = canonicalize_billing_header(text);
+    if !std::ptr::eq(folded, text) {
+        return std::borrow::Cow::Borrowed(folded);
+    }
+    // 2. 环境噪音剥离（受开关控制；默认开）
+    if strip_env_noise_enabled()
+        && let Some(stripped) = strip_env_noise_lines(text)
+    {
+        return std::borrow::Cow::Owned(stripped);
+    }
+    std::borrow::Cow::Borrowed(text)
+}
+
+/// 剥离 system 文本里每请求漂移的环境噪音行 / 整段。
+///
+/// 参照 kiro-account-manager `prompt_filter::filter_env_noise`（MIT），并补齐现代
+/// Claude Code 的 `<env>...</env>` 标签块形式。仅当确有内容被剥离时返回 `Some(改写副本)`，
+/// 否则返回 `None`（调用方据此零分配借用原串）。
+///
+/// 剥离目标全部是「确定每请求漂移」或「纯环境元数据」，不含稳定正文：
+/// - `<env>...</env>` 整块（工作目录 / 平台 / 日期，每请求 / 每日漂移）；
+/// - `# Environment` / `# auto memory` markdown 段（到下一个 `# ` 标题为止）；
+/// - `gitStatus:` / `Recent commits:` 声明行、`.claude/projects/` 路径行；
+/// - `Assistant knowledge cutoff` / `powered by the model named` 等模型/环境元数据行。
+fn strip_env_noise_lines(text: &str) -> Option<String> {
+    let mut changed = false;
+    let mut out: Vec<&str> = Vec::new();
+    let mut skip_section = false; // # Environment / # auto memory markdown 段
+    let mut skip_env_tag = false; // <env>...</env> 标签块
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_lowercase();
+
+        // <env>...</env> 块：整块剥离（含首尾标签行）。cwd/platform/date 每次漂移。
+        if skip_env_tag {
+            changed = true;
+            if trimmed.contains("</env>") {
+                skip_env_tag = false;
+            }
+            continue;
+        }
+        if trimmed.starts_with("<env>") {
+            changed = true;
+            // 兼容单行 <env>...</env>
+            if !trimmed.contains("</env>") {
+                skip_env_tag = true;
+            }
+            continue;
+        }
+
+        // # Environment / # auto memory 段：跳到下一个 `# ` 标题（保留该新标题）。
+        if trimmed == "# Environment" || trimmed == "# auto memory" {
+            skip_section = true;
+            changed = true;
+            continue;
+        }
+        if skip_section {
+            if trimmed.starts_with("# ") {
+                skip_section = false;
+                // fall through：保留新标题行
+            } else {
+                changed = true;
+                continue;
+            }
+        }
+
+        // 单独漂移行 / 环境元数据行
+        if trimmed.starts_with("gitStatus:")
+            || trimmed.starts_with("Recent commits:")
+            || trimmed.starts_with("Assistant knowledge cutoff")
+            || lower.contains("powered by the model named")
+            || trimmed.contains(".claude/projects/")
+            || trimmed.contains("git status at the start of the conversation")
+            || trimmed.contains("has been invoked in the following environment")
+        {
+            changed = true;
+            continue;
+        }
+
+        out.push(line);
+    }
+
+    if !changed {
+        return None;
+    }
+    Some(collapse_blank_lines(&out.join("\n")))
+}
+
+/// 连续空行合并为一行，并去除首尾空白（剥离整段后常留多余空行）。
+fn collapse_blank_lines(s: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut blanks = 0;
+    for line in s.lines() {
+        if line.trim().is_empty() {
+            blanks += 1;
+            if blanks > 1 {
+                continue;
+            }
+        } else {
+            blanks = 0;
+        }
+        out.push(line);
+    }
+    out.join("\n").trim().to_string()
+}
+
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 /// 严格对照版本号
 pub fn map_model(model: &str) -> Option<String> {
@@ -1110,11 +1251,14 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
 
     // 1. 处理系统消息
     if let Some(ref system) = req.system {
-        // 归一化每一块 system 文本：把 CC 归因头（第一块，每请求漂移）折叠成占位符，
-        // 稳定住转发给上游的 prompt 前缀，避免 Bedrock prefix cache 因归因头漂移而 0 命中。
+        // 归一化每一块 system 文本：折叠 CC 归因头（第一块，每请求漂移）+ 剥离环境噪音
+        // （<env> 块 / gitStatus / Recent commits / 模型名行等，每请求漂移）。
+        // 稳定住转发给上游的 prompt 前缀，避免 Bedrock prefix cache 因这些漂移而 0 命中，
+        // 同时省 token、降 CC 身份被关联风险。空块（整块被剥空）直接丢弃不参与拼接。
         let system_content: String = system
             .iter()
-            .map(|s| canonicalize_billing_header(&s.text).to_string())
+            .map(|s| canonicalize_system_text(&s.text).into_owned())
+            .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -1438,6 +1582,165 @@ mod tests {
             canonicalize_billing_header("x-anthropic-billing-header: cc_version=1;cch=x"),
             BILLING_HEADER_PLACEHOLDER
         );
+    }
+
+    // ===== 环境噪音剥离 prompt_filter =====
+
+    /// 环境噪音开关是进程级全局，测试并行会相互污染。用一把静态锁串行所有触碰该开关的
+    /// 用例，并在守卫里恢复原值，既消除竞态又不影响其它测试。
+    static ENV_NOISE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvNoiseGuard {
+        prev: bool,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl EnvNoiseGuard {
+        fn with(enabled: bool) -> Self {
+            let lock = ENV_NOISE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let prev = strip_env_noise_enabled();
+            set_strip_env_noise(enabled);
+            EnvNoiseGuard { prev, _lock: lock }
+        }
+        fn enable() -> Self {
+            Self::with(true)
+        }
+    }
+    impl Drop for EnvNoiseGuard {
+        fn drop(&mut self) {
+            set_strip_env_noise(self.prev);
+        }
+    }
+
+    #[test]
+    fn test_strip_env_noise_removes_env_block() {
+        let _g = EnvNoiseGuard::enable();
+        // <env> 块整块剥离，稳定正文保留
+        let text = "You are a helpful assistant.\n<env>\nWorking directory: /home/a\nPlatform: linux\nToday's date: 2026-07-09\n</env>\nFollow the task.";
+        let out = canonicalize_system_text(text);
+        assert!(!out.contains("<env>"), "env 起始标签应被剥离");
+        assert!(!out.contains("Working directory"), "cwd 行应被剥离");
+        assert!(!out.contains("Today's date"), "日期行应被剥离");
+        assert!(out.contains("You are a helpful assistant."), "稳定正文应保留");
+        assert!(out.contains("Follow the task."), "env 后正文应保留");
+    }
+
+    #[test]
+    fn test_strip_env_noise_removes_git_and_model_lines() {
+        let _g = EnvNoiseGuard::enable();
+        let text = "System prompt body.\ngitStatus: main clean\nRecent commits: abc123 fix\nYou are powered by the model named Claude.\nKeep going.";
+        let out = canonicalize_system_text(text);
+        assert!(!out.contains("gitStatus:"));
+        assert!(!out.contains("Recent commits:"));
+        assert!(!out.contains("powered by the model named"));
+        assert!(out.contains("System prompt body."));
+        assert!(out.contains("Keep going."));
+    }
+
+    #[test]
+    fn test_strip_env_noise_removes_environment_section() {
+        let _g = EnvNoiseGuard::enable();
+        // # Environment 段剥到下一个 # 标题为止，后续标题及正文保留
+        let text = "# Task\nDo the work.\n# Environment\nfoo\nbar\ngitStatus: x\n# Rules\nBe concise.";
+        let out = canonicalize_system_text(text);
+        assert!(out.contains("# Task"));
+        assert!(out.contains("Do the work."));
+        assert!(!out.contains("# Environment"));
+        assert!(!out.contains("foo"));
+        assert!(!out.contains("bar"));
+        assert!(out.contains("# Rules"), "环境段后的新标题应保留");
+        assert!(out.contains("Be concise."));
+    }
+
+    #[test]
+    fn test_strip_env_noise_stable_content_untouched() {
+        let _g = EnvNoiseGuard::enable();
+        // 纯稳定正文：无任何噪音标记 → 原样借用不改写
+        let text = "You are an expert engineer.\nWrite clean, tested code.\nExplain your reasoning.";
+        let out = canonicalize_system_text(text);
+        assert_eq!(out.as_ref(), text, "稳定正文一字节不改");
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)), "未改写应零分配借用");
+    }
+
+    #[test]
+    fn test_strip_env_noise_disabled_keeps_noise() {
+        // 开关关闭时不剥离环境噪音（但归因头折叠仍无条件生效）
+        let _g = EnvNoiseGuard::with(false);
+        let text = "Body.\ngitStatus: main\n<env>\ncwd\n</env>";
+        let out = canonicalize_system_text(text);
+        assert_eq!(out.as_ref(), text, "关闭时环境噪音应原样保留");
+    }
+
+    /// 关键回归：转发字节路径（canonicalize_system_text）与影子指纹路径
+    /// （cache_tracker::canonicalize_system_block_for_cache）对同一 system 块应产出一致文本。
+    #[test]
+    fn test_forward_and_shadow_canonicalization_consistent() {
+        let _g = EnvNoiseGuard::enable();
+        let raw = "You are a helpful assistant.\n<env>\nWorking directory: /x\nPlatform: linux\n</env>\ngitStatus: clean\nDo the task.";
+
+        // 转发路径：canonicalize_system_text 直接得到文本
+        let forwarded = canonicalize_system_text(raw).into_owned();
+
+        // 影子路径：cache_tracker 走 JSON text 块 → 调同一入口 → 写回 text
+        let mut block = serde_json::json!({ "type": "text", "text": raw });
+        super::super::cache_tracker::canonicalize_system_block_for_cache_for_test(&mut block);
+        let shadow = block["text"].as_str().unwrap().to_string();
+
+        assert_eq!(
+            forwarded, shadow,
+            "转发字节与影子指纹的归一化文本必须一致，否则记账与真实缓存脱节"
+        );
+        assert!(!forwarded.contains("Working directory"));
+        assert!(!forwarded.contains("gitStatus:"));
+    }
+
+    #[test]
+    fn test_env_noise_drift_produces_identical_forwarded_system() {
+        use super::super::types::{Message as AnthropicMessage, SystemMessage};
+        let _g = EnvNoiseGuard::enable();
+
+        // 两次请求：env 块里的 cwd/日期漂移，稳定正文相同
+        let mk = |env_line: &str| MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hi"),
+            }],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: format!(
+                    "You are Claude Code.\n<env>\n{}\nPlatform: win32\n</env>\nHelp the user.",
+                    env_line
+                ),
+                block_type: Some("text".to_string()),
+                cache_control: None,
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let req_a = mk("Working directory: /home/a  (2026-07-08)");
+        let req_b = mk("Working directory: /home/b  (2026-07-09)");
+
+        let extract = |req: &MessagesRequest| -> String {
+            let history =
+                build_history(req, &req.messages, "claude-sonnet-4.5", &mut HashMap::new())
+                    .unwrap();
+            match &history[0] {
+                Message::User(u) => u.user_input_message.content.clone(),
+                _ => panic!("首条历史应为 system 对应的 user 消息"),
+            }
+        };
+        let sys_a = extract(&req_a);
+        let sys_b = extract(&req_b);
+
+        assert_eq!(sys_a, sys_b, "env 漂移剥离后转发字节应一致");
+        assert!(!sys_a.contains("Working directory"), "漂移的 cwd 不应泄漏到转发字节");
+        assert!(sys_a.contains("Help the user."), "稳定正文应保留");
     }
 
     #[test]

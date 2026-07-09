@@ -24,7 +24,7 @@ use uuid::Uuid;
 use super::cache_tracker::{CacheProfile, CacheTracker};
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
-use super::stream::{BufferedStreamContext, CacheUsageBreakdown, SseEvent, StreamContext};
+use super::stream::{BufferedStreamContext, CacheUsageBreakdown, CompletionStatus, SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
 use super::websearch;
 
@@ -647,7 +647,8 @@ fn emit_stream_usage(
     record.credits_used = usage.credits_used;
     record.latency_ms = meta.latency_ms;
     record.retries = meta.retries;
-    record.outcome = crate::usage::RequestOutcome::Success;
+    // 去硬编码 Success：按本次响应的真实完成状态记账，避免截断/上游错误被记成成功污染熔断信号。
+    record.outcome = ctx.completion_outcome();
     client.apply(&mut record);
     crate::usage::emit_record(record);
 }
@@ -697,17 +698,36 @@ fn create_sse_stream(
                             }
 
                             let mut events = Vec::new();
+                            let mut last_decode_err: Option<String> = None;
                             for result in decoder.decode_iter() {
                                 match result {
                                     Ok(frame) => {
                                         if let Ok(event) = Event::from_frame(frame) {
+                                            // process_kiro_event 内部对 in-band Event::Error/Exception
+                                            // 会置 completion 失败态并内联返回 SSE error 事件。
                                             let sse_events = ctx.process_kiro_event(&event);
                                             events.extend(sse_events);
                                         }
                                     }
                                     Err(e) => {
+                                        last_decode_err = Some(e.to_string());
                                         tracing::warn!("解码事件失败: {}", e);
                                     }
+                                }
+                            }
+
+                            // 解码器连续错误超限而永久停止：响应必然截断，置失败态供收尾记账，
+                            // 并内联补发一个 SSE error 事件（若尚未发过），避免截断被当成功。
+                            if decoder.is_stopped() {
+                                ctx.mark_decoder_stopped(
+                                    last_decode_err.unwrap_or_else(|| "解码器连续错误已停止".to_string()),
+                                );
+                                if !ctx.error_event_emitted() {
+                                    events.push(SseEvent::error_event(
+                                        ctx.completion().sse_error_type(),
+                                        ctx.completion().client_message(),
+                                    ));
+                                    ctx.mark_error_event_emitted();
                                 }
                             }
 
@@ -721,12 +741,19 @@ fn create_sse_stream(
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
-                            // 上游流中途失败：先发一个 SSE error 事件显式告知客户端"本次未正常完成"，
-                            // 再补最终事件收尾。否则 Claude Code 会把截断输出当作正常 message_stop=成功，不重试。
-                            let mut events = vec![SseEvent::error_event(
-                                "api_error",
-                                format!("上游响应流中断: {}", e),
-                            )];
+                            // 上游流中途失败：置传输失败态（供收尾按 NetworkError 记账），
+                            // 先发一个 SSE error 事件显式告知客户端"本次未正常完成"，再补最终事件收尾。
+                            // 否则 Claude Code 会把截断输出当作正常 message_stop=成功，不重试。
+                            // 幂等：若 in-band 错误已置过失败态，mark_transport_error 会保留首因。
+                            ctx.mark_transport_error(e.to_string());
+                            let mut events = Vec::new();
+                            if !ctx.error_event_emitted() {
+                                events.push(SseEvent::error_event(
+                                    ctx.completion().sse_error_type(),
+                                    ctx.completion().client_message(),
+                                ));
+                                ctx.mark_error_event_emitted();
+                            }
                             events.extend(ctx.generate_final_events());
                             let bytes: Vec<Result<Bytes, Infallible>> = events
                                 .into_iter()
@@ -736,8 +763,18 @@ fn create_sse_stream(
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, meta, client)))
                         }
                         None => {
-                            // 流结束，发送最终事件
-                            let final_events = ctx.generate_final_events();
+                            // 流结束，发送最终事件。
+                            // 兜底：若本次完成状态为失败（in-band 错误/解码器停止）但尚未发过 error 事件，
+                            // 在收尾处补发，确保客户端不把截断输出当成功。
+                            let mut final_events = Vec::new();
+                            if !ctx.completion().is_ok() && !ctx.error_event_emitted() {
+                                final_events.push(SseEvent::error_event(
+                                    ctx.completion().sse_error_type(),
+                                    ctx.completion().client_message(),
+                                ));
+                                ctx.mark_error_event_emitted();
+                            }
+                            final_events.extend(ctx.generate_final_events());
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -813,11 +850,15 @@ async fn handle_non_stream_request(
     let mut context_input_tokens: Option<i32> = None;
     // 从 meteringEvent 解析的真实 credit 消耗量
     let mut credits_used: Option<f64> = None;
+    // 本次响应的完成状态：默认 Ok，遇 in-band 错误/异常/解码器停止置失败态。
+    // 收尾据此决定 HTTP 码与用量记账 outcome，避免截断输出被当成 200 成功。
+    let mut completion = CompletionStatus::Ok;
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
 
+    let mut last_decode_err: Option<String> = None;
     for result in decoder.decode_iter() {
         match result {
             Ok(frame) => {
@@ -884,9 +925,28 @@ async fn handle_non_stream_request(
                         Event::Metering(metering) => {
                             credits_used = Some(credits_used.unwrap_or(0.0) + metering.usage);
                         }
-                        Event::Exception { exception_type, .. } => {
+                        Event::Exception { exception_type, message } => {
+                            // 铁律：ContentLengthExceededException = max_tokens 干净收尾，绝不算失败。
                             if exception_type == "ContentLengthExceededException" {
                                 stop_reason = "max_tokens".to_string();
+                            } else if completion.is_ok() {
+                                // 其它异常是上游真实失败，置失败态（保留首因）。
+                                tracing::error!("非流式收到 in-band 异常: {} - {}", exception_type, message);
+                                completion = CompletionStatus::UpstreamError {
+                                    code: exception_type,
+                                    message,
+                                };
+                            }
+                        }
+                        Event::Error { error_code, error_message } => {
+                            // in-band 错误事件：落入历史的 `_ => {}` 会被静默忽略、照样返回 200，
+                            // 这里显式置失败态，收尾时返回非 200 并按真实 outcome 记账。
+                            if completion.is_ok() {
+                                tracing::error!("非流式收到 in-band 错误: {} - {}", error_code, error_message);
+                                completion = CompletionStatus::UpstreamError {
+                                    code: error_code,
+                                    message: error_message,
+                                };
                             }
                         }
                         _ => {}
@@ -894,9 +954,46 @@ async fn handle_non_stream_request(
                 }
             }
             Err(e) => {
+                last_decode_err = Some(e.to_string());
                 tracing::warn!("解码事件失败: {}", e);
             }
         }
+    }
+
+    // 解码器永久停止：单 feed 中途连续错误超限，后续帧必然丢失、响应截断。
+    if decoder.is_stopped() && completion.is_ok() {
+        completion = CompletionStatus::DecoderStopped {
+            message: last_decode_err.unwrap_or_else(|| "解码器连续错误已停止".to_string()),
+        };
+    }
+
+    // 完成状态为失败：直接返回非 200 错误响应 + 埋点真实 outcome，绝不把截断输出当 200 成功。
+    // （ContentLengthExceededException 走的是 max_tokens，completion 仍为 Ok，不进此分支。）
+    if !completion.is_ok() {
+        {
+            let mut record = crate::usage::RequestRecord::new(
+                Uuid::new_v4().to_string(),
+                meta.model.clone().unwrap_or_else(|| model.to_string()),
+            );
+            record.credential_id = Some(meta.credential_id);
+            record.session_id = meta.session_id.clone();
+            record.is_streaming = meta.is_streaming;
+            record.input_tokens = context_input_tokens.unwrap_or(input_tokens);
+            record.credits_used = credits_used;
+            record.latency_ms = meta.latency_ms;
+            record.retries = meta.retries;
+            record.outcome = completion.outcome();
+            client.apply(&mut record);
+            crate::usage::emit_record(record);
+        }
+        let status = StatusCode::from_u16(completion.http_status_u16())
+            .unwrap_or(StatusCode::BAD_GATEWAY);
+        let sse_error_type = completion.sse_error_type();
+        return (
+            status,
+            Json(ErrorResponse::new(sse_error_type, completion.client_message())),
+        )
+            .into_response();
     }
 
     // 确定 stop_reason
@@ -972,7 +1069,8 @@ async fn handle_non_stream_request(
         record.credits_used = credits_used;
         record.latency_ms = meta.latency_ms;
         record.retries = meta.retries;
-        record.outcome = crate::usage::RequestOutcome::Success;
+        // 去硬编码：此处 completion 必为 Ok（失败已在上方 early-return），显式读取以统一口径。
+        record.outcome = completion.outcome();
         client.apply(&mut record);
         crate::usage::emit_record(record);
     }
@@ -1305,29 +1403,44 @@ fn create_buffered_sse_stream(
                                     tracing::warn!("缓冲区溢出: {}", e);
                                 }
 
+                                let mut last_decode_err: Option<String> = None;
                                 for result in decoder.decode_iter() {
                                     match result {
                                         Ok(frame) => {
                                             if let Ok(event) = Event::from_frame(frame) {
-                                                // 缓冲事件（复用 StreamContext 的处理逻辑）
+                                                // 缓冲事件（复用 StreamContext 的处理逻辑）。
+                                                // in-band Event::Error/Exception 会在此置 completion 失败态。
                                                 ctx.process_and_buffer(&event);
                                             }
                                         }
                                         Err(e) => {
+                                            last_decode_err = Some(e.to_string());
                                             tracing::warn!("解码事件失败: {}", e);
                                         }
                                     }
+                                }
+                                // 解码器永久停止：响应必然截断，置失败态供收尾记账。
+                                if decoder.is_stopped() {
+                                    ctx.mark_decoder_stopped(
+                                        last_decode_err.unwrap_or_else(|| "解码器连续错误已停止".to_string()),
+                                    );
                                 }
                                 // 继续读取下一个 chunk，不发送任何数据
                             }
                             Some(Err(e)) => {
                                 tracing::error!("读取响应流失败: {}", e);
-                                // 上游流中途失败：先发 SSE error 事件显式告知"本次未正常完成"，
-                                // 再补齐已缓冲事件收尾。否则 Claude Code 把截断输出当成功、不重试。
-                                let mut all_events = vec![SseEvent::error_event(
-                                    "api_error",
-                                    format!("上游响应流中断: {}", e),
-                                )];
+                                // 上游流中途失败：置传输失败态（供收尾按 NetworkError 记账），
+                                // 先发 SSE error 事件显式告知"本次未正常完成"，再补齐已缓冲事件收尾。
+                                // 否则 Claude Code 把截断输出当成功、不重试。幂等保留首因。
+                                ctx.mark_transport_error(e.to_string());
+                                let mut all_events = Vec::new();
+                                if !ctx.error_event_emitted() {
+                                    all_events.push(SseEvent::error_event(
+                                        ctx.completion().sse_error_type(),
+                                        ctx.completion().client_message(),
+                                    ));
+                                    ctx.mark_error_event_emitted();
+                                }
                                 all_events.extend(ctx.finish_and_get_all_events());
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
@@ -1337,8 +1450,18 @@ fn create_buffered_sse_stream(
                                 return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, meta, client)));
                             }
                             None => {
-                                // 流结束，完成处理并返回所有事件（已更正 input_tokens）
-                                let all_events = ctx.finish_and_get_all_events();
+                                // 流结束，完成处理并返回所有事件（已更正 input_tokens）。
+                                // 兜底：完成状态为失败（in-band 错误/解码器停止）但尚未发过 error 事件时，
+                                // 在收尾处补发一个 error 事件，确保客户端不把截断输出当成功。
+                                let mut all_events = Vec::new();
+                                if !ctx.completion().is_ok() && !ctx.error_event_emitted() {
+                                    all_events.push(SseEvent::error_event(
+                                        ctx.completion().sse_error_type(),
+                                        ctx.completion().client_message(),
+                                    ));
+                                    ctx.mark_error_event_emitted();
+                                }
+                                all_events.extend(ctx.finish_and_get_all_events());
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -1376,7 +1499,8 @@ fn emit_buffered_usage(
     record.credits_used = usage.credits_used;
     record.latency_ms = meta.latency_ms;
     record.retries = meta.retries;
-    record.outcome = crate::usage::RequestOutcome::Success;
+    // 去硬编码 Success：按真实完成状态记账（截断/上游错误不再被记成成功）。
+    record.outcome = ctx.completion_outcome();
     client.apply(&mut record);
     crate::usage::emit_record(record);
 }
@@ -1421,5 +1545,135 @@ mod tier3_hotreload_tests {
         );
         // 复位默认，避免影响其它测试
         set_compression(CompressionConfig::default());
+    }
+}
+
+#[cfg(test)]
+mod truncation_completion_tests {
+    //! 「截断即成功」修复回归：验证非流式收尾逻辑依赖的
+    //! 解码 → CompletionStatus → HTTP 状态码 链路。
+    //!
+    //! 非流式 handler 与实盘 provider 强耦合，无法在单测里跑完整请求；
+    //! 这里用**真实构造的 event-stream 帧**驱动 handler 内部同一套解码 + 事件分类逻辑，
+    //! 断言 in-band error 帧会被识别为失败态，且映射到非 200。
+    use super::*;
+    use crate::kiro::parser::crc::crc32;
+
+    /// 构造一个带指定 message-type / 头部 / payload 的 event-stream 帧。
+    ///
+    /// 头部编码：name_len(1) + name + type(7=String) + value_len(2) + value。
+    fn build_frame(headers: &[(&str, &str)], payload: &[u8]) -> Vec<u8> {
+        let mut header_bytes = Vec::new();
+        for (name, value) in headers {
+            header_bytes.push(name.len() as u8);
+            header_bytes.extend_from_slice(name.as_bytes());
+            header_bytes.push(7u8); // String
+            header_bytes.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            header_bytes.extend_from_slice(value.as_bytes());
+        }
+        let header_length = header_bytes.len() as u32;
+        let total_length = (PRELUDE_SIZE + header_bytes.len() + payload.len() + 4) as u32;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&total_length.to_be_bytes());
+        buf.extend_from_slice(&header_length.to_be_bytes());
+        let prelude_crc = crc32(&buf[..8]);
+        buf.extend_from_slice(&prelude_crc.to_be_bytes());
+        buf.extend_from_slice(&header_bytes);
+        buf.extend_from_slice(payload);
+        let msg_crc = crc32(&buf);
+        buf.extend_from_slice(&msg_crc.to_be_bytes());
+        buf
+    }
+
+    // 引入 PRELUDE_SIZE
+    use crate::kiro::parser::frame::PRELUDE_SIZE;
+
+    /// 复刻非流式 handler 的解码收尾判定：drain 全部帧，遇 in-band error/非 CL 异常/
+    /// 解码器停止置失败态，返回最终 CompletionStatus。
+    fn decode_to_completion(data: &[u8]) -> CompletionStatus {
+        let mut decoder = EventStreamDecoder::new();
+        decoder.feed(data).unwrap();
+
+        let mut completion = CompletionStatus::Ok;
+        let mut last_err: Option<String> = None;
+        for result in decoder.decode_iter() {
+            match result {
+                Ok(frame) => {
+                    if let Ok(event) = Event::from_frame(frame) {
+                        match event {
+                            Event::Error { error_code, error_message } => {
+                                if completion.is_ok() {
+                                    completion = CompletionStatus::UpstreamError {
+                                        code: error_code,
+                                        message: error_message,
+                                    };
+                                }
+                            }
+                            Event::Exception { exception_type, message } => {
+                                if exception_type != "ContentLengthExceededException"
+                                    && completion.is_ok()
+                                {
+                                    completion = CompletionStatus::UpstreamError {
+                                        code: exception_type,
+                                        message,
+                                    };
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Err(e) => last_err = Some(e.to_string()),
+            }
+        }
+        if decoder.is_stopped() && completion.is_ok() {
+            completion = CompletionStatus::DecoderStopped {
+                message: last_err.unwrap_or_default(),
+            };
+        }
+        completion
+    }
+
+    #[test]
+    fn test_inband_error_frame_maps_to_non_200() {
+        // 回归 BUG①：in-band error 帧过去落入 `_ => {}` 被忽略、照返 200。
+        // 现在应被识别为 UpstreamError，映射非 200。
+        let frame = build_frame(
+            &[(":message-type", "error"), (":error-code", "InternalServerException")],
+            b"upstream exploded",
+        );
+        let completion = decode_to_completion(&frame);
+
+        assert!(!completion.is_ok(), "in-band error 帧应被识别为失败");
+        assert_ne!(completion.http_status_u16(), 200, "失败必须返回非 200");
+        assert_eq!(completion.http_status_u16(), 502);
+        assert_eq!(completion.outcome(), crate::usage::RequestOutcome::ServerError);
+    }
+
+    #[test]
+    fn test_inband_throttling_error_frame_maps_to_429() {
+        let frame = build_frame(
+            &[(":message-type", "error"), (":error-code", "ThrottlingException")],
+            b"slow down",
+        );
+        let completion = decode_to_completion(&frame);
+        assert_eq!(completion.http_status_u16(), 429);
+        assert_eq!(completion.outcome(), crate::usage::RequestOutcome::RateLimited);
+    }
+
+    #[test]
+    fn test_content_length_exception_frame_stays_ok() {
+        // 铁律：ContentLengthExceededException 干净收尾，不算失败，仍走 200。
+        let frame = build_frame(
+            &[
+                (":message-type", "exception"),
+                (":exception-type", "ContentLengthExceededException"),
+            ],
+            b"max tokens reached",
+        );
+        let completion = decode_to_completion(&frame);
+        assert!(completion.is_ok(), "CL 异常不应被判为失败");
+        assert_eq!(completion.outcome(), crate::usage::RequestOutcome::Success);
     }
 }
