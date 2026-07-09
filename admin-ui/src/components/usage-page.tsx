@@ -1,4 +1,4 @@
-import { useMemo, useState, useEffect, useRef } from 'react'
+import { Fragment, useMemo, useState, useEffect, useRef } from 'react'
 import { createPortal } from 'react-dom'
 import {
   Activity,
@@ -747,9 +747,8 @@ function RecentTable({ rows }: { rows: RequestRecord[] }) {
           {rows.map((r) => {
             const open = expandedIds.has(r.request_id)
             return (
-              <>
+              <Fragment key={r.request_id}>
                 <tr
-                  key={r.request_id}
                   className={`cursor-pointer border-b border-border/40 transition-colors last:border-0 hover:bg-secondary/40 ${open ? 'bg-secondary/60' : ''}`}
                   onClick={() => toggleRow(r.request_id)}
                   onContextMenu={(e) => { e.preventDefault(); setPopover({ record: r, x: e.pageX, y: e.pageY }) }}
@@ -771,13 +770,13 @@ function RecentTable({ rows }: { rows: RequestRecord[] }) {
                   <td className="py-2 text-right tabular-nums text-muted-foreground">{r.latency_ms}ms</td>
                 </tr>
                 {open && (
-                  <tr key={`${r.request_id}-detail`} className="border-b border-border/40 bg-secondary/20">
+                  <tr className="border-b border-border/40 bg-secondary/20">
                     <td colSpan={7} className="px-3 py-3">
                       <RequestDetailSpread record={r} />
                     </td>
                   </tr>
                 )}
-              </>
+              </Fragment>
             )
           })}
         </tbody>
