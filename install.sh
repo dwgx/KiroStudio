@@ -126,19 +126,17 @@ fi
 step "写入环境与配置文件"
 
 ENV_FILE="$SCRIPT_DIR/.env"
-if [ -f "$ENV_FILE" ] && grep -qE '^KIROSTUDIO_PORT=' "$ENV_FILE" 2>/dev/null; then
-  # 已有 .env 则就地更新端口，保留其他自定义项
-  if grep -qE "^KIROSTUDIO_PORT=$PORT$" "$ENV_FILE"; then
-    info ".env 端口已是 $PORT，跳过"
-  else
-    tmp="$(mktemp)"
-    sed "s/^KIROSTUDIO_PORT=.*/KIROSTUDIO_PORT=$PORT/" "$ENV_FILE" > "$tmp" && mv "$tmp" "$ENV_FILE"
-    info "已更新 .env 端口为 $PORT"
-  fi
-else
-  printf 'KIROSTUDIO_PORT=%s\n' "$PORT" > "$ENV_FILE"
-  info "已写入 .env（端口 $PORT）"
-fi
+# 容器以宿主当前 uid:gid 运行,才能读到 bind-mount 的 0600 config(容器内 USER app 的 uid
+# 与宿主文件 owner 不符会 Permission denied 崩溃循环)。Linux 取真实 uid/gid;取不到则 0(root)兜底。
+HOST_UID="$(id -u 2>/dev/null || echo 0)"
+HOST_GID="$(id -g 2>/dev/null || echo 0)"
+# 每次重写 .env(端口 + uid/gid),简单可靠;这三项无敏感信息。
+cat > "$ENV_FILE" <<EOF
+KIROSTUDIO_PORT=$PORT
+KIROSTUDIO_UID=$HOST_UID
+KIROSTUDIO_GID=$HOST_GID
+EOF
+info "已写入 .env（端口 $PORT，运行 uid:gid $HOST_UID:$HOST_GID）"
 
 # ---- 5. 生成 config/config.json（幂等：已存在不覆盖）----
 mkdir -p "$CONFIG_DIR"
