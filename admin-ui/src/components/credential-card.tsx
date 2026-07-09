@@ -666,32 +666,32 @@ export function CredentialCard({
           </div>
         </CardContent>
       </Card>
-      {/* 设置对话框：集中优先级 / 启用禁用 / 删除 */}
+      {/* 设置对话框：集中别名/代理/超额/优先级/RPM/启用/删除。
+          紧凑化：调度参数与开关双列并排、次要项(删除)收进底部危险区、
+          弹框限高 max-h 内部滚动而非整页滚。 */}
       <Dialog open={showSettings} onOpenChange={setShowSettings}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>
+        {/* flex 纵向 + p-0：头/尾固定，中段 body 独立滚动；限高 85vh 防超屏。 */}
+        <DialogContent className="flex max-h-[85vh] flex-col gap-0 p-0">
+          <DialogHeader className="shrink-0 border-b px-5 py-4">
+            <DialogTitle className="truncate">
               凭据设置 · #{credential.id}
               {credential.email ? ` · ${credential.email}` : ''}
             </DialogTitle>
-            <DialogDescription>调整优先级、启用状态，或删除此凭据。</DialogDescription>
+            <DialogDescription>别名 / 代理 / 超额 / 优先级 / RPM / 启用 / 删除。</DialogDescription>
           </DialogHeader>
 
-          <div className="space-y-5 py-1">
+          {/* 可滚动内容区：内容超高时仅此区域滚动 */}
+          <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">
             {/* 别名/备注：自定义卡片标题，留空清除后回落 email/#id */}
-            <div className="space-y-2">
-              <div className="min-w-0">
-                <div className="text-sm font-medium">别名 / 备注</div>
-                <div className="text-xs text-muted-foreground">
-                  卡片标题优先显示别名；留空并保存即清除，回落到邮箱或 #{credential.id}
-                </div>
-              </div>
+            <div className="space-y-1.5">
+              <label className="text-sm font-medium">别名 / 备注</label>
               <div className="flex items-center gap-2">
                 <Input
                   value={nameValue}
                   onChange={(e) => setNameValue(e.target.value)}
-                  placeholder="例如：主力号 / 备用 / 客户A"
+                  placeholder="留空清除，回落邮箱 / #id"
                   maxLength={64}
+                  className="h-9"
                   aria-label="别名或备注"
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' && !savingName) handleSaveName()
@@ -699,7 +699,7 @@ export function CredentialCard({
                 />
                 <Button
                   size="sm"
-                  className="shrink-0"
+                  className="h-9 shrink-0"
                   onClick={handleSaveName}
                   disabled={savingName || nameValue.trim() === (credential.name ?? '')}
                 >
@@ -714,42 +714,22 @@ export function CredentialCard({
             </div>
 
             {/* 单凭证代理：URL 留空=回退全局代理，"direct"=强制不走代理；账密留空=不改。立即生效无需重启。 */}
-            <div className="space-y-2">
-              <div className="min-w-0">
-                <div className="text-sm font-medium">代理</div>
-                <div className="text-xs text-muted-foreground">
-                  http(s)/socks5://host:port，可账密内嵌 URL（socks5://用户:密码@主机:端口）自动识别拆分。
-                  留空=用全局代理，“direct”=此号不走代理。保存后下次请求生效。
-                </div>
-              </div>
-              <Input
-                value={proxyValue}
-                onChange={(e) => setProxyValue(e.target.value)}
-                placeholder='例如 socks5://127.0.0.1:1080 或 direct'
-                className="font-mono text-xs"
-                aria-label="代理 URL"
-              />
+            <div className="space-y-1.5 border-t pt-4">
+              <label className="text-sm font-medium">代理</label>
+              <p className="text-xs text-muted-foreground">
+                留空=全局，“direct”=不走代理，可账密内嵌 URL 自动拆分。下次请求生效。
+              </p>
               <div className="flex items-center gap-2">
                 <Input
-                  value={proxyUser}
-                  onChange={(e) => setProxyUser(e.target.value)}
-                  placeholder="代理用户名（留空不改）"
-                  className="text-xs"
-                  autoComplete="off"
-                  aria-label="代理用户名"
-                />
-                <Input
-                  type="password"
-                  value={proxyPass}
-                  onChange={(e) => setProxyPass(e.target.value)}
-                  placeholder="代理密码（留空不改）"
-                  className="text-xs"
-                  autoComplete="new-password"
-                  aria-label="代理密码"
+                  value={proxyValue}
+                  onChange={(e) => setProxyValue(e.target.value)}
+                  placeholder="socks5://127.0.0.1:1080 或 direct"
+                  className="h-9 font-mono text-xs"
+                  aria-label="代理 URL"
                 />
                 <Button
                   size="sm"
-                  className="shrink-0"
+                  className="h-9 shrink-0"
                   onClick={handleSaveProxy}
                   disabled={savingProxy}
                 >
@@ -757,27 +737,98 @@ export function CredentialCard({
                   <span className="ml-1">保存</span>
                 </Button>
               </div>
+              {/* 代理账号 + 密码并排一行 */}
+              <div className="grid grid-cols-2 gap-2">
+                <Input
+                  value={proxyUser}
+                  onChange={(e) => setProxyUser(e.target.value)}
+                  placeholder="用户名（留空不改）"
+                  className="h-9 text-xs"
+                  autoComplete="off"
+                  aria-label="代理用户名"
+                />
+                <Input
+                  type="password"
+                  value={proxyPass}
+                  onChange={(e) => setProxyPass(e.target.value)}
+                  placeholder="密码（留空不改）"
+                  className="h-9 text-xs"
+                  autoComplete="new-password"
+                  aria-label="代理密码"
+                />
+              </div>
             </div>
 
-            {/* 超额（Overage）：接后端真开关，开启前二次确认（按量付费）。已从卡片主体移入此设置弹框。 */}
-            <div className="flex items-center justify-between gap-4 border-t pt-4">
-              <div className="flex min-w-0 items-center gap-2">
-                <Gauge className="h-4 w-4 shrink-0 text-muted-foreground" />
-                <div className="min-w-0">
-                  <div className="text-sm font-medium">超额（Overage）</div>
-                  <div className="text-xs text-muted-foreground">
-                    {overageEnabled
-                      ? '已开启 · 用尽 base 额度后按真实用量付费'
-                      : '关闭时不突破 base 额度；开启后超量按量付费'}
-                  </div>
+            {/* 调度参数：优先级 + RPM 容量并排两列，各自独立步进器 + 保存 */}
+            <div className="grid grid-cols-2 gap-3 border-t pt-4">
+              <div className="space-y-1.5">
+                <div className="text-sm font-medium">优先级</div>
+                <div className="text-xs text-muted-foreground">越小越优先</div>
+                <div className="flex items-center gap-1.5">
+                  <NumberStepper
+                    value={priorityValue}
+                    onChange={setPriorityValue}
+                    min={0}
+                    className="w-full"
+                    aria-label="优先级"
+                  />
+                  <Button
+                    size="sm"
+                    className="h-9 shrink-0 px-2"
+                    onClick={handlePriorityChange}
+                    disabled={setPriority.isPending || priorityValue === credential.priority}
+                    title="保存优先级"
+                  >
+                    {setPriority.isPending ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Check className="h-4 w-4" />
+                    )}
+                  </Button>
                 </div>
               </div>
-              <div className="flex shrink-0 items-center gap-2">
-                {overageEnabled != null && (
-                  <Badge variant={overageEnabled ? 'success' : 'secondary'}>
-                    {overageEnabled ? '开' : '关'}
-                  </Badge>
-                )}
+              <div className="space-y-1.5">
+                <div className="text-sm font-medium">RPM 容量</div>
+                <div className="text-xs text-muted-foreground">0=继承全局</div>
+                <div className="flex items-center gap-1.5">
+                  <NumberStepper
+                    value={rpmLimitValue}
+                    onChange={setRpmLimitValue}
+                    min={0}
+                    step={10}
+                    className="w-full"
+                    aria-label="RPM 容量上限"
+                  />
+                  <Button
+                    size="sm"
+                    className="h-9 shrink-0 px-2"
+                    onClick={handleRpmLimitChange}
+                    disabled={setRpmLimit.isPending || rpmLimitValue === (credential.rpmLimit ?? 0)}
+                    title="保存 RPM 容量"
+                  >
+                    {setRpmLimit.isPending ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Check className="h-4 w-4" />
+                    )}
+                  </Button>
+                </div>
+              </div>
+            </div>
+
+            {/* 开关组：超额 + 启用凭据并排两列，紧凑卡片式 */}
+            <div className="grid grid-cols-2 gap-3 border-t pt-4">
+              {/* 超额（Overage）：接后端真开关，开启前二次确认（按量付费）。 */}
+              <div className="flex items-center justify-between gap-2 rounded-md border bg-secondary/30 px-3 py-2.5">
+                <div className="flex min-w-0 items-center gap-1.5">
+                  <Gauge className="h-4 w-4 shrink-0 text-muted-foreground" />
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium">超额</div>
+                    <div className="truncate text-xs text-muted-foreground">
+                      {overageEnabled ? '按量付费' : '不突破 base'}
+                    </div>
+                  </div>
+                </div>
                 <Switch
                   checked={!!overageEnabled}
                   disabled={overageBusy}
@@ -785,111 +836,53 @@ export function CredentialCard({
                   aria-label="超额开关"
                 />
               </div>
+              {/* 启用 / 禁用 */}
+              <div className="flex items-center justify-between gap-2 rounded-md border bg-secondary/30 px-3 py-2.5">
+                <div className="flex min-w-0 items-center gap-1.5">
+                  <Power className="h-4 w-4 shrink-0 text-muted-foreground" />
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium">启用</div>
+                    <div className="truncate text-xs text-muted-foreground">
+                      {credential.disabled ? '已禁用' : '调度中'}
+                    </div>
+                  </div>
+                </div>
+                <Switch
+                  checked={!credential.disabled}
+                  onCheckedChange={handleToggleDisabled}
+                  disabled={setDisabled.isPending}
+                  aria-label="启用凭据"
+                />
+              </div>
             </div>
 
-            {/* 优先级：输入框（数字步进器）替代旧“点击编辑” */}
-            <div className="flex items-center justify-between gap-4 border-t pt-4">
-              <div className="min-w-0">
-                <div className="text-sm font-medium">优先级</div>
-                <div className="text-xs text-muted-foreground">数值越小越优先被调度</div>
-              </div>
-              <div className="flex shrink-0 items-center gap-2">
-                <NumberStepper
-                  value={priorityValue}
-                  onChange={setPriorityValue}
-                  min={0}
-                  className="w-24"
-                  aria-label="优先级"
-                />
+            {/* 危险区：删除凭据收进底部，红色描边区隔，需先禁用 */}
+            <div className="space-y-2 rounded-md border border-destructive/30 bg-destructive/[0.04] px-3 py-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-sm font-medium text-destructive">删除凭据</div>
+                  <div className="text-xs text-muted-foreground">移入回收站，不可恢复。需先禁用。</div>
+                </div>
                 <Button
                   size="sm"
-                  onClick={handlePriorityChange}
-                  disabled={setPriority.isPending || priorityValue === credential.priority}
+                  variant="destructive"
+                  className="h-9 shrink-0"
+                  onClick={() => setShowDeleteDialog(true)}
+                  disabled={!credential.disabled}
+                  title={!credential.disabled ? '需要先禁用凭据才能删除' : undefined}
                 >
-                  {setPriority.isPending ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <Check className="h-4 w-4" />
-                  )}
-                  <span className="ml-1">保存</span>
+                  <Trash2 className="h-4 w-4 mr-1" />
+                  删除
                 </Button>
               </div>
+              {!credential.disabled && (
+                <p className="text-xs text-amber-500">提示：删除前请先在上方关闭“启用”。</p>
+              )}
             </div>
-
-            {/* RPM 容量上限：本号每分钟请求容量，0=继承全局。体质好的号可设高（如 100）。 */}
-            <div className="flex items-center justify-between gap-4 border-t pt-4">
-              <div className="min-w-0">
-                <div className="text-sm font-medium">RPM 容量上限</div>
-                <div className="text-xs text-muted-foreground">
-                  每分钟请求容量，0=继承全局。体质好的号可设高（如 100），达上限才溢出到低优先级备份号。
-                </div>
-              </div>
-              <div className="flex shrink-0 items-center gap-2">
-                <NumberStepper
-                  value={rpmLimitValue}
-                  onChange={setRpmLimitValue}
-                  min={0}
-                  step={10}
-                  className="w-24"
-                  aria-label="RPM 容量上限"
-                />
-                <Button
-                  size="sm"
-                  onClick={handleRpmLimitChange}
-                  disabled={setRpmLimit.isPending || rpmLimitValue === (credential.rpmLimit ?? 0)}
-                >
-                  {setRpmLimit.isPending ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <Check className="h-4 w-4" />
-                  )}
-                  <span className="ml-1">保存</span>
-                </Button>
-              </div>
-            </div>
-
-            {/* 启用 / 禁用 */}
-            <div className="flex items-center justify-between gap-4 border-t pt-4">
-              <div className="min-w-0">
-                <div className="text-sm font-medium">启用凭据</div>
-                <div className="text-xs text-muted-foreground">
-                  {credential.disabled ? '当前已禁用，不参与调度' : '当前启用中'}
-                </div>
-              </div>
-              <Switch
-                checked={!credential.disabled}
-                onCheckedChange={handleToggleDisabled}
-                disabled={setDisabled.isPending}
-                aria-label="启用凭据"
-              />
-            </div>
-
-            {/* 删除（危险） */}
-            <div className="flex items-center justify-between gap-4 border-t pt-4">
-              <div className="min-w-0">
-                <div className="text-sm font-medium text-destructive">删除凭据</div>
-                <div className="text-xs text-muted-foreground">
-                  移入回收站，不可恢复地删除。需先禁用。
-                </div>
-              </div>
-              <Button
-                size="sm"
-                variant="destructive"
-                onClick={() => setShowDeleteDialog(true)}
-                disabled={!credential.disabled}
-                title={!credential.disabled ? '需要先禁用凭据才能删除' : undefined}
-              >
-                <Trash2 className="h-4 w-4 mr-1" />
-                删除
-              </Button>
-            </div>
-            {!credential.disabled && (
-              <p className="text-xs text-amber-500">提示：删除前请先在上方关闭“启用凭据”。</p>
-            )}
           </div>
 
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setShowSettings(false)}>
+          <DialogFooter className="shrink-0 border-t px-5 py-3">
+            <Button variant="outline" size="sm" onClick={() => setShowSettings(false)}>
               关闭
             </Button>
           </DialogFooter>

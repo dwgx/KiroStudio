@@ -4,7 +4,7 @@ import { Card } from '@/components/ui/card'
 import { StatCard } from '@/components/ui/stat-card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useCredentials, useCachedBalances } from '@/hooks/use-credentials'
-import { useUsageOverview, useUsageTimeseries, useUsageRecentLive, useRatelimitInsights } from '@/hooks/use-usage'
+import { useUsageOverview, useUsageTimeseries, useUsageRecentLive, useRatelimitInsights, useUsageCache } from '@/hooks/use-usage'
 import { Sparkline } from '@/components/overview/Sparkline'
 import { RadialGauge } from '@/components/overview/RadialGauge'
 import { SegmentedBar } from '@/components/overview/SegmentedBar'
@@ -13,6 +13,7 @@ import { RankBars } from '@/components/overview/RankBars'
 import { GlowGrid } from '@/components/overview/GlowGrid'
 import { StatusBars } from '@/components/overview/StatusBars'
 import { AreaTrendChart } from '@/components/overview/AreaTrendChart'
+import { CacheStatsCard } from '@/components/overview/CacheStatsCard'
 import { authLabel } from '@/lib/i18n-labels'
 import type { CredentialStatusItem, SeriesPoint, RateLimitInsight } from '@/types/api'
 
@@ -332,6 +333,8 @@ export function OverviewPage() {
   const recent = useUsageRecentLive(60)
   // 限流健康 insights（10s 轮询，只读内存零上游）。
   const insights = useRatelimitInsights()
+  // 影子缓存命中率快照（30s 轮询，读进程级计数零上游）。
+  const cacheStats = useUsageCache()
   // 火力全开号集合（RPM 饱和）：状态条据此点燃 WebGL 火焰。同时通常仅 1-2 个。
   const saturatedIds = useMemo(
     () => new Set((insights.data ?? []).filter((it) => it.rpmSaturated).map((it) => it.id)),
@@ -631,6 +634,10 @@ export function OverviewPage() {
           )}
         </Card>
       )}
+
+      {/* Row 2.6：缓存命中 —— 命中率环形 + 读/写 token 分布 + 省下输入 token。
+          缓存记账独立于用量统计开关（后端 /usage/cache 不走 usage_enabled），故不受 usageDisabled 影响。 */}
+      <CacheStatsCard data={cacheStats.data} loading={cacheStats.isLoading} />
 
       {/* Row 3：左健康 / 右鉴权 + 榜单 */}
       <div className="grid gap-4 lg:grid-cols-2">

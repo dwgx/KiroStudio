@@ -1,8 +1,7 @@
 import { useMemo } from 'react'
 import type { CredentialStatusItem, CachedBalanceItem } from '@/types/api'
-import { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider } from '@/components/ui/tooltip'
 import type { CellActivity } from '@/components/overview/StatusHeatmap'
-import { healthOf, HEALTH_RGB, CredTooltipBody, EmptyPool } from '@/components/overview/credViz'
+import { healthOf, HEALTH_RGB, EmptyPool, useHoverCard } from '@/components/overview/credViz'
 import { useCachedBalances } from '@/hooks/use-credentials'
 import { subscriptionLabel } from '@/lib/i18n-labels'
 import { X } from 'lucide-react'
@@ -231,13 +230,14 @@ export function StatusBars({ credentials, activity, balances, saturatedIds, clas
   // 缓存余额：优先用外部传入（全页共享），否则自订阅（react-query 去重，零额外上游）。
   const { data: cached } = useCachedBalances()
   const balanceMap = balances ?? cached?.balances
+  // 鼠标跟随悬浮卡（替代 Radix Tooltip 固定 side="right" 的边缘翻转，卡片黏着鼠标走）。
+  const hoverCard = useHoverCard()
 
   if (credentials.length === 0) {
     return <EmptyPool className={className} />
   }
 
   return (
-    <TooltipProvider delayDuration={80}>
       <div className={`flex flex-col gap-1.5 ${className ?? ''}`}>
         {credentials.map((c) => {
           const h = healthOf(c)
@@ -266,9 +266,11 @@ export function StatusBars({ credentials, activity, balances, saturatedIds, clas
           const hasLast = Number.isFinite(lastTs)
 
           return (
-            <Tooltip key={c.id}>
-              <TooltipTrigger asChild>
                 <div
+                  key={c.id}
+                  onMouseEnter={(e) => hoverCard.show(c, e)}
+                  onMouseMove={hoverCard.move}
+                  onMouseLeave={hoverCard.hide}
                   className={`group relative flex h-9 cursor-pointer items-center gap-2.5 overflow-hidden rounded-md border pl-4 pr-3 transition-colors duration-150 hover:border-border-hover hover:bg-foreground/[0.02] ${
                     c.isCurrent ? 'ring-1 ring-primary/60' : ''
                   }`}
@@ -381,14 +383,10 @@ export function StatusBars({ credentials, activity, balances, saturatedIds, clas
                     {hasLast ? agoShort(lastTs) : '—'}
                   </span>
                 </div>
-              </TooltipTrigger>
-              <TooltipContent side="right">
-                <CredTooltipBody c={c} act={act} />
-              </TooltipContent>
-            </Tooltip>
           )
         })}
+      {/* 鼠标跟随悬浮卡（正文 CredTooltipBody 不变，仅定位改为黏鼠标） */}
+      {hoverCard.render((id) => activity?.get(id))}
       </div>
-    </TooltipProvider>
   )
 }
