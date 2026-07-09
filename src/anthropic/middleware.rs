@@ -1,7 +1,6 @@
 //! Anthropic API 中间件
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::{
     body::Body,
@@ -14,7 +13,6 @@ use axum::{
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 
-use super::cache_tracker::CacheTracker;
 use super::types::ErrorResponse;
 
 /// 应用共享状态
@@ -25,29 +23,19 @@ pub struct AppState {
     /// Kiro Provider（可选，用于实际 API 调用）
     /// 内部使用 MultiTokenManager，已支持线程安全的多凭据管理
     pub kiro_provider: Option<Arc<KiroProvider>>,
-    /// prompt 缓存影子跟踪器（按凭据分桶）
-    pub cache_tracker: Arc<CacheTracker>,
 }
 
-// 注：`extract_thinking` / `prompt_cache_enabled` / `compression` 三项已迁出 AppState
-// （TIER3 配置热重载）：它们现由 handlers.rs 的进程级原子/ArcSwap 镜像承载，admin 改配置调
-// setter 即时生效、无需重启。AppState 只保留真正随请求走且无需热更的共享句柄。
+// 注：`extract_thinking` / `compression` 等热更项由 handlers.rs 的进程级原子/ArcSwap 镜像
+// 承载，admin 改配置调 setter 即时生效、无需重启。AppState 只保留真正随请求走的共享句柄。
+// （影子 prompt 缓存记账已整体移除——它不省钱且在大请求热路径同步跑 SHA256 拖慢传输，
+//   真正省上游 credit 的是 converter 的 continuationId 确定性派生，与此无关、仍在。）
 
 impl AppState {
     /// 创建应用状态。
-    ///
-    /// `prompt_cache_ttl_seconds` 固化进 `CacheTracker`（缓存表容忍的最长 TTL，运行时改它需
-    /// 重建 tracker 丢缓存，属诚实边界保留重启）。其余热更开关由 handlers 镜像承载，不进 AppState。
-    pub fn with_cache_ttl(
-        api_key: impl Into<String>,
-        prompt_cache_ttl_seconds: u64,
-    ) -> Self {
+    pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             api_key: api_key.into(),
             kiro_provider: None,
-            cache_tracker: Arc::new(CacheTracker::new(Duration::from_secs(
-                prompt_cache_ttl_seconds,
-            ))),
         }
     }
 

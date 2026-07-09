@@ -21,7 +21,7 @@ use super::{
     },
     middleware::{AdminState, admin_auth_middleware},
     usage_handlers::{
-        ratelimit_insights, stream_live, usage_by_credential, usage_by_model, usage_cache,
+        ratelimit_insights, stream_live, usage_by_credential, usage_by_model,
         usage_clients, usage_machines, usage_overview, usage_rate, usage_recent, usage_throughput,
         usage_timeseries,
     },
@@ -100,8 +100,6 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/usage/machines", get(usage_machines))
         // 全局实时吞吐（最近 60 秒逐秒桶，供前端画流动粒子）
         .route("/usage/throughput", get(usage_throughput))
-        // 影子缓存命中率累计快照（供前端展示缓存确实生效）
-        .route("/usage/cache", get(usage_cache))
         // 限流 insights：每号一条限流健康快照（rpm/软上限/冷却/近期429/中文推断），零上游
         .route("/ratelimit/insights", get(ratelimit_insights))
         // SSE 实时流：每 ~1.5s 推一帧轻量快照（全局 inflight/rpm + 每号状态 + 吞吐），零上游

@@ -190,14 +190,6 @@ pub async fn usage_throughput(State(state): State<AdminState>) -> impl IntoRespo
     }
 }
 
-/// GET /api/admin/usage/cache
-/// 影子 prompt 缓存记账的累计命中率快照（进程级累计，只读，零上游）。
-/// 供前端展示"缓存确实生效"：请求数 / 命中数 / 命中率 / 累计 cache_read/creation tokens。
-/// 与 usage_enabled 无关（缓存记账独立），故不走 stats_disabled。
-pub async fn usage_cache(State(_state): State<AdminState>) -> impl IntoResponse {
-    Json(crate::anthropic::cache_stats_snapshot())
-}
-
 /// GET /api/admin/ratelimit/insights
 /// 每号一条限流健康快照：rpm / 软上限 / 是否饱和 / 在途 / 冷却明细 / 近期 429 /
 /// 中文推断文案。全部取自内存（token_manager 快照 + cooldown 快照 + config 软上限），

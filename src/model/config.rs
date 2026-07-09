@@ -454,7 +454,13 @@ fn default_rate_limit_min_interval_ms() -> u64 {
 }
 
 fn default_prompt_cache_enabled() -> bool {
-    true
+    // 默认关闭影子 prompt 缓存记账。
+    // 该记账在请求热路径同步跑 build_profile（逐块 serde 序列化 + canonicalize_json
+    // 递归排序所有 JSON key + SHA256 前缀指纹）,对超大对话(30-40万 token/数百块)
+    // 有可观固定 CPU 开销,叠加在发上游之前。它只影响向下游客户端复现 Anthropic 风格的
+    // cache_read/cache_creation 展示,不影响真实上游 prefix 缓存(那由客户端断点 + Bedrock
+    // 决定,网关左右不了)。默认关以砍掉这块热路径开销;需要展示缓存记账时再显式开启。
+    false
 }
 
 fn default_prompt_cache_ttl_seconds() -> u64 {
