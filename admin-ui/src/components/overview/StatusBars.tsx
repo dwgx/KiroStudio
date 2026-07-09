@@ -305,10 +305,12 @@ export function StatusBars({ credentials, activity, balances, saturatedIds, clas
                   >
                     {c.name || c.email || '无邮箱'}
                   </span>
-                  {/* 订阅等级：固定等宽槽位（无论有无都占位），保证各行 KIRO POWER 标签对齐不跳动 */}
-                  <span className="hidden w-[76px] shrink-0 sm:block">
+                  {/* 订阅等级：固定等宽槽位（无论有无都占位），保证各行标签对齐不跳动。
+                      槽宽加到 100px 容下最长的 "KIRO PRO MAX"（原 76px 会把它截成 "KIRO PRO M…"）。
+                      标签本身不再 truncate、整体不换行，完整显示。 */}
+                  <span className="hidden w-[100px] shrink-0 sm:block">
                     {sub && (
-                      <span className="inline-block max-w-full truncate rounded bg-secondary/70 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wide text-muted-foreground/90">
+                      <span className="inline-block max-w-full whitespace-nowrap rounded bg-secondary/70 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wide text-muted-foreground/90">
                         {subscriptionLabel(sub)}
                       </span>
                     )}
