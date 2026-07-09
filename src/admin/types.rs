@@ -26,6 +26,9 @@ pub struct CredentialStatusItem {
     pub id: u64,
     /// 优先级（数字越小优先级越高）
     pub priority: u32,
+    /// 凭据级 RPM 容量上限（None=继承全局）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpm_limit: Option<u32>,
     /// 是否被禁用
     pub disabled: bool,
     /// 连续失败次数
@@ -141,6 +144,14 @@ pub struct SetPriorityRequest {
     pub priority: u32,
 }
 
+/// 设置凭据级 RPM 容量上限的请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetRpmLimitRequest {
+    /// 新 RPM 容量（0/null = 继承全局）
+    pub rpm_limit: Option<u32>,
+}
+
 /// 添加凭据请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -173,6 +184,10 @@ pub struct AddCredentialRequest {
     /// 优先级（可选，默认 0）
     #[serde(default)]
     pub priority: u32,
+
+    /// 凭据级 RPM 容量上限（可选，None/0=继承全局）
+    #[serde(default)]
+    pub rpm_limit: Option<u32>,
 
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
@@ -374,7 +389,7 @@ impl AdminErrorResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartSocialLoginRequest {
-    /// 新凭据优先级（默认 100）
+    /// 新凭据优先级（默认 0：所有号平权，越小越优先）
     #[serde(default = "default_login_priority")]
     pub priority: u32,
     /// 可选自定义出站代理（不填继承全局）
@@ -383,7 +398,8 @@ pub struct StartSocialLoginRequest {
 }
 
 fn default_login_priority() -> u32 {
-    100
+    // 默认 0:所有号平权(见 handlers.rs default_priority 说明)。
+    0
 }
 
 /// 发起网页上号响应
@@ -431,6 +447,8 @@ pub struct ConfigSnapshotResponse {
     pub rate_limit_daily_max: u32,
     pub rate_limit_min_interval_ms: u64,
     pub affinity_enabled: bool,
+    /// 均衡模式下是否叠加优先级分发
+    pub priority_in_balanced: bool,
     /// 是否配置了全局代理（不回传明文）
     pub has_proxy: bool,
     pub proxy_url: Option<String>,
@@ -486,6 +504,7 @@ pub struct UpdateConfigRequest {
     pub rate_limit_daily_max: Option<u32>,
     pub rate_limit_min_interval_ms: Option<u64>,
     pub affinity_enabled: Option<bool>,
+    pub priority_in_balanced: Option<bool>,
     /// 全局代理地址；传空字符串表示清除
     pub proxy_url: Option<String>,
     /// 全局代理认证用户名；出于安全前端不回显已存值，仅在非空时更新

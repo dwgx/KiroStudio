@@ -28,7 +28,7 @@ const POLL_INTERVAL_MS = 2000
 
 export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLoginDialogProps) {
   const [step, setStep] = useState<Step>('form')
-  const [priority, setPriority] = useState('100')
+  const [priority, setPriority] = useState('0')
   const [proxyUrl, setProxyUrl] = useState('')
   const [isStarting, setIsStarting] = useState(false)
   const [session, setSession] = useState<StartSocialLoginResponse | null>(null)
@@ -89,7 +89,7 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
     setIsStarting(true)
     try {
       const resp = await startSocialLogin({
-        priority: Number(priority) || 100,
+        priority: Number(priority) || 0,
         proxyUrl: proxyUrl.trim() || undefined,
       })
       setSession(resp)

@@ -25,6 +25,7 @@ import { authShortLabel, disabledReasonLabel, subscriptionLabel } from '@/lib/i1
 import {
   useSetDisabled,
   useSetPriority,
+  useSetRpmLimit,
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
@@ -103,6 +104,7 @@ export function CredentialCard({
 }: CredentialCardProps) {
   const [showSettings, setShowSettings] = useState(false)
   const [priorityValue, setPriorityValue] = useState(credential.priority)
+  const [rpmLimitValue, setRpmLimitValue] = useState(credential.rpmLimit ?? 0)
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
   // 超额（Overage）开关：真开关接线状态
   const [overageBusy, setOverageBusy] = useState(false)
@@ -123,6 +125,7 @@ export function CredentialCard({
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
+  const setRpmLimit = useSetRpmLimit()
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
@@ -216,6 +219,21 @@ export function CredentialCard({
     }
     setPriority.mutate(
       { id: credential.id, priority: newPriority },
+      {
+        onSuccess: (res) => toast.success(res.message),
+        onError: (err) => toast.error('操作失败: ' + (err as Error).message),
+      }
+    )
+  }
+
+  const handleRpmLimitChange = () => {
+    const v = rpmLimitValue
+    if (isNaN(v) || v < 0) {
+      toast.error('RPM 容量必须是非负整数（0=继承全局）')
+      return
+    }
+    setRpmLimit.mutate(
+      { id: credential.id, rpmLimit: v },
       {
         onSuccess: (res) => toast.success(res.message),
         onError: (err) => toast.error('操作失败: ' + (err as Error).message),
@@ -789,6 +807,38 @@ export function CredentialCard({
                   disabled={setPriority.isPending || priorityValue === credential.priority}
                 >
                   {setPriority.isPending ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Check className="h-4 w-4" />
+                  )}
+                  <span className="ml-1">保存</span>
+                </Button>
+              </div>
+            </div>
+
+            {/* RPM 容量上限：本号每分钟请求容量，0=继承全局。体质好的号可设高（如 100）。 */}
+            <div className="flex items-center justify-between gap-4 border-t pt-4">
+              <div className="min-w-0">
+                <div className="text-sm font-medium">RPM 容量上限</div>
+                <div className="text-xs text-muted-foreground">
+                  每分钟请求容量，0=继承全局。体质好的号可设高（如 100），达上限才溢出到低优先级备份号。
+                </div>
+              </div>
+              <div className="flex shrink-0 items-center gap-2">
+                <NumberStepper
+                  value={rpmLimitValue}
+                  onChange={setRpmLimitValue}
+                  min={0}
+                  step={10}
+                  className="w-24"
+                  aria-label="RPM 容量上限"
+                />
+                <Button
+                  size="sm"
+                  onClick={handleRpmLimitChange}
+                  disabled={setRpmLimit.isPending || rpmLimitValue === (credential.rpmLimit ?? 0)}
+                >
+                  {setRpmLimit.isPending ? (
                     <Loader2 className="h-4 w-4 animate-spin" />
                   ) : (
                     <Check className="h-4 w-4" />

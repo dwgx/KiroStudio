@@ -374,6 +374,21 @@ impl ClientAgg {
         "unknown".to_string()
     }
 
+    /// 本条记录是否带真实 client_ip(唯一稳定的机器区分信号)。
+    ///
+    /// device 兜底(claude-code 等所有客户端相同)与 `"unknown"` 都不能区分真实机器,
+    /// 故它们不能作为 session 粘滞的归属锚点——否则所有缺 IP 的请求会全部粘到同一个
+    /// `"unknown"`/device 黑洞,把互不相干的真实机器(及其 IP)错并成一台。
+    fn has_stable_machine_key(r: &RequestRecord) -> bool {
+        r.client_ip.as_deref().is_some_and(|ip| !ip.is_empty())
+    }
+
+    /// 某 machine_key 是否是真实 IP 派生(能 parse 成 IpAddr)。
+    /// 用于区分「真实 IP 粘滞(DHCP 漫游,合法)」与「unknown/device 黑洞粘滞(误并)」。
+    fn is_ip_key(key: &str) -> bool {
+        key.parse::<std::net::IpAddr>().is_ok()
+    }
+
     /// 累加一条记录到客户端/窗口速率环。
     fn bump(&mut self, r: &RequestRecord, slot: i64) {
         let client_key = Self::client_key_of(r);
@@ -395,6 +410,13 @@ impl ClientAgg {
             meta.client_key = client_key.clone();
             meta.client_ip = r.client_ip.clone();
             meta.device = r.client_device.clone();
+            // 单一归属:同一 session 的 client_key 变化时(如先无 IP 落 device/unknown、
+            // 后来真实 IP 落 IP 组)先从其它所有 client 组移除,避免重复出现在两个客户端下。
+            for (ck, sids) in self.client_sessions.iter_mut() {
+                if ck != &client_key {
+                    sids.remove(&sid);
+                }
+            }
             self.client_sessions
                 .entry(client_key)
                 .or_default()
@@ -402,14 +424,22 @@ impl ClientAgg {
         }
 
         // ---- 机器指纹维度 ----
-        // session 粘滞：该 session 已归属某机器时沿用原 machine_key（即便本条换了 IP /
-        // 画像细节抖动也不改判），否则按当前画像派生。修复同机器被拆分。
-        let machine_key = match r
+        // 归属规则(修复「unknown 黑洞」误并,同时保留 DHCP/漫游合并):
+        //   稳定 key = 真实 IP(能 parse 成 IpAddr);"unknown"/device 兜底不稳定。
+        // 1. 已粘到**真实 IP** 机器 → 沿用(DHCP/漫游:同 session 换 IP 不拆机器)。
+        // 2. 粘到不稳定 key(unknown/device)但本条有真实 IP → 升级到真实 IP(根治:
+        //    早先无 IP 粘到 unknown 的 session,拿到真实 IP 后归位,不再把真实 IP 灌进 unknown)。
+        // 3. 粘到不稳定 key 且本条也无 IP → 沿用(没有更好的)。
+        // 4. 无粘滞 → 按本条派生。
+        let sticky = r
             .session_id
             .as_ref()
             .and_then(|sid| self.session_machine.get(sid))
-        {
-            Some(mk) => mk.clone(),
+            .cloned();
+        let machine_key = match sticky {
+            Some(mk) if Self::is_ip_key(&mk) => mk,
+            Some(_) if Self::has_stable_machine_key(r) => Self::machine_key_of(r),
+            Some(mk) => mk,
             None => Self::machine_key_of(r),
         };
 
@@ -434,13 +464,30 @@ impl ClientAgg {
             mm.ips.insert(ip);
         }
 
-        // 机器 ⇄ session 归组 + 粘滞映射（首次归属即固定，后续沿用）
+        // 机器 ⇄ session 归组 + 粘滞映射。
+        // 粘滞只锚定**真实 IP** 派生的 key(has_stable_machine_key):
+        //   - 首次遇真实 IP → 记录粘滞;
+        //   - 已有粘滞但本条是真实 IP 且与旧值不同 → 覆盖(把早先误粘到 "unknown"/device 的
+        //     session 升级到真实机器,并把它从旧组移除,根治 unknown 黑洞越滚越大)。
+        // 缺 IP 的请求绝不建立粘滞(否则不同真实机器的缺 IP 请求会互相并入同一 "unknown")。
         if let Some(sid) = r.session_id.clone() {
+            // 单一归属不变量:一个 session 任一时刻只能属于一台机器。归到 machine_key 前,
+            // 先把它从**其它所有**机器组移除——否则会重复出现在两台机器下(如先无 IP 落
+            // "unknown"/device 组、后来真实 IP 落 IP 组,旧组残留没清 → RPM 双计、两处都列)。
+            // 只有当 session 曾以真实 IP 建立粘滞、machine_key 又被粘滞锚回旧 IP 时才不迁移(漫游)。
+            for (mk, set) in self.machine_sessions.iter_mut() {
+                if mk != &machine_key {
+                    set.remove(&sid);
+                }
+            }
             self.machine_sessions
                 .entry(machine_key.clone())
                 .or_default()
                 .insert(sid.clone());
-            self.session_machine.entry(sid).or_insert(machine_key);
+            // 粘滞映射只锚定真实 IP 派生的 key(缺 IP 不建粘滞,防 unknown 黑洞)。
+            if Self::has_stable_machine_key(r) {
+                self.session_machine.insert(sid, machine_key);
+            }
         }
     }
 
@@ -1469,7 +1516,7 @@ mod tests {
         // 修正后语义:IP 为主键。不同 IP 且无 session 关联 = 不同机器(即便 Claude Code 画像相同)。
         // 这正是修复"7 个不同 IP 被合并成 1 台"的核心。
         let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
-        s.on_record(&rec_machine(0, Some("w1"), Some("192.168.11.23"), Some("claude-code"), Some("Windows"), None));
+        s.on_record(&rec_machine(0, Some("w1"), Some("203.0.113.23"), Some("claude-code"), Some("Windows"), None));
         s.on_record(&rec_machine(1_000, Some("w2"), Some("10.0.0.9"), Some("claude-code"), Some("Windows"), None));
 
         let machines = s.machines_at(BASE_MS + 1_000);
@@ -1520,6 +1567,74 @@ mod tests {
         assert_eq!(m.rpm, 2);
         assert_eq!(m.active_sessions, 1);
         assert_eq!(m.ips, vec!["1.1.1.1".to_string(), "2.2.2.2".to_string()]);
+    }
+
+    #[test]
+    fn test_machines_unknown_no_ip_not_merged_black_hole() {
+        // 回归:多个**不同** session 都缺 IP → 各自归 "unknown",但不能因此把它们
+        // 后来拿到的真实 IP 全灌进同一个 "unknown" 黑洞(dwgx 实测:4 个天差地别的 IP
+        // 被并成一台 unknown)。缺 IP 请求不建立粘滞,后续真实 IP 应各自归位到真实机器。
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        // 两个不同 session,首条都缺 IP → 都落 "unknown",但不粘滞
+        s.on_record(&rec_machine(0, Some("wa"), None, Some("claude-code"), None, None));
+        s.on_record(&rec_machine(0, Some("wb"), None, Some("claude-code"), None, None));
+        // 各自后续拿到**不同**真实 IP → 应归位到两台不同真实机器,而非都并进 unknown
+        s.on_record(&rec_machine(1_000, Some("wa"), Some("103.219.194.13"), Some("claude-code"), None, None));
+        s.on_record(&rec_machine(1_000, Some("wb"), Some("38.244.34.185"), Some("claude-code"), None, None));
+
+        let machines = s.machines_at(BASE_MS + 1_000);
+        // 核心断言:两个不相干的真实 IP 各自独立成机器(黑洞根治)。
+        let ip_machines: Vec<_> = machines
+            .iter()
+            .filter(|m| m.machine_key.parse::<std::net::IpAddr>().is_ok())
+            .collect();
+        assert_eq!(
+            ip_machines.len(),
+            2,
+            "两个不同真实 IP 应各自成一台机器: {:?}",
+            machines.iter().map(|m| (&m.machine_key, &m.ips)).collect::<Vec<_>>()
+        );
+        // 关键:没有任何一台机器把两个不相干的公网 IP 混在一起(这正是 dwgx 看到的误并)。
+        for m in &machines {
+            assert!(
+                m.ips.len() <= 1,
+                "单台机器不应聚合多个不相干 IP: {} -> {:?}",
+                m.machine_key,
+                m.ips
+            );
+        }
+    }
+
+    #[test]
+    fn test_machines_session_not_double_listed_after_ip_arrives() {
+        // dwgx 实测:同一 session 先无 IP(落 device/unknown 组)后来带真实 IP(落 IP 组),
+        // 旧组残留没清 → session 同时出现在两台机器下、RPM 双计。这里回归该「单一归属」不变量。
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        // 首条:无 IP → 落 device("claude-code")组
+        s.on_record(&rec_machine(0, Some("s1"), None, Some("claude-code"), None, None));
+        // 同 session 后续带真实 IP → 应迁到 IP 组,且从 device 组移除(不再两处都在)
+        s.on_record(&rec_machine(1_000, Some("s1"), Some("203.0.113.23"), Some("claude-code"), None, None));
+
+        let machines = s.machines_at(BASE_MS + 1_000);
+        // 统计 s1 出现在几台机器下 —— 必须恰好 1 台
+        let appearances: usize = machines
+            .iter()
+            .filter(|m| m.sessions.iter().any(|w| w.session_id == "s1"))
+            .count();
+        assert_eq!(
+            appearances, 1,
+            "session s1 应只归属一台机器,不能在多台重复出现: {:?}",
+            machines
+                .iter()
+                .map(|m| (&m.machine_key, m.sessions.iter().map(|w| &w.session_id).collect::<Vec<_>>()))
+                .collect::<Vec<_>>()
+        );
+        // 且归属到真实 IP 那台
+        let owner = machines
+            .iter()
+            .find(|m| m.sessions.iter().any(|w| w.session_id == "s1"))
+            .unwrap();
+        assert_eq!(owner.machine_key, "203.0.113.23", "应归属真实 IP 机器");
     }
 
     #[test]

@@ -36,7 +36,7 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialog
   const [step, setStep] = useState<Step>('form')
   const [startUrl, setStartUrl] = useState('')
   const [region, setRegion] = useState('us-east-1')
-  const [priority, setPriority] = useState('100')
+  const [priority, setPriority] = useState('0')
   const [proxyUrl, setProxyUrl] = useState('')
   const [isStarting, setIsStarting] = useState(false)
   const [session, setSession] = useState<IdcSession | null>(null)
@@ -107,7 +107,7 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialog
       const resp = await startIdcLogin({
         startUrl: startUrl.trim(),
         region: region.trim() || 'us-east-1',
-        priority: Number(priority) || 100,
+        priority: Number(priority) || 0,
         proxyUrl: proxyUrl.trim() || undefined,
       })
       setSession(resp)

@@ -26,20 +26,9 @@ impl IdeEndpoint {
     }
 
     fn api_region<'a>(&self, ctx: &'a RequestContext<'_>) -> &'a str {
-        // Region 优先从 profileArn 第 4 段提取（arn:aws:codewhisperer:{region}:...，与 Kiro IDE 一致），
-        // 回退到凭据 region / auth_region / config region。
-        if let Some(ref arn) = ctx.credentials.profile_arn {
-            if let Some(region) = arn.split(':').nth(3) {
-                if !region.is_empty() {
-                    return region;
-                }
-            }
-        }
-        ctx.credentials
-            .region
-            .as_deref()
-            .or(ctx.credentials.auth_region.as_deref())
-            .unwrap_or_else(|| ctx.credentials.effective_api_region(ctx.config))
+        // Region 解析(稳健版):profileArn 第 4 段(严格校验 arn 前缀 + region 白名单)
+        // > 凭据 region/auth_region > config。严格校验防污染 ARN 拼出坏 host(DNS/502)。
+        ctx.credentials.effective_upstream_region(ctx.config)
     }
 
     fn host(&self, ctx: &RequestContext<'_>) -> String {
@@ -114,8 +103,7 @@ impl KiroEndpoint for IdeEndpoint {
             .header("amz-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
 
-        if ctx.credentials.should_send_profile_arn() {
-            let arn = ctx.credentials.profile_arn.as_ref().unwrap();
+        if let Some(arn) = ctx.credentials.effective_profile_arn() {
             req = req.header("x-amzn-kiro-profile-arn", arn);
         }
         if ctx.credentials.is_api_key_credential() {
@@ -127,11 +115,9 @@ impl KiroEndpoint for IdeEndpoint {
     }
 
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
-        if ctx.credentials.should_send_profile_arn() {
-            inject_profile_arn(body, &ctx.credentials.profile_arn)
-        } else {
-            body.to_string()
-        }
+        // 用 effective_profile_arn:idc/social 缺 profileArn 时回退默认 BuilderId ARN
+        // (根治新号 400 profileArn is required);external_idp 返回 None → 不注入。
+        inject_profile_arn(body, &ctx.credentials.effective_profile_arn())
     }
 }
 

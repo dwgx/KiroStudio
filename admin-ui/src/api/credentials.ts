@@ -97,6 +97,18 @@ export async function setCredentialPriority(
   return data
 }
 
+// 设置凭据级 RPM 容量上限（0=继承全局）
+export async function setCredentialRpmLimit(
+  id: number,
+  rpmLimit: number
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/rpm-limit`,
+    { rpmLimit: rpmLimit > 0 ? rpmLimit : null }
+  )
+  return data
+}
+
 // 设置凭据别名/备注（传空字符串清除）
 export async function setCredentialName(
   id: number,
