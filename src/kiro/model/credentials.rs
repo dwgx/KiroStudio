@@ -478,14 +478,24 @@ impl KiroCredentials {
     /// 注:更智能的做法是运行时 ListAvailableProfiles 拉真实 ARN 并持久化（见研究备忘），
     /// 此处先用默认回退保证可用,动态解析作为后续增强。
     pub fn effective_profile_arn(&self) -> Option<String> {
-        if self.is_external_idp_credential() {
-            return None;
-        }
+        // 有自带/动态解析到的真实 profileArn → 一律用它（含 external_idp）。
         if let Some(arn) = self.profile_arn.as_deref() {
             if !arn.trim().is_empty() {
                 return Some(arn.to_string());
             }
         }
+        // external_idp（M365 企业）缺真实 arn 时返回 None：绝不给它套 idc 的默认
+        // BuilderId 占位 ARN（那是别的租户的公共占位，external_idp 用了会 403）。
+        // 它的真实 arn 由 refresh 后的动态 ListAvailableProfiles 解析补上（见
+        // refresh_token_locked 的 eligible 判定）。
+        //
+        // 上游行为变更（kiro.dev 迁移后）：external_idp 号**必须**带自己租户的真实
+        // profileArn，缺了直接 `400 profileArn is required`；旧注释"带 profileArn 反而
+        // 403"已过时——那是旧 endpoint 时代、且指的是套错的占位 ARN。
+        if self.is_external_idp_credential() {
+            return None;
+        }
+        // idc/social/api_key 缺 arn → 回退默认 BuilderId 占位 ARN（上游接受）。
         Some(crate::kiro::token_manager::DEFAULT_BUILDER_ID_PROFILE_ARN.to_string())
     }
 

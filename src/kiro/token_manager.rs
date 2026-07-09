@@ -498,16 +498,14 @@ pub(crate) async fn get_usage_limits(
         host
     );
 
-    // profileArn：有值就用，没有则回退到默认 BuilderId profileArn（与 Kiro IDE 一致）。
-    let effective_profile_arn = credentials
-        .profile_arn
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or(DEFAULT_BUILDER_ID_PROFILE_ARN);
-    url.push_str(&format!(
-        "&profileArn={}",
-        urlencoding::encode(effective_profile_arn)
-    ));
+    // profileArn：统一走 effective_profile_arn（与对话/端点路径同口径）——
+    // idc/social/api_key 缺 arn 回退默认 BuilderId,external_idp 用它自己租户的真实 arn。
+    // 关键修复：原先此处直接读 credentials.profile_arn 并对**所有**类型回退默认 BuilderId ARN,
+    // 导致 external_idp 号(带的是别的租户占位 arn)余额查询 403 Invalid token → 余额恒 null。
+    // effective_profile_arn 对 external_idp 缺真实 arn 时返回 None,此时不附带 profileArn 参数。
+    if let Some(arn) = credentials.effective_profile_arn() {
+        url.push_str(&format!("&profileArn={}", urlencoding::encode(&arn)));
+    }
 
     // 构建 User-Agent headers
     let user_agent = format!(
@@ -2894,9 +2892,11 @@ impl MultiTokenManager {
                 }
             }
         });
-        if credentials.should_send_profile_arn() {
-            let arn = credentials.profile_arn.as_ref().unwrap();
-            body["profileArn"] = serde_json::Value::String(arn.clone());
+        // 用 effective_profile_arn（与对话路径 endpoint/ide.rs 统一口径）:idc/social 缺
+        // arn 回退默认 BuilderId,external_idp 用动态解析到的真实 ARN。直接读
+        // profile_arn.unwrap() 会在 idc 号回退默认 ARN(profile_arn 本身仍 None)时 panic。
+        if let Some(arn) = credentials.effective_profile_arn() {
+            body["profileArn"] = serde_json::Value::String(arn);
         }
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
@@ -3529,9 +3529,11 @@ impl MultiTokenManager {
                         .as_deref()
                         .map(|s| s.trim().is_empty())
                         .unwrap_or(true);
-                    let eligible = missing
-                        && !c.is_external_idp_credential()
-                        && !c.is_api_key_credential();
+                    // external_idp 也纳入动态解析:上游迁 kiro.dev 后 external_idp 号
+                    // 必须带自己租户的真实 profileArn（缺了 400 profileArn is required），
+                    // 而 resolve_profile_arn_via_management 本就为它设了 TokenType:EXTERNAL_IDP。
+                    // 仅 api_key 号无 profile 概念,排除。
+                    let eligible = missing && !c.is_api_key_credential();
                     (
                         eligible,
                         c.clone(),
@@ -4968,7 +4970,8 @@ mod tests {
 
     #[test]
     fn test_credential_region_empty_string_treated_as_set() {
-        // 空字符串 auth_region 被视为已设置（虽然不推荐，但行为应一致）
+        // 安全(H3)行为变更:空字符串/非法 region 不再被"视为已设置",而是过白名单不命中
+        // → 回退到 config。旧行为让空串拼出坏 host(runtime..kiro.dev),现修正为回退可信 config。
         let mut config = Config::default();
         config.region = "us-west-2".to_string();
 
@@ -4976,22 +4979,22 @@ mod tests {
         credentials.auth_region = Some("".to_string());
 
         let region = credentials.effective_auth_region(&config);
-        // 空字符串被视为已设置，不会回退到 config
-        assert_eq!(region, "");
+        // 空字符串不命中白名单 → 回退 config.region
+        assert_eq!(region, "us-west-2");
     }
 
     #[test]
     fn test_auth_and_api_region_independent() {
-        // auth_region 和 api_region 互不影响
+        // auth_region 和 api_region 互不影响（用真实 AWS region,过白名单）
         let mut config = Config::default();
-        config.region = "default".to_string();
+        config.region = "us-east-1".to_string();
 
         let mut credentials = KiroCredentials::default();
-        credentials.auth_region = Some("auth-only".to_string());
-        credentials.api_region = Some("api-only".to_string());
+        credentials.auth_region = Some("eu-west-1".to_string());
+        credentials.api_region = Some("ap-northeast-1".to_string());
 
-        assert_eq!(credentials.effective_auth_region(&config), "auth-only");
-        assert_eq!(credentials.effective_api_region(&config), "api-only");
+        assert_eq!(credentials.effective_auth_region(&config), "eu-west-1");
+        assert_eq!(credentials.effective_api_region(&config), "ap-northeast-1");
     }
 
     // ============ 凭据回收站测试 ============
