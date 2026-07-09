@@ -14,100 +14,66 @@ type ToasterProps = React.ComponentProps<typeof Sonner>
 // 说明：样式全部 scope 在 .toaster-glow 之下，只影响本 Toaster，不污染全局。
 const TOAST_CSS = `
 .toaster-glow[data-sonner-toaster] {
-  --width: 400px;
-  --gap: 13px;
-  --border-radius: 14px;
+  --width: 380px;
+  --gap: 10px;
+  --border-radius: 10px;
 }
 
+/* 干净扁平通知卡（dwgx 重写要求）：去掉一切光晕/发光/晕染（无光污染），
+   纯实色暗底 + 细边框 + 左侧一道细语义色竖条。关闭叉叉常驻可见。 */
 .toaster-glow [data-sonner-toast] {
-  --tone: #8b8f98;
-  --tone-soft: rgba(139, 143, 152, 0.16);
+  --tone: #9aa0aa;
   position: relative;
   width: 100%;
-  min-width: 320px;
-  max-width: 440px;
+  min-width: 300px;
+  max-width: 420px;
   overflow: hidden;
-  background:
-    linear-gradient(155deg, rgba(30, 30, 34, 0.95) 0%, rgba(21, 21, 24, 0.96) 100%);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 14px;
-  box-shadow:
-    0 1px 2px rgba(0, 0, 0, 0.4),
-    0 14px 40px -10px rgba(0, 0, 0, 0.6),
-    0 0 24px -12px var(--tone);
-  -webkit-backdrop-filter: blur(16px) saturate(1.25);
-  backdrop-filter: blur(16px) saturate(1.25);
-  padding: 15px 42px 16px 16px;
+  background: #1c1c1f;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-left: 3px solid var(--tone);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px -8px rgba(0, 0, 0, 0.5);
+  padding: 13px 40px 13px 14px;
   color: #ededed;
   align-items: flex-start;
 }
 
-/* 展开态下即便非最前一条也全不透明，杜绝后面看不清 */
-.toaster-glow [data-sonner-toast][data-expanded="true"][data-front="false"],
-.toaster-glow [data-sonner-toast][data-expanded="true"][data-front="false"][data-styled="true"] > * {
-  opacity: 1;
+/* 修 bug(dwgx 截图:绿 toast 上方几个空白灰卡):
+   sonner 折叠(未 hover)态会把非 front 的后置 toast 内容设 opacity:0 只留卡壳,
+   配我这纯实色暗底 #1c1c1f 就成了"空白灰盒"堆在上面。
+   处理:折叠态只显示最前一条,后置整卡隐藏(不再露空壳);hover 展开时全部完整显示。 */
+.toaster-glow [data-sonner-toast][data-expanded="false"][data-front="false"] {
+  opacity: 0 !important;
+  pointer-events: none;
+}
+.toaster-glow [data-sonner-toast][data-expanded="true"],
+.toaster-glow [data-sonner-toast][data-expanded="true"] > * {
+  opacity: 1 !important;
 }
 
-/* 顶部语义色渐变描边：中间实、两端淡出，比左竖条更成体系 */
-.toaster-glow [data-sonner-toast]::before {
-  content: '';
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: 0;
-  height: 2px;
-  background: linear-gradient(90deg, transparent, var(--tone) 22%, var(--tone) 78%, transparent);
-  opacity: 0.9;
-}
+.toaster-glow [data-sonner-toast][data-type="success"] { --tone: #2ecc9b; }
+.toaster-glow [data-sonner-toast][data-type="error"]   { --tone: #ff5c54; }
+.toaster-glow [data-sonner-toast][data-type="warning"] { --tone: #f0a92e; }
+.toaster-glow [data-sonner-toast][data-type="info"]    { --tone: #4c9dff; }
 
-/* 底部倒计时进度条：从满宽收缩到 0，时长 = toast duration；hover 暂停时动画一并暂停 */
-.toaster-glow [data-sonner-toast]::after {
-  content: '';
-  position: absolute;
-  left: 0;
-  bottom: 0;
-  height: 2px;
-  width: 100%;
-  transform-origin: left center;
-  background: linear-gradient(90deg, var(--tone), color-mix(in srgb, var(--tone) 55%, transparent));
-  animation: toast-countdown var(--toast-duration, 4000ms) linear forwards;
-}
-.toaster-glow [data-sonner-toast]:hover::after {
-  animation-play-state: paused;
-}
-/* 常驻/加载态（无自动消失）不显示倒计时条 */
-.toaster-glow [data-sonner-toast][data-type="loading"]::after {
-  display: none;
-}
-
-@keyframes toast-countdown {
-  from { transform: scaleX(1); }
-  to   { transform: scaleX(0); }
-}
-
-.toaster-glow [data-sonner-toast][data-type="success"] { --tone: #34e0b4; --tone-soft: rgba(52, 224, 180, 0.18); }
-.toaster-glow [data-sonner-toast][data-type="error"]   { --tone: #ff5c54; --tone-soft: rgba(255, 92, 84, 0.18); }
-.toaster-glow [data-sonner-toast][data-type="warning"] { --tone: #ffb020; --tone-soft: rgba(255, 176, 32, 0.18); }
-.toaster-glow [data-sonner-toast][data-type="info"]    { --tone: #4c9dff; --tone-soft: rgba(76, 157, 255, 0.18); }
-
-/* 图标：发光圆角章——语义色前景 + 同色柔光环 */
+/* 图标：扁平语义色，无光晕、无圆底章、无弹入动画 */
 .toaster-glow [data-sonner-toast] [data-icon] {
-  width: 28px;
-  height: 28px;
-  margin-right: 12px;
-  margin-top: 0;
+  width: 18px;
+  height: 18px;
+  margin-right: 10px;
+  margin-top: 1px;
   display: flex;
   align-items: center;
   justify-content: center;
-  border-radius: 9px;
-  background: var(--tone-soft);
   color: var(--tone);
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--tone) 30%, transparent), 0 0 14px -4px var(--tone);
+  background: none;
+  box-shadow: none;
   flex-shrink: 0;
 }
 .toaster-glow [data-sonner-toast] [data-icon] svg {
-  width: 16px;
-  height: 16px;
+  width: 18px;
+  height: 18px;
+  filter: none;
 }
 
 .toaster-glow [data-sonner-toast] [data-content] {
@@ -135,23 +101,31 @@ const TOAST_CSS = `
   overflow-wrap: anywhere;
 }
 
-/* 关闭按钮：常驻右上角，低调 hover 提亮 */
+/* 关闭叉叉：常驻右上角、清晰可见（实底 + 明显边框 + 亮图标），不再半透明藏起来 */
 .toaster-glow [data-sonner-toast] [data-close-button] {
   --toast-close-button-start: unset;
-  --toast-close-button-end: 0;
-  --toast-close-button-transform: translate(35%, -35%);
-  left: unset;
-  right: 0;
-  width: 20px;
-  height: 20px;
-  border-radius: 7px;
-  background: rgba(255, 255, 255, 0.06);
-  border: 1px solid rgba(255, 255, 255, 0.09);
-  color: #b5b5b5;
-  transition: background 150ms ease, color 150ms ease, transform 150ms ease;
+  --toast-close-button-end: 8px;
+  --toast-close-button-transform: none;
+  left: unset !important;
+  right: 8px !important;
+  top: 10px !important;
+  transform: none !important;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.10);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  color: #e4e4e7;
+  opacity: 1;
+  transition: background 150ms ease, color 150ms ease;
+}
+.toaster-glow [data-sonner-toast] [data-close-button] svg {
+  width: 14px;
+  height: 14px;
+  stroke-width: 2.4;
 }
 .toaster-glow [data-sonner-toast] [data-close-button]:hover {
-  background: rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.2);
   color: #ffffff;
 }
 
@@ -164,10 +138,6 @@ const TOAST_CSS = `
   .toaster-glow [data-sonner-toast],
   .toaster-glow [data-sonner-toast] [data-close-button] {
     transition: none !important;
-  }
-  .toaster-glow [data-sonner-toast]::after {
-    animation: none !important;
-    display: none;
   }
 }
 `

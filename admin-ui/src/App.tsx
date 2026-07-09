@@ -29,8 +29,9 @@ function App() {
       ) : (
         <LoginPage onLogin={handleLogin} />
       )}
-      {/* 通知栈挂载点：展开平铺 / 可见 6 条 / 常驻关闭按钮等行为在 Toaster 组件内统一配置，此处仅定位到右上角 */}
-      <Toaster position="top-right" />
+      {/* 通知栈挂载点：展开平铺 / 可见 6 条 / 常驻关闭按钮等行为在 Toaster 组件内统一配置。
+          定位右下角（dwgx 要求）：号池健康事件通知 + 手动操作反馈都从这里弹。 */}
+      <Toaster position="bottom-right" />
     </>
   )
 }
