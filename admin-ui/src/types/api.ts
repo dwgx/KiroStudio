@@ -10,6 +10,7 @@ export interface CredentialsStatusResponse {
 export interface CredentialStatusItem {
   id: number
   priority: number
+  rpmLimit?: number
   disabled: boolean
   failureCount: number
   isCurrent: boolean
@@ -251,6 +252,7 @@ export interface ConfigSnapshotResponse {
   rateLimitDailyMax: number
   rateLimitMinIntervalMs: number
   affinityEnabled: boolean
+  priorityInBalanced: boolean
   hasProxy: boolean
   proxyUrl?: string
   hasAdminKey: boolean
@@ -288,6 +290,7 @@ export interface UpdateConfigRequest {
   rateLimitDailyMax?: number
   rateLimitMinIntervalMs?: number
   affinityEnabled?: boolean
+  priorityInBalanced?: boolean
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
