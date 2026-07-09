@@ -9,7 +9,6 @@ import type {
   MachineRpm,
   ThroughputSnapshot,
   RateLimitInsight,
-  CacheStatsSnapshot,
 } from '@/types/api'
 
 // 复用与 credentials 相同的 baseURL 与鉴权拦截
@@ -87,9 +86,3 @@ export async function getUsageThroughput(): Promise<ThroughputSnapshot> {
   return data
 }
 
-// 影子 prompt 缓存记账累计快照（GET /usage/cache）：进程级累计命中率 + 省下/写入的 token，
-// 读进程级 static 计数,零上游、无封号风险。供概览页「缓存命中」卡片展示缓存确实生效。
-export async function getUsageCache(): Promise<CacheStatsSnapshot> {
-  const { data } = await api.get<CacheStatsSnapshot>('/usage/cache')
-  return data
-}
