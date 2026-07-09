@@ -550,21 +550,6 @@ export interface ThroughputSnapshot {
   recentBuckets: ThroughputBucket[]
 }
 
-// 影子 prompt 缓存记账累计统计（GET /usage/cache）：网关侧为下游复现的 Anthropic
-// 风格缓存命中,进程级累计,只读零上游。
-export interface CacheStatsSnapshot {
-  /** 参与缓存记账的请求总数 */
-  requests: number
-  /** 至少命中一次缓存读（cache_read>0）的请求数 */
-  hits: number
-  /** 累计 cache_read_input_tokens（从缓存复用、省下的输入 token） */
-  cacheReadTokens: number
-  /** 累计 cache_creation_input_tokens（写入缓存的输入 token） */
-  cacheCreationTokens: number
-  /** 命中率（hits / requests，0~1）；requests 为 0 时为 0 */
-  hitRate: number
-}
-
 // ============ 限流健康 insights（对接 GET /api/admin/ratelimit/insights） ============
 // 后端 service.rs 的 RateLimitInsight / CooldownDetail（serde camelCase）。
 // 全部取自内存快照（token_manager + cooldown + config 软上限），零上游、无封号风险。
