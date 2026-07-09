@@ -139,7 +139,12 @@ fn is_rate_limit_signal(s: &str) -> bool {
 /// 静默丢弃客户端回传的假签名，故永不转发给 Kiro。
 pub(super) const THINKING_SIGNATURE_PLACEHOLDER: &str = "kirostudio-thinking-signature";
 
-/// Prompt 缓存记账明细（由 [`crate::anthropic::cache_tracker`] 推算，注入响应 usage）
+/// Prompt 缓存记账明细（历史：由影子缓存 tracker 推算注入响应 usage）。
+///
+/// 影子缓存记账已整体移除（不省钱且在大请求热路径同步跑 SHA256 拖慢传输）。此类型与
+/// StreamContext 里的 `cache_usage` 字段现恒为 `None`，不再有任何计算路径写入它——保留为
+/// 惰性载体避免改动流式收尾热路径的十余处读点（那会引入无收益的回归风险）。
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CacheUsageBreakdown {
     pub cache_creation_input_tokens: i32,
@@ -152,6 +157,7 @@ pub(crate) struct CacheUsageBreakdown {
 ///
 /// Anthropic 语义：`usage.input_tokens` 只计「未命中缓存、非本次新建缓存」的部分，
 /// cache_read / cache_creation 单独列出。
+#[allow(dead_code)] // 影子缓存记账移除后仅由恒 None 的 cache_usage 分支引用
 pub(crate) fn billed_input_tokens(
     input_tokens: i32,
     cache_creation_input_tokens: i32,
@@ -786,7 +792,8 @@ impl StreamContext {
         }
     }
 
-    /// 设置 prompt 缓存记账明细（在生成初始事件前调用）
+    /// 设置 prompt 缓存记账明细（影子缓存已移除，现无调用方；保留避免改流式热路径）
+    #[allow(dead_code)]
     pub fn set_cache_usage(&mut self, cache_usage: Option<CacheUsageBreakdown>) {
         self.cache_usage = cache_usage;
     }
@@ -1577,7 +1584,8 @@ impl BufferedStreamContext {
         self.inner.mark_decoder_stopped(message);
     }
 
-    /// 设置 prompt 缓存记账明细（在处理事件前调用）
+    /// 设置 prompt 缓存记账明细（影子缓存已移除，现无调用方；保留避免改流式热路径）
+    #[allow(dead_code)]
     pub fn set_cache_usage(&mut self, cache_usage: Option<CacheUsageBreakdown>) {
         self.inner.set_cache_usage(cache_usage);
     }

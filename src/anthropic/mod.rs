@@ -22,7 +22,6 @@
 //! axum::serve(listener, app).await?;
 //! ```
 
-mod cache_tracker;
 pub mod compressor;
 mod converter;
 mod handlers;
@@ -32,7 +31,6 @@ mod stream;
 pub mod types;
 mod websearch;
 
-pub use cache_tracker::cache_stats_snapshot;
 pub use handlers::set_collect_client_fingerprint;
 pub use converter::set_strip_env_noise;
 pub use handlers::set_extract_thinking;
