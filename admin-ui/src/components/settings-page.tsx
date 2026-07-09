@@ -39,6 +39,7 @@ import {
   DialogDescription,
 } from '@/components/ui/dialog'
 import { Skeleton } from '@/components/ui/skeleton'
+import { PageSkeleton } from '@/components/ui/page-skeleton'
 import { Checkbox } from '@/components/ui/checkbox'
 import { StatCard } from '@/components/ui/stat-card'
 import { useConfigSnapshot, useUpdateConfig, useCredentials } from '@/hooks/use-credentials'
@@ -54,6 +55,13 @@ import {
 import { extractErrorMessage, copyToClipboard } from '@/lib/utils'
 import { RegionSelect } from '@/components/ui/region-select'
 import { NumberStepper } from '@/components/ui/number-stepper'
+import { ComboInput } from '@/components/ui/combo-input'
+
+// 版本字段的常见预设（可点选，也可自定义输入）。与 Kiro IDE 实际发行的标识对齐，
+// 便于伪装成主流客户端指纹；不在列表里的值直接手敲即可。
+const KIRO_VERSION_PRESETS = ['0.3.16', '0.3.15', '0.3.14', '0.3.13', '0.2.28', '0.1.25']
+const SYSTEM_VERSION_PRESETS = ['win32', 'darwin', 'linux', '10.0.22631', '10.0.19045', '14.5', '13.6']
+const NODE_VERSION_PRESETS = ['20.11.1', '20.18.1', '18.20.4', '22.11.0', '18.18.2']
 import type {
   ConfigSnapshotResponse,
   UpdateConfigRequest,
@@ -1373,11 +1381,8 @@ export function SettingsPage() {
   }
 
   if (isLoading || !form) {
-    return (
-      <div className="flex items-center justify-center py-24">
-        <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-primary" />
-      </div>
-    )
+    // 骨架屏替代蓝色转圈圈
+    return <PageSkeleton kind="settings" />
   }
 
   if (error || !config) {
@@ -1571,14 +1576,14 @@ export function SettingsPage() {
           <CardTitle className="text-base"><Highlight text="客户端伪装" /></CardTitle>
         </CardHeader>
         <CardContent className="py-0">
-          <Field label="Kiro 版本" hint="需重启生效">
-            <Input className={inputCls} value={form.kiroVersion} onChange={(e) => set('kiroVersion', e.target.value)} />
+          <Field label="Kiro 版本" hint="可选预设或自定义（需重启生效）">
+            <ComboInput className={inputCls} value={form.kiroVersion} onChange={(v) => set('kiroVersion', v)} options={KIRO_VERSION_PRESETS} aria-label="Kiro 版本" />
           </Field>
-          <Field label="系统版本" hint="需重启生效">
-            <Input className={inputCls} value={form.systemVersion} onChange={(e) => set('systemVersion', e.target.value)} />
+          <Field label="系统版本" hint="可选预设或自定义（需重启生效）">
+            <ComboInput className={inputCls} value={form.systemVersion} onChange={(v) => set('systemVersion', v)} options={SYSTEM_VERSION_PRESETS} aria-label="系统版本" />
           </Field>
-          <Field label="Node 版本" hint="需重启生效">
-            <Input className={inputCls} value={form.nodeVersion} onChange={(e) => set('nodeVersion', e.target.value)} />
+          <Field label="Node 版本" hint="可选预设或自定义（需重启生效）">
+            <ComboInput className={inputCls} value={form.nodeVersion} onChange={(v) => set('nodeVersion', v)} options={NODE_VERSION_PRESETS} aria-label="Node 版本" />
           </Field>
           <Field label="提取 thinking" hint="非流式响应解析 thinking 块（保存即时生效，无需重启）">
             <Switch checked={form.extractThinking} onCheckedChange={(v) => set('extractThinking', v)} />
