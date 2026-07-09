@@ -640,8 +640,11 @@ fn extract_session_id(user_id: &str) -> Option<String> {
     // 回退到字符串格式: 查找 "session_" 后面的内容
     if let Some(pos) = user_id.find("session_") {
         let session_part = &user_id[pos + 8..]; // "session_" 长度为 8
-        if session_part.len() >= 36 {
-            let uuid_str = &session_part[..36];
+        // 安全：用 get(..36) 而非 &session_part[..36]。后者按定长字节切片，
+        // 若第 36 字节落在多字节 UTF-8 字符中间（客户端可控的 metadata.user_id
+        // 如 "session_"+34字符+"中"），会 str range-index panic 打崩请求任务。
+        // get(..36) 在非字符边界处返回 None，自然回退到随机 conversationId。
+        if let Some(uuid_str) = session_part.get(..36) {
             if is_valid_uuid(uuid_str) {
                 return Some(uuid_str.to_string());
             }
@@ -1672,27 +1675,20 @@ mod tests {
         assert_eq!(out.as_ref(), text, "关闭时环境噪音应原样保留");
     }
 
-    /// 关键回归：转发字节路径（canonicalize_system_text）与影子指纹路径
-    /// （cache_tracker::canonicalize_system_block_for_cache）对同一 system 块应产出一致文本。
+    /// 转发字节路径（canonicalize_system_text）正确剥离环境噪音。
+    /// （原先还与影子指纹路径 cache_tracker 做一致性比对；影子缓存记账已整体移除，
+    ///   此处只保留转发路径本身的归一化回归。）
     #[test]
-    fn test_forward_and_shadow_canonicalization_consistent() {
+    fn test_forward_canonicalization_strips_env_noise() {
         let _g = EnvNoiseGuard::enable();
         let raw = "You are a helpful assistant.\n<env>\nWorking directory: /x\nPlatform: linux\n</env>\ngitStatus: clean\nDo the task.";
 
-        // 转发路径：canonicalize_system_text 直接得到文本
         let forwarded = canonicalize_system_text(raw).into_owned();
 
-        // 影子路径：cache_tracker 走 JSON text 块 → 调同一入口 → 写回 text
-        let mut block = serde_json::json!({ "type": "text", "text": raw });
-        super::super::cache_tracker::canonicalize_system_block_for_cache_for_test(&mut block);
-        let shadow = block["text"].as_str().unwrap().to_string();
-
-        assert_eq!(
-            forwarded, shadow,
-            "转发字节与影子指纹的归一化文本必须一致，否则记账与真实缓存脱节"
-        );
         assert!(!forwarded.contains("Working directory"));
         assert!(!forwarded.contains("gitStatus:"));
+        assert!(forwarded.contains("You are a helpful assistant."));
+        assert!(forwarded.contains("Do the task."));
     }
 
     #[test]

@@ -204,8 +204,13 @@ impl SocialLoginManager {
             None => return PollResult::Pending,
         };
 
-        // CSRF 校验
-        if !callback.state.is_empty() && callback.state != session.state {
+        // CSRF 校验（fail-closed）：state 必须存在且与本会话一致。
+        // 旧写法 `!state.is_empty() && state != session.state` 是 fail-open——
+        // 回调 state 为空时短路跳过校验。而 parse_callback 在 query 无 state 参数时
+        // 把它置为 ""，故伪造的 localhost 回调（只带 code、无 state）能绕过校验，
+        // 把攻击者的 Kiro 账号注入号池。合法流程 build_portal_url 一定嵌入 state，
+        // 故要求 state 非空且匹配不影响正常登录。
+        if callback.state.is_empty() || callback.state != session.state {
             self.sessions.lock().remove(session_id);
             return PollResult::Error("OAuth state 校验失败（可能的 CSRF）".to_string());
         }

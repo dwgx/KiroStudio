@@ -255,11 +255,15 @@ pub fn extract_search_query(req: &MessagesRequest) -> Option<String> {
         _ => return None,
     };
 
-    // 去除前缀 "Perform a web search for the query: "
-    let query = text
+    // 去除前缀 "Perform a web search for the query: "。
+    // 用 trim_start() 与路由判定 request_explicit_web_search_prefix 对齐——
+    // 后者用 t.trim_start().starts_with(PREFIX) 判前缀，此处若不 trim，带前导
+    // 空格的请求会 strip_prefix 失配、把整句（含前缀）当查询词传给 MCP → 垃圾结果。
+    let trimmed = text.trim_start();
+    let query = trimmed
         .strip_prefix(WEB_SEARCH_PREFIX)
         .map(|s| s.to_string())
-        .unwrap_or(text);
+        .unwrap_or_else(|| trimmed.to_string());
 
     if query.is_empty() { None } else { Some(query) }
 }
@@ -447,7 +451,9 @@ fn generate_websearch_events(
     ));
 
     // 5. content_block_start (web_search_tool_result, index 2)
-    // 官方 API 的 web_search_tool_result 没有 tool_use_id 字段
+    // 官方 Anthropic 协议里 web_search_tool_result 块**带** tool_use_id，且必须等于
+    // 前面 server_tool_use 块的 id——客户端 SDK 据此把搜索结果配对回对应的工具调用、
+    // 关联引用。缺此字段严格 SDK 客户端无法配对、typed 反序列化失败。此处补上。
     let search_content = if let Some(ref results) = search_results {
         results
             .results
@@ -477,6 +483,7 @@ fn generate_websearch_events(
             "index": 2,
             "content_block": {
                 "type": "web_search_tool_result",
+                "tool_use_id": tool_use_id,
                 "content": search_content
             }
         }),
