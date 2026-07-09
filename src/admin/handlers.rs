@@ -459,6 +459,18 @@ pub async fn start_idc_login(
     Json(payload): Json<StartIdcLoginRequest>,
 ) -> impl IntoResponse {
     let region = payload.region.as_deref().unwrap_or("us-east-1");
+    // 安全(M1):region 直接拼进 oidc.{region}.amazonaws.com 出站 host,必须白名单校验,
+    // 否则持 admin key 传 region=us-east-1.attacker.com 可把 OIDC 注册/设备授权引到攻击者子域。
+    // 与 external_idp 端点白名单、凭据 region 字段校验同口径。
+    if !crate::kiro::model::credentials::KiroCredentials::is_supported_region(region) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(super::types::AdminErrorResponse::invalid_request(format!(
+                "非法 region: {region}（不在支持的 AWS region 白名单内）"
+            ))),
+        )
+            .into_response();
+    }
     match state
         .service
         .start_idc_login(&payload.start_url, region, payload.priority, payload.proxy_url)
