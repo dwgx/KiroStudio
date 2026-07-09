@@ -5,6 +5,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Progress } from '@/components/ui/progress'
+import { Skeleton } from '@/components/ui/skeleton'
 import { useCredentialBalance } from '@/hooks/use-credentials'
 import { parseError } from '@/lib/utils'
 
@@ -36,8 +37,25 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
         </DialogHeader>
 
         {isLoading && (
-          <div className="flex items-center justify-center py-8">
-            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div>
+          <div className="space-y-4 py-2">
+            {/* 骨架屏：贴合余额内容形状(订阅标题 + 使用进度条 + 详情栅格)，替代蓝色转圈圈 */}
+            <div className="flex justify-center">
+              <Skeleton className="h-5 w-32" />
+            </div>
+            <div className="space-y-2">
+              <div className="flex justify-between">
+                <Skeleton className="h-3 w-20" />
+                <Skeleton className="h-3 w-20" />
+              </div>
+              <Skeleton className="h-2 w-full rounded-full" />
+              <div className="flex justify-center">
+                <Skeleton className="h-3 w-16" />
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-4 pt-4">
+              <Skeleton className="h-8 w-full" />
+              <Skeleton className="h-8 w-full" />
+            </div>
           </div>
         )}
 
