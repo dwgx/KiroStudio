@@ -51,7 +51,7 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
   const [step, setStep] = useState<Step>('form')
 
   // Shared
-  const [priority, setPriority] = useState('100')
+  const [priority, setPriority] = useState('0')
   const [proxyUrl, setProxyUrl] = useState('')
   const [isStarting, setIsStarting] = useState(false)
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -141,7 +141,7 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
     setIsStarting(true)
     try {
       const resp = await startSocialLogin({
-        priority: Number(priority) || 100,
+        priority: Number(priority) || 0,
         proxyUrl: proxyUrl.trim() || undefined,
       })
       setWebSession(resp)
@@ -191,7 +191,7 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
       const resp = await startIdcLogin({
         startUrl: startUrl.trim(),
         region: region.trim() || 'us-east-1',
-        priority: Number(priority) || 100,
+        priority: Number(priority) || 0,
         proxyUrl: proxyUrl.trim() || undefined,
       })
       setIdcSession(resp)
@@ -221,7 +221,7 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
     setEidpBusy(true)
     try {
       const resp = await startExternalIdpLogin({
-        priority: Number(priority) || 100,
+        priority: Number(priority) || 0,
         proxyUrl: proxyUrl.trim() || undefined,
       })
       setEidpSessionId(resp.sessionId)

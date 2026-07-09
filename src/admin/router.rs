@@ -13,7 +13,7 @@ use super::{
         get_overage_status, list_trash, purge_credential, poll_social_login, reset_failure_count,
         restart_service, restore_credential, set_credential_disabled, set_credential_name,
         set_credential_proxy,
-        set_credential_priority, purge_trash_batch,
+        set_credential_priority, set_credential_rpm_limit, purge_trash_batch,
         set_load_balancing_mode, social_callback, start_social_login, storage_cleanup,
         storage_stats, update_config, start_idc_login, poll_idc_login,
         start_external_idp_login, external_idp_leg1, external_idp_leg2,
@@ -61,6 +61,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/trash/{id}", delete(purge_credential))
         .route("/credentials/{id}/disabled", post(set_credential_disabled))
         .route("/credentials/{id}/priority", post(set_credential_priority))
+        .route("/credentials/{id}/rpm-limit", post(set_credential_rpm_limit))
         .route("/credentials/{id}/name", post(set_credential_name))
         .route("/credentials/{id}/proxy", post(set_credential_proxy))
         .route("/credentials/{id}/reset", post(reset_failure_count))
