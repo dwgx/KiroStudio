@@ -174,6 +174,7 @@ impl IdcLoginManager {
                     issuer_url: None,
                     scopes: None,
                     priority: session.priority,
+                    rpm_limit: None,
                     region: Some(session.region.clone()),
                     auth_region: Some(session.region.clone()),
                     api_region: None,

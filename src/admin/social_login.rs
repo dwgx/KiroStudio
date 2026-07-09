@@ -263,6 +263,7 @@ impl SocialLoginManager {
             issuer_url: None,
             scopes: None,
             priority: session.priority,
+            rpm_limit: None,
             region: None,
             auth_region: None,
             api_region: None,

@@ -482,15 +482,9 @@ pub(crate) async fn get_usage_limits(
 ) -> anyhow::Result<UsageLimitsResponse> {
     tracing::debug!("正在获取使用额度信息...");
 
-    // Region 优先级（与 Kiro IDE 一致）：profileArn 第 4 段 > 凭据 region/auth_region > config。
-    let region = credentials
-        .profile_arn
-        .as_deref()
-        .and_then(|arn| arn.split(':').nth(3))
-        .filter(|r| !r.is_empty())
-        .or(credentials.region.as_deref())
-        .or(credentials.auth_region.as_deref())
-        .unwrap_or_else(|| credentials.effective_api_region(config));
+    // Region 解析(稳健版):profileArn 第 4 段(严格校验 arn 前缀 + region 白名单)
+    // > 凭据 region/auth_region > config。严格校验防污染 ARN 拼出坏 host(DNS/502)。
+    let region = credentials.effective_upstream_region(config);
     // Kiro management API（已迁移，旧 q.{region}.amazonaws.com 停用）
     let host = format!("management.{}.kiro.dev", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
@@ -559,6 +553,62 @@ pub(crate) async fn get_usage_limits(
 
     let data: UsageLimitsResponse = response.json().await?;
     Ok(data)
+}
+
+/// 运行时动态解析真实 profileArn（Kiro management ControlPlane 的 ListAvailableProfiles）。
+///
+/// 为何需要:idc/Enterprise 号入池/刷新后常没有 profileArn(IdC 的 oidc 刷新不回传它),
+/// 而对话/余额端点对这类号要求带**真实** profileArn——回退默认占位 ARN 对 Enterprise 号
+/// 会被上游判 `Invalid token`/403(实测)。Kiro IDE / kiro-account-manager 的做法是运行时
+/// 调 ListAvailableProfiles 拿账号真实的 profiles[0].arn。此函数复刻该 recipe(已对齐 KAM):
+/// - `POST https://management.{region}.kiro.dev/`(根路径)
+/// - header: `x-amz-target: KiroControlPlaneBearerService.ListAvailableProfiles`
+///   + `content-type: application/x-amz-json-1.0` + Bearer + control-plane UA
+/// - body: `{}`;成功取响应 `profiles[0].arn`。
+///
+/// 返回 Ok(Some(arn)) 拿到、Ok(None) 响应无 profile(账号无可用 profile)、Err 网络/上游错误。
+pub(crate) async fn resolve_profile_arn_via_management(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<Option<String>> {
+    let region = credentials.effective_upstream_region(config);
+    let host = format!("management.{}.kiro.dev", region);
+    let url = format!("https://{}/", host);
+    let machine_id = machine_id::generate_from_credentials(credentials, config);
+    let user_agent = format!(
+        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/kirocontrolplanebearer#1.0.0 m/N,E KiroIDE-{}-{}",
+        config.system_version, config.node_version, config.kiro_version, machine_id
+    );
+    let client = build_client(proxy, 30, config.tls_backend)?;
+    let mut request = client
+        .post(&url)
+        .header("content-type", "application/x-amz-json-1.0")
+        .header("x-amz-target", "KiroControlPlaneBearerService.ListAvailableProfiles")
+        .header("host", &host)
+        .header("user-agent", &user_agent)
+        .header("x-amz-user-agent", "aws-sdk-js/1.0.0")
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=3")
+        .header("Authorization", format!("Bearer {}", token))
+        .body("{}");
+    if credentials.is_external_idp_credential() {
+        request = request.header("TokenType", "EXTERNAL_IDP");
+    }
+    let response = request.send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        bail!("ListAvailableProfiles 失败: {} {}", status, body_text);
+    }
+    let data: serde_json::Value = response.json().await?;
+    let arn = data
+        .get("profiles")
+        .and_then(|p| p.as_array())
+        .and_then(|arr| arr.iter().find_map(|p| p.get("arn").and_then(|a| a.as_str())))
+        .map(|s| s.to_string());
+    Ok(arn)
 }
 
 // ============================================================================
@@ -633,6 +683,8 @@ pub struct CredentialEntrySnapshot {
     pub id: u64,
     /// 优先级
     pub priority: u32,
+    /// 凭据级 RPM 容量上限（None=继承全局）
+    pub rpm_limit: Option<u32>,
     /// 是否被禁用
     pub disabled: bool,
     /// 连续失败次数
@@ -772,6 +824,8 @@ pub struct MultiTokenManager {
     all_cooling_fast_fail: AtomicBool,
     /// 是否在凭据持续可疑活动风控(trigger_count 达阈值)时自动禁用它。（原子镜像,reload 热更）
     auto_disable_suspicious: AtomicBool,
+    /// 均衡模式下是否叠加优先级分发（原子镜像,reload 热更）。
+    priority_in_balanced: AtomicBool,
     /// 主动 token 预刷新后台任务句柄（TIER2 热重载：改配置后 abort + respawn 即时生效不重启）。
     /// None = 当前未运行（proactive_token_refresh=false 或尚未启动）。
     refresh_task: Mutex<Option<JoinHandle<()>>>,
@@ -986,8 +1040,34 @@ impl MultiTokenManager {
             })
             .collect();
 
-        // 校验 API Key 凭据配置完整性：authMethod=api_key 时必须提供 kiroApiKey
+        // 重复 machine_id 自动轮换(防关联):多个凭据共用同一 machineId 会让上游把它们
+        // 识别为同一台设备而关联封禁。这里在入池时统计碰撞,对第 2 个及以后出现的重复
+        // machineId 重新生成一个随机唯一值(64 hex),保证每个凭据独立指纹。参考
+        // kiro-account-manager normalize_accounts 的 machine_id_counts 去重。
         let mut entries = entries;
+        {
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for entry in &mut entries {
+                let Some(mid) = entry.credentials.machine_id.clone() else {
+                    continue;
+                };
+                if !seen.insert(mid.clone()) {
+                    // 已见过 → 碰撞,重新生成唯一随机指纹(sha256(随机 UUID) → 64 hex)
+                    let mut fresh = machine_id::random_machine_id();
+                    while !seen.insert(fresh.clone()) {
+                        fresh = machine_id::random_machine_id();
+                    }
+                    tracing::warn!(
+                        "凭据 #{:?} machineId 与其它凭据重复,已自动轮换为独立指纹(防关联)",
+                        entry.id
+                    );
+                    entry.credentials.machine_id = Some(fresh);
+                    has_new_machine_ids = true;
+                }
+            }
+        }
+
+        // 校验 API Key 凭据配置完整性：authMethod=api_key 时必须提供 kiroApiKey
         for entry in &mut entries {
             if entry.credentials.kiro_api_key.is_none()
                 && entry
@@ -1033,6 +1113,7 @@ impl MultiTokenManager {
         let rpm_limit = config.credential_rpm_limit;
         let all_cooling_fast_fail = config.all_cooling_fast_fail;
         let auto_disable_suspicious = config.auto_disable_suspicious;
+        let priority_in_balanced = config.priority_in_balanced;
         let rate_limit_config = RateLimitConfig {
             daily_max_requests: config.rate_limit_daily_max,
             min_interval_ms: config.rate_limit_min_interval_ms,
@@ -1061,6 +1142,7 @@ impl MultiTokenManager {
             rpm_limit: AtomicU32::new(rpm_limit),
             all_cooling_fast_fail: AtomicBool::new(all_cooling_fast_fail),
             auto_disable_suspicious: AtomicBool::new(auto_disable_suspicious),
+            priority_in_balanced: AtomicBool::new(priority_in_balanced),
             refresh_task: Mutex::new(None),
         };
 
@@ -1113,6 +1195,8 @@ impl MultiTokenManager {
             .store(new.all_cooling_fast_fail, Ordering::Relaxed);
         self.auto_disable_suspicious
             .store(new.auto_disable_suspicious, Ordering::Relaxed);
+        self.priority_in_balanced
+            .store(new.priority_in_balanced, Ordering::Relaxed);
         *self.load_balancing_mode.lock() = new.load_balancing_mode.clone();
         self.rate_limiter.update_config(RateLimitConfig {
             daily_max_requests: new.rate_limit_daily_max,
@@ -1258,25 +1342,44 @@ impl MultiTokenManager {
                 //    共享一个 health(整族一起沉),IdC/social 各自 cred:{id} 独立(坚强兜底不受连坐)。
                 // ② rpm 饱和(硬软上限)③在途④近60s RPM⑤终身成功数⑥优先级:同健康档内的精细分流兜底。
                 // p_avail 已内含 rpm 压力/在途,②③④作同档兜底仍保留(粒度更细+rpm_limit=0 时 p_avail 不含压力)。
+                // 是否叠加优先级分发（热更开关）。开启时:先按可用性粗分层(不可用/饱和的沉底),
+                // 再按 priority 分层(越小越优先),层内仍按健康/负载均衡。这样高优先级号被优先用,
+                // 但整层被打爆(p_avail=0 或饱和)时优雅溢出到下一优先级层,不死磕单个坏号。
+                let prio_first = self.priority_in_balanced.load(Ordering::Relaxed);
                 available
                     .iter()
                     .min_by_key(|e| {
                         let key = e.credentials.family_key(e.id);
+                        // per-cred RPM 容量(>0 则用本号的,否则回退全局),供 p_avail 压力项 + 饱和判定。
+                        // 用 e.credentials.rpm_limit 直接取,避免在已持 entries 锁的闭包里二次锁死锁。
+                        let cred_rpm_cap = e
+                            .credentials
+                            .rpm_limit
+                            .filter(|&v| v > 0)
+                            .unwrap_or_else(|| self.rpm_limit.load(Ordering::Relaxed));
                         let p = self.health.p_avail(
                             &key,
                             self.rpm.count(e.id),
                             e.inflight.load(Ordering::Acquire),
-                            self.rpm_limit.load(Ordering::Relaxed),
+                            cred_rpm_cap,
                         );
                         // p_avail(0..1) → 0..100 桶,取负作升序首键(高 p 排前)。同桶内再走下面细分。
                         let neg_p_bucket = -((p * 100.0) as i64);
+                        let saturated = self.is_rpm_saturated_with_limit(e.id, e.credentials.rpm_limit);
+                        // 溢出闸:仅当该号"真不可用"(熔断 Open→p_avail=0 或 RPM 已饱和)时置 1 沉底,
+                        // 保证优先级分层不会把流量钉死在一个已打爆的高优先级号上。
+                        let unusable = (p <= 0.0 || saturated) as u8;
+                        // 优先级键仅在开关开启时参与首排;关闭时置 0(不影响原有纯健康均衡)。
+                        let prio_key = if prio_first { e.credentials.priority } else { 0 };
                         (
-                            neg_p_bucket,
-                            self.is_rpm_saturated(e.id),
-                            e.inflight.load(Ordering::Acquire),
-                            self.rpm.count(e.id),
-                            e.success_count,
-                            e.credentials.priority,
+                            unusable,          // ① 先把真不可用的沉底(优雅溢出到下一层)
+                            prio_key,          // ② 开关开:按优先级分层(越小越优先);关:恒 0
+                            neg_p_bucket,      // ③ 层内健康均衡(p_avail 高排前)
+                            saturated,         // ④ rpm 饱和兜底
+                            e.inflight.load(Ordering::Acquire), // ⑤ 在途
+                            self.rpm.count(e.id),               // ⑥ 近 60s RPM
+                            e.success_count,                    // ⑦ 终身成功数
+                            e.credentials.priority,             // ⑧ 优先级末位兜底(开关关时唯一 priority 参与点)
                         )
                     })
                     .copied()
@@ -1381,8 +1484,28 @@ impl MultiTokenManager {
     }
 
     /// 该凭据在滚动 60 秒窗口内是否已达 RPM 软上限（rpm_limit == 0 时恒为 false）
+    /// 该号近 60s RPM 是否达到容量上限（按 id,会短暂锁 entries 取 per-cred 容量）。
+    ///
+    /// ⚠️ 绝不能在已持 entries 锁时调用(parking_lot 非重入会死锁);选号热路径已持锁,
+    /// 用 [`Self::is_rpm_saturated_with_limit`] 直接传入 per-cred 容量避免二次锁。
+    /// 容量优先级:凭据级 `rpm_limit`(体质好的号可设高) > 全局 `credential_rpm_limit`。
     fn is_rpm_saturated(&self, id: u64) -> bool {
-        let lim = self.rpm_limit.load(Ordering::Relaxed);
+        let per_cred = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .and_then(|e| e.credentials.rpm_limit)
+                .filter(|&v| v > 0)
+        };
+        self.is_rpm_saturated_with_limit(id, per_cred)
+    }
+
+    /// 无锁版:调用方已持 entries 锁时用,直接传该号的凭据级 rpm_limit(None/0 则回退全局)。
+    fn is_rpm_saturated_with_limit(&self, id: u64, per_cred_limit: Option<u32>) -> bool {
+        let lim = per_cred_limit
+            .filter(|&v| v > 0)
+            .unwrap_or_else(|| self.rpm_limit.load(Ordering::Relaxed));
         lim > 0 && self.rpm.count(id) >= lim
     }
 
@@ -2381,6 +2504,7 @@ impl MultiTokenManager {
                 .map(|e| CredentialEntrySnapshot {
                     id: e.id,
                     priority: e.credentials.priority,
+                    rpm_limit: e.credentials.rpm_limit,
                     disabled: e.disabled,
                     failure_count: e.failure_count,
                     auth_method: if e.credentials.is_api_key_credential() {
@@ -2487,6 +2611,21 @@ impl MultiTokenManager {
         // 立即按新优先级重新选择当前凭据（无论持久化是否成功）
         self.select_highest_priority();
         // 持久化更改
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 设置凭据级 RPM 容量上限（0/None=继承全局）。即时生效于下次选号饱和判定。
+    pub fn set_rpm_limit(&self, id: u64, rpm_limit: Option<u32>) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            // 0 归一为 None(继承全局),避免存 Some(0) 语义歧义
+            entry.credentials.rpm_limit = rpm_limit.filter(|&v| v > 0);
+        }
         self.persist_credentials()?;
         Ok(())
     }
@@ -2850,8 +2989,11 @@ impl MultiTokenManager {
         };
 
         let cfg = self.config.load();
-        let region = credentials.effective_api_region(&cfg);
-        let host = format!("q.{}.amazonaws.com", region);
+        // 与主对话路径(endpoint/ide.rs)对齐:上游已迁 runtime.{region}.kiro.dev,
+        // 旧 q.{region}.amazonaws.com 已停用。此处深度验活曾漏迁,旧端点若停用会导致
+        // 验活恒失败 → 把活号误判成死号禁用。region 用稳健版(profileArn 严格解析)。
+        let region = credentials.effective_upstream_region(&cfg);
+        let host = format!("runtime.{}.kiro.dev", region);
         let url = format!("https://{}/generateAssistantResponse", host);
         let machine_id = machine_id::generate_from_credentials(&credentials, &cfg);
         let kiro_version = &cfg.kiro_version;
@@ -3427,6 +3569,13 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
 
+        // 陈旧刷新守卫：快照发起刷新时的 refresh_token。刷新是跨 .await 的网络调用,
+        // 期间请求路径的 try_ensure_token 等可能已用同一 refresh_token 换到新 token 并写回。
+        // 若写回时发现 entry 的 refresh_token 已不等于本次快照,说明别的路径抢先刷新成功,
+        // 本次结果已陈旧 → 丢弃写回(否则会把已轮换的新 token 覆盖回旧的,导致下次刷新用废弃
+        // 的 refresh_token 而失败)。参考 kiro-account-manager tasks/token_refresh.rs 的守卫。
+        let refresh_token_snapshot = credentials.refresh_token.clone();
+
         // 条件刷新（后台预刷新）：token 已不再将过期 → 跳过，避免重复刷新
         if let Some(lead) = conditional_lead {
             if !is_token_expiring_within(&credentials, lead).unwrap_or(false) {
@@ -3439,12 +3588,64 @@ impl MultiTokenManager {
         let new_creds =
             refresh_token(&credentials, &cfg, effective_proxy.as_ref()).await?;
 
-        // 更新 entries 中对应凭据
+        // 更新 entries 中对应凭据（写回前校验 refresh_token 未被其它路径抢先轮换）
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                if entry.credentials.refresh_token != refresh_token_snapshot {
+                    // 别的路径已刷新成功,本次结果陈旧,不覆盖(避免用旧 refresh_token 覆盖新的)
+                    tracing::debug!(
+                        "凭据 #{} 刷新结果已陈旧(refresh_token 期间被其它路径轮换),丢弃本次写回",
+                        id
+                    );
+                    return Ok(RefreshOutcome::Skipped);
+                }
                 entry.credentials = new_creds;
                 entry.refresh_failure_count = 0;
+            }
+        }
+
+        // 动态解析 profileArn:idc/Enterprise 号常无 profileArn(oidc 刷新不回传),而对话/余额
+        // 端点要求真实 profileArn(占位 ARN 对 Enterprise 号会被判 Invalid token/403)。刷新成功后
+        // 若该号仍缺 profileArn 且非 external_idp(它不带),运行时调 management ListAvailableProfiles
+        // 拿真实 arn 写回,一次解析后持久化缓存,后续对话/余额直接用真实值。失败仅告警不阻断。
+        let (needs_arn, arn_creds, arn_token) = {
+            let entries = self.entries.lock();
+            match entries.iter().find(|e| e.id == id) {
+                Some(e) => {
+                    let c = &e.credentials;
+                    let missing = c
+                        .profile_arn
+                        .as_deref()
+                        .map(|s| s.trim().is_empty())
+                        .unwrap_or(true);
+                    let eligible = missing
+                        && !c.is_external_idp_credential()
+                        && !c.is_api_key_credential();
+                    (
+                        eligible,
+                        c.clone(),
+                        c.access_token.clone().unwrap_or_default(),
+                    )
+                }
+                None => (false, KiroCredentials::default(), String::new()),
+            }
+        };
+        if needs_arn && !arn_token.is_empty() {
+            let cfg2 = self.config.load_full();
+            let proxy2 = arn_creds.effective_proxy(self.proxy.as_ref());
+            match resolve_profile_arn_via_management(&arn_creds, &cfg2, &arn_token, proxy2.as_ref())
+                .await
+            {
+                Ok(Some(arn)) => {
+                    let mut entries = self.entries.lock();
+                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                        entry.credentials.profile_arn = Some(arn.clone());
+                    }
+                    tracing::info!("凭据 #{} 动态解析到 profileArn（ListAvailableProfiles）", id);
+                }
+                Ok(None) => tracing::warn!("凭据 #{} ListAvailableProfiles 无可用 profile", id),
+                Err(e) => tracing::warn!("凭据 #{} 动态解析 profileArn 失败（不阻断）: {}", id, e),
             }
         }
 
@@ -3637,7 +3838,7 @@ mod tests {
         // 非法：攻击者域 / 内网 / http / userinfo 混淆 / 相似域后缀伪装
         for bad in [
             "https://evil.com/token",
-            "https://192.168.11.4/token",
+            "https://10.0.0.1/token", // 内网 IP（SSRF 应拒）
             "http://login.microsoftonline.com/token", // 非 https
             "https://login.microsoftonline.com@evil.com/token", // userinfo 混淆
             "https://login.microsoftonline.com.evil.com/token", // 后缀伪装
@@ -3854,6 +4055,44 @@ mod tests {
             MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
         assert_eq!(manager.total_count(), 2);
         assert_eq!(manager.available_count(), 2);
+    }
+
+    #[test]
+    fn test_duplicate_machine_id_auto_rotated() {
+        // 两个凭据显式共用同一 machineId → 入池时应把重复者轮换成独立指纹(防关联)。
+        let config = Config::default();
+        let shared = "a".repeat(64); // 合法 64-hex 格式,两个凭据故意相同
+        let mut c1 = KiroCredentials::default();
+        c1.id = Some(1);
+        c1.machine_id = Some(shared.clone());
+        let mut c2 = KiroCredentials::default();
+        c2.id = Some(2);
+        c2.machine_id = Some(shared.clone());
+
+        let mgr = MultiTokenManager::new(config, vec![c1, c2], None, None, false).unwrap();
+        let m1 = mgr.export_credential(1).unwrap().machine_id.unwrap();
+        let m2 = mgr.export_credential(2).unwrap().machine_id.unwrap();
+        assert_ne!(m1, m2, "重复 machineId 应被自动轮换成不同值");
+        // 第一个保留原值,第二个被轮换(64 hex)
+        assert_eq!(m1, shared, "首个保留原 machineId");
+        assert_eq!(m2.len(), 64, "轮换后应为 64 hex");
+        assert!(m2.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_distinct_machine_ids_untouched() {
+        // 已各自独立的 machineId 不应被改动。
+        let config = Config::default();
+        let mut c1 = KiroCredentials::default();
+        c1.id = Some(1);
+        c1.machine_id = Some("a".repeat(64));
+        let mut c2 = KiroCredentials::default();
+        c2.id = Some(2);
+        c2.machine_id = Some("b".repeat(64));
+
+        let mgr = MultiTokenManager::new(config, vec![c1, c2], None, None, false).unwrap();
+        assert_eq!(mgr.export_credential(1).unwrap().machine_id.unwrap(), "a".repeat(64));
+        assert_eq!(mgr.export_credential(2).unwrap().machine_id.unwrap(), "b".repeat(64));
     }
 
     #[test]
@@ -4269,6 +4508,38 @@ mod tests {
         // 选号：#1 虽优先级更高，但 RPM 饱和被降权 → 应选未饱和的 #2
         let ctx = manager.acquire_context(None, None).await.unwrap();
         assert_eq!(ctx.id, 2, "RPM 饱和的 #1 应被降权，改选未饱和的 #2");
+    }
+
+    #[tokio::test]
+    async fn test_per_credential_rpm_capacity_overrides_global() {
+        // per-cred rpm_limit 覆盖全局:#1 设自己的容量 5(体质好),全局是 2。
+        // 打 3 次 RPM:按全局(2)会饱和,但 #1 自己容量 5 未到 → 不饱和。
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.affinity_enabled = false;
+        config.credential_rpm_limit = 2; // 全局软上限 2
+
+        let mut c1 = KiroCredentials::default();
+        c1.priority = 0;
+        c1.rpm_limit = Some(5); // 本号容量 5,高于全局
+        c1.access_token = Some("tok1".to_string());
+        c1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut c2 = KiroCredentials::default();
+        c2.priority = 1;
+        c2.access_token = Some("tok2".to_string()); // 无 per-cred,用全局 2
+        c2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(config, vec![c1, c2], None, None, false).unwrap();
+
+        // #1 打 3 次:全局阈值 2 会判饱和,但 #1 自己容量 5 → 不饱和
+        manager.rpm.record(1);
+        manager.rpm.record(1);
+        manager.rpm.record(1);
+        assert!(!manager.is_rpm_saturated(1), "#1 有 per-cred 容量 5,打 3 次不应饱和");
+        // #2 无 per-cred,用全局 2:打 2 次即饱和
+        manager.rpm.record(2);
+        manager.rpm.record(2);
+        assert!(manager.is_rpm_saturated(2), "#2 用全局容量 2,打 2 次应饱和");
     }
 
     #[tokio::test]

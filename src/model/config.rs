@@ -158,6 +158,15 @@ pub struct Config {
     #[serde(default = "default_auto_disable_suspicious")]
     pub auto_disable_suspicious: bool,
 
+    /// 均衡负载模式下是否叠加**优先级分发**（默认 false）。
+    ///
+    /// 关闭（默认）：balanced 纯按健康/负载分摊，priority 仅作末位兜底。
+    /// 开启：balanced 先按 priority 分层（越小越优先），**层内**仍按健康/负载均衡，
+    /// 且整层饱和/熔断才优雅溢出到下一优先级层——既尊重优先级又不死磕单个被打爆的高优先级号。
+    /// 仅在 balanced 模式生效；priority 模式本就按优先级，不受影响。TIER1 热重载即时生效。
+    #[serde(default)]
+    pub priority_in_balanced: bool,
+
     /// 是否启用 prompt 缓存记账（默认 true）
     ///
     /// Kiro 上游不回传 Anthropic 的 cache_read / cache_creation 记账字段。
@@ -508,6 +517,7 @@ impl Default for Config {
             credential_rpm_limit: 0,
             all_cooling_fast_fail: default_all_cooling_fast_fail(),
             auto_disable_suspicious: default_auto_disable_suspicious(),
+            priority_in_balanced: false,
             prompt_cache_enabled: default_prompt_cache_enabled(),
             prompt_cache_ttl_seconds: default_prompt_cache_ttl_seconds(),
             callback_base_url: None,
