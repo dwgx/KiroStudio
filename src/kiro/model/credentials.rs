@@ -10,6 +10,26 @@ use std::path::Path;
 use crate::http_client::ProxyConfig;
 use crate::model::config::Config;
 
+/// 已知的 AWS/Kiro region 白名单,用于严格校验 profileArn 里解析出的 region
+/// (防污染 ARN 拼出坏 host)。含标准分区 + GovCloud + 中国分区。
+/// 参考 kiro-account-manager 的 SUPPORTED_KIRO_REGIONS。
+const SUPPORTED_KIRO_REGIONS: &[&str] = &[
+    "us-east-1", "us-east-2", "us-west-1", "us-west-2",
+    "ca-central-1", "ca-west-1",
+    "eu-west-1", "eu-west-2", "eu-west-3", "eu-central-1", "eu-central-2",
+    "eu-north-1", "eu-south-1", "eu-south-2",
+    "ap-south-1", "ap-south-2",
+    "ap-southeast-1", "ap-southeast-2", "ap-southeast-3", "ap-southeast-4",
+    "ap-northeast-1", "ap-northeast-2", "ap-northeast-3",
+    "ap-east-1",
+    "sa-east-1",
+    "me-south-1", "me-central-1",
+    "af-south-1",
+    "il-central-1",
+    "us-gov-east-1", "us-gov-west-1",
+    "cn-north-1", "cn-northwest-1",
+];
+
 /// Kiro OAuth 凭证
 ///
 /// ⚠️ 安全：**刻意不派生 `Debug`**，改为手写脱敏实现（见下方 `impl Debug`）。
@@ -73,6 +93,15 @@ pub struct KiroCredentials {
     #[serde(default)]
     #[serde(skip_serializing_if = "is_zero")]
     pub priority: u32,
+
+    /// 凭据级 RPM 容量上限（每分钟请求数，可选）。
+    ///
+    /// None/0 = 继承全局 `credential_rpm_limit`。设了就用本号自己的容量:体质好的号(如
+    /// Enterprise)可设高(100),弱号设低。用于 balanced 选号的 per-号饱和判定 + 优先级备份溢出:
+    /// 高优先级号近 60s RPM 接近**它自己的**容量时才判饱和、溢出分流给下一优先级备份号。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpm_limit: Option<u32>,
 
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
@@ -319,6 +348,49 @@ impl KiroCredentials {
             .unwrap_or(config.effective_api_region())
     }
 
+    /// 上游 kiro.dev/CodeWhisperer 端点构建时,用于 region 解析优先级的**稳健**版:
+    /// profileArn 第 4 段(严格校验) > 凭据 region/auth_region > config。
+    ///
+    /// 为何要严格校验而非裸 `split(':').nth(3)`:profileArn 可能被污染(存错值 / 非
+    /// codewhisperer ARN / 臆造 region),裸取第 4 段会直接拼成坏 host(如
+    /// `runtime.{垃圾}.kiro.dev`)导致 DNS 失败/502。故:①先校验 ARN 前缀
+    /// (`arn:aws:codewhisperer:`)②再校验第 4 段命中已知 region 白名单,任一不过
+    /// 就跳过 profileArn,回退凭据/config region。(白名单校验参考 kiro-account-manager。)
+    pub fn effective_upstream_region<'a>(&'a self, config: &'a Config) -> &'a str {
+        if let Some(region) = self
+            .profile_arn
+            .as_deref()
+            .and_then(Self::region_from_profile_arn)
+        {
+            return region;
+        }
+        self.region
+            .as_deref()
+            .filter(|r| !r.is_empty())
+            .or(self.auth_region.as_deref().filter(|r| !r.is_empty()))
+            .unwrap_or_else(|| self.effective_api_region(config))
+    }
+
+    /// 从 profileArn 严格解析 region:必须形如
+    /// `arn:aws:codewhisperer:{region}:{account}:profile/{id}` 且 region 命中白名单,
+    /// 否则返回 None(交由上层回退)。
+    pub fn region_from_profile_arn(arn: &str) -> Option<&str> {
+        let mut segs = arn.split(':');
+        if segs.next()? != "arn" {
+            return None;
+        }
+        segs.next()?; // partition: aws / aws-us-gov / aws-cn（不强制,region 白名单已足够约束分区）
+        if segs.next()? != "codewhisperer" {
+            return None;
+        }
+        let region = segs.next()?;
+        if SUPPORTED_KIRO_REGIONS.contains(&region) {
+            Some(region)
+        } else {
+            None
+        }
+    }
+
     /// 获取有效的代理配置
     /// 优先级：凭据代理 > 全局代理 > 无代理
     /// 特殊值 "direct" 表示显式不使用代理（即使全局配置了代理）
@@ -390,11 +462,31 @@ impl KiroCredentials {
     ///
     /// 仅用于 overage 开关等 Web Portal 调用；返回空串表示该凭据不支持。
     pub fn should_send_profile_arn(&self) -> bool {
-        if self.profile_arn.is_none() {
-            return false;
-        }
+        self.effective_profile_arn().is_some()
+    }
 
-        !self.is_external_idp_credential()
+    /// 实际应注入/发送的 profileArn（对话 body / MCP header / 余额 query 统一走这里）。
+    ///
+    /// 规则(对齐 Kiro IDE + kiro-account-manager,修复新加 idc 号缺 profileArn 报
+    /// `400 profileArn is required`):
+    /// - external_idp(M365 企业)→ `None`：这类号带 profileArn 反而 403，绝不发。
+    /// - 自带真实 profile_arn → 用它。
+    /// - idc/social/api_key 缺 profile_arn → 回退默认 BuilderId profileArn（Kiro IDE 公共
+    ///   占位 ARN，上游接受）。**根治**:idc 号入池时常没 profileArn(登录未拉),
+    ///   而对话/余额端点要求必带,缺了就 400/403。
+    ///
+    /// 注:更智能的做法是运行时 ListAvailableProfiles 拉真实 ARN 并持久化（见研究备忘），
+    /// 此处先用默认回退保证可用,动态解析作为后续增强。
+    pub fn effective_profile_arn(&self) -> Option<String> {
+        if self.is_external_idp_credential() {
+            return None;
+        }
+        if let Some(arn) = self.profile_arn.as_deref() {
+            if !arn.trim().is_empty() {
+                return Some(arn.to_string());
+            }
+        }
+        Some(crate::kiro::token_manager::DEFAULT_BUILDER_ID_PROFILE_ARN.to_string())
     }
 
     pub fn is_external_idp_credential(&self) -> bool {
@@ -474,6 +566,96 @@ mod tests {
     use super::*;
     use crate::model::config::Config;
 
+    #[test]
+    fn test_region_from_profile_arn_valid() {
+        assert_eq!(
+            KiroCredentials::region_from_profile_arn(
+                "arn:aws:codewhisperer:us-east-1:123456789012:profile/ABC"
+            ),
+            Some("us-east-1")
+        );
+        assert_eq!(
+            KiroCredentials::region_from_profile_arn(
+                "arn:aws-us-gov:codewhisperer:us-gov-west-1:1:profile/X"
+            ),
+            Some("us-gov-west-1")
+        );
+    }
+
+    #[test]
+    fn test_region_from_profile_arn_rejects_polluted() {
+        // 非 codewhisperer ARN → None（不会误取第 4 段当 region）
+        assert_eq!(
+            KiroCredentials::region_from_profile_arn("arn:aws:s3:::my-bucket/key"),
+            None
+        );
+        // region 不在白名单（臆造/垃圾）→ None
+        assert_eq!(
+            KiroCredentials::region_from_profile_arn(
+                "arn:aws:codewhisperer:not-a-region:1:profile/X"
+            ),
+            None
+        );
+        // 非 arn 前缀 → None
+        assert_eq!(
+            KiroCredentials::region_from_profile_arn("garbage:aws:codewhisperer:us-east-1:1:x"),
+            None
+        );
+        // 空/残缺 → None（不 panic）
+        assert_eq!(KiroCredentials::region_from_profile_arn(""), None);
+        assert_eq!(KiroCredentials::region_from_profile_arn("arn:aws"), None);
+    }
+
+    #[test]
+    fn test_effective_profile_arn_idc_falls_back_to_default() {
+        // 根治新加 idc 号缺 profileArn 报 400:idc 缺 profileArn 应回退默认 BuilderId ARN
+        let mut idc = KiroCredentials::default();
+        idc.auth_method = Some("idc".to_string());
+        idc.profile_arn = None;
+        let arn = idc.effective_profile_arn();
+        assert_eq!(
+            arn.as_deref(),
+            Some(crate::kiro::token_manager::DEFAULT_BUILDER_ID_PROFILE_ARN),
+            "idc 缺 profileArn 应回退默认 BuilderId ARN(否则对话 400 profileArn is required)"
+        );
+        assert!(idc.should_send_profile_arn(), "idc 应发送 profileArn");
+    }
+
+    #[test]
+    fn test_effective_profile_arn_uses_real_when_present() {
+        let mut idc = KiroCredentials::default();
+        idc.auth_method = Some("idc".to_string());
+        idc.profile_arn = Some("arn:aws:codewhisperer:us-east-1:111:profile/REAL".to_string());
+        assert_eq!(
+            idc.effective_profile_arn().as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:111:profile/REAL")
+        );
+    }
+
+    #[test]
+    fn test_effective_profile_arn_external_idp_none() {
+        // external_idp(M365)带 profileArn 反而 403,必须返回 None 不发
+        let mut ext = KiroCredentials::default();
+        ext.auth_method = Some("external_idp".to_string());
+        ext.profile_arn = Some("arn:aws:codewhisperer:us-east-1:222:profile/X".to_string());
+        assert_eq!(ext.effective_profile_arn(), None, "external_idp 绝不发 profileArn");
+        assert!(!ext.should_send_profile_arn());
+    }
+
+    #[test]
+    fn test_effective_upstream_region_fallback() {
+        let config = Config::default();
+        // profileArn 污染 → 回退凭据 region（不拼坏 host）
+        let mut c = KiroCredentials::default();
+        c.profile_arn = Some("arn:aws:s3:::bucket".to_string());
+        c.region = Some("eu-central-1".to_string());
+        assert_eq!(c.effective_upstream_region(&config), "eu-central-1");
+        // profileArn 合法 → 优先用 ARN region（压过凭据 region）
+        c.profile_arn =
+            Some("arn:aws:codewhisperer:ap-northeast-1:1:profile/X".to_string());
+        assert_eq!(c.effective_upstream_region(&config), "ap-northeast-1");
+    }
+
     /// 安全回归：Debug 输出绝不含敏感凭证明文（防 HIGH-1 日志泄露复发）。
     #[test]
     fn test_debug_masks_secrets() {
@@ -552,6 +734,7 @@ mod tests {
             issuer_url: None,
             scopes: None,
             priority: 0,
+            rpm_limit: None,
             region: None,
             auth_region: None,
             api_region: None,
@@ -674,6 +857,7 @@ mod tests {
             issuer_url: None,
             scopes: None,
             priority: 0,
+            rpm_limit: None,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
             api_region: None,
@@ -709,6 +893,7 @@ mod tests {
             issuer_url: None,
             scopes: None,
             priority: 0,
+            rpm_limit: None,
             region: None,
             auth_region: None,
             api_region: None,
@@ -827,6 +1012,7 @@ mod tests {
             issuer_url: None,
             scopes: None,
             priority: 3,
+            rpm_limit: None,
             region: Some("us-west-2".to_string()),
             auth_region: None,
             api_region: None,

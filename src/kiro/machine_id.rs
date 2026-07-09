@@ -70,6 +70,15 @@ fn normalize_machine_id(machine_id: &str) -> Option<String> {
 ///    - API Key 凭据：基于 `kiroApiKey` 派生
 ///    - OAuth 凭据：基于 `refreshToken` 派生
 /// 4. 兜底：基于随机种子派生，按 `credentials.id` 在进程内缓存（首次触发 warn 日志）
+/// 生成一个全新的随机 machineId（64 字符十六进制）。
+///
+/// 用于「重复 machineId 自动轮换」：当多个凭据共用同一指纹时,给碰撞者换一个
+/// 独立随机指纹(sha256(随机 UUID)),避免上游按设备指纹关联多个号。每次调用产出
+/// 不同值,不进任何缓存。
+pub fn random_machine_id() -> String {
+    sha256_hex(&Uuid::new_v4().to_string())
+}
+
 pub fn generate_from_credentials(credentials: &KiroCredentials, config: &Config) -> String {
     // 如果配置了凭据级 machineId，优先使用
     if let Some(ref machine_id) = credentials.machine_id {

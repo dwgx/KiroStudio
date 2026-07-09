@@ -3,6 +3,7 @@ import {
   getCredentials,
   setCredentialDisabled,
   setCredentialPriority,
+  setCredentialRpmLimit,
   resetCredentialFailure,
   forceRefreshToken,
   getCredentialBalance,
@@ -86,6 +87,17 @@ export function useSetPriority() {
   return useMutation({
     mutationFn: ({ id, priority }: { id: number; priority: number }) =>
       setCredentialPriority(id, priority),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+export function useSetRpmLimit() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, rpmLimit }: { id: number; rpmLimit: number }) =>
+      setCredentialRpmLimit(id, rpmLimit),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },

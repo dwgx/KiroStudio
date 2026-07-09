@@ -201,6 +201,7 @@ interface FormState {
   rateLimitDailyMax: string
   rateLimitMinIntervalMs: string
   affinityEnabled: boolean
+  priorityInBalanced: boolean
   proxyUrl: string
   proxyUsername: string
   proxyPassword: string
@@ -251,6 +252,7 @@ function toForm(c: ConfigSnapshotResponse): FormState {
     rateLimitDailyMax: String(c.rateLimitDailyMax),
     rateLimitMinIntervalMs: String(c.rateLimitMinIntervalMs),
     affinityEnabled: c.affinityEnabled,
+    priorityInBalanced: c.priorityInBalanced,
     proxyUrl: c.proxyUrl ?? '',
     // 代理账密出于安全后端不下发,UI 留空占位:留空=不改,填了=更新。
     proxyUsername: '',
@@ -1307,6 +1309,7 @@ export function SettingsPage() {
     const interval = Number(form.rateLimitMinIntervalMs)
     if (Number.isFinite(interval) && interval !== config.rateLimitMinIntervalMs) d.rateLimitMinIntervalMs = interval
     if (form.affinityEnabled !== config.affinityEnabled) d.affinityEnabled = form.affinityEnabled
+    if (form.priorityInBalanced !== config.priorityInBalanced) d.priorityInBalanced = form.priorityInBalanced
     if (form.proxyUrl.trim() !== (config.proxyUrl ?? '')) d.proxyUrl = form.proxyUrl.trim()
     // 代理账密:后端不下发(安全),故只在用户填了内容时才发送(留空=保持不变)。
     if (form.proxyUsername.trim() !== '') d.proxyUsername = form.proxyUsername.trim()
@@ -1497,6 +1500,16 @@ export function SettingsPage() {
               均衡负载
             </Button>
           </div>
+          <Field
+            label="均衡模式叠加优先级分发"
+            hint="开启后:均衡负载也先按 priority 分层(越小越优先),层内仍按健康/负载均衡,整层打满才溢出到下一层。保存即时生效。"
+          >
+            <Switch
+              checked={form.priorityInBalanced}
+              onCheckedChange={(v) => set('priorityInBalanced', v)}
+              disabled={form.loadBalancingMode !== 'balanced'}
+            />
+          </Field>
         </CardContent>
       </Card>
       </SectionGate>
