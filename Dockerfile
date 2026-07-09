@@ -13,7 +13,10 @@ FROM node:22-alpine AS frontend-builder
 WORKDIR /app/admin-ui
 # 先只拷贝依赖清单，命中 Docker 层缓存（源码变动不必重装依赖）
 COPY admin-ui/package.json admin-ui/pnpm-lock.yaml admin-ui/.npmrc ./
-RUN npm install -g pnpm && pnpm install --frozen-lockfile
+# 固定 pnpm 大版本与 lockfile(lockfileVersion 9.0)匹配:不 pin 会拉到 pnpm v10+,
+# 它对未批准的 build 脚本(@swc/core/esbuild)在 --frozen-lockfile 下硬失败(ERR_PNPM_IGNORED_BUILDS),
+# 导致 docker 一键构建当场崩(fresh clone 实测)。pnpm@9 与本 lockfile 一致且行为稳定。
+RUN npm install -g pnpm@9 && pnpm install --frozen-lockfile
 COPY admin-ui ./
 RUN pnpm build
 
