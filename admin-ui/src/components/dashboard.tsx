@@ -14,6 +14,7 @@ import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useSetDisabled } from '@/hooks/use-credentials'
 import { getCredentialBalance, getCachedBalances, forceRefreshToken, deepVerifyCredential } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
+import { PageSkeleton } from '@/components/ui/page-skeleton'
 import type { BalanceResponse } from '@/types/api'
 
 interface DashboardProps {
@@ -594,12 +595,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   }
 
   if (isLoading) {
+    // 骨架屏替代蓝色转圈圈：贴合凭据管理页布局(统计卡 + 凭据卡网格)
     return (
-      <div className={embedded ? "flex items-center justify-center py-24" : "min-h-screen flex items-center justify-center bg-background"}>
-        <div className="text-center">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary mx-auto mb-4"></div>
-          <p className="text-muted-foreground">加载中...</p>
-        </div>
+      <div className={embedded ? "" : "min-h-screen bg-background p-8"}>
+        <PageSkeleton kind="credentials" />
       </div>
     )
   }
