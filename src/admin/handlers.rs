@@ -11,6 +11,7 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
+        SetRpmLimitRequest,
         SuccessResponse,
     },
 };
@@ -49,6 +50,23 @@ pub async fn set_credential_priority(
         Ok(_) => Json(SuccessResponse::new(format!(
             "凭据 #{} 优先级已设置为 {}",
             id, payload.priority
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/rpm-limit
+/// 设置凭据级 RPM 容量上限（0/null=继承全局）
+pub async fn set_credential_rpm_limit(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetRpmLimitRequest>,
+) -> impl IntoResponse {
+    match state.service.set_rpm_limit(id, payload.rpm_limit) {
+        Ok(_) => Json(SuccessResponse::new(format!(
+            "凭据 #{} RPM 容量已设置为 {:?}",
+            id, payload.rpm_limit
         )))
         .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
@@ -567,7 +585,9 @@ pub struct ExternalIdpPasteRequest {
 }
 
 fn default_priority() -> u32 {
-    100
+    // 默认 0:所有号平权(priority 越小越优先,0 即最高且彼此相等)。
+    // dwgx:新号默认 100 没必要,都 0 就行,想区分优先级再手动改。
+    0
 }
 
 // ============ 运维：一键重启 / 存储统计与清理 ============

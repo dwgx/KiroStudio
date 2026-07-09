@@ -284,6 +284,7 @@ impl AdminService {
                 CredentialStatusItem {
                 id: entry.id,
                 priority: entry.priority,
+                rpm_limit: entry.rpm_limit,
                 disabled: entry.disabled,
                 failure_count: entry.failure_count,
                 is_current: entry.id == snapshot.current_id,
@@ -345,11 +346,14 @@ impl AdminService {
             .into_iter()
             .map(|e| {
                 let cd = cooldowns.get(&e.id);
-                // 火力全开判定:配了软上限就按上限;没配上限(credential_rpm_limit=0,线上默认)时,
-                // 用固定高水位 30/min 兜底——否则 rpm_limit=0 会让 saturated 恒 false,火焰永不触发。
+                // per-cred 有效容量:该号自己的 rpm_limit(>0) 优先,否则回退全局。
+                // 修复:#68 设 100 时,insight 不能再按全局阈值误判饱和 + 火焰误触发。
+                let eff_limit = e.rpm_limit.filter(|&v| v > 0).unwrap_or(rpm_limit);
+                // 火力全开判定:配了软上限就按上限;没配上限(=0,线上默认)时用固定高水位 30/min 兜底
+                // ——否则 limit=0 会让 saturated 恒 false,火焰永不触发。
                 const SATURATION_FALLBACK_RPM: u32 = 30;
-                let saturated = if rpm_limit > 0 {
-                    e.rpm >= rpm_limit
+                let saturated = if eff_limit > 0 {
+                    e.rpm >= eff_limit
                 } else {
                     e.rpm >= SATURATION_FALLBACK_RPM
                 };
@@ -362,11 +366,11 @@ impl AdminService {
                     .map(|c| c.trigger_count)
                     .unwrap_or(0);
                 let insight_text =
-                    build_insight_text(e.id, e.rpm, rpm_limit, saturated, e.disabled, cd);
+                    build_insight_text(e.id, e.rpm, eff_limit, saturated, e.disabled, cd);
                 RateLimitInsight {
                     id: e.id,
                     rpm: e.rpm,
-                    rpm_limit,
+                    rpm_limit: eff_limit,
                     rpm_saturated: saturated && !e.disabled,
                     inflight: e.inflight,
                     disabled: e.disabled,
@@ -440,6 +444,13 @@ impl AdminService {
     pub fn set_priority(&self, id: u64, priority: u32) -> Result<(), AdminServiceError> {
         self.token_manager
             .set_priority(id, priority)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 设置凭据级 RPM 容量上限（0/None=继承全局）
+    pub fn set_rpm_limit(&self, id: u64, rpm_limit: Option<u32>) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_rpm_limit(id, rpm_limit)
             .map_err(|e| self.classify_error(e, id))
     }
 
@@ -768,6 +779,7 @@ impl AdminService {
             issuer_url: req.issuer_url,
             scopes: req.scopes,
             priority: req.priority,
+            rpm_limit: req.rpm_limit,
             region: req.region,
             auth_region: req.auth_region,
             api_region: req.api_region,
@@ -915,6 +927,7 @@ impl AdminService {
             rate_limit_daily_max: config.rate_limit_daily_max,
             rate_limit_min_interval_ms: config.rate_limit_min_interval_ms,
             affinity_enabled: config.affinity_enabled,
+            priority_in_balanced: config.priority_in_balanced,
             has_proxy: config.proxy_url.is_some(),
             proxy_url: config.proxy_url.clone(),
             has_admin_key: config
@@ -1115,6 +1128,12 @@ impl AdminService {
         if let Some(v) = req.affinity_enabled {
             if v != config.affinity_enabled {
                 config.affinity_enabled = v;
+                hot_changed = true;
+            }
+        }
+        if let Some(v) = req.priority_in_balanced {
+            if v != config.priority_in_balanced {
+                config.priority_in_balanced = v;
                 hot_changed = true;
             }
         }
