@@ -19,6 +19,10 @@ services:
       dockerfile: Dockerfile
     image: kirostudio:latest
     container_name: kirostudio
+    # 以宿主当前用户 uid:gid 运行(install.sh 写入 .env)。否则容器内 USER app 的 uid 与
+    # bind-mount 的 config(宿主用户所有, 0600)uid 不符 → 读配置 Permission denied 崩溃循环。
+    # 缺省 0:0(root)兜底可读任何 bind-mount 文件;install.sh 会填成真实 uid:gid。
+    user: "${KIROSTUDIO_UID:-0}:${KIROSTUDIO_GID:-0}"
     # 允许容器内访问宿主机服务（如本机代理），Linux 上映射 host-gateway
     extra_hosts:
       - "host.docker.internal:host-gateway"
