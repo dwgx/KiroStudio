@@ -52,6 +52,11 @@ static BG_POOL: OnceLock<BgPool> = OnceLock::new();
 /// 默认 1=启用；由 main 在启动时按配置写入，支持后续被 update_config 立即改写。
 static LOGIN_BG_ENABLED: AtomicU64 = AtomicU64::new(1);
 
+/// 登录页背景是否走 R18 图源（`login_background_r18` 的运行时镜像）。
+/// 默认 1=开启（r18=1）；由 main 在启动时按配置写入，支持后续被 update_config 立即改写。
+/// 下一轮后台预取 / 池空实时兜底拉取时读取此镜像决定 r18 参数。
+static LOGIN_BG_R18: AtomicU64 = AtomicU64::new(1);
+
 fn bg_pool() -> &'static BgPool {
     BG_POOL.get_or_init(|| BgPool {
         imgs: Mutex::new(Vec::new()),
@@ -65,6 +70,20 @@ pub fn set_login_background_enabled(enabled: bool) {
 
 fn login_background_enabled() -> bool {
     LOGIN_BG_ENABLED.load(Ordering::Relaxed) != 0
+}
+
+/// 设置登录页背景 R18 开关（供 main 启动接线 / update_config 立即生效调用）。
+pub fn set_login_background_r18(r18: bool) {
+    LOGIN_BG_R18.store(if r18 { 1 } else { 0 }, Ordering::Relaxed);
+}
+
+fn login_background_r18() -> bool {
+    LOGIN_BG_R18.load(Ordering::Relaxed) != 0
+}
+
+/// 按当前 R18 开关取 lolicon 的 r18 参数值（开=1，关=0=全年龄）。
+fn r18_param() -> u8 {
+    if login_background_r18() { 1 } else { 0 }
 }
 
 /// 背景图内存池统计：返回 (张数, 总字节数)。供 admin 存储统计端点展示。
@@ -158,9 +177,10 @@ async fn fetch_bg_batch() {
         }
     };
 
-    // 一次向 lolicon 要 BG_FETCH_BATCH 张（纯 R18 横图，用户自用）。
+    // 一次向 lolicon 要 BG_FETCH_BATCH 张横图（r18 参数按配置开关取，用户自用）。
     let api = format!(
-        "https://api.lolicon.app/setu/v2?r18=1&size=regular&excludeAI=true&num={}&aspectRatio=gt1.2",
+        "https://api.lolicon.app/setu/v2?r18={}&size=regular&excludeAI=true&num={}&aspectRatio=gt1.2",
+        r18_param(),
         BG_FETCH_BATCH
     );
     let body: serde_json::Value = match client.get(&api).send().await {
@@ -373,8 +393,11 @@ async fn random_bg_handler() -> impl IntoResponse {
         Some(c) => c,
         None => return Json(serde_json::json!({"url": null})).into_response(),
     };
-    let api = "https://api.lolicon.app/setu/v2?r18=1&size=regular&excludeAI=true&num=1&aspectRatio=gt1.2";
-    let body: serde_json::Value = match client.get(api).send().await {
+    let api = format!(
+        "https://api.lolicon.app/setu/v2?r18={}&size=regular&excludeAI=true&num=1&aspectRatio=gt1.2",
+        r18_param()
+    );
+    let body: serde_json::Value = match client.get(&api).send().await {
         Ok(r) => match r.json().await {
             Ok(v) => v,
             Err(_) => return Json(serde_json::json!({"url": null})).into_response(),

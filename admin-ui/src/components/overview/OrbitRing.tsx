@@ -1,8 +1,7 @@
 import { useMemo } from 'react'
 import type { CredentialStatusItem } from '@/types/api'
-import { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider } from '@/components/ui/tooltip'
 import type { CellActivity } from '@/components/overview/StatusHeatmap'
-import { healthOf, HEALTH_RGB, CredTooltipBody, EmptyPool } from '@/components/overview/credViz'
+import { healthOf, HEALTH_RGB, EmptyPool, useHoverCard } from '@/components/overview/credViz'
 
 export interface OrbitRingProps {
   credentials: CredentialStatusItem[]
@@ -61,6 +60,8 @@ function placeNodes(creds: CredentialStatusItem[]): { nodes: PlacedNode[]; rings
  */
 export function OrbitRing({ credentials, activity, className }: OrbitRingProps) {
   const { nodes, rings } = useMemo(() => placeNodes(credentials), [credentials])
+  // 鼠标跟随悬浮卡（替代 Radix Tooltip 固定 side 的边缘翻转，卡片黏着鼠标走）。
+  const hoverCard = useHoverCard()
 
   if (credentials.length === 0) {
     return <EmptyPool className={className} />
@@ -69,7 +70,6 @@ export function OrbitRing({ credentials, activity, className }: OrbitRingProps) 
   const available = credentials.filter((c) => !c.disabled).length
 
   return (
-    <TooltipProvider delayDuration={80}>
       <div className={className}>
         <div className="relative mx-auto aspect-square w-full max-w-[380px]">
           <svg viewBox={`0 0 ${VIEWBOX} ${VIEWBOX}`} className="h-full w-full overflow-visible">
@@ -112,9 +112,13 @@ export function OrbitRing({ credentials, activity, className }: OrbitRingProps) 
               const act = activity?.get(c.id)
               const lit = h !== 'disabled'
               return (
-                <Tooltip key={c.id}>
-                  <TooltipTrigger asChild>
-                    <g className="cursor-pointer">
+                    <g
+                      key={c.id}
+                      className="cursor-pointer"
+                      onMouseEnter={(e) => hoverCard.show(c, e)}
+                      onMouseMove={hoverCard.move}
+                      onMouseLeave={hoverCard.hide}
+                    >
                       {/* 命中涟漪：pulse 变化重挂载，向外扩散淡出 */}
                       {act && act.pulse > 0 && lit && (
                         <circle
@@ -157,11 +161,6 @@ export function OrbitRing({ credentials, activity, className }: OrbitRingProps) 
                       {/* 健康号中心高光点 */}
                       {lit && <circle cx={x} cy={y - 1.5} r={1.6} fill="rgb(255 255 255 / 0.7)" />}
                     </g>
-                  </TooltipTrigger>
-                  <TooltipContent>
-                    <CredTooltipBody c={c} act={act} />
-                  </TooltipContent>
-                </Tooltip>
               )
             })}
           </svg>
@@ -177,7 +176,8 @@ export function OrbitRing({ credentials, activity, className }: OrbitRingProps) 
             </span>
           </div>
         </div>
+      {/* 鼠标跟随悬浮卡（正文 CredTooltipBody 不变，仅定位改为黏鼠标） */}
+      {hoverCard.render((id) => activity?.get(id))}
       </div>
-    </TooltipProvider>
   )
 }
