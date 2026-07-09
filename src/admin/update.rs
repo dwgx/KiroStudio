@@ -285,6 +285,33 @@ async fn download_asset(tag: &str, asset: &str) -> anyhow::Result<Vec<u8>> {
     anyhow::bail!("所有镜像下载 {asset} 均失败: {last_err}")
 }
 
+/// 仅从 github.com 直连下载（不走任何第三方镜像/代理）。
+///
+/// 安全(H1):sha256 校验文件必须走**与二进制独立的可信信道**。原实现里二进制和 .sha256
+/// 都走 asset_candidates()(gh-proxy.org 系列第三方代理优先),同源 → 恶意/被劫持的镜像可
+/// 同时返回后门二进制 + 与之匹配的 .sha256,校验必过 = RCE。此函数强制 .sha256 只从
+/// github.com 直连(TLS 证书校验由 reqwest 默认开启,无第三方 TLS 终止方能改写),
+/// 使 sha256 的信任根与二进制的下载源解耦——镜像即便投毒二进制,也改不了直连 GitHub 的哈希。
+/// (二进制仍可走镜像加速;完整方案是内置公钥验签,另立项。)
+async fn download_from_github_direct(tag: &str, asset: &str) -> anyhow::Result<Vec<u8>> {
+    let client = http_client();
+    let url = format!("https://github.com/{GITHUB_REPO}/releases/download/{tag}/{asset}");
+    tracing::info!("[Update] 直连 github.com 下载 {asset}（独立可信信道,不走镜像）…");
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("直连 GitHub 下载 {asset} 失败: {e}"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("直连 GitHub 下载 {asset} 返回 {}", resp.status());
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| anyhow::anyhow!("直连 GitHub 读取 {asset} 响应体失败: {e}"))?;
+    Ok(bytes.to_vec())
+}
+
 /// 执行 OTA 更新：下载新二进制 + sha256 校验 + 备份 + 原子替换。
 ///
 /// **不在此函数里重启**——替换成功后由 handler 调用 `restart_service` 触发 systemd 拉起新二进制，
@@ -315,11 +342,14 @@ pub async fn perform_update(target: Option<String>) -> anyhow::Result<UpdatePerf
         });
     }
 
-    // 2) 下载二进制 + sha256 文件
+    // 2) 下载二进制（可走镜像加速）+ sha256 文件（强制 github.com 直连,独立可信信道）
     let bin = download_asset(&tag, ASSET_BIN).await?;
-    let sha_txt = download_asset(&tag, &format!("{ASSET_BIN}.sha256")).await?;
+    // 安全(H1):sha256 只从 github 直连取,不走 asset_candidates 的第三方镜像——
+    // 否则二进制与哈希同源,恶意镜像给"后门二进制+匹配哈希"即绕过校验=RCE。
+    // 直连失败宁可中止升级,也不退回镜像取哈希(那等于没校验)。
+    let sha_txt = download_from_github_direct(&tag, &format!("{ASSET_BIN}.sha256")).await?;
 
-    // 3) ⭐sha256 校验（安全红线，不可省——防镜像/中间人替换二进制 = RCE）
+    // 3) ⭐sha256 校验（安全红线：哈希来自 github 直连、与二进制下载源解耦,镜像投毒改不了哈希）
     let expected = String::from_utf8_lossy(&sha_txt)
         .split_whitespace()
         .next()
