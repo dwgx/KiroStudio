@@ -10,6 +10,8 @@ import {
   LogOut,
 } from 'lucide-react'
 import { LoginDialog } from '@/components/login-dialog'
+import { PageSkeleton } from '@/components/ui/page-skeleton'
+import { usePoolNotifications } from '@/hooks/use-pool-notifications'
 
 const Dashboard = lazy(() =>
   import('@/components/dashboard').then((m) => ({ default: m.Dashboard }))
@@ -48,6 +50,9 @@ export function AppShell({ onLogout }: AppShellProps) {
   const [tab, setTab] = useState<Tab>('overview')
   const [loginOpen, setLoginOpen] = useState(false)
   const queryClient = useQueryClient()
+
+  // 号池健康事件通知（右下角 toast，状态跃迁时弹一次；复用已有轮询数据，零额外上游调用）。
+  usePoolNotifications()
 
   const handleLogout = () => {
     storage.removeApiKey()
@@ -133,13 +138,7 @@ export function AppShell({ onLogout }: AppShellProps) {
 
         {/* Page Content */}
         <div className="max-w-[1200px] mx-auto px-8 py-8">
-          <Suspense
-            fallback={
-              <div className="flex items-center justify-center py-24">
-                <div className="animate-spin rounded-full h-8 w-8 border-2 border-[#2e2e2e] border-t-[#0070f3]" />
-              </div>
-            }
-          >
+          <Suspense fallback={<PageSkeleton kind={tab} />}>
             {tab === 'overview' && <OverviewPage />}
             {tab === 'usage' && <UsagePage />}
             {tab === 'credentials' && <Dashboard onLogout={onLogout} embedded />}
