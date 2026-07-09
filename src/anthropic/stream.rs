@@ -8,6 +8,123 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::kiro::model::events::Event;
+use crate::usage::RequestOutcome;
+
+/// 一次响应的**完成状态**，贯穿流式 / 缓冲 / 非流式三条收尾路径。
+///
+/// # 为什么需要它
+///
+/// 历史 BUG：上游在流中途发来 in-band `Event::Error`、或读流/解码中断时，收尾逻辑
+/// 仍按 `message_stop` + HTTP 200 正常结束，用量埋点也硬编码 `outcome=Success`。
+/// 下游 Claude Code 收到 200 + `end_turn` 就把**截断输出当成功**，既不重试、又污染
+/// 熔断/健康信号（失败被记成成功）。
+///
+/// `CompletionStatus` 把「这次到底成没成」显式建模，收尾时据此统一决定三件事：
+/// - 用量记账的 [`RequestOutcome`]（RateLimited / ServerError / NetworkError…）
+/// - 回给客户端的 SSE `error` 事件类型（overloaded_error / api_error）
+/// - 非流式响应的 HTTP 状态码（429 / 502）
+///
+/// # 铁律
+///
+/// `ContentLengthExceededException`（= max_tokens 干净收尾）**不是**失败，
+/// 不设置任何非 `Ok` 状态；它照常走 message_stop + 200。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompletionStatus {
+    /// 正常完成（含 max_tokens 干净收尾）
+    Ok,
+    /// 上游在响应流中 in-band 下发的错误事件（`:message-type=error`）
+    UpstreamError { code: String, message: String },
+    /// 读流 / 读响应体传输中断（未拿到完整响应）
+    TransportError { message: String },
+    /// 解码器连续错误超限、永久停止（响应必然截断）
+    DecoderStopped { message: String },
+}
+
+impl CompletionStatus {
+    /// 是否正常完成
+    pub fn is_ok(&self) -> bool {
+        matches!(self, CompletionStatus::Ok)
+    }
+
+    /// 映射为用量记账的最终结果分类。
+    ///
+    /// 上游错误按 code/message 关键字粗分：限流类 → `RateLimited`，其余 → `ServerError`；
+    /// 传输中断 → `NetworkError`；解码器停止 → `ServerError`（响应被上游截断）。
+    pub fn outcome(&self) -> RequestOutcome {
+        match self {
+            CompletionStatus::Ok => RequestOutcome::Success,
+            CompletionStatus::UpstreamError { code, message } => {
+                if is_rate_limit_signal(code) || is_rate_limit_signal(message) {
+                    RequestOutcome::RateLimited
+                } else {
+                    RequestOutcome::ServerError
+                }
+            }
+            CompletionStatus::TransportError { .. } => RequestOutcome::NetworkError,
+            CompletionStatus::DecoderStopped { .. } => RequestOutcome::ServerError,
+        }
+    }
+
+    /// 回给客户端的 SSE `error` 事件的 `type` 字段。
+    ///
+    /// 限流类用 `overloaded_error`（Claude Code 会按过载退避重试），其余用 `api_error`。
+    pub fn sse_error_type(&self) -> &'static str {
+        match self {
+            CompletionStatus::Ok => "api_error",
+            CompletionStatus::UpstreamError { code, message } => {
+                if is_rate_limit_signal(code) || is_rate_limit_signal(message) {
+                    "overloaded_error"
+                } else {
+                    "api_error"
+                }
+            }
+            CompletionStatus::TransportError { .. } => "api_error",
+            CompletionStatus::DecoderStopped { .. } => "api_error",
+        }
+    }
+
+    /// 非流式响应的 HTTP 状态码：限流 429，其余 502。
+    pub fn http_status_u16(&self) -> u16 {
+        match self.outcome() {
+            RequestOutcome::RateLimited => 429,
+            _ => 502,
+        }
+    }
+
+    /// 面向客户端的错误描述（用于 SSE error 事件 / 非流式错误体）。
+    pub fn client_message(&self) -> String {
+        match self {
+            CompletionStatus::Ok => String::new(),
+            CompletionStatus::UpstreamError { code, message } => {
+                if message.is_empty() {
+                    format!("上游返回错误: {}", code)
+                } else {
+                    format!("上游返回错误: {} - {}", code, message)
+                }
+            }
+            CompletionStatus::TransportError { message } => {
+                format!("上游响应流中断: {}", message)
+            }
+            CompletionStatus::DecoderStopped { message } => {
+                format!("上游响应解析中断: {}", message)
+            }
+        }
+    }
+}
+
+/// 判断错误 code/message 是否属于「限流/过载」信号（大小写不敏感的关键字匹配）。
+fn is_rate_limit_signal(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    lower.contains("throttl")
+        || lower.contains("toomanyrequests")
+        || lower.contains("too many requests")
+        || lower.contains("ratelimit")
+        || lower.contains("rate limit")
+        || lower.contains("429")
+        || lower.contains("overload")
+        || lower.contains("quota")
+        || lower.contains("exhaust")
+}
 
 /// thinking 块的 signature 占位字符串。
 ///
@@ -629,6 +746,13 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
+    /// 本次响应的完成状态（收尾时据此决定 outcome / SSE error / HTTP 码）。
+    /// 默认 `Ok`；in-band `Event::Error` / 传输中断 / 解码器停止时被置为对应失败态。
+    completion: CompletionStatus,
+    /// 是否已向客户端内联发过 SSE `error` 事件。
+    /// in-band `Event::Error`（及非 max_tokens 的 Exception）会在事件流中就地补发，
+    /// 收尾逻辑据此避免重复补发同一个 error 事件。
+    error_event_emitted: bool,
 }
 
 impl StreamContext {
@@ -657,6 +781,8 @@ impl StreamContext {
             thinking_block_index: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
+            completion: CompletionStatus::Ok,
+            error_event_emitted: false,
         }
     }
 
@@ -770,8 +896,23 @@ impl StreamContext {
                 error_code,
                 error_message,
             } => {
-                tracing::error!("收到错误事件: {} - {}", error_code, error_message);
-                Vec::new()
+                tracing::error!("收到 in-band 错误事件: {} - {}", error_code, error_message);
+                // 记录完成状态为上游错误：收尾时据此把 outcome 记成失败、非流式返回非 200。
+                // 幂等：只在首个错误落定，后续错误不覆盖（保留首因）。
+                if self.completion.is_ok() {
+                    self.completion = CompletionStatus::UpstreamError {
+                        code: error_code.clone(),
+                        message: error_message.clone(),
+                    };
+                }
+                // in-band 错误已发生，立即内联发一个 SSE error 事件显式告知客户端
+                // “本次响应未正常完成”，避免截断输出被当作 message_stop 正常收尾。
+                // 标记已发，收尾路径据此不重复补发。
+                self.error_event_emitted = true;
+                vec![SseEvent::error_event(
+                    self.completion.sse_error_type(),
+                    self.completion.client_message(),
+                )]
             }
             Event::Metering(metering) => {
                 // 记录上游返回的真实 credit 消耗量（累加，兼容单请求多次计费事件）
@@ -788,12 +929,26 @@ impl StreamContext {
                 exception_type,
                 message,
             } => {
-                // 处理 ContentLengthExceededException
+                // 铁律：ContentLengthExceededException = max_tokens 干净收尾，绝不算失败。
+                // 它是模型正常耗尽输出预算，照常走 message_stop + 200。
                 if exception_type == "ContentLengthExceededException" {
                     self.state_manager.set_stop_reason("max_tokens");
+                    tracing::warn!("收到 ContentLengthExceededException：按 max_tokens 干净收尾");
+                    return Vec::new();
                 }
-                tracing::warn!("收到异常事件: {} - {}", exception_type, message);
-                Vec::new()
+                // 其它异常是上游真实失败，等同 in-band 错误处理：置失败态 + 内联发 error 事件。
+                tracing::error!("收到 in-band 异常事件: {} - {}", exception_type, message);
+                if self.completion.is_ok() {
+                    self.completion = CompletionStatus::UpstreamError {
+                        code: exception_type.clone(),
+                        message: message.clone(),
+                    };
+                }
+                self.error_event_emitted = true;
+                vec![SseEvent::error_event(
+                    self.completion.sse_error_type(),
+                    self.completion.client_message(),
+                )]
             }
             _ => Vec::new(),
         }
@@ -814,6 +969,46 @@ impl StreamContext {
                 .cache_usage
                 .map(|c| c.cache_creation_input_tokens)
                 .unwrap_or(0),
+        }
+    }
+
+    /// 本次响应的完成状态（收尾时读取以决定 outcome / HTTP 码）
+    pub fn completion(&self) -> &CompletionStatus {
+        &self.completion
+    }
+
+    /// 用量记账应采用的最终结果分类（去掉硬编码 Success，改读真实完成状态）
+    pub fn completion_outcome(&self) -> RequestOutcome {
+        self.completion.outcome()
+    }
+
+    /// 是否已向客户端内联发过 SSE error 事件（收尾据此避免重复补发）
+    pub fn error_event_emitted(&self) -> bool {
+        self.error_event_emitted
+    }
+
+    /// 标记已向客户端发过 SSE error 事件（收尾路径手动补发后调用）
+    pub fn mark_error_event_emitted(&mut self) {
+        self.error_event_emitted = true;
+    }
+
+    /// 标记传输层中断（读流/读响应体 Err）：置失败态供收尾记账。
+    /// 幂等：已是失败态则保留首因。
+    pub fn mark_transport_error(&mut self, message: impl Into<String>) {
+        if self.completion.is_ok() {
+            self.completion = CompletionStatus::TransportError {
+                message: message.into(),
+            };
+        }
+    }
+
+    /// 标记解码器永久停止（连续错误超限，响应必然截断）：置失败态供收尾记账。
+    /// 幂等：已是失败态则保留首因。
+    pub fn mark_decoder_stopped(&mut self, message: impl Into<String>) {
+        if self.completion.is_ok() {
+            self.completion = CompletionStatus::DecoderStopped {
+                message: message.into(),
+            };
         }
     }
 
@@ -1350,6 +1545,36 @@ impl BufferedStreamContext {
     /// 返回本次请求解析出的最终用量（供用量统计埋点使用）
     pub fn resolved_usage(&self) -> ResolvedUsage {
         self.inner.resolved_usage()
+    }
+
+    /// 本次响应的完成状态（透传内部 StreamContext）
+    pub fn completion(&self) -> &CompletionStatus {
+        self.inner.completion()
+    }
+
+    /// 用量记账应采用的最终结果分类（透传，去硬编码 Success）
+    pub fn completion_outcome(&self) -> RequestOutcome {
+        self.inner.completion_outcome()
+    }
+
+    /// 是否已内联发过 SSE error 事件（透传）
+    pub fn error_event_emitted(&self) -> bool {
+        self.inner.error_event_emitted()
+    }
+
+    /// 标记已发过 SSE error 事件（透传）
+    pub fn mark_error_event_emitted(&mut self) {
+        self.inner.mark_error_event_emitted();
+    }
+
+    /// 标记传输层中断（透传）
+    pub fn mark_transport_error(&mut self, message: impl Into<String>) {
+        self.inner.mark_transport_error(message);
+    }
+
+    /// 标记解码器永久停止（透传）
+    pub fn mark_decoder_stopped(&mut self, message: impl Into<String>) {
+        self.inner.mark_decoder_stopped(message);
     }
 
     /// 设置 prompt 缓存记账明细（在处理事件前调用）
@@ -2231,5 +2456,136 @@ mod tests {
             pos_sig.unwrap() < pos_stop.unwrap(),
             "signature_delta 必须排在 content_block_stop 之前"
         );
+    }
+
+    // ============ 「截断即成功」修复：CompletionStatus 回归 ============
+
+    #[test]
+    fn test_completion_status_outcome_and_http_mapping() {
+        // 上游限流类错误 → RateLimited / overloaded_error / 429
+        let rl = CompletionStatus::UpstreamError {
+            code: "ThrottlingException".to_string(),
+            message: "rate exceeded".to_string(),
+        };
+        assert_eq!(rl.outcome(), RequestOutcome::RateLimited);
+        assert_eq!(rl.sse_error_type(), "overloaded_error");
+        assert_eq!(rl.http_status_u16(), 429);
+
+        // 普通上游错误 → ServerError / api_error / 502
+        let se = CompletionStatus::UpstreamError {
+            code: "InternalServerException".to_string(),
+            message: "boom".to_string(),
+        };
+        assert_eq!(se.outcome(), RequestOutcome::ServerError);
+        assert_eq!(se.sse_error_type(), "api_error");
+        assert_eq!(se.http_status_u16(), 502);
+
+        // 传输中断 → NetworkError / 502
+        let te = CompletionStatus::TransportError {
+            message: "connection reset".to_string(),
+        };
+        assert_eq!(te.outcome(), RequestOutcome::NetworkError);
+        assert_eq!(te.http_status_u16(), 502);
+
+        // 解码器停止 → ServerError / 502
+        let ds = CompletionStatus::DecoderStopped {
+            message: "too many errors".to_string(),
+        };
+        assert_eq!(ds.outcome(), RequestOutcome::ServerError);
+        assert_eq!(ds.http_status_u16(), 502);
+
+        // Ok → Success
+        assert_eq!(CompletionStatus::Ok.outcome(), RequestOutcome::Success);
+        assert!(CompletionStatus::Ok.is_ok());
+    }
+
+    #[test]
+    fn test_inband_error_event_sets_failure_and_emits_error_event() {
+        // 回归 BUG①/③：in-band Event::Error 应内联发 SSE error 事件，并把 completion 置失败态，
+        // 使收尾 outcome 不再是硬编码的 Success。
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        let events = ctx.process_kiro_event(&Event::Error {
+            error_code: "InternalServerException".to_string(),
+            error_message: "upstream boom".to_string(),
+        });
+
+        // 内联发出了 error 事件
+        assert!(
+            events.iter().any(|e| e.event == "error"
+                && e.data["error"]["type"] == "api_error"),
+            "in-band 错误应内联发出 SSE error 事件"
+        );
+        assert!(ctx.error_event_emitted(), "应标记已发 error 事件");
+        // completion 置为失败态，outcome 不再是 Success
+        assert!(!ctx.completion().is_ok());
+        assert_eq!(ctx.completion_outcome(), RequestOutcome::ServerError);
+    }
+
+    #[test]
+    fn test_content_length_exceeded_is_not_failure() {
+        // 铁律：ContentLengthExceededException = max_tokens 干净收尾，绝不算失败。
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        let events = ctx.process_kiro_event(&Event::Exception {
+            exception_type: "ContentLengthExceededException".to_string(),
+            message: "max tokens".to_string(),
+        });
+
+        assert!(events.is_empty(), "CL 异常不应发 error 事件");
+        assert!(ctx.completion().is_ok(), "CL 异常不应置失败态");
+        assert_eq!(ctx.completion_outcome(), RequestOutcome::Success);
+        assert!(!ctx.error_event_emitted());
+    }
+
+    #[test]
+    fn test_non_cl_exception_marks_failure_and_emits_error() {
+        // 非 CL 异常是上游真实失败：置失败态 + 内联发 error 事件。
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        let events = ctx.process_kiro_event(&Event::Exception {
+            exception_type: "ThrottlingException".to_string(),
+            message: "slow down".to_string(),
+        });
+
+        assert!(
+            events.iter().any(|e| e.event == "error"
+                && e.data["error"]["type"] == "overloaded_error"),
+            "限流类异常应发 overloaded_error"
+        );
+        assert_eq!(ctx.completion_outcome(), RequestOutcome::RateLimited);
+    }
+
+    #[test]
+    fn test_mark_transport_and_decoder_stopped_are_idempotent() {
+        // 传输中断 / 解码器停止的 setter 应置失败态，且幂等保留首因。
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        ctx.mark_transport_error("reset");
+        assert_eq!(ctx.completion_outcome(), RequestOutcome::NetworkError);
+        // 首因已定，后续 mark 不覆盖
+        ctx.mark_decoder_stopped("later error");
+        assert_eq!(
+            ctx.completion_outcome(),
+            RequestOutcome::NetworkError,
+            "幂等：应保留首个失败原因"
+        );
+    }
+
+    #[test]
+    fn test_buffered_context_delegates_completion() {
+        // BufferedStreamContext 应把完成状态透传给内部 StreamContext。
+        let mut ctx = BufferedStreamContext::new("test-model", 1, false, HashMap::new());
+        ctx.process_and_buffer(&Event::Error {
+            error_code: "InternalServerException".to_string(),
+            error_message: "boom".to_string(),
+        });
+        assert!(!ctx.completion().is_ok());
+        assert_eq!(ctx.completion_outcome(), RequestOutcome::ServerError);
+        assert!(ctx.error_event_emitted());
     }
 }

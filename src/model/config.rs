@@ -180,6 +180,20 @@ pub struct Config {
     #[serde(default = "default_prompt_cache_ttl_seconds")]
     pub prompt_cache_ttl_seconds: u64,
 
+    /// 是否剥离转发给上游的 system 环境噪音（默认 true，立即生效 / 无需重启）
+    ///
+    /// Claude Code 每次请求都会在 system 携带每请求漂移的环境上下文
+    /// （`<env>` 工作目录/平台/日期块、`gitStatus:`、`Recent commits:`、
+    /// `# Environment` / `# auto memory` 段、模型名行等）。这些漂移行位于 prompt 前缀，
+    /// 只要变一个字节，上游 Bedrock prefix cache 其后全部失效（命中率骤降），且它们是
+    /// 关联「这是 Claude Code」的强指纹。开启后在归一化路径保守剥离这些整块 / 整行：
+    /// 提升上游缓存命中率、省 token、降 CC 身份被关联风险。
+    ///
+    /// 剥离对**转发字节**与**影子缓存指纹**两条路径经同一归一化入口施加，保证记账与真实
+    /// 缓存一致。保守：只剥确定漂移的环境块，绝不触碰稳定的 system 正文（工具/身份/任务指令）。
+    #[serde(default = "default_strip_env_noise")]
+    pub strip_env_noise: bool,
+
     /// 网页上号回调基地址（可选）
     ///
     /// - 不配置：本地回调模式，后端在本机临时端口接收 OAuth 回调（仅本机浏览器可达）。
@@ -259,6 +273,11 @@ pub struct Config {
     /// 不再请求外部图源。此项立即生效（登录页每次加载时读取）。
     #[serde(default = "default_true")]
     pub login_background_enabled: bool,
+
+    /// 登录页背景图是否请求 R18 图源（默认 true）。开启走 r18=1，关闭走 r18=0（全年龄）。
+    /// 此项立即生效（下一轮后台预取 / 池空实时兜底拉取时按此取 r18 参数）。
+    #[serde(default = "default_true")]
+    pub login_background_r18: bool,
 
     // ============ 余额同步（A6：温和的周期性余额刷新）============
     /// 后台温和刷新余额缓存的间隔（秒）。`0` = 禁用（默认 1800 = 30 分钟）。
@@ -442,6 +461,10 @@ fn default_prompt_cache_ttl_seconds() -> u64 {
     3600
 }
 
+fn default_strip_env_noise() -> bool {
+    true
+}
+
 fn default_usage_enabled() -> bool {
     true
 }
@@ -520,6 +543,7 @@ impl Default for Config {
             priority_in_balanced: false,
             prompt_cache_enabled: default_prompt_cache_enabled(),
             prompt_cache_ttl_seconds: default_prompt_cache_ttl_seconds(),
+            strip_env_noise: default_strip_env_noise(),
             callback_base_url: None,
             usage_enabled: default_usage_enabled(),
             usage_data_dir: default_usage_data_dir(),
@@ -534,6 +558,7 @@ impl Default for Config {
             token_refresh_lead_minutes: default_refresh_lead_minutes(),
             token_refresh_interval_secs: default_refresh_interval_secs(),
             login_background_enabled: default_true(),
+            login_background_r18: default_true(),
             trash_retention_days: default_trash_retention_days(),
             balance_refresh_interval_secs: default_balance_refresh_interval_secs(),
             compression: CompressionConfig::default(),
@@ -600,5 +625,44 @@ impl Config {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn login_background_defaults_on() {
+        // 登录页背景图开关默认开启（显示背景图）。
+        let cfg = Config::default();
+        assert!(cfg.login_background_enabled);
+    }
+
+    #[test]
+    fn login_background_r18_defaults_on() {
+        // R18 开关默认开启（走 r18=1 图源）。
+        let cfg = Config::default();
+        assert!(cfg.login_background_r18);
+    }
+
+    #[test]
+    fn login_background_r18_missing_field_defaults_on() {
+        // 旧配置文件缺 loginBackgroundR18 字段时，serde 默认回退为 true（向后兼容）。
+        let json = r#"{"host":"127.0.0.1","port":8080}"#;
+        let cfg: Config = serde_json::from_str(json).expect("解析最小配置应成功");
+        assert!(cfg.login_background_r18);
+        assert!(cfg.login_background_enabled);
+    }
+
+    #[test]
+    fn login_background_r18_roundtrip() {
+        // camelCase 序列化 + 反序列化保真：关闭 R18 应被正确保留。
+        let mut cfg = Config::default();
+        cfg.login_background_r18 = false;
+        let s = serde_json::to_string(&cfg).expect("序列化应成功");
+        assert!(s.contains("\"loginBackgroundR18\":false"));
+        let back: Config = serde_json::from_str(&s).expect("反序列化应成功");
+        assert!(!back.login_background_r18);
     }
 }

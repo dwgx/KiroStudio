@@ -108,8 +108,13 @@ pub struct CacheStatsSnapshot {
 
 /// 读取进程级累计缓存统计快照（只读，零上游）。供 admin 端点调用。
 pub fn cache_stats_snapshot() -> CacheStatsSnapshot {
-    let requests = CACHE_STAT_REQUESTS.load(Ordering::Relaxed);
+    // 修正(缓存审计 P2):4 个计数器是独立 AtomicU64 非原子快照,写序恒「先 requests 再 hits」。
+    // 若读序也「先 requests 再 hits」,并发下可能读到旧 requests + 新 hits → hits>requests →
+    // hit_rate 瞬时 >1.0(前端显示 101%)。**读序与写序相反**(先 hits 再 requests):因写序恒先
+    // 加 requests,故读到的 requests >= 当时的 hits,再叠 min 钳制,hit_rate 恒 <=1。
     let hits = CACHE_STAT_HITS.load(Ordering::Relaxed);
+    let requests = CACHE_STAT_REQUESTS.load(Ordering::Relaxed);
+    let hits = hits.min(requests); // 双保险:即便极端时序也钳到 <= requests
     CacheStatsSnapshot {
         requests,
         hits,
@@ -449,34 +454,38 @@ fn flatten_cacheable_blocks(payload: &MessagesRequest) -> Vec<PendingBlock> {
     blocks
 }
 
-/// 归一化 system 文本块：把 Claude Code 的 `x-anthropic-billing-header:` 归因头
-/// 折叠成固定占位符，避免每次请求归因头轻微漂移（版本号/随机 cch）就打破缓存前缀。
+/// 归一化 system 文本块：折叠 Claude Code 的 `x-anthropic-billing-header:` 归因头，
+/// 并（开关开启时）剥离环境噪音（`<env>` 块 / gitStatus / Recent commits / 模型名行等），
+/// 避免每次请求这些内容漂移就打破缓存前缀。
 ///
-/// 复用 [`super::converter::canonicalize_billing_header`]，与转发路径保持同一套归一化规则，
-/// 确保影子指纹计算与实际转发给上游的字节一致。
+/// 与转发路径(converter::build_history)共用**同一** `canonicalize_system_text` 入口:
+/// 对**任何带 text 字段的 system 块**施加归一化(归因头折叠 + 环境噪音剥离),口径与转发字节
+/// 一致——否则影子记账会与真实缓存脱节。
+///
+/// 修正(缓存审计 P1):原先按 `type=="text"` 短路,非 text 类型块跳过 canonicalize,而转发路径
+/// 无条件按 text 字段处理,构成不对称(现实触发≈0 但仍是缺口)。现去掉短路,只要有 text 字段就
+/// 归一化,与转发路径彻底对齐。
 fn canonicalize_system_block_for_cache(value: &mut serde_json::Value) {
     let Some(obj) = value.as_object_mut() else {
         return;
     };
 
-    let is_text_block = obj
-        .get("type")
-        .and_then(|v| v.as_str())
-        .map(|t| t == "text")
-        .unwrap_or(true);
-    if !is_text_block {
-        return;
-    }
-
     let Some(text) = obj.get("text").and_then(|v| v.as_str()) else {
         return;
     };
-    let canonical = super::converter::canonicalize_billing_header(text);
-    // 只有实际发生折叠（返回占位符）时才改写，避免无谓的字符串分配。
-    if !std::ptr::eq(canonical, text) {
-        let canonical = canonical.to_string();
+    // 按内容比对判断是否改写：归因头折叠会返回 Cow::Borrowed(占位符)（内容变了但仍是借用），
+    // 故不能只看 Owned/Borrowed，必须比内容，才能同时覆盖归因头折叠与环境噪音剥离两种改写。
+    let canonical = super::converter::canonicalize_system_text(text);
+    if canonical.as_ref() != text {
+        let canonical = canonical.into_owned();
         obj.insert("text".to_string(), serde_json::Value::String(canonical));
     }
+}
+
+/// 测试专用：暴露影子指纹路径的 system 块归一化，供 converter 测试断言两侧一致。
+#[cfg(test)]
+pub(crate) fn canonicalize_system_block_for_cache_for_test(value: &mut serde_json::Value) {
+    canonicalize_system_block_for_cache(value);
 }
 
 fn flatten_message_blocks(message_index: usize, message: &Message) -> Vec<PendingBlock> {
@@ -577,11 +586,13 @@ fn strip_cache_control(value: &mut serde_json::Value) {
 }
 
 fn minimum_cacheable_tokens_for_model(model: &str) -> i32 {
+    // Anthropic 官方最小可缓存 token 门限:Haiku 全系 2048,Opus/Sonnet 全系 1024。
+    // 修正(缓存审计 P0):原 Opus 误写 4096,会把 1024-4095 token 的 Opus 前缀断点全丢弃
+    // → 主力模型影子命中恒报 0,系统性压低命中率+账目偏移;Haiku 原判定 "haiku-3"/"haiku_3"
+    // 匹配不到真实 ID(claude-3-5-haiku / claude-haiku-4-5)→落 1024 过度上报。
+    // 用 contains("haiku") 兜住全系 Haiku,其余(含 Opus/Sonnet)1024。
     let model_lower = model.to_lowercase();
-
-    if model_lower.contains("opus") {
-        4096
-    } else if model_lower.contains("haiku-3") || model_lower.contains("haiku_3") {
+    if model_lower.contains("haiku") {
         2048
     } else {
         1024
@@ -912,5 +923,16 @@ mod tests {
             70
         );
         assert!((0.0..=1.0).contains(&after.hit_rate));
+    }
+
+    #[test]
+    fn test_min_cacheable_tokens_thresholds() {
+        // 缓存审计 P0 回归:Opus/Sonnet 全系 1024(修正原误写 4096),Haiku 全系 2048。
+        assert_eq!(minimum_cacheable_tokens_for_model("claude-opus-4-8"), 1024, "Opus 应 1024 非 4096");
+        assert_eq!(minimum_cacheable_tokens_for_model("claude-sonnet-4-20250514"), 1024, "Sonnet 1024");
+        // Haiku 真实 ID 各形态都应命中 2048(原 haiku-3 判定匹配不到)
+        assert_eq!(minimum_cacheable_tokens_for_model("claude-3-5-haiku-20241022"), 2048);
+        assert_eq!(minimum_cacheable_tokens_for_model("claude-haiku-4-5"), 2048);
+        assert_eq!(minimum_cacheable_tokens_for_model("unknown-model"), 1024, "未知回退 1024");
     }
 }

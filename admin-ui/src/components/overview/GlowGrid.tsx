@@ -1,7 +1,6 @@
 import type { CredentialStatusItem } from '@/types/api'
-import { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider } from '@/components/ui/tooltip'
 import type { CellActivity } from '@/components/overview/StatusHeatmap'
-import { healthOf, HEALTH_RGB, HEALTH_LABEL, CredTooltipBody, EmptyPool } from '@/components/overview/credViz'
+import { healthOf, HEALTH_RGB, HEALTH_LABEL, EmptyPool, useHoverCard } from '@/components/overview/credViz'
 import './glow-grid.css'
 
 export interface GlowGridProps {
@@ -46,13 +45,15 @@ function breatheDelay(id: number): string {
  * 常驻仅低频呼吸（opacity）；数百核心不卡；motion-reduce 全面降级为静态色块。
  */
 export function GlowGrid({ credentials, activity, className }: GlowGridProps) {
+  // 鼠标跟随悬浮卡（替代 Radix Tooltip 固定 side 的边缘翻转，卡片黏着鼠标走）。
+  const hoverCard = useHoverCard()
+
   if (credentials.length === 0) {
     return <EmptyPool className={className} />
   }
 
   return (
-    <TooltipProvider delayDuration={80}>
-      <div className={className}>
+    <div className={className}>
         <div
           className="grid gap-1.5"
           style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(22px, 1fr))' }}
@@ -66,9 +67,11 @@ export function GlowGrid({ credentials, activity, className }: GlowGridProps) {
             const busy = lit && inflight > 0
             const hit = !!act && act.pulse > 0
             return (
-              <Tooltip key={c.id}>
-                <TooltipTrigger asChild>
                   <div
+                    key={c.id}
+                    onMouseEnter={(e) => hoverCard.show(c, e)}
+                    onMouseMove={hoverCard.move}
+                    onMouseLeave={hoverCard.hide}
                     className={`group relative aspect-square cursor-pointer ${R} transition-transform duration-200 ease-out hover:z-10 hover:-translate-y-0.5 hover:scale-[1.18]`}
                     style={{
                       // 核心本体：基色斜面渐变 + 内凹描边，像 die 上一枚微小的算力单元。
@@ -129,11 +132,6 @@ export function GlowGrid({ credentials, activity, className }: GlowGridProps) {
                       />
                     )}
                   </div>
-                </TooltipTrigger>
-                <TooltipContent>
-                  <CredTooltipBody c={c} act={act} />
-                </TooltipContent>
-              </Tooltip>
             )
           })}
         </div>
@@ -170,7 +168,8 @@ export function GlowGrid({ credentials, activity, className }: GlowGridProps) {
             处理中
           </span>
         </div>
+      {/* 鼠标跟随悬浮卡（正文 CredTooltipBody 不变，仅定位改为黏鼠标） */}
+      {hoverCard.render((id) => activity?.get(id))}
       </div>
-    </TooltipProvider>
   )
 }

@@ -220,6 +220,15 @@ impl EventStreamDecoder {
         DecodeIter { decoder: self }
     }
 
+    /// 解码器是否已进入终止态（连续错误超限而永久停止）
+    ///
+    /// 终止态是不可逆的：一旦 `Stopped`，`decode()` 只会返回 `TooManyErrors`，
+    /// `feed()` 也不再复位它（只复位可恢复的 `Recovering`）。迭代器据此判定是否
+    /// 应停止 drain。注意：`Recovering` 只是**可恢复中间态**，不是终止态。
+    pub fn is_stopped(&self) -> bool {
+        self.state == DecoderState::Stopped
+    }
+
     /// 尝试容错恢复
     ///
     /// 根据错误类型采用不同的恢复策略（参考 kiro-kt 的设计）：
@@ -301,16 +310,27 @@ impl<'a> Iterator for DecodeIter<'a> {
     type Item = ParseResult<Frame>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // 如果处于 Stopped 或 Recovering 状态，停止迭代
-        match self.decoder.state {
-            DecoderState::Stopped => return None,
-            DecoderState::Recovering => return None,
-            _ => {}
+        // 只有终止态 Stopped 才停止迭代。
+        //
+        // 历史 BUG：这里曾把 `Recovering` 也当作终止条件直接 `return None`，
+        // 导致单次 feed 中遇到**可恢复**错误（如一帧 CRC 损坏）后迭代器立即结束，
+        // 缓冲区里后续所有有效帧被整体丢弃——但外层仍按 200/正常收尾返回，
+        // 造成“截断输出被当成功”。实际上 `try_recover()` 在报错前已推进缓冲区跳过
+        // 损坏字节，`Recovering` 只是可恢复中间态：应继续 drain，让后续有效帧被解析出来。
+        //
+        // 终止性由 `decode()` 自身保证：连续错误累计到 `max_errors`(5) 即转入
+        // `Stopped` 并返回 `TooManyErrors`；每次 `try_recover()` 至少推进 1 字节，
+        // 缓冲区耗尽时 `decode()` 先行返回 `Ok(None)`，故不会死循环。
+        if self.decoder.is_stopped() {
+            return None;
         }
 
         match self.decoder.decode() {
             Ok(Some(frame)) => Some(Ok(frame)),
+            // 数据不足/缓冲区耗尽：本轮 drain 到此为止（等待下次 feed）
             Ok(None) => None,
+            // 可恢复错误：如实抛出本帧错误，但**不终止迭代**——
+            // 下次 next() 会在已跳过损坏字节的缓冲区上继续解析后续帧。
             Err(e) => Some(Err(e)),
         }
     }
@@ -333,5 +353,109 @@ mod tests {
 
         let result = decoder.decode();
         assert!(matches!(result, Ok(None)));
+    }
+
+    /// 构造一个最小的合法帧（空头部 + 空 payload），仅用于测试 drain 行为，
+    /// 不关心帧语义（解析出的 Event 是 Unknown）。
+    ///
+    /// 布局：total_length(4) + header_length(4) + prelude_crc(4) + payload + msg_crc(4)。
+    fn build_minimal_frame() -> Vec<u8> {
+        use super::super::crc::crc32;
+        let payload: &[u8] = b"";
+        let header_length: u32 = 0;
+        let total_length: u32 = (PRELUDE_SIZE + payload.len() + 4) as u32;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&total_length.to_be_bytes());
+        buf.extend_from_slice(&header_length.to_be_bytes());
+        let prelude_crc = crc32(&buf[..8]);
+        buf.extend_from_slice(&prelude_crc.to_be_bytes());
+        buf.extend_from_slice(payload);
+        let msg_crc = crc32(&buf);
+        buf.extend_from_slice(&msg_crc.to_be_bytes());
+        buf
+    }
+
+    #[test]
+    fn test_decode_iter_drains_multiple_valid_frames() {
+        // 单次 feed 里塞入 3 个合法帧，迭代器应完整 drain 出 3 个
+        let mut decoder = EventStreamDecoder::new();
+        let mut data = Vec::new();
+        for _ in 0..3 {
+            data.extend_from_slice(&build_minimal_frame());
+        }
+        decoder.feed(&data).unwrap();
+
+        let frames: Vec<_> = decoder.decode_iter().filter_map(|r| r.ok()).collect();
+        assert_eq!(frames.len(), 3, "应 drain 出全部 3 个合法帧");
+        assert!(!decoder.is_stopped());
+    }
+
+    /// 构造一个 prelude 合法但 Message CRC 损坏的帧。
+    ///
+    /// 触发 `MessageCrcMismatch` → try_recover 的 Data 分支「按 total_length 跳过整帧」，
+    /// 单帧一次错误即可干净跳过，用于验证损坏帧之后的合法帧仍能被 drain 出来。
+    fn build_corrupt_crc_frame() -> Vec<u8> {
+        let mut frame = build_minimal_frame();
+        // 翻转最后一个字节，破坏 Message CRC（prelude 仍合法，故能读出 total_length 跳整帧）
+        let last = frame.len() - 1;
+        frame[last] ^= 0xFF;
+        frame
+    }
+
+    #[test]
+    fn test_decode_iter_recovers_and_drains_after_corrupt_frame() {
+        // 回归 BUG②：损坏帧夹在两个合法帧之间。
+        // 单次 feed 中遇到可恢复错误后不应永久终止，应继续 drain 出损坏帧之后的合法帧。
+        let mut decoder = EventStreamDecoder::new();
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&build_minimal_frame());
+        data.extend_from_slice(&build_corrupt_crc_frame());
+        data.extend_from_slice(&build_minimal_frame());
+
+        decoder.feed(&data).unwrap();
+
+        let mut ok_frames = 0usize;
+        let mut err_frames = 0usize;
+        for result in decoder.decode_iter() {
+            match result {
+                Ok(_) => ok_frames += 1,
+                Err(_) => err_frames += 1,
+            }
+        }
+
+        assert_eq!(
+            ok_frames, 2,
+            "损坏帧前后的两个合法帧都应被解析出来（旧实现会丢掉损坏帧之后的帧）"
+        );
+        assert_eq!(err_frames, 1, "中间损坏帧应恰好抛出一次错误");
+        assert!(
+            !decoder.is_stopped(),
+            "单个可恢复错误不应把解码器打进终止态"
+        );
+    }
+
+    #[test]
+    fn test_decode_iter_stops_after_too_many_errors() {
+        // 连续 max_errors 次不可恢复错误后进入终止态，迭代器停止 drain
+        let mut decoder = EventStreamDecoder::new();
+        // 全 0 字节：total_length=0 触发 MessageTooSmall，逐字节跳过，连续错误累积
+        decoder.feed(&[0u8; 64]).unwrap();
+
+        let mut err_count = 0usize;
+        for result in decoder.decode_iter() {
+            if result.is_err() {
+                err_count += 1;
+            }
+        }
+
+        assert!(err_count >= 1, "应至少抛出一次错误");
+        assert!(
+            decoder.is_stopped(),
+            "连续错误超过 max_errors 后应进入终止态"
+        );
+        // 终止态后再次迭代应立即返回 None（不再产出）
+        assert!(decoder.decode_iter().next().is_none());
     }
 }

@@ -922,6 +922,7 @@ impl AdminService {
             default_endpoint: config.default_endpoint.clone(),
             endpoint_names,
             extract_thinking: config.extract_thinking,
+            strip_env_noise: config.strip_env_noise,
             cooldown_enabled: config.cooldown_enabled,
             rate_limit_enabled: config.rate_limit_enabled,
             rate_limit_daily_max: config.rate_limit_daily_max,
@@ -946,6 +947,7 @@ impl AdminService {
             token_refresh_lead_minutes: config.token_refresh_lead_minutes,
             token_refresh_interval_secs: config.token_refresh_interval_secs,
             login_background_enabled: config.login_background_enabled,
+            login_background_r18: config.login_background_r18,
             balance_refresh_interval_secs: config.balance_refresh_interval_secs,
             collect_client_fingerprint: config.collect_client_fingerprint,
             config_path: config
@@ -1006,6 +1008,8 @@ impl AdminService {
         let mut balance_task_changed = false;
         // TIER3 AppState 热更字段：extract_thinking 改后调 handlers setter 即时生效（不重启）。
         let mut extract_thinking_changed: Option<bool> = None;
+        // 环境噪音剥离开关：改后调 converter setter 即时生效（进程级镜像，不重启）。
+        let mut strip_env_noise_changed: Option<bool> = None;
 
         // —— 需重启生效的字段 ——
         if let Some(v) = req.host {
@@ -1097,6 +1101,13 @@ impl AdminService {
             if v != config.extract_thinking {
                 config.extract_thinking = v;
                 extract_thinking_changed = Some(v);
+            }
+        }
+        // —— 环境噪音剥离开关（改后调 converter setter 即时生效不重启）——
+        if let Some(v) = req.strip_env_noise {
+            if v != config.strip_env_noise {
+                config.strip_env_noise = v;
+                strip_env_noise_changed = Some(v);
             }
         }
         // —— TIER1 运行时热更字段：改完 reload_config 即时生效,不进 restart_fields ——
@@ -1260,6 +1271,16 @@ impl AdminService {
             }
         }
 
+        // —— 立即生效的字段：登录页背景 R18 开关 ——
+        // 改后下一轮后台预取 / 池空实时兜底拉取即按新 r18 参数取图，不需重启。
+        let mut login_bg_r18_changed: Option<bool> = None;
+        if let Some(v) = req.login_background_r18 {
+            if v != config.login_background_r18 {
+                config.login_background_r18 = v;
+                login_bg_r18_changed = Some(v);
+            }
+        }
+
         // —— 立即生效的字段：指纹采集开关（隐私）——
         // 关闭后热路径不再解析 device/ip/os/browser，用量记录留空；无需重启。
         let mut fingerprint_changed: Option<bool> = None;
@@ -1309,6 +1330,11 @@ impl AdminService {
             crate::admin_ui::set_login_background_enabled(v);
         }
 
+        // 登录页背景 R18 开关立即应用到运行时镜像（下一轮预取 / 池空兜底拉取即按新参数）
+        if let Some(v) = login_bg_r18_changed {
+            crate::admin_ui::set_login_background_r18(v);
+        }
+
         // 指纹采集开关立即应用到热路径运行时镜像（下一个请求即生效）
         if let Some(v) = fingerprint_changed {
             crate::anthropic::set_collect_client_fingerprint(v);
@@ -1319,12 +1345,19 @@ impl AdminService {
             crate::anthropic::set_extract_thinking(v);
         }
 
+        // 环境噪音剥离开关立即应用到 converter 进程级镜像（下一个请求即生效）
+        if let Some(v) = strip_env_noise_changed {
+            crate::anthropic::set_strip_env_noise(v);
+        }
+
         let immediate_changed = hot_changed
             || refresh_task_changed
             || balance_task_changed
             || login_bg_changed.is_some()
+            || login_bg_r18_changed.is_some()
             || fingerprint_changed.is_some()
-            || extract_thinking_changed.is_some();
+            || extract_thinking_changed.is_some()
+            || strip_env_noise_changed.is_some();
         let restart_required = !restart_fields.is_empty();
         let message = if restart_required {
             format!(
@@ -1338,12 +1371,13 @@ impl AdminService {
         };
 
         tracing::info!(
-            "配置已更新（需重启字段: {:?}, TIER1热更: {}, TIER2重挂: 预刷新={} 余额={}, TIER3: thinking={:?}）",
+            "配置已更新（需重启字段: {:?}, TIER1热更: {}, TIER2重挂: 预刷新={} 余额={}, TIER3: thinking={:?} envNoise={:?}）",
             restart_fields,
             hot_changed,
             refresh_task_changed,
             balance_task_changed,
-            extract_thinking_changed
+            extract_thinking_changed,
+            strip_env_noise_changed
         );
 
         Ok(UpdateConfigResponse {

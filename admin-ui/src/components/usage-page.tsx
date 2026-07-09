@@ -1030,7 +1030,7 @@ export function UsagePage() {
   const timeseries = useUsageTimeseries(granularity)
   const byModel = useUsageByModel()
   const byCredential = useUsageByCredential()
-  // 最近请求条数（dwgx：可切换,不止 200）。"全部"取后端上限 5000。
+  // 最近请求条数（dwgx：可切换,不止 200）。0="全部"，后端取到硬上限(5万)的真全量；表格分页渲染不炸 DOM。
   const [recentLimit, setRecentLimit] = useState<number>(200)
   const recent = useUsageRecent(recentLimit)
   // 机器维度聚合（按设备指纹分组，IP 变化不拆分）——后端 /usage/machines。
@@ -1232,7 +1232,7 @@ export function UsagePage() {
             <span className="text-xs text-muted-foreground">
               {recent.isLoading ? '加载中…' : `${recentRows.length} 条`}
             </span>
-            {/* 条数切换：200/500/1000/全部(取后端上限 5000)。dwgx：不止最近 200 条 */}
+            {/* 条数切换：200/500/1000/全部。"全部"传 limit=0，后端解释为取到硬上限(5万)的真全量。dwgx：不止最近 200 条 */}
             <Select
               value={String(recentLimit)}
               onChange={(v) => setRecentLimit(Number(v))}
@@ -1242,7 +1242,7 @@ export function UsagePage() {
                 { value: '200', label: '最近 200' },
                 { value: '500', label: '最近 500' },
                 { value: '1000', label: '最近 1000' },
-                { value: '5000', label: '全部' },
+                { value: '0', label: '全部' },
               ]}
             />
           </div>

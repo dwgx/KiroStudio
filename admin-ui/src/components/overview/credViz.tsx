@@ -1,3 +1,5 @@
+import { useCallback, useState, type ReactNode } from 'react'
+import { createPortal } from 'react-dom'
 import type { CredentialStatusItem } from '@/types/api'
 import type { CellActivity } from '@/components/overview/StatusHeatmap'
 import { authLabel, disabledReasonLabel } from '@/lib/i18n-labels'
@@ -86,6 +88,77 @@ export function CredTooltipBody({
           本视图 hover 仅展示免费字段，绝不在此拉 per-account balance（避免触发上游风控）。 */}
     </div>
   )
+}
+
+// 悬浮卡估算尺寸（clamp 防出界用）：正文约 6~7 行小字 + 内边距，取保守上限。
+const HOVER_W = 240
+const HOVER_H = 190
+
+/**
+ * 鼠标跟随的悬浮卡（替代 Radix Tooltip 固定 side 的边缘翻转）。
+ * dwgx：卡片要黏在鼠标上，别翻到方块左边显得脱离。
+ *
+ * 定位思路参照 usage-page 的 RequestPopover——文档坐标（pageX/pageY）+ createPortal 挂到 body，
+ * 随页面一起滚（absolute 定位）；区别是本卡在 onMouseMove 里持续更新坐标，让它跟着鼠标走。
+ * clamp：默认落在鼠标右下方 14px，右/下越界则翻到左/上，保证不出屏。
+ * pointer-events-none：卡本身不吃鼠标事件，避免挡住下面方块的 hover / 抖动。
+ */
+function HoverCard({ x, y, children }: { x: number; y: number; children: ReactNode }) {
+  // x/y 为文档坐标；用视口宽高 + 当前滚动量换算越界，右/下溢出则向左/上翻。
+  const maxLeft = window.scrollX + window.innerWidth - HOVER_W - 8
+  const maxTop = window.scrollY + window.innerHeight - HOVER_H - 8
+  const left = Math.max(window.scrollX + 8, Math.min(x + 14, maxLeft))
+  const top = Math.max(window.scrollY + 8, Math.min(y + 14, maxTop))
+  return createPortal(
+    <div
+      className="pointer-events-none absolute z-50 overflow-hidden rounded-md border border-border bg-popover px-3 py-2 text-xs text-popover-foreground shadow-lg animate-rise-in"
+      style={{ left, top }}
+    >
+      {children}
+    </div>,
+    document.body,
+  )
+}
+
+/** 悬浮卡状态：正在 hover 的凭据 + 鼠标文档坐标。 */
+interface HoverState {
+  c: CredentialStatusItem
+  x: number
+  y: number
+}
+
+/**
+ * 三视图共用的“鼠标跟随悬浮卡”hook：统一封装 hover 状态 + 事件处理。
+ * 用法：拿到 { hover, show, hide, move, render }，
+ * 给每个可 hover 元素挂 onMouseEnter={() => show(c, e)} / onMouseMove={move} / onMouseLeave={hide}，
+ * 再在组件末尾放 {render(act)} 输出悬浮卡（正文仍是 CredTooltipBody，展示内容不变）。
+ */
+export function useHoverCard() {
+  const [hover, setHover] = useState<HoverState | null>(null)
+
+  const show = useCallback((c: CredentialStatusItem, e: { pageX: number; pageY: number }) => {
+    setHover({ c, x: e.pageX, y: e.pageY })
+  }, [])
+
+  const move = useCallback((e: { pageX: number; pageY: number }) => {
+    // 只在已显示时更新坐标，让卡片黏着鼠标移动。
+    setHover((prev) => (prev ? { ...prev, x: e.pageX, y: e.pageY } : prev))
+  }, [])
+
+  const hide = useCallback(() => setHover(null), [])
+
+  // 传入“按 id 取 activity”的取值函数，渲染当前 hover 凭据的悬浮卡。
+  const render = useCallback(
+    (getAct?: (id: number) => CellActivity | undefined) =>
+      hover ? (
+        <HoverCard x={hover.x} y={hover.y}>
+          <CredTooltipBody c={hover.c} act={getAct?.(hover.c.id)} />
+        </HoverCard>
+      ) : null,
+    [hover],
+  )
+
+  return { hover, show, move, hide, render }
 }
 
 /** 空池优雅占位：三视图共用。 */

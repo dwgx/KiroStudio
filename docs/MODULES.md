@@ -134,7 +134,7 @@
 **函数**
 - `check_rate_limit(id) → RateLimitResult` — Allow/TooManyRequests/MinInterval/Backoff
 - `calculate_wait_time(id) → Option<Duration>`
-- `record_success(id)` / `record_failure(id, msg)`
+- `record_success(id)` / `record_failure(id, kind: FailureKind)` — kind=Transient(指数退避,秒级) / Suspended(1h长冻);用结构化枚举替旧的错误字符串子串匹配,杜绝"rate limited"碰撞误冻
 - `calculate_backoff(failures) → Duration` — base×multiplier^n
 
 ---
