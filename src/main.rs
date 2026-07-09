@@ -208,6 +208,8 @@ async fn main() {
 
     // 登录页背景图预取：启动即拉一批到内存池，之后后台定时补充。
     // 请求命中内存字节秒回，不再在登录页热路径实时打图源。关闭时不 spawn。
+    // R18 开关先写入运行时镜像（默认 true），预取轮次按此取 r18 参数。
+    admin_ui::set_login_background_r18(config.login_background_r18);
     admin_ui::spawn_bg_prefetch(config.login_background_enabled);
 
     // 指纹采集开关：把配置写入热路径运行时镜像（默认 true）。关闭后不采集
@@ -249,6 +251,7 @@ async fn main() {
         &config.cors_allowed_origins,
         config.max_body_bytes,
         config.compression.clone(),
+        config.strip_env_noise,
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）

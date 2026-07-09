@@ -43,6 +43,7 @@ pub fn create_router_with_provider(
     cors_allowed_origins: &[String],
     max_body_bytes: usize,
     compression: crate::model::config::CompressionConfig,
+    strip_env_noise: bool,
 ) -> Router {
     let mut state = AppState::with_cache_ttl(api_key, prompt_cache_ttl_seconds);
     if let Some(provider) = kiro_provider {
@@ -55,6 +56,8 @@ pub fn create_router_with_provider(
     super::handlers::set_extract_thinking(extract_thinking);
     super::handlers::set_prompt_cache_enabled(prompt_cache_enabled);
     super::handlers::set_compression(compression);
+    // 环境噪音剥离开关：播种进 converter 进程级镜像（归一化路径读镜像），admin 改后即时生效。
+    super::converter::set_strip_env_noise(strip_env_noise);
 
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()

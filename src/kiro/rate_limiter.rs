@@ -30,15 +30,21 @@ const DEFAULT_BACKOFF_MAX_MS: u64 = 300_000;
 /// 默认退避倍数
 const DEFAULT_BACKOFF_MULTIPLIER: f64 = 1.5;
 
-/// 暂停检测关键词
-const SUSPEND_KEYWORDS: &[&str] = &[
-    "suspended",
-    "banned",
-    "quota exceeded",
-    "rate limit",
-    "too many requests",
-    "account disabled",
-];
+/// 失败类型（决定退避时长）
+///
+/// 用结构化枚举替代过去"用调用方传入的错误字符串子串匹配来判定是否暂停"的做法。
+/// 旧做法用宽泛子串（如 "rate limit"）匹配，会把瞬时 429（错误信息含 "rate limited"）
+/// 误判为账户暂停 → 自造 1 小时冻结。调用方现在按语义显式声明失败类型，杜绝碰撞。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// 瞬态失败（429/5xx/网络抖动等）：走指数退避，秒级自愈，绝不长冻。
+    Transient,
+    /// 账户被上游暂停/封禁：走长时间（1 小时）退避。
+    ///
+    /// 注意：真封号在 token_manager 里走 `report_account_suspended` 直接禁用凭据，
+    /// 不经过本枚举；此项保留给未来确有"限速器级别暂停退避"需求的场景。
+    Suspended,
+}
 
 /// 速率限制配置
 #[derive(Debug, Clone)]
@@ -242,8 +248,12 @@ impl RateLimiter {
 
     /// 记录请求失败
     ///
-    /// 返回下次可以重试的等待时间
-    pub fn record_failure(&self, credential_id: u64, error_message: Option<&str>) -> Duration {
+    /// `kind` 由调用方按语义显式声明失败类型（见 [`FailureKind`]）：
+    /// - [`FailureKind::Transient`]：走指数退避（秒级起步、随连续失败递增、有上限）；
+    /// - [`FailureKind::Suspended`]：走长时间退避（1 小时）。
+    ///
+    /// 返回下次可以重试的等待时间。
+    pub fn record_failure(&self, credential_id: u64, kind: FailureKind) -> Duration {
         // 先获取 config 读锁，再获取 states 锁（与 check_rate_limit/try_acquire 保持一致）
         let config = self.config.read().clone();
 
@@ -254,20 +264,14 @@ impl RateLimiter {
         state.consecutive_failures += 1;
         state.last_request_at = Some(now);
 
-        // 检查是否触发暂停检测
-        let is_suspended = error_message
-            .map(|msg| {
-                let lower = msg.to_ascii_lowercase();
-                SUSPEND_KEYWORDS.iter().any(|kw| lower.contains(kw))
-            })
-            .unwrap_or(false);
-
-        // 计算退避时间
-        let backoff = if is_suspended {
-            // 暂停检测触发长时间退避（1 小时）
-            Duration::from_secs(3600)
-        } else {
-            Self::calculate_backoff_with_config(&config, state.consecutive_failures)
+        // 计算退避时间：按结构化失败类型分派，不再用错误字符串子串匹配（杜绝碰撞误冻）
+        let backoff = match kind {
+            // 账户暂停：长时间退避（1 小时）
+            FailureKind::Suspended => Duration::from_secs(3600),
+            // 瞬态失败：指数退避，秒级自愈
+            FailureKind::Transient => {
+                Self::calculate_backoff_with_config(&config, state.consecutive_failures)
+            }
         };
 
         state.backoff_until = Some(now + backoff);
@@ -419,11 +423,11 @@ mod tests {
         let limiter = RateLimiter::new(config);
 
         // 记录失败
-        let backoff1 = limiter.record_failure(1, None);
+        let backoff1 = limiter.record_failure(1, FailureKind::Transient);
         assert!(backoff1.as_millis() >= 100);
 
         // 第二次失败应该有更长的退避
-        let backoff2 = limiter.record_failure(1, None);
+        let backoff2 = limiter.record_failure(1, FailureKind::Transient);
         assert!(backoff2.as_millis() >= 200);
     }
 
@@ -431,9 +435,44 @@ mod tests {
     fn test_rate_limiter_suspend_detection() {
         let limiter = RateLimiter::with_defaults();
 
-        // 触发暂停检测
-        let backoff = limiter.record_failure(1, Some("Your account has been suspended"));
+        // 账户暂停触发长时间退避
+        let backoff = limiter.record_failure(1, FailureKind::Suspended);
         assert!(backoff.as_secs() >= 3600);
+    }
+
+    #[test]
+    fn test_transient_not_hour_freeze() {
+        // 回归：瞬态失败（如 429）绝不能被误判为暂停而自造 1 小时冻结。
+        // 用小基数配置，验证首次瞬态退避是秒级（远小于 60s），而非 3600s。
+        let config = RateLimitConfig {
+            backoff_base_ms: 1000,
+            backoff_multiplier: 1.5,
+            backoff_max_ms: 300_000,
+            jitter_percent: 0.0,
+            min_interval_ms: 0,
+            max_interval_ms: 0,
+            ..Default::default()
+        };
+        let limiter = RateLimiter::new(config);
+
+        let backoff = limiter.record_failure(1, FailureKind::Transient);
+        assert!(
+            backoff.as_secs() < 60,
+            "瞬态失败退避应为秒级，实际 {:?}",
+            backoff
+        );
+    }
+
+    #[test]
+    fn test_suspended_still_freezes() {
+        // 账户暂停仍应走长时间（>= 3600s）退避。
+        let limiter = RateLimiter::with_defaults();
+        let backoff = limiter.record_failure(1, FailureKind::Suspended);
+        assert!(
+            backoff.as_secs() >= 3600,
+            "账户暂停退避应 >= 3600s，实际 {:?}",
+            backoff
+        );
     }
 
     #[test]
@@ -441,8 +480,8 @@ mod tests {
         let limiter = RateLimiter::with_defaults();
 
         // 记录几次失败
-        limiter.record_failure(1, None);
-        limiter.record_failure(1, None);
+        limiter.record_failure(1, FailureKind::Transient);
+        limiter.record_failure(1, FailureKind::Transient);
 
         let state = limiter.get_state(1).unwrap();
         assert_eq!(state.consecutive_failures, 2);
@@ -474,7 +513,7 @@ mod tests {
         let limiter = RateLimiter::with_defaults();
 
         limiter.record_success(1);
-        limiter.record_failure(1, None);
+        limiter.record_failure(1, FailureKind::Transient);
 
         assert!(limiter.get_state(1).is_some());
 

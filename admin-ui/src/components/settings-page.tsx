@@ -22,6 +22,7 @@ import {
   FileJson,
   KeyRound,
   ClipboardCopy,
+  Image as ImageIcon,
   X,
 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -126,6 +127,7 @@ const CARD_INDEX: { section: SectionId; title: string; keywords: string[] }[] = 
   { section: 'basic', title: '服务信息', keywords: ['监听地址', 'host', '端口', 'port', '区域', 'region', 'tls 后端', 'rustls', 'native-tls', '默认 endpoint', '配置文件'] },
   { section: 'basic', title: '客户端伪装', keywords: ['kiro 版本', '系统版本', 'node 版本', '提取 thinking', 'thinking'] },
   { section: 'basic', title: '网络与上号', keywords: ['全局代理', 'proxy', '上号回调地址', 'callback', '回调模式', 'admin key'] },
+  { section: 'basic', title: '登录页背景', keywords: ['登录背景图', '登录页背景', '背景图', 'r18', '图源', 'lolicon', '关闭登录背景图'] },
   { section: 'security', title: '反代安全', keywords: ['cors 允许来源', 'ip 白名单', 'cidr', '信任 x-forwarded-for', 'xff', '入口限流', '请求体上限', '413', '429'] },
   { section: 'scheduling', title: '负载均衡模式', keywords: ['负载均衡', '优先级模式', '均衡负载', 'priority', 'balanced'] },
   { section: 'scheduling', title: '防关联 / 限流', keywords: ['冷却机制', '速率限制', '每日上限', '最小请求间隔', '会话亲和性', 'affinity'] },
@@ -196,6 +198,7 @@ interface FormState {
   loadBalancingMode: string
   defaultEndpoint: string
   extractThinking: boolean
+  stripEnvNoise: boolean
   cooldownEnabled: boolean
   rateLimitEnabled: boolean
   rateLimitDailyMax: string
@@ -216,6 +219,9 @@ interface FormState {
   proactiveTokenRefresh: boolean
   tokenRefreshLeadMinutes: string
   tokenRefreshIntervalSecs: string
+  // Admin UI 登录页背景（立即生效）
+  loginBackgroundEnabled: boolean
+  loginBackgroundR18: boolean
 }
 
 // 多行文本 <-> 字符串列表（去空白、去空行）
@@ -247,6 +253,7 @@ function toForm(c: ConfigSnapshotResponse): FormState {
     loadBalancingMode: c.loadBalancingMode,
     defaultEndpoint: c.defaultEndpoint,
     extractThinking: c.extractThinking,
+    stripEnvNoise: c.stripEnvNoise,
     cooldownEnabled: c.cooldownEnabled,
     rateLimitEnabled: c.rateLimitEnabled,
     rateLimitDailyMax: String(c.rateLimitDailyMax),
@@ -266,6 +273,9 @@ function toForm(c: ConfigSnapshotResponse): FormState {
     proactiveTokenRefresh: c.proactiveTokenRefresh,
     tokenRefreshLeadMinutes: String(c.tokenRefreshLeadMinutes),
     tokenRefreshIntervalSecs: String(c.tokenRefreshIntervalSecs),
+    // 缺省视为开启（后端字段可能尚未下发时不误显示为关闭）
+    loginBackgroundEnabled: c.loginBackgroundEnabled ?? true,
+    loginBackgroundR18: c.loginBackgroundR18 ?? true,
   }
 }
 
@@ -1302,6 +1312,7 @@ export function SettingsPage() {
     if (form.loadBalancingMode !== config.loadBalancingMode) d.loadBalancingMode = form.loadBalancingMode
     if (form.defaultEndpoint.trim() !== config.defaultEndpoint) d.defaultEndpoint = form.defaultEndpoint.trim()
     if (form.extractThinking !== config.extractThinking) d.extractThinking = form.extractThinking
+    if (form.stripEnvNoise !== config.stripEnvNoise) d.stripEnvNoise = form.stripEnvNoise
     if (form.cooldownEnabled !== config.cooldownEnabled) d.cooldownEnabled = form.cooldownEnabled
     if (form.rateLimitEnabled !== config.rateLimitEnabled) d.rateLimitEnabled = form.rateLimitEnabled
     const daily = Number(form.rateLimitDailyMax)
@@ -1331,6 +1342,9 @@ export function SettingsPage() {
     if (Number.isFinite(lead) && lead !== config.tokenRefreshLeadMinutes) d.tokenRefreshLeadMinutes = lead
     const interval2 = Number(form.tokenRefreshIntervalSecs)
     if (Number.isFinite(interval2) && interval2 !== config.tokenRefreshIntervalSecs) d.tokenRefreshIntervalSecs = interval2
+    // Admin UI 登录页背景（缺省视为开启，与 toForm 基线一致）
+    if (form.loginBackgroundEnabled !== (config.loginBackgroundEnabled ?? true)) d.loginBackgroundEnabled = form.loginBackgroundEnabled
+    if (form.loginBackgroundR18 !== (config.loginBackgroundR18 ?? true)) d.loginBackgroundR18 = form.loginBackgroundR18
     return d
   }, [config, form])
 
@@ -1569,6 +1583,9 @@ export function SettingsPage() {
           <Field label="提取 thinking" hint="非流式响应解析 thinking 块（保存即时生效，无需重启）">
             <Switch checked={form.extractThinking} onCheckedChange={(v) => set('extractThinking', v)} />
           </Field>
+          <Field label="剥离环境噪音" hint="转发前剥离 system 里每请求漂移的 env/git/模型名等噪音，省 token 提缓存降关联（保存即时生效，无需重启）">
+            <Switch checked={form.stripEnvNoise} onCheckedChange={(v) => set('stripEnvNoise', v)} />
+          </Field>
         </CardContent>
       </Card>
       </SectionGate>
@@ -1630,6 +1647,36 @@ export function SettingsPage() {
             }
           />
           <ReadonlyRow label="Admin Key" value={<Badge variant={config.hasAdminKey ? 'default' : 'secondary'}>{config.hasAdminKey ? '已设置' : '未设置'}</Badge>} />
+        </CardContent>
+      </Card>
+      </SectionGate>
+
+      {/* 基础分区：登录页背景（立即生效，无需重启） */}
+      <SectionGate section="basic" title="登录页背景" keywords={['登录背景图', '登录页背景', '背景图', 'r18', '图源', 'lolicon', '关闭登录背景图']}>
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="text-base flex items-center gap-2">
+            <ImageIcon className="h-4 w-4 text-muted-foreground" />
+            <Highlight text="登录页背景" />
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="py-0">
+          <Field
+            label="显示登录背景图"
+            hint="开启：登录页显示随机背景图；关闭：改用纯渐变背景，不再请求外部图源（保存即时生效，无需重启）"
+          >
+            <Switch checked={form.loginBackgroundEnabled} onCheckedChange={(v) => set('loginBackgroundEnabled', v)} />
+          </Field>
+          <Field
+            label="R18 图源"
+            hint="开启：背景图走 R18 图源（r18=1）；关闭：走全年龄图源（r18=0）。仅在显示背景图开启时有意义（保存即时生效，下一轮预取按新参数取图）"
+          >
+            <Switch
+              checked={form.loginBackgroundR18}
+              onCheckedChange={(v) => set('loginBackgroundR18', v)}
+              disabled={!form.loginBackgroundEnabled}
+            />
+          </Field>
         </CardContent>
       </Card>
       </SectionGate>
