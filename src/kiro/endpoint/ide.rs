@@ -115,8 +115,9 @@ impl KiroEndpoint for IdeEndpoint {
     }
 
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
-        // 用 effective_profile_arn:idc/social 缺 profileArn 时回退默认 BuilderId ARN
-        // (根治新号 400 profileArn is required);external_idp 返回 None → 不注入。
+        // 用 effective_profile_arn:idc/social 缺 profileArn 时回退默认 BuilderId ARN,
+        // external_idp 用动态解析到的真实租户 ARN(kiro.dev 迁移后 external_idp 也必须带,
+        // 缺了 400 profileArn is required);仅在 arn 为 None 时不注入。
         inject_profile_arn(body, &ctx.credentials.effective_profile_arn())
     }
 }
