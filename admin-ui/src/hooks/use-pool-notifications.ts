@@ -49,6 +49,37 @@ function disabledReasonText(reason?: string): string {
   }
 }
 
+/**
+ * 批量发射：同类事件 1-2 条逐条发（保留详细描述），≥3 条合并成一条汇总通知
+ * （标题给数量，描述列出前几个 + "等 N 个"），避免号池批量出事时刷屏。
+ */
+const MERGE_THRESHOLD = 3
+function flushBatch(
+  _cat: string,
+  labels: string[],
+  cfg: {
+    one: (label: string) => string
+    manyTitle: (count: number) => string
+    type: 'warning' | 'error'
+    desc: string
+  },
+) {
+  if (labels.length === 0) return
+  const fire = cfg.type === 'error' ? toast.error : toast.warning
+  if (labels.length < MERGE_THRESHOLD) {
+    for (const label of labels) {
+      fire(cfg.one(label), { description: cfg.desc, duration: cfg.type === 'error' ? 10000 : 8000 })
+    }
+    return
+  }
+  const head = labels.slice(0, 3).join('、')
+  const rest = labels.length > 3 ? ` 等 ${labels.length} 个` : ''
+  fire(cfg.manyTitle(labels.length), {
+    description: `${head}${rest}。${cfg.desc}`,
+    duration: 11000,
+  })
+}
+
 export function usePoolNotifications() {
   const { data: creds } = useCredentials()
   const { data: insights } = useRatelimitInsights()
@@ -66,44 +97,31 @@ export function usePoolNotifications() {
     // 本轮所有"问题态"指纹，用于回收恢复态的键
     const activeKeys = new Set<string>()
 
-    const emit = (key: string, fire: () => void) => {
+    // 批量合并：本轮**新触发**的事件先按类别攒起来，最后统一发；
+    // 同类 ≥3 条合并成一条汇总（如"3 个号已禁用"），避免号池批量出事时刷屏。
+    type Cat = 'arn' | 'quota' | 'disabled' | 'suspicious'
+    const batch: Record<Cat, string[]> = { arn: [], quota: [], disabled: [], suspicious: [] }
+
+    // 标记指纹为"已见"，若是本轮新出现且已过首轮 prime，则归入对应类别的批次。
+    const track = (key: string, cat: Cat, label: string) => {
       activeKeys.add(key)
       if (seen.has(key)) return
       seen.add(key)
-      if (primedRef.current) fire() // 首轮只 prime 不弹
+      if (primedRef.current) batch[cat].push(label)
     }
 
     for (const c of list) {
       const label = credLabel(c)
-
       // 1. ARN 缺失（非 api_key 号才需要 profileArn；api_key 无此概念）
       if (!c.hasProfileArn && c.authMethod !== 'api_key' && !c.disabled) {
-        emit(`arn:${c.id}`, () =>
-          toast.warning(`凭据 ${label} 缺少 Profile ARN`, {
-            description: '对话会返回 400 profileArn is required。请刷新 Token 触发动态解析，或检查该号是否已开通 Kiro。',
-            duration: 8000,
-          })
-        )
+        track(`arn:${c.id}`, 'arn', label)
       }
-
-      // 2. 号死/被禁用
+      // 2. 号死/被禁用（额度耗尽单独归 quota 语义）
       if (c.disabled) {
-        const reason = disabledReasonText(c.disabledReason)
-        // 额度耗尽单独归到"余额"语义（红），其余禁用归"号死"（红）
         if (c.disabledReason === 'QuotaExceeded') {
-          emit(`quota:${c.id}`, () =>
-            toast.error(`凭据 ${label} 额度已用尽`, {
-              description: '该号已达上游月度请求上限，已移出调度。可加号或等下月重置。',
-              duration: 10000,
-            })
-          )
+          track(`quota:${c.id}`, 'quota', label)
         } else {
-          emit(`disabled:${c.id}:${c.disabledReason ?? ''}`, () =>
-            toast.error(`凭据 ${label} ${reason}`, {
-              description: '已移出调度池。可在凭据管理里查看并处理。',
-              duration: 10000,
-            })
-          )
+          track(`disabled:${c.id}:${c.disabledReason ?? ''}`, 'disabled', `${label}（${disabledReasonText(c.disabledReason)}）`)
         }
       }
     }
@@ -111,27 +129,43 @@ export function usePoolNotifications() {
     // 3. 可疑活动风控：从 insights 的冷却原因判定（账户级软风控，最痛点）
     if (insights) {
       for (const it of insights as RateLimitInsight[]) {
-        const reason = it.cooldown?.reason ?? ''
-        if (reason.includes('可疑活动')) {
+        if ((it.cooldown?.reason ?? '').includes('可疑活动')) {
           const c = list.find((x) => x.id === it.id)
-          const label = c ? credLabel(c) : `#${it.id}`
-          const secs = Math.ceil((it.cooldown?.remainingMs ?? 0) / 1000)
-          emit(`suspicious:${it.id}`, () =>
-            toast.warning(`凭据 ${label} 触发账户级可疑活动风控`, {
-              description: `上游临时限速中（约 ${secs}s），已分钟级退避避免加重风控。频繁触发建议加号分流。`,
-              duration: 9000,
-            })
-          )
+          track(`suspicious:${it.id}`, 'suspicious', c ? credLabel(c) : `#${it.id}`)
         }
       }
     }
+
+    // 统一发射：每类 1-2 条逐条发（含详细描述），≥3 条合并成一条汇总。
+    flushBatch('arn', batch.arn, {
+      one: (n) => `凭据 ${n} 缺少 Profile ARN`,
+      manyTitle: (k) => `${k} 个凭据缺少 Profile ARN`,
+      type: 'warning',
+      desc: '对话会返回 400 profileArn is required。请刷新 Token 触发动态解析，或检查是否已开通 Kiro。',
+    })
+    flushBatch('quota', batch.quota, {
+      one: (n) => `凭据 ${n} 额度已用尽`,
+      manyTitle: (k) => `${k} 个凭据额度已用尽`,
+      type: 'error',
+      desc: '已达上游月度请求上限，已移出调度。可加号或等下月重置。',
+    })
+    flushBatch('disabled', batch.disabled, {
+      one: (n) => `凭据 ${n}`,
+      manyTitle: (k) => `${k} 个凭据被自动禁用`,
+      type: 'error',
+      desc: '已移出调度池。可在凭据管理里查看并处理。',
+    })
+    flushBatch('suspicious', batch.suspicious, {
+      one: (n) => `凭据 ${n} 触发账户级可疑活动风控`,
+      manyTitle: (k) => `${k} 个凭据触发账户级可疑活动风控`,
+      type: 'warning',
+      desc: '上游临时限速中，已分钟级退避避免加重风控。频繁触发建议加号分流。',
+    })
 
     // 回收：本轮不再处于问题态的键从 seen 移除，使问题再次发生时能重新通知。
     for (const key of Array.from(seen)) {
       if (!activeKeys.has(key)) seen.delete(key)
     }
-
-    // 首轮结束后开启弹窗（此前已把当前问题态 prime 进 seen）。
     if (!primedRef.current) primedRef.current = true
   }, [creds, insights])
 }
