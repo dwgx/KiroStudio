@@ -2,6 +2,26 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.5.0] - 2026-07-11
+
+本轮聚焦**通知系统重写**与**架构文档校准**。
+
+### UI
+- **通知系统重写**(弃用 sonner,改自研 `admin-ui/src/lib/toaster.tsx`):此前多条通知并发时,
+  sonner 的折叠态需靠一堆 `!important` CSS 硬掰其内部堆叠状态机,导致闪烁 / 空白灰卡 / hover 才
+  显现等问题。改为极简 pub/sub store + 自绘 Toaster,完全掌控堆叠:竖直平铺、硬上限 5 条(超出丢
+  最旧防刷屏堆爆)、底部倒计时进度条、hover 暂停、常驻关闭叉叉,保留右下角纯实色去光污染视觉。
+  经 Vite alias + tsconfig paths 把 `sonner` 重定向到自研模块,现有全部 `toast.*` 调用点零改动。
+- **号池健康通知批量合并**:同类事件(ARN 缺失/号禁用/额度耗尽/可疑活动风控)≥3 条时合并为一条
+  汇总通知(标题给数量、描述列出前几个),避免号池批量出事时刷屏;1-2 条仍逐条带详细描述。
+
+### 文档
+- **`docs/ARCHITECTURE.md` / `docs/MODULES.md` 按当前代码全面校准**(用 codegraph 索引 + 源码逐一
+  取证):修正代码规模(约 35,800 行)、上游端点(`runtime.{region}.kiro.dev`)、单端口 nest
+  (admin 不再独立 :8992)、balanced 8 键选号 + AIMD 熔断器 + 族级连坐、动态重试预算 + 45s 墙钟、
+  冷却时长现值;补全 health/compressor/overage/web_portal/health_marker/ssrf/scheduling/
+  external_idp_login/update 等新模块;删除已移除的 cache_tracker 记述。
+
 ## [0.4.0] - 2026-07-10
 
 本轮聚焦**性能、安全、上号可用性与 UI 打磨**,并规整了发布与一键部署流程。
