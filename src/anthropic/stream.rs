@@ -735,6 +735,13 @@ pub struct StreamContext {
     pub credits_used: Option<f64>,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
+    /// 每个 tool_use_id 已经转发给客户端的 input JSON 累计内容。
+    ///
+    /// 用于修复 `Invalid tool parameters`：Kiro 的 `ToolUseEvent.input` 在同一 tool_use_id 上
+    /// **可能是累积快照**（每帧带"到目前为止的完整 JSON"）而非纯增量。若原样把每帧当
+    /// `input_json_delta` 转发，Claude Code 会把累积片段再拼一次 → JSON 重复损坏 → 报错。
+    /// 这里记录已发内容，转发前做前缀检测：累积则只发差量，纯增量则原样发（自适应两种上游行为）。
+    tool_input_sent: HashMap<String, String>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
     pub tool_name_map: HashMap<String, String>,
     /// thinking 是否启用
@@ -779,6 +786,7 @@ impl StreamContext {
             output_tokens: 0,
             credits_used: None,
             tool_block_indices: HashMap::new(),
+            tool_input_sent: HashMap::new(),
             tool_name_map,
             thinking_enabled,
             thinking_buffer: String::new(),
@@ -1377,27 +1385,34 @@ impl StreamContext {
         );
         events.extend(start_events);
 
-        // 发送参数增量 (ToolUseEvent.input 是 String 类型)
+        // ⭐修复 Invalid tool parameters（根治，非逐片透传）：
+        // 根因（4路研究 + kiro2api 参照实现结论）：Kiro 的 toolUseEvent.input 逐帧到达，逐片当
+        // partial_json 原样透传时，一旦(a)上游帧非严格前缀单调（启发式 else 分支重复拼接）、或
+        // (b)中间帧被静默丢弃/截断，客户端拼接后的**总 JSON** 就非法 → 报 Invalid tool parameters。
+        // Anthropic 契约：客户端只在 content_block_stop 才把所有 partial_json 拼接后**一次性** parse，
+        // 不要求逐片合法。故最稳做法（kiro2api 已验证）：按 tool_use_id **缓冲**到 stop，校验后
+        // **一次性发单个 delta**。全程 String 级重组，绝不做字节切片，char-boundary panic 面彻底消除。
+        //
+        // 重组语义（与真实上游模式对齐，自适应累积快照 / 纯增量）：
+        //   - 累积（本帧以已缓冲为前缀且更长）→ 用本帧整体替换缓冲（取最新最全快照）。
+        //   - 完全重复帧 → 不变。
+        //   - 纯增量 / 前缀不成立 → 追加本帧（还原完整内容）。
         if !tool_use.input.is_empty() {
-            self.output_tokens += (tool_use.input.len() as i32 + 3) / 4; // 估算 token
-
-            if let Some(delta_event) = self.state_manager.handle_content_block_delta(
-                block_index,
-                json!({
-                    "type": "content_block_delta",
-                    "index": block_index,
-                    "delta": {
-                        "type": "input_json_delta",
-                        "partial_json": tool_use.input
-                    }
-                }),
-            ) {
-                events.push(delta_event);
+            let buf = self.tool_input_sent.entry(tool_use.tool_use_id.clone()).or_default();
+            if tool_use.input.len() >= buf.len() && tool_use.input.starts_with(buf.as_str()) {
+                *buf = tool_use.input.clone();
+            } else if buf.as_str() != tool_use.input {
+                buf.push_str(&tool_use.input);
             }
         }
 
-        // 如果是完整的工具调用（stop=true），发送 content_block_stop
+        // 仅在 stop 时把完整缓冲一次性发出 + 关闭块（此前只累积、不发 partial_json）。
         if tool_use.stop {
+            let assembled = self
+                .tool_input_sent
+                .remove(&tool_use.tool_use_id)
+                .unwrap_or_default();
+            events.extend(self.flush_tool_input(block_index, assembled));
             if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
                 events.push(stop_event);
             }
@@ -1406,9 +1421,58 @@ impl StreamContext {
         events
     }
 
+    /// 把某 tool_use 累积完整的 input 作为**单个** input_json_delta 发出（stop 时调用 / 截断收尾兜底）。
+    ///
+    /// 校验完整 JSON：合法→原样发；非法→告警并尽力发（不静默吞成空参数——空参数会让客户端把
+    /// 一个失败的工具调用当成"无参数成功调用"执行，比报错更危险）。空串→不发（无参工具，客户端得 `{}`）。
+    fn flush_tool_input(&mut self, block_index: i32, assembled: String) -> Vec<SseEvent> {
+        if assembled.is_empty() {
+            return Vec::new();
+        }
+        self.output_tokens += (assembled.len() as i32 + 3) / 4;
+        if serde_json::from_str::<serde_json::Value>(&assembled).is_err() {
+            // 拼装后仍非法：多因上游发了非法 JSON（如 JSON 不支持的 \x 转义 / 截断 \uXXXX / 裸控制符）
+            // 或中间帧丢失致截断。如实告警便于定位；仍把原样串发出交由客户端处置，不静默改写成空参。
+            tracing::warn!(
+                block_index,
+                "tool_use 拼装后 input 非合法 JSON（长度 {}），可能上游非法转义或帧丢失截断",
+                assembled.len()
+            );
+        }
+        self.state_manager
+            .handle_content_block_delta(
+                block_index,
+                json!({
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": assembled
+                    }
+                }),
+            )
+            .into_iter()
+            .collect()
+    }
+
     /// 生成最终事件序列
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
+
+        // 截断兜底：若某 tool_use 累积了 input 但流在 stop 之前就结束（上游截断/客户端断开），
+        // 缓冲会残留、块未关闭。这里把残留 input 尽力发出并关闭块，避免客户端卡在未闭合的
+        // tool_use 块上。（正常路径 stop 时已 flush + remove，此处只处理未收到 stop 的残留。）
+        if !self.tool_input_sent.is_empty() {
+            let pending: Vec<(String, String)> = self.tool_input_sent.drain().collect();
+            for (tool_use_id, assembled) in pending {
+                if let Some(&idx) = self.tool_block_indices.get(&tool_use_id) {
+                    events.extend(self.flush_tool_input(idx, assembled));
+                    if let Some(stop_event) = self.state_manager.handle_content_block_stop(idx) {
+                        events.push(stop_event);
+                    }
+                }
+            }
+        }
 
         // Flush thinking_buffer 中的剩余内容
         if self.thinking_enabled && !self.thinking_buffer.is_empty() {
@@ -1758,6 +1822,161 @@ mod tests {
             "mcp__very_long_original_tool_name",
             "应还原为原始工具名称"
         );
+    }
+
+    /// 跑一串 tool_use 帧，返回 (拼接出的 partial_json 全文, 发出的 input_json_delta 事件数)。
+    /// 根治后应恒为「单个 delta 在 stop 时发出」，故 delta 数应为 0(空参)或 1(有参)。
+    fn run_tool_frames(ctx: &mut StreamContext, frames: &[(&str, bool)]) -> (String, usize) {
+        use crate::kiro::model::events::ToolUseEvent;
+        let mut out = String::new();
+        let mut delta_count = 0usize;
+        for (input, stop) in frames {
+            let ev = Event::ToolUse(ToolUseEvent {
+                name: "t".to_string(),
+                tool_use_id: "toolu_x".to_string(),
+                input: input.to_string(),
+                stop: *stop,
+            });
+            for e in ctx.process_kiro_event(&ev) {
+                if e.event == "content_block_delta"
+                    && e.data["delta"]["type"] == "input_json_delta"
+                {
+                    out.push_str(e.data["delta"]["partial_json"].as_str().unwrap_or(""));
+                    delta_count += 1;
+                }
+            }
+        }
+        (out, delta_count)
+    }
+
+    /// 兼容旧断言：只取拼接全文。
+    fn collect_tool_partial_json(ctx: &mut StreamContext, frames: &[(&str, bool)]) -> String {
+        run_tool_frames(ctx, frames).0
+    }
+
+    #[test]
+    fn test_tool_input_cumulative_snapshots() {
+        // 上游发累积快照：每帧是"到目前为止的完整 JSON"。转发拼接后不应重复,应恰为最终完整 JSON。
+        let mut ctx = StreamContext::new_with_thinking("m", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        let joined = collect_tool_partial_json(
+            &mut ctx,
+            &[
+                (r#"{"a""#, false),
+                (r#"{"a":1"#, false),
+                (r#"{"a":1,"b":2}"#, true),
+            ],
+        );
+        assert_eq!(joined, r#"{"a":1,"b":2}"#, "累积模式:拼接后应为完整 JSON,无重复");
+    }
+
+    #[test]
+    fn test_tool_input_repeated_final_frame() {
+        // 累积模式常见收尾：stop 帧重复带上完整 JSON（与上一帧相同）→ 不应重复发。
+        let mut ctx = StreamContext::new_with_thinking("m", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        let joined = collect_tool_partial_json(
+            &mut ctx,
+            &[
+                (r#"{"a":1}"#, false),
+                (r#"{"a":1}"#, true), // 完全重复帧
+            ],
+        );
+        assert_eq!(joined, r#"{"a":1}"#, "重复帧不应二次转发");
+    }
+
+    #[test]
+    fn test_tool_input_pure_deltas() {
+        // 上游发纯增量:每帧是不同片段。转发原样,拼接后仍为完整 JSON。
+        let mut ctx = StreamContext::new_with_thinking("m", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        let joined = collect_tool_partial_json(
+            &mut ctx,
+            &[
+                (r#"{"a""#, false),
+                (r#":1,"#, false),
+                (r#""b":2}"#, true),
+            ],
+        );
+        assert_eq!(joined, r#"{"a":1,"b":2}"#, "增量模式:原样转发,拼接后为完整 JSON");
+    }
+
+    #[test]
+    fn test_tool_input_single_full_snapshot() {
+        // 单帧完整 JSON（最常见）:原样一次发出。
+        let mut ctx = StreamContext::new_with_thinking("m", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        let joined = collect_tool_partial_json(&mut ctx, &[(r#"{"k":"v"}"#, true)]);
+        assert_eq!(joined, r#"{"k":"v"}"#);
+    }
+
+    #[test]
+    fn test_tool_input_single_delta_invariant() {
+        // 根治不变式：无论上游发几帧，最终只在 stop 发**一个** input_json_delta（缓冲到 stop 再发）。
+        let mut ctx = StreamContext::new_with_thinking("m", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        let (joined, n) = run_tool_frames(
+            &mut ctx,
+            &[(r#"{"a""#, false), (r#"{"a":1"#, false), (r#"{"a":1,"b":2}"#, true)],
+        );
+        assert_eq!(joined, r#"{"a":1,"b":2}"#);
+        assert_eq!(n, 1, "应只发一个 delta（缓冲到 stop 一次性发）");
+    }
+
+    #[test]
+    fn test_tool_input_non_prefix_trap() {
+        // 旧逐片启发式的致命陷阱:上游第二帧不以第一帧为前缀(非单调重写)。根治后按缓冲语义:
+        // 前缀不成立 → 追加,stop 时一次性发,拼接不产生"两段独立 delta 拼错"的坏 JSON。
+        let mut ctx = StreamContext::new_with_thinking("m", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        let (joined, n) = run_tool_frames(
+            &mut ctx,
+            &[(r#"{"path":"/a"}"#, false), (r#"{"path":"/b"}"#, true)],
+        );
+        // 追加语义:两帧拼接(这是"前缀不成立"时唯一无信息损失的重组)；关键是只发一个 delta、
+        // 且 KiroStudio 不再自造"半累积半增量"的重复错位。
+        assert_eq!(n, 1, "非前缀帧也只发一个 delta");
+        assert_eq!(joined, r#"{"path":"/a"}{"path":"/b"}"#);
+    }
+
+    #[test]
+    fn test_tool_input_illegal_json_at_stop_still_emitted() {
+        // 上游发本就非法的 JSON（如 JSON 不支持的 \x 转义）→ 校验失败但仍原样发出（告警),
+        // 绝不静默吞成空参数（空参会让客户端把失败工具调用当无参成功执行,更危险）。
+        let mut ctx = StreamContext::new_with_thinking("m", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        let (joined, n) = run_tool_frames(&mut ctx, &[(r#"{"a":"\xd7"}"#, true)]);
+        assert_eq!(n, 1, "非法 JSON 也要发出(不静默空参)");
+        assert_eq!(joined, r#"{"a":"\xd7"}"#, "原样发出交客户端处置");
+    }
+
+    #[test]
+    fn test_tool_input_truncated_stream_flushes_on_final() {
+        // 截断:tool_use 帧永不带 stop,流结束。generate_final_events 应把残留缓冲发出并关闭块,
+        // 客户端不会卡在未闭合 tool_use 块上。
+        use crate::kiro::model::events::ToolUseEvent;
+        let mut ctx = StreamContext::new_with_thinking("m", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        // 两帧累积,均无 stop
+        for input in [r#"{"a""#, r#"{"a":1}"#] {
+            let ev = Event::ToolUse(ToolUseEvent {
+                name: "t".to_string(),
+                tool_use_id: "toolu_x".to_string(),
+                input: input.to_string(),
+                stop: false,
+            });
+            let evs = ctx.process_kiro_event(&ev);
+            // stop 前不应发任何 input_json_delta
+            assert!(!evs.iter().any(|e| e.event == "content_block_delta"
+                && e.data["delta"]["type"] == "input_json_delta"));
+        }
+        let finals = ctx.generate_final_events();
+        let delta = finals.iter().find(|e| e.event == "content_block_delta"
+            && e.data["delta"]["type"] == "input_json_delta");
+        assert!(delta.is_some(), "截断收尾应 flush 残留 tool input");
+        assert_eq!(delta.unwrap().data["delta"]["partial_json"], r#"{"a":1}"#);
+        // 块应被关闭
+        assert!(finals.iter().any(|e| e.event == "content_block_stop"), "截断应关闭 tool 块");
     }
 
     #[test]

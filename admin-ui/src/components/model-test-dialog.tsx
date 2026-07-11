@@ -7,8 +7,17 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { CheckCircle2, XCircle, Loader2, MoreHorizontal, FlaskConical, Lightbulb } from 'lucide-react'
+import { CheckCircle2, XCircle, Loader2, MoreHorizontal, FlaskConical, Lightbulb, ShieldCheck, History } from 'lucide-react'
 import { PROBE_MODEL_CATALOG, type ProbedModel, type ProbeModelsResponse } from '@/api/credentials'
+import type { CredentialStatusItem } from '@/types/api'
+import { toast } from 'sonner'
+
+/** 模型勾选模板：一键切换常测组合。 */
+const MODEL_TEMPLATES: { label: string; models: string[] }[] = [
+  { label: '仅国产便宜', models: ['qwen3-coder-next', 'minimax-m2.1', 'deepseek-3.2', 'minimax-m2.5', 'glm-5'] },
+  { label: '仅 Claude', models: ['claude-haiku-4.5', 'claude-sonnet-4.5', 'claude-sonnet-4.6', 'claude-opus-4.6', 'claude-opus-4.8'] },
+  { label: '全部', models: PROBE_MODEL_CATALOG.map((m) => m.id) },
+]
 
 export interface ModelTestResult {
   id: number
@@ -23,8 +32,12 @@ interface ModelTestDialogProps {
   onOpenChange: (open: boolean) => void
   /** 本次要测的凭据 id（勾选自 dashboard） */
   credentialIds: number[]
+  /** 全部凭据（用于读取每号已存的白名单 allowedModels / 历史测试结果 testedModels） */
+  credentials: CredentialStatusItem[]
   /** 逐号探测回调：由 dashboard 提供（调用 probeAvailableModels）。 */
   onProbe: (id: number, models: string[]) => Promise<ProbeModelsResponse>
+  /** 一键把某号测出 supported 的模型设为其「允许模型」白名单（成本安全硬门）。 */
+  onSetWhitelist: (id: number, models: string[]) => Promise<void>
 }
 
 /** 单模型状态 → 短标签 */
@@ -53,7 +66,28 @@ function modelChip(m: ProbedModel) {
   )
 }
 
-export function ModelTestDialog({ open, onOpenChange, credentialIds, onProbe }: ModelTestDialogProps) {
+export function ModelTestDialog({ open, onOpenChange, credentialIds, credentials, onProbe, onSetWhitelist }: ModelTestDialogProps) {
+  const credById = new Map(credentials.map((c) => [c.id, c]))
+  const [savingWhitelist, setSavingWhitelist] = useState<number | null>(null)
+  const hasHistory = credentialIds.some((id) => (credById.get(id)?.testedModels?.length ?? 0) > 0)
+
+  // 一键把某号测出 supported 的模型设为其白名单（成本安全硬门）
+  const applyWhitelist = async (id: number, supported: string[]) => {
+    if (supported.length === 0) {
+      toast.error('该号没有测出可用模型，不能设为白名单')
+      return
+    }
+    setSavingWhitelist(id)
+    try {
+      await onSetWhitelist(id, supported)
+      toast.success(`凭据 #${id} 白名单已设为 ${supported.length} 个可用模型（便宜请求锁定此号）`)
+    } catch (e) {
+      toast.error(`设置白名单失败: ${(e as Error).message}`)
+    } finally {
+      setSavingWhitelist(null)
+    }
+  }
+
   // 勾选要测的模型（默认全选常用主力，国产便宜的也默认选上验证机制）
   const [selectedModels, setSelectedModels] = useState<Set<string>>(
     () => new Set(['qwen3-coder-next', 'claude-haiku-4.5', 'claude-sonnet-4.6', 'claude-opus-4.6', 'claude-opus-4.8']),
@@ -116,7 +150,23 @@ export function ModelTestDialog({ open, onOpenChange, credentialIds, onProbe }: 
         <div className="space-y-4 py-3">
           {/* 模型勾选：可自己选要测哪些 */}
           <div>
-            <div className="mb-1.5 text-xs text-muted-foreground">选择要测的模型（倍率=计费系数，越低越便宜）</div>
+            <div className="mb-1.5 flex items-center justify-between">
+              <span className="text-xs text-muted-foreground">选择要测的模型（倍率=计费系数，越低越便宜）</span>
+              <div className="flex gap-1">
+                {MODEL_TEMPLATES.map((t) => (
+                  <button
+                    key={t.label}
+                    type="button"
+                    disabled={testing}
+                    onClick={() => setSelectedModels(new Set(t.models))}
+                    className="rounded border border-white/10 bg-white/5 px-2 py-0.5 text-[11px] text-muted-foreground hover:border-white/25 disabled:opacity-50"
+                    title={`快速勾选：${t.models.join(', ')}`}
+                  >
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+            </div>
             <div className="flex flex-wrap gap-1.5">
               {PROBE_MODEL_CATALOG.map((m) => {
                 const on = selectedModels.has(m.id)
@@ -158,6 +208,37 @@ export function ModelTestDialog({ open, onOpenChange, credentialIds, onProbe }: 
             </div>
           )}
 
+          {/* 未测前：展示这些号之前测过的历史标签（持久化 testedModels），无需重测即可看 */}
+          {results.size === 0 && hasHistory && (
+            <div className="max-h-[240px] overflow-y-auto border rounded-md p-2 space-y-2">
+              <div className="flex items-center gap-1 text-[11px] text-muted-foreground">
+                <History className="h-3 w-3" /> 上次测试结果（点上方「开始测试」可重测刷新）
+              </div>
+              {credentialIds.map((id) => {
+                const hist = credById.get(id)?.testedModels
+                const current = credById.get(id)?.allowedModels
+                if (!hist || hist.length === 0) return (
+                  <div key={id} className="text-xs text-muted-foreground p-1">凭据 #{id}：未测过</div>
+                )
+                return (
+                  <div key={id} className="text-sm p-2 rounded bg-black/20 border border-white/5">
+                    <div className="flex items-center gap-2">
+                      <span className="font-medium">凭据 #{id}</span>
+                      {current && current.length > 0 && (
+                        <Badge variant="secondary" className="text-[10px]" title={current.join(', ')}>
+                          白名单 {current.length} 项
+                        </Badge>
+                      )}
+                    </div>
+                    <div className="flex flex-wrap gap-1.5 mt-1.5">
+                      {hist.map((h) => modelChip({ model: h.model, status: h.status, credits: 0 }))}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+
           {results.size > 0 && (
             <div className="flex justify-between text-sm font-medium">
               <span>完成 {doneCount} / 失败 {failedCount}（共 {progress.total}）</span>
@@ -184,8 +265,51 @@ export function ModelTestDialog({ open, onOpenChange, credentialIds, onProbe }: 
                     </span>
                   </div>
                   {r.status === 'done' && r.models && (
-                    <div className="flex flex-wrap gap-1.5 mt-2">{r.models.map((m) => modelChip(m))}</div>
+                    <>
+                      <div className="flex flex-wrap gap-1.5 mt-2">{r.models.map((m) => modelChip(m))}</div>
+                      {(() => {
+                        const supported = r.models.filter((m) => m.status === 'supported').map((m) => m.model)
+                        const current = credById.get(r.id)?.allowedModels
+                        return (
+                          <div className="mt-2 flex items-center gap-2">
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="h-6 px-2 text-[11px]"
+                              disabled={supported.length === 0 || savingWhitelist === r.id}
+                              onClick={() => applyWhitelist(r.id, supported)}
+                              title="把测出可用的模型设为该号的允许白名单（成本安全硬门：便宜请求锁定此号，绝不溢出到贵号）"
+                            >
+                              {savingWhitelist === r.id
+                                ? <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                                : <ShieldCheck className="h-3 w-3 mr-1" />}
+                              设为白名单（{supported.length}）
+                            </Button>
+                            {current && current.length > 0 && (
+                              <span className="text-[11px] text-muted-foreground" title={current.join(', ')}>
+                                当前白名单：{current.length} 项
+                              </span>
+                            )}
+                          </div>
+                        )
+                      })()}
+                    </>
                   )}
+                  {/* 历史测试结果（本次未测但之前测过）：从持久化的 testedModels 展示 */}
+                  {r.status !== 'done' && (() => {
+                    const hist = credById.get(r.id)?.testedModels
+                    if (!hist || hist.length === 0) return null
+                    return (
+                      <div className="mt-2">
+                        <div className="mb-1 flex items-center gap-1 text-[11px] text-muted-foreground">
+                          <History className="h-3 w-3" /> 历史测试结果
+                        </div>
+                        <div className="flex flex-wrap gap-1.5">
+                          {hist.map((h) => modelChip({ model: h.model, status: h.status, credits: 0 }))}
+                        </div>
+                      </div>
+                    )
+                  })()}
                   {r.error && <div className="text-xs mt-1 text-red-300">错误: {r.error}</div>}
                 </div>
               ))}

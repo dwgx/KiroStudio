@@ -2,6 +2,38 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.6.7] - 2026-07-11
+
+### 新增（国产模型 + 成本安全）
+- **国产模型可调用（GLM / DeepSeek / Qwen / MiniMax）**：Kiro 上游本身直收原生 modelId，
+  `map_model` 加分支——`deepseek→deepseek-3.2`、`glm→glm-5`、`qwen→qwen3-coder-next`、
+  `minimax→minimax-m2.5/m2.1`，并支持完整原生 id 直透；`/v1/models` 列出这些模型；上下文窗口
+  默认 200k。计费按上游 meteringEvent 真实累加，不硬编码倍率。（能否用取决于该号订阅是否覆盖，
+  不覆盖走 INVALID_MODEL_ID 模型级黑名单 + failover，不废号。）
+- **每号「允许模型」白名单（成本安全硬门）**：凭据可设 `allowedModels`，选号在唯一收敛点
+  `is_entry_selectable` + 平行 `transient_wait_duration` 两处硬过滤——设了白名单的号**只**接白名单内
+  模型。用途：把便宜模型（国产）的流量锁死在指定便宜号上，**杜绝便宜请求溢出到贵号按贵号计费**。
+  硬门语义：设太窄 + 号不够则该模型无号可用返错（防溢出优先于可用性，刻意如此）。新增
+  `POST /credentials/{id}/allowed-models` 端点。
+- **探测结果打标签持久化**：`probe_models` 完成后把「测试可用模型」结果（supported/unsupported/
+  unknown + 时间）写入凭据、持久化，下次进测试页无需重测即可看到该号测过什么、结果如何。
+- **白名单 UI**：模型测试弹窗加模板（仅国产便宜 / 仅 Claude / 全部）、测出 supported 一键设为白名单、
+  展示历史测试结果。
+
+### 修复 / 改进
+- **`Invalid tool parameters` 根治**：根因是逐片透传 tool 参数 partial_json——上游帧非前缀单调时
+  启发式重复拼接、或中间帧静默丢弃/截断，客户端拼接后的**总 JSON 非法**。改为 kiro2api 验证的
+  范式：按 tool_use_id **缓冲到 content_block_stop 再一次性发单个 delta**（Anthropic 契约允许，
+  客户端只在 stop 才 parse）。全程 String 级重组、删除字节切片（消除 char-boundary panic 面）；
+  stop 时校验完整 JSON，非法则告警但原样发（绝不静默吞成空参数）；流截断时收尾 flush 残留缓冲 +
+  关闭块。单点覆盖 /v1 流式、/cc/v1 缓冲、非流式三条路径。
+- **tool 帧静默丢弃补盲（可观测性）**：`Event::from_frame` 失败此前无声吞帧。四处站点补 Err 分支——
+  `toolUseEvent` 解析失败置 DecoderStopped 失败态（收尾补发 SSE error / 非流式返 502，客户端按
+  api_error 重试，不再把截断当成功），非 tool 帧仅告警不置失败态（零误伤正常流）。
+- **Claude Code 自动切协议**：识别到 CC 请求（`x-anthropic-billing-header` 或 UA 经
+  `classify_device` 判为 claude-code）时，`/v1` 流式自动走 buffered 分发（等价 `/cc/v1`，
+  input_tokens 用上游准确值），CC 无需手动改端点。可配置热更开关 `ccAutoBuffer`（默认开）。
+
 ## [0.6.6] - 2026-07-11
 
 ### 修复（v0.6.5 出厂构建随附的三处真实缺陷）

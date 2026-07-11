@@ -10,7 +10,8 @@ use serde::Deserialize;
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
+        AddCredentialRequest, SetAllowedModelsRequest, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest,
         SetRpmLimitRequest,
         SuccessResponse,
     },
@@ -67,6 +68,24 @@ pub async fn set_credential_rpm_limit(
         Ok(_) => Json(SuccessResponse::new(format!(
             "凭据 #{} RPM 容量已设置为 {:?}",
             id, payload.rpm_limit
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/allowed-models
+/// 设置凭据级「允许模型」白名单（成本安全硬门；空/null = 不限制）
+pub async fn set_credential_allowed_models(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetAllowedModelsRequest>,
+) -> impl IntoResponse {
+    match state.service.set_allowed_models(id, payload.allowed_models.clone()) {
+        Ok(_) => Json(SuccessResponse::new(format!(
+            "凭据 #{} 允许模型白名单已更新（{} 项，空=不限制）",
+            id,
+            payload.allowed_models.as_ref().map(|l| l.len()).unwrap_or(0)
         )))
         .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),

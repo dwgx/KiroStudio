@@ -7,10 +7,19 @@ export interface CredentialsStatusResponse {
 }
 
 // 单个凭据状态
+export interface TestedModel {
+  model: string
+  status: 'supported' | 'unsupported' | 'unknown'
+  testedAt: string
+}
 export interface CredentialStatusItem {
   id: number
   priority: number
   rpmLimit?: number
+  /** 「允许模型」白名单（成本安全硬门；空/缺省 = 不限制） */
+  allowedModels?: string[]
+  /** 「测试可用模型」历史结果（探测打的标签） */
+  testedModels?: TestedModel[]
   disabled: boolean
   failureCount: number
   isCurrent: boolean
@@ -249,6 +258,7 @@ export interface ConfigSnapshotResponse {
   defaultEndpoint: string
   endpointNames: string[]
   extractThinking: boolean
+  ccAutoBuffer: boolean
   stripEnvNoise: boolean
   cooldownEnabled: boolean
   rateLimitEnabled: boolean
@@ -293,6 +303,7 @@ export interface UpdateConfigRequest {
   loadBalancingMode?: string
   defaultEndpoint?: string
   extractThinking?: boolean
+  ccAutoBuffer?: boolean
   stripEnvNoise?: boolean
   cooldownEnabled?: boolean
   rateLimitEnabled?: boolean

@@ -29,6 +29,12 @@ pub struct CredentialStatusItem {
     /// 凭据级 RPM 容量上限（None=继承全局）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rpm_limit: Option<u32>,
+    /// 凭据级「允许模型」白名单（成本安全硬门；None/空=不限制）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_models: Option<Vec<String>>,
+    /// 「测试可用模型」历史结果（探测打的标签，供前端展示该号测过什么）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tested_models: Option<Vec<crate::kiro::model::credentials::TestedModel>>,
     /// 是否被禁用
     pub disabled: bool,
     /// 连续失败次数
@@ -153,6 +159,15 @@ pub struct SetPriorityRequest {
 pub struct SetRpmLimitRequest {
     /// 新 RPM 容量（0/null = 继承全局）
     pub rpm_limit: Option<u32>,
+}
+
+/// 设置凭据级「允许模型」白名单的请求（成本安全硬门；空/null = 不限制）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAllowedModelsRequest {
+    /// 允许的 kiro modelId 列表（如 `["deepseek-3.2","glm-5"]`）。空/null = 不限制。
+    #[serde(default)]
+    pub allowed_models: Option<Vec<String>>,
 }
 
 /// 添加凭据请求
@@ -445,6 +460,8 @@ pub struct ConfigSnapshotResponse {
     pub default_endpoint: String,
     pub endpoint_names: Vec<String>,
     pub extract_thinking: bool,
+    /// Claude Code 自动切缓冲协议（识别到 CC 请求时 /v1 流式自动走 buffered，准确 input_tokens）
+    pub cc_auto_buffer: bool,
     /// 是否剥离转发给上游的 system 环境噪音（省 token / 提缓存命中 / 降关联，立即生效）
     pub strip_env_noise: bool,
     pub cooldown_enabled: bool,
@@ -508,6 +525,7 @@ pub struct UpdateConfigRequest {
     pub load_balancing_mode: Option<String>,
     pub default_endpoint: Option<String>,
     pub extract_thinking: Option<bool>,
+    pub cc_auto_buffer: Option<bool>,
     pub strip_env_noise: Option<bool>,
     pub cooldown_enabled: Option<bool>,
     pub rate_limit_enabled: Option<bool>,
@@ -673,6 +691,7 @@ mod tests {
             default_endpoint: "ide".into(),
             endpoint_names: vec![],
             extract_thinking: true,
+            cc_auto_buffer: true,
             cooldown_enabled: true,
             rate_limit_enabled: false,
             rate_limit_daily_max: 500,

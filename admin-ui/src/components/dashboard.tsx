@@ -13,7 +13,7 @@ import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { ModelTestDialog } from '@/components/model-test-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useSetDisabled } from '@/hooks/use-credentials'
-import { getCredentialBalance, getCachedBalances, forceRefreshToken, deepVerifyCredential, probeAvailableModels } from '@/api/credentials'
+import { getCredentialBalance, getCachedBalances, forceRefreshToken, deepVerifyCredential, probeAvailableModels, setCredentialAllowedModels } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import { PageSkeleton } from '@/components/ui/page-skeleton'
 import type { BalanceResponse } from '@/types/api'
@@ -927,7 +927,12 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         open={modelTestOpen}
         onOpenChange={setModelTestOpen}
         credentialIds={modelTestIds}
+        credentials={data?.credentials ?? []}
         onProbe={(id, models) => probeAvailableModels(id, models)}
+        onSetWhitelist={async (id, models) => {
+          await setCredentialAllowedModels(id, models)
+          queryClient.invalidateQueries({ queryKey: ['credentials'] })
+        }}
       />
     </div>
   )

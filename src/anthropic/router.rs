@@ -38,6 +38,7 @@ pub fn create_router_with_provider(
     api_key: impl Into<String>,
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
+    cc_auto_buffer: bool,
     cors_allowed_origins: &[String],
     max_body_bytes: usize,
     compression: crate::model::config::CompressionConfig,
@@ -51,6 +52,7 @@ pub fn create_router_with_provider(
     // TIER3 配置热重载：把热路径开关/压缩配置播种进进程级镜像（handler 读镜像而非固化 state）。
     // 之后 admin 改配置调对应 setter 即时生效、无需重启（extract_thinking / compression 两项）。
     super::handlers::set_extract_thinking(extract_thinking);
+    super::handlers::set_cc_auto_buffer(cc_auto_buffer);
     super::handlers::set_compression(compression);
     // 环境噪音剥离开关：播种进 converter 进程级镜像（归一化路径读镜像），admin 改后即时生效。
     super::converter::set_strip_env_noise(strip_env_noise);

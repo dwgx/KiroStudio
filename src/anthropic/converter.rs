@@ -561,6 +561,22 @@ pub fn map_model(model: &str) -> Option<String> {
         }
     } else if model_lower.contains("haiku") {
         Some("claude-haiku-4.5".to_string())
+    } else if model_lower.contains("deepseek") {
+        // Kiro 上游直收原生 modelId（Kiro 不是 Anthropic 服务端，也接国产模型，倍率远低于
+        // claude，见 kiro-model-catalog）。模糊名 → 当前唯一版本；完整原生 id `deepseek-3.2`
+        // 也含 "deepseek" 子串，同样命中此分支映射回自身（直透兼容）。
+        Some("deepseek-3.2".to_string())
+    } else if model_lower.contains("glm") {
+        Some("glm-5".to_string())
+    } else if model_lower.contains("qwen") {
+        Some("qwen3-coder-next".to_string())
+    } else if model_lower.contains("minimax") {
+        // minimax-m2.1 / m2.5：显式带 2.1 → m2.1，否则（含 m2.5、无版本号）回退较新的 m2.5
+        if model_lower.contains("2.1") || model_lower.contains("2-1") {
+            Some("minimax-m2.1".to_string())
+        } else {
+            Some("minimax-m2.5".to_string())
+        }
     } else {
         None
     }
@@ -1769,6 +1785,29 @@ mod tests {
     #[test]
     fn test_map_model_unsupported() {
         assert!(map_model("gpt-4").is_none());
+        // 仍不支持的：gemini / 未知
+        assert!(map_model("gemini-2.0").is_none());
+    }
+
+    #[test]
+    fn test_map_model_national() {
+        // 模糊名 → 规范 kiro modelId
+        assert_eq!(map_model("deepseek"), Some("deepseek-3.2".to_string()));
+        assert_eq!(map_model("glm"), Some("glm-5".to_string()));
+        assert_eq!(map_model("qwen"), Some("qwen3-coder-next".to_string()));
+        assert_eq!(map_model("minimax"), Some("minimax-m2.5".to_string()));
+        // 完整原生 id 直透（含子串，映射回自身）
+        assert_eq!(map_model("deepseek-3.2"), Some("deepseek-3.2".to_string()));
+        assert_eq!(map_model("glm-5"), Some("glm-5".to_string()));
+        assert_eq!(map_model("qwen3-coder-next"), Some("qwen3-coder-next".to_string()));
+        assert_eq!(map_model("minimax-m2.5"), Some("minimax-m2.5".to_string()));
+        // minimax 版本细分
+        assert_eq!(map_model("minimax-m2.1"), Some("minimax-m2.1".to_string()));
+        // 大小写不敏感
+        assert_eq!(map_model("DeepSeek"), Some("deepseek-3.2".to_string()));
+        // 国产模型窗口 = 200k（非 1M）
+        assert_eq!(get_context_window_size("deepseek-3.2"), 200_000);
+        assert_eq!(get_context_window_size("glm-5"), 200_000);
     }
 
     #[test]
