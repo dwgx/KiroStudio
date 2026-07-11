@@ -12,6 +12,7 @@ import {
 import { LoginDialog } from '@/components/login-dialog'
 import { PageSkeleton } from '@/components/ui/page-skeleton'
 import { usePoolNotifications } from '@/hooks/use-pool-notifications'
+import { useConfigSnapshot } from '@/hooks/use-credentials'
 
 const Dashboard = lazy(() =>
   import('@/components/dashboard').then((m) => ({ default: m.Dashboard }))
@@ -54,6 +55,10 @@ export function AppShell({ onLogout }: AppShellProps) {
   // 号池健康事件通知（右下角 toast，状态跃迁时弹一次；复用已有轮询数据，零额外上游调用）。
   usePoolNotifications()
 
+  // 侧边栏版本号：读服务端真实版本（编译期注入），不再硬编码。react-query 缓存键与设置页
+  // 共享（config-snapshot），此处零额外请求。取不到时不显示版本号，胜过显示过时的写死值。
+  const { data: cfg } = useConfigSnapshot()
+
   const handleLogout = () => {
     storage.removeApiKey()
     queryClient.clear()
@@ -69,7 +74,9 @@ export function AppShell({ onLogout }: AppShellProps) {
           <h1 className="text-xl font-bold text-gradient-brand">
             KiroStudio
           </h1>
-          <p className="text-xs text-[#666] mt-1">Admin Panel v0.6.4</p>
+          <p className="text-xs text-[#666] mt-1">
+            Admin Panel{cfg?.serverVersion ? ` v${cfg.serverVersion}` : ''}
+          </p>
         </div>
 
         {/* Main Nav */}
