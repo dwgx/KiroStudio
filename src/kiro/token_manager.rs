@@ -693,6 +693,10 @@ pub struct CredentialEntrySnapshot {
     pub priority: u32,
     /// 凭据级 RPM 容量上限（None=继承全局）
     pub rpm_limit: Option<u32>,
+    /// 凭据级「允许模型」白名单（None/空=不限制）
+    pub allowed_models: Option<Vec<String>>,
+    /// 「测试可用模型」历史结果（探测打的标签）
+    pub tested_models: Option<Vec<crate::kiro::model::credentials::TestedModel>>,
     /// 是否被禁用
     pub disabled: bool,
     /// 连续失败次数
@@ -1455,6 +1459,13 @@ impl MultiTokenManager {
         if is_opus && !entry.credentials.supports_opus() {
             return false;
         }
+        // 成本安全白名单硬门：该号设了 allowed_models 且当前模型不在其中 → 过滤掉。
+        // 把便宜模型（国产）的流量锁死在指定号上，杜绝溢出到未列该模型的（更贵）号按贵号计费。
+        // model 为空串（无模型信息，如 MCP 工具调用不带 modelId）时**跳过本检查**（不因白名单过滤），
+        // 因为白名单约束的是"对话模型"，不该误伤无模型语义的 MCP 调用。
+        if !model.is_empty() && !entry.credentials.allows_model(model) {
+            return false;
+        }
         // 模型级黑名单：该号曾对此模型返回 INVALID_MODEL_ID（订阅不含）→ 仅对此模型跳过它，
         // 该号对其它模型不受影响。TTL 到期后自动放行重试探。
         if self.is_model_blocked(entry.id, model) {
@@ -1479,6 +1490,7 @@ impl MultiTokenManager {
         let is_opus = model
             .map(|m| m.to_lowercase().contains("opus"))
             .unwrap_or(false);
+        let model_key = model.unwrap_or("");
         let entries = self.entries.lock();
         let mut has_candidate = false;
         let mut waits = Vec::new();
@@ -1488,6 +1500,10 @@ impl MultiTokenManager {
                 continue;
             }
             if is_opus && !entry.credentials.supports_opus() {
+                continue;
+            }
+            // 成本安全白名单硬门（与 is_entry_selectable 保持一致，否则等待估算与实际可选号不符）
+            if !model_key.is_empty() && !entry.credentials.allows_model(model_key) {
                 continue;
             }
 
@@ -2637,6 +2653,8 @@ impl MultiTokenManager {
                     id: e.id,
                     priority: e.credentials.priority,
                     rpm_limit: e.credentials.rpm_limit,
+                    allowed_models: e.credentials.allowed_models.clone(),
+                    tested_models: e.credentials.tested_models.clone(),
                     disabled: e.disabled,
                     failure_count: e.failure_count,
                     auth_method: if e.credentials.is_api_key_credential() {
@@ -2758,6 +2776,28 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             // 0 归一为 None(继承全局),避免存 Some(0) 语义歧义
             entry.credentials.rpm_limit = rpm_limit.filter(|&v| v > 0);
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 设置凭据级「允许模型」白名单（成本安全硬门）。空列表归一为 None（不限制）。
+    /// 值为 kiro modelId（如 `deepseek-3.2`/`claude-opus-4.8`）。持久化到凭据源文件。
+    pub fn set_allowed_models(&self, id: u64, models: Option<Vec<String>>) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            // 去空白 + 去空项；空列表归一为 None（= 不限制，兼容"清空白名单"操作）
+            let cleaned = models.map(|list| {
+                list.into_iter()
+                    .map(|m| m.trim().to_string())
+                    .filter(|m| !m.is_empty())
+                    .collect::<Vec<_>>()
+            });
+            entry.credentials.allowed_models = cleaned.filter(|l| !l.is_empty());
         }
         self.persist_credentials()?;
         Ok(())
@@ -3077,6 +3117,28 @@ impl MultiTokenManager {
             // 逐个之间留一点间隔，避免密集打同一号触发风控（与批量验活一致的谨慎）。
             tokio::time::sleep(StdDuration::from_millis(600)).await;
         }
+
+        // 打标签持久化：把本轮探测结果写入该凭据的 tested_models（覆盖旧结果），
+        // 下次进"测试可用模型"页无需重测即可看到该号测过什么、结果如何。
+        {
+            let now = chrono::Utc::now().to_rfc3339();
+            let tested: Vec<crate::kiro::model::credentials::TestedModel> = detail
+                .iter()
+                .map(|(model, status, _credits)| crate::kiro::model::credentials::TestedModel {
+                    model: model.clone(),
+                    status: status.clone(),
+                    tested_at: now.clone(),
+                })
+                .collect();
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                entry.credentials.tested_models = Some(tested);
+            }
+        }
+        if let Err(e) = self.persist_credentials() {
+            tracing::warn!("持久化探测结果(tested_models)失败: {e}");
+        }
+
         Ok((detail, total_credits))
     }
 

@@ -98,6 +98,12 @@ pub struct Config {
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
 
+    /// Claude Code 自动切缓冲协议：识别到 CC 请求时，`/v1` 流式自动改走 buffered 分发
+    /// （等价 `/cc/v1`，input_tokens 用上游准确值）。默认 true。CC 会校验 input_tokens，
+    /// 开启后 CC 直接打 `/v1` 也能正确工作，无需手动改用 `/cc/v1`。
+    #[serde(default = "default_cc_auto_buffer")]
+    pub cc_auto_buffer: bool,
+
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
@@ -426,6 +432,10 @@ fn default_extract_thinking() -> bool {
     true
 }
 
+fn default_cc_auto_buffer() -> bool {
+    true
+}
+
 fn default_all_cooling_fast_fail() -> bool {
     true
 }
@@ -537,6 +547,7 @@ impl Default for Config {
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
+            cc_auto_buffer: default_cc_auto_buffer(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             cooldown_enabled: default_cooldown_enabled(),
