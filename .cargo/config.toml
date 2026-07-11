@@ -1,0 +1,26 @@
+# Cargo 构建配置
+#
+# ⚠️ 本文件仅为 Windows 分发兼容性而加，是 Windows 支持的“纯附加层”一部分，
+#    不影响 Linux/macOS 构建（下面的 cfg 条件只对 windows+msvc 目标生效）。
+#
+# 为什么需要它：
+#   Rust 的 MSVC 目标（x86_64-pc-windows-msvc，也是 Windows 上 rustup 默认目标）
+#   默认【动态】链接 C 运行时，编出的 exe 依赖 VCRUNTIME140.dll。而该 DLL 属于
+#   “Microsoft Visual C++ Redistributable”，并非 Windows 自带——在没装过 VC++
+#   运行库的干净系统上，双击 exe 会直接报“找不到 VCRUNTIME140.dll”而打不开。
+#
+#   加上 +crt-static 后，C 运行时被【静态】链接进 exe，产物不再依赖任何第三方
+#   DLL，仅依赖 Windows 10+ 自带的系统 DLL（kernel32/ntdll/ws2_32/crypt32/bcrypt
+#   等），真正做到“任意 Win10+ x64 机器双击即跑，无需预装任何运行库”。
+#
+#   已实测验证：加此配置后 exe 的导入表中 VCRUNTIME140.dll 消失，功能（HTTP/TLS/
+#   SQLite/admin 登录）全部正常，体积仅增约 150KB。
+#
+# 副作用（可接受）：
+#   +crt-static 会同时静态链接 UCRT（Universal C Runtime），失去随 OS 更新的能力，
+#   体积略增。对“单文件分发、零依赖运行”的目标而言完全值得。
+#
+# 仅影响 Windows：Linux（musl/gnu）与 macOS 目标不匹配下面的 cfg，构建行为不变，
+# GitHub Actions 的 Linux release 产物不受任何影响。
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]
