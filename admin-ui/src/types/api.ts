@@ -24,6 +24,8 @@ export interface CredentialStatusItem {
   apiKeyHash?: string
   maskedApiKey?: string
   successCount: number
+  /** 生命周期累计 credit 花费（真实计费累加，独立于用量保留期，只增不清）。 */
+  totalCreditsUsed: number
   lastUsedAt: string | null
   hasProxy: boolean
   proxyUrl?: string

@@ -237,6 +237,9 @@ pub struct TrashEntry {
     /// 删除前累计的 API 调用成功次数（恢复时一并还原）
     #[serde(default)]
     pub success_count: u64,
+    /// 删除前的生命周期累计 credit 花费（恢复时一并还原；老回收站数据无此字段默认 0）
+    #[serde(default)]
+    pub total_credits_used: f64,
     /// 删除前最后一次 API 调用时间（恢复时一并还原）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used_at: Option<String>,
