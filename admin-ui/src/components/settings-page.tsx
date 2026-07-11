@@ -286,7 +286,7 @@ function toForm(c: ConfigSnapshotResponse): FormState {
     tokenRefreshIntervalSecs: String(c.tokenRefreshIntervalSecs),
     // 缺省视为开启（后端字段可能尚未下发时不误显示为关闭）
     loginBackgroundEnabled: c.loginBackgroundEnabled ?? true,
-    loginBackgroundR18: c.loginBackgroundR18 ?? true,
+    loginBackgroundR18: c.loginBackgroundR18 ?? false,
   }
 }
 
@@ -1356,7 +1356,7 @@ export function SettingsPage() {
     if (Number.isFinite(interval2) && interval2 !== config.tokenRefreshIntervalSecs) d.tokenRefreshIntervalSecs = interval2
     // Admin UI 登录页背景（缺省视为开启，与 toForm 基线一致）
     if (form.loginBackgroundEnabled !== (config.loginBackgroundEnabled ?? true)) d.loginBackgroundEnabled = form.loginBackgroundEnabled
-    if (form.loginBackgroundR18 !== (config.loginBackgroundR18 ?? true)) d.loginBackgroundR18 = form.loginBackgroundR18
+    if (form.loginBackgroundR18 !== (config.loginBackgroundR18 ?? false)) d.loginBackgroundR18 = form.loginBackgroundR18
     return d
   }, [config, form])
 
@@ -1663,13 +1663,15 @@ export function SettingsPage() {
             <div className="flex items-center gap-2">
               <Input
                 type="password"
-                className="max-w-[260px] font-mono text-xs"
+                className="flex-1 min-w-0 max-w-[260px] font-mono text-xs"
                 value={form.apiKey}
                 onChange={(e) => set('apiKey', e.target.value)}
                 placeholder={config.hasApiKey ? '已设置，留空不改' : '未设置，填写以设定'}
                 autoComplete="new-password"
               />
-              <Badge variant={config.hasApiKey ? 'default' : 'secondary'}>{config.hasApiKey ? '已设置' : '未设置'}</Badge>
+              <Badge variant={config.hasApiKey ? 'default' : 'secondary'} className="shrink-0 whitespace-nowrap">
+                {config.hasApiKey ? '已设置' : '未设置'}
+              </Badge>
             </div>
           </Field>
         </CardContent>
