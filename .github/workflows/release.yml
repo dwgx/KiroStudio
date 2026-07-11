@@ -11,7 +11,25 @@ permissions:
   contents: write
 
 jobs:
+  # 测试门禁：出厂二进制一律 --no-default-features（纯 rustls）。历史上 cargo test 只跑默认
+  # 特性(native-tls)，从未覆盖真正发布的 --no-default-features 构建 = 出厂配置存在测试盲区。
+  # 这里在任何产物构建前，先用**出厂特性**跑全量测试；两个 build 任务 needs 它，测试不过不发布。
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Rust 编译缓存
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: test-no-default
+      - name: 运行测试（出厂特性：纯 rustls）
+        run: cargo test --no-default-features --locked
+
   build-release:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - name: 检出代码
@@ -77,6 +95,7 @@ jobs:
   # 无 VCRUNTIME140.dll 依赖，见 .cargo/config.toml）。纯 rustls（--no-default-features），
   # 与 Linux 产物一致，避开 Windows 上 vendored OpenSSL 的工具链依赖。
   build-release-windows:
+    needs: test
     runs-on: windows-latest
     steps:
       - name: 检出代码

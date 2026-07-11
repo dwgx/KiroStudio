@@ -153,9 +153,17 @@ fn apply_tls_and_proxy(
             {
                 builder = builder.use_native_tls();
             }
+            // 防呆：出厂发布版一律 --no-default-features（纯 rustls，见 build.bat / release.yml），
+            // 不含 native-tls 后端。旧 config.json 里残留 tlsBackend="native-tls" 时，
+            // **静默回退 rustls** 而非报错——否则整条上游调用（刷 token / 转发）全挂，
+            // 网关直接废，得手改配置才能救回。rustls 内置 webpki + native-roots 双证书源，
+            // 功能上完全等价，回退无副作用。（前端已移除 native-tls 选项，此分支仅兜底旧配置。）
             #[cfg(not(feature = "native-tls"))]
             {
-                anyhow::bail!("此构建版本未包含 native-tls 后端，请在配置中改用 rustls");
+                tracing::warn!(
+                    "配置 tlsBackend=native-tls，但本构建未编译 native-tls 后端；已自动回退 rustls（功能等价）"
+                );
+                builder = builder.use_rustls_tls();
             }
         }
     }
