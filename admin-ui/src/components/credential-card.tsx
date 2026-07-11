@@ -20,7 +20,7 @@ import {
 } from '@/components/ui/dialog'
 import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
 import { cn, copyToClipboard } from '@/lib/utils'
-import { enableOverage, disableOverage, setCredentialName, setCredentialProxy, probeAvailableModels, type ProbedModel } from '@/api/credentials'
+import { enableOverage, disableOverage, setCredentialName, setCredentialProxy } from '@/api/credentials'
 import { authShortLabel, disabledReasonLabel, subscriptionLabel } from '@/lib/i18n-labels'
 import {
   useSetDisabled,
@@ -120,10 +120,6 @@ export function CredentialCard({
   // 别名/备注编辑：设置弹框内输入框的本地值 + 保存中状态
   const [nameValue, setNameValue] = useState(credential.name ?? '')
   const [savingName, setSavingName] = useState(false)
-  // opus 能力探测：档位 verdict + 明细 + 进行中状态（勾选令牌后手动触发）
-  const [probingModels, setProbingModels] = useState(false)
-  const [probedModels, setProbedModels] = useState<ProbedModel[] | null>(null)
-  const [opusVerdict, setOpusVerdict] = useState<'normal' | 'partial' | 'restricted' | 'unknown' | null>(null)
 
   // 单凭证代理编辑：URL(留空回退全局,"direct"不走代理) + 账密(留空不改)。立即生效无需重启。
   const [proxyValue, setProxyValue] = useState(credential.proxyUrl ?? '')
@@ -267,24 +263,6 @@ export function CredentialCard({
     })
   }
 
-  // 探测该号当前可用的模型（逐模型极小上游请求，仅手动触发）
-  const handleProbeModels = async () => {
-    setProbingModels(true)
-    try {
-      const res = await probeAvailableModels(credential.id)
-      setProbedModels(res.models)
-      setOpusVerdict(res.verdict)
-      // 按 opus 档位给结论提示（dwgx 口径：opus-4.8 + opus-4.6 都有=正常）
-      if (res.verdict === 'normal') toast.success('opus 探测：4.8 与 4.6 均可用，正常号')
-      else if (res.verdict === 'partial') toast.warning('opus 探测：仅一个 opus 版本可用（部分受限）')
-      else if (res.verdict === 'restricted') toast.warning('opus 探测：两个 opus 版本都不可用，该号 opus 受限')
-      else toast.warning('opus 探测：上游异常，暂时无法判定，可重试')
-    } catch (err) {
-      toast.error('模型探测失败: ' + (err as Error).message)
-    } finally {
-      setProbingModels(false)
-    }
-  }
 
   const handleDelete = () => {
     if (!credential.disabled) {
@@ -668,22 +646,6 @@ export function CredentialCard({
               <RefreshCw className={`h-4 w-4 mr-1 ${forceRefresh.isPending ? 'animate-spin' : ''}`} />
               刷新 Token
             </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={handleProbeModels}
-              disabled={probingModels || credential.authMethod === 'api_key' || !selected}
-              title={
-                credential.authMethod === 'api_key'
-                  ? 'API Key 凭据不区分模型订阅'
-                  : !selected
-                    ? '请先勾选该凭据的复选框再测（避免误触发上游请求）'
-                    : '探测该号 opus 能力档位（探 opus-4.8 + opus-4.6 两个，2 次轻量上游请求）'
-              }
-            >
-              <RefreshCw className={`h-4 w-4 mr-1 ${probingModels ? 'animate-spin' : ''}`} />
-              测 opus 能力
-            </Button>
             {/* 查看余额：改用青蓝信息色（与主色/禁用色区分开，语义=只读查询） */}
             <Button
               size="sm"
@@ -720,49 +682,6 @@ export function CredentialCard({
               )}
             </Button>
           </div>
-          {/* opus 能力探测结果：档位结论 + opus-4.8/4.6 明细 */}
-          {probedModels && opusVerdict && (
-            <div className="mt-3 rounded-md border border-white/10 bg-black/20 p-2.5">
-              {(() => {
-                const v = opusVerdict
-                const banner =
-                  v === 'normal'
-                    ? { cls: 'text-emerald-300', txt: '✓ 正常号：opus-4.8 与 opus-4.6 均可用' }
-                    : v === 'partial'
-                      ? { cls: 'text-amber-300', txt: '△ 部分受限：仅一个 opus 版本可用' }
-                      : v === 'restricted'
-                        ? { cls: 'text-red-300', txt: '✕ opus 受限：两个 opus 版本都不可用（这号就这样）' }
-                        : { cls: 'text-amber-300', txt: '? 上游异常，暂时无法判定（可重试）' }
-                return <div className={`mb-1.5 text-xs font-medium ${banner.cls}`}>{banner.txt}</div>
-              })()}
-              <div className="flex flex-wrap gap-1.5">
-                {probedModels.map((m) => {
-                  const cls =
-                    m.status === 'supported'
-                      ? 'bg-emerald-500/10 text-emerald-300 border border-emerald-500/30'
-                      : m.status === 'unsupported'
-                        ? 'bg-white/5 text-muted-foreground border border-white/10 line-through'
-                        : 'bg-amber-500/10 text-amber-300 border border-amber-500/30'
-                  const tip =
-                    m.status === 'supported'
-                      ? '该号可用此模型'
-                      : m.status === 'unsupported'
-                        ? '该号不支持此模型（订阅不含）'
-                        : '探测时上游异常，无法判定（可重试）'
-                  return (
-                    <span
-                      key={m.model}
-                      className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium ${cls}`}
-                      title={tip}
-                    >
-                      {m.model.replace('claude-', '')}
-                      {m.status === 'unknown' && ' ?'}
-                    </span>
-                  )
-                })}
-              </div>
-            </div>
-          )}
         </CardContent>
       </Card>
       {/* 设置对话框：集中别名/代理/超额/优先级/RPM/启用/删除。
