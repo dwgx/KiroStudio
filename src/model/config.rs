@@ -274,9 +274,10 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub login_background_enabled: bool,
 
-    /// 登录页背景图是否请求 R18 图源（默认 true）。开启走 r18=1，关闭走 r18=0（全年龄）。
+    /// 登录页背景图是否请求 R18 图源（**默认 false / 全年龄**）。开启走 r18=1，关闭走 r18=0。
     /// 此项立即生效（下一轮后台预取 / 池空实时兜底拉取时按此取 r18 参数）。
-    #[serde(default = "default_true")]
+    /// 默认关闭：截图/演示/给别人看面板更安全，需要再手动开。
+    #[serde(default)]
     pub login_background_r18: bool,
 
     // ============ 余额同步（A6：温和的周期性余额刷新）============
@@ -564,7 +565,7 @@ impl Default for Config {
             token_refresh_lead_minutes: default_refresh_lead_minutes(),
             token_refresh_interval_secs: default_refresh_interval_secs(),
             login_background_enabled: default_true(),
-            login_background_r18: default_true(),
+            login_background_r18: false,
             trash_retention_days: default_trash_retention_days(),
             balance_refresh_interval_secs: default_balance_refresh_interval_secs(),
             compression: CompressionConfig::default(),
@@ -646,18 +647,18 @@ mod tests {
     }
 
     #[test]
-    fn login_background_r18_defaults_on() {
-        // R18 开关默认开启（走 r18=1 图源）。
+    fn login_background_r18_defaults_off() {
+        // R18 开关**默认关闭**（走 r18=0 全年龄图源，截图/演示更安全，需要再手动开）。
         let cfg = Config::default();
-        assert!(cfg.login_background_r18);
+        assert!(!cfg.login_background_r18);
     }
 
     #[test]
-    fn login_background_r18_missing_field_defaults_on() {
-        // 旧配置文件缺 loginBackgroundR18 字段时，serde 默认回退为 true（向后兼容）。
+    fn login_background_r18_missing_field_defaults_off() {
+        // 旧配置文件缺 loginBackgroundR18 字段时，serde 默认回退为 false（全年龄）。
         let json = r#"{"host":"127.0.0.1","port":8080}"#;
         let cfg: Config = serde_json::from_str(json).expect("解析最小配置应成功");
-        assert!(cfg.login_background_r18);
+        assert!(!cfg.login_background_r18);
         assert!(cfg.login_background_enabled);
     }
 
