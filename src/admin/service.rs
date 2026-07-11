@@ -1423,14 +1423,31 @@ impl AdminService {
     }
 
     /// 探测指定凭据当前可用的模型列表（选中令牌后手动触发）。
-    /// 探测 opus 能力档位。返回 (verdict, 明细)；verdict ∈ normal/partial/restricted/unknown。
+    /// 探测该凭据可用哪些模型。返回 (每模型明细[(model,status,credits)], 本次总花费 credits)。
     /// 认证/账号级失败时返回 Err（前端提示先刷新/检查号）。
-    pub async fn probe_opus_capability(
+    /// models 为空时用默认候选清单（真实 Kiro modelId，从便宜到贵）。
+    pub async fn probe_models(
         &self,
         id: u64,
-    ) -> Result<(String, Vec<(String, String)>), AdminServiceError> {
+        models: Option<Vec<String>>,
+    ) -> Result<(Vec<(String, String, f64)>, f64), AdminServiceError> {
+        // 默认候选：覆盖 opus/sonnet 主力 + 一个最便宜的国产模型验证探测机制。
+        // 真实 Kiro modelId（见 kiro-model-catalog）；探测直发不过 map_model。
+        let list = models.filter(|v| !v.is_empty()).unwrap_or_else(|| {
+            [
+                "qwen3-coder-next",
+                "claude-haiku-4.5",
+                "claude-sonnet-4.5",
+                "claude-sonnet-4.6",
+                "claude-opus-4.6",
+                "claude-opus-4.8",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+        });
         self.token_manager
-            .probe_opus_capability(id)
+            .probe_models(id, &list)
             .await
             .map_err(|e| self.classify_balance_error(e, id))
     }

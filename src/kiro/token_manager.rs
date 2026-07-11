@@ -3050,63 +3050,53 @@ impl MultiTokenManager {
         Ok(())
     }
 
-    /// 探测指定凭据的 **opus 能力档位**（Admin API，选中令牌后手动触发）。
+    /// 探测指定凭据**可用哪些模型**（Admin API，勾选后从独立页面手动触发）。
     ///
-    /// dwgx 口径：只看 opus 系列——探 `opus-4.8` 与 `opus-4.6` 两个：
-    /// - 两个都可用 → `normal`（正常号）
-    /// - 只有一个可用 → `partial`（部分可用，提醒）
-    /// - 两个都不可用 → `restricted`（受限号，"这号就这样"）
+    /// 对一组候选模型逐个发无提示词的最小请求、消费响应流判定支持与否，并累加真实 credit 花费。
+    /// Kiro 无原生"列模型"接口，靠"发请求看是否 INVALID_MODEL_ID"判定；⚠️**每个 supported 的
+    /// 探测都是真实计费请求**（消真实积分）。仅 admin 手动触发、逐个间隔、绝不进请求热路径。
     ///
-    /// Kiro 无原生"列模型"接口，靠对模型发极小请求看是否返回 `INVALID_MODEL_ID` 判定。
-    /// ⚠️诚实边界：该判定依赖上游"无权限模型才返回 INVALID_MODEL_ID"的行为；若上游在校验模型
-    /// 前就先受理请求(返回 2xx)，探测会偏乐观。仅 admin 手动触发、每次 2 次轻量上游调用，不进热路径。
-    ///
-    /// 返回 (档位 verdict, 明细列表)；明细每项 = (model_id, status∈supported/unsupported/unknown)。
-    /// 仅认证/账号级问题(401/403/取不到token)整体返回 Err（前端提示先刷新/检查号）。
-    pub async fn probe_opus_capability(
+    /// 返回 `(每模型明细, 本次总花费 credits)`；明细每项 = (model_id, status, credits)，
+    /// status ∈ supported/unsupported/unknown。仅认证/账号级问题(401/403/无token)整体返回 Err。
+    pub async fn probe_models(
         &self,
         id: u64,
-    ) -> anyhow::Result<(String, Vec<(String, String)>)> {
-        // 只探 opus 判定档位的两个关键版本。
-        const OPUS_PROBES: &[&str] = &["claude-opus-4.8", "claude-opus-4.6"];
-        let mut detail = Vec::with_capacity(OPUS_PROBES.len());
-        let mut ok_count = 0usize;
-        let mut unknown = false;
-        for m in OPUS_PROBES {
+        models: &[String],
+    ) -> anyhow::Result<(Vec<(String, String, f64)>, f64)> {
+        let mut detail = Vec::with_capacity(models.len());
+        let mut total_credits = 0.0f64;
+        for m in models {
             // 认证级错误(401/403/无token) → ? 向上抛整轮中止；单模型 5xx/网络 → None=unknown。
-            let status = match self.probe_single_model(id, m).await? {
-                Some(true) => {
-                    ok_count += 1;
-                    "supported"
-                }
-                Some(false) => "unsupported",
-                None => {
-                    unknown = true;
-                    "unknown"
-                }
+            let (status, credits) = match self.probe_single_model(id, m).await? {
+                Some((true, c)) => ("supported", c),
+                Some((false, c)) => ("unsupported", c),
+                None => ("unknown", 0.0),
             };
-            detail.push((m.to_string(), status.to_string()));
+            total_credits += credits;
+            detail.push((m.clone(), status.to_string(), credits));
+            // 逐个之间留一点间隔，避免密集打同一号触发风控（与批量验活一致的谨慎）。
+            tokio::time::sleep(StdDuration::from_millis(600)).await;
         }
-        // 档位判定：优先按可用数；若含 unknown 且不足 2，标 partial/unknown 以免误判 restricted。
-        let verdict = if ok_count == OPUS_PROBES.len() {
-            "normal"
-        } else if ok_count == 1 {
-            "partial"
-        } else if unknown {
-            "unknown"
-        } else {
-            "restricted"
-        };
-        Ok((verdict.to_string(), detail))
+        Ok((detail, total_credits))
     }
 
     /// 对单个模型发一个极小探测请求，返回该号是否支持它。
     ///
     /// `Ok(true)` = 支持（200 或非 INVALID_MODEL_ID 的 400）；`Ok(false)` = INVALID_MODEL_ID；
     /// `Err` = 认证/账号级问题（401/403/网络），调用方应整体中止并提示。
-    /// 探测单个模型：`Ok(Some(true))`=支持, `Ok(Some(false))`=不支持(INVALID_MODEL_ID),
-    /// `Ok(None)`=未知(5xx/非2xx，无法判定), `Err`=认证/账号级问题(401/403，整轮应中止)。
-    async fn probe_single_model(&self, id: u64, model_id: &str) -> anyhow::Result<Option<bool>> {
+    /// 探测单个模型，返回 `(supported, credits_used)`：
+    /// - `Ok(Some((true, c)))`  = 支持，本次真实消耗 c credits（消费流解析 meteringEvent）；
+    /// - `Ok(Some((false, 0)))` = 不支持（INVALID_MODEL_ID，无论来自 400 还是流内 error）；
+    /// - `Ok(None)`             = 未知（5xx/网络/其它非 2xx，无法判定，不计费）；
+    /// - `Err`                  = 认证/账号级问题（401/403，整轮应中止）。
+    ///
+    /// ⚠️真实计费：supported 的探测会真正消费上游 event-stream（无提示词的最小请求），
+    /// 产生真实内容与真实 credit 消耗——这是"能报出本次花费"与"判定准确"的必要代价。
+    async fn probe_single_model(
+        &self,
+        id: u64,
+        model_id: &str,
+    ) -> anyhow::Result<Option<(bool, f64)>> {
         let (credentials, token) = self.ensure_valid_token(id).await?;
         let cfg = self.config.load();
         let region = credentials.effective_upstream_region(&cfg);
@@ -3167,15 +3157,70 @@ impl MultiTokenManager {
         }
         if status.as_u16() == 400 {
             let body_text = response.text().await.unwrap_or_default();
-            // INVALID_MODEL_ID = 不支持该模型；其它 400（请求体不完整）= 支持（认证过了）。
-            return Ok(Some(!crate::kiro::endpoint::default_is_invalid_model_id(&body_text)));
+            // INVALID_MODEL_ID = 不支持；其它 400 也归"不支持/不可用"（探测请求本身合法，
+            // 400 只可能是模型侧问题）——比旧逻辑"其它400=支持"更保守，杜绝假阳性。
+            let _ = body_text;
+            return Ok(Some((false, 0.0)));
         }
-        // 5xx / 其它非 2xx：上游侧问题，无法判定该模型支持与否 → 返回 None(unknown)，不误判 supported。
-        if status.is_server_error() || !status.is_success() {
+        // 5xx / 其它非 2xx：上游侧问题，无法判定 → None(unknown)，不计费。
+        if !status.is_success() {
             return Ok(None);
         }
-        // 2xx = 支持
-        Ok(Some(true))
+
+        // 2xx：真正消费 event-stream。流内可能仍出现 error/exception(INVALID_MODEL_ID 等)→ 不支持；
+        // 正常则累加 meteringEvent 的真实 credit。这修正了旧逻辑"只看 200 就判 supported"的假阳性。
+        use crate::kiro::model::events::Event;
+        use crate::kiro::parser::decoder::EventStreamDecoder;
+        use futures::StreamExt;
+        let mut decoder = EventStreamDecoder::new();
+        let mut stream = response.bytes_stream();
+        let mut credits = 0.0f64;
+        let mut invalid = false;
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(_) => break, // 传输中断：已收到的按现状判定
+            };
+            if decoder.feed(&chunk).is_err() {
+                break;
+            }
+            let mut stop = false;
+            for frame in decoder.decode_iter() {
+                let frame = match frame {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
+                if let Ok(ev) = Event::from_frame(frame) {
+                    match ev {
+                        Event::Metering(m) => credits += m.usage,
+                        Event::Error { error_code, error_message } => {
+                            if crate::kiro::endpoint::default_is_invalid_model_id(&error_code)
+                                || crate::kiro::endpoint::default_is_invalid_model_id(&error_message)
+                            {
+                                invalid = true;
+                            }
+                            stop = true;
+                        }
+                        Event::Exception { exception_type, message } => {
+                            if crate::kiro::endpoint::default_is_invalid_model_id(&exception_type)
+                                || crate::kiro::endpoint::default_is_invalid_model_id(&message)
+                            {
+                                invalid = true;
+                            }
+                            stop = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if stop {
+                break;
+            }
+        }
+        if invalid {
+            return Ok(Some((false, credits)));
+        }
+        Ok(Some((true, credits)))
     }
 
     /// 添加新凭据（Admin API）
