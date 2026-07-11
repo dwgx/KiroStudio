@@ -4,6 +4,7 @@ import {
   setCredentialDisabled,
   setCredentialPriority,
   setCredentialRpmLimit,
+  setCredentialAllowedModels,
   resetCredentialFailure,
   forceRefreshToken,
   getCredentialBalance,
@@ -98,6 +99,17 @@ export function useSetRpmLimit() {
   return useMutation({
     mutationFn: ({ id, rpmLimit }: { id: number; rpmLimit: number }) =>
       setCredentialRpmLimit(id, rpmLimit),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+export function useSetAllowedModels() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, allowedModels }: { id: number; allowedModels: string[] | null }) =>
+      setCredentialAllowedModels(id, allowedModels),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
