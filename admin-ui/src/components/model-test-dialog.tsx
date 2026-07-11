@@ -14,7 +14,7 @@ import { toast } from 'sonner'
 
 /** 模型勾选模板：一键切换常测组合。 */
 const MODEL_TEMPLATES: { label: string; models: string[] }[] = [
-  { label: '仅国产便宜', models: ['qwen3-coder-next', 'minimax-m2.1', 'deepseek-3.2', 'minimax-m2.5', 'glm-5'] },
+  { label: '仅国产', models: ['qwen3-coder-next', 'minimax-m2.1', 'deepseek-3.2', 'minimax-m2.5', 'glm-5'] },
   { label: '仅 Claude', models: ['claude-haiku-4.5', 'claude-sonnet-4.5', 'claude-sonnet-4.6', 'claude-opus-4.6', 'claude-opus-4.8'] },
   { label: '全部', models: PROBE_MODEL_CATALOG.map((m) => m.id) },
 ]
