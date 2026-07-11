@@ -2,6 +2,18 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.2] - 2026-07-11
+
+### 修复（非 us-east-1 的 IdC/Enterprise 号对话 400 Improperly formed）
+- **profileArn 动态解析固定打 us-east-1**：`resolve_profile_arn_via_management`（ListAvailableProfiles）
+  此前用凭据 region 拼 management host，但 **Kiro 的 profile 全局注册在 us-east-1**，不随账号
+  region 分布。服务器实测（eu-central-1 Enterprise 号）：打 `management.us-east-1.kiro.dev`
+  返回真实 profile，打 `management.eu-central-1.kiro.dev` 返回空 `[]`。空 profiles → profileArn
+  恒 None → 对话套 us-east-1 占位 ARN → region 与 profileArn 不符 → 400 Improperly formed。
+  修为：**该解析函数固定 us-east-1**（对话/余额端点仍按凭据 region，解析到的真实 ARN 第 4 段自带
+  正确 region，会被 `effective_upstream_region` 回正，自洽）。这是「以前 non-us-east-1 号偶发 400、
+  一直没根治」的真根因——us-east-1 号巧合一致所以没暴露，eu/ap 等 region 的号才炸。
+
 ## [0.7.1] - 2026-07-11
 
 ### 修复
