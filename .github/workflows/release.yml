@@ -19,6 +19,27 @@ jobs:
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
+
+      # 前端产物 admin-ui/dist 必须在 cargo 之前存在 —— rust-embed(#[derive(Embed)]) 是
+      # 编译期嵌入，dist 缺失时 Asset::get 无法生成，测试也编不过。故与 build 任务一致先构建前端。
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: admin-ui/pnpm-lock.yaml
+
+      - name: 构建前端 (admin-ui/dist)
+        working-directory: admin-ui
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
       - name: 安装 Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Rust 编译缓存
