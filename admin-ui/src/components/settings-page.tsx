@@ -132,7 +132,7 @@ const SECTIONS: { id: SectionId; label: string; icon: React.ComponentType<{ clas
 // 每张卡片的可搜索索引（标题 + 关键词）。既驱动搜索命中，也用于判断“无匹配”空态。
 // keywords 覆盖该卡片内所有设置项的文案，保证按关键词能跨区定位。
 const CARD_INDEX: { section: SectionId; title: string; keywords: string[] }[] = [
-  { section: 'basic', title: '服务信息', keywords: ['监听地址', 'host', '端口', 'port', '区域', 'region', 'tls 后端', 'rustls', 'native-tls', '默认 endpoint', '配置文件'] },
+  { section: 'basic', title: '服务信息', keywords: ['监听地址', 'host', '端口', 'port', '区域', 'region', 'tls 后端', 'rustls', '默认 endpoint', '配置文件'] },
   { section: 'basic', title: '客户端伪装', keywords: ['kiro 版本', '系统版本', 'node 版本', '提取 thinking', 'thinking'] },
   { section: 'basic', title: '网络与上号', keywords: ['全局代理', 'proxy', '上号回调地址', 'callback', '回调模式', 'admin key'] },
   { section: 'basic', title: '登录页背景', keywords: ['登录背景图', '登录页背景', '背景图', 'r18', '图源', 'lolicon', '关闭登录背景图'] },
@@ -1538,7 +1538,7 @@ export function SettingsPage() {
       </SectionGate>
 
       {/* 基础分区：服务信息（需重启） */}
-      <SectionGate section="basic" title="服务信息" keywords={['监听地址', 'host', '端口', 'port', '区域', 'region', 'tls 后端', 'rustls', 'native-tls', '默认 endpoint', '配置文件']}>
+      <SectionGate section="basic" title="服务信息" keywords={['监听地址', 'host', '端口', 'port', '区域', 'region', 'tls 后端', 'rustls', '默认 endpoint', '配置文件']}>
       <Card>
         <CardHeader className="pb-2">
           <CardTitle className="text-base"><Highlight text="服务信息" /></CardTitle>
@@ -1555,16 +1555,9 @@ export function SettingsPage() {
               <RegionSelect value={form.region} onChange={(v) => set('region', v)} />
             </div>
           </Field>
-          <Field label="TLS 后端" hint="需重启生效">
-            <div className="flex gap-2">
-              <Button variant={form.tlsBackend === 'rustls' ? 'default' : 'outline'} size="sm" onClick={() => set('tlsBackend', 'rustls')}>
-                rustls
-              </Button>
-              <Button variant={form.tlsBackend === 'native-tls' ? 'default' : 'outline'} size="sm" onClick={() => set('tlsBackend', 'native-tls')}>
-                native-tls
-              </Button>
-            </div>
-          </Field>
+          {/* TLS 后端固定为 rustls：出厂构建纯 rustls（见 build.bat / release.yml），
+              native-tls 已废弃（曾误导用户切换后废网关）。仅作只读展示，不再可切换。 */}
+          <ReadonlyRow label="TLS 后端" value="rustls（内置 webpki + 系统根证书）" />
           <Field label="默认 endpoint" hint={`可用：${config.endpointNames.join(', ') || '—'}（需重启生效）`}>
             <Input className={inputCls} value={form.defaultEndpoint} onChange={(e) => set('defaultEndpoint', e.target.value)} />
           </Field>
