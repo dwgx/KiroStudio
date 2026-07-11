@@ -218,23 +218,15 @@ impl KiroProvider {
         model: Option<&str>,
         user_id: Option<&str>,
     ) -> Option<axum::response::Response> {
-        // 仅当池中确实存在自定义 API 凭据时才尝试(否则直接放行 Kiro 路径,零开销)。
-        if !self.token_manager.has_custom_api_credential() {
-            return None;
-        }
-        let ctx = self
-            .token_manager
-            .acquire_context(model, user_id)
-            .await
-            .ok()?;
-        if !ctx.credentials.is_custom_api_credential() {
-            // 选到 Kiro 号:释放选号(inflight 守卫随 ctx drop -1),回退 Kiro 路径。
-            return None;
-        }
-        // 命中自定义号:计一次请求(达上限自动禁用),然后透传。inflight 守卫在透传返回后 drop。
-        self.token_manager.record_request(ctx.id);
+        // 从**custom_api 专属选号**里挑一个(独立于 Kiro 选号;Kiro 的 is_entry_selectable 已排除
+        // custom_api,不会误选)。无可用 custom_api 号 → None,回退 Kiro 路径。
+        // 注:model/user_id 暂不参与 custom_api 选号(代挂上游自行处理模型),保留参数供将来按模型分流。
+        let _ = (model, user_id);
+        let (id, cred) = self.token_manager.select_custom_api()?;
+        // 计一次请求(达上限自动禁用),然后透传。
+        self.token_manager.record_request(id);
         let resp = crate::kiro::passthrough::forward(
-            &ctx.credentials,
+            &cred,
             raw_body,
             self.global_proxy.as_ref(),
             self.tls_backend,
