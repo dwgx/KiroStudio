@@ -2,6 +2,27 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.6.5] - 2026-07-11
+
+### 新增（Windows 本机部署，纯增量层，不改任何 `src/` 运行逻辑）
+- **引导式启动器 `deploy/windows/start.bat`（双击即跑）**：检测配置 → 缺失/损坏则自动生成带强
+  随机密钥的 `config.json`（无 BOM，避免后端 `serde_json` 报 `expected value at line 1 column 1`）
+  → 大字打印 adminApiKey/apiKey/面板地址 → 拉起网关。首次零手工配置。
+- **监督循环（等价 systemd `Restart=always`）**：`start.bat` / `run.bat` 内置守护循环，网关干净
+  自退（exit 0）后自动重拉——**让 admin 面板「一键重启」/ OTA 后重启在 Windows 真正生效**（Windows
+  前台无守护进程，此前点重启只会停服不自起）。按退出码区分：0=面板重启→重拉；非零=崩溃→退避重试，
+  连续 5 次放弃并报错（不无限刷屏）；Ctrl-C / 关窗口=停服。已在 Windows 实机测试通过。
+- **更新脚本 `deploy/windows/update.bat`**：`git pull` + 重建前端/exe，等价面板 OTA（面板 OTA 在
+  Windows 不适用：它下载 Linux musl 二进制 + 依赖 rename 运行中 exe）。带防呆：已跟踪文件脏改动
+  拒绝更新（不吞用户改动，untracked 文件不误伤）、检测到 exe 运行中拒绝重编（Windows 锁定运行中 .exe）。
+- **零运行库依赖 `.cargo/config.toml`（`+crt-static`）**：仅对 `windows-msvc` 目标生效，静态链接 C
+  运行时，消除对 `VCRUNTIME140.dll`（VC++ Redistributable）的依赖——任意 Win10+ x64 机器双击即跑，
+  无需预装任何运行库。**不影响 Linux/macOS 构建**（cfg 条件不匹配，GitHub Actions Linux 产物不变）。
+- **发布产物新增 Windows exe**：`release.yml` 增加 `kirostudio-windows-x86_64.exe`（纯 rustls，
+  `--no-default-features`，前端已内嵌）+ sha256，Release 页可直接下载运行。
+- **部署文档 `docs/DEPLOY-WINDOWS.md`**：兼容性矩阵、从零跑起、日常运维（停止/重启/更新）、
+  与 Linux 版差异表、常见问题。
+
 ## [0.6.4] - 2026-07-11
 
 ### 修复（模型探测超时）

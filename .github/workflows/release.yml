@@ -72,3 +72,65 @@ jobs:
           files: |
             kirostudio-linux-x86_64
             kirostudio-linux-x86_64.sha256
+
+  # Windows 原生 exe：任意 Win10+ x64 双击即跑（crt-static 静态链接 C 运行时，
+  # 无 VCRUNTIME140.dll 依赖，见 .cargo/config.toml）。纯 rustls（--no-default-features），
+  # 与 Linux 产物一致，避开 Windows 上 vendored OpenSSL 的工具链依赖。
+  build-release-windows:
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # 前端必须在 cargo build 之前产出 admin-ui/dist —— rust-embed 是编译期嵌入
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: admin-ui/pnpm-lock.yaml
+
+      - name: 构建前端 (admin-ui/dist)
+        working-directory: admin-ui
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: 安装 Rust (msvc 目标)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust 编译缓存
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msvc-release
+
+      # 纯 rustls：--no-default-features 去掉 native-tls(vendored openssl，Windows 需 Perl/NASM)。
+      # 代码默认配置 tlsBackend=rustls，reqwest 内置 rustls-tls-webpki-roots，自洽。
+      # crt-static 由仓库根 .cargo/config.toml 对 windows-msvc 目标自动施加。
+      - name: 构建 release 二进制
+        run: cargo build --release --no-default-features --target x86_64-pc-windows-msvc
+
+      - name: 打包产物 + 生成校验和
+        shell: pwsh
+        run: |
+          $bin = "target/x86_64-pc-windows-msvc/release/kirostudio.exe"
+          Copy-Item $bin kirostudio-windows-x86_64.exe
+          $hash = (Get-FileHash kirostudio-windows-x86_64.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  kirostudio-windows-x86_64.exe" | Out-File -Encoding ascii kirostudio-windows-x86_64.exe.sha256
+          Write-Host "--- 产物 ---"
+          Get-ChildItem kirostudio-windows-x86_64.exe, kirostudio-windows-x86_64.exe.sha256
+          Get-Content kirostudio-windows-x86_64.exe.sha256
+
+      - name: 上传到 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            kirostudio-windows-x86_64.exe
+            kirostudio-windows-x86_64.exe.sha256
