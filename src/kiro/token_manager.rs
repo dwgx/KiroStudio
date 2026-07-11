@@ -667,9 +667,6 @@ enum DisabledReason {
     InvalidRefreshToken,
     /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
     InvalidConfig,
-    /// 订阅失效/降级：上游反复返回 INVALID_MODEL_ID，该号已不能服务请求的模型
-    /// （多为订阅被取消/降级）。达阈值后自动禁用，可人工/自愈重新启用。
-    SubscriptionInvalid,
 }
 
 /// 统计数据持久化条目
@@ -829,6 +826,13 @@ pub struct MultiTokenManager {
     affinity_enabled: AtomicBool,
     /// RPM 滚动窗口追踪器（balanced 选号时对接近 RPM 上限的号降权）
     rpm: RpmTracker,
+    /// 模型级"该号不支持此模型"短期黑名单：key=(credential_id, kiro_model_id)，value=记录时刻。
+    ///
+    /// 上游对某号返回 `INVALID_MODEL_ID` 时，只记"这个号 + 这个模型"不可用（短 TTL），
+    /// 选号时**仅对该模型**跳过它，该号对其它模型照常参与调度。这修正了 v0.6.0 的致命
+    /// 设计缺陷：此前把 INVALID_MODEL_ID 当"整个号坏了"冷却/自动禁用，导致一个客户端请求
+    /// 一个订阅不含的模型就能把能正常服务其它模型的号（乃至整池）全部打下线。
+    model_blocklist: Mutex<HashMap<(u64, String), Instant>>,
     /// 号池/族级健康评分 + 熔断半开渐进放回（balanced 选号 p_avail 权重 + 429 后逐步试探放回）。
     health: HealthTracker,
     /// 每凭据 RPM 软上限（0 = 不限制）（原子镜像,reload 热更）
@@ -854,6 +858,10 @@ const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 const MAX_TRANSIENT_WAIT_SECS: u64 = 20;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
+
+/// 模型级不支持黑名单的 TTL：某号对某模型返回 INVALID_MODEL_ID 后，这段时间内选号跳过
+/// "该号+该模型"组合。取中长窗（订阅权益变化是较慢的事），到期后自动允许重试探。
+const MODEL_BLOCK_TTL: StdDuration = StdDuration::from_secs(1800);
 
 /// 原子写入文件：先写同目录临时文件 + 尽力 fsync，再 rename 覆盖目标
 ///
@@ -1150,6 +1158,7 @@ impl MultiTokenManager {
             rate_limiter: RateLimiter::new(rate_limit_config),
             rate_limit_enabled: AtomicBool::new(rate_limit_enabled),
             affinity: UserAffinityManager::new(),
+            model_blocklist: Mutex::new(HashMap::new()),
             affinity_enabled: AtomicBool::new(affinity_enabled),
             rpm: RpmTracker::new(),
             health: HealthTracker::new(),
@@ -1310,6 +1319,8 @@ impl MultiTokenManager {
         let is_opus = model
             .map(|m| m.to_lowercase().contains("opus"))
             .unwrap_or(false);
+        // 模型级黑名单键用的 kiro modelId（与 provider extract 的 modelId 同源）
+        let model_key = model.unwrap_or("");
 
         // 过滤可用凭据：可选性判定统一收敛到 is_entry_selectable
         // （disabled / opus 订阅 / 冷却 / 限流）。历史上此处曾在其后再挂一个
@@ -1317,7 +1328,7 @@ impl MultiTokenManager {
         // 翻倍；已合并为单次 filter。
         let available: Vec<&CredentialEntry> = entries
             .iter()
-            .filter(|e| self.is_entry_selectable(e, is_opus))
+            .filter(|e| self.is_entry_selectable(e, is_opus, model_key))
             .collect();
 
         if available.is_empty() {
@@ -1437,11 +1448,16 @@ impl MultiTokenManager {
     ///
     /// 必须在 `select_next_credential` 的 `entries.lock()` 临界区内调用，
     /// 以保证 `inflight += 1` 相对其它并发选号是原子可见的。
-    fn is_entry_selectable(&self, entry: &CredentialEntry, is_opus: bool) -> bool {
+    fn is_entry_selectable(&self, entry: &CredentialEntry, is_opus: bool, model: &str) -> bool {
         if entry.disabled {
             return false;
         }
         if is_opus && !entry.credentials.supports_opus() {
+            return false;
+        }
+        // 模型级黑名单：该号曾对此模型返回 INVALID_MODEL_ID（订阅不含）→ 仅对此模型跳过它，
+        // 该号对其它模型不受影响。TTL 到期后自动放行重试探。
+        if self.is_model_blocked(entry.id, model) {
             return false;
         }
         if self.cooldown_enabled.load(Ordering::Relaxed) && !self.cooldown.is_available(entry.id) {
@@ -1607,7 +1623,7 @@ impl MultiTokenManager {
                     let current_id = *self.current_id.lock();
                     entries
                         .iter()
-                        .find(|e| e.id == current_id && self.is_entry_selectable(e, is_opus))
+                        .find(|e| e.id == current_id && self.is_entry_selectable(e, is_opus, model.unwrap_or("")))
                         .map(|e| self.commit_selection(e))
                 };
 
@@ -2313,47 +2329,52 @@ impl MultiTokenManager {
         }
     }
 
-    /// 报告凭据返回 `INVALID_MODEL_ID`（该号已不能服务请求的模型，多为订阅取消/降级）。
+    /// 报告"凭据 #id 对模型 model 返回 `INVALID_MODEL_ID`"（该号的订阅不含此模型）。
     ///
-    /// 处置：给该号一段冷却（用 ModelUnavailable 的 300s 中长窗——它是"这个号服务不了"
-    /// 而非全局模型故障），让 balanced 选号本轮避开它、failover 到订阅仍有效的号。
-    /// 短时间内反复命中达阈值 → 判定订阅已失效，自动禁用（SubscriptionInvalid，可人工/自愈恢复），
-    /// 避免坏号一直留在轮转里被反复命中。
+    /// ⭐**模型级**处置（修正 v0.6.0 致命缺陷）：只把"该号+该模型"记进短期黑名单，
+    /// 选号时**仅对这个模型**跳过它——该号对其它模型（如它仍支持的 sonnet/haiku）照常参与
+    /// 调度。**绝不**冷却/禁用整个号（那会让一个客户端请求一个订阅不含的模型就打垮全池）。
     ///
-    /// 返回是否仍有其它可用凭据（供 provider 决定 failover 还是把错误透传给客户端）。
-    pub fn report_model_invalid(&self, id: u64) -> bool {
-        if self.cooldown_enabled.load(Ordering::Relaxed) {
-            let dur = self
-                .cooldown
-                .set_cooldown(id, CooldownReason::ModelUnavailable);
-            tracing::warn!(
-                "凭据 #{} 返回 INVALID_MODEL_ID（订阅疑似失效/降级），冷却 {:?} 并 failover 到其它号",
-                id,
-                dur
-            );
-
-            // 反复命中达阈值 → 订阅已失效，自动禁用移出轮转（与 auto_disable_suspicious 同开关口径）。
-            const AUTO_DISABLE_TRIGGER: u32 = 3;
-            if self.auto_disable_suspicious.load(Ordering::Relaxed)
-                && self.cooldown.trigger_count(id) >= AUTO_DISABLE_TRIGGER
-            {
-                let mut entries = self.entries.lock();
-                if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                    if !entry.disabled {
-                        entry.disabled = true;
-                        entry.disabled_reason = Some(DisabledReason::SubscriptionInvalid);
-                        tracing::warn!(
-                            "凭据 #{} 连续 {} 次 INVALID_MODEL_ID，判定订阅失效，自动禁用（SubscriptionInvalid）",
-                            id,
-                            AUTO_DISABLE_TRIGGER
-                        );
-                        drop(entries);
-                        let _ = self.persist_credentials();
-                    }
-                }
-            }
+    /// 返回：本模型是否还有其它候选号可试（供 provider 决定 failover 还是把真 400 透传给客户端）。
+    /// 当所有未禁用的号都已对该模型进黑名单时返回 false → provider 透传真实 INVALID_MODEL_ID。
+    pub fn report_model_invalid(&self, id: u64, model: Option<&str>) -> bool {
+        let model = model.unwrap_or("").to_string();
+        {
+            let mut bl = self.model_blocklist.lock();
+            bl.insert((id, model.clone()), Instant::now());
         }
-        self.available_count() > 0
+        tracing::warn!(
+            "凭据 #{} 对模型 {:?} 返回 INVALID_MODEL_ID（该号订阅不含此模型），仅对此模型跳过该号并 failover；该号对其它模型仍可用",
+            id, model
+        );
+        self.count_selectable_for_model(&model) > 0
+    }
+
+    /// 判断"凭据 #id + 模型 model"当前是否在模型级黑名单内（未过 TTL）。惰性清理过期项。
+    fn is_model_blocked(&self, id: u64, model: &str) -> bool {
+        if model.is_empty() {
+            return false;
+        }
+        let mut bl = self.model_blocklist.lock();
+        match bl.get(&(id, model.to_string())) {
+            Some(&t) if t.elapsed() < MODEL_BLOCK_TTL => true,
+            Some(_) => {
+                bl.remove(&(id, model.to_string()));
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// 统计对指定模型仍可选的凭据数（未禁用 && 未对该模型进黑名单）。
+    /// model 为空串时退化为 available_count（无模型维度）。
+    fn count_selectable_for_model(&self, model: &str) -> usize {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .filter(|e| !e.disabled)
+            .filter(|e| model.is_empty() || !self.is_model_blocked(e.id, model))
+            .count()
     }
 
     /// 报告指定凭据额度已用尽
@@ -2668,7 +2689,6 @@ impl MultiTokenManager {
                         DisabledReason::SuspiciousActivityAuto => "SuspiciousActivityAuto",
                         DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
                         DisabledReason::InvalidConfig => "InvalidConfig",
-                        DisabledReason::SubscriptionInvalid => "SubscriptionInvalid",
                     }.to_string()),
                     endpoint: e.credentials.endpoint.clone(),
                     inflight: e.inflight.load(Ordering::Acquire),
@@ -3021,52 +3041,72 @@ impl MultiTokenManager {
             bail!("Token 无效 (401): {}", body_text);
         }
 
-        // 400：区分两种语义——
-        // - INVALID_MODEL_ID：该号订阅失效/降级，已不能服务模型（活着但订阅没了，需报出真相）；
-        // - 其它 400：请求体不完整（预期的，只为触发 suspend 检查），说明凭据/认证本身有效。
-        // 200/其他 = 凭据有效。
-        if status.as_u16() == 400 {
-            let body_text = response.text().await.unwrap_or_default();
-            if crate::kiro::endpoint::default_is_invalid_model_id(&body_text) {
-                bail!("订阅已失效/降级（INVALID_MODEL_ID）：该号已不能服务模型: {}", body_text);
-            }
-        }
+        // 400 = 请求体不完整（预期的，探测体故意不含 modelId，只为触发认证/suspend 检查），
+        // 说明凭据/认证本身有效。200/其它 = 凭据有效。
+        //
+        // 注：本函数只做**认证/封禁**层面的验活，不判"订阅是否含某模型"——后者由
+        // `probe_available_models` 逐模型带 modelId 探测（因为此处探测体无 modelId，上游
+        // 不会返回 INVALID_MODEL_ID，在这里判它属死代码）。分工清晰、不做假承诺。
         Ok(())
     }
 
-    /// 探测指定凭据**当前可用的模型列表**（Admin API，选中令牌后手动触发）。
+    /// 探测指定凭据的 **opus 能力档位**（Admin API，选中令牌后手动触发）。
     ///
-    /// Kiro 没有原生"列出模型"接口，故对一组候选模型逐个发一个极小探测请求，按上游反应判定：
-    /// - `INVALID_MODEL_ID` → 该号不支持此模型（订阅等级不够/已降级）；
-    /// - 200 或其它 400（请求体不完整等）→ 认证与模型都 OK，视为支持；
-    /// - 401/403 → 认证/账号问题，整体探测失败（返回 Err，前端提示先刷新/检查号）。
+    /// dwgx 口径：只看 opus 系列——探 `opus-4.8` 与 `opus-4.6` 两个：
+    /// - 两个都可用 → `normal`（正常号）
+    /// - 只有一个可用 → `partial`（部分可用，提醒）
+    /// - 两个都不可用 → `restricted`（受限号，"这号就这样"）
     ///
-    /// 只在 admin 手动点击时跑（~7 次轻量上游调用），绝不进请求热路径、不自动周期跑。
-    /// 返回 (model_id, supported) 列表，顺序与候选列表一致。
-    pub async fn probe_available_models(&self, id: u64) -> anyhow::Result<Vec<(String, bool)>> {
-        // 候选模型：每个家族取有意义的版本（与 converter::map_model 的目标口径一致）。
-        const CANDIDATES: &[&str] = &[
-            "claude-sonnet-4.5",
-            "claude-sonnet-4.6",
-            "claude-opus-4.5",
-            "claude-opus-4.6",
-            "claude-opus-4.7",
-            "claude-opus-4.8",
-            "claude-haiku-4.5",
-        ];
-        let mut out = Vec::with_capacity(CANDIDATES.len());
-        for m in CANDIDATES {
-            let supported = self.probe_single_model(id, m).await?;
-            out.push((m.to_string(), supported));
+    /// Kiro 无原生"列模型"接口，靠对模型发极小请求看是否返回 `INVALID_MODEL_ID` 判定。
+    /// ⚠️诚实边界：该判定依赖上游"无权限模型才返回 INVALID_MODEL_ID"的行为；若上游在校验模型
+    /// 前就先受理请求(返回 2xx)，探测会偏乐观。仅 admin 手动触发、每次 2 次轻量上游调用，不进热路径。
+    ///
+    /// 返回 (档位 verdict, 明细列表)；明细每项 = (model_id, status∈supported/unsupported/unknown)。
+    /// 仅认证/账号级问题(401/403/取不到token)整体返回 Err（前端提示先刷新/检查号）。
+    pub async fn probe_opus_capability(
+        &self,
+        id: u64,
+    ) -> anyhow::Result<(String, Vec<(String, String)>)> {
+        // 只探 opus 判定档位的两个关键版本。
+        const OPUS_PROBES: &[&str] = &["claude-opus-4.8", "claude-opus-4.6"];
+        let mut detail = Vec::with_capacity(OPUS_PROBES.len());
+        let mut ok_count = 0usize;
+        let mut unknown = false;
+        for m in OPUS_PROBES {
+            // 认证级错误(401/403/无token) → ? 向上抛整轮中止；单模型 5xx/网络 → None=unknown。
+            let status = match self.probe_single_model(id, m).await? {
+                Some(true) => {
+                    ok_count += 1;
+                    "supported"
+                }
+                Some(false) => "unsupported",
+                None => {
+                    unknown = true;
+                    "unknown"
+                }
+            };
+            detail.push((m.to_string(), status.to_string()));
         }
-        Ok(out)
+        // 档位判定：优先按可用数；若含 unknown 且不足 2，标 partial/unknown 以免误判 restricted。
+        let verdict = if ok_count == OPUS_PROBES.len() {
+            "normal"
+        } else if ok_count == 1 {
+            "partial"
+        } else if unknown {
+            "unknown"
+        } else {
+            "restricted"
+        };
+        Ok((verdict.to_string(), detail))
     }
 
     /// 对单个模型发一个极小探测请求，返回该号是否支持它。
     ///
     /// `Ok(true)` = 支持（200 或非 INVALID_MODEL_ID 的 400）；`Ok(false)` = INVALID_MODEL_ID；
     /// `Err` = 认证/账号级问题（401/403/网络），调用方应整体中止并提示。
-    async fn probe_single_model(&self, id: u64, model_id: &str) -> anyhow::Result<bool> {
+    /// 探测单个模型：`Ok(Some(true))`=支持, `Ok(Some(false))`=不支持(INVALID_MODEL_ID),
+    /// `Ok(None)`=未知(5xx/非2xx，无法判定), `Err`=认证/账号级问题(401/403，整轮应中止)。
+    async fn probe_single_model(&self, id: u64, model_id: &str) -> anyhow::Result<Option<bool>> {
         let (credentials, token) = self.ensure_valid_token(id).await?;
         let cfg = self.config.load();
         let region = credentials.effective_upstream_region(&cfg);
@@ -3111,19 +3151,31 @@ impl MultiTokenManager {
             request = request.header("tokentype", "EXTERNAL_IDP");
         }
 
-        let response = request.body(body.to_string()).send().await?;
+        // 单个模型探测的网络错误不应中止整轮：吞掉转成 None(unknown) 继续探下一个。
+        let response = match request.body(body.to_string()).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!("探测模型 {} 网络错误(记为 unknown): {}", model_id, e);
+                return Ok(None);
+            }
+        };
         let status = response.status();
         if matches!(status.as_u16(), 401 | 403) {
+            // 认证/账号级问题：整轮探测都会失败，向上抛错让 probe_available_models 整体中止并提示。
             let body_text = response.text().await.unwrap_or_default();
             bail!("认证/账号问题（{}）：{}", status.as_u16(), body_text);
         }
         if status.as_u16() == 400 {
             let body_text = response.text().await.unwrap_or_default();
             // INVALID_MODEL_ID = 不支持该模型；其它 400（请求体不完整）= 支持（认证过了）。
-            return Ok(!crate::kiro::endpoint::default_is_invalid_model_id(&body_text));
+            return Ok(Some(!crate::kiro::endpoint::default_is_invalid_model_id(&body_text)));
         }
-        // 200 / 其它 = 支持
-        Ok(true)
+        // 5xx / 其它非 2xx：上游侧问题，无法判定该模型支持与否 → 返回 None(unknown)，不误判 supported。
+        if status.is_server_error() || !status.is_success() {
+            return Ok(None);
+        }
+        // 2xx = 支持
+        Ok(Some(true))
     }
 
     /// 添加新凭据（Admin API）

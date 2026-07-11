@@ -216,6 +216,7 @@ interface FormState {
   proxyUrl: string
   proxyUsername: string
   proxyPassword: string
+  apiKey: string
   callbackBaseUrl: string
   // 反代安全（批次3）：列表用换行分隔的多行文本承载
   corsAllowedOrigins: string
@@ -272,6 +273,8 @@ function toForm(c: ConfigSnapshotResponse): FormState {
     // 代理账密出于安全后端不下发,UI 留空占位:留空=不改,填了=更新。
     proxyUsername: '',
     proxyPassword: '',
+    // userKey(对话 api_key)后端不下发明文,留空=不改,填了=更新(需重启生效)。
+    apiKey: '',
     callbackBaseUrl: c.callbackBaseUrl ?? '',
     corsAllowedOrigins: listToLines(c.corsAllowedOrigins ?? []),
     ipAllowlist: listToLines(c.ipAllowlist ?? []),
@@ -1333,6 +1336,7 @@ export function SettingsPage() {
     // 代理账密:后端不下发(安全),故只在用户填了内容时才发送(留空=保持不变)。
     if (form.proxyUsername.trim() !== '') d.proxyUsername = form.proxyUsername.trim()
     if (form.proxyPassword !== '') d.proxyPassword = form.proxyPassword
+    if (form.apiKey.trim() !== '') d.apiKey = form.apiKey.trim()
     if (form.callbackBaseUrl.trim() !== (config.callbackBaseUrl ?? '')) d.callbackBaseUrl = form.callbackBaseUrl.trim()
     // 反代安全
     const origins = linesToList(form.corsAllowedOrigins)
@@ -1652,6 +1656,22 @@ export function SettingsPage() {
             }
           />
           <ReadonlyRow label="Admin Key" value={<Badge variant={config.hasAdminKey ? 'default' : 'secondary'}>{config.hasAdminKey ? '已设置' : '未设置'}</Badge>} />
+          <Field
+            label="userKey（对话 API Key）"
+            hint="下游客户端连网关用的 x-api-key。出于安全不回显现值：留空=不改，填写=更新。⚠️需重启服务生效。"
+          >
+            <div className="flex items-center gap-2">
+              <Input
+                type="password"
+                className="max-w-[260px] font-mono text-xs"
+                value={form.apiKey}
+                onChange={(e) => set('apiKey', e.target.value)}
+                placeholder={config.hasApiKey ? '已设置，留空不改' : '未设置，填写以设定'}
+                autoComplete="new-password"
+              />
+              <Badge variant={config.hasApiKey ? 'default' : 'secondary'}>{config.hasApiKey ? '已设置' : '未设置'}</Badge>
+            </div>
+          </Field>
         </CardContent>
       </Card>
       </SectionGate>

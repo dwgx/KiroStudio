@@ -937,6 +937,11 @@ impl AdminService {
                 .as_ref()
                 .map(|k| !k.trim().is_empty())
                 .unwrap_or(false),
+            has_api_key: config
+                .api_key
+                .as_ref()
+                .map(|k| !k.trim().is_empty())
+                .unwrap_or(false),
             callback_mode,
             callback_base_url: config.callback_base_url.clone(),
             cors_allowed_origins: config.cors_allowed_origins.clone(),
@@ -1188,6 +1193,18 @@ impl AdminService {
                 restart_fields.push("callbackBaseUrl".into());
             }
         }
+        // userKey（下游对话 api_key）：仅在非空白时更新（防 fail-open：空 key 会让 /v1 匿名可达）。
+        // 前端不回显现值，传空串=不改。需重启生效（auth 中间件启动时固化 key）。
+        if let Some(v) = req.api_key {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                let new_val = Some(trimmed.to_string());
+                if new_val != config.api_key {
+                    config.api_key = new_val;
+                    restart_fields.push("apiKey".into());
+                }
+            }
+        }
 
         // —— 反代安全（批次3，均需重启生效）——
         if let Some(v) = req.cors_allowed_origins {
@@ -1406,13 +1423,14 @@ impl AdminService {
     }
 
     /// 探测指定凭据当前可用的模型列表（选中令牌后手动触发）。
-    /// 返回 (model_id, supported) 列表。认证/账号级失败时返回 Err（前端提示先刷新/检查号）。
-    pub async fn probe_available_models(
+    /// 探测 opus 能力档位。返回 (verdict, 明细)；verdict ∈ normal/partial/restricted/unknown。
+    /// 认证/账号级失败时返回 Err（前端提示先刷新/检查号）。
+    pub async fn probe_opus_capability(
         &self,
         id: u64,
-    ) -> Result<Vec<(String, bool)>, AdminServiceError> {
+    ) -> Result<(String, Vec<(String, String)>), AdminServiceError> {
         self.token_manager
-            .probe_available_models(id)
+            .probe_opus_capability(id)
             .await
             .map_err(|e| self.classify_balance_error(e, id))
     }
