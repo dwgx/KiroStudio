@@ -295,6 +295,12 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         toast.error('请输入 Kiro API Key')
         return
       }
+    } else if (authMethod === 'custom_api') {
+      // 自定义 API 代挂:只需 base URL(下方校验),不需要 Refresh Token。
+      if (!baseUrl.trim()) {
+        toast.error('自定义 API 需填写上游地址 base URL')
+        return
+      }
     } else {
       if (!refreshToken.trim()) {
         toast.error('请输入 Refresh Token')
@@ -302,10 +308,6 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       }
       if (authMethod === 'idc' && (!clientId.trim() || !clientSecret.trim())) {
         toast.error('IdC/Builder-ID/IAM 认证需要填写 Client ID 和 Client Secret')
-        return
-      }
-      if (authMethod === 'custom_api' && !baseUrl.trim()) {
-        toast.error('自定义 API 需填写上游地址 base URL')
         return
       }
       if (authMethod === 'external_idp' && (!clientId.trim() || !tokenEndpoint.trim())) {
