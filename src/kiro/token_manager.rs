@@ -629,6 +629,9 @@ struct CredentialEntry {
     disabled_reason: Option<DisabledReason>,
     /// API 调用成功次数
     success_count: u64,
+    /// 累计请求数（用于 `request_limit` 上限自动禁用；主要自定义 API 代挂计数）。
+    /// 内存态即可,不必持久化(重启清零可接受,上限是防跑量的软护栏)。
+    request_count: u64,
     /// 该凭据**生命周期累计**上游 credit 消耗（花费）。
     ///
     /// 由每次请求完成后上游 meteringEvent 的真实计费量累加而来（无 meteringEvent 的
@@ -667,6 +670,9 @@ enum DisabledReason {
     InvalidRefreshToken,
     /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
     InvalidConfig,
+    /// 累计请求数达到 `request_limit` 上限后自动禁用（主要用于自定义 API 代挂计费防护）。
+    /// 属"自动禁用",重置计数(reset)或人工可重新启用。
+    RequestLimitReached,
 }
 
 /// 统计数据持久化条目
@@ -1059,6 +1065,7 @@ impl MultiTokenManager {
                         None
                     },
                     success_count: 0,
+                    request_count: 0,
                     total_credits_used: 0.0,
                     last_used_at: None,
                     inflight: Arc::new(AtomicU32::new(0)),
@@ -1280,6 +1287,35 @@ impl MultiTokenManager {
     /// 获取凭据总数
     pub fn total_count(&self) -> usize {
         self.entries.lock().len()
+    }
+
+    /// 池中是否存在「自定义 API」凭据（未禁用）。供分流快速判断:无则直接走 Kiro 路径零开销。
+    pub fn has_custom_api_credential(&self) -> bool {
+        self.entries
+            .lock()
+            .iter()
+            .any(|e| !e.disabled && e.credentials.is_custom_api_credential())
+    }
+
+    /// 记一次请求(自定义 API 代挂计数)。累计达到 `request_limit` 时自动禁用该凭据
+    /// (reason=RequestLimitReached),防止代挂 key 跑量超预算。limit=None/0 表示不限。
+    pub fn record_request(&self, id: u64) {
+        let mut entries = self.entries.lock();
+        if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
+            e.request_count = e.request_count.saturating_add(1);
+            if let Some(limit) = e.credentials.request_limit {
+                if limit > 0 && e.request_count >= limit && !e.disabled {
+                    e.disabled = true;
+                    e.disabled_reason = Some(DisabledReason::RequestLimitReached);
+                    tracing::warn!(
+                        credential_id = id,
+                        count = e.request_count,
+                        limit,
+                        "自定义 API 凭据已达请求上限,自动禁用"
+                    );
+                }
+            }
+        }
     }
 
     /// 获取可用凭据数量
@@ -1804,6 +1840,13 @@ impl MultiTokenManager {
                 .map(|e| e.credentials.clone())
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
+
+        // 自定义 API 代挂凭据:不是 Kiro 号,无 Kiro token 概念——直接放行(token 用其 api_key 或空占位),
+        // 真正的鉴权在透传时用 base_url + api_key 打上游。绝不进 Kiro 的 refresh/IdC 逻辑。
+        if credentials.is_custom_api_credential() {
+            let token = credentials.api_key.clone().unwrap_or_default();
+            return Ok((credentials, token));
+        }
 
         // API Key 凭据直接使用 kiroApiKey 作为 Bearer Token，无需刷新
         if credentials.is_api_key_credential() {
@@ -2707,6 +2750,7 @@ impl MultiTokenManager {
                         DisabledReason::SuspiciousActivityAuto => "SuspiciousActivityAuto",
                         DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
                         DisabledReason::InvalidConfig => "InvalidConfig",
+                        DisabledReason::RequestLimitReached => "RequestLimitReached",
                     }.to_string()),
                     endpoint: e.credentials.endpoint.clone(),
                     inflight: e.inflight.load(Ordering::Acquire),
@@ -3473,6 +3517,7 @@ impl MultiTokenManager {
                 disabled: false,
                 disabled_reason: None,
                 success_count: 0,
+                request_count: 0,
                 total_credits_used: 0.0,
                 last_used_at: None,
                 inflight: Arc::new(AtomicU32::new(0)),
@@ -3571,6 +3616,7 @@ impl MultiTokenManager {
                     disabled: true,
                     disabled_reason: Some(DisabledReason::Manual),
                     success_count: 0,
+                    request_count: 0,
                     total_credits_used: 0.0,
                     last_used_at: None,
                     inflight: Arc::new(AtomicU32::new(0)),
@@ -3691,6 +3737,7 @@ impl MultiTokenManager {
                 disabled: true,
                 disabled_reason: Some(DisabledReason::Manual),
                 success_count: restored_entry.success_count,
+                request_count: 0,
                 total_credits_used: restored_entry.total_credits_used,
                 last_used_at: restored_entry.last_used_at,
                 inflight: Arc::new(AtomicU32::new(0)),
