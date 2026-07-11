@@ -215,6 +215,9 @@ export function CredentialCard({
   const subscriptionTitle =
     balance?.subscriptionTitle ?? cached?.subscriptionTitle ?? credential.subscriptionTitle ?? null
 
+  // 自定义 API 代挂号:不是 Kiro 号,订阅/余额/profileArn/刷新Token 全无意义,卡片显示专属信息。
+  const isCustomApi = credential.authMethod === 'custom_api'
+
   const handleToggleDisabled = () => {
     setDisabled.mutate(
       { id: credential.id, disabled: !credential.disabled },
@@ -550,7 +553,35 @@ export function CredentialCard({
             </div>
           )}
 
-          {/* 订阅等级 + 余额状态条（自动加载缓存，无需手动点查询） */}
+          {/* 自定义 API 代挂:专属信息(上游地址 + 请求用量),不显示 Kiro 的订阅/余额 */}
+          {isCustomApi ? (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs text-muted-foreground">上游地址</span>
+                <span className="font-mono text-xs text-foreground truncate max-w-[200px]" title={credential.baseUrl}>
+                  {credential.baseUrl || '—'}
+                </span>
+              </div>
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs text-muted-foreground">请求用量</span>
+                <span className="text-xs">
+                  {credential.requestLimit && credential.requestLimit > 0 ? (
+                    <span className={
+                      (credential.requestCount ?? 0) >= credential.requestLimit
+                        ? 'text-amber-400 font-medium'
+                        : 'text-foreground'
+                    }>
+                      {credential.requestCount ?? 0} / {credential.requestLimit}
+                      {(credential.requestCount ?? 0) >= credential.requestLimit && '（已达上限·已禁用）'}
+                    </span>
+                  ) : (
+                    <span className="text-foreground">{credential.requestCount ?? 0}（不限）</span>
+                  )}
+                </span>
+              </div>
+            </div>
+          ) : (
+          /* 订阅等级 + 余额状态条（自动加载缓存，无需手动点查询） */
           <div className="space-y-2">
             <div className="flex items-center justify-between gap-2">
               <span className="text-xs text-muted-foreground">订阅等级</span>
@@ -564,6 +595,7 @@ export function CredentialCard({
             </div>
             {renderBalanceBar()}
           </div>
+          )}
 
           {/* 信息网格 */}
           <div className="grid grid-cols-2 gap-x-4 gap-y-3 text-sm">
@@ -675,6 +707,8 @@ export function CredentialCard({
               <RefreshCw className="h-4 w-4 mr-1" />
               重置失败
             </Button>
+            {/* 刷新 Token / 查看余额 是 Kiro 专属,自定义 API 代挂号不显示(它无 token/余额概念) */}
+            {!isCustomApi && (
             <Button
               size="sm"
               variant="outline"
@@ -685,7 +719,9 @@ export function CredentialCard({
               <RefreshCw className={`h-4 w-4 mr-1 ${forceRefresh.isPending ? 'animate-spin' : ''}`} />
               刷新 Token
             </Button>
-            {/* 查看余额：改用青蓝信息色（与主色/禁用色区分开，语义=只读查询） */}
+            )}
+            {!isCustomApi && (
+            /* 查看余额：改用青蓝信息色（与主色/禁用色区分开，语义=只读查询） */
             <Button
               size="sm"
               variant="outline"
@@ -695,6 +731,7 @@ export function CredentialCard({
               <Wallet className="h-4 w-4 mr-1" />
               查看余额
             </Button>
+            )}
             {/* 令牌导出已统一移至「设置 · 令牌导出」分区（单个/全部 · JSON/refreshToken/复制）。 */}
             {/* 启用 / 禁用 快捷入口（卡片主体直达，无需再进齿轮设置）。
                 禁用=琥珀警示色（非删除的红，只是暂停调度）；启用=翠绿（恢复）。 */}
