@@ -2,6 +2,17 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.3] - 2026-07-11
+
+### 修复
+- **添加自定义 API 报「refreshToken 为空」**：后端 `add_credential` 只认 api_key / OAuth 两类，
+  custom_api 落进 OAuth 分支被要求 refreshToken。修为：custom_api 单独分支——只校验 base_url、
+  去重按 base_url+api_key、跳过 Kiro 网络刷新验证（它不是 Kiro 号，没有 refresh token）。
+  本地实测：只给 base_url+apiKey 添加成功，不再报 refreshToken 为空。
+- **R18 图源开关关闭后缓存不清、刷新仍是旧图**：改 R18 / 背景开关保存后，只改了「下一轮预取参数」
+  却没清已缓存的 20 张旧图（容量 20、每 12 分钟才补 6 张，旧图能服务很久）。修为：R18 或背景
+  开关一变，**立即清空背景图内存池**（`clear_bg_pool`），下次 random-bg 按新参数即时重新拉取。
+
 ## [0.7.2] - 2026-07-11
 
 ### 修复（非 us-east-1 的 IdC/Enterprise 号对话 400 Improperly formed）

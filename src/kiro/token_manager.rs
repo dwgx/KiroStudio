@@ -3379,7 +3379,16 @@ impl MultiTokenManager {
     /// - `Err(_)` - 验证失败或添加失败
     pub async fn add_credential(&self, new_cred: KiroCredentials) -> anyhow::Result<u64> {
         // 1. 基本验证
-        if new_cred.is_api_key_credential() {
+        if new_cred.is_custom_api_credential() {
+            // 自定义 API 代挂:只需 base_url(Anthropic 兼容上游),不需要 refreshToken/kiroApiKey。
+            let base = new_cred
+                .base_url
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("自定义 API 凭据缺少 base_url"))?;
+            if base.trim().is_empty() {
+                anyhow::bail!("自定义 API 的 base_url 为空");
+            }
+        } else if new_cred.is_api_key_credential() {
             let api_key = new_cred
                 .kiro_api_key
                 .as_deref()
@@ -3392,7 +3401,32 @@ impl MultiTokenManager {
         }
 
         // 2. 基于哈希检测重复
-        if new_cred.is_api_key_credential() {
+        if new_cred.is_custom_api_credential() {
+            // 自定义 API 去重键 = base_url + api_key(允许同一上游用不同 key,或不同上游)。
+            let dup_key = format!(
+                "{}|{}",
+                new_cred.base_url.as_deref().unwrap_or(""),
+                new_cred.api_key.as_deref().unwrap_or("")
+            );
+            let new_hash = sha256_hex(&dup_key);
+            let duplicate_exists = {
+                let entries = self.entries.lock();
+                entries.iter().any(|entry| {
+                    if !entry.credentials.is_custom_api_credential() {
+                        return false;
+                    }
+                    let k = format!(
+                        "{}|{}",
+                        entry.credentials.base_url.as_deref().unwrap_or(""),
+                        entry.credentials.api_key.as_deref().unwrap_or("")
+                    );
+                    sha256_hex(&k) == new_hash
+                })
+            };
+            if duplicate_exists {
+                anyhow::bail!("凭据已存在（相同 base_url + api_key）");
+            }
+        } else if new_cred.is_api_key_credential() {
             let new_api_key = new_cred
                 .kiro_api_key
                 .as_deref()
@@ -3436,8 +3470,10 @@ impl MultiTokenManager {
             }
         }
 
-        // 3. 验证凭据有效性（API Key 无需网络刷新）
-        let mut validated_cred = if new_cred.is_api_key_credential() {
+        // 3. 验证凭据有效性（API Key / 自定义 API 无需 Kiro 网络刷新）
+        let mut validated_cred = if new_cred.is_api_key_credential()
+            || new_cred.is_custom_api_credential()
+        {
             new_cred.clone()
         } else {
             let effective_proxy = new_cred.effective_proxy(self.proxy.as_ref());
