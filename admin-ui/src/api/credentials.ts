@@ -193,6 +193,20 @@ export async function deepVerifyCredential(id: number): Promise<SuccessResponse>
   return data
 }
 
+// 探测该凭据当前可用的模型列表（逐模型极小请求，看哪些通/哪些 INVALID_MODEL_ID）
+export interface ProbedModel {
+  model: string
+  supported: boolean
+}
+export interface ProbeModelsResponse {
+  id: number
+  models: ProbedModel[]
+}
+export async function probeAvailableModels(id: number): Promise<ProbeModelsResponse> {
+  const { data } = await api.get<ProbeModelsResponse>(`/credentials/${id}/models`)
+  return data
+}
+
 // 单号超额（Overage）状态快照（后端 OverageStatus，camelCase）。
 export interface OverageStatus {
   id: number
