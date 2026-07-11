@@ -20,12 +20,13 @@ import {
 } from '@/components/ui/dialog'
 import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
 import { cn, copyToClipboard } from '@/lib/utils'
-import { enableOverage, disableOverage, setCredentialName, setCredentialProxy } from '@/api/credentials'
+import { enableOverage, disableOverage, setCredentialName, setCredentialProxy, PROBE_MODEL_CATALOG } from '@/api/credentials'
 import { authShortLabel, disabledReasonLabel, subscriptionLabel } from '@/lib/i18n-labels'
 import {
   useSetDisabled,
   useSetPriority,
   useSetRpmLimit,
+  useSetAllowedModels,
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
@@ -113,6 +114,10 @@ export function CredentialCard({
   const [showSettings, setShowSettings] = useState(false)
   const [priorityValue, setPriorityValue] = useState(credential.priority)
   const [rpmLimitValue, setRpmLimitValue] = useState(credential.rpmLimit ?? 0)
+  // 「允许模型」白名单本地编辑集合（成本安全硬门；空=不限制）
+  const [allowedModelsValue, setAllowedModelsValue] = useState<Set<string>>(
+    () => new Set(credential.allowedModels ?? []),
+  )
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
   // 超额（Overage）开关：真开关接线状态
   const [overageBusy, setOverageBusy] = useState(false)
@@ -134,6 +139,7 @@ export function CredentialCard({
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
   const setRpmLimit = useSetRpmLimit()
+  const setAllowedModels = useSetAllowedModels()
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
@@ -247,6 +253,26 @@ export function CredentialCard({
         onError: (err) => toast.error('操作失败: ' + (err as Error).message),
       }
     )
+  }
+
+  const handleAllowedModelsChange = () => {
+    const list = Array.from(allowedModelsValue)
+    setAllowedModels.mutate(
+      { id: credential.id, allowedModels: list.length ? list : null },
+      {
+        onSuccess: (res) => toast.success(res.message),
+        onError: (err) => toast.error('操作失败: ' + (err as Error).message),
+      }
+    )
+  }
+
+  const toggleAllowedModel = (id: string) => {
+    setAllowedModelsValue((prev) => {
+      const n = new Set(prev)
+      if (n.has(id)) n.delete(id)
+      else n.add(id)
+      return n
+    })
   }
 
   const handleReset = () => {
@@ -490,10 +516,12 @@ export function CredentialCard({
               className="h-8 w-8 shrink-0 p-0"
               onClick={() => {
                 setPriorityValue(credential.priority)
+                setRpmLimitValue(credential.rpmLimit ?? 0)
+                setAllowedModelsValue(new Set(credential.allowedModels ?? []))
                 setNameValue(credential.name ?? '')
                 setShowSettings(true)
               }}
-              title="设置（优先级 / 启用 / 删除）"
+              title="设置（优先级 / RPM / 允许模型 / 启用 / 删除）"
               aria-label="设置"
             >
               <Settings className="h-4 w-4" />
@@ -581,6 +609,17 @@ export function CredentialCard({
               <span className="text-muted-foreground">最后调用：</span>
               <span className="font-medium">{formatLastUsed(credential.lastUsedAt)}</span>
             </div>
+            {credential.allowedModels && credential.allowedModels.length > 0 && (
+              <div className="col-span-2">
+                <span className="text-muted-foreground">允许模型：</span>
+                <span
+                  className="font-medium text-primary"
+                  title={'成本安全硬门:此号只接这些模型\n' + credential.allowedModels.join('\n')}
+                >
+                  白名单 {credential.allowedModels.length} 项（齿轮→编辑）
+                </span>
+              </div>
+            )}
             {credential.maskedApiKey && (
               <div className="col-span-2">
                 <span className="text-muted-foreground">API Key：</span>
@@ -831,6 +870,55 @@ export function CredentialCard({
                     )}
                   </Button>
                 </div>
+              </div>
+            </div>
+
+            {/* 允许模型白名单（成本安全硬门）：勾选后该号只接白名单内模型，把便宜模型流量
+                锁死在指定号,杜绝溢出到贵号计费。全不选=不限制(接任意模型)。 */}
+            <div className="space-y-2 border-t pt-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <div className="text-sm font-medium">允许模型（白名单）</div>
+                  <div className="text-xs text-muted-foreground">
+                    {allowedModelsValue.size === 0
+                      ? '全不选=不限制,接任意模型'
+                      : `硬门:此号只接勾选的 ${allowedModelsValue.size} 个模型`}
+                  </div>
+                </div>
+                <Button
+                  size="sm"
+                  className="h-8 shrink-0 px-2.5"
+                  onClick={handleAllowedModelsChange}
+                  disabled={setAllowedModels.isPending}
+                  title="保存白名单"
+                >
+                  {setAllowedModels.isPending ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <><Check className="mr-1 h-4 w-4" />保存</>
+                  )}
+                </Button>
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {PROBE_MODEL_CATALOG.map((m) => {
+                  const on = allowedModelsValue.has(m.id)
+                  return (
+                    <button
+                      key={m.id}
+                      type="button"
+                      onClick={() => toggleAllowedModel(m.id)}
+                      className={cn(
+                        'inline-flex items-center gap-1 rounded border px-2 py-1 text-[11px] font-medium transition-colors',
+                        on
+                          ? 'border-primary/40 bg-primary/15 text-primary'
+                          : 'border-white/10 bg-white/5 text-muted-foreground hover:border-white/25'
+                      )}
+                      title={`${m.id} · ${m.mult}`}
+                    >
+                      {m.id} <span className="opacity-60">{m.mult}</span>
+                    </button>
+                  )
+                })}
               </div>
             </div>
 
