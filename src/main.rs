@@ -27,6 +27,91 @@ pub struct UsageHandles {
     pub trace_db: Arc<TraceDb>,
 }
 
+/// 生成一个加密安全的随机密钥：`<prefix>-<base64url(32B)>`。
+///
+/// 用 4 个 UUID v4（各 122 bit 熵，getrandom 后端）拼成 32 字节再 base64url，去掉易混字符。
+/// 不引新依赖（uuid 已在用），熵足够做 apiKey / adminApiKey。
+fn generate_strong_key(prefix: &str) -> String {
+    use base64::Engine;
+    let mut bytes = Vec::with_capacity(64);
+    for _ in 0..4 {
+        bytes.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+    }
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes[..24]);
+    let cleaned: String = b64.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    format!("{prefix}-{}", &cleaned[..cleaned.len().min(32)])
+}
+
+/// 防呆引导：`config_path` 指向的配置文件不存在时，自动生成一份带强随机密钥的最小 config.json，
+/// 并大字打印 adminApiKey / apiKey / 面板地址。已存在则不做任何事（绝不覆盖用户配置）。
+///
+/// 关键：路径为默认相对名 `config.json` 时，落到 **exe 同目录**（双击时 cwd 常不是 exe 目录，
+/// 若按 cwd 写会散落到桌面/系统目录）。用户显式 `--config` 指定的绝对/相对路径则原样尊重。
+fn bootstrap_config_if_missing(config_path: &str) -> String {
+    use std::path::Path;
+    // 解析实际落盘路径：默认名 → 优先 exe 同目录（双击时 cwd 常不是 exe 目录）；显式路径 → 原样。
+    // 默认名场景:若 cwd 下已有 config.json（源码目录运行）则沿用 cwd,不强拽到 exe 目录,
+    // 避免和 start.bat/源码构建的既有配置错位。
+    let resolved = if config_path == Config::default_config_path() {
+        let cwd_path = Path::new(config_path).to_path_buf();
+        if cwd_path.exists() {
+            cwd_path
+        } else {
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|d| d.join(config_path)))
+                .unwrap_or(cwd_path)
+        }
+    } else {
+        Path::new(config_path).to_path_buf()
+    };
+    let resolved_str = resolved.to_string_lossy().to_string();
+    if resolved.exists() {
+        return resolved_str; // 已有配置，尊重用户，不碰
+    }
+    let target = resolved;
+
+    let api_key = generate_strong_key("sk-kiro");
+    let admin_key = generate_strong_key("sk-admin");
+    // 最小可运行 config：host/port + 两把密钥 + rustls。其余字段走 serde default。
+    let cfg = serde_json::json!({
+        "host": "127.0.0.1",
+        "port": 8990,
+        "apiKey": api_key,
+        "adminApiKey": admin_key,
+        "tlsBackend": "rustls",
+        "region": "us-east-1",
+        "defaultEndpoint": "ide",
+    });
+    let body = serde_json::to_string_pretty(&cfg).unwrap_or_default();
+    if let Err(e) = std::fs::write(&target, body) {
+        // 写失败不阻断：继续走原流程（大概率随后因缺 apiKey 退出并报错），但先告知原因。
+        tracing::error!("[引导] 自动生成配置失败({}): {e}；请手动创建 config.json 或用 start.bat", target.display());
+        return resolved_str;
+    }
+    // Unix 收紧权限（含密钥，仅属主可读写）；Windows 依赖 NTFS ACL，此调用 no-op。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600));
+    }
+
+    // 大字横幅打印密钥 + 面板地址（用户据此登录 /admin 上号）。用 println! 确保裸双击也能看到。
+    println!("\n############################################################");
+    println!("#  KiroStudio 首次启动：已自动生成配置（请妥善保存密钥）  #");
+    println!("############################################################");
+    println!("  配置文件:  {}", target.display());
+    println!("  面板密钥 (adminApiKey，登录 /admin 用):");
+    println!("     {admin_key}");
+    println!("  网关密钥 (apiKey，给 Claude Code / SDK 用):");
+    println!("     {api_key}");
+    println!("  管理面板:  http://127.0.0.1:8990/admin");
+    println!("  登录后到「凭据/号池」页添加 Kiro 账号即可开始使用。");
+    println!("############################################################\n");
+    tracing::info!("[引导] 已自动生成 {}（首次启动）", target.display());
+    resolved_str
+}
+
 #[tokio::main]
 async fn main() {
     // 解析命令行参数
@@ -44,6 +129,13 @@ async fn main() {
     let config_path = args
         .config
         .unwrap_or_else(|| Config::default_config_path().to_string());
+
+    // 防呆引导（Windows 裸双击 exe 的核心体验）：config 缺失时**不再直接闪退**，而是
+    // 自动在合适目录生成带强随机密钥的 config.json + 大字打印密钥/面板地址，再正常启动。
+    // 这样下载单个 exe 双击、或首次运行都能开箱即用，无需先跑 start.bat。
+    // 已有 config 则完全不碰（绝不覆盖用户配置）。返回实际落盘路径,供随后 load 用同一路径。
+    let config_path = bootstrap_config_if_missing(&config_path);
+
     let config = Config::load(&config_path).unwrap_or_else(|e| {
         tracing::error!("加载配置失败: {}", e);
         std::process::exit(1);
