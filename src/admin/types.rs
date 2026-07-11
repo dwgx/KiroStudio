@@ -45,6 +45,15 @@ pub struct CredentialStatusItem {
     pub expires_at: Option<String>,
     /// 认证方式
     pub auth_method: Option<String>,
+    /// 自定义 API 代挂:上游 base_url(展示用；api_key 绝不下发)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// 自定义 API 代挂:请求上限
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_limit: Option<u64>,
+    /// 自定义 API 代挂:累计已发请求数
+    #[serde(default)]
+    pub request_count: u64,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
     /// refreshToken 的 SHA-256 哈希（仅 OAuth 凭据，用于前端去重）

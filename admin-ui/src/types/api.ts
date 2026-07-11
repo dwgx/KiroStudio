@@ -16,6 +16,12 @@ export interface CredentialStatusItem {
   id: number
   priority: number
   rpmLimit?: number
+  /** 自定义 API 代挂:上游 base_url（api_key 不下发） */
+  baseUrl?: string
+  /** 自定义 API 代挂:请求上限 */
+  requestLimit?: number
+  /** 自定义 API 代挂:累计已发请求数 */
+  requestCount?: number
   /** 「允许模型」白名单（成本安全硬门；空/缺省 = 不限制） */
   allowedModels?: string[]
   /** 「测试可用模型」历史结果（探测打的标签） */
