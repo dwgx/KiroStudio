@@ -571,8 +571,16 @@ pub(crate) async fn resolve_profile_arn_via_management(
     token: &str,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<Option<String>> {
-    let region = credentials.effective_upstream_region(config);
-    let host = format!("management.{}.kiro.dev", region);
+    // ⭐ListAvailableProfiles 固定打 **us-east-1**：Kiro 的 profile/控制面是**全局注册在
+    // us-east-1** 的,不随账号 region 分布。实测(#86 eu-central-1 Enterprise 号):
+    //   - management.us-east-1.kiro.dev  → 返回真实 profile ✅
+    //   - management.eu-central-1.kiro.dev → 返回空 [] ❌
+    // 此前用 effective_upstream_region(跟凭据 region),导致非 us-east-1 的号(尤其 Enterprise)
+    // 拿到空 profiles → profileArn 恒 None → 对话套 us-east-1 占位 ARN → region 不符 →
+    // 400 Improperly formed(这正是"以前出现过没修复"的根因)。us-east-1 号巧合一致没暴露,
+    // eu/ap 等 region 的号才炸。**仅本解析函数固定 us-east-1**;对话/余额端点仍按凭据 region 走
+    // (解析到的 arn 第4段自带正确 region,effective_upstream_region 会据此回正)。
+    let host = "management.us-east-1.kiro.dev".to_string();
     let url = format!("https://{}/", host);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     let user_agent = format!(
