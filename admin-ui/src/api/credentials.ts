@@ -196,10 +196,13 @@ export async function deepVerifyCredential(id: number): Promise<SuccessResponse>
 // 探测该凭据当前可用的模型列表（逐模型极小请求，看哪些通/哪些 INVALID_MODEL_ID）
 export interface ProbedModel {
   model: string
-  supported: boolean
+  /** supported=可用, unsupported=订阅不含(INVALID_MODEL_ID), unknown=探测时上游5xx/网络无法判定 */
+  status: 'supported' | 'unsupported' | 'unknown'
 }
 export interface ProbeModelsResponse {
   id: number
+  /** opus 能力档位：normal=都可用 / partial=只一个 / restricted=都没有 / unknown=上游异常无法判定 */
+  verdict: 'normal' | 'partial' | 'restricted' | 'unknown'
   models: ProbedModel[]
 }
 export async function probeAvailableModels(id: number): Promise<ProbeModelsResponse> {

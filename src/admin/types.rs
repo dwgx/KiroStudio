@@ -459,6 +459,8 @@ pub struct ConfigSnapshotResponse {
     pub proxy_url: Option<String>,
     /// 是否配置了 admin key（不回传明文）
     pub has_admin_key: bool,
+    /// 是否配置了 userKey（下游对话 api_key，不回传明文）
+    pub has_api_key: bool,
     /// 回调模式：local（本地端口）/ remote（公网回调）
     pub callback_mode: String,
     pub callback_base_url: Option<String>,
@@ -523,6 +525,10 @@ pub struct UpdateConfigRequest {
     pub proxy_password: Option<String>,
     /// 网页上号回调基地址；传空字符串表示清除（回退本地模式）
     pub callback_base_url: Option<String>,
+    /// 下游客户端对话 API Key（userKey，x-api-key）。出于安全前端不回显已存值，仅在非空时更新；
+    /// ⚠️需重启生效（认证中间件在启动时固化 key）。空白值会被后端拒绝（防 fail-open）。
+    #[serde(default)]
+    pub api_key: Option<String>,
     // ---- 反代安全（批次3，均需重启生效）----
     /// CORS 允许来源列表（整表替换）
     pub cors_allowed_origins: Option<Vec<String>>,
@@ -676,6 +682,7 @@ mod tests {
             has_proxy: false,
             proxy_url: None,
             has_admin_key: false,
+            has_api_key: false,
             callback_mode: "local".into(),
             callback_base_url: None,
             cors_allowed_origins: vec![],

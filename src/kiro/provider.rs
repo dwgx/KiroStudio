@@ -625,20 +625,27 @@ impl KiroProvider {
             // 只有当所有号都返回它（report 返回 has_available=false）时，才是模型本身无效、透传。
             if status.as_u16() == 400 && endpoint.is_invalid_model_id(&body) {
                 last_outcome = crate::usage::RequestOutcome::BadRequest;
-                let has_available = self.token_manager.report_model_invalid(ctx.id);
-                if !has_available {
+                // 模型级处置：只把"该号+该模型"记进短期黑名单并 failover 到对此模型仍可用的号；
+                // 绝不冷却/禁用整个号（该号对其它模型照常可用）。返回 false = 所有未禁用号都已对
+                // 此模型进黑名单 → 说明是模型本身无效，透传真 400 给客户端(而非 429/502 死循环)。
+                let has_available_for_model =
+                    self.token_manager.report_model_invalid(ctx.id, model.as_deref());
+                if !has_available_for_model {
                     last_error = Some(anyhow::anyhow!(
-                        "{} API 请求失败（模型不可用且所有凭据已用尽）: {} {}",
+                        "{} API 请求失败（模型 {:?} 对所有号均 INVALID_MODEL_ID，判定模型无效）: {} {}",
                         api_type,
+                        model.as_deref().unwrap_or(""),
                         status,
                         body
                     ));
+                    // 透传真实 400：这是客户端请求了一个所有号都不支持的模型，重试无意义。
                     break;
                 }
                 last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败（凭据 #{} INVALID_MODEL_ID，切换凭据）: {} {}",
+                    "{} API 请求失败（凭据 #{} 对模型 {:?} INVALID_MODEL_ID，切换到仍支持的号）: {} {}",
                     api_type,
                     ctx.id,
+                    model.as_deref().unwrap_or(""),
                     status,
                     body
                 ));
