@@ -44,6 +44,7 @@ const DISABLED_REASON_MAP: Record<string, string> = {
   InvalidConfig: '配置无效',
   TooManyRefreshFailures: '刷新失败过多',
   InsufficientBalance: '余额不足',
+  SubscriptionInvalid: '订阅失效/降级',
 }
 
 /** 禁用原因 -> 中文；未知值原样返回。 */

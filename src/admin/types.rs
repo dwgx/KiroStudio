@@ -55,6 +55,9 @@ pub struct CredentialStatusItem {
     pub subscription_title: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
+    /// 生命周期累计 credit 花费（上游 meteringEvent 真实计费累加，独立于用量保留期，只增不清）。
+    /// 供前端凭据卡片展示"这个号从入池至今一共花了多少 credit"。
+    pub total_credits_used: f64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
     /// 是否配置了凭据级代理

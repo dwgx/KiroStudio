@@ -556,7 +556,7 @@ async fn handle_stream_request(
     let initial_events = ctx.generate_initial_events();
 
     // 创建 SSE 流（流结束时用 meta + 最终 usage 埋点一条成功记录）
-    let stream = create_sse_stream(response, ctx, initial_events, meta, client);
+    let stream = create_sse_stream(provider, response, ctx, initial_events, meta, client);
 
     // 返回 SSE 响应
     Response::builder()
@@ -570,6 +570,7 @@ async fn handle_stream_request(
 
 /// 流结束时，用 provider 元数据 + StreamContext 最终 usage 埋点一条成功记录
 fn emit_stream_usage(
+    provider: &crate::kiro::provider::KiroProvider,
     ctx: &StreamContext,
     meta: &crate::kiro::provider::CallMeta,
     client: &ClientInfo,
@@ -591,6 +592,10 @@ fn emit_stream_usage(
     record.retries = meta.retries;
     // 去硬编码 Success：按本次响应的真实完成状态记账，避免截断/上游错误被记成成功污染熔断信号。
     record.outcome = ctx.completion_outcome();
+    // 生命周期累计花费：把本次真实 credit 消耗累加到该凭据（独立于用量保留期，只增不清）。
+    if let Some(c) = record.credits_used {
+        provider.report_credits(meta.credential_id, c);
+    }
     client.apply(&mut record);
     crate::usage::emit_record(record);
 }
@@ -605,6 +610,7 @@ fn create_ping_sse() -> Bytes {
 
 /// 创建 SSE 事件流
 fn create_sse_stream(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     response: reqwest::Response,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
@@ -622,8 +628,8 @@ fn create_sse_stream(
     let body_stream = response.bytes_stream();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), meta, client),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, meta, client)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), meta, client, provider),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, meta, client, provider)| async move {
             if finished {
                 return None;
             }
@@ -679,7 +685,7 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, meta, client)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, meta, client, provider)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
@@ -701,8 +707,8 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            emit_stream_usage(&ctx, &meta, &client);
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, meta, client)))
+                            emit_stream_usage(&provider, &ctx, &meta, &client);
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, meta, client, provider)))
                         }
                         None => {
                             // 流结束，发送最终事件。
@@ -721,8 +727,8 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            emit_stream_usage(&ctx, &meta, &client);
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, meta, client)))
+                            emit_stream_usage(&provider, &ctx, &meta, &client);
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, meta, client, provider)))
                         }
                     }
                 }
@@ -730,7 +736,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, meta, client)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, meta, client, provider)))
                 }
             }
         },
@@ -921,6 +927,10 @@ async fn handle_non_stream_request(
             record.latency_ms = meta.latency_ms;
             record.retries = meta.retries;
             record.outcome = completion.outcome();
+            // 生命周期累计花费：本次真实 credit 消耗累加到该凭据（独立于用量保留期，只增不清）。
+            if let Some(c) = record.credits_used {
+                provider.report_credits(meta.credential_id, c);
+            }
             client.apply(&mut record);
             crate::usage::emit_record(record);
         }
@@ -995,6 +1005,10 @@ async fn handle_non_stream_request(
         record.retries = meta.retries;
         // 去硬编码：此处 completion 必为 Ok（失败已在上方 early-return），显式读取以统一口径。
         record.outcome = completion.outcome();
+        // 生命周期累计花费：本次真实 credit 消耗累加到该凭据（独立于用量保留期，只增不清）。
+        if let Some(c) = record.credits_used {
+            provider.report_credits(meta.credential_id, c);
+        }
         client.apply(&mut record);
         crate::usage::emit_record(record);
     }
@@ -1246,7 +1260,7 @@ async fn handle_stream_request_buffered(
     let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
 
     // 创建缓冲 SSE 流（流结束时用 meta + 最终 usage 埋点）
-    let stream = create_buffered_sse_stream(response, ctx, meta, client);
+    let stream = create_buffered_sse_stream(provider, response, ctx, meta, client);
 
     // 返回 SSE 响应
     Response::builder()
@@ -1266,6 +1280,7 @@ async fn handle_stream_request_buffered(
 /// 3. 流结束后，用正确的 input_tokens 更正 message_start 事件
 /// 4. 一次性发送所有事件
 fn create_buffered_sse_stream(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     response: reqwest::Response,
     ctx: BufferedStreamContext,
     meta: crate::kiro::provider::CallMeta,
@@ -1282,8 +1297,9 @@ fn create_buffered_sse_stream(
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
             meta,
             client,
+            provider,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, meta, client)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, meta, client, provider)| async move {
             if finished {
                 return None;
             }
@@ -1298,7 +1314,7 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, meta, client)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, meta, client, provider)));
                     }
 
                     // 然后处理数据流
@@ -1353,8 +1369,8 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                emit_buffered_usage(&ctx, &meta, &client);
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, meta, client)));
+                                emit_buffered_usage(&provider, &ctx, &meta, &client);
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, meta, client, provider)));
                             }
                             None => {
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）。
@@ -1373,8 +1389,8 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                emit_buffered_usage(&ctx, &meta, &client);
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, meta, client)));
+                                emit_buffered_usage(&provider, &ctx, &meta, &client);
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, meta, client, provider)));
                             }
                         }
                     }
@@ -1387,6 +1403,7 @@ fn create_buffered_sse_stream(
 
 /// 缓冲流结束时埋点一条成功记录
 fn emit_buffered_usage(
+    provider: &crate::kiro::provider::KiroProvider,
     ctx: &BufferedStreamContext,
     meta: &crate::kiro::provider::CallMeta,
     client: &ClientInfo,
@@ -1408,6 +1425,10 @@ fn emit_buffered_usage(
     record.retries = meta.retries;
     // 去硬编码 Success：按真实完成状态记账（截断/上游错误不再被记成成功）。
     record.outcome = ctx.completion_outcome();
+    // 生命周期累计花费：把本次真实 credit 消耗累加到该凭据（独立于用量保留期，只增不清）。
+    if let Some(c) = record.credits_used {
+        provider.report_credits(meta.credential_id, c);
+    }
     client.apply(&mut record);
     crate::usage::emit_record(record);
 }

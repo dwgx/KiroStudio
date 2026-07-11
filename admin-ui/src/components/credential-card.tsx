@@ -20,7 +20,7 @@ import {
 } from '@/components/ui/dialog'
 import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
 import { cn, copyToClipboard } from '@/lib/utils'
-import { enableOverage, disableOverage, setCredentialName, setCredentialProxy } from '@/api/credentials'
+import { enableOverage, disableOverage, setCredentialName, setCredentialProxy, probeAvailableModels, type ProbedModel } from '@/api/credentials'
 import { authShortLabel, disabledReasonLabel, subscriptionLabel } from '@/lib/i18n-labels'
 import {
   useSetDisabled,
@@ -42,6 +42,14 @@ interface CredentialCardProps {
   /** 按需（hover/“查询信息”）拉取的余额；若存在则优先于自动缓存快照展示。可为 null。 */
   balance: BalanceResponse | null
   loadingBalance: boolean
+}
+
+/** 累计花费展示：0 显示 0，小数保留两位，过千用 k 简写，避免长号占满卡片。 */
+function formatCredits(v: number | undefined | null): string {
+  const n = typeof v === 'number' && isFinite(v) ? v : 0
+  if (n === 0) return '0'
+  if (n >= 10000) return `${(n / 1000).toFixed(1)}k`
+  return n.toFixed(2)
 }
 
 function formatLastUsed(lastUsedAt: string | null): string {
@@ -112,6 +120,9 @@ export function CredentialCard({
   // 别名/备注编辑：设置弹框内输入框的本地值 + 保存中状态
   const [nameValue, setNameValue] = useState(credential.name ?? '')
   const [savingName, setSavingName] = useState(false)
+  // 可用模型探测：结果 + 进行中状态（选中令牌后手动触发，逐模型探测）
+  const [probingModels, setProbingModels] = useState(false)
+  const [probedModels, setProbedModels] = useState<ProbedModel[] | null>(null)
 
   // 单凭证代理编辑：URL(留空回退全局,"direct"不走代理) + 账密(留空不改)。立即生效无需重启。
   const [proxyValue, setProxyValue] = useState(credential.proxyUrl ?? '')
@@ -253,6 +264,21 @@ export function CredentialCard({
       onSuccess: (res) => toast.success(res.message),
       onError: (err) => toast.error('刷新失败: ' + (err as Error).message),
     })
+  }
+
+  // 探测该号当前可用的模型（逐模型极小上游请求，仅手动触发）
+  const handleProbeModels = async () => {
+    setProbingModels(true)
+    try {
+      const res = await probeAvailableModels(credential.id)
+      setProbedModels(res.models)
+      const ok = res.models.filter((m) => m.supported).length
+      toast.success(`探测完成：${ok}/${res.models.length} 个模型可用`)
+    } catch (err) {
+      toast.error('模型探测失败: ' + (err as Error).message)
+    } finally {
+      setProbingModels(false)
+    }
   }
 
   const handleDelete = () => {
@@ -560,6 +586,15 @@ export function CredentialCard({
               )}
             </div>
             <div className="col-span-2">
+              <span className="text-muted-foreground">累计花费：</span>
+              <span
+                className="font-medium"
+                title="该号从入池至今的生命周期累计 credit 消耗（上游真实计费，独立于用量保留期，只增不清）"
+              >
+                {formatCredits(credential.totalCreditsUsed)} credits
+              </span>
+            </div>
+            <div className="col-span-2">
               <span className="text-muted-foreground">最后调用：</span>
               <span className="font-medium">{formatLastUsed(credential.lastUsedAt)}</span>
             </div>
@@ -622,11 +657,21 @@ export function CredentialCard({
               size="sm"
               variant="outline"
               onClick={handleForceRefresh}
-              disabled={forceRefresh.isPending || credential.disabled || credential.authMethod === 'api_key'}
-              title={credential.authMethod === 'api_key' ? 'API Key 凭据无需刷新 Token' : credential.disabled ? '已禁用的凭据无法刷新 Token' : '强制刷新 Token'}
+              disabled={forceRefresh.isPending || credential.authMethod === 'api_key'}
+              title={credential.authMethod === 'api_key' ? 'API Key 凭据无需刷新 Token' : '强制刷新 Token（禁用的号也可刷，便于排查/恢复）'}
             >
               <RefreshCw className={`h-4 w-4 mr-1 ${forceRefresh.isPending ? 'animate-spin' : ''}`} />
               刷新 Token
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={handleProbeModels}
+              disabled={probingModels || credential.authMethod === 'api_key'}
+              title={credential.authMethod === 'api_key' ? 'API Key 凭据不区分模型订阅' : '探测该号当前可用的模型（逐模型试探，约 7 次轻量上游请求）'}
+            >
+              <RefreshCw className={`h-4 w-4 mr-1 ${probingModels ? 'animate-spin' : ''}`} />
+              测可用模型
             </Button>
             {/* 查看余额：改用青蓝信息色（与主色/禁用色区分开，语义=只读查询） */}
             <Button
@@ -664,6 +709,29 @@ export function CredentialCard({
               )}
             </Button>
           </div>
+          {/* 模型探测结果：点「测可用模型」后展示每个模型可用/不可用（不可用=订阅不支持） */}
+          {probedModels && (
+            <div className="mt-3 rounded-md border border-white/10 bg-black/20 p-2.5">
+              <div className="mb-1.5 text-xs text-muted-foreground">
+                可用模型（{probedModels.filter((m) => m.supported).length}/{probedModels.length}）
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {probedModels.map((m) => (
+                  <span
+                    key={m.model}
+                    className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium ${
+                      m.supported
+                        ? 'bg-emerald-500/10 text-emerald-300 border border-emerald-500/30'
+                        : 'bg-white/5 text-muted-foreground border border-white/10 line-through'
+                    }`}
+                    title={m.supported ? '该号可用此模型' : '该号不支持此模型（订阅等级不够/已降级）'}
+                  >
+                    {m.model.replace('claude-', '')}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
         </CardContent>
       </Card>
       {/* 设置对话框：集中别名/代理/超额/优先级/RPM/启用/删除。

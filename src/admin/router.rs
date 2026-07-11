@@ -13,7 +13,7 @@ use super::{
         get_overage_status, list_trash, purge_credential, poll_social_login, reset_failure_count,
         restart_service, restore_credential, set_credential_disabled, set_credential_name,
         set_credential_proxy,
-        set_credential_priority, set_credential_rpm_limit, purge_trash_batch,
+        set_credential_priority, set_credential_rpm_limit, purge_trash_batch, probe_available_models,
         set_load_balancing_mode, social_callback, start_social_login, storage_cleanup,
         storage_stats, update_config, start_idc_login, poll_idc_login,
         start_external_idp_login, external_idp_leg1, external_idp_leg2,
@@ -67,6 +67,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/reset", post(reset_failure_count))
         .route("/credentials/{id}/refresh", post(force_refresh_token))
         .route("/credentials/{id}/verify", post(deep_verify_credential))
+        // 选中令牌后探测可用模型（逐模型极小请求，看哪些通/哪些 INVALID_MODEL_ID）
+        .route("/credentials/{id}/models", get(probe_available_models))
         .route("/credentials/{id}/balance", get(get_credential_balance))
         // 单号 overage 真开关（⚠️ enable 触发真实按量付费；仅响应显式单号请求）
         .route("/credentials/{id}/overage", get(get_overage_status))
