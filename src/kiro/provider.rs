@@ -202,6 +202,14 @@ impl KiroProvider {
         self.call_mcp_with_retry(request_body).await
     }
 
+    /// 累加一次请求的真实 credit 花费到该凭据的生命周期累计（透传到 token_manager）。
+    ///
+    /// handler 在请求完成、从上游 meteringEvent 拿到真实计费量后调用；provider 持有
+    /// token_manager，handler 只有 provider，故在此开一个薄 passthrough。
+    pub fn report_credits(&self, credential_id: u64, credits: f64) {
+        self.token_manager.add_credits(credential_id, credits);
+    }
+
     /// 内部方法：带重试逻辑的 MCP API 调用
     async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count();
@@ -611,7 +619,33 @@ impl KiroProvider {
                 continue;
             }
 
-            // 400 Bad Request - 请求问题，重试/切换凭据无意义
+            // 400 INVALID_MODEL_ID：该号已不能服务请求的模型（多为订阅取消/降级）。
+            // 不是客户端请求错误——换个订阅仍有效的号往往能成功。故给该号冷却 + failover，
+            // 而非直接把 400 透传（那样坏号还留在轮转里，下个请求又命中它）。
+            // 只有当所有号都返回它（report 返回 has_available=false）时，才是模型本身无效、透传。
+            if status.as_u16() == 400 && endpoint.is_invalid_model_id(&body) {
+                last_outcome = crate::usage::RequestOutcome::BadRequest;
+                let has_available = self.token_manager.report_model_invalid(ctx.id);
+                if !has_available {
+                    last_error = Some(anyhow::anyhow!(
+                        "{} API 请求失败（模型不可用且所有凭据已用尽）: {} {}",
+                        api_type,
+                        status,
+                        body
+                    ));
+                    break;
+                }
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败（凭据 #{} INVALID_MODEL_ID，切换凭据）: {} {}",
+                    api_type,
+                    ctx.id,
+                    status,
+                    body
+                ));
+                continue;
+            }
+
+            // 400 Bad Request - 其它请求问题（客户端构造错误），重试/切换凭据无意义
             if status.as_u16() == 400 {
                 last_outcome = crate::usage::RequestOutcome::BadRequest;
                 last_error = Some(anyhow::anyhow!(
