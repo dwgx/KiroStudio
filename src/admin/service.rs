@@ -1070,14 +1070,16 @@ impl AdminService {
             }
         }
         if let Some(v) = req.tls_backend {
+            // 出厂发布版一律纯 rustls（见 build.bat / release.yml 的 --no-default-features）。
+            // native-tls 已是死路：前端已移除该选项，此处对任何非 rustls 值一律归一到 rustls，
+            // 避免把一个"点了会触发回退警告"的死后端持久化进 config.json。宽容接收旧客户端/
+            // 旧脚本传来的 "native-tls"，静默归一而非报错（防呆）。
             let backend = match v.as_str() {
-                "rustls" => crate::model::config::TlsBackend::Rustls,
-                "native-tls" => crate::model::config::TlsBackend::NativeTls,
-                _ => {
-                    return Err(AdminServiceError::InvalidCredential(
-                        "tlsBackend 必须是 'rustls' 或 'native-tls'".to_string(),
-                    ));
+                "native-tls" => {
+                    tracing::warn!("tlsBackend=native-tls 已废弃，自动归一到 rustls（功能等价）");
+                    crate::model::config::TlsBackend::Rustls
                 }
+                _ => crate::model::config::TlsBackend::Rustls,
             };
             if backend != config.tls_backend {
                 config.tls_backend = backend;
