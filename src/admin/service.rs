@@ -285,6 +285,8 @@ impl AdminService {
                 id: entry.id,
                 priority: entry.priority,
                 rpm_limit: entry.rpm_limit,
+                allowed_models: entry.allowed_models,
+                tested_models: entry.tested_models,
                 disabled: entry.disabled,
                 failure_count: entry.failure_count,
                 is_current: entry.id == snapshot.current_id,
@@ -452,6 +454,17 @@ impl AdminService {
     pub fn set_rpm_limit(&self, id: u64, rpm_limit: Option<u32>) -> Result<(), AdminServiceError> {
         self.token_manager
             .set_rpm_limit(id, rpm_limit)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 设置凭据级「允许模型」白名单（成本安全硬门；空=不限制）。
+    pub fn set_allowed_models(
+        &self,
+        id: u64,
+        models: Option<Vec<String>>,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_allowed_models(id, models)
             .map_err(|e| self.classify_error(e, id))
     }
 
@@ -781,6 +794,9 @@ impl AdminService {
             scopes: req.scopes,
             priority: req.priority,
             rpm_limit: req.rpm_limit,
+            // 新增号默认不设白名单（不限制）；上号后经 /credentials/{id}/allowed-models 单独设置。
+            allowed_models: None,
+            tested_models: None,
             region: req.region,
             auth_region: req.auth_region,
             api_region: req.api_region,
@@ -923,6 +939,7 @@ impl AdminService {
             default_endpoint: config.default_endpoint.clone(),
             endpoint_names,
             extract_thinking: config.extract_thinking,
+            cc_auto_buffer: config.cc_auto_buffer,
             strip_env_noise: config.strip_env_noise,
             cooldown_enabled: config.cooldown_enabled,
             rate_limit_enabled: config.rate_limit_enabled,
@@ -1014,6 +1031,8 @@ impl AdminService {
         let mut balance_task_changed = false;
         // TIER3 AppState 热更字段：extract_thinking 改后调 handlers setter 即时生效（不重启）。
         let mut extract_thinking_changed: Option<bool> = None;
+        // CC 自动切缓冲开关：改后调 handlers setter 即时生效（进程级镜像，不重启）。
+        let mut cc_auto_buffer_changed: Option<bool> = None;
         // 环境噪音剥离开关：改后调 converter setter 即时生效（进程级镜像，不重启）。
         let mut strip_env_noise_changed: Option<bool> = None;
 
@@ -1109,6 +1128,13 @@ impl AdminService {
             if v != config.extract_thinking {
                 config.extract_thinking = v;
                 extract_thinking_changed = Some(v);
+            }
+        }
+        // —— CC 自动切缓冲开关（TIER3 热更：改后调 handlers setter 即时生效不重启）——
+        if let Some(v) = req.cc_auto_buffer {
+            if v != config.cc_auto_buffer {
+                config.cc_auto_buffer = v;
+                cc_auto_buffer_changed = Some(v);
             }
         }
         // —— 环境噪音剥离开关（改后调 converter setter 即时生效不重启）——
@@ -1365,6 +1391,11 @@ impl AdminService {
             crate::anthropic::set_extract_thinking(v);
         }
 
+        // TIER3：CC 自动切缓冲开关立即应用到热路径进程级镜像（下一个流式请求即生效）
+        if let Some(v) = cc_auto_buffer_changed {
+            crate::anthropic::set_cc_auto_buffer(v);
+        }
+
         // 环境噪音剥离开关立即应用到 converter 进程级镜像（下一个请求即生效）
         if let Some(v) = strip_env_noise_changed {
             crate::anthropic::set_strip_env_noise(v);
@@ -1377,6 +1408,7 @@ impl AdminService {
             || login_bg_r18_changed.is_some()
             || fingerprint_changed.is_some()
             || extract_thinking_changed.is_some()
+            || cc_auto_buffer_changed.is_some()
             || strip_env_noise_changed.is_some();
         let restart_required = !restart_fields.is_empty();
         let message = if restart_required {

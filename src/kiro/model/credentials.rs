@@ -36,6 +36,18 @@ const SUPPORTED_KIRO_REGIONS: &[&str] = &[
 /// `access_token`/`refresh_token`/`client_secret`/`kiro_api_key`/`proxy_password`
 /// 属可直接复用的活凭证，一旦被 `{:?}` 打进日志即等于泄露。派生 Debug 会输出全部
 /// 明文——这里统一在类型层面脱敏，杜绝任何调用点（日志/错误链）意外泄密。
+/// 一次「测试可用模型」探测对单个模型的结果记录（持久化，供下次进测试页展示历史）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestedModel {
+    /// 被测的 kiro modelId（如 `deepseek-3.2`）
+    pub model: String,
+    /// 结果：`supported` / `unsupported` / `unknown`
+    pub status: String,
+    /// 测试时刻（RFC3339）
+    pub tested_at: String,
+}
+
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct KiroCredentials {
@@ -102,6 +114,24 @@ pub struct KiroCredentials {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rpm_limit: Option<u32>,
+
+    /// 凭据级「允许模型」白名单（成本安全硬门，可选）。
+    ///
+    /// None/空 = 不限制（该号可服务任意模型，兼容现有号）。设了就是**硬门**:该号**只**接
+    /// 白名单内的模型（值为 map_model 后的规范 kiro modelId，如 `deepseek-3.2`/`claude-opus-4.8`）。
+    /// 用途:把便宜模型（国产）的流量锁死在指定便宜号上——即使贵号也能跑国产，只要没在其白名单里
+    /// 就绝不会被选中，杜绝便宜请求溢出到贵号按贵号计费。选号唯一收敛点 is_entry_selectable 据此过滤。
+    /// ⚠️ 硬门语义:设太窄 + 号不够 → 该模型无号可用返错（防溢出优先于可用性，刻意如此）。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_models: Option<Vec<String>>,
+
+    /// 「测试可用模型」历史结果（探测打的标签，持久化）。下次进测试页可直接看到该号测过什么、
+    /// 结果如何，无需重测。每次探测覆盖写入。与 allowed_models 独立：这是"测过的事实"，
+    /// allowed_models 是"准用的硬门"；UI 可把测出 supported 的一键设为白名单。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tested_models: Option<Vec<TestedModel>>,
 
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
@@ -458,6 +488,19 @@ impl KiroCredentials {
         }
     }
 
+    /// 该号是否允许服务给定模型（成本安全白名单硬门）。
+    ///
+    /// `model` 为 map_model 后的规范 kiro modelId。未设白名单（None/空）→ 允许一切（兼容旧号）。
+    /// 设了白名单 → 仅当 model 在其中才允许（大小写不敏感）。用于 is_entry_selectable 过滤，
+    /// 确保便宜模型的请求绝不溢出到未列该模型的（更贵的）号。
+    pub fn allows_model(&self, model: &str) -> bool {
+        match &self.allowed_models {
+            None => true,
+            Some(list) if list.is_empty() => true,
+            Some(list) => list.iter().any(|m| m.eq_ignore_ascii_case(model)),
+        }
+    }
+
     /// 检查凭据是否支持 Opus 模型
     ///
     /// Free 账号不支持 Opus 模型，需要 PRO 或更高等级订阅
@@ -606,6 +649,29 @@ impl KiroCredentials {
 mod tests {
     use super::*;
     use crate::model::config::Config;
+
+    #[test]
+    fn test_allows_model_whitelist() {
+        // 无白名单 → 允许一切（兼容旧号）
+        let c = KiroCredentials::from_json(r#"{"refreshToken":"x"}"#).unwrap();
+        assert!(c.allows_model("claude-opus-4.8"));
+        assert!(c.allows_model("deepseek-3.2"));
+
+        // 空白名单 → 允许一切
+        let c = KiroCredentials::from_json(r#"{"refreshToken":"x","allowedModels":[]}"#).unwrap();
+        assert!(c.allows_model("claude-opus-4.8"));
+
+        // 设了白名单 → 仅白名单内允许（成本安全硬门）
+        let c = KiroCredentials::from_json(
+            r#"{"refreshToken":"x","allowedModels":["deepseek-3.2","glm-5"]}"#,
+        )
+        .unwrap();
+        assert!(c.allows_model("deepseek-3.2"), "白名单内应允许");
+        assert!(c.allows_model("glm-5"));
+        assert!(!c.allows_model("claude-opus-4.8"), "白名单外的贵模型绝不允许(防溢出)");
+        // 大小写不敏感
+        assert!(c.allows_model("DeepSeek-3.2"));
+    }
 
     #[test]
     fn test_region_from_profile_arn_valid() {
@@ -818,6 +884,8 @@ mod tests {
             scopes: None,
             priority: 0,
             rpm_limit: None,
+            allowed_models: None,
+            tested_models: None,
             region: None,
             auth_region: None,
             api_region: None,
@@ -941,6 +1009,8 @@ mod tests {
             scopes: None,
             priority: 0,
             rpm_limit: None,
+            allowed_models: None,
+            tested_models: None,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
             api_region: None,
@@ -977,6 +1047,8 @@ mod tests {
             scopes: None,
             priority: 0,
             rpm_limit: None,
+            allowed_models: None,
+            tested_models: None,
             region: None,
             auth_region: None,
             api_region: None,
@@ -1096,6 +1168,8 @@ mod tests {
             scopes: None,
             priority: 3,
             rpm_limit: None,
+            allowed_models: None,
+            tested_models: None,
             region: Some("us-west-2".to_string()),
             auth_region: None,
             api_region: None,
