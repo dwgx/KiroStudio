@@ -223,7 +223,11 @@ export const PROBE_MODEL_CATALOG: { id: string; mult: string }[] = [
 
 export async function probeAvailableModels(id: number, models?: string[]): Promise<ProbeModelsResponse> {
   const q = models && models.length ? `?models=${encodeURIComponent(models.join(','))}` : ''
-  const { data } = await api.get<ProbeModelsResponse>(`/credentials/${id}/models${q}`)
+  // 探测会对每个模型发真实生成请求(可耗时数十秒~数分钟),远超全局 15s 超时。
+  // 单独放宽到 5 分钟(后端每模型探测有自己的上游超时兜底,不会真无限挂)。
+  const { data } = await api.get<ProbeModelsResponse>(`/credentials/${id}/models${q}`, {
+    timeout: 300000,
+  })
   return data
 }
 

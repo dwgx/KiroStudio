@@ -22,7 +22,7 @@ use std::time::{Duration as StdDuration, Instant};
 
 use arc_swap::ArcSwap;
 
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{ProxyConfig, build_client, build_streaming_client};
 use crate::kiro::affinity::UserAffinityManager;
 use crate::kiro::cooldown::{CooldownManager, CooldownReason};use crate::kiro::machine_id;
 use crate::kiro::model::credentials::{KiroCredentials, TrashEntry};
@@ -3148,7 +3148,10 @@ impl MultiTokenManager {
         let body = kiro_req;
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let client = build_client(effective_proxy.as_ref(), 30, cfg.tls_backend)?;
+        // 探测要消费完整生成流,用 read_timeout(空闲间隔)而非总超时,否则慢模型生成中途被 30s
+        // 总超时掐断→误判 unknown/失败(与 mid-response 同类)。空闲上限 60s:探测请求 content="hi"
+        // 生成极短,只要上游在吐数据就不该超时;真卡死 60s 无数据才放弃,比对话路径更快止损。
+        let client = build_streaming_client(effective_proxy.as_ref(), 60, cfg.tls_backend)?;
         let mut request = client
             .post(&url)
             .header("content-type", "application/json")
