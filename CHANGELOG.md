@@ -2,6 +2,13 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.1] - 2026-07-11
+
+### 修复
+- **自定义 API 上号误报「请输入 Refresh Token」**：添加凭据选「自定义 API」时，提交校验的
+  非-api_key 分支会先要求 Refresh Token，导致自定义 API（本不需要 refresh token）永远卡在
+  这一步、走不到 base URL 校验。修为：custom_api 单独分支，只校验 base URL、不要 Refresh Token。
+
 ## [0.7.0] - 2026-07-11
 
 ### 新增（自定义 API 代挂透传）
