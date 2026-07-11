@@ -23,7 +23,7 @@ interface AddCredentialDialogProps {
   onOpenChange: (open: boolean) => void
 }
 
-type AuthMethod = 'social' | 'idc' | 'external_idp' | 'api_key'
+type AuthMethod = 'social' | 'idc' | 'external_idp' | 'api_key' | 'custom_api'
 type Tab = 'manual' | 'paste' | 'login'
 
 // 从字符串中挑第一个非空值
@@ -239,6 +239,10 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [issuerUrl, setIssuerUrl] = useState('')
   const [scopes, setScopes] = useState('')
   const [profileArn, setProfileArn] = useState('')
+  // 自定义 API 代挂透传字段
+  const [baseUrl, setBaseUrl] = useState('')
+  const [customApiKey, setCustomApiKey] = useState('')
+  const [requestLimit, setRequestLimit] = useState('')
   const [priority, setPriority] = useState('0')
   const [machineId, setMachineId] = useState('')
   const [proxyUrl, setProxyUrl] = useState('')
@@ -300,6 +304,10 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         toast.error('IdC/Builder-ID/IAM 认证需要填写 Client ID 和 Client Secret')
         return
       }
+      if (authMethod === 'custom_api' && !baseUrl.trim()) {
+        toast.error('自定义 API 需填写上游地址 base URL')
+        return
+      }
       if (authMethod === 'external_idp' && (!clientId.trim() || !tokenEndpoint.trim())) {
         toast.error('External IdP 需要 Client ID 和 Token Endpoint')
         return
@@ -319,6 +327,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         issuerUrl: authMethod === 'external_idp' ? issuerUrl.trim() || undefined : undefined,
         scopes: authMethod === 'external_idp' ? scopes.trim() || undefined : undefined,
         profileArn: authMethod === 'external_idp' ? profileArn.trim() || undefined : undefined,
+        baseUrl: authMethod === 'custom_api' ? baseUrl.trim() || undefined : undefined,
+        apiKey: authMethod === 'custom_api' ? customApiKey.trim() || undefined : undefined,
+        requestLimit: authMethod === 'custom_api' ? (parseInt(requestLimit) || undefined) : undefined,
         priority: parseInt(priority) || 0,
         machineId: machineId.trim() || undefined,
         proxyUrl: proxyUrl.trim() || undefined,
@@ -516,6 +527,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     { value: 'idc', label: 'IdC/Builder-ID/IAM' },
                     { value: 'external_idp', label: 'External IdP' },
                     { value: 'api_key', label: 'API Key' },
+                    { value: 'custom_api', label: '自定义 API（代挂透传）' },
                   ]}
                 />
               </div>
@@ -537,8 +549,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 </div>
               )}
 
-              {/* Refresh Token (OAuth 模式) */}
-              {!isApiKey && (
+              {/* Refresh Token (OAuth 模式；自定义 API 不需要) */}
+              {!isApiKey && authMethod !== 'custom_api' && (
                 <div className="space-y-2">
                   <label htmlFor="refreshToken" className="text-sm font-medium">
                     Refresh Token <span className="text-red-500">*</span>
@@ -551,6 +563,49 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     onChange={(e) => setRefreshToken(e.target.value)}
                     disabled={isPending}
                   />
+                </div>
+              )}
+
+              {/* 自定义 API 代挂透传：上游地址 + 密钥 + 请求上限 */}
+              {authMethod === 'custom_api' && (
+                <div className="space-y-3 rounded-md border border-border bg-secondary/20 p-3">
+                  <div className="text-xs text-muted-foreground">
+                    Anthropic 兼容上游中转站。请求原样透传到该地址、换用下面的密钥（零转换，效果等同直接用该 key）。
+                  </div>
+                  <div className="space-y-2">
+                    <label htmlFor="baseUrl" className="text-sm font-medium">
+                      上游地址 base URL <span className="text-red-500">*</span>
+                    </label>
+                    <Input
+                      id="baseUrl"
+                      placeholder="如 https://api.anthropic.com 或 https://你的中转站"
+                      value={baseUrl}
+                      onChange={(e) => setBaseUrl(e.target.value)}
+                      disabled={isPending}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label htmlFor="customApiKey" className="text-sm font-medium">上游密钥</label>
+                    <Input
+                      id="customApiKey"
+                      type="password"
+                      placeholder="上游 API Key（透传时替换）"
+                      value={customApiKey}
+                      onChange={(e) => setCustomApiKey(e.target.value)}
+                      disabled={isPending}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label htmlFor="requestLimit" className="text-sm font-medium">请求上限（0=不限）</label>
+                    <Input
+                      id="requestLimit"
+                      type="number"
+                      placeholder="累计请求数达到后自动禁用该凭据"
+                      value={requestLimit}
+                      onChange={(e) => setRequestLimit(e.target.value)}
+                      disabled={isPending}
+                    />
+                  </div>
                 </div>
               )}
 

@@ -479,8 +479,21 @@ pub async fn post_messages(
     State(state): State<AppState>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: axum::http::HeaderMap,
-    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
+    // 取**裸 body 字节**(而非 JsonExtractor):自定义 API 代挂需要原样透传原始请求体。
+    // Kiro 路径行为不变——下面立即从同一份字节解析出 MessagesRequest,与旧 JsonExtractor 等价。
+    raw_body: Bytes,
 ) -> Response {
+    // 先按原逻辑解析请求体(解析失败=400,与旧 JsonExtractor 的行为对齐)。
+    let mut payload: MessagesRequest = match serde_json::from_slice(&raw_body) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new("invalid_request_error", format!("请求体解析失败: {e}"))),
+            )
+                .into_response();
+        }
+    };
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
@@ -506,6 +519,16 @@ pub async fn post_messages(
                 .into_response();
         }
     };
+
+    // 混入池分流:选一次号,若命中自定义 API 凭据 → 原样透传原始请求体到其上游、直接返回。
+    // 选到 Kiro 号(或池中无自定义号)→ 返回 None,继续走下方原 Kiro 路径(行为完全不变)。
+    let user_id = payload.metadata.as_ref().and_then(|m| m.user_id.clone());
+    if let Some(resp) = provider
+        .try_custom_api_passthrough(raw_body.clone(), Some(&payload.model), user_id.as_deref())
+        .await
+    {
+        return resp;
+    }
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);

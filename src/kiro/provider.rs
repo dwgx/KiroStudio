@@ -204,6 +204,45 @@ impl KiroProvider {
         self.call_mcp_with_retry(request_body).await
     }
 
+    /// 混入池分流:选一次号,若命中「自定义 API」凭据则原样透传原始 Anthropic 请求体到其上游、
+    /// 返回 `Some(透传响应)`;若选到 Kiro 号(或无自定义号)则返回 `None`,由调用方走原 Kiro 路径。
+    ///
+    /// ⚠️ 与 Kiro 主路径隔离:本方法只在选到 custom_api 时接管;选到 Kiro 号时**立即释放**
+    /// (drop inflight 守卫)并返回 None,不影响后续 Kiro 正常选号/转发。`raw_body` 是**未经
+    /// Kiro 转换**的客户端原始请求体(透传要原样发)。
+    ///
+    /// `model` 供选号做模型过滤/亲和(与 Kiro 路径同源解析);命中自定义号时记一次请求(上限计数)。
+    pub async fn try_custom_api_passthrough(
+        &self,
+        raw_body: bytes::Bytes,
+        model: Option<&str>,
+        user_id: Option<&str>,
+    ) -> Option<axum::response::Response> {
+        // 仅当池中确实存在自定义 API 凭据时才尝试(否则直接放行 Kiro 路径,零开销)。
+        if !self.token_manager.has_custom_api_credential() {
+            return None;
+        }
+        let ctx = self
+            .token_manager
+            .acquire_context(model, user_id)
+            .await
+            .ok()?;
+        if !ctx.credentials.is_custom_api_credential() {
+            // 选到 Kiro 号:释放选号(inflight 守卫随 ctx drop -1),回退 Kiro 路径。
+            return None;
+        }
+        // 命中自定义号:计一次请求(达上限自动禁用),然后透传。inflight 守卫在透传返回后 drop。
+        self.token_manager.record_request(ctx.id);
+        let resp = crate::kiro::passthrough::forward(
+            &ctx.credentials,
+            raw_body,
+            self.global_proxy.as_ref(),
+            self.tls_backend,
+        )
+        .await;
+        Some(resp)
+    }
+
     /// 累加一次请求的真实 credit 花费到该凭据的生命周期累计（透传到 token_manager）。
     ///
     /// handler 在请求完成、从上游 meteringEvent 拿到真实计费量后调用；provider 持有
