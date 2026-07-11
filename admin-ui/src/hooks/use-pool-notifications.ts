@@ -40,6 +40,8 @@ function disabledReasonText(reason?: string): string {
       return '连续失败过多，已自动禁用'
     case 'RefreshTokenInvalid':
       return 'refreshToken 永久失效'
+    case 'SubscriptionInvalid':
+      return '订阅失效/降级（INVALID_MODEL_ID），已移出调度'
     case 'InvalidConfig':
       return '凭据配置不完整'
     case 'Manual':

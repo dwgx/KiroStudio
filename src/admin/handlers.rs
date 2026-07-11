@@ -307,6 +307,23 @@ pub async fn deep_verify_credential(
     }
 }
 
+/// GET /credentials/{id}/models —— 探测该凭据当前可用的模型列表（选中令牌后手动触发）。
+pub async fn probe_available_models(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.probe_available_models(id).await {
+        Ok(models) => {
+            let items: Vec<serde_json::Value> = models
+                .into_iter()
+                .map(|(model, supported)| serde_json::json!({ "model": model, "supported": supported }))
+                .collect();
+            Json(serde_json::json!({ "id": id, "models": items })).into_response()
+        }
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// GET /api/admin/credentials/:id/export
 /// 导出指定凭据的原始 JSON（令牌下载，含敏感字段）
 pub async fn export_credential(

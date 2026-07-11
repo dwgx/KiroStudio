@@ -297,6 +297,7 @@ impl AdminService {
                 email: entry.email,
                 subscription_title: entry.subscription_title,
                 success_count: entry.success_count,
+                total_credits_used: entry.total_credits_used,
                 last_used_at: entry.last_used_at.clone(),
                 has_proxy: entry.has_proxy,
                 proxy_url: entry.proxy_url,
@@ -1400,6 +1401,18 @@ impl AdminService {
     pub async fn deep_verify_credential(&self, id: u64) -> Result<(), AdminServiceError> {
         self.token_manager
             .deep_verify_credential(id)
+            .await
+            .map_err(|e| self.classify_balance_error(e, id))
+    }
+
+    /// 探测指定凭据当前可用的模型列表（选中令牌后手动触发）。
+    /// 返回 (model_id, supported) 列表。认证/账号级失败时返回 Err（前端提示先刷新/检查号）。
+    pub async fn probe_available_models(
+        &self,
+        id: u64,
+    ) -> Result<Vec<(String, bool)>, AdminServiceError> {
+        self.token_manager
+            .probe_available_models(id)
             .await
             .map_err(|e| self.classify_balance_error(e, id))
     }

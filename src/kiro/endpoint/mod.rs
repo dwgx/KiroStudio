@@ -78,6 +78,16 @@ pub trait KiroEndpoint: Send + Sync {
         default_is_client_validation_error(body)
     }
 
+    /// 判断响应体是否表示"该凭据不能服务此模型"（`INVALID_MODEL_ID`）。
+    ///
+    /// 典型成因：该号的订阅被上游取消/降级，原本能用的模型（如 opus）不再对它开放，
+    /// 上游返回 `400 INVALID_MODEL_ID`。这**不是**客户端请求错误——换一个订阅仍有效的
+    /// 号往往能成功。因此命中时应：给该号冷却 + failover 到别的号（而非直接把 400 透传给
+    /// 客户端、坏号还留在轮转里反复命中）。若**所有**号都返回它，才是模型本身无效，透传。
+    fn is_invalid_model_id(&self, body: &str) -> bool {
+        default_is_invalid_model_id(body)
+    }
+
     /// 从错误响应中提取上游给出的重置时间（秒）
     ///
     /// 某些上游把真实重置时间放在 body 里（如 `resets_in_seconds` / `resets_at` epoch），
@@ -85,6 +95,27 @@ pub trait KiroEndpoint: Send + Sync {
     fn extract_retry_after_secs(&self, body: &str) -> Option<u64> {
         default_extract_retry_after_secs(body)
     }
+}
+
+/// 默认的 INVALID_MODEL_ID 判断逻辑（识别顶层 `reason` 与嵌套 `error.reason`）。
+pub fn default_is_invalid_model_id(body: &str) -> bool {
+    if body.contains("INVALID_MODEL_ID") {
+        return true;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    if value
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .is_some_and(|v| v == "INVALID_MODEL_ID")
+    {
+        return true;
+    }
+    value
+        .pointer("/error/reason")
+        .and_then(|v| v.as_str())
+        .is_some_and(|v| v == "INVALID_MODEL_ID")
 }
 
 /// 装饰请求时可用的上下文
