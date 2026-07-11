@@ -23,7 +23,7 @@
 //! ```
 
 pub mod compressor;
-mod converter;
+pub(crate) mod converter;
 mod handlers;
 mod middleware;
 mod router;

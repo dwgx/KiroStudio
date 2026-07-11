@@ -102,13 +102,48 @@ pub fn split_proxy_credentials(raw: &str) -> (String, Option<String>, Option<Str
 ///
 /// # Returns
 /// 配置好的 reqwest::Client
+/// 构建**流式专用** HTTP Client（对话路径）。
+///
+/// 与 [`build_client`] 的关键区别：用 `read_timeout`（两次数据之间的**空闲间隔**上限）
+/// 替代 `.timeout()`（整个请求生命周期的**总时长**上限）。
+///
+/// 根因（2026-07-11 定位 `Connection closed mid-response`）：reqwest 的 `.timeout()` 覆盖
+/// 读取响应体全过程，对流式是致命的——一个健康但耗时长的大请求（opus 大 prompt / 64k
+/// max_tokens，生成可超 12 分钟）会在**流中途被硬掐**，上游流没读完就断，我方转出的 SSE
+/// 随之断裂，下游客户端报 `Connection closed mid-response` 并疯狂重试。
+///
+/// 改用 `read_timeout` 后：只要上游持续吐数据（token/ping），流就永不被超时掐断；只有真正
+/// **卡死**（`idle_secs` 内一个字节都没来）才中断——这才是流式该有的语义。另设一个宽松的
+/// `connect_timeout` 防连不上时无限等。
+pub fn build_streaming_client(
+    proxy: Option<&ProxyConfig>,
+    idle_secs: u64,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<Client> {
+    let mut builder = Client::builder()
+        .read_timeout(Duration::from_secs(idle_secs))
+        .connect_timeout(Duration::from_secs(30));
+    builder = apply_tls_and_proxy(builder, proxy, tls_backend)?;
+    Ok(builder.build()?)
+}
+
 pub fn build_client(
     proxy: Option<&ProxyConfig>,
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
-    let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+    let builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+    let builder = apply_tls_and_proxy(builder, proxy, tls_backend)?;
+    Ok(builder.build()?)
+}
 
+/// 把 TLS 后端选择 + 可选代理（含账密）应用到 builder 上（[`build_client`] /
+/// [`build_streaming_client`] 共用，避免两处逻辑漂移）。
+fn apply_tls_and_proxy(
+    mut builder: reqwest::ClientBuilder,
+    proxy: Option<&ProxyConfig>,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<reqwest::ClientBuilder> {
     match tls_backend {
         TlsBackend::Rustls => {
             builder = builder.use_rustls_tls();
@@ -127,17 +162,14 @@ pub fn build_client(
 
     if let Some(proxy_config) = proxy {
         let mut proxy = Proxy::all(&proxy_config.url)?;
-
-        // 设置代理认证
         if let (Some(username), Some(password)) = (&proxy_config.username, &proxy_config.password) {
             proxy = proxy.basic_auth(username, password);
         }
-
         builder = builder.proxy(proxy);
         tracing::debug!("HTTP Client 使用代理: {}", proxy_config.url);
     }
 
-    Ok(builder.build()?)
+    Ok(builder)
 }
 
 #[cfg(test)]
