@@ -259,6 +259,7 @@ export interface ConfigSnapshotResponse {
   hasProxy: boolean
   proxyUrl?: string
   hasAdminKey: boolean
+  hasApiKey: boolean
   callbackMode: string
   callbackBaseUrl?: string
   // 反代安全（批次3）
@@ -302,6 +303,8 @@ export interface UpdateConfigRequest {
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
+  /** userKey（对话 api_key）：留空不改，填了更新，需重启生效 */
+  apiKey?: string
   callbackBaseUrl?: string
   // 反代安全（批次3，整表替换语义）
   corsAllowedOrigins?: string[]
