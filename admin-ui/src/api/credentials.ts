@@ -109,6 +109,20 @@ export async function setCredentialRpmLimit(
   return data
 }
 
+// 设置凭据「允许模型」白名单（成本安全硬门；传空数组/null = 不限制）。
+// 值为 kiro modelId（如 ['deepseek-3.2','glm-5']）。设了就是硬门：该号只接白名单内模型，
+// 便宜模型的流量被锁在指定号上，绝不溢出到未列该模型的（更贵）号。
+export async function setCredentialAllowedModels(
+  id: number,
+  allowedModels: string[] | null
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/allowed-models`,
+    { allowedModels: allowedModels && allowedModels.length ? allowedModels : null }
+  )
+  return data
+}
+
 // 设置凭据别名/备注（传空字符串清除）
 export async function setCredentialName(
   id: number,
