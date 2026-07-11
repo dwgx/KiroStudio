@@ -247,6 +247,8 @@ export interface ExternalIdpLeg2Response {
 
 // 服务端配置（敏感字段已脱敏）
 export interface ConfigSnapshotResponse {
+  /** 服务端真实版本(编译期注入),侧边栏据此展示,不再硬编码 */
+  serverVersion: string
   host: string
   port: number
   region: string
