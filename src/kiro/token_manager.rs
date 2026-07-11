@@ -1305,6 +1305,25 @@ impl MultiTokenManager {
             .any(|e| !e.disabled && e.credentials.is_custom_api_credential())
     }
 
+    /// 为透传选一个可用的「自定义 API」凭据(独立于 Kiro 选号)。
+    ///
+    /// 只从 custom_api 号里选,按优先级(priority 小优先)、跳过禁用/冷却的。命中返回其
+    /// (id, credentials) 供透传;无可用返回 None(调用方回退 Kiro 路径)。
+    /// 与 Kiro 的 is_entry_selectable 彻底分离——Kiro 选号已排除 custom_api,此处只管 custom_api。
+    pub fn select_custom_api(&self) -> Option<(u64, KiroCredentials)> {
+        let entries = self.entries.lock();
+        let cooldown_on = self.cooldown_enabled.load(Ordering::Relaxed);
+        entries
+            .iter()
+            .filter(|e| {
+                !e.disabled
+                    && e.credentials.is_custom_api_credential()
+                    && (!cooldown_on || self.cooldown.is_available(e.id))
+            })
+            .min_by_key(|e| (e.credentials.priority, e.inflight.load(Ordering::Acquire)))
+            .map(|e| (e.id, e.credentials.clone()))
+    }
+
     /// 记一次请求(自定义 API 代挂计数)。累计达到 `request_limit` 时自动禁用该凭据
     /// (reason=RequestLimitReached),防止代挂 key 跑量超预算。limit=None/0 表示不限。
     pub fn record_request(&self, id: u64) {
@@ -1498,6 +1517,12 @@ impl MultiTokenManager {
     /// 以保证 `inflight += 1` 相对其它并发选号是原子可见的。
     fn is_entry_selectable(&self, entry: &CredentialEntry, is_opus: bool, model: &str) -> bool {
         if entry.disabled {
+            return false;
+        }
+        // ⭐自定义 API 代挂号**绝不进 Kiro 选号**:它不是 Kiro 号,当 Kiro 号打 CodeWhisperer 端点
+        // 会 403 认证失败→被误冷却(实测 #87 就这样被冷却 86400s)。它只由透传路径(select_custom_api)
+        // 单独选号。这是"混入池但分流"的关键隔离:Kiro 路径永不碰 custom_api,custom_api 路径永不碰 Kiro。
+        if entry.credentials.is_custom_api_credential() {
             return false;
         }
         if is_opus && !entry.credentials.supports_opus() {
