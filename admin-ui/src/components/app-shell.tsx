@@ -69,7 +69,7 @@ export function AppShell({ onLogout }: AppShellProps) {
           <h1 className="text-xl font-bold text-gradient-brand">
             KiroStudio
           </h1>
-          <p className="text-xs text-[#666] mt-1">Admin Panel v0.6.2</p>
+          <p className="text-xs text-[#666] mt-1">Admin Panel v0.6.3</p>
         </div>
 
         {/* Main Nav */}

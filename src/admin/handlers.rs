@@ -311,8 +311,16 @@ pub async fn deep_verify_credential(
 pub async fn probe_available_models(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    match state.service.probe_models(id, None).await {
+    // 可选 ?models=a,b,c 指定要测的模型；不传则用默认候选清单。
+    let models: Option<Vec<String>> = params.get("models").map(|s| {
+        s.split(',')
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+            .collect()
+    });
+    match state.service.probe_models(id, models).await {
         Ok((detail, total_credits)) => {
             let items: Vec<serde_json::Value> = detail
                 .into_iter()
