@@ -9,21 +9,32 @@
 //! 相较 WindsurfAPI 额外加了一道**它没有的安全线**：下载的二进制必须过 **sha256 校验**——
 //! 换的是可执行文件，不校验 = 镜像/中间人替换二进制即 RCE。这是唯一不可省的安全点。
 //!
-//! 应用更新：写入 `<exe>.new` → 原子 rename 覆盖运行中的 exe（Linux 允许）→ 复用
-//! `AdminService::restart_service`（exit(0) 交给 systemd `Restart=always` 拉起新二进制）。
-//! 替换前备份 `<exe>.bak`，供启动自检失败时回滚兜底。
+//! 应用更新（平台差异，见 `perform_update`）：
+//! - **Linux/macOS**：写 `<exe>.new` → 备份 `<exe>.bak` → 原子 rename 覆盖运行中的 exe →
+//!   复用 `AdminService::restart_service`（exit(0) 交给 systemd `Restart=always` 拉起新二进制）。
+//! - **Windows**：不能覆盖运行中的 exe，改用「rename 旧 exe→.bak（备份+腾路径）→ rename
+//!   .new→原路径」，重启由 start.bat/run.bat 的监督循环按原路径拉起新二进制（exit(0) 即重拉）。
 //!
-//! ⚠️ 平台差异：rename 运行中 exe 仅 Linux 可行；本机 Windows 开发跑不了（文件占用），
-//! 只能在 CI/Linux 部署验证（同"本机 npm build 假绿"规矩）。
+//! OTA 资产按运行平台自动选择（`ASSET_BIN`）：Windows 下 `kirostudio-windows-x86_64.exe`，
+//! 其余 `kirostudio-linux-x86_64`。下错平台的二进制即便 sha256 自洽也无法运行，故必须匹配。
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 /// 上游仓库（owner/repo）。发布产物见 .github/workflows/release.yml：
-/// `kirostudio-linux-x86_64` + `kirostudio-linux-x86_64.sha256`。
+/// `kirostudio-linux-x86_64`(+.sha256) 与 `kirostudio-windows-x86_64.exe`(+.sha256)。
 const GITHUB_REPO: &str = "dwgx/KiroStudio";
-/// 发布的二进制资产名（musl 静态链接，见 release.yml）。
+
+/// 本平台对应的发布二进制资产名（按目标平台编译期选择）。
+///
+/// release.yml 会同时产出 Linux(musl) 与 Windows(msvc) 两个资产。OTA 必须下载**与当前
+/// 运行平台匹配**的那一个——否则 Windows 上会下到 Linux ELF（下错架构），即便 sha256
+/// 校验通过（下的和它自己的哈希对得上），替换后也无法运行。历史 bug：此处曾硬编码
+/// Linux 资产名，导致 Windows 用户点面板 OTA 必然下错包。
+#[cfg(target_os = "windows")]
+const ASSET_BIN: &str = "kirostudio-windows-x86_64.exe";
+#[cfg(not(target_os = "windows"))]
 const ASSET_BIN: &str = "kirostudio-linux-x86_64";
 /// 本地版本（编译期注入 Cargo.toml 的 version）。
 const LOCAL_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -366,11 +377,11 @@ pub async fn perform_update(target: Option<String>) -> anyhow::Result<UpdatePerf
     }
     tracing::info!("[Update] sha256 校验通过");
 
-    // 4) 备份当前 exe + 原子替换（Linux 允许 rename 运行中的 exe）
+    // 4) 备份当前 exe + 替换。平台差异（运行中 exe 的替换方式不同）：
     let exe = std::env::current_exe()?;
     let bak = exe.with_extension("bak");
     let new = exe.with_extension("new");
-    // 先写 .new（同目录，保证 rename 是同一文件系统的原子操作）
+    // 先写 .new（同目录，保证后续 rename 是同一文件系统的原子操作）
     tokio::fs::write(&new, &bin).await?;
     // 赋可执行权限（Unix）
     #[cfg(unix)]
@@ -380,13 +391,41 @@ pub async fn perform_update(target: Option<String>) -> anyhow::Result<UpdatePerf
         perm.set_mode(0o755);
         tokio::fs::set_permissions(&new, perm).await?;
     }
-    // 备份现役 exe（供启动自检失败时 systemd ExecStartPre 回滚兜底）。
-    // ⚠️ 备份失败必须 abort：若无 .bak 就 rename 替换，回滚网彻底失效（崩了没得回滚）。
-    // fail-safe 优于 fail-open——宁可本次不升级，也不留一个无回滚点的替换。
-    tokio::fs::copy(&exe, &bak).await.map_err(|e| {
-        anyhow::anyhow!("备份现役二进制到 {bak:?} 失败，已中止升级（不留无回滚点的替换）: {e}")
-    })?;
-    tokio::fs::rename(&new, &exe).await?;
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // Linux/macOS：允许 rename 覆盖运行中的 exe（inode 语义）。
+        // 备份现役 exe（供启动自检失败时 systemd ExecStartPre 回滚兜底）。
+        // ⚠️ 备份失败必须 abort：若无 .bak 就 rename 替换，回滚网彻底失效（崩了没得回滚）。
+        // fail-safe 优于 fail-open——宁可本次不升级，也不留一个无回滚点的替换。
+        tokio::fs::copy(&exe, &bak).await.map_err(|e| {
+            anyhow::anyhow!("备份现役二进制到 {bak:?} 失败，已中止升级（不留无回滚点的替换）: {e}")
+        })?;
+        tokio::fs::rename(&new, &exe).await?;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Windows：**不能覆盖**运行中的 .exe（文件被独占锁定，rename over 会 os error 5），
+        // 但**可以把运行中的 .exe 改名移走**。故用「移走旧的 → 新的顶上」的 Windows 惯用法：
+        //   1) rename(exe → .bak)：把正在运行的 exe 改名为 .bak（既是备份、又腾出原路径）；
+        //   2) rename(.new → exe)：把新二进制放到原路径。
+        // 重启由 start.bat / run.bat 的监督循环负责：进程 exit(0) 后脚本按**原路径**重新拉起，
+        // 拉起的就是新二进制。若第 2 步失败，尽力回滚（把 .bak 改回来），不留下缺失的 exe。
+        // 先清理可能残留的旧 .bak（上次升级留下的），否则 rename 到已存在路径在 Windows 会失败。
+        let _ = tokio::fs::remove_file(&bak).await;
+        tokio::fs::rename(&exe, &bak).await.map_err(|e| {
+            anyhow::anyhow!("移走现役二进制到 {bak:?} 失败，已中止升级（未改动运行中的 exe）: {e}")
+        })?;
+        if let Err(e) = tokio::fs::rename(&new, &exe).await {
+            // 新二进制没顶上：尽力把旧的改名回来，避免原路径缺失导致重启后无 exe 可拉。
+            let _ = tokio::fs::rename(&bak, &exe).await;
+            let _ = tokio::fs::remove_file(&new).await;
+            return Err(anyhow::anyhow!(
+                "替换二进制失败，已回滚到原版本（未升级）: {e}"
+            ));
+        }
+    }
     tracing::warn!("[Update] 二进制已替换为 {tag}（备份在 {bak:?}），待重启生效");
 
     Ok(UpdatePerformResult {

@@ -2,6 +2,27 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.6.6] - 2026-07-11
+
+### 修复（v0.6.5 出厂构建随附的三处真实缺陷）
+- **TLS 后端统一为 rustls，消除「切 native-tls 废网关」的雷**：v0.6.5 起出厂二进制一律
+  `--no-default-features`（纯 rustls），不含 native-tls 后端；但设置页仍留着可点的「native-tls」
+  按钮，用户点它保存并重启后，所有上游调用（刷 token / 转发）会命中 `bail!` 全部失败、网关直接废，
+  只能手改 config.json 才能救回。三重根治：① 设置页移除 native-tls 按钮，TLS 后端改为只读展示
+  `rustls`；② 后端 `http_client` 遇 `native-tls` 配置**静默回退 rustls**（不再 `bail`），兜底旧
+  `config.json`；③ 保存配置时对任何非 rustls 值归一到 rustls，不再把死后端持久化。rustls 内置
+  webpki + 系统根证书，功能等价，回退无副作用。
+- **Windows 面板「OTA 在线更新」修好**：OTA 资产名此前硬编码 Linux（`kirostudio-linux-x86_64`），
+  Windows 用户点面板升级会下载 Linux ELF（下错平台，即便 sha256 自洽也无法运行）、再试图覆盖
+  运行中的 `.exe`（Windows 锁定，失败）。两处根治：① 资产名按运行平台编译期选择（Windows 取
+  `kirostudio-windows-x86_64.exe`）；② 替换步骤按平台分流——Windows 用「rename 旧 exe→.bak（备份+
+  腾路径）→ rename 新 exe→原路径」绕开文件锁，重启由 start.bat/run.bat 监督循环按原路径拉起新
+  二进制；替换失败自动回滚，不留缺失的 exe。至此 Windows 面板一键升级真正可用。
+- **CI 增加出厂构建测试门禁**：此前 `cargo test` 只跑默认特性（native-tls），从未覆盖真正发布的
+  `--no-default-features`（纯 rustls）构建 = 出厂配置存在测试盲区。`release.yml` 新增 `test` 任务，
+  在构建任何产物前先以出厂特性跑全量测试（492 通过），Linux/Windows 两个 build 任务均 `needs` 它，
+  测试不过不发布。
+
 ## [0.6.5] - 2026-07-11
 
 ### 新增（Windows 本机部署，纯增量层，不改任何 `src/` 运行逻辑）
