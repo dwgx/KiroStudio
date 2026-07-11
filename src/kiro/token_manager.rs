@@ -3110,18 +3110,42 @@ impl MultiTokenManager {
         let x_amz_user_agent =
             format!("aws-sdk-js/1.0.34 KiroIDE-{}-{}", cfg.kiro_version, machine_id);
 
-        // 带 modelId 的最小请求体：只为触发上游对"该号能否用此模型"的判定。
-        let mut body = serde_json::json!({
-            "conversationState": {
-                "conversationId": uuid::Uuid::new_v4().to_string(),
-                "currentMessage": {
-                    "userInputMessage": { "content": "hi", "modelId": model_id }
-                }
-            }
-        });
+        // 构造**与真实对话同构**的合法请求体（关键修复）：此前手搓的最小体缺 chatTriggerType/
+        // origin 等必填字段，上游一律回通用 400（与"模型没权限"无关），导致探测非全绿即全红、
+        // 且拿不到 credits。改为复用 converter::convert_request 生成完整 ConversationState，
+        // 再把 modelId 覆盖成探测目标（探测直发原生 id，不经 map_model），这样上游才会真正走到
+        // "该号能否用此模型"的判定：有权限→200+meteringEvent 计费流，无权限→INVALID_MODEL_ID。
+        use crate::anthropic::converter::convert_request;
+        use crate::anthropic::types::MessagesRequest;
+        let probe_req = MessagesRequest {
+            model: "claude-sonnet-4.5".to_string(), // 仅用于过 convert_request 合法性；下面覆盖 modelId
+            max_tokens: 16,
+            messages: vec![crate::anthropic::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!("hi"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let mut conv = convert_request(&probe_req)
+            .map_err(|e| anyhow::anyhow!("构造探测请求失败: {:?}", e))?
+            .conversation_state;
+        // 覆盖为探测目标模型 id（原生 Kiro modelId，如 qwen3-coder-next / claude-opus-4.8）
+        conv.current_message.user_input_message.model_id = model_id.to_string();
+        let mut kiro_req = serde_json::to_value(&crate::kiro::model::requests::kiro::KiroRequest {
+            conversation_state: conv,
+            profile_arn: None,
+        })?;
+        // profileArn 注入：与对话路径统一口径（idc/social 回退默认，external_idp 用真实 arn）
         if let Some(arn) = credentials.effective_profile_arn() {
-            body["profileArn"] = serde_json::Value::String(arn);
+            kiro_req["profileArn"] = serde_json::Value::String(arn);
         }
+        let body = kiro_req;
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
         let client = build_client(effective_proxy.as_ref(), 30, cfg.tls_backend)?;

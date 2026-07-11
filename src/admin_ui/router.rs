@@ -53,9 +53,9 @@ static BG_POOL: OnceLock<BgPool> = OnceLock::new();
 static LOGIN_BG_ENABLED: AtomicU64 = AtomicU64::new(1);
 
 /// 登录页背景是否走 R18 图源（`login_background_r18` 的运行时镜像）。
-/// 默认 1=开启（r18=1）；由 main 在启动时按配置写入，支持后续被 update_config 立即改写。
+/// **默认 0=关闭（r18=0 全年龄）**；由 main 在启动时按配置写入，支持后续被 update_config 立即改写。
 /// 下一轮后台预取 / 池空实时兜底拉取时读取此镜像决定 r18 参数。
-static LOGIN_BG_R18: AtomicU64 = AtomicU64::new(1);
+static LOGIN_BG_R18: AtomicU64 = AtomicU64::new(0);
 
 fn bg_pool() -> &'static BgPool {
     BG_POOL.get_or_init(|| BgPool {

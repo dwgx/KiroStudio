@@ -207,8 +207,23 @@ export interface ProbeModelsResponse {
   /** 本次探测总花费 credits */
   totalCredits: number
 }
-export async function probeAvailableModels(id: number): Promise<ProbeModelsResponse> {
-  const { data } = await api.get<ProbeModelsResponse>(`/credentials/${id}/models`)
+/** 全部可探测的候选模型（真实 Kiro modelId，从便宜到贵；供 UI 勾选）。 */
+export const PROBE_MODEL_CATALOG: { id: string; mult: string }[] = [
+  { id: 'qwen3-coder-next', mult: '0.05x' },
+  { id: 'minimax-m2.1', mult: '0.15x' },
+  { id: 'deepseek-3.2', mult: '0.25x' },
+  { id: 'minimax-m2.5', mult: '0.25x' },
+  { id: 'claude-haiku-4.5', mult: '0.40x' },
+  { id: 'glm-5', mult: '0.50x' },
+  { id: 'claude-sonnet-4.5', mult: '1.30x' },
+  { id: 'claude-sonnet-4.6', mult: '1.30x' },
+  { id: 'claude-opus-4.6', mult: '2.20x' },
+  { id: 'claude-opus-4.8', mult: '2.20x' },
+]
+
+export async function probeAvailableModels(id: number, models?: string[]): Promise<ProbeModelsResponse> {
+  const q = models && models.length ? `?models=${encodeURIComponent(models.join(','))}` : ''
+  const { data } = await api.get<ProbeModelsResponse>(`/credentials/${id}/models${q}`)
   return data
 }
 
