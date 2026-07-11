@@ -206,6 +206,7 @@ interface FormState {
   loadBalancingMode: string
   defaultEndpoint: string
   extractThinking: boolean
+  ccAutoBuffer: boolean
   stripEnvNoise: boolean
   cooldownEnabled: boolean
   rateLimitEnabled: boolean
@@ -262,6 +263,7 @@ function toForm(c: ConfigSnapshotResponse): FormState {
     loadBalancingMode: c.loadBalancingMode,
     defaultEndpoint: c.defaultEndpoint,
     extractThinking: c.extractThinking,
+    ccAutoBuffer: c.ccAutoBuffer,
     stripEnvNoise: c.stripEnvNoise,
     cooldownEnabled: c.cooldownEnabled,
     rateLimitEnabled: c.rateLimitEnabled,
@@ -1323,6 +1325,7 @@ export function SettingsPage() {
     if (form.loadBalancingMode !== config.loadBalancingMode) d.loadBalancingMode = form.loadBalancingMode
     if (form.defaultEndpoint.trim() !== config.defaultEndpoint) d.defaultEndpoint = form.defaultEndpoint.trim()
     if (form.extractThinking !== config.extractThinking) d.extractThinking = form.extractThinking
+    if (form.ccAutoBuffer !== config.ccAutoBuffer) d.ccAutoBuffer = form.ccAutoBuffer
     if (form.stripEnvNoise !== config.stripEnvNoise) d.stripEnvNoise = form.stripEnvNoise
     if (form.cooldownEnabled !== config.cooldownEnabled) d.cooldownEnabled = form.cooldownEnabled
     if (form.rateLimitEnabled !== config.rateLimitEnabled) d.rateLimitEnabled = form.rateLimitEnabled
@@ -1584,6 +1587,9 @@ export function SettingsPage() {
           </Field>
           <Field label="提取 thinking" hint="非流式响应解析 thinking 块（保存即时生效，无需重启）">
             <Switch checked={form.extractThinking} onCheckedChange={(v) => set('extractThinking', v)} />
+          </Field>
+          <Field label="Claude Code 自动切协议" hint="识别到 Claude Code 请求时，/v1 流式自动走缓冲分发（准确 input_tokens，等价 /cc/v1），CC 无需手动改端点（保存即时生效，无需重启）">
+            <Switch checked={form.ccAutoBuffer} onCheckedChange={(v) => set('ccAutoBuffer', v)} />
           </Field>
           <Field label="剥离环境噪音" hint="转发前剥离 system 里每请求漂移的 env/git/模型名等噪音，省 token 提缓存降关联（保存即时生效，无需重启）">
             <Switch checked={form.stripEnvNoise} onCheckedChange={(v) => set('stripEnvNoise', v)} />

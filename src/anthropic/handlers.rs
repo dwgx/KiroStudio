@@ -87,6 +87,36 @@ fn extract_thinking_enabled() -> bool {
     EXTRACT_THINKING.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Claude Code 自动切缓冲协议开关（进程级镜像，admin 热更即时生效）。默认 true。
+///
+/// 开启时：`/v1/messages` 若识别到请求来自 Claude Code，流式响应自动改走 buffered 分发
+/// （与 `/cc/v1` 同款），使 message_start 的 input_tokens 用上游 contextUsageEvent 的准确值——
+/// CC 会校验该字段。这样 CC 直接打 `/v1` 也能拿到正确行为，无需用户手动改用 `/cc/v1` 端点。
+static CC_AUTO_BUFFER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// 设置 CC 自动切缓冲开关（main 启动接线 / admin 热更调用，立即生效）。
+pub fn set_cc_auto_buffer(enabled: bool) {
+    CC_AUTO_BUFFER.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn cc_auto_buffer_enabled() -> bool {
+    CC_AUTO_BUFFER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 从入站请求头识别请求是否来自 Claude Code。
+///
+/// 两个信号（任一命中即判为 CC）：
+/// - `x-anthropic-billing-header`：CC 专属归因头（converter.rs 已处理该前缀），最强信号。
+/// - User-Agent 经 `usage::classify_device` 判为 `claude-code` 类（唯一真源，避免此处重复
+///   维护 UA 关键字列表导致与设备分类逻辑静默漂移）。
+fn is_claude_code_request(headers: &axum::http::HeaderMap) -> bool {
+    if headers.contains_key("x-anthropic-billing-header") {
+        return true;
+    }
+    let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
+    crate::usage::classify_device(ua).as_deref() == Some("claude-code")
+}
+
 /// 输入压缩配置的进程级镜像（TIER3 热更）。
 ///
 /// `CompressionConfig` 非标量（阈值 + 开关），用 `ArcSwap` 承载：admin 改配置时整份原子换、
@@ -387,6 +417,53 @@ pub async fn get_models() -> impl IntoResponse {
             model_type: "chat".to_string(),
             max_tokens: 64000,
         },
+        // 国产模型：Kiro 上游直收原生 modelId（倍率远低于 claude，见 kiro-model-catalog）。
+        // id 直接用 Kiro 规范 modelId，客户端选它即原样透传上游。窗口 200k。
+        Model {
+            id: "deepseek-3.2".to_string(),
+            object: "model".to_string(),
+            created: 1759104000,
+            owned_by: "deepseek".to_string(),
+            display_name: "DeepSeek V3.2".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "glm-5".to_string(),
+            object: "model".to_string(),
+            created: 1759104000,
+            owned_by: "zhipu".to_string(),
+            display_name: "GLM-5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "qwen3-coder-next".to_string(),
+            object: "model".to_string(),
+            created: 1759104000,
+            owned_by: "qwen".to_string(),
+            display_name: "Qwen3 Coder Next".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "minimax-m2.5".to_string(),
+            object: "model".to_string(),
+            created: 1759104000,
+            owned_by: "minimax".to_string(),
+            display_name: "MiniMax M2.5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "minimax-m2.1".to_string(),
+            object: "model".to_string(),
+            created: 1759104000,
+            owned_by: "minimax".to_string(),
+            display_name: "MiniMax M2.1".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
     ];
 
     Json(ModelsResponse {
@@ -515,17 +592,33 @@ pub async fn post_messages(
     let tool_name_map = conversion_result.tool_name_map;
 
     if payload.stream {
-        // 流式响应
-        handle_stream_request(
-            provider,
-            &request_body,
-            &payload.model,
-            input_tokens,
-            thinking_enabled,
-            tool_name_map,
-            client,
-        )
-        .await
+        // 流式响应。CC 自动切协议：识别到 Claude Code 且开关开启时，改走 buffered 分发
+        // （等价 /cc/v1），让 message_start 的 input_tokens 用上游准确值——CC 会校验它。
+        // 这样 CC 直接打 /v1 也能拿到正确行为，无需手动改用 /cc/v1 端点。
+        if cc_auto_buffer_enabled() && is_claude_code_request(&headers) {
+            tracing::debug!("识别到 Claude Code 请求，/v1 流式自动切换为 buffered 分发（准确 input_tokens）");
+            handle_stream_request_buffered(
+                provider,
+                &request_body,
+                &payload.model,
+                input_tokens,
+                thinking_enabled,
+                tool_name_map,
+                client,
+            )
+            .await
+        } else {
+            handle_stream_request(
+                provider,
+                &request_body,
+                &payload.model,
+                input_tokens,
+                thinking_enabled,
+                tool_name_map,
+                client,
+            )
+            .await
+        }
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = extract_thinking_enabled() && thinking_enabled;
@@ -650,11 +743,27 @@ fn create_sse_stream(
                             for result in decoder.decode_iter() {
                                 match result {
                                     Ok(frame) => {
-                                        if let Ok(event) = Event::from_frame(frame) {
-                                            // process_kiro_event 内部对 in-band Event::Error/Exception
-                                            // 会置 completion 失败态并内联返回 SSE error 事件。
-                                            let sse_events = ctx.process_kiro_event(&event);
-                                            events.extend(sse_events);
+                                        // from_frame 按值吞 frame，事件类型须在 move 前先拥有化捕获。
+                                        let et = frame.event_type().map(|s| s.to_string());
+                                        match Event::from_frame(frame) {
+                                            Ok(event) => {
+                                                // process_kiro_event 内部对 in-band Event::Error/Exception
+                                                // 会置 completion 失败态并内联返回 SSE error 事件。
+                                                let sse_events = ctx.process_kiro_event(&event);
+                                                events.extend(sse_events);
+                                            }
+                                            Err(err) => {
+                                                // 帧层解码成功、Frame→Event 反序列化失败：
+                                                // toolUseEvent 失败意味着工具调用不可恢复丢失，置 DecoderStopped
+                                                // 失败态（收尾靠 None 分支补发 SSE error），避免截断被当成功不重试；
+                                                // 非 tool 帧解析失败历史上就允许被忽略，仅告警不置失败态，防误伤正常流。
+                                                if et.as_deref() == Some("toolUseEvent") {
+                                                    tracing::warn!("toolUseEvent 帧解析失败,按响应截断处理: {}", err);
+                                                    ctx.mark_decoder_stopped(format!("toolUseEvent 帧解析失败: {}", err));
+                                                } else {
+                                                    tracing::warn!("事件帧解析失败(event_type={:?}),已忽略: {}", et.as_deref(), err);
+                                                }
+                                            }
                                         }
                                     }
                                     Err(e) => {
@@ -806,33 +915,59 @@ async fn handle_non_stream_request(
     for result in decoder.decode_iter() {
         match result {
             Ok(frame) => {
-                if let Ok(event) = Event::from_frame(frame) {
-                    match event {
+                // from_frame 按值吞 frame，事件类型须在 move 前先拥有化捕获。
+                let et = frame.event_type().map(|s| s.to_string());
+                match Event::from_frame(frame) {
+                    Ok(event) => match event {
                         Event::AssistantResponse(resp) => {
                             text_content.push_str(&resp.content);
                         }
                         Event::ToolUse(tool_use) => {
                             has_tool_use = true;
 
-                            // 累积工具的 JSON 输入
+                            // 累积工具的 JSON 输入（自适应累积快照 vs 纯增量，与流式路径同源修复）：
+                            // Kiro 同一 tool_use_id 的 input 可能是"到目前为止的完整 JSON"（累积）
+                            // 而非片段。若原样 push_str，累积模式会把 JSON 重复拼接 → 解析失败。
                             let buffer = tool_json_buffers
                                 .entry(tool_use.tool_use_id.clone())
                                 .or_insert_with(String::new);
-                            buffer.push_str(&tool_use.input);
+                            // 与流式路径同源判据：累积（本帧含 buffer 为前缀且更长）→ 全量替换；
+                            // 完全重复 → 不变；纯增量/前缀不成立 → 追加。
+                            if tool_use.input.len() >= buffer.len()
+                                && tool_use.input.starts_with(buffer.as_str())
+                            {
+                                *buffer = tool_use.input.clone();
+                            } else if buffer.as_str() != tool_use.input {
+                                buffer.push_str(&tool_use.input);
+                            }
 
                             // 如果是完整的工具调用，添加到列表
                             if tool_use.stop {
                                 let input: serde_json::Value = if buffer.is_empty() {
                                     serde_json::json!({})
                                 } else {
-                                    serde_json::from_str(buffer)
-                                        .unwrap_or_else(|e| {
+                                    match serde_json::from_str(buffer) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            // 拼装后仍非法：置失败态，收尾(下方 `if !completion.is_ok()`)
+                                            // 返回非 200，绝不静默吞成空参数——空参会让客户端把失败的
+                                            // 工具调用当成"无参数成功调用"执行，比报错更危险。
                                             tracing::warn!(
-                                                "工具输入 JSON 解析失败: {}, tool_use_id: {}",
+                                                "工具输入 JSON 解析失败: {}, tool_use_id: {}（返回错误,不静默空参）",
                                                 e, tool_use.tool_use_id
                                             );
+                                            if completion.is_ok() {
+                                                completion = CompletionStatus::UpstreamError {
+                                                    code: "INVALID_TOOL_INPUT".to_string(),
+                                                    message: format!(
+                                                        "工具参数 JSON 非法（tool_use_id={}）: {}",
+                                                        tool_use.tool_use_id, e
+                                                    ),
+                                                };
+                                            }
                                             serde_json::json!({})
-                                        })
+                                        }
+                                    }
                                 };
 
                                 let original_name = tool_name_map
@@ -894,6 +1029,22 @@ async fn handle_non_stream_request(
                             }
                         }
                         _ => {}
+                    },
+                    Err(err) => {
+                        // 帧层解码成功、Frame→Event 反序列化失败：
+                        // toolUseEvent 失败=工具调用不可恢复丢失，置 DecoderStopped 失败态
+                        // （收尾靠下方 `if !completion.is_ok()` 返回 502+记账），避免截断被当成功。
+                        // 非 tool 帧解析失败历史上就允许被忽略，仅告警不置失败态，防误伤正常流。
+                        if et.as_deref() == Some("toolUseEvent") {
+                            tracing::warn!("非流式 toolUseEvent 帧解析失败,按响应截断处理: {}", err);
+                            if completion.is_ok() {
+                                completion = CompletionStatus::DecoderStopped {
+                                    message: format!("toolUseEvent 帧解析失败: {}", err),
+                                };
+                            }
+                        } else {
+                            tracing::warn!("非流式事件帧解析失败(event_type={:?}),已忽略: {}", et.as_deref(), err);
+                        }
                     }
                 }
             }
@@ -1330,10 +1481,26 @@ fn create_buffered_sse_stream(
                                 for result in decoder.decode_iter() {
                                     match result {
                                         Ok(frame) => {
-                                            if let Ok(event) = Event::from_frame(frame) {
-                                                // 缓冲事件（复用 StreamContext 的处理逻辑）。
-                                                // in-band Event::Error/Exception 会在此置 completion 失败态。
-                                                ctx.process_and_buffer(&event);
+                                            // from_frame 按值吞 frame，事件类型须在 move 前先拥有化捕获。
+                                            let et = frame.event_type().map(|s| s.to_string());
+                                            match Event::from_frame(frame) {
+                                                Ok(event) => {
+                                                    // 缓冲事件（复用 StreamContext 的处理逻辑）。
+                                                    // in-band Event::Error/Exception 会在此置 completion 失败态。
+                                                    ctx.process_and_buffer(&event);
+                                                }
+                                                Err(err) => {
+                                                    // 帧层解码成功、Frame→Event 反序列化失败：
+                                                    // toolUseEvent 失败=工具调用不可恢复丢失，置 DecoderStopped
+                                                    // 失败态（收尾靠 None 分支补发 SSE error），避免截断被当成功不重试；
+                                                    // 非 tool 帧解析失败历史上就允许被忽略，仅告警不置失败态，防误伤正常流。
+                                                    if et.as_deref() == Some("toolUseEvent") {
+                                                        tracing::warn!("buffered toolUseEvent 帧解析失败,按响应截断处理: {}", err);
+                                                        ctx.mark_decoder_stopped(format!("toolUseEvent 帧解析失败: {}", err));
+                                                    } else {
+                                                        tracing::warn!("buffered 事件帧解析失败(event_type={:?}),已忽略: {}", et.as_deref(), err);
+                                                    }
+                                                }
                                             }
                                         }
                                         Err(e) => {
@@ -1520,8 +1687,10 @@ mod truncation_completion_tests {
         for result in decoder.decode_iter() {
             match result {
                 Ok(frame) => {
-                    if let Ok(event) = Event::from_frame(frame) {
-                        match event {
+                    // 忠实镜像非流式收尾：move 前先拥有化事件类型，供 Err 分支判据用。
+                    let et = frame.event_type().map(|s| s.to_string());
+                    match Event::from_frame(frame) {
+                        Ok(event) => match event {
                             Event::Error { error_code, error_message } => {
                                 if completion.is_ok() {
                                     completion = CompletionStatus::UpstreamError {
@@ -1541,6 +1710,14 @@ mod truncation_completion_tests {
                                 }
                             }
                             _ => {}
+                        },
+                        Err(_) => {
+                            // 镜像非流式：toolUseEvent 帧解析失败 → DecoderStopped 失败态。
+                            if et.as_deref() == Some("toolUseEvent") && completion.is_ok() {
+                                completion = CompletionStatus::DecoderStopped {
+                                    message: "toolUseEvent 帧解析失败".to_string(),
+                                };
+                            }
                         }
                     }
                 }
@@ -1595,5 +1772,48 @@ mod truncation_completion_tests {
         let completion = decode_to_completion(&frame);
         assert!(completion.is_ok(), "CL 异常不应被判为失败");
         assert_eq!(completion.outcome(), crate::usage::RequestOutcome::Success);
+    }
+
+    #[test]
+    fn test_toolusevent_parse_failure_maps_to_502() {
+        // 回归：toolUseEvent 帧解析失败过去被静默丢弃 → 客户端按 end_turn 当成功不重试。
+        // 现在应置 DecoderStopped 失败态，映射 502/ServerError，供收尾补发 error 触发重试。
+        // 帧 CRC/framing 合法（decoder 不 is_stopped），仅 ToolUseEvent::from_frame 因非法 JSON 返 Err。
+        let frame = build_frame(
+            &[(":message-type", "event"), (":event-type", "toolUseEvent")],
+            b"not valid json",
+        );
+        let completion = decode_to_completion(&frame);
+        assert!(!completion.is_ok(), "toolUseEvent 解析失败应判失败态");
+        assert_eq!(completion.http_status_u16(), 502);
+        assert_eq!(completion.outcome(), crate::usage::RequestOutcome::ServerError);
+    }
+
+    #[test]
+    fn test_non_tool_parse_failure_stays_ok() {
+        // 零倒退承诺：非 tool 帧解析失败只应告警、不置失败态。
+        // 注意 AssistantResponseEvent.content 有 serde(default)，故须用非法 JSON 而非 `{}` 才能触发反序列化失败。
+        let frame = build_frame(
+            &[(":message-type", "event"), (":event-type", "assistantResponseEvent")],
+            b"not valid json",
+        );
+        let completion = decode_to_completion(&frame);
+        assert!(completion.is_ok(), "非 tool 帧解析失败只应告警,不置失败态");
+        assert_eq!(completion.outcome(), crate::usage::RequestOutcome::Success);
+    }
+
+    #[test]
+    fn test_from_frame_toolusevent_malformed_errs() {
+        // 防呆：锁死「frame 层成功、Event 层失败、event_type 在 move 前可取」三条前提，
+        // 防未来 payload 结构变动悄悄使该帧变成 Ok。
+        let raw = build_frame(
+            &[(":message-type", "event"), (":event-type", "toolUseEvent")],
+            b"not valid json",
+        );
+        let mut d = EventStreamDecoder::new();
+        d.feed(&raw).unwrap();
+        let frame = d.decode_iter().next().unwrap().unwrap();
+        assert_eq!(frame.event_type(), Some("toolUseEvent"));
+        assert!(Event::from_frame(frame).is_err());
     }
 }
