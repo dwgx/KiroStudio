@@ -629,6 +629,13 @@ struct CredentialEntry {
     disabled_reason: Option<DisabledReason>,
     /// API 调用成功次数
     success_count: u64,
+    /// 该凭据**生命周期累计**上游 credit 消耗（花费）。
+    ///
+    /// 由每次请求完成后上游 meteringEvent 的真实计费量累加而来（无 meteringEvent 的
+    /// 请求不计）。持久化进 kiro_stats.json，**独立于 usage_retention_days**——用量
+    /// 明细（JSONL/SQLite）会按保留期滚动清理，但这个累计值只增不清，反映该号从入池
+    /// 至今一共花了多少 credit。
+    total_credits_used: f64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
     /// 当前在途（in-flight）请求数
@@ -660,12 +667,18 @@ enum DisabledReason {
     InvalidRefreshToken,
     /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
     InvalidConfig,
+    /// 订阅失效/降级：上游反复返回 INVALID_MODEL_ID，该号已不能服务请求的模型
+    /// （多为订阅被取消/降级）。达阈值后自动禁用，可人工/自愈重新启用。
+    SubscriptionInvalid,
 }
 
 /// 统计数据持久化条目
 #[derive(Serialize, Deserialize)]
 struct StatsEntry {
     success_count: u64,
+    /// 生命周期累计 credit 花费。向后兼容：老 stats 文件无此字段时默认 0。
+    #[serde(default)]
+    total_credits_used: f64,
     last_used_at: Option<String>,
 }
 
@@ -707,6 +720,8 @@ pub struct CredentialEntrySnapshot {
     pub subscription_title: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
+    /// 生命周期累计 credit 花费（真实计费累加，独立于用量保留期，只增不清）
+    pub total_credits_used: f64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
     /// 是否配置了凭据级代理
@@ -1032,6 +1047,7 @@ impl MultiTokenManager {
                         None
                     },
                     success_count: 0,
+                    total_credits_used: 0.0,
                     last_used_at: None,
                     inflight: Arc::new(AtomicU32::new(0)),
                 }
@@ -1989,6 +2005,7 @@ impl MultiTokenManager {
         for entry in entries.iter_mut() {
             if let Some(s) = stats.get(&entry.id.to_string()) {
                 entry.success_count = s.success_count;
+                entry.total_credits_used = s.total_credits_used;
                 entry.last_used_at = s.last_used_at.clone();
             }
         }
@@ -2013,6 +2030,7 @@ impl MultiTokenManager {
                         e.id.to_string(),
                         StatsEntry {
                             success_count: e.success_count,
+                            total_credits_used: e.total_credits_used,
                             last_used_at: e.last_used_at.clone(),
                         },
                     )
@@ -2082,6 +2100,27 @@ impl MultiTokenManager {
         // 健康：成功抬 ewma_success、衰减 ewma_429;半开期连续成功 AIMD 逐步放回直至全开。
         // 键用 family_key（族/号同口径），锁外调用（health 独立 Mutex，避免与 entries 锁嵌套）。
         self.health.on_success(&fam);
+        self.save_stats_debounced();
+    }
+
+    /// 累加一次请求的真实 credit 花费到该凭据的**生命周期累计**。
+    ///
+    /// 在请求完成、拿到上游 meteringEvent 的真实计费量后调用（见 anthropic/handlers.rs
+    /// 的 emit_record 处）。累计值持久化进 kiro_stats.json，独立于用量明细的保留期清理，
+    /// 只增不清——供凭据卡片展示"这个号从入池至今一共花了多少 credit"。
+    ///
+    /// `credits <= 0` 或 `credential_id` 未知时静默忽略（无 meteringEvent 的请求本就不计）。
+    pub fn add_credits(&self, id: u64, credits: f64) {
+        if !(credits > 0.0) {
+            return;
+        }
+        {
+            let mut entries = self.entries.lock();
+            match entries.iter_mut().find(|e| e.id == id) {
+                Some(entry) => entry.total_credits_used += credits,
+                None => return, // 未知 id（已删除等）：不落账
+            }
+        }
         self.save_stats_debounced();
     }
 
@@ -2272,6 +2311,49 @@ impl MultiTokenManager {
                 .set_cooldown(id, CooldownReason::AuthenticationFailed);
             tracing::warn!("凭据 #{} 认证失败，冷却 {:?}", id, dur);
         }
+    }
+
+    /// 报告凭据返回 `INVALID_MODEL_ID`（该号已不能服务请求的模型，多为订阅取消/降级）。
+    ///
+    /// 处置：给该号一段冷却（用 ModelUnavailable 的 300s 中长窗——它是"这个号服务不了"
+    /// 而非全局模型故障），让 balanced 选号本轮避开它、failover 到订阅仍有效的号。
+    /// 短时间内反复命中达阈值 → 判定订阅已失效，自动禁用（SubscriptionInvalid，可人工/自愈恢复），
+    /// 避免坏号一直留在轮转里被反复命中。
+    ///
+    /// 返回是否仍有其它可用凭据（供 provider 决定 failover 还是把错误透传给客户端）。
+    pub fn report_model_invalid(&self, id: u64) -> bool {
+        if self.cooldown_enabled.load(Ordering::Relaxed) {
+            let dur = self
+                .cooldown
+                .set_cooldown(id, CooldownReason::ModelUnavailable);
+            tracing::warn!(
+                "凭据 #{} 返回 INVALID_MODEL_ID（订阅疑似失效/降级），冷却 {:?} 并 failover 到其它号",
+                id,
+                dur
+            );
+
+            // 反复命中达阈值 → 订阅已失效，自动禁用移出轮转（与 auto_disable_suspicious 同开关口径）。
+            const AUTO_DISABLE_TRIGGER: u32 = 3;
+            if self.auto_disable_suspicious.load(Ordering::Relaxed)
+                && self.cooldown.trigger_count(id) >= AUTO_DISABLE_TRIGGER
+            {
+                let mut entries = self.entries.lock();
+                if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                    if !entry.disabled {
+                        entry.disabled = true;
+                        entry.disabled_reason = Some(DisabledReason::SubscriptionInvalid);
+                        tracing::warn!(
+                            "凭据 #{} 连续 {} 次 INVALID_MODEL_ID，判定订阅失效，自动禁用（SubscriptionInvalid）",
+                            id,
+                            AUTO_DISABLE_TRIGGER
+                        );
+                        drop(entries);
+                        let _ = self.persist_credentials();
+                    }
+                }
+            }
+        }
+        self.available_count() > 0
     }
 
     /// 报告指定凭据额度已用尽
@@ -2572,6 +2654,7 @@ impl MultiTokenManager {
                     name: e.credentials.name.clone(),
                     subscription_title: e.credentials.subscription_title.clone(),
                     success_count: e.success_count,
+                    total_credits_used: e.total_credits_used,
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
@@ -2585,6 +2668,7 @@ impl MultiTokenManager {
                         DisabledReason::SuspiciousActivityAuto => "SuspiciousActivityAuto",
                         DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
                         DisabledReason::InvalidConfig => "InvalidConfig",
+                        DisabledReason::SubscriptionInvalid => "SubscriptionInvalid",
                     }.to_string()),
                     endpoint: e.credentials.endpoint.clone(),
                     inflight: e.inflight.load(Ordering::Acquire),
@@ -2937,9 +3021,109 @@ impl MultiTokenManager {
             bail!("Token 无效 (401): {}", body_text);
         }
 
-        // 400 = 请求格式错误（预期的，说明凭据有效，只是请求体不完整）
-        // 200/其他 = 凭据有效
+        // 400：区分两种语义——
+        // - INVALID_MODEL_ID：该号订阅失效/降级，已不能服务模型（活着但订阅没了，需报出真相）；
+        // - 其它 400：请求体不完整（预期的，只为触发 suspend 检查），说明凭据/认证本身有效。
+        // 200/其他 = 凭据有效。
+        if status.as_u16() == 400 {
+            let body_text = response.text().await.unwrap_or_default();
+            if crate::kiro::endpoint::default_is_invalid_model_id(&body_text) {
+                bail!("订阅已失效/降级（INVALID_MODEL_ID）：该号已不能服务模型: {}", body_text);
+            }
+        }
         Ok(())
+    }
+
+    /// 探测指定凭据**当前可用的模型列表**（Admin API，选中令牌后手动触发）。
+    ///
+    /// Kiro 没有原生"列出模型"接口，故对一组候选模型逐个发一个极小探测请求，按上游反应判定：
+    /// - `INVALID_MODEL_ID` → 该号不支持此模型（订阅等级不够/已降级）；
+    /// - 200 或其它 400（请求体不完整等）→ 认证与模型都 OK，视为支持；
+    /// - 401/403 → 认证/账号问题，整体探测失败（返回 Err，前端提示先刷新/检查号）。
+    ///
+    /// 只在 admin 手动点击时跑（~7 次轻量上游调用），绝不进请求热路径、不自动周期跑。
+    /// 返回 (model_id, supported) 列表，顺序与候选列表一致。
+    pub async fn probe_available_models(&self, id: u64) -> anyhow::Result<Vec<(String, bool)>> {
+        // 候选模型：每个家族取有意义的版本（与 converter::map_model 的目标口径一致）。
+        const CANDIDATES: &[&str] = &[
+            "claude-sonnet-4.5",
+            "claude-sonnet-4.6",
+            "claude-opus-4.5",
+            "claude-opus-4.6",
+            "claude-opus-4.7",
+            "claude-opus-4.8",
+            "claude-haiku-4.5",
+        ];
+        let mut out = Vec::with_capacity(CANDIDATES.len());
+        for m in CANDIDATES {
+            let supported = self.probe_single_model(id, m).await?;
+            out.push((m.to_string(), supported));
+        }
+        Ok(out)
+    }
+
+    /// 对单个模型发一个极小探测请求，返回该号是否支持它。
+    ///
+    /// `Ok(true)` = 支持（200 或非 INVALID_MODEL_ID 的 400）；`Ok(false)` = INVALID_MODEL_ID；
+    /// `Err` = 认证/账号级问题（401/403/网络），调用方应整体中止并提示。
+    async fn probe_single_model(&self, id: u64, model_id: &str) -> anyhow::Result<bool> {
+        let (credentials, token) = self.ensure_valid_token(id).await?;
+        let cfg = self.config.load();
+        let region = credentials.effective_upstream_region(&cfg);
+        let host = format!("runtime.{}.kiro.dev", region);
+        let url = format!("https://{}/generateAssistantResponse", host);
+        let machine_id = machine_id::generate_from_credentials(&credentials, &cfg);
+        let user_agent = format!(
+            "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
+            cfg.system_version, cfg.node_version, cfg.kiro_version, machine_id
+        );
+        let x_amz_user_agent =
+            format!("aws-sdk-js/1.0.34 KiroIDE-{}-{}", cfg.kiro_version, machine_id);
+
+        // 带 modelId 的最小请求体：只为触发上游对"该号能否用此模型"的判定。
+        let mut body = serde_json::json!({
+            "conversationState": {
+                "conversationId": uuid::Uuid::new_v4().to_string(),
+                "currentMessage": {
+                    "userInputMessage": { "content": "hi", "modelId": model_id }
+                }
+            }
+        });
+        if let Some(arn) = credentials.effective_profile_arn() {
+            body["profileArn"] = serde_json::Value::String(arn);
+        }
+
+        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        let client = build_client(effective_proxy.as_ref(), 30, cfg.tls_backend)?;
+        let mut request = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("x-amzn-codewhisperer-optout", "true")
+            .header("x-amz-user-agent", &x_amz_user_agent)
+            .header("user-agent", &user_agent)
+            .header("host", &host)
+            .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+            .header("amz-sdk-request", "attempt=1; max=1")
+            .header("Authorization", format!("Bearer {}", token));
+        if credentials.is_api_key_credential() {
+            request = request.header("tokentype", "API_KEY");
+        } else if credentials.is_external_idp_credential() {
+            request = request.header("tokentype", "EXTERNAL_IDP");
+        }
+
+        let response = request.body(body.to_string()).send().await?;
+        let status = response.status();
+        if matches!(status.as_u16(), 401 | 403) {
+            let body_text = response.text().await.unwrap_or_default();
+            bail!("认证/账号问题（{}）：{}", status.as_u16(), body_text);
+        }
+        if status.as_u16() == 400 {
+            let body_text = response.text().await.unwrap_or_default();
+            // INVALID_MODEL_ID = 不支持该模型；其它 400（请求体不完整）= 支持（认证过了）。
+            return Ok(!crate::kiro::endpoint::default_is_invalid_model_id(&body_text));
+        }
+        // 200 / 其它 = 支持
+        Ok(true)
     }
 
     /// 添加新凭据（Admin API）
@@ -3103,6 +3287,7 @@ impl MultiTokenManager {
                 disabled: false,
                 disabled_reason: None,
                 success_count: 0,
+                total_credits_used: 0.0,
                 last_used_at: None,
                 inflight: Arc::new(AtomicU32::new(0)),
             });
@@ -3158,6 +3343,7 @@ impl MultiTokenManager {
                 credentials: cred,
                 deleted_at: Utc::now().to_rfc3339(),
                 success_count: removed.success_count,
+                total_credits_used: removed.total_credits_used,
                 last_used_at: removed.last_used_at,
             });
 
@@ -3199,6 +3385,7 @@ impl MultiTokenManager {
                     disabled: true,
                     disabled_reason: Some(DisabledReason::Manual),
                     success_count: 0,
+                    total_credits_used: 0.0,
                     last_used_at: None,
                     inflight: Arc::new(AtomicU32::new(0)),
                 });
@@ -3318,6 +3505,7 @@ impl MultiTokenManager {
                 disabled: true,
                 disabled_reason: Some(DisabledReason::Manual),
                 success_count: restored_entry.success_count,
+                total_credits_used: restored_entry.total_credits_used,
                 last_used_at: restored_entry.last_used_at,
                 inflight: Arc::new(AtomicU32::new(0)),
             });
