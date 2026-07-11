@@ -9,6 +9,7 @@ pub mod machine_id;
 pub mod model;
 pub mod overage;
 pub mod parser;
+pub mod passthrough;
 pub mod provider;
 pub mod rate_limiter;
 pub mod refresh_loop;
