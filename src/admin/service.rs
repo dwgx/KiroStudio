@@ -928,6 +928,7 @@ impl AdminService {
         .to_string();
 
         ConfigSnapshotResponse {
+            server_version: env!("CARGO_PKG_VERSION").to_string(),
             host: config.host.clone(),
             port: config.port,
             region: config.region.clone(),

@@ -449,6 +449,8 @@ pub struct PollSocialLoginResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigSnapshotResponse {
+    /// 服务端版本（编译期注入 Cargo.toml version），供前端展示真实版本,不再硬编码。
+    pub server_version: String,
     pub host: String,
     pub port: u16,
     pub region: String,
@@ -680,6 +682,7 @@ mod tests {
     fn config_snapshot_serializes_login_background_r18() {
         // 快照以 camelCase 下发，前端据此渲染开关初值。
         let snap = ConfigSnapshotResponse {
+            server_version: "0.0.0".into(),
             host: "127.0.0.1".into(),
             port: 8080,
             region: "us-east-1".into(),
