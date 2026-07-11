@@ -717,6 +717,12 @@ pub struct CredentialEntrySnapshot {
     pub failure_count: u32,
     /// 认证方式
     pub auth_method: Option<String>,
+    /// 自定义 API 代挂:上游 base_url(展示用,api_key 绝不下发)
+    pub base_url: Option<String>,
+    /// 自定义 API 代挂:请求上限(None/0=不限)
+    pub request_limit: Option<u64>,
+    /// 自定义 API 代挂:累计已发请求数
+    pub request_count: u64,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
     /// Token 过期时间
@@ -2744,6 +2750,9 @@ impl MultiTokenManager {
                             }
                         })
                     },
+                    base_url: e.credentials.base_url.clone(),
+                    request_limit: e.credentials.request_limit,
+                    request_count: e.request_count,
                     has_profile_arn: e.credentials.profile_arn.is_some(),
                     expires_at: if e.credentials.is_api_key_credential() {
                         None // API Key 凭据本地不维护过期时间（服务端策略未知）
