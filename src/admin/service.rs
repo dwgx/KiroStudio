@@ -1386,6 +1386,14 @@ impl AdminService {
             crate::admin_ui::set_login_background_r18(v);
         }
 
+        // ⭐修复"关闭 R18/背景后缓存不清、刷新还是旧图":开关一变就**立即清空背景图内存池**。
+        // 否则池里已缓存的旧参数图(R18/全年龄)会一直服务到自然淘汰完(容量20、每12分钟才补6张),
+        // 表现为"关了 R18 保存后刷新仍是旧图"。清池后下次 random-bg 按新参数即时重新拉取。
+        if login_bg_r18_changed.is_some() || login_bg_changed.is_some() {
+            let cleared = crate::admin_ui::clear_bg_pool();
+            tracing::info!("登录背景开关变更,已清空背景图缓存池({} 张),下次按新参数重新预取", cleared);
+        }
+
         // 指纹采集开关立即应用到热路径运行时镜像（下一个请求即生效）
         if let Some(v) = fingerprint_changed {
             crate::anthropic::set_collect_client_fingerprint(v);
