@@ -140,7 +140,7 @@ export interface SetPriorityRequest {
 export interface AddCredentialRequest {
   accessToken?: string
   refreshToken?: string
-  authMethod?: 'social' | 'idc' | 'external_idp' | 'api_key'
+  authMethod?: 'social' | 'idc' | 'external_idp' | 'api_key' | 'custom_api'
   clientId?: string
   clientSecret?: string
   tokenEndpoint?: string
@@ -157,6 +157,10 @@ export interface AddCredentialRequest {
   proxyPassword?: string
   kiroApiKey?: string
   endpoint?: string
+  // 自定义 API 代挂透传
+  baseUrl?: string
+  apiKey?: string
+  requestLimit?: number
 }
 
 // 添加凭据响应

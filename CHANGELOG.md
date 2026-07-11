@@ -2,6 +2,22 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.0] - 2026-07-11
+
+### 新增（自定义 API 代挂透传）
+- **自定义 API 凭据（Anthropic 兼容上游代挂）**：可在「添加凭据」里选「自定义 API」，填上游
+  base URL + 密钥 + 请求上限。语义是**代挂透传**——Claude Code 打 `/v1/messages` 时，若选号
+  命中自定义 API 凭据，就把原始请求体**原样透传**到该 base URL、换用它的密钥、响应流**原样回**
+  （入口=出口=Anthropic，零协议转换，效果等同直接拿那个 key 用）。与 Kiro 号**混在同一池按
+  优先级/负载均衡分流**。
+  - **请求上限自动禁用**：累计请求数达到 `requestLimit` 自动禁用该凭据（防代挂 key 跑量超预算）。
+  - 支持凭据级**代理 + 优先级**（复用现有 effective_proxy）。
+  - **铁律：绝不污染 Kiro 主路径** —— 只在选号命中自定义 API 凭据时接管；选到 Kiro 号（或池中
+    无自定义号）则原样走 Kiro 转发，行为字节级不变。透传响应独立流回，绝不进 Kiro 的 event-stream
+    解码器/StreamContext。本地假上游实测透传通过（换 key + body 原样转发），505 测试双特性全绿。
+  - 数据模型：`KiroCredentials` 加 `base_url`/`api_key`/`request_limit`（auth_method=custom_api），
+    api_key 已加入 Debug 脱敏；自定义号在 `ensure_valid_token` 短路，不进 Kiro token 刷新/IdC 逻辑。
+
 ## [0.6.10] - 2026-07-11
 
 ### 修复（关键：Windows 裸双击 exe「点击没反应」）

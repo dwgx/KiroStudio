@@ -207,6 +207,17 @@ pub struct AddCredentialRequest {
     #[serde(default)]
     pub rpm_limit: Option<u32>,
 
+    // ==== 自定义 API 代挂透传（authMethod=custom_api 时前端填入）====
+    /// 自定义 API 上游基址（Anthropic 兼容中转站，透传目标）
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// 自定义 API 密钥（透传时替换成它）
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// 请求上限（累计达到后自动禁用，None/0=不限）
+    #[serde(default)]
+    pub request_limit: Option<u64>,
+
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
     pub region: Option<String>,

@@ -133,6 +133,24 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tested_models: Option<Vec<TestedModel>>,
 
+    // ==== 自定义 API「代挂透传」字段（auth_method=custom_api 时用）====
+    // 语义:该凭据是一个 Anthropic 兼容上游中转站,Claude Code 打 /v1/messages 时原样透传到
+    // base_url + 换用 api_key。不做协议转换(入口=出口=Anthropic)。零 Kiro 字段依赖。
+    /// 自定义 API 上游基址（如 https://api.anthropic-proxy.com,透传目标）。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+
+    /// 自定义 API 密钥（透传时替换成它;**独立于 kiro_api_key**;已加入 Debug 脱敏清单）。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+
+    /// 请求上限：累计请求数达到后自动禁用该凭据（None/0=不限）。通用字段,自定义API主用。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_limit: Option<u64>,
+
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -242,6 +260,8 @@ impl std::fmt::Debug for KiroCredentials {
             .field("issuer_url", &self.issuer_url)
             .field("scopes", &self.scopes)
             .field("kiro_api_key", &mask_secret(&self.kiro_api_key))
+            .field("api_key", &mask_secret(&self.api_key))
+            .field("base_url", &self.base_url)
             .field("proxy_username", &mask_secret(&self.proxy_username))
             .field("proxy_password", &mask_secret(&self.proxy_password))
             .finish()
@@ -287,6 +307,12 @@ fn canonicalize_auth_method_value(value: &str) -> &str {
         || value.eq_ignore_ascii_case("azure_ad")
     {
         "external_idp"
+    } else if value.eq_ignore_ascii_case("custom_api")
+        || value.eq_ignore_ascii_case("customapi")
+        || value.eq_ignore_ascii_case("custom-api")
+        || value.eq_ignore_ascii_case("passthrough")
+    {
+        "custom_api"
     } else {
         value
     }
@@ -486,6 +512,14 @@ impl KiroCredentials {
         if canonical != auth_method {
             self.auth_method = Some(canonical.to_string());
         }
+    }
+
+    /// 是否为「自定义 API 代挂透传」凭据（auth_method=custom_api）。
+    ///
+    /// 这类凭据不是 Kiro 号:它是一个 Anthropic 兼容上游中转站（base_url + api_key），
+    /// /v1/messages 请求原样透传过去。不参与 Kiro 的 token 刷新 / profileArn / region 逻辑。
+    pub fn is_custom_api_credential(&self) -> bool {
+        self.auth_method.as_deref() == Some("custom_api") || self.base_url.is_some()
     }
 
     /// 该号是否允许服务给定模型（成本安全白名单硬门）。
@@ -886,6 +920,9 @@ mod tests {
             rpm_limit: None,
             allowed_models: None,
             tested_models: None,
+            base_url: None,
+            api_key: None,
+            request_limit: None,
             region: None,
             auth_region: None,
             api_region: None,
@@ -1011,6 +1048,9 @@ mod tests {
             rpm_limit: None,
             allowed_models: None,
             tested_models: None,
+            base_url: None,
+            api_key: None,
+            request_limit: None,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
             api_region: None,
@@ -1049,6 +1089,9 @@ mod tests {
             rpm_limit: None,
             allowed_models: None,
             tested_models: None,
+            base_url: None,
+            api_key: None,
+            request_limit: None,
             region: None,
             auth_region: None,
             api_region: None,
@@ -1170,6 +1213,9 @@ mod tests {
             rpm_limit: None,
             allowed_models: None,
             tested_models: None,
+            base_url: None,
+            api_key: None,
+            request_limit: None,
             region: Some("us-west-2".to_string()),
             auth_region: None,
             api_region: None,

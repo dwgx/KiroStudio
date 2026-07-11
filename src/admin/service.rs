@@ -797,6 +797,10 @@ impl AdminService {
             // 新增号默认不设白名单（不限制）；上号后经 /credentials/{id}/allowed-models 单独设置。
             allowed_models: None,
             tested_models: None,
+            // 自定义 API 代挂透传字段（auth_method=custom_api 时由前端填入）。
+            base_url: req.base_url,
+            api_key: req.api_key,
+            request_limit: req.request_limit,
             region: req.region,
             auth_region: req.auth_region,
             api_region: req.api_region,
