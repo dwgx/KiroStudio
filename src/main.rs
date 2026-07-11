@@ -246,6 +246,7 @@ async fn main() {
         &api_key,
         Some(kiro_provider),
         config.extract_thinking,
+        config.cc_auto_buffer,
         &config.cors_allowed_origins,
         config.max_body_bytes,
         config.compression.clone(),

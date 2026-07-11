@@ -34,4 +34,5 @@ mod websearch;
 pub use handlers::set_collect_client_fingerprint;
 pub use converter::set_strip_env_noise;
 pub use handlers::set_extract_thinking;
+pub use handlers::set_cc_auto_buffer;
 pub use router::create_router_with_provider;
