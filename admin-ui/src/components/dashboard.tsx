@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Trash2, RotateCcw, CheckCircle2, Database, Zap, Ban, Power } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Trash2, RotateCcw, CheckCircle2, Database, Zap, Ban, Power, FlaskConical } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -11,8 +11,9 @@ import { StatCard } from '@/components/ui/stat-card'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
+import { ModelTestDialog, type ModelTestResult } from '@/components/model-test-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useSetDisabled } from '@/hooks/use-credentials'
-import { getCredentialBalance, getCachedBalances, forceRefreshToken, deepVerifyCredential } from '@/api/credentials'
+import { getCredentialBalance, getCachedBalances, forceRefreshToken, deepVerifyCredential, probeAvailableModels } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import { PageSkeleton } from '@/components/ui/page-skeleton'
 import type { BalanceResponse } from '@/types/api'
@@ -88,6 +89,13 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
   const cancelVerifyRef = useRef(false)
+  // 模型测试（勾选后独立弹窗触发；逐号发真实计费请求探测可用模型）
+  const [modelTestOpen, setModelTestOpen] = useState(false)
+  const [modelTesting, setModelTesting] = useState(false)
+  const [modelTestProgress, setModelTestProgress] = useState({ current: 0, total: 0 })
+  const [modelTestResults, setModelTestResults] = useState<Map<number, ModelTestResult>>(new Map())
+  const [modelTestGrandTotal, setModelTestGrandTotal] = useState(0)
+  const cancelModelTestRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 12
   const [darkMode, setDarkMode] = useState(() => {
@@ -382,6 +390,47 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     }
 
     deselectAll()
+  }
+
+  // 测试可用模型：对选中的号逐个探测（真实计费），结果进独立弹窗；测完提示总花费。
+  const handleTestModels = async () => {
+    const ids = Array.from(selectedIds)
+    if (ids.length === 0) {
+      toast.error('请先勾选要测试的凭据')
+      return
+    }
+    cancelModelTestRef.current = false
+    setModelTesting(true)
+    setModelTestOpen(true)
+    setModelTestGrandTotal(0)
+    setModelTestProgress({ current: 0, total: ids.length })
+    // 初始化为 pending
+    const init = new Map<number, ModelTestResult>()
+    ids.forEach((id) => init.set(id, { id, status: 'pending' }))
+    setModelTestResults(new Map(init))
+
+    let grand = 0
+    for (let i = 0; i < ids.length; i++) {
+      if (cancelModelTestRef.current) break
+      const id = ids[i]
+      setModelTestResults((prev) => new Map(prev).set(id, { id, status: 'testing' }))
+      try {
+        const res = await probeAvailableModels(id)
+        grand += res.totalCredits
+        setModelTestResults((prev) =>
+          new Map(prev).set(id, { id, status: 'done', models: res.models, totalCredits: res.totalCredits }),
+        )
+        setModelTestGrandTotal(grand)
+      } catch (err) {
+        setModelTestResults((prev) =>
+          new Map(prev).set(id, { id, status: 'failed', error: extractErrorMessage(err) }),
+        )
+      }
+      setModelTestProgress({ current: i + 1, total: ids.length })
+    }
+
+    setModelTesting(false)
+    toast.success(`模型测试完成：本轮共花费 ${grand.toFixed(4)} credits`)
   }
 
   // 一键清除所有已禁用凭据
@@ -747,6 +796,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                     <CheckCircle2 className="h-4 w-4 mr-2" />
                     批量验活
                   </Button>
+                  <Button onClick={handleTestModels} size="sm" variant="outline" disabled={modelTesting}>
+                    <FlaskConical className={`h-4 w-4 mr-2 ${modelTesting ? 'animate-pulse' : ''}`} />
+                    测试可用模型
+                  </Button>
                   <Button
                     onClick={handleBatchForceRefresh}
                     size="sm"
@@ -903,6 +956,15 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         progress={verifyProgress}
         results={verifyResults}
         onCancel={handleCancelVerify}
+      />
+      <ModelTestDialog
+        open={modelTestOpen}
+        onOpenChange={setModelTestOpen}
+        testing={modelTesting}
+        progress={modelTestProgress}
+        results={modelTestResults}
+        grandTotalCredits={modelTestGrandTotal}
+        onCancel={() => { cancelModelTestRef.current = true }}
       />
     </div>
   )
