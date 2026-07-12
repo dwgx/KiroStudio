@@ -248,8 +248,46 @@ export interface ExternalIdpLeg1Response {
   authorizeUrl: string
 }
 
-// 第 3 步响应：换 token 入池成功，返回新凭据 id
+// 一个可选 profile：ARN + region + account（多 region 账号供用户选）
+export interface ExternalIdpProfileOption {
+  arn: string
+  region: string
+  account: string
+  /** 该区域是否可用（订阅已开通）。缺省视为可用（旧后端未下发时不误置灰）。 */
+  usable?: boolean
+  /** 订阅等级标题（如 "Kiro Pro"），供选择列表展示。 */
+  subscriptionTitle?: string | null
+}
+
+// 单个凭据在某 region 的 profile（切 Profile ARN 用）。
+// 约定字段：arn / region / account / usable / subscriptionTitle（后端字段名有出入时以此为准）。
+export interface CredentialRegionProfile {
+  arn: string
+  region: string
+  account?: string | null
+  /** 该区域是否可用（订阅已开通）。 */
+  usable: boolean
+  /** 订阅等级标题（如 "Kiro Pro"）。 */
+  subscriptionTitle?: string | null
+  /** 是否为该凭据当前正在使用的 profile。 */
+  current?: boolean
+}
+
+// GET /credentials/{id}/regions 响应：该账号各 region 的 profile 列表。
+export interface CredentialRegionsResponse {
+  regions: CredentialRegionProfile[]
+}
+
+// 第 3 步响应：换 token + 探测多 region profile。
+// - profiles 多个 → 弹窗选 region，随后调 leg2/select 建号（credentialId 为 null）。
+// - profiles 恰 1 个 → 后端已自动建号，credentialId 有值，直接完成。
 export interface ExternalIdpLeg2Response {
+  credentialId: number | null
+  profiles: ExternalIdpProfileOption[]
+}
+
+// 第 3 步选定响应：选定 profile 建号成功
+export interface ExternalIdpSelectResponse {
   credentialId: number
 }
 

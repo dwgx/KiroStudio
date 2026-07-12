@@ -150,11 +150,17 @@ deploy\windows\build.bat
 ```
 因为 Windows 支持是纯增量层，`git pull` 通常不会与 `deploy/windows/` 冲突。
 
-> ⚠️ **admin 面板里的"OTA 在线更新"按钮在 Windows 上不可用**：它下载的是
-> Linux musl 二进制（`kirostudio-linux-x86_64`，ELF 格式 Windows 跑不了），且
-> 依赖 Linux「可 rename 运行中 exe」的特性（Windows 会锁定运行中的 .exe）。
-> Windows 请一律用上面的 `update.bat`（或 `git pull` + `build.bat`）更新。
-> （注：面板的**一键重启**已可用，只有 **OTA 换二进制**这一步在 Windows 不适用。）
+> ✅ **admin 面板的"OTA 在线更新"按钮在 Windows 上已可用**（v0.6.6 起修复，v0.7.5
+> 起支持裸跑自重启）：它按平台下载 **Windows 二进制**（`kirostudio-windows-x86_64.exe`），
+> 用「rename 运行中 exe → .bak，新二进制顶上原路径」绕开 Windows 文件锁，替换失败会
+> 自动回滚（不留缺失 exe）；`.sha256` 只从 github.com 直连校验，防镜像投毒。
+> 升级成功后**自动重启加载新版本**：裸跑双击 exe 时由进程自身 spawn 一个后台 helper，
+> 等旧进程退出、端口释放后用原路径拉起新 exe；用 start.bat/run.bat 监督循环跑时则
+> 靠脚本重拉。两种姿势都无需手动重启。
+>
+> `update.bat`（`git pull` + `build.bat`）仍**覆盖更全**：`git pull` 能拿到 master 上
+> 的**全部最新改动**，而面板 OTA 只能升级到恰好打了 GitHub Release tag 的版本。
+> 想要「跟到最新 master」用 `update.bat`；想要「一键升到最近发布版」用面板 OTA。
 
 ### 查看日志
 前台模式日志直接在窗口里。如需留存，可在启动时重定向：
