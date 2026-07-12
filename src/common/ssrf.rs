@@ -174,6 +174,50 @@ fn parse_host_port(url: &str) -> Result<(String, u16), String> {
     }
 }
 
+/// 校验一个出站 URL 的目标不落私网/环回/链路本地/元数据/保留段（写入时主防线）。
+///
+/// 用于 custom_api 写入 base_url 时先校验最终透传 URL。校验语义（安全 vs 可用的权衡）：
+/// - scheme 不合法 → 拒绝。
+/// - 解析成功 + 任一候选 IP 命中禁止段 → 拒绝（真 SSRF，含 IP 字面量如 169.254.169.254）。
+/// - **DNS 解析失败 → 放行**：解析失败是网络问题（离线/DNS 抖动/中转站临时下线），
+///   不是攻击信号；硬拒会让合法中转站因一时网络问题加不进号。IP 字面量（最主要的元数据/
+///   内网攻击向量）走 lookup_host 不经真实 DNS、直接返回，仍会被立即拦下。域名指向内网这条
+///   二阶风险由出站禁重定向兜底（见透传/deep_verify 的 no_redirect client）。
+///
+/// `allow_http=false` 仅允许 https；true 时额外允许 http（明文中转站，IP 层禁止段仍拦）。
+/// 成功返回 ()，失败返回拒绝原因。
+pub async fn validate_outbound_url(url: &str, allow_http: bool) -> Result<(), String> {
+    let scheme = url
+        .split_once("://")
+        .map(|(s, _)| s.to_ascii_lowercase())
+        .ok_or_else(|| "URL 缺少 scheme".to_string())?;
+    let allowed: &[&str] = if allow_http {
+        &["https", "http"]
+    } else {
+        &["https"]
+    };
+    if !allowed.iter().any(|s| *s == scheme) {
+        return Err(format!(
+            "scheme 不被允许(仅 https{}): {scheme}",
+            if allow_http { "/http" } else { "" }
+        ));
+    }
+    let (host, port) = parse_host_port(url)?;
+    match tokio::net::lookup_host((host.as_str(), port)).await {
+        Ok(iter) => {
+            let addrs: Vec<SocketAddr> = iter.collect();
+            for sa in &addrs {
+                if is_forbidden_ip(sa.ip()) {
+                    return Err(format!("目标解析到非公网地址，已拒绝: {}", sa.ip()));
+                }
+            }
+            Ok(())
+        }
+        // DNS 失败 = 网络问题而非攻击，放行（IP 字面量不会走到这里）。出站禁重定向兜底。
+        Err(_) => Ok(()),
+    }
+}
+
 /// 校验一个出站 URL 并构造「已固定 DNS + 禁重定向」的安全 reqwest 客户端。
 ///
 /// 成功返回的 `Client` 已把目标域名固定到本次校验通过的 IP 集合，直接对同一
@@ -279,8 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_host_port() {
-        assert_eq!(
+    fn test_parse_host_port() {        assert_eq!(
             parse_host_port("https://example.com/a/b?x=1").unwrap(),
             ("example.com".to_string(), 443)
         );
@@ -303,5 +346,29 @@ mod tests {
         );
         assert!(parse_host_port("ftp://example.com").is_err());
         assert!(parse_host_port("not-a-url").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_validate_outbound_url_rejects_internal_and_scheme() {
+        // 元数据/环回/内网 IP 字面量：拒绝（IP 字面量 lookup_host 直接返回，不走真实 DNS）。
+        assert!(validate_outbound_url("http://169.254.169.254/latest/meta-data", true).await.is_err());
+        assert!(validate_outbound_url("https://127.0.0.1/v1/messages", true).await.is_err());
+        assert!(validate_outbound_url("http://10.0.0.1:6379", true).await.is_err());
+        assert!(validate_outbound_url("http://[::1]/x", true).await.is_err());
+        // userinfo 混淆：@ 后是内网 → 拒绝（parse_host_port 剥 userinfo 取真实 host）。
+        assert!(validate_outbound_url("https://ok.com@169.254.169.254/x", true).await.is_err());
+        // scheme 门：allow_http=false 时 http 被拒。
+        assert!(validate_outbound_url("http://8.8.8.8/x", false).await.is_err());
+        // 非 http(s) scheme 一律拒。
+        assert!(validate_outbound_url("ftp://8.8.8.8/x", true).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_validate_outbound_url_allows_public_ip() {
+        // 公网 IP 字面量放行（用 IP 免真实 DNS 依赖）。
+        assert!(validate_outbound_url("https://8.8.8.8/v1/messages", false).await.is_ok());
+        assert!(validate_outbound_url("http://1.1.1.1/x", true).await.is_ok());
+        // allow_http=false 下 https 公网放行。
+        assert!(validate_outbound_url("https://1.1.1.1/x", false).await.is_ok());
     }
 }

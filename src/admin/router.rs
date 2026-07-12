@@ -14,10 +14,12 @@ use super::{
         restart_service, restore_credential, set_credential_disabled, set_credential_name,
         set_credential_proxy,
         set_credential_priority, set_credential_rpm_limit, set_credential_allowed_models,
+        set_credential_custom_api,
         purge_trash_batch, probe_available_models,
+        probe_regions, switch_profile_region,
         set_load_balancing_mode, social_callback, start_social_login, storage_cleanup,
         storage_stats, update_config, start_idc_login, poll_idc_login,
-        start_external_idp_login, external_idp_leg1, external_idp_leg2,
+        start_external_idp_login, external_idp_leg1, external_idp_leg2, external_idp_leg2_select,
         check_update, perform_update, update_status,
     },
     middleware::{AdminState, admin_auth_middleware},
@@ -64,11 +66,15 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/priority", post(set_credential_priority))
         .route("/credentials/{id}/rpm-limit", post(set_credential_rpm_limit))
         .route("/credentials/{id}/allowed-models", post(set_credential_allowed_models))
+        .route("/credentials/{id}/custom-api", post(set_credential_custom_api))
         .route("/credentials/{id}/name", post(set_credential_name))
         .route("/credentials/{id}/proxy", post(set_credential_proxy))
         .route("/credentials/{id}/reset", post(reset_failure_count))
         .route("/credentials/{id}/refresh", post(force_refresh_token))
         .route("/credentials/{id}/verify", post(deep_verify_credential))
+        // External IdP region 验活选择：列候选 region（GET）+ 切换到目标 region profile（POST，仅验活可用才写）
+        .route("/credentials/{id}/regions", get(probe_regions))
+        .route("/credentials/{id}/switch-region", post(switch_profile_region))
         // 选中令牌后探测可用模型（逐模型极小请求，看哪些通/哪些 INVALID_MODEL_ID）
         .route("/credentials/{id}/models", get(probe_available_models))
         .route("/credentials/{id}/balance", get(get_credential_balance))
@@ -92,6 +98,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/auth/external-idp/start", post(start_external_idp_login))
         .route("/auth/external-idp/leg1", post(external_idp_leg1))
         .route("/auth/external-idp/leg2", post(external_idp_leg2))
+        .route("/auth/external-idp/leg2/select", post(external_idp_leg2_select))
         // 用量统计查询（只读）
         .route("/usage/overview", get(usage_overview))
         .route("/usage/timeseries", get(usage_timeseries))

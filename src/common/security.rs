@@ -200,8 +200,8 @@ impl IngressRateLimiter {
 
 /// 从请求判定客户端 IP。
 ///
-/// - `trust_forwarded`=true 时优先取 `X-Forwarded-For` 首段、再 `X-Real-IP`；
-///   仅在本服务确实位于可信反代之后才应开启，否则可被伪造。
+/// - `trust_forwarded`=true 时优先取 `X-Forwarded-For` **最右**段、再 `X-Real-IP`；
+///   仅在本服务确实位于可信反代之后才应开启，否则可被伪造（取最右防伪造，见下方实现注释）。
 /// - 否则回退到 TCP 连接对端地址（`ConnectInfo`）。
 pub fn client_ip(req: &Request<Body>, peer: Option<SocketAddr>, trust_forwarded: bool) -> Option<IpAddr> {
     if trust_forwarded {
