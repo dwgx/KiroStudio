@@ -47,8 +47,6 @@ const SOCIAL_REDIRECT_FROM: &str = "KiroIDE";
 const SESSION_TTL_SECS: u64 = 900;
 /// ListAvailableProfiles 的 X-Amz-Target。
 const LIST_PROFILES_TARGET: &str = "AmazonCodeWhispererService.ListAvailableProfiles";
-/// 无 profileArn region 时的默认 AWS region。
-const DEFAULT_REGION: &str = "us-east-1";
 
 /// 单个外部 IdP 上号会话。leg1 完成后填充 `leg2`。
 struct ExternalIdpSession {
@@ -62,7 +60,39 @@ struct ExternalIdpSession {
     custom_proxy: Option<ProxyConfig>,
     /// leg2 上下文（提交 leg1 后填充）：IdP authorize/token 端点 + PKCE。
     leg2: Option<Leg2Context>,
+    /// leg2 换到 token + 探测到的多 region profile 列表（等用户选定 region 后建号）。
+    /// 多 profile 时前端弹窗选一个,select 阶段用暂存的 token 直接建号(避免二次 exchange,
+    /// 授权码一次性)。
+    pending: Option<PendingLeg2>,
     created_at: Instant,
+}
+
+/// leg2 换到 token 后暂存,等 select 阶段选定 profile 建号。
+#[derive(Clone)]
+struct PendingLeg2 {
+    access_token: String,
+    refresh_token: String,
+    expires_in: i64,
+    client_id: String,
+    token_endpoint: String,
+    issuer_url: String,
+    scopes: String,
+    /// 该账号在候选 region 探测到的全部 profile(去重)。select 的 arn 必须在此列表内(防呆+防伪)。
+    profiles: Vec<ProfileOption>,
+}
+
+/// 一个可选 profile:ARN + 解析出的 region + account(供前端展示与用户选择)。
+#[derive(Clone, Debug)]
+pub struct ProfileOption {
+    pub arn: String,
+    pub region: String,
+    pub account: String,
+    /// 该 region profile 是否真开通可用（getUsageLimits 验活 2xx）。
+    /// 实测同一 M365 账号 us-east-1 返回 403 FEATURE_NOT_SUPPORTED、eu-central-1 200，
+    /// 故列 profile 后逐个验活，前端只让用户选真能用的（或 0 个可用时标注知情）。
+    pub usable: bool,
+    /// 验活拿到的订阅标题（如 "KIRO POWER"），供前端展示与择优。
+    pub subscription_title: Option<String>,
 }
 
 /// 外部 IdP 段（leg2）上下文，`submit_leg1` 成功后建立。
@@ -93,8 +123,16 @@ pub struct ExternalIdpLeg1Result {
     pub authorize_url: String,
 }
 
-/// `submit_leg2` 结果：入池的新凭据 ID。
+/// `submit_leg2` 结果:换 token + 探测 profile。
+/// - `profiles` 多个 → 前端弹窗选,随后调 select 建号(`credential_id` 为 None)。
+/// - `profiles` 恰 1 个 → 后端已自动建号,`credential_id` 有值,前端不弹窗直接完成。
 pub struct ExternalIdpLeg2Result {
+    pub credential_id: Option<u64>,
+    pub profiles: Vec<ProfileOption>,
+}
+
+/// `submit_leg2_select` 结果:选定 profile 后入池的新凭据 ID。
+pub struct ExternalIdpSelectResult {
     pub credential_id: u64,
 }
 
@@ -163,6 +201,7 @@ impl ExternalIdpLoginManager {
                 proxy,
                 custom_proxy,
                 leg2: None,
+                pending: None,
                 created_at: Instant::now(),
             },
         );
@@ -272,7 +311,8 @@ impl ExternalIdpLoginManager {
         session_id: &str,
         pasted_url: &str,
     ) -> anyhow::Result<ExternalIdpLeg2Result> {
-        let (leg2, priority, proxy, custom_proxy) = {
+        // priority/custom_proxy 在 build_and_add_credential 里从 session 重新读,此处只需 leg2+proxy。
+        let (leg2, proxy) = {
             let sessions = self.sessions.lock();
             let s = sessions
                 .get(session_id)
@@ -284,7 +324,7 @@ impl ExternalIdpLoginManager {
                 .leg2
                 .clone()
                 .ok_or_else(|| anyhow!("请先完成第 2 步（粘贴登录跳转后的地址）"))?;
-            (leg2, s.priority, s.proxy.clone(), s.custom_proxy.clone())
+            (leg2, s.proxy.clone())
         };
 
         let params = parse_query_from_pasted(pasted_url);
@@ -310,40 +350,160 @@ impl ExternalIdpLoginManager {
 
         // 外部 IdP token 自身不带 profileArn，必须走 ListAvailableProfiles 解析
         // （带 TokenType: EXTERNAL_IDP，否则上游静默返回空列表）。
-        let region = DEFAULT_REGION.to_string();
-        let profile_arn = list_available_profiles(
+        // ⭐多 region:每个 region 端点只返回本 region 的 profile(实测),故**逐 region 探测合并**,
+        // 把该账号在候选 region 的全部 profile 都拿出来让用户选(对齐官方 kiro-cli 的选择体验)。
+        let mut profiles = list_all_available_profiles(
             &token.access_token,
-            &region,
             &self.token_manager.config().kiro_version,
             proxy.as_ref(),
             tls,
         )
         .await
         .context("解析 CodeWhisperer profileArn 失败（该 M365 账号可能未开通 Kiro/CodeWhisperer）")?;
-        let region = region_from_profile_arn(&profile_arn).unwrap_or(region);
 
-        let expires_at = (token.expires_in > 0).then(|| {
+        if profiles.is_empty() {
+            bail!("该账号在候选 region 均无可用 profile（可能未开通 Kiro/CodeWhisperer）");
+        }
+
+        // ⭐验活（本 bug 核心）：逐个 profile 真发 getUsageLimits，标出哪些 region 真开通。
+        // 实测同账号 us-east-1 → 403 FEATURE_NOT_SUPPORTED、eu-central-1 → 200 KIRO POWER，
+        // 只列出/自动选 usable 的，杜绝「导入成功但一直 403」的坑。
+        probe_profiles_usable(
+            &mut profiles,
+            &token.access_token,
+            &self.token_manager.config(),
+            proxy.as_ref(),
+        )
+        .await;
+        // usable 排前面（select/展示都优先真能用的）。
+        profiles.sort_by(|a, b| b.usable.cmp(&a.usable));
+        let usable_count = profiles.iter().filter(|p| p.usable).count();
+
+        // 暂存 token + profiles 到 session,供 select 阶段建号(避免二次 exchange,授权码一次性)。
+        {
+            let mut sessions = self.sessions.lock();
+            if let Some(s) = sessions.get_mut(session_id) {
+                s.pending = Some(PendingLeg2 {
+                    access_token: token.access_token.clone(),
+                    refresh_token: token.refresh_token.clone(),
+                    expires_in: token.expires_in,
+                    client_id: leg2.client_id.clone(),
+                    token_endpoint: leg2.token_endpoint.clone(),
+                    issuer_url: leg2.issuer_url.clone(),
+                    scopes: leg2.scopes.clone(),
+                    profiles: profiles.clone(),
+                });
+            }
+        }
+
+        // 恰 1 个 usable:无需打扰用户,直接选它建号并返回 credential_id(前端不弹窗)。
+        if usable_count == 1 {
+            let chosen = profiles
+                .iter()
+                .find(|p| p.usable)
+                .expect("usable_count==1 保证存在")
+                .arn
+                .clone();
+            let cred_id = self.build_and_add_credential(session_id, &chosen).await?;
+            return Ok(ExternalIdpLeg2Result {
+                credential_id: Some(cred_id),
+                profiles,
+            });
+        }
+
+        // 多个 usable → 返回列表给前端弹窗选(只应选 usable 的),select 阶段再建号。
+        // 0 个 usable(全 FEATURE_NOT_SUPPORTED/验活失败) → 也返回全部(标 usable=false),
+        //   让用户知情该账号目前无任何 region 开通(不擅自建一个必 403 的号)。
+        tracing::info!(
+            "外部 IdP 账号 {} 个 region profile（{} 个可用）,返回前端选择",
+            profiles.len(),
+            usable_count
+        );
+        Ok(ExternalIdpLeg2Result {
+            credential_id: None,
+            profiles,
+        })
+    }
+
+    /// leg2 选定阶段:用户从多 region profile 里选一个,用暂存 token 建号入池。
+    /// arn 必须在 session 暂存的 profiles 列表内(防呆+防伪造)。
+    pub async fn submit_leg2_select(
+        &self,
+        session_id: &str,
+        arn: &str,
+    ) -> anyhow::Result<ExternalIdpSelectResult> {
+        let cred_id = self.build_and_add_credential(session_id, arn).await?;
+        Ok(ExternalIdpSelectResult { credential_id: cred_id })
+    }
+
+    /// 用 session 暂存的 token + 指定 arn 构建凭据并入池。arn 必须在暂存 profiles 内。
+    /// region/auth_region 全部取 **arn 内的 region**(防呆铁律:region 与 ARN 物理绑定)。
+    async fn build_and_add_credential(
+        &self,
+        session_id: &str,
+        arn: &str,
+    ) -> anyhow::Result<u64> {
+        let (pending, priority, custom_proxy) = {
+            let sessions = self.sessions.lock();
+            let s = sessions
+                .get(session_id)
+                .ok_or_else(|| anyhow!("外部 IdP 上号会话不存在或已过期"))?;
+            let pending = s
+                .pending
+                .clone()
+                .ok_or_else(|| anyhow!("请先完成第 3 步（换取 token 并列出 profile）"))?;
+            (pending, s.priority, s.custom_proxy.clone())
+        };
+
+        // 防呆+防伪:选的 arn 必须确在本账号探测到的 profiles 列表里。
+        let mut chosen = pending
+            .profiles
+            .iter()
+            .find(|p| p.arn == arn.trim())
+            .ok_or_else(|| anyhow!("选中的 profile 不在该账号可用列表内（arn 不匹配）"))?
+            .clone();
+
+        // 自动纠正（J）：若选中的 profile 验活不可用（FEATURE_NOT_SUPPORTED 等），但同账号存在
+        // 其它已验活可用的 region profile，则自动改用可用的那个——绝不建一个必 403 的死号。
+        // （单 usable 时 submit_leg2 已自动选好；此处兜住「多 profile 弹窗里误选了不可用项」。）
+        if !chosen.usable {
+            if let Some(usable) = pending.profiles.iter().find(|p| p.usable) {
+                tracing::info!(
+                    "选中的 region profile {} 未开通（FEATURE_NOT_SUPPORTED）,自动改用可用的 {}",
+                    chosen.arn,
+                    usable.arn
+                );
+                chosen = usable.clone();
+            } else {
+                bail!(
+                    "该账号所有 region profile 目前均未开通（FEATURE_NOT_SUPPORTED）,暂无法建号——请确认账号已开通 Kiro 订阅"
+                );
+            }
+        }
+        // region 以 arn 内解析为准(chosen.region 已是白名单校验过的 arn region)。
+        let region = chosen.region.clone();
+
+        let expires_at = (pending.expires_in > 0).then(|| {
             chrono::Utc::now()
-                .checked_add_signed(chrono::Duration::seconds(token.expires_in))
+                .checked_add_signed(chrono::Duration::seconds(pending.expires_in))
                 .unwrap_or_else(chrono::Utc::now)
                 .to_rfc3339()
         });
 
         let new_cred = KiroCredentials {
-            access_token: Some(token.access_token),
-            refresh_token: (!token.refresh_token.is_empty()).then_some(token.refresh_token),
-            profile_arn: Some(profile_arn),
+            access_token: Some(pending.access_token.clone()),
+            refresh_token: (!pending.refresh_token.is_empty())
+                .then(|| pending.refresh_token.clone()),
+            profile_arn: Some(chosen.arn.clone()),
             expires_at,
             auth_method: Some("external_idp".to_string()),
-            client_id: Some(leg2.client_id.clone()),
-            token_endpoint: Some(leg2.token_endpoint.clone()),
-            issuer_url: Some(leg2.issuer_url.clone()),
-            scopes: (!leg2.scopes.trim().is_empty()).then(|| leg2.scopes.clone()),
+            client_id: Some(pending.client_id.clone()),
+            token_endpoint: Some(pending.token_endpoint.clone()),
+            issuer_url: Some(pending.issuer_url.clone()),
+            scopes: (!pending.scopes.trim().is_empty()).then(|| pending.scopes.clone()),
             priority,
             region: Some(region.clone()),
             auth_region: Some(region.clone()),
-            // 上号时**显式填的**代理持久化到该凭据（拆好账密），否则登录用了代理、
-            // 之后请求却回落全局代理（“上号输入的代理没有自动加入”）。global 回落不持久化。
             proxy_url: custom_proxy.as_ref().map(|p| p.url.clone()),
             proxy_username: custom_proxy.as_ref().and_then(|p| p.username.clone()),
             proxy_password: custom_proxy.as_ref().and_then(|p| p.password.clone()),
@@ -361,9 +521,16 @@ impl ExternalIdpLoginManager {
             tracing::warn!("外部 IdP 上号后获取订阅等级失败: {}", e);
         }
 
+        // 新号自动初始化(异步):刷 token + 解析 profileArn(external_idp 尤其需要真实 arn,否则 400/403)。
+        self.token_manager.spawn_initial_refresh(credential_id);
+
         self.sessions.lock().remove(session_id);
-        tracing::info!("外部 IdP（Microsoft）上号成功，新凭据 #{}", credential_id);
-        Ok(ExternalIdpLeg2Result { credential_id })
+        tracing::info!(
+            "外部 IdP（Microsoft）上号成功，新凭据 #{}（region={}）",
+            credential_id,
+            region
+        );
+        Ok(credential_id)
     }
 
     fn cleanup_expired(&self) {
@@ -563,13 +730,16 @@ async fn exchange_code(
 
 /// 解析外部 IdP token 的 CodeWhisperer profileArn。
 /// **必须**带 `TokenType: EXTERNAL_IDP`，否则上游静默返回空列表。
-async fn list_available_profiles(
+/// 打**单个 region** 的 `q.{region}.amazonaws.com` ListAvailableProfiles,返回该 region 的
+/// 全部 profile arn(实测每端点只返回本 region 的 profile)。空列表返回 Ok(vec![]),不报错
+/// (交由上层跨 region 合并后统一判空)。
+async fn list_region_profile_arns(
     access_token: &str,
     region: &str,
     kiro_version: &str,
     proxy: Option<&ProxyConfig>,
     tls: crate::model::config::TlsBackend,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Vec<String>> {
     if access_token.trim().is_empty() {
         bail!("access_token 为空");
     }
@@ -607,21 +777,112 @@ async fn list_available_profiles(
     if !status.is_success() {
         bail!("ListAvailableProfiles 返回 {}", status);
     }
-    body.get("profiles")
+    let arns = body
+        .get("profiles")
         .and_then(|v| v.as_array())
-        .and_then(|arr| {
+        .map(|arr| {
             arr.iter()
-                .find_map(|p| p.get("arn").and_then(|a| a.as_str()))
+                .filter_map(|p| p.get("arn").and_then(|a| a.as_str()))
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
         })
-        .ok_or_else(|| anyhow!("无可用 profile（账号可能未开通 Kiro/CodeWhisperer）"))
+        .unwrap_or_default();
+    Ok(arns)
+}
+
+/// 跨候选 region 探测该账号的**全部** profile,合并去重为 `Vec<ProfileOption>`。
+///
+/// 每个 region 端点只返回本 region 的 profile(实测 2026-07-12),故必须逐 region 打。
+/// 候选 region = `PROFILE_PROBE_REGIONS`(us-east-1 / eu-central-1,dwgx 定的最普遍两个)。
+/// 并发探测,单 region 失败不阻断其它;按 arn 去重。region 由 arn 严格解析(白名单校验)。
+async fn list_all_available_profiles(
+    access_token: &str,
+    kiro_version: &str,
+    proxy: Option<&ProxyConfig>,
+    tls: crate::model::config::TlsBackend,
+) -> anyhow::Result<Vec<ProfileOption>> {
+    use crate::kiro::token_manager::PROFILE_PROBE_REGIONS;
+    // 并发打所有候选 region。
+    let futs = PROFILE_PROBE_REGIONS.iter().map(|region| {
+        let region = region.to_string();
+        async move {
+            match list_region_profile_arns(access_token, &region, kiro_version, proxy, tls).await {
+                Ok(arns) => arns,
+                Err(e) => {
+                    tracing::debug!("region={} 探测 profile 失败(不阻断): {}", region, e);
+                    Vec::new()
+                }
+            }
+        }
+    });
+    let per_region: Vec<Vec<String>> = futures::future::join_all(futs).await;
+
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<ProfileOption> = Vec::new();
+    for arn in per_region.into_iter().flatten() {
+        if !seen.insert(arn.clone()) {
+            continue; // 去重(理论上不同 region 端点返回的 arn 不重,防御性)
+        }
+        // region 用 KiroCredentials 的严格白名单解析(与对话端点选 region 同一套逻辑)。
+        let region = KiroCredentials::region_from_profile_arn(&arn)
+            .map(|s| s.to_string())
+            .or_else(|| region_from_profile_arn(&arn))
+            .unwrap_or_default();
+        let account = account_from_profile_arn(&arn).unwrap_or_default();
+        out.push(ProfileOption {
+            arn,
+            region,
+            account,
+            usable: false,
+            subscription_title: None,
+        });
+    }
+    Ok(out)
+}
+
+/// 对已列出的候选 profile 逐个验活（getUsageLimits），填 `usable` / `subscription_title`。
+///
+/// 用 leg2 的 access_token 构造临时 external_idp 凭据（尚未入池），复用
+/// [`crate::kiro::token_manager::probe_profile_usable`]（与刷新/切换路径同一套判据）。
+/// 单个验活失败/限流不阻断其它——只是该项 usable=false（保守，绝不因 429 判死 region）。
+async fn probe_profiles_usable(
+    profiles: &mut [ProfileOption],
+    access_token: &str,
+    config: &crate::model::config::Config,
+    proxy: Option<&ProxyConfig>,
+) {
+    use crate::kiro::token_manager::{probe_profile_usable, ProfileProbeOutcome};
+    // 临时 external_idp 基准凭据：只需 auth_method + token 供 probe 构造请求。
+    let base = KiroCredentials {
+        access_token: Some(access_token.to_string()),
+        auth_method: Some("external_idp".to_string()),
+        ..Default::default()
+    };
+    for p in profiles.iter_mut() {
+        match probe_profile_usable(&base, config, access_token, proxy, &p.arn).await {
+            ProfileProbeOutcome::Usable { subscription_title } => {
+                p.usable = true;
+                p.subscription_title = subscription_title;
+            }
+            other => {
+                p.usable = false;
+                tracing::debug!("profile {} 验活不可用: {:?}", p.arn, other);
+            }
+        }
+    }
 }
 
 /// 从 `arn:aws:codewhisperer:{region}:...` 提取 region（index 3）。
 fn region_from_profile_arn(arn: &str) -> Option<String> {
     let parts: Vec<&str> = arn.trim().split(':').collect();
     parts.get(3).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// 从 `arn:aws:codewhisperer:{region}:{account}:...` 提取 account（index 4，供前端展示区分账号）。
+fn account_from_profile_arn(arn: &str) -> Option<String> {
+    let parts: Vec<&str> = arn.trim().split(':').collect();
+    parts.get(4).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
 /// SHA-256 十六进制。
@@ -674,6 +935,24 @@ mod tests {
             Some("us-west-2".to_string())
         );
         assert_eq!(region_from_profile_arn("garbage"), None);
+    }
+
+    #[test]
+    fn test_account_from_profile_arn() {
+        // 多 profile 账号 region 不同、account 也不同,前端要靠 account 区分展示。
+        assert_eq!(
+            account_from_profile_arn(
+                "arn:aws:codewhisperer:us-east-1:617485799832:profile/D7XY4GXYQWG4"
+            ),
+            Some("617485799832".to_string())
+        );
+        assert_eq!(
+            account_from_profile_arn(
+                "arn:aws:codewhisperer:eu-central-1:155119901513:profile/ACPYXKUPYE3H"
+            ),
+            Some("155119901513".to_string())
+        );
+        assert_eq!(account_from_profile_arn("garbage"), None);
     }
 
     #[test]

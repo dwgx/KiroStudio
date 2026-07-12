@@ -2,6 +2,88 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.5] - 2026-07-12
+
+### 模型识别（registry 重构）
+- **模型目录改为单一声明式真相源**（`model_catalog.rs`）：一张 `CATALOG` 表，每个 Kiro 真实
+  modelId 一行，携带别名/上下文窗口/计费倍率/能力。`map_model` / `get_context_window_size` /
+  `/v1/models` 广告清单全部从此表派生，消灭「广告清单 vs 映射逻辑」漂移。对齐 Kiro 官方模型表
+  （补全 Sonnet 5 / Sonnet 4.0 / Auto，DeepSeek 128K、Qwen 256K 窗口）。
+- **修旧 `contains` 子串匹配的静默错档**：Claude 老名不再静默升到最贵档、高版本不再静默降级、
+  未知模型/未知版本改为**显式拒绝**（strict，可用 `KIRO_ALLOW_UNKNOWN_VERSION=1` 回退最新档），
+  所有非精确命中打 `warn` 日志（从静默变可观测）。
+- **修含 "auto" 子串的未知名被静默映射到 Auto**：`gpt-4-auto` / `autopilot` 等不含真实族名但含
+  `auto` 子串的名字，此前会静默命中 Kiro Auto（1.0x）真实发上游、既不拒也不告警。改为 Auto 只经
+  精确别名（`auto` / `claude-auto`）命中，其余 strict 拒绝。
+
+### 流式与国产模型
+- **剥离 DeepSeek DSML 工具协议标记**：国产模型（deepseek/qwen/glm）调工具前会吐 `<｜DSML｜…>` /
+  `<｜tool▁calls▁begin｜>` 家族标记，原样透传会让客户端看到乱码。新增跨 chunk 安全的剥离逻辑，
+  白名单门控、**只对国产模型生效**，Claude 路径首行即原样返回（零风险跳过）。
+- **修 thinking 模式下 DSML 残留导致的 SSE 块顺序交错**：流在 thinking 块内结束且末尾残留 `<` 时，
+  把 DSML 尾巴 flush 移到 thinking 块 stop 之后，避免「新 text 块 start → 旧 thinking 块 stop」
+  违反 Anthropic「先 stop 再 start」契约。
+- **cc_auto_buffer 默认改真流式**：Claude Code 请求从整段缓冲改为边到边逐块转发，修 CC 卡顿
+  （想要 message_start 即精确 input_tokens 的场景仍可将 ccAutoBuffer 设回 true，热更即时生效）。
+
+### 号池与稳定性
+- **根治 id 复用隐患**：进程内单调计数器（`AtomicU64`，`fetch_add` 取号永不回退/复用），删号后
+  清 per-id 冷却 / RPM / 模型黑名单态，杀「删号→出回收站→再加号复用旧 id→静默继承死号内存态」。
+- **custom_api 请求上限改为终身预算**：`request_count` 纳入持久化（`kiro_stats.json`），达上限时
+  **立即落盘** `request_count` + 禁用状态，修「重启即额度归零、被禁号重新可用」的防超预算漏洞。
+
+### External IdP 多 region profile（403 FEATURE_NOT_SUPPORTED 根治）
+- **同一 External IdP 账号多 region profile「验活选 region」**：实测坐实同一微软账号在 us-east-1 /
+  eu-central-1 各有独立 profile，但**只有部分 region 真正开通可用**（另一 region 打 getUsageLimits
+  返回 403 FEATURE_NOT_SUPPORTED）。导入时逐 region 探测 + **验活**（试 getUsageLimits），把可用
+  region 标出、默认选可用的（多个才让用户选）；导入 UI 从盲取第一个改为列出全部 profile 让选。
+- **存量坏号自动纠正**：已入池号若当前 region profile 返回 FEATURE_NOT_SUPPORTED，刷新时自动
+  reprobe 切到可用 region（`sync_region_from_arn` 保 region 与 ARN 物理绑定，杜绝错配 400）。
+- 右键卡片设置支持切换 Profile ARN region（切 ARN 而非改 region 字段，带验活校验，不可用则拒绝写入）。
+
+### 安全（Grok 审计修复）
+- **清除源码内嵌真实代理账密**（C1）：`http_client.rs` / `credentials.rs` / `usage_stats.rs` 三处
+  测试样例的真实 socks5 账密与 IP 全部改虚构样例（RFC5737 文档 IP）。
+- **custom_api 出站 SSRF 防护**（H1）：写入 `base_url` 时校验最终透传 URL 目标 IP 不落私网/环回/
+  链路本地/元数据段（复用 `ssrf` 现有 forbidden 逻辑，DNS 失败放行不误伤）；透传/测活出站禁重定向
+  （`redirect::Policy::none()`），堵死「公网 302 → 内网/元数据」的绕过链。
+
+### Windows
+- **系统托盘**：Windows 裸跑在系统托盘显示图标，右键菜单：打开网页 / 复制面板密钥 / 重启服务 /
+  版本号 / 退出。「退出」走优雅关闭（drain 在途请求、关 SQLite），不硬杀。专用线程跑 win32 消息
+  循环，不占 tokio 主线程；非 Windows 编译时不含托盘。
+- **数据隔离 + 首次开浏览器**：Windows 裸跑把 config.json / credentials.json / 用量库统一收进 exe
+  同目录 `KiroStudio-data/`（兼容旧位置存量配置，不丢号）；首次启动（新生成 config 时）自动开
+  浏览器到 /admin。Linux 与显式 `--config` 路径行为不变。
+- **面板 OTA / 重启在 Windows 裸跑（双击 exe）下支持自重启**：升级/重启后进程自身 spawn 一个后台
+  helper（`.bat`），等旧进程退出、端口释放后用原路径拉起新 exe——不再依赖 systemd/监督脚本。
+  修复 detached helper 缺 `CREATE_BREAKAWAY_FROM_JOB` 导致主进程在 job object 下退出时连带杀掉
+  重启脚本、新进程起不来的问题（带 fallback：job 禁止 breakaway 时回退）。
+- 更正 `DEPLOY-WINDOWS.md` / `update.bat` 的陈旧描述（旧文档称 OTA 会下 Linux 包/不可用，
+  实际 v0.6.6 起已下对平台包 + 绕文件锁 + 回滚）。
+
+### 工具调用（Invalid tool parameters 类型C 根治）
+- **修 tool_use input 多帧拼装的非前缀重写洞**：Kiro 上游同一 tool_use_id 逐帧到达的 input，旧
+  merge 只有「前缀替换 / 否则追加」两步，遇到非前缀双完整对象（如 AskUserQuestion 深嵌套参数被
+  重写）会拼成 `}{` 粘连的非法 JSON → 客户端报 Invalid tool parameters。抽出 `merge_tool_input`
+  纯函数补全 7 步决策表（新增「丢迟到旧短快照」「非前缀双完整对象取最新」），流式/非流式共用
+  同一实现消除漂移。保持「stop 前不发 delta、stop 时单个 input_json_delta」不变式。
+
+### 前端
+- **号池列表 FLIP 平滑重排动画**：排序模式切换 / 显隐变化时，列表项从旧位滑到新位（不瞬跳）。
+- **UI 排版自定义**：号池排序模式 + 卡片尺寸档位（设置页新增「UI 排版」区，切换后统一走保存按钮）。
+- **custom_api 专属卡片**：上游地址 / 请求用量 / 测活，隐藏 Kiro 订阅/余额/刷新 Token。
+- **白名单（允许模型）/ 测活统一到勾选后批量操作**：去掉卡片正面重复的「测活」「允许模型」按钮，
+  改为勾选凭据后由工具栏「批量验活」「允许模型」（弹窗）统一操作，卡片正面更清爽。
+- 新号初始化翻牌 toast 通知。
+
+## [0.7.4] - 2026-07-11
+
+### 修复
+- **透传号被 Kiro 选号误选致 403 冷却**：彻底隔离 custom_api 与 Kiro 两个选号池——
+  `is_entry_selectable` 对 custom_api 直接返回 false（Kiro 永不选透传号），透传结果记账只动
+  per-id RPM/计数，不碰 Kiro 的 health/family/token 状态。
+
 ## [0.7.3] - 2026-07-11
 
 ### 修复

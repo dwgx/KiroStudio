@@ -170,6 +170,25 @@ pub struct SetRpmLimitRequest {
     pub rpm_limit: Option<u32>,
 }
 
+/// 修改自定义 API(代挂透传)凭据配置的请求。字段均可选:None=不改。
+/// 仅对 custom_api 凭据有效(后端 gate 拒绝非 custom_api 号)。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCustomApiConfigRequest {
+    /// 上游地址(base_url)。None=不改;非空=更新;空串=后端拒绝(必填)。
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// 上游密钥(api_key)。None=不改;空串=清除;非空=更新。
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// 请求上限。None=不改;0=不限;>0=更新。
+    #[serde(default)]
+    pub request_limit: Option<u64>,
+    /// 是否归零调用次数(换上游/换 key 时前端可勾选,避免旧计数残留触顶)。
+    #[serde(default)]
+    pub reset_count: bool,
+}
+
 /// 设置凭据级「允许模型」白名单的请求（成本安全硬门；空/null = 不限制）
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

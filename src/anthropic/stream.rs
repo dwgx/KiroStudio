@@ -759,6 +759,13 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
+    /// DSML 标记跨 chunk 探测缓冲:保留可能是半个 DeepSeek 工具标记(如 `<｜DSML` / `<｜tool▁`)
+    /// 的文本尾巴,等下一个 chunk 拼上再判定,避免标记被从中间切开导致漏字或漏标记。详见 strip_dsml_markers。
+    dsml_tail_buffer: String,
+    /// tail 里的残留是否**已确认为 DSML 关键字标记**(而非"不确定的正文半标记")。
+    /// true=流结束 flush 时丢弃(标记噪音,不补发,否则 `<｜DSML…` 会当正文泄漏);
+    /// false=flush 时作普通文本补发(被误判的正文/末尾孤立 `<`,不吞字)。
+    dsml_tail_is_marker: bool,
     /// 本次响应的完成状态（收尾时据此决定 outcome / SSE error / HTTP 码）。
     /// 默认 `Ok`；in-band `Event::Error` / 传输中断 / 解码器停止时被置为对应失败态。
     completion: CompletionStatus,
@@ -795,6 +802,8 @@ impl StreamContext {
             thinking_block_index: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
+            dsml_tail_buffer: String::new(),
+            dsml_tail_is_marker: false,
             completion: CompletionStatus::Ok,
             error_event_emitted: false,
         }
@@ -1027,8 +1036,145 @@ impl StreamContext {
         }
     }
 
+    /// 剥离 DeepSeek 的工具调用协议标记(DSML 特殊 token),它们本是模型内部"要开始调工具"的
+    /// 分隔符、不该出现在给用户的文本流里,但 Kiro 上游未过滤、当普通文本发下来(实测坐实:
+    /// deepseek 调工具前先吐 `<｜DSML｜function_calls` / `<｜tool▁calls▁begin｜>` 家族标记,
+    /// 之后才发真正的 toolUseEvent 帧)。原样透传会让客户端看到乱码标记。
+    ///
+    /// 标记用全角竖线 `｜`(U+FF5C)分隔,形如 `<｜DSML｜...` / `<｜tool▁calls▁begin｜>` /
+    /// `<｜tool▁call▁begin｜>` / `<｜tool▁sep｜>` / `<｜tool▁call▁end｜>` 等。
+    ///
+    /// 跨 chunk 安全:标记可能被上游分帧从中间切开。策略——先把上轮留存的尾巴拼到本次内容前,
+    /// 然后:①遇到 `<｜` 开头且已闭合 `｜>` 或后接 DSML/tool 关键字的完整标记 → 整段丢弃;
+    /// ②末尾若是"半个可能的标记"(有 `<｜` 但还没闭合)→ 留到 dsml_tail_buffer 等下轮;
+    /// ③其余正常文本原样输出。只对**含全角竖线的 `<｜` 序列**动手,绝不误伤正常 `<` 文本。
+    /// 是否对本请求模型启用 DSML 剥离:**只对会吐 DSML 工具标记的国产模型**(deepseek/qwen/glm/
+    /// minimax/kimi/moonshot 等)启用;Claude 系绝不剥离(它不产生这些标记,剥离只会误伤正文/吞字)。
+    fn dsml_filter_applicable(&self) -> bool {
+        let m = self.model.to_ascii_lowercase();
+        // Claude 系明确排除(最主力路径,零风险优先)。
+        if m.contains("claude") || m.contains("opus") || m.contains("sonnet") || m.contains("haiku") {
+            return false;
+        }
+        m.contains("deepseek")
+            || m.contains("qwen")
+            || m.contains("glm")
+            || m.contains("minimax")
+            || m.contains("kimi")
+            || m.contains("moonshot")
+            || m.contains("deepglm") // 兜底泛化(未来国产名)
+    }
+
+    /// `<｜` 之后是否确为已知 DSML/工具协议标记关键字(白名单)。只有命中才剥离,
+    /// 避免正文里合法的 `<｜…>`(CJK 排版 / 用户引用 token / 代码)被误删。
+    /// DeepSeek 标记家族:`<｜DSML｜…` / `<｜tool▁calls▁begin｜>` / `<｜tool▁call▁begin｜>` /
+    /// `<｜tool▁sep｜>` / `<｜tool▁call▁end｜>` / `<｜tool▁calls▁end｜>` 等,均以 `DSML`/`tool` 开头。
+    fn is_dsml_keyword_after_pipe(rest: &str) -> bool {
+        // rest = `<｜` 之后的内容(不含 `<｜`)。大小写不敏感前缀匹配。
+        let r = rest.trim_start().to_ascii_lowercase();
+        r.starts_with("dsml") || r.starts_with("tool") || r.starts_with("function")
+    }
+
+    /// DSML 尾巴缓冲的最大保留字符数:超过说明 `<｜` 后长期不闭合、大概率**不是**标记(正常正文),
+    /// 应作为普通文本放行,避免无界囤积 + 静默吞正文。DeepSeek 标记都很短(<40 字符)。
+    const DSML_TAIL_MAX: usize = 48;
+
+    fn strip_dsml_markers(&mut self, content: &str) -> String {
+        // 模型门控:非国产模型(尤其 Claude)完全不走剥离,原样返回,零风险零开销。
+        if !self.dsml_filter_applicable() {
+            return content.to_string();
+        }
+        // 快路径:无待处理尾巴且不含 `<`,直接返回。
+        if self.dsml_tail_buffer.is_empty() && !content.contains('<') {
+            return content.to_string();
+        }
+        let mut work = std::mem::take(&mut self.dsml_tail_buffer);
+        self.dsml_tail_is_marker = false; // 取出后复位;若本轮再 hold 确认标记会重新置 true
+        work.push_str(content);
+
+        let mut out = String::with_capacity(work.len());
+        let chars: Vec<char> = work.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            // 探测 DSML 标记起点:`<` 紧跟全角竖线 `｜`(U+FF5C)。
+            if chars[i] == '<' && i + 1 < chars.len() && chars[i + 1] == '\u{FF5C}' {
+                let rest: String = chars[i + 2..].iter().collect();
+                // 白名单校验:`<｜` 后必须确为 DSML/tool/function 关键字才当标记;否则是正文,原样输出。
+                // 若关键字尚不完整(rest 太短还看不出)且没闭合,则 hold 到下轮再判。
+                let looks_marker = Self::is_dsml_keyword_after_pipe(&rest);
+                let closed = chars[i..].iter().position(|&c| c == '>');
+                if looks_marker {
+                    if let Some(rel_gt) = closed {
+                        i += rel_gt + 1; // 完整标记 `<｜…>` 整段丢弃
+                        continue;
+    } else {
+                        // 已**确认是 DSML/tool 关键字标记**但无 `>` 闭合:DeepSeek 的 `<｜DSML｜function_calls`
+                        // 这类标记本就不以 `>` 收尾、以后续(转成真 toolUseEvent 帧)为界,文本流里到此即断。
+                        // 它是标记噪音**不是正文**——丢弃本 chunk 从 `<｜` 起的余下全部,标记 tail 为
+                        // "确认标记残留",使流结束 flush 时**丢弃而非补发**(补发会把 <｜DSML… 当正文泄漏)。
+                        let held: String = chars[i..].iter().collect();
+                        if held.chars().count() > Self::DSML_TAIL_MAX {
+                            // 超长仍无 `>`:关键字命中大概率是误判(正文恰以 <｜tool… 开头且很长),
+                            // 放行为正文避免吞掉大段合法内容(误判从宽,宁可偶尔漏个标记也不吞正文)。
+                            out.push_str(&held);
+                        } else {
+                            self.dsml_tail_buffer = held;
+                            self.dsml_tail_is_marker = true;
+                        }
+                        return out;
+                    }
+                } else {
+                    // `<｜` 后不是关键字:可能是(a)正文里合法 `<｜…>`→原样输出这个 `<`,继续扫;
+                    // (b)关键字还没到齐(rest 短且未闭合)→ hold 等下轮确认。
+                    let undecided = closed.is_none() && rest.chars().count() < 8;
+                    if undecided {
+                        let held: String = chars[i..].iter().collect();
+                        if held.chars().count() <= Self::DSML_TAIL_MAX {
+                            self.dsml_tail_buffer = held;
+                            return out;
+                        }
+                        // 超长:放行为正文
+                    }
+                    // 确定不是标记:原样输出 `<` 后继续(不跳过后续内容)。
+                    out.push(chars[i]);
+                    i += 1;
+                    continue;
+                }
+            }
+            out.push(chars[i]);
+            i += 1;
+        }
+        // 边界:输出末尾孤立 `<`(标记 `<｜` 可能被从 `<` 与 `｜` 间切开)。hold 等下轮拼判。
+        if out.ends_with('<') {
+            out.pop();
+            self.dsml_tail_buffer.push('<');
+        }
+        out
+    }
+
+    /// 流结束时把 DSML 尾巴缓冲里的残留作为**普通文本**补发,避免末尾孤立 `<`/未闭合半标记被静默吞掉。
+    /// 收尾路径(generate_final_events/finish)调用。返回残留文本(空则无事)。
+    pub fn flush_dsml_tail(&mut self) -> Vec<SseEvent> {
+        if self.dsml_tail_buffer.is_empty() {
+            return Vec::new();
+        }
+        let leftover = std::mem::take(&mut self.dsml_tail_buffer);
+        let was_marker = self.dsml_tail_is_marker;
+        self.dsml_tail_is_marker = false;
+        if was_marker {
+            // 已确认是 DSML 关键字标记的残留(如 `<｜DSML｜function_calls` 无 `>` 收尾):丢弃,
+            // 绝不补发——补发会把标记当正文泄漏给客户端(这正是之前实测漏的那条)。
+            return Vec::new();
+        }
+        // 否则是被误判为半标记的正文(或流在 `<` 后截断):按普通文本发出,不吞字。
+        self.create_text_delta_events(&leftover)
+    }
+
     /// 处理助手响应事件
     fn process_assistant_response(&mut self, content: &str) -> Vec<SseEvent> {
+        // 先剥离 DeepSeek DSML 工具协议标记(跨 chunk 安全),再走后续文本处理。
+        let cleaned = self.strip_dsml_markers(content);
+        let content = cleaned.as_str();
         if content.is_empty() {
             return Vec::new();
         }
@@ -1393,17 +1539,12 @@ impl StreamContext {
         // 不要求逐片合法。故最稳做法（kiro2api 已验证）：按 tool_use_id **缓冲**到 stop，校验后
         // **一次性发单个 delta**。全程 String 级重组，绝不做字节切片，char-boundary panic 面彻底消除。
         //
-        // 重组语义（与真实上游模式对齐，自适应累积快照 / 纯增量）：
-        //   - 累积（本帧以已缓冲为前缀且更长）→ 用本帧整体替换缓冲（取最新最全快照）。
-        //   - 完全重复帧 → 不变。
-        //   - 纯增量 / 前缀不成立 → 追加本帧（还原完整内容）。
+        // 重组语义（与真实上游模式对齐，见 `merge_tool_input` 完备决策表）：
+        //   累积快照 / 纯增量碎片 / 重复终帧 / 迟到旧短快照 / 非前缀重写 均被正确处理。
+        //   关键：非前缀双完整对象不再被无脑 append 成 `}{` 粘连非法 JSON（Invalid tool parameters 类型 C）。
         if !tool_use.input.is_empty() {
             let buf = self.tool_input_sent.entry(tool_use.tool_use_id.clone()).or_default();
-            if tool_use.input.len() >= buf.len() && tool_use.input.starts_with(buf.as_str()) {
-                *buf = tool_use.input.clone();
-            } else if buf.as_str() != tool_use.input {
-                buf.push_str(&tool_use.input);
-            }
+            *buf = merge_tool_input(buf, &tool_use.input);
         }
 
         // 仅在 stop 时把完整缓冲一次性发出 + 关闭块（此前只累积、不发 partial_json）。
@@ -1538,6 +1679,16 @@ impl StreamContext {
             }
             self.thinking_buffer.clear();
         }
+
+        // Flush DSML 尾巴缓冲:把被误判为半标记而 hold 住的残留(或末尾孤立 `<`)作为普通文本补发,
+        // 避免静默吞字。**必须放在 thinking 块收尾之后**:thinking 模式下 strip_dsml_markers 先于
+        // process_content_with_thinking 执行,末尾残留 `<` 被 hold 进 dsml_tail_buffer(不进
+        // thinking_buffer)。若在 thinking 块 stop 之前 flush,create_text_delta_events 会先开一个
+        // text 块(更大索引),而更小索引的 thinking 块尚未 stop → SSE 出现「新块 start → 旧块 stop」
+        // 交错,违反 Anthropic「先 stop 当前块再 start 下一块」契约,CC 可能解析报错。放在此处,
+        // 残留 text 块在 thinking 块 stop 之后才 start,顺序合法;残留也使 has_non_thinking_blocks()
+        // 变真,避免下方「仅 thinking」分支多补一个空格 text 块。
+        events.extend(self.flush_dsml_tail());
 
         // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
         // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
@@ -1747,6 +1898,64 @@ fn estimate_tokens(text: &str) -> i32 {
     (chinese_tokens + other_tokens).max(1)
 }
 
+/// 判定一段字符串是否为一个**完整合法**的 JSON 值（对象/数组/标量均可）。
+/// 用于 `merge_tool_input` 识别「非前缀重写」：两帧各自都完整时不能追加。
+fn is_complete_json(s: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(s).is_ok()
+}
+
+/// 合并同一 tool_use_id 逐帧到达的 input，返回合并后的新缓冲值。
+///
+/// 上游 `toolUseEvent.input` 的到达模式并不统一：可能是**纯增量碎片**（每帧只带新片段）、
+/// **累积快照**（每帧是"到目前为止的完整 JSON"）、偶发**重复终帧**、迟到的**旧短快照**，
+/// 甚至**非前缀重写**（同一 id 先发一个完整对象、再发另一个措辞不同的完整对象）。
+/// 旧实现只有「前缀替换 / 否则 append」两步，遇到非前缀双完整对象会拼成 `}{` 粘连的非法 JSON
+/// → 客户端 `JSON.parse` 失败 → **Invalid tool parameters（类型 C）**。
+///
+/// 完备决策表（顺序敏感）：
+///   1. frame 空           → buf 不变
+///   2. buf 空             → frame
+///   3. frame == buf       → buf 不变（重复终帧，不翻倍）
+///   4. frame 以 buf 为前缀且更长 → frame（累积快照，取最新最全）
+///   5. buf 以 frame 为前缀（frame 更短） → buf 不变（丢弃迟到的旧短快照）
+///   6. buf 与 frame 各自都是完整合法 JSON → frame（非前缀重写，只留最新完整对象，消灭 `}{` 粘连）
+///   7. 否则               → buf + frame 追加（真增量碎片，还原完整内容）
+///
+/// 注意第 6 步的前提是**两者各自都完整**：单个完整 JSON 对象无法再被增量扩展，因此第二个
+/// 完整对象必然是重写而非续写；反之若 frame 仅是"看似完整"的内层片段（如 `{"inner":1}` 续在
+/// `{"outer":` 之后），buf 尚不完整则不触发第 6 步，仍走第 7 步正确追加。
+pub(crate) fn merge_tool_input(buf: &str, frame: &str) -> String {
+    // 1. 空帧 → 缓冲不变
+    if frame.is_empty() {
+        return buf.to_string();
+    }
+    // 2. 缓冲空 → 取本帧
+    if buf.is_empty() {
+        return frame.to_string();
+    }
+    // 3. 完全重复终帧 → 不变（避免翻倍）
+    if frame == buf {
+        return buf.to_string();
+    }
+    // 4. 累积快照：本帧以缓冲为前缀且更长 → 用本帧整体替换
+    if frame.len() > buf.len() && frame.starts_with(buf) {
+        return frame.to_string();
+    }
+    // 5. 迟到的旧短快照：缓冲以本帧为前缀（本帧更短）→ 保留更全的缓冲，丢弃本帧
+    if buf.len() > frame.len() && buf.starts_with(frame) {
+        return buf.to_string();
+    }
+    // 6. 非前缀重写：缓冲与本帧各自都是完整合法 JSON → 只留最新完整对象（消灭 `}{` 粘连）
+    if is_complete_json(buf) && is_complete_json(frame) {
+        return frame.to_string();
+    }
+    // 7. 真增量碎片：追加还原完整内容
+    let mut merged = String::with_capacity(buf.len() + frame.len());
+    merged.push_str(buf);
+    merged.push_str(frame);
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1759,6 +1968,178 @@ mod tests {
         assert!(sse_str.starts_with("event: message_start\n"));
         assert!(sse_str.contains("data: "));
         assert!(sse_str.ends_with("\n\n"));
+    }
+
+    fn mk_ctx() -> StreamContext {
+        StreamContext::new_with_thinking("deepseek", 10, false, HashMap::new())
+    }
+
+    #[test]
+    fn test_strip_dsml_full_marker_in_one_chunk() {
+        // DeepSeek 工具协议标记应被整段剥离,正常文本保留。
+        let mut ctx = mk_ctx();
+        let out = ctx.strip_dsml_markers("先看目录。\n\n<｜DSML｜function_calls｜>后续");
+        assert_eq!(out, "先看目录。\n\n后续", "DSML 完整标记应被剥离,前后正常文本保留");
+        assert!(ctx.dsml_tail_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_strip_dsml_tool_calls_family() {
+        let mut ctx = mk_ctx();
+        let out = ctx.strip_dsml_markers("<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>正文");
+        assert_eq!(out, "正文", "tool_calls 家族标记应全部剥离");
+    }
+
+    #[test]
+    fn test_strip_dsml_cross_chunk_split() {
+        // 标记被上游从中间切成两个 chunk:第一块留半个标记到 tail,第二块拼上闭合后整段剥离。
+        let mut ctx = mk_ctx();
+        let out1 = ctx.strip_dsml_markers("正常文字<｜DSML｜func");
+        assert_eq!(out1, "正常文字", "闭合前只输出正常文字,半个标记留 tail");
+        assert!(!ctx.dsml_tail_buffer.is_empty(), "半个标记应留在 tail 缓冲");
+        let out2 = ctx.strip_dsml_markers("tion_calls｜>之后");
+        assert_eq!(out2, "之后", "拼上闭合后整段标记被剥离,只剩后续文本");
+        assert!(ctx.dsml_tail_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_strip_dsml_split_at_angle_bracket() {
+        // 实测坐实的分帧:`<` 单独在前一帧末尾,`｜DSML…` 在下一帧。
+        let mut ctx = mk_ctx();
+        let out1 = ctx.strip_dsml_markers("创建网页。\n\n<");
+        assert_eq!(out1, "创建网页。\n\n", "末尾孤立 < 应 hold 到 tail,不输出");
+        assert_eq!(ctx.dsml_tail_buffer, "<");
+        let out2 = ctx.strip_dsml_markers("｜DSML｜function_calls｜>正文");
+        assert_eq!(out2, "正文", "拼上后 <｜DSML…> 整段剥离");
+        assert!(ctx.dsml_tail_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_strip_dsml_trailing_angle_then_normal() {
+        // 末尾 < 被 hold,但下一帧是正常文本(非｜)→ < 应被还原输出,不丢字。
+        let mut ctx = mk_ctx();
+        let out1 = ctx.strip_dsml_markers("比较 a <");
+        assert_eq!(out1, "比较 a ");
+        let out2 = ctx.strip_dsml_markers(" b");
+        assert_eq!(out2, "< b", "孤立 < 后接正常文本应还原,不误吞");
+    }
+
+    #[test]
+    fn test_strip_dsml_does_not_touch_normal_text() {
+        // 不含 DSML 的正常文本(哪怕有普通 < 号)绝不被改动。
+        let mut ctx = mk_ctx();
+        let out = ctx.strip_dsml_markers("if a < b && c > d 这是正常代码");
+        assert_eq!(out, "if a < b && c > d 这是正常代码");
+        assert!(ctx.dsml_tail_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_strip_dsml_claude_model_never_filtered() {
+        // 门控:Claude 系模型完全不剥离——哪怕内容里恰好含 <｜…>(如用户让 Claude 解释 DSML)也原样保留。
+        let mut ctx = StreamContext::new_with_thinking("claude-sonnet-4.6", 10, false, HashMap::new());
+        let s = "DeepSeek 的标记写作 <｜DSML｜function_calls｜> 你看";
+        assert_eq!(ctx.strip_dsml_markers(s), s, "Claude 模型不应剥离任何 <｜…>");
+        assert!(ctx.dsml_tail_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_strip_dsml_keyword_whitelist_preserves_normal_fullwidth() {
+        // 国产模型下,<｜ 后不是 DSML/tool/function 关键字的正文(CJK 排版)不被误删。
+        let mut ctx = mk_ctx(); // deepseek
+        let s = "见 <｜注｜关于x｜> 说明";
+        assert_eq!(ctx.strip_dsml_markers(s), s, "非关键字的 <｜…> 属正文,应保留");
+    }
+
+    #[test]
+    fn test_strip_dsml_flush_recovers_leftover() {
+        // 末尾孤立 < 被 hold 后,若流结束(无下一帧),flush_dsml_tail 应把它作为普通文本补发,不吞字。
+        let mut ctx = mk_ctx();
+        let out = ctx.strip_dsml_markers("结尾是 a <");
+        assert_eq!(out, "结尾是 a ");
+        assert_eq!(ctx.dsml_tail_buffer, "<");
+        // 模拟流结束:flush 应产出含 "<" 的 text_delta 事件,tail 清空。
+        let flushed = ctx.flush_dsml_tail();
+        assert!(!flushed.is_empty(), "flush 应补发残留 <,不静默吞字");
+        assert!(ctx.dsml_tail_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_strip_dsml_marker_no_gt_discarded_on_flush() {
+        // 实测漏的形态:<｜DSML｜function_calls 单帧到达且不以 > 收尾(DeepSeek 标记本就以后续为界)。
+        // 应被识别为标记 hold 到 tail 且标记 is_marker,流结束 flush 时**丢弃不补发**,不泄漏。
+        let mut ctx = mk_ctx(); // deepseek
+        let out = ctx.strip_dsml_markers("我来看看目录。\n\n<｜DSML｜function_calls");
+        assert_eq!(out, "我来看看目录。\n\n", "正文保留,标记 hold 不输出");
+        assert!(ctx.dsml_tail_is_marker, "应标记为确认标记");
+        let flushed = ctx.flush_dsml_tail();
+        assert!(flushed.is_empty(), "确认标记的残留 flush 时丢弃,绝不当正文补发(否则泄漏)");
+        assert!(ctx.dsml_tail_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_strip_dsml_unclosed_marker_bounded_flush() {
+        // 是关键字但超长不闭合 → 不无界囤积,放行为正文(防吞正文/防无界)。
+        let mut ctx = mk_ctx();
+        let long = format!("<｜tool{}", "x".repeat(60)); // >DSML_TAIL_MAX 且无 >
+        let out = ctx.strip_dsml_markers(&long);
+        assert!(out.contains("tool"), "超长未闭合应放行为正文,不吞");
+    }
+
+    #[test]
+    fn test_dsml_flush_after_thinking_close_keeps_block_order() {
+        // 回归(对抗 review #2):国产模型 + thinking 开启,流在 thinking 块内结束,且最后一帧
+        // 内容以孤立 `<` 收尾(被 strip_dsml_markers hold 进 dsml_tail_buffer,不进 thinking_buffer)。
+        // generate_final_events 必须先 stop thinking 块,再把 DSML 残留作为 text 块 start——
+        // 否则会出现「text 块 start(大索引)→ thinking 块 stop(小索引)」交错,违反 Anthropic
+        // 「先 stop 当前块再 start 下一块」契约,CC 解析报错。
+        let mut ctx = StreamContext::new_with_thinking("deepseek", 10, true, HashMap::new());
+
+        // 驱动进入 thinking 块并停在块内;末尾孤立 `<` 会被 DSML 逻辑 hold 到 tail。
+        let _ = ctx.process_assistant_response("<thinking>我在想 <");
+        assert!(ctx.in_thinking_block, "应仍处于 thinking 块内");
+        assert_eq!(ctx.dsml_tail_buffer, "<", "末尾孤立 < 应被 hold 到 DSML tail,而非进 thinking_buffer");
+
+        let events = ctx.generate_final_events();
+
+        // 收集块生命周期事件,校验:同一 index 的 text start 必须在 thinking stop 之后。
+        // 找出 thinking 块 stop 的位置与任何 text 块 start 的位置。
+        let mut thinking_stop_pos: Option<usize> = None;
+        let mut text_start_pos: Option<usize> = None;
+        for (pos, e) in events.iter().enumerate() {
+            let idx = e.data.get("index").and_then(|v| v.as_i64());
+            match e.event.as_str() {
+                "content_block_stop" => {
+                    // thinking 块索引来自 ctx.thinking_block_index
+                    if idx == ctx.thinking_block_index.map(|i| i as i64) {
+                        thinking_stop_pos = Some(pos);
+                    }
+                }
+                "content_block_start" => {
+                    let is_text = e
+                        .data
+                        .get("content_block")
+                        .and_then(|cb| cb.get("type"))
+                        .and_then(|t| t.as_str())
+                        == Some("text");
+                    if is_text && text_start_pos.is_none() {
+                        text_start_pos = Some(pos);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // 残留 `<` 会作为 text 块补发,thinking 块必然先 stop。
+        let ts = thinking_stop_pos.expect("thinking 块应被 stop");
+        if let Some(txs) = text_start_pos {
+            assert!(
+                ts < txs,
+                "thinking 块 stop(pos={}) 必须早于 DSML 残留 text 块 start(pos={}),否则块顺序交错",
+                ts,
+                txs
+            );
+        }
+        assert!(ctx.dsml_tail_buffer.is_empty(), "flush 后 tail 应清空");
     }
 
     #[test]
@@ -1925,18 +2306,22 @@ mod tests {
 
     #[test]
     fn test_tool_input_non_prefix_trap() {
-        // 旧逐片启发式的致命陷阱:上游第二帧不以第一帧为前缀(非单调重写)。根治后按缓冲语义:
-        // 前缀不成立 → 追加,stop 时一次性发,拼接不产生"两段独立 delta 拼错"的坏 JSON。
+        // 旧逐片启发式的致命陷阱:上游第二帧不以第一帧为前缀(非单调重写)。
+        // 根治后（merge_tool_input 第 6 步）：两帧各自都是完整合法 JSON → 视为"重写",
+        // 只保留最新完整对象,消灭 `}{` 粘连非法串(Invalid tool parameters 类型 C 根因)。
         let mut ctx = StreamContext::new_with_thinking("m", 1, false, HashMap::new());
         let _ = ctx.generate_initial_events();
         let (joined, n) = run_tool_frames(
             &mut ctx,
             &[(r#"{"path":"/a"}"#, false), (r#"{"path":"/b"}"#, true)],
         );
-        // 追加语义:两帧拼接(这是"前缀不成立"时唯一无信息损失的重组)；关键是只发一个 delta、
-        // 且 KiroStudio 不再自造"半累积半增量"的重复错位。
+        // 只发一个 delta,且结果是合法 JSON(第二帧),不再是 `}{` 粘连串。
         assert_eq!(n, 1, "非前缀帧也只发一个 delta");
-        assert_eq!(joined, r#"{"path":"/a"}{"path":"/b"}"#);
+        assert_eq!(joined, r#"{"path":"/b"}"#, "非前缀双完整对象只留最新完整对象");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&joined).is_ok(),
+            "结果必须是合法 JSON"
+        );
     }
 
     #[test]
@@ -2814,5 +3199,162 @@ mod tests {
         assert!(!ctx.completion().is_ok());
         assert_eq!(ctx.completion_outcome(), RequestOutcome::ServerError);
         assert!(ctx.error_event_emitted());
+    }
+
+    // ==================== merge_tool_input 决策表回归（Invalid tool parameters 类型 C 根治） ====================
+
+    /// 累积快照三帧：每帧是"到目前为止的完整 JSON" → 最终取最后最全的一帧。
+    #[test]
+    fn test_merge_cumulative_snapshots() {
+        let mut buf = String::new();
+        buf = merge_tool_input(&buf, r#"{"path""#);
+        buf = merge_tool_input(&buf, r#"{"path":"a.txt""#);
+        buf = merge_tool_input(&buf, r#"{"path":"a.txt","content":"hi"}"#);
+        assert_eq!(buf, r#"{"path":"a.txt","content":"hi"}"#);
+        assert!(serde_json::from_str::<serde_json::Value>(&buf).is_ok());
+    }
+
+    /// 纯增量碎片三帧：每帧只带新片段 → 追加拼成完整 JSON。
+    #[test]
+    fn test_merge_pure_increments() {
+        let mut buf = String::new();
+        buf = merge_tool_input(&buf, r#"{"path":"#);
+        buf = merge_tool_input(&buf, r#""a.txt","content""#);
+        buf = merge_tool_input(&buf, r#":"hi"}"#);
+        assert_eq!(buf, r#"{"path":"a.txt","content":"hi"}"#);
+        assert!(serde_json::from_str::<serde_json::Value>(&buf).is_ok());
+    }
+
+    /// 重复终帧：同一完整快照来两次 → 不翻倍。
+    #[test]
+    fn test_merge_duplicate_final_frame() {
+        let full = r#"{"a":1,"b":2}"#;
+        let mut buf = String::new();
+        buf = merge_tool_input(&buf, full);
+        buf = merge_tool_input(&buf, full);
+        assert_eq!(buf, full, "重复终帧不应翻倍");
+    }
+
+    /// 核心：两个各自完整、彼此非前缀的对象 → 结果是第二帧，而不是 `{"a":1}{"a":2}` 粘连串。
+    #[test]
+    fn test_merge_nonprefix_double_object_keeps_latest() {
+        let buf = merge_tool_input(r#"{"a":1}"#, r#"{"a":2}"#);
+        assert_eq!(buf, r#"{"a":2}"#, "非前缀双完整对象应只留最新，消灭 object 粘连");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&buf).is_ok(),
+            "结果必须是合法 JSON"
+        );
+    }
+
+    /// 完整对象之后来一个更短的旧前缀快照 → 保持完整，不被旧短帧覆盖。
+    #[test]
+    fn test_merge_full_then_shorter_prefix_kept() {
+        let full = r#"{"path":"a.txt","content":"hi"}"#;
+        let buf = merge_tool_input(full, r#"{"path""#);
+        assert_eq!(buf, full, "迟到的旧短前缀快照应被丢弃，保留更全缓冲");
+    }
+
+    /// 空帧不改变缓冲；空缓冲取本帧。
+    #[test]
+    fn test_merge_empty_edges() {
+        assert_eq!(merge_tool_input("abc", ""), "abc", "空帧 → 缓冲不变");
+        assert_eq!(merge_tool_input("", "abc"), "abc", "空缓冲 → 取本帧");
+        assert_eq!(merge_tool_input("", ""), "", "双空 → 空");
+    }
+
+    /// 真增量碎片（各帧本身非法）→ append 后拼成合法整体，不被第 6 步误判。
+    #[test]
+    fn test_merge_illegal_fragments_append() {
+        // 第一帧是未闭合的合法前缀，第二帧续上闭合：两者都不是完整 JSON → 走追加。
+        let buf = merge_tool_input(r#"{"x":[1,2"#, r#",3]}"#);
+        assert_eq!(buf, r#"{"x":[1,2,3]}"#);
+        assert!(serde_json::from_str::<serde_json::Value>(&buf).is_ok());
+    }
+
+    /// process_tool_use 端到端：非前缀双对象场景，flush 出的 partial_json 必须是合法 JSON（第二帧）。
+    #[test]
+    fn test_process_tool_use_nonprefix_double_object_emits_legal_json() {
+        use crate::kiro::model::events::ToolUseEvent;
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-4.6", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_tool_use(&ToolUseEvent {
+            name: "AskUserQuestion".to_string(),
+            tool_use_id: "toolu_np".to_string(),
+            input: r#"{"a":1}"#.to_string(),
+            stop: false,
+        });
+        let evs = ctx.process_tool_use(&ToolUseEvent {
+            name: "AskUserQuestion".to_string(),
+            tool_use_id: "toolu_np".to_string(),
+            input: r#"{"a":2}"#.to_string(),
+            stop: true,
+        });
+        let delta = evs
+            .iter()
+            .find(|e| {
+                e.event == "content_block_delta"
+                    && e.data["delta"]["type"] == "input_json_delta"
+            })
+            .expect("应有 input_json_delta");
+        let assembled = delta.data["delta"]["partial_json"].as_str().unwrap();
+        assert_eq!(assembled, r#"{"a":2}"#, "非前缀双对象只发最新完整对象");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(assembled).is_ok(),
+            "流式 flush 的 partial_json 必须合法"
+        );
+    }
+
+    /// 隔离回归：tool_use input 含小于号 + 全角竖线 DSML 起始标记（U+FF5C）时，
+    /// 拼装完全不经过 strip_dsml_markers，原样保留（Claude 系）。
+    #[test]
+    fn test_tool_input_not_stripped_by_dsml_claude() {
+        use crate::kiro::model::events::ToolUseEvent;
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-4.6", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        let payload = r#"{"code":"if a < b","note":"<｜DSML｜function_calls｜>","x":"a<｜tool"}"#;
+        let evs = ctx.process_tool_use(&ToolUseEvent {
+            name: "Write".to_string(),
+            tool_use_id: "toolu_d".to_string(),
+            input: payload.to_string(),
+            stop: true,
+        });
+        let delta = evs
+            .iter()
+            .find(|e| {
+                e.event == "content_block_delta"
+                    && e.data["delta"]["type"] == "input_json_delta"
+            })
+            .expect("delta");
+        let assembled = delta.data["delta"]["partial_json"].as_str().unwrap();
+        assert_eq!(assembled, payload, "tool input 应原样保留，DSML 未碰");
+    }
+
+    /// 隔离回归：国产模型（deepseek）下 DSML 门控放行，但 tool input 拼装路径同样不经过剥离。
+    #[test]
+    fn test_tool_input_not_stripped_by_dsml_deepseek() {
+        use crate::kiro::model::events::ToolUseEvent;
+        let mut ctx = StreamContext::new_with_thinking("deepseek-v3", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        let payload = r#"{"code":"if a < b","note":"<｜DSML｜function_calls｜>"}"#;
+        let evs = ctx.process_tool_use(&ToolUseEvent {
+            name: "Write".to_string(),
+            tool_use_id: "toolu_d2".to_string(),
+            input: payload.to_string(),
+            stop: true,
+        });
+        let delta = evs
+            .iter()
+            .find(|e| {
+                e.event == "content_block_delta"
+                    && e.data["delta"]["type"] == "input_json_delta"
+            })
+            .expect("delta");
+        let assembled = delta.data["delta"]["partial_json"].as_str().unwrap();
+        assert_eq!(
+            assembled, payload,
+            "国产模型下 tool input 也应原样，DSML 只作用于 text/thinking"
+        );
     }
 }

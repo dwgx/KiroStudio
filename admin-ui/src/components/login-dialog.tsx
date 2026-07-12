@@ -18,11 +18,13 @@ import {
   startExternalIdpLogin,
   submitExternalIdpLeg1,
   submitExternalIdpLeg2,
+  submitExternalIdpLeg2Select,
 } from '@/api/credentials'
 import { copyToClipboard, extractErrorMessage } from '@/lib/utils'
-import { CheckCircle2 } from 'lucide-react'
+import { CheckCircle2, XCircle, Loader2 } from 'lucide-react'
 import { AnimatedHeight } from '@/components/ui/animated-height'
-import type { StartSocialLoginResponse } from '@/types/api'
+import { regionLabel } from '@/lib/regions'
+import type { StartSocialLoginResponse, ExternalIdpProfileOption } from '@/types/api'
 
 interface LoginDialogProps {
   open: boolean
@@ -33,7 +35,7 @@ interface LoginDialogProps {
 type Mode = 'web' | 'idc' | 'external-idp'
 type Step = 'form' | 'waiting' | 'done'
 // 微软 SSO 独立的 3 步引导：0=表单 1=粘回登录 URL 2=粘回授权 URL 3=完成
-type EidpStep = 0 | 1 | 2 | 3
+type EidpStep = 0 | 1 | 2 | 3 | 'select'
 
 interface IdcSession {
   sessionId: string
@@ -75,6 +77,8 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
   const [eidpAuthorizeUrl, setEidpAuthorizeUrl] = useState('')
   const [eidpUrl1, setEidpUrl1] = useState('')
   const [eidpUrl2, setEidpUrl2] = useState('')
+  // 多 region profile 选择：leg2 返回多个 profile 时填充，用户选一个后调 select 建号。
+  const [eidpProfiles, setEidpProfiles] = useState<ExternalIdpProfileOption[]>([])
   const [eidpCredId, setEidpCredId] = useState<number | null>(null)
 
   const stopPolling = () => {
@@ -106,6 +110,7 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
         setEidpUrl1('')
         setEidpUrl2('')
         setEidpCredId(null)
+        setEidpProfiles([])
       }, 200)
       return () => clearTimeout(t)
     }
@@ -259,6 +264,32 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
     setEidpBusy(true)
     try {
       const resp = await submitExternalIdpLeg2(eidpSessionId, eidpUrl2.trim())
+      // 恰 1 个 profile：后端已自动建号，直接完成。
+      if (resp.credentialId != null) {
+        setEidpCredId(resp.credentialId)
+        setEidpStep(3)
+        toast.success(`微软上号成功，凭据 #${resp.credentialId}`)
+        onSuccess?.()
+        return
+      }
+      // 多个 region profile：进选择步，让用户选一个。
+      if (resp.profiles.length > 0) {
+        setEidpProfiles(resp.profiles)
+        setEidpStep('select')
+        return
+      }
+      toast.error('该账号未探测到可用 profile（可能未开通 Kiro/CodeWhisperer）')
+    } catch (err) {
+      toast.error(extractErrorMessage(err))
+    } finally {
+      setEidpBusy(false)
+    }
+  }
+
+  const handleEidpSelect = async (arn: string) => {
+    setEidpBusy(true)
+    try {
+      const resp = await submitExternalIdpLeg2Select(eidpSessionId, arn)
       setEidpCredId(resp.credentialId)
       setEidpStep(3)
       toast.success(`微软上号成功，凭据 #${resp.credentialId}`)
@@ -515,6 +546,60 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
           </div>
         )}
 
+        {/* 微软 SSO：多 region profile 选择（账号在多个 region 各有独立 profile 时）。
+            批量验活式卡片列表：展示每个 profile 的可用状态 + 订阅等级，可用的高亮/排前，
+            不可用的置灰标注「该区域未开通」。不用 toast，直接卡片内呈现。 */}
+        {mode === 'external-idp' && eidpStep === 'select' && (
+          <div className="space-y-3 py-2">
+            <p className="text-sm text-muted-foreground">
+              该账号在多个区域各有一个 profile，请选择要使用的区域（决定对话走哪个上游端点，务必选账号真实开通的区域）。
+            </p>
+            <div className="space-y-2">
+              {[...eidpProfiles]
+                .sort((a, b) => Number(b.usable ?? true) - Number(a.usable ?? true))
+                .map((p) => {
+                  // usable 缺省视为可用（旧后端未下发时不误置灰）。
+                  const usable = p.usable ?? true
+                  return (
+                    <button
+                      key={p.arn}
+                      type="button"
+                      disabled={eidpBusy || !usable}
+                      onClick={() => handleEidpSelect(p.arn)}
+                      className={`flex w-full items-start justify-between gap-2 rounded-md border px-3 py-2 text-left transition-colors disabled:cursor-not-allowed ${
+                        usable
+                          ? 'border-input bg-background hover:border-primary hover:bg-accent'
+                          : 'border-border bg-secondary/30 opacity-60'
+                      }`}
+                    >
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-1.5 text-sm font-medium">
+                          {usable ? (
+                            <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-500 dark:text-emerald-400" />
+                          ) : (
+                            <XCircle className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                          )}
+                          <span className="truncate">{regionLabel(p.region)}</span>
+                          {!usable && (
+                            <span className="shrink-0 rounded bg-white/5 px-1 py-0.5 text-[10px] text-muted-foreground">
+                              该区域未开通
+                            </span>
+                          )}
+                        </div>
+                        <div className="mt-0.5 truncate text-xs text-muted-foreground">
+                          {p.region}
+                          {p.subscriptionTitle ? ` · ${p.subscriptionTitle}` : ''}
+                          {p.account ? ` · 账号 ${p.account}` : ''}
+                        </div>
+                      </div>
+                      {eidpBusy && <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-primary" />}
+                    </button>
+                  )
+                })}
+            </div>
+          </div>
+        )}
+
         {/* 微软 SSO 第 3 步：完成 */}
         {mode === 'external-idp' && eidpStep === 3 && (
           <div className="space-y-3 py-4 text-center">
@@ -705,6 +790,16 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
                 {eidpBusy ? '提交中…' : '完成上号'}
               </Button>
             </>
+          )}
+          {mode === 'external-idp' && eidpStep === 'select' && (
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => onOpenChange(false)}
+              disabled={eidpBusy}
+            >
+              取消
+            </Button>
           )}
           {mode === 'external-idp' && eidpStep === 3 && (
             <Button type="button" onClick={() => onOpenChange(false)}>

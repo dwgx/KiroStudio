@@ -184,7 +184,10 @@ async fn call_remote_count_tokens(
 }
 
 /// 本地计算请求的输入 tokens
-fn count_all_tokens_local(
+///
+/// `pub(crate)`:自定义 API 透传路径埋点专用——透传要低延迟原样中转,不能像 Kiro 路径那样
+/// 走可能阻塞 TTFB 的远程 count_tokens API,故直接用本地估算(诚实边界:埋点 token 本就是估算)。
+pub(crate) fn count_all_tokens_local(
     system: Option<&[SystemMessage]>,
     messages: &[Message],
     tools: Option<&[Tool]>,

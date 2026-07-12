@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { Settings, RefreshCw, Wallet, Trash2, Loader2, ClipboardCopy, ShieldAlert, Gauge, Check, Ban, Power } from 'lucide-react'
+import { Settings, RefreshCw, Wallet, Trash2, Loader2, ClipboardCopy, ShieldAlert, Gauge, Check, Ban, Power, Globe, CheckCircle2, XCircle } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -18,21 +18,22 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
-import { cn, copyToClipboard } from '@/lib/utils'
-import { enableOverage, disableOverage, setCredentialName, setCredentialProxy, PROBE_MODEL_CATALOG } from '@/api/credentials'
+import type { CredentialStatusItem, BalanceResponse, CredentialRegionProfile } from '@/types/api'
+import { cn, copyToClipboard, extractErrorMessage } from '@/lib/utils'
+import { enableOverage, disableOverage, setCredentialName, setCredentialProxy, probeCredentialRegions, switchProfileRegion } from '@/api/credentials'
 import { authShortLabel, disabledReasonLabel, subscriptionLabel } from '@/lib/i18n-labels'
 import {
   useSetDisabled,
   useSetPriority,
   useSetRpmLimit,
-  useSetAllowedModels,
+  useSetCustomApiConfig,
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
   useCachedBalances,
 } from '@/hooks/use-credentials'
 import { useCtrlHeld } from '@/hooks/use-ctrl-held'
+import { regionLabel } from '@/lib/regions'
 
 interface CredentialCardProps {
   credential: CredentialStatusItem
@@ -114,10 +115,6 @@ export function CredentialCard({
   const [showSettings, setShowSettings] = useState(false)
   const [priorityValue, setPriorityValue] = useState(credential.priority)
   const [rpmLimitValue, setRpmLimitValue] = useState(credential.rpmLimit ?? 0)
-  // 「允许模型」白名单本地编辑集合（成本安全硬门；空=不限制）
-  const [allowedModelsValue, setAllowedModelsValue] = useState<Set<string>>(
-    () => new Set(credential.allowedModels ?? []),
-  )
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
   // 超额（Overage）开关：真开关接线状态
   const [overageBusy, setOverageBusy] = useState(false)
@@ -132,6 +129,19 @@ export function CredentialCard({
   const [proxyPass, setProxyPass] = useState('')
   const [savingProxy, setSavingProxy] = useState(false)
 
+  // 自定义 API 代挂配置编辑(仅 custom_api 号):上游地址 / 上游密钥(留空不改) / 请求上限 / 换key清零计数。
+  const [customBaseUrl, setCustomBaseUrl] = useState(credential.baseUrl ?? '')
+  const [customApiKeyInput, setCustomApiKeyInput] = useState('')
+  const [customRequestLimit, setCustomRequestLimit] = useState(credential.requestLimit ?? 0)
+  const [customResetCount, setCustomResetCount] = useState(false)
+  const [savingCustomApi, setSavingCustomApi] = useState(false)
+
+  // Profile ARN 区域切换(齿轮设置内):探测该账号各 region 的 profile,卡片式列表选一个切过去。
+  const [regions, setRegions] = useState<CredentialRegionProfile[] | null>(null)
+  const [regionsLoading, setRegionsLoading] = useState(false)
+  const [regionsError, setRegionsError] = useState<string | null>(null)
+  const [switchingArn, setSwitchingArn] = useState<string | null>(null)
+
   const queryClient = useQueryClient()
   // 是否按住 Ctrl/Cmd:按住时卡片显示可点击手型 + 左键即多选(松开则普通左键不选中)
   const ctrlHeld = useCtrlHeld()
@@ -139,7 +149,7 @@ export function CredentialCard({
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
   const setRpmLimit = useSetRpmLimit()
-  const setAllowedModels = useSetAllowedModels()
+  const setCustomApiConfig = useSetCustomApiConfig()
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
@@ -203,6 +213,35 @@ export function CredentialCard({
     }
   }
 
+  // 保存自定义 API 代挂配置(base_url / api_key 留空不改 / 请求上限 / 可选清零计数)。
+  const handleSaveCustomApi = async () => {
+    const url = customBaseUrl.trim()
+    if (!url) {
+      toast.error('上游地址(base URL)不能为空')
+      return
+    }
+    setSavingCustomApi(true)
+    try {
+      await setCustomApiConfig.mutateAsync({
+        id: credential.id,
+        input: {
+          baseUrl: url,
+          // 留空=不改;非空=更新(明文不回显,只在用户输入新值时提交)。
+          apiKey: customApiKeyInput.trim() ? customApiKeyInput.trim() : undefined,
+          requestLimit: customRequestLimit,
+          resetCount: customResetCount,
+        },
+      })
+      setCustomApiKeyInput('')
+      setCustomResetCount(false)
+      toast.success('已保存自定义 API 配置，下次请求生效')
+    } catch (err) {
+      toast.error('保存失败: ' + (err as Error).message)
+    } finally {
+      setSavingCustomApi(false)
+    }
+  }
+
   // 自动加载：读后端【已缓存】余额（零上游、不封号），卡片挂载即显示，无需手动点“查询信息”。
   const { data: cachedBalances, isLoading: cachedLoading } = useCachedBalances()
   const cached = cachedBalances?.balances[String(credential.id)]
@@ -216,7 +255,8 @@ export function CredentialCard({
     balance?.subscriptionTitle ?? cached?.subscriptionTitle ?? credential.subscriptionTitle ?? null
 
   // 自定义 API 代挂号:不是 Kiro 号,订阅/余额/profileArn/刷新Token 全无意义,卡片显示专属信息。
-  const isCustomApi = credential.authMethod === 'custom_api'
+  // 判据与后端 is_custom_api_credential + StatusBars 对齐(authMethod 优先,baseUrl 兜底旧数据)。
+  const isCustomApi = credential.authMethod === 'custom_api' || !!credential.baseUrl
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -258,31 +298,41 @@ export function CredentialCard({
     )
   }
 
-  const handleAllowedModelsChange = () => {
-    const list = Array.from(allowedModelsValue)
-    setAllowedModels.mutate(
-      { id: credential.id, allowedModels: list.length ? list : null },
-      {
-        onSuccess: (res) => toast.success(res.message),
-        onError: (err) => toast.error('操作失败: ' + (err as Error).message),
-      }
-    )
-  }
-
-  const toggleAllowedModel = (id: string) => {
-    setAllowedModelsValue((prev) => {
-      const n = new Set(prev)
-      if (n.has(id)) n.delete(id)
-      else n.add(id)
-      return n
-    })
-  }
-
   const handleReset = () => {
     resetFailure.mutate(credential.id, {
       onSuccess: (res) => toast.success(res.message),
       onError: (err) => toast.error('操作失败: ' + (err as Error).message),
     })
+  }
+
+  // 探测该账号各 region 的 profile（切 Profile ARN 用）。结果走卡片式列表展示，不用 toast。
+  const loadRegions = async () => {
+    setRegionsLoading(true)
+    setRegionsError(null)
+    try {
+      const res = await probeCredentialRegions(credential.id)
+      setRegions(res.regions ?? [])
+    } catch (err) {
+      setRegionsError(extractErrorMessage(err))
+      setRegions(null)
+    } finally {
+      setRegionsLoading(false)
+    }
+  }
+
+  // 切换当前使用的 Profile ARN（切区域，非改全局 region）。成功后刷新列表 + 重新探测标记当前项。
+  const handleSwitchRegion = async (arn: string) => {
+    setSwitchingArn(arn)
+    try {
+      const res = await switchProfileRegion(credential.id, arn)
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      toast.success(res.message || '已切换 Profile ARN，下次请求生效')
+      await loadRegions()
+    } catch (err) {
+      toast.error('切换失败: ' + extractErrorMessage(err))
+    } finally {
+      setSwitchingArn(null)
+    }
   }
 
   const handleForceRefresh = () => {
@@ -385,6 +435,8 @@ export function CredentialCard({
     e.preventDefault()
     setPriorityValue(credential.priority)
     setNameValue(credential.name ?? '')
+    setRegions(null)
+    setRegionsError(null)
     setShowSettings(true)
   }
 
@@ -520,11 +572,12 @@ export function CredentialCard({
               onClick={() => {
                 setPriorityValue(credential.priority)
                 setRpmLimitValue(credential.rpmLimit ?? 0)
-                setAllowedModelsValue(new Set(credential.allowedModels ?? []))
                 setNameValue(credential.name ?? '')
+                setRegions(null)
+                setRegionsError(null)
                 setShowSettings(true)
               }}
-              title="设置（优先级 / RPM / 允许模型 / 启用 / 删除）"
+              title="设置（优先级 / RPM / Profile ARN / 启用 / 删除）"
               aria-label="设置"
             >
               <Settings className="h-4 w-4" />
@@ -553,32 +606,67 @@ export function CredentialCard({
             </div>
           )}
 
-          {/* 自定义 API 代挂:专属信息(上游地址 + 请求用量),不显示 Kiro 的订阅/余额 */}
+          {/* 自定义 API 代挂:一体紧凑块(上游地址/请求用量/优先级/成功·失败/最后调用/密钥/代理),
+              不显示 Kiro 的订阅/余额网格——避免信息被劈成上下两坨 + 奇数格留白(卡片瘦身)。 */}
           {isCustomApi ? (
-            <div className="space-y-2">
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-xs text-muted-foreground">上游地址</span>
-                <span className="font-mono text-xs text-foreground truncate max-w-[200px]" title={credential.baseUrl}>
+            <div className="space-y-1.5 text-sm">
+              {/* 上游地址:主视觉,吃满宽度不硬截断 */}
+              <div className="flex items-center gap-2">
+                <span className="shrink-0 text-xs text-muted-foreground">上游地址</span>
+                <span className="min-w-0 flex-1 truncate text-right font-mono text-xs text-foreground" title={credential.baseUrl}>
                   {credential.baseUrl || '—'}
                 </span>
               </div>
+              {/* 请求用量:达上限变琥珀 + 小徽章"已满"(替代长中文) */}
               <div className="flex items-center justify-between gap-2">
                 <span className="text-xs text-muted-foreground">请求用量</span>
                 <span className="text-xs">
                   {credential.requestLimit && credential.requestLimit > 0 ? (
                     <span className={
                       (credential.requestCount ?? 0) >= credential.requestLimit
-                        ? 'text-amber-400 font-medium'
+                        ? 'font-medium text-amber-400'
                         : 'text-foreground'
                     }>
                       {credential.requestCount ?? 0} / {credential.requestLimit}
-                      {(credential.requestCount ?? 0) >= credential.requestLimit && '（已达上限·已禁用）'}
+                      {(credential.requestCount ?? 0) >= credential.requestLimit && (
+                        <span className="ml-1 rounded bg-amber-500/15 px-1 py-0.5 text-[10px] text-amber-300">已满</span>
+                      )}
                     </span>
                   ) : (
-                    <span className="text-foreground">{credential.requestCount ?? 0}（不限）</span>
+                    <span className="text-foreground">{credential.requestCount ?? 0} <span className="text-muted-foreground">（不限）</span></span>
                   )}
                 </span>
               </div>
+              {/* 优先级 + 成功·失败 + 最后调用:一行内紧凑排布,弱化次要信息 */}
+              <div className="flex items-center justify-between gap-2 text-xs">
+                <span className="text-muted-foreground">优先级 <span className="font-medium text-foreground">{credential.priority}</span></span>
+                <span className="text-muted-foreground">
+                  成功 <span className="font-medium text-emerald-400/90">{credential.successCount}</span>
+                  {credential.failureCount > 0 && (
+                    <> · 失败 <span className="font-medium text-red-400/80">{credential.failureCount}</span></>
+                  )}
+                </span>
+              </div>
+              <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+                <span>最后调用</span>
+                <span>{formatLastUsed(credential.lastUsedAt)}</span>
+              </div>
+              {/* 上游密钥掩码(有则显) */}
+              {credential.maskedApiKey && (
+                <div className="flex items-center justify-between gap-2 text-xs">
+                  <span className="text-muted-foreground">上游密钥</span>
+                  <span className="font-mono text-foreground">{credential.maskedApiKey}</span>
+                </div>
+              )}
+              {/* 代理(有则显,复用掩码) */}
+              {credential.hasProxy && credential.proxyUrl && (
+                <div className="flex min-w-0 items-center gap-2 text-xs">
+                  <span className="shrink-0 text-muted-foreground">代理</span>
+                  <span className="min-w-0 flex-1 truncate text-right font-mono text-foreground" title={maskProxyUrl(credential.proxyUrl)}>
+                    {maskProxyUrl(credential.proxyUrl)}
+                  </span>
+                </div>
+              )}
             </div>
           ) : (
           /* 订阅等级 + 余额状态条（自动加载缓存，无需手动点查询） */
@@ -597,7 +685,8 @@ export function CredentialCard({
           </div>
           )}
 
-          {/* 信息网格 */}
+          {/* 信息网格(Kiro 号专用;custom_api 已由上方一体紧凑块覆盖所有有意义字段,不再重复渲染) */}
+          {!isCustomApi && (
           <div className="grid grid-cols-2 gap-x-4 gap-y-3 text-sm">
             <div>
               <span className="text-muted-foreground">优先级：</span>
@@ -609,12 +698,15 @@ export function CredentialCard({
                 {credential.failureCount}
               </span>
             </div>
+            {/* 刷新失败是 Token 刷新概念,自定义 API 代挂号无 token 刷新,不显示 */}
+            {!isCustomApi && (
             <div>
               <span className="text-muted-foreground">刷新失败：</span>
               <span className={credential.refreshFailureCount > 0 ? 'text-red-500 font-medium' : ''}>
                 {credential.refreshFailureCount}
               </span>
             </div>
+            )}
             <div>
               <span className="text-muted-foreground">成功次数：</span>
               <span className="font-medium">{credential.successCount}</span>
@@ -628,6 +720,9 @@ export function CredentialCard({
                 </span>
               )}
             </div>
+            {/* 累计花费=上游 credit 计量,仅 Kiro 号有。自定义 API 透传不解析上游拿不到 credit,
+                改由上方"请求用量"块展示调用次数,此行对 custom_api 不渲染(避免"0 credits"误导)。 */}
+            {!isCustomApi && (
             <div className="col-span-2">
               <span className="text-muted-foreground">累计花费：</span>
               <span
@@ -637,6 +732,7 @@ export function CredentialCard({
                 {formatCredits(credential.totalCreditsUsed)} credits
               </span>
             </div>
+            )}
             <div className="col-span-2">
               <span className="text-muted-foreground">最后调用：</span>
               <span className="font-medium">{formatLastUsed(credential.lastUsedAt)}</span>
@@ -648,7 +744,7 @@ export function CredentialCard({
                   className="font-medium text-primary"
                   title={'成本安全硬门:此号只接这些模型\n' + credential.allowedModels.join('\n')}
                 >
-                  白名单 {credential.allowedModels.length} 项（齿轮→编辑）
+                  白名单 {credential.allowedModels.length} 项（按钮→编辑）
                 </span>
               </div>
             )}
@@ -695,18 +791,12 @@ export function CredentialCard({
               </div>
             )}
           </div>
+          )}
 
-          {/* 常用操作（重活收进设置齿轮；这里只留高频只读/查看类） */}
+          {/* 常用操作（重活收进设置齿轮；这里只留高频只读/查看类）。
+              「测活」「允许模型」已移到勾选后工具栏的批量操作(批量验活 / 允许模型),
+              勾一个号即可对单号操作,卡片正面不再重复这两个按钮,保持清爽。 */}
           <div className="flex flex-wrap gap-2 pt-2 border-t">
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={handleReset}
-              disabled={resetFailure.isPending || (credential.failureCount === 0 && credential.refreshFailureCount === 0)}
-            >
-              <RefreshCw className="h-4 w-4 mr-1" />
-              重置失败
-            </Button>
             {/* 刷新 Token / 查看余额 是 Kiro 专属,自定义 API 代挂号不显示(它无 token/余额概念) */}
             {!isCustomApi && (
             <Button
@@ -771,7 +861,7 @@ export function CredentialCard({
               凭据设置 · #{credential.id}
               {credential.email ? ` · ${credential.email}` : ''}
             </DialogTitle>
-            <DialogDescription>别名 / 代理 / 超额 / 优先级 / RPM / 启用 / 删除。</DialogDescription>
+            <DialogDescription>别名 / 代理 / 超额 / 优先级 / RPM / Profile ARN / 启用 / 重置失败 / 删除。</DialogDescription>
           </DialogHeader>
 
           {/* 可滚动内容区：内容超高时仅此区域滚动 */}
@@ -853,8 +943,74 @@ export function CredentialCard({
               </div>
             </div>
 
-            {/* 调度参数：优先级 + RPM 容量并排两列，各自独立步进器 + 保存 */}
-            <div className="grid grid-cols-2 gap-3 border-t pt-4">
+            {/* 自定义 API 代挂配置(仅 custom_api 号):上游地址 / 上游密钥 / 请求上限 */}
+            {isCustomApi && (
+              <div className="space-y-2 border-t pt-4">
+                <label className="text-sm font-medium">自定义 API 配置</label>
+                <p className="text-xs text-muted-foreground">
+                  上游地址 + 密钥(留空不改) + 请求上限。改上游/密钥后可勾选清零调用次数。下次请求生效。
+                </p>
+                <div className="space-y-1.5">
+                  <label className="text-xs text-muted-foreground">上游地址（base URL）</label>
+                  <Input
+                    value={customBaseUrl}
+                    onChange={(e) => setCustomBaseUrl(e.target.value)}
+                    placeholder="https://your-relay.example.com/v1"
+                    className="h-9 font-mono text-xs"
+                    aria-label="上游地址"
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <label className="text-xs text-muted-foreground">上游密钥（留空不改）</label>
+                  <Input
+                    type="password"
+                    value={customApiKeyInput}
+                    onChange={(e) => setCustomApiKeyInput(e.target.value)}
+                    placeholder="sk-... （留空=保持不变）"
+                    className="h-9 font-mono text-xs"
+                    autoComplete="new-password"
+                    aria-label="上游密钥"
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <label className="text-xs text-muted-foreground">请求上限（0=不限）</label>
+                  <NumberStepper
+                    value={customRequestLimit}
+                    onChange={setCustomRequestLimit}
+                    min={0}
+                    step={100}
+                    className="w-full"
+                    aria-label="请求上限"
+                  />
+                </div>
+                <label className="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+                  <Checkbox
+                    checked={customResetCount}
+                    onCheckedChange={(v) => setCustomResetCount(v === true)}
+                    className="h-3.5 w-3.5"
+                    aria-label="同时清零调用次数"
+                  />
+                  同时清零调用次数（换上游/换密钥后建议勾选）
+                </label>
+                <Button
+                  size="sm"
+                  className="h-9 w-full"
+                  onClick={handleSaveCustomApi}
+                  disabled={savingCustomApi}
+                >
+                  {savingCustomApi ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Check className="h-4 w-4" />
+                  )}
+                  <span className="ml-1">保存自定义 API 配置</span>
+                </Button>
+              </div>
+            )}
+
+            {/* 调度参数：优先级 + RPM 容量并排两列，各自独立步进器 + 保存。
+                自定义 API 号不参与 RPM 饱和判定(按 优先级+在途 选号),只显优先级单列。 */}
+            <div className={cn('grid gap-3 border-t pt-4', isCustomApi ? 'grid-cols-1' : 'grid-cols-2')}>
               <div className="space-y-1.5">
                 <div className="text-sm font-medium">优先级</div>
                 <div className="text-xs text-muted-foreground">越小越优先</div>
@@ -881,6 +1037,7 @@ export function CredentialCard({
                   </Button>
                 </div>
               </div>
+              {!isCustomApi && (
               <div className="space-y-1.5">
                 <div className="text-sm font-medium">RPM 容量</div>
                 <div className="text-xs text-muted-foreground">0=继承全局</div>
@@ -908,60 +1065,103 @@ export function CredentialCard({
                   </Button>
                 </div>
               </div>
+              )}
             </div>
 
-            {/* 允许模型白名单（成本安全硬门）：勾选后该号只接白名单内模型，把便宜模型流量
-                锁死在指定号,杜绝溢出到贵号计费。全不选=不限制(接任意模型)。 */}
+            {/* Profile ARN 区域切换（仅 Kiro 号）：列出该账号各 region 的 profile，
+                卡片式单选列表展示每个 region 的 ARN + 是否可用 + 订阅等级，选中即切过去
+                （切的是对话走哪个上游 profile/端点，非改全局 region）。自定义 API 号不适用。 */}
+            {!isCustomApi && (
             <div className="space-y-2 border-t pt-4">
-              <div className="flex items-center justify-between">
-                <div>
-                  <div className="text-sm font-medium">允许模型（白名单）</div>
+              <div className="flex items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="text-sm font-medium">Profile ARN 区域</div>
                   <div className="text-xs text-muted-foreground">
-                    {allowedModelsValue.size === 0
-                      ? '全不选=不限制,接任意模型'
-                      : `硬门:此号只接勾选的 ${allowedModelsValue.size} 个模型`}
+                    切换此号对话走哪个区域的 profile（非改全局 region）。下次请求生效。
                   </div>
                 </div>
                 <Button
                   size="sm"
+                  variant="outline"
                   className="h-8 shrink-0 px-2.5"
-                  onClick={handleAllowedModelsChange}
-                  disabled={setAllowedModels.isPending}
-                  title="保存白名单"
+                  onClick={loadRegions}
+                  disabled={regionsLoading}
+                  title="探测该账号各区域的 profile"
                 >
-                  {setAllowedModels.isPending ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
+                  {regionsLoading ? (
+                    <Loader2 className="mr-1 h-4 w-4 animate-spin" />
                   ) : (
-                    <><Check className="mr-1 h-4 w-4" />保存</>
+                    <Globe className="mr-1 h-4 w-4" />
                   )}
+                  {regions === null ? '探测区域' : '重新探测'}
                 </Button>
               </div>
-              <div className="flex flex-wrap gap-1.5">
-                {PROBE_MODEL_CATALOG.map((m) => {
-                  const on = allowedModelsValue.has(m.id)
-                  return (
-                    <button
-                      key={m.id}
-                      type="button"
-                      onClick={() => toggleAllowedModel(m.id)}
-                      className={cn(
-                        'inline-flex items-center gap-1 rounded border px-2 py-1 text-[11px] font-medium transition-colors',
-                        on
-                          ? 'border-primary/40 bg-primary/15 text-primary'
-                          : 'border-white/10 bg-white/5 text-muted-foreground hover:border-white/25'
-                      )}
-                      title={`${m.id} · ${m.mult}`}
-                    >
-                      {m.id} <span className="opacity-60">{m.mult}</span>
-                    </button>
-                  )
-                })}
-              </div>
+              {regionsError && (
+                <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-400">
+                  探测失败：{regionsError}
+                </div>
+              )}
+              {regions !== null && regions.length === 0 && !regionsLoading && (
+                <div className="rounded-md border border-dashed border-border px-3 py-3 text-center text-xs text-muted-foreground">
+                  未探测到可用的 profile。
+                </div>
+              )}
+              {regions !== null && regions.length > 0 && (
+                <div className="space-y-1.5">
+                  {[...regions]
+                    .sort((a, b) => Number(b.usable) - Number(a.usable))
+                    .map((r) => {
+                      const isSwitching = switchingArn === r.arn
+                      return (
+                        <button
+                          key={r.arn}
+                          type="button"
+                          disabled={!r.usable || switchingArn !== null || r.current}
+                          onClick={() => handleSwitchRegion(r.arn)}
+                          className={cn(
+                            'flex w-full items-start justify-between gap-2 rounded-md border px-3 py-2 text-left transition-colors',
+                            r.current
+                              ? 'border-emerald-500/50 bg-emerald-500/10'
+                              : r.usable
+                                ? 'border-input bg-background hover:border-primary hover:bg-accent'
+                                : 'border-border bg-secondary/30 opacity-60',
+                            (switchingArn !== null && !isSwitching) && 'opacity-50'
+                          )}
+                        >
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-1.5 text-sm font-medium">
+                              {r.usable ? (
+                                <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
+                              ) : (
+                                <XCircle className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                              )}
+                              <span className="truncate">{regionLabel(r.region)}</span>
+                              {r.current && (
+                                <span className="shrink-0 rounded bg-emerald-500/15 px-1 py-0.5 text-[10px] text-emerald-300">当前</span>
+                              )}
+                              {!r.usable && (
+                                <span className="shrink-0 rounded bg-white/5 px-1 py-0.5 text-[10px] text-muted-foreground">该区域未开通</span>
+                              )}
+                            </div>
+                            <div className="mt-0.5 truncate font-mono text-[10px] text-muted-foreground" title={r.arn}>
+                              {r.region}
+                              {r.subscriptionTitle ? ` · ${subscriptionLabel(r.subscriptionTitle)}` : ''}
+                              {r.account ? ` · 账号 ${r.account}` : ''}
+                            </div>
+                          </div>
+                          {isSwitching && <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-primary" />}
+                        </button>
+                      )
+                    })}
+                </div>
+              )}
             </div>
+            )}
 
-            {/* 开关组：超额 + 启用凭据并排两列，紧凑卡片式 */}
-            <div className="grid grid-cols-2 gap-3 border-t pt-4">
-              {/* 超额（Overage）：接后端真开关，开启前二次确认（按量付费）。 */}
+            {/* 开关组：超额(仅Kiro号) + 启用凭据。自定义 API 无 base 额度概念,不显示超额,只留启用。 */}
+            <div className={cn('grid gap-3 border-t pt-4', isCustomApi ? 'grid-cols-1' : 'grid-cols-2')}>
+              {/* 超额（Overage）：接后端真开关，开启前二次确认（按量付费）。自定义 API 号不适用。 */}
+              {!isCustomApi && (
               <div className="flex items-center justify-between gap-2 rounded-md border bg-secondary/30 px-3 py-2.5">
                 <div className="flex min-w-0 items-center gap-1.5">
                   <Gauge className="h-4 w-4 shrink-0 text-muted-foreground" />
@@ -979,6 +1179,7 @@ export function CredentialCard({
                   aria-label="超额开关"
                 />
               </div>
+              )}
               {/* 启用 / 禁用 */}
               <div className="flex items-center justify-between gap-2 rounded-md border bg-secondary/30 px-3 py-2.5">
                 <div className="flex min-w-0 items-center gap-1.5">
@@ -998,6 +1199,33 @@ export function CredentialCard({
                 />
               </div>
             </div>
+
+            {/* 重置失败（Kiro 失败计数概念，从卡片正面移进此处）：清零该号失败/刷新失败计数。
+                自定义 API 代挂号不走 Kiro 失败处置，不显示。 */}
+            {!isCustomApi && (
+            <div className="flex items-center justify-between gap-3 rounded-md border bg-secondary/30 px-3 py-3">
+              <div className="min-w-0">
+                <div className="text-sm font-medium">重置失败计数</div>
+                <div className="text-xs text-muted-foreground">
+                  清零失败 / 刷新失败次数（当前 {credential.failureCount} / {credential.refreshFailureCount}）。
+                </div>
+              </div>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-9 shrink-0"
+                onClick={handleReset}
+                disabled={resetFailure.isPending || (credential.failureCount === 0 && credential.refreshFailureCount === 0)}
+              >
+                {resetFailure.isPending ? (
+                  <Loader2 className="h-4 w-4 mr-1 animate-spin" />
+                ) : (
+                  <RefreshCw className="h-4 w-4 mr-1" />
+                )}
+                重置失败
+              </Button>
+            </div>
+            )}
 
             {/* 危险区：删除凭据收进底部，红色描边区隔，需先禁用 */}
             <div className="space-y-2 rounded-md border border-destructive/30 bg-destructive/[0.04] px-3 py-3">

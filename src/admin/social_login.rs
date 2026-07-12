@@ -306,6 +306,9 @@ impl SocialLoginManager {
             tracing::warn!("网页上号后获取订阅等级失败（不影响上号）: {}", e);
         }
 
+        // 新号自动初始化(异步):刷 token + 解析 profileArn(门控在方法内,social 号合格)。
+        self.token_manager.spawn_initial_refresh(credential_id);
+
         let email = {
             let snap = self.token_manager.snapshot();
             snap.entries

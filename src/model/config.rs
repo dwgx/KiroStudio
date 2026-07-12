@@ -433,7 +433,19 @@ fn default_extract_thinking() -> bool {
 }
 
 fn default_cc_auto_buffer() -> bool {
-    true
+    // 默认 false=CC 请求走**真流式**(内容边到边逐块转发)。
+    //
+    // 【为何改默认】cc_auto_buffer=true 时,CC 请求走 buffered 分发:整轮回答对客户端**全程只发
+    // ping、憋到上游流结束才一次性吐**——目的是让 message_start 的 input_tokens 用上游
+    // contextUsageEvent 的准确值(CC 会读它)。但实测坐实两个代价:①contextUsageEvent **结尾才到**,
+    // 所以 buffered 等于把整条流憋到最后 → 客户端整轮看不到进度(慢/看不到工具调用),模型越慢越像卡死;
+    // ②CC 的 steering(执行途中插入消息引导方向)依赖观察流式增量判断当前 turn 状态,buffered 把整轮
+    // 变成不可打断的黑盒 → 途中发消息要等整轮憋完才被处理。旁挂实测:CC 走真流式能正常干活(工具任务
+    // 成功、无 input_tokens 报错)、流式增量恢复。真流式下 message_start 发估算 input_tokens、结尾
+    // message_delta 携带上游真实 usage 修正——CC 以最终 usage 记账,估算值不影响功能。
+    //
+    // 想要 message_start 即精确 input_tokens 的场景仍可将 ccAutoBuffer 设回 true(热更即时生效)。
+    false
 }
 
 fn default_all_cooling_fast_fail() -> bool {

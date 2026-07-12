@@ -17,12 +17,12 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::time::{Duration as StdDuration, Instant};
 
 use arc_swap::ArcSwap;
 
-use crate::http_client::{ProxyConfig, build_client, build_streaming_client};
+use crate::http_client::{ProxyConfig, build_client, build_client_no_redirect, build_streaming_client};
 use crate::kiro::affinity::UserAffinityManager;
 use crate::kiro::cooldown::{CooldownManager, CooldownReason};use crate::kiro::machine_id;
 use crate::kiro::model::credentials::{KiroCredentials, TrashEntry};
@@ -553,34 +553,56 @@ pub(crate) async fn get_usage_limits(
     Ok(data)
 }
 
+/// custom_api 写入 base_url 时的 SSRF 主防线：拼出与 [`passthrough::forward`] /
+/// [`deep_verify_custom_api`] **完全一致**的最终透传 URL，校验其目标 IP 不落
+/// 内网/环回/链路本地/元数据/保留段。校验**最终 URL**而非裸 base，防 `https://ok@169.254.x`
+/// 之类 userinfo 混淆（ssrf::parse_host_port 已剥 userinfo 取真实 host）。
+///
+/// `allow_http=true`（dwgx 定：允许明文 http 中转站）——scheme 放宽，但 IP 层禁止段仍拦截，
+/// 元数据端点 169.254.x 一律挡下。出站另有禁重定向做纵深。
+async fn validate_custom_api_base_url(base_raw: &str) -> anyhow::Result<()> {
+    let base = base_raw.trim().trim_end_matches('/');
+    let url = if base.ends_with("/v1") || base.contains("/v1/") {
+        format!("{base}/messages")
+    } else {
+        format!("{base}/v1/messages")
+    };
+    crate::common::ssrf::validate_outbound_url(&url, /*allow_http=*/ true)
+        .await
+        .map_err(|e| anyhow::anyhow!("自定义 API base_url 校验失败(SSRF 防护): {e}"))
+}
+
 /// 运行时动态解析真实 profileArn（Kiro management ControlPlane 的 ListAvailableProfiles）。
 ///
-/// 为何需要:idc/Enterprise 号入池/刷新后常没有 profileArn(IdC 的 oidc 刷新不回传它),
+/// 为何需要:idc/Enterprise/external_idp 号入池/刷新后常没有 profileArn(oidc 刷新不回传它),
 /// 而对话/余额端点对这类号要求带**真实** profileArn——回退默认占位 ARN 对 Enterprise 号
 /// 会被上游判 `Invalid token`/403(实测)。Kiro IDE / kiro-account-manager 的做法是运行时
-/// 调 ListAvailableProfiles 拿账号真实的 profiles[0].arn。此函数复刻该 recipe(已对齐 KAM):
+/// 调 ListAvailableProfiles 拿账号真实的 profile arn。此函数复刻该 recipe:
 /// - `POST https://management.{region}.kiro.dev/`(根路径)
 /// - header: `x-amz-target: KiroControlPlaneBearerService.ListAvailableProfiles`
 ///   + `content-type: application/x-amz-json-1.0` + Bearer + control-plane UA
-/// - body: `{}`;成功取响应 `profiles[0].arn`。
+/// - body: `{}`;成功取响应 `profiles` 里的 arn。
 ///
-/// 返回 Ok(Some(arn)) 拿到、Ok(None) 响应无 profile(账号无可用 profile)、Err 网络/上游错误。
+/// ⭐ **region 修正(2026-07-12 真 token 实测,推翻旧「固定 us-east-1」规则)**:
+/// External IdP 账号可在多 region 各有独立 profile。实测同一账号:
+///   - management.us-east-1.kiro.dev  → 只返回 us-east-1 的 profile
+///   - management.eu-central-1.kiro.dev → 只返回 eu-central-1 的 profile
+/// **每个 region 端点只返回本 region 的 profile**(旧注释说 eu 返回空 `[]` 是误判:那是当时
+/// 账号在 eu 无 profile,非端点不行)。故必须打**号自己 region** 的端点,固定 us-east-1 会让
+/// eu/ap 号拿到 us 的 ARN 覆盖写回 → region 与真实 profile 错配 → 400 Improperly formed
+/// (这正是「导入成功但刷新不了/ARN 不匹配」的根因)。
+///
+/// 本函数按 `preferred_region` 优先探测;拿到即返回(带 region 自洽的 arn)。
+///
+/// 返回 Ok(Some(arn)) 拿到、Ok(None) 该 region 无 profile、Err 网络/上游错误。
 pub(crate) async fn resolve_profile_arn_via_management(
     credentials: &KiroCredentials,
     config: &Config,
     token: &str,
     proxy: Option<&ProxyConfig>,
+    preferred_region: &str,
 ) -> anyhow::Result<Option<String>> {
-    // ⭐ListAvailableProfiles 固定打 **us-east-1**：Kiro 的 profile/控制面是**全局注册在
-    // us-east-1** 的,不随账号 region 分布。实测(#86 eu-central-1 Enterprise 号):
-    //   - management.us-east-1.kiro.dev  → 返回真实 profile ✅
-    //   - management.eu-central-1.kiro.dev → 返回空 [] ❌
-    // 此前用 effective_upstream_region(跟凭据 region),导致非 us-east-1 的号(尤其 Enterprise)
-    // 拿到空 profiles → profileArn 恒 None → 对话套 us-east-1 占位 ARN → region 不符 →
-    // 400 Improperly formed(这正是"以前出现过没修复"的根因)。us-east-1 号巧合一致没暴露,
-    // eu/ap 等 region 的号才炸。**仅本解析函数固定 us-east-1**;对话/余额端点仍按凭据 region 走
-    // (解析到的 arn 第4段自带正确 region,effective_upstream_region 会据此回正)。
-    let host = "management.us-east-1.kiro.dev".to_string();
+    let host = format!("management.{}.kiro.dev", preferred_region);
     let url = format!("https://{}/", host);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     let user_agent = format!(
@@ -617,6 +639,318 @@ pub(crate) async fn resolve_profile_arn_via_management(
     Ok(arn)
 }
 
+/// External IdP / Enterprise 号动态解析 profileArn 时的候选 region(dwgx 定:最普遍两个)。
+/// 先探测号自己的 region,再补这两个兜底(去重)。将来账号在别 region 有 profile 可扩展此表。
+pub(crate) const PROFILE_PROBE_REGIONS: &[&str] = &["us-east-1", "eu-central-1"];
+
+/// 多 region 探测 profileArn:优先号自己的 region,拿到就用(region 与 ARN 自洽);
+/// 该 region 无 profile 再依次探测候选 region 兜底。任一命中即返回,全部无则 Ok(None)。
+///
+/// 每个 management 端点只返回本 region 的 profile(实测),所以优先探测号 region 能拿到
+/// region 完全匹配的 ARN——从根上杜绝「拿到别 region ARN 覆盖导致错配」。
+pub(crate) async fn resolve_profile_arn_multi_region(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+    preferred_region: &str,
+) -> anyhow::Result<Option<String>> {
+    // 探测顺序:号自己的 region 打头,后接候选表(去重)。
+    let mut order: Vec<&str> = vec![preferred_region];
+    for r in PROFILE_PROBE_REGIONS {
+        if !order.contains(r) {
+            order.push(r);
+        }
+    }
+    let mut last_err: Option<anyhow::Error> = None;
+    for region in order {
+        match resolve_profile_arn_via_management(credentials, config, token, proxy, region).await {
+            Ok(Some(arn)) => return Ok(Some(arn)),
+            Ok(None) => continue, // 该 region 无 profile,试下一个
+            Err(e) => {
+                tracing::debug!("profileArn 探测 region={} 失败(继续试其它): {}", region, e);
+                last_err = Some(e);
+            }
+        }
+    }
+    // 全部 region 都无 profile:若中途有网络错误则上报最后一个,否则 Ok(None)(账号确无 profile)。
+    match last_err {
+        Some(e) => Err(e),
+        None => Ok(None),
+    }
+}
+
+// ============================================================================
+// External IdP「验活」层：某 region 的 profile 是否真开通可用
+// ============================================================================
+//
+// 背景（2026-07-12 真 token 实测）：同一 external_idp（M365）账号可在多 region 各有
+// 独立 profile，但**只有部分 region 真正开通可用**：
+//   - us-east-1(account 617485799832) → getUsageLimits 403 FEATURE_NOT_SUPPORTED
+//   - eu-central-1(account 155119901513) → 200, subscriptionTitle="KIRO POWER"
+// 现有 region 解析只保证「ARN region 自洽」,从不验证「这个 region 的 profile 是否真开通」。
+// 本层在既有解析之上补「验活选择」：真发一次 getUsageLimits 探测,只有 200 才算 usable。
+
+/// External IdP 某 region profile 的「验活」结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProfileProbeOutcome {
+    /// 该 region profile 真开通可用（getUsageLimits 2xx）。附带解析到的订阅标题（便于择优）。
+    Usable { subscription_title: Option<String> },
+    /// 403 FEATURE_NOT_SUPPORTED —— profile 存在但该 region 未开通（本 bug 的核心症状）。
+    FeatureNotSupported,
+    /// 401 —— token 无效/过期（与 region 无关，调用方不应据此判死 region）。
+    Unauthorized,
+    /// 其它错误（含 429 限流 / 5xx / 网络错误 / 非法响应）——视为「暂时不可用」，不据此判死 region。
+    OtherError(String),
+}
+
+/// 纯逻辑：按 HTTP status + body 把一次 getUsageLimits 验活分类。
+///
+/// 单独抽出便于单测（无网络）。200 返回 `Usable{subscription_title:None}`——真实标题由
+/// [`probe_profile_usable`] 解析响应体后填入；此处只做 status/body 语义分类。
+/// **铁律**：429 归 OtherError（暂时不可用，绝不因限流判死一个 region）。
+fn classify_profile_probe(status: u16, body: &str) -> ProfileProbeOutcome {
+    if (200..300).contains(&status) {
+        return ProfileProbeOutcome::Usable {
+            subscription_title: None,
+        };
+    }
+    if status == 403 && body.contains("FEATURE_NOT_SUPPORTED") {
+        return ProfileProbeOutcome::FeatureNotSupported;
+    }
+    if status == 401 {
+        return ProfileProbeOutcome::Unauthorized;
+    }
+    let snippet: String = body.chars().take(200).collect();
+    ProfileProbeOutcome::OtherError(format!("HTTP {}: {}", status, snippet))
+}
+
+/// 验活单个候选 profileArn：clone base → 强制 `profile_arn=candidate_arn` → `sync_region_from_arn()`
+/// 保证 host region 与 ARN 一致 → 自己发一次 getUsageLimits（复刻 [`get_usage_limits`] 的请求构造，
+/// 30s 超时）→ 按 status+body 分类。**只读探测**，不改任何持久化状态。
+pub(crate) async fn probe_profile_usable(
+    base: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+    candidate_arn: &str,
+) -> ProfileProbeOutcome {
+    // 强制候选 arn，并让 region/auth_region 随 ARN 物理绑定（防呆铁律：region 与 ARN 自洽）。
+    let mut cred = base.clone();
+    cred.profile_arn = Some(candidate_arn.to_string());
+    cred.sync_region_from_arn();
+    let region = cred.effective_upstream_region(config);
+    let host = format!("management.{}.kiro.dev", region);
+    let machine_id = machine_id::generate_from_credentials(&cred, config);
+
+    let mut url = format!(
+        "https://{}/getUsageLimits?isEmailRequired=true&origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
+        host
+    );
+    // 验活必须带候选 arn（external_idp 缺 arn 会 400 profileArn is required）。
+    url.push_str(&format!("&profileArn={}", urlencoding::encode(candidate_arn)));
+
+    let user_agent = format!(
+        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+        config.system_version, config.node_version, config.kiro_version, machine_id
+    );
+    let amz_user_agent = format!(
+        "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
+        config.kiro_version, machine_id
+    );
+
+    let client = match build_client(proxy, 30, config.tls_backend) {
+        Ok(c) => c,
+        Err(e) => return ProfileProbeOutcome::OtherError(format!("构建 HTTP 客户端失败: {}", e)),
+    };
+    let mut request = client
+        .get(&url)
+        .header("x-amz-user-agent", &amz_user_agent)
+        .header("user-agent", &user_agent)
+        .header("host", &host)
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=1")
+        .header("Authorization", format!("Bearer {}", token));
+    if cred.is_api_key_credential() {
+        request = request.header("tokentype", "API_KEY");
+    } else if cred.is_external_idp_credential() {
+        request = request.header("tokentype", "EXTERNAL_IDP");
+    }
+
+    let response = match request.send().await {
+        Ok(r) => r,
+        Err(e) => return ProfileProbeOutcome::OtherError(format!("请求失败: {}", e)),
+    };
+    let status = response.status().as_u16();
+    let body = response.text().await.unwrap_or_default();
+    match classify_profile_probe(status, &body) {
+        ProfileProbeOutcome::Usable { .. } => {
+            // 解析订阅标题（供择优：优先选非 FREE 的 region）。
+            let title = serde_json::from_str::<UsageLimitsResponse>(&body)
+                .ok()
+                .and_then(|u| u.subscription_title().map(|s| s.to_string()));
+            ProfileProbeOutcome::Usable {
+                subscription_title: title,
+            }
+        }
+        other => other,
+    }
+}
+
+/// 一个验活过的候选 profile（arn + region + account + 是否可用 + 订阅标题 + 原因标签）。
+#[derive(Debug, Clone)]
+pub struct ProfileCandidate {
+    pub arn: String,
+    pub region: String,
+    pub account: String,
+    pub usable: bool,
+    pub subscription_title: Option<String>,
+    /// 分类原因（"usable" / "feature_not_supported" / "unauthorized" / "error"）。
+    pub reason: &'static str,
+}
+
+/// 候选排序键（越小越靠前）：usable 优先；usable 内订阅标题非空非 FREE 更优。
+/// 纯逻辑，便于单测。
+fn candidate_rank(c: &ProfileCandidate) -> (u8, u8) {
+    let usable_key = if c.usable { 0 } else { 1 };
+    let title_key = match c.subscription_title.as_deref() {
+        Some(t) if !t.trim().is_empty() && !t.to_uppercase().contains("FREE") => 0,
+        _ => 1,
+    };
+    (usable_key, title_key)
+}
+
+/// 从 `arn:aws:codewhisperer:{region}:{account}:profile/{id}` 提取 account（index 4）。
+fn account_from_arn(arn: &str) -> String {
+    arn.split(':')
+        .nth(4)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// 与 [`resolve_profile_arn_via_management`] 同构，但返回该 region 端点的**全部** arn（原单值
+/// 函数用 `find_map` 只取第一个，保留不动）。供验活层枚举候选。
+pub(crate) async fn list_region_profile_arns_mgmt(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+    region: &str,
+) -> anyhow::Result<Vec<String>> {
+    let host = format!("management.{}.kiro.dev", region);
+    let url = format!("https://{}/", host);
+    let machine_id = machine_id::generate_from_credentials(credentials, config);
+    let user_agent = format!(
+        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/kirocontrolplanebearer#1.0.0 m/N,E KiroIDE-{}-{}",
+        config.system_version, config.node_version, config.kiro_version, machine_id
+    );
+    let client = build_client(proxy, 30, config.tls_backend)?;
+    let mut request = client
+        .post(&url)
+        .header("content-type", "application/x-amz-json-1.0")
+        .header("x-amz-target", "KiroControlPlaneBearerService.ListAvailableProfiles")
+        .header("host", &host)
+        .header("user-agent", &user_agent)
+        .header("x-amz-user-agent", "aws-sdk-js/1.0.0")
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=3")
+        .header("Authorization", format!("Bearer {}", token))
+        .body("{}");
+    if credentials.is_external_idp_credential() {
+        request = request.header("TokenType", "EXTERNAL_IDP");
+    }
+    let response = request.send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        bail!("ListAvailableProfiles 失败: {} {}", status, body_text);
+    }
+    let data: serde_json::Value = response.json().await?;
+    let arns = data
+        .get("profiles")
+        .and_then(|p| p.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| p.get("arn").and_then(|a| a.as_str()))
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Ok(arns)
+}
+
+/// 枚举该账号在（号自己 region + [`PROFILE_PROBE_REGIONS`]）的**全部** arn（去重），逐个
+/// [`probe_profile_usable`] 验活，构成候选列表。usable=true 排前面（再按订阅标题优先非 FREE）。
+///
+/// 每个 management 端点只返回本 region 的 profile（实测），故逐 region 枚举再合并。
+pub(crate) async fn probe_all_usable_profiles(
+    base: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> Vec<ProfileCandidate> {
+    // region 探测顺序：号自己 region 打头 + 候选表（去重）。
+    let preferred = base.effective_upstream_region(config).to_string();
+    let mut regions: Vec<String> = vec![preferred];
+    for r in PROFILE_PROBE_REGIONS {
+        if !regions.iter().any(|x| x == r) {
+            regions.push(r.to_string());
+        }
+    }
+
+    // 枚举全部 region 的全部 arn，去重。
+    let mut seen = std::collections::HashSet::new();
+    let mut arns: Vec<String> = Vec::new();
+    for region in &regions {
+        match list_region_profile_arns_mgmt(base, config, token, proxy, region).await {
+            Ok(list) => {
+                for arn in list {
+                    if seen.insert(arn.clone()) {
+                        arns.push(arn);
+                    }
+                }
+            }
+            Err(e) => tracing::debug!("列 region={} profile 失败（继续）: {}", region, e),
+        }
+    }
+    // base 自带的 arn 也纳入（可能不在任何 list 里，防御性补全）。
+    if let Some(a) = base.profile_arn.as_deref() {
+        let a = a.trim().to_string();
+        if !a.is_empty() && seen.insert(a.clone()) {
+            arns.push(a);
+        }
+    }
+
+    // 逐个验活（顺序探测，避免密集打同族触发风控）。
+    let mut out: Vec<ProfileCandidate> = Vec::new();
+    for arn in arns {
+        let region = KiroCredentials::region_from_profile_arn(&arn)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let account = account_from_arn(&arn);
+        let (usable, subscription_title, reason) =
+            match probe_profile_usable(base, config, token, proxy, &arn).await {
+                ProfileProbeOutcome::Usable { subscription_title } => {
+                    (true, subscription_title, "usable")
+                }
+                ProfileProbeOutcome::FeatureNotSupported => (false, None, "feature_not_supported"),
+                ProfileProbeOutcome::Unauthorized => (false, None, "unauthorized"),
+                ProfileProbeOutcome::OtherError(_) => (false, None, "error"),
+            };
+        out.push(ProfileCandidate {
+            arn,
+            region,
+            account,
+            usable,
+            subscription_title,
+            reason,
+        });
+    }
+    out.sort_by_key(candidate_rank);
+    out
+}
+
 // ============================================================================
 // 多凭据 Token 管理器
 // ============================================================================
@@ -638,7 +972,8 @@ struct CredentialEntry {
     /// API 调用成功次数
     success_count: u64,
     /// 累计请求数（用于 `request_limit` 上限自动禁用；主要自定义 API 代挂计数）。
-    /// 内存态即可,不必持久化(重启清零可接受,上限是防跑量的软护栏)。
+    /// **持久化**进 kiro_stats.json(随 success_count 一起)——请求上限是「终身预算」护栏,
+    /// 重启不能清零,否则达上限被禁的号一重启就额度归零、重新可用,防超预算失效。
     request_count: u64,
     /// 该凭据**生命周期累计**上游 credit 消耗（花费）。
     ///
@@ -656,6 +991,10 @@ struct CredentialEntry {
     /// balanced 选号按此升序，把并发流量分摊到在飞请求最少的号，根治惊群热点。
     /// 用 `Arc` 是为了让守卫直接持有计数器、与条目生命周期解耦（见 [`crate::kiro::scheduling`] 的 REF-1 说明）。
     inflight: Arc<AtomicU32>,
+    /// external_idp 号上次 getUsageLimits 是否返回过 403 FEATURE_NOT_SUPPORTED
+    /// （该 region 的 profile 未开通）。刷新时据此**只对确认坏的号**触发 reprobe 重选 region，
+    /// 健康号不额外探测（省成本）。非持久化：进程内状态，重启后由首次余额查询重新置位。
+    last_usage_403_feature_not_supported: AtomicBool,
 }
 
 /// 禁用原因
@@ -690,6 +1029,9 @@ struct StatsEntry {
     /// 生命周期累计 credit 花费。向后兼容：老 stats 文件无此字段时默认 0。
     #[serde(default)]
     total_credits_used: f64,
+    /// 累计请求数(request_limit 终身预算计数)。向后兼容：老 stats 文件无此字段时默认 0。
+    #[serde(default)]
+    request_count: u64,
     last_used_at: Option<String>,
 }
 
@@ -824,6 +1166,19 @@ pub struct MultiTokenManager {
     trash: Mutex<Vec<TrashEntry>>,
     /// 当前活动凭据 ID
     current_id: Mutex<u64>,
+    /// 下一个待分配的凭据 ID（进程内单调递增计数器，永不回退、永不复用）。
+    ///
+    /// 【为何不用 `max(entries ∪ trash).id + 1`】旧算法在「删号 → 从回收站彻底清除(purge)
+    /// → 再加新号」时，`max+1` 会**回落到刚被清除的号的 id**，于是新号复用了旧号的 id。
+    /// 而 cooldown / rpm / model_blocklist 这些 per-id 内存态在删号时并不随号消失（HashMap<u64,_>
+    /// 里旧条目还在），复用 id 的全新健康号就会**静默继承死号的冷却/模型黑名单**，被选号跳过
+    /// 直到旧冷却到期——低概率但真实的正确性地雷，且随将来新增 per-id 表而放大。
+    ///
+    /// 单调计数器让「id 永不复用」由构造保证：不管现在/将来有几张 per-id 表，新号都拿全新 id，
+    /// 结构上不可能撞上任何遗留内存态。启动时初始化为 `max(entries ∪ trash).id + 1`，之后每次
+    /// 分配只 `fetch_add(1)`。restore(按原 id 恢复) 恒复用 < 计数器的旧 id，不与新号冲突；
+    /// 重启后内存态(cooldown/rpm/...)本就全空，计数器从持久化的 max 重新起算，一致且安全。
+    next_id: AtomicU64,
     /// Token 刷新锁，确保同一时间只有一个刷新操作
     refresh_lock: TokioMutex<()>,
     /// 凭据文件路径（用于回写）
@@ -1083,6 +1438,7 @@ impl MultiTokenManager {
                     total_credits_used: 0.0,
                     last_used_at: None,
                     inflight: Arc::new(AtomicU32::new(0)),
+                    last_usage_403_feature_not_supported: AtomicBool::new(false),
                 }
             })
             .collect();
@@ -1172,6 +1528,9 @@ impl MultiTokenManager {
             entries: Mutex::new(entries),
             trash: Mutex::new(Vec::new()),
             current_id: Mutex::new(initial_id),
+            // 计数器起点 = 现有 entries 的 max id + 1（local next_id 已含 id-less 补全后的值）。
+            // 回收站(trash)此刻尚未加载，其可能更高的 id 在下方 load_trash() 后再 reconcile。
+            next_id: AtomicU64::new(next_id),
             refresh_lock: TokioMutex::new(()),
             credentials_path,
             is_multiple_format,
@@ -1209,6 +1568,17 @@ impl MultiTokenManager {
         // 加载回收站（trash.json；不存在则空）
         manager.load_trash();
 
+        // reconcile id 计数器：回收站里的号可能有比现存 entries 更高的 id（删了高 id 号后
+        // 该号进 trash）。计数器必须 ≥ max(entries ∪ trash) + 1，否则从 trash 恢复的高 id 号
+        // 会与后续新分配的 id 撞号。取当前值与 trash max+1 的较大者，单调只增不减。
+        {
+            let trash = manager.trash.lock();
+            if let Some(max_trash) = trash.iter().filter_map(|t| t.credentials.id).max() {
+                // fetch_max：仅当 trash max+1 更大时才抬高，保持单调。
+                manager.next_id.fetch_max(max_trash + 1, Ordering::AcqRel);
+            }
+        }
+
         Ok(manager)
     }
 
@@ -1229,7 +1599,27 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("无 config 文件路径,无法热重载"))?
                 .to_path_buf()
         };
-        let new = Config::load(&path)?; // 解析失败 → return Err,不动任何状态
+        let mut new = Config::load(&path)?; // 解析失败 → return Err,不动任何状态
+        // ⚠️【proxy split-brain 根治】restart-only 固化项(proxy/tls/端口/host/callback/adminkey 等)
+        // 在启动时已固化进运行态:KiroProvider.global_proxy 由 new() 一次性赋值,对话/token刷新路径
+        // 全程用它;而登录流(social/idc/external_idp)却**活读 config().proxy_url**。
+        // 若 reload 把磁盘上的新 proxy 换进 ArcSwap(哪怕只是因为同批改了热字段而顺带 reload),
+        // 登录流立刻走新 proxy、对话流仍走启动旧 proxy = split-brain,持续到重启。
+        // 修法:reload 只热更运行时字段,把 restart-only 字段用**当前 ArcSwap 里的旧值**覆盖回 new,
+        // 使 ArcSwap 的这些字段永远 == 启动固化值,与对话路径全局一致(改这些要生效仍靠重启)。
+        {
+            let old = self.config.load();
+            new.proxy_url = old.proxy_url.clone();
+            new.proxy_username = old.proxy_username.clone();
+            new.proxy_password = old.proxy_password.clone();
+            new.tls_backend = old.tls_backend.clone();
+            new.host = old.host.clone();
+            new.port = old.port;
+            new.region = old.region.clone();
+            new.callback_base_url = old.callback_base_url.clone();
+            new.admin_api_key = old.admin_api_key.clone();
+            new.api_key = old.api_key.clone();
+        }
         // 刷新热路径原子镜像
         self.cooldown_enabled
             .store(new.cooldown_enabled, Ordering::Relaxed);
@@ -1311,12 +1701,19 @@ impl MultiTokenManager {
             .any(|e| !e.disabled && e.credentials.is_custom_api_credential())
     }
 
-    /// 为透传选一个可用的「自定义 API」凭据(独立于 Kiro 选号)。
+    /// 为透传选一个可用的「自定义 API」凭据(独立于 Kiro 选号池,守两池隔离铁律)。
     ///
-    /// 只从 custom_api 号里选,按优先级(priority 小优先)、跳过禁用/冷却的。命中返回其
-    /// (id, credentials) 供透传;无可用返回 None(调用方回退 Kiro 路径)。
+    /// 选号素质对齐 Kiro 的 balanced,但只在 custom_api 池内:
+    /// ① **优先级**(priority 小先)——你用它控制哪个中转站优先/当备份;
+    /// ② 同优先级 **按近 60s RPM 均衡分流**(RPM 最低的先,让多个同级 API 号轮流用,不再只压第一个);
+    /// ③ 再按在途细分兜底。
+    /// 跳过:禁用 / 冷却中(failover 时失败号被设了短冷却会被自动跳过)/ `exclude` 内(本请求已试过的号)。
+    /// 命中返回 (id, credentials) 供透传;无可用返回 None → 调用方 failover 完毕落 Kiro 主力路径。
     /// 与 Kiro 的 is_entry_selectable 彻底分离——Kiro 选号已排除 custom_api,此处只管 custom_api。
-    pub fn select_custom_api(&self) -> Option<(u64, KiroCredentials)> {
+    pub fn select_custom_api(
+        &self,
+        exclude: &std::collections::HashSet<u64>,
+    ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
         let cooldown_on = self.cooldown_enabled.load(Ordering::Relaxed);
         entries
@@ -1324,30 +1721,101 @@ impl MultiTokenManager {
             .filter(|e| {
                 !e.disabled
                     && e.credentials.is_custom_api_credential()
+                    && !exclude.contains(&e.id)
                     && (!cooldown_on || self.cooldown.is_available(e.id))
             })
-            .min_by_key(|e| (e.credentials.priority, e.inflight.load(Ordering::Acquire)))
+            // 均衡分流键(升序):优先级 → 近 60s RPM → 在途。rpm 用独立 mutex,与 Kiro balanced 同款模式。
+            .min_by_key(|e| {
+                (
+                    e.credentials.priority,
+                    self.rpm.count(e.id),
+                    e.inflight.load(Ordering::Acquire),
+                )
+            })
             .map(|e| (e.id, e.credentials.clone()))
     }
 
-    /// 记一次请求(自定义 API 代挂计数)。累计达到 `request_limit` 时自动禁用该凭据
-    /// (reason=RequestLimitReached),防止代挂 key 跑量超预算。limit=None/0 表示不限。
-    pub fn record_request(&self, id: u64) {
-        let mut entries = self.entries.lock();
-        if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
-            e.request_count = e.request_count.saturating_add(1);
-            if let Some(limit) = e.credentials.request_limit {
-                if limit > 0 && e.request_count >= limit && !e.disabled {
-                    e.disabled = true;
-                    e.disabled_reason = Some(DisabledReason::RequestLimitReached);
-                    tracing::warn!(
-                        credential_id = id,
-                        count = e.request_count,
-                        limit,
-                        "自定义 API 凭据已达请求上限,自动禁用"
-                    );
+    /// 给 custom_api 透传号设一段冷却(**仅操作 cooldown,不碰 health/family/report_success/failure**,
+    /// 守两池隔离铁律)。供透传 failover:某号 403 额度满 / 401 key 失效 / 429 / 5xx 时暂时跳过它,
+    /// 让 select_custom_api 下次(及本请求循环 exclude)避开,换下一个号。
+    pub fn cooldown_custom_api(&self, id: u64, secs: u64) {
+        if self.cooldown_enabled.load(Ordering::Relaxed) {
+            self.cooldown.set_cooldown_with_duration(
+                id,
+                CooldownReason::RateLimitExceeded,
+                Some(std::time::Duration::from_secs(secs)),
+            );
+        }
+    }
+
+    /// 记录一次自定义 API 透传的**结果**(dwgx 定:只计成功口径)。
+    ///
+    /// 与 Kiro 主路径的 [`report_success`](Self::report_success)/[`report_failure`](Self::report_failure)
+    /// **彻底隔离**:透传号是独立选号池(`select_custom_api`),绝不能触碰
+    /// cooldown / rate_limiter / health(family_key 连坐)/ auto-disable —— 那些会误冷却透传号、
+    /// 甚至连坐真 Kiro 号。这里只做轻量计数 + 速率环记录,供号池可视化(流动/成功失败/RPM)与
+    /// 用量展示用。
+    ///
+    /// 三态计数(据上游 outcome 决定,dwgx 定的口径):
+    /// - `Success`(2xx):`success_count += 1` + `request_count += 1`(只计成功口径,计入请求上限,
+    ///   达上限自动禁用防超预算)。
+    /// - `ServerError`/`NetworkError`(5xx/连接错误):`failure_count += 1`(供展示号"不健康"),
+    ///   **不**计 request_count、**不**禁用(透传失败多为上游临时问题,客户端自行重试/退避)。
+    /// - 其余(429 RateLimited / 401·403 AuthFailed / 4xx BadRequest 等):**既不计成功也不计失败**
+    ///   ——透传给客户端由其处理,不误判号健康(dwgx:4xx/429 不计号失败)。
+    ///
+    /// 三态都会 `rpm.record` + 更新 `last_used_at`,让号池状态条/发光网格能"流动"(反映真实活跃)。
+    pub fn record_passthrough_result(&self, id: u64, outcome: crate::usage::RequestOutcome) {
+        use crate::usage::RequestOutcome as RO;
+        // 速率环:任何结果都记一次活跃,驱动可视化流动(rpm 用独立 mutex,与 entries 无关)。
+        self.rpm.record(id);
+        // ⚠️ entries 锁必须在内层块内释放,再调 save_stats/persist_credentials ——
+        //    两者都会二次加 entries 锁(parking_lot 非可重入),同函数持锁调用即同线程自死锁。
+        //    照 report_success/add_credits 同款范式:块结束释放锁后再落盘。
+        let mut limit_just_reached = false;
+        {
+            let mut entries = self.entries.lock();
+            if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
+                e.last_used_at = Some(Utc::now().to_rfc3339());
+                match outcome {
+                    RO::Success => {
+                        e.success_count = e.success_count.saturating_add(1);
+                        e.request_count = e.request_count.saturating_add(1);
+                        if let Some(limit) = e.credentials.request_limit {
+                            if limit > 0 && e.request_count >= limit && !e.disabled {
+                                e.disabled = true;
+                                e.disabled_reason = Some(DisabledReason::RequestLimitReached);
+                                limit_just_reached = true;
+                                tracing::warn!(
+                                    credential_id = id,
+                                    count = e.request_count,
+                                    limit,
+                                    "自定义 API 凭据已达请求上限,自动禁用"
+                                );
+                            }
+                        }
+                    }
+                    // 上游/链路真失败:仅计数供展示,绝不 auto-disable(隔离铁律:透传号不走 Kiro 失败处置)。
+                    RO::ServerError | RO::NetworkError => {
+                        e.failure_count = e.failure_count.saturating_add(1);
+                    }
+                    // 429 / 4xx / 认证类:透传给客户端,不计号失败(避免误判健康、误触发状态条红)。
+                    _ => {}
                 }
             }
+        }
+        if limit_just_reached {
+            // 达上限是「终身预算」硬边界:必须立即落盘,不能等 debounce/下次写。
+            //   ① request_count 进 stats 文件——立即 save_stats 而非 debounced,防命中上限后进程
+            //      崩溃/重启丢计数导致额度回退。
+            //   ② disabled=true 进凭据文件——persist_credentials 立即落盘,否则重启前若无其它写操作
+            //      则禁用状态丢失,号重新可用。两者叠加才真正杜绝「重启即额度归零」漏洞。
+            self.save_stats();
+            if let Err(e) = self.persist_credentials() {
+                tracing::warn!(credential_id = id, "达请求上限后持久化禁用状态失败: {}", e);
+            }
+        } else {
+            self.save_stats_debounced();
         }
     }
 
@@ -2017,6 +2485,11 @@ impl MultiTokenManager {
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
     }
 
+    /// 获取凭据文件完整路径（供 OTA 自重启把 `--credentials` 原样传给新进程）。
+    pub fn credentials_path(&self) -> Option<PathBuf> {
+        self.credentials_path.clone()
+    }
+
     /// 回收站文件路径（cache_dir/trash.json）
     fn trash_path(&self) -> Option<PathBuf> {
         self.cache_dir().map(|d| d.join("trash.json"))
@@ -2120,6 +2593,7 @@ impl MultiTokenManager {
             if let Some(s) = stats.get(&entry.id.to_string()) {
                 entry.success_count = s.success_count;
                 entry.total_credits_used = s.total_credits_used;
+                entry.request_count = s.request_count;
                 entry.last_used_at = s.last_used_at.clone();
             }
         }
@@ -2145,6 +2619,7 @@ impl MultiTokenManager {
                         StatsEntry {
                             success_count: e.success_count,
                             total_credits_used: e.total_credits_used,
+                            request_count: e.request_count,
                             last_used_at: e.last_used_at.clone(),
                         },
                     )
@@ -2955,6 +3430,66 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 修改自定义 API(代挂透传)凭据的 base_url / api_key / request_limit(Admin API)。
+    ///
+    /// ⚠️ 安全命门(隔离铁律 4):第一行必须 gate `is_custom_api_credential()`——给 Kiro 号写
+    /// base_url 会让它被 `is_custom_api_credential`(判定含 `base_url.is_some()`)误判进透传池
+    /// `select_custom_api`,彻底破坏两选号池隔离。非 custom_api 号直接 bail。
+    ///
+    /// 三态语义(对齐 set_credential_proxy):
+    /// - `base_url`:None=不改 / Some(非空)=trim 更新 / Some(空)=bail(base_url 是透传必填,不许清空)。
+    /// - `api_key`:None=不改 / Some(空)=清除 / Some(非空)=更新。
+    /// - `request_limit`:None=不改 / Some(0)=归一为「不限」(存 None) / Some(>0)=更新。
+    /// - `reset_count`:true 时把 request_count 归零(换上游/换 key 时由前端勾选,避免旧计数残留触顶)。
+    pub async fn set_custom_api_config(
+        &self,
+        id: u64,
+        base_url: Option<String>,
+        api_key: Option<String>,
+        request_limit: Option<u64>,
+        reset_count: bool,
+    ) -> anyhow::Result<()> {
+        // SSRF 写入校验(主防线)：DNS 解析不能在 entries 锁临界区内做，故取锁前先校验。
+        // 仅当传入了新 base_url 才校验（None=不改）。
+        if let Some(url) = base_url.as_deref() {
+            let trimmed = url.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!("base_url(上游地址)不能为空");
+            }
+            validate_custom_api_base_url(trimmed).await?;
+        }
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            // 隔离命门:仅自定义 API 凭据可改这些字段。
+            if !entry.credentials.is_custom_api_credential() {
+                anyhow::bail!("仅自定义 API(代挂透传)凭据可修改 base_url / api_key / 请求上限");
+            }
+            // base_url:必填,不许清空;None 表示不改。（空/SSRF 校验已在锁外完成）
+            if let Some(url) = base_url {
+                let trimmed = url.trim();
+                entry.credentials.base_url = Some(trimmed.trim_end_matches('/').to_string());
+            }
+            // api_key:None 不改 / 空清除 / 非空更新。
+            if let Some(key) = api_key {
+                entry.credentials.api_key = Some(key.trim().to_string()).filter(|s| !s.is_empty());
+            }
+            // request_limit:None 不改 / 0 归一为不限 / >0 更新。
+            if let Some(limit) = request_limit {
+                entry.credentials.request_limit = Some(limit).filter(|&v| v > 0);
+            }
+            // 换上游/换 key 后可选归零调用次数,避免旧计数残留立即触发请求上限。
+            if reset_count {
+                entry.request_count = 0;
+            }
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
     /// 批量清空回收站中的指定凭据（无 ids 时清空全部）。返回成功清除数。
     pub fn purge_trash_batch(&self, ids: Option<Vec<u64>>) -> usize {
         let target_ids: Vec<u64> = match ids {
@@ -2984,11 +3519,21 @@ impl MultiTokenManager {
                     id
                 );
             }
+            // 若该号是因达到「请求上限」被自动禁用(custom_api 代挂计数,见 RequestLimitReached),
+            // 复活时必须同时把 request_count 清零——否则计数仍 >= limit,下一次成功调用即再次触顶
+            // 自动禁用,"重置并启用"形同虚设(复活即秒禁)。其它禁用原因不动计数。
+            if entry.disabled_reason == Some(DisabledReason::RequestLimitReached) {
+                entry.request_count = 0;
+            }
             entry.failure_count = 0;
             entry.refresh_failure_count = 0;
             entry.disabled = false;
             entry.disabled_reason = None;
         }
+        // 重置并启用时一并清 per-id 冷却/退避残留,让「重置」名副其实(否则刚启用又被残留退避跳过)。
+        // 在 entries 锁外调用(rate_limiter/cooldown 各有独立锁)。
+        self.cooldown.clear_cooldown(id);
+        self.rate_limiter.reset(id);
         // 持久化更改
         self.persist_credentials()?;
         Ok(())
@@ -3002,7 +3547,32 @@ impl MultiTokenManager {
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
         let cfg = self.config.load_full();
-        let usage_limits = get_usage_limits(&credentials, &cfg, &token, effective_proxy.as_ref()).await?;
+        let usage_limits = match get_usage_limits(&credentials, &cfg, &token, effective_proxy.as_ref()).await {
+            Ok(u) => u,
+            Err(e) => {
+                // 验活标记（E）：external_idp 号若 403 FEATURE_NOT_SUPPORTED（该 region profile 未开通），
+                // 置位供刷新路径（D）只对**确认坏的号** reprobe 重选可用 region，健康号不额外探测（省成本）。
+                if e.to_string().contains("FEATURE_NOT_SUPPORTED") {
+                    let entries = self.entries.lock();
+                    if let Some(entry) = entries.iter().find(|e| e.id == id) {
+                        entry
+                            .last_usage_403_feature_not_supported
+                            .store(true, Ordering::Relaxed);
+                    }
+                }
+                return Err(e);
+            }
+        };
+
+        // 成功查询 → 清除 FEATURE_NOT_SUPPORTED 标记（该号当前 region profile 已可用）。
+        {
+            let entries = self.entries.lock();
+            if let Some(entry) = entries.iter().find(|e| e.id == id) {
+                entry
+                    .last_usage_403_feature_not_supported
+                    .store(false, Ordering::Relaxed);
+            }
+        }
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {
@@ -3089,6 +3659,21 @@ impl MultiTokenManager {
     /// 发送一个会被服务端拒绝（空 conversationState）的请求，
     /// 只要返回 400（格式错误）而非 403（suspend）即表示凭据存活。
     pub async fn deep_verify_credential(&self, id: u64) -> anyhow::Result<()> {
+        // 自定义 API 透传号:不能走 ensure_valid_token(会用 api_key 当 Kiro token 打
+        // runtime.kiro.dev/generateAssistantResponse 必 401/403,把活号误判死号)。改走
+        // 透传专属探测:打它自己的 base_url,只看 header status(隔离铁律,不进 Kiro 池、不解析流)。
+        let custom_cred = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .filter(|e| e.credentials.is_custom_api_credential())
+                .map(|e| e.credentials.clone())
+        };
+        if let Some(cred) = custom_cred {
+            return self.deep_verify_custom_api(&cred).await;
+        }
+
         // 双检刷新收敛到 ensure_valid_token：credentials 为刷新后最新快照
         // （含可能动态解析到的 profileArn），供后续 region / machine_id / 请求头使用。
         let (credentials, token) = self.ensure_valid_token(id).await?;
@@ -3174,6 +3759,61 @@ impl MultiTokenManager {
         // `probe_available_models` 逐模型带 modelId 探测（因为此处探测体无 modelId，上游
         // 不会返回 INVALID_MODEL_ID，在这里判它属死代码）。分工清晰、不做假承诺。
         Ok(())
+    }
+
+    /// 自定义 API 透传号的测活探测:打它自己的 base_url(Anthropic messages 端点),
+    /// 用它的 api_key,发一个极小请求看 header status 判活。
+    ///
+    /// **隔离铁律**:走 base_url 独立 client(非 Kiro 选号池)、非流式短超时、**只看 header status
+    /// 绝不解析响应流**。判定按透传 failover 同口径:401=key 失效 / 402·403=额度耗尽 / 429=限流(视为活)
+    /// / 200·400=可达有效 / 5xx·网络=上游不可用。bail 文案复用现有关键字,免改 classify_balance_error。
+    async fn deep_verify_custom_api(&self, credentials: &KiroCredentials) -> anyhow::Result<()> {
+        let base = match credentials.base_url.as_deref() {
+            Some(b) if !b.trim().is_empty() => b.trim_end_matches('/').to_string(),
+            _ => bail!("自定义 API 凭据缺少 base_url"),
+        };
+        let url = if base.ends_with("/v1") || base.contains("/v1/") {
+            format!("{base}/messages")
+        } else {
+            format!("{base}/v1/messages")
+        };
+        // 非流式短超时(30s),勿用流式 720s。走该号 effective_proxy。
+        // **禁重定向**(SSRF 纵深):防公网中转站 302→内网/元数据的盲 SSRF(端口探测)。
+        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        let client = build_client_no_redirect(effective_proxy.as_ref(), 30, self.config.load().tls_backend)?;
+
+        // 极小 Anthropic 探测体(max_tokens:1),只为触发认证/额度检查。
+        let probe = serde_json::json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "ping"}]
+        });
+        let mut req = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("anthropic-version", "2023-06-01");
+        if let Some(key) = credentials.api_key.as_deref().filter(|k| !k.is_empty()) {
+            req = req
+                .header("x-api-key", key)
+                .header("Authorization", format!("Bearer {key}"));
+        }
+        let resp = match req.body(probe.to_string()).send().await {
+            Ok(r) => r,
+            Err(e) => bail!("上游不可达: {}", e),
+        };
+        let code = resp.status().as_u16();
+        // 只看 status,不解析流(隔离铁律)。
+        match code {
+            401 => bail!("凭证已过期或无效 (401): 上游 API key 失效"),
+            402 | 403 => bail!("额度已用尽或权限不足 ({}): 上游拒绝", code),
+            429 => Ok(()),                          // 限流=号仍活,只是暂时被限
+            c if (200..300).contains(&c) => Ok(()), // 可达有效
+            // 其余 4xx(400 请求校验/404 模型名不认/422 等):上游可达且已通过认证(否则 401/403),
+            // 号本身有效——不因探测体的 model 字段被某中转站拒就误判死号。只 401/402/403 + 5xx 判死。
+            c if (400..500).contains(&c) => Ok(()),
+            c if (500..600).contains(&c) => bail!("上游服务不可用 ({})", c),
+            c => bail!("上游返回异常状态 ({})", c),
+        }
     }
 
     /// 探测指定凭据**可用哪些模型**（Admin API，勾选后从独立页面手动触发）。
@@ -3422,6 +4062,8 @@ impl MultiTokenManager {
             if base.trim().is_empty() {
                 anyhow::bail!("自定义 API 的 base_url 为空");
             }
+            // SSRF 写入校验(主防线):解析最终透传 URL 的目标 IP,禁内网/环回/链路本地/元数据。
+            validate_custom_api_base_url(base).await?;
         } else if new_cred.is_api_key_credential() {
             let api_key = new_cred
                 .kiro_api_key
@@ -3515,20 +4157,12 @@ impl MultiTokenManager {
             refresh_token(&new_cred, &cfg, effective_proxy.as_ref()).await?
         };
 
-        // 4. 分配新 ID
-        //    【红线】必须扫描 entries ∪ trash 的 id 并集取 max+1，
-        //    否则回收站里的 id 会与新加凭据撞号，恢复时冲突。
-        let new_id = {
-            let entries = self.entries.lock();
-            let trash = self.trash.lock();
-            let max_entry = entries.iter().map(|e| e.id).max().unwrap_or(0);
-            let max_trash = trash
-                .iter()
-                .filter_map(|t| t.credentials.id)
-                .max()
-                .unwrap_or(0);
-            max_entry.max(max_trash) + 1
-        };
+        // 4. 分配新 ID：进程内单调计数器，fetch_add 原子取号，永不回退、永不复用（见 next_id 字段说明）。
+        //    【为何不再扫 entries ∪ trash 取 max+1】旧算法在「删号 → purge 出回收站 → 再加号」时
+        //    max+1 会回落复用刚被清除的 id，让新号继承死号残留的 cooldown/model_blocklist 内存态。
+        //    计数器在启动时已初始化为 max(entries ∪ trash)+1 并随每次分配单调递增，天然 ≥ 任何现存
+        //    /回收站 id，既杜绝复用又不会与 trash 恢复的号撞号。
+        let new_id = self.next_id.fetch_add(1, Ordering::AcqRel);
 
         // 5. 设置 ID 并保留用户输入的元数据
         validated_cred.id = Some(new_id);
@@ -3599,6 +4233,7 @@ impl MultiTokenManager {
                 total_credits_used: 0.0,
                 last_used_at: None,
                 inflight: Arc::new(AtomicU32::new(0)),
+                last_usage_403_feature_not_supported: AtomicBool::new(false),
             });
         }
 
@@ -3662,6 +4297,20 @@ impl MultiTokenManager {
         // 清除被删凭据的会话亲和性绑定，避免后续重选时命中已移出的凭据
         self.affinity.remove_by_credential(id);
 
+        // 清除被删凭据的一切 per-id 调度内存态（cooldown / rpm / model_blocklist / rate_limiter）。
+        // 这些结构以 credential_id 为键但不随删号自动收缩，若不清：
+        //   ①从回收站 restore(按原 id 恢复)的号会背着删除前的长冷却/退避/日计数/黑名单被静默跳过；
+        //   ②即便有单调 id 计数器兜底新号不复用 id，删→恢复同一 id 的路径仍需要它。
+        // 与上面 affinity 清理同属「删号清干净它的调度态」契约。current_id 切换靠下方
+        // select_highest_priority；health 是族级(family_key)非 per-id，与单号删除无关，不动。
+        self.cooldown.clear_cooldown(id);
+        self.rpm.remove(id);
+        // model_blocklist 键是复合 (credential_id, model)，按 id 剔除该号的所有模型级黑名单条目。
+        self.model_blocklist.lock().retain(|(cred_id, _), _| *cred_id != id);
+        // rate_limiter per-id 状态(backoff_until 退避≤1h / daily_count / consecutive_failures):
+        // 不清则 restore 同 id 的 Kiro 号会继承残留退避被静默跳过直到自愈,与 cooldown 同源同类。
+        self.rate_limiter.reset(id);
+
         // 如果删除的是当前凭据，切换到优先级最高的可用凭据
         if was_current {
             self.select_highest_priority();
@@ -3698,6 +4347,7 @@ impl MultiTokenManager {
                     total_credits_used: 0.0,
                     last_used_at: None,
                     inflight: Arc::new(AtomicU32::new(0)),
+                    last_usage_403_feature_not_supported: AtomicBool::new(false),
                 });
             }
             return Err(e.context("回收站落盘失败，已回滚删除操作"));
@@ -3819,6 +4469,7 @@ impl MultiTokenManager {
                 total_credits_used: restored_entry.total_credits_used,
                 last_used_at: restored_entry.last_used_at,
                 inflight: Arc::new(AtomicU32::new(0)),
+                last_usage_403_feature_not_supported: AtomicBool::new(false),
             });
         }
 
@@ -3916,11 +4567,117 @@ impl MultiTokenManager {
             .collect()
     }
 
+    /// 新号入池后一次性自动初始化(异步 fire-and-forget):刷 token + 动态解析 profileArn。
+    ///
+    /// 根治「刚上号查余额报 403 Invalid token / 400 profileArn is required」的时序坑(#89):
+    /// 新号 add 后不再被动等后台刷新循环(它过滤临期 token,新号不命中)才解析 arn,而是入池即触发一次
+    /// [`force_refresh_token_for`](Self::force_refresh_token_for)(内含「刷 token + 缺则 ListAvailableProfiles
+    /// 解析 arn + persist」)。
+    ///
+    /// **门控集中在此**(4 条上号路径调用点无需各自判类型):custom_api(透传,无 refresh_token/arn)、
+    /// api_key(直接用 kiro_api_key,无需刷新)一律跳过——否则 custom_api 会误入 force_refresh 的
+    /// refresh_token 分支 bail。不阻塞上号响应(spawn 后台跑),失败仅 warn。
+    pub fn spawn_initial_refresh(self: &Arc<Self>, id: u64) {
+        let eligible = {
+            let entries = self.entries.lock();
+            match entries.iter().find(|e| e.id == id) {
+                Some(e) => {
+                    !e.credentials.is_custom_api_credential()
+                        && !e.credentials.is_api_key_credential()
+                }
+                None => false,
+            }
+        };
+        if !eligible {
+            return;
+        }
+        let tm = Arc::clone(self);
+        tokio::spawn(async move {
+            tracing::info!("凭据 #{} 新号自动初始化开始(刷新 Token + 解析 profileArn)", id);
+            match tm.force_refresh_token_for(id).await {
+                Ok(_) => tracing::info!("凭据 #{} 新号自动初始化完成", id),
+                Err(e) => tracing::warn!(
+                    "凭据 #{} 新号初始化失败(不影响入池,后台刷新循环会重试): {}",
+                    id,
+                    e
+                ),
+            }
+        });
+    }
+
     /// 强制刷新指定凭据的 Token（admin 手动强刷）。
     ///
     /// 无条件刷新；错误直接返回给调用方（admin 侧）展示，不在此累计失败/禁用。
     pub async fn force_refresh_token_for(&self, id: u64) -> anyhow::Result<()> {
         self.refresh_token_locked(id, None).await.map(|_| ())
+    }
+
+    /// 【F】切换指定 external_idp 号到目标 region 的 profile。
+    ///
+    /// 流程：取有效 token → [`probe_profile_usable`] 验活目标 arn → **仅 Usable 才**写回
+    /// `profile_arn` + `sync_region_from_arn()` + 持久化，并返回订阅标题；
+    /// FeatureNotSupported/Unauthorized/其它一律 `bail!`，**校验不可用绝不写入**（防呆铁律）。
+    pub async fn switch_profile_region_for(
+        &self,
+        id: u64,
+        target_arn: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let target_arn = target_arn.trim().to_string();
+        if target_arn.is_empty() {
+            bail!("目标 profileArn 为空");
+        }
+        // 取有效 token（过期会先刷新）。credentials 为最新快照。
+        let (credentials, token) = self.ensure_valid_token(id).await?;
+        if !credentials.is_external_idp_credential() {
+            bail!("仅 External IdP 凭据支持切换 region profile");
+        }
+        let cfg = self.config.load_full();
+        let proxy = credentials.effective_proxy(self.proxy.as_ref());
+        match probe_profile_usable(&credentials, &cfg, &token, proxy.as_ref(), &target_arn).await {
+            ProfileProbeOutcome::Usable { subscription_title } => {
+                {
+                    let mut entries = self.entries.lock();
+                    let entry = entries
+                        .iter_mut()
+                        .find(|e| e.id == id)
+                        .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+                    entry.credentials.profile_arn = Some(target_arn.clone());
+                    entry.credentials.sync_region_from_arn();
+                    if let Some(t) = &subscription_title {
+                        entry.credentials.subscription_title = Some(t.clone());
+                    }
+                    // 切到已验活可用的 region → 清除坏标记。
+                    entry
+                        .last_usage_403_feature_not_supported
+                        .store(false, Ordering::Relaxed);
+                }
+                if let Err(e) = self.persist_credentials() {
+                    tracing::warn!("切换 region 后持久化失败（不影响本次切换）: {}", e);
+                }
+                tracing::info!("凭据 #{} 已切换到 region profile {}", id, target_arn);
+                Ok(subscription_title)
+            }
+            ProfileProbeOutcome::FeatureNotSupported => {
+                bail!("目标 region profile 不可用（FEATURE_NOT_SUPPORTED，该 region 未开通），未切换")
+            }
+            ProfileProbeOutcome::Unauthorized => {
+                bail!("目标 region profile 验活失败（401 认证无效），未切换")
+            }
+            ProfileProbeOutcome::OtherError(e) => {
+                bail!("目标 region profile 验活失败（{}），未切换", e)
+            }
+        }
+    }
+
+    /// 【F】列出指定 external_idp 号在候选 region 的全部 profile 及其验活结果（供前端选 region）。
+    pub async fn probe_regions_for(&self, id: u64) -> anyhow::Result<Vec<ProfileCandidate>> {
+        let (credentials, token) = self.ensure_valid_token(id).await?;
+        if !credentials.is_external_idp_credential() {
+            bail!("仅 External IdP 凭据支持列出 region profile");
+        }
+        let cfg = self.config.load_full();
+        let proxy = credentials.effective_proxy(self.proxy.as_ref());
+        Ok(probe_all_usable_profiles(&credentials, &cfg, &token, proxy.as_ref()).await)
     }
 
     /// 后台主动预刷新指定凭据（批次4.4）。
@@ -4018,7 +4775,7 @@ impl MultiTokenManager {
         // 端点要求真实 profileArn(占位 ARN 对 Enterprise 号会被判 Invalid token/403)。刷新成功后
         // 若该号仍缺 profileArn 且非 external_idp(它不带),运行时调 management ListAvailableProfiles
         // 拿真实 arn 写回,一次解析后持久化缓存,后续对话/余额直接用真实值。失败仅告警不阻断。
-        let (needs_arn, arn_creds, arn_token) = {
+        let (needs_arn, needs_reprobe, arn_creds, arn_token) = {
             let entries = self.entries.lock();
             match entries.iter().find(|e| e.id == id) {
                 Some(e) => {
@@ -4033,25 +4790,88 @@ impl MultiTokenManager {
                     // 而 resolve_profile_arn_via_management 本就为它设了 TokenType:EXTERNAL_IDP。
                     // 仅 api_key 号无 profile 概念,排除。
                     let eligible = missing && !c.is_api_key_credential();
+                    // 验活重选（D）：external_idp 号当前 arn 上次 getUsageLimits 返回过
+                    // 403 FEATURE_NOT_SUPPORTED（该 region profile 未开通）→ 需要 reprobe 换可用 region。
+                    // 只对**确认坏的号**触发（健康号 flag=false 不动，省成本）。missing 优先走解析路径。
+                    let needs_reprobe = !missing
+                        && c.is_external_idp_credential()
+                        && e.last_usage_403_feature_not_supported.load(Ordering::Relaxed);
                     (
                         eligible,
+                        needs_reprobe,
                         c.clone(),
                         c.access_token.clone().unwrap_or_default(),
                     )
                 }
-                None => (false, KiroCredentials::default(), String::new()),
+                None => (false, false, KiroCredentials::default(), String::new()),
             }
         };
+        // 验活重选（D）：确认坏的 external_idp 号——枚举全部候选、真验活、选 usable 的 arn 写回。
+        // 用 probe_all_usable_profiles（而非 resolve_profile_arn_multi_region 的「取第一个」），
+        // 否则可能再次选中同一个 FEATURE_NOT_SUPPORTED 的坏 arn。
+        if needs_reprobe && !arn_token.is_empty() {
+            let cfg2 = self.config.load_full();
+            let proxy2 = arn_creds.effective_proxy(self.proxy.as_ref());
+            let candidates =
+                probe_all_usable_profiles(&arn_creds, &cfg2, &arn_token, proxy2.as_ref()).await;
+            if let Some(best) = candidates.iter().find(|c| c.usable) {
+                let mut entries = self.entries.lock();
+                if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                    let old = entry.credentials.profile_arn.clone();
+                    if old.as_deref() != Some(best.arn.as_str()) {
+                        entry.credentials.profile_arn = Some(best.arn.clone());
+                        entry.credentials.sync_region_from_arn();
+                        if let Some(t) = &best.subscription_title {
+                            entry.credentials.subscription_title = Some(t.clone());
+                        }
+                        tracing::info!(
+                            "凭据 #{} 验活重选：{:?} → {}（region={}, {}）",
+                            id,
+                            old,
+                            best.arn,
+                            best.region,
+                            best.subscription_title.as_deref().unwrap_or("?")
+                        );
+                    }
+                    // 无论 arn 是否变（可能只是当时暂时性 403 后确认仍可用），清除坏标记。
+                    entry
+                        .last_usage_403_feature_not_supported
+                        .store(false, Ordering::Relaxed);
+                }
+            } else {
+                tracing::warn!(
+                    "凭据 #{} 验活重选未找到可用 region profile（保持原 arn，等待人工/后续重试）",
+                    id
+                );
+            }
+        }
         if needs_arn && !arn_token.is_empty() {
             let cfg2 = self.config.load_full();
             let proxy2 = arn_creds.effective_proxy(self.proxy.as_ref());
-            match resolve_profile_arn_via_management(&arn_creds, &cfg2, &arn_token, proxy2.as_ref())
-                .await
+            // 优先探测号自己的 region（拿到 region 与 ARN 自洽的 profile），无则候选兜底。
+            let preferred_region = arn_creds.effective_upstream_region(&cfg2).to_string();
+            match resolve_profile_arn_multi_region(
+                &arn_creds,
+                &cfg2,
+                &arn_token,
+                proxy2.as_ref(),
+                &preferred_region,
+            )
+            .await
             {
                 Ok(Some(arn)) => {
                     let mut entries = self.entries.lock();
                     if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                         entry.credentials.profile_arn = Some(arn.clone());
+                        // 防呆铁律:profile_arn 一变,region/auth_region 立即同步成 ARN 内 region,
+                        // 杜绝「解析到 X region 的 ARN 却留着 Y region」错配 → 400 Improperly formed。
+                        if entry.credentials.sync_region_from_arn() {
+                            tracing::info!(
+                                "凭据 #{} region 已随 profileArn 同步为 {}",
+                                id,
+                                entry.credentials.region.as_deref().unwrap_or("?")
+                            );
+                        }
                     }
                     tracing::info!("凭据 #{} 动态解析到 profileArn（ListAvailableProfiles）", id);
                 }
@@ -4130,6 +4950,113 @@ impl Drop for MultiTokenManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ===== External IdP 验活层：纯逻辑单测 =====
+
+    #[test]
+    fn test_classify_probe_200_usable() {
+        assert_eq!(
+            classify_profile_probe(200, r#"{"subscriptionInfo":{}}"#),
+            ProfileProbeOutcome::Usable { subscription_title: None }
+        );
+        assert_eq!(
+            classify_profile_probe(204, ""),
+            ProfileProbeOutcome::Usable { subscription_title: None }
+        );
+    }
+
+    #[test]
+    fn test_classify_probe_403_feature_not_supported() {
+        // 实测 us-east-1 未开通号的真实症状
+        let body = r#"{"__type":"AccessDeniedException","message":"FEATURE_NOT_SUPPORTED"}"#;
+        assert_eq!(
+            classify_profile_probe(403, body),
+            ProfileProbeOutcome::FeatureNotSupported
+        );
+    }
+
+    #[test]
+    fn test_classify_probe_403_other_is_not_feature() {
+        // 403 但不含 FEATURE_NOT_SUPPORTED → OtherError（不判死 region）
+        match classify_profile_probe(403, "some other 403 reason") {
+            ProfileProbeOutcome::OtherError(_) => {}
+            other => panic!("期望 OtherError，得到 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_classify_probe_401_unauthorized() {
+        assert_eq!(
+            classify_profile_probe(401, "invalid token"),
+            ProfileProbeOutcome::Unauthorized
+        );
+    }
+
+    #[test]
+    fn test_classify_probe_429_is_other_error_not_dead() {
+        // 铁律：429 归 OtherError（暂时不可用），绝不因限流判死一个 region
+        match classify_profile_probe(429, "Too Many Requests") {
+            ProfileProbeOutcome::OtherError(_) => {}
+            other => panic!("429 必须是 OtherError，得到 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_classify_probe_5xx_is_other_error() {
+        match classify_profile_probe(502, "bad gateway") {
+            ProfileProbeOutcome::OtherError(_) => {}
+            other => panic!("期望 OtherError，得到 {:?}", other),
+        }
+    }
+
+    fn mk_candidate(usable: bool, title: Option<&str>) -> ProfileCandidate {
+        ProfileCandidate {
+            arn: "arn:aws:codewhisperer:eu-central-1:1:profile/x".to_string(),
+            region: "eu-central-1".to_string(),
+            account: "1".to_string(),
+            usable,
+            subscription_title: title.map(|s| s.to_string()),
+            reason: if usable { "usable" } else { "feature_not_supported" },
+        }
+    }
+
+    #[test]
+    fn test_candidate_rank_usable_before_unusable() {
+        let usable = mk_candidate(true, None);
+        let unusable = mk_candidate(false, None);
+        assert!(candidate_rank(&usable) < candidate_rank(&unusable));
+    }
+
+    #[test]
+    fn test_candidate_rank_paid_before_free() {
+        let paid = mk_candidate(true, Some("KIRO POWER"));
+        let free = mk_candidate(true, Some("KIRO FREE"));
+        let none = mk_candidate(true, None);
+        assert!(candidate_rank(&paid) < candidate_rank(&free));
+        assert!(candidate_rank(&paid) < candidate_rank(&none));
+    }
+
+    #[test]
+    fn test_candidate_sort_orders_usable_paid_first() {
+        let mut v = vec![
+            mk_candidate(false, None),
+            mk_candidate(true, Some("KIRO FREE")),
+            mk_candidate(true, Some("KIRO POWER")),
+        ];
+        v.sort_by_key(candidate_rank);
+        assert_eq!(v[0].subscription_title.as_deref(), Some("KIRO POWER"));
+        assert_eq!(v[1].subscription_title.as_deref(), Some("KIRO FREE"));
+        assert!(!v[2].usable);
+    }
+
+    #[test]
+    fn test_account_from_arn() {
+        assert_eq!(
+            account_from_arn("arn:aws:codewhisperer:eu-central-1:155119901513:profile/abc"),
+            "155119901513"
+        );
+        assert_eq!(account_from_arn("garbage"), "");
+    }
 
     #[test]
     fn test_write_atomic_writes_content_and_no_tmp_residue() {
@@ -4537,6 +5464,68 @@ mod tests {
         assert_eq!(manager.available_count(), 2);
     }
 
+    #[tokio::test]
+    async fn test_credential_id_never_reused_after_purge() {
+        // 回归:删号→从回收站彻底清除(purge)→再加号,新号绝不复用被清除的 id。
+        // 旧算法 max(entries∪trash)+1 会在 purge 后回落复用 id,使新号继承死号残留的
+        // cooldown/model_blocklist 内存态。单调 id 计数器根治之。custom_api 号免网络校验。
+        let config = Config::default();
+        let mk = |url: &str| {
+            let mut c = KiroCredentials::default();
+            c.auth_method = Some("custom_api".to_string());
+            c.base_url = Some(url.to_string());
+            c
+        };
+        let mgr = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+        let id1 = mgr.add_credential(mk("https://a.example.com")).await.unwrap();
+        let id2 = mgr.add_credential(mk("https://b.example.com")).await.unwrap();
+        assert!(id2 > id1, "id 应单调递增: #{id1} → #{id2}");
+
+        // 删除最高 id 的号并从回收站彻底清除。
+        mgr.set_disabled(id2, true).unwrap();
+        mgr.delete_credential(id2).unwrap();
+        mgr.purge_credential(id2).unwrap();
+
+        // 此刻 entries∪trash 的 max 已回落到 id1;旧算法会把 id2 分配给新号(复用),
+        // 计数器则继续给 id2 之后的值。
+        let id3 = mgr.add_credential(mk("https://c.example.com")).await.unwrap();
+        assert!(
+            id3 > id2,
+            "purge 后新号 id 必须 > 已清除的 id,不得复用(新号 #{id3},已清除 #{id2})"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_clears_per_id_cooldown_and_restore_is_clean() {
+        // 回归:删号应清掉其 per-id 调度内存态(cooldown 等);从回收站按原 id 恢复的号
+        // 不得继承删除前的长冷却而被静默跳过。
+        use crate::kiro::cooldown::CooldownReason;
+        let config = Config::default();
+        let mut c = KiroCredentials::default();
+        c.auth_method = Some("custom_api".to_string());
+        c.base_url = Some("https://relay.example.com".to_string());
+        let mgr = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+        let id = mgr.add_credential(c).await.unwrap();
+
+        // 打一个长冷却(账户暂停=24h,测试期内不会自然到期)。
+        mgr.cooldown.set_cooldown(id, CooldownReason::AccountSuspended);
+        assert!(
+            mgr.cooldown_snapshot().iter().any(|i| i.credential_id == id),
+            "冷却应已设置"
+        );
+
+        // 禁用 + 删除:delete_credential 应清掉该号的 per-id 冷却态。
+        mgr.set_disabled(id, true).unwrap();
+        mgr.delete_credential(id).unwrap();
+
+        // 从回收站恢复(id 不变):不应再背着删除前的长冷却。
+        mgr.restore_credential(id).unwrap();
+        assert!(
+            !mgr.cooldown_snapshot().iter().any(|i| i.credential_id == id),
+            "restore 后不应继承删除前的冷却(#{id} 仍在冷却快照 = 泄漏)"
+        );
+    }
+
     // MultiTokenManager 测试
 
     #[test]
@@ -4573,6 +5562,65 @@ mod tests {
         assert_eq!(m1, shared, "首个保留原 machineId");
         assert_eq!(m2.len(), 64, "轮换后应为 64 hex");
         assert!(m2.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_select_custom_api_priority_and_failover_exclude() {
+        // custom_api 池内调度:①优先级小先选 ②exclude 排除已试号 failover 到下一个
+        // ③全部 exclude → None(供上层落 Kiro 主力)。
+        use std::collections::HashSet;
+        let config = Config::default();
+        let mk = |id: u64, prio: u32| {
+            let mut c = KiroCredentials::default();
+            c.id = Some(id);
+            c.auth_method = Some("custom_api".to_string());
+            c.base_url = Some(format!("https://relay{id}.example.com"));
+            c.api_key = Some(format!("sk-{id}"));
+            c.priority = prio;
+            c
+        };
+        // #1 prio0, #2 prio0, #3 prio1
+        let mgr = MultiTokenManager::new(config, vec![mk(1, 0), mk(2, 0), mk(3, 1)], None, None, false).unwrap();
+
+        let empty = HashSet::new();
+        // 初选:priority 最小(0)的 #1/#2 之一(同级按 RPM 均衡,初始 RPM 全 0 → 取 id 最小 #1)。
+        let first = mgr.select_custom_api(&empty).expect("应选到 custom_api 号");
+        assert!(first.0 == 1 || first.0 == 2, "应先选 priority=0 的号,得到 #{}", first.0);
+
+        // failover:排除 #1、#2 后应落到 priority=1 的 #3(仍在 custom_api 池内,不跳类型)。
+        let mut ex: HashSet<u64> = HashSet::new();
+        ex.insert(1);
+        ex.insert(2);
+        let third = mgr.select_custom_api(&ex).expect("排除两个 prio0 后应选 #3");
+        assert_eq!(third.0, 3, "failover 应落到 priority=1 的 #3");
+
+        // 全部排除 → None(上层据此落 Kiro 主力路径)。
+        ex.insert(3);
+        assert!(mgr.select_custom_api(&ex).is_none(), "全部 custom_api 排除后应返回 None");
+    }
+
+    #[test]
+    fn test_select_custom_api_skips_cooldown() {
+        // failover 给失败号设了冷却后,select_custom_api 应跳过冷却中的号。
+        use std::collections::HashSet;
+        let config = Config::default();
+        let mut c1 = KiroCredentials::default();
+        c1.id = Some(1);
+        c1.auth_method = Some("custom_api".to_string());
+        c1.base_url = Some("https://relay1.example.com".to_string());
+        c1.priority = 0;
+        let mut c2 = KiroCredentials::default();
+        c2.id = Some(2);
+        c2.auth_method = Some("custom_api".to_string());
+        c2.base_url = Some("https://relay2.example.com".to_string());
+        c2.priority = 0;
+        let mgr = MultiTokenManager::new(config, vec![c1, c2], None, None, false).unwrap();
+
+        // 给 #1 设冷却(模拟它 403 额度满被 failover 冷却)→ 选号应跳过 #1 选 #2。
+        mgr.cooldown_custom_api(1, 180);
+        let empty = HashSet::new();
+        let sel = mgr.select_custom_api(&empty).expect("应选到未冷却的 #2");
+        assert_eq!(sel.0, 2, "#1 冷却中,应选 #2");
     }
 
     #[test]
@@ -5732,6 +6780,79 @@ mod tests {
         assert_eq!(trash[0].id, 1);
         // entries 只剩 id=2
         assert_eq!(manager2.total_count(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_custom_api_request_count_and_disabled_persist_across_restart() {
+        // 回归(对抗 review #3):custom_api 的 request_count 是「终身预算」计数,达上限后
+        // request_count + disabled 都必须跨重启持久化——否则重启即额度归零、被禁号重新可用,防超预算失效。
+        use crate::usage::RequestOutcome;
+
+        let dir = std::env::temp_dir().join(format!("kiro-reqcount-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cred_path = dir.join("credentials.json");
+        std::fs::write(
+            &cred_path,
+            r#"[{"id":1,"authMethod":"custom_api","baseUrl":"https://up.example.com","requestLimit":2}]"#,
+        )
+        .unwrap();
+
+        let cred = {
+            let mut c = KiroCredentials::default();
+            c.id = Some(1);
+            c.auth_method = Some("custom_api".to_string());
+            c.base_url = Some("https://up.example.com".to_string());
+            c.request_limit = Some(2);
+            c
+        };
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(cred_path.clone()),
+            true,
+        )
+        .unwrap();
+
+        // 两次成功透传 → 命中 request_limit=2 → 自动禁用 + 立即落盘。
+        manager.record_passthrough_result(1, RequestOutcome::Success);
+        manager.record_passthrough_result(1, RequestOutcome::Success);
+
+        // stats 文件应已写入 request_count(命中上限走立即 save_stats,非 debounced)。
+        let stats_file = dir.join("kiro_stats.json");
+        assert!(stats_file.exists(), "kiro_stats.json 应已落盘");
+        let stats_json = std::fs::read_to_string(&stats_file).unwrap();
+        assert!(
+            stats_json.contains("\"request_count\""),
+            "stats 文件应含 request_count 字段"
+        );
+
+        // 用同一目录重建 manager,模拟进程重启:reload_creds 从 credentials.json 读回(含 disabled),
+        // load_stats 从 kiro_stats.json 读回 request_count。
+        let reload_creds =
+            crate::kiro::model::credentials::CredentialsConfig::load(&cred_path)
+                .unwrap()
+                .into_sorted_credentials();
+        let manager2 = MultiTokenManager::new(
+            Config::default(),
+            reload_creds,
+            None,
+            Some(cred_path.clone()),
+            true,
+        )
+        .unwrap();
+
+        let snap = manager2
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|c| c.id == 1)
+            .expect("id=1 应仍在池中");
+        assert_eq!(snap.request_count, 2, "request_count 应跨重启保留为 2,不回退归零");
+        assert!(snap.disabled, "达上限的禁用状态应跨重启保留");
 
         std::fs::remove_dir_all(&dir).ok();
     }
