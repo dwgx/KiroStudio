@@ -12,10 +12,19 @@ import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { ModelTestDialog } from '@/components/model-test-dialog'
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from '@/components/ui/dialog'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useSetDisabled } from '@/hooks/use-credentials'
-import { getCredentialBalance, getCachedBalances, forceRefreshToken, deepVerifyCredential, probeAvailableModels, setCredentialAllowedModels } from '@/api/credentials'
+import { getCredentialBalance, getCachedBalances, forceRefreshToken, deepVerifyCredential, probeAvailableModels, setCredentialAllowedModels, PROBE_MODEL_CATALOG } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import { PageSkeleton } from '@/components/ui/page-skeleton'
+import { useUiLayoutPrefs } from '@/hooks/use-ui-layout-prefs'
 import type { BalanceResponse } from '@/types/api'
 
 interface DashboardProps {
@@ -78,6 +87,22 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
+  // 二次确认弹框(替代浏览器原生 confirm,统一走设计系统控件):
+  // 存待执行动作 + 文案,确认后调 onConfirm。批量删除/清除已禁用都走它。
+  const [confirmState, setConfirmState] = useState<{
+    title: string
+    description: string
+    confirmText: string
+    onConfirm: () => void | Promise<void>
+  } | null>(null)
+  const [confirmBusy, setConfirmBusy] = useState(false)
+  // 批量设"允许模型白名单"本地编辑集合(勾选后弹窗用):空=不限制。
+  const [batchAllowedModels, setBatchAllowedModels] = useState<Set<string>>(new Set())
+  const [batchWhitelistBusy, setBatchWhitelistBusy] = useState(false)
+  // 「允许模型」弹窗开关(勾选后按钮触发,交互对齐「测试可用模型」)。
+  const [batchWhitelistOpen, setBatchWhitelistOpen] = useState(false)
+  // UI 排版偏好:凭据卡片尺寸档位 → 自适应每行 N 个(设置页配置)。
+  const { prefs: uiPrefs } = useUiLayoutPrefs()
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
   const [verifying, setVerifying] = useState(false)
   const [verifyProgress, setVerifyProgress] = useState({ current: 0, total: 0 })
@@ -223,41 +248,35 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     const skippedCount = selectedIds.size - disabledIds.length
     const skippedText = skippedCount > 0 ? `（将跳过 ${skippedCount} 个未禁用凭据）` : ''
 
-    if (!confirm(`确定要删除 ${disabledIds.length} 个已禁用凭据吗？此操作无法撤销。${skippedText}`)) {
-      return
-    }
-
-    let successCount = 0
-    let failCount = 0
-
-    for (const id of disabledIds) {
-      try {
-        await new Promise<void>((resolve, reject) => {
-          deleteCredential(id, {
-            onSuccess: () => {
-              successCount++
-              resolve()
-            },
-            onError: (err) => {
-              failCount++
-              reject(err)
-            }
-          })
-        })
-      } catch (error) {
-        // 错误已在 onError 中处理
-      }
-    }
-
-    const skippedResultText = skippedCount > 0 ? `，已跳过 ${skippedCount} 个未禁用凭据` : ''
-
-    if (failCount === 0) {
-      toast.success(`成功删除 ${successCount} 个已禁用凭据${skippedResultText}`)
-    } else {
-      toast.warning(`删除已禁用凭据：成功 ${successCount} 个，失败 ${failCount} 个${skippedResultText}`)
-    }
-
-    deselectAll()
+    // 走设计系统 ConfirmDialog(不用浏览器原生 confirm)。确认后再执行删除。
+    setConfirmState({
+      title: '批量删除已禁用凭据',
+      description: `确定要删除 ${disabledIds.length} 个已禁用凭据吗？此操作无法撤销。${skippedText}`,
+      confirmText: '删除',
+      onConfirm: async () => {
+        let successCount = 0
+        let failCount = 0
+        for (const id of disabledIds) {
+          try {
+            await new Promise<void>((resolve, reject) => {
+              deleteCredential(id, {
+                onSuccess: () => { successCount++; resolve() },
+                onError: (err) => { failCount++; reject(err) },
+              })
+            })
+          } catch (error) {
+            // 错误已在 onError 中处理
+          }
+        }
+        const skippedResultText = skippedCount > 0 ? `，已跳过 ${skippedCount} 个未禁用凭据` : ''
+        if (failCount === 0) {
+          toast.success(`成功删除 ${successCount} 个已禁用凭据${skippedResultText}`)
+        } else {
+          toast.warning(`删除已禁用凭据：成功 ${successCount} 个，失败 ${failCount} 个${skippedResultText}`)
+        }
+        deselectAll()
+      },
+    })
   }
 
   // 批量恢复异常
@@ -343,6 +362,51 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     deselectAll()
   }
 
+  const toggleBatchAllowedModel = (mid: string) => {
+    setBatchAllowedModels((prev) => {
+      const n = new Set(prev)
+      if (n.has(mid)) n.delete(mid)
+      else n.add(mid)
+      return n
+    })
+  }
+
+  // 批量设"允许模型白名单"(成本安全硬门)。破坏性整体覆盖 → 走 confirmState 二次确认。
+  // custom_api 号无 Kiro 白名单概念,循环跳过并计入 skipped。空集=清空(设为不限制)。
+  const handleBatchSetAllowedModels = () => {
+    if (selectedIds.size === 0) {
+      toast.error('请先选择要设置白名单的凭据')
+      return
+    }
+    const list = Array.from(batchAllowedModels)
+    const targetIds = Array.from(selectedIds)
+    const setEmpty = list.length === 0
+    setConfirmState({
+      title: setEmpty ? '清空选中凭据的白名单' : '批量设置允许模型（白名单）',
+      description: setEmpty
+        ? `将把选中 ${targetIds.length} 个凭据设为"不限制"（清空现有白名单）。custom_api 号会跳过。`
+        : `将把选中 ${targetIds.length} 个凭据的白名单【整体覆盖】为 ${list.length} 个模型（原有白名单会被清掉）。custom_api 号会跳过。`,
+      confirmText: setEmpty ? '清空' : '覆盖设置',
+      onConfirm: async () => {
+        setBatchWhitelistBusy(true)
+        let ok = 0, fail = 0, skipped = 0
+        for (const id of targetIds) {
+          const cred = data?.credentials.find(c => c.id === id)
+          if (cred && (cred.authMethod === 'custom_api' || cred.baseUrl)) { skipped++; continue }
+          try {
+            await setCredentialAllowedModels(id, setEmpty ? null : list)
+            ok++
+          } catch { fail++ }
+        }
+        queryClient.invalidateQueries({ queryKey: ['credentials'] })
+        setBatchWhitelistBusy(false)
+        const skipText = skipped > 0 ? `，跳过 ${skipped} 个 custom_api` : ''
+        if (fail === 0) toast.success(`白名单已应用到 ${ok} 个凭据${skipText}`)
+        else toast.warning(`白名单：成功 ${ok} 个，失败 ${fail} 个${skipText}`)
+      },
+    })
+  }
+
   // 批量刷新 Token
   const handleBatchForceRefresh = async () => {
     if (selectedIds.size === 0) {
@@ -413,39 +477,33 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       return
     }
 
-    if (!confirm(`确定要清除所有 ${disabledCredentials.length} 个已禁用凭据吗？此操作无法撤销。`)) {
-      return
-    }
-
-    let successCount = 0
-    let failCount = 0
-
-    for (const credential of disabledCredentials) {
-      try {
-        await new Promise<void>((resolve, reject) => {
-          deleteCredential(credential.id, {
-            onSuccess: () => {
-              successCount++
-              resolve()
-            },
-            onError: (err) => {
-              failCount++
-              reject(err)
-            }
-          })
-        })
-      } catch (error) {
-        // 错误已在 onError 中处理
-      }
-    }
-
-    if (failCount === 0) {
-      toast.success(`成功清除所有 ${successCount} 个已禁用凭据`)
-    } else {
-      toast.warning(`清除已禁用凭据：成功 ${successCount} 个，失败 ${failCount} 个`)
-    }
-
-    deselectAll()
+    setConfirmState({
+      title: '清除所有已禁用凭据',
+      description: `确定要清除所有 ${disabledCredentials.length} 个已禁用凭据吗？此操作无法撤销。`,
+      confirmText: '清除',
+      onConfirm: async () => {
+        let successCount = 0
+        let failCount = 0
+        for (const credential of disabledCredentials) {
+          try {
+            await new Promise<void>((resolve, reject) => {
+              deleteCredential(credential.id, {
+                onSuccess: () => { successCount++; resolve() },
+                onError: (err) => { failCount++; reject(err) },
+              })
+            })
+          } catch (error) {
+            // 错误已在 onError 中处理
+          }
+        }
+        if (failCount === 0) {
+          toast.success(`成功清除所有 ${successCount} 个已禁用凭据`)
+        } else {
+          toast.warning(`清除已禁用凭据：成功 ${successCount} 个，失败 ${failCount} 个`)
+        }
+        deselectAll()
+      },
+    })
   }
 
   // 查询当前页凭据信息（只读已缓存余额快照，一次拉取、绝不触发上游调用）。
@@ -504,6 +562,9 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
 
   // 批量验活
   const handleBatchVerify = async () => {
+    // 去重:已在验活中(含"后台运行"关窗后 verifying 仍 true)则忽略重入,
+    // 避免两个并发验活循环共享 cancelVerifyRef/进度 state 互相覆盖、且把 2s 防封号间隔打穿。
+    if (verifying) return
     if (selectedIds.size === 0) {
       toast.error('请先选择要验活的凭据')
       return
@@ -543,19 +604,29 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       })
 
       try {
-        // 深度验活：发真实 API 请求检测 suspend 状态
+        // 深度验活：发真实 API 请求检测 suspend 状态(custom_api 走透传上游探测,后端已分流)
         await deepVerifyCredential(id)
-        const balance = await getCredentialBalance(id)
+        // await 期间用户可能点了取消:复检,取消则不再记成功/不再多发余额请求。
+        if (cancelVerifyRef.current) {
+          toast.info('已取消验活')
+          break
+        }
+        const cred = data?.credentials.find(c => c.id === id)
+        const isCustomApi = cred?.authMethod === 'custom_api' || !!cred?.baseUrl
+        // custom_api 号无 Kiro 余额概念,跳过 getCredentialBalance(对透传号必失败),usage 显"可达/请求数"
+        let usage: string
+        if (isCustomApi) {
+          usage = `可达 · 请求 ${cred?.requestCount ?? 0}`
+        } else {
+          const balance = await getCredentialBalance(id)
+          usage = `${balance.currentUsage}/${balance.usageLimit}`
+        }
         successCount++
 
         // 更新为成功状态
         setVerifyResults(prev => {
           const newResults = new Map(prev)
-          newResults.set(id, {
-            id,
-            status: 'success',
-            usage: `${balance.currentUsage}/${balance.usageLimit}`
-          })
+          newResults.set(id, { id, status: 'success', usage })
           return newResults
         })
       } catch (error) {
@@ -587,10 +658,11 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     }
   }
 
-  // 取消验活
+  // 取消验活:只置取消标志,**不**提前翻 verifying。verifying 由验活循环真正退出时(第 652 行)
+  // 统一置 false——否则 cancel 后循环还卡在 await(deepVerify/2s sleep)期间 verifying=false,
+  // 重入守卫 if(verifying)return 失效,用户再点会起第二个并发循环打穿 2s 防封号间隔+进度错乱。
   const handleCancelVerify = () => {
     cancelVerifyRef.current = true
-    setVerifying(false)
   }
 
   // 切换负载均衡模式
@@ -723,20 +795,19 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           <div className="flex flex-wrap items-center justify-between gap-3 min-h-[2.5rem]">
             <div className="flex items-center gap-3">
               <h2 className="text-xl font-semibold">凭据管理</h2>
-              {/* 选中信息固定占位：选中数为 0 时也占位，避免整块横竖流向跳动 */}
+              {/* 选中信息 + 交互说明(常驻,选中时也可见,不再被 Badge 替换掉) */}
               <div className="flex items-center gap-2 min-h-[2rem]">
-                {selectedIds.size > 0 ? (
+                {selectedIds.size > 0 && (
                   <>
                     <Badge variant="secondary">已选择 {selectedIds.size} 个</Badge>
                     <Button onClick={deselectAll} size="sm" variant="ghost">
                       取消选择
                     </Button>
                   </>
-                ) : (
-                  <span className="text-sm text-muted-foreground">
-                    勾选复选框 或 Ctrl+左键 选择；右键卡片打开设置
-                  </span>
                 )}
+                <span className="text-sm text-muted-foreground">
+                  勾选复选框 或 Ctrl+左键 选择；右键卡片打开设置
+                </span>
               </div>
             </div>
             <div className="flex gap-2 flex-wrap">
@@ -758,13 +829,17 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               )}
               {selectedIds.size > 0 && (
                 <>
-                  <Button onClick={handleBatchVerify} size="sm" variant="outline">
+                  <Button onClick={handleBatchVerify} size="sm" variant="outline" disabled={verifying}>
                     <CheckCircle2 className="h-4 w-4 mr-2" />
                     批量验活
                   </Button>
                   <Button onClick={handleTestModels} size="sm" variant="outline">
                     <FlaskConical className="h-4 w-4 mr-2" />
                     测试可用模型
+                  </Button>
+                  <Button onClick={() => setBatchWhitelistOpen(true)} size="sm" variant="outline">
+                    <Zap className="h-4 w-4 mr-2" />
+                    允许模型
                   </Button>
                   <Button
                     onClick={handleBatchForceRefresh}
@@ -849,6 +924,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               </Button>
             </div>
           </div>
+
           {data?.credentials.length === 0 ? (
             <Card>
               <CardContent className="py-8 text-center text-muted-foreground">
@@ -857,7 +933,15 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
             </Card>
           ) : (
             <>
-              <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+              <div
+                className="grid gap-4"
+                style={{
+                  // 卡片尺寸档位 → 每列最小宽,auto-fill 按容器宽自动决定每行 N 个(紧凑~5、标准~4、大~3)。
+                  gridTemplateColumns: `repeat(auto-fill, minmax(min(100%, ${
+                    uiPrefs.cardSize === 'compact' ? 240 : uiPrefs.cardSize === 'large' ? 380 : 300
+                  }px), 1fr))`,
+                }}
+              >
                 {currentCredentials.map((credential) => (
                   <CredentialCard
                     key={credential.id}
@@ -934,6 +1018,90 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           queryClient.invalidateQueries({ queryKey: ['credentials'] })
         }}
       />
+
+      {/* 「允许模型」弹窗:勾选凭据后由工具栏「允许模型」按钮触发(交互对齐「测试可用模型」)。
+          批量设成本白名单硬门;custom_api 号无白名单概念,应用时自动跳过。 */}
+      <Dialog open={batchWhitelistOpen} onOpenChange={setBatchWhitelistOpen}>
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>批量设置允许模型（白名单） · 已选 {selectedIds.size} 个</DialogTitle>
+            <DialogDescription>
+              {batchAllowedModels.size === 0
+                ? '全不选=不限制（应用即清空白名单）'
+                : `硬门:选中号只接勾选的 ${batchAllowedModels.size} 个模型`}
+              ——设了就只接勾选的模型,把便宜模型流量锁在指定号、绝不溢出到贵号。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-wrap gap-1.5 py-2">
+            {PROBE_MODEL_CATALOG.map((m) => {
+              const on = batchAllowedModels.has(m.id)
+              return (
+                <button
+                  key={m.id}
+                  type="button"
+                  onClick={() => toggleBatchAllowedModel(m.id)}
+                  className={`inline-flex items-center gap-1 rounded border px-2 py-1 text-[11px] font-medium transition-colors ${
+                    on
+                      ? 'border-primary/40 bg-primary/15 text-primary'
+                      : 'border-white/10 bg-white/5 text-muted-foreground hover:border-white/25'
+                  }`}
+                  title={`${m.id} · ${m.mult}`}
+                >
+                  {m.id} <span className="opacity-60">{m.mult}</span>
+                </button>
+              )
+            })}
+          </div>
+          <DialogFooter>
+            {batchAllowedModels.size > 0 && (
+              <Button size="sm" variant="ghost" onClick={() => setBatchAllowedModels(new Set())}>
+                清空选择
+              </Button>
+            )}
+            <Button
+              size="sm"
+              disabled={batchWhitelistBusy}
+              onClick={() => {
+                handleBatchSetAllowedModels()
+                setBatchWhitelistOpen(false)
+              }}
+            >
+              {batchWhitelistBusy ? '应用中…' : `应用到选中 ${selectedIds.size} 个`}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 统一二次确认弹框(替代浏览器原生 confirm):批量删除/清除已禁用等危险操作走它。 */}
+      <Dialog open={!!confirmState} onOpenChange={(o) => { if (!o && !confirmBusy) setConfirmState(null) }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{confirmState?.title}</DialogTitle>
+            <DialogDescription>{confirmState?.description}</DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirmState(null)} disabled={confirmBusy}>
+              取消
+            </Button>
+            <Button
+              variant="destructive"
+              disabled={confirmBusy}
+              onClick={async () => {
+                if (!confirmState) return
+                setConfirmBusy(true)
+                try {
+                  await confirmState.onConfirm()
+                } finally {
+                  setConfirmBusy(false)
+                  setConfirmState(null)
+                }
+              }}
+            >
+              {confirmBusy ? '处理中…' : (confirmState?.confirmText ?? '确认')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

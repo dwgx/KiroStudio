@@ -23,6 +23,7 @@ import {
   KeyRound,
   ClipboardCopy,
   Image as ImageIcon,
+  LayoutGrid,
   X,
 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -45,6 +46,7 @@ import { StatCard } from '@/components/ui/stat-card'
 import { useConfigSnapshot, useUpdateConfig, useCredentials } from '@/hooks/use-credentials'
 import { useRestartService, useStorageStats, useCleanupStorage, useCheckUpdate, usePerformUpdate } from '@/hooks/use-ops'
 import { useUsageClients } from '@/hooks/use-usage'
+import { useUiLayoutPrefs, type PoolSortMode, type CardSize, type UiLayoutPrefs } from '@/hooks/use-ui-layout-prefs'
 import {
   exportCredential,
   listTrash,
@@ -116,7 +118,7 @@ function timeAgo(iso: string | null | undefined): string {
 /* ============ 分区导航 + 搜索 基础设施 ============ */
 
 // 设置分区（顶部 tab）。id 用于 tab 切换与卡片归属；label 为中文标题。
-type SectionId = 'basic' | 'security' | 'scheduling' | 'storage' | 'service' | 'privacy' | 'export' | 'trash'
+type SectionId = 'basic' | 'security' | 'scheduling' | 'storage' | 'service' | 'privacy' | 'appearance' | 'export' | 'trash'
 
 const SECTIONS: { id: SectionId; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
   { id: 'basic', label: '基础', icon: SlidersHorizontal },
@@ -125,6 +127,7 @@ const SECTIONS: { id: SectionId; label: string; icon: React.ComponentType<{ clas
   { id: 'storage', label: '存储', icon: Database },
   { id: 'service', label: '服务管理', icon: Server },
   { id: 'privacy', label: '隐私', icon: Fingerprint },
+  { id: 'appearance', label: 'UI 排版', icon: LayoutGrid },
   { id: 'export', label: '令牌导出', icon: Download },
   { id: 'trash', label: '回收站', icon: Trash2 },
 ]
@@ -144,6 +147,7 @@ const CARD_INDEX: { section: SectionId; title: string; keywords: string[] }[] = 
   { section: 'service', title: '服务管理', keywords: ['一键重启', '重启服务', 'restart'] },
   { section: 'service', title: '客户端 RPM', keywords: ['客户端 rpm', '窗口', 'session', '吞吐', '活跃客户端'] },
   { section: 'privacy', title: '隐私 / 客户端指纹', keywords: ['采集下游客户端指纹', '设备', 'ip', '系统', '浏览器', '隐私', 'fingerprint'] },
+  { section: 'appearance', title: 'UI 排版自定义', keywords: ['ui 排版', '排版', '号池排序', '卡片大小', '卡片尺寸', '禁用号', '布局', 'layout', '排序模式'] },
   { section: 'export', title: '令牌导出', keywords: ['令牌导出', '凭据 json', '导出单个', '导出全部', 'token 导出', 'export'] },
   { section: 'trash', title: '回收站', keywords: ['回收站', '已删除', '清空', '恢复', 'trash'] },
 ]
@@ -232,6 +236,10 @@ interface FormState {
   // Admin UI 登录页背景（立即生效）
   loginBackgroundEnabled: boolean
   loginBackgroundR18: boolean
+  // UI 排版自定义（纯前端 localStorage，纳入统一保存流程：切换改 form，保存时才落地）
+  poolSort: PoolSortMode
+  poolShowDisabled: boolean
+  cardSize: CardSize
 }
 
 // 多行文本 <-> 字符串列表（去空白、去空行）
@@ -251,7 +259,7 @@ function sameList(a: string[], b: string[]): boolean {
   return a.length === b.length && a.every((v, i) => v === b[i])
 }
 
-function toForm(c: ConfigSnapshotResponse): FormState {
+function toForm(c: ConfigSnapshotResponse, ui: UiLayoutPrefs): FormState {
   return {
     host: c.host,
     port: String(c.port),
@@ -289,6 +297,10 @@ function toForm(c: ConfigSnapshotResponse): FormState {
     // 缺省视为开启（后端字段可能尚未下发时不误显示为关闭）
     loginBackgroundEnabled: c.loginBackgroundEnabled ?? true,
     loginBackgroundR18: c.loginBackgroundR18 ?? false,
+    // UI 排版偏好（纯前端 localStorage，作为 form 基线纳入统一保存）
+    poolSort: ui.poolSort,
+    poolShowDisabled: ui.poolShowDisabled,
+    cardSize: ui.cardSize,
   }
 }
 
@@ -309,6 +321,39 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
         {hint && <div className="text-xs text-muted-foreground mt-0.5">{hint}</div>}
       </div>
       <div className="flex-1 flex justify-end">{children}</div>
+    </div>
+  )
+}
+
+// 分段选择按钮组(UI 排版分区用):一排互斥按钮,选中态高亮。
+function SegChoice({
+  value,
+  onChange,
+  options,
+}: {
+  value: string
+  onChange: (v: string) => void
+  options: { value: string; label: string }[]
+}) {
+  return (
+    <div className="inline-flex flex-wrap gap-1 rounded-lg border border-white/10 bg-white/5 p-1">
+      {options.map((o) => {
+        const on = o.value === value
+        return (
+          <button
+            key={o.value}
+            type="button"
+            onClick={() => onChange(o.value)}
+            className={`rounded-md px-3 py-1 text-xs font-medium transition-colors ${
+              on
+                ? 'bg-primary/20 text-primary'
+                : 'text-muted-foreground hover:bg-white/5 hover:text-foreground'
+            }`}
+          >
+            {o.label}
+          </button>
+        )
+      })}
     </div>
   )
 }
@@ -1285,6 +1330,8 @@ export function SettingsPage() {
 
   // 分区导航当前 tab + 搜索关键词（纯前端）。
   const [activeSection, setActiveSection] = useState<SectionId>('basic')
+  // UI 排版偏好(号池排序模式 / 禁用号显隐 / 卡片尺寸)。localStorage 持久,概览页+凭据页读它生效。
+  const { prefs: uiPrefs, set: setUiPrefs } = useUiLayoutPrefs()
   const [searchRaw, setSearchRaw] = useState('')
   const query = searchRaw.trim().toLowerCase()
 
@@ -1302,9 +1349,11 @@ export function SettingsPage() {
 
   const hasAnyMatch = matchedSections.size > 0
 
-  // 配置加载/刷新后，重置表单基线
+  // 配置加载/刷新后，重置表单基线（含 UI 排版偏好）
   useEffect(() => {
-    if (config) setForm(toForm(config))
+    if (config) setForm(toForm(config, uiPrefs))
+    // uiPrefs 作为初始基线读取一次即可，其变化不应覆盖用户正在编辑的 form（保存时才回写 localStorage）。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [config])
 
   const set = <K extends keyof FormState>(key: K, value: FormState[K]) =>
@@ -1363,10 +1412,34 @@ export function SettingsPage() {
     return d
   }, [config, form])
 
-  const dirty = Object.keys(diff).length > 0
+  // UI 排版偏好(纯前端 localStorage)是否与当前已落地值有差异。它不进后端 diff,
+  // 但纳入统一 dirty/保存流程:点亮保存按钮、保存时才写 localStorage。
+  const uiPrefsDirty = !!form && (
+    form.poolSort !== uiPrefs.poolSort ||
+    form.poolShowDisabled !== uiPrefs.poolShowDisabled ||
+    form.cardSize !== uiPrefs.cardSize
+  )
+
+  const dirty = Object.keys(diff).length > 0 || uiPrefsDirty
+
+  // 待保存改动计数(后端字段 + UI 排版视为 1 项聚合)。
+  const dirtyCount = Object.keys(diff).length + (uiPrefsDirty ? 1 : 0)
 
   const handleSave = () => {
-    if (!dirty) return
+    if (!dirty || !form) return
+    // 先把 UI 排版偏好落地到 localStorage(纯前端,即时生效)。
+    if (uiPrefsDirty) {
+      setUiPrefs({
+        poolSort: form.poolSort,
+        poolShowDisabled: form.poolShowDisabled,
+        cardSize: form.cardSize,
+      })
+    }
+    // 无后端字段改动时,仅 UI 排版改动:落地后直接提示成功,不打后端。
+    if (Object.keys(diff).length === 0) {
+      if (uiPrefsDirty) toast.success('已保存 UI 排版偏好')
+      return
+    }
     save(diff, {
       onSuccess: (resp) => {
         if (resp.restartRequired) {
@@ -1384,7 +1457,7 @@ export function SettingsPage() {
   }
 
   const handleReset = () => {
-    if (config) setForm(toForm(config))
+    if (config) setForm(toForm(config, uiPrefs))
   }
 
   if (isLoading || !form) {
@@ -1488,6 +1561,39 @@ export function SettingsPage() {
       {/* 隐私分区：客户端指纹采集开关（立即生效） */}
       <SectionGate section="privacy" title="隐私 / 客户端指纹" keywords={['采集下游客户端指纹', '设备', 'ip', '系统', '浏览器', '隐私', 'fingerprint']}>
         <PrivacyCard />
+      </SectionGate>
+
+      {/* UI 排版自定义分区：号池状态排序/禁用号显隐 + 凭据卡片尺寸。纯前端 localStorage,纳入统一保存流程(切换点亮保存,点保存才落地)。 */}
+      <SectionGate section="appearance" title="UI 排版自定义" keywords={['ui 排版', '排版', '号池排序', '卡片大小', '卡片尺寸', '禁用号', '布局', 'layout', '排序模式']}>
+        <Field label="号池状态排序" hint="概览页「号池状态」按此排列（实时数据自动排，保存后生效）">
+          <SegChoice
+            value={form.poolSort}
+            onChange={(v) => set('poolSort', v as PoolSortMode)}
+            options={[
+              { value: 'health', label: '健康度' },
+              { value: 'sequence', label: '顺序' },
+              { value: 'concurrency', label: '并发数' },
+              { value: 'lastUsed', label: '最后调用' },
+            ]}
+          />
+        </Field>
+        <Field label="展示已禁用号" hint="关闭后号池状态只显示启用中的号，隐藏已禁用的">
+          <Switch
+            checked={form.poolShowDisabled}
+            onCheckedChange={(v) => set('poolShowDisabled', v)}
+          />
+        </Field>
+        <Field label="凭据卡片尺寸" hint="凭据管理页卡片大小，按尺寸自动决定每行几个（紧凑约5、标准约4、大约3）">
+          <SegChoice
+            value={form.cardSize}
+            onChange={(v) => set('cardSize', v as CardSize)}
+            options={[
+              { value: 'compact', label: '紧凑' },
+              { value: 'standard', label: '标准' },
+              { value: 'large', label: '大' },
+            ]}
+          />
+        </Field>
       </SectionGate>
 
       {/* 令牌导出分区：单个 / 全部凭据 JSON 下载 */}
@@ -1792,7 +1898,7 @@ export function SettingsPage() {
       <div className="fixed bottom-0 left-0 right-0 z-30 border-t bg-background/95 px-6 py-3 backdrop-blur md:left-[240px]">
         <div className="mx-auto flex max-w-[1200px] items-center justify-end gap-3">
           <span className="mr-auto text-sm text-muted-foreground">
-            {dirty ? `${Object.keys(diff).length} 项改动待保存` : '无改动'}
+            {dirty ? `${dirtyCount} 项改动待保存` : '无改动'}
           </span>
           <Button variant="outline" onClick={handleReset} disabled={!dirty || isSaving}>
             撤销

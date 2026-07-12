@@ -1578,9 +1578,10 @@ mod tests {
         // 两个不同 session,首条都缺 IP → 都落 "unknown",但不粘滞
         s.on_record(&rec_machine(0, Some("wa"), None, Some("claude-code"), None, None));
         s.on_record(&rec_machine(0, Some("wb"), None, Some("claude-code"), None, None));
-        // 各自后续拿到**不同**真实 IP → 应归位到两台不同真实机器,而非都并进 unknown
-        s.on_record(&rec_machine(1_000, Some("wa"), Some("103.219.194.13"), Some("claude-code"), None, None));
-        s.on_record(&rec_machine(1_000, Some("wb"), Some("38.244.34.185"), Some("claude-code"), None, None));
+        // 各自后续拿到**不同** IP → 应归位到两台不同真实机器,而非都并进 unknown
+        // (用 RFC5737 文档保留段 203.0.113.0/24 / 198.51.100.0/24 作样例)
+        s.on_record(&rec_machine(1_000, Some("wa"), Some("203.0.113.13"), Some("claude-code"), None, None));
+        s.on_record(&rec_machine(1_000, Some("wb"), Some("198.51.100.185"), Some("claude-code"), None, None));
 
         let machines = s.machines_at(BASE_MS + 1_000);
         // 核心断言:两个不相干的真实 IP 各自独立成机器(黑洞根治)。

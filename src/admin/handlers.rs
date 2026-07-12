@@ -10,7 +10,8 @@ use serde::Deserialize;
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetAllowedModelsRequest, SetDisabledRequest,
+        AddCredentialRequest, SetAllowedModelsRequest, SetCustomApiConfigRequest,
+        SetDisabledRequest,
         SetLoadBalancingModeRequest, SetPriorityRequest,
         SetRpmLimitRequest,
         SuccessResponse,
@@ -70,6 +71,26 @@ pub async fn set_credential_rpm_limit(
             id, payload.rpm_limit
         )))
         .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/custom-api
+/// 修改自定义 API(代挂透传)凭据的 base_url / api_key / 请求上限。仅 custom_api 号可用(后端 gate)。
+pub async fn set_credential_custom_api(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetCustomApiConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_custom_api_config(
+        id,
+        payload.base_url,
+        payload.api_key,
+        payload.request_limit,
+        payload.reset_count,
+    ).await {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 自定义 API 配置已更新", id)))
+            .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -324,6 +345,54 @@ pub async fn deep_verify_credential(
         .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
+}
+
+/// GET /api/admin/credentials/:id/regions
+/// 【F】列出 external_idp 号在候选 region 的全部 profile 及验活结果（供前端选 region）。
+pub async fn probe_regions(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.probe_regions(id).await {
+        Ok(candidates) => Json(serde_json::json!({
+            "id": id,
+            "regions": candidates.iter().map(|c| serde_json::json!({
+                "arn": c.arn,
+                "region": c.region,
+                "account": c.account,
+                "usable": c.usable,
+                "subscriptionTitle": c.subscription_title,
+                "reason": c.reason,
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/switch-region  body: { "arn": "..." }
+/// 【F】切换 external_idp 号到目标 region 的 profile（仅验活可用才写入，不可用则 400 且不改）。
+pub async fn switch_profile_region(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SwitchRegionRequest>,
+) -> impl IntoResponse {
+    match state.service.switch_profile_region(id, &payload.arn).await {
+        Ok(title) => Json(serde_json::json!({
+            "id": id,
+            "arn": payload.arn,
+            "subscriptionTitle": title,
+            "message": format!("凭据 #{} 已切换 region profile", id),
+        }))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SwitchRegionRequest {
+    pub arn: String,
 }
 
 /// GET /credentials/{id}/models —— 探测该凭据当前可用的模型列表（选中令牌后手动触发）。
@@ -613,7 +682,10 @@ pub async fn external_idp_leg1(
 }
 
 /// POST /api/admin/auth/external-idp/leg2
-/// 第 3 步：粘回授权回调 URL，换 token 入池。
+/// 第 3 步：粘回授权回调 URL，换 token + 探测多 region profile。
+/// 返回 `{ credentialId, profiles: [{arn, region, account}] }`：
+/// - profiles 多个 → 前端弹窗选 region，随后调 leg2/select 建号（credentialId 为 null）。
+/// - profiles 恰 1 个 → 后端已自动建号，credentialId 有值，前端直接完成。
 pub async fn external_idp_leg2(
     State(state): State<AdminState>,
     Json(payload): Json<ExternalIdpPasteRequest>,
@@ -625,10 +697,43 @@ pub async fn external_idp_leg2(
     {
         Ok(result) => Json(serde_json::json!({
             "credentialId": result.credential_id,
+            "profiles": result.profiles.iter().map(|p| serde_json::json!({
+                "arn": p.arn,
+                "region": p.region,
+                "account": p.account,
+                "usable": p.usable,
+                "subscriptionTitle": p.subscription_title,
+            })).collect::<Vec<_>>(),
         }))
         .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
+}
+
+/// POST /api/admin/auth/external-idp/leg2/select
+/// 第 3 步选定：从多 region profile 里选一个 arn，用暂存 token 建号入池。
+pub async fn external_idp_leg2_select(
+    State(state): State<AdminState>,
+    Json(payload): Json<ExternalIdpSelectRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .submit_external_idp_leg2_select(&payload.session_id, &payload.arn)
+        .await
+    {
+        Ok(result) => Json(serde_json::json!({
+            "credentialId": result.credential_id,
+        }))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalIdpSelectRequest {
+    pub session_id: String,
+    pub arn: String,
 }
 
 #[derive(Deserialize)]

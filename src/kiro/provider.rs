@@ -96,6 +96,23 @@ pub struct CallMeta {
     pub inflight: crate::kiro::scheduling::InflightGuard,
 }
 
+/// 一次自定义 API 透传的元数据,供 handler 做 usage 埋点。
+///
+/// 透传路径不进 Kiro 解码器、拿不到真实 token/credit(隔离铁律 3),故只带调度维度信息;
+/// token 由 handler 侧估算,credits 恒 None。与 [`CallMeta`] 分离,避免复用 Kiro 的 inflight/重试语义。
+pub struct PassthroughMeta {
+    /// 服务该请求的自定义 API 凭据 ID
+    pub credential_id: u64,
+    /// 请求模型名(原样,透传不映射)
+    pub model: Option<String>,
+    /// 会话标识
+    pub session_id: Option<String>,
+    /// 据上游 status 推断的用量结果分类
+    pub outcome: crate::usage::RequestOutcome,
+    /// 从选号到拿到上游响应头的耗时(毫秒)
+    pub latency_ms: u64,
+}
+
 /// Kiro API Provider
 ///
 /// 核心组件，负责与 Kiro API 通信
@@ -217,22 +234,87 @@ impl KiroProvider {
         raw_body: bytes::Bytes,
         model: Option<&str>,
         user_id: Option<&str>,
-    ) -> Option<axum::response::Response> {
-        // 从**custom_api 专属选号**里挑一个(独立于 Kiro 选号;Kiro 的 is_entry_selectable 已排除
-        // custom_api,不会误选)。无可用 custom_api 号 → None,回退 Kiro 路径。
-        // 注:model/user_id 暂不参与 custom_api 选号(代挂上游自行处理模型),保留参数供将来按模型分流。
-        let _ = (model, user_id);
-        let (id, cred) = self.token_manager.select_custom_api()?;
-        // 计一次请求(达上限自动禁用),然后透传。
-        self.token_manager.record_request(id);
-        let resp = crate::kiro::passthrough::forward(
-            &cred,
-            raw_body,
-            self.global_proxy.as_ref(),
-            self.tls_backend,
-        )
-        .await;
-        Some(resp)
+    ) -> Option<(axum::response::Response, PassthroughMeta)> {
+        // 从**custom_api 专属选号池**里 failover 调度(独立于 Kiro 选号,守两池隔离铁律)。
+        // 语义(dwgx 定):池内按优先级+RPM 均衡选号;某号 403 额度满/401 key 失效/429/5xx →
+        // 给该号短冷却 + 换下一个 custom_api;全部 custom_api 不可用 → 返回 None,由上层落 Kiro 主力路径。
+        // 4xx(非 403,客户端请求错误)→ 换号也一样错,直接把该响应返给客户端(不 failover、不落 Kiro)。
+        // 注:model/user_id 暂不参与 custom_api 选号(代挂上游自行处理模型),仅随 meta 供埋点关联。
+        let mut excluded: HashSet<u64> = HashSet::new();
+        loop {
+            let (id, cred) = match self.token_manager.select_custom_api(&excluded) {
+                Some(x) => x,
+                // 无更多可用 custom_api 号:①一开始就没(excluded 空)→ 池里无透传号,零开销落 Kiro;
+                // ②都试过失败(excluded 非空)→ custom_api 全额度满/失败,failover 落 Kiro 主力。
+                None => return None,
+            };
+            let started = std::time::Instant::now();
+            let (resp, status) = crate::kiro::passthrough::forward(
+                &cred,
+                raw_body.clone(),
+                self.global_proxy.as_ref(),
+                self.tls_backend,
+            )
+            .await;
+            let latency_ms = started.elapsed().as_millis() as u64;
+            // 据上游 status 推断 outcome(与 Kiro 主路径同口径)。502 含真上游 5xx 与本地连接失败。
+            let code = status.as_u16();
+            let outcome = match code {
+                s if (200..300).contains(&s) => crate::usage::RequestOutcome::Success,
+                429 => crate::usage::RequestOutcome::RateLimited,
+                402 => crate::usage::RequestOutcome::QuotaExhausted, // 中转站常用 402 表额度耗尽
+                401 | 403 => crate::usage::RequestOutcome::AuthFailed,
+                s if (500..600).contains(&s) => crate::usage::RequestOutcome::ServerError,
+                s if (400..500).contains(&s) => crate::usage::RequestOutcome::BadRequest,
+                _ => crate::usage::RequestOutcome::OtherError,
+            };
+            // 轻量结果计数(隔离铁律:绝不复用 report_success/failure 的 cooldown/family 连坐)。
+            self.token_manager.record_passthrough_result(id, outcome);
+
+            // 成功 → 直接返回该号的响应流。
+            if (200..300).contains(&code) {
+                let meta = PassthroughMeta {
+                    credential_id: id,
+                    model: model.map(|s| s.to_string()),
+                    session_id: user_id.map(|s| s.to_string()),
+                    outcome,
+                    latency_ms,
+                };
+                return Some((resp, meta));
+            }
+
+            // ⭐ 显式列出「该 failover 的状态码」而非用"4xx 非403"反推——后者会让 401/429 先命中
+            //    下方 4xx 直返、永远到不了 failover(对抗 review B1 抓到的持久黑洞:429 号不切换)。
+            // - 401 key 失效 / 402·403 额度耗尽 / 429 限流 / 5xx 上游错误 → 该号短冷却 + 换下一个 custom_api。
+            // - 其余 4xx(400/404/422 等客户端请求错误)→ 换号/落 Kiro 也一样错,直接返给客户端。
+            let should_failover = matches!(code, 401 | 402 | 403 | 429) || (500..600).contains(&code);
+            if !should_failover {
+                let meta = PassthroughMeta {
+                    credential_id: id,
+                    model: model.map(|s| s.to_string()),
+                    session_id: user_id.map(|s| s.to_string()),
+                    outcome,
+                    latency_ms,
+                };
+                return Some((resp, meta));
+            }
+
+            // 冷却时长按性质:额度/认证类恢复慢给长冷却,限流中等,5xx 瞬态给短冷却。
+            let cooldown_secs = match code {
+                401 | 402 | 403 => 180, // 额度用尽/key 失效:短期内重试仍会失败,冷却久点避免频繁撞
+                429 => 30,              // 限流:中等退避
+                _ => 15,                // 5xx / 网络:瞬态,短冷却快速再参与
+            };
+            self.token_manager.cooldown_custom_api(id, cooldown_secs);
+            tracing::warn!(
+                credential_id = id,
+                status = code,
+                "自定义 API 透传失败,该号冷却 {}s 并 failover 下一个 custom_api",
+                cooldown_secs
+            );
+            excluded.insert(id);
+            // 丢弃本次错误响应,继续循环试下一个 custom_api;全部试完 select 返 None → 落 Kiro。
+        }
     }
 
     /// 累加一次请求的真实 credit 花费到该凭据的生命周期累计（透传到 token_manager）。

@@ -20,9 +20,11 @@ import type {
   StartExternalIdpLoginResponse,
   ExternalIdpLeg1Response,
   ExternalIdpLeg2Response,
+  ExternalIdpSelectResponse,
   ConfigSnapshotResponse,
   UpdateConfigRequest,
   UpdateConfigResponse,
+  CredentialRegionsResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -106,6 +108,29 @@ export async function setCredentialRpmLimit(
     `/credentials/${id}/rpm-limit`,
     { rpmLimit: rpmLimit > 0 ? rpmLimit : null }
   )
+  return data
+}
+
+// 修改自定义 API(代挂透传)凭据的 base_url / api_key / 请求上限。仅 custom_api 号有效。
+// 字段可选:undefined=不改;api_key 传空串=清除;requestLimit=0 视为不限。
+// resetCount=true 时归零调用次数(换上游/换 key 时避免旧计数残留触顶)。
+export interface SetCustomApiConfigInput {
+  baseUrl?: string
+  apiKey?: string
+  requestLimit?: number
+  resetCount?: boolean
+}
+export async function setCredentialCustomApi(
+  id: number,
+  input: SetCustomApiConfigInput
+): Promise<SuccessResponse> {
+  const body: Record<string, unknown> = {}
+  if (input.baseUrl !== undefined) body.baseUrl = input.baseUrl
+  if (input.apiKey !== undefined) body.apiKey = input.apiKey
+  if (input.requestLimit !== undefined)
+    body.requestLimit = input.requestLimit > 0 ? input.requestLimit : 0
+  if (input.resetCount) body.resetCount = true
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/custom-api`, body)
   return data
 }
 
@@ -207,6 +232,22 @@ export async function deepVerifyCredential(id: number): Promise<SuccessResponse>
   return data
 }
 
+// 探测该凭据各 region 的 profile（切 Profile ARN 用）：列出账号在各区域的 profile，
+// 带 usable 标记 + subscription_title。切区域而非改 region（换的是对话走哪个上游 profile/端点）。
+// 会向上游探测各区域，可能耗时，单独放宽超时。
+export async function probeCredentialRegions(id: number): Promise<CredentialRegionsResponse> {
+  const { data } = await api.get<CredentialRegionsResponse>(`/credentials/${id}/regions`, {
+    timeout: 120000,
+  })
+  return data
+}
+
+// 切换该凭据当前使用的 Profile ARN（切区域，非改全局 region）。成功后下次请求生效。
+export async function switchProfileRegion(id: number, arn: string): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/switch-region`, { arn })
+  return data
+}
+
 // 探测该凭据可用哪些模型（逐模型发无提示词真实请求，⚠️消耗真实积分）
 export interface ProbedModel {
   model: string
@@ -221,7 +262,11 @@ export interface ProbeModelsResponse {
   /** 本次探测总花费 credits */
   totalCredits: number
 }
-/** 全部可探测的候选模型（真实 Kiro modelId，从便宜到贵；供 UI 勾选）。 */
+/**
+ * 全部可探测的候选模型（真实 Kiro modelId，从便宜到贵；供 UI 勾选）。
+ * ⚠️ 须与后端声明式模型目录 src/anthropic/model_catalog.rs::CATALOG 保持一致
+ * （id=kiro_id，mult=credit_mult）。补齐 opus-4.5/4.7 消除「广告了却无法探测/加白名单」漂移。
+ */
 export const PROBE_MODEL_CATALOG: { id: string; mult: string }[] = [
   { id: 'qwen3-coder-next', mult: '0.05x' },
   { id: 'minimax-m2.1', mult: '0.15x' },
@@ -229,9 +274,14 @@ export const PROBE_MODEL_CATALOG: { id: string; mult: string }[] = [
   { id: 'minimax-m2.5', mult: '0.25x' },
   { id: 'claude-haiku-4.5', mult: '0.40x' },
   { id: 'glm-5', mult: '0.50x' },
+  { id: 'auto', mult: '1.00x' },
+  { id: 'claude-sonnet-4.0', mult: '1.30x' },
   { id: 'claude-sonnet-4.5', mult: '1.30x' },
   { id: 'claude-sonnet-4.6', mult: '1.30x' },
+  { id: 'claude-sonnet-5', mult: '1.30x' },
+  { id: 'claude-opus-4.5', mult: '2.20x' },
   { id: 'claude-opus-4.6', mult: '2.20x' },
+  { id: 'claude-opus-4.7', mult: '2.20x' },
   { id: 'claude-opus-4.8', mult: '2.20x' },
 ]
 
@@ -380,7 +430,8 @@ export async function submitExternalIdpLeg1(
   return data
 }
 
-// 第 3 步：粘回授权后地址栏 URL → 换 token 入池，返回新凭据 id
+// 第 3 步：粘回授权后地址栏 URL → 换 token + 探测多 region profile。
+// 返回 profiles（多个则弹窗选，1 个则 credentialId 已有值直接完成）。
 export async function submitExternalIdpLeg2(
   sessionId: string,
   url: string
@@ -388,6 +439,18 @@ export async function submitExternalIdpLeg2(
   const { data } = await api.post<ExternalIdpLeg2Response>('/auth/external-idp/leg2', {
     sessionId,
     url,
+  })
+  return data
+}
+
+// 第 3 步选定：从多 region profile 里选一个 arn → 用暂存 token 建号入池。
+export async function submitExternalIdpLeg2Select(
+  sessionId: string,
+  arn: string
+): Promise<ExternalIdpSelectResponse> {
+  const { data } = await api.post<ExternalIdpSelectResponse>('/auth/external-idp/leg2/select', {
+    sessionId,
+    arn,
   })
   return data
 }
