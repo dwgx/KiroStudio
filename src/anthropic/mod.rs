@@ -24,6 +24,7 @@
 
 pub mod compressor;
 pub(crate) mod converter;
+pub(crate) mod model_catalog;
 mod handlers;
 mod middleware;
 mod router;

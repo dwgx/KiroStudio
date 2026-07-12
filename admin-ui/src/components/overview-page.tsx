@@ -13,6 +13,7 @@ import { type CellActivity } from '@/components/overview/StatusHeatmap'
 import { RankBars } from '@/components/overview/RankBars'
 import { GlowGrid } from '@/components/overview/GlowGrid'
 import { StatusBars } from '@/components/overview/StatusBars'
+import { useUiLayoutPrefs } from '@/hooks/use-ui-layout-prefs'
 import { AreaTrendChart } from '@/components/overview/AreaTrendChart'
 import { authLabel } from '@/lib/i18n-labels'
 import type { CredentialStatusItem, SeriesPoint, RateLimitInsight } from '@/types/api'
@@ -463,6 +464,41 @@ export function OverviewPage() {
     if (changed) setActivity(new Map(map))
   }, [recent.data])
 
+  // UI 排版偏好(设置页配置,localStorage 持久):号池排序模式 + 禁用号显隐。
+  const { prefs } = useUiLayoutPrefs()
+
+  // 按偏好排序 + 过滤禁用号,供两视图共用。lastUsed 用实时 activity 优先、回退 lastUsedAt。
+  const displayCreds = useMemo(() => {
+    let list = stats.creds
+    if (!prefs.poolShowDisabled) list = list.filter((c) => !c.disabled)
+    const arr = [...list]
+    const lastTsOf = (c: CredentialStatusItem) => {
+      const t = activity.get(c.id)?.lastTs ?? (c.lastUsedAt ? Date.parse(c.lastUsedAt) : 0)
+      return Number.isFinite(t) ? t : 0 // Date.parse 非法串返 NaN,兜底 0 避免污染排序
+    }
+    switch (prefs.poolSort) {
+      case 'sequence':
+        arr.sort((a, b) => a.id - b.id)
+        break
+      case 'concurrency':
+        // 在途多优先,同则近 60s RPM 多优先
+        arr.sort((a, b) => (b.inflight ?? 0) - (a.inflight ?? 0) || (b.rpm ?? 0) - (a.rpm ?? 0))
+        break
+      case 'lastUsed':
+        arr.sort((a, b) => lastTsOf(b) - lastTsOf(a))
+        break
+      case 'health':
+      default:
+        // 健康度:启用且无失败 > 启用有失败 > 禁用;同档按成功数多优先。
+        arr.sort((a, b) => {
+          const rank = (c: CredentialStatusItem) => (c.disabled ? 2 : c.failureCount > 0 ? 1 : 0)
+          return rank(a) - rank(b) || (b.successCount || 0) - (a.successCount || 0)
+        })
+        break
+    }
+    return arr
+  }, [stats.creds, prefs.poolShowDisabled, prefs.poolSort, activity])
+
   // 号池主体：加载 / 空 / 三视图。
   const poolBody = credLoading ? (
     // 网格骨架，形状贴近发光网格
@@ -475,9 +511,9 @@ export function OverviewPage() {
       ))}
     </div>
   ) : poolView === 'bars' ? (
-    <StatusBars credentials={stats.creds} activity={activity} balances={cachedBalances?.balances} saturatedIds={saturatedIds} />
+    <StatusBars credentials={displayCreds} activity={activity} balances={cachedBalances?.balances} saturatedIds={saturatedIds} />
   ) : (
-    <GlowGrid credentials={stats.creds} activity={activity} />
+    <GlowGrid credentials={displayCreds} activity={activity} />
   )
 
   return (

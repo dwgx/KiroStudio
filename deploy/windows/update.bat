@@ -2,11 +2,12 @@
 REM ============================================================================
 REM KiroStudio - Windows update script (follow upstream, rebuild)
 REM Pulls latest code from the upstream git repo, rebuilds frontend + exe.
-REM This is the Windows equivalent of the panel's "OTA update" button, which
-REM   does NOT work on Windows (it downloads a Linux musl binary and relies on
-REM   renaming a running ELF - neither applies to a Windows .exe).
-REM Advantage over OTA: git pull fetches the FULL latest master (every change),
-REM   not just versions that happen to have a GitHub Release.
+REM NOTE: The panel's "OTA update" button DOES work on Windows now (v0.6.6+):
+REM   it downloads the Windows .exe, swaps it via rename (renaming the running
+REM   exe out of the way), and auto-restarts (v0.7.5+ self-relaunches even when
+REM   run as a bare double-clicked exe). Use OTA to jump to the latest RELEASE.
+REM Advantage of this script over OTA: git pull fetches the FULL latest master
+REM   (every change), not just versions that happen to have a GitHub Release.
 REM After it finishes: restart the gateway (close the start/run window, then
 REM   double-click start.bat or run.bat again) to load the new exe.
 REM   ASCII-only on purpose (see build.bat note on .bat encoding).

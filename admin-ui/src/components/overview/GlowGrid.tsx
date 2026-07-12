@@ -1,6 +1,7 @@
 import type { CredentialStatusItem } from '@/types/api'
 import type { CellActivity } from '@/components/overview/StatusHeatmap'
 import { healthOf, HEALTH_RGB, HEALTH_LABEL, EmptyPool, useHoverCard } from '@/components/overview/credViz'
+import { useFlip } from '@/hooks/use-flip'
 import './glow-grid.css'
 
 export interface GlowGridProps {
@@ -47,6 +48,8 @@ function breatheDelay(id: number): string {
 export function GlowGrid({ credentials, activity, className }: GlowGridProps) {
   // 鼠标跟随悬浮卡（替代 Radix Tooltip 固定 side 的边缘翻转，卡片黏着鼠标走）。
   const hoverCard = useHoverCard()
+  // FLIP 平滑重排:排序/显隐变化时核心从旧位滑到新位。
+  const flipRef = useFlip<HTMLDivElement>([credentials.map((c) => c.id).join(',')])
 
   if (credentials.length === 0) {
     return <EmptyPool className={className} />
@@ -55,6 +58,7 @@ export function GlowGrid({ credentials, activity, className }: GlowGridProps) {
   return (
     <div className={className}>
         <div
+          ref={flipRef}
           className="grid gap-1.5"
           style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(22px, 1fr))' }}
         >
@@ -69,6 +73,7 @@ export function GlowGrid({ credentials, activity, className }: GlowGridProps) {
             return (
                   <div
                     key={c.id}
+                    data-flip-key={c.id}
                     onMouseEnter={(e) => hoverCard.show(c, e)}
                     onMouseMove={hoverCard.move}
                     onMouseLeave={hoverCard.hide}

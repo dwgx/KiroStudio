@@ -16,7 +16,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures::StreamExt;
 
-use crate::http_client::build_streaming_client;
+use crate::http_client::build_streaming_client_no_redirect;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::TlsBackend;
 
@@ -26,16 +26,23 @@ use crate::model::config::TlsBackend;
 /// - `raw_body`:客户端原始 `/v1/messages` 请求体(**未经 Kiro 转换**)。
 /// - `global_proxy` / `tls_backend`:复用全局代理与 TLS 后端配置。
 ///
-/// 成功返回上游响应的流式 [`Response`](原样透传 status/body);失败返回 502 错误响应。
+/// 返回 `(Response, StatusCode)`:Response 原样透传上游 status/body(失败为 502 错误响应);
+/// StatusCode 供调用侧(provider)据以推断 usage outcome 并做轻量结果计数。**只暴露 header 层
+/// status,body 仍原样流式回传,绝不解析上游 SSE**(隔离铁律 3)。
 pub async fn forward(
     cred: &KiroCredentials,
     raw_body: Bytes,
     global_proxy: Option<&crate::http_client::ProxyConfig>,
     tls_backend: TlsBackend,
-) -> Response {
+) -> (Response, StatusCode) {
     let base = match cred.base_url.as_deref() {
         Some(b) if !b.trim().is_empty() => b.trim_end_matches('/').to_string(),
-        _ => return err_response(StatusCode::BAD_GATEWAY, "自定义 API 凭据缺少 base_url"),
+        _ => {
+            return (
+                err_response(StatusCode::BAD_GATEWAY, "自定义 API 凭据缺少 base_url"),
+                StatusCode::BAD_GATEWAY,
+            )
+        }
     };
     // Anthropic messages 端点:base 已含 /v1 则不重复拼;否则补 /v1/messages。
     let url = if base.ends_with("/v1") || base.contains("/v1/") {
@@ -46,10 +53,17 @@ pub async fn forward(
 
     // 透传用流式 client:read_timeout(空闲间隔)而非总超时,防长回复被中途掐断
     // (与 Kiro 对话路径同款,根因见 build_streaming_client 注释)。
+    // **禁重定向**(SSRF 纵深):写入 base_url 时已校验目标非内网,但公网中转站若返回
+    // 302→内网/元数据仍能绕过,禁重定向堵死这条链。base_url 的 IP 层校验在写入时做。
     let proxy = cred.effective_proxy(global_proxy);
-    let client = match build_streaming_client(proxy.as_ref(), 720, tls_backend) {
+    let client = match build_streaming_client_no_redirect(proxy.as_ref(), 720, tls_backend) {
         Ok(c) => c,
-        Err(e) => return err_response(StatusCode::BAD_GATEWAY, &format!("构建透传 client 失败: {e}")),
+        Err(e) => {
+            return (
+                err_response(StatusCode::BAD_GATEWAY, &format!("构建透传 client 失败: {e}")),
+                StatusCode::BAD_GATEWAY,
+            )
+        }
     };
 
     // 组装转发请求:换上该凭据的 api_key(Anthropic 双头兼容:x-api-key + Authorization),
@@ -69,7 +83,11 @@ pub async fn forward(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("[透传] 上游请求失败({}): {e}", url);
-            return err_response(StatusCode::BAD_GATEWAY, &format!("透传上游请求失败: {e}"));
+            // 连接层错误:上游不可达/超时,归 502(调用侧据此计一次失败)。
+            return (
+                err_response(StatusCode::BAD_GATEWAY, &format!("透传上游请求失败: {e}")),
+                StatusCode::BAD_GATEWAY,
+            );
         }
     };
 
@@ -96,11 +114,13 @@ pub async fn forward(
             }
         });
 
-    Response::builder()
+    let resp = Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, content_type)
         .body(Body::from_stream(byte_stream))
-        .unwrap_or_else(|_| err_response(StatusCode::BAD_GATEWAY, "构建透传响应失败"))
+        .unwrap_or_else(|_| err_response(StatusCode::BAD_GATEWAY, "构建透传响应失败"));
+    // 返回上游真实 status 供调用侧推断 outcome(成功/限流/失败);body 已原样流式接管。
+    (resp, status)
 }
 
 /// 构建一个 Anthropic 风格的错误响应(供透传失败时返回)。

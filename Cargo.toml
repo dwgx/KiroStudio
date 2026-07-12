@@ -1,6 +1,6 @@
 [package]
 name = "kirostudio"
-version = "0.7.4"
+version = "0.7.5"
 edition = "2024"
 
 [features]
@@ -40,3 +40,13 @@ subtle = "2.6"        # 常量时间比较（防止时序攻击）
 rust-embed = "8"      # 嵌入静态文件
 mime_guess = "2"      # MIME 类型推断
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+
+# ============================================================================
+# Windows 专属：系统托盘（图标 + 右键菜单：打开网页/复制密钥/重启/版本/退出）。
+# 仅 Windows target 编译时拉取，Linux/macOS 不受影响（编译时间/二进制不变）。
+# ============================================================================
+[target.'cfg(windows)'.dependencies]
+tray-icon = "0.21"   # 系统托盘图标 + muda 菜单（tauri-apps 官方，win32 消息循环）
+resvg = "0.45"       # 运行时把内嵌 svg 渲染成 RGBA 喂给 tray-icon（无外部转换工具依赖）
+arboard = "3"        # 复制 adminApiKey 到剪贴板
+windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }  # win32 消息循环 GetMessageW

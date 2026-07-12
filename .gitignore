@@ -43,10 +43,16 @@ admin-ui/package-lock.json
 
 # 临时部署产物
 *.tar.gz
+*.zip
+dist-windows/
 data/
 ui-mockups/
 *.txt.dproj.txt
 tmp-import*/
+
+# 临时实测脚本 / 本地命令 caveat 转储（不进 repo）
+_*.sh
+*-local-command-caveat*.txt
 
 # ⚠️ 敏感运营文档：绝不推公开 repo（含真实账户邮箱/M365租户GUID/AWS账户号/SSH路径/
 # adminkey 线索/号池防封策略/内部交接细节）。仅留本地。可公开的纯技术文档单独列白名单在下方。
@@ -65,3 +71,4 @@ PROMPT-*.md
 
 # Claude Code agent 配置/记忆（本地私有，不公开）
 .claude/
+kiro_balance_cache.json

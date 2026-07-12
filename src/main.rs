@@ -6,6 +6,8 @@ mod http_client;
 mod kiro;
 mod model;
 pub mod token;
+#[cfg(windows)]
+mod tray;
 mod usage;
 
 use std::collections::HashMap;
@@ -42,32 +44,126 @@ fn generate_strong_key(prefix: &str) -> String {
     format!("{prefix}-{}", &cleaned[..cleaned.len().min(32)])
 }
 
+/// Windows 数据隔离根目录：`<exe 同目录>/KiroStudio-data/`。
+///
+/// 双击 exe 时 cwd 不可控（常是桌面/system32），产物会散落。故把 config.json / credentials.json /
+/// trash.json / 用量库统一收进 exe 同目录下一个 `KiroStudio-data/` 文件夹，与 Linux 部署隔离。
+/// 仅 Windows 生效；非 Windows 返回 None（走原 cwd/exe 逻辑，systemd 部署用显式路径不受影响）。
+/// 不存在则创建；创建失败返回 None（优雅降级到原逻辑，不阻断启动）。
+#[cfg(windows)]
+fn windows_data_root() -> Option<std::path::PathBuf> {
+    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let root = exe_dir.join("KiroStudio-data");
+    if let Err(e) = std::fs::create_dir_all(&root) {
+        tracing::warn!("创建数据目录 {} 失败: {}，回退到默认路径", root.display(), e);
+        return None;
+    }
+    Some(root)
+}
+
+/// 解析「默认名」文件的实际落盘路径，兼顾 Windows 数据隔离 + 旧位置兼容 + 源码目录开发。
+///
+/// 仅当传入是默认名（未显式指定路径）时才重定向；显式路径原样尊重。查找/落盘优先级：
+/// 1. cwd 下已有（源码目录开发场景）→ 沿用 cwd，不搬。
+/// 2. exe 同目录已有（旧版本落这里的存量配置）→ 沿用，**不强制迁移到 data 目录，避免丢号**。
+/// 3. Windows 且能建 data 根 → `<exe>/KiroStudio-data/<name>`（新的隔离位置）。
+/// 4. 兜底：exe 同目录（非 Windows 或建 data 失败）。
+fn resolve_default_data_path(name: &str) -> std::path::PathBuf {
+    use std::path::Path;
+    let cwd_path = Path::new(name).to_path_buf();
+    if cwd_path.exists() {
+        return cwd_path; // 源码目录开发：cwd 已有则沿用
+    }
+    let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf()));
+    if let Some(dir) = &exe_dir {
+        let legacy = dir.join(name);
+        if legacy.exists() {
+            return legacy; // 旧版本落 exe 根目录的存量配置：沿用，不搬（防丢号）
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Some(root) = windows_data_root() {
+            let in_data = root.join(name);
+            // data 目录里已有 → 用它；没有 → 也用它作为新的落盘位置（隔离）。
+            return in_data;
+        }
+    }
+    // 非 Windows 或 data 根不可用：回退 exe 同目录（保持原防呆语义）。
+    exe_dir.map(|d| d.join(name)).unwrap_or(cwd_path)
+}
+
+/// 首次启动自动打开浏览器到 /admin（仅 Windows）。
+///
+/// 触发条件（全满足）：①本次 bootstrap 新生成了 config（首次运行）②host 是本地回环
+/// （127.0.0.1/localhost/::1，避免服务器/公网监听场景乱开）③未设 `KIRO_NO_BROWSER` 环境变量
+/// （自动化/测试可关）。用 detached `cmd /C start` 开系统默认浏览器，免新依赖、不阻塞。
+#[cfg(windows)]
+fn maybe_open_browser_on_first_run(freshly_generated: bool, host: &str, port: u16) {
+    if !freshly_generated {
+        return;
+    }
+    if std::env::var("KIRO_NO_BROWSER").map(|v| !v.is_empty()).unwrap_or(false) {
+        return;
+    }
+    let is_loopback = matches!(host, "127.0.0.1" | "localhost" | "::1" | "0.0.0.0");
+    // host 为 0.0.0.0（监听所有网卡）时用 127.0.0.1 打开本机面板。
+    let browse_host = if host == "0.0.0.0" { "127.0.0.1" } else { host };
+    if !is_loopback {
+        return;
+    }
+    let url = format!("http://{}:{}/admin", browse_host, port);
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // `start "" "<url>"`：空标题占位 + URL。用 .bat 无关，单条 start 命令引号简单可靠。
+    let mut c = std::process::Command::new("cmd");
+    c.args(["/C", "start", "", &url])
+        .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
+    match c.spawn() {
+        Ok(_) => tracing::info!("首次启动：已尝试打开浏览器 {}", url),
+        Err(e) => tracing::warn!("首次启动打开浏览器失败（不影响服务）: {}", e),
+    }
+}
+
+/// 非 Windows：不自动开浏览器（服务器部署无 GUI）。
+#[cfg(not(windows))]
+fn maybe_open_browser_on_first_run(_freshly_generated: bool, _host: &str, _port: u16) {}
+
+/// 解析用量库目录：默认相对值 `"data/usage"` 在 Windows 下前缀到 `KiroStudio-data/`（数据隔离）；
+/// 已被用户改成绝对路径或自定义相对值的，原样尊重（不劫持用户显式配置）。
+/// 非 Windows / 数据根不可用：原样返回（保持相对 cwd 语义）。
+fn resolve_usage_data_dir(configured: &str) -> std::path::PathBuf {
+    let p = std::path::PathBuf::from(configured);
+    let is_default = configured == "data/usage";
+    if !is_default || p.is_absolute() {
+        return p;
+    }
+    #[cfg(windows)]
+    {
+        if let Some(root) = windows_data_root() {
+            return root.join(configured);
+        }
+    }
+    p
+}
+
 /// 防呆引导：`config_path` 指向的配置文件不存在时，自动生成一份带强随机密钥的最小 config.json，
 /// 并大字打印 adminApiKey / apiKey / 面板地址。已存在则不做任何事（绝不覆盖用户配置）。
 ///
-/// 关键：路径为默认相对名 `config.json` 时，落到 **exe 同目录**（双击时 cwd 常不是 exe 目录，
-/// 若按 cwd 写会散落到桌面/系统目录）。用户显式 `--config` 指定的绝对/相对路径则原样尊重。
-fn bootstrap_config_if_missing(config_path: &str) -> String {
+/// 返回 `(实际配置路径, 是否本次新生成)`。新生成标志供启动后「仅首次自动开浏览器」判断。
+/// 路径解析：默认名走 [`resolve_default_data_path`]（Windows 数据隔离 + 旧位置兼容）；
+/// 显式 `--config` 指定的路径原样尊重。
+fn bootstrap_config_if_missing(config_path: &str) -> (String, bool) {
     use std::path::Path;
-    // 解析实际落盘路径：默认名 → 优先 exe 同目录（双击时 cwd 常不是 exe 目录）；显式路径 → 原样。
-    // 默认名场景:若 cwd 下已有 config.json（源码目录运行）则沿用 cwd,不强拽到 exe 目录,
-    // 避免和 start.bat/源码构建的既有配置错位。
     let resolved = if config_path == Config::default_config_path() {
-        let cwd_path = Path::new(config_path).to_path_buf();
-        if cwd_path.exists() {
-            cwd_path
-        } else {
-            std::env::current_exe()
-                .ok()
-                .and_then(|exe| exe.parent().map(|d| d.join(config_path)))
-                .unwrap_or(cwd_path)
-        }
+        resolve_default_data_path(config_path)
     } else {
         Path::new(config_path).to_path_buf()
     };
     let resolved_str = resolved.to_string_lossy().to_string();
     if resolved.exists() {
-        return resolved_str; // 已有配置，尊重用户，不碰
+        return (resolved_str, false); // 已有配置，尊重用户，不碰；非首次
     }
     let target = resolved;
 
@@ -87,7 +183,7 @@ fn bootstrap_config_if_missing(config_path: &str) -> String {
     if let Err(e) = std::fs::write(&target, body) {
         // 写失败不阻断：继续走原流程（大概率随后因缺 apiKey 退出并报错），但先告知原因。
         tracing::error!("[引导] 自动生成配置失败({}): {e}；请手动创建 config.json 或用 start.bat", target.display());
-        return resolved_str;
+        return (resolved_str, false);
     }
     // Unix 收紧权限（含密钥，仅属主可读写）；Windows 依赖 NTFS ACL，此调用 no-op。
     #[cfg(unix)]
@@ -109,7 +205,7 @@ fn bootstrap_config_if_missing(config_path: &str) -> String {
     println!("  登录后到「凭据/号池」页添加 Kiro 账号即可开始使用。");
     println!("############################################################\n");
     tracing::info!("[引导] 已自动生成 {}（首次启动）", target.display());
-    resolved_str
+    (resolved_str, true)
 }
 
 #[tokio::main]
@@ -133,8 +229,9 @@ async fn main() {
     // 防呆引导（Windows 裸双击 exe 的核心体验）：config 缺失时**不再直接闪退**，而是
     // 自动在合适目录生成带强随机密钥的 config.json + 大字打印密钥/面板地址，再正常启动。
     // 这样下载单个 exe 双击、或首次运行都能开箱即用，无需先跑 start.bat。
-    // 已有 config 则完全不碰（绝不覆盖用户配置）。返回实际落盘路径,供随后 load 用同一路径。
-    let config_path = bootstrap_config_if_missing(&config_path);
+    // 已有 config 则完全不碰（绝不覆盖用户配置）。返回 (实际落盘路径, 是否本次新生成)。
+    // freshly_generated 供启动后「仅首次自动开浏览器」判断。
+    let (config_path, freshly_generated) = bootstrap_config_if_missing(&config_path);
 
     let config = Config::load(&config_path).unwrap_or_else(|e| {
         tracing::error!("加载配置失败: {}", e);
@@ -142,9 +239,12 @@ async fn main() {
     });
 
     // 加载凭证（支持单对象或数组格式）
-    let credentials_path = args
-        .credentials
-        .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
+    // 默认名场景走数据隔离解析（Windows→KiroStudio-data/，兼容旧位置）；显式 --credentials 原样尊重。
+    let credentials_path = args.credentials.unwrap_or_else(|| {
+        resolve_default_data_path(KiroCredentials::default_credentials_path())
+            .to_string_lossy()
+            .to_string()
+    });
     let credentials_config = CredentialsConfig::load(&credentials_path).unwrap_or_else(|e| {
         tracing::error!("加载凭证失败: {}", e);
         std::process::exit(1);
@@ -453,6 +553,29 @@ async fn main() {
     // + 删 .bak 回滚点的确认任务。详见 common::health_marker + deploy/rollback-guard.sh。
     common::health_marker::clear_boot_attempts();
     common::health_marker::spawn_health_confirm(env!("CARGO_PKG_VERSION").to_string());
+    // 首次启动自动开浏览器（仅 Windows）：本次新生成 config + 本地回环 host + 未设 KIRO_NO_BROWSER
+    // 时，bind 成功后打开默认浏览器到 /admin，实现「点击软件直接进面板」。仅首次（新装/首跑），
+    // 已有 config 重启不开，避免每次重启骚扰。
+    maybe_open_browser_on_first_run(freshly_generated, &config.host, config.port);
+    // Windows 系统托盘：另 spawn 一个专用 std 线程跑 win32 消息循环 + 托盘图标（不占 tokio 主线程）。
+    // 菜单:打开网页/复制密钥/重启服务/版本/退出。「退出」通过 tray::quit_notify() 通知本进程优雅关闭。
+    #[cfg(windows)]
+    {
+        let admin_key_for_tray = config.admin_api_key.clone().unwrap_or_default();
+        let tray_host = config.host.clone();
+        let tray_port = config.port;
+        std::thread::Builder::new()
+            .name("kiro-tray".into())
+            .spawn(move || {
+                tray::run(tray::TrayConfig {
+                    host: tray_host,
+                    port: tray_port,
+                    admin_api_key: admin_key_for_tray,
+                    relaunch: None, // 重启项接线见 tray 模块（当前 None=置灰）
+                });
+            })
+            .ok();
+    }
     // into_make_service_with_connect_info 让中间件可通过 ConnectInfo 拿到对端 IP
     // with_graceful_shutdown：收到 SIGTERM/Ctrl-C 后停止接新连接，等在途请求（含 SSE 流）drain
     axum::serve(
@@ -464,6 +587,12 @@ async fn main() {
     .unwrap();
 
     tracing::info!("服务已优雅停机");
+    // 托盘「退出」触发的停机：以退出码 3 退出,让 start.bat/run.bat 监督循环识别为「用户主动退出」
+    // 而不重拉(区别于面板重启/OTA 的 exit 0)。裸跑无脚本时退出码不影响。
+    #[cfg(windows)]
+    if TRAY_QUIT_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+        std::process::exit(tray::TRAY_QUIT_EXIT_CODE);
+    }
 }
 
 /// 等待停机信号：Ctrl-C（全平台）或 SIGTERM（Unix，容器编排 docker stop / k8s 用）。
@@ -485,11 +614,27 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
+    // Windows 托盘「退出」：等托盘线程 notify。非 Windows 永挂（无此源）。
+    #[cfg(windows)]
+    let tray_quit = async {
+        tray::quit_notify().notified().await;
+    };
+    #[cfg(not(windows))]
+    let tray_quit = std::future::pending::<()>();
+
     tokio::select! {
         _ = ctrl_c => tracing::info!("收到 Ctrl-C，开始优雅停机…"),
         _ = terminate => tracing::info!("收到 SIGTERM，开始优雅停机…"),
+        _ = tray_quit => {
+            tracing::info!("收到托盘退出，开始优雅停机…");
+            // 标记托盘退出:优雅停机后 main 以特殊退出码 3 退出,让监督脚本识别「用户主动退出、别重拉」。
+            TRAY_QUIT_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
+
+/// 是否由托盘「退出」触发的停机（决定 main 的退出码：3=用户主动退出，监督脚本不重拉）。
+static TRAY_QUIT_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 装配用量统计管道：打开 SQLite、构造 JSONL 统计、冷启动重放、启动保留清理任务。
 ///
@@ -498,7 +643,9 @@ async fn shutdown_signal() {
 fn init_usage_pipeline(config: &Config) -> Option<UsageHandles> {
     use std::path::PathBuf;
 
-    let data_dir = PathBuf::from(&config.usage_data_dir);
+    // 用量库目录：默认相对值 "data/usage" 在 Windows 数据隔离下前缀到 KiroStudio-data/，
+    // 避免双击时按 cwd 散落。显式改成绝对/自定义路径的：尊重不动。非 Windows：保持原相对 cwd 语义。
+    let data_dir = resolve_usage_data_dir(&config.usage_data_dir);
     if let Err(e) = std::fs::create_dir_all(&data_dir) {
         tracing::error!(
             "创建用量数据目录失败 {}: {}，用量统计已禁用",

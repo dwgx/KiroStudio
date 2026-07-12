@@ -57,6 +57,24 @@ static LOGIN_BG_ENABLED: AtomicU64 = AtomicU64::new(1);
 /// 下一轮后台预取 / 池空实时兜底拉取时读取此镜像决定 r18 参数。
 static LOGIN_BG_R18: AtomicU64 = AtomicU64::new(0);
 
+/// 背景池「代次」(generation/epoch)。clear_bg_pool 与 R18/开关变更时递增。
+///
+/// ⭐修复"关 R18 后仍可能服务到 R18 图"的在途竞态:fetch_bg_batch 是长时任务(多张×最长12s),
+/// 起点捕获当时的 epoch+r18;若下载途中用户关了 R18/清了池(epoch 变),在途批次下载完的**旧参数
+/// 图**若照旧 push 回池,就会把已清的 R18 图塞回刚清空的池 → random-bg 命中即返回本应清除的 R18 图。
+/// push 前校验 epoch 未变 + r18 未变,不符则丢弃该图并中止本批,拦住陈旧写入。
+static BG_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// 递增背景池代次,使所有在途 fetch 批次的后续 push 失效(它们捕获的是旧 epoch)。
+fn bump_bg_epoch() {
+    BG_EPOCH.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 读当前代次。
+fn bg_epoch() -> u64 {
+    BG_EPOCH.load(Ordering::Relaxed)
+}
+
 fn bg_pool() -> &'static BgPool {
     BG_POOL.get_or_init(|| BgPool {
         imgs: Mutex::new(Vec::new()),
@@ -73,8 +91,15 @@ fn login_background_enabled() -> bool {
 }
 
 /// 设置登录页背景 R18 开关（供 main 启动接线 / update_config 立即生效调用）。
+///
+/// 值真正变化时递增 BG_EPOCH:使所有在途 fetch 批次(捕获旧 epoch/旧 r18)的后续 push 失效,
+/// 防止"关 R18 瞬间在途批次把旧 R18 图 push 回池"。切换 R18 通常配合 clear_bg_pool 清池。
 pub fn set_login_background_r18(r18: bool) {
-    LOGIN_BG_R18.store(if r18 { 1 } else { 0 }, Ordering::Relaxed);
+    let new = if r18 { 1 } else { 0 };
+    let old = LOGIN_BG_R18.swap(new, Ordering::Relaxed);
+    if old != new {
+        bump_bg_epoch();
+    }
 }
 
 fn login_background_r18() -> bool {
@@ -104,6 +129,9 @@ pub fn bg_pool_stats() -> (usize, u64) {
 ///
 /// 仅释放内存缓存；下一轮后台预取或实时请求会重新填充，无副作用。
 pub fn clear_bg_pool() -> usize {
+    // 先递增代次:让此刻所有在途 fetch 批次的后续 push 失效,避免它们下载完的(可能是旧 R18)
+    // 图在 clear 之后又塞回刚清空的池(在途竞态)。
+    bump_bg_epoch();
     let pool = bg_pool();
     let mut guard = match pool.imgs.lock() {
         Ok(g) => g,
@@ -161,42 +189,82 @@ async fn download_bg_bytes(client: &reqwest::Client, img_url: &str) -> Option<Ca
     }
 }
 
-/// 拉取一批背景图并存入内存池：
-/// 1) 向 lolicon 请求一批图片 URL；2) 逐张下载字节；3) 存入池并按上限丢老。
-async fn fetch_bg_batch() {
-    // 关闭时不拉（即便被调度到也直接返回，池子保持原状不受影响）。
-    if !login_background_enabled() {
-        return;
+/// 背景图源类型。
+/// - `Json`：GET 返回 JSON，需按 lolicon 格式解析出图片 URL 列表再逐张下载(`{num}` 占位=本轮还需张数)。
+/// - `Direct`：GET 直接返回图片字节(含 302 跳转到 CDN)，每 GET 一次得一张，要 N 张就 GET N 次。
+#[derive(Clone, Copy)]
+enum BgKind {
+    Json,
+    Direct,
+}
+
+/// 一个背景图源。题材统一为二次元/pixiv 插画横图,高质量。
+#[derive(Clone, Copy)]
+struct BgSource {
+    name: &'static str,
+    kind: BgKind,
+    url: &'static str,
+}
+
+/// 非 R18(全年龄)图源组:都是二次元/pixiv 高质量横图。多源冗余——某源不可达/失败自动换下一个。
+const NON_R18_SOURCES: &[BgSource] = &[
+    BgSource {
+        name: "lolicon",
+        kind: BgKind::Json,
+        url: "https://api.lolicon.app/setu/v2?r18=0&size=regular&excludeAI=true&num={num}&aspectRatio=gt1.2",
+    },
+    BgSource { name: "alcy", kind: BgKind::Direct, url: "https://t.alcy.cc/pc" },
+    BgSource { name: "loliapi", kind: BgKind::Direct, url: "https://www.loliapi.com/acg/" },
+];
+
+/// R18 图源组:同为二次元/pixiv 题材,仅内容分级不同。lolicon r18=1 可靠,anosu 作冗余备份。
+const R18_SOURCES: &[BgSource] = &[
+    BgSource {
+        name: "lolicon-r18",
+        kind: BgKind::Json,
+        url: "https://api.lolicon.app/setu/v2?r18=1&size=regular&excludeAI=true&num={num}&aspectRatio=gt1.2",
+    },
+    BgSource { name: "anosu-r18", kind: BgKind::Direct, url: "https://image.anosu.top/pixiv/direct?r18=1" },
+];
+
+/// 把一张下载好的图推进内存池,并按上限丢弃最老的(有界)。
+///
+/// `batch_epoch` = 本 fetch 批次起点捕获的代次。push 前校验它仍等于当前代次:若期间发生过
+/// clear_bg_pool / R18 切换(代次已 bump),说明本批下载的是**陈旧参数图**,丢弃不入池并返回 false
+/// (调用方据此中止本批),防止旧 R18 图被塞回已清空的池。
+fn push_bg_to_pool(img: CachedBg, batch_epoch: u64) -> bool {
+    if bg_epoch() != batch_epoch {
+        tracing::debug!("背景图预取:代次已变(池被清/R18切换),丢弃在途陈旧图并中止本批");
+        return false;
     }
-
-    let client = match bg_http_client(20) {
-        Some(c) => c,
-        None => {
-            tracing::warn!("背景图预取：构造 HTTP 客户端失败，跳过本轮");
-            return;
-        }
+    let pool = bg_pool();
+    let mut guard = match pool.imgs.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(), // 锁中毒也继续用,背景图不涉及一致性风险
     };
+    guard.push(img);
+    while guard.len() > BG_POOL_CAP {
+        guard.remove(0);
+    }
+    true
+}
 
-    // 一次向 lolicon 要 BG_FETCH_BATCH 张横图（r18 参数按配置开关取，用户自用）。
-    let api = format!(
-        "https://api.lolicon.app/setu/v2?r18={}&size=regular&excludeAI=true&num={}&aspectRatio=gt1.2",
-        r18_param(),
-        BG_FETCH_BATCH
-    );
-    let body: serde_json::Value = match client.get(&api).send().await {
+/// 从一个 Json 源(lolicon 格式)拿图片 URL 列表并逐张下载,返回成功存池的张数。
+/// `batch_epoch` 透传给 push_bg_to_pool 做代次校验;某张 push 被拒(代次变)即停止本源下载。
+async fn fetch_from_json_source(client: &reqwest::Client, url: &str, batch_epoch: u64) -> usize {
+    let body: serde_json::Value = match client.get(url).send().await {
         Ok(r) => match r.json().await {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!("背景图预取：解析 lolicon 响应失败: {}", e);
-                return;
+                tracing::warn!("背景图预取:解析 JSON 源响应失败: {}", e);
+                return 0;
             }
         },
         Err(e) => {
-            tracing::warn!("背景图预取：请求 lolicon 失败: {}", e);
-            return;
+            tracing::warn!("背景图预取:请求 JSON 源失败: {}", e);
+            return 0;
         }
     };
-
     let urls: Vec<String> = match body["data"].as_array() {
         Some(arr) => arr
             .iter()
@@ -205,69 +273,154 @@ async fn fetch_bg_batch() {
             .collect(),
         None => Vec::new(),
     };
-    if urls.is_empty() {
-        tracing::warn!("背景图预取：lolicon 未返回可用 URL");
-        return;
-    }
-
-    // 逐张下载（串行，避免瞬时并发打爆图源），只把成功的存进池。
     let mut fetched = 0usize;
     for u in urls {
-        if let Some(img) = download_bg_bytes(&client, &u).await {
-            let pool = bg_pool();
-            let mut guard = match pool.imgs.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(), // 锁中毒也继续用，背景图不涉及一致性风险
-            };
-            guard.push(img);
-            // 超过上限：从头丢最老的，保持有界。
-            while guard.len() > BG_POOL_CAP {
-                guard.remove(0);
+        if let Some(img) = download_bg_bytes(client, &u).await {
+            // 代次已变则 push 被拒,停止本源(在途陈旧图不入池)。
+            if !push_bg_to_pool(img, batch_epoch) {
+                break;
             }
             fetched += 1;
         }
     }
+    fetched
+}
+
+/// 拉取一批背景图并存入内存池(多源 + R18 分流 + failover):
+/// 按当前 R18 开关选源组,打乱顺序依次尝试,累计够 BG_FETCH_BATCH 张即停;某源不可达/失败自动换下一个。
+async fn fetch_bg_batch() {
+    // 关闭时不拉（即便被调度到也直接返回，池子保持原状不受影响）。
+    if !login_background_enabled() {
+        return;
+    }
+
+    // 单次下载超时 12s:够下大图(loliapi ~2.6MB),又不至于让死源(如本机不可达的 anosu)
+    // 每次都干等 20s 拖垮整批 failover。
+    let client = match bg_http_client(12) {
+        Some(c) => c,
+        None => {
+            tracing::warn!("背景图预取：构造 HTTP 客户端失败，跳过本轮");
+            return;
+        }
+    };
+
+    // 捕获本批起点的代次:下载途中若 R18 切换/池被清(代次 bump),push 会被拒并中止本批,
+    // 防止旧参数图被塞回池(关 R18 后仍服务到 R18 图的在途竞态修复)。
+    let batch_epoch = bg_epoch();
+
+    // 按 R18 开关选源组。多源冗余:打乱顺序依次尝试,累计够 BG_FETCH_BATCH 张即停;
+    // 某源不可达/失败(超时/DNS/403)自动跳到下一个源——保证换环境(本机/服务器)都有可用源。
+    let sources = if login_background_r18() {
+        R18_SOURCES
+    } else {
+        NON_R18_SOURCES
+    };
+    // 打乱源顺序,避免总是死磕第一个源(也让不同源的图混着进池,更多样)。
+    let mut order: Vec<usize> = (0..sources.len()).collect();
+    for i in (1..order.len()).rev() {
+        order.swap(i, fastrand::usize(..=i));
+    }
+
+    let mut fetched = 0usize;
+    for idx in order {
+        if fetched >= BG_FETCH_BATCH {
+            break;
+        }
+        // 代次已变(R18 切换/清池)→ 中止本批,不再拉旧参数图。
+        if bg_epoch() != batch_epoch {
+            tracing::debug!("背景图预取:代次已变,中止本批 failover");
+            return;
+        }
+        let need = BG_FETCH_BATCH - fetched;
+        let src = &sources[idx];
+        let got = match src.kind {
+            BgKind::Json => {
+                let url = src.url.replace("{num}", &need.to_string());
+                fetch_from_json_source(&client, &url, batch_epoch).await
+            }
+            BgKind::Direct => {
+                // Direct 源每 GET 一次得一张,要 need 张就 GET need 次(串行,不打爆图源)。
+                // 连续失败 2 次即判定该源当前不可用,早停换下一个源——避免对死源(如不可达的
+                // anosu)硬试满 need 次、每次超时拖垮整批 failover(R18 组池填不上的根因)。
+                let mut n = 0usize;
+                let mut consecutive_fail = 0usize;
+                for _ in 0..need {
+                    if let Some(img) = download_bg_bytes(&client, src.url).await {
+                        // 代次已变则 push 被拒,停止本源(在途陈旧图不入池)。
+                        if !push_bg_to_pool(img, batch_epoch) {
+                            break;
+                        }
+                        n += 1;
+                        consecutive_fail = 0;
+                    } else {
+                        consecutive_fail += 1;
+                        if consecutive_fail >= 2 {
+                            tracing::debug!("背景图预取:源 [{}] 连续失败,早停换下一个源", src.name);
+                            break;
+                        }
+                    }
+                }
+                n
+            }
+        };
+        if got > 0 {
+            tracing::debug!("背景图预取:源 [{}] 贡献 {} 张", src.name, got);
+        }
+        fetched += got;
+    }
+
     if fetched > 0 {
-        let total = bg_pool()
-            .imgs
-            .lock()
-            .map(|g| g.len())
-            .unwrap_or(0);
-        tracing::info!("背景图预取：本轮新增 {} 张，池内共 {} 张", fetched, total);
+        let total = bg_pool().imgs.lock().map(|g| g.len()).unwrap_or(0);
+        tracing::info!(
+            "背景图预取:本轮新增 {} 张(R18={}),池内共 {} 张",
+            fetched,
+            login_background_r18(),
+            total
+        );
+    } else {
+        tracing::warn!("背景图预取:本轮所有图源均未拉到图(将靠下轮/实时兜底重试)");
     }
 }
 
 /// 启动登录页背景图预取后台任务。
 ///
 /// 由 main 在启动时接线：
-/// - `enabled` 为当前 `login_background_enabled` 配置，写入运行时镜像。
-/// - 启用时立即先拉一批（不等第一个 interval），随后每 12 分钟补一批。
-/// - 关闭时不 spawn 任务；即使后续被开启，也可由 update_config 改写镜像后靠下次
-///   请求回退到实时拉逻辑兜底（保持最小侵入，不做热重启任务）。
+/// 启动一个**常驻**的背景图预取循环(main 启动调一次)。
+///
+/// - `enabled` 仅播种运行时镜像的初值;**循环无条件常驻**,不再"关闭时不 spawn"。
+/// - 循环体 `fetch_bg_batch` 内已有 `if !login_background_enabled() return` 门:关闭时每轮空转
+///   跳过(开销极小),开启时自动拉图填池。这样即便启动时 enabled=false、之后 admin 开启,
+///   预取循环也一直在、下一轮(及开启时的即时 [`trigger_bg_refill`])就能把池填满。
+/// - ⭐修复根因:旧实现"关闭时不 spawn、开启后不 respawn"→ 启动 false 再开启则预取循环永不启动、
+///   池永远空、每次走单张实时兜底(慢/偶尔失败),表现为"第一次没图、关开偶尔显示一次、再刷新又没"。
 pub fn spawn_bg_prefetch(enabled: bool) {
     set_login_background_enabled(enabled);
-    if !enabled {
-        tracing::info!("登录页背景预取未启用（login_background_enabled=false）");
-        return;
-    }
     tokio::spawn(async move {
-        // 启动即先拉一批，避免开机后头一批用户拿到空池。
+        // 启动即先尝试拉一批(enabled=false 时 fetch 内部 gate 直接 return,不浪费)。
         fetch_bg_batch().await;
         let mut ticker = tokio::time::interval(Duration::from_secs(BG_REFILL_INTERVAL_SECS));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // 跳过 interval 立即触发的第一次 tick（上面已经主动拉过一批）。
-        ticker.tick().await;
+        ticker.tick().await; // 跳过 interval 立即触发的首 tick(上面已主动拉过)
         loop {
             ticker.tick().await;
-            fetch_bg_batch().await;
+            fetch_bg_batch().await; // 内部按 login_background_enabled 门控:关则空转、开则补池
         }
     });
     tracing::info!(
-        "登录页背景预取已启用：启动即拉一批，之后每 {} 秒补 {} 张（池上限 {}）",
+        "登录页背景预取循环已常驻(初始 enabled={}):开则每 {} 秒补 {} 张(池上限 {}),关则空转",
+        enabled,
         BG_REFILL_INTERVAL_SECS,
         BG_FETCH_BATCH,
         BG_POOL_CAP
     );
+}
+
+/// 立即触发一次背景图补池(供 admin 把 login_background_enabled 开启时调用,不用等常驻循环的下一轮
+/// 12 分钟 tick)。`fetch_bg_batch` 内部有 enabled 门,关闭态调用会空转直接返回(幂等安全)。
+pub fn trigger_bg_refill() {
+    tokio::spawn(async move {
+        fetch_bg_batch().await;
+    });
 }
 
 /// 创建 Admin UI 路由

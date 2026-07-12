@@ -290,181 +290,22 @@ fn map_provider_error(err: Error) -> Response {
 pub async fn get_models() -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
-    let models = vec![
-        Model {
-            id: "claude-opus-4-8".to_string(),
+    // 从声明式模型目录(单一真相源)派生 /v1/models，消除「广告清单 vs map_model 映射」漂移。
+    // 只吐 advertised=true 的模型;thinking 变体作别名不单列。created 为 OpenAI 兼容占位字段。
+    const ADVERTISED_CREATED: i64 = 1_759_104_000;
+    let models: Vec<Model> = crate::anthropic::model_catalog::CATALOG
+        .iter()
+        .filter(|s| s.advertised)
+        .map(|s| Model {
+            id: s.advertised_id().to_string(),
             object: "model".to_string(),
-            created: 1779897600, // May 28, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.8".to_string(),
+            created: ADVERTISED_CREATED,
+            owned_by: s.owned_by.to_string(),
+            display_name: s.display_name.to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 128_000,
-        },
-        Model {
-            id: "claude-opus-4-8-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1779897600, // May 28, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.8 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 128_000,
-        },
-        Model {
-            id: "claude-opus-4-7".to_string(),
-            object: "model".to_string(),
-            created: 1776276000, // Apr 16, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.7".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-7-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1776276000, // Apr 16, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.7 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1770163200, // Feb 4, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1770163200, // Feb 4, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1771286400, // Feb 17, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1771286400, // Feb 17, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101".to_string(),
-            object: "model".to_string(),
-            created: 1763942400, // Nov 24, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1763942400, // Nov 24, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-5-20250929".to_string(),
-            object: "model".to_string(),
-            created: 1759104000, // Sep 29, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-5-20250929-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1759104000, // Sep 29, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-haiku-4-5-20251001".to_string(),
-            object: "model".to_string(),
-            created: 1760486400, // Oct 15, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-haiku-4-5-20251001-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1760486400, // Oct 15, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        // 国产模型：Kiro 上游直收原生 modelId（倍率远低于 claude，见 kiro-model-catalog）。
-        // id 直接用 Kiro 规范 modelId，客户端选它即原样透传上游。窗口 200k。
-        Model {
-            id: "deepseek-3.2".to_string(),
-            object: "model".to_string(),
-            created: 1759104000,
-            owned_by: "deepseek".to_string(),
-            display_name: "DeepSeek V3.2".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "glm-5".to_string(),
-            object: "model".to_string(),
-            created: 1759104000,
-            owned_by: "zhipu".to_string(),
-            display_name: "GLM-5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "qwen3-coder-next".to_string(),
-            object: "model".to_string(),
-            created: 1759104000,
-            owned_by: "qwen".to_string(),
-            display_name: "Qwen3 Coder Next".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "minimax-m2.5".to_string(),
-            object: "model".to_string(),
-            created: 1759104000,
-            owned_by: "minimax".to_string(),
-            display_name: "MiniMax M2.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "minimax-m2.1".to_string(),
-            object: "model".to_string(),
-            created: 1759104000,
-            owned_by: "minimax".to_string(),
-            display_name: "MiniMax M2.1".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-    ];
+            max_tokens: s.max_output,
+        })
+        .collect();
 
     Json(ModelsResponse {
         object: "list".to_string(),
@@ -523,10 +364,32 @@ pub async fn post_messages(
     // 混入池分流:选一次号,若命中自定义 API 凭据 → 原样透传原始请求体到其上游、直接返回。
     // 选到 Kiro 号(或池中无自定义号)→ 返回 None,继续走下方原 Kiro 路径(行为完全不变)。
     let user_id = payload.metadata.as_ref().and_then(|m| m.user_id.clone());
-    if let Some(resp) = provider
+    if let Some((resp, meta)) = provider
         .try_custom_api_passthrough(raw_body.clone(), Some(&payload.model), user_id.as_deref())
         .await
     {
+        // 透传路径也记一条 usage record → 用量统计/最近请求/号池可视化能看到 custom_api。
+        // 诚实边界(隔离铁律 3):透传不解析上游 SSE,拿不到真实 output token/credit——
+        // input_tokens 用**本地**估算(不走远程 count_tokens API,避免阻塞低延迟中转的 TTFB),
+        // output_tokens=0,credits_used=None。
+        let input_tokens = token::count_all_tokens_local(
+            payload.system.as_deref(),
+            &payload.messages,
+            payload.tools.as_deref(),
+        ) as i32;
+        let mut record = crate::usage::RequestRecord::new(
+            Uuid::new_v4().to_string(),
+            meta.model.clone().unwrap_or_else(|| payload.model.clone()),
+        );
+        record.credential_id = Some(meta.credential_id);
+        record.session_id = meta.session_id.clone();
+        record.is_streaming = payload.stream;
+        record.input_tokens = input_tokens;
+        record.output_tokens = 0;
+        record.latency_ms = meta.latency_ms;
+        record.outcome = meta.outcome;
+        client.apply(&mut record);
+        crate::usage::emit_record(record);
         return resp;
     }
 
@@ -954,15 +817,10 @@ async fn handle_non_stream_request(
                             let buffer = tool_json_buffers
                                 .entry(tool_use.tool_use_id.clone())
                                 .or_insert_with(String::new);
-                            // 与流式路径同源判据：累积（本帧含 buffer 为前缀且更长）→ 全量替换；
-                            // 完全重复 → 不变；纯增量/前缀不成立 → 追加。
-                            if tool_use.input.len() >= buffer.len()
-                                && tool_use.input.starts_with(buffer.as_str())
-                            {
-                                *buffer = tool_use.input.clone();
-                            } else if buffer.as_str() != tool_use.input {
-                                buffer.push_str(&tool_use.input);
-                            }
+                            // 与流式路径同源修复：复用 stream::merge_tool_input 完备决策表
+                            // （累积快照 / 纯增量 / 重复终帧 / 迟到旧短快照 / 非前缀重写），
+                            // 消灭非前缀双完整对象被 append 成 `}{` 粘连非法 JSON 的漂移。
+                            *buffer = super::stream::merge_tool_input(buffer, &tool_use.input);
 
                             // 如果是完整的工具调用，添加到列表
                             if tool_use.stop {

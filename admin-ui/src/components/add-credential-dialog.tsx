@@ -278,6 +278,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setProxyUsername('')
     setProxyPassword('')
     setEndpoint('')
+    setBaseUrl('')
+    setCustomApiKey('')
+    setRequestLimit('')
   }
 
   const resetPaste = () => {
@@ -611,7 +614,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 </div>
               )}
 
-              {/* Region 配置 */}
+              {/* Region 配置(Kiro 专属:Token 刷新/API 请求 region)。自定义 API 代挂透传不适用,不显示 */}
+              {authMethod !== 'custom_api' && (
               <div className="space-y-2">
                 <label className="text-sm font-medium">Region 配置</label>
                 <div className="grid grid-cols-2 gap-2">
@@ -638,6 +642,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   均可留空使用全局配置。Auth Region 用于 Token 刷新，API Region 用于 API 请求
                 </p>
               </div>
+              )}
               {/* IdC/Builder-ID/IAM 额外字段 */}
               {authMethod === 'idc' && (
                 <>
@@ -753,6 +758,10 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 </p>
               </div>
 
+              {/* Machine ID + 端点 均为 Kiro 专属(设备指纹/Kiro API 路由)。
+                  自定义 API 代挂透传号无 refreshToken、直接打上游 base_url,不适用,不显示。 */}
+              {authMethod !== 'custom_api' && (
+              <>
               {/* Machine ID */}
               <div className="space-y-2">
                 <label htmlFor="machineId" className="text-sm font-medium">
@@ -786,6 +795,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   可选。决定该凭据走哪套 Kiro API。留空使用全局 defaultEndpoint
                 </p>
               </div>
+              </>
+              )}
 
               {/* 代理配置 */}
               <div className="space-y-2">

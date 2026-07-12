@@ -6,6 +6,7 @@ import { useCachedBalances } from '@/hooks/use-credentials'
 import { subscriptionLabel } from '@/lib/i18n-labels'
 import { X } from 'lucide-react'
 import { FireCanvas } from '@/components/overview/FireCanvas'
+import { useFlip } from '@/hooks/use-flip'
 import './status-bars.css'
 
 export interface StatusBarsProps {
@@ -49,6 +50,24 @@ function pctTone(pct: number): { text: string; bar: string } {
   if (pct >= 40) return { text: 'text-emerald-400/90', bar: 'bg-emerald-500' }
   if (pct >= 20) return { text: 'text-yellow-400/90', bar: 'bg-yellow-500' }
   return { text: 'text-red-400/90', bar: 'bg-red-500' }
+}
+
+// 用量百分比 → 配色（与剩余%反向语义：用得越满越危险。自定义 API 请求上限进度条用）。
+// <60% 绿、<85% 黄、以上红（接近上限=快被自动禁用）。
+function usageTone(pct: number): { text: string; bar: string } {
+  if (pct < 60) return { text: 'text-emerald-400/90', bar: 'bg-emerald-500' }
+  if (pct < 85) return { text: 'text-yellow-400/90', bar: 'bg-yellow-500' }
+  return { text: 'text-red-400/90', bar: 'bg-red-500' }
+}
+
+// 从 base_url 提取 host（状态条名字槽展示,替代自定义 API 号的"无邮箱"占位）。
+function hostOf(url?: string): string | null {
+  if (!url) return null
+  try {
+    return new URL(url).host
+  } catch {
+    return url.replace(/^https?:\/\//, '').split('/')[0] || url
+  }
 }
 
 // ── 算力格子阵列可调常量 ──（合并版：凌晨观感 + 算法加减；参数集中此处便于调）
@@ -232,13 +251,15 @@ export function StatusBars({ credentials, activity, balances, saturatedIds, clas
   const balanceMap = balances ?? cached?.balances
   // 鼠标跟随悬浮卡（替代 Radix Tooltip 固定 side="right" 的边缘翻转，卡片黏着鼠标走）。
   const hoverCard = useHoverCard()
+  // FLIP 平滑重排:排序模式切换/显隐变化导致 id 顺序变时,列表项从旧位滑到新位(不瞬跳)。
+  const flipRef = useFlip<HTMLDivElement>([credentials.map((c) => c.id).join(',')])
 
   if (credentials.length === 0) {
     return <EmptyPool className={className} />
   }
 
   return (
-      <div className={`flex flex-col gap-1.5 ${className ?? ''}`}>
+      <div ref={flipRef} className={`flex flex-col gap-1.5 ${className ?? ''}`}>
         {credentials.map((c) => {
           const h = healthOf(c)
           const rgb = HEALTH_RGB[h]
@@ -254,6 +275,15 @@ export function StatusBars({ credentials, activity, balances, saturatedIds, clas
           // 订阅等级：凭据持久化字段优先，回退缓存快照；缺失则不显（不占“未知”）。
           const sub = c.subscriptionTitle ?? balanceMap?.[String(c.id)]?.subscriptionTitle ?? null
 
+          // 自定义 API 代挂号:无 Kiro 订阅/余额,改展示上游 host + 请求用量。
+          const isCustomApi = c.authMethod === 'custom_api' || !!c.baseUrl
+          const reqCount = c.requestCount ?? 0
+          const reqLimit = c.requestLimit ?? 0
+          // 请求用量%:有上限才算(接近上限=快被自动禁用,越满越红);无上限=null(只显计数)。
+          const usagePct = isCustomApi && reqLimit > 0
+            ? Math.min(Math.max((reqCount / reqLimit) * 100, 0), 100)
+            : null
+
           // 余额迷你条：仅当缓存有该号且 limit 有效时展示剩余%，否则等宽占位保持列对齐。
           const bal = balanceMap?.[String(c.id)]
           const limit = bal?.usageLimit ?? 0
@@ -268,6 +298,7 @@ export function StatusBars({ credentials, activity, balances, saturatedIds, clas
           return (
                 <div
                   key={c.id}
+                  data-flip-key={c.id}
                   onMouseEnter={(e) => hoverCard.show(c, e)}
                   onMouseMove={hoverCard.move}
                   onMouseLeave={hoverCard.hide}
@@ -297,23 +328,31 @@ export function StatusBars({ credentials, activity, balances, saturatedIds, clas
                   <span className="relative z-[1] flex shrink-0 items-center font-mono text-xs tabular-nums text-foreground">
                     #{c.id}
                   </span>
-                  {/* 别名优先 > 邮箱 > 无邮箱占位。设了别名(name)就显别名(如"#53"),不再强显长邮箱。 */}
+                  {/* 别名优先 > 邮箱 > (自定义 API)上游 host > 无邮箱占位。
+                      设了别名(name)就显别名;自定义 API 号无邮箱,回退显上游 host,不再空显"无邮箱"。 */}
                   <span
                     className={`min-w-0 flex-1 truncate text-xs ${
-                      c.name || c.email ? 'text-muted-foreground' : 'italic text-muted-foreground/40'
+                      c.name || c.email || (isCustomApi && c.baseUrl)
+                        ? 'text-muted-foreground'
+                        : 'italic text-muted-foreground/40'
                     }`}
+                    title={isCustomApi ? c.baseUrl : undefined}
                   >
-                    {c.name || c.email || '无邮箱'}
+                    {c.name || c.email || (isCustomApi ? hostOf(c.baseUrl) ?? '自定义 API' : '无邮箱')}
                   </span>
                   {/* 订阅等级：固定等宽槽位（无论有无都占位），保证各行标签对齐不跳动。
                       槽宽加到 100px 容下最长的 "KIRO PRO MAX"（原 76px 会把它截成 "KIRO PRO M…"）。
                       标签本身不再 truncate、整体不换行，完整显示。 */}
                   <span className="hidden w-[100px] shrink-0 sm:block">
-                    {sub && (
+                    {isCustomApi ? (
+                      <span className="inline-block max-w-full whitespace-nowrap rounded bg-violet-500/15 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wide text-violet-300/90">
+                        代挂 API
+                      </span>
+                    ) : sub ? (
                       <span className="inline-block max-w-full whitespace-nowrap rounded bg-secondary/70 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wide text-muted-foreground/90">
                         {subscriptionLabel(sub)}
                       </span>
-                    )}
+                    ) : null}
                   </span>
                   {/* RPM 活跃度容器（自动挡）：未饱满=负载格子流；火力全开(onFire)=同一容器自动拉满成 WebGL 火焰 */}
                   <CellFlow
@@ -324,8 +363,36 @@ export function StatusBars({ credentials, activity, balances, saturatedIds, clas
                     litHealth={lit}
                     onFire={onFire}
                   />
-                  {/* 余额迷你进度条：剩余% + 细条；无缓存则等宽占位维持列对齐（不显“未知”） */}
-                  {remainingPct !== null ? (
+                  {/* 迷你进度条槽(等宽 92px 保列对齐):
+                      - Kiro 号:剩余额度%(越低越红)。
+                      - 自定义 API 号:请求用量(有上限=用量%进度条越满越红;无上限=纯计数"N 次")。 */}
+                  {isCustomApi ? (
+                    usagePct !== null ? (
+                      <div
+                        className="flex w-[92px] shrink-0 items-center gap-1.5"
+                        title={`请求用量 ${reqCount} / ${reqLimit}`}
+                      >
+                        <span
+                          className={`w-8 shrink-0 text-right font-mono text-[10px] tabular-nums ${usageTone(usagePct).text}`}
+                        >
+                          {usagePct.toFixed(0)}%
+                        </span>
+                        <span className="relative h-1.5 flex-1 overflow-hidden rounded-full bg-secondary">
+                          <span
+                            className={`absolute inset-y-0 left-0 rounded-full transition-all duration-500 ease-out-expo ${usageTone(usagePct).bar}`}
+                            style={{ width: `${usagePct}%` }}
+                          />
+                        </span>
+                      </div>
+                    ) : (
+                      <span
+                        className="w-[92px] shrink-0 text-right font-mono text-[10px] tabular-nums text-muted-foreground/70"
+                        title="累计透传请求数（不限上限）"
+                      >
+                        {reqCount} 次
+                      </span>
+                    )
+                  ) : remainingPct !== null ? (
                     <div
                       className="flex w-[92px] shrink-0 items-center gap-1.5"
                       title={`剩余 ${fmtAmount(remaining)} / ${fmtAmount(limit)}`}

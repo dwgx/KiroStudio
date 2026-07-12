@@ -6,5 +6,5 @@ mod router;
 
 pub use router::{
     bg_pool_stats, clear_bg_pool, create_admin_ui_router, set_login_background_enabled,
-    set_login_background_r18, spawn_bg_prefetch,
+    set_login_background_r18, spawn_bg_prefetch, trigger_bg_refill,
 };

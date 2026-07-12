@@ -137,6 +137,37 @@ pub fn build_client(
     Ok(builder.build()?)
 }
 
+/// 与 [`build_streaming_client`] 相同，但**禁用重定向**（`redirect::Policy::none()`）。
+/// 供 custom_api 透传出站用：写入时已校验 base_url 目标非内网（SSRF 主防线），但公网中转站
+/// 若返回 `302 Location: http://169.254.169.254/...` 仍能把请求跳向内网/元数据——禁重定向
+/// 堵死这条最典型的 SSRF 绕过链（纵深防护 C2）。
+pub fn build_streaming_client_no_redirect(
+    proxy: Option<&ProxyConfig>,
+    idle_secs: u64,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<Client> {
+    let mut builder = Client::builder()
+        .read_timeout(Duration::from_secs(idle_secs))
+        .connect_timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none());
+    builder = apply_tls_and_proxy(builder, proxy, tls_backend)?;
+    Ok(builder.build()?)
+}
+
+/// 与 [`build_client`] 相同，但**禁用重定向**。供 custom_api deep_verify 出站用（同上，防
+/// 302 跳内网的盲 SSRF）。
+pub fn build_client_no_redirect(
+    proxy: Option<&ProxyConfig>,
+    timeout_secs: u64,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<Client> {
+    let builder = Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .redirect(reqwest::redirect::Policy::none());
+    let builder = apply_tls_and_proxy(builder, proxy, tls_backend)?;
+    Ok(builder.build()?)
+}
+
 /// 把 TLS 后端选择 + 可选代理（含账密）应用到 builder 上（[`build_client`] /
 /// [`build_streaming_client`] 共用，避免两处逻辑漂移）。
 fn apply_tls_and_proxy(
@@ -202,12 +233,12 @@ mod tests {
 
     #[test]
     fn test_split_proxy_inline_credentials() {
-        // dwgx 的真实输入：账密内嵌在 socks5 URL 里。
+        // 账密内嵌在 socks5 URL 里（虚构样例）：应拆出干净 URL + 独立账密。
         let (url, user, pass) =
-            split_proxy_credentials("socks5://dwgxsocks:Dwgxnbnb0705@38.244.34.185:1080");
-        assert_eq!(url, "socks5://38.244.34.185:1080");
-        assert_eq!(user, Some("dwgxsocks".to_string()));
-        assert_eq!(pass, Some("Dwgxnbnb0705".to_string()));
+            split_proxy_credentials("socks5://proxyuser:proxypass@127.0.0.1:1080");
+        assert_eq!(url, "socks5://127.0.0.1:1080");
+        assert_eq!(user, Some("proxyuser".to_string()));
+        assert_eq!(pass, Some("proxypass".to_string()));
     }
 
     #[test]
