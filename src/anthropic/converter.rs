@@ -531,67 +531,22 @@ fn collapse_blank_lines(s: &str) -> String {
     out.join("\n").trim().to_string()
 }
 
-/// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
-/// 严格对照版本号
+/// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID。
+///
+/// **已重构**:委托给声明式模型目录 [`super::model_catalog`](单一真相源)。
+/// 旧实现是 `contains` 子串启发式，有三个真漏洞(Claude3 静默升贵档 / 高版本静默降级 /
+/// 子串误命中),且模型清单散落四处易漂移。现改为「精确别名 → 结构化 family+版本 →
+/// 老名近似(告警) → 未知拒绝」的分层解析，所有非精确命中都打 warn 日志(可观测)。
 pub fn map_model(model: &str) -> Option<String> {
-    let model_lower = model.to_lowercase();
-
-    if model_lower.contains("sonnet") {
-        if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            Some("claude-sonnet-4.6".to_string())
-        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-sonnet-4.5".to_string())
-        } else {
-            // 无显式版本号的 sonnet（如 claude-sonnet-4-20250514、claude-3-5-sonnet）
-            // 回退到 4.5，避免标准客户端被 UnsupportedModel 拒绝（对齐参照实现）
-            Some("claude-sonnet-4.5".to_string())
-        }
-    } else if model_lower.contains("opus") {
-        if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-opus-4.5".to_string())
-        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            Some("claude-opus-4.6".to_string())
-        } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
-            Some("claude-opus-4.7".to_string())
-        } else if model_lower.contains("4-8") || model_lower.contains("4.8") {
-            Some("claude-opus-4.8".to_string())
-        } else {
-            // 无显式版本号的 opus（如 claude-opus-4-20250514）回退到 4.6（对齐参照实现）
-            Some("claude-opus-4.6".to_string())
-        }
-    } else if model_lower.contains("haiku") {
-        Some("claude-haiku-4.5".to_string())
-    } else if model_lower.contains("deepseek") {
-        // Kiro 上游直收原生 modelId（Kiro 不是 Anthropic 服务端，也接国产模型，倍率远低于
-        // claude，见 kiro-model-catalog）。模糊名 → 当前唯一版本；完整原生 id `deepseek-3.2`
-        // 也含 "deepseek" 子串，同样命中此分支映射回自身（直透兼容）。
-        Some("deepseek-3.2".to_string())
-    } else if model_lower.contains("glm") {
-        Some("glm-5".to_string())
-    } else if model_lower.contains("qwen") {
-        Some("qwen3-coder-next".to_string())
-    } else if model_lower.contains("minimax") {
-        // minimax-m2.1 / m2.5：显式带 2.1 → m2.1，否则（含 m2.5、无版本号）回退较新的 m2.5
-        if model_lower.contains("2.1") || model_lower.contains("2-1") {
-            Some("minimax-m2.1".to_string())
-        } else {
-            Some("minimax-m2.5".to_string())
-        }
-    } else {
-        None
-    }
+    super::model_catalog::resolve_kiro_id(model).map(|s| s.to_string())
 }
 
-/// 根据模型名称返回对应的上下文窗口大小
+/// 根据模型名称返回对应的上下文窗口大小。
 ///
-/// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
-/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// 4.7 / 4.8 同 1M
+/// 委托给模型目录 [`super::model_catalog::context_window`]:窗口值直接来自 `ModelSpec.context_window`
+/// (单一真相源),不再复用 map_model 的映射结果拼判——避免继承 map_model 误判(如老名被当 1M)。
 pub fn get_context_window_size(model: &str) -> i32 {
-    match map_model(model) {
-        Some(mapped) if mapped == "claude-sonnet-4.6" || mapped == "claude-opus-4.6" || mapped == "claude-opus-4.7" || mapped == "claude-opus-4.8" => 1_000_000,
-        _ => 200_000,
-    }
+    super::model_catalog::context_window(model)
 }
 
 /// 转换结果
@@ -1806,7 +1761,7 @@ mod tests {
         // 大小写不敏感
         assert_eq!(map_model("DeepSeek"), Some("deepseek-3.2".to_string()));
         // 国产模型窗口 = 200k（非 1M）
-        assert_eq!(get_context_window_size("deepseek-3.2"), 200_000);
+        assert_eq!(get_context_window_size("deepseek-3.2"), 128_000); // 官方 128K
         assert_eq!(get_context_window_size("glm-5"), 200_000);
     }
 

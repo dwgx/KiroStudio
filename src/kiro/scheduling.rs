@@ -104,6 +104,12 @@ impl RpmTracker {
         v.retain(|t| now.duration_since(*t) < window);
     }
 
+    /// 移除指定凭据的窗口条目（删号时调用，避免其 RPM 记录残留被复用 id 的新号继承）。
+    /// 返回是否确有条目被移除。
+    pub fn remove(&self, id: u64) -> bool {
+        self.hits.lock().remove(&id).is_some()
+    }
+
     /// 清理空闲条目（由后台定时任务周期调用，防止不再出现的凭据 id 无界堆积）
     pub fn cleanup(&self) {
         let now = Instant::now();

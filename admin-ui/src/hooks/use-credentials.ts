@@ -5,6 +5,8 @@ import {
   setCredentialPriority,
   setCredentialRpmLimit,
   setCredentialAllowedModels,
+  setCredentialCustomApi,
+  type SetCustomApiConfigInput,
   resetCredentialFailure,
   forceRefreshToken,
   getCredentialBalance,
@@ -110,6 +112,18 @@ export function useSetAllowedModels() {
   return useMutation({
     mutationFn: ({ id, allowedModels }: { id: number; allowedModels: string[] | null }) =>
       setCredentialAllowedModels(id, allowedModels),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 修改自定义 API 凭据的 base_url / api_key / 请求上限
+export function useSetCustomApiConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, input }: { id: number; input: SetCustomApiConfigInput }) =>
+      setCredentialCustomApi(id, input),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },

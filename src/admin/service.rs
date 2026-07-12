@@ -14,7 +14,8 @@ use crate::kiro::token_manager::MultiTokenManager;
 
 use super::error::AdminServiceError;
 use super::external_idp_login::{
-    ExternalIdpLeg1Result, ExternalIdpLeg2Result, ExternalIdpLoginManager, ExternalIdpStartResult,
+    ExternalIdpLeg1Result, ExternalIdpLeg2Result, ExternalIdpLoginManager, ExternalIdpSelectResult,
+    ExternalIdpStartResult,
 };
 use super::idc_login::IdcLoginManager;
 use super::social_login::SocialLoginManager;
@@ -251,7 +252,8 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))
     }
 
-    /// 外部 IdP 上号 · 第 3 步：粘回授权回调 URL，换 token 入池。
+    /// 外部 IdP 上号 · 第 3 步：粘回授权回调 URL，换 token + 探测多 region profile。
+    /// 返回 profile 列表(多个则前端弹窗选,恰 1 个后端已自动建号)。
     pub async fn submit_external_idp_leg2(
         &self,
         session_id: &str,
@@ -259,6 +261,18 @@ impl AdminService {
     ) -> Result<ExternalIdpLeg2Result, AdminServiceError> {
         self.external_idp_login
             .submit_leg2(session_id, pasted_url)
+            .await
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))
+    }
+
+    /// 外部 IdP 上号 · 第 3 步选定:多 region profile 里选一个 arn,用暂存 token 建号入池。
+    pub async fn submit_external_idp_leg2_select(
+        &self,
+        session_id: &str,
+        arn: &str,
+    ) -> Result<ExternalIdpSelectResult, AdminServiceError> {
+        self.external_idp_login
+            .submit_leg2_select(session_id, arn)
             .await
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))
     }
@@ -491,6 +505,21 @@ impl AdminService {
     ) -> Result<(), AdminServiceError> {
         self.token_manager
             .set_credential_proxy(id, proxy_url, proxy_username, proxy_password)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 修改自定义 API(代挂透传)凭据的 base_url / api_key / 请求上限(仅 custom_api 号,后端 gate)。
+    pub async fn set_custom_api_config(
+        &self,
+        id: u64,
+        base_url: Option<String>,
+        api_key: Option<String>,
+        request_limit: Option<u64>,
+        reset_count: bool,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_custom_api_config(id, base_url, api_key, request_limit, reset_count)
+            .await
             .map_err(|e| self.classify_error(e, id))
     }
 
@@ -830,6 +859,10 @@ impl AdminService {
         if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
             tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
         }
+
+        // 新号自动初始化(异步,不阻塞响应):刷 token + 解析 profileArn，根治上号初期查余额 403(#89)。
+        // 门控在 spawn_initial_refresh 内部(custom_api/api_key 自动跳过)。
+        self.token_manager.spawn_initial_refresh(credential_id);
 
         Ok(AddCredentialResponse {
             success: true,
@@ -1361,11 +1394,30 @@ impl AdminService {
             .save()
             .map_err(|e| AdminServiceError::InternalError(format!("保存配置失败: {}", e)))?;
 
-        // TIER1 运行时字段统一热重载（冷却/限流/亲和/RPM上限/快失败/自动禁用/负载均衡即时生效,
-        // 不重启）。reload_config 从盘重读并原子刷新所有运行时镜像。失败仅告警(已存盘,重启即生效)。
-        // TIER2 字段变更也需先 reload：respawn 任务读的是 token_manager.config()（ArcSwap），
-        // 若不 reload，新间隔/开关不会进 ArcSwap，respawn 会读到旧值。
-        if hot_changed || refresh_task_changed || balance_task_changed {
+        // 配置快照(get_config_snapshot)读的是 token_manager.config()(ArcSwap 内存 config)。
+        // 只要有**运行时/展示类**字段落盘,就 reload_config 把 ArcSwap 与磁盘对齐,否则快照会读到旧值——
+        // ⭐这正是"关掉 R18/背景图保存后、刷新页面开关又变回开"的根因:那些字段过去只更运行时镜像
+        //   (AtomicBool)+存盘,却没 reload ArcSwap,导致快照永远回读 ArcSwap 里的旧值。
+        // reload_config 从盘重读整份 config 原子换入 ArcSwap(含 login_background/fingerprint/
+        // extract_thinking 等所有热字段),幂等安全。
+        //
+        // ⚠️【proxy split-brain 修复】**绝不因 restart-only 字段(proxyUrl/tls/host/port/callback/
+        // adminKey 等)触发 reload**。这些固化项在启动时已被固化到运行态(如 KiroProvider.self.proxy
+        // 由 new() 一次性赋值,对话/刷新路径全程用它),而登录流(social/idc/external_idp)却是
+        // **活读 config().proxy_url**。若改了 proxyUrl 就 reload 换进 ArcSwap:登录流立刻走新代理、
+        // 对话/刷新流仍走启动固化的旧代理 = split-brain(功能性割裂,与"改这些需重启"的语义矛盾)。
+        // 故这类字段只进 restart_fields 提示前端重启,ArcSwap 保持旧值 → 全局一致(全旧,重启才全新)。
+        // 展示/热字段各有独立 *_changed 标志,不依赖 restart_fields,R18 stale 根治不受影响。
+        let hot_or_display_changed = hot_changed
+            || refresh_task_changed
+            || balance_task_changed
+            || login_bg_changed.is_some()
+            || login_bg_r18_changed.is_some()
+            || fingerprint_changed.is_some()
+            || extract_thinking_changed.is_some()
+            || cc_auto_buffer_changed.is_some()
+            || strip_env_noise_changed.is_some();
+        if hot_or_display_changed {
             if let Err(e) = self.token_manager.reload_config() {
                 tracing::warn!("配置已存盘但热重载失败,下次重启生效: {}", e);
             }
@@ -1394,7 +1446,14 @@ impl AdminService {
         // 表现为"关了 R18 保存后刷新仍是旧图"。清池后下次 random-bg 按新参数即时重新拉取。
         if login_bg_r18_changed.is_some() || login_bg_changed.is_some() {
             let cleared = crate::admin_ui::clear_bg_pool();
-            tracing::info!("登录背景开关变更,已清空背景图缓存池({} 张),下次按新参数重新预取", cleared);
+            tracing::info!("登录背景开关变更,已清空背景图缓存池({} 张)", cleared);
+            // ⭐清池后若背景图当前为开启态,立即补一批新参数图填池(不等常驻循环的下一轮 12min tick)。
+            // 否则:开启背景图/切换 R18 后池是空的,登录页只能走单张实时兜底(慢/偶尔失败),
+            // 表现为"第一次没图、关开偶尔显示一次、再刷新又没"——本次连同预取循环常驻一起根治。
+            if config.login_background_enabled {
+                crate::admin_ui::trigger_bg_refill();
+                tracing::info!("背景图已开启,已触发即时补池(按新参数预取一批)");
+            }
         }
 
         // 指纹采集开关立即应用到热路径运行时镜像（下一个请求即生效）
@@ -1472,6 +1531,31 @@ impl AdminService {
             .map_err(|e| self.classify_balance_error(e, id))
     }
 
+    /// 【F】列出指定 external_idp 号在候选 region 的全部 profile 及验活结果（供前端选 region）。
+    /// 返回 `[(arn, region, account, usable, subscriptionTitle, reason)]`。
+    pub async fn probe_regions(
+        &self,
+        id: u64,
+    ) -> Result<Vec<crate::kiro::token_manager::ProfileCandidate>, AdminServiceError> {
+        self.token_manager
+            .probe_regions_for(id)
+            .await
+            .map_err(|e| self.classify_balance_error(e, id))
+    }
+
+    /// 【F】切换 external_idp 号到目标 region 的 profile（仅验活可用才写入）。
+    /// 返回切换后拿到的订阅标题（若有）。
+    pub async fn switch_profile_region(
+        &self,
+        id: u64,
+        arn: &str,
+    ) -> Result<Option<String>, AdminServiceError> {
+        self.token_manager
+            .switch_profile_region_for(id, arn)
+            .await
+            .map_err(|e| self.classify_balance_error(e, id))
+    }
+
     /// 探测指定凭据当前可用的模型列表（选中令牌后手动触发）。
     /// 探测该凭据可用哪些模型。返回 (每模型明细[(model,status,credits)], 本次总花费 credits)。
     /// 认证/账号级失败时返回 Err（前端提示先刷新/检查号）。
@@ -1484,12 +1568,16 @@ impl AdminService {
         // 默认候选：覆盖 opus/sonnet 主力 + 一个最便宜的国产模型验证探测机制。
         // 真实 Kiro modelId（见 kiro-model-catalog）；探测直发不过 map_model。
         let list = models.filter(|v| !v.is_empty()).unwrap_or_else(|| {
+            // 默认候选与 model_catalog::CATALOG 对齐(真实 Kiro modelId，探测直发不过 map_model)。
+            // 补齐 opus-4.5/4.7，消除「/v1/models 广告了却无法探测」的清单漂移。
             [
                 "qwen3-coder-next",
                 "claude-haiku-4.5",
                 "claude-sonnet-4.5",
                 "claude-sonnet-4.6",
+                "claude-opus-4.5",
                 "claude-opus-4.6",
+                "claude-opus-4.7",
                 "claude-opus-4.8",
             ]
             .iter()
@@ -1523,16 +1611,141 @@ impl AdminService {
     /// 后 `std::process::exit(0)`，完全绕开 sudo/NoNewPrivileges，稳定可靠。
     /// 若将来 unit 去掉 Restart=always，此法失效——但当前部署（见 kirostudio.service）已配置。
     pub fn restart_service(&self) -> Result<(), AdminServiceError> {
-        tracing::warn!(
-            "收到一键重启请求，约 1 秒后进程自退，由 systemd（Restart=always）在 3 秒内自动拉起"
+        // Windows：用户普遍**裸跑双击 exe**，无 systemd/监督脚本会在 exit(0) 后重拉。
+        // 若直接 exit(0),服务就此消失(H1)。故 Windows 下改为**进程自重启**:spawn 一个 detached
+        // helper(cmd),让它等本进程退出+端口释放后,用**原 exe 路径**(OTA 已把新二进制放到原路径)
+        // 加相同的 --config/--credentials 参数、相同 cwd 重新拉起,再由本进程 exit(0)。
+        #[cfg(target_os = "windows")]
+        {
+            self.spawn_windows_relaunch();
+            tokio::spawn(async {
+                // 睡 1 秒让本次 HTTP 200 flush 给前端,再退出让出端口,helper 会拉起新进程。
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                tracing::warn!("一键重启(Windows 裸跑):进程退出,已交给 detached helper 拉起新二进制");
+                std::process::exit(0);
+            });
+            return Ok(());
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            tracing::warn!(
+                "收到一键重启请求，约 1 秒后进程自退，由 systemd（Restart=always）在 3 秒内自动拉起"
+            );
+            // detached 异步任务：睡 1 秒让本次 HTTP 200 响应先 flush 给前端，再退出触发 systemd 重启。
+            tokio::spawn(async {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                tracing::warn!("一键重启：进程即将退出，交由 systemd 自动拉起");
+                std::process::exit(0);
+            });
+            Ok(())
+        }
+    }
+
+    /// Windows 专用：写一个临时 `.bat`，让它等本进程退出+端口释放后重新拉起新二进制。
+    ///
+    /// 为什么用 .bat 而不是 `cmd /C "start ... "`：Rust `Command::args(["/C", line])` 会对
+    /// 整串再加一层引号转义传给 cmd，叠加 `start "" "path"` 的多重引号 + `&`，cmd 解析错乱
+    /// 会去找 `\\`（实测 bug:`Windows cannot find '\\'` + `Access is denied`）。批处理**文件**的
+    /// 解析规则可预测,把带空格路径的引号写进文件即可,彻底绕开 `/C` 引号地狱。
+    ///
+    /// 为什么要中间脚本而非当前进程直接 spawn 新 exe：新旧进程抢同一监听端口,当前进程还没退出、
+    /// 端口没释放,新 exe 会 bind 失败。脚本先 sleep 等旧进程退出+端口释放,再启动新 exe。
+    #[cfg(target_os = "windows")]
+    fn spawn_windows_relaunch(&self) {
+        use std::io::Write;
+        use std::os::windows::process::CommandExt;
+        use std::process::Command;
+
+        // OTA 已把新二进制放到原 exe 路径（rename 旧→.bak、new→原路径）。current_exe 即目标。
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("Windows 自重启:取 current_exe 失败,无法拉起新进程: {e}");
+                return;
+            }
+        };
+        // 保留启动时的 --config / --credentials，让新进程用同一套路径（裸跑常为默认名，也照传更稳）。
+        let config_path = self
+            .token_manager
+            .config()
+            .config_path()
+            .map(|p| p.to_path_buf());
+        let credentials_path = self.token_manager.credentials_path();
+        // 新进程的工作目录：沿用当前 cwd（config/credentials 相对路径解析依赖它）。
+        let cwd = std::env::current_dir().ok();
+
+        // 组装批处理里的 exe 调用行:每个含空格/特殊字符的路径用双引号包裹(bat 内引号规则简单可靠)。
+        let q = |s: &str| format!("\"{}\"", s);
+        let mut launch = format!("start \"KiroStudio\" {}", q(&exe.to_string_lossy()));
+        if let Some(cfg) = &config_path {
+            launch.push_str(&format!(" --config {}", q(&cfg.to_string_lossy())));
+        }
+        if let Some(cred) = &credentials_path {
+            launch.push_str(&format!(" --credentials {}", q(&cred.to_string_lossy())));
+        }
+
+        // 批处理内容:等 ~3 秒(ping 当 sleep,免 timeout 交互性)→ 起新 exe → 删自身。
+        // `start "标题" "exe" args` 让新 exe 独立于本 .bat 存活;`chcp 65001` 防中文路径乱码。
+        let cwd_line = cwd
+            .as_ref()
+            .map(|d| format!("cd /d \"{}\"\r\n", d.to_string_lossy()))
+            .unwrap_or_default();
+        let bat = format!(
+            "@echo off\r\nchcp 65001 >nul\r\n{cwd_line}ping 127.0.0.1 -n 4 >nul\r\n{launch}\r\n(goto) 2>nul & del \"%~f0\"\r\n"
         );
-        // detached 异步任务：睡 1 秒让本次 HTTP 200 响应先 flush 给前端，再退出触发 systemd 重启。
-        tokio::spawn(async {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            tracing::warn!("一键重启：进程即将退出，交由 systemd 自动拉起");
-            std::process::exit(0);
-        });
-        Ok(())
+
+        // 写进临时目录的唯一 .bat。
+        let bat_path = std::env::temp_dir()
+            .join(format!("kirostudio-relaunch-{}.bat", uuid::Uuid::new_v4()));
+        {
+            let mut f = match std::fs::File::create(&bat_path) {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::error!("Windows 自重启:创建重启脚本失败,请手动重启: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = f.write_all(bat.as_bytes()) {
+                tracing::error!("Windows 自重启:写重启脚本失败,请手动重启: {e}");
+                return;
+            }
+        }
+
+        // DETACHED_PROCESS(0x8) | CREATE_NEW_PROCESS_GROUP(0x200) | CREATE_NO_WINDOW(0x8000000)
+        // + CREATE_BREAKAWAY_FROM_JOB(0x1000000):脱离父进程的 job object。
+        // 【根因】若本进程被放进一个 job(如某些启动器/终端/服务包装把子进程装进 job,且 job 设了
+        // KILL_ON_JOB_CLOSE),主进程 exit(0) 会**连带杀掉** detached 子进程 → 重启脚本还没 ping 完
+        // 就被杀 → 新 exe 起不来(实测:Bash `&` 后台起的实例点重启即复现)。BREAKAWAY 让 cmd 脱离
+        // 该 job,主进程退出不再牵连它。但 job 若禁止 breakaway,带此 flag 会 spawn 失败——故**先带
+        // breakaway 尝试,失败再回退不带**(不在 job / 双击场景本就不需要,回退等价原行为)。
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        let base_flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
+
+        let bat_str = bat_path.to_string_lossy().to_string();
+        let spawn_with = |flags: u32| {
+            let mut c = Command::new("cmd");
+            c.args(["/C", &bat_str]).creation_flags(flags);
+            if let Some(dir) = &cwd {
+                c.current_dir(dir);
+            }
+            c.spawn()
+        };
+        // 先带 breakaway;失败(job 禁止 breakaway / 其它)则回退到原 flags。
+        let result = spawn_with(base_flags | CREATE_BREAKAWAY_FROM_JOB)
+            .or_else(|_| spawn_with(base_flags));
+        match result {
+            Ok(_) => tracing::warn!(
+                "Windows 自重启:已 spawn 重启脚本({:?}),将在本进程退出后拉起 {exe:?}",
+                bat_path
+            ),
+            Err(e) => tracing::error!(
+                "Windows 自重启:spawn 重启脚本失败,OTA 后服务可能不会自动恢复,请手动重启: {e}"
+            ),
+        }
     }
 
     // ============ 存储统计 / 清理（运维）============
@@ -1883,6 +2096,16 @@ impl AdminService {
         // 2. API Key 凭据不支持刷新：客户端请求错误，映射为 400
         if msg.contains("API Key 凭据不支持刷新") {
             return AdminServiceError::InvalidCredential(msg);
+        }
+
+        // 2b. region profile 未开通（FEATURE_NOT_SUPPORTED）——可解释错误：
+        //     该 region 的 external_idp profile 未开通，刷新路径会自动 reprobe 纠正到可用 region，
+        //     或让用户手动切换。归为可解释的凭据错误（400），并给出中文提示。
+        if msg.contains("FEATURE_NOT_SUPPORTED") || msg.contains("region profile") {
+            return AdminServiceError::InvalidCredential(format!(
+                "该 region profile 未开通，将自动纠正到可用 region（或手动切换 region）: {}",
+                msg
+            ));
         }
 
         // 3. 上游服务错误特征：HTTP 响应错误或网络错误

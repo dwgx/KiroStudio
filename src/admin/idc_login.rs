@@ -212,6 +212,9 @@ impl IdcLoginManager {
                     tracing::warn!("IDC 上号后获取订阅等级失败: {}", e);
                 }
 
+                // 新号自动初始化(异步):刷 token + 解析 profileArn(#89 那种 idc 号必需)。
+                self.token_manager.spawn_initial_refresh(credential_id);
+
                 self.sessions.lock().remove(session_id);
                 tracing::info!("IDC 上号成功，新凭据 #{}", credential_id);
                 IdcPollResult::Done { credential_id }

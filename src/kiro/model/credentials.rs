@@ -478,6 +478,37 @@ impl KiroCredentials {
         }
     }
 
+    /// 【防呆根基】把 `region` / `auth_region` 强制同步成 `profile_arn` 内的 region。
+    ///
+    /// External IdP 账号可在多 region 各有独立 profile（实测 2026-07-12:同一账号
+    /// us-east-1 与 eu-central-1 各一个 ARN,account 都不同）。上游对话端点
+    /// `runtime.{region}.kiro.dev` 用的 region **必须**与 profileArn 第 4 段 region 一致,
+    /// 否则 400 Improperly formed。故凡设置/写回 profile_arn 处都调本方法,让 region 字段
+    /// 与 ARN 物理绑定、不可能错配——这是「导入/刷新不管怎样都自洽」的防呆保证。
+    ///
+    /// 以 ARN region 为唯一真相源:ARN 是上游权威返回的,region 字段只是本地记录。
+    /// profile_arn 缺失或 region 非白名单时不动(交由既有回退逻辑)。返回是否发生了修正。
+    pub fn sync_region_from_arn(&mut self) -> bool {
+        let arn_region = match self
+            .profile_arn
+            .as_deref()
+            .and_then(|a| Self::region_from_profile_arn(a))
+        {
+            Some(r) => r.to_string(),
+            None => return false,
+        };
+        let mut changed = false;
+        if self.region.as_deref() != Some(arn_region.as_str()) {
+            self.region = Some(arn_region.clone());
+            changed = true;
+        }
+        if self.auth_region.as_deref() != Some(arn_region.as_str()) {
+            self.auth_region = Some(arn_region.clone());
+            changed = true;
+        }
+        changed
+    }
+
     /// 获取有效的代理配置
     /// 优先级：凭据代理 > 全局代理 > 无代理
     /// 特殊值 "direct" 表示显式不使用代理（即使全局配置了代理）
@@ -518,6 +549,10 @@ impl KiroCredentials {
     ///
     /// 这类凭据不是 Kiro 号:它是一个 Anthropic 兼容上游中转站（base_url + api_key），
     /// /v1/messages 请求原样透传过去。不参与 Kiro 的 token 刷新 / profileArn / region 逻辑。
+    /// ⚠️ 判据以 auth_method 为准(canonicalize 已覆盖 custom_api 各种写法);`|| base_url.is_some()`
+    /// 是旧数据兜底(早期未写 auth_method 的透传号)。语义脆弱:任何 Kiro 号一旦被写了 base_url
+    /// 就会被判成透传号并踢出 Kiro 选号池——故 set_custom_api_config 的 gate 与添加表单都严格只让
+    /// custom_api 号写 base_url,不给 Kiro 号写。将来若能确保存量数据都带 auth_method,可收紧掉此兜底。
     pub fn is_custom_api_credential(&self) -> bool {
         self.auth_method.as_deref() == Some("custom_api") || self.base_url.is_some()
     }
@@ -745,6 +780,43 @@ mod tests {
         // 空/残缺 → None（不 panic）
         assert_eq!(KiroCredentials::region_from_profile_arn(""), None);
         assert_eq!(KiroCredentials::region_from_profile_arn("arn:aws"), None);
+    }
+
+    #[test]
+    fn test_sync_region_from_arn_overrides_mismatched_region() {
+        // 防呆核心:region 字段与 ARN region 不符时,以 ARN 为准强制同步。
+        // 场景:导入存了 us-east-1,但实际选的 profile 是 eu-central-1 的 ARN。
+        let mut c = KiroCredentials::default();
+        c.region = Some("us-east-1".to_string());
+        c.auth_region = Some("us-east-1".to_string());
+        c.profile_arn =
+            Some("arn:aws:codewhisperer:eu-central-1:155119901513:profile/ACPYXKUPYE3H".to_string());
+        let changed = c.sync_region_from_arn();
+        assert!(changed, "region 不符时应发生修正");
+        assert_eq!(c.region.as_deref(), Some("eu-central-1"), "region 应被 ARN region 覆盖");
+        assert_eq!(c.auth_region.as_deref(), Some("eu-central-1"), "auth_region 同步");
+    }
+
+    #[test]
+    fn test_sync_region_from_arn_noop_when_consistent_or_missing() {
+        // 已一致 → 不改（返回 false）
+        let mut c = KiroCredentials::default();
+        c.region = Some("eu-central-1".to_string());
+        c.auth_region = Some("eu-central-1".to_string());
+        c.profile_arn = Some("arn:aws:codewhisperer:eu-central-1:1:profile/X".to_string());
+        assert!(!c.sync_region_from_arn(), "已一致不应改动");
+        // profile_arn 缺失 → 不动 region（交由既有回退）
+        let mut c2 = KiroCredentials::default();
+        c2.region = Some("ap-southeast-1".to_string());
+        c2.profile_arn = None;
+        assert!(!c2.sync_region_from_arn());
+        assert_eq!(c2.region.as_deref(), Some("ap-southeast-1"), "无 ARN 不碰 region");
+        // ARN region 非白名单 → 不动（不会把 region 改成垃圾值）
+        let mut c3 = KiroCredentials::default();
+        c3.region = Some("us-east-1".to_string());
+        c3.profile_arn = Some("arn:aws:codewhisperer:not-a-region:1:profile/X".to_string());
+        assert!(!c3.sync_region_from_arn());
+        assert_eq!(c3.region.as_deref(), Some("us-east-1"), "非法 ARN region 不覆盖");
     }
 
     #[test]
@@ -1482,15 +1554,15 @@ mod tests {
 
     #[test]
     fn test_effective_proxy_inline_credentials_in_url() {
-        // 账密内嵌 URL（dwgx 场景）：effective_proxy 应拆出账密走 with_auth，
+        // 账密内嵌 URL（虚构样例）：effective_proxy 应拆出账密走 with_auth，
         // 干净 URL 不含账密。
         let mut creds = KiroCredentials::default();
-        creds.proxy_url = Some("socks5://dwgxsocks:Dwgxnbnb0705@38.244.34.185:1080".to_string());
+        creds.proxy_url = Some("socks5://proxyuser:proxypass@127.0.0.1:1080".to_string());
 
         let result = creds.effective_proxy(None).unwrap();
-        assert_eq!(result.url, "socks5://38.244.34.185:1080");
-        assert_eq!(result.username, Some("dwgxsocks".to_string()));
-        assert_eq!(result.password, Some("Dwgxnbnb0705".to_string()));
+        assert_eq!(result.url, "socks5://127.0.0.1:1080");
+        assert_eq!(result.username, Some("proxyuser".to_string()));
+        assert_eq!(result.password, Some("proxypass".to_string()));
     }
 
     #[test]
