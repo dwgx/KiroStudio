@@ -18,8 +18,9 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import type { CredentialStatusItem, BalanceResponse, CredentialRegionProfile } from '@/types/api'
-import { cn, copyToClipboard, extractErrorMessage } from '@/lib/utils'
+import type { CredentialStatusItem, BalanceResponse, CredentialRegionProfile, OnboardingDiagnosis } from '@/types/api'
+import { cn, copyToClipboard, extractErrorMessage, extractDiagnosis } from '@/lib/utils'
+import { DiagnosisCard } from '@/components/diagnosis-card'
 import { enableOverage, disableOverage, setCredentialName, setCredentialProxy, probeCredentialRegions, switchProfileRegion } from '@/api/credentials'
 import { authShortLabel, disabledReasonLabel, subscriptionLabel } from '@/lib/i18n-labels'
 import {
@@ -141,6 +142,8 @@ export function CredentialCard({
   const [regionsLoading, setRegionsLoading] = useState(false)
   const [regionsError, setRegionsError] = useState<string | null>(null)
   const [switchingArn, setSwitchingArn] = useState<string | null>(null)
+  const [refreshDiagnosis, setRefreshDiagnosis] = useState<OnboardingDiagnosis | null>(null)
+  const [customRegion, setCustomRegion] = useState('')
 
   const queryClient = useQueryClient()
   // 是否按住 Ctrl/Cmd:按住时卡片显示可点击手型 + 左键即多选(松开则普通左键不选中)
@@ -350,16 +353,51 @@ export function CredentialCard({
       toast.success(res.message || '已切换 Profile ARN，下次请求生效')
       await loadRegions()
     } catch (err) {
-      toast.error('切换失败: ' + extractErrorMessage(err))
+      const diag = extractDiagnosis(err)
+      toast.error('切换失败: ' + (diag ? diag.summary : extractErrorMessage(err)))
     } finally {
       setSwitchingArn(null)
     }
   }
 
+  // 自定义 region 切换：用户手填 region，用当前号的 account 构造 ARN 直接切过去（绕候选表，
+  // 覆盖冷门 region）。account 从已探测候选或当前 profileArn 提取；构造后走同一 switch（验活可用才生效）。
+  const handleCustomRegionSwitch = async () => {
+    const region = customRegion.trim()
+    if (!region) {
+      toast.error('请输入 region（如 eu-central-1）')
+      return
+    }
+    // 前端拿不到原始 ARN（安全:只暴露 hasProfileArn），故 account/profile 名从**已探测候选**取。
+    // 需先「探测区域」拿到至少一个候选,才能构造同账号的其它 region ARN。
+    const sample = regions?.find((r) => r.account && r.arn)
+    if (!sample) {
+      toast.error('请先点「探测区域」——需要一个已知 profile 才能构造自定义 region 的 ARN')
+      return
+    }
+    // 构造 ARN：arn:aws:codewhisperer:{region}:{account}:{profileSeg}（同账号同 profile 名，换 region）。
+    const profileSeg = sample.arn.split(':').slice(5).join(':')
+    const arn = `arn:aws:codewhisperer:${region}:${sample.account}:${profileSeg}`
+    await handleSwitchRegion(arn)
+  }
+
   const handleForceRefresh = () => {
+    setRefreshDiagnosis(null)
     forceRefresh.mutate(credential.id, {
-      onSuccess: (res) => toast.success(res.message),
-      onError: (err) => toast.error('刷新失败: ' + (err as Error).message),
+      onSuccess: (res) => {
+        setRefreshDiagnosis(null)
+        toast.success(res.message)
+      },
+      onError: (err) => {
+        // 结构化诊断优先(如 #98 的 CLIENT_OR_TOKEN_MISMATCH:引导重新上号而非裸 502),否则 toast。
+        const diag = extractDiagnosis(err)
+        if (diag) {
+          setRefreshDiagnosis(diag)
+          toast.error('刷新失败：' + diag.summary)
+        } else {
+          toast.error('刷新失败: ' + extractErrorMessage(err))
+        }
+      },
     })
   }
 
@@ -1089,9 +1127,17 @@ export function CredentialCard({
               )}
             </div>
 
-            {/* Profile ARN 区域切换（仅 External IdP 号）：列出该账号各 region 的 profile，
-                卡片式单选列表展示每个 region 的 ARN + 是否可用 + 订阅等级，选中即切过去
-                （切的是对话走哪个上游 profile/端点，非改全局 region）。
+            {/* 刷新 Token 失败诊断卡片（如 #98 的 client 过期 → 引导重新上号，而非裸 502）。 */}
+            {refreshDiagnosis && (
+              <DiagnosisCard
+                diagnosis={refreshDiagnosis}
+                onRetry={refreshDiagnosis.retriable ? handleForceRefresh : undefined}
+                className="mt-1"
+              />
+            )}
+
+            {/* Profile ARN 区域切换：列出该账号各 region 的 profile，卡片式单选列表展示每个 region 的
+                ARN + 是否可用 + 订阅等级，选中即切过去（切对话走哪个上游 profile/端点，非改全局 region）。
                 external_idp（多 region profile 选择）+ idc（通常单 region，用于确认/重新解析 profileArn）
                 显示；social/api_key/custom_api 无 profile 概念不显示。后端 probe_regions_for 已放开到
                 external_idp||idc。 */}
@@ -1129,9 +1175,31 @@ export function CredentialCard({
               )}
               {regions !== null && regions.length === 0 && !regionsLoading && (
                 <div className="rounded-md border border-dashed border-border px-3 py-3 text-center text-xs text-muted-foreground">
-                  未探测到可用的 profile。
+                  未探测到可用的 profile。该账号可能在此 region 未开通（刚加入订阅组需等最多 24h 传播），
+                  或试试下方手填其它 region。
                 </div>
               )}
+              {/* 自定义 region：手填任意 region 直接构造 ARN 切过去（绕候选表，覆盖冷门 region）。
+                  验活可用才真生效（后端 switch 只在 Usable 写回）。 */}
+              <div className="flex items-center gap-2 pt-1">
+                <Input
+                  value={customRegion}
+                  onChange={(e) => setCustomRegion(e.target.value)}
+                  placeholder="自定义 region，如 eu-central-1"
+                  className="h-8 flex-1 text-xs"
+                  disabled={switchingArn !== null}
+                />
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-8 shrink-0 px-2.5"
+                  onClick={handleCustomRegionSwitch}
+                  disabled={switchingArn !== null || !customRegion.trim()}
+                  title="用手填 region 构造 ARN 直接切换（验活可用才生效）"
+                >
+                  切到此区域
+                </Button>
+              </div>
               {regions !== null && regions.length > 0 && (
                 <div className="space-y-1.5">
                   {[...regions]
