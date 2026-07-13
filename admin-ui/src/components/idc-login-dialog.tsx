@@ -12,7 +12,9 @@ import { Input } from '@/components/ui/input'
 import { NumberStepper } from '@/components/ui/number-stepper'
 import { startIdcLogin, pollIdcLogin } from '@/api/credentials'
 import { CheckCircle2 } from 'lucide-react'
-import { copyToClipboard, extractErrorMessage } from '@/lib/utils'
+import { copyToClipboard, extractErrorMessage, extractDiagnosis } from '@/lib/utils'
+import { DiagnosisCard } from '@/components/diagnosis-card'
+import type { OnboardingDiagnosis } from '@/types/api'
 
 interface IdcLoginDialogProps {
   open: boolean
@@ -41,6 +43,7 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialog
   const [isStarting, setIsStarting] = useState(false)
   const [session, setSession] = useState<IdcSession | null>(null)
   const [countdown, setCountdown] = useState(0)
+  const [diagnosis, setDiagnosis] = useState<OnboardingDiagnosis | null>(null)
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
@@ -103,6 +106,7 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialog
       return
     }
     setIsStarting(true)
+    setDiagnosis(null)
     try {
       const resp = await startIdcLogin({
         startUrl: startUrl.trim(),
@@ -127,7 +131,13 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialog
       }, 1000)
       poll(resp.sessionId)
     } catch (err) {
-      toast.error(extractErrorMessage(err))
+      // 结构化诊断优先(如 REGION_MISMATCH:填错 region 给引导),否则退回 toast。
+      const diag = extractDiagnosis(err)
+      if (diag) {
+        setDiagnosis(diag)
+      } else {
+        toast.error(extractErrorMessage(err))
+      }
     } finally {
       setIsStarting(false)
     }
@@ -188,6 +198,9 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialog
                 placeholder="us-east-1"
                 disabled={isStarting}
               />
+              <p className="text-xs text-muted-foreground">
+                填错也没关系——会自动探测实例所在 region。不确定就留默认。
+              </p>
             </div>
             <div className="space-y-2">
               <label className="text-sm font-medium" htmlFor="idcPriority">
@@ -215,6 +228,7 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialog
                 disabled={isStarting}
               />
             </div>
+            {diagnosis && <DiagnosisCard diagnosis={diagnosis} />}
           </div>
         )}
 

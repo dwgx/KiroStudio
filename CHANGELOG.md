@@ -2,6 +2,38 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.14] - 2026-07-14
+
+### 上号智能诊断系统（无论谁的错都给正确引导）
+上号是本项目最关键路径，历来反复翻车的共性不是某个 bug，而是**出错时说不清"是账号的问题
+还是网关的问题"，用户只看到裸 502 / 裸报错，不知道该干什么**。本版建立结构化诊断，把"出错了"
+升级成 **(哪一步 + 谁的错 + 具体 code + 该干什么)**。
+
+- **新增 `src/kiro/diagnosis.rs`**：`OnboardingDiagnosis`（stage / fault 归因 / code / summary /
+  有序 guidance / raw 折叠 / retriable）+ 纯函数 `diagnose_*` 规则库，收录本轮**真实 token 实测**
+  坐实的错误模式。归因分五类：`user_input`（用户填错）/ `account_state`（账号问题）/ `upstream`
+  （AWS 侧）/ `gateway`（网关未覆盖，诚实标注 + 附原文 + 提示反馈）/ `transient`（瞬时）。
+- **修 #98 刷新 502 的真因**：实测 #98 刷新返回 `400 invalid_request "Invalid token provided"`
+  （不是我此前以为的 region 错配——#98 全是 us-east-1）。旧代码只识别 `invalid_grant/Invalid refresh
+  token` 精确组合，#98 措辞不同 → 落兜底 → 裸 502。现在归 `CLIENT_OR_TOKEN_MISMATCH`（client 注册
+  约 90 天过期或与 token 不匹配）+ 引导「重新上号」。**诚实说明**：这是"归因+引导"修复——refresh_token
+  真失效只能重新上号，但用户会清楚知道原因，不再对着裸 502 懵。
+- **诊断贯穿链路**：`refresh_idc_token` / IdC device flow 全 region 失败（`REGION_MISMATCH`）→
+  `DiagnosedError` → `classify_balance_error`/`start_idc_login` **downcast 透传**（不再字符串关键词
+  匹配丢结构）→ `AdminServiceError::Diagnosed` → API 响应 `error.diagnosis` 结构化字段。
+- **前端诊断卡片**（`DiagnosisCard`）：归因徽标 + 一句话诊断 + 有序引导步骤 + 折叠原始信息 +
+  按需「重试」/「重新上号」按钮。接入 IdC 上号对话框 + 凭据卡片刷新。
+
+### 自定义 region（都要）
+- 凭据卡片「Profile ARN 区域」块新增**手填 region 输入**：用已探测候选的 account + profile 名构造
+  目标 region 的 ARN 直接切换（绕候选表，覆盖冷门 region），验活可用才真生效（后端 switch 只在
+  Usable 写回）。空探测结果时提示可能未开通（24h 传播）或手填其它 region。
+
+### 诚实修正（本轮实测推翻的假设）
+- 用 #98 真实 token 直打 AWS `ListAvailableProfiles`：eu-central-1 返回 `{"profiles":[]}`（**EU 确实
+  无 profile**），us-east-1 有。此账号目前只在 us-east-1 开通，探测无 bug。0.7.13 的 auth_region 错配
+  修复对 #98 无效（它不存在错配），真因是 client 凭证——本版归因修对。
+
 ## [0.7.13] - 2026-07-13
 
 ### 修复 IdC 号刷新 Token 502（0.7.12 收口引入的回归）
