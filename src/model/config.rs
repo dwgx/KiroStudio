@@ -200,6 +200,57 @@ pub struct Config {
     #[serde(default = "default_strip_env_noise")]
     pub strip_env_noise: bool,
 
+    /// 工具错误缓解 ①：清洗模型泄漏的控制 token（course/課/count/care 之类）。默认关，热更生效。
+    ///
+    /// 模型偶发把内部控制/规划 token 泄漏进输出文本、甚至混进 tool_use.input 导致 JSON 非法
+    /// （客户端报 Invalid tool parameters）。开启后对文本流做**保守高信号**清洗：只剥离句首/块首、
+    /// 且英文控制词直贴 CJK 无空格分隔的粘连（如 `course重读`），正常文本不会这样粘连，误删风险低。
+    /// 这是**缓解非根治**（病根在模型侧生成参数，网关无法根治）。对所有模型可用（含 Claude 路径）。
+    #[serde(default = "default_tool_clean_leaked_tokens")]
+    pub tool_clean_leaked_tokens: bool,
+
+    /// 工具错误缓解 ②：流式路径工具拼装非法 JSON 时，对齐成失败态。默认关，热更生效。
+    ///
+    /// 修既有不对称：非流式工具拼装非法 → 502 失败态；流式却只告警+透传原文、网关记 Success。
+    /// 开启后流式也置 UpstreamError{INVALID_TOOL_INPUT} 失败态（用量记 ServerError，不污染成功率），
+    /// 与非流式对齐。**绝不静默吞成空参、绝不 report_failure 连坐号**（工具非法≠号坏）。
+    #[serde(default = "default_tool_stream_align_failure")]
+    pub tool_stream_align_failure: bool,
+
+    /// 工具错误缓解 ③：工具拼装非法时，向客户端补发明确的 SSE error 事件。默认关，热更生效。
+    ///
+    /// 开启后拼装非法时收尾补发 in-band error（而非静默透传坏 JSON），让客户端收到明确失败信号、
+    /// 自行退避重试，而不是把坏 JSON 当参数解析报 Invalid tool parameters。需配合 ② 使用效果最佳。
+    #[serde(default = "default_tool_expose_error_to_client")]
+    pub tool_expose_error_to_client: bool,
+
+    /// 工具错误缓解 ④（**根治向**）：工具参数拼装后非法 JSON 时，尝试修成合法 JSON 再发客户端。默认**开**，热更生效。
+    ///
+    /// 依据 Claude Code 客户端源码坐实：客户端拿 `partial_json` 直接 `JSON.parse`、**不做任何修复**，
+    /// 失败即报 "Invalid tool parameters"；官方对相关 issue（#69522/#20015/#29715）Open/not-planned
+    /// **不修**。本网关在发给客户端前把坏 JSON 修好（转义非法反斜杠/裸控制符、补全截断），客户端即可
+    /// parse 成功。安全：**只在 `from_str` 已失败时介入、修复后强制复验 `from_str` 通过才用**，修不好
+    /// 退回原样透传——对正常合法 JSON 零影响，最坏情况等于不开。故默认开（纯增益，不改变正常流行为）。
+    #[serde(default = "default_tool_repair_json")]
+    pub tool_repair_json: bool,
+
+    /// 工具错误缓解 ⑤：截断跨轮恢复。默认**关**（改变对话流程），热更生效。
+    ///
+    /// 只在**修复层④也补不回**（真截断，缺整段值）且归因为截断时触发：不发不完整的 tool_use 参数
+    /// （半截参数会被客户端当完整调用执行），改置失败态 + 收尾补发 SSE error，让客户端退避后重试整个
+    /// 请求（下轮模型可能生成更小的调用）。绝不连坐号（工具截断≠号坏）。默认关：它把截断从"发半截"
+    /// 变成"整轮失败重试"，改变对话行为，需用户显式开启。
+    #[serde(default = "default_tool_truncation_recovery")]
+    pub tool_truncation_recovery: bool,
+
+    /// 入站工具**顶层** description 的字符上限（默认 10000）。超出按字符边界安全截断（防多字节切断）。
+    ///
+    /// Claude Code 会给每个工具挂很长的说明，累积后既占 token 又逼近上游对单工具描述的隐性上限。
+    /// 硬截断早已存在（等价 kiro2api `MAX_TOOL_DESCRIPTION_LENGTH`），此字段只把上限提为可配置；
+    /// schema 内嵌 description 上限按同一比例（1/5）联动，无需单独字段。设 0 表示不截断。
+    #[serde(default = "default_tool_description_max_chars")]
+    pub tool_description_max_chars: usize,
+
     /// 网页上号回调基地址（可选）
     ///
     /// - 不配置：本地回调模式，后端在本机临时端口接收 OAuth 回调（仅本机浏览器可达）。
@@ -494,6 +545,34 @@ fn default_strip_env_noise() -> bool {
     true
 }
 
+/// 工具错误缓解开关默认全关：保持现状行为，用户在设置页按需开启（不意外改变任何既有行为）。
+fn default_tool_clean_leaked_tokens() -> bool {
+    false
+}
+
+fn default_tool_stream_align_failure() -> bool {
+    false
+}
+
+fn default_tool_expose_error_to_client() -> bool {
+    false
+}
+
+/// JSON 修复层默认**开启**：只在 JSON 已非法时介入 + 修复后强制复验，对正常流零影响，纯增益。
+fn default_tool_repair_json() -> bool {
+    true
+}
+
+/// 截断跨轮恢复默认关：它改变对话流程（截断→整轮失败重试），需用户显式开启。
+fn default_tool_truncation_recovery() -> bool {
+    false
+}
+
+/// 工具顶层描述上限默认 10000 字符（保持既有硬编码行为，只是提为可配置）。
+fn default_tool_description_max_chars() -> usize {
+    10000
+}
+
 fn default_usage_enabled() -> bool {
     true
 }
@@ -574,6 +653,12 @@ impl Default for Config {
             prompt_cache_enabled: default_prompt_cache_enabled(),
             prompt_cache_ttl_seconds: default_prompt_cache_ttl_seconds(),
             strip_env_noise: default_strip_env_noise(),
+            tool_clean_leaked_tokens: default_tool_clean_leaked_tokens(),
+            tool_stream_align_failure: default_tool_stream_align_failure(),
+            tool_expose_error_to_client: default_tool_expose_error_to_client(),
+            tool_repair_json: default_tool_repair_json(),
+            tool_truncation_recovery: default_tool_truncation_recovery(),
+            tool_description_max_chars: default_tool_description_max_chars(),
             callback_base_url: None,
             usage_enabled: default_usage_enabled(),
             usage_data_dir: default_usage_data_dir(),

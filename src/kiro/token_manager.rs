@@ -643,6 +643,11 @@ pub(crate) async fn resolve_profile_arn_via_management(
 /// 先探测号自己的 region,再补这两个兜底(去重)。将来账号在别 region 有 profile 可扩展此表。
 pub(crate) const PROFILE_PROBE_REGIONS: &[&str] = &["us-east-1", "eu-central-1"];
 
+/// 全 region 都探测不到可用 profile 的号，两次全坏 reprobe 之间的最小冷却间隔（成本护栏）。
+/// 见 [`CredentialEntry::last_full_reprobe_at`]。6 小时足够稀释「每 token TTL 白跑一轮」的浪费，
+/// 又不至于长到 dwgx 在别 region 开通后要等太久才自动纠正（届时手动刷新/切 region 也能立即生效）。
+const REPROBE_ALL_BAD_COOLDOWN: StdDuration = StdDuration::from_secs(6 * 3600);
+
 /// 多 region 探测 profileArn:优先号自己的 region,拿到就用(region 与 ARN 自洽);
 /// 该 region 无 profile 再依次探测候选 region 兜底。任一命中即返回,全部无则 Ok(None)。
 ///
@@ -995,6 +1000,14 @@ struct CredentialEntry {
     /// （该 region 的 profile 未开通）。刷新时据此**只对确认坏的号**触发 reprobe 重选 region，
     /// 健康号不额外探测（省成本）。非持久化：进程内状态，重启后由首次余额查询重新置位。
     last_usage_403_feature_not_supported: AtomicBool,
+    /// external_idp 号上次「全 region 探测都没找到可用 profile」的时间戳（成本护栏）。
+    ///
+    /// 全 region 都坏的号（微软账号在所有候选 region 都未开通 Kiro）：reprobe 每次都白跑
+    /// 一整轮 getUsageLimits 探测，而余额环每 ~30min 又会把 `last_usage_403_feature_not_supported`
+    /// 重新置位 → 每个 token TTL 都重复全 region 探测，纯浪费上游调用。此处记录上次全坏探测
+    /// 时间，`REPROBE_ALL_BAD_COOLDOWN` 冷却期内跳过 reprobe。找到可用 profile 时清空（恢复灵敏）。
+    /// 非持久化：进程内成本护栏，重启清零可接受（重启后至多多探一轮）。
+    last_full_reprobe_at: Mutex<Option<Instant>>,
 }
 
 /// 禁用原因
@@ -1439,6 +1452,7 @@ impl MultiTokenManager {
                     last_used_at: None,
                     inflight: Arc::new(AtomicU32::new(0)),
                     last_usage_403_feature_not_supported: AtomicBool::new(false),
+                    last_full_reprobe_at: Mutex::new(None),
                 }
             })
             .collect();
@@ -4234,6 +4248,7 @@ impl MultiTokenManager {
                 last_used_at: None,
                 inflight: Arc::new(AtomicU32::new(0)),
                 last_usage_403_feature_not_supported: AtomicBool::new(false),
+                last_full_reprobe_at: Mutex::new(None),
             });
         }
 
@@ -4348,6 +4363,7 @@ impl MultiTokenManager {
                     last_used_at: None,
                     inflight: Arc::new(AtomicU32::new(0)),
                     last_usage_403_feature_not_supported: AtomicBool::new(false),
+                    last_full_reprobe_at: Mutex::new(None),
                 });
             }
             return Err(e.context("回收站落盘失败，已回滚删除操作"));
@@ -4470,6 +4486,7 @@ impl MultiTokenManager {
                 last_used_at: restored_entry.last_used_at,
                 inflight: Arc::new(AtomicU32::new(0)),
                 last_usage_403_feature_not_supported: AtomicBool::new(false),
+                last_full_reprobe_at: Mutex::new(None),
             });
         }
 
@@ -4771,6 +4788,14 @@ impl MultiTokenManager {
             }
         }
 
+        // 队头阻塞根治（Medium 1）：token 已刷新并写回，refresh_lock 的职责（串行化 token 轮换，
+        // 防并发用同一 refresh_token 重复换取）到此结束。下面的 profileArn 动态解析 / 验活重选
+        // 是**独立的纯网络探测**（只改 profile_arn，与 refresh_token 轮换正交），若继续持锁，一个
+        // 全坏 external_idp 号 reprobe 一整轮 getUsageLimits 会把所有号的刷新全堵在锁后（队头阻塞）。
+        // 故在此显式释放 refresh_lock，让 arn/reprobe 在锁外并发进行。写回 profile_arn 时另用
+        // entries 短临界区 + 值比对，无需 refresh_lock 保护。
+        drop(_guard);
+
         // 动态解析 profileArn:idc/Enterprise 号常无 profileArn(oidc 刷新不回传),而对话/余额
         // 端点要求真实 profileArn(占位 ARN 对 Enterprise 号会被判 Invalid token/403)。刷新成功后
         // 若该号仍缺 profileArn 且非 external_idp(它不带),运行时调 management ListAvailableProfiles
@@ -4793,9 +4818,18 @@ impl MultiTokenManager {
                     // 验活重选（D）：external_idp 号当前 arn 上次 getUsageLimits 返回过
                     // 403 FEATURE_NOT_SUPPORTED（该 region profile 未开通）→ 需要 reprobe 换可用 region。
                     // 只对**确认坏的号**触发（健康号 flag=false 不动，省成本）。missing 优先走解析路径。
+                    //
+                    // 成本护栏（Medium 2）：全 region 都坏的号，上次全坏探测若在 REPROBE_ALL_BAD_COOLDOWN
+                    // 冷却期内则跳过——否则余额环每 ~30min 重置 403 flag，每 token TTL 都白跑一整轮探测。
+                    let in_reprobe_cooldown = e
+                        .last_full_reprobe_at
+                        .lock()
+                        .map(|t| t.elapsed() < REPROBE_ALL_BAD_COOLDOWN)
+                        .unwrap_or(false);
                     let needs_reprobe = !missing
                         && c.is_external_idp_credential()
-                        && e.last_usage_403_feature_not_supported.load(Ordering::Relaxed);
+                        && e.last_usage_403_feature_not_supported.load(Ordering::Relaxed)
+                        && !in_reprobe_cooldown;
                     (
                         eligible,
                         needs_reprobe,
@@ -4837,11 +4871,22 @@ impl MultiTokenManager {
                     entry
                         .last_usage_403_feature_not_supported
                         .store(false, Ordering::Relaxed);
+                    // 找到可用 profile → 清空全坏冷却时间戳，恢复灵敏（下次真坏能立即重探）。
+                    *entry.last_full_reprobe_at.lock() = None;
                 }
             } else {
+                // 全 region 都探测不到可用 profile：记录时间戳进入冷却，避免每 token TTL 白跑一整轮
+                // （余额环每 ~30min 会重置 403 flag，无冷却则每次刷新都重复全 region 探测，纯浪费上游调用）。
+                {
+                    let entries = self.entries.lock();
+                    if let Some(entry) = entries.iter().find(|e| e.id == id) {
+                        *entry.last_full_reprobe_at.lock() = Some(Instant::now());
+                    }
+                }
                 tracing::warn!(
-                    "凭据 #{} 验活重选未找到可用 region profile（保持原 arn，等待人工/后续重试）",
-                    id
+                    "凭据 #{} 验活重选未找到可用 region profile（保持原 arn，{}h 内不再重复全 region 探测，等待人工/后续重试）",
+                    id,
+                    REPROBE_ALL_BAD_COOLDOWN.as_secs() / 3600
                 );
             }
         }

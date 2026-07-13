@@ -154,7 +154,9 @@ pub fn run(cfg: TrayConfig) {
                 copy_to_clipboard(&cfg.admin_api_key);
             } else if *id == id_restart {
                 if let Some(r) = &cfg.relaunch {
+                    tracing::info!("[托盘] 用户点击重启服务，触发自重启…");
                     (r.trigger)();
+                    return; // trigger 已 spawn 重启脚本 + 通知优雅关闭;结束消息循环,主线程退出后由脚本拉起新进程
                 }
             } else if *id == id_quit {
                 tracing::info!("[托盘] 用户点击退出,通知优雅关闭…");

@@ -505,6 +505,16 @@ pub struct ConfigSnapshotResponse {
     pub cc_auto_buffer: bool,
     /// 是否剥离转发给上游的 system 环境噪音（省 token / 提缓存命中 / 降关联，立即生效）
     pub strip_env_noise: bool,
+    /// 工具错误缓解：泄漏控制 token 清洗 / 流式失败态对齐 / 如实暴露错误（均立即生效，默认关）
+    pub tool_clean_leaked_tokens: bool,
+    pub tool_stream_align_failure: bool,
+    pub tool_expose_error_to_client: bool,
+    /// JSON 修复层（根治向）：非法工具参数修成合法 JSON 再发客户端（立即生效，默认开）
+    pub tool_repair_json: bool,
+    /// 截断跨轮恢复：真截断且修复层补不回时置失败态让客户端重试整轮（立即生效，默认关）
+    pub tool_truncation_recovery: bool,
+    /// 入站工具顶层 description 字符上限（默认 10000，立即生效，0=不截断）
+    pub tool_description_max_chars: usize,
     pub cooldown_enabled: bool,
     pub rate_limit_enabled: bool,
     pub rate_limit_daily_max: u32,
@@ -568,6 +578,12 @@ pub struct UpdateConfigRequest {
     pub extract_thinking: Option<bool>,
     pub cc_auto_buffer: Option<bool>,
     pub strip_env_noise: Option<bool>,
+    pub tool_clean_leaked_tokens: Option<bool>,
+    pub tool_stream_align_failure: Option<bool>,
+    pub tool_expose_error_to_client: Option<bool>,
+    pub tool_repair_json: Option<bool>,
+    pub tool_truncation_recovery: Option<bool>,
+    pub tool_description_max_chars: Option<usize>,
     pub cooldown_enabled: Option<bool>,
     pub rate_limit_enabled: Option<bool>,
     pub rate_limit_daily_max: Option<u32>,
@@ -759,6 +775,12 @@ mod tests {
             balance_refresh_interval_secs: 1800,
             collect_client_fingerprint: true,
             strip_env_noise: true,
+            tool_clean_leaked_tokens: false,
+            tool_stream_align_failure: false,
+            tool_expose_error_to_client: false,
+            tool_repair_json: true,
+            tool_truncation_recovery: false,
+            tool_description_max_chars: 10000,
             config_path: None,
         };
         let s = serde_json::to_string(&snap).expect("序列化应成功");

@@ -982,6 +982,12 @@ impl AdminService {
             extract_thinking: config.extract_thinking,
             cc_auto_buffer: config.cc_auto_buffer,
             strip_env_noise: config.strip_env_noise,
+            tool_clean_leaked_tokens: config.tool_clean_leaked_tokens,
+            tool_stream_align_failure: config.tool_stream_align_failure,
+            tool_expose_error_to_client: config.tool_expose_error_to_client,
+            tool_repair_json: config.tool_repair_json,
+            tool_truncation_recovery: config.tool_truncation_recovery,
+            tool_description_max_chars: config.tool_description_max_chars,
             cooldown_enabled: config.cooldown_enabled,
             rate_limit_enabled: config.rate_limit_enabled,
             rate_limit_daily_max: config.rate_limit_daily_max,
@@ -1076,6 +1082,13 @@ impl AdminService {
         let mut cc_auto_buffer_changed: Option<bool> = None;
         // 环境噪音剥离开关：改后调 converter setter 即时生效（进程级镜像，不重启）。
         let mut strip_env_noise_changed: Option<bool> = None;
+        // 工具错误缓解三开关：改后调 handlers setter 即时生效（进程级镜像，不重启）。
+        let mut tool_clean_leaked_tokens_changed: Option<bool> = None;
+        let mut tool_stream_align_failure_changed: Option<bool> = None;
+        let mut tool_expose_error_to_client_changed: Option<bool> = None;
+        let mut tool_repair_json_changed: Option<bool> = None;
+        let mut tool_truncation_recovery_changed: Option<bool> = None;
+        let mut tool_description_max_chars_changed: Option<usize> = None;
 
         // —— 需重启生效的字段 ——
         if let Some(v) = req.host {
@@ -1183,6 +1196,42 @@ impl AdminService {
             if v != config.strip_env_noise {
                 config.strip_env_noise = v;
                 strip_env_noise_changed = Some(v);
+            }
+        }
+        if let Some(v) = req.tool_clean_leaked_tokens {
+            if v != config.tool_clean_leaked_tokens {
+                config.tool_clean_leaked_tokens = v;
+                tool_clean_leaked_tokens_changed = Some(v);
+            }
+        }
+        if let Some(v) = req.tool_stream_align_failure {
+            if v != config.tool_stream_align_failure {
+                config.tool_stream_align_failure = v;
+                tool_stream_align_failure_changed = Some(v);
+            }
+        }
+        if let Some(v) = req.tool_expose_error_to_client {
+            if v != config.tool_expose_error_to_client {
+                config.tool_expose_error_to_client = v;
+                tool_expose_error_to_client_changed = Some(v);
+            }
+        }
+        if let Some(v) = req.tool_repair_json {
+            if v != config.tool_repair_json {
+                config.tool_repair_json = v;
+                tool_repair_json_changed = Some(v);
+            }
+        }
+        if let Some(v) = req.tool_truncation_recovery {
+            if v != config.tool_truncation_recovery {
+                config.tool_truncation_recovery = v;
+                tool_truncation_recovery_changed = Some(v);
+            }
+        }
+        if let Some(v) = req.tool_description_max_chars {
+            if v != config.tool_description_max_chars {
+                config.tool_description_max_chars = v;
+                tool_description_max_chars_changed = Some(v);
             }
         }
         // —— TIER1 运行时热更字段：改完 reload_config 即时生效,不进 restart_fields ——
@@ -1416,7 +1465,13 @@ impl AdminService {
             || fingerprint_changed.is_some()
             || extract_thinking_changed.is_some()
             || cc_auto_buffer_changed.is_some()
-            || strip_env_noise_changed.is_some();
+            || strip_env_noise_changed.is_some()
+            || tool_clean_leaked_tokens_changed.is_some()
+            || tool_stream_align_failure_changed.is_some()
+            || tool_expose_error_to_client_changed.is_some()
+            || tool_repair_json_changed.is_some()
+            || tool_truncation_recovery_changed.is_some()
+            || tool_description_max_chars_changed.is_some();
         if hot_or_display_changed {
             if let Err(e) = self.token_manager.reload_config() {
                 tracing::warn!("配置已存盘但热重载失败,下次重启生效: {}", e);
@@ -1475,6 +1530,26 @@ impl AdminService {
         if let Some(v) = strip_env_noise_changed {
             crate::anthropic::set_strip_env_noise(v);
         }
+        // 工具错误缓解三开关立即应用到 handlers 进程级镜像（下一个请求即生效，不重启）。
+        if let Some(v) = tool_clean_leaked_tokens_changed {
+            crate::anthropic::set_tool_clean_leaked_tokens(v);
+        }
+        if let Some(v) = tool_stream_align_failure_changed {
+            crate::anthropic::set_tool_stream_align_failure(v);
+        }
+        if let Some(v) = tool_expose_error_to_client_changed {
+            crate::anthropic::set_tool_expose_error_to_client(v);
+        }
+        if let Some(v) = tool_repair_json_changed {
+            crate::anthropic::set_tool_repair_json(v);
+        }
+        if let Some(v) = tool_truncation_recovery_changed {
+            crate::anthropic::set_tool_truncation_recovery(v);
+        }
+        // 工具描述上限立即应用到 converter 进程级镜像（下一个请求即生效，不重启）。
+        if let Some(v) = tool_description_max_chars_changed {
+            crate::anthropic::set_tool_description_max_chars(v);
+        }
 
         let immediate_changed = hot_changed
             || refresh_task_changed
@@ -1484,7 +1559,13 @@ impl AdminService {
             || fingerprint_changed.is_some()
             || extract_thinking_changed.is_some()
             || cc_auto_buffer_changed.is_some()
-            || strip_env_noise_changed.is_some();
+            || strip_env_noise_changed.is_some()
+            || tool_clean_leaked_tokens_changed.is_some()
+            || tool_stream_align_failure_changed.is_some()
+            || tool_expose_error_to_client_changed.is_some()
+            || tool_repair_json_changed.is_some()
+            || tool_truncation_recovery_changed.is_some()
+            || tool_description_max_chars_changed.is_some();
         let restart_required = !restart_fields.is_empty();
         let message = if restart_required {
             format!(
@@ -1653,6 +1734,30 @@ impl AdminService {
     /// 端口没释放,新 exe 会 bind 失败。脚本先 sleep 等旧进程退出+端口释放,再启动新 exe。
     #[cfg(target_os = "windows")]
     fn spawn_windows_relaunch(&self) {
+        // 复用模块级自由函数（托盘「重启服务」项亦共用同一逻辑），传入启动时的
+        // config/credentials 路径，让新进程用同一套路径重启。
+        let config_path = self
+            .token_manager
+            .config()
+            .config_path()
+            .map(|p| p.to_path_buf());
+        let credentials_path = self.token_manager.credentials_path();
+        spawn_windows_relaunch_process(config_path, credentials_path);
+    }
+}
+
+/// Windows 专用自由函数：写一个临时 `.bat`，让它等本进程退出+端口释放后重新拉起新二进制。
+///
+/// 从 [`AdminService::spawn_windows_relaunch`] 抽出为模块级函数，供**面板一键重启**与
+/// **系统托盘「重启服务」**共用同一套久经验证的自重启逻辑（不依赖 `AdminService` 实例，
+/// 托盘线程也能调）。`config_path` / `credentials_path` 由调用方传入（启动参数），让新进程
+/// 用同一套路径。为何用 .bat + 中间脚本 + `CREATE_BREAKAWAY_FROM_JOB` 的完整原因见函数体注释。
+#[cfg(target_os = "windows")]
+pub(crate) fn spawn_windows_relaunch_process(
+    config_path: Option<PathBuf>,
+    credentials_path: Option<PathBuf>,
+) {
+    {
         use std::io::Write;
         use std::os::windows::process::CommandExt;
         use std::process::Command;
@@ -1665,13 +1770,6 @@ impl AdminService {
                 return;
             }
         };
-        // 保留启动时的 --config / --credentials，让新进程用同一套路径（裸跑常为默认名，也照传更稳）。
-        let config_path = self
-            .token_manager
-            .config()
-            .config_path()
-            .map(|p| p.to_path_buf());
-        let credentials_path = self.token_manager.credentials_path();
         // 新进程的工作目录：沿用当前 cwd（config/credentials 相对路径解析依赖它）。
         let cwd = std::env::current_dir().ok();
 
@@ -1747,7 +1845,9 @@ impl AdminService {
             ),
         }
     }
+}
 
+impl AdminService {
     // ============ 存储统计 / 清理（运维）============
 
     /// 用量数据目录（SQLite traces.db 与 usage-*.jsonl 所在目录）。
@@ -2101,7 +2201,11 @@ impl AdminService {
         // 2b. region profile 未开通（FEATURE_NOT_SUPPORTED）——可解释错误：
         //     该 region 的 external_idp profile 未开通，刷新路径会自动 reprobe 纠正到可用 region，
         //     或让用户手动切换。归为可解释的凭据错误（400），并给出中文提示。
-        if msg.contains("FEATURE_NOT_SUPPORTED") || msg.contains("region profile") {
+        //     判据只认 FEATURE_NOT_SUPPORTED（上游真实的「该 region 未开通」信号）——**不再**用
+        //     `msg.contains("region profile")` 模糊匹配：那会误伤 probe_regions_for 对非 external_idp
+        //     号 bail 的「仅 External IdP 凭据支持列出 region profile」，把「号类型不对」误报成
+        //     「region 未开通，将自动纠正」，误导用户以为是区域问题。号类型错走下面的默认分支原文透出。
+        if msg.contains("FEATURE_NOT_SUPPORTED") {
             return AdminServiceError::InvalidCredential(format!(
                 "该 region profile 未开通，将自动纠正到可用 region（或手动切换 region）: {}",
                 msg
