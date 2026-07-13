@@ -2,6 +2,36 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.9] - 2026-07-13
+
+### region 自动纠正「一条龙」（对话路径补齐——此前只有导入/刷新/手动探测有）
+- **对话请求撞 403 FEATURE_NOT_SUPPORTED 时自动纠正 region**：此前对话热路径把该错误当普通凭据
+  错误 `report_failure` 冷却 + 换号，**误伤只是 region 配错的好号**（号本身可用，换个 region 就行）。
+  现在特判：① 廉价本地纠正 `sync_region_from_arn`（纯字符串，无网络）；② 触发 **per-id 守卫的
+  后台异步重探**（`trigger_background_reprobe`：`compare_exchange` 抢占，N 并发只 1 个真探测，
+  6h 冷却双检，detached spawn，绝不阻塞当前对话请求）；③ 本地纠正生效则同号重试一次，否则认证冷却
+  换号（**绝不 report_failure 连坐**）。非 external_idp 号短路，行为零变化。
+- **对抗复核裁决**：昂贵的 `probe_all_usable_profiles`（一整轮 getUsageLimits）**绝不上同步对话
+  热路径**（会阻塞客户端数十秒 + 并发打爆上游自造风控），改为后台异步 + 当前请求立即 failover。
+- **右键手动切换 region 补「当前」标记**：`ProfileCandidate.current` 标出当前绑定的 profile，
+  前端绿标 + 禁点，省一次冗余 switch。
+
+### Invalid tool parameters 补三个漏过的洞
+- **非流式路径补 JSON 修复**：此前 `repair_tool_json` 只在流式路径生效，非流式解析失败直接置失败态；
+  现在非流式也先修复再复验，与流式对齐。
+- **整包双重编码解包**：模型偶发把整个工具参数对象**再套一层字符串编码**（`from_str` 成功但得到
+  `String`，漏过修复层），客户端按 object 消费即报 InputValidationError。新增 `unwrap_double_encoded`
+  解一层还原（只解一层、复验必 object/array 才用），流式 + 非流式两处接入。
+- **孤立/半截 UTF-16 代理对降级**（对应 #69522）：`\uD83D` 等孤立高/低代理会被判非法 JSON，
+  修复层降级为字面；合法代理对（如 😀 = `😀`）原样保留不碰。
+- **修 repair 成功路径绕过双重编码解包**：修复成功后不再提前返回，与「原本合法」路径汇合到同一
+  解包 + 发送出口，消除路径不一致。
+
+### 错误翻译层
+- **修 `translate_network` 子串误匹配**：此前对上游错误串裸 `contains("tls"/"proxy"/"timeout"…)`，
+  会把响应体里恰好含这些词的**普通上游错误**误判成网络故障（错状态码 + 误导排障）。现在加传输层
+  闸门 `is_transport_error`（只认 reqwest 建连/发送阶段的稳定标志），非传输错误不在此翻译、诚实透传。
+
 ## [0.7.8] - 2026-07-13
 
 ### 1M 上下文变体 + beta header 注入

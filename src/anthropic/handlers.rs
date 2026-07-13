@@ -346,10 +346,38 @@ fn translate_context_input(err_str: &str) -> Option<TranslatedError> {
     None
 }
 
+/// 是否为**传输层**错误(reqwest 在 `send()`/建连阶段失败,尚未拿到任何 HTTP 响应)。
+///
+/// 判据:reqwest 传输错误的 Display 有稳定标志(`error sending request` / `error trying to
+/// connect` / `tcp connect` / `connection refused|reset|closed` / `dns error`),而**上游 HTTP
+/// 错误响应体**(provider 格式化成含 HTTP 状态码 + body 的串)**绝不含这些标志**。以此为闸门,
+/// 杜绝「上游正常错误 body 里恰好含 timeout/tls/proxy 字样 → 被误判成网络故障」(review high)。
+fn is_transport_error(low: &str) -> bool {
+    low.contains("error sending request")
+        || low.contains("error trying to connect")
+        || low.contains("tcp connect")
+        || low.contains("connection refused")
+        || low.contains("connection reset")
+        || low.contains("connection closed")
+        || low.contains("dns error")
+        || low.contains("failed to lookup")
+        // reqwest 纯超时错误(无 HTTP 响应)的 Display,不与上游 body 里的 "timeout" 混淆:
+        // 上游 body 是 JSON,不会是 reqwest 顶层超时串。此项要求整串"像"传输超时(无 HTTP 状态码语境)。
+        || (low.contains("operation timed out") && !low.contains("api 请求失败"))
+}
+
 /// 网络/传输类（多为可重试的暂时故障，常与代理配置相关）。
+///
+/// **闸门**:仅当 [`is_transport_error`] 判定为真正的传输层错误才分类,否则返回 None——避免对
+/// 上游 HTTP 错误响应体做裸子串匹配导致误判(review high 缺陷)。
 fn translate_network(err_str: &str) -> Option<TranslatedError> {
     let low = err_str.to_lowercase();
-    if low.contains("dns") || low.contains("resolve") || low.contains("name resolution") {
+    // 闸门:不是传输层错误(如上游 4xx/5xx 响应体)一律不在此翻译,交由上层诚实透传。
+    if !is_transport_error(&low) {
+        return None;
+    }
+    if low.contains("dns") || low.contains("resolve") || low.contains("name resolution")
+        || low.contains("failed to lookup") {
         return Some(TranslatedError {
             status: StatusCode::BAD_GATEWAY,
             error_type: "api_error",
@@ -896,6 +924,25 @@ fn create_sse_stream(
 
 use super::converter::get_context_window_size;
 
+/// 非流式工具参数 JSON 非法且修复层也修不好时:置 INVALID_TOOL_INPUT 失败态(收尾返回非 200)。
+/// 幂等:只在首个失败落定。绝不静默吞成空参(空参会被客户端当"无参成功调用"执行,更危险)。
+fn mark_invalid_tool_input(
+    completion: &mut CompletionStatus,
+    tool_use_id: &str,
+    err: &serde_json::Error,
+) {
+    tracing::warn!(
+        "工具输入 JSON 解析失败: {}, tool_use_id: {}（修复层也修不好,返回错误不静默空参）",
+        err, tool_use_id
+    );
+    if completion.is_ok() {
+        *completion = CompletionStatus::UpstreamError {
+            code: "INVALID_TOOL_INPUT".to_string(),
+            message: format!("工具参数 JSON 非法（tool_use_id={}）: {}", tool_use_id, err),
+        };
+    }
+}
+
 /// 处理非流式请求
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
@@ -979,32 +1026,67 @@ async fn handle_non_stream_request(
 
                             // 如果是完整的工具调用，添加到列表
                             if tool_use.stop {
-                                let input: serde_json::Value = if buffer.is_empty() {
+                                let mut input: serde_json::Value = if buffer.is_empty() {
                                     serde_json::json!({})
                                 } else {
                                     match serde_json::from_str(buffer) {
                                         Ok(v) => v,
                                         Err(e) => {
-                                            // 拼装后仍非法：置失败态，收尾(下方 `if !completion.is_ok()`)
-                                            // 返回非 200，绝不静默吞成空参数——空参会让客户端把失败的
-                                            // 工具调用当成"无参数成功调用"执行，比报错更危险。
-                                            tracing::warn!(
-                                                "工具输入 JSON 解析失败: {}, tool_use_id: {}（返回错误,不静默空参）",
-                                                e, tool_use.tool_use_id
-                                            );
-                                            if completion.is_ok() {
-                                                completion = CompletionStatus::UpstreamError {
-                                                    code: "INVALID_TOOL_INPUT".to_string(),
-                                                    message: format!(
-                                                        "工具参数 JSON 非法（tool_use_id={}）: {}",
-                                                        tool_use.tool_use_id, e
-                                                    ),
-                                                };
+                                            // 与流式路径同源修复(洞3 对齐):非流式此前**从不**调修复层,
+                                            // 流式已 repair 的坏 JSON(非法转义/裸控制符/截断)在非流式白瞎。
+                                            // 先尝试 repair_tool_json,复验通过则用修复结果、不置失败态。
+                                            if super::handlers::tool_repair_json_enabled() {
+                                                if let Some(fixed) = super::stream::repair_tool_json(buffer) {
+                                                    if let Ok(v) = serde_json::from_str(&fixed) {
+                                                        tracing::info!(
+                                                            "非流式工具 JSON 已修复为合法(tool_use_id={})",
+                                                            tool_use.tool_use_id
+                                                        );
+                                                        v
+                                                    } else {
+                                                        // 理论不可达(repair 内部已复验),兜底走失败态。
+                                                        mark_invalid_tool_input(
+                                                            &mut completion, &tool_use.tool_use_id, &e,
+                                                        );
+                                                        serde_json::json!({})
+                                                    }
+                                                } else {
+                                                    // 修不好：置失败态，收尾(下方 `if !completion.is_ok()`)
+                                                    // 返回非 200，绝不静默吞成空参数——空参会让客户端把失败的
+                                                    // 工具调用当成"无参数成功调用"执行，比报错更危险。
+                                                    mark_invalid_tool_input(
+                                                        &mut completion, &tool_use.tool_use_id, &e,
+                                                    );
+                                                    serde_json::json!({})
+                                                }
+                                            } else {
+                                                mark_invalid_tool_input(
+                                                    &mut completion, &tool_use.tool_use_id, &e,
+                                                );
+                                                serde_json::json!({})
                                             }
-                                            serde_json::json!({})
                                         }
                                     }
                                 };
+
+                                // 洞1:整包双重编码解包(非流式,与流式 flush_tool_input 同源)。
+                                // input 若是被再套一层字符串编码的 object/array(顶层解出 String,
+                                // 内层可 parse 成 object/array),解一层还原;只解一层、标量不动。
+                                if super::handlers::tool_repair_json_enabled() {
+                                    if let Some(inner) = input.as_str() {
+                                        if let Ok(reparsed) =
+                                            serde_json::from_str::<serde_json::Value>(inner)
+                                        {
+                                            if reparsed.is_object() || reparsed.is_array() {
+                                                tracing::info!(
+                                                    "非流式工具参数双重编码,已解一层(tool_use_id={})",
+                                                    tool_use.tool_use_id
+                                                );
+                                                input = reparsed;
+                                            }
+                                        }
+                                    }
+                                }
 
                                 let original_name = tool_name_map
                                     .get(&tool_use.name)
@@ -1687,6 +1769,7 @@ mod error_translation_tests {
 
     #[test]
     fn test_translate_network_timeout() {
+        // 纯 reqwest 超时(无 HTTP 状态码语境)。
         let t = translate_upstream_error("operation timed out").unwrap();
         assert_eq!(t.status, StatusCode::GATEWAY_TIMEOUT);
         assert!(t.message.contains("超时"));
@@ -1694,13 +1777,18 @@ mod error_translation_tests {
 
     #[test]
     fn test_translate_tls() {
-        let t = translate_upstream_error("invalid certificate: SSL handshake failed").unwrap();
+        // 真实 reqwest TLS 错误在建连阶段,Display 带 "error trying to connect" 传输标志。
+        let t = translate_upstream_error(
+            "error trying to connect: invalid certificate: SSL handshake failed",
+        )
+        .unwrap();
         assert!(t.message.contains("TLS") || t.message.contains("证书"));
     }
 
     #[test]
     fn test_translate_proxy() {
-        let t = translate_upstream_error("proxy CONNECT failed").unwrap();
+        // 真实 reqwest 代理错误同样在建连阶段包裹。
+        let t = translate_upstream_error("error trying to connect: proxy CONNECT failed").unwrap();
         assert!(t.message.contains("代理"));
     }
 
@@ -1708,6 +1796,21 @@ mod error_translation_tests {
     fn test_translate_unknown_returns_none() {
         // 未知错误必须返回 None（调用方诚实透传原文，不臆造排障步骤）。
         assert!(translate_upstream_error("some totally unrecognized upstream gibberish").is_none());
+    }
+
+    /// review high 回归:上游 HTTP 错误**响应体**里恰好含 timeout/tls/proxy/resolve 字样时,
+    /// **绝不**被误判成网络故障(它不是传输层错误,无 "error sending request" 等标志)。
+    #[test]
+    fn test_translate_network_no_false_positive_on_upstream_body() {
+        // 模拟 provider 格式化的上游错误串(含 HTTP 状态码 + body,body 里有 "timeout"/"proxy" 字样)。
+        let upstream_body =
+            "流式 API 请求失败: 400 {\"message\":\"your request proxy timeout config is invalid, tls off\"}";
+        // is_transport_error 应判 false → translate_network 返回 None → 整体不误翻译。
+        assert!(!is_transport_error(&upstream_body.to_lowercase()));
+        assert!(
+            translate_network(upstream_body).is_none(),
+            "上游 body 含 timeout/proxy/tls 字样不应被误判成网络故障"
+        );
     }
 }
 

@@ -363,6 +363,7 @@ pub async fn probe_regions(
                 "usable": c.usable,
                 "subscriptionTitle": c.subscription_title,
                 "reason": c.reason,
+                "current": c.current,
             })).collect::<Vec<_>>(),
         }))
         .into_response(),
