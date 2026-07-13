@@ -2,6 +2,38 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.12] - 2026-07-13
+
+### 上号统一治理（根治 region/ARN 反复修补）
+- **region 三表归拢单一真相源**（新建 `src/kiro/regions.rs`）：此前 region 表散落三处（对话白名单 /
+  profile 探测 / OIDC 探测），加一种认证源就各自新增或漏改 → 反复修补。现按**用途维度**归拢到一处并
+  分层命名：`KIRO_DIALOG_REGIONS`（对话/profileArn 白名单）、`OIDC_PROBE_REGIONS`（SSO-OIDC 探测，
+  16→25 补全）、`PROFILE_PROBE_REGIONS`（profile 探测，2→6 补全）。三者维度不同**不合并**，原三处
+  const 改 re-export，调用点零改动。
+- **`add_credential` 收口铁律**：任何号进池那一刻强制 `sync_region_from_arn`——无论来自哪条上号路径
+  （external_idp / idc / social）、建号前 region 填得对不对，进池即 region↔ARN 自洽，杜绝错配 →
+  400 Improperly formed。无 profileArn 的号（api_key/custom_api）是安全 no-op。
+
+### IdC 登录自动探测 region（防呆）
+- IdC start URL（`d-xxxxxxxxxx.awsapps.com`）是全局域名、**不含 region**，用户填错 →
+  device_authorization 400 invalid_request。新增 `register_and_authorize_probing`：按「用户填的 region
+  打头 + 候选表」顺次试，**第一个 device_authorization 成功的 region 即实例所在 region**，探到即用并
+  贯穿 poll/建号/token 刷新。全不成才报可读中文错误（引导查 IAM Identity Center 设置），不再裸抛 400。
+  走 AWS 公开 OIDC 端点，与号池无关不烧号。
+
+### Invalid tool parameters 工具容错 5 缺陷修复（完整性核实查出）
+- **缺陷1（默认配置即中·时序）**：无 stop 残留截断时，收尾先查 completion 决定补 error、后跑
+  `generate_final_events`（残留 flush 才置失败态）→ error 事件漏发，客户端把 `input:{}` 的 tool 块当
+  成功。修：收尾**先** flush、**后**据 completion 补 error（/v1 与 /cc/v1 两路径同修）。
+- **缺陷2/3（②③开关拆开即漏）**：「②开③关」记账失败却发坏 JSON；「②关③开」吞坏 JSON 记成功。
+  修：把「不发坏 JSON」的判据从③开关本身改为**失败态已置**（`!completion.is_ok()`），与失败态绑定，
+  消除所有拆开组合的矛盾。
+- **缺陷4/5（清洗）**：泄漏 token 清单补 `court`（实测最高频，独占行 202 次）/`card`/`call`，删死条目
+  `coursecount`；判据**收严**为「仅 CJK/全角粘连才剥」（此前「非空格非小写即剥」会误删 `count: 42` /
+  `countDown()` / `courseCatalog` 等正常英文）；`court`/`課`/`课` 独占整行特例（高置信泄漏）。
+- **P2-1（unwrap 解耦）**：`unwrap_double_encoded`（双重编码解包）从 `tool_repair_json` 开关摘出、
+  独立恒开——它不改语义、对合法输入 no-op，此前被绑在 repair 开关下，用户关 repair 排查时会连带关掉它。
+
 ## [0.7.11] - 2026-07-13
 
 ### 文档与注释(无逻辑改动)

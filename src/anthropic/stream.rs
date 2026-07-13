@@ -1177,11 +1177,27 @@ impl StreamContext {
     }
 
     /// 处理助手响应事件
-    /// 已知的模型泄漏控制/规划 token（会以行首粘连形式漏进输出文本）。可扩展。
-    /// 判据极保守：仅当这些词出现在**行首**、且**紧跟非空格且跨字符类**（后接 CJK / 全角标点 /
-    /// 冒号）时才视为泄漏并剥离——正常英文用法（`count the items`、`care about`，词后有空格）绝不命中。
+    /// 已知的模型泄漏控制/规划 token（#70544 高多字节密度紧邻工具标签时,模型把内部规划 token
+    /// 当可见文本吐出,以行首粘连形式漏进输出）。真实日志实测最高频是 `court`(独占整行 202 次),
+    /// 及 course/count/care/card/call 粘 CJK。**注意:此现象发生在 Claude/opus 侧,故清洗必须对
+    /// Claude 生效**(不能像 DSML 那样门控排除 Claude,否则正好漏掉主战场)。
+    /// 删除死条目 `coursecount`(被 `course` 前缀遮蔽,strip_prefix 顺序遍历永不可达)。
     const LEAKED_CONTROL_TOKENS: &'static [&'static str] =
-        &["course", "count", "care", "課", "课", "coursecount"];
+        &["court", "course", "count", "care", "card", "call", "課", "课"];
+
+    /// 判断字符是否为「泄漏粘连」信号:CJK 表意文字 或 全角标点/字符(U+3000..U+303F、U+FF00..U+FFEF、
+    /// U+4E00..U+9FFF 等)。**收严关键**:此前用「非空格非小写即剥」过宽,把 `count: 42`(冒号)、
+    /// `countDown()`(大写)、`care2share`(数字)这类**正常英文**行首误删。现在只认 CJK/全角——
+    /// 正常英文的 ASCII 冒号/数字/大写字母一律不触发,杜绝对 Claude 正文的误删。
+    fn is_leak_glue_char(c: char) -> bool {
+        let u = c as u32;
+        // CJK 统一表意 + 扩展A + 兼容 + 全角/半角形式 + CJK 标点。
+        (0x4E00..=0x9FFF).contains(&u)      // CJK 统一表意
+            || (0x3400..=0x4DBF).contains(&u) // CJK 扩展 A
+            || (0x3000..=0x303F).contains(&u) // CJK 标点(、。「」等)
+            || (0xFF00..=0xFFEF).contains(&u) // 全角 ASCII + 全角标点(：！？，等)
+            || (0x2E80..=0x2EFF).contains(&u) // CJK 部首补充
+    }
 
     /// 保守清洗行首泄漏的控制 token（`tool_clean_leaked_tokens` 开启时）。
     ///
@@ -1207,21 +1223,32 @@ impl StreamContext {
         out
     }
 
+    /// 独占整行即视为泄漏的高置信 token:这几个词在正常英文里**极少独占一整行**,
+    /// 但在 #70544 泄漏里恰恰大量独占行(court 实测 202 次全独占行)。仅这几个可"整行即剥",
+    /// call/card/count/care/course 独占行可能是正常内容(标题/变量/列表),**不**享此特例。
+    const LEAK_STANDALONE_TOKENS: &'static [&'static str] = &["court", "課", "课"];
+
     /// 剥掉单行行首的一个泄漏词（若命中粘连特征）。非命中原样返回。
     fn strip_leaked_prefix(line: &str) -> String {
+        // 先处理"独占整行"特例:整行(去掉行尾 \n / 空白后)恰等于某高置信 token → 泄漏,整行剥空。
+        let trimmed = line.trim_end_matches(['\n', '\r', ' ', '\t']);
+        for &tok in Self::LEAK_STANDALONE_TOKENS {
+            if trimmed == tok {
+                // 保留行尾换行(维持行结构),只把词本身剥掉。
+                return line[tok.len()..].to_string();
+            }
+        }
         for &tok in Self::LEAKED_CONTROL_TOKENS {
             if let Some(rest) = line.strip_prefix(tok) {
-                // 判定粘连：rest 的首字符必须是"跨类粘连"信号，才算泄漏。
+                // 判定粘连：rest 的首字符必须是 **CJK / 全角** 粘连信号,才算泄漏(收严:
+                // 排除 ASCII 冒号/数字/大写等——那些是正常英文,误删 count:42 / countDown())。
                 match rest.chars().next() {
-                    // 行尾就是这个词（后面啥也没有）→ 不确定，不剥（保守）。
-                    None => return line.to_string(),
+                    None => return line.to_string(), // 行尾就是这个词(非独占特例词)→ 保守不剥。
                     Some(c) => {
-                        // 空格/普通 ASCII 小写字母 → 正常英文延续（count the / counter），不剥。
-                        if c.is_whitespace() || c.is_ascii_lowercase() {
-                            return line.to_string();
+                        if Self::is_leak_glue_char(c) {
+                            return rest.to_string(); // CJK/全角粘连 → 判泄漏剥掉。
                         }
-                        // 跨类粘连：CJK、全角标点、冒号、数字、大写字母等 → 判泄漏，剥掉该词。
-                        return rest.to_string();
+                        return line.to_string(); // 其余(空格/ASCII/数字/大写/标点)→ 正常英文,不剥。
                     }
                 }
             }
@@ -1738,22 +1765,35 @@ impl StreamContext {
                     message: "工具调用参数非合法 JSON（模型侧生成异常）".to_string(),
                 };
             }
-            // 缓解③：如实暴露错误（开关默认关）。开启时**不发**这条坏 partial_json（避免客户端拿坏 JSON
-            // parse 报 Invalid tool parameters），改由收尾兜底补发明确的 SSE error 让客户端退避重试。
-            // 关闭时保持现状：原样发出交客户端处置（绝不静默吞成空参——空参会被当"无参成功调用"，更危险）。
-            if super::handlers::tool_expose_error_to_client_enabled() {
+            // 缓解③：如实暴露错误。**不发坏 JSON 的判据绑定"失败态已置"（completion.is_err），
+            // 而非③开关本身**——消除②③拆开的两个矛盾组合（验证报告缺陷2/3）：
+            //   ·②开③关(旧):置了失败态却 fall-through 发坏 JSON → 记账失败却发坏 JSON,自相矛盾;
+            //   ·②关③开(旧):completion 仍 Ok 却 return 吞掉 → 记成功但客户端拿 input:{} 当成功执行(更危险)。
+            // 新语义:只要②或⑤已置失败态(completion.is_err)→ 一律不发坏 partial_json(收尾据失败态补 SSE
+            // error);completion 仍 Ok(②③都关)→ 保持现状原样发出交客户端(绝不静默吞成空参)。
+            // ③开关现语义 = 是否额外"主动置失败态并暴露"(见下),与"不发坏 JSON"由失败态统一裁决解耦。
+            if super::handlers::tool_expose_error_to_client_enabled() && self.completion.is_ok() {
+                // ③开但②没置态(如②关):③自己置失败态,保证"暴露错误"语义成立(不发坏 JSON + 收尾补 error)。
+                self.completion = CompletionStatus::UpstreamError {
+                    code: "INVALID_TOOL_INPUT".to_string(),
+                    message: "工具调用参数非合法 JSON（模型侧生成异常）".to_string(),
+                };
+            }
+            // 统一出口:失败态已置(②/③/⑤任一)→ 不发坏 JSON。这一条兜住所有开关组合的自洽。
+            if !self.completion.is_ok() {
                 return Vec::new();
             }
             } // end if !repaired_ok(修复成功则跳过②/③/⑤)
         }
         // 洞1:整包双重编码解包。走到这里 assembled 已是合法 JSON(原本合法 / 修复后)。若它其实是
         // 「被再套一层字符串编码的 object/array」,解一层还原成客户端能按 object 消费的形态,消灭
-        // 一类漏过 repair 层的 InputValidationError。只在 tool_repair_json 开启时启用(同属修复族)。
-        if super::handlers::tool_repair_json_enabled() {
-            if let Some(unwrapped) = unwrap_double_encoded(&assembled) {
-                tracing::info!(block_index, "tool_use 参数为双重编码,已解一层还原为 object/array");
-                assembled = unwrapped;
-            }
+        // 一类漏过 repair 层的 InputValidationError。
+        // 【P2-1 解耦】此前裹在 tool_repair_json 开关下,导致用户为排查关掉 repair 时连带关掉解包——
+        // 而解包不改语义(只剥误加的一层字符串编码)、对合法 object/array 是安全 no-op(as_str 返回
+        // None 即不动),与"修坏 JSON"是正交能力,应独立恒开。故移出开关无条件跑。
+        if let Some(unwrapped) = unwrap_double_encoded(&assembled) {
+            tracing::info!(block_index, "tool_use 参数为双重编码,已解一层还原为 object/array");
+            assembled = unwrapped;
         }
         self.state_manager
             .handle_content_block_delta(
@@ -4155,20 +4195,37 @@ mod tests {
         );
     }
 
-    /// 泄漏 token 清洗（保守高信号）：行首泄漏词直贴 CJK/标点粘连 → 剥离；正常英文用法 → 不误删。
+    /// 泄漏 token 清洗（收严高信号）：行首泄漏词直贴 **CJK/全角** 粘连 → 剥离；正常英文用法（含
+    /// ASCII 冒号/数字/大写）→ 绝不误删。court/課/课 独占整行 → 剥（高置信 #70544 泄漏）。
     #[test]
     fn test_strip_leaked_prefix() {
+        // CJK/全角粘连 → 剥离。
         assert_eq!(StreamContext::strip_leaked_prefix("course重读文件"), "重读文件");
         assert_eq!(StreamContext::strip_leaked_prefix("課我加的是"), "我加的是");
-        assert_eq!(StreamContext::strip_leaked_prefix("care：我把"), "：我把");
+        assert_eq!(StreamContext::strip_leaked_prefix("care：我把"), "：我把"); // 全角冒号
         assert_eq!(StreamContext::strip_leaked_prefix("count你好"), "你好");
-        // 不命中（正常英文）：词后空格 / 小写延续 → 原样保留，绝不误删。
+        assert_eq!(StreamContext::strip_leaked_prefix("court重读"), "重读"); // 新增 court
+        assert_eq!(StreamContext::strip_leaked_prefix("card表格"), "表格"); // 新增 card
+        assert_eq!(StreamContext::strip_leaked_prefix("call调用"), "调用"); // 新增 call
+        // court/課/课 独占整行 → 剥空(保留换行)。
+        assert_eq!(StreamContext::strip_leaked_prefix("court\n"), "\n");
+        assert_eq!(StreamContext::strip_leaked_prefix("court"), "");
+        assert_eq!(StreamContext::strip_leaked_prefix("課\n"), "\n");
+        // 【收严关键】正常英文含 ASCII 冒号/数字/大写 → 绝不误删(旧逻辑会误剥)。
+        assert_eq!(StreamContext::strip_leaked_prefix("count: 42"), "count: 42"); // 半角冒号
+        assert_eq!(StreamContext::strip_leaked_prefix("countDown()"), "countDown()"); // 大写
+        assert_eq!(StreamContext::strip_leaked_prefix("care2share"), "care2share"); // 数字
+        assert_eq!(StreamContext::strip_leaked_prefix("courseCatalog"), "courseCatalog"); // 大写
+        assert_eq!(StreamContext::strip_leaked_prefix("card#1"), "card#1"); // ASCII 标点
+        // 正常英文：词后空格 / 小写延续 → 原样保留。
         assert_eq!(StreamContext::strip_leaked_prefix("count the items"), "count the items");
         assert_eq!(StreamContext::strip_leaked_prefix("counter offer"), "counter offer");
         assert_eq!(StreamContext::strip_leaked_prefix("careful now"), "careful now");
-        assert_eq!(StreamContext::strip_leaked_prefix("course of action"), "course of action");
-        // 词单独成行尾（后无内容）→ 不确定，保守不剥。
+        assert_eq!(StreamContext::strip_leaked_prefix("call me"), "call me");
+        // call/card/count/care/course 独占整行 → **不**享特例(可能是正常内容),保守不剥。
         assert_eq!(StreamContext::strip_leaked_prefix("count"), "count");
+        assert_eq!(StreamContext::strip_leaked_prefix("card"), "card");
+        assert_eq!(StreamContext::strip_leaked_prefix("call"), "call");
         // 非泄漏词开头 → 原样。
         assert_eq!(StreamContext::strip_leaked_prefix("hello世界"), "hello世界");
     }

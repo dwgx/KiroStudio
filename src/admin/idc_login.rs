@@ -88,17 +88,11 @@ impl IdcLoginManager {
         });
         let proxy = custom_proxy.clone().or(global_proxy);
 
-        let oidc_client =
-            idc::register_client(region, &config, proxy.as_ref()).await?;
-
-        let device_auth = idc::start_device_authorization(
-            region,
-            &oidc_client,
-            start_url,
-            &config,
-            proxy.as_ref(),
-        )
-        .await?;
+        // 自动探测 region（防呆）：IdC start URL 不含 region,用户填错会 400。探测函数按
+        // 「用户填的 region 打头 + 候选表」顺次试,返回真正命中的 region + 其 OidcClient + DeviceAuth。
+        // resolved_region 后续贯穿 poll/建号/oidc 刷新,保证一致。
+        let (resolved_region, oidc_client, device_auth) =
+            idc::register_and_authorize_probing(region, start_url, &config, proxy.as_ref()).await?;
 
         let session_id = uuid::Uuid::new_v4().to_string();
         let result = IdcStartResult {
@@ -110,7 +104,7 @@ impl IdcLoginManager {
         };
 
         let session = Arc::new(IdcSession {
-            region: region.to_string(),
+            region: resolved_region,
             oidc_client,
             device_auth,
             priority,

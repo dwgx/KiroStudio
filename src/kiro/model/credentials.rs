@@ -12,23 +12,9 @@ use crate::model::config::Config;
 
 /// 已知的 AWS/Kiro region 白名单,用于严格校验 profileArn 里解析出的 region
 /// (防污染 ARN 拼出坏 host)。含标准分区 + GovCloud + 中国分区。
-/// 参考 kiro-account-manager 的 SUPPORTED_KIRO_REGIONS。
-const SUPPORTED_KIRO_REGIONS: &[&str] = &[
-    "us-east-1", "us-east-2", "us-west-1", "us-west-2",
-    "ca-central-1", "ca-west-1",
-    "eu-west-1", "eu-west-2", "eu-west-3", "eu-central-1", "eu-central-2",
-    "eu-north-1", "eu-south-1", "eu-south-2",
-    "ap-south-1", "ap-south-2",
-    "ap-southeast-1", "ap-southeast-2", "ap-southeast-3", "ap-southeast-4",
-    "ap-northeast-1", "ap-northeast-2", "ap-northeast-3",
-    "ap-east-1",
-    "sa-east-1",
-    "me-south-1", "me-central-1",
-    "af-south-1",
-    "il-central-1",
-    "us-gov-east-1", "us-gov-west-1",
-    "cn-north-1", "cn-northwest-1",
-];
+/// Kiro 对话/余额端点 + profileArn 的合法 region 白名单。
+/// 单一真相源见 [`crate::kiro::regions::KIRO_DIALOG_REGIONS`]（此处 re-export，调用点不变）。
+use crate::kiro::regions::KIRO_DIALOG_REGIONS as SUPPORTED_KIRO_REGIONS;
 
 /// Kiro OAuth 凭证
 ///

@@ -890,8 +890,13 @@ fn create_sse_stream(
                         }
                         None => {
                             // 流结束，发送最终事件。
-                            // 兜底：若本次完成状态为失败（in-band 错误/解码器停止）但尚未发过 error 事件，
-                            // 在收尾处补发，确保客户端不把截断输出当成功。
+                            // 【缺陷1 时序修复】必须**先** generate_final_events(它内部会 flush 未收到 stop 的
+                            // 残留 tool 缓冲,那步才可能把 completion 置失败态),**再**据 completion 补发 error。
+                            // 旧序(先查 completion 再 flush)在"无 stop 残留截断"场景漏发 error → 客户端拿
+                            // input:{} 的 tool 块 + 正常 message_stop 误判成功(服务端却记失败)。默认②③开也中。
+                            // 现在残留 flush 的 ③ 逻辑在置失败态时已返回空(不发坏 JSON),故 final 里无坏 delta,
+                            // 把 error 事件**插到最前**(在收尾 message_delta/message_stop 之前)符合 SSE 语义。
+                            let tail = ctx.generate_final_events();
                             let mut final_events = Vec::new();
                             if !ctx.completion().is_ok() && !ctx.error_event_emitted() {
                                 final_events.push(SseEvent::error_event(
@@ -900,7 +905,7 @@ fn create_sse_stream(
                                 ));
                                 ctx.mark_error_event_emitted();
                             }
-                            final_events.extend(ctx.generate_final_events());
+                            final_events.extend(tail);
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -1074,18 +1079,18 @@ async fn handle_non_stream_request(
                                 // 洞1:整包双重编码解包(非流式,与流式 flush_tool_input 同源)。
                                 // input 若是被再套一层字符串编码的 object/array(顶层解出 String,
                                 // 内层可 parse 成 object/array),解一层还原;只解一层、标量不动。
-                                if super::handlers::tool_repair_json_enabled() {
-                                    if let Some(inner) = input.as_str() {
-                                        if let Ok(reparsed) =
-                                            serde_json::from_str::<serde_json::Value>(inner)
-                                        {
-                                            if reparsed.is_object() || reparsed.is_array() {
-                                                tracing::info!(
-                                                    "非流式工具参数双重编码,已解一层(tool_use_id={})",
-                                                    tool_use.tool_use_id
-                                                );
-                                                input = reparsed;
-                                            }
+                                // 【P2-1 解耦】移出 tool_repair_json 开关:解包不改语义、对非 String 顶层
+                                // 是 no-op,与流式路径一致独立恒开(关 repair 不应连带关它)。
+                                if let Some(inner) = input.as_str() {
+                                    if let Ok(reparsed) =
+                                        serde_json::from_str::<serde_json::Value>(inner)
+                                    {
+                                        if reparsed.is_object() || reparsed.is_array() {
+                                            tracing::info!(
+                                                "非流式工具参数双重编码,已解一层(tool_use_id={})",
+                                                tool_use.tool_use_id
+                                            );
+                                            input = reparsed;
                                         }
                                     }
                                 }
@@ -1663,8 +1668,11 @@ fn create_buffered_sse_stream(
                             }
                             None => {
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）。
-                                // 兜底：完成状态为失败（in-band 错误/解码器停止）但尚未发过 error 事件时，
-                                // 在收尾处补发一个 error 事件，确保客户端不把截断输出当成功。
+                                // 【缺陷1 时序修复·/cc/v1 同构】finish_and_get_all_events 内部调
+                                // generate_final_events（含残留 tool flush，那步才置失败态）。必须**先**跑它,
+                                // **再**据 completion 补 error,否则无 stop 残留截断场景漏发 error（客户端误判成功）。
+                                // 残留 flush 的 ③ 逻辑置失败态时已返回空(不发坏 JSON),error 插到最前符合 SSE 语义。
+                                let tail = ctx.finish_and_get_all_events();
                                 let mut all_events = Vec::new();
                                 if !ctx.completion().is_ok() && !ctx.error_event_emitted() {
                                     all_events.push(SseEvent::error_event(
@@ -1673,7 +1681,7 @@ fn create_buffered_sse_stream(
                                     ));
                                     ctx.mark_error_event_emitted();
                                 }
-                                all_events.extend(ctx.finish_and_get_all_events());
+                                all_events.extend(tail);
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
