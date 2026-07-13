@@ -17,6 +17,15 @@ use super::{KiroEndpoint, RequestContext};
 /// Kiro IDE 端点名称
 pub const IDE_ENDPOINT_NAME: &str = "ide";
 
+/// Anthropic 1M 上下文窗口的 beta 特性标识(官方 `context-1m-2025-08-07`)。
+const BETA_1M: &str = "context-1m-2025-08-07";
+
+/// 纯函数:据 is_1m 决定要不要注入 1M beta 头。抽出便于单测(decorate_api 返回 RequestBuilder
+/// 不便直接断言 header)。is_1m=true → Some(beta 值);否则 None(不注入)。
+fn beta_header_for_1m(is_1m: bool) -> Option<&'static str> {
+    if is_1m { Some(BETA_1M) } else { None }
+}
+
 /// Kiro IDE 端点
 pub struct IdeEndpoint;
 
@@ -91,6 +100,12 @@ impl KiroEndpoint for IdeEndpoint {
         } else if ctx.credentials.is_external_idp_credential() {
             req = req.header("tokentype", "EXTERNAL_IDP");
         }
+        // 1M 上下文变体:注入 anthropic-beta 头,上游(若为 Anthropic 直连/透传)才会放开 1M 窗口。
+        // Kiro 路径从零构造请求(不转发客户端原始 header),故此处不会与已有 anthropic-beta 重复。
+        // 诚实边界见 model_catalog::ModelSpec::supports_1m 注释:上游是否真识别待旁挂验证。
+        if let Some(beta) = beta_header_for_1m(ctx.is_1m) {
+            req = req.header("anthropic-beta", beta);
+        }
         req
     }
 
@@ -137,8 +152,15 @@ fn inject_profile_arn(request_body: &str, profile_arn: &Option<String>) -> Strin
 
 #[cfg(test)]
 mod tests {
-    use super::inject_profile_arn;
+    use super::{beta_header_for_1m, inject_profile_arn, BETA_1M};
     use serde_json::Value;
+
+    #[test]
+    fn test_beta_header_for_1m() {
+        assert_eq!(beta_header_for_1m(true), Some(BETA_1M));
+        assert_eq!(beta_header_for_1m(true), Some("context-1m-2025-08-07"));
+        assert_eq!(beta_header_for_1m(false), None);
+    }
 
     #[test]
     fn test_inject_profile_arn_with_some() {

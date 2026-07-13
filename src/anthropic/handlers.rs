@@ -432,11 +432,11 @@ pub async fn get_models() -> impl IntoResponse {
 
     // 从声明式模型目录(单一真相源)派生 /v1/models，消除「广告清单 vs map_model 映射」漂移。
     // 只吐 advertised=true 的模型;thinking 变体作别名不单列。created 为 OpenAI 兼容占位字段。
+    // supports_1m 的模型额外广告一条 `<id>[1m]` 变体,供只能传纯模型名的客户端选 1M 上下文。
     const ADVERTISED_CREATED: i64 = 1_759_104_000;
-    let models: Vec<Model> = crate::anthropic::model_catalog::CATALOG
-        .iter()
-        .filter(|s| s.advertised)
-        .map(|s| Model {
+    let mut models: Vec<Model> = Vec::new();
+    for s in crate::anthropic::model_catalog::CATALOG.iter().filter(|s| s.advertised) {
+        models.push(Model {
             id: s.advertised_id().to_string(),
             object: "model".to_string(),
             created: ADVERTISED_CREATED,
@@ -444,8 +444,19 @@ pub async fn get_models() -> impl IntoResponse {
             display_name: s.display_name.to_string(),
             model_type: "chat".to_string(),
             max_tokens: s.max_output,
-        })
-        .collect();
+        });
+        if s.supports_1m {
+            models.push(Model {
+                id: format!("{}[1m]", s.advertised_id()),
+                object: "model".to_string(),
+                created: ADVERTISED_CREATED,
+                owned_by: s.owned_by.to_string(),
+                display_name: format!("{} (1M)", s.display_name),
+                model_type: "chat".to_string(),
+                max_tokens: s.max_output,
+            });
+        }
+    }
 
     Json(ModelsResponse {
         object: "list".to_string(),
@@ -662,8 +673,10 @@ async fn handle_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
     client: ClientInfo,
 ) -> Response {
+    // 1M 变体:据原始模型名判定是否注入 anthropic-beta 头(仅受支持的 [1m] 变体为 true)。
+    let is_1m = crate::anthropic::model_catalog::resolve_is_1m(model);
     // 调用 Kiro API（支持多凭据故障转移）
-    let (response, meta) = match provider.call_api_stream(request_body).await {
+    let (response, meta) = match provider.call_api_stream(request_body, is_1m).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -893,8 +906,10 @@ async fn handle_non_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
     client: ClientInfo,
 ) -> Response {
+    // 1M 变体:据原始模型名判定是否注入 anthropic-beta 头(仅受支持的 [1m] 变体为 true)。
+    let is_1m = crate::anthropic::model_catalog::resolve_is_1m(model);
     // 调用 Kiro API（支持多凭据故障转移）
-    let (response, meta) = match provider.call_api(request_body).await {
+    let (response, meta) = match provider.call_api(request_body, is_1m).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -1422,8 +1437,10 @@ async fn handle_stream_request_buffered(
     tool_name_map: std::collections::HashMap<String, String>,
     client: ClientInfo,
 ) -> Response {
+    // 1M 变体:据原始模型名判定是否注入 anthropic-beta 头(仅受支持的 [1m] 变体为 true)。
+    let is_1m = crate::anthropic::model_catalog::resolve_is_1m(model);
     // 调用 Kiro API（支持多凭据故障转移）
-    let (response, meta) = match provider.call_api_stream(request_body).await {
+    let (response, meta) = match provider.call_api_stream(request_body, is_1m).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };

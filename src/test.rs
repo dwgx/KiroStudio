@@ -46,8 +46,8 @@ pub(crate) async fn call_stream_api() -> anyhow::Result<()> {
     println!("\n开始调用流式 API...\n");
     println!("{}", "=".repeat(60));
 
-    // 调用流式 API
-    let (response, _meta) = provider.call_api_stream(&request_body).await?;
+    // 调用流式 API（测试工具:不测 1M,传 false）
+    let (response, _meta) = provider.call_api_stream(&request_body, false).await?;
 
     // 获取字节流
     let mut stream = response.bytes_stream();

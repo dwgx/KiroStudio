@@ -204,16 +204,18 @@ impl KiroProvider {
     pub async fn call_api(
         &self,
         request_body: &str,
+        is_1m: bool,
     ) -> anyhow::Result<(reqwest::Response, CallMeta)> {
-        self.call_api_with_retry(request_body, false).await
+        self.call_api_with_retry(request_body, false, is_1m).await
     }
 
     /// 发送流式 API 请求
     pub async fn call_api_stream(
         &self,
         request_body: &str,
+        is_1m: bool,
     ) -> anyhow::Result<(reqwest::Response, CallMeta)> {
-        self.call_api_with_retry(request_body, true).await
+        self.call_api_with_retry(request_body, true, is_1m).await
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -361,6 +363,8 @@ impl KiroProvider {
                 token: &ctx.token,
                 machine_id: &machine_id,
                 config: &config,
+                // MCP(WebSearch 等)不涉及模型对话上下文,无 1M 语义。
+                is_1m: false,
             };
 
             let url = endpoint.mcp_url(&rctx);
@@ -482,6 +486,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         is_stream: bool,
+        is_1m: bool,
     ) -> anyhow::Result<(reqwest::Response, CallMeta)> {
         let total_credentials = self.token_manager.total_count();
         let max_retries =
@@ -557,6 +562,7 @@ impl KiroProvider {
                 token: &ctx.token,
                 machine_id: &machine_id,
                 config: &config,
+                is_1m,
             };
 
             let url = endpoint.api_url(&rctx);
