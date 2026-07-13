@@ -1689,26 +1689,20 @@ impl StreamContext {
                         repaired_len = repaired.len(),
                         "tool_use 非法 JSON 已修复为合法 JSON（Invalid tool parameters 根治）"
                     );
+                    // 修复成功:assembled 已合法。**不 early-return**——fall through 到函数尾的统一
+                    // 出口(unwrap_double_encoded + 发送),否则 repair 结果恰好是双重编码串时会跳过
+                    // 洞1 解包(review confirmed:如 \U 被修成字面后整体成 Value::String)。两条路径
+                    // (原本合法 / 修复后)从此经同一 unwrap + 发送出口,消除路径不一致。
                     assembled = repaired;
-                    // 修复成功 → 走正常发送（下方），不进入缓解②/③。
-                    return self
-                        .state_manager
-                        .handle_content_block_delta(
-                            block_index,
-                            json!({
-                                "type": "content_block_delta",
-                                "index": block_index,
-                                "delta": {
-                                    "type": "input_json_delta",
-                                    "partial_json": assembled
-                                }
-                            }),
-                        )
-                        .into_iter()
-                        .collect();
+                    // 修复成功 → 跳过下方缓解②/③/⑤(那些是给"修不好"的),直接走统一出口。
+                    // 用标签跳出 is_err 块:此处 break 掉外层 if is_err 的剩余分支。
                 }
                 // 修不好 → 落入下方缓解②/③/⑤（与不开修复层等价，最坏情况不劣化）。
             }
+            // 若 repair 已把 assembled 修成合法,则跳过缓解②/③/⑤(它们只服务"仍非法"的残留)。
+            let repaired_ok =
+                serde_json::from_str::<serde_json::Value>(&assembled).is_ok();
+            if !repaired_ok {
             // 缓解⑤：截断跨轮恢复（开关默认关）。只在**修复层已启用且也补不回**（修复层开时走到这里
             // = 上面 repair 已返回 None）且归因为真截断（Truncated / TruncatedAndIllegal）时触发：
             // 不发不完整的 partial_json
@@ -1749,6 +1743,16 @@ impl StreamContext {
             // 关闭时保持现状：原样发出交客户端处置（绝不静默吞成空参——空参会被当"无参成功调用"，更危险）。
             if super::handlers::tool_expose_error_to_client_enabled() {
                 return Vec::new();
+            }
+            } // end if !repaired_ok(修复成功则跳过②/③/⑤)
+        }
+        // 洞1:整包双重编码解包。走到这里 assembled 已是合法 JSON(原本合法 / 修复后)。若它其实是
+        // 「被再套一层字符串编码的 object/array」,解一层还原成客户端能按 object 消费的形态,消灭
+        // 一类漏过 repair 层的 InputValidationError。只在 tool_repair_json 开启时启用(同属修复族)。
+        if super::handlers::tool_repair_json_enabled() {
+            if let Some(unwrapped) = unwrap_double_encoded(&assembled) {
+                tracing::info!(block_index, "tool_use 参数为双重编码,已解一层还原为 object/array");
+                assembled = unwrapped;
             }
         }
         self.state_manager
@@ -2211,8 +2215,32 @@ fn scan_tool_json(s: &str) -> ToolJsonScan {
 /// - **只修字符级噪声，绝不臆测语义**：仅转义字符串内的非法转义/裸控制符、补全结构截断，
 ///   不新增/删除/改写任何键值语义。
 ///
+/// 整包双重编码解包(洞1):工具 input 契约上顶层必是 object。模型偶发把整个参数对象**再套一层
+/// JSON 字符串编码**(double-encoded),如发出 `"{\"path\":\"a\"}"` 而非 `{"path":"a"}`——此时
+/// `from_str` 会**成功**得到 `Value::String`,但客户端按 object 消费该工具参数就报
+/// InputValidationError(参数类型不符)。这类**漏过 repair 层**(它 from_str 成功、不进修复)。
+///
+/// 本函数在 from_str **成功**后调用:若解析结果是 `Value::String(inner)` 且 `inner` 本身能再
+/// parse 成 object/array,返回解一层后的合法 JSON 串;否则 `None`(不动)。
+///
+/// # 铁律
+/// - **只解一层**:深层嵌套(`"\"nested\""`)保守不碰,避免过度解包改语义。
+/// - **复验必 object/array 才用**:顶层数字/布尔/纯字符串 → None(工具 input 顶层不该是标量,
+///   但也不臆测,原样交上层)。零语义损失(只是剥掉误加的一层字符串编码)。
+pub(crate) fn unwrap_double_encoded(s: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(s).ok()?;
+    let inner = v.as_str()?; // 顶层必须是 JSON 字符串才可能是双重编码
+    let reparsed: serde_json::Value = serde_json::from_str(inner).ok()?;
+    // 只有解出 object/array 才认定是"误套一层"的双重编码;标量不动。
+    if reparsed.is_object() || reparsed.is_array() {
+        serde_json::to_string(&reparsed).ok()
+    } else {
+        None
+    }
+}
+
 /// 返回修复后的合法 JSON 串；无法修成合法则 `None`。
-fn repair_tool_json(s: &str) -> Option<String> {
+pub(crate) fn repair_tool_json(s: &str) -> Option<String> {
     // 空串不在本函数职责内（flush_tool_input 上游已处理空串），保守拒绝。
     if s.trim().is_empty() {
         return None;
@@ -2286,8 +2314,34 @@ fn repair_json_char_level(s: &str) -> String {
                                 }
                             }
                             if hex.len() == 4 {
-                                out.push_str("\\u");
-                                out.push_str(&hex);
+                                // 洞4:UTF-16 代理对完整性(对应 #69522 长 unicode 转义 parse 失败)。
+                                // serde_json 只接受**成对**的代理(高 D800-DBFF 紧跟低 DC00-DFFF);
+                                // 孤立高代理 / 孤立低代理会被判非法 JSON。这里:
+                                //   - 高代理 + 后随合法低代理 → 原样保留(合法 emoji 如 😀 不碰);
+                                //   - 高代理但后面不是合法低代理 → 孤立,降级字面 \\uXXXX;
+                                //   - 直接遇到低代理(没被前面的高代理配对消费) → 孤立,降级字面。
+                                let cp = u32::from_str_radix(&hex, 16).unwrap_or(0);
+                                if (0xD800..=0xDBFF).contains(&cp) {
+                                    // 高代理:向前看是否紧跟 \uYYYY 且 YYYY 是合法低代理。
+                                    if let Some(low_hex) = peek_low_surrogate(&mut chars) {
+                                        out.push_str("\\u");
+                                        out.push_str(&hex);
+                                        out.push_str("\\u");
+                                        out.push_str(&low_hex);
+                                    } else {
+                                        // 孤立高代理 → 降级字面。
+                                        out.push_str("\\\\u");
+                                        out.push_str(&hex);
+                                    }
+                                } else if (0xDC00..=0xDFFF).contains(&cp) {
+                                    // 孤立低代理(合法对已在高代理分支被整体消费,能到这里必是孤立)→ 降级字面。
+                                    out.push_str("\\\\u");
+                                    out.push_str(&hex);
+                                } else {
+                                    // BMP 普通码位 → 原样保留。
+                                    out.push_str("\\u");
+                                    out.push_str(&hex);
+                                }
                             } else {
                                 // 截断的 \uXX → 字面反斜杠 + u + 已收集 hex。
                                 out.push_str("\\\\u");
@@ -2312,6 +2366,37 @@ fn repair_json_char_level(s: &str) -> String {
         }
     }
     out
+}
+
+/// 向前看：紧接的是否为 `\uYYYY` 且 YYYY 是合法低代理(DC00-DFFF)。是则**消费**这 6 个字符
+/// (`\` `u` + 4 hex)并返回 `Some("YYYY")`;否则不消费任何字符、返回 `None`。
+/// 用于 [`repair_json_char_level`] 判定高代理后是否紧跟合法低代理(合法代理对整体保留)。
+fn peek_low_surrogate(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<String> {
+    // clone 迭代器做无损前瞻:先在 clone 上验证,确认合法才在真迭代器上消费。
+    let mut look = chars.clone();
+    if look.next() != Some('\\') {
+        return None;
+    }
+    if look.next() != Some('u') {
+        return None;
+    }
+    let mut hex = String::new();
+    for _ in 0..4 {
+        match look.next() {
+            Some(h) if h.is_ascii_hexdigit() => hex.push(h),
+            _ => return None,
+        }
+    }
+    let cp = u32::from_str_radix(&hex, 16).ok()?;
+    if (0xDC00..=0xDFFF).contains(&cp) {
+        // 合法低代理 → 在真迭代器上消费掉这 6 个字符(\ u + 4 hex)。
+        for _ in 0..6 {
+            chars.next();
+        }
+        Some(hex)
+    } else {
+        None
+    }
 }
 
 /// 把一个字符写进输出：控制符转义成 JSON 合法形式（`\n`/`\t`/`\uXXXX`），其余原样。
@@ -3898,6 +3983,87 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&fixed).is_ok(),
             "修复后必为合法 JSON"
         );
+    }
+
+    /// 洞4:合法 UTF-16 代理对(😀 = 😀)必须**原样保留**,不被误降级。
+    #[test]
+    fn test_repair_keeps_valid_surrogate_pair() {
+        // 构造一个整体非法(裸控制符触发 repair)、但含合法代理对的串,验证代理对不被破坏。
+        let bad = "{\"emoji\":\"\\uD83D\\uDE00\nx\"}"; // 含真实换行=裸控制符→非法,触发 repair
+        assert!(serde_json::from_str::<serde_json::Value>(bad).is_err());
+        let fixed = repair_tool_json(bad).expect("应可修复");
+        let v: serde_json::Value = serde_json::from_str(&fixed).expect("修复后合法");
+        // 合法代理对应解码成 😀,不被降级为字面。
+        assert!(v["emoji"].as_str().unwrap().contains('😀'), "合法代理对必须保留为 emoji");
+    }
+
+    /// 洞4:孤立高代理(无低代理配对)→ 降级字面,修成合法 JSON。
+    #[test]
+    fn test_repair_isolated_high_surrogate() {
+        let bad = r#"{"x":"\uD83Dnext"}"#; // 高代理后跟普通文本,孤立
+        assert!(serde_json::from_str::<serde_json::Value>(bad).is_err(), "前提:孤立高代理非法");
+        let fixed = repair_tool_json(bad).expect("孤立高代理应可降级修复");
+        assert!(serde_json::from_str::<serde_json::Value>(&fixed).is_ok(), "修复后必合法");
+    }
+
+    /// 洞4:孤立低代理 → 降级字面,修成合法 JSON。
+    #[test]
+    fn test_repair_isolated_low_surrogate() {
+        let bad = r#"{"x":"\uDE00abc"}"#;
+        assert!(serde_json::from_str::<serde_json::Value>(bad).is_err(), "前提:孤立低代理非法");
+        let fixed = repair_tool_json(bad).expect("孤立低代理应可降级修复");
+        assert!(serde_json::from_str::<serde_json::Value>(&fixed).is_ok(), "修复后必合法");
+    }
+
+    /// 洞1:整包双重编码解包——顶层是被字符串编码的 object → 解一层还原。
+    #[test]
+    fn test_unwrap_double_encoded_object() {
+        // 双重编码:整个 {"path":"a.txt"} 被再套一层字符串编码。
+        let double = r#""{\"path\":\"a.txt\"}""#;
+        // 顶层 from_str 成功但得到 String(漏过 repair 层)。
+        assert!(serde_json::from_str::<serde_json::Value>(double).unwrap().is_string());
+        let unwrapped = unwrap_double_encoded(double).expect("应解一层");
+        let v: serde_json::Value = serde_json::from_str(&unwrapped).unwrap();
+        assert_eq!(v["path"].as_str().unwrap(), "a.txt");
+    }
+
+    /// review confirmed 回归(端到端):合法的双重编码串经 flush_tool_input 必须被 unwrap 成 object
+    /// 再发出。这锁死"unwrap 在函数尾统一出口执行"——修复前 repair 成功分支 early-return 会绕过它,
+    /// 修复后两条路径(原本合法 / 修复后)都经同一 unwrap 出口。此处走"原本合法"路径(from_str 成功
+    /// → 跳过 repair → 命中尾部 unwrap),验证出口本身正确;repair 分支的 fall-through 由结构保证
+    /// (assembled=repaired 后不再 return,与本路径汇合到同一 unwrap)。
+    #[test]
+    fn test_flush_unwraps_double_encoded_at_exit() {
+        let mut ctx = StreamContext::new_with_thinking("claude-sonnet-4.6", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        // 合法的双重编码:整个 {"path":"a.txt"} 被再套一层字符串编码(from_str 成功但得 String)。
+        let double = r#""{\"path\":\"a.txt\"}""#;
+        assert!(
+            serde_json::from_str::<serde_json::Value>(double).unwrap().is_string(),
+            "前提:顶层 from_str 成功但是 String(双重编码,会漏过 repair)"
+        );
+        let evs = ctx.flush_tool_input(0, double.to_string());
+        let delta = evs
+            .iter()
+            .find(|e| e.data["delta"]["type"] == "input_json_delta")
+            .expect("应发出 input_json_delta");
+        let partial = delta.data["delta"]["partial_json"].as_str().unwrap();
+        let v: serde_json::Value = serde_json::from_str(partial).expect("发出的必是合法 JSON");
+        assert!(v.is_object(), "双重编码必须在出口被 unwrap 成 object,实际={}", partial);
+        assert_eq!(v["path"].as_str().unwrap(), "a.txt");
+    }
+
+    /// 洞1:双重编码 array 也解;标量/普通 object 不动。
+    #[test]
+    fn test_unwrap_double_encoded_boundaries() {
+        // array 双重编码 → 解。
+        let arr = r#""[1,2,3]""#;
+        assert!(unwrap_double_encoded(arr).is_some());
+        // 正常 object(非双重编码)→ 不动(顶层不是 String)。
+        assert!(unwrap_double_encoded(r#"{"a":1}"#).is_none());
+        // 顶层是字符串但内层是标量(不是 object/array)→ 不动(不臆测)。
+        assert!(unwrap_double_encoded(r#""hello""#).is_none());
+        assert!(unwrap_double_encoded(r#""42""#).is_none());
     }
 
     /// 端到端：flush_tool_input 收到非法 JSON（开关默认开）→ 修复成功 → 发出的 partial_json 必合法。
