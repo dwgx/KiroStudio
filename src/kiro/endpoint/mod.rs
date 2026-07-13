@@ -130,6 +130,10 @@ pub struct RequestContext<'a> {
     pub machine_id: &'a str,
     /// 全局配置
     pub config: &'a Config,
+    /// 本次请求是否命中受支持的 1M 上下文变体(`claude-xxx[1m]`)。
+    /// 为 true 时 [`super::endpoint`] 的 `decorate_api` 注入 `anthropic-beta: context-1m-2025-08-07`。
+    /// 由 handler 用 [`crate::anthropic::model_catalog::resolve_is_1m`] 从原始模型名算出、透传到此。
+    pub is_1m: bool,
 }
 
 /// 默认的 MONTHLY_REQUEST_COUNT 判断逻辑
