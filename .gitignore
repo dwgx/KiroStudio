@@ -72,3 +72,8 @@ PROMPT-*.md
 # Claude Code agent 配置/记忆（本地私有，不公开）
 .claude/
 kiro_balance_cache.json
+
+# 运行时产物 / 本地临时(绝不提交)
+kiro_stats.json
+replay.tmp.json
+scripts/
