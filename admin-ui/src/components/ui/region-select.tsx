@@ -1,31 +1,42 @@
 import * as React from 'react'
-import { Check, ChevronsUpDown, Search } from 'lucide-react'
+import { Check, ChevronsUpDown, Search, History } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { AWS_REGIONS, filterRegions } from '@/lib/regions'
+import { AWS_REGIONS, filterRegions, getRecentRegions, pushRecentRegion, regionLabel, isRegionCodeShape } from '@/lib/regions'
 
 export interface RegionSelectProps {
   value: string
   onChange: (value: string) => void
   className?: string
+  /** 追加到触发按钮的类名（覆盖高度等，用于紧凑场景与邻接元素对齐）。 */
+  triggerClassName?: string
   placeholder?: string
   disabled?: boolean
+  /** 采用某 region 时是否记入「最近使用」历史（跨入口共享）。默认开启。 */
+  recordRecent?: boolean
 }
 
 /**
  * 带搜索的 AWS 区域选择器：可输入 code / 中文名 / 城市 / 关键词实时过滤
  * （us / tokyo / 东京 / 弗吉尼亚 都能命中）。点选即填，也允许自由输入非列表值
  * （AWS 新区兼容）。纯手写 combobox，无外部依赖。
+ *
+ * 智能复用：下拉打开且未输入搜索词时，顶部展示「最近使用」分组（跨设置页 / IdC /
+ * 微软 SSO / 凭据卡片自定义切换全局共享的历史，见 lib/regions）；采用任一 region
+ * 都会写回历史，下次任何入口都能一键复用。
  */
 export function RegionSelect({
   value,
   onChange,
   className,
+  triggerClassName,
   placeholder = '选择或输入区域',
   disabled = false,
+  recordRecent = true,
 }: RegionSelectProps) {
   const [open, setOpen] = React.useState(false)
   const [query, setQuery] = React.useState('')
   const [highlight, setHighlight] = React.useState(0)
+  const [recent, setRecent] = React.useState<string[]>([])
   const rootRef = React.useRef<HTMLDivElement>(null)
   const inputRef = React.useRef<HTMLInputElement>(null)
 
@@ -35,39 +46,69 @@ export function RegionSelect({
     [value]
   )
 
-  // 点击外部关闭
+  // 最新 query 的 ref：点击外部的 document 监听器只按 [open] 重订阅，闭包会捕获旧 query，
+  // 用 ref 读实时值，确保「关闭时提交」拿到用户最后键入的内容。
+  const queryRef = React.useRef(query)
+  queryRef.current = query
+  // 仅在「打开且无搜索词」时展示最近使用分组。排除当前已选值（避免与展示重复）。
+  const showRecent = open && query.trim() === '' && recent.length > 0
+  const recentToShow = React.useMemo(
+    () => (showRecent ? recent.filter((c) => c !== value).slice(0, 5) : []),
+    [showRecent, recent, value]
+  )
+
+  // 关闭下拉时提交已键入但未回车/点选的内容（commit-on-close，防丢字）：
+  // 用户在搜索框键入 `eu-central-1` 后直接点框外/切换按钮 → 若不提交，query 被丢弃、
+  // 外部 value 仍是旧值（曾致「填了 region 但切换按钮还是灰的」交互回归）。
+  // 仅当输入**长得像一个 region code**（形状校验）时才回写，避免把「东京」这类
+  // 未解析成 code 的搜索关键词污染进 value（保护设置页 region 表单）。
+  const closeWithCommit = React.useCallback(() => {
+    const q = queryRef.current.trim().toLowerCase()
+    if (q && q !== value && isRegionCodeShape(q)) {
+      if (recordRecent) pushRecentRegion(q)
+      onChange(q)
+    }
+    setOpen(false)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value, onChange, recordRecent])
+
+  // 点击外部关闭（提交已键入的 region code）
   React.useEffect(() => {
     if (!open) return
     const onDown = (e: MouseEvent) => {
       if (rootRef.current && !rootRef.current.contains(e.target as Node)) {
-        setOpen(false)
+        closeWithCommit()
       }
     }
     document.addEventListener('mousedown', onDown)
     return () => document.removeEventListener('mousedown', onDown)
-  }, [open])
+  }, [open, closeWithCommit])
 
   React.useEffect(() => {
     if (open) {
       setQuery('')
       setHighlight(0)
+      setRecent(getRecentRegions()) // 每次打开刷新历史（其它入口刚写入的也能立刻看到）
       // 打开后聚焦搜索框
       requestAnimationFrame(() => inputRef.current?.focus())
     }
   }, [open])
 
   const pick = (code: string) => {
+    if (recordRecent) pushRecentRegion(code)
     onChange(code)
     setOpen(false)
   }
 
-  // 自由输入：query 是一个非列表值时，允许直接采用
+  // 自由输入：query 是一个非列表值时，允许直接采用。
+  // AWS region code 恒为小写，归一化后再采用——否则 EU-CENTRAL-1 会被后端白名单精确匹配拒掉，
+  // 且与 pushRecentRegion 内部的小写化不一致导致「最近使用」重复展示。
   const commitFreeInput = () => {
     const q = query.trim()
     if (results.length > 0) {
       pick(results[Math.min(highlight, results.length - 1)].code)
     } else if (q) {
-      pick(q)
+      pick(q.toLowerCase())
     } else {
       setOpen(false)
     }
@@ -78,12 +119,13 @@ export function RegionSelect({
       <button
         type="button"
         disabled={disabled}
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => (open ? closeWithCommit() : setOpen(true))}
         className={cn(
           'flex h-10 w-full items-center justify-between gap-2 rounded-md border border-input bg-background px-3 py-2 text-sm',
           'ring-offset-background transition-colors duration-200 ease-out-expo',
           'hover:border-border-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
-          'disabled:cursor-not-allowed disabled:opacity-50'
+          'disabled:cursor-not-allowed disabled:opacity-50',
+          triggerClassName
         )}
       >
         <span className={cn('truncate text-left', !value && 'text-muted-foreground')}>
@@ -135,6 +177,30 @@ export function RegionSelect({
               className="h-9 w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
             />
           </div>
+
+          {/* 最近使用分组（仅打开且无搜索词时置顶展示，跨入口共享的历史） */}
+          {recentToShow.length > 0 && (
+            <div className="border-b border-border py-1">
+              <div className="flex items-center gap-1.5 px-3 py-1 text-[11px] font-medium text-muted-foreground">
+                <History className="h-3 w-3" />
+                最近使用
+              </div>
+              {recentToShow.map((code) => {
+                const r = AWS_REGIONS.find((x) => x.code === code)
+                return (
+                  <button
+                    type="button"
+                    key={`recent-${code}`}
+                    onClick={() => pick(code)}
+                    className="flex w-full items-center justify-between gap-3 px-3 py-1.5 text-left text-sm text-muted-foreground transition-colors duration-150 hover:bg-accent hover:text-foreground"
+                  >
+                    <span className="truncate text-foreground">{r ? r.label : regionLabel(code)}</span>
+                    <span className="font-mono text-xs text-muted-foreground">{code}</span>
+                  </button>
+                )
+              })}
+            </div>
+          )}
 
           {/* 结果列表 */}
           <div className="max-h-[240px] overflow-y-auto py-1">
