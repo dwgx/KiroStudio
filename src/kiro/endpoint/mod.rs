@@ -88,6 +88,14 @@ pub trait KiroEndpoint: Send + Sync {
         default_is_invalid_model_id(body)
     }
 
+    /// 是否为「该 region 的 profile 未开通」错误(403 FEATURE_NOT_SUPPORTED)。
+    ///
+    /// external_idp 号在某些 region 有 profile 但未开通 Kiro,对话打过去即返回此错。对话路径据此
+    /// 触发 region 自动纠正(本地纠正 + 后台异步重探),而非当普通凭据错误冷却/换号。
+    fn is_feature_not_supported(&self, body: &str) -> bool {
+        default_is_feature_not_supported(body)
+    }
+
     /// 从错误响应中提取上游给出的重置时间（秒）
     ///
     /// 某些上游把真实重置时间放在 body 里（如 `resets_in_seconds` / `resets_at` epoch），
@@ -95,6 +103,11 @@ pub trait KiroEndpoint: Send + Sync {
     fn extract_retry_after_secs(&self, body: &str) -> Option<u64> {
         default_extract_retry_after_secs(body)
     }
+}
+
+/// 默认的 FEATURE_NOT_SUPPORTED 判断逻辑（与 `classify_profile_probe` 同口径:子串命中即真）。
+pub fn default_is_feature_not_supported(body: &str) -> bool {
+    body.contains("FEATURE_NOT_SUPPORTED")
 }
 
 /// 默认的 INVALID_MODEL_ID 判断逻辑（识别顶层 `reason` 与嵌套 `error.reason`）。
@@ -269,6 +282,17 @@ mod tests {
     fn test_default_monthly_request_limit_detects_reason() {
         let body = r#"{"message":"You have reached the limit.","reason":"MONTHLY_REQUEST_COUNT"}"#;
         assert!(default_is_monthly_request_limit(body));
+    }
+
+    #[test]
+    fn test_default_feature_not_supported() {
+        assert!(default_is_feature_not_supported(
+            r#"{"__type":"AccessDeniedException","message":"FEATURE_NOT_SUPPORTED"}"#
+        ));
+        assert!(default_is_feature_not_supported("403 FEATURE_NOT_SUPPORTED for region"));
+        // 不误命中普通错误。
+        assert!(!default_is_feature_not_supported(r#"{"reason":"MONTHLY_REQUEST_COUNT"}"#));
+        assert!(!default_is_feature_not_supported("INVALID_MODEL_ID"));
     }
 
     #[test]

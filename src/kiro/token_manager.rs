@@ -812,6 +812,8 @@ pub struct ProfileCandidate {
     pub subscription_title: Option<String>,
     /// 分类原因（"usable" / "feature_not_supported" / "unauthorized" / "error"）。
     pub reason: &'static str,
+    /// 是否为该号**当前**绑定的 profileArn(前端标「当前」绿标 + 禁点,省一次冗余 switch)。
+    pub current: bool,
 }
 
 /// 候选排序键（越小越靠前）：usable 优先；usable 内订阅标题非空非 FREE 更优。
@@ -895,6 +897,13 @@ pub(crate) async fn probe_all_usable_profiles(
     token: &str,
     proxy: Option<&ProxyConfig>,
 ) -> Vec<ProfileCandidate> {
+    // 该号当前绑定的 profileArn(用于给候选标 current;建号前 base.profile_arn=None → 全 false)。
+    let current_arn = base
+        .profile_arn
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
     // region 探测顺序：号自己 region 打头 + 候选表（去重）。
     let preferred = base.effective_upstream_region(config).to_string();
     let mut regions: Vec<String> = vec![preferred];
@@ -943,6 +952,7 @@ pub(crate) async fn probe_all_usable_profiles(
                 ProfileProbeOutcome::Unauthorized => (false, None, "unauthorized"),
                 ProfileProbeOutcome::OtherError(_) => (false, None, "error"),
             };
+        let current = current_arn == Some(arn.trim());
         out.push(ProfileCandidate {
             arn,
             region,
@@ -950,6 +960,7 @@ pub(crate) async fn probe_all_usable_profiles(
             usable,
             subscription_title,
             reason,
+            current,
         });
     }
     out.sort_by_key(candidate_rank);
@@ -1008,6 +1019,13 @@ struct CredentialEntry {
     /// 时间，`REPROBE_ALL_BAD_COOLDOWN` 冷却期内跳过 reprobe。找到可用 profile 时清空（恢复灵敏）。
     /// 非持久化：进程内成本护栏，重启清零可接受（重启后至多多探一轮）。
     last_full_reprobe_at: Mutex<Option<Instant>>,
+    /// 对话路径撞 403 FEATURE_NOT_SUPPORTED 时触发的**后台异步重探**是否在飞(per-id 去重守卫)。
+    ///
+    /// N 个并发对话请求同撞同一坏号时,只允许 1 个真正 spawn 重探(compare_exchange 抢占),其余直接
+    /// failover——防止各起一轮 probe_all_usable_profiles(一整轮 getUsageLimits)打爆上游、自造
+    /// suspicious-activity 风控。重探任务结束(成功/失败/panic)由 guard Drop 清回 false。
+    /// 非持久化:进程内并发守卫,重启清零可接受。
+    reprobe_in_flight: AtomicBool,
 }
 
 /// 禁用原因
@@ -1453,6 +1471,7 @@ impl MultiTokenManager {
                     inflight: Arc::new(AtomicU32::new(0)),
                     last_usage_403_feature_not_supported: AtomicBool::new(false),
                     last_full_reprobe_at: Mutex::new(None),
+                    reprobe_in_flight: AtomicBool::new(false),
                 }
             })
             .collect();
@@ -4249,6 +4268,7 @@ impl MultiTokenManager {
                 inflight: Arc::new(AtomicU32::new(0)),
                 last_usage_403_feature_not_supported: AtomicBool::new(false),
                 last_full_reprobe_at: Mutex::new(None),
+                reprobe_in_flight: AtomicBool::new(false),
             });
         }
 
@@ -4364,6 +4384,7 @@ impl MultiTokenManager {
                     inflight: Arc::new(AtomicU32::new(0)),
                     last_usage_403_feature_not_supported: AtomicBool::new(false),
                     last_full_reprobe_at: Mutex::new(None),
+                    reprobe_in_flight: AtomicBool::new(false),
                 });
             }
             return Err(e.context("回收站落盘失败，已回滚删除操作"));
@@ -4487,6 +4508,7 @@ impl MultiTokenManager {
                 inflight: Arc::new(AtomicU32::new(0)),
                 last_usage_403_feature_not_supported: AtomicBool::new(false),
                 last_full_reprobe_at: Mutex::new(None),
+                reprobe_in_flight: AtomicBool::new(false),
             });
         }
 
@@ -4697,6 +4719,143 @@ impl MultiTokenManager {
         Ok(probe_all_usable_profiles(&credentials, &cfg, &token, proxy.as_ref()).await)
     }
 
+    /// 验活重选并写回可用 region profile(刷新路径 + 对话路径异步任务共用的单一真相源)。
+    ///
+    /// 枚举全部候选 → 真验活(probe_all_usable_profiles,一整轮 getUsageLimits) → 选 usable 的 arn
+    /// 写回 + `sync_region_from_arn` + 清 403 坏标记;全坏则记 6h 冷却时间戳。
+    /// 返回 `true` = 找到并应用了可用 region(含"原 arn 复验仍可用");`false` = 全坏未纠正。
+    /// **不持锁跑网络**:探测在锁外,只在写回时短临界区持 entries 锁。
+    async fn reprobe_and_correct_region_with(
+        &self,
+        id: u64,
+        creds: &KiroCredentials,
+        token: &str,
+    ) -> bool {
+        let cfg = self.config.load_full();
+        let proxy = creds.effective_proxy(self.proxy.as_ref());
+        let candidates = probe_all_usable_profiles(creds, &cfg, token, proxy.as_ref()).await;
+        if let Some(best) = candidates.iter().find(|c| c.usable) {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                let old = entry.credentials.profile_arn.clone();
+                if old.as_deref() != Some(best.arn.as_str()) {
+                    entry.credentials.profile_arn = Some(best.arn.clone());
+                    entry.credentials.sync_region_from_arn();
+                    if let Some(t) = &best.subscription_title {
+                        entry.credentials.subscription_title = Some(t.clone());
+                    }
+                    tracing::info!(
+                        "凭据 #{} 验活重选：{:?} → {}（region={}, {}）",
+                        id, old, best.arn, best.region,
+                        best.subscription_title.as_deref().unwrap_or("?")
+                    );
+                }
+                // 无论 arn 是否变，清除坏标记 + 清空全坏冷却时间戳(恢复灵敏)。
+                entry.last_usage_403_feature_not_supported.store(false, Ordering::Relaxed);
+                *entry.last_full_reprobe_at.lock() = None;
+            }
+            true
+        } else {
+            // 全 region 都探测不到可用 profile：记时间戳进入 6h 冷却，避免反复白跑一整轮探测。
+            {
+                let entries = self.entries.lock();
+                if let Some(entry) = entries.iter().find(|e| e.id == id) {
+                    *entry.last_full_reprobe_at.lock() = Some(Instant::now());
+                }
+            }
+            tracing::warn!(
+                "凭据 #{} 验活重选未找到可用 region profile（保持原 arn，{}h 内不再重复全 region 探测）",
+                id, REPROBE_ALL_BAD_COOLDOWN.as_secs() / 3600
+            );
+            false
+        }
+    }
+
+    /// 标记某号上次对话/查询撞了 403 FEATURE_NOT_SUPPORTED(供后台刷新循环 needs_reprobe 门兜底纠正)。
+    pub fn mark_usage_403_feature_not_supported(&self, id: u64) {
+        let entries = self.entries.lock();
+        if let Some(entry) = entries.iter().find(|e| e.id == id) {
+            entry.last_usage_403_feature_not_supported.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// 廉价本地纠正:只把 region/auth_region 同步成 profileArn 内的 region(纯字符串,无网络)。
+    /// 返回 true = region 字段确实被改动(正交隐患"region 与 ARN 漂移"的即时修正)。
+    /// 对真正的 FEATURE_NOT_SUPPORTED(ARN region 本身就是未开通那个)通常是 no-op → false。
+    pub fn sync_region_from_arn_for(&self, id: u64) -> bool {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.credentials.sync_region_from_arn()
+        } else {
+            false
+        }
+    }
+
+    /// 触发某 external_idp 号的**后台异步** region 重探(对话路径撞 403 时调用,不阻塞当前请求)。
+    ///
+    /// per-id 守卫:`reprobe_in_flight` compare_exchange 抢占,抢不到直接返回(N 并发只 1 个真探测)。
+    /// 6h 冷却双检:全坏号冷却期内不重探。抢到则 detached spawn,任务内取 token → 校验 external_idp
+    /// → `reprobe_and_correct_region_with` → 成功则持久化;无论成败由 guard Drop 清回 in_flight。
+    pub fn trigger_background_reprobe(self: &Arc<Self>, id: u64) {
+        // 抢占 in_flight;抢不到 = 已有任务在跑,直接返回。
+        {
+            let entries = self.entries.lock();
+            let Some(entry) = entries.iter().find(|e| e.id == id) else { return };
+            if entry
+                .reprobe_in_flight
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+            {
+                return; // 已有重探在飞
+            }
+            // 6h 冷却双检:全坏号冷却期内不重探(省成本)。抢到了锁但在冷却→立即清回并返回。
+            let in_cooldown = entry
+                .last_full_reprobe_at
+                .lock()
+                .map(|t| t.elapsed() < REPROBE_ALL_BAD_COOLDOWN)
+                .unwrap_or(false);
+            if in_cooldown {
+                entry.reprobe_in_flight.store(false, Ordering::Release);
+                return;
+            }
+        }
+        // detached 任务:克隆 Arc 进 spawn,当前对话请求不等待。
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            // guard:任务无论走哪条路径退出(含 panic 后的栈展开),Drop 都清回 in_flight。
+            struct InFlightGuard {
+                tm: Arc<MultiTokenManager>,
+                id: u64,
+            }
+            impl Drop for InFlightGuard {
+                fn drop(&mut self) {
+                    let entries = self.tm.entries.lock();
+                    if let Some(e) = entries.iter().find(|e| e.id == self.id) {
+                        e.reprobe_in_flight.store(false, Ordering::Release);
+                    }
+                }
+            }
+            let _guard = InFlightGuard { tm: Arc::clone(&this), id };
+
+            // 取有效 token(过期先刷)。失败则放弃本次重探(guard 会清标记)。
+            let (creds, token) = match this.ensure_valid_token(id).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("凭据 #{} 后台重探取 token 失败,跳过: {}", id, e);
+                    return;
+                }
+            };
+            if !creds.is_external_idp_credential() {
+                return; // 只有 external_idp 号有多 region profile 概念
+            }
+            if this.reprobe_and_correct_region_with(id, &creds, &token).await {
+                if let Err(e) = this.persist_credentials() {
+                    tracing::warn!("凭据 #{} 后台重探纠正 region 后持久化失败(不影响本次纠正): {}", id, e);
+                }
+            }
+        });
+    }
+
     /// 后台主动预刷新指定凭据（批次4.4）。
     ///
     /// 与 [`force_refresh_token_for`] 的区别有二：
@@ -4844,51 +5003,8 @@ impl MultiTokenManager {
         // 用 probe_all_usable_profiles（而非 resolve_profile_arn_multi_region 的「取第一个」），
         // 否则可能再次选中同一个 FEATURE_NOT_SUPPORTED 的坏 arn。
         if needs_reprobe && !arn_token.is_empty() {
-            let cfg2 = self.config.load_full();
-            let proxy2 = arn_creds.effective_proxy(self.proxy.as_ref());
-            let candidates =
-                probe_all_usable_profiles(&arn_creds, &cfg2, &arn_token, proxy2.as_ref()).await;
-            if let Some(best) = candidates.iter().find(|c| c.usable) {
-                let mut entries = self.entries.lock();
-                if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                    let old = entry.credentials.profile_arn.clone();
-                    if old.as_deref() != Some(best.arn.as_str()) {
-                        entry.credentials.profile_arn = Some(best.arn.clone());
-                        entry.credentials.sync_region_from_arn();
-                        if let Some(t) = &best.subscription_title {
-                            entry.credentials.subscription_title = Some(t.clone());
-                        }
-                        tracing::info!(
-                            "凭据 #{} 验活重选：{:?} → {}（region={}, {}）",
-                            id,
-                            old,
-                            best.arn,
-                            best.region,
-                            best.subscription_title.as_deref().unwrap_or("?")
-                        );
-                    }
-                    // 无论 arn 是否变（可能只是当时暂时性 403 后确认仍可用），清除坏标记。
-                    entry
-                        .last_usage_403_feature_not_supported
-                        .store(false, Ordering::Relaxed);
-                    // 找到可用 profile → 清空全坏冷却时间戳，恢复灵敏（下次真坏能立即重探）。
-                    *entry.last_full_reprobe_at.lock() = None;
-                }
-            } else {
-                // 全 region 都探测不到可用 profile：记录时间戳进入冷却，避免每 token TTL 白跑一整轮
-                // （余额环每 ~30min 会重置 403 flag，无冷却则每次刷新都重复全 region 探测，纯浪费上游调用）。
-                {
-                    let entries = self.entries.lock();
-                    if let Some(entry) = entries.iter().find(|e| e.id == id) {
-                        *entry.last_full_reprobe_at.lock() = Some(Instant::now());
-                    }
-                }
-                tracing::warn!(
-                    "凭据 #{} 验活重选未找到可用 region profile（保持原 arn，{}h 内不再重复全 region 探测，等待人工/后续重试）",
-                    id,
-                    REPROBE_ALL_BAD_COOLDOWN.as_secs() / 3600
-                );
-            }
+            // 抽成 helper 供刷新路径 + 对话路径异步任务共用(逻辑单一真相源)。
+            self.reprobe_and_correct_region_with(id, &arn_creds, &arn_token).await;
         }
         if needs_arn && !arn_token.is_empty() {
             let cfg2 = self.config.load_full();
@@ -5062,6 +5178,7 @@ mod tests {
             usable,
             subscription_title: title.map(|s| s.to_string()),
             reason: if usable { "usable" } else { "feature_not_supported" },
+            current: false,
         }
     }
 
