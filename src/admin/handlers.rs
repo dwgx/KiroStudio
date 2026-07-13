@@ -652,7 +652,7 @@ pub async fn start_external_idp_login(
 ) -> impl IntoResponse {
     match state
         .service
-        .start_external_idp_login(payload.priority, payload.proxy_url)
+        .start_external_idp_login(payload.priority, payload.proxy_url, payload.region)
     {
         Ok(result) => Json(serde_json::json!({
             "sessionId": result.session_id,
@@ -743,6 +743,9 @@ pub struct StartExternalIdpLoginRequest {
     #[serde(default = "default_priority")]
     pub priority: u32,
     pub proxy_url: Option<String>,
+    /// 优先探测区域（可选）：并入授权后的多 region profile 探测候选并排头，覆盖冷门 region。
+    /// 非白名单值忽略（退回默认候选表），不直接拼进上游 host（region 仍由 ARN 严格解析）。
+    pub region: Option<String>,
 }
 
 #[derive(Deserialize)]

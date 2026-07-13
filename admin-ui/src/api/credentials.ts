@@ -414,6 +414,7 @@ export async function startExternalIdpLogin(
   const { data } = await api.post<StartExternalIdpLoginResponse>('/auth/external-idp/start', {
     priority: req.priority,
     proxyUrl: req.proxyUrl,
+    region: req.region,
   })
   return data
 }

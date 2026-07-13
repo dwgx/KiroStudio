@@ -2,6 +2,40 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.16] - 2026-07-14
+
+### region 选择器统一复用（设置页那套下拉铺到三处上号 region 输入）
+此前三处 region 输入各不相同：设置页「区域 region」已是带搜索/键盘选择/自由输入的
+`RegionSelect`，而凭据卡片自定义 region、IdC 上号 Region 还是裸 `Input`，微软 SSO 干脆
+没有 region 字段。本版把 `RegionSelect` 统一铺到三处，并加「最近使用区域」智能复用。
+- **最近使用区域（跨入口全局共享）**：`lib/regions.ts` 新增 `getRecentRegions`/
+  `pushRecentRegion`（localStorage 存最近 5 个，去重 + 最新置顶，正则形状校验防脏值，
+  坏 JSON 安全降级）。`RegionSelect` 下拉打开且无搜索词时顶部展示「最近使用」分组，
+  采用任一 region 自动写回历史——设置页 / IdC / 微软 SSO / 凭据卡片自定义切换，任一入口
+  填过的 region，下次在任何入口都能一键复用。
+- **三处接入**：凭据卡片自定义 region 切换、IdC 上号 Region、微软 SSO 新增「优先探测区域
+  （可选）」。三处外观统一（凭据卡片紧凑场景经新增 `triggerClassName` 与邻接按钮齐平）。
+- **微软 SSO region 后端真生效（优先探测）**：微软号 region 是授权后按候选表探测发现的。
+  本版把用户填的优先区域从 `start` 贯穿到 leg2 探测（`StartExternalIdpLoginRequest.region`
+  → session → `list_all_available_profiles` → 新增 `merge_probe_regions`：优先区域排头、
+  并入 `PROFILE_PROBE_REGIONS` 去重），让只在冷门 region（如 eu-central-1）开通的账号也能
+  被探到，不再漏掉。**安全**：优先区域在 `start` 时先经 `is_supported_region` 白名单过滤
+  （非法值忽略退回默认候选），`merge_probe_regions` 仅决定探测顺序，出站 host 仍由白名单
+  region + ARN 严格解析构造，SSRF 铁律未破。
+
+### 交互回归修复（对抗性 review 查出）
+- **commit-on-close（防丢字）**：`RegionSelect` 是提交式 combobox，搜索框逐键只更新内部
+  状态、仅在回车/点选时才回写外部值。裸 `Input` 换成它后暴露一处回归：用户在自定义 region
+  框键入 `eu-central-1` 后不回车、直接点框外或「切到此区域」按钮 → 已键入内容被丢弃、外部值
+  仍是旧值 → 表现为「明明填了 region，切换按钮却是灰的」。现改为关闭下拉时提交已键入的
+  **合法形状 region code**（点框外 / 点触发按钮均生效），搜索关键词（如「东京」未解析成 code）
+  不回写以免污染。
+- 自由输入 region 归一化小写（`EU-CENTRAL-1` → `eu-central-1`），对齐后端白名单精确匹配。
+
+诚实边界：微软 SSO「优先探测区域」仅影响探测顺序/覆盖面，最终 region 仍以授权后验活可用的
+profile ARN 为准（账号未在该 region 开通则探不到，符合预期）。
+双特性各 624 绿（+3 merge_probe_regions 测：无 preferred / 冷门排头 / 大小写去重）+ 前端 build 绿。
+
 ## [0.7.15] - 2026-07-14
 
 ### 泄漏 token 清洗诊断（清洗不再是黑箱）

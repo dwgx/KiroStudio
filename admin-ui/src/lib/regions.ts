@@ -65,3 +65,60 @@ export function filterRegions(query: string): AwsRegion[] {
     return r.keywords.some((k) => k.includes(q))
   })
 }
+
+// ============ 最近使用区域（智能复用，全局共享） ============
+// 三处 region 选择器（设置页 / IdC 上号 / 微软 SSO / 凭据卡片自定义切换）共享同一份历史，
+// 让「复用过去填过的 region」在任何入口都即时可选。存 localStorage，跨会话保留。
+
+const RECENT_REGIONS_KEY = 'kirostudio.recentRegions'
+const RECENT_REGIONS_MAX = 5
+
+// region code 的宽松形状校验：如 us-east-1 / eu-central-1 / ap-northeast-3 / us-gov-east-1。
+// 只做形状过滤（防脏值/注入进历史），不校验 AWS 是否真存在——AWS 新区也应能记录复用。
+const REGION_CODE_SHAPE = /^[a-z]{2}(-[a-z]+)+-\d+$/
+
+/** 形状校验：输入是否长得像一个 AWS region code（区分「真 region」与「搜索关键词」）。 */
+export function isRegionCodeShape(code: string): boolean {
+  return REGION_CODE_SHAPE.test(code)
+}
+
+/** 读取最近使用区域 code 列表（最新在前）。脏数据/坏 JSON 一律返回空数组。 */
+export function getRecentRegions(): string[] {
+  try {
+    const raw = localStorage.getItem(RECENT_REGIONS_KEY)
+    if (!raw) return []
+    const arr = JSON.parse(raw)
+    if (!Array.isArray(arr)) return []
+    // 二次防御：只保留形状合法且去重的字符串。
+    const seen = new Set<string>()
+    const out: string[] = []
+    for (const v of arr) {
+      if (typeof v !== 'string') continue
+      const c = v.trim().toLowerCase()
+      if (!isRegionCodeShape(c) || seen.has(c)) continue
+      seen.add(c)
+      out.push(c)
+      if (out.length >= RECENT_REGIONS_MAX) break
+    }
+    return out
+  } catch {
+    return []
+  }
+}
+
+/**
+ * 记录一个刚被采用的 region 到历史（去重 + 最新置顶 + 上限 N 条）。
+ * 只接受形状合法的 code（防脏值污染历史）。localStorage 写失败静默忽略（隐私模式等）。
+ */
+export function pushRecentRegion(code: string | null | undefined): void {
+  if (!code) return
+  const c = code.trim().toLowerCase()
+  if (!isRegionCodeShape(c)) return
+  try {
+    const prev = getRecentRegions().filter((r) => r !== c)
+    const next = [c, ...prev].slice(0, RECENT_REGIONS_MAX)
+    localStorage.setItem(RECENT_REGIONS_KEY, JSON.stringify(next))
+  } catch {
+    // 忽略：隐私模式 / 存储配额满时不影响功能。
+  }
+}

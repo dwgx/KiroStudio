@@ -241,9 +241,10 @@ impl AdminService {
         &self,
         priority: u32,
         proxy_url: Option<String>,
+        preferred_region: Option<String>,
     ) -> Result<ExternalIdpStartResult, AdminServiceError> {
         self.external_idp_login
-            .start(priority, proxy_url)
+            .start(priority, proxy_url, preferred_region)
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))
     }
 

@@ -10,6 +10,7 @@ import { Switch } from '@/components/ui/switch'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Skeleton } from '@/components/ui/skeleton'
 import { NumberStepper } from '@/components/ui/number-stepper'
+import { RegionSelect } from '@/components/ui/region-select'
 import {
   Dialog,
   DialogContent,
@@ -1182,12 +1183,13 @@ export function CredentialCard({
               {/* 自定义 region：手填任意 region 直接构造 ARN 切过去（绕候选表，覆盖冷门 region）。
                   验活可用才真生效（后端 switch 只在 Usable 写回）。 */}
               <div className="flex items-center gap-2 pt-1">
-                <Input
+                <RegionSelect
                   value={customRegion}
-                  onChange={(e) => setCustomRegion(e.target.value)}
+                  onChange={setCustomRegion}
                   placeholder="自定义 region，如 eu-central-1"
-                  className="h-8 flex-1 text-xs"
                   disabled={switchingArn !== null}
+                  className="flex-1"
+                  triggerClassName="h-8 text-xs"
                 />
                 <Button
                   size="sm"
