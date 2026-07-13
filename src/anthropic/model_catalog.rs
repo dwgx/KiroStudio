@@ -67,9 +67,10 @@ pub struct ModelSpec {
     pub supports_thinking: bool,
     /// 是否支持 1M 上下文窗口变体(`claude-xxx[1m]`)。为 true 的模型:
     /// ① `/v1/models` 额外广告一条 `<id>[1m]` 变体;② 请求命中 `[1m]` 后缀时注入
-    /// `anthropic-beta: context-1m-2025-08-07` 头。**诚实边界**:Kiro 上游是 CodeWhisperer/Q
-    /// 协议(非 Anthropic 直连),该 beta 头是否被上游识别并真放开 1M 窗口未经证实——本字段以
-    /// `context_window == 1_000_000` 为内部一致性依据,不代表上游一定认(待旁挂黑盒验证)。
+    /// `anthropic-beta: context-1m-2025-08-07` 头(见 `ide::BETA_1M`)。
+    /// **已验证(0713 旁挂黑盒)**:Kiro 上游本就给足远超 200K 的窗口(opus-4.6 不带任何头即吃下
+    /// 64万 token),**不依赖那个 beta 头**;故 `[1m]` 的实际价值 = 给只能传纯模型名的客户端一个
+    /// 显式 1M 变体名(已验证可接受、正确映射),beta 头保留但无害。
     pub supports_1m: bool,
     /// 是否在 `/v1/models` 中广告(thinking 变体通常只做别名不单列)。
     pub advertised: bool,
