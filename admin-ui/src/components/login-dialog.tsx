@@ -23,6 +23,7 @@ import {
 import { copyToClipboard, extractErrorMessage } from '@/lib/utils'
 import { CheckCircle2, XCircle, Loader2 } from 'lucide-react'
 import { AnimatedHeight } from '@/components/ui/animated-height'
+import { RegionSelect } from '@/components/ui/region-select'
 import { regionLabel } from '@/lib/regions'
 import type { StartSocialLoginResponse, ExternalIdpProfileOption } from '@/types/api'
 
@@ -71,6 +72,9 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
 
   // 微软 SSO（External IdP）state
   const [eidpStep, setEidpStep] = useState<EidpStep>(0)
+  // 优先探测区域（可选）：微软号 region 由授权后探测发现，此值会被并入探测候选并排头，
+  // 让冷门 region（如只在 eu-central-1 开通的号）也能被探到。留空则用默认候选表。
+  const [eidpRegion, setEidpRegion] = useState('')
   const [eidpBusy, setEidpBusy] = useState(false)
   const [eidpSessionId, setEidpSessionId] = useState('')
   const [eidpSigninUrl, setEidpSigninUrl] = useState('')
@@ -103,6 +107,7 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
         setCountdown(0)
         setIsStarting(false)
         setEidpStep(0)
+        setEidpRegion('')
         setEidpBusy(false)
         setEidpSessionId('')
         setEidpSigninUrl('')
@@ -228,6 +233,7 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
       const resp = await startExternalIdpLogin({
         priority: Number(priority) || 0,
         proxyUrl: proxyUrl.trim() || undefined,
+        region: eidpRegion.trim() || undefined,
       })
       setEidpSessionId(resp.sessionId)
       setEidpSigninUrl(resp.signinUrl)
@@ -402,12 +408,15 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
             </div>
             <div className="space-y-2">
               <label className="text-sm font-medium">Region</label>
-              <Input
+              <RegionSelect
                 value={region}
-                onChange={(e) => setRegion(e.target.value)}
+                onChange={setRegion}
                 placeholder="us-east-1"
                 disabled={isStarting}
               />
+              <p className="text-xs text-muted-foreground">
+                填错也没关系——会自动探测实例所在 region。不确定就留默认。
+              </p>
             </div>
             <div className="space-y-2">
               <label className="text-sm font-medium">优先级</label>
@@ -452,6 +461,19 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
                 aria-label="优先级"
               />
               <p className="text-xs text-muted-foreground">数字越小优先级越高</p>
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium">优先探测区域（可选）</label>
+              <RegionSelect
+                value={eidpRegion}
+                onChange={setEidpRegion}
+                placeholder="留空按默认候选探测"
+                disabled={eidpBusy}
+              />
+              <p className="text-xs text-muted-foreground">
+                微软号区域会在授权后自动探测。若你的账号只在冷门区域（如 eu-central-1）开通，
+                填这里可优先探测该区域，避免漏掉。不确定就留空。
+              </p>
             </div>
             <div className="space-y-2">
               <label className="text-sm font-medium">代理（可选）</label>
