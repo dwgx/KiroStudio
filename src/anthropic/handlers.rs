@@ -440,13 +440,15 @@ fn map_provider_error(err: Error) -> Response {
         return (t.status, Json(ErrorResponse::new(t.error_type, t.message))).into_response();
     }
 
-    // 未知错误：诚实透传原文（不臆造排障步骤误导用户）。
-    tracing::error!("Kiro API 调用失败（未识别，原文透传）: {}", err);
+    // 未知错误:**完整原文只进服务端日志**(便于 dwgx 排障),**不回给客户端**——原始错误链可能
+    // 含上游响应体里的 profileArn / AWS 账号号 / region / 内部 URL 等敏感信息(review 泄露发现)。
+    // 客户端只得通用提示 + 引导查网关日志,不泄露任何上游内部细节。
+    tracing::error!("Kiro API 调用失败（未识别，原文仅进日志不回客户端）: {}", err);
     (
         StatusCode::BAD_GATEWAY,
         Json(ErrorResponse::new(
             "api_error",
-            format!("上游 API 调用失败（未识别错误，请查看网关日志）: {}", err),
+            "上游 API 调用失败（未识别错误）。请查看网关日志获取详情。",
         )),
     )
         .into_response()
@@ -1796,6 +1798,28 @@ mod error_translation_tests {
     fn test_translate_unknown_returns_none() {
         // 未知错误必须返回 None（调用方诚实透传原文，不臆造排障步骤）。
         assert!(translate_upstream_error("some totally unrecognized upstream gibberish").is_none());
+    }
+
+    /// review 泄露回归:未知错误的 map_provider_error 响应体**绝不含**原始错误链里的敏感信息
+    /// (profileArn / AWS 账号号 / region / 内部 URL)。只给通用提示 + 引导查日志。
+    #[test]
+    fn test_unknown_error_response_body_no_sensitive_leak() {
+        use axum::body::to_bytes;
+        // 构造一个含敏感信息的未知错误(模拟上游响应体泄露 ARN/账号)。
+        let leaky = anyhow::anyhow!(
+            "API 请求失败: 500 {{\"detail\":\"profile arn:aws:codewhisperer:eu-central-1:123456789012:profile/SECRET failed\"}}"
+        );
+        let resp = map_provider_error(leaky);
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body = futures::executor::block_on(to_bytes(resp.into_body(), usize::MAX)).unwrap();
+        let text = String::from_utf8_lossy(&body);
+        // 客户端拿到的响应体绝不含任何敏感片段。
+        assert!(!text.contains("arn:aws"), "响应体泄露了 ARN: {}", text);
+        assert!(!text.contains("123456789012"), "响应体泄露了 AWS 账号号: {}", text);
+        assert!(!text.contains("SECRET"), "响应体泄露了 profile id: {}", text);
+        assert!(!text.contains("eu-central-1"), "响应体泄露了 region: {}", text);
+        // 仍给出通用引导。
+        assert!(text.contains("未识别错误") && text.contains("网关日志"));
     }
 
     /// review high 回归:上游 HTTP 错误**响应体**里恰好含 timeout/tls/proxy/resolve 字样时,
