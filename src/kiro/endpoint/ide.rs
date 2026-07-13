@@ -18,6 +18,13 @@ use super::{KiroEndpoint, RequestContext};
 pub const IDE_ENDPOINT_NAME: &str = "ide";
 
 /// Anthropic 1M 上下文窗口的 beta 特性标识(官方 `context-1m-2025-08-07`)。
+///
+/// # 验证结论(0713 旁挂 8995 黑盒实测,重要)
+/// **Kiro 上游(CodeWhisperer 协议)大概率不依赖这个 HTTP 头。** 实测 `claude-opus-4-6`
+/// **不带** `[1m]`、**不带**任何 beta 头,64 万 token 输入直接返回 200(input_tokens=640571)——
+/// 说明上游本就给足远超 opus「官方 200K」的窗口,不靠此头开 1M。故本头注入是**保留但无害**:
+/// 上游认则加成、不认则忽略,绝不破坏正常请求。真正让大窗口生效的是上游本身(按 modelId 给窗口),
+/// 不是这个头。`[1m]` 后缀的实际价值 = 给只能传纯模型名的客户端一个显式的 1M 变体名(已验证可用)。
 const BETA_1M: &str = "context-1m-2025-08-07";
 
 /// 纯函数:据 is_1m 决定要不要注入 1M beta 头。抽出便于单测(decorate_api 返回 RequestBuilder
