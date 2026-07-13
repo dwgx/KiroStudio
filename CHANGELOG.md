@@ -2,6 +2,19 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.11] - 2026-07-13
+
+### 文档与注释(无逻辑改动)
+- **1M `[1m]` 变体验证结论钉入代码注释**：0713 旁挂 8995 黑盒实测坐实——Kiro 上游(CodeWhisperer
+  协议)本就给足远超「官方 200K」的窗口(`claude-opus-4-6` 不带 `[1m]`、不带任何 beta 头,64 万
+  token 输入直接返回 200),**不依赖 `anthropic-beta: context-1m-2025-08-07` 头**。故该头注入是
+  「保留但无害」,`[1m]` 后缀的实际价值 = 给只能传纯模型名的客户端一个显式 1M 变体名。结论写进
+  `model_catalog.rs` `supports_1m` 与 `ide.rs` `BETA_1M` 注释,替换此前「待验证」措辞。
+- **新增 Invalid tool parameters 攻坚报告**（`docs/ATTACK-REPORT-invalid-tool-params-0713night.md`）：
+  并发攻坚四症状(Invalid tool params / 幻觉 token / 空回复 / mid-response)的可落地修复清单，含
+  客户端源码逐行坐实、对抗复核裁决、KILL 死路清单、验证方案、诚实边界。属规划文档，本版未实现其中代码。
+- gitignore 补挡 `kiro_stats.json` / `replay.tmp.json` / `scripts/` 三类运行时产物与本地临时脚本。
+
 ## [0.7.10] - 2026-07-13
 
 ### 安全
