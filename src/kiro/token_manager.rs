@@ -639,9 +639,10 @@ pub(crate) async fn resolve_profile_arn_via_management(
     Ok(arn)
 }
 
-/// External IdP / Enterprise 号动态解析 profileArn 时的候选 region(dwgx 定:最普遍两个)。
-/// 先探测号自己的 region,再补这两个兜底(去重)。将来账号在别 region 有 profile 可扩展此表。
-pub(crate) const PROFILE_PROBE_REGIONS: &[&str] = &["us-east-1", "eu-central-1"];
+/// External IdP / Enterprise 号动态解析 profileArn 时的多 region 探测候选。
+/// 单一真相源见 [`crate::kiro::regions::PROFILE_PROBE_REGIONS`]（此处 re-export，调用点不变）。
+/// 先探测号自己的 region，再按此表兜底（去重）。
+pub(crate) use crate::kiro::regions::PROFILE_PROBE_REGIONS;
 
 /// 全 region 都探测不到可用 profile 的号，两次全坏 reprobe 之间的最小冷却间隔（成本护栏）。
 /// 见 [`CredentialEntry::last_full_reprobe_at`]。6 小时足够稀释「每 token TTL 白跑一轮」的浪费，
@@ -4212,6 +4213,16 @@ impl MultiTokenManager {
         validated_cred.region = new_cred.region;
         validated_cred.auth_region = new_cred.auth_region;
         validated_cred.api_region = new_cred.api_region;
+        // 【统一上号治理·收口铁律】任何号进池那一刻,强制把 region/auth_region 同步成 profileArn
+        // 内的 region——无论它来自哪条上号路径(external_idp 验活选/idc 探测/social token 解析)、
+        // 无论建号前 region 填得对不对,进池即 region↔ARN 自洽,杜绝错配 → 400 Improperly formed。
+        // 无 profileArn 的号(api_key/custom_api/待后台回补的 idc)是安全 no-op(返回 false)。
+        if validated_cred.sync_region_from_arn() {
+            tracing::info!(
+                "上号收口:凭据 region 已随 profileArn 同步为 {}",
+                validated_cred.region.as_deref().unwrap_or("?")
+            );
+        }
         validated_cred.machine_id = new_cred.machine_id;
         validated_cred.email = new_cred.email;
         validated_cred.proxy_url = new_cred.proxy_url;
