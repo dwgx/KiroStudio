@@ -108,9 +108,9 @@ fn cc_auto_buffer_enabled() -> bool {
 // 定性：Invalid tool parameters 病根在模型侧生成参数，网关不能根治只能缓解——这些开关是缓解手段，
 // 默认关（保持现状行为），用户在设置页按需开启。
 
-/// ①泄漏控制 token 清洗开关（course/課/count/care 之类粘连）。默认 false。
+/// ①泄漏控制 token 清洗开关（course/課/count/care 之类粘连）。默认 **true**（保守高信号，正常文本零误删）。
 static TOOL_CLEAN_LEAKED_TOKENS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+    std::sync::atomic::AtomicBool::new(true);
 /// 设置泄漏 token 清洗开关（main 启动接线 / admin 热更调用，立即生效）。
 pub fn set_tool_clean_leaked_tokens(enabled: bool) {
     TOOL_CLEAN_LEAKED_TOKENS.store(enabled, std::sync::atomic::Ordering::Relaxed);
@@ -119,9 +119,9 @@ pub(crate) fn tool_clean_leaked_tokens_enabled() -> bool {
     TOOL_CLEAN_LEAKED_TOKENS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// ②流式工具拼装非法时对齐成失败态开关。默认 false。
+/// ②流式工具拼装非法时对齐成失败态开关。默认 **true**（与非流式一致，配合③给干净失败信号，不连坐号）。
 static TOOL_STREAM_ALIGN_FAILURE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+    std::sync::atomic::AtomicBool::new(true);
 /// 设置流式失败态对齐开关（main 启动接线 / admin 热更调用，立即生效）。
 pub fn set_tool_stream_align_failure(enabled: bool) {
     TOOL_STREAM_ALIGN_FAILURE.store(enabled, std::sync::atomic::Ordering::Relaxed);
@@ -130,9 +130,9 @@ pub(crate) fn tool_stream_align_failure_enabled() -> bool {
     TOOL_STREAM_ALIGN_FAILURE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// ③工具拼装非法时向客户端补发 SSE error 开关。默认 false。
+/// ③工具拼装非法时向客户端补发 SSE error 开关。默认 **true**（与②配对，修复层修不好时不发坏 JSON）。
 static TOOL_EXPOSE_ERROR_TO_CLIENT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+    std::sync::atomic::AtomicBool::new(true);
 /// 设置工具错误暴露开关（main 启动接线 / admin 热更调用，立即生效）。
 pub fn set_tool_expose_error_to_client(enabled: bool) {
     TOOL_EXPOSE_ERROR_TO_CLIENT.store(enabled, std::sync::atomic::Ordering::Relaxed);
