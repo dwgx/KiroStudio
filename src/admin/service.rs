@@ -221,7 +221,14 @@ impl AdminService {
         self.idc_login
             .start(start_url, region, priority, proxy_url)
             .await
-            .map_err(|e| AdminServiceError::InternalError(e.to_string()))
+            .map_err(|e| {
+                // 结构化诊断优先(全 region 失败→REGION_MISMATCH),否则退回内部错误。
+                if let Some(de) = e.downcast_ref::<crate::kiro::token_manager::DiagnosedError>() {
+                    AdminServiceError::Diagnosed(de.diagnosis.clone())
+                } else {
+                    AdminServiceError::InternalError(e.to_string())
+                }
+            })
     }
 
     /// 轮询 IDC 上号会话
@@ -2186,6 +2193,12 @@ impl AdminService {
 
     /// 分类余额查询错误（可能涉及上游 API 调用）
     fn classify_balance_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
+        // 0. 结构化诊断优先：若错误链携带 DiagnosedError，直接透传其诊断（归因+引导），
+        //    绝不降级成字符串关键词匹配（那会丢结构 → 裸 502，正是本轮要根治的病）。
+        if let Some(de) = e.downcast_ref::<crate::kiro::token_manager::DiagnosedError>() {
+            return AdminServiceError::Diagnosed(de.diagnosis.clone());
+        }
+
         let msg = e.to_string();
 
         // 1. 凭据不存在

@@ -66,6 +66,28 @@ export function extractErrorMessage(error: unknown): string {
 }
 
 /**
+ * 从错误响应里提取结构化上号诊断（后端 error.diagnosis）。无则 null。
+ * 用于上号/刷新/探测失败时渲染诊断卡片（归因+引导）而非裸报错。
+ */
+export function extractDiagnosis(error: unknown): import('@/types/api').OnboardingDiagnosis | null {
+  if (!error || typeof error !== 'object') return null
+  const axiosError = error as Record<string, unknown>
+  const response = axiosError.response as Record<string, unknown> | undefined
+  const data = response?.data as Record<string, unknown> | undefined
+  const errorObj = data?.error as Record<string, unknown> | undefined
+  const diag = errorObj?.diagnosis as Record<string, unknown> | undefined
+  if (
+    diag &&
+    typeof diag.code === 'string' &&
+    typeof diag.summary === 'string' &&
+    Array.isArray(diag.guidance)
+  ) {
+    return diag as unknown as import('@/types/api').OnboardingDiagnosis
+  }
+  return null
+}
+
+/**
  * 解析错误，返回结构化的错误信息
  */
 export function parseError(error: unknown): ParsedError {

@@ -407,6 +407,9 @@ pub struct AdminError {
     #[serde(rename = "type")]
     pub error_type: String,
     pub message: String,
+    /// 结构化上号诊断（归因+引导），仅诊断类错误携带；前端据此渲染诊断卡片而非裸报错。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnosis: Option<crate::kiro::diagnosis::OnboardingDiagnosis>,
 }
 
 impl AdminErrorResponse {
@@ -415,6 +418,18 @@ impl AdminErrorResponse {
             error: AdminError {
                 error_type: error_type.into(),
                 message: message.into(),
+                diagnosis: None,
+            },
+        }
+    }
+
+    /// 携带结构化诊断的错误响应：error_type=diagnosis 的 fault，message=summary，diagnosis 全量。
+    pub fn diagnosed(diagnosis: crate::kiro::diagnosis::OnboardingDiagnosis) -> Self {
+        Self {
+            error: AdminError {
+                error_type: "onboarding_diagnosis".to_string(),
+                message: diagnosis.summary.clone(),
+                diagnosis: Some(diagnosis),
             },
         }
     }

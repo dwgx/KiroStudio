@@ -121,6 +121,22 @@ impl fmt::Display for RefreshTokenInvalidError {
 
 impl std::error::Error for RefreshTokenInvalidError {}
 
+/// 携带结构化上号诊断的错误：贯穿刷新/探测路径，供 service 层 downcast 取出诊断，
+/// 序列化成 (归因+引导) 给前端，取代裸字符串 → 502。见 [`crate::kiro::diagnosis`]。
+#[derive(Debug)]
+pub(crate) struct DiagnosedError {
+    pub(crate) diagnosis: crate::kiro::diagnosis::OnboardingDiagnosis,
+}
+
+impl fmt::Display for DiagnosedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Display 用诊断的 summary（供日志/兜底文本），结构化信息经 downcast 取 diagnosis。
+        write!(f, "{}", self.diagnosis.summary)
+    }
+}
+
+impl std::error::Error for DiagnosedError {}
+
 /// 刷新 Token
 pub(crate) async fn refresh_token(
     credentials: &KiroCredentials,
@@ -427,6 +443,7 @@ async fn refresh_idc_token(
         let body_text = response.text().await.unwrap_or_default();
 
         // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
+        // （保留 RefreshTokenInvalidError:调度层据它禁用/标记该号,语义强于通用诊断）。
         if status.as_u16() == 400
             && body_text.contains("\"invalid_grant\"")
             && body_text.contains("Invalid refresh token provided")
@@ -437,14 +454,11 @@ async fn refresh_idc_token(
             .into());
         }
 
-        let error_msg = match status.as_u16() {
-            401 => "IdC 凭证已过期或无效，需要重新认证",
-            403 => "权限不足，无法刷新 Token",
-            429 => "请求过于频繁，已被限流",
-            500..=599 => "服务器错误，AWS OIDC 服务暂时不可用",
-            _ => "IdC Token 刷新失败",
-        };
-        bail!("{}: {} {}", error_msg, status, body_text);
+        // 其余非 2xx：交结构化诊断（含 #98 实测的 invalid_request/Invalid token provided →
+        // CLIENT_OR_TOKEN_MISMATCH，此前落兜底裸 502）。诊断带归因+引导，service 层 downcast 透传前端。
+        let diagnosis = crate::kiro::diagnosis::diagnose_refresh(status.as_u16(), &body_text);
+        tracing::warn!("IdC 刷新失败：{}", diagnosis.log_line());
+        return Err(DiagnosedError { diagnosis }.into());
     }
 
     let data: IdcRefreshResponse = response.json().await?;
