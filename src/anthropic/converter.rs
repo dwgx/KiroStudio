@@ -206,14 +206,11 @@ fn normalize_json_schema_inner(schema: serde_json::Value, root: bool) -> serde_j
         None => {}
     }
 
-    // description 截断到 2000 字符（按字符边界，避免截断多字节）
+    // schema 内嵌 description 截断（默认 2000 字符 = 顶层上限的 1/5，可配置，按字符边界防多字节切断）
     if let Some(description) = obj.remove("description")
         && let Some(description) = description.as_str()
     {
-        let description = match description.char_indices().nth(2000) {
-            Some((idx, _)) => description[..idx].to_string(),
-            None => description.to_string(),
-        };
+        let description = truncate_chars(description, schema_description_max_chars());
         obj.insert("description".to_string(), serde_json::Value::String(description));
     }
 
@@ -408,6 +405,45 @@ pub fn set_strip_env_noise(enabled: bool) {
 
 fn strip_env_noise_enabled() -> bool {
     STRIP_ENV_NOISE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 工具顶层 description 的字符上限镜像（`config.tool_description_max_chars`，TIER3 热更）。
+///
+/// [`convert_tools`] 是纯转换、拿不到 config，沿用 [`STRIP_ENV_NOISE`] 同款进程级原子镜像：
+/// main 启动按配置写入、admin 改值立即改写、转换热路径读镜像，无锁近零成本。
+/// schema 内嵌 description 上限取此值的 1/5（保持既有 10000/2000 比例），0 表示不截断。
+static TOOL_DESC_MAX_CHARS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(10000);
+
+/// 设置工具描述上限（main 启动接线 / admin 热更调用，立即生效，下个请求即读到新值）。
+pub fn set_tool_description_max_chars(n: usize) {
+    TOOL_DESC_MAX_CHARS.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 顶层 description 上限（0 = 不截断）。
+fn tool_description_max_chars() -> usize {
+    TOOL_DESC_MAX_CHARS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// schema 内嵌 description 上限：顶层的 1/5（保持既有 10000→2000 比例）。0（不截断）时同样不截断。
+fn schema_description_max_chars() -> usize {
+    let top = tool_description_max_chars();
+    if top == 0 {
+        0
+    } else {
+        (top / 5).max(1)
+    }
+}
+
+/// 按字符边界安全截断（防多字节切断）。`max==0` 表示不截断，原样返回。
+fn truncate_chars(s: &str, max: usize) -> String {
+    if max == 0 {
+        return s.to_string();
+    }
+    match s.char_indices().nth(max) {
+        Some((idx, _)) => s[..idx].to_string(),
+        None => s.to_string(),
+    }
 }
 
 /// 归一化单个 system 文本块：折叠归因头 + （开关开启时）剥离环境噪音。
@@ -1164,11 +1200,8 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut Ha
                 description.push_str(suffix);
             }
 
-            // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
-            let description = match description.char_indices().nth(10000) {
-                Some((idx, _)) => description[..idx].to_string(),
-                None => description,
-            };
+            // 限制顶层描述长度（默认 10000 字符，可配置；安全截断 UTF-8，单次遍历）
+            let description = truncate_chars(&description, tool_description_max_chars());
 
             Tool {
                 tool_specification: ToolSpecification {
@@ -1485,6 +1518,36 @@ mod tests {
                 .unwrap()
                 .contains("sonnet")
         );
+    }
+
+    /// 短板3：按字符边界截断，多字节不被切坏；max==0 = 不截断。
+    #[test]
+    fn test_truncate_chars_boundary_safe() {
+        // 5 个中文（各 3 字节）→ 截到 3 字符应得前 3 个字，且是合法 UTF-8（未切多字节）。
+        let s = "你好世界啊";
+        let out = truncate_chars(s, 3);
+        assert_eq!(out, "你好世");
+        assert_eq!(out.chars().count(), 3);
+        // 短于上限 → 原样。
+        assert_eq!(truncate_chars("abc", 10), "abc");
+        // max==0 → 不截断（原样返回）。
+        assert_eq!(truncate_chars(s, 0), s);
+    }
+
+    /// 短板3：schema 内嵌上限恒为顶层的 1/5（保持既有 10000→2000 比例），0 时同样为 0。
+    #[test]
+    fn test_schema_desc_ratio_derives_from_top() {
+        // 不改全局镜像（并行测试污染风险），只验证默认镜像值下的派生比例。
+        let top = tool_description_max_chars();
+        let schema = schema_description_max_chars();
+        if top == 0 {
+            assert_eq!(schema, 0);
+        } else {
+            assert_eq!(schema, (top / 5).max(1));
+        }
+        // 默认镜像应为 10000（与 config 默认一致）→ schema 2000。
+        assert_eq!(top, 10000);
+        assert_eq!(schema, 2000);
     }
 
     /// T1 回归：带每请求漂移 cc_version/cch 的归因头，归一化后 system 转发字节应相同。
