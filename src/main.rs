@@ -346,6 +346,14 @@ async fn main() {
 
     let endpoint_names: Vec<String> = endpoints.keys().cloned().collect();
 
+    // 托盘「重启服务」复用启动时的 config/credentials 路径拉起新进程（Windows）。
+    // credentials_path 下面会被 .into() 移动进 TokenManager，config_path 是 String，此处先各克隆一份。
+    #[cfg(windows)]
+    let tray_relaunch_paths = (
+        std::path::PathBuf::from(&config_path),
+        std::path::PathBuf::from(&credentials_path),
+    );
+
     // 创建 MultiTokenManager 和 KiroProvider
     let token_manager = MultiTokenManager::new(
         config.clone(),
@@ -443,6 +451,12 @@ async fn main() {
         config.max_body_bytes,
         config.compression.clone(),
         config.strip_env_noise,
+        config.tool_clean_leaked_tokens,
+        config.tool_stream_align_failure,
+        config.tool_expose_error_to_client,
+        config.tool_repair_json,
+        config.tool_truncation_recovery,
+        config.tool_description_max_chars,
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -564,6 +578,19 @@ async fn main() {
         let admin_key_for_tray = config.admin_api_key.clone().unwrap_or_default();
         let tray_host = config.host.clone();
         let tray_port = config.port;
+        let (relaunch_config_path, relaunch_credentials_path) = tray_relaunch_paths;
+        // 托盘「重启服务」trigger：spawn detached 重启脚本（用启动时的 config/credentials 路径拉起
+        // 新进程）后，通知主线程优雅关闭（drain 在途请求、关 SQLite），主线程随后以退出码 3 退出。
+        // run.bat 监督循环见退出码 3 = 用户主动退出、不重拉；由重启脚本单独拉起新进程 → 无双拉。
+        // 与面板一键重启同源（复用 admin::service::spawn_windows_relaunch_process）。
+        let relaunch_trigger: Box<dyn Fn() + Send> = Box::new(move || {
+            tracing::info!("[托盘] 用户点击重启服务，spawn 重启脚本并优雅关闭…");
+            admin::spawn_windows_relaunch_process(
+                Some(relaunch_config_path.clone()),
+                Some(relaunch_credentials_path.clone()),
+            );
+            tray::quit_notify().notify_one();
+        });
         std::thread::Builder::new()
             .name("kiro-tray".into())
             .spawn(move || {
@@ -571,7 +598,9 @@ async fn main() {
                     host: tray_host,
                     port: tray_port,
                     admin_api_key: admin_key_for_tray,
-                    relaunch: None, // 重启项接线见 tray 模块（当前 None=置灰）
+                    relaunch: Some(tray::RelaunchInfo {
+                        trigger: relaunch_trigger,
+                    }),
                 });
             })
             .ok();

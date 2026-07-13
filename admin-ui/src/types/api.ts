@@ -310,6 +310,12 @@ export interface ConfigSnapshotResponse {
   extractThinking: boolean
   ccAutoBuffer: boolean
   stripEnvNoise: boolean
+  toolCleanLeakedTokens: boolean
+  toolStreamAlignFailure: boolean
+  toolExposeErrorToClient: boolean
+  toolRepairJson: boolean
+  toolTruncationRecovery: boolean
+  toolDescriptionMaxChars: number
   cooldownEnabled: boolean
   rateLimitEnabled: boolean
   rateLimitDailyMax: number
@@ -355,6 +361,12 @@ export interface UpdateConfigRequest {
   extractThinking?: boolean
   ccAutoBuffer?: boolean
   stripEnvNoise?: boolean
+  toolCleanLeakedTokens?: boolean
+  toolStreamAlignFailure?: boolean
+  toolExposeErrorToClient?: boolean
+  toolRepairJson?: boolean
+  toolTruncationRecovery?: boolean
+  toolDescriptionMaxChars?: number
   cooldownEnabled?: boolean
   rateLimitEnabled?: boolean
   rateLimitDailyMax?: number
