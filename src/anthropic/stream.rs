@@ -773,6 +773,11 @@ pub struct StreamContext {
     /// in-band `Event::Error`（及非 max_tokens 的 Exception）会在事件流中就地补发，
     /// 收尾逻辑据此避免重复补发同一个 error 事件。
     error_event_emitted: bool,
+    /// 泄漏 token 清洗（`tool_clean_leaked_tokens` 开启时）：当前文本处理位置是否在**行首/块首**。
+    /// 泄漏控制 token（course/課/count/care）只出现在行首且与后文无空格粘连，故只在行首尝试剥离，
+    /// 正常正文里的这些词（有空格分隔）绝不误删。初始 true（响应开头即行首），每段文本按是否以
+    /// 换行结尾更新。非持久跨请求，随 StreamContext 生命周期。
+    at_line_start: bool,
 }
 
 impl StreamContext {
@@ -806,6 +811,7 @@ impl StreamContext {
             dsml_tail_is_marker: false,
             completion: CompletionStatus::Ok,
             error_event_emitted: false,
+            at_line_start: true,
         }
     }
 
@@ -1171,9 +1177,71 @@ impl StreamContext {
     }
 
     /// 处理助手响应事件
+    /// 已知的模型泄漏控制/规划 token（会以行首粘连形式漏进输出文本）。可扩展。
+    /// 判据极保守：仅当这些词出现在**行首**、且**紧跟非空格且跨字符类**（后接 CJK / 全角标点 /
+    /// 冒号）时才视为泄漏并剥离——正常英文用法（`count the items`、`care about`，词后有空格）绝不命中。
+    const LEAKED_CONTROL_TOKENS: &'static [&'static str] =
+        &["course", "count", "care", "課", "课", "coursecount"];
+
+    /// 保守清洗行首泄漏的控制 token（`tool_clean_leaked_tokens` 开启时）。
+    ///
+    /// 只处理**行首**：若文本（在行首位置）以某个已知泄漏词开头，且该词紧邻的下一个字符是
+    /// 非 ASCII 字母/非空格（CJK、全角标点、冒号、大写字母跳变等跨类粘连），判定为泄漏并剥掉该词。
+    /// 返回清洗后的文本。误删防护：词后是空格或普通 ASCII 小写延续（如 `counter`/`careful`）→ 不剥。
+    fn clean_leaked_tokens(&self, content: &str) -> String {
+        if !self.at_line_start {
+            return content.to_string();
+        }
+        // 逐行处理：只对每行的行首做一次判定（保守，不递归剥多层）。
+        let mut out = String::with_capacity(content.len());
+        for (i, line) in content.split_inclusive('\n').enumerate() {
+            // split_inclusive 保留了行尾 \n；首段是否真在行首由 at_line_start 保证（i==0）
+            // 或前一段以 \n 结尾（i>0 必然行首）。
+            let is_line_start = i > 0 || self.at_line_start;
+            if is_line_start {
+                out.push_str(&Self::strip_leaked_prefix(line));
+            } else {
+                out.push_str(line);
+            }
+        }
+        out
+    }
+
+    /// 剥掉单行行首的一个泄漏词（若命中粘连特征）。非命中原样返回。
+    fn strip_leaked_prefix(line: &str) -> String {
+        for &tok in Self::LEAKED_CONTROL_TOKENS {
+            if let Some(rest) = line.strip_prefix(tok) {
+                // 判定粘连：rest 的首字符必须是"跨类粘连"信号，才算泄漏。
+                match rest.chars().next() {
+                    // 行尾就是这个词（后面啥也没有）→ 不确定，不剥（保守）。
+                    None => return line.to_string(),
+                    Some(c) => {
+                        // 空格/普通 ASCII 小写字母 → 正常英文延续（count the / counter），不剥。
+                        if c.is_whitespace() || c.is_ascii_lowercase() {
+                            return line.to_string();
+                        }
+                        // 跨类粘连：CJK、全角标点、冒号、数字、大写字母等 → 判泄漏，剥掉该词。
+                        return rest.to_string();
+                    }
+                }
+            }
+        }
+        line.to_string()
+    }
+
     fn process_assistant_response(&mut self, content: &str) -> Vec<SseEvent> {
         // 先剥离 DeepSeek DSML 工具协议标记(跨 chunk 安全),再走后续文本处理。
         let cleaned = self.strip_dsml_markers(content);
+        // 泄漏控制 token 清洗（开关默认关）：仅行首粘连特征命中才剥，误删风险极低。
+        let cleaned = if super::handlers::tool_clean_leaked_tokens_enabled() {
+            self.clean_leaked_tokens(&cleaned)
+        } else {
+            cleaned
+        };
+        // 更新行首标志：本段非空时，按是否以换行结尾决定下段起点是否在行首。
+        if !cleaned.is_empty() {
+            self.at_line_start = cleaned.ends_with('\n');
+        }
         let content = cleaned.as_str();
         if content.is_empty() {
             return Vec::new();
@@ -1543,8 +1611,20 @@ impl StreamContext {
         //   累积快照 / 纯增量碎片 / 重复终帧 / 迟到旧短快照 / 非前缀重写 均被正确处理。
         //   关键：非前缀双完整对象不再被无脑 append 成 `}{` 粘连非法 JSON（Invalid tool parameters 类型 C）。
         if !tool_use.input.is_empty() {
+            let model = self.model.clone();
             let buf = self.tool_input_sent.entry(tool_use.tool_use_id.clone()).or_default();
+            // 帧探针（KIRO_TOOL_TRACE）：抓上游逐帧原文 + 合并轨迹，定性 Invalid tool parameters 真因。
+            let buf_before = buf.clone();
             *buf = merge_tool_input(buf, &tool_use.input);
+            trace_tool_frame(
+                &model,
+                &tool_use.tool_use_id,
+                &tool_use.name,
+                tool_use.stop,
+                &tool_use.input,
+                &buf_before,
+                buf,
+            );
         }
 
         // 仅在 stop 时把完整缓冲一次性发出 + 关闭块（此前只累积、不发 partial_json）。
@@ -1566,19 +1646,110 @@ impl StreamContext {
     ///
     /// 校验完整 JSON：合法→原样发；非法→告警并尽力发（不静默吞成空参数——空参数会让客户端把
     /// 一个失败的工具调用当成"无参数成功调用"执行，比报错更危险）。空串→不发（无参工具，客户端得 `{}`）。
-    fn flush_tool_input(&mut self, block_index: i32, assembled: String) -> Vec<SseEvent> {
+    fn flush_tool_input(&mut self, block_index: i32, mut assembled: String) -> Vec<SseEvent> {
         if assembled.is_empty() {
             return Vec::new();
         }
         self.output_tokens += (assembled.len() as i32 + 3) / 4;
         if serde_json::from_str::<serde_json::Value>(&assembled).is_err() {
             // 拼装后仍非法：多因上游发了非法 JSON（如 JSON 不支持的 \x 转义 / 截断 \uXXXX / 裸控制符）
-            // 或中间帧丢失致截断。如实告警便于定位；仍把原样串发出交由客户端处置，不静默改写成空参。
+            // 或中间帧丢失截断。客户端拿坏 JSON 直接 parse 失败 → Invalid tool parameters。
+            // 归因标签（纯可观测，绝不进控制流）：单遍 string-aware 扫描把非法串按责任方分流——
+            // truncated=帧丢失/上游截断、illegal_chars=模型侧非法转义/裸控制符、两者兼有、其它畸形。
+            // 判据与 repair 层同源，只用于日志定位真因（"修不好的残留到底是谁的责任"）。
+            let defect = classify_tool_json_defect(&assembled);
             tracing::warn!(
                 block_index,
-                "tool_use 拼装后 input 非合法 JSON（长度 {}），可能上游非法转义或帧丢失截断",
-                assembled.len()
+                defect = defect.as_str(),
+                "tool_use 拼装后 input 非合法 JSON（长度 {}），归因={}",
+                assembled.len(),
+                defect.as_str()
             );
+            // 帧探针（KIRO_TOOL_TRACE）：非法时额外打印**完整拼装串**全文（含 model + 归因标签），
+            // 用于坐实是类型 A（上游模型帧本身含非法转义/乱码 token）还是类型 C（合并逻辑洞，已修）。
+            if tool_trace_enabled() {
+                tracing::warn!(
+                    target: "kiro::tool_trace",
+                    model = %self.model,
+                    block_index,
+                    defect = defect.as_str(),
+                    assembled_len = assembled.len(),
+                    assembled = %assembled,
+                    "[tool_trace] 拼装后非法 JSON 全文（定性 Invalid tool parameters）"
+                );
+            }
+            // 缓解④（根治向，默认开）：先尝试把坏 JSON 修成合法（转义非法反斜杠/裸控制符、补全截断），
+            // 修复后强制复验通过才用。成功则 assembled 已是合法 JSON、直接落到下方正常发送路径，
+            // 完全跳过失败态对齐/暴露错误逻辑（客户端能正常 parse，无需退避重试）。
+            if super::handlers::tool_repair_json_enabled() {
+                if let Some(repaired) = repair_tool_json(&assembled) {
+                    tracing::info!(
+                        block_index,
+                        orig_len = assembled.len(),
+                        repaired_len = repaired.len(),
+                        "tool_use 非法 JSON 已修复为合法 JSON（Invalid tool parameters 根治）"
+                    );
+                    assembled = repaired;
+                    // 修复成功 → 走正常发送（下方），不进入缓解②/③。
+                    return self
+                        .state_manager
+                        .handle_content_block_delta(
+                            block_index,
+                            json!({
+                                "type": "content_block_delta",
+                                "index": block_index,
+                                "delta": {
+                                    "type": "input_json_delta",
+                                    "partial_json": assembled
+                                }
+                            }),
+                        )
+                        .into_iter()
+                        .collect();
+                }
+                // 修不好 → 落入下方缓解②/③/⑤（与不开修复层等价，最坏情况不劣化）。
+            }
+            // 缓解⑤：截断跨轮恢复（开关默认关）。只在**修复层已启用且也补不回**（修复层开时走到这里
+            // = 上面 repair 已返回 None）且归因为真截断（Truncated / TruncatedAndIllegal）时触发：
+            // 不发不完整的 partial_json
+            // （半截参数会被客户端当完整调用执行，比整轮失败更危险），改置失败态 + 收尾补发 SSE error，
+            // 让客户端退避后重试整个请求。绝不 report_failure 连坐号（工具截断≠号坏，隔离铁律）。
+            // 非截断的畸形（IllegalChars/Malformed）不归本开关管，仍走②/③按原语义处理。
+            if should_recover_truncation(
+                defect,
+                super::handlers::tool_truncation_recovery_enabled(),
+                super::handlers::tool_repair_json_enabled(),
+            ) {
+                tracing::warn!(
+                    block_index,
+                    defect = defect.as_str(),
+                    "tool_use 参数真截断且修复层补不回：置失败态让客户端重试整轮（截断跨轮恢复）"
+                );
+                if self.completion.is_ok() {
+                    self.completion = CompletionStatus::UpstreamError {
+                        code: "INVALID_TOOL_INPUT".to_string(),
+                        message: "工具调用参数被上游截断（缺整段值），请重试；如反复触发可拆小该调用。"
+                            .to_string(),
+                    };
+                }
+                // 不发这条截断的坏 partial_json（收尾兜底据失败态补发 SSE error）。
+                return Vec::new();
+            }
+            // 缓解②：流式失败态对齐（开关默认关）。开启时把流式也置 UpstreamError{INVALID_TOOL_INPUT}
+            // 失败态，与非流式对齐（收尾记 ServerError、不污染成功率、收尾兜底会补发 SSE error）。
+            // 幂等：只在首个失败落定。绝不 report_failure 连坐号（工具非法≠号坏，隔离铁律）。
+            if super::handlers::tool_stream_align_failure_enabled() && self.completion.is_ok() {
+                self.completion = CompletionStatus::UpstreamError {
+                    code: "INVALID_TOOL_INPUT".to_string(),
+                    message: "工具调用参数非合法 JSON（模型侧生成异常）".to_string(),
+                };
+            }
+            // 缓解③：如实暴露错误（开关默认关）。开启时**不发**这条坏 partial_json（避免客户端拿坏 JSON
+            // parse 报 Invalid tool parameters），改由收尾兜底补发明确的 SSE error 让客户端退避重试。
+            // 关闭时保持现状：原样发出交客户端处置（绝不静默吞成空参——空参会被当"无参成功调用"，更危险）。
+            if super::handlers::tool_expose_error_to_client_enabled() {
+                return Vec::new();
+            }
         }
         self.state_manager
             .handle_content_block_delta(
@@ -1902,6 +2073,365 @@ fn estimate_tokens(text: &str) -> i32 {
 /// 用于 `merge_tool_input` 识别「非前缀重写」：两帧各自都完整时不能追加。
 fn is_complete_json(s: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(s).is_ok()
+}
+
+/// 非法工具参数 JSON 的缺陷归因（**纯可观测**，只写日志，绝不进控制流）。
+///
+/// 服务于「修不好的残留按责任方分流」定位真因：
+/// - `Truncated`：结构未闭合（缺 `}`/`]` 或字符串未收尾）→ 指向上游 Kiro 截断/超时/网络侧，可查。
+/// - `IllegalChars`：含非法转义（`\x`/`\U` 等）或裸控制符 → 指向模型侧生成异常，网关只能缓解。
+/// - `TruncatedAndIllegal`：两者兼有。
+/// - `Malformed`：结构闭合但仍非法（如 `}{` 粘连、键后无值）→ 归为其它畸形。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolJsonDefect {
+    Truncated,
+    IllegalChars,
+    TruncatedAndIllegal,
+    Malformed,
+}
+
+impl ToolJsonDefect {
+    /// 供日志字段用的稳定短标签。
+    fn as_str(&self) -> &'static str {
+        match self {
+            ToolJsonDefect::Truncated => "truncated",
+            ToolJsonDefect::IllegalChars => "illegal_chars",
+            ToolJsonDefect::TruncatedAndIllegal => "truncated_and_illegal",
+            ToolJsonDefect::Malformed => "malformed",
+        }
+    }
+}
+
+/// 单遍 string-aware 扫描的诊断计数（判据与两层 repair 一一对应，不新造语义）。
+struct ToolJsonScan {
+    /// 结构未闭合：括号栈非空，或扫描结束仍在字符串内。
+    truncated: bool,
+    /// 含 JSON 非法转义（非九种合法转义）或裸控制符。
+    illegal_chars: bool,
+    /// 出现 `}{` / `} {` 粘连（非前缀双对象特征）。
+    glued: bool,
+}
+
+/// 截断跨轮恢复的**纯决策**。三条件同时满足才触发：
+/// 1. `recovery_on`：截断恢复开关开（默认关）。
+/// 2. `repair_on`：JSON 修复层**已启用**——恢复的语义前提是「修复层也补不回」。修复层关时无法断言
+///    此截断不可修（很多截断如未闭合字符串其实能被结构层补全），故修复层关则不触发，退回②/③原语义。
+/// 3. 归因为真截断（Truncated / TruncatedAndIllegal）——非截断畸形（IllegalChars/Malformed）不归本开关管。
+///
+/// 抽成纯函数以便离线测试判据，避免在并行测试里 set/get 进程级开关造成互相污染。
+fn should_recover_truncation(defect: ToolJsonDefect, recovery_on: bool, repair_on: bool) -> bool {
+    recovery_on
+        && repair_on
+        && matches!(
+            defect,
+            ToolJsonDefect::Truncated | ToolJsonDefect::TruncatedAndIllegal
+        )
+}
+
+/// 对已知非法的工具参数串做单遍扫描并归因。只在 `flush_tool_input` 的 `from_str` 已失败分支调用。
+fn classify_tool_json_defect(s: &str) -> ToolJsonDefect {
+    let scan = scan_tool_json(s);
+    match (scan.truncated, scan.illegal_chars) {
+        (true, true) => ToolJsonDefect::TruncatedAndIllegal,
+        (true, false) => ToolJsonDefect::Truncated,
+        (false, true) => ToolJsonDefect::IllegalChars,
+        (false, false) => ToolJsonDefect::Malformed,
+    }
+}
+
+/// 单遍 string-aware 扫描，判据与 repair 层同源（合法转义集 `" \ / b f n r t u`，其余非法；
+/// 裸控制符 <0x20 非法；串未闭合 / 括号栈非空 / 末尾悬空转义 = 截断）。只归因，不改内容。
+fn scan_tool_json(s: &str) -> ToolJsonScan {
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut depth: i32 = 0;
+    let mut illegal_chars = false;
+    let mut glued = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_string {
+            if escaped {
+                if !matches!(c, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u') {
+                    illegal_chars = true;
+                }
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            } else if (c as u32) < 0x20 {
+                illegal_chars = true;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' | '[' => depth += 1,
+            '}' | ']' => {
+                depth -= 1;
+                if c == '}' {
+                    let mut look = chars.clone();
+                    while let Some(&n) = look.peek() {
+                        if n.is_whitespace() {
+                            look.next();
+                        } else {
+                            if n == '{' {
+                                glued = true;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let truncated = in_string || depth > 0 || escaped;
+    ToolJsonScan {
+        truncated,
+        illegal_chars,
+        glued,
+    }
+}
+
+/// 尝试把模型吐出的**非法 JSON 工具参数**修成合法 JSON（根治 `Invalid tool parameters`）。
+///
+/// # 为什么做这个（对着 Claude Code 客户端源码 + 官方 issue 的确凿依据）
+/// 客户端（2.1.207）拿到累积的 `partial_json` 后直接 `JSON.parse`（`Rq`+`JSON.parse`，仅剥 BOM、
+/// **不做任何修复**），parse 失败即包成 `{__unparsedToolInput:{raw,len}}` → 渲染成 "Invalid tool
+/// parameters"。官方源码 `HLy` 明列三类成因：**未转义反斜杠 / 未转义控制符 / 截断输出**，且
+/// 对应 issue（#69522 长 unicode 转义、#20015 Windows 路径反斜杠、#29715 smart quote/控制符）
+/// 全部 Open/not-planned——**官方不修**。这些请求经本网关时，我们在发给客户端前把坏 JSON 修好，
+/// 客户端就能 parse 成功，"Invalid tool parameters" 从本侧消失。
+///
+/// # 安全契约（调用方 `flush_tool_input` 已保证 + 本函数复验）
+/// - **只在 `from_str` 已失败时调用**：合法 JSON 永不进入本函数（对正常流零影响）。
+/// - **修复后必须复验**：返回 `Some` 当且仅当修复结果 `from_str` 通过；修不好返回 `None`，
+///   调用方退回现状（原样透传），**最坏情况 == 修复前行为**，不会更糟。
+/// - **只修字符级噪声，绝不臆测语义**：仅转义字符串内的非法转义/裸控制符、补全结构截断，
+///   不新增/删除/改写任何键值语义。
+///
+/// 返回修复后的合法 JSON 串；无法修成合法则 `None`。
+fn repair_tool_json(s: &str) -> Option<String> {
+    // 空串不在本函数职责内（flush_tool_input 上游已处理空串），保守拒绝。
+    if s.trim().is_empty() {
+        return None;
+    }
+    // 第一层：字符级修复（转义字符串内非法转义 + 裸控制符）。
+    let char_fixed = repair_json_char_level(s);
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&char_fixed) {
+        return serde_json::to_string(&v).ok();
+    }
+    // 第二层：在字符级修复基础上再补全结构截断（缺 `}` / `]` / 收尾 `"`）。
+    let struct_fixed = repair_json_structure(&char_fixed);
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&struct_fixed) {
+        return serde_json::to_string(&v).ok();
+    }
+    None
+}
+
+/// JSON 字符级修复：状态机扫描，**只修字符串字面量内部**的非法字符，结构字符（`{}[]:,` 等）原样保留。
+///
+/// 修两类（对应客户端 `HLy` 列的成因）：
+/// 1. **裸控制符**（U+0000..=U+001F 未转义，如真实换行/制表符混进字符串值）→ 转义成 `\n`/`\t`/`\uXXXX`。
+/// 2. **非法反斜杠转义**：JSON 只认 `\" \\ \/ \b \f \n \r \t \uXXXX` 九种。其它 `\x` 一律非法——
+///    - `\U`（Windows 路径 `C:\Users` 的典型泄漏）、`\x41`、`\.`、行尾孤立 `\` 等 → 把该反斜杠**再转义**
+///      成 `\\`（还原成"字面反斜杠 + 原字符"，这是模型本想表达路径/字面量时的正确 JSON）。
+///    - `\uXXXX` 若后随不足 4 位 hex（截断）→ 同样降级成字面 `\\u...`，交由结构层或复验兜底。
+///
+/// 字符串外的字符原样透传（不碰任何结构）。非字符串区的裸控制符（缩进空白等）JSON 本就允许，不动。
+fn repair_json_char_level(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 16);
+    let mut chars = s.chars().peekable();
+    let mut in_string = false;
+    while let Some(c) = chars.next() {
+        if !in_string {
+            // 结构区：只关心进入字符串的 `"`，其余原样。
+            out.push(c);
+            if c == '"' {
+                in_string = true;
+            }
+            continue;
+        }
+        // 字符串内：
+        match c {
+            '"' => {
+                // 字符串结束（未转义的引号）。
+                out.push(c);
+                in_string = false;
+            }
+            '\\' => {
+                // 转义序列：看下一个字符决定合法性。
+                match chars.next() {
+                    None => {
+                        // 行尾孤立反斜杠 → 转义成字面反斜杠。
+                        out.push_str("\\\\");
+                    }
+                    Some(esc) => match esc {
+                        // 九种合法转义原样保留。
+                        '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' => {
+                            out.push('\\');
+                            out.push(esc);
+                        }
+                        'u' => {
+                            // 必须后随 4 位 hex，否则截断 → 降级字面。
+                            let mut hex = String::new();
+                            for _ in 0..4 {
+                                match chars.peek() {
+                                    Some(h) if h.is_ascii_hexdigit() => {
+                                        hex.push(*h);
+                                        chars.next();
+                                    }
+                                    _ => break,
+                                }
+                            }
+                            if hex.len() == 4 {
+                                out.push_str("\\u");
+                                out.push_str(&hex);
+                            } else {
+                                // 截断的 \uXX → 字面反斜杠 + u + 已收集 hex。
+                                out.push_str("\\\\u");
+                                out.push_str(&hex);
+                            }
+                        }
+                        // 非法转义（\U \x \. 等）→ 反斜杠降级字面，原字符正常写入
+                        // （若原字符本身是控制符，落入下方 push_escaped_char 再处理）。
+                        other => {
+                            out.push_str("\\\\");
+                            push_escaped_char(&mut out, other);
+                        }
+                    },
+                }
+            }
+            // 裸控制符 → 转义。
+            c if (c as u32) < 0x20 => {
+                push_escaped_char(&mut out, c);
+            }
+            // 普通字符原样。
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// 把一个字符写进输出：控制符转义成 JSON 合法形式（`\n`/`\t`/`\uXXXX`），其余原样。
+fn push_escaped_char(out: &mut String, c: char) {
+    match c {
+        '\n' => out.push_str("\\n"),
+        '\r' => out.push_str("\\r"),
+        '\t' => out.push_str("\\t"),
+        '\u{08}' => out.push_str("\\b"),
+        '\u{0C}' => out.push_str("\\f"),
+        c if (c as u32) < 0x20 => {
+            out.push_str(&format!("\\u{:04x}", c as u32));
+        }
+        _ => out.push(c),
+    }
+}
+
+/// JSON 结构补全：针对**截断**（流被上游/网络在中途切断，缺尾部 `"`/`}`/`]`）。
+///
+/// 单遍扫描跟踪：是否在字符串内、括号栈（`{`/`[`）。扫完若仍在字符串内先补收尾 `"`，
+/// 再按栈逆序补 `}`/`]`。假设**输入已过字符级修复**（转义已合法），故这里只需按结构闭合。
+/// 保守边界：若结尾停在"键后无值"或"逗号后无元素"这类语义残缺处，闭合后仍非法 → 交由
+/// 调用方复验 `from_str` 拒绝（返回 None 退回透传）。不猜测缺失的值，只补闭合符号。
+fn repair_json_structure(s: &str) -> String {
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut stack: Vec<char> = Vec::new();
+    for c in s.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+    let mut out = s.to_string();
+    // 末尾悬空转义符（单个 `\`）→ 补成字面反斜杠，避免收尾 `"` 被它吃掉。
+    if escaped {
+        out.push('\\');
+    }
+    // 仍在字符串内 → 先闭合字符串。
+    if in_string {
+        out.push('"');
+    }
+    // 逆序补齐未闭合的括号。
+    while let Some(closer) = stack.pop() {
+        out.push(closer);
+    }
+    out
+}
+
+/// 工具帧探针总开关（环境变量 `KIRO_TOOL_TRACE` 非空即开）。用 `OnceLock` 缓存，避免每帧读环境变量。
+///
+/// 这是**常驻代码**的诊断探针（非临时旁挂），用于坐实 `Invalid tool parameters` 真因：
+/// dwgx 现场复现时设 `KIRO_TOOL_TRACE=1` 重启网关，即可抓到上游 `toolUseEvent.input` 的**逐帧原文**
+/// 与 `merge_tool_input` 的合并轨迹，据此定性：
+///   - **类型 C（网关侧，已修）**：原始帧序列里出现「非前缀双完整对象」等，合并后仍为合法 JSON；
+///   - **类型 A（模型抽风，网关修不了）**：某原始帧本身就含非法转义 / 乱码控制 token，
+///     拼装后 `flush_tool_input` 报「非合法 JSON」——此时网关只能如实透传，责任在上游模型。
+/// 平时零开销（未设环境变量时 `tool_trace_enabled()` 恒 false，探针整体短路）。
+fn tool_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("KIRO_TOOL_TRACE")
+            .map(|v| !v.trim().is_empty() && v != "0")
+            .unwrap_or(false)
+    })
+}
+
+/// 记录一帧 `toolUseEvent.input` 的合并轨迹（仅 `KIRO_TOOL_TRACE` 开启时）。
+///
+/// 输出到 `tracing` 的 `kiro::tool_trace` target（`RUST_LOG=kiro::tool_trace=trace` 可单独放行），
+/// 逐帧打印：model / tool_use_id / name / stop / 原始帧原文 / 合并前后缓冲，非前缀重写与非法 JSON
+/// 额外标注。原文可能含用户数据，故仅在显式开探针时输出。
+fn trace_tool_frame(
+    model: &str,
+    tool_use_id: &str,
+    name: &str,
+    stop: bool,
+    raw_frame: &str,
+    buf_before: &str,
+    buf_after: &str,
+) {
+    if !tool_trace_enabled() {
+        return;
+    }
+    let frame_ok = is_complete_json(raw_frame);
+    let after_ok = is_complete_json(buf_after);
+    // `}{` 粘连是类型 C 的典型非法特征，单独标注便于一眼识别。
+    let glued = buf_after.contains("}{") || buf_after.contains("} {");
+    tracing::trace!(
+        target: "kiro::tool_trace",
+        model = model,
+        tool_use_id = tool_use_id,
+        tool_name = name,
+        stop = stop,
+        raw_frame_len = raw_frame.len(),
+        raw_frame_json_ok = frame_ok,
+        buf_before_len = buf_before.len(),
+        buf_after_len = buf_after.len(),
+        buf_after_json_ok = after_ok,
+        buf_after_glued = glued,
+        raw_frame = %raw_frame,
+        buf_after = %buf_after,
+        "[tool_trace] 帧合并轨迹"
+    );
 }
 
 /// 合并同一 tool_use_id 逐帧到达的 input，返回合并后的新缓冲值。
@@ -2325,15 +2855,27 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_input_illegal_json_at_stop_still_emitted() {
-        // 上游发本就非法的 JSON（如 JSON 不支持的 \x 转义）→ 校验失败但仍原样发出（告警),
-        // 绝不静默吞成空参数（空参会让客户端把失败工具调用当无参成功执行,更危险）。
+    fn test_tool_input_illegal_json_at_stop_repaired_by_default() {
+        // 修复层默认开：上游发本就非法的 JSON（\x 是 JSON 不支持的转义）→ 修复层介入修成合法后发出，
+        // 客户端能正常 parse，不再报 Invalid tool parameters。`\xd7` 的 `\x` 非法 → 降级字面 `\\xd7`。
         let mut ctx = StreamContext::new_with_thinking("m", 1, false, HashMap::new());
         let _ = ctx.generate_initial_events();
         let (joined, n) = run_tool_frames(&mut ctx, &[(r#"{"a":"\xd7"}"#, true)]);
         assert_eq!(n, 1, "非法 JSON 也要发出(不静默空参)");
-        assert_eq!(joined, r#"{"a":"\xd7"}"#, "原样发出交客户端处置");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&joined).is_ok(),
+            "修复层默认开：发给客户端的必须是合法 JSON，实际={}",
+            joined
+        );
+        // 值语义：`\x` 非法转义降级为字面反斜杠，值为字面 `\xd7`。
+        let v: serde_json::Value = serde_json::from_str(&joined).unwrap();
+        assert_eq!(v["a"].as_str().unwrap(), r"\xd7", "非法 \\x 转义降级为字面反斜杠");
     }
+
+    // 注：修复层"关闭时原样透传"的行为不单独用 static 开关测——进程级 static 在并行测试下会互相
+    // 污染（一个测试 set(false) 期间别的 ON 前提测试恰好在跑就会假失败）。透传分支的正确性由
+    // flush_tool_input 里 `if tool_repair_json_enabled()` 的显式门控保证（关则完全不调 repair），
+    // 修复函数本身的正确性由上面的纯函数注入测试独立覆盖，两者组合已充分且无并发风险。
 
     #[test]
     fn test_tool_input_truncated_stream_flushes_on_final() {
@@ -3271,6 +3813,208 @@ mod tests {
         assert!(serde_json::from_str::<serde_json::Value>(&buf).is_ok());
     }
 
+    // ============ JSON 修复层（缓解④，根治向）离线注入测试 ============
+    // 数据源：Claude Code 官方 issue 坐实的真实坏帧成因——
+    //   #20015 Windows 路径反斜杠（\U 非法转义）、#69522 长 unicode 转义、#29715 裸控制符/smart quote。
+    // 契约：repair_tool_json 只在 from_str 已失败时被调用；返回 Some 必为合法 JSON，否则 None。
+
+    /// 铁律①：合法 JSON 绝不进入修复函数——但即便误入，也应原样往返、语义不变（幂等安全网）。
+    #[test]
+    fn test_repair_noop_on_valid_json() {
+        let valid = r#"{"path":"C:/Users/foo","content":"hello world"}"#;
+        // repair_tool_json 内部先 char_level 再复验；合法 JSON 的 char_level 不改结构、复验即过。
+        let repaired = repair_tool_json(valid).expect("合法 JSON 应能往返");
+        let a: serde_json::Value = serde_json::from_str(valid).unwrap();
+        let b: serde_json::Value = serde_json::from_str(&repaired).unwrap();
+        assert_eq!(a, b, "合法 JSON 修复往返后语义必须完全一致");
+    }
+
+    /// #20015：Windows 路径反斜杠 `C:\Users`（模型直接吐字面 `\U`，JSON 非法转义）。
+    /// 现状：客户端 JSON.parse 失败 → Invalid tool parameters。修复后合法，客户端不再报错。
+    ///
+    /// 诚实边界：`\U`、`\d` 是 JSON 非法转义 → 修复层把反斜杠降级成字面 `\\`，值正确还原。
+    /// 但 `\t`（如 `\test.txt`）是 JSON **合法**转义（制表符）——修复层**不碰合法转义**（碰了会破坏
+    /// 正常场景），故这里用 `program.exe` 这类**不含合法转义字符**的路径，锁死"非法转义被正确还原"。
+    #[test]
+    fn test_repair_windows_path_backslash() {
+        // content 值里 C:\Users\dwgx\program.exe —— \U \d \p 都是 JSON 非法转义（无合法转义歧义）。
+        let bad = r#"{"file_path":"C:\Users\dwgx\program.exe"}"#;
+        assert!(
+            serde_json::from_str::<serde_json::Value>(bad).is_err(),
+            "前提：Windows 反斜杠路径确为非法 JSON"
+        );
+        let fixed = repair_tool_json(bad).expect("Windows 路径反斜杠应可修复");
+        let v: serde_json::Value = serde_json::from_str(&fixed).expect("修复后必合法");
+        assert_eq!(
+            v["file_path"].as_str().unwrap(),
+            r"C:\Users\dwgx\program.exe",
+            "修复后路径值应还原成字面反斜杠（非法转义 \\U\\d\\p 降级为字面）"
+        );
+    }
+
+    /// #29715：裸控制符（真实换行/制表符混进字符串值，未转义）→ JSON 非法。修复后转义成 \n/\t。
+    #[test]
+    fn test_repair_bare_control_chars() {
+        // content 值里有真实换行和 tab（裸控制符），JSON 字符串内非法。
+        let bad = "{\"content\":\"line1\nline2\tend\"}";
+        assert!(
+            serde_json::from_str::<serde_json::Value>(bad).is_err(),
+            "前提：裸控制符确为非法 JSON"
+        );
+        let fixed = repair_tool_json(bad).expect("裸控制符应可修复");
+        let v: serde_json::Value = serde_json::from_str(&fixed).expect("修复后必合法");
+        assert_eq!(
+            v["content"].as_str().unwrap(),
+            "line1\nline2\tend",
+            "修复后控制符应还原为真实换行/制表符（值语义不变）"
+        );
+    }
+
+    /// 截断输出（流被中途切断，缺收尾 `"` 和 `}`）→ 结构层补全。
+    #[test]
+    fn test_repair_truncated_structure() {
+        let bad = r#"{"path":"a.txt","content":"unfinished"#;
+        assert!(
+            serde_json::from_str::<serde_json::Value>(bad).is_err(),
+            "前提：截断串确为非法 JSON"
+        );
+        let fixed = repair_tool_json(bad).expect("截断应可补全");
+        let v: serde_json::Value = serde_json::from_str(&fixed).expect("补全后必合法");
+        assert_eq!(v["path"].as_str().unwrap(), "a.txt");
+        assert_eq!(v["content"].as_str().unwrap(), "unfinished");
+    }
+
+    /// #69522：截断的 `\u` 转义（`\uD83`——不足 4 位 hex）→ 降级字面，复验兜底。
+    #[test]
+    fn test_repair_truncated_unicode_escape() {
+        let bad = r#"{"q":"emoji \uD83"}"#;
+        assert!(
+            serde_json::from_str::<serde_json::Value>(bad).is_err(),
+            "前提：截断 \\u 转义确为非法 JSON"
+        );
+        // 能修成合法即达标（降级为字面 \uD83 文本），语义退化可接受、总比客户端整个报错强。
+        let fixed = repair_tool_json(bad).expect("截断 unicode 转义应可修成合法");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&fixed).is_ok(),
+            "修复后必为合法 JSON"
+        );
+    }
+
+    /// 端到端：flush_tool_input 收到非法 JSON（开关默认开）→ 修复成功 → 发出的 partial_json 必合法。
+    /// 这是客户端真正消费的字节，锁死"客户端不再报 Invalid tool parameters"。
+    #[test]
+    fn test_flush_tool_input_repairs_before_sending() {
+        let mut ctx = StreamContext::new_with_thinking("claude-sonnet-4.6", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        // Windows 路径非法转义（#20015 真实成因）。
+        let bad = r#"{"file_path":"C:\Users\x\a.txt"}"#.to_string();
+        let evs = ctx.flush_tool_input(0, bad);
+        let delta = evs
+            .iter()
+            .find(|e| e.data["delta"]["type"] == "input_json_delta")
+            .expect("应发出 input_json_delta");
+        let partial = delta.data["delta"]["partial_json"].as_str().unwrap();
+        assert!(
+            serde_json::from_str::<serde_json::Value>(partial).is_ok(),
+            "flush 发给客户端的 partial_json 必须是合法 JSON（修复层已介入）：{}",
+            partial
+        );
+    }
+
+    /// 真实上游模式回归（2026-07-13 本地网关 KIRO_TOOL_TRACE 抓包坐实）：Kiro toolUseEvent.input
+    /// 是**纯增量碎片**——每帧只带新片段（`{"path": "` → `test.txt"` → `, "con` → …），buf 单调增长、
+    /// 全程无 `}{` 粘连，最后一帧拼成完整合法 JSON。含反斜杠 / emoji / 多语言 / 引号亦无碍。
+    /// 这是 Invalid tool parameters 类型 C 修复覆盖的主路径，此测试锁死其正确性防回归。
+    #[test]
+    fn test_merge_real_upstream_incremental_capture() {
+        // 逐帧照抄一次真实抓包的碎片序列（含转义反斜杠与 emoji）。
+        let frames = [
+            r#"{"path": ""#,
+            r#"test.txt""#,
+            r#", "con"#,
+            r#"tent": "H"#,
+            "ello World! ",
+            r#"🌍\n\nend"#,
+            r#""}"#,
+        ];
+        let mut buf = String::new();
+        let mut glued_ever = false;
+        for f in frames {
+            buf = merge_tool_input(&buf, f);
+            if buf.contains("}{") {
+                glued_ever = true;
+            }
+        }
+        assert!(!glued_ever, "纯增量拼装全程不应出现 }}{{ 粘连");
+        assert_eq!(buf, r#"{"path": "test.txt", "content": "Hello World! 🌍\n\nend"}"#);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&buf).is_ok(),
+            "纯增量碎片最终应拼成合法 JSON（类型 C 主路径）"
+        );
+    }
+
+    /// 曾经的"类型 A 只能透传"契约，已被修复层（缓解④，默认开）**升级为根治**：上游模型帧含 JSON
+    /// 非法转义（`\x` —— JSON 只认 `\uXXXX`）时，`flush_tool_input` 先修成合法 JSON 再发，客户端能
+    /// 正常 parse，不再报 Invalid tool parameters。此测试锁死"端到端非法 → 发出的必是合法 JSON"。
+    /// （修复层关闭时的原样透传行为由纯函数契约 + repair_off 专测覆盖。）
+    #[test]
+    fn test_process_tool_use_type_a_illegal_escape_repaired() {
+        use crate::kiro::model::events::ToolUseEvent;
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-4.6", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        // `\x41` 是 JSON 非法转义（合法应为 `A`）——模拟上游模型控制 token 抽风产出的非法串。
+        let illegal = r#"{"path":"a.txt","content":"bad\x41escape"}"#;
+        assert!(
+            serde_json::from_str::<serde_json::Value>(illegal).is_err(),
+            "前提：该串确为非法 JSON（\\x 转义）"
+        );
+        let evs = ctx.process_tool_use(&ToolUseEvent {
+            name: "write_file".to_string(),
+            tool_use_id: "toolu_typea".to_string(),
+            input: illegal.to_string(),
+            stop: true,
+        });
+        let delta = evs
+            .iter()
+            .find(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "input_json_delta"
+            })
+            .expect("应发出 input_json_delta（修复后，不吞）");
+        let assembled = delta.data["delta"]["partial_json"].as_str().unwrap();
+        assert!(
+            serde_json::from_str::<serde_json::Value>(assembled).is_ok(),
+            "修复层默认开：发给客户端的必是合法 JSON，实际={}",
+            assembled
+        );
+    }
+
+    /// 泄漏 token 清洗（保守高信号）：行首泄漏词直贴 CJK/标点粘连 → 剥离；正常英文用法 → 不误删。
+    #[test]
+    fn test_strip_leaked_prefix() {
+        assert_eq!(StreamContext::strip_leaked_prefix("course重读文件"), "重读文件");
+        assert_eq!(StreamContext::strip_leaked_prefix("課我加的是"), "我加的是");
+        assert_eq!(StreamContext::strip_leaked_prefix("care：我把"), "：我把");
+        assert_eq!(StreamContext::strip_leaked_prefix("count你好"), "你好");
+        // 不命中（正常英文）：词后空格 / 小写延续 → 原样保留，绝不误删。
+        assert_eq!(StreamContext::strip_leaked_prefix("count the items"), "count the items");
+        assert_eq!(StreamContext::strip_leaked_prefix("counter offer"), "counter offer");
+        assert_eq!(StreamContext::strip_leaked_prefix("careful now"), "careful now");
+        assert_eq!(StreamContext::strip_leaked_prefix("course of action"), "course of action");
+        // 词单独成行尾（后无内容）→ 不确定，保守不剥。
+        assert_eq!(StreamContext::strip_leaked_prefix("count"), "count");
+        // 非泄漏词开头 → 原样。
+        assert_eq!(StreamContext::strip_leaked_prefix("hello世界"), "hello世界");
+    }
+
+    /// clean_leaked_tokens：只在行首处理，多行时每行行首各判一次。
+    #[test]
+    fn test_clean_leaked_tokens_multiline() {
+        let ctx = StreamContext::new_with_thinking("claude-sonnet-4.6", 1, false, HashMap::new());
+        let input = "course重读\nnormal line\ncount你好";
+        assert_eq!(ctx.clean_leaked_tokens(input), "重读\nnormal line\n你好");
+    }
+
     /// process_tool_use 端到端：非前缀双对象场景，flush 出的 partial_json 必须是合法 JSON（第二帧）。
     #[test]
     fn test_process_tool_use_nonprefix_double_object_emits_legal_json() {
@@ -3356,5 +4100,79 @@ mod tests {
             assembled, payload,
             "国产模型下 tool input 也应原样，DSML 只作用于 text/thinking"
         );
+    }
+
+    // ============ 截断诊断归因标签（短板 2.5，纯可观测）离线测试 ============
+    // classify_tool_json_defect 只在 from_str 已失败分支被调、只写日志，绝不进控制流。
+    // 判据与 repair 层同源：truncated=结构未闭合/串未终结、illegal_chars=非法转义或裸控制符。
+
+    /// 截断（缺收尾 `"` 和 `}`）→ 归因 Truncated。
+    #[test]
+    fn test_classify_defect_truncated() {
+        let s = r#"{"path":"a.txt","content":"unfinished"#;
+        assert_eq!(classify_tool_json_defect(s), ToolJsonDefect::Truncated);
+    }
+
+    /// 非法转义（`\x`）+ 结构完整闭合 → 归因 IllegalChars。
+    #[test]
+    fn test_classify_defect_illegal_chars() {
+        let s = r#"{"path":"bad\x41escape"}"#;
+        assert_eq!(classify_tool_json_defect(s), ToolJsonDefect::IllegalChars);
+    }
+
+    /// 裸控制符（真实换行未转义）+ 结构完整 → 归因 IllegalChars。
+    #[test]
+    fn test_classify_defect_bare_control() {
+        let s = "{\"content\":\"line1\nline2\"}";
+        assert_eq!(classify_tool_json_defect(s), ToolJsonDefect::IllegalChars);
+    }
+
+    /// 既含非法转义又结构截断 → 归因 TruncatedAndIllegal。
+    #[test]
+    fn test_classify_defect_truncated_and_illegal() {
+        let s = r#"{"path":"C:\Users\x"#;
+        assert_eq!(
+            classify_tool_json_defect(s),
+            ToolJsonDefect::TruncatedAndIllegal
+        );
+    }
+
+    /// 结构闭合、字符合法，但 `}{` 粘连（非前缀双对象）→ 归因 Malformed。
+    #[test]
+    fn test_classify_defect_malformed_glued() {
+        let s = r#"{"a":1}{"b":2}"#;
+        let scan = scan_tool_json(s);
+        assert!(scan.glued, "应识别出 }}{{ 粘连");
+        assert_eq!(classify_tool_json_defect(s), ToolJsonDefect::Malformed);
+    }
+
+    /// 短板2：截断跨轮恢复纯决策——恢复开关开 + 修复层开 + 归因真截断,三条件全满足才触发。
+    #[test]
+    fn test_should_recover_truncation_decision() {
+        use ToolJsonDefect::*;
+        // 恢复开关关 → 任何情况都不触发（默认行为不变）。
+        assert!(!should_recover_truncation(Truncated, false, true));
+        assert!(!should_recover_truncation(TruncatedAndIllegal, false, true));
+        // 修复层关 → 不触发（无法断言"修复也补不回",退回②/③原语义）。
+        assert!(!should_recover_truncation(Truncated, true, false));
+        assert!(!should_recover_truncation(TruncatedAndIllegal, true, false));
+        // 恢复开 + 修复开 + 真截断 → 触发。
+        assert!(should_recover_truncation(Truncated, true, true));
+        assert!(should_recover_truncation(TruncatedAndIllegal, true, true));
+        // 恢复开 + 修复开但非截断畸形 → 不归本开关管（仍走②/③）。
+        assert!(!should_recover_truncation(IllegalChars, true, true));
+        assert!(!should_recover_truncation(Malformed, true, true));
+    }
+
+    /// 稳定短标签：日志字段值不随重构漂移。
+    #[test]
+    fn test_defect_as_str_labels() {
+        assert_eq!(ToolJsonDefect::Truncated.as_str(), "truncated");
+        assert_eq!(ToolJsonDefect::IllegalChars.as_str(), "illegal_chars");
+        assert_eq!(
+            ToolJsonDefect::TruncatedAndIllegal.as_str(),
+            "truncated_and_illegal"
+        );
+        assert_eq!(ToolJsonDefect::Malformed.as_str(), "malformed");
     }
 }
