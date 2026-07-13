@@ -20,6 +20,10 @@ const OIDC_SCOPES: &[&str] = &[
     "codewhisperer:taskassist",
 ];
 
+/// 自动探测 IdC 实例 region 的候选表。单一真相源见
+/// [`crate::kiro::regions::OIDC_PROBE_REGIONS`]（此处 re-export，调用点不变）。
+use crate::kiro::regions::OIDC_PROBE_REGIONS as IDC_OIDC_PROBE_REGIONS;
+
 /// OIDC 客户端注册结果
 #[derive(Debug, Clone)]
 pub struct OidcClient {
@@ -181,6 +185,74 @@ pub async fn start_device_authorization(
     })
 }
 
+/// 构造探测顺序:用户填的 region 打头,再补候选表(去重)。抽成纯函数便于单测。
+fn probe_region_order(user_region: &str) -> Vec<String> {
+    let mut order: Vec<String> = Vec::with_capacity(IDC_OIDC_PROBE_REGIONS.len() + 1);
+    let ur = user_region.trim();
+    if !ur.is_empty() {
+        order.push(ur.to_string());
+    }
+    for r in IDC_OIDC_PROBE_REGIONS {
+        if !order.iter().any(|x| x == r) {
+            order.push((*r).to_string());
+        }
+    }
+    order
+}
+
+/// Step 1+2 合并·自动探测 region（防呆）：IdC start URL 不含 region,用户填错会 400。
+/// 按「用户填的 region 打头 + 候选表」顺次试 register_client + start_device_authorization,
+/// **第一个 device_authorization 成功的 region 即实例所在 region**,返回 `(region, client, device_auth)`。
+///
+/// - clientId/secret 是 per-region 的,故每个 region 各注册一次,返回命中 region 的那套。
+/// - device_authorization 报 400/invalid_request = 该 region 无此实例 → 试下一个（这是探测主判据）。
+/// - 其它错误（网络/5xx）记 last_err 继续试别的 region,不因单点故障中断整轮。
+/// - 全部 region 都不成 → 返回可读中文错误 + 最后一个上游错误（不再裸抛 400 让用户懵）。
+/// - 成本:走 AWS 公开 OIDC 端点,与 Kiro 号池无关、不烧号；用户填对时首个即命中零额外开销。
+pub async fn register_and_authorize_probing(
+    user_region: &str,
+    start_url: &str,
+    config: &Config,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<(String, OidcClient, DeviceAuth)> {
+    let order = probe_region_order(user_region);
+    let mut last_err: Option<String> = None;
+    for region in &order {
+        let oidc_client = match register_client(region, config, proxy).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!("IdC region={} register_client 失败(试下一个): {}", region, e);
+                last_err = Some(format!("register_client@{}: {}", region, e));
+                continue;
+            }
+        };
+        match start_device_authorization(region, &oidc_client, start_url, config, proxy).await {
+            Ok(device_auth) => {
+                tracing::info!(
+                    "IdC 探测到实例 region={}（用户填 {}）",
+                    region,
+                    if user_region.trim().is_empty() { "<空>" } else { user_region.trim() }
+                );
+                return Ok((region.clone(), oidc_client, device_auth));
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "IdC region={} device_authorization 未命中(试下一个): {}",
+                    region, e
+                );
+                last_err = Some(format!("device_authorization@{}: {}", region, e));
+                continue;
+            }
+        }
+    }
+    anyhow::bail!(
+        "IdC 登录失败:start URL 在所试的 {} 个 region 均无对应实例。请确认 start URL 正确,\
+         或到 AWS IAM Identity Center 设置查看实例所在 region 后重填。（最后错误：{}）",
+        order.len(),
+        last_err.as_deref().unwrap_or("无")
+    )
+}
+
 /// Step 4: 轮询 CreateToken（一次调用，由上层循环驱动）
 pub async fn poll_create_token(
     region: &str,
@@ -255,4 +327,40 @@ pub async fn poll_create_token(
     }
 
     PollTokenResult::Error(format!("CreateToken 失败 {}: {}", status, text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_probe_region_order_user_first_dedup() {
+        // 用户填的 region 打头,候选表补齐,去重(用户填的若在候选表里不重复出现)。
+        let order = probe_region_order("eu-central-1");
+        assert_eq!(order.first().map(|s| s.as_str()), Some("eu-central-1"));
+        // eu-central-1 只出现一次(去重)
+        assert_eq!(order.iter().filter(|r| *r == "eu-central-1").count(), 1);
+        // 候选表其余 region 仍在
+        assert!(order.iter().any(|r| r == "us-east-1"));
+        assert_eq!(order.len(), IDC_OIDC_PROBE_REGIONS.len());
+    }
+
+    #[test]
+    fn test_probe_region_order_novel_user_region_prepended() {
+        // 用户填了候选表没有的 region → 打头,总数 = 候选表 + 1。
+        // 用一个确定不在 OIDC_PROBE_REGIONS 里的 region(us-west-1 只在对话白名单,不在 OIDC 探测表)。
+        let novel = "us-west-1";
+        assert!(!IDC_OIDC_PROBE_REGIONS.contains(&novel), "测试前提:该 region 不在 OIDC 候选表");
+        let order = probe_region_order(novel);
+        assert_eq!(order.first().map(|s| s.as_str()), Some(novel));
+        assert_eq!(order.len(), IDC_OIDC_PROBE_REGIONS.len() + 1);
+    }
+
+    #[test]
+    fn test_probe_region_order_empty_user_region() {
+        // 用户没填 region → 只用候选表,顺序不变。
+        let order = probe_region_order("   ");
+        assert_eq!(order.len(), IDC_OIDC_PROBE_REGIONS.len());
+        assert_eq!(order.first().map(|s| s.as_str()), Some("us-east-1"));
+    }
 }
