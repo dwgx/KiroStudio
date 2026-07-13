@@ -2,6 +2,23 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.15] - 2026-07-14
+
+### 泄漏 token 清洗诊断（清洗不再是黑箱）
+此前 `clean_leaked_tokens` 剥掉 #70544 幻觉 token（court/course/count/care/card/call/課/课）后
+**直接返回，零计数、零日志、零诊断**——剥了多少、命中什么，用户和运维都看不到。本版补上可观测：
+- `StreamContext` 加泄漏计数器：`leaked_stripped`（真剥掉数）+ `leaked_saturation_lines`（整行就是纯
+  泄漏词的行数，#70544 整段退化信号）。`strip_leaked_prefix` 返回命中信息，`clean_leaked_tokens` 累加。
+- 收尾 `generate_final_events` 若本请求清洗过泄漏 token / 命中 saturation → `tracing::warn` 如实记一条
+  （含 model + 清洗数 + saturation 行数 + 归因提示：saturation=模型侧整段退化，网关仅能缓解不能根治，
+  建议该模型高多字节上下文场景 /clear 或换 sonnet）。
+- 新增 `KIRO_LEAK_TRACE` 环境变量探针（仿 `KIRO_TOOL_TRACE`），开启时收尾打印本请求泄漏清洗全貌，
+  平时零开销。
+- **剥离判据完全不变**（0.7.14 已收严：CJK/全角粘连才剥、正常英文 count:42/countDown() 绝不误删、
+  court/課/课 独占整行特例真删）——本版纯加观测，不改任何已发内容。
+- **诚实边界**：清洗只作用于**流经网关的上游文本**（Bug B 模型侧现象，网关能缓解流经它的下游泄漏，
+  但对不经过网关的场景物理上无能为力）。
+
 ## [0.7.14] - 2026-07-14
 
 ### 上号智能诊断系统（无论谁的错都给正确引导）
