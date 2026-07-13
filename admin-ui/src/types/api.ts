@@ -229,6 +229,8 @@ export interface PollIdcLoginResponse {
 export interface StartExternalIdpLoginRequest {
   priority?: number
   proxyUrl?: string
+  // 优先探测区域（可选）：并入授权后的多 region profile 探测候选并排头，覆盖冷门 region。
+  region?: string
 }
 
 // 第 1 步响应：拿到会话 id + Kiro 登录地址

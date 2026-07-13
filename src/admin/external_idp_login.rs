@@ -64,6 +64,9 @@ struct ExternalIdpSession {
     /// 多 profile 时前端弹窗选一个,select 阶段用暂存的 token 直接建号(避免二次 exchange,
     /// 授权码一次性)。
     pending: Option<PendingLeg2>,
+    /// 优先探测区域（可选，start 时用户填的合法 region）：leg2 探测 profile 时并入候选并排头,
+    /// 覆盖只在冷门 region 开通的账号。非法/空值在 start 时已被过滤为 None。
+    preferred_region: Option<String>,
     created_at: Instant,
 }
 
@@ -175,8 +178,16 @@ impl ExternalIdpLoginManager {
         &self,
         priority: u32,
         proxy_url: Option<String>,
+        preferred_region: Option<String>,
     ) -> anyhow::Result<ExternalIdpStartResult> {
         self.cleanup_expired();
+
+        // 优先探测区域：只接受合法 Kiro region（白名单），非法/空值忽略退回默认候选表。
+        // 这里绝不直接拼进出站 host（探测仍走 PROFILE_PROBE_REGIONS 逻辑 + ARN 严格解析），
+        // 仅作为「优先尝试哪个 region」的提示，防污染值。
+        let preferred_region = preferred_region
+            .map(|r| r.trim().to_lowercase())
+            .filter(|r| !r.is_empty() && KiroCredentials::is_supported_region(r));
 
         let (_verifier, challenge) = generate_pkce();
         let state = random_state();
@@ -202,6 +213,7 @@ impl ExternalIdpLoginManager {
                 custom_proxy,
                 leg2: None,
                 pending: None,
+                preferred_region,
                 created_at: Instant::now(),
             },
         );
@@ -311,8 +323,9 @@ impl ExternalIdpLoginManager {
         session_id: &str,
         pasted_url: &str,
     ) -> anyhow::Result<ExternalIdpLeg2Result> {
-        // priority/custom_proxy 在 build_and_add_credential 里从 session 重新读,此处只需 leg2+proxy。
-        let (leg2, proxy) = {
+        // priority/custom_proxy 在 build_and_add_credential 里从 session 重新读,此处只需
+        // leg2+proxy+优先探测区域。
+        let (leg2, proxy, preferred_region) = {
             let sessions = self.sessions.lock();
             let s = sessions
                 .get(session_id)
@@ -324,7 +337,7 @@ impl ExternalIdpLoginManager {
                 .leg2
                 .clone()
                 .ok_or_else(|| anyhow!("请先完成第 2 步（粘贴登录跳转后的地址）"))?;
-            (leg2, s.proxy.clone())
+            (leg2, s.proxy.clone(), s.preferred_region.clone())
         };
 
         let params = parse_query_from_pasted(pasted_url);
@@ -357,6 +370,7 @@ impl ExternalIdpLoginManager {
             &self.token_manager.config().kiro_version,
             proxy.as_ref(),
             tls,
+            preferred_region.as_deref(),
         )
         .await
         .context("解析 CodeWhisperer profileArn 失败（该 M365 账号可能未开通 Kiro/CodeWhisperer）")?;
@@ -791,20 +805,45 @@ async fn list_region_profile_arns(
     Ok(arns)
 }
 
+/// 合并探测候选 region：用户优先区域（若有，排头）∪ `PROFILE_PROBE_REGIONS`，按顺序去重。
+///
+/// preferred 已在 start 时经白名单校验（此处仅按小写比较去重）。这样只在冷门 region 开通的
+/// 账号（如仅 eu-central-1）也能被探到,而不改动默认候选表本身。
+fn merge_probe_regions(preferred_region: Option<&str>) -> Vec<String> {
+    use crate::kiro::token_manager::PROFILE_PROBE_REGIONS;
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    if let Some(pref) = preferred_region.map(|r| r.trim().to_lowercase()).filter(|r| !r.is_empty()) {
+        if seen.insert(pref.clone()) {
+            out.push(pref);
+        }
+    }
+    for r in PROFILE_PROBE_REGIONS {
+        if seen.insert(r.to_string()) {
+            out.push(r.to_string());
+        }
+    }
+    out
+}
+
 /// 跨候选 region 探测该账号的**全部** profile,合并去重为 `Vec<ProfileOption>`。
 ///
 /// 每个 region 端点只返回本 region 的 profile(实测 2026-07-12),故必须逐 region 打。
-/// 候选 region = `PROFILE_PROBE_REGIONS`(us-east-1 / eu-central-1,dwgx 定的最普遍两个)。
+/// 候选 region = 用户优先区域(可选,排头) ∪ `PROFILE_PROBE_REGIONS`(见 [`merge_probe_regions`])。
 /// 并发探测,单 region 失败不阻断其它;按 arn 去重。region 由 arn 严格解析(白名单校验)。
 async fn list_all_available_profiles(
     access_token: &str,
     kiro_version: &str,
     proxy: Option<&ProxyConfig>,
     tls: crate::model::config::TlsBackend,
+    preferred_region: Option<&str>,
 ) -> anyhow::Result<Vec<ProfileOption>> {
-    use crate::kiro::token_manager::PROFILE_PROBE_REGIONS;
+    // 探测候选 = 用户优先区域（若有，排头）∪ PROFILE_PROBE_REGIONS，去重。
+    // 优先区域已在 start 时经白名单校验；这里合并让冷门 region 的账号也能被探到,
+    // 且不改变「每 region 端点只返回本 region profile」的逐 region 探测语义。
+    let probe_regions = merge_probe_regions(preferred_region);
     // 并发打所有候选 region。
-    let futs = PROFILE_PROBE_REGIONS.iter().map(|region| {
+    let futs = probe_regions.iter().map(|region| {
         let region = region.to_string();
         async move {
             match list_region_profile_arns(access_token, &region, kiro_version, proxy, tls).await {
@@ -919,6 +958,44 @@ mod tests {
         let p = parse_query_from_pasted("code=AQAB123&state=xyz");
         assert_eq!(p.get("code").map(|s| s.as_str()), Some("AQAB123"));
         assert_eq!(p.get("state").map(|s| s.as_str()), Some("xyz"));
+    }
+
+    #[test]
+    fn test_merge_probe_regions_no_preferred() {
+        use crate::kiro::token_manager::PROFILE_PROBE_REGIONS;
+        // 无优先区域 → 恰好等于默认候选表（顺序不变）。
+        let got = merge_probe_regions(None);
+        let want: Vec<String> = PROFILE_PROBE_REGIONS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn test_merge_probe_regions_preferred_prepended_and_deduped() {
+        use crate::kiro::token_manager::PROFILE_PROBE_REGIONS;
+        // 冷门区域（不在默认表内）→ 排头、其余原样、总数 +1。
+        let cold = "ap-northeast-3";
+        assert!(!PROFILE_PROBE_REGIONS.contains(&cold), "该测试要求 cold 不在默认表内");
+        let got = merge_probe_regions(Some(cold));
+        assert_eq!(got.first().map(|s| s.as_str()), Some(cold));
+        assert_eq!(got.len(), PROFILE_PROBE_REGIONS.len() + 1);
+
+        // 优先区域已在默认表内 → 排头且不重复，总数不变。
+        let dup = PROFILE_PROBE_REGIONS[1]; // 如 eu-central-1
+        let got2 = merge_probe_regions(Some(dup));
+        assert_eq!(got2.first().map(|s| s.as_str()), Some(dup));
+        assert_eq!(got2.len(), PROFILE_PROBE_REGIONS.len());
+        // 去重：dup 只出现一次。
+        assert_eq!(got2.iter().filter(|r| r.as_str() == dup).count(), 1);
+    }
+
+    #[test]
+    fn test_merge_probe_regions_case_insensitive_dedup() {
+        use crate::kiro::token_manager::PROFILE_PROBE_REGIONS;
+        // 大写形式的默认表成员 → 归一化小写后去重，不重复插入。
+        let dup_upper = PROFILE_PROBE_REGIONS[0].to_uppercase();
+        let got = merge_probe_regions(Some(&dup_upper));
+        assert_eq!(got.len(), PROFILE_PROBE_REGIONS.len());
+        assert_eq!(got.first().map(|s| s.as_str()), Some(PROFILE_PROBE_REGIONS[0]));
     }
 
     #[test]
