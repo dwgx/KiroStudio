@@ -103,6 +103,70 @@ fn cc_auto_buffer_enabled() -> bool {
     CC_AUTO_BUFFER.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+// ==================== 工具错误缓解开关（TIER3 进程镜像，admin 热更即时生效，默认全关）====================
+// 三个开关沿用 EXTRACT_THINKING 同款范式。getter 为 pub(crate) 供 stream.rs 在工具/文本处理热路径读。
+// 定性：Invalid tool parameters 病根在模型侧生成参数，网关不能根治只能缓解——这些开关是缓解手段，
+// 默认关（保持现状行为），用户在设置页按需开启。
+
+/// ①泄漏控制 token 清洗开关（course/課/count/care 之类粘连）。默认 false。
+static TOOL_CLEAN_LEAKED_TOKENS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// 设置泄漏 token 清洗开关（main 启动接线 / admin 热更调用，立即生效）。
+pub fn set_tool_clean_leaked_tokens(enabled: bool) {
+    TOOL_CLEAN_LEAKED_TOKENS.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+pub(crate) fn tool_clean_leaked_tokens_enabled() -> bool {
+    TOOL_CLEAN_LEAKED_TOKENS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// ②流式工具拼装非法时对齐成失败态开关。默认 false。
+static TOOL_STREAM_ALIGN_FAILURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// 设置流式失败态对齐开关（main 启动接线 / admin 热更调用，立即生效）。
+pub fn set_tool_stream_align_failure(enabled: bool) {
+    TOOL_STREAM_ALIGN_FAILURE.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+pub(crate) fn tool_stream_align_failure_enabled() -> bool {
+    TOOL_STREAM_ALIGN_FAILURE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// ③工具拼装非法时向客户端补发 SSE error 开关。默认 false。
+static TOOL_EXPOSE_ERROR_TO_CLIENT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// 设置工具错误暴露开关（main 启动接线 / admin 热更调用，立即生效）。
+pub fn set_tool_expose_error_to_client(enabled: bool) {
+    TOOL_EXPOSE_ERROR_TO_CLIENT.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+pub(crate) fn tool_expose_error_to_client_enabled() -> bool {
+    TOOL_EXPOSE_ERROR_TO_CLIENT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// ④JSON 修复层开关（根治向）。默认 **true**——只在 JSON 已非法时介入 + 修复后强制复验，正常流零影响。
+static TOOL_REPAIR_JSON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// 设置 JSON 修复层开关（main 启动接线 / admin 热更调用，立即生效）。
+pub fn set_tool_repair_json(enabled: bool) {
+    TOOL_REPAIR_JSON.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+pub(crate) fn tool_repair_json_enabled() -> bool {
+    TOOL_REPAIR_JSON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// ⑤截断跨轮恢复开关。默认 **false**（改变对话流程：不发坏参数、置失败态让客户端重试整轮）。
+///
+/// 只在**修复层⑤也补不回**（真截断，缺整段值）且归因为 Truncated/TruncatedAndIllegal 时触发：
+/// 不发不完整的 partial_json（避免客户端把半截参数当完整调用执行），改置失败态、收尾补发 SSE error，
+/// 让客户端退避后**重试整个请求**（下一轮模型可能生成更小的调用）。绝不 report_failure 连坐号
+/// （工具截断≠号坏）。默认关：它改变对话行为（把截断从"发半截"变成"整轮失败重试"），需用户确认。
+static TOOL_TRUNCATION_RECOVERY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// 设置截断跨轮恢复开关（main 启动接线 / admin 热更调用，立即生效）。
+pub fn set_tool_truncation_recovery(enabled: bool) {
+    TOOL_TRUNCATION_RECOVERY.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+pub(crate) fn tool_truncation_recovery_enabled() -> bool {
+    TOOL_TRUNCATION_RECOVERY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// 从入站请求头识别请求是否来自 Claude Code。
 ///
 /// 两个信号（任一命中即判为 CC）：
@@ -222,6 +286,100 @@ fn build_kiro_request_body(
     Ok(body)
 }
 
+/// 已翻译的上游错误：HTTP 状态 + Anthropic 错误类型码 + 面向用户的中文消息（含排障步骤）。
+struct TranslatedError {
+    status: StatusCode,
+    error_type: &'static str,
+    message: String,
+}
+
+/// 把上游错误串翻译成带排障步骤的可读错误。命中已知类别返回 `Some`，未知返回 `None`（调用方透传）。
+/// 不处理需额外响应头的情形（429 + Retry-After 在 `map_provider_error` 单独处理）。
+fn translate_upstream_error(err_str: &str) -> Option<TranslatedError> {
+    translate_quota_subscription(err_str)
+        .or_else(|| translate_context_input(err_str))
+        .or_else(|| translate_network(err_str))
+}
+
+/// 配额/订阅/region 类（不可重试，需用户处理账号）。
+fn translate_quota_subscription(err_str: &str) -> Option<TranslatedError> {
+    if err_str.contains("MONTHLY_REQUEST_COUNT") || err_str.contains("QUOTA") {
+        return Some(TranslatedError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            error_type: "rate_limit_error",
+            message: "月度请求配额已耗尽。排障：①面板查看各凭据用量，切到仍有额度的账号；②等待配额周期重置；③为号池补充新凭据。".to_string(),
+        });
+    }
+    if err_str.contains("FEATURE_NOT_SUPPORTED") {
+        return Some(TranslatedError {
+            status: StatusCode::BAD_GATEWAY,
+            error_type: "api_error",
+            message: "当前凭据所在 region 未开通该功能（profile 未激活）。排障：①网关会在刷新时自动验活重选可用 region；②如持续，右键该凭据切换 Profile ARN 到已开通 region（如 eu-central-1）；③确认该账号确在某 region 开通了 Kiro。".to_string(),
+        });
+    }
+    if err_str.contains("Improperly formed") || err_str.contains("Invalid token") || err_str.contains("subscription") {
+        return Some(TranslatedError {
+            status: StatusCode::BAD_GATEWAY,
+            error_type: "api_error",
+            message: "上游拒绝凭据（订阅失效或 token 无效）。排障：①面板对该凭据点『刷新 Token』；②若为 Enterprise/IdC 号，确认 profileArn 已正确解析；③测活确认订阅有效，失效则更换凭据。".to_string(),
+        });
+    }
+    None
+}
+
+/// 上下文/输入体积类（不可重试，需减小请求）。
+fn translate_context_input(err_str: &str) -> Option<TranslatedError> {
+    if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+        return Some(TranslatedError {
+            status: StatusCode::BAD_REQUEST,
+            error_type: "invalid_request_error",
+            message: "上下文窗口已满（对话历史累积超出模型上下文上限）。排障：①精简对话历史或开新会话；②缩短 system prompt；③减少同时挂载的工具数量。".to_string(),
+        });
+    }
+    if err_str.contains("Input is too long") {
+        return Some(TranslatedError {
+            status: StatusCode::BAD_REQUEST,
+            error_type: "invalid_request_error",
+            message: "单次输入过长（请求体本身超出上游限制）。排障：①拆分过大的消息或附件；②减少一次性粘贴的文件内容；③对超大工具结果先做摘要。".to_string(),
+        });
+    }
+    None
+}
+
+/// 网络/传输类（多为可重试的暂时故障，常与代理配置相关）。
+fn translate_network(err_str: &str) -> Option<TranslatedError> {
+    let low = err_str.to_lowercase();
+    if low.contains("dns") || low.contains("resolve") || low.contains("name resolution") {
+        return Some(TranslatedError {
+            status: StatusCode::BAD_GATEWAY,
+            error_type: "api_error",
+            message: "DNS 解析失败（无法解析上游域名）。排障：①检查本机/容器 DNS 配置；②若走代理，确认代理能解析 kiro.dev；③确认网络出口正常。".to_string(),
+        });
+    }
+    if low.contains("timed out") || low.contains("timeout") {
+        return Some(TranslatedError {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            error_type: "api_error",
+            message: "连接上游超时。排障：①上游或代理可能拥塞，稍后重试；②检查代理延迟；③大请求可拆小以缩短单次耗时。".to_string(),
+        });
+    }
+    if low.contains("certificate") || low.contains("ssl") || low.contains("tls") {
+        return Some(TranslatedError {
+            status: StatusCode::BAD_GATEWAY,
+            error_type: "api_error",
+            message: "TLS/证书握手失败。排障：①检查系统时间是否准确；②若走中间人代理，确认其证书受信；③确认未误用被拦截的代理。".to_string(),
+        });
+    }
+    if low.contains("proxy") {
+        return Some(TranslatedError {
+            status: StatusCode::BAD_GATEWAY,
+            error_type: "api_error",
+            message: "代理连接失败。排障：①检查代理地址/账密是否正确；②确认代理在线可达；③面板核对该凭据绑定的代理配置。".to_string(),
+        });
+    }
+    None
+}
+
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
@@ -248,37 +406,19 @@ fn map_provider_error(err: Error) -> Response {
             .into_response();
     }
 
-    // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
-    if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
-        tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Context window is full. Reduce conversation history, system prompt, or tools.",
-            )),
-        )
-            .into_response();
+    // 已确证含义的上游错误：翻译成带排障步骤的可读错误。
+    if let Some(t) = translate_upstream_error(&err_str) {
+        tracing::warn!(error = %err, error_type = t.error_type, "上游错误已翻译为可读排障提示");
+        return (t.status, Json(ErrorResponse::new(t.error_type, t.message))).into_response();
     }
 
-    // 单次输入太长（请求体本身超出上游限制）
-    if err_str.contains("Input is too long") {
-        tracing::warn!(error = %err, "上游拒绝请求：输入过长（不应重试）");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Input is too long. Reduce the size of your messages.",
-            )),
-        )
-            .into_response();
-    }
-    tracing::error!("Kiro API 调用失败: {}", err);
+    // 未知错误：诚实透传原文（不臆造排障步骤误导用户）。
+    tracing::error!("Kiro API 调用失败（未识别，原文透传）: {}", err);
     (
         StatusCode::BAD_GATEWAY,
         Json(ErrorResponse::new(
             "api_error",
-            format!("上游 API 调用失败: {}", err),
+            format!("上游 API 调用失败（未识别错误，请查看网关日志）: {}", err),
         )),
     )
         .into_response()
@@ -1479,6 +1619,79 @@ fn emit_buffered_usage(
     }
     client.apply(&mut record);
     crate::usage::emit_record(record);
+}
+
+#[cfg(test)]
+mod error_translation_tests {
+    //! 错误翻译层：已确证含义的上游错误 → 带排障步骤的可读错误；未知错误诚实透传（None）。
+    use super::*;
+
+    #[test]
+    fn test_translate_quota_exhausted() {
+        let t = translate_upstream_error("upstream: MONTHLY_REQUEST_COUNT limit reached").unwrap();
+        assert_eq!(t.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(t.error_type, "rate_limit_error");
+        assert!(t.message.contains("配额") && t.message.contains("排障"));
+    }
+
+    #[test]
+    fn test_translate_region_not_activated() {
+        let t = translate_upstream_error("403 FEATURE_NOT_SUPPORTED for this region").unwrap();
+        assert_eq!(t.error_type, "api_error");
+        assert!(t.message.contains("region") && t.message.contains("Profile ARN"));
+    }
+
+    #[test]
+    fn test_translate_subscription_invalid() {
+        let t = translate_upstream_error("Invalid token: subscription expired").unwrap();
+        assert!(t.message.contains("刷新 Token") && t.message.contains("排障"));
+    }
+
+    #[test]
+    fn test_translate_context_full() {
+        let t = translate_upstream_error("CONTENT_LENGTH_EXCEEDS_THRESHOLD").unwrap();
+        assert_eq!(t.status, StatusCode::BAD_REQUEST);
+        assert!(t.message.contains("上下文") && t.message.contains("精简"));
+    }
+
+    #[test]
+    fn test_translate_input_too_long() {
+        let t = translate_upstream_error("Input is too long for the model").unwrap();
+        assert_eq!(t.status, StatusCode::BAD_REQUEST);
+        assert!(t.message.contains("输入过长") && t.message.contains("拆分"));
+    }
+
+    #[test]
+    fn test_translate_network_dns() {
+        let t = translate_upstream_error("error trying to connect: dns error: failed to resolve").unwrap();
+        assert_eq!(t.status, StatusCode::BAD_GATEWAY);
+        assert!(t.message.contains("DNS") && t.message.contains("排障"));
+    }
+
+    #[test]
+    fn test_translate_network_timeout() {
+        let t = translate_upstream_error("operation timed out").unwrap();
+        assert_eq!(t.status, StatusCode::GATEWAY_TIMEOUT);
+        assert!(t.message.contains("超时"));
+    }
+
+    #[test]
+    fn test_translate_tls() {
+        let t = translate_upstream_error("invalid certificate: SSL handshake failed").unwrap();
+        assert!(t.message.contains("TLS") || t.message.contains("证书"));
+    }
+
+    #[test]
+    fn test_translate_proxy() {
+        let t = translate_upstream_error("proxy CONNECT failed").unwrap();
+        assert!(t.message.contains("代理"));
+    }
+
+    #[test]
+    fn test_translate_unknown_returns_none() {
+        // 未知错误必须返回 None（调用方诚实透传原文，不臆造排障步骤）。
+        assert!(translate_upstream_error("some totally unrecognized upstream gibberish").is_none());
+    }
 }
 
 #[cfg(test)]

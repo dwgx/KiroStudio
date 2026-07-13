@@ -136,7 +136,7 @@ const SECTIONS: { id: SectionId; label: string; icon: React.ComponentType<{ clas
 // keywords 覆盖该卡片内所有设置项的文案，保证按关键词能跨区定位。
 const CARD_INDEX: { section: SectionId; title: string; keywords: string[] }[] = [
   { section: 'basic', title: '服务信息', keywords: ['监听地址', 'host', '端口', 'port', '区域', 'region', 'tls 后端', 'rustls', '默认 endpoint', '配置文件'] },
-  { section: 'basic', title: '客户端伪装', keywords: ['kiro 版本', '系统版本', 'node 版本', '提取 thinking', 'thinking'] },
+  { section: 'basic', title: '客户端伪装', keywords: ['kiro 版本', '系统版本', 'node 版本', '提取 thinking', 'thinking', '剥离环境噪音', '清洗泄漏控制 token', 'invalid tool parameters', '工具拼装非法', '工具错误', '失败态对齐', 'json 修复', '修复层', '修非法转义'] },
   { section: 'basic', title: '网络与上号', keywords: ['全局代理', 'proxy', '上号回调地址', 'callback', '回调模式', 'admin key'] },
   { section: 'basic', title: '登录页背景', keywords: ['登录背景图', '登录页背景', '背景图', 'r18', '图源', 'lolicon', '关闭登录背景图'] },
   { section: 'security', title: '反代安全', keywords: ['cors 允许来源', 'ip 白名单', 'cidr', '信任 x-forwarded-for', 'xff', '入口限流', '请求体上限', '413', '429'] },
@@ -212,6 +212,12 @@ interface FormState {
   extractThinking: boolean
   ccAutoBuffer: boolean
   stripEnvNoise: boolean
+  toolCleanLeakedTokens: boolean
+  toolStreamAlignFailure: boolean
+  toolExposeErrorToClient: boolean
+  toolRepairJson: boolean
+  toolTruncationRecovery: boolean
+  toolDescriptionMaxChars: string
   cooldownEnabled: boolean
   rateLimitEnabled: boolean
   rateLimitDailyMax: string
@@ -273,6 +279,12 @@ function toForm(c: ConfigSnapshotResponse, ui: UiLayoutPrefs): FormState {
     extractThinking: c.extractThinking,
     ccAutoBuffer: c.ccAutoBuffer,
     stripEnvNoise: c.stripEnvNoise,
+    toolCleanLeakedTokens: c.toolCleanLeakedTokens ?? false,
+    toolStreamAlignFailure: c.toolStreamAlignFailure ?? false,
+    toolExposeErrorToClient: c.toolExposeErrorToClient ?? false,
+    toolRepairJson: c.toolRepairJson ?? true,
+    toolTruncationRecovery: c.toolTruncationRecovery ?? false,
+    toolDescriptionMaxChars: String(c.toolDescriptionMaxChars ?? 10000),
     cooldownEnabled: c.cooldownEnabled,
     rateLimitEnabled: c.rateLimitEnabled,
     rateLimitDailyMax: String(c.rateLimitDailyMax),
@@ -1376,6 +1388,13 @@ export function SettingsPage() {
     if (form.extractThinking !== config.extractThinking) d.extractThinking = form.extractThinking
     if (form.ccAutoBuffer !== config.ccAutoBuffer) d.ccAutoBuffer = form.ccAutoBuffer
     if (form.stripEnvNoise !== config.stripEnvNoise) d.stripEnvNoise = form.stripEnvNoise
+    if (form.toolCleanLeakedTokens !== (config.toolCleanLeakedTokens ?? false)) d.toolCleanLeakedTokens = form.toolCleanLeakedTokens
+    if (form.toolStreamAlignFailure !== (config.toolStreamAlignFailure ?? false)) d.toolStreamAlignFailure = form.toolStreamAlignFailure
+    if (form.toolExposeErrorToClient !== (config.toolExposeErrorToClient ?? false)) d.toolExposeErrorToClient = form.toolExposeErrorToClient
+    if (form.toolRepairJson !== (config.toolRepairJson ?? true)) d.toolRepairJson = form.toolRepairJson
+    if (form.toolTruncationRecovery !== (config.toolTruncationRecovery ?? false)) d.toolTruncationRecovery = form.toolTruncationRecovery
+    const descMax = Number(form.toolDescriptionMaxChars)
+    if (Number.isFinite(descMax) && descMax >= 0 && descMax !== (config.toolDescriptionMaxChars ?? 10000)) d.toolDescriptionMaxChars = descMax
     if (form.cooldownEnabled !== config.cooldownEnabled) d.cooldownEnabled = form.cooldownEnabled
     if (form.rateLimitEnabled !== config.rateLimitEnabled) d.rateLimitEnabled = form.rateLimitEnabled
     const daily = Number(form.rateLimitDailyMax)
@@ -1676,7 +1695,7 @@ export function SettingsPage() {
       </SectionGate>
 
       {/* 基础分区：客户端伪装（需重启） */}
-      <SectionGate section="basic" title="客户端伪装" keywords={['kiro 版本', '系统版本', 'node 版本', '提取 thinking', 'thinking']}>
+      <SectionGate section="basic" title="客户端伪装" keywords={['kiro 版本', '系统版本', 'node 版本', '提取 thinking', 'thinking', '剥离环境噪音', '清洗泄漏控制 token', 'invalid tool parameters', '工具拼装非法', '工具错误', '失败态对齐', 'json 修复', '修复层', '修非法转义']}>
       <Card>
         <CardHeader className="pb-2">
           <CardTitle className="text-base"><Highlight text="客户端伪装" /></CardTitle>
@@ -1699,6 +1718,24 @@ export function SettingsPage() {
           </Field>
           <Field label="剥离环境噪音" hint="转发前剥离 system 里每请求漂移的 env/git/模型名等噪音，省 token 提缓存降关联（保存即时生效，无需重启）">
             <Switch checked={form.stripEnvNoise} onCheckedChange={(v) => set('stripEnvNoise', v)} />
+          </Field>
+          <Field label="清洗泄漏控制 token" hint="缓解 Invalid tool parameters：清洗模型泄漏进文本行首的控制 token（course/課/count/care 粘连），保守只剥行首粘连不误删正文（默认关，保存即时生效）">
+            <Switch checked={form.toolCleanLeakedTokens} onCheckedChange={(v) => set('toolCleanLeakedTokens', v)} />
+          </Field>
+          <Field label="工具拼装非法对齐失败态" hint="流式工具调用参数拼成非法 JSON 时置失败态（与非流式一致，不再静默记成功），便于客户端感知重试（默认关，保存即时生效）">
+            <Switch checked={form.toolStreamAlignFailure} onCheckedChange={(v) => set('toolStreamAlignFailure', v)} />
+          </Field>
+          <Field label="工具错误如实暴露客户端" hint="工具参数拼装非法时不发坏 JSON，改发明确 SSE error 让客户端退避重试（配合上一项，默认关，保存即时生效）">
+            <Switch checked={form.toolExposeErrorToClient} onCheckedChange={(v) => set('toolExposeErrorToClient', v)} />
+          </Field>
+          <Field label="JSON 修复层（根治 Invalid tool parameters）" hint="工具参数非法 JSON 时先尝试修成合法（转义非法反斜杠/裸控制符、补全截断），修复后强制复验通过才发。只在 JSON 已非法时介入、对正常流零影响，故默认开。客户端不再报 Invalid tool parameters（保存即时生效）">
+            <Switch checked={form.toolRepairJson} onCheckedChange={(v) => set('toolRepairJson', v)} />
+          </Field>
+          <Field label="截断跨轮恢复" hint="工具参数被上游真截断（缺整段值）且 JSON 修复层也补不回时，不发半截参数（半截会被客户端当完整调用执行），改置失败态让客户端退避重试整轮。会把截断从「发半截」变成「整轮失败重试」，改变对话流程，故默认关（保存即时生效）">
+            <Switch checked={form.toolTruncationRecovery} onCheckedChange={(v) => set('toolTruncationRecovery', v)} />
+          </Field>
+          <Field label="工具描述字符上限" hint="入站工具顶层 description 超此长度按字符边界安全截断（省 token、避开上游单工具描述隐性上限），schema 内嵌描述取此值 1/5。默认 10000，设 0 表示不截断（保存即时生效）">
+            <NumberStepper value={Number(form.toolDescriptionMaxChars) || 0} onChange={(v) => set('toolDescriptionMaxChars', String(v))} min={0} step={1000} className="w-32" aria-label="工具描述字符上限" />
           </Field>
         </CardContent>
       </Card>

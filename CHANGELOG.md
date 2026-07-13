@@ -2,6 +2,37 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.6] - 2026-07-13
+
+### 工具参数错误处理（承 0.7.5 JSON 修复层，补齐用户体验层）
+- **上游错误翻译层**：`map_provider_error` 新增 `translate_upstream_error`（纯函数，可测），把已确证
+  含义的上游错误翻译成**带排障步骤的中文提示**——覆盖月配额耗尽 / region 未开通
+  （FEATURE_NOT_SUPPORTED）/ 订阅失效 / 上下文窗口满 / 输入过长 / DNS / 超时 / TLS / 代理故障，
+  每类给「一句诊断 + 分步排障」。未知错误诚实透传原文（不臆造排障步骤误导）。
+- **截断诊断归因标签**：工具参数拼装后非法 JSON 时，单遍 string-aware 扫描把非法串按责任方归因
+  （`truncated` 帧丢失/上游截断 / `illegal_chars` 模型侧非法转义或裸控制符 / `truncated_and_illegal`
+  / `malformed`），只写日志（warn + `KIRO_TOOL_TRACE` 带 `defect` 字段），**纯可观测、绝不进控制流**，
+  服务于「修不好的残留到底是谁的责任」定位真因。
+- **截断跨轮恢复**（开关 `tool_truncation_recovery`，默认**关**）：仅当 JSON 修复层已启用且也补不回
+  （真截断，缺整段值）、且归因为截断时触发——不发半截参数（半截会被客户端当完整调用执行），改置
+  失败态让客户端退避**重试整个请求**（下轮模型可能生成更小的调用）。**绝不连坐号**（工具截断≠号坏）。
+  默认关：它把截断从「发半截」变成「整轮失败重试」，改变对话流程，需用户显式开启。
+- **工具描述长度上限可配置**（`tool_description_max_chars`，默认 10000）：入站工具顶层 description 的
+  硬编码截断（原 10000 / schema 内嵌 2000）提为配置项，schema 内嵌恒取顶层的 1/5，设 0 表示不截断；
+  按字符边界安全截断防多字节切坏。热更即时生效。
+
+### External IdP 验活（承 0.7.5，补队头阻塞与成本泄漏）
+- **修 reprobe/ARN 解析的 refresh_lock 队头阻塞**：全坏 external_idp 号 reprobe 一整轮 getUsageLimits
+  会把所有号的刷新堵在锁后；显式 `drop` refresh_lock 让 arn/reprobe 在锁外并发，写回 profile_arn
+  时另用短锁，消除队头阻塞。
+- **全坏号 reprobe 成本护栏**：所有候选 region 都未开通 Kiro 的号，两次全坏 reprobe 之间加 6 小时
+  最小冷却（`last_full_reprobe_at`），稀释「每 token TTL 白跑一整轮 getUsageLimits」的成本泄漏；
+  找到可用 profile 时清空冷却（恢复灵敏）。
+
+### Windows
+- **系统托盘「重启服务」接线**：抽 `spawn_windows_relaunch_process` 自由函数供托盘与面板一键重启
+  共用，走优雅关闭（quit notify + exit 3）拉起新进程，避免双拉。
+
 ## [0.7.5] - 2026-07-12
 
 ### 模型识别（registry 重构）
