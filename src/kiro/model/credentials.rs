@@ -488,7 +488,15 @@ impl KiroCredentials {
             self.region = Some(arn_region.clone());
             changed = true;
         }
-        if self.auth_region.as_deref() != Some(arn_region.as_str()) {
+        // 【IdC 豁免·502 回归修复】IdC 号的 auth_region = SSO-OIDC 实例所在 region(clientId/secret/
+        // refreshToken 在此注册,刷新 token 必须打 oidc.{auth_region}.amazonaws.com),它与 profileArn
+        // 的 region(对话/余额用)**物理不同**。若把 auth_region 也同步成 ARN region,刷新就打到错的
+        // OIDC 端点 → clientId 跨 region 失配 → AWS 拒 → 网关 502(0.7.12 收口引入的回归)。故 IdC 号
+        // **只同步 region(对话/余额),绝不碰 auth_region**。external_idp 的 auth_region 不参与刷新
+        // (用微软 token_endpoint)、social 的走 kiro.dev,故仅 IdC 需此豁免。
+        if !self.is_idc_credential()
+            && self.auth_region.as_deref() != Some(arn_region.as_str())
+        {
             self.auth_region = Some(arn_region.clone());
             changed = true;
         }
@@ -642,6 +650,16 @@ impl KiroCredentials {
             .unwrap_or(false)
     }
 
+    /// 是否 IdC(AWS IAM Identity Center / Builder ID)号。归一化后 == "idc"(含 builder-id/iam）。
+    /// IdC 号的**认证 region(SSO-OIDC 实例)与对话/余额 region(profileArn)物理不同**,故
+    /// [`sync_region_from_arn`](Self::sync_region_from_arn) 对它豁免 auth_region 改写(见该方法)。
+    pub fn is_idc_credential(&self) -> bool {
+        self.auth_method
+            .as_deref()
+            .map(|m| canonicalize_auth_method_value(m) == "idc")
+            .unwrap_or(false)
+    }
+
     /// 账户族键（family_key）—— 限流/健康的分组单位（见 docs/DESIGN-M365-FAMILY-RATELIMIT-0708.md）。
     ///
     /// M365 external_idp 号的上游限速是**租户/账户族级连坐**：同一 M365 租户的多个号，
@@ -781,6 +799,33 @@ mod tests {
         assert!(changed, "region 不符时应发生修正");
         assert_eq!(c.region.as_deref(), Some("eu-central-1"), "region 应被 ARN region 覆盖");
         assert_eq!(c.auth_region.as_deref(), Some("eu-central-1"), "auth_region 同步");
+    }
+
+    #[test]
+    fn test_sync_region_from_arn_idc_exempts_auth_region() {
+        // 【502 回归修复】IdC 号:auth_region=SSO-OIDC 实例 region(刷新 token 用),与 profileArn
+        // region(对话/余额)物理不同。sync 只同步 region,**绝不改 auth_region**(改了刷新打错端点→502)。
+        let mut c = KiroCredentials::default();
+        c.auth_method = Some("idc".to_string());
+        c.region = Some("us-east-1".to_string());
+        c.auth_region = Some("us-east-1".to_string()); // = R_sso(SSO-OIDC 注册 region)
+        c.profile_arn =
+            Some("arn:aws:codewhisperer:eu-central-1:1:profile/X".to_string()); // R_arn 不同
+        let changed = c.sync_region_from_arn();
+        assert!(changed, "region 不符仍应同步(返回 true)");
+        assert_eq!(c.region.as_deref(), Some("eu-central-1"), "IdC 对话 region 应同步为 ARN region");
+        assert_eq!(
+            c.auth_region.as_deref(),
+            Some("us-east-1"),
+            "IdC 的 auth_region 必须保留 R_sso,绝不被 ARN region 覆盖(否则刷新 502)"
+        );
+        // builder-id / iam 归一化也算 IdC,同样豁免。
+        let mut c2 = KiroCredentials::default();
+        c2.auth_method = Some("builder-id".to_string());
+        c2.auth_region = Some("us-west-2".to_string());
+        c2.profile_arn = Some("arn:aws:codewhisperer:eu-central-1:1:profile/X".to_string());
+        c2.sync_region_from_arn();
+        assert_eq!(c2.auth_region.as_deref(), Some("us-west-2"), "builder-id 也豁免 auth_region");
     }
 
     #[test]
