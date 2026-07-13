@@ -545,17 +545,22 @@ fn default_strip_env_noise() -> bool {
     true
 }
 
-/// 工具错误缓解开关默认全关：保持现状行为，用户在设置页按需开启（不意外改变任何既有行为）。
+/// 泄漏控制 token 清洗默认**开启**：治 #70544 模型泄漏（course/課/count 粘连），保守只剥行首
+/// 高信号粘连、正常文本零误删。纯缓解、对干净输出零影响，故默认开。
 fn default_tool_clean_leaked_tokens() -> bool {
-    false
+    true
 }
 
+/// 流式失败态对齐默认**开启**：工具拼装非法时置失败态（与非流式一致，不再静默记成功），
+/// 配合 ③ 才让「修复层也修不好的残留」有干净的失败信号。绝不连坐号。
 fn default_tool_stream_align_failure() -> bool {
-    false
+    true
 }
 
+/// 工具错误如实暴露客户端默认**开启**：与 ② 配对——修复层④修不好时不发坏 JSON，改发明确 SSE
+/// error 让客户端退避重试，客户端不再拿坏参数报 Invalid tool parameters。
 fn default_tool_expose_error_to_client() -> bool {
-    false
+    true
 }
 
 /// JSON 修复层默认**开启**：只在 JSON 已非法时介入 + 修复后强制复验，对正常流零影响，纯增益。
