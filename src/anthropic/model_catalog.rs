@@ -65,6 +65,12 @@ pub struct ModelSpec {
     pub credit_mult: f32,
     /// 是否支持 thinking(思考)变体。
     pub supports_thinking: bool,
+    /// 是否支持 1M 上下文窗口变体(`claude-xxx[1m]`)。为 true 的模型:
+    /// ① `/v1/models` 额外广告一条 `<id>[1m]` 变体;② 请求命中 `[1m]` 后缀时注入
+    /// `anthropic-beta: context-1m-2025-08-07` 头。**诚实边界**:Kiro 上游是 CodeWhisperer/Q
+    /// 协议(非 Anthropic 直连),该 beta 头是否被上游识别并真放开 1M 窗口未经证实——本字段以
+    /// `context_window == 1_000_000` 为内部一致性依据,不代表上游一定认(待旁挂黑盒验证)。
+    pub supports_1m: bool,
     /// 是否在 `/v1/models` 中广告(thinking 变体通常只做别名不单列)。
     pub advertised: bool,
 }
@@ -87,6 +93,7 @@ pub static CATALOG: &[ModelSpec] = &[
         max_output: 128_000,
         credit_mult: 2.20,
         supports_thinking: true,
+        supports_1m: true,
         advertised: true,
     },
     ModelSpec {
@@ -100,6 +107,7 @@ pub static CATALOG: &[ModelSpec] = &[
         max_output: 64_000,
         credit_mult: 2.20,
         supports_thinking: true,
+        supports_1m: true,
         advertised: true,
     },
     ModelSpec {
@@ -113,6 +121,7 @@ pub static CATALOG: &[ModelSpec] = &[
         max_output: 64_000,
         credit_mult: 2.20,
         supports_thinking: true,
+        supports_1m: true,
         advertised: true,
     },
     ModelSpec {
@@ -132,6 +141,7 @@ pub static CATALOG: &[ModelSpec] = &[
         max_output: 64_000,
         credit_mult: 2.20,
         supports_thinking: true,
+        supports_1m: false,
         advertised: true,
     },
     // ===== Sonnet 系(1.30x) =====
@@ -146,6 +156,7 @@ pub static CATALOG: &[ModelSpec] = &[
         max_output: 64_000,
         credit_mult: 1.30,
         supports_thinking: true,
+        supports_1m: true,
         advertised: true,
     },
     ModelSpec {
@@ -159,6 +170,7 @@ pub static CATALOG: &[ModelSpec] = &[
         max_output: 64_000,
         credit_mult: 1.30,
         supports_thinking: true,
+        supports_1m: true,
         advertised: true,
     },
     ModelSpec {
@@ -178,6 +190,7 @@ pub static CATALOG: &[ModelSpec] = &[
         max_output: 64_000,
         credit_mult: 1.30,
         supports_thinking: true,
+        supports_1m: false,
         advertised: true,
     },
     ModelSpec {
@@ -199,6 +212,7 @@ pub static CATALOG: &[ModelSpec] = &[
         max_output: 64_000,
         credit_mult: 1.30,
         supports_thinking: true,
+        supports_1m: false,
         advertised: true,
     },
     // ===== Haiku 系(0.40x) =====
@@ -219,6 +233,7 @@ pub static CATALOG: &[ModelSpec] = &[
         max_output: 64_000,
         credit_mult: 0.40,
         supports_thinking: true,
+        supports_1m: false,
         advertised: true,
     },
     // ===== 国产模型(Kiro 直收原生 modelId，倍率远低) =====
@@ -233,6 +248,7 @@ pub static CATALOG: &[ModelSpec] = &[
         max_output: 64_000,
         credit_mult: 0.25,
         supports_thinking: false,
+        supports_1m: false,
         advertised: true,
     },
     ModelSpec {
@@ -246,6 +262,7 @@ pub static CATALOG: &[ModelSpec] = &[
         max_output: 64_000,
         credit_mult: 0.50,
         supports_thinking: false,
+        supports_1m: false,
         advertised: true,
     },
     ModelSpec {
@@ -259,6 +276,7 @@ pub static CATALOG: &[ModelSpec] = &[
         max_output: 64_000,
         credit_mult: 0.05,
         supports_thinking: false,
+        supports_1m: false,
         advertised: true,
     },
     ModelSpec {
@@ -272,6 +290,7 @@ pub static CATALOG: &[ModelSpec] = &[
         max_output: 64_000,
         credit_mult: 0.25,
         supports_thinking: false,
+        supports_1m: false,
         advertised: true,
     },
     ModelSpec {
@@ -285,6 +304,7 @@ pub static CATALOG: &[ModelSpec] = &[
         max_output: 64_000,
         credit_mult: 0.15,
         supports_thinking: false,
+        supports_1m: false,
         advertised: true,
     },
     // ===== Auto(1.0x,上游按负载路由,无固定版本/窗口) =====
@@ -299,6 +319,7 @@ pub static CATALOG: &[ModelSpec] = &[
         max_output: 64_000,
         credit_mult: 1.00,
         supports_thinking: false,
+        supports_1m: false,
         advertised: true,
     },
 ];
@@ -344,6 +365,22 @@ pub enum MatchKind {
 pub struct Resolved {
     pub spec: &'static ModelSpec,
     pub kind: MatchKind,
+    /// 客户端请求的是 1M 上下文变体(`claude-xxx[1m]`)**且**该 spec 支持 1M。
+    /// 客户端给了 `[1m]` 但 spec 不支持 → 此处为 false(后缀被忽略并告警),不发 beta 头。
+    pub is_1m: bool,
+}
+
+/// 从原始模型名剥离受控的 `[1m]` 后缀,返回 (去后缀名, 是否带 [1m])。
+///
+/// 与 [`strip_thinking`] 对称的范式。客户端(如某些只能传纯模型名的客户端)可用
+/// `claude-opus-4-6[1m]` 显式请求 1M 上下文变体。在 [`resolve`] 最前面剥离,剥完走既有
+/// 精确/thinking/结构化全流程,`[1m]` 只作为 is_1m 布尔信号,不影响 kiro_id 映射。
+fn strip_1m_suffix(model_lower: &str) -> (String, bool) {
+    if let Some(base) = model_lower.strip_suffix("[1m]") {
+        (base.to_string(), true)
+    } else {
+        (model_lower.to_string(), false)
+    }
 }
 
 /// 从原始模型名剥离受控的 `-thinking` 后缀，返回 (去后缀名, 是否带 thinking)。
@@ -472,20 +509,44 @@ fn allow_unknown_version() -> bool {
 }
 
 /// 解析客户端模型名 → CATALOG spec + 命中方式。这是**唯一**的模型识别入口。
+///
+/// 先剥 `[1m]` 后缀(若有),用剥后名走完整解析,再据 spec.supports_1m 决定最终 is_1m:
+/// spec 支持 → is_1m=true(触发 beta 头);spec 不支持 → 忽略后缀 + 告警(不拒绝,更宽容)。
 pub fn resolve(model: &str) -> Option<Resolved> {
+    let lower = model.to_ascii_lowercase();
+    let (base_name, requested_1m) = strip_1m_suffix(&lower);
+    // 用剥掉 [1m] 的名字走既有全流程(精确/thinking/结构化)。
+    let mut resolved = resolve_inner(&base_name)?;
+    if requested_1m {
+        if resolved.spec.supports_1m {
+            resolved.is_1m = true;
+        } else {
+            tracing::warn!(
+                request_model = %model,
+                resolved_kiro_id = %resolved.spec.kiro_id,
+                "模型识别:客户端请求 [1m] 变体但该模型不支持 1M 上下文,忽略后缀按普通请求处理(不注入 beta 头)"
+            );
+        }
+    }
+    Some(resolved)
+}
+
+/// 内部解析(不含 `[1m]` 处理):入参已是剥掉 `[1m]` 的名字。所有 `Resolved` 的 `is_1m` 恒 false,
+/// 由外层 [`resolve`] 据 supports_1m 回填。
+fn resolve_inner(model: &str) -> Option<Resolved> {
     let raw_lower = model.to_ascii_lowercase();
     let idx = alias_index();
 
     // 1) 原名精确匹配(主路径，无告警)。
     if let Some(&i) = idx.get(&raw_lower) {
-        return Some(Resolved { spec: &CATALOG[i], kind: MatchKind::Exact });
+        return Some(Resolved { spec: &CATALOG[i], kind: MatchKind::Exact, is_1m: false });
     }
 
     // 2) 剥 thinking 后缀再精确匹配。
     let (base, _had_thinking) = strip_thinking(&raw_lower);
     if base != raw_lower {
         if let Some(&i) = idx.get(&base) {
-            return Some(Resolved { spec: &CATALOG[i], kind: MatchKind::Exact });
+            return Some(Resolved { spec: &CATALOG[i], kind: MatchKind::Exact, is_1m: false });
         }
     }
 
@@ -494,7 +555,7 @@ pub fn resolve(model: &str) -> Option<Resolved> {
         if let Some(ver) = ver_opt {
             // 3a) 确切版本目录里有 → Structured(无损)。
             if let Some(spec) = find_family_version(family, ver) {
-                return Some(Resolved { spec, kind: MatchKind::Structured });
+                return Some(Resolved { spec, kind: MatchKind::Structured, is_1m: false });
             }
             // 3b) Claude 3/2 老名:历史被静默升到 4.x 贵档——显式近似+告警。
             if is_legacy_claude(&raw_lower) {
@@ -506,7 +567,7 @@ pub fn resolve(model: &str) -> Option<Resolved> {
                         match_kind = "claude3-approx",
                         "模型识别:Claude 老名近似到最近档(语义有损、计费按目标档)——请客户端改用明确新模型名"
                     );
-                    return Some(Resolved { spec, kind: MatchKind::Claude3Approx });
+                    return Some(Resolved { spec, kind: MatchKind::Claude3Approx, is_1m: false });
                 }
             }
             // 3c) 更新的未知版本(opus-4.9/opus-5):默认拒绝(strict);开关开则回退最新档+告警。
@@ -519,7 +580,7 @@ pub fn resolve(model: &str) -> Option<Resolved> {
                         match_kind = "unknown-version-fallback",
                         "模型识别:未知版本回退到同族最新档(KIRO_ALLOW_UNKNOWN_VERSION 已开)——可能非用户预期版本"
                     );
-                    return Some(Resolved { spec, kind: MatchKind::UnknownVersionFallback });
+                    return Some(Resolved { spec, kind: MatchKind::UnknownVersionFallback, is_1m: false });
                 }
             }
             tracing::warn!(
@@ -535,7 +596,7 @@ pub fn resolve(model: &str) -> Option<Resolved> {
         match family {
             Family::DeepSeek | Family::Glm | Family::Qwen | Family::Auto => {
                 if let Some(spec) = default_in_family(family) {
-                    return Some(Resolved { spec, kind: MatchKind::Structured });
+                    return Some(Resolved { spec, kind: MatchKind::Structured, is_1m: false });
                 }
             }
             _ => {
@@ -550,7 +611,7 @@ pub fn resolve(model: &str) -> Option<Resolved> {
                             match_kind = "claude3-approx",
                             "模型识别:Claude 老名近似到最近档(语义有损、计费按目标档)——请客户端改用明确新模型名"
                         );
-                        return Some(Resolved { spec, kind: MatchKind::Claude3Approx });
+                        return Some(Resolved { spec, kind: MatchKind::Claude3Approx, is_1m: false });
                     }
                     tracing::warn!(
                         request_model = %model,
@@ -559,7 +620,7 @@ pub fn resolve(model: &str) -> Option<Resolved> {
                         match_kind = "family-default",
                         "模型识别:无显式版本号，回退到同族最新档——建议客户端带明确版本"
                     );
-                    return Some(Resolved { spec, kind: MatchKind::Structured });
+                    return Some(Resolved { spec, kind: MatchKind::Structured, is_1m: false });
                 }
             }
         }
@@ -572,6 +633,12 @@ pub fn resolve(model: &str) -> Option<Resolved> {
 /// 便捷:仅要 Kiro modelId(map_model 语义)。
 pub fn resolve_kiro_id(model: &str) -> Option<&'static str> {
     resolve(model).map(|r| r.spec.kiro_id)
+}
+
+/// 便捷:该模型名是否请求了受支持的 1M 上下文变体(`[1m]` 后缀且 spec.supports_1m)。
+/// 未识别或非 1M → false。供 handler 决定是否给上游注入 `anthropic-beta: context-1m` 头。
+pub fn resolve_is_1m(model: &str) -> bool {
+    resolve(model).map(|r| r.is_1m).unwrap_or(false)
 }
 
 /// 便捷:上下文窗口。未识别默认 200k(与旧行为一致)。
@@ -604,6 +671,62 @@ mod tests {
         let r = resolve("claude-opus-4.7").unwrap();
         assert_eq!(r.spec.kiro_id, "claude-opus-4.7");
         assert_eq!(r.kind, MatchKind::Exact);
+    }
+
+    #[test]
+    fn test_1m_suffix_supported_models() {
+        // [1m] 后缀:映射到干净 kiro_id(后缀不进 modelId)+ is_1m=true。
+        let r = resolve("claude-opus-4-6[1m]").unwrap();
+        assert_eq!(r.spec.kiro_id, "claude-opus-4.6");
+        assert_eq!(r.kind, MatchKind::Exact);
+        assert!(r.is_1m, "opus-4.6 支持 1M,[1m] 应置 is_1m");
+        // kiro_id 干净,不含 [1m]
+        assert_eq!(kid("claude-opus-4-6[1m]"), Some("claude-opus-4.6"));
+        // sonnet 系 1M 变体
+        assert!(resolve("claude-sonnet-5[1m]").unwrap().is_1m);
+        assert!(resolve("claude-sonnet-4-6[1m]").unwrap().is_1m);
+        assert!(resolve("claude-opus-4-8[1m]").unwrap().is_1m);
+        assert!(resolve("claude-opus-4-7[1m]").unwrap().is_1m);
+    }
+
+    #[test]
+    fn test_1m_without_suffix_is_not_1m() {
+        // 无后缀:即便模型支持 1M,is_1m 也为 false(未请求)。
+        let r = resolve("claude-opus-4.6").unwrap();
+        assert!(!r.is_1m);
+        assert!(!resolve_is_1m("claude-sonnet-5"));
+    }
+
+    #[test]
+    fn test_1m_suffix_unsupported_model_ignored() {
+        // 不支持 1M 的模型加 [1m]:后缀被忽略(不拒绝),kiro_id 正常,is_1m=false。
+        let r = resolve("claude-opus-4-5[1m]").unwrap();
+        assert_eq!(r.spec.kiro_id, "claude-opus-4.5");
+        assert!(!r.is_1m, "opus-4.5 不支持 1M,[1m] 应被忽略");
+        assert_eq!(kid("claude-sonnet-4-5[1m]"), Some("claude-sonnet-4.5"));
+        assert!(!resolve_is_1m("claude-haiku-4-5[1m]"));
+    }
+
+    #[test]
+    fn test_1m_suffix_unknown_model_still_none() {
+        // 未知模型加 [1m]:剥后仍未知 → None(不因后缀假命中)。
+        assert_eq!(kid("gpt-4[1m]"), None);
+        assert!(!resolve_is_1m("gpt-4[1m]"));
+    }
+
+    #[test]
+    fn test_1m_and_thinking_combined() {
+        // [1m] 与 thinking 后缀共存:先剥 [1m] 再走 thinking 剥离,两者都识别。
+        let r = resolve("claude-opus-4-6-thinking[1m]").unwrap();
+        assert_eq!(r.spec.kiro_id, "claude-opus-4.6");
+        assert!(r.is_1m, "[1m] 应被识别");
+    }
+
+    #[test]
+    fn test_resolve_is_1m_helper() {
+        assert!(resolve_is_1m("claude-opus-4-6[1m]"));
+        assert!(!resolve_is_1m("claude-opus-4-6"));
+        assert!(!resolve_is_1m("claude-opus-4-5[1m]")); // 不支持 1M
     }
 
     #[test]
