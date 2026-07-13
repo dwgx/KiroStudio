@@ -2,6 +2,22 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.8] - 2026-07-13
+
+### 1M 上下文变体 + beta header 注入
+- **`[1m]` 后缀模型名可用**：客户端传 `claude-opus-4-6[1m]`（部分客户端只能传纯模型名、无法单独
+  设置 beta 头）现在能成功。照 `-thinking` 后缀范式，在 `model_catalog::resolve` 最前面剥离
+  `[1m]` → 映射到干净的 Kiro modelId（body 里仍是 `claude-opus-4.6`）+ 记 `is_1m` 标志。
+- **自动注入 1M beta 头**：命中受支持的 `[1m]` 变体时，`IdeEndpoint::decorate_api` 给上游请求注入
+  `anthropic-beta: context-1m-2025-08-07`，上游（若为 Anthropic 直连/透传）才会真启用 1M 窗口。
+- **`/v1/models` 广告 1M 变体**：`supports_1m` 的模型（opus 4.6/4.7/4.8、sonnet 5/4.6）额外广告一条
+  `<id>[1m]`（显示名带 `(1M)`），客户端可直接选。
+- **宽容降级**：不支持 1M 的模型加 `[1m]`（如 `claude-opus-4-5[1m]`）→ 忽略后缀 + 告警，不拒绝；
+  未知模型加 `[1m]` → 剥后仍未知即拒。信号经 `RequestContext.is_1m` 透传，Kiro 路径从零构造请求
+  不与客户端 header 重复。
+- **诚实边界**：Kiro 上游是 CodeWhisperer/Q 协议（非 Anthropic 直连），该 beta 头是否被上游识别
+  并真放开 1M 窗口**待旁挂黑盒验证**。header 注入本身无害（上游不认最多忽略），故先落地、再验证。
+
 ## [0.7.7] - 2026-07-13
 
 ### 工具容错开关默认组合调优
