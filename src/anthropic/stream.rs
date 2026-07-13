@@ -778,6 +778,25 @@ pub struct StreamContext {
     /// 正常正文里的这些词（有空格分隔）绝不误删。初始 true（响应开头即行首），每段文本按是否以
     /// 换行结尾更新。非持久跨请求，随 StreamContext 生命周期。
     at_line_start: bool,
+    /// 泄漏 token 诊断（可观测，不影响清洗剥离判据）：本请求累计真剥掉的泄漏 token 数。
+    leaked_stripped: u32,
+    /// 本请求检测到的 saturation 泄漏行数（整行就是纯泄漏词的行，#70544 整段退化的信号）。
+    leaked_saturation_lines: u32,
+}
+
+/// 泄漏 token 剥离的命中信息（诊断计数用，不影响剥离判据）。
+#[derive(Debug, Clone, Copy)]
+struct StripHit {
+    /// 是否真剥掉了泄漏词。
+    stripped: bool,
+    /// 是否为"独占整行"泄漏（saturation 信号：整行就是纯泄漏词，#70544 整段退化）。
+    standalone: bool,
+}
+
+impl StripHit {
+    fn none() -> Self {
+        StripHit { stripped: false, standalone: false }
+    }
 }
 
 impl StreamContext {
@@ -812,6 +831,8 @@ impl StreamContext {
             completion: CompletionStatus::Ok,
             error_event_emitted: false,
             at_line_start: true,
+            leaked_stripped: 0,
+            leaked_saturation_lines: 0,
         }
     }
 
@@ -1204,7 +1225,7 @@ impl StreamContext {
     /// 只处理**行首**：若文本（在行首位置）以某个已知泄漏词开头，且该词紧邻的下一个字符是
     /// 非 ASCII 字母/非空格（CJK、全角标点、冒号、大写字母跳变等跨类粘连），判定为泄漏并剥掉该词。
     /// 返回清洗后的文本。误删防护：词后是空格或普通 ASCII 小写延续（如 `counter`/`careful`）→ 不剥。
-    fn clean_leaked_tokens(&self, content: &str) -> String {
+    fn clean_leaked_tokens(&mut self, content: &str) -> String {
         if !self.at_line_start {
             return content.to_string();
         }
@@ -1215,7 +1236,15 @@ impl StreamContext {
             // 或前一段以 \n 结尾（i>0 必然行首）。
             let is_line_start = i > 0 || self.at_line_start;
             if is_line_start {
-                out.push_str(&Self::strip_leaked_prefix(line));
+                // 诊断（可观测，不改剥离判据）：strip 返回是否命中 + 是否为独占整行泄漏，累加计数。
+                let (cleaned, hit) = Self::strip_leaked_prefix(line);
+                if hit.stripped {
+                    self.leaked_stripped += 1;
+                }
+                if hit.standalone {
+                    self.leaked_saturation_lines += 1;
+                }
+                out.push_str(&cleaned);
             } else {
                 out.push_str(line);
             }
@@ -1228,14 +1257,15 @@ impl StreamContext {
     /// call/card/count/care/course 独占行可能是正常内容(标题/变量/列表),**不**享此特例。
     const LEAK_STANDALONE_TOKENS: &'static [&'static str] = &["court", "課", "课"];
 
-    /// 剥掉单行行首的一个泄漏词（若命中粘连特征）。非命中原样返回。
-    fn strip_leaked_prefix(line: &str) -> String {
+    /// 剥掉单行行首的一个泄漏词（若命中粘连特征）。返回 (清洗后文本, 命中信息)。
+    /// **剥离判据完全不变**（0.7.14 已收严），只额外返回命中标志供诊断计数用。
+    fn strip_leaked_prefix(line: &str) -> (String, StripHit) {
         // 先处理"独占整行"特例:整行(去掉行尾 \n / 空白后)恰等于某高置信 token → 泄漏,整行剥空。
         let trimmed = line.trim_end_matches(['\n', '\r', ' ', '\t']);
         for &tok in Self::LEAK_STANDALONE_TOKENS {
             if trimmed == tok {
-                // 保留行尾换行(维持行结构),只把词本身剥掉。
-                return line[tok.len()..].to_string();
+                // 保留行尾换行(维持行结构),只把词本身剥掉。standalone=true(saturation 信号)。
+                return (line[tok.len()..].to_string(), StripHit { stripped: true, standalone: true });
             }
         }
         for &tok in Self::LEAKED_CONTROL_TOKENS {
@@ -1243,17 +1273,17 @@ impl StreamContext {
                 // 判定粘连：rest 的首字符必须是 **CJK / 全角** 粘连信号,才算泄漏(收严:
                 // 排除 ASCII 冒号/数字/大写等——那些是正常英文,误删 count:42 / countDown())。
                 match rest.chars().next() {
-                    None => return line.to_string(), // 行尾就是这个词(非独占特例词)→ 保守不剥。
+                    None => return (line.to_string(), StripHit::none()), // 行尾就是这个词→ 保守不剥。
                     Some(c) => {
                         if Self::is_leak_glue_char(c) {
-                            return rest.to_string(); // CJK/全角粘连 → 判泄漏剥掉。
+                            return (rest.to_string(), StripHit { stripped: true, standalone: false }); // CJK/全角粘连 → 剥。
                         }
-                        return line.to_string(); // 其余(空格/ASCII/数字/大写/标点)→ 正常英文,不剥。
+                        return (line.to_string(), StripHit::none()); // 其余→ 正常英文,不剥。
                     }
                 }
             }
         }
-        line.to_string()
+        (line.to_string(), StripHit::none())
     }
 
     fn process_assistant_response(&mut self, content: &str) -> Vec<SseEvent> {
@@ -1936,6 +1966,30 @@ impl StreamContext {
             self.output_tokens,
             self.cache_usage,
         ));
+
+        // 泄漏 token 诊断收尾（可观测，不改任何已发内容）：本请求若清洗过泄漏 token / 命中 saturation,
+        // 如实记一条——绝不黑箱。saturation（整段纯泄漏词行）= #70544 模型侧整段退化的信号,网关只能
+        // 清洗单个粘连、救不了整段（Bug B），此处标注归因便于 dwgx 判"是模型抽风非网关问题"。
+        if self.leaked_stripped > 0 || self.leaked_saturation_lines > 0 {
+            tracing::warn!(
+                model = %self.model,
+                leaked_stripped = self.leaked_stripped,
+                saturation_lines = self.leaked_saturation_lines,
+                "检测到 #70544 泄漏 token：已清洗 {} 个（其中 {} 行为整段纯泄漏词=模型侧整段退化，网关仅能清洗不能根治，建议该模型高多字节上下文场景 /clear 或换 sonnet）",
+                self.leaked_stripped,
+                self.leaked_saturation_lines,
+            );
+            if leak_trace_enabled() {
+                tracing::warn!(
+                    target: "kiro::leak_trace",
+                    model = %self.model,
+                    leaked_stripped = self.leaked_stripped,
+                    saturation_lines = self.leaked_saturation_lines,
+                    "[leak_trace] 本请求泄漏 token 清洗全貌"
+                );
+            }
+        }
+
         events
     }
 }
@@ -2515,6 +2569,18 @@ fn tool_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("KIRO_TOOL_TRACE")
+            .map(|v| !v.trim().is_empty() && v != "0")
+            .unwrap_or(false)
+    })
+}
+
+/// 泄漏 token 探针总开关（环境变量 `KIRO_LEAK_TRACE` 非空即开）。仿 `KIRO_TOOL_TRACE`,平时零开销。
+/// 开启时收尾额外打印本请求泄漏 token 清洗全貌，用于坐实 #70544 在流经网关的下游泄漏程度。
+fn leak_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("KIRO_LEAK_TRACE")
             .map(|v| !v.trim().is_empty() && v != "0")
             .unwrap_or(false)
     })
@@ -4199,43 +4265,68 @@ mod tests {
     /// ASCII 冒号/数字/大写）→ 绝不误删。court/課/课 独占整行 → 剥（高置信 #70544 泄漏）。
     #[test]
     fn test_strip_leaked_prefix() {
+        // 辅助：只取清洗后文本（新签名返回 (String, StripHit)）。
+        let s = |line: &str| StreamContext::strip_leaked_prefix(line).0;
         // CJK/全角粘连 → 剥离。
-        assert_eq!(StreamContext::strip_leaked_prefix("course重读文件"), "重读文件");
-        assert_eq!(StreamContext::strip_leaked_prefix("課我加的是"), "我加的是");
-        assert_eq!(StreamContext::strip_leaked_prefix("care：我把"), "：我把"); // 全角冒号
-        assert_eq!(StreamContext::strip_leaked_prefix("count你好"), "你好");
-        assert_eq!(StreamContext::strip_leaked_prefix("court重读"), "重读"); // 新增 court
-        assert_eq!(StreamContext::strip_leaked_prefix("card表格"), "表格"); // 新增 card
-        assert_eq!(StreamContext::strip_leaked_prefix("call调用"), "调用"); // 新增 call
+        assert_eq!(s("course重读文件"), "重读文件");
+        assert_eq!(s("課我加的是"), "我加的是");
+        assert_eq!(s("care：我把"), "：我把"); // 全角冒号
+        assert_eq!(s("count你好"), "你好");
+        assert_eq!(s("court重读"), "重读"); // 新增 court
+        assert_eq!(s("card表格"), "表格"); // 新增 card
+        assert_eq!(s("call调用"), "调用"); // 新增 call
         // court/課/课 独占整行 → 剥空(保留换行)。
-        assert_eq!(StreamContext::strip_leaked_prefix("court\n"), "\n");
-        assert_eq!(StreamContext::strip_leaked_prefix("court"), "");
-        assert_eq!(StreamContext::strip_leaked_prefix("課\n"), "\n");
+        assert_eq!(s("court\n"), "\n");
+        assert_eq!(s("court"), "");
+        assert_eq!(s("課\n"), "\n");
         // 【收严关键】正常英文含 ASCII 冒号/数字/大写 → 绝不误删(旧逻辑会误剥)。
-        assert_eq!(StreamContext::strip_leaked_prefix("count: 42"), "count: 42"); // 半角冒号
-        assert_eq!(StreamContext::strip_leaked_prefix("countDown()"), "countDown()"); // 大写
-        assert_eq!(StreamContext::strip_leaked_prefix("care2share"), "care2share"); // 数字
-        assert_eq!(StreamContext::strip_leaked_prefix("courseCatalog"), "courseCatalog"); // 大写
-        assert_eq!(StreamContext::strip_leaked_prefix("card#1"), "card#1"); // ASCII 标点
+        assert_eq!(s("count: 42"), "count: 42"); // 半角冒号
+        assert_eq!(s("countDown()"), "countDown()"); // 大写
+        assert_eq!(s("care2share"), "care2share"); // 数字
+        assert_eq!(s("courseCatalog"), "courseCatalog"); // 大写
+        assert_eq!(s("card#1"), "card#1"); // ASCII 标点
         // 正常英文：词后空格 / 小写延续 → 原样保留。
-        assert_eq!(StreamContext::strip_leaked_prefix("count the items"), "count the items");
-        assert_eq!(StreamContext::strip_leaked_prefix("counter offer"), "counter offer");
-        assert_eq!(StreamContext::strip_leaked_prefix("careful now"), "careful now");
-        assert_eq!(StreamContext::strip_leaked_prefix("call me"), "call me");
+        assert_eq!(s("count the items"), "count the items");
+        assert_eq!(s("counter offer"), "counter offer");
+        assert_eq!(s("careful now"), "careful now");
+        assert_eq!(s("call me"), "call me");
         // call/card/count/care/course 独占整行 → **不**享特例(可能是正常内容),保守不剥。
-        assert_eq!(StreamContext::strip_leaked_prefix("count"), "count");
-        assert_eq!(StreamContext::strip_leaked_prefix("card"), "card");
-        assert_eq!(StreamContext::strip_leaked_prefix("call"), "call");
+        assert_eq!(s("count"), "count");
+        assert_eq!(s("card"), "card");
+        assert_eq!(s("call"), "call");
         // 非泄漏词开头 → 原样。
-        assert_eq!(StreamContext::strip_leaked_prefix("hello世界"), "hello世界");
+        assert_eq!(s("hello世界"), "hello世界");
     }
 
-    /// clean_leaked_tokens：只在行首处理，多行时每行行首各判一次。
+    /// 诊断计数：strip 命中信息（stripped / standalone）正确——供收尾泄漏诊断计数。
+    #[test]
+    fn test_strip_leaked_prefix_hit_flags() {
+        let (_, hit) = StreamContext::strip_leaked_prefix("court\n"); // 独占整行
+        assert!(hit.stripped && hit.standalone, "独占整行 court 应 stripped+standalone");
+        let (_, hit) = StreamContext::strip_leaked_prefix("course重读"); // 粘连非独占
+        assert!(hit.stripped && !hit.standalone, "粘连剥离应 stripped 但非 standalone");
+        let (_, hit) = StreamContext::strip_leaked_prefix("count: 42"); // 正常英文不剥
+        assert!(!hit.stripped && !hit.standalone, "正常英文不应命中");
+    }
+
+    /// clean_leaked_tokens：只在行首处理，多行时每行行首各判一次；并累加诊断计数。
     #[test]
     fn test_clean_leaked_tokens_multiline() {
-        let ctx = StreamContext::new_with_thinking("claude-sonnet-4.6", 1, false, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("claude-sonnet-4.6", 1, false, HashMap::new());
         let input = "course重读\nnormal line\ncount你好";
         assert_eq!(ctx.clean_leaked_tokens(input), "重读\nnormal line\n你好");
+        assert_eq!(ctx.leaked_stripped, 2, "剥了 course / count 两个");
+        assert_eq!(ctx.leaked_saturation_lines, 0, "无独占整行泄漏");
+    }
+
+    /// saturation 计数：满屏纯 court 独占行 → 每行计入 saturation。
+    #[test]
+    fn test_clean_leaked_tokens_saturation_count() {
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4.8", 1, false, HashMap::new());
+        let input = "court\ncourt\ncourt\n";
+        ctx.clean_leaked_tokens(input);
+        assert_eq!(ctx.leaked_saturation_lines, 3, "3 行纯 court 独占行=saturation 信号");
+        assert_eq!(ctx.leaked_stripped, 3);
     }
 
     /// process_tool_use 端到端：非前缀双对象场景，flush 出的 partial_json 必须是合法 JSON（第二帧）。
