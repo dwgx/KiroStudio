@@ -257,11 +257,13 @@ export function CredentialCard({
   // 自定义 API 代挂号:不是 Kiro 号,订阅/余额/profileArn/刷新Token 全无意义,卡片显示专属信息。
   // 判据与后端 is_custom_api_credential + StatusBars 对齐(authMethod 优先,baseUrl 兜底旧数据)。
   const isCustomApi = credential.authMethod === 'custom_api' || !!credential.baseUrl
-  // 「Profile ARN 区域」探测/切换只对 External IdP(微软 M365 等)号有意义:同一账号在多个
-  // AWS region 各有独立 profile、只部分开通。后端 probe_regions_for 也只支持 external_idp,
-  // 对 social/idc 号会 bail「仅 External IdP 凭据支持列出 region profile」。故 UI 只对
-  // external_idp 号显示该区块,避免其它号点了必然报误导错误。
+  // 「Profile ARN 区域」探测/切换:External IdP(微软 M365 等,同账号多 region 各有独立 profile 只部分
+  // 开通)+ IdC(AWS SSO)。后端 probe_regions_for/switch 已放开到 external_idp||idc(排除 social/api_key
+  // /custom_api)。**IdC 实例通常绑单一 region,探测多用于确认/重新解析该号 profileArn,一般只返回一个
+  // region**(非多 region 选择器)。故对这两类显示区块。
   const isExternalIdp = credential.authMethod === 'external_idp'
+  const isIdc = credential.authMethod === 'idc'
+  const canProbeRegion = isExternalIdp || isIdc
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -310,16 +312,30 @@ export function CredentialCard({
     })
   }
 
-  // 探测该账号各 region 的 profile（切 Profile ARN 用）。结果走卡片式列表展示，不用 toast。
+  // 探测该账号各 region 的 profile（切 Profile ARN 用）。实时 notification 反馈探测过程：
+  // 开始「探测中」→ 找到即报可用数量 / 没找到给详细错误报告（不吞成裸失败）。
   const loadRegions = async () => {
     setRegionsLoading(true)
     setRegionsError(null)
+    const pending = toast.loading('正在探测各区域 profile…')
     try {
       const res = await probeCredentialRegions(credential.id)
-      setRegions(res.regions ?? [])
+      const list = res.regions ?? []
+      setRegions(list)
+      const usableCount = list.filter((r) => r.usable).length
+      if (usableCount > 0) {
+        toast.success(`探测完成：找到 ${usableCount} 个可用区域（共 ${list.length} 个）`, { id: pending })
+      } else if (list.length > 0) {
+        toast.warning(`探测完成：${list.length} 个区域均不可用（未开通/验活失败）`, { id: pending })
+      } else {
+        toast.warning('探测完成：未找到任何 region profile', { id: pending })
+      }
     } catch (err) {
-      setRegionsError(extractErrorMessage(err))
+      // 详细错误报告：把后端 bail 的具体原因透传到卡片红框 + toast，不是裸 502。
+      const msg = extractErrorMessage(err)
+      setRegionsError(msg)
       setRegions(null)
+      toast.error('探测失败：' + msg, { id: pending })
     } finally {
       setRegionsLoading(false)
     }
@@ -1076,15 +1092,18 @@ export function CredentialCard({
             {/* Profile ARN 区域切换（仅 External IdP 号）：列出该账号各 region 的 profile，
                 卡片式单选列表展示每个 region 的 ARN + 是否可用 + 订阅等级，选中即切过去
                 （切的是对话走哪个上游 profile/端点，非改全局 region）。
-                只对 external_idp 号显示：social/idc/api_key/custom_api 号无多 region profile 概念，
-                后端 probe_regions_for 也只支持 external_idp（否则 bail「仅 External IdP 凭据支持」）。 */}
-            {isExternalIdp && (
+                external_idp（多 region profile 选择）+ idc（通常单 region，用于确认/重新解析 profileArn）
+                显示；social/api_key/custom_api 无 profile 概念不显示。后端 probe_regions_for 已放开到
+                external_idp||idc。 */}
+            {canProbeRegion && (
             <div className="space-y-2 border-t pt-4">
               <div className="flex items-center justify-between gap-2">
                 <div className="min-w-0">
                   <div className="text-sm font-medium">Profile ARN 区域</div>
                   <div className="text-xs text-muted-foreground">
-                    切换此号对话走哪个区域的 profile（非改全局 region）。下次请求生效。
+                    {isIdc
+                      ? 'IdC 实例通常绑定单一区域，探测用于确认/重新解析该号 profileArn（一般只返回一个区域）。'
+                      : '切换此号对话走哪个区域的 profile（非改全局 region）。下次请求生效。'}
                   </div>
                 </div>
                 <Button

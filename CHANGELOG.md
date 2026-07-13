@@ -2,6 +2,31 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.13] - 2026-07-13
+
+### 修复 IdC 号刷新 Token 502（0.7.12 收口引入的回归）
+- **根因**：IdC 号有两个物理不同的 region——`auth_region`=SSO-OIDC 实例所在区域（clientId/secret/
+  refreshToken 在此注册，刷新 token 必须打 `oidc.{auth_region}.amazonaws.com`），与 profileArn 的
+  region（对话 `runtime.{R}.kiro.dev` / 余额 `management.{R}.kiro.dev` 用）不同。0.7.12 加的
+  `sync_region_from_arn` 收口铁律会把 `auth_region` 也一起同步成 ARN region → 刷新打到错的 OIDC 端点
+  → clientId 跨 region 失配 → AWS 拒 → 网关映射成 502。表现为「余额/对话正常、唯独刷新 Token 502」，
+  且 access_token 过期后会使该号变废（定时炸弹）。
+- **修复**：`sync_region_from_arn` 对 IdC 号**豁免 auth_region 改写**（只同步 `region` 供对话/余额，
+  `auth_region` 保留上号 device flow 探测的 SSO-OIDC 区域）。新增 `is_idc_credential()` 判据。
+  external_idp 的 auth_region 不参与刷新（用微软 token_endpoint）、social 走 kiro.dev，故仅 IdC 需豁免。
+
+### IdC 号放开 region 手动切换 / 自动探测
+- `probe_regions_for` / `switch_profile_region_for` 从「仅 External IdP」放开到 **External IdP + IdC**
+  （排除 social/api_key/custom_api）。底层探测对 IdC 用纯 Bearer（无特殊 TokenType），与刷新路径已
+  在用的多 region ListAvailableProfiles 同源；切换只在验活 `Usable` 时才写回，坏 region 一律 bail
+  不动状态，零误切风险。
+- 前端凭据卡片设置区对 IdC 号显示「Profile ARN 区域」探测/切换。**诚实文案**：IdC 实例通常绑定单一
+  区域，探测多用于确认/重新解析该号 profileArn（一般只返回一个区域），非多 region 选择器。
+
+### region 探测实时反馈（notification）
+- 探测过程实时 toast：开始「正在探测…」→ 找到「找到 N 个可用区域」/ 全不可用给明确提示 / 失败给
+  **详细错误报告**（后端 bail 的具体原因透传到卡片红框 + toast，不再是裸失败）。
+
 ## [0.7.12] - 2026-07-13
 
 ### 上号统一治理（根治 region/ARN 反复修补）

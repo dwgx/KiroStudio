@@ -4678,8 +4678,10 @@ impl MultiTokenManager {
         }
         // 取有效 token（过期会先刷新）。credentials 为最新快照。
         let (credentials, token) = self.ensure_valid_token(id).await?;
-        if !credentials.is_external_idp_credential() {
-            bail!("仅 External IdP 凭据支持切换 region profile");
+        // External IdP + IdC 支持切换 region profile(底层探测对 IdC 用纯 Bearer,已在刷新路径验证)。
+        // 排除 social(通常只占位 ARN)/api_key/custom_api(无 profile 概念)。
+        if !credentials.is_external_idp_credential() && !credentials.is_idc_credential() {
+            bail!("仅 External IdP / IdC 凭据支持切换 region profile");
         }
         let cfg = self.config.load_full();
         let proxy = credentials.effective_proxy(self.proxy.as_ref());
@@ -4722,8 +4724,9 @@ impl MultiTokenManager {
     /// 【F】列出指定 external_idp 号在候选 region 的全部 profile 及其验活结果（供前端选 region）。
     pub async fn probe_regions_for(&self, id: u64) -> anyhow::Result<Vec<ProfileCandidate>> {
         let (credentials, token) = self.ensure_valid_token(id).await?;
-        if !credentials.is_external_idp_credential() {
-            bail!("仅 External IdP 凭据支持列出 region profile");
+        // External IdP + IdC 支持列出 region profile(排除 social/api_key/custom_api)。
+        if !credentials.is_external_idp_credential() && !credentials.is_idc_credential() {
+            bail!("仅 External IdP / IdC 凭据支持列出 region profile");
         }
         let cfg = self.config.load_full();
         let proxy = credentials.effective_proxy(self.proxy.as_ref());
