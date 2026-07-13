@@ -245,12 +245,14 @@ pub async fn register_and_authorize_probing(
             }
         }
     }
-    anyhow::bail!(
-        "IdC 登录失败:start URL 在所试的 {} 个 region 均无对应实例。请确认 start URL 正确,\
-         或到 AWS IAM Identity Center 设置查看实例所在 region 后重填。（最后错误：{}）",
+    // 全 region 都不成 → 结构化诊断 REGION_MISMATCH（归因 UserInput + 引导查 IAM Identity Center），
+    // 取代裸 bail 字符串,前端渲染成引导卡片。
+    let diagnosis = crate::kiro::diagnosis::diagnose_device_auth_all_failed(
         order.len(),
-        last_err.as_deref().unwrap_or("无")
-    )
+        last_err.as_deref(),
+    );
+    tracing::warn!("IdC device flow 全 region 失败：{}", diagnosis.log_line());
+    Err(crate::kiro::token_manager::DiagnosedError { diagnosis }.into())
 }
 
 /// Step 4: 轮询 CreateToken（一次调用，由上层循环驱动）

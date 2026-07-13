@@ -7,6 +7,7 @@ pub mod endpoint;
 pub mod health;
 pub mod machine_id;
 pub mod model;
+pub mod diagnosis;
 pub mod overage;
 pub mod parser;
 pub mod passthrough;

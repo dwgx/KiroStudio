@@ -663,3 +663,21 @@ export interface RateLimitInsight {
   /** 中文推断文案（如「#54 冷却中（速率限制）剩22s，已触发3次」「畅通」） */
   insightText: string
 }
+
+/** 上号智能诊断：后端错误响应 error.diagnosis 携带（归因+引导），前端渲染诊断卡片。 */
+export interface OnboardingDiagnosis {
+  /** 阶段：register/device_auth/poll/resolve_profile/refresh/probe_region/verify */
+  stage: string
+  /** 归因方：user_input(用户填错)/account_state(账号问题)/upstream(AWS侧)/gateway(网关未覆盖)/transient(瞬时) */
+  fault: 'user_input' | 'account_state' | 'upstream' | 'gateway' | 'transient'
+  /** 机器可读错误码，如 REGION_MISMATCH / CLIENT_OR_TOKEN_MISMATCH / NO_PROFILE_IN_REGION */
+  code: string
+  /** 一句话中文诊断（主行） */
+  summary: string
+  /** 用户该做什么——有序可操作步骤 */
+  guidance: string[]
+  /** 原始上游 status+body（折叠详情，供排障） */
+  raw?: string
+  /** 能否重试 */
+  retriable: boolean
+}

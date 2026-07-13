@@ -20,6 +20,9 @@ pub enum AdminServiceError {
 
     /// 凭据无效（验证失败）
     InvalidCredential(String),
+
+    /// 结构化上号诊断（归因+引导）——取代裸字符串错误，前端渲染诊断卡片。
+    Diagnosed(crate::kiro::diagnosis::OnboardingDiagnosis),
 }
 
 impl fmt::Display for AdminServiceError {
@@ -31,6 +34,7 @@ impl fmt::Display for AdminServiceError {
             AdminServiceError::UpstreamError(msg) => write!(f, "上游服务错误: {}", msg),
             AdminServiceError::InternalError(msg) => write!(f, "内部错误: {}", msg),
             AdminServiceError::InvalidCredential(msg) => write!(f, "凭据无效: {}", msg),
+            AdminServiceError::Diagnosed(d) => write!(f, "{}", d.log_line()),
         }
     }
 }
@@ -45,6 +49,15 @@ impl AdminServiceError {
             AdminServiceError::UpstreamError(_) => StatusCode::BAD_GATEWAY,
             AdminServiceError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AdminServiceError::InvalidCredential(_) => StatusCode::BAD_REQUEST,
+            // 诊断类:可重试(上游/瞬时)→502 让客户端知道是上游侧;不可重试(账号/用户/网关)→400
+            // (账号需重新上号、用户需改输入,不是"服务器错",给 400 更准 + 前端据 diagnosis 渲染引导)。
+            AdminServiceError::Diagnosed(d) => {
+                if d.retriable {
+                    StatusCode::BAD_GATEWAY
+                } else {
+                    StatusCode::BAD_REQUEST
+                }
+            }
         }
     }
 
@@ -59,6 +72,7 @@ impl AdminServiceError {
             AdminServiceError::InvalidCredential(_) => {
                 AdminErrorResponse::invalid_request(self.to_string())
             }
+            AdminServiceError::Diagnosed(d) => AdminErrorResponse::diagnosed(d.clone()),
         }
     }
 }
