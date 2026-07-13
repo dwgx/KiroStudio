@@ -499,6 +499,9 @@ impl KiroProvider {
         //  自造雪崩）。首次 429 才设冷却，同链再 429 只换号 failover，不重复惩罚。
         // 跨请求（新请求 = 新集合）仍正常累加，保留「持续被限流的号冷却渐长」的合理行为。
         let mut rate_limited_this_call: HashSet<u64> = HashSet::new();
+        // 本请求链内已因 403 FEATURE_NOT_SUPPORTED 做过「本地 region 纠正 + 重试」的号(镜像
+        // force_refreshed 去重惯例)。防同一坏号在一条链里反复本地纠正+重试烧光 max_retries。
+        let mut region_corrected_this_call: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         // 一次解析同时取出模型信息与会话标识（conversationId），避免热路径上对
@@ -794,6 +797,56 @@ impl KiroProvider {
                     status,
                     body
                 );
+
+                // region 自动纠正一条龙:403 FEATURE_NOT_SUPPORTED = 该 region 的 profile 未开通。
+                // 这**不是**凭据坏(号本身好、只是 region 配错),绝不当普通 401/403 冷却 + 换号误伤它。
+                // 处置(对抗复核裁决:昂贵 reprobe 绝不上同步对话热路径):
+                //   ① 廉价本地纠正 sync_region_from_arn(纯字符串,无网络)——修"region 字段与 ARN 漂移";
+                //   ② 置 flag + 触发 per-id 守卫的**后台异步**重探(不阻塞本请求,为后续请求恢复);
+                //   ③ 仅当本地纠正真改了 region 且本链未纠正过 → continue 重试一次(不 report_failure);
+                //   否则落下方 report_failure + failover(本请求换号,重探已在后台启动)。
+                // 非 external_idp 号(social/idc)第二条件即短路,行为逐字不变。
+                if status.as_u16() == 403
+                    && endpoint.is_feature_not_supported(&body)
+                    && ctx.credentials.is_external_idp_credential()
+                {
+                    let corrected = self.token_manager.sync_region_from_arn_for(ctx.id);
+                    self.token_manager.mark_usage_403_feature_not_supported(ctx.id);
+                    self.token_manager.trigger_background_reprobe(ctx.id);
+                    if corrected
+                        && region_corrected_this_call.insert(ctx.id)
+                        && call_started.elapsed()
+                            < std::time::Duration::from_secs(MAX_REQUEST_RETRY_BUDGET_SECS)
+                    {
+                        tracing::info!(
+                            "凭据 #{} 403 FEATURE_NOT_SUPPORTED:已本地纠正 region,同号重试一次(不冷却)",
+                            ctx.id
+                        );
+                        last_outcome = crate::usage::RequestOutcome::ServerError;
+                        last_error = Some(anyhow::anyhow!(
+                            "{} 403 FEATURE_NOT_SUPPORTED(已本地纠正 region 重试): {} {}",
+                            api_type, status, body
+                        ));
+                        // continue → 下一轮 acquire_context 重克隆已改好 region 的 creds(不复用旧 ctx/url)。
+                        continue;
+                    }
+                    // 本地纠不动(ARN region 本身就是未开通那个,常见)→ failover 换号服务本请求,
+                    // 后台异步重探已启动为该号后续请求恢复。给该号一段**认证冷却**(临时跳过、非禁用、
+                    // 不累计失败),让调度本链内避开它、别反复选回来空撞 403;冷却到期或后台重探成功后
+                    // 自动恢复。绝不 report_failure 连坐(region 配错≠号坏,隔离铁律)。
+                    tracing::info!(
+                        "凭据 #{} 403 FEATURE_NOT_SUPPORTED:本地纠正无效,冷却+failover 换号(后台重探已启动)",
+                        ctx.id
+                    );
+                    last_outcome = crate::usage::RequestOutcome::ServerError;
+                    self.token_manager.report_auth_cooldown(ctx.id);
+                    last_error = Some(anyhow::anyhow!(
+                        "{} 403 FEATURE_NOT_SUPPORTED(region 未开通,冷却换号,后台重探中): {} {}",
+                        api_type, status, body
+                    ));
+                    // continue:下一轮 acquire_context 选别的号;全池不可用时由 max_retries/墙钟兜底透传。
+                    continue;
+                }
 
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
