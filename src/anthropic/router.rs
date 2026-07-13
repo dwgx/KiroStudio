@@ -43,6 +43,12 @@ pub fn create_router_with_provider(
     max_body_bytes: usize,
     compression: crate::model::config::CompressionConfig,
     strip_env_noise: bool,
+    tool_clean_leaked_tokens: bool,
+    tool_stream_align_failure: bool,
+    tool_expose_error_to_client: bool,
+    tool_repair_json: bool,
+    tool_truncation_recovery: bool,
+    tool_description_max_chars: usize,
 ) -> Router {
     let mut state = AppState::new(api_key);
     if let Some(provider) = kiro_provider {
@@ -56,6 +62,14 @@ pub fn create_router_with_provider(
     super::handlers::set_compression(compression);
     // 环境噪音剥离开关：播种进 converter 进程级镜像（归一化路径读镜像），admin 改后即时生效。
     super::converter::set_strip_env_noise(strip_env_noise);
+    // 工具错误缓解三开关：播种进 handlers 进程级镜像（工具/文本处理热路径读），admin 改后即时生效。
+    super::handlers::set_tool_clean_leaked_tokens(tool_clean_leaked_tokens);
+    super::handlers::set_tool_stream_align_failure(tool_stream_align_failure);
+    super::handlers::set_tool_expose_error_to_client(tool_expose_error_to_client);
+    super::handlers::set_tool_repair_json(tool_repair_json);
+    super::handlers::set_tool_truncation_recovery(tool_truncation_recovery);
+    // 工具描述上限：播种进 converter 进程级镜像（convert_tools 读镜像），admin 改后即时生效。
+    super::converter::set_tool_description_max_chars(tool_description_max_chars);
 
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()

@@ -257,6 +257,11 @@ export function CredentialCard({
   // 自定义 API 代挂号:不是 Kiro 号,订阅/余额/profileArn/刷新Token 全无意义,卡片显示专属信息。
   // 判据与后端 is_custom_api_credential + StatusBars 对齐(authMethod 优先,baseUrl 兜底旧数据)。
   const isCustomApi = credential.authMethod === 'custom_api' || !!credential.baseUrl
+  // 「Profile ARN 区域」探测/切换只对 External IdP(微软 M365 等)号有意义:同一账号在多个
+  // AWS region 各有独立 profile、只部分开通。后端 probe_regions_for 也只支持 external_idp,
+  // 对 social/idc 号会 bail「仅 External IdP 凭据支持列出 region profile」。故 UI 只对
+  // external_idp 号显示该区块,避免其它号点了必然报误导错误。
+  const isExternalIdp = credential.authMethod === 'external_idp'
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -1068,10 +1073,12 @@ export function CredentialCard({
               )}
             </div>
 
-            {/* Profile ARN 区域切换（仅 Kiro 号）：列出该账号各 region 的 profile，
+            {/* Profile ARN 区域切换（仅 External IdP 号）：列出该账号各 region 的 profile，
                 卡片式单选列表展示每个 region 的 ARN + 是否可用 + 订阅等级，选中即切过去
-                （切的是对话走哪个上游 profile/端点，非改全局 region）。自定义 API 号不适用。 */}
-            {!isCustomApi && (
+                （切的是对话走哪个上游 profile/端点，非改全局 region）。
+                只对 external_idp 号显示：social/idc/api_key/custom_api 号无多 region profile 概念，
+                后端 probe_regions_for 也只支持 external_idp（否则 bail「仅 External IdP 凭据支持」）。 */}
+            {isExternalIdp && (
             <div className="space-y-2 border-t pt-4">
               <div className="flex items-center justify-between gap-2">
                 <div className="min-w-0">
