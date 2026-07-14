@@ -6,6 +6,7 @@ import {
   Key,
   BarChart3,
   Settings,
+  Wrench,
   LogIn,
   LogOut,
 } from 'lucide-react'
@@ -26,13 +27,17 @@ const UsagePage = lazy(() =>
 const SettingsPage = lazy(() =>
   import('@/components/settings-page').then((m) => ({ default: m.SettingsPage }))
 )
+const OpsPage = lazy(() =>
+  import('@/components/ops-page').then((m) => ({ default: m.OpsPage }))
+)
 
-type Tab = 'overview' | 'credentials' | 'usage' | 'settings'
+type Tab = 'overview' | 'credentials' | 'usage' | 'ops' | 'settings'
 
 const NAV_ITEMS: { key: Tab; label: string; icon: React.ReactNode }[] = [
   { key: 'overview', label: '概览', icon: <LayoutDashboard className="h-4 w-4" /> },
   { key: 'credentials', label: '凭据管理', icon: <Key className="h-4 w-4" /> },
   { key: 'usage', label: '用量统计', icon: <BarChart3 className="h-4 w-4" /> },
+  { key: 'ops', label: '运维', icon: <Wrench className="h-4 w-4" /> },
   { key: 'settings', label: '设置', icon: <Settings className="h-4 w-4" /> },
 ]
 
@@ -40,6 +45,7 @@ const TAB_TITLES: Record<Tab, string> = {
   overview: '概览',
   credentials: '凭据管理',
   usage: '用量统计',
+  ops: '运维',
   settings: '设置',
 }
 
@@ -149,6 +155,7 @@ export function AppShell({ onLogout }: AppShellProps) {
             {tab === 'overview' && <OverviewPage />}
             {tab === 'usage' && <UsagePage />}
             {tab === 'credentials' && <Dashboard onLogout={onLogout} embedded />}
+            {tab === 'ops' && <OpsPage />}
             {tab === 'settings' && <SettingsPage />}
           </Suspense>
         </div>

@@ -2,6 +2,43 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.17] - 2026-07-14
+
+### GPT-5.6 三变体接入（Kiro 2026-07 新增）
+- `model_catalog.rs` 新增 `Family::Gpt` + 三个并列变体 `gpt-5.6-sol` / `gpt-5.6-luna` /
+  `gpt-5.6-terra`（各带连字符/无点/大小写别名）。走**精确别名命中**范式（与国产模型一致，无语义
+  版本号）。故意不做 `contains("gpt")` 子串探测——`gpt-5.6` / `gpt-4` 这类无变体名会被 strict 拒绝，
+  逼客户端指明 sol/luna/terra（与 `auto` 同理，防误命中 + 乱计费）。`/v1/models` 自动派生广告，
+  前端 `PROBE_MODEL_CATALOG` 补三条（测活/号池白名单可选）。
+- **诚实边界**：credit_mult / context_window 暂用保守占位（1.0x / 200K），待 Kiro 官方权威值校正；
+  这两个字段只影响计费展示与 max_tokens 广告，不影响模型能否用。上游是否真接受该 modelId 需真机验证。
+
+### 运维可观测三件套（对比并行项目 WindsurfAPI 调研后借鉴）
+- **自愈机器可观测（recovery-metrics）**：新增 `common/recovery_metrics.rs` 进程级原子计数器
+  （刷新 ok/fail、failover 换号跳数/耗尽、自动禁用死号、风控冷却触发、region 重探 ok/fail、
+  泄漏 token 清洗/整段退化）。各处自愈事件埋点，`GET /admin/recovery-metrics` 一次性导出快照
+  （含 uptimeMs）。**不持久化**（自进程启动的健康信号，重启归零）。把刷新/failover/清洗机器从
+  黑箱变成可查。前端「运维」页自愈计数卡片（warn 类计数 >0 标琥珀色）。
+- **实时日志流 + 一键导出**：新增 `common/log_buffer.rs` 自定义 tracing Layer → 有界环形缓冲
+  （1000 条）+ broadcast 实时推送，与 fmt 层共享同一 EnvFilter。端点 `/admin/logs`（增量拉取 +
+  级别过滤）、`/admin/logs/stream`（SSE 回放 + 实时直播）、`/admin/logs/export`（JSONL 下载，
+  直接附 bug 报告）。前端运维页日志查看器：级别过滤 / 实时暂停（断连自动重连 + 如实反映连接态）/
+  一键导出。自托管场景下运维不必 SSH/grep。
+
+### 原子写重构（config.json 崩溃截断防护）
+- 抽 `common/fs_atomic.rs` 共享单一真相源：temp → fsync → rename（创建即 0600，无 rename 后设权的
+  短 world-readable 窗口）+ Windows 句柄占用（杀软/索引器）的 rename 退避重试（PermissionDenied /
+  os error 5,32）。`config.rs Config::save()` 从裸 `fs::write` 改用它——修 adminApiKey / proxyPassword
+  明文配置的**崩溃截断丢配置**（写一半崩溃 → 面板密钥丢失锁死管理入口）+ 短权限窗口双风险。
+  token_manager 原内联 `write_atomic` 提取到共享模块复用（凭据/回收站持久化行为不变）。
+
+### 诚实边界（实测推翻的假设）
+- 「客户端断开→取消贯穿 failover」经旁挂实测**证明现状已正确**：axum/hyper 在客户端断开时会主动
+  drop 正在执行的 handler future（即便还在 failover 的 `.await` 点），Rust 协作式取消让 failover
+  循环 / inflight 守卫 / 上游 reqwest 级联取消。故**未改代码**（drop 级联已在做正确的事）。
+
+双特性各 635 绿（+8 新测）+ 前端 build 绿 + 对抗性 review（5 维 + 复核）。
+
 ## [0.7.16] - 2026-07-14
 
 ### region 选择器统一复用（设置页那套下拉铺到三处上号 region 输入）
