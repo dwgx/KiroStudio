@@ -512,6 +512,9 @@ impl KiroProvider {
         let call_started = std::time::Instant::now();
         let mut last_credential_id: Option<u64> = None;
         let mut last_outcome = crate::usage::RequestOutcome::OtherError;
+        // 是否真的发生过 failover(打了 >1 个号)。用于区分「整池换号都失败=真耗尽」与
+        // 「首个号就因客户端错误/模型无效 break=不是池的问题」——后者不该计 failover_exhausted。
+        let mut real_failover_happened = false;
 
         for attempt in 0..max_retries {
             // 墙钟闸门：单请求重试总时长超预算就停止（把最后错误透传给客户端，
@@ -528,7 +531,6 @@ impl KiroProvider {
                 );
                 break;
             }
-
             // 获取调用上下文（绑定 index、credentials、token）
             let ctx = match self
                 .token_manager
@@ -547,6 +549,13 @@ impl KiroProvider {
                     continue;
                 }
             };
+
+            // 可观测:attempt>0 且真拿到了一个号 = 一次 failover 换号(真打了下一个号)。
+            // 放在 acquire_context 成功之后,避免全池冷却 continue(没拿到号)误计一跳。
+            if attempt > 0 {
+                crate::common::recovery_metrics::bump_failover_hop();
+                real_failover_happened = true;
+            }
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
@@ -957,7 +966,12 @@ impl KiroProvider {
             }
         }
 
-        // 所有重试都失败：埋点一条失败记录后返回错误
+        // 所有重试都失败:埋点一条失败记录后返回错误。
+        // 可观测:仅当真的换号 failover 过(打了 >1 个号)才计「耗尽」——首个号即因客户端错误/
+        // 模型无效 break 的不算池耗尽,避免运维看错(误判池死实为客户端请求问题)。
+        if real_failover_happened {
+            crate::common::recovery_metrics::bump_failover_exhausted();
+        }
         let final_error = last_error.unwrap_or_else(|| {
             anyhow::anyhow!(
                 "{} API 请求失败：已达到最大重试次数（{}次）",
