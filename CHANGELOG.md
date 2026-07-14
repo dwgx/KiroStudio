@@ -2,6 +2,45 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.18] - 2026-07-14
+
+### OpenAI 兼容入站端点（让 Codex / OpenAI 客户端走网关用上游模型）
+此前网关只有 Anthropic 端点（/v1/messages），OpenAI 协议客户端打 /v1/chat/completions 或
+/v1/responses 一律 404。本版新增 `src/openai/` 薄适配层，让 OpenAI 客户端能通过 KiroStudio 使用
+上游模型（含 Kiro 新增的 gpt-5.6-sol/luna/terra）。
+- **架构**：OpenAI 请求 → 翻译成内部 Anthropic MessagesRequest → **复用现有整条管线**
+  （custom_api 透传 / failover / 工具修复 / 泄漏清洗 / 用量埋点，零重复）→ 把 Anthropic 响应/SSE
+  翻回 OpenAI 格式。翻译层只处理 JSON 字节、不碰网络，与号池调度解耦。转换规则移植自参考项目
+  CLIProxyAPI / sub2api（同为「OpenAI 入站 → Anthropic 上游」方向）。
+- **`POST /v1/chat/completions`**（经典无状态端点，覆盖绝大多数 OpenAI 客户端）：role 映射
+  （system/developer→system、assistant tool_calls→tool_use、tool→tool_result）、多模态
+  image_url/file、tools/tool_choice、流式 chat.completion.chunk（tool_call 缓冲到块结束一次性吐、
+  规避 accumulator shear）、非流式聚合、usage cache token 计费回加、强制透出 usage。
+- **`POST /v1/responses`**（Codex 走此端点）：input 字符串/数组、instructions→system、
+  function_call/function_call_output item、reasoning.effort→thinking、完整 Responses SSE 事件序列
+  （response.created→output_item.added→content_part.added→output_text.delta→.done→
+  output_item.done→response.completed，sequence_number 单调、终结事件回填全量内容）。
+  previous_response_id 无状态兼容：忽略、要求客户端发全量、回稳定 response.id。
+- **工具配对修复**（防上游 400）：`normalize_tool_pairing_and_merge` 丢弃孤儿 tool_result /
+  悬空 tool_use、合并连续同角色消息、保证首条为 user（Anthropic 严格交替/配对不变量）。
+- model 经 model_catalog 归一（gpt-5.6 三变体已在表），未识别原样透传给上游。
+- **诚实边界**：gpt-5.6 上游是否被 Kiro CodeWhisperer 接受**仍需真机验证**；SSE happy-path 需真号
+  端到端验证（离线单测 + 假号路由验证已过）。
+
+### 文本化工具调用诊断探针（KIRO_INVOKE_TRACE）
+新增环境变量探针（默认关、零开销）：assistantResponseEvent 文本流出现工具调用标记
+（`<invoke>`/`antml:`/`<parameter`）时如实记一条现场语料，用于坐实「Claude 系模型偶发把工具调用
+语法当纯文本吐出（丢 antml: 前缀 + 夹 court/课 泄漏词）致客户端断连」现象（#70544 变体，模型侧）。
+线上开 `KIRO_INVOKE_TRACE=1` 复现即可抓真实语料定性。
+
+### 对抗性 review 修复
+两轮 review（chat/completions + responses）共修复：流式 tool_calls index 用错（幻影空工具）、
+UTF-8 跨 chunk 损坏、CRLF SSE 分帧、tool_choice:none 丢弃、thinking+temperature 400、中途断流
+误当成功、responses 流式终结事件无 payload（工具空参/消息空文本/output 空壳）、reasoning summary
+未闭合、transport 断开终结帧协议不匹配等。测试强化为断言 payload 字段（非仅事件类型）。
+
+openai 模块 26 单测 + 双特性各 662 绿。
+
 ## [0.7.17] - 2026-07-14
 
 ### GPT-5.6 三变体接入（Kiro 2026-07 新增）
