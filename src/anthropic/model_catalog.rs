@@ -37,6 +37,9 @@ pub enum Family {
     Glm,
     Qwen,
     Minimax,
+    /// OpenAI GPT 系(Kiro 2026-07 新增,直收原生 modelId)。sol/luna/terra 为并列变体,
+    /// 无 major.minor 语义版本号,故与国产模型同属「无版本族」——走精确别名命中。
+    Gpt,
     /// Kiro 的 "Auto" 路由模型(1.0x,由上游按负载自动选目标模型,无固定版本/窗口)。
     Auto,
 }
@@ -304,6 +307,51 @@ pub static CATALOG: &[ModelSpec] = &[
         context_window: 200_000,
         max_output: 64_000,
         credit_mult: 0.15,
+        supports_thinking: false,
+        supports_1m: false,
+        advertised: true,
+    },
+    // ===== GPT 系(Kiro 2026-07 新增;sol/luna/terra 三并列变体,无语义版本号) =====
+    // ⚠️ credit_mult / context_window 暂用保守默认(200K / 1.0x),待 dwgx 给 Kiro 官方权威值后校正。
+    //    这两个字段只影响计费展示与 /v1/models 的 max_tokens 广告,不影响映射是否生效。
+    ModelSpec {
+        kiro_id: "gpt-5.6-sol",
+        family: Family::Gpt,
+        version: None,
+        aliases: &["gpt-5.6-sol", "gpt-5-6-sol", "gpt5.6-sol"],
+        owned_by: "openai",
+        display_name: "GPT-5.6 Sol",
+        context_window: 200_000,
+        max_output: 64_000,
+        credit_mult: 1.00,
+        supports_thinking: false,
+        supports_1m: false,
+        advertised: true,
+    },
+    ModelSpec {
+        kiro_id: "gpt-5.6-luna",
+        family: Family::Gpt,
+        version: None,
+        aliases: &["gpt-5.6-luna", "gpt-5-6-luna", "gpt5.6-luna"],
+        owned_by: "openai",
+        display_name: "GPT-5.6 Luna",
+        context_window: 200_000,
+        max_output: 64_000,
+        credit_mult: 1.00,
+        supports_thinking: false,
+        supports_1m: false,
+        advertised: true,
+    },
+    ModelSpec {
+        kiro_id: "gpt-5.6-terra",
+        family: Family::Gpt,
+        version: None,
+        aliases: &["gpt-5.6-terra", "gpt-5-6-terra", "gpt5.6-terra"],
+        owned_by: "openai",
+        display_name: "GPT-5.6 Terra",
+        context_window: 200_000,
+        max_output: 64_000,
+        credit_mult: 1.00,
         supports_thinking: false,
         supports_1m: false,
         advertised: true,
@@ -805,6 +853,46 @@ mod tests {
         assert_eq!(kid("deepseek"), Some("deepseek-3.2"));
         assert_eq!(kid("minimax-m2.1"), Some("minimax-m2.1"));
         assert_eq!(kid("minimax"), Some("minimax-m2.5")); // 无版本回退最新
+    }
+
+    #[test]
+    fn test_gpt_variants_exact_match() {
+        // GPT 三并列变体(sol/luna/terra)精确别名命中,映射到各自原生 kiro_id。
+        assert_eq!(kid("gpt-5.6-sol"), Some("gpt-5.6-sol"));
+        assert_eq!(kid("gpt-5.6-luna"), Some("gpt-5.6-luna"));
+        assert_eq!(kid("gpt-5.6-terra"), Some("gpt-5.6-terra"));
+        // 连字符/无点变体别名也命中。
+        assert_eq!(kid("gpt-5-6-sol"), Some("gpt-5.6-sol"));
+        assert_eq!(kid("gpt5.6-luna"), Some("gpt-5.6-luna"));
+        // 大小写不敏感。
+        assert_eq!(kid("GPT-5.6-TERRA"), Some("gpt-5.6-terra"));
+        // family/version 正确。
+        let r = resolve("gpt-5.6-sol").unwrap();
+        assert_eq!(r.spec.family, Family::Gpt);
+        assert_eq!(r.spec.version, None);
+        assert_eq!(r.kind, MatchKind::Exact);
+    }
+
+    #[test]
+    fn test_gpt_ambiguous_names_rejected() {
+        // 无变体后缀的 gpt 名(无「默认 GPT」概念)+ 旧 gpt 名 → strict 拒绝,不静默映射。
+        // 与 auto 子串同理:gpt 不做 contains 探测,逼客户端指明 sol/luna/terra。
+        assert_eq!(kid("gpt-5.6"), None, "无变体的 gpt-5.6 应拒绝,逼指明 sol/luna/terra");
+        assert_eq!(kid("gpt-4"), None);
+        assert_eq!(kid("gpt-5-6-mars"), None, "未知变体应拒绝");
+        assert_eq!(kid("chatgpt"), None);
+    }
+
+    #[test]
+    fn test_gpt_advertised_in_catalog() {
+        // 三变体都应在 /v1/models 广告(advertised=true),advertised_id 为第一个别名。
+        let gpt: Vec<_> = CATALOG.iter().filter(|s| s.family == Family::Gpt).collect();
+        assert_eq!(gpt.len(), 3);
+        assert!(gpt.iter().all(|s| s.advertised));
+        assert_eq!(
+            resolve("gpt-5.6-sol").unwrap().spec.advertised_id(),
+            "gpt-5.6-sol"
+        );
     }
 
     #[test]

@@ -734,15 +734,18 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
 
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
-        fs::write(path, content).with_context(|| format!("写入配置文件失败: {}", path.display()))?;
-        // 安全：config.json 明文含 adminApiKey / proxyPassword，收紧为仅属主可读写（Unix 0600），
-        // 避免默认 umask 造成的 world-readable 泄露。失败仅告警不致命。
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
-                tracing::warn!("收紧配置文件权限失败 {}: {}", path.display(), e);
-            }
+        // 原子写:config.json 明文含 adminApiKey / proxyPassword,裸 fs::write 崩溃会截断
+        // → 面板密钥丢失锁死管理入口。走 temp→fsync→rename(创建即 0600,无 rename 后设权的短
+        // world-readable 窗口)+ Windows 句柄占用 rename 重试。见 common::fs_atomic。
+        // 在 Tokio runtime 内(save 从 update_config 异步 handler 调)用 block_in_place,
+        // 避免 rename 重试的同步 sleep 阻塞 worker(与 persist_credentials 同一惯例)。
+        let bytes = content.as_bytes();
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(|| crate::common::fs_atomic::write_atomic(path, bytes))
+                .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
+        } else {
+            crate::common::fs_atomic::write_atomic(path, bytes)
+                .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         }
         Ok(())
     }

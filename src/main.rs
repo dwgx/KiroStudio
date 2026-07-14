@@ -213,13 +213,19 @@ async fn main() {
     // 解析命令行参数
     let args = Args::parse();
 
-    // 初始化日志
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // 初始化日志:fmt 层(终端/文件)+ 内存环形缓冲层(面板实时日志流/一键导出,见 common::log_buffer)。
+    // 两层共享同一 EnvFilter,故内存 ring 与终端看到的是同一批日志。
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer())
+            .with(crate::common::log_buffer::LogBufferLayer)
+            .init();
+    }
 
     // 加载配置
     let config_path = args

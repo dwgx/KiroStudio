@@ -270,6 +270,93 @@ pub async fn stream_live(
     )
 }
 
+// ============ 运维日志:内存环形缓冲拉取 / 实时流 / 一键导出 ============
+
+/// 日志查询参数:增量游标 since(seq)+ 最低级别 level(ERROR/WARN/INFO/DEBUG)。
+#[derive(Debug, Deserialize)]
+pub struct LogsQuery {
+    /// 只取 seq > since 的(轮询增量);缺省取全部环形缓冲。
+    #[serde(default)]
+    pub since: Option<u64>,
+    /// 最低级别过滤(≥):如 level=WARN 只返回 WARN+ERROR。缺省不过滤。
+    #[serde(default)]
+    pub level: Option<String>,
+}
+
+/// GET /api/admin/logs?since=N&level=WARN
+/// 拉取内存环形缓冲的最近日志(增量 + 级别过滤)。零上游、纯内存。
+pub async fn logs_poll(Query(q): Query<LogsQuery>) -> impl IntoResponse {
+    let entries = crate::common::log_buffer::snapshot(q.since, q.level.as_deref());
+    Json(serde_json::json!({ "logs": entries })).into_response()
+}
+
+/// GET /api/admin/logs/stream
+/// SSE 实时日志直播:先回放当前环形缓冲(补上下文),再逐条推送新日志。面板不必 SSH/tail。
+/// 用 unfold 状态机(与 stream_live 同范式,不引新依赖):状态 = (待回放队列, broadcast 接收端)。
+pub async fn logs_stream() -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let rx = crate::common::log_buffer::subscribe();
+    // 回放最近缓冲(补上下文),VecDeque 便于 pop_front 逐条吐。
+    let replay: std::collections::VecDeque<_> =
+        crate::common::log_buffer::snapshot(None, None).into();
+
+    let stream = futures::stream::unfold((replay, rx), |(mut replay, mut rx)| async move {
+        // 先吐完回放队列。
+        if let Some(entry) = replay.pop_front() {
+            let ev = Event::default()
+                .json_data(&entry)
+                .unwrap_or_else(|_| Event::default().comment("log-serialize-error"));
+            return Some((Ok(ev), (replay, rx)));
+        }
+        // 回放完毕,进入实时推送。滞后跳过、关闭结束流。
+        loop {
+            match rx.recv().await {
+                Ok(entry) => {
+                    let ev = Event::default()
+                        .json_data(&entry)
+                        .unwrap_or_else(|_| Event::default().comment("log-serialize-error"));
+                    return Some((Ok(ev), (replay, rx)));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
+
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    )
+}
+
+/// GET /api/admin/logs/export?level=WARN
+/// 把环形缓冲打包成 JSONL 下载(每行一条 LogEntry),供用户直接附到 bug 报告——不必 SSH/grep。
+pub async fn logs_export(Query(q): Query<LogsQuery>) -> impl IntoResponse {
+    use axum::http::header;
+    let entries = crate::common::log_buffer::snapshot(q.since, q.level.as_deref());
+    let mut body = String::with_capacity(entries.len() * 128);
+    for e in &entries {
+        // 每条一行 JSON(JSONL)。序列化极不可能失败(纯 Serialize 结构),失败则跳过该行。
+        if let Ok(line) = serde_json::to_string(e) {
+            body.push_str(&line);
+            body.push('\n');
+        }
+    }
+    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let filename = format!("kirostudio-logs-{}.jsonl", ts);
+    (
+        [
+            (header::CONTENT_TYPE, "application/x-ndjson".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{}\"", filename),
+            ),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{resolve_recent_limit, MAX_RECENT_LIMIT};

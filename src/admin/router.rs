@@ -18,12 +18,13 @@ use super::{
         purge_trash_batch, probe_available_models,
         probe_regions, switch_profile_region,
         set_load_balancing_mode, social_callback, start_social_login, storage_cleanup,
-        storage_stats, update_config, start_idc_login, poll_idc_login,
+        storage_stats, update_config, start_idc_login, poll_idc_login, recovery_metrics,
         start_external_idp_login, external_idp_leg1, external_idp_leg2, external_idp_leg2_select,
         check_update, perform_update, update_status,
     },
     middleware::{AdminState, admin_auth_middleware},
     usage_handlers::{
+        logs_export, logs_poll, logs_stream,
         ratelimit_insights, stream_live, usage_by_credential, usage_by_model,
         usage_clients, usage_machines, usage_overview, usage_rate, usage_recent, usage_throughput,
         usage_timeseries,
@@ -113,8 +114,14 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/usage/throughput", get(usage_throughput))
         // 限流 insights：每号一条限流健康快照（rpm/软上限/冷却/近期429/中文推断），零上游
         .route("/ratelimit/insights", get(ratelimit_insights))
+        // 自愈机器可观测:刷新/failover/自动禁用/冷却/region重探/泄漏清洗 进程级计数器,零上游
+        .route("/recovery-metrics", get(recovery_metrics))
         // SSE 实时流：每 ~1.5s 推一帧轻量快照（全局 inflight/rpm + 每号状态 + 吞吐），零上游
         .route("/stream/live", get(stream_live))
+        // 运维日志：内存环形缓冲拉取(增量+级别) / SSE 实时直播 / 一键导出 JSONL(附 bug 报告)
+        .route("/logs", get(logs_poll))
+        .route("/logs/stream", get(logs_stream))
+        .route("/logs/export", get(logs_export))
         // 运维：一键重启 + 存储统计/清理
         .route("/service/restart", post(restart_service))
         .route("/storage/stats", get(storage_stats))
