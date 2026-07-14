@@ -76,6 +76,9 @@ pub fn create_router_with_provider(
         .route("/models", get(get_models))
         .route("/messages", post(post_messages))
         .route("/messages/count_tokens", post(count_tokens))
+        // OpenAI 兼容入站:chat/completions + responses(翻译成 Anthropic 复用同管线)。
+        .route("/chat/completions", post(crate::openai::handlers::post_chat_completions))
+        .route("/responses", post(crate::openai::handlers::post_responses))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

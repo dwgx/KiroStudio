@@ -1287,6 +1287,19 @@ impl StreamContext {
     }
 
     fn process_assistant_response(&mut self, content: &str) -> Vec<SseEvent> {
+        // 【诊断探针·KIRO_INVOKE_TRACE】坐实「文本化工具调用」现象(#70544 变体):Claude 系模型
+        // 偶发把工具调用语法当纯文本吐进 assistantResponseEvent(丢 antml: 前缀 + 夹 court 泄漏词),
+        // 客户端拿到 <invoke.../> 文本解析不了直接断连。此探针在文本流里出现工具调用标记时如实记一条
+        // (含现场文本片段),用于抓真实语料定性——上游到底走文本流还是 toolUseEvent。平时零开销。
+        if invoke_trace_enabled() && contains_textified_tool_call(content) {
+            let snippet: String = content.chars().take(200).collect();
+            tracing::warn!(
+                target: "kiro::invoke_trace",
+                model = %self.model,
+                "[invoke_trace] assistantResponseEvent 文本流出现工具调用标记(疑似文本化 invoke 泄漏): {:?}",
+                snippet
+            );
+        }
         // 先剥离 DeepSeek DSML 工具协议标记(跨 chunk 安全),再走后续文本处理。
         let cleaned = self.strip_dsml_markers(content);
         // 泄漏控制 token 清洗（开关默认关）：仅行首粘连特征命中才剥，误删风险极低。
@@ -2577,6 +2590,30 @@ fn tool_trace_enabled() -> bool {
             .map(|v| !v.trim().is_empty() && v != "0")
             .unwrap_or(false)
     })
+}
+
+/// 文本化工具调用诊断探针总开关(环境变量 `KIRO_INVOKE_TRACE` 非空即开)。平时零开销。
+/// 开启时,assistantResponseEvent 文本流里出现工具调用标记(文本化 invoke)即记一条现场语料,
+/// 用于坐实「模型把工具调用当纯文本吐出」现象(#70544 变体,致客户端断连)。
+fn invoke_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("KIRO_INVOKE_TRACE")
+            .map(|v| !v.trim().is_empty() && v != "0")
+            .unwrap_or(false)
+    })
+}
+
+/// 检测文本片段里是否出现「文本化的工具调用标记」。
+/// 覆盖:Anthropic 工具调用语法 `<invoke`/`</invoke>`/`<parameter name=`(不论是否带 antml: 前缀),
+/// 及 `<function_calls>` 包裹。仅诊断用(探针),不改控制流。
+fn contains_textified_tool_call(text: &str) -> bool {
+    text.contains("<invoke")
+        || text.contains("</invoke")
+        || text.contains("<parameter name=")
+        || text.contains("function_calls>")
+        || text.contains("antml:")
 }
 
 /// 泄漏 token 探针总开关（环境变量 `KIRO_LEAK_TRACE` 非空即开）。仿 `KIRO_TOOL_TRACE`,平时零开销。
@@ -4466,6 +4503,20 @@ mod tests {
     }
 
     /// 短板2：截断跨轮恢复纯决策——恢复开关开 + 修复层开 + 归因真截断,三条件全满足才触发。
+    #[test]
+    fn test_contains_textified_tool_call_detector() {
+        // 文本化 invoke 标记(不论是否带 antml: 前缀)应命中。
+        assert!(contains_textified_tool_call(r#"<invoke name="Bash">"#));
+        assert!(contains_textified_tool_call(r#"<invoke name="Bash">"#));
+        assert!(contains_textified_tool_call("</invoke>"));
+        assert!(contains_textified_tool_call(r#"<parameter name="command">"#));
+        assert!(contains_textified_tool_call("</function_calls>"));
+        // 正常文本不误命中。
+        assert!(!contains_textified_tool_call("这是一段正常的助手回复,讲 invoke 概念但无标签"));
+        assert!(!contains_textified_tool_call("函数调用 function calls 讨论"));
+        assert!(!contains_textified_tool_call(""));
+    }
+
     #[test]
     fn test_should_recover_truncation_decision() {
         use ToolJsonDefect::*;

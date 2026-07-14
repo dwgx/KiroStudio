@@ -1,6 +1,6 @@
 [package]
 name = "kirostudio"
-version = "0.7.17"
+version = "0.7.18"
 edition = "2024"
 
 [features]
@@ -24,6 +24,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
 http = "1.0"
 futures = "0.3"
+async-stream = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.10", features = ["v1", "v4", "fast-rng"] }
 fastrand = "2"
