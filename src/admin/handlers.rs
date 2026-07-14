@@ -459,6 +459,14 @@ pub async fn set_load_balancing_mode(
     }
 }
 
+/// GET /api/admin/recovery-metrics
+/// 自愈机器可观测:进程级计数器(刷新 ok/fail、failover 跳数/耗尽、自动禁用死号、冷却触发、
+/// region 重探 ok/fail、泄漏 token 清洗)+ uptimeMs。不持久化(自进程启动的健康信号,重启归零)。
+/// 零上游、零副作用,把刷新/failover/清洗机器从黑箱变成可查。
+pub async fn recovery_metrics() -> impl IntoResponse {
+    Json(crate::common::recovery_metrics::snapshot())
+}
+
 // ============ 网页上号（Social OAuth）============
 
 use super::service::PollResult;

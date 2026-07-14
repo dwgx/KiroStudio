@@ -77,3 +77,40 @@ export async function performUpdate(version?: string): Promise<UpdatePerformResu
   const { data } = await api.post<UpdatePerformResult>('/update/perform', version ? { version } : {})
   return data
 }
+
+// ============ 自愈机器可观测（recovery-metrics）============
+// 进程级计数器（自进程启动以来，重启归零）。后端 common/recovery_metrics.rs。
+export interface RecoveryMetrics {
+  uptimeMs: number
+  refreshOk: number
+  refreshFail: number
+  failoverHops: number
+  failoverExhausted: number
+  deadTokensDisabled: number
+  cooldownTriggered: number
+  regionReprobeOk: number
+  regionReprobeFail: number
+  leakedCleanedRequests: number
+  leakedSaturationRequests: number
+}
+
+export async function getRecoveryMetrics(): Promise<RecoveryMetrics> {
+  const { data } = await api.get<RecoveryMetrics>('/recovery-metrics')
+  return data
+}
+
+// ============ 运维日志（内存环形缓冲）============
+export interface LogEntry {
+  seq: number
+  ts: string
+  level: string
+  target: string
+  message: string
+}
+
+// 拉取最近日志（可选增量游标 since + 最低级别 level）。
+export async function getLogs(params?: { since?: number; level?: string }): Promise<LogEntry[]> {
+  const { data } = await api.get<{ logs: LogEntry[] }>('/logs', { params })
+  return data.logs
+}
+

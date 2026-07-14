@@ -14,7 +14,7 @@ use tokio::time::sleep;
 
 use std::collections::HashMap;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64};
@@ -162,7 +162,7 @@ pub(crate) async fn refresh_token(
         }
     });
 
-    if credentials.is_external_idp_credential() {
+    let result = if credentials.is_external_idp_credential() {
         refresh_external_idp_token(credentials, config, proxy).await
     } else if auth_method.eq_ignore_ascii_case("idc")
         || auth_method.eq_ignore_ascii_case("builder-id")
@@ -171,7 +171,14 @@ pub(crate) async fn refresh_token(
         refresh_idc_token(credentials, config, proxy).await
     } else {
         refresh_social_token(credentials, config, proxy).await
+    };
+    // 可观测:真实刷新分发的成败(early bail 的 api_key/validate 不计,那不是网络刷新)。
+    if result.is_ok() {
+        crate::common::recovery_metrics::bump_refresh_ok();
+    } else {
+        crate::common::recovery_metrics::bump_refresh_fail();
     }
+    result
 }
 
 /// 刷新 Social Token
@@ -1288,112 +1295,9 @@ const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 /// "该号+该模型"组合。取中长窗（订阅权益变化是较慢的事），到期后自动允许重试探。
 const MODEL_BLOCK_TTL: StdDuration = StdDuration::from_secs(1800);
 
-/// 原子写入文件：先写同目录临时文件 + 尽力 fsync，再 rename 覆盖目标
-///
-/// 相比 `std::fs::write` 的裸覆盖，本函数避免"写到一半崩溃 / 磁盘满"导致
-/// 目标文件被截断清空（refreshToken/clientSecret 属不可再生资产，绝不能丢）。
-///
-/// 关键点：
-/// - 临时文件放在目标 **同目录**（保证同一文件系统，`rename` 才是原子的）；
-/// - 若 `path` 是软链，先 `canonicalize` 拿到真实路径再 rename，避免把软链
-///   本身替换成普通文件（canonicalize 对不存在的目标会失败，此时说明是首次
-///   写入，直接用原 path）；
-/// - Windows 下 `rename` 覆盖已存在文件是支持的，但目标被占用可能失败——
-///   失败时回退到直接 `write` 并记 warn，绝不让整体持久化失败。
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-
-    // 解析真实目标路径：软链要写到它指向的真身；不存在（首次写入）则用原 path
-    let target: PathBuf = match std::fs::canonicalize(path) {
-        Ok(real) => real,
-        Err(_) => path.to_path_buf(),
-    };
-
-    let dir = target.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = target
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("credentials");
-    // 同目录下的隐藏临时文件。文件名带 pid + 进程内单调递增序号，
-    // 既避免跨进程碰撞，也避免同进程内两个并发持久化争抢同一 tmp 互相截断。
-    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = dir.join(format!(".{}.{}.{}.tmp", file_name, std::process::id(), seq));
-
-    // 写入临时文件并尽力落盘。
-    // 安全：凭据文件含 refreshToken/clientSecret/kiroApiKey 等活凭证，绝不能 world-readable。
-    // Unix 下创建即以 0600（仅属主可读写）打开临时文件，rename 后目标继承该权限，
-    // 杜绝默认 umask 造成的 0644 本地泄露。
-    let write_tmp = || -> std::io::Result<()> {
-        let mut f = {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .open(&tmp)?
-            }
-            #[cfg(not(unix))]
-            {
-                std::fs::File::create(&tmp)?
-            }
-        };
-        f.write_all(bytes)?;
-        f.flush()?;
-        // 尽力 sync，失败不致命（部分平台/文件系统可能不支持）
-        let _ = f.sync_all();
-        Ok(())
-    };
-
-    if let Err(e) = write_tmp() {
-        // 临时文件都写不出，清理残留后回退到直接写
-        let _ = std::fs::remove_file(&tmp);
-        tracing::warn!("原子写临时文件失败，回退直接写: {:?}: {}", tmp, e);
-        std::fs::write(&target, bytes)?;
-        restrict_permissions(&target);
-        return Ok(());
-    }
-
-    // rename 覆盖目标（原子替换）。目标继承临时文件的 0600 权限。
-    match std::fs::rename(&tmp, &target) {
-        Ok(()) => {
-            restrict_permissions(&target);
-            Ok(())
-        }
-        Err(e) => {
-            // Windows 下目标被句柄占用等场景可能失败：回退直接写，别让持久化整体失败
-            tracing::warn!("原子 rename 失败，回退直接写: {:?} -> {:?}: {}", tmp, target, e);
-            let result = std::fs::write(&target, bytes);
-            if result.is_ok() {
-                restrict_permissions(&target);
-            }
-            // 清理残留临时文件
-            let _ = std::fs::remove_file(&tmp);
-            result
-        }
-    }
-}
-
-/// 将文件权限收紧为仅属主可读写（Unix 0600）；非 Unix 无操作。
-///
-/// 敏感凭据文件的纵深防护：即便走了 `fs::write` 回退路径（默认受 umask 影响可能 0644），
-/// 也把最终文件权限拉回 0600，失败仅告警不致命。
-fn restrict_permissions(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
-            tracing::warn!("收紧文件权限失败 {:?}: {}", path, e);
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-}
+// 原子写 + 权限收紧已提取为共享单一真相源 `common::fs_atomic`(供 config.rs 等复用,
+// 并补了 Windows 句柄占用的 rename 重试)。此处 re-import 保持调用点不变。
+use crate::common::fs_atomic::write_atomic;
 
 /// API 调用上下文
 ///
@@ -2677,7 +2581,14 @@ impl MultiTokenManager {
 
         match serde_json::to_string_pretty(&stats) {
             Ok(json) => {
-                if let Err(e) = write_atomic(&path, json.as_bytes()) {
+                // 原子写(在 Tokio runtime 内用 block_in_place 避免 rename 重试 sleep 阻塞 worker,
+                // 与 persist_credentials 同一惯例)。save_stats 常从 report_success/failure 的异步计费路径调。
+                let write_result = if tokio::runtime::Handle::try_current().is_ok() {
+                    tokio::task::block_in_place(|| write_atomic(&path, json.as_bytes()))
+                } else {
+                    write_atomic(&path, json.as_bytes())
+                };
+                if let Err(e) = write_result {
                     tracing::warn!("保存统计缓存失败: {}", e);
                 } else {
                     *self.last_stats_save_at.lock() = Some(Instant::now());
@@ -2900,6 +2811,7 @@ impl MultiTokenManager {
             let dur = self
                 .cooldown
                 .set_cooldown(id, CooldownReason::SuspiciousActivity);
+            crate::common::recovery_metrics::bump_cooldown_triggered();
             tracing::warn!(
                 "凭据 #{} 触发账户级可疑活动风控，冷却 {:?}（分钟级退避，避免反复砸加重风控/触发封禁）",
                 id,
@@ -2922,6 +2834,7 @@ impl MultiTokenManager {
                     if !entry.disabled {
                         entry.disabled = true;
                         entry.disabled_reason = Some(DisabledReason::SuspiciousActivityAuto);
+                        crate::common::recovery_metrics::bump_dead_token_disabled();
                         tracing::warn!(
                             "凭据 #{} 连续可疑活动风控达 {} 次，自动禁用（SuspiciousActivityAuto），移出调度避免继续加重风控",
                             id,
@@ -3023,6 +2936,7 @@ impl MultiTokenManager {
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             // 设为阈值，便于在管理面板中直观看到该凭据已不可用
             entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+            crate::common::recovery_metrics::bump_dead_token_disabled();
 
             tracing::error!("凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用", id);
 
@@ -3073,6 +2987,7 @@ impl MultiTokenManager {
             entry.disabled_reason = Some(DisabledReason::AccountSuspended);
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+            crate::common::recovery_metrics::bump_dead_token_disabled();
 
             tracing::error!("凭据 #{} 被上游暂停/封禁，已禁用（等待人工处理）", id);
 
@@ -3188,6 +3103,7 @@ impl MultiTokenManager {
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::InvalidRefreshToken);
+            crate::common::recovery_metrics::bump_dead_token_disabled();
 
             tracing::error!(
                 "凭据 #{} refreshToken 已失效 (invalid_grant)，已立即禁用",
@@ -4782,6 +4698,7 @@ impl MultiTokenManager {
                 entry.last_usage_403_feature_not_supported.store(false, Ordering::Relaxed);
                 *entry.last_full_reprobe_at.lock() = None;
             }
+            crate::common::recovery_metrics::bump_region_reprobe_ok();
             true
         } else {
             // 全 region 都探测不到可用 profile：记时间戳进入 6h 冷却，避免反复白跑一整轮探测。
@@ -4791,6 +4708,7 @@ impl MultiTokenManager {
                     *entry.last_full_reprobe_at.lock() = Some(Instant::now());
                 }
             }
+            crate::common::recovery_metrics::bump_region_reprobe_fail();
             tracing::warn!(
                 "凭据 #{} 验活重选未找到可用 region profile（保持原 arn，{}h 内不再重复全 region 探测）",
                 id, REPROBE_ALL_BAD_COOLDOWN.as_secs() / 3600
