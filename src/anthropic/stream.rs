@@ -1971,6 +1971,11 @@ impl StreamContext {
         // 如实记一条——绝不黑箱。saturation（整段纯泄漏词行）= #70544 模型侧整段退化的信号,网关只能
         // 清洗单个粘连、救不了整段（Bug B），此处标注归因便于 dwgx 判"是模型抽风非网关问题"。
         if self.leaked_stripped > 0 || self.leaked_saturation_lines > 0 {
+            // 可观测:本请求发生过泄漏清洗 / 命中 saturation 退化(各计一次请求级)。
+            crate::common::recovery_metrics::bump_leaked_cleaned_request();
+            if self.leaked_saturation_lines > 0 {
+                crate::common::recovery_metrics::bump_leaked_saturation_request();
+            }
             tracing::warn!(
                 model = %self.model,
                 leaked_stripped = self.leaked_stripped,

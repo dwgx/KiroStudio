@@ -275,6 +275,10 @@ export const PROBE_MODEL_CATALOG: { id: string; mult: string }[] = [
   { id: 'claude-haiku-4.5', mult: '0.40x' },
   { id: 'glm-5', mult: '0.50x' },
   { id: 'auto', mult: '1.00x' },
+  // GPT 系(Kiro 2026-07 新增,sol/luna/terra 三并列变体)。倍率暂用 1.00x 占位,待官方权威值校正。
+  { id: 'gpt-5.6-sol', mult: '1.00x' },
+  { id: 'gpt-5.6-luna', mult: '1.00x' },
+  { id: 'gpt-5.6-terra', mult: '1.00x' },
   { id: 'claude-sonnet-4.0', mult: '1.30x' },
   { id: 'claude-sonnet-4.5', mult: '1.30x' },
   { id: 'claude-sonnet-4.6', mult: '1.30x' },
