@@ -5,6 +5,7 @@ mod common;
 mod http_client;
 mod kiro;
 mod model;
+mod openai;
 pub mod token;
 #[cfg(windows)]
 mod tray;
