@@ -522,6 +522,10 @@ pub struct ConfigSnapshotResponse {
     pub strip_env_noise: bool,
     /// 工具错误缓解：泄漏控制 token 清洗 / 流式失败态对齐 / 如实暴露错误（均立即生效，默认关）
     pub tool_clean_leaked_tokens: bool,
+    /// 文本化 invoke 重组(默认开):<invoke> 文本在四道门内重组成结构化 tool_use。
+    pub tool_reclaim_textified_invoke: bool,
+    /// stray token(call/count/card/court)复读熔断(默认开)。
+    pub tool_stray_repeat_guard: bool,
     pub tool_stream_align_failure: bool,
     pub tool_expose_error_to_client: bool,
     /// JSON 修复层（根治向）：非法工具参数修成合法 JSON 再发客户端（立即生效，默认开）
@@ -609,6 +613,8 @@ pub struct UpdateConfigRequest {
     pub cc_auto_buffer: Option<bool>,
     pub strip_env_noise: Option<bool>,
     pub tool_clean_leaked_tokens: Option<bool>,
+    pub tool_reclaim_textified_invoke: Option<bool>,
+    pub tool_stray_repeat_guard: Option<bool>,
     pub tool_stream_align_failure: Option<bool>,
     pub tool_expose_error_to_client: Option<bool>,
     pub tool_repair_json: Option<bool>,
@@ -821,6 +827,8 @@ mod tests {
             collect_client_fingerprint: true,
             strip_env_noise: true,
             tool_clean_leaked_tokens: true,
+            tool_reclaim_textified_invoke: true,
+            tool_stray_repeat_guard: true,
             tool_stream_align_failure: true,
             tool_expose_error_to_client: true,
             tool_repair_json: true,

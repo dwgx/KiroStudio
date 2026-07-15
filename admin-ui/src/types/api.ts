@@ -313,6 +313,8 @@ export interface ConfigSnapshotResponse {
   ccAutoBuffer: boolean
   stripEnvNoise: boolean
   toolCleanLeakedTokens: boolean
+  toolReclaimTextifiedInvoke: boolean
+  toolStrayRepeatGuard: boolean
   toolStreamAlignFailure: boolean
   toolExposeErrorToClient: boolean
   toolRepairJson: boolean
@@ -373,6 +375,8 @@ export interface UpdateConfigRequest {
   ccAutoBuffer?: boolean
   stripEnvNoise?: boolean
   toolCleanLeakedTokens?: boolean
+  toolReclaimTextifiedInvoke?: boolean
+  toolStrayRepeatGuard?: boolean
   toolStreamAlignFailure?: boolean
   toolExposeErrorToClient?: boolean
   toolRepairJson?: boolean
