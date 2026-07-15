@@ -353,8 +353,11 @@ pub async fn perform_update(target: Option<String>) -> anyhow::Result<UpdatePerf
         });
     }
 
+    tracing::info!("[Update] 开始升级到 {tag}：下载二进制 + sha256 校验 + 替换（完成后自动重启）");
+
     // 2) 下载二进制（可走镜像加速）+ sha256 文件（强制 github.com 直连,独立可信信道）
     let bin = download_asset(&tag, ASSET_BIN).await?;
+    tracing::info!("[Update] 二进制下载完成（{} 字节），开始取 sha256 校验文件", bin.len());
     // 安全(H1):sha256 只从 github 直连取,不走 asset_candidates 的第三方镜像——
     // 否则二进制与哈希同源,恶意镜像给"后门二进制+匹配哈希"即绕过校验=RCE。
     // 直连失败宁可中止升级,也不退回镜像取哈希(那等于没校验)。
@@ -382,6 +385,7 @@ pub async fn perform_update(target: Option<String>) -> anyhow::Result<UpdatePerf
     let bak = exe.with_extension("bak");
     let new = exe.with_extension("new");
     // 先写 .new（同目录，保证后续 rename 是同一文件系统的原子操作）
+    tracing::info!("[Update] 写入新二进制到 {new:?} 并备份现役版本，准备原子替换");
     tokio::fs::write(&new, &bin).await?;
     // 赋可执行权限（Unix）
     #[cfg(unix)]

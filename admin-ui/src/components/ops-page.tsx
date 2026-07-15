@@ -159,14 +159,20 @@ const LEVEL_COLORS: Record<string, string> = {
 export function OpsPage() {
   // 单个 SSE /stream/live 连接在页级共享,分给实时指标条 + 号池健康卡,避免同页开两条流翻倍服务端推送。
   const live = useLiveStream(true)
+  // 日志聚焦信号:OTA 检查/升级时,让实时日志展开并过滤到 update 活动(流动日志)。
+  // token 每次自增触发 LogViewer 的 effect;term 是要搜的关键字([Update])。
+  const [logFocus, setLogFocus] = useState<{ token: number; term: string }>({ token: 0, term: '' })
+  const focusLog = useCallback((term: string) => {
+    setLogFocus((prev) => ({ token: prev.token + 1, term }))
+  }, [])
   return (
     <TooltipProvider delayDuration={200}>
       <div className="space-y-6">
         <LiveMetricsBar live={live} />
         <PoolHealthCard live={live} />
         <RecoveryMetricsCard />
-        <LogViewer />
-        <OpsAggregationCard />
+        <LogViewer focusToken={logFocus.token} focusTerm={logFocus.term} />
+        <OpsAggregationCard onFocusLog={focusLog} />
       </div>
     </TooltipProvider>
   )
@@ -950,7 +956,7 @@ const CLEANABLE_KEYS: StorageCleanupTarget[] = ['traces', 'usage_jsonl', 'trash'
 
 // 聚合运维卡:重启服务 / OTA 升级回滚观测 / 存储占用清理。
 // 与 settings 页调用同一批 hooks(同 queryKey,两处并存无冲突);此处复用 hooks 不复用组件。
-function OpsAggregationCard() {
+function OpsAggregationCard({ onFocusLog }: { onFocusLog?: (term: string) => void } = {}) {
   const restart = useRestartService()
   const checkUpd = useCheckUpdate()
   const performUpd = usePerformUpdate()
@@ -966,7 +972,9 @@ function OpsAggregationCard() {
   // bg_cache 分区张数(供背景图缓存弹框渲染 idx 网格)。
   const bgCount = storage?.partitions.find((p) => p.key === 'bg_cache')?.items ?? 0
 
-  const handleCheck = () =>
+  const handleCheck = () => {
+    // 聚焦实时日志到 update 活动(检查也会发 [Update] 日志:镜像探测/tags 拉取)。
+    onFocusLog?.('[Update]')
     checkUpd.mutate(undefined, {
       onSuccess: (r) => {
         if (r.error) toast.error(`检查更新失败:${r.error}`)
@@ -975,6 +983,7 @@ function OpsAggregationCard() {
       },
       onError: (e) => toast.error(`检查更新失败:${(e as Error).message}`),
     })
+  }
 
   const cleanupTarget = confirm && typeof confirm === 'object' ? confirm.p : null
   const cleanupSupportsDays = cleanupTarget ? cleanupTarget.key === 'traces' || cleanupTarget.key === 'usage_jsonl' : false
@@ -1128,7 +1137,9 @@ function OpsAggregationCard() {
         description="将从 GitHub 下载新二进制、校验 sha256 后替换并自动重启。重启期间短暂断服数秒。确定继续？"
         confirmLabel="确认升级"
         loading={performUpd.isPending}
-        onConfirm={() =>
+        onConfirm={() => {
+          // 聚焦实时日志到升级流程:perform_update 每步发 [Update] 日志(下载/校验/写入/替换)在此流动显示。
+          onFocusLog?.('[Update]')
           performUpd.mutate(undefined, {
             onSuccess: (r) => {
               toast.success(r.message || '升级中,数秒后自动重启恢复')
@@ -1139,7 +1150,7 @@ function OpsAggregationCard() {
               setConfirm(null)
             },
           })
-        }
+        }}
       />
       <ConfirmDialog
         open={!!cleanupTarget}
@@ -1184,7 +1195,7 @@ function rankOk(entryLevel: string, minLevel: string): boolean {
   return (rank[entryLevel.toUpperCase()] ?? 0) >= (rank[minLevel.toUpperCase()] ?? 0)
 }
 
-function LogViewer() {
+function LogViewer({ focusToken = 0, focusTerm = '' }: { focusToken?: number; focusTerm?: string } = {}) {
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [level, setLevel] = useState<LevelFilter>('INFO')
   const [live, setLive] = useState(true)
@@ -1218,6 +1229,19 @@ function LogViewer() {
     })
   }, [])
   const scrollRef = useRef<HTMLDivElement>(null)
+  // OTA 聚焦:检查更新/升级触发(focusToken 自增)时,展开日志 + 把搜索设为 [Update],
+  // 让升级步骤日志(perform_update 发的 [Update] tracing)在实时日志里流动显示。
+  useEffect(() => {
+    if (focusToken <= 0) return
+    setCollapsed(false)
+    try {
+      localStorage.setItem(LOGVIEWER_COLLAPSED_KEY, '0')
+    } catch {
+      /* 忽略 */
+    }
+    setSearch(focusTerm)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusToken])
   // 滚动锁定防呆：用户手动上滚离开底部时暂停自动滚到底，避免"想看历史却被拽回底部"；
   // 贴底时恢复自动跟随。用 ref 存"是否贴底"避免每帧 setState。
   const atBottomRef = useRef(true)
