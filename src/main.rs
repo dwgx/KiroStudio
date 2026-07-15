@@ -455,6 +455,10 @@ async fn main() {
         tls_backend: config.tls_backend,
     });
 
+    // 文本化 invoke 重组 + stray 熔断两开关:启动播种进程级镜像(handlers 热路径读),admin 改后即时生效。
+    anthropic::handlers::set_tool_reclaim_textified_invoke(config.tool_reclaim_textified_invoke);
+    anthropic::handlers::set_tool_stray_repeat_guard(config.tool_stray_repeat_guard);
+
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
