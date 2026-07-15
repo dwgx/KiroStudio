@@ -10,6 +10,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { NumberStepper } from '@/components/ui/number-stepper'
+import { ProxyTestButton } from '@/components/proxy-test-button'
 import { startSocialLogin, pollSocialLogin } from '@/api/credentials'
 import { CheckCircle2 } from 'lucide-react'
 import { copyToClipboard, extractErrorMessage } from '@/lib/utils'
@@ -148,13 +149,17 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
               <label className="text-sm font-medium" htmlFor="proxyUrl">
                 代理（可选）
               </label>
-              <Input
-                id="proxyUrl"
-                value={proxyUrl}
-                onChange={(e) => setProxyUrl(e.target.value)}
-                placeholder="留空使用全局代理"
-                disabled={isStarting}
-              />
+              <div className="flex items-center gap-2">
+                <Input
+                  id="proxyUrl"
+                  className="flex-1"
+                  value={proxyUrl}
+                  onChange={(e) => setProxyUrl(e.target.value)}
+                  placeholder="留空使用全局代理"
+                  disabled={isStarting}
+                />
+                <ProxyTestButton proxyUrl={proxyUrl} />
+              </div>
             </div>
           </div>
         )}

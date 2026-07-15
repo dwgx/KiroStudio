@@ -13,6 +13,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { NumberStepper } from '@/components/ui/number-stepper'
 import { Select } from '@/components/ui/select'
+import { ProxyTestButton } from '@/components/proxy-test-button'
 import { useAddCredential, useCredentials } from '@/hooks/use-credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
 import { LoginDialog } from '@/components/login-dialog'
@@ -801,13 +802,17 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               {/* 代理配置 */}
               <div className="space-y-2">
                 <label className="text-sm font-medium">代理配置</label>
-                <Input
-                  id="proxyUrl"
-                  placeholder='如 socks5://user:pass@1.2.3.4:1080（可含账密）/ 留空用全局 / direct 不走代理'
-                  value={proxyUrl}
-                  onChange={(e) => setProxyUrl(e.target.value)}
-                  disabled={isPending}
-                />
+                <div className="flex items-center gap-2">
+                  <Input
+                    id="proxyUrl"
+                    className="flex-1"
+                    placeholder='如 socks5://user:pass@1.2.3.4:1080（可含账密）/ 留空用全局 / direct 不走代理'
+                    value={proxyUrl}
+                    onChange={(e) => setProxyUrl(e.target.value)}
+                    disabled={isPending}
+                  />
+                  <ProxyTestButton proxyUrl={proxyUrl} proxyUsername={proxyUsername} proxyPassword={proxyPassword} />
+                </div>
                 <div className="grid grid-cols-2 gap-2">
                   <Input
                     id="proxyUsername"
