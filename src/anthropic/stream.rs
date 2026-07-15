@@ -3164,8 +3164,10 @@ fn find_next_param_open(body: &str, from: usize) -> Option<usize> {
 /// `call` / `count` / `card`。集合形式便于以后扩充。
 ///
 /// 生产语料（KiroStudio #70544 变体）里 `court` 是最主要的 stray token，故并入集合。
+/// 中文变体 `課`/`课` 也是我们实测到的高置信泄漏词（见 LEAKED_CONTROL_TOKENS），一并纳入熔断计数，
+/// 否则中文退化刷屏时逐字清洗能剥、但复读熔断（32 次截断止血）抓不到 → 仍会耗尽 max_tokens。
 #[allow(dead_code)]
-const STRAY_INVOKE_TOKENS: &[&str] = &["call", "count", "card", "court"];
+const STRAY_INVOKE_TOKENS: &[&str] = &["call", "count", "card", "court", "課", "课"];
 
 /// 复读熔断阈值：同一个 stray token（call/count/card/court）连续作为独占一行重复出现
 /// 超过这么多次，判定为「Opus 长上下文退化复读死循环」，立即熔断本轮文本输出。
@@ -3670,6 +3672,21 @@ mod tests {
             "复读应被熔断截断，court 次数={court_count}"
         );
         assert!(!collapsed.contains("<invoke"), "超阈值后的内容应被丢弃");
+    }
+
+    #[test]
+    fn test_invoke_collapse_stray_token_chinese_flood() {
+        // 🟢 中文变体 課/课 独占行复读也应被熔断(修复:原集合漏了中文,逐字清洗剥得掉但熔断抓不到)。
+        for tok in ["課", "课"] {
+            let mut s = String::from("正文\n");
+            for _ in 0..100 {
+                s.push_str(tok);
+                s.push('\n');
+            }
+            let collapsed = collapse_stray_token_floods(&s);
+            let cnt = collapsed.matches(tok).count();
+            assert!(cnt < 100, "中文 {tok} 复读应被熔断截断,次数={cnt}");
+        }
     }
 
     #[test]

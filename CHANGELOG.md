@@ -2,6 +2,13 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.27] - 2026-07-15
+
+### 修复:stray token 复读熔断补中文 課/课(0.7.26 移植疏漏)
+0.7.26 移植 ZyphrZero 的 STRAY_INVOKE_TOKENS 只照搬其 ASCII 集合 [call,count,card] + court,漏了我们自己
+LEAKED_CONTROL_TOKENS 早已实测的中文变体 課/课。后果:模型中文退化刷屏时,逐字泄漏清洗能剥,但复读熔断
+(连续 32 次独占行截断止血)抓不到 → 仍会耗尽 max_tokens + 污染历史。补 課/课 进熔断集合 + 中文 flood 测试。739 绿。
+
 ## [0.7.26] - 2026-07-15
 
 ### 文本化 invoke 重组容错(根治 court / Invalid tool parameters)+ stray token 复读熔断
