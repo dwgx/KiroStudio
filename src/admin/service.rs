@@ -1011,6 +1011,11 @@ impl AdminService {
         }
     }
 
+    /// 当前 TLS 后端（供出站 HTTP client 构建复用配置，如代理测活）。
+    pub fn tls_backend(&self) -> crate::model::config::TlsBackend {
+        self.token_manager.config().tls_backend
+    }
+
     /// 获取服务端配置快照（敏感字段脱敏）
     pub fn get_config_snapshot(&self) -> ConfigSnapshotResponse {
         let config = self.token_manager.config();
