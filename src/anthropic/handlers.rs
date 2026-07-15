@@ -119,6 +119,27 @@ pub(crate) fn tool_clean_leaked_tokens_enabled() -> bool {
     TOOL_CLEAN_LEAKED_TOKENS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// 文本化 invoke 重组开关(默认 **true**):模型把工具调用吐成 <invoke> 文本时,在四道安全门内
+/// (行首 + 非围栏 + 工具名已声明 + 完整闭合)重组为结构化 tool_use。关=退回纯转发(原样吐文本)。
+static TOOL_RECLAIM_TEXTIFIED_INVOKE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+pub fn set_tool_reclaim_textified_invoke(enabled: bool) {
+    TOOL_RECLAIM_TEXTIFIED_INVOKE.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+pub(crate) fn tool_reclaim_textified_invoke_enabled() -> bool {
+    TOOL_RECLAIM_TEXTIFIED_INVOKE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// stray token(call/count/card/court)复读熔断开关(默认 **true**):连续独占行复读超阈值截断本轮文本。
+static TOOL_STRAY_REPEAT_GUARD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+pub fn set_tool_stray_repeat_guard(enabled: bool) {
+    TOOL_STRAY_REPEAT_GUARD.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+pub(crate) fn tool_stray_repeat_guard_enabled() -> bool {
+    TOOL_STRAY_REPEAT_GUARD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// ②流式工具拼装非法时对齐成失败态开关。默认 **true**（与非流式一致，配合③给干净失败信号，不连坐号）。
 static TOOL_STREAM_ALIGN_FAILURE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
@@ -657,6 +678,7 @@ pub async fn post_messages(
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
+    let known_tool_names = conversion_result.known_tool_names;
 
     if payload.stream {
         // 流式响应。CC 自动切协议：识别到 Claude Code 且开关开启时，改走 buffered 分发
@@ -671,6 +693,7 @@ pub async fn post_messages(
                 input_tokens,
                 thinking_enabled,
                 tool_name_map,
+                known_tool_names,
                 client,
             )
             .await
@@ -682,6 +705,7 @@ pub async fn post_messages(
                 input_tokens,
                 thinking_enabled,
                 tool_name_map,
+                known_tool_names,
                 client,
             )
             .await
@@ -701,6 +725,7 @@ async fn handle_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    known_tool_names: std::collections::HashSet<String>,
     client: ClientInfo,
 ) -> Response {
     // 1M 变体:据原始模型名判定是否注入 anthropic-beta 头(仅受支持的 [1m] 变体为 true)。
@@ -712,7 +737,7 @@ async fn handle_stream_request(
     };
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    let mut ctx = StreamContext::new_full(model, input_tokens, thinking_enabled, tool_name_map, known_tool_names);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -1493,6 +1518,7 @@ pub async fn post_messages_cc(
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
+    let known_tool_names = conversion_result.known_tool_names;
 
     if payload.stream {
         // 流式响应（缓冲模式）
@@ -1503,6 +1529,7 @@ pub async fn post_messages_cc(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            known_tool_names,
             client,
         )
         .await
@@ -1524,6 +1551,7 @@ async fn handle_stream_request_buffered(
     estimated_input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    known_tool_names: std::collections::HashSet<String>,
     client: ClientInfo,
 ) -> Response {
     // 1M 变体:据原始模型名判定是否注入 anthropic-beta 头(仅受支持的 [1m] 变体为 true)。
@@ -1535,7 +1563,7 @@ async fn handle_stream_request_buffered(
     };
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map, known_tool_names);
 
     // 创建缓冲 SSE 流（流结束时用 meta + 最终 usage 埋点）
     let stream = create_buffered_sse_stream(provider, response, ctx, meta, client);
