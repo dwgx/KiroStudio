@@ -2,6 +2,36 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.20] - 2026-07-15
+
+### OpenAI 兼容层:多智能体对抗 review 修复 + Codex /v1/responses 完全支持
+在 0.7.19 之上做了一轮多智能体对抗式 review(5 维度独立审 + 回读源码验证),并对照参考项目
+CLIProxyAPI 的 Codex 真实协议行为(claude/openai/responses 翻译 + codex_executor)补齐 Codex 支持。
+
+review 查出并修复(均为 0.7.19 同类「透传路径 400」的漏网之鱼):
+- **top_p 未随 thinking 门控**：0.7.19 给 temperature 加了「thinking 开启不透传」的门,但 top_p 仍
+  无条件透传。客户端同发 reasoning_effort:high + top_p 会在透传路径 400（Anthropic 扩展思考模式不
+  接受非默认采样参数）。chat + responses 两路径均把 top_p 并入 `!thinking_enabled` 分支。
+- **tool_choice 无 tools 时误下发**：tool_choice 独立于 tools 是否非空而设置，客户端发 tool_choice
+  但 tools 空/全被过滤（非 function 类型）→ 产出「有 tool_choice 无 tools」body → Anthropic 400。
+  改为仅当确实下发 tools 才设 tool_choice。chat + responses 两路径。
+
+Codex /v1/responses 完全支持（对照 CLIProxyAPI 真机协议）：
+- **确认无状态假设正确**：CLIProxyAPI 明确删除 previous_response_id（codex_executor.go），坐实 Codex
+  每轮发全量 input、不依赖服务端状态。我们的白名单式转换本就丢弃 previous_response_id/store/
+  stream_options，对 Codex 是正确行为，无需改。
+- **custom_tool_call / custom_tool_call_output 落地**（此前未处理，CLIProxyAPI 的 request.go 也漏）：
+  Codex 的 apply_patch 类自定义工具走这两个 item。翻成 assistant tool_use / user tool_result（与
+  function_call 同）；custom_tool_call 的 input 是自由文本，非 JSON object 时包进 `{"input":<原文>}`
+  保内容（Anthropic input 必须 object）。
+- **response.completed 骨架补全**：加 `background:false` + `error:null`（对齐参考 response.go，Codex
+  严格解析器期望完整骨架）。流式 + 非流式两处。
+
+已复核 Codex 两大死穴我们本就正确：response.output 非空且从已闭合块重建（build_output）、流式必须
+以 response.completed 收尾（transport 断开补发 response.failed）。
+
+openai 模块 37 单测（+4）+ 双特性各 673 绿。
+
 ## [0.7.19] - 2026-07-15
 
 ### OpenAI 兼容层深度 review：补齐协议兼容缺口
