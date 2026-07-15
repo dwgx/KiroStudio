@@ -5,6 +5,7 @@ import {
   cleanupStorage,
   checkUpdate,
   performUpdate,
+  getUpdateStatus,
 } from '@/api/ops'
 import type { StorageCleanupRequest } from '@/types/api'
 
@@ -47,5 +48,13 @@ export function useCheckUpdate() {
 export function usePerformUpdate() {
   return useMutation({
     mutationFn: (version?: string) => performUpdate(version),
+  })
+}
+
+// OTA 升级/回滚状态（只读）。进设置页按需拉取，展示"本版是否稳定确认 / 是否发生过回滚"。
+export function useUpdateStatus() {
+  return useQuery({
+    queryKey: ['update-status'],
+    queryFn: getUpdateStatus,
   })
 }

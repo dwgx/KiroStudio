@@ -1282,6 +1282,13 @@ pub struct MultiTokenManager {
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
+/// 凭据自定义字段的服务端防呆上界(不信任前端校验,直打 admin API 的越界值也自动修补)。
+/// priority:优先级(越小越优先),上界够大覆盖任意分层又防 u32 极值污染排序。
+const MAX_PRIORITY: u32 = 9999;
+/// rpm_limit:单号 RPM 软上限,上界远超真实吞吐(防 u32 极值,0 另归一为 None=继承全局)。
+const MAX_RPM_LIMIT: u32 = 100_000;
+/// name:自定义别名/备注最大字符数(与前端 maxLength 一致,按 char 截断防切坏多字节)。
+const MAX_NAME_CHARS: usize = 64;
 /// 所有号只是临时冷却/限流（会自动恢复）时，单次选号最多在网关内等待多久再放弃。
 /// 避免瞬时全忙就立刻返回“所有凭据均已禁用”；但也不能太长——否则一个请求的一次
 /// 选号就阻塞数分钟，叠加上层重试会反复扫冷全池（雪崩）。取 20s：够扛过一次
@@ -2683,6 +2690,22 @@ impl MultiTokenManager {
             .unwrap_or_else(|| format!("cred:{id}"))
     }
 
+    /// 每个凭据的熔断/健康只读快照(供 admin 运维观测:circuit Open/HalfOpen + EWMA 健康分等)。
+    /// 键=凭据 id。family_key 是族级(M365 同租户共享),故同族多号会拿到同一份快照(符合连坐语义)。
+    /// 无健康记录(从未被选过/已淘汰)的号不在返回表中——调用方按缺省=Closed 满血处理。零上游只读内存。
+    pub fn health_snapshots(&self) -> std::collections::HashMap<u64, crate::kiro::health::HealthSnapshot> {
+        // 先在 entries 锁内只收集 (id, family_key) 轻量对,立即释放锁;再逐个查 health(独立 Mutex)。
+        // 避免持 entries 锁跨多次 health.snapshot() 调用形成锁嵌套(与既有"health 锁外调用"约定一致)。
+        let pairs: Vec<(u64, String)> = {
+            let entries = self.entries.lock();
+            entries.iter().map(|e| (e.id, e.credentials.family_key(e.id))).collect()
+        };
+        pairs
+            .into_iter()
+            .filter_map(|(id, key)| self.health.snapshot(&key).map(|snap| (id, snap)))
+            .collect()
+    }
+
     /// 报告指定凭据 API 调用失败
     ///
     /// 增加失败计数，达到阈值时禁用凭据并切换到优先级最高的可用凭据
@@ -3282,7 +3305,8 @@ impl MultiTokenManager {
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            entry.credentials.priority = priority;
+            // 服务端防呆:clamp 到合理上界(不信任前端校验,直打 API 的负值/极值也自动修补)。
+            entry.credentials.priority = priority.min(MAX_PRIORITY);
         }
         // 立即按新优先级重新选择当前凭据（无论持久化是否成功）
         self.select_highest_priority();
@@ -3299,8 +3323,9 @@ impl MultiTokenManager {
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            // 0 归一为 None(继承全局),避免存 Some(0) 语义歧义
-            entry.credentials.rpm_limit = rpm_limit.filter(|&v| v > 0);
+            // 0 归一为 None(继承全局),避免存 Some(0) 语义歧义;非 0 clamp 到合理上界
+            // (服务端防呆:直打 API 的 u32 极值也自动修补,不信任前端校验)。
+            entry.credentials.rpm_limit = rpm_limit.filter(|&v| v > 0).map(|v| v.min(MAX_RPM_LIMIT));
         }
         self.persist_credentials()?;
         Ok(())
@@ -3336,9 +3361,10 @@ impl MultiTokenManager {
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            // 去空白;空则清除
+            // 去空白;空则清除;超长按字符截断到上界(服务端防呆:与前端 maxLength 一致,
+            // 直打 API 的超长值也自动修补,按 char 边界截断避免切坏多字节 UTF-8)。
             entry.credentials.name = name
-                .map(|s| s.trim().to_string())
+                .map(|s| s.trim().chars().take(MAX_NAME_CHARS).collect::<String>())
                 .filter(|s| !s.is_empty());
         }
         self.persist_credentials()?;
@@ -6963,5 +6989,96 @@ mod tests {
         assert!(snap.disabled, "达上限的禁用状态应跨重启保留");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ============ 服务端防呆:setter 越界自动修补(不信任前端校验)============
+
+    /// 优先级超上界 → clamp 到 MAX_PRIORITY(直打 admin API 的极值不污染排序)。
+    #[test]
+    fn test_set_priority_clamps_to_max() {
+        let config = Config::default();
+        let mut c = KiroCredentials::default();
+        c.refresh_token = Some("r-clamp-prio".to_string());
+        let mgr = MultiTokenManager::new(config, vec![c], None, None, false).unwrap();
+
+        mgr.set_priority(1, u32::MAX).unwrap();
+        let snap = mgr.snapshot().entries.into_iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(snap.priority, MAX_PRIORITY, "越界优先级应 clamp 到上界");
+
+        // 界内值不动。
+        mgr.set_priority(1, 5).unwrap();
+        let snap2 = mgr.snapshot().entries.into_iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(snap2.priority, 5);
+    }
+
+    /// RPM 上限:0→None(继承全局),极值→clamp 到 MAX_RPM_LIMIT。
+    #[test]
+    fn test_set_rpm_limit_normalizes_and_clamps() {
+        let config = Config::default();
+        let mut c = KiroCredentials::default();
+        c.refresh_token = Some("r-clamp-rpm".to_string());
+        let mgr = MultiTokenManager::new(config, vec![c], None, None, false).unwrap();
+
+        // 0 → None
+        mgr.set_rpm_limit(1, Some(0)).unwrap();
+        let snap = mgr.snapshot().entries.into_iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(snap.rpm_limit, None, "0 应归一为 None(继承全局)");
+
+        // 极值 → clamp 到上界
+        mgr.set_rpm_limit(1, Some(u32::MAX)).unwrap();
+        let snap2 = mgr.snapshot().entries.into_iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(snap2.rpm_limit, Some(MAX_RPM_LIMIT), "越界 RPM 应 clamp 到上界");
+
+        // 界内值不动
+        mgr.set_rpm_limit(1, Some(60)).unwrap();
+        let snap3 = mgr.snapshot().entries.into_iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(snap3.rpm_limit, Some(60));
+    }
+
+    /// 别名超长 → 按字符截断到 MAX_NAME_CHARS(多字节安全,不切坏 UTF-8);空白清除。
+    #[test]
+    fn test_set_credential_name_truncates_and_trims() {
+        let config = Config::default();
+        let mut c = KiroCredentials::default();
+        c.refresh_token = Some("r-clamp-name".to_string());
+        let mgr = MultiTokenManager::new(config, vec![c], None, None, false).unwrap();
+
+        // 超长中文(每字符多字节)→ 截断到 MAX_NAME_CHARS 个 char,不 panic 不切坏。
+        let long = "中".repeat(100);
+        mgr.set_credential_name(1, Some(long)).unwrap();
+        let snap = mgr.snapshot().entries.into_iter().find(|e| e.id == 1).unwrap();
+        let name = snap.name.expect("应有别名");
+        assert_eq!(name.chars().count(), MAX_NAME_CHARS, "超长别名应截断到上界字符数");
+
+        // 纯空白 → 清除。
+        mgr.set_credential_name(1, Some("   ".to_string())).unwrap();
+        let snap2 = mgr.snapshot().entries.into_iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(snap2.name, None, "纯空白别名应清除");
+    }
+
+    // ============ 熔断/健康快照暴露(Phase 2:此前后端算好但无出口)============
+
+    /// 从未被选过的号无健康记录 → 不在 health_snapshots 表中(调用方按缺省满血处理)。
+    /// 连续 429 跳闸后 → 表中出现该号且 circuit_open=true、健康分被拉低。
+    #[test]
+    fn test_health_snapshots_reflects_circuit_state() {
+        let mut config = Config::default();
+        config.cooldown_enabled = true;
+        let mut c = KiroCredentials::default();
+        c.refresh_token = Some("r-health-snap".to_string());
+        let mgr = MultiTokenManager::new(config, vec![c], None, None, false).unwrap();
+
+        // 初始:无健康记录(从未 429/成功过)→ 不在表中。
+        assert!(mgr.health_snapshots().get(&1).is_none(), "初始无健康记录");
+
+        // 连续裸 429 跳闸(TRIP_THRESHOLD 次以上),触发熔断 Open。
+        for _ in 0..5 {
+            mgr.report_rate_limited_with_retry_after(1, None);
+        }
+        let snaps = mgr.health_snapshots();
+        let h = snaps.get(&1).expect("跳闸后应有健康记录");
+        assert!(h.circuit_open, "连续 429 应跳闸 circuit Open");
+        assert!(h.health < 1.0, "健康分应被 429 拉低");
+        assert!(h.consecutive_429 >= 5, "连续 429 计数应累加");
     }
 }

@@ -2,6 +2,32 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.21] - 2026-07-15
+
+### 运维可控性/可观测性大增强(日志页 + 号池健康 + 凭证防呆)
+围绕"运维页可控性/查看性不足"做了跨前后端增强,重点是把后端已算好但没出口的数据暴露出来 +
+补服务端防呆(不信任前端校验,任何越界输入都自动修补)。
+
+- **后端 setter 防呆硬化**(token_manager.rs):`set_priority` / `set_rpm_limit` / `set_credential_name`
+  加服务端 clamp/截断(priority≤9999、rpm_limit≤100000、name 按 char 截断到 64 且去空白)。此前只有前端
+  校验,直打 admin API 的越界值可绕过——现服务端兜底,越界自动修补。
+- **暴露真实熔断健康**(此前后端算好但无任何出口):`HealthTracker` 的熔断态(Open/HalfOpen)、EWMA
+  健康分、试探概率、熔断剩余秒,经新增 `health_snapshots()` 接进 `/ratelimit/insights`(每号 `health`
+  字段)与 SSE `/stream/live`(`circuitOpen`/`healthScore`)。锁使用:先在 entries 锁内收集轻量
+  (id, family_key) 对再查 health(独立 Mutex),避免锁嵌套。无健康记录的号缺省满血。
+- **运维页新增「号池健康」卡**:每号真实熔断态 + 健康分条 + rpm/冷却/429 + 快捷运维操作(强制刷新
+  Token / 重置失败计数 / 启用禁用),按"最需关注"排序。零上游只读,10s 刷新。
+- **日志页可查看性**:内存环形缓冲 1000→5000;日志查看器加关键字搜索(匹配 message+target、命中高亮)、
+  模块(target)过滤下拉、滚动锁定防呆(用户上滚看历史不再被自动拽回底、贴底恢复跟随)、点开单条看
+  全文 + 一键复制、前端缓冲 2000→5000。
+- **OTA 升级/回滚观测**:接上 `/update/status`(此前后端有、前端未消费),设置页展示"本版是否稳定
+  确认 / 回滚点是否仍在 / 是否发生过回滚"。
+
+对抗式 review(后端+前端两维度,bounded diff)查出并修复 1 个 medium:切换级别/live 清空日志时未复位
+`atBottomRef`,导致过滤切换后自动跟随底部静默失效——已在两处日志重置点同步复位。
+
+新增回归测试 4 个(3 个防呆 clamp/截断 + 1 个 health_snapshots 熔断态),双特性各 677 绿;前端全构建通过。
+
 ## [0.7.20] - 2026-07-15
 
 ### OpenAI 兼容层:多智能体对抗 review 修复 + Codex /v1/responses 完全支持
