@@ -30,6 +30,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
+import { ProxyTestButton } from '@/components/proxy-test-button'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Skeleton } from '@/components/ui/skeleton'
 import { PageSkeleton } from '@/components/ui/page-skeleton'
@@ -1872,7 +1873,10 @@ export function SettingsPage() {
         </CardHeader>
         <CardContent className="py-0">
           <Field label="全局代理" hint="http(s)://host:port 或 socks5://host:port，留空清除（需重启生效）">
-            <Input className="max-w-[260px] font-mono text-xs" value={form.proxyUrl} onChange={(e) => set('proxyUrl', e.target.value)} placeholder="未配置" />
+            <div className="flex items-center gap-2">
+              <Input className="max-w-[260px] font-mono text-xs" value={form.proxyUrl} onChange={(e) => set('proxyUrl', e.target.value)} placeholder="未配置" />
+              <ProxyTestButton proxyUrl={form.proxyUrl} proxyUsername={form.proxyUsername} proxyPassword={form.proxyPassword} />
+            </div>
           </Field>
           <Field label="代理用户名" hint="需认证的代理才填。留空=不修改（后端出于安全不回显已存值，需重启生效）">
             <Input className="max-w-[260px] font-mono text-xs" value={form.proxyUsername} onChange={(e) => set('proxyUsername', e.target.value)} placeholder="留空不改" autoComplete="off" />

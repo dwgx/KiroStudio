@@ -20,8 +20,6 @@ import {
 import {
   useDeepVerify,
   useProbeModels,
-  useProbeRegions,
-  useSwitchRegion,
   useEnableOverage,
   useDisableOverage,
   useSetName,
@@ -40,8 +38,8 @@ import type {
   CredentialStatusItem,
   StoragePartition,
   StorageCleanupTarget,
-  CredentialRegionProfile,
 } from '@/types/api'
+import { cn } from '@/lib/utils'
 import { storage } from '@/lib/storage'
 import {
   Download,
@@ -76,6 +74,8 @@ import {
 } from 'lucide-react'
 import { Select } from '@/components/ui/select'
 import { Input } from '@/components/ui/input'
+import { RegionSwitcher } from '@/components/region-switcher'
+import { ProxyTestButton } from '@/components/proxy-test-button'
 import { EmptyState } from '@/components/ui/empty-state'
 import { Callout } from '@/components/ui/callout'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -628,17 +628,13 @@ function CredOpsDialog({
   const disableOv = useDisableOverage()
   const deleteCred = useDeleteCredential()
   const setDisabled = useSetDisabled()
-  const probeRegions = useProbeRegions()
-  const switchRegion = useSwitchRegion()
 
-  // 本地编辑态(初值取当前值;open 变化时重置)。
+  // 本地编辑态(初值取当前值;open 变化时重置)。region 切换逻辑已抽到共享 RegionSwitcher(自持探测态)。
   const [priority, setPriorityVal] = useState(cred.priority)
   const [rpmLimit, setRpmLimitVal] = useState(cred.rpmLimit ?? 0)
   const [name, setNameVal] = useState(cred.name ?? '')
   const [proxyUrl, setProxyUrl] = useState(cred.proxyUrl ?? '')
   const [allowed, setAllowed_] = useState<string[]>(cred.allowedModels ?? [])
-  const [regions, setRegions] = useState<CredentialRegionProfile[]>([])
-  const [selectedArn, setSelectedArn] = useState('')
 
   // 破坏性二次确认目标。
   const [confirm, setConfirm] = useState<null | 'overage' | 'disable' | 'delete'>(null)
@@ -650,8 +646,6 @@ function CredOpsDialog({
       setNameVal(cred.name ?? '')
       setProxyUrl(cred.proxyUrl ?? '')
       setAllowed_(cred.allowedModels ?? [])
-      setRegions([])
-      setSelectedArn('')
     }
   }, [open, cred])
 
@@ -673,62 +667,10 @@ function CredOpsDialog({
           </DialogDescription>
         </DialogHeader>
 
-        {/* 切 region(仅非 custom_api) */}
+        {/* 切 region(仅非 custom_api):复用凭据管理页同款 RegionSwitcher(探测/自定义 region/卡片列表)。 */}
         {!isCustom && (
           <OpsSection title="切换 Region / Profile" hint="切上游 profile,非改全局 region">
-            <div className="flex items-center gap-2">
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={probeRegions.isPending}
-                onClick={() =>
-                  probeRegions.mutate(id, {
-                    onSuccess: (r) => {
-                      setRegions(r.regions)
-                      const cur = r.regions.find((x) => x.current)
-                      setSelectedArn(cur?.arn ?? r.regions[0]?.arn ?? '')
-                      if (r.regions.length === 0) toast.info('未探测到可用 profile')
-                    },
-                    onError: () => toast.error('探测 region 失败'),
-                  })
-                }
-              >
-                {probeRegions.isPending ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="mr-1.5 h-3.5 w-3.5" />}
-                探测各区域 profile
-              </Button>
-              {probeRegions.isPending && <span className="text-xs text-muted-foreground">向上游探测,可能耗时…</span>}
-            </div>
-            {regions.length > 0 && (
-              <div className="mt-2 space-y-2">
-                <Select
-                  value={selectedArn}
-                  onChange={setSelectedArn}
-                  aria-label="选择 profile"
-                  options={regions.map((r) => ({
-                    value: r.arn,
-                    label: `${r.region}${r.current ? '(当前)' : ''}`,
-                    hint: `${r.subscriptionTitle ?? '未知订阅'}${r.usable ? '' : ' · 不可用'}`,
-                    disabled: !r.usable,
-                  }))}
-                />
-                <Button
-                  size="sm"
-                  disabled={switchRegion.isPending || !selectedArn || regions.find((r) => r.arn === selectedArn)?.current}
-                  onClick={() =>
-                    switchRegion.mutate(
-                      { id, arn: selectedArn },
-                      {
-                        onSuccess: () => toast.success('已切换 profile'),
-                        onError: () => toast.error('切换失败'),
-                      },
-                    )
-                  }
-                >
-                  {switchRegion.isPending && <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />}
-                  应用切换
-                </Button>
-              </div>
-            )}
+            <RegionSwitcher credentialId={id} />
           </OpsSection>
         )}
 
@@ -776,13 +718,31 @@ function CredOpsDialog({
         {!isCustom && (
           <OpsSection title="允许模型白名单" hint="空 = 不限制;设了即硬门">
             <div className="grid grid-cols-2 gap-x-3 gap-y-1.5">
-              {PROBE_MODEL_CATALOG.map((m) => (
-                <label key={m.id} className="flex cursor-pointer items-center gap-2 text-xs">
-                  <Checkbox checked={allowed.includes(m.id)} onCheckedChange={() => toggleModel(m.id)} />
-                  <span className="truncate font-mono">{m.id}</span>
-                  <span className="shrink-0 text-[10px] text-muted-foreground">{m.mult}</span>
-                </label>
-              ))}
+              {PROBE_MODEL_CATALOG.map((m) => {
+                const isSel = allowed.includes(m.id)
+                return (
+                  <label
+                    key={m.id}
+                    data-state={isSel ? 'checked' : 'unchecked'}
+                    className={cn(
+                      // 平滑过渡:选中行高亮底色 + 边框 + 轻微上浮阴影;未选中 hover 给反馈。
+                      'group flex cursor-pointer items-center gap-2 rounded-md border px-2 py-1.5 text-xs',
+                      'transition-[background-color,border-color,box-shadow,transform] duration-200 ease-out',
+                      isSel
+                        ? 'border-primary/50 bg-primary/10 text-foreground shadow-sm shadow-primary/10'
+                        : 'border-transparent hover:border-border hover:bg-accent/40',
+                    )}
+                  >
+                    <Checkbox
+                      checked={isSel}
+                      onCheckedChange={() => toggleModel(m.id)}
+                      className="transition-colors duration-200"
+                    />
+                    <span className={cn('truncate font-mono transition-colors duration-200', isSel && 'text-primary')}>{m.id}</span>
+                    <span className="ml-auto shrink-0 text-[10px] text-muted-foreground">{m.mult}</span>
+                  </label>
+                )
+              })}
             </div>
             <Button
               size="sm"
@@ -810,6 +770,7 @@ function CredOpsDialog({
               placeholder="socks5://host:port 或 direct"
               className="h-8 flex-1 text-xs"
             />
+            <ProxyTestButton proxyUrl={proxyUrl} className="h-8" />
             <Button
               size="sm"
               variant="outline"

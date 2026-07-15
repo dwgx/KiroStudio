@@ -136,3 +136,73 @@ export async function getLogs(params?: { since?: number; level?: string }): Prom
   return data.logs
 }
 
+// ============ 请求明细搜索（trace SQLite，服务端过滤 + 分页）============
+// 单条请求明细（后端 RequestRecord，snake_case）。
+export interface TraceRecord {
+  request_id: string
+  ts_ms: number
+  credential_id: number | null
+  model: string
+  is_streaming: boolean
+  input_tokens: number
+  output_tokens: number
+  cache_read_tokens: number
+  cache_creation_tokens: number
+  credits_used: number | null
+  latency_ms: number
+  first_token_ms: number | null
+  outcome: string
+  retries: number
+  error_message: string | null
+  session_id: string | null
+  client_device: string | null
+  client_ip: string | null
+  client_os: string | null
+  client_browser: string | null
+}
+
+// 搜索过滤条件（全部可选，空=不过滤）。camelCase 对齐后端 TracesSearchQuery。
+export interface TraceSearchFilter {
+  model?: string
+  credentialId?: number
+  clientIp?: string
+  sessionId?: string
+  outcome?: string
+  tsFrom?: number
+  tsTo?: number
+  text?: string
+  isStreaming?: boolean
+  limit?: number
+  offset?: number
+}
+
+export interface TraceSearchResponse {
+  items: TraceRecord[]
+  total: number
+}
+
+// GET /traces/search：服务端过滤 + 分页的请求明细。
+export async function searchTraces(filter: TraceSearchFilter): Promise<TraceSearchResponse> {
+  const { data } = await api.get<TraceSearchResponse>('/traces/search', { params: filter })
+  return data
+}
+
+// ============ 代理测活 ============
+export interface ProxyTestResult {
+  ok: boolean
+  latencyMs: number
+  exitIp: string | null
+  error: string | null
+}
+
+// POST /proxy/test：测试代理连通性（后端走该代理请求固定 ipify 探测出口 IP）。
+// proxyUrl 传 "direct" 或空串=测直连。username/password 可选（覆盖 URL 内嵌账密）。
+export async function testProxy(input: {
+  proxyUrl: string
+  proxyUsername?: string
+  proxyPassword?: string
+}): Promise<ProxyTestResult> {
+  const { data } = await api.post<ProxyTestResult>('/proxy/test', input)
+  return data
+}
+

@@ -16,8 +16,15 @@ const Checkbox = React.forwardRef<
     )}
     {...props}
   >
+    {/* forceMount：让指示器常驻 DOM，据 data-state 用 transition 平滑缩放/淡入勾，
+        而非挂载即突现（无 tailwindcss-animate 插件，纯 transition 实现顺滑手感）。 */}
     <CheckboxPrimitive.Indicator
-      className={cn("flex items-center justify-center text-current")}
+      forceMount
+      className={cn(
+        "flex items-center justify-center text-current",
+        "transition-transform duration-200 ease-out",
+        "data-[state=unchecked]:scale-0 data-[state=checked]:scale-100",
+      )}
     >
       <Check className="h-4 w-4" />
     </CheckboxPrimitive.Indicator>
