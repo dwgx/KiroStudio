@@ -22,6 +22,7 @@
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const A_SUCCESS: f64 = 0.3; // ewma_success 平滑系数（慢升，抗抖动）
@@ -118,6 +119,9 @@ pub struct HealthSnapshot {
 /// 健康追踪器：单一 `Mutex<HashMap<family_key, HealthState>>`。
 pub struct HealthTracker {
     states: Mutex<HashMap<String, HealthState>>,
+    /// 429 降权关闭开关(默认 false=降权生效)。运维页可热更:true 时 p_avail 的 health 项跳过
+    /// EWMA-429 惩罚(某些场景不想让偶发 429 影响分流)。熔断 gate 不受此开关影响(429 跳闸仍生效)。
+    disable_429_weight: AtomicBool,
 }
 
 impl Default for HealthTracker {
@@ -130,7 +134,13 @@ impl HealthTracker {
     pub fn new() -> Self {
         Self {
             states: Mutex::new(HashMap::new()),
+            disable_429_weight: AtomicBool::new(false),
         }
+    }
+
+    /// 设置 429 降权是否关闭(运维热更)。true=关闭降权(health 跳过 429 惩罚)。
+    pub fn set_disable_429_weight(&self, disabled: bool) {
+        self.disable_429_weight.store(disabled, Ordering::Relaxed);
     }
 
     /// 退避时长：`min(BASE*GROWTH^(n-1), MAX)`，n=open_count（≥1）。
@@ -242,7 +252,12 @@ impl HealthTracker {
             Circuit::Open { .. } => 0.0,
             Circuit::HalfOpen { admit_prob } => admit_prob,
         };
-        let health = (s.ewma_success * (1.0 - HEALTH_429_WEIGHT * s.ewma_429)).clamp(0.0, 1.0);
+        // 429 降权:默认生效(health 含 EWMA-429 惩罚);运维关闭开关后跳过惩罚(只用 ewma_success)。
+        let health = if self.disable_429_weight.load(Ordering::Relaxed) {
+            s.ewma_success.clamp(0.0, 1.0)
+        } else {
+            (s.ewma_success * (1.0 - HEALTH_429_WEIGHT * s.ewma_429)).clamp(0.0, 1.0)
+        };
         let rpm_pressure = if rpm_limit > 0 {
             (rpm as f64 / rpm_limit as f64).clamp(0.0, 1.0)
         } else {
@@ -320,6 +335,24 @@ mod tests {
         }
         let p = h.p_avail("k", 0, 0, 0);
         assert!((p - 0.56).abs() < 1e-6, "p={p}");
+    }
+
+    /// 429 降权开关(0.7.24):关闭后 p_avail 的 health 跳过 EWMA-429 惩罚(只用 ewma_success)。
+    /// 旧代码无此开关,429 惩罚恒生效。
+    #[test]
+    fn test_health_429_weight_toggle() {
+        let h = ht();
+        {
+            let mut map = h.states.lock();
+            let s = map.entry("k".into()).or_default();
+            s.ewma_success = 0.8;
+            s.ewma_429 = 0.5;
+        }
+        // 默认降权开:health=0.8×(1-0.6×0.5)=0.56。
+        assert!((h.p_avail("k", 0, 0, 0) - 0.56).abs() < 1e-6, "降权开 → 0.56");
+        // 关闭降权:health=ewma_success=0.8(跳过 429 惩罚)。
+        h.set_disable_429_weight(true);
+        assert!((h.p_avail("k", 0, 0, 0) - 0.8).abs() < 1e-6, "降权关 → 0.8(跳过 429 惩罚)");
     }
 
     #[test]
