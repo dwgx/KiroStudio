@@ -1014,6 +1014,7 @@ impl AdminService {
             tool_repair_json: config.tool_repair_json,
             tool_truncation_recovery: config.tool_truncation_recovery,
             tool_description_max_chars: config.tool_description_max_chars,
+            encrypt_credentials_at_rest: config.encrypt_credentials_at_rest,
             cooldown_enabled: config.cooldown_enabled,
             rate_limit_enabled: config.rate_limit_enabled,
             rate_limit_daily_max: config.rate_limit_daily_max,
@@ -1115,6 +1116,8 @@ impl AdminService {
         let mut tool_repair_json_changed: Option<bool> = None;
         let mut tool_truncation_recovery_changed: Option<bool> = None;
         let mut tool_description_max_chars_changed: Option<usize> = None;
+        // at-rest 加密开关变更:变更后立即重写凭据/回收站文件(明文↔密文),不等下次偶发变更。
+        let mut encrypt_at_rest_changed = false;
 
         // —— 需重启生效的字段 ——
         if let Some(v) = req.host {
@@ -1258,6 +1261,15 @@ impl AdminService {
             if v != config.tool_description_max_chars {
                 config.tool_description_max_chars = v;
                 tool_description_max_chars_changed = Some(v);
+            }
+        }
+        // at-rest 加密开关:热更(persist 每次读 self.config() 现值)。开→关或关→开都在下次 persist 生效;
+        // 想立即把已有明文转密文(或密文转明文),改完开关后触发任意一次凭据变更(或下方主动 persist)即可。
+        if let Some(v) = req.encrypt_credentials_at_rest {
+            if v != config.encrypt_credentials_at_rest {
+                config.encrypt_credentials_at_rest = v;
+                hot_changed = true;
+                encrypt_at_rest_changed = true;
             }
         }
         // —— TIER1 运行时热更字段：改完 reload_config 即时生效,不进 restart_fields ——
@@ -1501,6 +1513,19 @@ impl AdminService {
         if hot_or_display_changed {
             if let Err(e) = self.token_manager.reload_config() {
                 tracing::warn!("配置已存盘但热重载失败,下次重启生效: {}", e);
+            }
+        }
+
+        // at-rest 加密开关变更:reload_config 后 config 已是新值,立即重写凭据+回收站文件(明文↔密文),
+        // 让开/关即时落到磁盘,而非等下次偶发凭据变更。失败仅告警(下次 persist 会补上)。
+        if encrypt_at_rest_changed {
+            match self.token_manager.repersist_secrets() {
+                Ok(true) => tracing::info!("at-rest 加密开关已改,已立即重写凭据/回收站文件"),
+                Ok(false) => tracing::warn!(
+                    "at-rest 加密开关已改,但当前为单凭据(Single)格式——persist 是 no-op,加密不生效。\
+                     请先转为多凭据数组格式(如通过 UI 增删任一号触发格式升级)。"
+                ),
+                Err(e) => tracing::warn!("at-rest 加密开关已改,但立即重写凭据文件失败(下次变更会补上): {}", e),
             }
         }
 

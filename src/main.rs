@@ -253,7 +253,14 @@ async fn main() {
             .to_string()
     });
     let credentials_config = CredentialsConfig::load(&credentials_path).unwrap_or_else(|e| {
-        tracing::error!("加载凭证失败: {}", e);
+        // 加载失败即 fail-safe 退出(而非空池启动)——**故意如此**:若是 at-rest 密文解不开
+        // (密钥文件丢失/来自别机),空池启动后一旦 persist 就会用空池覆盖掉那份仍可恢复的密文
+        // = 永久丢号。宁可拒绝启动、保留密文不动,让用户按下方指引恢复(密文本身没坏)。
+        tracing::error!("加载凭证失败,拒绝启动以保护现有凭据文件不被覆盖: {}", e);
+        tracing::error!(
+            "若启用了 at-rest 加密:请确认密钥文件 {:?} 存在且未被移动;跨机器迁移请带上明文导出重新导入。",
+            crate::common::secret_store::key_path_for(std::path::Path::new(&credentials_path))
+        );
         std::process::exit(1);
     });
 
