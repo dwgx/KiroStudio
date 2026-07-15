@@ -2,6 +2,42 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.26] - 2026-07-15
+
+### 文本化 invoke 重组容错(根治 court / Invalid tool parameters)+ stray token 复读熔断
+**问题**:Kiro 后端模型偶发把工具调用"文本化"——本该结构化 toolUseEvent,却退化成纯文本吐进
+assistantResponseEvent(丢 antml: 前缀 → 裸 `<invoke>` 或碎片词 `court`/`call`),客户端(Claude Code)拿不到
+结构化 tool_use → Zod 校验失败报 "Invalid tool parameters"。根因在模型侧,网关只能缓解。
+
+**方案**:深度研究(4 路 fan-out + 逐行读码)发现 **ZyphrZero__kiro.rs v0.6.5 已生产解决**,vLLM/llama.cpp/
+Harmony 证明这套流式重组是行业标准。移植其五组件 + 融入我们既有的 DSML 剥离/泄漏清洗/court 探针:
+- **invoke 重组解析器**(纯函数):字节扫描状态机,`<invoke name><parameter name>V</parameter></invoke>` →
+  结构化 tool_use。**贪婪取边界内最后一个 `</parameter>`/`</invoke>`** 扛住 apply_patch 正文里的字面闭合 +
+  连发 burst 不合并。兼容 antml: 前缀。
+- **四道安全门**(敢重组的前提):①行首启发式(真泄漏在行首,句中的当正文)②代码围栏排除(跨 chunk 追踪
+  ``` 奇偶,展示代码不执行)③**工具名硬护栏**(解析出的名必须是本次请求声明的工具,否则当文本——宁可漏捞
+  不误执行假命令)④只收完整闭合块(截断半块不捕获)。
+- **流式状态机**:文本先进 sniff 缓冲,决策安全才释放;行首未闭合块 hold 等下片(256 KiB 兜底防卡死),
+  非行首/围栏内直接当文本;收尾 flush 残留当文本绝不静默吞。重组成功 set_has_tool_use → stop_reason 自然
+  tool_use(就地修复,不用 borrow-retry)。
+- **stray token 复读熔断**:`call`/`count`/`card`/`court`(我们语料主症状)连续独占行复读超阈值(32)截断本轮
+  文本,治 Opus 退化刷屏耗尽 max_tokens + 污染历史。
+- **反方向治根(核实无需改)**:converter 历史工具调用走 `with_tool_uses` 结构化字段,从不叙述成文本,不给
+  模型"用文本调工具"的示范。
+
+**plumbing**:ConversionResult 加 known_tool_names(从发给模型的 tools 收集)→ 沿 tool_name_map 同路穿到
+StreamContext。两开关 `tool_reclaim_textified_invoke` / `tool_stray_repeat_guard`(默认 **true**,热更,运维页可关)。
+recovery-metrics 加 reclaimed_invoke_calls / stray_guard_tripped 计数。
+
+**测试**:26 纯函数单测(完整块/antml前缀/apply_patch字面闭合/背靠背/截断/句中/围栏/court剥离/复读熔断/
+半标签)+ 4 端到端(重组成 tool_use / 工具名硬护栏拦截 / 跨 chunk 分片 / 未声明工具不启用)。均"旧代码上会
+失败"。`cargo test --bin kirostudio` 与 `--no-default-features --locked` 各 **738 绿**;前端 build 绿。
+
+**诚实边界**:R4 是尽力恢复层非根治(根治靠 grammar 约束解码,上游做不了)。三个公认脆弱点(闭合标记在参数
+值内 / 模型漏分隔符 / 并行调用 index)vLLM/llama.cpp 至今在填。默认开会改 Claude 工具调用路径,部署前值得
+真机观察 reclaimed_invoke_calls 命中率 + textified_invoke_hits。95% 的 court 碎片没块可重组交给熔断器,少数
+完整块交给重组,两者互补。
+
 ## [0.7.25] - 2026-07-15
 
 ### 运维控制台大翻新(请求明细搜索 / 4 张明细卡 / 代理测活 / Region 复用 / 日志收缩 / OTA 流动日志)
