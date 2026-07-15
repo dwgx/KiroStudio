@@ -10,6 +10,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { NumberStepper } from '@/components/ui/number-stepper'
+import { ProxyTestButton } from '@/components/proxy-test-button'
 import {
   startSocialLogin,
   pollSocialLogin,
@@ -382,12 +383,16 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
             </div>
             <div className="space-y-2">
               <label className="text-sm font-medium">代理（可选）</label>
-              <Input
-                value={proxyUrl}
-                onChange={(e) => setProxyUrl(e.target.value)}
-                placeholder="留空使用全局代理"
-                disabled={isStarting}
-              />
+              <div className="flex items-center gap-2">
+                <Input
+                  className="flex-1"
+                  value={proxyUrl}
+                  onChange={(e) => setProxyUrl(e.target.value)}
+                  placeholder="留空使用全局代理"
+                  disabled={isStarting}
+                />
+                <ProxyTestButton proxyUrl={proxyUrl} />
+              </div>
             </div>
           </div>
         )}
@@ -432,12 +437,16 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
             </div>
             <div className="space-y-2">
               <label className="text-sm font-medium">代理（可选）</label>
-              <Input
-                value={proxyUrl}
-                onChange={(e) => setProxyUrl(e.target.value)}
-                placeholder="留空使用全局代理"
-                disabled={isStarting}
-              />
+              <div className="flex items-center gap-2">
+                <Input
+                  className="flex-1"
+                  value={proxyUrl}
+                  onChange={(e) => setProxyUrl(e.target.value)}
+                  placeholder="留空使用全局代理"
+                  disabled={isStarting}
+                />
+                <ProxyTestButton proxyUrl={proxyUrl} />
+              </div>
             </div>
           </div>
         )}
@@ -477,12 +486,16 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
             </div>
             <div className="space-y-2">
               <label className="text-sm font-medium">代理（可选）</label>
-              <Input
-                value={proxyUrl}
-                onChange={(e) => setProxyUrl(e.target.value)}
-                placeholder="留空使用全局代理"
-                disabled={eidpBusy}
-              />
+              <div className="flex items-center gap-2">
+                <Input
+                  className="flex-1"
+                  value={proxyUrl}
+                  onChange={(e) => setProxyUrl(e.target.value)}
+                  placeholder="留空使用全局代理"
+                  disabled={eidpBusy}
+                />
+                <ProxyTestButton proxyUrl={proxyUrl} />
+              </div>
             </div>
           </div>
         )}
