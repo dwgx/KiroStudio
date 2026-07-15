@@ -1,15 +1,77 @@
-import { useState, useEffect, useRef, useCallback, type ReactNode } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo, type ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { getRecoveryMetrics, getLogs, type RecoveryMetrics, type LogEntry } from '@/api/ops'
+import { PROBE_MODEL_CATALOG } from '@/api/credentials'
 import { useRatelimitInsights } from '@/hooks/use-usage'
 import { useLiveStream } from '@/hooks/use-live-stream'
-import { useSetDisabled, useResetFailure, useForceRefreshToken } from '@/hooks/use-credentials'
-import type { RateLimitInsight } from '@/types/api'
+import {
+  useSetDisabled,
+  useResetFailure,
+  useForceRefreshToken,
+  useCredentials,
+  useSetPriority,
+  useSetRpmLimit,
+  useSetAllowedModels,
+  useDeleteCredential,
+} from '@/hooks/use-credentials'
+import {
+  useDeepVerify,
+  useProbeModels,
+  useProbeRegions,
+  useSwitchRegion,
+  useEnableOverage,
+  useDisableOverage,
+  useSetName,
+  useSetProxy,
+} from '@/hooks/use-credential-ops'
+import {
+  useRestartService,
+  useStorageStats,
+  useCleanupStorage,
+  useCheckUpdate,
+  usePerformUpdate,
+  useUpdateStatus,
+} from '@/hooks/use-ops'
+import type {
+  RateLimitInsight,
+  CredentialStatusItem,
+  StoragePartition,
+  StorageCleanupTarget,
+  CredentialRegionProfile,
+} from '@/types/api'
 import { storage } from '@/lib/storage'
-import { Download, RefreshCw, Activity, Search, X, Copy, ShieldAlert, Zap, Power, RotateCcw, Inbox, SearchX, ServerCrash } from 'lucide-react'
+import {
+  Download,
+  RefreshCw,
+  Activity,
+  Search,
+  X,
+  Copy,
+  ShieldAlert,
+  Zap,
+  Power,
+  RotateCcw,
+  Inbox,
+  SearchX,
+  ServerCrash,
+  ShieldCheck,
+  Boxes,
+  MoreHorizontal,
+  Server,
+  Database,
+  Trash,
+  Loader2,
+  CheckCircle2,
+  Clock,
+  AlertTriangle,
+  Gauge,
+  Layers,
+  Cpu,
+  Timer,
+} from 'lucide-react'
 import { Select } from '@/components/ui/select'
 import { Input } from '@/components/ui/input'
 import { EmptyState } from '@/components/ui/empty-state'
@@ -17,6 +79,25 @@ import { Callout } from '@/components/ui/callout'
 import { Skeleton } from '@/components/ui/skeleton'
 import { StatCard } from '@/components/ui/stat-card'
 import { AnimatedNumber } from '@/components/ui/animated-number'
+import { Badge, type BadgeProps } from '@/components/ui/badge'
+import { Progress } from '@/components/ui/progress'
+import { Checkbox } from '@/components/ui/checkbox'
+import { NumberStepper } from '@/components/ui/number-stepper'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+import {
+  Tooltip,
+  TooltipTrigger,
+  TooltipContent,
+  TooltipProvider,
+} from '@/components/ui/tooltip'
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from '@/components/ui/dialog'
 
 // 自愈计数器展示项：字段 → 中文标签 + 是否"越多越该警惕"（用于配色）。
 const METRIC_ITEMS: { key: keyof RecoveryMetrics; label: string; warn?: boolean }[] = [
@@ -52,11 +133,83 @@ const LEVEL_COLORS: Record<string, string> = {
 }
 
 export function OpsPage() {
+  // 单个 SSE /stream/live 连接在页级共享,分给实时指标条 + 号池健康卡,避免同页开两条流翻倍服务端推送。
+  const live = useLiveStream(true)
   return (
-    <div className="space-y-6">
-      <RecoveryMetricsCard />
-      <PoolHealthCard />
-      <LogViewer />
+    <TooltipProvider delayDuration={200}>
+      <div className="space-y-6">
+        <LiveMetricsBar live={live} />
+        <RecoveryMetricsCard />
+        <PoolHealthCard live={live} />
+        <OpsAggregationCard />
+        <LogViewer />
+      </div>
+    </TooltipProvider>
+  )
+}
+
+// 落盘字节人类可读（与 settings-page 同实现，存储卡复用）。
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
+  const v = bytes / Math.pow(1024, i)
+  return `${i === 0 ? String(v) : v.toFixed(1)} ${units[i]}`
+}
+
+// 实时指标条:全局 RPM / 在途 / 当前 RPS / Tokens-s,~1.5s SSE 实时刷新(AnimatedNumber 滚动)。
+// 连接态脉冲点如实反映流是否活着;首帧未到(连接中)用 Skeleton 占位而非闪 0。
+function LiveMetricsBar({ live }: { live: ReturnType<typeof useLiveStream> }) {
+  const { frame, connected } = live
+
+  // 首帧未到达且未连上:骨架占位(避免闪现 0 值误导)。
+  if (!frame && !connected) {
+    return (
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        {Array.from({ length: 4 }).map((_, i) => (
+          <Skeleton key={i} className="h-[92px]" />
+        ))}
+      </div>
+    )
+  }
+
+  const rps = frame?.throughput?.currentRps ?? 0
+  const tps = frame?.throughput?.tokensPerSec ?? 0
+  const dot = (
+    <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+      <span
+        className={`inline-block h-1.5 w-1.5 rounded-full ${connected ? 'animate-pulse bg-emerald-400' : 'bg-[#666]'}`}
+      />
+      {connected ? '实时' : '重连中'}
+    </span>
+  )
+  return (
+    <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+      <StatCard
+        label="全局 RPM"
+        value={<AnimatedNumber value={frame?.globalRpm ?? 0} />}
+        icon={Gauge}
+        accent="primary"
+        hint={dot}
+      />
+      <StatCard
+        label="在途请求"
+        value={<AnimatedNumber value={frame?.globalInflight ?? 0} />}
+        icon={Layers}
+        accent={frame && frame.globalInflight > 0 ? 'warning' : 'neutral'}
+      />
+      <StatCard
+        label="当前 RPS"
+        value={<AnimatedNumber value={rps} format={(n) => n.toFixed(1)} />}
+        icon={Cpu}
+        accent="neutral"
+      />
+      <StatCard
+        label="Tokens/s"
+        value={<AnimatedNumber value={tps} format={(n) => Math.round(n).toLocaleString()} />}
+        icon={Timer}
+        accent="neutral"
+      />
     </div>
   )
 }
@@ -130,41 +283,86 @@ function RecoveryMetricsCard() {
   )
 }
 
-// 单号健康行:状态点 + 健康分 + rpm/冷却 + 快捷操作。
+// 图标按钮 + Tooltip 的小包装(替代裸 button title,统一 ghost icon 尺寸)。
+function IconAction({
+  icon: Icon,
+  label,
+  onClick,
+  disabled,
+  pending,
+  className,
+}: {
+  icon: typeof Zap
+  label: string
+  onClick: () => void
+  disabled?: boolean
+  pending?: boolean
+  className?: string
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          variant="ghost"
+          size="icon"
+          className={`h-7 w-7 ${className ?? ''}`}
+          onClick={onClick}
+          disabled={disabled}
+          aria-label={label}
+        >
+          {pending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Icon className="h-3.5 w-3.5" />}
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>{label}</TooltipContent>
+    </Tooltip>
+  )
+}
+
+// 单号健康行:状态 Badge + 健康分 Progress + rpm/冷却 + 快捷操作(强刷/重置/启禁 + 验活/探模型 + 更多)。
 function PoolHealthRow({
   it,
+  cred,
   busy,
   onRefresh,
   onReset,
   onToggleDisabled,
+  onVerify,
+  onProbe,
+  onMore,
+  verifying,
+  probing,
 }: {
   it: RateLimitInsight
+  cred?: CredentialStatusItem
   busy: boolean
   onRefresh: () => void
   onReset: () => void
   onToggleDisabled: () => void
+  onVerify: () => void
+  onProbe: () => void
+  onMore: () => void
+  verifying: boolean
+  probing: boolean
 }) {
   const st = circuitStateOf(it)
   const meta = CIRCUIT_META[st]
+  const badge = CIRCUIT_BADGE[st]
   // 健康分百分比(无健康记录=满血 100%)。
   const healthPct = Math.round((it.health?.health ?? 1) * 100)
+  // custom_api 号(有 baseUrl)无 region/overage/探模型概念。
+  const isCustom = !!cred?.baseUrl
   return (
-    <div className="flex items-center gap-3 rounded-md border border-[#2e2e2e] bg-[#111] px-3 py-2">
+    <div className="grid grid-cols-[8px_48px_84px_1fr_minmax(140px,1.5fr)_auto] items-center gap-3 rounded-md border border-[#2e2e2e] bg-[#111] px-3 py-2">
       <span className={`inline-block h-2 w-2 shrink-0 rounded-full ${meta.dot}`} />
-      <span className="w-10 shrink-0 font-mono text-xs text-[#aaa]">#{it.id}</span>
-      <span className={`w-20 shrink-0 text-xs font-medium ${meta.cls}`}>{meta.label}</span>
+      <span className="font-mono text-xs text-[#aaa]">#{it.id}</span>
+      <Badge variant={badge} className="justify-center">{meta.label}</Badge>
       {/* 健康分条 */}
-      <div className="flex w-24 shrink-0 items-center gap-1.5" title={`健康分 ${healthPct}%`}>
-        <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-[#222]">
-          <div
-            className={`h-full rounded-full ${healthPct >= 60 ? 'bg-emerald-500' : healthPct >= 30 ? 'bg-amber-400' : 'bg-red-500'}`}
-            style={{ width: `${healthPct}%` }}
-          />
-        </div>
+      <div className="flex items-center gap-1.5" title={`健康分 ${healthPct}%`}>
+        <Progress value={healthPct} invert className="h-1.5 flex-1" />
         <span className="w-8 text-right text-[10px] tabular-nums text-[#888]">{healthPct}%</span>
       </div>
       {/* 关键指标:rpm + 熔断/冷却剩余 */}
-      <span className="flex-1 truncate text-xs text-[#888]">
+      <span className="truncate text-xs text-[#888]">
         <span className="tabular-nums">rpm {it.rpm}{it.rpmLimit > 0 ? `/${it.rpmLimit}` : ''}</span>
         {it.health?.circuitOpen && it.health.openRemainingSecs > 0 && (
           <span className="ml-2 text-red-400">熔断剩 {it.health.openRemainingSecs}s</span>
@@ -175,31 +373,21 @@ function PoolHealthRow({
         {it.recent429 > 0 && <span className="ml-2 text-amber-400">429×{it.recent429}</span>}
       </span>
       {/* 快捷操作 */}
-      <div className="flex shrink-0 items-center gap-1">
-        <button
-          onClick={onRefresh}
-          disabled={busy}
-          title="强制刷新 Token"
-          className="rounded p-1 text-[#888] hover:bg-[#222] hover:text-sky-400 disabled:opacity-40"
-        >
-          <Zap className="h-3.5 w-3.5" />
-        </button>
-        <button
-          onClick={onReset}
-          disabled={busy}
-          title="重置失败计数并启用"
-          className="rounded p-1 text-[#888] hover:bg-[#222] hover:text-emerald-400 disabled:opacity-40"
-        >
-          <RotateCcw className="h-3.5 w-3.5" />
-        </button>
-        <button
+      <div className="flex shrink-0 items-center gap-0.5">
+        <IconAction icon={Zap} label="强制刷新 Token" onClick={onRefresh} disabled={busy} className="text-[#888] hover:text-sky-400" />
+        <IconAction icon={RotateCcw} label="重置失败计数并启用" onClick={onReset} disabled={busy} className="text-[#888] hover:text-emerald-400" />
+        <IconAction icon={ShieldCheck} label="深度验活(真实 API 调用)" onClick={onVerify} disabled={busy} pending={verifying} className="text-[#888] hover:text-emerald-400" />
+        {!isCustom && (
+          <IconAction icon={Boxes} label="探测可用模型(⚠️消耗真实积分)" onClick={onProbe} disabled={busy} pending={probing} className="text-[#888] hover:text-amber-400" />
+        )}
+        <IconAction
+          icon={Power}
+          label={it.disabled ? '启用' : '禁用'}
           onClick={onToggleDisabled}
           disabled={busy}
-          title={it.disabled ? '启用' : '禁用'}
-          className={`rounded p-1 hover:bg-[#222] disabled:opacity-40 ${it.disabled ? 'text-[#777] hover:text-emerald-400' : 'text-emerald-400 hover:text-red-400'}`}
-        >
-          <Power className="h-3.5 w-3.5" />
-        </button>
+          className={it.disabled ? 'text-[#777] hover:text-emerald-400' : 'text-emerald-400 hover:text-red-400'}
+        />
+        <IconAction icon={MoreHorizontal} label="更多运维操作" onClick={onMore} disabled={busy} className="text-[#888] hover:text-foreground" />
       </div>
     </div>
   )
@@ -227,15 +415,38 @@ const CIRCUIT_META: Record<CircuitState, { label: string; cls: string; dot: stri
   healthy: { label: '健康', cls: 'text-emerald-400', dot: 'bg-emerald-500' },
 }
 
+// 熔断态 → Badge 变体(与 CIRCUIT_META 同键,展示层用 Badge 承载状态色)。
+const CIRCUIT_BADGE: Record<CircuitState, BadgeProps['variant']> = {
+  open: 'destructive',
+  halfOpen: 'warning',
+  cooldown: 'default',
+  disabled: 'secondary',
+  warn: 'warning',
+  healthy: 'success',
+}
+
 // 号池健康总览:每号真实熔断态 + 健康分 + 冷却剩余 + 快捷运维操作(强刷/重置/启用禁用)。
 // 数据双源:insights(10s 轮询,给全量字段)+ SSE live 帧(~1.5s,实时覆盖 rpm/inflight/熔断/健康分),
 // 让实时指标跟手、又不丢 insights 的推断文案/软上限。
-function PoolHealthCard() {
+function PoolHealthCard({ live }: { live: ReturnType<typeof useLiveStream> }) {
   const { data, isLoading } = useRatelimitInsights()
-  const { frame, connected } = useLiveStream(true)
+  const { data: credsResp } = useCredentials()
+  const { frame, connected } = live
   const setDisabled = useSetDisabled()
   const resetFailure = useResetFailure()
   const forceRefresh = useForceRefreshToken()
+  const deepVerify = useDeepVerify()
+  const probeModels = useProbeModels()
+
+  // 「更多」操作面板 + 探模型确认弹框的目标 id。
+  const [moreId, setMoreId] = useState<number | null>(null)
+  const [probeConfirmId, setProbeConfirmId] = useState<number | null>(null)
+
+  // 凭据列表按 id 索引(CredOpsDialog 取 allowedModels/overageEnabled/name/baseUrl 等 insights 缺的字段)。
+  const credById = useMemo(
+    () => new Map((credsResp?.credentials ?? []).map((c) => [c.id, c])),
+    [credsResp],
+  )
 
   // 用 SSE live 帧的实时值覆盖 insights 的对应字段(id 对齐;live 帧缺该号则保留 insights 值)。
   const liveById = new Map((frame?.creds ?? []).map((c) => [c.id, c]))
@@ -256,7 +467,27 @@ function PoolHealthCard() {
   const order: Record<CircuitState, number> = { open: 0, halfOpen: 1, cooldown: 2, warn: 3, healthy: 4, disabled: 5 }
   const sorted = [...insights].sort((a, b) => order[circuitStateOf(a)] - order[circuitStateOf(b)] || a.id - b.id)
 
+  // 全局 busy(禁用类互斥操作时锁整行);验活/探模型走 per-id pending(见下),不进 busy。
   const busy = setDisabled.isPending || resetFailure.isPending || forceRefresh.isPending
+
+  const runVerify = (id: number) =>
+    deepVerify.mutate(id, {
+      onSuccess: () => toast.success(`#${id} 验活完成`),
+      onError: () => toast.error(`#${id} 验活失败`),
+    })
+  const runProbe = (id: number) =>
+    probeModels.mutate(
+      { id },
+      {
+        onSuccess: (r) =>
+          toast.success(
+            `#${id} 探测完成:${r.models.filter((m) => m.status === 'supported').length}/${r.models.length} 可用,耗 ${r.totalCredits} credits`,
+          ),
+        onError: () => toast.error(`#${id} 探模型失败`),
+      },
+    )
+
+  const moreCred = moreId !== null ? credById.get(moreId) : undefined
 
   return (
     <Card>
@@ -275,16 +506,23 @@ function PoolHealthCard() {
       </CardHeader>
       <CardContent>
         {isLoading ? (
-          <p className="text-sm text-muted-foreground">加载中…</p>
+          <div className="space-y-1.5">
+            {Array.from({ length: 3 }).map((_, i) => (
+              <Skeleton key={i} className="h-11" />
+            ))}
+          </div>
         ) : sorted.length === 0 ? (
-          <p className="text-sm text-muted-foreground">暂无凭据</p>
+          <EmptyState icon={ShieldAlert} title="暂无凭据" description="号池为空,先在凭据页添加账号" />
         ) : (
           <div className="space-y-1.5">
             {sorted.map((it) => (
               <PoolHealthRow
                 key={it.id}
                 it={it}
+                cred={credById.get(it.id)}
                 busy={busy}
+                verifying={deepVerify.isPending && deepVerify.variables === it.id}
+                probing={probeModels.isPending && probeModels.variables?.id === it.id}
                 onRefresh={() => forceRefresh.mutate(it.id, {
                   onSuccess: () => toast.success(`#${it.id} 已触发刷新`),
                   onError: () => toast.error(`#${it.id} 刷新失败`),
@@ -300,11 +538,627 @@ function PoolHealthCard() {
                     onError: () => toast.error('操作失败'),
                   },
                 )}
+                onVerify={() => runVerify(it.id)}
+                onProbe={() => setProbeConfirmId(it.id)}
+                onMore={() => setMoreId(it.id)}
               />
             ))}
           </div>
         )}
       </CardContent>
+
+      {/* 探模型二次确认(耗真实积分) */}
+      <ConfirmDialog
+        open={probeConfirmId !== null}
+        onOpenChange={(v) => !v && setProbeConfirmId(null)}
+        title={`探测 #${probeConfirmId ?? ''} 可用模型？`}
+        description="将逐个候选模型发真实生成请求探测可用性——会消耗该号真实积分(通常几分钱到几毛),耗时可达数十秒。确定继续？"
+        confirmLabel="确认探测"
+        loading={probeModels.isPending}
+        onConfirm={() => {
+          if (probeConfirmId !== null) {
+            runProbe(probeConfirmId)
+            setProbeConfirmId(null)
+          }
+        }}
+      />
+
+      {/* 更多运维操作面板 */}
+      {moreCred && (
+        <CredOpsDialog
+          cred={moreCred}
+          open={moreId !== null}
+          onOpenChange={(v) => !v && setMoreId(null)}
+        />
+      )}
+    </Card>
+  )
+}
+
+// 面板内的分区小标题。
+function OpsSection({ title, hint, children }: { title: string; hint?: string; children: ReactNode }) {
+  return (
+    <div className="space-y-2 border-t border-border/50 py-3 first:border-t-0 first:pt-0">
+      <div className="flex items-baseline justify-between gap-2">
+        <span className="text-sm font-medium">{title}</span>
+        {hint && <span className="text-[11px] text-muted-foreground">{hint}</span>}
+      </div>
+      {children}
+    </div>
+  )
+}
+
+// 「更多」运维操作面板:切 region / 优先级 / RPM 上限 / 允许模型 / 代理 / 别名 + 破坏性(超额/禁用/删除)。
+// custom_api 号(有 baseUrl)隐藏 region / overage / 探模型相关区。数据来自 useCredentials 按 id 取。
+function CredOpsDialog({
+  cred,
+  open,
+  onOpenChange,
+}: {
+  cred: CredentialStatusItem
+  open: boolean
+  onOpenChange: (v: boolean) => void
+}) {
+  const id = cred.id
+  const isCustom = !!cred.baseUrl
+
+  const setPriority = useSetPriority()
+  const setRpmLimit = useSetRpmLimit()
+  const setAllowed = useSetAllowedModels()
+  const setName = useSetName()
+  const setProxy = useSetProxy()
+  const enableOv = useEnableOverage()
+  const disableOv = useDisableOverage()
+  const deleteCred = useDeleteCredential()
+  const setDisabled = useSetDisabled()
+  const probeRegions = useProbeRegions()
+  const switchRegion = useSwitchRegion()
+
+  // 本地编辑态(初值取当前值;open 变化时重置)。
+  const [priority, setPriorityVal] = useState(cred.priority)
+  const [rpmLimit, setRpmLimitVal] = useState(cred.rpmLimit ?? 0)
+  const [name, setNameVal] = useState(cred.name ?? '')
+  const [proxyUrl, setProxyUrl] = useState(cred.proxyUrl ?? '')
+  const [allowed, setAllowed_] = useState<string[]>(cred.allowedModels ?? [])
+  const [regions, setRegions] = useState<CredentialRegionProfile[]>([])
+  const [selectedArn, setSelectedArn] = useState('')
+
+  // 破坏性二次确认目标。
+  const [confirm, setConfirm] = useState<null | 'overage' | 'disable' | 'delete'>(null)
+
+  useEffect(() => {
+    if (open) {
+      setPriorityVal(cred.priority)
+      setRpmLimitVal(cred.rpmLimit ?? 0)
+      setNameVal(cred.name ?? '')
+      setProxyUrl(cred.proxyUrl ?? '')
+      setAllowed_(cred.allowedModels ?? [])
+      setRegions([])
+      setSelectedArn('')
+    }
+  }, [open, cred])
+
+  const toggleModel = (m: string) =>
+    setAllowed_((prev) => (prev.includes(m) ? prev.filter((x) => x !== m) : [...prev, m]))
+
+  const label = cred.name || cred.email || `#${id}`
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-h-[85vh] max-w-lg overflow-y-auto">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <MoreHorizontal className="h-4 w-4" />
+            运维操作 · {label}
+          </DialogTitle>
+          <DialogDescription>
+            单号级配置,均即时生效、无需重启{isCustom ? '(自定义 API 号:region/超额/探模型不适用)' : ''}。
+          </DialogDescription>
+        </DialogHeader>
+
+        {/* 切 region(仅非 custom_api) */}
+        {!isCustom && (
+          <OpsSection title="切换 Region / Profile" hint="切上游 profile,非改全局 region">
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={probeRegions.isPending}
+                onClick={() =>
+                  probeRegions.mutate(id, {
+                    onSuccess: (r) => {
+                      setRegions(r.regions)
+                      const cur = r.regions.find((x) => x.current)
+                      setSelectedArn(cur?.arn ?? r.regions[0]?.arn ?? '')
+                      if (r.regions.length === 0) toast.info('未探测到可用 profile')
+                    },
+                    onError: () => toast.error('探测 region 失败'),
+                  })
+                }
+              >
+                {probeRegions.isPending ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="mr-1.5 h-3.5 w-3.5" />}
+                探测各区域 profile
+              </Button>
+              {probeRegions.isPending && <span className="text-xs text-muted-foreground">向上游探测,可能耗时…</span>}
+            </div>
+            {regions.length > 0 && (
+              <div className="mt-2 space-y-2">
+                <Select
+                  value={selectedArn}
+                  onChange={setSelectedArn}
+                  aria-label="选择 profile"
+                  options={regions.map((r) => ({
+                    value: r.arn,
+                    label: `${r.region}${r.current ? '(当前)' : ''}`,
+                    hint: `${r.subscriptionTitle ?? '未知订阅'}${r.usable ? '' : ' · 不可用'}`,
+                    disabled: !r.usable,
+                  }))}
+                />
+                <Button
+                  size="sm"
+                  disabled={switchRegion.isPending || !selectedArn || regions.find((r) => r.arn === selectedArn)?.current}
+                  onClick={() =>
+                    switchRegion.mutate(
+                      { id, arn: selectedArn },
+                      {
+                        onSuccess: () => toast.success('已切换 profile'),
+                        onError: () => toast.error('切换失败'),
+                      },
+                    )
+                  }
+                >
+                  {switchRegion.isPending && <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />}
+                  应用切换
+                </Button>
+              </div>
+            )}
+          </OpsSection>
+        )}
+
+        {/* 优先级 */}
+        <OpsSection title="优先级" hint="数字越小越优先">
+          <div className="flex items-center gap-2">
+            <NumberStepper value={priority} onChange={setPriorityVal} min={0} max={999} aria-label="优先级" className="w-24" />
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={setPriority.isPending || priority === cred.priority}
+              onClick={() =>
+                setPriority.mutate(
+                  { id, priority },
+                  { onSuccess: () => toast.success('优先级已更新'), onError: () => toast.error('更新失败') },
+                )
+              }
+            >
+              保存
+            </Button>
+          </div>
+        </OpsSection>
+
+        {/* RPM 上限 */}
+        <OpsSection title="RPM 上限" hint="0 = 继承全局">
+          <div className="flex items-center gap-2">
+            <NumberStepper value={rpmLimit} onChange={setRpmLimitVal} min={0} max={100000} step={10} aria-label="RPM 上限" className="w-28" />
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={setRpmLimit.isPending || rpmLimit === (cred.rpmLimit ?? 0)}
+              onClick={() =>
+                setRpmLimit.mutate(
+                  { id, rpmLimit },
+                  { onSuccess: () => toast.success('RPM 上限已更新'), onError: () => toast.error('更新失败') },
+                )
+              }
+            >
+              保存
+            </Button>
+          </div>
+        </OpsSection>
+
+        {/* 允许模型白名单(仅非 custom_api) */}
+        {!isCustom && (
+          <OpsSection title="允许模型白名单" hint="空 = 不限制;设了即硬门">
+            <div className="grid grid-cols-2 gap-x-3 gap-y-1.5">
+              {PROBE_MODEL_CATALOG.map((m) => (
+                <label key={m.id} className="flex cursor-pointer items-center gap-2 text-xs">
+                  <Checkbox checked={allowed.includes(m.id)} onCheckedChange={() => toggleModel(m.id)} />
+                  <span className="truncate font-mono">{m.id}</span>
+                  <span className="shrink-0 text-[10px] text-muted-foreground">{m.mult}</span>
+                </label>
+              ))}
+            </div>
+            <Button
+              size="sm"
+              variant="outline"
+              className="mt-1"
+              disabled={setAllowed.isPending}
+              onClick={() =>
+                setAllowed.mutate(
+                  { id, allowedModels: allowed.length ? allowed : null },
+                  { onSuccess: () => toast.success('允许模型已更新'), onError: () => toast.error('更新失败') },
+                )
+              }
+            >
+              保存白名单{allowed.length > 0 ? `(${allowed.length})` : '(不限制)'}
+            </Button>
+          </OpsSection>
+        )}
+
+        {/* 代理 */}
+        <OpsSection title="代理" hint='空=回退全局,"direct"=强制直连'>
+          <div className="flex items-center gap-2">
+            <Input
+              value={proxyUrl}
+              onChange={(e) => setProxyUrl(e.target.value)}
+              placeholder="socks5://host:port 或 direct"
+              className="h-8 flex-1 text-xs"
+            />
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={setProxy.isPending || proxyUrl === (cred.proxyUrl ?? '')}
+              onClick={() =>
+                setProxy.mutate(
+                  { id, proxyUrl: proxyUrl.trim() === '' ? null : proxyUrl.trim() },
+                  { onSuccess: () => toast.success('代理已更新'), onError: () => toast.error('更新失败') },
+                )
+              }
+            >
+              保存
+            </Button>
+          </div>
+        </OpsSection>
+
+        {/* 别名 */}
+        <OpsSection title="别名 / 备注" hint="展示优先于 email/#id">
+          <div className="flex items-center gap-2">
+            <Input
+              value={name}
+              onChange={(e) => setNameVal(e.target.value)}
+              placeholder="留空清除"
+              className="h-8 flex-1 text-xs"
+            />
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={setName.isPending || name === (cred.name ?? '')}
+              onClick={() =>
+                setName.mutate(
+                  { id, name: name.trim() === '' ? null : name.trim() },
+                  { onSuccess: () => toast.success('别名已更新'), onError: () => toast.error('更新失败') },
+                )
+              }
+            >
+              保存
+            </Button>
+          </div>
+        </OpsSection>
+
+        {/* 超额(仅非 custom_api):开启破坏性(真花钱)走确认;关闭非破坏直接执行 */}
+        {!isCustom && (
+          <OpsSection title="超额 Overage" hint="超 base 额度后按真实用量计费">
+            <div className="flex items-center gap-2">
+              <Button
+                size="sm"
+                variant="destructive"
+                disabled={enableOv.isPending}
+                onClick={() => setConfirm('overage')}
+              >
+                开启超额
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={disableOv.isPending}
+                onClick={() =>
+                  disableOv.mutate(id, {
+                    onSuccess: () => toast.success('已关闭超额'),
+                    onError: () => toast.error('操作失败'),
+                  })
+                }
+              >
+                关闭超额
+              </Button>
+              {cred.overageEnabled && <Badge variant="warning">当前已开启</Badge>}
+            </div>
+          </OpsSection>
+        )}
+
+        {/* 危险区:禁用 / 删除 */}
+        <OpsSection title="危险操作">
+          <div className="flex items-center gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={setDisabled.isPending}
+              onClick={() => {
+                // 启用非破坏,直接执行;禁用走二次确认。
+                if (cred.disabled) {
+                  setDisabled.mutate(
+                    { id, disabled: false },
+                    { onSuccess: () => toast.success('已启用'), onError: () => toast.error('操作失败') },
+                  )
+                } else {
+                  setConfirm('disable')
+                }
+              }}
+            >
+              {cred.disabled ? '启用凭据' : '禁用凭据'}
+            </Button>
+            <Button size="sm" variant="destructive" disabled={deleteCred.isPending} onClick={() => setConfirm('delete')}>
+              <Trash className="mr-1 h-3.5 w-3.5" />
+              删除凭据
+            </Button>
+          </div>
+        </OpsSection>
+
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)}>关闭</Button>
+        </DialogFooter>
+      </DialogContent>
+
+      {/* 破坏性二次确认(共享 ConfirmDialog) */}
+      <ConfirmDialog
+        open={confirm === 'overage'}
+        onOpenChange={(v) => !v && setConfirm(null)}
+        title={`开启 #${id} 超额？`}
+        description="开启后该号超出 base 额度仍会继续服务,超出部分按真实用量向上游付费——这会产生真实费用。确定开启？"
+        confirmLabel="确认开启(会产生费用)"
+        destructive
+        loading={enableOv.isPending}
+        onConfirm={() =>
+          enableOv.mutate(id, {
+            onSuccess: (s) => {
+              toast.success(s.confirmed === false ? (s.note || '已提交,状态待确认') : '已开启超额')
+              setConfirm(null)
+            },
+            onError: () => toast.error('开启失败'),
+          })
+        }
+      />
+      <ConfirmDialog
+        open={confirm === 'disable'}
+        onOpenChange={(v) => !v && setConfirm(null)}
+        title={`禁用 #${id}？`}
+        description="禁用后该号将从调度池中移除,不再被选中处理请求(可随时重新启用)。确定禁用？"
+        confirmLabel="确认禁用"
+        destructive
+        loading={setDisabled.isPending}
+        onConfirm={() =>
+          setDisabled.mutate(
+            { id, disabled: true },
+            {
+              onSuccess: () => {
+                toast.success('已禁用')
+                setConfirm(null)
+              },
+              onError: () => toast.error('操作失败'),
+            },
+          )
+        }
+      />
+      <ConfirmDialog
+        open={confirm === 'delete'}
+        onOpenChange={(v) => !v && setConfirm(null)}
+        title={`删除 #${id}？`}
+        description="将把该凭据移入回收站(可在回收站恢复,永久清除后不可恢复)。确定删除？"
+        confirmLabel="确认删除"
+        destructive
+        loading={deleteCred.isPending}
+        onConfirm={() =>
+          deleteCred.mutate(id, {
+            onSuccess: () => {
+              toast.success('已删除(移入回收站)')
+              setConfirm(null)
+              onOpenChange(false)
+            },
+            onError: () => toast.error('删除失败'),
+          })
+        }
+      />
+    </Dialog>
+  )
+}
+
+// 存储清理目标(与后端 target 白名单一致;bg_cache/trash 为全清)。
+const CLEANABLE_KEYS: StorageCleanupTarget[] = ['traces', 'usage_jsonl', 'trash', 'bg_cache']
+
+// 聚合运维卡:重启服务 / OTA 升级回滚观测 / 存储占用清理。
+// 与 settings 页调用同一批 hooks(同 queryKey,两处并存无冲突);此处复用 hooks 不复用组件。
+function OpsAggregationCard() {
+  const restart = useRestartService()
+  const checkUpd = useCheckUpdate()
+  const performUpd = usePerformUpdate()
+  const { data: updStatus } = useUpdateStatus()
+  const { data: storage, isLoading: storageLoading, refetch: refetchStorage } = useStorageStats()
+  const cleanup = useCleanupStorage()
+
+  const [confirm, setConfirm] = useState<null | 'restart' | 'upgrade' | { kind: 'cleanup'; p: StoragePartition }>(null)
+  const updInfo = checkUpd.data
+
+  const handleCheck = () =>
+    checkUpd.mutate(undefined, {
+      onSuccess: (r) => {
+        if (r.error) toast.error(`检查更新失败:${r.error}`)
+        else if (r.has_update) toast.success(`发现新版本 ${r.latest_version}(当前 ${r.local_version})`)
+        else toast.success(`已是最新版本 ${r.local_version}`)
+      },
+      onError: (e) => toast.error(`检查更新失败:${(e as Error).message}`),
+    })
+
+  const cleanupTarget = confirm && typeof confirm === 'object' ? confirm.p : null
+  const cleanupSupportsDays = cleanupTarget ? cleanupTarget.key === 'traces' || cleanupTarget.key === 'usage_jsonl' : false
+
+  return (
+    <Card>
+      <CardHeader className="pb-2">
+        <CardTitle className="flex items-center gap-2 text-base">
+          <Server className="h-4 w-4" />
+          聚合运维
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {/* 重启 + OTA */}
+        <div className="space-y-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <Button variant="destructive" size="sm" disabled={restart.isPending} onClick={() => setConfirm('restart')}>
+              <RotateCcw className="mr-1.5 h-4 w-4" />
+              一键重启服务
+            </Button>
+            <Button variant="outline" size="sm" onClick={handleCheck} disabled={checkUpd.isPending || performUpd.isPending}>
+              {checkUpd.isPending ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-1.5 h-4 w-4" />}
+              检查更新
+            </Button>
+            {updInfo && !updInfo.error && (
+              <span className="text-xs text-muted-foreground">
+                当前 <span className="font-mono">{updInfo.local_version}</span>
+                {updInfo.latest_version && <> · 最新 <span className="font-mono">{updInfo.latest_version}</span></>}
+              </span>
+            )}
+            {updInfo?.has_update && (
+              <Button size="sm" disabled={performUpd.isPending} onClick={() => setConfirm('upgrade')}>
+                {performUpd.isPending ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <RotateCcw className="mr-1.5 h-4 w-4" />}
+                升级到 {updInfo.latest_version}
+              </Button>
+            )}
+          </div>
+          {/* OTA 升级/回滚观测(后端 .health/.bak/*.failed 标记) */}
+          {updStatus && (
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+              {updStatus.healthConfirmed ? (
+                <span className="flex items-center gap-1 text-emerald-400" title={updStatus.healthDetail ?? undefined}>
+                  <CheckCircle2 className="h-3.5 w-3.5" /> 本版已稳定确认
+                </span>
+              ) : (
+                <span className="flex items-center gap-1 text-amber-400">
+                  <Clock className="h-3.5 w-3.5" /> 本版尚未确认稳定(运行一段时间后自动确认)
+                </span>
+              )}
+              {updStatus.rollbackPointPresent && <span className="text-muted-foreground">回滚点仍在(可回退)</span>}
+              {updStatus.rolledBackBinaryPresent && (
+                <span className="flex items-center gap-1 text-red-400" title="守卫脚本曾执行过回滚">
+                  <AlertTriangle className="h-3.5 w-3.5" /> 检测到曾发生回滚
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* 存储占用 + 清理 */}
+        <div className="border-t border-border/50 pt-3">
+          <div className="mb-2 flex items-center justify-between">
+            <div className="flex items-center gap-2 text-sm font-medium">
+              <Database className="h-4 w-4 text-muted-foreground" />
+              存储占用
+              {storage && <span className="text-xs font-normal text-muted-foreground">落盘合计 {formatBytes(storage.totalDiskBytes)}</span>}
+            </div>
+            <Button variant="ghost" size="sm" className="h-7 px-2" onClick={() => refetchStorage()} disabled={storageLoading}>
+              <RefreshCw className="h-3.5 w-3.5" />
+            </Button>
+          </div>
+          {storageLoading ? (
+            <div className="space-y-2">
+              {Array.from({ length: 3 }).map((_, i) => (
+                <Skeleton key={i} className="h-10" />
+              ))}
+            </div>
+          ) : storage && storage.partitions.length > 0 ? (
+            <div className="space-y-1">
+              {storage.partitions.map((p) => {
+                const cleanable = (CLEANABLE_KEYS as string[]).includes(p.key)
+                return (
+                  <div key={p.key} className="flex items-center justify-between gap-3 rounded-md border border-[#2e2e2e] bg-[#111] px-3 py-1.5">
+                    <div className="flex min-w-0 items-center gap-2">
+                      <span className="truncate text-xs">{p.label}</span>
+                      {p.inMemory && <Badge variant="outline" className="text-[10px]">内存</Badge>}
+                    </div>
+                    <div className="flex shrink-0 items-center gap-3">
+                      <span className="text-xs tabular-nums text-muted-foreground">{formatBytes(p.bytes)} · {p.items} 项</span>
+                      {cleanable && (
+                        <Button variant="outline" size="sm" className="h-7 px-2 text-xs" onClick={() => setConfirm({ kind: 'cleanup', p })}>
+                          <Trash className="mr-1 h-3 w-3" />
+                          清理
+                        </Button>
+                      )}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          ) : (
+            <EmptyState icon={Database} title="暂无可统计的分区" />
+          )}
+        </div>
+      </CardContent>
+
+      <ConfirmDialog
+        open={confirm === 'restart'}
+        onOpenChange={(v) => !v && setConfirm(null)}
+        title="确认重启服务？"
+        description="重启会导致网关短暂断服数秒,期间所有请求失败(含正在进行的对话)。约 3 秒后自动恢复。确定继续？"
+        confirmLabel="确认重启"
+        destructive
+        loading={restart.isPending}
+        onConfirm={() =>
+          restart.mutate(undefined, {
+            onSuccess: (r) => {
+              toast.success(r.message || '重启中,约 3 秒后自动恢复')
+              setConfirm(null)
+            },
+            onError: () => {
+              toast.warning('重启中,约 3 秒后自动恢复(本次连接已中断,属正常)')
+              setConfirm(null)
+            },
+          })
+        }
+      />
+      <ConfirmDialog
+        open={confirm === 'upgrade'}
+        onOpenChange={(v) => !v && setConfirm(null)}
+        title={`确认升级到 ${updInfo?.latest_version ?? '最新版本'}？`}
+        description="将从 GitHub 下载新二进制、校验 sha256 后替换并自动重启。重启期间短暂断服数秒。确定继续？"
+        confirmLabel="确认升级"
+        loading={performUpd.isPending}
+        onConfirm={() =>
+          performUpd.mutate(undefined, {
+            onSuccess: (r) => {
+              toast.success(r.message || '升级中,数秒后自动重启恢复')
+              setConfirm(null)
+            },
+            onError: () => {
+              toast.warning('升级已发起,若成功将自动重启(本次连接可能中断,属正常)')
+              setConfirm(null)
+            },
+          })
+        }
+      />
+      <ConfirmDialog
+        open={!!cleanupTarget}
+        onOpenChange={(v) => !v && setConfirm(null)}
+        title={`清理「${cleanupTarget?.label ?? ''}」？`}
+        description={
+          <span>
+            此操作<strong className="text-red-400">不可逆</strong>,将永久删除对应数据。
+            {cleanupSupportsDays ? '按各分区配置的默认保留期清理早于该期的数据。' : '该分区为整体清理,将清空全部内容。'}
+          </span>
+        }
+        confirmLabel="确认清理"
+        destructive
+        loading={cleanup.isPending}
+        onConfirm={() => {
+          if (!cleanupTarget) return
+          cleanup.mutate(
+            { target: cleanupTarget.key as StorageCleanupTarget },
+            {
+              onSuccess: (resp) => {
+                toast.success(resp.message)
+                setConfirm(null)
+              },
+              onError: () => toast.error('清理失败'),
+            },
+          )
+        }}
+      />
     </Card>
   )
 }
