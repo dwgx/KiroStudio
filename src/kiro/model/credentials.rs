@@ -332,9 +332,20 @@ impl CredentialsConfig {
             return Ok(CredentialsConfig::Multiple(vec![]));
         }
 
-        let content = fs::read_to_string(path)?;
+        // 读裸字节:文件可能是明文 JSON 或本机加密的密文信封。maybe_decrypt_to_string 按 magic
+        // 前缀自动区分——明文直通、密文用机器绑定密钥解密。**必须先解密再交给 serde**,否则密文会
+        // 被当明文解析报一堆看不懂的 JSON 错(且此路径失败会 exit(1))。
+        let bytes = fs::read(path)?;
 
         // 文件为空时返回空数组
+        if bytes.iter().all(|b| b.is_ascii_whitespace()) {
+            return Ok(CredentialsConfig::Multiple(vec![]));
+        }
+
+        let key_path = crate::common::secret_store::key_path_for(path);
+        let content = crate::common::secret_store::maybe_decrypt_to_string(&bytes, &key_path)?;
+
+        // 解密/直通后再判空(密文解出来也可能是空数组的 JSON)。
         if content.trim().is_empty() {
             return Ok(CredentialsConfig::Multiple(vec![]));
         }

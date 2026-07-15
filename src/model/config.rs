@@ -46,6 +46,12 @@ pub struct Config {
     #[serde(default)]
     pub machine_id: Option<String>,
 
+    /// credentials.json / trash.json at-rest 加密开关(默认关,兼容现有明文文件)。
+    /// 开启后:落盘用机器绑定密钥加密(XChaCha20-Poly1305),读时透明解密。首次开启后下次 persist
+    /// 才把明文重写为密文(透明迁移)。导出/导入接口走明文,不受影响。见 common::secret_store。
+    #[serde(default)]
+    pub encrypt_credentials_at_rest: bool,
+
     #[serde(default)]
     pub api_key: Option<String>,
 
@@ -630,6 +636,7 @@ impl Default for Config {
             api_region: None,
             kiro_version: default_kiro_version(),
             machine_id: None,
+            encrypt_credentials_at_rest: false,
             api_key: None,
             system_version: default_system_version(),
             node_version: default_node_version(),

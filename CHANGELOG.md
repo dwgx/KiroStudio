@@ -2,6 +2,45 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.22] - 2026-07-15
+
+### 凭据 at-rest 加密 + 实时号池视图
+- **credentials.json / trash.json at-rest 加密**(默认关,config 开关):开启后敏感凭据(access_token/
+  refresh_token/api_key/proxy_password 等)用 XChaCha20-Poly1305 AEAD 加密落盘。新增
+  `common/secret_store.rs`。**密钥 = 同目录持久化的随机 32 字节密钥文件 `.at_rest.key`(0600)**——
+  刻意不从机器属性(hostname/用户名)派生:那会在 hostname 变化或交互式↔systemd 启动切换时漂移→
+  解不开自己的文件锁死号池。持久化密钥彻底消除漂移,同时保留"文件被单独拷走仍解不开"的保护
+  (密钥文件不随 credentials 导出)。导出/导入接口走明文,不受影响。
+- **透明迁移**:读收口 `CredentialsConfig::load` 按 magic 前缀区分明文/密文——老明文文件照旧直通,
+  首次开启后下次 persist 才重写为密文;写收口 persist_credentials/persist_trash 按开关加密。
+- **防呆**:加密失败自动回退明文落盘(绝不因加密丢号)+ `atRestHealthy` 健康标志经 recovery-metrics
+  暴露,运维页红条告警"开了加密但上次实为明文";单凭据(Single)格式 persist no-op 时明确日志告警;
+  解密失败拒绝启动(fail-safe,防空池覆盖可恢复密文)并给恢复指引。
+- **实时号池视图**:新增 `useLiveStream` hook(fetch+ReadableStream 消费 SSE `/stream/live`,断连重连、
+  隐藏页暂停),接进运维页「号池健康」卡——rpm/在途/熔断态/健康分 ~1.5s 实时更新(替代 10s 轮询,
+  10s 仍兜底),标题连接指示灯如实反映实时/回退。收尾 0.7.21 给 LiveCred 加的 circuitOpen/healthScore
+  死字段。
+
+两轮对抗式安全 review(加密核心/接线 + 升级安全/密码学正确性)查出并修复:
+- HIGH:密钥原从机器属性(hostname/用户名)派生会漂移锁死 → 改持久化随机密钥文件;
+- HIGH:密钥/nonce 原用 fastrand(64-bit 非密码学 PRNG,256-bit 密钥有效熵坍到 ~64 位)→ 改 OS CSPRNG(getrandom);
+- HIGH:并发首次建密钥竞态可致密钥/密文错配锁死 → create_new(O_EXCL) 原子创建 + 竞态输家回读赢家密钥;
+- MEDIUM/LOW:加密失败静默无观测 → atRestHealthy 健康标志 + 运维页红条;Single 格式加密无效 → 置健康标志 false + 日志告警;
+- 解密失败拒绝启动(fail-safe,防空池覆盖可恢复密文)+ 恢复指引。
+
+新增测试:secret_store 8(含并发建密钥竞态回归)+ at-rest 落盘往返 2,双特性各 687 绿;前端全构建通过。
+
+### court/Invalid-tool-params 取证探针(R1)+ 日志页 select 丑修
+基于 Claude Code 2.1.112 源码逆向 + 网关代码核实,确认 "Invalid tool parameters" 根因=Kiro 后端模型把
+工具调用"文本化"吐进文本流(丢 antml: 前缀→退化成 court/card 残片),CC 无 <invoke> 文本兜底解析→
+结构化 tool_use 缺失/畸形→Zod 校验失败。根治在模型侧,网关只能缓解。
+- **R1 取证探针**:`textifiedInvokeHits` 计数器无条件累加(不再只在 KIRO_INVOKE_TRACE 开时记),经
+  recovery-metrics 暴露、运维页新增"文本化工具调用"警示指标——量化 Kiro 文本化频率,作为是否值得做
+  重组层(R4)的依据。修正 stream.rs 注释与实现不一致(泄漏清洗实际默认开)。
+- 经源码核实**否决**了 review 建议的 R2(tool_name_map 只存超长名,按它校验会误杀正常工具调用)、
+  确认 R5 无需做(历史工具调用已走结构化 tool_uses 非文本)——避免了会劣化的改动。
+- **日志页模块过滤**:原生 `<select>`(无样式)换成项目内置 `ui/select`(暗色主题一致、键盘导航)。
+
 ## [0.7.21] - 2026-07-15
 
 ### 运维可控性/可观测性大增强(日志页 + 号池健康 + 凭证防呆)
