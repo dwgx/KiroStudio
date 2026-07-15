@@ -84,6 +84,23 @@ impl Default for HealthState {
     }
 }
 
+/// p_avail 健康分档边界(L2 重排序键用):把连续 p_avail 粗量化成 3 档,让"负载"能在同档内成为
+/// 一等分流键(治惠群),坏号仍靠粗档沉底。宽边界(0.75/0.40)降低边界抖动。
+pub const HEALTH_TIER_HEALTHY_MIN: f64 = 0.75;
+pub const HEALTH_TIER_DEGRADED_MIN: f64 = 0.40;
+
+/// p_avail → 健康档:0=healthy(p≥0.75)、1=degraded(p≥0.40)、2=bad(其余,含熔断 Open 的 p=0)。
+/// 升序排序键用:档小(健康)排前,同档内再按负载分流。
+pub fn health_tier(p: f64) -> u8 {
+    if p >= HEALTH_TIER_HEALTHY_MIN {
+        0
+    } else if p >= HEALTH_TIER_DEGRADED_MIN {
+        1
+    } else {
+        2
+    }
+}
+
 /// 只读健康快照（概览页/hover 推断日志用）。
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
