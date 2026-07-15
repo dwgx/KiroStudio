@@ -248,6 +248,17 @@ pub struct Config {
     #[serde(default = "default_tool_clean_leaked_tokens")]
     pub tool_clean_leaked_tokens: bool,
 
+    /// 工具错误缓解:文本化 invoke 重组(默认 **true**,热更)。模型把工具调用吐成 <invoke> 文本时,
+    /// 在四道安全门内(行首+非代码围栏+工具名已声明+完整闭合)重组为结构化 tool_use;修不了的碎片/
+    /// 截断当文本安全放过。移植 ZyphrZero__kiro.rs v0.6.5 生产方案。关=退回纯转发。
+    #[serde(default = "default_tool_reclaim_textified_invoke")]
+    pub tool_reclaim_textified_invoke: bool,
+
+    /// 工具错误缓解:stray token 复读熔断(默认 **true**,热更)。call/count/card/court 连续独占行复读
+    /// 超阈值(32)截断本轮文本,治 Opus 退化刷屏耗尽 max_tokens + 污染历史。
+    #[serde(default = "default_tool_stray_repeat_guard")]
+    pub tool_stray_repeat_guard: bool,
+
     /// 工具错误缓解 ②：流式路径工具拼装非法 JSON 时，对齐成失败态。默认关，热更生效。
     ///
     /// 修既有不对称：非流式工具拼装非法 → 502 失败态；流式却只告警+透传原文、网关记 Success。
@@ -606,6 +617,12 @@ fn default_strip_env_noise() -> bool {
 
 /// 泄漏控制 token 清洗默认**开启**：治 #70544 模型泄漏（course/課/count 粘连），保守只剥行首
 /// 高信号粘连、正常文本零误删。纯缓解、对干净输出零影响，故默认开。
+fn default_tool_reclaim_textified_invoke() -> bool {
+    true
+}
+fn default_tool_stray_repeat_guard() -> bool {
+    true
+}
 fn default_tool_clean_leaked_tokens() -> bool {
     true
 }
@@ -725,6 +742,8 @@ impl Default for Config {
             prompt_cache_ttl_seconds: default_prompt_cache_ttl_seconds(),
             strip_env_noise: default_strip_env_noise(),
             tool_clean_leaked_tokens: default_tool_clean_leaked_tokens(),
+            tool_reclaim_textified_invoke: default_tool_reclaim_textified_invoke(),
+            tool_stray_repeat_guard: default_tool_stray_repeat_guard(),
             tool_stream_align_failure: default_tool_stream_align_failure(),
             tool_expose_error_to_client: default_tool_expose_error_to_client(),
             tool_repair_json: default_tool_repair_json(),

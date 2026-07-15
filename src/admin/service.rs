@@ -1052,6 +1052,8 @@ impl AdminService {
             cc_auto_buffer: config.cc_auto_buffer,
             strip_env_noise: config.strip_env_noise,
             tool_clean_leaked_tokens: config.tool_clean_leaked_tokens,
+            tool_reclaim_textified_invoke: config.tool_reclaim_textified_invoke,
+            tool_stray_repeat_guard: config.tool_stray_repeat_guard,
             tool_stream_align_failure: config.tool_stream_align_failure,
             tool_expose_error_to_client: config.tool_expose_error_to_client,
             tool_repair_json: config.tool_repair_json,
@@ -1280,6 +1282,20 @@ impl AdminService {
             if v != config.tool_clean_leaked_tokens {
                 config.tool_clean_leaked_tokens = v;
                 tool_clean_leaked_tokens_changed = Some(v);
+            }
+        }
+        if let Some(v) = req.tool_reclaim_textified_invoke {
+            if v != config.tool_reclaim_textified_invoke {
+                config.tool_reclaim_textified_invoke = v;
+                crate::anthropic::handlers::set_tool_reclaim_textified_invoke(v);
+                hot_changed = true;
+            }
+        }
+        if let Some(v) = req.tool_stray_repeat_guard {
+            if v != config.tool_stray_repeat_guard {
+                config.tool_stray_repeat_guard = v;
+                crate::anthropic::handlers::set_tool_stray_repeat_guard(v);
+                hot_changed = true;
             }
         }
         if let Some(v) = req.tool_stream_align_failure {
