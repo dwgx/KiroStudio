@@ -786,6 +786,24 @@ pub struct StreamContext {
     /// <parameter 标记)。这是决定要不要做 R4 重组层的取证依据——无条件累加(不受 KIRO_INVOKE_TRACE 限),
     /// 收尾经 recovery_metrics 暴露。
     textified_invoke_hits: u32,
+    // ===== 文本化 invoke 重组(R4,移植 ZyphrZero__kiro.rs v0.6.5)=====
+    /// 本次请求声明的工具名集合(=模型看到的名字)。重组硬护栏:解析出的工具名必须在此才允许捞回,
+    /// 否则当文本吐——宁可漏捞不可把正文讨论的假命令误执行。
+    known_tool_names: std::collections::HashSet<String>,
+    /// invoke 嗅探缓冲:文本先进这里,决策安全(完整块过四道门 / 确认非泄漏)后才释放。跨 chunk 累积。
+    invoke_sniff_buffer: String,
+    /// 代码围栏(```)开合状态:围栏内的 <invoke> 是展示代码不捞回。跨 chunk 追踪奇偶。
+    code_fence_open: bool,
+    /// 围栏扫描的未完成行尾巴(等换行拼齐再判定是否围栏行)。
+    fence_scan_partial: String,
+    /// stray token(call/count/card/court)连续独占行复读计数,超阈值熔断本轮文本(治退化刷屏)。
+    stray_repeat_last: String,
+    stray_repeat_run: u32,
+    /// 本请求真重组成结构化 tool_use 的次数 + stray 熔断触发次数(可观测)。
+    reclaimed_invoke_count: u32,
+    stray_guard_tripped: bool,
+    /// 重组容错总开关(config tool_reclaim_textified_invoke;默认开)。关=退回纯转发(原样吐文本)。
+    reclaim_enabled: bool,
 }
 
 /// 泄漏 token 剥离的命中信息（诊断计数用，不影响剥离判据）。
@@ -804,12 +822,28 @@ impl StripHit {
 }
 
 impl StreamContext {
+    /// invoke 嗅探缓冲 hold 上限(256 KiB):行首未闭合的 <invoke 累计超此值仍没等到 </invoke>,
+    /// 放弃 hold 当普通文本吐,避免永不闭合的半块把流卡死。多行参数(apply_patch)是常态,故按字节非行数。
+    const MAX_INVOKE_HOLD_BYTES: usize = 262_144;
+
     /// 创建启用thinking的StreamContext
     pub fn new_with_thinking(
         model: impl Into<String>,
         input_tokens: i32,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
+    ) -> Self {
+        Self::new_full(model, input_tokens, thinking_enabled, tool_name_map, std::collections::HashSet::new())
+    }
+
+    /// 完整构造:额外接 known_tool_names(文本化 invoke 重组的工具名硬护栏)。
+    /// new_with_thinking 是它的薄封装(空工具集=不启用重组捞回,兼容既有调用/测试)。
+    pub fn new_full(
+        model: impl Into<String>,
+        input_tokens: i32,
+        thinking_enabled: bool,
+        tool_name_map: HashMap<String, String>,
+        known_tool_names: std::collections::HashSet<String>,
     ) -> Self {
         Self {
             state_manager: SseStateManager::new(),
@@ -838,6 +872,15 @@ impl StreamContext {
             leaked_stripped: 0,
             leaked_saturation_lines: 0,
             textified_invoke_hits: 0,
+            known_tool_names,
+            invoke_sniff_buffer: String::new(),
+            code_fence_open: false,
+            fence_scan_partial: String::new(),
+            stray_repeat_last: String::new(),
+            stray_repeat_run: 0,
+            reclaimed_invoke_count: 0,
+            stray_guard_tripped: false,
+            reclaim_enabled: super::handlers::tool_reclaim_textified_invoke_enabled(),
         }
     }
 
@@ -1337,6 +1380,13 @@ impl StreamContext {
             return self.process_content_with_thinking(content);
         }
 
+        // 文本化 invoke 重组(开关开且本次请求带了工具):文本先进 sniff 缓冲,决策安全后才释放
+        // (完整块过四道门重组 / 半块 hold 等闭合 / 非泄漏当文本)。开关关或无声明工具则走原路径。
+        if self.reclaim_enabled && !self.known_tool_names.is_empty() {
+            self.invoke_sniff_buffer.push_str(content);
+            return self.drain_invoke_sniff_buffer(false);
+        }
+
         // 非 thinking 模式同样复用统一的 text_delta 发送逻辑，
         // 以便在 tool_use 自动关闭文本块后能够自愈重建新的文本块，避免“吞字”。
         self.create_text_delta_events(content)
@@ -1548,6 +1598,207 @@ impl StreamContext {
         }
 
         events
+    }
+
+    // ===== 文本化 invoke 重组(R4,移植 ZyphrZero__kiro.rs v0.6.5)=====
+
+    /// 把重组出的 (工具名, input_json) 合成为标准结构化 tool_use 的 6 步 SSE
+    /// (content_block_start type:tool_use → input_json_delta → content_block_stop)。
+    /// set_has_tool_use(true) → get_stop_reason 自然返回 tool_use(不用 borrow-retry,就地修复)。
+    /// 工具名经 tool_name_map 还原(超长名缩短过的还原回客户端原名)。
+    fn synthesize_tool_use(&mut self, parsed_name: String, input_json: String) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        self.state_manager.set_has_tool_use(true);
+        self.reclaimed_invoke_count += 1;
+        crate::common::recovery_metrics::bump_reclaimed_invoke();
+        let block_index = self.state_manager.next_block_index();
+        let tool_use_id = format!("toolu_{}", Uuid::new_v4().to_string().replace('-', ""));
+        self.tool_block_indices.insert(tool_use_id.clone(), block_index);
+        let name = self
+            .tool_name_map
+            .get(&parsed_name)
+            .cloned()
+            .unwrap_or(parsed_name);
+        events.extend(self.state_manager.handle_content_block_start(
+            block_index,
+            "tool_use",
+            json!({
+                "type": "content_block_start",
+                "index": block_index,
+                "content_block": { "type": "tool_use", "id": tool_use_id, "name": name, "input": {} }
+            }),
+        ));
+        if let Some(d) = self.state_manager.handle_content_block_delta(
+            block_index,
+            json!({
+                "type": "content_block_delta",
+                "index": block_index,
+                "delta": { "type": "input_json_delta", "partial_json": input_json }
+            }),
+        ) {
+            events.push(d);
+        }
+        if let Some(s) = self.state_manager.handle_content_block_stop(block_index) {
+            events.push(s);
+        }
+        events
+    }
+
+    /// stray token 复读熔断:对即将作为文本吐出的内容,检测 call/count/card/court 连续独占行复读。
+    /// 跨 chunk 维护 (stray_repeat_last, stray_repeat_run);超阈值后本请求剩余文本全丢(熔断已 tripped)。
+    /// 返回截断后可安全吐出的文本(熔断已触发则返回空)。开关关或已 tripped 走各自快路径。
+    fn stray_guard_filter<'a>(&mut self, text: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.stray_guard_tripped {
+            return std::borrow::Cow::Borrowed("");
+        }
+        if !super::handlers::tool_stray_repeat_guard_enabled() {
+            return std::borrow::Cow::Borrowed(text);
+        }
+        let mut cut_at: Option<usize> = None;
+        let mut offset = 0usize;
+        for segment in text.split_inclusive('\n') {
+            let line = segment.trim();
+            if STRAY_INVOKE_TOKENS.contains(&line) {
+                if line == self.stray_repeat_last {
+                    self.stray_repeat_run += 1;
+                } else {
+                    self.stray_repeat_last = line.to_string();
+                    self.stray_repeat_run = 1;
+                }
+                if self.stray_repeat_run >= REPEAT_GUARD_TRIP_THRESHOLD {
+                    cut_at = Some(offset);
+                    break;
+                }
+            } else if !line.is_empty() {
+                self.stray_repeat_last = line.to_string();
+                self.stray_repeat_run = 0;
+            }
+            offset += segment.len();
+        }
+        match cut_at {
+            Some(pos) => {
+                self.stray_guard_tripped = true;
+                crate::common::recovery_metrics::bump_stray_guard_tripped();
+                tracing::warn!(target: "kiro::invoke_trace", model = %self.model,
+                    "[invoke_reclaim] stray token 复读超阈值({}),熔断本轮剩余文本", REPEAT_GUARD_TRIP_THRESHOLD);
+                std::borrow::Cow::Owned(text[..pos].to_string())
+            }
+            None => std::borrow::Cow::Borrowed(text),
+        }
+    }
+
+    /// 文本经 stray 熔断后作为普通文本 delta 发出(重组路径里"当文本吐"的统一出口)。
+    fn emit_text_delta_guarded(&mut self, text: &str) -> Vec<SseEvent> {
+        let filtered = self.stray_guard_filter(text);
+        if filtered.is_empty() {
+            return Vec::new();
+        }
+        // 借用与可变借用错开:先拿到 owned 再调 &mut self 方法。
+        let owned = filtered.into_owned();
+        self.create_text_delta_events(&owned)
+    }
+
+    /// invoke 嗅探缓冲驱动:文本进缓冲后,循环找完整/半 <invoke> 块,过四道门决定"重组捞回 vs 当文本"。
+    /// flush=true 时流已结束,残留半块当普通文本吐(绝不静默吞)。移植 ZyphrZero drain_invoke_sniff_buffer。
+    fn drain_invoke_sniff_buffer(&mut self, flush: bool) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        // 取出本地 buffer 一次性驱动(避免每轮 clone;退化大缓冲下省 O(n²))。
+        let mut buf = std::mem::take(&mut self.invoke_sniff_buffer);
+        loop {
+            match find_invoke_start(&buf) {
+                Some(start) => match find_invoke_block_end(&buf, start) {
+                    Some(end) => {
+                        // 完整块:过四道门。
+                        let before = strip_trailing_stray_tokens(&buf[..start]).to_string();
+                        let fence_after_before =
+                            fence_open_after(self.code_fence_open, &self.fence_scan_partial, &before);
+                        let parsed = parse_invoke_block(&buf[start..end]);
+                        let name_known = parsed
+                            .as_ref()
+                            .map(|(n, _)| self.known_tool_names.contains(n))
+                            .unwrap_or(false);
+                        if invoke_looks_like_real_leak(&before) && !fence_after_before && name_known {
+                            // 真泄漏:吐块前文本(剥掉尾部独立 stray 行)+ 合成 tool_use。
+                            if !before.is_empty() {
+                                // before 的围栏状态要并入(它会作为文本吐,推进围栏奇偶)。
+                                advance_code_fence_state(&mut self.code_fence_open, &mut self.fence_scan_partial, &before);
+                                events.extend(self.emit_text_delta_guarded(&before));
+                            }
+                            let (name, input_json) = parsed.expect("parsed is Some when name_known");
+                            events.extend(self.synthesize_tool_use(name, input_json));
+                        } else {
+                            // 不捞回(句中/围栏内/工具名未知/解析失败)→ 整段当普通文本吐。
+                            let seg = buf[..end].to_string();
+                            advance_code_fence_state(&mut self.code_fence_open, &mut self.fence_scan_partial, &seg);
+                            events.extend(self.emit_text_delta_guarded(&seg));
+                        }
+                        buf = buf[end..].to_string();
+                        continue;
+                    }
+                    None => {
+                        // 半块(未闭合)。行首判定:非行首/围栏内当文本直接吐,不 hold。
+                        let before = strip_trailing_stray_tokens(&buf[..start]).to_string();
+                        let fence_after_before =
+                            fence_open_after(self.code_fence_open, &self.fence_scan_partial, &before);
+                        if !invoke_looks_like_real_leak(&before) || fence_after_before {
+                            if !buf.is_empty() {
+                                let seg = buf.clone();
+                                advance_code_fence_state(&mut self.code_fence_open, &mut self.fence_scan_partial, &seg);
+                                events.extend(self.emit_text_delta_guarded(&seg));
+                            }
+                            break;
+                        }
+                        // 行首未闭合块:吐 start 前文本,保留 start.. 等闭合。
+                        if start > 0 {
+                            let seg = buf[..start].to_string();
+                            advance_code_fence_state(&mut self.code_fence_open, &mut self.fence_scan_partial, &seg);
+                            events.extend(self.emit_text_delta_guarded(&seg));
+                        }
+                        let remainder = buf[start..].to_string();
+                        if flush {
+                            if !remainder.is_empty() {
+                                events.extend(self.emit_text_delta_guarded(&remainder));
+                            }
+                        } else if remainder.len() > Self::MAX_INVOKE_HOLD_BYTES {
+                            // 纯字节上限兜底:永不闭合的 <invoke 不能无限 hold 卡死流。
+                            events.extend(self.emit_text_delta_guarded(&remainder));
+                        } else {
+                            self.invoke_sniff_buffer = remainder;
+                        }
+                        break;
+                    }
+                },
+                None => {
+                    // 无 invoke 开标签。flush 全吐;否则保留可能是半个 <invoke 开标签的尾巴。
+                    if flush {
+                        if !buf.is_empty() {
+                            let seg = buf.clone();
+                            advance_code_fence_state(&mut self.code_fence_open, &mut self.fence_scan_partial, &seg);
+                            events.extend(self.emit_text_delta_guarded(&seg));
+                        }
+                    } else {
+                        let keep = partial_invoke_tag_suffix_len(&buf);
+                        let emit_len = buf.len() - keep;
+                        if emit_len > 0 {
+                            let seg = buf[..emit_len].to_string();
+                            advance_code_fence_state(&mut self.code_fence_open, &mut self.fence_scan_partial, &seg);
+                            events.extend(self.emit_text_delta_guarded(&seg));
+                        }
+                        self.invoke_sniff_buffer = buf[emit_len..].to_string();
+                    }
+                    break;
+                }
+            }
+        }
+        events
+    }
+
+    /// 收尾 flush invoke 嗅探缓冲(流结束):残留半块当普通文本吐,绝不静默吞。
+    fn flush_invoke_sniff_buffer(&mut self) -> Vec<SseEvent> {
+        if self.invoke_sniff_buffer.is_empty() {
+            return Vec::new();
+        }
+        self.drain_invoke_sniff_buffer(true)
     }
 
     /// 创建 thinking_delta 事件
@@ -1959,6 +2210,8 @@ impl StreamContext {
         // 残留 text 块在 thinking 块 stop 之后才 start,顺序合法;残留也使 has_non_thinking_blocks()
         // 变真,避免下方「仅 thinking」分支多补一个空格 text 块。
         events.extend(self.flush_dsml_tail());
+        // 收尾 flush invoke 嗅探缓冲:流结束时残留的半块(未等到 </invoke>)当普通文本吐,绝不静默吞。
+        events.extend(self.flush_invoke_sniff_buffer());
 
         // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
         // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
@@ -2052,9 +2305,10 @@ impl BufferedStreamContext {
         estimated_input_tokens: i32,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
+        known_tool_names: std::collections::HashSet<String>,
     ) -> Self {
         let inner =
-            StreamContext::new_with_thinking(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+            StreamContext::new_full(model, estimated_input_tokens, thinking_enabled, tool_name_map, known_tool_names);
         Self {
             inner,
             event_buffer: Vec::new(),
@@ -3549,6 +3803,76 @@ mod tests {
         assert_eq!(ctx.strip_dsml_markers(s), s, "非关键字的 <｜…> 属正文,应保留");
     }
 
+    // ===== 文本化 invoke 重组端到端(旧代码上会失败:旧代码把 <invoke> 当纯文本吐,不重组)=====
+
+    /// 造一个开了重组 + 声明了工具 Bash 的 ctx。
+    fn mk_reclaim_ctx() -> StreamContext {
+        let mut known = std::collections::HashSet::new();
+        known.insert("Bash".to_string());
+        StreamContext::new_full("claude-opus-4.6", 10, false, HashMap::new(), known)
+    }
+
+    /// 判定事件流里是否有结构化 tool_use 的 content_block_start。
+    fn has_tool_use_block(events: &[SseEvent]) -> bool {
+        events.iter().any(|e| {
+            e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
+        })
+    }
+
+    #[test]
+    fn test_reclaim_textified_invoke_to_tool_use() {
+        // 行首完整 <invoke name="Bash"><parameter name="command">ls</parameter></invoke> + 工具名已声明
+        // → 应重组成结构化 tool_use,且收尾 stop_reason=tool_use。用 concat 拼避免源码里出现字面工具标签。
+        let mut ctx = mk_reclaim_ctx();
+        let lt = "<";
+        let block = format!(
+            "{lt}invoke name=\"Bash\">{lt}parameter name=\"command\">ls -la{lt}/parameter>{lt}/invoke>"
+        );
+        let mut events = ctx.process_assistant_response(&block);
+        events.extend(ctx.flush_invoke_sniff_buffer());
+        assert!(has_tool_use_block(&events), "行首完整 invoke 块应重组成 tool_use");
+        assert_eq!(ctx.reclaimed_invoke_count, 1);
+        assert_eq!(ctx.state_manager.get_stop_reason(), "tool_use", "重组后 stop_reason 应为 tool_use");
+    }
+
+    #[test]
+    fn test_reclaim_gated_by_unknown_tool_name() {
+        // 工具名硬护栏:解析出的工具名不在声明表里 → 不重组,当普通文本吐(宁可漏捞不误执行)。
+        let mut known = std::collections::HashSet::new();
+        known.insert("Read".to_string()); // 只声明 Read,没声明 Bash
+        let mut ctx = StreamContext::new_full("claude-opus-4.6", 10, false, HashMap::new(), known);
+        let lt = "<";
+        let block = format!("{lt}invoke name=\"Bash\">{lt}parameter name=\"x\">1{lt}/parameter>{lt}/invoke>");
+        let mut events = ctx.process_assistant_response(&block);
+        events.extend(ctx.flush_invoke_sniff_buffer());
+        assert!(!has_tool_use_block(&events), "未声明的工具名不应被重组执行");
+        assert_eq!(ctx.reclaimed_invoke_count, 0);
+    }
+
+    #[test]
+    fn test_reclaim_split_across_chunks() {
+        // 跨 chunk 切分的 invoke 块:分片到达仍应重组(sniff 缓冲 hold 到闭合)。
+        let mut ctx = mk_reclaim_ctx();
+        let lt = "<";
+        let mut events = Vec::new();
+        events.extend(ctx.process_assistant_response(&format!("{lt}invoke name=\"Ba")));
+        events.extend(ctx.process_assistant_response(&format!("sh\">{lt}parameter name=\"command\">echo hi")));
+        events.extend(ctx.process_assistant_response(&format!("{lt}/parameter>{lt}/invoke>")));
+        events.extend(ctx.flush_invoke_sniff_buffer());
+        assert!(has_tool_use_block(&events), "跨 chunk 分片的 invoke 应重组成 tool_use");
+    }
+
+    #[test]
+    fn test_reclaim_disabled_when_no_tools_declared() {
+        // 未声明任何工具(known 空)→ 不进重组路径,<invoke> 原样当文本吐(new_with_thinking 空集=不启用)。
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4.6", 10, false, HashMap::new());
+        let lt = "<";
+        let block = format!("{lt}invoke name=\"Bash\">{lt}parameter name=\"c\">x{lt}/parameter>{lt}/invoke>");
+        let events = ctx.process_assistant_response(&block);
+        assert!(!has_tool_use_block(&events), "无声明工具时不重组");
+        assert!(ctx.invoke_sniff_buffer.is_empty(), "不启用重组则不进 sniff 缓冲");
+    }
+
     #[test]
     fn test_strip_dsml_flush_recovers_leftover() {
         // 末尾孤立 < 被 hold 后,若流结束(无下一帧),flush_dsml_tail 应把它作为普通文本补发,不吞字。
@@ -4702,7 +5026,7 @@ mod tests {
     #[test]
     fn test_buffered_context_delegates_completion() {
         // BufferedStreamContext 应把完成状态透传给内部 StreamContext。
-        let mut ctx = BufferedStreamContext::new("test-model", 1, false, HashMap::new());
+        let mut ctx = BufferedStreamContext::new("test-model", 1, false, HashMap::new(), std::collections::HashSet::new());
         ctx.process_and_buffer(&Event::Error {
             error_code: "InternalServerException".to_string(),
             error_message: "boom".to_string(),
