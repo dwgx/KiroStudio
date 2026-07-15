@@ -174,6 +174,24 @@ pub struct Config {
     #[serde(default)]
     pub rpm_hard_gate_overload_wait: bool,
 
+    /// 余额加权分流(默认 **true**):同优先级、同健康档、同在途时,按剩余额度比例微调选号评分——
+    /// 余额多的号略多分、少的略少分,长期把号池剩余额度拉平,不让某个号先耗干。
+    /// 软偏置非硬配额:只在 p_avail(末位兜底键)上乘一个 [floor,1] 因子,绝不掀翻 0.7.23 在途均分。
+    /// 关闭 = 退回纯 0.7.23 行为(不看余额)。热更即时生效。
+    #[serde(default = "default_balance_weight_enabled")]
+    pub balance_weight_enabled: bool,
+
+    /// 余额加权下限 FLOOR(0..100 整百分比,默认 50)。因子 = floor/100 + (1-floor/100) × 剩余额度比例。
+    /// floor=50:满额号因子 1.0、半额号 0.75、耗尽号 0.5——差 10~20% 属微调不喧宾夺主。
+    /// floor=100 = 因子恒 1.0(等于关闭加权)。越小余额影响越强。热更即时生效。
+    #[serde(default = "default_balance_weight_floor")]
+    pub balance_weight_floor: u32,
+
+    /// 429/限速感知降权(默认 **true**):某号冒 429 时经 EWMA 拉低健康分→少被选(现有 health 机制)。
+    /// 关闭 = p_avail 的 health 项跳过 429 惩罚(某些场景不想让偶发 429 影响分流)。热更即时生效。
+    #[serde(default = "default_health_429_weight_enabled")]
+    pub health_429_weight_enabled: bool,
+
     /// 全池冷却时是否"快速失败"：当所有可用凭据都在冷却/风控中，立即返回 429+Retry-After
     /// 让客户端(Claude Code)自己退避重试，而不是在网关内硬扛等待。默认 true。
     /// 客户端退避比网关反复选号温和，也减少对被风控号的零星试探（吸收其它 kiro.rs fork 做法）。
@@ -537,6 +555,21 @@ fn default_rpm_headroom_factor() -> u32 {
     85
 }
 
+/// 余额加权默认开(动态化出厂即用,dwgx 真机观察拉平)。
+fn default_balance_weight_enabled() -> bool {
+    true
+}
+
+/// 余额加权 FLOOR 默认 50(因子 [0.5,1.0],差 10~20% 微调)。
+fn default_balance_weight_floor() -> u32 {
+    50
+}
+
+/// 429 降权默认开(现有 health/EWMA 机制)。
+fn default_health_429_weight_enabled() -> bool {
+    true
+}
+
 fn default_cooldown_enabled() -> bool {
     true
 }
@@ -682,6 +715,9 @@ impl Default for Config {
             rpm_headroom_factor: default_rpm_headroom_factor(),
             rpm_reserve_slots: 0,
             rpm_hard_gate_overload_wait: false,
+            balance_weight_enabled: default_balance_weight_enabled(),
+            balance_weight_floor: default_balance_weight_floor(),
+            health_429_weight_enabled: default_health_429_weight_enabled(),
             all_cooling_fast_fail: default_all_cooling_fast_fail(),
             auto_disable_suspicious: default_auto_disable_suspicious(),
             priority_in_balanced: false,
