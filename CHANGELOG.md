@@ -2,6 +2,32 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.19] - 2026-07-15
+
+### OpenAI 兼容层深度 review：补齐协议兼容缺口
+承接 0.7.18 的 OpenAI 入站端点，对 `/v1/chat/completions` + `/v1/responses` 做系统性兼容 review，
+按 OpenAI 官方协议逐点核对，修复会真导致客户端出错的兼容缺陷。关键背景：`MessagesRequest` 结构体
+不含 temperature/top_p/stop_sequences，Kiro 主路径会静默丢弃这些字段，但 **custom_api 透传路径**把
+翻译后的 body 原样发给 Anthropic 兼容上游、不经归一——所以协议不合规会在透传路径 400。
+
+- **temperature clamp 到 [0,1]**：OpenAI 范围 [0,2]、Anthropic 只接受 [0,1]，客户端发 1.5 曾致
+  透传路径 400。chat + responses 两路径都 clamp（2.0→1.0）。
+- **空 stop sequence 过滤**：`stop:[""]` 曾把空串传入 stop_sequences（Anthropic 拒绝空 stop），
+  现过滤空串、全空则不下发。
+- **空请求兜底加宽**：无 messages 且无 system（或 responses 无 input 无 instructions）曾产出空
+  messages 数组致 Anthropic 400，现无条件补一条空 user。
+- **tool-only 回复 content=null**：非流式聚合时 assistant 只返回 tool_calls（无文本）现给
+  `content:null`（此前空串），贴合 OpenAI 规范、避免严格 SDK 断言失败。
+- **流式 usage 拆成规范形状**：usage 从「与 finish_reason 同 chunk」改为**单独一个 choices:[] 的
+  chunk**（紧邻 [DONE]），符合 OpenAI 流式规范，严格 SDK 能正确取到 usage。
+- **response_format / JSON mode 落地**（此前静默忽略）：`{type:json_object}` 与
+  `{type:json_schema}` 翻成 system 指令引导上游只输出合法 JSON（json_schema 内嵌目标 schema）；
+  Responses 路径同时认原生 `text.format` 与 `response_format`。诚实边界：这是尽力引导、非上游硬
+  保证（Anthropic 无服务端 JSON 约束），覆盖绝大多数 JSON mode 客户端但不承诺 100% 合规。
+- **未支持字段仍静默忽略**（n>1 多选 / logprobs 等）：最大兼容，客户端不因装饰性字段整体失败。
+
+openai 模块 33 单测（+7）+ 双特性各 669 绿。
+
 ## [0.7.18] - 2026-07-14
 
 ### OpenAI 兼容入站端点（让 Codex / OpenAI 客户端走网关用上游模型）
