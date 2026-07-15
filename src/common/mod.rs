@@ -5,5 +5,6 @@ pub mod fs_atomic;
 pub mod health_marker;
 pub mod log_buffer;
 pub mod recovery_metrics;
+pub mod secret_store;
 pub mod security;
 pub mod ssrf;
