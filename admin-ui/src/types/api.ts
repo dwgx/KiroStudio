@@ -326,6 +326,13 @@ export interface ConfigSnapshotResponse {
   rateLimitMinIntervalMs: number
   affinityEnabled: boolean
   priorityInBalanced: boolean
+  /** 智能调度（0.7.23 headroom/背压 + 0.7.24 余额加权/429 感知，均热更即时生效） */
+  rpmHeadroomFactor: number
+  rpmReserveSlots: number
+  rpmHardGateOverloadWait: boolean
+  balanceWeightEnabled: boolean
+  balanceWeightFloor: number
+  health429WeightEnabled: boolean
   hasProxy: boolean
   proxyUrl?: string
   hasAdminKey: boolean
@@ -378,6 +385,12 @@ export interface UpdateConfigRequest {
   rateLimitMinIntervalMs?: number
   affinityEnabled?: boolean
   priorityInBalanced?: boolean
+  rpmHeadroomFactor?: number
+  rpmReserveSlots?: number
+  rpmHardGateOverloadWait?: boolean
+  balanceWeightEnabled?: boolean
+  balanceWeightFloor?: number
+  health429WeightEnabled?: boolean
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string

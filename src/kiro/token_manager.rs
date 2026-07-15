@@ -5,7 +5,7 @@
 
 use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
@@ -1281,9 +1281,28 @@ pub struct MultiTokenManager {
     auto_disable_suspicious: AtomicBool,
     /// 均衡模式下是否叠加优先级分发（原子镜像,reload 热更）。
     priority_in_balanced: AtomicBool,
+    /// 余额加权分流开关（原子镜像,reload 热更）。true=同档内按剩余额度微调选号评分。
+    balance_weight_enabled: AtomicBool,
+    /// 余额加权 FLOOR(整百分比 0..100;50=因子下限 0.5)。（原子镜像,reload 热更）
+    balance_weight_floor: AtomicU32,
+    /// 余额快照(每 30 分钟由 AdminService 余额刷新任务回推)。key=cred id。
+    /// balanced 选号时 balance_factor 用它 + 本地实时 total_credits_used 累加修正估当前剩余。
+    /// 读多写少(30 分钟写一次,每次选号读),用 RwLock。缺表(新号/未刷)= 中性因子 1.0 不惩罚。
+    balance_snapshots: RwLock<HashMap<u64, BalanceSnapshot>>,
     /// 主动 token 预刷新后台任务句柄（TIER2 热重载：改配置后 abort + respawn 即时生效不重启）。
     /// None = 当前未运行（proactive_token_refresh=false 或尚未启动）。
     refresh_task: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// 单号余额快照(供余额加权分流)。由 AdminService 每 30 分钟刷新后回推。
+#[derive(Debug, Clone, Copy)]
+pub struct BalanceSnapshot {
+    /// 快照时刻的剩余额度(overage 感知:含 overage cap)。
+    pub remaining_at_cache: f64,
+    /// 有效额度上限(base + overage cap),用于归一成剩余比例。<=0 时因子回退中性。
+    pub effective_limit: f64,
+    /// 快照时刻该号的 total_credits_used(本地累加修正基线:当前用量 - 此基线 = 快照后新增花费)。
+    pub credits_used_at_cache: f64,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -1505,6 +1524,9 @@ impl MultiTokenManager {
         let all_cooling_fast_fail = config.all_cooling_fast_fail;
         let auto_disable_suspicious = config.auto_disable_suspicious;
         let priority_in_balanced = config.priority_in_balanced;
+        let balance_weight_enabled = config.balance_weight_enabled;
+        let balance_weight_floor = config.balance_weight_floor;
+        let health_429_weight_enabled = config.health_429_weight_enabled;
         let rate_limit_config = RateLimitConfig {
             daily_max_requests: config.rate_limit_daily_max,
             min_interval_ms: config.rate_limit_min_interval_ms,
@@ -1533,7 +1555,12 @@ impl MultiTokenManager {
             model_blocklist: Mutex::new(HashMap::new()),
             affinity_enabled: AtomicBool::new(affinity_enabled),
             rpm: RpmTracker::new(),
-            health: HealthTracker::new(),
+            health: {
+                let h = HealthTracker::new();
+                // 429 降权开关:config 存"是否启用降权",HealthTracker 存"是否关闭降权",取反装配。
+                h.set_disable_429_weight(!health_429_weight_enabled);
+                h
+            },
             rpm_limit: AtomicU32::new(rpm_limit),
             rpm_headroom_factor: AtomicU32::new(rpm_headroom_factor),
             rpm_reserve_slots: AtomicU32::new(rpm_reserve_slots),
@@ -1541,6 +1568,9 @@ impl MultiTokenManager {
             all_cooling_fast_fail: AtomicBool::new(all_cooling_fast_fail),
             auto_disable_suspicious: AtomicBool::new(auto_disable_suspicious),
             priority_in_balanced: AtomicBool::new(priority_in_balanced),
+            balance_weight_enabled: AtomicBool::new(balance_weight_enabled),
+            balance_weight_floor: AtomicU32::new(balance_weight_floor),
+            balance_snapshots: RwLock::new(HashMap::new()),
             refresh_task: Mutex::new(None),
         };
 
@@ -1632,6 +1662,13 @@ impl MultiTokenManager {
             .store(new.auto_disable_suspicious, Ordering::Relaxed);
         self.priority_in_balanced
             .store(new.priority_in_balanced, Ordering::Relaxed);
+        self.balance_weight_enabled
+            .store(new.balance_weight_enabled, Ordering::Relaxed);
+        self.balance_weight_floor
+            .store(new.balance_weight_floor, Ordering::Relaxed);
+        // 429 降权:config 存"启用",HealthTracker 存"关闭",取反。
+        self.health
+            .set_disable_429_weight(!new.health_429_weight_enabled);
         *self.load_balancing_mode.lock() = new.load_balancing_mode.clone();
         self.rate_limiter.update_config(RateLimitConfig {
             daily_max_requests: new.rate_limit_daily_max,
@@ -1942,18 +1979,24 @@ impl MultiTokenManager {
                         // L2:健康降为 3 档粗门(不再是首要连续键),让"负载"成为同档内一等分流键。
                         // 治惠群根因——旧代码 neg_p_bucket 首排,最健康的号哪怕背 7 个在途也压过空闲的
                         // 稍弱号,突发全被它吸走。现同档内按 在途 + 剩余名额 分流。
+                        // ⚠️健康分档用**原始 p**(不含余额加权):余额绝不该把健康号打进坏档,只在同档细分。
                         let health_tier = crate::kiro::health::health_tier(p);
                         let saturated = self.is_rpm_saturated_with_limit(e.id, e.credentials.rpm_limit);
                         // 溢出闸:仅当该号"真不可用"(熔断 Open→p_avail=0 或 RPM 已饱和)时置 1 沉底,
-                        // 保证优先级分层不会把流量钉死在一个已打爆的高优先级号上。
+                        // 保证优先级分层不会把流量钉死在一个已打爆的高优先级号上。用原始 p(余额不该把
+                        // 健康号判成不可用)。
                         let unusable = (p <= 0.0 || saturated) as u8;
                         // 已用率(升序 min:已用率低的先选)——按 RPM 占容量的比例分流,比裸 rpm_count
                         // 更贴"容量差异化的号"(大容量号能接更多)。用整数千分比避免浮点排序不确定。
                         // cred_rpm_cap 恒 >0(effective_saturation_limit 保证),不会除零。
                         let rpm_usage_permille =
                             ((self.rpm.count(e.id) as u64 * 1000) / cred_rpm_cap as u64) as u32;
-                        // p_avail 精细值降为末位兜底,保留确定性 + 避免同档抖动。
-                        let neg_p_fine = -((p * 1000.0) as i64);
+                        // 余额加权(软偏置微调):同档、同在途、同 RPM 已用率时,按剩余额度比例细分——
+                        // 余额多的号 p_weighted 略高(neg 更小)→ 先选,长期拉平号池余额。开关关/缺快照=因子1.0。
+                        // 只作用在 neg_p_fine(第 6 位末位兜底键),前面在途/已用率相等才轮到 → 不掀翻 0.7.23 分流。
+                        let p_weighted = p * self.balance_factor(e.id, e.total_credits_used);
+                        // p_avail 精细值(含余额加权)降为末位兜底,保留确定性 + 避免同档抖动。
+                        let neg_p_fine = -((p_weighted * 1000.0) as i64);
                         // 优先级键仅在开关开启时参与首排;关闭时置 0(不影响原有均衡)。
                         let prio_key = if prio_first { e.credentials.priority } else { 0 };
                         (
@@ -2869,6 +2912,40 @@ impl MultiTokenManager {
             }
         }
         self.save_stats_debounced();
+    }
+
+    /// 回推余额快照(AdminService 每 30 分钟余额刷新后调用)。一次性替换全表(读多写少)。
+    /// 号被删/禁用则不在表里,balance_factor 缺表 → 中性因子 1.0(不惩罚)。
+    pub fn set_balance_snapshots(&self, snaps: HashMap<u64, BalanceSnapshot>) {
+        *self.balance_snapshots.write() = snaps;
+    }
+
+    /// 余额加权因子 ∈ [floor, 1.0](balanced 选号微调用)。软偏置:余额多的号因子高(略多分),
+    /// 少的低(略少分),长期把号池剩余额度拉平。**本地累加修正**:以快照剩余为基线,减去快照后
+    /// 本地记的新增花费(total_credits_used 增量),估当前剩余,比纯 30 分钟旧快照准。
+    /// 缺快照/上限<=0/加权关 → 返回 1.0 中性(不影响选号,退回纯 0.7.23 行为)。
+    fn balance_factor(&self, id: u64, credits_used_now: f64) -> f64 {
+        if !self.balance_weight_enabled.load(Ordering::Relaxed) {
+            return 1.0;
+        }
+        let snap = {
+            let map = self.balance_snapshots.read();
+            match map.get(&id) {
+                Some(s) => *s,
+                None => return 1.0, // 缺快照(新号/未刷)→ 中性
+            }
+        };
+        if !(snap.effective_limit > 0.0) {
+            return 1.0;
+        }
+        // 本地累加修正:当前用量 - 快照基线 = 快照后新增花费(负数=快照更旧或已重置,钳到 0)。
+        let spent_since = (credits_used_now - snap.credits_used_at_cache).max(0.0);
+        let est_remaining = (snap.remaining_at_cache - spent_since).max(0.0);
+        let frac = (est_remaining / snap.effective_limit).clamp(0.0, 1.0);
+        // FLOOR 映射:factor = floor + (1-floor)×frac。floor=0.5:满额 1.0、半额 0.75、耗尽 0.5。
+        // floor=100 → 因子恒 1.0(等于关闭)。整百分比转 [0,1]。
+        let floor = (self.balance_weight_floor.load(Ordering::Relaxed).min(100) as f64) / 100.0;
+        floor + (1.0 - floor) * frac
     }
 
     /// 按 id 取该凭据的 family_key（M365 号→族键连坐；IdC/social→cred:{id} 独立）。
@@ -6225,6 +6302,99 @@ mod tests {
             })
             .collect();
         MultiTokenManager::new(config, creds, None, None, false).unwrap()
+    }
+
+    // ============ 余额加权分流(0.7.24,旧代码上会失败:旧代码无 balance_factor/set_balance_snapshots)============
+
+    fn mk_bal_snap(remaining: f64, effective_limit: f64, used_at_cache: f64) -> BalanceSnapshot {
+        BalanceSnapshot { remaining_at_cache: remaining, effective_limit, credits_used_at_cache: used_at_cache }
+    }
+
+    /// 余额加权因子数学:满额→1.0、半额→floor+0.5×(1-floor)、耗尽→floor;缺快照/关闭→中性 1.0。
+    #[test]
+    fn test_balance_factor_math_and_neutral() {
+        let m = make_balanced_manager(1);
+        // 默认 floor=50 → 0.5。满额(remaining=eff)→ factor=1.0。
+        m.set_balance_snapshots(HashMap::from([(1, mk_bal_snap(100.0, 100.0, 0.0))]));
+        assert!((m.balance_factor(1, 0.0) - 1.0).abs() < 1e-9, "满额 → 1.0");
+        // 半额(remaining=50/100)→ 0.5 + 0.5×0.5 = 0.75。
+        m.set_balance_snapshots(HashMap::from([(1, mk_bal_snap(50.0, 100.0, 0.0))]));
+        assert!((m.balance_factor(1, 0.0) - 0.75).abs() < 1e-9, "半额 → 0.75");
+        // 耗尽(remaining=0)→ floor=0.5。
+        m.set_balance_snapshots(HashMap::from([(1, mk_bal_snap(0.0, 100.0, 0.0))]));
+        assert!((m.balance_factor(1, 0.0) - 0.5).abs() < 1e-9, "耗尽 → floor 0.5");
+        // 缺快照 → 中性 1.0(新号不被惩罚)。
+        m.set_balance_snapshots(HashMap::new());
+        assert!((m.balance_factor(1, 0.0) - 1.0).abs() < 1e-9, "缺快照 → 中性 1.0");
+        // 加权关 → 恒中性 1.0(退回纯 0.7.23)。
+        m.set_balance_snapshots(HashMap::from([(1, mk_bal_snap(0.0, 100.0, 0.0))]));
+        m.balance_weight_enabled.store(false, Ordering::Relaxed);
+        assert!((m.balance_factor(1, 0.0) - 1.0).abs() < 1e-9, "开关关 → 中性 1.0");
+    }
+
+    /// 本地累加修正:快照后本地花费增量拉低估算剩余 → 因子下降(比纯 30 分钟旧快照更准)。
+    #[test]
+    fn test_balance_factor_local_correction() {
+        let m = make_balanced_manager(1);
+        // 快照:满额 100,基线花费 200(生命周期累计)。
+        m.set_balance_snapshots(HashMap::from([(1, mk_bal_snap(100.0, 100.0, 200.0))]));
+        // 当前累计花费仍 200(无新增)→ 满额 → 1.0。
+        assert!((m.balance_factor(1, 200.0) - 1.0).abs() < 1e-9, "无新增 → 满额");
+        // 当前累计花费 250(快照后新花 50)→ est_remaining=100-50=50 → 半额 → 0.75。
+        assert!((m.balance_factor(1, 250.0) - 0.75).abs() < 1e-9, "快照后花 50 → 估半额 0.75");
+        // 花费退回(重置/负增量)钳到 0 → 满额,不因时钟/重置乱跳。
+        assert!((m.balance_factor(1, 150.0) - 1.0).abs() < 1e-9, "负增量钳 0 → 满额");
+    }
+
+    /// 余额加权作为末位 tie-break 生效:两号同优先级/同健康/同在途 0/同 RPM 时,余额多的先选。
+    /// 旧代码无余额概念,两号完全并列靠 id 兜底(选 #1);新代码 #2 余额满、#1 半额 → 首取应是 #2。
+    #[tokio::test]
+    async fn test_balance_weight_breaks_tie_toward_richer() {
+        let manager = make_balanced_manager(2);
+        // 同优先级(make_balanced 给的是 0/1,改成都 0 才是真并列)——直接改 entries 优先级。
+        {
+            let mut entries = manager.entries.lock();
+            for e in entries.iter_mut() {
+                e.credentials.priority = 0;
+            }
+        }
+        // #1 半额(factor 0.75),#2 满额(factor 1.0)。其余全并列(在途 0、RPM 0、健康满)。
+        manager.set_balance_snapshots(HashMap::from([
+            (1, mk_bal_snap(50.0, 100.0, 0.0)),
+            (2, mk_bal_snap(100.0, 100.0, 0.0)),
+        ]));
+        // 首取(此刻两号在途都 0)→ 余额是唯一区分键 → 选余额多的 #2。
+        let g = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(g.id, 2, "全并列时余额多的 #2 应先选(余额末位 tie-break),实际 #{}", g.id);
+    }
+
+    /// 余额加权是软偏置微调,**不掀翻在途分流**:#1 余额耗尽但在途少、#2 满额但在途多,
+    /// 仍先选在途少的 #1(在途是第 4 位主键,余额只在第 6 位末位)。证明不打架 0.7.23。
+    #[tokio::test]
+    async fn test_balance_weight_does_not_override_inflight() {
+        let manager = make_balanced_manager(2);
+        {
+            let mut entries = manager.entries.lock();
+            for e in entries.iter_mut() {
+                e.credentials.priority = 0;
+            }
+        }
+        // #1 余额耗尽(factor 0.5),#2 满额(factor 1.0)。
+        manager.set_balance_snapshots(HashMap::from([
+            (1, mk_bal_snap(0.0, 100.0, 0.0)),
+            (2, mk_bal_snap(100.0, 100.0, 0.0)),
+        ]));
+        // 给 #2 压 3 个在途(直接改 inflight 原子,不走选号避免污染)。
+        {
+            let entries = manager.entries.lock();
+            let e2 = entries.iter().find(|e| e.id == 2).unwrap();
+            for _ in 0..3 {
+                e2.inflight.fetch_add(1, Ordering::Release);
+            }
+        }
+        // 选号:#1 在途 0、#2 在途 3。在途(第4位主键)先决 → 选 #1,尽管 #1 余额因子更低。
+        let g = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(g.id, 1, "在途少的 #1 应先选(在途主键压过余额末位键),实际 #{}", g.id);
     }
 
     /// T1(L2 回归,旧代码必挂):健康不对称下同优先级仍按负载分流,不被最健康的号吸走整轮。

@@ -539,6 +539,19 @@ pub struct ConfigSnapshotResponse {
     pub affinity_enabled: bool,
     /// 均衡模式下是否叠加优先级分发
     pub priority_in_balanced: bool,
+    // ---- 智能调度（0.7.23 headroom/背压 + 0.7.24 余额加权/429 感知，均立即生效）----
+    /// RPM headroom 系数（整百分比 0..100，85=预留 15%）
+    pub rpm_headroom_factor: u32,
+    /// RPM 预留名额（headroom 折扣后再扣 N）
+    pub rpm_reserve_slots: u32,
+    /// 整池 RPM 饱和时是否走背压等待（默认关）
+    pub rpm_hard_gate_overload_wait: bool,
+    /// 余额加权分流（默认开）：同档内按剩余额度微调选号，长期拉平号池余额
+    pub balance_weight_enabled: bool,
+    /// 余额加权 FLOOR（整百分比 0..100，50=因子下限 0.5，越小余额影响越强）
+    pub balance_weight_floor: u32,
+    /// 429/限速感知降权（默认开）：某号冒 429 经 EWMA 拉低健康分少被选
+    pub health_429_weight_enabled: bool,
     /// 是否配置了全局代理（不回传明文）
     pub has_proxy: bool,
     pub proxy_url: Option<String>,
@@ -609,6 +622,13 @@ pub struct UpdateConfigRequest {
     pub rate_limit_min_interval_ms: Option<u64>,
     pub affinity_enabled: Option<bool>,
     pub priority_in_balanced: Option<bool>,
+    // ---- 智能调度（立即生效热更）----
+    pub rpm_headroom_factor: Option<u32>,
+    pub rpm_reserve_slots: Option<u32>,
+    pub rpm_hard_gate_overload_wait: Option<bool>,
+    pub balance_weight_enabled: Option<bool>,
+    pub balance_weight_floor: Option<u32>,
+    pub health_429_weight_enabled: Option<bool>,
     /// 全局代理地址；传空字符串表示清除
     pub proxy_url: Option<String>,
     /// 全局代理认证用户名；出于安全前端不回显已存值，仅在非空时更新
@@ -775,6 +795,12 @@ mod tests {
             rate_limit_min_interval_ms: 1000,
             affinity_enabled: true,
             priority_in_balanced: false,
+            rpm_headroom_factor: 85,
+            rpm_reserve_slots: 0,
+            rpm_hard_gate_overload_wait: false,
+            balance_weight_enabled: true,
+            balance_weight_floor: 50,
+            health_429_weight_enabled: true,
             has_proxy: false,
             proxy_url: None,
             has_admin_key: false,

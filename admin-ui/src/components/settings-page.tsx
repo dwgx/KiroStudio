@@ -219,6 +219,13 @@ interface FormState {
   rateLimitMinIntervalMs: string
   affinityEnabled: boolean
   priorityInBalanced: boolean
+  // 智能调度（0.7.23/0.7.24，均热更即时生效）
+  rpmHeadroomFactor: string
+  rpmReserveSlots: string
+  rpmHardGateOverloadWait: boolean
+  balanceWeightEnabled: boolean
+  balanceWeightFloor: string
+  health429WeightEnabled: boolean
   proxyUrl: string
   proxyUsername: string
   proxyPassword: string
@@ -287,6 +294,12 @@ function toForm(c: ConfigSnapshotResponse, ui: UiLayoutPrefs): FormState {
     rateLimitMinIntervalMs: String(c.rateLimitMinIntervalMs),
     affinityEnabled: c.affinityEnabled,
     priorityInBalanced: c.priorityInBalanced,
+    rpmHeadroomFactor: String(c.rpmHeadroomFactor ?? 85),
+    rpmReserveSlots: String(c.rpmReserveSlots ?? 0),
+    rpmHardGateOverloadWait: c.rpmHardGateOverloadWait ?? false,
+    balanceWeightEnabled: c.balanceWeightEnabled ?? true,
+    balanceWeightFloor: String(c.balanceWeightFloor ?? 50),
+    health429WeightEnabled: c.health429WeightEnabled ?? true,
     proxyUrl: c.proxyUrl ?? '',
     // 代理账密出于安全后端不下发,UI 留空占位:留空=不改,填了=更新。
     proxyUsername: '',
@@ -1372,6 +1385,16 @@ export function SettingsPage() {
     if (Number.isFinite(interval) && interval !== config.rateLimitMinIntervalMs) d.rateLimitMinIntervalMs = interval
     if (form.affinityEnabled !== config.affinityEnabled) d.affinityEnabled = form.affinityEnabled
     if (form.priorityInBalanced !== config.priorityInBalanced) d.priorityInBalanced = form.priorityInBalanced
+    // 智能调度:整数字段解析后比对(空/非法回退当前值不发)。
+    const nHeadroom = parseInt(form.rpmHeadroomFactor, 10)
+    if (Number.isFinite(nHeadroom) && nHeadroom !== config.rpmHeadroomFactor) d.rpmHeadroomFactor = nHeadroom
+    const nReserve = parseInt(form.rpmReserveSlots, 10)
+    if (Number.isFinite(nReserve) && nReserve !== config.rpmReserveSlots) d.rpmReserveSlots = nReserve
+    if (form.rpmHardGateOverloadWait !== config.rpmHardGateOverloadWait) d.rpmHardGateOverloadWait = form.rpmHardGateOverloadWait
+    if (form.balanceWeightEnabled !== config.balanceWeightEnabled) d.balanceWeightEnabled = form.balanceWeightEnabled
+    const nFloor = parseInt(form.balanceWeightFloor, 10)
+    if (Number.isFinite(nFloor) && nFloor !== config.balanceWeightFloor) d.balanceWeightFloor = nFloor
+    if (form.health429WeightEnabled !== config.health429WeightEnabled) d.health429WeightEnabled = form.health429WeightEnabled
     if (form.proxyUrl.trim() !== (config.proxyUrl ?? '')) d.proxyUrl = form.proxyUrl.trim()
     // 代理账密:后端不下发(安全),故只在用户填了内容时才发送(留空=保持不变)。
     if (form.proxyUsername.trim() !== '') d.proxyUsername = form.proxyUsername.trim()
@@ -1628,6 +1651,90 @@ export function SettingsPage() {
               checked={form.priorityInBalanced}
               onCheckedChange={(v) => set('priorityInBalanced', v)}
               disabled={form.loadBalancingMode !== 'balanced'}
+            />
+          </Field>
+        </CardContent>
+      </Card>
+      </SectionGate>
+
+      {/* 智能调度分区（余额加权 / RPM headroom / 背压 / 429 感知，全部热更即时生效） */}
+      <SectionGate section="scheduling" title="智能调度" keywords={['余额加权', '智能调度', 'headroom', '预留', '背压', '429', '限速感知', 'balance', 'rpm']}>
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="text-base"><Highlight text="智能调度" /></CardTitle>
+        </CardHeader>
+        <CardContent className="py-0">
+          <p className="mb-3 mt-1 text-sm text-muted-foreground">
+            均衡模式下的动态分流策略。全部保存后立即生效（热更，无需重启）。默认配置已是良好动态化，
+            按需微调或一键关闭回退纯负载均衡。
+          </p>
+          <Field
+            label="余额加权分流"
+            hint="开启后:同优先级/同健康/同在途时,按各号剩余额度微调选号——余额多的略多用、少的略少用,长期把号池剩余额度拉平,不让某个号先耗干。软偏置不掀翻在途均分。"
+          >
+            <Switch
+              checked={form.balanceWeightEnabled}
+              onCheckedChange={(v) => set('balanceWeightEnabled', v)}
+            />
+          </Field>
+          <Field
+            label="余额加权强度 FLOOR"
+            hint="因子下限(整百分比 0-100)。50=满额号因子1.0、半额0.75、耗尽0.5(差10~20%微调)。越小余额影响越强;100=等于关闭加权。"
+          >
+            <NumberStepper
+              value={Number(form.balanceWeightFloor) || 0}
+              onChange={(v) => set('balanceWeightFloor', String(v))}
+              min={0}
+              max={100}
+              step={5}
+              className="w-28"
+              aria-label="余额加权 FLOOR"
+              disabled={!form.balanceWeightEnabled}
+            />
+          </Field>
+          <Field
+            label="429/限速感知降权"
+            hint="开启后:某号冒 429/被上游软限流时,经 EWMA 拉低其健康分→自动少分配给它,恢复后逐步放回。关闭则偶发 429 不影响分流。"
+          >
+            <Switch
+              checked={form.health429WeightEnabled}
+              onCheckedChange={(v) => set('health429WeightEnabled', v)}
+            />
+          </Field>
+          <Field
+            label="RPM headroom 系数"
+            hint="饱和阈值 = 上限 × 系数%(整百分比)。85=预留 15% 缓冲,让分流在撞上游硬限之前提前触发,削弱 60s 滑窗边界爆发。100=不打折(贴硬限)。"
+          >
+            <NumberStepper
+              value={Number(form.rpmHeadroomFactor) || 0}
+              onChange={(v) => set('rpmHeadroomFactor', String(v))}
+              min={0}
+              max={100}
+              step={5}
+              className="w-28"
+              aria-label="RPM headroom 系数"
+            />
+          </Field>
+          <Field
+            label="RPM 预留名额"
+            hint="在 headroom 折扣后再额外扣掉 N 个名额给突发留固定缓冲。0=不额外预留。与 headroom 叠加。"
+          >
+            <NumberStepper
+              value={Number(form.rpmReserveSlots) || 0}
+              onChange={(v) => set('rpmReserveSlots', String(v))}
+              min={0}
+              max={1000}
+              className="w-28"
+              aria-label="RPM 预留名额"
+            />
+          </Field>
+          <Field
+            label="整池饱和背压等待"
+            hint="⚠️进阶:开启后当整池 RPM 全饱和时,选号会在网关内等待最短恢复窗口而非立即回退软门。默认关(回退软门选最不坏的号继续,不阻塞)。"
+          >
+            <Switch
+              checked={form.rpmHardGateOverloadWait}
+              onCheckedChange={(v) => set('rpmHardGateOverloadWait', v)}
             />
           </Field>
         </CardContent>

@@ -742,7 +742,51 @@ impl AdminService {
             }
         }
 
+        // 回推余额快照给调度器(余额加权分流用)。用当前缓存的 remaining/effective_limit + 该号此刻的
+        // total_credits_used 作本地累加修正基线。号被删/禁用则不含在表里(调度侧缺表=中性因子1.0)。
+        self.push_balance_snapshots_to_scheduler();
+
         tracing::info!("后台温和余额刷新完成");
+    }
+
+    /// 把当前余额缓存 + 各号 total_credits_used 基线打包成 BalanceSnapshot 表,回推给调度器。
+    /// 供余额加权分流:remaining/effective_limit 归一成剩余比例,credits_used 作累加修正基线。
+    fn push_balance_snapshots_to_scheduler(&self) {
+        use crate::kiro::token_manager::BalanceSnapshot;
+        // 各号当前累计花费(本地实时,作累加修正基线)。
+        let used_by_id: std::collections::HashMap<u64, f64> = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .map(|e| (e.id, e.total_credits_used))
+            .collect();
+        let snaps: std::collections::HashMap<u64, BalanceSnapshot> = {
+            let cache = self.balance_cache.lock();
+            cache
+                .iter()
+                .filter_map(|(id, cb)| {
+                    let eff = if cb.data.effective_limit > 0.0 {
+                        cb.data.effective_limit
+                    } else {
+                        // 旧缓存可能无 effective_limit,回退 usage_limit(base)。<=0 则跳过(调度侧缺表=中性)。
+                        cb.data.usage_limit
+                    };
+                    if eff <= 0.0 {
+                        return None;
+                    }
+                    Some((
+                        *id,
+                        BalanceSnapshot {
+                            remaining_at_cache: cb.data.remaining,
+                            effective_limit: eff,
+                            credits_used_at_cache: used_by_id.get(id).copied().unwrap_or(0.0),
+                        },
+                    ))
+                })
+                .collect()
+        };
+        self.token_manager.set_balance_snapshots(snaps);
     }
 
     /// 重挂后台温和余额刷新任务（TIER2 热重载）。
@@ -1015,6 +1059,12 @@ impl AdminService {
             rate_limit_min_interval_ms: config.rate_limit_min_interval_ms,
             affinity_enabled: config.affinity_enabled,
             priority_in_balanced: config.priority_in_balanced,
+            rpm_headroom_factor: config.rpm_headroom_factor,
+            rpm_reserve_slots: config.rpm_reserve_slots,
+            rpm_hard_gate_overload_wait: config.rpm_hard_gate_overload_wait,
+            balance_weight_enabled: config.balance_weight_enabled,
+            balance_weight_floor: config.balance_weight_floor,
+            health_429_weight_enabled: config.health_429_weight_enabled,
             has_proxy: config.proxy_url.is_some(),
             proxy_url: config.proxy_url.clone(),
             has_admin_key: config
@@ -1301,6 +1351,47 @@ impl AdminService {
         if let Some(v) = req.priority_in_balanced {
             if v != config.priority_in_balanced {
                 config.priority_in_balanced = v;
+                hot_changed = true;
+            }
+        }
+        // ---- 智能调度(全部热更即时生效)。整百分比字段服务端 clamp 到 [0,100],不信任前端。----
+        if let Some(v) = req.rpm_headroom_factor {
+            let v = v.min(100);
+            if v != config.rpm_headroom_factor {
+                config.rpm_headroom_factor = v;
+                hot_changed = true;
+            }
+        }
+        if let Some(v) = req.rpm_reserve_slots {
+            // 预留名额上界防 u32 极值污染(远超真实 RPM 容量即无意义,100_000 与 rpm_limit 上界一致)。
+            let v = v.min(100_000);
+            if v != config.rpm_reserve_slots {
+                config.rpm_reserve_slots = v;
+                hot_changed = true;
+            }
+        }
+        if let Some(v) = req.rpm_hard_gate_overload_wait {
+            if v != config.rpm_hard_gate_overload_wait {
+                config.rpm_hard_gate_overload_wait = v;
+                hot_changed = true;
+            }
+        }
+        if let Some(v) = req.balance_weight_enabled {
+            if v != config.balance_weight_enabled {
+                config.balance_weight_enabled = v;
+                hot_changed = true;
+            }
+        }
+        if let Some(v) = req.balance_weight_floor {
+            let v = v.min(100);
+            if v != config.balance_weight_floor {
+                config.balance_weight_floor = v;
+                hot_changed = true;
+            }
+        }
+        if let Some(v) = req.health_429_weight_enabled {
+            if v != config.health_429_weight_enabled {
+                config.health_429_weight_enabled = v;
                 hot_changed = true;
             }
         }
