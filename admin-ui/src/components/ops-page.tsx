@@ -114,6 +114,17 @@ const METRIC_ITEMS: { key: keyof RecoveryMetrics; label: string; warn?: boolean 
   { key: 'textifiedInvokeHits', label: '文本化工具调用', warn: true },
 ]
 
+// 后端日志 ts 是 UTC RFC3339(带 Z)。转成浏览器本地时区的 HH:MM:SS.mmm 显示——
+// 此前直接 slice(11,23) 切原始字符串,展示的是 UTC 时分秒(比 +0900 慢 9 小时,看着像凌晨/上午)。
+// 解析失败(异常格式)回退原切片,绝不因单条坏时间戳整行崩。
+function formatLocalTime(ts: string): string {
+  const d = new Date(ts)
+  if (Number.isNaN(d.getTime())) return ts.slice(11, 23)
+  const p2 = (n: number) => String(n).padStart(2, '0')
+  const ms = String(d.getMilliseconds()).padStart(3, '0')
+  return `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}.${ms}`
+}
+
 function formatUptime(ms: number): string {
   const s = Math.floor(ms / 1000)
   const d = Math.floor(s / 86400)
@@ -1469,7 +1480,7 @@ function LogRow({
       onClick={onToggle}
       className="flex cursor-pointer gap-2 border-b border-[#161616] py-0.5 hover:bg-[#141414]"
     >
-      <span className="shrink-0 text-[#555]">{entry.ts.slice(11, 23)}</span>
+      <span className="shrink-0 text-[#555]" title={entry.ts}>{formatLocalTime(entry.ts)}</span>
       <span className={`shrink-0 font-semibold ${LEVEL_COLORS[entry.level] ?? 'text-[#888]'}`}>
         {entry.level.padEnd(5)}
       </span>
