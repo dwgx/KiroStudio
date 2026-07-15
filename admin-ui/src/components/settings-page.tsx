@@ -44,7 +44,7 @@ import { PageSkeleton } from '@/components/ui/page-skeleton'
 import { Checkbox } from '@/components/ui/checkbox'
 import { StatCard } from '@/components/ui/stat-card'
 import { useConfigSnapshot, useUpdateConfig, useCredentials } from '@/hooks/use-credentials'
-import { useRestartService, useStorageStats, useCleanupStorage, useCheckUpdate, usePerformUpdate } from '@/hooks/use-ops'
+import { useRestartService, useStorageStats, useCleanupStorage, useCheckUpdate, usePerformUpdate, useUpdateStatus } from '@/hooks/use-ops'
 import { useUsageClients } from '@/hooks/use-usage'
 import { useUiLayoutPrefs, type PoolSortMode, type CardSize, type UiLayoutPrefs } from '@/hooks/use-ui-layout-prefs'
 import {
@@ -441,6 +441,7 @@ function ServiceManagementCard() {
   // OTA 更新：检查 + 一键升级
   const { mutate: checkUpd, isPending: checking, data: updInfo } = useCheckUpdate()
   const { mutate: performUpd, isPending: upgrading } = usePerformUpdate()
+  const { data: updStatus } = useUpdateStatus()
   const [upgradeConfirm, setUpgradeConfirm] = useState(false)
 
   const handleConfirm = () => {
@@ -539,6 +540,24 @@ function ServiceManagementCard() {
                   </li>
                 ))}
               </ul>
+            </div>
+          )}
+          {/* OTA 升级/回滚观测:展示本版是否稳定确认、是否发生过回滚(后端 .health/.bak/*.failed 标记)。 */}
+          {updStatus && (
+            <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+              {updStatus.healthConfirmed ? (
+                <span className="text-emerald-500" title={updStatus.healthDetail ?? undefined}>
+                  ✓ 本版已稳定确认
+                </span>
+              ) : (
+                <span className="text-amber-500">⏳ 本版尚未确认稳定（升级后运行一段时间自动确认）</span>
+              )}
+              {updStatus.rollbackPointPresent && (
+                <span className="text-muted-foreground">回滚点仍在(可回退)</span>
+              )}
+              {updStatus.rolledBackBinaryPresent && (
+                <span className="text-red-400" title="守卫脚本曾执行过回滚">⚠ 检测到曾发生回滚</span>
+              )}
             </div>
           )}
         </div>
