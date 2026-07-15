@@ -220,6 +220,7 @@ interface FormState {
   toolRepairJson: boolean
   toolTruncationRecovery: boolean
   toolDescriptionMaxChars: string
+  encryptCredentialsAtRest: boolean
   cooldownEnabled: boolean
   rateLimitEnabled: boolean
   rateLimitDailyMax: string
@@ -287,6 +288,7 @@ function toForm(c: ConfigSnapshotResponse, ui: UiLayoutPrefs): FormState {
     toolRepairJson: c.toolRepairJson ?? true,
     toolTruncationRecovery: c.toolTruncationRecovery ?? false,
     toolDescriptionMaxChars: String(c.toolDescriptionMaxChars ?? 10000),
+    encryptCredentialsAtRest: c.encryptCredentialsAtRest ?? false,
     cooldownEnabled: c.cooldownEnabled,
     rateLimitEnabled: c.rateLimitEnabled,
     rateLimitDailyMax: String(c.rateLimitDailyMax),
@@ -1416,6 +1418,7 @@ export function SettingsPage() {
     if (form.toolTruncationRecovery !== (config.toolTruncationRecovery ?? false)) d.toolTruncationRecovery = form.toolTruncationRecovery
     const descMax = Number(form.toolDescriptionMaxChars)
     if (Number.isFinite(descMax) && descMax >= 0 && descMax !== (config.toolDescriptionMaxChars ?? 10000)) d.toolDescriptionMaxChars = descMax
+    if (form.encryptCredentialsAtRest !== (config.encryptCredentialsAtRest ?? false)) d.encryptCredentialsAtRest = form.encryptCredentialsAtRest
     if (form.cooldownEnabled !== config.cooldownEnabled) d.cooldownEnabled = form.cooldownEnabled
     if (form.rateLimitEnabled !== config.rateLimitEnabled) d.rateLimitEnabled = form.rateLimitEnabled
     const daily = Number(form.rateLimitDailyMax)
@@ -1899,6 +1902,15 @@ export function SettingsPage() {
           <CardTitle className="text-base"><Highlight text="反代安全" /></CardTitle>
         </CardHeader>
         <CardContent className="py-0">
+          <Field
+            label="凭据落盘加密"
+            hint="开启后 credentials.json / trash.json 用机器绑定密钥加密落盘（XChaCha20-Poly1305）。防文件被拷走/误传泄露 token。保存即时生效并立即重写文件；导出/导入走明文不受影响。⚠️换机器后密文解不开（需用明文备份重新导入，与 token 换机失效同理）。默认关。"
+          >
+            <Switch
+              checked={form.encryptCredentialsAtRest}
+              onCheckedChange={(v) => set('encryptCredentialsAtRest', v)}
+            />
+          </Field>
           <Field
             label="CORS 允许来源"
             hint="每行一个来源，如 https://app.example.com。留空=允许任意来源（公开 API，需重启生效）"
