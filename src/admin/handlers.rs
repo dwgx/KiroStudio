@@ -161,6 +161,130 @@ pub struct SetNameRequest {
     pub name: Option<String>,
 }
 
+/// POST /api/admin/proxy/test 请求体。
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyTestRequest {
+    /// 待测代理 URL；"direct"/空 表示测直连（不走代理）。可内嵌账密。
+    pub proxy_url: String,
+    /// 代理用户名（可选，未内嵌在 URL 时用）
+    #[serde(default)]
+    pub proxy_username: Option<String>,
+    /// 代理密码（可选）
+    #[serde(default)]
+    pub proxy_password: Option<String>,
+}
+
+/// POST /api/admin/proxy/test 响应体。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyTestResponse {
+    /// 是否连通成功
+    pub ok: bool,
+    /// 端到端耗时（毫秒）
+    pub latency_ms: u64,
+    /// 出口 IP（成功时从 ipify 返回），失败为 None
+    pub exit_ip: Option<String>,
+    /// 失败原因（成功为 None）
+    pub error: Option<String>,
+}
+
+/// 代理测活探针目标：**硬编码**的轻量 HTTPS 接口，返回 `{"ip":"..."}`。
+///
+/// SSRF 铁律：目标 URL 永远固定在此，绝不接受请求方传入——用户只能控制「用哪个代理」，
+/// 不能控制「访问哪个 URL」，杜绝把本网关当跳板打内网/元数据端点。
+const PROXY_TEST_PROBE_URL: &str = "https://api.ipify.org?format=json";
+
+/// POST /api/admin/proxy/test
+/// 通过指定代理（或直连）访问固定探针 URL，测连通性 + 出口 IP。
+///
+/// 无论代理是否可达，都以 HTTP 200 返回结构化结果（`ok=false` + `error` 描述失败），
+/// 不抛 500——让前端能稳定拿到"测活失败原因"而非通用错误页。
+pub async fn proxy_test(
+    State(state): State<AdminState>,
+    Json(payload): Json<ProxyTestRequest>,
+) -> impl IntoResponse {
+    use crate::http_client::{build_client, split_proxy_credentials, ProxyConfig};
+
+    let started = std::time::Instant::now();
+
+    // 拆出干净 URL 与内嵌账密；显式字段优先覆盖内嵌账密。
+    let (clean_url, embedded_user, embedded_pass) = split_proxy_credentials(&payload.proxy_url);
+    let is_direct = clean_url.is_empty() || clean_url.eq_ignore_ascii_case("direct");
+
+    let proxy_config = if is_direct {
+        None
+    } else {
+        let username = payload
+            .proxy_username
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .or(embedded_user);
+        let password = payload
+            .proxy_password
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or(embedded_pass);
+        let mut cfg = ProxyConfig::new(clean_url);
+        if let (Some(u), Some(p)) = (username, password) {
+            cfg = cfg.with_auth(u, p);
+        }
+        Some(cfg)
+    };
+
+    // 复用全局 TLS 后端 + http_client 构建助手；~10s 超时（连不上/超时都算失败）。
+    let client = match build_client(proxy_config.as_ref(), 10, state.service.tls_backend()) {
+        Ok(c) => c,
+        Err(e) => {
+            return Json(ProxyTestResponse {
+                ok: false,
+                latency_ms: started.elapsed().as_millis() as u64,
+                exit_ip: None,
+                error: Some(format!("构建代理客户端失败: {e}")),
+            })
+            .into_response();
+        }
+    };
+
+    // 目标固定为硬编码探针 URL（SSRF 防线：请求方无法左右访问目标）。
+    match client.get(PROXY_TEST_PROBE_URL).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let latency_ms = started.elapsed().as_millis() as u64;
+            if !status.is_success() {
+                return Json(ProxyTestResponse {
+                    ok: false,
+                    latency_ms,
+                    exit_ip: None,
+                    error: Some(format!("探针返回非 2xx 状态: {status}")),
+                })
+                .into_response();
+            }
+            // 解析 {"ip":"..."}；解析失败不影响连通性判定，仅 exit_ip 为 None。
+            let exit_ip = resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| v.get("ip").and_then(|ip| ip.as_str().map(|s| s.to_string())));
+            Json(ProxyTestResponse {
+                ok: true,
+                latency_ms,
+                exit_ip,
+                error: None,
+            })
+            .into_response()
+        }
+        Err(e) => Json(ProxyTestResponse {
+            ok: false,
+            latency_ms: started.elapsed().as_millis() as u64,
+            exit_ip: None,
+            // reqwest 错误可能含代理地址，保留原因文本便于诊断（不含用户密码，账密在 ProxyConfig 内）。
+            error: Some(format!("代理连通失败: {e}")),
+        })
+        .into_response(),
+    }
+}
+
 #[derive(serde::Deserialize)]
 pub struct SetProxyRequest {
     /// 代理 URL;传 null/空清除(回退全局),"direct" 表示强制不走代理
