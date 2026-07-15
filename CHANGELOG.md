@@ -2,6 +2,38 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.25] - 2026-07-15
+
+### 运维控制台大翻新(请求明细搜索 / 4 张明细卡 / 代理测活 / Region 复用 / 日志收缩 / OTA 流动日志)
+分两批多智能体流水线 fan-out 完成,每批主线复核 + build 验证。
+
+**后端新能力**:
+- **请求明细搜索端点** `GET /traces/search`:trace_db 加 `search(TraceFilter, limit, offset)` + `count_filtered`,
+  按 model/credential_id/client_ip(子串)/session_id/outcome/时间范围/全文(error_message/request_id/model)/
+  is_streaming 过滤,**全参数化防注入** + LIKE 元字符转义 + client_ip/session_id/outcome 索引,limit 上限 500,
+  返回 `{items, total}` 服务端分页。
+- **代理测活端点** `POST /proxy/test`:复用 `http_client::build_client`,走给定代理请求**硬编码 ipify 探测目标**
+  (SSRF 守卫,目标从不取自请求)测连通,返回 `{ok, latencyMs, exitIp, error}`;direct/失败均 HTTP 200 + ok:false。
+- **OTA step 日志**:`perform_update` 补 `[Update]` tracing(开始/下载完成/写入替换),配合已有镜像/sha256/替换日志。
+
+**前端运维页翻新**(admin-ui):
+- **实时日志可收缩展开**:AnimatedHeight 平滑折叠 + localStorage 持久化(SSE 流不卸载,日志继续累积);
+  日志按**浏览器本地时区**显示(原直接切 UTC 字符串致显示慢时区差);聚合运维卡挪到实时日志下。
+- **聚合运维 4 张明细卡**(存储分区加「查看」开高保真 Dialog):①请求明细(走 /traces/search 服务端搜索分页,
+  文本+模型+IP+outcome+session 过滤,行展开看全文,IP/device/session 可点联动过滤,上下页)②用量日志
+  (近 24h KPI + by-model/by-credential 聚合)③凭据回收站(恢复/永久清除,清除走确认)④登录背景图缓存
+  (全部缓存图缩略图网格,/admin/api/bg-cached?idx=N,lazy + hover zoom)。
+- **RegionSwitcher 共享组件**:凭据 region/profile 切换从 credential-card 抽出去重(-208 行),号池健康
+  「更多操作」面板**复用凭据管理页同款** UI;切换成功双刷 credentials + insights。
+- **ProxyTestButton 共享组件**:「测活」按钮接进**所有代理输入处**(号池更多操作/凭据卡/设置全局代理/
+  新增凭据/IdC/微软 SSO/网页上号各 dialog),显示延迟 + 出口 IP。
+- **允许模型白名单勾选动画**:label 卡片化 data-state 高亮 + 平滑过渡;checkbox 勾选态 scale 动画。
+- **OTA 流动日志**:检查更新/升级时实时日志自动展开 + 过滤到 `[Update]`,升级步骤日志流动显示
+  (复用现有 /logs/stream,不新建 SSE;重启后 2s 自动重连)。
+
+`cargo test --bin kirostudio` 与 `--no-default-features --locked` 各 **708 绿**;前端全构建通过。
+**暂缓**:指纹识别增强(动 ingress 热路径 + DB schema,dwgx 定单独版本稳扎)。
+
 ## [0.7.24] - 2026-07-15
 
 ### 余额加权动态调度 + 429 感知 + 全部智能调度项运维可配
