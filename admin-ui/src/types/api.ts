@@ -664,6 +664,28 @@ export interface RateLimitInsight {
   recent429: number
   /** 中文推断文案（如「#54 冷却中（速率限制）剩22s，已触发3次」「畅通」） */
   insightText: string
+  /** 真实熔断/健康快照（后端 HealthTracker）。无健康记录（从未被选过）时为 null，前端按缺省=满血处理。 */
+  health?: HealthSnapshot | null
+}
+
+/** 熔断器/健康只读快照（后端 HealthTracker，族级 family_key 共享）。 */
+export interface HealthSnapshot {
+  /** 熔断器是否 Open（完全拒流，等退避到期转半开） */
+  circuitOpen: boolean
+  /** 是否半开（试探性放行 admitProb 比例的流量） */
+  halfOpen: boolean
+  /** 半开期试探放行概率 [0,1]（Closed=1，Open=0） */
+  admitProb: number
+  /** 健康分 [0,1]（EWMA 成功率 × 429 惩罚） */
+  health: number
+  /** EWMA 成功率 [0,1] */
+  ewmaSuccess: number
+  /** EWMA 429 率 [0,1] */
+  ewma429: number
+  /** 连续 429 次数 */
+  consecutive429: number
+  /** 熔断剩余秒（Open 时 >0，其余为 0） */
+  openRemainingSecs: number
 }
 
 /** 上号智能诊断：后端错误响应 error.diagnosis 携带（归因+引导），前端渲染诊断卡片。 */

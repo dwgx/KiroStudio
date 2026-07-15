@@ -15,7 +15,8 @@ use parking_lot::Mutex;
 use serde::Serialize;
 
 /// 环形缓冲容量(条)。够覆盖一次故障排查的近期上下文,又不占大内存。
-const RING_CAPACITY: usize = 1000;
+/// 5000 条:每条 message 通常几百字节,~数 MB 上限,覆盖更长排障窗口(搜索/回溯需要历史)。
+const RING_CAPACITY: usize = 5000;
 /// broadcast 通道容量。订阅者跟不上时丢最旧(lagged),不阻塞日志写入。
 const BROADCAST_CAPACITY: usize = 256;
 
