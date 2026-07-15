@@ -208,6 +208,8 @@ interface FormState {
   ccAutoBuffer: boolean
   stripEnvNoise: boolean
   toolCleanLeakedTokens: boolean
+  toolReclaimTextifiedInvoke: boolean
+  toolStrayRepeatGuard: boolean
   toolStreamAlignFailure: boolean
   toolExposeErrorToClient: boolean
   toolRepairJson: boolean
@@ -283,6 +285,8 @@ function toForm(c: ConfigSnapshotResponse, ui: UiLayoutPrefs): FormState {
     ccAutoBuffer: c.ccAutoBuffer,
     stripEnvNoise: c.stripEnvNoise,
     toolCleanLeakedTokens: c.toolCleanLeakedTokens ?? true,
+    toolReclaimTextifiedInvoke: c.toolReclaimTextifiedInvoke ?? true,
+    toolStrayRepeatGuard: c.toolStrayRepeatGuard ?? true,
     toolStreamAlignFailure: c.toolStreamAlignFailure ?? true,
     toolExposeErrorToClient: c.toolExposeErrorToClient ?? true,
     toolRepairJson: c.toolRepairJson ?? true,
@@ -1371,6 +1375,8 @@ export function SettingsPage() {
     if (form.ccAutoBuffer !== config.ccAutoBuffer) d.ccAutoBuffer = form.ccAutoBuffer
     if (form.stripEnvNoise !== config.stripEnvNoise) d.stripEnvNoise = form.stripEnvNoise
     if (form.toolCleanLeakedTokens !== (config.toolCleanLeakedTokens ?? true)) d.toolCleanLeakedTokens = form.toolCleanLeakedTokens
+    if (form.toolReclaimTextifiedInvoke !== (config.toolReclaimTextifiedInvoke ?? true)) d.toolReclaimTextifiedInvoke = form.toolReclaimTextifiedInvoke
+    if (form.toolStrayRepeatGuard !== (config.toolStrayRepeatGuard ?? true)) d.toolStrayRepeatGuard = form.toolStrayRepeatGuard
     if (form.toolStreamAlignFailure !== (config.toolStreamAlignFailure ?? true)) d.toolStreamAlignFailure = form.toolStreamAlignFailure
     if (form.toolExposeErrorToClient !== (config.toolExposeErrorToClient ?? true)) d.toolExposeErrorToClient = form.toolExposeErrorToClient
     if (form.toolRepairJson !== (config.toolRepairJson ?? true)) d.toolRepairJson = form.toolRepairJson
@@ -1828,6 +1834,12 @@ export function SettingsPage() {
           </Field>
           <Field label="清洗泄漏控制 token" hint="清洗模型泄漏进文本行首的控制 token（course/課/count/care 粘连），保守只剥行首粘连不误删正文。默认开">
             <Switch checked={form.toolCleanLeakedTokens} onCheckedChange={(v) => set('toolCleanLeakedTokens', v)} />
+          </Field>
+          <Field label="文本化 invoke 重组（根治 court/Invalid tool parameters）" hint="模型把工具调用吐成 <invoke> 文本时，在四道安全门内（行首+非代码围栏+工具名已声明+完整闭合）重组为结构化 tool_use；修不了的碎片/截断安全当文本放过。移植 ZyphrZero 生产方案。默认开">
+            <Switch checked={form.toolReclaimTextifiedInvoke} onCheckedChange={(v) => set('toolReclaimTextifiedInvoke', v)} />
+          </Field>
+          <Field label="stray token 复读熔断" hint="call/count/card/court 连续独占行复读超阈值（32）截断本轮文本，治 Opus 退化刷屏耗尽 max_tokens + 污染历史。默认开">
+            <Switch checked={form.toolStrayRepeatGuard} onCheckedChange={(v) => set('toolStrayRepeatGuard', v)} />
           </Field>
           <Field label="截断跨轮恢复" hint="工具参数被上游真截断（缺整段值）且修复层也补不回时，不发半截参数，改置失败态让客户端重试整轮。会把截断从「发半截」变成「整轮失败重试」，改变对话流程，故默认关">
             <Switch checked={form.toolTruncationRecovery} onCheckedChange={(v) => set('toolTruncationRecovery', v)} />
