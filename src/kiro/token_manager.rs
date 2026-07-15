@@ -1304,6 +1304,26 @@ const MAX_TRANSIENT_WAIT_SECS: u64 = 20;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 
+/// 全池无立即可用候选时,一个候选为何在等待——决定调用方终态处理与文案类别。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitReason {
+    /// 冷却/风控/速率限制:典型秒~分钟级,长时应 fast-fail 让客户端退避。
+    Cooling,
+    /// RPM 饱和,滑窗过期即恢复(L4 背压):属"限流/繁忙"可重试类别,绝不报"已禁用"。
+    RpmRecovery,
+}
+
+/// select 返 None 时的等待判定结果(见 transient_wait_outcome)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitOutcome {
+    /// 无任何可用候选(全禁用/被硬门过滤)→ 终态报"已禁用"。
+    NoCandidate,
+    /// 存在立即可用候选(select 却返 None,竞态)→ 应重选,绝不 bail/等待。
+    Available,
+    /// 所有候选都在等待恢复:最短等待 + 原因。
+    Wait(StdDuration, WaitReason),
+}
+
 /// 模型级不支持黑名单的 TTL：某号对某模型返回 INVALID_MODEL_ID 后，这段时间内选号跳过
 /// "该号+该模型"组合。取中长窗（订阅权益变化是较慢的事），到期后自动允许重试探。
 const MODEL_BLOCK_TTL: StdDuration = StdDuration::from_secs(1800);
@@ -1950,20 +1970,30 @@ impl MultiTokenManager {
                 // L4:两趟选号。第一趟只在**非饱和**候选里选(硬门,RPM 成真天花板);
                 // 若整池饱和(第一趟空),按开关决定:false(默认)=回退软门对全体选"最不坏"(不阻塞,
                 // 保留旧行为);true=返回 None 让 acquire_context 走背压等待最短 RPM 恢复窗口。
-                let non_saturated: Vec<&CredentialEntry> = available
+                // 每个候选的排序键**只求值一次**快照到 (key, entry),再 min_by_key。
+                // 不用 min_by(闭包每次比较重算 sort_key):sort_key 读 inflight(无锁 fetch_update)、
+                // p_avail(独立 Mutex,锁外调用)等并发可变态,重算会让比较器非传递——中途某号被 429
+                // 降档时,已被早期淘汰的真最优号不会回来,偶发选到负载更高的号。快照后是稳定全序。
+                let non_saturated: Vec<_> = available
                     .iter()
                     .copied()
                     .filter(|e| !self.is_rpm_saturated_with_limit(e.id, e.credentials.rpm_limit))
+                    .map(|e| (sort_key(e), e))
                     .collect();
                 if !non_saturated.is_empty() {
-                    non_saturated.into_iter().min_by(|a, b| sort_key(a).cmp(&sort_key(b)))
+                    non_saturated.into_iter().min_by_key(|(k, _)| *k).map(|(_, e)| e)
                 } else if self.rpm_hard_gate_overload_wait.load(Ordering::Relaxed) {
                     // 整池饱和 + 背压开:返回 None,上游 acquire_context 等待恢复(受 MAX_TRANSIENT_WAIT 限)。
                     None
                 } else {
                     // 整池饱和 + 背压关(默认):回退软门,对全体选"最不坏"(排序键里 unusable/已用率会
-                    // 让最不坏的浮上来),不阻塞——保留旧行为,零回归。
-                    available.iter().copied().min_by(|a, b| sort_key(a).cmp(&sort_key(b)))
+                    // 让最不坏的浮上来),不阻塞——保留旧行为,零回归。同样单次求值快照。
+                    available
+                        .iter()
+                        .copied()
+                        .map(|e| (sort_key(e), e))
+                        .min_by_key(|(k, _)| *k)
+                        .map(|(_, e)| e)
                 }
             }
             _ => {
@@ -2031,14 +2061,20 @@ impl MultiTokenManager {
         true
     }
 
-    fn transient_wait_duration(&self, model: Option<&str>) -> Option<StdDuration> {
+    /// 全池无立即可用候选时的等待判定(带类型化原因,供调用方区分终态处理):
+    /// - `NoCandidate`:无任何可用候选(全禁用/被 opus/模型白名单等硬门过滤)→ 终态应报"已禁用"。
+    /// - `Available`:存在**立即可用**候选(select 却返 None,多为去饱和/并发释放的竞态)→ 应重选,绝不 bail。
+    /// - `Wait(dur, reason)`:所有候选都在等待恢复,取最短等待 + 其原因(Cooling=冷却/风控;RpmRecovery=
+    ///   RPM 饱和将恢复)。原因决定调用方是否 fast-fail、终态文案用哪类(RPM 饱和绝不报"已禁用")。
+    fn transient_wait_outcome(&self, model: Option<&str>) -> WaitOutcome {
         let is_opus = model
             .map(|m| m.to_lowercase().contains("opus"))
             .unwrap_or(false);
         let model_key = model.unwrap_or("");
         let entries = self.entries.lock();
         let mut has_candidate = false;
-        let mut waits = Vec::new();
+        let mut immediate_available = false;
+        let mut waits: Vec<(StdDuration, WaitReason)> = Vec::new();
 
         for entry in entries.iter() {
             if entry.disabled {
@@ -2056,14 +2092,14 @@ impl MultiTokenManager {
 
             if self.cooldown_enabled.load(Ordering::Relaxed) {
                 if let Some((_reason, remaining)) = self.cooldown.check_cooldown(entry.id) {
-                    waits.push(remaining);
+                    waits.push((remaining, WaitReason::Cooling));
                     continue;
                 }
             }
 
             if self.rate_limit_enabled.load(Ordering::Relaxed) {
                 if let Err(wait) = self.rate_limiter.check_rate_limit(entry.id) {
-                    waits.push(wait);
+                    waits.push((wait, WaitReason::Cooling));
                     continue;
                 }
             }
@@ -2080,22 +2116,28 @@ impl MultiTokenManager {
                     .map(|age| self.rpm.window().saturating_sub(age))
                     .unwrap_or_else(|| StdDuration::from_secs(1));
                 // 至少等 250ms,避免 0 等待空转;上限由外层 MAX_TRANSIENT_WAIT 兜底。
-                waits.push(recover.max(StdDuration::from_millis(250)));
+                waits.push((recover.max(StdDuration::from_millis(250)), WaitReason::RpmRecovery));
                 continue;
             }
 
-            // 注意：不再因 inflight「繁忙」而等待——inflight 不是阻塞门槛，
-            // 只要该号未禁用/未冷却/未限流，就是当下可选的候选（并发直接落它）。
-            // 走到这里说明有一个立即可用的候选，无需等待。
+            // 走到这里说明该号既未冷却/限流、也未被背压计为饱和 → 立即可用候选。
+            // inflight 绝不作为阻塞门槛(在途只进排序键,并发直接落它)。
+            immediate_available = true;
         }
 
         if !has_candidate {
-            return None;
+            return WaitOutcome::NoCandidate;
         }
-
-        // 只有当所有候选都在冷却/限流(将来会自动恢复)时才等待其中最短的那个；
-        // 若存在立即可用候选(waits 为空)则不等待。
-        waits.into_iter().min()
+        // 有立即可用候选(select 却返 None)= 竞态,应重选而非 bail/等待。
+        if immediate_available {
+            return WaitOutcome::Available;
+        }
+        // 所有候选都在等待:取最短,连同其原因返回。
+        match waits.into_iter().min_by_key(|(d, _)| *d) {
+            Some((d, reason)) => WaitOutcome::Wait(d, reason),
+            // has_candidate 但既非立即可用又无等待项:理论不可达,保守当竞态重选。
+            None => WaitOutcome::Available,
+        }
     }
 
     fn commit_selection(&self, entry: &CredentialEntry) -> (u64, KiroCredentials, InflightGuard) {
@@ -2136,7 +2178,10 @@ impl MultiTokenManager {
 
     /// 有效饱和阈值:per-cred(>0) > 全局(>0) > 默认高水位兜底(30),再应用 headroom 折扣。
     /// 恒 >0,保证分流生效。**优先级不破坏**:折扣作用在选定 base 之后,per_cred/global/兜底的选取不变。
-    fn effective_saturation_limit(&self, per_cred_limit: Option<u32>) -> u32 {
+    ///
+    /// pub:运维观测(ratelimit_insights)复用此真相源判饱和,避免 UI 侧重算不含 headroom 的阈值
+    /// 导致"调度早已硬门拦下、UI 仍显示畅通"的观测口径漂移。只读原子镜像,不锁 entries,可任意调用。
+    pub fn effective_saturation_limit(&self, per_cred_limit: Option<u32>) -> u32 {
         const SATURATION_FALLBACK_RPM: u32 = 30;
         let base = per_cred_limit
             .filter(|&v| v > 0)
@@ -2253,46 +2298,74 @@ impl MultiTokenManager {
                         *current_id = new_id;
                         (new_id, new_creds, guard)
                     } else {
-                        if let Some(wait) = self.transient_wait_duration(model) {
-                            // 全池快速失败(吸收 fork 做法):当最短恢复时间较长(>2s,典型是冷却/风控)时,
-                            // 不在网关内硬扛,立即带 retry_after_secs 透传,让客户端(Claude Code)自己退避重试。
-                            // 客户端退避比网关反复选号温和,也减少对被风控号的零星试探。
-                            // 只有"马上(≤2s)就能恢复"的瞬时繁忙才短等一下,避免把秒级抖动也甩给客户端。
-                            const FAST_FAIL_THRESHOLD: StdDuration = StdDuration::from_secs(2);
-                            if self.all_cooling_fast_fail.load(Ordering::Relaxed) && wait > FAST_FAIL_THRESHOLD {
+                        // 只有"马上(≤2s)就能恢复"的瞬时繁忙才短等一下,避免把秒级抖动也甩给客户端。
+                        const FAST_FAIL_THRESHOLD: StdDuration = StdDuration::from_secs(2);
+                        match self.transient_wait_outcome(model) {
+                            // 竞态:select 返 None 但此刻已有立即可用候选(去饱和/并发释放)→ 重选,绝不 bail。
+                            WaitOutcome::Available => continue,
+                            // 冷却/风控:长恢复窗口走 fast-fail(仅当 all_cooling_fast_fail 开),让客户端退避;
+                            // 否则网关内短等重试。
+                            WaitOutcome::Wait(wait, WaitReason::Cooling) => {
+                                if self.all_cooling_fast_fail.load(Ordering::Relaxed)
+                                    && wait > FAST_FAIL_THRESHOLD
+                                {
+                                    let retry_after = wait.as_secs().max(1);
+                                    let entries = self.entries.lock();
+                                    let available = entries.iter().filter(|e| !e.disabled).count();
+                                    drop(entries);
+                                    tracing::warn!(
+                                        "所有可用凭据均在冷却，最短恢复 {}s，快速返回 429+Retry-After 让客户端退避（不在网关内硬扛）",
+                                        retry_after
+                                    );
+                                    anyhow::bail!(
+                                        "所有凭据均在冷却（{}/{}）retry_after_secs={}",
+                                        available,
+                                        total,
+                                        retry_after
+                                    );
+                                }
+                                if wait_started.elapsed() < StdDuration::from_secs(MAX_TRANSIENT_WAIT_SECS) {
+                                    let w = wait.max(StdDuration::from_millis(250)).min(StdDuration::from_secs(2));
+                                    tracing::warn!("所有可用凭据暂时繁忙，短等 {:?} 后重试", w);
+                                    sleep(w).await;
+                                    continue;
+                                }
+                                // 冷却等待超总预算:带 retry_after 报可重试的"冷却"类别(非"已禁用")。
                                 let retry_after = wait.as_secs().max(1);
-                                let entries = self.entries.lock();
-                                let available = entries.iter().filter(|e| !e.disabled).count();
-                                drop(entries);
-                                tracing::warn!(
-                                    "所有可用凭据均在冷却，最短恢复 {}s，快速返回 429+Retry-After 让客户端退避（不在网关内硬扛）",
-                                    retry_after
-                                );
                                 anyhow::bail!(
-                                    "所有凭据均在冷却（{}/{}）retry_after_secs={}",
-                                    available,
+                                    "所有凭据均在冷却，等待超时（0/{}）retry_after_secs={}",
                                     total,
                                     retry_after
                                 );
                             }
-                            if wait_started.elapsed() < StdDuration::from_secs(MAX_TRANSIENT_WAIT_SECS) {
-                                let wait = wait
-                                    .max(StdDuration::from_millis(250))
-                                    .min(StdDuration::from_secs(2));
-                                tracing::warn!(
-                                    "所有可用凭据暂时繁忙，短等 {:?} 后重试",
-                                    wait
+                            // L4 背压:RPM 饱和将恢复。绝不 cooling-fast-fail、绝不报"已禁用"——网关内等到
+                            // 恢复窗口(受 MAX_TRANSIENT_WAIT 上限);超上限带 retry_after 报可重试的"繁忙"类别。
+                            WaitOutcome::Wait(wait, WaitReason::RpmRecovery) => {
+                                if wait_started.elapsed() < StdDuration::from_secs(MAX_TRANSIENT_WAIT_SECS) {
+                                    // RPM 恢复窗口可长达 ~60s,等待封顶到剩余总预算内,不空转也不超墙钟。
+                                    let remaining = StdDuration::from_secs(MAX_TRANSIENT_WAIT_SECS)
+                                        .saturating_sub(wait_started.elapsed());
+                                    let w = wait.max(StdDuration::from_millis(250)).min(remaining.max(StdDuration::from_millis(250)));
+                                    tracing::warn!("整池 RPM 饱和(背压),等待恢复窗口 {:?} 后重试", w);
+                                    sleep(w).await;
+                                    continue;
+                                }
+                                let retry_after = wait.as_secs().max(1);
+                                anyhow::bail!(
+                                    "整池 RPM 已饱和，等待恢复超时（{}/{}）retry_after_secs={}",
+                                    total,
+                                    total,
+                                    retry_after
                                 );
-                                sleep(wait).await;
-                                continue;
+                            }
+                            // 无任何可用候选(全禁用/硬门过滤):终态报"已禁用"。
+                            WaitOutcome::NoCandidate => {
+                                let entries = self.entries.lock();
+                                // 注意:必须在 bail! 之前算 available,available_count() 会再锁 entries 致死锁。
+                                let available = entries.iter().filter(|e| !e.disabled).count();
+                                anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
                             }
                         }
-                        let entries = self.entries.lock();
-                        // 注意：必须在 bail! 之前计算 available_count，
-                        // 因为 available_count() 会尝试获取 entries 锁，
-                        // 而此时我们已经持有该锁，会导致死锁
-                        let available = entries.iter().filter(|e| !e.disabled).count();
-                        anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
                     }
                 }
             };
@@ -6222,8 +6295,9 @@ mod tests {
         assert_eq!(total, 6, "两号各 3 次共 6,负载均摊到容量");
     }
 
-    /// T2b(L4 背压路径):背压开 + 整池 RPM 饱和时,transient_wait 返回 Some(恢复窗口),
-    /// 使 acquire_context 等待 RPM 恢复而非误判"所有凭据均已禁用"bail。背压关时饱和号不计等待。
+    /// T2b(L4 背压路径):背压开 + 整池 RPM 饱和时,transient_wait_outcome 返回
+    /// Wait(≤60s, RpmRecovery),使 acquire_context 等待 RPM 恢复而非误判"所有凭据均已禁用"bail。
+    /// 背压关时饱和号算立即可用候选 → Available(不等待,保持默认行为)。
     #[tokio::test]
     async fn test_l4_backpressure_waits_on_rpm_saturation() {
         let mut config = Config::default();
@@ -6241,16 +6315,50 @@ mod tests {
         manager.rpm.record(1);
         manager.rpm.record(1);
         assert!(manager.is_rpm_saturated(1), "应已饱和");
-        // 背压开:该号是"将恢复的等待候选",transient_wait 返回 Some(≤60s)。
-        let wait = manager.transient_wait_duration(None);
-        assert!(wait.is_some(), "背压开 + 饱和应返回等待时长(而非 None→误判全禁用)");
-        assert!(wait.unwrap() <= StdDuration::from_secs(60), "恢复窗口不超过 60s 窗口长度");
+        // 背压开:该号是"将恢复的等待候选",返回 Wait(≤60s, RpmRecovery)——原因是 RPM 恢复而非冷却,
+        // 调用方据此绝不 cooling-fast-fail、绝不报"已禁用"(D1 修复核心)。
+        match manager.transient_wait_outcome(None) {
+            WaitOutcome::Wait(d, reason) => {
+                assert_eq!(reason, WaitReason::RpmRecovery, "饱和的等待原因应是 RpmRecovery 而非 Cooling");
+                assert!(d <= StdDuration::from_secs(60), "恢复窗口不超过 60s 窗口长度");
+            }
+            other => panic!("背压开 + 饱和应返回 Wait(RpmRecovery),实际 {:?}", other),
+        }
 
-        // 对照:背压关时,饱和号仍算立即可用候选,不等待。
+        // 对照:背压关时,饱和号仍算立即可用候选 → Available(不等待,保持默认行为)。
         manager.rpm_hard_gate_overload_wait.store(false, Ordering::Relaxed);
-        assert!(
-            manager.transient_wait_duration(None).is_none(),
+        assert_eq!(
+            manager.transient_wait_outcome(None),
+            WaitOutcome::Available,
             "背压关:饱和号是立即可选候选,不等待(保持默认行为)"
+        );
+    }
+
+    /// D1 回归(旧代码上会失败):RPM 饱和的等待原因是 RpmRecovery(非 Cooling),确保调用方不会把
+    /// "整池 RPM 饱和"误当"全在冷却"而 cooling-fast-fail、也不会因去饱和竞态误报"已禁用"。
+    /// 旧实现 transient_wait_duration 返回无类型 Option<Duration>,冷却/RPM 饱和不可区分——本测坐实已分型。
+    #[tokio::test]
+    async fn test_l4_backpressure_wait_reason_is_rpm_not_cooling() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.affinity_enabled = false;
+        config.credential_rpm_limit = 2;
+        config.rpm_headroom_factor = 100;
+        config.rpm_hard_gate_overload_wait = true;
+        config.cooldown_enabled = true; // 冷却开着,但该号没被冷却——只是 RPM 饱和
+        let mut c = KiroCredentials::default();
+        c.access_token = Some("tok-1".to_string());
+        c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let manager = MultiTokenManager::new(config, vec![c], None, None, false).unwrap();
+        manager.rpm.record(1);
+        manager.rpm.record(1);
+        // 无冷却记录 → 若原因被误判为 Cooling,长窗口下会 cooling-fast-fail;分型后必为 RpmRecovery。
+        assert!(
+            matches!(
+                manager.transient_wait_outcome(None),
+                WaitOutcome::Wait(_, WaitReason::RpmRecovery)
+            ),
+            "未冷却、仅 RPM 饱和 → 等待原因必须是 RpmRecovery(不得误当 Cooling)"
         );
     }
 
