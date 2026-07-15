@@ -97,11 +97,9 @@ pub fn openai_chat_to_anthropic(model: &str, raw: &Value, stream: bool) -> Value
     out.insert("max_tokens".into(), json!(max_tokens));
     out.insert("stream".into(), json!(stream));
 
-    if let Some(tp) = raw.get("top_p").and_then(|v| v.as_f64()) {
-        out.insert("top_p".into(), json!(tp));
-    }
     // reasoning_effort → thinking(简化:开 enabled;none→disabled)。上游按 modelId 给窗口,budget 非必需。
-    // 先算出 thinking 是否开启,后面决定 temperature 是否透传(Anthropic thinking 模式只接受 temperature=1)。
+    // 先算出 thinking 是否开启,后面决定 temperature/top_p 是否透传(Anthropic thinking 模式只接受
+    // temperature=1 且不接受采样参数改写)。
     let mut thinking_enabled = false;
     if let Some(effort) = raw.get("reasoning_effort").and_then(|v| v.as_str()) {
         let e = effort.trim().to_lowercase();
@@ -113,11 +111,14 @@ pub fn openai_chat_to_anthropic(model: &str, raw: &Value, stream: bool) -> Value
         }
     }
 
-    // temperature:thinking 开启时**不透传**(Anthropic thinking 模式只接受 temperature=1,
-    // 透传客户端的非 1 值会让 Anthropic 兼容上游/透传路径 400)。thinking 关时正常透传。
+    // temperature/top_p:thinking 开启时**都不透传**(Anthropic thinking 模式只接受 temperature=1、
+    // 且不接受非默认 top_p/top_k,透传客户端的值会让 Anthropic 兼容上游/透传路径 400)。thinking 关时正常透传。
     if !thinking_enabled {
         if let Some(t) = raw.get("temperature").and_then(|v| v.as_f64()) {
             out.insert("temperature".into(), json!(clamp_anthropic_temperature(t)));
+        }
+        if let Some(tp) = raw.get("top_p").and_then(|v| v.as_f64()) {
+            out.insert("top_p".into(), json!(tp));
         }
     }
 
@@ -217,25 +218,28 @@ pub fn openai_chat_to_anthropic(model: &str, raw: &Value, stream: bool) -> Value
         }
     }
 
-    // tool_choice
-    if let Some(tc) = raw.get("tool_choice") {
-        match tc {
-            Value::String(s) => match s.as_str() {
-                "auto" => { out.insert("tool_choice".into(), json!({"type": "auto"})); }
-                "required" => { out.insert("tool_choice".into(), json!({"type": "any"})); }
-                // "none" = 客户端明确禁止调用工具 → 显式下发 {type:none},绝不能不设(不设=回落默认 auto,
-                // 模型仍可能调工具,违背客户端意图)。Kiro 转换层不认时会忽略,无害。
-                "none" => { out.insert("tool_choice".into(), json!({"type": "none"})); }
-                _ => {}
-            },
-            Value::Object(_) => {
-                if tc.get("type").and_then(|v| v.as_str()) == Some("function") {
-                    if let Some(name) = tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()) {
-                        out.insert("tool_choice".into(), json!({"type": "tool", "name": name}));
+    // tool_choice。⚠️ 仅当确实下发了 tools 才设:Anthropic 对「有 tool_choice 无 tools」400。
+    // 客户端可能发 tool_choice 但 tools 为空/全被过滤(非 function 类型),此时必须不下发 tool_choice。
+    if out.contains_key("tools") {
+        if let Some(tc) = raw.get("tool_choice") {
+            match tc {
+                Value::String(s) => match s.as_str() {
+                    "auto" => { out.insert("tool_choice".into(), json!({"type": "auto"})); }
+                    "required" => { out.insert("tool_choice".into(), json!({"type": "any"})); }
+                    // "none" = 客户端明确禁止调用工具 → 显式下发 {type:none},绝不能不设(不设=回落默认 auto,
+                    // 模型仍可能调工具,违背客户端意图)。Kiro 转换层不认时会忽略,无害。
+                    "none" => { out.insert("tool_choice".into(), json!({"type": "none"})); }
+                    _ => {}
+                },
+                Value::Object(_) => {
+                    if tc.get("type").and_then(|v| v.as_str()) == Some("function") {
+                        if let Some(name) = tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()) {
+                            out.insert("tool_choice".into(), json!({"type": "tool", "name": name}));
+                        }
                     }
                 }
+                _ => {}
             }
-            _ => {}
         }
     }
 
@@ -589,13 +593,14 @@ pub fn openai_responses_to_anthropic(model: &str, raw: &Value, stream: bool) -> 
             thinking_enabled = true;
         }
     }
+    // temperature/top_p:同 chat 路径,thinking 开启时都不透传(Anthropic thinking 模式约束),防透传路径 400。
     if !thinking_enabled {
         if let Some(t) = raw.get("temperature").and_then(|v| v.as_f64()) {
             out.insert("temperature".into(), json!(clamp_anthropic_temperature(t)));
         }
-    }
-    if let Some(tp) = raw.get("top_p").and_then(|v| v.as_f64()) {
-        out.insert("top_p".into(), json!(tp));
+        if let Some(tp) = raw.get("top_p").and_then(|v| v.as_f64()) {
+            out.insert("top_p".into(), json!(tp));
+        }
     }
 
     // system:instructions 顶层字段(Responses 惯例)。
@@ -627,26 +632,37 @@ pub fn openai_responses_to_anthropic(model: &str, raw: &Value, stream: bool) -> 
                             messages.push(msg);
                         }
                     }
-                    "function_call" => {
+                    // function_call(arguments=JSON 字符串)与 custom_tool_call(input=自由字符串,
+                    // Codex 的 apply_patch 类自定义工具走这个)都翻成 assistant tool_use。
+                    // 区别:function_call 的 arguments 期望是 JSON object;custom_tool_call 的 input 可能是
+                    // 非 JSON 的自由文本 → 非 object 时包成 {"input": <原文>} 保住内容(Anthropic input 必须 object)。
+                    "function_call" | "custom_tool_call" => {
                         let call_id = item
                             .get("call_id")
                             .and_then(|v| v.as_str())
                             .map(sanitize_tool_id)
                             .unwrap_or_else(gen_tool_call_id);
                         let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                        let input = item
+                        // function_call 用 arguments、custom_tool_call 用 input。
+                        let raw_args = item
                             .get("arguments")
+                            .or_else(|| item.get("input"))
                             .and_then(|v| v.as_str())
-                            .filter(|s| !s.is_empty())
-                            .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                            .filter(|v| v.is_object())
-                            .unwrap_or_else(|| json!({}));
+                            .filter(|s| !s.is_empty());
+                        let input = match raw_args.and_then(|s| serde_json::from_str::<Value>(s).ok()) {
+                            Some(v) if v.is_object() => v,
+                            // 非 JSON object(自由文本/JSON 标量)→ 包进 {"input": ...} 保内容不丢。
+                            _ => match raw_args {
+                                Some(s) => json!({"input": s}),
+                                None => json!({}),
+                            },
+                        };
                         messages.push(json!({
                             "role": "assistant",
                             "content": [{"type": "tool_use", "id": call_id, "name": name, "input": input}]
                         }));
                     }
-                    "function_call_output" => {
+                    "function_call_output" | "custom_tool_call_output" => {
                         let call_id = item
                             .get("call_id")
                             .and_then(|v| v.as_str())
@@ -688,22 +704,25 @@ pub fn openai_responses_to_anthropic(model: &str, raw: &Value, stream: bool) -> 
     }
 
     // tool_choice(Responses 同 chat:字符串 auto/required/none 或 {type:function,name})。
-    if let Some(tc) = raw.get("tool_choice") {
-        match tc {
-            Value::String(s) => match s.as_str() {
-                "auto" => { out.insert("tool_choice".into(), json!({"type": "auto"})); }
-                "required" => { out.insert("tool_choice".into(), json!({"type": "any"})); }
-                "none" => { out.insert("tool_choice".into(), json!({"type": "none"})); }
-                _ => {}
-            },
-            Value::Object(_) => {
-                if tc.get("type").and_then(|v| v.as_str()) == Some("function") {
-                    if let Some(name) = tc.get("name").and_then(|v| v.as_str()) {
-                        out.insert("tool_choice".into(), json!({"type": "tool", "name": name}));
+    // ⚠️ 同 chat:仅当确实下发 tools 才设,防 Anthropic「有 tool_choice 无 tools」400。
+    if out.contains_key("tools") {
+        if let Some(tc) = raw.get("tool_choice") {
+            match tc {
+                Value::String(s) => match s.as_str() {
+                    "auto" => { out.insert("tool_choice".into(), json!({"type": "auto"})); }
+                    "required" => { out.insert("tool_choice".into(), json!({"type": "any"})); }
+                    "none" => { out.insert("tool_choice".into(), json!({"type": "none"})); }
+                    _ => {}
+                },
+                Value::Object(_) => {
+                    if tc.get("type").and_then(|v| v.as_str()) == Some("function") {
+                        if let Some(name) = tc.get("name").and_then(|v| v.as_str()) {
+                            out.insert("tool_choice".into(), json!({"type": "tool", "name": name}));
+                        }
                     }
                 }
+                _ => {}
             }
-            _ => {}
         }
     }
 
@@ -1344,9 +1363,11 @@ impl ResponsesStreamConverter {
                 let status = if self.stop_reason == "max_tokens" { "incomplete" } else { "completed" };
                 let output = self.build_output();
                 let s = self.next_seq();
+                // 骨架补全 background:false / error:null(Codex 严格解析器期望完整骨架,见参考 response.go)。
                 let mut resp = json!({
                     "id": self.response_id, "object": "response", "created_at": self.created,
-                    "status": status, "model": self.model, "output": output,
+                    "status": status, "background": false, "error": Value::Null,
+                    "model": self.model, "output": output,
                     "usage": {"input_tokens": p, "output_tokens": c, "total_tokens": t,
                         "input_tokens_details": {"cached_tokens": cached}}
                 });
@@ -1521,8 +1542,10 @@ pub fn aggregate_responses(model: &str, events: &[Value]) -> Value {
     let (p, c, t, cached) = usage.openai();
     let status = if stop_reason == "max_tokens" { "incomplete" } else { "completed" };
     let id = if response_id.is_empty() { gen_responses_id("resp") } else { response_id };
+    // 骨架补全 background:false / error:null(与流式 response.completed 对齐,Codex 期望完整骨架)。
     let mut resp = json!({
-        "id": id, "object": "response", "created_at": created, "status": status, "model": model,
+        "id": id, "object": "response", "created_at": created, "status": status,
+        "background": false, "error": Value::Null, "model": model,
         "output": output,
         "usage": {"input_tokens": p, "output_tokens": c, "total_tokens": t, "input_tokens_details": {"cached_tokens": cached}}
     });
@@ -1648,8 +1671,12 @@ mod tests {
 
     #[test]
     fn test_request_tool_choice_mapping() {
+        // tool_choice 只在有 tools 时才下发,故构造时带一个 tool。
         let mk = |tc: Value| {
-            let raw = json!({"model": "m", "messages": [], "tool_choice": tc});
+            let raw = json!({
+                "model": "m", "messages": [], "tool_choice": tc,
+                "tools": [{"type": "function", "function": {"name": "f"}}]
+            });
             openai_chat_to_anthropic("m", &raw, false)
         };
         assert_eq!(mk(json!("auto"))["tool_choice"]["type"], "auto");
@@ -1934,6 +1961,109 @@ mod tests {
         let instr = a["system"][0]["text"].as_str().unwrap();
         assert!(instr.contains("Weather"), "指令带 schema 名");
         assert!(instr.contains("\"temp\""), "指令内嵌 schema 内容");
+    }
+
+    #[test]
+    fn test_request_top_p_dropped_when_thinking_enabled() {
+        // 回归(review):thinking 开启时 top_p 也不透传(与 temperature 同,Anthropic thinking 模式
+        // 不接受非默认采样参数,透传路径 400)。此前只 gate 了 temperature、漏了 top_p。
+        let raw = json!({"model": "m", "messages": [], "reasoning_effort": "high", "top_p": 0.9, "temperature": 0.5});
+        let a = openai_chat_to_anthropic("m", &raw, false);
+        assert_eq!(a["thinking"]["type"], "enabled");
+        assert!(a.get("top_p").is_none(), "thinking 开时不应透传 top_p");
+        assert!(a.get("temperature").is_none(), "thinking 开时不应透传 temperature");
+        // thinking 关时 top_p 正常透传。
+        let raw2 = json!({"model": "m", "messages": [], "top_p": 0.9});
+        assert_eq!(openai_chat_to_anthropic("m", &raw2, false)["top_p"], 0.9);
+        // responses 路径同样 gate。
+        let raw3 = json!({"model": "m", "input": "x", "reasoning": {"effort": "high"}, "top_p": 0.5});
+        let a3 = openai_responses_to_anthropic("m", &raw3, false);
+        assert!(a3.get("top_p").is_none(), "responses thinking 开时不应透传 top_p");
+    }
+
+    #[test]
+    fn test_request_tool_choice_dropped_without_tools() {
+        // 回归(review):tool_choice 无 tools 时不下发(Anthropic「有 tool_choice 无 tools」400)。
+        // 客户端发 tool_choice 但无 tools。
+        let raw = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}], "tool_choice": "auto"});
+        let a = openai_chat_to_anthropic("m", &raw, false);
+        assert!(a.get("tool_choice").is_none(), "无 tools 时不应下发 tool_choice");
+        assert!(a.get("tools").is_none());
+        // tools 全被过滤(非 function 类型)→ 同样不下发 tool_choice。
+        let raw2 = json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": "required", "tools": [{"type": "code_interpreter"}]
+        });
+        let a2 = openai_chat_to_anthropic("m", &raw2, false);
+        assert!(a2.get("tools").is_none(), "非 function 工具被过滤");
+        assert!(a2.get("tool_choice").is_none(), "工具全过滤后不下发 tool_choice");
+        // responses 路径同样。
+        let raw3 = json!({"model": "m", "input": "hi", "tool_choice": "auto"});
+        let a3 = openai_responses_to_anthropic("m", &raw3, false);
+        assert!(a3.get("tool_choice").is_none(), "responses 无 tools 时不下发 tool_choice");
+    }
+
+    #[test]
+    fn test_responses_custom_tool_call_maps_to_tool_use() {
+        // Codex 用 custom_tool_call/custom_tool_call_output(apply_patch 类自定义工具),需与
+        // function_call 一样翻成 tool_use/tool_result。input 是自由文本(非 JSON object)→ 包进 {"input":...}。
+        let raw = json!({
+            "model": "m",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "patch it"}]},
+                {"type": "custom_tool_call", "call_id": "ct1", "name": "apply_patch", "input": "*** Begin Patch\n..."},
+                {"type": "custom_tool_call_output", "call_id": "ct1", "output": "applied"}
+            ]
+        });
+        let a = openai_responses_to_anthropic("m", &raw, false);
+        let msgs = a["messages"].as_array().unwrap();
+        let tu = msgs[1]["content"].as_array().unwrap().iter().find(|b| b["type"] == "tool_use").unwrap();
+        assert_eq!(tu["id"], "ct1");
+        assert_eq!(tu["name"], "apply_patch");
+        // 自由文本 input 包进 {"input": <原文>}(Anthropic input 必须 object)。
+        assert_eq!(tu["input"]["input"], "*** Begin Patch\n...");
+        // output → tool_result
+        assert_eq!(msgs[2]["content"][0]["type"], "tool_result");
+        assert_eq!(msgs[2]["content"][0]["tool_use_id"], "ct1");
+        assert_eq!(msgs[2]["content"][0]["content"], "applied");
+        // custom_tool_call 的 input 若恰是合法 JSON object,则原样用(不套壳)。
+        let raw2 = json!({"model": "m", "input": [
+            {"type": "custom_tool_call", "call_id": "c2", "name": "f", "input": "{\"k\":1}"},
+            {"type": "custom_tool_call_output", "call_id": "c2", "output": "ok"}
+        ]});
+        let a2 = openai_responses_to_anthropic("m", &raw2, false);
+        // 首条 assistant(tool_use)会被 normalize 补空 user 打头,故跨消息找 tool_use。
+        let tu2 = a2["messages"].as_array().unwrap().iter()
+            .flat_map(|m| m["content"].as_array().cloned().unwrap_or_default())
+            .find(|b| b["type"] == "tool_use").unwrap();
+        assert_eq!(tu2["input"]["k"], 1, "合法 JSON object input 原样用");
+    }
+
+    #[test]
+    fn test_responses_completed_skeleton_has_background_and_error() {
+        // Codex 严格解析器期望 response.completed 完整骨架(background:false + error:null)。
+        // 流式:
+        let mut conv = ResponsesStreamConverter::new("m");
+        conv.push_event(&json!({"type": "message_start", "message": {"id": "r1"}}));
+        conv.push_event(&json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}));
+        conv.push_event(&json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hi"}}));
+        conv.push_event(&json!({"type": "content_block_stop", "index": 0}));
+        let done = conv.push_event(&json!({"type": "message_stop"}));
+        let resp = &done[0].1["response"];
+        assert_eq!(resp["background"], false);
+        assert!(resp["error"].is_null());
+        assert_eq!(resp["status"], "completed");
+        // 非流式:
+        let events = vec![
+            json!({"type": "message_start", "message": {"id": "r2"}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "x"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+        ];
+        let r = aggregate_responses("m", &events);
+        assert_eq!(r["background"], false);
+        assert!(r["error"].is_null());
     }
 
     #[test]
