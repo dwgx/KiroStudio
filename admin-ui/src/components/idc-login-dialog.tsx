@@ -10,6 +10,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { NumberStepper } from '@/components/ui/number-stepper'
+import { ProxyTestButton } from '@/components/proxy-test-button'
 import { startIdcLogin, pollIdcLogin } from '@/api/credentials'
 import { CheckCircle2 } from 'lucide-react'
 import { copyToClipboard, extractErrorMessage, extractDiagnosis } from '@/lib/utils'
@@ -220,13 +221,17 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialog
               <label className="text-sm font-medium" htmlFor="idcProxy">
                 代理（可选）
               </label>
-              <Input
-                id="idcProxy"
-                value={proxyUrl}
-                onChange={(e) => setProxyUrl(e.target.value)}
-                placeholder="留空使用全局代理"
-                disabled={isStarting}
-              />
+              <div className="flex items-center gap-2">
+                <Input
+                  id="idcProxy"
+                  className="flex-1"
+                  value={proxyUrl}
+                  onChange={(e) => setProxyUrl(e.target.value)}
+                  placeholder="留空使用全局代理"
+                  disabled={isStarting}
+                />
+                <ProxyTestButton proxyUrl={proxyUrl} />
+              </div>
             </div>
             {diagnosis && <DiagnosisCard diagnosis={diagnosis} />}
           </div>

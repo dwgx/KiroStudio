@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { Settings, RefreshCw, Wallet, Trash2, Loader2, ClipboardCopy, ShieldAlert, Gauge, Check, Ban, Power, Globe, CheckCircle2, XCircle } from 'lucide-react'
+import { Settings, RefreshCw, Wallet, Trash2, Loader2, ClipboardCopy, ShieldAlert, Gauge, Check, Ban, Power } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -10,7 +10,8 @@ import { Switch } from '@/components/ui/switch'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Skeleton } from '@/components/ui/skeleton'
 import { NumberStepper } from '@/components/ui/number-stepper'
-import { RegionSelect } from '@/components/ui/region-select'
+import { RegionSwitcher } from '@/components/region-switcher'
+import { ProxyTestButton } from '@/components/proxy-test-button'
 import {
   Dialog,
   DialogContent,
@@ -19,10 +20,10 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import type { CredentialStatusItem, BalanceResponse, CredentialRegionProfile, OnboardingDiagnosis } from '@/types/api'
+import type { CredentialStatusItem, BalanceResponse, OnboardingDiagnosis } from '@/types/api'
 import { cn, copyToClipboard, extractErrorMessage, extractDiagnosis } from '@/lib/utils'
 import { DiagnosisCard } from '@/components/diagnosis-card'
-import { enableOverage, disableOverage, setCredentialName, setCredentialProxy, probeCredentialRegions, switchProfileRegion } from '@/api/credentials'
+import { enableOverage, disableOverage, setCredentialName, setCredentialProxy } from '@/api/credentials'
 import { authShortLabel, disabledReasonLabel, subscriptionLabel } from '@/lib/i18n-labels'
 import {
   useSetDisabled,
@@ -35,7 +36,6 @@ import {
   useCachedBalances,
 } from '@/hooks/use-credentials'
 import { useCtrlHeld } from '@/hooks/use-ctrl-held'
-import { regionLabel } from '@/lib/regions'
 
 interface CredentialCardProps {
   credential: CredentialStatusItem
@@ -138,13 +138,8 @@ export function CredentialCard({
   const [customResetCount, setCustomResetCount] = useState(false)
   const [savingCustomApi, setSavingCustomApi] = useState(false)
 
-  // Profile ARN 区域切换(齿轮设置内):探测该账号各 region 的 profile,卡片式列表选一个切过去。
-  const [regions, setRegions] = useState<CredentialRegionProfile[] | null>(null)
-  const [regionsLoading, setRegionsLoading] = useState(false)
-  const [regionsError, setRegionsError] = useState<string | null>(null)
-  const [switchingArn, setSwitchingArn] = useState<string | null>(null)
+  // 刷新 Token 失败诊断（结构化，如 client 过期引导重新上号）。
   const [refreshDiagnosis, setRefreshDiagnosis] = useState<OnboardingDiagnosis | null>(null)
-  const [customRegion, setCustomRegion] = useState('')
 
   const queryClient = useQueryClient()
   // 是否按住 Ctrl/Cmd:按住时卡片显示可点击手型 + 左键即多选(松开则普通左键不选中)
@@ -316,72 +311,6 @@ export function CredentialCard({
     })
   }
 
-  // 探测该账号各 region 的 profile（切 Profile ARN 用）。实时 notification 反馈探测过程：
-  // 开始「探测中」→ 找到即报可用数量 / 没找到给详细错误报告（不吞成裸失败）。
-  const loadRegions = async () => {
-    setRegionsLoading(true)
-    setRegionsError(null)
-    const pending = toast.loading('正在探测各区域 profile…')
-    try {
-      const res = await probeCredentialRegions(credential.id)
-      const list = res.regions ?? []
-      setRegions(list)
-      const usableCount = list.filter((r) => r.usable).length
-      if (usableCount > 0) {
-        toast.success(`探测完成：找到 ${usableCount} 个可用区域（共 ${list.length} 个）`, { id: pending })
-      } else if (list.length > 0) {
-        toast.warning(`探测完成：${list.length} 个区域均不可用（未开通/验活失败）`, { id: pending })
-      } else {
-        toast.warning('探测完成：未找到任何 region profile', { id: pending })
-      }
-    } catch (err) {
-      // 详细错误报告：把后端 bail 的具体原因透传到卡片红框 + toast，不是裸 502。
-      const msg = extractErrorMessage(err)
-      setRegionsError(msg)
-      setRegions(null)
-      toast.error('探测失败：' + msg, { id: pending })
-    } finally {
-      setRegionsLoading(false)
-    }
-  }
-
-  // 切换当前使用的 Profile ARN（切区域，非改全局 region）。成功后刷新列表 + 重新探测标记当前项。
-  const handleSwitchRegion = async (arn: string) => {
-    setSwitchingArn(arn)
-    try {
-      const res = await switchProfileRegion(credential.id, arn)
-      queryClient.invalidateQueries({ queryKey: ['credentials'] })
-      toast.success(res.message || '已切换 Profile ARN，下次请求生效')
-      await loadRegions()
-    } catch (err) {
-      const diag = extractDiagnosis(err)
-      toast.error('切换失败: ' + (diag ? diag.summary : extractErrorMessage(err)))
-    } finally {
-      setSwitchingArn(null)
-    }
-  }
-
-  // 自定义 region 切换：用户手填 region，用当前号的 account 构造 ARN 直接切过去（绕候选表，
-  // 覆盖冷门 region）。account 从已探测候选或当前 profileArn 提取；构造后走同一 switch（验活可用才生效）。
-  const handleCustomRegionSwitch = async () => {
-    const region = customRegion.trim()
-    if (!region) {
-      toast.error('请输入 region（如 eu-central-1）')
-      return
-    }
-    // 前端拿不到原始 ARN（安全:只暴露 hasProfileArn），故 account/profile 名从**已探测候选**取。
-    // 需先「探测区域」拿到至少一个候选,才能构造同账号的其它 region ARN。
-    const sample = regions?.find((r) => r.account && r.arn)
-    if (!sample) {
-      toast.error('请先点「探测区域」——需要一个已知 profile 才能构造自定义 region 的 ARN')
-      return
-    }
-    // 构造 ARN：arn:aws:codewhisperer:{region}:{account}:{profileSeg}（同账号同 profile 名，换 region）。
-    const profileSeg = sample.arn.split(':').slice(5).join(':')
-    const arn = `arn:aws:codewhisperer:${region}:${sample.account}:${profileSeg}`
-    await handleSwitchRegion(arn)
-  }
-
   const handleForceRefresh = () => {
     setRefreshDiagnosis(null)
     forceRefresh.mutate(credential.id, {
@@ -495,8 +424,6 @@ export function CredentialCard({
     e.preventDefault()
     setPriorityValue(credential.priority)
     setNameValue(credential.name ?? '')
-    setRegions(null)
-    setRegionsError(null)
     setShowSettings(true)
   }
 
@@ -633,8 +560,6 @@ export function CredentialCard({
                 setPriorityValue(credential.priority)
                 setRpmLimitValue(credential.rpmLimit ?? 0)
                 setNameValue(credential.name ?? '')
-                setRegions(null)
-                setRegionsError(null)
                 setShowSettings(true)
               }}
               title="设置（优先级 / RPM / Profile ARN / 启用 / 删除）"
@@ -971,6 +896,12 @@ export function CredentialCard({
                   className="h-9 font-mono text-xs"
                   aria-label="代理 URL"
                 />
+                <ProxyTestButton
+                  proxyUrl={proxyValue}
+                  proxyUsername={proxyUser}
+                  proxyPassword={proxyPass}
+                  className="h-9 shrink-0"
+                />
                 <Button
                   size="sm"
                   className="h-9 shrink-0"
@@ -1140,117 +1071,18 @@ export function CredentialCard({
             {/* Profile ARN 区域切换：列出该账号各 region 的 profile，卡片式单选列表展示每个 region 的
                 ARN + 是否可用 + 订阅等级，选中即切过去（切对话走哪个上游 profile/端点，非改全局 region）。
                 external_idp（多 region profile 选择）+ idc（通常单 region，用于确认/重新解析 profileArn）
-                显示；social/api_key/custom_api 无 profile 概念不显示。后端 probe_regions_for 已放开到
-                external_idp||idc。 */}
+                显示；social/api_key/custom_api 无 profile 概念不显示。逻辑抽到共享 RegionSwitcher，与运维页复用同款。 */}
             {canProbeRegion && (
             <div className="space-y-2 border-t pt-4">
-              <div className="flex items-center justify-between gap-2">
-                <div className="min-w-0">
-                  <div className="text-sm font-medium">Profile ARN 区域</div>
-                  <div className="text-xs text-muted-foreground">
-                    {isIdc
-                      ? 'IdC 实例通常绑定单一区域，探测用于确认/重新解析该号 profileArn（一般只返回一个区域）。'
-                      : '切换此号对话走哪个区域的 profile（非改全局 region）。下次请求生效。'}
-                  </div>
+              <div className="min-w-0">
+                <div className="text-sm font-medium">Profile ARN 区域</div>
+                <div className="text-xs text-muted-foreground">
+                  {isIdc
+                    ? 'IdC 实例通常绑定单一区域，探测用于确认/重新解析该号 profileArn（一般只返回一个区域）。'
+                    : '切换此号对话走哪个区域的 profile（非改全局 region）。下次请求生效。'}
                 </div>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-8 shrink-0 px-2.5"
-                  onClick={loadRegions}
-                  disabled={regionsLoading}
-                  title="探测该账号各区域的 profile"
-                >
-                  {regionsLoading ? (
-                    <Loader2 className="mr-1 h-4 w-4 animate-spin" />
-                  ) : (
-                    <Globe className="mr-1 h-4 w-4" />
-                  )}
-                  {regions === null ? '探测区域' : '重新探测'}
-                </Button>
               </div>
-              {regionsError && (
-                <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-400">
-                  探测失败：{regionsError}
-                </div>
-              )}
-              {regions !== null && regions.length === 0 && !regionsLoading && (
-                <div className="rounded-md border border-dashed border-border px-3 py-3 text-center text-xs text-muted-foreground">
-                  未探测到可用的 profile。该账号可能在此 region 未开通（刚加入订阅组需等最多 24h 传播），
-                  或试试下方手填其它 region。
-                </div>
-              )}
-              {/* 自定义 region：手填任意 region 直接构造 ARN 切过去（绕候选表，覆盖冷门 region）。
-                  验活可用才真生效（后端 switch 只在 Usable 写回）。 */}
-              <div className="flex items-center gap-2 pt-1">
-                <RegionSelect
-                  value={customRegion}
-                  onChange={setCustomRegion}
-                  placeholder="自定义 region，如 eu-central-1"
-                  disabled={switchingArn !== null}
-                  className="flex-1"
-                  triggerClassName="h-8 text-xs"
-                />
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-8 shrink-0 px-2.5"
-                  onClick={handleCustomRegionSwitch}
-                  disabled={switchingArn !== null || !customRegion.trim()}
-                  title="用手填 region 构造 ARN 直接切换（验活可用才生效）"
-                >
-                  切到此区域
-                </Button>
-              </div>
-              {regions !== null && regions.length > 0 && (
-                <div className="space-y-1.5">
-                  {[...regions]
-                    .sort((a, b) => Number(b.usable) - Number(a.usable))
-                    .map((r) => {
-                      const isSwitching = switchingArn === r.arn
-                      return (
-                        <button
-                          key={r.arn}
-                          type="button"
-                          disabled={!r.usable || switchingArn !== null || r.current}
-                          onClick={() => handleSwitchRegion(r.arn)}
-                          className={cn(
-                            'flex w-full items-start justify-between gap-2 rounded-md border px-3 py-2 text-left transition-colors',
-                            r.current
-                              ? 'border-emerald-500/50 bg-emerald-500/10'
-                              : r.usable
-                                ? 'border-input bg-background hover:border-primary hover:bg-accent'
-                                : 'border-border bg-secondary/30 opacity-60',
-                            (switchingArn !== null && !isSwitching) && 'opacity-50'
-                          )}
-                        >
-                          <div className="min-w-0 flex-1">
-                            <div className="flex items-center gap-1.5 text-sm font-medium">
-                              {r.usable ? (
-                                <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
-                              ) : (
-                                <XCircle className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                              )}
-                              <span className="truncate">{regionLabel(r.region)}</span>
-                              {r.current && (
-                                <span className="shrink-0 rounded bg-emerald-500/15 px-1 py-0.5 text-[10px] text-emerald-300">当前</span>
-                              )}
-                              {!r.usable && (
-                                <span className="shrink-0 rounded bg-white/5 px-1 py-0.5 text-[10px] text-muted-foreground">该区域未开通</span>
-                              )}
-                            </div>
-                            <div className="mt-0.5 truncate font-mono text-[10px] text-muted-foreground" title={r.arn}>
-                              {r.region}
-                              {r.subscriptionTitle ? ` · ${subscriptionLabel(r.subscriptionTitle)}` : ''}
-                              {r.account ? ` · 账号 ${r.account}` : ''}
-                            </div>
-                          </div>
-                          {isSwitching && <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-primary" />}
-                        </button>
-                      )
-                    })}
-                </div>
-              )}
+              <RegionSwitcher credentialId={credential.id} />
             </div>
             )}
 
