@@ -104,6 +104,21 @@ impl RpmTracker {
         v.retain(|t| now.duration_since(*t) < window);
     }
 
+    /// 该号窗口内**最老命中**距今的时长(供 L4 背压估算"最短 RPM 恢复窗口":最老那条再过
+    /// `window - oldest_age` 就会过期腾出一个名额)。无命中返回 None。
+    pub fn oldest_age(&self, id: u64) -> Option<Duration> {
+        let now = Instant::now();
+        let mut map = self.hits.lock();
+        let v = map.get_mut(&id)?;
+        Self::prune(v, now, self.window);
+        v.first().map(|t| now.duration_since(*t))
+    }
+
+    /// 该号窗口长度(60s),供恢复窗口计算。
+    pub fn window(&self) -> Duration {
+        self.window
+    }
+
     /// 移除指定凭据的窗口条目（删号时调用，避免其 RPM 记录残留被复用 id 的新号继承）。
     /// 返回是否确有条目被移除。
     pub fn remove(&self, id: u64) -> bool {

@@ -1269,6 +1269,12 @@ pub struct MultiTokenManager {
     health: HealthTracker,
     /// 每凭据 RPM 软上限（0 = 不限制）（原子镜像,reload 热更）
     rpm_limit: AtomicU32,
+    /// RPM headroom 系数(整百分比 0..100;85=预留15%)。饱和阈值 = base × factor/100。（原子镜像,reload 热更）
+    rpm_headroom_factor: AtomicU32,
+    /// RPM 预留名额(headroom 折扣后再扣 N)。（原子镜像,reload 热更）
+    rpm_reserve_slots: AtomicU32,
+    /// 整池 RPM 饱和时是否走背压等待(默认 false=回退软门)。（原子镜像,reload 热更）
+    rpm_hard_gate_overload_wait: AtomicBool,
     /// 全池冷却时是否快速失败（立即返回 429+Retry-After 让客户端退避，而非网关内硬扛）。（原子镜像,reload 热更）
     all_cooling_fast_fail: AtomicBool,
     /// 是否在凭据持续可疑活动风控(trigger_count 达阈值)时自动禁用它。（原子镜像,reload 热更）
@@ -1473,6 +1479,9 @@ impl MultiTokenManager {
         let rate_limit_enabled = config.rate_limit_enabled;
         let affinity_enabled = config.affinity_enabled;
         let rpm_limit = config.credential_rpm_limit;
+        let rpm_headroom_factor = config.rpm_headroom_factor;
+        let rpm_reserve_slots = config.rpm_reserve_slots;
+        let rpm_hard_gate_overload_wait = config.rpm_hard_gate_overload_wait;
         let all_cooling_fast_fail = config.all_cooling_fast_fail;
         let auto_disable_suspicious = config.auto_disable_suspicious;
         let priority_in_balanced = config.priority_in_balanced;
@@ -1506,6 +1515,9 @@ impl MultiTokenManager {
             rpm: RpmTracker::new(),
             health: HealthTracker::new(),
             rpm_limit: AtomicU32::new(rpm_limit),
+            rpm_headroom_factor: AtomicU32::new(rpm_headroom_factor),
+            rpm_reserve_slots: AtomicU32::new(rpm_reserve_slots),
+            rpm_hard_gate_overload_wait: AtomicBool::new(rpm_hard_gate_overload_wait),
             all_cooling_fast_fail: AtomicBool::new(all_cooling_fast_fail),
             auto_disable_suspicious: AtomicBool::new(auto_disable_suspicious),
             priority_in_balanced: AtomicBool::new(priority_in_balanced),
@@ -1588,6 +1600,12 @@ impl MultiTokenManager {
             .store(new.affinity_enabled, Ordering::Relaxed);
         self.rpm_limit
             .store(new.credential_rpm_limit, Ordering::Relaxed);
+        self.rpm_headroom_factor
+            .store(new.rpm_headroom_factor, Ordering::Relaxed);
+        self.rpm_reserve_slots
+            .store(new.rpm_reserve_slots, Ordering::Relaxed);
+        self.rpm_hard_gate_overload_wait
+            .store(new.rpm_hard_gate_overload_wait, Ordering::Relaxed);
         self.all_cooling_fast_fail
             .store(new.all_cooling_fast_fail, Ordering::Relaxed);
         self.auto_disable_suspicious
@@ -1844,6 +1862,8 @@ impl MultiTokenManager {
                         // 打爆(retry 慢/雪崩),旁边空闲号却不接——故饱和时**不复用**,落到下方 balanced
                         // 分流到未饱和号(临时解绑,会话下次仍可能粘回,防关联与分流兼得)。
                         // 用无锁版:此处已持 entries 锁,直传 e.credentials.rpm_limit(per-cred 容量优先)。
+                        // L5:饱和判定含 L3 headroom 折扣(effective_saturation_limit),即绑定号达 headroom
+                        // 后阈值(如 25 而非硬限 30)就让路,防单会话高吞吐把一个号顶到贴顶再让路。
                         let bound_saturated =
                             self.is_rpm_saturated_with_limit(entry.id, entry.credentials.rpm_limit);
                         if !bound_saturated {
@@ -1885,43 +1905,66 @@ impl MultiTokenManager {
                 // 再按 priority 分层(越小越优先),层内仍按健康/负载均衡。这样高优先级号被优先用,
                 // 但整层被打爆(p_avail=0 或饱和)时优雅溢出到下一优先级层,不死磕单个坏号。
                 let prio_first = self.priority_in_balanced.load(Ordering::Relaxed);
-                available
-                    .iter()
-                    .min_by_key(|e| {
+                // L4 排序键闭包(供两趟复用):入参 &CredentialEntry,升序 min_by_key。
+                let sort_key = |e: &CredentialEntry| {
                         let key = e.credentials.family_key(e.id);
-                        // per-cred RPM 容量(>0 则用本号的,否则回退全局),供 p_avail 压力项 + 饱和判定。
-                        // 用 e.credentials.rpm_limit 直接取,避免在已持 entries 锁的闭包里二次锁死锁。
-                        let cred_rpm_cap = e
-                            .credentials
-                            .rpm_limit
-                            .filter(|&v| v > 0)
-                            .unwrap_or_else(|| self.rpm_limit.load(Ordering::Relaxed));
+                        // per-cred RPM 容量:复用 effective_saturation_limit,与饱和判定口径统一
+                        // (含兜底 30 + headroom 折扣)——修 L1:此前 unwrap_or 全局默认 0 会让
+                        // p_avail 的 rpm_pressure 恒 0、速率维度从主键被剔除。effective_saturation_limit
+                        // 只读原子镜像不锁 entries,闭包内调用安全。
+                        let cred_rpm_cap = self.effective_saturation_limit(e.credentials.rpm_limit);
                         let p = self.health.p_avail(
                             &key,
                             self.rpm.count(e.id),
                             e.inflight.load(Ordering::Acquire),
                             cred_rpm_cap,
                         );
-                        // p_avail(0..1) → 0..100 桶,取负作升序首键(高 p 排前)。同桶内再走下面细分。
-                        let neg_p_bucket = -((p * 100.0) as i64);
+                        // L2:健康降为 3 档粗门(不再是首要连续键),让"负载"成为同档内一等分流键。
+                        // 治惠群根因——旧代码 neg_p_bucket 首排,最健康的号哪怕背 7 个在途也压过空闲的
+                        // 稍弱号,突发全被它吸走。现同档内按 在途 + 剩余名额 分流。
+                        let health_tier = crate::kiro::health::health_tier(p);
                         let saturated = self.is_rpm_saturated_with_limit(e.id, e.credentials.rpm_limit);
                         // 溢出闸:仅当该号"真不可用"(熔断 Open→p_avail=0 或 RPM 已饱和)时置 1 沉底,
                         // 保证优先级分层不会把流量钉死在一个已打爆的高优先级号上。
                         let unusable = (p <= 0.0 || saturated) as u8;
-                        // 优先级键仅在开关开启时参与首排;关闭时置 0(不影响原有纯健康均衡)。
+                        // 已用率(升序 min:已用率低的先选)——按 RPM 占容量的比例分流,比裸 rpm_count
+                        // 更贴"容量差异化的号"(大容量号能接更多)。用整数千分比避免浮点排序不确定。
+                        // cred_rpm_cap 恒 >0(effective_saturation_limit 保证),不会除零。
+                        let rpm_usage_permille =
+                            ((self.rpm.count(e.id) as u64 * 1000) / cred_rpm_cap as u64) as u32;
+                        // p_avail 精细值降为末位兜底,保留确定性 + 避免同档抖动。
+                        let neg_p_fine = -((p * 1000.0) as i64);
+                        // 优先级键仅在开关开启时参与首排;关闭时置 0(不影响原有均衡)。
                         let prio_key = if prio_first { e.credentials.priority } else { 0 };
                         (
-                            unusable,          // ① 先把真不可用的沉底(优雅溢出到下一层)
-                            prio_key,          // ② 开关开:按优先级分层(越小越优先);关:恒 0
-                            neg_p_bucket,      // ③ 层内健康均衡(p_avail 高排前)
-                            saturated,         // ④ rpm 饱和兜底
-                            e.inflight.load(Ordering::Acquire), // ⑤ 在途
-                            self.rpm.count(e.id),               // ⑥ 近 60s RPM
+                            unusable,                           // ① 真不可用沉底(优雅溢出)
+                            prio_key,                           // ② 开关开:按优先级分层;关:恒 0
+                            health_tier,                        // ③ 健康 3 档粗门(坏号沉档)
+                            e.inflight.load(Ordering::Acquire), // ④ ⭐同档内在途最少优先(治惠群核心)
+                            rpm_usage_permille,                 // ⑤ 已用率低的先选(按容量比例分流)
+                            neg_p_fine,                         // ⑥ p_avail 精细兜底(确定性,防抖动)
                             e.success_count,                    // ⑦ 终身成功数
-                            e.credentials.priority,             // ⑧ 优先级末位兜底(开关关时唯一 priority 参与点)
+                            e.credentials.priority,             // ⑧ 优先级末位兜底
                         )
-                    })
+                };
+                // L4:两趟选号。第一趟只在**非饱和**候选里选(硬门,RPM 成真天花板);
+                // 若整池饱和(第一趟空),按开关决定:false(默认)=回退软门对全体选"最不坏"(不阻塞,
+                // 保留旧行为);true=返回 None 让 acquire_context 走背压等待最短 RPM 恢复窗口。
+                let non_saturated: Vec<&CredentialEntry> = available
+                    .iter()
                     .copied()
+                    .filter(|e| !self.is_rpm_saturated_with_limit(e.id, e.credentials.rpm_limit))
+                    .collect();
+                if !non_saturated.is_empty() {
+                    non_saturated.into_iter().min_by(|a, b| sort_key(a).cmp(&sort_key(b)))
+                } else if self.rpm_hard_gate_overload_wait.load(Ordering::Relaxed) {
+                    // 整池饱和 + 背压开:返回 None,上游 acquire_context 等待恢复(受 MAX_TRANSIENT_WAIT 限)。
+                    None
+                } else {
+                    // 整池饱和 + 背压关(默认):回退软门,对全体选"最不坏"(排序键里 unusable/已用率会
+                    // 让最不坏的浮上来),不阻塞——保留旧行为,零回归。
+                    available.iter().copied().min_by(|a, b| sort_key(a).cmp(&sort_key(b)))
+                }
             }
             _ => {
                 // priority 模式（默认）：选择优先级最高的
@@ -2025,6 +2068,22 @@ impl MultiTokenManager {
                 }
             }
 
+            // L4 背压:仅当开启硬门背压时,RPM 饱和号才算"将恢复的等待候选"(而非立即可用)。
+            // 恢复窗口 = 该号最老命中再过 (60s - oldest_age) 就过期腾名额。背压关时不计(RPM 饱和号
+            // 在软门下仍是立即可选候选,不等待——保持默认行为)。
+            if self.rpm_hard_gate_overload_wait.load(Ordering::Relaxed)
+                && self.is_rpm_saturated_with_limit(entry.id, entry.credentials.rpm_limit)
+            {
+                let recover = self
+                    .rpm
+                    .oldest_age(entry.id)
+                    .map(|age| self.rpm.window().saturating_sub(age))
+                    .unwrap_or_else(|| StdDuration::from_secs(1));
+                // 至少等 250ms,避免 0 等待空转;上限由外层 MAX_TRANSIENT_WAIT 兜底。
+                waits.push(recover.max(StdDuration::from_millis(250)));
+                continue;
+            }
+
             // 注意：不再因 inflight「繁忙」而等待——inflight 不是阻塞门槛，
             // 只要该号未禁用/未冷却/未限流，就是当下可选的候选（并发直接落它）。
             // 走到这里说明有一个立即可用的候选，无需等待。
@@ -2075,16 +2134,32 @@ impl MultiTokenManager {
         self.rpm.count(id) >= lim
     }
 
-    /// 有效饱和阈值:per-cred(>0) > 全局(>0) > 默认高水位兜底(30)。恒 >0,保证分流生效。
+    /// 有效饱和阈值:per-cred(>0) > 全局(>0) > 默认高水位兜底(30),再应用 headroom 折扣。
+    /// 恒 >0,保证分流生效。**优先级不破坏**:折扣作用在选定 base 之后,per_cred/global/兜底的选取不变。
     fn effective_saturation_limit(&self, per_cred_limit: Option<u32>) -> u32 {
         const SATURATION_FALLBACK_RPM: u32 = 30;
-        per_cred_limit
+        let base = per_cred_limit
             .filter(|&v| v > 0)
             .or_else(|| {
                 let g = self.rpm_limit.load(Ordering::Relaxed);
                 (g > 0).then_some(g)
             })
-            .unwrap_or(SATURATION_FALLBACK_RPM)
+            .unwrap_or(SATURATION_FALLBACK_RPM);
+        self.apply_rpm_headroom(base)
+    }
+
+    /// 对 base 容量应用 headroom:base × factor/100 再减预留名额,下限 1(绝不 0,否则恒饱和)。
+    /// factor=0 或 100 且 reserve=0 时 = base(旧行为,零回归)。
+    fn apply_rpm_headroom(&self, base: u32) -> u32 {
+        let factor = self.rpm_headroom_factor.load(Ordering::Relaxed);
+        // factor=0 视为"不打折"(=100),避免误配 0 把所有号打成恒饱和。
+        let discounted = if factor == 0 || factor >= 100 {
+            base
+        } else {
+            ((base as u64 * factor as u64) / 100) as u32
+        };
+        let reserve = self.rpm_reserve_slots.load(Ordering::Relaxed);
+        discounted.saturating_sub(reserve).max(1)
     }
 
     /// 获取 API 调用上下文
@@ -6079,6 +6154,106 @@ mod tests {
         MultiTokenManager::new(config, creds, None, None, false).unwrap()
     }
 
+    /// T1(L2 回归,旧代码必挂):健康不对称下同优先级仍按负载分流,不被最健康的号吸走整轮。
+    /// 旧代码 neg_p_bucket 首排:健康分高的号哪怕在途多也压过空闲的稍弱号 → 突发全扑一个号。
+    /// L2 后:健康降 3 档粗门,同档内在途最少优先 → 3 个并发在途分摊到不同号。
+    #[tokio::test]
+    async fn test_l2_health_asymmetric_still_spreads() {
+        let manager = make_balanced_manager(3);
+        // 造同档内 p_avail 不对称:#1 满血(p=1.0),#2/#3 各记 3 次近窗 RPM 制造轻微 rpm_pressure
+        // (cap 默认 25,pressure=3/25=0.12 → p≈0.88),三者都在 healthy 档(≥0.75,tier 同为 0)。
+        // 旧代码:neg_p_bucket 首要连续键,#1 的 p 最高;每 +1 在途只压 ~6 分,压不过 #1 对 #2/#3 的
+        // 健康优势 → 3 个并发全吸到 #1(惊群)。L2:同档内在途最少优先 → 分摊到 3 个号。
+        manager.rpm.record(2);
+        manager.rpm.record(2);
+        manager.rpm.record(2);
+        manager.rpm.record(3);
+        manager.rpm.record(3);
+        manager.rpm.record(3);
+        // 连取 3 个 context 不释放(guard 持有 = 模拟 3 个并发在途)。
+        let a = manager.acquire_context(None, None).await.unwrap();
+        let b = manager.acquire_context(None, None).await.unwrap();
+        let c = manager.acquire_context(None, None).await.unwrap();
+        let mut ids = [a.id, b.id, c.id];
+        ids.sort();
+        assert_eq!(
+            ids, [1, 2, 3],
+            "3 个并发在途应分摊到 3 个不同号(同档内在途最少优先,不吸附到最健康的 #1),实际 {:?}",
+            ids
+        );
+    }
+
+    /// T2(L4 硬门回归,旧代码必挂):常载下 RPM 不越限——两趟选号只在非饱和候选里选。
+    /// 旧代码饱和只是软降权,整池未满时也可能把 burst 拍到排序靠前的号使其越限;L4 硬门过滤饱和号。
+    #[tokio::test]
+    async fn test_l4_hard_gate_no_overshoot() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.affinity_enabled = false;
+        config.credential_rpm_limit = 3;
+        config.rpm_headroom_factor = 100; // 隔离 headroom,只验硬门:阈值恰为 3
+        let creds: Vec<KiroCredentials> = (1..=2)
+            .map(|i| {
+                let mut c = KiroCredentials::default();
+                c.priority = 0;
+                c.access_token = Some(format!("tok-{}", i));
+                c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+                c
+            })
+            .collect();
+        let manager = MultiTokenManager::new(config, creds, None, None, false).unwrap();
+
+        // 取 6 次(=2 号 × 3),每次释放 guard(只累积 rpm.record)。硬门保证不越各号 limit=3。
+        for _ in 0..6 {
+            let ctx = manager.acquire_context(None, None).await.unwrap();
+            drop(ctx);
+        }
+        let snap = manager.snapshot();
+        for e in &snap.entries {
+            assert!(
+                manager.rpm.count(e.id) <= 3,
+                "L4 硬门:#{} 近窗 RPM {} 不应越过 limit=3",
+                e.id,
+                manager.rpm.count(e.id)
+            );
+        }
+        // 总量恰好 6(2×3),证明两号都被用满而非一个越限、一个闲置。
+        let total: u32 = snap.entries.iter().map(|e| manager.rpm.count(e.id)).sum();
+        assert_eq!(total, 6, "两号各 3 次共 6,负载均摊到容量");
+    }
+
+    /// T2b(L4 背压路径):背压开 + 整池 RPM 饱和时,transient_wait 返回 Some(恢复窗口),
+    /// 使 acquire_context 等待 RPM 恢复而非误判"所有凭据均已禁用"bail。背压关时饱和号不计等待。
+    #[tokio::test]
+    async fn test_l4_backpressure_waits_on_rpm_saturation() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.affinity_enabled = false;
+        config.credential_rpm_limit = 2;
+        config.rpm_headroom_factor = 100;
+        config.rpm_hard_gate_overload_wait = true; // 开背压
+        let mut c = KiroCredentials::default();
+        c.access_token = Some("tok-1".to_string());
+        c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let manager = MultiTokenManager::new(config, vec![c], None, None, false).unwrap();
+
+        // 打到饱和(limit=2)。
+        manager.rpm.record(1);
+        manager.rpm.record(1);
+        assert!(manager.is_rpm_saturated(1), "应已饱和");
+        // 背压开:该号是"将恢复的等待候选",transient_wait 返回 Some(≤60s)。
+        let wait = manager.transient_wait_duration(None);
+        assert!(wait.is_some(), "背压开 + 饱和应返回等待时长(而非 None→误判全禁用)");
+        assert!(wait.unwrap() <= StdDuration::from_secs(60), "恢复窗口不超过 60s 窗口长度");
+
+        // 对照:背压关时,饱和号仍算立即可用候选,不等待。
+        manager.rpm_hard_gate_overload_wait.store(false, Ordering::Relaxed);
+        assert!(
+            manager.transient_wait_duration(None).is_none(),
+            "背压关:饱和号是立即可选候选,不等待(保持默认行为)"
+        );
+    }
+
     // ===== TIER2 配置热重载：后台任务 abort+respawn 回归 =====
 
     /// 造一个可控 proactive_token_refresh 的单号 manager（带有效 token）。
@@ -6373,18 +6548,54 @@ mod tests {
     #[tokio::test]
     async fn test_default_saturation_fallback_spreads_load() {
         // 默认配置(credential_rpm_limit=0 未设)也要最优:回退高水位 30 判饱和,不再恒不饱和。
-        let config = Config::default(); // credential_rpm_limit=0
+        // L3 headroom 默认 factor=85 → 兜底 30 打折为 floor(30×0.85)=25,饱和阈值提前到 25(留 15% 缓冲)。
+        let config = Config::default(); // credential_rpm_limit=0, rpm_headroom_factor=85
         let mut c1 = KiroCredentials::default();
         c1.access_token = Some("tok1".to_string());
         c1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
         let manager = MultiTokenManager::new(config, vec![c1], None, None, false).unwrap();
-        // 默认未设限,打 29 次不饱和,30 次达兜底阈值饱和
-        for _ in 0..29 {
+        // 默认兜底 30 × 0.85 = 25:打 24 次不饱和,第 25 次达 headroom 后阈值饱和。
+        for _ in 0..24 {
             manager.rpm.record(1);
         }
-        assert!(!manager.is_rpm_saturated(1), "默认兜底 30,打 29 次不应饱和");
+        assert!(!manager.is_rpm_saturated(1), "默认兜底 30×0.85=25,打 24 次不应饱和");
         manager.rpm.record(1);
-        assert!(manager.is_rpm_saturated(1), "打到 30 应触发默认兜底饱和(默认配置也分流)");
+        assert!(manager.is_rpm_saturated(1), "打到 25(headroom 后阈值)应触发饱和");
+    }
+
+    // ============ L3 headroom 折扣(旧代码上会失败:旧代码无折扣恒等于 base)============
+
+    #[test]
+    fn test_rpm_headroom_discount() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+        // 默认 factor=85:base 30 → 25;base 100 → 85。
+        assert_eq!(manager.effective_saturation_limit(Some(30)), 25, "30×0.85=25");
+        assert_eq!(manager.effective_saturation_limit(Some(100)), 85, "100×0.85=85");
+        // factor=100(不打折):= base。
+        manager.rpm_headroom_factor.store(100, Ordering::Relaxed);
+        assert_eq!(manager.effective_saturation_limit(Some(30)), 30, "factor=100 不打折");
+        // factor=0 视为不打折(防误配把号打成恒饱和)。
+        manager.rpm_headroom_factor.store(0, Ordering::Relaxed);
+        assert_eq!(manager.effective_saturation_limit(Some(30)), 30, "factor=0 视为不打折");
+        // reserve_slots 叠加:base 30 × 0.85=25,再减 3 = 22。
+        manager.rpm_headroom_factor.store(85, Ordering::Relaxed);
+        manager.rpm_reserve_slots.store(3, Ordering::Relaxed);
+        assert_eq!(manager.effective_saturation_limit(Some(30)), 22, "25-3=22");
+        // 边界:base 1 × 0.85 = floor 0 → max(1)=1(绝不 0,否则恒饱和)。
+        manager.rpm_reserve_slots.store(0, Ordering::Relaxed);
+        assert_eq!(manager.effective_saturation_limit(Some(1)), 1, "base 1 折后下限 1,不得 0");
+    }
+
+    #[test]
+    fn test_rpm_headroom_preserves_percred_priority() {
+        // per-cred rpm_limit(>0) 优先级不被 headroom 破坏:#1 设 100、#2 未设(用全局/兜底)。
+        let mut config = Config::default();
+        config.credential_rpm_limit = 0; // 全局未设 → #2 走兜底 30
+        config.rpm_headroom_factor = 100; // 隔离 headroom 变量,只验优先级选取
+        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+        assert_eq!(manager.effective_saturation_limit(Some(100)), 100, "per-cred 100 优先");
+        assert_eq!(manager.effective_saturation_limit(None), 30, "未设 → 兜底 30");
     }
 
     #[tokio::test]
