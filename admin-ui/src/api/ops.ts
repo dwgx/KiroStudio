@@ -72,6 +72,24 @@ export async function checkUpdate(): Promise<UpdateCheckResult> {
   return data
 }
 
+// OTA 升级/回滚观测（后端 health_marker::HealthStatus，camelCase）。
+export interface UpdateStatusResult {
+  /** 本版是否已稳定确认（.health 已写）。 */
+  healthConfirmed: boolean
+  /** .health 原文（version=.. / confirmed_at=..）。 */
+  healthDetail: string | null
+  /** 回滚点 .bak 是否仍在（健康后应被清；仍在=尚未确认）。 */
+  rollbackPointPresent: boolean
+  /** 是否有 *.failed.* 残留（守卫脚本执行过回滚的证据）。 */
+  rolledBackBinaryPresent: boolean
+}
+
+// 读 OTA 升级/回滚状态（只读，读 .health/.bak/*.failed 标记）。
+export async function getUpdateStatus(): Promise<UpdateStatusResult> {
+  const { data } = await api.get<UpdateStatusResult>('/update/status')
+  return data
+}
+
 // 一键升级（下载→sha256→替换→重启）。成功后服务会自动重启，请求可能因断连抛错，调用方容忍。
 export async function performUpdate(version?: string): Promise<UpdatePerformResult> {
   const { data } = await api.post<UpdatePerformResult>('/update/perform', version ? { version } : {})
