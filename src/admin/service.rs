@@ -367,7 +367,6 @@ impl AdminService {
     /// 列表按 rpm 降序、id 升序，方便前端把最热的号排在前面。
     pub fn ratelimit_insights(&self) -> Vec<RateLimitInsight> {
         let snapshot = self.token_manager.snapshot();
-        let rpm_limit = self.token_manager.config().credential_rpm_limit;
 
         // 冷却快照：按 id 建表，合并进每条 insight
         let cooldowns: std::collections::HashMap<u64, crate::kiro::cooldown::CooldownInfo> = self
@@ -385,17 +384,12 @@ impl AdminService {
             .into_iter()
             .map(|e| {
                 let cd = cooldowns.get(&e.id);
-                // per-cred 有效容量:该号自己的 rpm_limit(>0) 优先,否则回退全局。
-                // 修复:#68 设 100 时,insight 不能再按全局阈值误判饱和 + 火焰误触发。
-                let eff_limit = e.rpm_limit.filter(|&v| v > 0).unwrap_or(rpm_limit);
-                // 火力全开判定:配了软上限就按上限;没配上限(=0,线上默认)时用固定高水位 30/min 兜底
-                // ——否则 limit=0 会让 saturated 恒 false,火焰永不触发。
-                const SATURATION_FALLBACK_RPM: u32 = 30;
-                let saturated = if eff_limit > 0 {
-                    e.rpm >= eff_limit
-                } else {
-                    e.rpm >= SATURATION_FALLBACK_RPM
-                };
+                // 有效饱和阈值:复用调度真相源 effective_saturation_limit——per-cred(>0)>全局(>0)>兜底 30,
+                // **再应用 L3 headroom 折扣**(默认 factor=85 → 兜底 30 打折为 25)。此前 UI 侧只按 base 重算
+                // (不含 headroom),会出现"调度已在 rpm≥25 硬门拦下并释放亲和、UI 仍显示畅通/无火焰"的观测
+                // 口径漂移(误导加号决策)。改走同一真相源,饱和判定与调度完全对齐。
+                let eff_limit = self.token_manager.effective_saturation_limit(e.rpm_limit);
+                let saturated = e.rpm >= eff_limit;
                 // recent429：速率限制类冷却的连续触发计数近似"近期 429 次数"（零上游）；
                 // 非速率限制冷却或无冷却则为 0。
                 let recent429 = cd

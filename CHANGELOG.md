@@ -2,6 +2,57 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.23] - 2026-07-15
+
+### 调度:反惊群分流 + RPM headroom 预留(L1~L5)
+治两个生产问题:①同优先级 balanced 不分流(惊群)②设了 RPM 上限还超。**确诊根因**(多智能体
+workflow 挖出,比最初"惊群"判断更准):balanced 排序键把健康分(p_avail)排在负载之上——最健康的号
+哪怕背 7 个在途也压过空闲的稍弱号,突发全被它吸走直到饱和;RPM 饱和只是软降权非硬门 + 零 headroom +
+60s 尾随滑窗边界爆发。
+- **L1**:选号闭包内 `cred_rpm_cap` 改为复用 `effective_saturation_limit`(含兜底 30 + headroom),
+  与饱和判定口径统一。修隐藏 bug:默认未设全局上限时 cap=0 → p_avail 的 rpm_pressure 恒 0 →
+  速率维度被从主键剔除。
+- **L2**:`health.rs` 加 `health_tier`(0.75/0.40 三档);排序键改为
+  `(unusable, prio_key, health_tier, inflight, rpm_usage_permille, neg_p_fine, success_count, priority)`
+  ——健康降为 3 档粗门,**在途升为同档内一等分流键**(治惊群核心)。
+- **L3**:config 加 `rpm_headroom_factor`(默认 85=预留 15%)+ `rpm_reserve_slots`(默认 0),
+  `effective_saturation_limit` 打折(factor=0/100 视为不打折=旧行为,下限 max(1) 防恒饱和)。构造/reload
+  两处装配原子镜像。
+- **L4**:balanced 两趟——先过滤饱和号(硬门,RPM 成真天花板);整池饱和按 `rpm_hard_gate_overload_wait`
+  (默认 **false**=回退软门零回归)决定回退或背压。`RpmTracker` 加 `oldest_age`/`window`。
+- **L5**:亲和让路复用 L3 headroom 阈值(达 headroom 就让路,非贴硬限)。
+
+### 调度对抗 review 修复(15 智能体多视角 review + 对抗验证)
+发布前对 L1~L5 跑独立对抗 review(生产核心),确认核心逻辑正确、默认路径零回归后,修掉三条存活缺陷:
+- **D2(MEDIUM,影响默认配置)**:运维页「号池健康」饱和口径漏了 L3 headroom——`ratelimit_insights`
+  在 UI 侧按 base 阈值(不含折扣)重算,导致"调度已在 rpm≥25 硬门拦下并释放亲和、UI 仍显示畅通/无火焰"
+  的观测漂移(误导加号决策)。改走同一真相源:`effective_saturation_limit` 提为 pub,insight 复用它判饱和 +
+  文案,与调度完全对齐。
+- **D1(MEDIUM,背压路径)**:`rpm_hard_gate_overload_wait=true` 时的等待判定原用无类型 `Option<Duration>`,
+  冷却/风控与 RPM 饱和恢复不可区分,导致三种终态全错——默认 `all_cooling_fast_fail=true` 下把 RPM 饱和
+  误当"全在冷却"直接 429 fast-fail(背压等于没生效)、fast-fail 关时空转 20s 后误报"已禁用"(健康号池被
+  报成致命/不可重试类别)、去饱和竞态假 bail。改为类型化 `WaitOutcome`(NoCandidate/Available/Wait(_, reason)):
+  竞态走重选、RPM 恢复只在网关内等(绝不 cooling-fast-fail、绝不报"已禁用",超时报可重试的"繁忙"类别)、
+  冷却才 fast-fail。
+- **D3(LOW)**:两趟选号的 `min_by(|a,b| sort_key(a).cmp(sort_key(b)))` 每次比较重算 inflight/p_avail 等
+  并发可变态,比较器非传递,偶发选到次优号。改为进 min 前对每个候选**单次求值** sort_key 快照,再
+  `min_by_key`,恢复稳定全序。
+
+**回归测试**(均"旧代码上会失败"):T1 同档内在途分流、T2 常载不越限、T2b 背压返回 Wait(RpmRecovery)、
+D1 等待原因分型(未冷却仅饱和 → RpmRecovery 非 Cooling)、T3/T4 headroom 折扣与 per-cred 优先级不破坏。
+`cargo test --bin kirostudio` 与 `--no-default-features --locked` 各 **693 绿**。
+
+**诚实边界**:滑窗 vs 上游窗口计时偏差只缓解不根治(要根治得上令牌桶,回归面大,推迟);过载(聚合需求>
+号池总容量)是物理约束,治本靠加号。默认 balanced 用户部署后会立即受硬门过滤 + headroom 提前饱和影响
+(这正是要的),部署前值得真机观察分流。
+
+### 运维控制台重写(叶子件化 + 全操作面板)
+运维页从 3 卡扩成完整控制台:新增实时指标条(全局 RPM/在途/RPS/Tokens-s,SSE ~1.5s + AnimatedNumber
+滚动)、号池行改 Badge/Progress(invert)/Tooltip + 行内验活/探模型、「更多」操作面板(切 region/优先级/
+RPM 上限/允许模型/代理/别名,custom_api 号隐藏 region/超额/探模型)、聚合运维卡(重启/OTA 观测/存储清理)。
+破坏性操作(开超额/禁用/删除/重启/清理/升级/探模型)全走共享 ConfirmDialog 二次确认。SSE 实时流提到页级
+共享,避免同页开两条流翻倍服务端推送。
+
 ## [0.7.22] - 2026-07-15
 
 ### 凭据 at-rest 加密 + 实时号池视图
