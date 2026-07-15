@@ -99,6 +99,10 @@ counters! {
     // 文本化工具调用(assistantResponseEvent 文本流出现 <invoke/antml:/<parameter):命中 chunk 数。
     // 取证用:量化 Kiro 把工具调用文本化的频率,决定是否值得做 R4 重组层。
     textified_invoke_hits: bump_textified_invoke,
+    // 文本化 invoke 真重组成结构化 tool_use 的次数(R4 捞回生效计数)。
+    reclaimed_invoke_calls: bump_reclaimed_invoke,
+    // stray token(call/count/card/court)复读熔断触发次数(退化刷屏被截断)。
+    stray_guard_tripped: bump_stray_guard_tripped,
 }
 
 #[cfg(test)]
