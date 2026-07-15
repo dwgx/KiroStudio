@@ -15,7 +15,7 @@ use super::{
         set_credential_proxy,
         set_credential_priority, set_credential_rpm_limit, set_credential_allowed_models,
         set_credential_custom_api,
-        purge_trash_batch, probe_available_models,
+        purge_trash_batch, probe_available_models, proxy_test,
         probe_regions, switch_profile_region,
         set_load_balancing_mode, social_callback, start_social_login, storage_cleanup,
         storage_stats, update_config, start_idc_login, poll_idc_login, recovery_metrics,
@@ -26,8 +26,8 @@ use super::{
     usage_handlers::{
         logs_export, logs_poll, logs_stream,
         ratelimit_insights, stream_live, usage_by_credential, usage_by_model,
-        usage_clients, usage_machines, usage_overview, usage_rate, usage_recent, usage_throughput,
-        usage_timeseries,
+        traces_search, usage_clients, usage_machines, usage_overview, usage_rate, usage_recent,
+        usage_throughput, usage_timeseries,
     },
 };
 
@@ -106,6 +106,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/usage/by-model", get(usage_by_model))
         .route("/usage/by-credential", get(usage_by_credential))
         .route("/usage/recent", get(usage_recent))
+        // trace 明细搜索/过滤/分页（多维 AND，参数化防注入，单页≤500）
+        .route("/traces/search", get(traces_search))
         .route("/usage/rate", get(usage_rate))
         // 下游客户端 RPM 视图（谁开了几个窗口、各打多少）
         .route("/usage/clients", get(usage_clients))
@@ -126,6 +128,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/service/restart", post(restart_service))
         .route("/storage/stats", get(storage_stats))
         .route("/storage/cleanup", post(storage_cleanup))
+        // 代理测活：通过指定代理(或直连)访问固定探针 URL,测连通性+出口 IP(SSRF:目标硬编码)
+        .route("/proxy/test", post(proxy_test))
         // OTA 自更新：GitHub 版本检查 + 一键升级（下载→sha256→替换→重启）
         .route("/update/check", get(check_update))
         .route("/update/perform", post(perform_update))
