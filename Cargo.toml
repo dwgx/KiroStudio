@@ -1,6 +1,6 @@
 [package]
 name = "kirostudio"
-version = "0.7.21"
+version = "0.7.22"
 edition = "2024"
 
 [features]
@@ -32,6 +32,8 @@ sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"     # PDF document 块 base64 解码（提取文本给上游）
 crc = "3"           # CRC32C 计算
+chacha20poly1305 = "0.10"  # credentials.json at-rest 加密（AEAD，纯 Rust 无 C 依赖）
+getrandom = "0.2"   # at-rest 加密密钥/nonce 的 CSPRNG（OS 熵源，非 fastrand 弱 PRNG）
 bytes = "1"         # 高效的字节缓冲区
 tower-http = { version = "0.6", features = ["cors"] }
 clap = { version = "4.5", features = ["derive"] }

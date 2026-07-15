@@ -318,6 +318,8 @@ export interface ConfigSnapshotResponse {
   toolRepairJson: boolean
   toolTruncationRecovery: boolean
   toolDescriptionMaxChars: number
+  /** credentials.json / trash.json at-rest 加密开关（机器绑定密钥，立即生效，默认关）。 */
+  encryptCredentialsAtRest: boolean
   cooldownEnabled: boolean
   rateLimitEnabled: boolean
   rateLimitDailyMax: number
@@ -369,6 +371,7 @@ export interface UpdateConfigRequest {
   toolRepairJson?: boolean
   toolTruncationRecovery?: boolean
   toolDescriptionMaxChars?: number
+  encryptCredentialsAtRest?: boolean
   cooldownEnabled?: boolean
   rateLimitEnabled?: boolean
   rateLimitDailyMax?: number

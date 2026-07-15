@@ -100,6 +100,8 @@ export async function performUpdate(version?: string): Promise<UpdatePerformResu
 // 进程级计数器（自进程启动以来，重启归零）。后端 common/recovery_metrics.rs。
 export interface RecoveryMetrics {
   uptimeMs: number
+  /** at-rest 加密健康:false=开了加密但上次落盘回退了明文(密钥文件读写失败等,UI 应告警)。 */
+  atRestHealthy: boolean
   refreshOk: number
   refreshFail: number
   failoverHops: number
@@ -110,6 +112,8 @@ export interface RecoveryMetrics {
   regionReprobeFail: number
   leakedCleanedRequests: number
   leakedSaturationRequests: number
+  /** 文本化工具调用命中 chunk 数(Kiro 把工具调用当文本吐,court/Invalid-tool-params 根源信号)。 */
+  textifiedInvokeHits: number
 }
 
 export async function getRecoveryMetrics(): Promise<RecoveryMetrics> {

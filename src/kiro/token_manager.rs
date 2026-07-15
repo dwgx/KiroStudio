@@ -2393,11 +2393,28 @@ impl MultiTokenManager {
     /// - `Ok(true)` - 成功写入文件
     /// - `Ok(false)` - 跳过写入（非多凭据格式或无路径配置）
     /// - `Err(_)` - 写入失败
+    /// 立即按当前 config 的 at-rest 加密开关重写凭据 + 回收站文件(明文↔密文)。
+    /// 供 admin 改加密开关后即时落盘用。两文件都写,任一失败返回 Err。
+    ///
+    /// 返回 `Ok(true)`=真的重写了;`Ok(false)`=单对象(Single)格式,persist 是 no-op(加密对该格式
+    /// 不生效)——调用方据此提示用户"当前为单凭据格式,加密未生效"。
+    pub fn repersist_secrets(&self) -> anyhow::Result<bool> {
+        // is_multiple_format=false 时 persist_credentials 直接 return Ok(false),加密对其无效。
+        let wrote = self.persist_credentials()?;
+        self.persist_trash()?;
+        Ok(wrote)
+    }
+
     fn persist_credentials(&self) -> anyhow::Result<bool> {
         use anyhow::Context;
 
         // 仅多凭据格式才回写
         if !self.is_multiple_format {
+            // Single 格式 persist 是 no-op:若此时开着加密,磁盘凭据其实仍是明文——置健康标志 false,
+            // 让 UI 红条如实告警"开了加密但未生效"(review MEDIUM:否则标志停在 true 误报健康)。
+            if self.config().encrypt_credentials_at_rest {
+                crate::common::recovery_metrics::set_at_rest_healthy(false);
+            }
             return Ok(false);
         }
 
@@ -2424,16 +2441,25 @@ impl MultiTokenManager {
         // 序列化为 pretty JSON
         let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
 
+        // at-rest 加密(开关关=明文原样;开=持久化密钥文件加密。加密失败自动回退明文不丢数据,
+        // 并置健康标志=false 让 UI 可观测"开了加密但这次实为明文")。
+        let enc = self.config().encrypt_credentials_at_rest;
+        let key_path = crate::common::secret_store::key_path_for(path);
+        let (bytes, encrypted) =
+            crate::common::secret_store::encode_for_disk(json.as_bytes(), enc, &key_path);
+        // 可观测:开了加密但实际没加密成(密钥文件读写失败等)→ 记健康标志,消除安全预期偏差。
+        crate::common::recovery_metrics::set_at_rest_healthy(!enc || encrypted);
+
         // 原子写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
         if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| write_atomic(path, json.as_bytes()))
+            tokio::task::block_in_place(|| write_atomic(path, &bytes))
                 .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
         } else {
-            write_atomic(path, json.as_bytes())
+            write_atomic(path, &bytes)
                 .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
         }
 
-        tracing::debug!("已回写凭据到文件: {:?}", path);
+        tracing::debug!("已回写凭据到文件: {:?}(加密开关={} 实际加密={})", path, enc, encrypted);
         Ok(true)
     }
 
@@ -2466,9 +2492,21 @@ impl MultiTokenManager {
             Some(p) => p,
             None => return,
         };
-        let content = match std::fs::read_to_string(&path) {
+        let raw = match std::fs::read(&path) {
             Ok(c) => c,
             Err(_) => return, // 首次运行时文件不存在
+        };
+        if raw.iter().all(|b| b.is_ascii_whitespace()) {
+            return;
+        }
+        // 透明解密(明文直通/密文解密),与 credentials 同口径;失败静默回退空(trash 非关键路径)。
+        let key_path = crate::common::secret_store::key_path_for(&path);
+        let content = match crate::common::secret_store::maybe_decrypt_to_string(&raw, &key_path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("解密回收站失败,将忽略: {}", e);
+                return;
+            }
         };
         if content.trim().is_empty() {
             return;
@@ -2509,16 +2547,22 @@ impl MultiTokenManager {
         // 序列化为 pretty JSON
         let json = serde_json::to_string_pretty(&items).context("序列化回收站失败")?;
 
+        // at-rest 加密(trash 也含完整凭据敏感字段,与 credentials 同开关同口径,共用同一密钥文件)。
+        let enc = self.config().encrypt_credentials_at_rest;
+        let key_path = crate::common::secret_store::key_path_for(&path);
+        let (bytes, encrypted) =
+            crate::common::secret_store::encode_for_disk(json.as_bytes(), enc, &key_path);
+
         // 原子写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
         if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| write_atomic(&path, json.as_bytes()))
+            tokio::task::block_in_place(|| write_atomic(&path, &bytes))
                 .with_context(|| format!("回写回收站文件失败: {:?}", path))?;
         } else {
-            write_atomic(&path, json.as_bytes())
+            write_atomic(&path, &bytes)
                 .with_context(|| format!("回写回收站文件失败: {:?}", path))?;
         }
 
-        tracing::debug!("已回写回收站到文件: {:?}", path);
+        tracing::debug!("已回写回收站到文件: {:?}(加密开关={} 实际加密={})", path, enc, encrypted);
         Ok(true)
     }
 
@@ -7080,5 +7124,66 @@ mod tests {
         assert!(h.circuit_open, "连续 429 应跳闸 circuit Open");
         assert!(h.health < 1.0, "健康分应被 429 拉低");
         assert!(h.consecutive_429 >= 5, "连续 429 计数应累加");
+    }
+
+    // ============ at-rest 加密:落盘密文 + 重载解密全链路 ============
+
+    /// 开启加密后:credentials.json 落盘是密文(带 magic、不含明文 token);重载能透明解密还原。
+    #[test]
+    fn test_at_rest_encryption_roundtrip_on_disk() {
+        let dir = std::env::temp_dir().join(format!("kiro-enc-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cred_path = dir.join("credentials.json");
+
+        let mut config = Config::default();
+        config.encrypt_credentials_at_rest = true;
+
+        let mut c = KiroCredentials::default();
+        c.refresh_token = Some("super-secret-refresh-token-xyz".to_string());
+        let mgr = MultiTokenManager::new(config, vec![c], None, Some(cred_path.clone()), true).unwrap();
+
+        // 触发一次 persist(改个字段即回写)。
+        mgr.set_priority(1, 3).unwrap();
+
+        // 磁盘上应是密文:带 magic、绝不含明文 refresh_token。
+        let raw = std::fs::read(&cred_path).unwrap();
+        assert!(crate::common::secret_store::is_encrypted(&raw), "开启加密后落盘应为密文");
+        let raw_str = String::from_utf8_lossy(&raw);
+        assert!(!raw_str.contains("super-secret-refresh-token-xyz"), "密文不应含明文 token");
+
+        // 重载能解密还原(透明迁移的反向:密文→明文→解析)。
+        let reloaded = crate::kiro::model::credentials::CredentialsConfig::load(&cred_path)
+            .unwrap()
+            .into_sorted_credentials();
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(reloaded[0].refresh_token.as_deref(), Some("super-secret-refresh-token-xyz"));
+        assert_eq!(reloaded[0].priority, 3);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 迁移兼容:关闭加密(默认)时落盘仍是明文;已有明文文件能被读(直通,不因加密崩)。
+    #[test]
+    fn test_at_rest_disabled_stays_plaintext_and_reads_legacy() {
+        let dir = std::env::temp_dir().join(format!("kiro-enc-off-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cred_path = dir.join("credentials.json");
+        // 预置一个老的明文 credentials.json(模拟升级前用户)。
+        std::fs::write(&cred_path, r#"[{"id":1,"refreshToken":"legacy-plain-token"}]"#).unwrap();
+
+        // 明文照旧能读(直通)。
+        let loaded = crate::kiro::model::credentials::CredentialsConfig::load(&cred_path)
+            .unwrap()
+            .into_sorted_credentials();
+        assert_eq!(loaded[0].refresh_token.as_deref(), Some("legacy-plain-token"));
+
+        // 加密关(默认)→ persist 后仍是明文(不惊扰现有用户)。
+        let mgr = MultiTokenManager::new(Config::default(), loaded, None, Some(cred_path.clone()), true).unwrap();
+        mgr.set_priority(1, 7).unwrap();
+        let raw = std::fs::read(&cred_path).unwrap();
+        assert!(!crate::common::secret_store::is_encrypted(&raw), "加密关时应保持明文");
+        assert!(String::from_utf8_lossy(&raw).contains("legacy-plain-token"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

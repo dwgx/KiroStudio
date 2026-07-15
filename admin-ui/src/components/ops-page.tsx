@@ -5,10 +5,12 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { getRecoveryMetrics, getLogs, type RecoveryMetrics, type LogEntry } from '@/api/ops'
 import { useRatelimitInsights } from '@/hooks/use-usage'
+import { useLiveStream } from '@/hooks/use-live-stream'
 import { useSetDisabled, useResetFailure, useForceRefreshToken } from '@/hooks/use-credentials'
 import type { RateLimitInsight } from '@/types/api'
 import { storage } from '@/lib/storage'
 import { Download, RefreshCw, Activity, Search, X, Copy, ShieldAlert, Zap, Power, RotateCcw } from 'lucide-react'
+import { Select } from '@/components/ui/select'
 
 // 自愈计数器展示项：字段 → 中文标签 + 是否"越多越该警惕"（用于配色）。
 const METRIC_ITEMS: { key: keyof RecoveryMetrics; label: string; warn?: boolean }[] = [
@@ -22,6 +24,7 @@ const METRIC_ITEMS: { key: keyof RecoveryMetrics; label: string; warn?: boolean 
   { key: 'regionReprobeFail', label: 'region 重探失败', warn: true },
   { key: 'leakedCleanedRequests', label: '泄漏清洗请求', warn: true },
   { key: 'leakedSaturationRequests', label: '整段退化请求', warn: true },
+  { key: 'textifiedInvokeHits', label: '文本化工具调用', warn: true },
 ]
 
 function formatUptime(ms: number): string {
@@ -77,6 +80,12 @@ function RecoveryMetricsCard() {
         </Button>
       </CardHeader>
       <CardContent>
+        {data && data.atRestHealthy === false && (
+          <div className="mb-3 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+            ⚠ at-rest 加密已开启,但上次凭据落盘回退成了明文(密钥文件读写失败)。磁盘上的凭据当前未加密——
+            请检查密钥文件权限/磁盘可写后重试保存,或查看日志。
+          </div>
+        )}
         {isLoading ? (
           <p className="text-sm text-muted-foreground">加载中…</p>
         ) : data ? (
@@ -207,13 +216,30 @@ const CIRCUIT_META: Record<CircuitState, { label: string; cls: string; dot: stri
 }
 
 // 号池健康总览:每号真实熔断态 + 健康分 + 冷却剩余 + 快捷运维操作(强刷/重置/启用禁用)。
+// 数据双源:insights(10s 轮询,给全量字段)+ SSE live 帧(~1.5s,实时覆盖 rpm/inflight/熔断/健康分),
+// 让实时指标跟手、又不丢 insights 的推断文案/软上限。
 function PoolHealthCard() {
   const { data, isLoading } = useRatelimitInsights()
+  const { frame, connected } = useLiveStream(true)
   const setDisabled = useSetDisabled()
   const resetFailure = useResetFailure()
   const forceRefresh = useForceRefreshToken()
 
-  const insights = data ?? []
+  // 用 SSE live 帧的实时值覆盖 insights 的对应字段(id 对齐;live 帧缺该号则保留 insights 值)。
+  const liveById = new Map((frame?.creds ?? []).map((c) => [c.id, c]))
+  const insights: RateLimitInsight[] = (data ?? []).map((it) => {
+    const lv = liveById.get(it.id)
+    if (!lv) return it
+    return {
+      ...it,
+      rpm: lv.rpm,
+      inflight: lv.inflight,
+      // 实时熔断态/健康分覆盖(insights.health 可能为 10s 前的);其余 health 字段保留。
+      health: it.health
+        ? { ...it.health, circuitOpen: lv.circuitOpen, health: lv.healthScore }
+        : it.health,
+    }
+  })
   // 排序:最需要关注的排前(熔断/半开/冷却/亚健康 > 健康 > 禁用)。
   const order: Record<CircuitState, number> = { open: 0, halfOpen: 1, cooldown: 2, warn: 3, healthy: 4, disabled: 5 }
   const sorted = [...insights].sort((a, b) => order[circuitStateOf(a)] - order[circuitStateOf(b)] || a.id - b.id)
@@ -226,8 +252,12 @@ function PoolHealthCard() {
         <CardTitle className="flex items-center gap-2 text-base">
           <ShieldAlert className="h-4 w-4" />
           号池健康
-          <span className="text-xs font-normal text-muted-foreground">
-            · 真实熔断态 + 健康分(零上游,10s 刷新)
+          <span className="flex items-center gap-1.5 text-xs font-normal text-muted-foreground">
+            <span
+              className={`inline-block h-1.5 w-1.5 rounded-full ${connected ? 'animate-pulse bg-emerald-400' : 'bg-[#666]'}`}
+              title={connected ? '实时流已连接（~1.5s）' : '实时流未连接，回退 10s 轮询'}
+            />
+            · 真实熔断态 + 健康分(零上游{connected ? '，实时' : '，10s 轮询'})
           </span>
         </CardTitle>
       </CardHeader>
@@ -506,17 +536,16 @@ function LogViewer() {
              </button>
            )}
          </div>
-         <select
+         <Select
            value={moduleFilter}
-           onChange={(e) => setModuleFilter(e.target.value)}
-           className="h-7 max-w-[200px] rounded-md border border-[#2e2e2e] bg-[#0a0a0a] px-2 text-xs text-[#ededed] focus:border-[#0070f3] focus:outline-none"
-           title="按模块过滤"
-         >
-           <option value="">全部模块</option>
-           {modules.map((m) => (
-             <option key={m} value={m}>{m}</option>
-           ))}
-         </select>
+           onChange={setModuleFilter}
+           aria-label="按模块过滤"
+           className="w-[180px] shrink-0"
+           options={[
+             { value: '', label: '全部模块' },
+             ...modules.map((m) => ({ value: m, label: m })),
+           ]}
+         />
        </div>
       </CardHeader>
       <CardContent>

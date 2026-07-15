@@ -11,9 +11,24 @@
 //! - **零成本**:全是 `AtomicU64::fetch_add(Relaxed)`,热路径可无脑调。
 //! - **单一真相源**:各处自愈事件只调 `bump_*`,`snapshot()` 一次性导出给端点。
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
+
+/// at-rest 加密健康标志:true=最近一次凭据落盘符合加密开关预期(关→明文 / 开→真加密成功);
+/// false=开了加密但上次落盘因密钥文件读写失败等回退了明文(安全预期与现实不符,UI 应告警)。
+/// 初值 true(未落盘/未开加密时视为健康)。
+static AT_REST_HEALTHY: AtomicBool = AtomicBool::new(true);
+
+/// 设置 at-rest 加密健康标志(persist 时调:!enabled || 真加密成功 = true)。
+pub fn set_at_rest_healthy(healthy: bool) {
+    AT_REST_HEALTHY.store(healthy, Ordering::Relaxed);
+}
+
+/// 读 at-rest 加密健康标志(供 recovery-metrics 端点/UI)。
+pub fn at_rest_healthy() -> bool {
+    AT_REST_HEALTHY.load(Ordering::Relaxed)
+}
 
 /// 进程启动时刻(首次访问时锚定),用于 uptime_ms。
 fn start_instant() -> Instant {
@@ -45,16 +60,19 @@ macro_rules! counters {
             let c = counters();
             RecoveryMetricsSnapshot {
                 uptime_ms,
+                at_rest_healthy: at_rest_healthy(),
                 $($field: c.$field.load(Ordering::Relaxed),)*
             }
         }
 
-        /// 计数器快照(序列化为 JSON 给前端)。字段与 `Counters` 一一对应 + uptime_ms。
+        /// 计数器快照(序列化为 JSON 给前端)。字段与 `Counters` 一一对应 + uptime_ms + at_rest_healthy。
         #[derive(Debug, Clone, serde::Serialize)]
         #[serde(rename_all = "camelCase")]
         pub struct RecoveryMetricsSnapshot {
             /// 自进程启动以来的毫秒数(抓取端据此算速率)。
             pub uptime_ms: u64,
+            /// at-rest 加密健康:false=开了加密但上次落盘回退了明文(UI 告警用)。
+            pub at_rest_healthy: bool,
             $(pub $field: u64,)*
         }
     };
@@ -78,6 +96,9 @@ counters! {
     // 泄漏 token 清洗(#70544 幻觉 token):清洗过的请求数 + 命中 saturation 退化的请求数
     leaked_cleaned_requests: bump_leaked_cleaned_request,
     leaked_saturation_requests: bump_leaked_saturation_request,
+    // 文本化工具调用(assistantResponseEvent 文本流出现 <invoke/antml:/<parameter):命中 chunk 数。
+    // 取证用:量化 Kiro 把工具调用文本化的频率,决定是否值得做 R4 重组层。
+    textified_invoke_hits: bump_textified_invoke,
 }
 
 #[cfg(test)]

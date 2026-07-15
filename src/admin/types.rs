@@ -530,6 +530,8 @@ pub struct ConfigSnapshotResponse {
     pub tool_truncation_recovery: bool,
     /// 入站工具顶层 description 字符上限（默认 10000，立即生效，0=不截断）
     pub tool_description_max_chars: usize,
+    /// credentials.json / trash.json at-rest 加密开关（机器绑定密钥，立即生效，默认关）
+    pub encrypt_credentials_at_rest: bool,
     pub cooldown_enabled: bool,
     pub rate_limit_enabled: bool,
     pub rate_limit_daily_max: u32,
@@ -599,6 +601,8 @@ pub struct UpdateConfigRequest {
     pub tool_repair_json: Option<bool>,
     pub tool_truncation_recovery: Option<bool>,
     pub tool_description_max_chars: Option<usize>,
+    /// credentials.json / trash.json at-rest 加密开关。开启后下次 persist 把明文重写为密文(透明迁移)。
+    pub encrypt_credentials_at_rest: Option<bool>,
     pub cooldown_enabled: Option<bool>,
     pub rate_limit_enabled: Option<bool>,
     pub rate_limit_daily_max: Option<u32>,
@@ -796,6 +800,7 @@ mod tests {
             tool_repair_json: true,
             tool_truncation_recovery: false,
             tool_description_max_chars: 10000,
+            encrypt_credentials_at_rest: false,
             config_path: None,
         };
         let s = serde_json::to_string(&snap).expect("序列化应成功");
