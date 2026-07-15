@@ -2617,6 +2617,452 @@ fn invoke_trace_enabled() -> bool {
     })
 }
 
+// ============================================================================
+// 文本化 invoke 解析纯函数集（从 ZyphrZero/kiro.rs 移植，逐字保真逻辑）
+//
+// 这批函数全部是纯函数：不触碰 StreamContext / 任何可变状态，只对入参字符串做
+// 结构解析。用于从「模型把工具调用当纯文本吐出」的退化输出（#70544 变体）里把
+// `<invoke name="...">...<parameter ...>...</parameter>...</invoke>` 结构捞回。
+// 复用本文件既有的 `QUOTE_CHARS` / `is_quote_char`（与 kiro.rs 完全一致）。
+//
+// 本阶段只落地函数 + 单测（隔离验证），暂不接入任何状态机。
+// ============================================================================
+
+/// 检查 `name_pos`（指向标签名首字母）的前面是否构成合法的开标签起始，
+/// 兼容裸写法 `<tag` 和带命名空间前缀的写法 `<prefix:tag`。
+///
+/// 返回 `Some(lt_pos)`（指向 `<` 的字节位置）表示合法；`None` 表示不是标签。
+///
+/// 注：本阶段这批 invoke 解析纯函数仅落地 + 单测隔离验证，尚未接入状态机，
+/// 故统一 `#[allow(dead_code)]`；后续接线阶段移除。
+#[allow(dead_code)]
+fn open_tag_lt_pos(buffer: &str, name_pos: usize) -> Option<usize> {
+    let bytes = buffer.as_bytes();
+    if name_pos == 0 {
+        return None;
+    }
+    let prev = bytes[name_pos - 1];
+    if prev == b'<' {
+        return Some(name_pos - 1);
+    }
+    // 形如 `<prefix:tag`：name 前面是 ':'，再往前是一段标识符，再往前是 '<'
+    if prev == b':' {
+        let i = name_pos - 1; // 指向 ':'
+        let mut j = i; // 标识符左边界扫描
+        while j > 0 && {
+            let c = bytes[j - 1];
+            c.is_ascii_alphanumeric() || c == b'_'
+        } {
+            j -= 1;
+        }
+        // 标识符非空，且其左边是 '<'
+        if j < i && j > 0 && bytes[j - 1] == b'<' {
+            return Some(j - 1);
+        }
+    }
+    None
+}
+
+/// 查找未被引用字符包裹的 invoke 开标签，返回指向 `<` 的字节位置
+///
+/// 兼容裸 `<invoke ...>` 与带命名空间前缀 `<prefix:invoke ...>` 两种写法。
+/// 复用 `is_quote_char`：若 `<` 前紧贴反引号/引号等包裹字符，视为引用，跳过。
+#[allow(dead_code)]
+fn find_invoke_start(buffer: &str) -> Option<usize> {
+    let mut search = 0;
+    while let Some(rel) = buffer[search..].find("invoke") {
+        let name_pos = search + rel;
+        if let Some(lt) = open_tag_lt_pos(buffer, name_pos) {
+            // 标签名后必须是边界字符（空白或 '>'），避免误匹配 invoked 之类
+            let after = name_pos + "invoke".len();
+            let next_ok = buffer.as_bytes().get(after).map_or(true, |c| {
+                c.is_ascii_whitespace() || *c == b'>' || *c == b'/'
+            });
+            let has_quote_before = lt > 0 && is_quote_char(buffer, lt - 1);
+            if next_ok && !has_quote_before {
+                return Some(lt);
+            }
+        }
+        search = name_pos + "invoke".len();
+    }
+    None
+}
+
+/// 从 `start` 之后查找第一个 invoke 闭标签，返回结束位置（exclusive，含闭标签）
+///
+/// 兼容裸 `</invoke>` 与带前缀 `</prefix:invoke>`。找不到返回 `None`（块还没到齐）。
+#[allow(dead_code)]
+fn find_invoke_block_end(buffer: &str, start: usize) -> Option<usize> {
+    // 块 A 的边界 = 下一个 `<invoke` 开标签（即下一个块 B 的起点），没有则到 buffer 结尾。
+    // 这样连发 burst（A 紧跟 B）时，A 的搜索区间被 B 的开标签卡住，绝不会吃进 B。
+    let boundary = match find_next_invoke_open(buffer, start) {
+        Some(p) => p,
+        None => buffer.len(),
+    };
+    // 在 [start, boundary) 区间里取【最后一个】 `</invoke>` 作为真闭合。
+    // 贪婪取最后一个 → patch 正文里出现的字面 `</invoke>` 不会导致提前截断；
+    // 区间被下一个块开标签卡住 → 不会跨块误合并。
+    find_last_invoke_close(buffer, start, boundary)
+}
+
+/// 从 `start` 之后查找下一个真正的 `<invoke`（或 `<prefix:invoke`）开标签的字节位置。
+/// 跳过 `start` 处当前块自身的开标签。
+#[allow(dead_code)]
+fn find_next_invoke_open(buffer: &str, start: usize) -> Option<usize> {
+    // 先跳过当前块的开标签：从 start 之后第一个 '>' 之后开始找。
+    let after_open = match buffer[start..].find('>') {
+        Some(rel) => start + rel + 1,
+        None => return None,
+    };
+    // 注意：不能复用 find_invoke_start——它对 `<` 前是 `>`（引用字符）的情况会拒绝，
+    // 而连发 burst 里 B 的 `<invoke` 恰好紧跟在 A 的 `</invoke>` 的 `>` 后面。
+    // 这里只认结构：`<invoke` 或 `<prefix:invoke`，开标签名后须是空白/`>`/`/` 边界。
+    let region = &buffer[after_open..];
+    let mut search = 0usize;
+    while let Some(rel) = region[search..].find("invoke") {
+        let name_pos = search + rel;
+        if let Some(lt) = open_tag_lt_pos(region, name_pos) {
+            let after = name_pos + "invoke".len();
+            let next_ok = region.as_bytes().get(after).map_or(true, |c| {
+                c.is_ascii_whitespace() || *c == b'>' || *c == b'/'
+            });
+            if next_ok {
+                return Some(after_open + lt);
+            }
+        }
+        search = name_pos + "invoke".len();
+    }
+    None
+}
+
+/// 在 `[from, boundary)` 区间内查找最后一个 `</invoke>` / `</prefix:invoke>` 的结束位置
+/// （exclusive，含闭标签）。找不到返回 `None`（块还没到齐）。
+#[allow(dead_code)]
+fn find_last_invoke_close(buffer: &str, from: usize, boundary: usize) -> Option<usize> {
+    let region_end = boundary.min(buffer.len());
+    if from >= region_end {
+        return None;
+    }
+    let region = &buffer[from..region_end];
+    let bytes = region.as_bytes();
+    let mut search = 0usize;
+    let mut last: Option<usize> = None;
+    while let Some(rel) = region[search..].find("invoke>") {
+        let name_pos = search + rel;
+        // '</invoke>' 形式
+        if name_pos >= 2 && &region[name_pos - 2..name_pos] == "</" {
+            last = Some(from + name_pos + "invoke>".len());
+        } else if name_pos >= 1 && bytes[name_pos - 1] == b':' {
+            // '</prefix:invoke>' 形式
+            let mut j = name_pos - 1; // ':'
+            while j > 0 && {
+                let c = bytes[j - 1];
+                c.is_ascii_alphanumeric() || c == b'_'
+            } {
+                j -= 1;
+            }
+            if j >= 2 && &region[j - 2..j] == "</" {
+                last = Some(from + name_pos + "invoke>".len());
+            }
+        }
+        search = name_pos + "invoke>".len();
+    }
+    last
+}
+
+/// 从标签字符串中抠出 `name="..."` 的值（取第一个匹配）
+#[allow(dead_code)]
+fn extract_name_attr(tag: &str) -> Option<String> {
+    let needle = "name=\"";
+    let rel = tag.find(needle)?;
+    let start = rel + needle.len();
+    let end_rel = tag[start..].find('"')?;
+    Some(tag[start..start + end_rel].to_string())
+}
+
+/// 解析一个完整 invoke 块，抠出 (tool_name, input_json_string)
+///
+/// - tool name 来自 invoke 开标签的 `name="..."`（兼容 antml: 前缀）
+/// - 参数为零个或多个 `<parameter name="K">V</parameter>`（兼容前缀）
+/// - 参数值取到下一个参数开标签前的**最后一个** `</parameter>` 为界（贪婪），
+///   允许多行 / 含 `<` / 中文 / 含字面 `</parameter>`（P0-1 修复）
+/// - 用 serde_json 拼成 object（值都是字符串，自动转义）
+/// - 无合法 name 或拼不出合法 JSON 返回 `None`
+#[allow(dead_code)]
+fn parse_invoke_block(block: &str) -> Option<(String, String)> {
+    // invoke 开标签 = 块开头到第一个 '>'
+    let open_end = block.find('>')?;
+    let open_tag = &block[..=open_end];
+    let tool_name = extract_name_attr(open_tag)?;
+    if tool_name.is_empty() {
+        return None;
+    }
+
+    let mut map = serde_json::Map::new();
+    let body = &block[open_end + 1..];
+    let mut cursor = 0usize;
+    while let Some(rel) = body[cursor..].find("parameter name=\"") {
+        let name_kw = cursor + rel;
+        // 确认是真正的 '<parameter' 或 '<prefix:parameter' 开标签
+        // name_kw 指向 'parameter'，往前应是 '<' 或 '<prefix:'
+        // 确认是真正的开标签（'<parameter' / '<prefix:parameter'）；仅用于校验，不需要位置值
+        if open_tag_lt_pos(body, name_kw).is_none() {
+            cursor = name_kw + "parameter".len();
+            continue;
+        }
+        // 找该参数开标签的 '>'
+        let tag_gt = match body[name_kw..].find('>') {
+            Some(r) => name_kw + r,
+            None => break, // 开标签未闭合，停止
+        };
+        let param_open_tag = &body[name_kw..tag_gt + 1];
+        // 从 'parameter name="..."' 抠 key（剥掉前缀干扰：直接找 name="）
+        let key = match extract_name_attr(param_open_tag) {
+            Some(k) => k,
+            None => {
+                cursor = tag_gt + 1;
+                continue;
+            }
+        };
+        // 参数值取到 </parameter>（兼容前缀）为界。find_param_close 较贵，只调一次，
+        // 同时复用 (闭标签起始, 闭标签结束) 两个值：起始用于切值，结束用于推进游标。
+        let val_start = tag_gt + 1;
+        let (close_start, close_end) = match find_param_close(body, val_start) {
+            Some(pair) => pair,
+            None => break, // 值未闭合，停止
+        };
+        let value = &body[val_start..close_start];
+        map.insert(key, serde_json::Value::String(value.to_string()));
+        // 推进到闭标签之后
+        cursor = close_end;
+    }
+
+    let obj = serde_json::Value::Object(map);
+    let s = serde_json::to_string(&obj).ok()?;
+    Some((tool_name, s))
+}
+
+/// 从 `from` 开始查找第一个 parameter 闭标签，返回 (起始位置, 结束位置 exclusive)
+///
+/// 兼容裸 `</parameter>` 与带前缀 `</prefix:parameter>`。
+#[allow(dead_code)]
+fn find_param_close(body: &str, from: usize) -> Option<(usize, usize)> {
+    // P0-1：参数值（尤其 apply_patch 的 patch 正文）可能含字面 `</parameter>`。
+    // 朴素「取第一个 </parameter>」会把值截断。改成「贪婪取边界内最后一个 </parameter>」：
+    // 边界 = 下一个 `<parameter name="` 开标签（多参数场景），没有则到 body 结尾。
+    // 这样：① 单参数（含 apply_patch）取到真正的最后一个闭合，内容里的字面闭合不误伤；
+    //      ② 多参数仍按下一个参数开标签正确切分。
+    // 局限（已诚实标注）：若参数值里同时含字面 `<parameter name="`，边界判定会偏早；
+    // 实测 apply_patch 正文极少出现该字面串，可接受。
+    let boundary = match find_next_param_open(body, from) {
+        Some(p) => p,
+        None => body.len(),
+    };
+    let region = &body[from..boundary];
+    let kw = "parameter>";
+    let mut last: Option<(usize, usize)> = None;
+    let mut search = 0usize;
+    let bytes = region.as_bytes();
+    while let Some(rel) = region[search..].find(kw) {
+        let name_pos = search + rel;
+        // '</parameter>' 形式
+        if name_pos >= 2 && &region[name_pos - 2..name_pos] == "</" {
+            last = Some((from + name_pos - 2, from + name_pos + kw.len()));
+        } else if name_pos >= 1 && bytes[name_pos - 1] == b':' {
+            // '</prefix:parameter>' 形式
+            let mut j = name_pos - 1; // ':'
+            while j > 0 && {
+                let c = bytes[j - 1];
+                c.is_ascii_alphanumeric() || c == b'_'
+            } {
+                j -= 1;
+            }
+            if j >= 2 && &region[j - 2..j] == "</" {
+                last = Some((from + j - 2, from + name_pos + kw.len()));
+            }
+        }
+        search = name_pos + kw.len();
+    }
+    last
+}
+
+/// 从 `from` 开始查找下一个 `<parameter name="`（或 `<prefix:parameter name="`）开标签的字节位置。
+/// 用于 `find_param_close` 的贪婪边界：当前参数值最多吃到下一个参数开标签之前。
+#[allow(dead_code)]
+fn find_next_param_open(body: &str, from: usize) -> Option<usize> {
+    let mut search = from;
+    while let Some(rel) = body[search..].find("parameter name=\"") {
+        let kw_pos = search + rel;
+        // 必须是真正的开标签：'parameter' 前面是 '<' 或 '<prefix:'
+        if let Some(lt) = open_tag_lt_pos(body, kw_pos) {
+            return Some(lt);
+        }
+        search = kw_pos + "parameter".len();
+    }
+    None
+}
+
+/// 剥掉块前文本尾部的独立 stray token 行（单独一行的 `call` / `count` / `card` / `court`）
+///
+/// 实测里 `<invoke>` 前常出现一行裸 `call`/`count`，需要从块前叙述文本里剥掉，
+/// 避免泄漏给客户端。只剥“尾部、且独占一行”的 stray token，前面的正常叙述保留。
+/// 已实测到的 stray token 集合：Opus 长上下文退化时，泄漏的 `<invoke>` 前常有一行裸的
+/// `call` / `count` / `card`。集合形式便于以后扩充。
+///
+/// 生产语料（KiroStudio #70544 变体）里 `court` 是最主要的 stray token，故并入集合。
+#[allow(dead_code)]
+const STRAY_INVOKE_TOKENS: &[&str] = &["call", "count", "card", "court"];
+
+/// 复读熔断阈值：同一个 stray token（call/count/card/court）连续作为独占一行重复出现
+/// 超过这么多次，判定为「Opus 长上下文退化复读死循环」，立即熔断本轮文本输出。
+///
+/// 取值权衡：正常工具调用前最多出现 1 个引导词行（偶有 2~3），绝不会连续几十次。
+/// 设为 32 远高于正常上限、又远低于退化时的数万次，既不误伤正常引导词，又能尽早止血。
+#[allow(dead_code)]
+const REPEAT_GUARD_TRIP_THRESHOLD: u32 = 32;
+
+/// 块级复读折叠：对「已完整的整段文本」做一次性复读熔断。
+///
+/// 用于非流式 / web_search loop 路径（`extract_invoke_content_blocks` 入口）——
+/// 那条路不经过流式 `emit_text_delta_raw` 的逐 chunk 熔断，所以在这里独立兜一次。
+///
+/// 规则与流式版一致：同一个 `STRAY_INVOKE_TOKENS`（call/count/card/court）连续作为独占一行
+/// 重复超过 `REPEAT_GUARD_TRIP_THRESHOLD` 次，判定为 Opus 退化复读，**从超阈值处截断**，
+/// 丢弃其后的全部复读垃圾（断雪球、不灌历史）。阈值内的少量引导词重复原样保留。
+#[allow(dead_code)]
+fn collapse_stray_token_floods(text: &str) -> std::borrow::Cow<'_, str> {
+    let mut last_line = "";
+    let mut run: u32 = 0;
+    let mut cut_at: Option<usize> = None;
+    let mut offset = 0usize;
+    for segment in text.split_inclusive('\n') {
+        let line = segment.trim();
+        if STRAY_INVOKE_TOKENS.contains(&line) {
+            if line == last_line {
+                run += 1;
+            } else {
+                last_line = line;
+                run = 1;
+            }
+            if run >= REPEAT_GUARD_TRIP_THRESHOLD {
+                // 从「本段（这一行）开头」截断：保留阈值内已累计的内容。
+                cut_at = Some(offset);
+                break;
+            }
+        } else if !line.is_empty() {
+            last_line = line;
+            run = 0;
+        }
+        offset += segment.len();
+    }
+    match cut_at {
+        Some(pos) => std::borrow::Cow::Owned(text[..pos].to_string()),
+        None => std::borrow::Cow::Borrowed(text),
+    }
+}
+
+/// 剥掉块前文本尾部独占一行的 stray token（保留其前一行的换行）
+#[allow(dead_code)]
+fn strip_trailing_stray_tokens(before: &str) -> &str {
+    let mut end = before.len();
+    loop {
+        let bytes = before.as_bytes();
+        // 先跳过尾部的换行符，定位“最后一行”的真实结束位置
+        let mut e = end;
+        while e > 0 && (bytes[e - 1] == b'\n' || bytes[e - 1] == b'\r') {
+            e -= 1;
+        }
+        let line_start = before[..e].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let last_line = before[line_start..e].trim();
+        // Opus 长上下文退化时，泄漏的 <invoke> 前常有一个孤立的 stray token 行。
+        // 实测样本里出现过 call / count / card / court；用集合便于以后扩充。
+        if STRAY_INVOKE_TOKENS.contains(&last_line) {
+            // 只剥 stray token 行本身，【保留】前一行末尾的换行符。
+            // 旧实现用 line_start - 1 把前一行的换行也吞掉，会把前面的叙述正文和
+            // 后续 <invoke> 挤到同一行，导致 invoke_looks_like_real_leak 的“行首”判定
+            // 失败、漏捞真泄漏（narrative\ncall\n<invoke>）。改成 end = line_start：
+            //   "some text\ncall" -> "some text\n"（行首信号保留）
+            //   "call"（无前导正文）-> ""（line_start==0）
+            end = line_start;
+            if end == 0 {
+                return "";
+            }
+        } else {
+            break;
+        }
+    }
+    &before[..end]
+}
+
+/// 判定一个 `<invoke>` 块到底像“真泄漏的工具调用”还是“正文里讨论的文本”
+///
+/// 实测真泄漏的 `<invoke>` 都出现在**行首**（前面是流的开头、或上一行已经换行结束），
+/// 而正文讨论里的 `<invoke>` 一般**嵌在一句话中间**——前面同一行还有普通文字。
+///
+/// 判定规则（输入 `before` 是 `<invoke>` 之前、已剥过 stray token 的文本）：
+/// - `before` 为空（`<invoke>` 在流开头）→ 像真泄漏，抓。
+/// - `before` 去掉尾部空格/制表符后以换行结尾（`<invoke>` 独占新行）→ 抓。
+/// - 否则（同一行前面还有非空白正文）→ 像讨论文本，不抓。
+///
+/// 注意：这里的“尾部空白”只剥行内空白（空格 / 制表符），不剥换行；
+/// 换行结尾才是“另起一行”的信号。
+#[allow(dead_code)]
+fn invoke_looks_like_real_leak(before: &str) -> bool {
+    // 剥掉尾部的行内空白（空格 / 制表符），但保留换行
+    let trimmed = before.trim_end_matches([' ', '\t']);
+    // 行首：要么前面什么都没有，要么上一行已经以换行结束
+    trimmed.is_empty() || trimmed.ends_with('\n') || trimmed.ends_with('\r')
+}
+
+/// 推进「代码围栏」奇偶状态，对切分到多个 chunk 的 ``` 分隔符鲁棒。
+///
+/// 只在遇到换行符时才对「已重组的完整行」判定是否为围栏行（行首去空白后以 ``` 开头）。
+/// 未遇换行的尾部留在 `partial` 里，等后续 chunk 拼齐——所以即使 ``` 被切成
+/// `` `` `` + `` ` `` 两个 chunk，重组成完整行后仍能正确翻转 `open`。
+///
+/// 返回值仅在内部使用；主要副作用是更新 `open` 与 `partial`。
+#[allow(dead_code)]
+fn advance_code_fence_state(open: &mut bool, partial: &mut String, text: &str) {
+    for ch in text.chars() {
+        if ch == '\n' {
+            if partial.trim_start().starts_with("```") {
+                *open = !*open;
+            }
+            partial.clear();
+        } else {
+            partial.push(ch);
+        }
+    }
+}
+
+/// 纯函数：在不改动真实状态的前提下，试算「把 `text` 走完之后围栏是否打开」。
+/// 用于 drain 决策处判断某个 `<invoke>` 是否落在围栏内。
+#[allow(dead_code)]
+fn fence_open_after(open: bool, partial: &str, text: &str) -> bool {
+    let mut o = open;
+    let mut p = partial.to_string();
+    advance_code_fence_state(&mut o, &mut p, text);
+    // 还要考虑：partial 里残留的「未换行行」如果本身已经是 ``` 开头，
+    // 它在遇到换行前不算翻转（保守：只有完整行才翻转）。这里返回已翻转的 o。
+    o
+}
+
+/// 计算缓冲区末尾“可能是部分 `<invoke` 开标签前缀”的字节数，需要保留等待更多内容
+///
+/// 例如缓冲区以 `<inv` / `<` / `<i` 结尾时，可能是被切碎的 invoke 开标签，
+/// 保留这段尾巴等下一个 chunk 拼齐，避免把半个标签当文本吐出去。
+#[allow(dead_code)]
+fn partial_invoke_tag_suffix_len(buf: &str) -> usize {
+    // 任何形如 `<...`（最后一个 '<' 之后没有 '>'）的尾巴都可能是部分开标签
+    if let Some(lt) = buf.rfind('<') {
+        if !buf[lt..].contains('>') {
+            return buf.len() - lt;
+        }
+    }
+    0
+}
+
+
 /// 检测文本片段里是否出现「文本化的工具调用标记」。
 /// 覆盖:Anthropic 工具调用语法 `<invoke`/`</invoke>`/`<parameter name=`(不论是否带 antml: 前缀),
 /// 及 `<function_calls>` 包裹。仅诊断用(探针),不改控制流。
@@ -2734,6 +3180,284 @@ pub(crate) fn merge_tool_input(buf: &str, frame: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // 文本化 invoke 解析纯函数单测（从 ZyphrZero/kiro.rs 移植 + KiroStudio 补充）
+    // 这些函数是纯函数，直接对字符串断言，不经过 StreamContext 状态机。
+    // 命名统一含 `invoke`，便于 `cargo test -- invoke` 精准挑选。
+    // ========================================================================
+
+    #[test]
+    fn test_invoke_parse_complete_block() {
+        // 🟢 完整块：<invoke name="Bash"><parameter name="command">ls</parameter></invoke>
+        let block = r#"<invoke name="Bash"><parameter name="command">ls</parameter></invoke>"#;
+        let (name, input) = parse_invoke_block(block).expect("应解析出 tool");
+        assert_eq!(name, "Bash");
+        let parsed: serde_json::Value = serde_json::from_str(&input).expect("input 应为合法 JSON");
+        assert_eq!(parsed["command"], "ls");
+    }
+
+    #[test]
+    fn test_invoke_parse_antml_prefix_tolerated() {
+        // 🟢 带 antml: 命名空间前缀应被容忍（开/闭标签均带前缀）。
+        // 用拼接构造标签，避免源码里出现字面工具调用标记。
+        let ns = "antml:";
+        let block = format!(
+            "<{ns}invoke name=\"X\"><{ns}parameter name=\"y\">v</{ns}parameter></{ns}invoke>"
+        );
+        let (name, input) = parse_invoke_block(&block).expect("带前缀的块应能解析");
+        assert_eq!(name, "X");
+        let parsed: serde_json::Value = serde_json::from_str(&input).expect("input 应为合法 JSON");
+        assert_eq!(parsed["y"], "v");
+    }
+
+    #[test]
+    fn test_invoke_parse_param_value_with_lt_multiline_chinese() {
+        // 🟢 参数值含 `<`、多行、中文 → 不被截断
+        let value = "第一行 a < b\n第二行 路径 /tmp/中文";
+        let block = format!(
+            "<invoke name=\"write_file\"><parameter name=\"content\">{value}</parameter></invoke>"
+        );
+        let (name, input) = parse_invoke_block(&block).expect("应解析出 tool");
+        assert_eq!(name, "write_file");
+        let parsed: serde_json::Value = serde_json::from_str(&input).expect("input 应为合法 JSON");
+        assert_eq!(parsed["content"], value, "参数值应完整保留（含 < / 多行 / 中文）");
+    }
+
+    #[test]
+    fn test_invoke_parse_apply_patch_literal_close_tag_survives() {
+        // 🟢 P0-1：apply_patch 正文里含字面 </parameter> —— 贪婪取最后一个闭合，不被提前截断。
+        let closing = format!("</{}>", "parameter");
+        let value = format!("patch line 1\n此处有字面 {closing} 标记\npatch line 3");
+        let block = format!(
+            "<invoke name=\"apply_patch\"><parameter name=\"input\">{value}</parameter></invoke>"
+        );
+        let (name, input) = parse_invoke_block(&block).expect("应解析出 tool");
+        assert_eq!(name, "apply_patch");
+        let parsed: serde_json::Value = serde_json::from_str(&input).expect("input 应为合法 JSON");
+        assert_eq!(parsed["input"], value, "含字面闭合标签的正文应完整保留");
+    }
+
+    #[test]
+    fn test_invoke_parse_two_params() {
+        // 🟢 多参数：按下一个参数开标签正确切分
+        let block = r#"<invoke name="t"><parameter name="a">1</parameter><parameter name="b">2</parameter></invoke>"#;
+        let (name, input) = parse_invoke_block(block).expect("应解析出 tool");
+        assert_eq!(name, "t");
+        let parsed: serde_json::Value = serde_json::from_str(&input).expect("input 应为合法 JSON");
+        assert_eq!(parsed["a"], "1");
+        assert_eq!(parsed["b"], "2");
+    }
+
+    #[test]
+    fn test_invoke_parse_no_params() {
+        // 🟢 零参数块 → 合法但 input 为空对象
+        let block = r#"<invoke name="noop"></invoke>"#;
+        let (name, input) = parse_invoke_block(block).expect("应解析出 tool");
+        assert_eq!(name, "noop");
+        assert_eq!(input, "{}");
+    }
+
+    #[test]
+    fn test_invoke_parse_empty_name_rejected() {
+        // 🔴 name 为空 → None
+        let block = r#"<invoke name=""><parameter name="x">v</parameter></invoke>"#;
+        assert!(parse_invoke_block(block).is_none(), "空 name 应被拒绝");
+    }
+
+    #[test]
+    fn test_invoke_find_start_bare_and_prefixed() {
+        // 🟢 裸 `<invoke` 与带前缀 `<prefix:invoke` 都能定位到 '<'
+        assert_eq!(find_invoke_start("<invoke name=\"x\">"), Some(0));
+        assert_eq!(find_invoke_start("abc\n<invoke name=\"x\">"), Some(4));
+        let prefixed = "<invoke name=\"x\">";
+        assert_eq!(find_invoke_start(prefixed), Some(0));
+    }
+
+    #[test]
+    fn test_invoke_find_start_backtick_wrapped_is_skipped() {
+        // 🔴 被反引号包裹的 <invoke 视为引用，跳过
+        assert_eq!(find_invoke_start("示例：`<invoke name=\"x\">`"), None);
+    }
+
+    #[test]
+    fn test_invoke_find_start_ignores_invoked_word() {
+        // 🔴 `invoked` 这类词不构成开标签（标签名后需边界字符）
+        assert_eq!(find_invoke_start("the model invoked a tool"), None);
+    }
+
+    #[test]
+    fn test_invoke_block_end_greedy_and_unclosed() {
+        // 🟢 完整块 → 返回含闭标签的结束位置；未闭合 → None
+        let full = r#"<invoke name="x"><parameter name="c">ls</parameter></invoke>"#;
+        let end = find_invoke_block_end(full, 0).expect("完整块应有结束位置");
+        assert_eq!(end, full.len());
+
+        let unclosed = r#"<invoke name="x"><parameter name="c">ls"#;
+        assert!(find_invoke_block_end(unclosed, 0).is_none(), "未闭合块应返回 None");
+    }
+
+    #[test]
+    fn test_invoke_next_open_finds_second_burst() {
+        // 🟢 连发 burst：A 紧跟 B，find_next_invoke_open 跳过 A 自身开标签，定位到 B
+        let s = r#"<invoke name="a"><parameter name="x">1</parameter></invoke><invoke name="b"><parameter name="y">2</parameter></invoke>"#;
+        let b_pos = find_next_invoke_open(s, 0).expect("应找到第二个块开标签");
+        assert_eq!(&s[b_pos..b_pos + "<invoke name=\"b\"".len()], "<invoke name=\"b\"");
+    }
+
+    #[test]
+    fn test_invoke_two_blocks_parsed_via_block_end() {
+        // 🟢 用 find_invoke_block_end + parse_invoke_block 串起两块，各自独立解析
+        let s = r#"<invoke name="a"><parameter name="x">1</parameter></invoke><invoke name="b"><parameter name="y">2</parameter></invoke>"#;
+        let start_a = find_invoke_start(s).unwrap();
+        let end_a = find_invoke_block_end(s, start_a).unwrap();
+        let (na, _) = parse_invoke_block(&s[start_a..end_a]).unwrap();
+        assert_eq!(na, "a");
+
+        let start_b = find_next_invoke_open(s, start_a).unwrap();
+        let end_b = find_invoke_block_end(s, start_b).unwrap();
+        let (nb, _) = parse_invoke_block(&s[start_b..end_b]).unwrap();
+        assert_eq!(nb, "b");
+        assert_eq!(end_b, s.len());
+    }
+
+    #[test]
+    fn test_invoke_last_close_greedy_skips_literal() {
+        // 🟢 区间内含字面 </invoke> → find_last_invoke_close 取最后一个真闭合
+        let s = format!(
+            "<invoke name=\"x\"><parameter name=\"c\">正文里有字面 {} 标记</parameter></invoke>",
+            "</invoke>"
+        );
+        let end = find_last_invoke_close(&s, 0, s.len()).expect("应找到最后一个闭合");
+        assert_eq!(end, s.len());
+    }
+
+    #[test]
+    fn test_invoke_open_tag_lt_pos_bare_and_prefixed() {
+        // 🟢 open_tag_lt_pos：裸 `<tag` 与 `<prefix:tag` 都能回溯到 '<'
+        let bare = "<invoke";
+        let name_pos = bare.find("invoke").unwrap();
+        assert_eq!(open_tag_lt_pos(bare, name_pos), Some(0));
+
+        let prefixed = "<invoke";
+        let np = prefixed.find("invoke").unwrap();
+        assert_eq!(open_tag_lt_pos(prefixed, np), Some(0));
+
+        // 前面不是 '<' 也不是合法前缀 → None
+        let bad = "xinvoke";
+        let bp = bad.find("invoke").unwrap();
+        assert_eq!(open_tag_lt_pos(bad, bp), None);
+    }
+
+    #[test]
+    fn test_invoke_extract_name_attr() {
+        assert_eq!(extract_name_attr(r#"<invoke name="Bash">"#), Some("Bash".to_string()));
+        assert_eq!(extract_name_attr(r#"<parameter name="cmd">"#), Some("cmd".to_string()));
+        assert_eq!(extract_name_attr("<invoke>"), None);
+    }
+
+    #[test]
+    fn test_invoke_next_param_open() {
+        // 🟢 find_next_param_open 定位下一个参数开标签的 '<'
+        let body = r#"<parameter name="a">1</parameter><parameter name="b">2</parameter>"#;
+        // 从第一个参数值区起找下一个参数开标签
+        let first_val_start = body.find('>').unwrap() + 1;
+        let next = find_next_param_open(body, first_val_start).expect("应找到第二个参数开标签");
+        assert_eq!(&body[next..next + "<parameter name=\"b\"".len()], "<parameter name=\"b\"");
+    }
+
+    #[test]
+    fn test_invoke_looks_like_real_leak_line_start() {
+        // 🟢 行首（空 / 换行结尾）→ 像真泄漏；句中 → 不像
+        assert!(invoke_looks_like_real_leak(""));
+        assert!(invoke_looks_like_real_leak("some text\n"));
+        assert!(invoke_looks_like_real_leak("some text\n   "));
+        assert!(invoke_looks_like_real_leak("some text\r"));
+        assert!(!invoke_looks_like_real_leak("讨论 "));
+        assert!(!invoke_looks_like_real_leak("- "));
+    }
+
+    #[test]
+    fn test_invoke_strip_trailing_stray_preserves_newline() {
+        // 回归：narrative\ncall → 只剥 stray 行，保留前一行换行（行首信号不丢）
+        let got = strip_trailing_stray_tokens("some text\ncall");
+        assert_eq!(got, "some text\n", "必须保留叙述行末的换行");
+        assert!(invoke_looks_like_real_leak(got), "剥完仍应像行首泄漏");
+    }
+
+    #[test]
+    fn test_invoke_strip_trailing_stray_court_token() {
+        // 🟢 KiroStudio 生产语料：court 是主要 stray token，应被剥
+        assert_eq!(strip_trailing_stray_tokens("先看结果。\ncourt"), "先看结果。\n");
+        assert_eq!(strip_trailing_stray_tokens("court"), "");
+        // 多个连续 stray 行全部剥掉
+        assert_eq!(strip_trailing_stray_tokens("正文\ncall\ncourt"), "正文\n");
+    }
+
+    #[test]
+    fn test_invoke_strip_trailing_stray_keeps_non_stray() {
+        // 🔴 非 stray 的末行不剥
+        assert_eq!(strip_trailing_stray_tokens("hello world"), "hello world");
+    }
+
+    #[test]
+    fn test_invoke_collapse_stray_token_floods() {
+        // 🟢 复读死循环：court 独占一行连续 100 次 → 从超阈值处截断
+        let mut s = String::from("正文引导\n");
+        for _ in 0..100 {
+            s.push_str("court\n");
+        }
+        s.push_str("<invoke name=\"x\">");
+        let collapsed = collapse_stray_token_floods(&s);
+        // 截断后应只保留阈值内内容，court 出现次数远小于 100
+        let court_count = collapsed.matches("court").count();
+        assert!(
+            court_count < 100,
+            "复读应被熔断截断，court 次数={court_count}"
+        );
+        assert!(!collapsed.contains("<invoke"), "超阈值后的内容应被丢弃");
+    }
+
+    #[test]
+    fn test_invoke_collapse_stray_token_below_threshold() {
+        // 🔴 阈值内的少量引导词重复原样保留
+        let s = "call\ncall\n<invoke name=\"x\">";
+        let collapsed = collapse_stray_token_floods(s);
+        assert_eq!(collapsed, s, "阈值内不应截断");
+    }
+
+    #[test]
+    fn test_invoke_code_fence_state_toggle() {
+        // 🟢 代码围栏奇偶翻转：一对 ``` 归零
+        let mut open = false;
+        let mut partial = String::new();
+        advance_code_fence_state(&mut open, &mut partial, "```rust\nlet x = 1;\n```\n");
+        assert!(!open, "一对围栏后应回到关闭态");
+
+        // 单个开围栏 → 打开
+        let mut open2 = false;
+        let mut partial2 = String::new();
+        advance_code_fence_state(&mut open2, &mut partial2, "```\n代码\n");
+        assert!(open2, "单个开围栏后应为打开态");
+    }
+
+    #[test]
+    fn test_invoke_fence_open_after_pure() {
+        // 🟢 fence_open_after 纯试算，不改传入状态
+        assert!(fence_open_after(false, "", "```\n"), "进入围栏");
+        assert!(!fence_open_after(true, "", "```\n"), "离开围栏");
+        assert!(!fence_open_after(false, "", "普通文本\n"), "普通文本不翻转");
+    }
+
+    #[test]
+    fn test_invoke_partial_tag_suffix_len() {
+        // 🟢 缓冲区末尾的半个开标签应被识别为需保留的尾巴
+        assert_eq!(partial_invoke_tag_suffix_len("hello<inv"), 4);
+        assert_eq!(partial_invoke_tag_suffix_len("hello<"), 1);
+        // 已闭合的标签结尾 → 无需保留
+        assert_eq!(partial_invoke_tag_suffix_len("<invoke>"), 0);
+        assert_eq!(partial_invoke_tag_suffix_len("no angle bracket"), 0);
+    }
 
     #[test]
     fn test_sse_event_format() {
