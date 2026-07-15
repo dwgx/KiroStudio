@@ -13,7 +13,6 @@ import {
   RefreshCw,
   Loader,
   Loader2,
-  AlertTriangle,
   Search,
   Fingerprint,
   ShieldCheck,
@@ -31,14 +30,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogFooter,
-  DialogTitle,
-  DialogDescription,
-} from '@/components/ui/dialog'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Skeleton } from '@/components/ui/skeleton'
 import { PageSkeleton } from '@/components/ui/page-skeleton'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -387,54 +379,7 @@ function ReadonlyRow({ label, value, mono }: { label: string; value: React.React
 
 /* ============ 通用二次确认弹框 ============ */
 // 危险操作前的确认：标题 + 描述 + 可选额外内容（如保留天数输入），确认色可选危险红。
-function ConfirmDialog({
-  open,
-  onOpenChange,
-  title,
-  description,
-  confirmLabel = '确定',
-  destructive = false,
-  loading = false,
-  onConfirm,
-  children,
-}: {
-  open: boolean
-  onOpenChange: (v: boolean) => void
-  title: string
-  description: React.ReactNode
-  confirmLabel?: string
-  destructive?: boolean
-  loading?: boolean
-  onConfirm: () => void
-  children?: React.ReactNode
-}) {
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-md">
-        <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
-            {destructive && <AlertTriangle className="h-4 w-4 text-red-400" />}
-            {title}
-          </DialogTitle>
-          <DialogDescription>{description}</DialogDescription>
-        </DialogHeader>
-        {children}
-        <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={loading}>
-            取消
-          </Button>
-          <Button
-            variant={destructive ? 'destructive' : 'default'}
-            onClick={onConfirm}
-            disabled={loading}
-          >
-            {loading ? '处理中…' : confirmLabel}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
+// ConfirmDialog 已抽到 @/components/ui/confirm-dialog(供运维页共享),此处从该模块 import。
 
 /* ============ 1. 服务管理：一键重启 + OTA 更新 ============ */
 function ServiceManagementCard() {
