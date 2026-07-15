@@ -85,7 +85,8 @@ impl Default for HealthState {
 }
 
 /// 只读健康快照（概览页/hover 推断日志用）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HealthSnapshot {
     pub circuit_open: bool,
     pub half_open: bool,

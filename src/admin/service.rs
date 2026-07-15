@@ -91,6 +91,10 @@ pub struct RateLimitInsight {
     pub recent429: u32,
     /// 中文推断文案（如"#54 冷却中（速率限制）剩22s，已触发3次""畅通"）
     pub insight_text: String,
+    /// 真实熔断/健康快照(circuit Open/HalfOpen + EWMA 健康分 + 试探概率 + 熔断剩余秒)。
+    /// 后端 HealthTracker 现成算好,此前无出口——现暴露给运维观测。无健康记录(从未被选过)时为 null,
+    /// 前端按缺省=Closed 满血处理。族级(M365 同租户共享),故同族多号快照一致(连坐语义)。
+    pub health: Option<crate::kiro::health::HealthSnapshot>,
 }
 
 /// SSE 实时流中单个凭据的轻量快照
@@ -107,6 +111,10 @@ pub struct LiveCred {
     pub cooling_down: bool,
     /// 冷却剩余毫秒；未冷却时为 null
     pub cooldown_remaining_ms: Option<u64>,
+    /// 熔断器是否 Open(真实熔断态,非启发式)。无健康记录时为 false(缺省满血)。
+    pub circuit_open: bool,
+    /// 健康分 [0,1](EWMA 成功率 × 429 惩罚)。无健康记录时为 1.0(缺省满血)。
+    pub health_score: f64,
 }
 
 /// 根据 rpm / 冷却状态推断中文限流文案（纯本地计算，零上游）。
@@ -369,6 +377,9 @@ impl AdminService {
             .map(|c| (c.credential_id, c))
             .collect();
 
+        // 熔断/健康快照:按 id 建表(后端现成算好,此前无出口)。无记录的号不在表中=缺省满血。
+        let mut healths = self.token_manager.health_snapshots();
+
         let mut out: Vec<RateLimitInsight> = snapshot
             .entries
             .into_iter()
@@ -409,6 +420,7 @@ impl AdminService {
                     }),
                     recent429,
                     insight_text,
+                    health: healths.remove(&e.id),
                 }
             })
             .collect();
@@ -429,6 +441,8 @@ impl AdminService {
             .map(|c| (c.credential_id, c))
             .collect();
 
+        let healths = self.token_manager.health_snapshots();
+
         let mut global_inflight: u32 = 0;
         let mut global_rpm: u32 = 0;
         let creds: Vec<LiveCred> = snapshot
@@ -438,12 +452,16 @@ impl AdminService {
                 global_inflight = global_inflight.saturating_add(e.inflight);
                 global_rpm = global_rpm.saturating_add(e.rpm);
                 let cd = cooldowns.get(&e.id);
+                let h = healths.get(&e.id);
                 LiveCred {
                     id: e.id,
                     rpm: e.rpm,
                     inflight: e.inflight,
                     cooling_down: cd.is_some(),
                     cooldown_remaining_ms: cd.map(|c| c.remaining_ms),
+                    // 无健康记录=缺省满血(Closed, health=1.0)。
+                    circuit_open: h.map(|s| s.circuit_open).unwrap_or(false),
+                    health_score: h.map(|s| s.health).unwrap_or(1.0),
                 }
             })
             .collect();
