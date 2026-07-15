@@ -34,6 +34,52 @@ fn gen_tool_call_id() -> String {
     format!("toolu_{}", random_hex(24))
 }
 
+/// OpenAI temperature ∈ [0,2],Anthropic(及兼容上游)∈ [0,1]。custom_api 透传路径把翻译后的
+/// body 原样发给 Anthropic 兼容上游,>1 会 400(Kiro 主路径不吃 temperature,但透传路径吃)。
+/// clamp 到 [0,1](2.0→1.0 仍是最高随机性,语义最接近),两条路径都安全。
+fn clamp_anthropic_temperature(t: f64) -> f64 {
+    t.clamp(0.0, 1.0)
+}
+
+/// 把 OpenAI `response_format` 翻成一段 system 指令(Anthropic 无原生 JSON mode,只能提示引导)。
+///
+/// - `{"type":"text"}` 或缺失 → None(默认,无需注入)。
+/// - `{"type":"json_object"}` → 要求只输出合法 JSON。
+/// - `{"type":"json_schema","json_schema":{"name","schema","strict"}}` → 附上目标 schema,要求严格遵循。
+///
+/// ⚠️ 诚实边界:这是**尽力引导**,非上游硬保证(Anthropic 不像 OpenAI 有服务端 JSON 约束/schema
+/// 校验)。绝大多数场景足够,但不能承诺 100% 合法/完全贴合 schema。作为 system 块追加(不覆盖用户
+/// 自己的 system),两条路径(Kiro 主路径 + custom_api 透传)都安全。
+fn response_format_instruction(rf: &Value) -> Option<String> {
+    let typ = rf.get("type").and_then(|v| v.as_str())?;
+    match typ {
+        "json_object" => Some(
+            "You must respond with a single valid JSON value only. \
+             Do not include any prose, explanation, markdown code fences, or text outside the JSON."
+                .to_string(),
+        ),
+        "json_schema" => {
+            // json_schema 既可能是 {json_schema:{schema:{..}}}(chat),也可能扁平在顶层(responses)。
+            let js = rf.get("json_schema").unwrap_or(rf);
+            let schema = js.get("schema").or_else(|| rf.get("schema"));
+            let name = js.get("name").and_then(|v| v.as_str()).unwrap_or("Response");
+            let mut instr = format!(
+                "You must respond with a single valid JSON value only, with no prose, explanation, \
+                 or markdown fences. The JSON must conform to this JSON Schema (named \"{name}\")"
+            );
+            if let Some(s) = schema {
+                instr.push_str(":\n");
+                instr.push_str(&s.to_string());
+            } else {
+                instr.push('.');
+            }
+            Some(instr)
+        }
+        // "text" 或未知类型:默认文本,不注入。
+        _ => None,
+    }
+}
+
 /// 把 OpenAI chat/completions 请求 JSON 翻译成 Anthropic MessagesRequest JSON。
 ///
 /// - `model` 用调用方已解析好的模型名(经 model_catalog 归一,GPT-5.6 等已在表)。
@@ -71,19 +117,23 @@ pub fn openai_chat_to_anthropic(model: &str, raw: &Value, stream: bool) -> Value
     // 透传客户端的非 1 值会让 Anthropic 兼容上游/透传路径 400)。thinking 关时正常透传。
     if !thinking_enabled {
         if let Some(t) = raw.get("temperature").and_then(|v| v.as_f64()) {
-            out.insert("temperature".into(), json!(t));
+            out.insert("temperature".into(), json!(clamp_anthropic_temperature(t)));
         }
     }
 
-    // stop → stop_sequences
+    // stop → stop_sequences。空串是合法 JSON 但 Anthropic 拒绝空 stop sequence(透传路径 400),
+    // 过滤掉;全空则不下发该字段。
     match raw.get("stop") {
         Some(Value::Array(arr)) => {
-            let seqs: Vec<String> = arr.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+            let seqs: Vec<String> = arr
+                .iter()
+                .filter_map(|v| v.as_str().filter(|s| !s.is_empty()).map(String::from))
+                .collect();
             if !seqs.is_empty() {
                 out.insert("stop_sequences".into(), json!(seqs));
             }
         }
-        Some(Value::String(s)) => {
+        Some(Value::String(s)) if !s.is_empty() => {
             out.insert("stop_sequences".into(), json!([s]));
         }
         _ => {}
@@ -124,9 +174,17 @@ pub fn openai_chat_to_anthropic(model: &str, raw: &Value, stream: bool) -> Value
     //   ③ 合并连续同角色消息(并行工具调用/结果归组),恢复 user/assistant 严格交替。
     messages = normalize_tool_pairing_and_merge(messages);
 
-    // 系统-only 输入:补一条空 user,防下游校验风险。
-    if messages.is_empty() && !system_blocks.is_empty() {
+    // 空消息兜底:补一条空 user,防 Anthropic「messages 非空」400。
+    // 覆盖两种退化输入:①system-only(有 system 无 user/assistant);②整体空请求。
+    if messages.is_empty() {
         messages.push(json!({"role": "user", "content": [{"type": "text", "text": ""}]}));
+    }
+
+    // response_format(JSON mode):Anthropic 无原生支持,翻成 system 指令引导(追加,不覆盖用户 system)。
+    if let Some(rf) = raw.get("response_format") {
+        if let Some(instr) = response_format_instruction(rf) {
+            system_blocks.push(json!({"type": "text", "text": instr}));
+        }
     }
 
     if !system_blocks.is_empty() {
@@ -533,7 +591,7 @@ pub fn openai_responses_to_anthropic(model: &str, raw: &Value, stream: bool) -> 
     }
     if !thinking_enabled {
         if let Some(t) = raw.get("temperature").and_then(|v| v.as_f64()) {
-            out.insert("temperature".into(), json!(t));
+            out.insert("temperature".into(), json!(clamp_anthropic_temperature(t)));
         }
     }
     if let Some(tp) = raw.get("top_p").and_then(|v| v.as_f64()) {
@@ -650,9 +708,23 @@ pub fn openai_responses_to_anthropic(model: &str, raw: &Value, stream: bool) -> 
     }
 
     messages = normalize_tool_pairing_and_merge(messages);
-    if messages.is_empty() && !system_blocks.is_empty() {
+    // 空消息兜底:同 chat 路径,覆盖 instructions-only 与整体空 input,防 Anthropic 400。
+    if messages.is_empty() {
         messages.push(json!({"role": "user", "content": [{"type": "text", "text": ""}]}));
     }
+
+    // 结构化输出:Responses API 原生用 `text.format`(type=json_object/json_schema),部分客户端仍发
+    // `response_format`。两者都认,翻成 system 指令引导(追加,不覆盖用户 instructions)。
+    let rf = raw
+        .get("text")
+        .and_then(|t| t.get("format"))
+        .or_else(|| raw.get("response_format"));
+    if let Some(rf) = rf {
+        if let Some(instr) = response_format_instruction(rf) {
+            system_blocks.push(json!({"type": "text", "text": instr}));
+        }
+    }
+
     if !system_blocks.is_empty() {
         out.insert("system".into(), json!(system_blocks));
     }
@@ -916,22 +988,28 @@ impl ChatStreamConverter {
                 vec![]
             }
             "message_delta" => {
-                let mut chunk = self.base_chunk();
-                let mut emit = false;
+                // OpenAI 流式规范:finish_reason 放在带 choices 的 chunk;usage 单独放在**最后一个
+                // choices:[] 的 chunk**(紧邻 [DONE])。此前把 usage 塞在 finish_reason 同一 chunk 上,
+                // 严格 SDK 在 choices[0] 找不到独立 usage。拆成两个 chunk:先 finish_reason,再 usage。
+                let mut out = Vec::new();
                 if let Some(sr) = ev.get("delta").and_then(|d| d.get("stop_reason")).and_then(|v| v.as_str()) {
+                    let mut chunk = self.base_chunk();
                     chunk["choices"][0]["finish_reason"] = json!(map_stop_reason(sr));
-                    emit = true;
+                    out.push(chunk);
                 }
                 if let Some(u) = ev.get("usage") {
                     self.usage.merge(u);
                     let (p, c, t, cached) = self.usage.openai();
-                    chunk["usage"] = json!({
+                    let mut usage_chunk = self.base_chunk();
+                    // usage chunk 的 choices 为空数组(OpenAI 规范);usage 挂顶层。
+                    usage_chunk["choices"] = json!([]);
+                    usage_chunk["usage"] = json!({
                         "prompt_tokens": p, "completion_tokens": c, "total_tokens": t,
                         "prompt_tokens_details": {"cached_tokens": cached}
                     });
-                    emit = true;
+                    out.push(usage_chunk);
                 }
-                if emit { vec![chunk] } else { vec![] }
+                out
             }
             "error" => {
                 if let Some(e) = ev.get("error") {
@@ -1006,7 +1084,13 @@ pub fn aggregate_chat_completion(model: &str, events: &[Value]) -> Value {
 
     let mut message = Map::new();
     message.insert("role".into(), json!("assistant"));
-    message.insert("content".into(), json!(text));
+    // OpenAI 规范:assistant 只返回 tool_calls(无文本)时 content 应为 null,不是空串——
+    // 部分严格客户端(及 OpenAI SDK 类型)对「空串 + tool_calls」处理不同,给 null 最兼容。
+    if text.is_empty() && !tools.is_empty() {
+        message.insert("content".into(), Value::Null);
+    } else {
+        message.insert("content".into(), json!(text));
+    }
     if !reasoning.is_empty() {
         message.insert("reasoning".into(), json!(reasoning));
         message.insert("reasoning_content".into(), json!(reasoning));
@@ -1609,8 +1693,11 @@ mod tests {
         let d = conv.push_event(&json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hi"}}));
         assert_eq!(d[0]["choices"][0]["delta"]["content"], "Hi");
         let md = conv.push_event(&json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5}}));
+        // OpenAI 规范:finish_reason chunk 与 usage chunk 分开;usage chunk 的 choices 为空。
         assert_eq!(md[0]["choices"][0]["finish_reason"], "stop");
-        assert_eq!(md[0]["usage"]["completion_tokens"], 5);
+        assert!(md[0].get("usage").is_none(), "finish_reason chunk 不带 usage");
+        assert_eq!(md[1]["choices"], json!([]), "usage chunk 的 choices 为空数组");
+        assert_eq!(md[1]["usage"]["completion_tokens"], 5);
     }
 
     #[test]
@@ -1743,6 +1830,122 @@ mod tests {
         // orphan tool_result 丢弃 → 首条本会是 assistant → 补空 user。
         assert_eq!(out[0]["role"], "user", "首条必须 user");
         assert_eq!(out[1]["role"], "assistant");
+    }
+
+    #[test]
+    fn test_request_temperature_clamped_to_anthropic_range() {
+        // 回归(review P0):OpenAI temperature∈[0,2],Anthropic∈[0,1];透传路径 >1 会 400。
+        // clamp 到 [0,1](2.0→1.0)。
+        let raw = json!({"model": "m", "messages": [], "temperature": 1.7});
+        let a = openai_chat_to_anthropic("m", &raw, false);
+        assert_eq!(a["temperature"], 1.0, "temperature 1.7 应 clamp 到 1.0");
+        // 范围内不动。
+        let raw2 = json!({"model": "m", "messages": [], "temperature": 0.3});
+        assert_eq!(openai_chat_to_anthropic("m", &raw2, false)["temperature"], 0.3);
+        // responses 路径同样 clamp。
+        let raw3 = json!({"model": "m", "input": "x", "temperature": 2.0});
+        assert_eq!(openai_responses_to_anthropic("m", &raw3, false)["temperature"], 1.0);
+    }
+
+    #[test]
+    fn test_request_stop_empty_string_filtered() {
+        // 回归(review P0):空串 stop sequence 被 Anthropic 拒绝(透传路径 400),须过滤。
+        // 数组含空串:只留非空。
+        let raw = json!({"model": "m", "messages": [], "stop": ["", "END", ""]});
+        let a = openai_chat_to_anthropic("m", &raw, false);
+        assert_eq!(a["stop_sequences"], json!(["END"]));
+        // 全空数组:不下发 stop_sequences。
+        let raw2 = json!({"model": "m", "messages": [], "stop": ["", ""]});
+        assert!(openai_chat_to_anthropic("m", &raw2, false).get("stop_sequences").is_none());
+        // 单个空串:不下发。
+        let raw3 = json!({"model": "m", "messages": [], "stop": ""});
+        assert!(openai_chat_to_anthropic("m", &raw3, false).get("stop_sequences").is_none());
+    }
+
+    #[test]
+    fn test_request_fully_empty_still_gets_user_message() {
+        // 回归(review P1):整体空请求(无 messages 无 system)也要补空 user,防 Anthropic
+        // 「messages 非空」400(此前只在有 system 时才补)。
+        let raw = json!({"model": "m", "messages": []});
+        let a = openai_chat_to_anthropic("m", &raw, false);
+        let msgs = a["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1, "空请求应补一条空 user");
+        assert_eq!(msgs[0]["role"], "user");
+        // responses:无 input 无 instructions 同样兜底。
+        let raw2 = json!({"model": "m"});
+        let a2 = openai_responses_to_anthropic("m", &raw2, false);
+        assert_eq!(a2["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(a2["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn test_aggregate_content_null_when_only_tool_calls() {
+        // 回归(review P1):assistant 只返回 tool_calls(无文本)时 content 应为 null,非空串。
+        let events = vec![
+            json!({"type": "message_start", "message": {"id": "m1"}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "t1", "name": "f"}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{}"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}}),
+        ];
+        let c = aggregate_chat_completion("m", &events);
+        assert!(c["choices"][0]["message"]["content"].is_null(), "只有 tool_calls 时 content 应为 null");
+        assert_eq!(c["choices"][0]["finish_reason"], "tool_calls");
+        // 有文本时 content 仍是字符串(不误伤)。
+        let events2 = vec![
+            json!({"type": "message_start", "message": {"id": "m2"}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hi"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+        ];
+        let c2 = aggregate_chat_completion("m", &events2);
+        assert_eq!(c2["choices"][0]["message"]["content"], "hi");
+    }
+
+    #[test]
+    fn test_request_response_format_json_object() {
+        // response_format json_object → 追加一段要求纯 JSON 的 system 指令(不覆盖用户 system)。
+        let raw = json!({
+            "model": "m",
+            "messages": [{"role": "system", "content": "be terse"}, {"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_object"}
+        });
+        let a = openai_chat_to_anthropic("m", &raw, false);
+        let sys = a["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 2, "用户 system + JSON 指令");
+        assert_eq!(sys[0]["text"], "be terse");
+        assert!(sys[1]["text"].as_str().unwrap().contains("valid JSON"));
+        // type:text 不注入。
+        let raw2 = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}], "response_format": {"type": "text"}});
+        let a2 = openai_chat_to_anthropic("m", &raw2, false);
+        assert!(a2.get("system").is_none(), "text 格式不注入 system");
+    }
+
+    #[test]
+    fn test_request_response_format_json_schema_embeds_schema() {
+        let raw = json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_schema", "json_schema": {
+                "name": "Weather", "schema": {"type": "object", "properties": {"temp": {"type": "number"}}}
+            }}
+        });
+        let a = openai_chat_to_anthropic("m", &raw, false);
+        let instr = a["system"][0]["text"].as_str().unwrap();
+        assert!(instr.contains("Weather"), "指令带 schema 名");
+        assert!(instr.contains("\"temp\""), "指令内嵌 schema 内容");
+    }
+
+    #[test]
+    fn test_responses_text_format_json_object() {
+        // Responses API 原生 text.format 路径。
+        let raw = json!({"model": "m", "input": "hi", "text": {"format": {"type": "json_object"}}});
+        let a = openai_responses_to_anthropic("m", &raw, false);
+        assert!(a["system"][0]["text"].as_str().unwrap().contains("valid JSON"));
+        // 也认 response_format(部分客户端仍发)。
+        let raw2 = json!({"model": "m", "input": "hi", "response_format": {"type": "json_object"}});
+        let a2 = openai_responses_to_anthropic("m", &raw2, false);
+        assert!(a2["system"][0]["text"].as_str().unwrap().contains("valid JSON"));
     }
 
     #[test]
