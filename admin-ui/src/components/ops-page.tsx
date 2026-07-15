@@ -9,8 +9,14 @@ import { useLiveStream } from '@/hooks/use-live-stream'
 import { useSetDisabled, useResetFailure, useForceRefreshToken } from '@/hooks/use-credentials'
 import type { RateLimitInsight } from '@/types/api'
 import { storage } from '@/lib/storage'
-import { Download, RefreshCw, Activity, Search, X, Copy, ShieldAlert, Zap, Power, RotateCcw } from 'lucide-react'
+import { Download, RefreshCw, Activity, Search, X, Copy, ShieldAlert, Zap, Power, RotateCcw, Inbox, SearchX, ServerCrash } from 'lucide-react'
 import { Select } from '@/components/ui/select'
+import { Input } from '@/components/ui/input'
+import { EmptyState } from '@/components/ui/empty-state'
+import { Callout } from '@/components/ui/callout'
+import { Skeleton } from '@/components/ui/skeleton'
+import { StatCard } from '@/components/ui/stat-card'
+import { AnimatedNumber } from '@/components/ui/animated-number'
 
 // 自愈计数器展示项：字段 → 中文标签 + 是否"越多越该警惕"（用于配色）。
 const METRIC_ITEMS: { key: keyof RecoveryMetrics; label: string; warn?: boolean }[] = [
@@ -81,37 +87,43 @@ function RecoveryMetricsCard() {
       </CardHeader>
       <CardContent>
         {data && data.atRestHealthy === false && (
-          <div className="mb-3 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-300">
-            ⚠ at-rest 加密已开启,但上次凭据落盘回退成了明文(密钥文件读写失败)。磁盘上的凭据当前未加密——
+          <Callout variant="danger" className="mb-3">
+            at-rest 加密已开启,但上次凭据落盘回退成了明文(密钥文件读写失败)。磁盘上的凭据当前未加密——
             请检查密钥文件权限/磁盘可写后重试保存,或查看日志。
-          </div>
+          </Callout>
         )}
         {isLoading ? (
-          <p className="text-sm text-muted-foreground">加载中…</p>
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+            {Array.from({ length: METRIC_ITEMS.length }).map((_, i) => (
+              <Skeleton key={i} className="h-16" />
+            ))}
+          </div>
         ) : data ? (
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
             {METRIC_ITEMS.map((it) => {
               const v = data[it.key] as number
-              const highlight = it.warn && v > 0
               return (
-                <div
+                <StatCard
                   key={it.key}
-                  className="rounded-md border border-[#2e2e2e] bg-[#111] px-3 py-2.5"
-                >
-                  <div className="text-xs text-muted-foreground">{it.label}</div>
-                  <div
-                    className={`mt-0.5 text-xl font-semibold tabular-nums ${
-                      highlight ? 'text-amber-400' : 'text-[#ededed]'
-                    }`}
-                  >
-                    {v}
-                  </div>
-                </div>
+                  label={it.label}
+                  value={<AnimatedNumber value={v} />}
+                  accent={it.warn && v > 0 ? 'warning' : 'neutral'}
+                />
               )
             })}
           </div>
         ) : (
-          <p className="text-sm text-muted-foreground">读取失败</p>
+          <EmptyState
+            icon={ServerCrash}
+            tone="destructive"
+            title="读取失败"
+            description="自愈计数端点无响应"
+            action={
+              <Button variant="outline" size="sm" onClick={() => refetch()}>
+                重试
+              </Button>
+            }
+          />
         )}
       </CardContent>
     </Card>
@@ -519,17 +531,17 @@ function LogViewer() {
        {/* 搜索 + 模块过滤行 */}
        <div className="flex flex-row items-center gap-2">
          <div className="relative flex-1">
-           <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[#666]" />
-           <input
+           <Search className="pointer-events-none absolute left-2 top-1/2 z-10 h-3.5 w-3.5 -translate-y-1/2 text-[#666]" />
+           <Input
              value={search}
              onChange={(e) => setSearch(e.target.value)}
              placeholder="搜索消息或模块…"
-             className="h-7 w-full rounded-md border border-[#2e2e2e] bg-[#0a0a0a] pl-7 pr-7 text-xs text-[#ededed] placeholder:text-[#555] focus:border-[#0070f3] focus:outline-none"
+             className="h-7 pl-7 pr-7 text-xs"
            />
            {search && (
              <button
                onClick={() => setSearch('')}
-               className="absolute right-1.5 top-1/2 -translate-y-1/2 text-[#666] hover:text-[#ededed]"
+               className="absolute right-1.5 top-1/2 z-10 -translate-y-1/2 text-[#666] hover:text-[#ededed]"
                title="清除搜索"
              >
                <X className="h-3.5 w-3.5" />
@@ -555,9 +567,11 @@ function LogViewer() {
           className="h-[420px] overflow-y-auto rounded-md border border-[#2e2e2e] bg-[#0a0a0a] p-2 font-mono text-xs leading-relaxed"
         >
           {visibleLogs.length === 0 ? (
-            <p className="p-4 text-center text-muted-foreground">
-              {logs.length === 0 ? '暂无日志' : '无匹配日志（调整搜索/过滤）'}
-            </p>
+            <EmptyState
+              icon={logs.length === 0 ? Inbox : SearchX}
+              title={logs.length === 0 ? '暂无日志' : '无匹配日志'}
+              description={logs.length === 0 ? undefined : '调整搜索或模块过滤'}
+            />
           ) : (
             visibleLogs.map((e) => (
               <LogRow
