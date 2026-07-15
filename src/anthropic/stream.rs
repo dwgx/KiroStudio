@@ -782,6 +782,10 @@ pub struct StreamContext {
     leaked_stripped: u32,
     /// 本请求检测到的 saturation 泄漏行数（整行就是纯泄漏词的行，#70544 整段退化的信号）。
     leaked_saturation_lines: u32,
+    /// 本请求检测到「文本化工具调用」的 chunk 数(assistantResponseEvent 文本流里出现 <invoke/antml:/
+    /// <parameter 标记)。这是决定要不要做 R4 重组层的取证依据——无条件累加(不受 KIRO_INVOKE_TRACE 限),
+    /// 收尾经 recovery_metrics 暴露。
+    textified_invoke_hits: u32,
 }
 
 /// 泄漏 token 剥离的命中信息（诊断计数用，不影响剥离判据）。
@@ -833,6 +837,7 @@ impl StreamContext {
             at_line_start: true,
             leaked_stripped: 0,
             leaked_saturation_lines: 0,
+            textified_invoke_hits: 0,
         }
     }
 
@@ -1291,18 +1296,25 @@ impl StreamContext {
         // 偶发把工具调用语法当纯文本吐进 assistantResponseEvent(丢 antml: 前缀 + 夹 court 泄漏词),
         // 客户端拿到 <invoke.../> 文本解析不了直接断连。此探针在文本流里出现工具调用标记时如实记一条
         // (含现场文本片段),用于抓真实语料定性——上游到底走文本流还是 toolUseEvent。平时零开销。
-        if invoke_trace_enabled() && contains_textified_tool_call(content) {
-            let snippet: String = content.chars().take(200).collect();
-            tracing::warn!(
-                target: "kiro::invoke_trace",
-                model = %self.model,
-                "[invoke_trace] assistantResponseEvent 文本流出现工具调用标记(疑似文本化 invoke 泄漏): {:?}",
-                snippet
-            );
+        if contains_textified_tool_call(content) {
+            // 无条件计数(取证:决定是否值得做 R4 文本化重组层)——不受 KIRO_INVOKE_TRACE 限。
+            self.textified_invoke_hits += 1;
+            crate::common::recovery_metrics::bump_textified_invoke();
+            // 详细现场语料仅在探针开启时打(含文本片段,量大)。
+            if invoke_trace_enabled() {
+                let snippet: String = content.chars().take(200).collect();
+                tracing::warn!(
+                    target: "kiro::invoke_trace",
+                    model = %self.model,
+                    "[invoke_trace] assistantResponseEvent 文本流出现工具调用标记(疑似文本化 invoke 泄漏): {:?}",
+                    snippet
+                );
+            }
         }
         // 先剥离 DeepSeek DSML 工具协议标记(跨 chunk 安全),再走后续文本处理。
         let cleaned = self.strip_dsml_markers(content);
-        // 泄漏控制 token 清洗（开关默认关）：仅行首粘连特征命中才剥，误删风险极低。
+        // 泄漏控制 token 清洗（开关默认 true，见 handlers::tool_clean_leaked_tokens_enabled）：
+        // 仅行首粘连特征命中才剥，误删风险极低。
         let cleaned = if super::handlers::tool_clean_leaked_tokens_enabled() {
             self.clean_leaked_tokens(&cleaned)
         } else {
