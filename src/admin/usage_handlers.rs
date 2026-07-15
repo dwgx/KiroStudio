@@ -140,6 +140,114 @@ pub async fn usage_recent(
     }
 }
 
+/// trace 明细搜索/过滤/分页查询参数（camelCase，全部可选）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TracesSearchQuery {
+    /// 模型精确匹配
+    #[serde(default)]
+    pub model: Option<String>,
+    /// 凭据 ID 精确匹配
+    #[serde(default)]
+    pub credential_id: Option<u64>,
+    /// 客户端 IP 子串匹配
+    #[serde(default)]
+    pub client_ip: Option<String>,
+    /// 会话 ID 精确匹配
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// 结果精确匹配（success/rate_limited/...）
+    #[serde(default)]
+    pub outcome: Option<String>,
+    /// 时间范围起点（Unix 毫秒，含）
+    #[serde(default)]
+    pub ts_from: Option<i64>,
+    /// 时间范围终点（Unix 毫秒，含）
+    #[serde(default)]
+    pub ts_to: Option<i64>,
+    /// 全文子串匹配 error_message / request_id / model
+    #[serde(default)]
+    pub text: Option<String>,
+    /// 是否流式
+    #[serde(default)]
+    pub is_streaming: Option<bool>,
+    /// 单页条数（默认 50，服务端裁剪到 [1, 500]）
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// 偏移（默认 0）
+    #[serde(default)]
+    pub offset: Option<usize>,
+}
+
+impl TracesSearchQuery {
+    /// 把空串归一为 None（前端清空过滤框常传空串，避免退化成「精确匹配空值」）。
+    fn norm(v: Option<String>) -> Option<String> {
+        v.and_then(|s| {
+            let t = s.trim().to_string();
+            if t.is_empty() { None } else { Some(t) }
+        })
+    }
+
+    /// 映射为存储层 [`TraceFilter`]。
+    fn to_filter(&self) -> crate::usage::TraceFilter {
+        crate::usage::TraceFilter {
+            model: Self::norm(self.model.clone()),
+            credential_id: self.credential_id,
+            client_ip: Self::norm(self.client_ip.clone()),
+            session_id: Self::norm(self.session_id.clone()),
+            outcome: Self::norm(self.outcome.clone()),
+            ts_from: self.ts_from,
+            ts_to: self.ts_to,
+            text: Self::norm(self.text.clone()),
+            is_streaming: self.is_streaming,
+        }
+    }
+}
+
+/// GET /api/admin/usage/traces/search
+/// 多维过滤 + 分页查询请求明细，返回 `{items: [...], total: N}`。
+/// items 按 ts_ms 倒序、单页最多 500 条；total 为同过滤条件下的匹配总数（供分页）。
+pub async fn traces_search(
+    State(state): State<AdminState>,
+    Query(query): Query<TracesSearchQuery>,
+) -> impl IntoResponse {
+    let Some(db) = &state.trace_db else {
+        return stats_disabled();
+    };
+    let filter = query.to_filter();
+    let limit = query.limit.unwrap_or(50);
+    let offset = query.offset.unwrap_or(0);
+
+    // 先查总数再取本页；两处同一 filter 保证 total 与 items 口径一致。
+    let total = match db.count_filtered(&filter) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("统计 trace 明细失败: {:#}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(AdminErrorResponse::internal_error(format!(
+                    "统计 trace 明细失败: {e}"
+                ))),
+            )
+                .into_response();
+        }
+    };
+
+    match db.search(&filter, limit, offset) {
+        Ok(items) => Json(serde_json::json!({ "items": items, "total": total })).into_response(),
+        Err(e) => {
+            tracing::warn!("查询 trace 明细失败: {:#}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(AdminErrorResponse::internal_error(format!(
+                    "查询 trace 明细失败: {e}"
+                ))),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// rate 查询参数
 #[derive(Debug, Deserialize)]
 pub struct RateQuery {

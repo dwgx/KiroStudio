@@ -71,6 +71,8 @@ import {
   Layers,
   Cpu,
   Timer,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react'
 import { Select } from '@/components/ui/select'
 import { Input } from '@/components/ui/input'
@@ -84,6 +86,7 @@ import { Progress } from '@/components/ui/progress'
 import { Checkbox } from '@/components/ui/checkbox'
 import { NumberStepper } from '@/components/ui/number-stepper'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+import { AnimatedHeight } from '@/components/ui/animated-height'
 import {
   Tooltip,
   TooltipTrigger,
@@ -135,6 +138,9 @@ function formatUptime(ms: number): string {
   return `${m}分`
 }
 
+// 实时日志卡收缩状态持久化 key（纯前端偏好,localStorage 直存,与 use-ui-layout-prefs 同 try/catch 惯例）。
+const LOGVIEWER_COLLAPSED_KEY = 'ops.logviewer.collapsed'
+
 const LEVEL_COLORS: Record<string, string> = {
   ERROR: 'text-red-400',
   WARN: 'text-amber-400',
@@ -150,10 +156,10 @@ export function OpsPage() {
     <TooltipProvider delayDuration={200}>
       <div className="space-y-6">
         <LiveMetricsBar live={live} />
-        <RecoveryMetricsCard />
         <PoolHealthCard live={live} />
-        <OpsAggregationCard />
+        <RecoveryMetricsCard />
         <LogViewer />
+        <OpsAggregationCard />
       </div>
     </TooltipProvider>
   )
@@ -1198,6 +1204,27 @@ function LogViewer() {
   const [moduleFilter, setModuleFilter] = useState('')
   // 展开查看详情的条目 seq（点开单条看全文 + 复制）。
   const [expandedSeq, setExpandedSeq] = useState<number | null>(null)
+  // 整卡收缩状态（收起只隐藏搜索行 + 日志区,卡头恒显；SSE 流不卸载,日志继续累积)。
+  // 初值从 localStorage 读,默认展开(false)；读失败不因偏好崩。
+  const [collapsed, setCollapsed] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(LOGVIEWER_COLLAPSED_KEY) === '1'
+    } catch {
+      return false
+    }
+  })
+  // 收缩状态变化即写回 localStorage(与 use-ui-layout-prefs 同 try/catch 惯例)。
+  const toggleCollapsed = useCallback(() => {
+    setCollapsed((prev) => {
+      const next = !prev
+      try {
+        localStorage.setItem(LOGVIEWER_COLLAPSED_KEY, next ? '1' : '0')
+      } catch {
+        /* 隐私模式/配额满:偏好写失败不影响功能 */
+      }
+      return next
+    })
+  }, [])
   const scrollRef = useRef<HTMLDivElement>(null)
   // 滚动锁定防呆：用户手动上滚离开底部时暂停自动滚到底，避免"想看历史却被拽回底部"；
   // 贴底时恢复自动跟随。用 ref 存"是否贴底"避免每帧 setState。
@@ -1391,10 +1418,26 @@ function LogViewer() {
             <Download className="h-3.5 w-3.5" />
             导出
           </Button>
+          {/* 收缩/展开切换:只折叠卡体(搜索行 + 日志区),卡头恒显 */}
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={toggleCollapsed}
+            className="h-7 w-7 px-0"
+            aria-expanded={!collapsed}
+            title={collapsed ? '展开日志' : '收起日志'}
+          >
+            {collapsed ? <ChevronDown className="h-4 w-4" /> : <ChevronUp className="h-4 w-4" />}
+          </Button>
         </div>
        </div>
+      </CardHeader>
+      {/* 卡体(搜索行 + 日志滚动区)收缩:AnimatedHeight 平滑过渡；SSE 流不卸载,日志继续累积 */}
+      <AnimatedHeight>
+       {!collapsed && (
+        <>
        {/* 搜索 + 模块过滤行 */}
-       <div className="flex flex-row items-center gap-2">
+       <div className="flex flex-row items-center gap-2 px-6 pb-2">
          <div className="relative flex-1">
            <Search className="pointer-events-none absolute left-2 top-1/2 z-10 h-3.5 w-3.5 -translate-y-1/2 text-[#666]" />
            <Input
@@ -1424,7 +1467,6 @@ function LogViewer() {
            ]}
          />
        </div>
-      </CardHeader>
       <CardContent>
         <div
           ref={scrollRef}
@@ -1450,6 +1492,9 @@ function LogViewer() {
           )}
         </div>
       </CardContent>
+        </>
+       )}
+      </AnimatedHeight>
     </Card>
   )
 }
