@@ -592,6 +592,10 @@ pub struct ConversionResult {
     pub conversation_state: ConversationState,
     /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
     pub tool_name_map: HashMap<String, String>,
+    /// 本次请求声明的工具名集合（= 发给模型看到的名字，超长名已缩短）。
+    /// 文本化 invoke 重组的"工具名硬护栏"用它：解析出的工具名必须在此集合里才允许捞回,
+    /// 否则当普通文本吐出——宁可漏捞不可把正文里讨论的假命令误执行。
+    pub known_tool_names: std::collections::HashSet<String>,
 }
 
 /// 转换错误
@@ -782,6 +786,14 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         }
     }
 
+    // 工具名硬护栏集合 = 发给模型的工具名（含缩短后的短名 + 历史占位工具名）。模型文本化 invoke 时
+    // 吐的就是它看到的这些名字,重组时据此校验,杜绝把正文里讨论的假命令误重组成 tool_use 执行。
+    // 必须在 tools 被 move 进 context 之前收集。
+    let known_tool_names: std::collections::HashSet<String> = tools
+        .iter()
+        .map(|t| t.tool_specification.name.clone())
+        .collect();
+
     // 11. 构建 UserInputMessageContext
     let mut context = UserInputMessageContext::new();
     if !tools.is_empty() {
@@ -823,6 +835,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     Ok(ConversionResult {
         conversation_state,
         tool_name_map,
+        known_tool_names,
     })
 }
 
