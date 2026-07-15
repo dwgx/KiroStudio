@@ -159,6 +159,21 @@ pub struct Config {
     #[serde(default)]
     pub credential_rpm_limit: u32,
 
+    /// RPM headroom 系数(0..100 整百分比;默认 85=预留 15% 缓冲)。饱和阈值 = base_limit × factor/100。
+    /// 让饱和判定在上游真硬限之下提前触发,削弱 60s 滑窗边界爆发 + 贴顶跑。0/100 = 不打折(=旧行为)。
+    #[serde(default = "default_rpm_headroom_factor")]
+    pub rpm_headroom_factor: u32,
+
+    /// RPM 预留名额:在 headroom 折扣后再额外扣掉 N 个名额(默认 0)。给突发留固定缓冲,与 factor 叠加。
+    #[serde(default)]
+    pub rpm_reserve_slots: u32,
+
+    /// 整池 RPM 饱和时是否走背压等待(默认 false=回退软门,选"最不坏"的号继续)。
+    /// true 时选号返回 None → acquire_context 等待最短 RPM 恢复窗口(受 MAX_TRANSIENT_WAIT 上限)。
+    /// 保守默认关:硬门只在非整池饱和时生效,整池饱和回退旧软门行为不阻塞。
+    #[serde(default)]
+    pub rpm_hard_gate_overload_wait: bool,
+
     /// 全池冷却时是否"快速失败"：当所有可用凭据都在冷却/风控中，立即返回 429+Retry-After
     /// 让客户端(Claude Code)自己退避重试，而不是在网关内硬扛等待。默认 true。
     /// 客户端退避比网关反复选号温和，也减少对被风控号的零星试探（吸收其它 kiro.rs fork 做法）。
@@ -517,6 +532,11 @@ fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
 
+/// RPM headroom 系数默认 85(预留 15% 缓冲)。
+fn default_rpm_headroom_factor() -> u32 {
+    85
+}
+
 fn default_cooldown_enabled() -> bool {
     true
 }
@@ -659,6 +679,9 @@ impl Default for Config {
             rate_limit_min_interval_ms: default_rate_limit_min_interval_ms(),
             affinity_enabled: default_affinity_enabled(),
             credential_rpm_limit: 0,
+            rpm_headroom_factor: default_rpm_headroom_factor(),
+            rpm_reserve_slots: 0,
+            rpm_hard_gate_overload_wait: false,
             all_cooling_fast_fail: default_all_cooling_fast_fail(),
             auto_disable_suspicious: default_auto_disable_suspicious(),
             priority_in_balanced: false,
