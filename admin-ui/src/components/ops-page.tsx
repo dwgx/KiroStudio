@@ -71,6 +71,7 @@ import {
   Timer,
   ChevronDown,
   ChevronUp,
+  Eye,
 } from 'lucide-react'
 import { Select } from '@/components/ui/select'
 import { Input } from '@/components/ui/input'
@@ -101,6 +102,12 @@ import {
   DialogDescription,
   DialogFooter,
 } from '@/components/ui/dialog'
+import {
+  TraceDetailDialog,
+  UsageDetailDialog,
+  TrashDetailDialog,
+  BgCacheDetailDialog,
+} from '@/components/ops-detail-dialogs'
 
 // 自愈计数器展示项：字段 → 中文标签 + 是否"越多越该警惕"（用于配色）。
 const METRIC_ITEMS: { key: keyof RecoveryMetrics; label: string; warn?: boolean }[] = [
@@ -952,7 +959,12 @@ function OpsAggregationCard() {
   const cleanup = useCleanupStorage()
 
   const [confirm, setConfirm] = useState<null | 'restart' | 'upgrade' | { kind: 'cleanup'; p: StoragePartition }>(null)
+  // 存储分区详情弹框:按分区 key 打开对应高保真明细(traces/usage_jsonl/trash/bg_cache)。
+  const [detail, setDetail] = useState<null | 'traces' | 'usage_jsonl' | 'trash' | 'bg_cache'>(null)
   const updInfo = checkUpd.data
+
+  // bg_cache 分区张数(供背景图缓存弹框渲染 idx 网格)。
+  const bgCount = storage?.partitions.find((p) => p.key === 'bg_cache')?.items ?? 0
 
   const handleCheck = () =>
     checkUpd.mutate(undefined, {
@@ -1044,6 +1056,8 @@ function OpsAggregationCard() {
             <div className="space-y-1">
               {storage.partitions.map((p) => {
                 const cleanable = (CLEANABLE_KEYS as string[]).includes(p.key)
+                // 四个分区各有高保真明细弹框(与 CLEANABLE_KEYS 同集)。
+                const viewable = (CLEANABLE_KEYS as string[]).includes(p.key)
                 return (
                   <div key={p.key} className="flex items-center justify-between gap-3 rounded-md border border-[#2e2e2e] bg-[#111] px-3 py-1.5">
                     <div className="flex min-w-0 items-center gap-2">
@@ -1052,6 +1066,17 @@ function OpsAggregationCard() {
                     </div>
                     <div className="flex shrink-0 items-center gap-3">
                       <span className="text-xs tabular-nums text-muted-foreground">{formatBytes(p.bytes)} · {p.items} 项</span>
+                      {viewable && (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-7 px-2 text-xs"
+                          onClick={() => setDetail(p.key as 'traces' | 'usage_jsonl' | 'trash' | 'bg_cache')}
+                        >
+                          <Eye className="mr-1 h-3 w-3" />
+                          查看
+                        </Button>
+                      )}
                       {cleanable && (
                         <Button variant="outline" size="sm" className="h-7 px-2 text-xs" onClick={() => setConfirm({ kind: 'cleanup', p })}>
                           <Trash className="mr-1 h-3 w-3" />
@@ -1068,6 +1093,12 @@ function OpsAggregationCard() {
           )}
         </div>
       </CardContent>
+
+      {/* 存储分区高保真明细弹框(查看按钮触发,与清理并存) */}
+      <TraceDetailDialog open={detail === 'traces'} onOpenChange={(v) => !v && setDetail(null)} />
+      <UsageDetailDialog open={detail === 'usage_jsonl'} onOpenChange={(v) => !v && setDetail(null)} />
+      <TrashDetailDialog open={detail === 'trash'} onOpenChange={(v) => !v && setDetail(null)} />
+      <BgCacheDetailDialog open={detail === 'bg_cache'} onOpenChange={(v) => !v && setDetail(null)} count={bgCount} />
 
       <ConfirmDialog
         open={confirm === 'restart'}
