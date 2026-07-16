@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Trash2, RotateCcw, CheckCircle2, Database, Zap, Ban, Power, FlaskConical } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Trash2, RotateCcw, CheckCircle2, Database, Zap, Ban, Power, FlaskConical, Download } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -21,8 +21,8 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useSetDisabled } from '@/hooks/use-credentials'
-import { getCredentialBalance, getCachedBalances, forceRefreshToken, deepVerifyCredential, probeAvailableModels, setCredentialAllowedModels, PROBE_MODEL_CATALOG } from '@/api/credentials'
-import { extractErrorMessage } from '@/lib/utils'
+import { getCredentialBalance, getCachedBalances, forceRefreshToken, deepVerifyCredential, probeAvailableModels, setCredentialAllowedModels, PROBE_MODEL_CATALOG, exportCredential } from '@/api/credentials'
+import { extractErrorMessage, downloadJson, fileStamp } from '@/lib/utils'
 import { PageSkeleton } from '@/components/ui/page-skeleton'
 import { useUiLayoutPrefs } from '@/hooks/use-ui-layout-prefs'
 import type { BalanceResponse } from '@/types/api'
@@ -113,6 +113,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [queryInfoProgress, setQueryInfoProgress] = useState({ current: 0, total: 0 })
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
+  const [exportingSelected, setExportingSelected] = useState(false)
+  const [exportProgress, setExportProgress] = useState({ current: 0, total: 0 })
   const cancelVerifyRef = useRef(false)
   // 模型测试：勾选凭据后打开独立弹窗（弹窗内自选模型、可反复测、保留上次结果）
   const [modelTestOpen, setModelTestOpen] = useState(false)
@@ -450,6 +452,31 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     }
 
     deselectAll()
+  }
+
+  // 批量导出选中凭据为 JSON（格式与设置页「导出全部」一致，仅过滤成选中项）。
+  // 串行调后端 export 端点逐个拉完整导出对象，打包成数组一次性下载。
+  const handleExportSelected = async () => {
+    const ids = Array.from(selectedIds)
+    if (ids.length === 0) {
+      toast.error('请先勾选要导出的凭据')
+      return
+    }
+    setExportingSelected(true)
+    setExportProgress({ current: 0, total: ids.length })
+    try {
+      const all: Record<string, unknown>[] = []
+      for (let i = 0; i < ids.length; i++) {
+        all.push(await exportCredential(ids[i]))
+        setExportProgress({ current: i + 1, total: ids.length })
+      }
+      downloadJson(`credentials-selected-${fileStamp()}.json`, all)
+      toast.success(`已导出选中的 ${all.length} 个凭据`)
+    } catch (err) {
+      toast.error(extractErrorMessage(err))
+    } finally {
+      setExportingSelected(false)
+    }
   }
 
   // 测试可用模型：把勾选的凭据 id 定格，打开独立弹窗（弹窗内自选模型、可反复测、保留结果）。
@@ -832,6 +859,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   <Button onClick={handleBatchVerify} size="sm" variant="outline" disabled={verifying}>
                     <CheckCircle2 className="h-4 w-4 mr-2" />
                     批量验活
+                  </Button>
+                  <Button onClick={handleExportSelected} size="sm" variant="outline" disabled={exportingSelected}>
+                    <Download className={`h-4 w-4 mr-2 ${exportingSelected ? 'animate-spin' : ''}`} />
+                    {exportingSelected ? `导出中... ${exportProgress.current}/${exportProgress.total}` : '导出选中'}
                   </Button>
                   <Button onClick={handleTestModels} size="sm" variant="outline">
                     <FlaskConical className="h-4 w-4 mr-2" />

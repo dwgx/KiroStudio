@@ -537,6 +537,8 @@ pub struct ConfigSnapshotResponse {
     /// credentials.json / trash.json at-rest 加密开关（机器绑定密钥，立即生效，默认关）
     pub encrypt_credentials_at_rest: bool,
     pub cooldown_enabled: bool,
+    /// 全池冷却快速失败:全池都在冷却时立即返回 429+Retry-After 让客户端退避(而非网关内硬扛短等)。默认开。
+    pub all_cooling_fast_fail: bool,
     pub rate_limit_enabled: bool,
     pub rate_limit_daily_max: u32,
     pub rate_limit_min_interval_ms: u64,
@@ -639,6 +641,8 @@ pub struct UpdateConfigRequest {
     /// credentials.json / trash.json at-rest 加密开关。开启后下次 persist 把明文重写为密文(透明迁移)。
     pub encrypt_credentials_at_rest: Option<bool>,
     pub cooldown_enabled: Option<bool>,
+    /// 全池冷却快速失败开关(见响应结构注释)。
+    pub all_cooling_fast_fail: Option<bool>,
     pub rate_limit_enabled: Option<bool>,
     pub rate_limit_daily_max: Option<u32>,
     pub rate_limit_min_interval_ms: Option<u64>,
@@ -822,6 +826,7 @@ mod tests {
             extract_thinking: true,
             cc_auto_buffer: true,
             cooldown_enabled: true,
+            all_cooling_fast_fail: true,
             rate_limit_enabled: false,
             rate_limit_daily_max: 500,
             rate_limit_min_interval_ms: 1000,
