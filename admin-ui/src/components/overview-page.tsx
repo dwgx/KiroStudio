@@ -1,4 +1,5 @@
 import { useMemo, useState, useEffect, useRef } from 'react'
+import { useTranslation } from 'react-i18next'
 import { Activity, CheckCircle2, Coins, Database, LayoutGrid, List, Gauge, ShieldCheck, ShieldAlert, TriangleAlert } from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { StatCard } from '@/components/ui/stat-card'
@@ -112,6 +113,7 @@ function RateLimitDashboard({
   insights: RateLimitInsight[]
   loading: boolean
 }) {
+  const { t } = useTranslation()
   const labelOf = (id: number): string => {
     const c = creds.find((x) => x.id === id)
     return c?.name || c?.email || `#${id}`
@@ -119,7 +121,7 @@ function RateLimitDashboard({
 
   // 号池整体撑不住预测:取各号最高风险 + 被限流号数。
   const summary = useMemo(() => {
-    if (insights.length === 0) return { level: 'ok' as RiskLevel, text: '暂无数据', limited: 0 }
+    if (insights.length === 0) return { level: 'ok' as RiskLevel, text: t('overviewpage.dashboard.summary.noData'), limited: 0 }
     let worst: RiskLevel = 'ok'
     const order: RiskLevel[] = ['ok', 'watch', 'high', 'limited']
     let limited = 0
@@ -134,14 +136,14 @@ function RateLimitDashboard({
     const healthy = insights.length - limited - disabledCount
     const text =
       worst === 'limited' && healthy === 0
-        ? '号池全部被限流,请加号或降低并发'
+        ? t('overviewpage.dashboard.summary.allLimited')
         : worst === 'limited'
-        ? `${limited} 个号被限流,${healthy} 个仍可用`
+        ? t('overviewpage.dashboard.summary.partialLimited', { limited, healthy })
         : worst === 'high'
-        ? '部分号即将限流,建议关注'
+        ? t('overviewpage.dashboard.summary.highRisk')
         : worst === 'watch'
-        ? '号池压力偏高'
-        : '号池畅通'
+        ? t('overviewpage.dashboard.summary.watch')
+        : t('overviewpage.dashboard.summary.clear')
     return { level: worst, text, limited }
   }, [insights])
 
@@ -168,7 +170,7 @@ function RateLimitDashboard({
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-2">
           <SummaryIcon className={`h-4 w-4 ${tone.text}`} />
-          <h3 className="text-sm font-medium text-foreground">限流健康</h3>
+          <h3 className="text-sm font-medium text-foreground">{t('overviewpage.dashboard.title')}</h3>
         </div>
         {/* 撑不住预测:整体结论胶囊 */}
         <span className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium ${tone.chip}`}>
@@ -179,7 +181,7 @@ function RateLimitDashboard({
       {rows.length === 0 ? (
         <div className="flex items-center gap-2 rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-3 py-2.5 text-sm text-emerald-400">
           <ShieldCheck className="h-4 w-4 shrink-0" />
-          号池畅通,无限流
+          {t('overviewpage.dashboard.empty')}
         </div>
       ) : (
         <div className="flex flex-col gap-1.5">
@@ -194,6 +196,7 @@ function RateLimitDashboard({
 
 // 单号一行:名称 + 风险胶囊 + RPM占用率迷你条 + 推断浮层(hover)。
 function RateLimitRow({ it, label }: { it: RateLimitInsight; label: string }) {
+  const { t } = useTranslation()
   const risk = assessRisk(it)
   const tone = RISK_TONE[risk.level]
   // 冷却剩余本地按秒显示(粗粒度,数据每 10s 刷)。
@@ -218,13 +221,13 @@ function RateLimitRow({ it, label }: { it: RateLimitInsight; label: string }) {
         </div>
       )}
       {it.recent429 > 0 && (
-        <span className="shrink-0 rounded bg-red-500/10 px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-red-400/90" title="近期 429 次数">
+        <span className="shrink-0 rounded bg-red-500/10 px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-red-400/90" title={t('overviewpage.row.recent429.title')}>
           429×{it.recent429}
         </span>
       )}
       {it.inflight > 0 && (
         <span className="shrink-0 rounded bg-primary/15 px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-primary">
-          在途 {it.inflight}
+          {t('overviewpage.row.inflight', { n: it.inflight })}
         </span>
       )}
       <span className={`inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium ${tone.chip}`}>
@@ -324,6 +327,7 @@ function KpiSkeleton() {
 }
 
 export function OverviewPage() {
+  const { t } = useTranslation()
   const { data, isLoading: credLoading } = useCredentials()
   // 全页共享一份已缓存余额（只读、零上游），传给状态条视图展示剩余额度迷你条。
   const { data: cachedBalances } = useCachedBalances()
@@ -405,9 +409,9 @@ export function OverviewPage() {
     const withFailure = creds.filter((c) => !c.disabled && c.failureCount > 0).length
     const healthy = available - withFailure
     const healthSegments = [
-      { label: '健康', value: healthy, color: 'hsl(160 84% 45%)' },
-      { label: '有失败', value: withFailure, color: 'hsl(38 92% 55%)' },
-      { label: '已禁用', value: disabled, color: 'hsl(0 84% 60%)' },
+      { label: t('overviewpage.health.healthy'), value: healthy, color: 'hsl(160 84% 45%)' },
+      { label: t('overviewpage.health.withFailure'), value: withFailure, color: 'hsl(38 92% 55%)' },
+      { label: t('overviewpage.health.disabled'), value: disabled, color: 'hsl(0 84% 60%)' },
     ]
 
     // 调用量 Top 5（免费的 successCount，绝不拉 per-account balance）
@@ -519,8 +523,8 @@ export function OverviewPage() {
   return (
     <div className="space-y-6">
       <div className="flex items-baseline justify-between">
-        <h2 className="text-xl font-semibold text-gradient-brand">概览</h2>
-        {usageDisabled && <span className="text-xs text-muted-foreground">用量统计未启用</span>}
+        <h2 className="text-xl font-semibold text-gradient-brand">{t('overviewpage.title')}</h2>
+        {usageDisabled && <span className="text-xs text-muted-foreground">{t('overviewpage.usageDisabled')}</span>}
       </div>
 
       {/* Row 1：四张 KPI 卡（凭据侧与用量侧各自独立骨架，互不阻塞） */}
@@ -530,22 +534,22 @@ export function OverviewPage() {
           <KpiSkeleton />
         ) : (
           <StatCard
-            label="凭据总数"
+            label={t('overviewpage.kpi.totalCreds.label')}
             value={<AnimatedNumber value={stats.total} />}
             icon={Database}
             accent="neutral"
             hint={
               stats.isEmpty ? (
-                '暂无凭据'
+                t('overviewpage.kpi.totalCreds.empty')
               ) : (
                 <div className="flex items-center gap-1.5">
                   <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/10 px-2 py-0.5 text-emerald-400">
                     <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-                    可用 {stats.available}
+                    {t('overviewpage.kpi.available', { n: stats.available })}
                   </span>
                   <span className="inline-flex items-center gap-1 rounded-full bg-red-500/10 px-2 py-0.5 text-red-400">
                     <span className="h-1.5 w-1.5 rounded-full bg-red-400" />
-                    禁用 {stats.disabled}
+                    {t('overviewpage.kpi.disabled', { n: stats.disabled })}
                   </span>
                 </div>
               )
@@ -558,19 +562,19 @@ export function OverviewPage() {
           <KpiSkeleton />
         ) : (
           <StatCard
-            label="24h 请求量"
+            label={t('overviewpage.kpi.requests24h.label')}
             value={usageReady && hasReq ? <AnimatedNumber value={w24!.requests} format={compact} /> : usageReady ? '0' : '—'}
             icon={Activity}
             accent="primary"
             hint={
               usageDisabled ? (
-                '用量统计未启用'
+                t('overviewpage.usageDisabled')
               ) : hasReq && reqSpark.length > 0 ? (
                 <div className="w-full pt-1">
                   <Sparkline data={reqSpark} height={28} />
                 </div>
               ) : (
-                '近 24h 暂无调用'
+                t('overviewpage.kpi.requests24h.empty')
               )
             }
           />
@@ -581,7 +585,7 @@ export function OverviewPage() {
           <KpiSkeleton />
         ) : (
           <StatCard
-            label="24h 成功率"
+            label={t('overviewpage.kpi.successRate24h.label')}
             value={
               usageReady && hasReq ? (
                 <div className="flex items-center gap-3">
@@ -604,10 +608,10 @@ export function OverviewPage() {
             }
             hint={
               usageDisabled
-                ? '用量统计未启用'
+                ? t('overviewpage.usageDisabled')
                 : hasReq
-                ? `成功 ${compact(w24!.success)} · 失败 ${compact(w24!.failure)}`
-                : '暂无调用记录'
+                ? t('overviewpage.kpi.successRate24h.detail', { success: compact(w24!.success), failure: compact(w24!.failure) })
+                : t('overviewpage.kpi.successRate24h.empty')
             }
           />
         )}
@@ -617,16 +621,16 @@ export function OverviewPage() {
           <KpiSkeleton />
         ) : (
           <StatCard
-            label="24h Tokens"
+            label={t('overviewpage.kpi.tokens24h.label')}
             value={usageReady && hasReq ? <AnimatedNumber value={w24!.total_tokens} format={compact} /> : usageReady ? '0' : '—'}
             icon={Coins}
             accent="neutral"
             hint={
               usageDisabled
-                ? '用量统计未启用'
+                ? t('overviewpage.usageDisabled')
                 : hasReq
-                ? `Credits ${w24!.credits_used.toFixed(2)} · 均延迟 ${Math.round(w24!.avg_latency_ms)}ms`
-                : '近 24h 暂无调用'
+                ? t('overviewpage.kpi.tokens24h.detail', { credits: w24!.credits_used.toFixed(2), ms: Math.round(w24!.avg_latency_ms) })
+                : t('overviewpage.kpi.requests24h.empty')
             }
           />
         )}
@@ -636,10 +640,10 @@ export function OverviewPage() {
       <Card className="p-5">
         <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-baseline gap-2">
-            <h3 className="text-sm font-medium text-foreground">号池状态</h3>
+            <h3 className="text-sm font-medium text-foreground">{t('overviewpage.pool.title')}</h3>
             {!credLoading && !stats.isEmpty && (
               <span className="text-xs text-muted-foreground">
-                可用 {stats.available} / 共 {stats.total}
+                {t('overviewpage.pool.availableOfTotal', { available: stats.available, total: stats.total })}
               </span>
             )}
           </div>
@@ -656,8 +660,8 @@ export function OverviewPage() {
         <Card className="p-5">
           <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-baseline gap-2">
-              <h3 className="text-sm font-medium text-foreground">请求趋势</h3>
-              <span className="text-xs text-muted-foreground">{trend.label}内的请求量与成功率</span>
+              <h3 className="text-sm font-medium text-foreground">{t('overviewpage.trend.title')}</h3>
+              <span className="text-xs text-muted-foreground">{t('overviewpage.trend.subtitle', { label: trend.label })}</span>
             </div>
             <TrendRangeSwitch value={trendRange} onChange={setTrendRange} />
           </div>
@@ -672,8 +676,8 @@ export function OverviewPage() {
       {/* Row 3：左健康 / 右鉴权 + 榜单 */}
       <div className="grid gap-4 lg:grid-cols-2">
         <Card className="p-5">
-          <SectionTitle hint={credLoading ? undefined : `共 ${stats.total} 个`}>
-            健康状态
+          <SectionTitle hint={credLoading ? undefined : t('overviewpage.section.totalCount', { n: stats.total })}>
+            {t('overviewpage.section.health')}
           </SectionTitle>
           {credLoading ? (
             <div className="space-y-3">
@@ -686,7 +690,7 @@ export function OverviewPage() {
         </Card>
 
         <Card className="p-5">
-          <SectionTitle>鉴权方式</SectionTitle>
+          <SectionTitle>{t('overviewpage.section.auth')}</SectionTitle>
           {credLoading ? (
             <div className="space-y-3">
               <Skeleton className="h-2.5 w-full rounded-full" />
@@ -695,7 +699,7 @@ export function OverviewPage() {
           ) : (
             <SegmentedBar segments={stats.authSegments} className="mb-5" />
           )}
-          <SectionTitle hint="按成功调用量">调用量 Top 5</SectionTitle>
+          <SectionTitle hint={t('overviewpage.section.topUsed.hint')}>{t('overviewpage.section.topUsed.title')}</SectionTitle>
           {credLoading ? (
             <div className="space-y-2.5">
               {Array.from({ length: 3 }).map((_, i) => (
@@ -703,7 +707,7 @@ export function OverviewPage() {
               ))}
             </div>
           ) : (
-            <RankBars items={stats.topUsed} unit="次" className="text-muted-foreground" />
+            <RankBars items={stats.topUsed} unit={t('overviewpage.rankbars.unit')} className="text-muted-foreground" />
           )}
         </Card>
       </div>

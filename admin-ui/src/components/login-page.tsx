@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { useTranslation } from 'react-i18next'
 import { KeyRound, Loader2 } from 'lucide-react'
 import { storage } from '@/lib/storage'
 import { getLoadBalancingMode, setSuppressAuthReload } from '@/api/credentials'
@@ -8,6 +9,7 @@ interface LoginPageProps {
 }
 
 export function LoginPage({ onLogin }: LoginPageProps) {
+  const { t } = useTranslation()
   const [apiKey, setApiKey] = useState('')
   const [bgLoaded, setBgLoaded] = useState(false)
   const [bgUrl, setBgUrl] = useState<string | null>(null)
@@ -72,7 +74,7 @@ export function LoginPage({ onLogin }: LoginPageProps) {
     } catch (err) {
       storage.removeApiKey()
       const status = (err as { response?: { status?: number } })?.response?.status
-      setError(status === 401 || status === 403 ? '密钥无效，请重新输入' : '无法连接服务，请稍后重试')
+      setError(status === 401 || status === 403 ? t('loginpage.error.invalidKey') : t('loginpage.error.connectFailed'))
     } finally {
       setSuppressAuthReload(false)
       setVerifying(false)
@@ -142,7 +144,7 @@ export function LoginPage({ onLogin }: LoginPageProps) {
             </div>
             <input
               type="password"
-              placeholder="输入管理密钥"
+              placeholder={t('loginpage.input.apiKeyPlaceholder')}
               value={apiKey}
               onChange={(e) => { setApiKey(e.target.value); if (error) setError(null) }}
               disabled={verifying}
@@ -198,7 +200,7 @@ export function LoginPage({ onLogin }: LoginPageProps) {
             }}
           >
             {verifying && <Loader2 style={{ width: '15px', height: '15px' }} className="animate-spin" />}
-            {verifying ? '校验中…' : '登录'}
+            {verifying ? t('loginpage.button.verifying') : '登录'}
           </button>
         </form>
 

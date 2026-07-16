@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { CheckCircle2, XCircle, AlertCircle, AlertTriangle, Loader2 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
@@ -226,6 +227,7 @@ interface PasteResult {
 }
 
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
+  const { t } = useTranslation()
   const [tab, setTab] = useState<Tab>('manual')
 
   // 手动添加表单
@@ -296,26 +298,26 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
     if (isApiKey) {
       if (!kiroApiKey.trim()) {
-        toast.error('请输入 Kiro API Key')
+        toast.error(t('addcredentialdialog.validate.apiKeyRequired'))
         return
       }
     } else if (authMethod === 'custom_api') {
       // 自定义 API 代挂:只需 base URL(下方校验),不需要 Refresh Token。
       if (!baseUrl.trim()) {
-        toast.error('自定义 API 需填写上游地址 base URL')
+        toast.error(t('addcredentialdialog.validate.baseUrlRequired'))
         return
       }
     } else {
       if (!refreshToken.trim()) {
-        toast.error('请输入 Refresh Token')
+        toast.error(t('addcredentialdialog.validate.refreshTokenRequired'))
         return
       }
       if (authMethod === 'idc' && (!clientId.trim() || !clientSecret.trim())) {
-        toast.error('IdC/Builder-ID/IAM 认证需要填写 Client ID 和 Client Secret')
+        toast.error(t('addcredentialdialog.validate.idcFieldsRequired'))
         return
       }
       if (authMethod === 'external_idp' && (!clientId.trim() || !tokenEndpoint.trim())) {
-        toast.error('External IdP 需要 Client ID 和 Token Endpoint')
+        toast.error(t('addcredentialdialog.validate.externalIdpFieldsRequired'))
         return
       }
     }
@@ -350,7 +352,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
           resetManual()
         },
         onError: (error: unknown) => {
-          toast.error(`添加失败: ${extractErrorMessage(error)}`)
+          toast.error(t('addcredentialdialog.toast.addFailed') + extractErrorMessage(error))
         },
       }
     )
@@ -363,12 +365,12 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       const parsed = tolerantJsonParse(pasteInput)
       reqs = extractCredentials(parsed)
     } catch (error) {
-      toast.error('无法识别 JSON（已尝试自动纠正）: ' + extractErrorMessage(error))
+      toast.error(t('addcredentialdialog.toast.jsonUnrecognized') + extractErrorMessage(error))
       return
     }
 
     if (reqs.length === 0) {
-      toast.error('没有识别到可导入的凭据')
+      toast.error(t('addcredentialdialog.toast.noCredentials'))
       return
     }
 
@@ -407,7 +409,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
           dup++
           setPasteResults(prev => {
             const next = [...prev]
-            next[i] = { ...next[i], status: 'duplicate', error: '该凭据已存在' }
+            next[i] = { ...next[i], status: 'duplicate', error: t('addcredentialdialog.paste.duplicateExists') }
             return next
           })
           continue
@@ -441,9 +443,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     queryClient.invalidateQueries({ queryKey: ['credentials'] })
 
     if (fail === 0 && dup === 0) {
-      toast.success(`成功导入 ${success} 个凭据`)
+      toast.success(t('addcredentialdialog.toast.importSuccess', { success }))
     } else {
-      toast.info(`导入完成：成功 ${success}，重复 ${dup}，失败 ${fail}`)
+      toast.info(t('addcredentialdialog.toast.importDone', { success, dup, fail }))
     }
   }
 
@@ -475,7 +477,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       >
         <DialogContent className="sm:max-w-lg max-h-[85vh] flex flex-col">
           <DialogHeader>
-            <DialogTitle>添加凭据</DialogTitle>
+            <DialogTitle>{t('addcredentialdialog.title')}</DialogTitle>
           </DialogHeader>
 
           {/* 模式切换 tab */}
@@ -489,7 +491,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   : 'border-transparent text-[#888] hover:text-[#ededed]'
               }`}
             >
-              手动添加
+              {t('addcredentialdialog.tab.manual')}
             </button>
             <button
               type="button"
@@ -500,7 +502,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   : 'border-transparent text-[#888] hover:text-[#ededed]'
               }`}
             >
-              导入（粘贴）
+              {t('addcredentialdialog.tab.paste')}
             </button>
             <button
               type="button"
@@ -511,7 +513,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   : 'border-transparent text-[#888] hover:text-[#ededed]'
               }`}
             >
-              上号
+              {t('addcredentialdialog.tab.login')}
             </button>
           </div>
 
@@ -521,7 +523,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               {/* 认证方式 */}
               <div className="space-y-2">
                 <label htmlFor="authMethod" className="text-sm font-medium">
-                  认证方式
+                  {t('addcredentialdialog.field.authMethod.label')}
                 </label>
                 <Select<AuthMethod>
                   id="authMethod"
@@ -533,7 +535,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     { value: 'idc', label: 'IdC/Builder-ID/IAM' },
                     { value: 'external_idp', label: 'External IdP' },
                     { value: 'api_key', label: 'API Key' },
-                    { value: 'custom_api', label: '自定义 API（代挂透传）' },
+                    { value: 'custom_api', label: t('addcredentialdialog.field.authMethod.customApi') },
                   ]}
                 />
               </div>
@@ -547,7 +549,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   <Input
                     id="kiroApiKey"
                     type="password"
-                    placeholder="格式: ksk_xxxxxxxx"
+                    placeholder={t('addcredentialdialog.field.kiroApiKey.placeholder')}
                     value={kiroApiKey}
                     onChange={(e) => setKiroApiKey(e.target.value)}
                     disabled={isPending}
@@ -564,7 +566,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   <Input
                     id="refreshToken"
                     type="password"
-                    placeholder="请输入 Refresh Token"
+                    placeholder={t('addcredentialdialog.field.refreshToken.placeholder')}
                     value={refreshToken}
                     onChange={(e) => setRefreshToken(e.target.value)}
                     disabled={isPending}
@@ -576,37 +578,37 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               {authMethod === 'custom_api' && (
                 <div className="space-y-3 rounded-md border border-border bg-secondary/20 p-3">
                   <div className="text-xs text-muted-foreground">
-                    Anthropic 兼容上游中转站。请求原样透传到该地址、换用下面的密钥（零转换，效果等同直接用该 key）。
+                    {t('addcredentialdialog.customApi.desc')}
                   </div>
                   <div className="space-y-2">
                     <label htmlFor="baseUrl" className="text-sm font-medium">
-                      上游地址 base URL <span className="text-red-500">*</span>
+                      {t('addcredentialdialog.field.baseUrl.label')} <span className="text-red-500">*</span>
                     </label>
                     <Input
                       id="baseUrl"
-                      placeholder="如 https://api.anthropic.com 或 https://你的中转站"
+                      placeholder={t('addcredentialdialog.field.baseUrl.placeholder')}
                       value={baseUrl}
                       onChange={(e) => setBaseUrl(e.target.value)}
                       disabled={isPending}
                     />
                   </div>
                   <div className="space-y-2">
-                    <label htmlFor="customApiKey" className="text-sm font-medium">上游密钥</label>
+                    <label htmlFor="customApiKey" className="text-sm font-medium">{t('addcredentialdialog.field.customApiKey.label')}</label>
                     <Input
                       id="customApiKey"
                       type="password"
-                      placeholder="上游 API Key（透传时替换）"
+                      placeholder={t('addcredentialdialog.field.customApiKey.placeholder')}
                       value={customApiKey}
                       onChange={(e) => setCustomApiKey(e.target.value)}
                       disabled={isPending}
                     />
                   </div>
                   <div className="space-y-2">
-                    <label htmlFor="requestLimit" className="text-sm font-medium">请求上限（0=不限）</label>
+                    <label htmlFor="requestLimit" className="text-sm font-medium">{t('addcredentialdialog.field.requestLimit.label')}</label>
                     <Input
                       id="requestLimit"
                       type="number"
-                      placeholder="累计请求数达到后自动禁用该凭据"
+                      placeholder={t('addcredentialdialog.field.requestLimit.placeholder')}
                       value={requestLimit}
                       onChange={(e) => setRequestLimit(e.target.value)}
                       disabled={isPending}
@@ -618,7 +620,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               {/* Region 配置(Kiro 专属:Token 刷新/API 请求 region)。自定义 API 代挂透传不适用,不显示 */}
               {authMethod !== 'custom_api' && (
               <div className="space-y-2">
-                <label className="text-sm font-medium">Region 配置</label>
+                <label className="text-sm font-medium">{t('addcredentialdialog.field.region.label')}</label>
                 <div className="grid grid-cols-2 gap-2">
                   <div>
                     <Input
@@ -640,7 +642,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   </div>
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  均可留空使用全局配置。Auth Region 用于 Token 刷新，API Region 用于 API 请求
+                  {t('addcredentialdialog.field.region.help')}
                 </p>
               </div>
               )}
@@ -653,7 +655,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     </label>
                     <Input
                       id="clientId"
-                      placeholder="请输入 Client ID"
+                      placeholder={t('addcredentialdialog.field.clientId.placeholder')}
                       value={clientId}
                       onChange={(e) => setClientId(e.target.value)}
                       disabled={isPending}
@@ -666,7 +668,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     <Input
                       id="clientSecret"
                       type="password"
-                      placeholder="请输入 Client Secret"
+                      placeholder={t('addcredentialdialog.field.clientSecret.placeholder')}
                       value={clientSecret}
                       onChange={(e) => setClientSecret(e.target.value)}
                       disabled={isPending}
@@ -744,7 +746,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               {/* 优先级 */}
               <div className="space-y-2">
                 <label htmlFor="priority" className="text-sm font-medium">
-                  优先级
+                  {t('addcredentialdialog.field.priority.label')}
                 </label>
                 <NumberStepper
                   value={Number(priority) || 0}
@@ -752,10 +754,10 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   min={0}
                   disabled={isPending}
                   className="w-full"
-                  aria-label="优先级"
+                  aria-label={t('addcredentialdialog.field.priority.label')}
                 />
                 <p className="text-xs text-muted-foreground">
-                  数字越小优先级越高，默认为 0
+                  {t('addcredentialdialog.field.priority.help')}
                 </p>
               </div>
 
@@ -770,30 +772,30 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 </label>
                 <Input
                   id="machineId"
-                  placeholder="留空使用配置中字段, 否则由刷新Token自动派生"
+                  placeholder={t('addcredentialdialog.field.machineId.placeholder')}
                   value={machineId}
                   onChange={(e) => setMachineId(e.target.value)}
                   disabled={isPending}
                 />
                 <p className="text-xs text-muted-foreground">
-                  可选，64 位十六进制字符串，留空使用配置中字段, 否则由刷新Token自动派生
+                  {t('addcredentialdialog.field.machineId.help')}
                 </p>
               </div>
 
               {/* 端点 */}
               <div className="space-y-2">
                 <label htmlFor="endpoint" className="text-sm font-medium">
-                  端点
+                  {t('addcredentialdialog.field.endpoint.label')}
                 </label>
                 <Input
                   id="endpoint"
-                  placeholder="留空使用默认端点（如 ide / cli）"
+                  placeholder={t('addcredentialdialog.field.endpoint.placeholder')}
                   value={endpoint}
                   onChange={(e) => setEndpoint(e.target.value)}
                   disabled={isPending}
                 />
                 <p className="text-xs text-muted-foreground">
-                  可选。决定该凭据走哪套 Kiro API。留空使用全局 defaultEndpoint
+                  {t('addcredentialdialog.field.endpoint.help')}
                 </p>
               </div>
               </>
@@ -801,12 +803,12 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
               {/* 代理配置 */}
               <div className="space-y-2">
-                <label className="text-sm font-medium">代理配置</label>
+                <label className="text-sm font-medium">{t('addcredentialdialog.field.proxy.label')}</label>
                 <div className="flex items-center gap-2">
                   <Input
                     id="proxyUrl"
                     className="flex-1"
-                    placeholder='如 socks5://user:pass@1.2.3.4:1080（可含账密）/ 留空用全局 / direct 不走代理'
+                    placeholder={t('addcredentialdialog.field.proxyUrl.placeholder')}
                     value={proxyUrl}
                     onChange={(e) => setProxyUrl(e.target.value)}
                     disabled={isPending}
@@ -816,7 +818,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 <div className="grid grid-cols-2 gap-2">
                   <Input
                     id="proxyUsername"
-                    placeholder="代理用户名"
+                    placeholder={t('addcredentialdialog.field.proxyUsername.placeholder')}
                     value={proxyUsername}
                     onChange={(e) => setProxyUsername(e.target.value)}
                     disabled={isPending}
@@ -824,15 +826,14 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   <Input
                     id="proxyPassword"
                     type="password"
-                    placeholder="代理密码"
+                    placeholder={t('addcredentialdialog.field.proxyPassword.placeholder')}
                     value={proxyPassword}
                     onChange={(e) => setProxyPassword(e.target.value)}
                     disabled={isPending}
                   />
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  支持账密内嵌 URL（socks5://用户:密码@主机:端口），会自动识别拆分；也可用下方独立账密框。
-                  留空使用全局代理，"direct" 显式不走代理。
+                  {t('addcredentialdialog.field.proxy.help')}
                 </p>
               </div>
             </div>
@@ -844,10 +845,10 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 onClick={() => onOpenChange(false)}
                 disabled={isPending}
               >
-                取消
+                {t('addcredentialdialog.button.cancel')}
               </Button>
               <Button type="submit" disabled={isPending}>
-                {isPending ? '添加中...' : '添加'}
+                {isPending ? t('addcredentialdialog.button.adding') : t('addcredentialdialog.button.add')}
               </Button>
             </DialogFooter>
           </form>
@@ -857,16 +858,16 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
             <div className="flex flex-col min-h-0 flex-1">
               <div className="space-y-4 py-4 overflow-y-auto flex-1 pr-1">
                 <div className="space-y-2">
-                  <label className="text-sm font-medium">粘贴任意格式 JSON</label>
+                  <label className="text-sm font-medium">{t('addcredentialdialog.paste.label')}</label>
                   <textarea
                     value={pasteInput}
                     onChange={(e) => setPasteInput(e.target.value)}
                     disabled={importing}
-                    placeholder={'把凭据 JSON 粘到这里，自动识别并导入。\n\n支持：单个对象 / 数组 / {credentials:[...]} / KAM 导出格式\n\n[\n  { "refreshToken": "...", "clientId": "...", "clientSecret": "..." },\n  { "kiroApiKey": "ksk_xxx" }\n]\n\n就算 JSON 格式有小错（多余逗号、单引号、缺括号），也会尽力自动纠正。'}
+                    placeholder={t('addcredentialdialog.paste.placeholder')}
                     className="flex min-h-[220px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
                   />
                   <p className="text-xs text-muted-foreground">
-                    自动识别单个 / 数组 / KAM 格式，容错纠正常见 JSON 错误。一条失败不影响其它。
+                    {t('addcredentialdialog.paste.help')}
                   </p>
                 </div>
 
@@ -875,15 +876,15 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     <div className="flex gap-4 text-sm">
                       <span className="inline-flex items-center gap-1 text-green-600 dark:text-green-400">
                         <CheckCircle2 className="h-3.5 w-3.5" />
-                        成功: {pasteResults.filter(r => r.status === 'success').length}
+                        {t('addcredentialdialog.paste.countSuccess')}{pasteResults.filter(r => r.status === 'success').length}
                       </span>
                       <span className="inline-flex items-center gap-1 text-yellow-600 dark:text-yellow-400">
                         <AlertTriangle className="h-3.5 w-3.5" />
-                        重复: {pasteResults.filter(r => r.status === 'duplicate').length}
+                        {t('addcredentialdialog.paste.countDuplicate')}{pasteResults.filter(r => r.status === 'duplicate').length}
                       </span>
                       <span className="inline-flex items-center gap-1 text-red-600 dark:text-red-400">
                         <XCircle className="h-3.5 w-3.5" />
-                        失败: {pasteResults.filter(r => r.status === 'failed').length}
+                        {t('addcredentialdialog.paste.countFailed')}{pasteResults.filter(r => r.status === 'failed').length}
                       </span>
                     </div>
                     <div className="border rounded-md divide-y max-h-[220px] overflow-y-auto">
@@ -893,7 +894,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                           <div className="flex-1 min-w-0">
                             <div className="flex items-center gap-2">
                               <span className="text-sm font-medium">
-                                {r.email || (r.credentialId ? `凭据 #${r.credentialId}` : `第 ${r.index} 条`)}
+                                {r.email || (r.credentialId ? t('addcredentialdialog.paste.credentialItem', { credentialId: r.credentialId }) : t('addcredentialdialog.paste.rowItem', { index: r.index }))}
                               </span>
                             </div>
                             {r.error && (
@@ -916,14 +917,14 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   onClick={() => onOpenChange(false)}
                   disabled={importing}
                 >
-                  {importing ? '导入中...' : pasteResults.length > 0 ? '关闭' : '取消'}
+                  {importing ? t('addcredentialdialog.button.importing') : pasteResults.length > 0 ? t('addcredentialdialog.button.close') : t('addcredentialdialog.button.cancel')}
                 </Button>
                 <Button
                   type="button"
                   onClick={handlePasteImport}
                   disabled={importing || !pasteInput.trim()}
                 >
-                  {importing ? '导入中...' : '识别并导入'}
+                  {importing ? t('addcredentialdialog.button.importing') : t('addcredentialdialog.button.recognizeImport')}
                 </Button>
               </DialogFooter>
             </div>

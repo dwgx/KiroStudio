@@ -11,6 +11,7 @@ import {
   LogOut,
 } from 'lucide-react'
 import { LoginDialog } from '@/components/login-dialog'
+import { LanguageSwitcher } from '@/components/language-switcher'
 import { PageSkeleton } from '@/components/ui/page-skeleton'
 import { usePoolNotifications } from '@/hooks/use-pool-notifications'
 import { useConfigSnapshot } from '@/hooks/use-credentials'
@@ -130,7 +131,8 @@ export function AppShell({ onLogout }: AppShellProps) {
         </div>
 
         {/* Footer */}
-        <div className="px-5 py-4 border-t border-[#2e2e2e]">
+        <div className="px-5 py-4 border-t border-[#2e2e2e] space-y-2">
+          <LanguageSwitcher className="w-full" />
           <button
             onClick={handleLogout}
             className="flex w-full items-center justify-center gap-2 px-3 py-2 rounded-md text-sm text-[#888] hover:text-[#ededed] hover:bg-[#1a1a1a] transition-all duration-200 ease-out-expo"

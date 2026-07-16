@@ -2,6 +2,21 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.34] - 2026-07-16
+
+### 运维台 I18N 三语(中/日/英)+ 设置搜索优化
+
+**I18N 三语框架 + 13 核心组件国际化**:
+- 引入 react-i18next + i18next + languagedetector。945 条三语 key(zh/en/ja)字典,语言选择持久化到
+  localStorage(`kiroLang`),侧边栏 footer 加语言切换器(中文/English/日本語)。
+- 13 个核心组件硬编码中文替换为 `t('key')`:overview / usage / dashboard / ops / credential-card /
+  ops-detail-dialogs / model-test / login-page / login-dialog / add-credential / kam-import / batch-import(约 1000+ 处)。
+- 字典占位符用单括号 `{var}`,i18next interpolation 前后缀配为单括号(否则占位符运行时显示字面量)。
+- 渐进式:未替换组件(部分次要弹窗/可视化子组件/模块级常量)继续显示中文,不影响运行,后续版本补齐。
+
+**设置页搜索优化**:齿轮卡内部字段(如「排队超时放行」「全池冷却快速失败」「令牌桶突发容量」等)之前
+搜不到——给「智能调度」「防关联/限流」两个含齿轮卡的分区补全内部字段关键词,碎片设置项现在可搜到。
+
 ## [0.7.33] - 2026-07-16
 
 ### 根治入站整形排队超时"不流通"(单号/高 RPM)

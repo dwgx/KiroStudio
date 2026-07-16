@@ -2,6 +2,7 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import App from './App'
+import './i18n' // I18N 初始化(副作用 import,须在任何组件用 useTranslation 前执行)
 import './index.css'
 
 const queryClient = new QueryClient({

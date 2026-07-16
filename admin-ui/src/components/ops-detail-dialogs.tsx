@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, type ReactNode } from 'react'
+import { useTranslation } from 'react-i18next'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import {
@@ -96,6 +97,7 @@ function DateTimeField({
   onChange: (v: string) => void
   ariaLabel?: string
 }) {
+  const { t } = useTranslation()
   // 生成本地时区的 datetime-local 字符串(YYYY-MM-DDTHH:mm)。
   const nowLocal = () => {
     const d = new Date()
@@ -131,7 +133,7 @@ function DateTimeField({
           size="sm"
           className="h-8 w-8 shrink-0 p-0 text-muted-foreground hover:text-[#ededed]"
           onClick={() => onChange('')}
-          title="清除"
+          title={t('opsdetaildialogs.trace.clear')}
         >
           <X className="h-3.5 w-3.5" />
         </Button>
@@ -192,6 +194,7 @@ function polar(cx: number, cy: number, r: number, angle: number): [number, numbe
 // 纯 SVG 自绘饼图 + 图例(禁图表库)。value 为占比权重,自动归一为角度;
 // 图例含 label + 百分比。空数据(总和为 0)显示占位文案。
 function PieChart({ segments, size = 132 }: { segments: PieSegment[]; size?: number }) {
+  const { t } = useTranslation()
   const total = segments.reduce((s, seg) => s + Math.max(0, seg.value), 0)
   const cx = size / 2
   const cy = size / 2
@@ -224,7 +227,7 @@ function PieChart({ segments, size = 132 }: { segments: PieSegment[]; size?: num
           className="flex shrink-0 items-center justify-center rounded-full border border-dashed border-[#2e2e2e] text-[10px] text-muted-foreground"
           style={{ width: size, height: size }}
         >
-          无数据
+          {t('opsdetaildialogs.pieChart.noData')}
         </div>
       ) : (
         <svg
@@ -267,6 +270,7 @@ export function TraceDetailDialog({
   open: boolean
   onOpenChange: (v: boolean) => void
 }) {
+  const { t } = useTranslation()
   // 文本输入(即时) + 防抖值(300ms,喂给查询)。text 为主搜索框(全文)。
   const [textRaw, setTextRaw] = useState('')
   const [text, setText] = useState('')
@@ -356,16 +360,16 @@ export function TraceDetailDialog({
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <FileClock className="h-4 w-4" />
-            请求明细
+            {t('opsdetaildialogs.trace.title')}
             <span className="text-xs font-normal text-muted-foreground tabular-nums">
-              共 {total} 条 · 第 {page}/{totalPages} 页
+              {t('opsdetaildialogs.trace.countPage', { total, page, totalPages })}
             </span>
             {isFetching && !isLoading && (
-              <span className="text-[11px] font-normal text-muted-foreground">刷新中…</span>
+              <span className="text-[11px] font-normal text-muted-foreground">{t('opsdetaildialogs.trace.refreshing')}</span>
             )}
           </DialogTitle>
           <DialogDescription>
-            服务端过滤 + 分页的逐请求 trace。点行看全文;点 IP / 设备 / 会话可回填为过滤条件。
+            {t('opsdetaildialogs.trace.description')}
           </DialogDescription>
         </DialogHeader>
 
@@ -376,14 +380,14 @@ export function TraceDetailDialog({
             <Input
               value={textRaw}
               onChange={(e) => setTextRaw(e.target.value)}
-              placeholder="搜索 error / request_id / model…"
+              placeholder={t('opsdetaildialogs.trace.searchPlaceholder')}
               className="h-8 pl-7 pr-7 text-xs"
             />
             {textRaw && (
               <button
                 onClick={() => setTextRaw('')}
                 className="absolute right-1.5 top-1/2 z-10 -translate-y-1/2 text-[#666] hover:text-[#ededed]"
-                title="清除"
+                title={t('opsdetaildialogs.trace.clear')}
               >
                 <X className="h-3.5 w-3.5" />
               </button>
@@ -396,7 +400,7 @@ export function TraceDetailDialog({
             onClick={() => setPanelOpen((v) => !v)}
           >
             <Filter className="mr-1 h-3.5 w-3.5" />
-            筛选
+            {t('opsdetaildialogs.trace.filter')}
             {activeFilterCount > 0 && (
               <Badge variant="default" className="ml-1.5 h-4 min-w-4 justify-center px-1 text-[10px] tabular-nums">
                 {activeFilterCount}
@@ -416,7 +420,7 @@ export function TraceDetailDialog({
                 <Input
                   value={clientIp}
                   onChange={(e) => setClientIp(e.target.value)}
-                  placeholder="如 203.0.113.5"
+                  placeholder={t('opsdetaildialogs.trace.clientIpHint')}
                   className="h-8 text-xs"
                 />
               </div>
@@ -425,36 +429,36 @@ export function TraceDetailDialog({
                 <Input
                   value={sessionId}
                   onChange={(e) => setSessionId(e.target.value)}
-                  placeholder="会话 ID(前缀即可)"
+                  placeholder={t('opsdetaildialogs.trace.sessionHint')}
                   className="h-8 text-xs"
                 />
               </div>
               <div className="space-y-1">
-                <span className="block text-[11px] text-muted-foreground">模型</span>
+                <span className="block text-[11px] text-muted-foreground">{t('opsdetaildialogs.trace.modelLabel')}</span>
                 <Input
                   value={model}
                   onChange={(e) => setModel(e.target.value)}
-                  placeholder="如 claude-opus-4"
+                  placeholder={t('opsdetaildialogs.trace.modelHint')}
                   className="h-8 text-xs"
                 />
               </div>
               <div className="space-y-1">
-                <span className="block text-[11px] text-muted-foreground">结果</span>
+                <span className="block text-[11px] text-muted-foreground">{t('opsdetaildialogs.trace.resultLabel')}</span>
                 <Select
                   value={outcome}
                   onChange={setOutcome}
                   options={OUTCOME_OPTIONS}
-                  aria-label="按结果过滤"
+                  aria-label={t('opsdetaildialogs.trace.filterByResult')}
                   className="[&>button]:h-8 [&>button]:py-1 [&>button]:text-xs"
                 />
               </div>
               <div className="space-y-1">
-                <span className="block text-[11px] text-muted-foreground">起始时间</span>
-                <DateTimeField value={tsFromRaw} onChange={setTsFromRaw} ariaLabel="起始时间" />
+                <span className="block text-[11px] text-muted-foreground">{t('opsdetaildialogs.trace.startTime')}</span>
+                <DateTimeField value={tsFromRaw} onChange={setTsFromRaw} ariaLabel={t('opsdetaildialogs.trace.startTime')} />
               </div>
               <div className="space-y-1">
-                <span className="block text-[11px] text-muted-foreground">截止时间</span>
-                <DateTimeField value={tsToRaw} onChange={setTsToRaw} ariaLabel="截止时间" />
+                <span className="block text-[11px] text-muted-foreground">{t('opsdetaildialogs.trace.endTime')}</span>
+                <DateTimeField value={tsToRaw} onChange={setTsToRaw} ariaLabel={t('opsdetaildialogs.trace.endTime')} />
               </div>
             </div>
             <div className="flex items-center justify-end gap-2">
@@ -466,7 +470,7 @@ export function TraceDetailDialog({
                 onClick={clearPanel}
               >
                 <X className="mr-1 h-3.5 w-3.5" />
-                清空
+                {t('opsdetaildialogs.trace.clearFilters')}
               </Button>
               <Button
                 variant="secondary"
@@ -474,7 +478,7 @@ export function TraceDetailDialog({
                 className="h-8 px-3 text-xs"
                 onClick={() => setPanelOpen(false)}
               >
-                应用筛选
+                {t('opsdetaildialogs.trace.applyFilter')}
               </Button>
             </div>
           </div>
@@ -491,22 +495,22 @@ export function TraceDetailDialog({
           ) : items.length === 0 ? (
             <EmptyState
               icon={hasFilters ? SearchX : Inbox}
-              title={hasFilters ? '无匹配请求' : '暂无请求明细'}
-              description={hasFilters ? '调整或清空过滤条件' : undefined}
+              title={hasFilters ? t('opsdetaildialogs.trace.noMatch') : t('opsdetaildialogs.trace.empty')}
+              description={hasFilters ? t('opsdetaildialogs.trace.emptyHint') : undefined}
             />
           ) : (
             <table className="w-full border-collapse text-xs">
               <thead className="sticky top-0 z-10 bg-[#111] text-[#888]">
                 <tr className="[&>th]:px-2 [&>th]:py-1.5 [&>th]:text-left [&>th]:font-medium">
-                  <th>时间</th>
-                  <th>模型</th>
-                  <th>号</th>
+                  <th>{t('opsdetaildialogs.trace.colTime')}</th>
+                  <th>{t('opsdetaildialogs.trace.modelLabel')}</th>
+                  <th>{t('opsdetaildialogs.trace.colCred')}</th>
                   <th>client IP</th>
-                  <th>设备</th>
-                  <th>会话</th>
+                  <th>{t('opsdetaildialogs.trace.colDevice')}</th>
+                  <th>{t('opsdetaildialogs.trace.colSession')}</th>
                   <th className="text-right">tok(in/out)</th>
-                  <th className="text-right">延迟</th>
-                  <th>结果</th>
+                  <th className="text-right">{t('opsdetaildialogs.trace.colLatency')}</th>
+                  <th>{t('opsdetaildialogs.trace.resultLabel')}</th>
                 </tr>
               </thead>
               <tbody>
@@ -531,7 +535,7 @@ export function TraceDetailDialog({
         {/* 分页条 */}
         <div className="flex items-center justify-between gap-2">
           <span className="text-xs text-muted-foreground tabular-nums">
-            共 {total} 条 · 第 {page}/{totalPages} 页
+            {t('opsdetaildialogs.trace.countPage', { total, page, totalPages })}
           </span>
           <div className="flex items-center gap-2">
             <Button
@@ -542,7 +546,7 @@ export function TraceDetailDialog({
               onClick={() => setOffset((o) => Math.max(0, o - PAGE_SIZE))}
             >
               <ChevronLeft className="mr-1 h-3.5 w-3.5" />
-              上一页
+              {t('opsdetaildialogs.trace.prevPage')}
             </Button>
             <Button
               variant="outline"
@@ -551,7 +555,7 @@ export function TraceDetailDialog({
               disabled={offset + PAGE_SIZE >= total || isFetching}
               onClick={() => setOffset((o) => o + PAGE_SIZE)}
             >
-              下一页
+              {t('opsdetaildialogs.trace.nextPage')}
               <ChevronRight className="ml-1 h-3.5 w-3.5" />
             </Button>
           </div>
@@ -577,6 +581,7 @@ function TraceRow({
   onPickSession: (v: string) => void
   onPickModel: (v: string) => void
 }) {
+  const { t } = useTranslation()
   const oc = outcomeMeta(it.outcome)
   const sessShort = it.session_id ? `${it.session_id.slice(0, 8)}…` : '—'
   // 可点击的联动值(阻止冒泡,避免同时触发行展开)。
@@ -597,7 +602,7 @@ function TraceRow({
           <button
             onClick={pivot(() => it.model && onPickModel(it.model))}
             className="max-w-[130px] truncate font-mono text-[#ccc] hover:text-primary"
-            title={`按模型过滤:${it.model}`}
+            title={t('opsdetaildialogs.trace.filterByModel', { model: it.model })}
           >
             {it.model || '—'}
           </button>
@@ -610,7 +615,7 @@ function TraceRow({
             <button
               onClick={pivot(() => onPickIp(it.client_ip!))}
               className="font-mono text-sky-400/80 hover:text-sky-300"
-              title={`按 IP 过滤:${it.client_ip}`}
+              title={t('opsdetaildialogs.trace.filterByIp', { ip: it.client_ip })}
             >
               {it.client_ip}
             </button>
@@ -626,7 +631,7 @@ function TraceRow({
             <button
               onClick={pivot(() => onPickSession(it.session_id!))}
               className="font-mono text-[#888] hover:text-primary"
-              title={`按会话过滤:${it.session_id}`}
+              title={t('opsdetaildialogs.trace.filterBySession', { session: it.session_id })}
             >
               {sessShort}
             </button>
@@ -650,10 +655,10 @@ function TraceRow({
             <div className="grid grid-cols-1 gap-x-6 gap-y-1 text-[11px] sm:grid-cols-2">
               <Detail label="request_id" value={it.request_id} mono />
               <Detail label="session_id" value={it.session_id ?? '—'} mono />
-              <Detail label="流式" value={it.is_streaming ? '是' : '否'} />
-              <Detail label="重试" value={String(it.retries)} />
+              <Detail label={t('opsdetaildialogs.trace.detailStreaming')} value={it.is_streaming ? t('opsdetaildialogs.trace.yes') : t('opsdetaildialogs.trace.no')} />
+              <Detail label={t('opsdetaildialogs.trace.detailRetries')} value={String(it.retries)} />
               <Detail
-                label="缓存 tok(读/写)"
+                label={t('opsdetaildialogs.trace.detailCacheTok')}
                 value={`${fmtNum(it.cache_read_tokens)} / ${fmtNum(it.cache_creation_tokens)}`}
               />
               <Detail
@@ -661,10 +666,10 @@ function TraceRow({
                 value={it.credits_used != null ? it.credits_used.toFixed(4) : '—'}
               />
               <Detail
-                label="首 token"
+                label={t('opsdetaildialogs.trace.detailFirstToken')}
                 value={it.first_token_ms != null ? `${it.first_token_ms} ms` : '—'}
               />
-              <Detail label="OS / 浏览器" value={`${it.client_os ?? '—'} / ${it.client_browser ?? '—'}`} />
+              <Detail label={t('opsdetaildialogs.trace.detailOsBrowser')} value={`${it.client_os ?? '—'} / ${it.client_browser ?? '—'}`} />
               {it.error_message && (
                 <div className="sm:col-span-2">
                   <span className="text-muted-foreground">error_message:</span>
@@ -699,6 +704,7 @@ export function UsageDetailDialog({
   open: boolean
   onOpenChange: (v: boolean) => void
 }) {
+  const { t } = useTranslation()
   const { data: overview, isLoading: ovLoading } = useUsageOverview()
   const { data: byModel, isLoading: bmLoading } = useUsageByModel()
   const { data: byCred, isLoading: bcLoading } = useUsageByCredential()
@@ -730,7 +736,7 @@ export function UsageDetailDialog({
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <BarChart3 className="h-4 w-4" />
-            用量日志
+            {t('opsdetaildialogs.usage.title')}
           </DialogTitle>
           <DialogDescription>
             汇总 + 占比饼图 + 按模型 / 按号维度聚合(读本地统计,零上游)。KPI 随时间窗切换;饼图为累计维度。
@@ -771,12 +777,12 @@ export function UsageDetailDialog({
           {/* 中部:两饼图并排(token 占比 / 请求数占比) */}
           <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
             <UsagePieCard
-              title="Token 占比(按模型)"
+              title={t('opsdetaildialogs.usage.tokenShareByModel')}
               loading={bmLoading}
               segments={modelTokenSegments}
             />
             <UsagePieCard
-              title="请求数占比(按号)"
+              title={t('opsdetaildialogs.usage.requestShareByCred')}
               loading={bcLoading}
               segments={credReqSegments}
             />
@@ -784,14 +790,14 @@ export function UsageDetailDialog({
 
           {/* 底部:按模型 / 按号明细表 */}
           <UsageGroupTable
-            title="按模型"
-            keyHeader="模型"
+            title={t('opsdetaildialogs.usage.byModel')}
+            keyHeader={t('opsdetaildialogs.trace.modelLabel')}
             rows={byModel}
             loading={bmLoading}
           />
           <UsageGroupTable
-            title="按号(credential)"
-            keyHeader="号"
+            title={t('opsdetaildialogs.usage.byCredential')}
+            keyHeader={t('opsdetaildialogs.trace.colCred')}
             rows={byCred}
             loading={bcLoading}
             keyPrefix="#"
@@ -839,6 +845,7 @@ function UsagePieCard({
   loading: boolean
   segments: PieSegment[]
 }) {
+  const { t } = useTranslation()
   return (
     <div className="rounded-md border border-[#2e2e2e] bg-[#0a0a0a]">
       <div className="border-b border-[#2e2e2e] px-3 py-2 text-sm font-medium">{title}</div>
@@ -846,7 +853,7 @@ function UsagePieCard({
         {loading ? (
           <Skeleton className="h-[132px]" />
         ) : segments.length === 0 ? (
-          <EmptyState icon={Inbox} title="暂无数据" className="py-6" />
+          <EmptyState icon={Inbox} title={t('opsdetaildialogs.usage.noData')} className="py-6" />
         ) : (
           <PieChart segments={segments} />
         )}
@@ -856,17 +863,18 @@ function UsagePieCard({
 }
 
 function UsageKpiRow({ w }: { w?: WindowSummary }) {
+  const { t } = useTranslation()
   const reqs = w?.requests ?? 0
   const tok = w?.total_tokens ?? 0
   const credits = w?.credits_used ?? 0
   const rate = w?.success_rate ?? 0
   return (
     <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-      <StatCard label="请求数" value={fmtNum(reqs)} accent="primary" />
+      <StatCard label={t('opsdetaildialogs.usage.kpiRequests')} value={fmtNum(reqs)} accent="primary" />
       <StatCard label="Tokens" value={fmtNum(tok)} accent="neutral" />
       <StatCard label="Credits" value={credits.toFixed(2)} accent="neutral" />
       <StatCard
-        label="成功率"
+        label={t('opsdetaildialogs.usage.kpiSuccessRate')}
         value={`${(rate * 100).toFixed(1)}%`}
         accent={rate >= 0.95 ? 'success' : rate >= 0.8 ? 'warning' : 'destructive'}
       />
@@ -888,6 +896,7 @@ function UsageGroupTable({
   loading: boolean
   keyPrefix?: string
 }) {
+  const { t } = useTranslation()
   const sorted = useMemo(
     () => [...(rows ?? [])].sort((a, b) => b.requests - a.requests),
     [rows],
@@ -902,7 +911,7 @@ function UsageGroupTable({
           ))}
         </div>
       ) : sorted.length === 0 ? (
-        <EmptyState icon={Inbox} title="暂无数据" className="py-6" />
+        <EmptyState icon={Inbox} title={t('opsdetaildialogs.usage.noData')} className="py-6" />
       ) : (
         // 行多时表格自身独立滚动(表头 sticky 吸顶),避免长表格把整个弹窗撑长、只能滚外层。
         <div className="max-h-[320px] overflow-y-auto">
@@ -910,11 +919,11 @@ function UsageGroupTable({
           <thead className="sticky top-0 z-10 bg-[#0a0a0a] text-[#888]">
             <tr className="[&>th]:px-3 [&>th]:py-1.5 [&>th]:text-left [&>th]:font-medium">
               <th>{keyHeader}</th>
-              <th className="text-right">请求</th>
-              <th className="text-right">成功率</th>
+              <th className="text-right">{t('opsdetaildialogs.usage.colRequests')}</th>
+              <th className="text-right">{t('opsdetaildialogs.usage.kpiSuccessRate')}</th>
               <th className="text-right">tok(in/out)</th>
               <th className="text-right">credits</th>
-              <th className="text-right">均延迟</th>
+              <th className="text-right">{t('opsdetaildialogs.usage.colAvgLatency')}</th>
             </tr>
           </thead>
           <tbody>
@@ -961,6 +970,7 @@ export function TrashDetailDialog({
   open: boolean
   onOpenChange: (v: boolean) => void
 }) {
+  const { t } = useTranslation()
   const queryClient = useQueryClient()
   const { data, isLoading, isFetching } = useQuery({
     queryKey: ['trash'],
@@ -982,10 +992,10 @@ export function TrashDetailDialog({
     setBusyId(item.id)
     try {
       await restoreCredential(item.id)
-      toast.success(`已恢复凭据 #${item.id}`)
+      toast.success(t('opsdetaildialogs.trash.restoreSuccess', { id: item.id }))
       invalidate()
     } catch {
-      toast.error(`恢复 #${item.id} 失败`)
+      toast.error(t('opsdetaildialogs.trash.restoreFailed', { id: item.id }))
     } finally {
       setBusyId(null)
     }
@@ -997,11 +1007,11 @@ export function TrashDetailDialog({
     setBusyId(id)
     try {
       await purgeCredential(id)
-      toast.success(`已永久清除凭据 #${id}`)
+      toast.success(t('opsdetaildialogs.trash.purgeSuccess', { id }))
       setPurgeTarget(null)
       invalidate()
     } catch {
-      toast.error(`清除 #${id} 失败`)
+      toast.error(t('opsdetaildialogs.trash.purgeFailed', { id }))
     } finally {
       setBusyId(null)
     }
@@ -1013,17 +1023,17 @@ export function TrashDetailDialog({
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Trash2 className="h-4 w-4" />
-            凭据回收站
+            {t('opsdetaildialogs.trash.title')}
             <span className="text-xs font-normal text-muted-foreground tabular-nums">
-              {list.length} 项
+              {t('opsdetaildialogs.trash.count', { count: list.length })}
             </span>
             {isFetching && !isLoading && (
-              <span className="text-[11px] font-normal text-muted-foreground">刷新中…</span>
+              <span className="text-[11px] font-normal text-muted-foreground">{t('opsdetaildialogs.trace.refreshing')}</span>
             )}
           </DialogTitle>
           <DialogDescription>
             已删除的凭据暂存于此,可恢复回号池或永久清除。永久清除
-            <strong className="text-red-400">不可恢复</strong>。
+            <strong className="text-red-400">{t('opsdetaildialogs.trash.notRecoverable')}</strong>。
           </DialogDescription>
         </DialogHeader>
 
@@ -1035,7 +1045,7 @@ export function TrashDetailDialog({
               ))}
             </div>
           ) : list.length === 0 ? (
-            <EmptyState icon={Trash2} title="回收站为空" description="删除凭据后会暂存于此" />
+            <EmptyState icon={Trash2} title={t('opsdetaildialogs.trash.empty')} description={t('opsdetaildialogs.trash.emptyHint')} />
           ) : (
             <div className="space-y-1.5">
               {list.map((item) => (
@@ -1046,7 +1056,7 @@ export function TrashDetailDialog({
                   <div className="min-w-0">
                     <div className="flex items-center gap-2 text-sm">
                       <span className="font-mono text-[#aaa]">#{item.id}</span>
-                      <span className="truncate">{item.email || '(无 email)'}</span>
+                      <span className="truncate">{item.email || t('opsdetaildialogs.trash.noEmail')}</span>
                       {item.authMethod && (
                         <Badge variant="outline" className="text-[10px]">{item.authMethod}</Badge>
                       )}
@@ -1055,12 +1065,12 @@ export function TrashDetailDialog({
                       {item.maskedApiKey && (
                         <span className="font-mono">{item.maskedApiKey}</span>
                       )}
-                      <span title={item.deletedAt}>删除于 {timeAgo(item.deletedAt)}</span>
+                      <span title={item.deletedAt}>{t('opsdetaildialogs.trash.deletedAt', { time: timeAgo(item.deletedAt) })}</span>
                       <span>·</span>
-                      <span>成功 {item.successCount} 次</span>
+                      <span>{t('opsdetaildialogs.trash.successCount', { count: item.successCount })}</span>
                       <span>·</span>
                       <span title={item.lastUsedAt ?? undefined}>
-                        最后调用 {timeAgo(item.lastUsedAt)}
+                        {t('opsdetaildialogs.trash.lastUsed', { time: timeAgo(item.lastUsedAt) })}
                       </span>
                     </div>
                   </div>
@@ -1073,7 +1083,7 @@ export function TrashDetailDialog({
                       onClick={() => handleRestore(item)}
                     >
                       <RotateCcw className="mr-1 h-3.5 w-3.5" />
-                      恢复
+                      {t('opsdetaildialogs.trash.restore')}
                     </Button>
                     <Button
                       variant="destructive"
@@ -1083,7 +1093,7 @@ export function TrashDetailDialog({
                       onClick={() => setPurgeTarget(item)}
                     >
                       <Trash className="mr-1 h-3.5 w-3.5" />
-                      永久清除
+                      {t('opsdetaildialogs.trash.purge')}
                     </Button>
                   </div>
                 </div>
@@ -1097,14 +1107,14 @@ export function TrashDetailDialog({
       <ConfirmDialog
         open={purgeTarget !== null}
         onOpenChange={(v) => !v && setPurgeTarget(null)}
-        title={`永久清除凭据 #${purgeTarget?.id ?? ''}？`}
+        title={t('opsdetaildialogs.trash.confirmTitle', { id: purgeTarget?.id ?? '' })}
         description={
           <span>
             此操作将<strong className="text-red-400">永久删除,无法恢复</strong>
             ,该凭据将从回收站彻底清除。确定继续？
           </span>
         }
-        confirmLabel="确认永久清除"
+        confirmLabel={t('opsdetaildialogs.trash.confirmPurgeLabel')}
         destructive
         loading={busyId !== null && busyId === purgeTarget?.id}
         onConfirm={runPurge}
@@ -1124,6 +1134,7 @@ export function BgCacheDetailDialog({
   // 缓存张数(来自 storage stats 的 bg_cache 分区 items 字段)。
   count: number
 }) {
+  const { t } = useTranslation()
   const idxs = useMemo(() => Array.from({ length: Math.max(0, count) }, (_, i) => i), [count])
   // 放大预览:记住当前放大的图索引(null=未放大)。
   const [lightboxIdx, setLightboxIdx] = useState<number | null>(null)
@@ -1204,9 +1215,9 @@ export function BgCacheDetailDialog({
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <ImageIcon className="h-4 w-4" />
-            登录背景图缓存
+            {t('opsdetaildialogs.bgcache.title')}
             <span className="text-xs font-normal text-muted-foreground tabular-nums">
-              {count} 张
+              {t('opsdetaildialogs.bgcache.count', { count })}
             </span>
           </DialogTitle>
           <DialogDescription>
@@ -1232,7 +1243,7 @@ export function BgCacheDetailDialog({
                 onClick={() => setSelectedImgs(new Set())}
                 className="rounded border border-[#2e2e2e] px-2.5 py-1 text-xs text-muted-foreground hover:text-[#ededed]"
               >
-                清空
+                {t('opsdetaildialogs.trace.clearFilters')}
               </button>
             </div>
           </div>
@@ -1240,7 +1251,7 @@ export function BgCacheDetailDialog({
 
         <div className="min-h-0 flex-1 overflow-y-auto">
           {idxs.length === 0 ? (
-            <EmptyState icon={ImageIcon} title="缓存为空" description="尚未拉取任何背景图" />
+            <EmptyState icon={ImageIcon} title={t('opsdetaildialogs.bgcache.empty')} description={t('opsdetaildialogs.bgcache.emptyHint')} />
           ) : (
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
               {idxs.map((i) => {
@@ -1257,7 +1268,7 @@ export function BgCacheDetailDialog({
                   <img
                     src={bgUrl(i)}
                     loading="lazy"
-                    alt={`背景图 #${i}`}
+                    alt={t('opsdetaildialogs.bgcache.imageAlt', { i })}
                     className="h-full w-full object-cover transition-transform duration-300 ease-out group-hover:scale-110"
                   />
                   <span className="absolute left-1.5 top-1.5 rounded bg-black/60 px-1.5 py-0.5 font-mono text-[10px] text-white/90">
@@ -1285,7 +1296,7 @@ export function BgCacheDetailDialog({
                     href={bgUrl(i)}
                     download={`bg-${i}.jpg`}
                     onClick={(e) => e.stopPropagation()}
-                    title="下载此图"
+                    title={t('opsdetaildialogs.bgcache.downloadThis')}
                     className="absolute right-1.5 top-1.5 flex h-6 w-6 items-center justify-center rounded bg-black/60 text-white/90 opacity-0 transition-opacity hover:bg-black/80 group-hover:opacity-100"
                   >
                     <Download className="h-3.5 w-3.5" />
@@ -1304,11 +1315,11 @@ export function BgCacheDetailDialog({
           onClick={() => setLightboxIdx(null)}
           className="fixed inset-0 z-[100] flex items-center justify-center bg-black/85 p-6 backdrop-blur-sm"
           role="dialog"
-          aria-label={`背景图 #${lightboxIdx} 放大预览`}
+          aria-label={t('opsdetaildialogs.bgcache.lightboxLabel', { i: lightboxIdx })}
         >
           <button
             onClick={() => setLightboxIdx(null)}
-            title="关闭(Esc)"
+            title={t('opsdetaildialogs.bgcache.closeEsc')}
             className="absolute right-4 top-4 flex h-9 w-9 items-center justify-center rounded-full bg-white/10 text-white/90 hover:bg-white/20"
           >
             <X className="h-5 w-5" />
@@ -1316,7 +1327,7 @@ export function BgCacheDetailDialog({
           <div className="relative max-h-full max-w-full" onClick={(e) => e.stopPropagation()}>
             <img
               src={bgUrl(lightboxIdx)}
-              alt={`背景图 #${lightboxIdx}`}
+              alt={t('opsdetaildialogs.bgcache.imageAlt', { i: lightboxIdx })}
               className="max-h-[80vh] max-w-full rounded-md object-contain shadow-2xl"
             />
             <div className="absolute bottom-2 left-2 flex items-center gap-2">
@@ -1330,7 +1341,7 @@ export function BgCacheDetailDialog({
                 className="flex items-center gap-1 rounded bg-black/60 px-2 py-0.5 text-xs text-white/90 hover:bg-black/80"
               >
                 <Download className="h-3.5 w-3.5" />
-                下载
+                {t('opsdetaildialogs.bgcache.download')}
               </a>
             </div>
           </div>
