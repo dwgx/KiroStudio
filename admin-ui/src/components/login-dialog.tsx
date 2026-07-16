@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
+import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import {
   Dialog,
@@ -51,6 +52,7 @@ const SOCIAL_POLL_MS = 2000
 const IDC_POLL_MS = 5000
 
 export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps) {
+  const { t } = useTranslation()
   const [mode, setMode] = useState<Mode>('idc')
   const [step, setStep] = useState<Step>('form')
 
@@ -175,15 +177,15 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
         } else if (result.status === 'done') {
           stopPolling()
           setStep('done')
-          toast.success(`IDC 上号成功，凭据 #${result.credentialId}`)
+          toast.success(`${t('idclogindialog.toast.loginSuccess')}${result.credentialId}`)
           onSuccess?.()
         } else if (result.status === 'expired') {
           stopPolling()
-          toast.error('授权已超时，请重新发起')
+          toast.error(t('idclogindialog.toast.authTimeoutRetry'))
           setStep('form')
         } else {
           stopPolling()
-          toast.error(result.message || 'IDC 登录失败')
+          toast.error(result.message || t('idclogindialog.toast.loginFailed'))
           setStep('form')
         }
       } catch {
@@ -194,7 +196,7 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
 
   const handleStartIdc = async () => {
     if (!startUrl.trim()) {
-      toast.error('请输入 Start URL')
+      toast.error(t('idclogindialog.toast.startUrlRequired'))
       return
     }
     setIsStarting(true)
@@ -213,7 +215,7 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
           if (prev <= 1) {
             stopPolling()
             setStep('form')
-            toast.error('授权已超时')
+            toast.error(t('idclogindialog.toast.authTimeout'))
             return 0
           }
           return prev - 1
@@ -370,25 +372,25 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
               在浏览器中登录你的 Kiro 账号，完成后凭据会自动加入池。
             </p>
             <div className="space-y-2">
-              <label className="text-sm font-medium">优先级</label>
+              <label className="text-sm font-medium">{t('idclogindialog.form.priorityLabel')}</label>
               <NumberStepper
                 value={Number(priority) || 0}
                 onChange={(n) => setPriority(String(n))}
                 min={0}
                 disabled={isStarting}
                 className="w-full"
-                aria-label="优先级"
+                aria-label={t('idclogindialog.form.priorityAriaLabel')}
               />
-              <p className="text-xs text-muted-foreground">数字越小优先级越高</p>
+              <p className="text-xs text-muted-foreground">{t('idclogindialog.form.priorityHelp')}</p>
             </div>
             <div className="space-y-2">
-              <label className="text-sm font-medium">代理（可选）</label>
+              <label className="text-sm font-medium">{t('idclogindialog.form.proxyLabel')}</label>
               <div className="flex items-center gap-2">
                 <Input
                   className="flex-1"
                   value={proxyUrl}
                   onChange={(e) => setProxyUrl(e.target.value)}
-                  placeholder="留空使用全局代理"
+                  placeholder={t('idclogindialog.form.proxyPlaceholder')}
                   disabled={isStarting}
                 />
                 <ProxyTestButton proxyUrl={proxyUrl} />
@@ -400,10 +402,10 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
         {step === 'form' && mode === 'idc' && (
           <div className="space-y-4 py-2">
             <p className="text-sm text-muted-foreground">
-              通过 AWS IAM Identity Center 登录。输入 Start URL 后在浏览器中授权。
+              {t('idclogindialog.form.intro')}
             </p>
             <div className="space-y-2">
-              <label className="text-sm font-medium">Start URL</label>
+              <label className="text-sm font-medium">{t('idclogindialog.form.startUrlLabel')}</label>
               <Input
                 value={startUrl}
                 onChange={(e) => setStartUrl(e.target.value)}
@@ -412,7 +414,7 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
               />
             </div>
             <div className="space-y-2">
-              <label className="text-sm font-medium">Region</label>
+              <label className="text-sm font-medium">{t('idclogindialog.form.regionLabel')}</label>
               <RegionSelect
                 value={region}
                 onChange={setRegion}
@@ -420,29 +422,29 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
                 disabled={isStarting}
               />
               <p className="text-xs text-muted-foreground">
-                填错也没关系——会自动探测实例所在 region。不确定就留默认。
+                {t('idclogindialog.form.regionHelp')}
               </p>
             </div>
             <div className="space-y-2">
-              <label className="text-sm font-medium">优先级</label>
+              <label className="text-sm font-medium">{t('idclogindialog.form.priorityLabel')}</label>
               <NumberStepper
                 value={Number(priority) || 0}
                 onChange={(n) => setPriority(String(n))}
                 min={0}
                 disabled={isStarting}
                 className="w-full"
-                aria-label="优先级"
+                aria-label={t('idclogindialog.form.priorityAriaLabel')}
               />
-              <p className="text-xs text-muted-foreground">数字越小优先级越高</p>
+              <p className="text-xs text-muted-foreground">{t('idclogindialog.form.priorityHelp')}</p>
             </div>
             <div className="space-y-2">
-              <label className="text-sm font-medium">代理（可选）</label>
+              <label className="text-sm font-medium">{t('idclogindialog.form.proxyLabel')}</label>
               <div className="flex items-center gap-2">
                 <Input
                   className="flex-1"
                   value={proxyUrl}
                   onChange={(e) => setProxyUrl(e.target.value)}
-                  placeholder="留空使用全局代理"
+                  placeholder={t('idclogindialog.form.proxyPlaceholder')}
                   disabled={isStarting}
                 />
                 <ProxyTestButton proxyUrl={proxyUrl} />
@@ -460,16 +462,16 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
               下面会分 3 步引导你完成。
             </div>
             <div className="space-y-2">
-              <label className="text-sm font-medium">优先级</label>
+              <label className="text-sm font-medium">{t('idclogindialog.form.priorityLabel')}</label>
               <NumberStepper
                 value={Number(priority) || 0}
                 onChange={(n) => setPriority(String(n))}
                 min={0}
                 disabled={eidpBusy}
                 className="w-full"
-                aria-label="优先级"
+                aria-label={t('idclogindialog.form.priorityAriaLabel')}
               />
-              <p className="text-xs text-muted-foreground">数字越小优先级越高</p>
+              <p className="text-xs text-muted-foreground">{t('idclogindialog.form.priorityHelp')}</p>
             </div>
             <div className="space-y-2">
               <label className="text-sm font-medium">优先探测区域（可选）</label>
@@ -485,13 +487,13 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
               </p>
             </div>
             <div className="space-y-2">
-              <label className="text-sm font-medium">代理（可选）</label>
+              <label className="text-sm font-medium">{t('idclogindialog.form.proxyLabel')}</label>
               <div className="flex items-center gap-2">
                 <Input
                   className="flex-1"
                   value={proxyUrl}
                   onChange={(e) => setProxyUrl(e.target.value)}
-                  placeholder="留空使用全局代理"
+                  placeholder={t('idclogindialog.form.proxyPlaceholder')}
                   disabled={eidpBusy}
                 />
                 <ProxyTestButton proxyUrl={proxyUrl} />
@@ -681,21 +683,21 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
         {step === 'waiting' && mode === 'idc' && idcSession && (
           <div className="space-y-4 py-2">
             <p className="text-sm text-muted-foreground">
-              在浏览器中打开授权页面，输入验证码完成登录。
+              {t('idclogindialog.waiting.intro')}
             </p>
             <div className="rounded-lg border bg-muted/50 p-4 text-center space-y-2">
-              <p className="text-xs text-muted-foreground">验证码</p>
+              <p className="text-xs text-muted-foreground">{t('idclogindialog.waiting.codeLabel')}</p>
               <p className="text-2xl font-mono font-bold tracking-widest">{idcSession.userCode}</p>
               <Button
                 type="button"
                 variant="ghost"
                 size="sm"
                 onClick={() => copyToClipboard(idcSession.userCode).then(ok => {
-                  if (ok) toast.success('验证码已复制')
-                  else toast.error('复制失败')
+                  if (ok) toast.success(t('idclogindialog.toast.userCodeCopied'))
+                  else toast.error(t('idclogindialog.toast.copyFailed'))
                 })}
               >
-                复制验证码
+                {t('idclogindialog.waiting.copyCode')}
               </Button>
             </div>
             <div className="flex items-center gap-2">
@@ -721,12 +723,12 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
                 window.open(url, '_blank', 'noopener,noreferrer')
               }}
             >
-              打开授权页面
+              {t('idclogindialog.waiting.openAuthPage')}
             </Button>
             <div className="flex items-center justify-between text-sm text-muted-foreground">
               <div className="flex items-center gap-2">
                 <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-primary" />
-                等待授权完成…
+                {t('idclogindialog.waiting.waitingAuth')}
               </div>
               <span className="tabular-nums">{formatCountdown(countdown)}</span>
             </div>
@@ -738,13 +740,13 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
           <div className="space-y-3 py-4 text-center">
             <CheckCircle2 className="mx-auto h-12 w-12 text-green-600 dark:text-green-400" />
             <p className="text-sm font-medium">
-              {mode === 'web' ? '网页上号成功' : 'IDC 上号成功'}
+              {mode === 'web' ? '网页上号成功' : t('idclogindialog.done.title')}
             </p>
             {resultEmail && (
               <p className="text-xs text-muted-foreground">{resultEmail}</p>
             )}
             {mode === 'idc' && (
-              <p className="text-xs text-muted-foreground">凭据已加入池</p>
+              <p className="text-xs text-muted-foreground">{t('idclogindialog.done.desc')}</p>
             )}
           </div>
         )}
@@ -762,21 +764,21 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
                 onClick={() => onOpenChange(false)}
                 disabled={isStarting}
               >
-                取消
+                {t('idclogindialog.footer.cancel')}
               </Button>
               <Button type="button" onClick={handleStart} disabled={isStarting}>
-                {isStarting ? '启动中…' : '开始登录'}
+                {isStarting ? t('idclogindialog.footer.starting') : t('idclogindialog.footer.startLogin')}
               </Button>
             </>
           )}
           {mode !== 'external-idp' && step === 'waiting' && (
             <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
-              取消
+              {t('idclogindialog.footer.cancel')}
             </Button>
           )}
           {mode !== 'external-idp' && step === 'done' && (
             <Button type="button" onClick={() => onOpenChange(false)}>
-              完成
+              {t('idclogindialog.footer.done')}
             </Button>
           )}
 
@@ -789,7 +791,7 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
                 onClick={() => onOpenChange(false)}
                 disabled={eidpBusy}
               >
-                取消
+                {t('idclogindialog.footer.cancel')}
               </Button>
               <Button type="button" onClick={handleStart} disabled={eidpBusy}>
                 {eidpBusy ? '启动中…' : '开始'}
@@ -804,7 +806,7 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
                 onClick={() => onOpenChange(false)}
                 disabled={eidpBusy}
               >
-                取消
+                {t('idclogindialog.footer.cancel')}
               </Button>
               <Button type="button" onClick={handleEidpLeg1} disabled={eidpBusy}>
                 {eidpBusy ? '提交中…' : '下一步'}
@@ -819,7 +821,7 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
                 onClick={() => onOpenChange(false)}
                 disabled={eidpBusy}
               >
-                取消
+                {t('idclogindialog.footer.cancel')}
               </Button>
               <Button type="button" onClick={handleEidpLeg2} disabled={eidpBusy}>
                 {eidpBusy ? '提交中…' : '完成上号'}
@@ -833,12 +835,12 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
               onClick={() => onOpenChange(false)}
               disabled={eidpBusy}
             >
-              取消
+              {t('idclogindialog.footer.cancel')}
             </Button>
           )}
           {mode === 'external-idp' && eidpStep === 3 && (
             <Button type="button" onClick={() => onOpenChange(false)}>
-              完成
+              {t('idclogindialog.footer.done')}
             </Button>
           )}
         </DialogFooter>

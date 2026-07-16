@@ -1742,7 +1742,7 @@ export function SettingsPage() {
       </SectionGate>
 
       {/* 智能调度分区（余额加权 / RPM headroom / 背压 / 429 感知，全部热更即时生效） */}
-      <SectionGate section="scheduling" title="智能调度" keywords={['余额加权', '智能调度', 'headroom', '预留', '背压', '429', '限速感知', 'balance', 'rpm', '每号 rpm 软上限', '全局 rpm']}>
+      <SectionGate section="scheduling" title="智能调度" keywords={['余额加权', '智能调度', 'headroom', '预留', '背压', '429', '限速感知', 'balance', 'rpm', '每号 rpm 软上限', '全局 rpm', '入站整形', '入站请求整形', 'rpm 自动挡', 'aimd', '令牌桶', '目标 rpm', '自动挡 rpm 下限', '自动挡 rpm 上限', '突发容量', '排队最长等待', '排队超时放行', '超时放行', '削峰', '整池饱和背压等待', 'rpm 预留名额', '余额权重', '权重下限', '429 降权']}>
       <Card>
         <CardHeader className="pb-2">
           <CardTitle className="text-base"><Highlight text="智能调度" /></CardTitle>
@@ -2023,7 +2023,7 @@ export function SettingsPage() {
       </SectionGate>
 
       {/* 调度分区：防关联 / 限流（需重启） */}
-      <SectionGate section="scheduling" title="防关联 / 限流" keywords={['冷却机制', '速率限制', '每日上限', '最小请求间隔', '会话亲和性', 'affinity']}>
+      <SectionGate section="scheduling" title="防关联 / 限流" keywords={['冷却机制', '速率限制', '每日上限', '最小请求间隔', '会话亲和性', 'affinity', '全池冷却快速失败', '全池冷却', 'fast-fail', '冷却时长缩放', '启用冷却机制', '启用速率限制', '间隔抖动', '拟人节奏', 'retry-after', '客户端退避']}>
       <Card>
         <CardHeader className="pb-2">
           <CardTitle className="text-base"><Highlight text="防关联 / 限流" /></CardTitle>

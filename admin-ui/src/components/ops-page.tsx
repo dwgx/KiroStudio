@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo, type ReactNode } from 'react'
+import { useTranslation } from 'react-i18next'
 import { useQuery } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -194,6 +195,7 @@ function formatBytes(bytes: number): string {
 // 实时指标条:全局 RPM / 在途 / 当前 RPS / Tokens-s,~1.5s SSE 实时刷新(AnimatedNumber 滚动)。
 // 连接态脉冲点如实反映流是否活着;首帧未到(连接中)用 Skeleton 占位而非闪 0。
 function LiveMetricsBar({ live }: { live: ReturnType<typeof useLiveStream> }) {
+  const { t } = useTranslation()
   const { frame, connected } = live
 
   // 首帧未到达且未连上:骨架占位(避免闪现 0 值误导)。
@@ -214,32 +216,32 @@ function LiveMetricsBar({ live }: { live: ReturnType<typeof useLiveStream> }) {
       <span
         className={`inline-block h-1.5 w-1.5 rounded-full ${connected ? 'animate-pulse bg-emerald-400' : 'bg-[#666]'}`}
       />
-      {connected ? '实时' : '重连中'}
+      {connected ? t('opspage.live.realtime') : t('opspage.live.reconnecting')}
     </span>
   )
   return (
     <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
       <StatCard
-        label="全局 RPM"
+        label={t('opspage.stat.globalRpm')}
         value={<AnimatedNumber value={frame?.globalRpm ?? 0} />}
         icon={Gauge}
         accent="primary"
         hint={dot}
       />
       <StatCard
-        label="在途请求"
+        label={t('opspage.stat.inflight')}
         value={<AnimatedNumber value={frame?.globalInflight ?? 0} />}
         icon={Layers}
         accent={frame && frame.globalInflight > 0 ? 'warning' : 'neutral'}
       />
       <StatCard
-        label="当前 RPS"
+        label={t('opspage.stat.currentRps')}
         value={<AnimatedNumber value={rps} format={(n) => n.toFixed(1)} />}
         icon={Cpu}
         accent="neutral"
       />
       <StatCard
-        label="Tokens/s"
+        label={t('opspage.stat.tokensPerSec')}
         value={<AnimatedNumber value={tps} format={(n) => Math.round(n).toLocaleString()} />}
         icon={Timer}
         accent="neutral"
@@ -249,6 +251,7 @@ function LiveMetricsBar({ live }: { live: ReturnType<typeof useLiveStream> }) {
 }
 
 function RecoveryMetricsCard() {
+  const { t } = useTranslation()
   // 每 5s 刷新计数器（纯内存端点，零上游）。
   const { data, isLoading, refetch } = useQuery({
     queryKey: ['recovery-metrics'],
@@ -261,10 +264,10 @@ function RecoveryMetricsCard() {
       <CardHeader className="flex flex-row items-center justify-between pb-2">
         <CardTitle className="flex items-center gap-2 text-base">
           <Activity className="h-4 w-4" />
-          自愈机器
+          {t('opspage.recovery.title')}
           {data && (
             <span className="text-xs font-normal text-muted-foreground">
-              · 运行 {formatUptime(data.uptimeMs)}（自启动累计，重启归零）
+              {t('opspage.recovery.uptime', { uptime: formatUptime(data.uptimeMs) })}
             </span>
           )}
         </CardTitle>
@@ -275,8 +278,7 @@ function RecoveryMetricsCard() {
       <CardContent>
         {data && data.atRestHealthy === false && (
           <Callout variant="danger" className="mb-3">
-            at-rest 加密已开启,但上次凭据落盘回退成了明文(密钥文件读写失败)。磁盘上的凭据当前未加密——
-            请检查密钥文件权限/磁盘可写后重试保存,或查看日志。
+            {t('opspage.recovery.atRestWarning')}
           </Callout>
         )}
         {isLoading ? (
@@ -303,11 +305,11 @@ function RecoveryMetricsCard() {
           <EmptyState
             icon={ServerCrash}
             tone="destructive"
-            title="读取失败"
-            description="自愈计数端点无响应"
+            title={t('opspage.recovery.readFailTitle')}
+            description={t('opspage.recovery.readFailDesc')}
             action={
               <Button variant="outline" size="sm" onClick={() => refetch()}>
-                重试
+                {t('opspage.common.retry')}
               </Button>
             }
           />
@@ -378,6 +380,7 @@ function PoolHealthRow({
   verifying: boolean
   probing: boolean
 }) {
+  const { t } = useTranslation()
   const st = circuitStateOf(it)
   const meta = CIRCUIT_META[st]
   const badge = CIRCUIT_BADGE[st]
@@ -389,9 +392,9 @@ function PoolHealthRow({
     <div className="grid grid-cols-[8px_48px_84px_1fr_minmax(140px,1.5fr)_auto] items-center gap-3 rounded-md border border-[#2e2e2e] bg-[#111] px-3 py-2">
       <span className={`inline-block h-2 w-2 shrink-0 rounded-full ${meta.dot}`} />
       <span className="font-mono text-xs text-[#aaa]">#{it.id}</span>
-      <Badge variant={badge} className="justify-center">{meta.label}</Badge>
+      <Badge variant={badge} className="justify-center">{t(`opspage.circuit.${st}`)}</Badge>
       {/* 健康分条 */}
-      <div className="flex items-center gap-1.5" title={`健康分 ${healthPct}%`}>
+      <div className="flex items-center gap-1.5" title={t('opspage.row.healthScore', { pct: healthPct })}>
         <Progress value={healthPct} invert className="h-1.5 flex-1" />
         <span className="w-8 text-right text-[10px] tabular-nums text-[#888]">{healthPct}%</span>
       </div>
@@ -399,29 +402,29 @@ function PoolHealthRow({
       <span className="truncate text-xs text-[#888]">
         <span className="tabular-nums">rpm {it.rpm}{it.rpmLimit > 0 ? `/${it.rpmLimit}` : ''}</span>
         {it.health?.circuitOpen && it.health.openRemainingSecs > 0 && (
-          <span className="ml-2 text-red-400">熔断剩 {it.health.openRemainingSecs}s</span>
+          <span className="ml-2 text-red-400">{t('opspage.row.circuitRemaining', { s: it.health.openRemainingSecs })}</span>
         )}
         {it.cooldown && (
-          <span className="ml-2 text-sky-400">冷却 {Math.ceil(it.cooldown.remainingMs / 1000)}s</span>
+          <span className="ml-2 text-sky-400">{t('opspage.row.cooldown', { s: Math.ceil(it.cooldown.remainingMs / 1000) })}</span>
         )}
         {it.recent429 > 0 && <span className="ml-2 text-amber-400">429×{it.recent429}</span>}
       </span>
       {/* 快捷操作 */}
       <div className="flex shrink-0 items-center gap-0.5">
-        <IconAction icon={Zap} label="强制刷新 Token" onClick={onRefresh} disabled={busy} className="text-[#888] hover:text-sky-400" />
-        <IconAction icon={RotateCcw} label="重置失败计数并启用" onClick={onReset} disabled={busy} className="text-[#888] hover:text-emerald-400" />
-        <IconAction icon={ShieldCheck} label="深度验活(真实 API 调用)" onClick={onVerify} disabled={busy} pending={verifying} className="text-[#888] hover:text-emerald-400" />
+        <IconAction icon={Zap} label={t('opspage.row.forceRefresh')} onClick={onRefresh} disabled={busy} className="text-[#888] hover:text-sky-400" />
+        <IconAction icon={RotateCcw} label={t('opspage.row.resetEnable')} onClick={onReset} disabled={busy} className="text-[#888] hover:text-emerald-400" />
+        <IconAction icon={ShieldCheck} label={t('opspage.row.deepVerify')} onClick={onVerify} disabled={busy} pending={verifying} className="text-[#888] hover:text-emerald-400" />
         {!isCustom && (
-          <IconAction icon={Boxes} label="探测可用模型(⚠️消耗真实积分)" onClick={onProbe} disabled={busy} pending={probing} className="text-[#888] hover:text-amber-400" />
+          <IconAction icon={Boxes} label={t('opspage.row.probeModels')} onClick={onProbe} disabled={busy} pending={probing} className="text-[#888] hover:text-amber-400" />
         )}
         <IconAction
           icon={Power}
-          label={it.disabled ? '启用' : '禁用'}
+          label={it.disabled ? t('opspage.row.enable') : t('opspage.row.disable')}
           onClick={onToggleDisabled}
           disabled={busy}
           className={it.disabled ? 'text-[#777] hover:text-emerald-400' : 'text-emerald-400 hover:text-red-400'}
         />
-        <IconAction icon={MoreHorizontal} label="更多运维操作" onClick={onMore} disabled={busy} className="text-[#888] hover:text-foreground" />
+        <IconAction icon={MoreHorizontal} label={t('opspage.row.moreOps')} onClick={onMore} disabled={busy} className="text-[#888] hover:text-foreground" />
       </div>
     </div>
   )
@@ -463,6 +466,7 @@ const CIRCUIT_BADGE: Record<CircuitState, BadgeProps['variant']> = {
 // 数据双源:insights(10s 轮询,给全量字段)+ SSE live 帧(~1.5s,实时覆盖 rpm/inflight/熔断/健康分),
 // 让实时指标跟手、又不丢 insights 的推断文案/软上限。
 function PoolHealthCard({ live }: { live: ReturnType<typeof useLiveStream> }) {
+  const { t } = useTranslation()
   const { data, isLoading } = useRatelimitInsights()
   const { data: credsResp } = useCredentials()
   const { frame, connected } = live
@@ -506,8 +510,8 @@ function PoolHealthCard({ live }: { live: ReturnType<typeof useLiveStream> }) {
 
   const runVerify = (id: number) =>
     deepVerify.mutate(id, {
-      onSuccess: () => toast.success(`#${id} 验活完成`),
-      onError: () => toast.error(`#${id} 验活失败`),
+      onSuccess: () => toast.success(t('opspage.toast.verifyOk', { id })),
+      onError: () => toast.error(t('opspage.toast.verifyFail', { id })),
     })
   const runProbe = (id: number) =>
     probeModels.mutate(
@@ -515,9 +519,14 @@ function PoolHealthCard({ live }: { live: ReturnType<typeof useLiveStream> }) {
       {
         onSuccess: (r) =>
           toast.success(
-            `#${id} 探测完成:${r.models.filter((m) => m.status === 'supported').length}/${r.models.length} 可用,耗 ${r.totalCredits} credits`,
+            t('opspage.toast.probeOk', {
+              id,
+              ok: r.models.filter((m) => m.status === 'supported').length,
+              total: r.models.length,
+              credits: r.totalCredits,
+            }),
           ),
-        onError: () => toast.error(`#${id} 探模型失败`),
+        onError: () => toast.error(t('opspage.toast.probeFail', { id })),
       },
     )
 
@@ -528,13 +537,13 @@ function PoolHealthCard({ live }: { live: ReturnType<typeof useLiveStream> }) {
       <CardHeader className="flex flex-row items-center justify-between pb-2">
         <CardTitle className="flex items-center gap-2 text-base">
           <ShieldAlert className="h-4 w-4" />
-          号池健康
+          {t('opspage.pool.title')}
           <span className="flex items-center gap-1.5 text-xs font-normal text-muted-foreground">
             <span
               className={`inline-block h-1.5 w-1.5 rounded-full ${connected ? 'animate-pulse bg-emerald-400' : 'bg-[#666]'}`}
-              title={connected ? '实时流已连接（~1.5s）' : '实时流未连接，回退 10s 轮询'}
+              title={connected ? t('opspage.pool.streamConnected') : t('opspage.pool.streamDisconnected')}
             />
-            · 真实熔断态 + 健康分(零上游{connected ? '，实时' : '，10s 轮询'})
+            {connected ? t('opspage.pool.subtitleRealtime') : t('opspage.pool.subtitlePolling')}
           </span>
         </CardTitle>
       </CardHeader>
@@ -546,7 +555,7 @@ function PoolHealthCard({ live }: { live: ReturnType<typeof useLiveStream> }) {
             ))}
           </div>
         ) : sorted.length === 0 ? (
-          <EmptyState icon={ShieldAlert} title="暂无凭据" description="号池为空,先在凭据页添加账号" />
+          <EmptyState icon={ShieldAlert} title={t('opspage.pool.emptyTitle')} description={t('opspage.pool.emptyDesc')} />
         ) : (
           <div className="space-y-1.5">
             {sorted.map((it) => (
@@ -558,18 +567,18 @@ function PoolHealthCard({ live }: { live: ReturnType<typeof useLiveStream> }) {
                 verifying={deepVerify.isPending && deepVerify.variables === it.id}
                 probing={probeModels.isPending && probeModels.variables?.id === it.id}
                 onRefresh={() => forceRefresh.mutate(it.id, {
-                  onSuccess: () => toast.success(`#${it.id} 已触发刷新`),
-                  onError: () => toast.error(`#${it.id} 刷新失败`),
+                  onSuccess: () => toast.success(t('opspage.toast.refreshTriggered', { id: it.id })),
+                  onError: () => toast.error(t('opspage.toast.refreshFail', { id: it.id })),
                 })}
                 onReset={() => resetFailure.mutate(it.id, {
-                  onSuccess: () => toast.success(`#${it.id} 已重置并启用`),
-                  onError: () => toast.error(`#${it.id} 重置失败`),
+                  onSuccess: () => toast.success(t('opspage.toast.resetEnabled', { id: it.id })),
+                  onError: () => toast.error(t('opspage.toast.resetFail', { id: it.id })),
                 })}
                 onToggleDisabled={() => setDisabled.mutate(
                   { id: it.id, disabled: !it.disabled },
                   {
-                    onSuccess: () => toast.success(`#${it.id} 已${it.disabled ? '启用' : '禁用'}`),
-                    onError: () => toast.error('操作失败'),
+                    onSuccess: () => toast.success(it.disabled ? t('opspage.toast.toggledEnabled', { id: it.id }) : t('opspage.toast.toggledDisabled', { id: it.id })),
+                    onError: () => toast.error(t('opspage.toast.opFail')),
                   },
                 )}
                 onVerify={() => runVerify(it.id)}
@@ -585,9 +594,9 @@ function PoolHealthCard({ live }: { live: ReturnType<typeof useLiveStream> }) {
       <ConfirmDialog
         open={probeConfirmId !== null}
         onOpenChange={(v) => !v && setProbeConfirmId(null)}
-        title={`探测 #${probeConfirmId ?? ''} 可用模型？`}
-        description="将逐个候选模型发真实生成请求探测可用性——会消耗该号真实积分(通常几分钱到几毛),耗时可达数十秒。确定继续？"
-        confirmLabel="确认探测"
+        title={t('opspage.probeConfirm.title', { id: probeConfirmId ?? '' })}
+        description={t('opspage.probeConfirm.desc')}
+        confirmLabel={t('opspage.probeConfirm.confirm')}
         loading={probeModels.isPending}
         onConfirm={() => {
           if (probeConfirmId !== null) {
@@ -633,6 +642,7 @@ function CredOpsDialog({
   open: boolean
   onOpenChange: (v: boolean) => void
 }) {
+  const { t } = useTranslation()
   const id = cred.id
   const isCustom = !!cred.baseUrl
 
@@ -677,24 +687,24 @@ function CredOpsDialog({
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <MoreHorizontal className="h-4 w-4" />
-            运维操作 · {label}
+            {t('opspage.credops.title', { label })}
           </DialogTitle>
           <DialogDescription>
-            单号级配置,均即时生效、无需重启{isCustom ? '(自定义 API 号:region/超额/探模型不适用)' : ''}。
+            {isCustom ? t('opspage.credops.descCustom') : t('opspage.credops.desc')}
           </DialogDescription>
         </DialogHeader>
 
         {/* 切 region(仅非 custom_api):复用凭据管理页同款 RegionSwitcher(探测/自定义 region/卡片列表)。 */}
         {!isCustom && (
-          <OpsSection title="切换 Region / Profile" hint="切上游 profile,非改全局 region">
+          <OpsSection title={t('opspage.credops.regionTitle')} hint={t('opspage.credops.regionHint')}>
             <RegionSwitcher credentialId={id} />
           </OpsSection>
         )}
 
         {/* 优先级 */}
-        <OpsSection title="优先级" hint="数字越小越优先">
+        <OpsSection title={t('opspage.credops.priorityTitle')} hint={t('opspage.credops.priorityHint')}>
           <div className="flex items-center gap-2">
-            <NumberStepper value={priority} onChange={setPriorityVal} min={0} max={999} aria-label="优先级" className="w-24" />
+            <NumberStepper value={priority} onChange={setPriorityVal} min={0} max={999} aria-label={t('opspage.credops.priorityTitle')} className="w-24" />
             <Button
               size="sm"
               variant="outline"
@@ -702,19 +712,19 @@ function CredOpsDialog({
               onClick={() =>
                 setPriority.mutate(
                   { id, priority },
-                  { onSuccess: () => toast.success('优先级已更新'), onError: () => toast.error('更新失败') },
+                  { onSuccess: () => toast.success(t('opspage.toast.priorityUpdated')), onError: () => toast.error(t('opspage.toast.updateFail')) },
                 )
               }
             >
-              保存
+              {t('opspage.common.save')}
             </Button>
           </div>
         </OpsSection>
 
         {/* RPM 上限 */}
-        <OpsSection title="RPM 上限" hint="0 = 继承全局">
+        <OpsSection title={t('opspage.credops.rpmTitle')} hint={t('opspage.credops.rpmHint')}>
           <div className="flex items-center gap-2">
-            <NumberStepper value={rpmLimit} onChange={setRpmLimitVal} min={0} max={100000} step={10} aria-label="RPM 上限" className="w-28" />
+            <NumberStepper value={rpmLimit} onChange={setRpmLimitVal} min={0} max={100000} step={10} aria-label={t('opspage.credops.rpmTitle')} className="w-28" />
             <Button
               size="sm"
               variant="outline"
@@ -722,18 +732,18 @@ function CredOpsDialog({
               onClick={() =>
                 setRpmLimit.mutate(
                   { id, rpmLimit },
-                  { onSuccess: () => toast.success('RPM 上限已更新'), onError: () => toast.error('更新失败') },
+                  { onSuccess: () => toast.success(t('opspage.toast.rpmUpdated')), onError: () => toast.error(t('opspage.toast.updateFail')) },
                 )
               }
             >
-              保存
+              {t('opspage.common.save')}
             </Button>
           </div>
         </OpsSection>
 
         {/* 允许模型白名单(仅非 custom_api) */}
         {!isCustom && (
-          <OpsSection title="允许模型白名单" hint="空 = 不限制;设了即硬门">
+          <OpsSection title={t('opspage.credops.allowedTitle')} hint={t('opspage.credops.allowedHint')}>
             <div className="grid grid-cols-2 gap-x-3 gap-y-1.5">
               {PROBE_MODEL_CATALOG.map((m) => {
                 const isSel = allowed.includes(m.id)
@@ -769,22 +779,22 @@ function CredOpsDialog({
               onClick={() =>
                 setAllowed.mutate(
                   { id, allowedModels: allowed.length ? allowed : null },
-                  { onSuccess: () => toast.success('允许模型已更新'), onError: () => toast.error('更新失败') },
+                  { onSuccess: () => toast.success(t('opspage.toast.allowedUpdated')), onError: () => toast.error(t('opspage.toast.updateFail')) },
                 )
               }
             >
-              保存白名单{allowed.length > 0 ? `(${allowed.length})` : '(不限制)'}
+              {allowed.length > 0 ? t('opspage.credops.saveWhitelist', { n: allowed.length }) : t('opspage.credops.saveWhitelistUnlimited')}
             </Button>
           </OpsSection>
         )}
 
         {/* 代理 */}
-        <OpsSection title="代理" hint='空=回退全局,"direct"=强制直连'>
+        <OpsSection title={t('opspage.credops.proxyTitle')} hint={t('opspage.credops.proxyHint')}>
           <div className="flex items-center gap-2">
             <Input
               value={proxyUrl}
               onChange={(e) => setProxyUrl(e.target.value)}
-              placeholder="socks5://host:port 或 direct"
+              placeholder={t('opspage.credops.proxyPlaceholder')}
               className="h-8 flex-1 text-xs"
             />
             <ProxyTestButton proxyUrl={proxyUrl} className="h-8" />
@@ -795,22 +805,22 @@ function CredOpsDialog({
               onClick={() =>
                 setProxy.mutate(
                   { id, proxyUrl: proxyUrl.trim() === '' ? null : proxyUrl.trim() },
-                  { onSuccess: () => toast.success('代理已更新'), onError: () => toast.error('更新失败') },
+                  { onSuccess: () => toast.success(t('opspage.toast.proxyUpdated')), onError: () => toast.error(t('opspage.toast.updateFail')) },
                 )
               }
             >
-              保存
+              {t('opspage.common.save')}
             </Button>
           </div>
         </OpsSection>
 
         {/* 别名 */}
-        <OpsSection title="别名 / 备注" hint="展示优先于 email/#id">
+        <OpsSection title={t('opspage.credops.nameTitle')} hint={t('opspage.credops.nameHint')}>
           <div className="flex items-center gap-2">
             <Input
               value={name}
               onChange={(e) => setNameVal(e.target.value)}
-              placeholder="留空清除"
+              placeholder={t('opspage.credops.namePlaceholder')}
               className="h-8 flex-1 text-xs"
             />
             <Button
@@ -820,18 +830,18 @@ function CredOpsDialog({
               onClick={() =>
                 setName.mutate(
                   { id, name: name.trim() === '' ? null : name.trim() },
-                  { onSuccess: () => toast.success('别名已更新'), onError: () => toast.error('更新失败') },
+                  { onSuccess: () => toast.success(t('opspage.toast.nameUpdated')), onError: () => toast.error(t('opspage.toast.updateFail')) },
                 )
               }
             >
-              保存
+              {t('opspage.common.save')}
             </Button>
           </div>
         </OpsSection>
 
         {/* 超额(仅非 custom_api):开启破坏性(真花钱)走确认;关闭非破坏直接执行 */}
         {!isCustom && (
-          <OpsSection title="超额 Overage" hint="超 base 额度后按真实用量计费">
+          <OpsSection title={t('opspage.credops.overageTitle')} hint={t('opspage.credops.overageHint')}>
             <div className="flex items-center gap-2">
               <Button
                 size="sm"
@@ -839,7 +849,7 @@ function CredOpsDialog({
                 disabled={enableOv.isPending}
                 onClick={() => setConfirm('overage')}
               >
-                开启超额
+                {t('opspage.credops.enableOverage')}
               </Button>
               <Button
                 size="sm"
@@ -847,20 +857,20 @@ function CredOpsDialog({
                 disabled={disableOv.isPending}
                 onClick={() =>
                   disableOv.mutate(id, {
-                    onSuccess: () => toast.success('已关闭超额'),
-                    onError: () => toast.error('操作失败'),
+                    onSuccess: () => toast.success(t('opspage.toast.overageDisabled')),
+                    onError: () => toast.error(t('opspage.toast.opFail')),
                   })
                 }
               >
-                关闭超额
+                {t('opspage.credops.disableOverage')}
               </Button>
-              {cred.overageEnabled && <Badge variant="warning">当前已开启</Badge>}
+              {cred.overageEnabled && <Badge variant="warning">{t('opspage.credops.overageOn')}</Badge>}
             </div>
           </OpsSection>
         )}
 
         {/* 危险区:禁用 / 删除 */}
-        <OpsSection title="危险操作">
+        <OpsSection title={t('opspage.credops.dangerTitle')}>
           <div className="flex items-center gap-2">
             <Button
               size="sm"
@@ -871,24 +881,24 @@ function CredOpsDialog({
                 if (cred.disabled) {
                   setDisabled.mutate(
                     { id, disabled: false },
-                    { onSuccess: () => toast.success('已启用'), onError: () => toast.error('操作失败') },
+                    { onSuccess: () => toast.success(t('opspage.toast.enabled')), onError: () => toast.error(t('opspage.toast.opFail')) },
                   )
                 } else {
                   setConfirm('disable')
                 }
               }}
             >
-              {cred.disabled ? '启用凭据' : '禁用凭据'}
+              {cred.disabled ? t('opspage.credops.enableCred') : t('opspage.credops.disableCred')}
             </Button>
             <Button size="sm" variant="destructive" disabled={deleteCred.isPending} onClick={() => setConfirm('delete')}>
               <Trash className="mr-1 h-3.5 w-3.5" />
-              删除凭据
+              {t('opspage.credops.deleteCred')}
             </Button>
           </div>
         </OpsSection>
 
         <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>关闭</Button>
+          <Button variant="outline" onClick={() => onOpenChange(false)}>{t('opspage.common.close')}</Button>
         </DialogFooter>
       </DialogContent>
 
@@ -896,27 +906,27 @@ function CredOpsDialog({
       <ConfirmDialog
         open={confirm === 'overage'}
         onOpenChange={(v) => !v && setConfirm(null)}
-        title={`开启 #${id} 超额？`}
-        description="开启后该号超出 base 额度仍会继续服务,超出部分按真实用量向上游付费——这会产生真实费用。确定开启？"
-        confirmLabel="确认开启(会产生费用)"
+        title={t('opspage.confirm.overageTitle', { id })}
+        description={t('opspage.confirm.overageDesc')}
+        confirmLabel={t('opspage.confirm.overageConfirm')}
         destructive
         loading={enableOv.isPending}
         onConfirm={() =>
           enableOv.mutate(id, {
             onSuccess: (s) => {
-              toast.success(s.confirmed === false ? (s.note || '已提交,状态待确认') : '已开启超额')
+              toast.success(s.confirmed === false ? (s.note || t('opspage.toast.overagePending')) : t('opspage.toast.overageEnabled'))
               setConfirm(null)
             },
-            onError: () => toast.error('开启失败'),
+            onError: () => toast.error(t('opspage.toast.overageEnableFail')),
           })
         }
       />
       <ConfirmDialog
         open={confirm === 'disable'}
         onOpenChange={(v) => !v && setConfirm(null)}
-        title={`禁用 #${id}？`}
-        description="禁用后该号将从调度池中移除,不再被选中处理请求(可随时重新启用)。确定禁用？"
-        confirmLabel="确认禁用"
+        title={t('opspage.confirm.disableTitle', { id })}
+        description={t('opspage.confirm.disableDesc')}
+        confirmLabel={t('opspage.confirm.disableConfirm')}
         destructive
         loading={setDisabled.isPending}
         onConfirm={() =>
@@ -924,10 +934,10 @@ function CredOpsDialog({
             { id, disabled: true },
             {
               onSuccess: () => {
-                toast.success('已禁用')
+                toast.success(t('opspage.toast.disabled'))
                 setConfirm(null)
               },
-              onError: () => toast.error('操作失败'),
+              onError: () => toast.error(t('opspage.toast.opFail')),
             },
           )
         }
@@ -935,19 +945,19 @@ function CredOpsDialog({
       <ConfirmDialog
         open={confirm === 'delete'}
         onOpenChange={(v) => !v && setConfirm(null)}
-        title={`删除 #${id}？`}
-        description="将把该凭据移入回收站(可在回收站恢复,永久清除后不可恢复)。确定删除？"
-        confirmLabel="确认删除"
+        title={t('opspage.confirm.deleteTitle', { id })}
+        description={t('opspage.confirm.deleteDesc')}
+        confirmLabel={t('opspage.confirm.deleteConfirm')}
         destructive
         loading={deleteCred.isPending}
         onConfirm={() =>
           deleteCred.mutate(id, {
             onSuccess: () => {
-              toast.success('已删除(移入回收站)')
+              toast.success(t('opspage.toast.deleted'))
               setConfirm(null)
               onOpenChange(false)
             },
-            onError: () => toast.error('删除失败'),
+            onError: () => toast.error(t('opspage.toast.deleteFail')),
           })
         }
       />
@@ -961,6 +971,7 @@ const CLEANABLE_KEYS: StorageCleanupTarget[] = ['traces', 'usage_jsonl', 'trash'
 // 聚合运维卡:重启服务 / OTA 升级回滚观测 / 存储占用清理。
 // 与 settings 页调用同一批 hooks(同 queryKey,两处并存无冲突);此处复用 hooks 不复用组件。
 function OpsAggregationCard({ onFocusLog }: { onFocusLog?: (term: string) => void } = {}) {
+  const { t } = useTranslation()
   const restart = useRestartService()
   const checkUpd = useCheckUpdate()
   const performUpd = usePerformUpdate()
@@ -981,11 +992,11 @@ function OpsAggregationCard({ onFocusLog }: { onFocusLog?: (term: string) => voi
     onFocusLog?.('[Update]')
     checkUpd.mutate(undefined, {
       onSuccess: (r) => {
-        if (r.error) toast.error(`检查更新失败:${r.error}`)
-        else if (r.has_update) toast.success(`发现新版本 ${r.latest_version}(当前 ${r.local_version})`)
-        else toast.success(`已是最新版本 ${r.local_version}`)
+        if (r.error) toast.error(t('opspage.toast.checkUpdFail', { error: r.error }))
+        else if (r.has_update) toast.success(t('opspage.toast.updFound', { latest: r.latest_version, local: r.local_version }))
+        else toast.success(t('opspage.toast.updLatest', { local: r.local_version }))
       },
-      onError: (e) => toast.error(`检查更新失败:${(e as Error).message}`),
+      onError: (e) => toast.error(t('opspage.toast.checkUpdFail', { error: (e as Error).message })),
     })
   }
 
@@ -997,7 +1008,7 @@ function OpsAggregationCard({ onFocusLog }: { onFocusLog?: (term: string) => voi
       <CardHeader className="pb-2">
         <CardTitle className="flex items-center gap-2 text-base">
           <Server className="h-4 w-4" />
-          聚合运维
+          {t('opspage.agg.title')}
         </CardTitle>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -1006,22 +1017,22 @@ function OpsAggregationCard({ onFocusLog }: { onFocusLog?: (term: string) => voi
           <div className="flex flex-wrap items-center gap-2">
             <Button variant="destructive" size="sm" disabled={restart.isPending} onClick={() => setConfirm('restart')}>
               <RotateCcw className="mr-1.5 h-4 w-4" />
-              一键重启服务
+              {t('opspage.agg.restart')}
             </Button>
             <Button variant="outline" size="sm" onClick={handleCheck} disabled={checkUpd.isPending || performUpd.isPending}>
               {checkUpd.isPending ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-1.5 h-4 w-4" />}
-              检查更新
+              {t('opspage.agg.checkUpdate')}
             </Button>
             {updInfo && !updInfo.error && (
               <span className="text-xs text-muted-foreground">
-                当前 <span className="font-mono">{updInfo.local_version}</span>
-                {updInfo.latest_version && <> · 最新 <span className="font-mono">{updInfo.latest_version}</span></>}
+                {t('opspage.agg.currentVersion', { local: updInfo.local_version })}
+                {updInfo.latest_version && <> {t('opspage.agg.latestVersion', { latest: updInfo.latest_version })}</>}
               </span>
             )}
             {updInfo?.has_update && (
               <Button size="sm" disabled={performUpd.isPending} onClick={() => setConfirm('upgrade')}>
                 {performUpd.isPending ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <RotateCcw className="mr-1.5 h-4 w-4" />}
-                升级到 {updInfo.latest_version}
+                {t('opspage.agg.upgradeTo', { latest: updInfo.latest_version })}
               </Button>
             )}
           </div>
@@ -1030,17 +1041,17 @@ function OpsAggregationCard({ onFocusLog }: { onFocusLog?: (term: string) => voi
             <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
               {updStatus.healthConfirmed ? (
                 <span className="flex items-center gap-1 text-emerald-400" title={updStatus.healthDetail ?? undefined}>
-                  <CheckCircle2 className="h-3.5 w-3.5" /> 本版已稳定确认
+                  <CheckCircle2 className="h-3.5 w-3.5" /> {t('opspage.agg.stableConfirmed')}
                 </span>
               ) : (
                 <span className="flex items-center gap-1 text-amber-400">
-                  <Clock className="h-3.5 w-3.5" /> 本版尚未确认稳定(运行一段时间后自动确认)
+                  <Clock className="h-3.5 w-3.5" /> {t('opspage.agg.stablePending')}
                 </span>
               )}
-              {updStatus.rollbackPointPresent && <span className="text-muted-foreground">回滚点仍在(可回退)</span>}
+              {updStatus.rollbackPointPresent && <span className="text-muted-foreground">{t('opspage.agg.rollbackPoint')}</span>}
               {updStatus.rolledBackBinaryPresent && (
-                <span className="flex items-center gap-1 text-red-400" title="守卫脚本曾执行过回滚">
-                  <AlertTriangle className="h-3.5 w-3.5" /> 检测到曾发生回滚
+                <span className="flex items-center gap-1 text-red-400" title={t('opspage.agg.guardRolledBack')}>
+                  <AlertTriangle className="h-3.5 w-3.5" /> {t('opspage.agg.rollbackDetected')}
                 </span>
               )}
             </div>
@@ -1052,8 +1063,8 @@ function OpsAggregationCard({ onFocusLog }: { onFocusLog?: (term: string) => voi
           <div className="mb-2 flex items-center justify-between">
             <div className="flex items-center gap-2 text-sm font-medium">
               <Database className="h-4 w-4 text-muted-foreground" />
-              存储占用
-              {storage && <span className="text-xs font-normal text-muted-foreground">落盘合计 {formatBytes(storage.totalDiskBytes)}</span>}
+              {t('opspage.storage.title')}
+              {storage && <span className="text-xs font-normal text-muted-foreground">{t('opspage.storage.diskTotal', { bytes: formatBytes(storage.totalDiskBytes) })}</span>}
             </div>
             <Button variant="ghost" size="sm" className="h-7 px-2" onClick={() => refetchStorage()} disabled={storageLoading}>
               <RefreshCw className="h-3.5 w-3.5" />
@@ -1075,10 +1086,10 @@ function OpsAggregationCard({ onFocusLog }: { onFocusLog?: (term: string) => voi
                   <div key={p.key} className="flex items-center justify-between gap-3 rounded-md border border-[#2e2e2e] bg-[#111] px-3 py-1.5">
                     <div className="flex min-w-0 items-center gap-2">
                       <span className="truncate text-xs">{p.label}</span>
-                      {p.inMemory && <Badge variant="outline" className="text-[10px]">内存</Badge>}
+                      {p.inMemory && <Badge variant="outline" className="text-[10px]">{t('opspage.storage.inMemory')}</Badge>}
                     </div>
                     <div className="flex shrink-0 items-center gap-3">
-                      <span className="text-xs tabular-nums text-muted-foreground">{formatBytes(p.bytes)} · {p.items} 项</span>
+                      <span className="text-xs tabular-nums text-muted-foreground">{t('opspage.storage.itemStat', { bytes: formatBytes(p.bytes), items: p.items })}</span>
                       {viewable && (
                         <Button
                           variant="outline"
@@ -1087,13 +1098,13 @@ function OpsAggregationCard({ onFocusLog }: { onFocusLog?: (term: string) => voi
                           onClick={() => setDetail(p.key as 'traces' | 'usage_jsonl' | 'trash' | 'bg_cache')}
                         >
                           <Eye className="mr-1 h-3 w-3" />
-                          查看
+                          {t('opspage.storage.view')}
                         </Button>
                       )}
                       {cleanable && (
                         <Button variant="outline" size="sm" className="h-7 px-2 text-xs" onClick={() => setConfirm({ kind: 'cleanup', p })}>
                           <Trash className="mr-1 h-3 w-3" />
-                          清理
+                          {t('opspage.storage.cleanup')}
                         </Button>
                       )}
                     </div>
@@ -1102,7 +1113,7 @@ function OpsAggregationCard({ onFocusLog }: { onFocusLog?: (term: string) => voi
               })}
             </div>
           ) : (
-            <EmptyState icon={Database} title="暂无可统计的分区" />
+            <EmptyState icon={Database} title={t('opspage.storage.emptyPartitions')} />
           )}
         </div>
       </CardContent>
@@ -1116,19 +1127,19 @@ function OpsAggregationCard({ onFocusLog }: { onFocusLog?: (term: string) => voi
       <ConfirmDialog
         open={confirm === 'restart'}
         onOpenChange={(v) => !v && setConfirm(null)}
-        title="确认重启服务？"
-        description="重启会导致网关短暂断服数秒,期间所有请求失败(含正在进行的对话)。约 3 秒后自动恢复。确定继续？"
-        confirmLabel="确认重启"
+        title={t('opspage.confirm.restartTitle')}
+        description={t('opspage.confirm.restartDesc')}
+        confirmLabel={t('opspage.confirm.restartConfirm')}
         destructive
         loading={restart.isPending}
         onConfirm={() =>
           restart.mutate(undefined, {
             onSuccess: (r) => {
-              toast.success(r.message || '重启中,约 3 秒后自动恢复')
+              toast.success(r.message || t('opspage.toast.restarting'))
               setConfirm(null)
             },
             onError: () => {
-              toast.warning('重启中,约 3 秒后自动恢复(本次连接已中断,属正常)')
+              toast.warning(t('opspage.toast.restartingWarn'))
               setConfirm(null)
             },
           })
@@ -1137,20 +1148,20 @@ function OpsAggregationCard({ onFocusLog }: { onFocusLog?: (term: string) => voi
       <ConfirmDialog
         open={confirm === 'upgrade'}
         onOpenChange={(v) => !v && setConfirm(null)}
-        title={`确认升级到 ${updInfo?.latest_version ?? '最新版本'}？`}
-        description="将从 GitHub 下载新二进制、校验 sha256 后替换并自动重启。重启期间短暂断服数秒。确定继续？"
-        confirmLabel="确认升级"
+        title={t('opspage.confirm.upgradeTitle', { latest: updInfo?.latest_version ?? t('opspage.confirm.upgradeTitleFallback') })}
+        description={t('opspage.confirm.upgradeDesc')}
+        confirmLabel={t('opspage.confirm.upgradeConfirm')}
         loading={performUpd.isPending}
         onConfirm={() => {
           // 聚焦实时日志到升级流程:perform_update 每步发 [Update] 日志(下载/校验/写入/替换)在此流动显示。
           onFocusLog?.('[Update]')
           performUpd.mutate(undefined, {
             onSuccess: (r) => {
-              toast.success(r.message || '升级中,数秒后自动重启恢复')
+              toast.success(r.message || t('opspage.toast.upgrading'))
               setConfirm(null)
             },
             onError: () => {
-              toast.warning('升级已发起,若成功将自动重启(本次连接可能中断,属正常)')
+              toast.warning(t('opspage.toast.upgradingWarn'))
               setConfirm(null)
             },
           })
@@ -1159,14 +1170,14 @@ function OpsAggregationCard({ onFocusLog }: { onFocusLog?: (term: string) => voi
       <ConfirmDialog
         open={!!cleanupTarget}
         onOpenChange={(v) => !v && setConfirm(null)}
-        title={`清理「${cleanupTarget?.label ?? ''}」？`}
+        title={t('opspage.confirm.cleanupTitle', { label: cleanupTarget?.label ?? '' })}
         description={
           <span>
-            此操作<strong className="text-red-400">不可逆</strong>,将永久删除对应数据。
-            {cleanupSupportsDays ? '按各分区配置的默认保留期清理早于该期的数据。' : '该分区为整体清理,将清空全部内容。'}
+            {t('opspage.confirm.cleanupIrreversible')}
+            {cleanupSupportsDays ? t('opspage.confirm.cleanupByRetention') : t('opspage.confirm.cleanupWhole')}
           </span>
         }
-        confirmLabel="确认清理"
+        confirmLabel={t('opspage.confirm.cleanupConfirm')}
         destructive
         loading={cleanup.isPending}
         onConfirm={() => {
@@ -1178,7 +1189,7 @@ function OpsAggregationCard({ onFocusLog }: { onFocusLog?: (term: string) => voi
                 toast.success(resp.message)
                 setConfirm(null)
               },
-              onError: () => toast.error('清理失败'),
+              onError: () => toast.error(t('opspage.toast.cleanupFail')),
             },
           )
         }}
@@ -1200,6 +1211,7 @@ function rankOk(entryLevel: string, minLevel: string): boolean {
 }
 
 function LogViewer({ focusToken = 0, focusTerm = '' }: { focusToken?: number; focusTerm?: string } = {}) {
+  const { t } = useTranslation()
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [level, setLevel] = useState<LevelFilter>('INFO')
   const [live, setLive] = useState(true)
@@ -1343,7 +1355,7 @@ function LogViewer({ focusToken = 0, focusTerm = '' }: { focusToken?: number; fo
         // 同上:快照重载后复位贴底标志,避免过期 false 卡住后续自动跟随。
         atBottomRef.current = true
       })
-      .catch(() => toast.error('拉取日志失败'))
+      .catch(() => toast.error(t('opspage.toast.fetchLogsFail')))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [live, level])
 
@@ -1387,9 +1399,9 @@ function LogViewer({ focusToken = 0, focusTerm = '' }: { focusToken?: number; fo
       a.download = `kirostudio-logs-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '')}.jsonl`
       a.click()
       URL.revokeObjectURL(url)
-      toast.success('日志已导出')
+      toast.success(t('opspage.toast.logsExported'))
     } catch {
-      toast.error('导出失败')
+      toast.error(t('opspage.log.exportFail'))
     } finally {
       setDownloading(false)
     }
@@ -1400,10 +1412,10 @@ function LogViewer({ focusToken = 0, focusTerm = '' }: { focusToken?: number; fo
       <CardHeader className="flex flex-col gap-2 pb-2">
        <div className="flex flex-row items-center justify-between gap-2">
         <CardTitle className="text-base">
-          实时日志
+          {t('opspage.log.title')}
           <span className="ml-2 text-xs font-normal text-muted-foreground tabular-nums">
             {visibleLogs.length}
-            {visibleLogs.length !== logs.length ? ` / ${logs.length}` : ''} 条
+            {visibleLogs.length !== logs.length ? ` / ${logs.length}` : ''} {t('opspage.log.countUnit')}
           </span>
         </CardTitle>
         <div className="flex items-center gap-2">
@@ -1425,18 +1437,18 @@ function LogViewer({ focusToken = 0, focusTerm = '' }: { focusToken?: number; fo
             size="sm"
             onClick={() => setLive((v) => !v)}
             className="h-7 gap-1 px-2 text-xs"
-            title={live && !connected ? '连接已断开，正在重连…' : undefined}
+            title={live && !connected ? t('opspage.log.reconnectingTip') : undefined}
           >
             <span
               className={`inline-block h-1.5 w-1.5 rounded-full ${
                 !live ? 'bg-[#666]' : connected ? 'animate-pulse bg-white' : 'animate-pulse bg-amber-400'
               }`}
             />
-            {!live ? '暂停' : connected ? '实时' : '重连中'}
+            {!live ? t('opspage.log.paused') : connected ? t('opspage.live.realtime') : t('opspage.live.reconnecting')}
           </Button>
           <Button variant="outline" size="sm" onClick={handleExport} disabled={downloading} className="h-7 gap-1 px-2 text-xs">
             <Download className="h-3.5 w-3.5" />
-            导出
+            {t('opspage.common.export')}
           </Button>
           {/* 收缩/展开切换:只折叠卡体(搜索行 + 日志区),卡头恒显 */}
           <Button
@@ -1445,7 +1457,7 @@ function LogViewer({ focusToken = 0, focusTerm = '' }: { focusToken?: number; fo
             onClick={toggleCollapsed}
             className="h-7 w-7 px-0"
             aria-expanded={!collapsed}
-            title={collapsed ? '展开日志' : '收起日志'}
+            title={collapsed ? t('opspage.log.expand') : t('opspage.log.collapse')}
           >
             {collapsed ? <ChevronDown className="h-4 w-4" /> : <ChevronUp className="h-4 w-4" />}
           </Button>
@@ -1463,14 +1475,14 @@ function LogViewer({ focusToken = 0, focusTerm = '' }: { focusToken?: number; fo
            <Input
              value={search}
              onChange={(e) => setSearch(e.target.value)}
-             placeholder="搜索消息或模块…"
+             placeholder={t('opspage.log.searchPlaceholder')}
              className="h-7 pl-7 pr-7 text-xs"
            />
            {search && (
              <button
                onClick={() => setSearch('')}
                className="absolute right-1.5 top-1/2 z-10 -translate-y-1/2 text-[#666] hover:text-[#ededed]"
-               title="清除搜索"
+               title={t('opspage.log.clearSearch')}
              >
                <X className="h-3.5 w-3.5" />
              </button>
@@ -1479,10 +1491,10 @@ function LogViewer({ focusToken = 0, focusTerm = '' }: { focusToken?: number; fo
          <Select
            value={moduleFilter}
            onChange={setModuleFilter}
-           aria-label="按模块过滤"
+           aria-label={t('opspage.log.filterByModule')}
            className="w-[180px] shrink-0"
            options={[
-             { value: '', label: '全部模块' },
+             { value: '', label: t('opspage.log.allModules') },
              ...modules.map((m) => ({ value: m, label: m })),
            ]}
          />
@@ -1496,8 +1508,8 @@ function LogViewer({ focusToken = 0, focusTerm = '' }: { focusToken?: number; fo
           {visibleLogs.length === 0 ? (
             <EmptyState
               icon={logs.length === 0 ? Inbox : SearchX}
-              title={logs.length === 0 ? '暂无日志' : '无匹配日志'}
-              description={logs.length === 0 ? undefined : '调整搜索或模块过滤'}
+              title={logs.length === 0 ? t('opspage.log.emptyTitle') : t('opspage.log.noMatchTitle')}
+              description={logs.length === 0 ? undefined : t('opspage.log.noMatchDesc')}
             />
           ) : (
             visibleLogs.map((e) => (
@@ -1531,13 +1543,14 @@ function LogRow({
   onToggle: () => void
   highlight: string
 }) {
+  const { t } = useTranslation()
   const handleCopy = (ev: React.MouseEvent) => {
     ev.stopPropagation()
     // 复制整条（时间 + 级别 + 模块 + 消息），方便贴 issue。
     const line = `${entry.ts} ${entry.level} ${entry.target} ${entry.message}`
     navigator.clipboard.writeText(line).then(
-      () => toast.success('已复制该条日志'),
-      () => toast.error('复制失败'),
+      () => toast.success(t('opspage.log.copied')),
+      () => toast.error(t('opspage.log.copyFail')),
     )
   }
   return (
@@ -1559,7 +1572,7 @@ function LogRow({
         <button
           onClick={handleCopy}
           className="shrink-0 self-start text-[#666] hover:text-[#ededed]"
-          title="复制整条"
+          title={t('opspage.log.copyWhole')}
         >
           <Copy className="h-3.5 w-3.5" />
         </button>

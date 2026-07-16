@@ -1,4 +1,6 @@
 import { useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import i18n from '@/i18n'
 import {
   Dialog,
   DialogContent,
@@ -13,10 +15,10 @@ import type { CredentialStatusItem } from '@/types/api'
 import { toast } from 'sonner'
 
 /** 模型勾选模板：一键切换常测组合。 */
-const MODEL_TEMPLATES: { label: string; models: string[] }[] = [
-  { label: '仅国产', models: ['qwen3-coder-next', 'minimax-m2.1', 'deepseek-3.2', 'minimax-m2.5', 'glm-5'] },
-  { label: '仅 Claude', models: ['claude-haiku-4.5', 'claude-sonnet-4.5', 'claude-sonnet-4.6', 'claude-opus-4.6', 'claude-opus-4.8'] },
-  { label: '全部', models: PROBE_MODEL_CATALOG.map((m) => m.id) },
+const MODEL_TEMPLATES: { label: string; labelKey: string; models: string[] }[] = [
+  { label: '仅国产', labelKey: 'modeltestdialog.template.domesticOnly', models: ['qwen3-coder-next', 'minimax-m2.1', 'deepseek-3.2', 'minimax-m2.5', 'glm-5'] },
+  { label: '仅 Claude', labelKey: 'modeltestdialog.template.claudeOnly', models: ['claude-haiku-4.5', 'claude-sonnet-4.5', 'claude-sonnet-4.6', 'claude-opus-4.6', 'claude-opus-4.8'] },
+  { label: '全部', labelKey: 'modeltestdialog.template.all', models: PROBE_MODEL_CATALOG.map((m) => m.id) },
 ]
 
 export interface ModelTestResult {
@@ -50,10 +52,10 @@ function modelChip(m: ProbedModel) {
         : 'bg-amber-500/10 text-amber-300 border border-amber-500/30'
   const tip =
     m.status === 'supported'
-      ? `可用 · 本次 ${m.credits.toFixed(4)} credits`
+      ? i18n.t('modeltestdialog.chip.availableCredits', { credits: m.credits.toFixed(4) })
       : m.status === 'unsupported'
-        ? '不支持（订阅不含 / INVALID_MODEL_ID）'
-        : '探测时上游异常，无法判定（可重试）'
+        ? i18n.t('modeltestdialog.chip.unsupported')
+        : i18n.t('modeltestdialog.chip.unknown')
   return (
     <span
       key={m.model}
@@ -67,6 +69,7 @@ function modelChip(m: ProbedModel) {
 }
 
 export function ModelTestDialog({ open, onOpenChange, credentialIds, credentials, onProbe, onSetWhitelist }: ModelTestDialogProps) {
+  const { t } = useTranslation()
   const credById = new Map(credentials.map((c) => [c.id, c]))
   const [savingWhitelist, setSavingWhitelist] = useState<number | null>(null)
   const hasHistory = credentialIds.some((id) => (credById.get(id)?.testedModels?.length ?? 0) > 0)
@@ -74,15 +77,15 @@ export function ModelTestDialog({ open, onOpenChange, credentialIds, credentials
   // 一键把某号测出 supported 的模型设为其白名单（成本安全硬门）
   const applyWhitelist = async (id: number, supported: string[]) => {
     if (supported.length === 0) {
-      toast.error('该号没有测出可用模型，不能设为白名单')
+      toast.error(t('modeltestdialog.toast.noSupportedModel'))
       return
     }
     setSavingWhitelist(id)
     try {
       await onSetWhitelist(id, supported)
-      toast.success(`凭据 #${id} 白名单已设为 ${supported.length} 个可用模型（便宜请求锁定此号）`)
+      toast.success(t('modeltestdialog.toast.whitelistSaved', { id, count: supported.length }))
     } catch (e) {
-      toast.error(`设置白名单失败: ${(e as Error).message}`)
+      toast.error(t('modeltestdialog.toast.whitelistFailed', { message: (e as Error).message }))
     } finally {
       setSavingWhitelist(null)
     }
@@ -144,25 +147,25 @@ export function ModelTestDialog({ open, onOpenChange, credentialIds, credentials
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-2xl">
         <DialogHeader>
-          <DialogTitle>测试可用模型（{credentialIds.length} 个凭据）</DialogTitle>
+          <DialogTitle>{t('modeltestdialog.title', { count: credentialIds.length })}</DialogTitle>
         </DialogHeader>
 
         <div className="space-y-4 py-3">
           {/* 模型勾选：可自己选要测哪些 */}
           <div>
             <div className="mb-1.5 flex items-center justify-between">
-              <span className="text-xs text-muted-foreground">选择要测的模型（倍率=计费系数，越低越便宜）</span>
+              <span className="text-xs text-muted-foreground">{t('modeltestdialog.select.hint')}</span>
               <div className="flex gap-1">
-                {MODEL_TEMPLATES.map((t) => (
+                {MODEL_TEMPLATES.map((tpl) => (
                   <button
-                    key={t.label}
+                    key={tpl.label}
                     type="button"
                     disabled={testing}
-                    onClick={() => setSelectedModels(new Set(t.models))}
+                    onClick={() => setSelectedModels(new Set(tpl.models))}
                     className="rounded border border-white/10 bg-white/5 px-2 py-0.5 text-[11px] text-muted-foreground hover:border-white/25 disabled:opacity-50"
-                    title={`快速勾选：${t.models.join(', ')}`}
+                    title={t('modeltestdialog.select.quickPickTitle', { models: tpl.models.join(', ') })}
                   >
-                    {t.label}
+                    {t(tpl.labelKey)}
                   </button>
                 ))}
               </div>
@@ -194,12 +197,12 @@ export function ModelTestDialog({ open, onOpenChange, credentialIds, credentials
           <div className="flex items-center gap-2">
             <Button size="sm" onClick={runTest} disabled={testing || selectedModels.size === 0}>
               <FlaskConical className={`h-4 w-4 mr-1.5 ${testing ? 'animate-pulse' : ''}`} />
-              {testing ? '测试中...' : results.size > 0 ? '再测一次（用当前勾选）' : '开始测试'}
+              {testing ? t('modeltestdialog.button.testing') : results.size > 0 ? t('modeltestdialog.button.retestWithSelection') : t('modeltestdialog.button.startTest')}
             </Button>
             {testing && (
-              <Button size="sm" variant="destructive" onClick={() => { cancelRef.v = true }}>取消</Button>
+              <Button size="sm" variant="destructive" onClick={() => { cancelRef.v = true }}>{t('modeltestdialog.button.cancel')}</Button>
             )}
-            <span className="text-xs text-muted-foreground">已选 {selectedModels.size} 个模型</span>
+            <span className="text-xs text-muted-foreground">{t('modeltestdialog.select.selectedCount', { count: selectedModels.size })}</span>
           </div>
 
           {testing && (
@@ -212,21 +215,21 @@ export function ModelTestDialog({ open, onOpenChange, credentialIds, credentials
           {results.size === 0 && hasHistory && (
             <div className="max-h-[240px] overflow-y-auto border rounded-md p-2 space-y-2">
               <div className="flex items-center gap-1 text-[11px] text-muted-foreground">
-                <History className="h-3 w-3" /> 上次测试结果（点上方「开始测试」可重测刷新）
+                <History className="h-3 w-3" /> {t('modeltestdialog.history.lastResultHint')}
               </div>
               {credentialIds.map((id) => {
                 const hist = credById.get(id)?.testedModels
                 const current = credById.get(id)?.allowedModels
                 if (!hist || hist.length === 0) return (
-                  <div key={id} className="text-xs text-muted-foreground p-1">凭据 #{id}：未测过</div>
+                  <div key={id} className="text-xs text-muted-foreground p-1">{t('modeltestdialog.history.neverTested', { id })}</div>
                 )
                 return (
                   <div key={id} className="text-sm p-2 rounded bg-black/20 border border-white/5">
                     <div className="flex items-center gap-2">
-                      <span className="font-medium">凭据 #{id}</span>
+                      <span className="font-medium">{t('modeltestdialog.credential.label', { id })}</span>
                       {current && current.length > 0 && (
                         <Badge variant="secondary" className="text-[10px]" title={current.join(', ')}>
-                          白名单 {current.length} 项
+                          {t('modeltestdialog.whitelist.badge', { count: current.length })}
                         </Badge>
                       )}
                     </div>
@@ -241,8 +244,8 @@ export function ModelTestDialog({ open, onOpenChange, credentialIds, credentials
 
           {results.size > 0 && (
             <div className="flex justify-between text-sm font-medium">
-              <span>完成 {doneCount} / 失败 {failedCount}（共 {progress.total}）</span>
-              <span className="text-amber-300">本轮总花费 {grandTotal.toFixed(4)} credits</span>
+              <span>{t('modeltestdialog.summary.doneFailed', { done: doneCount, failed: failedCount, total: progress.total })}</span>
+              <span className="text-amber-300">{t('modeltestdialog.summary.roundTotalCost', { credits: grandTotal.toFixed(4) })}</span>
             </div>
           )}
 
@@ -252,9 +255,9 @@ export function ModelTestDialog({ open, onOpenChange, credentialIds, credentials
                 <div key={r.id} className="text-sm p-2 rounded bg-black/20 border border-white/5">
                   <div className="flex items-start justify-between gap-2">
                     <div className="flex items-center gap-2">
-                      <span className="font-medium">凭据 #{r.id}</span>
+                      <span className="font-medium">{t('modeltestdialog.credential.label', { id: r.id })}</span>
                       {r.status === 'done' && r.totalCredits != null && (
-                        <Badge variant="secondary" className="text-xs">花费 {r.totalCredits.toFixed(4)} credits</Badge>
+                        <Badge variant="secondary" className="text-xs">{t('modeltestdialog.result.costBadge', { credits: r.totalCredits.toFixed(4) })}</Badge>
                       )}
                     </div>
                     <span className="inline-flex items-center">
@@ -278,16 +281,16 @@ export function ModelTestDialog({ open, onOpenChange, credentialIds, credentials
                               className="h-6 px-2 text-[11px]"
                               disabled={supported.length === 0 || savingWhitelist === r.id}
                               onClick={() => applyWhitelist(r.id, supported)}
-                              title="把测出可用的模型设为该号的允许白名单（成本安全硬门：便宜请求锁定此号，绝不溢出到贵号）"
+                              title={t('modeltestdialog.whitelist.buttonTitle')}
                             >
                               {savingWhitelist === r.id
                                 ? <Loader2 className="h-3 w-3 mr-1 animate-spin" />
                                 : <ShieldCheck className="h-3 w-3 mr-1" />}
-                              设为白名单（{supported.length}）
+                              {t('modeltestdialog.whitelist.setButton', { count: supported.length })}
                             </Button>
                             {current && current.length > 0 && (
                               <span className="text-[11px] text-muted-foreground" title={current.join(', ')}>
-                                当前白名单：{current.length} 项
+                                {t('modeltestdialog.whitelist.currentLabel', { count: current.length })}
                               </span>
                             )}
                           </div>
@@ -302,7 +305,7 @@ export function ModelTestDialog({ open, onOpenChange, credentialIds, credentials
                     return (
                       <div className="mt-2">
                         <div className="mb-1 flex items-center gap-1 text-[11px] text-muted-foreground">
-                          <History className="h-3 w-3" /> 历史测试结果
+                          <History className="h-3 w-3" /> {t('modeltestdialog.history.resultLabel')}
                         </div>
                         <div className="flex flex-wrap gap-1.5">
                           {hist.map((h) => modelChip({ model: h.model, status: h.status, credits: 0 }))}
@@ -310,7 +313,7 @@ export function ModelTestDialog({ open, onOpenChange, credentialIds, credentials
                       </div>
                     )
                   })()}
-                  {r.error && <div className="text-xs mt-1 text-red-300">错误: {r.error}</div>}
+                  {r.error && <div className="text-xs mt-1 text-red-300">{t('modeltestdialog.result.error', { error: r.error })}</div>}
                 </div>
               ))}
             </div>
@@ -318,12 +321,12 @@ export function ModelTestDialog({ open, onOpenChange, credentialIds, credentials
 
           <p className="flex items-start gap-1.5 text-xs text-muted-foreground">
             <Lightbulb className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-            <span>每个勾选模型发一个<b>无提示词真实请求</b>并消耗真实积分（能用的才计费）。结果保留在此页，可改勾选后再测一次。</span>
+            <span>每个勾选模型发一个<b>{t('modeltestdialog.footer.realRequestBold')}</b>并消耗真实积分（能用的才计费）。结果保留在此页，可改勾选后再测一次。</span>
           </p>
         </div>
 
         <div className="flex justify-end">
-          <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>返回</Button>
+          <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>{t('modeltestdialog.button.back')}</Button>
         </div>
       </DialogContent>
     </Dialog>
