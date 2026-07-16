@@ -1072,6 +1072,14 @@ impl AdminService {
             rpm_hard_gate_overload_wait: config.rpm_hard_gate_overload_wait,
             cooldown_scale_pct: config.cooldown_scale_pct,
             rate_limit_jitter_pct: config.rate_limit_jitter_pct,
+            inbound_throttle_enabled: config.inbound_throttle_enabled,
+            inbound_rpm_auto: config.inbound_rpm_auto,
+            inbound_target_rpm: config.inbound_target_rpm,
+            inbound_rpm_min: config.inbound_rpm_min,
+            inbound_rpm_max: config.inbound_rpm_max,
+            inbound_burst_secs: config.inbound_burst_secs,
+            inbound_queue_max_wait_secs: config.inbound_queue_max_wait_secs,
+            inbound_current_rpm: self.token_manager.inbound_target_rpm(),
             balance_weight_enabled: config.balance_weight_enabled,
             balance_weight_floor: config.balance_weight_floor,
             health_429_weight_enabled: config.health_429_weight_enabled,
@@ -1405,6 +1413,54 @@ impl AdminService {
             let v = v.min(100);
             if v != config.rpm_headroom_factor {
                 config.rpm_headroom_factor = v;
+                hot_changed = true;
+            }
+        }
+        // ---- 入站请求整形 + RPM 自动挡(全热更)----
+        if let Some(v) = req.inbound_throttle_enabled {
+            if v != config.inbound_throttle_enabled {
+                config.inbound_throttle_enabled = v;
+                hot_changed = true;
+            }
+        }
+        if let Some(v) = req.inbound_rpm_auto {
+            if v != config.inbound_rpm_auto {
+                config.inbound_rpm_auto = v;
+                hot_changed = true;
+            }
+        }
+        if let Some(v) = req.inbound_target_rpm {
+            let v = v.clamp(1, 100_000);
+            if v != config.inbound_target_rpm {
+                config.inbound_target_rpm = v;
+                hot_changed = true;
+            }
+        }
+        if let Some(v) = req.inbound_rpm_min {
+            let v = v.clamp(1, 100_000);
+            if v != config.inbound_rpm_min {
+                config.inbound_rpm_min = v;
+                hot_changed = true;
+            }
+        }
+        if let Some(v) = req.inbound_rpm_max {
+            let v = v.clamp(1, 100_000);
+            if v != config.inbound_rpm_max {
+                config.inbound_rpm_max = v;
+                hot_changed = true;
+            }
+        }
+        if let Some(v) = req.inbound_burst_secs {
+            let v = v.clamp(1, 60);
+            if v != config.inbound_burst_secs {
+                config.inbound_burst_secs = v;
+                hot_changed = true;
+            }
+        }
+        if let Some(v) = req.inbound_queue_max_wait_secs {
+            let v = v.clamp(1, 300);
+            if v != config.inbound_queue_max_wait_secs {
+                config.inbound_queue_max_wait_secs = v;
                 hot_changed = true;
             }
         }
