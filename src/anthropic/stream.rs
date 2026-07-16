@@ -1456,6 +1456,12 @@ impl StreamContext {
                         if !safe_content.is_empty() && !safe_content.trim().is_empty() {
                             events.extend(self.create_text_delta_events(&safe_content));
                             self.thinking_buffer = self.thinking_buffer[safe_len..].to_string();
+                        } else if self.thinking_buffer.len() > MAX_THINKING_BUFFER_BYTES {
+                            // review Finding 5 修复:上游若持续吐纯空白(无 <thinking>),纯空白分支
+                            // 既不 emit 也不收缩 → thinking_buffer 无界增长 OOM(远程 DoS)。
+                            // 超上限时把纯空白安全内容按普通文本吐出并收缩,只保留可能的半标签尾巴。
+                            events.extend(self.create_text_delta_events(&safe_content));
+                            self.thinking_buffer = self.thinking_buffer[safe_len..].to_string();
                         }
                     }
                     break;
@@ -3188,6 +3194,10 @@ fn find_next_param_open(body: &str, from: usize) -> Option<usize> {
 #[allow(dead_code)]
 const STRAY_INVOKE_TOKENS: &[&str] = &["call", "count", "card", "court", "課", "课"];
 
+/// thinking 缓冲上限(review Finding 5):上游持续吐纯空白时,纯空白分支既不 emit 也不收缩会让
+/// thinking_buffer 无界增长 OOM。超此上限即强制按普通文本吐出收缩。256KiB 远超正常 thinking 前导空白。
+const MAX_THINKING_BUFFER_BYTES: usize = 262_144;
+
 /// 复读熔断阈值：同一个 stray token（call/count/card/court）连续作为独占一行重复出现
 /// 超过这么多次，判定为「Opus 长上下文退化复读死循环」，立即熔断本轮文本输出。
 ///
@@ -3378,15 +3388,19 @@ fn invoke_looks_like_real_leak(before: &str) -> bool {
 /// 返回值仅在内部使用；主要副作用是更新 `open` 与 `partial`。
 #[allow(dead_code)]
 fn advance_code_fence_state(open: &mut bool, partial: &mut String, text: &str) {
+    // review Finding 6 修复:围栏判定只需"行首若干字节是否 ```",无换行的超长行会让 partial 无界增长。
+    // 一旦当前行已超过判定所需长度(远大于 "```" + 缩进),就不再累积字符(围栏与否已定),防无界 String。
+    const FENCE_SCAN_LINE_CAP: usize = 256;
     for ch in text.chars() {
         if ch == '\n' {
             if partial.trim_start().starts_with("```") {
                 *open = !*open;
             }
             partial.clear();
-        } else {
+        } else if partial.len() < FENCE_SCAN_LINE_CAP {
             partial.push(ch);
         }
+        // 超过 cap 的同一行剩余字符丢弃(围栏判定不需要;遇换行才重置)。
     }
 }
 
@@ -4021,8 +4035,23 @@ mod tests {
         let flood = format!("{}", "课".repeat(200));
         let events = ctx.process_assistant_response(&flood);
         assert!(ctx.stray_guard_tripped, "thinking 路径的课刷屏也应触发熔断");
-        // 熔断后本轮应几乎不吐正文(截断在游程起点)。
+        // 熔断后本轮应几乎不吐正文(截断在游点起点)。
         let _ = events;
+    }
+
+    #[test]
+    fn test_thinking_buffer_bounded_on_whitespace_flood() {
+        // review Finding 5 修复:上游持续吐纯空白(无 <thinking>)时 thinking_buffer 不应无界增长。
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4.6", 10, true, HashMap::new());
+        // 每次喂一大块纯空白(不含 <thinking>),多轮累积。旧代码 buffer 只涨不裁。
+        for _ in 0..20 {
+            let _ = ctx.process_content_with_thinking(&" ".repeat(50_000));
+        }
+        assert!(
+            ctx.thinking_buffer.len() <= MAX_THINKING_BUFFER_BYTES + 50_000,
+            "纯空白洪水下 thinking_buffer 应被上限约束,实测 {} 字节",
+            ctx.thinking_buffer.len()
+        );
     }
 
     #[test]
