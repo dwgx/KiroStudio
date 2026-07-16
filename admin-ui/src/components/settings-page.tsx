@@ -1,4 +1,5 @@
 import { createContext, useContext, useEffect, useMemo, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import {
@@ -73,6 +74,7 @@ import type {
   ClientRpm,
   TrashItem,
 } from '@/types/api'
+import type { TFunction } from 'i18next'
 
 // 人性化字节数：1536 → "1.5 KB"，0 → "0 B"（1024 进制）。
 function formatBytes(bytes: number): string {
@@ -97,63 +99,71 @@ function downloadJson(filename: string, data: unknown) {
 }
 
 // 友好相对时间："X 秒/分钟/小时/天 前"。无法解析时回退原字符串。
-function timeAgo(iso: string | null | undefined): string {
-  if (!iso) return '—'
-  const t = new Date(iso).getTime()
-  if (!Number.isFinite(t)) return iso
-  const diff = Date.now() - t
-  if (diff < 0) return '刚刚'
+function timeAgo(iso: string | null | undefined, t: TFunction): string {
+  if (!iso) return t('settingspage.common.emDash')
+  const ts = new Date(iso).getTime()
+  if (!Number.isFinite(ts)) return iso
+  const diff = Date.now() - ts
+  if (diff < 0) return t('settingspage.time.justNow')
   const sec = Math.floor(diff / 1000)
-  if (sec < 60) return `${sec} 秒前`
+  if (sec < 60) return t('settingspage.time.secondsAgo', { n: sec })
   const min = Math.floor(sec / 60)
-  if (min < 60) return `${min} 分钟前`
+  if (min < 60) return t('settingspage.time.minutesAgo', { n: min })
   const hour = Math.floor(min / 60)
-  if (hour < 24) return `${hour} 小时前`
+  if (hour < 24) return t('settingspage.time.hoursAgo', { n: hour })
   const day = Math.floor(hour / 24)
-  if (day < 30) return `${day} 天前`
+  if (day < 30) return t('settingspage.time.daysAgo', { n: day })
   const month = Math.floor(day / 30)
-  if (month < 12) return `${month} 个月前`
-  return `${Math.floor(month / 12)} 年前`
+  if (month < 12) return t('settingspage.time.monthsAgo', { n: month })
+  return t('settingspage.time.yearsAgo', { n: Math.floor(month / 12) })
 }
 
 /* ============ 分区导航 + 搜索 基础设施 ============ */
 
-// 设置分区（顶部 tab）。id 用于 tab 切换与卡片归属；label 为中文标题。
+// 设置分区（顶部 tab）。id 用于 tab 切换与卡片归属；label 经 i18n 在渲染时解析。
 type SectionId = 'basic' | 'security' | 'scheduling' | 'storage' | 'service' | 'privacy' | 'appearance' | 'export' | 'trash'
 
-const SECTIONS: { id: SectionId; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
-  { id: 'basic', label: '基础', icon: SlidersHorizontal },
-  { id: 'security', label: '安全', icon: ShieldCheck },
-  { id: 'scheduling', label: '调度', icon: Activity },
-  { id: 'storage', label: '存储', icon: Database },
-  { id: 'service', label: '服务管理', icon: Server },
-  { id: 'privacy', label: '隐私', icon: Fingerprint },
-  { id: 'appearance', label: 'UI 排版', icon: LayoutGrid },
-  { id: 'export', label: '令牌导出', icon: Download },
-  { id: 'trash', label: '回收站', icon: Trash2 },
+const SECTION_DEFS: { id: SectionId; labelKey: string; icon: React.ComponentType<{ className?: string }> }[] = [
+  { id: 'basic', labelKey: 'settingspage.section.basic', icon: SlidersHorizontal },
+  { id: 'security', labelKey: 'settingspage.section.security', icon: ShieldCheck },
+  { id: 'scheduling', labelKey: 'settingspage.section.scheduling', icon: Activity },
+  { id: 'storage', labelKey: 'settingspage.section.storage', icon: Database },
+  { id: 'service', labelKey: 'settingspage.section.service', icon: Server },
+  { id: 'privacy', labelKey: 'settingspage.section.privacy', icon: Fingerprint },
+  { id: 'appearance', labelKey: 'settingspage.section.appearance', icon: LayoutGrid },
+  { id: 'export', labelKey: 'settingspage.section.export', icon: Download },
+  { id: 'trash', labelKey: 'settingspage.section.trash', icon: Trash2 },
 ]
 
-// 每张卡片的可搜索索引（标题 + 关键词）。既驱动搜索命中，也用于判断“无匹配”空态。
-// keywords 覆盖该卡片内所有设置项的文案，保证按关键词能跨区定位。
-const CARD_INDEX: { section: SectionId; title: string; keywords: string[] }[] = [
-  { section: 'basic', title: '服务信息', keywords: ['监听地址', 'host', '端口', 'port', '区域', 'region', 'tls 后端', 'rustls', '默认 endpoint', '配置文件'] },
-  { section: 'basic', title: '客户端伪装', keywords: ['kiro 版本', '系统版本', 'node 版本', '伪装', '版本号'] },
-  { section: 'basic', title: '协议与转发', keywords: ['提取 thinking', 'thinking', 'claude code 自动切协议', 'cc_auto_buffer', '缓冲分发', '剥离环境噪音', 'env', 'git', '省 token', '缓存'] },
-  { section: 'basic', title: '工具调用容错', keywords: ['invalid tool parameters', '工具拼装非法', '工具错误', '失败态对齐', 'json 修复', '修复层', '修非法转义', '清洗泄漏控制 token', '截断跨轮恢复', '工具描述字符上限', 'tool_repair', 'tool_truncation'] },
-  { section: 'basic', title: '网络与上号', keywords: ['全局代理', 'proxy', '上号回调地址', 'callback', '回调模式', 'admin key'] },
-  { section: 'basic', title: '登录页背景', keywords: ['登录背景图', '登录页背景', '背景图', 'r18', '图源', 'lolicon', '关闭登录背景图'] },
-  { section: 'security', title: '反代安全', keywords: ['cors 允许来源', 'ip 白名单', 'cidr', '信任 x-forwarded-for', 'xff', '入口限流', '请求体上限', '413', '429'] },
-  { section: 'scheduling', title: '负载均衡模式', keywords: ['负载均衡', '优先级模式', '均衡负载', 'priority', 'balanced'] },
-  { section: 'scheduling', title: '防关联 / 限流', keywords: ['冷却机制', '速率限制', '每日上限', '最小请求间隔', '会话亲和性', 'affinity', '冷却时长缩放', '间隔抖动', 'jitter', '拟人'] },
-  { section: 'scheduling', title: '主动 token 预刷新', keywords: ['启用预刷新', '提前量', '扫描间隔', 'token 刷新'] },
-  { section: 'storage', title: '存储占用', keywords: ['存储', '清理', '落盘', '分区', 'traces', 'usage', 'trash', 'bg_cache', '磁盘'] },
-  { section: 'service', title: '服务管理', keywords: ['一键重启', '重启服务', 'restart'] },
-  { section: 'service', title: '客户端 RPM', keywords: ['客户端 rpm', '窗口', 'session', '吞吐', '活跃客户端'] },
-  { section: 'privacy', title: '隐私 / 客户端指纹', keywords: ['采集下游客户端指纹', '设备', 'ip', '系统', '浏览器', '隐私', 'fingerprint'] },
-  { section: 'appearance', title: 'UI 排版自定义', keywords: ['ui 排版', '排版', '号池排序', '卡片大小', '卡片尺寸', '禁用号', '布局', 'layout', '排序模式'] },
-  { section: 'export', title: '令牌导出', keywords: ['令牌导出', '凭据 json', '导出单个', '导出全部', 'token 导出', 'export'] },
-  { section: 'trash', title: '回收站', keywords: ['回收站', '已删除', '清空', '恢复', 'trash'] },
+// 每张卡片的可搜索索引（titleKey + kwKey）。kw 为各语言逗号分隔同义词，运行时 split。
+// 含智能调度（原先仅 SectionGate 有、CARD_INDEX 缺，导致命中计数不准）。
+const CARD_INDEX_DEFS: { section: SectionId; titleKey: string; kwKey: string }[] = [
+  { section: 'basic', titleKey: 'settingspage.card.serviceInfo', kwKey: 'settingspage.card.serviceInfo.kw' },
+  { section: 'basic', titleKey: 'settingspage.card.clientSpoof', kwKey: 'settingspage.card.clientSpoof.kw' },
+  { section: 'basic', titleKey: 'settingspage.card.protocol', kwKey: 'settingspage.card.protocol.kw' },
+  { section: 'basic', titleKey: 'settingspage.card.toolFault', kwKey: 'settingspage.card.toolFault.kw' },
+  { section: 'basic', titleKey: 'settingspage.card.network', kwKey: 'settingspage.card.network.kw' },
+  { section: 'basic', titleKey: 'settingspage.card.loginBg', kwKey: 'settingspage.card.loginBg.kw' },
+  { section: 'security', titleKey: 'settingspage.card.security', kwKey: 'settingspage.card.security.kw' },
+  { section: 'scheduling', titleKey: 'settingspage.card.loadBalance', kwKey: 'settingspage.card.loadBalance.kw' },
+  { section: 'scheduling', titleKey: 'settingspage.card.antiAssoc', kwKey: 'settingspage.card.antiAssoc.kw' },
+  { section: 'scheduling', titleKey: 'settingspage.card.smartSchedule', kwKey: 'settingspage.card.smartSchedule.kw' },
+  { section: 'scheduling', titleKey: 'settingspage.card.tokenRefresh', kwKey: 'settingspage.card.tokenRefresh.kw' },
+  { section: 'storage', titleKey: 'settingspage.card.storage', kwKey: 'settingspage.card.storage.kw' },
+  { section: 'service', titleKey: 'settingspage.card.service', kwKey: 'settingspage.card.service.kw' },
+  { section: 'service', titleKey: 'settingspage.card.clientRpm', kwKey: 'settingspage.card.clientRpm.kw' },
+  { section: 'privacy', titleKey: 'settingspage.card.privacy', kwKey: 'settingspage.card.privacy.kw' },
+  { section: 'appearance', titleKey: 'settingspage.card.appearance', kwKey: 'settingspage.card.appearance.kw' },
+  { section: 'export', titleKey: 'settingspage.card.export', kwKey: 'settingspage.card.export.kw' },
+  { section: 'trash', titleKey: 'settingspage.card.trash', kwKey: 'settingspage.card.trash.kw' },
 ]
+
+function parseKeywords(raw: string): string[] {
+  return raw
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean)
+}
 
 // 搜索上下文：query 为小写去空白后的关键词，'' 表示未搜索。
 const SearchContext = createContext<{ query: string }>({ query: '' })
@@ -181,17 +191,20 @@ function Highlight({ text }: { text: string }) {
 //   让内部 Field/ReadonlyRow 自行过滤，只留匹配项；都不命中则整卡隐藏。
 function SectionGate({
   section,
-  title,
-  keywords = [],
+  titleKey,
+  kwKey,
   children,
 }: {
   section: SectionId
-  title: string
-  keywords?: string[]
+  titleKey: string
+  kwKey: string
   children: React.ReactNode
 }) {
+  const { t } = useTranslation()
   const { query } = useContext(SearchContext)
   const active = useContext(ActiveSectionContext)
+  const title = t(titleKey)
+  const keywords = parseKeywords(t(kwKey))
   if (query) {
     const titleMatch = title.toLowerCase().includes(query)
     const kwMatch = keywords.some((k) => k.toLowerCase().includes(query))
@@ -433,6 +446,7 @@ function ReadonlyRow({ label, value, mono }: { label: string; value: React.React
 
 /* ============ 1. 服务管理：一键重启 + OTA 更新 ============ */
 function ServiceManagementCard() {
+  const { t } = useTranslation()
   const [confirmOpen, setConfirmOpen] = useState(false)
   const { mutate: restart, isPending } = useRestartService()
   // OTA 更新：检查 + 一键升级
@@ -445,12 +459,12 @@ function ServiceManagementCard() {
     restart(undefined, {
       // 重启会掐断本次连接，成功/失败都当作"已发起"提示——真正结果看服务是否恢复。
       onSuccess: (resp) => {
-        toast.success(resp.message || '重启中，约 3 秒后自动恢复')
+        toast.success(resp.message || t('settingspage.service.toastRestarting'))
         setConfirmOpen(false)
       },
       onError: () => {
         // 连接被重启中断而抛错属预期，仍提示已发起
-        toast.warning('重启中，约 3 秒后自动恢复（本次连接已中断，属正常）')
+        toast.warning(t('settingspage.service.toastRestartingDisconnected'))
         setConfirmOpen(false)
       },
     })
@@ -459,23 +473,23 @@ function ServiceManagementCard() {
   const handleCheck = () => {
     checkUpd(undefined, {
       onSuccess: (r) => {
-        if (r.error) toast.error(`检查更新失败：${r.error}`)
-        else if (r.has_update) toast.success(`发现新版本 ${r.latest_version}（当前 ${r.local_version}）`)
-        else toast.success(`已是最新版本 ${r.local_version}`)
+        if (r.error) toast.error(t('settingspage.service.toastCheckFail', { error: r.error }))
+        else if (r.has_update) toast.success(t('settingspage.service.toastNewVersion', { latest: r.latest_version, local: r.local_version }))
+        else toast.success(t('settingspage.service.toastLatest', { version: r.local_version }))
       },
-      onError: (e) => toast.error(`检查更新失败：${(e as Error).message}`),
+      onError: (e) => toast.error(t('settingspage.service.toastCheckFail', { error: (e as Error).message })),
     })
   }
 
   const handleUpgrade = () => {
     performUpd(undefined, {
       onSuccess: (r) => {
-        toast.success(r.message || '升级中，数秒后自动重启恢复')
+        toast.success(r.message || t('settingspage.service.toastUpgrading'))
         setUpgradeConfirm(false)
       },
       onError: () => {
         // 升级成功后会自动重启导致本次连接中断，抛错也当"已发起"
-        toast.warning('升级已发起，若成功将自动重启（本次连接可能中断，属正常）')
+        toast.warning(t('settingspage.service.toastUpgradingDisconnected'))
         setUpgradeConfirm(false)
       },
     })
@@ -486,40 +500,40 @@ function ServiceManagementCard() {
       <CardHeader className="pb-2">
         <CardTitle className="text-base flex items-center gap-2">
           <Server className="h-4 w-4 text-muted-foreground" />
-          <Highlight text="服务管理" />
+          <Highlight text={t('settingspage.card.service')} />
         </CardTitle>
       </CardHeader>
       <CardContent className="space-y-3">
         <p className="text-sm text-muted-foreground">
-          一键重启网关服务。重启瞬间会短暂断服数秒，期间请求失败——若有客户端正经由本网关，务必确认无进行中的关键请求。重启后约 3 秒自动恢复。
+          {t('settingspage.service.descRestart')}
         </p>
         <Button variant="destructive" size="sm" onClick={() => setConfirmOpen(true)} disabled={isPending}>
           <RotateCcw className="mr-1.5 h-4 w-4" />
-          一键重启服务
+          {t('settingspage.service.btnRestart')}
         </Button>
 
         {/* OTA 更新：检查 GitHub 最新版本 + 一键升级（多镜像回退 + sha256 校验 + 换二进制 + 自动重启） */}
         <div className="border-t pt-3 space-y-2">
           <p className="text-sm text-muted-foreground">
-            从 GitHub 检查并一键升级到最新版本（多镜像加速 + sha256 校验，升级后自动重启）。
+            {t('settingspage.service.descOta')}
           </p>
           <div className="flex flex-wrap items-center gap-2">
             <Button variant="outline" size="sm" onClick={handleCheck} disabled={checking || upgrading}>
               {checking ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-1.5 h-4 w-4" />}
-              检查更新
+              {t('settingspage.service.btnCheckUpdate')}
             </Button>
             {updInfo && !updInfo.error && (
               <span className="text-xs text-muted-foreground">
-                当前 <span className="font-mono">{updInfo.local_version}</span>
+                {t('settingspage.service.current')} <span className="font-mono">{updInfo.local_version}</span>
                 {updInfo.latest_version && (
-                  <> · 最新 <span className="font-mono">{updInfo.latest_version}</span></>
+                  <> {t('settingspage.service.latest')} <span className="font-mono">{updInfo.latest_version}</span></>
                 )}
               </span>
             )}
             {updInfo?.has_update && (
               <Button size="sm" onClick={() => setUpgradeConfirm(true)} disabled={upgrading}>
                 {upgrading ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <RotateCcw className="mr-1.5 h-4 w-4" />}
-                升级到 {updInfo.latest_version}
+                {t('settingspage.service.btnUpgrade', { version: updInfo.latest_version })}
               </Button>
             )}
           </div>
@@ -527,7 +541,7 @@ function ServiceManagementCard() {
           {updInfo?.has_update && updInfo.commits.length > 0 && (
             <div className="mt-1 rounded-md border border-border/60 bg-secondary/30 p-2">
               <div className="mb-1 text-xs font-medium text-muted-foreground">
-                本次更新包含 {updInfo.commits.length} 个提交：
+                {t('settingspage.service.commitsTitle', { n: updInfo.commits.length })}
               </div>
               <ul className="max-h-40 space-y-0.5 overflow-y-auto text-xs">
                 {updInfo.commits.map((c) => (
@@ -544,16 +558,16 @@ function ServiceManagementCard() {
             <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
               {updStatus.healthConfirmed ? (
                 <span className="text-emerald-500" title={updStatus.healthDetail ?? undefined}>
-                  ✓ 本版已稳定确认
+                  {t('settingspage.service.stableConfirmed')}
                 </span>
               ) : (
-                <span className="text-amber-500">⏳ 本版尚未确认稳定（升级后运行一段时间自动确认）</span>
+                <span className="text-amber-500">{t('settingspage.service.stablePending')}</span>
               )}
               {updStatus.rollbackPointPresent && (
-                <span className="text-muted-foreground">回滚点仍在(可回退)</span>
+                <span className="text-muted-foreground">{t('settingspage.service.rollbackPoint')}</span>
               )}
               {updStatus.rolledBackBinaryPresent && (
-                <span className="text-red-400" title="守卫脚本曾执行过回滚">⚠ 检测到曾发生回滚</span>
+                <span className="text-red-400" title={t('settingspage.service.rollbackDetectedTitle')}>{t('settingspage.service.rollbackDetected')}</span>
               )}
             </div>
           )}
@@ -563,9 +577,9 @@ function ServiceManagementCard() {
       <ConfirmDialog
         open={confirmOpen}
         onOpenChange={setConfirmOpen}
-        title="确认重启服务？"
-        description="重启会导致网关短暂断服数秒，期间所有请求失败（含正在进行的对话）。约 3 秒后自动恢复。确定继续？"
-        confirmLabel="确认重启"
+        title={t('settingspage.service.confirmRestartTitle')}
+        description={t('settingspage.service.confirmRestartDesc')}
+        confirmLabel={t('settingspage.service.confirmRestartLabel')}
         destructive
         loading={isPending}
         onConfirm={handleConfirm}
@@ -573,9 +587,11 @@ function ServiceManagementCard() {
       <ConfirmDialog
         open={upgradeConfirm}
         onOpenChange={setUpgradeConfirm}
-        title={`确认升级到 ${updInfo?.latest_version ?? '最新版本'}？`}
-        description="将从 GitHub 下载新二进制、校验 sha256 后替换并自动重启。重启期间短暂断服数秒。确定继续？"
-        confirmLabel="确认升级"
+        title={t('settingspage.service.confirmUpgradeTitle', {
+          version: updInfo?.latest_version ?? t('settingspage.service.confirmUpgradeTitleFallback'),
+        })}
+        description={t('settingspage.service.confirmUpgradeDesc')}
+        confirmLabel={t('settingspage.service.confirmUpgradeLabel')}
         loading={upgrading}
         onConfirm={handleUpgrade}
       />
@@ -596,6 +612,7 @@ function StoragePartitionRow({
   onCleanup: (p: StoragePartition) => void
   onView: (p: StoragePartition) => void
 }) {
+  const { t } = useTranslation()
   const cleanable = (CLEANABLE_KEYS as string[]).includes(p.key)
   // 四个可清理分区各有高保真明细弹框（与 CLEANABLE_KEYS 同集，复用运维页模板）。
   const viewable = (CLEANABLE_KEYS as string[]).includes(p.key)
@@ -606,7 +623,7 @@ function StoragePartitionRow({
           <span className="truncate">{p.label}</span>
           {p.inMemory && (
             <Badge variant="outline" className="text-[10px]">
-              内存
+              {t('settingspage.storage.inMemory')}
             </Badge>
           )}
         </div>
@@ -619,18 +636,18 @@ function StoragePartitionRow({
       <div className="flex shrink-0 items-center gap-4">
         <div className="text-right">
           <div className="text-sm font-semibold tabular-nums">{formatBytes(p.bytes)}</div>
-          <div className="text-[11px] text-muted-foreground tabular-nums">{p.items} 项</div>
+          <div className="text-[11px] text-muted-foreground tabular-nums">{t('settingspage.storage.items', { n: p.items })}</div>
         </div>
         {viewable && (
           <Button variant="outline" size="sm" onClick={() => onView(p)}>
             <Eye className="mr-1 h-3.5 w-3.5" />
-            查看
+            {t('settingspage.common.view')}
           </Button>
         )}
         {cleanable && (
           <Button variant="outline" size="sm" onClick={() => onCleanup(p)}>
             <Trash className="mr-1 h-3.5 w-3.5" />
-            清理
+            {t('settingspage.common.clean')}
           </Button>
         )}
       </div>
@@ -639,6 +656,7 @@ function StoragePartitionRow({
 }
 
 function StorageStatsCard() {
+  const { t } = useTranslation()
   const { data, isLoading, error, refetch } = useStorageStats()
   const { mutate: cleanup, isPending } = useCleanupStorage()
 
@@ -685,10 +703,10 @@ function StorageStatsCard() {
       <CardHeader className="pb-2 flex-row items-center justify-between space-y-0">
         <CardTitle className="text-base flex items-center gap-2">
           <Database className="h-4 w-4 text-muted-foreground" />
-          <Highlight text="存储占用" />
+          <Highlight text={t('settingspage.card.storage')} />
         </CardTitle>
         <Button variant="outline" size="sm" onClick={() => refetch()} disabled={isLoading}>
-          刷新
+          {t('settingspage.common.refresh')}
         </Button>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -700,23 +718,23 @@ function StorageStatsCard() {
           </div>
         ) : error ? (
           <div className="py-4 text-center text-sm text-red-400">
-            加载存储统计失败：{extractErrorMessage(error)}
+            {t('settingspage.storage.loadFail', { error: extractErrorMessage(error) })}
           </div>
         ) : data ? (
           <>
             <StatCard
-              label="落盘占用合计"
+              label={t('settingspage.storage.totalDisk')}
               value={formatBytes(data.totalDiskBytes)}
               icon={Database}
               accent="primary"
-              hint={data.usageEnabled ? '用量统计已启用' : '用量统计未启用（部分分区缺失）'}
+              hint={data.usageEnabled ? t('settingspage.storage.usageEnabled') : t('settingspage.storage.usageDisabled')}
             />
             <div>
               {data.partitions.map((p) => (
                 <StoragePartitionRow key={p.key} p={p} onCleanup={openCleanup} onView={openView} />
               ))}
               {data.partitions.length === 0 && (
-                <p className="py-4 text-center text-sm text-muted-foreground">暂无可统计的分区</p>
+                <p className="py-4 text-center text-sm text-muted-foreground">{t('settingspage.storage.noPartitions')}</p>
               )}
             </div>
           </>
@@ -726,23 +744,25 @@ function StorageStatsCard() {
       <ConfirmDialog
         open={target !== null}
         onOpenChange={(v) => !v && setTarget(null)}
-        title={`清理「${target?.label ?? ''}」？`}
+        title={t('settingspage.storage.confirmTitle', { label: target?.label ?? '' })}
         description={
           <span>
-            此操作<strong className="text-red-400">不可逆</strong>，将永久删除对应数据。
+            {t('settingspage.storage.confirmDescBase')}
+            <strong className="text-red-400">{t('settingspage.storage.confirmDescIrreversible')}</strong>
+            {t('settingspage.storage.confirmDescMid')}
             {supportsDays
-              ? '可指定保留天数：仅删除早于该天数的数据；留空按服务配置的默认保留期。'
-              : '该分区为整体清理，将清空全部内容。'}
+              ? t('settingspage.storage.confirmDescDays')
+              : t('settingspage.storage.confirmDescWhole')}
           </span>
         }
-        confirmLabel="确认清理"
+        confirmLabel={t('settingspage.storage.confirmClean')}
         destructive
         loading={isPending}
         onConfirm={handleConfirm}
       >
         {supportsDays && (
           <div className="flex items-center justify-between gap-3 rounded-md border border-border/60 bg-secondary/30 px-3 py-2">
-            <span className="text-sm">保留天数</span>
+            <span className="text-sm">{t('settingspage.storage.keepDays')}</span>
             <div className="flex items-center gap-2">
               <Input
                 className="w-24 text-right"
@@ -750,9 +770,9 @@ function StorageStatsCard() {
                 min={0}
                 value={keepDays}
                 onChange={(e) => setKeepDays(e.target.value)}
-                placeholder="默认"
+                placeholder={t('settingspage.common.default')}
               />
-              <span className="text-xs text-muted-foreground">天</span>
+              <span className="text-xs text-muted-foreground">{t('settingspage.common.days')}</span>
             </div>
           </div>
         )}
@@ -769,6 +789,7 @@ function StorageStatsCard() {
 
 /* ============ 3. per 客户端/窗口 RPM 面板 ============ */
 function ClientRow({ c }: { c: ClientRpm }) {
+  const { t } = useTranslation()
   const [expanded, setExpanded] = useState(false)
   const canExpand = c.sessions.length > 0
   return (
@@ -802,7 +823,7 @@ function ClientRow({ c }: { c: ClientRpm }) {
             <div className="text-[11px] text-muted-foreground">RPM</div>
           </div>
           <Badge variant="outline" className="text-[11px]">
-            {c.activeSessions} 窗口
+            {t('settingspage.clientRpm.windows', { n: c.activeSessions })}
           </Badge>
         </div>
       </div>
@@ -826,6 +847,7 @@ function ClientRow({ c }: { c: ClientRpm }) {
 }
 
 function ClientRpmCard() {
+  const { t } = useTranslation()
   const { data, isLoading, error, isFetching } = useUsageClients()
 
   const totalRpm = useMemo(() => (data ?? []).reduce((s, c) => s + c.rpm, 0), [data])
@@ -839,16 +861,16 @@ function ClientRpmCard() {
       <CardHeader className="pb-2 flex-row items-center justify-between space-y-0">
         <CardTitle className="text-base flex items-center gap-2">
           <Activity className="h-4 w-4 text-muted-foreground" />
-          <Highlight text="客户端 RPM" />
+          <Highlight text={t('settingspage.card.clientRpm')} />
           {isFetching && <Loader className="h-3.5 w-3.5 animate-spin text-muted-foreground" />}
         </CardTitle>
-        <span className="text-xs text-muted-foreground">每 30 秒刷新（读本地统计）</span>
+        <span className="text-xs text-muted-foreground">{t('settingspage.clientRpm.refreshHint')}</span>
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="grid grid-cols-3 gap-3">
-          <StatCard label="客户端数" value={data?.length ?? 0} accent="neutral" />
-          <StatCard label="合计 RPM" value={totalRpm} accent="primary" />
-          <StatCard label="活跃窗口" value={totalWindows} accent="success" />
+          <StatCard label={t('settingspage.clientRpm.clientCount')} value={data?.length ?? 0} accent="neutral" />
+          <StatCard label={t('settingspage.clientRpm.totalRpm')} value={totalRpm} accent="primary" />
+          <StatCard label={t('settingspage.clientRpm.activeWindows')} value={totalWindows} accent="success" />
         </div>
 
         {isLoading ? (
@@ -859,19 +881,19 @@ function ClientRpmCard() {
           </div>
         ) : error ? (
           <div className="py-4 text-center text-sm text-red-400">
-            加载客户端 RPM 失败：{extractErrorMessage(error)}
+            {t('settingspage.clientRpm.loadFail', { error: extractErrorMessage(error) })}
           </div>
         ) : data && data.length > 0 ? (
           <div>
             <p className="mb-1 px-2 text-xs text-muted-foreground">
-              点击展开查看每个窗口（session）的 RPM
+              {t('settingspage.clientRpm.expandHint')}
             </p>
             {data.map((c) => (
               <ClientRow key={c.clientKey} c={c} />
             ))}
           </div>
         ) : (
-          <p className="py-6 text-center text-sm text-muted-foreground">当前无活跃客户端</p>
+          <p className="py-6 text-center text-sm text-muted-foreground">{t('settingspage.clientRpm.noClients')}</p>
         )}
       </CardContent>
     </Card>
@@ -881,6 +903,7 @@ function ClientRpmCard() {
 /* ============ 4. 隐私：下游客户端指纹采集开关（立即生效） ============ */
 // 独立于底部批量保存：切换即调用 updateConfig，立即生效、无需重启。
 function PrivacyCard() {
+  const { t } = useTranslation()
   const { data: config } = useConfigSnapshot()
   const { mutate: save, isPending } = useUpdateConfig()
 
@@ -892,7 +915,7 @@ function PrivacyCard() {
       { collectClientFingerprint: v },
       {
         onSuccess: () =>
-          toast.success(v ? '已开启下游客户端指纹采集' : '已关闭下游客户端指纹采集，不再采集与存储'),
+          toast.success(v ? t('settingspage.privacy.toast.on') : t('settingspage.privacy.toast.off')),
         onError: (err) => toast.error(extractErrorMessage(err)),
       }
     )
@@ -903,13 +926,13 @@ function PrivacyCard() {
       <CardHeader className="pb-2">
         <CardTitle className="text-base flex items-center gap-2">
           <Fingerprint className="h-4 w-4 text-muted-foreground" />
-          <Highlight text="隐私 / 客户端指纹" />
+          <Highlight text={t('settingspage.card.privacy')} />
         </CardTitle>
       </CardHeader>
       <CardContent className="py-0">
         <Field
-          label="采集下游客户端指纹（设备/IP/系统/浏览器）"
-          hint="关闭后不再采集、不存储下游客户端的设备/IP/系统/浏览器信息，隐私性更好（不影响请求转发与用量统计）"
+          label={t('settingspage.privacy.field.label')}
+          hint={t('settingspage.privacy.field.hint')}
         >
           <Switch checked={enabled} disabled={isPending} onCheckedChange={toggle} />
         </Field>
@@ -920,6 +943,7 @@ function PrivacyCard() {
 
 /* ============ 5. 令牌导出：单个 / 全部凭据 JSON 下载 ============ */
 function TokenExportCard() {
+  const { t } = useTranslation()
   const { data: creds, isLoading, error, refetch } = useCredentials()
   // 记录正在导出的凭据 id（单个），以及“导出全部”进行中标志，避免重复点击。
   const [exportingId, setExportingId] = useState<number | null>(null)
@@ -935,7 +959,7 @@ function TokenExportCard() {
     try {
       const obj = await exportCredential(id)
       downloadJson(`credential-${id}-${stamp()}.json`, obj)
-      toast.success(`已导出凭据 #${id}`)
+      toast.success(t('settingspage.export.toast.exportedOne', { id }))
     } catch (err) {
       toast.error(extractErrorMessage(err))
     } finally {
@@ -950,7 +974,7 @@ function TokenExportCard() {
       const obj = await exportCredential(id)
       const token = obj.refreshToken
       if (typeof token !== 'string' || !token) {
-        toast.error('该凭据不包含 refreshToken（可能是 API Key 凭据）')
+        toast.error(t('settingspage.export.toast.noRt'))
         return
       }
       const blob = new Blob([token], { type: 'text/plain' })
@@ -962,7 +986,7 @@ function TokenExportCard() {
       a.click()
       document.body.removeChild(a)
       URL.revokeObjectURL(url)
-      toast.success(`已导出 #${id} 的 refreshToken`)
+      toast.success(t('settingspage.export.toast.exportedRt', { id }))
     } catch (err) {
       toast.error(extractErrorMessage(err))
     } finally {
@@ -977,9 +1001,9 @@ function TokenExportCard() {
       const obj = await exportCredential(id)
       const ok = await copyToClipboard(JSON.stringify(obj, null, 2))
       if (ok) {
-        toast.success(`已复制 #${id} 凭据 JSON 到剪贴板`)
+        toast.success(t('settingspage.export.toast.copied', { id }))
       } else {
-        toast.error('复制失败，请重试')
+        toast.error(t('settingspage.export.toast.copyFail'))
       }
     } catch (err) {
       toast.error(extractErrorMessage(err))
@@ -998,7 +1022,7 @@ function TokenExportCard() {
         all.push(await exportCredential(c.id))
       }
       downloadJson(`credentials-all-${stamp()}.json`, all)
-      toast.success(`已导出全部 ${all.length} 个凭据`)
+      toast.success(t('settingspage.export.toast.exportedAll', { n: all.length }))
     } catch (err) {
       toast.error(extractErrorMessage(err))
     } finally {
@@ -1011,7 +1035,7 @@ function TokenExportCard() {
       <CardHeader className="pb-2 flex-row items-center justify-between space-y-0">
         <CardTitle className="text-base flex items-center gap-2">
           <Download className="h-4 w-4 text-muted-foreground" />
-          <Highlight text="令牌导出" />
+          <Highlight text={t('settingspage.card.export')} />
         </CardTitle>
         <Button
           variant="outline"
@@ -1024,13 +1048,12 @@ function TokenExportCard() {
           ) : (
             <Download className="mr-1.5 h-4 w-4" />
           )}
-          导出全部（{list.length}）
+          {t('settingspage.export.exportAll', { n: list.length })}
         </Button>
       </CardHeader>
       <CardContent className="space-y-3">
         <p className="text-sm text-muted-foreground">
-          导出凭据令牌：完整 JSON（可重新导入）、仅 refreshToken 纯文本、或复制到剪贴板。
-          含 refreshToken / kiroApiKey 等敏感字段，请妥善保管、勿外泄。
+          {t('settingspage.export.desc')}
         </p>
         {isLoading ? (
           <div className="space-y-2">
@@ -1039,13 +1062,13 @@ function TokenExportCard() {
           </div>
         ) : error ? (
           <div className="py-3 text-center text-sm text-red-400">
-            加载凭据列表失败：{extractErrorMessage(error)}
+            {t('settingspage.export.loadFail', { error: extractErrorMessage(error) })}
             <Button variant="outline" size="sm" className="ml-2" onClick={() => refetch()}>
-              重试
+              {t('settingspage.common.retry')}
             </Button>
           </div>
         ) : list.length === 0 ? (
-          <p className="py-4 text-center text-sm text-muted-foreground">暂无凭据可导出</p>
+          <p className="py-4 text-center text-sm text-muted-foreground">{t('settingspage.export.noCreds')}</p>
         ) : (
           <div>
             {list.map((c) => (
@@ -1059,14 +1082,14 @@ function TokenExportCard() {
                     {c.email ? ` · ${c.email}` : ''}
                   </div>
                   <div className="mt-0.5 text-[11px] text-muted-foreground">
-                    {c.subscriptionTitle || c.authMethod || '凭据'}
+                    {c.subscriptionTitle || c.authMethod || t('settingspage.common.credential')}
                   </div>
                 </div>
                 <div className="flex shrink-0 items-center gap-1.5">
                   {exportingId === c.id ? (
                     <div className="flex h-8 items-center px-2 text-xs text-muted-foreground">
                       <Loader className="mr-1 h-3.5 w-3.5 animate-spin" />
-                      导出中
+                      {t('settingspage.export.exporting')}
                     </div>
                   ) : (
                     <>
@@ -1075,7 +1098,7 @@ function TokenExportCard() {
                         size="sm"
                         onClick={() => exportOne(c.id)}
                         disabled={exportingAll}
-                        title="下载完整凭据 JSON（可重新导入）"
+                        title={t('settingspage.export.jsonTitle')}
                       >
                         <FileJson className="mr-1 h-3.5 w-3.5" />
                         JSON
@@ -1086,7 +1109,7 @@ function TokenExportCard() {
                         className="h-8 w-8"
                         onClick={() => exportRefreshTokenOne(c.id)}
                         disabled={exportingAll}
-                        title="仅下载 refreshToken 纯文本"
+                        title={t('settingspage.export.refreshTokenTitle')}
                       >
                         <KeyRound className="h-3.5 w-3.5" />
                       </Button>
@@ -1096,7 +1119,7 @@ function TokenExportCard() {
                         className="h-8 w-8"
                         onClick={() => copyOne(c.id)}
                         disabled={exportingAll}
-                        title="复制完整 JSON 到剪贴板"
+                        title={t('settingspage.export.copyTitle')}
                       >
                         <ClipboardCopy className="h-3.5 w-3.5" />
                       </Button>
@@ -1135,13 +1158,14 @@ function TrashRow({
   onPurge: () => void
   busy: boolean
 }) {
+  const { t } = useTranslation()
   return (
     <div className="flex items-center justify-between gap-4 border-b border-border/40 py-2.5 last:border-0">
       <div className="flex min-w-0 items-center gap-3">
         <Checkbox
           checked={checked}
           onCheckedChange={(v) => onToggle(v === true)}
-          aria-label={`选择 #${item.id}`}
+          aria-label={t('settingspage.trash.selectAria', { id: item.id })}
         />
         <div className="min-w-0">
           <div className="truncate text-sm">
@@ -1149,22 +1173,22 @@ function TrashRow({
             {item.email ? ` · ${item.email}` : ''}
           </div>
           <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground">
-            <span>{item.authMethod || '凭据'}</span>
+            <span>{item.authMethod || t('settingspage.common.credential')}</span>
             <span>·</span>
-            <span title={item.deletedAt}>删除于 {timeAgo(item.deletedAt)}</span>
+            <span title={item.deletedAt}>{t('settingspage.trash.deletedAt', { when: timeAgo(item.deletedAt, t) })}</span>
             <span>·</span>
-            <span>成功 {item.successCount} 次</span>
+            <span>{t('settingspage.trash.successCount', { n: item.successCount })}</span>
           </div>
         </div>
       </div>
       <div className="flex shrink-0 items-center gap-2">
         <Button variant="outline" size="sm" onClick={onRestore} disabled={busy}>
           <RotateCcw className="mr-1 h-3.5 w-3.5" />
-          恢复
+          {t('settingspage.trash.btnRestore')}
         </Button>
         <Button variant="destructive" size="sm" onClick={onPurge} disabled={busy}>
           <Trash className="mr-1 h-3.5 w-3.5" />
-          永久删除
+          {t('settingspage.trash.btnPurge')}
         </Button>
       </div>
     </div>
@@ -1172,6 +1196,7 @@ function TrashRow({
 }
 
 function TrashCard() {
+  const { t } = useTranslation()
   const queryClient = useQueryClient()
   const { data, isLoading, error, refetch, isFetching } = useQuery({
     queryKey: ['trash'],
@@ -1221,7 +1246,7 @@ function TrashCard() {
     setBusy(true)
     try {
       await restoreCredential(item.id)
-      toast.success(`已恢复凭据 #${item.id}`)
+      toast.success(t('settingspage.trash.toast.restored', { id: item.id }))
       invalidate()
     } catch (err) {
       toast.error(extractErrorMessage(err))
@@ -1237,13 +1262,13 @@ function TrashCard() {
     try {
       if (confirm.kind === 'one') {
         await purgeCredential(confirm.item.id)
-        toast.success(`已永久删除凭据 #${confirm.item.id}`)
+        toast.success(t('settingspage.trash.toast.purgedOne', { id: confirm.item.id }))
       } else if (confirm.kind === 'selected') {
         await purgeTrashBatch(confirm.ids)
-        toast.success(`已永久删除选中的 ${confirm.ids.length} 项`)
+        toast.success(t('settingspage.trash.toast.purgedSelected', { n: confirm.ids.length }))
       } else {
         await purgeTrashBatch()
-        toast.success('已清空回收站')
+        toast.success(t('settingspage.trash.toast.cleared'))
       }
       setSelected(new Set())
       setConfirm(null)
@@ -1259,26 +1284,28 @@ function TrashCard() {
 
   const confirmTitle =
     confirm?.kind === 'one'
-      ? `永久删除凭据 #${confirm.item.id}？`
+      ? t('settingspage.trash.confirmOneTitle', { id: confirm.item.id })
       : confirm?.kind === 'selected'
-        ? `永久删除选中的 ${confirm.ids.length} 项？`
-        : '清空整个回收站？'
+        ? t('settingspage.trash.confirmSelectedTitle', { n: confirm.ids.length })
+        : t('settingspage.trash.confirmAllTitle')
 
   return (
     <Card>
       <CardHeader className="pb-2 flex-row items-center justify-between space-y-0">
         <CardTitle className="text-base flex items-center gap-2">
           <Trash2 className="h-4 w-4 text-muted-foreground" />
-          <Highlight text="回收站" />
+          <Highlight text={t('settingspage.card.trash')} />
           {isFetching && <Loader className="h-3.5 w-3.5 animate-spin text-muted-foreground" />}
         </CardTitle>
         <Button variant="outline" size="sm" onClick={() => refetch()} disabled={isLoading}>
-          刷新
+          {t('settingspage.common.refresh')}
         </Button>
       </CardHeader>
       <CardContent className="space-y-4">
         <p className="text-sm text-muted-foreground">
-          已删除的凭据暂存于此，可恢复回号池或永久清除。永久删除后<strong className="text-red-400">无法恢复</strong>。
+          {t('settingspage.trash.desc')}
+          <strong className="text-red-400">{t('settingspage.trash.descStrong')}</strong>
+          {t('settingspage.trash.descTail')}
         </p>
 
         {isLoading ? (
@@ -1289,15 +1316,15 @@ function TrashCard() {
           </div>
         ) : error ? (
           <div className="py-4 text-center text-sm text-red-400">
-            加载回收站失败：{extractErrorMessage(error)}
+            {t('settingspage.trash.loadFail', { error: extractErrorMessage(error) })}
             <Button variant="outline" size="sm" className="ml-2" onClick={() => refetch()}>
-              重试
+              {t('settingspage.common.retry')}
             </Button>
           </div>
         ) : list.length === 0 ? (
           <div className="flex flex-col items-center gap-2 py-12 text-center text-sm text-muted-foreground">
             <Trash2 className="h-8 w-8 opacity-40" />
-            回收站为空
+            {t('settingspage.trash.empty')}
           </div>
         ) : (
           <>
@@ -1307,12 +1334,14 @@ function TrashCard() {
                 <Checkbox
                   checked={allChecked ? true : someChecked ? 'indeterminate' : false}
                   onCheckedChange={(v) => toggleAll(v === true)}
-                  aria-label="全选"
+                  aria-label={t('settingspage.trash.selectAll')}
                 />
                 <span>
-                  全选
+                  {t('settingspage.trash.selectAll')}
                   {selected.size > 0 && (
-                    <span className="ml-1 text-muted-foreground">（已选 {selected.size} / {total}）</span>
+                    <span className="ml-1 text-muted-foreground">
+                      {t('settingspage.trash.selectedCount', { selected: selected.size, total })}
+                    </span>
                   )}
                 </span>
               </label>
@@ -1324,7 +1353,7 @@ function TrashCard() {
                   onClick={() => setConfirm({ kind: 'selected', ids: Array.from(selected) })}
                 >
                   <Trash className="mr-1 h-3.5 w-3.5" />
-                  清空选中
+                  {t('settingspage.trash.btnPurgeSelected')}
                 </Button>
                 <Button
                   variant="destructive"
@@ -1333,7 +1362,7 @@ function TrashCard() {
                   onClick={() => setConfirm({ kind: 'all' })}
                 >
                   <Trash2 className="mr-1 h-3.5 w-3.5" />
-                  清空全部
+                  {t('settingspage.trash.btnPurgeAll')}
                 </Button>
               </div>
             </div>
@@ -1361,13 +1390,15 @@ function TrashCard() {
         title={confirmTitle}
         description={
           <span>
-            此操作将<strong className="text-red-400">永久删除，无法恢复</strong>。
+            {t('settingspage.trash.confirmDesc')}
+            <strong className="text-red-400">{t('settingspage.trash.confirmDescStrong')}</strong>
+            {t('settingspage.trash.confirmDescTail')}
             {confirm?.kind === 'all'
-              ? '回收站内全部条目都会被清除。'
-              : '删除后无法再从回收站找回。'}
+              ? t('settingspage.trash.confirmAllDesc')
+              : t('settingspage.trash.confirmSelectedDesc')}
           </span>
         }
-        confirmLabel="确认永久删除"
+        confirmLabel={t('settingspage.trash.confirmLabel')}
         destructive
         loading={busy}
         onConfirm={runConfirmed}
@@ -1377,6 +1408,7 @@ function TrashCard() {
 }
 
 export function SettingsPage() {
+  const { t, i18n } = useTranslation()
   const { data: config, isLoading, error, refetch } = useConfigSnapshot()
   const { mutate: save, isPending: isSaving } = useUpdateConfig()
 
@@ -1393,13 +1425,15 @@ export function SettingsPage() {
   const matchedSections = useMemo(() => {
     if (!query) return new Set<SectionId>()
     const s = new Set<SectionId>()
-    for (const c of CARD_INDEX) {
-      if (c.title.toLowerCase().includes(query) || c.keywords.some((k) => k.includes(query))) {
+    for (const c of CARD_INDEX_DEFS) {
+      const title = t(c.titleKey)
+      const keywords = parseKeywords(t(c.kwKey))
+      if (title.toLowerCase().includes(query) || keywords.some((k) => k.includes(query))) {
         s.add(c.section)
       }
     }
     return s
-  }, [query])
+  }, [query, t, i18n.language])
 
   const hasAnyMatch = matchedSections.size > 0
 
@@ -1532,14 +1566,14 @@ export function SettingsPage() {
     }
     // 无后端字段改动时,仅 UI 排版改动:落地后直接提示成功,不打后端。
     if (Object.keys(diff).length === 0) {
-      if (uiPrefsDirty) toast.success('已保存 UI 排版偏好')
+      if (uiPrefsDirty) toast.success(t('settingspage.toast.uiPrefsSaved'))
       return
     }
     save(diff, {
       onSuccess: (resp) => {
         if (resp.restartRequired) {
           toast.warning(resp.message, {
-            description: `需重启字段：${resp.restartFields.join('、')}`,
+            description: t('settingspage.toast.restartFields', { fields: resp.restartFields.join('、') }),
             duration: 8000,
           })
         } else {
@@ -1565,9 +1599,9 @@ export function SettingsPage() {
       <div className="flex items-center justify-center py-24">
         <Card className="w-full max-w-md">
           <CardContent className="pt-6 text-center">
-            <div className="text-red-500 mb-4">加载配置失败</div>
-            <p className="text-muted-foreground mb-4">{error ? (error as Error).message : '无数据'}</p>
-            <Button onClick={() => refetch()}>重试</Button>
+            <div className="text-red-500 mb-4">{t('settingspage.page.loadFailed')}</div>
+            <p className="text-muted-foreground mb-4">{error ? (error as Error).message : t('settingspage.page.noData')}</p>
+            <Button onClick={() => refetch()}>{t('settingspage.common.retry')}</Button>
           </CardContent>
         </Card>
       </div>
@@ -1575,13 +1609,18 @@ export function SettingsPage() {
   }
 
   const inputCls = 'max-w-[260px] text-right'
+  const hot = t('settingspage.hint.hotReload')
+  const hotParen = t('settingspage.hint.hotReloadParen')
+  const restart = t('settingspage.hint.restartRequired')
+  const presetRestart = t('settingspage.hint.presetOrCustomRestart')
+  const emDash = t('settingspage.common.emDash')
 
   return (
     <SearchContext.Provider value={{ query }}>
     <ActiveSectionContext.Provider value={activeSection}>
     <div className="space-y-6 pb-24">
       <div className="flex items-center justify-between gap-4">
-        <h2 className="text-xl font-semibold text-gradient-brand">设置</h2>
+        <h2 className="text-xl font-semibold text-gradient-brand">{t('settingspage.page.title')}</h2>
         <div className="flex items-center gap-2">
           {/* 搜索：跨区定位设置项，命中即高亮/过滤 */}
           <div className="relative">
@@ -1590,22 +1629,22 @@ export function SettingsPage() {
               className="w-56 pl-8 pr-8"
               value={searchRaw}
               onChange={(e) => setSearchRaw(e.target.value)}
-              placeholder="搜索设置项…"
-              aria-label="搜索设置项"
+              placeholder={t('settingspage.page.searchPlaceholder')}
+              aria-label={t('settingspage.page.searchAria')}
             />
             {searchRaw && (
               <button
                 type="button"
                 onClick={() => setSearchRaw('')}
                 className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
-                aria-label="清除搜索"
+                aria-label={t('settingspage.page.clearSearch')}
               >
                 <X className="h-4 w-4" />
               </button>
             )}
           </div>
           <Button variant="outline" size="sm" onClick={() => refetch()} disabled={isSaving}>
-            刷新
+            {t('settingspage.common.refresh')}
           </Button>
         </div>
       </div>
@@ -1613,7 +1652,7 @@ export function SettingsPage() {
       {/* 分区导航 tab：搜索态下隐藏（改为跨区展示命中项） */}
       {!query && (
         <div className="flex flex-wrap gap-2 border-b pb-3">
-          {SECTIONS.map((s) => {
+          {SECTION_DEFS.map((s) => {
             const Icon = s.icon
             const isActive = s.id === activeSection
             return (
@@ -1624,7 +1663,7 @@ export function SettingsPage() {
                 onClick={() => setActiveSection(s.id)}
               >
                 <Icon className="mr-1.5 h-4 w-4" />
-                {s.label}
+                {t(s.labelKey)}
               </Button>
             )
           })}
@@ -1635,81 +1674,81 @@ export function SettingsPage() {
       {query && (
         <p className="text-sm text-muted-foreground">
           {hasAnyMatch
-            ? `“${searchRaw.trim()}” 的匹配结果（命中 ${matchedSections.size} 个分区）`
-            : `没有匹配“${searchRaw.trim()}”的设置项`}
+            ? t('settingspage.page.searchMatch', { q: searchRaw.trim(), n: matchedSections.size })
+            : t('settingspage.page.searchNone', { q: searchRaw.trim() })}
         </p>
       )}
 
       {/* 服务管理分区：一键重启 */}
-      <SectionGate section="service" title="服务管理" keywords={['一键重启', '重启服务', 'restart']}>
+      <SectionGate section="service" titleKey="settingspage.card.service" kwKey="settingspage.card.service.kw">
         <ServiceManagementCard />
       </SectionGate>
       {/* 存储分区：占用统计 + 清理 */}
-      <SectionGate section="storage" title="存储占用" keywords={['存储', '清理', '落盘', '分区', 'traces', 'usage', 'trash', 'bg_cache', '磁盘']}>
+      <SectionGate section="storage" titleKey="settingspage.card.storage" kwKey="settingspage.card.storage.kw">
         <StorageStatsCard />
       </SectionGate>
       {/* 服务管理分区：客户端 RPM */}
-      <SectionGate section="service" title="客户端 RPM" keywords={['客户端 rpm', '窗口', 'session', '吞吐', '活跃客户端']}>
+      <SectionGate section="service" titleKey="settingspage.card.clientRpm" kwKey="settingspage.card.clientRpm.kw">
         <ClientRpmCard />
       </SectionGate>
 
       {/* 隐私分区：客户端指纹采集开关（立即生效） */}
-      <SectionGate section="privacy" title="隐私 / 客户端指纹" keywords={['采集下游客户端指纹', '设备', 'ip', '系统', '浏览器', '隐私', 'fingerprint']}>
+      <SectionGate section="privacy" titleKey="settingspage.card.privacy" kwKey="settingspage.card.privacy.kw">
         <PrivacyCard />
       </SectionGate>
 
       {/* UI 排版自定义分区：号池状态排序/禁用号显隐 + 凭据卡片尺寸。纯前端 localStorage,纳入统一保存流程(切换点亮保存,点保存才落地)。 */}
-      <SectionGate section="appearance" title="UI 排版自定义" keywords={['ui 排版', '排版', '号池排序', '卡片大小', '卡片尺寸', '禁用号', '布局', 'layout', '排序模式']}>
-        <Field label="号池状态排序" hint="概览页「号池状态」按此排列（实时数据自动排，保存后生效）">
+      <SectionGate section="appearance" titleKey="settingspage.card.appearance" kwKey="settingspage.card.appearance.kw">
+        <Field label={t('settingspage.appearance.poolSort.label')} hint={t('settingspage.appearance.poolSort.hint')}>
           <SegChoice
             value={form.poolSort}
             onChange={(v) => set('poolSort', v as PoolSortMode)}
             options={[
-              { value: 'health', label: '健康度' },
-              { value: 'sequence', label: '顺序' },
-              { value: 'concurrency', label: '并发数' },
-              { value: 'lastUsed', label: '最后调用' },
+              { value: 'health', label: t('settingspage.appearance.poolSort.health') },
+              { value: 'sequence', label: t('settingspage.appearance.poolSort.sequence') },
+              { value: 'concurrency', label: t('settingspage.appearance.poolSort.concurrency') },
+              { value: 'lastUsed', label: t('settingspage.appearance.poolSort.lastUsed') },
             ]}
           />
         </Field>
-        <Field label="展示已禁用号" hint="关闭后号池状态只显示启用中的号，隐藏已禁用的">
+        <Field label={t('settingspage.appearance.poolShowDisabled.label')} hint={t('settingspage.appearance.poolShowDisabled.hint')}>
           <Switch
             checked={form.poolShowDisabled}
             onCheckedChange={(v) => set('poolShowDisabled', v)}
           />
         </Field>
-        <Field label="凭据卡片尺寸" hint="凭据管理页卡片大小，按尺寸自动决定每行几个（紧凑约5、标准约4、大约3）">
+        <Field label={t('settingspage.appearance.cardSize.label')} hint={t('settingspage.appearance.cardSize.hint')}>
           <SegChoice
             value={form.cardSize}
             onChange={(v) => set('cardSize', v as CardSize)}
             options={[
-              { value: 'compact', label: '紧凑' },
-              { value: 'standard', label: '标准' },
-              { value: 'large', label: '大' },
+              { value: 'compact', label: t('settingspage.appearance.cardSize.compact') },
+              { value: 'standard', label: t('settingspage.appearance.cardSize.standard') },
+              { value: 'large', label: t('settingspage.appearance.cardSize.large') },
             ]}
           />
         </Field>
       </SectionGate>
 
       {/* 令牌导出分区：单个 / 全部凭据 JSON 下载 */}
-      <SectionGate section="export" title="令牌导出" keywords={['令牌导出', '凭据 json', '导出单个', '导出全部', 'token 导出', 'export']}>
+      <SectionGate section="export" titleKey="settingspage.card.export" kwKey="settingspage.card.export.kw">
         <TokenExportCard />
       </SectionGate>
 
       {/* 回收站分区：已删除凭据的恢复 / 永久清除 */}
-      <SectionGate section="trash" title="回收站" keywords={['回收站', '已删除', '清空', '恢复', 'trash']}>
+      <SectionGate section="trash" titleKey="settingspage.card.trash" kwKey="settingspage.card.trash.kw">
         <TrashCard />
       </SectionGate>
 
       {/* 调度分区：负载均衡（立即生效） */}
-      <SectionGate section="scheduling" title="负载均衡模式" keywords={['负载均衡', '优先级模式', '均衡负载', 'priority', 'balanced']}>
+      <SectionGate section="scheduling" titleKey="settingspage.card.loadBalance" kwKey="settingspage.card.loadBalance.kw">
       <Card>
         <CardHeader className="pb-2">
-          <CardTitle className="text-base"><Highlight text="负载均衡模式" /></CardTitle>
+          <CardTitle className="text-base"><Highlight text={t('settingspage.card.loadBalance')} /></CardTitle>
         </CardHeader>
         <CardContent className="space-y-3">
           <p className="text-sm text-muted-foreground">
-            优先级模式：按 priority 顺序使用凭据；均衡负载：在可用凭据间轮换分摊请求。此项保存后立即生效。
+            {t('settingspage.loadBalance.desc')}
           </p>
           <div className="flex gap-2">
             <Button
@@ -1717,19 +1756,19 @@ export function SettingsPage() {
               size="sm"
               onClick={() => set('loadBalancingMode', 'priority')}
             >
-              优先级模式
+              {t('settingspage.loadBalance.priority')}
             </Button>
             <Button
               variant={form.loadBalancingMode === 'balanced' ? 'default' : 'outline'}
               size="sm"
               onClick={() => set('loadBalancingMode', 'balanced')}
             >
-              均衡负载
+              {t('settingspage.loadBalance.balanced')}
             </Button>
           </div>
           <Field
-            label="均衡模式叠加优先级分发"
-            hint="开启后:均衡负载也先按 priority 分层(越小越优先),层内仍按健康/负载均衡,整层打满才溢出到下一层。保存即时生效。"
+            label={t('settingspage.loadBalance.priorityInBalanced.label')}
+            hint={t('settingspage.loadBalance.priorityInBalanced.hint')}
           >
             <Switch
               checked={form.priorityInBalanced}
@@ -1742,19 +1781,18 @@ export function SettingsPage() {
       </SectionGate>
 
       {/* 智能调度分区（余额加权 / RPM headroom / 背压 / 429 感知，全部热更即时生效） */}
-      <SectionGate section="scheduling" title="智能调度" keywords={['余额加权', '智能调度', 'headroom', '预留', '背压', '429', '限速感知', 'balance', 'rpm', '每号 rpm 软上限', '全局 rpm', '入站整形', '入站请求整形', 'rpm 自动挡', 'aimd', '令牌桶', '目标 rpm', '自动挡 rpm 下限', '自动挡 rpm 上限', '突发容量', '排队最长等待', '排队超时放行', '超时放行', '削峰', '整池饱和背压等待', 'rpm 预留名额', '余额权重', '权重下限', '429 降权']}>
+      <SectionGate section="scheduling" titleKey="settingspage.card.smartSchedule" kwKey="settingspage.card.smartSchedule.kw">
       <Card>
         <CardHeader className="pb-2">
-          <CardTitle className="text-base"><Highlight text="智能调度" /></CardTitle>
+          <CardTitle className="text-base"><Highlight text={t('settingspage.card.smartSchedule')} /></CardTitle>
         </CardHeader>
         <CardContent className="py-0">
           <p className="mb-3 mt-1 text-sm text-muted-foreground">
-            均衡模式下的动态分流策略。全部保存后立即生效（热更，无需重启）。默认配置已是良好动态化，
-            按需微调或一键关闭回退纯负载均衡。
+            {t('settingspage.smart.desc')}
           </p>
           <Field
-            label="余额加权分流"
-            hint="开启后:同优先级/同健康/同在途时,按各号剩余额度微调选号——余额多的略多用、少的略少用,长期把号池剩余额度拉平,不让某个号先耗干。软偏置不掀翻在途均分。"
+            label={t('settingspage.smart.balanceWeight.label')}
+            hint={t('settingspage.smart.balanceWeight.hint')}
           >
             <Switch
               checked={form.balanceWeightEnabled}
@@ -1762,8 +1800,8 @@ export function SettingsPage() {
             />
           </Field>
           <Field
-            label="余额加权强度 FLOOR"
-            hint="因子下限(整百分比 0-100)。50=满额号因子1.0、半额0.75、耗尽0.5(差10~20%微调)。越小余额影响越强;100=等于关闭加权。"
+            label={t('settingspage.smart.balanceWeightFloor.label')}
+            hint={t('settingspage.smart.balanceWeightFloor.hint')}
           >
             <NumberStepper
               value={Number(form.balanceWeightFloor) || 0}
@@ -1772,13 +1810,13 @@ export function SettingsPage() {
               max={100}
               step={5}
               className="w-28"
-              aria-label="余额加权 FLOOR"
+              aria-label={t('settingspage.smart.balanceWeightFloor.aria')}
               disabled={!form.balanceWeightEnabled}
             />
           </Field>
           <Field
-            label="429/限速感知降权"
-            hint="开启后:某号冒 429/被上游软限流时,经 EWMA 拉低其健康分→自动少分配给它,恢复后逐步放回。关闭则偶发 429 不影响分流。"
+            label={t('settingspage.smart.health429.label')}
+            hint={t('settingspage.smart.health429.hint')}
           >
             <Switch
               checked={form.health429WeightEnabled}
@@ -1787,8 +1825,8 @@ export function SettingsPage() {
           </Field>
           {/* RPM 相关：行尾齿轮点开「RPM 卡」，含全局软上限 + headroom + 预留 + 背压 */}
           <Field
-            label="RPM headroom 系数"
-            hint="饱和阈值 = 上限 × 系数%(整百分比)。85=预留 15% 缓冲,让分流在撞上游硬限之前提前触发,削弱 60s 滑窗边界爆发。100=不打折(贴硬限)。点齿轮调全局每号 RPM 软上限等。"
+            label={t('settingspage.smart.headroom.label')}
+            hint={t('settingspage.smart.headroom.hint')}
           >
             <div className="flex items-center gap-1.5">
               <NumberStepper
@@ -1798,16 +1836,16 @@ export function SettingsPage() {
                 max={100}
                 step={5}
                 className="w-28"
-                aria-label="RPM headroom 系数"
+                aria-label={t('settingspage.smart.headroom.aria')}
               />
               <SettingGearCard
-                title="RPM 细粒度设置"
-                description="每号 RPM 软上限与饱和预留策略。全局软上限在单号未单独设置时兜底继承。均热更即时生效。"
+                title={t('settingspage.smart.gear.rpmTitle')}
+                description={t('settingspage.smart.gear.rpmDesc')}
               >
                 <SearchContext.Provider value={{ query: '' }}>
                   <Field
-                    label="全局每号 RPM 软上限"
-                    hint="单号未单独设置(=0)时继承此值；此值也为 0 时用内置兜底 30。防单号请求过密撞上游滑窗限。"
+                    label={t('settingspage.smart.credRpm.label')}
+                    hint={t('settingspage.smart.credRpm.hint')}
                   >
                     <NumberStepper
                       value={Number(form.credentialRpmLimit) || 0}
@@ -1816,12 +1854,12 @@ export function SettingsPage() {
                       max={10000}
                       step={5}
                       className="w-28"
-                      aria-label="全局每号 RPM 软上限"
+                      aria-label={t('settingspage.smart.credRpm.aria')}
                     />
                   </Field>
                   <Field
-                    label="RPM headroom 系数"
-                    hint="饱和阈值 = 上限 × 系数%。85=预留 15% 缓冲，提前触发分流削弱滑窗边界爆发。100=贴硬限。"
+                    label={t('settingspage.smart.headroom.label')}
+                    hint={t('settingspage.smart.headroom.hintGear')}
                   >
                     <NumberStepper
                       value={Number(form.rpmHeadroomFactor) || 0}
@@ -1830,12 +1868,12 @@ export function SettingsPage() {
                       max={100}
                       step={5}
                       className="w-28"
-                      aria-label="RPM headroom 系数"
+                      aria-label={t('settingspage.smart.headroom.aria')}
                     />
                   </Field>
                   <Field
-                    label="RPM 预留名额"
-                    hint="在 headroom 折扣后再额外扣掉 N 个名额给突发留固定缓冲。0=不额外预留。与 headroom 叠加。"
+                    label={t('settingspage.smart.reserve.label')}
+                    hint={t('settingspage.smart.reserve.hint')}
                   >
                     <NumberStepper
                       value={Number(form.rpmReserveSlots) || 0}
@@ -1843,12 +1881,12 @@ export function SettingsPage() {
                       min={0}
                       max={1000}
                       className="w-28"
-                      aria-label="RPM 预留名额"
+                      aria-label={t('settingspage.smart.reserve.aria')}
                     />
                   </Field>
                   <Field
-                    label="整池饱和背压等待"
-                    hint="⚠️进阶：整池 RPM 全饱和时，选号在网关内等待最短恢复窗口而非立即回退软门。默认关。"
+                    label={t('settingspage.smart.hardGate.label')}
+                    hint={t('settingspage.smart.hardGate.hintGear')}
                   >
                     <Switch
                       checked={form.rpmHardGateOverloadWait}
@@ -1858,34 +1896,36 @@ export function SettingsPage() {
                 </SearchContext.Provider>
               </SettingGearCard>
               <SettingGearCard
-                title={`入站请求整形 / RPM 自动挡（当前 ${config?.inboundCurrentRpm ?? '—'} RPM）`}
-                description="在网关入口用令牌桶把突发削平成受控 RPM，让号不被上游打爆（治 429 雪崩）。自动挡按上游反馈动态升降速率。均热更即时生效。"
+                title={t('settingspage.smart.gear.inboundTitle', {
+                  rpm: config?.inboundCurrentRpm ?? emDash,
+                })}
+                description={t('settingspage.smart.gear.inboundDesc')}
               >
                 <SearchContext.Provider value={{ query: '' }}>
-                  <Field label="启用入站整形" hint="开=请求进上游前先过全局令牌桶，突发被排队削平；关=不限速直发（易被上游 429）。">
+                  <Field label={t('settingspage.smart.inboundEnabled.label')} hint={t('settingspage.smart.inboundEnabled.hint')}>
                     <Switch checked={form.inboundThrottleEnabled} onCheckedChange={(v) => set('inboundThrottleEnabled', v)} />
                   </Field>
-                  <Field label="RPM 自动挡" hint="开=AIMD 动态调速率（无 429 加速/收 429 砍半），自动收敛到上游不限流的最高速；关=固定用目标 RPM（手动挡）。">
+                  <Field label={t('settingspage.smart.inboundAuto.label')} hint={t('settingspage.smart.inboundAuto.hint')}>
                     <Switch checked={form.inboundRpmAuto} onCheckedChange={(v) => set('inboundRpmAuto', v)} />
                   </Field>
-                  <Field label="目标 RPM（初值/手动挡固定值）" hint="自动挡：作为起点，之后动态调整；手动挡：固定用此值。">
-                    <NumberStepper value={Number(form.inboundTargetRpm) || 0} onChange={(v) => set('inboundTargetRpm', String(v))} min={1} max={10000} step={10} className="w-28" aria-label="目标 RPM" />
+                  <Field label={t('settingspage.smart.targetRpm.label')} hint={t('settingspage.smart.targetRpm.hint')}>
+                    <NumberStepper value={Number(form.inboundTargetRpm) || 0} onChange={(v) => set('inboundTargetRpm', String(v))} min={1} max={10000} step={10} className="w-28" aria-label={t('settingspage.smart.targetRpm.aria')} />
                   </Field>
-                  <Field label="自动挡 RPM 下限" hint="乘性降档不低于此。">
-                    <NumberStepper value={Number(form.inboundRpmMin) || 0} onChange={(v) => set('inboundRpmMin', String(v))} min={1} max={10000} step={5} className="w-28" aria-label="RPM 下限" />
+                  <Field label={t('settingspage.smart.inboundMin.label')} hint={t('settingspage.smart.inboundMin.hint')}>
+                    <NumberStepper value={Number(form.inboundRpmMin) || 0} onChange={(v) => set('inboundRpmMin', String(v))} min={1} max={10000} step={5} className="w-28" aria-label={t('settingspage.smart.inboundMin.aria')} />
                   </Field>
-                  <Field label="自动挡 RPM 上限" hint="加性升档不超过此。加号后可调高。">
-                    <NumberStepper value={Number(form.inboundRpmMax) || 0} onChange={(v) => set('inboundRpmMax', String(v))} min={1} max={10000} step={10} className="w-28" aria-label="RPM 上限" />
+                  <Field label={t('settingspage.smart.inboundMax.label')} hint={t('settingspage.smart.inboundMax.hint')}>
+                    <NumberStepper value={Number(form.inboundRpmMax) || 0} onChange={(v) => set('inboundRpmMax', String(v))} min={1} max={10000} step={10} className="w-28" aria-label={t('settingspage.smart.inboundMax.aria')} />
                   </Field>
-                  <Field label="令牌桶突发容量（秒）" hint="允许短时小突发不排队。越大越宽松。默认 2。">
-                    <NumberStepper value={Number(form.inboundBurstSecs) || 0} onChange={(v) => set('inboundBurstSecs', String(v))} min={1} max={60} className="w-28" aria-label="突发容量秒" />
+                  <Field label={t('settingspage.smart.burstSecs.label')} hint={t('settingspage.smart.burstSecs.hint')}>
+                    <NumberStepper value={Number(form.inboundBurstSecs) || 0} onChange={(v) => set('inboundBurstSecs', String(v))} min={1} max={60} className="w-28" aria-label={t('settingspage.smart.burstSecs.aria')} />
                   </Field>
-                  <Field label="排队最长等待（秒）" hint="排队超此时长后按下方「超时放行」决定放行或返回 429。默认 30。">
-                    <NumberStepper value={Number(form.inboundQueueMaxWaitSecs) || 0} onChange={(v) => set('inboundQueueMaxWaitSecs', String(v))} min={1} max={300} step={5} className="w-28" aria-label="排队最长等待秒" />
+                  <Field label={t('settingspage.smart.queueWait.label')} hint={t('settingspage.smart.queueWait.hint')}>
+                    <NumberStepper value={Number(form.inboundQueueMaxWaitSecs) || 0} onChange={(v) => set('inboundQueueMaxWaitSecs', String(v))} min={1} max={300} step={5} className="w-28" aria-label={t('settingspage.smart.queueWait.aria')} />
                   </Field>
                   <Field
-                    label="排队超时放行"
-                    hint="排队超时后：开=直接放行去打上游（单号/高 RPM 推荐，避免请求被网关卡死超时=不流通，最坏退化成不限速）；关=返回 429+Retry-After 让客户端退避（多号池/需严格保护上游时用）。默认开。"
+                    label={t('settingspage.smart.queueTimeout.label')}
+                    hint={t('settingspage.smart.queueTimeout.hint')}
                   >
                     <Switch checked={form.inboundQueueTimeoutPassthrough} onCheckedChange={(v) => set('inboundQueueTimeoutPassthrough', v)} />
                   </Field>
@@ -1894,8 +1934,8 @@ export function SettingsPage() {
             </div>
           </Field>
           <Field
-            label="RPM 预留名额"
-            hint="在 headroom 折扣后再额外扣掉 N 个名额给突发留固定缓冲。0=不额外预留。与 headroom 叠加。"
+            label={t('settingspage.smart.reserve.label')}
+            hint={t('settingspage.smart.reserve.hint')}
           >
             <NumberStepper
               value={Number(form.rpmReserveSlots) || 0}
@@ -1903,12 +1943,12 @@ export function SettingsPage() {
               min={0}
               max={1000}
               className="w-28"
-              aria-label="RPM 预留名额"
+              aria-label={t('settingspage.smart.reserve.aria')}
             />
           </Field>
           <Field
-            label="整池饱和背压等待"
-            hint="⚠️进阶:开启后当整池 RPM 全饱和时,选号会在网关内等待最短恢复窗口而非立即回退软门。默认关(回退软门选最不坏的号继续,不阻塞)。"
+            label={t('settingspage.smart.hardGate.label')}
+            hint={t('settingspage.smart.hardGate.hint')}
           >
             <Switch
               checked={form.rpmHardGateOverloadWait}
@@ -1920,130 +1960,130 @@ export function SettingsPage() {
       </SectionGate>
 
       {/* 基础分区：服务信息（需重启） */}
-      <SectionGate section="basic" title="服务信息" keywords={['监听地址', 'host', '端口', 'port', '区域', 'region', 'tls 后端', 'rustls', '默认 endpoint', '配置文件']}>
+      <SectionGate section="basic" titleKey="settingspage.card.serviceInfo" kwKey="settingspage.card.serviceInfo.kw">
       <Card>
         <CardHeader className="pb-2">
-          <CardTitle className="text-base"><Highlight text="服务信息" /></CardTitle>
+          <CardTitle className="text-base"><Highlight text={t('settingspage.card.serviceInfo')} /></CardTitle>
         </CardHeader>
         <CardContent className="py-0">
-          <Field label="监听地址 host" hint="需重启生效">
+          <Field label={t('settingspage.basic.host.label')} hint={restart}>
             <Input className={inputCls} value={form.host} onChange={(e) => set('host', e.target.value)} />
           </Field>
-          <Field label="端口 port" hint="需重启生效">
-            <NumberStepper value={Number(form.port) || 0} onChange={(v) => set('port', String(v))} min={1} max={65535} className="w-28" aria-label="端口" />
+          <Field label={t('settingspage.basic.port.label')} hint={restart}>
+            <NumberStepper value={Number(form.port) || 0} onChange={(v) => set('port', String(v))} min={1} max={65535} className="w-28" aria-label={t('settingspage.basic.port.aria')} />
           </Field>
-          <Field label="区域 region" hint="需重启生效">
+          <Field label={t('settingspage.basic.region.label')} hint={restart}>
             <div className="w-[260px]">
               <RegionSelect value={form.region} onChange={(v) => set('region', v)} />
             </div>
           </Field>
           {/* TLS 后端固定为 rustls：出厂构建纯 rustls（见 build.bat / release.yml），
               native-tls 已废弃（曾误导用户切换后废网关）。仅作只读展示，不再可切换。 */}
-          <ReadonlyRow label="TLS 后端" value="rustls（内置 webpki + 系统根证书）" />
-          <Field label="默认 endpoint" hint={`可用：${config.endpointNames.join(', ') || '—'}（需重启生效）`}>
+          <ReadonlyRow label={t('settingspage.basic.tlsBackend')} value={t('settingspage.basic.tlsBackendValue')} />
+          <Field label={t('settingspage.basic.defaultEndpoint.label')} hint={t('settingspage.basic.defaultEndpoint.hint', { names: config.endpointNames.join(', ') || emDash })}>
             <Input className={inputCls} value={form.defaultEndpoint} onChange={(e) => set('defaultEndpoint', e.target.value)} />
           </Field>
-          {config.configPath && <ReadonlyRow label="配置文件" value={config.configPath} mono />}
+          {config.configPath && <ReadonlyRow label={t('settingspage.basic.configPath')} value={config.configPath} mono />}
         </CardContent>
       </Card>
       </SectionGate>
 
       {/* 基础分区：客户端伪装（需重启） */}
-      <SectionGate section="basic" title="客户端伪装" keywords={['kiro 版本', '系统版本', 'node 版本', '伪装', '版本号']}>
+      <SectionGate section="basic" titleKey="settingspage.card.clientSpoof" kwKey="settingspage.card.clientSpoof.kw">
       <Card>
         <CardHeader className="pb-2">
-          <CardTitle className="text-base"><Highlight text="客户端伪装" /></CardTitle>
+          <CardTitle className="text-base"><Highlight text={t('settingspage.card.clientSpoof')} /></CardTitle>
         </CardHeader>
         <CardContent className="py-0">
-          <Field label="Kiro 版本" hint="可选预设或自定义（需重启生效）">
-            <ComboInput className={inputCls} value={form.kiroVersion} onChange={(v) => set('kiroVersion', v)} options={KIRO_VERSION_PRESETS} aria-label="Kiro 版本" />
+          <Field label={t('settingspage.spoof.kiro.label')} hint={presetRestart}>
+            <ComboInput className={inputCls} value={form.kiroVersion} onChange={(v) => set('kiroVersion', v)} options={KIRO_VERSION_PRESETS} aria-label={t('settingspage.spoof.kiro.aria')} />
           </Field>
-          <Field label="系统版本" hint="可选预设或自定义（需重启生效）">
-            <ComboInput className={inputCls} value={form.systemVersion} onChange={(v) => set('systemVersion', v)} options={SYSTEM_VERSION_PRESETS} aria-label="系统版本" />
+          <Field label={t('settingspage.spoof.system.label')} hint={presetRestart}>
+            <ComboInput className={inputCls} value={form.systemVersion} onChange={(v) => set('systemVersion', v)} options={SYSTEM_VERSION_PRESETS} aria-label={t('settingspage.spoof.system.aria')} />
           </Field>
-          <Field label="Node 版本" hint="可选预设或自定义（需重启生效）">
-            <ComboInput className={inputCls} value={form.nodeVersion} onChange={(v) => set('nodeVersion', v)} options={NODE_VERSION_PRESETS} aria-label="Node 版本" />
+          <Field label={t('settingspage.spoof.node.label')} hint={presetRestart}>
+            <ComboInput className={inputCls} value={form.nodeVersion} onChange={(v) => set('nodeVersion', v)} options={NODE_VERSION_PRESETS} aria-label={t('settingspage.spoof.node.aria')} />
           </Field>
         </CardContent>
       </Card>
       </SectionGate>
 
-      <SectionGate section="basic" title="协议与转发" keywords={['提取 thinking', 'thinking', 'claude code 自动切协议', 'cc_auto_buffer', '缓冲分发', '剥离环境噪音', 'env', 'git', '省 token', '缓存']}>
+      <SectionGate section="basic" titleKey="settingspage.card.protocol" kwKey="settingspage.card.protocol.kw">
       <Card>
         <CardHeader className="pb-2">
-          <CardTitle className="text-base"><Highlight text="协议与转发" /></CardTitle>
+          <CardTitle className="text-base"><Highlight text={t('settingspage.card.protocol')} /></CardTitle>
         </CardHeader>
         <CardContent className="py-0">
-          <Field label="提取 thinking" hint="非流式响应解析 thinking 块（保存即时生效，无需重启）">
+          <Field label={t('settingspage.protocol.extractThinking.label')} hint={`${t('settingspage.protocol.extractThinking.hint')}${hotParen}`}>
             <Switch checked={form.extractThinking} onCheckedChange={(v) => set('extractThinking', v)} />
           </Field>
-          <Field label="Claude Code 自动切协议" hint="识别到 Claude Code 请求时，/v1 流式自动走缓冲分发（准确 input_tokens，等价 /cc/v1），CC 无需手动改端点（保存即时生效，无需重启）">
+          <Field label={t('settingspage.protocol.ccAuto.label')} hint={`${t('settingspage.protocol.ccAuto.hint')}${hotParen}`}>
             <Switch checked={form.ccAutoBuffer} onCheckedChange={(v) => set('ccAutoBuffer', v)} />
           </Field>
-          <Field label="剥离环境噪音" hint="转发前剥离 system 里每请求漂移的 env/git/模型名等噪音，省 token 提缓存降关联（保存即时生效，无需重启）">
+          <Field label={t('settingspage.protocol.stripEnv.label')} hint={`${t('settingspage.protocol.stripEnv.hint')}${hotParen}`}>
             <Switch checked={form.stripEnvNoise} onCheckedChange={(v) => set('stripEnvNoise', v)} />
           </Field>
         </CardContent>
       </Card>
       </SectionGate>
 
-      <SectionGate section="basic" title="工具调用容错" keywords={['invalid tool parameters', '工具拼装非法', '工具错误', '失败态对齐', 'json 修复', '修复层', '修非法转义', '清洗泄漏控制 token', '截断跨轮恢复', '工具描述字符上限', 'tool_repair', 'tool_truncation']}>
+      <SectionGate section="basic" titleKey="settingspage.card.toolFault" kwKey="settingspage.card.toolFault.kw">
       <Card>
         <CardHeader className="pb-2">
-          <CardTitle className="text-base"><Highlight text="工具调用容错" /></CardTitle>
-          <p className="text-xs text-muted-foreground">缓解 / 根治 Claude Code 的 Invalid tool parameters，均热更即时生效。</p>
+          <CardTitle className="text-base"><Highlight text={t('settingspage.card.toolFault')} /></CardTitle>
+          <p className="text-xs text-muted-foreground">{t('settingspage.tool.cardSubtitle')}</p>
         </CardHeader>
         <CardContent className="py-0">
-          <Field label="JSON 修复层（根治 Invalid tool parameters）" hint="工具参数非法 JSON 时先尝试修成合法（转义非法反斜杠/裸控制符、补全截断），修复后强制复验通过才发。只在 JSON 已非法时介入、对正常流零影响，故默认开。客户端不再报 Invalid tool parameters">
+          <Field label={t('settingspage.tool.repairJson.label')} hint={t('settingspage.tool.repairJson.hint')}>
             <Switch checked={form.toolRepairJson} onCheckedChange={(v) => set('toolRepairJson', v)} />
           </Field>
-          <Field label="工具拼装非法对齐失败态" hint="流式工具调用参数拼成非法 JSON 时置失败态（与非流式一致，不再静默记成功），便于客户端感知重试。默认开，绝不连坐号">
+          <Field label={t('settingspage.tool.streamAlign.label')} hint={t('settingspage.tool.streamAlign.hint')}>
             <Switch checked={form.toolStreamAlignFailure} onCheckedChange={(v) => set('toolStreamAlignFailure', v)} />
           </Field>
-          <Field label="工具错误如实暴露客户端" hint="工具参数拼装非法且修复层修不好时不发坏 JSON，改发明确 SSE error 让客户端退避重试（与上一项配对）。默认开">
+          <Field label={t('settingspage.tool.exposeError.label')} hint={t('settingspage.tool.exposeError.hint')}>
             <Switch checked={form.toolExposeErrorToClient} onCheckedChange={(v) => set('toolExposeErrorToClient', v)} />
           </Field>
-          <Field label="清洗泄漏控制 token" hint="清洗模型泄漏进文本行首的控制 token（course/課/count/care 粘连），保守只剥行首粘连不误删正文。默认开">
+          <Field label={t('settingspage.tool.cleanLeaked.label')} hint={t('settingspage.tool.cleanLeaked.hint')}>
             <Switch checked={form.toolCleanLeakedTokens} onCheckedChange={(v) => set('toolCleanLeakedTokens', v)} />
           </Field>
-          <Field label="文本化 invoke 重组（根治 court/Invalid tool parameters）" hint="模型把工具调用吐成 <invoke> 文本时，在四道安全门内（行首+非代码围栏+工具名已声明+完整闭合）重组为结构化 tool_use；修不了的碎片/截断安全当文本放过。移植 ZyphrZero 生产方案。默认开">
+          <Field label={t('settingspage.tool.reclaim.label')} hint={t('settingspage.tool.reclaim.hint')}>
             <Switch checked={form.toolReclaimTextifiedInvoke} onCheckedChange={(v) => set('toolReclaimTextifiedInvoke', v)} />
           </Field>
-          <Field label="stray token 复读熔断" hint="call/count/card/court 连续独占行复读超阈值（32）截断本轮文本，治 Opus 退化刷屏耗尽 max_tokens + 污染历史。默认开">
+          <Field label={t('settingspage.tool.strayGuard.label')} hint={t('settingspage.tool.strayGuard.hint')}>
             <Switch checked={form.toolStrayRepeatGuard} onCheckedChange={(v) => set('toolStrayRepeatGuard', v)} />
           </Field>
-          <Field label="截断跨轮恢复" hint="工具参数被上游真截断（缺整段值）且修复层也补不回时，不发半截参数，改置失败态让客户端重试整轮。会把截断从「发半截」变成「整轮失败重试」，改变对话流程，故默认关">
+          <Field label={t('settingspage.tool.truncation.label')} hint={t('settingspage.tool.truncation.hint')}>
             <Switch checked={form.toolTruncationRecovery} onCheckedChange={(v) => set('toolTruncationRecovery', v)} />
           </Field>
-          <Field label="工具描述字符上限" hint="入站工具顶层 description 超此长度按字符边界安全截断（省 token、避开上游单工具描述隐性上限），schema 内嵌描述取此值 1/5。默认 10000，设 0 表示不截断">
-            <NumberStepper value={Number(form.toolDescriptionMaxChars) || 0} onChange={(v) => set('toolDescriptionMaxChars', String(v))} min={0} step={1000} className="w-32" aria-label="工具描述字符上限" />
+          <Field label={t('settingspage.tool.descMax.label')} hint={t('settingspage.tool.descMax.hint')}>
+            <NumberStepper value={Number(form.toolDescriptionMaxChars) || 0} onChange={(v) => set('toolDescriptionMaxChars', String(v))} min={0} step={1000} className="w-32" aria-label={t('settingspage.tool.descMax.aria')} />
           </Field>
         </CardContent>
       </Card>
       </SectionGate>
 
       {/* 调度分区：防关联 / 限流（需重启） */}
-      <SectionGate section="scheduling" title="防关联 / 限流" keywords={['冷却机制', '速率限制', '每日上限', '最小请求间隔', '会话亲和性', 'affinity', '全池冷却快速失败', '全池冷却', 'fast-fail', '冷却时长缩放', '启用冷却机制', '启用速率限制', '间隔抖动', '拟人节奏', 'retry-after', '客户端退避']}>
+      <SectionGate section="scheduling" titleKey="settingspage.card.antiAssoc" kwKey="settingspage.card.antiAssoc.kw">
       <Card>
         <CardHeader className="pb-2">
-          <CardTitle className="text-base"><Highlight text="防关联 / 限流" /></CardTitle>
+          <CardTitle className="text-base"><Highlight text={t('settingspage.card.antiAssoc')} /></CardTitle>
         </CardHeader>
         <CardContent className="py-0">
           {/* 冷却机制：行尾齿轮点开「冷却卡」做细粒度设置 */}
-          <Field label="冷却机制" hint="失败后短暂跳过该凭据（保存即时生效，无需重启）。点齿轮调冷却时长缩放。">
+          <Field label={t('settingspage.anti.cooldown.label')} hint={`${t('settingspage.anti.cooldown.hint')}${hotParen}`}>
             <div className="flex items-center gap-1.5">
               <Switch checked={form.cooldownEnabled} onCheckedChange={(v) => set('cooldownEnabled', v)} />
               <SettingGearCard
-                title="冷却设置"
-                description="失败后短暂跳过该凭据，避开风控。冷却时长缩放让重试节奏更激进或更保守。均热更即时生效。"
+                title={t('settingspage.anti.gear.cooldownTitle')}
+                description={t('settingspage.anti.gear.cooldownDesc')}
               >
                 <SearchContext.Provider value={{ query: '' }}>
-                  <Field label="启用冷却机制" hint="失败后短暂跳过该凭据（保存即时生效，无需重启）">
+                  <Field label={t('settingspage.anti.cooldownEnabled.label')} hint={`${t('settingspage.anti.cooldownEnabled.hint')}${hotParen}`}>
                     <Switch checked={form.cooldownEnabled} onCheckedChange={(v) => set('cooldownEnabled', v)} />
                   </Field>
                   <Field
-                    label="冷却时长缩放 (%)"
-                    hint="缩放可恢复的短冷却时长。<100 更激进快重试（省吞吐但更易撞风控），>100 更保守防封。100=原时长。"
+                    label={t('settingspage.anti.cooldownScale.label')}
+                    hint={t('settingspage.anti.cooldownScale.hint')}
                   >
                     <NumberStepper
                       value={Number(form.cooldownScalePct) || 0}
@@ -2053,7 +2093,7 @@ export function SettingsPage() {
                       step={10}
                       className="w-28"
                       disabled={!form.cooldownEnabled}
-                      aria-label="冷却时长缩放百分比"
+                      aria-label={t('settingspage.anti.cooldownScale.aria')}
                     />
                   </Field>
                 </SearchContext.Provider>
@@ -2062,32 +2102,32 @@ export function SettingsPage() {
           </Field>
           {/* 全池冷却快速失败：全池都在冷却时立即 429 让客户端退避，还是网关内短等重试 */}
           <Field
-            label="全池冷却快速失败"
-            hint="全部凭据都在冷却时：开=立即返回 429+Retry-After 让客户端退避（多号池更合适）；关=网关内短等到有号恢复再重试（单号/小池更平滑，避免频繁 429）。保存即时生效，无需重启。"
+            label={t('settingspage.anti.allCooling.label')}
+            hint={`${t('settingspage.anti.allCooling.hint')}${hotParen}`}
           >
             <Switch checked={form.allCoolingFastFail} onCheckedChange={(v) => set('allCoolingFastFail', v)} />
           </Field>
           {/* 速率限制：行尾齿轮点开「速率卡」做细粒度设置 */}
-          <Field label="速率限制" hint="拟人节奏：每日上限 + 请求间隔 + 间隔抖动（保存即时生效，无需重启）。点齿轮细调。">
+          <Field label={t('settingspage.anti.rateLimit.label')} hint={`${t('settingspage.anti.rateLimit.hint')}${hotParen}`}>
             <div className="flex items-center gap-1.5">
               <Switch checked={form.rateLimitEnabled} onCheckedChange={(v) => set('rateLimitEnabled', v)} />
               <SettingGearCard
-                title="速率限制设置"
-                description="拟人节奏，降低账号关联/风控风险。每日上限 + 最小请求间隔 + 间隔抖动。均热更即时生效。"
+                title={t('settingspage.anti.gear.rateTitle')}
+                description={t('settingspage.anti.gear.rateDesc')}
               >
                 <SearchContext.Provider value={{ query: '' }}>
-                  <Field label="启用速率限制" hint="拟人节奏：每日上限 + 请求间隔（保存即时生效，无需重启）">
+                  <Field label={t('settingspage.anti.rateLimitEnabled.label')} hint={`${t('settingspage.anti.rateLimitEnabled.hint')}${hotParen}`}>
                     <Switch checked={form.rateLimitEnabled} onCheckedChange={(v) => set('rateLimitEnabled', v)} />
                   </Field>
-                  <Field label="每日上限" hint="0 表示无限制（保存即时生效，无需重启）">
-                    <NumberStepper value={Number(form.rateLimitDailyMax) || 0} onChange={(v) => set('rateLimitDailyMax', String(v))} min={0} step={10} className="w-28" disabled={!form.rateLimitEnabled} aria-label="每日上限" />
+                  <Field label={t('settingspage.anti.dailyMax.label')} hint={`${t('settingspage.anti.dailyMax.hint')}${hotParen}`}>
+                    <NumberStepper value={Number(form.rateLimitDailyMax) || 0} onChange={(v) => set('rateLimitDailyMax', String(v))} min={0} step={10} className="w-28" disabled={!form.rateLimitEnabled} aria-label={t('settingspage.anti.dailyMax.aria')} />
                   </Field>
-                  <Field label="最小请求间隔 (ms)" hint="保存即时生效，无需重启">
-                    <NumberStepper value={Number(form.rateLimitMinIntervalMs) || 0} onChange={(v) => set('rateLimitMinIntervalMs', String(v))} min={0} step={100} className="w-28" disabled={!form.rateLimitEnabled} aria-label="最小请求间隔" />
+                  <Field label={t('settingspage.anti.minInterval.label')} hint={hot}>
+                    <NumberStepper value={Number(form.rateLimitMinIntervalMs) || 0} onChange={(v) => set('rateLimitMinIntervalMs', String(v))} min={0} step={100} className="w-28" disabled={!form.rateLimitEnabled} aria-label={t('settingspage.anti.minInterval.aria')} />
                   </Field>
                   <Field
-                    label="间隔抖动 (%)"
-                    hint="在最小请求间隔上叠加随机抖动，让节奏更像人（0-50）。0=固定间隔（更机械）。"
+                    label={t('settingspage.anti.jitter.label')}
+                    hint={t('settingspage.anti.jitter.hint')}
                   >
                     <NumberStepper
                       value={Number(form.rateLimitJitterPct) || 0}
@@ -2097,20 +2137,20 @@ export function SettingsPage() {
                       step={5}
                       className="w-28"
                       disabled={!form.rateLimitEnabled}
-                      aria-label="间隔抖动百分比"
+                      aria-label={t('settingspage.anti.jitter.aria')}
                     />
                   </Field>
                 </SearchContext.Provider>
               </SettingGearCard>
             </div>
           </Field>
-          <Field label="每日上限" hint="0 表示无限制（保存即时生效，无需重启）">
-            <NumberStepper value={Number(form.rateLimitDailyMax) || 0} onChange={(v) => set('rateLimitDailyMax', String(v))} min={0} step={10} className="w-28" disabled={!form.rateLimitEnabled} aria-label="每日上限" />
+          <Field label={t('settingspage.anti.dailyMax.label')} hint={`${t('settingspage.anti.dailyMax.hint')}${hotParen}`}>
+            <NumberStepper value={Number(form.rateLimitDailyMax) || 0} onChange={(v) => set('rateLimitDailyMax', String(v))} min={0} step={10} className="w-28" disabled={!form.rateLimitEnabled} aria-label={t('settingspage.anti.dailyMax.aria')} />
           </Field>
-          <Field label="最小请求间隔 (ms)" hint="保存即时生效，无需重启">
-            <NumberStepper value={Number(form.rateLimitMinIntervalMs) || 0} onChange={(v) => set('rateLimitMinIntervalMs', String(v))} min={0} step={100} className="w-28" disabled={!form.rateLimitEnabled} aria-label="最小请求间隔" />
+          <Field label={t('settingspage.anti.minInterval.label')} hint={hot}>
+            <NumberStepper value={Number(form.rateLimitMinIntervalMs) || 0} onChange={(v) => set('rateLimitMinIntervalMs', String(v))} min={0} step={100} className="w-28" disabled={!form.rateLimitEnabled} aria-label={t('settingspage.anti.minInterval.aria')} />
           </Field>
-          <Field label="会话亲和性" hint="同一会话尽量复用同一凭据（保存即时生效，无需重启）">
+          <Field label={t('settingspage.anti.affinity.label')} hint={`${t('settingspage.anti.affinity.hint')}${hotParen}`}>
             <Switch checked={form.affinityEnabled} onCheckedChange={(v) => set('affinityEnabled', v)} />
           </Field>
         </CardContent>
@@ -2118,42 +2158,42 @@ export function SettingsPage() {
       </SectionGate>
 
       {/* 基础分区：网络与上号（需重启） */}
-      <SectionGate section="basic" title="网络与上号" keywords={['全局代理', 'proxy', '上号回调地址', 'callback', '回调模式', 'admin key']}>
+      <SectionGate section="basic" titleKey="settingspage.card.network" kwKey="settingspage.card.network.kw">
       <Card>
         <CardHeader className="pb-2">
-          <CardTitle className="text-base"><Highlight text="网络与上号" /></CardTitle>
+          <CardTitle className="text-base"><Highlight text={t('settingspage.card.network')} /></CardTitle>
         </CardHeader>
         <CardContent className="py-0">
-          <Field label="全局代理" hint="http(s)://host:port 或 socks5://host:port，留空清除（需重启生效）">
+          <Field label={t('settingspage.network.proxy.label')} hint={t('settingspage.network.proxy.hint')}>
             <div className="flex items-center gap-2">
-              <Input className="max-w-[260px] font-mono text-xs" value={form.proxyUrl} onChange={(e) => set('proxyUrl', e.target.value)} placeholder="未配置" />
+              <Input className="max-w-[260px] font-mono text-xs" value={form.proxyUrl} onChange={(e) => set('proxyUrl', e.target.value)} placeholder={t('settingspage.network.proxy.ph')} />
               <ProxyTestButton proxyUrl={form.proxyUrl} proxyUsername={form.proxyUsername} proxyPassword={form.proxyPassword} />
             </div>
           </Field>
-          <Field label="代理用户名" hint="需认证的代理才填。留空=不修改（后端出于安全不回显已存值，需重启生效）">
-            <Input className="max-w-[260px] font-mono text-xs" value={form.proxyUsername} onChange={(e) => set('proxyUsername', e.target.value)} placeholder="留空不改" autoComplete="off" />
+          <Field label={t('settingspage.network.proxyUser.label')} hint={t('settingspage.network.proxyUser.hint')}>
+            <Input className="max-w-[260px] font-mono text-xs" value={form.proxyUsername} onChange={(e) => set('proxyUsername', e.target.value)} placeholder={t('settingspage.network.proxyUser.ph')} autoComplete="off" />
           </Field>
-          <Field label="代理密码" hint="需认证的代理才填。留空=不修改（后端出于安全不回显，需重启生效）">
-            <Input type="password" className="max-w-[260px] font-mono text-xs" value={form.proxyPassword} onChange={(e) => set('proxyPassword', e.target.value)} placeholder="留空不改" autoComplete="new-password" />
+          <Field label={t('settingspage.network.proxyPass.label')} hint={t('settingspage.network.proxyPass.hint')}>
+            <Input type="password" className="max-w-[260px] font-mono text-xs" value={form.proxyPassword} onChange={(e) => set('proxyPassword', e.target.value)} placeholder={t('settingspage.network.proxyPass.ph')} autoComplete="new-password" />
           </Field>
           <Field
-            label="上号回调地址"
-            hint="远程模式：浏览器回调打到此地址。服务器部署必须配置，否则远程浏览器上号失败。留空回退本地模式（需重启生效）"
+            label={t('settingspage.network.callback.label')}
+            hint={t('settingspage.network.callback.hint')}
           >
             <Input className="max-w-[260px] font-mono text-xs" value={form.callbackBaseUrl} onChange={(e) => set('callbackBaseUrl', e.target.value)} placeholder="http://host:port" />
           </Field>
           <ReadonlyRow
-            label="当前回调模式"
+            label={t('settingspage.network.callbackMode')}
             value={
               <Badge variant="outline">
-                {config.callbackMode === 'remote' ? '远程（公网回调）' : '本地（临时端口）'}
+                {config.callbackMode === 'remote' ? t('settingspage.network.callbackModeRemote') : t('settingspage.network.callbackModeLocal')}
               </Badge>
             }
           />
-          <ReadonlyRow label="Admin Key" value={<Badge variant={config.hasAdminKey ? 'default' : 'secondary'}>{config.hasAdminKey ? '已设置' : '未设置'}</Badge>} />
+          <ReadonlyRow label={t('settingspage.network.adminKey')} value={<Badge variant={config.hasAdminKey ? 'default' : 'secondary'}>{config.hasAdminKey ? t('settingspage.common.set') : t('settingspage.common.unset')}</Badge>} />
           <Field
-            label="userKey（对话 API Key）"
-            hint="下游客户端连网关用的 x-api-key。出于安全不回显现值：留空=不改，填写=更新。⚠️需重启服务生效。"
+            label={t('settingspage.network.apiKey.label')}
+            hint={t('settingspage.network.apiKey.hint')}
           >
             <div className="flex items-center gap-2">
               <Input
@@ -2161,11 +2201,11 @@ export function SettingsPage() {
                 className="flex-1 min-w-0 max-w-[260px] font-mono text-xs"
                 value={form.apiKey}
                 onChange={(e) => set('apiKey', e.target.value)}
-                placeholder={config.hasApiKey ? '已设置，留空不改' : '未设置，填写以设定'}
+                placeholder={config.hasApiKey ? t('settingspage.network.apiKey.phSet') : t('settingspage.network.apiKey.phUnset')}
                 autoComplete="new-password"
               />
               <Badge variant={config.hasApiKey ? 'default' : 'secondary'} className="shrink-0 whitespace-nowrap">
-                {config.hasApiKey ? '已设置' : '未设置'}
+                {config.hasApiKey ? t('settingspage.common.set') : t('settingspage.common.unset')}
               </Badge>
             </div>
           </Field>
@@ -2174,24 +2214,24 @@ export function SettingsPage() {
       </SectionGate>
 
       {/* 基础分区：登录页背景（立即生效，无需重启） */}
-      <SectionGate section="basic" title="登录页背景" keywords={['登录背景图', '登录页背景', '背景图', 'r18', '图源', 'lolicon', '关闭登录背景图']}>
+      <SectionGate section="basic" titleKey="settingspage.card.loginBg" kwKey="settingspage.card.loginBg.kw">
       <Card>
         <CardHeader className="pb-2">
           <CardTitle className="text-base flex items-center gap-2">
             <ImageIcon className="h-4 w-4 text-muted-foreground" />
-            <Highlight text="登录页背景" />
+            <Highlight text={t('settingspage.card.loginBg')} />
           </CardTitle>
         </CardHeader>
         <CardContent className="py-0">
           <Field
-            label="显示登录背景图"
-            hint="开启：登录页显示随机背景图；关闭：改用纯渐变背景，不再请求外部图源（保存即时生效，无需重启）"
+            label={t('settingspage.loginBg.enabled.label')}
+            hint={`${t('settingspage.loginBg.enabled.hint')}${hotParen}`}
           >
             <Switch checked={form.loginBackgroundEnabled} onCheckedChange={(v) => set('loginBackgroundEnabled', v)} />
           </Field>
           <Field
-            label="R18 图源"
-            hint="开启：背景图走 R18 图源（r18=1）；关闭：走全年龄图源（r18=0）。仅在显示背景图开启时有意义（保存即时生效，下一轮预取按新参数取图）"
+            label={t('settingspage.loginBg.r18.label')}
+            hint={t('settingspage.loginBg.r18.hint')}
           >
             <Switch
               checked={form.loginBackgroundR18}
@@ -2204,15 +2244,15 @@ export function SettingsPage() {
       </SectionGate>
 
       {/* 安全分区：反代安全（需重启） */}
-      <SectionGate section="security" title="反代安全" keywords={['cors 允许来源', 'ip 白名单', 'cidr', '信任 x-forwarded-for', 'xff', '入口限流', '请求体上限', '413', '429']}>
+      <SectionGate section="security" titleKey="settingspage.card.security" kwKey="settingspage.card.security.kw">
       <Card>
         <CardHeader className="pb-2">
-          <CardTitle className="text-base"><Highlight text="反代安全" /></CardTitle>
+          <CardTitle className="text-base"><Highlight text={t('settingspage.card.security')} /></CardTitle>
         </CardHeader>
         <CardContent className="py-0">
           <Field
-            label="凭据落盘加密"
-            hint="开启后 credentials.json / trash.json 用机器绑定密钥加密落盘（XChaCha20-Poly1305）。防文件被拷走/误传泄露 token。保存即时生效并立即重写文件；导出/导入走明文不受影响。⚠️换机器后密文解不开（需用明文备份重新导入，与 token 换机失效同理）。默认关。"
+            label={t('settingspage.security.encrypt.label')}
+            hint={t('settingspage.security.encrypt.hint')}
           >
             <Switch
               checked={form.encryptCredentialsAtRest}
@@ -2220,60 +2260,60 @@ export function SettingsPage() {
             />
           </Field>
           <Field
-            label="CORS 允许来源"
-            hint="每行一个来源，如 https://app.example.com。留空=允许任意来源（公开 API，需重启生效）"
+            label={t('settingspage.security.cors.label')}
+            hint={t('settingspage.security.cors.hint')}
           >
             <textarea
               className="flex min-h-[72px] w-full max-w-[260px] rounded-md border border-input bg-background px-3 py-2 font-mono text-xs ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               value={form.corsAllowedOrigins}
               onChange={(e) => set('corsAllowedOrigins', e.target.value)}
-              placeholder="留空=允许任意来源"
+              placeholder={t('settingspage.security.cors.ph')}
               spellCheck={false}
             />
           </Field>
           <Field
-            label="IP 白名单"
-            hint="每行一条 CIDR 或单 IP，如 10.0.0.0/8、127.0.0.1。留空=不限制。非法条目保存时会被拒绝（需重启生效）"
+            label={t('settingspage.security.ip.label')}
+            hint={t('settingspage.security.ip.hint')}
           >
             <textarea
               className="flex min-h-[72px] w-full max-w-[260px] rounded-md border border-input bg-background px-3 py-2 font-mono text-xs ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               value={form.ipAllowlist}
               onChange={(e) => set('ipAllowlist', e.target.value)}
-              placeholder="留空=不限制"
+              placeholder={t('settingspage.security.ip.ph')}
               spellCheck={false}
             />
           </Field>
           <Field
-            label="信任 X-Forwarded-For"
-            hint="仅当部署在可信反代（nginx 等）之后才开启，否则客户端可伪造 IP 绕过白名单（需重启生效）"
+            label={t('settingspage.security.xff.label')}
+            hint={t('settingspage.security.xff.hint')}
           >
             <Switch checked={form.trustForwardedHeader} onCheckedChange={(v) => set('trustForwardedHeader', v)} />
           </Field>
-          <Field label="入口限流 (次/分钟/IP)" hint="0 表示关闭。超限返回 429（需重启生效）">
-            <NumberStepper value={Number(form.ingressRateLimitPerMin) || 0} onChange={(v) => set('ingressRateLimitPerMin', String(v))} min={0} step={10} className="w-28" aria-label="入口限流" />
+          <Field label={t('settingspage.security.ingress.label')} hint={t('settingspage.security.ingress.hint')}>
+            <NumberStepper value={Number(form.ingressRateLimitPerMin) || 0} onChange={(v) => set('ingressRateLimitPerMin', String(v))} min={0} step={10} className="w-28" aria-label={t('settingspage.security.ingress.aria')} />
           </Field>
-          <Field label="请求体上限 (字节)" hint="0 = 不限制（推荐，大请求体走流式转发不占内存）。非 0 时超限返回 413（需重启生效）">
-            <NumberStepper value={Number(form.maxBodyBytes) || 0} onChange={(v) => set('maxBodyBytes', String(v))} min={0} step={1048576} className="w-40" aria-label="请求体上限（字节，0=不限制）" />
+          <Field label={t('settingspage.security.maxBody.label')} hint={t('settingspage.security.maxBody.hint')}>
+            <NumberStepper value={Number(form.maxBodyBytes) || 0} onChange={(v) => set('maxBodyBytes', String(v))} min={0} step={1048576} className="w-40" aria-label={t('settingspage.security.maxBody.aria')} />
           </Field>
         </CardContent>
       </Card>
       </SectionGate>
 
       {/* 调度分区：主动 token 预刷新（TIER2 热重载：保存即时生效，无需重启） */}
-      <SectionGate section="scheduling" title="主动 token 预刷新" keywords={['启用预刷新', '提前量', '扫描间隔', 'token 刷新']}>
+      <SectionGate section="scheduling" titleKey="settingspage.card.tokenRefresh" kwKey="settingspage.card.tokenRefresh.kw">
       <Card>
         <CardHeader className="pb-2">
-          <CardTitle className="text-base"><Highlight text="主动 token 预刷新" /></CardTitle>
+          <CardTitle className="text-base"><Highlight text={t('settingspage.card.tokenRefresh')} /></CardTitle>
         </CardHeader>
         <CardContent className="py-0">
-          <Field label="启用预刷新" hint="后台提前刷新将过期的 token，把刷新移出请求热路径、削掉突发（保存即时生效，无需重启）">
+          <Field label={t('settingspage.refresh.enable.label')} hint={`${t('settingspage.refresh.enable.hint')}${hotParen}`}>
             <Switch checked={form.proactiveTokenRefresh} onCheckedChange={(v) => set('proactiveTokenRefresh', v)} />
           </Field>
-          <Field label="提前量 (分钟)" hint="token 剩余有效期低于此值即后台刷新（保存即时生效，无需重启）">
-            <NumberStepper value={Number(form.tokenRefreshLeadMinutes) || 0} onChange={(v) => set('tokenRefreshLeadMinutes', String(v))} min={0} className="w-28" disabled={!form.proactiveTokenRefresh} aria-label="提前量分钟" />
+          <Field label={t('settingspage.refresh.lead.label')} hint={`${t('settingspage.refresh.lead.hint')}${hotParen}`}>
+            <NumberStepper value={Number(form.tokenRefreshLeadMinutes) || 0} onChange={(v) => set('tokenRefreshLeadMinutes', String(v))} min={0} className="w-28" disabled={!form.proactiveTokenRefresh} aria-label={t('settingspage.refresh.lead.aria')} />
           </Field>
-          <Field label="扫描间隔 (秒)" hint="后台扫描周期，最小 5 秒（保存即时生效，无需重启）">
-            <NumberStepper value={Number(form.tokenRefreshIntervalSecs) || 0} onChange={(v) => set('tokenRefreshIntervalSecs', String(v))} min={5} step={5} className="w-28" disabled={!form.proactiveTokenRefresh} aria-label="扫描间隔秒" />
+          <Field label={t('settingspage.refresh.interval.label')} hint={`${t('settingspage.refresh.interval.hint')}${hotParen}`}>
+            <NumberStepper value={Number(form.tokenRefreshIntervalSecs) || 0} onChange={(v) => set('tokenRefreshIntervalSecs', String(v))} min={5} step={5} className="w-28" disabled={!form.proactiveTokenRefresh} aria-label={t('settingspage.refresh.interval.aria')} />
           </Field>
         </CardContent>
       </Card>
@@ -2282,13 +2322,13 @@ export function SettingsPage() {
       {/* 搜索且全无匹配时的空态 */}
       {query && !hasAnyMatch && (
         <div className="py-16 text-center text-sm text-muted-foreground">
-          未找到匹配的设置项，换个关键词试试。
+          {t('settingspage.page.emptySearch')}
         </div>
       )}
 
       {!query && (
         <p className="text-xs text-muted-foreground">
-          除负载均衡模式与隐私开关立即生效外，其余字段保存后需重启服务才生效。敏感字段（API/Admin 密钥、代理账密）出于安全不回显已存值：代理账密留空表示保持不变，填入则更新；API/Admin 密钥仍请在配置文件中维护。
+          {t('settingspage.page.footerNote')}
         </p>
       )}
 
@@ -2297,13 +2337,13 @@ export function SettingsPage() {
       <div className="fixed bottom-0 left-0 right-0 z-30 border-t bg-background/95 px-6 py-3 backdrop-blur md:left-[240px]">
         <div className="mx-auto flex max-w-[1200px] items-center justify-end gap-3">
           <span className="mr-auto text-sm text-muted-foreground">
-            {dirty ? `${dirtyCount} 项改动待保存` : '无改动'}
+            {dirty ? t('settingspage.page.dirtyCount', { n: dirtyCount }) : t('settingspage.page.noChanges')}
           </span>
           <Button variant="outline" onClick={handleReset} disabled={!dirty || isSaving}>
-            撤销
+            {t('settingspage.common.undo')}
           </Button>
           <Button onClick={handleSave} disabled={!dirty || isSaving}>
-            {isSaving ? '保存中…' : '保存'}
+            {isSaving ? t('settingspage.common.saving') : t('settingspage.common.save')}
           </Button>
         </div>
       </div>

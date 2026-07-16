@@ -1,4 +1,5 @@
 import { useState, type ReactNode } from 'react'
+import { useTranslation } from 'react-i18next'
 import { Settings2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
@@ -22,6 +23,7 @@ export function SettingGearCard({
   description?: string
   children: ReactNode
 }) {
+  const { t } = useTranslation()
   const [open, setOpen] = useState(false)
   return (
     <>
@@ -31,8 +33,8 @@ export function SettingGearCard({
         size="icon"
         className="h-7 w-7 shrink-0 text-muted-foreground hover:text-foreground"
         onClick={() => setOpen(true)}
-        title={`${title}（细粒度设置）`}
-        aria-label={`打开${title}`}
+        title={t('settinggearcard.tooltip', { title })}
+        aria-label={t('settinggearcard.openAria', { title })}
       >
         <Settings2 className="h-4 w-4" />
       </Button>
