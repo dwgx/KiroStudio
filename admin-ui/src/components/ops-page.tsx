@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
+import i18n from '@/i18n'
 import { useQuery } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -110,23 +111,24 @@ import {
   BgCacheDetailDialog,
 } from '@/components/ops-detail-dialogs'
 
-// 自愈计数器展示项：字段 → 中文标签 + 是否"越多越该警惕"（用于配色）。
-const METRIC_ITEMS: { key: keyof RecoveryMetrics; label: string; warn?: boolean }[] = [
-  { key: 'refreshOk', label: '刷新成功' },
-  { key: 'refreshFail', label: '刷新失败', warn: true },
-  { key: 'failoverHops', label: 'failover 换号', warn: true },
-  { key: 'failoverExhausted', label: 'failover 耗尽', warn: true },
-  { key: 'deadTokensDisabled', label: '自动禁用死号', warn: true },
-  { key: 'cooldownTriggered', label: '风控冷却触发', warn: true },
-  { key: 'regionReprobeOk', label: 'region 重探成功' },
-  { key: 'regionReprobeFail', label: 'region 重探失败', warn: true },
-  { key: 'leakedCleanedRequests', label: '泄漏清洗请求', warn: true },
-  { key: 'leakedSaturationRequests', label: '整段退化请求', warn: true },
-  { key: 'textifiedInvokeHits', label: '文本化工具调用', warn: true },
-  { key: 'reclaimedInvokeCalls', label: 'invoke 重组捞回' },
-  { key: 'strayGuardTripped', label: 'stray 熔断触发', warn: true },
-  { key: 'strayStandaloneRequests', label: 'stray 独占行(观测)', warn: true },
-  { key: 'strayInlineRequests', label: 'stray 句中泄漏(观测)', warn: true },
+// 自愈计数器展示项：字段 → i18n key + 是否"越多越该警惕"（用于配色）。
+// labelKey 在渲染时 t()，切语言实时更新（模块级常量不可用 hook）。
+const METRIC_ITEMS: { key: keyof RecoveryMetrics; labelKey: string; warn?: boolean }[] = [
+  { key: 'refreshOk', labelKey: 'opspage.metric.refreshOk' },
+  { key: 'refreshFail', labelKey: 'opspage.metric.refreshFail', warn: true },
+  { key: 'failoverHops', labelKey: 'opspage.metric.failoverHops', warn: true },
+  { key: 'failoverExhausted', labelKey: 'opspage.metric.failoverExhausted', warn: true },
+  { key: 'deadTokensDisabled', labelKey: 'opspage.metric.deadTokensDisabled', warn: true },
+  { key: 'cooldownTriggered', labelKey: 'opspage.metric.cooldownTriggered', warn: true },
+  { key: 'regionReprobeOk', labelKey: 'opspage.metric.regionReprobeOk' },
+  { key: 'regionReprobeFail', labelKey: 'opspage.metric.regionReprobeFail', warn: true },
+  { key: 'leakedCleanedRequests', labelKey: 'opspage.metric.leakedCleanedRequests', warn: true },
+  { key: 'leakedSaturationRequests', labelKey: 'opspage.metric.leakedSaturationRequests', warn: true },
+  { key: 'textifiedInvokeHits', labelKey: 'opspage.metric.textifiedInvokeHits', warn: true },
+  { key: 'reclaimedInvokeCalls', labelKey: 'opspage.metric.reclaimedInvokeCalls' },
+  { key: 'strayGuardTripped', labelKey: 'opspage.metric.strayGuardTripped', warn: true },
+  { key: 'strayStandaloneRequests', labelKey: 'opspage.metric.strayStandaloneRequests', warn: true },
+  { key: 'strayInlineRequests', labelKey: 'opspage.metric.strayInlineRequests', warn: true },
 ]
 
 // 后端日志 ts 是 UTC RFC3339(带 Z)。转成浏览器本地时区的 HH:MM:SS.mmm 显示——
@@ -140,14 +142,15 @@ function formatLocalTime(ts: string): string {
   return `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}.${ms}`
 }
 
+// 每次渲染调用：用 i18n 单例取当前语言（非模块 import 时求值）。
 function formatUptime(ms: number): string {
   const s = Math.floor(ms / 1000)
   const d = Math.floor(s / 86400)
   const h = Math.floor((s % 86400) / 3600)
   const m = Math.floor((s % 3600) / 60)
-  if (d > 0) return `${d}天 ${h}小时`
-  if (h > 0) return `${h}小时 ${m}分`
-  return `${m}分`
+  if (d > 0) return i18n.t('opspage.uptime.days', { d, h })
+  if (h > 0) return i18n.t('opspage.uptime.hours', { h, m })
+  return i18n.t('opspage.uptime.minutes', { m })
 }
 
 // 实时日志卡收缩状态持久化 key（纯前端偏好,localStorage 直存,与 use-ui-layout-prefs 同 try/catch 惯例）。
@@ -294,7 +297,7 @@ function RecoveryMetricsCard() {
               return (
                 <StatCard
                   key={it.key}
-                  label={it.label}
+                  label={t(it.labelKey)}
                   value={<AnimatedNumber value={v} />}
                   accent={it.warn && v > 0 ? 'warning' : 'neutral'}
                 />
@@ -443,13 +446,14 @@ function circuitStateOf(it: RateLimitInsight): CircuitState {
   return 'healthy'
 }
 
-const CIRCUIT_META: Record<CircuitState, { label: string; cls: string; dot: string }> = {
-  open: { label: '熔断', cls: 'text-red-400', dot: 'bg-red-500' },
-  halfOpen: { label: '半开试探', cls: 'text-amber-400', dot: 'bg-amber-400' },
-  cooldown: { label: '冷却中', cls: 'text-sky-400', dot: 'bg-sky-400' },
-  disabled: { label: '已禁用', cls: 'text-[#777]', dot: 'bg-[#555]' },
-  warn: { label: '亚健康', cls: 'text-amber-300', dot: 'bg-amber-300' },
-  healthy: { label: '健康', cls: 'text-emerald-400', dot: 'bg-emerald-500' },
+// 熔断态配色（标签已在渲染处 t(`opspage.circuit.${st}`)）。
+const CIRCUIT_META: Record<CircuitState, { cls: string; dot: string }> = {
+  open: { cls: 'text-red-400', dot: 'bg-red-500' },
+  halfOpen: { cls: 'text-amber-400', dot: 'bg-amber-400' },
+  cooldown: { cls: 'text-sky-400', dot: 'bg-sky-400' },
+  disabled: { cls: 'text-[#777]', dot: 'bg-[#555]' },
+  warn: { cls: 'text-amber-300', dot: 'bg-amber-300' },
+  healthy: { cls: 'text-emerald-400', dot: 'bg-emerald-500' },
 }
 
 // 熔断态 → Badge 变体(与 CIRCUIT_META 同键,展示层用 Badge 承载状态色)。
@@ -1391,7 +1395,7 @@ function LogViewer({ focusToken = 0, focusTerm = '' }: { focusToken?: number; fo
       const key = storage.getApiKey() ?? ''
       const q = levelParam ? `?level=${levelParam}` : ''
       const resp = await fetch(`/api/admin/logs/export${q}`, { headers: { 'x-api-key': key } })
-      if (!resp.ok) throw new Error('导出失败')
+      if (!resp.ok) throw new Error(t('opspage.log.exportFail'))
       const blob = await resp.blob()
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')

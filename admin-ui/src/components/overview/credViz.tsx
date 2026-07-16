@@ -1,5 +1,7 @@
 import { useCallback, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
+import { useTranslation } from 'react-i18next'
+import i18n from '@/i18n'
 import type { CredentialStatusItem } from '@/types/api'
 import type { CellActivity } from '@/components/overview/StatusHeatmap'
 import { authLabel, disabledReasonLabel } from '@/lib/i18n-labels'
@@ -27,32 +29,32 @@ export const HEALTH_RGB: Record<Health, string> = {
   disabled: '127 29 29', // 暗红（red-900，禁用号发暗不发光）
 }
 
-/** 健康态中文短标签（图例用）。 */
-export const HEALTH_LABEL: Record<Health, string> = {
-  healthy: '健康',
-  warn: '有失败',
-  disabled: '已禁用',
+/** 健康态 i18n key（图例用，渲染时 t）。 */
+export const HEALTH_LABEL_KEYS: Record<Health, string> = {
+  healthy: 'overviewpage.health.healthy',
+  warn: 'overviewpage.health.withFailure',
+  disabled: 'overviewpage.health.disabled',
 }
 
-/** 相对时间：与 StatusHeatmap 一致的“x 秒/分钟/小时前”。 */
+/** 相对时间：与 StatusHeatmap 一致的“x 秒/分钟/小时前”。每次调用取当前语言。 */
 export function fmtAgo(ts: number): string {
   const diff = Date.now() - ts
-  if (diff < 0) return '刚刚'
+  if (diff < 0) return i18n.t('credentialcard.lastUsed.justNow')
   const s = Math.floor(diff / 1000)
-  if (s < 5) return '刚刚'
-  if (s < 60) return `${s} 秒前`
+  if (s < 5) return i18n.t('credentialcard.lastUsed.justNow')
+  if (s < 60) return i18n.t('credentialcard.lastUsed.secondsAgo', { n: s })
   const m = Math.floor(s / 60)
-  if (m < 60) return `${m} 分钟前`
+  if (m < 60) return i18n.t('credentialcard.lastUsed.minutesAgo', { n: m })
   const h = Math.floor(m / 60)
-  if (h < 24) return `${h} 小时前`
-  return `${Math.floor(h / 24)} 天前`
+  if (h < 24) return i18n.t('credentialcard.lastUsed.hoursAgo', { n: h })
+  return i18n.t('credentialcard.lastUsed.daysAgo', { n: Math.floor(h / 24) })
 }
 
 /** 状态文案：禁用给原因，启用有失败给次数，否则健康。 */
 export function statusText(c: CredentialStatusItem): string {
-  if (c.disabled) return disabledReasonLabel(c.disabledReason) || '已禁用'
-  if (c.failureCount > 0) return `启用（失败 ${c.failureCount}）`
-  return '健康'
+  if (c.disabled) return disabledReasonLabel(c.disabledReason) || i18n.t('overviewpage.health.disabled')
+  if (c.failureCount > 0) return i18n.t('overviewpage.status.enabledWithFailures', { n: c.failureCount })
+  return i18n.t('overviewpage.health.healthy')
 }
 
 /**
@@ -67,22 +69,27 @@ export function CredTooltipBody({
   c: CredentialStatusItem
   act?: CellActivity
 }) {
+  const { t } = useTranslation()
   return (
     <div className="space-y-1">
       <div className="flex items-center gap-2 font-medium text-foreground">
         <span>#{c.id}</span>
-        {c.isCurrent && <span className="text-emerald-400">当前活跃</span>}
+        {c.isCurrent && <span className="text-emerald-400">{t('overviewpage.tooltip.currentActive')}</span>}
       </div>
       {c.email && <div className="text-muted-foreground">{c.email}</div>}
-      <div className="text-muted-foreground">鉴权：{authLabel(c.authMethod)}</div>
+      <div className="text-muted-foreground">{t('overviewpage.tooltip.auth', { method: authLabel(c.authMethod) })}</div>
       <div className="flex gap-3 tabular-nums text-muted-foreground">
-        <span className="text-emerald-400">成功 {c.successCount}</span>
-        <span className={c.failureCount > 0 ? 'text-red-400' : ''}>失败 {c.failureCount}</span>
+        <span className="text-emerald-400">{t('overviewpage.tooltip.success', { n: c.successCount })}</span>
+        <span className={c.failureCount > 0 ? 'text-red-400' : ''}>{t('overviewpage.tooltip.failure', { n: c.failureCount })}</span>
       </div>
-      <div className="text-muted-foreground">状态：{statusText(c)}</div>
-      <div className="text-muted-foreground">最近命中：{act ? fmtAgo(act.lastTs) : '近 24h 无'}</div>
+      <div className="text-muted-foreground">{t('overviewpage.tooltip.status', { status: statusText(c) })}</div>
+      <div className="text-muted-foreground">
+        {t('overviewpage.tooltip.lastHit', {
+          time: act ? fmtAgo(act.lastTs) : t('overviewpage.tooltip.noHit24h'),
+        })}
+      </div>
       {typeof c.inflight === 'number' && c.inflight > 0 && (
-        <div className="text-primary">在途：{c.inflight}</div>
+        <div className="text-primary">{t('overviewpage.tooltip.inflight', { n: c.inflight })}</div>
       )}
       {/* TODO(BE-balance): 额度/积分待后端批量缓存端点 cached-balances；
           本视图 hover 仅展示免费字段，绝不在此拉 per-account balance（避免触发上游风控）。 */}
@@ -163,13 +170,14 @@ export function useHoverCard() {
 
 /** 空池优雅占位：三视图共用。 */
 export function EmptyPool({ className }: { className?: string }) {
+  const { t } = useTranslation()
   return (
     <div
       className={`flex min-h-[140px] flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-border/60 text-center ${className ?? ''}`}
     >
       <div className="h-2 w-2 rounded-full bg-muted-foreground/40" />
-      <p className="text-sm text-muted-foreground">暂无凭据</p>
-      <p className="text-xs text-muted-foreground/60">添加凭据后这里会亮起</p>
+      <p className="text-sm text-muted-foreground">{t('overviewpage.kpi.totalCreds.empty')}</p>
+      <p className="text-xs text-muted-foreground/60">{t('overviewpage.empty.poolHint')}</p>
     </div>
   )
 }

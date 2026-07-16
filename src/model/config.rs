@@ -392,6 +392,12 @@ pub struct Config {
     #[serde(default)]
     pub ip_allowlist: Vec<String>,
 
+    /// 入口 IP 黑名单（CIDR 或单 IP）。空 = 不启用。命中即拒（403），**优先于白名单判定**。
+    /// 用于封禁特定滥用 IP。支持 IPv4/IPv6 CIDR，例：`["1.2.3.4/32", "5.6.0.0/16"]`。
+    /// 客户端 IP 判定同白名单（TCP 对端 / 反代后按 trust_forwarded_header 取 XFF 最右段）。
+    #[serde(default)]
+    pub ip_blocklist: Vec<String>,
+
     /// 是否信任 `X-Forwarded-For` / `X-Real-IP` 头来判定客户端 IP（默认 false）。
     /// **仅当本服务确实部署在可信反代（nginx/traefik）之后才可开启**，
     /// 否则客户端可伪造该头绕过 IP 白名单与限流。
@@ -836,6 +842,7 @@ impl Default for Config {
             collect_client_fingerprint: default_collect_client_fingerprint(),
             cors_allowed_origins: Vec::new(),
             ip_allowlist: Vec::new(),
+            ip_blocklist: Vec::new(),
             trust_forwarded_header: false,
             ingress_rate_limit_per_min: 0,
             max_body_bytes: default_max_body_bytes(),

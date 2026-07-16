@@ -552,6 +552,7 @@ async fn main() {
     // 入口安全层（IP 白名单 + 每-IP 限流）。两者都未配置时不挂载中间件，零开销。
     let app = match common::security::SecurityState::from_config(
         &config.ip_allowlist,
+        &config.ip_blocklist,
         config.ingress_rate_limit_per_min,
         config.trust_forwarded_header,
     ) {
@@ -560,6 +561,12 @@ async fn main() {
                 tracing::info!(
                     "入口 IP 白名单已启用（{} 条规则）",
                     config.ip_allowlist.len()
+                );
+            }
+            if sec_state.blocklist.is_active() {
+                tracing::info!(
+                    "入口 IP 黑名单已启用（{} 条规则）",
+                    config.ip_blocklist.len()
                 );
             }
             if sec_state.rate_limiter.is_active() {

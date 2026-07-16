@@ -202,20 +202,17 @@ export function RegionSelect({
                   <Trash2 className="h-3 w-3" />
                 </button>
               </div>
-              {recentToShow.map((code) => {
-                const r = AWS_REGIONS.find((x) => x.code === code)
-                return (
+              {recentToShow.map((code) => (
                   <button
                     type="button"
                     key={`recent-${code}`}
                     onClick={() => pick(code)}
                     className="flex w-full items-center justify-between gap-3 px-3 py-1.5 text-left text-sm text-muted-foreground transition-colors duration-150 hover:bg-accent hover:text-foreground"
                   >
-                    <span className="truncate text-foreground">{r ? r.label : regionLabel(code)}</span>
+                    <span className="truncate text-foreground">{regionLabel(code)}</span>
                     <span className="font-mono text-xs text-muted-foreground">{code}</span>
                   </button>
-                )
-              })}
+              ))}
             </div>
           )}
 
@@ -239,7 +236,7 @@ export function RegionSelect({
                   )}
                 >
                   <span className="flex min-w-0 flex-col">
-                    <span className="truncate text-foreground">{r.label}</span>
+                    <span className="truncate text-foreground">{regionLabel(r.code)}</span>
                     <span className="truncate text-xs text-muted-foreground">{r.city}</span>
                   </span>
                   <span className="flex shrink-0 items-center gap-2">
