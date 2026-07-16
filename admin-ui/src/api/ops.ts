@@ -114,6 +114,14 @@ export interface RecoveryMetrics {
   leakedSaturationRequests: number
   /** 文本化工具调用命中 chunk 数(Kiro 把工具调用当文本吐,court/Invalid-tool-params 根源信号)。 */
   textifiedInvokeHits: number
+  /** 文本化 invoke 真重组成结构化 tool_use 的次数(捞回生效计数)。 */
+  reclaimedInvokeCalls?: number
+  /** stray token 复读熔断触发次数(≥32 连写刷屏被截断)。 */
+  strayGuardTripped?: number
+  /** 【观测】见过"独占 stray 行"的请求数(高置信泄漏)。 */
+  strayStandaloneRequests?: number
+  /** 【观测】见过"句中紧贴 CJK 的 stray 词"的请求数(clean 层够不到的句中黑洞取证)。 */
+  strayInlineRequests?: number
 }
 
 export async function getRecoveryMetrics(): Promise<RecoveryMetrics> {

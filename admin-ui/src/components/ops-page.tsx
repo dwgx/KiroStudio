@@ -122,6 +122,10 @@ const METRIC_ITEMS: { key: keyof RecoveryMetrics; label: string; warn?: boolean 
   { key: 'leakedCleanedRequests', label: '泄漏清洗请求', warn: true },
   { key: 'leakedSaturationRequests', label: '整段退化请求', warn: true },
   { key: 'textifiedInvokeHits', label: '文本化工具调用', warn: true },
+  { key: 'reclaimedInvokeCalls', label: 'invoke 重组捞回' },
+  { key: 'strayGuardTripped', label: 'stray 熔断触发', warn: true },
+  { key: 'strayStandaloneRequests', label: 'stray 独占行(观测)', warn: true },
+  { key: 'strayInlineRequests', label: 'stray 句中泄漏(观测)', warn: true },
 ]
 
 // 后端日志 ts 是 UTC RFC3339(带 Z)。转成浏览器本地时区的 HH:MM:SS.mmm 显示——
