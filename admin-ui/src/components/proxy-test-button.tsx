@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { Loader2, Wifi } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -25,13 +26,18 @@ export function ProxyTestButton({
   proxyPassword,
   className,
 }: ProxyTestButtonProps) {
+  const { t } = useTranslation()
   const [pending, setPending] = useState(false)
 
   const handleTest = async () => {
     setPending(true)
     // 说明：阻止冒泡/默认提交在 onClick 里完成（见下），此处只负责测活逻辑。
     const url = proxyUrl.trim()
-    const pendingToast = toast.loading(url && url !== 'direct' ? '正在测试代理连通性…' : '正在测试直连…')
+    const pendingToast = toast.loading(
+      url && url !== 'direct'
+        ? t('proxytestbutton.toast.testingProxy')
+        : t('proxytestbutton.toast.testingDirect'),
+    )
     try {
       const res = await testProxy({
         proxyUrl: url,
@@ -40,14 +46,25 @@ export function ProxyTestButton({
       })
       if (res.ok) {
         toast.success(
-          `代理可用 · 延迟 ${res.latencyMs}ms · 出口 ${res.exitIp ?? '未知'}`,
+          t('proxytestbutton.toast.ok', {
+            latencyMs: res.latencyMs,
+            exitIp: res.exitIp ?? t('proxytestbutton.toast.unknownIp'),
+          }),
           { id: pendingToast },
         )
       } else {
-        toast.error('代理不可用：' + (res.error || '未知错误'), { id: pendingToast })
+        toast.error(
+          t('proxytestbutton.toast.unavailable', {
+            error: res.error || t('proxytestbutton.toast.unknownError'),
+          }),
+          { id: pendingToast },
+        )
       }
     } catch (err) {
-      toast.error('测活失败：' + (err as Error).message, { id: pendingToast })
+      toast.error(
+        t('proxytestbutton.toast.failed', { message: (err as Error).message }),
+        { id: pendingToast },
+      )
     } finally {
       setPending(false)
     }
@@ -68,10 +85,10 @@ export function ProxyTestButton({
         void handleTest()
       }}
       disabled={pending}
-      title="测试该代理连通性（后端探测出口 IP + 延迟）"
+      title={t('proxytestbutton.title')}
     >
       {pending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Wifi className="h-4 w-4" />}
-      <span className="ml-1">测活</span>
+      <span className="ml-1">{t('proxytestbutton.label')}</span>
     </Button>
   )
 }

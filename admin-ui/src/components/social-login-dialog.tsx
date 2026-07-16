@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
+import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import {
   Dialog,
@@ -28,6 +29,7 @@ type Step = 'form' | 'waiting' | 'done'
 const POLL_INTERVAL_MS = 2000
 
 export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLoginDialogProps) {
+  const { t } = useTranslation()
   const [step, setStep] = useState<Step>('form')
   const [priority, setPriority] = useState('0')
   const [proxyUrl, setProxyUrl] = useState('')
@@ -71,11 +73,11 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
           stopPolling()
           setResultEmail(result.email ?? null)
           setStep('done')
-          toast.success(`上号成功，凭据 #${result.credentialId}`)
+          toast.success(t('sociallogindialog.toast.loginSuccess', { credentialId: result.credentialId }))
           onSuccess?.()
         } else {
           stopPolling()
-          toast.error(result.message || '登录失败')
+          toast.error(result.message || t('sociallogindialog.toast.loginFailed'))
           setStep('form')
         }
       } catch (err) {
@@ -113,9 +115,9 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
     if (!session) return
     const ok = await copyToClipboard(session.portalUrl)
     if (ok) {
-      toast.success('登录链接已复制')
+      toast.success(t('sociallogindialog.toast.linkCopied'))
     } else {
-      toast.error('复制失败，请手动选中链接复制')
+      toast.error(t('sociallogindialog.toast.copyFailedSelectManually'))
     }
   }
 
@@ -123,17 +125,17 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-[480px]">
         <DialogHeader>
-          <DialogTitle>网页上号</DialogTitle>
+          <DialogTitle>{t('sociallogindialog.title')}</DialogTitle>
         </DialogHeader>
 
         {step === 'form' && (
           <div className="space-y-4 py-2">
             <p className="text-sm text-muted-foreground">
-              在浏览器中登录你的 Kiro 账号，完成后凭据会自动加入池，无需手动复制 token。
+              {t('sociallogindialog.form.intro')}
             </p>
             <div className="space-y-2">
               <label className="text-sm font-medium" htmlFor="priority">
-                优先级
+                {t('sociallogindialog.form.priorityLabel')}
               </label>
               <NumberStepper
                 value={Number(priority) || 0}
@@ -141,13 +143,13 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
                 min={0}
                 disabled={isStarting}
                 className="w-full"
-                aria-label="优先级"
+                aria-label={t('sociallogindialog.form.priorityAriaLabel')}
               />
-              <p className="text-xs text-muted-foreground">数字越小优先级越高</p>
+              <p className="text-xs text-muted-foreground">{t('sociallogindialog.form.priorityHelp')}</p>
             </div>
             <div className="space-y-2">
               <label className="text-sm font-medium" htmlFor="proxyUrl">
-                代理（可选）
+                {t('sociallogindialog.form.proxyLabel')}
               </label>
               <div className="flex items-center gap-2">
                 <Input
@@ -155,7 +157,7 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
                   className="flex-1"
                   value={proxyUrl}
                   onChange={(e) => setProxyUrl(e.target.value)}
-                  placeholder="留空使用全局代理"
+                  placeholder={t('sociallogindialog.form.proxyPlaceholder')}
                   disabled={isStarting}
                 />
                 <ProxyTestButton proxyUrl={proxyUrl} />
@@ -167,21 +169,20 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
         {step === 'waiting' && session && (
           <div className="space-y-4 py-2">
             <p className="text-sm text-muted-foreground">
-              点「打开登录页」在新标签页登录 Kiro 账号；登录完成后此处会自动检测并入池。
-              若按钮被浏览器拦截，请复制下方链接手动打开。
+              {t('sociallogindialog.waiting.intro')}
             </p>
             <div className="flex items-center gap-2">
               <Input readOnly value={session.portalUrl} className="text-xs" onFocus={(e) => e.currentTarget.select()} />
               <Button type="button" variant="outline" onClick={handleCopy}>
-                复制
+                {t('sociallogindialog.waiting.copy')}
               </Button>
             </div>
             <Button type="button" className="w-full" onClick={handleOpenLogin}>
-              打开登录页
+              {t('sociallogindialog.waiting.openLoginPage')}
             </Button>
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
               <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-primary" />
-              等待浏览器完成登录…
+              {t('sociallogindialog.waiting.waitingBrowser')}
             </div>
           </div>
         )}
@@ -189,7 +190,7 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
         {step === 'done' && (
           <div className="space-y-3 py-4 text-center">
             <CheckCircle2 className="mx-auto h-12 w-12 text-green-600 dark:text-green-400" />
-            <p className="text-sm font-medium">上号成功</p>
+            <p className="text-sm font-medium">{t('sociallogindialog.done.title')}</p>
             {resultEmail && (
               <p className="text-xs text-muted-foreground">{resultEmail}</p>
             )}
@@ -205,21 +206,21 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
                 onClick={() => onOpenChange(false)}
                 disabled={isStarting}
               >
-                取消
+                {t('sociallogindialog.footer.cancel')}
               </Button>
               <Button type="button" onClick={handleStart} disabled={isStarting}>
-                {isStarting ? '启动中…' : '开始登录'}
+                {isStarting ? t('sociallogindialog.footer.starting') : t('sociallogindialog.footer.startLogin')}
               </Button>
             </>
           )}
           {step === 'waiting' && (
             <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
-              取消
+              {t('sociallogindialog.footer.cancel')}
             </Button>
           )}
           {step === 'done' && (
             <Button type="button" onClick={() => onOpenChange(false)}>
-              完成
+              {t('sociallogindialog.footer.done')}
             </Button>
           )}
         </DialogFooter>

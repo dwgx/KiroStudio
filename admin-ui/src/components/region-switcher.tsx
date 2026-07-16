@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { Globe, Loader2, CheckCircle2, XCircle } from 'lucide-react'
@@ -24,6 +25,7 @@ interface RegionSwitcherProps {
  * 可见性由调用方 gate（external_idp || idc 才渲染）——本组件不再判断 authMethod。
  */
 export function RegionSwitcher({ credentialId }: RegionSwitcherProps) {
+  const { t } = useTranslation()
   // 探测结果（null=未探测）+ 加载/错误态 + 正在切换的 ARN + 自定义 region 手填值。
   const [regions, setRegions] = useState<CredentialRegionProfile[] | null>(null)
   const [regionsLoading, setRegionsLoading] = useState(false)
@@ -38,25 +40,31 @@ export function RegionSwitcher({ credentialId }: RegionSwitcherProps) {
   const loadRegions = async () => {
     setRegionsLoading(true)
     setRegionsError(null)
-    const pending = toast.loading('正在探测各区域 profile…')
+    const pending = toast.loading(t('regionswitcher.toast.probing'))
     try {
       const res = await probeCredentialRegions(credentialId)
       const list = res.regions ?? []
       setRegions(list)
       const usableCount = list.filter((r) => r.usable).length
       if (usableCount > 0) {
-        toast.success(`探测完成：找到 ${usableCount} 个可用区域（共 ${list.length} 个）`, { id: pending })
+        toast.success(
+          t('regionswitcher.toast.probeOkUsable', { usableCount, total: list.length }),
+          { id: pending },
+        )
       } else if (list.length > 0) {
-        toast.warning(`探测完成：${list.length} 个区域均不可用（未开通/验活失败）`, { id: pending })
+        toast.warning(
+          t('regionswitcher.toast.probeOkNoneUsable', { total: list.length }),
+          { id: pending },
+        )
       } else {
-        toast.warning('探测完成：未找到任何 region profile', { id: pending })
+        toast.warning(t('regionswitcher.toast.probeOkEmpty'), { id: pending })
       }
     } catch (err) {
       // 详细错误报告：把后端 bail 的具体原因透传到卡片红框 + toast，不是裸 502。
       const msg = extractErrorMessage(err)
       setRegionsError(msg)
       setRegions(null)
-      toast.error('探测失败：' + msg, { id: pending })
+      toast.error(t('regionswitcher.toast.probeFailed', { message: msg }), { id: pending })
     } finally {
       setRegionsLoading(false)
     }
@@ -69,11 +77,15 @@ export function RegionSwitcher({ credentialId }: RegionSwitcherProps) {
       const res = await switchProfileRegion(credentialId, arn)
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
       queryClient.invalidateQueries({ queryKey: ['usage', 'ratelimit-insights'] })
-      toast.success(res.message || '已切换 Profile ARN，下次请求生效')
+      toast.success(res.message || t('regionswitcher.toast.switchSuccess'))
       await loadRegions()
     } catch (err) {
       const diag = extractDiagnosis(err)
-      toast.error('切换失败: ' + (diag ? diag.summary : extractErrorMessage(err)))
+      toast.error(
+        t('regionswitcher.toast.switchFailed', {
+          message: diag ? diag.summary : extractErrorMessage(err),
+        }),
+      )
     } finally {
       setSwitchingArn(null)
     }
@@ -84,14 +96,14 @@ export function RegionSwitcher({ credentialId }: RegionSwitcherProps) {
   const handleCustomRegionSwitch = async () => {
     const region = customRegion.trim()
     if (!region) {
-      toast.error('请输入 region（如 eu-central-1）')
+      toast.error(t('regionswitcher.toast.customRegionRequired'))
       return
     }
     // 前端拿不到原始 ARN（安全:只暴露 hasProfileArn），故 account/profile 名从**已探测候选**取。
     // 需先「探测区域」拿到至少一个候选,才能构造同账号的其它 region ARN。
     const sample = regions?.find((r) => r.account && r.arn)
     if (!sample) {
-      toast.error('请先点「探测区域」——需要一个已知 profile 才能构造自定义 region 的 ARN')
+      toast.error(t('regionswitcher.toast.probeFirst'))
       return
     }
     // 构造 ARN：arn:aws:codewhisperer:{region}:{account}:{profileSeg}（同账号同 profile 名，换 region）。
@@ -109,25 +121,24 @@ export function RegionSwitcher({ credentialId }: RegionSwitcherProps) {
           className="h-8 shrink-0 px-2.5"
           onClick={loadRegions}
           disabled={regionsLoading}
-          title="探测该账号各区域的 profile"
+          title={t('regionswitcher.button.probeTitle')}
         >
           {regionsLoading ? (
             <Loader2 className="mr-1 h-4 w-4 animate-spin" />
           ) : (
             <Globe className="mr-1 h-4 w-4" />
           )}
-          {regions === null ? '探测区域' : '重新探测'}
+          {regions === null ? t('regionswitcher.button.probe') : t('regionswitcher.button.reprobe')}
         </Button>
       </div>
       {regionsError && (
         <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-400">
-          探测失败：{regionsError}
+          {t('regionswitcher.error.probeFailed', { message: regionsError })}
         </div>
       )}
       {regions !== null && regions.length === 0 && !regionsLoading && (
         <div className="rounded-md border border-dashed border-border px-3 py-3 text-center text-xs text-muted-foreground">
-          未探测到可用的 profile。该账号可能在此 region 未开通（刚加入订阅组需等最多 24h 传播），
-          或试试下方手填其它 region。
+          {t('regionswitcher.empty.noProfile')}
         </div>
       )}
       {/* 自定义 region：手填任意 region 直接构造 ARN 切过去（绕候选表，覆盖冷门 region）。
@@ -136,7 +147,7 @@ export function RegionSwitcher({ credentialId }: RegionSwitcherProps) {
         <RegionSelect
           value={customRegion}
           onChange={setCustomRegion}
-          placeholder="自定义 region，如 eu-central-1"
+          placeholder={t('regionswitcher.placeholder.customRegion')}
           disabled={switchingArn !== null}
           className="flex-1"
           triggerClassName="h-8 text-xs"
@@ -147,9 +158,9 @@ export function RegionSwitcher({ credentialId }: RegionSwitcherProps) {
           className="h-8 shrink-0 px-2.5"
           onClick={handleCustomRegionSwitch}
           disabled={switchingArn !== null || !customRegion.trim()}
-          title="用手填 region 构造 ARN 直接切换（验活可用才生效）"
+          title={t('regionswitcher.button.customSwitchTitle')}
         >
-          切到此区域
+          {t('regionswitcher.button.switchToRegion')}
         </Button>
       </div>
       {regions !== null && regions.length > 0 && (
@@ -183,16 +194,20 @@ export function RegionSwitcher({ credentialId }: RegionSwitcherProps) {
                       )}
                       <span className="truncate">{regionLabel(r.region)}</span>
                       {r.current && (
-                        <span className="shrink-0 rounded bg-emerald-500/15 px-1 py-0.5 text-[10px] text-emerald-300">当前</span>
+                        <span className="shrink-0 rounded bg-emerald-500/15 px-1 py-0.5 text-[10px] text-emerald-300">
+                          {t('regionswitcher.badge.current')}
+                        </span>
                       )}
                       {!r.usable && (
-                        <span className="shrink-0 rounded bg-white/5 px-1 py-0.5 text-[10px] text-muted-foreground">该区域未开通</span>
+                        <span className="shrink-0 rounded bg-white/5 px-1 py-0.5 text-[10px] text-muted-foreground">
+                          {t('regionswitcher.badge.notEnabled')}
+                        </span>
                       )}
                     </div>
                     <div className="mt-0.5 truncate font-mono text-[10px] text-muted-foreground" title={r.arn}>
                       {r.region}
                       {r.subscriptionTitle ? ` · ${subscriptionLabel(r.subscriptionTitle)}` : ''}
-                      {r.account ? ` · 账号 ${r.account}` : ''}
+                      {r.account ? ` · ${t('regionswitcher.meta.account', { account: r.account })}` : ''}
                     </div>
                   </div>
                   {isSwitching && <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-primary" />}
