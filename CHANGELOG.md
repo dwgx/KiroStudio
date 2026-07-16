@@ -2,6 +2,36 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.29] - 2026-07-16
+
+### toaster 根因修复 + stray 泄漏形态观测探针 + 用量时间窗/日期组件 UI
+
+**toaster 修复(影响全站所有 loading→结果 通知)**:
+- 自研 toaster 的 `ToastItem` 用 `useRef(rec.duration)` 存剩余时长。`toast.loading`(Infinity)同 id 就地更新为
+  `toast.success`(3200ms)时,`remainingRef` 仍是旧的 Infinity → 计时 effect 执行 `setTimeout(beginClose, Infinity)`
+  → 浏览器把 Infinity 延时当 0 → 成功 toast 一闪即消失。这正是"代理测活 notification 立马消失"的根因。
+- 修:加 effect 在 `rec.duration` 变化时重同步 `remainingRef`+`startRef`。惠及全站测活/探模型/验活等所有
+  `loading→success/error` 模式。
+
+**stray 泄漏形态观测探针(纯统计,零误删,零上游成本)**:
+- `clean_leaked_tokens` 只清**行首**,句中泄漏(如 `重读course了`)完全静默穿透、连计数都没进 → 线上
+  leakedCleaned 全 0 无法区分"没泄漏"还是"泄漏没检测到"(盲飞)。
+- 加 `observe_stray_leak_forms`(清洗**前**扫原始 content,不改输出):按形态分类计数——standalone(stray 词独占
+  整行,高置信)/ inline(stray 词句中紧贴 CJK,如 `course课`/`值是count的`,正常中英混排有空格分隔故紧贴 CJK 是
+  泄漏特征)。快路径 contains 先筛,正常文本零开销。
+- recovery_metrics 加 `strayStandaloneRequests`/`strayInlineRequests` 请求级计数;运维页实时指标条展示
+  (顺带补齐之前漏展示的 reclaimedInvokeCalls/strayGuardTripped)。inline>0 打 warn 日志。4 新测试。
+- 目的:上线后收数据看真机 course/课 泄漏形态,再决定要不要开保守句中清洗(误删风险项,默认不做)。
+
+**用量时间窗切换 + 请求明细日期组件 + 修筛选点击错位**:
+- 用量日志:后端 `Overview` 加 `all_time`(保留期内所有天桶合计);前端 UsageDetailDialog 加 24h/7天/30天/全部
+  段控件切 KPI(数据都在 overview 里,零额外请求)。
+- 请求明细:抽 `DateTimeField` 组件(native datetime-local 自带日历弹层 + 日历图标 + "此刻"快捷 + 清除)。
+- 修点击错位(点标题文字区域误聚焦输入框):筛选面板 6 字段原用 `<label>` 包裹 span+input,label 会把点击转发给
+  内部 input。改 `<label>`→`<div>` + 独立 span 消除转发。
+
+后端 754 测试绿(`--locked` 门禁),前端 build 绿。
+
 ## [0.7.28] - 2026-07-16
 
 ### 入站请求整形 + RPM 自动挡(治 429 雪崩)+ 结构性 stray 熔断(治 course/课)+ 运维页大批 UI + 红队修复
