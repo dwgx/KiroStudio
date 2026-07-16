@@ -1080,6 +1080,7 @@ impl AdminService {
             inbound_rpm_max: config.inbound_rpm_max,
             inbound_burst_secs: config.inbound_burst_secs,
             inbound_queue_max_wait_secs: config.inbound_queue_max_wait_secs,
+            inbound_queue_timeout_passthrough: config.inbound_queue_timeout_passthrough,
             inbound_current_rpm: self.token_manager.inbound_target_rpm(),
             balance_weight_enabled: config.balance_weight_enabled,
             balance_weight_floor: config.balance_weight_floor,
@@ -1468,6 +1469,12 @@ impl AdminService {
             let v = v.clamp(1, 300);
             if v != config.inbound_queue_max_wait_secs {
                 config.inbound_queue_max_wait_secs = v;
+                hot_changed = true;
+            }
+        }
+        if let Some(v) = req.inbound_queue_timeout_passthrough {
+            if v != config.inbound_queue_timeout_passthrough {
+                config.inbound_queue_timeout_passthrough = v;
                 hot_changed = true;
             }
         }

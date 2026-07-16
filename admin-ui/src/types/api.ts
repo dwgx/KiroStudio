@@ -347,6 +347,7 @@ export interface ConfigSnapshotResponse {
   inboundRpmMax: number
   inboundBurstSecs: number
   inboundQueueMaxWaitSecs: number
+  inboundQueueTimeoutPassthrough: boolean
   /** 当前实时目标 RPM（自动挡动态，只读展示） */
   inboundCurrentRpm: number
   balanceWeightEnabled: boolean
@@ -420,6 +421,7 @@ export interface UpdateConfigRequest {
   inboundRpmMax?: number
   inboundBurstSecs?: number
   inboundQueueMaxWaitSecs?: number
+  inboundQueueTimeoutPassthrough?: boolean
   balanceWeightEnabled?: boolean
   balanceWeightFloor?: number
   health429WeightEnabled?: boolean
