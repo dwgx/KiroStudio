@@ -153,6 +153,29 @@ pub struct Config {
     #[serde(default = "default_rate_limit_jitter_pct")]
     pub rate_limit_jitter_pct: u32,
 
+    // ---- 入站请求整形 + RPM 自动挡(治上游 429 雪崩;冷却是号挂后补救,整形在入口削平突发) ----
+    /// 入站整形总开关（默认 true）。开=请求进上游前先过全局令牌桶,突发被排队削平成受控 RPM。
+    #[serde(default = "default_true")]
+    pub inbound_throttle_enabled: bool,
+    /// RPM 自动挡（默认 true）。开=AIMD 动态调 target(无 429 加性增/收 429 乘性减);关=固定 target(手动挡)。
+    #[serde(default = "default_true")]
+    pub inbound_rpm_auto: bool,
+    /// 目标 RPM 初值/手动挡固定值（默认 100）。
+    #[serde(default = "default_inbound_target_rpm")]
+    pub inbound_target_rpm: u32,
+    /// 自动挡 RPM 下限（默认 20）。乘性减不低于此。
+    #[serde(default = "default_inbound_rpm_min")]
+    pub inbound_rpm_min: u32,
+    /// 自动挡 RPM 上限（默认 300）。加性增不超过此。
+    #[serde(default = "default_inbound_rpm_max")]
+    pub inbound_rpm_max: u32,
+    /// 令牌桶突发容量（秒，默认 2）。允许短时小突发不排队。
+    #[serde(default = "default_inbound_burst_secs")]
+    pub inbound_burst_secs: u32,
+    /// 排队最长等待（秒，默认 30）。超时返回带 Retry-After 的 429 让客户端退避。
+    #[serde(default = "default_inbound_queue_max_wait_secs")]
+    pub inbound_queue_max_wait_secs: u32,
+
     /// 是否启用会话亲和性（同一会话尽量复用同一凭据，默认 true）
     ///
     /// 防关联用：让同一对话粘在同一账号上，避免单次会话散落到多个账号引发关联。
@@ -577,6 +600,21 @@ fn default_endpoint() -> String {
 fn default_rate_limit_jitter_pct() -> u32 {
     20
 }
+fn default_inbound_target_rpm() -> u32 {
+    100
+}
+fn default_inbound_rpm_min() -> u32 {
+    20
+}
+fn default_inbound_rpm_max() -> u32 {
+    300
+}
+fn default_inbound_burst_secs() -> u32 {
+    2
+}
+fn default_inbound_queue_max_wait_secs() -> u32 {
+    30
+}
 fn default_cooldown_scale_pct() -> u32 {
     100
 }
@@ -744,6 +782,13 @@ impl Default for Config {
             cooldown_enabled: default_cooldown_enabled(),
             cooldown_scale_pct: default_cooldown_scale_pct(),
             rate_limit_jitter_pct: default_rate_limit_jitter_pct(),
+            inbound_throttle_enabled: default_true(),
+            inbound_rpm_auto: default_true(),
+            inbound_target_rpm: default_inbound_target_rpm(),
+            inbound_rpm_min: default_inbound_rpm_min(),
+            inbound_rpm_max: default_inbound_rpm_max(),
+            inbound_burst_secs: default_inbound_burst_secs(),
+            inbound_queue_max_wait_secs: default_inbound_queue_max_wait_secs(),
             rate_limit_enabled: false,
             rate_limit_daily_max: default_rate_limit_daily(),
             rate_limit_min_interval_ms: default_rate_limit_min_interval_ms(),

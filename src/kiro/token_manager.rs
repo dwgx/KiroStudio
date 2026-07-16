@@ -1248,6 +1248,8 @@ pub struct MultiTokenManager {
     cooldown: CooldownManager,
     /// 是否启用冷却（原子镜像,reload 热更）
     cooldown_enabled: AtomicBool,
+    /// 入站请求整形 + RPM 自动挡（主动：入口削平突发,让号不被上游打爆;治 429 雪崩）
+    throttle: std::sync::Arc<crate::kiro::throttle::GlobalThrottle>,
     /// 拟人速率限制器（防关联：每日上限 + 请求间隔）
     rate_limiter: RateLimiter,
     /// 是否启用速率限制（原子镜像,reload 热更）
@@ -1518,6 +1520,15 @@ impl MultiTokenManager {
         let rate_limit_enabled = config.rate_limit_enabled;
         let affinity_enabled = config.affinity_enabled;
         let cooldown_scale_pct = config.cooldown_scale_pct;
+        let throttle = std::sync::Arc::new(crate::kiro::throttle::GlobalThrottle::new(
+            config.inbound_throttle_enabled,
+            config.inbound_rpm_auto,
+            config.inbound_target_rpm,
+            config.inbound_rpm_min,
+            config.inbound_rpm_max,
+            config.inbound_burst_secs,
+            config.inbound_queue_max_wait_secs,
+        ));
         let rpm_limit = config.credential_rpm_limit;
         let rpm_headroom_factor = config.rpm_headroom_factor;
         let rpm_reserve_slots = config.rpm_reserve_slots;
@@ -1552,6 +1563,7 @@ impl MultiTokenManager {
             stats_dirty: AtomicBool::new(false),
             cooldown: CooldownManager::new(),
             cooldown_enabled: AtomicBool::new(cooldown_enabled),
+            throttle,
             rate_limiter: RateLimiter::new(rate_limit_config),
             rate_limit_enabled: AtomicBool::new(rate_limit_enabled),
             affinity: UserAffinityManager::new(),
@@ -1683,6 +1695,16 @@ impl MultiTokenManager {
         });
         // 冷却时长缩放热更(即时生效)。
         self.cooldown.set_cooldown_scale_pct(new.cooldown_scale_pct);
+        // 入站整形热更。
+        self.throttle.update(
+            new.inbound_throttle_enabled,
+            new.inbound_rpm_auto,
+            new.inbound_target_rpm,
+            new.inbound_rpm_min,
+            new.inbound_rpm_max,
+            new.inbound_burst_secs,
+            new.inbound_queue_max_wait_secs,
+        );
         // 最后原子换整份配置（源真值,供冷/温读点 load() 取新值）
         self.config.store(Arc::new(new));
         tracing::info!("配置已热重载（TIER1 运行时字段即时生效;proxy/tls/端口等固化项仍需重启）");
@@ -2270,6 +2292,36 @@ impl MultiTokenManager {
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     /// - `user_id`: 可选的会话标识（取自请求 conversationId），用于会话亲和性
     pub async fn acquire_context(
+        &self,
+        model: Option<&str>,
+        user_id: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
+        // 入站整形闸门:请求进上游前先过全局令牌桶。突发被排队削平成受控 RPM,让号不被上游打爆。
+        // 超时(排队等太久)返回带 retry_after 的可重试错误,让客户端退避而非继续挤爆。
+        if let Err(retry_after) = self.throttle.acquire().await {
+            anyhow::bail!(
+                "入站限速排队超时(网关目标 {} RPM 保护上游),请 {}s 后重试",
+                self.throttle.current_target_rpm(),
+                retry_after
+            );
+        }
+        // 有请求通过 → 触发一次自动挡升档探测(内部判周期,轻量)。
+        self.throttle.maybe_step_up();
+
+        self.acquire_context_inner(model, user_id).await
+    }
+
+    /// 上游 429 反馈:让入站整形的 RPM 自动挡乘性降档(provider 检到上游限流时调用)。
+    pub fn report_upstream_rate_limited(&self) {
+        self.throttle.report_upstream_429();
+    }
+
+    /// 当前入站整形目标 RPM(可观测/运维页展示)。
+    pub fn inbound_target_rpm(&self) -> u32 {
+        self.throttle.current_target_rpm()
+    }
+
+    async fn acquire_context_inner(
         &self,
         model: Option<&str>,
         user_id: Option<&str>,
