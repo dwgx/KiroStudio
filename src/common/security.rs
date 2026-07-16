@@ -30,7 +30,7 @@ use crate::anthropic::types::ErrorResponse;
 
 /// 单条 CIDR 规则：网络地址（映射为 IPv6 的 128 位表示）+ 前缀长度。
 #[derive(Debug, Clone, Copy)]
-struct Cidr {
+pub struct Cidr {
     /// 网络地址的 128 位大端表示（IPv4 走 IPv4-mapped IPv6 ::ffff:a.b.c.d）
     network: u128,
     /// 有效前缀位数（IPv4 已按 +96 归一到 128 位空间）
@@ -39,7 +39,7 @@ struct Cidr {
 
 impl Cidr {
     /// 解析 "1.2.3.4"、"1.2.3.0/24"、"::1"、"2001:db8::/32" 等格式。
-    fn parse(s: &str) -> Result<Self, String> {
+    pub fn parse(s: &str) -> Result<Self, String> {
         let s = s.trim();
         let (addr_part, prefix_part) = match s.split_once('/') {
             Some((a, p)) => (a, Some(p)),
@@ -82,6 +82,11 @@ impl Cidr {
     fn contains(&self, addr: u128) -> bool {
         let mask = prefix_mask(self.prefix_bits);
         (addr & mask) == self.network
+    }
+
+    /// 判断某 `IpAddr` 是否落在本网段内(便捷封装,供业务层黑名单直接用 IpAddr 判定)。
+    pub fn contains_ip(&self, ip: IpAddr) -> bool {
+        self.contains(ip_to_u128(ip))
     }
 }
 

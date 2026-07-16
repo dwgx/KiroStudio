@@ -1602,8 +1602,11 @@ impl AdminService {
                 }
             }
             if cleaned != config.ip_blocklist {
-                config.ip_blocklist = cleaned;
-                restart_fields.push("ipBlocklist".into());
+                config.ip_blocklist = cleaned.clone();
+                // 业务层黑名单镜像热更(按真实客户端 IP 封禁,反代后也生效,立即生效无需重启)。
+                // 注:security 中间件的黑名单仍是 restart-only(启动时建),但业务层这道已足够拦截。
+                crate::anthropic::handlers::set_ip_blocklist(&cleaned);
+                hot_changed = true;
             }
         }
         if let Some(v) = req.trust_forwarded_header {

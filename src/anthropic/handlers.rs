@@ -65,6 +65,42 @@ pub fn set_collect_client_fingerprint(enabled: bool) {
     COLLECT_CLIENT_FINGERPRINT.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// IP 黑名单业务层镜像(ArcSwap 热更)。**与 security 中间件的黑名单互补**:
+/// 中间件用 TCP 对端 IP(反代后=反代内网 IP,拿不到真实客户端),而对话/记账路径的
+/// [`extract_client_ip`] 读 XFF/X-Real-IP 首段=**真实客户端 IP**。故在此业务层再判一次,
+/// 命中即拒——这样即便部署在 openresty/nginx 反代后、未开 trust_forwarded,也能按真实 IP 封禁。
+/// 启动时由 main 接线、admin 改 ip_blocklist 时热更(无需重启),存已解析的 Cidr 列表。
+static IP_BLOCKLIST: std::sync::OnceLock<arc_swap::ArcSwap<Vec<crate::common::security::Cidr>>> =
+    std::sync::OnceLock::new();
+
+fn ip_blocklist_cell() -> &'static arc_swap::ArcSwap<Vec<crate::common::security::Cidr>> {
+    IP_BLOCKLIST.get_or_init(|| arc_swap::ArcSwap::from_pointee(Vec::new()))
+}
+
+/// 设置业务层 IP 黑名单(启动接线 / admin 热更调用)。非法条目跳过。
+pub fn set_ip_blocklist(entries: &[String]) {
+    let mut cidrs = Vec::new();
+    for e in entries {
+        match crate::common::security::Cidr::parse(e) {
+            Ok(c) => cidrs.push(c),
+            Err(err) => tracing::warn!("业务层 IP 黑名单忽略非法条目 '{}': {}", e, err),
+        }
+    }
+    ip_blocklist_cell().store(std::sync::Arc::new(cidrs));
+}
+
+/// 判断某客户端 IP 字符串是否命中黑名单(命中=应拒绝)。空黑名单恒 false。
+fn ip_is_blocked(ip_str: &str) -> bool {
+    let list = ip_blocklist_cell().load();
+    if list.is_empty() {
+        return false;
+    }
+    match ip_str.parse::<std::net::IpAddr>() {
+        Ok(ip) => list.iter().any(|c| c.contains_ip(ip)),
+        Err(_) => false,
+    }
+}
+
 fn collect_client_fingerprint() -> bool {
     COLLECT_CLIENT_FINGERPRINT.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -547,6 +583,18 @@ pub async fn post_messages(
 
     // 从入站请求头 + TCP 对端地址识别来源画像（设备/IP/OS/浏览器，用于「最近请求」展示）
     let client = ClientInfo::from_headers_with_peer(&headers, Some(peer));
+    // IP 黑名单(业务层,按真实客户端 IP 判定):反代后中间件只看到反代内网 IP,故在此按
+    // extract_client_ip 拿到的真实 IP(XFF/X-Real-IP 首段)再判一次,命中即拒绝。
+    if let Some(ip) = client.ip.as_deref() {
+        if ip_is_blocked(ip) {
+            tracing::warn!(client_ip = %ip, "IP 黑名单拦截:拒绝该来源请求(403)");
+            return (
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse::new("permission_error", "来源 IP 已被封禁")),
+            )
+                .into_response();
+        }
+    }
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
@@ -1419,6 +1467,18 @@ pub async fn post_messages_cc(
     // 从入站请求头 + TCP 对端地址识别来源画像（设备/IP/OS/浏览器，用于「最近请求」展示）
     let client = ClientInfo::from_headers_with_peer(&headers, Some(peer));
 
+    // IP 黑名单(业务层,按真实客户端 IP 判定,同 /v1/messages)。
+    if let Some(ip) = client.ip.as_deref() {
+        if ip_is_blocked(ip) {
+            tracing::warn!(client_ip = %ip, "IP 黑名单拦截:拒绝该来源请求(403)");
+            return (
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse::new("permission_error", "来源 IP 已被封禁")),
+            )
+                .into_response();
+        }
+    }
+
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
@@ -1756,6 +1816,28 @@ fn emit_buffered_usage(
     }
     client.apply(&mut record);
     crate::usage::emit_record(record);
+}
+
+#[cfg(test)]
+mod ip_blocklist_tests {
+    //! 业务层 IP 黑名单:按真实客户端 IP(XFF 首段)封禁,反代后也生效。
+    use super::*;
+
+    #[test]
+    fn test_ip_blocklist_business_layer() {
+        // 空黑名单:任何 IP 都不拦。
+        set_ip_blocklist(&[]);
+        assert!(!ip_is_blocked("223.73.32.14"));
+        // 设单 IP + 子网。
+        set_ip_blocklist(&["223.73.32.14/32".to_string(), "10.0.0.0/8".to_string()]);
+        assert!(ip_is_blocked("223.73.32.14"), "命中单 IP 应拦");
+        assert!(ip_is_blocked("10.1.2.3"), "命中子网应拦");
+        assert!(!ip_is_blocked("8.8.8.8"), "不在黑名单应放行");
+        assert!(!ip_is_blocked("not-an-ip"), "非法 IP 字符串不拦(不 panic)");
+        // 清空恢复(避免污染其它测试的全局镜像)。
+        set_ip_blocklist(&[]);
+        assert!(!ip_is_blocked("223.73.32.14"));
+    }
 }
 
 #[cfg(test)]
