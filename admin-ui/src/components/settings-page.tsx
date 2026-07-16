@@ -270,6 +270,7 @@ interface FormState {
   // 反代安全（批次3）：列表用换行分隔的多行文本承载
   corsAllowedOrigins: string
   ipAllowlist: string
+  ipBlocklist: string
   trustForwardedHeader: boolean
   ingressRateLimitPerMin: string
   maxBodyBytes: string
@@ -359,6 +360,7 @@ function toForm(c: ConfigSnapshotResponse, ui: UiLayoutPrefs): FormState {
     callbackBaseUrl: c.callbackBaseUrl ?? '',
     corsAllowedOrigins: listToLines(c.corsAllowedOrigins ?? []),
     ipAllowlist: listToLines(c.ipAllowlist ?? []),
+    ipBlocklist: listToLines(c.ipBlocklist ?? []),
     trustForwardedHeader: c.trustForwardedHeader,
     ingressRateLimitPerMin: String(c.ingressRateLimitPerMin),
     maxBodyBytes: String(c.maxBodyBytes),
@@ -1524,6 +1526,8 @@ export function SettingsPage() {
     if (!sameList(origins, config.corsAllowedOrigins ?? [])) d.corsAllowedOrigins = origins
     const allowlist = linesToList(form.ipAllowlist)
     if (!sameList(allowlist, config.ipAllowlist ?? [])) d.ipAllowlist = allowlist
+    const blocklist = linesToList(form.ipBlocklist)
+    if (!sameList(blocklist, config.ipBlocklist ?? [])) d.ipBlocklist = blocklist
     if (form.trustForwardedHeader !== config.trustForwardedHeader) d.trustForwardedHeader = form.trustForwardedHeader
     const ingress = Number(form.ingressRateLimitPerMin)
     if (Number.isFinite(ingress) && ingress !== config.ingressRateLimitPerMin) d.ingressRateLimitPerMin = ingress
@@ -2280,6 +2284,18 @@ export function SettingsPage() {
               value={form.ipAllowlist}
               onChange={(e) => set('ipAllowlist', e.target.value)}
               placeholder={t('settingspage.security.ip.ph')}
+              spellCheck={false}
+            />
+          </Field>
+          <Field
+            label={t('settingspage.security.ipBlock.label')}
+            hint={t('settingspage.security.ipBlock.hint')}
+          >
+            <textarea
+              className="flex min-h-[72px] w-full max-w-[260px] rounded-md border border-input bg-background px-3 py-2 font-mono text-xs ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              value={form.ipBlocklist}
+              onChange={(e) => set('ipBlocklist', e.target.value)}
+              placeholder={t('settingspage.security.ipBlock.ph')}
               spellCheck={false}
             />
           </Field>

@@ -1,5 +1,6 @@
 import { useState, useEffect, useMemo, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
+import i18n from '@/i18n'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import {
@@ -55,23 +56,24 @@ function formatTraceTime(tsMs: number): string {
 }
 
 // RFC3339 → 相对时间(与 settings-page timeAgo 同实现,回收站行复用)。
+// 每次渲染调用：i18n 单例取当前语言。
 function timeAgo(iso: string | null | undefined): string {
   if (!iso) return '—'
-  const t = new Date(iso).getTime()
-  if (!Number.isFinite(t)) return iso
-  const diff = Date.now() - t
-  if (diff < 0) return '刚刚'
+  const ts = new Date(iso).getTime()
+  if (!Number.isFinite(ts)) return iso
+  const diff = Date.now() - ts
+  if (diff < 0) return i18n.t('opsdetaildialogs.timeAgo.justNow')
   const sec = Math.floor(diff / 1000)
-  if (sec < 60) return `${sec} 秒前`
+  if (sec < 60) return `${sec} ${i18n.t('opsdetaildialogs.timeAgo.secondsAgo')}`
   const min = Math.floor(sec / 60)
-  if (min < 60) return `${min} 分钟前`
+  if (min < 60) return `${min} ${i18n.t('opsdetaildialogs.timeAgo.minutesAgo')}`
   const hour = Math.floor(min / 60)
-  if (hour < 24) return `${hour} 小时前`
+  if (hour < 24) return `${hour} ${i18n.t('opsdetaildialogs.timeAgo.hoursAgo')}`
   const day = Math.floor(hour / 24)
-  if (day < 30) return `${day} 天前`
+  if (day < 30) return `${day} ${i18n.t('opsdetaildialogs.timeAgo.daysAgo')}`
   const month = Math.floor(day / 30)
-  if (month < 12) return `${month} 个月前`
-  return `${Math.floor(month / 12)} 年前`
+  if (month < 12) return `${month} ${i18n.t('opsdetaildialogs.timeAgo.monthsAgo')}`
+  return `${Math.floor(month / 12)} ${i18n.t('opsdetaildialogs.timeAgo.yearsAgo')}`
 }
 
 // 大数字千分位(tokens/credits)。
@@ -122,9 +124,9 @@ function DateTimeField({
         size="sm"
         className="h-8 shrink-0 px-1.5 text-[10px] text-muted-foreground hover:text-[#ededed]"
         onClick={() => onChange(nowLocal())}
-        title="设为此刻"
+        title={t('opsdetaildialogs.datetime.setToNow')}
       >
-        此刻
+        {t('opsdetaildialogs.datetime.now')}
       </Button>
       {value && (
         <Button
@@ -142,27 +144,28 @@ function DateTimeField({
   )
 }
 
-// outcome → Badge 变体 + 中文短标签。success 绿 / rate_limited 黄 / 其余红。
-const OUTCOME_META: Record<string, { label: string; variant: BadgeProps['variant'] }> = {
-  success: { label: '成功', variant: 'success' },
-  rate_limited: { label: '限流', variant: 'warning' },
-  auth_failed: { label: '鉴权失败', variant: 'destructive' },
-  quota_exhausted: { label: '额度耗尽', variant: 'destructive' },
-  account_suspended: { label: '账号封禁', variant: 'destructive' },
-  server_error: { label: '服务错误', variant: 'destructive' },
-  bad_request: { label: '请求错误', variant: 'destructive' },
-  network_error: { label: '网络错误', variant: 'destructive' },
-  other_error: { label: '其他错误', variant: 'destructive' },
+// outcome → Badge 变体 + i18n key。success 绿 / rate_limited 黄 / 其余红。
+// labelKey 在渲染时 t()，切语言实时更新。
+const OUTCOME_META: Record<string, { labelKey: string; variant: BadgeProps['variant'] }> = {
+  success: { labelKey: 'opsdetaildialogs.outcome.success', variant: 'success' },
+  rate_limited: { labelKey: 'opsdetaildialogs.outcome.rateLimited', variant: 'warning' },
+  auth_failed: { labelKey: 'opsdetaildialogs.outcome.authFailed', variant: 'destructive' },
+  quota_exhausted: { labelKey: 'opsdetaildialogs.outcome.quotaExhausted', variant: 'destructive' },
+  account_suspended: { labelKey: 'opsdetaildialogs.outcome.accountSuspended', variant: 'destructive' },
+  server_error: { labelKey: 'opsdetaildialogs.outcome.serverError', variant: 'destructive' },
+  bad_request: { labelKey: 'opsdetaildialogs.outcome.badRequest', variant: 'destructive' },
+  network_error: { labelKey: 'opsdetaildialogs.outcome.networkError', variant: 'destructive' },
+  other_error: { labelKey: 'opsdetaildialogs.outcome.otherError', variant: 'destructive' },
 }
 
-function outcomeMeta(oc: string): { label: string; variant: BadgeProps['variant'] } {
+function outcomeMeta(oc: string): { labelKey?: string; label?: string; variant: BadgeProps['variant'] } {
   return OUTCOME_META[oc] ?? { label: oc, variant: 'secondary' }
 }
 
-// outcome 下拉选项(空=全部)。
-const OUTCOME_OPTIONS = [
-  { value: '', label: '全部结果' },
-  ...Object.entries(OUTCOME_META).map(([value, m]) => ({ value, label: m.label })),
+// outcome 下拉选项 keys（空=全部）；渲染时 map + t()。
+const OUTCOME_OPTION_DEFS = [
+  { value: '', labelKey: 'opsdetaildialogs.outcome.allResults' },
+  ...Object.entries(OUTCOME_META).map(([value, m]) => ({ value, labelKey: m.labelKey })),
 ]
 
 const PAGE_SIZE = 50
@@ -447,7 +450,7 @@ export function TraceDetailDialog({
                 <Select
                   value={outcome}
                   onChange={setOutcome}
-                  options={OUTCOME_OPTIONS}
+                  options={OUTCOME_OPTION_DEFS.map((o) => ({ value: o.value, label: t(o.labelKey) }))}
                   aria-label={t('opsdetaildialogs.trace.filterByResult')}
                   className="[&>button]:h-8 [&>button]:py-1 [&>button]:text-xs"
                 />
@@ -583,6 +586,7 @@ function TraceRow({
 }) {
   const { t } = useTranslation()
   const oc = outcomeMeta(it.outcome)
+  const ocLabel = oc.labelKey ? t(oc.labelKey) : (oc.label ?? it.outcome)
   const sessShort = it.session_id ? `${it.session_id.slice(0, 8)}…` : '—'
   // 可点击的联动值(阻止冒泡,避免同时触发行展开)。
   const pivot = (fn: () => void) => (e: React.MouseEvent) => {
@@ -646,7 +650,7 @@ function TraceRow({
           {it.latency_ms} ms
         </td>
         <td>
-          <Badge variant={oc.variant} className="text-[10px]">{oc.label}</Badge>
+          <Badge variant={oc.variant} className="text-[10px]">{ocLabel}</Badge>
         </td>
       </tr>
       {expanded && (
@@ -711,11 +715,11 @@ export function UsageDetailDialog({
 
   // 时间窗切换:24h / 7天 / 30天 / 全部(数据均已在 overview 里,零额外请求)。
   const [win, setWin] = useState<'last_24h' | 'last_7d' | 'last_30d' | 'all_time'>('last_24h')
-  const WINDOW_OPTIONS: { key: typeof win; label: string }[] = [
-    { key: 'last_24h', label: '24 小时' },
-    { key: 'last_7d', label: '7 天' },
-    { key: 'last_30d', label: '30 天' },
-    { key: 'all_time', label: '全部' },
+  const WINDOW_OPTIONS: { key: typeof win; labelKey: string }[] = [
+    { key: 'last_24h', labelKey: 'opsdetaildialogs.window.last24h' },
+    { key: 'last_7d', labelKey: 'opsdetaildialogs.window.last7d' },
+    { key: 'last_30d', labelKey: 'opsdetaildialogs.window.last30d' },
+    { key: 'all_time', labelKey: 'opsdetaildialogs.window.allTime' },
   ]
   const w = overview?.[win]
 
@@ -758,7 +762,7 @@ export function UsageDetailDialog({
                     : 'text-muted-foreground hover:text-[#ededed]')
                 }
               >
-                {opt.label}
+                {t(opt.labelKey)}
               </button>
             ))}
           </div>
@@ -809,6 +813,7 @@ export function UsageDetailDialog({
 }
 
 // 从分组统计构建饼图段:按取值降序,取前 8,其余聚合成「其它」;循环取主题色。
+// 每次调用解析 i18n（非模块 import 时求值）。
 function buildPieSegments(
   rows: GroupStat[] | undefined,
   pick: (r: GroupStat) => number,
@@ -827,7 +832,7 @@ function buildPieSegments(
   }))
   if (rest.length > 0) {
     segments.push({
-      label: `其它(${rest.length})`,
+      label: i18n.t('opsdetaildialogs.pieChart.other', { n: rest.length }),
       value: rest.reduce((s, r) => s + r.value, 0),
       color: PIE_COLORS[PIE_COLORS.length - 1],
     })
@@ -1032,8 +1037,7 @@ export function TrashDetailDialog({
             )}
           </DialogTitle>
           <DialogDescription>
-            已删除的凭据暂存于此,可恢复回号池或永久清除。永久清除
-            <strong className="text-red-400">{t('opsdetaildialogs.trash.notRecoverable')}</strong>。
+            {t('opsdetaildialogs.trash.description')}
           </DialogDescription>
         </DialogHeader>
 
@@ -1108,12 +1112,7 @@ export function TrashDetailDialog({
         open={purgeTarget !== null}
         onOpenChange={(v) => !v && setPurgeTarget(null)}
         title={t('opsdetaildialogs.trash.confirmTitle', { id: purgeTarget?.id ?? '' })}
-        description={
-          <span>
-            此操作将<strong className="text-red-400">永久删除,无法恢复</strong>
-            ,该凭据将从回收站彻底清除。确定继续？
-          </span>
-        }
+        description={t('opsdetaildialogs.trash.confirmDescription')}
         confirmLabel={t('opsdetaildialogs.trash.confirmPurgeLabel')}
         destructive
         loading={busyId !== null && busyId === purgeTarget?.id}
@@ -1221,14 +1220,14 @@ export function BgCacheDetailDialog({
             </span>
           </DialogTitle>
           <DialogDescription>
-            常驻内存的登录页随机背景图池。单击放大预览,Ctrl/⌘+单击勾选多张后可批量下载,悬停右上角可下载单张。清理即释放内存(下次登录会重新拉取填充)。
+            {t('opsdetaildialogs.bgcache.description')}
           </DialogDescription>
         </DialogHeader>
 
         {/* 多选工具栏:有勾选时出现,批量下载 / 清空选择。 */}
         {selectedImgs.size > 0 && (
           <div className="flex items-center gap-2 rounded-md border border-primary/40 bg-primary/[0.06] px-3 py-2 text-sm">
-            <span className="text-[#ededed]">已选 {selectedImgs.size} 张</span>
+            <span className="text-[#ededed]">{t('opsdetaildialogs.bgcache.selected', { n: selectedImgs.size })}</span>
             <div className="ml-auto flex items-center gap-2">
               <button
                 type="button"
@@ -1236,7 +1235,7 @@ export function BgCacheDetailDialog({
                 className="flex items-center gap-1 rounded bg-primary/80 px-2.5 py-1 text-xs text-white hover:bg-primary"
               >
                 <Download className="h-3.5 w-3.5" />
-                批量下载
+                {t('opsdetaildialogs.bgcache.batchDownload')}
               </button>
               <button
                 type="button"
@@ -1281,7 +1280,7 @@ export function BgCacheDetailDialog({
                       e.stopPropagation()
                       toggleSelect(i)
                     }}
-                    title={isSel ? '取消选择' : '勾选(可批量下载)'}
+                    title={isSel ? t('opsdetaildialogs.bgcache.deselect') : t('opsdetaildialogs.bgcache.toggleSelect')}
                     className={cn(
                       'absolute left-1.5 bottom-1.5 flex h-6 w-6 items-center justify-center rounded transition-opacity',
                       isSel

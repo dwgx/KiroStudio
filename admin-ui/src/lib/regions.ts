@@ -1,6 +1,6 @@
 // AWS 区域列表 + 中文名 + 中英文搜索关键词。
-// 手写维护，不引入任何 i18n / 地区数据库依赖。
 // region-select 组件与各处 regionLabel() 展示共用此数据源。
+import i18n from '@/i18n'
 
 export interface AwsRegion {
   /** 区域代码，如 us-east-1 */
@@ -41,17 +41,25 @@ export const AWS_REGIONS: AwsRegion[] = [
 
 const REGION_MAP = new Map<string, AwsRegion>(AWS_REGIONS.map((r) => [r.code, r]))
 
-/** code -> 中文名；未知 code 原样返回，便于兼容 AWS 新区。 */
-export function regionLabel(code: string | null | undefined): string {
-  if (!code) return '未设置'
-  return REGION_MAP.get(code)?.label ?? code
+/** 展示名：中文界面用中文名，其它语言用城市英文名；未知 code 原样返回。 */
+function regionDisplayName(r: AwsRegion): string {
+  const lng = (i18n.language || 'zh').toLowerCase()
+  if (lng.startsWith('zh')) return r.label
+  return r.city
 }
 
-/** code -> "中文名 · code"，用于既要中文又要保留原始代码的展示位。 */
-export function regionLabelWithCode(code: string | null | undefined): string {
-  if (!code) return '未设置'
+/** code -> 本地化名；未知 code 原样返回，便于兼容 AWS 新区。 */
+export function regionLabel(code: string | null | undefined): string {
+  if (!code) return i18n.t('labels.region.unset')
   const r = REGION_MAP.get(code)
-  return r ? `${r.label}（${r.code}）` : code
+  return r ? regionDisplayName(r) : code
+}
+
+/** code -> "本地化名 · code"，用于既要可读名又要保留原始代码的展示位。 */
+export function regionLabelWithCode(code: string | null | undefined): string {
+  if (!code) return i18n.t('labels.region.unset')
+  const r = REGION_MAP.get(code)
+  return r ? `${regionDisplayName(r)} (${r.code})` : code
 }
 
 /** 关键词过滤：匹配 code / 中文名 / 城市英文名 / 别名，全部大小写不敏感。 */

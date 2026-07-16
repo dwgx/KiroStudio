@@ -1,4 +1,5 @@
 import { useMemo } from 'react'
+import { useTranslation } from 'react-i18next'
 import type { CredentialStatusItem } from '@/types/api'
 import type { CellActivity } from '@/components/overview/StatusHeatmap'
 import { healthOf, HEALTH_RGB, EmptyPool, useHoverCard } from '@/components/overview/credViz'
@@ -59,6 +60,7 @@ function placeNodes(creds: CredentialStatusItem[]): { nodes: PlacedNode[]; rings
  * 纯 SVG + Radix Tooltip，无图表库；motion-reduce 下去掉涟漪/脉冲，仅保留静态节点。
  */
 export function OrbitRing({ credentials, activity, className }: OrbitRingProps) {
+  const { t } = useTranslation()
   const { nodes, rings } = useMemo(() => placeNodes(credentials), [credentials])
   // 鼠标跟随悬浮卡（替代 Radix Tooltip 固定 side 的边缘翻转，卡片黏着鼠标走）。
   const hoverCard = useHoverCard()
@@ -172,7 +174,7 @@ export function OrbitRing({ credentials, activity, className }: OrbitRingProps) 
               <span className="text-base text-muted-foreground"> / {credentials.length}</span>
             </span>
             <span className="mt-0.5 text-[11px] uppercase tracking-wider text-muted-foreground">
-              可用 / 总数
+              {t('overviewpage.orbit.availableTotal')}
             </span>
           </div>
         </div>

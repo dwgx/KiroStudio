@@ -1,3 +1,5 @@
+import { useTranslation } from 'react-i18next'
+
 export interface Segment {
   label: string
   value: number
@@ -15,13 +17,14 @@ export interface SegmentedBarProps {
  * 段宽用 flex-grow 占比，宽度变化带 CSS 过渡；空数据显示占位。
  */
 export function SegmentedBar({ segments, className }: SegmentedBarProps) {
+  const { t } = useTranslation()
   const total = segments.reduce((s, seg) => s + seg.value, 0)
 
   if (total === 0) {
     return (
       <div className={className}>
         <div className="h-2.5 w-full rounded-full bg-muted" />
-        <p className="mt-3 text-sm text-muted-foreground">暂无数据</p>
+        <p className="mt-3 text-sm text-muted-foreground">{t('overviewpage.dashboard.summary.noData')}</p>
       </div>
     )
   }

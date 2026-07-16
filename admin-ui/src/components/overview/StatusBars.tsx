@@ -1,4 +1,6 @@
 import { useMemo } from 'react'
+import { useTranslation } from 'react-i18next'
+import i18n from '@/i18n'
 import type { CredentialStatusItem, CachedBalanceItem } from '@/types/api'
 import type { CellActivity } from '@/components/overview/StatusHeatmap'
 import { healthOf, HEALTH_RGB, EmptyPool, useHoverCard } from '@/components/overview/credViz'
@@ -36,7 +38,7 @@ function fmtAmount(n: number): string {
 // 密集条带里的超短相对时间：5s / 3m / 2h / 4d（tooltip 里仍走完整“x 分钟前”）。
 function agoShort(ts: number): string {
   const s = Math.floor((Date.now() - ts) / 1000)
-  if (s < 5) return '刚刚'
+  if (s < 5) return i18n.t('credentialcard.lastUsed.justNow')
   if (s < 60) return `${s}s`
   const m = Math.floor(s / 60)
   if (m < 60) return `${m}m`
@@ -127,7 +129,7 @@ function CellFlow({
     return (
       <div
         className="relative flex h-4 w-[84px] shrink-0 items-center overflow-hidden rounded-[2px]"
-        title={`火力全开（RPM ${rpm} · 在途 ${inflight}）`}
+        title={i18n.t('overviewpage.bar.fireFull', { rpm, inflight })}
         aria-hidden
       >
         {/* 火焰强度由 RPM/在途派生:越猛越偏 Ruby 红(满档最强);青→绿→金→橙→紫→白热→Ruby 红 7 档连续过渡 */}
@@ -180,7 +182,17 @@ function CellFlow({
     <div
       className="relative grid h-4 w-[84px] shrink-0 gap-[1.5px] overflow-hidden rounded-[2px]"
       style={{ gridTemplateColumns: `repeat(${GRID_COLS}, 1fr)`, gridTemplateRows: `repeat(${GRID_ROWS}, 1fr)` }}
-      title={active ? `算力利用率 ${(level * 100).toFixed(0)}%（${litCount}/${GRID_CELLS} 核 · RPM ${rpm} · 在途 ${inflight}）` : '空闲'}
+      title={
+        active
+          ? i18n.t('overviewpage.bar.utilization', {
+              pct: (level * 100).toFixed(0),
+              lit: litCount,
+              total: GRID_CELLS,
+              rpm,
+              inflight,
+            })
+          : i18n.t('overviewpage.bar.idle')
+      }
       aria-hidden
     >
       {cells.map((c, i) => {
@@ -246,6 +258,7 @@ function CellFlow({
  * 纯 CSS transform/opacity（GPU 合成）+ Radix Tooltip，数百号不常驻数百动画，motion-reduce 降级。
  */
 export function StatusBars({ credentials, activity, balances, saturatedIds, className }: StatusBarsProps) {
+  const { t } = useTranslation()
   // 缓存余额：优先用外部传入（全页共享），否则自订阅（react-query 去重，零额外上游）。
   const { data: cached } = useCachedBalances()
   const balanceMap = balances ?? cached?.balances
@@ -338,7 +351,7 @@ export function StatusBars({ credentials, activity, balances, saturatedIds, clas
                     }`}
                     title={isCustomApi ? c.baseUrl : undefined}
                   >
-                    {c.name || c.email || (isCustomApi ? hostOf(c.baseUrl) ?? '自定义 API' : '无邮箱')}
+                    {c.name || c.email || (isCustomApi ? hostOf(c.baseUrl) ?? t('overviewpage.bar.customApi') : t('overviewpage.bar.noEmail'))}
                   </span>
                   {/* 订阅等级：固定等宽槽位（无论有无都占位），保证各行标签对齐不跳动。
                       槽宽加到 100px 容下最长的 "KIRO PRO MAX"（原 76px 会把它截成 "KIRO PRO M…"）。
@@ -346,7 +359,7 @@ export function StatusBars({ credentials, activity, balances, saturatedIds, clas
                   <span className="hidden w-[100px] shrink-0 sm:block">
                     {isCustomApi ? (
                       <span className="inline-block max-w-full whitespace-nowrap rounded bg-violet-500/15 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wide text-violet-300/90">
-                        代挂 API
+                        {t('overviewpage.bar.proxyApi')}
                       </span>
                     ) : sub ? (
                       <span className="inline-block max-w-full whitespace-nowrap rounded bg-secondary/70 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wide text-muted-foreground/90">
@@ -370,7 +383,7 @@ export function StatusBars({ credentials, activity, balances, saturatedIds, clas
                     usagePct !== null ? (
                       <div
                         className="flex w-[92px] shrink-0 items-center gap-1.5"
-                        title={`请求用量 ${reqCount} / ${reqLimit}`}
+                        title={t('overviewpage.bar.reqUsage', { count: reqCount, limit: reqLimit })}
                       >
                         <span
                           className={`w-8 shrink-0 text-right font-mono text-[10px] tabular-nums ${usageTone(usagePct).text}`}
@@ -387,15 +400,15 @@ export function StatusBars({ credentials, activity, balances, saturatedIds, clas
                     ) : (
                       <span
                         className="w-[92px] shrink-0 text-right font-mono text-[10px] tabular-nums text-muted-foreground/70"
-                        title="累计透传请求数（不限上限）"
+                        title={t('overviewpage.bar.totalPassthrough')}
                       >
-                        {reqCount} 次
+                        {t('overviewpage.bar.times', { n: reqCount })}
                       </span>
                     )
                   ) : remainingPct !== null ? (
                     <div
                       className="flex w-[92px] shrink-0 items-center gap-1.5"
-                      title={`剩余 ${fmtAmount(remaining)} / ${fmtAmount(limit)}`}
+                      title={t('overviewpage.bar.remaining', { remaining: fmtAmount(remaining), limit: fmtAmount(limit) })}
                     >
                       <span
                         className={`w-8 shrink-0 text-right font-mono text-[10px] tabular-nums ${pctTone(remainingPct).text}`}
@@ -425,7 +438,7 @@ export function StatusBars({ credentials, activity, balances, saturatedIds, clas
                   <span className="flex w-[52px] shrink-0 justify-end" aria-hidden={!(inflight > 0)}>
                     {inflight > 0 && (
                       <span className="rounded bg-primary/15 px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-primary">
-                        在途 {inflight}
+                        {t('overviewpage.row.inflight', { n: inflight })}
                       </span>
                     )}
                   </span>

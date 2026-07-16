@@ -1101,6 +1101,7 @@ impl AdminService {
             callback_base_url: config.callback_base_url.clone(),
             cors_allowed_origins: config.cors_allowed_origins.clone(),
             ip_allowlist: config.ip_allowlist.clone(),
+            ip_blocklist: config.ip_blocklist.clone(),
             trust_forwarded_header: config.trust_forwarded_header,
             ingress_rate_limit_per_min: config.ingress_rate_limit_per_min,
             max_body_bytes: config.max_body_bytes,
@@ -1587,6 +1588,22 @@ impl AdminService {
             if cleaned != config.ip_allowlist {
                 config.ip_allowlist = cleaned;
                 restart_fields.push("ipAllowlist".into());
+            }
+        }
+        if let Some(v) = req.ip_blocklist {
+            let cleaned: Vec<String> =
+                v.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            // 校验每条 CIDR 合法,非法直接拒绝。
+            for entry in &cleaned {
+                if let Err(e) = crate::common::security::validate_cidr(entry) {
+                    return Err(AdminServiceError::InvalidCredential(format!(
+                        "ipBlocklist 条目 '{entry}' 非法: {e}"
+                    )));
+                }
+            }
+            if cleaned != config.ip_blocklist {
+                config.ip_blocklist = cleaned;
+                restart_fields.push("ipBlocklist".into());
             }
         }
         if let Some(v) = req.trust_forwarded_header {

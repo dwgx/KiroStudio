@@ -1,3 +1,4 @@
+import { useTranslation } from 'react-i18next'
 import type { CredentialStatusItem } from '@/types/api'
 import { useHoverCard } from '@/components/overview/credViz'
 
@@ -26,11 +27,12 @@ export interface StatusHeatmapProps {
  * 纯 CSS，无图表库；motion-reduce 降级。
  */
 export function StatusHeatmap({ credentials, activity, className }: StatusHeatmapProps) {
+  const { t } = useTranslation()
   // 鼠标跟随悬浮卡（替代 Radix Tooltip 固定 side 的边缘翻转，卡片黏着鼠标走）。
   const hoverCard = useHoverCard()
 
   if (credentials.length === 0) {
-    return <p className={className}>暂无凭据</p>
+    return <p className={className}>{t('overviewpage.kpi.totalCreds.empty')}</p>
   }
 
   const cellClass = (c: CredentialStatusItem): string => {
@@ -73,16 +75,16 @@ export function StatusHeatmap({ credentials, activity, className }: StatusHeatma
         {/* 图例 */}
         <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1.5 text-xs text-muted-foreground">
           <span className="flex items-center gap-1.5">
-            <span className="h-2.5 w-2.5 rounded-[3px] bg-emerald-500/80" /> 健康
+            <span className="h-2.5 w-2.5 rounded-[3px] bg-emerald-500/80" /> {t('overviewpage.health.healthy')}
           </span>
           <span className="flex items-center gap-1.5">
-            <span className="h-2.5 w-2.5 rounded-[3px] bg-amber-500/80" /> 有失败
+            <span className="h-2.5 w-2.5 rounded-[3px] bg-amber-500/80" /> {t('overviewpage.health.withFailure')}
           </span>
           <span className="flex items-center gap-1.5">
-            <span className="h-2.5 w-2.5 rounded-[3px] bg-red-500/80" /> 已禁用
+            <span className="h-2.5 w-2.5 rounded-[3px] bg-red-500/80" /> {t('overviewpage.health.disabled')}
           </span>
           <span className="flex items-center gap-1.5">
-            <span className="h-2.5 w-2.5 rounded-[3px] bg-transparent ring-1 ring-primary/70" /> 当前活跃
+            <span className="h-2.5 w-2.5 rounded-[3px] bg-transparent ring-1 ring-primary/70" /> {t('overviewpage.legend.currentActive')}
           </span>
         </div>
       {/* 鼠标跟随悬浮卡（正文 CredTooltipBody 不变，仅定位改为黏鼠标） */}
