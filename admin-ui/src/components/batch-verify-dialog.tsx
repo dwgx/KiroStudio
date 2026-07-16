@@ -1,3 +1,4 @@
+import { useTranslation } from 'react-i18next'
 import {
   Dialog,
   DialogContent,
@@ -32,6 +33,7 @@ export function BatchVerifyDialog({
   results,
   onCancel,
 }: BatchVerifyDialogProps) {
+  const { t } = useTranslation()
   const resultsArray = Array.from(results.values())
   const successCount = resultsArray.filter(r => r.status === 'success').length
   const failedCount = resultsArray.filter(r => r.status === 'failed').length
@@ -40,7 +42,7 @@ export function BatchVerifyDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>批量验活</DialogTitle>
+          <DialogTitle>{t('batchverifydialog.title')}</DialogTitle>
         </DialogHeader>
 
         <div className="space-y-4 py-4">
@@ -48,7 +50,7 @@ export function BatchVerifyDialog({
           {verifying && (
             <div className="space-y-2">
               <div className="flex justify-between text-sm">
-                <span>验活进度</span>
+                <span>{t('batchverifydialog.progress')}</span>
                 <span>{progress.current} / {progress.total}</span>
               </div>
               <div className="w-full bg-secondary rounded-full h-2">
@@ -63,9 +65,9 @@ export function BatchVerifyDialog({
           {/* 统计信息 */}
           {results.size > 0 && (
             <div className="flex justify-between text-sm font-medium">
-              <span>验活结果</span>
+              <span>{t('batchverifydialog.results')}</span>
               <span>
-                成功: {successCount} / 失败: {failedCount}
+                {t('batchverifydialog.summary', { success: successCount, failed: failedCount })}
               </span>
             </div>
           )}
@@ -88,7 +90,7 @@ export function BatchVerifyDialog({
                 >
                   <div className="flex items-start justify-between gap-2">
                     <div className="flex items-center gap-2">
-                      <span className="font-medium">凭据 #{result.id}</span>
+                      <span className="font-medium">{t('batchverifydialog.credential', { id: result.id })}</span>
                       {result.status === 'success' && result.usage && (
                         <Badge variant="secondary" className="text-xs">
                           {result.usage}
@@ -104,7 +106,7 @@ export function BatchVerifyDialog({
                   </div>
                   {result.error && (
                     <div className="text-xs mt-1 opacity-90">
-                      错误: {result.error}
+                      {t('batchverifydialog.error', { error: result.error })}
                     </div>
                   )}
                 </div>
@@ -116,7 +118,7 @@ export function BatchVerifyDialog({
           {verifying && (
             <p className="flex items-start gap-1.5 text-xs text-muted-foreground">
               <Lightbulb className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-              <span>验活过程中每次请求间隔 2 秒，防止被封号。你可以关闭此窗口，验活会在后台继续进行。</span>
+              <span>{t('batchverifydialog.hint')}</span>
             </p>
           )}
         </div>
@@ -129,14 +131,14 @@ export function BatchVerifyDialog({
                 variant="outline"
                 onClick={() => onOpenChange(false)}
               >
-                后台运行
+                {t('batchverifydialog.button.background')}
               </Button>
               <Button
                 type="button"
                 variant="destructive"
                 onClick={onCancel}
               >
-                取消验活
+                {t('batchverifydialog.button.cancel')}
               </Button>
             </>
           ) : (
@@ -144,7 +146,7 @@ export function BatchVerifyDialog({
               type="button"
               onClick={() => onOpenChange(false)}
             >
-              关闭
+              {t('batchverifydialog.button.close')}
             </Button>
           )}
         </div>

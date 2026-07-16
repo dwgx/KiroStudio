@@ -1,3 +1,4 @@
+import { useTranslation } from 'react-i18next'
 import {
   Dialog,
   DialogContent,
@@ -15,16 +16,24 @@ interface BalanceDialogProps {
   onOpenChange: (open: boolean) => void
 }
 
+function localeForLang(lang: string): string {
+  if (lang.startsWith('ja')) return 'ja-JP'
+  if (lang.startsWith('en')) return 'en-US'
+  return 'zh-CN'
+}
+
 export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialogProps) {
+  const { t, i18n } = useTranslation()
   const { data: balance, isLoading, error } = useCredentialBalance(credentialId)
+  const locale = localeForLang(i18n.language)
 
   const formatDate = (timestamp: number | null) => {
-    if (!timestamp) return '未知'
-    return new Date(timestamp * 1000).toLocaleString('zh-CN')
+    if (!timestamp) return t('balancedialog.unknown')
+    return new Date(timestamp * 1000).toLocaleString(locale)
   }
 
   const formatNumber = (num: number) => {
-    return num.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+    return num.toLocaleString(locale, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
   }
 
   return (
@@ -32,7 +41,7 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>
-            凭据 #{credentialId} 余额信息
+            {t('balancedialog.title', { credentialId })}
           </DialogTitle>
         </DialogHeader>
 
@@ -83,32 +92,32 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
             {/* 订阅类型 */}
             <div className="text-center">
               <span className="text-lg font-semibold">
-                {balance.subscriptionTitle || '未知订阅类型'}
+                {balance.subscriptionTitle || t('balancedialog.unknownSubscription')}
               </span>
             </div>
 
             {/* 使用进度 */}
             <div className="space-y-2">
               <div className="flex justify-between text-sm">
-                <span>已使用: ${formatNumber(balance.currentUsage)}</span>
-                <span>限额: ${formatNumber(balance.usageLimit)}</span>
+                <span>{t('balancedialog.used', { amount: formatNumber(balance.currentUsage) })}</span>
+                <span>{t('balancedialog.limit', { amount: formatNumber(balance.usageLimit) })}</span>
               </div>
               <Progress value={balance.usagePercentage} />
               <div className="text-center text-sm text-muted-foreground">
-                {balance.usagePercentage.toFixed(1)}% 已使用
+                {t('balancedialog.usedPercent', { percent: balance.usagePercentage.toFixed(1) })}
               </div>
             </div>
 
             {/* 详细信息 */}
             <div className="grid grid-cols-2 gap-4 pt-4 border-t text-sm">
               <div>
-                <span className="text-muted-foreground">剩余额度：</span>
+                <span className="text-muted-foreground">{t('balancedialog.remaining')}</span>
                 <span className="font-medium text-green-600">
                   ${formatNumber(balance.remaining)}
                 </span>
               </div>
               <div>
-                <span className="text-muted-foreground">下次重置：</span>
+                <span className="text-muted-foreground">{t('balancedialog.nextReset')}</span>
                 <span className="font-medium">
                   {formatDate(balance.nextResetAt)}
                 </span>

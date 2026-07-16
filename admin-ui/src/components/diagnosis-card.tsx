@@ -1,16 +1,25 @@
 import { useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import { AlertCircle, ChevronDown, ChevronRight, RefreshCw, LogIn } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import type { OnboardingDiagnosis } from '@/types/api'
 
-/** 归因方 → 中文标签 + 配色（用户填错=琥珀可改，账号问题=红需重新上号，上游/瞬时=蓝可重试，网关=紫需反馈）。 */
-const FAULT_META: Record<OnboardingDiagnosis['fault'], { label: string; cls: string }> = {
-  user_input: { label: '输入问题', cls: 'border-amber-500/40 bg-amber-500/10 text-amber-400' },
-  account_state: { label: '账号状态', cls: 'border-red-500/40 bg-red-500/10 text-red-400' },
-  upstream: { label: '上游(AWS)', cls: 'border-sky-500/40 bg-sky-500/10 text-sky-400' },
-  gateway: { label: '网关未覆盖', cls: 'border-violet-500/40 bg-violet-500/10 text-violet-400' },
-  transient: { label: '瞬时故障', cls: 'border-sky-500/40 bg-sky-500/10 text-sky-400' },
+/** 归因方 → 配色（用户填错=琥珀可改，账号问题=红需重新上号，上游/瞬时=蓝可重试，网关=紫需反馈）。标签走 i18n。 */
+const FAULT_CLS: Record<OnboardingDiagnosis['fault'], string> = {
+  user_input: 'border-amber-500/40 bg-amber-500/10 text-amber-400',
+  account_state: 'border-red-500/40 bg-red-500/10 text-red-400',
+  upstream: 'border-sky-500/40 bg-sky-500/10 text-sky-400',
+  gateway: 'border-violet-500/40 bg-violet-500/10 text-violet-400',
+  transient: 'border-sky-500/40 bg-sky-500/10 text-sky-400',
+}
+
+const FAULT_LABEL_KEYS: Record<OnboardingDiagnosis['fault'], string> = {
+  user_input: 'diagnosiscard.fault.userInput',
+  account_state: 'diagnosiscard.fault.accountState',
+  upstream: 'diagnosiscard.fault.upstream',
+  gateway: 'diagnosiscard.fault.gateway',
+  transient: 'diagnosiscard.fault.transient',
 }
 
 interface DiagnosisCardProps {
@@ -24,8 +33,10 @@ interface DiagnosisCardProps {
 
 /** 上号诊断卡片：主行 summary + 归因徽标 + 有序引导步骤 + 折叠原始信息 + 可操作按钮。 */
 export function DiagnosisCard({ diagnosis, onRetry, onReLogin, className }: DiagnosisCardProps) {
+  const { t } = useTranslation()
   const [rawOpen, setRawOpen] = useState(false)
-  const fault = FAULT_META[diagnosis.fault] ?? FAULT_META.gateway
+  const faultKey = FAULT_LABEL_KEYS[diagnosis.fault] ?? FAULT_LABEL_KEYS.gateway
+  const faultCls = FAULT_CLS[diagnosis.fault] ?? FAULT_CLS.gateway
   const needReLogin =
     diagnosis.code === 'REFRESH_TOKEN_INVALID' ||
     diagnosis.code === 'CLIENT_OR_TOKEN_MISMATCH' ||
@@ -37,7 +48,7 @@ export function DiagnosisCard({ diagnosis, onRetry, onReLogin, className }: Diag
         <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-red-400" />
         <div className="min-w-0 flex-1 space-y-2">
           <div className="flex flex-wrap items-center gap-2">
-            <span className={cn('rounded border px-1.5 py-0.5 text-xs', fault.cls)}>{fault.label}</span>
+            <span className={cn('rounded border px-1.5 py-0.5 text-xs', faultCls)}>{t(faultKey)}</span>
             <span className="rounded border border-border bg-secondary/40 px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">
               {diagnosis.code}
             </span>
@@ -56,13 +67,13 @@ export function DiagnosisCard({ diagnosis, onRetry, onReLogin, className }: Diag
             {diagnosis.retriable && onRetry && (
               <Button size="sm" variant="outline" className="h-7 px-2.5" onClick={onRetry}>
                 <RefreshCw className="mr-1 h-3.5 w-3.5" />
-                重试
+                {t('diagnosiscard.button.retry')}
               </Button>
             )}
             {needReLogin && onReLogin && (
               <Button size="sm" variant="outline" className="h-7 px-2.5" onClick={onReLogin}>
                 <LogIn className="mr-1 h-3.5 w-3.5" />
-                重新上号
+                {t('diagnosiscard.button.reLogin')}
               </Button>
             )}
           </div>
@@ -75,7 +86,7 @@ export function DiagnosisCard({ diagnosis, onRetry, onReLogin, className }: Diag
                 onClick={() => setRawOpen((v) => !v)}
               >
                 {rawOpen ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
-                原始信息（排障）
+                {t('diagnosiscard.rawInfo')}
               </button>
               {rawOpen && (
                 <pre className="mt-1 max-h-40 overflow-auto rounded bg-secondary/40 p-2 font-mono text-[11px] text-muted-foreground whitespace-pre-wrap break-all">
