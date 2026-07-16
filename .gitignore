@@ -54,6 +54,9 @@ tmp-import*/
 _*.sh
 *-local-command-caveat*.txt
 
+# 归档目录：老文档统一归此,整目录不进公开 repo(含敏感历史交接/运营文档,仅留本地)
+docs/archive/
+
 # ⚠️ 敏感运营文档：绝不推公开 repo（含真实账户邮箱/M365租户GUID/AWS账户号/SSH路径/
 # adminkey 线索/号池防封策略/内部交接细节）。仅留本地。可公开的纯技术文档单独列白名单在下方。
 docs/HANDOFF-*
