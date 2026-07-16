@@ -666,6 +666,8 @@ impl KiroProvider {
                     body
                 );
                 last_outcome = crate::usage::RequestOutcome::RateLimited;
+                // 账户级风控也是上游限速信号 → 入站整形 RPM 自动降档。
+                self.token_manager.report_upstream_rate_limited();
                 // 账户级可疑活动风控：走分钟级退避（report_suspicious_activity），而非普通
                 // 429 的 15s 瞬时冷却。本请求链内该号首次触发才设冷却；再次触发只 failover，
                 // 不重复惩罚（同 rate_limited_this_call 去重，避免一条链把号砸进更深风控）。
@@ -905,6 +907,8 @@ impl KiroProvider {
                 // （仍不禁用、不计永久失败，冷却到期自动恢复）
                 if status.as_u16() == 429 {
                     last_outcome = crate::usage::RequestOutcome::RateLimited;
+                    // 上游 429 → 入站整形 RPM 自动挡乘性降档(削平后续入站速率,别继续挤爆上游)。
+                    self.token_manager.report_upstream_rate_limited();
                     // 优先用上游给出的精确重置时间：响应头 Retry-After 优先，其次错误 body
                     let retry_after = retry_after_header
                         .or_else(|| endpoint.extract_retry_after_secs(&body));
