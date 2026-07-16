@@ -122,3 +122,12 @@ export function pushRecentRegion(code: string | null | undefined): void {
     // 忽略：隐私模式 / 存储配额满时不影响功能。
   }
 }
+
+/** 清空「最近使用」历史（用户主动清理）。localStorage 写失败静默忽略（隐私模式等）。 */
+export function clearRecentRegions(): void {
+  try {
+    localStorage.removeItem(RECENT_REGIONS_KEY)
+  } catch {
+    // 忽略：隐私模式 / 存储不可用时不影响功能。
+  }
+}

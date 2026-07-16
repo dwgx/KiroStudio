@@ -329,9 +329,15 @@ export interface ConfigSnapshotResponse {
   affinityEnabled: boolean
   priorityInBalanced: boolean
   /** 智能调度（0.7.23 headroom/背压 + 0.7.24 余额加权/429 感知，均热更即时生效） */
+  /** 全局每号 RPM 软上限（单号 rpm_limit=0 时继承此值；此值也为 0 时用内置兜底 30） */
+  credentialRpmLimit: number
   rpmHeadroomFactor: number
   rpmReserveSlots: number
   rpmHardGateOverloadWait: boolean
+  /** 冷却时长缩放百分比（10..500，100=原时长；<100 更激进快重试，>100 更保守防封） */
+  cooldownScalePct: number
+  /** 拟人速率：请求间隔抖动百分比（0..50），让节奏更像人 */
+  rateLimitJitterPct: number
   balanceWeightEnabled: boolean
   balanceWeightFloor: number
   health429WeightEnabled: boolean
@@ -389,9 +395,12 @@ export interface UpdateConfigRequest {
   rateLimitMinIntervalMs?: number
   affinityEnabled?: boolean
   priorityInBalanced?: boolean
+  credentialRpmLimit?: number
   rpmHeadroomFactor?: number
   rpmReserveSlots?: number
   rpmHardGateOverloadWait?: boolean
+  cooldownScalePct?: number
+  rateLimitJitterPct?: number
   balanceWeightEnabled?: boolean
   balanceWeightFloor?: number
   health429WeightEnabled?: boolean
