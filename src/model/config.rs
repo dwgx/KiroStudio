@@ -127,6 +127,12 @@ pub struct Config {
     #[serde(default = "default_cooldown_enabled")]
     pub cooldown_enabled: bool,
 
+    /// 冷却时长缩放百分比（10..500，默认 100=原时长）。统一缩放所有冷却基础时长：
+    /// <100 更短（激进，快速重试，适合号多）、>100 更长（保守，慎防封号，适合号少）。
+    /// 只缩放短时/瞬时冷却基数，不动认证失败/封号那类长冷却硬窗（防误配把死号放行）。
+    #[serde(default = "default_cooldown_scale_pct")]
+    pub cooldown_scale_pct: u32,
+
     /// 是否启用拟人速率限制（每凭据每日上限 + 请求间隔，默认 false）
     ///
     /// 防关联用：模拟人类节奏。注意默认间隔 1s/请求会拖慢单用户高频工具调用，
@@ -142,6 +148,11 @@ pub struct Config {
     #[serde(default = "default_rate_limit_min_interval_ms")]
     pub rate_limit_min_interval_ms: u64,
 
+    /// 速率限制：请求间隔抖动百分比（0..50，默认 20）。真实间隔 = min_interval ±jitter% 随机，
+    /// 让节奏更像人（固定间隔太机械易被识别为脚本）。仅 rate_limit_enabled 时生效。
+    #[serde(default = "default_rate_limit_jitter_pct")]
+    pub rate_limit_jitter_pct: u32,
+
     /// 是否启用会话亲和性（同一会话尽量复用同一凭据，默认 true）
     ///
     /// 防关联用：让同一对话粘在同一账号上，避免单次会话散落到多个账号引发关联。
@@ -150,12 +161,13 @@ pub struct Config {
     #[serde(default = "default_affinity_enabled")]
     pub affinity_enabled: bool,
 
-    /// 每凭据 RPM（每分钟请求数）软上限（默认 0 = 不限制）
+    /// **全局每号 RPM（每分钟请求数）软上限**（默认 0）。
     ///
-    /// 调度用：balanced 选号时，滚动 60 秒窗口内请求数达到该上限的凭据会被
-    /// **降权**（排到未饱和的凭据之后），而非硬性跳过——避免全部凭据都饱和时
-    /// 把可用池清空导致请求直接失败。仅在 balanced 模式选号排序时参考。
-    /// 与 `rate_limit_*`（拟人节流，硬跳过）互补：本项只影响多号间的负载分摊。
+    /// 这是号池的「全局默认 RPM」：单号未单独设置自己的 `rpm_limit`（=0/None）时**继承此值**。
+    /// 解析顺序 = 单号 rpm_limit(>0) → 本全局值(>0) → 内置兜底 30（见 effective_saturation_limit）。
+    /// 所以导入的新号 RPM=0 时用的就是这里；此值也为 0 时才落到内置 30。
+    /// 调度用：balanced 选号时，滚动 60 秒窗口内请求数达到该上限的凭据会被**降权**
+    /// （排到未饱和凭据之后），而非硬跳过。与 `rate_limit_*`（拟人节流，硬跳过）互补。
     #[serde(default)]
     pub credential_rpm_limit: u32,
 
@@ -562,6 +574,12 @@ fn default_endpoint() -> String {
 }
 
 /// RPM headroom 系数默认 85(预留 15% 缓冲)。
+fn default_rate_limit_jitter_pct() -> u32 {
+    20
+}
+fn default_cooldown_scale_pct() -> u32 {
+    100
+}
 fn default_rpm_headroom_factor() -> u32 {
     85
 }
@@ -724,6 +742,8 @@ impl Default for Config {
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             cooldown_enabled: default_cooldown_enabled(),
+            cooldown_scale_pct: default_cooldown_scale_pct(),
+            rate_limit_jitter_pct: default_rate_limit_jitter_pct(),
             rate_limit_enabled: false,
             rate_limit_daily_max: default_rate_limit_daily(),
             rate_limit_min_interval_ms: default_rate_limit_min_interval_ms(),
