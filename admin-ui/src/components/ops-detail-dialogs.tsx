@@ -41,6 +41,8 @@ import {
   Filter,
   Download,
   CalendarClock,
+  Check,
+  Square,
 } from 'lucide-react'
 
 // ts_ms 是 epoch 毫秒。请求明细跨天,故展示「MM-DD HH:MM:SS」(本地时区,解析失败回退原值)。
@@ -902,8 +904,10 @@ function UsageGroupTable({
       ) : sorted.length === 0 ? (
         <EmptyState icon={Inbox} title="暂无数据" className="py-6" />
       ) : (
+        // 行多时表格自身独立滚动(表头 sticky 吸顶),避免长表格把整个弹窗撑长、只能滚外层。
+        <div className="max-h-[320px] overflow-y-auto">
         <table className="w-full border-collapse text-xs">
-          <thead className="text-[#888]">
+          <thead className="sticky top-0 z-10 bg-[#0a0a0a] text-[#888]">
             <tr className="[&>th]:px-3 [&>th]:py-1.5 [&>th]:text-left [&>th]:font-medium">
               <th>{keyHeader}</th>
               <th className="text-right">请求</th>
@@ -943,6 +947,7 @@ function UsageGroupTable({
             ))}
           </tbody>
         </table>
+        </div>
       )}
     </div>
   )
@@ -1122,26 +1127,80 @@ export function BgCacheDetailDialog({
   const idxs = useMemo(() => Array.from({ length: Math.max(0, count) }, (_, i) => i), [count])
   // 放大预览:记住当前放大的图索引(null=未放大)。
   const [lightboxIdx, setLightboxIdx] = useState<number | null>(null)
+  // 多选态:Ctrl/Cmd+点击勾选的图索引集合,用于批量下载。
+  const [selectedImgs, setSelectedImgs] = useState<Set<number>>(new Set())
   const bgUrl = (i: number) => `/admin/api/bg-cached?idx=${i}`
 
-  // Esc 关闭 lightbox(仅在放大态挂监听)。
+  // 切换单张勾选(additive:保留其它选中项)。
+  const toggleSelect = (i: number) => {
+    setSelectedImgs((prev) => {
+      const next = new Set(prev)
+      if (next.has(i)) next.delete(i)
+      else next.add(i)
+      return next
+    })
+  }
+
+  // 缩略图点击:Ctrl/Cmd 键按下=勾选/取消选(多选下载);否则=放大预览。
+  const onThumbClick = (i: number, e: React.MouseEvent) => {
+    if (e.ctrlKey || e.metaKey) {
+      e.preventDefault()
+      toggleSelect(i)
+    } else {
+      setLightboxIdx(i)
+    }
+  }
+
+  // 批量下载选中的图:逐个触发浏览器下载(<a download> 编程点击),间隔小延时避免被浏览器拦截。
+  const downloadSelected = async () => {
+    const list = Array.from(selectedImgs).sort((a, b) => a - b)
+    for (const i of list) {
+      const a = document.createElement('a')
+      a.href = bgUrl(i)
+      a.download = `bg-${i}.jpg`
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      // 多文件连续下载时给浏览器一点间隔,否则部分浏览器只保存最后一个。
+      await new Promise((r) => setTimeout(r, 250))
+    }
+  }
+
+  // Esc 关闭 lightbox(仅在放大态挂监听)。放大态时优先只收起 lightbox,不关整个 Dialog
+  // (Dialog 的 onEscapeKeyDown 另有拦截,见下方 DialogContent)。
   useEffect(() => {
     if (lightboxIdx === null) return
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setLightboxIdx(null)
+      if (e.key === 'Escape') {
+        e.stopPropagation()
+        setLightboxIdx(null)
+      }
     }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
+    // 捕获阶段监听,先于 Radix Dialog 的文档级监听处理,阻止其冒泡关闭 Dialog。
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
   }, [lightboxIdx])
 
-  // Dialog 关闭时顺带收起 lightbox。
+  // Dialog 关闭时顺带收起 lightbox + 清空多选。
   useEffect(() => {
-    if (!open) setLightboxIdx(null)
+    if (!open) {
+      setLightboxIdx(null)
+      setSelectedImgs(new Set())
+    }
   }, [open])
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="flex max-h-[85vh] w-[min(96vw,860px)] max-w-none flex-col overflow-hidden">
+      <DialogContent
+        className="flex max-h-[85vh] w-[min(96vw,860px)] max-w-none flex-col overflow-hidden"
+        onEscapeKeyDown={(e) => {
+          // 放大态按 ESC:只收起 lightbox,不关整个 Dialog(拦截 Radix 默认关闭行为)。
+          if (lightboxIdx !== null) {
+            e.preventDefault()
+            setLightboxIdx(null)
+          }
+        }}
+      >
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <ImageIcon className="h-4 w-4" />
@@ -1151,20 +1210,49 @@ export function BgCacheDetailDialog({
             </span>
           </DialogTitle>
           <DialogDescription>
-            常驻内存的登录页随机背景图池,点击可放大预览,悬停右上角可下载。清理即释放内存(下次登录会重新拉取填充)。
+            常驻内存的登录页随机背景图池。单击放大预览,Ctrl/⌘+单击勾选多张后可批量下载,悬停右上角可下载单张。清理即释放内存(下次登录会重新拉取填充)。
           </DialogDescription>
         </DialogHeader>
+
+        {/* 多选工具栏:有勾选时出现,批量下载 / 清空选择。 */}
+        {selectedImgs.size > 0 && (
+          <div className="flex items-center gap-2 rounded-md border border-primary/40 bg-primary/[0.06] px-3 py-2 text-sm">
+            <span className="text-[#ededed]">已选 {selectedImgs.size} 张</span>
+            <div className="ml-auto flex items-center gap-2">
+              <button
+                type="button"
+                onClick={downloadSelected}
+                className="flex items-center gap-1 rounded bg-primary/80 px-2.5 py-1 text-xs text-white hover:bg-primary"
+              >
+                <Download className="h-3.5 w-3.5" />
+                批量下载
+              </button>
+              <button
+                type="button"
+                onClick={() => setSelectedImgs(new Set())}
+                className="rounded border border-[#2e2e2e] px-2.5 py-1 text-xs text-muted-foreground hover:text-[#ededed]"
+              >
+                清空
+              </button>
+            </div>
+          </div>
+        )}
 
         <div className="min-h-0 flex-1 overflow-y-auto">
           {idxs.length === 0 ? (
             <EmptyState icon={ImageIcon} title="缓存为空" description="尚未拉取任何背景图" />
           ) : (
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-              {idxs.map((i) => (
+              {idxs.map((i) => {
+                const isSel = selectedImgs.has(i)
+                return (
                 <div
                   key={i}
-                  onClick={() => setLightboxIdx(i)}
-                  className="group relative aspect-video cursor-zoom-in overflow-hidden rounded-md border border-[#2e2e2e] bg-[#111]"
+                  onClick={(e) => onThumbClick(i, e)}
+                  className={cn(
+                    'group relative aspect-video cursor-zoom-in overflow-hidden rounded-md border bg-[#111]',
+                    isSel ? 'border-primary ring-2 ring-primary' : 'border-[#2e2e2e]',
+                  )}
                 >
                   <img
                     src={bgUrl(i)}
@@ -1175,6 +1263,23 @@ export function BgCacheDetailDialog({
                   <span className="absolute left-1.5 top-1.5 rounded bg-black/60 px-1.5 py-0.5 font-mono text-[10px] text-white/90">
                     #{i}
                   </span>
+                  {/* 勾选钮:Ctrl/⌘+单击图片也可勾选;此钮直接点亦可(stopPropagation 避免放大)。 */}
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      toggleSelect(i)
+                    }}
+                    title={isSel ? '取消选择' : '勾选(可批量下载)'}
+                    className={cn(
+                      'absolute left-1.5 bottom-1.5 flex h-6 w-6 items-center justify-center rounded transition-opacity',
+                      isSel
+                        ? 'bg-primary text-white opacity-100'
+                        : 'bg-black/60 text-white/90 opacity-0 hover:bg-black/80 group-hover:opacity-100',
+                    )}
+                  >
+                    {isSel ? <Check className="h-3.5 w-3.5" /> : <Square className="h-3.5 w-3.5" />}
+                  </button>
                   {/* hover 显示下载钮:stopPropagation 避免触发放大 */}
                   <a
                     href={bgUrl(i)}
@@ -1186,7 +1291,8 @@ export function BgCacheDetailDialog({
                     <Download className="h-3.5 w-3.5" />
                   </a>
                 </div>
-              ))}
+                )
+              })}
             </div>
           )}
         </div>
