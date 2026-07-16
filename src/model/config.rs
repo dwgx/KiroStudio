@@ -172,9 +172,20 @@ pub struct Config {
     /// 令牌桶突发容量（秒，默认 2）。允许短时小突发不排队。
     #[serde(default = "default_inbound_burst_secs")]
     pub inbound_burst_secs: u32,
-    /// 排队最长等待（秒，默认 30）。超时返回带 Retry-After 的 429 让客户端退避。
+    /// 排队最长等待（秒，默认 30）。超时后行为由 inbound_queue_timeout_passthrough 决定。
     #[serde(default = "default_inbound_queue_max_wait_secs")]
     pub inbound_queue_max_wait_secs: u32,
+
+    /// 排队超时后是否**放行**（默认 true）而非返回 429。
+    ///
+    /// 【单号/高 RPM 不流通根治】入站整形是为"削峰保护号不被打爆"设计的。但单号被上游 429 砍到
+    /// 下限 RPM 后，请求量远超该 RPM → 大量请求在网关内排队 → 超过 queue_max_wait 就被拒 429，
+    /// 表现为"RPM 跑太多就不流通"（请求没到上游就被网关自己卡死超时）。
+    /// - true（默认）：排队超时不拒绝，直接**放行**去打上游（上游能否处理交给上游 + failover/冷却）。
+    ///   入站整形仍在平峰削峰（有令牌正常限速），只在真堆积超时时降级为放行，最坏 == 不限速，绝不"不流通"。
+    /// - false：保持旧行为，超时返回带 Retry-After 的 429 让客户端退避（多号池/需严格保护上游时用）。
+    #[serde(default = "default_inbound_queue_timeout_passthrough")]
+    pub inbound_queue_timeout_passthrough: bool,
 
     /// 是否启用会话亲和性（同一会话尽量复用同一凭据，默认 true）
     ///
@@ -615,6 +626,9 @@ fn default_inbound_burst_secs() -> u32 {
 fn default_inbound_queue_max_wait_secs() -> u32 {
     30
 }
+fn default_inbound_queue_timeout_passthrough() -> bool {
+    true
+}
 fn default_cooldown_scale_pct() -> u32 {
     100
 }
@@ -789,6 +803,7 @@ impl Default for Config {
             inbound_rpm_max: default_inbound_rpm_max(),
             inbound_burst_secs: default_inbound_burst_secs(),
             inbound_queue_max_wait_secs: default_inbound_queue_max_wait_secs(),
+            inbound_queue_timeout_passthrough: default_inbound_queue_timeout_passthrough(),
             rate_limit_enabled: false,
             rate_limit_daily_max: default_rate_limit_daily(),
             rate_limit_min_interval_ms: default_rate_limit_min_interval_ms(),

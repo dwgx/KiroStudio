@@ -566,6 +566,8 @@ pub struct ConfigSnapshotResponse {
     pub inbound_rpm_max: u32,
     pub inbound_burst_secs: u32,
     pub inbound_queue_max_wait_secs: u32,
+    /// 入站排队超时后是否放行(默认 true)而非返回 429。单号/高 RPM 不流通根治。
+    pub inbound_queue_timeout_passthrough: bool,
     /// 当前实时目标 RPM(自动挡下动态,只读展示)
     pub inbound_current_rpm: u32,
     /// 余额加权分流（默认开）：同档内按剩余额度微调选号，长期拉平号池余额
@@ -662,6 +664,7 @@ pub struct UpdateConfigRequest {
     pub inbound_rpm_max: Option<u32>,
     pub inbound_burst_secs: Option<u32>,
     pub inbound_queue_max_wait_secs: Option<u32>,
+    pub inbound_queue_timeout_passthrough: Option<bool>,
     pub balance_weight_enabled: Option<bool>,
     pub balance_weight_floor: Option<u32>,
     pub health_429_weight_enabled: Option<bool>,
@@ -845,6 +848,7 @@ mod tests {
             inbound_rpm_max: 300,
             inbound_burst_secs: 2,
             inbound_queue_max_wait_secs: 30,
+            inbound_queue_timeout_passthrough: true,
             inbound_current_rpm: 100,
             balance_weight_enabled: true,
             balance_weight_floor: 50,
