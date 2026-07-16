@@ -19,6 +19,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
+/// 令牌桶内部状态(Mutex 守护)。令牌数用定点 ×1000 避免浮点。
+struct Bucket {
+    tokens_milli: u64,
+    last_refill_nanos: u64,
+}
+
 /// AIMD 参数(内置,可由 config 覆盖初始值)。
 const DEFAULT_STEP_UP: u32 = 10; // 每个探测周期无 429 就 +10 RPM
 const AIMD_PROBE_SECS: u64 = 20; // 探测周期:距上次降档 ≥20s 且无新 429 才升档
@@ -40,10 +46,10 @@ pub struct GlobalThrottle {
     /// 排队最长等待(秒),超时返回错误让上层带 Retry-After 回给客户端。
     queue_max_wait_secs: AtomicU32,
 
-    /// 令牌桶状态(用一把轻锁维护"当前令牌数 + 上次补充时刻")。
-    /// 令牌数用定点数(×1000)存 AtomicU64 避免浮点原子;时刻用相对启动的纳秒。
-    tokens_milli: AtomicU64, // 当前令牌数 ×1000
-    last_refill_nanos: AtomicU64,
+    /// 令牌桶状态:**一把轻锁**守护(令牌数×1000 + 上次补充时刻纳秒)。
+    /// review 定论:补充(read-modify-write)+ 扣减若用裸原子会相互覆盖丢更新;速率整形不在
+    /// CPU 热路径(每请求后面就是一次上游 HTTP,锁开销可忽略),故用 Mutex 换取可证明的正确性。
+    bucket: parking_lot::Mutex<Bucket>,
     start: Instant,
     /// 排队者唤醒:补充令牌后 notify_waiters,让等待的 acquire 重试取令牌。
     notify: Notify,
@@ -78,8 +84,11 @@ impl GlobalThrottle {
             rpm_max: AtomicU32::new(rpm_max.max(1)),
             burst_secs: AtomicU32::new(burst_secs.max(1)),
             queue_max_wait_secs: AtomicU32::new(queue_max_wait_secs.max(1)),
-            tokens_milli: AtomicU64::new((target as u64) * 1000 / 60 * (burst_secs.max(1) as u64)),
-            last_refill_nanos: AtomicU64::new(0),
+            bucket: parking_lot::Mutex::new(Bucket {
+                // 初始给满桶(允许启动后一个小突发)。
+                tokens_milli: (target as u64) * 1000 / 60 * (burst_secs.max(1) as u64),
+                last_refill_nanos: 0,
+            }),
             start: Instant::now(),
             notify: Notify::new(),
             last_md_nanos: AtomicU64::new(0),
@@ -101,42 +110,21 @@ impl GlobalThrottle {
         (rpm * 1000 / 60).max(1) * burst
     }
 
-    /// 按经过时间补充令牌(惰性补充:每次 acquire 时结算)。返回补充后的令牌数(定点)。
-    fn refill(&self) -> u64 {
-        let now = self.now_nanos();
-        let last = self.last_refill_nanos.swap(now, Ordering::AcqRel);
-        let elapsed_nanos = now.saturating_sub(last);
-        let rpm = self.target_rpm.load(Ordering::Relaxed) as u64;
-        // 每纳秒补充的令牌(定点 ×1000):rpm/60 令牌每秒 = rpm*1000/60 milli 每秒。
-        let per_sec_milli = rpm * 1000 / 60;
-        let add = per_sec_milli.saturating_mul(elapsed_nanos) / 1_000_000_000;
-        let cap = self.capacity_milli();
-        let cur = self.tokens_milli.load(Ordering::Acquire);
-        let next = (cur + add).min(cap);
-        self.tokens_milli.store(next, Ordering::Release);
-        next
-    }
-
-    /// 尝试取一个令牌(定点 1000)。成功返回 true。
+    /// 尝试取一个令牌(定点 1000):在**一把锁内**完成"按经过时间补充 → 判足 → 扣减 → 推进时钟",
+    /// 补充与扣减不可分割,杜绝并发丢更新/超发。
     fn try_take(&self) -> bool {
-        let avail = self.refill();
-        if avail >= 1000 {
-            // CAS 扣减,防并发多取。
-            let mut cur = avail;
-            loop {
-                if cur < 1000 {
-                    return false;
-                }
-                match self.tokens_milli.compare_exchange_weak(
-                    cur,
-                    cur - 1000,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => return true,
-                    Err(actual) => cur = actual,
-                }
-            }
+        let cap = self.capacity_milli();
+        let rpm = self.target_rpm.load(Ordering::Relaxed) as u64;
+        let per_sec_milli = rpm * 1000 / 60;
+        let now = self.now_nanos();
+        let mut b = self.bucket.lock();
+        let elapsed = now.saturating_sub(b.last_refill_nanos);
+        let add = per_sec_milli.saturating_mul(elapsed) / 1_000_000_000;
+        b.tokens_milli = (b.tokens_milli + add).min(cap);
+        b.last_refill_nanos = now;
+        if b.tokens_milli >= 1000 {
+            b.tokens_milli -= 1000;
+            true
         } else {
             false
         }
@@ -306,6 +294,27 @@ mod tests {
         let t = mk(true, false, 200);
         t.report_upstream_429();
         assert_eq!(t.current_target_rpm(), 200, "手动挡不受 429 影响");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_concurrent_no_overadmit() {
+        // review 修复验证:高并发下令牌桶不超发。60 RPM + burst 2s → 桶容量 = 60/60*2 = 2 令牌。
+        // 瞬时(几乎零 elapsed)并发抢 100 次,只应有 ≈桶容量(2,±1)个成功——绝不接近 100。
+        use std::sync::Arc;
+        let t = Arc::new(mk(true, false, 60));
+        let mut handles = vec![];
+        for _ in 0..100 {
+            let t = t.clone();
+            handles.push(tokio::spawn(async move { t.try_take() }));
+        }
+        let mut ok = 0;
+        for h in handles {
+            if h.await.unwrap() {
+                ok += 1;
+            }
+        }
+        assert!(ok <= 4, "瞬时并发只应放行≈桶容量个令牌,实得 {ok}(超发=丢更新bug复现)");
+        assert!(ok >= 1, "至少应放行初始桶里的令牌");
     }
 
     #[test]
