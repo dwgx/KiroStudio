@@ -648,6 +648,8 @@ pub struct Overview {
     pub last_7d: WindowSummary,
     /// 最近 30 天
     pub last_30d: WindowSummary,
+    /// 全部(保留期内所有天桶合计;受 stats 保留期限制,非严格历史全量)
+    pub all_time: WindowSummary,
 }
 
 /// 时间序列中的一个点
@@ -944,6 +946,7 @@ impl UsageStats {
         // 最近 7 天 / 30 天：天 slot 区间
         let mut agg7 = Aggregate::default();
         let mut agg30 = Aggregate::default();
+        let mut agg_all = Aggregate::default();
         for b in &inner.days {
             if b.slot < 0 || b.slot > now_day {
                 continue;
@@ -954,12 +957,15 @@ impl UsageStats {
             if b.slot >= now_day - 29 {
                 agg30.merge(&b.agg);
             }
+            // 全部:保留期内所有天桶(受 stats 保留期限制)。
+            agg_all.merge(&b.agg);
         }
 
         Overview {
             last_24h: agg24.into(),
             last_7d: agg7.into(),
             last_30d: agg30.into(),
+            all_time: agg_all.into(),
         }
     }
 

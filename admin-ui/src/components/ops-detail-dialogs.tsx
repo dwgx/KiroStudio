@@ -40,6 +40,7 @@ import {
   ChevronRight,
   Filter,
   Download,
+  CalendarClock,
 } from 'lucide-react'
 
 // ts_ms 是 epoch 毫秒。请求明细跨天,故展示「MM-DD HH:MM:SS」(本地时区,解析失败回退原值)。
@@ -80,6 +81,61 @@ function localInputToMs(v: string): number | undefined {
   if (!v) return undefined
   const t = new Date(v).getTime()
   return Number.isFinite(t) ? t : undefined
+}
+
+// 日期时间选择组件:包 native datetime-local(自带日历弹层,零依赖),补日历图标 + 快捷「此刻」/清除,
+// 深色主题对齐。native 控件本身点击弹日历,不会有 label 转发错位问题(不用 label 包裹)。
+function DateTimeField({
+  value,
+  onChange,
+  ariaLabel,
+}: {
+  value: string
+  onChange: (v: string) => void
+  ariaLabel?: string
+}) {
+  // 生成本地时区的 datetime-local 字符串(YYYY-MM-DDTHH:mm)。
+  const nowLocal = () => {
+    const d = new Date()
+    const pad = (n: number) => String(n).padStart(2, '0')
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+  }
+  return (
+    <div className="flex items-center gap-1">
+      <div className="relative flex-1">
+        <CalendarClock className="pointer-events-none absolute left-2 top-1/2 z-10 h-3.5 w-3.5 -translate-y-1/2 text-[#666]" />
+        <Input
+          type="datetime-local"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          aria-label={ariaLabel}
+          className="h-8 pl-7 text-xs [color-scheme:dark]"
+        />
+      </div>
+      <Button
+        type="button"
+        variant="ghost"
+        size="sm"
+        className="h-8 shrink-0 px-1.5 text-[10px] text-muted-foreground hover:text-[#ededed]"
+        onClick={() => onChange(nowLocal())}
+        title="设为此刻"
+      >
+        此刻
+      </Button>
+      {value && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="h-8 w-8 shrink-0 p-0 text-muted-foreground hover:text-[#ededed]"
+          onClick={() => onChange('')}
+          title="清除"
+        >
+          <X className="h-3.5 w-3.5" />
+        </Button>
+      )}
+    </div>
+  )
 }
 
 // outcome → Badge 变体 + 中文短标签。success 绿 / rate_limited 黄 / 其余红。
@@ -351,35 +407,37 @@ export function TraceDetailDialog({
         {panelOpen && (
           <div className="space-y-3 rounded-md border border-[#2e2e2e] bg-[#0d0d0d] p-3">
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-              <label className="space-y-1">
-                <span className="text-[11px] text-muted-foreground">client IP</span>
+              {/* 用 div 而非 label 包裹:label 会把点击(含上方 span 文字区域)转发给内部 input,
+                  导致"点标题文字也聚焦到输入框"的错位(dwgx 反馈)。改 div + 独立 span 标题即消除。 */}
+              <div className="space-y-1">
+                <span className="block text-[11px] text-muted-foreground">client IP</span>
                 <Input
                   value={clientIp}
                   onChange={(e) => setClientIp(e.target.value)}
                   placeholder="如 203.0.113.5"
                   className="h-8 text-xs"
                 />
-              </label>
-              <label className="space-y-1">
-                <span className="text-[11px] text-muted-foreground">session</span>
+              </div>
+              <div className="space-y-1">
+                <span className="block text-[11px] text-muted-foreground">session</span>
                 <Input
                   value={sessionId}
                   onChange={(e) => setSessionId(e.target.value)}
                   placeholder="会话 ID(前缀即可)"
                   className="h-8 text-xs"
                 />
-              </label>
-              <label className="space-y-1">
-                <span className="text-[11px] text-muted-foreground">模型</span>
+              </div>
+              <div className="space-y-1">
+                <span className="block text-[11px] text-muted-foreground">模型</span>
                 <Input
                   value={model}
                   onChange={(e) => setModel(e.target.value)}
                   placeholder="如 claude-opus-4"
                   className="h-8 text-xs"
                 />
-              </label>
-              <label className="space-y-1">
-                <span className="text-[11px] text-muted-foreground">结果</span>
+              </div>
+              <div className="space-y-1">
+                <span className="block text-[11px] text-muted-foreground">结果</span>
                 <Select
                   value={outcome}
                   onChange={setOutcome}
@@ -387,25 +445,15 @@ export function TraceDetailDialog({
                   aria-label="按结果过滤"
                   className="[&>button]:h-8 [&>button]:py-1 [&>button]:text-xs"
                 />
-              </label>
-              <label className="space-y-1">
-                <span className="text-[11px] text-muted-foreground">起始时间</span>
-                <Input
-                  type="datetime-local"
-                  value={tsFromRaw}
-                  onChange={(e) => setTsFromRaw(e.target.value)}
-                  className="h-8 text-xs"
-                />
-              </label>
-              <label className="space-y-1">
-                <span className="text-[11px] text-muted-foreground">截止时间</span>
-                <Input
-                  type="datetime-local"
-                  value={tsToRaw}
-                  onChange={(e) => setTsToRaw(e.target.value)}
-                  className="h-8 text-xs"
-                />
-              </label>
+              </div>
+              <div className="space-y-1">
+                <span className="block text-[11px] text-muted-foreground">起始时间</span>
+                <DateTimeField value={tsFromRaw} onChange={setTsFromRaw} ariaLabel="起始时间" />
+              </div>
+              <div className="space-y-1">
+                <span className="block text-[11px] text-muted-foreground">截止时间</span>
+                <DateTimeField value={tsToRaw} onChange={setTsToRaw} ariaLabel="截止时间" />
+              </div>
             </div>
             <div className="flex items-center justify-end gap-2">
               <Button
@@ -653,7 +701,15 @@ export function UsageDetailDialog({
   const { data: byModel, isLoading: bmLoading } = useUsageByModel()
   const { data: byCred, isLoading: bcLoading } = useUsageByCredential()
 
-  const w = overview?.last_24h
+  // 时间窗切换:24h / 7天 / 30天 / 全部(数据均已在 overview 里,零额外请求)。
+  const [win, setWin] = useState<'last_24h' | 'last_7d' | 'last_30d' | 'all_time'>('last_24h')
+  const WINDOW_OPTIONS: { key: typeof win; label: string }[] = [
+    { key: 'last_24h', label: '24 小时' },
+    { key: 'last_7d', label: '7 天' },
+    { key: 'last_30d', label: '30 天' },
+    { key: 'all_time', label: '全部' },
+  ]
+  const w = overview?.[win]
 
   // 饼图数据:①按模型的 token 占比(取 top,总和 > 0 才画) ②按号的请求数占比。
   // 只取前 8 个,其余合并为「其它」段,避免图例过长。
@@ -675,12 +731,31 @@ export function UsageDetailDialog({
             用量日志
           </DialogTitle>
           <DialogDescription>
-            近 24 小时汇总 + 占比饼图 + 按模型 / 按号维度聚合(读本地统计,零上游)。
+            汇总 + 占比饼图 + 按模型 / 按号维度聚合(读本地统计,零上游)。KPI 随时间窗切换;饼图为累计维度。
           </DialogDescription>
         </DialogHeader>
 
         <div className="min-h-0 flex-1 space-y-4 overflow-y-auto pr-1">
-          {/* 顶部:近 24h KPI */}
+          {/* 时间窗切换段控件:24h / 7天 / 30天 / 全部 */}
+          <div className="inline-flex rounded-md border border-[#2e2e2e] bg-[#0d0d0d] p-0.5">
+            {WINDOW_OPTIONS.map((opt) => (
+              <button
+                key={opt.key}
+                type="button"
+                onClick={() => setWin(opt.key)}
+                className={
+                  'h-7 rounded px-3 text-xs transition-colors ' +
+                  (win === opt.key
+                    ? 'bg-[#2a2a2a] text-[#ededed]'
+                    : 'text-muted-foreground hover:text-[#ededed]')
+                }
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+
+          {/* 顶部:所选时间窗 KPI */}
           {ovLoading ? (
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
               {Array.from({ length: 4 }).map((_, i) => (
