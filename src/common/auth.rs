@@ -35,7 +35,14 @@ pub fn extract_api_key(request: &Request<Body>) -> Option<String> {
 /// 无论字符串内容如何，比较所需的时间都是恒定的，
 /// 这可以防止攻击者通过测量响应时间来猜测 API Key。
 ///
-/// 使用经过安全审计的 `subtle` crate 实现
+/// 使用经过安全审计的 `subtle` crate 实现。
+///
+/// review Finding 8 修复:`subtle` 对不等长 slice 会提前返回 → 泄漏长度侧信道(可测出 key 长度)。
+/// 先各自 SHA-256 成定长 32 字节摘要再 ct_eq,使**任何长度输入**的比较都恒定时间、不泄漏长度。
+/// 摘要相等 ⟺ 原文相等(抗碰撞),安全等价。
 pub fn constant_time_eq(a: &str, b: &str) -> bool {
-    a.as_bytes().ct_eq(b.as_bytes()).into()
+    use sha2::{Digest, Sha256};
+    let ha = Sha256::digest(a.as_bytes());
+    let hb = Sha256::digest(b.as_bytes());
+    ha.ct_eq(&hb).into()
 }
