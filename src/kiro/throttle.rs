@@ -19,16 +19,25 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
-/// 令牌桶内部状态(Mutex 守护)。令牌数用定点 ×1000 避免浮点。
+/// 令牌桶 + AIMD 状态(**同一把 Mutex 守护**,令牌桶与 target_rpm 调整全原子)。
+/// review 修复(Finding 3):target_rpm 原是裸 AtomicU32,MD 与 step_up 的 load-compute-store
+/// 相互覆盖(降档被升档冲掉)。纳入锁后所有读改写不可分割。令牌数用定点 ×1000 避免浮点。
 struct Bucket {
     tokens_milli: u64,
     last_refill_nanos: u64,
+    /// 当前目标 RPM(AIMD 动态 / 手动挡固定)。锁内读改写。
+    target_rpm: u32,
+    /// 上次乘性降档(MD)的相对纳秒。用于 ①升档探测的静默期 ②MD 去抖窗口。
+    last_md_nanos: u64,
+    /// 上次升档探测的相对纳秒。
+    last_probe_nanos: u64,
 }
 
 /// AIMD 参数(内置,可由 config 覆盖初始值)。
 const DEFAULT_STEP_UP: u32 = 10; // 每个探测周期无 429 就 +10 RPM
 const AIMD_PROBE_SECS: u64 = 20; // 探测周期:距上次降档 ≥20s 且无新 429 才升档
 const MD_FACTOR_PCT: u32 = 50; // 乘性减:×50%(砍半)
+const MD_DEBOUNCE_SECS: u64 = 3; // MD 去抖窗口:此窗内重复 429(如单请求 failover 链)只降一档
 
 /// 全局入站节流器。挂在 TokenManager 上,acquire_context 进入时先 await throttle.acquire()。
 pub struct GlobalThrottle {
@@ -36,8 +45,6 @@ pub struct GlobalThrottle {
     enabled: AtomicBool,
     /// 自动挡开关。关 = 固定 target_rpm(手动挡)。
     auto: AtomicBool,
-    /// 当前目标 RPM(自动挡下由 AIMD 动态调整;手动挡 = 固定值)。
-    target_rpm: AtomicU32,
     /// 自动挡上下限。
     rpm_min: AtomicU32,
     rpm_max: AtomicU32,
@@ -54,10 +61,6 @@ pub struct GlobalThrottle {
     /// 排队者唤醒:补充令牌后 notify_waiters,让等待的 acquire 重试取令牌。
     notify: Notify,
 
-    /// AIMD:上次降档(收到 429)的相对纳秒;升档要求距此 ≥AIMD_PROBE_SECS。
-    last_md_nanos: AtomicU64,
-    /// 上次升档探测的相对纳秒。
-    last_probe_nanos: AtomicU64,
     /// 可观测:累计排队等待次数 / 降档次数 / 升档次数。
     pub queued_total: AtomicU64,
     pub md_total: AtomicU64,
@@ -79,7 +82,6 @@ impl GlobalThrottle {
         Self {
             enabled: AtomicBool::new(enabled),
             auto: AtomicBool::new(auto),
-            target_rpm: AtomicU32::new(target),
             rpm_min: AtomicU32::new(rpm_min.max(1)),
             rpm_max: AtomicU32::new(rpm_max.max(1)),
             burst_secs: AtomicU32::new(burst_secs.max(1)),
@@ -88,11 +90,12 @@ impl GlobalThrottle {
                 // 初始给满桶(允许启动后一个小突发)。
                 tokens_milli: (target as u64) * 1000 / 60 * (burst_secs.max(1) as u64),
                 last_refill_nanos: 0,
+                target_rpm: target,
+                last_md_nanos: 0,
+                last_probe_nanos: 0,
             }),
             start: Instant::now(),
             notify: Notify::new(),
-            last_md_nanos: AtomicU64::new(0),
-            last_probe_nanos: AtomicU64::new(0),
             queued_total: AtomicU64::new(0),
             md_total: AtomicU64::new(0),
             ai_total: AtomicU64::new(0),
@@ -103,25 +106,38 @@ impl GlobalThrottle {
         self.start.elapsed().as_nanos() as u64
     }
 
-    /// 令牌桶容量上限(定点 ×1000)。
-    fn capacity_milli(&self) -> u64 {
-        let rpm = self.target_rpm.load(Ordering::Relaxed) as u64;
+    /// 令牌桶容量上限(定点 ×1000)。按锁内 target_rpm 算(调用方已持锁)。
+    fn capacity_milli_locked(&self, target_rpm: u32) -> u64 {
         let burst = self.burst_secs.load(Ordering::Relaxed) as u64;
-        (rpm * 1000 / 60).max(1) * burst
+        ((target_rpm as u64) * 1000 / 60).max(1) * burst
     }
 
-    /// 尝试取一个令牌(定点 1000):在**一把锁内**完成"按经过时间补充 → 判足 → 扣减 → 推进时钟",
+    /// 尝试取一个令牌(定点 1000):在**一把锁内**完成"按经过时间补充 → 判足 → 扣减",
     /// 补充与扣减不可分割,杜绝并发丢更新/超发。
+    /// Finding 4 修复:**只把已折算成令牌的那段时间推进时钟**——按整数除法算出真正兑现的
+    /// 纳秒(consumed = add_milli 对应的时间),剩余不足 1 个 milli 的零头留到下次,失败时也不吞时间。
     fn try_take(&self) -> bool {
-        let cap = self.capacity_milli();
-        let rpm = self.target_rpm.load(Ordering::Relaxed) as u64;
-        let per_sec_milli = rpm * 1000 / 60;
         let now = self.now_nanos();
         let mut b = self.bucket.lock();
+        let per_sec_milli = (b.target_rpm as u64) * 1000 / 60;
+        let cap = self.capacity_milli_locked(b.target_rpm);
         let elapsed = now.saturating_sub(b.last_refill_nanos);
-        let add = per_sec_milli.saturating_mul(elapsed) / 1_000_000_000;
-        b.tokens_milli = (b.tokens_milli + add).min(cap);
-        b.last_refill_nanos = now;
+        if per_sec_milli > 0 {
+            let add = per_sec_milli.saturating_mul(elapsed) / 1_000_000_000;
+            if add > 0 {
+                b.tokens_milli = (b.tokens_milli + add).min(cap);
+                // 只推进"真正兑现了 add 个 milli"所需的时间;零头(不足 1 milli 的 elapsed)留到下次累积,
+                // 避免高并发下每次调用都把不足量的 elapsed 清零 → 补充被反复吞掉 → 有效 RPM 塌缩。
+                let consumed_nanos = add.saturating_mul(1_000_000_000) / per_sec_milli;
+                b.last_refill_nanos = b.last_refill_nanos.saturating_add(consumed_nanos);
+                // 若已撞容量顶(桶满),时间戳直接对齐到 now(多余时间无意义,防 last 落后过多)。
+                if b.tokens_milli >= cap {
+                    b.last_refill_nanos = now;
+                }
+            }
+        } else {
+            b.last_refill_nanos = now;
+        }
         if b.tokens_milli >= 1000 {
             b.tokens_milli -= 1000;
             true
@@ -145,7 +161,7 @@ impl GlobalThrottle {
             Instant::now() + Duration::from_secs(self.queue_max_wait_secs.load(Ordering::Relaxed) as u64);
         loop {
             // 估算下一个令牌到达时间,睡到那时或被 notify 唤醒(取先到)。
-            let rpm = self.target_rpm.load(Ordering::Relaxed).max(1) as u64;
+            let rpm = self.current_target_rpm().max(1) as u64;
             let per_token = Duration::from_millis((60_000 / rpm).max(1));
             let now = Instant::now();
             if now >= deadline {
@@ -163,44 +179,57 @@ impl GlobalThrottle {
         }
     }
 
-    /// 上游 429 反馈:乘性减档(×MD_FACTOR%),记降档时刻。provider 检到上游限流时调用。
+    /// 上游 429 反馈:乘性减档(×MD_FACTOR%)。**锁内原子**(Finding 3)+ **去抖窗口**(Finding 2)。
+    /// Finding 2 修复:单请求 failover 链会对每个 429 号各调一次,若每次都砍半 → 一波上游限流被连乘
+    /// 降到 floor。加去抖:距上次 MD < MD_DEBOUNCE_SECS 内的重复 429 只更新时刻不再降档,
+    /// 使"一波上游限流"至多降一档。
     pub fn report_upstream_429(&self) {
         if !self.enabled.load(Ordering::Relaxed) || !self.auto.load(Ordering::Relaxed) {
             return;
         }
-        let cur = self.target_rpm.load(Ordering::Relaxed);
+        let now = self.now_nanos();
         let floor = self.rpm_min.load(Ordering::Relaxed);
-        let next = ((cur * MD_FACTOR_PCT) / 100).max(floor);
+        let debounce = Duration::from_secs(MD_DEBOUNCE_SECS).as_nanos() as u64;
+        let mut b = self.bucket.lock();
+        // 去抖:距上次降档还在窗口内 → 只刷新时刻(维持静默期),不再降。
+        if b.last_md_nanos != 0 && now.saturating_sub(b.last_md_nanos) < debounce {
+            b.last_md_nanos = now;
+            return;
+        }
+        let cur = b.target_rpm;
+        let next = ((cur * MD_FACTOR_PCT) / 100).max(floor).max(1);
+        b.last_md_nanos = now;
         if next != cur {
-            self.target_rpm.store(next, Ordering::Relaxed);
+            b.target_rpm = next;
+            drop(b);
             self.md_total.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(target: "kiro::throttle", "上游429 → RPM自动降档 {cur}→{next}(下限{floor})");
         }
-        self.last_md_nanos.store(self.now_nanos(), Ordering::Relaxed);
     }
 
     /// 周期性探测升档:距上次降档 ≥AIMD_PROBE_SECS 且距上次升档 ≥AIMD_PROBE_SECS,无新 429 → 加性增。
-    /// 由后台 tick 或每次成功请求调用(轻量,内部判周期)。
+    /// **锁内原子**(Finding 3):target_rpm 与 last_probe/md 同锁,MD 与 step_up 不再相互覆盖。
     pub fn maybe_step_up(&self) {
         if !self.enabled.load(Ordering::Relaxed) || !self.auto.load(Ordering::Relaxed) {
             return;
         }
         let now = self.now_nanos();
         let probe_gap = Duration::from_secs(AIMD_PROBE_SECS).as_nanos() as u64;
-        let since_md = now.saturating_sub(self.last_md_nanos.load(Ordering::Relaxed));
-        let since_probe = now.saturating_sub(self.last_probe_nanos.load(Ordering::Relaxed));
+        let ceil = self.rpm_max.load(Ordering::Relaxed);
+        let mut b = self.bucket.lock();
+        let since_md = now.saturating_sub(b.last_md_nanos);
+        let since_probe = now.saturating_sub(b.last_probe_nanos);
         if since_md < probe_gap || since_probe < probe_gap {
             return;
         }
-        let cur = self.target_rpm.load(Ordering::Relaxed);
-        let ceil = self.rpm_max.load(Ordering::Relaxed);
+        let cur = b.target_rpm;
+        b.last_probe_nanos = now;
         if cur >= ceil {
-            self.last_probe_nanos.store(now, Ordering::Relaxed);
             return;
         }
         let next = (cur + DEFAULT_STEP_UP).min(ceil);
-        self.target_rpm.store(next, Ordering::Relaxed);
-        self.last_probe_nanos.store(now, Ordering::Relaxed);
+        b.target_rpm = next;
+        drop(b);
         self.ai_total.fetch_add(1, Ordering::Relaxed);
         self.notify.notify_waiters(); // 提速后唤醒排队者
         tracing::debug!(target: "kiro::throttle", "RPM自动升档 {cur}→{next}(上限{ceil})");
@@ -226,23 +255,23 @@ impl GlobalThrottle {
         self.burst_secs.store(burst_secs.max(1), Ordering::Relaxed);
         self.queue_max_wait_secs
             .store(queue_max_wait_secs.max(1), Ordering::Relaxed);
-        // target 重置策略(review 自查修复:避免无关配置保存把 AIMD 学到的档位打回初值):
+        // target 重置策略(锁内,review 自查修复:避免无关配置保存把 AIMD 学到的档位打回初值):
         // - 手动挡(auto=false):直接用配置的 target(手动挡就该固定用它)。
         // - 自动挡(auto=true):**保留当前学到的 target**,只重新 clamp 到新上下限——否则每次保存
         //   任意无关配置都会把自动挡辛苦收敛的速率(如被 429 降到 40)打回初值(100)→ 立刻又打爆上游。
-        let cur = self.target_rpm.load(Ordering::Relaxed);
-        let next = if auto {
-            cur.clamp(lo, hi)
+        let mut b = self.bucket.lock();
+        b.target_rpm = if auto {
+            b.target_rpm.clamp(lo, hi)
         } else {
             target_rpm.clamp(lo, hi)
         };
-        self.target_rpm.store(next, Ordering::Relaxed);
+        drop(b);
         self.notify.notify_waiters();
     }
 
     /// 当前目标 RPM(可观测)。
     pub fn current_target_rpm(&self) -> u32 {
-        self.target_rpm.load(Ordering::Relaxed)
+        self.bucket.lock().target_rpm
     }
 }
 
@@ -280,19 +309,37 @@ mod tests {
         assert!(!t.try_take(), "桶干后应无法立即取令牌");
     }
 
+    // 测试辅助:清掉 MD 去抖时刻,模拟"过了去抖窗口"(否则连续 429 只降一档)。
+    fn clear_md_debounce(t: &GlobalThrottle) {
+        t.bucket.lock().last_md_nanos = 0;
+    }
+
     #[test]
-    fn test_aimd_md_halves_on_429() {
+    fn test_aimd_md_debounce_single_drop_per_burst() {
+        // Finding 2 修复:一波 failover 链的多次 429(去抖窗内)只降一档,不连乘到 floor。
         let t = mk(true, true, 200);
-        assert_eq!(t.current_target_rpm(), 200);
+        t.report_upstream_429(); // 200→100(首次)
+        t.report_upstream_429(); // 去抖窗内,不再降
+        t.report_upstream_429(); // 去抖窗内,不再降
+        assert_eq!(t.current_target_rpm(), 100, "一波连续429只降一档(去抖)");
+    }
+
+    #[test]
+    fn test_aimd_md_halves_across_windows() {
+        // 跨去抖窗的 429 才继续降档(模拟窗口过去)。
+        let t = mk(true, true, 200);
         t.report_upstream_429();
-        assert_eq!(t.current_target_rpm(), 100, "429 应砍半");
+        assert_eq!(t.current_target_rpm(), 100);
+        clear_md_debounce(&t);
         t.report_upstream_429();
         assert_eq!(t.current_target_rpm(), 50);
-        // 下探到下限 20 不再降(50→25→20)。
+        clear_md_debounce(&t);
         t.report_upstream_429();
         assert_eq!(t.current_target_rpm(), 25);
+        clear_md_debounce(&t);
         t.report_upstream_429();
         assert_eq!(t.current_target_rpm(), 20, "不低于下限 20");
+        clear_md_debounce(&t);
         t.report_upstream_429();
         assert_eq!(t.current_target_rpm(), 20);
     }
@@ -340,8 +387,9 @@ mod tests {
     fn test_auto_mode_preserves_learned_rpm_on_reload() {
         // review 自查修复:自动挡下 AIMD 学到的档位不应被无关配置保存打回初值。
         let t = mk(true, true, 200);
-        // 模拟被 429 降档到 50。
+        // 模拟被 429 降档到 50(跨去抖窗)。
         t.report_upstream_429(); // 200→100
+        clear_md_debounce(&t);
         t.report_upstream_429(); // 100→50
         assert_eq!(t.current_target_rpm(), 50);
         // 无关配置保存(target 传的还是初值 200,但自动挡应保留学到的 50,只 re-clamp)。
