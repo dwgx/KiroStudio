@@ -2,6 +2,20 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.37] - 2026-07-16
+
+### IP 黑名单按真实客户端 IP 封禁(反代后也生效)+ 热更即时
+
+修 0.7.36 IP 黑名单在反代后不生效的问题:网关部署在 openresty/nginx 反代后、`trust_forwarded=false` 时,
+security 中间件只看到反代内网 IP(拿不到真实客户端 IP),黑名单形同虚设。
+
+- 新增**业务层 IP 黑名单**:在对话入口(`/v1/messages` + `/cc/v1/messages`)用 `extract_client_ip`
+  (读 X-Forwarded-For / X-Real-IP 首段=真实客户端 IP)判定,命中即返回 403「来源 IP 已被封禁」。
+  反代后也能按真实公网 IP 封禁,不依赖 trust_forwarded 配置。
+- **热更即时**:改 ip_blocklist 配置立即生效(ArcSwap 镜像),不再 restart-only。
+- `Cidr` 提升为 pub + 新增 `contains_ip(IpAddr)`;业务层与 security 中间件黑名单互补(中间件按 TCP IP,
+  业务层按真实 IP)。新增业务层黑名单单测,766 绿。
+
 ## [0.7.36] - 2026-07-16
 
 ### IP 黑名单(封禁)+ I18N 模块级残留清扫

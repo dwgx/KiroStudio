@@ -430,6 +430,9 @@ async fn main() {
     // 下游客户端 device/ip/os/browser。admin 改开关时会立即改写此镜像。
     anthropic::set_collect_client_fingerprint(config.collect_client_fingerprint);
 
+    // IP 黑名单业务层镜像(按真实客户端 IP 封禁,反代后也生效;admin 改配置时热更):
+    anthropic::handlers::set_ip_blocklist(&config.ip_blocklist);
+
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),
