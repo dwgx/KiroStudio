@@ -103,6 +103,10 @@ counters! {
     reclaimed_invoke_calls: bump_reclaimed_invoke,
     // stray token(call/count/card/court)复读熔断触发次数(退化刷屏被截断)。
     stray_guard_tripped: bump_stray_guard_tripped,
+    // stray 泄漏形态观测(纯统计,点亮 clean 层够不到的句中黑洞):见过独占 stray 行的请求数 /
+    // 见过句中紧贴 CJK 的 stray 词的请求数。用于取证真机泄漏形态,决定要不要开保守句中清洗。
+    stray_standalone_requests: bump_stray_standalone_seen,
+    stray_inline_requests: bump_stray_inline_seen,
 }
 
 #[cfg(test)]

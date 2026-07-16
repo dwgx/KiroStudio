@@ -802,6 +802,10 @@ pub struct StreamContext {
     /// 本请求真重组成结构化 tool_use 的次数 + stray 熔断触发次数(可观测)。
     reclaimed_invoke_count: u32,
     stray_guard_tripped: bool,
+    /// stray 泄漏形态观测(纯统计不改输出):本请求见过的"独占 stray 行"数 / "句中紧贴 CJK 的 stray 词"数。
+    /// 点亮句中泄漏黑洞——决定要不要开保守清洗的取证依据。收尾经 recovery_metrics 暴露。
+    stray_standalone_seen: u32,
+    stray_inline_seen: u32,
     /// 重组容错总开关(config tool_reclaim_textified_invoke;默认开)。关=退回纯转发(原样吐文本)。
     reclaim_enabled: bool,
 }
@@ -880,6 +884,8 @@ impl StreamContext {
             stray_repeat_run: 0,
             reclaimed_invoke_count: 0,
             stray_guard_tripped: false,
+            stray_standalone_seen: 0,
+            stray_inline_seen: 0,
             reclaim_enabled: super::handlers::tool_reclaim_textified_invoke_enabled(),
         }
     }
@@ -1354,6 +1360,12 @@ impl StreamContext {
                 );
             }
         }
+        // 【诊断探针·stray 泄漏形态观测】纯统计不改输出,零误删风险。目的:点亮"句中/独占 stray 词"黑洞——
+        // 现有 leakedCleaned 只在**行首**清洗命中才计数,句中泄漏(如 `重读course了`)完全静默穿透、
+        // 连计数都没进,导致线上全 0 无法区分"没泄漏"还是"泄漏了没检测到"。这里在**清洗前**扫原始
+        // content,按形态分类计数(独占 stray 行 / 句中紧贴 CJK 的 stray 词),供运维页看真机泄漏形态,
+        // 再据此决定要不要开保守清洗。开销:仅在 content 含已知 stray 词时才细扫(快路径先 contains)。
+        observe_stray_leak_forms(content, &mut self.stray_standalone_seen, &mut self.stray_inline_seen);
         // 先剥离 DeepSeek DSML 工具协议标记(跨 chunk 安全),再走后续文本处理。
         let cleaned = self.strip_dsml_markers(content);
         // 泄漏控制 token 清洗（开关默认 true，见 handlers::tool_clean_leaked_tokens_enabled）：
@@ -2297,6 +2309,20 @@ impl StreamContext {
                 );
             }
         }
+        // stray 泄漏形态观测收尾(请求级各计一次):点亮 clean 层够不到的句中/独占黑洞。
+        // 这与 leaked_stripped 互补——leaked_stripped 只记行首真剥掉的,这里记"见到但可能没处理"的形态。
+        if self.stray_standalone_seen > 0 {
+            crate::common::recovery_metrics::bump_stray_standalone_seen();
+        }
+        if self.stray_inline_seen > 0 {
+            crate::common::recovery_metrics::bump_stray_inline_seen();
+            tracing::warn!(
+                model = %self.model,
+                inline_seen = self.stray_inline_seen,
+                standalone_seen = self.stray_standalone_seen,
+                "检测到句中/独占 stray 泄漏词(clean 层只清行首、句中未处理,此为观测取证:确认真机泄漏形态)"
+            );
+        }
 
         events
     }
@@ -3206,6 +3232,48 @@ const MAX_THINKING_BUFFER_BYTES: usize = 262_144;
 #[allow(dead_code)]
 const REPEAT_GUARD_TRIP_THRESHOLD: u32 = 32;
 
+/// stray 泄漏观测词表(与 clean 层 LEAKED_CONTROL_TOKENS 对齐,纯观测用)。
+const STRAY_OBSERVE_TOKENS: &[&str] = &["court", "course", "count", "care", "card", "call", "課", "课"];
+
+/// 判断字符是否 CJK 表意文字(观测"stray 词紧贴 CJK"的判据,与 clean 层 is_leak_glue_char 同族)。
+fn is_cjk_ideograph(c: char) -> bool {
+    matches!(c, '\u{3400}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}')
+}
+
+/// 【纯观测】扫 content 里的 stray 泄漏形态,累加两类计数(**不修改 content**):
+/// - standalone:某 stray 词**独占一整行**(trim 后整行 == 词)——高置信泄漏(court 实测全独占行)。
+/// - inline:某 stray 词出现在句中且**紧贴 CJK 表意字**(如 `重读course课`/`值是count的`)——
+///   正常中英混排会有空格分隔,紧贴 CJK 是泄漏特征。用于点亮 clean 层够不到的句中黑洞。
+/// 快路径:先 contains 任一词才细扫,正常文本零开销。
+fn observe_stray_leak_forms(content: &str, standalone: &mut u32, inline: &mut u32) {
+    // 快路径:一个都不含直接返回。
+    if !STRAY_OBSERVE_TOKENS.iter().any(|t| content.contains(*t)) {
+        return;
+    }
+    // 独占行:逐行 trim 后整行等于某 stray 词。
+    for line in content.split('\n') {
+        let t = line.trim();
+        if STRAY_OBSERVE_TOKENS.contains(&t) {
+            *standalone = standalone.saturating_add(1);
+        }
+    }
+    // 句中紧贴 CJK:词出现处,其紧邻(前或后)是 CJK 表意字。
+    for tok in STRAY_OBSERVE_TOKENS {
+        let tb = tok.as_bytes();
+        let mut from = 0usize;
+        while let Some(rel) = content[from..].find(*tok) {
+            let start = from + rel;
+            let end = start + tb.len();
+            let before_cjk = content[..start].chars().next_back().is_some_and(is_cjk_ideograph);
+            let after_cjk = content[end..].chars().next().is_some_and(is_cjk_ideograph);
+            if before_cjk || after_cjk {
+                *inline = inline.saturating_add(1);
+            }
+            from = end;
+        }
+    }
+}
+
 /// 判断一个 trim 后的行是否"看起来像退化刷屏 token":短(≤6 字符)、且全为字母或全为 CJK 表意文字,
 /// 无空格/标点/数字。用于逐行检测里放宽词表(不止已知的 call/count/card/court/課/课),
 /// 但仍保守(要求整行就是这么个短纯词),正常句子/代码不会整行是这种。
@@ -4026,6 +4094,28 @@ mod tests {
         assert!(detect_structural_flood("这是一段正常的中文回复,讲解代码逻辑和实现细节。").is_none());
         assert!(detect_structural_flood("the quick brown fox jumps over the lazy dog").is_none());
         assert!(detect_structural_flood("aaa bbb ccc").is_none(), "短重复但未达阈值不误判");
+    }
+
+    #[test]
+    fn test_observe_stray_leak_forms() {
+        let mut sa = 0u32;
+        let mut il = 0u32;
+        // 独占行:course 单独一行 → standalone。
+        observe_stray_leak_forms("正常\ncourse\n继续", &mut sa, &mut il);
+        assert_eq!(sa, 1, "course 独占行应计 standalone");
+        // 句中紧贴 CJK:`重读course了` 里 course 前后都贴 CJK → inline。
+        let (mut sa2, mut il2) = (0u32, 0u32);
+        observe_stray_leak_forms("重读course了", &mut sa2, &mut il2);
+        assert_eq!(il2, 1, "句中紧贴 CJK 的 course 应计 inline");
+        // 正常英文(有空格分隔)不误判:"the course is" 里 course 两侧是空格非 CJK。
+        let (mut sa3, mut il3) = (0u32, 0u32);
+        observe_stray_leak_forms("the course is good", &mut sa3, &mut il3);
+        assert_eq!(sa3, 0, "正常英文散文不计 standalone");
+        assert_eq!(il3, 0, "有空格分隔的正常 course 不计 inline");
+        // 完全不含 stray 词:零开销快路径 + 零计数。
+        let (mut sa4, mut il4) = (0u32, 0u32);
+        observe_stray_leak_forms("一段完全正常的中文回复讲解逻辑", &mut sa4, &mut il4);
+        assert_eq!(sa4 + il4, 0);
     }
 
     #[test]
