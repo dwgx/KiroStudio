@@ -2028,14 +2028,24 @@ impl StreamContext {
             // truncated=帧丢失/上游截断、illegal_chars=模型侧非法转义/裸控制符、两者兼有、其它畸形。
             // 判据与 repair 层同源，只用于日志定位真因（"修不好的残留到底是谁的责任"）。
             let defect = classify_tool_json_defect(&assembled);
+            // malformed 子型细分（纯诊断）：只在归因 Malformed 时算——它是"结构闭合+字符合法但仍非法"的
+            // 兜底类,笼统 "malformed" 无法区分类型 A(上游吐坏)/类型 C(我们拼坏)。子型标签(glued/
+            // trailing_comma/missing_comma/expected_value/...)直接指向责任方。其它归因输出 "-"（不适用）。
+            let subkind = if defect == ToolJsonDefect::Malformed {
+                malformed_subkind(&assembled)
+            } else {
+                "-"
+            };
             tracing::warn!(
                 block_index,
                 defect = defect.as_str(),
-                "tool_use 拼装后 input 非合法 JSON（长度 {}），归因={}",
+                subkind,
+                "tool_use 拼装后 input 非合法 JSON（长度 {}），归因={} 子型={}",
                 assembled.len(),
-                defect.as_str()
+                defect.as_str(),
+                subkind
             );
-            // 帧探针（KIRO_TOOL_TRACE）：非法时额外打印**完整拼装串**全文（含 model + 归因标签），
+            // 帧探针（KIRO_TOOL_TRACE）：非法时额外打印**完整拼装串**全文（含 model + 归因标签 + 子型），
             // 用于坐实是类型 A（上游模型帧本身含非法转义/乱码 token）还是类型 C（合并逻辑洞，已修）。
             if tool_trace_enabled() {
                 tracing::warn!(
@@ -2043,6 +2053,7 @@ impl StreamContext {
                     model = %self.model,
                     block_index,
                     defect = defect.as_str(),
+                    subkind,
                     assembled_len = assembled.len(),
                     assembled = %assembled,
                     "[tool_trace] 拼装后非法 JSON 全文（定性 Invalid tool parameters）"
@@ -2569,6 +2580,50 @@ fn classify_tool_json_defect(s: &str) -> ToolJsonDefect {
         (true, false) => ToolJsonDefect::Truncated,
         (false, true) => ToolJsonDefect::IllegalChars,
         (false, false) => ToolJsonDefect::Malformed,
+    }
+}
+
+/// 【纯诊断·不进控制流】把归因为 `Malformed`(结构闭合+无非法字符但仍 parse 失败)的串**再细分**成
+/// 可区分的子型,供日志定性「malformed 到底是哪种畸形」——这是解开「类型 A(上游模型帧本身吐坏,
+/// 网关修不了)还是类型 C(我们合并逻辑把好帧拼坏,能修)」的钥匙:
+///   - `glued`      : `}{` / `} {` 粘连(两个完整对象黏一起)——偏类型 C(合并/上游重写),`merge_tool_input`
+///                     第 6 步本应消灭,若仍出现说明帧序列走了未覆盖分支,**优先怀疑我们侧**。
+///   - `trailing_comma` : 尾逗号 `{"a":1,}` / `[1,2,]`——偏模型侧多吐一个逗号。
+///   - `missing_comma`  : 缺分隔逗号 `{"a":1"b":2}`——偏模型侧漏吐逗号/上游丢了逗号帧。
+///   - `expected_value` : 键后/数组位缺值 `{"a":}`——偏模型侧生成中断在值前。
+///   - `expected_colon` : 键后缺冒号 `{"a" 1}`——偏模型侧。
+///   - `key_not_string` : 键不是字符串 `{a:1}`——偏模型侧吐了裸键。
+///   - `trailing_chars` : 首个完整值后还有多余字符(非 `}{` 粘连的其它尾随)——偏上游多发。
+///   - `other`          : serde 消息未落入上述已知形态(留观测,收够样本再补分类)。
+///
+/// 判据源 = serde_json 的**官方错误 Display 消息**(稳定字符串,非自造启发式) + `scan.glued`(已算出)。
+/// 只在 Malformed 分支调用(调用方保证 `from_str` 已失败),纯读不改内容。
+fn malformed_subkind(s: &str) -> &'static str {
+    // glued 优先:scan 已单遍算出 `}{` 粘连,语义比 serde 的 "trailing characters" 更精确。
+    if scan_tool_json(s).glued {
+        return "glued";
+    }
+    // 取 serde 官方错误消息做形态判据(Display 文本稳定,见 serde_json/src/error.rs ErrorCode::fmt)。
+    let msg = match serde_json::from_str::<serde_json::Value>(s) {
+        Ok(_) => return "other", // 理论不可达(调用方已确保非法),兜底不 panic。
+        Err(e) => e.to_string(),
+    };
+    // 匹配官方消息里的稳定短语(全小写包含匹配,不依赖行列号)。
+    if msg.contains("trailing comma") {
+        "trailing_comma"
+    } else if msg.contains("expected `:`") {
+        "expected_colon"
+    } else if msg.contains("expected `,` or `}`") || msg.contains("expected `,` or `]`") {
+        // serde 在缺分隔逗号时报「expected `,` or `}`/`]`」——即两个值之间少了逗号。
+        "missing_comma"
+    } else if msg.contains("expected value") {
+        "expected_value"
+    } else if msg.contains("key must be a string") {
+        "key_not_string"
+    } else if msg.contains("trailing characters") {
+        "trailing_chars"
+    } else {
+        "other"
     }
 }
 
@@ -5847,6 +5902,65 @@ mod tests {
         let scan = scan_tool_json(s);
         assert!(scan.glued, "应识别出 }}{{ 粘连");
         assert_eq!(classify_tool_json_defect(s), ToolJsonDefect::Malformed);
+    }
+
+    // ============ malformed 子型细分（第一步:解开类型 A/C 的诊断钥匙）离线测试 ============
+    // malformed_subkind 只在归因 Malformed 时调用,纯诊断不进控制流。判据源=serde 官方错误消息 + scan.glued。
+    // 每条都先确认:①确实 parse 失败 ②归因确为 Malformed(结构闭合+字符合法)③子型标签正确。
+
+    #[test]
+    fn test_malformed_subkind_glued() {
+        // `}{` 粘连:两个完整对象黏一起——偏类型 C(合并/上游重写),优先怀疑我们侧。
+        let s = r#"{"a":1}{"b":2}"#;
+        assert!(serde_json::from_str::<serde_json::Value>(s).is_err());
+        assert_eq!(classify_tool_json_defect(s), ToolJsonDefect::Malformed);
+        assert_eq!(malformed_subkind(s), "glued");
+    }
+
+    #[test]
+    fn test_malformed_subkind_trailing_comma() {
+        // 尾逗号:偏模型侧多吐一个逗号。
+        let s = r#"{"a":1,"b":2,}"#;
+        assert!(serde_json::from_str::<serde_json::Value>(s).is_err());
+        assert_eq!(classify_tool_json_defect(s), ToolJsonDefect::Malformed);
+        assert_eq!(malformed_subkind(s), "trailing_comma");
+    }
+
+    #[test]
+    fn test_malformed_subkind_missing_comma() {
+        // 两个键值之间缺分隔逗号:偏模型侧漏吐/上游丢了逗号帧。
+        let s = r#"{"a":1"b":2}"#;
+        assert!(serde_json::from_str::<serde_json::Value>(s).is_err());
+        assert_eq!(classify_tool_json_defect(s), ToolJsonDefect::Malformed);
+        assert_eq!(malformed_subkind(s), "missing_comma");
+    }
+
+    #[test]
+    fn test_malformed_subkind_expected_value() {
+        // 键后缺值:偏模型侧生成中断在值前。
+        let s = r#"{"a":}"#;
+        assert!(serde_json::from_str::<serde_json::Value>(s).is_err());
+        assert_eq!(classify_tool_json_defect(s), ToolJsonDefect::Malformed);
+        assert_eq!(malformed_subkind(s), "expected_value");
+    }
+
+    #[test]
+    fn test_malformed_subkind_key_not_string() {
+        // 键不是字符串(裸键):偏模型侧吐了非法键。
+        let s = r#"{a:1}"#;
+        assert!(serde_json::from_str::<serde_json::Value>(s).is_err());
+        assert_eq!(classify_tool_json_defect(s), ToolJsonDefect::Malformed);
+        assert_eq!(malformed_subkind(s), "key_not_string");
+    }
+
+    #[test]
+    fn test_malformed_subkind_trailing_chars() {
+        // 首个完整值后有非 `}{` 的多余字符(不触发 glued 那条)——偏上游多发尾随。
+        let s = r#"{"a":1} garbage"#;
+        assert!(serde_json::from_str::<serde_json::Value>(s).is_err());
+        assert_eq!(classify_tool_json_defect(s), ToolJsonDefect::Malformed);
+        // 非 `}{`,glued=false,应落到 trailing_chars。
+        assert_eq!(malformed_subkind(s), "trailing_chars");
     }
 
     /// 短板2：截断跨轮恢复纯决策——恢复开关开 + 修复层开 + 归因真截断,三条件全满足才触发。

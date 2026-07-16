@@ -2,6 +2,24 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.30] - 2026-07-16
+
+### malformed 类 Invalid tool parameters 归因细分(诊断增强,解开类型 A/C 死结)
+
+真机日志坐实 `Invalid tool parameters` 现主形态 = `defect="malformed"`(结构闭合+字符合法但 serde 仍
+parse 失败),input 长度上万字节(大参数工具 Edit/Write)。但笼统的 "malformed" 无法区分责任方:
+是**类型 A**(上游模型帧本身吐坏,网关只能缓解)还是**类型 C**(我们合并逻辑把好帧拼坏,能修)。
+
+- 新增 `malformed_subkind`(纯诊断,不进控制流):只在归因 Malformed 时调用,把兜底类细分成可区分子型——
+  `glued`(`}{` 粘连,偏类型 C 优先怀疑我们侧)/ `trailing_comma`(尾逗号)/ `missing_comma`(缺分隔逗号)/
+  `expected_value`(键后缺值)/ `expected_colon`(缺冒号)/ `key_not_string`(裸键)/ `trailing_chars`
+  (完整值后多余尾随)/ `other`(未知形态留观测)。
+- 判据源 = **serde_json 官方错误 Display 消息**(稳定字符串,非自造启发式)+ 已算出但之前未用的
+  `scan.glued` 标记。子型标签接入常规 warn 日志 + KIRO_TOOL_TRACE 全文探针(新增 `subkind` 字段)。
+- **纯诊断增强**:不动 repair/合并/失败态任何控制流,对合法 JSON 零影响,不会误伤。6 个子型回归测试,760 绿。
+- 目的:下次真机 malformed 出现即知确切形态——`glued` 多=我们 merge 有洞能修;`missing_comma`/
+  `expected_value` 多=模型抽风只能扩兜底。这是决定后续修复方向的取证钥匙。
+
 ## [0.7.29] - 2026-07-16
 
 ### toaster 根因修复 + stray 泄漏形态观测探针 + 用量时间窗/日期组件 UI
