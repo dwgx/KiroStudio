@@ -1066,9 +1066,12 @@ impl AdminService {
             rate_limit_min_interval_ms: config.rate_limit_min_interval_ms,
             affinity_enabled: config.affinity_enabled,
             priority_in_balanced: config.priority_in_balanced,
+            credential_rpm_limit: config.credential_rpm_limit,
             rpm_headroom_factor: config.rpm_headroom_factor,
             rpm_reserve_slots: config.rpm_reserve_slots,
             rpm_hard_gate_overload_wait: config.rpm_hard_gate_overload_wait,
+            cooldown_scale_pct: config.cooldown_scale_pct,
+            rate_limit_jitter_pct: config.rate_limit_jitter_pct,
             balance_weight_enabled: config.balance_weight_enabled,
             balance_weight_floor: config.balance_weight_floor,
             health_429_weight_enabled: config.health_429_weight_enabled,
@@ -1375,7 +1378,29 @@ impl AdminService {
                 hot_changed = true;
             }
         }
-        // ---- 智能调度(全部热更即时生效)。整百分比字段服务端 clamp 到 [0,100],不信任前端。----
+        // ---- 智能调度(全部热更即时生效)。整百分比字段服务端 clamp,不信任前端。----
+        if let Some(v) = req.credential_rpm_limit {
+            // 全局每号 RPM 上界防 u32 极值污染(远超真实吞吐即无意义)。
+            let v = v.min(100_000);
+            if v != config.credential_rpm_limit {
+                config.credential_rpm_limit = v;
+                hot_changed = true;
+            }
+        }
+        if let Some(v) = req.cooldown_scale_pct {
+            let v = v.clamp(10, 500);
+            if v != config.cooldown_scale_pct {
+                config.cooldown_scale_pct = v;
+                hot_changed = true;
+            }
+        }
+        if let Some(v) = req.rate_limit_jitter_pct {
+            let v = v.min(50);
+            if v != config.rate_limit_jitter_pct {
+                config.rate_limit_jitter_pct = v;
+                hot_changed = true;
+            }
+        }
         if let Some(v) = req.rpm_headroom_factor {
             let v = v.min(100);
             if v != config.rpm_headroom_factor {

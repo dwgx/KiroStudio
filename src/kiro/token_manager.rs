@@ -1517,6 +1517,7 @@ impl MultiTokenManager {
         let cooldown_enabled = config.cooldown_enabled;
         let rate_limit_enabled = config.rate_limit_enabled;
         let affinity_enabled = config.affinity_enabled;
+        let cooldown_scale_pct = config.cooldown_scale_pct;
         let rpm_limit = config.credential_rpm_limit;
         let rpm_headroom_factor = config.rpm_headroom_factor;
         let rpm_reserve_slots = config.rpm_reserve_slots;
@@ -1530,6 +1531,8 @@ impl MultiTokenManager {
         let rate_limit_config = RateLimitConfig {
             daily_max_requests: config.rate_limit_daily_max,
             min_interval_ms: config.rate_limit_min_interval_ms,
+            // 抖动百分比:config 的 0..50 整数 → 0.0..0.5 小数,喂给已有的 jitter 机制(拟人节奏)。
+            jitter_percent: (config.rate_limit_jitter_pct.min(50) as f64) / 100.0,
             ..RateLimitConfig::default()
         };
         let manager = Self {
@@ -1573,6 +1576,8 @@ impl MultiTokenManager {
             balance_snapshots: RwLock::new(HashMap::new()),
             refresh_task: Mutex::new(None),
         };
+        // 播种冷却时长缩放(启动即用 config 值)。
+        manager.cooldown.set_cooldown_scale_pct(cooldown_scale_pct);
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
         if has_new_ids || has_new_machine_ids {
@@ -1673,8 +1678,11 @@ impl MultiTokenManager {
         self.rate_limiter.update_config(RateLimitConfig {
             daily_max_requests: new.rate_limit_daily_max,
             min_interval_ms: new.rate_limit_min_interval_ms,
+            jitter_percent: (new.rate_limit_jitter_pct.min(50) as f64) / 100.0,
             ..RateLimitConfig::default()
         });
+        // 冷却时长缩放热更(即时生效)。
+        self.cooldown.set_cooldown_scale_pct(new.cooldown_scale_pct);
         // 最后原子换整份配置（源真值,供冷/温读点 load() 取新值）
         self.config.store(Arc::new(new));
         tracing::info!("配置已热重载（TIER1 运行时字段即时生效;proxy/tls/端口等固化项仍需重启）");
