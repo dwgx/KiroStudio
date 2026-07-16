@@ -1,4 +1,5 @@
 import { useState, useMemo } from 'react'
+import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { CheckCircle2, XCircle, AlertCircle, Loader2 } from 'lucide-react'
 import {
@@ -142,6 +143,7 @@ function parseKamJson(raw: string): KamAccount[] {
 }
 
 export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
+  const { t } = useTranslation()
   const [jsonInput, setJsonInput] = useState('')
   const [importing, setImporting] = useState(false)
   const [skipErrorAccounts, setSkipErrorAccounts] = useState(true)
@@ -181,17 +183,17 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
       const accounts = parseKamJson(jsonInput)
 
       if (accounts.length === 0) {
-        toast.error('没有可导入的账号')
+        toast.error(t('kamimportdialog.toast.noAccountsToImport'))
         return
       }
 
       validAccounts = accounts.filter(a => a.credentials?.refreshToken)
       if (validAccounts.length === 0) {
-        toast.error('没有包含有效 refreshToken 的账号')
+        toast.error(t('kamimportdialog.toast.noValidRefreshToken'))
         return
       }
     } catch (error) {
-      toast.error('JSON 格式错误: ' + extractErrorMessage(error))
+      toast.error(t('kamimportdialog.toast.jsonFormatError') + extractErrorMessage(error))
       return
     }
 
@@ -248,7 +250,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           const existingCred = existingCredentials?.credentials.find(c => c.refreshTokenHash === tokenHash)
           setResults(prev => {
             const next = [...prev]
-            next[i] = { ...next[i], status: 'duplicate', error: '该凭据已存在', email: existingCred?.email || account.email }
+            next[i] = { ...next[i], status: 'duplicate', error: t('kamimportdialog.result.credentialExists'), email: existingCred?.email || account.email }
             return next
           })
           setProgress({ current: i + 1, total: validAccounts.length })
@@ -271,7 +273,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
           // idc 模式下必须同时提供 clientId 和 clientSecret
           if (authMethod === 'social' && (clientId || clientSecret)) {
-            throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
+            throw new Error(t('kamimportdialog.error.idcNeedsBoth'))
           }
 
           const addedCred = await addCredential({
@@ -347,7 +349,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         toast.info(`导入完成：${parts.join('，')}`)
       }
     } catch (error) {
-      toast.error('导入失败: ' + extractErrorMessage(error))
+      toast.error(t('kamimportdialog.toast.importFailed') + extractErrorMessage(error))
     } finally {
       setImporting(false)
     }
@@ -373,16 +375,16 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
   const getStatusText = (result: VerificationResult) => {
     switch (result.status) {
-      case 'pending': return '等待中'
-      case 'checking': return '检查重复...'
-      case 'verifying': return '验活中...'
-      case 'verified': return '验活成功'
-      case 'duplicate': return '重复凭据'
-      case 'skipped': return '已跳过（error 状态）'
+      case 'pending': return t('kamimportdialog.status.pending')
+      case 'checking': return t('kamimportdialog.status.checking')
+      case 'verifying': return t('kamimportdialog.status.verifying')
+      case 'verified': return t('kamimportdialog.status.verified')
+      case 'duplicate': return t('kamimportdialog.status.duplicate')
+      case 'skipped': return t('kamimportdialog.status.skipped')
       case 'failed':
-        if (result.rollbackStatus === 'success') return '验活失败（已排除）'
-        if (result.rollbackStatus === 'failed') return '验活失败（未排除）'
-        return '验活失败（未创建）'
+        if (result.rollbackStatus === 'success') return t('kamimportdialog.status.failedExcluded')
+        if (result.rollbackStatus === 'failed') return t('kamimportdialog.status.failedNotExcluded')
+        return t('kamimportdialog.status.failedNotCreated')
     }
   }
 
@@ -409,12 +411,12 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     >
       <DialogContent className="sm:max-w-2xl max-h-[80vh] flex flex-col">
         <DialogHeader>
-          <DialogTitle>KAM 账号导入（自动验活）</DialogTitle>
+          <DialogTitle>{t('kamimportdialog.title')}</DialogTitle>
         </DialogHeader>
 
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
           <div className="space-y-2">
-            <label className="text-sm font-medium">KAM 导出 JSON</label>
+            <label className="text-sm font-medium">{t('kamimportdialog.label.exportJson')}</label>
             <textarea
               placeholder={'粘贴 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "us-east-1"\n  }\n]\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "us-east-1"\n      }\n    }\n  ]\n}'}
               value={jsonInput}
@@ -426,7 +428,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
           {/* 解析预览 */}
           {parseError && (
-            <div className="text-sm text-red-600 dark:text-red-400">解析失败: {parseError}</div>
+            <div className="text-sm text-red-600 dark:text-red-400">{t('kamimportdialog.preview.parseFailed')}{parseError}</div>
           )}
           {previewAccounts.length > 0 && !importing && results.length === 0 && (
             <div className="space-y-2">
@@ -442,7 +444,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
                     onChange={(e) => setSkipErrorAccounts(e.target.checked)}
                     className="rounded border-gray-300"
                   />
-                  跳过 error 状态的账号
+                  {t('kamimportdialog.checkbox.skipErrorAccounts')}
                 </label>
               )}
             </div>
@@ -453,7 +455,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             <>
               <div className="space-y-2">
                 <div className="flex justify-between text-sm">
-                  <span>{importing ? '导入进度' : '导入完成'}</span>
+                  <span>{importing ? t('kamimportdialog.progress.importing') : t('kamimportdialog.progress.done')}</span>
                   <span>{progress.current} / {progress.total}</span>
                 </div>
                 <div className="w-full bg-secondary rounded-full h-2">
@@ -469,16 +471,16 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
               <div className="flex gap-4 text-sm">
                 <span className="text-green-600 dark:text-green-400">
-                  ✓ 成功: {results.filter(r => r.status === 'verified').length}
+                  {t('kamimportdialog.stats.success')}{results.filter(r => r.status === 'verified').length}
                 </span>
                 <span className="text-yellow-600 dark:text-yellow-400">
-                  ⚠ 重复: {results.filter(r => r.status === 'duplicate').length}
+                  {t('kamimportdialog.stats.duplicate')}{results.filter(r => r.status === 'duplicate').length}
                 </span>
                 <span className="text-red-600 dark:text-red-400">
-                  ✗ 失败: {results.filter(r => r.status === 'failed').length}
+                  {t('kamimportdialog.stats.failed')}{results.filter(r => r.status === 'failed').length}
                 </span>
                 <span className="text-gray-500">
-                  ○ 跳过: {results.filter(r => r.status === 'skipped').length}
+                  {t('kamimportdialog.stats.skipped')}{results.filter(r => r.status === 'skipped').length}
                 </span>
               </div>
 
@@ -497,13 +499,13 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
                           </span>
                         </div>
                         {result.usage && (
-                          <div className="text-xs text-muted-foreground mt-1">用量: {result.usage}</div>
+                          <div className="text-xs text-muted-foreground mt-1">{t('kamimportdialog.result.usage')}{result.usage}</div>
                         )}
                         {result.error && (
                           <div className="text-xs text-red-600 dark:text-red-400 mt-1">{result.error}</div>
                         )}
                         {result.rollbackError && (
-                          <div className="text-xs text-red-600 dark:text-red-400 mt-1">回滚失败: {result.rollbackError}</div>
+                          <div className="text-xs text-red-600 dark:text-red-400 mt-1">{t('kamimportdialog.result.rollbackFailed')}{result.rollbackError}</div>
                         )}
                       </div>
                     </div>
@@ -521,7 +523,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             onClick={() => { onOpenChange(false); resetForm() }}
             disabled={importing}
           >
-            {importing ? '导入中...' : results.length > 0 ? '关闭' : '取消'}
+            {importing ? t('kamimportdialog.button.importing') : results.length > 0 ? t('kamimportdialog.button.close') : t('kamimportdialog.button.cancel')}
           </Button>
           {results.length === 0 && (
             <Button
@@ -529,7 +531,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
               onClick={handleImport}
               disabled={importing || !jsonInput.trim() || previewAccounts.length === 0 || !!parseError}
             >
-              开始导入并验活
+              {t('kamimportdialog.button.startImport')}
             </Button>
           )}
         </DialogFooter>

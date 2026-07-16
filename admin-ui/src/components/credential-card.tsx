@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { useTranslation } from 'react-i18next'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { Settings, RefreshCw, Wallet, Trash2, Loader2, ClipboardCopy, ShieldAlert, Gauge, Check, Ban, Power } from 'lucide-react'
@@ -114,6 +115,7 @@ export function CredentialCard({
   balance,
   loadingBalance,
 }: CredentialCardProps) {
+  const { t } = useTranslation()
   const [showSettings, setShowSettings] = useState(false)
   const [priorityValue, setPriorityValue] = useState(credential.priority)
   const [rpmLimitValue, setRpmLimitValue] = useState(credential.rpmLimit ?? 0)
@@ -182,9 +184,9 @@ export function CredentialCard({
     try {
       await setCredentialName(credential.id, trimmed === '' ? null : trimmed)
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
-      toast.success(trimmed === '' ? '已清除别名' : '已保存别名')
+      toast.success(trimmed === '' ? t('credentialcard.toast.nameCleared') : t('credentialcard.toast.nameSaved'))
     } catch (err) {
-      toast.error('保存别名失败: ' + (err as Error).message)
+      toast.error(t('credentialcard.toast.nameSaveFailed') + (err as Error).message)
     } finally {
       setSavingName(false)
     }
@@ -204,9 +206,9 @@ export function CredentialCard({
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
       setProxyUser('')
       setProxyPass('')
-      toast.success(url === '' ? '已清除代理（回退全局）' : '已保存代理，下次请求生效')
+      toast.success(url === '' ? t('credentialcard.toast.proxyCleared') : t('credentialcard.toast.proxySaved'))
     } catch (err) {
-      toast.error('保存代理失败: ' + (err as Error).message)
+      toast.error(t('credentialcard.toast.proxySaveFailed') + (err as Error).message)
     } finally {
       setSavingProxy(false)
     }
@@ -216,7 +218,7 @@ export function CredentialCard({
   const handleSaveCustomApi = async () => {
     const url = customBaseUrl.trim()
     if (!url) {
-      toast.error('上游地址(base URL)不能为空')
+      toast.error(t('credentialcard.toast.baseUrlRequired'))
       return
     }
     setSavingCustomApi(true)
@@ -233,9 +235,9 @@ export function CredentialCard({
       })
       setCustomApiKeyInput('')
       setCustomResetCount(false)
-      toast.success('已保存自定义 API 配置，下次请求生效')
+      toast.success(t('credentialcard.toast.customApiSaved'))
     } catch (err) {
-      toast.error('保存失败: ' + (err as Error).message)
+      toast.error(t('credentialcard.toast.saveFailed') + (err as Error).message)
     } finally {
       setSavingCustomApi(false)
     }
@@ -269,7 +271,7 @@ export function CredentialCard({
       { id: credential.id, disabled: !credential.disabled },
       {
         onSuccess: (res) => toast.success(res.message),
-        onError: (err) => toast.error('操作失败: ' + (err as Error).message),
+        onError: (err) => toast.error(t('credentialcard.toast.operationFailed') + (err as Error).message),
       }
     )
   }
@@ -277,14 +279,14 @@ export function CredentialCard({
   const handlePriorityChange = () => {
     const newPriority = priorityValue
     if (isNaN(newPriority) || newPriority < 0) {
-      toast.error('优先级必须是非负整数')
+      toast.error(t('credentialcard.toast.priorityInvalid'))
       return
     }
     setPriority.mutate(
       { id: credential.id, priority: newPriority },
       {
         onSuccess: (res) => toast.success(res.message),
-        onError: (err) => toast.error('操作失败: ' + (err as Error).message),
+        onError: (err) => toast.error(t('credentialcard.toast.operationFailed') + (err as Error).message),
       }
     )
   }
@@ -292,14 +294,14 @@ export function CredentialCard({
   const handleRpmLimitChange = () => {
     const v = rpmLimitValue
     if (isNaN(v) || v < 0) {
-      toast.error('RPM 容量必须是非负整数（0=继承全局）')
+      toast.error(t('credentialcard.toast.rpmInvalid'))
       return
     }
     setRpmLimit.mutate(
       { id: credential.id, rpmLimit: v },
       {
         onSuccess: (res) => toast.success(res.message),
-        onError: (err) => toast.error('操作失败: ' + (err as Error).message),
+        onError: (err) => toast.error(t('credentialcard.toast.operationFailed') + (err as Error).message),
       }
     )
   }
@@ -307,7 +309,7 @@ export function CredentialCard({
   const handleReset = () => {
     resetFailure.mutate(credential.id, {
       onSuccess: (res) => toast.success(res.message),
-      onError: (err) => toast.error('操作失败: ' + (err as Error).message),
+      onError: (err) => toast.error(t('credentialcard.toast.operationFailed') + (err as Error).message),
     })
   }
 
@@ -323,9 +325,9 @@ export function CredentialCard({
         const diag = extractDiagnosis(err)
         if (diag) {
           setRefreshDiagnosis(diag)
-          toast.error('刷新失败：' + diag.summary)
+          toast.error(t('credentialcard.toast.refreshFailedDiag') + diag.summary)
         } else {
-          toast.error('刷新失败: ' + extractErrorMessage(err))
+          toast.error(t('credentialcard.toast.refreshFailed') + extractErrorMessage(err))
         }
       },
     })
@@ -334,7 +336,7 @@ export function CredentialCard({
 
   const handleDelete = () => {
     if (!credential.disabled) {
-      toast.error('请先禁用凭据再删除')
+      toast.error(t('credentialcard.toast.disableBeforeDelete'))
       setShowDeleteDialog(false)
       return
     }
@@ -344,7 +346,7 @@ export function CredentialCard({
         setShowDeleteDialog(false)
         setShowSettings(false)
       },
-      onError: (err) => toast.error('删除失败: ' + (err as Error).message),
+      onError: (err) => toast.error(t('credentialcard.toast.deleteFailed') + (err as Error).message),
     })
   }
 
@@ -366,12 +368,12 @@ export function CredentialCard({
       const res = await disableOverage(credential.id)
       refreshOverageState()
       if (res.confirmed === false) {
-        toast.warning(res.note || '已提交关闭请求，但上游尚未确认，请稍后刷新查看')
+        toast.warning(res.note || t('credentialcard.toast.disableOverageUnconfirmed'))
       } else {
-        toast.success('已关闭超额')
+        toast.success(t('credentialcard.toast.overageDisabled'))
       }
     } catch (err) {
-      toast.error('关闭超额失败: ' + (err as Error).message)
+      toast.error(t('credentialcard.toast.disableOverageFailed') + (err as Error).message)
     } finally {
       setOverageBusy(false)
     }
@@ -385,12 +387,12 @@ export function CredentialCard({
       const res = await enableOverage(credential.id)
       refreshOverageState()
       if (res.confirmed === false) {
-        toast.warning(res.note || '已提交开启请求，但上游尚未确认，请稍后刷新查看')
+        toast.warning(res.note || t('credentialcard.toast.enableOverageUnconfirmed'))
       } else {
-        toast.success('已开启超额')
+        toast.success(t('credentialcard.toast.overageEnabled'))
       }
     } catch (err) {
-      toast.error('开启超额失败: ' + (err as Error).message)
+      toast.error(t('credentialcard.toast.enableOverageFailed') + (err as Error).message)
     } finally {
       setOverageBusy(false)
     }
@@ -435,8 +437,8 @@ export function CredentialCard({
       return (
         <div className="space-y-1.5">
           <div className="flex items-center justify-between">
-            <span className="text-xs text-muted-foreground">剩余用量</span>
-            <span className="text-xs text-muted-foreground">加载中…</span>
+            <span className="text-xs text-muted-foreground">{t('credentialcard.balanceBar.remainingUsage')}</span>
+            <span className="text-xs text-muted-foreground">{t('credentialcard.balanceBar.loading')}</span>
           </div>
           <Skeleton className="h-6 w-full rounded-md" />
         </div>
@@ -447,12 +449,12 @@ export function CredentialCard({
       return (
         <div className="space-y-1.5">
           <div className="flex items-center justify-between">
-            <span className="text-xs text-muted-foreground">剩余用量</span>
-            <span className="text-xs text-muted-foreground">暂无缓存</span>
+            <span className="text-xs text-muted-foreground">{t('credentialcard.balanceBar.remainingUsage')}</span>
+            <span className="text-xs text-muted-foreground">{t('credentialcard.balanceBar.noCache')}</span>
           </div>
           <div className="relative h-6 w-full overflow-hidden rounded-md border border-dashed border-border bg-secondary/40">
             <div className="absolute inset-0 flex items-center justify-center text-xs text-muted-foreground">
-              暂无数据（后台每 30 分钟温和刷新）
+              {t('credentialcard.balanceBar.noData')}
             </div>
           </div>
         </div>
@@ -474,12 +476,12 @@ export function CredentialCard({
     return (
       <div className="space-y-1.5">
         <div className="flex items-center justify-between">
-          <span className="text-xs text-muted-foreground">剩余用量</span>
+          <span className="text-xs text-muted-foreground">{t('credentialcard.balanceBar.remainingUsage')}</span>
           <span className="text-xs text-muted-foreground">
-            {cachedAt ? `截至 ${formatCachedAt(cachedAt)}` : '实时'}
+            {cachedAt ? t('credentialcard.balanceBar.asOf', { time: formatCachedAt(cachedAt) }) : t('credentialcard.balanceBar.realtime')}
             {' · '}
             <span className={cn('font-semibold tabular-nums', pctTextColor)}>
-              {remainingPct.toFixed(1)}% 剩余
+              {t('credentialcard.balanceBar.remainingPct', { n: remainingPct.toFixed(1) })}
             </span>
           </span>
         </div>
@@ -528,9 +530,9 @@ export function CredentialCard({
               <CardTitle className="text-lg flex min-w-0 flex-wrap items-center gap-2">
                 <span
                   className="min-w-0 max-w-full truncate"
-                  title={credential.name ? (credential.email || `凭据 #${credential.id}`) : (credential.email || undefined)}
+                  title={credential.name ? (credential.email || t('credentialcard.title.fallback', { id: credential.id })) : (credential.email || undefined)}
                 >
-                  {credential.name || credential.email || `凭据 #${credential.id}`}
+                  {credential.name || credential.email || t('credentialcard.title.fallback', { id: credential.id })}
                 </span>
                 {/* 设了别名时，标题旁补一个次级真实身份标注（email 或 #id），便于识别 */}
                 {credential.name && (
@@ -538,8 +540,8 @@ export function CredentialCard({
                     {credential.email || `#${credential.id}`}
                   </span>
                 )}
-                {credential.isCurrent && <Badge variant="success">当前</Badge>}
-                {credential.disabled && <Badge variant="destructive">已禁用</Badge>}
+                {credential.isCurrent && <Badge variant="success">{t('credentialcard.badge.current')}</Badge>}
+                {credential.disabled && <Badge variant="destructive">{t('credentialcard.badge.disabled')}</Badge>}
                 {credential.disabled && credential.disabledReason && (
                   <Badge variant="outline">{disabledReasonLabel(credential.disabledReason)}</Badge>
                 )}
@@ -562,8 +564,8 @@ export function CredentialCard({
                 setNameValue(credential.name ?? '')
                 setShowSettings(true)
               }}
-              title="设置（优先级 / RPM / Profile ARN / 启用 / 删除）"
-              aria-label="设置"
+              title={t('credentialcard.gearButton.title')}
+              aria-label={t('credentialcard.gearButton.ariaLabel')}
             >
               <Settings className="h-4 w-4" />
             </Button>
@@ -583,9 +585,9 @@ export function CredentialCard({
             >
               <Gauge className="h-4 w-4 shrink-0 animate-pulse" />
               <span className="min-w-0 truncate">
-                冷却中
+                {t('credentialcard.cooldown.label')}
                 {credential.cooldownReason ? ` · ${credential.cooldownReason}` : ''}
-                {' · 剩余'}
+                {' · '}{t('credentialcard.cooldown.remaining')}
                 <span className="tabular-nums">{cooldownSeconds}</span>s
               </span>
             </div>
@@ -597,14 +599,14 @@ export function CredentialCard({
             <div className="space-y-1.5 text-sm">
               {/* 上游地址:主视觉,吃满宽度不硬截断 */}
               <div className="flex items-center gap-2">
-                <span className="shrink-0 text-xs text-muted-foreground">上游地址</span>
+                <span className="shrink-0 text-xs text-muted-foreground">{t('credentialcard.customApi.baseUrl')}</span>
                 <span className="min-w-0 flex-1 truncate text-right font-mono text-xs text-foreground" title={credential.baseUrl}>
                   {credential.baseUrl || '—'}
                 </span>
               </div>
               {/* 请求用量:达上限变琥珀 + 小徽章"已满"(替代长中文) */}
               <div className="flex items-center justify-between gap-2">
-                <span className="text-xs text-muted-foreground">请求用量</span>
+                <span className="text-xs text-muted-foreground">{t('credentialcard.customApi.requestUsage')}</span>
                 <span className="text-xs">
                   {credential.requestLimit && credential.requestLimit > 0 ? (
                     <span className={
@@ -614,39 +616,39 @@ export function CredentialCard({
                     }>
                       {credential.requestCount ?? 0} / {credential.requestLimit}
                       {(credential.requestCount ?? 0) >= credential.requestLimit && (
-                        <span className="ml-1 rounded bg-amber-500/15 px-1 py-0.5 text-[10px] text-amber-300">已满</span>
+                        <span className="ml-1 rounded bg-amber-500/15 px-1 py-0.5 text-[10px] text-amber-300">{t('credentialcard.customApi.full')}</span>
                       )}
                     </span>
                   ) : (
-                    <span className="text-foreground">{credential.requestCount ?? 0} <span className="text-muted-foreground">（不限）</span></span>
+                    <span className="text-foreground">{credential.requestCount ?? 0} <span className="text-muted-foreground">{t('credentialcard.customApi.unlimited')}</span></span>
                   )}
                 </span>
               </div>
               {/* 优先级 + 成功·失败 + 最后调用:一行内紧凑排布,弱化次要信息 */}
               <div className="flex items-center justify-between gap-2 text-xs">
-                <span className="text-muted-foreground">优先级 <span className="font-medium text-foreground">{credential.priority}</span></span>
+                <span className="text-muted-foreground">{t('credentialcard.customApi.priority')} <span className="font-medium text-foreground">{credential.priority}</span></span>
                 <span className="text-muted-foreground">
-                  成功 <span className="font-medium text-emerald-400/90">{credential.successCount}</span>
+                  {t('credentialcard.customApi.success')} <span className="font-medium text-emerald-400/90">{credential.successCount}</span>
                   {credential.failureCount > 0 && (
-                    <> · 失败 <span className="font-medium text-red-400/80">{credential.failureCount}</span></>
+                    <> · {t('credentialcard.customApi.failure')} <span className="font-medium text-red-400/80">{credential.failureCount}</span></>
                   )}
                 </span>
               </div>
               <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-                <span>最后调用</span>
+                <span>{t('credentialcard.customApi.lastCall')}</span>
                 <span>{formatLastUsed(credential.lastUsedAt)}</span>
               </div>
               {/* 上游密钥掩码(有则显) */}
               {credential.maskedApiKey && (
                 <div className="flex items-center justify-between gap-2 text-xs">
-                  <span className="text-muted-foreground">上游密钥</span>
+                  <span className="text-muted-foreground">{t('credentialcard.customApi.upstreamKey')}</span>
                   <span className="font-mono text-foreground">{credential.maskedApiKey}</span>
                 </div>
               )}
               {/* 代理(有则显,复用掩码) */}
               {credential.hasProxy && credential.proxyUrl && (
                 <div className="flex min-w-0 items-center gap-2 text-xs">
-                  <span className="shrink-0 text-muted-foreground">代理</span>
+                  <span className="shrink-0 text-muted-foreground">{t('credentialcard.customApi.proxy')}</span>
                   <span className="min-w-0 flex-1 truncate text-right font-mono text-foreground" title={maskProxyUrl(credential.proxyUrl)}>
                     {maskProxyUrl(credential.proxyUrl)}
                   </span>
@@ -657,7 +659,7 @@ export function CredentialCard({
           /* 订阅等级 + 余额状态条（自动加载缓存，无需手动点查询） */
           <div className="space-y-2">
             <div className="flex items-center justify-between gap-2">
-              <span className="text-xs text-muted-foreground">订阅等级</span>
+              <span className="text-xs text-muted-foreground">{t('credentialcard.info.subscriptionLevel')}</span>
               {balancePending && !subscriptionTitle ? (
                 <Skeleton className="h-5 w-20 rounded" />
               ) : (
@@ -674,11 +676,11 @@ export function CredentialCard({
           {!isCustomApi && (
           <div className="grid grid-cols-2 gap-x-4 gap-y-3 text-sm">
             <div>
-              <span className="text-muted-foreground">优先级：</span>
+              <span className="text-muted-foreground">{t('credentialcard.info.priority')}</span>
               <span className="font-medium">{credential.priority}</span>
             </div>
             <div>
-              <span className="text-muted-foreground">失败次数：</span>
+              <span className="text-muted-foreground">{t('credentialcard.info.failureCount')}</span>
               <span className={credential.failureCount > 0 ? 'text-red-500 font-medium' : ''}>
                 {credential.failureCount}
               </span>
@@ -686,22 +688,22 @@ export function CredentialCard({
             {/* 刷新失败是 Token 刷新概念,自定义 API 代挂号无 token 刷新,不显示 */}
             {!isCustomApi && (
             <div>
-              <span className="text-muted-foreground">刷新失败：</span>
+              <span className="text-muted-foreground">{t('credentialcard.info.refreshFailure')}</span>
               <span className={credential.refreshFailureCount > 0 ? 'text-red-500 font-medium' : ''}>
                 {credential.refreshFailureCount}
               </span>
             </div>
             )}
             <div>
-              <span className="text-muted-foreground">成功次数：</span>
+              <span className="text-muted-foreground">{t('credentialcard.info.successCount')}</span>
               <span className="font-medium">{credential.successCount}</span>
               {(credential.inflight ?? 0) > 0 && (
                 <span
                   className="ml-2 inline-flex items-center gap-1 text-xs font-medium text-sky-600"
-                  title="当前在途请求数（实时负载）"
+                  title={t('credentialcard.info.inflightTitle')}
                 >
                   <span className="w-1.5 h-1.5 rounded-full bg-sky-500 animate-pulse" />
-                  在途 {credential.inflight}
+                  {t('credentialcard.info.inflight', { n: credential.inflight })}
                 </span>
               )}
             </div>
@@ -709,40 +711,40 @@ export function CredentialCard({
                 改由上方"请求用量"块展示调用次数,此行对 custom_api 不渲染(避免"0 credits"误导)。 */}
             {!isCustomApi && (
             <div className="col-span-2">
-              <span className="text-muted-foreground">累计花费：</span>
+              <span className="text-muted-foreground">{t('credentialcard.info.totalCredits')}</span>
               <span
                 className="font-medium"
-                title="该号从入池至今的生命周期累计 credit 消耗（上游真实计费，独立于用量保留期，只增不清）"
+                title={t('credentialcard.info.totalCreditsTitle')}
               >
                 {formatCredits(credential.totalCreditsUsed)} credits
               </span>
             </div>
             )}
             <div className="col-span-2">
-              <span className="text-muted-foreground">最后调用：</span>
+              <span className="text-muted-foreground">{t('credentialcard.info.lastCall')}</span>
               <span className="font-medium">{formatLastUsed(credential.lastUsedAt)}</span>
             </div>
             {credential.allowedModels && credential.allowedModels.length > 0 && (
               <div className="col-span-2">
-                <span className="text-muted-foreground">允许模型：</span>
+                <span className="text-muted-foreground">{t('credentialcard.info.allowedModels')}</span>
                 <span
                   className="font-medium text-primary"
-                  title={'成本安全硬门:此号只接这些模型\n' + credential.allowedModels.join('\n')}
+                  title={t('credentialcard.info.allowedModelsTitle') + '\n' + credential.allowedModels.join('\n')}
                 >
-                  白名单 {credential.allowedModels.length} 项（按钮→编辑）
+                  {t('credentialcard.info.allowedModelsCount', { n: credential.allowedModels.length })}
                 </span>
               </div>
             )}
             {credential.maskedApiKey && (
               <div className="col-span-2">
-                <span className="text-muted-foreground">API Key：</span>
+                <span className="text-muted-foreground">{t('credentialcard.info.apiKey')}</span>
                 <span className="font-mono font-medium">{credential.maskedApiKey}</span>
               </div>
             )}
             {/* 超额（Overage）开关已移入「设置」弹框（齿轮），保持卡片主体信息网格干净。 */}
             {credential.hasProxy && (
               <div className="col-span-2 flex min-w-0 items-center gap-1">
-                <span className="shrink-0 text-muted-foreground">代理：</span>
+                <span className="shrink-0 text-muted-foreground">{t('credentialcard.info.proxy')}</span>
                 {credential.proxyUrl ? (
                   <>
                     <span
@@ -755,24 +757,24 @@ export function CredentialCard({
                       size="sm"
                       variant="ghost"
                       className="h-6 w-6 shrink-0 p-0"
-                      title="复制代理地址（含账号密码）"
+                      title={t('credentialcard.info.copyProxyTitle')}
                       onClick={async (e) => {
                         e.stopPropagation()
                         const ok = await copyToClipboard(credential.proxyUrl!)
-                        ok ? toast.success('已复制代理地址') : toast.error('复制失败，请重试')
+                        ok ? toast.success(t('credentialcard.toast.proxyCopied')) : toast.error(t('credentialcard.toast.copyFailed'))
                       }}
                     >
                       <ClipboardCopy className="h-3.5 w-3.5" />
                     </Button>
                   </>
                 ) : (
-                  <Badge variant="secondary">已配置</Badge>
+                  <Badge variant="secondary">{t('credentialcard.info.proxyConfigured')}</Badge>
                 )}
               </div>
             )}
             {credential.hasProfileArn && (
               <div className="col-span-2">
-                <Badge variant="secondary">有 Profile ARN</Badge>
+                <Badge variant="secondary">{t('credentialcard.info.hasProfileArn')}</Badge>
               </div>
             )}
           </div>
@@ -789,10 +791,10 @@ export function CredentialCard({
               variant="outline"
               onClick={handleForceRefresh}
               disabled={forceRefresh.isPending || credential.authMethod === 'api_key'}
-              title={credential.authMethod === 'api_key' ? 'API Key 凭据无需刷新 Token' : '强制刷新 Token（禁用的号也可刷，便于排查/恢复）'}
+              title={credential.authMethod === 'api_key' ? t('credentialcard.action.refreshTokenApiKeyTitle') : t('credentialcard.action.refreshTokenTitle')}
             >
               <RefreshCw className={`h-4 w-4 mr-1 ${forceRefresh.isPending ? 'animate-spin' : ''}`} />
-              刷新 Token
+              {t('credentialcard.action.refreshToken')}
             </Button>
             )}
             {!isCustomApi && (
@@ -804,7 +806,7 @@ export function CredentialCard({
               onClick={() => onViewBalance(credential.id)}
             >
               <Wallet className="h-4 w-4 mr-1" />
-              查看余额
+              {t('credentialcard.action.viewBalance')}
             </Button>
             )}
             {/* 令牌导出已统一移至「设置 · 令牌导出」分区（单个/全部 · JSON/refreshToken/复制）。 */}
@@ -818,17 +820,17 @@ export function CredentialCard({
                 : 'border-amber-500/40 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20 hover:text-amber-200'}
               onClick={handleToggleDisabled}
               disabled={setDisabled.isPending}
-              title={credential.disabled ? '启用此凭据（重新参与调度）' : '禁用此凭据（暂停调度）'}
+              title={credential.disabled ? t('credentialcard.action.enableTitle') : t('credentialcard.action.disableTitle')}
             >
               {credential.disabled ? (
                 <>
                   <Power className="h-4 w-4 mr-1" />
-                  启用
+                  {t('credentialcard.action.enable')}
                 </>
               ) : (
                 <>
                   <Ban className="h-4 w-4 mr-1" />
-                  禁用
+                  {t('credentialcard.action.disable')}
                 </>
               )}
             </Button>
@@ -843,25 +845,25 @@ export function CredentialCard({
         <DialogContent className="flex max-h-[85vh] flex-col gap-0 p-0">
           <DialogHeader className="shrink-0 border-b px-5 py-4">
             <DialogTitle className="truncate">
-              凭据设置 · #{credential.id}
+              {t('credentialcard.settings.title', { id: credential.id })}
               {credential.email ? ` · ${credential.email}` : ''}
             </DialogTitle>
-            <DialogDescription>别名 / 代理 / 超额 / 优先级 / RPM / Profile ARN / 启用 / 重置失败 / 删除。</DialogDescription>
+            <DialogDescription>{t('credentialcard.settings.description')}</DialogDescription>
           </DialogHeader>
 
           {/* 可滚动内容区：内容超高时仅此区域滚动 */}
           <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">
             {/* 别名/备注：自定义卡片标题，留空清除后回落 email/#id */}
             <div className="space-y-1.5">
-              <label className="text-sm font-medium">别名 / 备注</label>
+              <label className="text-sm font-medium">{t('credentialcard.settings.aliasLabel')}</label>
               <div className="flex items-center gap-2">
                 <Input
                   value={nameValue}
                   onChange={(e) => setNameValue(e.target.value)}
-                  placeholder="留空清除，回落邮箱 / #id"
+                  placeholder={t('credentialcard.settings.aliasPlaceholder')}
                   maxLength={64}
                   className="h-9"
-                  aria-label="别名或备注"
+                  aria-label={t('credentialcard.settings.aliasAria')}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' && !savingName) handleSaveName()
                   }}
@@ -877,24 +879,24 @@ export function CredentialCard({
                   ) : (
                     <Check className="h-4 w-4" />
                   )}
-                  <span className="ml-1">保存</span>
+                  <span className="ml-1">{t('credentialcard.settings.save')}</span>
                 </Button>
               </div>
             </div>
 
             {/* 单凭证代理：URL 留空=回退全局代理，"direct"=强制不走代理；账密留空=不改。立即生效无需重启。 */}
             <div className="space-y-1.5 border-t pt-4">
-              <label className="text-sm font-medium">代理</label>
+              <label className="text-sm font-medium">{t('credentialcard.settings.proxyLabel')}</label>
               <p className="text-xs text-muted-foreground">
-                留空=全局，“direct”=不走代理，可账密内嵌 URL 自动拆分。下次请求生效。
+                {t('credentialcard.settings.proxyHint')}
               </p>
               <div className="flex items-center gap-2">
                 <Input
                   value={proxyValue}
                   onChange={(e) => setProxyValue(e.target.value)}
-                  placeholder="socks5://127.0.0.1:1080 或 direct"
+                  placeholder={t('credentialcard.settings.proxyPlaceholder')}
                   className="h-9 font-mono text-xs"
-                  aria-label="代理 URL"
+                  aria-label={t('credentialcard.settings.proxyUrlAria')}
                 />
                 <ProxyTestButton
                   proxyUrl={proxyValue}
@@ -909,7 +911,7 @@ export function CredentialCard({
                   disabled={savingProxy}
                 >
                   {savingProxy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
-                  <span className="ml-1">保存</span>
+                  <span className="ml-1">{t('credentialcard.settings.save')}</span>
                 </Button>
               </div>
               {/* 代理账号 + 密码并排一行 */}
@@ -917,19 +919,19 @@ export function CredentialCard({
                 <Input
                   value={proxyUser}
                   onChange={(e) => setProxyUser(e.target.value)}
-                  placeholder="用户名（留空不改）"
+                  placeholder={t('credentialcard.settings.proxyUserPlaceholder')}
                   className="h-9 text-xs"
                   autoComplete="off"
-                  aria-label="代理用户名"
+                  aria-label={t('credentialcard.settings.proxyUserAria')}
                 />
                 <Input
                   type="password"
                   value={proxyPass}
                   onChange={(e) => setProxyPass(e.target.value)}
-                  placeholder="密码（留空不改）"
+                  placeholder={t('credentialcard.settings.proxyPassPlaceholder')}
                   className="h-9 text-xs"
                   autoComplete="new-password"
-                  aria-label="代理密码"
+                  aria-label={t('credentialcard.settings.proxyPassAria')}
                 />
               </div>
             </div>
@@ -937,41 +939,41 @@ export function CredentialCard({
             {/* 自定义 API 代挂配置(仅 custom_api 号):上游地址 / 上游密钥 / 请求上限 */}
             {isCustomApi && (
               <div className="space-y-2 border-t pt-4">
-                <label className="text-sm font-medium">自定义 API 配置</label>
+                <label className="text-sm font-medium">{t('credentialcard.settings.customApiLabel')}</label>
                 <p className="text-xs text-muted-foreground">
-                  上游地址 + 密钥(留空不改) + 请求上限。改上游/密钥后可勾选清零调用次数。下次请求生效。
+                  {t('credentialcard.settings.customApiHint')}
                 </p>
                 <div className="space-y-1.5">
-                  <label className="text-xs text-muted-foreground">上游地址（base URL）</label>
+                  <label className="text-xs text-muted-foreground">{t('credentialcard.settings.baseUrlLabel')}</label>
                   <Input
                     value={customBaseUrl}
                     onChange={(e) => setCustomBaseUrl(e.target.value)}
                     placeholder="https://your-relay.example.com/v1"
                     className="h-9 font-mono text-xs"
-                    aria-label="上游地址"
+                    aria-label={t('credentialcard.settings.baseUrlAria')}
                   />
                 </div>
                 <div className="space-y-1.5">
-                  <label className="text-xs text-muted-foreground">上游密钥（留空不改）</label>
+                  <label className="text-xs text-muted-foreground">{t('credentialcard.settings.upstreamKeyLabel')}</label>
                   <Input
                     type="password"
                     value={customApiKeyInput}
                     onChange={(e) => setCustomApiKeyInput(e.target.value)}
-                    placeholder="sk-... （留空=保持不变）"
+                    placeholder={t('credentialcard.settings.upstreamKeyPlaceholder')}
                     className="h-9 font-mono text-xs"
                     autoComplete="new-password"
-                    aria-label="上游密钥"
+                    aria-label={t('credentialcard.settings.upstreamKeyAria')}
                   />
                 </div>
                 <div className="space-y-1.5">
-                  <label className="text-xs text-muted-foreground">请求上限（0=不限）</label>
+                  <label className="text-xs text-muted-foreground">{t('credentialcard.settings.requestLimitLabel')}</label>
                   <NumberStepper
                     value={customRequestLimit}
                     onChange={setCustomRequestLimit}
                     min={0}
                     step={100}
                     className="w-full"
-                    aria-label="请求上限"
+                    aria-label={t('credentialcard.settings.requestLimitAria')}
                   />
                 </div>
                 <label className="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
@@ -979,9 +981,9 @@ export function CredentialCard({
                     checked={customResetCount}
                     onCheckedChange={(v) => setCustomResetCount(v === true)}
                     className="h-3.5 w-3.5"
-                    aria-label="同时清零调用次数"
+                    aria-label={t('credentialcard.settings.resetCountAria')}
                   />
-                  同时清零调用次数（换上游/换密钥后建议勾选）
+                  {t('credentialcard.settings.resetCountLabel')}
                 </label>
                 <Button
                   size="sm"
@@ -994,7 +996,7 @@ export function CredentialCard({
                   ) : (
                     <Check className="h-4 w-4" />
                   )}
-                  <span className="ml-1">保存自定义 API 配置</span>
+                  <span className="ml-1">{t('credentialcard.settings.saveCustomApi')}</span>
                 </Button>
               </div>
             )}
@@ -1003,22 +1005,22 @@ export function CredentialCard({
                 自定义 API 号不参与 RPM 饱和判定(按 优先级+在途 选号),只显优先级单列。 */}
             <div className={cn('grid gap-3 border-t pt-4', isCustomApi ? 'grid-cols-1' : 'grid-cols-2')}>
               <div className="space-y-1.5">
-                <div className="text-sm font-medium">优先级</div>
-                <div className="text-xs text-muted-foreground">越小越优先</div>
+                <div className="text-sm font-medium">{t('credentialcard.settings.priorityLabel')}</div>
+                <div className="text-xs text-muted-foreground">{t('credentialcard.settings.priorityHint')}</div>
                 <div className="flex items-center gap-1.5">
                   <NumberStepper
                     value={priorityValue}
                     onChange={setPriorityValue}
                     min={0}
                     className="w-full"
-                    aria-label="优先级"
+                    aria-label={t('credentialcard.settings.priorityAria')}
                   />
                   <Button
                     size="sm"
                     className="h-9 shrink-0 px-2"
                     onClick={handlePriorityChange}
                     disabled={setPriority.isPending || priorityValue === credential.priority}
-                    title="保存优先级"
+                    title={t('credentialcard.settings.savePriorityTitle')}
                   >
                     {setPriority.isPending ? (
                       <Loader2 className="h-4 w-4 animate-spin" />
@@ -1030,8 +1032,8 @@ export function CredentialCard({
               </div>
               {!isCustomApi && (
               <div className="space-y-1.5">
-                <div className="text-sm font-medium">RPM 容量</div>
-                <div className="text-xs text-muted-foreground">0=继承全局</div>
+                <div className="text-sm font-medium">{t('credentialcard.settings.rpmLabel')}</div>
+                <div className="text-xs text-muted-foreground">{t('credentialcard.settings.rpmHint')}</div>
                 <div className="flex items-center gap-1.5">
                   <NumberStepper
                     value={rpmLimitValue}
@@ -1039,14 +1041,14 @@ export function CredentialCard({
                     min={0}
                     step={10}
                     className="w-full"
-                    aria-label="RPM 容量上限"
+                    aria-label={t('credentialcard.settings.rpmAria')}
                   />
                   <Button
                     size="sm"
                     className="h-9 shrink-0 px-2"
                     onClick={handleRpmLimitChange}
                     disabled={setRpmLimit.isPending || rpmLimitValue === (credential.rpmLimit ?? 0)}
-                    title="保存 RPM 容量"
+                    title={t('credentialcard.settings.saveRpmTitle')}
                   >
                     {setRpmLimit.isPending ? (
                       <Loader2 className="h-4 w-4 animate-spin" />
@@ -1075,11 +1077,11 @@ export function CredentialCard({
             {canProbeRegion && (
             <div className="space-y-2 border-t pt-4">
               <div className="min-w-0">
-                <div className="text-sm font-medium">Profile ARN 区域</div>
+                <div className="text-sm font-medium">{t('credentialcard.settings.profileArnLabel')}</div>
                 <div className="text-xs text-muted-foreground">
                   {isIdc
-                    ? 'IdC 实例通常绑定单一区域，探测用于确认/重新解析该号 profileArn（一般只返回一个区域）。'
-                    : '切换此号对话走哪个区域的 profile（非改全局 region）。下次请求生效。'}
+                    ? t('credentialcard.settings.profileArnIdcHint')
+                    : t('credentialcard.settings.profileArnHint')}
                 </div>
               </div>
               <RegionSwitcher credentialId={credential.id} />
@@ -1094,9 +1096,9 @@ export function CredentialCard({
                 <div className="flex min-w-0 items-center gap-1.5">
                   <Gauge className="h-4 w-4 shrink-0 text-muted-foreground" />
                   <div className="min-w-0">
-                    <div className="text-sm font-medium">超额</div>
+                    <div className="text-sm font-medium">{t('credentialcard.settings.overageLabel')}</div>
                     <div className="truncate text-xs text-muted-foreground">
-                      {overageEnabled ? '按量付费' : '不突破 base'}
+                      {overageEnabled ? t('credentialcard.settings.overageOn') : t('credentialcard.settings.overageOff')}
                     </div>
                   </div>
                 </div>
@@ -1104,7 +1106,7 @@ export function CredentialCard({
                   checked={!!overageEnabled}
                   disabled={overageBusy}
                   onCheckedChange={handleOverageToggle}
-                  aria-label="超额开关"
+                  aria-label={t('credentialcard.settings.overageAria')}
                 />
               </div>
               )}
@@ -1113,9 +1115,9 @@ export function CredentialCard({
                 <div className="flex min-w-0 items-center gap-1.5">
                   <Power className="h-4 w-4 shrink-0 text-muted-foreground" />
                   <div className="min-w-0">
-                    <div className="text-sm font-medium">启用</div>
+                    <div className="text-sm font-medium">{t('credentialcard.settings.enableLabel')}</div>
                     <div className="truncate text-xs text-muted-foreground">
-                      {credential.disabled ? '已禁用' : '调度中'}
+                      {credential.disabled ? t('credentialcard.settings.enableStatusDisabled') : t('credentialcard.settings.enableStatusScheduling')}
                     </div>
                   </div>
                 </div>
@@ -1123,7 +1125,7 @@ export function CredentialCard({
                   checked={!credential.disabled}
                   onCheckedChange={handleToggleDisabled}
                   disabled={setDisabled.isPending}
-                  aria-label="启用凭据"
+                  aria-label={t('credentialcard.settings.enableAria')}
                 />
               </div>
             </div>
@@ -1133,9 +1135,9 @@ export function CredentialCard({
             {!isCustomApi && (
             <div className="flex items-center justify-between gap-3 rounded-md border bg-secondary/30 px-3 py-3">
               <div className="min-w-0">
-                <div className="text-sm font-medium">重置失败计数</div>
+                <div className="text-sm font-medium">{t('credentialcard.settings.resetFailureLabel')}</div>
                 <div className="text-xs text-muted-foreground">
-                  清零失败 / 刷新失败次数（当前 {credential.failureCount} / {credential.refreshFailureCount}）。
+                  {t('credentialcard.settings.resetFailureHint', { failures: credential.failureCount, refreshFailures: credential.refreshFailureCount })}
                 </div>
               </div>
               <Button
@@ -1150,7 +1152,7 @@ export function CredentialCard({
                 ) : (
                   <RefreshCw className="h-4 w-4 mr-1" />
                 )}
-                重置失败
+                {t('credentialcard.settings.resetFailure')}
               </Button>
             </div>
             )}
@@ -1159,8 +1161,8 @@ export function CredentialCard({
             <div className="space-y-2 rounded-md border border-destructive/30 bg-destructive/[0.04] px-3 py-3">
               <div className="flex items-center justify-between gap-3">
                 <div className="min-w-0">
-                  <div className="text-sm font-medium text-destructive">删除凭据</div>
-                  <div className="text-xs text-muted-foreground">移入回收站，不可恢复。需先禁用。</div>
+                  <div className="text-sm font-medium text-destructive">{t('credentialcard.settings.deleteLabel')}</div>
+                  <div className="text-xs text-muted-foreground">{t('credentialcard.settings.deleteHint')}</div>
                 </div>
                 <Button
                   size="sm"
@@ -1168,21 +1170,21 @@ export function CredentialCard({
                   className="h-9 shrink-0"
                   onClick={() => setShowDeleteDialog(true)}
                   disabled={!credential.disabled}
-                  title={!credential.disabled ? '需要先禁用凭据才能删除' : undefined}
+                  title={!credential.disabled ? t('credentialcard.settings.deleteDisabledTitle') : undefined}
                 >
                   <Trash2 className="h-4 w-4 mr-1" />
-                  删除
+                  {t('credentialcard.settings.delete')}
                 </Button>
               </div>
               {!credential.disabled && (
-                <p className="text-xs text-amber-500">提示：删除前请先在上方关闭“启用”。</p>
+                <p className="text-xs text-amber-500">{t('credentialcard.settings.deleteWarning')}</p>
               )}
             </div>
           </div>
 
           <DialogFooter className="shrink-0 border-t px-5 py-3">
             <Button variant="outline" size="sm" onClick={() => setShowSettings(false)}>
-              关闭
+              {t('credentialcard.settings.close')}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -1192,9 +1194,9 @@ export function CredentialCard({
       <Dialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>确认删除凭据 #{credential.id}？</DialogTitle>
+            <DialogTitle>{t('credentialcard.deleteDialog.title', { id: credential.id })}</DialogTitle>
             <DialogDescription>
-              将不可恢复地移入回收站。此操作无法撤销，删除前需先禁用凭据。
+              {t('credentialcard.deleteDialog.description')}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -1203,7 +1205,7 @@ export function CredentialCard({
               onClick={() => setShowDeleteDialog(false)}
               disabled={deleteCredential.isPending}
             >
-              取消
+              {t('credentialcard.deleteDialog.cancel')}
             </Button>
             <Button
               variant="destructive"
@@ -1211,7 +1213,7 @@ export function CredentialCard({
               disabled={deleteCredential.isPending || !credential.disabled}
             >
               {deleteCredential.isPending && <Loader2 className="h-4 w-4 mr-1 animate-spin" />}
-              确认删除
+              {t('credentialcard.deleteDialog.confirm')}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -1221,14 +1223,14 @@ export function CredentialCard({
       <Dialog open={showOverageConfirm} onOpenChange={setShowOverageConfirm}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>确认开启超额（Overage）？</DialogTitle>
+            <DialogTitle>{t('credentialcard.overageDialog.title')}</DialogTitle>
             <DialogDescription>
-              开启后，此凭据在用尽 base 额度后仍可继续使用，超出部分将按真实用量付费。请确认已了解计费影响再继续。
+              {t('credentialcard.overageDialog.description')}
             </DialogDescription>
           </DialogHeader>
           <div className="flex items-start gap-2 rounded-md border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-400">
             <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-            <span>超额 = 超出 base 额度后按真实用量付费，可能产生额外费用。</span>
+            <span>{t('credentialcard.overageDialog.warning')}</span>
           </div>
           <DialogFooter>
             <Button
@@ -1236,11 +1238,11 @@ export function CredentialCard({
               onClick={() => setShowOverageConfirm(false)}
               disabled={overageBusy}
             >
-              取消
+              {t('credentialcard.overageDialog.cancel')}
             </Button>
             <Button onClick={handleConfirmEnableOverage} disabled={overageBusy}>
               {overageBusy && <Loader2 className="h-4 w-4 mr-1 animate-spin" />}
-              确认开启
+              {t('credentialcard.overageDialog.confirm')}
             </Button>
           </DialogFooter>
         </DialogContent>
