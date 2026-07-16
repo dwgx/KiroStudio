@@ -226,8 +226,17 @@ impl GlobalThrottle {
         self.burst_secs.store(burst_secs.max(1), Ordering::Relaxed);
         self.queue_max_wait_secs
             .store(queue_max_wait_secs.max(1), Ordering::Relaxed);
-        // 手动挡:直接用 target_rpm;自动挡:也重置当前档为 target(作为新起点),clamp 到上下限。
-        self.target_rpm.store(target_rpm.clamp(lo, hi), Ordering::Relaxed);
+        // target 重置策略(review 自查修复:避免无关配置保存把 AIMD 学到的档位打回初值):
+        // - 手动挡(auto=false):直接用配置的 target(手动挡就该固定用它)。
+        // - 自动挡(auto=true):**保留当前学到的 target**,只重新 clamp 到新上下限——否则每次保存
+        //   任意无关配置都会把自动挡辛苦收敛的速率(如被 429 降到 40)打回初值(100)→ 立刻又打爆上游。
+        let cur = self.target_rpm.load(Ordering::Relaxed);
+        let next = if auto {
+            cur.clamp(lo, hi)
+        } else {
+            target_rpm.clamp(lo, hi)
+        };
+        self.target_rpm.store(next, Ordering::Relaxed);
         self.notify.notify_waiters();
     }
 
@@ -325,5 +334,21 @@ mod tests {
         // 手动挡了,429 不降。
         t.report_upstream_429();
         assert_eq!(t.current_target_rpm(), 150);
+    }
+
+    #[test]
+    fn test_auto_mode_preserves_learned_rpm_on_reload() {
+        // review 自查修复:自动挡下 AIMD 学到的档位不应被无关配置保存打回初值。
+        let t = mk(true, true, 200);
+        // 模拟被 429 降档到 50。
+        t.report_upstream_429(); // 200→100
+        t.report_upstream_429(); // 100→50
+        assert_eq!(t.current_target_rpm(), 50);
+        // 无关配置保存(target 传的还是初值 200,但自动挡应保留学到的 50,只 re-clamp)。
+        t.update(true, true, 200, 20, 300, 2, 30);
+        assert_eq!(t.current_target_rpm(), 50, "自动挡保存无关配置不应打回初值");
+        // 若新下限抬高到 80,则学到的 50 被 clamp 到 80。
+        t.update(true, true, 200, 80, 300, 2, 30);
+        assert_eq!(t.current_target_rpm(), 80, "学到值低于新下限时 clamp 到下限");
     }
 }
