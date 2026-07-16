@@ -245,6 +245,7 @@ interface FormState {
   inboundRpmMax: string
   inboundBurstSecs: string
   inboundQueueMaxWaitSecs: string
+  inboundQueueTimeoutPassthrough: boolean
   balanceWeightEnabled: boolean
   balanceWeightFloor: string
   health429WeightEnabled: boolean
@@ -332,6 +333,7 @@ function toForm(c: ConfigSnapshotResponse, ui: UiLayoutPrefs): FormState {
     inboundRpmMax: String(c.inboundRpmMax ?? 300),
     inboundBurstSecs: String(c.inboundBurstSecs ?? 2),
     inboundQueueMaxWaitSecs: String(c.inboundQueueMaxWaitSecs ?? 30),
+    inboundQueueTimeoutPassthrough: c.inboundQueueTimeoutPassthrough ?? true,
     balanceWeightEnabled: c.balanceWeightEnabled ?? true,
     balanceWeightFloor: String(c.balanceWeightFloor ?? 50),
     health429WeightEnabled: c.health429WeightEnabled ?? true,
@@ -1472,6 +1474,7 @@ export function SettingsPage() {
     if (Number.isFinite(nBurst) && nBurst !== (config.inboundBurstSecs ?? 2)) d.inboundBurstSecs = nBurst
     const nQwait = parseInt(form.inboundQueueMaxWaitSecs, 10)
     if (Number.isFinite(nQwait) && nQwait !== (config.inboundQueueMaxWaitSecs ?? 30)) d.inboundQueueMaxWaitSecs = nQwait
+    if (form.inboundQueueTimeoutPassthrough !== (config.inboundQueueTimeoutPassthrough ?? true)) d.inboundQueueTimeoutPassthrough = form.inboundQueueTimeoutPassthrough
     if (form.balanceWeightEnabled !== config.balanceWeightEnabled) d.balanceWeightEnabled = form.balanceWeightEnabled
     const nFloor = parseInt(form.balanceWeightFloor, 10)
     if (Number.isFinite(nFloor) && nFloor !== config.balanceWeightFloor) d.balanceWeightFloor = nFloor
@@ -1877,8 +1880,14 @@ export function SettingsPage() {
                   <Field label="令牌桶突发容量（秒）" hint="允许短时小突发不排队。越大越宽松。默认 2。">
                     <NumberStepper value={Number(form.inboundBurstSecs) || 0} onChange={(v) => set('inboundBurstSecs', String(v))} min={1} max={60} className="w-28" aria-label="突发容量秒" />
                   </Field>
-                  <Field label="排队最长等待（秒）" hint="排队超此时长返回带 Retry-After 的 429 让客户端退避。默认 30。">
+                  <Field label="排队最长等待（秒）" hint="排队超此时长后按下方「超时放行」决定放行或返回 429。默认 30。">
                     <NumberStepper value={Number(form.inboundQueueMaxWaitSecs) || 0} onChange={(v) => set('inboundQueueMaxWaitSecs', String(v))} min={1} max={300} step={5} className="w-28" aria-label="排队最长等待秒" />
+                  </Field>
+                  <Field
+                    label="排队超时放行"
+                    hint="排队超时后：开=直接放行去打上游（单号/高 RPM 推荐，避免请求被网关卡死超时=不流通，最坏退化成不限速）；关=返回 429+Retry-After 让客户端退避（多号池/需严格保护上游时用）。默认开。"
+                  >
+                    <Switch checked={form.inboundQueueTimeoutPassthrough} onCheckedChange={(v) => set('inboundQueueTimeoutPassthrough', v)} />
                   </Field>
                 </SearchContext.Provider>
               </SettingGearCard>
