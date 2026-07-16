@@ -191,9 +191,16 @@ impl GlobalThrottle {
         let floor = self.rpm_min.load(Ordering::Relaxed);
         let debounce = Duration::from_secs(MD_DEBOUNCE_SECS).as_nanos() as u64;
         let mut b = self.bucket.lock();
-        // 去抖:距上次降档还在窗口内 → 只刷新时刻(维持静默期),不再降。
+        // 去抖:距上次**真降档**还在窗口内 → 直接返回,不再降。
+        // ⚠️ 关键修复(升档饿死死锁):此分支**绝不刷新** last_md_nanos。
+        //   last_md_nanos 语义 = "上次真正降档的时刻",被 maybe_step_up 用作升档静默期判据
+        //   (距上次降档 ≥20s 才升档)。旧代码在去抖分支也 `last_md_nanos = now`,导致:上游只要
+        //   持续零星 429(哪怕都被去抖挡掉、RPM 已在 floor 无法再降),last_md 就被反复刷成 now →
+        //   升档的"距上次降档≥20s"永不满足 → RPM 卡在 floor(20)死锁不回升 → 表现为"不调度了,
+        //   必须重启网关"(重启清零 last_md 才恢复)。去抖窗口本就该基于"上次真降档",不刷新后:
+        //   一波 failover 链(通常几百 ms 内)仍落在同一 3s 窗、只降一档(去抖语义不变),而持续 429
+        //   不再污染升档静默期。
         if b.last_md_nanos != 0 && now.saturating_sub(b.last_md_nanos) < debounce {
-            b.last_md_nanos = now;
             return;
         }
         let cur = b.target_rpm;
@@ -312,6 +319,43 @@ mod tests {
     // 测试辅助:清掉 MD 去抖时刻,模拟"过了去抖窗口"(否则连续 429 只降一档)。
     fn clear_md_debounce(t: &GlobalThrottle) {
         t.bucket.lock().last_md_nanos = 0;
+    }
+
+    // 测试辅助:读当前 last_md_nanos(升档静默期判据源)。
+    fn last_md(t: &GlobalThrottle) -> u64 {
+        t.bucket.lock().last_md_nanos
+    }
+    // 测试辅助:把 last_md_nanos 强制设成"很久以前"(0),再看去抖 429 是否会把它推进到 now。
+    fn set_last_md(t: &GlobalThrottle, v: u64) {
+        t.bucket.lock().last_md_nanos = v;
+    }
+
+    #[test]
+    fn test_debounced_429_does_not_refresh_last_md_no_upshift_starvation() {
+        // ⭐死锁回归(旧代码必失败):RPM 已在下限、持续 429 都被去抖挡掉时,last_md_nanos 绝不能被
+        // 去抖分支推进——否则升档静默期(maybe_step_up 要求距上次降档≥20s)永不满足 → RPM 卡死不回升。
+        let t = mk(true, true, 200);
+        // 先真降一档,记下 last_md(此后它应是"上次真降档"的稳定锚点)。
+        t.report_upstream_429(); // 200→100,记 last_md=t0
+        let t0 = last_md(&t);
+        assert!(t0 > 0, "首次真降档应记录 last_md");
+        assert_eq!(t.current_target_rpm(), 100);
+        // 把 RPM 直接压到下限,并把 last_md 设回"很久以前"(0=从未降,模拟静默期已够长)。
+        set_last_md(&t, 0);
+        t.report_upstream_429(); // last_md=0 → 不在去抖窗 → 真降档 100→50,记新 last_md=t1
+        let t1 = last_md(&t);
+        assert_eq!(t.current_target_rpm(), 50);
+        assert!(t1 > 0);
+        // 紧接着一串"去抖窗内"的 429(模拟持续零星限流):它们都应被去抖挡掉且**不推进 last_md**。
+        for _ in 0..5 {
+            t.report_upstream_429();
+        }
+        assert_eq!(t.current_target_rpm(), 50, "去抖窗内的连续429只降过一档");
+        assert_eq!(
+            last_md(&t),
+            t1,
+            "⭐关键:去抖挡掉的429绝不能刷新last_md(旧代码在此刷新→升档静默期永不满足→RPM卡死)"
+        );
     }
 
     #[test]
