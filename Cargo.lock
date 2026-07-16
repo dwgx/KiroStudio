@@ -1610,7 +1610,7 @@ dependencies = [
 
 [[package]]
 name = "kirostudio"
-version = "0.7.30"
+version = "0.7.31"
 dependencies = [
  "anyhow",
  "arboard",
