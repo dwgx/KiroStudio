@@ -1367,10 +1367,15 @@ impl StreamContext {
         if !cleaned.is_empty() {
             self.at_line_start = cleaned.ends_with('\n');
         }
-        let content = cleaned.as_str();
-        if content.is_empty() {
+        // stray 复读熔断:**所有路径的公共入口**(thinking / 无工具 / reclaim 都在此之后),
+        // 治 Opus 退化刷屏(课/course/任意短词连写或独占行)。脱离 reclaim 路径独立生效——
+        // 这修了审计发现的两个 HIGH 盲区:①thinking 提前 return 绕过 ②无工具请求绕过。
+        // 熔断已 tripped → 返回空丢弃剩余;截断 → 只保留阈值前文本。
+        let guarded = self.stray_guard_filter(&cleaned).into_owned();
+        if guarded.is_empty() {
             return Vec::new();
         }
+        let content = guarded.as_str();
 
         // 估算 tokens
         self.output_tokens += estimate_tokens(content);
@@ -1654,27 +1659,17 @@ impl StreamContext {
         if !super::handlers::tool_stray_repeat_guard_enabled() {
             return std::borrow::Cow::Borrowed(text);
         }
-        let mut cut_at: Option<usize> = None;
-        let mut offset = 0usize;
-        for segment in text.split_inclusive('\n') {
-            let line = segment.trim();
-            if STRAY_INVOKE_TOKENS.contains(&line) {
-                if line == self.stray_repeat_last {
-                    self.stray_repeat_run += 1;
-                } else {
-                    self.stray_repeat_last = line.to_string();
-                    self.stray_repeat_run = 1;
-                }
-                if self.stray_repeat_run >= REPEAT_GUARD_TRIP_THRESHOLD {
-                    cut_at = Some(offset);
-                    break;
-                }
-            } else if !line.is_empty() {
-                self.stray_repeat_last = line.to_string();
-                self.stray_repeat_run = 0;
-            }
-            offset += segment.len();
-        }
+        // 两条独立的复读检测,取先命中的截断点(取 min):
+        // ① 逐行独占:同一 stray 行连续重复(跨 chunk 维护 run),覆盖 "课\n课\n课\n…" 形态。
+        // ② 结构性签名:任意"短 token"(≤6 字符、纯字母或纯 CJK、无空格标点)连续重复 ≥阈值——
+        //    **不依赖硬编码词表、不依赖换行**,覆盖 "课课课…"(单行连写)/"coursecourse…"/未来任何新退化词。
+        //    这是治本:硬编码词表(course 都漏过)+ 独占行精确匹配(单行连写漏)双盲区的通用兜底。
+        let line_cut = self.detect_stray_line_repeat(text);
+        let sig_cut = detect_structural_flood(text);
+        let cut_at = match (line_cut, sig_cut) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         match cut_at {
             Some(pos) => {
                 self.stray_guard_tripped = true;
@@ -1687,15 +1682,39 @@ impl StreamContext {
         }
     }
 
-    /// 文本经 stray 熔断后作为普通文本 delta 发出(重组路径里"当文本吐"的统一出口)。
+    /// ① 逐行独占 stray 词复读检测(跨 chunk 维护 stray_repeat_last/run,保留已知词提前介入)。
+    /// 返回截断字节偏移(命中阈值)或 None。
+    fn detect_stray_line_repeat(&mut self, text: &str) -> Option<usize> {
+        let mut offset = 0usize;
+        for segment in text.split_inclusive('\n') {
+            let line = segment.trim();
+            if !line.is_empty() && (STRAY_INVOKE_TOKENS.contains(&line) || is_short_flood_token(line)) {
+                if line == self.stray_repeat_last {
+                    self.stray_repeat_run += 1;
+                } else {
+                    self.stray_repeat_last = line.to_string();
+                    self.stray_repeat_run = 1;
+                }
+                if self.stray_repeat_run >= REPEAT_GUARD_TRIP_THRESHOLD {
+                    return Some(offset);
+                }
+            } else if !line.is_empty() {
+                self.stray_repeat_last = line.to_string();
+                self.stray_repeat_run = 0;
+            }
+            offset += segment.len();
+        }
+        None
+    }
+
+    /// 重组路径里"当文本吐"的统一出口。stray 熔断已在 process_assistant_response 顶层对全部入站文本
+    /// 统一执行过(进 sniff 缓冲的内容都已过滤),这里直接裸发,**不再重复跑有状态的 guard**
+    /// (重复跑会二次累加 stray_repeat_run 导致误判/提前熔断)。
     fn emit_text_delta_guarded(&mut self, text: &str) -> Vec<SseEvent> {
-        let filtered = self.stray_guard_filter(text);
-        if filtered.is_empty() {
+        if text.is_empty() {
             return Vec::new();
         }
-        // 借用与可变借用错开:先拿到 owned 再调 &mut self 方法。
-        let owned = filtered.into_owned();
-        self.create_text_delta_events(&owned)
+        self.create_text_delta_events(text)
     }
 
     /// invoke 嗅探缓冲驱动:文本进缓冲后,循环找完整/半 <invoke> 块,过四道门决定"重组捞回 vs 当文本"。
@@ -3177,6 +3196,86 @@ const STRAY_INVOKE_TOKENS: &[&str] = &["call", "count", "card", "court", "課", 
 #[allow(dead_code)]
 const REPEAT_GUARD_TRIP_THRESHOLD: u32 = 32;
 
+/// 判断一个 trim 后的行是否"看起来像退化刷屏 token":短(≤6 字符)、且全为字母或全为 CJK 表意文字,
+/// 无空格/标点/数字。用于逐行检测里放宽词表(不止已知的 call/count/card/court/課/课),
+/// 但仍保守(要求整行就是这么个短纯词),正常句子/代码不会整行是这种。
+fn is_short_flood_token(line: &str) -> bool {
+    let n = line.chars().count();
+    if n == 0 || n > 6 {
+        return false;
+    }
+    let all_ascii_alpha = line.chars().all(|c| c.is_ascii_alphabetic());
+    // CJK 统一表意文字区(含扩展 A):课/課 等中文单字刷屏。
+    let all_cjk = line
+        .chars()
+        .all(|c| matches!(c, '\u{3400}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}'));
+    all_ascii_alpha || all_cjk
+}
+
+/// ② 结构性洪水检测:**不依赖换行、不依赖词表**。扫描文本里"同一个短 token 连续紧邻重复"的最长游程,
+/// 覆盖单行连写 "课课课…课" / "coursecoursecourse…" / 逐字符重复,任意退化词都抓。
+/// 命中(游程 ≥ 阈值)返回该游程起点的字节偏移(从那里截断)。
+///
+/// 算法:对每个可能的 token 长度(1..=6 字符),检测是否有从某位置起、同一 token 连续重复 ≥阈值次。
+/// 优先抓最靠前的命中点。中文单字(len=1 char)刷屏是最常见形态,单独快速扫一遍。
+fn detect_structural_flood(text: &str) -> Option<usize> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let n = chars.len();
+    if n < REPEAT_GUARD_TRIP_THRESHOLD as usize {
+        return None;
+    }
+    let thresh = REPEAT_GUARD_TRIP_THRESHOLD as usize;
+    // 单字符游程(最常见:中文"课"连写、单字母连写)。只对"字母或 CJK"的字符计游程,
+    // 避免把正常重复(如 "----" 分隔线、"...")误判——那些是标点不在此列。
+    let is_floodable = |c: char| {
+        c.is_ascii_alphabetic() || matches!(c, '\u{3400}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}')
+    };
+    let mut i = 0usize;
+    while i < n {
+        let (byte_start, ch) = chars[i];
+        if is_floodable(ch) {
+            let mut j = i + 1;
+            while j < n && chars[j].1 == ch {
+                j += 1;
+            }
+            if j - i >= thresh {
+                return Some(byte_start);
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    // 多字符 token 连写(如 "coursecourse…"):对 token 长度 2..=6 char 滑窗检测连续相等块。
+    for tok_len in 2..=6usize {
+        if n < tok_len * thresh {
+            continue;
+        }
+        let mut i = 0usize;
+        while i + tok_len <= n {
+            // 当前 token = chars[i..i+tok_len],要求全 floodable(纯词,不含空格标点)。
+            if !chars[i..i + tok_len].iter().all(|(_, c)| is_floodable(*c)) {
+                i += 1;
+                continue;
+            }
+            let tok: Vec<char> = chars[i..i + tok_len].iter().map(|(_, c)| *c).collect();
+            let mut reps = 1usize;
+            let mut k = i + tok_len;
+            while k + tok_len <= n
+                && chars[k..k + tok_len].iter().map(|(_, c)| *c).eq(tok.iter().copied())
+            {
+                reps += 1;
+                k += tok_len;
+            }
+            if reps >= thresh {
+                return Some(chars[i].0);
+            }
+            i = if reps > 1 { k } else { i + 1 };
+        }
+    }
+    None
+}
+
 /// 块级复读折叠：对「已完整的整段文本」做一次性复读熔断。
 ///
 /// 用于非流式 / web_search loop 路径（`extract_invoke_content_blocks` 入口）——
@@ -3888,6 +3987,58 @@ mod tests {
         let events = ctx.process_assistant_response(&block);
         assert!(!has_tool_use_block(&events), "无声明工具时不重组");
         assert!(ctx.invoke_sniff_buffer.is_empty(), "不启用重组则不进 sniff 缓冲");
+    }
+
+    // ===== 结构性 stray 熔断(治 course/课 打地鼠 + 修 thinking/无工具盲区,旧代码上会失败)=====
+
+    #[test]
+    fn test_structural_flood_single_line_cjk() {
+        // 单行连写「课」×100(无换行)——旧独占行匹配漏,结构性检测应抓到并从游程起点截断。
+        let s = format!("正常开头 {}", "课".repeat(100));
+        let cut = detect_structural_flood(&s);
+        assert!(cut.is_some(), "单行连写课刷屏应被结构性检测命中");
+    }
+
+    #[test]
+    fn test_structural_flood_multichar_course() {
+        // "coursecourse…" ×40(词表里根本没 course)——多字符 token 连写应被抓。
+        let s = "course".repeat(40);
+        assert!(detect_structural_flood(&s).is_some(), "course 连写应被结构性检测命中(不靠词表)");
+    }
+
+    #[test]
+    fn test_structural_flood_normal_text_safe() {
+        // 正常文本(含少量重复词)不应误判。
+        assert!(detect_structural_flood("这是一段正常的中文回复,讲解代码逻辑和实现细节。").is_none());
+        assert!(detect_structural_flood("the quick brown fox jumps over the lazy dog").is_none());
+        assert!(detect_structural_flood("aaa bbb ccc").is_none(), "短重复但未达阈值不误判");
+    }
+
+    #[test]
+    fn test_stray_guard_covers_thinking_path() {
+        // 核心盲区修复:thinking 开着时,课刷屏也要被熔断(旧代码 thinking 提前 return 完全绕过)。
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4.6", 10, true, HashMap::new());
+        let flood = format!("{}", "课".repeat(200));
+        let events = ctx.process_assistant_response(&flood);
+        assert!(ctx.stray_guard_tripped, "thinking 路径的课刷屏也应触发熔断");
+        // 熔断后本轮应几乎不吐正文(截断在游程起点)。
+        let _ = events;
+    }
+
+    #[test]
+    fn test_stray_guard_covers_no_tools_path() {
+        // 核心盲区修复:无工具声明请求(known_tool_names 空)的课刷屏也要被处理。
+        // 用单行连写(泄漏清洗器只剥行首独占,够不到单行连写)专门验证 guard 生效——
+        // 逐行独占的课会被 clean_leaked_tokens 先剥掉(那也是有效清除路径),故此处用连写测 guard。
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4.6", 10, false, HashMap::new());
+        let flood = format!("正文{}", "课".repeat(200));
+        let events = ctx.process_assistant_response(&flood);
+        assert!(ctx.stray_guard_tripped, "无工具请求的单行课连写刷屏应触发 guard 熔断");
+        // 熔断后吐出的文本里课的数量应远少于 200(截断在游程起点)。
+        let emitted: String = events.iter()
+            .filter_map(|e| e.data["delta"]["text"].as_str())
+            .collect();
+        assert!(emitted.matches('课').count() < 200, "熔断应截断掉大部分课");
     }
 
     #[test]
