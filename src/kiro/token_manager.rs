@@ -1528,6 +1528,7 @@ impl MultiTokenManager {
             config.inbound_rpm_max,
             config.inbound_burst_secs,
             config.inbound_queue_max_wait_secs,
+            config.inbound_queue_timeout_passthrough,
         ));
         let rpm_limit = config.credential_rpm_limit;
         let rpm_headroom_factor = config.rpm_headroom_factor;
@@ -1704,6 +1705,7 @@ impl MultiTokenManager {
             new.inbound_rpm_max,
             new.inbound_burst_secs,
             new.inbound_queue_max_wait_secs,
+            new.inbound_queue_timeout_passthrough,
         );
         // 最后原子换整份配置（源真值,供冷/温读点 load() 取新值）
         self.config.store(Arc::new(new));

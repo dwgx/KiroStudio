@@ -50,8 +50,11 @@ pub struct GlobalThrottle {
     rpm_max: AtomicU32,
     /// 令牌桶突发容量(秒)。
     burst_secs: AtomicU32,
-    /// 排队最长等待(秒),超时返回错误让上层带 Retry-After 回给客户端。
+    /// 排队最长等待(秒),超时后行为由 queue_timeout_passthrough 决定。
     queue_max_wait_secs: AtomicU32,
+    /// 排队超时后是否放行(默认 true)而非返回 429。单号/高 RPM 不流通根治:超时放行去打上游,
+    /// 最坏退化成不限速,绝不因网关排队超时把请求卡死拒绝。
+    queue_timeout_passthrough: AtomicBool,
 
     /// 令牌桶状态:**一把轻锁**守护(令牌数×1000 + 上次补充时刻纳秒)。
     /// review 定论:补充(read-modify-write)+ 扣减若用裸原子会相互覆盖丢更新;速率整形不在
@@ -77,6 +80,7 @@ impl GlobalThrottle {
         rpm_max: u32,
         burst_secs: u32,
         queue_max_wait_secs: u32,
+        queue_timeout_passthrough: bool,
     ) -> Self {
         let target = target_rpm.clamp(rpm_min.max(1), rpm_max.max(1));
         Self {
@@ -86,6 +90,7 @@ impl GlobalThrottle {
             rpm_max: AtomicU32::new(rpm_max.max(1)),
             burst_secs: AtomicU32::new(burst_secs.max(1)),
             queue_max_wait_secs: AtomicU32::new(queue_max_wait_secs.max(1)),
+            queue_timeout_passthrough: AtomicBool::new(queue_timeout_passthrough),
             bucket: parking_lot::Mutex::new(Bucket {
                 // 初始给满桶(允许启动后一个小突发)。
                 tokens_milli: (target as u64) * 1000 / 60 * (burst_secs.max(1) as u64),
@@ -165,6 +170,15 @@ impl GlobalThrottle {
             let per_token = Duration::from_millis((60_000 / rpm).max(1));
             let now = Instant::now();
             if now >= deadline {
+                // 排队超时:passthrough=true(默认)则**放行**去打上游(单号/高RPM不流通根治——
+                // 不因网关排队超时把请求卡死拒绝,最坏退化成不限速);false 才返回 Retry-After 让客户端退避。
+                if self.queue_timeout_passthrough.load(Ordering::Relaxed) {
+                    tracing::warn!(
+                        target: "kiro::throttle",
+                        "入站排队超时,放行去打上游(passthrough,不拒绝)"
+                    );
+                    return Ok(());
+                }
                 let retry = self.queue_max_wait_secs.load(Ordering::Relaxed) as u64;
                 return Err(retry.max(1));
             }
@@ -252,9 +266,12 @@ impl GlobalThrottle {
         rpm_max: u32,
         burst_secs: u32,
         queue_max_wait_secs: u32,
+        queue_timeout_passthrough: bool,
     ) {
         self.enabled.store(enabled, Ordering::Relaxed);
         self.auto.store(auto, Ordering::Relaxed);
+        self.queue_timeout_passthrough
+            .store(queue_timeout_passthrough, Ordering::Relaxed);
         let lo = rpm_min.max(1);
         let hi = rpm_max.max(1);
         self.rpm_min.store(lo, Ordering::Relaxed);
@@ -287,7 +304,26 @@ mod tests {
     use super::*;
 
     fn mk(enabled: bool, auto: bool, rpm: u32) -> GlobalThrottle {
-        GlobalThrottle::new(enabled, auto, rpm, 20, 300, 2, 30)
+        // 测试默认 passthrough=false(超时返回 Err),保持既有排队/超发测试语义不变。
+        GlobalThrottle::new(enabled, auto, rpm, 20, 300, 2, 30, false)
+    }
+
+    #[tokio::test]
+    async fn test_queue_timeout_passthrough_admits_not_reject() {
+        // 单号/高RPM不流通根治:passthrough=true 时排队超时应**放行**(Ok)而非拒绝(Err)。
+        // 极低 RPM(1)+ 极短 queue_max_wait(1s)+ 桶抽干 → 下一个 acquire 必排队超时。
+        let t = GlobalThrottle::new(true, false, 1, 1, 300, 1, 1, true);
+        while t.try_take() {} // 抽干初始桶
+        // passthrough=true:超时放行,返回 Ok。
+        assert!(t.acquire().await.is_ok(), "passthrough 开:排队超时应放行(Ok)不拒绝");
+    }
+
+    #[tokio::test]
+    async fn test_queue_timeout_reject_when_passthrough_off() {
+        // passthrough=false 时保持旧行为:排队超时返回 Err(retry 秒数)。
+        let t = GlobalThrottle::new(true, false, 1, 1, 300, 1, 1, false);
+        while t.try_take() {} // 抽干初始桶
+        assert!(t.acquire().await.is_err(), "passthrough 关:排队超时应返回 Err(拒绝)");
     }
 
     #[tokio::test]
@@ -420,7 +456,7 @@ mod tests {
     #[test]
     fn test_update_hot_reload() {
         let t = mk(true, true, 100);
-        t.update(true, false, 150, 10, 500, 3, 45);
+        t.update(true, false, 150, 10, 500, 3, 45, false);
         assert_eq!(t.current_target_rpm(), 150);
         // 手动挡了,429 不降。
         t.report_upstream_429();
@@ -437,10 +473,10 @@ mod tests {
         t.report_upstream_429(); // 100→50
         assert_eq!(t.current_target_rpm(), 50);
         // 无关配置保存(target 传的还是初值 200,但自动挡应保留学到的 50,只 re-clamp)。
-        t.update(true, true, 200, 20, 300, 2, 30);
+        t.update(true, true, 200, 20, 300, 2, 30, false);
         assert_eq!(t.current_target_rpm(), 50, "自动挡保存无关配置不应打回初值");
         // 若新下限抬高到 80,则学到的 50 被 clamp 到 80。
-        t.update(true, true, 200, 80, 300, 2, 30);
+        t.update(true, true, 200, 80, 300, 2, 30, false);
         assert_eq!(t.current_target_rpm(), 80, "学到值低于新下限时 clamp 到下限");
     }
 }
