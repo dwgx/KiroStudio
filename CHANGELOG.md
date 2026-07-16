@@ -2,6 +2,37 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.28] - 2026-07-16
+
+### 入站请求整形 + RPM 自动挡(治 429 雪崩)+ 结构性 stray 熔断(治 course/课)+ 运维页大批 UI + 红队修复
+本版经**我自己 review + grok 外部红队 + ultrathink 核验**三重把关,修了 9 个 bug。
+
+**入站请求整形 + RPM 自动挡(治 429)**:
+- 新 `throttle.rs` GlobalThrottle:全局令牌桶挂在 acquire 唯一关口,突发被**排队削平**成受控 RPM,让号不被上游打爆
+  (冷却是号挂后补救减不了并发,整形在入口削平)。AIMD 自动挡:无 429 加性提速 / 收 429 乘性砍半,自动收敛到
+  上游不限流的最高稳定速率。config 7 字段(默认开 100RPM 自动挡 20-300)+ 热更 + 运维页齿轮卡(实时 RPM 展示)。
+
+**结构性 stray 熔断(治 course/课,根治打地鼠)**:
+- 修两个盲区(真机 strayGuardTripped:0 根因):①thinking 开着完全绕过熔断 ②熔断耦合进 reclaim 路径 gate 工具声明。
+  熔断提到所有文本公共出口。
+- 结构性检测 detect_structural_flood:**任意短 token 连续重复≥32 即熔断,不依赖词表/换行**——course/课/court/
+  单行连写/未来任何退化词全覆盖(硬编码词表补 course 都漏 + 独占行匹配漏单行连写的双盲区根治)。
+- 冷却时长缩放 cooldown_scale_pct、全局每号 RPM 上限入 UI(导入号=0 继承全局)、拟人速率抖动。
+
+**运维页大批 UI**:代理测活防冒泡、region 最近使用清理钮、齿轮展开设置卡、存储占用复用、用量日志饼图(自绘 SVG)、
+请求明细去裸框改筛选按钮(分页无 bug)、登录背景图点击放大 + 下载。
+
+**红队修复(grok 报告 + ultrathink 核验)**:
+- CRITICAL:单请求 failover 链对 AIMD 连乘降到底 → MD 加 3s 去抖(一波限流只降一档)。
+- HIGH:failover 每跳扣全局令牌 + fast-fail 空转 → 闸门上移每请求只过一次;AIMD 非原子相互覆盖 → 纳入
+  令牌桶同一 Mutex;try_take 失败吞时钟致 RPM 塌缩 → 只推进已兑现时间;thinking_buffer 纯空白无界 OOM → 256KiB 上限;
+  令牌桶高并发超发(我自己 review 抓)→ Mutex 原子 + 并发压测;自动挡被无关保存打回初值 → 保留学习值。
+- MEDIUM:fence_scan_partial 无界 → 行内 256 字节封顶;key 比较长度侧信道 → 先 SHA-256 定长再 ct_eq。
+
+`cargo test --bin kirostudio` 与 `--no-default-features --locked` 各 **753 绿**;前端 build 绿。
+**部署后真机观察**:reclaimedInvokeCalls/strayGuardTripped(治课生效)+ inboundCurrentRpm(自动挡收敛)。
+**根治 429 仍需加号**(1 个号配额有限,整形只让它用得最稳)。
+
 ## [0.7.27] - 2026-07-15
 
 ### 修复:stray token 复读熔断补中文 課/课(0.7.26 移植疏漏)
