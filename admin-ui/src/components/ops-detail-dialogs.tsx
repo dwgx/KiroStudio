@@ -38,6 +38,8 @@ import {
   SearchX,
   ChevronLeft,
   ChevronRight,
+  Filter,
+  Download,
 } from 'lucide-react'
 
 // ts_ms 是 epoch 毫秒。请求明细跨天,故展示「MM-DD HH:MM:SS」(本地时区,解析失败回退原值)。
@@ -73,6 +75,13 @@ function fmtNum(n: number): string {
   return Math.round(n).toLocaleString()
 }
 
+// datetime-local 输入值 → epoch 毫秒(空串/非法回 undefined)。
+function localInputToMs(v: string): number | undefined {
+  if (!v) return undefined
+  const t = new Date(v).getTime()
+  return Number.isFinite(t) ? t : undefined
+}
+
 // outcome → Badge 变体 + 中文短标签。success 绿 / rate_limited 黄 / 其余红。
 const OUTCOME_META: Record<string, { label: string; variant: BadgeProps['variant'] }> = {
   success: { label: '成功', variant: 'success' },
@@ -98,6 +107,100 @@ const OUTCOME_OPTIONS = [
 
 const PAGE_SIZE = 50
 
+// 饼图主题色板(取自主题色调,循环取用;禁图表库,纯 SVG 自绘)。
+const PIE_COLORS = [
+  'hsl(var(--primary))',
+  'hsl(160 84% 45%)',
+  'hsl(38 92% 55%)',
+  'hsl(280 65% 60%)',
+  'hsl(199 89% 55%)',
+  'hsl(0 84% 62%)',
+  'hsl(48 96% 55%)',
+  'hsl(220 9% 60%)',
+]
+
+// 饼图单段(外部传入)。
+interface PieSegment {
+  label: string
+  value: number
+  color: string
+}
+
+// 极角 → SVG 坐标(半径 r,圆心 cx/cy,angle 弧度从 12 点方向顺时针)。
+function polar(cx: number, cy: number, r: number, angle: number): [number, number] {
+  return [cx + r * Math.sin(angle), cy - r * Math.cos(angle)]
+}
+
+// 纯 SVG 自绘饼图 + 图例(禁图表库)。value 为占比权重,自动归一为角度;
+// 图例含 label + 百分比。空数据(总和为 0)显示占位文案。
+function PieChart({ segments, size = 132 }: { segments: PieSegment[]; size?: number }) {
+  const total = segments.reduce((s, seg) => s + Math.max(0, seg.value), 0)
+  const cx = size / 2
+  const cy = size / 2
+  const r = size / 2 - 2
+
+  // 生成每段的扇形 path(单段占满时画整圆,避免 arc 起止点重合消失)。
+  let acc = 0
+  const arcs = segments
+    .filter((s) => s.value > 0)
+    .map((seg) => {
+      const start = (acc / total) * Math.PI * 2
+      acc += seg.value
+      const end = (acc / total) * Math.PI * 2
+      const frac = seg.value / total
+      const [x0, y0] = polar(cx, cy, r, start)
+      const [x1, y1] = polar(cx, cy, r, end)
+      const largeArc = end - start > Math.PI ? 1 : 0
+      // 整段占满 → 画整圆(两段半圆拼接)。
+      const d =
+        frac >= 0.999
+          ? `M ${cx} ${cy - r} A ${r} ${r} 0 1 1 ${cx - 0.01} ${cy - r} Z`
+          : `M ${cx} ${cy} L ${x0} ${y0} A ${r} ${r} 0 ${largeArc} 1 ${x1} ${y1} Z`
+      return { d, color: seg.color, label: seg.label, value: seg.value, frac }
+    })
+
+  return (
+    <div className="flex items-center gap-4">
+      {total <= 0 ? (
+        <div
+          className="flex shrink-0 items-center justify-center rounded-full border border-dashed border-[#2e2e2e] text-[10px] text-muted-foreground"
+          style={{ width: size, height: size }}
+        >
+          无数据
+        </div>
+      ) : (
+        <svg
+          width={size}
+          height={size}
+          viewBox={`0 0 ${size} ${size}`}
+          className="shrink-0"
+          role="img"
+        >
+          {arcs.map((a, i) => (
+            <path key={i} d={a.d} fill={a.color} stroke="hsl(var(--card))" strokeWidth={1} />
+          ))}
+        </svg>
+      )}
+      <ul className="min-w-0 flex-1 space-y-1 text-[11px]">
+        {arcs.map((a, i) => (
+          <li key={i} className="flex items-center gap-1.5">
+            <span
+              className="h-2.5 w-2.5 shrink-0 rounded-[2px]"
+              style={{ background: a.color }}
+            />
+            <span className="min-w-0 flex-1 truncate text-[#ccc]" title={a.label}>
+              {a.label}
+            </span>
+            <span className="shrink-0 tabular-nums text-muted-foreground">
+              {(a.frac * 100).toFixed(1)}%
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
 // ============ 1. 请求明细 Dialog(traces,服务端搜索 + 分页) ============
 export function TraceDetailDialog({
   open,
@@ -106,16 +209,21 @@ export function TraceDetailDialog({
   open: boolean
   onOpenChange: (v: boolean) => void
 }) {
-  // 文本输入(即时) + 防抖值(300ms,喂给查询)。
+  // 文本输入(即时) + 防抖值(300ms,喂给查询)。text 为主搜索框(全文)。
   const [textRaw, setTextRaw] = useState('')
   const [text, setText] = useState('')
-  // 快捷过滤:model / clientIp / outcome / sessionId(联动过滤,点行内值可回填)。
+  // 高级过滤:model / clientIp / outcome / sessionId / 时间范围(收在筛选面板内)。
   const [model, setModel] = useState('')
   const [clientIp, setClientIp] = useState('')
   const [outcome, setOutcome] = useState('')
   const [sessionId, setSessionId] = useState('')
+  // 时间范围以 datetime-local 字符串暂存(本地时区),查询前转 epoch 毫秒。
+  const [tsFromRaw, setTsFromRaw] = useState('')
+  const [tsToRaw, setTsToRaw] = useState('')
   const [offset, setOffset] = useState(0)
   const [expandedId, setExpandedId] = useState<string | null>(null)
+  // 筛选面板开合(内嵌可折叠,项目无 Popover 组件)。
+  const [panelOpen, setPanelOpen] = useState(false)
 
   // 文本防抖:输入停 300ms 后才更新查询词,避免每键一次请求。
   useEffect(() => {
@@ -123,15 +231,21 @@ export function TraceDetailDialog({
     return () => clearTimeout(t)
   }, [textRaw])
 
-  // 任一过滤条件变化即回到第一页(避免停在越界页显示空)。
+  // 任一过滤条件变化即回到第一页(避免停在越界页显示空)。联动回填也走此处归零。
   useEffect(() => {
     setOffset(0)
-  }, [text, model, clientIp, outcome, sessionId])
+  }, [text, model, clientIp, outcome, sessionId, tsFromRaw, tsToRaw])
 
-  // 关闭时清空展开态(下次打开干净);过滤条件保留,便于二次排障。
+  // 关闭时清空展开态与筛选面板(下次打开干净);过滤条件保留,便于二次排障。
   useEffect(() => {
-    if (!open) setExpandedId(null)
+    if (!open) {
+      setExpandedId(null)
+      setPanelOpen(false)
+    }
   }, [open])
+
+  const tsFrom = localInputToMs(tsFromRaw)
+  const tsTo = localInputToMs(tsToRaw)
 
   // 构建过滤对象:仅带非空字段(空串不入参,后端也会归一,但保持 URL 干净)。
   const filter: TraceSearchFilter = useMemo(() => {
@@ -141,8 +255,10 @@ export function TraceDetailDialog({
     if (clientIp.trim()) f.clientIp = clientIp.trim()
     if (outcome) f.outcome = outcome
     if (sessionId.trim()) f.sessionId = sessionId.trim()
+    if (tsFrom != null) f.tsFrom = tsFrom
+    if (tsTo != null) f.tsTo = tsTo
     return f
-  }, [text, model, clientIp, outcome, sessionId, offset])
+  }, [text, model, clientIp, outcome, sessionId, tsFrom, tsTo, offset])
 
   const { data, isLoading, isFetching } = useQuery({
     queryKey: ['traces-search', filter],
@@ -153,17 +269,27 @@ export function TraceDetailDialog({
 
   const items = data?.items ?? []
   const total = data?.total ?? 0
-  const page = Math.floor(offset / PAGE_SIZE) + 1
+  // 分页派生:total=0 时 totalPages 兜底为 1(显示「第 1/1 页」而非 0);page 夹在合法区间。
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
-  const hasFilters = !!(text || model || clientIp || outcome || sessionId)
+  const page = total === 0 ? 1 : Math.min(totalPages, Math.floor(offset / PAGE_SIZE) + 1)
+  // 面板内高级过滤条件个数(不含主搜索框 text)——用于筛选按钮上的 badge。
+  const activeFilterCount =
+    (model.trim() ? 1 : 0) +
+    (clientIp.trim() ? 1 : 0) +
+    (outcome ? 1 : 0) +
+    (sessionId.trim() ? 1 : 0) +
+    (tsFrom != null ? 1 : 0) +
+    (tsTo != null ? 1 : 0)
+  const hasFilters = !!text || activeFilterCount > 0
 
-  const clearAll = () => {
-    setTextRaw('')
-    setText('')
+  // 清空面板内的高级过滤(不动主搜索框)。
+  const clearPanel = () => {
     setModel('')
     setClientIp('')
     setOutcome('')
     setSessionId('')
+    setTsFromRaw('')
+    setTsToRaw('')
   }
 
   return (
@@ -185,7 +311,7 @@ export function TraceDetailDialog({
           </DialogDescription>
         </DialogHeader>
 
-        {/* 过滤栏 */}
+        {/* 过滤栏:主搜索框(全文) + 筛选按钮(打开高级筛选面板) */}
         <div className="flex flex-wrap items-center gap-2">
           <div className="relative min-w-[200px] flex-1">
             <Search className="pointer-events-none absolute left-2 top-1/2 z-10 h-3.5 w-3.5 -translate-y-1/2 text-[#666]" />
@@ -205,38 +331,104 @@ export function TraceDetailDialog({
               </button>
             )}
           </div>
-          <Input
-            value={model}
-            onChange={(e) => setModel(e.target.value)}
-            placeholder="模型"
-            className="h-8 w-[150px] text-xs"
-          />
-          <Input
-            value={clientIp}
-            onChange={(e) => setClientIp(e.target.value)}
-            placeholder="client IP"
-            className="h-8 w-[130px] text-xs"
-          />
-          <Input
-            value={sessionId}
-            onChange={(e) => setSessionId(e.target.value)}
-            placeholder="session"
-            className="h-8 w-[130px] text-xs"
-          />
-          <Select
-            value={outcome}
-            onChange={setOutcome}
-            options={OUTCOME_OPTIONS}
-            aria-label="按结果过滤"
-            className="h-8 w-[120px] shrink-0 [&>button]:h-8 [&>button]:py-1 [&>button]:text-xs"
-          />
-          {hasFilters && (
-            <Button variant="ghost" size="sm" className="h-8 px-2 text-xs" onClick={clearAll}>
-              <X className="mr-1 h-3.5 w-3.5" />
-              清空
-            </Button>
-          )}
+          <Button
+            variant={panelOpen || activeFilterCount > 0 ? 'secondary' : 'outline'}
+            size="sm"
+            className="h-8 shrink-0 px-2 text-xs"
+            onClick={() => setPanelOpen((v) => !v)}
+          >
+            <Filter className="mr-1 h-3.5 w-3.5" />
+            筛选
+            {activeFilterCount > 0 && (
+              <Badge variant="default" className="ml-1.5 h-4 min-w-4 justify-center px-1 text-[10px] tabular-nums">
+                {activeFilterCount}
+              </Badge>
+            )}
+          </Button>
         </div>
+
+        {/* 高级筛选面板(内嵌可折叠) */}
+        {panelOpen && (
+          <div className="space-y-3 rounded-md border border-[#2e2e2e] bg-[#0d0d0d] p-3">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+              <label className="space-y-1">
+                <span className="text-[11px] text-muted-foreground">client IP</span>
+                <Input
+                  value={clientIp}
+                  onChange={(e) => setClientIp(e.target.value)}
+                  placeholder="如 203.0.113.5"
+                  className="h-8 text-xs"
+                />
+              </label>
+              <label className="space-y-1">
+                <span className="text-[11px] text-muted-foreground">session</span>
+                <Input
+                  value={sessionId}
+                  onChange={(e) => setSessionId(e.target.value)}
+                  placeholder="会话 ID(前缀即可)"
+                  className="h-8 text-xs"
+                />
+              </label>
+              <label className="space-y-1">
+                <span className="text-[11px] text-muted-foreground">模型</span>
+                <Input
+                  value={model}
+                  onChange={(e) => setModel(e.target.value)}
+                  placeholder="如 claude-opus-4"
+                  className="h-8 text-xs"
+                />
+              </label>
+              <label className="space-y-1">
+                <span className="text-[11px] text-muted-foreground">结果</span>
+                <Select
+                  value={outcome}
+                  onChange={setOutcome}
+                  options={OUTCOME_OPTIONS}
+                  aria-label="按结果过滤"
+                  className="[&>button]:h-8 [&>button]:py-1 [&>button]:text-xs"
+                />
+              </label>
+              <label className="space-y-1">
+                <span className="text-[11px] text-muted-foreground">起始时间</span>
+                <Input
+                  type="datetime-local"
+                  value={tsFromRaw}
+                  onChange={(e) => setTsFromRaw(e.target.value)}
+                  className="h-8 text-xs"
+                />
+              </label>
+              <label className="space-y-1">
+                <span className="text-[11px] text-muted-foreground">截止时间</span>
+                <Input
+                  type="datetime-local"
+                  value={tsToRaw}
+                  onChange={(e) => setTsToRaw(e.target.value)}
+                  className="h-8 text-xs"
+                />
+              </label>
+            </div>
+            <div className="flex items-center justify-end gap-2">
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-8 px-2 text-xs"
+                disabled={activeFilterCount === 0}
+                onClick={clearPanel}
+              >
+                <X className="mr-1 h-3.5 w-3.5" />
+                清空
+              </Button>
+              <Button
+                variant="secondary"
+                size="sm"
+                className="h-8 px-3 text-xs"
+                onClick={() => setPanelOpen(false)}
+              >
+                应用筛选
+              </Button>
+            </div>
+          </div>
+        )}
 
         {/* 结果区 */}
         <div className="min-h-0 flex-1 overflow-y-auto rounded-md border border-[#2e2e2e] bg-[#0a0a0a]">
@@ -462,21 +654,33 @@ export function UsageDetailDialog({
   const { data: byCred, isLoading: bcLoading } = useUsageByCredential()
 
   const w = overview?.last_24h
+
+  // 饼图数据:①按模型的 token 占比(取 top,总和 > 0 才画) ②按号的请求数占比。
+  // 只取前 8 个,其余合并为「其它」段,避免图例过长。
+  const modelTokenSegments = useMemo(
+    () => buildPieSegments(byModel, (r) => r.input_tokens + r.output_tokens),
+    [byModel],
+  )
+  const credReqSegments = useMemo(
+    () => buildPieSegments(byCred, (r) => r.requests, '#'),
+    [byCred],
+  )
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="flex max-h-[88vh] w-[min(96vw,900px)] max-w-none flex-col overflow-hidden">
+      <DialogContent className="flex max-h-[90vh] w-[min(96vw,1100px)] max-w-none flex-col overflow-hidden">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <BarChart3 className="h-4 w-4" />
             用量日志
           </DialogTitle>
           <DialogDescription>
-            近 24 小时汇总 + 按模型 / 按号维度聚合(读本地统计,零上游)。
+            近 24 小时汇总 + 占比饼图 + 按模型 / 按号维度聚合(读本地统计,零上游)。
           </DialogDescription>
         </DialogHeader>
 
         <div className="min-h-0 flex-1 space-y-4 overflow-y-auto pr-1">
-          {/* 近 24h KPI */}
+          {/* 顶部:近 24h KPI */}
           {ovLoading ? (
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
               {Array.from({ length: 4 }).map((_, i) => (
@@ -487,14 +691,27 @@ export function UsageDetailDialog({
             <UsageKpiRow w={w} />
           )}
 
-          {/* 按模型 */}
+          {/* 中部:两饼图并排(token 占比 / 请求数占比) */}
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+            <UsagePieCard
+              title="Token 占比(按模型)"
+              loading={bmLoading}
+              segments={modelTokenSegments}
+            />
+            <UsagePieCard
+              title="请求数占比(按号)"
+              loading={bcLoading}
+              segments={credReqSegments}
+            />
+          </div>
+
+          {/* 底部:按模型 / 按号明细表 */}
           <UsageGroupTable
             title="按模型"
             keyHeader="模型"
             rows={byModel}
             loading={bmLoading}
           />
-          {/* 按号 */}
           <UsageGroupTable
             title="按号(credential)"
             keyHeader="号"
@@ -505,6 +722,59 @@ export function UsageDetailDialog({
         </div>
       </DialogContent>
     </Dialog>
+  )
+}
+
+// 从分组统计构建饼图段:按取值降序,取前 8,其余聚合成「其它」;循环取主题色。
+function buildPieSegments(
+  rows: GroupStat[] | undefined,
+  pick: (r: GroupStat) => number,
+  keyPrefix = '',
+): PieSegment[] {
+  const list = [...(rows ?? [])]
+    .map((r) => ({ label: `${keyPrefix}${r.key}`, value: Math.max(0, pick(r)) }))
+    .filter((r) => r.value > 0)
+    .sort((a, b) => b.value - a.value)
+  const TOP = 7
+  const head = list.slice(0, TOP)
+  const rest = list.slice(TOP)
+  const segments: PieSegment[] = head.map((r, i) => ({
+    ...r,
+    color: PIE_COLORS[i % PIE_COLORS.length],
+  }))
+  if (rest.length > 0) {
+    segments.push({
+      label: `其它(${rest.length})`,
+      value: rest.reduce((s, r) => s + r.value, 0),
+      color: PIE_COLORS[PIE_COLORS.length - 1],
+    })
+  }
+  return segments
+}
+
+// 饼图卡片(带标题 + 加载骨架 + 空态)。
+function UsagePieCard({
+  title,
+  loading,
+  segments,
+}: {
+  title: string
+  loading: boolean
+  segments: PieSegment[]
+}) {
+  return (
+    <div className="rounded-md border border-[#2e2e2e] bg-[#0a0a0a]">
+      <div className="border-b border-[#2e2e2e] px-3 py-2 text-sm font-medium">{title}</div>
+      <div className="p-4">
+        {loading ? (
+          <Skeleton className="h-[132px]" />
+        ) : segments.length === 0 ? (
+          <EmptyState icon={Inbox} title="暂无数据" className="py-6" />
+        ) : (
+          <PieChart segments={segments} />
+        )}
+      </div>
+    </div>
   )
 }
 
@@ -775,6 +1045,25 @@ export function BgCacheDetailDialog({
   count: number
 }) {
   const idxs = useMemo(() => Array.from({ length: Math.max(0, count) }, (_, i) => i), [count])
+  // 放大预览:记住当前放大的图索引(null=未放大)。
+  const [lightboxIdx, setLightboxIdx] = useState<number | null>(null)
+  const bgUrl = (i: number) => `/admin/api/bg-cached?idx=${i}`
+
+  // Esc 关闭 lightbox(仅在放大态挂监听)。
+  useEffect(() => {
+    if (lightboxIdx === null) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setLightboxIdx(null)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [lightboxIdx])
+
+  // Dialog 关闭时顺带收起 lightbox。
+  useEffect(() => {
+    if (!open) setLightboxIdx(null)
+  }, [open])
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="flex max-h-[85vh] w-[min(96vw,860px)] max-w-none flex-col overflow-hidden">
@@ -787,7 +1076,7 @@ export function BgCacheDetailDialog({
             </span>
           </DialogTitle>
           <DialogDescription>
-            常驻内存的登录页随机背景图池,清理即释放内存(下次登录会重新拉取填充)。
+            常驻内存的登录页随机背景图池,点击可放大预览,悬停右上角可下载。清理即释放内存(下次登录会重新拉取填充)。
           </DialogDescription>
         </DialogHeader>
 
@@ -799,10 +1088,11 @@ export function BgCacheDetailDialog({
               {idxs.map((i) => (
                 <div
                   key={i}
-                  className="group relative aspect-video overflow-hidden rounded-md border border-[#2e2e2e] bg-[#111]"
+                  onClick={() => setLightboxIdx(i)}
+                  className="group relative aspect-video cursor-zoom-in overflow-hidden rounded-md border border-[#2e2e2e] bg-[#111]"
                 >
                   <img
-                    src={`/admin/api/bg-cached?idx=${i}`}
+                    src={bgUrl(i)}
                     loading="lazy"
                     alt={`背景图 #${i}`}
                     className="h-full w-full object-cover transition-transform duration-300 ease-out group-hover:scale-110"
@@ -810,12 +1100,61 @@ export function BgCacheDetailDialog({
                   <span className="absolute left-1.5 top-1.5 rounded bg-black/60 px-1.5 py-0.5 font-mono text-[10px] text-white/90">
                     #{i}
                   </span>
+                  {/* hover 显示下载钮:stopPropagation 避免触发放大 */}
+                  <a
+                    href={bgUrl(i)}
+                    download={`bg-${i}.jpg`}
+                    onClick={(e) => e.stopPropagation()}
+                    title="下载此图"
+                    className="absolute right-1.5 top-1.5 flex h-6 w-6 items-center justify-center rounded bg-black/60 text-white/90 opacity-0 transition-opacity hover:bg-black/80 group-hover:opacity-100"
+                  >
+                    <Download className="h-3.5 w-3.5" />
+                  </a>
                 </div>
               ))}
             </div>
           )}
         </div>
       </DialogContent>
+
+      {/* 放大 lightbox:全屏半透明 overlay 居中大图,点背景或 Esc 关闭 */}
+      {lightboxIdx !== null && (
+        <div
+          onClick={() => setLightboxIdx(null)}
+          className="fixed inset-0 z-[100] flex items-center justify-center bg-black/85 p-6 backdrop-blur-sm"
+          role="dialog"
+          aria-label={`背景图 #${lightboxIdx} 放大预览`}
+        >
+          <button
+            onClick={() => setLightboxIdx(null)}
+            title="关闭(Esc)"
+            className="absolute right-4 top-4 flex h-9 w-9 items-center justify-center rounded-full bg-white/10 text-white/90 hover:bg-white/20"
+          >
+            <X className="h-5 w-5" />
+          </button>
+          <div className="relative max-h-full max-w-full" onClick={(e) => e.stopPropagation()}>
+            <img
+              src={bgUrl(lightboxIdx)}
+              alt={`背景图 #${lightboxIdx}`}
+              className="max-h-[80vh] max-w-full rounded-md object-contain shadow-2xl"
+            />
+            <div className="absolute bottom-2 left-2 flex items-center gap-2">
+              <span className="rounded bg-black/60 px-2 py-0.5 font-mono text-xs text-white/90">
+                #{lightboxIdx}
+              </span>
+              <a
+                href={bgUrl(lightboxIdx)}
+                download={`bg-${lightboxIdx}.jpg`}
+                onClick={(e) => e.stopPropagation()}
+                className="flex items-center gap-1 rounded bg-black/60 px-2 py-0.5 text-xs text-white/90 hover:bg-black/80"
+              >
+                <Download className="h-3.5 w-3.5" />
+                下载
+              </a>
+            </div>
+          </div>
+        </div>
+      )}
     </Dialog>
   )
 }

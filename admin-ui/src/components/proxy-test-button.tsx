@@ -29,6 +29,7 @@ export function ProxyTestButton({
 
   const handleTest = async () => {
     setPending(true)
+    // 说明：阻止冒泡/默认提交在 onClick 里完成（见下），此处只负责测活逻辑。
     const url = proxyUrl.trim()
     const pendingToast = toast.loading(url && url !== 'direct' ? '正在测试代理连通性…' : '正在测试直连…')
     try {
@@ -58,7 +59,14 @@ export function ProxyTestButton({
       size="sm"
       variant="outline"
       className={className}
-      onClick={handleTest}
+      onClick={(e) => {
+        // 防冒泡：本按钮常被放进 <form>（如 add-credential-dialog）或 Dialog 里，
+        // 裸 onClick 会冒泡触发外层 form submit / onClick，导致「点测活弹 toast 后
+        // dialog 直接关闭 / 表单跳转」。preventDefault 挡默认提交，stopPropagation 断冒泡。
+        e.preventDefault()
+        e.stopPropagation()
+        void handleTest()
+      }}
       disabled={pending}
       title="测试该代理连通性（后端探测出口 IP + 延迟）"
     >

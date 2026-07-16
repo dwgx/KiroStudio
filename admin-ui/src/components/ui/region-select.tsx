@@ -1,7 +1,7 @@
 import * as React from 'react'
-import { Check, ChevronsUpDown, Search, History } from 'lucide-react'
+import { Check, ChevronsUpDown, Search, History, Trash2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { AWS_REGIONS, filterRegions, getRecentRegions, pushRecentRegion, regionLabel, isRegionCodeShape } from '@/lib/regions'
+import { AWS_REGIONS, filterRegions, getRecentRegions, pushRecentRegion, clearRecentRegions, regionLabel, isRegionCodeShape } from '@/lib/regions'
 
 export interface RegionSelectProps {
   value: string
@@ -181,9 +181,26 @@ export function RegionSelect({
           {/* 最近使用分组（仅打开且无搜索词时置顶展示，跨入口共享的历史） */}
           {recentToShow.length > 0 && (
             <div className="border-b border-border py-1">
-              <div className="flex items-center gap-1.5 px-3 py-1 text-[11px] font-medium text-muted-foreground">
-                <History className="h-3 w-3" />
-                最近使用
+              <div className="flex items-center justify-between px-3 py-1">
+                <span className="flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground">
+                  <History className="h-3 w-3" />
+                  最近使用
+                </span>
+                {/* 清理钮：清空全局「最近使用」历史并即时收起分组。阻止冒泡，不触发下拉选中/关闭。 */}
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.preventDefault()
+                    e.stopPropagation()
+                    clearRecentRegions()
+                    setRecent([])
+                  }}
+                  className="flex items-center rounded p-0.5 text-muted-foreground transition-colors duration-150 hover:text-foreground"
+                  title="清空最近使用历史"
+                  aria-label="清空最近使用历史"
+                >
+                  <Trash2 className="h-3 w-3" />
+                </button>
               </div>
               {recentToShow.map((code) => {
                 const r = AWS_REGIONS.find((x) => x.code === code)

@@ -51,6 +51,14 @@ import { extractErrorMessage, copyToClipboard } from '@/lib/utils'
 import { RegionSelect } from '@/components/ui/region-select'
 import { NumberStepper } from '@/components/ui/number-stepper'
 import { ComboInput } from '@/components/ui/combo-input'
+import { SettingGearCard } from '@/components/setting-gear-card'
+import {
+  TraceDetailDialog,
+  UsageDetailDialog,
+  TrashDetailDialog,
+  BgCacheDetailDialog,
+} from '@/components/ops-detail-dialogs'
+import { Eye } from 'lucide-react'
 
 // 版本字段的常见预设（可点选，也可自定义输入）。与 Kiro IDE 实际发行的标识对齐，
 // 便于伪装成主流客户端指纹；不在列表里的值直接手敲即可。
@@ -136,7 +144,7 @@ const CARD_INDEX: { section: SectionId; title: string; keywords: string[] }[] = 
   { section: 'basic', title: '登录页背景', keywords: ['登录背景图', '登录页背景', '背景图', 'r18', '图源', 'lolicon', '关闭登录背景图'] },
   { section: 'security', title: '反代安全', keywords: ['cors 允许来源', 'ip 白名单', 'cidr', '信任 x-forwarded-for', 'xff', '入口限流', '请求体上限', '413', '429'] },
   { section: 'scheduling', title: '负载均衡模式', keywords: ['负载均衡', '优先级模式', '均衡负载', 'priority', 'balanced'] },
-  { section: 'scheduling', title: '防关联 / 限流', keywords: ['冷却机制', '速率限制', '每日上限', '最小请求间隔', '会话亲和性', 'affinity'] },
+  { section: 'scheduling', title: '防关联 / 限流', keywords: ['冷却机制', '速率限制', '每日上限', '最小请求间隔', '会话亲和性', 'affinity', '冷却时长缩放', '间隔抖动', 'jitter', '拟人'] },
   { section: 'scheduling', title: '主动 token 预刷新', keywords: ['启用预刷新', '提前量', '扫描间隔', 'token 刷新'] },
   { section: 'storage', title: '存储占用', keywords: ['存储', '清理', '落盘', '分区', 'traces', 'usage', 'trash', 'bg_cache', '磁盘'] },
   { section: 'service', title: '服务管理', keywords: ['一键重启', '重启服务', 'restart'] },
@@ -223,9 +231,12 @@ interface FormState {
   affinityEnabled: boolean
   priorityInBalanced: boolean
   // 智能调度（0.7.23/0.7.24，均热更即时生效）
+  credentialRpmLimit: string
   rpmHeadroomFactor: string
   rpmReserveSlots: string
   rpmHardGateOverloadWait: boolean
+  cooldownScalePct: string
+  rateLimitJitterPct: string
   balanceWeightEnabled: boolean
   balanceWeightFloor: string
   health429WeightEnabled: boolean
@@ -299,9 +310,12 @@ function toForm(c: ConfigSnapshotResponse, ui: UiLayoutPrefs): FormState {
     rateLimitMinIntervalMs: String(c.rateLimitMinIntervalMs),
     affinityEnabled: c.affinityEnabled,
     priorityInBalanced: c.priorityInBalanced,
+    credentialRpmLimit: String(c.credentialRpmLimit ?? 0),
     rpmHeadroomFactor: String(c.rpmHeadroomFactor ?? 85),
     rpmReserveSlots: String(c.rpmReserveSlots ?? 0),
     rpmHardGateOverloadWait: c.rpmHardGateOverloadWait ?? false,
+    cooldownScalePct: String(c.cooldownScalePct ?? 100),
+    rateLimitJitterPct: String(c.rateLimitJitterPct ?? 20),
     balanceWeightEnabled: c.balanceWeightEnabled ?? true,
     balanceWeightFloor: String(c.balanceWeightFloor ?? 50),
     health429WeightEnabled: c.health429WeightEnabled ?? true,
@@ -558,11 +572,15 @@ const CLEANABLE_KEYS: StorageCleanupTarget[] = ['traces', 'usage_jsonl', 'trash'
 function StoragePartitionRow({
   p,
   onCleanup,
+  onView,
 }: {
   p: StoragePartition
   onCleanup: (p: StoragePartition) => void
+  onView: (p: StoragePartition) => void
 }) {
   const cleanable = (CLEANABLE_KEYS as string[]).includes(p.key)
+  // 四个可清理分区各有高保真明细弹框（与 CLEANABLE_KEYS 同集，复用运维页模板）。
+  const viewable = (CLEANABLE_KEYS as string[]).includes(p.key)
   return (
     <div className="flex items-center justify-between gap-4 border-b border-border/40 py-3 last:border-0">
       <div className="min-w-0">
@@ -585,6 +603,12 @@ function StoragePartitionRow({
           <div className="text-sm font-semibold tabular-nums">{formatBytes(p.bytes)}</div>
           <div className="text-[11px] text-muted-foreground tabular-nums">{p.items} 项</div>
         </div>
+        {viewable && (
+          <Button variant="outline" size="sm" onClick={() => onView(p)}>
+            <Eye className="mr-1 h-3.5 w-3.5" />
+            查看
+          </Button>
+        )}
         {cleanable && (
           <Button variant="outline" size="sm" onClick={() => onCleanup(p)}>
             <Trash className="mr-1 h-3.5 w-3.5" />
@@ -603,10 +627,18 @@ function StorageStatsCard() {
   // 清理弹框状态：target 分区 + 可选保留天数（空=按配置默认保留期）
   const [target, setTarget] = useState<StoragePartition | null>(null)
   const [keepDays, setKeepDays] = useState<string>('')
+  // 分区明细弹框：按分区 key 打开对应高保真明细（复用运维页 ops-detail-dialogs 模板）。
+  const [detail, setDetail] = useState<null | 'traces' | 'usage_jsonl' | 'trash' | 'bg_cache'>(null)
+  // bg_cache 分区张数（供背景图缓存弹框渲染 idx 网格）。
+  const bgCount = data?.partitions.find((p) => p.key === 'bg_cache')?.items ?? 0
 
   const openCleanup = (p: StoragePartition) => {
     setTarget(p)
     setKeepDays('')
+  }
+
+  const openView = (p: StoragePartition) => {
+    setDetail(p.key as 'traces' | 'usage_jsonl' | 'trash' | 'bg_cache')
   }
 
   // 时间维度仅对落盘按天数据有意义（traces / usage_jsonl）；trash/bg_cache 为全清
@@ -663,7 +695,7 @@ function StorageStatsCard() {
             />
             <div>
               {data.partitions.map((p) => (
-                <StoragePartitionRow key={p.key} p={p} onCleanup={openCleanup} />
+                <StoragePartitionRow key={p.key} p={p} onCleanup={openCleanup} onView={openView} />
               ))}
               {data.partitions.length === 0 && (
                 <p className="py-4 text-center text-sm text-muted-foreground">暂无可统计的分区</p>
@@ -707,6 +739,12 @@ function StorageStatsCard() {
           </div>
         )}
       </ConfirmDialog>
+
+      {/* 分区高保真明细弹框（查看按钮触发，复用运维页 ops-detail-dialogs 模板） */}
+      <TraceDetailDialog open={detail === 'traces'} onOpenChange={(v) => !v && setDetail(null)} />
+      <UsageDetailDialog open={detail === 'usage_jsonl'} onOpenChange={(v) => !v && setDetail(null)} />
+      <TrashDetailDialog open={detail === 'trash'} onOpenChange={(v) => !v && setDetail(null)} />
+      <BgCacheDetailDialog open={detail === 'bg_cache'} onOpenChange={(v) => !v && setDetail(null)} count={bgCount} />
     </Card>
   )
 }
@@ -1393,11 +1431,17 @@ export function SettingsPage() {
     if (form.affinityEnabled !== config.affinityEnabled) d.affinityEnabled = form.affinityEnabled
     if (form.priorityInBalanced !== config.priorityInBalanced) d.priorityInBalanced = form.priorityInBalanced
     // 智能调度:整数字段解析后比对(空/非法回退当前值不发)。
+    const nCredRpm = parseInt(form.credentialRpmLimit, 10)
+    if (Number.isFinite(nCredRpm) && nCredRpm !== (config.credentialRpmLimit ?? 0)) d.credentialRpmLimit = nCredRpm
     const nHeadroom = parseInt(form.rpmHeadroomFactor, 10)
     if (Number.isFinite(nHeadroom) && nHeadroom !== config.rpmHeadroomFactor) d.rpmHeadroomFactor = nHeadroom
     const nReserve = parseInt(form.rpmReserveSlots, 10)
     if (Number.isFinite(nReserve) && nReserve !== config.rpmReserveSlots) d.rpmReserveSlots = nReserve
     if (form.rpmHardGateOverloadWait !== config.rpmHardGateOverloadWait) d.rpmHardGateOverloadWait = form.rpmHardGateOverloadWait
+    const nCooldownScale = parseInt(form.cooldownScalePct, 10)
+    if (Number.isFinite(nCooldownScale) && nCooldownScale !== (config.cooldownScalePct ?? 100)) d.cooldownScalePct = nCooldownScale
+    const nJitter = parseInt(form.rateLimitJitterPct, 10)
+    if (Number.isFinite(nJitter) && nJitter !== (config.rateLimitJitterPct ?? 20)) d.rateLimitJitterPct = nJitter
     if (form.balanceWeightEnabled !== config.balanceWeightEnabled) d.balanceWeightEnabled = form.balanceWeightEnabled
     const nFloor = parseInt(form.balanceWeightFloor, 10)
     if (Number.isFinite(nFloor) && nFloor !== config.balanceWeightFloor) d.balanceWeightFloor = nFloor
@@ -1665,7 +1709,7 @@ export function SettingsPage() {
       </SectionGate>
 
       {/* 智能调度分区（余额加权 / RPM headroom / 背压 / 429 感知，全部热更即时生效） */}
-      <SectionGate section="scheduling" title="智能调度" keywords={['余额加权', '智能调度', 'headroom', '预留', '背压', '429', '限速感知', 'balance', 'rpm']}>
+      <SectionGate section="scheduling" title="智能调度" keywords={['余额加权', '智能调度', 'headroom', '预留', '背压', '429', '限速感知', 'balance', 'rpm', '每号 rpm 软上限', '全局 rpm']}>
       <Card>
         <CardHeader className="pb-2">
           <CardTitle className="text-base"><Highlight text="智能调度" /></CardTitle>
@@ -1708,19 +1752,79 @@ export function SettingsPage() {
               onCheckedChange={(v) => set('health429WeightEnabled', v)}
             />
           </Field>
+          {/* RPM 相关：行尾齿轮点开「RPM 卡」，含全局软上限 + headroom + 预留 + 背压 */}
           <Field
             label="RPM headroom 系数"
-            hint="饱和阈值 = 上限 × 系数%(整百分比)。85=预留 15% 缓冲,让分流在撞上游硬限之前提前触发,削弱 60s 滑窗边界爆发。100=不打折(贴硬限)。"
+            hint="饱和阈值 = 上限 × 系数%(整百分比)。85=预留 15% 缓冲,让分流在撞上游硬限之前提前触发,削弱 60s 滑窗边界爆发。100=不打折(贴硬限)。点齿轮调全局每号 RPM 软上限等。"
           >
-            <NumberStepper
-              value={Number(form.rpmHeadroomFactor) || 0}
-              onChange={(v) => set('rpmHeadroomFactor', String(v))}
-              min={0}
-              max={100}
-              step={5}
-              className="w-28"
-              aria-label="RPM headroom 系数"
-            />
+            <div className="flex items-center gap-1.5">
+              <NumberStepper
+                value={Number(form.rpmHeadroomFactor) || 0}
+                onChange={(v) => set('rpmHeadroomFactor', String(v))}
+                min={0}
+                max={100}
+                step={5}
+                className="w-28"
+                aria-label="RPM headroom 系数"
+              />
+              <SettingGearCard
+                title="RPM 细粒度设置"
+                description="每号 RPM 软上限与饱和预留策略。全局软上限在单号未单独设置时兜底继承。均热更即时生效。"
+              >
+                <SearchContext.Provider value={{ query: '' }}>
+                  <Field
+                    label="全局每号 RPM 软上限"
+                    hint="单号未单独设置(=0)时继承此值；此值也为 0 时用内置兜底 30。防单号请求过密撞上游滑窗限。"
+                  >
+                    <NumberStepper
+                      value={Number(form.credentialRpmLimit) || 0}
+                      onChange={(v) => set('credentialRpmLimit', String(v))}
+                      min={0}
+                      max={10000}
+                      step={5}
+                      className="w-28"
+                      aria-label="全局每号 RPM 软上限"
+                    />
+                  </Field>
+                  <Field
+                    label="RPM headroom 系数"
+                    hint="饱和阈值 = 上限 × 系数%。85=预留 15% 缓冲，提前触发分流削弱滑窗边界爆发。100=贴硬限。"
+                  >
+                    <NumberStepper
+                      value={Number(form.rpmHeadroomFactor) || 0}
+                      onChange={(v) => set('rpmHeadroomFactor', String(v))}
+                      min={0}
+                      max={100}
+                      step={5}
+                      className="w-28"
+                      aria-label="RPM headroom 系数"
+                    />
+                  </Field>
+                  <Field
+                    label="RPM 预留名额"
+                    hint="在 headroom 折扣后再额外扣掉 N 个名额给突发留固定缓冲。0=不额外预留。与 headroom 叠加。"
+                  >
+                    <NumberStepper
+                      value={Number(form.rpmReserveSlots) || 0}
+                      onChange={(v) => set('rpmReserveSlots', String(v))}
+                      min={0}
+                      max={1000}
+                      className="w-28"
+                      aria-label="RPM 预留名额"
+                    />
+                  </Field>
+                  <Field
+                    label="整池饱和背压等待"
+                    hint="⚠️进阶：整池 RPM 全饱和时，选号在网关内等待最短恢复窗口而非立即回退软门。默认关。"
+                  >
+                    <Switch
+                      checked={form.rpmHardGateOverloadWait}
+                      onCheckedChange={(v) => set('rpmHardGateOverloadWait', v)}
+                    />
+                  </Field>
+                </SearchContext.Provider>
+              </SettingGearCard>
+            </div>
           </Field>
           <Field
             label="RPM 预留名额"
@@ -1858,11 +1962,73 @@ export function SettingsPage() {
           <CardTitle className="text-base"><Highlight text="防关联 / 限流" /></CardTitle>
         </CardHeader>
         <CardContent className="py-0">
-          <Field label="冷却机制" hint="失败后短暂跳过该凭据（保存即时生效，无需重启）">
-            <Switch checked={form.cooldownEnabled} onCheckedChange={(v) => set('cooldownEnabled', v)} />
+          {/* 冷却机制：行尾齿轮点开「冷却卡」做细粒度设置 */}
+          <Field label="冷却机制" hint="失败后短暂跳过该凭据（保存即时生效，无需重启）。点齿轮调冷却时长缩放。">
+            <div className="flex items-center gap-1.5">
+              <Switch checked={form.cooldownEnabled} onCheckedChange={(v) => set('cooldownEnabled', v)} />
+              <SettingGearCard
+                title="冷却设置"
+                description="失败后短暂跳过该凭据，避开风控。冷却时长缩放让重试节奏更激进或更保守。均热更即时生效。"
+              >
+                <SearchContext.Provider value={{ query: '' }}>
+                  <Field label="启用冷却机制" hint="失败后短暂跳过该凭据（保存即时生效，无需重启）">
+                    <Switch checked={form.cooldownEnabled} onCheckedChange={(v) => set('cooldownEnabled', v)} />
+                  </Field>
+                  <Field
+                    label="冷却时长缩放 (%)"
+                    hint="缩放可恢复的短冷却时长。<100 更激进快重试（省吞吐但更易撞风控），>100 更保守防封。100=原时长。"
+                  >
+                    <NumberStepper
+                      value={Number(form.cooldownScalePct) || 0}
+                      onChange={(v) => set('cooldownScalePct', String(v))}
+                      min={10}
+                      max={500}
+                      step={10}
+                      className="w-28"
+                      disabled={!form.cooldownEnabled}
+                      aria-label="冷却时长缩放百分比"
+                    />
+                  </Field>
+                </SearchContext.Provider>
+              </SettingGearCard>
+            </div>
           </Field>
-          <Field label="速率限制" hint="拟人节奏：每日上限 + 请求间隔（保存即时生效，无需重启）">
-            <Switch checked={form.rateLimitEnabled} onCheckedChange={(v) => set('rateLimitEnabled', v)} />
+          {/* 速率限制：行尾齿轮点开「速率卡」做细粒度设置 */}
+          <Field label="速率限制" hint="拟人节奏：每日上限 + 请求间隔 + 间隔抖动（保存即时生效，无需重启）。点齿轮细调。">
+            <div className="flex items-center gap-1.5">
+              <Switch checked={form.rateLimitEnabled} onCheckedChange={(v) => set('rateLimitEnabled', v)} />
+              <SettingGearCard
+                title="速率限制设置"
+                description="拟人节奏，降低账号关联/风控风险。每日上限 + 最小请求间隔 + 间隔抖动。均热更即时生效。"
+              >
+                <SearchContext.Provider value={{ query: '' }}>
+                  <Field label="启用速率限制" hint="拟人节奏：每日上限 + 请求间隔（保存即时生效，无需重启）">
+                    <Switch checked={form.rateLimitEnabled} onCheckedChange={(v) => set('rateLimitEnabled', v)} />
+                  </Field>
+                  <Field label="每日上限" hint="0 表示无限制（保存即时生效，无需重启）">
+                    <NumberStepper value={Number(form.rateLimitDailyMax) || 0} onChange={(v) => set('rateLimitDailyMax', String(v))} min={0} step={10} className="w-28" disabled={!form.rateLimitEnabled} aria-label="每日上限" />
+                  </Field>
+                  <Field label="最小请求间隔 (ms)" hint="保存即时生效，无需重启">
+                    <NumberStepper value={Number(form.rateLimitMinIntervalMs) || 0} onChange={(v) => set('rateLimitMinIntervalMs', String(v))} min={0} step={100} className="w-28" disabled={!form.rateLimitEnabled} aria-label="最小请求间隔" />
+                  </Field>
+                  <Field
+                    label="间隔抖动 (%)"
+                    hint="在最小请求间隔上叠加随机抖动，让节奏更像人（0-50）。0=固定间隔（更机械）。"
+                  >
+                    <NumberStepper
+                      value={Number(form.rateLimitJitterPct) || 0}
+                      onChange={(v) => set('rateLimitJitterPct', String(v))}
+                      min={0}
+                      max={50}
+                      step={5}
+                      className="w-28"
+                      disabled={!form.rateLimitEnabled}
+                      aria-label="间隔抖动百分比"
+                    />
+                  </Field>
+                </SearchContext.Provider>
+              </SettingGearCard>
+            </div>
           </Field>
           <Field label="每日上限" hint="0 表示无限制（保存即时生效，无需重启）">
             <NumberStepper value={Number(form.rateLimitDailyMax) || 0} onChange={(v) => set('rateLimitDailyMax', String(v))} min={0} step={10} className="w-28" disabled={!form.rateLimitEnabled} aria-label="每日上限" />
