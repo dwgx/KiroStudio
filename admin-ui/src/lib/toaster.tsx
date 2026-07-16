@@ -249,6 +249,15 @@ function ToastItem({ rec }: { rec: ToastRecord }) {
     setTimeout(() => toastStore.dismiss(rec.id), 170)
   }
 
+  // 同 id 就地更新(loading→success/error)时,rec.duration 会从 Infinity 变成有限值。
+  // remainingRef 是 useRef 初始化的,不会自动跟随 rec.duration 变化——若不同步,下方计时 effect
+  // 会用**旧的 Infinity** 去 setTimeout(beginClose, Infinity),浏览器把 Infinity/溢出延时当 0 处理
+  // → 成功 toast 一闪即消失(这正是"测活 notification 立马消失"的根因)。故 duration 变化即重同步。
+  useEffect(() => {
+    remainingRef.current = rec.duration
+    startRef.current = Date.now()
+  }, [rec.duration])
+
   useEffect(() => {
     if (!finite) return
     const clear = () => {
