@@ -225,6 +225,7 @@ interface FormState {
   toolDescriptionMaxChars: string
   encryptCredentialsAtRest: boolean
   cooldownEnabled: boolean
+  allCoolingFastFail: boolean
   rateLimitEnabled: boolean
   rateLimitDailyMax: string
   rateLimitMinIntervalMs: string
@@ -312,6 +313,7 @@ function toForm(c: ConfigSnapshotResponse, ui: UiLayoutPrefs): FormState {
     toolDescriptionMaxChars: String(c.toolDescriptionMaxChars ?? 10000),
     encryptCredentialsAtRest: c.encryptCredentialsAtRest ?? false,
     cooldownEnabled: c.cooldownEnabled,
+    allCoolingFastFail: c.allCoolingFastFail ?? true,
     rateLimitEnabled: c.rateLimitEnabled,
     rateLimitDailyMax: String(c.rateLimitDailyMax),
     rateLimitMinIntervalMs: String(c.rateLimitMinIntervalMs),
@@ -1437,6 +1439,7 @@ export function SettingsPage() {
     if (Number.isFinite(descMax) && descMax >= 0 && descMax !== (config.toolDescriptionMaxChars ?? 10000)) d.toolDescriptionMaxChars = descMax
     if (form.encryptCredentialsAtRest !== (config.encryptCredentialsAtRest ?? false)) d.encryptCredentialsAtRest = form.encryptCredentialsAtRest
     if (form.cooldownEnabled !== config.cooldownEnabled) d.cooldownEnabled = form.cooldownEnabled
+    if (form.allCoolingFastFail !== (config.allCoolingFastFail ?? true)) d.allCoolingFastFail = form.allCoolingFastFail
     if (form.rateLimitEnabled !== config.rateLimitEnabled) d.rateLimitEnabled = form.rateLimitEnabled
     const daily = Number(form.rateLimitDailyMax)
     if (Number.isFinite(daily) && daily !== config.rateLimitDailyMax) d.rateLimitDailyMax = daily
@@ -2047,6 +2050,13 @@ export function SettingsPage() {
                 </SearchContext.Provider>
               </SettingGearCard>
             </div>
+          </Field>
+          {/* 全池冷却快速失败：全池都在冷却时立即 429 让客户端退避，还是网关内短等重试 */}
+          <Field
+            label="全池冷却快速失败"
+            hint="全部凭据都在冷却时：开=立即返回 429+Retry-After 让客户端退避（多号池更合适）；关=网关内短等到有号恢复再重试（单号/小池更平滑，避免频繁 429）。保存即时生效，无需重启。"
+          >
+            <Switch checked={form.allCoolingFastFail} onCheckedChange={(v) => set('allCoolingFastFail', v)} />
           </Field>
           {/* 速率限制：行尾齿轮点开「速率卡」做细粒度设置 */}
           <Field label="速率限制" hint="拟人节奏：每日上限 + 请求间隔 + 间隔抖动（保存即时生效，无需重启）。点齿轮细调。">

@@ -257,3 +257,21 @@ function sha256Pure(data: Uint8Array): string {
     .map(v => (v >>> 0).toString(16).padStart(8, '0'))
     .join('')
 }
+
+// 触发浏览器下载一段 JSON（Blob + a.download）。用于凭据令牌导出（设置页/凭据批量导出共用）。
+export function downloadJson(filename: string, data: unknown) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
+}
+
+// 文件名用时间戳：2026-07-16-18-30-00。
+export function fileStamp(): string {
+  return new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
+}

@@ -1061,6 +1061,7 @@ impl AdminService {
             tool_description_max_chars: config.tool_description_max_chars,
             encrypt_credentials_at_rest: config.encrypt_credentials_at_rest,
             cooldown_enabled: config.cooldown_enabled,
+            all_cooling_fast_fail: config.all_cooling_fast_fail,
             rate_limit_enabled: config.rate_limit_enabled,
             rate_limit_daily_max: config.rate_limit_daily_max,
             rate_limit_min_interval_ms: config.rate_limit_min_interval_ms,
@@ -1353,6 +1354,12 @@ impl AdminService {
         if let Some(v) = req.cooldown_enabled {
             if v != config.cooldown_enabled {
                 config.cooldown_enabled = v;
+                hot_changed = true;
+            }
+        }
+        if let Some(v) = req.all_cooling_fast_fail {
+            if v != config.all_cooling_fast_fail {
+                config.all_cooling_fast_fail = v;
                 hot_changed = true;
             }
         }

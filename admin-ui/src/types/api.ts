@@ -323,6 +323,7 @@ export interface ConfigSnapshotResponse {
   /** credentials.json / trash.json at-rest 加密开关（机器绑定密钥，立即生效，默认关）。 */
   encryptCredentialsAtRest: boolean
   cooldownEnabled: boolean
+  allCoolingFastFail: boolean
   rateLimitEnabled: boolean
   rateLimitDailyMax: number
   rateLimitMinIntervalMs: number
@@ -400,6 +401,7 @@ export interface UpdateConfigRequest {
   toolDescriptionMaxChars?: number
   encryptCredentialsAtRest?: boolean
   cooldownEnabled?: boolean
+  allCoolingFastFail?: boolean
   rateLimitEnabled?: boolean
   rateLimitDailyMax?: number
   rateLimitMinIntervalMs?: number
