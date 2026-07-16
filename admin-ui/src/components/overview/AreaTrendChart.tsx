@@ -1,4 +1,5 @@
 import { useMemo, useRef, useState, useEffect, useLayoutEffect } from 'react'
+import { useTranslation } from 'react-i18next'
 import type { SeriesPoint } from '@/types/api'
 import { useUsageThroughput } from '@/hooks/use-usage'
 
@@ -359,6 +360,7 @@ function FlowParticles({
  * tooltip 数值取最近数据点。失败以底部淡红点含蓄标记。空数据显示占位文案。motion-reduce 兜底。
  */
 export function AreaTrendChart({ points, height = 280, showRate = false, granularity = 'hourly', className }: AreaTrendChartProps) {
+  const { t } = useTranslation()
   const wrapRef = useRef<HTMLDivElement>(null)
   const tipRef = useRef<HTMLDivElement>(null)
   const [width, setWidth] = useState(600)
@@ -472,9 +474,9 @@ export function AreaTrendChart({ points, height = 280, showRate = false, granula
 
   if (!hasData) {
     return (
-      <div className={className} style={{ height }} role="img" aria-label="暂无请求趋势数据">
+      <div className={className} style={{ height }} role="img" aria-label={t('overviewpage.trend.emptyAria')}>
         <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
-          该区间暂无请求数据
+          {t('overviewpage.trend.empty')}
         </div>
       </div>
     )
@@ -653,12 +655,14 @@ export function AreaTrendChart({ points, height = 280, showRate = false, granula
             <div className="rounded-md border border-border bg-popover px-3 py-2 text-xs shadow-lg animate-rise-in">
               <div className="mb-1 font-medium text-foreground">{fmtLabel(nearest.p.ts_ms)}</div>
               <div className="flex items-center gap-3 tabular-nums text-muted-foreground">
-                <span>请求 <span className="font-medium text-foreground">{nearest.p.requests}</span></span>
-                <span className="text-emerald-400">成功 {nearest.p.success}</span>
-                <span className={nearest.p.failure > 0 ? 'text-red-400' : ''}>失败 {nearest.p.failure}</span>
+                <span>{t('overviewpage.trend.requests')} <span className="font-medium text-foreground">{nearest.p.requests}</span></span>
+                <span className="text-emerald-400">{t('overviewpage.trend.successCount', { n: nearest.p.success })}</span>
+                <span className={nearest.p.failure > 0 ? 'text-red-400' : ''}>{t('overviewpage.trend.failureCount', { n: nearest.p.failure })}</span>
                 {showRate && (
                   <span className="text-emerald-400">
-                    成功率 {nearest.p.requests > 0 ? Math.round((nearest.p.success / nearest.p.requests) * 100) : 100}%
+                    {t('overviewpage.trend.successRate', {
+                      pct: nearest.p.requests > 0 ? Math.round((nearest.p.success / nearest.p.requests) * 100) : 100,
+                    })}
                   </span>
                 )}
               </div>

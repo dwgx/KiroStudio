@@ -80,7 +80,16 @@ interface DeviceMeta {
 }
 
 // 规范取值 → 元数据。取值集合与后端 classify_device 契约一致。
-const DEVICE_META: Record<string, DeviceMeta> = {
+// 品牌名原样展示；需翻译的用 labelKey，渲染时 t()。
+interface DeviceMetaRaw {
+  icon: React.ComponentType<{ className?: string }>
+  label?: string
+  labelKey?: string
+  badge: string
+  bar: string
+}
+
+const DEVICE_META: Record<string, DeviceMetaRaw> = {
   'claude-code': {
     icon: ClaudeCodeIcon,
     label: 'Claude Code',
@@ -140,27 +149,34 @@ const DEVICE_META: Record<string, DeviceMeta> = {
   },
   browser: {
     icon: Globe,
-    label: '浏览器',
+    labelKey: 'usagepage.device.browser',
     badge: 'border-indigo-500/25 bg-indigo-500/10 text-indigo-300',
     bar: '#6366f1',
   },
   unknown: {
     icon: HelpCircle,
-    label: '未知',
+    labelKey: 'usagepage.device.unknown',
     badge: 'border-border bg-secondary text-muted-foreground',
     bar: '#6b7280',
   },
 }
 
 // 归一化取回设备元数据：空值/未收录一律落到 unknown，保证永远有可展示项。
-function deviceMeta(key: string | null | undefined): DeviceMeta {
-  if (!key) return DEVICE_META.unknown
-  return DEVICE_META[key] ?? DEVICE_META.unknown
+// 渲染时解析 label（labelKey → t）。
+function deviceMeta(key: string | null | undefined, t: (k: string) => string): DeviceMeta {
+  const raw = !key ? DEVICE_META.unknown : (DEVICE_META[key] ?? DEVICE_META.unknown)
+  return {
+    icon: raw.icon,
+    label: raw.labelKey ? t(raw.labelKey) : (raw.label ?? key ?? ''),
+    badge: raw.badge,
+    bar: raw.bar,
+  }
 }
 
 // 设备徽标：图标 + 中文/原文标签，tinted 底色小胶囊，一眼看清请求来源。
 function DeviceBadge({ device }: { device: string | null | undefined }) {
-  const meta = deviceMeta(device)
+  const { t } = useTranslation()
+  const meta = deviceMeta(device, t)
   const Icon = meta.icon
   return (
     <span
@@ -399,7 +415,7 @@ function DeviceDistribution({ rows }: { rows: RequestRecord[] }) {
   return (
     <ol className="space-y-3">
       {aggs.map((d) => {
-        const meta = deviceMeta(d.key)
+        const meta = deviceMeta(d.key, t)
         const pct = Math.round((d.requests / max) * 100)
         const share = total > 0 ? Math.round((d.requests / total) * 100) : 0
         return (
@@ -531,16 +547,17 @@ function MachineBreakdown({
 
 /* ============ 结果徽标 ============ */
 
-const OUTCOME_LABEL: Record<RequestOutcome, string> = {
-  success: '成功',
-  rate_limited: '限流',
-  auth_failed: '认证失败',
-  quota_exhausted: '额度用尽',
-  account_suspended: '账户暂停',
-  server_error: '服务端错误',
-  bad_request: '请求错误',
-  network_error: '网络错误',
-  other_error: '其它错误',
+// outcome → i18n key（渲染时 t，切语言实时更新）
+const OUTCOME_LABEL_KEYS: Record<RequestOutcome, string> = {
+  success: 'usagepage.outcome.success',
+  rate_limited: 'usagepage.outcome.rateLimited',
+  auth_failed: 'usagepage.outcome.authFailed',
+  quota_exhausted: 'usagepage.outcome.quotaExhausted',
+  account_suspended: 'usagepage.outcome.accountSuspended',
+  server_error: 'usagepage.outcome.serverError',
+  bad_request: 'usagepage.outcome.badRequest',
+  network_error: 'usagepage.outcome.networkError',
+  other_error: 'usagepage.outcome.otherError',
 }
 
 // 结果分类 → tinted badge 语义色：成功绿 / 限流·额度黄 / 其余红
@@ -551,9 +568,11 @@ function outcomeVariant(o: RequestOutcome): 'success' | 'warning' | 'destructive
 }
 
 function OutcomeBadge({ outcome }: { outcome: RequestOutcome }) {
+  const { t } = useTranslation()
+  const key = OUTCOME_LABEL_KEYS[outcome]
   return (
     <Badge variant={outcomeVariant(outcome)} className="text-[10px]">
-      {OUTCOME_LABEL[outcome] ?? outcome}
+      {key ? t(key) : outcome}
     </Badge>
   )
 }
@@ -587,7 +606,7 @@ function DetailRow({
 // 客户端 IP、凭据、结果（含错误信息）、token、延迟/首字、重试、流式、会话窗口等。
 function RequestDetail({ record: r }: { record: RequestRecord }) {
   const { t } = useTranslation()
-  const dev = deviceMeta(r.client_device)
+  const dev = deviceMeta(r.client_device, t)
   // 设备三维拼一行：主类 + OS + 浏览器，各自有值才拼。
   const deviceLine = [dev.label, r.client_os, r.client_browser].filter(Boolean).join(' · ')
   return (
@@ -639,7 +658,7 @@ function RequestDetail({ record: r }: { record: RequestRecord }) {
 // dwgx:左键展开不要竖卡片,要"和上面 bar 一样在下面铺开几行"。
 function RequestDetailSpread({ record: r }: { record: RequestRecord }) {
   const { t } = useTranslation()
-  const dev = deviceMeta(r.client_device)
+  const dev = deviceMeta(r.client_device, t)
   const deviceLine = [dev.label, r.client_os, r.client_browser].filter(Boolean).join(' · ')
   const cacheR = (r as { cache_read_tokens?: number }).cache_read_tokens
   const cacheW = (r as { cache_creation_tokens?: number }).cache_creation_tokens

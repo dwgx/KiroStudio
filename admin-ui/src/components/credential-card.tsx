@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
+import i18n from '@/i18n'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { Settings, RefreshCw, Wallet, Trash2, Loader2, ClipboardCopy, ShieldAlert, Gauge, Check, Ban, Power } from 'lucide-react'
@@ -57,33 +58,34 @@ function formatCredits(v: number | undefined | null): string {
   return n.toFixed(2)
 }
 
+// 每次渲染调用：i18n 单例取当前语言。
 function formatLastUsed(lastUsedAt: string | null): string {
-  if (!lastUsedAt) return '从未使用'
+  if (!lastUsedAt) return i18n.t('credentialcard.lastUsed.never')
   const date = new Date(lastUsedAt)
   const now = new Date()
   const diff = now.getTime() - date.getTime()
-  if (diff < 0) return '刚刚'
+  if (diff < 0) return i18n.t('credentialcard.lastUsed.justNow')
   const seconds = Math.floor(diff / 1000)
-  if (seconds < 60) return `${seconds} 秒前`
+  if (seconds < 60) return i18n.t('credentialcard.lastUsed.secondsAgo', { n: seconds })
   const minutes = Math.floor(seconds / 60)
-  if (minutes < 60) return `${minutes} 分钟前`
+  if (minutes < 60) return i18n.t('credentialcard.lastUsed.minutesAgo', { n: minutes })
   const hours = Math.floor(minutes / 60)
-  if (hours < 24) return `${hours} 小时前`
+  if (hours < 24) return i18n.t('credentialcard.lastUsed.hoursAgo', { n: hours })
   const days = Math.floor(hours / 24)
-  return `${days} 天前`
+  return i18n.t('credentialcard.lastUsed.daysAgo', { n: days })
 }
 
 // 缓存新鲜度：把 cachedAt（Unix 秒）转成“截至 X 分钟前”，不抹掉数字，只标注时效。
 function formatCachedAt(cachedAt: number): string {
   const diffMs = Date.now() - cachedAt * 1000
-  if (diffMs < 0) return '刚刚'
+  if (diffMs < 0) return i18n.t('credentialcard.lastUsed.justNow')
   const minutes = Math.floor(diffMs / 60000)
-  if (minutes < 1) return '刚刚'
-  if (minutes < 60) return `${minutes} 分钟前`
+  if (minutes < 1) return i18n.t('credentialcard.lastUsed.justNow')
+  if (minutes < 60) return i18n.t('credentialcard.lastUsed.minutesAgo', { n: minutes })
   const hours = Math.floor(minutes / 60)
-  if (hours < 24) return `${hours} 小时前`
+  if (hours < 24) return i18n.t('credentialcard.lastUsed.hoursAgo', { n: hours })
   const days = Math.floor(hours / 24)
-  return `${days} 天前`
+  return i18n.t('credentialcard.lastUsed.daysAgo', { n: days })
 }
 
 // 代理 URL 脱敏：隐藏 user:pass@ 凭据段，仅保留协议 + 主机:端口。
