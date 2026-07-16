@@ -338,6 +338,16 @@ export interface ConfigSnapshotResponse {
   cooldownScalePct: number
   /** 拟人速率：请求间隔抖动百分比（0..50），让节奏更像人 */
   rateLimitJitterPct: number
+  // 入站请求整形 + RPM 自动挡
+  inboundThrottleEnabled: boolean
+  inboundRpmAuto: boolean
+  inboundTargetRpm: number
+  inboundRpmMin: number
+  inboundRpmMax: number
+  inboundBurstSecs: number
+  inboundQueueMaxWaitSecs: number
+  /** 当前实时目标 RPM（自动挡动态，只读展示） */
+  inboundCurrentRpm: number
   balanceWeightEnabled: boolean
   balanceWeightFloor: number
   health429WeightEnabled: boolean
@@ -401,6 +411,13 @@ export interface UpdateConfigRequest {
   rpmHardGateOverloadWait?: boolean
   cooldownScalePct?: number
   rateLimitJitterPct?: number
+  inboundThrottleEnabled?: boolean
+  inboundRpmAuto?: boolean
+  inboundTargetRpm?: number
+  inboundRpmMin?: number
+  inboundRpmMax?: number
+  inboundBurstSecs?: number
+  inboundQueueMaxWaitSecs?: number
   balanceWeightEnabled?: boolean
   balanceWeightFloor?: number
   health429WeightEnabled?: boolean

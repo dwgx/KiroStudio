@@ -237,6 +237,13 @@ interface FormState {
   rpmHardGateOverloadWait: boolean
   cooldownScalePct: string
   rateLimitJitterPct: string
+  inboundThrottleEnabled: boolean
+  inboundRpmAuto: boolean
+  inboundTargetRpm: string
+  inboundRpmMin: string
+  inboundRpmMax: string
+  inboundBurstSecs: string
+  inboundQueueMaxWaitSecs: string
   balanceWeightEnabled: boolean
   balanceWeightFloor: string
   health429WeightEnabled: boolean
@@ -316,6 +323,13 @@ function toForm(c: ConfigSnapshotResponse, ui: UiLayoutPrefs): FormState {
     rpmHardGateOverloadWait: c.rpmHardGateOverloadWait ?? false,
     cooldownScalePct: String(c.cooldownScalePct ?? 100),
     rateLimitJitterPct: String(c.rateLimitJitterPct ?? 20),
+    inboundThrottleEnabled: c.inboundThrottleEnabled ?? true,
+    inboundRpmAuto: c.inboundRpmAuto ?? true,
+    inboundTargetRpm: String(c.inboundTargetRpm ?? 100),
+    inboundRpmMin: String(c.inboundRpmMin ?? 20),
+    inboundRpmMax: String(c.inboundRpmMax ?? 300),
+    inboundBurstSecs: String(c.inboundBurstSecs ?? 2),
+    inboundQueueMaxWaitSecs: String(c.inboundQueueMaxWaitSecs ?? 30),
     balanceWeightEnabled: c.balanceWeightEnabled ?? true,
     balanceWeightFloor: String(c.balanceWeightFloor ?? 50),
     health429WeightEnabled: c.health429WeightEnabled ?? true,
@@ -1442,6 +1456,19 @@ export function SettingsPage() {
     if (Number.isFinite(nCooldownScale) && nCooldownScale !== (config.cooldownScalePct ?? 100)) d.cooldownScalePct = nCooldownScale
     const nJitter = parseInt(form.rateLimitJitterPct, 10)
     if (Number.isFinite(nJitter) && nJitter !== (config.rateLimitJitterPct ?? 20)) d.rateLimitJitterPct = nJitter
+    // 入站整形
+    if (form.inboundThrottleEnabled !== (config.inboundThrottleEnabled ?? true)) d.inboundThrottleEnabled = form.inboundThrottleEnabled
+    if (form.inboundRpmAuto !== (config.inboundRpmAuto ?? true)) d.inboundRpmAuto = form.inboundRpmAuto
+    const nTarget = parseInt(form.inboundTargetRpm, 10)
+    if (Number.isFinite(nTarget) && nTarget !== (config.inboundTargetRpm ?? 100)) d.inboundTargetRpm = nTarget
+    const nRmin = parseInt(form.inboundRpmMin, 10)
+    if (Number.isFinite(nRmin) && nRmin !== (config.inboundRpmMin ?? 20)) d.inboundRpmMin = nRmin
+    const nRmax = parseInt(form.inboundRpmMax, 10)
+    if (Number.isFinite(nRmax) && nRmax !== (config.inboundRpmMax ?? 300)) d.inboundRpmMax = nRmax
+    const nBurst = parseInt(form.inboundBurstSecs, 10)
+    if (Number.isFinite(nBurst) && nBurst !== (config.inboundBurstSecs ?? 2)) d.inboundBurstSecs = nBurst
+    const nQwait = parseInt(form.inboundQueueMaxWaitSecs, 10)
+    if (Number.isFinite(nQwait) && nQwait !== (config.inboundQueueMaxWaitSecs ?? 30)) d.inboundQueueMaxWaitSecs = nQwait
     if (form.balanceWeightEnabled !== config.balanceWeightEnabled) d.balanceWeightEnabled = form.balanceWeightEnabled
     const nFloor = parseInt(form.balanceWeightFloor, 10)
     if (Number.isFinite(nFloor) && nFloor !== config.balanceWeightFloor) d.balanceWeightFloor = nFloor
@@ -1821,6 +1848,34 @@ export function SettingsPage() {
                       checked={form.rpmHardGateOverloadWait}
                       onCheckedChange={(v) => set('rpmHardGateOverloadWait', v)}
                     />
+                  </Field>
+                </SearchContext.Provider>
+              </SettingGearCard>
+              <SettingGearCard
+                title={`入站请求整形 / RPM 自动挡（当前 ${config?.inboundCurrentRpm ?? '—'} RPM）`}
+                description="在网关入口用令牌桶把突发削平成受控 RPM，让号不被上游打爆（治 429 雪崩）。自动挡按上游反馈动态升降速率。均热更即时生效。"
+              >
+                <SearchContext.Provider value={{ query: '' }}>
+                  <Field label="启用入站整形" hint="开=请求进上游前先过全局令牌桶，突发被排队削平；关=不限速直发（易被上游 429）。">
+                    <Switch checked={form.inboundThrottleEnabled} onCheckedChange={(v) => set('inboundThrottleEnabled', v)} />
+                  </Field>
+                  <Field label="RPM 自动挡" hint="开=AIMD 动态调速率（无 429 加速/收 429 砍半），自动收敛到上游不限流的最高速；关=固定用目标 RPM（手动挡）。">
+                    <Switch checked={form.inboundRpmAuto} onCheckedChange={(v) => set('inboundRpmAuto', v)} />
+                  </Field>
+                  <Field label="目标 RPM（初值/手动挡固定值）" hint="自动挡：作为起点，之后动态调整；手动挡：固定用此值。">
+                    <NumberStepper value={Number(form.inboundTargetRpm) || 0} onChange={(v) => set('inboundTargetRpm', String(v))} min={1} max={10000} step={10} className="w-28" aria-label="目标 RPM" />
+                  </Field>
+                  <Field label="自动挡 RPM 下限" hint="乘性降档不低于此。">
+                    <NumberStepper value={Number(form.inboundRpmMin) || 0} onChange={(v) => set('inboundRpmMin', String(v))} min={1} max={10000} step={5} className="w-28" aria-label="RPM 下限" />
+                  </Field>
+                  <Field label="自动挡 RPM 上限" hint="加性升档不超过此。加号后可调高。">
+                    <NumberStepper value={Number(form.inboundRpmMax) || 0} onChange={(v) => set('inboundRpmMax', String(v))} min={1} max={10000} step={10} className="w-28" aria-label="RPM 上限" />
+                  </Field>
+                  <Field label="令牌桶突发容量（秒）" hint="允许短时小突发不排队。越大越宽松。默认 2。">
+                    <NumberStepper value={Number(form.inboundBurstSecs) || 0} onChange={(v) => set('inboundBurstSecs', String(v))} min={1} max={60} className="w-28" aria-label="突发容量秒" />
+                  </Field>
+                  <Field label="排队最长等待（秒）" hint="排队超此时长返回带 Retry-After 的 429 让客户端退避。默认 30。">
+                    <NumberStepper value={Number(form.inboundQueueMaxWaitSecs) || 0} onChange={(v) => set('inboundQueueMaxWaitSecs', String(v))} min={1} max={300} step={5} className="w-28" aria-label="排队最长等待秒" />
                   </Field>
                 </SearchContext.Provider>
               </SettingGearCard>
