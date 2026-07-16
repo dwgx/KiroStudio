@@ -135,6 +135,10 @@ pub struct CooldownManager {
 
     /// 长冷却时长（秒）
     long_cooldown_secs: u64,
+
+    /// 冷却时长缩放百分比（默认 100=原时长）。热更即时生效。只缩放**可自动恢复**(短/瞬时)冷却基数,
+    /// 认证失败/封号/配额耗尽那类长硬窗**不缩放**(防误配把死号提前放行)。
+    cooldown_scale_pct: std::sync::atomic::AtomicU32,
 }
 
 impl Default for CooldownManager {
@@ -150,7 +154,26 @@ impl CooldownManager {
             entries: Mutex::new(HashMap::new()),
             max_short_cooldown_secs: 90, // 上限 90s（原 300s 太黏，小号池下一个卡住请求能把整池压死数分钟）
             long_cooldown_secs: 86400,   // 24 小时
+            cooldown_scale_pct: std::sync::atomic::AtomicU32::new(100),
         }
+    }
+
+    /// 设置冷却时长缩放百分比（10..500,admin 热更调用,即时生效）。越界 clamp。
+    pub fn set_cooldown_scale_pct(&self, pct: u32) {
+        self.cooldown_scale_pct
+            .store(pct.clamp(10, 500), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 对**可自动恢复**的短/瞬时冷却时长按 scale 缩放；长硬窗(不可恢复)原样返回。
+    fn scaled_duration(&self, reason: CooldownReason, base: Duration) -> Duration {
+        if !reason.is_auto_recoverable() {
+            return base; // 认证失败/封号/配额:不缩放,防误配放行死号
+        }
+        let pct = self.cooldown_scale_pct.load(std::sync::atomic::Ordering::Relaxed);
+        if pct == 100 {
+            return base;
+        }
+        Duration::from_millis((base.as_millis() as u64).saturating_mul(pct as u64) / 100)
     }
 
     /// 使用自定义配置创建冷却管理器
@@ -160,6 +183,7 @@ impl CooldownManager {
             entries: Mutex::new(HashMap::new()),
             max_short_cooldown_secs,
             long_cooldown_secs,
+            cooldown_scale_pct: std::sync::atomic::AtomicU32::new(100),
         }
     }
 
@@ -181,7 +205,7 @@ impl CooldownManager {
     pub fn set_transient_cooldown(&self, credential_id: u64, reason: CooldownReason) -> Duration {
         let mut entries = self.entries.lock();
         let now = Instant::now();
-        let baseline = reason.default_duration();
+        let baseline = self.scaled_duration(reason, reason.default_duration());
 
         let entry = entries.entry(credential_id).or_insert_with(|| CooldownEntry {
             reason,
@@ -371,7 +395,8 @@ impl CooldownManager {
             const SUSPICIOUS_MAX_SECS: u64 = 1800; // 30 分钟
             let multiplier = 1.6_f64.powi((trigger_count.saturating_sub(1)) as i32);
             let duration_secs = (base.as_secs() as f64 * multiplier) as u64;
-            return Duration::from_secs(duration_secs.min(SUSPICIOUS_MAX_SECS));
+            // scale 作用在递增后、封顶前:缩放后仍不超过 30min 硬顶。
+            return self.scaled_duration(reason, Duration::from_secs(duration_secs.min(SUSPICIOUS_MAX_SECS)));
         }
 
         if reason.is_auto_recoverable() {
@@ -380,7 +405,7 @@ impl CooldownManager {
             let multiplier = 1.3_f64.powi((trigger_count.saturating_sub(1)) as i32);
             let duration_secs = (base.as_secs() as f64 * multiplier) as u64;
             let capped_secs = duration_secs.min(self.max_short_cooldown_secs);
-            Duration::from_secs(capped_secs)
+            self.scaled_duration(reason, Duration::from_secs(capped_secs))
         } else {
             // 不可自动恢复的原因：使用长冷却时长
             Duration::from_secs(self.long_cooldown_secs)

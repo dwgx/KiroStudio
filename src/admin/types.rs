@@ -544,12 +544,18 @@ pub struct ConfigSnapshotResponse {
     /// 均衡模式下是否叠加优先级分发
     pub priority_in_balanced: bool,
     // ---- 智能调度（0.7.23 headroom/背压 + 0.7.24 余额加权/429 感知，均立即生效）----
+    /// 全局每号 RPM 软上限（单号 rpm_limit=0 时继承此值；此值也为 0 时用内置兜底 30）
+    pub credential_rpm_limit: u32,
     /// RPM headroom 系数（整百分比 0..100，85=预留 15%）
     pub rpm_headroom_factor: u32,
     /// RPM 预留名额（headroom 折扣后再扣 N）
     pub rpm_reserve_slots: u32,
     /// 整池 RPM 饱和时是否走背压等待（默认关）
     pub rpm_hard_gate_overload_wait: bool,
+    /// 冷却时长缩放百分比（10..500，100=原时长；只缩放可恢复的短冷却）
+    pub cooldown_scale_pct: u32,
+    /// 拟人速率：请求间隔抖动百分比（0..50）
+    pub rate_limit_jitter_pct: u32,
     /// 余额加权分流（默认开）：同档内按剩余额度微调选号，长期拉平号池余额
     pub balance_weight_enabled: bool,
     /// 余额加权 FLOOR（整百分比 0..100，50=因子下限 0.5，越小余额影响越强）
@@ -629,9 +635,12 @@ pub struct UpdateConfigRequest {
     pub affinity_enabled: Option<bool>,
     pub priority_in_balanced: Option<bool>,
     // ---- 智能调度（立即生效热更）----
+    pub credential_rpm_limit: Option<u32>,
     pub rpm_headroom_factor: Option<u32>,
     pub rpm_reserve_slots: Option<u32>,
     pub rpm_hard_gate_overload_wait: Option<bool>,
+    pub cooldown_scale_pct: Option<u32>,
+    pub rate_limit_jitter_pct: Option<u32>,
     pub balance_weight_enabled: Option<bool>,
     pub balance_weight_floor: Option<u32>,
     pub health_429_weight_enabled: Option<bool>,
@@ -801,9 +810,12 @@ mod tests {
             rate_limit_min_interval_ms: 1000,
             affinity_enabled: true,
             priority_in_balanced: false,
+            credential_rpm_limit: 0,
             rpm_headroom_factor: 85,
             rpm_reserve_slots: 0,
             rpm_hard_gate_overload_wait: false,
+            cooldown_scale_pct: 100,
+            rate_limit_jitter_pct: 20,
             balance_weight_enabled: true,
             balance_weight_floor: 50,
             health_429_weight_enabled: true,
