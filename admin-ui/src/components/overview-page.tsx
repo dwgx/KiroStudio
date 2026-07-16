@@ -48,11 +48,11 @@ function loadTrendRange(): TrendRange {
   return v === '24h' || v === '7d' || v === '30d' ? v : '24h'
 }
 
-// 各区间对应的桶数（hourly 每桶 1 小时，daily 每桶 1 天）。
-const TREND_RANGE_META: { key: TrendRange; label: string; buckets: number; granularity: 'hourly' | 'daily' }[] = [
-  { key: '24h', label: '24 小时', buckets: 24, granularity: 'hourly' },
-  { key: '7d', label: '7 天', buckets: 7, granularity: 'daily' },
-  { key: '30d', label: '30 天', buckets: 30, granularity: 'daily' },
+// 各区间对应的桶数（hourly 每桶 1 小时，daily 每桶 1 天）。labelKey 渲染时 t()。
+const TREND_RANGE_META: { key: TrendRange; labelKey: string; buckets: number; granularity: 'hourly' | 'daily' }[] = [
+  { key: '24h', labelKey: 'overviewpage.trend.range.24h', buckets: 24, granularity: 'hourly' },
+  { key: '7d', labelKey: 'overviewpage.trend.range.7d', buckets: 7, granularity: 'daily' },
+  { key: '30d', labelKey: 'overviewpage.trend.range.30d', buckets: 30, granularity: 'daily' },
 ]
 
 // 截取最近 N 桶，再裁掉前导全 0 桶让有数据段铺满宽度（与用量页 trimSeries 同治法）。
@@ -72,27 +72,27 @@ function trimTrend(points: SeriesPoint[], buckets: number): SeriesPoint[] {
 // 单号限流风险等级（撑不住预测的核心判定）。
 type RiskLevel = 'ok' | 'watch' | 'high' | 'limited' | 'disabled'
 
-// 由 insight 推断该号的限流风险等级 + 一句中文预测。
-function assessRisk(it: RateLimitInsight): { level: RiskLevel; label: string; pct: number } {
+// 由 insight 推断该号的限流风险等级 + i18n key（渲染时 t）。
+function assessRisk(it: RateLimitInsight): { level: RiskLevel; labelKey: string; pct: number } {
   // 已禁用:不参与调度,显示"已禁用"而非"畅通"(修 dwgx 反馈:禁用了还显示畅通/在用)。
   if (it.disabled) {
-    return { level: 'disabled', label: '已禁用', pct: 0 }
+    return { level: 'disabled', labelKey: 'overviewpage.risk.disabled', pct: 0 }
   }
   // 冷却中（尤其可疑活动风控）= 已经被限流,最高危。
   if (it.cooldown) {
     const isSuspicious = it.cooldown.reason.includes('可疑')
     return {
       level: 'limited',
-      label: isSuspicious ? '风控中' : '冷却中',
+      labelKey: isSuspicious ? 'overviewpage.risk.suspicious' : 'overviewpage.risk.cooldown',
       pct: 100,
     }
   }
   // RPM 占用率：接近软上限 = 撑不住风险。rpmLimit=0（不限制）时按 0 处理。
   const pct = it.rpmLimit > 0 ? Math.min(100, Math.round((it.rpm / it.rpmLimit) * 100)) : 0
   // 近期 429 是强信号：有 429 说明已经在被上游限,即使当前没冷却。
-  if (it.recent429 >= 3 || pct >= 90) return { level: 'high', label: '即将限流', pct: Math.max(pct, 90) }
-  if (it.recent429 >= 1 || pct >= 70) return { level: 'watch', label: '压力偏高', pct: Math.max(pct, 70) }
-  return { level: 'ok', label: '畅通', pct }
+  if (it.recent429 >= 3 || pct >= 90) return { level: 'high', labelKey: 'overviewpage.risk.high', pct: Math.max(pct, 90) }
+  if (it.recent429 >= 1 || pct >= 70) return { level: 'watch', labelKey: 'overviewpage.risk.watch', pct: Math.max(pct, 70) }
+  return { level: 'ok', labelKey: 'overviewpage.risk.ok', pct }
 }
 
 const RISK_TONE: Record<RiskLevel, { text: string; bar: string; chip: string }> = {
@@ -231,7 +231,7 @@ function RateLimitRow({ it, label }: { it: RateLimitInsight; label: string }) {
         </span>
       )}
       <span className={`inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium ${tone.chip}`}>
-        {risk.label}
+        {t(risk.labelKey)}
         {cdSecs > 0 && <span className="tabular-nums">{cdSecs}s</span>}
       </span>
     </div>
@@ -248,10 +248,10 @@ function SectionTitle({ children, hint }: { children: React.ReactNode; hint?: st
   )
 }
 
-// 号池视图切换（segmented）：发光网格 / 状态条。
-const POOL_VIEWS: { key: PoolView; label: string; icon: typeof LayoutGrid }[] = [
-  { key: 'grid', label: '发光网格', icon: LayoutGrid },
-  { key: 'bars', label: '状态条', icon: List },
+// 号池视图切换（segmented）：发光网格 / 状态条。labelKey 渲染时 t()。
+const POOL_VIEWS: { key: PoolView; labelKey: string; icon: typeof LayoutGrid }[] = [
+  { key: 'grid', labelKey: 'overviewpage.poolview.grid', icon: LayoutGrid },
+  { key: 'bars', labelKey: 'overviewpage.poolview.bars', icon: List },
 ]
 
 function PoolViewSwitch({
@@ -261,9 +261,10 @@ function PoolViewSwitch({
   value: PoolView
   onChange: (v: PoolView) => void
 }) {
+  const { t } = useTranslation()
   return (
     <div className="inline-flex rounded-md border border-border bg-secondary/40 p-0.5 text-xs">
-      {POOL_VIEWS.map(({ key, label, icon: Icon }) => (
+      {POOL_VIEWS.map(({ key, labelKey, icon: Icon }) => (
         <button
           key={key}
           onClick={() => onChange(key)}
@@ -275,7 +276,7 @@ function PoolViewSwitch({
           }`}
         >
           <Icon className="h-3.5 w-3.5" />
-          {label}
+          {t(labelKey)}
         </button>
       ))}
     </div>
@@ -290,9 +291,10 @@ function TrendRangeSwitch({
   value: TrendRange
   onChange: (v: TrendRange) => void
 }) {
+  const { t } = useTranslation()
   return (
     <div className="inline-flex rounded-md border border-border bg-secondary/40 p-0.5 text-xs">
-      {TREND_RANGE_META.map(({ key, label }) => (
+      {TREND_RANGE_META.map(({ key, labelKey }) => (
         <button
           key={key}
           onClick={() => onChange(key)}
@@ -303,7 +305,7 @@ function TrendRangeSwitch({
               : 'text-muted-foreground hover:text-foreground'
           }`}
         >
-          {label}
+          {t(labelKey)}
         </button>
       ))}
     </div>
@@ -375,8 +377,8 @@ export function OverviewPage() {
   const trend = useMemo(() => {
     const meta = TREND_RANGE_META.find((m) => m.key === trendRange) ?? TREND_RANGE_META[0]
     const src = meta.granularity === 'hourly' ? hourly.data : daily.data
-    return { points: trimTrend(src ?? [], meta.buckets), granularity: meta.granularity, label: meta.label }
-  }, [trendRange, hourly.data, daily.data])
+    return { points: trimTrend(src ?? [], meta.buckets), granularity: meta.granularity, label: t(meta.labelKey) }
+  }, [trendRange, hourly.data, daily.data, t])
   // 趋势加载态：跟随当前区间对应的序列查询首帧加载。
   const trendLoading =
     !usageDisabled &&

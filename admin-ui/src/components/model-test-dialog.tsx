@@ -15,10 +15,10 @@ import type { CredentialStatusItem } from '@/types/api'
 import { toast } from 'sonner'
 
 /** 模型勾选模板：一键切换常测组合。 */
-const MODEL_TEMPLATES: { label: string; labelKey: string; models: string[] }[] = [
-  { label: '仅国产', labelKey: 'modeltestdialog.template.domesticOnly', models: ['qwen3-coder-next', 'minimax-m2.1', 'deepseek-3.2', 'minimax-m2.5', 'glm-5'] },
-  { label: '仅 Claude', labelKey: 'modeltestdialog.template.claudeOnly', models: ['claude-haiku-4.5', 'claude-sonnet-4.5', 'claude-sonnet-4.6', 'claude-opus-4.6', 'claude-opus-4.8'] },
-  { label: '全部', labelKey: 'modeltestdialog.template.all', models: PROBE_MODEL_CATALOG.map((m) => m.id) },
+const MODEL_TEMPLATES: { labelKey: string; models: string[] }[] = [
+  { labelKey: 'modeltestdialog.template.domesticOnly', models: ['qwen3-coder-next', 'minimax-m2.1', 'deepseek-3.2', 'minimax-m2.5', 'glm-5'] },
+  { labelKey: 'modeltestdialog.template.claudeOnly', models: ['claude-haiku-4.5', 'claude-sonnet-4.5', 'claude-sonnet-4.6', 'claude-opus-4.6', 'claude-opus-4.8'] },
+  { labelKey: 'modeltestdialog.template.all', models: PROBE_MODEL_CATALOG.map((m) => m.id) },
 ]
 
 export interface ModelTestResult {
@@ -158,7 +158,7 @@ export function ModelTestDialog({ open, onOpenChange, credentialIds, credentials
               <div className="flex gap-1">
                 {MODEL_TEMPLATES.map((tpl) => (
                   <button
-                    key={tpl.label}
+                    key={tpl.labelKey}
                     type="button"
                     disabled={testing}
                     onClick={() => setSelectedModels(new Set(tpl.models))}

@@ -362,6 +362,7 @@ export interface ConfigSnapshotResponse {
   // 反代安全（批次3）
   corsAllowedOrigins: string[]
   ipAllowlist: string[]
+  ipBlocklist: string[]
   trustForwardedHeader: boolean
   ingressRateLimitPerMin: number
   maxBodyBytes: number
@@ -434,6 +435,7 @@ export interface UpdateConfigRequest {
   // 反代安全（批次3，整表替换语义）
   corsAllowedOrigins?: string[]
   ipAllowlist?: string[]
+  ipBlocklist?: string[]
   trustForwardedHeader?: boolean
   ingressRateLimitPerMin?: number
   maxBodyBytes?: number

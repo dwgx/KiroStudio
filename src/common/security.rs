@@ -145,6 +145,44 @@ impl IpAllowlist {
     }
 }
 
+/// IP 黑名单：任一 CIDR 命中即**拒绝**(403)。空列表表示「不启用黑名单」。
+/// 与白名单相反语义——白名单是"只允许列表内",黑名单是"只拒绝列表内"。两者独立可同时启用
+/// (黑名单先判、命中即拒;再判白名单)。用于封禁特定滥用 IP。
+#[derive(Debug, Clone)]
+pub struct IpBlocklist {
+    cidrs: Arc<Vec<Cidr>>,
+}
+
+impl IpBlocklist {
+    /// 从配置字符串构建,非法条目记录告警并跳过(不致命)。
+    pub fn from_config(entries: &[String]) -> Self {
+        let mut cidrs = Vec::new();
+        for e in entries {
+            match Cidr::parse(e) {
+                Ok(c) => cidrs.push(c),
+                Err(err) => tracing::warn!("忽略非法 IP 黑名单条目 '{}': {}", e, err),
+            }
+        }
+        IpBlocklist {
+            cidrs: Arc::new(cidrs),
+        }
+    }
+
+    /// 是否启用(非空才启用)。
+    pub fn is_active(&self) -> bool {
+        !self.cidrs.is_empty()
+    }
+
+    /// 判断 IP 是否被黑名单拦截(命中任一 CIDR 即 true=拒绝)。未启用时恒为 false(不拦)。
+    pub fn blocks(&self, ip: IpAddr) -> bool {
+        if self.cidrs.is_empty() {
+            return false;
+        }
+        let addr = ip_to_u128(ip);
+        self.cidrs.iter().any(|c| c.contains(addr))
+    }
+}
+
 // ============ 入口每-IP 限流（固定窗口）============
 
 /// 每-IP 固定窗口限流器：每 60s 窗口内计数，超 `max_per_min` 拒绝。
@@ -236,24 +274,28 @@ pub fn client_ip(req: &Request<Body>, peer: Option<SocketAddr>, trust_forwarded:
 #[derive(Clone)]
 pub struct SecurityState {
     pub allowlist: IpAllowlist,
+    pub blocklist: IpBlocklist,
     pub rate_limiter: Arc<IngressRateLimiter>,
     pub trust_forwarded: bool,
 }
 
 impl SecurityState {
-    /// 若两道防线都未启用则返回 None，调用方据此决定是否挂载中间件。
+    /// 若三道防线都未启用则返回 None，调用方据此决定是否挂载中间件。
     pub fn from_config(
         ip_allowlist: &[String],
+        ip_blocklist: &[String],
         ingress_rate_limit_per_min: u32,
         trust_forwarded: bool,
     ) -> Option<Self> {
         let allowlist = IpAllowlist::from_config(ip_allowlist);
+        let blocklist = IpBlocklist::from_config(ip_blocklist);
         let rate_limiter = IngressRateLimiter::new(ingress_rate_limit_per_min);
-        if !allowlist.is_active() && !rate_limiter.is_active() {
+        if !allowlist.is_active() && !blocklist.is_active() && !rate_limiter.is_active() {
             return None;
         }
         Some(SecurityState {
             allowlist,
+            blocklist,
             rate_limiter: Arc::new(rate_limiter),
             trust_forwarded,
         })
@@ -268,6 +310,23 @@ pub async fn security_middleware(
     next: Next,
 ) -> Response {
     let ip = client_ip(&request, Some(peer), state.trust_forwarded);
+
+    // IP 黑名单(先判、命中即拒):封禁特定滥用 IP,优先于白名单。无法判定 IP 时不拦(交给后续白名单/放行)。
+    if state.blocklist.is_active() {
+        if let Some(ip) = ip {
+            if state.blocklist.blocks(ip) {
+                tracing::debug!("入口 IP 黑名单拒绝: {:?}", ip);
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(ErrorResponse::new(
+                        "permission_error",
+                        "来源 IP 已被封禁",
+                    )),
+                )
+                    .into_response();
+            }
+        }
+    }
 
     // IP 白名单
     if state.allowlist.is_active() {
@@ -447,8 +506,30 @@ mod tests {
 
     #[test]
     fn test_security_state_none_when_all_disabled() {
-        assert!(SecurityState::from_config(&[], 0, false).is_none());
-        assert!(SecurityState::from_config(&["127.0.0.1/32".to_string()], 0, false).is_some());
-        assert!(SecurityState::from_config(&[], 100, false).is_some());
+        assert!(SecurityState::from_config(&[], &[], 0, false).is_none());
+        assert!(SecurityState::from_config(&["127.0.0.1/32".to_string()], &[], 0, false).is_some());
+        // 只配黑名单也应启用中间件。
+        assert!(SecurityState::from_config(&[], &["1.2.3.4/32".to_string()], 0, false).is_some());
+        assert!(SecurityState::from_config(&[], &[], 100, false).is_some());
+    }
+
+    #[test]
+    fn test_ip_blocklist_blocks_and_passes() {
+        let bl = IpBlocklist::from_config(&["1.2.3.4/32".to_string(), "5.6.0.0/16".to_string()]);
+        assert!(bl.is_active());
+        // 命中单 IP → 拦。
+        assert!(bl.blocks("1.2.3.4".parse().unwrap()));
+        // 命中子网 → 拦。
+        assert!(bl.blocks("5.6.7.8".parse().unwrap()));
+        // 不在黑名单 → 放行(blocks=false)。
+        assert!(!bl.blocks("9.9.9.9".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_ip_blocklist_empty_blocks_nothing() {
+        let bl = IpBlocklist::from_config(&[]);
+        assert!(!bl.is_active());
+        // 空黑名单:任何 IP 都不拦(恒 false)。
+        assert!(!bl.blocks("1.2.3.4".parse().unwrap()));
     }
 }

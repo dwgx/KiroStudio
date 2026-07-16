@@ -1,6 +1,7 @@
+import { useTranslation } from 'react-i18next'
 import type { CredentialStatusItem } from '@/types/api'
 import type { CellActivity } from '@/components/overview/StatusHeatmap'
-import { healthOf, HEALTH_RGB, HEALTH_LABEL, EmptyPool, useHoverCard } from '@/components/overview/credViz'
+import { healthOf, HEALTH_RGB, HEALTH_LABEL_KEYS, EmptyPool, useHoverCard } from '@/components/overview/credViz'
 import { useFlip } from '@/hooks/use-flip'
 import './glow-grid.css'
 
@@ -46,6 +47,7 @@ function breatheDelay(id: number): string {
  * 常驻仅低频呼吸（opacity）；数百核心不卡；motion-reduce 全面降级为静态色块。
  */
 export function GlowGrid({ credentials, activity, className }: GlowGridProps) {
+  const { t } = useTranslation()
   // 鼠标跟随悬浮卡（替代 Radix Tooltip 固定 side 的边缘翻转，卡片黏着鼠标走）。
   const hoverCard = useHoverCard()
   // FLIP 平滑重排:排序/显隐变化时核心从旧位滑到新位。
@@ -151,11 +153,11 @@ export function GlowGrid({ credentials, activity, className }: GlowGridProps) {
                   boxShadow: k !== 'disabled' ? `0 0 6px rgb(${HEALTH_RGB[k]} / 0.6)` : 'none',
                 }}
               />
-              {HEALTH_LABEL[k]}
+              {t(HEALTH_LABEL_KEYS[k])}
             </span>
           ))}
           <span className="flex items-center gap-1.5">
-            <span className={`h-2.5 w-2.5 rounded-[3px] bg-transparent ring-1 ring-primary/70`} /> 当前活跃
+            <span className={`h-2.5 w-2.5 rounded-[3px] bg-transparent ring-1 ring-primary/70`} /> {t('overviewpage.legend.currentActive')}
           </span>
           <span className="flex items-center gap-1.5">
             <span
@@ -170,7 +172,7 @@ export function GlowGrid({ credentials, activity, className }: GlowGridProps) {
                 }}
               />
             </span>
-            处理中
+            {t('overviewpage.legend.processing')}
           </span>
         </div>
       {/* 鼠标跟随悬浮卡（正文 CredTooltipBody 不变，仅定位改为黏鼠标） */}

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 
 export interface RankItem {
   /** 唯一 key（如凭据 id） */
@@ -20,6 +21,7 @@ export interface RankBarsProps {
  * 避免每次渲染重置为 0。prefers-reduced-motion 下禁用过渡。
  */
 export function RankBars({ items, unit = '', className }: RankBarsProps) {
+  const { t } = useTranslation()
   const [mounted, setMounted] = useState(false)
 
   useEffect(() => {
@@ -28,7 +30,7 @@ export function RankBars({ items, unit = '', className }: RankBarsProps) {
   }, [])
 
   if (items.length === 0) {
-    return <p className={className}>暂无调用记录</p>
+    return <p className={className}>{t('overviewpage.empty.noCalls')}</p>
   }
 
   const max = Math.max(1, ...items.map((it) => it.value))
