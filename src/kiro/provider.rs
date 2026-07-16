@@ -516,6 +516,17 @@ impl KiroProvider {
         // 「首个号就因客户端错误/模型无效 break=不是池的问题」——后者不该计 failover_exhausted。
         let mut real_failover_happened = false;
 
+        // 入站整形准入闸门:**整个客户端请求只过一次**(在 failover 循环外),突发被令牌桶排队削平。
+        // review Finding 1 修复:不在 acquire_context 里扣(否则 failover N 跳扣 N 令牌 + fast-fail 空转白扣)。
+        // 排队超时用与全池冷却同款的 retry_after_secs= 标记 → 下游归类为 RateLimited + 带 Retry-After。
+        if let Err(retry_after) = self.token_manager.acquire_admission().await {
+            anyhow::bail!(
+                "入站限速排队超时(网关目标 {} RPM 保护上游)retry_after_secs={}",
+                self.token_manager.inbound_target_rpm(),
+                retry_after
+            );
+        }
+
         for attempt in 0..max_retries {
             // 墙钟闸门：单请求重试总时长超预算就停止（把最后错误透传给客户端，
             // 让它自己退避）。防止一个卡住的请求在小号池里反复扫冷全池、把偶发 429

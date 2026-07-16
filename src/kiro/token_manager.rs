@@ -2291,24 +2291,15 @@ impl MultiTokenManager {
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     /// - `user_id`: 可选的会话标识（取自请求 conversationId），用于会话亲和性
-    pub async fn acquire_context(
-        &self,
-        model: Option<&str>,
-        user_id: Option<&str>,
-    ) -> anyhow::Result<CallContext> {
-        // 入站整形闸门:请求进上游前先过全局令牌桶。突发被排队削平成受控 RPM,让号不被上游打爆。
-        // 超时(排队等太久)返回带 retry_after 的可重试错误,让客户端退避而非继续挤爆。
-        if let Err(retry_after) = self.throttle.acquire().await {
-            anyhow::bail!(
-                "入站限速排队超时(网关目标 {} RPM 保护上游),请 {}s 后重试",
-                self.throttle.current_target_rpm(),
-                retry_after
-            );
+    /// 入站整形准入:**每个客户端请求进 failover 循环前调用一次**(不在 acquire_context 里,
+    /// 避免每跳重复扣令牌)。突发被排队削平成受控 RPM;超时返回 Err(retry_after 秒)让客户端退避。
+    pub async fn acquire_admission(&self) -> Result<(), u64> {
+        let r = self.throttle.acquire().await;
+        if r.is_ok() {
+            // 有请求真正获准 → 触发一次自动挡升档探测(内部判周期)。
+            self.throttle.maybe_step_up();
         }
-        // 有请求通过 → 触发一次自动挡升档探测(内部判周期,轻量)。
-        self.throttle.maybe_step_up();
-
-        self.acquire_context_inner(model, user_id).await
+        r
     }
 
     /// 上游 429 反馈:让入站整形的 RPM 自动挡乘性降档(provider 检到上游限流时调用)。
@@ -2321,11 +2312,14 @@ impl MultiTokenManager {
         self.throttle.current_target_rpm()
     }
 
-    async fn acquire_context_inner(
+    pub async fn acquire_context(
         &self,
         model: Option<&str>,
         user_id: Option<&str>,
     ) -> anyhow::Result<CallContext> {
+        // 注意:入站整形闸门**不在这里**。acquire_context 会被 failover 循环每跳调用,
+        // 若在此扣令牌 → 一个客户端请求 failover N 次就扣 N 个令牌 + fast-fail 空转白扣(review Finding 1)。
+        // 整形应针对"客户端请求"一次,故闸门上移到 provider 调用入口(acquire_admission,循环外只过一次)。
         let total = self.total_count();
         // 内层尝试预算需与 provider 层的外层重试预算同量级放开：
         // 以可用凭据数为下限，保证内层不会在外层遍历完所有可用号之前就先耗尽。
