@@ -473,6 +473,7 @@ export interface UsageOverview {
   last_24h: WindowSummary
   last_7d: WindowSummary
   last_30d: WindowSummary
+  all_time: WindowSummary
 }
 
 // 时间序列点
