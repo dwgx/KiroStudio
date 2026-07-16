@@ -1,4 +1,5 @@
 import { useState, lazy, Suspense } from 'react'
+import { useTranslation } from 'react-i18next'
 import { useQueryClient } from '@tanstack/react-query'
 import { storage } from '@/lib/storage'
 import {
@@ -34,20 +35,22 @@ const OpsPage = lazy(() =>
 
 type Tab = 'overview' | 'credentials' | 'usage' | 'ops' | 'settings'
 
-const NAV_ITEMS: { key: Tab; label: string; icon: React.ReactNode }[] = [
-  { key: 'overview', label: '概览', icon: <LayoutDashboard className="h-4 w-4" /> },
-  { key: 'credentials', label: '凭据管理', icon: <Key className="h-4 w-4" /> },
-  { key: 'usage', label: '用量统计', icon: <BarChart3 className="h-4 w-4" /> },
-  { key: 'ops', label: '运维', icon: <Wrench className="h-4 w-4" /> },
-  { key: 'settings', label: '设置', icon: <Settings className="h-4 w-4" /> },
-]
+const NAV_ICONS: Record<Tab, React.ReactNode> = {
+  overview: <LayoutDashboard className="h-4 w-4" />,
+  credentials: <Key className="h-4 w-4" />,
+  usage: <BarChart3 className="h-4 w-4" />,
+  ops: <Wrench className="h-4 w-4" />,
+  settings: <Settings className="h-4 w-4" />,
+}
 
-const TAB_TITLES: Record<Tab, string> = {
-  overview: '概览',
-  credentials: '凭据管理',
-  usage: '用量统计',
-  ops: '运维',
-  settings: '设置',
+const NAV_KEYS: Tab[] = ['overview', 'credentials', 'usage', 'ops', 'settings']
+
+const TAB_TITLE_KEYS: Record<Tab, string> = {
+  overview: 'appshell.nav.overview',
+  credentials: 'appshell.nav.credentials',
+  usage: 'appshell.nav.usage',
+  ops: 'appshell.nav.ops',
+  settings: 'appshell.nav.settings',
 }
 
 interface AppShellProps {
@@ -55,6 +58,7 @@ interface AppShellProps {
 }
 
 export function AppShell({ onLogout }: AppShellProps) {
+  const { t } = useTranslation()
   const [tab, setTab] = useState<Tab>('overview')
   const [loginOpen, setLoginOpen] = useState(false)
   const queryClient = useQueryClient()
@@ -82,32 +86,32 @@ export function AppShell({ onLogout }: AppShellProps) {
             KiroStudio
           </h1>
           <p className="text-xs text-[#666] mt-1">
-            Admin Panel{cfg?.serverVersion ? ` v${cfg.serverVersion}` : ''}
+            {t('appshell.brand.adminPanel')}{cfg?.serverVersion ? ` v${cfg.serverVersion}` : ''}
           </p>
         </div>
 
         {/* Main Nav */}
         <div className="px-3 flex-1">
           <p className="text-[11px] font-medium text-[#666] uppercase tracking-wider px-3 mb-2">
-            主菜单
+            {t('appshell.section.mainMenu')}
           </p>
           <nav className="flex flex-col gap-0.5">
-            {NAV_ITEMS.map((item) => (
+            {NAV_KEYS.map((key) => (
               <button
-                key={item.key}
-                onClick={() => setTab(item.key)}
+                key={key}
+                onClick={() => setTab(key)}
                 className={`
                   relative flex items-center gap-3 px-3 py-2 rounded-md text-sm font-medium
                   transition-all duration-250 ease-out-expo
                   ${
-                    tab === item.key
+                    tab === key
                       ? 'bg-[rgba(0,112,243,0.12)] text-[#ededed] border-l-2 border-l-[#0070f3] pl-[10px]'
                       : 'text-[#888] hover:bg-[#1a1a1a] hover:text-[#ededed] hover:translate-x-0.5 border-l-2 border-l-transparent pl-[10px]'
                   }
                 `}
               >
-                {item.icon}
-                {item.label}
+                {NAV_ICONS[key]}
+                {t(TAB_TITLE_KEYS[key])}
               </button>
             ))}
           </nav>
@@ -117,7 +121,7 @@ export function AppShell({ onLogout }: AppShellProps) {
 
           {/* Quick Actions */}
           <p className="text-[11px] font-medium text-[#666] uppercase tracking-wider px-3 mb-2">
-            快捷操作
+            {t('appshell.section.quickActions')}
           </p>
           <div className="flex flex-col gap-0.5">
             <button
@@ -125,7 +129,7 @@ export function AppShell({ onLogout }: AppShellProps) {
               className="flex items-center gap-3 px-3 py-2 rounded-md text-sm text-[#888] hover:bg-[#1a1a1a] hover:text-[#ededed] transition-all duration-150"
             >
               <LogIn className="h-4 w-4" />
-              上号
+              {t('appshell.action.login')}
             </button>
           </div>
         </div>
@@ -136,10 +140,10 @@ export function AppShell({ onLogout }: AppShellProps) {
           <button
             onClick={handleLogout}
             className="flex w-full items-center justify-center gap-2 px-3 py-2 rounded-md text-sm text-[#888] hover:text-[#ededed] hover:bg-[#1a1a1a] transition-all duration-200 ease-out-expo"
-            title="退出登录"
+            title={t('appshell.action.logout')}
           >
             <LogOut className="h-4 w-4" />
-            退出登录
+            {t('appshell.action.logout')}
           </button>
         </div>
       </aside>
@@ -148,7 +152,7 @@ export function AppShell({ onLogout }: AppShellProps) {
       <main className="ml-[240px] min-h-screen">
         {/* Page Header */}
         <div className="border-b border-[#2e2e2e] px-8 py-5">
-          <h2 className="text-lg font-semibold text-gradient-brand">{TAB_TITLES[tab]}</h2>
+          <h2 className="text-lg font-semibold text-gradient-brand">{t(TAB_TITLE_KEYS[tab])}</h2>
         </div>
 
         {/* Page Content */}

@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
+import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import {
   Dialog,
@@ -36,6 +37,7 @@ interface IdcSession {
 const POLL_INTERVAL_MS = 5000
 
 export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialogProps) {
+  const { t } = useTranslation()
   const [step, setStep] = useState<Step>('form')
   const [startUrl, setStartUrl] = useState('')
   const [region, setRegion] = useState('us-east-1')
@@ -83,15 +85,16 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialog
         } else if (result.status === 'done') {
           stopPolling()
           setStep('done')
-          toast.success(`IDC 上号成功，凭据 #${result.credentialId}`)
+          // 与 login-dialog 一致：字典为前缀文案，凭据 ID 追加拼接（既有 key 无占位符）
+          toast.success(`${t('idclogindialog.toast.loginSuccess')}${result.credentialId}`)
           onSuccess?.()
         } else if (result.status === 'expired') {
           stopPolling()
-          toast.error('授权已超时，请重新发起')
+          toast.error(t('idclogindialog.toast.authTimeoutRetry'))
           setStep('form')
         } else {
           stopPolling()
-          toast.error(result.message || 'IDC 登录失败')
+          toast.error(result.message || t('idclogindialog.toast.loginFailed'))
           setStep('form')
         }
       } catch (err) {
@@ -103,7 +106,7 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialog
 
   const handleStart = async () => {
     if (!startUrl.trim()) {
-      toast.error('请输入 Start URL')
+      toast.error(t('idclogindialog.toast.startUrlRequired'))
       return
     }
     setIsStarting(true)
@@ -124,7 +127,7 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialog
           if (prev <= 1) {
             stopPolling()
             setStep('form')
-            toast.error('授权已超时')
+            toast.error(t('idclogindialog.toast.authTimeout'))
             return 0
           }
           return prev - 1
@@ -153,8 +156,8 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialog
   const handleCopyCode = async () => {
     if (!session) return
     const ok = await copyToClipboard(session.userCode)
-    if (ok) toast.success('User Code 已复制')
-    else toast.error('复制失败')
+    if (ok) toast.success(t('idclogindialog.toast.userCodeCopied'))
+    else toast.error(t('idclogindialog.toast.copyFailed'))
   }
 
   const formatCountdown = (secs: number) => {
@@ -167,17 +170,17 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialog
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-[480px]">
         <DialogHeader>
-          <DialogTitle>IDC 上号（AWS SSO）</DialogTitle>
+          <DialogTitle>{t('idclogindialog.title')}</DialogTitle>
         </DialogHeader>
 
         {step === 'form' && (
           <div className="space-y-4 py-2">
             <p className="text-sm text-muted-foreground">
-              通过 AWS IAM Identity Center 登录企业账号。输入你的 Start URL，然后在浏览器中完成授权。
+              {t('idclogindialog.form.intro')}
             </p>
             <div className="space-y-2">
               <label className="text-sm font-medium" htmlFor="startUrl">
-                Start URL
+                {t('idclogindialog.form.startUrlLabel')}
               </label>
               <Input
                 id="startUrl"
@@ -186,11 +189,11 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialog
                 placeholder="https://d-xxxxxxxxxx.awsapps.com/start"
                 disabled={isStarting}
               />
-              <p className="text-xs text-muted-foreground">你的 AWS SSO 入口地址</p>
+              <p className="text-xs text-muted-foreground">{t('idclogindialog.form.startUrlHelp')}</p>
             </div>
             <div className="space-y-2">
               <label className="text-sm font-medium" htmlFor="idcRegion">
-                Region
+                {t('idclogindialog.form.regionLabel')}
               </label>
               <Input
                 id="idcRegion"
@@ -200,12 +203,12 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialog
                 disabled={isStarting}
               />
               <p className="text-xs text-muted-foreground">
-                填错也没关系——会自动探测实例所在 region。不确定就留默认。
+                {t('idclogindialog.form.regionHelp')}
               </p>
             </div>
             <div className="space-y-2">
               <label className="text-sm font-medium" htmlFor="idcPriority">
-                优先级
+                {t('idclogindialog.form.priorityLabel')}
               </label>
               <NumberStepper
                 value={Number(priority) || 0}
@@ -213,13 +216,13 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialog
                 min={0}
                 disabled={isStarting}
                 className="w-full"
-                aria-label="优先级"
+                aria-label={t('idclogindialog.form.priorityAriaLabel')}
               />
-              <p className="text-xs text-muted-foreground">数字越小优先级越高</p>
+              <p className="text-xs text-muted-foreground">{t('idclogindialog.form.priorityHelp')}</p>
             </div>
             <div className="space-y-2">
               <label className="text-sm font-medium" htmlFor="idcProxy">
-                代理（可选）
+                {t('idclogindialog.form.proxyLabel')}
               </label>
               <div className="flex items-center gap-2">
                 <Input
@@ -227,7 +230,7 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialog
                   className="flex-1"
                   value={proxyUrl}
                   onChange={(e) => setProxyUrl(e.target.value)}
-                  placeholder="留空使用全局代理"
+                  placeholder={t('idclogindialog.form.proxyPlaceholder')}
                   disabled={isStarting}
                 />
                 <ProxyTestButton proxyUrl={proxyUrl} />
@@ -240,22 +243,22 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialog
         {step === 'waiting' && session && (
           <div className="space-y-4 py-2">
             <p className="text-sm text-muted-foreground">
-              请在浏览器中打开授权页面，输入下方验证码完成登录。
+              {t('idclogindialog.waiting.intro')}
             </p>
             <div className="rounded-lg border bg-muted/50 p-4 text-center space-y-2">
-              <p className="text-xs text-muted-foreground">验证码</p>
+              <p className="text-xs text-muted-foreground">{t('idclogindialog.waiting.codeLabel')}</p>
               <p className="text-2xl font-mono font-bold tracking-widest">{session.userCode}</p>
               <Button type="button" variant="ghost" size="sm" onClick={handleCopyCode}>
-                复制验证码
+                {t('idclogindialog.waiting.copyCode')}
               </Button>
             </div>
             <Button type="button" className="w-full" onClick={handleOpenVerification}>
-              打开授权页面
+              {t('idclogindialog.waiting.openAuthPage')}
             </Button>
             <div className="flex items-center justify-between text-sm text-muted-foreground">
               <div className="flex items-center gap-2">
                 <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-primary" />
-                等待授权完成…
+                {t('idclogindialog.waiting.waitingAuth')}
               </div>
               <span className="tabular-nums">{formatCountdown(countdown)}</span>
             </div>
@@ -265,8 +268,8 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialog
         {step === 'done' && (
           <div className="space-y-3 py-4 text-center">
             <CheckCircle2 className="mx-auto h-12 w-12 text-green-600 dark:text-green-400" />
-            <p className="text-sm font-medium">IDC 上号成功</p>
-            <p className="text-xs text-muted-foreground">凭据已加入池</p>
+            <p className="text-sm font-medium">{t('idclogindialog.done.title')}</p>
+            <p className="text-xs text-muted-foreground">{t('idclogindialog.done.desc')}</p>
           </div>
         )}
 
@@ -279,21 +282,21 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialog
                 onClick={() => onOpenChange(false)}
                 disabled={isStarting}
               >
-                取消
+                {t('idclogindialog.footer.cancel')}
               </Button>
               <Button type="button" onClick={handleStart} disabled={isStarting}>
-                {isStarting ? '启动中…' : '开始登录'}
+                {isStarting ? t('idclogindialog.footer.starting') : t('idclogindialog.footer.startLogin')}
               </Button>
             </>
           )}
           {step === 'waiting' && (
             <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
-              取消
+              {t('idclogindialog.footer.cancel')}
             </Button>
           )}
           {step === 'done' && (
             <Button type="button" onClick={() => onOpenChange(false)}>
-              完成
+              {t('idclogindialog.footer.done')}
             </Button>
           )}
         </DialogFooter>
