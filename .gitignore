@@ -54,6 +54,9 @@ tmp-import*/
 _*.sh
 *-local-command-caveat*.txt
 
+# 归档目录：老文档统一归此,整目录不进公开 repo(仅留本地)
+docs/archive/
+
 # 本地专用文档：不进公开 repo。
 # 可公开的纯技术文档单独列白名单在下方。
 docs/HANDOFF-*
