@@ -2,6 +2,40 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.38] - 2026-07-17 - 对抗性审计修复批次(机器码封禁 + IP身份 + 刷新惊群 + 缓冲内存)
+
+外部红队审计(grok)+ 主线逐条核验代码后修复的确认缺陷。质量只升不降。
+
+### 机器码识别 + 黑名单封禁(新功能)
+- 运维台「按机器」视图对每台机器**逐 IP 展示可复制的机器码**(`MC-`+SHA256 前12位);
+  设置→反代安全新增「机器码黑名单(封禁)」,命中即 403、消息体 `sbsbsb！`。ArcSwap 热更即时。
+- **F1(封禁绕过)**:漫游多 IP 时展示码≠拦截码 → 改为每个见过的 IP 各派生一个码(`ip_codes`),
+  复制哪个 IP 的码就精准封哪个 IP,与入口「按当前请求 IP 重算」的拦截口径一一对应。
+- **F2(关指纹失效)**:抽 `security_block_response` 统一封禁网关,**独立于 `collect_client_fingerprint`
+  隐私开关**直接从请求头解析真实 IP——安全过滤不再被可观测性开关关掉(连带修好 IP 黑名单同缺陷)。
+
+### A1/A2 客户端 IP 身份统一(P0 安全)
+- **A1(XFF 伪造)**:业务层 `extract_client_ip` 由取 XFF **最左**(客户端可伪造)改为取**最右**段
+  (反代 `$proxy_add_x_forwarded_for` 追加的真实 IP,不可伪造),与 security 中间件口径一致。
+  彻底堵住「客户端加伪造 `X-Forwarded-For` 前缀绕过 IP/机器码封禁」。
+- **A2(双轨 IP)**:中间件 `client_ip` 加**自动判定**——TCP 对端为私网/环回(=本机反代)时即便
+  `trust_forwarded=false` 也采信 XFF 最右;对端为公网(直连)则忽略可伪造 XFF 用对端 IP。
+  修反代后白名单/入口限流只看到反代内网 IP 而失效/误伤。业务层与展示层统一 `trusted_client_ip`,
+  保证「按机器」展示 IP == 实际封禁 IP。
+
+### A3/C2 过期刷新惊群(P1 稳定性)
+- `ensure_valid_token` 由 `refresh_token_locked(id, None)` 改为 `Some(10)`:过期风暴下多请求排队等
+  refresh_lock 时,出队者拿锁后二次检查——若前一个 waiter 已刷新成功则 Skipped、**不再各自重打上游
+  refresh**(消除放大 429 / refresh_failure_count)。条件重检 `unwrap_or(false)→true`(expiry 未知视为
+  需刷新,与热路径同口径,防误跳过)。
+
+### C4 缓冲 SSE 内存上限(P1)
+- `BufferedStreamContext.event_buffer` 累计字节加 64MiB 上限(对齐 thinking 256KiB / decoder 16MB
+  的既有范式):`/cc` 与 CC auto-buffer 把整段流收进内存改写 input_tokens,超长响应/异常上游会 OOM。
+  超限即按「响应截断」处置(复用 decoder_stopped 收尾发 SSE error),停止继续缓冲。
+
+后端 776 测试绿(`cargo test --no-default-features --locked`,新增 6 个「旧代码会失败」的回归测试)。
+
 ## [0.7.37] - 2026-07-16
 
 ### IP 黑名单按真实客户端 IP 封禁(反代后也生效)+ 热更即时

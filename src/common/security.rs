@@ -245,16 +245,21 @@ impl IngressRateLimiter {
 ///
 /// - `trust_forwarded`=true 时优先取 `X-Forwarded-For` **最右**段、再 `X-Real-IP`；
 ///   仅在本服务确实位于可信反代之后才应开启，否则可被伪造（取最右防伪造，见下方实现注释）。
-/// - 否则回退到 TCP 连接对端地址（`ConnectInfo`）。
+/// - 否则（默认）**自动判定**：TCP 对端是私网/环回地址（=本机 openresty/nginx 反代）时，
+///   同样信任 XFF 最右段（A2 修复：反代后中间件白名单/限流不再只看到反代内网 IP）；
+///   对端是公网地址（=客户端直连本服务）时，直接用对端 IP、忽略可被伪造的 XFF。
 pub fn client_ip(req: &Request<Body>, peer: Option<SocketAddr>, trust_forwarded: bool) -> Option<IpAddr> {
-    if trust_forwarded {
+    // 是否应信任转发头:显式开启,或对端是私网/环回(说明位于本机可信反代之后)。
+    // 后者是 A2 修复:线上 openresty 反代到 8990,对端恒为 127.0.0.1/内网,默认 trust=false
+    // 会让中间件白名单/入口限流全部按同一个反代 IP 工作(失效或误伤)。对端私网即视为可信反代。
+    let trust = trust_forwarded || peer.map(|p| is_trusted_proxy_peer(p.ip())).unwrap_or(false);
+    if trust {
         if let Some(xff) = req.headers().get("x-forwarded-for") {
             if let Ok(s) = xff.to_str() {
                 // 安全(H2):取**最右**段,不是最左。XFF 是各级代理依次追加的链
                 // (client, proxy1, proxy2, ...),最左是客户端**可任意伪造**的值——取最左
                 // 会让攻击者发 `X-Forwarded-For: <白名单IP>` 绕过 IP 白名单,或每次换伪造 IP
                 // 绕过每-IP 限流。只有**最右**那段是紧邻本服务的可信反代追加的、不可伪造。
-                // (前提:本服务确实位于可信反代之后才开 trust_forwarded;默认关。)
                 if let Some(last) = s.split(',').next_back() {
                     if let Ok(ip) = last.trim().parse::<IpAddr>() {
                         return Some(ip);
@@ -271,6 +276,25 @@ pub fn client_ip(req: &Request<Body>, peer: Option<SocketAddr>, trust_forwarded:
         }
     }
     peer.map(|p| p.ip())
+}
+
+/// 对端地址是否为「可信本机反代」:环回(127.0.0.1/::1)或私网(RFC1918 / fc00::/7 / 链路本地)。
+/// 用于 A2 自动判定——只有当请求来自本机/内网反代时才信任其追加的 XFF 最右段。
+pub fn is_trusted_proxy_peer(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_private() || v4.is_link_local()
+        }
+        IpAddr::V6(v6) => {
+            // 环回 ::1 / 唯一本地 fc00::/7 / 链路本地 fe80::/10 / IPv4-mapped 私网
+            v6.is_loopback()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                || v6.to_ipv4_mapped().is_some_and(|v4| {
+                    v4.is_loopback() || v4.is_private() || v4.is_link_local()
+                })
+        }
+    }
 }
 
 // ============ 中间件状态与实现 ============
@@ -536,5 +560,62 @@ mod tests {
         assert!(!bl.is_active());
         // 空黑名单:任何 IP 都不拦(恒 false)。
         assert!(!bl.blocks("1.2.3.4".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_is_trusted_proxy_peer() {
+        // 环回 / 私网 / 链路本地 = 可信本机反代。
+        assert!(is_trusted_proxy_peer("127.0.0.1".parse().unwrap()));
+        assert!(is_trusted_proxy_peer("192.168.11.23".parse().unwrap()));
+        assert!(is_trusted_proxy_peer("10.0.0.5".parse().unwrap()));
+        assert!(is_trusted_proxy_peer("172.16.0.1".parse().unwrap()));
+        assert!(is_trusted_proxy_peer("169.254.1.1".parse().unwrap()));
+        assert!(is_trusted_proxy_peer("::1".parse().unwrap()));
+        assert!(is_trusted_proxy_peer("fc00::1".parse().unwrap()));
+        assert!(is_trusted_proxy_peer("fe80::1".parse().unwrap()));
+        // 公网 = 不可信(客户端直连)。
+        assert!(!is_trusted_proxy_peer("8.8.8.8".parse().unwrap()));
+        assert!(!is_trusted_proxy_peer("223.73.32.14".parse().unwrap()));
+        assert!(!is_trusted_proxy_peer("2606:4700::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_client_ip_a2_auto_trust_behind_proxy() {
+        use axum::body::Body;
+        use axum::http::Request;
+
+        // A2:对端=私网反代 + 默认 trust_forwarded=false → 自动信任 XFF 最右(真实客户端)。
+        let req = Request::builder()
+            .header("x-forwarded-for", "8.8.8.8, 203.0.113.7")
+            .body(Body::empty())
+            .unwrap();
+        let proxy_peer: SocketAddr = "127.0.0.1:8990".parse().unwrap();
+        assert_eq!(
+            client_ip(&req, Some(proxy_peer), false),
+            Some("203.0.113.7".parse().unwrap()),
+            "反代后(默认 trust=false)应自动取 XFF 最右真实 IP,而非只看反代对端"
+        );
+
+        // A1:最左伪造前缀不影响结果(取最右)。
+        let req2 = Request::builder()
+            .header("x-forwarded-for", "1.1.1.1, 203.0.113.7")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            client_ip(&req2, Some(proxy_peer), false),
+            Some("203.0.113.7".parse().unwrap())
+        );
+
+        // 公网直连(对端非私网)→ 忽略可伪造 XFF,用对端。
+        let req3 = Request::builder()
+            .header("x-forwarded-for", "10.0.0.1, 203.0.113.7")
+            .body(Body::empty())
+            .unwrap();
+        let public_peer: SocketAddr = "198.51.100.22:5000".parse().unwrap();
+        assert_eq!(
+            client_ip(&req3, Some(public_peer), false),
+            Some("198.51.100.22".parse().unwrap()),
+            "公网直连应忽略 XFF 用对端 IP(防直连伪造)"
+        );
     }
 }

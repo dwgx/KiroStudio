@@ -2358,6 +2358,10 @@ pub struct BufferedStreamContext {
     estimated_input_tokens: i32,
     /// 是否已经生成了初始事件
     initial_events_generated: bool,
+    /// 已缓冲事件的累计字节数（C4：内存上限守卫，超 [`MAX_BUFFERED_EVENT_BYTES`] 即停止缓冲）
+    buffered_bytes: usize,
+    /// 是否已因超出缓冲上限而截断（只标记一次，避免重复置失败态/重复告警）
+    buffer_overflowed: bool,
 }
 
 impl BufferedStreamContext {
@@ -2376,7 +2380,25 @@ impl BufferedStreamContext {
             event_buffer: Vec::new(),
             estimated_input_tokens,
             initial_events_generated: false,
+            buffered_bytes: 0,
+            buffer_overflowed: false,
         }
+    }
+
+    /// 估算一批事件的字节占用（event 名 + 序列化 data），用于缓冲上限累计。
+    fn estimate_events_bytes(events: &[SseEvent]) -> usize {
+        events
+            .iter()
+            .map(|e| {
+                e.event.len()
+                    + serde_json::to_string(&e.data).map(|s| s.len()).unwrap_or(0)
+            })
+            .sum()
+    }
+
+    /// 是否已因缓冲超上限而截断（C4）。
+    pub fn buffer_overflowed(&self) -> bool {
+        self.buffer_overflowed
     }
 
     /// 返回本次请求解析出的最终用量（供用量统计埋点使用）
@@ -2424,16 +2446,36 @@ impl BufferedStreamContext {
     ///
     /// 复用 StreamContext 的事件处理逻辑，但把结果缓存而不是立即发送。
     pub fn process_and_buffer(&mut self, event: &crate::kiro::model::events::Event) {
+        // C4:已超缓冲上限 → 停止继续缓冲(丢弃后续事件),防 OOM。已置截断失败态,收尾按截断处理。
+        if self.buffer_overflowed {
+            return;
+        }
+
         // 首次处理事件时，先生成初始事件（message_start 等）
         if !self.initial_events_generated {
             let initial_events = self.inner.generate_initial_events();
+            self.buffered_bytes += Self::estimate_events_bytes(&initial_events);
             self.event_buffer.extend(initial_events);
             self.initial_events_generated = true;
         }
 
         // 处理事件并缓冲结果
         let events = self.inner.process_kiro_event(event);
+        self.buffered_bytes += Self::estimate_events_bytes(&events);
         self.event_buffer.extend(events);
+
+        // C4:累计字节超上限 → 按"响应截断"处置(复用 decoder_stopped 收尾:发 SSE error,
+        // 不把半截缓冲当成功)。只置一次,后续事件在上面的 early-return 丢弃。
+        if self.buffered_bytes > MAX_BUFFERED_EVENT_BYTES {
+            self.buffer_overflowed = true;
+            tracing::warn!(
+                buffered_bytes = self.buffered_bytes,
+                limit = MAX_BUFFERED_EVENT_BYTES,
+                "缓冲流事件超出内存上限,按响应截断处置(停止继续缓冲,防 OOM)"
+            );
+            self.inner
+                .mark_decoder_stopped("缓冲流事件超出内存上限(疑似异常超长响应)".to_string());
+        }
     }
 
     /// 完成流处理并返回所有事件
@@ -3278,6 +3320,14 @@ const STRAY_INVOKE_TOKENS: &[&str] = &["call", "count", "card", "court", "課", 
 /// thinking 缓冲上限(review Finding 5):上游持续吐纯空白时,纯空白分支既不 emit 也不收缩会让
 /// thinking_buffer 无界增长 OOM。超此上限即强制按普通文本吐出收缩。256KiB 远超正常 thinking 前导空白。
 const MAX_THINKING_BUFFER_BYTES: usize = 262_144;
+
+/// 缓冲流(BufferedStreamContext,/cc + CC auto-buffer)累计事件字节上限(C4 修复):
+/// 缓冲模式把整段上游流收进内存再更正 message_start 的 input_tokens。无上限时超长流式工具
+/// 参数 + 大 thinking(或异常上游持续推送)会让 event_buffer 无界增长直至 OOM(对比 thinking
+/// 已有 256KiB 上限、decoder 16MB 上限)。64MiB 远超任何正常 Claude 响应(含大工具参数与长
+/// thinking),超限即按"响应截断"处置(mark_decoder_stopped),复用既有截断→SSE error 收尾语义,
+/// 不再继续吃内存。
+const MAX_BUFFERED_EVENT_BYTES: usize = 64 * 1024 * 1024;
 
 /// 复读熔断阈值：同一个 stray token（call/count/card/court）连续作为独占一行重复出现
 /// 超过这么多次，判定为「Opus 长上下文退化复读死循环」，立即熔断本轮文本输出。
@@ -5376,6 +5426,50 @@ mod tests {
         assert!(!ctx.completion().is_ok());
         assert_eq!(ctx.completion_outcome(), RequestOutcome::ServerError);
         assert!(ctx.error_event_emitted());
+    }
+
+    #[test]
+    fn test_buffered_context_bounds_memory_on_flood() {
+        // C4 回归:上游持续推送超长文本时,缓冲事件累计字节超上限应触发截断守卫——
+        // 停止继续缓冲(event_buffer 不再无界增长)并置失败态。旧实现无上限会一直吃内存 OOM。
+        use crate::kiro::model::events::AssistantResponseEvent;
+        let mut ctx = BufferedStreamContext::new(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+
+        // 每帧约 1MiB 文本;喂 200 帧(约 200MiB) 远超 64MiB 上限。
+        // 用变化的自然文本(非单字符/单词连写),避免触发 stray 复读熔断(那会吞掉内容)。
+        let sentence = "The quick brown fox jumps over the lazy dog while parsing tokens. ";
+        let chunk = sentence.repeat((1024 * 1024) / sentence.len() + 1);
+        for _ in 0..200 {
+            ctx.process_and_buffer(&Event::AssistantResponse(AssistantResponseEvent {
+                content: chunk.clone(),
+            }));
+            if ctx.buffer_overflowed() {
+                break;
+            }
+        }
+
+        assert!(ctx.buffer_overflowed(), "超长响应应触发缓冲上限守卫");
+        // 缓冲不应无界增长:累计字节应止于略超上限(不是 200MiB 全吃进来)。
+        assert!(
+            ctx.buffered_bytes <= MAX_BUFFERED_EVENT_BYTES + 4 * 1024 * 1024,
+            "超限后应停止缓冲,不再继续增长(实际 {} 字节)",
+            ctx.buffered_bytes
+        );
+        // 截断按失败态处置(收尾会发 SSE error,不把半截当成功)。
+        assert!(!ctx.completion().is_ok(), "缓冲溢出应置失败态");
+
+        // 溢出后继续喂事件应被丢弃(early-return),字节数不再变。
+        let before = ctx.buffered_bytes;
+        ctx.process_and_buffer(&Event::AssistantResponse(AssistantResponseEvent {
+            content: chunk.clone(),
+        }));
+        assert_eq!(ctx.buffered_bytes, before, "溢出后应丢弃后续事件,不再缓冲");
     }
 
     // ==================== merge_tool_input 决策表回归（Invalid tool parameters 类型 C 根治） ====================

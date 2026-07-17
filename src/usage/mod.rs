@@ -18,4 +18,4 @@ pub use record::{
     classify_device, parse_client_browser, parse_client_os, RequestOutcome, RequestRecord,
 };
 pub use trace_db::{TraceDb, TraceFilter};
-pub use usage_stats::UsageStats;
+pub use usage_stats::{machine_code_of, UsageStats};
