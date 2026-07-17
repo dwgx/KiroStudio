@@ -432,6 +432,8 @@ async fn main() {
 
     // IP 黑名单业务层镜像(按真实客户端 IP 封禁,反代后也生效;admin 改配置时热更):
     anthropic::handlers::set_ip_blocklist(&config.ip_blocklist);
+    // 机器码黑名单业务层镜像(命中即拒;admin 改配置时热更):
+    anthropic::handlers::set_machine_code_blocklist(&config.machine_code_blocklist);
 
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),

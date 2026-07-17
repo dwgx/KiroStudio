@@ -590,6 +590,7 @@ pub struct ConfigSnapshotResponse {
     pub cors_allowed_origins: Vec<String>,
     pub ip_allowlist: Vec<String>,
     pub ip_blocklist: Vec<String>,
+    pub machine_code_blocklist: Vec<String>,
     pub trust_forwarded_header: bool,
     pub ingress_rate_limit_per_min: u32,
     pub max_body_bytes: usize,
@@ -690,6 +691,8 @@ pub struct UpdateConfigRequest {
     pub ip_allowlist: Option<Vec<String>>,
     /// 入口 IP 黑名单（CIDR/单 IP，整表替换；命中即 403，优先于白名单）
     pub ip_blocklist: Option<Vec<String>>,
+    /// 机器码黑名单（整表替换；命中即 403，消息 sbsbsb！）
+    pub machine_code_blocklist: Option<Vec<String>>,
     /// 是否信任 X-Forwarded-For
     pub trust_forwarded_header: Option<bool>,
     /// 入口每-IP 每分钟限流（0=关闭）
@@ -865,6 +868,7 @@ mod tests {
             cors_allowed_origins: vec![],
             ip_allowlist: vec![],
             ip_blocklist: vec![],
+            machine_code_blocklist: vec![],
             trust_forwarded_header: false,
             ingress_rate_limit_per_min: 0,
             max_body_bytes: 0,

@@ -1102,6 +1102,7 @@ impl AdminService {
             cors_allowed_origins: config.cors_allowed_origins.clone(),
             ip_allowlist: config.ip_allowlist.clone(),
             ip_blocklist: config.ip_blocklist.clone(),
+            machine_code_blocklist: config.machine_code_blocklist.clone(),
             trust_forwarded_header: config.trust_forwarded_header,
             ingress_rate_limit_per_min: config.ingress_rate_limit_per_min,
             max_body_bytes: config.max_body_bytes,
@@ -1606,6 +1607,30 @@ impl AdminService {
                 // 业务层黑名单镜像热更(按真实客户端 IP 封禁,反代后也生效,立即生效无需重启)。
                 // 注:security 中间件的黑名单仍是 restart-only(启动时建),但业务层这道已足够拦截。
                 crate::anthropic::handlers::set_ip_blocklist(&cleaned);
+                hot_changed = true;
+            }
+        }
+        if let Some(v) = req.machine_code_blocklist {
+            // 归一化:trim + 小写(判定端大小写不敏感);校验格式 MC- + 12 位十六进制,非法直接拒绝。
+            let cleaned: Vec<String> = v
+                .into_iter()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            for entry in &cleaned {
+                let ok = entry.len() == 15
+                    && entry.starts_with("mc-")
+                    && entry[3..].chars().all(|c| c.is_ascii_hexdigit());
+                if !ok {
+                    return Err(AdminServiceError::InvalidCredential(format!(
+                        "machineCodeBlocklist 条目 '{entry}' 非法(应为 MC- 加 12 位十六进制)"
+                    )));
+                }
+            }
+            if cleaned != config.machine_code_blocklist {
+                config.machine_code_blocklist = cleaned.clone();
+                // 业务层机器码黑名单镜像热更(立即生效无需重启)。
+                crate::anthropic::handlers::set_machine_code_blocklist(&cleaned);
                 hot_changed = true;
             }
         }

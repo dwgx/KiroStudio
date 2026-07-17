@@ -398,9 +398,18 @@ pub struct Config {
     #[serde(default)]
     pub ip_blocklist: Vec<String>,
 
-    /// 是否信任 `X-Forwarded-For` / `X-Real-IP` 头来判定客户端 IP（默认 false）。
-    /// **仅当本服务确实部署在可信反代（nginx/traefik）之后才可开启**，
-    /// 否则客户端可伪造该头绕过 IP 白名单与限流。
+    /// 机器码黑名单（封禁）。空 = 不启用。命中即拒（403，返回消息 `sbsbsb！`）。
+    /// 机器码 = `MC-` + SHA256(machine_key) 前 12 位，从运维台「按机器」视图复制。
+    /// 判定时按当前请求的真实客户端 IP（同 IP 黑名单口径）重算机器码，精确匹配（大小写不敏感）。
+    /// 与 IP 黑名单互补：机器码不暴露裸 IP，且与「按机器」分组一一对应，复制即可拉黑。
+    #[serde(default)]
+    pub machine_code_blocklist: Vec<String>,
+
+    /// 是否**强制**信任 `X-Forwarded-For` / `X-Real-IP` 头来判定客户端 IP（默认 false）。
+    /// 说明（A2 修复后）：即便为 false，当 TCP 对端是私网/环回地址（=本机可信反代）时也会
+    /// 自动采信 XFF **最右**段（不可伪造）；置 true 则**无论对端**都信任转发头。
+    /// **仅当本服务确实部署在可信反代（nginx/traefik）之后才可置 true**，否则公网直连客户端
+    /// 可伪造该头绕过 IP 白名单与限流。取最右段防伪造，见 `security::client_ip`。
     #[serde(default)]
     pub trust_forwarded_header: bool,
 
@@ -843,6 +852,7 @@ impl Default for Config {
             cors_allowed_origins: Vec::new(),
             ip_allowlist: Vec::new(),
             ip_blocklist: Vec::new(),
+            machine_code_blocklist: Vec::new(),
             trust_forwarded_header: false,
             ingress_rate_limit_per_min: 0,
             max_body_bytes: default_max_body_bytes(),

@@ -363,6 +363,7 @@ export interface ConfigSnapshotResponse {
   corsAllowedOrigins: string[]
   ipAllowlist: string[]
   ipBlocklist: string[]
+  machineCodeBlocklist: string[]
   trustForwardedHeader: boolean
   ingressRateLimitPerMin: number
   maxBodyBytes: number
@@ -436,6 +437,7 @@ export interface UpdateConfigRequest {
   corsAllowedOrigins?: string[]
   ipAllowlist?: string[]
   ipBlocklist?: string[]
+  machineCodeBlocklist?: string[]
   trustForwardedHeader?: boolean
   ingressRateLimitPerMin?: number
   maxBodyBytes?: number
@@ -635,9 +637,17 @@ export interface RequestRecord {
 // 单台机器（按设备指纹分组，IP 变化不拆分）的 RPM 视图（对接 GET /usage/machines）。
 // 与 ClientRpm（按 IP 分组）的关键区别：分组主键是设备画像派生的 machineKey（不含 IP），
 // 同一机器换 IP（DHCP/VPN/NAT）仍合并为一组，IP 只作 ips 列表展示。
+// 单个 IP → 机器码：漫游机器（多 IP）逐 IP 展示可复制的封禁码。
+export interface MachineIpCode {
+  ip: string
+  code: string
+}
+
 export interface MachineRpm {
   /** 机器分组键（设备画像派生：device|os|browser 拼接，稳定标识一台机器） */
   machineKey: string
+  /** 机器码（MC- + SHA256 前 12 位，对应 machineKey/粘滞 IP；漫游多 IP 请用 ipCodes 逐个封） */
+  machineCode: string
   /** 设备类型（如 claude-code） */
   device?: string | null
   /** 操作系统细分（如 Windows） */
@@ -646,6 +656,8 @@ export interface MachineRpm {
   browser?: string | null
   /** 这台机器见过的所有 IP（升序去重） */
   ips: string[]
+  /** 每个见过的 IP 各自的机器码（与 ips 对应）：复制哪个 IP 的码就精准封哪个 IP */
+  ipCodes: MachineIpCode[]
   /** 该机器最近 60 秒请求数（RPM，聚合其所有窗口） */
   rpm: number
   /** 活跃窗口数（distinct session_id，近 10 分钟内有请求） */
