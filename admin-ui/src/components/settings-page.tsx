@@ -271,6 +271,7 @@ interface FormState {
   corsAllowedOrigins: string
   ipAllowlist: string
   ipBlocklist: string
+  machineCodeBlocklist: string
   trustForwardedHeader: boolean
   ingressRateLimitPerMin: string
   maxBodyBytes: string
@@ -361,6 +362,7 @@ function toForm(c: ConfigSnapshotResponse, ui: UiLayoutPrefs): FormState {
     corsAllowedOrigins: listToLines(c.corsAllowedOrigins ?? []),
     ipAllowlist: listToLines(c.ipAllowlist ?? []),
     ipBlocklist: listToLines(c.ipBlocklist ?? []),
+    machineCodeBlocklist: listToLines(c.machineCodeBlocklist ?? []),
     trustForwardedHeader: c.trustForwardedHeader,
     ingressRateLimitPerMin: String(c.ingressRateLimitPerMin),
     maxBodyBytes: String(c.maxBodyBytes),
@@ -1528,6 +1530,8 @@ export function SettingsPage() {
     if (!sameList(allowlist, config.ipAllowlist ?? [])) d.ipAllowlist = allowlist
     const blocklist = linesToList(form.ipBlocklist)
     if (!sameList(blocklist, config.ipBlocklist ?? [])) d.ipBlocklist = blocklist
+    const mcBlocklist = linesToList(form.machineCodeBlocklist)
+    if (!sameList(mcBlocklist, config.machineCodeBlocklist ?? [])) d.machineCodeBlocklist = mcBlocklist
     if (form.trustForwardedHeader !== config.trustForwardedHeader) d.trustForwardedHeader = form.trustForwardedHeader
     const ingress = Number(form.ingressRateLimitPerMin)
     if (Number.isFinite(ingress) && ingress !== config.ingressRateLimitPerMin) d.ingressRateLimitPerMin = ingress
@@ -2296,6 +2300,18 @@ export function SettingsPage() {
               value={form.ipBlocklist}
               onChange={(e) => set('ipBlocklist', e.target.value)}
               placeholder={t('settingspage.security.ipBlock.ph')}
+              spellCheck={false}
+            />
+          </Field>
+          <Field
+            label={t('settingspage.security.mcBlock.label')}
+            hint={t('settingspage.security.mcBlock.hint')}
+          >
+            <textarea
+              className="flex min-h-[72px] w-full max-w-[260px] rounded-md border border-input bg-background px-3 py-2 font-mono text-xs ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              value={form.machineCodeBlocklist}
+              onChange={(e) => set('machineCodeBlocklist', e.target.value)}
+              placeholder={t('settingspage.security.mcBlock.ph')}
               spellCheck={false}
             />
           </Field>

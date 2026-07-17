@@ -29,14 +29,20 @@ use super::websearch;
 
 /// 从入站请求头提取客户端 IP（仅头部来源，不含连接层回退）。
 ///
-/// 优先级：`x-forwarded-for` 首段（逗号分割，取最靠近客户端的第一跳）→
-/// `x-real-ip` → 都没有则 `None`。反代场景下这两个头即客户端真实 IP；直连
-/// 无反代时头缺失，由 [`ClientInfo::from_headers_with_peer`] 回退到 TCP 对端地址。
+/// **安全(A1 修复)**：取 `x-forwarded-for` 的**最右**段，不是最左。XFF 是各级代理依次
+/// 追加的链 `client, proxy1, proxy2, ...`——最左是**客户端可任意伪造**的值，取最左会让
+/// 攻击者发 `X-Forwarded-For: <任意IP>` 来伪造身份、绕过按真实 IP 的封禁/机器码/限流。
+/// 本服务部署在可信反代（openresty，`$proxy_add_x_forwarded_for` 追加式）之后：客户端伪造的
+/// 前缀会被反代把真实 `$remote_addr` **追加到最右**，故最右那段才是不可伪造的真实客户端 IP。
+/// 与安全中间件 [`crate::common::security::client_ip`] 的最右口径一致（消除 A1 的两套语义相反）。
+///
+/// 优先级：`x-forwarded-for` 最右段 → `x-real-ip` → 都没有则 `None`（直连无反代时头缺失，
+/// 由 [`ClientInfo::from_headers_with_peer`] / [`security_block_response`] 回退到 TCP 对端地址）。
 fn extract_client_ip(headers: &axum::http::HeaderMap) -> Option<String> {
-    // x-forwarded-for: "client, proxy1, proxy2" —— 取第一段
+    // x-forwarded-for: "client, proxy1, proxy2" —— 取**最右**段(反代追加的真实 IP,不可伪造)
     if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        if let Some(first) = xff.split(',').next() {
-            let ip = first.trim();
+        if let Some(last) = xff.split(',').next_back() {
+            let ip = last.trim();
             if !ip.is_empty() {
                 return Some(ip.to_string());
             }
@@ -99,6 +105,104 @@ fn ip_is_blocked(ip_str: &str) -> bool {
         Ok(ip) => list.iter().any(|c| c.contains_ip(ip)),
         Err(_) => false,
     }
+}
+
+/// 机器码黑名单业务层镜像(ArcSwap 热更)。机器码 = `MC-` + SHA256(machine_key) 前 12 位,
+/// 由运维台「按机器」视图复制。判定时按当前请求真实客户端 IP(同 IP 黑名单口径)重算机器码,
+/// 精确匹配(存归一化后的大写小写无关形式)。命中即拒(403,消息 `sbsbsb！`)。
+/// 启动时由 main 接线、admin 改 machine_code_blocklist 时热更(无需重启)。
+static MACHINE_CODE_BLOCKLIST: std::sync::OnceLock<arc_swap::ArcSwap<Vec<String>>> =
+    std::sync::OnceLock::new();
+
+fn machine_code_blocklist_cell() -> &'static arc_swap::ArcSwap<Vec<String>> {
+    MACHINE_CODE_BLOCKLIST.get_or_init(|| arc_swap::ArcSwap::from_pointee(Vec::new()))
+}
+
+/// 设置业务层机器码黑名单(启动接线 / admin 热更调用)。空串跳过,统一小写去空白存储。
+pub fn set_machine_code_blocklist(entries: &[String]) {
+    let cleaned: Vec<String> = entries
+        .iter()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    machine_code_blocklist_cell().store(std::sync::Arc::new(cleaned));
+}
+
+/// 判断给定机器码是否命中黑名单(大小写不敏感精确匹配)。空黑名单恒 false。
+fn machine_code_is_blocked(code: &str) -> bool {
+    let list = machine_code_blocklist_cell().load();
+    if list.is_empty() {
+        return false;
+    }
+    let needle = code.trim().to_ascii_lowercase();
+    list.iter().any(|c| *c == needle)
+}
+
+/// 安全封禁网关：IP 黑名单 + 机器码黑名单统一判定。命中返回 403 响应，未命中返回 None。
+///
+/// **F2 修复关键**：封禁判定**独立于 `collect_client_fingerprint` 隐私开关**——直接从请求头
+/// 解析真实客户端 IP（[`extract_client_ip`]，回退 TCP 对端），而非复用 `ClientInfo`（后者在
+/// 关闭指纹采集时返回全空 IP，会让黑名单静默失效）。安全过滤不该被可观测性开关关掉。
+///
+/// 机器码按当前请求真实 IP / device 重算判定（与「按机器」视图逐 IP 展示的码口径一致）。
+/// device 仅在无 IP 时作兜底键；关指纹时无 UA→device 为 None，机器码回退到 IP/unknown 派生，
+/// 与展示端同源。命中即拒。
+/// 业务层真实客户端 IP：与安全中间件 [`crate::common::security::client_ip`] 同口径(A1+A2 统一)。
+/// - 对端是可信反代(私网/环回)→ 采信 XFF **最右**段(不可伪造)/ X-Real-IP;
+/// - 对端是公网(客户端直连)→ 忽略可伪造的 XFF,直接用对端 IP;
+/// - 无头无对端 → None。
+/// 供封禁判定与「按机器」画像共用同一身份,保证展示 IP == 封禁 IP(不再回到最左伪造/双轨)。
+fn trusted_client_ip(
+    headers: &axum::http::HeaderMap,
+    peer: Option<std::net::SocketAddr>,
+) -> Option<String> {
+    let peer_is_proxy = peer
+        .map(|p| crate::common::security::is_trusted_proxy_peer(p.ip()))
+        .unwrap_or(false);
+    // 对端是可信反代时才采信转发头(取最右,不可伪造);否则忽略 XFF 用对端。
+    if peer_is_proxy {
+        if let Some(ip) = extract_client_ip(headers) {
+            return Some(ip);
+        }
+    }
+    peer.map(|a| a.ip().to_string())
+}
+
+fn security_block_response(
+    headers: &axum::http::HeaderMap,
+    peer: Option<std::net::SocketAddr>,
+) -> Option<axum::response::Response> {
+    // 真实客户端 IP：XFF 最右(A1,不可伪造) → 回退 TCP 对端。不受指纹开关影响。
+    // A1 修复:extract_client_ip 已改取最右段;仅当对端是可信反代(私网/环回)时才采信 XFF,
+    // 公网直连客户端伪造的 XFF 被忽略(用对端 IP),与中间件 client_ip 口径统一。
+    let real_ip = trusted_client_ip(headers, peer);
+
+    if let Some(ip) = real_ip.as_deref() {
+        if ip_is_blocked(ip) {
+            tracing::warn!(client_ip = %ip, "IP 黑名单拦截:拒绝该来源请求(403)");
+            return Some(
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(ErrorResponse::new("permission_error", "来源 IP 已被封禁")),
+                )
+                    .into_response(),
+            );
+        }
+    }
+
+    // 机器码黑名单:按真实 IP 重算(device 仅无 IP 时兜底;关指纹时 device=None 不影响 IP 派生)。
+    let code = crate::usage::machine_code_of(real_ip.as_deref(), None);
+    if machine_code_is_blocked(&code) {
+        tracing::warn!(machine_code = %code, client_ip = ?real_ip, "机器码黑名单拦截:拒绝该机器请求(403)");
+        return Some(
+            (
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse::new("permission_error", "sbsbsb！")),
+            )
+                .into_response(),
+        );
+    }
+    None
 }
 
 fn collect_client_fingerprint() -> bool {
@@ -274,9 +378,9 @@ struct ClientInfo {
 impl ClientInfo {
     /// 从入站请求头 + TCP 对端地址一次性解析设备/IP/OS/浏览器。
     ///
-    /// IP 取值优先级：`x-forwarded-for` / `x-real-ip`（反代场景）→ TCP 连接对端
-    /// 地址（直连 8990 无反代头时的回退）。peer 取自 axum 的 `ConnectInfo<SocketAddr>`，
-    /// 仅取 IP 部分（丢弃端口），拿不到则为 None。
+    /// IP 取值：[`trusted_client_ip`]（A1+A2 统一口径——可信反代后取 XFF 最右不可伪造，
+    /// 公网直连用对端）。与 [`security_block_response`] 封禁判定**同一身份**，保证用量/「按机器」
+    /// 视图展示的 IP == 实际封禁的 IP（不再出现展示≠拦截的漂移）。
     ///
     /// 隐私开关：`collect_client_fingerprint` 关闭时直接返回全空画像，
     /// 热路径不解析任何指纹字段，用量记录不落这些信息。
@@ -288,7 +392,7 @@ impl ClientInfo {
             return Self::default();
         }
         let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
-        let ip = extract_client_ip(headers).or_else(|| peer.map(|a| a.ip().to_string()));
+        let ip = trusted_client_ip(headers, peer);
         Self {
             device: crate::usage::classify_device(ua),
             ip,
@@ -581,20 +685,13 @@ pub async fn post_messages(
         "Received POST /v1/messages request"
     );
 
+    // 安全封禁网关(IP + 机器码黑名单,独立于指纹开关,按真实客户端 IP 判定):命中即 403。
+    if let Some(resp) = security_block_response(&headers, Some(peer)) {
+        return resp;
+    }
+
     // 从入站请求头 + TCP 对端地址识别来源画像（设备/IP/OS/浏览器，用于「最近请求」展示）
     let client = ClientInfo::from_headers_with_peer(&headers, Some(peer));
-    // IP 黑名单(业务层,按真实客户端 IP 判定):反代后中间件只看到反代内网 IP,故在此按
-    // extract_client_ip 拿到的真实 IP(XFF/X-Real-IP 首段)再判一次,命中即拒绝。
-    if let Some(ip) = client.ip.as_deref() {
-        if ip_is_blocked(ip) {
-            tracing::warn!(client_ip = %ip, "IP 黑名单拦截:拒绝该来源请求(403)");
-            return (
-                StatusCode::FORBIDDEN,
-                Json(ErrorResponse::new("permission_error", "来源 IP 已被封禁")),
-            )
-                .into_response();
-        }
-    }
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
@@ -1464,20 +1561,13 @@ pub async fn post_messages_cc(
         "Received POST /cc/v1/messages request"
     );
 
+    // 安全封禁网关(IP + 机器码黑名单,独立于指纹开关,按真实客户端 IP 判定,同 /v1/messages)。
+    if let Some(resp) = security_block_response(&headers, Some(peer)) {
+        return resp;
+    }
+
     // 从入站请求头 + TCP 对端地址识别来源画像（设备/IP/OS/浏览器，用于「最近请求」展示）
     let client = ClientInfo::from_headers_with_peer(&headers, Some(peer));
-
-    // IP 黑名单(业务层,按真实客户端 IP 判定,同 /v1/messages)。
-    if let Some(ip) = client.ip.as_deref() {
-        if ip_is_blocked(ip) {
-            tracing::warn!(client_ip = %ip, "IP 黑名单拦截:拒绝该来源请求(403)");
-            return (
-                StatusCode::FORBIDDEN,
-                Json(ErrorResponse::new("permission_error", "来源 IP 已被封禁")),
-            )
-                .into_response();
-        }
-    }
 
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
@@ -1818,6 +1908,11 @@ fn emit_buffered_usage(
     crate::usage::emit_record(record);
 }
 
+/// 测试串行锁:IP/机器码黑名单是进程级全局静态(ArcSwap 镜像),多个测试并行读写会互相污染
+/// (一个测试清空黑名单会让另一个测试的命中断言失败)。凡改这些全局态的测试都先取此锁,串行执行。
+#[cfg(test)]
+static BLOCKLIST_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod ip_blocklist_tests {
     //! 业务层 IP 黑名单:按真实客户端 IP(XFF 首段)封禁,反代后也生效。
@@ -1825,6 +1920,7 @@ mod ip_blocklist_tests {
 
     #[test]
     fn test_ip_blocklist_business_layer() {
+        let _guard = BLOCKLIST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 空黑名单:任何 IP 都不拦。
         set_ip_blocklist(&[]);
         assert!(!ip_is_blocked("223.73.32.14"));
@@ -1837,6 +1933,133 @@ mod ip_blocklist_tests {
         // 清空恢复(避免污染其它测试的全局镜像)。
         set_ip_blocklist(&[]);
         assert!(!ip_is_blocked("223.73.32.14"));
+    }
+}
+
+#[cfg(test)]
+mod machine_code_blocklist_tests {
+    //! 业务层机器码黑名单:按当前请求真实客户端 IP 重算机器码,命中即拒(消息 sbsbsb！)。
+    use super::*;
+
+    #[test]
+    fn test_machine_code_blocklist_business_layer() {
+        let _guard = BLOCKLIST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 空黑名单:任何机器码都不拦。
+        set_machine_code_blocklist(&[]);
+        let code = crate::usage::machine_code_of(Some("223.73.32.14"), Some("claude-code"));
+        assert!(!machine_code_is_blocked(&code));
+
+        // 拉黑该机器码后命中。
+        set_machine_code_blocklist(&[code.clone()]);
+        assert!(machine_code_is_blocked(&code), "命中机器码应拦");
+        // 大小写不敏感。
+        assert!(machine_code_is_blocked(&code.to_uppercase()), "大写形式也应命中");
+        // 另一台机器(不同 IP → 不同码)不受影响。
+        let other = crate::usage::machine_code_of(Some("8.8.8.8"), Some("claude-code"));
+        assert!(!machine_code_is_blocked(&other), "未拉黑的机器码应放行");
+
+        // 有 IP 时 device 不影响判定(machine_key = IP)。
+        let same_ip_diff_dev = crate::usage::machine_code_of(Some("223.73.32.14"), Some("vscode"));
+        assert!(machine_code_is_blocked(&same_ip_diff_dev), "同 IP 不同 device 仍应命中");
+
+        // 清空恢复(避免污染其它测试的全局镜像)。
+        set_machine_code_blocklist(&[]);
+        assert!(!machine_code_is_blocked(&code));
+    }
+
+    // F2 回归:安全封禁网关独立于 collect_client_fingerprint 隐私开关。
+    // 网关直接从请求头解析真实 IP(不走 ClientInfo,后者关指纹时返回空 IP 会让黑名单失效)。
+    #[test]
+    fn test_security_gate_independent_of_fingerprint_flag() {
+        use axum::http::HeaderMap;
+        use std::net::SocketAddr;
+        use std::sync::atomic::Ordering;
+
+        let _guard = BLOCKLIST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // 反代场景:对端=本机 openresty(127.0.0.1),XFF 最右=反代追加的真实客户端 IP。
+        // (A1:最右不可伪造;此处 223.73.32.14 是反代追加的真实 IP。)
+        let proxy_peer: Option<SocketAddr> = Some("127.0.0.1:9999".parse().unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "10.9.9.9, 223.73.32.14".parse().unwrap());
+
+        // 记录并强制关闭指纹采集(模拟 collect_client_fingerprint=false)。
+        let saved = COLLECT_CLIENT_FINGERPRINT.load(Ordering::Relaxed);
+        COLLECT_CLIENT_FINGERPRINT.store(false, Ordering::Relaxed);
+
+        // 场景 A:IP 黑名单命中——即便关指纹,网关仍按 XFF 最右真实 IP 拦截(403)。
+        set_ip_blocklist(&["223.73.32.14/32".to_string()]);
+        set_machine_code_blocklist(&[]);
+        let resp = security_block_response(&headers, proxy_peer);
+        assert!(resp.is_some(), "关指纹时 IP 黑名单仍应生效(F2)");
+        assert_eq!(resp.unwrap().status(), StatusCode::FORBIDDEN);
+
+        // 场景 B:机器码黑名单命中——按真实 IP 重算的码,关指纹也拦。
+        set_ip_blocklist(&[]);
+        let code = crate::usage::machine_code_of(Some("223.73.32.14"), None);
+        set_machine_code_blocklist(&[code.clone()]);
+        let resp = security_block_response(&headers, proxy_peer);
+        assert!(resp.is_some(), "关指纹时机器码黑名单仍应生效(F2)");
+        assert_eq!(resp.unwrap().status(), StatusCode::FORBIDDEN);
+
+        // 场景 C:都不命中→放行(None)。
+        set_machine_code_blocklist(&[]);
+        assert!(security_block_response(&headers, proxy_peer).is_none(), "未命中应放行");
+
+        // 恢复全局状态,避免污染其它测试。
+        set_ip_blocklist(&[]);
+        set_machine_code_blocklist(&[]);
+        COLLECT_CLIENT_FINGERPRINT.store(saved, Ordering::Relaxed);
+    }
+
+    // A1 回归:业务层客户端 IP 取 XFF **最右**(不可伪造),客户端伪造的最左前缀不改变封禁。
+    // A2 回归:对端是可信反代(私网)才采信 XFF;公网直连忽略伪造 XFF 用对端。
+    #[test]
+    fn test_trusted_client_ip_a1_a2_forgery_resistance() {
+        use axum::http::HeaderMap;
+        use std::net::SocketAddr;
+
+        let _guard = BLOCKLIST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let proxy_peer: Option<SocketAddr> = Some("127.0.0.1:8990".parse().unwrap());
+
+        // A1:反代后,XFF = "<客户端伪造>, <反代追加的真实IP>",取最右=真实 IP。
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "8.8.8.8, 203.0.113.7".parse().unwrap());
+        assert_eq!(
+            trusted_client_ip(&h, proxy_peer).as_deref(),
+            Some("203.0.113.7"),
+            "反代后应取 XFF 最右真实 IP,不受最左伪造影响"
+        );
+
+        // A1 核心:攻击者把自己真实流量伪装成被封 IP——无论前缀怎么伪造,判定结果不变。
+        set_ip_blocklist(&["203.0.113.7/32".to_string()]);
+        let mut forged = HeaderMap::new();
+        // 攻击者(真实 203.0.113.7)想改前缀嫁祸/绕过:仍被反代把真实 IP 追加到最右。
+        forged.insert("x-forwarded-for", "1.2.3.4, 203.0.113.7".parse().unwrap());
+        assert!(
+            security_block_response(&forged, proxy_peer).is_some(),
+            "伪造前缀不能绕过对真实最右 IP 的封禁"
+        );
+        set_ip_blocklist(&[]);
+
+        // A2:对端是公网(客户端直连,非反代)→ 忽略可伪造的 XFF,用对端 IP。
+        let public_peer: Option<SocketAddr> = Some("198.51.100.22:5000".parse().unwrap());
+        let mut spoof = HeaderMap::new();
+        spoof.insert("x-forwarded-for", "10.0.0.1, 203.0.113.7".parse().unwrap());
+        assert_eq!(
+            trusted_client_ip(&spoof, public_peer).as_deref(),
+            Some("198.51.100.22"),
+            "公网直连应忽略 XFF,用对端 IP(防直连客户端伪造 XFF)"
+        );
+
+        // 直连无 XFF → 回退对端。
+        let empty = HeaderMap::new();
+        assert_eq!(
+            trusted_client_ip(&empty, public_peer).as_deref(),
+            Some("198.51.100.22"),
+            "无 XFF 应回退对端 IP"
+        );
     }
 }
 

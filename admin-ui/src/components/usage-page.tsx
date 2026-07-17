@@ -24,8 +24,11 @@ import {
   ChevronRight,
   ChevronDown,
   Server,
+  Copy,
+  Check,
   type LucideIcon,
 } from 'lucide-react'
+import { copyToClipboard } from '@/lib/utils'
 import { ClaudeCodeIcon, OpenCodeIcon } from '@/components/overview/brand-icons'
 import { Card } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -467,6 +470,15 @@ function MachineBreakdown({
       next.has(k) ? next.delete(k) : next.add(k)
       return next
     })
+  // 机器码复制反馈：记录刚复制的机器码，短暂显示 ✓。
+  const [copiedCode, setCopiedCode] = useState<string | null>(null)
+  const copyCode = async (code: string) => {
+    const ok = await copyToClipboard(code)
+    if (ok) {
+      setCopiedCode(code)
+      setTimeout(() => setCopiedCode((c) => (c === code ? null : c)), 1500)
+    }
+  }
   if (machines.length === 0) {
     return <p className="text-sm text-muted-foreground">{t('usagepage.machine.noData')}</p>
   }
@@ -502,16 +514,49 @@ function MachineBreakdown({
             {open && (
               <div className="border-t border-border/50 px-3 py-2.5 text-[11px]">
                 <div className="mb-2">
-                  <div className="mb-1 text-muted-foreground">{t('usagepage.machine.seenIps')}</div>
-                  <div className="flex flex-wrap gap-1.5">
-                    {m.ips.length === 0 ? (
-                      <span className="text-muted-foreground/60">—</span>
-                    ) : (
-                      m.ips.map((ip) => (
-                        <span key={ip} className="rounded bg-secondary px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-foreground">{ip}</span>
-                      ))
-                    )}
+                  <div className="mb-1 text-muted-foreground">
+                    {t('usagepage.machine.machineCode')}
+                    <span className="ml-1 text-muted-foreground/50">{t('usagepage.machine.machineCodeHint')}</span>
                   </div>
+                  {/* 每个见过的 IP 各一行:IP + 该 IP 的机器码 + 复制。复制哪个就精准封哪个 IP
+                      (与入口按当前请求 IP 重算的拦截口径一一对应,漫游多 IP 逐个可封)。 */}
+                  {m.ipCodes.length > 0 ? (
+                    <div className="space-y-1">
+                      {m.ipCodes.map(({ ip, code }) => (
+                        <div key={ip} className="flex items-center gap-1.5">
+                          <span className="w-32 shrink-0 truncate font-mono text-[10px] tabular-nums text-muted-foreground/80" title={ip}>{ip}</span>
+                          <span className="rounded bg-secondary px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-foreground">{code}</span>
+                          <button
+                            onClick={() => copyCode(code)}
+                            title={t('usagepage.machine.copyCodeTitle')}
+                            className="inline-flex items-center gap-1 rounded border border-border/60 px-1.5 py-0.5 text-[10px] text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+                          >
+                            {copiedCode === code ? (
+                              <><Check className="h-3 w-3 text-emerald-400" />{t('usagepage.machine.copied')}</>
+                            ) : (
+                              <><Copy className="h-3 w-3" />{t('usagepage.machine.copyCode')}</>
+                            )}
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    /* 无 IP(device/unknown 兜底键)时,退回展示主键码。 */
+                    <div className="flex items-center gap-1.5">
+                      <span className="rounded bg-secondary px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-foreground">{m.machineCode}</span>
+                      <button
+                        onClick={() => copyCode(m.machineCode)}
+                        title={t('usagepage.machine.copyCodeTitle')}
+                        className="inline-flex items-center gap-1 rounded border border-border/60 px-1.5 py-0.5 text-[10px] text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+                      >
+                        {copiedCode === m.machineCode ? (
+                          <><Check className="h-3 w-3 text-emerald-400" />{t('usagepage.machine.copied')}</>
+                        ) : (
+                          <><Copy className="h-3 w-3" />{t('usagepage.machine.copyCode')}</>
+                        )}
+                      </button>
+                    </div>
+                  )}
                 </div>
                 {m.sessions.length > 0 && (
                   <div>
