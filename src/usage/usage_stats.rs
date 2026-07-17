@@ -39,6 +39,40 @@ const THROUGHPUT_BUCKETS: usize = 60;
 const THROUGHPUT_BUCKET_SECS: i64 = 1;
 
 const HOUR_MS: i64 = 3_600_000;
+
+/// 机器码派生（单一真相源）——供「按机器」视图展示与入口黑名单判定共用同一套派生逻辑，
+/// 保证展示出来能复制的码与拦截时重算的码永远一致（绝不漂移）。
+///
+/// - `derive_machine_key`：与 [`ClientAgg::machine_key_of`] 同口径（IP 优先 → device 兜底 → unknown），
+///   但接受裸字段，便于 handlers 在入口不构造 RequestRecord 也能算。
+/// - `machine_code`：`MC-` + `SHA256(machine_key)` 前 12 位十六进制。稳定、可复制、不暴露裸 IP。
+pub fn derive_machine_key(client_ip: Option<&str>, client_device: Option<&str>) -> String {
+    if let Some(ip) = client_ip {
+        if !ip.is_empty() {
+            return ip.to_string();
+        }
+    }
+    if let Some(dev) = client_device {
+        if !dev.is_empty() {
+            return dev.to_string();
+        }
+    }
+    "unknown".to_string()
+}
+
+/// 由 machine_key 派生机器码：`MC-` + SHA256 十六进制前 12 位。
+pub fn machine_code(machine_key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(machine_key.as_bytes());
+    let hex = hex::encode(hasher.finalize());
+    format!("MC-{}", &hex[..12])
+}
+
+/// 便捷封装：直接由裸客户端字段派生机器码。
+pub fn machine_code_of(client_ip: Option<&str>, client_device: Option<&str>) -> String {
+    machine_code(&derive_machine_key(client_ip, client_device))
+}
 const DAY_MS: i64 = 86_400_000;
 
 /// 聚合指标（小时桶 / 天桶 / 模型 / 凭据 共用的累加字段）
@@ -361,17 +395,8 @@ impl ClientAgg {
     /// 分隔并对空字段留空段，保证同画像稳定映射到同一 key。
     fn machine_key_of(r: &RequestRecord) -> String {
         // 以 IP 为主键(每个 IP = 一台真实机器);无 IP 时回退 device;都无则 unknown。
-        if let Some(ip) = r.client_ip.as_deref() {
-            if !ip.is_empty() {
-                return ip.to_string();
-            }
-        }
-        if let Some(dev) = r.client_device.as_deref() {
-            if !dev.is_empty() {
-                return dev.to_string();
-            }
-        }
-        "unknown".to_string()
+        // 复用 [`derive_machine_key`] 保持与机器码派生同口径(单一真相源,绝不漂移)。
+        derive_machine_key(r.client_ip.as_deref(), r.client_device.as_deref())
     }
 
     /// 本条记录是否带真实 client_ip(唯一稳定的机器区分信号)。
@@ -739,11 +764,26 @@ pub struct ClientRpm {
 /// 与 [`ClientRpm`]（按 IP 分组）的关键区别：分组主键是**设备画像派生的
 /// machine_key**（不含 IP），IP 只作 [`ips`] 列表展示；同一 session 一旦归属某机器，
 /// 后续换 IP 仍归该机器。供前端「机器指纹分组」视图使用。
+///
+/// 单个 IP → 机器码映射。用于漫游机器（多 IP）逐 IP 展示可复制的封禁码。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineIpCode {
+    /// 该 IP 字符串
+    pub ip: String,
+    /// 该 IP 派生的机器码（`machine_code(ip)`，入口按当前请求 IP 重算时命中的正是它）
+    pub code: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MachineRpm {
     /// 机器分组键（设备画像派生，稳定标识一台机器）
     pub machine_key: String,
+    /// 机器码（`MC-` + SHA256 前 12 位，可复制、用于黑名单封禁；不暴露裸 IP）。
+    /// 对应 [`machine_key`]。当机器见过多个 IP（漫游）时，主键码只覆盖粘滞 IP，
+    /// 封禁其它 IP 需用 [`ip_codes`] 里对应 IP 的码——因为入口拦截按**当前请求 IP** 重算。
+    pub machine_code: String,
     /// 设备类型（如 claude-code）
     pub device: Option<String>,
     /// 操作系统细分（如 Windows）
@@ -752,6 +792,10 @@ pub struct MachineRpm {
     pub browser: Option<String>,
     /// 这台机器见过的所有 IP（升序去重）
     pub ips: Vec<String>,
+    /// 每个见过的 IP 各自的机器码（`ip → machine_code(ip)`，与 [`ips`] 同序）。
+    /// 前端应展示每个 IP 的码供复制：复制哪个 IP 的码就精准封哪个 IP，
+    /// 与入口「按当前请求 IP 重算」的拦截口径一一对应（漫游多 IP 也能逐个封）。
+    pub ip_codes: Vec<MachineIpCode>,
     /// 该机器最近 60 秒请求数（RPM，聚合其所有窗口）
     pub rpm: u32,
     /// 活跃窗口数（distinct session_id，近 10 分钟内有请求）
@@ -1184,12 +1228,24 @@ impl UsageStats {
                 .unwrap_or((None, None, None, Vec::new()));
             ips.sort();
 
+            // 每个见过的 IP 各派生一个码：复制哪个 IP 的码就封哪个 IP，与入口「按当前请求 IP
+            // 重算」的拦截口径一一对应（漫游机器多 IP 时逐个可封，不留绕过缺口）。
+            let ip_codes: Vec<MachineIpCode> = ips
+                .iter()
+                .map(|ip| MachineIpCode {
+                    ip: ip.clone(),
+                    code: machine_code(ip),
+                })
+                .collect();
+
             out.push(MachineRpm {
+                machine_code: machine_code(machine_key),
                 machine_key: machine_key.clone(),
                 device,
                 os,
                 browser,
                 ips,
+                ip_codes,
                 rpm,
                 active_sessions: sessions.len(),
                 sessions,
@@ -1809,6 +1865,88 @@ mod tests {
         assert_eq!(snap.current_rpm, 1, "只应看到新记录");
         let last = snap.recent_buckets.last().unwrap();
         assert_eq!(last.tokens, 7);
+    }
+
+    #[test]
+    fn test_machine_code_derivation_stable_and_format() {
+        // 机器码格式：MC- + 12 位十六进制，稳定可复制。
+        let code = machine_code_of(Some("203.0.113.23"), Some("claude-code"));
+        assert!(code.starts_with("MC-"), "机器码应以 MC- 开头: {code}");
+        assert_eq!(code.len(), 15, "机器码应为 MC- + 12 位: {code}");
+        assert!(
+            code[3..].chars().all(|c| c.is_ascii_hexdigit()),
+            "MC- 之后应全为十六进制: {code}"
+        );
+
+        // 确定性：同输入永远同码。
+        assert_eq!(code, machine_code_of(Some("203.0.113.23"), Some("claude-code")));
+
+        // IP 优先：有 IP 时 device 不影响码（machine_key = IP）。
+        assert_eq!(
+            machine_code_of(Some("203.0.113.23"), Some("claude-code")),
+            machine_code_of(Some("203.0.113.23"), Some("vscode")),
+            "有 IP 时机器码只由 IP 决定"
+        );
+
+        // 无 IP 回退 device；都无回退 unknown，三者互不相同。
+        let by_device = machine_code_of(None, Some("claude-code"));
+        let by_unknown = machine_code_of(None, None);
+        assert_ne!(code, by_device);
+        assert_ne!(by_device, by_unknown);
+        assert_eq!(by_unknown, machine_code("unknown"));
+
+        // machines_at 填充的 machine_code 与独立派生一致（展示=拦截同一真相源）。
+        let s = UsageStats::new(std::env::temp_dir().join(format!(
+            "kiro_mc_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        )));
+        s.on_record(&rec_machine(1_000, Some("w1"), Some("203.0.113.23"), Some("claude-code"), None, None));
+        let machines = s.machines_at(BASE_MS + 1_000);
+        let m = machines.iter().find(|m| m.machine_key == "203.0.113.23").unwrap();
+        assert_eq!(m.machine_code, machine_code("203.0.113.23"));
+    }
+
+    #[test]
+    fn test_machine_ip_codes_cover_every_roaming_ip() {
+        // F1 回归:同一 session 漫游多 IP 会被粘滞合并成一台机器(主键=首个真实 IP)。
+        // 主键 machine_code 只覆盖粘滞 IP,但入口拦截按**当前请求 IP** 重算——若只暴露主键码,
+        // 客户端换到第二个 IP 就绕过封禁。修复=ip_codes 对每个见过的 IP 各给一个码,
+        // 每个码 == 入口按该 IP 重算的码,逐个可封,无绕过缺口。
+        let s = UsageStats::new(std::env::temp_dir().join(format!(
+            "kiro_mc_roam_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        )));
+        // 同一 session "roam" 先后用两个 IP(DHCP/VPN 漫游)→ 合并为一台机器,ips 收两个。
+        s.on_record(&rec_machine(0, Some("roam"), Some("203.0.113.13"), Some("claude-code"), None, None));
+        s.on_record(&rec_machine(1_000, Some("roam"), Some("203.0.113.99"), Some("claude-code"), None, None));
+
+        let machines = s.machines_at(BASE_MS + 1_000);
+        // 该机器(粘滞主键=首个真实 IP 203.0.113.13)应收录两个漫游 IP。
+        let m = machines
+            .iter()
+            .find(|m| m.machine_key == "203.0.113.13")
+            .expect("漫游应合并到首个真实 IP 机器");
+        assert!(m.ips.contains(&"203.0.113.13".to_string()));
+        assert!(m.ips.contains(&"203.0.113.99".to_string()), "第二个漫游 IP 应被收录: {:?}", m.ips);
+
+        // 关键:ip_codes 覆盖每个见过的 IP,且每个码 == 入口按该 IP 重算的码。
+        for ip in &m.ips {
+            let entry = m
+                .ip_codes
+                .iter()
+                .find(|c| &c.ip == ip)
+                .unwrap_or_else(|| panic!("ip_codes 应覆盖每个见过的 IP,缺 {ip}"));
+            assert_eq!(
+                entry.code,
+                machine_code_of(Some(ip), None),
+                "IP {ip} 的展示码必须 == 入口按当前 IP 重算的码(否则封禁绕过)"
+            );
+        }
+        // 第二个漫游 IP 的码 ≠ 主键码(否则会误以为拉黑主键就够)。
+        let second_code = m.ip_codes.iter().find(|c| c.ip == "203.0.113.99").unwrap();
+        assert_ne!(second_code.code, m.machine_code, "漫游第二 IP 的码应独立于主键码");
     }
 }
 

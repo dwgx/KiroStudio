@@ -2579,8 +2579,12 @@ impl MultiTokenManager {
             return Ok((credentials, token));
         }
 
-        // 需刷新：委托带守卫的唯一刷新实现（? 保 RefreshTokenInvalidError 原样上抛）
-        self.refresh_token_locked(id, None).await?;
+        // 需刷新：委托带守卫的唯一刷新实现（? 保 RefreshTokenInvalidError 原样上抛）。
+        // A3/C2 修复：传 Some(10)(与上面热路径进入条件 expiring_within(10) 同阈值)。这样
+        // 过期风暴下多个请求排队等 refresh_lock 时,出队者拿锁后会二次检查——若前一个 waiter
+        // 已刷新成功(token 不再 10min 内到期),直接返回 Skipped,**不再各自重打一次上游 refresh**
+        // (消除惊群放大 429/refresh_failure_count)。传 None 会跳过该重检导致逐个重刷。
+        self.refresh_token_locked(id, Some(10)).await?;
 
         // 重读取最新凭据（可能由本次刷新或其它并发路径刷新完成）
         let refreshed = {
@@ -5215,9 +5219,13 @@ impl MultiTokenManager {
         // 的 refresh_token 而失败)。参考 kiro-account-manager tasks/token_refresh.rs 的守卫。
         let refresh_token_snapshot = credentials.refresh_token.clone();
 
-        // 条件刷新（后台预刷新）：token 已不再将过期 → 跳过，避免重复刷新
+        // 条件刷新：拿锁后二次确认 token 仍将在 lead 内过期才刷,否则跳过(避免惊群重刷)。
+        // unwrap_or(**true**):expires_at 缺失/不可解析时视为"需刷新"不跳过,与热路径进入判定
+        // is_token_expired(unwrap_or=true) 同口径——否则 A3/C2 修复会把 expiry 未知的凭据误跳过
+        // 导致该刷不刷、返回陈旧 token。(后台预刷新在 :4900 已用 unwrap_or(false) 预筛,expiry
+        // 未知的凭据根本不会进预刷新,故此处改 true 不会引发后台重刷。)
         if let Some(lead) = conditional_lead {
-            if !is_token_expiring_within(&credentials, lead).unwrap_or(false) {
+            if !is_token_expiring_within(&credentials, lead).unwrap_or(true) {
                 return Ok(RefreshOutcome::Skipped);
             }
         }
@@ -5807,6 +5815,57 @@ mod tests {
         assert!(
             err.to_string().contains("refreshToken 已被截断"),
             "应命中刷新委托路径的 validate 报错（证明进入了刷新而非热路径），实际: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refresh_conditional_skips_when_peer_already_refreshed() {
+        // A3/C2 回归:模拟惊群第二个 waiter——出队拿锁时 token 已被前一个 waiter 刷新成新鲜。
+        // ensure_valid_token 现在传 Some(10),故拿锁后的条件重检应 Skipped、**不再重打上游刷新**。
+        // (旧代码 ensure_valid 传 None → 无条件刷新 → 该测试若把 lead 换 None 会走网络失败。)
+        let mut cred = KiroCredentials::default();
+        cred.refresh_token = Some("r".repeat(120));
+        cred.access_token = Some("already_fresh".to_string());
+        // 关键:token 已新鲜(1 小时后过期),等价于"前一个 waiter 刚刷好"。
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(Config::default(), vec![cred], None, None, true)
+            .expect("构造 manager");
+
+        // 与 ensure_valid_token 同阈值 Some(10):新鲜 → Skipped,无网络。
+        let outcome = manager
+            .refresh_token_locked(1, Some(10))
+            .await
+            .expect("新鲜 token 条件刷新应跳过,不报错");
+        assert_eq!(
+            outcome,
+            RefreshOutcome::Skipped,
+            "惊群出队者遇已刷新的新鲜 token 应跳过(消除重复刷新)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refresh_conditional_does_not_skip_on_unknown_expiry() {
+        // A3/C2 边界:expires_at 不可解析时,条件重检必须**不跳过**(unwrap_or(true)),
+        // 与热路径 is_token_expired(unwrap_or=true) 同口径——否则 expiry 未知的凭据会被
+        // 误跳过、该刷不刷、返回陈旧 token。旧实现 unwrap_or(false) 会错误 Skipped,此测试会失败。
+        // 用短 refresh_token(<100)让底层 validate 在任何网络前 bail,从而无网络地证明"进入了刷新"。
+        let mut cred = KiroCredentials::default();
+        cred.refresh_token = Some("short".to_string()); // <100 → validate 阶段即 bail
+        cred.access_token = Some("stale".to_string());
+        cred.expires_at = Some("not-a-date".to_string()); // 不可解析 → expiring_within=None
+
+        let manager = MultiTokenManager::new(Config::default(), vec![cred], None, None, true)
+            .expect("构造 manager");
+
+        let err = manager
+            .refresh_token_locked(1, Some(10))
+            .await
+            .expect_err("expiry 未知应进入刷新(而非 Skipped),因 refresh_token 截断而失败");
+        assert!(
+            err.to_string().contains("refreshToken 已被截断"),
+            "应进入真实刷新路径的 validate 报错(证明未被条件重检误跳过),实际: {}",
             err
         );
     }
