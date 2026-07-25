@@ -87,6 +87,26 @@ pub struct ModelSpec {
 pub static CATALOG: &[ModelSpec] = &[
     // ===== Opus 系(2.20x 最贵) =====
     ModelSpec {
+        kiro_id: "claude-opus-5",
+        family: Family::Opus,
+        version: Some((5, 0)),
+        aliases: &[
+            "claude-opus-5",
+            "claude-opus-5-0",
+            "claude-opus-5-20260715",
+            "opus-5",
+            "opus-5-0",
+        ],
+        owned_by: "anthropic",
+        display_name: "Claude Opus 5",
+        context_window: 1_000_000,
+        max_output: 128_000,
+        credit_mult: 2.20,
+        supports_thinking: true,
+        supports_1m: true,
+        advertised: true,
+    },
+    ModelSpec {
         kiro_id: "claude-opus-4.8",
         family: Family::Opus,
         version: Some((4, 8)),
@@ -816,6 +836,26 @@ mod tests {
         assert_eq!(kid("claude-sonnet-4-20250514"), Some("claude-sonnet-4.0"), "旧带日期名归 4.0 不再静默升级");
         assert_eq!(kid("auto"), Some("auto"));
         assert_eq!(kid("claude-auto"), Some("auto"));
+    }
+
+    #[test]
+    fn test_opus5_mapping() {
+        // Opus 5 精确别名命中
+        assert_eq!(kid("claude-opus-5"), Some("claude-opus-5"));
+        assert_eq!(kid("claude-opus-5-0"), Some("claude-opus-5"));
+        assert_eq!(kid("claude-opus-5-20260715"), Some("claude-opus-5"));
+        assert_eq!(kid("opus-5"), Some("claude-opus-5"));
+        assert_eq!(kid("opus-5-0"), Some("claude-opus-5"));
+        // 1M 变体
+        assert!(resolve("claude-opus-5[1m]").unwrap().is_1m);
+        // 无版本 opus 回退应指向最新 = Opus 5
+        assert_eq!(resolve("claude-opus").unwrap().spec.kiro_id, "claude-opus-5");
+        // 参数正确
+        let r = resolve("claude-opus-5").unwrap();
+        assert_eq!(r.spec.family, Family::Opus);
+        assert_eq!(r.spec.version, Some((5, 0)));
+        assert_eq!(r.spec.context_window, 1_000_000);
+        assert!(r.spec.supports_thinking);
     }
 
     #[test]
