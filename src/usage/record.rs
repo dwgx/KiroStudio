@@ -30,6 +30,10 @@ pub enum RequestOutcome {
     NetworkError,
     /// 其它/未分类失败
     OtherError,
+    /// 模型容量暂时不可用（503 MODEL_TEMPORARILY_UNAVAILABLE）
+    ///
+    /// 全局容量问题，非凭据问题。不影响凭据健康分，独立于 ServerError 便于可观测。
+    ModelUnavailable,
 }
 
 impl RequestOutcome {
@@ -49,6 +53,7 @@ impl RequestOutcome {
             RequestOutcome::BadRequest => "bad_request",
             RequestOutcome::NetworkError => "network_error",
             RequestOutcome::OtherError => "other_error",
+            RequestOutcome::ModelUnavailable => "model_unavailable",
         }
     }
 }

@@ -78,6 +78,15 @@ pub trait KiroEndpoint: Send + Sync {
         default_is_client_validation_error(body)
     }
 
+    /// 判断响应体是否表示"模型暂时不可用"（503 MODEL_TEMPORARILY_UNAVAILABLE）。
+    ///
+    /// 这是**全局容量**问题（模型实例过载或预热中），**非**凭据级问题——所有凭据对
+    /// 同一模型都会同等受影响。命中时应：使用慢速退避重试（1s base），且**不**调用
+    /// `report_failure` / `report_rate_limited_with_retry_after`，避免健康分被无辜拖低。
+    fn is_model_temporarily_unavailable(&self, body: &str) -> bool {
+        default_is_model_temporarily_unavailable(body)
+    }
+
     /// 判断响应体是否表示"该凭据不能服务此模型"（`INVALID_MODEL_ID`）。
     ///
     /// 典型成因：该号的订阅被上游取消/降级，原本能用的模型（如 opus）不再对它开放，
@@ -236,6 +245,15 @@ pub fn default_is_temporary_rate_limit(body: &str) -> bool {
 /// 命中即视为请求构造问题：立即终止，换号/重试都无意义。
 pub fn default_is_client_validation_error(body: &str) -> bool {
     body.contains("TOOL_USE_RESULT_MISMATCH")
+}
+
+/// 默认的 MODEL_TEMPORARILY_UNAVAILABLE 判断逻辑。
+///
+/// 503 且 body 含该信号时表示**模型容量**问题，非凭据问题。
+/// 命中时应走慢速退避，且不影响凭据健康分。
+pub fn default_is_model_temporarily_unavailable(body: &str) -> bool {
+    body.contains("MODEL_TEMPORARILY_UNAVAILABLE")
+        || body.contains("model is temporarily unavailable")
 }
 
 /// 默认的"从错误 body 提取重置秒数"逻辑

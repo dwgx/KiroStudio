@@ -418,6 +418,8 @@ impl CooldownManager {
             let capped_secs = duration_secs.min(self.max_short_cooldown_secs);
             self.scaled_duration(reason, Duration::from_secs(capped_secs))
         } else {
+            // 非自动恢复原因实际走 long_cooldown_secs (86400s = 24h)，
+            // 而非 default_duration() 文档中的值（AuthenticationFailed: 3600s 是参考值不是实际值）。
             // 不可自动恢复的原因：使用长冷却时长
             Duration::from_secs(self.long_cooldown_secs)
         }

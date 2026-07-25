@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
-use super::stream::{BufferedStreamContext, CompletionStatus, SseEvent, StreamContext};
+use super::stream::{BufferedStreamContext, CacheUsageBreakdown, CompletionStatus, SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
 use super::websearch;
 
@@ -823,6 +823,23 @@ pub async fn post_messages(
         payload.tools.as_deref(),
     ) as i32;
 
+    // 估算影子缓存：系统提示 + 历史轮次已被 Bedrock prefix cache 缓存（通过 agentContinuationId）。
+    // 仅在有历史轮次时（messages.len() > 1）估算；首轮返回 0 保守不注入。
+    let prefix_tokens = token::count_prefix_tokens(
+        payload.system.as_deref(),
+        &payload.messages,
+    );
+    let cache_breakdown: Option<CacheUsageBreakdown> = if prefix_tokens > 0 {
+        Some(CacheUsageBreakdown {
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: prefix_tokens.min(input_tokens),
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        })
+    } else {
+        None
+    };
+
     // 检查是否启用了thinking
     let thinking_enabled = payload
         .thinking
@@ -847,6 +864,7 @@ pub async fn post_messages(
                 thinking_enabled,
                 tool_name_map,
                 known_tool_names,
+                cache_breakdown,
                 client,
             )
             .await
@@ -859,6 +877,7 @@ pub async fn post_messages(
                 thinking_enabled,
                 tool_name_map,
                 known_tool_names,
+                cache_breakdown,
                 client,
             )
             .await
@@ -866,7 +885,7 @@ pub async fn post_messages(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = extract_thinking_enabled() && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, client).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, cache_breakdown, client).await
     }
 }
 
@@ -879,6 +898,7 @@ async fn handle_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
+    cache_breakdown: Option<CacheUsageBreakdown>,
     client: ClientInfo,
 ) -> Response {
     // 1M 变体:据原始模型名判定是否注入 anthropic-beta 头(仅受支持的 [1m] 变体为 true)。
@@ -891,6 +911,8 @@ async fn handle_stream_request(
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_full(model, input_tokens, thinking_enabled, tool_name_map, known_tool_names);
+    // 注入影子缓存估算（必须在 generate_initial_events 之前，message_start 才能携带 cache 字段）
+    ctx.set_cache_usage(cache_breakdown);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -1136,6 +1158,7 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    cache_breakdown: Option<CacheUsageBreakdown>,
     client: ClientInfo,
 ) -> Response {
     // 1M 变体:据原始模型名判定是否注入 anthropic-beta 头(仅受支持的 [1m] 变体为 true)。
@@ -1467,11 +1490,24 @@ async fn handle_non_stream_request(
         crate::usage::emit_record(record);
     }
 
-    // 构建 usage（影子缓存记账已移除，不再注入 cache_read/cache_creation 字段）
-    let usage = json!({
-        "input_tokens": final_input_tokens,
+    // 构建 usage（注入影子缓存估算字段，让 Claude Code 显示 cache hits）
+    let billed_input = if let Some(c) = cache_breakdown {
+        super::stream::billed_input_tokens(
+            final_input_tokens,
+            c.cache_creation_input_tokens,
+            c.cache_read_input_tokens,
+        )
+    } else {
+        final_input_tokens
+    };
+    let mut usage = json!({
+        "input_tokens": billed_input,
         "output_tokens": output_tokens
     });
+    if let Some(c) = cache_breakdown {
+        usage["cache_creation_input_tokens"] = json!(c.cache_creation_input_tokens);
+        usage["cache_read_input_tokens"] = json!(c.cache_read_input_tokens);
+    }
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -1668,6 +1704,22 @@ pub async fn post_messages_cc(
         payload.tools.as_deref(),
     ) as i32;
 
+    // 估算影子缓存（与 /v1 路径逻辑一致）
+    let prefix_tokens = token::count_prefix_tokens(
+        payload.system.as_deref(),
+        &payload.messages,
+    );
+    let cache_breakdown: Option<CacheUsageBreakdown> = if prefix_tokens > 0 {
+        Some(CacheUsageBreakdown {
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: prefix_tokens.min(input_tokens),
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        })
+    } else {
+        None
+    };
+
     // 检查是否启用了thinking
     let thinking_enabled = payload
         .thinking
@@ -1688,13 +1740,14 @@ pub async fn post_messages_cc(
             thinking_enabled,
             tool_name_map,
             known_tool_names,
+            cache_breakdown,
             client,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = extract_thinking_enabled() && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, client).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, cache_breakdown, client).await
     }
 }
 
@@ -1710,6 +1763,7 @@ async fn handle_stream_request_buffered(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
+    cache_breakdown: Option<CacheUsageBreakdown>,
     client: ClientInfo,
 ) -> Response {
     // 1M 变体:据原始模型名判定是否注入 anthropic-beta 头(仅受支持的 [1m] 变体为 true)。
@@ -1721,7 +1775,9 @@ async fn handle_stream_request_buffered(
     };
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map, known_tool_names);
+    let mut ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map, known_tool_names);
+    // 注入影子缓存估算（finish_and_get_all_events 回补 message_start 时会携带 cache 字段）
+    ctx.set_cache_usage(cache_breakdown);
 
     // 创建缓冲 SSE 流（流结束时用 meta + 最终 usage 埋点）
     let stream = create_buffered_sse_stream(provider, response, ctx, meta, client);
