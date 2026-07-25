@@ -150,13 +150,20 @@ pub struct UpdatePerformResult {
     pub target_version: Option<String>,
 }
 
+/// OTA 下载二进制的最大允许字节数（200 MiB）。
+/// 防止恶意或被劫持的镜像推超大响应耗尽内存（OOM）。
+const MAX_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
+
 /// 构建一个带超时的 reqwest client（更新走独立 client，30s 超时；不复用 provider 的池）。
 fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .user_agent("KiroStudio-Updater")
         .build()
-        .unwrap_or_default()
+        .unwrap_or_else(|e| {
+            tracing::warn!("[Update] 构建 HTTP 客户端失败: {e}，使用无超时的默认客户端");
+            reqwest::Client::default()
+        })
 }
 
 /// 从 GitHub 拉最近的 tag 列表（按 semver 降序），多镜像回退，全失败返回空。
@@ -281,12 +288,24 @@ async fn download_asset(tag: &str, asset: &str) -> anyhow::Result<Vec<u8>> {
     for (name, url) in asset_candidates(tag, asset) {
         tracing::info!("[Update] 经 {name} 下载 {asset}…");
         match client.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => match resp.bytes().await {
-                Ok(bytes) => {
-                    tracing::info!("[Update] 经 {name} 下载 {asset} 成功（{} 字节）", bytes.len());
-                    return Ok(bytes.to_vec());
+            Ok(resp) if resp.status().is_success() => {
+                // Content-Length 预检：防止恶意/被劫持镜像推超大响应 OOM
+                if let Some(content_length) = resp.content_length() {
+                    if content_length > MAX_DOWNLOAD_BYTES {
+                        last_err = format!(
+                            "{name} Content-Length {content_length} 超过 {MAX_DOWNLOAD_BYTES}，拒绝下载"
+                        );
+                        tracing::warn!("[Update] {last_err}");
+                        continue;
+                    }
                 }
-                Err(e) => last_err = format!("{name} 读取响应体失败: {e}"),
+                match resp.bytes().await {
+                    Ok(bytes) => {
+                        tracing::info!("[Update] 经 {name} 下载 {asset} 成功（{} 字节）", bytes.len());
+                        return Ok(bytes.to_vec());
+                    }
+                    Err(e) => last_err = format!("{name} 读取响应体失败: {e}"),
+                }
             },
             Ok(resp) => last_err = format!("{name} 返回 {}", resp.status()),
             Err(e) => last_err = format!("{name} 请求失败: {e}"),
@@ -316,6 +335,14 @@ async fn download_from_github_direct(tag: &str, asset: &str) -> anyhow::Result<V
     if !resp.status().is_success() {
         anyhow::bail!("直连 GitHub 下载 {asset} 返回 {}", resp.status());
     }
+    // Content-Length 预检（sha256 文件应极小，> 200MiB 必然异常）
+    if let Some(content_length) = resp.content_length() {
+        if content_length > MAX_DOWNLOAD_BYTES {
+            anyhow::bail!(
+                "直连 GitHub 响应体 Content-Length {content_length} 超过 {MAX_DOWNLOAD_BYTES}，拒绝下载"
+            );
+        }
+    }
     let bytes = resp
         .bytes()
         .await
@@ -343,11 +370,11 @@ pub async fn perform_update(target: Option<String>) -> anyhow::Result<UpdatePerf
         None => check.latest_version.clone().ok_or_else(|| anyhow::anyhow!("无最新版本"))?,
     };
 
-    // 已是目标版本 → 免更新
-    if !target_differs(&tag) {
+    // 已是目标版本或目标版本更旧 → 免更新（防降级）
+    if !target_is_newer(&tag) {
         return Ok(UpdatePerformResult {
             success: true,
-            message: format!("已是版本 {tag}，无需更新"),
+            message: format!("当前版本 {LOCAL_VERSION} 已是 {tag} 或更新，无需更新"),
             updated: false,
             target_version: Some(tag),
         });
@@ -440,9 +467,12 @@ pub async fn perform_update(target: Option<String>) -> anyhow::Result<UpdatePerf
     })
 }
 
-/// 目标版本是否与本地不同（相同则免更新）。
-fn target_differs(tag: &str) -> bool {
-    compare_versions(tag, LOCAL_VERSION) != 0
+/// 目标版本是否**比本地新**（只升不降；等于或低于当前版本→免更新，防降级攻击）。
+///
+/// 安全：`perform_update` 接受 admin 传入的任意 tag，若不做版本方向检查，
+/// 持 admin key 的攻击者可把服务降到含已知漏洞的旧版本。
+fn target_is_newer(tag: &str) -> bool {
+    compare_versions(tag, LOCAL_VERSION) > 0
 }
 
 
