@@ -1425,7 +1425,7 @@ impl StreamContext {
                     // 避免在 thinking 块之前产生无意义的 text 块导致客户端解析失败
                     let before_thinking = self.thinking_buffer[..start_pos].to_string();
                     if !before_thinking.is_empty() && !before_thinking.trim().is_empty() {
-                        events.extend(self.create_text_delta_events(&before_thinking));
+                        events.extend(self.emit_non_thinking_text(&before_thinking));
                     }
 
                     // 进入 thinking 块
@@ -1466,13 +1466,13 @@ impl StreamContext {
                         // 前导空白（如 "\n\n"）被错误地创建为 text 块，
                         // 导致 text 块先于 thinking 块出现的问题。
                         if !safe_content.is_empty() && !safe_content.trim().is_empty() {
-                            events.extend(self.create_text_delta_events(&safe_content));
+                            events.extend(self.emit_non_thinking_text(&safe_content));
                             self.thinking_buffer = self.thinking_buffer[safe_len..].to_string();
                         } else if self.thinking_buffer.len() > MAX_THINKING_BUFFER_BYTES {
                             // review Finding 5 修复:上游若持续吐纯空白(无 <thinking>),纯空白分支
                             // 既不 emit 也不收缩 → thinking_buffer 无界增长 OOM(远程 DoS)。
                             // 超上限时把纯空白安全内容按普通文本吐出并收缩,只保留可能的半标签尾巴。
-                            events.extend(self.create_text_delta_events(&safe_content));
+                            events.extend(self.emit_non_thinking_text(&safe_content));
                             self.thinking_buffer = self.thinking_buffer[safe_len..].to_string();
                         }
                     }
@@ -1554,13 +1554,26 @@ impl StreamContext {
                 if !self.thinking_buffer.is_empty() {
                     let remaining = self.thinking_buffer.clone();
                     self.thinking_buffer.clear();
-                    events.extend(self.create_text_delta_events(&remaining));
+                    events.extend(self.emit_non_thinking_text(&remaining));
                 }
                 break;
             }
         }
 
         events
+    }
+
+    /// 非 thinking 文本的统一出口：当 reclaim 开关开且请求带工具时，
+    /// 先进 invoke_sniff_buffer（与非 thinking 路径保持一致），否则直接发 text_delta。
+    /// 这修复了 thinking 模式下 process_content_with_thinking 内部各文本分支
+    /// 直接调用 create_text_delta_events 导致的 invoke_sniff_buffer 旁路 bug。
+    fn emit_non_thinking_text(&mut self, text: &str) -> Vec<SseEvent> {
+        if self.reclaim_enabled && !self.known_tool_names.is_empty() {
+            self.invoke_sniff_buffer.push_str(text);
+            self.drain_invoke_sniff_buffer(false)
+        } else {
+            self.create_text_delta_events(text)
+        }
     }
 
     /// 创建 text_delta 事件
@@ -2777,6 +2790,41 @@ pub(crate) fn repair_tool_json(s: &str) -> Option<String> {
         return serde_json::to_string(&v).ok();
     }
     // 第二层：在字符级修复基础上再补全结构截断（缺 `}` / `]` / 收尾 `"`）。
+    let struct_fixed = repair_json_structure(&char_fixed);
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&struct_fixed) {
+        return serde_json::to_string(&v).ok();
+    }
+    // 第三层：glued 粘连修复（`}{...}` 头部多余 `}` 来自上一个 JSON 对象泄漏）。
+    // 仅在前两层均失败后触发，保守策略：剥离头部 `}` 及其后直到下一个 `{` 之间的垃圾字符，
+    // 剩余部分必须能被 serde_json 解析为合法 JSON 才采用，否则放弃（不比前两层差）。
+    if let Some(glued_fixed) = repair_json_glued(s) {
+        return Some(glued_fixed);
+    }
+    None
+}
+
+/// glued 粘连修复：剥掉头部多余的 `}` 及其后到下一个 `{` 之间的任意字符。
+///
+/// 例：`}{\"path\": \"src/foo.rs\"}` → `{\"path\": \"src/foo.rs\"}`
+///
+/// 保守策略：
+/// - 只在原串（trim 后）以 `}` 开头时尝试。
+/// - 找到第一个 `{` 并截取子串，子串必须 serde_json 解析成功才返回，否则 `None`。
+/// - 不修改原有字符级/结构级修复的结果，仅作为最后兜底。
+fn repair_json_glued(s: &str) -> Option<String> {
+    let trimmed = s.trim_start();
+    if !trimmed.starts_with('}') {
+        return None;
+    }
+    // 找到第一个 '{' 的位置（在原串中，而非 trim 后偏移，保持 slice 安全）。
+    let brace_pos = s.find('{')?;
+    let candidate = &s[brace_pos..];
+    // 对候选串先做字符级修复再验证，与前两层保持一致的处理质量。
+    let char_fixed = repair_json_char_level(candidate);
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&char_fixed) {
+        return serde_json::to_string(&v).ok();
+    }
+    // 字符级修复后仍不合法，再尝试结构层补全（截断 + glued 同时出现的罕见情况）。
     let struct_fixed = repair_json_structure(&char_fixed);
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&struct_fixed) {
         return serde_json::to_string(&v).ok();
@@ -5657,6 +5705,33 @@ mod tests {
         assert!(serde_json::from_str::<serde_json::Value>(bad).is_err(), "前提:孤立低代理非法");
         let fixed = repair_tool_json(bad).expect("孤立低代理应可降级修复");
         assert!(serde_json::from_str::<serde_json::Value>(&fixed).is_ok(), "修复后必合法");
+    }
+
+    /// glued 粘连修复：头部多余 `}` 剥除后得到合法 JSON。
+    #[test]
+    fn test_repair_glued_leading_brace() {
+        let bad = r#"}{"path": "src/foo.rs"}"#;
+        assert!(serde_json::from_str::<serde_json::Value>(bad).is_err(), "前提：glued 串非合法 JSON");
+        let fixed = repair_tool_json(bad).expect("glued 粘连应可修复");
+        let v: serde_json::Value = serde_json::from_str(&fixed).expect("修复后必须是合法 JSON");
+        assert_eq!(v["path"].as_str().unwrap(), "src/foo.rs");
+    }
+
+    /// glued 粘连修复（带空白分隔）：`} {` 变体同样可剥除。
+    #[test]
+    fn test_repair_glued_with_space() {
+        let bad = r#"} {"key": "value"}"#;
+        assert!(serde_json::from_str::<serde_json::Value>(bad).is_err(), "前提：非法");
+        let fixed = repair_tool_json(bad).expect("glued (带空白) 应可修复");
+        let v: serde_json::Value = serde_json::from_str(&fixed).unwrap();
+        assert_eq!(v["key"].as_str().unwrap(), "value");
+    }
+
+    /// glued 修复保守性：`}` 后无 `{` 时返回 None，不乱猜。
+    #[test]
+    fn test_repair_glued_no_opening_brace_returns_none() {
+        let bad = r#"}not_json_at_all"#;
+        assert!(repair_tool_json(bad).is_none(), "无 `{{` 时修复层应返回 None");
     }
 
     /// 洞1:整包双重编码解包——顶层是被字符串编码的 object → 解一层还原。

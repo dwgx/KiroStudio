@@ -70,8 +70,11 @@ impl CooldownReason {
             CooldownReason::ServerError => Duration::from_secs(30),
             CooldownReason::ModelUnavailable => Duration::from_secs(300),
 
-            // 长冷却（1-24 小时）
-            CooldownReason::AuthenticationFailed => Duration::from_secs(3600),
+            // 长冷却（24 小时）
+            // 注意：default_duration() 仅供文档/展示参考。AuthenticationFailed /
+            // AccountSuspended / QuotaExhausted 均属不可自动恢复（is_auto_recoverable=false），
+            // calculate_cooldown_duration 实际走 long_cooldown_secs（= 86400s），而非此处的值。
+            CooldownReason::AuthenticationFailed => Duration::from_secs(86400),
             CooldownReason::AccountSuspended => Duration::from_secs(86400),
             CooldownReason::QuotaExhausted => Duration::from_secs(86400),
         }
@@ -189,6 +192,9 @@ impl CooldownManager {
 
     /// 设置凭据冷却
     ///
+    /// 时长由 `calculate_cooldown_duration` 根据 trigger_count 指数计算，可能比剩余时间更长或更短。
+    /// 若新到期时间 > 已有到期时间则延长冷却；反之保留更长的已有冷却（不缩短）。
+    ///
     /// 返回实际的冷却时长
     pub fn set_cooldown(&self, credential_id: u64, reason: CooldownReason) -> Duration {
         self.set_cooldown_with_duration(credential_id, reason, None)
@@ -296,8 +302,13 @@ impl CooldownManager {
         let duration = custom_duration
             .unwrap_or_else(|| self.calculate_cooldown_duration(reason, entry.trigger_count));
 
-        entry.started_at = now;
-        entry.expires_at = now + duration;
+        let new_expires = now + duration;
+        // 不缩短已有更长的冷却（与 set_transient_cooldown 一致）：若上游 Retry-After 已设定
+        // 更长冷却，自定义时长不应将其覆盖为更短的值。
+        if new_expires > entry.expires_at {
+            entry.started_at = now;
+            entry.expires_at = new_expires;
+        }
 
         tracing::info!(
             credential_id = %credential_id,
