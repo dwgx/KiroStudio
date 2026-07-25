@@ -305,7 +305,7 @@ pub struct Config {
     #[serde(default = "default_tool_stray_repeat_guard")]
     pub tool_stray_repeat_guard: bool,
 
-    /// 工具错误缓解 ②：流式路径工具拼装非法 JSON 时，对齐成失败态。默认关，热更生效。
+    /// 工具错误缓解 ②：流式路径工具拼装非法 JSON 时，对齐成失败态。默认开，热更生效。
     ///
     /// 修既有不对称：非流式工具拼装非法 → 502 失败态；流式却只告警+透传原文、网关记 Success。
     /// 开启后流式也置 UpstreamError{INVALID_TOOL_INPUT} 失败态（用量记 ServerError，不污染成功率），
@@ -313,7 +313,7 @@ pub struct Config {
     #[serde(default = "default_tool_stream_align_failure")]
     pub tool_stream_align_failure: bool,
 
-    /// 工具错误缓解 ③：工具拼装非法时，向客户端补发明确的 SSE error 事件。默认关，热更生效。
+    /// 工具错误缓解 ③：工具拼装非法时，向客户端补发明确的 SSE error 事件。默认开，热更生效。
     ///
     /// 开启后拼装非法时收尾补发 in-band error（而非静默透传坏 JSON），让客户端收到明确失败信号、
     /// 自行退避重试，而不是把坏 JSON 当参数解析报 Invalid tool parameters。需配合 ② 使用效果最佳。
