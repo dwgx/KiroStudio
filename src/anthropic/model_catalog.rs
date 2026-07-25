@@ -814,10 +814,11 @@ mod tests {
 
     #[test]
     fn test_unknown_version_strict_reject_by_default() {
-        // 回归:更新的未知版本(opus-4-9 / opus-5)默认 strict 拒绝,不静默降级到 4.6。
-        // (未设 KIRO_ALLOW_UNKNOWN_VERSION,默认关)
+        // 回归:catalog 未收录的版本默认 strict 拒绝,不静默降级。
+        // claude-opus-4-9 不在目录 → None。
+        // claude-opus-5-0 已作为 claude-opus-5 的别名收录 → Some("claude-opus-5")。
         assert_eq!(kid("claude-opus-4-9"), None);
-        assert_eq!(kid("claude-opus-5-0"), None);
+        assert_eq!(kid("claude-opus-5-0"), Some("claude-opus-5"));
     }
 
     #[test]
