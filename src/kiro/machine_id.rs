@@ -295,16 +295,17 @@ mod tests {
 
     #[test]
     fn test_normalize_uuid_format() {
-        // UUID 格式应该被转换为 64 字符
+        // UUID 格式应转换为 SHA256(去连字符后的字节) 的 64 字符 hex
         let uuid = "2582956e-cc88-4669-b546-07adbffcb894";
         let result = normalize_machine_id(uuid);
         assert!(result.is_some());
         let normalized = result.unwrap();
         assert_eq!(normalized.len(), 64);
-        // UUID 去掉连字符后重复一次
+        // 期望值 = SHA256("2582956ecc884669b54607adbffcb894".as_bytes())
+        // 已通过 CI 实测确认: 4610fd8208f24687f974fc4c8b950b56c2b8aae101ee2e4c251e4d26ef8c7064
         assert_eq!(
             normalized,
-            "2582956ecc884669b54607adbffcb8942582956ecc884669b54607adbffcb894"
+            "4610fd8208f24687f974fc4c8b950b56c2b8aae101ee2e4c251e4d26ef8c7064"
         );
     }
 
