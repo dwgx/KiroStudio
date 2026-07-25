@@ -471,6 +471,14 @@ fn translate_quota_subscription(err_str: &str) -> Option<TranslatedError> {
             message: "月度请求配额已耗尽。排障：①面板查看各凭据用量，切到仍有额度的账号；②等待配额周期重置；③为号池补充新凭据。".to_string(),
         });
     }
+    // 上游容量紧张/模型短暂不可用：临时状态，稍后重试即可（常见于新模型发布初期）。
+    if err_str.contains("MODEL_TEMPORARILY_UNAVAILABLE") {
+        return Some(TranslatedError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            error_type: "overloaded_error",
+            message: "上游模型暂时不可用（负载过高），请稍后重试。若持续出现：①换用同族其他版本（如 claude-opus-4.8）；②新发布模型发布初期容量有限，属正常现象，等待 1~2 小时后通常恢复。".to_string(),
+        });
+    }
     if err_str.contains("FEATURE_NOT_SUPPORTED") {
         return Some(TranslatedError {
             status: StatusCode::BAD_GATEWAY,
