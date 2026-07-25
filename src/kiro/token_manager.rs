@@ -57,6 +57,8 @@ pub(crate) fn is_token_expiring_within(
         .map(|expires| expires <= Utc::now() + Duration::minutes(minutes))
 }
 
+/// 检查 Token 是否即将（5分钟内）过期，非真正已过期。名称有误导性，实为提前刷新触发条件。
+///
 /// Returns whether the credential's token is currently expired (using a 5-minute early window).
 ///
 /// # `expires_at = None` semantics
@@ -262,10 +264,9 @@ async fn refresh_social_token(
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
 
-        // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
+        // 400 + invalid_grant → refreshToken 永久失效
         if status.as_u16() == 400
-            && body_text.contains("\"invalid_grant\"")
-            && body_text.contains("Invalid refresh token provided")
+            && body_text.contains("invalid_grant")
         {
             return Err(RefreshTokenInvalidError {
                 message: format!("Social refreshToken 已失效 (invalid_grant): {}", body_text),
@@ -273,8 +274,15 @@ async fn refresh_social_token(
             .into());
         }
 
+        // 401 = Cognito token 被吊销或已永久过期 → 立即禁用凭据。
+        if status.as_u16() == 401 {
+            return Err(RefreshTokenInvalidError {
+                message: format!("Social refreshToken 已失效 (401 Unauthorized): {}", body_text),
+            }
+            .into());
+        }
+
         let error_msg = match status.as_u16() {
-            401 => "OAuth 凭证已过期或无效，需要重新认证",
             403 => "权限不足，无法刷新 Token",
             429 => "请求过于频繁，已被限流",
             500..=599 => "服务器错误，AWS OAuth 服务暂时不可用",
@@ -490,14 +498,21 @@ async fn refresh_idc_token(
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
 
-        // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
+        // 400 + invalid_grant → refreshToken 永久失效
         // （保留 RefreshTokenInvalidError:调度层据它禁用/标记该号,语义强于通用诊断）。
         if status.as_u16() == 400
-            && body_text.contains("\"invalid_grant\"")
-            && body_text.contains("Invalid refresh token provided")
+            && body_text.contains("invalid_grant")
         {
             return Err(RefreshTokenInvalidError {
                 message: format!("IdC refreshToken 已失效 (invalid_grant): {}", body_text),
+            }
+            .into());
+        }
+
+        // 401 = token 被吊销或已永久过期，不应再重试 → 立即禁用凭据（与 invalid_grant 同语义）。
+        if status.as_u16() == 401 {
+            return Err(RefreshTokenInvalidError {
+                message: format!("IdC refreshToken 已失效 (401 Unauthorized): {}", body_text),
             }
             .into());
         }
@@ -2072,6 +2087,9 @@ impl MultiTokenManager {
                         let neg_p_fine = -((p_weighted * 1000.0) as i64);
                         // 优先级键仅在开关开启时参与首排;关闭时置 0(不影响原有均衡)。
                         let prio_key = if prio_first { e.credentials.priority } else { 0 };
+                        // 末位兜底同样受开关门控:关闭时置 0,确保 priority_in_balanced=false 时
+                        // 优先级在整个排序键中完全不起作用,均衡纯粹由健康/在途/用率决定。
+                        let priority_tiebreaker = if prio_first { e.credentials.priority } else { 0u32 };
                         (
                             unusable,                           // ① 真不可用沉底(优雅溢出)
                             prio_key,                           // ② 开关开:按优先级分层;关:恒 0
@@ -2080,7 +2098,7 @@ impl MultiTokenManager {
                             rpm_usage_permille,                 // ⑤ 已用率低的先选(按容量比例分流)
                             neg_p_fine,                         // ⑥ p_avail 精细兜底(确定性,防抖动)
                             e.success_count,                    // ⑦ 终身成功数
-                            e.credentials.priority,             // ⑧ 优先级末位兜底
+                            priority_tiebreaker,                // ⑧ 优先级末位兜底(同开关门控,关:恒 0)
                         )
                 };
                 // L4:两趟选号。第一趟只在**非饱和**候选里选(硬门,RPM 成真天花板);
@@ -3187,9 +3205,9 @@ impl MultiTokenManager {
             // 429 是瞬态限流，走秒级指数退避；绝不能长冻（真封号走 report_account_suspended）
             self.rate_limiter.record_failure(id, FailureKind::Transient);
         }
-        // 健康：裸 429 走单号 health（family_key 对 IdC 是 cred:{id};对 M365 是族键——
-        // 但普通 429 不像 suspicious 那样整族连坐,这里仍按该号自己的键累计即可,连续达阈值单号跳闸）。
-        self.health.on_429(&self.family_key_of(id));
+        // 健康：裸 429 走单号 health，按该号自己的键累计，不整族连坐。
+        // （族级连坐仅用于 suspicious activity，见 report_family_suspicious）
+        self.health.on_429(&format!("cred:{}", id));
     }
 
     /// 报告凭据触发**账户级可疑活动风控**（`suspicious activity`+`temporary limits`）。
@@ -3401,11 +3419,6 @@ impl MultiTokenManager {
                 false
             }
         };
-        // 设置长冷却（不可自动恢复原因）
-        if self.cooldown_enabled.load(Ordering::Relaxed) {
-            self.cooldown
-                .set_cooldown(id, CooldownReason::AccountSuspended);
-        }
         // 封禁已禁用该凭据，清除其会话亲和性绑定
         self.affinity.remove_by_credential(id);
         self.save_stats_debounced();

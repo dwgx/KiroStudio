@@ -53,8 +53,9 @@ fn normalize_machine_id(machine_id: &str) -> Option<String> {
 
     // UUID 去掉连字符后是 32 字符
     if without_dashes.len() == 32 && without_dashes.chars().all(|c| c.is_ascii_hexdigit()) {
-        // 补齐到 64 字符（重复一次）
-        return Some(format!("{}{}", without_dashes, without_dashes));
+        // SHA256 of the UUID bytes to produce a 64-char hex string
+        let hash = sha2::Sha256::digest(without_dashes.as_bytes());
+        return Some(hex::encode(hash));
     }
 
     // 无法识别的格式

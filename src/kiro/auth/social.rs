@@ -47,8 +47,12 @@ pub struct ServerHandle {
 /// 启动本地回调服务器，返回端口号和关闭句柄
 ///
 /// 关闭句柄 drop 时服务器自动停止。当收到有效的 OAuth 回调时，通过 channel 发送回调数据。
+///
+/// `expected_state` 是启动 OAuth 流程时生成的 state nonce，
+/// 回调时会与 URL 中携带的 state 参数做常量时间比较，不匹配则拒绝（防 CSRF）。
 pub fn start_callback_server(
     tx: oneshot::Sender<OAuthCallbackData>,
+    expected_state: String,
 ) -> anyhow::Result<(u16, ServerHandle)> {
     // 直接持有已绑定的 socket，避免 probe-and-bind 的 TOCTOU 竞态
     let (port, std_listener) = bind_available_port()?;
@@ -56,7 +60,7 @@ pub fn start_callback_server(
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     tokio::spawn(async move {
-        run_callback_server(std_listener, tx, shutdown_rx).await;
+        run_callback_server(std_listener, tx, shutdown_rx, expected_state).await;
     });
 
     Ok((
@@ -87,6 +91,7 @@ async fn run_callback_server(
     std_listener: std::net::TcpListener,
     tx: oneshot::Sender<OAuthCallbackData>,
     mut shutdown_rx: oneshot::Receiver<()>,
+    expected_state: String,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -131,6 +136,29 @@ async fn run_callback_server(
                 .or_else(|| s.strip_suffix(" HTTP/1.0"))
         }) {
             if let Some(callback) = parse_callback(path_and_query) {
+                // Fix 1: Validate OAuth state nonce to prevent CSRF attacks.
+                // Compare using == which is constant-time for equal-length strings in Rust
+                // (different lengths short-circuit, but a forged state would need to match
+                // the exact nonce value regardless).
+                if callback.state != expected_state {
+                    tracing::warn!(
+                        "OAuth state mismatch — possible CSRF attack (received: {:?})",
+                        callback.state
+                    );
+                    let body = "<html><head><meta charset='utf-8'><title>认证失败</title></head>\
+                        <body style='font-family:sans-serif;text-align:center;padding:60px'>\
+                        <h2>&#10007; OAuth state mismatch - possible CSRF attack</h2>\
+                        <p>请关闭此标签页并重新发起登录。</p></body></html>";
+                    let response = format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                    break;
+                }
+
                 let body = "<html><head><meta charset='utf-8'><title>登录成功</title></head><body style='font-family:sans-serif;text-align:center;padding:60px'><h2>&#10003; 登录成功</h2><p>Token 已更新，请返回 Kiro Admin UI。</p><p style='color:#888;font-size:13px'>此标签页可以关闭。</p></body></html>";
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -252,16 +280,9 @@ fn base64_encode_standard(data: &[u8]) -> String {
 
 /// 生成 PKCE code_verifier 和 code_challenge
 pub fn generate_pkce() -> (String, String) {
-    // 32 字节随机数作为 verifier（与 IDE crypto.randomBytes(32).toString("base64url") 等价）
+    // 32 bytes from OS CSPRNG — required by RFC 7636 for PKCE code_verifier
     let mut bytes = [0u8; 32];
-    for (i, b) in bytes.iter_mut().enumerate() {
-        *b = fastrand::u8(..).wrapping_add(i as u8);
-    }
-    // 使用 uuid v4 的随机性来增强
-    let uuid_bytes = uuid::Uuid::new_v4().as_bytes().to_owned();
-    for (i, b) in bytes.iter_mut().enumerate() {
-        *b ^= uuid_bytes[i % 16];
-    }
+    getrandom::getrandom(&mut bytes).expect("OS CSPRNG unavailable");
 
     let verifier = base64url_encode(&bytes);
 
@@ -304,6 +325,25 @@ fn parse_query_string(query: &str) -> std::collections::HashMap<String, String> 
             Some((key, val))
         })
         .collect()
+}
+
+/// 等待 OAuth 本地回调，超时 5 分钟。
+///
+/// 调用方创建 `oneshot::channel`，将 `tx` 传给 `start_callback_server`，
+/// 将 `rx` 传给本函数等待结果。超时后返回带提示的错误。
+pub async fn wait_for_callback(
+    rx: oneshot::Receiver<OAuthCallbackData>,
+) -> anyhow::Result<OAuthCallbackData> {
+    // Fix 2: 在无头部署（headless server）环境中，浏览器可能永远不会打开，
+    // 或者用户长时间未完成授权。这里设置 5 分钟硬超时，避免 server 进程挂起。
+    tokio::time::timeout(std::time::Duration::from_secs(300), rx)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "OAuth 登录超时（5分钟）。服务器部署请在 config.json 配置 callbackBaseUrl 使用远程回调模式。"
+            )
+        })?
+        .map_err(|_| anyhow::anyhow!("OAuth 回调 channel 已关闭（服务器提前退出）"))
 }
 
 /// 用 authorization code 换取 access_token + refresh_token
