@@ -287,6 +287,7 @@ export const PROBE_MODEL_CATALOG: { id: string; mult: string }[] = [
   { id: 'claude-opus-4.6', mult: '2.20x' },
   { id: 'claude-opus-4.7', mult: '2.20x' },
   { id: 'claude-opus-4.8', mult: '2.20x' },
+  { id: 'claude-opus-5', mult: '2.20x' },
 ]
 
 export async function probeAvailableModels(id: number, models?: string[]): Promise<ProbeModelsResponse> {
