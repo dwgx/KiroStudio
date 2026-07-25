@@ -258,12 +258,14 @@ pub struct Config {
     #[serde(default)]
     pub priority_in_balanced: bool,
 
-    /// 是否启用 prompt 缓存记账（默认 true）
+    /// 是否启用 prompt 缓存记账（默认 false）
     ///
     /// Kiro 上游不回传 Anthropic 的 cache_read / cache_creation 记账字段。
     /// 开启后，网关侧维护本地影子缓存表，按凭据推算并注入这些字段，
     /// 让下游客户端（Claude Code 等）能显示缓存命中情况。
     /// 这是估算展示，非真实计费（真实计费以 meteringEvent 为准）。
+    /// 当前默认关：热路径的 build_profile（JSON 规范化 + SHA256 指纹）对超大对话有
+    /// 可观 CPU 开销。开启后结果写入 StreamContext.cache_usage 并注入响应 usage 字段。
     #[serde(default = "default_prompt_cache_enabled")]
     pub prompt_cache_enabled: bool,
 
@@ -475,6 +477,15 @@ pub struct Config {
     #[serde(default)]
     pub compression: CompressionConfig,
 
+    /// MODEL_TEMPORARILY_UNAVAILABLE 重试耗尽时的自动回退模型（可选）。
+    ///
+    /// 设置后，当上游返回 MODEL_TEMPORARILY_UNAVAILABLE 且慢速重试失败时，
+    /// 自动以此模型重试最后一次。留空（默认）则直接透传过载错误给客户端。
+    /// 推荐备用："claude-sonnet-4-5-20251001"（容量池独立，响应更快）。
+    /// 不建议填同族 opus 变体——容量压力通常跨变体共享，切过去大概率同样过载。
+    #[serde(default)]
+    pub overload_fallback_model: Option<String>,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -685,10 +696,12 @@ fn default_rate_limit_min_interval_ms() -> u64 {
 fn default_prompt_cache_enabled() -> bool {
     // 默认关闭影子 prompt 缓存记账。
     // 该记账在请求热路径同步跑 build_profile（逐块 serde 序列化 + canonicalize_json
-    // 递归排序所有 JSON key + SHA256 前缀指纹）,对超大对话(30-40万 token/数百块)
-    // 有可观固定 CPU 开销,叠加在发上游之前。它只影响向下游客户端复现 Anthropic 风格的
-    // cache_read/cache_creation 展示,不影响真实上游 prefix 缓存(那由客户端断点 + Bedrock
-    // 决定,网关左右不了)。默认关以砍掉这块热路径开销;需要展示缓存记账时再显式开启。
+    // 递归排序所有 JSON key + SHA256 前缀指纹），对超大对话（30-40 万 token / 数百块）
+    // 有可观固定 CPU 开销，叠加在发上游之前。它只影响向下游客户端复现 Anthropic 风格的
+    // cache_read / cache_creation 展示，不影响真实上游 prefix 缓存（那由客户端断点 +
+    // Bedrock 决定，网关左右不了）。默认关以砍掉这块热路径开销；需要展示缓存命中统计时
+    // 再显式设 "promptCacheEnabled": true——开启后，记账结果写入 StreamContext.cache_usage
+    // 并在每条响应的 usage 字段注入 cache_read_input_tokens / cache_creation_input_tokens。
     false
 }
 
@@ -864,6 +877,7 @@ impl Default for Config {
             trash_retention_days: default_trash_retention_days(),
             balance_refresh_interval_secs: default_balance_refresh_interval_secs(),
             compression: CompressionConfig::default(),
+            overload_fallback_model: None,
             config_path: None,
         }
     }

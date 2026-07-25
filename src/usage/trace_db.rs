@@ -426,6 +426,7 @@ fn parse_outcome(s: &str) -> RequestOutcome {
         "server_error" => RequestOutcome::ServerError,
         "bad_request" => RequestOutcome::BadRequest,
         "network_error" => RequestOutcome::NetworkError,
+        "model_unavailable" => RequestOutcome::ModelUnavailable,
         _ => RequestOutcome::OtherError,
     }
 }
@@ -553,6 +554,7 @@ mod tests {
             RequestOutcome::BadRequest,
             RequestOutcome::NetworkError,
             RequestOutcome::OtherError,
+            RequestOutcome::ModelUnavailable,
         ];
 
         // 每个变体用递增 ts_ms 插入，读回后按 request_id 建映射逐一校验

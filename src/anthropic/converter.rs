@@ -376,7 +376,8 @@ pub(super) const BILLING_HEADER_PLACEHOLDER: &str = "__anthropic_billing_header_
 /// 若 `text` 以归因头前缀开头（该块整行都是每请求漂移的归因字段），折叠成固定占位符；
 /// 否则原样返回。此函数同时供两处调用：
 /// 1. [`build_history`] 的 system 拼接路径——归一化**转发给上游**的字节，稳定缓存前缀；
-/// 2. [`super::cache_tracker`] 的影子指纹计算——本就归一化，保持两侧一致。
+/// 2. 影子缓存记账路径——本就归一化，保持两侧一致。
+///    // 影子缓存记账已移至 StreamContext.cache_usage (prompt_cache_enabled 开启时)
 ///
 /// 归一化保守：只折叠确定每请求漂移的归因头整块，不触碰其余稳定的 system 内容。
 pub(super) fn canonicalize_billing_header(text: &str) -> &str {
@@ -393,9 +394,10 @@ pub(super) fn canonicalize_billing_header(text: &str) -> &str {
 /// [`super::handlers`] 已验证的进程级原子镜像范式：main 启动按配置写入、admin 改开关
 /// 立即改写、归一化热路径读镜像，无需重启、无锁近零成本。默认 true（与 config 默认一致）。
 ///
-/// **关键**：转发字节路径（[`build_history`]）与影子指纹路径
-/// （[`super::cache_tracker`]）都经由 [`canonicalize_system_text`] 读同一镜像，
+/// **关键**：转发字节路径（[`build_history`]）与影子缓存记账路径
+/// 都经由 [`canonicalize_system_text`] 读同一镜像，
 /// 保证两侧对同一 system 块施加**完全一致**的变换，记账与真实缓存不脱节。
+/// // 影子缓存记账已移至 StreamContext.cache_usage (prompt_cache_enabled 开启时)
 static STRIP_ENV_NOISE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// 设置环境噪音剥离开关（main 启动接线 / admin 热更调用，立即生效，下个请求即读到新值）。

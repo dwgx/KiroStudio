@@ -90,6 +90,18 @@ fn get_or_create_key(key_path: &Path) -> anyhow::Result<[u8; 32]> {
                 .map_err(|e| anyhow::anyhow!("写入密钥文件失败 {:?}: {e}", key_path))?;
             // Unix 已在 open 时 0600;非 Unix 尽力收紧(Windows 为 no-op)。
             crate::common::fs_atomic::restrict_permissions(key_path);
+            // Windows: restrict_permissions 是 no-op（NTFS 无 POSIX ACL），密钥文件无权限保护。
+            #[cfg(windows)]
+            {
+                use std::sync::OnceLock;
+                static WINDOWS_KEY_WARN: OnceLock<()> = OnceLock::new();
+                WINDOWS_KEY_WARN.get_or_init(|| {
+                    tracing::warn!(
+                        "at-rest 加密在 Windows 上密钥文件无 ACL 保护（NTFS 限制），\
+                        任何本地进程均可读取。Linux 已正确设置 0600 权限。"
+                    );
+                });
+            }
             tracing::info!("已生成 at-rest 加密密钥文件: {:?}(0600,勿删,勿随 credentials 导出)", key_path);
             Ok(candidate)
         }

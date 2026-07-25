@@ -227,6 +227,26 @@ pub(crate) fn count_all_tokens_local(
     total.max(1)
 }
 
+/// 估算稳定前缀（系统提示 + 历史轮次）占用的 token 数。
+///
+/// Bedrock prefix cache 缓存的是 [system_prompt] + [messages[0..len-1]]——即当前 user
+/// 消息之前的所有内容。当 `agentContinuationId` 固定（同一会话），连续请求会命中该缓存。
+///
+/// 返回 0 表示第一轮（无历史，缓存尚未建立）；返回正值表示可估算的 cache_read 量。
+pub(crate) fn count_prefix_tokens(
+    system: Option<&[crate::anthropic::types::SystemMessage]>,
+    messages: &[crate::anthropic::types::Message],
+) -> i32 {
+    // 第一轮：没有历史前缀，prefix cache 尚未建立，保守返回 0
+    if messages.len() <= 1 {
+        return 0;
+    }
+    let history_slice = &messages[..messages.len() - 1];
+    let sys_tokens = count_all_tokens_local(system, &[], None);
+    let hist_tokens = count_all_tokens_local(None, history_slice, None);
+    (sys_tokens + hist_tokens) as i32
+}
+
 // 注：TOKENS_PER_TOOL / count_system_message_tokens / count_tool_definition_tokens /
 // count_message_content_tokens / estimate_content_block_tokens 原仅供影子缓存记账
 // （cache_tracker）按块累计使用。影子缓存已整体移除，这些辅助函数一并删除。

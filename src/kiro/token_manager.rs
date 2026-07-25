@@ -420,7 +420,16 @@ async fn refresh_external_idp_token(
             .into());
         }
         let error_msg = match status.as_u16() {
-            401 => "External IdP 凭证已过期或无效，需要重新认证",
+            401 => {
+                // 401 = Microsoft IdP token 被吊销或已永久过期 → 立即禁用凭据（与 invalid_grant 同语义）。
+                return Err(RefreshTokenInvalidError {
+                    message: format!(
+                        "External IdP refreshToken 已失效 (401 Unauthorized): {}",
+                        body_text
+                    ),
+                }
+                .into());
+            }
             403 => "External IdP 权限不足，无法刷新 Token",
             429 => "External IdP 请求过于频繁，已被限流",
             500..=599 => "External IdP 服务暂时不可用",
@@ -1104,6 +1113,13 @@ struct CredentialEntry {
     /// suspicious-activity 风控。重探任务结束(成功/失败/panic)由 guard Drop 清回 false。
     /// 非持久化:进程内并发守卫,重启清零可接受。
     reprobe_in_flight: AtomicBool,
+    /// 凭据级 Token 刷新锁（per-credential）。
+    ///
+    /// 替代 MultiTokenManager 上的全局 refresh_lock：N 个凭据并发刷新时，每个凭据只
+    /// 串行化自己的刷新，彼此不再互相阻塞（消除"凭据 #1 预刷新挂起时，凭据 #N 的按需
+    /// 刷新在全局锁后排队"的队头阻塞问题）。双检守卫（stale-snapshot guard）仍通过
+    /// 「拿锁后二次确认 refresh_token 是否已被他人轮换」实现，语义与旧全局锁完全一致。
+    refresh_lock: Arc<TokioMutex<()>>,
 }
 
 /// 禁用原因
@@ -1288,8 +1304,6 @@ pub struct MultiTokenManager {
     /// 分配只 `fetch_add(1)`。restore(按原 id 恢复) 恒复用 < 计数器的旧 id，不与新号冲突；
     /// 重启后内存态(cooldown/rpm/...)本就全空，计数器从持久化的 max 重新起算，一致且安全。
     next_id: AtomicU64,
-    /// Token 刷新锁，确保同一时间只有一个刷新操作
-    refresh_lock: TokioMutex<()>,
     /// 凭据文件路径（用于回写）
     credentials_path: Option<PathBuf>,
     /// 是否为多凭据格式（数组格式才回写）
@@ -1501,6 +1515,7 @@ impl MultiTokenManager {
                     last_usage_403_feature_not_supported: AtomicBool::new(false),
                     last_full_reprobe_at: Mutex::new(None),
                     reprobe_in_flight: AtomicBool::new(false),
+                    refresh_lock: Arc::new(TokioMutex::new(())),
                 }
             })
             .collect();
@@ -1612,7 +1627,6 @@ impl MultiTokenManager {
             // 计数器起点 = 现有 entries 的 max id + 1（local next_id 已含 id-less 补全后的值）。
             // 回收站(trash)此刻尚未加载，其可能更高的 id 在下方 load_trash() 后再 reconcile。
             next_id: AtomicU64::new(next_id),
-            refresh_lock: TokioMutex::new(()),
             credentials_path,
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
@@ -4580,6 +4594,9 @@ impl MultiTokenManager {
                 Some(machine_id::generate_from_credentials(&validated_cred, &cfg));
         }
 
+        // Track whether a machineId collision was detected and rotation occurred,
+        // so the persist-failure warning can report the correct risk accurately.
+        let mut mid_was_rotated = false;
         {
             let mut entries = self.entries.lock();
             // 指纹去重(防关联):新号指纹若与池中已有号撞车,轮换成独立随机指纹,避免上游
@@ -4589,6 +4606,7 @@ impl MultiTokenManager {
                     .iter()
                     .any(|e| e.credentials.machine_id.as_deref() == Some(mid.as_str()));
                 if collides {
+                    mid_was_rotated = true;
                     let existing: std::collections::HashSet<String> = entries
                         .iter()
                         .filter_map(|e| e.credentials.machine_id.clone())
@@ -4619,11 +4637,30 @@ impl MultiTokenManager {
                 last_usage_403_feature_not_supported: AtomicBool::new(false),
                 last_full_reprobe_at: Mutex::new(None),
                 reprobe_in_flight: AtomicBool::new(false),
+                refresh_lock: Arc::new(TokioMutex::new(())),
             });
         }
 
         // 6. 持久化
-        self.persist_credentials()?;
+        // Change 5: 持久化失败时发出结构化告警而不是硬错误返回，
+        // 以免调用方因磁盘/权限问题无法上号。若 machineId 发生了轮换，
+        // 仅内存中有新指纹；重启后 reconcile 会重新检测碰撞并再次轮换，
+        // 但重启前的指纹将恢复旧值（漂移风险），故区分两种情况分别告警。
+        if let Err(e) = self.persist_credentials() {
+            if mid_was_rotated {
+                tracing::warn!(
+                    credential_id = new_id,
+                    "machineId 轮转后持久化失败，重启后指纹将漂移。建议手动检查凭据文件权限。error = {}",
+                    e
+                );
+            } else {
+                tracing::warn!(
+                    credential_id = new_id,
+                    "add_credential 持久化失败，重启前新增的凭据将丢失。建议检查凭据文件权限。error = {}",
+                    e
+                );
+            }
+        }
 
         tracing::info!("成功添加凭据 #{}", new_id);
         Ok(new_id)
@@ -4735,6 +4772,7 @@ impl MultiTokenManager {
                     last_usage_403_feature_not_supported: AtomicBool::new(false),
                     last_full_reprobe_at: Mutex::new(None),
                     reprobe_in_flight: AtomicBool::new(false),
+                    refresh_lock: Arc::new(TokioMutex::new(())),
                 });
             }
             return Err(e.context("回收站落盘失败，已回滚删除操作"));
@@ -4859,6 +4897,7 @@ impl MultiTokenManager {
                 last_usage_403_feature_not_supported: AtomicBool::new(false),
                 last_full_reprobe_at: Mutex::new(None),
                 reprobe_in_flight: AtomicBool::new(false),
+                refresh_lock: Arc::new(TokioMutex::new(())),
             });
         }
 
@@ -5245,16 +5284,19 @@ impl MultiTokenManager {
         id: u64,
         conditional_lead: Option<i64>,
     ) -> anyhow::Result<RefreshOutcome> {
-        // 快速存在性检查（无锁）
-        {
+        // 快速存在性检查（无锁），同时取出该凭据的 per-credential 刷新锁。
+        // Arc clone 出来后无需持有 entries 锁，await 期间不阻塞其他凭据的 entries 读写。
+        let cred_refresh_lock = {
             let entries = self.entries.lock();
-            if !entries.iter().any(|e| e.id == id) {
-                anyhow::bail!("凭据不存在: {}", id);
-            }
-        }
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| Arc::clone(&e.refresh_lock))
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
 
-        // 获取刷新锁防止并发刷新
-        let _guard = self.refresh_lock.lock().await;
+        // 获取该凭据专属的刷新锁——仅串行化同一凭据的并发刷新，不影响其他凭据。
+        let _guard = cred_refresh_lock.lock().await;
 
         // 拿锁后读取当前凭据：请求路径或其它预刷新可能在等锁期间已刷新
         let credentials = {
@@ -5286,8 +5328,71 @@ impl MultiTokenManager {
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
         let cfg = self.config.load_full();
-        let new_creds =
-            refresh_token(&credentials, &cfg, effective_proxy.as_ref()).await?;
+
+        // Change 2: 瞬态错误重试退避（3 次，1s/2s/4s）。
+        // 仅对 5xx 状态码和网络/连接错误重试；400/401/403/429/invalid_grant/DiagnosedError
+        // 属永久性或策略性失败，直接透传给上层（保留 RefreshTokenInvalidError 语义不变）。
+        let new_creds = {
+            const MAX_ATTEMPTS: u32 = 3;
+            let mut last_err: anyhow::Error = anyhow::anyhow!("unreachable");
+            let mut succeeded = false;
+            let mut result_creds = None;
+            for attempt in 0..MAX_ATTEMPTS {
+                match refresh_token(&credentials, &cfg, effective_proxy.as_ref()).await {
+                    Ok(c) => {
+                        result_creds = Some(c);
+                        succeeded = true;
+                        break;
+                    }
+                    Err(e) => {
+                        // 永久/策略失败：不重试，立即透传
+                        if e.downcast_ref::<RefreshTokenInvalidError>().is_some()
+                            || e.downcast_ref::<DiagnosedError>().is_some()
+                        {
+                            return Err(e);
+                        }
+                        // 检查是否为可重试的瞬态错误（5xx 响应体中会含状态码描述，
+                        // 或为网络层 IO 错误）。reqwest 的连接/超时错误均无状态码，
+                        // 凡不属上述永久错误的 anyhow::Error 视为可重试瞬态错误。
+                        let is_5xx = e.to_string().contains("500")
+                            || e.to_string().contains("502")
+                            || e.to_string().contains("503")
+                            || e.to_string().contains("504")
+                            || e.to_string().contains("505")
+                            || e.to_string().contains("服务器错误")
+                            || e.to_string().contains("暂时不可用");
+                        // Exclude all permanent HTTP error codes so they are not retried.
+                        // Any error string not matching these exclusions is treated as a
+                        // transient network/IO error and is eligible for retry.
+                        let is_network = !e.to_string().contains("400")
+                            && !e.to_string().contains("401")
+                            && !e.to_string().contains("403")
+                            && !e.to_string().contains("404")
+                            && !e.to_string().contains("410")
+                            && !e.to_string().contains("422")
+                            && !e.to_string().contains("429")
+                            && !e.to_string().contains("invalid_grant");
+                        if (is_5xx || is_network) && attempt + 1 < MAX_ATTEMPTS {
+                            let backoff_secs = 1u64 << attempt; // 1, 2
+                            tracing::warn!(
+                                "凭据 #{} 刷新瞬态错误（第 {}/{}），{}s 后重试: {}",
+                                id, attempt + 1, MAX_ATTEMPTS, backoff_secs, e
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                            last_err = e;
+                        } else {
+                            last_err = e;
+                            break;
+                        }
+                    }
+                }
+            }
+            if succeeded {
+                result_creds.unwrap()
+            } else {
+                return Err(last_err);
+            }
+        };
 
         // 更新 entries 中对应凭据（写回前校验 refresh_token 未被其它路径抢先轮换）
         {
