@@ -696,7 +696,11 @@ impl KiroCredentials {
             if let Some(arn) = self.profile_arn.as_deref() {
                 let parts: Vec<&str> = arn.split(':').collect();
                 // arn:aws:codewhisperer:{region}:{account}:profile/{id} → 索引 4 = account
-                if parts.len() >= 5 && !parts[4].is_empty() {
+                if parts.len() >= 5
+                    && !parts[4].is_empty()
+                    && parts.len() >= 3
+                    && (parts[2] == "codewhisperer" || parts[2] == "bedrock")
+                {
                     return format!("aws:{}", parts[4]);
                 }
             }
