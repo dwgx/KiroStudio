@@ -138,7 +138,7 @@ impl SocialLoginManager {
             None => {
                 // 本地：起临时 TCP 端口，浏览器在本机回调
                 let (tx, rx) = oneshot::channel::<OAuthCallbackData>();
-                let (port, handle) = social::start_callback_server(tx)?;
+                let (port, handle) = social::start_callback_server(tx, state.clone())?;
                 (
                     format!("http://127.0.0.1:{}", port),
                     Some(handle),
