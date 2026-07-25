@@ -252,7 +252,9 @@ impl GlobalThrottle {
         b.target_rpm = next;
         drop(b);
         self.ai_total.fetch_add(1, Ordering::Relaxed);
-        self.notify.notify_waiters(); // 提速后唤醒排队者
+        // 只唤醒一个排队者:新令牌仅产出了一个(step=+10RPM 可能慢于实际消耗速率),
+        // 其余排队者下次 per_token 定时后自然重试,避免惊群。
+        self.notify.notify_one();
         tracing::debug!(target: "kiro::throttle", "RPM自动升档 {cur}→{next}(上限{ceil})");
     }
 

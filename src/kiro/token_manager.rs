@@ -36,7 +36,16 @@ use crate::kiro::scheduling::{InflightGuard, RpmTracker};
 use crate::kiro::health::HealthTracker;
 use crate::model::config::Config;
 
-/// 检查 Token 是否在指定时间内过期
+/// Returns whether the credential's token expires within the given number of minutes.
+///
+/// Returns `None` in two cases:
+/// - `expires_at` is `None` — the credential carries no expiry field (API key credentials,
+///   or social/IdC credentials whose expiry data is missing or was never set).
+/// - `expires_at` is `Some` but its value fails RFC 3339 parsing (malformed or corrupted
+///   timestamp string). `DateTime::parse_from_rfc3339` returns `Err`; `.ok()` maps that
+///   to `None`, which propagates out through `and_then`.
+///
+/// Callers are responsible for deciding what `None` means in their context via `unwrap_or`.
 pub(crate) fn is_token_expiring_within(
     credentials: &KiroCredentials,
     minutes: i64,
@@ -48,12 +57,44 @@ pub(crate) fn is_token_expiring_within(
         .map(|expires| expires <= Utc::now() + Duration::minutes(minutes))
 }
 
-/// 检查 Token 是否已过期（提前 5 分钟判断）
+/// Returns whether the credential's token is currently expired (using a 5-minute early window).
+///
+/// # `expires_at = None` semantics
+///
+/// `is_token_expiring_within` returns `None` when `expires_at` is absent or unparseable.
+/// This function applies different handling depending on credential type:
+///
+/// - **API key credentials**: `expires_at` is never set because API keys do not expire.
+///   Returning `true` here would trigger a pointless refresh attempt on every request;
+///   `refresh_token()` would immediately fail with "API keys do not support refresh".
+///   Therefore API key credentials short-circuit to `false` before reaching the `unwrap_or`.
+///
+/// - **Social / IdC credentials with missing or corrupted `expires_at`**: after the API key
+///   guard, a `None` result (missing field or RFC 3339 parse failure) is treated as expired
+///   via `unwrap_or(true)`. The fail-safe assumption is that an unreadable expiry means the
+///   token should be refreshed rather than blindly trusted, which is the safer default.
 pub(crate) fn is_token_expired(credentials: &KiroCredentials) -> bool {
+    if credentials.is_api_key_credential() {
+        return false;
+    }
     is_token_expiring_within(credentials, 5).unwrap_or(true)
 }
 
-/// 检查 Token 是否即将过期（10分钟内）
+/// Returns whether the credential's token will expire within the next 10 minutes.
+///
+/// # `expires_at = None` semantics
+///
+/// `is_token_expiring_within` returns `None` when `expires_at` is absent or unparseable.
+/// This function resolves `None` as `false` via `unwrap_or(false)`, meaning:
+///
+/// - **API key credentials**: no `expires_at` field exists; `None` correctly maps to
+///   "not expiring soon" — there is no expiry to proactively refresh against.
+///
+/// - **Social / IdC credentials with missing or corrupted `expires_at`**: a `None` result
+///   is also treated as "not expiring soon". Unlike `is_token_expired` (which defaults to
+///   `true` as a safety measure), proactive background refresh is a best-effort optimisation
+///   and the cost of skipping it is low. Defaulting to `false` avoids spurious refresh
+///   scheduling when expiry information is unavailable.
 pub(crate) fn is_token_expiring_soon(credentials: &KiroCredentials) -> bool {
     is_token_expiring_within(credentials, 10).unwrap_or(false)
 }
