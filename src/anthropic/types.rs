@@ -200,8 +200,9 @@ pub struct Message {
 /// 缓存控制（Anthropic prompt caching）
 ///
 /// 客户端在 system 块 / tool / message content 块上通过 `cache_control` 声明缓存断点。
-/// 网关据此做本地影子缓存记账（见 [`super::cache_tracker`]），推算 cache_read /
+/// 网关据此做本地影子缓存记账，推算 cache_read /
 /// cache_creation 注入回响应 usage。
+/// 影子缓存记账已移至 StreamContext.cache_usage (prompt_cache_enabled 开启时)
 ///
 /// **注意**：此字段仅供网关内部记账，绝不透传给 Kiro 上游——上游请求体由
 /// `converter` 独立按字段重建（见 `converter::convert_tools` / 系统块拼接），

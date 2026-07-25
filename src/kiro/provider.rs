@@ -502,6 +502,10 @@ impl KiroProvider {
         // 本请求链内已因 403 FEATURE_NOT_SUPPORTED 做过「本地 region 纠正 + 重试」的号(镜像
         // force_refreshed 去重惯例)。防同一坏号在一条链里反复本地纠正+重试烧光 max_retries。
         let mut region_corrected_this_call: HashSet<u64> = HashSet::new();
+        // MODEL_TEMPORARILY_UNAVAILABLE 全局容量问题专用计数：只允许 1 次慢速退避重试，
+        // 耗尽后立即 break（而非继续烧光 max_retries 切换凭据——所有凭据受同一模型过载影响）。
+        let mut model_unavailable_attempts: usize = 0;
+        const MAX_MODEL_UNAVAILABLE_RETRIES: usize = 1;
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         // 一次解析同时取出模型信息与会话标识（conversationId），避免热路径上对
@@ -904,6 +908,36 @@ impl KiroProvider {
                 continue;
             }
 
+            // 503 MODEL_TEMPORARILY_UNAVAILABLE — 模型容量问题，非凭据问题。
+            // 使用慢速退避（1s base）；不调用 report_failure / report_rate_limited，
+            // 不影响凭据健康分（健康分反映凭据质量，与模型过载无关）。
+            // 只允许 MAX_MODEL_UNAVAILABLE_RETRIES 次慢速重试，耗尽后直接 break 透传错误——
+            // 继续切换凭据无意义（所有凭据对同一过载模型等价）。
+            if status.as_u16() == 503 && endpoint.is_model_temporarily_unavailable(&body) {
+                model_unavailable_attempts += 1;
+                tracing::warn!(
+                    "模型暂时不可用（MODEL_TEMPORARILY_UNAVAILABLE，第 {}/{} 次）: {} {}",
+                    model_unavailable_attempts,
+                    MAX_MODEL_UNAVAILABLE_RETRIES + 1,
+                    status,
+                    body
+                );
+                last_outcome = crate::usage::RequestOutcome::ModelUnavailable;
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败（模型暂时不可用，建议稍后重试）: {} {}",
+                    api_type,
+                    status,
+                    body
+                ));
+                if model_unavailable_attempts > MAX_MODEL_UNAVAILABLE_RETRIES {
+                    // 已用完慢速重试预算，透传过载错误给客户端，让其自行退避。
+                    break;
+                }
+                // 慢速退避：1s base，比通用 200ms 更长，避免反复冲击过载路径。
+                sleep(Self::retry_delay_model_unavailable(model_unavailable_attempts - 1)).await;
+                continue;
+            }
+
             // 429/408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
             // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
@@ -987,6 +1021,76 @@ impl KiroProvider {
         if real_failover_happened {
             crate::common::recovery_metrics::bump_failover_exhausted();
         }
+
+        // overload_fallback_model：MODEL_TEMPORARILY_UNAVAILABLE 耗尽重试预算后，
+        // 若配置了备用模型，以备用模型做最后一次尝试（限 1 次，不再套完整 failover 循环）。
+        // 典型用途：opus 系列过载时切到容量独立的 sonnet（前提：用户已知晓响应质量/计费差异）。
+        if last_outcome == crate::usage::RequestOutcome::ModelUnavailable {
+            let cfg = self.token_manager.config();
+            if let Some(ref fallback_model_id) = cfg.overload_fallback_model.clone() {
+                tracing::warn!(
+                    "MODEL_TEMPORARILY_UNAVAILABLE 重试耗尽，尝试 overload_fallback_model: {}",
+                    fallback_model_id
+                );
+                let fallback_body = Self::rewrite_model_id(request_body, fallback_model_id);
+                if let Ok(ctx) = self
+                    .token_manager
+                    .acquire_context(Some(fallback_model_id), session_id.as_deref())
+                    .await
+                {
+                    let config = self.token_manager.config();
+                    let machine_id =
+                        machine_id::generate_from_credentials(&ctx.credentials, &config);
+                    if let Ok(endpoint) = self.endpoint_for(&ctx.credentials) {
+                        let rctx = RequestContext {
+                            credentials: &ctx.credentials,
+                            token: &ctx.token,
+                            machine_id: &machine_id,
+                            config: &config,
+                            is_1m,
+                        };
+                        let url = endpoint.api_url(&rctx);
+                        let body = endpoint.transform_api_body(&fallback_body, &rctx);
+                        let base = self
+                            .client_for(&ctx.credentials)?
+                            .post(&url)
+                            .body(body)
+                            .header("content-type", "application/json");
+                        let request = endpoint.decorate_api(base, &rctx);
+                        match request.send().await {
+                            Ok(resp) if resp.status().is_success() => {
+                                self.token_manager.report_success(ctx.id);
+                                let meta = CallMeta {
+                                    credential_id: ctx.id,
+                                    model: Some(fallback_model_id.clone()),
+                                    session_id: session_id.clone(),
+                                    is_streaming: is_stream,
+                                    retries: (model_unavailable_attempts + 1) as u32,
+                                    latency_ms: call_started.elapsed().as_millis() as u64,
+                                    inflight: ctx.inflight,
+                                };
+                                return Ok((resp, meta));
+                            }
+                            Ok(resp) => {
+                                tracing::warn!(
+                                    "overload_fallback_model {} 也失败: {}",
+                                    fallback_model_id,
+                                    resp.status()
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "overload_fallback_model {} 请求错误: {}",
+                                    fallback_model_id,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let final_error = last_error.unwrap_or_else(|| {
             anyhow::anyhow!(
                 "{} API 请求失败：已达到最大重试次数（{}次）",
@@ -1056,6 +1160,38 @@ impl KiroProvider {
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
+    }
+
+    /// 慢速退避：专用于 MODEL_TEMPORARILY_UNAVAILABLE（容量过载）。
+    ///
+    /// 1s base，2x 指数，30s 上限 + 25% jitter。
+    /// 与通用 `retry_delay`（200ms base，基础设施瞬态）区分：过载是容量级问题，
+    /// 短暂快速重试只是反复冲击同一过载路径，慢速更合理。
+    fn retry_delay_model_unavailable(attempt: usize) -> Duration {
+        const BASE_MS: u64 = 1_000;
+        const MAX_MS: u64 = 30_000;
+        let exp = BASE_MS.saturating_mul(2u64.saturating_pow(attempt.min(5) as u32));
+        let backoff = exp.min(MAX_MS);
+        let jitter_max = (backoff / 4).max(1);
+        let jitter = fastrand::u64(0..=jitter_max);
+        Duration::from_millis(backoff.saturating_add(jitter))
+    }
+
+    /// 将序列化的 Kiro 请求体中的 modelId 替换为指定值。
+    ///
+    /// 用于 overload_fallback_model：过载重试耗尽时，以备用模型再试一次。
+    /// 替换路径：`conversationState.currentMessage.userInputMessage.modelId`。
+    /// 解析/序列化失败时原样返回，保证函数不 panic。
+    fn rewrite_model_id(request_body: &str, new_model: &str) -> String {
+        let Ok(mut v) = serde_json::from_str::<serde_json::Value>(request_body) else {
+            return request_body.to_string();
+        };
+        if let Some(mid) = v.pointer_mut(
+            "/conversationState/currentMessage/userInputMessage/modelId",
+        ) {
+            *mid = serde_json::Value::String(new_model.to_string());
+        }
+        serde_json::to_string(&v).unwrap_or_else(|_| request_body.to_string())
     }
 }
 
