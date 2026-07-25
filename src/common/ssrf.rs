@@ -107,6 +107,20 @@ fn is_forbidden_ipv6(ip: Ipv6Addr) -> bool {
         );
         return is_forbidden_ipv4(v4);
     }
+    // 6to4 (RFC 3056): 2002::/16 —— 前缀内嵌 IPv4 地址（bits 16–47）。
+    // 例：2002:7f00:0001:: 内嵌 127.0.0.1，2002:a9fe:a9fe:: 内嵌 169.254.169.254。
+    // ip.to_ipv4() 仅覆盖 ::ffff: 和 :: 兼容形式，不覆盖 6to4，故需单独处理。
+    if seg[0] == 0x2002 {
+        let embedded_v4 = Ipv4Addr::new(
+            (seg[1] >> 8) as u8,
+            (seg[1] & 0xff) as u8,
+            (seg[2] >> 8) as u8,
+            (seg[2] & 0xff) as u8,
+        );
+        if is_forbidden_ipv4(embedded_v4) {
+            return true;
+        }
+    }
     false
 }
 
@@ -309,10 +323,15 @@ mod tests {
         for ip in [
             "::1", "::", "fe80::1", "fc00::1", "fd12:3456::1",
             "ff02::1", "::ffff:127.0.0.1", "::ffff:169.254.169.254",
+            // 6to4 (RFC 3056): 2002::/16 内嵌私有/回环 IPv4
+            "2002:7f00:0001::",   // 内嵌 127.0.0.1
+            "2002:a9fe:a9fe::",   // 内嵌 169.254.169.254
+            "2002:0a00:0001::",   // 内嵌 10.0.0.1
+            "2002:c0a8:0101::",   // 内嵌 192.168.1.1
         ] {
             assert!(
                 is_forbidden_ip(ip.parse().unwrap()),
-                "{ip} 应被禁止"
+                "{ip} 应被禁止（含6to4嵌私有/回环IPv4）"
             );
         }
     }

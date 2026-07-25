@@ -267,11 +267,16 @@ impl HealthTracker {
         (gate * health * (1.0 - rpm_pressure) * (1.0 - LOAD_PENALTY * load)).clamp(0.0, 1.0)
     }
 
-    /// 只读快照（概览页/hover）。不推进状态（用当前值）。
+    /// 只读快照（概览页/hover）。先推进到期的 Open→HalfOpen，保证展示状态与热路径一致。
+    ///
+    /// 不调用 tick_circuit 时，已到期的 Open 在面板上持续显示 circuit_open=true，
+    /// 直到下一次真实流量触发 on_success/on_429 才推进，造成"已恢复但面板仍显断路"假象。
     pub fn snapshot(&self, key: &str) -> Option<HealthSnapshot> {
         let now = Instant::now();
-        let map = self.states.lock();
-        map.get(key).map(|s| {
+        let mut map = self.states.lock();
+        map.get_mut(key).map(|s| {
+            // 推进到期熔断器状态（惰性推进，无定时器）
+            Self::tick_circuit(s, now);
             let (circuit_open, half_open, admit_prob, open_remaining_secs) = match s.circuit {
                 Circuit::Closed => (false, false, 1.0, 0),
                 Circuit::Open { until } => (
