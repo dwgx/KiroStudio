@@ -327,6 +327,15 @@ impl KiroProvider {
         self.token_manager.add_credits(credential_id, credits);
     }
 
+    /// 借出内部的号池管理器（只读用途）。
+    ///
+    /// handler 只持有 provider，但需要在**分派之前**做跨池优先级仲裁
+    /// （`should_try_custom_api_first`：决定这次请求先走 custom_api 透传还是先走 Kiro）。
+    /// 与 `report_credits` 同款薄 passthrough 思路，避免把仲裁逻辑复制到 handler 层。
+    pub fn token_manager(&self) -> &MultiTokenManager {
+        &self.token_manager
+    }
+
     /// 内部方法：带重试逻辑的 MCP API 调用
     async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count();
