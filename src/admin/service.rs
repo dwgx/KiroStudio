@@ -1978,9 +1978,10 @@ impl AdminService {
             .ok_or(AdminServiceError::NotFound { id })
     }
 
-    /// 一键重启本服务（spawn 后立即返回，实际退出延迟约 1 秒，systemd 3s 内自动拉起）。
+    /// 一键重启本服务：Windows/macOS 下进程自重启（spawn detached 助手拉起新二进制）；
+    /// 其余平台（Linux）优雅自退，由 systemd 自动重启。
     ///
-    /// **实现方式：优雅自退，让 systemd 自动重启——不需要任何提权。**
+    /// **Linux 实现方式：优雅自退，让 systemd 自动重启——不需要任何提权。**
     /// 根因（2026-07-08 定位）：systemd unit 设了 `NoNewPrivileges=true`，它会**永久禁止**
     /// 本进程及其子进程通过 setuid 提权，于是旧实现的 `sudo -n systemd-run ...` 静默失败
     /// （后台收到请求、打了日志，但 sudo 无法提权 → 什么都没发生 = "点了没反应"）。
@@ -1988,6 +1989,10 @@ impl AdminService {
     /// systemd 就会在 3 秒内自动重新拉起。因此这里改为：延迟 1 秒（给 HTTP 200 flush 时间）
     /// 后 `std::process::exit(0)`，完全绕开 sudo/NoNewPrivileges，稳定可靠。
     /// 若将来 unit 去掉 Restart=always，此法失效——但当前部署（见 kirostudio.service）已配置。
+    ///
+    /// **macOS 没有 systemd**（2026-07-27 定位）：早期实现把"非 Windows"等同于"Linux+systemd"，
+    /// macOS 下 `exit(0)` 后没有任何监督者会拉起新进程，一键重启/OTA 更新后服务直接消失、
+    /// 端口不再监听。故 macOS 单独拆出一支，复用 Windows 同款思路自行 spawn 重启助手。
     pub fn restart_service(&self) -> Result<(), AdminServiceError> {
         // Windows：用户普遍**裸跑双击 exe**，无 systemd/监督脚本会在 exit(0) 后重拉。
         // 若直接 exit(0),服务就此消失(H1)。故 Windows 下改为**进程自重启**:spawn 一个 detached
@@ -2005,7 +2010,20 @@ impl AdminService {
             return Ok(());
         }
 
-        #[cfg(not(target_os = "windows"))]
+        // macOS：和 Windows 一样没有监督者会在 exit(0) 后自动拉起，且不像 Linux 有 systemd
+        // 兜底——同样 spawn 一个 detached 助手，等端口释放后拉起新二进制，再自行退出。
+        #[cfg(target_os = "macos")]
+        {
+            self.spawn_macos_relaunch();
+            tokio::spawn(async {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                tracing::warn!("一键重启(macOS):进程退出,已交给 detached 助手拉起新二进制");
+                std::process::exit(0);
+            });
+            return Ok(());
+        }
+
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
             tracing::warn!(
                 "收到一键重启请求，约 1 秒后进程自退，由 systemd（Restart=always）在 3 秒内自动拉起"
@@ -2040,6 +2058,66 @@ impl AdminService {
             .map(|p| p.to_path_buf());
         let credentials_path = self.token_manager.credentials_path();
         spawn_windows_relaunch_process(config_path, credentials_path);
+    }
+
+    /// macOS 专用：spawn 一个 detached shell 助手，sleep 后 exec 拉起新二进制。
+    ///
+    /// 不落地临时脚本文件（Windows 因 cmd `/C` 的多重引号转义问题才需要写 .bat，见
+    /// [`spawn_windows_relaunch_process`] 注释）：POSIX shell 用位置参数 `"$0" "$@"` 接收
+    /// exe 路径与参数，不做任何字符串拼接/转义，天然规避引号/注入问题。
+    /// `trap '' HUP`：若用户是在 Terminal 前台直接跑的（而非 launchd/nohup），关终端触发的
+    /// SIGHUP 不该连累刚 spawn、还在 sleep 的助手（及它 exec 顶替出的新进程）。
+    /// 不重定向 stdio：助手与 exec 出的新进程沿用当前的 stdout/stderr（终端或已重定向的日志
+    /// 文件），保持和重启前一致的日志去向。
+    #[cfg(target_os = "macos")]
+    fn spawn_macos_relaunch(&self) {
+        use std::process::Command;
+
+        // OTA 已把新二进制放到原 exe 路径（rename 旧→.bak、new→原路径）。current_exe 即目标。
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("macOS 自重启:取 current_exe 失败,无法拉起新进程: {e}");
+                return;
+            }
+        };
+        // 新进程的工作目录：沿用当前 cwd（config/credentials 相对路径解析依赖它）。
+        let cwd = std::env::current_dir().ok();
+        let config_path = self
+            .token_manager
+            .config()
+            .config_path()
+            .map(|p| p.to_path_buf());
+        let credentials_path = self.token_manager.credentials_path();
+
+        // sh -c 'script' 之后的第一个参数是 $0，其余是 $1.. ($@ 不含 $0)——
+        // 故把 exe 路径放第一位，"$0" 取到的正是它，"$@" 取到的正是后续的 --config/--credentials。
+        let mut args: Vec<std::ffi::OsString> = vec![exe.clone().into_os_string()];
+        if let Some(cfg) = &config_path {
+            args.push("--config".into());
+            args.push(cfg.clone().into_os_string());
+        }
+        if let Some(cred) = &credentials_path {
+            args.push("--credentials".into());
+            args.push(cred.clone().into_os_string());
+        }
+
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(r#"trap '' HUP; sleep 3; exec "$0" "$@""#)
+            .args(&args);
+        if let Some(dir) = &cwd {
+            cmd.current_dir(dir);
+        }
+
+        match cmd.spawn() {
+            Ok(_) => tracing::warn!(
+                "macOS 自重启:已 spawn 重启助手(sleep 3s 后拉起 {exe:?}),本进程退出后由它接管端口"
+            ),
+            Err(e) => tracing::error!(
+                "macOS 自重启:spawn 重启助手失败,OTA/一键重启后服务可能不会自动恢复,请手动重启: {e}"
+            ),
+        }
     }
 }
 

@@ -173,20 +173,62 @@ async fn download_bg_bytes(client: &reqwest::Client, img_url: &str) -> Option<Ca
         .and_then(|v| v.to_str().ok())
         .unwrap_or("image/jpeg")
         .to_string();
-    match resp.bytes().await {
-        Ok(b) if !b.is_empty() => Some(CachedBg {
-            bytes: b.to_vec(),
-            content_type,
-        }),
-        Ok(_) => {
-            tracing::warn!("背景图下载为空: {}", img_url);
-            None
-        }
-        Err(e) => {
-            tracing::warn!("背景图下载失败（读取）: {} - {}", img_url, e);
-            None
+
+    // ⚠️ MIME 白名单：池里的字节会连同 content_type 一起，经**匿名可达**的
+    // `/admin/api/bg-cached?idx=N` 原样吐给浏览器。图片 URL 来自第三方 JSON 源
+    // （api.lolicon.app）的响应，属于外部可控数据；若该源被劫持返回一个 text/html 的
+    // URL，就能把 HTML 灌进池子，再由 bg-cached 在 /admin 同源下吐出 → XSS →
+    // localStorage 里的 adminKey 泄露。故非图片 MIME 一律拒绝入池。
+    // 与代理端点共用同一判定（single source of truth，防两处漂移）；
+    // 但入池侧更严格：直接**拒绝**而非覆盖，绝不让非图片字节进常驻内存池。
+    if sanitize_image_content_type(&content_type, img_url) != content_type {
+        tracing::warn!(
+            "背景图预取拒绝非图片 MIME {:?}（防止污染内存池后经匿名 bg-cached 造成 XSS）: {}",
+            content_type, img_url
+        );
+        return None;
+    }
+
+    // ⚠️ 体积上限：与 bg_img_proxy_handler 的 MAX_BG_BYTES 对齐。
+    // resp.bytes() 会把整个响应体读进内存且无上限，而池容量 BG_POOL_CAP=20 ——
+    // 恶意/超大图可直接把常驻内存顶上去。先按 Content-Length 预检，再流式累计兜底
+    //（防伪造/缺失 Content-Length 的无限流）。
+    const MAX_BG_BYTES: usize = 10 * 1024 * 1024; // 10 MiB，与代理端点同口径
+    if let Some(len) = resp.content_length() {
+        if len as usize > MAX_BG_BYTES {
+            tracing::warn!("背景图预取过大（Content-Length={}），跳过: {}", len, img_url);
+            return None;
         }
     }
+    let mut resp = resp;
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                if buf.len() + chunk.len() > MAX_BG_BYTES {
+                    tracing::warn!(
+                        "背景图预取流超过 {} 字节上限，丢弃: {}",
+                        MAX_BG_BYTES, img_url
+                    );
+                    return None;
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!("背景图下载失败（读取）: {} - {}", img_url, e);
+                return None;
+            }
+        }
+    }
+    if buf.is_empty() {
+        tracing::warn!("背景图下载为空: {}", img_url);
+        return None;
+    }
+    Some(CachedBg {
+        bytes: buf,
+        content_type,
+    })
 }
 
 /// 背景图源类型。
@@ -597,10 +639,46 @@ async fn bg_cached_handler(uri: Uri) -> impl IntoResponse {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, img.content_type.clone())
+        // nosniff：本端点匿名可达，池内 MIME 虽已在 download_bg_bytes 入池时白名单过滤，
+        // 这里再加一层防浏览器内容嗅探（纵深防御，避免任何遗漏路径变成 /admin 同源 XSS）。
+        .header("x-content-type-options", "nosniff")
         // 命中的是内存字节，可让浏览器短期缓存。
         .header(header::CACHE_CONTROL, "public, max-age=3600")
         .body(Body::from(img.bytes.clone()))
         .expect("Failed to build response")
+}
+
+/// 把上游 `Content-Type` 收敛成"安全的图片 MIME"。
+///
+/// ⚠️ 为什么必须做：`/admin/api/bg-img` 与 `/admin/api/bg-cached` 都是**匿名可达**的
+/// （`create_admin_ui_router` 整棵树没有任何鉴权 layer），且会把响应体原样回给浏览器。
+/// 若把上游 Content-Type 原样透传：
+///   1. 攻击者构造一个返回 `text/html` 的 URL 作为 `url=` 参数；
+///   2. 浏览器在 **`/admin` 同源**下把它当 HTML 执行 → XSS；
+///   3. 面板的 adminKey 明文存在 localStorage（全仓无 CSP）→ 完整接管管理面。
+/// SSRF 与 10MiB 上限都已经防了，唯独不限制 MIME 等于没闭合这条链。
+///
+/// 策略：只放行 `image/*`（以及某些 CDN 对图片用的 `application/octet-stream`），
+/// 其余**覆盖**为 `image/jpeg` 而不是拒绝——避免上游偶发返回怪异 MIME 时背景图直接加载失败
+/// （背景图是纯装饰，可用性优先；关键是绝不能让浏览器把它当可执行文档看待）。
+/// 调用方还必须配合 `X-Content-Type-Options: nosniff`，否则浏览器仍可能内容嗅探绕过。
+fn sanitize_image_content_type(content_type: &str, img_url: &str) -> String {
+    // 只看 MIME 主类型，忽略参数（如 `image/jpeg; charset=binary`）。
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if mime.starts_with("image/") || mime == "application/octet-stream" {
+        content_type.to_string()
+    } else {
+        tracing::warn!(
+            "背景图代理：上游返回非图片 MIME {:?}，已覆盖为 image/jpeg 防止 /admin 同源 XSS（目标 URL: {}）",
+            content_type, img_url
+        );
+        "image/jpeg".to_string()
+    }
 }
 
 /// 图片代理（绕过 i.pixiv.re 防盗链，直接把图片 stream 给浏览器）
@@ -653,6 +731,8 @@ async fn bg_img_proxy_handler(uri: Uri) -> impl IntoResponse {
         .unwrap_or("image/jpeg")
         .to_string();
 
+    let safe_content_type = sanitize_image_content_type(&content_type, &img_url);
+
     // DoS 防护：本端点匿名可达且把响应体读进内存，必须限制最大字节数，
     // 否则攻击者可把 url 指向超大文件/无限流一次撑爆内存。
     const MAX_BG_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
@@ -690,8 +770,65 @@ async fn bg_img_proxy_handler(uri: Uri) -> impl IntoResponse {
     }
     Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_TYPE, safe_content_type)
+        // nosniff 是 MIME 白名单的必要补充：即使 Content-Type 已被收敛为 image/*，
+        // 没有这个头时浏览器仍可能按内容嗅探（content sniffing）成 HTML 并执行。
+        .header("x-content-type-options", "nosniff")
         .header(header::CACHE_CONTROL, "public, max-age=3600")
         .body(Body::from(buf))
         .expect("Failed to build response")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_image_content_type_rejects_executable_mimes() {
+        // ⭐XSS 回归(旧代码原样透传上游 Content-Type):/admin/api/bg-img 与 /admin/api/bg-cached
+        // 都是**匿名可达**且原样回响应体。若把 text/html 透传出去,浏览器会在 /admin **同源**下
+        // 执行它 → adminKey 存在 localStorage(全仓无 CSP) → 管理面完整接管。
+        // 这里断言:一切可被浏览器当文档/脚本执行的 MIME 都必须被覆盖成 image/jpeg。
+        for evil in [
+            "text/html",
+            "text/html; charset=utf-8",
+            "TEXT/HTML",                    // 大小写不敏感
+            "application/xhtml+xml",
+            "image",                        // 缺斜杠,不算 image/*
+            "text/javascript",
+            "application/javascript",
+            "application/pdf",
+            "text/plain",
+            "application/xml",
+            "image_evil/html",              // 前缀相似但不是 image/
+            "",                             // 缺失 Content-Type
+        ] {
+            assert_eq!(
+                sanitize_image_content_type(evil, "https://example.invalid/x"),
+                "image/jpeg",
+                "非图片 MIME {evil:?} 必须被覆盖为 image/jpeg,否则匿名端点可在 /admin 同源 XSS"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sanitize_image_content_type_preserves_real_images() {
+        // 真实图片 MIME 必须原样保留(含带参数的形态),否则浏览器可能不渲染或触发下载。
+        for ok in [
+            "image/jpeg",
+            "image/png",
+            "image/webp",
+            "image/avif",
+            "image/gif",
+            "image/jpeg; charset=binary",   // 带参数:只看主类型
+            "IMAGE/PNG",                     // 大小写不敏感放行,且原样回传
+            "application/octet-stream",      // 部分 CDN 对图片用它
+        ] {
+            assert_eq!(
+                sanitize_image_content_type(ok, "https://example.invalid/x"),
+                ok,
+                "合法图片 MIME {ok:?} 应原样保留"
+            );
+        }
+    }
 }
