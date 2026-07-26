@@ -274,6 +274,8 @@ impl SocialLoginManager {
             base_url: None,
             api_key: None,
             request_limit: None,
+            // Social 上号产出的是 Kiro 号（非 custom_api 代挂号），该开关对它无意义 → 跟随全局。
+            custom_api_first: None,
             region: None,
             auth_region: None,
             api_region: None,

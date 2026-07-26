@@ -897,6 +897,7 @@ impl AdminService {
             base_url: req.base_url,
             api_key: req.api_key,
             request_limit: req.request_limit,
+            custom_api_first: req.custom_api_first,
             region: req.region,
             auth_region: req.auth_region,
             api_region: req.api_region,

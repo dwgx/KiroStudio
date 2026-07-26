@@ -1837,6 +1837,70 @@ impl MultiTokenManager {
             .any(|e| !e.disabled && e.credentials.is_custom_api_credential())
     }
 
+    /// 跨池仲裁：本次请求**是否应该先尝试 custom_api 透传**。
+    ///
+    /// 这是修正「用户设的 priority 在跨池维度完全无效」的关键收敛点。
+    ///
+    /// ## 背景（历史缺陷）
+    /// 分派顺序被写死在 handlers 里：一进来就先 `try_custom_api_passthrough`，只有它返回
+    /// `None`（代挂池全部冷却/失败）才落 Kiro 主路径。而 `select_custom_api` 又只在代挂号
+    /// **子集内**比较 priority。两者叠加的结果是：**custom_api 隐含享有绝对最高优先级**，
+    /// 哪怕 Kiro 号 priority=0、代挂号 priority=99 也永远先走代挂 —— 与「priority 越小越优先」
+    /// 的产品直觉直接冲突（用户实测反馈："优先级设置了 kiro 更小，还是会优先调度上游 apikey"）。
+    ///
+    /// ## 现在的语义
+    /// 逐个候选代挂号看它的**生效开关**（凭据级 `custom_api_first` 覆盖全局 `config.custom_api_first`）：
+    /// - 任一可用代挂号显式 `first=true` → 先走透传（保留历史行为，供"就是要中转兜底在前"的部署）。
+    /// - 否则（默认 `false`）→ 取两池各自的**最优 priority** 比较：
+    ///   代挂池最优 `<=` Kiro 池最优时才先走透传；Kiro 更优则先走 Kiro，
+    ///   Kiro 全失败后 provider 的 failover 仍会落回代挂池（不损失兜底能力）。
+    ///
+    /// 用 `<=` 而非 `<`：priority 相同时维持"代挂在前"的既有习惯，避免纯升级场景行为突变。
+    ///
+    /// 注意这里只做**一次性的路径选择**，不改动两池各自的选号逻辑，
+    /// 因此「两池隔离铁律」（Kiro 选号永不返回 custom_api、透传结果永不进 health/family 连坐）完全不变。
+    pub fn should_try_custom_api_first(&self) -> bool {
+        let global_first = self.config.load().custom_api_first;
+        let cooldown_on = self.cooldown_enabled.load(Ordering::Relaxed);
+        let entries = self.entries.lock();
+
+        let mut best_custom: Option<u32> = None;
+        let mut best_kiro: Option<u32> = None;
+
+        for e in entries.iter() {
+            if e.disabled {
+                continue;
+            }
+            let is_custom = e.credentials.is_custom_api_credential();
+            // 冷却中的号不参与本次仲裁（它此刻选不出来，不该影响路径决策）。
+            if cooldown_on && !self.cooldown.is_available(e.id) {
+                continue;
+            }
+            if is_custom {
+                // 凭据级开关优先于全局；任一可用代挂号要求"无条件优先"即立刻先走透传。
+                if e.credentials.custom_api_first.unwrap_or(global_first) {
+                    return true;
+                }
+                best_custom = Some(best_custom.map_or(e.credentials.priority, |p: u32| {
+                    p.min(e.credentials.priority)
+                }));
+            } else {
+                best_kiro = Some(best_kiro.map_or(e.credentials.priority, |p: u32| {
+                    p.min(e.credentials.priority)
+                }));
+            }
+        }
+
+        match (best_custom, best_kiro) {
+            // 没有可用代挂号 → 无需尝试透传（也省掉一次无谓的 select_custom_api）。
+            (None, _) => false,
+            // 有代挂号但没有可用 Kiro 号 → 只能走透传。
+            (Some(_), None) => true,
+            // 两池都有 → 比 priority，代挂不劣于 Kiro 才先走透传。
+            (Some(c), Some(k)) => c <= k,
+        }
+    }
+
     /// 为透传选一个可用的「自定义 API」凭据(独立于 Kiro 选号池,守两池隔离铁律)。
     ///
     /// 选号素质对齐 Kiro 的 balanced,但只在 custom_api 池内:
@@ -6392,6 +6456,198 @@ mod tests {
         let empty = HashSet::new();
         let sel = mgr.select_custom_api(&empty).expect("应选到未冷却的 #2");
         assert_eq!(sel.0, 2, "#1 冷却中,应选 #2");
+    }
+
+    /// 造一个 custom_api 代挂号（priority 可指定，可选凭据级 custom_api_first 覆盖）。
+    fn mk_custom(id: u64, priority: u32, first: Option<bool>) -> KiroCredentials {
+        let mut c = KiroCredentials::default();
+        c.id = Some(id);
+        c.auth_method = Some("custom_api".to_string());
+        c.base_url = Some(format!("https://relay{id}.example.invalid"));
+        c.api_key = Some(format!("sk-relay-{id}"));
+        c.priority = priority;
+        c.custom_api_first = first;
+        c
+    }
+
+    /// 造一个 Kiro（api_key 型）号，priority 可指定。
+    fn mk_kiro(id: u64, priority: u32) -> KiroCredentials {
+        let mut c = KiroCredentials::default();
+        c.id = Some(id);
+        c.auth_method = Some("api_key".to_string());
+        c.kiro_api_key = Some(format!("sk-kiro-{id}"));
+        c.priority = priority;
+        c
+    }
+
+    #[test]
+    fn test_cross_pool_priority_kiro_wins_when_lower() {
+        // ⭐用户实测反馈的核心场景:"优先级设置了 kiro 的 apikey 更小,还是会优先调度上游的 apikey"。
+        // 历史行为把「custom_api 优先」写死在分派顺序里(handlers 一进来就先试透传),而
+        // select_custom_api 只在代挂号**子集内**比 priority → 跨池优先级从未被比较过。
+        // 修复后:默认(custom_api_first=false)按 priority 全局公平比较,Kiro 更优则不先走透传。
+        let config = Config::default();
+        assert!(
+            !config.custom_api_first,
+            "全局默认必须是 false(priority 全局统一比较),否则又回到代挂号绝对优先"
+        );
+        // kiro priority=0 优于 relay priority=5
+        let mgr = MultiTokenManager::new(
+            config,
+            vec![mk_custom(1, 5, None), mk_kiro(2, 0)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            !mgr.should_try_custom_api_first(),
+            "Kiro 号 priority(0) 更小时应先走 Kiro,不该先试代挂透传"
+        );
+    }
+
+    #[test]
+    fn test_cross_pool_priority_custom_wins_when_lower_or_equal() {
+        let config = Config::default();
+        // 代挂 priority=0 优于 kiro priority=5 → 先走透传
+        let mgr = MultiTokenManager::new(
+            config.clone(),
+            vec![mk_custom(1, 0, None), mk_kiro(2, 5)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(mgr.should_try_custom_api_first(), "代挂 priority 更小时应先走透传");
+
+        // priority 相同 → 维持"代挂在前"的既有习惯(用 <= 而非 <),避免纯升级场景行为突变
+        let mgr2 = MultiTokenManager::new(
+            config,
+            vec![mk_custom(1, 3, None), mk_kiro(2, 3)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            mgr2.should_try_custom_api_first(),
+            "priority 相同时保持代挂在前(兼容既有部署)"
+        );
+    }
+
+    #[test]
+    fn test_cross_pool_per_credential_override_wins() {
+        // 凭据级 custom_api_first=Some(true) 必须覆盖全局 false:
+        // 即便该代挂号 priority 明显更差,它也要求无条件优先。
+        // 这是用户要的"每个上游账号 apikey 都可以自定义"。
+        let config = Config::default();
+        let mgr = MultiTokenManager::new(
+            config,
+            vec![mk_custom(1, 99, Some(true)), mk_kiro(2, 0)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            mgr.should_try_custom_api_first(),
+            "凭据级 custom_api_first=true 必须覆盖全局,无条件优先"
+        );
+    }
+
+    #[test]
+    fn test_cross_pool_global_switch_restores_legacy_behavior() {
+        // 全局 custom_api_first=true 恢复历史行为:代挂号无条件优先(供"就是要中转兜底在前"的部署)。
+        let mut config = Config::default();
+        config.custom_api_first = true;
+        let mgr = MultiTokenManager::new(
+            config,
+            vec![mk_custom(1, 99, None), mk_kiro(2, 0)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            mgr.should_try_custom_api_first(),
+            "全局开关为 true 时应恢复代挂号绝对优先的历史行为"
+        );
+    }
+
+    #[test]
+    fn test_cross_pool_per_credential_false_overrides_global_true() {
+        // 反向覆盖也必须生效:全局 true,但该号显式 false → 参与公平比较。
+        let mut config = Config::default();
+        config.custom_api_first = true;
+        let mgr = MultiTokenManager::new(
+            config,
+            vec![mk_custom(1, 99, Some(false)), mk_kiro(2, 0)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            !mgr.should_try_custom_api_first(),
+            "凭据级显式 false 必须覆盖全局 true,回到 priority 公平比较"
+        );
+    }
+
+    #[test]
+    fn test_cross_pool_edge_cases() {
+        let config = Config::default();
+
+        // 无代挂号 → 不必尝试透传（也省掉一次无谓的 select_custom_api）
+        let only_kiro =
+            MultiTokenManager::new(config.clone(), vec![mk_kiro(1, 0)], None, None, false).unwrap();
+        assert!(!only_kiro.should_try_custom_api_first(), "池中无代挂号时不该尝试透传");
+
+        // 只有代挂号 → 只能走透传（不管 priority 多大）
+        let only_custom =
+            MultiTokenManager::new(config.clone(), vec![mk_custom(1, 999, None)], None, None, false)
+                .unwrap();
+        assert!(only_custom.should_try_custom_api_first(), "只有代挂号时必须走透传");
+
+        // 空池 → 不尝试
+        let empty = MultiTokenManager::new(config.clone(), vec![], None, None, false).unwrap();
+        assert!(!empty.should_try_custom_api_first(), "空池不该尝试透传");
+
+        // 被禁用的号不参与仲裁：唯一的代挂号被禁用 → 视为无代挂号
+        let mgr = MultiTokenManager::new(
+            config,
+            vec![mk_custom(1, 0, None), mk_kiro(2, 5)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(mgr.should_try_custom_api_first(), "禁用前:代挂 priority 更小 → 走透传");
+        mgr.set_disabled(1, true).unwrap();
+        assert!(
+            !mgr.should_try_custom_api_first(),
+            "代挂号被禁用后应视为无代挂号,不再尝试透传"
+        );
+    }
+
+    #[test]
+    fn test_cross_pool_cooldown_excluded_from_arbitration() {
+        // 冷却中的代挂号此刻选不出来,不该影响路径决策:
+        // 唯一的(且 priority 更优的)代挂号在冷却中 → 应先走 Kiro,而不是先试一次必然失败的透传。
+        let config = Config::default();
+        let mgr = MultiTokenManager::new(
+            config,
+            vec![mk_custom(1, 0, None), mk_kiro(2, 5)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(mgr.should_try_custom_api_first(), "冷却前应走透传");
+        mgr.cooldown_custom_api(1, 300);
+        assert!(
+            !mgr.should_try_custom_api_first(),
+            "唯一代挂号在冷却中时应先走 Kiro(避免白试一次注定失败的透传)"
+        );
     }
 
     #[tokio::test]
