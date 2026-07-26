@@ -2228,11 +2228,27 @@ impl MultiTokenManager {
             if entry.disabled {
                 continue;
             }
+            // ⚠️ 下面这组硬门**必须与 is_entry_selectable 逐条对齐**。
+            // 任何 is_entry_selectable 会过滤、而这里不过滤的条件，都会让
+            // 「select_next_credential 返 None」与「本函数判定 immediate_available」同时成立，
+            // 于是 acquire_context 的 `WaitOutcome::Available => continue` 分支既不 sleep 也不
+            // 递增 attempt_count（那条分支的语义是"竞态，立刻重选"）→ 形成**无退出条件的忙等
+            // 热循环**：请求永不返回且烧满一个 CPU 核。
+            // 历史缺口：漏了 custom_api 与 model_blocklist 两道，触发路径真实存在——
+            //   ① 池中只有 custom_api 代挂号（未禁用无冷却），任何走 Kiro 主路径的调用
+            //      （如 try_custom_api_passthrough 全冷却后回落、MCP/WebSearch）即命中；
+            //   ② 某模型被池中所有号加进 model_blocklist（TTL 1800s）后再来同模型请求。
+            if entry.credentials.is_custom_api_credential() {
+                continue;
+            }
             if is_opus && !entry.credentials.supports_opus() {
                 continue;
             }
             // 成本安全白名单硬门（与 is_entry_selectable 保持一致，否则等待估算与实际可选号不符）
             if !model_key.is_empty() && !entry.credentials.allows_model(model_key) {
+                continue;
+            }
+            if self.is_model_blocked(entry.id, model_key) {
                 continue;
             }
 
@@ -2403,6 +2419,13 @@ impl MultiTokenManager {
             .max(self.available_count())
             .max(1);
         let mut attempt_count = 0;
+        // 纵深防御：`WaitOutcome::Available` 分支的语义是"选号与等待判定之间发生了竞态,
+        // 立刻重选"，它刻意不递增 attempt_count（竞态重选不该消耗重试预算）也不 sleep。
+        // 代价是：若两处硬门条件一旦不对齐，该分支会变成无退出条件的忙等热循环（烧满一核、
+        // 请求永不返回）。这里独立计数并设上限，保证**即使将来再次出现条件不对齐，也只是
+        // 快速失败而非挂死**——把"逻辑 bug"降级成"可观测的错误"。
+        let mut race_reselect_count = 0usize;
+        const MAX_RACE_RESELECT: usize = 64;
         let wait_started = Instant::now();
         let is_opus = model
             .map(|m| m.to_lowercase().contains("opus"))
@@ -2474,7 +2497,25 @@ impl MultiTokenManager {
                         const FAST_FAIL_THRESHOLD: StdDuration = StdDuration::from_secs(2);
                         match self.transient_wait_outcome(model) {
                             // 竞态:select 返 None 但此刻已有立即可用候选(去饱和/并发释放)→ 重选,绝不 bail。
-                            WaitOutcome::Available => continue,
+                            // 计数兜底见 race_reselect_count 的声明处：正常竞态只需 1~2 次重选即可命中,
+                            // 连续 64 次仍不命中说明两处硬门条件不对齐（逻辑 bug），此时快速失败而非挂死。
+                            WaitOutcome::Available => {
+                                race_reselect_count += 1;
+                                if race_reselect_count > MAX_RACE_RESELECT {
+                                    tracing::error!(
+                                        "选号竞态重选已达 {} 次仍无法命中：说明 is_entry_selectable 与 \
+                                         transient_wait_outcome 的硬门条件不对齐（逻辑 bug，请检查两处过滤是否一致）。\
+                                         为避免忙等挂死，此处快速失败。",
+                                        MAX_RACE_RESELECT
+                                    );
+                                    anyhow::bail!(
+                                        "选号竞态无法收敛（可用: {}/{}），已中止以避免忙等",
+                                        self.available_count(),
+                                        total
+                                    );
+                                }
+                                continue;
+                            }
                             // 冷却/风控:长恢复窗口走 fast-fail(仅当 all_cooling_fast_fail 开),让客户端退避;
                             // 否则网关内短等重试。
                             WaitOutcome::Wait(wait, WaitReason::Cooling) => {
@@ -3108,6 +3149,27 @@ impl MultiTokenManager {
             .collect()
     }
 
+    /// 把「凭据已被自动禁用」这一状态立即落盘到 credentials.json。
+    ///
+    /// 为什么必须单独做这件事：`save_stats_debounced()` 只写 `kiro_stats.json`，而 `StatsEntry`
+    /// 仅含 success_count / total_credits_used / request_count / last_used_at —— **不含
+    /// disabled / disabled_reason**。因此凡是"自动禁用"的路径（配额耗尽 / 账户封禁 /
+    /// refreshToken 永久失效 / 连续失败 / 连续刷新失败）都必须额外调本函数，否则重启后
+    /// 这些死号会以 enabled 状态回池，网关重新拿它们打上游、再走一遍禁用流程：
+    /// invalid_grant 号会白白多消耗一次刷新往返，配额耗尽号会多打一次 402。
+    ///
+    /// 失败只告警不抛错：禁用已在内存生效，落盘失败不该影响本次请求的 failover 决策。
+    /// （Single 对象格式的 credentials.json 下 persist_credentials 本身是 no-op，属预期。）
+    fn persist_disabled_state(&self, id: u64) {
+        if let Err(e) = self.persist_credentials() {
+            tracing::warn!(
+                "凭据 #{} 已自动禁用，但持久化失败：{}。重启后该号会以启用状态回池并重新走一遍禁用流程。",
+                id,
+                e
+            );
+        }
+    }
+
     /// 报告指定凭据 API 调用失败
     ///
     /// 增加失败计数，达到阈值时禁用凭据并切换到优先级最高的可用凭据
@@ -3175,6 +3237,12 @@ impl MultiTokenManager {
             self.rate_limiter.record_failure(id, FailureKind::Transient);
         }
         self.save_stats_debounced();
+        // 自动禁用必须落盘：save_stats_debounced 写的是 kiro_stats.json，其 StatsEntry 只含
+        // success_count/total_credits_used/request_count/last_used_at，**不含 disabled/disabled_reason**。
+        // 不落盘则重启后该号以 enabled 回池、重新走一遍失败→禁用流程（白耗配额与上游请求）。
+        if disabled_now {
+            self.persist_disabled_state(id);
+        }
         result
     }
 
@@ -3219,9 +3287,18 @@ impl MultiTokenManager {
             // 429 是瞬态限流，走秒级指数退避；绝不能长冻（真封号走 report_account_suspended）
             self.rate_limiter.record_failure(id, FailureKind::Transient);
         }
-        // 健康：裸 429 走单号 health，按该号自己的键累计，不整族连坐。
-        // （族级连坐仅用于 suspicious activity，见 report_family_suspicious）
-        self.health.on_429(&format!("cred:{}", id));
+        // 健康：必须用 family_key —— 这是 HealthTracker 的**唯一合法键**。
+        //
+        // ⚠️ 历史 bug：这里曾硬编码 format!("cred:{}", id)，而**读侧**全部用 family_key：
+        //   选号 sort_key(p_avail) / report_success / report_family_suspicious / health_snapshots。
+        // social/idc/api_key 的 family_key 恰好就是 "cred:{id}"，所以看起来正常；但 external_idp
+        // (M365) 的 family_key 是 "m365:{tenant}"、AWS 兜底是 "aws:{account}"，于是这些号的裸 429
+        // 全部写进一个**从不被任何人读取**的影子条目：ewma_429 / consecutive_429 / TRIP_THRESHOLD
+        // 跳闸统统失效 → M365 号被 429 打爆也永远不会被熔断或降权，且面板 health 快照恒显示
+        // consecutive_429=0。现有测试用的是 social 默认凭据（两键恰好相等），所以测不出来。
+        //
+        // 注意 family_key_of 内部会取 entries 锁，故必须在**锁外**调用（本函数此处已在锁外）。
+        self.health.on_429(&self.family_key_of(id));
     }
 
     /// 报告凭据触发**账户级可疑活动风控**（`suspicious activity`+`temporary limits`）。
@@ -3386,6 +3463,9 @@ impl MultiTokenManager {
         // 额度用尽已禁用该凭据，清除其会话亲和性绑定
         self.affinity.remove_by_credential(id);
         self.save_stats_debounced();
+        // 立即落盘禁用状态（见 persist_disabled_state 的说明）：否则重启后该号回池，
+        // 又会打一次 402 MONTHLY_REQUEST_COUNT 才重新被禁用。
+        self.persist_disabled_state(id);
         result
     }
 
@@ -3436,6 +3516,9 @@ impl MultiTokenManager {
         // 封禁已禁用该凭据，清除其会话亲和性绑定
         self.affinity.remove_by_credential(id);
         self.save_stats_debounced();
+        // 立即落盘禁用状态：AccountSuspended 不可自动恢复（等人工），重启后回池毫无意义，
+        // 只会再打一次上游确认被封。
+        self.persist_disabled_state(id);
         result
     }
 
@@ -3444,6 +3527,7 @@ impl MultiTokenManager {
     /// 连续刷新失败达到阈值后禁用凭据并切换，阈值内保持当前凭据不切换，
     /// 与 API 401/403 的累计失败策略保持一致。
     pub fn report_refresh_failure(&self, id: u64) -> bool {
+        let disabled_now;
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -3471,6 +3555,7 @@ impl MultiTokenManager {
             if refresh_failure_count < MAX_FAILURES_PER_CREDENTIAL {
                 return entries.iter().any(|e| !e.disabled);
             }
+            disabled_now = true;
 
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::TooManyRefreshFailures);
@@ -3499,6 +3584,11 @@ impl MultiTokenManager {
             }
         };
         self.save_stats_debounced();
+        // 连续刷新失败达阈值而被禁用时落盘（阈值内的失败只累计计数、不落盘，避免高频写）。
+        if disabled_now {
+            self.affinity.remove_by_credential(id);
+            self.persist_disabled_state(id);
+        }
         result
     }
 
@@ -3548,6 +3638,10 @@ impl MultiTokenManager {
             }
         };
         self.save_stats_debounced();
+        // refreshToken 永久失效（invalid_grant）不可能自愈，必须落盘：否则每次重启都会
+        // 拿着已作废的 refreshToken 再打一次上游刷新，白耗一次往返且在上游留下失败记录。
+        self.affinity.remove_by_credential(id);
+        self.persist_disabled_state(id);
         result
     }
 
@@ -6154,8 +6248,8 @@ mod tests {
             c
         };
         let mgr = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
-        let id1 = mgr.add_credential(mk("https://a.example.com")).await.unwrap();
-        let id2 = mgr.add_credential(mk("https://b.example.com")).await.unwrap();
+        let id1 = mgr.add_credential(mk("https://a.example.invalid")).await.unwrap();
+        let id2 = mgr.add_credential(mk("https://b.example.invalid")).await.unwrap();
         assert!(id2 > id1, "id 应单调递增: #{id1} → #{id2}");
 
         // 删除最高 id 的号并从回收站彻底清除。
@@ -6165,7 +6259,7 @@ mod tests {
 
         // 此刻 entries∪trash 的 max 已回落到 id1;旧算法会把 id2 分配给新号(复用),
         // 计数器则继续给 id2 之后的值。
-        let id3 = mgr.add_credential(mk("https://c.example.com")).await.unwrap();
+        let id3 = mgr.add_credential(mk("https://c.example.invalid")).await.unwrap();
         assert!(
             id3 > id2,
             "purge 后新号 id 必须 > 已清除的 id,不得复用(新号 #{id3},已清除 #{id2})"
@@ -6180,7 +6274,7 @@ mod tests {
         let config = Config::default();
         let mut c = KiroCredentials::default();
         c.auth_method = Some("custom_api".to_string());
-        c.base_url = Some("https://relay.example.com".to_string());
+        c.base_url = Some("https://relay.example.invalid".to_string());
         let mgr = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
         let id = mgr.add_credential(c).await.unwrap();
 
@@ -6251,7 +6345,7 @@ mod tests {
             let mut c = KiroCredentials::default();
             c.id = Some(id);
             c.auth_method = Some("custom_api".to_string());
-            c.base_url = Some(format!("https://relay{id}.example.com"));
+            c.base_url = Some(format!("https://relay{id}.example.invalid"));
             c.api_key = Some(format!("sk-{id}"));
             c.priority = prio;
             c
@@ -6284,12 +6378,12 @@ mod tests {
         let mut c1 = KiroCredentials::default();
         c1.id = Some(1);
         c1.auth_method = Some("custom_api".to_string());
-        c1.base_url = Some("https://relay1.example.com".to_string());
+        c1.base_url = Some("https://relay1.example.invalid".to_string());
         c1.priority = 0;
         let mut c2 = KiroCredentials::default();
         c2.id = Some(2);
         c2.auth_method = Some("custom_api".to_string());
-        c2.base_url = Some("https://relay2.example.com".to_string());
+        c2.base_url = Some("https://relay2.example.invalid".to_string());
         c2.priority = 0;
         let mgr = MultiTokenManager::new(config, vec![c1, c2], None, None, false).unwrap();
 
@@ -6298,6 +6392,89 @@ mod tests {
         let empty = HashSet::new();
         let sel = mgr.select_custom_api(&empty).expect("应选到未冷却的 #2");
         assert_eq!(sel.0, 2, "#1 冷却中,应选 #2");
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_no_busy_loop_with_only_custom_api() {
+        // ⭐⭐ CPU 死循环回归(旧代码会挂死+烧满一核,本测试靠超时兜底):
+        //
+        // is_entry_selectable 会过滤 custom_api 号(两池隔离铁律:Kiro 路径永不碰代挂号),
+        // 但 transient_wait_outcome 旧代码**漏了这道过滤**。于是当池中只有 custom_api 号时:
+        //   - select_next_credential → None(全被 is_entry_selectable 过滤)
+        //   - transient_wait_outcome → Available(它看不出这些号不可选,判为"立即可用")
+        //   - acquire_context 的 `WaitOutcome::Available => continue` 既不 sleep 也不递增
+        //     attempt_count(该分支语义是"竞态,立刻重选")
+        //   → 循环顶部的 attempt_count >= max_attempts 永远不成立 → **无退出条件的忙等热循环**,
+        //     请求永不返回且烧满一个 CPU 核。
+        //
+        // 真实触发路径:try_custom_api_passthrough 在 custom_api 全部冷却后返回 None,
+        // 随即回落 Kiro 主路径调 acquire_context;以及 MCP/WebSearch 等不走透传的调用。
+        //
+        // 修复后应**快速返回 Err**(NoCandidate → "所有凭据均已禁用"类错误),而不是挂死。
+        let config = Config::default();
+        let mut c = KiroCredentials::default();
+        c.id = Some(1);
+        c.auth_method = Some("custom_api".to_string());
+        c.base_url = Some("https://relay.example.invalid".to_string());
+        let mgr = MultiTokenManager::new(config, vec![c], None, None, false).unwrap();
+
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            mgr.acquire_context(Some("claude-sonnet-4.5"), None),
+        )
+        .await;
+
+        match r {
+            Err(_) => panic!(
+                "⭐acquire_context 在【池中只有 custom_api 号】时挂死(忙等热循环)。\
+                 说明 transient_wait_outcome 与 is_entry_selectable 的硬门条件不对齐。"
+            ),
+            Ok(Ok(_)) => panic!("custom_api 号绝不该被 Kiro 主路径选中(两池隔离铁律被破坏)"),
+            Ok(Err(e)) => {
+                // 预期:快速失败。错误应指向无可用凭据,而非竞态收敛失败。
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("竞态无法收敛"),
+                    "不该退化到竞态兜底上限才结束,说明 transient_wait_outcome 仍未正确过滤: {msg}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_no_busy_loop_when_model_blocked_for_all() {
+        // ⭐ 同一死循环的第二条触发路径:某模型被池中**所有**号加进 model_blocklist
+        //（每个号都曾对该模型返回 INVALID_MODEL_ID,TTL 1800s）之后,再来一个同模型请求。
+        // is_entry_selectable 会因 is_model_blocked 过滤掉全部号 → select 返 None;
+        // 而 transient_wait_outcome 旧代码不检查 model_blocklist → 判 Available → 忙等挂死。
+        let config = Config::default();
+        let mut c = KiroCredentials::default();
+        c.id = Some(1);
+        c.auth_method = Some("api_key".to_string());
+        c.kiro_api_key = Some("sk-test-key".to_string());
+        let mgr = MultiTokenManager::new(config, vec![c], None, None, false).unwrap();
+
+        const MODEL: &str = "claude-opus-4.5";
+        // 把该模型对唯一的号拉黑(模拟上游回过 INVALID_MODEL_ID)。
+        mgr.report_model_invalid(1, Some(MODEL));
+
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            mgr.acquire_context(Some(MODEL), None),
+        )
+        .await;
+
+        match r {
+            Err(_) => panic!(
+                "⭐acquire_context 在【该模型已被全池拉黑】时挂死(忙等热循环)。\
+                 说明 transient_wait_outcome 缺少 is_model_blocked 过滤。"
+            ),
+            Ok(Ok(_)) => panic!("该模型已被唯一的号拉黑,不该还能选出号"),
+            Ok(Err(e)) => assert!(
+                !e.to_string().contains("竞态无法收敛"),
+                "不该退化到竞态兜底上限才结束,说明过滤仍不对齐: {e}"
+            ),
+        }
     }
 
     #[test]
@@ -7736,7 +7913,7 @@ mod tests {
         let cred_path = dir.join("credentials.json");
         std::fs::write(
             &cred_path,
-            r#"[{"id":1,"authMethod":"custom_api","baseUrl":"https://up.example.com","requestLimit":2}]"#,
+            r#"[{"id":1,"authMethod":"custom_api","baseUrl":"https://up.example.invalid","requestLimit":2}]"#,
         )
         .unwrap();
 
@@ -7744,7 +7921,7 @@ mod tests {
             let mut c = KiroCredentials::default();
             c.id = Some(1);
             c.auth_method = Some("custom_api".to_string());
-            c.base_url = Some("https://up.example.com".to_string());
+            c.base_url = Some("https://up.example.invalid".to_string());
             c.request_limit = Some(2);
             c
         };
@@ -7948,5 +8125,59 @@ mod tests {
         assert!(String::from_utf8_lossy(&raw).contains("legacy-plain-token"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TEMP ADVERSARIAL REPRO (F1): 池中只有 custom_api 号时 acquire_context 是否忙等不返回。
+    #[test]
+    fn temp_repro_f1_custom_api_only_busy_loop() {
+        let (tx, rx) = std::sync::mpsc::channel::<&'static str>();
+        std::thread::spawn(move || {
+            let mut config = Config::default();
+            config.load_balancing_mode = "balanced".to_string();
+            let mut c = KiroCredentials::default();
+            c.id = Some(1);
+            c.auth_method = Some("custom_api".to_string());
+            c.base_url = Some("https://relay.example.invalid".to_string());
+            c.api_key = Some("sk-1".to_string());
+            let mgr = MultiTokenManager::new(config, vec![c], None, None, false).unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let r = rt.block_on(async { mgr.acquire_context(None, None).await });
+            let _ = tx.send(if r.is_ok() { "ok" } else { "err" });
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(v) => println!("F1-REPRO: acquire_context 返回了 {v}（未忙等）"),
+            Err(_) => println!("F1-REPRO: acquire_context 5s 内未返回（忙等热循环成立）"),
+        }
+    }
+
+    /// TEMP ADVERSARIAL REPRO (F1b): 所有号对该模型进 model_blocklist 时是否忙等。
+    #[test]
+    fn temp_repro_f1b_model_blocked_busy_loop() {
+        let (tx, rx) = std::sync::mpsc::channel::<&'static str>();
+        std::thread::spawn(move || {
+            let mut config = Config::default();
+            config.load_balancing_mode = "balanced".to_string();
+            let mut c = KiroCredentials::default();
+            c.id = Some(1);
+            c.access_token = Some("tok-1".to_string());
+            c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+            let mgr = MultiTokenManager::new(config, vec![c], None, None, false).unwrap();
+            mgr.report_model_invalid(1, Some("claude-opus-4.8"));
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let r = rt.block_on(async {
+                mgr.acquire_context(Some("claude-opus-4.8"), None).await
+            });
+            let _ = tx.send(if r.is_ok() { "ok" } else { "err" });
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(v) => println!("F1b-REPRO: acquire_context 返回了 {v}（未忙等）"),
+            Err(_) => println!("F1b-REPRO: acquire_context 5s 内未返回（忙等热循环成立）"),
+        }
     }
 }
