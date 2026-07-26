@@ -258,6 +258,23 @@ pub struct Config {
     #[serde(default)]
     pub priority_in_balanced: bool,
 
+    /// custom_api 代挂号是否**无条件抢在所有 Kiro 号之前**（默认 **false**）。
+    ///
+    /// `false`（默认，推荐）：代挂号与 Kiro 号在**同一个 `priority` 维度**上公平比较 ——
+    ///   谁的 priority 数字小谁先用，用完/失败再落另一池。这符合"priority 越小越优先"的直觉。
+    /// `true`（历史行为）：只要有任一可用的 custom_api 号就先透传，Kiro 号完全不参与竞争，
+    ///   用户设的 priority 在跨池维度上**完全无效**。
+    ///
+    /// 背景：历史实现把「custom_api 优先」写死在分派顺序里（handlers 一进来就先试透传，
+    /// 见 `try_custom_api_passthrough` 的调用点），而 `select_custom_api` 只在代挂号**子集内**
+    /// 比较 priority，于是跨池优先级从来没有被比较过 —— 表现为"我把 Kiro 号 priority 调到 0
+    /// 了，它还是先走中转"。
+    ///
+    /// 单个凭据可用 `credentials.json` 的 `customApiFirst` 字段各自覆盖本全局值。
+    /// TIER1 热重载即时生效。
+    #[serde(default)]
+    pub custom_api_first: bool,
+
     /// 是否启用 prompt 缓存记账（默认 false）
     ///
     /// Kiro 上游不回传 Anthropic 的 cache_read / cache_creation 记账字段。
@@ -846,6 +863,8 @@ impl Default for Config {
             all_cooling_fast_fail: default_all_cooling_fast_fail(),
             auto_disable_suspicious: default_auto_disable_suspicious(),
             priority_in_balanced: false,
+            // 默认 false = priority 全局统一比较（修正历史上"代挂号隐含绝对优先"的反直觉行为）。
+            custom_api_first: false,
             prompt_cache_enabled: default_prompt_cache_enabled(),
             prompt_cache_ttl_seconds: default_prompt_cache_ttl_seconds(),
             strip_env_noise: default_strip_env_noise(),
