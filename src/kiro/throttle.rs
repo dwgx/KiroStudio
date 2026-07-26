@@ -39,6 +39,10 @@ const AIMD_PROBE_SECS: u64 = 20; // 探测周期:距上次降档 ≥20s 且无�
 const MD_FACTOR_PCT: u32 = 50; // 乘性减:×50%(砍半)
 const MD_DEBOUNCE_SECS: u64 = 3; // MD 去抖窗口:此窗内重复 429(如单请求 failover 链)只降一档
 
+/// 一个令牌的定点值。令牌数全程按 ×1000 定点存储以避免浮点，故"取走一个令牌"= 扣 1000 milli。
+/// 桶容量必须 ≥ 此值，否则永远攒不满一个令牌（见 capacity_milli_locked 的容量塌陷说明）。
+const ONE_TOKEN_MILLI: u64 = 1000;
+
 /// 全局入站节流器。挂在 TokenManager 上,acquire_context 进入时先 await throttle.acquire()。
 pub struct GlobalThrottle {
     /// 总开关。关 = acquire() 直接放行。
@@ -92,8 +96,11 @@ impl GlobalThrottle {
             queue_max_wait_secs: AtomicU32::new(queue_max_wait_secs.max(1)),
             queue_timeout_passthrough: AtomicBool::new(queue_timeout_passthrough),
             bucket: parking_lot::Mutex::new(Bucket {
-                // 初始给满桶(允许启动后一个小突发)。
-                tokens_milli: (target as u64) * 1000 / 60 * (burst_secs.max(1) as u64),
+                // 初始给满桶(允许启动后一个小突发)。与 capacity_milli_locked 同口径：
+                // 必须 .max(ONE_TOKEN_MILLI)，否则低 target_rpm 启动时初始桶连一个令牌都装不下，
+                // 首个请求就得白排队(容量塌陷)。
+                tokens_milli: (((target as u64) * 1000 / 60).max(1) * (burst_secs.max(1) as u64))
+                    .max(ONE_TOKEN_MILLI),
                 last_refill_nanos: 0,
                 target_rpm: target,
                 last_md_nanos: 0,
@@ -112,9 +119,21 @@ impl GlobalThrottle {
     }
 
     /// 令牌桶容量上限(定点 ×1000)。按锁内 target_rpm 算(调用方已持锁)。
+    ///
+    /// ⚠️ 容量必须 ≥ ONE_TOKEN_MILLI(1000)，否则**桶永远攒不满一个令牌** → try_take 恒 false →
+    /// 所有入站请求必须排满 queue_max_wait_secs(默认 30s)：passthrough=true 时全部超时放行
+    /// （限速彻底失效，且每个请求白等 30s），false 时全部 429。
+    ///
+    /// 历史 bug（容量塌陷）：容量 = (rpm*1000/60).max(1) * burst_secs，取一个令牌需 1000 milli，
+    /// 即隐含要求 `rpm * burst_secs >= 60`。默认 inbound_burst_secs=2 时，只要 target_rpm <= 29
+    /// 容量就 < 1000。而 AIMD 从默认 100 连降两档即到 25（100→50→25→20=floor），
+    /// rpm_min 默认 20 时容量仅 666 —— 也就是说**默认配置下一旦被上游 429 打两次降档，
+    /// 整个网关的入站整形就永久塌陷**。这里用 `.max(ONE_TOKEN_MILLI)` 兜底：低 RPM 时容量
+    /// 至少能装一个令牌（突发能力退化为 1，符合"低速率就该没有突发"的语义），
+    /// 补充速率仍严格由 target_rpm 决定，不会超发。
     fn capacity_milli_locked(&self, target_rpm: u32) -> u64 {
         let burst = self.burst_secs.load(Ordering::Relaxed) as u64;
-        ((target_rpm as u64) * 1000 / 60).max(1) * burst
+        (((target_rpm as u64) * 1000 / 60).max(1) * burst).max(ONE_TOKEN_MILLI)
     }
 
     /// 尝试取一个令牌(定点 1000):在**一把锁内**完成"按经过时间补充 → 判足 → 扣减",
@@ -143,8 +162,8 @@ impl GlobalThrottle {
         } else {
             b.last_refill_nanos = now;
         }
-        if b.tokens_milli >= 1000 {
-            b.tokens_milli -= 1000;
+        if b.tokens_milli >= ONE_TOKEN_MILLI {
+            b.tokens_milli -= ONE_TOKEN_MILLI;
             true
         } else {
             false
@@ -219,9 +238,18 @@ impl GlobalThrottle {
         }
         let cur = b.target_rpm;
         let next = ((cur * MD_FACTOR_PCT) / 100).max(floor).max(1);
-        b.last_md_nanos = now;
+        // ⚠️ 关键修复(升档饿死死锁·第二处):`last_md_nanos` 的语义严格是"上次**真正降档**的时刻",
+        //   因此只有 next != cur（确实降了档）才允许刷新它。
+        //   历史 bug：这里曾无条件 `b.last_md_nanos = now`，于是当 target_rpm **已经在 rpm_min 下限**
+        //   （next == cur，本次并没有真降档）时，时间戳照样被推进。而 maybe_step_up 要求
+        //   `since_md >= AIMD_PROBE_SECS(20s)` 才升档，于是只要上游持续零星 429（间隔 >3s 穿过
+        //   去抖窗、又 <20s），last_md 就被反复刷成 now → 升档静默期永不满足 → RPM 永久卡在
+        //   floor(默认 20) 再也回不去，表现为"网关突然不调度了，必须重启"。
+        //   与上面那处去抖分支的修复是同一个死锁的两条触发路径：去抖分支管"3s 内重复 429"，
+        //   这里管"已在下限、降不动了"。两处都不刷新，才真正闭合。
         if next != cur {
             b.target_rpm = next;
+            b.last_md_nanos = now;
             drop(b);
             self.md_total.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(target: "kiro::throttle", "上游429 → RPM自动降档 {cur}→{next}(下限{floor})");
@@ -393,6 +421,80 @@ mod tests {
             last_md(&t),
             t1,
             "⭐关键:去抖挡掉的429绝不能刷新last_md(旧代码在此刷新→升档静默期永不满足→RPM卡死)"
+        );
+    }
+
+    #[test]
+    fn test_at_floor_429_does_not_refresh_last_md_no_upshift_starvation() {
+        // ⭐死锁回归·第二条触发路径(旧代码必失败):已在 rpm_min 下限时,429 穿过去抖窗后
+        // next == cur(降不动了),此时**绝不能**刷新 last_md_nanos——否则只要上游持续零星 429
+        // (间隔 >3s 穿过去抖、又 <20s 不到升档静默期),last_md 就被反复推进,
+        // maybe_step_up 的 since_md>=20s 永不满足 → RPM 永久卡在 floor 再也回不去。
+        let t = mk(true, true, 200);
+        // 直接把 target 压到下限(mk 的 rpm_min=20)。
+        t.bucket.lock().target_rpm = 20;
+        // last_md=0 表示"从未降档/静默期已足够长",保证下面这次 429 能穿过去抖窗。
+        set_last_md(&t, 0);
+
+        t.report_upstream_429();
+
+        assert_eq!(t.current_target_rpm(), 20, "已在下限,不应再降");
+        assert_eq!(
+            last_md(&t),
+            0,
+            "⭐关键:已在下限、本次并未真降档时绝不能刷新 last_md\
+             (旧代码在此无条件刷新 → 升档静默期 since_md>=20s 永不满足 → RPM 永久卡在 floor)"
+        );
+
+        // 对照组:真降档时**必须**刷新 last_md(证明上面的"不刷新"是精确针对"没降动"这一情形,
+        // 而不是把 last_md 的维护整个删掉了)。
+        let t2 = mk(true, true, 200);
+        set_last_md(&t2, 0);
+        t2.report_upstream_429();
+        assert_eq!(t2.current_target_rpm(), 100, "未到下限时应正常降档");
+        assert!(
+            last_md(&t2) > 0,
+            "真降档必须刷新 last_md,否则去抖窗与升档静默期都失去锚点"
+        );
+    }
+
+    #[test]
+    fn test_bucket_capacity_never_below_one_token() {
+        // ⭐容量塌陷回归(旧代码必失败):容量 = (rpm*1000/60).max(1)*burst,而取一个令牌需 1000 milli,
+        // 隐含要求 rpm*burst >= 60。默认 burst_secs=2 时 rpm<=29 容量就 <1000 → 桶永远攒不满
+        // 一个令牌 → try_take 恒 false → 所有请求排满 queue_max_wait_secs。
+        // 而 AIMD 从默认 100 连降两档即到 25(100→50→25),rpm_min 默认 20 → 默认配置下
+        // 被上游 429 打两次就整体塌陷。
+        for rpm in [1u32, 5, 20, 25, 29, 30, 60, 100] {
+            for burst in [1u32, 2, 3] {
+                let t = GlobalThrottle::new(true, false, rpm, 1, 300, burst, 30, false);
+                let cap = {
+                    let b = t.bucket.lock();
+                    t.capacity_milli_locked(b.target_rpm)
+                };
+                assert!(
+                    cap >= ONE_TOKEN_MILLI,
+                    "rpm={rpm} burst={burst}: 桶容量 {cap} < 一个令牌({ONE_TOKEN_MILLI}) → 永远取不到令牌(塌陷)"
+                );
+                // 初始桶也必须至少装得下一个令牌,否则首个请求就得白排队。
+                assert!(
+                    t.bucket.lock().tokens_milli >= ONE_TOKEN_MILLI,
+                    "rpm={rpm} burst={burst}: 初始令牌数不足一个令牌"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_low_rpm_still_admits_immediately_at_floor() {
+        // 端到端佐证容量塌陷已修:默认 burst_secs=2 + target_rpm=20(=AIMD floor) 时,
+        // 首个请求必须**立即**放行,而不是排队 30s 后靠 passthrough 超时兜底。
+        // passthrough=false 保证"若塌陷则返回 Err",使断言有判别力。
+        let t = GlobalThrottle::new(true, false, 20, 20, 300, 2, 30, false);
+        let r = tokio::time::timeout(Duration::from_millis(500), t.acquire()).await;
+        assert!(
+            matches!(r, Ok(Ok(()))),
+            "低 RPM(20)+默认 burst(2) 首个请求应立即放行,实际={r:?}(旧代码容量 666<1000 → 排队直至超时)"
         );
     }
 

@@ -49,6 +49,28 @@ jobs:
       - name: 运行测试（出厂特性：纯 rustls）
         run: cargo test --no-default-features --locked
 
+      # 发版闸门：tag 必须与 Cargo.toml 的 version 完全一致。
+      #
+      # 为什么必须卡这一步：OTA 的 has_update 判定是「远端 tag 列表的最大版本 > LOCAL_VERSION」，
+      # 而 LOCAL_VERSION 是编译期注入的 env!("CARGO_PKG_VERSION")。若打了 v0.7.44 的 tag 却忘记
+      # bump Cargo.toml（仍是 0.7.43），产出的二进制自报 0.7.43 →
+      #   升级 → 重启 → 仍然发现"有新版 0.7.44" → 再升级 …… **无限升级循环**，
+      # 且每一轮都真的重写一次二进制。这是整条发布链上唯一没有任何自动校验的地方。
+      - name: 校验 tag 与 Cargo.toml 版本一致
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/v}"
+          CARGO_VER="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)"
+          echo "tag=$TAG  Cargo.toml=$CARGO_VER"
+          if [ "$TAG" != "$CARGO_VER" ]; then
+            echo "::error::tag(v$TAG) 与 Cargo.toml version($CARGO_VER) 不一致。"
+            echo "::error::直接发布会导致 OTA 无限升级循环（二进制自报旧版本，永远认为有新版）。"
+            echo "::error::请修正 Cargo.toml 的 version 后重新打 tag。"
+            exit 1
+          fi
+          echo "✅ 版本一致"
+
   build-release:
     needs: test
     runs-on: ubuntu-latest
@@ -111,6 +133,82 @@ jobs:
           files: |
             kirostudio-linux-x86_64
             kirostudio-linux-x86_64.sha256
+
+  # macOS 原生二进制：Apple Silicon(aarch64) 与 Intel(x86_64) 各一份。
+  #
+  # 为什么必须有这个 job：src/admin/update.rs 的 ASSET_BIN 按 OS×ARCH 选资产，
+  # macOS 分支期望 kirostudio-macos-{aarch64,x86_64}。若 CI 不产出，macOS 用户点面板
+  # 「一键升级」会 404（现在）——而在补齐 ASSET_BIN 之前更糟：会下到 Linux ELF 覆盖
+  # 自己的 Mach-O，重启后无法执行 → 服务当场死亡。三方（CI 产出 / ASSET_BIN / installer）
+  # 必须保持一致。
+  #
+  # runner 用 macos-14（Apple Silicon），交叉编译 x86_64 只需 rustup target add，
+  # 不需要额外 C 工具链（纯 rustls，无 vendored OpenSSL；--no-default-features 与其它平台一致）。
+  build-release-macos:
+    needs: test
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            asset: kirostudio-macos-aarch64
+          - target: x86_64-apple-darwin
+            asset: kirostudio-macos-x86_64
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # 前端必须在 cargo build 之前产出 admin-ui/dist —— rust-embed 是编译期嵌入
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: admin-ui/pnpm-lock.yaml
+
+      - name: 构建前端 (admin-ui/dist)
+        working-directory: admin-ui
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: 安装 Rust (${{ matrix.target }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust 编译缓存
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-release-${{ matrix.target }}
+
+      - name: 构建 release 二进制
+        run: cargo build --release --no-default-features --target ${{ matrix.target }}
+
+      - name: 打包产物 + 生成校验和
+        run: |
+          BIN=target/${{ matrix.target }}/release/kirostudio
+          cp "$BIN" ${{ matrix.asset }}
+          # macOS 自带 shasum，输出格式与 sha256sum 一致（"<hash>  <file>"），
+          # 与 update.rs 的解析（取第一段 64 位 hex）兼容。
+          shasum -a 256 ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
+          echo "--- 产物 ---"
+          ls -la ${{ matrix.asset }} ${{ matrix.asset }}.sha256
+          cat ${{ matrix.asset }}.sha256
+          file ${{ matrix.asset }}
+
+      - name: 上传到 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
 
   # Windows 原生 exe：任意 Win10+ x64 双击即跑（crt-static 静态链接 C 运行时，
   # 无 VCRUNTIME140.dll 依赖，见 .cargo/config.toml）。纯 rustls（--no-default-features），
