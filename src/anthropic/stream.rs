@@ -3633,16 +3633,36 @@ fn fence_open_after(open: bool, partial: &str, text: &str) -> bool {
     o
 }
 
-/// 计算缓冲区末尾“可能是部分 `<invoke` 开标签前缀”的字节数，需要保留等待更多内容
+/// 计算缓冲区末尾”可能是部分 `<invoke` 开标签前缀”的字节数，需要保留等待更多内容
 ///
 /// 例如缓冲区以 `<inv` / `<` / `<i` 结尾时，可能是被切碎的 invoke 开标签，
 /// 保留这段尾巴等下一个 chunk 拼齐，避免把半个标签当文本吐出去。
+///
+/// ⚠️ **安全上界**：真正的部分开标签（`<invoke` / `<invoke` 等）最多只有几十字节。
+/// 若从末尾最后一个 `<` 到缓冲区结尾的字节数超过此阈值，说明这个 `<` 只是正文里的普通
+/// `<`（中文散文的”a < b”、代码里的比较运算符等），**不是**未闭合的 invoke 开标签。
+/// 此时应把整段缓冲（含 `<`）当普通文本吐出去，而不是无限持有导致流停摆：
+///   1. `invoke_sniff_buffer` 一旦积压，下一轮 chunk 追加进来，lt=0，emit_len=0，
+///      没有任何输出，请求看起来挂死（客户端无增量输出 + 无界内存增长）；
+///   2. 根本触发路径：reclaim 开（默认）+ 请求带工具 + 模型输出含一个孤立 `<`，
+///      比如”条件 a < b 时触发”这样在中文段落里极为常见的表达式。
+/// 64 字节远超最长合法部分标签（`<parameter name=”` ≈ 18 字节含引号，
+/// 加最长的 antml: 前缀也不超过 32 字节），同时对真正被切碎的标签有充足余量。
 #[allow(dead_code)]
 fn partial_invoke_tag_suffix_len(buf: &str) -> usize {
+    /// 最长合法开标签前缀的安全上界（字节）。
+    /// `<parameter name=”` ≈ 23 字节，`<invoke` = 7 字节；64 字节极为保守。
+    /// 超过这个长度的”尾巴”一定不是被切碎的开标签，不应该再持有。
+    const MAX_PARTIAL_TAG_BYTES: usize = 64;
     // 任何形如 `<...`（最后一个 '<' 之后没有 '>'）的尾巴都可能是部分开标签
     if let Some(lt) = buf.rfind('<') {
         if !buf[lt..].contains('>') {
-            return buf.len() - lt;
+            let tail_len = buf.len() - lt;
+            // 安全上界：真正的部分开标签只有几十字节，超过则是正文中的普通 '<'，
+            // 不应持有（否则导致缓冲区无界增长 + 整条响应停摆）。
+            if tail_len <= MAX_PARTIAL_TAG_BYTES {
+                return tail_len;
+            }
         }
     }
     0
@@ -4058,6 +4078,43 @@ mod tests {
         // 已闭合的标签结尾 → 无需保留
         assert_eq!(partial_invoke_tag_suffix_len("<invoke>"), 0);
         assert_eq!(partial_invoke_tag_suffix_len("no angle bracket"), 0);
+    }
+
+    #[test]
+    fn test_partial_invoke_tag_suffix_bounded_no_stream_stall() {
+        // ⭐流停摆回归(旧代码必失败):`<` 之后的尾巴一旦超过"最长可能的半个开标签",
+        // 就一定不是被切碎的 invoke 标签,而是正文里的普通 `<`(中文散文的"a < b"、
+        // 数学式、代码里的比较运算符)。旧代码无上限地把它全部 hold 住:
+        //   一旦这个 `<` 落到缓冲区首位,keep=buf.len()、emit_len=0 → 此后**整条响应
+        //   的所有文本都不再下发**,全部囤到流结束才 flush,且缓冲无界增长。
+        // 修复后超过 64 字节即判定"不是标签",返回 0 让正文正常吐出。
+
+        // 短尾巴(可能是真的半个标签)→ 仍然保留,行为不变。
+        assert_eq!(partial_invoke_tag_suffix_len("text<inv"), 4);
+        assert_eq!(partial_invoke_tag_suffix_len("text<parameter na"), 13);
+
+        // 长尾巴(正文里的普通 `<`)→ 必须返回 0(不 hold),否则流停摆。
+        let prose = format!("条件 a < b 时触发{}", "后面还有很多正文".repeat(20));
+        assert_eq!(
+            partial_invoke_tag_suffix_len(&prose),
+            0,
+            "正文中的普通 `<` 后跟大量文本时绝不能 hold(旧代码在此无界持有 → 整条流停摆)"
+        );
+
+        // 关键退化场景:`<` 恰好在缓冲区**首位**且后面全是正文。
+        // 旧代码此时 keep=len、emit_len=0 → 一个字节都不输出。
+        let stuck = format!("<{}", "x".repeat(500));
+        assert_eq!(
+            partial_invoke_tag_suffix_len(&stuck),
+            0,
+            "`<` 在首位且尾巴超长时必须返回 0,否则 emit_len=0 → 流永久停摆"
+        );
+
+        // 边界:恰好 64 字节的尾巴仍视为可能的标签;65 字节则不再 hold。
+        let at_limit = format!("<{}", "a".repeat(63)); // 尾巴 = 64 字节
+        assert_eq!(partial_invoke_tag_suffix_len(&at_limit), 64);
+        let over_limit = format!("<{}", "a".repeat(64)); // 尾巴 = 65 字节
+        assert_eq!(partial_invoke_tag_suffix_len(&over_limit), 0);
     }
 
     #[test]

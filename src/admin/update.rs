@@ -15,27 +15,62 @@
 //! - **Windows**：不能覆盖运行中的 exe，改用「rename 旧 exe→.bak（备份+腾路径）→ rename
 //!   .new→原路径」，重启由 start.bat/run.bat 的监督循环按原路径拉起新二进制（exit(0) 即重拉）。
 //!
-//! OTA 资产按运行平台自动选择（`ASSET_BIN`）：Windows 下 `kirostudio-windows-x86_64.exe`，
-//! 其余 `kirostudio-linux-x86_64`。下错平台的二进制即便 sha256 自洽也无法运行，故必须匹配。
+//! OTA 资产按运行平台 **OS × 架构** 自动选择（`ASSET_BIN`）：Windows 下 `kirostudio-windows-x86_64.exe`，
+//! Linux 下 `kirostudio-linux-{x86_64,aarch64}`，macOS 下 `kirostudio-macos-{x86_64,aarch64}`。
+//! 下错平台/架构的二进制即便 sha256 自洽也无法运行（覆盖后服务当场死亡），故必须精确匹配；
+//! 未适配的组合在编译期直接 `compile_error!`，绝不静默回退到某个默认资产名。
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 
-/// 上游仓库（owner/repo）。发布产物见 .github/workflows/release.yml：
-/// `kirostudio-linux-x86_64`(+.sha256) 与 `kirostudio-windows-x86_64.exe`(+.sha256)。
+/// 上游仓库（owner/repo）。发布产物见 .github/workflows/release.yml，每个平台一份二进制 + 同名 .sha256：
+/// `kirostudio-linux-x86_64` / `kirostudio-linux-aarch64` /
+/// `kirostudio-macos-x86_64` / `kirostudio-macos-aarch64` / `kirostudio-windows-x86_64.exe`。
+/// ⚠️ 这份清单必须与 `ASSET_BIN` 的 cfg 分支、release.yml 的产出**三方保持一致**，
+/// 少一个平台就意味着该平台的用户点 OTA 会 404（好）或下到错误资产（灾难）。
 const GITHUB_REPO: &str = "dwgx/KiroStudio";
 
 /// 本平台对应的发布二进制资产名（按目标平台编译期选择）。
 ///
-/// release.yml 会同时产出 Linux(musl) 与 Windows(msvc) 两个资产。OTA 必须下载**与当前
-/// 运行平台匹配**的那一个——否则 Windows 上会下到 Linux ELF（下错架构），即便 sha256
-/// 校验通过（下的和它自己的哈希对得上），替换后也无法运行。历史 bug：此处曾硬编码
-/// Linux 资产名，导致 Windows 用户点面板 OTA 必然下错包。
-#[cfg(target_os = "windows")]
+/// release.yml 产出 Linux(musl) / Windows(msvc) / macOS(darwin, arm64+x86_64) 四个资产。
+/// OTA 必须下载**与当前运行平台匹配**的那一个——否则会下到别的平台/架构的二进制，
+/// 即便 sha256 校验通过（下的和它自己的哈希对得上），替换后也无法执行。
+///
+/// ⚠️ 必须同时按 **OS × ARCH** 两个维度选择，只按 OS 分是不够的：
+/// 历史 bug（两轮）——
+///   1. 最初硬编码 Linux 资产名 → Windows 用户点 OTA 必然下错包；
+///   2. 补了 Windows 分支后仍只有 `cfg(windows)` / `cfg(not(windows))` 二选一，**不看架构**：
+///      于是 macOS（无论 Intel 还是 Apple Silicon）与 arm64 Linux 都会落到
+///      `kirostudio-linux-x86_64` 分支 —— macOS 上会把 Mach-O 可执行文件替换成 Linux ELF，
+///      随后 restart_service 让进程退出，新二进制根本无法执行 → **服务当场死亡且无法自愈**
+///      （人工恢复：`mv kirostudio.bak kirostudio`）。arm64 Linux 同理（Exec format error）。
+/// 因此这里穷举 OS×ARCH；未覆盖的组合让编译期直接失败（见最后的 compile_error!），
+/// 避免"静默落到某个错误的默认值"这种最危险的形态再次发生。
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 const ASSET_BIN: &str = "kirostudio-windows-x86_64.exe";
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+const ASSET_BIN: &str = "kirostudio-windows-aarch64.exe";
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const ASSET_BIN: &str = "kirostudio-linux-x86_64";
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const ASSET_BIN: &str = "kirostudio-linux-aarch64";
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+const ASSET_BIN: &str = "kirostudio-macos-x86_64";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const ASSET_BIN: &str = "kirostudio-macos-aarch64";
+
+// 未覆盖的 OS×ARCH 组合：宁可编译失败，也绝不静默下载一个不匹配的二进制去覆盖自己。
+#[cfg(not(any(
+    all(target_os = "windows", any(target_arch = "x86_64", target_arch = "aarch64")),
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+    all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64")),
+)))]
+compile_error!(
+    "OTA 自更新未适配当前 OS/架构组合：请在 src/admin/update.rs 的 ASSET_BIN 增加对应分支，\
+     并确保 .github/workflows/release.yml 会产出同名 release 资产。\
+     （绝不能回退到某个默认资产名——那会导致 OTA 用不匹配的二进制覆盖自己，服务当场死亡。）"
+);
 /// 本地版本（编译期注入 Cargo.toml 的 version）。
 const LOCAL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
