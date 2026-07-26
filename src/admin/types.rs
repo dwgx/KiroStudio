@@ -245,6 +245,10 @@ pub struct AddCredentialRequest {
     /// 请求上限（累计达到后自动禁用，None/0=不限）
     #[serde(default)]
     pub request_limit: Option<u64>,
+    /// 该代挂号是否**无条件抢在所有 Kiro 号之前**。
+    /// None = 跟随全局 `config.customApiFirst`（默认 false = 与 Kiro 号按 priority 公平比较）。
+    #[serde(default)]
+    pub custom_api_first: Option<bool>,
 
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region

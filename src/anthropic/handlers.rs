@@ -718,11 +718,20 @@ pub async fn post_messages(
 
     // 混入池分流:选一次号,若命中自定义 API 凭据 → 原样透传原始请求体到其上游、直接返回。
     // 选到 Kiro 号(或池中无自定义号)→ 返回 None,继续走下方原 Kiro 路径(行为完全不变)。
+    //
+    // ⭐ 跨池优先级仲裁（should_try_custom_api_first）：历史实现无条件先试透传，导致用户设的
+    //    priority 在跨池维度完全无效（Kiro 号 priority=0 也抢不过代挂号）。现在先仲裁一次：
+    //    默认按 priority 公平比较，Kiro 更优时**跳过**透传直接走 Kiro；
+    //    即便跳过，Kiro 全失败后 provider 的 failover 依然会落回代挂池，兜底能力不减。
     let user_id = payload.metadata.as_ref().and_then(|m| m.user_id.clone());
-    if let Some((resp, meta)) = provider
-        .try_custom_api_passthrough(raw_body.clone(), Some(&payload.model), user_id.as_deref())
-        .await
-    {
+    let passthrough_result = if provider.token_manager().should_try_custom_api_first() {
+        provider
+            .try_custom_api_passthrough(raw_body.clone(), Some(&payload.model), user_id.as_deref())
+            .await
+    } else {
+        None
+    };
+    if let Some((resp, meta)) = passthrough_result {
         // 透传路径也记一条 usage record → 用量统计/最近请求/号池可视化能看到 custom_api。
         // 诚实边界(隔离铁律 3):透传不解析上游 SSE,拿不到真实 output token/credit——
         // input_tokens 用**本地**估算(不走远程 count_tokens API,避免阻塞低延迟中转的 TTFB),
