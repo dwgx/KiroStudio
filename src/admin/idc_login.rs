@@ -174,6 +174,8 @@ impl IdcLoginManager {
                     base_url: None,
                     api_key: None,
                     request_limit: None,
+                    // IdC 上号产出的是 Kiro 号（非 custom_api 代挂号），该开关对它无意义 → 跟随全局。
+                    custom_api_first: None,
                     region: Some(session.region.clone()),
                     auth_region: Some(session.region.clone()),
                     api_region: None,

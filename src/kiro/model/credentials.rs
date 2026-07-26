@@ -137,6 +137,19 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_limit: Option<u64>,
 
+    /// **凭据级**「是否抢在 Kiro 号之前无条件先用」（仅对 custom_api 代挂号有意义）。
+    ///
+    /// `None`（默认）= 跟随全局 `config.customApiFirst`（其默认值是 `false`）。
+    /// `Some(true)`  = 该代挂号**无条件优先**于所有 Kiro 号（历史行为：只要它可用就先透传）。
+    /// `Some(false)` = 该代挂号与 Kiro 号在**同一个 priority 维度**上公平比较。
+    ///
+    /// 背景：历史实现把「custom_api 优先」写死在分派顺序里（handlers 一进来就先试透传），
+    /// 于是用户在面板上设的 `priority` 在**跨池维度上完全无效** —— 哪怕 Kiro 号
+    /// priority=0、代挂号 priority=99，也永远先走代挂号。该字段让每个代挂号能各自选择语义。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_api_first: Option<bool>,
+
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1041,6 +1054,7 @@ mod tests {
             base_url: None,
             api_key: None,
             request_limit: None,
+            custom_api_first: None,
             region: None,
             auth_region: None,
             api_region: None,
@@ -1169,6 +1183,7 @@ mod tests {
             base_url: None,
             api_key: None,
             request_limit: None,
+            custom_api_first: None,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
             api_region: None,
@@ -1210,6 +1225,7 @@ mod tests {
             base_url: None,
             api_key: None,
             request_limit: None,
+            custom_api_first: None,
             region: None,
             auth_region: None,
             api_region: None,
@@ -1334,6 +1350,7 @@ mod tests {
             base_url: None,
             api_key: None,
             request_limit: None,
+            custom_api_first: None,
             region: Some("us-west-2".to_string()),
             auth_region: None,
             api_region: None,
