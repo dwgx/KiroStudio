@@ -62,9 +62,12 @@ git clone https://github.com/dwgx/KiroStudio.git && cd KiroStudio
 # 路径 A：Docker（需 Docker + Compose，跨平台）
 bash install.sh
 
-# 路径 B：预编译二进制 + systemd（仅 Linux x86_64，无需 Docker/Rust/Node）
+# 路径 B：预编译二进制 + 进程守护（Linux x86_64 / macOS arm64+x86_64，无需 Docker/Rust/Node）
 bash install-binary.sh
 ```
+
+`install-binary.sh` 按 `uname` 自动选对应平台的资产，并安装进程守护：
+Linux 装 systemd 服务（含 OTA 崩溃自动回滚守卫），macOS 装 launchd LaunchAgent（`KeepAlive` 崩溃自愈）。
 
 非交互（CI/无人值守）：`KIROSTUDIO_YES=1 KIROSTUDIO_PORT=8990 bash install.sh`
 （密钥留空自动生成；`install-binary.sh` 支持 `KIROSTUDIO_NO_SYSTEMD=1` 只下载配置不装服务）。
@@ -90,14 +93,23 @@ cp credentials.example.social.json config/credentials.json   # 按你的上号�
 docker compose up -d
 ```
 
-默认映射到宿主机 **8991** 端口（容器内 8990，见 `docker-compose.yml`）。启动后访问 `http://localhost:8991/admin` 打开管理面板。
+默认映射到宿主机 **8990** 端口（容器内固定 8990，宿主端口由 `.env` 的 `KIROSTUDIO_PORT` 控制，见 `docker-compose.yml`）。启动后访问 `http://localhost:8990/admin` 打开管理面板。
 
 ### 预编译二进制（GitHub Release）
 
-从 [Releases](https://github.com/dwgx/KiroStudio/releases) 下载对应平台的静态二进制（Linux x86_64 为 `kirostudio-linux-x86_64`，纯 rustls、静态链接、无运行时依赖）：
+从 [Releases](https://github.com/dwgx/KiroStudio/releases) 下载对应平台的二进制（纯 rustls、无运行时依赖）。资产命名按 `OS-架构`：
+
+| 平台 | 资产名 |
+|---|---|
+| Linux x86_64 | `kirostudio-linux-x86_64`（musl 静态链接） |
+| macOS Apple Silicon | `kirostudio-macos-aarch64` |
+| macOS Intel | `kirostudio-macos-x86_64` |
+| Windows x64 | `kirostudio-windows-x86_64.exe` |
+
+每个资产都附带同名 `.sha256`。面板的「一键升级」(OTA) 会按当前运行平台自动选择匹配的资产。
 
 ```bash
-# 下载并校验
+# 下载并校验（以 Linux x86_64 为例；macOS 换成 kirostudio-macos-aarch64 并用 shasum -a 256 -c）
 curl -LO https://github.com/dwgx/KiroStudio/releases/latest/download/kirostudio-linux-x86_64
 curl -LO https://github.com/dwgx/KiroStudio/releases/latest/download/kirostudio-linux-x86_64.sha256
 sha256sum -c kirostudio-linux-x86_64.sha256
