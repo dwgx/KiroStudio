@@ -758,6 +758,15 @@ pub async fn post_messages(
     }
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
+    tracing::debug!(
+        model = %payload.model,
+        has_thinking = payload.thinking.is_some(),
+        thinking_type = payload.thinking.as_ref().map(|t| t.thinking_type.as_str()).unwrap_or("none"),
+        budget_tokens = payload.thinking.as_ref().map(|t| t.budget_tokens).unwrap_or(0),
+        has_output_config = payload.output_config.is_some(),
+        effort = payload.output_config.as_ref().map(|c| c.effort.as_str()).unwrap_or("none"),
+        "入站 thinking 参数（override 前）"
+    );
     override_thinking_from_model_name(&mut payload);
 
     // 检查是否应本地处理 WebSearch 请求（tool_choice 强制 / 纯 web_search 单工具 / Claude Code 前缀）
@@ -1444,6 +1453,10 @@ async fn handle_non_stream_request(
             super::stream::extract_thinking_from_complete_text(&text_content);
 
         if let Some(thinking_text) = thinking {
+            tracing::debug!(
+                thinking_chars = thinking_text.chars().count(),
+                "非流式响应检测到 thinking 块"
+            );
             // 补 signature 占位符：客户端 thinking 模式下本地校验 thinking 块必须带非空
             // signature，非流式组装时同样需要（回传时 converter 只读 thinking，占位符被
             // serde 静默丢弃，不会转发给 Kiro）。详见 stream::THINKING_SIGNATURE_PLACEHOLDER。
@@ -1564,7 +1577,8 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         budget_tokens: 20000,
     });
     
-    if is_opus_4_6 {
+    if is_opus_4_6 && payload.output_config.is_none() {
+        // 仅在用户未指定 effort 时默认 high
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
         });

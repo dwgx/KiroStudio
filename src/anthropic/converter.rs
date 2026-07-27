@@ -1253,20 +1253,55 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut Ha
         .collect()
 }
 
+/// 判断模型是否为 GPT 系列（sol/terra/luna 等 OpenAI 模型）
+fn is_non_claude_model(model: &str) -> bool {
+    let lower = model.to_lowercase();
+    lower.contains("gpt-") || lower.contains("sol") || lower.contains("terra") || lower.contains("luna")
+}
+
 /// 生成thinking标签前缀
+///
+/// - Claude 模型：使用 `<thinking_mode>` 标签（上游通过文本标签触发思考）
+/// - GPT 系列模型（sol/terra/luna）：使用 `<effort>LEVEL</effort>` 标签（上游协议级识别）
 fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
     if let Some(t) = &req.thinking {
+        if t.thinking_type == "disabled" {
+            // GPT 系列模型：low 抑制推理；Claude：不注入任何标签
+            if is_non_claude_model(&req.model) {
+                tracing::debug!(
+                    model = %req.model,
+                    effort = "low",
+                    "GPT 系列模型 thinking disabled，注入 <effort>low</effort> 抑制推理"
+                );
+                return Some("<effort>low</effort>".to_string());
+            }
+            return None;
+        }
+
+        // 获取 effort 级别
+        let effort = req
+            .output_config
+            .as_ref()
+            .map(|c| c.effort.as_str())
+            .unwrap_or("high");
+
+        if is_non_claude_model(&req.model) {
+            // GPT 系列模型：使用 <effort> 标签控制推理强度
+            tracing::debug!(
+                model = %req.model,
+                effort = %effort,
+                "GPT 系列模型注入思考等级标签"
+            );
+            return Some(format!("<effort>{}</effort>", effort));
+        }
+
+        // Claude 模型：保持原有 <thinking_mode> 机制，使用固定 budget_tokens
         if t.thinking_type == "enabled" {
             return Some(format!(
                 "<thinking_mode>enabled</thinking_mode><max_thinking_length>{}</max_thinking_length>",
                 t.budget_tokens
             ));
         } else if t.thinking_type == "adaptive" {
-            let effort = req
-                .output_config
-                .as_ref()
-                .map(|c| c.effort.as_str())
-                .unwrap_or("high");
             return Some(format!(
                 "<thinking_mode>adaptive</thinking_mode><thinking_effort>{}</thinking_effort>",
                 effort
@@ -1278,7 +1313,7 @@ fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
 
 /// 检查内容是否已包含thinking标签
 fn has_thinking_tags(content: &str) -> bool {
-    content.contains("<thinking_mode>") || content.contains("<max_thinking_length>")
+    content.contains("<thinking_mode>") || content.contains("<max_thinking_length>") || content.contains("<effort>")
 }
 
 /// 构建历史消息
@@ -3091,5 +3126,97 @@ mod tests {
             text2.contains("identical to an earlier screenshot"),
             "重复图片应替换为去重占位符"
         );
+    }
+}
+
+// === 临时测试模块：验证 sol 模型 thinking prefix ===
+#[cfg(test)]
+mod sol_thinking_tests {
+    use super::*;
+    use crate::anthropic::types::*;
+
+    fn make_req(model: &str, thinking_type: &str, effort: Option<&str>) -> MessagesRequest {
+        MessagesRequest {
+            model: model.to_string(),
+            max_tokens: 4096,
+            messages: vec![],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: thinking_type.to_string(),
+                budget_tokens: 1024,
+            }),
+            output_config: effort.map(|e| OutputConfig {
+                effort: e.to_string(),
+            }),
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_is_non_claude_model() {
+        assert!(is_non_claude_model("gpt-5-sol"));
+        assert!(is_non_claude_model("gpt-4o"));
+        assert!(is_non_claude_model("sol"));
+        assert!(is_non_claude_model("my-terra-model"));
+        assert!(is_non_claude_model("luna-v2"));
+        assert!(!is_non_claude_model("claude-sonnet-4"));
+        assert!(!is_non_claude_model("claude-3-opus"));
+    }
+
+    #[test]
+    fn test_sol_enabled_high() {
+        let req = make_req("gpt-5-sol", "enabled", Some("high"));
+        let prefix = generate_thinking_prefix(&req).unwrap();
+        assert_eq!(prefix, "<effort>high</effort>", "sol enabled+high 应生成 <effort>high</effort>");
+    }
+
+    #[test]
+    fn test_sol_enabled_medium() {
+        let req = make_req("gpt-5-sol", "enabled", Some("medium"));
+        let prefix = generate_thinking_prefix(&req).unwrap();
+        assert_eq!(prefix, "<effort>medium</effort>");
+    }
+
+    #[test]
+    fn test_sol_enabled_low() {
+        let req = make_req("gpt-5-sol", "enabled", Some("low"));
+        let prefix = generate_thinking_prefix(&req).unwrap();
+        assert_eq!(prefix, "<effort>low</effort>");
+    }
+
+    #[test]
+    fn test_sol_disabled_returns_low() {
+        // thinking disabled + 非 Claude → <effort>low</effort> 抑制推理
+        let req = make_req("gpt-5-sol", "disabled", None);
+        let prefix = generate_thinking_prefix(&req).unwrap();
+        assert_eq!(prefix, "<effort>low</effort>", "disabled 非 Claude 应返回 <effort>low</effort>");
+    }
+
+    #[test]
+    fn test_claude_disabled_returns_none() {
+        // thinking disabled + Claude → None（不注入任何标签）
+        let req = make_req("claude-sonnet-4", "disabled", None);
+        assert!(generate_thinking_prefix(&req).is_none(), "Claude disabled 应返回 None");
+    }
+
+    #[test]
+    fn test_claude_enabled_uses_thinking_mode() {
+        // Claude enabled → <thinking_mode> 标签，不用 <effort>
+        let req = make_req("claude-sonnet-4", "enabled", Some("high"));
+        let prefix = generate_thinking_prefix(&req).unwrap();
+        assert!(prefix.contains("<thinking_mode>enabled</thinking_mode>"));
+        assert!(prefix.contains("<max_thinking_length>"));
+        assert!(!prefix.contains("<effort>"), "Claude 不应使用 <effort> 标签");
+    }
+
+    #[test]
+    fn test_has_thinking_tags_detects_effort() {
+        assert!(has_thinking_tags("<effort>high</effort>"));
+        assert!(has_thinking_tags("<thinking_mode>enabled</thinking_mode>"));
+        assert!(has_thinking_tags("<max_thinking_length>1024</max_thinking_length>"));
+        assert!(!has_thinking_tags("just normal text"));
     }
 }
