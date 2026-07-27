@@ -1,0 +1,96 @@
+# 部署构建：按分支手动触发，产出 Linux x86_64 musl 静态二进制作为 Actions artifact。
+#
+# 与 release.yml 的区别：
+#   - release.yml 面向"发版"：需要 tag、有版本一致性门禁、产物上传到 GitHub Release。
+#   - 本 workflow 面向"部署"：任意分支手动触发，产物只作为 artifact（保留 14 天），
+#     不建 Release、不需要 tag、不碰版本号。适合把私有仓库当前状态直接推到 VPS。
+#
+# 为什么用 musl 静态链接：VPS 上零工具链、零运行时依赖，拷过去 chmod +x 就能跑，
+# 不受 glibc 版本影响。与 release.yml 的 build-release 保持同一 target。
+#
+# 为什么必须先构建前端：rust-embed(#[derive(Embed)]) 是编译期嵌入 admin-ui/dist，
+# dist 缺失时 cargo 直接报 E0599 no associated function named `get`（不是友好报错）。
+name: deploy-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_tests:
+        description: "构建前先跑测试（出厂特性 --no-default-features）"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: admin-ui/pnpm-lock.yaml
+
+      - name: 构建前端 (admin-ui/dist)
+        working-directory: admin-ui
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: 安装 Rust (musl 目标)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: 安装 musl 工具链
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Rust 编译缓存
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: deploy-musl
+
+      # 出厂特性一律 --no-default-features（纯 rustls）：Cargo.toml 的
+      # default = ["native-tls"] 与出厂配置相反，测默认特性等于测发布版走不到的分支。
+      - name: 运行测试（出厂特性）
+        if: inputs.run_tests
+        run: cargo test --no-default-features --locked
+
+      - name: 构建 release 二进制
+        run: cargo build --release --no-default-features --target x86_64-unknown-linux-musl
+
+      - name: 打包产物 + 校验和
+        run: |
+          set -euo pipefail
+          BIN=target/x86_64-unknown-linux-musl/release/kirostudio
+          cp "$BIN" kirostudio-linux-x86_64
+          sha256sum kirostudio-linux-x86_64 > kirostudio-linux-x86_64.sha256
+          echo "--- 产物 ---"
+          ls -la kirostudio-linux-x86_64
+          cat kirostudio-linux-x86_64.sha256
+          echo "commit=$GITHUB_SHA" > build-info.txt
+          echo "ref=$GITHUB_REF" >> build-info.txt
+          echo "built_at=$(date -u +%FT%TZ)" >> build-info.txt
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kirostudio-linux-x86_64
+          path: |
+            kirostudio-linux-x86_64
+            kirostudio-linux-x86_64.sha256
+            build-info.txt
+          retention-days: 14
