@@ -74,6 +74,8 @@ PROMPT-*.md
 
 # Claude Code agent 配置/记忆（本地私有，不公开）
 .claude/
+# 项目级 AI 助手导航文件：与 .claude/ 同类,仅本地留存不推公开 repo
+CLAUDE.md
 kiro_balance_cache.json
 
 # 运行时产物 / 本地临时(绝不提交)
