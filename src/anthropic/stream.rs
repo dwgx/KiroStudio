@@ -750,6 +750,8 @@ pub struct StreamContext {
     pub in_thinking_block: bool,
     /// thinking 块是否已提取完成
     pub thinking_extracted: bool,
+    /// thinking 块累计字符数（用于 debug 日志）
+    thinking_chars_total: usize,
     /// thinking 块索引
     pub thinking_block_index: Option<i32>,
     /// 文本块索引（thinking 启用时动态分配）
@@ -863,6 +865,7 @@ impl StreamContext {
             thinking_buffer: String::new(),
             in_thinking_block: false,
             thinking_extracted: false,
+            thinking_chars_total: 0,
             thinking_block_index: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
@@ -1502,7 +1505,9 @@ impl StreamContext {
 
                     // 结束 thinking 块
                     self.in_thinking_block = false;
+                    self.thinking_chars_total += end_pos;
                     self.thinking_extracted = true;
+                    tracing::debug!(thinking_chars = self.thinking_chars_total, "流式响应 thinking 块完成");
 
                     // 发送空的 thinking_delta 事件，然后发送 content_block_stop 事件
                     if let Some(thinking_index) = self.thinking_block_index {
@@ -1543,6 +1548,7 @@ impl StreamContext {
                             }
                         }
                         self.thinking_buffer = self.thinking_buffer[safe_len..].to_string();
+                        self.thinking_chars_total += safe_len;
                     }
                     break;
                 }
@@ -1908,7 +1914,9 @@ impl StreamContext {
 
                 // 结束 thinking 块
                 self.in_thinking_block = false;
+                self.thinking_chars_total += end_pos;
                 self.thinking_extracted = true;
+                tracing::debug!(thinking_chars = self.thinking_chars_total, "流式响应 thinking 块完成");
 
                 if let Some(thinking_index) = self.thinking_block_index {
                     // 先发送空的 thinking_delta
@@ -2226,7 +2234,9 @@ impl StreamContext {
                     let remaining = self.thinking_buffer[after_pos..].trim_start().to_string();
                     self.thinking_buffer.clear();
                     self.in_thinking_block = false;
+                    self.thinking_chars_total += end_pos;
                     self.thinking_extracted = true;
+                    tracing::debug!(thinking_chars = self.thinking_chars_total, "流式响应 thinking 块完成");
                     if !remaining.is_empty() {
                         events.extend(self.create_text_delta_events(&remaining));
                     }

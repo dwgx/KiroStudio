@@ -106,6 +106,8 @@ pub fn openai_chat_to_anthropic(model: &str, raw: &Value, stream: bool) -> Value
         if e == "none" {
             out.insert("thinking".into(), json!({"type": "disabled"}));
         } else if !e.is_empty() {
+            // 传递 effort 值供 converter 区分 Claude/非Claude 模型
+            out.insert("output_config".into(), json!({"effort": e}));
             out.insert("thinking".into(), json!({"type": "enabled"}));
             thinking_enabled = true;
         }
@@ -589,6 +591,8 @@ pub fn openai_responses_to_anthropic(model: &str, raw: &Value, stream: bool) -> 
         if e == "none" {
             out.insert("thinking".into(), json!({"type": "disabled"}));
         } else if !e.is_empty() {
+            // 传递 effort 值供 converter 区分 Claude/非Claude 模型
+            out.insert("output_config".into(), json!({"effort": e}));
             out.insert("thinking".into(), json!({"type": "enabled"}));
             thinking_enabled = true;
         }
@@ -2213,4 +2217,64 @@ mod tests {
         assert_eq!(r["usage"]["output_tokens"], 2);
     }
 
+}
+
+// === 临时测试模块：验证 sol 模型 effort 传递 ===
+#[cfg(test)]
+mod sol_effort_tests {
+    use super::*;
+
+    #[test]
+    fn test_sol_chat_reasoning_effort_passthrough() {
+        // sol 模型 chat/completions 路径: reasoning_effort → output_config.effort
+        let raw = serde_json::json!({
+            "model": "gpt-5-sol",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_effort": "high"
+        });
+        let a = openai_chat_to_anthropic("gpt-5-sol", &raw, false);
+        assert_eq!(a["thinking"]["type"], "enabled", "sol thinking 应启用");
+        assert_eq!(a["output_config"]["effort"], "high", "effort 应透传为 high");
+
+        // medium
+        let raw2 = serde_json::json!({
+            "model": "gpt-5-sol",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_effort": "medium"
+        });
+        let a2 = openai_chat_to_anthropic("gpt-5-sol", &raw2, false);
+        assert_eq!(a2["output_config"]["effort"], "medium");
+
+        // low
+        let raw3 = serde_json::json!({
+            "model": "gpt-5-sol",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_effort": "low"
+        });
+        let a3 = openai_chat_to_anthropic("gpt-5-sol", &raw3, false);
+        assert_eq!(a3["output_config"]["effort"], "low");
+
+        // none → disabled, 无 output_config
+        let raw4 = serde_json::json!({
+            "model": "gpt-5-sol",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_effort": "none"
+        });
+        let a4 = openai_chat_to_anthropic("gpt-5-sol", &raw4, false);
+        assert_eq!(a4["thinking"]["type"], "disabled");
+        assert!(a4.get("output_config").is_none(), "none 时不应有 output_config");
+    }
+
+    #[test]
+    fn test_sol_responses_reasoning_effort_passthrough() {
+        // sol 模型 responses API 路径: reasoning.effort → output_config.effort
+        let raw = serde_json::json!({
+            "model": "gpt-5-sol",
+            "input": "hello",
+            "reasoning": {"effort": "high"}
+        });
+        let a = openai_responses_to_anthropic("gpt-5-sol", &raw, false);
+        assert_eq!(a["thinking"]["type"], "enabled");
+        assert_eq!(a["output_config"]["effort"], "high");
+    }
 }
