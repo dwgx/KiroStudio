@@ -635,6 +635,13 @@ fn default_cc_auto_buffer() -> bool {
     // message_delta 携带上游真实 usage 修正——CC 以最终 usage 记账,估算值不影响功能。
     //
     // 想要 message_start 即精确 input_tokens 的场景仍可将 ccAutoBuffer 设回 true(热更即时生效)。
+    //
+    // 【作用范围】本开关**同时**决定两个端点的分发方式(2026-07-27 统一):
+    //   - `/v1/messages`     : 识别到 CC 请求且开关为 true 时走 buffered
+    //   - `/cc/v1/messages`  : 开关为 true 时走 buffered
+    // 历史缺陷:`/cc/v1` 曾**无条件** buffered,导致把 CC 指向该端点的用户拿到"整轮只发 ping、
+    // 越慢越像卡死"的行为(客户端报 Stream idle timeout - no chunks received),且把本开关
+    // 设成 false 也关不掉。现两端语义统一,一个开关控制到底。
     false
 }
 

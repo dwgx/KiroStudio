@@ -1740,19 +1740,51 @@ pub async fn post_messages_cc(
     let known_tool_names = conversion_result.known_tool_names;
 
     if payload.stream {
-        // 流式响应（缓冲模式）
-        handle_stream_request_buffered(
-            provider,
-            &request_body,
-            &payload.model,
-            input_tokens,
-            thinking_enabled,
-            tool_name_map,
-            known_tool_names,
-            cache_breakdown,
-            client,
-        )
-        .await
+        // ⭐ /cc/v1 也必须尊重 ccAutoBuffer（历史缺陷：此处曾**无条件** buffered）。
+        //
+        // 背景：buffered 分发会把整轮回答憋到上游流结束才一次性吐，期间对客户端**只发 ping**。
+        // 项目已在 `default_cc_auto_buffer()` 里坐实它的两个代价并因此把 /v1 的默认改成真流式：
+        //   ① contextUsageEvent 结尾才到 → 整轮看不到进度，模型越慢**越像卡死**
+        //      （客户端侧表现为 "Stream idle timeout - no chunks received"）；
+        //   ② CC 的 steering（执行途中插消息引导）依赖观察流式增量，buffered 把整轮变成
+        //      不可打断的黑盒 → 途中发消息要等整轮憋完才被处理。
+        // 但那次修正只落在 /v1，本端点仍强制 buffered —— 于是把 CC 指向 /cc/v1 的用户
+        // 拿到的是旧的有害行为，且**把 ccAutoBuffer 设成 false 也关不掉**（开关对本路径无效）。
+        //
+        // 现在两个端点由同一个开关统一语义：
+        //   ccAutoBuffer=false（默认）→ 两端都真流式（内容边到边转发）
+        //   ccAutoBuffer=true          → 两端都 buffered（换取 message_start 即精确 input_tokens）
+        if cc_auto_buffer_enabled() {
+            tracing::debug!(
+                "/cc/v1 流式分发: buffered（ccAutoBuffer=true；整轮只发 ping 直到上游流结束）"
+            );
+            handle_stream_request_buffered(
+                provider,
+                &request_body,
+                &payload.model,
+                input_tokens,
+                thinking_enabled,
+                tool_name_map,
+                known_tool_names,
+                cache_breakdown,
+                client,
+            )
+            .await
+        } else {
+            tracing::debug!("/cc/v1 流式分发: 真流式（ccAutoBuffer=false，内容边到边转发）");
+            handle_stream_request(
+                provider,
+                &request_body,
+                &payload.model,
+                input_tokens,
+                thinking_enabled,
+                tool_name_map,
+                known_tool_names,
+                cache_breakdown,
+                client,
+            )
+            .await
+        }
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = extract_thinking_enabled() && thinking_enabled;
