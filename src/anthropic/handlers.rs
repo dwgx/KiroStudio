@@ -2294,6 +2294,22 @@ mod tier3_hotreload_tests {
     use super::*;
 
     #[test]
+    fn cc_auto_buffer_static_matches_config_default() {
+        // ccAutoBuffer 的默认值散落三处，历史上长期不一致（config 默认 false，而本文件的
+        // static 初值与 admin 快照 Default 都是 true）。运行时 static 会被 main 启动播种覆盖，
+        // 所以不一致不会立刻出错——但会让单元测试、以及任何绕过 create_router_with_provider
+        // 的代码路径读到错的默认值，排障时极易误判。此处把两者钉死。
+        //
+        // ⚠️ 本测试必须在任何 set_cc_auto_buffer 之前读取，故不与其它 TIER3 测试共用镜像。
+        assert_eq!(
+            cc_auto_buffer_enabled(),
+            crate::model::config::Config::default().cc_auto_buffer,
+            "CC_AUTO_BUFFER static 初值与 config 默认不一致：改任一处都必须同步另一处\
+             （src/anthropic/handlers.rs 的 static、src/model/config.rs 的 default_cc_auto_buffer）"
+        );
+    }
+
+    #[test]
     fn test_extract_thinking_mirror_roundtrip() {
         set_extract_thinking(true);
         assert!(extract_thinking_enabled(), "set true 后热路径应读到 true");
