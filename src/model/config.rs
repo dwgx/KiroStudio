@@ -105,8 +105,12 @@ pub struct Config {
     pub extract_thinking: bool,
 
     /// Claude Code 自动切缓冲协议：识别到 CC 请求时，`/v1` 流式自动改走 buffered 分发
-    /// （等价 `/cc/v1`，input_tokens 用上游准确值）。默认 true。CC 会校验 input_tokens，
+    /// （等价 `/cc/v1`，input_tokens 用上游准确值）。**默认 true**。CC 会校验 input_tokens，
     /// 开启后 CC 直接打 `/v1` 也能正确工作，无需手动改用 `/cc/v1`。
+    ///
+    /// ⚠️ 代价：buffered 会把整轮回答憋到上游流结束才一次性吐，期间**只发 ping**——
+    /// 模型越慢越像卡死（可能触发客户端 `Stream idle timeout`），且 CC 的 steering 失效。
+    /// 想要内容边到边的真流式请设为 false（热更即时生效）。详见 `default_cc_auto_buffer`。
     #[serde(default = "default_cc_auto_buffer")]
     pub cc_auto_buffer: bool,
 
@@ -623,26 +627,32 @@ fn default_extract_thinking() -> bool {
 }
 
 fn default_cc_auto_buffer() -> bool {
-    // 默认 false=CC 请求走**真流式**(内容边到边逐块转发)。
+    // 默认 **true** = 识别到 Claude Code 的请求走 buffered 分发。
     //
-    // 【为何改默认】cc_auto_buffer=true 时,CC 请求走 buffered 分发:整轮回答对客户端**全程只发
-    // ping、憋到上游流结束才一次性吐**——目的是让 message_start 的 input_tokens 用上游
-    // contextUsageEvent 的准确值(CC 会读它)。但实测坐实两个代价:①contextUsageEvent **结尾才到**,
-    // 所以 buffered 等于把整条流憋到最后 → 客户端整轮看不到进度(慢/看不到工具调用),模型越慢越像卡死;
-    // ②CC 的 steering(执行途中插入消息引导方向)依赖观察流式增量判断当前 turn 状态,buffered 把整轮
-    // 变成不可打断的黑盒 → 途中发消息要等整轮憋完才被处理。旁挂实测:CC 走真流式能正常干活(工具任务
-    // 成功、无 input_tokens 报错)、流式增量恢复。真流式下 message_start 发估算 input_tokens、结尾
-    // message_delta 携带上游真实 usage 修正——CC 以最终 usage 记账,估算值不影响功能。
+    // 【为何默认开】buffered 让 message_start 的 input_tokens 用上游 contextUsageEvent 的
+    // **准确值**（CC 会校验该字段），这样 CC 直接打 `/v1` 也能拿到正确行为，无需手动改用
+    // `/cc/v1`。同时与两处进程级镜像的初值保持一致（`anthropic/handlers.rs` 的
+    // `CC_AUTO_BUFFER` static、`admin/types.rs` 的 `ConfigSnapshotResponse::default`
+    // 都是 true）——历史上此处返回 false 与那两处相反，是长期的默认值不一致来源。
     //
-    // 想要 message_start 即精确 input_tokens 的场景仍可将 ccAutoBuffer 设回 true(热更即时生效)。
+    // 【代价，务必知情】buffered = 整轮回答对客户端**全程只发 ping、憋到上游流结束才一次性吐**：
+    //   ① `contextUsageEvent` **结尾才到**，所以 buffered 等于把整条流憋到最后 →
+    //      客户端整轮看不到进度（慢/看不到工具调用），**模型越慢越像卡死**；
+    //      客户端侧可能表现为 `Stream idle timeout - no chunks received`。
+    //   ② CC 的 steering（执行途中插入消息引导方向）依赖观察流式增量判断当前 turn 状态，
+    //      buffered 把整轮变成**不可打断的黑盒** → 途中发消息要等整轮憋完才被处理。
+    //
+    // 【想要真流式怎么做】把 ccAutoBuffer 设为 false（热更即时生效，无需重启）：
+    // 内容边到边逐块转发，`message_start` 发估算 input_tokens、结尾 `message_delta` 携带
+    // 上游真实 usage 修正 —— CC 以最终 usage 记账，估算值不影响功能。旁挂实测真流式下
+    // CC 能正常干活（工具任务成功、无 input_tokens 报错）且流式增量恢复。
     //
     // 【作用范围】本开关**同时**决定两个端点的分发方式(2026-07-27 统一):
     //   - `/v1/messages`     : 识别到 CC 请求且开关为 true 时走 buffered
     //   - `/cc/v1/messages`  : 开关为 true 时走 buffered
-    // 历史缺陷:`/cc/v1` 曾**无条件** buffered,导致把 CC 指向该端点的用户拿到"整轮只发 ping、
-    // 越慢越像卡死"的行为(客户端报 Stream idle timeout - no chunks received),且把本开关
-    // 设成 false 也关不掉。现两端语义统一,一个开关控制到底。
-    false
+    // 历史缺陷:`/cc/v1` 曾**无条件** buffered,导致把 CC 指向该端点的用户即便把本开关设成
+    // false 也关不掉。现两端语义统一,一个开关控制到底。
+    true
 }
 
 fn default_all_cooling_fast_fail() -> bool {
@@ -976,6 +986,30 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cc_auto_buffer_default_is_on_and_consistent_across_mirrors() {
+        // ccAutoBuffer 的默认值散落在**三处**，历史上曾长期不一致
+        //（config 默认 false，而 handlers 的 static 初值与 admin 快照 Default 都是 true）：
+        //   ① 本函数 default_cc_auto_buffer()
+        //   ② src/anthropic/handlers.rs 的 CC_AUTO_BUFFER static 初值
+        //   ③ src/admin/types.rs 的 ConfigSnapshotResponse::default
+        // 运行时 ② 会被 main 启动播种覆盖，所以不一致不会立刻出错——但会让单元测试、
+        // 以及任何绕过 create_router_with_provider 的代码路径读到错的默认值，排障时极易误判。
+        // 此处把 ①②的一致性钉死；改任一处默认值都必须同步另一处，否则本测试失败。
+        assert!(
+            default_cc_auto_buffer(),
+            "ccAutoBuffer 默认应为 true（CC 请求走 buffered，message_start 用上游精确 input_tokens）"
+        );
+        assert_eq!(
+            Config::default().cc_auto_buffer,
+            default_cc_auto_buffer(),
+            "Config::default() 必须走 default_cc_auto_buffer()，不得另写字面量"
+        );
+        // ② 的一致性断言放在 handlers 自己的测试里
+        //（cc_auto_buffer_enabled 是模块私有函数，不为测试放宽生产可见性）：
+        //   见 anthropic::handlers::tier3_hotreload_tests::cc_auto_buffer_static_matches_config_default
+    }
 
     #[test]
     fn login_background_defaults_on() {
