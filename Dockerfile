@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax removed for mirror
 # ============================================================================
 # KiroStudio 多阶段构建
 #   阶段 1 (frontend-builder): Node 构建 React admin-ui 静态产物
