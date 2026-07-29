@@ -631,8 +631,9 @@ impl KiroCredentials {
     /// 规则(对齐 Kiro IDE + kiro-account-manager,修复新加 idc 号缺 profileArn 报
     /// `400 profileArn is required`):
     /// - external_idp(M365 企业)→ `None`：这类号带 profileArn 反而 403，绝不发。
+    /// - api_key(ksk_ 凭据)→ `None`：同理，见下方实测记录。
     /// - 自带真实 profile_arn → 用它。
-    /// - idc/social/api_key 缺 profile_arn → 回退默认 BuilderId profileArn（Kiro IDE 公共
+    /// - idc/social 缺 profile_arn → 回退默认 BuilderId profileArn（Kiro IDE 公共
     ///   占位 ARN，上游接受）。**根治**:idc 号入池时常没 profileArn(登录未拉),
     ///   而对话/余额端点要求必带,缺了就 400/403。
     ///
@@ -656,7 +657,19 @@ impl KiroCredentials {
         if self.is_external_idp_credential() {
             return None;
         }
-        // idc/social/api_key 缺 arn → 回退默认 BuilderId 占位 ARN（上游接受）。
+        // api_key(ksk_)号同 external_idp:占位 ARN 属于别的账户(638616132270),ksk_ 凭据
+        // 套上去上游判定 token 与 profile 不匹配,回 `403 The bearer token included in the
+        // request is invalid`——报文形似 token 失效,实为 ARN 越权,极易误诊为「key 不可用」。
+        // 实测(2026-07-29,同一把 ksk_ 密钥,仅 profileArn 一个变量):
+        //   不带 profileArn → 400 INVALID_MODEL_ID(已过认证,仅模型名不合)
+        //   带占位 profileArn → 403 bearer token invalid
+        // 对照:伪造 key 不带 ARN → 403,故 400 证明认证通过。kiro-go 用 `omitempty`
+        // 天然不发(ksk_ 号无 ARN),这正是同一把 key 在 9090 可用、8990 不可用的原因。
+        // 真实 ARN 若已解析到(上面第一分支)仍照发,此处只拦占位值。
+        if self.is_api_key_credential() {
+            return None;
+        }
+        // idc/social 缺 arn → 回退默认 BuilderId 占位 ARN（上游接受）。
         Some(crate::kiro::token_manager::DEFAULT_BUILDER_ID_PROFILE_ARN.to_string())
     }
 
@@ -927,6 +940,45 @@ mod tests {
             ext_no_arn.effective_profile_arn(),
             None,
             "external_idp 缺真实 arn 应返回 None（不套默认占位 ARN）"
+        );
+    }
+
+    /// 回归(2026-07-29):api_key(ksk_)凭据缺真实 profileArn 时必须返回 None。
+    ///
+    /// 套上默认 BuilderId 占位 ARN(属账户 638616132270)会让上游回
+    /// `403 The bearer token included in the request is invalid` —— 报文形似
+    /// key 失效,实为 ARN 与 token 不匹配,曾被误诊为「这把 key 不可用」。
+    /// 实测同一把 ksk_ 密钥:不带 ARN → 400 INVALID_MODEL_ID(认证已通过);
+    /// 带占位 ARN → 403。kiro-go 靠 `omitempty` 天然不发,故同 key 在其上可用。
+    #[test]
+    fn test_effective_profile_arn_api_key_no_placeholder() {
+        // ① auth_method = api_key,缺 arn → None
+        let mut ak = KiroCredentials::default();
+        ak.auth_method = Some("api_key".to_string());
+        assert_eq!(
+            ak.effective_profile_arn(),
+            None,
+            "api_key 缺真实 arn 必须返回 None(套占位 ARN 会 403)"
+        );
+        assert!(!ak.should_send_profile_arn());
+
+        // ② 仅凭 kiro_api_key 字段识别(auth_method 未标注)→ 同样不发
+        let mut ak2 = KiroCredentials::default();
+        ak2.kiro_api_key = Some("ksk_example".to_string());
+        assert_eq!(
+            ak2.effective_profile_arn(),
+            None,
+            "有 kiro_api_key 即视为 API Key 凭据,不套占位 ARN"
+        );
+
+        // ③ 已解析到真实 arn → 照发(此修复只拦占位值,不影响真实 ARN)
+        let mut ak3 = KiroCredentials::default();
+        ak3.auth_method = Some("api_key".to_string());
+        ak3.profile_arn = Some("arn:aws:codewhisperer:us-east-1:333:profile/REAL".to_string());
+        assert_eq!(
+            ak3.effective_profile_arn().as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:333:profile/REAL"),
+            "api_key 有真实 arn 应照发"
         );
     }
 

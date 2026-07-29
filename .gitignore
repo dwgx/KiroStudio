@@ -82,3 +82,7 @@ kiro_balance_cache.json
 kiro_stats.json
 replay.tmp.json
 scripts/
+
+# 运行时配置挂载目录：整目录不进 repo。含 credentials.json / trash.json
+# （回收站保留了被删凭据的完整 accessToken/refreshToken）等真实密钥。
+/config/

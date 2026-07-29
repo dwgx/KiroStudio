@@ -88,9 +88,11 @@ pub async fn register_client(
     let (x_amz, ua) = build_user_agent(config);
 
     let body = serde_json::json!({
-        "clientName": "Amazon Q Developer for command line",
+        "clientName": "Kiro",
         "clientType": "public",
         "scopes": OIDC_SCOPES,
+        "grantTypes": ["authorization_code", "refresh_token"],
+        "redirectUris": ["http://127.0.0.1/oauth/callback"],
     });
 
     let resp = client
