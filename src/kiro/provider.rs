@@ -432,16 +432,21 @@ impl KiroProvider {
             // 401/403 凭据问题
             if matches!(status.as_u16(), 401 | 403) {
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
+                // API Key 凭据无 refresh_token，跳过强刷避免无意义重试+24h冷却
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
-                    tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                    if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
-                        tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
-                        continue;
+                    if ctx.credentials.is_api_key_credential() {
+                        tracing::warn!("凭据 #{} (API Key) bearer token 被上游拒绝，跳过强刷（API Key 不支持刷新）", ctx.id);
+                    } else {
+                        tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
+                        if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
+                            tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
+                            continue;
+                        }
+                        tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
+                        // 刷新失败 = 认证态有问题，加一段冷却让调度避开它
+                        self.token_manager.report_auth_cooldown(ctx.id);
                     }
-                    tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
-                    // 刷新失败 = 认证态有问题，加一段冷却让调度避开它
-                    self.token_manager.report_auth_cooldown(ctx.id);
                 }
 
                 let has_available = self.token_manager.report_failure(ctx.id);
@@ -884,16 +889,21 @@ impl KiroProvider {
                 }
 
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
+                // API Key 凭据无 refresh_token，跳过强刷避免无意义重试+24h冷却
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
-                    tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                    if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
-                        tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
-                        continue;
+                    if ctx.credentials.is_api_key_credential() {
+                        tracing::warn!("凭据 #{} (API Key) bearer token 被上游拒绝，跳过强刷（API Key 不支持刷新）", ctx.id);
+                    } else {
+                        tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
+                        if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
+                            tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
+                            continue;
+                        }
+                        tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
+                        // 刷新失败 = 认证态有问题，加一段冷却让调度避开它
+                        self.token_manager.report_auth_cooldown(ctx.id);
                     }
-                    tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
-                    // 刷新失败 = 认证态有问题，加一段冷却让调度避开它
-                    self.token_manager.report_auth_cooldown(ctx.id);
                 }
 
                 last_outcome = crate::usage::RequestOutcome::AuthFailed;

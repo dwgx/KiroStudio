@@ -585,10 +585,11 @@ pub(crate) async fn get_usage_limits(
     );
 
     // profileArn：统一走 effective_profile_arn（与对话/端点路径同口径）——
-    // idc/social/api_key 缺 arn 回退默认 BuilderId,external_idp 用它自己租户的真实 arn。
+    // idc/social 缺 arn 回退默认 BuilderId,external_idp/api_key 用它自己的真实 arn。
     // 关键修复：原先此处直接读 credentials.profile_arn 并对**所有**类型回退默认 BuilderId ARN,
     // 导致 external_idp 号(带的是别的租户占位 arn)余额查询 403 Invalid token → 余额恒 null。
-    // effective_profile_arn 对 external_idp 缺真实 arn 时返回 None,此时不附带 profileArn 参数。
+    // effective_profile_arn 对 external_idp / api_key 缺真实 arn 时返回 None,此时不附带
+    // profileArn 参数（ksk_ 凭据套占位 ARN 同样 403,见 effective_profile_arn 内实测记录）。
     if let Some(arn) = credentials.effective_profile_arn() {
         url.push_str(&format!("&profileArn={}", urlencoding::encode(&arn)));
     }
