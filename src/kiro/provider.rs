@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 use crate::http_client::{ProxyConfig, build_streaming_client};
-use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
+use crate::kiro::endpoint::{KiroEndpoint, RequestContext, ENDPOINT_FALLBACK_ORDER};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
@@ -196,6 +196,33 @@ impl KiroProvider {
             .get(name)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
+    }
+
+    /// 构造本次调用的端点回退链
+    ///
+    /// 以凭据/配置指定的端点为链首（保持既有行为不变），其余已注册的备用端点按
+    /// [`ENDPOINT_FALLBACK_ORDER`] 顺序补齐。`endpoint_fallback = false` 或只注册了
+    /// 一个端点时退化为单元素链，行为与改动前完全一致。
+    fn endpoint_chain_for(
+        &self,
+        credentials: &KiroCredentials,
+        fallback_enabled: bool,
+    ) -> anyhow::Result<Vec<Arc<dyn KiroEndpoint>>> {
+        let primary = self.endpoint_for(credentials)?;
+        if !fallback_enabled {
+            return Ok(vec![primary]);
+        }
+        let primary_name = primary.name();
+        let mut chain = vec![primary];
+        for name in ENDPOINT_FALLBACK_ORDER {
+            if *name == primary_name {
+                continue;
+            }
+            if let Some(ep) = self.endpoints.get(*name) {
+                chain.push(ep.clone());
+            }
+        }
+        Ok(chain)
     }
 
     /// 发送非流式 API 请求
@@ -589,8 +616,8 @@ impl KiroProvider {
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
 
-            let endpoint = match self.endpoint_for(&ctx.credentials) {
-                Ok(e) => e,
+            let chain = match self.endpoint_chain_for(&ctx.credentials, config.endpoint_fallback) {
+                Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
                     self.token_manager.report_failure(ctx.id);
@@ -598,44 +625,84 @@ impl KiroProvider {
                 }
             };
 
-            let rctx = RequestContext {
-                credentials: &ctx.credentials,
-                token: &ctx.token,
-                machine_id: &machine_id,
-                config: &config,
-                is_1m,
-            };
-
-            let url = endpoint.api_url(&rctx);
-            let body = endpoint.transform_api_body(request_body, &rctx);
-
-            let base = self
-                .client_for(&ctx.credentials)?
-                .post(&url)
-                .body(body)
-                .header("content-type", "application/json");
-            let request = endpoint.decorate_api(base, &rctx);
-
             last_credential_id = Some(ctx.id);
 
-            let response = match request.send().await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    tracing::warn!(
-                        "API 请求发送失败（尝试 {}/{}）: {}",
-                        attempt + 1,
-                        max_retries,
-                        e
-                    );
-                    // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
-                    // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
-                    last_error = Some(e.into());
-                    last_outcome = crate::usage::RequestOutcome::NetworkError;
-                    if attempt + 1 < max_retries {
-                        sleep(Self::retry_delay(attempt)).await;
+            // 端点级回退：上游 429/5xx 多为端点容量问题，先在同一凭据上换端点重试，
+            // 不消耗凭据重试预算（max_retries）、不设凭据冷却、不扣健康分。只有整条
+            // 端点链都失败时才把最后一次响应交给下面的凭据级错误分类逻辑处理。
+            let mut endpoint = chain[0].clone();
+            let mut response: Option<reqwest::Response> = None;
+            let last_idx = chain.len() - 1;
+
+            for (idx, candidate) in chain.iter().enumerate() {
+                let rctx = RequestContext {
+                    credentials: &ctx.credentials,
+                    token: &ctx.token,
+                    machine_id: &machine_id,
+                    config: &config,
+                    is_1m,
+                };
+
+                let url = candidate.api_url(&rctx);
+                let body = candidate.transform_api_body(request_body, &rctx);
+
+                let base = self
+                    .client_for(&ctx.credentials)?
+                    .post(&url)
+                    .body(body)
+                    .header("content-type", "application/json");
+                let request = candidate.decorate_api(base, &rctx);
+
+                match request.send().await {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        let transient =
+                            matches!(status.as_u16(), 408 | 429) || status.is_server_error();
+                        // 非瞬态（含成功）→ 就用这个响应，交给下游逻辑。
+                        // 瞬态且还有备用端点 → 换下一个端点重试。
+                        if !transient || idx == last_idx {
+                            endpoint = candidate.clone();
+                            response = Some(resp);
+                            break;
+                        }
+                        tracing::warn!(
+                            "端点 {} 返回瞬态错误 {}，回退到下一端点（凭据 #{} 不计失败，尝试 {}/{}）",
+                            candidate.name(),
+                            status,
+                            ctx.id,
+                            attempt + 1,
+                            max_retries
+                        );
                     }
-                    continue;
+                    Err(e) => {
+                        if idx == last_idx {
+                            tracing::warn!(
+                                "API 请求发送失败（尝试 {}/{}）: {}",
+                                attempt + 1,
+                                max_retries,
+                                e
+                            );
+                            // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
+                            // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
+                            last_error = Some(e.into());
+                            last_outcome = crate::usage::RequestOutcome::NetworkError;
+                            break;
+                        }
+                        tracing::warn!(
+                            "端点 {} 发送失败，回退到下一端点: {}",
+                            candidate.name(),
+                            e
+                        );
+                    }
                 }
+            }
+
+            let Some(response) = response else {
+                // 整条端点链都发送失败（网络层）：错误已在链内记录。
+                if attempt + 1 < max_retries {
+                    sleep(Self::retry_delay(attempt)).await;
+                }
+                continue;
             };
 
             let status = response.status();
@@ -1242,6 +1309,33 @@ mod tests {
 
         // 小池但部分禁用：available 做下限，仍保证可用号被摸到。
         assert!(compute_max_retries(3, 2) >= 2);
+    }
+
+    /// 端点回退链：链首是主端点，其余按固定顺序补齐且无重复。
+    ///
+    /// 这层回退正是单凭据（`compute_max_retries(1,1) == 1`，凭据级零重试）下
+    /// 唯一的 429 容错来源，故链长必须 > 1 才有意义。
+    #[test]
+    fn test_endpoint_fallback_order_is_usable_as_chain() {
+        use crate::kiro::endpoint::ENDPOINT_FALLBACK_ORDER;
+
+        assert!(
+            ENDPOINT_FALLBACK_ORDER.len() > 1,
+            "回退链需至少 2 个端点，否则单凭据下 429 仍无容错"
+        );
+        assert_eq!(
+            ENDPOINT_FALLBACK_ORDER[0],
+            crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME,
+            "链首必须是 ide，保持既有默认行为不变"
+        );
+        let mut uniq = ENDPOINT_FALLBACK_ORDER.to_vec();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(
+            uniq.len(),
+            ENDPOINT_FALLBACK_ORDER.len(),
+            "回退链不得有重复端点（会白打同一 host 浪费预算）"
+        );
     }
 
     #[test]

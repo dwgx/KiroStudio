@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use clap::Parser;
-use kiro::endpoint::{IdeEndpoint, KiroEndpoint};
+use kiro::endpoint::{AmazonQEndpoint, CodeWhispererEndpoint, IdeEndpoint, KiroEndpoint};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
@@ -179,6 +179,7 @@ fn bootstrap_config_if_missing(config_path: &str) -> (String, bool) {
         "tlsBackend": "rustls",
         "region": "us-east-1",
         "defaultEndpoint": "ide",
+        "endpointFallback": true,
     });
     let body = serde_json::to_string_pretty(&cfg).unwrap_or_default();
     if let Err(e) = std::fs::write(&target, body) {
@@ -333,6 +334,11 @@ async fn main() {
     {
         let ide = IdeEndpoint::new();
         endpoints.insert(ide.name().to_string(), Arc::new(ide));
+        // 备用端点：供 429/5xx 时的端点级回退使用（endpointFallback）。
+        let cw = CodeWhispererEndpoint::new();
+        endpoints.insert(cw.name().to_string(), Arc::new(cw));
+        let aq = AmazonQEndpoint::new();
+        endpoints.insert(aq.name().to_string(), Arc::new(aq));
     }
 
     // 校验默认端点存在

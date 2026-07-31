@@ -131,6 +131,15 @@ pub struct Config {
     #[serde(default = "default_cooldown_enabled")]
     pub cooldown_enabled: bool,
 
+    /// 是否在上游瞬态错误（429/5xx）时做**端点级**回退（默认 true）
+    ///
+    /// 上游 429 常是端点容量问题而非凭据额度问题：同一凭据换到 codewhisperer /
+    /// amazonq 端点往往立刻成功（kiro-go 的 `endpointFallback` 即此机制）。
+    /// 单凭据下 `compute_max_retries` 退化为 1、一次 429 就透传给客户端，
+    /// 端点回退在**不额外消耗凭据重试预算**的前提下补上这一层容错。
+    #[serde(default = "default_endpoint_fallback")]
+    pub endpoint_fallback: bool,
+
     /// 冷却时长缩放百分比（10..500，默认 100=原时长）。统一缩放所有冷却基础时长：
     /// <100 更短（激进，快速重试，适合号多）、>100 更长（保守，慎防封号，适合号少）。
     /// 只缩放短时/瞬时冷却基数，不动认证失败/封号那类长冷却硬窗（防误配把死号放行）。
@@ -715,6 +724,10 @@ fn default_cooldown_enabled() -> bool {
     true
 }
 
+fn default_endpoint_fallback() -> bool {
+    true
+}
+
 fn default_affinity_enabled() -> bool {
     true
 }
@@ -856,6 +869,7 @@ impl Default for Config {
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             cooldown_enabled: default_cooldown_enabled(),
+            endpoint_fallback: default_endpoint_fallback(),
             cooldown_scale_pct: default_cooldown_scale_pct(),
             rate_limit_jitter_pct: default_rate_limit_jitter_pct(),
             inbound_throttle_enabled: default_true(),
