@@ -16,9 +16,17 @@ KiroStudio 用 Rust / Axum 编写，接收标准 **Anthropic Messages API** 请�
 
 前端管理面板（React + Vite）在编译期通过 `rust-embed` 嵌入二进制，**最终产物是单个可执行文件**，不依赖任何外部静态资源目录，拷贝即可运行。
 
+## 本分支的增强
+
+本仓库是 [**dwgx/KiroStudio**](https://github.com/dwgx/KiroStudio) 的 fork，在其之上追加了以下改动（均已附单元测试）：
+
+- **端点级回退** —— 上游 429/5xx 多为**端点**容量问题而非凭据额度问题。此前只注册 `ide` 一个端点，单凭据时 `compute_max_retries` 退化为 1、一次 429 便直接透传给客户端（Codex 侧表现为 `exceeded retry limit`）。现补上 `codewhisperer` / `amazonq` 两个备用端点，瞬态错误先在同一凭据上换端点重试，**不消耗凭据重试预算、不设冷却、不扣健康分**。开关：`endpointFallback`（默认开）。
+- **请求体超限时主动截断历史** —— 上游按**字节**拒绝过大请求（约 2MB → `CONTENT_LENGTH_EXCEEDS_THRESHOLD`），而客户端的自动压缩按 **token** 阈值触发，两者不同量纲，字节先撞线时压缩根本没机会启动。现于 900KB 处丢弃最旧历史（保留最近 4 条）并插入占位说明，长会话不再必然撞墙。
+- **GPT 系列 effort 透传** —— `reasoning_effort` / `reasoning.effort` → `output_config.effort`，converter 层为 sol/terra/luna 生成 `<effort>LEVEL</effort>` 标签，支持任意档位（含 `max`）。
+
 ## 致谢
 
-本项目基于 [**hank9999/kiro.rs**](https://github.com/hank9999/kiro.rs)（MIT License）深度魔改与增强，在原项目「Anthropic ↔ Kiro 协议转换」核心之上做了大量工程化扩展。感谢原作者 [hank9999](https://github.com/hank9999) 打下的基础。
+本项目基于 [**hank9999/kiro.rs**](https://github.com/hank9999/kiro.rs)（MIT License）深度魔改与增强，在原项目「Anthropic ↔ Kiro 协议转换」核心之上做了大量工程化扩展。感谢原作者 [hank9999](https://github.com/hank9999) 打下的基础，以及 [dwgx](https://github.com/dwgx) 在此之上的工程化建设。
 
 相较原项目，主要增强点：
 
