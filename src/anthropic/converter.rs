@@ -820,12 +820,17 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let current_message = CurrentMessage::new(user_input);
 
     // 13. 构建 ConversationState
-    let conversation_state = ConversationState::new(conversation_id)
+    let mut conversation_state = ConversationState::new(conversation_id)
         .with_agent_continuation_id(agent_continuation_id)
         .with_agent_task_type("vibe")
         .with_chat_trigger_type(chat_trigger_type)
         .with_current_message(current_message)
         .with_history(history);
+
+    // 14. 超限保护：上游按**字节**拒绝过大请求（400 CONTENT_LENGTH_EXCEEDS_THRESHOLD），
+    // 而客户端的自动压缩按 token 阈值触发，两者不对齐 → 长会话会撞墙且无法自恢复。
+    // 这里在网关侧主动丢弃最旧历史（对齐 kiro-go 的 truncatePayloadToLimit）。
+    super::truncate::truncate_history_if_needed(&mut conversation_state, &model_id);
 
     if !tool_name_map.is_empty() {
         tracing::info!(
