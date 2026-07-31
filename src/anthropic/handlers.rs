@@ -486,6 +486,16 @@ fn translate_quota_subscription(err_str: &str) -> Option<TranslatedError> {
             message: "当前凭据所在 region 未开通该功能（profile 未激活）。排障：①网关会在刷新时自动验活重选可用 region；②如持续，右键该凭据切换 Profile ARN 到已开通 region（如 eu-central-1）；③确认该账号确在某 region 开通了 Kiro。".to_string(),
         });
     }
+    // REQUEST_BODY_INVALID 是**请求体格式**问题（如历史未严格 user/assistant 交替），
+    // 与凭据无关。必须先于下面的 "Improperly formed" 判定，否则会被误报成「订阅失效
+    // 或 token 无效」，把排障引向刷新 Token / 换号的错误方向（实测踩过）。
+    if err_str.contains("REQUEST_BODY_INVALID") {
+        return Some(TranslatedError {
+            status: StatusCode::BAD_GATEWAY,
+            error_type: "api_error",
+            message: "上游拒收请求体格式（REQUEST_BODY_INVALID，与凭据无关）。排障：①检查会话历史是否严格 user/assistant 交替、首条为 user；②确认工具定义与 tool_result 配对完整；③查看网关日志中同一时刻是否发生过历史截断。".to_string(),
+        });
+    }
     if err_str.contains("Improperly formed") || err_str.contains("Invalid token") || err_str.contains("subscription") {
         return Some(TranslatedError {
             status: StatusCode::BAD_GATEWAY,
@@ -843,10 +853,15 @@ pub async fn post_messages(
 
     // 估算影子缓存：系统提示 + 历史轮次已被 Bedrock prefix cache 缓存（通过 agentContinuationId）。
     // 仅在有历史轮次时（messages.len() > 1）估算；首轮返回 0 保守不注入。
-    let prefix_tokens = token::count_prefix_tokens(
-        payload.system.as_deref(),
-        &payload.messages,
-    );
+    //
+    // ⚠️ 必须尊重 promptCacheEnabled：见 /cc/v1 路径同处注释——影子缓存会经
+    // `billed_input_tokens` 把 input_tokens 扣成 0，导致客户端自动压缩永不触发。
+    // 开关打开时由 count_prefix_tokens 内部的 85% 上限兜住（见该函数注释）。
+    let prefix_tokens = if provider.token_manager().config().prompt_cache_enabled {
+        token::count_prefix_tokens(payload.system.as_deref(), &payload.messages, input_tokens)
+    } else {
+        0
+    };
     let cache_breakdown: Option<CacheUsageBreakdown> = if prefix_tokens > 0 {
         Some(CacheUsageBreakdown {
             cache_creation_input_tokens: 0,
@@ -1728,10 +1743,16 @@ pub async fn post_messages_cc(
     ) as i32;
 
     // 估算影子缓存（与 /v1 路径逻辑一致）
-    let prefix_tokens = token::count_prefix_tokens(
-        payload.system.as_deref(),
-        &payload.messages,
-    );
+    //
+    // 两道防线保证 `input_tokens` 不会被 `billed_input_tokens` 扣成 0（扣成 0 会让
+    // 客户端认为本轮没消耗上下文 → 自动压缩永不触发 → 历史无限累积）：
+    // ①尊重 promptCacheEnabled（关则完全不算）；②开启时由 count_prefix_tokens
+    // 内部的 85% 上限兜底，见该函数注释。
+    let prefix_tokens = if provider.token_manager().config().prompt_cache_enabled {
+        token::count_prefix_tokens(payload.system.as_deref(), &payload.messages, input_tokens)
+    } else {
+        0
+    };
     let cache_breakdown: Option<CacheUsageBreakdown> = if prefix_tokens > 0 {
         Some(CacheUsageBreakdown {
             cache_creation_input_tokens: 0,
