@@ -32,7 +32,7 @@ const BETA_1M: &str = "context-1m-2025-08-07";
 
 /// 纯函数:据 is_1m 决定要不要注入 1M beta 头。抽出便于单测(decorate_api 返回 RequestBuilder
 /// 不便直接断言 header)。is_1m=true → Some(beta 值);否则 None(不注入)。
-fn beta_header_for_1m(is_1m: bool) -> Option<&'static str> {
+pub(super) fn beta_header_for_1m(is_1m: bool) -> Option<&'static str> {
     if is_1m { Some(BETA_1M) } else { None }
 }
 
@@ -149,7 +149,7 @@ impl KiroEndpoint for IdeEndpoint {
 }
 
 /// 将 profile_arn 注入到请求体 JSON 根对象
-fn inject_profile_arn(request_body: &str, profile_arn: &Option<String>) -> String {
+pub(super) fn inject_profile_arn(request_body: &str, profile_arn: &Option<String>) -> String {
     if let Some(arn) = profile_arn {
         if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(request_body) {
             json["profileArn"] = serde_json::Value::String(arn.clone());

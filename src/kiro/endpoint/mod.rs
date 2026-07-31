@@ -11,8 +11,10 @@ use reqwest::RequestBuilder;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
+pub mod alt;
 pub mod ide;
 
+pub use alt::{AmazonQEndpoint, CodeWhispererEndpoint, ENDPOINT_FALLBACK_ORDER};
 pub use ide::IdeEndpoint;
 
 /// Kiro 端点
