@@ -29,6 +29,7 @@ pub(crate) mod handlers;
 pub(crate) mod middleware;
 mod router;
 mod stream;
+pub(crate) mod truncate;
 pub mod types;
 mod websearch;
 
