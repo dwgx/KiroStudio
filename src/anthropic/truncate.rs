@@ -16,7 +16,7 @@
 //!   assistant 则一并丢弃。
 
 use crate::kiro::model::requests::conversation::{
-    ConversationState, HistoryUserMessage, Message,
+    ConversationState, HistoryAssistantMessage, HistoryUserMessage, Message,
 };
 
 /// 序列化后请求体的字节上限。
@@ -48,6 +48,58 @@ fn drop_leading_assistant(mut tail: Vec<Message>) -> Vec<Message> {
     }
     tail
 }
+
+/// 剥掉开头那些「引用了已被丢弃的 toolUse」的孤立 toolResults。
+///
+/// 历史里 assistant 用 `toolUses` 发起调用、随后的 user 用 `toolResults` 回结果，
+/// 两者靠 `tool_use_id` 配对。按字节切历史会把配对切断，留下引用不存在 id 的孤立
+/// toolResults，上游据此判定 `400 REQUEST_BODY_INVALID`（实测：纯文本历史截断能过，
+/// 带工具的真实会话必失败）。
+///
+/// 这里从头逐条剥离，直到首条 user 不再含无主的 toolResults。只需处理开头：
+/// 尾部的配对天然完整（切口只在前端）。
+fn drop_orphan_tool_results(mut tail: Vec<Message>) -> Vec<Message> {
+    loop {
+        // 收集当前 tail 里所有 assistant 发起过的 tool_use_id。
+        let known: std::collections::HashSet<&str> = tail
+            .iter()
+            .filter_map(|m| match m {
+                Message::Assistant(a) => a.assistant_response_message.tool_uses.as_ref(),
+                _ => None,
+            })
+            .flatten()
+            .map(|t| t.tool_use_id.as_str())
+            .collect();
+
+        let orphan = match tail.first() {
+            Some(Message::User(u)) => {
+                let results = &u.user_input_message.user_input_message_context.tool_results;
+                !results.is_empty()
+                    && results.iter().any(|r| !known.contains(r.tool_use_id.as_str()))
+            }
+            _ => false,
+        };
+
+        if !orphan {
+            return tail;
+        }
+        // 丢掉这条孤立 toolResults 的 user，以及紧随其后的 assistant（保持交替）。
+        tail.remove(0);
+        if matches!(tail.first(), Some(Message::Assistant(_))) {
+            tail.remove(0);
+        }
+        if tail.is_empty() {
+            return tail;
+        }
+    }
+}
+
+/// 占位条之后紧跟的 assistant 应答。
+///
+/// 上游要求历史严格 user/assistant 交替，否则 `400 REQUEST_BODY_INVALID`。
+/// 占位本身是一条 user 消息，而 [`drop_leading_assistant`] 又保证 tail 以 user
+/// 开头，二者直接相接会形成 user+user。故在中间补一条极短的 assistant 应答。
+const PLACEHOLDER_ACK: &str = "Understood.";
 
 /// 若请求体超过 [`MAX_PAYLOAD_BYTES`]，丢弃最旧的历史轮次直至满足上限。
 ///
@@ -85,10 +137,18 @@ pub fn truncate_history_if_needed(state: &mut ConversationState, model_id: &str)
     }
 
     let tail = drop_leading_assistant(conversation[keep_from..].to_vec());
+    // 切口可能落在 toolUse/toolResult 之间，留下无主的 toolResults → 上游 400。
+    let tail = drop_orphan_tool_results(tail);
+    // 上一步可能又暴露出开头的 assistant，再规整一次。
+    let tail = drop_leading_assistant(tail);
 
-    let mut rebuilt = Vec::with_capacity(tail.len() + 1);
+    let mut rebuilt = Vec::with_capacity(tail.len() + 2);
     if keep_from > 0 {
+        // 占位(user) + 应答(assistant)，保持与后续 tail(user 开头) 的严格交替。
         rebuilt.push(placeholder);
+        rebuilt.push(Message::Assistant(HistoryAssistantMessage::new(
+            PLACEHOLDER_ACK,
+        )));
     }
     rebuilt.extend(tail);
     state.history = rebuilt;
@@ -173,12 +233,13 @@ mod tests {
         let mut s = state_with(hist);
         truncate_history_if_needed(&mut s, "auto");
 
-        // 跳过占位条后，其余历史不得以 assistant 开头。
+        // 占位(user) 之后紧跟应答(assistant)，再往后才是保留的 tail(user 开头)，
+        // 这样才满足上游的严格交替要求。
         let rest: Vec<&Message> = s.history.iter().skip(1).collect();
         if let Some(first) = rest.first() {
             assert!(
-                matches!(first, Message::User(_)),
-                "占位之后必须紧跟 user 消息"
+                matches!(first, Message::Assistant(_)),
+                "占位之后必须紧跟 assistant 应答，否则形成 user+user 触发上游 400"
             );
         }
     }
@@ -187,5 +248,154 @@ mod tests {
     fn test_empty_history_is_noop() {
         let mut s = state_with(vec![]);
         assert_eq!(truncate_history_if_needed(&mut s, "auto"), 0);
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    use crate::kiro::model::requests::conversation::HistoryAssistantMessage;
+
+    #[test]
+    fn test_alternation_preserved_after_truncation() {
+        let big = "z".repeat(120 * 1024);
+        let mut hist = Vec::new();
+        for _ in 0..10 {
+            hist.push(Message::User(HistoryUserMessage::new(&big, "auto")));
+            hist.push(Message::Assistant(HistoryAssistantMessage::new(&big)));
+        }
+        let mut s = ConversationState::new("11111111-1111-4111-8111-111111111111");
+        s.history = hist;
+        truncate_history_if_needed(&mut s, "auto");
+
+        // 上游要求 user/assistant 严格交替，否则 400 REQUEST_BODY_INVALID。
+        for (i, w) in s.history.windows(2).enumerate() {
+            let same = matches!(
+                (&w[0], &w[1]),
+                (Message::User(_), Message::User(_)) | (Message::Assistant(_), Message::Assistant(_))
+            );
+            assert!(!same, "位置 {i} 出现连续同角色消息，会导致上游 400");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tool_pairing_tests {
+    use super::*;
+    use crate::kiro::model::requests::conversation::{
+        HistoryAssistantMessage, UserInputMessageContext,
+    };
+    use crate::kiro::model::requests::tool::{ToolResult, ToolUseEntry};
+
+    fn assistant_with_tool(content: &str, id: &str) -> Message {
+        let m = HistoryAssistantMessage::new(content);
+        let mut m = m;
+        m.assistant_response_message.tool_uses = Some(vec![ToolUseEntry {
+            tool_use_id: id.to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({"path": "a.rs"}),
+        }]);
+        Message::Assistant(m)
+    }
+
+    fn user_with_result(content: &str, id: &str) -> Message {
+        let mut m = HistoryUserMessage::new(content, "auto");
+        let mut ctx = UserInputMessageContext::default();
+        ctx.tool_results = vec![ToolResult {
+            tool_use_id: id.to_string(),
+            content: vec![],
+            status: Some("success".to_string()),
+            is_error: false,
+        }];
+        m.user_input_message.user_input_message_context = ctx;
+        Message::User(m)
+    }
+
+    /// 真实 Codex 会话形态：user → assistant(toolUse) → user(toolResult) → ...
+    /// 按字节截断会切断配对，留下无主 toolResults → 上游 400 REQUEST_BODY_INVALID。
+    #[test]
+    fn test_no_orphan_tool_results_after_truncation() {
+        let big = "q".repeat(100 * 1024);
+        let mut hist = Vec::new();
+        for i in 0..12 {
+            let id = format!("tu_{i}");
+            hist.push(Message::User(HistoryUserMessage::new(&big, "auto")));
+            hist.push(assistant_with_tool(&big, &id));
+            hist.push(user_with_result(&big, &id));
+            hist.push(Message::Assistant(HistoryAssistantMessage::new(&big)));
+        }
+        let mut s = ConversationState::new("11111111-1111-4111-8111-111111111111");
+        s.history = hist;
+        truncate_history_if_needed(&mut s, "auto");
+
+        // 保留历史里出现的每个 toolResult 都必须有对应的 toolUse。
+        let known: std::collections::HashSet<String> = s
+            .history
+            .iter()
+            .filter_map(|m| match m {
+                Message::Assistant(a) => a.assistant_response_message.tool_uses.as_ref(),
+                _ => None,
+            })
+            .flatten()
+            .map(|t| t.tool_use_id.clone())
+            .collect();
+        for m in &s.history {
+            if let Message::User(u) = m {
+                for r in &u.user_input_message.user_input_message_context.tool_results {
+                    assert!(
+                        known.contains(&r.tool_use_id),
+                        "孤立 toolResult {} 无对应 toolUse，会触发上游 400",
+                        r.tool_use_id
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod orphan_unit {
+    use super::*;
+    use crate::kiro::model::requests::conversation::{HistoryAssistantMessage, UserInputMessageContext};
+    use crate::kiro::model::requests::tool::{ToolResult, ToolUseEntry};
+
+    fn u_with_result(id: &str) -> Message {
+        let mut m = HistoryUserMessage::new("result", "auto");
+        let mut ctx = UserInputMessageContext::default();
+        ctx.tool_results = vec![ToolResult{tool_use_id:id.into(),content:vec![],status:Some("success".into()),is_error:false}];
+        m.user_input_message.user_input_message_context = ctx;
+        Message::User(m)
+    }
+    fn a_with_use(id: &str) -> Message {
+        let mut a = HistoryAssistantMessage::new("calling");
+        a.assistant_response_message.tool_uses = Some(vec![ToolUseEntry{
+            tool_use_id:id.into(), name:"read".into(), input: serde_json::json!({})}]);
+        Message::Assistant(a)
+    }
+
+    /// 切口落在配对中间：tail 以「引用了已丢弃 toolUse 的 user」开头。
+    #[test]
+    fn test_drops_orphan_leading_result() {
+        let tail = vec![
+            u_with_result("tu_gone"),                       // 孤立：tu_gone 的 toolUse 已被丢
+            Message::Assistant(HistoryAssistantMessage::new("ok")),
+            Message::User(HistoryUserMessage::new("next", "auto")),
+        ];
+        let out = drop_orphan_tool_results(tail);
+        if let Some(Message::User(u)) = out.first() {
+            let rs = &u.user_input_message.user_input_message_context.tool_results;
+            assert!(
+                rs.is_empty() || rs.iter().all(|r| r.tool_use_id != "tu_gone"),
+                "孤立 toolResult 未被清理"
+            );
+        }
+    }
+
+    /// 配对完整时不得误删。
+    #[test]
+    fn test_keeps_paired_results() {
+        let tail = vec![a_with_use("tu_1"), u_with_result("tu_1")];
+        let out = drop_orphan_tool_results(tail);
+        assert_eq!(out.len(), 2, "配对完整的历史不应被删");
     }
 }

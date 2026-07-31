@@ -27,6 +27,7 @@ pub(crate) mod converter;
 pub(crate) mod model_catalog;
 pub(crate) mod handlers;
 pub(crate) mod middleware;
+pub(crate) mod sanitize_history;
 mod router;
 mod stream;
 pub(crate) mod truncate;

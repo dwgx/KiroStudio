@@ -801,6 +801,12 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     if !tools.is_empty() {
         context = context.with_tools(tools);
     }
+    // 当前消息携带的 tool_use_id 集合：用于判定历史最后一条 assistant 是否为
+    // 「活跃工具轮次」（上游只接受一个活跃轮次，见 sanitize_history 模块文档）。
+    let current_tool_result_ids: std::collections::HashSet<String> = validated_tool_results
+        .iter()
+        .map(|r| r.tool_use_id.clone())
+        .collect();
     if !validated_tool_results.is_empty() {
         context = context.with_tool_results(validated_tool_results);
     }
@@ -827,7 +833,15 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         .with_current_message(current_message)
         .with_history(history);
 
-    // 14. 超限保护：上游按**字节**拒绝过大请求（400 CONTENT_LENGTH_EXCEEDS_THRESHOLD），
+    // 14. 历史工具扁平化：上游只接受**一个活跃工具轮次**（末条 assistant 的 toolUses
+    // ⟺ 当前 toolResults），历史里残留多组结构化配对会被判 400 REQUEST_BODY_INVALID。
+    // 放在截断之前：扁平化能显著缩小请求体，从根上降低触发截断的频率。
+    super::sanitize_history::sanitize_history(
+        &mut conversation_state.history,
+        &current_tool_result_ids,
+    );
+
+    // 15. 超限保护：上游按**字节**拒绝过大请求（400 CONTENT_LENGTH_EXCEEDS_THRESHOLD），
     // 而客户端的自动压缩按 token 阈值触发，两者不对齐 → 长会话会撞墙且无法自恢复。
     // 这里在网关侧主动丢弃最旧历史（对齐 kiro-go 的 truncatePayloadToLimit）。
     super::truncate::truncate_history_if_needed(&mut conversation_state, &model_id);
@@ -3035,14 +3049,16 @@ mod tests {
                         found_image = true;
                     }
                 }
-                // tool_result 只保留文本，base64 不应出现在 tool_result content 里
-                for tr in &u.user_input_message.user_input_message_context.tool_results {
-                    if tr.tool_use_id == "tool-1" {
-                        let text = tr.content[0].get("text").and_then(|v| v.as_str()).unwrap_or("");
-                        assert_eq!(text, "here is the screen");
-                        assert!(!text.contains(TINY_PNG_B64), "tool_result 不应含 base64");
-                        tool_result_text_ok = true;
-                    }
+                // 历史里的结构化 tool_results 已被 sanitize_history 扁平化成正文文本
+                // （上游只接受一个活跃工具轮次）。故改为在正文里断言：文本保留、
+                // base64 不泄漏进文本。
+                let content = &u.user_input_message.content;
+                if content.contains("here is the screen") {
+                    assert!(
+                        !content.contains(TINY_PNG_B64),
+                        "叙述化后的正文不应含 base64"
+                    );
+                    tool_result_text_ok = true;
                 }
             }
         }
