@@ -8,7 +8,7 @@
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 use crate::http_client::{ProxyConfig, build_streaming_client};
@@ -18,6 +18,10 @@ use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
+
+/// 死端点负缓存 TTL（30 分钟）。连接层失败通常表示 DNS 不存在（如 codewhisperer.eu-central-1）
+/// 或 host 路由黑洞，但配置/网络可能临时修复，过期后自动重试。
+const DEAD_ENDPOINT_TTL: Duration = Duration::from_secs(1800);
 
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
@@ -131,6 +135,11 @@ pub struct KiroProvider {
     endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
     /// 默认端点名称（凭据未指定 endpoint 时使用）
     default_endpoint: String,
+    /// DNS/连接层失败的端点负缓存（key: "endpoint_name@region", value: 首次失败时刻）。
+    /// 连接层失败通常表示 DNS 不存在（如 eu-central-1 的 codewhisperer）或
+    /// host 路由黑洞，端点回退逐一尝试会在每个请求上重复白跑 connect timeout。
+    /// 记住首次失败的端点，30 分钟内跳过（避免瞬时网络抖动永久拉黑，过期自动重试）。
+    dead_endpoints: Mutex<HashMap<String, Instant>>,
 }
 
 impl KiroProvider {
@@ -168,7 +177,36 @@ impl KiroProvider {
             tls_backend,
             endpoints,
             default_endpoint,
+            dead_endpoints: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// 该 (端点, region) 是否处于死亡负缓存窗口内（跳过本跳，别再白跑一次 DNS/连接超时）。
+    fn is_endpoint_dead(&self, endpoint_name: &str, region: &str) -> bool {
+        let key = format!("{}@{}", endpoint_name, region);
+        let mut dead = self.dead_endpoints.lock();
+        match dead.get(&key) {
+            Some(at) if at.elapsed() < DEAD_ENDPOINT_TTL => true,
+            // TTL 已过 → 清掉条目，让它重新试一次（region 可能恢复/配置已改）。
+            Some(_) => {
+                dead.remove(&key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// 记一次 (端点, region) 连接层失败。仅用于**连接层**失败（DNS/TCP/TLS），
+    /// HTTP 状态码错误（429/5xx）绝不进这里——那是容量问题，host 本身是好的。
+    fn mark_endpoint_dead(&self, endpoint_name: &str, region: &str) {
+        let key = format!("{}@{}", endpoint_name, region);
+        self.dead_endpoints.lock().insert(key, std::time::Instant::now());
+    }
+
+    /// 清除 (端点, region) 的负缓存。拿到 HTTP 响应 = 连接层通了（哪怕业务层 429/5xx）。
+    fn mark_endpoint_alive(&self, endpoint_name: &str, region: &str) {
+        let key = format!("{}@{}", endpoint_name, region);
+        self.dead_endpoints.lock().remove(&key);
     }
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
@@ -634,7 +672,21 @@ impl KiroProvider {
             let mut response: Option<reqwest::Response> = None;
             let last_idx = chain.len() - 1;
 
+            let upstream_region = ctx.credentials.effective_upstream_region(&config);
             for (idx, candidate) in chain.iter().enumerate() {
+                // 死端点负缓存：该 (端点, region) 近期连接层失败过 → 跳过本跳。
+                // 生产实证：codewhisperer.eu-central-1.amazonaws.com 根本不存在（DNS 无记录），
+                // 每个请求都要白跑一次 DNS 失败才继续，等于回退链凭空多一跳延迟且毫无收益。
+                // 注意：链尾绝不跳过——否则整条链无人发送，response 恒 None（见下方 else 分支）。
+                if idx != last_idx && self.is_endpoint_dead(candidate.name(), &upstream_region) {
+                    tracing::debug!(
+                        "端点 {} 在 region {} 近期连接失败（负缓存 {}s 内），跳过本跳",
+                        candidate.name(),
+                        upstream_region,
+                        DEAD_ENDPOINT_TTL.as_secs()
+                    );
+                    continue;
+                }
                 let rctx = RequestContext {
                     credentials: &ctx.credentials,
                     token: &ctx.token,
@@ -660,6 +712,9 @@ impl KiroProvider {
                             matches!(status.as_u16(), 408 | 429) || status.is_server_error();
                         // 非瞬态（含成功）→ 就用这个响应，交给下游逻辑。
                         // 瞬态且还有备用端点 → 换下一个端点重试。
+                        // 拿到 HTTP 响应 = 连接层通的（哪怕是 429/5xx）→ 清负缓存。
+                        // 负缓存只针对"连不上"（DNS/TCP/TLS），绝不针对上游返回的业务错误。
+                        self.mark_endpoint_alive(candidate.name(), &upstream_region);
                         if !transient || idx == last_idx {
                             endpoint = candidate.clone();
                             response = Some(resp);
@@ -675,6 +730,19 @@ impl KiroProvider {
                         );
                     }
                     Err(e) => {
+                        // 连接层失败：记负缓存（下次自动跳过此 (端点, region)）。
+                        // reqwest::Error 的 `.is_connect()` 仅含 TCP connect 失败，DNS 归 `.is_request()`，
+                        // 故综合判断 request/connect/timeout（避免漏掉 DNS 不存在的场景）。
+                        if e.is_connect() || e.is_timeout() || e.is_request() {
+                            self.mark_endpoint_dead(candidate.name(), &upstream_region);
+                            tracing::debug!(
+                                "端点 {} 在 region {} 连接层失败，记入负缓存 (TTL {}s): {}",
+                                candidate.name(),
+                                upstream_region,
+                                DEAD_ENDPOINT_TTL.as_secs(),
+                                e
+                            );
+                        }
                         if idx == last_idx {
                             tracing::warn!(
                                 "API 请求发送失败（尝试 {}/{}）: {}",
