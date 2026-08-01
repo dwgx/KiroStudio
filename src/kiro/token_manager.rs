@@ -2583,14 +2583,22 @@ impl MultiTokenManager {
                             }
                             // 冷却/风控:长恢复窗口走 fast-fail(仅当 all_cooling_fast_fail 开),让客户端退避;
                             // 否则网关内短等重试。
+                            //
+                            // ⚠️ 唯一凭据保护:可用凭据数为 1 时,冷却该凭据等于全域中断(没有备用号),
+                            // fast-fail 把一次瞬态 429 放大成 15s 客户端硬等。
+                            // **冷却的唯一价值是「让调度引到另一个号」,单凭据下无此上行空间**,
+                            // 改走网关内短等,用重试时间窗让上游限流自愈(通常几秒内恢复)。
                             WaitOutcome::Wait(wait, WaitReason::Cooling) => {
+                                let entries = self.entries.lock();
+                                let available = entries.iter().filter(|e| !e.disabled).count();
+                                drop(entries);
+
+                                let sole_credential = available == 1;
                                 if self.all_cooling_fast_fail.load(Ordering::Relaxed)
                                     && wait > FAST_FAIL_THRESHOLD
+                                    && !sole_credential
                                 {
                                     let retry_after = wait.as_secs().max(1);
-                                    let entries = self.entries.lock();
-                                    let available = entries.iter().filter(|e| !e.disabled).count();
-                                    drop(entries);
                                     tracing::warn!(
                                         "所有可用凭据均在冷却，最短恢复 {}s，快速返回 429+Retry-After 让客户端退避（不在网关内硬扛）",
                                         retry_after
@@ -2600,6 +2608,12 @@ impl MultiTokenManager {
                                         available,
                                         total,
                                         retry_after
+                                    );
+                                }
+                                if sole_credential && wait > FAST_FAIL_THRESHOLD {
+                                    tracing::warn!(
+                                        "唯一凭据冷却中（恢复需 {}s），网关内短等而非 fast-fail（单凭据下冷却等于全域中断）",
+                                        wait.as_secs()
                                     );
                                 }
                                 if wait_started.elapsed() < StdDuration::from_secs(MAX_TRANSIENT_WAIT_SECS) {
