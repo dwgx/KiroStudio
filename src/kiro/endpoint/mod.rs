@@ -251,11 +251,17 @@ pub fn default_is_client_validation_error(body: &str) -> bool {
 
 /// 默认的 MODEL_TEMPORARILY_UNAVAILABLE 判断逻辑。
 ///
-/// 503 且 body 含该信号时表示**模型容量**问题，非凭据问题。
+/// 识别**模型容量**问题的信号（503 或 429 均可能携带），非凭据问题。
 /// 命中时应走慢速退避，且不影响凭据健康分。
+///
+/// 已知信号：
+/// - `MODEL_TEMPORARILY_UNAVAILABLE` (503 经典形式)
+/// - `model is temporarily unavailable` (小写变体)
+/// - `INSUFFICIENT_MODEL_CAPACITY` (429 形式，生产实证 2026-08-01)
 pub fn default_is_model_temporarily_unavailable(body: &str) -> bool {
     body.contains("MODEL_TEMPORARILY_UNAVAILABLE")
         || body.contains("model is temporarily unavailable")
+        || body.contains("INSUFFICIENT_MODEL_CAPACITY")
 }
 
 /// 默认的"从错误 body 提取重置秒数"逻辑
@@ -429,6 +435,37 @@ mod tests {
         assert_eq!(
             default_extract_retry_after_secs(r#"{"resets_at":1000}"#),
             None
+        );
+    }
+
+    /// 回归：429 + INSUFFICIENT_MODEL_CAPACITY 应走容量路径（不冷却凭据、慢速退避）。
+    /// 生产实证 2026-08-01: claude-opus-5-thinking 返回此信号，被误处置成凭据限流。
+    #[test]
+    fn test_429_insufficient_model_capacity_recognized() {
+        let body = r#"{"message":"I am experiencing high traffic, please try again shortly.","reason":"INSUFFICIENT_MODEL_CAPACITY"}"#;
+        assert!(
+            default_is_model_temporarily_unavailable(body),
+            "429 + INSUFFICIENT_MODEL_CAPACITY 应识别为模型容量问题"
+        );
+    }
+
+    /// 确认经典 503 + MODEL_TEMPORARILY_UNAVAILABLE 仍被识别（回归）。
+    #[test]
+    fn test_503_model_temporarily_unavailable_still_works() {
+        let body = r#"{"error":{"type":"overloaded_error","message":"MODEL_TEMPORARILY_UNAVAILABLE"}}"#;
+        assert!(
+            default_is_model_temporarily_unavailable(body),
+            "503 + MODEL_TEMPORARILY_UNAVAILABLE 经典形式必须仍被识别"
+        );
+    }
+
+    /// 普通 429（无容量信号）应走限流路径，不被误认成容量问题。
+    #[test]
+    fn test_429_rate_limit_without_capacity_signal_not_recognized() {
+        let body = r#"{"error":{"type":"rate_limit_error","message":"Request quota exceeded"}}"#;
+        assert!(
+            !default_is_model_temporarily_unavailable(body),
+            "普通 429 限流错误不应被识别为容量问题（应走冷却路径）"
         );
     }
 }

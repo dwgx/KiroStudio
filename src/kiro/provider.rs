@@ -994,15 +994,25 @@ impl KiroProvider {
                 continue;
             }
 
-            // 503 MODEL_TEMPORARILY_UNAVAILABLE — 模型容量问题，非凭据问题。
+            // 503/429 模型容量问题（MODEL_TEMPORARILY_UNAVAILABLE / INSUFFICIENT_MODEL_CAPACITY）
+            // — 全局容量不足，非凭据问题。
+            //
             // 使用慢速退避（1s base）；不调用 report_failure / report_rate_limited，
-            // 不影响凭据健康分（健康分反映凭据质量，与模型过载无关）。
+            // 不影响凭据健康分（健康分反映凭据质量，与模型过载无关），不设凭据冷却
+            // （所有凭据对同一过载模型完全等价，切换无意义）。
+            //
             // 只允许 MAX_MODEL_UNAVAILABLE_RETRIES 次慢速重试，耗尽后直接 break 透传错误——
-            // 继续切换凭据无意义（所有凭据对同一过载模型等价）。
-            if status.as_u16() == 503 && endpoint.is_model_temporarily_unavailable(&body) {
+            // 继续切换凭据无意义。
+            //
+            // 已知信号：
+            // - 503 + MODEL_TEMPORARILY_UNAVAILABLE (经典形式)
+            // - 429 + INSUFFICIENT_MODEL_CAPACITY (生产实证 2026-08-01，claude-opus-5-thinking)
+            if (status.as_u16() == 503 || status.as_u16() == 429)
+                && endpoint.is_model_temporarily_unavailable(&body)
+            {
                 model_unavailable_attempts += 1;
                 tracing::warn!(
-                    "模型暂时不可用（MODEL_TEMPORARILY_UNAVAILABLE，第 {}/{} 次）: {} {}",
+                    "模型容量不足（容量信号，第 {}/{} 次）: {} {}",
                     model_unavailable_attempts,
                     MAX_MODEL_UNAVAILABLE_RETRIES + 1,
                     status,
@@ -1010,7 +1020,7 @@ impl KiroProvider {
                 );
                 last_outcome = crate::usage::RequestOutcome::ModelUnavailable;
                 last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败（模型暂时不可用，建议稍后重试）: {} {}",
+                    "{} API 请求失败（模型容量不足，建议稍后重试）: {} {}",
                     api_type,
                     status,
                     body
