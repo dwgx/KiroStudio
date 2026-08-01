@@ -2589,9 +2589,17 @@ impl MultiTokenManager {
                             // **冷却的唯一价值是「让调度引到另一个号」,单凭据下无此上行空间**,
                             // 改走网关内短等,用重试时间窗让上游限流自愈(通常几秒内恢复)。
                             WaitOutcome::Wait(wait, WaitReason::Cooling) => {
-                                let entries = self.entries.lock();
-                                let available = entries.iter().filter(|e| !e.disabled).count();
-                                drop(entries);
+                                // ⚠️ 锁必须在**块作用域内**取用并释放,绝不能让 guard 变量活到
+                                // 本分支后面的 `.await`(下方短等 sleep)：parking_lot 的 MutexGuard
+                                // 是 !Send,而 rustc 对 async 的 Send 分析是保守的——只要 guard 变量
+                                // 声明在含 await 的作用域里,即便显式 drop 也会被算进 generator 状态,
+                                // 整个 future 退化为 !Send,进而 axum 的 `Handler` bound 不满足
+                                // (报错现场是 router.rs 的 post(...) 处,与本文件毫无关联,极难定位)。
+                                // 用块表达式把 guard 的生命周期锁死在块内,只把 usize 结果带出来。
+                                let available = {
+                                    let entries = self.entries.lock();
+                                    entries.iter().filter(|e| !e.disabled).count()
+                                };
 
                                 let sole_credential = available == 1;
                                 if self.all_cooling_fast_fail.load(Ordering::Relaxed)
