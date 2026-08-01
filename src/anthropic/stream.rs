@@ -3771,7 +3771,7 @@ fn trace_tool_frame(
 ///   2. buf 空             → frame
 ///   3. frame == buf       → buf 不变（重复终帧，不翻倍）
 ///   4. frame 以 buf 为前缀且更长 → frame（累积快照，取最新最全）
-///   5. buf 以 frame 为前缀（frame 更短） → buf 不变（丢弃迟到的旧短快照）
+///   5. buf 以 frame 为前缀（frame 更短）**且 buf 已完整** → buf 不变（丢弃迟到的旧短快照）
 ///   6. buf 与 frame 各自都是完整合法 JSON → frame（非前缀重写，只留最新完整对象，消灭 `}{` 粘连）
 ///   7. 否则               → buf + frame 追加（真增量碎片，还原完整内容）
 ///
@@ -3795,8 +3795,21 @@ pub(crate) fn merge_tool_input(buf: &str, frame: &str) -> String {
     if frame.len() > buf.len() && frame.starts_with(buf) {
         return frame.to_string();
     }
-    // 5. 迟到的旧短快照：缓冲以本帧为前缀（本帧更短）→ 保留更全的缓冲，丢弃本帧
-    if buf.len() > frame.len() && buf.starts_with(frame) {
+    // 5. 迟到的旧短快照：缓冲以本帧为前缀（本帧更短）→ 保留更全的缓冲，丢弃本帧。
+    //
+    // 【关键前提：buf 必须已是完整合法 JSON】——不加这个前提会丢真增量碎片（生产实证）：
+    // gpt-5.6-sol 逐 token 流式发 input，帧序列形如
+    //   `{"plan":[`、`{"`、`step`、`":"`、…
+    // 第 2 帧 `{"` 恰好是 buf `{"plan":[` 的前缀，旧实现据此判为"旧快照"直接丢弃，
+    // 拼装结果 `{"plan":[step":"…` —— 中间少了整段 `{"`，客户端 parse 失败报
+    // Invalid tool parameters；且归因层会把它误标成 `truncated`（看着像上游截断，
+    // 实则是网关自己丢帧），修复层也补不回（缺的是中间的结构字符，不是尾部）。
+    //
+    // 判据：**已完整的 JSON 对象无法再被增量续写**，故 buf 完整时，更短的前缀帧只可能是
+    // 迟到的旧快照（本规则原本要防的就是这个，见 test_merge_full_then_shorter_prefix_kept）；
+    // buf 尚不完整时，前缀匹配的短帧是真增量碎片，必须落到第 7 步追加。
+    // 另注：单一有序字节流上"更旧的快照后到"本就不可能，故收窄本规则不会放过真实乱序。
+    if buf.len() > frame.len() && buf.starts_with(frame) && is_complete_json(buf) {
         return buf.to_string();
     }
     // 6. 非前缀重写：缓冲与本帧各自都是完整合法 JSON → 只留最新完整对象（消灭 `}{` 粘连）
@@ -5668,6 +5681,61 @@ mod tests {
         let buf = merge_tool_input(r#"{"x":[1,2"#, r#",3]}"#);
         assert_eq!(buf, r#"{"x":[1,2,3]}"#);
         assert!(serde_json::from_str::<serde_json::Value>(&buf).is_ok());
+    }
+
+    /// 根因回归（生产实证）：规则 5 曾把**真增量碎片**误判成"迟到的旧短快照"而丢弃。
+    ///
+    /// 现场：gpt-5.6-sol 逐 token 流式发 tool input，帧序列 `{"plan":[` → `{"` → `step` → …
+    /// 第 2 帧 `{"` 恰是 buf `{"plan":[` 的前缀，旧实现丢弃它，拼出
+    /// `{"plan":[step":"…`（中间少一段 `{"`）→ 客户端 Invalid tool parameters。
+    /// 该串归因层会误标 `truncated`（像上游截断，实则网关丢帧），且修复层补不回
+    /// （缺的是中间结构字符，非尾部）——这正是生产 23 次截断 0 次修复成功的原因。
+    #[test]
+    fn test_merge_prefix_fragment_not_dropped_when_buf_incomplete() {
+        // buf 尚不完整 + frame 是其前缀 → 必须追加，绝不丢弃。
+        assert_eq!(
+            merge_tool_input(r#"{"plan":["#, r#"{""#),
+            r#"{"plan":[{""#,
+            "buf 未完整时，前缀短帧是真增量碎片，必须追加"
+        );
+
+        // 全序列重放：与生产坏串同形，修复后应拼出合法 JSON。
+        let frames = [
+            r#"{"plan":["#,
+            r#"{""#,
+            "step",
+            r#"":""#,
+            "做事",
+            r#"",""#,
+            "status",
+            r#"":""#,
+            "in_progress",
+            r#""}"#,
+            "]}",
+        ];
+        let mut buf = String::new();
+        for f in frames {
+            buf = merge_tool_input(&buf, f);
+        }
+        assert_eq!(
+            buf, r#"{"plan":[{"step":"做事","status":"in_progress"}]}"#,
+            "逐 token 帧序列应无损还原（此前丢 `{{\"` 拼成 `[step\":\"…`）"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&buf).is_ok(),
+            "还原结果必须是合法 JSON"
+        );
+    }
+
+    /// 收窄规则 5 后，它原本要防的场景仍然成立：buf **已完整**时，更短的前缀帧是旧快照 → 丢弃。
+    #[test]
+    fn test_merge_rule5_still_guards_stale_snapshot_when_buf_complete() {
+        let full = r#"{"path":"a.txt","content":"hi"}"#;
+        assert_eq!(
+            merge_tool_input(full, r#"{"path":"a.txt""#),
+            full,
+            "buf 已完整 → 更短的前缀帧只可能是迟到旧快照，应丢弃"
+        );
     }
 
     // ============ JSON 修复层（缓解④，根治向）离线注入测试 ============
