@@ -2054,7 +2054,12 @@ impl StreamContext {
             } else {
                 "-"
             };
+            // model 字段是排查刚需：同一网关同时服务多客户端（Claude Code 打 claude-*、
+            // Codex 打 gpt-*），只有 block_index/defect 时无法判断是哪个模型在截断，
+            // 也就无法回答「是模型侧问题还是某条链路问题」。完整参数全文仍只在
+            // KIRO_TOOL_TRACE 下打（见下方 trace 分支），此处只加低成本的标识字段。
             tracing::warn!(
+                model = %self.model,
                 block_index,
                 defect = defect.as_str(),
                 subkind,
@@ -2083,6 +2088,7 @@ impl StreamContext {
             if super::handlers::tool_repair_json_enabled() {
                 if let Some(repaired) = repair_tool_json(&assembled) {
                     tracing::info!(
+                        model = %self.model,
                         block_index,
                         orig_len = assembled.len(),
                         repaired_len = repaired.len(),
@@ -2114,6 +2120,7 @@ impl StreamContext {
                 super::handlers::tool_repair_json_enabled(),
             ) {
                 tracing::warn!(
+                    model = %self.model,
                     block_index,
                     defect = defect.as_str(),
                     "tool_use 参数真截断且修复层补不回：置失败态让客户端重试整轮（截断跨轮恢复）"
@@ -2153,6 +2160,16 @@ impl StreamContext {
             }
             // 统一出口:失败态已置(②/③/⑤任一)→ 不发坏 JSON。这一条兜住所有开关组合的自洽。
             if !self.completion.is_ok() {
+                // 可观测补齐：此前这里静默 return，日志只有上面那条"参数非合法 JSON"，
+                // 看不出「所以坏参数没发给客户端、收尾会补 SSE error」——排查时容易误以为
+                // 半截参数已经发出去了。这条把处置结果显式记下来（含 model 便于区分
+                // GPT/Claude），与上面的归因告警配成一对。
+                tracing::warn!(
+                    model = %self.model,
+                    block_index,
+                    defect = defect.as_str(),
+                    "tool_use 坏参数未下发（已置失败态，收尾补发 SSE error 让客户端重试）"
+                );
                 return Vec::new();
             }
             } // end if !repaired_ok(修复成功则跳过②/③/⑤)
