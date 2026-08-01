@@ -100,10 +100,121 @@ docker run -d \
 ### 待观察 / 未处理
 
 1. **`toolTruncationRecovery` 仍为 `false`**。根因是丢帧而非截断，该开关不再必需；建议先观察数日，若无新增截断则保持关闭。
-2. **启用凭据数为 1**。单凭据下任何冷却都等于全池冷却，触发 `allCoolingFastFail` 快速失败 → 客户端硬等。建议：
+2. **启用凭据数为 1**（2026-08-02 核实）。单凭据下任何冷却都等于全池冷却，触发 `allCoolingFastFail` 快速失败 → 客户端硬等。建议：
    - 短期：若另一个凭据可用，启用它做冗余（2 凭据时冷却只是降速，不会完全中断）
    - 长期：v9 已修容量误冷却，但普通限流冷却仍会触发，冗余能显著改善可用性
 3. **Codex 404（已给出方案，未确认是否已改）**：`~/.codex/config.toml` 的 `base_url` 需带 `/v1`（`http://127.0.0.1:8990/v1`），否则 Codex 请求 `/responses` 而网关只注册 `/v1/responses`。
+
+---
+
+## v10 代码已提交但镜像构建受阻（2026-08-02）
+
+### 代码状态
+- **Commit**: `c2f1126` fix(single-credential): 唯一凭据保护 + 死端点负缓存
+- **已推送**: fork/master
+- **镜像**: ❌ **构建失败**（环境问题，非代码问题）
+
+### 构建障碍
+
+Handler 编译错误（exit code 101）：
+```
+error[E0277]: the trait bound `fn(...) -> ... {post_messages}: Handler<_, _>` is not satisfied
+```
+
+**根因**：依赖漂移。v9 commit（2bdb4d7）在之前的干净环境下能构建（v9 镜像即证据），现在重构 v9 commit 也编译失败。Handler 相关代码自 v9 以来零改动，故障与本次修复无关。
+
+可能原因：
+- Cargo.lock 漂移或 registry 更新
+- axum/tower 版本兼容性破坏
+- musl target 交叉编译工具链问题
+
+### v10 修复内容（代码已完成，等待构建环境修复）
+
+#### 问题复现（2026-08-01 16:22 生产日志）
+
+```
+16:22:00  上游 429（真限流，reason: null）
+16:22:00  凭据 #47 冷却 15s                   ← 仅1个启用凭据
+16:22:01  全池冷却，返回 429 Retry-After=14    ← 网关自己拒，未打上游
+16:22:02  全池冷却，返回 429 Retry-After=12
+16:22:06  全池冷却，返回 429 Retry-After=8
+16:22:10  全池冷却，返回 429 Retry-After=4
+```
+
+Codex 重试预算被网关造的 429 吃光 → `exceeded retry limit`。kiro-go 无此问题（无 cooldown + fast-fail 层）。
+
+#### 根因 A：唯一凭据下冷却 = 全域中断
+
+- 冷却的唯一价值是「让调度引到另一个号」
+- 可用凭据=1 时无备用号，冷却等于全域中断
+- fast-fail 把一次瞬态 429（上游几秒内可自愈）放大成 15 秒客户端硬等
+- 次级放大：`上游 429 → RPM自动降档 30→20`，入站整形被拖到地板
+
+#### 根因 B：死端点每请求白跑一跳延迟
+
+端点回退链在 eu-central-1 的实际情况：
+- `ide` (q.eu-central-1.amazonaws.com) → ✅ 可达
+- `codewhisperer.eu-central-1.amazonaws.com` → ❌ **DNS 不存在**（容器内实测 exitcode=6）
+- `amazonq` (q.eu-central-1.amazonaws.com) → 同 host，等于第二次打 ide
+
+每个请求在 codewhisperer 白跑一次 DNS 失败（connect timeout）才继续，等于回退链凭空多一跳延迟。0eaa141 那次专门修的横向退路，在 eu-central-1 退化成单端点。
+
+#### 修复实现
+
+**1. 唯一凭据保护** (`token_manager.rs`，+20 行)
+
+冷却 fast-fail 决策点加前置判断：
+```rust
+let available = count_enabled();
+let sole_credential = available == 1;
+if all_cooling_fast_fail && wait > 2s && !sole_credential { bail!(...) }
+if sole_credential && wait > 2s {
+    tracing::warn!("唯一凭据冷却中，网关内短等而非 fast-fail");
+}
+// 继续走 20s 短等重试（上游限流通常几秒内自愈）
+```
+
+**2. 死端点负缓存** (`provider.rs`，+70 行)
+
+新增 `dead_endpoints: Mutex<HashMap<endpoint@region, Instant>>`：
+- 连接层失败（DNS/TCP/TLS）→ 记 (endpoint, region)，TTL 30 分钟
+- 下次该端点在负缓存内 → 直接跳过（链尾除外，保证至少发一次）
+- 拿到 HTTP 响应（含 429/5xx）→ 清负缓存（连接层通了）
+
+判据：
+- `e.is_connect() || e.is_timeout() || e.is_request()` 进负缓存
+- 状态码错误（429/5xx）是容量问题，host 本身好，绝不进负缓存
+
+#### 验证状态
+
+- ✅ 语法检查：`rustc --crate-type lib` 通过
+- ✅ DNS 实测：codewhisperer.eu-central-1 不存在，us-east-1 / q.eu-central-1 可达
+- ✅ 两处改动独立：token_manager 与 provider 互不依赖，可独立回滚
+- ❌ 集成构建：受阻于环境问题（handler 编译错误）
+
+### 临时缓解方案（不需要v10镜像）
+
+当前生产已是单凭据场景（启用数=1），v10 修复高度相关。在镜像可构建之前：
+
+1. **配置修改** — 改 `config.json`（热更或重启生效）：
+   ```json
+   "allCoolingFastFail": false
+   ```
+   效果：全池冷却时网关内短等（上限 20s）而非立刻甩 429。Codex 不消耗重试预算。
+
+2. **凭据 region 改 us-east-1**（如果可行）— 让 codewhisperer 变成真正可达的第二个 host。
+   影响：改变上游落点和延迟，属于环境决策。
+
+3. **启用第二个凭据**（如果有） — 一次解决根因 A。有备用号时冷却回归本意（降速而非中断）。
+
+### 下一步
+
+1. **修复构建环境**：清理 Cargo.lock / 检查 axum 版本 / 验证 musl target
+2. **构建 v10 镜像**并部署
+3. 观察日志确认：
+   - 唯一凭据冷却时出现「网关内短等而非 fast-fail」日志
+   - codewhisperer.eu-central-1 出现「近期连接失败，跳过本跳」日志
+   - 全池冷却事件大幅减少
 
 ---
 
