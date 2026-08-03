@@ -62,9 +62,18 @@ const ASSET_BIN: &str = "kirostudio-macos-aarch64";
 
 // 未覆盖的 OS×ARCH 组合：宁可编译失败，也绝不静默下载一个不匹配的二进制去覆盖自己。
 #[cfg(not(any(
-    all(target_os = "windows", any(target_arch = "x86_64", target_arch = "aarch64")),
-    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
-    all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64")),
+    all(
+        target_os = "windows",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(
+        target_os = "macos",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
 )))]
 compile_error!(
     "OTA 自更新未适配当前 OS/架构组合：请在 src/admin/update.rs 的 ASSET_BIN 增加对应分支，\
@@ -78,10 +87,22 @@ const LOCAL_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// `path` 如 `repos/{repo}/tags` 或 `repos/{repo}/commits?sha=...`。
 fn github_api_candidates_for(path: &str) -> Vec<(&'static str, String)> {
     vec![
-        ("gh-proxy.org", format!("https://gh-proxy.org/https://api.github.com/{path}")),
-        ("hk.gh-proxy.org", format!("https://hk.gh-proxy.org/https://api.github.com/{path}")),
-        ("cdn.gh-proxy.org", format!("https://cdn.gh-proxy.org/https://api.github.com/{path}")),
-        ("edgeone.gh-proxy.org", format!("https://edgeone.gh-proxy.org/https://api.github.com/{path}")),
+        (
+            "gh-proxy.org",
+            format!("https://gh-proxy.org/https://api.github.com/{path}"),
+        ),
+        (
+            "hk.gh-proxy.org",
+            format!("https://hk.gh-proxy.org/https://api.github.com/{path}"),
+        ),
+        (
+            "cdn.gh-proxy.org",
+            format!("https://cdn.gh-proxy.org/https://api.github.com/{path}"),
+        ),
+        (
+            "edgeone.gh-proxy.org",
+            format!("https://edgeone.gh-proxy.org/https://api.github.com/{path}"),
+        ),
         ("github-direct", format!("https://api.github.com/{path}")),
     ]
 }
@@ -96,9 +117,18 @@ fn asset_candidates(tag: &str, asset: &str) -> Vec<(&'static str, String)> {
     let gh = format!("github.com/{GITHUB_REPO}/releases/download/{tag}/{asset}");
     vec![
         ("gh-proxy.org", format!("https://gh-proxy.org/https://{gh}")),
-        ("hk.gh-proxy.org", format!("https://hk.gh-proxy.org/https://{gh}")),
-        ("cdn.gh-proxy.org", format!("https://cdn.gh-proxy.org/https://{gh}")),
-        ("edgeone.gh-proxy.org", format!("https://edgeone.gh-proxy.org/https://{gh}")),
+        (
+            "hk.gh-proxy.org",
+            format!("https://hk.gh-proxy.org/https://{gh}"),
+        ),
+        (
+            "cdn.gh-proxy.org",
+            format!("https://cdn.gh-proxy.org/https://{gh}"),
+        ),
+        (
+            "edgeone.gh-proxy.org",
+            format!("https://edgeone.gh-proxy.org/https://{gh}"),
+        ),
         ("github-direct", format!("https://{gh}")),
     ]
 }
@@ -107,14 +137,19 @@ fn asset_candidates(tag: &str, asset: &str) -> Vec<(&'static str, String)> {
 fn is_valid_version_tag(tag: &str) -> bool {
     let s = tag.strip_prefix('v').unwrap_or(tag);
     !s.is_empty()
-        && s.split('.').all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+        && s.split('.')
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
         && s.split('.').count() <= 4
 }
 
 /// semver 比较：v1 > v2 → 1，< → -1，== → 0（照 WindsurfAPI compareVersions，缺省段补 0）。
 fn compare_versions(v1: &str, v2: &str) -> i32 {
     let clean = |v: &str| -> Vec<u64> {
-        v.strip_prefix('v').unwrap_or(v).split('.').map(|p| p.parse().unwrap_or(0)).collect()
+        v.strip_prefix('v')
+            .unwrap_or(v)
+            .split('.')
+            .map(|p| p.parse().unwrap_or(0))
+            .collect()
     };
     let (a, b) = (clean(v1), clean(v2));
     let n = a.len().max(b.len());
@@ -211,26 +246,24 @@ async fn fetch_versions(limit: usize) -> Vec<String> {
             .send()
             .await
         {
-            Ok(resp) if resp.status().is_success() => {
-                match resp.json::<Vec<GitHubTag>>().await {
-                    Ok(tags) => {
-                        let mut versions: Vec<String> = tags
-                            .into_iter()
-                            .map(|t| t.name)
-                            .filter(|t| is_valid_version_tag(t))
-                            .collect();
-                        if versions.is_empty() {
-                            tracing::warn!("[Update] {name} 返回无有效版本 tag");
-                            continue;
-                        }
-                        versions.sort_by(|a, b| compare_versions(b, a).cmp(&0));
-                        versions.truncate(limit);
-                        tracing::info!("[Update] 经 {name} 取到 {} 个版本", versions.len());
-                        return versions;
+            Ok(resp) if resp.status().is_success() => match resp.json::<Vec<GitHubTag>>().await {
+                Ok(tags) => {
+                    let mut versions: Vec<String> = tags
+                        .into_iter()
+                        .map(|t| t.name)
+                        .filter(|t| is_valid_version_tag(t))
+                        .collect();
+                    if versions.is_empty() {
+                        tracing::warn!("[Update] {name} 返回无有效版本 tag");
+                        continue;
                     }
-                    Err(e) => tracing::warn!("[Update] {name} 解析 tags 失败: {e}"),
+                    versions.sort_by(|a, b| compare_versions(b, a).cmp(&0));
+                    versions.truncate(limit);
+                    tracing::info!("[Update] 经 {name} 取到 {} 个版本", versions.len());
+                    return versions;
                 }
-            }
+                Err(e) => tracing::warn!("[Update] {name} 解析 tags 失败: {e}"),
+            },
             Ok(resp) => tracing::warn!("[Update] {name} 返回 {}", resp.status()),
             Err(e) => tracing::warn!("[Update] {name} 请求失败: {e}"),
         }
@@ -244,12 +277,23 @@ async fn fetch_versions(limit: usize) -> Vec<String> {
 /// base=当前本地版 tag，head=目标 tag。仅取标题+短sha+日期，不拉全 diff（省流量、够展示）。
 async fn fetch_commits(base: &str, head: &str) -> Vec<CommitSnapshot> {
     // base 可能是不带 v 的本地版本；GitHub tag 习惯带 v，两种都试。
-    let base_variants = [base.to_string(), format!("v{}", base.trim_start_matches('v'))];
+    let base_variants = [
+        base.to_string(),
+        format!("v{}", base.trim_start_matches('v')),
+    ];
     let client = http_client();
-    for base_ref in base_variants.iter().collect::<std::collections::HashSet<_>>() {
+    for base_ref in base_variants
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+    {
         let path = format!("repos/{GITHUB_REPO}/compare/{base_ref}...{head}");
         for (name, url) in github_api_candidates_for(&path) {
-            match client.get(&url).header("Accept", "application/vnd.github.v3+json").send().await {
+            match client
+                .get(&url)
+                .header("Accept", "application/vnd.github.v3+json")
+                .send()
+                .await
+            {
                 Ok(resp) if resp.status().is_success() => {
                     #[derive(Deserialize)]
                     struct Compare {
@@ -336,12 +380,15 @@ async fn download_asset(tag: &str, asset: &str) -> anyhow::Result<Vec<u8>> {
                 }
                 match resp.bytes().await {
                     Ok(bytes) => {
-                        tracing::info!("[Update] 经 {name} 下载 {asset} 成功（{} 字节）", bytes.len());
+                        tracing::info!(
+                            "[Update] 经 {name} 下载 {asset} 成功（{} 字节）",
+                            bytes.len()
+                        );
                         return Ok(bytes.to_vec());
                     }
                     Err(e) => last_err = format!("{name} 读取响应体失败: {e}"),
                 }
-            },
+            }
             Ok(resp) => last_err = format!("{name} 返回 {}", resp.status()),
             Err(e) => last_err = format!("{name} 请求失败: {e}"),
         }
@@ -402,7 +449,10 @@ pub async fn perform_update(target: Option<String>) -> anyhow::Result<UpdatePerf
             }
             t
         }
-        None => check.latest_version.clone().ok_or_else(|| anyhow::anyhow!("无最新版本"))?,
+        None => check
+            .latest_version
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("无最新版本"))?,
     };
 
     // 已是目标版本或目标版本更旧 → 免更新（防降级）
@@ -419,7 +469,10 @@ pub async fn perform_update(target: Option<String>) -> anyhow::Result<UpdatePerf
 
     // 2) 下载二进制（可走镜像加速）+ sha256 文件（强制 github.com 直连,独立可信信道）
     let bin = download_asset(&tag, ASSET_BIN).await?;
-    tracing::info!("[Update] 二进制下载完成（{} 字节），开始取 sha256 校验文件", bin.len());
+    tracing::info!(
+        "[Update] 二进制下载完成（{} 字节），开始取 sha256 校验文件",
+        bin.len()
+    );
     // 安全(H1):sha256 只从 github 直连取,不走 asset_candidates 的第三方镜像——
     // 否则二进制与哈希同源,恶意镜像给"后门二进制+匹配哈希"即绕过校验=RCE。
     // 直连失败宁可中止升级,也不退回镜像取哈希(那等于没校验)。
@@ -509,5 +562,3 @@ pub async fn perform_update(target: Option<String>) -> anyhow::Result<UpdatePerf
 fn target_is_newer(tag: &str) -> bool {
     compare_versions(tag, LOCAL_VERSION) > 0
 }
-
-

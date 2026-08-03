@@ -18,10 +18,9 @@ use super::external_idp_login::{
     ExternalIdpStartResult,
 };
 use super::idc_login::IdcLoginManager;
+use super::idc_login::{IdcPollResult, IdcStartResult};
 use super::social_login::SocialLoginManager;
 pub use super::social_login::{PollResult, StartResult};
-use super::idc_login::{IdcPollResult, IdcStartResult};
-use crate::kiro::auth::social::OAuthCallbackData;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, ConfigSnapshotResponse,
     CredentialStatusItem, CredentialsStatusResponse, LoadBalancingModeResponse,
@@ -29,6 +28,7 @@ use super::types::{
     StorageStatsResponse, TrashItemResponse, TrashListResponse, UpdateConfigRequest,
     UpdateConfigResponse,
 };
+use crate::kiro::auth::social::OAuthCallbackData;
 use crate::usage::TraceDb;
 
 /// 余额缓存【新鲜度】阈值（秒），5 分钟。
@@ -312,39 +312,39 @@ impl AdminService {
             .map(|entry| {
                 let cd = cooldowns.get(&entry.id);
                 CredentialStatusItem {
-                id: entry.id,
-                priority: entry.priority,
-                rpm_limit: entry.rpm_limit,
-                allowed_models: entry.allowed_models,
-                tested_models: entry.tested_models,
-                disabled: entry.disabled,
-                failure_count: entry.failure_count,
-                is_current: entry.id == snapshot.current_id,
-                expires_at: entry.expires_at,
-                auth_method: entry.auth_method,
-                base_url: entry.base_url,
-                request_limit: entry.request_limit,
-                request_count: entry.request_count,
-                has_profile_arn: entry.has_profile_arn,
-                refresh_token_hash: entry.refresh_token_hash,
-                api_key_hash: entry.api_key_hash,
-                masked_api_key: entry.masked_api_key,
-                email: entry.email,
-                subscription_title: entry.subscription_title,
-                success_count: entry.success_count,
-                total_credits_used: entry.total_credits_used,
-                last_used_at: entry.last_used_at.clone(),
-                has_proxy: entry.has_proxy,
-                proxy_url: entry.proxy_url,
-                refresh_failure_count: entry.refresh_failure_count,
-                disabled_reason: entry.disabled_reason,
-                endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
-                inflight: entry.inflight,
-                rpm: entry.rpm,
-                name: entry.name,
-                cooling_down: cd.is_some(),
-                cooldown_remaining_ms: cd.map(|c| c.remaining_ms),
-                cooldown_reason: cd.map(|c| c.reason.description().to_string()),
+                    id: entry.id,
+                    priority: entry.priority,
+                    rpm_limit: entry.rpm_limit,
+                    allowed_models: entry.allowed_models,
+                    tested_models: entry.tested_models,
+                    disabled: entry.disabled,
+                    failure_count: entry.failure_count,
+                    is_current: entry.id == snapshot.current_id,
+                    expires_at: entry.expires_at,
+                    auth_method: entry.auth_method,
+                    base_url: entry.base_url,
+                    request_limit: entry.request_limit,
+                    request_count: entry.request_count,
+                    has_profile_arn: entry.has_profile_arn,
+                    refresh_token_hash: entry.refresh_token_hash,
+                    api_key_hash: entry.api_key_hash,
+                    masked_api_key: entry.masked_api_key,
+                    email: entry.email,
+                    subscription_title: entry.subscription_title,
+                    success_count: entry.success_count,
+                    total_credits_used: entry.total_credits_used,
+                    last_used_at: entry.last_used_at.clone(),
+                    has_proxy: entry.has_proxy,
+                    proxy_url: entry.proxy_url,
+                    refresh_failure_count: entry.refresh_failure_count,
+                    disabled_reason: entry.disabled_reason,
+                    endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+                    inflight: entry.inflight,
+                    rpm: entry.rpm,
+                    name: entry.name,
+                    cooling_down: cd.is_some(),
+                    cooldown_remaining_ms: cd.map(|c| c.remaining_ms),
+                    cooldown_reason: cd.map(|c| c.reason.description().to_string()),
                 }
             })
             .collect();
@@ -813,8 +813,7 @@ impl AdminService {
         }
         let weak = Arc::downgrade(self);
         let handle = tokio::spawn(async move {
-            let mut ticker =
-                tokio::time::interval(std::time::Duration::from_secs(interval));
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // 跳过第一次立即触发的 tick，避免启动/重挂即批量拉（降低上游限流风险）
             ticker.tick().await;
@@ -867,8 +866,14 @@ impl AdminService {
                     crate::http_client::split_proxy_credentials(raw);
                 (
                     Some(clean),
-                    req.proxy_username.clone().filter(|s| !s.is_empty()).or(inline_user),
-                    req.proxy_password.clone().filter(|s| !s.is_empty()).or(inline_pass),
+                    req.proxy_username
+                        .clone()
+                        .filter(|s| !s.is_empty())
+                        .or(inline_user),
+                    req.proxy_password
+                        .clone()
+                        .filter(|s| !s.is_empty())
+                        .or(inline_pass),
                 )
             }
             None => (None, None, None),
@@ -1007,7 +1012,8 @@ impl AdminService {
     }
 
     /// 获取负载均衡模式
-    pub fn get_load_balancing_mode(&self) -> LoadBalancingModeResponse {        LoadBalancingModeResponse {
+    pub fn get_load_balancing_mode(&self) -> LoadBalancingModeResponse {
+        LoadBalancingModeResponse {
             mode: self.token_manager.get_load_balancing_mode(),
         }
     }
@@ -1114,9 +1120,7 @@ impl AdminService {
             login_background_r18: config.login_background_r18,
             balance_refresh_interval_secs: config.balance_refresh_interval_secs,
             collect_client_fingerprint: config.collect_client_fingerprint,
-            config_path: config
-                .config_path()
-                .map(|p| p.display().to_string()),
+            config_path: config.config_path().map(|p| p.display().to_string()),
         }
     }
 
@@ -1155,9 +1159,7 @@ impl AdminService {
             .config_path()
             .map(|p| p.to_path_buf())
             .ok_or_else(|| {
-                AdminServiceError::InternalError(
-                    "配置文件路径未知，无法保存配置".to_string(),
-                )
+                AdminServiceError::InternalError("配置文件路径未知，无法保存配置".to_string())
             })?;
 
         // 从磁盘重新加载，避免覆盖进程外的改动
@@ -1528,7 +1530,11 @@ impl AdminService {
         }
         // 代理账密：前端出于安全不回显已存值,只在非空时更新;显式传空串表示清除。
         if let Some(v) = req.proxy_username {
-            let new_val = if v.trim().is_empty() { None } else { Some(v.trim().to_string()) };
+            let new_val = if v.trim().is_empty() {
+                None
+            } else {
+                Some(v.trim().to_string())
+            };
             if new_val != config.proxy_username {
                 config.proxy_username = new_val;
                 restart_fields.push("proxyUsername".into());
@@ -1569,16 +1575,22 @@ impl AdminService {
         // —— 反代安全（批次3，均需重启生效）——
         if let Some(v) = req.cors_allowed_origins {
             // 去空白、去空项，保持整表替换语义
-            let cleaned: Vec<String> =
-                v.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            let cleaned: Vec<String> = v
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
             if cleaned != config.cors_allowed_origins {
                 config.cors_allowed_origins = cleaned;
                 restart_fields.push("corsAllowedOrigins".into());
             }
         }
         if let Some(v) = req.ip_allowlist {
-            let cleaned: Vec<String> =
-                v.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            let cleaned: Vec<String> = v
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
             // 校验每条 CIDR 合法，非法直接拒绝（避免静默丢弃导致白名单形同虚设）
             for entry in &cleaned {
                 if let Err(e) = crate::common::security::validate_cidr(entry) {
@@ -1593,8 +1605,11 @@ impl AdminService {
             }
         }
         if let Some(v) = req.ip_blocklist {
-            let cleaned: Vec<String> =
-                v.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            let cleaned: Vec<String> = v
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
             // 校验每条 CIDR 合法,非法直接拒绝。
             for entry in &cleaned {
                 if let Err(e) = crate::common::security::validate_cidr(entry) {
@@ -1772,7 +1787,10 @@ impl AdminService {
                     "at-rest 加密开关已改,但当前为单凭据(Single)格式——persist 是 no-op,加密不生效。\
                      请先转为多凭据数组格式(如通过 UI 增删任一号触发格式升级)。"
                 ),
-                Err(e) => tracing::warn!("at-rest 加密开关已改,但立即重写凭据文件失败(下次变更会补上): {}", e),
+                Err(e) => tracing::warn!(
+                    "at-rest 加密开关已改,但立即重写凭据文件失败(下次变更会补上): {}",
+                    e
+                ),
             }
         }
 
@@ -1866,10 +1884,7 @@ impl AdminService {
             || tool_description_max_chars_changed.is_some();
         let restart_required = !restart_fields.is_empty();
         let message = if restart_required {
-            format!(
-                "已保存。{} 个字段需重启服务后生效。",
-                restart_fields.len()
-            )
+            format!("已保存。{} 个字段需重启服务后生效。", restart_fields.len())
         } else if immediate_changed {
             "已保存并立即生效（无需重启）。".to_string()
         } else {
@@ -2005,7 +2020,9 @@ impl AdminService {
             tokio::spawn(async {
                 // 睡 1 秒让本次 HTTP 200 flush 给前端,再退出让出端口,helper 会拉起新进程。
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                tracing::warn!("一键重启(Windows 裸跑):进程退出,已交给 detached helper 拉起新二进制");
+                tracing::warn!(
+                    "一键重启(Windows 裸跑):进程退出,已交给 detached helper 拉起新二进制"
+                );
                 std::process::exit(0);
             });
             return Ok(());
@@ -2170,8 +2187,8 @@ pub(crate) fn spawn_windows_relaunch_process(
         );
 
         // 写进临时目录的唯一 .bat。
-        let bat_path = std::env::temp_dir()
-            .join(format!("kirostudio-relaunch-{}.bat", uuid::Uuid::new_v4()));
+        let bat_path =
+            std::env::temp_dir().join(format!("kirostudio-relaunch-{}.bat", uuid::Uuid::new_v4()));
         {
             let mut f = match std::fs::File::create(&bat_path) {
                 Ok(f) => f,
@@ -2209,8 +2226,8 @@ pub(crate) fn spawn_windows_relaunch_process(
             c.spawn()
         };
         // 先带 breakaway;失败(job 禁止 breakaway / 其它)则回退到原 flags。
-        let result = spawn_with(base_flags | CREATE_BREAKAWAY_FROM_JOB)
-            .or_else(|_| spawn_with(base_flags));
+        let result =
+            spawn_with(base_flags | CREATE_BREAKAWAY_FROM_JOB).or_else(|_| spawn_with(base_flags));
         match result {
             Ok(_) => tracing::warn!(
                 "Windows 自重启:已 spawn 重启脚本({:?}),将在本进程退出后拉起 {exe:?}",
@@ -2485,7 +2502,10 @@ impl AdminService {
             key: "trash".to_string(),
             removed: n,
             freed_bytes: 0,
-            note: Some(format!("清理 {} 天前的回收站条目（0=永久保留不清）", keep_days)),
+            note: Some(format!(
+                "清理 {} 天前的回收站条目（0=永久保留不清）",
+                keep_days
+            )),
         }
     }
 
@@ -2652,7 +2672,8 @@ impl AdminService {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
-        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据") {
+        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据")
+        {
             AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)
@@ -2735,7 +2756,10 @@ mod insight_text_tests {
     /// 已禁用号:显示"已禁用"而非"畅通"(即便有 RPM/未冷却)
     #[test]
     fn insight_disabled() {
-        assert_eq!(build_insight_text(54, 0, 50, false, true, None), "#54 已禁用（不参与调度）");
+        assert_eq!(
+            build_insight_text(54, 0, 50, false, true, None),
+            "#54 已禁用（不参与调度）"
+        );
     }
 }
 
