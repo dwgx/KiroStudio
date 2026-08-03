@@ -7,27 +7,25 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, deep_verify_credential, delete_credential, disable_overage,
-        enable_overage, export_credential, force_refresh_token, get_all_credentials,
-        get_cached_balances, get_credential_balance, get_load_balancing_mode, get_config,
-        get_overage_status, list_trash, purge_credential, poll_social_login, reset_failure_count,
-        restart_service, restore_credential, set_credential_disabled, set_credential_name,
-        set_credential_proxy,
-        set_credential_priority, set_credential_rpm_limit, set_credential_allowed_models,
-        set_credential_custom_api,
-        purge_trash_batch, probe_available_models, proxy_test,
-        probe_regions, switch_profile_region,
-        set_load_balancing_mode, social_callback, start_social_login, storage_cleanup,
-        storage_stats, update_config, start_idc_login, poll_idc_login, recovery_metrics,
-        start_external_idp_login, external_idp_leg1, external_idp_leg2, external_idp_leg2_select,
-        check_update, perform_update, update_status,
+        add_credential, check_update, deep_verify_credential, delete_credential, disable_overage,
+        enable_overage, export_credential, external_idp_leg1, external_idp_leg2,
+        external_idp_leg2_select, force_refresh_token, get_all_credentials, get_cached_balances,
+        get_config, get_credential_balance, get_load_balancing_mode, get_overage_status,
+        import_stats, list_trash, perform_update, poll_idc_login, poll_social_login,
+        probe_available_models,
+        probe_regions, proxy_test, purge_credential, purge_trash_batch, recovery_metrics,
+        reset_failure_count, restart_service, restore_credential, set_credential_allowed_models,
+        set_credential_custom_api, set_credential_disabled, set_credential_name,
+        set_credential_priority, set_credential_proxy, set_credential_rpm_limit,
+        set_load_balancing_mode, social_callback, start_external_idp_login, start_idc_login,
+        start_social_login, storage_cleanup, storage_stats, switch_profile_region, update_config,
+        update_status,
     },
     middleware::{AdminState, admin_auth_middleware},
     usage_handlers::{
-        logs_export, logs_poll, logs_stream,
-        ratelimit_insights, stream_live, usage_by_credential, usage_by_model,
-        traces_search, usage_clients, usage_machines, usage_overview, usage_rate, usage_recent,
-        usage_throughput, usage_timeseries,
+        logs_export, logs_poll, logs_stream, ratelimit_insights, stream_live, traces_search,
+        usage_by_credential, usage_by_model, usage_clients, usage_machines, usage_overview,
+        usage_rate, usage_recent, usage_throughput, usage_timeseries,
     },
 };
 
@@ -65,9 +63,18 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/trash/{id}", delete(purge_credential))
         .route("/credentials/{id}/disabled", post(set_credential_disabled))
         .route("/credentials/{id}/priority", post(set_credential_priority))
-        .route("/credentials/{id}/rpm-limit", post(set_credential_rpm_limit))
-        .route("/credentials/{id}/allowed-models", post(set_credential_allowed_models))
-        .route("/credentials/{id}/custom-api", post(set_credential_custom_api))
+        .route(
+            "/credentials/{id}/rpm-limit",
+            post(set_credential_rpm_limit),
+        )
+        .route(
+            "/credentials/{id}/allowed-models",
+            post(set_credential_allowed_models),
+        )
+        .route(
+            "/credentials/{id}/custom-api",
+            post(set_credential_custom_api),
+        )
         .route("/credentials/{id}/name", post(set_credential_name))
         .route("/credentials/{id}/proxy", post(set_credential_proxy))
         .route("/credentials/{id}/reset", post(reset_failure_count))
@@ -75,7 +82,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/verify", post(deep_verify_credential))
         // External IdP region 验活选择：列候选 region（GET）+ 切换到目标 region profile（POST，仅验活可用才写）
         .route("/credentials/{id}/regions", get(probe_regions))
-        .route("/credentials/{id}/switch-region", post(switch_profile_region))
+        .route(
+            "/credentials/{id}/switch-region",
+            post(switch_profile_region),
+        )
         // 选中令牌后探测可用模型（逐模型极小请求，看哪些通/哪些 INVALID_MODEL_ID）
         .route("/credentials/{id}/models", get(probe_available_models))
         .route("/credentials/{id}/balance", get(get_credential_balance))
@@ -99,7 +109,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/auth/external-idp/start", post(start_external_idp_login))
         .route("/auth/external-idp/leg1", post(external_idp_leg1))
         .route("/auth/external-idp/leg2", post(external_idp_leg2))
-        .route("/auth/external-idp/leg2/select", post(external_idp_leg2_select))
+        .route(
+            "/auth/external-idp/leg2/select",
+            post(external_idp_leg2_select),
+        )
         // 用量统计查询（只读）
         .route("/usage/overview", get(usage_overview))
         .route("/usage/timeseries", get(usage_timeseries))
@@ -118,6 +131,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/ratelimit/insights", get(ratelimit_insights))
         // 自愈机器可观测:刷新/failover/自动禁用/冷却/region重探/泄漏清洗 进程级计数器,零上游
         .route("/recovery-metrics", get(recovery_metrics))
+        // 外部凭据推送(POST /api/import/keys)的批次统计:进程级环形缓冲,零上游
+        .route("/import-stats", get(import_stats))
         // SSE 实时流：每 ~1.5s 推一帧轻量快照（全局 inflight/rpm + 每号状态 + 吞吐），零上游
         .route("/stream/live", get(stream_live))
         // 运维日志：内存环形缓冲拉取(增量+级别) / SSE 实时直播 / 一键导出 JSONL(附 bug 报告)

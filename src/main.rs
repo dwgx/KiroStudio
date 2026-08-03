@@ -3,6 +3,7 @@ mod admin_ui;
 mod anthropic;
 mod common;
 mod http_client;
+mod import_api;
 mod kiro;
 mod model;
 mod openai;
@@ -15,7 +16,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use clap::Parser;
-use kiro::endpoint::{AmazonQEndpoint, CodeWhispererEndpoint, IdeEndpoint, KiroEndpoint};
+use kiro::endpoint::{
+    AmazonQEndpoint, CliEndpoint, CodeWhispererEndpoint, IdeEndpoint, KiroEndpoint,
+};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
@@ -56,7 +59,11 @@ fn windows_data_root() -> Option<std::path::PathBuf> {
     let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
     let root = exe_dir.join("KiroStudio-data");
     if let Err(e) = std::fs::create_dir_all(&root) {
-        tracing::warn!("创建数据目录 {} 失败: {}，回退到默认路径", root.display(), e);
+        tracing::warn!(
+            "创建数据目录 {} 失败: {}，回退到默认路径",
+            root.display(),
+            e
+        );
         return None;
     }
     Some(root)
@@ -75,7 +82,9 @@ fn resolve_default_data_path(name: &str) -> std::path::PathBuf {
     if cwd_path.exists() {
         return cwd_path; // 源码目录开发：cwd 已有则沿用
     }
-    let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf()));
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.to_path_buf()));
     if let Some(dir) = &exe_dir {
         let legacy = dir.join(name);
         if legacy.exists() {
@@ -104,7 +113,10 @@ fn maybe_open_browser_on_first_run(freshly_generated: bool, host: &str, port: u1
     if !freshly_generated {
         return;
     }
-    if std::env::var("KIRO_NO_BROWSER").map(|v| !v.is_empty()).unwrap_or(false) {
+    if std::env::var("KIRO_NO_BROWSER")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
         return;
     }
     let is_loopback = matches!(host, "127.0.0.1" | "localhost" | "::1" | "0.0.0.0");
@@ -184,7 +196,10 @@ fn bootstrap_config_if_missing(config_path: &str) -> (String, bool) {
     let body = serde_json::to_string_pretty(&cfg).unwrap_or_default();
     if let Err(e) = std::fs::write(&target, body) {
         // 写失败不阻断：继续走原流程（大概率随后因缺 apiKey 退出并报错），但先告知原因。
-        tracing::error!("[引导] 自动生成配置失败({}): {e}；请手动创建 config.json 或用 start.bat", target.display());
+        tracing::error!(
+            "[引导] 自动生成配置失败({}): {e}；请手动创建 config.json 或用 start.bat",
+            target.display()
+        );
         return (resolved_str, false);
     }
     // Unix 收紧权限（含密钥，仅属主可读写）；Windows 依赖 NTFS ACL，此调用 no-op。
@@ -334,6 +349,8 @@ async fn main() {
     {
         let ide = IdeEndpoint::new();
         endpoints.insert(ide.name().to_string(), Arc::new(ide));
+        let cli = CliEndpoint::new();
+        endpoints.insert(cli.name().to_string(), Arc::new(cli));
         // 备用端点：供 429/5xx 时的端点级回退使用（endpointFallback）。
         let cw = CodeWhispererEndpoint::new();
         endpoints.insert(cw.name().to_string(), Arc::new(cw));
@@ -349,10 +366,7 @@ async fn main() {
 
     // 校验所有凭据声明的端点都已注册
     for cred in &credentials_list {
-        let name = cred
-            .endpoint
-            .as_deref()
-            .unwrap_or(&config.default_endpoint);
+        let name = cred.endpoint.as_deref().unwrap_or(&config.default_endpoint);
         if !endpoints.contains_key(name) {
             tracing::error!(
                 "凭据 id={:?} 指定了未知端点 \"{}\"（已注册: {:?}）",
@@ -506,8 +520,8 @@ async fn main() {
             let mut admin_state = admin::AdminState::new(admin_key, admin_service);
             // 注入用量查询句柄（未启用统计时为 None，端点返回 503）
             if let Some(handles) = &usage_handles {
-                admin_state = admin_state
-                    .with_usage(handles.stats.clone(), handles.trace_db.clone());
+                admin_state =
+                    admin_state.with_usage(handles.stats.clone(), handles.trace_db.clone());
             }
 
             // A6：温和的周期性余额刷新（严格受控）。
@@ -531,6 +545,23 @@ async fn main() {
         }
     } else {
         anthropic_app
+    };
+
+    // 外部凭据推送入口使用独立密钥，不复用网关 key 或高权限 admin key。
+    let app = match config.import_api_key.as_deref().map(str::trim) {
+        Some(import_key) if !import_key.is_empty() => {
+            tracing::info!("凭据批量导入 API 已启用: POST /api/import/keys");
+            // 让运维面板的导入卡片能区分「未配置」与「已启用但还没人推过」。
+            common::import_stats::set_enabled(true);
+            app.nest(
+                "/api/import",
+                import_api::create_router(import_key.to_string(), token_manager.clone()),
+            )
+        }
+        _ => {
+            tracing::info!("importApiKey 未配置，凭据批量导入 API 未启用");
+            app
+        }
     };
 
     // 启动服务器
@@ -699,7 +730,8 @@ async fn shutdown_signal() {
 }
 
 /// 是否由托盘「退出」触发的停机（决定 main 的退出码：3=用户主动退出，监督脚本不重拉）。
-static TRAY_QUIT_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TRAY_QUIT_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// 装配用量统计管道：打开 SQLite、构造 JSONL 统计、冷启动重放、启动保留清理任务。
 ///
@@ -779,8 +811,5 @@ fn init_usage_pipeline(config: &Config) -> Option<UsageHandles> {
         data_dir.display(),
         retention_days
     );
-    Some(UsageHandles {
-        stats,
-        trace_db,
-    })
+    Some(UsageHandles { stats, trace_db })
 }
