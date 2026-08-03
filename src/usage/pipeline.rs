@@ -14,10 +14,10 @@
 //! 路径。用独立 OS 线程承载阻塞 IO，兑现「统计侧故障绝不回传到请求路径」的承诺。
 
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 
 use super::record::RequestRecord;
 
@@ -112,8 +112,8 @@ pub fn dropped_count() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
 
     struct CountingSink {
         count: Arc<AtomicUsize>,
