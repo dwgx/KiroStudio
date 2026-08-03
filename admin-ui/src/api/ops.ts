@@ -135,6 +135,8 @@ export async function getRecoveryMetrics(): Promise<RecoveryMetrics> {
 export interface ImportItemRecord {
   /** 打码后的 key（如 ksk_Xwbz...SwBh），不可用于认证 */
   key: string
+  /** key 指纹(SHA-256 前 8 位)。与凭据管理页显示的指纹同源,用于确认是同一个 key。 */
+  fingerprint: string
   ok: boolean
   duplicate: boolean
   credentialId?: number
