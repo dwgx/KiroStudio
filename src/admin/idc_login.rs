@@ -185,8 +185,14 @@ impl IdcLoginManager {
                     subscription_title: None,
                     // 上号时显式填的代理持久化到该凭据（拆好账密），global 回落不持久化。
                     proxy_url: session.custom_proxy.as_ref().map(|p| p.url.clone()),
-                    proxy_username: session.custom_proxy.as_ref().and_then(|p| p.username.clone()),
-                    proxy_password: session.custom_proxy.as_ref().and_then(|p| p.password.clone()),
+                    proxy_username: session
+                        .custom_proxy
+                        .as_ref()
+                        .and_then(|p| p.username.clone()),
+                    proxy_password: session
+                        .custom_proxy
+                        .as_ref()
+                        .and_then(|p| p.password.clone()),
                     disabled: false,
                     kiro_api_key: None,
                     endpoint: None,
@@ -200,11 +206,7 @@ impl IdcLoginManager {
                     }
                 };
 
-                if let Err(e) = self
-                    .token_manager
-                    .get_usage_limits_for(credential_id)
-                    .await
-                {
+                if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
                     tracing::warn!("IDC 上号后获取订阅等级失败: {}", e);
                 }
 
