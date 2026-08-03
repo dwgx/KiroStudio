@@ -27,8 +27,16 @@ const MAX_ITEMS_PER_RECORD: usize = 20;
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportItemRecord {
-    /// 已打码的 key（如 `ksk_abcd...wxyz`），绝不含明文。
+    /// **完整明文 key**。
+    ///
+    /// 面板要能直接确认「对方推来的到底是哪个号」并复制去核对，故这里存完整值而非打码串。
+    /// 暴露面与既有 `GET /api/admin/credentials/{id}/export`（返回含明文 key 的整条凭据）
+    /// 同级：都只经 admin 鉴权的管理面出口，且本记录仅在进程内存、重启即失、不落盘。
+    /// 发给**推送方**的 HTTP 响应仍是打码值（契约明确「不依赖完整值」），两个出口口径不同是有意的。
     pub key: String,
+    /// key 指纹（SHA-256 前 8 位）。用于和凭据管理页的指纹对照同一个号，
+    /// 也便于在不整串比对的情况下快速判同。恒可计算，故非 Option。
+    pub fingerprint: String,
     pub ok: bool,
     /// 该 key 本已存在（幂等命中）。
     pub duplicate: bool,
@@ -175,6 +183,7 @@ mod tests {
     fn item(ok: bool, duplicate: bool) -> ImportItemRecord {
         ImportItemRecord {
             key: "ksk_abcd...wxyz".to_string(),
+            fingerprint: "a3f7c9d1".to_string(),
             ok,
             duplicate,
             credential_id: ok.then_some(1),

@@ -53,10 +53,10 @@ pub enum Circuit {
 
 #[derive(Debug, Clone)]
 struct HealthState {
-    ewma_success: f64,           // 成功率 EWMA(α=0.3)，乐观初始 1.0
-    ewma_429: f64,               // 429 率 EWMA(α=0.5)，初始 0.0
+    ewma_success: f64, // 成功率 EWMA(α=0.3)，乐观初始 1.0
+    ewma_429: f64,     // 429 率 EWMA(α=0.5)，初始 0.0
     circuit: Circuit,
-    consecutive_429: u32,        // 连续 429（成功即清零），驱动跳闸+退避升级
+    consecutive_429: u32, // 连续 429（成功即清零），驱动跳闸+退避升级
     last_success: Option<Instant>,
     last_429: Option<Instant>,
     open_start: Option<Instant>, // 本轮 Open 起点（观测/恢复窗口埋点）
@@ -145,8 +145,7 @@ impl HealthTracker {
 
     /// 退避时长：`min(BASE*GROWTH^(n-1), MAX)`，n=open_count（≥1）。
     fn open_backoff(n: u32) -> Duration {
-        let secs =
-            (BASE_OPEN_SECS as f64 * OPEN_GROWTH.powi(n.saturating_sub(1) as i32)) as u64;
+        let secs = (BASE_OPEN_SECS as f64 * OPEN_GROWTH.powi(n.saturating_sub(1) as i32)) as u64;
         Duration::from_secs(secs.min(MAX_OPEN_SECS))
     }
 
@@ -202,7 +201,9 @@ impl HealthTracker {
                 s.open_count += 1;
                 s.admit_prob_seed = (s.admit_prob_seed * 0.5).max(MIN_ADMIT_SEED);
                 let backoff = Self::open_backoff(s.open_count);
-                s.circuit = Circuit::Open { until: now + backoff };
+                s.circuit = Circuit::Open {
+                    until: now + backoff,
+                };
                 s.open_start = Some(now);
             }
             Circuit::Closed => {
@@ -210,11 +211,14 @@ impl HealthTracker {
                     s.open_count += 1;
                     s.admit_prob_seed = HALFOPEN_START;
                     let backoff = Self::open_backoff(s.open_count);
-                    s.circuit = Circuit::Open { until: now + backoff };
+                    s.circuit = Circuit::Open {
+                        until: now + backoff,
+                    };
                     s.open_start = Some(now);
                 }
             }
-            Circuit::Open { .. } => { /* 已开，不重复升级（一条链多次 429 只算一轮） */ }
+            Circuit::Open { .. } => { /* 已开，不重复升级（一条链多次 429 只算一轮） */
+            }
         }
     }
 
@@ -236,7 +240,9 @@ impl HealthTracker {
             Circuit::Closed => HALFOPEN_START,
         };
         s.open_count += 1;
-        s.circuit = Circuit::Open { until: now + backoff };
+        s.circuit = Circuit::Open {
+            until: now + backoff,
+        };
         s.open_start = Some(now);
     }
 
@@ -354,10 +360,16 @@ mod tests {
             s.ewma_429 = 0.5;
         }
         // 默认降权开:health=0.8×(1-0.6×0.5)=0.56。
-        assert!((h.p_avail("k", 0, 0, 0) - 0.56).abs() < 1e-6, "降权开 → 0.56");
+        assert!(
+            (h.p_avail("k", 0, 0, 0) - 0.56).abs() < 1e-6,
+            "降权开 → 0.56"
+        );
         // 关闭降权:health=ewma_success=0.8(跳过 429 惩罚)。
         h.set_disable_429_weight(true);
-        assert!((h.p_avail("k", 0, 0, 0) - 0.8).abs() < 1e-6, "降权关 → 0.8(跳过 429 惩罚)");
+        assert!(
+            (h.p_avail("k", 0, 0, 0) - 0.8).abs() < 1e-6,
+            "降权关 → 0.8(跳过 429 惩罚)"
+        );
     }
 
     #[test]
@@ -414,14 +426,21 @@ mod tests {
         let _ = h.p_avail("fam", 0, 0, 0);
         let snap = h.snapshot("fam").unwrap();
         assert!(snap.half_open, "应进入半开");
-        assert!((snap.admit_prob - 0.1).abs() < 1e-6, "半开起点 gate 应 0.1, got {}", snap.admit_prob);
+        assert!(
+            (snap.admit_prob - 0.1).abs() < 1e-6,
+            "半开起点 gate 应 0.1, got {}",
+            snap.admit_prob
+        );
         // 连续 5 次成功 → 全开(Closed)。health 是 EWMA 渐近回升,不必等于精确 1.0,
         // 故断言 circuit 已 Closed(gate 回 1.0)+ p_avail 已高(>0.9)。
         for _ in 0..RECOVERY_FULL {
             h.on_success("fam");
         }
         let snap2 = h.snapshot("fam").unwrap();
-        assert!(!snap2.circuit_open && !snap2.half_open, "5 次成功应全开(Closed)");
+        assert!(
+            !snap2.circuit_open && !snap2.half_open,
+            "5 次成功应全开(Closed)"
+        );
         assert!(h.p_avail("fam", 0, 0, 0) > 0.9, "全开后 p_avail 应高");
     }
 

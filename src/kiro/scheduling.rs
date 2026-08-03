@@ -48,7 +48,9 @@ impl Drop for InflightGuard {
         // saturating_sub：即便出现异常路径下的重复 drop 也绝不下溢回绕成天文数字
         let _ = self
             .counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some(v.saturating_sub(1)));
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                Some(v.saturating_sub(1))
+            });
     }
 }
 

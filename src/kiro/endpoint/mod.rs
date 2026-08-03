@@ -12,9 +12,11 @@ use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
 pub mod alt;
+pub mod cli;
 pub mod ide;
 
 pub use alt::{AmazonQEndpoint, CodeWhispererEndpoint, ENDPOINT_FALLBACK_ORDER};
+pub use cli::CliEndpoint;
 pub use ide::IdeEndpoint;
 
 /// Kiro 端点
@@ -315,9 +317,13 @@ mod tests {
         assert!(default_is_feature_not_supported(
             r#"{"__type":"AccessDeniedException","message":"FEATURE_NOT_SUPPORTED"}"#
         ));
-        assert!(default_is_feature_not_supported("403 FEATURE_NOT_SUPPORTED for region"));
+        assert!(default_is_feature_not_supported(
+            "403 FEATURE_NOT_SUPPORTED for region"
+        ));
         // 不误命中普通错误。
-        assert!(!default_is_feature_not_supported(r#"{"reason":"MONTHLY_REQUEST_COUNT"}"#));
+        assert!(!default_is_feature_not_supported(
+            r#"{"reason":"MONTHLY_REQUEST_COUNT"}"#
+        ));
         assert!(!default_is_feature_not_supported("INVALID_MODEL_ID"));
     }
 
@@ -383,8 +389,7 @@ mod tests {
         // ⚠️ 防误冻核心边界：一段"临时限速但文案里带 suspended"的 body，
         // is_temporary_rate_limit 必须命中（provider 会先判它，从而只设短冷却）。
         // 同时该 body 也会被 is_account_suspended 命中——正因如此顺序才关键。
-        let body =
-            "Your account has been suspended due to suspicious activity. temporary limits applied, try again later.";
+        let body = "Your account has been suspended due to suspicious activity. temporary limits applied, try again later.";
         assert!(
             default_is_temporary_rate_limit(body),
             "临时风控文案必须先被识别为临时限速"
@@ -452,7 +457,8 @@ mod tests {
     /// 确认经典 503 + MODEL_TEMPORARILY_UNAVAILABLE 仍被识别（回归）。
     #[test]
     fn test_503_model_temporarily_unavailable_still_works() {
-        let body = r#"{"error":{"type":"overloaded_error","message":"MODEL_TEMPORARILY_UNAVAILABLE"}}"#;
+        let body =
+            r#"{"error":{"type":"overloaded_error","message":"MODEL_TEMPORARILY_UNAVAILABLE"}}"#;
         assert!(
             default_is_model_temporarily_unavailable(body),
             "503 + MODEL_TEMPORARILY_UNAVAILABLE 经典形式必须仍被识别"
