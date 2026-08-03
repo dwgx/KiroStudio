@@ -163,7 +163,7 @@ pub(super) fn inject_profile_arn(request_body: &str, profile_arn: &Option<String
 
 #[cfg(test)]
 mod tests {
-    use super::{beta_header_for_1m, inject_profile_arn, BETA_1M};
+    use super::{BETA_1M, beta_header_for_1m, inject_profile_arn};
     use serde_json::Value;
 
     #[test]

@@ -84,7 +84,11 @@ pub fn split_proxy_credentials(raw: &str) -> (String, Option<String>, Option<Str
                 Some((u, p)) => (u, Some(p)),
                 None => (ui, None),
             };
-            let dec = |s: &str| urlencoding::decode(s).map(|c| c.into_owned()).unwrap_or_else(|_| s.to_string());
+            let dec = |s: &str| {
+                urlencoding::decode(s)
+                    .map(|c| c.into_owned())
+                    .unwrap_or_else(|_| s.to_string())
+            };
             let user = if u.is_empty() { None } else { Some(dec(u)) };
             let pass = p.and_then(|p| if p.is_empty() { None } else { Some(dec(p)) });
             (user, pass)

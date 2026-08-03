@@ -11,7 +11,7 @@
 use std::convert::Infallible;
 
 use axum::body::Body;
-use axum::http::{header, StatusCode};
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures::StreamExt;
@@ -41,7 +41,7 @@ pub async fn forward(
             return (
                 err_response(StatusCode::BAD_GATEWAY, "自定义 API 凭据缺少 base_url"),
                 StatusCode::BAD_GATEWAY,
-            )
+            );
         }
     };
     // Anthropic messages 端点:base 已含 /v1 则不重复拼;否则补 /v1/messages。
@@ -60,9 +60,12 @@ pub async fn forward(
         Ok(c) => c,
         Err(e) => {
             return (
-                err_response(StatusCode::BAD_GATEWAY, &format!("构建透传 client 失败: {e}")),
+                err_response(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("构建透传 client 失败: {e}"),
+                ),
                 StatusCode::BAD_GATEWAY,
-            )
+            );
         }
     };
 
