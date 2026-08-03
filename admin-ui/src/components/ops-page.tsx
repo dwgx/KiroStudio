@@ -48,7 +48,7 @@ import type {
   StoragePartition,
   StorageCleanupTarget,
 } from '@/types/api'
-import { cn } from '@/lib/utils'
+import { cn, copyToClipboard } from '@/lib/utils'
 import { storage } from '@/lib/storage'
 import {
   Download,
@@ -495,9 +495,31 @@ function ImportRecordRow({ rec }: { rec: ImportRecord }) {
                     ? t('opspage.import.itemDup')
                     : t('opspage.import.itemOk')}
               </span>
-              <span className="font-mono text-muted-foreground">{it.key}</span>
+              {/* 明文 key:面板走 admin 鉴权,与既有「导出凭据」同防护级别。
+                  运维需要直接核对/复制刚入池的号,打码反而挡住了正事(回给推送方的响应仍打码)。
+                  select-all 让单击即全选,长 key 用 break-all 折行不撑破卡片。 */}
+              <span
+                className="select-all break-all font-mono text-foreground"
+                title={t('opspage.import.copyKey')}
+              >
+                {it.key}
+              </span>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-4 shrink-0 px-1"
+                title={t('opspage.import.copyKey')}
+                onClick={async () => {
+                  const ok = await copyToClipboard(it.key)
+                  toast[ok ? 'success' : 'error'](
+                    t(ok ? 'opspage.import.keyCopied' : 'opspage.log.copyFail'),
+                  )
+                }}
+              >
+                <Copy className="h-3 w-3" />
+              </Button>
               {it.credentialId != null && (
-                <span className="text-muted-foreground">#{it.credentialId}</span>
+                <span className="shrink-0 text-muted-foreground">#{it.credentialId}</span>
               )}
               {it.error && <span className="flex-1 break-all text-amber-400/80">{it.error}</span>}
             </div>
