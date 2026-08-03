@@ -734,7 +734,10 @@ mod tests {
 
     // 测试辅助：构造一个带 user 消息与指定 tools 的请求
     #[cfg(test)]
-    fn mk_req(user_text: &str, tools: Option<Vec<crate::anthropic::types::Tool>>) -> MessagesRequest {
+    fn mk_req(
+        user_text: &str,
+        tools: Option<Vec<crate::anthropic::types::Tool>>,
+    ) -> MessagesRequest {
         use crate::anthropic::types::Message;
         MessagesRequest {
             model: "claude-sonnet-4".to_string(),

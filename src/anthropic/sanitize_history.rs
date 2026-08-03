@@ -192,7 +192,10 @@ mod tests {
         match &h[1] {
             Message::User(u) => {
                 assert!(
-                    u.user_input_message.user_input_message_context.tool_results.is_empty(),
+                    u.user_input_message
+                        .user_input_message_context
+                        .tool_results
+                        .is_empty(),
                     "toolResults 必须被扁平化"
                 );
                 let c = &u.user_input_message.content;
@@ -233,7 +236,10 @@ mod tests {
         if let Message::Assistant(a) = &h[0] {
             let c = &a.assistant_response_message.content;
             for bad in ["[Called", "read_file", "tool_use", "invoke"] {
-                assert!(!c.contains(bad), "assistant 正文不得叙述工具调用，命中 {bad}: {c}");
+                assert!(
+                    !c.contains(bad),
+                    "assistant 正文不得叙述工具调用，命中 {bad}: {c}"
+                );
             }
         }
     }
