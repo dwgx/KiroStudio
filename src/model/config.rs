@@ -93,6 +93,10 @@ pub struct Config {
     #[serde(default)]
     pub admin_api_key: Option<String>,
 
+    /// 凭据批量导入接口专用密钥。与管理密钥隔离，避免推送方获得管理权限。
+    #[serde(default)]
+    pub import_api_key: Option<String>,
+
     /// 负载均衡模式（"priority" 或 "balanced"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
@@ -863,6 +867,7 @@ impl Default for Config {
             proxy_username: None,
             proxy_password: None,
             admin_api_key: None,
+            import_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
             cc_auto_buffer: default_cc_auto_buffer(),

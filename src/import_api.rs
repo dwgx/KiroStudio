@@ -66,6 +66,17 @@ struct ImportItemResponse {
     credential_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// key 指纹（SHA-256 前 8 位），仅供本地面板辨别，**不进线上响应**（契约未要求，
+    /// 保持回给推送方的 JSON 与约定完全一致）。
+    #[serde(skip)]
+    fingerprint: String,
+    /// 完整明文 key，仅用于写入本地面板的导入记录，**绝不进线上响应**。
+    ///
+    /// 回给推送方的 `key` 字段保持打码（契约：「响应里的 key 建议打码，我们不依赖完整值」），
+    /// 而本地面板需要明文以便直接核对/复制刚入池的号——面板走 admin 鉴权，与既有
+    /// 「导出凭据」端点同一防护级别。两者用途不同，故分成两个字段而非复用一个。
+    #[serde(skip)]
+    plain_key: String,
 }
 
 pub fn create_router(token: String, manager: Arc<MultiTokenManager>) -> Router {
@@ -124,12 +135,14 @@ async fn import_keys(
     let imported = results.iter().filter(|item| item.ok).count();
     let failed = results.len() - imported;
     // 可观测摘要（进程级内存、零持久化）：面板据此显示最近几次推送，不必翻容器日志。
-    // 只记已打码的 key 与失败原因——明文密钥绝不进这里。
+    // 面板记**完整 key**（运维需要直接取用/比对），仅受 admin 鉴权保护、不落盘、重启即失；
+    // 回给推送方的 `ImportItemResponse.key` 仍是打码值（契约明确「不依赖完整值」）。
     crate::common::import_stats::record_push(
         results
             .iter()
             .map(|item| crate::common::import_stats::ImportItemRecord {
-                key: item.key.clone(),
+                key: item.plain_key.clone(),
+                fingerprint: item.fingerprint.clone(),
                 ok: item.ok,
                 duplicate: item.duplicate.unwrap_or(false),
                 credential_id: item.credential_id,
@@ -151,8 +164,13 @@ async fn import_keys(
 async fn process_item(state: &ImportState, item: ImportItem) -> ImportItemResponse {
     let key = item.key.trim().to_string();
     let masked = mask_key(&key);
+    let fingerprint = crate::common::key_mask::key_fingerprint(&key);
+    // 闭包持有自己的副本：末尾 upsert 会 move 掉 `key`，若闭包借用它则借用检查不通过。
+    let plain_for_fail = key.clone();
     let fail = |error: String| ImportItemResponse {
         key: masked.clone(),
+        plain_key: plain_for_fail.clone(),
+        fingerprint: fingerprint.clone(),
         ok: false,
         duplicate: None,
         credential_id: None,
@@ -203,12 +221,21 @@ async fn process_item(state: &ImportState, item: ImportItem) -> ImportItemRespon
         }
     };
 
-    // null/missing endpoint means "unknown": preserve an existing route; new API keys use the
-    // actual Kiro CLI runtime protocol instead of guessing an IDE endpoint.
+    // endpoint 为 null/缺省 = 推送方"不知道"，此时绝不替它猜：
+    // 已有记录保留原路由，全新 key 落 None → provider 回退 config.defaultEndpoint。
+    //
+    // 【为何不能默认 cli】实测同一个真实 key：
+    //   endpoint=cli → 上游 400 INVALID_MODEL_ID（cli 端点 runtime.{region}.kiro.dev 认的
+    //                  modelId 格式与网关下发的 CLAUDE_*_V1_0 不一致），且该 JSON 错误被
+    //                  喂进 Event Stream 解码器，报出"消息长度 19 亿字节"的误导性错误；
+    //   endpoint=ide → HTTP 200 正常推理。
+    // 而对方契约的示例恰好就是 `"endpoint": null`——硬编码 cli 会让推来的号**全部不可用**。
+    // 落 None 同时也符合契约第 1 条「不编造默认值」的精神：路由决策交给部署方的配置。
     let endpoint = requested_endpoint
-        .or_else(|| existing.as_ref().and_then(|old| old.endpoint.clone()))
-        .or_else(|| Some("cli".to_string()));
+        .or_else(|| existing.as_ref().and_then(|old| old.endpoint.clone()));
 
+    // upsert 会消费 key，先留一份给面板明细（明文仅存内存，见 ImportItemRecord.key 说明）。
+    let plain_key = key.clone();
     match state
         .manager
         .upsert_imported_api_key(key, region, endpoint)
@@ -216,6 +243,8 @@ async fn process_item(state: &ImportState, item: ImportItem) -> ImportItemRespon
     {
         Ok(result) => ImportItemResponse {
             key: masked,
+            plain_key,
+            fingerprint,
             ok: true,
             duplicate: Some(result.duplicate),
             credential_id: Some(result.id),
@@ -305,22 +334,27 @@ async fn probe_regions(
     }
 }
 
+/// 脱敏展示委托给 [`crate::common::key_mask`]，与凭据管理页同格式——同一个 key 在两处
+/// 显示一致，运维才能对照确认是不是同一个号（此前两处格式不同，无法比对）。
 fn mask_key(key: &str) -> String {
-    if key.is_ascii() && key.len() > 12 {
-        format!("{}...{}", &key[..8], &key[key.len() - 4..])
-    } else {
-        "ksk_***".to_string()
-    }
+    crate::common::key_mask::mask_api_key(key)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// 脱敏格式与凭据管理页同源（`common::key_mask`），两处显示同一个 key 必须一模一样，
+    /// 否则运维无法对照确认「面板上这个号就是对方推的那个」。
     #[test]
     fn masks_keys_without_exposing_full_value() {
         assert_eq!(mask_key("ksk_abcdefghijklmnop"), "ksk_abcd...mnop");
-        assert_eq!(mask_key("short"), "ksk_***");
+        assert_eq!(mask_key("short"), "***");
+        // 与共享实现逐字节一致（防某天有人在此处另开分支）。
+        assert_eq!(
+            mask_key("ksk_abcdefghijklmnop"),
+            crate::common::key_mask::mask_api_key("ksk_abcdefghijklmnop")
+        );
     }
 
     /// 回归：KIRO_DIALOG_REGIONS 里绝大多数 region **没有** management 端点（实测 33 个候选

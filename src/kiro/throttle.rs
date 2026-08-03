@@ -181,8 +181,8 @@ impl GlobalThrottle {
         }
         // 需要排队。
         self.queued_total.fetch_add(1, Ordering::Relaxed);
-        let deadline =
-            Instant::now() + Duration::from_secs(self.queue_max_wait_secs.load(Ordering::Relaxed) as u64);
+        let deadline = Instant::now()
+            + Duration::from_secs(self.queue_max_wait_secs.load(Ordering::Relaxed) as u64);
         loop {
             // 估算下一个令牌到达时间,睡到那时或被 notify 唤醒(取先到)。
             let rpm = self.current_target_rpm().max(1) as u64;
@@ -345,7 +345,10 @@ mod tests {
         let t = GlobalThrottle::new(true, false, 1, 1, 300, 1, 1, true);
         while t.try_take() {} // 抽干初始桶
         // passthrough=true:超时放行,返回 Ok。
-        assert!(t.acquire().await.is_ok(), "passthrough 开:排队超时应放行(Ok)不拒绝");
+        assert!(
+            t.acquire().await.is_ok(),
+            "passthrough 开:排队超时应放行(Ok)不拒绝"
+        );
     }
 
     #[tokio::test]
@@ -353,7 +356,10 @@ mod tests {
         // passthrough=false 时保持旧行为:排队超时返回 Err(retry 秒数)。
         let t = GlobalThrottle::new(true, false, 1, 1, 300, 1, 1, false);
         while t.try_take() {} // 抽干初始桶
-        assert!(t.acquire().await.is_err(), "passthrough 关:排队超时应返回 Err(拒绝)");
+        assert!(
+            t.acquire().await.is_err(),
+            "passthrough 关:排队超时应返回 Err(拒绝)"
+        );
     }
 
     #[tokio::test]
@@ -553,7 +559,10 @@ mod tests {
                 ok += 1;
             }
         }
-        assert!(ok <= 4, "瞬时并发只应放行≈桶容量个令牌,实得 {ok}(超发=丢更新bug复现)");
+        assert!(
+            ok <= 4,
+            "瞬时并发只应放行≈桶容量个令牌,实得 {ok}(超发=丢更新bug复现)"
+        );
         assert!(ok >= 1, "至少应放行初始桶里的令牌");
     }
 
@@ -581,6 +590,10 @@ mod tests {
         assert_eq!(t.current_target_rpm(), 50, "自动挡保存无关配置不应打回初值");
         // 若新下限抬高到 80,则学到的 50 被 clamp 到 80。
         t.update(true, true, 200, 80, 300, 2, 30, false);
-        assert_eq!(t.current_target_rpm(), 80, "学到值低于新下限时 clamp 到下限");
+        assert_eq!(
+            t.current_target_rpm(),
+            80,
+            "学到值低于新下限时 clamp 到下限"
+        );
     }
 }

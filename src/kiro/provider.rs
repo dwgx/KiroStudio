@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 use crate::http_client::{ProxyConfig, build_streaming_client};
-use crate::kiro::endpoint::{KiroEndpoint, RequestContext, ENDPOINT_FALLBACK_ORDER};
+use crate::kiro::endpoint::{ENDPOINT_FALLBACK_ORDER, KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
@@ -165,8 +165,8 @@ impl KiroProvider {
         // 预热：构建全局代理对应的 Client
         // 对话路径用流式 client：read_timeout(空闲间隔) 而非总时长，防长流被中途掐断
         // （根因见 build_streaming_client 注释：修 `Connection closed mid-response`）。
-        let initial_client = build_streaming_client(proxy.as_ref(), 720, tls_backend)
-            .expect("创建 HTTP 客户端失败");
+        let initial_client =
+            build_streaming_client(proxy.as_ref(), 720, tls_backend).expect("创建 HTTP 客户端失败");
         let mut cache = HashMap::new();
         cache.insert(proxy.clone(), initial_client);
 
@@ -200,7 +200,9 @@ impl KiroProvider {
     /// HTTP 状态码错误（429/5xx）绝不进这里——那是容量问题，host 本身是好的。
     fn mark_endpoint_dead(&self, endpoint_name: &str, region: &str) {
         let key = format!("{}@{}", endpoint_name, region);
-        self.dead_endpoints.lock().insert(key, std::time::Instant::now());
+        self.dead_endpoints
+            .lock()
+            .insert(key, std::time::Instant::now());
     }
 
     /// 清除 (端点, region) 的负缓存。拿到 HTTP 响应 = 连接层通了（哪怕业务层 429/5xx）。
@@ -222,10 +224,7 @@ impl KiroProvider {
     }
 
     /// 根据凭据选择 endpoint 实现
-    fn endpoint_for(
-        &self,
-        credentials: &KiroCredentials,
-    ) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
+    fn endpoint_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
         let name = credentials
             .endpoint
             .as_deref()
@@ -247,7 +246,7 @@ impl KiroProvider {
         fallback_enabled: bool,
     ) -> anyhow::Result<Vec<Arc<dyn KiroEndpoint>>> {
         let primary = self.endpoint_for(credentials)?;
-        if !fallback_enabled {
+        if !fallback_enabled || primary.name() == crate::kiro::endpoint::cli::CLI_ENDPOINT_NAME {
             return Ok(vec![primary]);
         }
         let primary_name = primary.name();
@@ -354,7 +353,8 @@ impl KiroProvider {
             //    下方 4xx 直返、永远到不了 failover(对抗 review B1 抓到的持久黑洞:429 号不切换)。
             // - 401 key 失效 / 402·403 额度耗尽 / 429 限流 / 5xx 上游错误 → 该号短冷却 + 换下一个 custom_api。
             // - 其余 4xx(400/404/422 等客户端请求错误)→ 换号/落 Kiro 也一样错,直接返给客户端。
-            let should_failover = matches!(code, 401 | 402 | 403 | 429) || (500..600).contains(&code);
+            let should_failover =
+                matches!(code, 401 | 402 | 403 | 429) || (500..600).contains(&code);
             if !should_failover {
                 let meta = PassthroughMeta {
                     credential_id: id,
@@ -501,10 +501,18 @@ impl KiroProvider {
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
                     if ctx.credentials.is_api_key_credential() {
-                        tracing::warn!("凭据 #{} (API Key) bearer token 被上游拒绝，跳过强刷（API Key 不支持刷新）", ctx.id);
+                        tracing::warn!(
+                            "凭据 #{} (API Key) bearer token 被上游拒绝，跳过强刷（API Key 不支持刷新）",
+                            ctx.id
+                        );
                     } else {
                         tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                        if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
+                        if self
+                            .token_manager
+                            .force_refresh_token_for(ctx.id)
+                            .await
+                            .is_ok()
+                        {
                             tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
                             continue;
                         }
@@ -615,7 +623,8 @@ impl KiroProvider {
             // 让它自己退避）。防止一个卡住的请求在小号池里反复扫冷全池、把偶发 429
             // 拖成持续雪崩。首次尝试(attempt==0)不受此限，保证至少打一次。
             if attempt > 0
-                && call_started.elapsed() >= std::time::Duration::from_secs(MAX_REQUEST_RETRY_BUDGET_SECS)
+                && call_started.elapsed()
+                    >= std::time::Duration::from_secs(MAX_REQUEST_RETRY_BUDGET_SECS)
             {
                 tracing::warn!(
                     "单请求重试已达墙钟预算 {}s（尝试 {}/{}），停止重试并透传上游错误，避免拖垮整池",
@@ -756,11 +765,7 @@ impl KiroProvider {
                             last_outcome = crate::usage::RequestOutcome::NetworkError;
                             break;
                         }
-                        tracing::warn!(
-                            "端点 {} 发送失败，回退到下一端点: {}",
-                            candidate.name(),
-                            e
-                        );
+                        tracing::warn!("端点 {} 发送失败，回退到下一端点: {}", candidate.name(), e);
                     }
                 }
             }
@@ -927,8 +932,9 @@ impl KiroProvider {
                 // 模型级处置：只把"该号+该模型"记进短期黑名单并 failover 到对此模型仍可用的号；
                 // 绝不冷却/禁用整个号（该号对其它模型照常可用）。返回 false = 所有未禁用号都已对
                 // 此模型进黑名单 → 说明是模型本身无效，透传真 400 给客户端(而非 429/502 死循环)。
-                let has_available_for_model =
-                    self.token_manager.report_model_invalid(ctx.id, model.as_deref());
+                let has_available_for_model = self
+                    .token_manager
+                    .report_model_invalid(ctx.id, model.as_deref());
                 if !has_available_for_model {
                     last_error = Some(anyhow::anyhow!(
                         "{} API 请求失败（模型 {:?} 对所有号均 INVALID_MODEL_ID，判定模型无效）: {} {}",
@@ -986,7 +992,8 @@ impl KiroProvider {
                     && ctx.credentials.is_external_idp_credential()
                 {
                     let corrected = self.token_manager.sync_region_from_arn_for(ctx.id);
-                    self.token_manager.mark_usage_403_feature_not_supported(ctx.id);
+                    self.token_manager
+                        .mark_usage_403_feature_not_supported(ctx.id);
                     self.token_manager.trigger_background_reprobe(ctx.id);
                     if corrected
                         && region_corrected_this_call.insert(ctx.id)
@@ -1000,7 +1007,9 @@ impl KiroProvider {
                         last_outcome = crate::usage::RequestOutcome::ServerError;
                         last_error = Some(anyhow::anyhow!(
                             "{} 403 FEATURE_NOT_SUPPORTED(已本地纠正 region 重试): {} {}",
-                            api_type, status, body
+                            api_type,
+                            status,
+                            body
                         ));
                         // continue → 下一轮 acquire_context 重克隆已改好 region 的 creds(不复用旧 ctx/url)。
                         continue;
@@ -1017,7 +1026,9 @@ impl KiroProvider {
                     self.token_manager.report_auth_cooldown(ctx.id);
                     last_error = Some(anyhow::anyhow!(
                         "{} 403 FEATURE_NOT_SUPPORTED(region 未开通,冷却换号,后台重探中): {} {}",
-                        api_type, status, body
+                        api_type,
+                        status,
+                        body
                     ));
                     // continue:下一轮 acquire_context 选别的号;全池不可用时由 max_retries/墙钟兜底透传。
                     continue;
@@ -1028,10 +1039,18 @@ impl KiroProvider {
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
                     if ctx.credentials.is_api_key_credential() {
-                        tracing::warn!("凭据 #{} (API Key) bearer token 被上游拒绝，跳过强刷（API Key 不支持刷新）", ctx.id);
+                        tracing::warn!(
+                            "凭据 #{} (API Key) bearer token 被上游拒绝，跳过强刷（API Key 不支持刷新）",
+                            ctx.id
+                        );
                     } else {
                         tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                        if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
+                        if self
+                            .token_manager
+                            .force_refresh_token_for(ctx.id)
+                            .await
+                            .is_ok()
+                        {
                             tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
                             continue;
                         }
@@ -1098,7 +1117,10 @@ impl KiroProvider {
                     break;
                 }
                 // 慢速退避：1s base，比通用 200ms 更长，避免反复冲击过载路径。
-                sleep(Self::retry_delay_model_unavailable(model_unavailable_attempts - 1)).await;
+                sleep(Self::retry_delay_model_unavailable(
+                    model_unavailable_attempts - 1,
+                ))
+                .await;
                 continue;
             }
 
@@ -1119,8 +1141,8 @@ impl KiroProvider {
                     // 上游 429 → 入站整形 RPM 自动挡乘性降档(削平后续入站速率,别继续挤爆上游)。
                     self.token_manager.report_upstream_rate_limited();
                     // 优先用上游给出的精确重置时间：响应头 Retry-After 优先，其次错误 body
-                    let retry_after = retry_after_header
-                        .or_else(|| endpoint.extract_retry_after_secs(&body));
+                    let retry_after =
+                        retry_after_header.or_else(|| endpoint.extract_retry_after_secs(&body));
                     // 本请求链内该号首次 429 才设冷却；再次 429 只换号 failover，不重复累加
                     // trigger_count / 延长冷却（见 rate_limited_this_call 定义处的根因说明）。
                     if rate_limited_this_call.insert(ctx.id) {
@@ -1350,9 +1372,9 @@ impl KiroProvider {
         let Ok(mut v) = serde_json::from_str::<serde_json::Value>(request_body) else {
             return request_body.to_string();
         };
-        if let Some(mid) = v.pointer_mut(
-            "/conversationState/currentMessage/userInputMessage/modelId",
-        ) {
+        if let Some(mid) =
+            v.pointer_mut("/conversationState/currentMessage/userInputMessage/modelId")
+        {
             *mid = serde_json::Value::String(new_model.to_string());
         }
         serde_json::to_string(&v).unwrap_or_else(|_| request_body.to_string())
@@ -1460,7 +1482,8 @@ mod tests {
         assert_eq!(session.as_deref(), Some("s1"));
 
         // 只有 modelId、无 conversationId：model=Some、session=None
-        let only_model = r#"{"conversationState":{"currentMessage":{"userInputMessage":{"modelId":"m"}}}}"#;
+        let only_model =
+            r#"{"conversationState":{"currentMessage":{"userInputMessage":{"modelId":"m"}}}}"#;
         let (model, session) = KiroProvider::extract_model_and_session(only_model);
         assert_eq!(model.as_deref(), Some("m"));
         assert_eq!(session, None);
@@ -1479,4 +1502,3 @@ mod tests {
         assert_eq!(session, None);
     }
 }
-

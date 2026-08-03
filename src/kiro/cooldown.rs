@@ -172,7 +172,9 @@ impl CooldownManager {
         if !reason.is_auto_recoverable() {
             return base; // 认证失败/封号/配额:不缩放,防误配放行死号
         }
-        let pct = self.cooldown_scale_pct.load(std::sync::atomic::Ordering::Relaxed);
+        let pct = self
+            .cooldown_scale_pct
+            .load(std::sync::atomic::Ordering::Relaxed);
         if pct == 100 {
             return base;
         }
@@ -213,12 +215,14 @@ impl CooldownManager {
         let now = Instant::now();
         let baseline = self.scaled_duration(reason, reason.default_duration());
 
-        let entry = entries.entry(credential_id).or_insert_with(|| CooldownEntry {
-            reason,
-            started_at: now,
-            expires_at: now,
-            trigger_count: 0,
-        });
+        let entry = entries
+            .entry(credential_id)
+            .or_insert_with(|| CooldownEntry {
+                reason,
+                started_at: now,
+                expires_at: now,
+                trigger_count: 0,
+            });
 
         // 平静期衰减（与 set_cooldown_with_duration 同口径）：长时间没再触发就回退强度。
         const DECAY_WINDOW_SECS: u64 = 60;
@@ -407,7 +411,10 @@ impl CooldownManager {
             let multiplier = 1.6_f64.powi((trigger_count.saturating_sub(1)) as i32);
             let duration_secs = (base.as_secs() as f64 * multiplier) as u64;
             // scale 作用在递增后、封顶前:缩放后仍不超过 30min 硬顶。
-            return self.scaled_duration(reason, Duration::from_secs(duration_secs.min(SUSPICIOUS_MAX_SECS)));
+            return self.scaled_duration(
+                reason,
+                Duration::from_secs(duration_secs.min(SUSPICIOUS_MAX_SECS)),
+            );
         }
 
         if reason.is_auto_recoverable() {
@@ -551,7 +558,9 @@ mod tests {
     #[test]
     fn test_transient_cooldown_does_not_escalate() {
         let manager = CooldownManager::new();
-        let baseline = CooldownReason::RateLimitExceeded.default_duration().as_secs();
+        let baseline = CooldownReason::RateLimitExceeded
+            .default_duration()
+            .as_secs();
 
         // 连打 10 次瞬时冷却，每次到期后再打（模拟裸 429 burst 反复发生）。
         let mut last = Duration::ZERO;
@@ -575,7 +584,12 @@ mod tests {
     fn test_suspicious_activity_first_trigger_is_short() {
         let manager = CooldownManager::new();
         let dur = manager.set_cooldown(1, CooldownReason::SuspiciousActivity);
-        assert_eq!(dur.as_secs(), 20, "可疑活动首次应为短基线 20s,实际 {}s", dur.as_secs());
+        assert_eq!(
+            dur.as_secs(),
+            20,
+            "可疑活动首次应为短基线 20s,实际 {}s",
+            dur.as_secs()
+        );
     }
 
     /// 可疑活动风控:持续触发才陡增,上限 30min(1800s),不无限涨也不被普通90s上限压回。
@@ -586,8 +600,16 @@ mod tests {
         for _ in 0..30 {
             last = manager.set_cooldown(1, CooldownReason::SuspiciousActivity);
         }
-        assert!(last.as_secs() <= 1800, "可疑活动冷却上限应为 30min,实际 {}s", last.as_secs());
-        assert!(last.as_secs() > 90, "持续触发应超普通短冷却上限(90s),实际 {}s", last.as_secs());
+        assert!(
+            last.as_secs() <= 1800,
+            "可疑活动冷却上限应为 30min,实际 {}s",
+            last.as_secs()
+        );
+        assert!(
+            last.as_secs() > 90,
+            "持续触发应超普通短冷却上限(90s),实际 {}s",
+            last.as_secs()
+        );
     }
 
     /// 可疑活动:反复触发时长单调不减(陡增曲线),验证"持续被风控才拉长退避"。
@@ -597,8 +619,18 @@ mod tests {
         let d1 = manager.set_cooldown(1, CooldownReason::SuspiciousActivity);
         let d2 = manager.set_cooldown(1, CooldownReason::SuspiciousActivity);
         let d3 = manager.set_cooldown(1, CooldownReason::SuspiciousActivity);
-        assert!(d2 >= d1 && d3 >= d2, "冷却应随连续触发单调不减:{:?}/{:?}/{:?}", d1, d2, d3);
-        assert!(d3.as_secs() > 20, "第3次应已超首次基线 20s,实际 {}s", d3.as_secs());
+        assert!(
+            d2 >= d1 && d3 >= d2,
+            "冷却应随连续触发单调不减:{:?}/{:?}/{:?}",
+            d1,
+            d2,
+            d3
+        );
+        assert!(
+            d3.as_secs() > 20,
+            "第3次应已超首次基线 20s,实际 {}s",
+            d3.as_secs()
+        );
     }
 
     /// 可疑活动号在冷却期内不可用(退出选号轮转,分流自然避开被风控的号)。
