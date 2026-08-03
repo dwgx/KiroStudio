@@ -4,14 +4,14 @@
 //! (整条管线自动复用)→ 把返回的 Anthropic SSE(流式)/ Messages JSON(非流式)翻回 OpenAI。
 
 use axum::{
+    Json,
     body::{Body, Bytes},
     extract::{ConnectInfo, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    Json,
 };
 use futures::StreamExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::net::SocketAddr;
 
 use crate::anthropic::middleware::AppState;
@@ -33,11 +33,23 @@ pub async fn post_chat_completions(
     // 解析原始请求(灵活 Value)+ 取 model/stream。
     let raw: Value = match serde_json::from_slice(&raw_body) {
         Ok(v) => v,
-        Err(e) => return openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", &format!("请求体解析失败: {e}")),
+        Err(e) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!("请求体解析失败: {e}"),
+            );
+        }
     };
     let peek: ChatCompletionsPeek = match serde_json::from_value(raw.clone()) {
         Ok(p) => p,
-        Err(e) => return openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", &format!("缺少必填字段: {e}")),
+        Err(e) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!("缺少必填字段: {e}"),
+            );
+        }
     };
 
     // model 经 catalog 归一(GPT-5.6 三变体已在表);未识别则原样透传给上游(由上游决定认不认)。
@@ -51,7 +63,13 @@ pub async fn post_chat_completions(
     let anthropic_req = convert::openai_chat_to_anthropic(&resolved_model, &raw, peek.stream);
     let anthropic_bytes = match serde_json::to_vec(&anthropic_req) {
         Ok(b) => Bytes::from(b),
-        Err(e) => return openai_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", &format!("请求翻译失败: {e}")),
+        Err(e) => {
+            return openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                &format!("请求翻译失败: {e}"),
+            );
+        }
     };
 
     tracing::info!(
@@ -94,28 +112,52 @@ pub async fn post_responses(
 ) -> Response {
     let raw: Value = match serde_json::from_slice(&raw_body) {
         Ok(v) => v,
-        Err(e) => return openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", &format!("请求体解析失败: {e}")),
+        Err(e) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!("请求体解析失败: {e}"),
+            );
+        }
     };
     let model = match raw.get("model").and_then(|v| v.as_str()) {
         Some(m) => m.to_string(),
-        None => return openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", "缺少必填字段 model"),
+        None => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "缺少必填字段 model",
+            );
+        }
     };
     let stream = raw.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    let resolved_model = model_catalog::resolve_kiro_id(&model).map(|s| s.to_string()).unwrap_or_else(|| model.clone());
+    let resolved_model = model_catalog::resolve_kiro_id(&model)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| model.clone());
     let echo_model = model.clone();
 
     let anthropic_req = convert::openai_responses_to_anthropic(&resolved_model, &raw, stream);
     let anthropic_bytes = match serde_json::to_vec(&anthropic_req) {
         Ok(b) => Bytes::from(b),
-        Err(e) => return openai_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", &format!("请求翻译失败: {e}")),
+        Err(e) => {
+            return openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                &format!("请求翻译失败: {e}"),
+            );
+        }
     };
 
     tracing::info!(model = %model, resolved = %resolved_model, stream = %stream, "Received POST /v1/responses request");
 
     let anthropic_resp = crate::anthropic::handlers::post_messages(
-        State(state), ConnectInfo(peer), headers, anthropic_bytes,
-    ).await;
+        State(state),
+        ConnectInfo(peer),
+        headers,
+        anthropic_bytes,
+    )
+    .await;
 
     if !anthropic_resp.status().is_success() {
         return translate_error_response(anthropic_resp).await;
@@ -130,16 +172,21 @@ pub async fn post_responses(
 
 /// 流式:Anthropic SSE → Responses SSE 事件序列(每事件 `event: T\ndata: {..}\n\n`)。
 async fn stream_responses_from_anthropic(resp: Response, model: String) -> Response {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     let body = resp.into_body();
     let mut conv = convert::ResponsesStreamConverter::new(model);
     let error_seen = Arc::new(AtomicBool::new(false));
     let error_seen_cb = error_seen.clone();
 
     let out_stream = async_stream_from_body(body, error_seen, true, move |line, sink| {
-        let payload = match line.strip_prefix("data:") { Some(p) => p.trim(), None => return };
-        if payload.is_empty() { return; }
+        let payload = match line.strip_prefix("data:") {
+            Some(p) => p.trim(),
+            None => return,
+        };
+        if payload.is_empty() {
+            return;
+        }
         if let Ok(ev) = serde_json::from_str::<Value>(payload) {
             for (event_type, data) in conv.push_event(&ev) {
                 if event_type == "response.failed" {
@@ -164,7 +211,13 @@ async fn stream_responses_from_anthropic(resp: Response, model: String) -> Respo
 async fn nonstream_responses_from_anthropic(resp: Response, model: String) -> Response {
     let bytes = match axum::body::to_bytes(resp.into_body(), MAX_RESP_BYTES).await {
         Ok(b) => b,
-        Err(e) => return openai_error(StatusCode::BAD_GATEWAY, "api_error", &format!("读取上游响应失败: {e}")),
+        Err(e) => {
+            return openai_error(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                &format!("读取上游响应失败: {e}"),
+            );
+        }
     };
     let text = String::from_utf8_lossy(&bytes);
     let events = parse_sse_or_message(&text);
@@ -174,8 +227,8 @@ async fn nonstream_responses_from_anthropic(resp: Response, model: String) -> Re
 
 /// 流式:把 Anthropic SSE body 逐帧翻成 OpenAI chat.completion.chunk SSE。
 async fn stream_openai_from_anthropic(resp: Response, model: String) -> Response {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     let body = resp.into_body();
     let mut conv = convert::ChatStreamConverter::new(model);
     // in-band 错误标志:转换器吐出 {"error":...} chunk 时置位,让流末尾**不发 [DONE]**
@@ -216,7 +269,13 @@ async fn stream_openai_from_anthropic(resp: Response, model: String) -> Response
 async fn nonstream_openai_from_anthropic(resp: Response, model: String) -> Response {
     let bytes = match axum::body::to_bytes(resp.into_body(), MAX_RESP_BYTES).await {
         Ok(b) => b,
-        Err(e) => return openai_error(StatusCode::BAD_GATEWAY, "api_error", &format!("读取上游响应失败: {e}")),
+        Err(e) => {
+            return openai_error(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                &format!("读取上游响应失败: {e}"),
+            );
+        }
     };
     // 内部非流式路径可能直接返回 Anthropic Messages JSON(非 SSE),也可能是 SSE 行。
     // 先尝试当 SSE 行解析事件;若整体是一个 JSON 对象(message),转成单事件序列。
@@ -283,7 +342,10 @@ fn synthesize_events_from_message(msg: &Value) -> Vec<Value> {
             }
         }
     }
-    let stop_reason = msg.get("stop_reason").and_then(|v| v.as_str()).unwrap_or("end_turn");
+    let stop_reason = msg
+        .get("stop_reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("end_turn");
     let mut delta = json!({"type": "message_delta", "delta": {"stop_reason": stop_reason}});
     if let Some(u) = msg.get("usage") {
         delta["usage"] = u.clone();
@@ -295,7 +357,9 @@ fn synthesize_events_from_message(msg: &Value) -> Vec<Value> {
 /// 把 Anthropic 错误响应翻成 OpenAI 错误结构。
 async fn translate_error_response(resp: Response) -> Response {
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), MAX_RESP_BYTES).await.unwrap_or_default();
+    let bytes = axum::body::to_bytes(resp.into_body(), MAX_RESP_BYTES)
+        .await
+        .unwrap_or_default();
     let text = String::from_utf8_lossy(&bytes);
     // Anthropic 错误体形如 {"type":"error","error":{"type":..,"message":..}} 或 {"error":{...}}。
     let (msg, typ) = serde_json::from_str::<Value>(text.trim())
@@ -410,7 +474,11 @@ fn find_sse_boundary(buf: &[u8]) -> Option<(usize, usize)> {
     let lf = buf.windows(2).position(|w| w == b"\n\n");
     match (crlf, lf) {
         (Some(c), Some(l)) => {
-            if c <= l { Some((c, 4)) } else { Some((l, 2)) }
+            if c <= l {
+                Some((c, 4))
+            } else {
+                Some((l, 2))
+            }
         }
         (Some(c), None) => Some((c, 4)),
         (None, Some(l)) => Some((l, 2)),
