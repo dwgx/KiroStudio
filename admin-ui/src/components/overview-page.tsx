@@ -330,7 +330,7 @@ function KpiSkeleton() {
 
 export function OverviewPage() {
   const { t } = useTranslation()
-  const { data, isLoading: credLoading } = useCredentials()
+  const { data, isLoading: credLoading, error: credError } = useCredentials()
   // 全页共享一份已缓存余额（只读、零上游），传给状态条视图展示剩余额度迷你条。
   const { data: cachedBalances } = useCachedBalances()
   const overview = useUsageOverview()
@@ -372,6 +372,12 @@ export function OverviewPage() {
   // usage 数据就绪（未禁用且已加载完首帧）；加载中走各自骨架。
   const usageReady = !usageDisabled && !overview.isLoading
   const usageLoading = !usageDisabled && overview.isLoading
+  // 「拿不到数」与「真的是 0」必须区分开：故障时安静显示 0 比报错更危险——
+  // 看起来像号池真的没流量/没凭据，运维会照着这个假象做判断。
+  // 有缓存 data 时不算不可用（v5 后台 refetch 失败会保留上次成功值，那份旧值仍有意义）。
+  const usageUnavailable = !usageDisabled && !!overview.error && !overview.data
+  const credUnavailable = !!credError && !data
+  const naText = t('common.value.unavailable')
 
   // 请求趋势数据：24h 取 hourly 序列，7d/30d 取 daily 序列，各自截取最近 N 桶并裁掉前导全 0。
   const trend = useMemo(() => {
@@ -537,11 +543,14 @@ export function OverviewPage() {
         ) : (
           <StatCard
             label={t('overviewpage.kpi.totalCreds.label')}
-            value={<AnimatedNumber value={stats.total} />}
+            // 凭据接口失败且无缓存时显示 '—'：显示 0 会被读成"号池空了"，是最危险的误报。
+            value={credUnavailable ? naText : <AnimatedNumber value={stats.total} />}
             icon={Database}
             accent="neutral"
             hint={
-              stats.isEmpty ? (
+              credUnavailable ? (
+                t('common.stale.retrying')
+              ) : stats.isEmpty ? (
                 t('overviewpage.kpi.totalCreds.empty')
               ) : (
                 <div className="flex items-center gap-1.5">
@@ -565,12 +574,24 @@ export function OverviewPage() {
         ) : (
           <StatCard
             label={t('overviewpage.kpi.requests24h.label')}
-            value={usageReady && hasReq ? <AnimatedNumber value={w24!.requests} format={compact} /> : usageReady ? '0' : '—'}
+            // usageUnavailable 优先：请求失败时 isLoading 已为 false，原式会落到 '0' 分支，
+            // 把"查不到"显示成"24h 零请求"——网关正在挂的时候这个假象最误导人。
+            value={
+              usageUnavailable
+                ? naText
+                : usageReady && hasReq
+                ? <AnimatedNumber value={w24!.requests} format={compact} />
+                : usageReady
+                ? '0'
+                : naText
+            }
             icon={Activity}
             accent="primary"
             hint={
               usageDisabled ? (
                 t('overviewpage.usageDisabled')
+              ) : usageUnavailable ? (
+                t('common.stale.retrying')
               ) : hasReq && reqSpark.length > 0 ? (
                 <div className="w-full pt-1">
                   <Sparkline data={reqSpark} height={28} />
@@ -589,13 +610,13 @@ export function OverviewPage() {
           <StatCard
             label={t('overviewpage.kpi.successRate24h.label')}
             value={
-              usageReady && hasReq ? (
+              !usageUnavailable && usageReady && hasReq ? (
                 <div className="flex items-center gap-3">
                   <span>{successRate}%</span>
                   <RadialGauge value={successRate} size={44} stroke={6} />
                 </div>
               ) : (
-                '—'
+                naText
               )
             }
             icon={CheckCircle2}
@@ -611,6 +632,8 @@ export function OverviewPage() {
             hint={
               usageDisabled
                 ? t('overviewpage.usageDisabled')
+                : usageUnavailable
+                ? t('common.stale.retrying')
                 : hasReq
                 ? t('overviewpage.kpi.successRate24h.detail', { success: compact(w24!.success), failure: compact(w24!.failure) })
                 : t('overviewpage.kpi.successRate24h.empty')
@@ -624,15 +647,39 @@ export function OverviewPage() {
         ) : (
           <StatCard
             label={t('overviewpage.kpi.tokens24h.label')}
-            value={usageReady && hasReq ? <AnimatedNumber value={w24!.total_tokens} format={compact} /> : usageReady ? '0' : '—'}
+            // 同 ② ：查不到 ≠ 0 tokens。
+            value={
+              usageUnavailable
+                ? naText
+                : usageReady && hasReq
+                ? <AnimatedNumber value={w24!.total_tokens} format={compact} />
+                : usageReady
+                ? '0'
+                : naText
+            }
             icon={Coins}
             accent="neutral"
             hint={
-              usageDisabled
-                ? t('overviewpage.usageDisabled')
-                : hasReq
-                ? t('overviewpage.kpi.tokens24h.detail', { credits: w24!.credits_used.toFixed(2), ms: Math.round(w24!.avg_latency_ms) })
-                : t('overviewpage.kpi.requests24h.empty')
+              usageDisabled ? (
+                t('overviewpage.usageDisabled')
+              ) : usageUnavailable ? (
+                t('common.stale.retrying')
+              ) : hasReq ? (
+                // 主行：credits + 延迟；次行：缓存读 + 命中占比（估算值，上游不返回真值）。
+                <div className="min-w-0 space-y-0.5">
+                  <div className="truncate">
+                    {t('overviewpage.kpi.tokens24h.detail', { credits: w24!.credits_used.toFixed(2), ms: Math.round(w24!.avg_latency_ms) })}
+                  </div>
+                  <div className="truncate text-[11px] text-sky-300/80" title={t('usagepage.cache.estimateNote')}>
+                    {t('overviewpage.kpi.tokens24h.cache', {
+                      read: compact(w24!.cache_read_tokens),
+                      pct: w24!.input_tokens > 0 ? Math.round((w24!.cache_read_tokens / w24!.input_tokens) * 100) : 0,
+                    })}
+                  </div>
+                </div>
+              ) : (
+                t('overviewpage.kpi.requests24h.empty')
+              )
             }
           />
         )}
@@ -670,7 +717,7 @@ export function OverviewPage() {
           {trendLoading ? (
             <Skeleton className="h-[280px] w-full rounded-lg" />
           ) : (
-            <AreaTrendChart points={trend.points} granularity={trend.granularity} showRate height={280} />
+            <AreaTrendChart points={trend.points} granularity={trend.granularity} showRate showCacheRead height={280} />
           )}
         </Card>
       )}

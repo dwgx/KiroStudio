@@ -8,13 +8,12 @@
 //! ⚠️ 与 Kiro 主路径完全隔离:透传响应**绝不进** Kiro 的 event-stream 解码器 / StreamContext,
 //! 而是把上游的字节流原样 [`Body::from_stream`] 回去。Kiro 转发路径一行不改。
 
-use std::convert::Infallible;
-
 use axum::body::Body;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use futures::StreamExt;
+// TryStreamExt 提供 map_err（错误传播）；StreamExt 的 map 不再需要。
+use futures::TryStreamExt;
 
 use crate::http_client::build_streaming_client_no_redirect;
 use crate::kiro::model::credentials::KiroCredentials;
@@ -101,18 +100,31 @@ pub async fn forward(
         .to_string();
 
     // 原样把上游字节流转回客户端——不解析、不改写。上游怎么发,客户端怎么收。
-    let byte_stream = upstream
-        .bytes_stream()
-        .map(|chunk| -> Result<Bytes, Infallible> {
-            match chunk {
-                Ok(b) => Ok(b),
-                // 上游流中断:结束流(客户端会看到连接提前结束)。透传不臆造错误事件。
-                Err(e) => {
-                    tracing::warn!("[透传] 上游流读取中断: {e}");
-                    Ok(Bytes::new())
-                }
-            }
-        });
+    //
+    // 🔴 修复的缺陷:此处原先是 `Err(e) => Ok(Bytes::new())`,即把上游中断**映射成一个正常的
+    // 空 chunk**。空 chunk 在 HTTP 层完全不可见,于是 chunked body 会以**正常终止**收尾——
+    // 客户端拿到 `200 OK` + 一个被截断的响应,判定成功、不重试、把半截内容当完整答案用。
+    // 注释写的是"结束流",但 `Ok(_)` 表达的是"这一项没有数据",两者语义相反。
+    // 根因是类型签名:`Result<Bytes, Infallible>` 里 `Infallible` **无法表达错误**,
+    // 所以当时只剩 `Ok` 可用——是类型选错逼出的错误处理。
+    //
+    // 为什么严重:静默截断比报错危险得多。号池当前 33% 请求已在 429,截断并不罕见,
+    // 而客户端对"成功但内容不全"没有任何恢复手段(它不知道出了问题)。
+    //
+    // 修法:用 `axum::Error` 让错误**真正传播**。`Body::from_stream` 见到 `Err` 会中止
+    // body 并关闭连接,客户端侧得到一个"提前结束且非正常终止"的流 → 可据此判失败并重试。
+    // 这正是原注释想表达的语义。`map_err` 只在出错时触发一次,不改变正常路径。
+    //
+    // ⚠️ 不在此处加重试:重试属 provider 层(见 try_custom_api_passthrough 的 failover)。
+    // 在流层重试会绕过已建立的会话亲和绑定 → 破坏前缀缓存(历史教训:换号 = prompt cache
+    // 全丢,单请求成本差 10 倍)。
+    //
+    // 注:这里**不会**因为返回 Err 而形成自旋——实测 reqwest 的 `bytes_stream` 出错后
+    // 下一次 poll 返回 `None`,不重复吐同一个 Err;且 `map`/`map_err` 都不改变终止时机。
+    let byte_stream = upstream.bytes_stream().map_err(|e| {
+        tracing::warn!("[透传] 上游流读取中断,以错误终止响应流(客户端可据此重试): {e}");
+        axum::Error::new(e)
+    });
 
     let resp = Response::builder()
         .status(status)
@@ -130,4 +142,49 @@ fn err_response(status: StatusCode, msg: &str) -> Response {
         "error": { "type": "api_error", "message": msg }
     });
     (status, axum::Json(body)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+
+    /// 回归：上游流中断必须**以错误终止** body，绝不能伪装成正常 EOF。
+    ///
+    /// **旧代码为何 FAIL**：原实现 `Err(e) => Ok(Bytes::new())` 把中断映射成一个正常的空 chunk。
+    /// 空 chunk 在 HTTP 层不可见 → chunked body 正常收尾 → 客户端拿到 `200 OK` + 截断内容，
+    /// 判定成功、不重试、把半截答案当完整结果用。旧代码下最后一项是 `Ok(b"")` 而非 `Err`，
+    /// 本测试的 `is_err()` 断言必然 FAIL。
+    ///
+    /// 静默截断比报错危险：客户端对「成功但内容不全」没有任何恢复手段（它不知道出了问题）。
+    /// 号池当前有三分之一请求在 429，截断并不罕见。
+    ///
+    /// 这里直接测 `map_err` 这一层的语义（与生产同款闭包），不依赖真实网络——
+    /// `forward` 需要真上游，而缺陷恰恰在这个映射本身。
+    #[tokio::test]
+    async fn upstream_stream_interruption_terminates_body_with_error_not_silent_eof() {
+        // 造「两个正常 chunk 后中断」的上游流，错误类型用 reqwest 的真实错误无法手工构造，
+        // 故用 std::io::Error 代表传输层失败——map_err 的语义与错误具体类型无关。
+        let upstream = futures::stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: a\n\n")),
+            Ok(Bytes::from_static(b"data: b\n\n")),
+            Err(std::io::Error::other("connection reset by peer")),
+        ]);
+
+        // 与生产同款：错误传播而非吞成空 chunk。
+        let mapped = upstream.map_err(axum::Error::new);
+        let items: Vec<_> = mapped.collect().await;
+
+        assert_eq!(items.len(), 3, "两个数据项 + 一个错误项");
+        assert!(items[0].is_ok() && items[1].is_ok(), "正常 chunk 不受影响");
+        assert!(
+            items[2].is_err(),
+            "上游中断必须传播为 Err（旧代码是 Ok(空 chunk) → 客户端把截断响应当成功）"
+        );
+        // 反向守卫：绝不能是"成功的空 chunk"这种最隐蔽的形式。
+        assert!(
+            !matches!(&items[2], Ok(b) if b.is_empty()),
+            "空 chunk 在 HTTP 层不可见，等于静默截断"
+        );
+    }
 }

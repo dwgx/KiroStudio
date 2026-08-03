@@ -46,7 +46,10 @@ export interface CredentialStatusItem {
   proxyUrl?: string
   refreshFailureCount: number
   disabledReason?: string
+  /** **实际生效**的端点名（含自动路由与默认回退），如 "ide" / "cli"。 */
   endpoint: string
+  /** 该端点是否被用户显式固定。false = 系统自动推断（ksk_ 号自动走 cli，其余回退全局默认）。 */
+  endpointPinned?: boolean
   /** 当前在途（in-flight）请求数：实时负载，用于观测负载是否均衡分摊。 */
   inflight?: number
   /** 最近 60 秒滚动窗口内的请求数（RPM 观测）。 */
@@ -80,6 +83,26 @@ export interface TrashItem {
   successCount: number
   /** 删除前最后调用时间 */
   lastUsedAt: string | null
+  /**
+   * 删除前的禁用原因（枚举名，与 Credential.disabledReason 同口径，复用 disabledReasonLabel）。
+   * 老回收站数据为 undefined —— 号被判死后往往紧接着被删，这里是唯一还能看到死因的地方。
+   */
+  disabledReason?: string
+  /** 删除前被禁用的时刻（RFC3339）。区分「刚坏就删」与「坏了很久才删」。 */
+  disabledAt?: string
+}
+
+/** 批量删除的逐条结果（部分失败仍返 200，须逐条检查 ok）。 */
+export interface BatchDeleteItemResult {
+  id: number
+  ok: boolean
+  error?: string
+}
+
+export interface BatchDeleteResponse {
+  deleted: number
+  failed: number
+  results: BatchDeleteItemResult[]
 }
 
 export interface TrashListResponse {
@@ -102,6 +125,10 @@ export interface BalanceResponse {
   overageCap?: number
   /** 有效使用限额（base + overage cap）。 */
   effectiveLimit?: number
+  /** 是否是过期的上次已知值（上游超时降级）。前端应提示"数据可能已过期"。 */
+  stale?: boolean
+  /** usage/remaining 是否含本地乐观推算（真值 + 缓存后新花掉的 credit）。可加"约"字样。 */
+  optimistic?: boolean
 }
 
 // 单条已缓存余额快照（后端 CachedBalanceItem：balance 字段被 serde flatten 到顶层，
@@ -163,6 +190,12 @@ export interface AddCredentialRequest {
   proxyPassword?: string
   kiroApiKey?: string
   endpoint?: string
+  /**
+   * 多开份数：同一账号导入 N 份，每份自动获得独立 machineId。
+   * 省略 / 1 = 普通上号（后端行为完全不变，含"重复凭据"去重保护）。
+   * >1 时第 1 份仍走去重，只有第 2..N 份绕过。上限 16。
+   */
+  copies?: number
   // 自定义 API 代挂透传
   baseUrl?: string
   apiKey?: string
@@ -173,7 +206,10 @@ export interface AddCredentialRequest {
 export interface AddCredentialResponse {
   success: boolean
   message: string
+  /** 多开时这是第 1 份的 id；全部 id 见 credentialIds */
   credentialId: number
+  /** 多开（copies>1）时全部新建凭据的 id（含第 1 份）。部分失败时只含成功的那些 */
+  credentialIds?: number[]
   email?: string
 }
 
@@ -469,9 +505,15 @@ export interface WindowSummary {
   success: number
   failure: number
   success_rate: number
+  /** 输入 token —— gross 口径，**已包含** cache_read_tokens + cache_creation_tokens */
   input_tokens: number
   output_tokens: number
+  /** 仍为 input_tokens + output_tokens，不含额外缓存增量 */
   total_tokens: number
+  /** 命中缓存复用的输入 token（input_tokens 的子集；网关本地估算） */
+  cache_read_tokens: number
+  /** 写入缓存的输入 token（input_tokens 的子集；上游不返回，当前恒为 0） */
+  cache_creation_tokens: number
   credits_used: number
   avg_latency_ms: number
 }
@@ -484,25 +526,35 @@ export interface UsageOverview {
   all_time: WindowSummary
 }
 
-// 时间序列点
+// 时间序列点（空桶各字段补 0，含两个 cache 字段）
 export interface SeriesPoint {
   ts_ms: number
   requests: number
   success: number
   failure: number
+  /** gross 口径，已含 cache 两项 */
   input_tokens: number
   output_tokens: number
+  /** 命中缓存复用的输入 token（input_tokens 的子集） */
+  cache_read_tokens: number
+  /** 写入缓存的输入 token（input_tokens 的子集） */
+  cache_creation_tokens: number
   credits_used: number
   avg_latency_ms: number
 }
 
-// 按模型/凭据分组统计
+// 按模型/凭据分组统计（无 total_tokens 字段）
 export interface GroupStat {
   key: string
   requests: number
   success_rate: number
+  /** gross 口径，已含 cache 两项 */
   input_tokens: number
   output_tokens: number
+  /** 命中缓存复用的输入 token（input_tokens 的子集） */
+  cache_read_tokens: number
+  /** 写入缓存的输入 token（input_tokens 的子集） */
+  cache_creation_tokens: number
   credits_used: number
   avg_latency_ms: number
 }
@@ -555,6 +607,14 @@ export interface StorageCleanupRequest {
   target: StorageCleanupTarget
   /** 保留天数：删除早于 N 天前的数据。省略时按各分区的配置默认保留期。 */
   olderThanDays?: number
+  /**
+   * 全清标记：忽略 olderThanDays，清空该分区**全部**条目。
+   *
+   * 回收站必须靠它才能清空：保留天数的 0 在后端已被后台任务占用为「永久保留」，
+   * 所以按天数的入参无法表达「立即全清」——传 0 清 0 条，传 N 又清不掉 N 天内新删的。
+   * 不可逆，调用前须二次确认。
+   */
+  purgeAll?: boolean
 }
 
 // 单个分区的清理结果
@@ -628,9 +688,11 @@ export interface RequestRecord {
   client_os?: string | null
   /** 客户端浏览器（后端解析 UA）：如 "Chrome 120"/"Edge 120"/"Safari"，非浏览器客户端为 null */
   client_browser?: string | null
-  /** 从缓存复用、省下的输入 token（cache_read_input_tokens）。后端 BE-A1 补，缺省 0。 */
+  /** 从缓存复用、省下的输入 token（cache_read_input_tokens）。
+      是 input_tokens 的**子集**（后者为 gross 口径），算总输入时不得再加。历史记录缺省 0。 */
   cache_read_tokens?: number
-  /** 写入缓存的输入 token（cache_creation_input_tokens）。后端 BE-A1 补，缺省 0。 */
+  /** 写入缓存的输入 token（cache_creation_input_tokens）。同为 input_tokens 的子集。
+      上游 Kiro 不提供该数字，当前恒为 0。历史记录缺省 0。 */
   cache_creation_tokens?: number
 }
 

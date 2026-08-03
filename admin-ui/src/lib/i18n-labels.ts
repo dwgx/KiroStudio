@@ -46,6 +46,14 @@ const DISABLED_REASON_KEYS: Record<string, string> = {
   TooManyRefreshFailures: 'labels.disabledReason.tooManyRefreshFailures',
   InsufficientBalance: 'labels.disabledReason.insufficientBalance',
   SubscriptionInvalid: 'labels.disabledReason.subscriptionInvalid',
+  // 后端早已下发但此前漏映射 → 面板显示的是裸英文枚举名。
+  RequestLimitReached: 'labels.disabledReason.requestLimitReached',
+  // 代挂号（第三方中转站）专用。与 TooManyFailures 分开是因为排查方向完全不同：
+  // 那条查 Kiro 号是否被风控，这两条查中转站的 key/余额/地址，或站点是否持续过载。
+  PassthroughFailed: 'labels.disabledReason.passthroughFailed',
+  PassthroughOverloaded: 'labels.disabledReason.passthroughOverloaded',
+  // 反序列化兜底：读到本版本不认识的原因（如回滚后读新版写的文件）时后端下发 Unknown。
+  Unknown: 'labels.disabledReason.unknown',
 }
 
 /** 禁用原因 -> 当前语言文案；未知值原样返回。 */

@@ -10,6 +10,10 @@ import type {
 // 复用与 credentials/usage 相同的 baseURL 与鉴权拦截
 const api = axios.create({
   baseURL: '/api/admin',
+  // 超时兜底（与 credentials.ts 同值）：axios 默认 timeout=0 即"永远等"。
+  // 请求挂在反代那一跳时会一直挂到上游超时，而 React Query 在上一次 fetch
+  // 未 settle 前不发下一轮轮询 → 运维页整块静默冻结。
+  timeout: 15000,
   headers: { 'Content-Type': 'application/json' },
 })
 
@@ -23,8 +27,13 @@ api.interceptors.request.use((config) => {
 
 // 一键重启服务（detached，systemctl restart）。
 // 注意：重启瞬间本服务断连是预期行为——本次请求可能因连接中断而抛错，调用方需容忍。
+// 单独用更短的 5s 超时而非全局 15s：后端已 detached 起了重启，响应能不能回来取决于
+// 连接被掐断的时机，等满 15s 只是让"重启中"的按钮多转 10s，对结果毫无影响。
+// 调用方（settings-page ServiceManagementCard）的 onError 已把断连当作"已发起"，超时同理。
 export async function restartService(): Promise<SuccessResponse> {
-  const { data } = await api.post<SuccessResponse>('/service/restart')
+  const { data } = await api.post<SuccessResponse>('/service/restart', undefined, {
+    timeout: 5000,
+  })
   return data
 }
 
@@ -67,8 +76,10 @@ export interface UpdatePerformResult {
 }
 
 // 检查更新（只读，多镜像回退拉 GitHub tags）。
+// 单独放宽超时：后端会串行试多个镜像，每个各有自己的超时，合计远超全局 15s；
+// 用全局值会把"镜像还在回退中"误判成失败。
 export async function checkUpdate(): Promise<UpdateCheckResult> {
-  const { data } = await api.get<UpdateCheckResult>('/update/check')
+  const { data } = await api.get<UpdateCheckResult>('/update/check', { timeout: 60000 })
   return data
 }
 
@@ -91,8 +102,14 @@ export async function getUpdateStatus(): Promise<UpdateStatusResult> {
 }
 
 // 一键升级（下载→sha256→替换→重启）。成功后服务会自动重启，请求可能因断连抛错，调用方容忍。
+// 单独放宽到 10 分钟：下载二进制（可达 200MiB 上限）+ 校验 + 替换是长操作，
+// 套全局 15s 会在升级真正进行中就报超时，误导用户去重复点击。
 export async function performUpdate(version?: string): Promise<UpdatePerformResult> {
-  const { data } = await api.post<UpdatePerformResult>('/update/perform', version ? { version } : {})
+  const { data } = await api.post<UpdatePerformResult>(
+    '/update/perform',
+    version ? { version } : {},
+    { timeout: 600000 },
+  )
   return data
 }
 
@@ -152,9 +169,12 @@ export interface TraceRecord {
   credential_id: number | null
   model: string
   is_streaming: boolean
+  /** gross 口径：**已包含** cache_read_tokens + cache_creation_tokens，算总输入时不得再加 */
   input_tokens: number
   output_tokens: number
+  /** 命中缓存复用的输入 token（input_tokens 的子集；网关本地估算，上游不返回真值） */
   cache_read_tokens: number
+  /** 写入缓存的输入 token（input_tokens 的子集；上游不提供，当前恒为 0） */
   cache_creation_tokens: number
   credits_used: number | null
   latency_ms: number

@@ -9,6 +9,12 @@ export interface AreaTrendChartProps {
   height?: number
   /** 叠加一条淡色成功率副线（右侧 0~100% 语义），让单图承载“请求量 + 质量”两维 */
   showRate?: boolean
+  /**
+   * 叠加一条缓存读 token 副线（独立标尺：按自身峰值归一化到下部 55% 带，底部贴基线）。
+   * 与请求量不共轴——两者量级差几个数量级，共轴会把请求曲线压成直线。
+   * 序列全为 0（无缓存记账）时自动不画，避免一条永远贴底的死线。
+   */
+  showCacheRead?: boolean
   /** x 轴刻度格式：小时视图显示 MM/DD HH:00，天视图显示 MM/DD */
   granularity?: 'hourly' | 'daily'
   className?: string
@@ -359,7 +365,7 @@ function FlowParticles({
  * hover：高亮圆点跟随鼠标 x 连续移动，y 沿平滑曲线实时插值升降（吸附曲线滑行）；
  * tooltip 数值取最近数据点。失败以底部淡红点含蓄标记。空数据显示占位文案。motion-reduce 兜底。
  */
-export function AreaTrendChart({ points, height = 280, showRate = false, granularity = 'hourly', className }: AreaTrendChartProps) {
+export function AreaTrendChart({ points, height = 280, showRate = false, showCacheRead = false, granularity = 'hourly', className }: AreaTrendChartProps) {
   const { t } = useTranslation()
   const wrapRef = useRef<HTMLDivElement>(null)
   const tipRef = useRef<HTMLDivElement>(null)
@@ -457,7 +463,19 @@ export function AreaTrendChart({ points, height = 280, showRate = false, granula
     })
     const ratePath = segsToPath(rateXY, buildSegments(rateXY))
 
-    return { linePts, linePath, areaPath, failures, baseY, lo, hi, ratePath, samples, markers, rawMax, rawMin }
+    // 缓存读副线：独立标尺（按自身峰值归一化），占绘图区下部 55% 带、底部贴基线。
+    // 与请求量不共轴——token 量级比请求数大 3~4 个数量级，共轴会把请求曲线压平。
+    const cacheMax = Math.max(0, ...pts.map((p) => p.cache_read_tokens))
+    const cacheXY: Pt[] =
+      cacheMax > 0
+        ? pts.map((p, i) => ({
+            x: x(i),
+            y: PAD_T + innerH - (p.cache_read_tokens / cacheMax) * innerH * 0.55,
+          }))
+        : []
+    const cachePath = cacheXY.length > 0 ? segsToPath(cacheXY, buildSegments(cacheXY)) : ''
+
+    return { linePts, linePath, areaPath, failures, baseY, lo, hi, ratePath, cachePath, cacheMax, samples, markers, rawMax, rawMin }
   }, [points, width, height])
 
   const hasData = points.some((p) => p.requests > 0)
@@ -575,6 +593,19 @@ export function AreaTrendChart({ points, height = 280, showRate = false, granula
           />
         )}
 
+        {/* 缓存读副线（淡蓝细实线，独立标尺，居下部带）：全 0 时 cachePath 为空自动不画 */}
+        {showCacheRead && model.cachePath && (
+          <path
+            d={model.cachePath}
+            fill="none"
+            stroke="hsl(199 89% 55%)"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            opacity="0.65"
+          />
+        )}
+
         {/* 非 hover 峰/谷淡显标记：空心小圈，暗示数据起伏（hover 时隐藏以免干扰） */}
         {mouseX === null &&
           model.markers.map((m, i) => (
@@ -663,6 +694,11 @@ export function AreaTrendChart({ points, height = 280, showRate = false, granula
                     {t('overviewpage.trend.successRate', {
                       pct: nearest.p.requests > 0 ? Math.round((nearest.p.success / nearest.p.requests) * 100) : 100,
                     })}
+                  </span>
+                )}
+                {showCacheRead && model.cacheMax > 0 && (
+                  <span className="text-sky-300">
+                    {t('overviewpage.trend.cacheRead', { n: compactNum(nearest.p.cache_read_tokens) })}
                   </span>
                 )}
               </div>

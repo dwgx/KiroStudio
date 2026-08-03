@@ -20,66 +20,128 @@ use std::time::Duration;
 ///
 /// 覆盖：本网络/未指定、私有、CGNAT、环回、链路本地(含 AWS 元数据
 /// 169.254.169.254)、IETF 协议段、文档/测试段、基准测试段、多播、保留、广播。
-fn is_forbidden_ipv4(ip: Ipv4Addr) -> bool {
+/// 出站目标的信任策略。按**调用点面向谁**选择，不是全局开关。
+///
+/// 两类调用点的威胁模型截然不同，用同一套判据必然一头过严一头过松：
+/// - [`Self::Strict`]：目标 URL 来自匿名可达端点或外部可控数据（如登录页背景图代理，
+///   URL 取自第三方 JSON 源）。攻击者能直接控制目标，必须拦下全部非公网段。
+/// - [`Self::AdminConfigured`]：目标由管理员过了 adminKey 鉴权后**亲手填写**
+///   （如 custom_api 的 base_url）。此时"能指定出站目标"本身就是该功能的用途，
+///   管理员另有 `proxy_url` 等同等能力，故对**不可能通向内网基础设施**的保留段放宽。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SsrfPolicy {
+    /// 严格：所有非公网段一律拒绝。
+    Strict,
+    /// 管理员显式配置：放宽 RFC 2544 基准测试段（见 [`is_forbidden_ipv4_with`] 的说明）。
+    AdminConfigured,
+}
+
+/// RFC 2544 基准测试段的标签。它被单独拎出来是因为**只有它**在
+/// [`SsrfPolicy::AdminConfigured`] 下被豁免，理由见 [`is_forbidden_ipv4_with`]。
+const BENCHMARK_SEGMENT: &str = "198.18.0.0/15 基准测试段";
+
+/// 判断某个 IPv4 落在哪个「禁止出站」段，返回该段的可读标签（不禁止则 None）。
+///
+/// 返回标签而非 bool 是为了让拒绝原因可诊断：历史缺陷是报错只说「SSRF 防护」，
+/// 用户完全不知道是自己机器的代理导致的（见 [`describe_rejection`]）。
+fn forbidden_segment_v4(ip: Ipv4Addr) -> Option<&'static str> {
     let o = ip.octets();
     // 0.0.0.0/8 本网络 / 未指定
     if o[0] == 0 {
-        return true;
+        return Some("0.0.0.0/8 本网络");
     }
     // 10.0.0.0/8 私有
     if o[0] == 10 {
-        return true;
+        return Some("10.0.0.0/8 私有网段");
     }
     // 100.64.0.0/10 CGNAT
     if o[0] == 100 && (o[1] & 0xc0) == 64 {
-        return true;
+        return Some("100.64.0.0/10 运营商级 NAT");
     }
     // 127.0.0.0/8 环回
     if o[0] == 127 {
-        return true;
+        return Some("127.0.0.0/8 环回");
     }
     // 169.254.0.0/16 链路本地（含云元数据 169.254.169.254）
     if o[0] == 169 && o[1] == 254 {
-        return true;
+        return Some("169.254.0.0/16 链路本地(含云元数据端点)");
     }
     // 172.16.0.0/12 私有
     if o[0] == 172 && (16..=31).contains(&o[1]) {
-        return true;
+        return Some("172.16.0.0/12 私有网段");
     }
     // 192.0.0.0/24 IETF 协议分配 & 192.0.2.0/24 文档(TEST-NET-1)
     if o[0] == 192 && o[1] == 0 && (o[2] == 0 || o[2] == 2) {
-        return true;
+        return Some("192.0.0.0/24 或 192.0.2.0/24 保留段");
     }
     // 192.168.0.0/16 私有
     if o[0] == 192 && o[1] == 168 {
-        return true;
+        return Some("192.168.0.0/16 私有网段");
     }
-    // 198.18.0.0/15 基准测试
+    // 198.18.0.0/15 基准测试（唯一可被 AdminConfigured 豁免的段）
     if o[0] == 198 && (o[1] == 18 || o[1] == 19) {
-        return true;
+        return Some(BENCHMARK_SEGMENT);
     }
     // 198.51.100.0/24 文档(TEST-NET-2)
     if o[0] == 198 && o[1] == 51 && o[2] == 100 {
-        return true;
+        return Some("198.51.100.0/24 文档保留段");
     }
     // 203.0.113.0/24 文档(TEST-NET-3)
     if o[0] == 203 && o[1] == 0 && o[2] == 113 {
-        return true;
+        return Some("203.0.113.0/24 文档保留段");
     }
     // 224.0.0.0/4 多播 + 240.0.0.0/4 保留（含 255.255.255.255 广播）
     if o[0] >= 224 {
-        return true;
+        return Some("224.0.0.0/4 多播或 240.0.0.0/4 保留段");
     }
-    false
+    None
+}
+
+/// 按策略判断 IPv4 是否禁止出站。
+///
+/// `AdminConfigured` 只豁免 [`BENCHMARK_SEGMENT`]（198.18.0.0/15）这一段。理由：
+///
+/// 1. **它是代理软件的 fake-IP 池默认段。** Clash / Mihomo / Surge 在 fake-IP 模式下
+///    把该段分配给**所有**域名。开了 fake-IP 的机器上，任何合法中转站域名都会解析到
+///    198.18.x.x → 严格策略会让管理员**无法添加任何 custom_api 中转站**
+///    （实测：api.uu6.top → 198.18.0.46 被拒）。这是本仓已知问题 #19 的生产侧同源缺陷，
+///    当时只把测试改用 .invalid 域名绕过，生产路径没动。
+/// 2. **它不通向任何内网基础设施。** 该段是 RFC 2544 给设备厂商做吞吐测试用的，
+///    既不是 RFC 1918 私有段，也不含云元数据端点（169.254.169.254 属链路本地，
+///    仍然拦）。fake-IP 场景下这个地址根本不是一台可达主机——代理会拦截该连接、
+///    按 IP 反查回真实域名再出网，所以"打到 198.18.x"实际打到的是那个公网域名。
+/// 3. **豁免范围严格限定在管理员已鉴权的调用点。** 匿名可达的背景图代理仍走
+///    `Strict`，威胁模型不变。且管理员本就能配 `proxy_url` 指定任意出站通道，
+///    放开这一段不新增任何它原本没有的能力。
+fn is_forbidden_ipv4_with(ip: Ipv4Addr, policy: SsrfPolicy) -> bool {
+    match forbidden_segment_v4(ip) {
+        None => false,
+        Some(seg) => !(policy == SsrfPolicy::AdminConfigured && seg == BENCHMARK_SEGMENT),
+    }
+}
+
+/// 严格策略下的 IPv4 判定（保留原签名，供 v6 内嵌 v4 与既有测试复用）。
+fn is_forbidden_ipv4(ip: Ipv4Addr) -> bool {
+    is_forbidden_ipv4_with(ip, SsrfPolicy::Strict)
 }
 
 /// 判断某个 IPv6 是否属于「禁止出站」段。IPv4-mapped/兼容地址回落到 v4 校验。
-fn is_forbidden_ipv6(ip: Ipv6Addr) -> bool {
-    // IPv4-mapped (::ffff:a.b.c.d) 或 IPv4-compatible：按内嵌 v4 判定，
-    // 防止用 ::ffff:127.0.0.1 之类绕过。
+fn is_forbidden_ipv6_with(ip: Ipv6Addr, policy: SsrfPolicy) -> bool {
+    // IPv4-mapped (::ffff:a.b.c.d) 或 IPv4-compatible：按内嵌 v4 判定（沿用同一策略，
+    // 否则 ::ffff:198.18.0.46 会与裸 198.18.0.46 判定不一致）。
     if let Some(v4) = ip.to_ipv4() {
-        return is_forbidden_ipv4(v4);
+        return is_forbidden_ipv4_with(v4, policy);
     }
+    is_forbidden_ipv6_native(ip, policy)
+}
+
+/// 严格策略下的 IPv6 判定（保留原签名，供既有测试复用）。
+fn is_forbidden_ipv6(ip: Ipv6Addr) -> bool {
+    is_forbidden_ipv6_with(ip, SsrfPolicy::Strict)
+}
+
+/// 非 IPv4-mapped 的原生 IPv6 段判定 + 各种内嵌 v4 形式。
+fn is_forbidden_ipv6_native(ip: Ipv6Addr, policy: SsrfPolicy) -> bool {
     let seg = ip.segments();
     // ::1 环回 / :: 未指定
     if ip == Ipv6Addr::LOCALHOST || ip == Ipv6Addr::UNSPECIFIED {
@@ -105,7 +167,7 @@ fn is_forbidden_ipv6(ip: Ipv6Addr) -> bool {
             (seg[7] >> 8) as u8,
             (seg[7] & 0xff) as u8,
         );
-        return is_forbidden_ipv4(v4);
+        return is_forbidden_ipv4_with(v4, policy);
     }
     // 6to4 (RFC 3056): 2002::/16 —— 前缀内嵌 IPv4 地址（bits 16–47）。
     // 例：2002:7f00:0001:: 内嵌 127.0.0.1，2002:a9fe:a9fe:: 内嵌 169.254.169.254。
@@ -117,18 +179,45 @@ fn is_forbidden_ipv6(ip: Ipv6Addr) -> bool {
             (seg[2] >> 8) as u8,
             (seg[2] & 0xff) as u8,
         );
-        if is_forbidden_ipv4(embedded_v4) {
+        if is_forbidden_ipv4_with(embedded_v4, policy) {
             return true;
         }
     }
     false
 }
 
-/// 统一入口：该 IP 是否禁止作为出站目标。
-fn is_forbidden_ip(ip: IpAddr) -> bool {
+/// 统一入口：该 IP 是否禁止作为出站目标（按策略）。
+fn is_forbidden_ip_with(ip: IpAddr, policy: SsrfPolicy) -> bool {
     match ip {
-        IpAddr::V4(v4) => is_forbidden_ipv4(v4),
-        IpAddr::V6(v6) => is_forbidden_ipv6(v6),
+        IpAddr::V4(v4) => is_forbidden_ipv4_with(v4, policy),
+        IpAddr::V6(v6) => is_forbidden_ipv6_with(v6, policy),
+    }
+}
+
+/// 严格策略下的统一入口（保留原签名，供既有测试复用）。
+fn is_forbidden_ip(ip: IpAddr) -> bool {
+    is_forbidden_ip_with(ip, SsrfPolicy::Strict)
+}
+
+/// 把「解析到禁止段」渲染成可诊断的中文拒绝原因。
+///
+/// 历史缺陷：报错只有一句「自定义 API base_url 校验失败(SSRF 防护)」，管理员看不出
+/// 是自己机器开了代理 fake-IP 导致的，只会以为网关坏了或中转站不可用（这正是本轮
+/// 用户遇到的情形）。命中基准测试段时额外给出可操作的提示。
+fn describe_rejection(ip: IpAddr) -> String {
+    let seg = match ip {
+        IpAddr::V4(v4) => forbidden_segment_v4(v4),
+        // v6 的具体段名未细分，统一给一个够用的标签
+        IpAddr::V6(v6) => v6.to_ipv4().and_then(forbidden_segment_v4),
+    };
+    match seg {
+        Some(s) if s == BENCHMARK_SEGMENT => format!(
+            "目标解析到 {ip}（{s}）。该段是 Clash/Mihomo 等代理软件 fake-IP 模式的默认地址池——\
+             若本机开着此类代理，所有域名都会解析到这里。请关闭 fake-IP（改用 redir-host）\
+             或让网关直连 DNS 后重试"
+        ),
+        Some(s) => format!("目标解析到非公网地址 {ip}（{s}），已拒绝"),
+        None => format!("目标解析到非公网地址 {ip}，已拒绝"),
     }
 }
 
@@ -201,6 +290,19 @@ fn parse_host_port(url: &str) -> Result<(String, u16), String> {
 /// `allow_http=false` 仅允许 https；true 时额外允许 http（明文中转站，IP 层禁止段仍拦）。
 /// 成功返回 ()，失败返回拒绝原因。
 pub async fn validate_outbound_url(url: &str, allow_http: bool) -> Result<(), String> {
+    validate_outbound_url_with(url, allow_http, SsrfPolicy::Strict).await
+}
+
+/// 同 [`validate_outbound_url`]，但显式指定信任策略（见 [`SsrfPolicy`]）。
+///
+/// 管理员在面板里亲手配置的出站目标（custom_api base_url）应传
+/// [`SsrfPolicy::AdminConfigured`]；匿名可达 / 外部数据驱动的抓取一律用
+/// [`SsrfPolicy::Strict`]。
+pub async fn validate_outbound_url_with(
+    url: &str,
+    allow_http: bool,
+    policy: SsrfPolicy,
+) -> Result<(), String> {
     let scheme = url
         .split_once("://")
         .map(|(s, _)| s.to_ascii_lowercase())
@@ -221,8 +323,8 @@ pub async fn validate_outbound_url(url: &str, allow_http: bool) -> Result<(), St
         Ok(iter) => {
             let addrs: Vec<SocketAddr> = iter.collect();
             for sa in &addrs {
-                if is_forbidden_ip(sa.ip()) {
-                    return Err(format!("目标解析到非公网地址，已拒绝: {}", sa.ip()));
+                if is_forbidden_ip_with(sa.ip(), policy) {
+                    return Err(describe_rejection(sa.ip()));
                 }
             }
             Ok(())
@@ -316,6 +418,90 @@ mod tests {
                 "{ip} 应被放行"
             );
         }
+    }
+
+    /// 管理员显式配置的出站目标：198.18.0.0/15 必须放行。
+    ///
+    /// 这是生产缺陷的回归守卫：该段是 Clash/Mihomo fake-IP 模式的默认地址池，
+    /// 开着此类代理的机器上**任何**域名都解析到这里（实测 api.uu6.top → 198.18.0.46），
+    /// 严格策略下管理员无法添加任何 custom_api 中转站。
+    #[test]
+    fn should_allow_benchmark_range_for_admin_configured_targets() {
+        for ip in ["198.18.0.46", "198.18.0.1", "198.19.255.255"] {
+            let addr: IpAddr = ip.parse().unwrap();
+            assert!(
+                is_forbidden_ip_with(addr, SsrfPolicy::Strict),
+                "{ip} 在严格策略下仍应拒绝（匿名端点的威胁模型不变）"
+            );
+            assert!(
+                !is_forbidden_ip_with(addr, SsrfPolicy::AdminConfigured),
+                "{ip} 对管理员亲手配置的目标应放行，否则 fake-IP 环境下无法上号"
+            );
+        }
+    }
+
+    /// 豁免范围必须**只有** 198.18.0.0/15 —— 内网与元数据端点在两种策略下都得拦。
+    ///
+    /// 这条是放宽策略的安全边界守卫：若将来有人把豁免扩大到整个 forbidden 集合，
+    /// 这个测试会立刻失败。
+    #[test]
+    fn should_still_reject_internal_targets_even_when_admin_configured() {
+        for ip in [
+            "169.254.169.254", // 云元数据端点：最主要的 SSRF 攻击目标
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.5.5",
+            "192.168.1.1",
+            "100.64.0.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "255.255.255.255",
+            "192.0.2.5",       // 文档段：与基准段相邻但不豁免
+            "198.51.100.7",
+            "203.0.113.9",
+        ] {
+            assert!(
+                is_forbidden_ip_with(ip.parse().unwrap(), SsrfPolicy::AdminConfigured),
+                "{ip} 即便是管理员配置也必须拒绝"
+            );
+        }
+    }
+
+    /// 内嵌 v4 的 IPv6 形式必须与裸 IPv4 判定一致（否则 ::ffff:198.18.0.46 成了绕过口）。
+    #[test]
+    fn should_apply_same_policy_to_v4_mapped_and_nat64_and_6to4() {
+        // 基准段：AdminConfigured 下三种内嵌形式都应与裸 IP 一样被放行
+        for ip in ["::ffff:198.18.0.46", "64:ff9b::198.18.0.46", "2002:c612:002e::"] {
+            let addr: IpAddr = ip.parse().unwrap();
+            assert!(
+                !is_forbidden_ip_with(addr, SsrfPolicy::AdminConfigured),
+                "{ip} 内嵌基准段，应与裸 IP 判定一致（放行）"
+            );
+            assert!(
+                is_forbidden_ip_with(addr, SsrfPolicy::Strict),
+                "{ip} 严格策略下仍应拒绝"
+            );
+        }
+        // 元数据端点：任何内嵌形式在任何策略下都必须拦
+        for ip in ["::ffff:169.254.169.254", "64:ff9b::169.254.169.254", "2002:a9fe:a9fe::"] {
+            assert!(
+                is_forbidden_ip_with(ip.parse().unwrap(), SsrfPolicy::AdminConfigured),
+                "{ip} 内嵌元数据端点，必须拒绝"
+            );
+        }
+    }
+
+    /// 拒绝原因必须可诊断：命中基准段时要点出「代理 fake-IP」这个真实原因。
+    #[test]
+    fn should_explain_fake_ip_cause_in_rejection_message() {
+        let msg = describe_rejection("198.18.0.46".parse().unwrap());
+        assert!(msg.contains("198.18.0.46"), "要带上实际解析到的 IP: {msg}");
+        assert!(msg.contains("fake-IP"), "要点出 fake-IP 这个真实原因: {msg}");
+
+        // 内网目标不应误报成 fake-IP 问题
+        let msg2 = describe_rejection("169.254.169.254".parse().unwrap());
+        assert!(msg2.contains("云元数据"), "元数据端点要如实说明: {msg2}");
+        assert!(!msg2.contains("fake-IP"), "不应误导为代理问题: {msg2}");
     }
 
     #[test]

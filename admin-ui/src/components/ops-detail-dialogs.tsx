@@ -512,6 +512,9 @@ export function TraceDetailDialog({
                   <th>{t('opsdetaildialogs.trace.colDevice')}</th>
                   <th>{t('opsdetaildialogs.trace.colSession')}</th>
                   <th className="text-right">tok(in/out)</th>
+                  <th className="text-right" title={t('opsdetaildialogs.usage.colCacheHint')}>
+                    {t('opsdetaildialogs.usage.colCache')}
+                  </th>
                   <th className="text-right">{t('opsdetaildialogs.trace.colLatency')}</th>
                   <th>{t('opsdetaildialogs.trace.resultLabel')}</th>
                 </tr>
@@ -588,6 +591,8 @@ function TraceRow({
   const oc = outcomeMeta(it.outcome)
   const ocLabel = oc.labelKey ? t(oc.labelKey) : (oc.label ?? it.outcome)
   const sessShort = it.session_id ? `${it.session_id.slice(0, 8)}…` : '—'
+  // 缓存列悬浮提示：读/写各自绝对值 + 估算声明（上游不返回真值）。
+  const cacheTitle = `${t('opsdetaildialogs.trace.detailCacheRead')} ${it.cache_read_tokens.toLocaleString()} · ${t('opsdetaildialogs.trace.detailCacheWrite')} ${it.cache_creation_tokens.toLocaleString()} · ${t('opsdetaildialogs.usage.cacheEstimateNote')}`
   // 可点击的联动值(阻止冒泡,避免同时触发行展开)。
   const pivot = (fn: () => void) => (e: React.MouseEvent) => {
     e.stopPropagation()
@@ -646,6 +651,21 @@ function TraceRow({
         <td className="whitespace-nowrap text-right tabular-nums text-[#aaa]">
           {fmtNum(it.input_tokens)}/{fmtNum(it.output_tokens)}
         </td>
+        {/* 缓存读 + 命中占比小字；无缓存记账显示「—」 */}
+        <td className="whitespace-nowrap text-right tabular-nums text-sky-300/90" title={cacheTitle}>
+          {it.cache_read_tokens > 0 || it.cache_creation_tokens > 0 ? (
+            <>
+              {fmtNum(it.cache_read_tokens)}
+              {it.input_tokens > 0 && (
+                <span className="ml-1 text-[10px] text-[#888]">
+                  {Math.round((it.cache_read_tokens / it.input_tokens) * 100)}%
+                </span>
+              )}
+            </>
+          ) : (
+            <span className="text-[#555]">—</span>
+          )}
+        </td>
         <td className="whitespace-nowrap text-right tabular-nums text-[#aaa]">
           {it.latency_ms} ms
         </td>
@@ -655,15 +675,32 @@ function TraceRow({
       </tr>
       {expanded && (
         <tr className="border-t border-[#161616] bg-[#0d0d0d]">
-          <td colSpan={9} className="px-3 py-2">
+          <td colSpan={10} className="px-3 py-2">
             <div className="grid grid-cols-1 gap-x-6 gap-y-1 text-[11px] sm:grid-cols-2">
               <Detail label="request_id" value={it.request_id} mono />
               <Detail label="session_id" value={it.session_id ?? '—'} mono />
               <Detail label={t('opsdetaildialogs.trace.detailStreaming')} value={it.is_streaming ? t('opsdetaildialogs.trace.yes') : t('opsdetaildialogs.trace.no')} />
               <Detail label={t('opsdetaildialogs.trace.detailRetries')} value={String(it.retries)} />
+              {/* 缓存读/写拆成两格（原先合并成一个「读 / 写」串，看不出哪个是哪个）。
+                  写入上游完全不提供（恒 0），明确标注而不是显示一个孤零零的 0。 */}
               <Detail
-                label={t('opsdetaildialogs.trace.detailCacheTok')}
-                value={`${fmtNum(it.cache_read_tokens)} / ${fmtNum(it.cache_creation_tokens)}`}
+                label={t('opsdetaildialogs.trace.detailCacheRead')}
+                value={it.cache_read_tokens.toLocaleString()}
+              />
+              <Detail
+                label={t('opsdetaildialogs.trace.detailCacheWrite')}
+                value={
+                  it.cache_creation_tokens > 0
+                    ? it.cache_creation_tokens.toLocaleString()
+                    : t('opsdetaildialogs.usage.cacheWriteUnavailable')
+                }
+              />
+              <Detail
+                label={t('opsdetaildialogs.trace.detailBilledInput')}
+                value={Math.max(
+                  0,
+                  it.input_tokens - it.cache_read_tokens - it.cache_creation_tokens,
+                ).toLocaleString()}
               />
               <Detail
                 label="credits"
@@ -769,8 +806,8 @@ export function UsageDetailDialog({
 
           {/* 顶部:所选时间窗 KPI */}
           {ovLoading ? (
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-              {Array.from({ length: 4 }).map((_, i) => (
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+              {Array.from({ length: 5 }).map((_, i) => (
                 <Skeleton key={i} className="h-[92px]" />
               ))}
             </div>
@@ -873,10 +910,20 @@ function UsageKpiRow({ w }: { w?: WindowSummary }) {
   const tok = w?.total_tokens ?? 0
   const credits = w?.credits_used ?? 0
   const rate = w?.success_rate ?? 0
+  const input = w?.input_tokens ?? 0
+  const cacheRead = w?.cache_read_tokens ?? 0
+  // 命中占比：input_tokens 是 gross 口径（已含缓存读），分母直接用它。
+  const hit = input > 0 ? Math.round((cacheRead / input) * 100) : null
   return (
-    <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+    <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
       <StatCard label={t('opsdetaildialogs.usage.kpiRequests')} value={fmtNum(reqs)} accent="primary" />
       <StatCard label="Tokens" value={fmtNum(tok)} accent="neutral" />
+      <StatCard
+        label={t('opsdetaildialogs.usage.kpiCacheRead')}
+        value={fmtNum(cacheRead)}
+        hint={hit === null ? undefined : t('opsdetaildialogs.usage.kpiCacheHint', { pct: hit })}
+        accent="neutral"
+      />
       <StatCard label="Credits" value={credits.toFixed(2)} accent="neutral" />
       <StatCard
         label={t('opsdetaildialogs.usage.kpiSuccessRate')}
@@ -927,6 +974,9 @@ function UsageGroupTable({
               <th className="text-right">{t('opsdetaildialogs.usage.colRequests')}</th>
               <th className="text-right">{t('opsdetaildialogs.usage.kpiSuccessRate')}</th>
               <th className="text-right">tok(in/out)</th>
+              <th className="text-right" title={t('opsdetaildialogs.usage.colCacheHint')}>
+                {t('opsdetaildialogs.usage.colCache')}
+              </th>
               <th className="text-right">credits</th>
               <th className="text-right">{t('opsdetaildialogs.usage.colAvgLatency')}</th>
             </tr>
@@ -954,6 +1004,21 @@ function UsageGroupTable({
                 </td>
                 <td className="text-right tabular-nums text-[#aaa]">
                   {fmtNum(r.input_tokens)}/{fmtNum(r.output_tokens)}
+                </td>
+                {/* 缓存读 + 命中占比（占比分母是 gross input，已含缓存读，不再相加） */}
+                <td className="whitespace-nowrap text-right tabular-nums text-sky-300/90">
+                  {r.cache_read_tokens > 0 ? (
+                    <>
+                      {fmtNum(r.cache_read_tokens)}
+                      {r.input_tokens > 0 && (
+                        <span className="ml-1 text-[10px] text-[#888]">
+                          {Math.round((r.cache_read_tokens / r.input_tokens) * 100)}%
+                        </span>
+                      )}
+                    </>
+                  ) : (
+                    <span className="text-[#555]">—</span>
+                  )}
                 </td>
                 <td className="text-right tabular-nums text-[#aaa]">{r.credits_used.toFixed(3)}</td>
                 <td className="text-right tabular-nums text-[#888]">{Math.round(r.avg_latency_ms)} ms</td>

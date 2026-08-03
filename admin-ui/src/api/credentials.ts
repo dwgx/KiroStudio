@@ -6,6 +6,7 @@ import type {
   CachedBalancesResponse,
   TrashListResponse,
   SuccessResponse,
+  BatchDeleteResponse,
   SetDisabledRequest,
   SetPriorityRequest,
   AddCredentialRequest,
@@ -145,6 +146,18 @@ export async function setCredentialAllowedModels(
     `/credentials/${id}/allowed-models`,
     { allowedModels: allowedModels && allowedModels.length ? allowedModels : null }
   )
+  return data
+}
+
+// 固定该凭据走的端点（'ide' / 'cli'）；传 null 清除 → 回到自动路由
+// （ksk_ API Key 号自动走 cli，其余回退全局 defaultEndpoint）。
+export async function setCredentialEndpoint(
+  id: number,
+  endpoint: string | null
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/endpoint`, {
+    endpoint: endpoint && endpoint.trim() ? endpoint.trim() : null,
+  })
   return data
 }
 
@@ -338,6 +351,21 @@ export async function addCredential(
 // 删除凭据
 export async function deleteCredential(id: number): Promise<SuccessResponse> {
   const { data } = await api.delete<SuccessResponse>(`/credentials/${id}`)
+  return data
+}
+
+/**
+ * 批量删除凭据。`force=true` 跳过后端「必须先禁用」这道门（仍进回收站，可恢复）。
+ *
+ * 为什么要它：此前批量删是对每个选中项各发一次 DELETE，且因后端要求先禁用，
+ * 实际是 2N 次往返。批量 + force 降到 1 次。
+ * 部分失败仍返 200，逐条看 results[].ok —— 调用方须据此提示，不能只看 HTTP 状态。
+ */
+export async function deleteCredentialsBatch(
+  ids: number[],
+  force = false,
+): Promise<BatchDeleteResponse> {
+  const { data } = await api.post<BatchDeleteResponse>('/credentials/batch-delete', { ids, force })
   return data
 }
 

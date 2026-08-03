@@ -202,6 +202,22 @@ pub struct KiroCredentials {
     #[serde(default)]
     pub disabled: bool,
 
+    /// 禁用原因（持久化）。`None` = 旧文件或未记录。
+    ///
+    /// ⚠️ 加这个字段修的是一个实测缺陷：此前只持久化 `disabled: bool`，
+    /// 加载时对所有禁用号一律回填 `Manual` → **自动禁用原因重启即丢失**，
+    /// 运维看到的全是「手动禁用」，且以 reason 为判据的自愈逻辑被一并击穿。
+    /// 详见 `token_manager::DisabledReason` 的说明。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<crate::kiro::token_manager::DisabledReason>,
+
+    /// 被禁用的时刻（RFC3339，持久化）。`None` = 旧文件或未记录。
+    ///
+    /// 用途：让运维一眼看出「这号什么时候坏的」，以及区分「刚坏」与「坏了很久」——
+    /// 前者可能是瞬时风控、后者基本可以确认要换号。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_at: Option<String>,
+
     /// Kiro API Key（headless 模式）
     /// 格式: ksk_xxxxxxxx
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
@@ -631,10 +647,19 @@ impl KiroCredentials {
     /// 规则(对齐 Kiro IDE + kiro-account-manager,修复新加 idc 号缺 profileArn 报
     /// `400 profileArn is required`):
     /// - external_idp(M365 企业)→ `None`：这类号带 profileArn 反而 403，绝不发。
+    /// - api_key(ksk_ 个人访问令牌)→ `None`：同理，见下方说明。
     /// - 自带真实 profile_arn → 用它。
-    /// - idc/social/api_key 缺 profile_arn → 回退默认 BuilderId profileArn（Kiro IDE 公共
+    /// - idc/social 缺 profile_arn → 回退默认 BuilderId profileArn（Kiro IDE 公共
     ///   占位 ARN，上游接受）。**根治**:idc 号入池时常没 profileArn(登录未拉),
     ///   而对话/余额端点要求必带,缺了就 400/403。
+    ///
+    /// ## api_key 为何也必须返回 `None`（实测修正）
+    /// 默认 BuilderId 占位 ARN 属于 AWS account `638616132270`。`ksk_` 令牌自身已绑定
+    /// 其所属账户，套上**别人账户**的占位 ARN 会被上游判为凭据与 ARN 不匹配：
+    /// `getUsageLimits` 直接 `403 Invalid token` → 面板余额恒为空、且 add_credential
+    /// 拉订阅等级失败。实测同一 key 去掉 profileArn 后同一端点即 `200`，
+    /// 对话端点 `generateAssistantResponse` 不带 ARN 亦正常返回 SSE。
+    /// 这与 external_idp 是同一类错误（套错租户的占位 ARN），故处置一致。
     ///
     /// 注:更智能的做法是运行时 ListAvailableProfiles 拉真实 ARN 并持久化（见研究备忘），
     /// 此处先用默认回退保证可用,动态解析作为后续增强。
@@ -656,8 +681,48 @@ impl KiroCredentials {
         if self.is_external_idp_credential() {
             return None;
         }
-        // idc/social/api_key 缺 arn → 回退默认 BuilderId 占位 ARN（上游接受）。
+        // api_key(ksk_)缺 arn → 同样返回 None：套别人账户的占位 ARN 会 403 Invalid token
+        // （详见上方文档注释的实测结论）。不带 ARN 时额度与对话端点均正常。
+        if self.is_api_key_credential() {
+            return None;
+        }
+        // idc/social 缺 arn → 回退默认 BuilderId 占位 ARN（上游接受）。
         Some(crate::kiro::token_manager::DEFAULT_BUILDER_ID_PROFILE_ARN.to_string())
+    }
+
+    /// 该凭据实际应走的端点名：**显式 `endpoint` 字段优先，其次按凭据类型自动路由**。
+    ///
+    /// # 为何需要自动路由
+    /// `ksk_` API Key 号本质是 Amazon Q Developer CLI 的访问密钥，**必须**走 CLI 协议
+    /// (`q.{region}.amazonaws.com` 服务根 + `X-Amz-Target` + `tokentype: API_KEY`，不带
+    /// profileArn)。走 IDE 端点 (`runtime.{region}.kiro.dev/generateAssistantResponse`)
+    /// 会被上游 403 —— 而 403 在 provider 的错误分类里会走「权限被拒/疑似封号」路径，
+    /// 于是**一个完全健康的 ksk_ 号只要没手填 `endpoint="cli"` 就会被自动禁用**。
+    /// 靠用户记得手填是不可接受的默认行为，故按凭据类型兜底路由。
+    ///
+    /// # 显式字段为何仍然优先
+    /// 上游协议随时可能变（IDE 端点若将来接受 API_KEY、或出现第三套端点），运维需要一个
+    /// 不改代码就能救急的旋钮；面板的「端点」下拉即写这个字段。显式值优先意味着
+    /// 自动路由只是**缺省推断**，永远可被人工覆盖。
+    ///
+    /// # 参数
+    /// `default_endpoint` 为 `config.defaultEndpoint`，仅在既无显式字段、又不命中任何
+    /// 自动路由规则时使用（即普通 social/idc/external_idp 号的既有行为，完全不变）。
+    pub fn effective_endpoint<'a>(&'a self, default_endpoint: &'a str) -> &'a str {
+        // ① 显式配置优先（面板可改、可切回 ide 救急）。
+        if let Some(name) = self.endpoint.as_deref() {
+            let name = name.trim();
+            if !name.is_empty() {
+                return name;
+            }
+        }
+        // ② 自动路由：ksk_ API Key 号 → CLI 端点。custom_api 透传号不走 Kiro 端点体系
+        //    （它有独立的 passthrough 路径），这里显式排除以免误判——它也可能带 api_key 字段。
+        if !self.is_custom_api_credential() && self.is_api_key_credential() {
+            return crate::kiro::endpoint::cli::CLI_ENDPOINT_NAME;
+        }
+        // ③ 其余凭据沿用全局默认（既有行为）。
+        default_endpoint
     }
 
     pub fn is_external_idp_credential(&self) -> bool {
@@ -930,6 +995,98 @@ mod tests {
         );
     }
 
+    /// 回归（🔴致命）：ksk_ API Key 号**未显式填 endpoint** 时必须自动路由到 cli。
+    ///
+    /// 旧实现只读 `credentials.endpoint`，缺省即落到 `default_endpoint`（"ide"）。
+    /// ksk_ 号打 IDE 端点稳定 403，而 403 在 provider/验活路径都被当"权限被拒/疑似封号"
+    /// 处理 → 一个完全健康的号会被自动禁用。
+    #[test]
+    fn should_auto_route_api_key_credential_to_cli_endpoint() {
+        let mut ak = KiroCredentials::default();
+        ak.kiro_api_key = Some("ksk_test".to_string());
+        assert_eq!(
+            ak.effective_endpoint("ide"),
+            "cli",
+            "ksk_ 号未填 endpoint 时应自动走 cli（旧实现落到 ide → 403 → 被误禁用）"
+        );
+
+        // auth_method 标注也应识别（有的导入源只写 authMethod 不写 key 前缀字段）。
+        let mut by_method = KiroCredentials::default();
+        by_method.auth_method = Some("api_key".to_string());
+        assert_eq!(by_method.effective_endpoint("ide"), "cli");
+    }
+
+    /// 显式配置必须**压过**自动路由：上游协议若变化，运维要能不改代码救急。
+    #[test]
+    fn should_prefer_explicit_endpoint_over_auto_route() {
+        let mut ak = KiroCredentials::default();
+        ak.kiro_api_key = Some("ksk_test".to_string());
+        ak.endpoint = Some("ide".to_string());
+        assert_eq!(
+            ak.effective_endpoint("cli"),
+            "ide",
+            "显式 endpoint 应优先于自动路由与全局默认"
+        );
+
+        // 空串/纯空白视为"未配置"，回到自动路由（前端清空输入框即恢复自动）。
+        ak.endpoint = Some("   ".to_string());
+        assert_eq!(ak.effective_endpoint("ide"), "cli", "空白值应视为未配置");
+    }
+
+    /// 非 API Key 号的既有行为完全不变：回退全局默认端点。
+    #[test]
+    fn should_fall_back_to_default_endpoint_for_non_api_key_credentials() {
+        let social = KiroCredentials::default();
+        assert_eq!(social.effective_endpoint("ide"), "ide");
+
+        let mut idc = KiroCredentials::default();
+        idc.auth_method = Some("idc".to_string());
+        idc.refresh_token = Some("rt".to_string());
+        assert_eq!(idc.effective_endpoint("ide"), "ide");
+    }
+
+    /// custom_api 透传号**绝不**被自动路由到 cli：它不走 Kiro 端点体系（有独立
+    /// passthrough 路径），且其 `api_key` 字段会让 is_api_key_credential 误判。
+    #[test]
+    fn should_not_auto_route_custom_api_credential_to_cli() {
+        let mut custom = KiroCredentials::default();
+        custom.auth_method = Some("custom_api".to_string());
+        custom.base_url = Some("https://relay.invalid".to_string());
+        custom.api_key = Some("sk-xxx".to_string());
+        // 极端情况：连 kiro_api_key 也被误填（旧数据/手工编辑）——仍不该改它的端点。
+        custom.kiro_api_key = Some("ksk_wrong".to_string());
+        assert_eq!(
+            custom.effective_endpoint("ide"),
+            "ide",
+            "custom_api 号不参与 Kiro 端点自动路由"
+        );
+    }
+
+    #[test]
+    fn test_effective_profile_arn_api_key_returns_none() {
+        // 回归:api_key(ksk_)缺 profileArn 时**绝不**套默认 BuilderId 占位 ARN。
+        // 该占位 ARN 属于 AWS account 638616132270,套到别的账户的 ksk_ 上会让
+        // getUsageLimits 返回 403 Invalid token(面板余额恒空、上号时拉订阅等级失败)。
+        // 实测:同一 key 去掉 profileArn 后额度端点 200、对话端点正常吐 SSE。
+        let mut ak = KiroCredentials::default();
+        ak.auth_method = Some("api_key".to_string());
+        ak.kiro_api_key = Some("ksk_test".to_string());
+        ak.profile_arn = None;
+        assert_eq!(
+            ak.effective_profile_arn(),
+            None,
+            "api_key 缺 arn 应返回 None(旧实现回退默认占位 ARN → 403 Invalid token)"
+        );
+
+        // 但自带真实 arn 时仍应使用它(不因类型一刀切丢弃)。
+        ak.profile_arn = Some("arn:aws:codewhisperer:us-east-1:999:profile/OWN".to_string());
+        assert_eq!(
+            ak.effective_profile_arn().as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:999:profile/OWN"),
+            "api_key 自带真实 arn 时应照常使用"
+        );
+    }
+
     #[test]
     fn test_effective_upstream_region_fallback() {
         let config = Config::default();
@@ -1066,6 +1223,8 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
+            disabled_at: None,
             kiro_api_key: None,
             endpoint: None,
         };
@@ -1195,6 +1354,8 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
+            disabled_at: None,
             kiro_api_key: None,
             endpoint: None,
         };
@@ -1237,6 +1398,8 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
+            disabled_at: None,
             kiro_api_key: None,
             endpoint: None,
         };
@@ -1337,6 +1500,8 @@ mod tests {
             refresh_token: Some("refresh".to_string()),
             profile_arn: None,
             expires_at: None,
+            disabled_reason: None,
+            disabled_at: None,
             auth_method: Some("social".to_string()),
             client_id: None,
             client_secret: None,

@@ -10,11 +10,12 @@ use serde::Deserialize;
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetAllowedModelsRequest, SetCustomApiConfigRequest,
-        SetDisabledRequest,
+        AddCredentialRequest, BatchDeleteRequest, BatchDeleteResponse,
+        SetAllowedModelsRequest, SetCustomApiConfigRequest,
+        SetDisabledRequest, SetEndpointRequest,
         SetLoadBalancingModeRequest, SetPriorityRequest,
         SetRpmLimitRequest,
-        SuccessResponse,
+        SuccessResponse, parse_import_keys_request,
     },
 };
 
@@ -71,6 +72,27 @@ pub async fn set_credential_rpm_limit(
             id, payload.rpm_limit
         )))
         .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/endpoint
+/// 固定该凭据走的端点（`ide` / `cli`）；传 null 或空串清除，回到自动路由
+/// （`ksk_` API Key 号自动走 `cli`，其余回退 `config.defaultEndpoint`）。
+pub async fn set_credential_endpoint(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetEndpointRequest>,
+) -> impl IntoResponse {
+    let requested = payload.endpoint.clone();
+    match state.service.set_credential_endpoint(id, payload.endpoint) {
+        Ok(_) => {
+            let msg = match requested.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(name) => format!("凭据 #{} 端点已固定为 {}", id, name),
+                None => format!("凭据 #{} 已恢复自动选择端点", id),
+            };
+            Json(SuccessResponse::new(msg)).into_response()
+        }
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -389,6 +411,34 @@ pub async fn add_credential(
     }
 }
 
+/// POST /api/admin/import/keys
+/// 批量导入 Kiro API Key（`ksk_` 号）。
+///
+/// 认证：与其余 admin 端点同源（`Authorization: Bearer <adminKey>` 或 `x-api-key`），
+/// 由 `admin_auth_middleware` 统一拦截，失败 401。
+///
+/// 请求体兼容 4 种格式（见 [`parse_import_keys_request`]）；格式错误 / concurrencyLimit
+/// 越界 → 400；部分失败仍 200，逐条在 `results[].ok` / `results[].error` 标记。
+/// 响应中的 `key` 恒为脱敏形态，不含完整 Key。
+pub async fn import_keys(
+    State(state): State<AdminState>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    // 手工解析而非 #[derive(Deserialize)]：4 种互斥格式 + 越界校验要区分「字段缺失」
+    // 与「类型/范围非法」，serde 的 untagged 无法给出可读的 400 原因。
+    let req = match parse_import_keys_request(&payload) {
+        Ok(req) => req,
+        Err(msg) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(super::types::AdminErrorResponse::invalid_request(msg)),
+            )
+                .into_response();
+        }
+    };
+    Json(state.service.import_keys(req).await).into_response()
+}
+
 /// DELETE /api/admin/credentials/:id
 /// 删除凭据
 pub async fn delete_credential(
@@ -399,6 +449,55 @@ pub async fn delete_credential(
         Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 已删除", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
+}
+
+/// 批量删除的 ids 上限。
+///
+/// 200 是线上号池量级（曾达 43）的数倍余量，同时防止一个请求把整池清空
+/// —— adminKey 明文存 localStorage 且全仓无 CSP，无上限的批量删除会放大 XSS 的破坏面。
+const MAX_BATCH_DELETE_IDS: usize = 200;
+
+/// POST /api/admin/credentials/batch-delete
+///
+/// 批量删除凭据。`force=true` 跳过「必须先禁用」这道门（仍进回收站，可恢复）。
+/// **部分失败仍返 200**，逐条标 ok/error（与 import/keys 同款模式）。
+pub async fn delete_credentials_batch(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchDeleteRequest>,
+) -> impl IntoResponse {
+    if payload.ids.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(super::types::AdminErrorResponse::invalid_request(
+                "ids 不能为空".to_string(),
+            )),
+        )
+            .into_response();
+    }
+    if payload.ids.len() > MAX_BATCH_DELETE_IDS {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(super::types::AdminErrorResponse::invalid_request(format!(
+                "一次最多删除 {} 个凭据（本次 {}）",
+                MAX_BATCH_DELETE_IDS,
+                payload.ids.len()
+            ))),
+        )
+            .into_response();
+    }
+
+    // 去重：同一 id 传两次时第二次必然失败（已从 entries 移出），会产生令人困惑的
+    // "部分失败"。这是前端多选去重不严时的常见输入，在边界处收敛掉。
+    let mut seen = std::collections::HashSet::new();
+    let ids: Vec<u64> = payload.ids.iter().copied().filter(|id| seen.insert(*id)).collect();
+
+    if payload.force {
+        tracing::warn!(count = ids.len(), "批量**强制**删除凭据（绕过先禁用门，仍进回收站）");
+    }
+    let results = state.service.delete_credentials_batch(&ids, payload.force);
+    let deleted = results.iter().filter(|r| r.ok).count();
+    let failed = results.len() - deleted;
+    Json(BatchDeleteResponse { deleted, failed, results }).into_response()
 }
 
 /// GET /api/admin/credentials/trash
@@ -918,6 +1017,8 @@ pub async fn storage_stats(State(state): State<AdminState>) -> impl IntoResponse
 
 /// POST /api/admin/storage/cleanup
 /// 按 target 白名单 + 可选时间窗口清理数据（路径全部从 config 派生，防穿越）
+///
+/// `purgeAll=true` 时忽略 `olderThanDays`，清空该分区全部条目（回收站的「全部清空」）。
 pub async fn storage_cleanup(
     State(state): State<AdminState>,
     Json(payload): Json<super::types::StorageCleanupRequest>,
@@ -925,6 +1026,7 @@ pub async fn storage_cleanup(
     match state.service.storage_cleanup(
         &payload.target,
         payload.older_than_days,
+        payload.purge_all,
         state.trace_db.as_ref(),
     ) {
         Ok(resp) => Json(resp).into_response(),

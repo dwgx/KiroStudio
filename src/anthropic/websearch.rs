@@ -324,7 +324,171 @@ pub fn create_mcp_request(query: &str) -> (String, McpRequest) {
     (tool_use_id, request)
 }
 
+/// HTML 文本清洗：MCP 返回的第三方网页 snippet/title 本质是 HTML 抽取文本，
+/// 常见残留 `<br>`/`<p>`/`&nbsp;` 等标签与实体，若原样拼进面向客户端的正文，
+/// 用户会看到裸露的 `<br>`。这里统一做三件事：块级标签转真实换行、
+/// 剥离其余标签（保留内部文字）、解码常见 HTML 实体，最后折叠残留的连续空白。
+///
+/// 调用顺序要求：**先清洗后截断**——截断发生在本函数之外的调用点，
+/// 若先截断再清洗，200 字符的边界可能正好切在一个标签中间，
+/// 清洗后会留下半个标签（如 `<b`）比原文更难看。
+fn normalize_html_text(input: &str) -> String {
+    let stripped = strip_html_tags(input);
+    let decoded = decode_html_entities(&stripped);
+    collapse_whitespace_runs(&decoded)
+}
+
+/// 剥离 HTML 标签。块级/换行类标签（`<br>`/`<p>`/`<div>`/`<li>` 等，大小写不敏感、
+/// 兼容自闭合 `<br/>`/`<br />`）转换为真实换行，保留原文分段语义；其余标签
+/// （如 `<b>`/`<a href="...">`）直接剥离，只保留标签包裹的文字内容。
+///
+/// 未闭合的孤立 `<`（找不到匹配的 `>`）视为普通文本字符原样保留，不 panic、
+/// 不误吞后续内容——这也覆盖了纯文本里“a < b”这类非标签用法。
+fn strip_html_tags(input: &str) -> String {
+    // 块级/换行标签名单：命中即输出一个换行；不在名单里的标签只剥不换行。
+    const BLOCK_TAGS: &[&str] = &[
+        "br", "p", "div", "li", "ul", "ol", "tr", "table", "h1", "h2", "h3", "h4", "h5", "h6",
+        "section", "article", "blockquote", "header", "footer",
+    ];
+
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '<' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        // 在 '<' 之后找匹配的 '>'，两者之间视为一个标签的内部内容
+        match chars[i + 1..].iter().position(|&c| c == '>') {
+            Some(rel) => {
+                let close_idx = i + 1 + rel;
+                let tag_inner: String = chars[i + 1..close_idx].iter().collect();
+                let tag_name = tag_inner
+                    .trim_start_matches('/')
+                    .trim_end_matches('/')
+                    .split(|c: char| c.is_whitespace())
+                    .next()
+                    .unwrap_or("")
+                    .to_lowercase();
+                if BLOCK_TAGS.contains(&tag_name.as_str()) {
+                    out.push('\n');
+                }
+                i = close_idx + 1;
+            }
+            None => {
+                // 没有匹配的 '>'，不是完整标签，把 '<' 当普通字符处理
+                out.push('<');
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// 解码常见 HTML 实体：`&nbsp;` `&amp;` `&lt;` `&gt;` `&quot;` `&apos;`，
+/// 以及数字实体 `&#NN;`（十进制）/ `&#xHH;`（十六进制，大小写均可）。
+/// 无法识别的 `&...;` 或没有 `;` 收尾的 `&` 原样保留，不 panic。
+fn decode_html_entities(input: &str) -> String {
+    // 实体名不会很长，给个扫描上限防止病态输入（一长串没有 ';' 的文本）退化成整段扫描
+    const MAX_ENTITY_LEN: usize = 10;
+
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '&' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        let scan_end = (i + 1 + MAX_ENTITY_LEN + 1).min(chars.len());
+        let found = chars[i + 1..scan_end]
+            .iter()
+            .position(|&c| c == ';')
+            .map(|rel| i + 1 + rel)
+            .and_then(|semi_idx| {
+                let name: String = chars[i + 1..semi_idx].iter().collect();
+                decode_entity_name(&name).map(|ch| (semi_idx, ch))
+            });
+
+        match found {
+            Some((semi_idx, ch)) => {
+                out.push(ch);
+                i = semi_idx + 1;
+            }
+            None => {
+                // 不是可识别的实体，把 '&' 当普通字符处理，不吞掉后续内容
+                out.push('&');
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// 单个 HTML 实体名（不含首尾 `&` `;`）解码为对应字符。
+fn decode_entity_name(name: &str) -> Option<char> {
+    match name {
+        // &nbsp; 解码为普通空格而非 U+00A0：Unicode 把 NBSP 排除在 White_Space
+        // 属性外，若保留 U+00A0 会导致后续空白折叠认不出它，视觉上残留大段空格。
+        "nbsp" => return Some(' '),
+        "amp" => return Some('&'),
+        "lt" => return Some('<'),
+        "gt" => return Some('>'),
+        "quot" => return Some('"'),
+        "apos" => return Some('\''),
+        _ => {}
+    }
+    if let Some(hex) = name.strip_prefix("#x").or_else(|| name.strip_prefix("#X")) {
+        return u32::from_str_radix(hex, 16).ok().and_then(char::from_u32);
+    }
+    if let Some(dec) = name.strip_prefix('#') {
+        return dec.parse::<u32>().ok().and_then(char::from_u32);
+    }
+    None
+}
+
+/// 折叠清洗后残留的连续空白：同一行内连续空格/Tab 折叠为单个空格；
+/// 连续换行折叠为单个（block 标签一开一合会连续产生两个换行，逐一剥离后
+/// 若不折叠就是空行满天飞）；首尾空白裁掉。
+fn collapse_whitespace_runs(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut last_was_space = false;
+    let mut last_was_newline = false;
+
+    for c in input.chars() {
+        if c == '\n' {
+            last_was_space = false;
+            if !last_was_newline {
+                out.push('\n');
+            }
+            last_was_newline = true;
+            continue;
+        }
+        last_was_newline = false;
+        if c.is_whitespace() {
+            if !last_was_space {
+                out.push(' ');
+            }
+            last_was_space = true;
+        } else {
+            out.push(c);
+            last_was_space = false;
+        }
+    }
+
+    out.trim().to_string()
+}
+
 /// 解析 MCP 响应中的搜索结果
+///
+/// 仅做反序列化，不在此处清洗 HTML——title/snippet 有三处不同的下游用法
+/// （摘要文本的标题/正文、web_search_tool_result 块的 encrypted_content），
+/// 清洗统一放在各自的使用点，便于单独核对“先清洗后截断”的顺序是否正确。
 pub fn parse_search_results(mcp_response: &McpResponse) -> Option<WebSearchResults> {
     let result = mcp_response.result.as_ref()?;
     let content = result.content.first()?;
@@ -467,7 +631,7 @@ fn generate_websearch_events(
                     "type": "web_search_result",
                     "title": r.title,
                     "url": r.url,
-                    "encrypted_content": r.snippet.clone().unwrap_or_default(),
+                    "encrypted_content": r.snippet.as_deref().map(normalize_html_text).unwrap_or_default(),
                     "page_age": page_age
                 })
             })
@@ -576,12 +740,17 @@ fn generate_search_summary(query: &str, results: &Option<WebSearchResults>) -> S
 
     if let Some(results) = results {
         for (i, result) in results.results.iter().enumerate() {
-            summary.push_str(&format!("{}. **{}**\n", i + 1, result.title));
+            let title = normalize_html_text(&result.title);
+            summary.push_str(&format!("{}. **{}**\n", i + 1, title));
             if let Some(ref snippet) = result.snippet {
-                // 截断过长的摘要（安全处理 UTF-8 多字节字符）
-                let truncated = match snippet.char_indices().nth(200) {
-                    Some((idx, _)) => format!("{}...", &snippet[..idx]),
-                    None => snippet.clone(),
+                // 先清洗 HTML 残留（<br>/&nbsp; 等），再截断——顺序不能反过来，
+                // 否则 200 字符的截断边界可能正好切在标签中间，清洗后会留下
+                // 半个标签（如 "<b"）比原文更难看。截断本身按 char 计数，
+                // 安全处理 UTF-8 多字节字符。
+                let cleaned = normalize_html_text(snippet);
+                let truncated = match cleaned.char_indices().nth(200) {
+                    Some((idx, _)) => format!("{}...", &cleaned[..idx]),
+                    None => cleaned,
                 };
                 summary.push_str(&format!("   {}\n", truncated));
             }
@@ -977,5 +1146,146 @@ mod tests {
         assert!(summary.contains("Test Result"));
         assert!(summary.contains("https://example.com"));
         assert!(summary.contains("This is a test snippet"));
+    }
+
+    // ---- normalize_html_text 及内部辅助函数的回归测试 ----
+    // 这些测试在修复前会失败：旧代码对 snippet/title 零清洗，<br> 等标签、
+    // &nbsp; 等实体会原样出现在结果里。
+
+    #[test]
+    fn test_br_variants_become_newline() {
+        assert_eq!(normalize_html_text("a<br>b"), "a\nb");
+        assert_eq!(normalize_html_text("a<br/>b"), "a\nb");
+        assert_eq!(normalize_html_text("a<br />b"), "a\nb");
+        assert_eq!(normalize_html_text("a<BR />b"), "a\nb");
+        assert_eq!(normalize_html_text("a<Br>b"), "a\nb");
+    }
+
+    #[test]
+    fn test_block_tags_become_newline() {
+        assert_eq!(normalize_html_text("<p>hello</p>"), "hello");
+        assert_eq!(normalize_html_text("<div>x</div><div>y</div>"), "x\ny");
+        assert_eq!(normalize_html_text("<li>one</li><li>two</li>"), "one\ntwo");
+    }
+
+    #[test]
+    fn test_entity_decoding() {
+        assert_eq!(normalize_html_text("a&nbsp;b"), "a b");
+        assert_eq!(normalize_html_text("a&amp;b"), "a&b");
+        assert_eq!(normalize_html_text("a&lt;b&gt;c"), "a<b>c");
+        assert_eq!(normalize_html_text("a&quot;b&apos;c"), "a\"b'c");
+        assert_eq!(normalize_html_text("it&#39;s"), "it's");
+        assert_eq!(normalize_html_text("it&#x27;s"), "it's");
+        assert_eq!(normalize_html_text("it&#X27;s"), "it's");
+    }
+
+    #[test]
+    fn test_malformed_and_unclosed_tags_do_not_panic() {
+        // 未闭合的标签
+        assert_eq!(normalize_html_text("<b>bold"), "bold");
+        // 完整但嵌套的标签，剥离标签保留内部文字
+        assert_eq!(normalize_html_text(r#"<a href="x">link</a>"#), "link");
+        // 孤立的 '<'，找不到匹配的 '>'，应原样保留而不是吞掉后续内容
+        assert_eq!(normalize_html_text("a < b"), "a < b");
+        // 未识别的 & 实体，没有 ';' 收尾
+        assert_eq!(normalize_html_text("a & b"), "a & b");
+    }
+
+    #[test]
+    fn test_empty_and_tag_only_input() {
+        assert_eq!(normalize_html_text(""), "");
+        assert_eq!(normalize_html_text("<p></p>"), "");
+        assert_eq!(normalize_html_text("<div><span></span></div>"), "");
+    }
+
+    #[test]
+    fn test_whitespace_collapsing_after_strip() {
+        // 剥离标签后不应留下大片空行
+        let input = "<p>first</p><p>second</p><p></p><p>third</p>";
+        let out = normalize_html_text(input);
+        assert!(!out.contains("\n\n\n"));
+        assert_eq!(out, "first\nsecond\nthird");
+    }
+
+    #[test]
+    fn test_summary_snippet_br_is_cleaned() {
+        // 端到端：generate_search_summary 输出不应包含裸的 <br>
+        let results = WebSearchResults {
+            results: vec![WebSearchResult {
+                title: "Title<br>With Break".to_string(),
+                url: "https://example.com".to_string(),
+                snippet: Some("Line one<br>Line two&nbsp;end".to_string()),
+                published_date: None,
+                id: None,
+                domain: None,
+                max_verbatim_word_limit: None,
+                public_domain: None,
+            }],
+            total_results: Some(1),
+            query: Some("test".to_string()),
+            error: None,
+        };
+
+        let summary = generate_search_summary("test", &Some(results));
+        assert!(!summary.contains("<br"));
+        assert!(!summary.contains("&nbsp;"));
+        assert!(summary.contains("Line one\nLine two end"));
+    }
+
+    #[test]
+    fn test_clean_then_truncate_does_not_cut_tag_in_half() {
+        // 构造一个 snippet：清洗前第 200 字符恰好落在标签中间。
+        // 若先截断后清洗，会残留半个标签；先清洗后截断则不会出现 '<' 或 '>'。
+        let mut snippet = "x".repeat(198);
+        snippet.push_str("<br>");
+        snippet.push_str(&"y".repeat(50));
+
+        let results = WebSearchResults {
+            results: vec![WebSearchResult {
+                title: "T".to_string(),
+                url: "https://example.com".to_string(),
+                snippet: Some(snippet),
+                published_date: None,
+                id: None,
+                domain: None,
+                max_verbatim_word_limit: None,
+                public_domain: None,
+            }],
+            total_results: Some(1),
+            query: Some("test".to_string()),
+            error: None,
+        };
+
+        let summary = generate_search_summary("test", &Some(results));
+        assert!(!summary.contains('<'));
+        assert!(!summary.contains('>'));
+    }
+
+    #[test]
+    fn test_truncate_does_not_split_multibyte_chars_pure_cjk() {
+        // 纯中文：201 个汉字，清洗后应截断为 200 字符 + "..."，且不 panic
+        // （UTF-8 每个汉字 3 字节，若按字节截断会切碎字符导致 panic 或乱码）
+        let snippet: String = "中".repeat(201);
+        let cleaned = normalize_html_text(&snippet);
+        let truncated = match cleaned.char_indices().nth(200) {
+            Some((idx, _)) => format!("{}...", &cleaned[..idx]),
+            None => cleaned,
+        };
+        assert_eq!(truncated.chars().filter(|&c| c == '中').count(), 200);
+        assert!(truncated.ends_with("..."));
+    }
+
+    #[test]
+    fn test_truncate_does_not_split_multibyte_chars_mixed_width() {
+        // 混合宽度：ASCII + 中文交替，同样验证不会在多字节字符中间截断
+        let snippet: String = "a中".repeat(150); // 300 字符
+        let cleaned = normalize_html_text(&snippet);
+        let truncated = match cleaned.char_indices().nth(200) {
+            Some((idx, _)) => format!("{}...", &cleaned[..idx]),
+            None => cleaned,
+        };
+        // 不 panic 即说明截断边界落在字符边界上；再校验字符数与内容正确
+        assert_eq!(truncated.chars().count(), 203); // 200 + "..."
+        assert!(truncated.starts_with("a中a中"));
     }
 }

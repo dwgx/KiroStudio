@@ -29,7 +29,49 @@ use std::time::Duration;
 /// `kirostudio-macos-x86_64` / `kirostudio-macos-aarch64` / `kirostudio-windows-x86_64.exe`。
 /// ⚠️ 这份清单必须与 `ASSET_BIN` 的 cfg 分支、release.yml 的产出**三方保持一致**，
 /// 少一个平台就意味着该平台的用户点 OTA 会 404（好）或下到错误资产（灾难）。
-const GITHUB_REPO: &str = "dwgx/KiroStudio";
+const DEFAULT_GITHUB_REPO: &str = "dwgx/KiroStudio";
+
+/// OTA 目标仓库（owner/repo）。默认 [`DEFAULT_GITHUB_REPO`]，可用环境变量
+/// `KIROSTUDIO_UPDATE_REPO` 覆盖，用于把 OTA 指向自建/私有仓库。
+///
+/// 为什么走环境变量而不是 config.json：OTA 是自更新路径，配置热重载与"正在替换自己的
+/// 二进制"这两件事叠在一起风险高；环境变量在进程启动时固定，语义最简单。
+/// 且 systemd 的 `Environment=` / `EnvironmentFile=` 天然适配（见部署单元）。
+fn github_repo() -> String {
+    std::env::var("KIROSTUDIO_UPDATE_REPO")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_GITHUB_REPO.to_string())
+}
+
+/// 私有仓库的 OTA 访问令牌，来自环境变量 `KIROSTUDIO_UPDATE_TOKEN`。
+///
+/// 公开仓库不需要它（GitHub 匿名可读），私有仓库则 API 与 asset 下载都必须带
+/// `Authorization: Bearer`。**永远不要把它写进日志或 API 响应**——
+/// 面板的更新接口只回显仓库名，不回显令牌。
+///
+/// 建议用 fine-grained PAT 且只授予目标仓库的 `Contents: read`：
+/// 泄露只丢这一个仓库的读权限，拿不到账号其它仓库、也改不了任何东西。
+fn update_token() -> Option<String> {
+    std::env::var("KIROSTUDIO_UPDATE_TOKEN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// 给 OTA 请求附加认证头（有令牌时）。
+///
+/// 注意 asset 下载走的是 `github.com/.../releases/download/...`，私有仓库下该 URL
+/// 会 302 到 objects.githubusercontent.com；reqwest 默认跟随重定向，而 GitHub
+/// 对预签名的对象地址**不需要**再带 Authorization。带着也无害（对象存储忽略它），
+/// 故此处统一加，不为两种 URL 分叉。
+fn with_update_auth(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match update_token() {
+        Some(token) => req.header("Authorization", format!("Bearer {token}")),
+        None => req,
+    }
+}
 
 /// 本平台对应的发布二进制资产名（按目标平台编译期选择）。
 ///
@@ -77,29 +119,41 @@ const LOCAL_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 构造某个 GitHub API 路径的镜像候选（逐个试，首个成功即用）。
 /// `path` 如 `repos/{repo}/tags` 或 `repos/{repo}/commits?sha=...`。
 fn github_api_candidates_for(path: &str) -> Vec<(&'static str, String)> {
+    let direct = ("github-direct", format!("https://api.github.com/{path}"));
+    // 🔒 配了令牌（私有仓库）时**只走直连**：镜像是第三方 HTTP 中间人，
+    // 请求经它转发意味着把 Authorization 头（即 PAT）交给对方。
+    // 私有仓库的可用性宁可依赖 GitHub 直连，也不能拿凭据换加速。
+    if update_token().is_some() {
+        return vec![direct];
+    }
     vec![
         ("gh-proxy.org", format!("https://gh-proxy.org/https://api.github.com/{path}")),
         ("hk.gh-proxy.org", format!("https://hk.gh-proxy.org/https://api.github.com/{path}")),
         ("cdn.gh-proxy.org", format!("https://cdn.gh-proxy.org/https://api.github.com/{path}")),
         ("edgeone.gh-proxy.org", format!("https://edgeone.gh-proxy.org/https://api.github.com/{path}")),
-        ("github-direct", format!("https://api.github.com/{path}")),
+        direct,
     ]
 }
 
 /// GitHub API 镜像候选（拉 tags 用）。逐个试，首个成功即用。
 fn github_api_candidates() -> Vec<(&'static str, String)> {
-    github_api_candidates_for(&format!("repos/{GITHUB_REPO}/tags"))
+    github_api_candidates_for(&format!("repos/{}/tags", github_repo()))
 }
 
 /// Release 资产下载镜像候选（下载二进制 / sha256 用）。`{tag}`/`{asset}` 已插值。
 fn asset_candidates(tag: &str, asset: &str) -> Vec<(&'static str, String)> {
-    let gh = format!("github.com/{GITHUB_REPO}/releases/download/{tag}/{asset}");
+    let gh = format!("github.com/{}/releases/download/{tag}/{asset}", github_repo());
+    let direct = ("github-direct", format!("https://{gh}"));
+    // 🔒 同 github_api_candidates_for：有令牌就只直连，绝不把 PAT 经第三方镜像转发。
+    if update_token().is_some() {
+        return vec![direct];
+    }
     vec![
         ("gh-proxy.org", format!("https://gh-proxy.org/https://{gh}")),
         ("hk.gh-proxy.org", format!("https://hk.gh-proxy.org/https://{gh}")),
         ("cdn.gh-proxy.org", format!("https://cdn.gh-proxy.org/https://{gh}")),
         ("edgeone.gh-proxy.org", format!("https://edgeone.gh-proxy.org/https://{gh}")),
-        ("github-direct", format!("https://{gh}")),
+        direct,
     ]
 }
 
@@ -189,6 +243,15 @@ pub struct UpdatePerformResult {
 /// 防止恶意或被劫持的镜像推超大响应耗尽内存（OOM）。
 const MAX_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
 
+/// OTA 下载的带上限读取 —— 委托 [`crate::common::http_read::read_body_capped`]。
+///
+/// 曾在本文件内有一份独立实现。收口到 `common` 是因为同一模式已出现三处
+/// （OTA 二进制、背景图图片、背景图 JSON），而**第三处当初被漏掉了** ——
+/// 各写一份就是那次漏改的原因。此处保留一个薄包装只为固定 `MAX_DOWNLOAD_BYTES`。
+async fn read_body_capped(resp: reqwest::Response, what: &str, cap: u64) -> anyhow::Result<Vec<u8>> {
+    crate::common::http_read::read_body_capped(resp, what, cap).await
+}
+
 /// 构建一个带超时的 reqwest client（更新走独立 client，30s 超时；不复用 provider 的池）。
 fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
@@ -205,11 +268,13 @@ fn http_client() -> reqwest::Client {
 async fn fetch_versions(limit: usize) -> Vec<String> {
     let client = http_client();
     for (name, url) in github_api_candidates() {
-        match client
-            .get(&url)
-            .header("Accept", "application/vnd.github.v3+json")
-            .send()
-            .await
+        match with_update_auth(
+            client
+                .get(&url)
+                .header("Accept", "application/vnd.github.v3+json"),
+        )
+        .send()
+        .await
         {
             Ok(resp) if resp.status().is_success() => {
                 match resp.json::<Vec<GitHubTag>>().await {
@@ -247,9 +312,9 @@ async fn fetch_commits(base: &str, head: &str) -> Vec<CommitSnapshot> {
     let base_variants = [base.to_string(), format!("v{}", base.trim_start_matches('v'))];
     let client = http_client();
     for base_ref in base_variants.iter().collect::<std::collections::HashSet<_>>() {
-        let path = format!("repos/{GITHUB_REPO}/compare/{base_ref}...{head}");
+        let path = format!("repos/{}/compare/{base_ref}...{head}", github_repo());
         for (name, url) in github_api_candidates_for(&path) {
-            match client.get(&url).header("Accept", "application/vnd.github.v3+json").send().await {
+            match with_update_auth(client.get(&url).header("Accept", "application/vnd.github.v3+json")).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     #[derive(Deserialize)]
                     struct Compare {
@@ -322,24 +387,21 @@ async fn download_asset(tag: &str, asset: &str) -> anyhow::Result<Vec<u8>> {
     let mut last_err = String::new();
     for (name, url) in asset_candidates(tag, asset) {
         tracing::info!("[Update] 经 {name} 下载 {asset}…");
-        match client.get(&url).send().await {
+        // 有令牌时 asset_candidates 已只返回直连，故此处不会把 PAT 发给任何第三方。
+        match with_update_auth(client.get(&url)).send().await {
             Ok(resp) if resp.status().is_success() => {
-                // Content-Length 预检：防止恶意/被劫持镜像推超大响应 OOM
-                if let Some(content_length) = resp.content_length() {
-                    if content_length > MAX_DOWNLOAD_BYTES {
-                        last_err = format!(
-                            "{name} Content-Length {content_length} 超过 {MAX_DOWNLOAD_BYTES}，拒绝下载"
-                        );
+                // 流式读 + 累计上限（Content-Length 预检也在内）：chunked 响应同样受限，
+                // 见 read_body_capped 的说明。超限时换下一个镜像而非直接失败。
+                match read_body_capped(resp, name, MAX_DOWNLOAD_BYTES).await {
+                    Ok(bytes) => {
+                        tracing::info!("[Update] 经 {name} 下载 {asset} 成功（{} 字节）", bytes.len());
+                        return Ok(bytes);
+                    }
+                    Err(e) => {
+                        last_err = format!("{e}");
                         tracing::warn!("[Update] {last_err}");
                         continue;
                     }
-                }
-                match resp.bytes().await {
-                    Ok(bytes) => {
-                        tracing::info!("[Update] 经 {name} 下载 {asset} 成功（{} 字节）", bytes.len());
-                        return Ok(bytes.to_vec());
-                    }
-                    Err(e) => last_err = format!("{name} 读取响应体失败: {e}"),
                 }
             },
             Ok(resp) => last_err = format!("{name} 返回 {}", resp.status()),
@@ -360,29 +422,19 @@ async fn download_asset(tag: &str, asset: &str) -> anyhow::Result<Vec<u8>> {
 /// (二进制仍可走镜像加速;完整方案是内置公钥验签,另立项。)
 async fn download_from_github_direct(tag: &str, asset: &str) -> anyhow::Result<Vec<u8>> {
     let client = http_client();
-    let url = format!("https://github.com/{GITHUB_REPO}/releases/download/{tag}/{asset}");
+    let url = format!("https://github.com/{}/releases/download/{tag}/{asset}", github_repo());
     tracing::info!("[Update] 直连 github.com 下载 {asset}（独立可信信道,不走镜像）…");
-    let resp = client
-        .get(&url)
+    let resp = with_update_auth(client.get(&url))
         .send()
         .await
         .map_err(|e| anyhow::anyhow!("直连 GitHub 下载 {asset} 失败: {e}"))?;
     if !resp.status().is_success() {
         anyhow::bail!("直连 GitHub 下载 {asset} 返回 {}", resp.status());
     }
-    // Content-Length 预检（sha256 文件应极小，> 200MiB 必然异常）
-    if let Some(content_length) = resp.content_length() {
-        if content_length > MAX_DOWNLOAD_BYTES {
-            anyhow::bail!(
-                "直连 GitHub 响应体 Content-Length {content_length} 超过 {MAX_DOWNLOAD_BYTES}，拒绝下载"
-            );
-        }
-    }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| anyhow::anyhow!("直连 GitHub 读取 {asset} 响应体失败: {e}"))?;
-    Ok(bytes.to_vec())
+    // 流式读 + 累计上限（含 Content-Length 预检）：与镜像路径同一道防线。
+    // 即便这条是"直连 GitHub"的可信信道，也不假设对端行为——TLS 只保证没有中间人，
+    // 不保证对端不会返回超大响应体（而 sha256 文件本应极小，超限必然异常）。
+    read_body_capped(resp, &format!("直连 GitHub {asset}"), MAX_DOWNLOAD_BYTES).await
 }
 
 /// 执行 OTA 更新：下载新二进制 + sha256 校验 + 备份 + 原子替换。
@@ -511,3 +563,173 @@ fn target_is_newer(tag: &str) -> bool {
 }
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归（已知缺陷 #2 的未修那一半）：**chunked 响应**（无 Content-Length）也必须受上限约束。
+    ///
+    /// **旧代码为何 FAIL**：上限检查只有 `if let Some(content_length) = resp.content_length()`
+    /// 这一道预检，chunked 响应不带该头 → 预检整个被跳过 → 随后 `resp.bytes()` 把无上限的
+    /// 响应体全读进内存。旧代码在这个测试里会一路读完 `MAX_DOWNLOAD_BYTES` 以上的数据并返回
+    /// `Ok`，而本测试断言 `is_err()`。
+    ///
+    /// 生产后果：OOM 的对象是**正在服务的网关进程**——点一次「检查更新」就能打死线上。
+    /// 注意加大上限治不了它（绕过的是"有没有检查"，不是阈值大小）。
+    ///
+    /// 用真实 TCP 服务端而非 mock：缺陷恰恰在 reqwest 的分块读取语义上，
+    /// 用假 Response 测不出"没有 Content-Length 时会发生什么"。
+    // multi_thread：服务端任务要与客户端读取**真正并发**推 1MiB。
+    // current_thread 下写端会在 socket 缓冲填满后卡住而客户端还没开始读 body，
+    // 表现为 hyper 侧 IncompleteMessage（看起来像连接坏了，实则是调度饿死）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn chunked_response_without_content_length_is_still_capped() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // 服务端：chunked 编码、**不发 Content-Length**、持续吐数据直到被对端关闭。
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // 必须把请求头**读到空行为止**再回响应：只 read 一次可能截断，
+            // 导致 hyper 侧报 IncompleteMessage 而非进入我们要测的 body 读取路径。
+            let mut req = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                match tokio::io::AsyncReadExt::read(&mut sock, &mut chunk).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        req.extend_from_slice(&chunk[..n]);
+                        // GET 请求无 body，收到头部结束的空行即可回响应。
+                        if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                }
+            }
+            if sock
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await
+                .is_err()
+            {
+                return;
+            }
+            // 发 16 块 × 64KiB = 1MiB，远超测试用的 TEST_CAP（64KiB）。
+            // 用**有限**块数而非无限循环：客户端一旦因超限中断读取，无限写会拿到 EPIPE，
+            // 那本身没问题，但有限块数让测试行为完全确定、不依赖断开时序。
+            let payload = vec![b'A'; 64 * 1024];
+            let head = format!("{:x}\r\n", payload.len());
+            for _ in 0..16 {
+                if sock.write_all(head.as_bytes()).await.is_err() { return; }
+                if sock.write_all(&payload).await.is_err() { return; }
+                if sock.write_all(b"\r\n").await.is_err() { return; }
+            }
+            // 正常收尾（0 长度块），使响应是**合法完整**的 chunked 响应——
+            // 这样测的就是"上限生效"，而不是"连接坏了"。
+            let _ = sock.write_all(b"0\r\n\r\n").await;
+            let _ = sock.flush().await;
+        });
+
+        // ⚠️ 必须 no_proxy()：本 crate 的 reqwest 开了 `system-proxy` feature，
+        // 默认会读系统代理设置。开发机上装了 Clash/Surge 之类时，客户端会尝试把
+        // 到 127.0.0.1 的请求也塞进代理隧道 → 握手失败，报 hyper IncompleteMessage
+        // （看起来像"连接坏了"，与被测逻辑毫无关系）。这与已知问题 #19 同型：
+        // 测试必须与本机网络环境无关。
+        let resp = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("构建测试 client")
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .expect("请求应成功建立");
+        assert!(
+            resp.content_length().is_none(),
+            "前提：chunked 响应不应带 Content-Length，否则测不到该绕过路径"
+        );
+
+        // 小上限：64KiB。服务端会推 1MiB，故必然触发累计截断。
+        const TEST_CAP: u64 = 64 * 1024;
+        let err = read_body_capped(resp, "test-chunked", TEST_CAP)
+            .await
+            .expect_err("超限的 chunked 响应必须返回 Err（旧代码会无上限读完 → Ok）");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("超过上限"),
+            "错误应明确指出超过上限，便于运维定位: {msg}"
+        );
+    }
+
+    /// 环境变量是进程级全局状态，多个测试并发读写会互相打断，故串行化。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard(&'static str);
+    impl EnvGuard {
+        fn set(key: &'static str, val: &str) -> Self {
+            unsafe { std::env::set_var(key, val) };
+            Self(key)
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var(self.0) };
+        }
+    }
+
+    #[test]
+    fn repo_defaults_and_env_override() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::remove_var("KIROSTUDIO_UPDATE_REPO") };
+        assert_eq!(github_repo(), DEFAULT_GITHUB_REPO);
+
+        let _g = EnvGuard::set("KIROSTUDIO_UPDATE_REPO", "dwgx/KiroStudio-skiapi");
+        assert_eq!(github_repo(), "dwgx/KiroStudio-skiapi");
+    }
+
+    #[test]
+    fn blank_env_falls_back_to_default() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // 空串/纯空白必须视作"未配置"，否则 systemd 里写了空的 Environment=
+        // 会让 OTA 去请求 repos//tags 这种畸形路径。
+        let _g = EnvGuard::set("KIROSTUDIO_UPDATE_REPO", "   ");
+        assert_eq!(github_repo(), DEFAULT_GITHUB_REPO);
+
+        let _t = EnvGuard::set("KIROSTUDIO_UPDATE_TOKEN", "  ");
+        assert!(update_token().is_none());
+    }
+
+    /// 核心安全属性：配了令牌就绝不把请求发给第三方镜像。
+    /// 镜像是 HTTP 中间人，经它转发等于把 PAT 交给对方。
+    #[test]
+    fn token_present_restricts_to_direct_only() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _t = EnvGuard::set("KIROSTUDIO_UPDATE_TOKEN", "ghp_dummy_for_test");
+
+        let api = github_api_candidates_for("repos/x/y/tags");
+        assert_eq!(api.len(), 1, "有令牌时 API 候选必须只剩直连");
+        assert_eq!(api[0].0, "github-direct");
+        assert!(api.iter().all(|(_, u)| !u.contains("gh-proxy")));
+
+        let assets = asset_candidates("v1.2.3", "kirostudio-linux-x86_64");
+        assert_eq!(assets.len(), 1, "有令牌时资产候选必须只剩直连");
+        assert_eq!(assets[0].0, "github-direct");
+        assert!(assets.iter().all(|(_, u)| !u.contains("gh-proxy")));
+    }
+
+    #[test]
+    fn no_token_keeps_mirror_fallbacks() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::remove_var("KIROSTUDIO_UPDATE_TOKEN") };
+
+        // 公开仓库无凭据可泄露，镜像加速照旧，且直连必须是最后兜底。
+        let api = github_api_candidates_for("repos/x/y/tags");
+        assert!(api.len() > 1);
+        assert_eq!(api.last().unwrap().0, "github-direct");
+
+        let assets = asset_candidates("v1.2.3", "kirostudio-linux-x86_64");
+        assert!(assets.len() > 1);
+        assert_eq!(assets.last().unwrap().0, "github-direct");
+    }
+}

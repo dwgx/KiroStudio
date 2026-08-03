@@ -71,15 +71,33 @@ pub struct RequestRecord {
     pub model: String,
     /// 是否流式
     pub is_streaming: bool,
-    /// 输入 tokens（优先精确值，回退估算）
+    /// 输入 tokens —— **gross 口径**（含 `cache_read_tokens` + `cache_creation_tokens`）。
+    ///
+    /// ⚠ 与响应体里同名的 `usage.input_tokens` **不是一回事**，二者口径相反：
+    /// - 本字段（用量统计 / `/api/admin/usage/*`）＝本次请求的**全量**输入 token
+    ///   （优先 `contextUsageEvent` 反推的精确值，回退本地估算），缓存命中部分**没有**被剔除。
+    /// - Anthropic 响应体里的 `usage.input_tokens`（见
+    ///   [`crate::anthropic::stream::billed_input_tokens`]）是 **billed 口径**，
+    ///   已减去 cache 读写，与 `cache_read_input_tokens` 互斥。
+    ///
+    /// 因此消费方要算「总输入」时**直接用本字段即可，不可再加 `cache_read_tokens`**，
+    /// 否则缓存部分被计两次。要还原客户端看到的口径请用
+    /// [`RequestRecord::billed_input_tokens`]。
+    ///
+    /// 保持 gross 是有意为之：用量统计关心的是真实上下文规模（缓存只影响计费不影响体积），
+    /// 且历史 JSONL/SQLite 数据已按 gross 落库，改口径会让历史数据断裂。
     pub input_tokens: i32,
     /// 输出 tokens
     pub output_tokens: i32,
     /// 本次命中缓存读取的 tokens（cache_read_input_tokens；无缓存记账时为 0）。
+    ///
+    /// 是 [`Self::input_tokens`] 的**子集**（gross 已包含它），不是额外增量。
     /// serde default，兼容早于本字段的历史 JSONL（缺字段视为 0）。
     #[serde(default)]
     pub cache_read_tokens: i32,
     /// 本次新建缓存写入的 tokens（cache_creation_input_tokens；无缓存记账时为 0）。
+    ///
+    /// 同样是 [`Self::input_tokens`] 的**子集**。
     /// serde default，兼容早于本字段的历史 JSONL（缺字段视为 0）。
     #[serde(default)]
     pub cache_creation_tokens: i32,
@@ -131,6 +149,46 @@ impl RequestRecord {
             client_ip: None,
             client_os: None,
             client_browser: None,
+        }
+    }
+
+    /// 派生只读值：把 gross 的 [`Self::input_tokens`] 换算成 Anthropic 响应体的
+    /// billed 口径（剔除 cache 读写）。**不参与序列化**，只为消费方省去自己减一遍。
+    ///
+    /// 与 [`crate::anthropic::stream::billed_input_tokens`] 同一算法，饱和减不为负。
+    pub fn billed_input_tokens(&self) -> i32 {
+        self.input_tokens
+            .saturating_sub(self.cache_creation_tokens)
+            .saturating_sub(self.cache_read_tokens)
+            .max(0)
+    }
+
+    /// 把 cache 明细收敛到不超过 gross [`Self::input_tokens`]，维持「cache 是 input 子集」不变量。
+    ///
+    /// 为什么需要：两个数字**不同源**。`cache_read` 由本地前缀估算得出并按**本地**
+    /// `count_all_tokens` 估算值 clamp（handlers.rs 的 `prefix_tokens.min(input_tokens)`），
+    /// 而落库的 `input_tokens` 优先取 `contextUsageEvent` 百分比反推的值。上游百分比偏低
+    /// （或 window_size 判定与实际不符）时反推值可能小于前缀估算 → 产出
+    /// `cache_read > input_tokens` 的自相矛盾记录，面板会显示「缓存读取比总输入还多」。
+    /// 这里做一次防御性收敛：creation 先占额度，read 取剩余。
+    ///
+    /// 在每个埋点写入 cache 字段后调用（`input_tokens` 也已确定）。
+    pub fn clamp_cache_to_input(&mut self) {
+        let gross = self.input_tokens.max(0);
+        let creation = self.cache_creation_tokens.clamp(0, gross);
+        let read = self.cache_read_tokens.clamp(0, gross - creation);
+        if creation != self.cache_creation_tokens || read != self.cache_read_tokens {
+            tracing::debug!(
+                request_id = %self.request_id,
+                input_tokens = self.input_tokens,
+                cache_read_before = self.cache_read_tokens,
+                cache_creation_before = self.cache_creation_tokens,
+                cache_read_after = read,
+                cache_creation_after = creation,
+                "cache 明细超过 gross input_tokens（估算与上游反推不同源），已收敛"
+            );
+            self.cache_creation_tokens = creation;
+            self.cache_read_tokens = read;
         }
     }
 }
@@ -312,6 +370,87 @@ mod tests {
         assert_eq!(back.credential_id, Some(3));
         assert_eq!(back.credits_used, Some(1.5));
         assert_eq!(back.outcome, RequestOutcome::Success);
+    }
+
+    #[test]
+    fn should_expose_billed_input_tokens_derived_from_gross() {
+        // record.input_tokens 是 gross（含 cache），派生方法还原客户端看到的 billed 口径
+        let mut rec = RequestRecord::new("req-gross", "claude-sonnet-5");
+        rec.input_tokens = 12_500;
+        rec.cache_read_tokens = 12_000;
+        rec.cache_creation_tokens = 300;
+        assert_eq!(rec.billed_input_tokens(), 200);
+        // 派生值不得进入序列化（否则前端会多出一个口径字段）。
+        // 注意 request_id 不含 "billed"，避免自身数据污染这条子串断言。
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(!json.contains("billed"), "派生值不应被序列化: {json}");
+    }
+
+    #[test]
+    fn should_return_zero_billed_when_cache_covers_whole_input() {
+        let mut rec = RequestRecord::new("req-full-hit", "claude-sonnet-5");
+        rec.input_tokens = 1_000;
+        rec.cache_read_tokens = 1_000;
+        assert_eq!(
+            rec.billed_input_tokens(),
+            0,
+            "全命中时 billed 为 0，不得为负"
+        );
+    }
+
+    #[test]
+    fn should_clamp_cache_read_exceeding_gross_input() {
+        // 触发场景：cache_read 按本地估算 clamp（=9000），而 input_tokens 取
+        // contextUsageEvent 反推值（=4000，上游百分比偏低）→ 矛盾记录
+        let mut rec = RequestRecord::new("req-clamp", "claude-sonnet-5");
+        rec.input_tokens = 4_000;
+        rec.cache_read_tokens = 9_000;
+        rec.clamp_cache_to_input();
+        assert_eq!(
+            rec.cache_read_tokens, 4_000,
+            "cache_read 不得超过 gross input"
+        );
+        assert_eq!(rec.billed_input_tokens(), 0);
+    }
+
+    #[test]
+    fn should_clamp_creation_first_then_read_with_remaining_budget() {
+        let mut rec = RequestRecord::new("req-clamp2", "claude-sonnet-5");
+        rec.input_tokens = 1_000;
+        rec.cache_creation_tokens = 700;
+        rec.cache_read_tokens = 900;
+        rec.clamp_cache_to_input();
+        // creation 先占 700，read 只剩 300 的额度
+        assert_eq!(rec.cache_creation_tokens, 700);
+        assert_eq!(rec.cache_read_tokens, 300);
+        assert_eq!(
+            rec.cache_creation_tokens + rec.cache_read_tokens,
+            rec.input_tokens,
+            "cache 合计不得超过 gross input"
+        );
+    }
+
+    #[test]
+    fn should_leave_consistent_cache_untouched_on_clamp() {
+        let mut rec = RequestRecord::new("req-noop", "claude-sonnet-5");
+        rec.input_tokens = 12_500;
+        rec.cache_read_tokens = 12_000;
+        rec.cache_creation_tokens = 300;
+        rec.clamp_cache_to_input();
+        assert_eq!(rec.cache_read_tokens, 12_000, "正常记录不应被改动");
+        assert_eq!(rec.cache_creation_tokens, 300);
+    }
+
+    #[test]
+    fn should_zero_cache_when_gross_input_is_zero_or_negative() {
+        // 失败记录可能 input_tokens=0（拿不到反推值也没估算）；cache 必须跟着归零
+        let mut rec = RequestRecord::new("req-zero", "claude-sonnet-5");
+        rec.input_tokens = 0;
+        rec.cache_read_tokens = 500;
+        rec.cache_creation_tokens = 50;
+        rec.clamp_cache_to_input();
+        assert_eq!(rec.cache_read_tokens, 0);
+        assert_eq!(rec.cache_creation_tokens, 0);
     }
 
     #[test]

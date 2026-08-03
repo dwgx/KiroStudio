@@ -1610,7 +1610,7 @@ dependencies = [
 
 [[package]]
 name = "kirostudio"
-version = "0.7.44"
+version = "0.7.46"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1638,6 +1638,7 @@ dependencies = [
  "serde_cbor",
  "serde_json",
  "sha2",
+ "socket2",
  "subtle",
  "tokio",
  "tower-http",

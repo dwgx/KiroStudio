@@ -97,10 +97,26 @@ pub struct RecentQuery {
 /// 最近请求明细返回条数的硬上限（兜底：全量查询也不至于把服务/前端拖垮）。
 ///
 /// dwgx 需求「最近请求支持真全部」：前端"全部"选项传 `limit=0`，服务端解释为
-/// 「取到该硬上限为止」。5 万条对本地 SQLite 单次查询与 JSON 序列化均可控，
-/// 而前端表格采用分页渲染（每页 20 行），故不存在 DOM 爆炸；此上限仅是极端场景
-/// 的内存/带宽兜底。
-pub const MAX_RECENT_LIMIT: usize = 50_000;
+/// 「取到该硬上限为止」。前端表格分页渲染（每页 20 行），故不存在 DOM 爆炸。
+///
+/// # 为什么从 50000 降到 2000（实测驱动）
+///
+/// 原注释断言「5 万条对本地 SQLite 单次查询与 JSON 序列化均可控」——**线上实测不成立**：
+/// 13.5 万行的库上取 5 万行需 **42ms**、原始文本 **6.5MB**（JSON 序列化后更大），
+/// 而不是此前假定的 admin API 那个 0.3ms 量级（差约 140 倍）。
+///
+/// 真正的危害不在响应慢，而在**持锁**：`TraceDb` 是单连接 + 一把 `parking_lot::Mutex`
+/// （`trace_db.rs:132-135`），用量写入管道（专用 OS 线程）与本查询**共享**这把锁。
+/// 一次 42ms 的持锁会让写侧排队，排满 `CHANNEL_CAPACITY`(10_000) 后 `try_send` 失败
+/// → **静默丢弃真实请求记录**（`pipeline.rs` 只在 2 的幂次告警）。
+/// 即「点一下面板的『全部』」会造成用量数据丢失。
+///
+/// 2000 条够任何人工排障翻页（前端每页 20 行 = 100 页），更大范围应走
+/// `traces_search` 的分页/过滤而不是一次性拉全量。
+///
+/// ⚠️ 不要用 `spawn_blocking` 代替降上限：那只解决"不占 tokio worker"，
+/// 锁照样被占死 42ms、写侧照样排队 —— 它解决的是三个问题里最不重要的那个。
+pub const MAX_RECENT_LIMIT: usize = 2_000;
 
 /// 解析「最近请求」的实际取数条数（纯函数，便于单测）。
 ///
@@ -485,7 +501,9 @@ mod tests {
     fn test_resolve_recent_limit_normal_values_pass_through() {
         assert_eq!(resolve_recent_limit(Some(1)), 1);
         assert_eq!(resolve_recent_limit(Some(200)), 200);
-        assert_eq!(resolve_recent_limit(Some(5000)), 5000);
+        // 用**符号**而非字面量：硬上限已从 50000 降到 2000（见 MAX_RECENT_LIMIT 的说明），
+        // 写死字面量会让上限的每次调整都连带改这里，且容易写出 > 上限的值。
+        assert_eq!(resolve_recent_limit(Some(MAX_RECENT_LIMIT)), MAX_RECENT_LIMIT);
     }
 
     #[test]
@@ -493,5 +511,17 @@ mod tests {
         // 超过硬上限（含旧的 5000 之上）一律裁剪到 MAX_RECENT_LIMIT，防拖垮服务
         assert_eq!(resolve_recent_limit(Some(MAX_RECENT_LIMIT + 1)), MAX_RECENT_LIMIT);
         assert_eq!(resolve_recent_limit(Some(usize::MAX)), MAX_RECENT_LIMIT);
+        // 回归（实测驱动）：上限必须足够小，使单次查询的**持锁时间**不会顶住用量写入管道。
+        //
+        // TraceDb 是单连接 + 一把 parking_lot::Mutex，写管道（专用 OS 线程）与 admin 查询
+        // 共享它。线上实测 13.5 万行的库取 5 万行需 42ms / 6.5MB —— 那会让写侧排队，
+        // 排满 CHANNEL_CAPACITY(10_000) 即**静默丢真实请求记录**。
+        // 也就是说「点一下面板的『全部』」会造成用量数据丢失。
+        // 若有人把上限调回万级，这条断言会 FAIL 并指回这段说明。
+        assert!(
+            MAX_RECENT_LIMIT <= 5_000,
+            "MAX_RECENT_LIMIT={MAX_RECENT_LIMIT} 过大：单次查询持锁会顶住用量写入管道并丢记录。\
+             需要更大范围请走 traces_search 的分页/过滤，不要一次性拉全量"
+        );
     }
 }

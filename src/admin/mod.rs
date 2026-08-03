@@ -29,7 +29,7 @@ mod update;
 mod usage_handlers;
 
 pub use middleware::AdminState;
-pub use router::create_admin_router;
+pub use router::{create_admin_router, create_import_alias_router};
 pub use service::AdminService;
 // Windows 系统托盘「重启服务」复用面板一键重启的自重启逻辑（同源）。
 #[cfg(windows)]

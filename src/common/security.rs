@@ -249,12 +249,35 @@ impl IngressRateLimiter {
 ///   同样信任 XFF 最右段（A2 修复：反代后中间件白名单/限流不再只看到反代内网 IP）；
 ///   对端是公网地址（=客户端直连本服务）时，直接用对端 IP、忽略可被伪造的 XFF。
 pub fn client_ip(req: &Request<Body>, peer: Option<SocketAddr>, trust_forwarded: bool) -> Option<IpAddr> {
+    client_ip_from_headers(req.headers(), peer, trust_forwarded)
+}
+
+/// 与 [`client_ip`] 完全同口径，但只要 `HeaderMap`（不要整个 `Request`）。
+///
+/// # 为什么需要这个签名
+///
+/// 已知问题 #6：业务层（`anthropic::handlers`）拿不到 `Request`（body 已被提取器消费），
+/// 于是它自己写了一份 `trusted_client_ip`，**只看对端是否私网**、完全没接
+/// `config.trust_forwarded_header`。两套口径分叉的后果：
+///
+/// 反代在**公网** IP（CDN 直连 / 跨网段 LB）且管理员开了 `trustForwardedHeader=true` 时，
+/// security 中间件按 XFF 最右段判定真实客户端，而 handler 层退回 `peer` = 反代公网 IP →
+/// 业务层 IP 黑名单实际封的是**反代自己**（一封就封掉全部用户）；且所有客户端共享同一个
+/// 机器码，机器码黑名单同样一封封全部。
+///
+/// 抽出这个函数让两层共用**同一份**判定逻辑，而不是让 handler 再维护一份近似实现——
+/// 近似实现就是这个缺陷的成因。
+pub fn client_ip_from_headers(
+    headers: &axum::http::HeaderMap,
+    peer: Option<SocketAddr>,
+    trust_forwarded: bool,
+) -> Option<IpAddr> {
     // 是否应信任转发头:显式开启,或对端是私网/环回(说明位于本机可信反代之后)。
     // 后者是 A2 修复:线上 openresty 反代到 8990,对端恒为 127.0.0.1/内网,默认 trust=false
     // 会让中间件白名单/入口限流全部按同一个反代 IP 工作(失效或误伤)。对端私网即视为可信反代。
     let trust = trust_forwarded || peer.map(|p| is_trusted_proxy_peer(p.ip())).unwrap_or(false);
     if trust {
-        if let Some(xff) = req.headers().get("x-forwarded-for") {
+        if let Some(xff) = headers.get("x-forwarded-for") {
             if let Ok(s) = xff.to_str() {
                 // 安全(H2):取**最右**段,不是最左。XFF 是各级代理依次追加的链
                 // (client, proxy1, proxy2, ...),最左是客户端**可任意伪造**的值——取最左
@@ -267,7 +290,7 @@ pub fn client_ip(req: &Request<Body>, peer: Option<SocketAddr>, trust_forwarded:
                 }
             }
         }
-        if let Some(xr) = req.headers().get("x-real-ip") {
+        if let Some(xr) = headers.get("x-real-ip") {
             if let Ok(s) = xr.to_str() {
                 if let Ok(ip) = s.trim().parse::<IpAddr>() {
                     return Some(ip);

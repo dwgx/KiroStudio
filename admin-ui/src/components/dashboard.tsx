@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Trash2, RotateCcw, CheckCircle2, Database, Zap, Ban, Power, FlaskConical, Download } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Trash2, RotateCcw, CheckCircle2, Database, Zap, Ban, Power, FlaskConical, Download, AlertTriangle } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -21,7 +21,7 @@ import {
   DialogDescription,
   DialogFooter,
 } from '@/components/ui/dialog'
-import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useSetDisabled } from '@/hooks/use-credentials'
+import { useCredentials, useDeleteCredential, useDeleteCredentialsBatch, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useSetDisabled } from '@/hooks/use-credentials'
 import { getCredentialBalance, getCachedBalances, forceRefreshToken, deepVerifyCredential, probeAvailableModels, setCredentialAllowedModels, PROBE_MODEL_CATALOG, exportCredential } from '@/api/credentials'
 import { extractErrorMessage, downloadJson, fileStamp } from '@/lib/utils'
 import { PageSkeleton } from '@/components/ui/page-skeleton'
@@ -32,6 +32,28 @@ interface DashboardProps {
   onLogout: () => void
   /** 内嵌到多页框架时为 true：隐藏自身顶栏，操作按钮移入工具行 */
   embedded?: boolean
+}
+
+/**
+ * 数据过期提示条（非阻塞）：后台刷新失败但仍有可用缓存时挂在页顶。
+ *
+ * 刻意不是错误卡：能看到（略旧的）真实数据远好过被一块"加载失败"糊住整页——
+ * 后端滚动重启期间反代会连着回 502，那几十秒里数据本身是好的，只是停止更新了。
+ */
+function StaleBanner({ updatedAt }: { updatedAt: number }) {
+  const { t } = useTranslation()
+  return (
+    <div className="mb-4 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-500">
+      <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+      <span>{t('common.stale.banner')}</span>
+      {updatedAt > 0 && (
+        <span className="text-amber-500/70">
+          {t('common.stale.lastUpdated', { time: new Date(updatedAt).toLocaleTimeString() })}
+        </span>
+      )}
+      <span className="text-amber-500/70">{t('common.stale.retrying')}</span>
+    </div>
+  )
 }
 
 /**
@@ -131,8 +153,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   })
 
   const queryClient = useQueryClient()
-  const { data, isLoading, error, refetch } = useCredentials()
+  // dataUpdatedAt = 最近一次**成功**拉取的时刻，用于过期提示条告诉用户手里这份数据有多旧。
+  const { data, isLoading, error, refetch, dataUpdatedAt } = useCredentials()
   const { mutate: deleteCredential } = useDeleteCredential()
+  const { mutateAsync: deleteCredentialsBatch } = useDeleteCredentialsBatch()
   const { mutate: resetFailure } = useResetFailure()
   const { mutateAsync: setDisabledAsync } = useSetDisabled()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
@@ -232,51 +256,54 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     setSelectedIds(new Set())
   }
 
-  // 批量删除（仅删除已禁用项）
-  const handleBatchDelete = async () => {
+  /**
+   * 批量删除。`force=true` 时**连未禁用的号一起删**（后端跳过「必须先禁用」门，仍进回收站）。
+   *
+   * 非 force 保持原语义：只删已禁用项，其余跳过并在文案里说明跳过了几个。
+   * 两条路径都走**一次**批量请求 —— 此前是逐个 DELETE，且未禁用的号还得先 PATCH 禁用，
+   * 实际 2N 次往返。
+   */
+  const handleBatchDelete = async (force = false) => {
     if (selectedIds.size === 0) {
       toast.error(t('dashboard.batchDelete.noSelection'))
       return
     }
 
-    const disabledIds = Array.from(selectedIds).filter(id => {
-      const credential = data?.credentials.find(c => c.id === id)
-      return Boolean(credential?.disabled)
-    })
+    const allIds = Array.from(selectedIds)
+    // force：全选中项都删。非 force：只删已禁用的，其余跳过（与原行为一致）。
+    const targetIds = force
+      ? allIds
+      : allIds.filter(id => Boolean(data?.credentials.find(c => c.id === id)?.disabled))
 
-    if (disabledIds.length === 0) {
+    if (targetIds.length === 0) {
       toast.error(t('dashboard.batchDelete.noDisabled'))
       return
     }
 
-    const skippedCount = selectedIds.size - disabledIds.length
+    const skippedCount = allIds.length - targetIds.length
     const skippedText = skippedCount > 0 ? t('dashboard.batchDelete.skipHint', { count: skippedCount }) : ''
 
     // 走设计系统 ConfirmDialog(不用浏览器原生 confirm)。确认后再执行删除。
     setConfirmState({
-      title: t('dashboard.batchDelete.confirmTitle'),
-      description: t('dashboard.batchDelete.confirmDesc', { count: disabledIds.length, skipped: skippedText }),
-      confirmText: t('dashboard.batchDelete.confirmBtn'),
+      title: force ? t('dashboard.batchDelete.forceConfirmTitle') : t('dashboard.batchDelete.confirmTitle'),
+      description: force
+        // 强删要说清两件事：会中断在途请求、但仍可从回收站恢复。
+        ? t('dashboard.batchDelete.forceConfirmDesc', { count: targetIds.length })
+        : t('dashboard.batchDelete.confirmDesc', { count: targetIds.length, skipped: skippedText }),
+      confirmText: force ? t('dashboard.batchDelete.forceConfirmBtn') : t('dashboard.batchDelete.confirmBtn'),
       onConfirm: async () => {
-        let successCount = 0
-        let failCount = 0
-        for (const id of disabledIds) {
-          try {
-            await new Promise<void>((resolve, reject) => {
-              deleteCredential(id, {
-                onSuccess: () => { successCount++; resolve() },
-                onError: (err) => { failCount++; reject(err) },
-              })
-            })
-          } catch (error) {
-            // 错误已在 onError 中处理
-          }
-        }
         const skippedResultText = skippedCount > 0 ? t('dashboard.batchDelete.skippedResult', { count: skippedCount }) : ''
-        if (failCount === 0) {
-          toast.success(t('dashboard.batchDelete.successToast', { count: successCount, skipped: skippedResultText }))
-        } else {
-          toast.warning(t('dashboard.batchDelete.warnToast', { ok: successCount, fail: failCount, skipped: skippedResultText }))
+        try {
+          // 一次请求。⚠️ 部分失败仍是 resolve（HTTP 200），必须看 failed 字段。
+          const res = await deleteCredentialsBatch({ ids: targetIds, force })
+          if (res.failed === 0) {
+            toast.success(t('dashboard.batchDelete.successToast', { count: res.deleted, skipped: skippedResultText }))
+          } else {
+            toast.warning(t('dashboard.batchDelete.warnToast', { ok: res.deleted, fail: res.failed, skipped: skippedResultText }))
+          }
+        } catch (err) {
+          // 整体失败（网络/鉴权/400）——与"部分条目失败"是不同的情形，文案要分开。
+          toast.error(t('dashboard.batchDelete.requestFailed'))
         }
         deselectAll()
       },
@@ -719,7 +746,11 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     )
   }
 
-  if (error) {
+  // 只有"错了且手里一份缓存都没有"才整页换错误卡。
+  // React Query v5 在后台 refetch 失败时只置 status:'error' 并**保留上一次成功的 data**；
+  // 这里若用 error 单条件，30s 轮询里任意一次 502（后端滚动重启实测中断 74s）就会把
+  // 完全可用的缓存数据换成错误卡 → 那段时间面板整块不可读。
+  if (error && !data) {
     return (
       <div className={embedded ? "flex items-center justify-center py-24 p-4" : "min-h-screen flex items-center justify-center bg-background p-4"}>
         <Card className="w-full max-w-md">
@@ -772,6 +803,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
 
       {/* 主内容 */}
       <main className={embedded ? "" : "container mx-auto px-4 md:px-8 py-6"}>
+        {/* 刷新失败但缓存仍在：只提示"数据可能已过期"，不遮挡下方内容 */}
+        {error && data && <StaleBanner updatedAt={dataUpdatedAt} />}
         {/* 统计卡片 */}
         <div className="grid gap-4 md:grid-cols-3 mb-6">
           <StatCard
@@ -908,7 +941,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                     {t('dashboard.toolbar.batchEnable')}
                   </Button>
                   <Button
-                    onClick={handleBatchDelete}
+                    onClick={() => handleBatchDelete(false)}
                     size="sm"
                     variant="destructive"
                     disabled={selectedDisabledCount === 0}
@@ -916,6 +949,19 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   >
                     <Trash2 className="h-4 w-4 mr-2" />
                     {t('dashboard.toolbar.batchDelete')}
+                  </Button>
+                  {/* 强制删除：连未禁用的号一起删（后端跳过"必须先禁用"门）。
+                      与普通批量删并列而非藏进下拉——components/ui 下没有 dropdown-menu，
+                      为一个下拉引 radix 不值得；而两个按钮的差异由文案与确认框说清。 */}
+                  <Button
+                    onClick={() => handleBatchDelete(true)}
+                    size="sm"
+                    variant="destructive"
+                    disabled={selectedIds.size === 0}
+                    title={t('dashboard.toolbar.batchForceDeleteTip')}
+                  >
+                    <Trash2 className="h-4 w-4 mr-2" />
+                    {t('dashboard.toolbar.batchForceDelete')}
                   </Button>
                 </>
               )}

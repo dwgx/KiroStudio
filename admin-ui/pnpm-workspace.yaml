@@ -1,0 +1,19 @@
+# pnpm 10+ 要求显式声明哪些依赖允许跑安装脚本（postinstall）。
+#
+# ⚠️ 这个文件原先是 pnpm 生成的**未填模板**（值写着 "set this to true or false"），
+# 会让 `pnpm install` / `pnpm build` 直接以 ERR_PNPM_IGNORED_BUILDS 失败。
+# 而 rust-embed 是编译期嵌入 admin-ui/dist，前端构建失败会连带让 cargo 报
+# E0599（no associated function named `get`），排查方向容易被带偏。
+#
+# 两者都必须为 true：
+#   @swc/core —— 原生二进制，postinstall 下载/链接对应平台的 .node
+#   esbuild   —— 同理，vite 的打包内核，缺它无法构建
+# packages 必填：pnpm 10 起本文件存在即视为 workspace 根，缺 packages 会报
+# "packages field missing or empty"（CI 上的 pnpm 版本比本机严格，实测踩过）。
+# 单包仓库声明为 ['.'] 即可。
+packages:
+  - '.'
+
+allowBuilds:
+  '@swc/core': true
+  esbuild: true

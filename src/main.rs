@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use clap::Parser;
-use kiro::endpoint::{IdeEndpoint, KiroEndpoint};
+use kiro::endpoint::KiroEndpoint;
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
@@ -328,12 +328,11 @@ async fn main() {
         tracing::info!("已配置 HTTP 代理: {}", config.proxy_url.as_ref().unwrap());
     }
 
-    // 构建端点注册表
-    let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
-    {
-        let ide = IdeEndpoint::new();
-        endpoints.insert(ide.name().to_string(), Arc::new(ide));
-    }
+    // 构建端点注册表（收口在 endpoint::registry，避免此处与旁路各自维护一份端点清单）：
+    // - ide：Kiro IDE 协议（runtime.{region}.kiro.dev/generateAssistantResponse）
+    // - cli：Amazon Q CLI 协议（q.{region}.amazonaws.com 服务根 + X-Amz-Target +
+    //   tokentype:API_KEY，绝不带 profileArn）。ksk_ 号自动路由至此，也可显式指定。
+    let endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = kiro::endpoint::registry();
 
     // 校验默认端点存在
     if !endpoints.contains_key(&config.default_endpoint) {
@@ -341,12 +340,13 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // 校验所有凭据声明的端点都已注册
+    // 校验所有凭据**实际会用**的端点都已注册
+    //
+    // 口径必须与 provider 的 endpoint_for 一致（同走 effective_endpoint）：显式字段优先、
+    // ksk_ 号自动路由到 cli、其余回退默认。若这里只看显式字段，自动路由到未注册端点的
+    // 凭据会绕过启动门禁，直到第一个请求打进来才在热路径上炸「未知端点」。
     for cred in &credentials_list {
-        let name = cred
-            .endpoint
-            .as_deref()
-            .unwrap_or(&config.default_endpoint);
+        let name = cred.effective_endpoint(&config.default_endpoint);
         if !endpoints.contains_key(name) {
             tracing::error!(
                 "凭据 id={:?} 指定了未知端点 \"{}\"（已注册: {:?}）",
@@ -429,6 +429,12 @@ async fn main() {
     // 指纹采集开关：把配置写入热路径运行时镜像（默认 true）。关闭后不采集
     // 下游客户端 device/ip/os/browser。admin 改开关时会立即改写此镜像。
     anthropic::set_collect_client_fingerprint(config.collect_client_fingerprint);
+    // ⭐ 修复已知问题 #6：把 trust_forwarded_header 也喂给**业务层**。
+    // 此前它只进了下面的 `SecurityState`，handler 层完全看不到 → 两层 IP 判定口径分叉，
+    // 反代在公网且开了该开关时，业务层黑名单会封掉反代自己（= 全部用户）。
+    // 与 `SecurityState` 同为启动期读取（改该值仍需重启，见 admin 的 restart_fields），
+    // 所以这里一次写入即可，不需要 admin 侧的热改钩子。
+    anthropic::set_trust_forwarded_header(config.trust_forwarded_header);
 
     // IP 黑名单业务层镜像(按真实客户端 IP 封禁,反代后也生效;admin 改配置时热更):
     anthropic::handlers::set_ip_blocklist(&config.ip_blocklist);
@@ -465,6 +471,13 @@ async fn main() {
     anthropic::handlers::set_tool_stray_repeat_guard(config.tool_stray_repeat_guard);
 
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
+    // prompt cache 记账下发开关：播种进 handlers 的 TIER3 进程镜像。
+    //
+    // 不走 create_router_with_provider 的参数是刻意的——那个签名已有 14 个参数并挂着
+    // #[allow(clippy::too_many_arguments)]，再加只会更难读。这里与下方 respawn_balance_task
+    // 同风格：启动即接线，admin 改配置后调同一个 setter 即时生效。
+    anthropic::set_prompt_cache_enabled(config.prompt_cache_enabled);
+
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
         Some(kiro_provider),
@@ -512,6 +525,11 @@ async fn main() {
             // 启动即受管，admin 改 balanceRefreshIntervalSecs 后 abort+respawn 即时生效不重启。
             admin_state.service.respawn_balance_task();
 
+            // 兼容别名路由必须在 admin_app 之前建（后者会 move 掉 admin_state）。
+            // 只含 POST /import/keys 一个端点，鉴权与 admin 树一致，见
+            // create_import_alias_router 的说明。
+            let import_alias_app = admin::create_import_alias_router(admin_state.clone());
+
             let admin_app = admin::create_admin_router(admin_state);
 
             // 创建 Admin UI 路由
@@ -521,6 +539,9 @@ async fn main() {
             tracing::info!("Admin UI 已启用: /admin");
             anthropic_app
                 .nest("/api/admin", admin_app)
+                // 外部对接方的固定路径 POST /api/import/keys（改不了），
+                // 等价于 /api/admin/import/keys。
+                .nest("/api", import_alias_app)
                 .nest("/admin", admin_ui_app)
         }
     } else {
@@ -591,7 +612,13 @@ async fn main() {
         None => app,
     };
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    let listener = match bind_listener(&addr) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("绑定 {} 失败: {:#}", addr, e);
+            std::process::exit(1);
+        }
+    };
     // OTA 回滚兜底（阶段A）：bind 成功即越过 config/凭据/端口三道启动门 → 清零启动计数器
     // （向 systemd ExecStartPre 守卫脚本表明「非 crashloop」），并 spawn 稳定 30s 后写 .health
     // + 删 .bak 回滚点的确认任务。详见 common::health_marker + deploy/rollback-guard.sh。
@@ -641,7 +668,7 @@ async fn main() {
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(shutdown_with_drain_cap())
     .await
     .unwrap();
 
@@ -652,6 +679,43 @@ async fn main() {
     if TRAY_QUIT_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
         std::process::exit(tray::TRAY_QUIT_EXIT_CODE);
     }
+}
+
+/// 优雅停机的 **drain 上限**（秒）。
+///
+/// ## 为什么需要上限（线上实测）
+///
+/// `with_graceful_shutdown` 会**无限**等待在途请求 drain，而本网关的在途请求是
+/// 长流式 SSE（一次 opus 响应动辄数十秒到数分钟）。于是 `systemctl restart` 实际
+/// 要等到 systemd 的 `TimeoutStopUSec`（线上 90s）超时才 SIGKILL。
+///
+/// 实测：一次部署重启 **02:54:56 → 02:56:10 停了 74 秒**，期间 Caddy 对所有请求
+/// 回 502 —— 单次部署就产生 167 次 502（占当日 502 总量的 41%）。
+/// 而 502 的 p50 duration 仅 0.01s，即连接被瞬间拒绝，正是"进程不在监听"的特征。
+///
+/// ## 取 8 秒的理由
+///
+/// 目标是"绝大多数短请求能正常收尾，但不为个别长流式无限期停服"。
+/// 实测非流式与短流式请求 p50 约 2.6s、p90 约 3.4s，8s 覆盖到 p99 量级；
+/// 而真正的长响应本来就会被客户端重试（Claude Code 有自身退避重试）。
+///
+/// 超时后直接返回让进程退出：未 drain 完的连接被断开，客户端看到流中断而非 502
+/// —— 前者可重试，后者在部署窗口里是全量失败。这个交换明显更好。
+const SHUTDOWN_DRAIN_CAP_SECS: u64 = 8;
+
+/// 停机信号 + drain 上限：收到信号后最多再等 [`SHUTDOWN_DRAIN_CAP_SECS`]。
+///
+/// axum 的 `with_graceful_shutdown` 语义是"此 future 完成即停止接新连接、
+/// 然后等在途完成"。所以上限要加在**信号之后**：先等信号，再给一个封顶的宽限期，
+/// 宽限期一到就让 future 返回，axum 随即结束。
+async fn shutdown_with_drain_cap() {
+    shutdown_signal().await;
+    tracing::info!(
+        "收到停机信号，开始 drain（最多 {}s，超时则断开残余连接以尽快让位给新进程）",
+        SHUTDOWN_DRAIN_CAP_SECS
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(SHUTDOWN_DRAIN_CAP_SECS)).await;
+    tracing::info!("drain 宽限期结束，进入停机");
 }
 
 /// 等待停机信号：Ctrl-C（全平台）或 SIGTERM（Unix，容器编排 docker stop / k8s 用）。
@@ -692,6 +756,63 @@ async fn shutdown_signal() {
     }
 }
 
+/// 绑定监听端口。**Unix 上开启 `SO_REUSEPORT`**，使新旧进程能同时持有同一端口。
+///
+/// 为什么需要：升级时 `systemctl restart` 会先 SIGTERM 旧进程、等它退出，才起新进程。
+/// 而本服务是优雅停机（`with_graceful_shutdown` 等在途请求 drain，SSE 长流可挂数十秒），
+/// 于是端口出现一段**无人监听**的空窗 —— 实测 **20.16 秒**，期间所有入站请求都是
+/// 连接拒绝（curl 返回 000），对上游 sub2api 表现为整条通道不可用。
+///
+/// 开启 `SO_REUSEPORT` 后可做零空窗交接：
+///   1. 起新实例（绑同一端口，内核在新旧之间自动分流新连接）
+///   2. 健康检查新实例通过
+///   3. SIGTERM 旧实例 → 它停止接新连接、继续把在途请求 drain 完才退出
+/// 全程端口始终有人监听，空窗为 0。部署脚本据此改造（见 deploy/hotswap.sh）。
+///
+/// ⚠️ 代价与注意：
+/// - 同端口可被多进程绑定，意味着**配置错误时可能悄悄起两个实例**而不再报
+///   「端口被占用」。故启动日志显式记录该行为，便于排查「改了配置却没生效」类问题。
+/// - 两实例会同时读写同一份 credentials.json。交接窗口很短（秒级）且写盘走
+///   `fs_atomic`（temp→fsync→rename）不会写坏文件，但仍应尽快 SIGTERM 旧实例，
+///   不要让两个实例长期并存。
+/// - Windows 无 `SO_REUSEPORT`（其 `SO_REUSEADDR` 语义不同且不安全），故仅 Unix 生效，
+///   Windows 保持原有独占绑定行为。
+fn bind_listener(addr: &str) -> anyhow::Result<tokio::net::TcpListener> {
+    use std::net::SocketAddr;
+
+    let sock_addr: SocketAddr = addr
+        .parse()
+        .map_err(|e| anyhow::anyhow!("解析监听地址 {} 失败: {}", addr, e))?;
+
+    let domain = if sock_addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+
+    // SO_REUSEADDR：允许立即复用处于 TIME_WAIT 的地址（原 tokio bind 默认行为，保持一致）。
+    socket.set_reuse_address(true)?;
+
+    #[cfg(unix)]
+    {
+        // SO_REUSEPORT：零空窗交接的关键。见函数文档。
+        socket.set_reuse_port(true)?;
+        tracing::info!(
+            "监听 {} 已开启 SO_REUSEPORT（支持零空窗热交接；注意同端口可并存多实例）",
+            addr
+        );
+    }
+
+    socket.set_nonblocking(true)?;
+    socket.bind(&sock_addr.into())?;
+    // backlog 取 1024：与 tokio 默认量级一致，突发连接不至于被内核丢弃。
+    socket.listen(1024)?;
+
+    let std_listener: std::net::TcpListener = socket.into();
+    Ok(tokio::net::TcpListener::from_std(std_listener)?)
+}
+
 /// 是否由托盘「退出」触发的停机（决定 main 的退出码：3=用户主动退出，监督脚本不重拉）。
 static TRAY_QUIT_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -700,8 +821,6 @@ static TRAY_QUIT_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::A
 /// 任一 sink 初始化失败都不致命——记录告警并退化（返回 None 或跳过该 sink），
 /// 保证统计侧故障绝不阻断主服务启动。
 fn init_usage_pipeline(config: &Config) -> Option<UsageHandles> {
-    use std::path::PathBuf;
-
     // 用量库目录：默认相对值 "data/usage" 在 Windows 数据隔离下前缀到 KiroStudio-data/，
     // 避免双击时按 cwd 散落。显式改成绝对/自定义路径的：尊重不动。非 Windows：保持原相对 cwd 语义。
     let data_dir = resolve_usage_data_dir(&config.usage_data_dir);
