@@ -129,6 +129,48 @@ export async function getRecoveryMetrics(): Promise<RecoveryMetrics> {
   return data
 }
 
+// ============ 外部凭据推送（import-stats）============
+// 对方系统按契约往 POST /api/import/keys 推 ksk_ 凭据，这里是该通道的可观测快照。
+// 进程级内存、重启归零；key 已在后端打码，明文密钥绝不出现在响应里。
+export interface ImportItemRecord {
+  /** 打码后的 key（如 ksk_Xwbz...SwBh），不可用于认证 */
+  key: string
+  ok: boolean
+  duplicate: boolean
+  credentialId?: number
+  error?: string
+}
+
+export interface ImportRecord {
+  atMs: number
+  total: number
+  imported: number
+  duplicates: number
+  failed: number
+  elapsedMs: number
+  items: ImportItemRecord[]
+  /** 明细超上限被省略的条数（失败项优先保留） */
+  omitted: number
+}
+
+export interface ImportStats {
+  /** 是否已配置 importApiKey 启用该通道 */
+  enabled: boolean
+  pushes: number
+  keysTotal: number
+  keysImported: number
+  keysDuplicate: number
+  keysFailed: number
+  lastAtMs?: number
+  /** 最近若干次推送，新的在前 */
+  records: ImportRecord[]
+}
+
+export async function getImportStats(): Promise<ImportStats> {
+  const { data } = await api.get<ImportStats>('/import-stats')
+  return data
+}
+
 // ============ 运维日志（内存环形缓冲）============
 export interface LogEntry {
   seq: number
