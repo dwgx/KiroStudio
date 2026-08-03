@@ -52,10 +52,7 @@ fn x_amz_user_agent(ctx: &RequestContext<'_>) -> String {
 fn user_agent(ctx: &RequestContext<'_>) -> String {
     format!(
         "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
-        ctx.config.system_version,
-        ctx.config.node_version,
-        ctx.config.kiro_version,
-        ctx.machine_id
+        ctx.config.system_version, ctx.config.node_version, ctx.config.kiro_version, ctx.machine_id
     )
 }
 
@@ -206,7 +203,10 @@ mod tests {
 
     #[test]
     fn test_fallback_order_starts_with_ide_and_has_no_dupes() {
-        assert_eq!(ENDPOINT_FALLBACK_ORDER[0], super::super::ide::IDE_ENDPOINT_NAME);
+        assert_eq!(
+            ENDPOINT_FALLBACK_ORDER[0],
+            super::super::ide::IDE_ENDPOINT_NAME
+        );
         let mut seen = ENDPOINT_FALLBACK_ORDER.to_vec();
         seen.sort_unstable();
         seen.dedup();

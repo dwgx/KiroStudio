@@ -518,9 +518,7 @@ impl KiroCredentials {
         // OIDC 端点 → clientId 跨 region 失配 → AWS 拒 → 网关 502(0.7.12 收口引入的回归)。故 IdC 号
         // **只同步 region(对话/余额),绝不碰 auth_region**。external_idp 的 auth_region 不参与刷新
         // (用微软 token_endpoint)、social 的走 kiro.dev,故仅 IdC 需此豁免。
-        if !self.is_idc_credential()
-            && self.auth_region.as_deref() != Some(arn_region.as_str())
-        {
+        if !self.is_idc_credential() && self.auth_region.as_deref() != Some(arn_region.as_str()) {
             self.auth_region = Some(arn_region.clone());
             changed = true;
         }
@@ -782,7 +780,10 @@ mod tests {
         .unwrap();
         assert!(c.allows_model("deepseek-3.2"), "白名单内应允许");
         assert!(c.allows_model("glm-5"));
-        assert!(!c.allows_model("claude-opus-4.8"), "白名单外的贵模型绝不允许(防溢出)");
+        assert!(
+            !c.allows_model("claude-opus-4.8"),
+            "白名单外的贵模型绝不允许(防溢出)"
+        );
         // 大小写不敏感
         assert!(c.allows_model("DeepSeek-3.2"));
     }
@@ -834,12 +835,21 @@ mod tests {
         let mut c = KiroCredentials::default();
         c.region = Some("us-east-1".to_string());
         c.auth_region = Some("us-east-1".to_string());
-        c.profile_arn =
-            Some("arn:aws:codewhisperer:eu-central-1:155119901513:profile/ACPYXKUPYE3H".to_string());
+        c.profile_arn = Some(
+            "arn:aws:codewhisperer:eu-central-1:155119901513:profile/ACPYXKUPYE3H".to_string(),
+        );
         let changed = c.sync_region_from_arn();
         assert!(changed, "region 不符时应发生修正");
-        assert_eq!(c.region.as_deref(), Some("eu-central-1"), "region 应被 ARN region 覆盖");
-        assert_eq!(c.auth_region.as_deref(), Some("eu-central-1"), "auth_region 同步");
+        assert_eq!(
+            c.region.as_deref(),
+            Some("eu-central-1"),
+            "region 应被 ARN region 覆盖"
+        );
+        assert_eq!(
+            c.auth_region.as_deref(),
+            Some("eu-central-1"),
+            "auth_region 同步"
+        );
     }
 
     #[test]
@@ -850,11 +860,14 @@ mod tests {
         c.auth_method = Some("idc".to_string());
         c.region = Some("us-east-1".to_string());
         c.auth_region = Some("us-east-1".to_string()); // = R_sso(SSO-OIDC 注册 region)
-        c.profile_arn =
-            Some("arn:aws:codewhisperer:eu-central-1:1:profile/X".to_string()); // R_arn 不同
+        c.profile_arn = Some("arn:aws:codewhisperer:eu-central-1:1:profile/X".to_string()); // R_arn 不同
         let changed = c.sync_region_from_arn();
         assert!(changed, "region 不符仍应同步(返回 true)");
-        assert_eq!(c.region.as_deref(), Some("eu-central-1"), "IdC 对话 region 应同步为 ARN region");
+        assert_eq!(
+            c.region.as_deref(),
+            Some("eu-central-1"),
+            "IdC 对话 region 应同步为 ARN region"
+        );
         assert_eq!(
             c.auth_region.as_deref(),
             Some("us-east-1"),
@@ -866,7 +879,11 @@ mod tests {
         c2.auth_region = Some("us-west-2".to_string());
         c2.profile_arn = Some("arn:aws:codewhisperer:eu-central-1:1:profile/X".to_string());
         c2.sync_region_from_arn();
-        assert_eq!(c2.auth_region.as_deref(), Some("us-west-2"), "builder-id 也豁免 auth_region");
+        assert_eq!(
+            c2.auth_region.as_deref(),
+            Some("us-west-2"),
+            "builder-id 也豁免 auth_region"
+        );
     }
 
     #[test]
@@ -882,13 +899,21 @@ mod tests {
         c2.region = Some("ap-southeast-1".to_string());
         c2.profile_arn = None;
         assert!(!c2.sync_region_from_arn());
-        assert_eq!(c2.region.as_deref(), Some("ap-southeast-1"), "无 ARN 不碰 region");
+        assert_eq!(
+            c2.region.as_deref(),
+            Some("ap-southeast-1"),
+            "无 ARN 不碰 region"
+        );
         // ARN region 非白名单 → 不动（不会把 region 改成垃圾值）
         let mut c3 = KiroCredentials::default();
         c3.region = Some("us-east-1".to_string());
         c3.profile_arn = Some("arn:aws:codewhisperer:not-a-region:1:profile/X".to_string());
         assert!(!c3.sync_region_from_arn());
-        assert_eq!(c3.region.as_deref(), Some("us-east-1"), "非法 ARN region 不覆盖");
+        assert_eq!(
+            c3.region.as_deref(),
+            Some("us-east-1"),
+            "非法 ARN region 不覆盖"
+        );
     }
 
     #[test]
@@ -991,8 +1016,7 @@ mod tests {
         c.region = Some("eu-central-1".to_string());
         assert_eq!(c.effective_upstream_region(&config), "eu-central-1");
         // profileArn 合法 → 优先用 ARN region（压过凭据 region）
-        c.profile_arn =
-            Some("arn:aws:codewhisperer:ap-northeast-1:1:profile/X".to_string());
+        c.profile_arn = Some("arn:aws:codewhisperer:ap-northeast-1:1:profile/X".to_string());
         assert_eq!(c.effective_upstream_region(&config), "ap-northeast-1");
     }
 
@@ -1628,11 +1652,20 @@ mod tests {
         // 注：租户 GUID 用占位假值（脱敏，不含真实账户标识）。
         let mut a = KiroCredentials::default();
         a.auth_method = Some("external_idp".to_string());
-        a.issuer_url = Some("https://login.microsoftonline.com/00000000-0000-0000-0000-000000000001/v2.0".to_string());
+        a.issuer_url = Some(
+            "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000001/v2.0"
+                .to_string(),
+        );
         let mut b = KiroCredentials::default();
         b.auth_method = Some("external_idp".to_string());
-        b.issuer_url = Some("https://login.microsoftonline.com/00000000-0000-0000-0000-000000000001/v2.0".to_string());
-        assert_eq!(a.family_key(53), "m365:00000000-0000-0000-0000-000000000001");
+        b.issuer_url = Some(
+            "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000001/v2.0"
+                .to_string(),
+        );
+        assert_eq!(
+            a.family_key(53),
+            "m365:00000000-0000-0000-0000-000000000001"
+        );
         assert_eq!(a.family_key(53), b.family_key(54), "同租户号必须同族键");
     }
 
@@ -1641,7 +1674,8 @@ mod tests {
         // issuer 缺失但有 profileArn → aws:{account}（AWS 账户号用占位假值，脱敏）
         let mut c = KiroCredentials::default();
         c.auth_method = Some("external_idp".to_string());
-        c.profile_arn = Some("arn:aws:codewhisperer:us-east-1:000000000000:profile/EXAMPLE".to_string());
+        c.profile_arn =
+            Some("arn:aws:codewhisperer:us-east-1:000000000000:profile/EXAMPLE".to_string());
         assert_eq!(c.family_key(53), "aws:000000000000");
     }
 

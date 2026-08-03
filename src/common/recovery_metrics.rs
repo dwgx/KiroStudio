@@ -11,8 +11,8 @@
 //! - **零成本**:全是 `AtomicU64::fetch_add(Relaxed)`,热路径可无脑调。
 //! - **单一真相源**:各处自愈事件只调 `bump_*`,`snapshot()` 一次性导出给端点。
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 /// at-rest 加密健康标志:true=最近一次凭据落盘符合加密开关预期(关→明文 / 开→真加密成功);
