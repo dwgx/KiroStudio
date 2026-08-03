@@ -1106,7 +1106,15 @@ function OpsAggregationCard({ onFocusLog }: { onFocusLog?: (term: string) => voi
                         </Button>
                       )}
                       {cleanable && (
-                        <Button variant="outline" size="sm" className="h-7 px-2 text-xs" onClick={() => setConfirm({ kind: 'cleanup', p })}>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-7 px-2 text-xs"
+                          onClick={() => setConfirm({ kind: 'cleanup', p })}
+                          // 与设置页同口径：分区已空时禁用，避免"点了清 0 项"被当成按钮坏了。
+                          disabled={p.items === 0}
+                          title={p.items === 0 ? t('opspage.storage.cleanEmpty') : undefined}
+                        >
                           <Trash className="mr-1 h-3 w-3" />
                           {t('opspage.storage.cleanup')}
                         </Button>
@@ -1187,10 +1195,17 @@ function OpsAggregationCard({ onFocusLog }: { onFocusLog?: (term: string) => voi
         onConfirm={() => {
           if (!cleanupTarget) return
           cleanup.mutate(
-            { target: cleanupTarget.key as StorageCleanupTarget },
+            {
+              target: cleanupTarget.key as StorageCleanupTarget,
+              // 与设置页同口径：无时间维度的分区（回收站 / 背景图池）显式请求全清。
+              // 不传的话后端按保留天数清，清不掉刚删除的条目 → 用户看到「共移除 0 项」。
+              purgeAll: cleanupSupportsDays ? undefined : true,
+            },
             {
               onSuccess: (resp) => {
-                toast.success(resp.message)
+                // note 带了「清了几条 / 为什么是 0 / 还剩几条」，比笼统 message 有用。
+                const note = resp.results.find((r) => r.key === cleanupTarget.key)?.note
+                toast.success(note ? `${resp.message}｜${note}` : resp.message)
                 setConfirm(null)
               },
               onError: () => toast.error(t('opspage.toast.cleanupFail')),
@@ -1207,6 +1222,11 @@ type LevelFilter = (typeof LEVEL_FILTERS)[number]
 
 // 前端日志缓冲上限（条）。与后端 ring 对齐（5000），覆盖更长排障/搜索窗口。
 const CLIENT_LOG_CAP = 5000
+
+// 一次铺进 DOM 的日志行数上限。缓冲仍是 CLIENT_LOG_CAP 条（搜索/过滤/导出都按全量走），
+// 只有**渲染**受此限制 —— 5000 行可展开的富文本节点全量 reconcile 会让页面卡死。
+// 200 条足够铺满 420px 视口若干屏，回溯更早的走「载入更早」按钮。
+const RENDER_WINDOW = 200
 
 // 级别过滤：entry 级别是否 ≥ 选定最低级别。
 function rankOk(entryLevel: string, minLevel: string): boolean {
@@ -1379,14 +1399,41 @@ function LogViewer({ focusToken = 0, focusTerm = '' }: { focusToken?: number; fo
 
   // 派生：按模块 + 关键字过滤后的可见日志（级别过滤已在拉取/流入口做）。
   const q = search.trim().toLowerCase()
-  const visibleLogs = logs.filter((e) => {
-    if (moduleFilter && e.target !== moduleFilter) return false
-    if (q && !e.message.toLowerCase().includes(q) && !e.target.toLowerCase().includes(q)) return false
-    return true
-  })
+
+  // ⚠️ 这两个派生值必须 memo：实时流每来一条日志就触发一次 rerender，而 logs 上限
+  // 5000 条。不 memo 的话每条新日志都要把 5000 条重新 filter 一遍、再建一次 Set
+  // 并排序，且是在渲染路径上同步做的 —— 这是「运维页点开日志就卡」的主因之一。
+  const visibleLogs = useMemo(
+    () =>
+      logs.filter((e) => {
+        if (moduleFilter && e.target !== moduleFilter) return false
+        if (q && !e.message.toLowerCase().includes(q) && !e.target.toLowerCase().includes(q)) return false
+        return true
+      }),
+    [logs, moduleFilter, q]
+  )
 
   // 已见模块（target）集合，供下拉过滤；按字母序稳定排列。
-  const modules = Array.from(new Set(logs.map((e) => e.target))).sort()
+  const modules = useMemo(() => Array.from(new Set(logs.map((e) => e.target))).sort(), [logs])
+
+  // 渲染窗口：只把**尾部** RENDER_WINDOW 条铺成 DOM。
+  //
+  // 为什么不做真正的定高虚拟滚动：日志行可点击展开看全文，行高不固定，按固定行高
+  // 算 scroll 偏移必然错位。而实时日志的实际用法是「看最新的那些」，配合下面的
+  // 「载入更早」按钮足够覆盖回溯需求，且完全不依赖高度估算。
+  //
+  // 不加窗口时 5000 条全量铺 DOM（每行还带展开态与高亮子节点），点开日志卡片即卡死。
+  const [renderLimit, setRenderLimit] = useState(RENDER_WINDOW)
+  // 过滤条件变化时重置窗口，否则换关键字后仍停在上次放大的窗口上。
+  useEffect(() => {
+    setRenderLimit(RENDER_WINDOW)
+  }, [moduleFilter, q, level])
+
+  const hiddenCount = Math.max(0, visibleLogs.length - renderLimit)
+  const renderedLogs = useMemo(
+    () => (hiddenCount > 0 ? visibleLogs.slice(hiddenCount) : visibleLogs),
+    [visibleLogs, hiddenCount]
+  )
 
   // 一键导出 JSONL：fetch 带鉴权 header → blob → 触发下载。
   const handleExport = async () => {
@@ -1516,15 +1563,34 @@ function LogViewer({ focusToken = 0, focusTerm = '' }: { focusToken?: number; fo
               description={logs.length === 0 ? undefined : t('opspage.log.noMatchDesc')}
             />
           ) : (
-            visibleLogs.map((e) => (
-              <LogRow
-                key={e.seq}
-                entry={e}
-                expanded={expandedSeq === e.seq}
-                onToggle={() => setExpandedSeq((prev) => (prev === e.seq ? null : e.seq))}
-                highlight={q}
-              />
-            ))
+            <>
+              {/* 被窗口挡在外面的更早日志：给出条数 + 一键放大窗口。
+                  它们仍在内存缓冲里（搜索、过滤、导出都按全量走），只是没铺成 DOM。 */}
+              {hiddenCount > 0 && (
+                <div className="mb-2 flex items-center justify-center gap-2 border-b border-[#2e2e2e] pb-2">
+                  <span className="text-[11px] text-muted-foreground tabular-nums">
+                    {t('opspage.log.hiddenEarlier', { n: hiddenCount })}
+                  </span>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-6 px-2 text-[11px]"
+                    onClick={() => setRenderLimit((n) => n + RENDER_WINDOW)}
+                  >
+                    {t('opspage.log.loadEarlier', { n: RENDER_WINDOW })}
+                  </Button>
+                </div>
+              )}
+              {renderedLogs.map((e) => (
+                <LogRow
+                  key={e.seq}
+                  entry={e}
+                  expanded={expandedSeq === e.seq}
+                  onToggle={() => setExpandedSeq((prev) => (prev === e.seq ? null : e.seq))}
+                  highlight={q}
+                />
+              ))}
+            </>
           )}
         </div>
       </CardContent>

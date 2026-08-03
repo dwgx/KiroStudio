@@ -13,7 +13,7 @@
 //! 原计数器上，永不泄漏、永不误伤其它号。
 
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -59,7 +59,7 @@ impl Drop for InflightGuard {
 /// 避免全部凭据饱和时清空可用池导致请求直接失败。
 pub struct RpmTracker {
     window: Duration,
-    hits: Mutex<HashMap<u64, Vec<Instant>>>,
+    hits: Mutex<HashMap<u64, VecDeque<Instant>>>,
 }
 
 impl Default for RpmTracker {
@@ -83,7 +83,7 @@ impl RpmTracker {
         let mut map = self.hits.lock();
         let v = map.entry(id).or_default();
         Self::prune(v, now, self.window);
-        v.push(now);
+        v.push_back(now);
     }
 
     /// 返回当前滚动窗口内的请求数
@@ -99,9 +99,54 @@ impl RpmTracker {
         }
     }
 
-    /// 剔除窗口外的过期时间戳
-    fn prune(v: &mut Vec<Instant>, now: Instant, window: Duration) {
-        v.retain(|t| now.duration_since(*t) < window);
+    /// 一次加锁批量读取多个凭据的窗口计数（选号热路径专用）。
+    ///
+    /// ## 为什么需要它
+    ///
+    /// 选号的排序键闭包对**每个候选**都要读 RPM，此前每次都单独调 [`Self::count`] →
+    /// 每候选一次独立加锁。43 号池实测一次选号至少 43 次加锁（排序键里读 2 次 +
+    /// 饱和判定 1 次，最坏 129 次），而这整段都在 `entries` 锁的临界区内 →
+    /// 1000 RPM（约 17 次选号/秒）下锁竞争与临界区时长被成倍放大。
+    ///
+    /// 改为一次加锁取回全部候选的计数，锁获取次数从 O(n) 降到 O(1)。
+    pub fn counts_for(&self, ids: &[u64]) -> std::collections::HashMap<u64, u32> {
+        let now = Instant::now();
+        let window = self.window;
+        let mut map = self.hits.lock();
+        let mut out = std::collections::HashMap::with_capacity(ids.len());
+        for &id in ids {
+            let n = match map.get_mut(&id) {
+                Some(v) => {
+                    Self::prune(v, now, window);
+                    v.len() as u32
+                }
+                None => 0,
+            };
+            out.insert(id, n);
+        }
+        out
+    }
+
+    /// 剔除窗口外的过期时间戳。
+    ///
+    /// ## 为什么用 `VecDeque` + 前端弹出，而不是 `Vec::retain`
+    ///
+    /// 时间戳是**单调递增**追加的（`record` 只在队尾 push），所以过期项必然是一段
+    /// 连续的前缀。`retain` 却要扫描**全部** w 个元素并做 O(w) 移动，而从队首弹出
+    /// 只需处理真正过期的那几个 —— 稳态下每次仅 0~1 个，摊还 O(1)。
+    ///
+    /// 规模差异（每号 200 RPM → w≈200，43 号池）：
+    ///   旧：单次选号 ≈ 43 候选 × 200 = 8600 次比较，1000 RPM 下每秒约 15 万次；
+    ///   新：稳态每次只弹出刚过期的那 1~2 个。
+    fn prune(v: &mut VecDeque<Instant>, now: Instant, window: Duration) {
+        while let Some(&front) = v.front() {
+            if now.duration_since(front) >= window {
+                v.pop_front();
+            } else {
+                // 单调递增 → 首个未过期即可停，后面的必然都在窗口内。
+                break;
+            }
+        }
     }
 
     /// 该号窗口内**最老命中**距今的时长(供 L4 背压估算"最短 RPM 恢复窗口":最老那条再过
@@ -111,7 +156,7 @@ impl RpmTracker {
         let mut map = self.hits.lock();
         let v = map.get_mut(&id)?;
         Self::prune(v, now, self.window);
-        v.first().map(|t| now.duration_since(*t))
+        v.front().map(|t| now.duration_since(*t))
     }
 
     /// 该号窗口长度(60s),供恢复窗口计算。
@@ -207,5 +252,69 @@ mod tests {
         // 全部过期且空 → map 应被清空
         assert_eq!(tracker.count(1), 0);
         assert_eq!(tracker.count(2), 0);
+    }
+
+    /// 批量读与逐个读必须完全等价（选号热路径用前者，观测/测试仍用后者）。
+    #[test]
+    fn test_counts_for_matches_individual_count() {
+        let tracker = RpmTracker::new();
+        for _ in 0..7 {
+            tracker.record(1);
+        }
+        for _ in 0..3 {
+            tracker.record(2);
+        }
+        // id=3 从未出现，必须返回 0 而不是缺键
+        let batch = tracker.counts_for(&[1, 2, 3]);
+        assert_eq!(batch.get(&1).copied(), Some(tracker.count(1)));
+        assert_eq!(batch.get(&2).copied(), Some(tracker.count(2)));
+        assert_eq!(batch.get(&3).copied(), Some(0), "未出现过的号必须返回 0");
+        assert_eq!(batch.len(), 3);
+    }
+
+    /// 批量读同样要剔除过期项（不能因为走了新路径就漏掉滑窗语义）。
+    #[test]
+    fn test_counts_for_prunes_expired() {
+        let tracker = RpmTracker {
+            window: Duration::from_millis(30),
+            hits: Mutex::new(HashMap::new()),
+        };
+        tracker.record(1);
+        tracker.record(2);
+        assert_eq!(tracker.counts_for(&[1, 2]).get(&1).copied(), Some(1));
+        std::thread::sleep(Duration::from_millis(50));
+        let batch = tracker.counts_for(&[1, 2]);
+        assert_eq!(batch.get(&1).copied(), Some(0), "过期项应被剔除");
+        assert_eq!(batch.get(&2).copied(), Some(0));
+    }
+
+    /// 回归（滑窗剔除必须是摊还 O(1) 而非每次全扫）：大量命中下 prune 只处理过期前缀。
+    ///
+    /// **旧实现为何有问题**：`hits` 是 `Vec<Instant>` 且 prune 用
+    /// `v.retain(|t| now - t < window)` —— 每次 record/count 都扫描**全部** w 个元素
+    /// 并做 O(w) 元素移动。而选号排序键对每个候选都要读 RPM，于是单次选号
+    /// ≈ O(n×w)：43 号池 × 每号 200 RPM ≈ 8600 次比较，1000 RPM（≈17 次选号/秒）
+    /// 下每秒约 15 万次，且全部串行在锁内。
+    ///
+    /// 时间戳是单调追加的，过期项必然是连续前缀，所以改用 `VecDeque` 从队首弹出，
+    /// 稳态下每次仅弹出刚过期的 0~2 个。本测试用一个**远大于**典型 w 的规模，
+    /// 断言全部读取能在明显低于"全扫"的时间内完成 —— 旧实现在同规模下会因
+    /// 反复全量 retain 而显著变慢。
+    #[test]
+    fn test_prune_is_amortized_not_full_scan() {
+        let tracker = RpmTracker::new(); // 60s 窗口，期间无项过期
+        const N: usize = 20_000;
+        let t0 = Instant::now();
+        for _ in 0..N {
+            tracker.record(1);
+        }
+        // 窗口内无过期 → 每次 prune 都应在检查队首后立即 break（O(1)）。
+        let elapsed = t0.elapsed();
+        assert_eq!(tracker.count(1), N as u32);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "{N} 次 record 耗时 {elapsed:?}：prune 应是摊还 O(1) 的队首弹出，\
+             而非每次 O(w) 全量 retain"
+        );
     }
 }

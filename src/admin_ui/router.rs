@@ -291,11 +291,25 @@ fn push_bg_to_pool(img: CachedBg, batch_epoch: u64) -> bool {
     true
 }
 
+/// 第三方 JSON 源响应体的体积上限。
+///
+/// 这些 URL 指向硬编码的第三方站（`NON_R18_SOURCES` 等），响应是**外部可控数据**。
+/// 原实现用 `r.json()` —— 无上限地把整个响应读进内存并解析。攻击面是该域名被劫持/DNS
+/// 投毒：返回一个 10GB 的 chunked JSON 就能把网关进程 OOM 掉，而预取任务每 12 分钟一轮常驻。
+///
+/// 注意同文件的**图片**那一跳早已有 10MiB 流式截断（见 `download_bg_bytes`）——
+/// 漏的正是 JSON 这一跳，是"每处各写一份"的典型漏改。现统一走
+/// [`crate::common::http_read::read_json_capped`]。
+///
+/// 1MiB：lolicon 的响应是几百字节的 URL 列表，1MiB 已是三个数量级的余量。
+const MAX_JSON_SOURCE_BYTES: u64 = 1024 * 1024;
+
 /// 从一个 Json 源(lolicon 格式)拿图片 URL 列表并逐张下载,返回成功存池的张数。
 /// `batch_epoch` 透传给 push_bg_to_pool 做代次校验;某张 push 被拒(代次变)即停止本源下载。
 async fn fetch_from_json_source(client: &reqwest::Client, url: &str, batch_epoch: u64) -> usize {
     let body: serde_json::Value = match client.get(url).send().await {
-        Ok(r) => match r.json().await {
+        // 带上限读取：第三方响应是外部可控数据，无上限的 r.json() 可被用来 OOM 网关。
+        Ok(r) => match crate::common::http_read::read_json_capped(r, "背景图 JSON 源", MAX_JSON_SOURCE_BYTES).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("背景图预取:解析 JSON 源响应失败: {}", e);
@@ -593,7 +607,8 @@ async fn random_bg_handler() -> impl IntoResponse {
         r18_param()
     );
     let body: serde_json::Value = match client.get(&api).send().await {
-        Ok(r) => match r.json().await {
+        // 同上：带上限读取（本端点匿名可达，更不能让外部响应决定内存占用）。
+        Ok(r) => match crate::common::http_read::read_json_capped(r, "背景图 JSON 源(直取)", MAX_JSON_SOURCE_BYTES).await {
             Ok(v) => v,
             Err(_) => return Json(serde_json::json!({"url": null})).into_response(),
         },

@@ -71,6 +71,28 @@ pub fn set_collect_client_fingerprint(enabled: bool) {
     COLLECT_CLIENT_FINGERPRINT.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// `trust_forwarded_header` 的进程级镜像（TIER3 热重载，与上面的指纹开关同款范式）。
+///
+/// # 修的是什么（已知问题 #6）
+///
+/// 这个配置项此前**只喂给 `SecurityState`**（`main.rs` 里），业务层 handler 拿不到它，
+/// 于是 handler 自己写了一份只看"对端是否私网"的近似判定 → 两层口径分叉。
+///
+/// 真实受害场景：反代在**公网** IP（CDN 直连 / 跨网段 LB）且管理员开了
+/// `trustForwardedHeader=true` 时，security 中间件按 XFF 最右段判定真实客户端，
+/// 而 handler 层退回 `peer` = 反代公网 IP → 业务层 IP 黑名单封的是**反代自己**
+/// （一封封掉全部用户）；且所有客户端共享同一个机器码，机器码黑名单同样一封封全部。
+///
+/// 默认 false，与 `Config::default()` 及线上刻意保持的值一致
+/// （sub2api 的透传白名单不转发 XFF，开了也拿不到真实 IP）。
+static TRUST_FORWARDED_HEADER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 设置是否信任转发头（供 main 启动接线 / admin 更新配置时立即生效调用）。
+pub fn set_trust_forwarded_header(enabled: bool) {
+    TRUST_FORWARDED_HEADER.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// IP 黑名单业务层镜像(ArcSwap 热更)。**与 security 中间件的黑名单互补**:
 /// 中间件用 TCP 对端 IP(反代后=反代内网 IP,拿不到真实客户端),而对话/记账路径的
 /// [`extract_client_ip`] 读 XFF/X-Real-IP 首段=**真实客户端 IP**。故在此业务层再判一次,
@@ -152,20 +174,21 @@ fn machine_code_is_blocked(code: &str) -> bool {
 /// - 对端是公网(客户端直连)→ 忽略可伪造的 XFF,直接用对端 IP;
 /// - 无头无对端 → None。
 /// 供封禁判定与「按机器」画像共用同一身份,保证展示 IP == 封禁 IP(不再回到最左伪造/双轨)。
+/// ⭐ 直接委托给 [`crate::common::security::client_ip_from_headers`] —— **一份判定逻辑，两层共用**。
+///
+/// 修复已知问题 #6：此处原先自己实现了一份近似判定（只看 `is_trusted_proxy_peer(peer)`），
+/// **完全没有读 `config.trust_forwarded_header`**，与 security 中间件的口径分叉。
+/// 分叉的代价见 [`TRUST_FORWARDED_HEADER`] 的说明（黑名单会封掉反代自己 = 全部用户）。
+///
+/// 保留本函数而不是让调用方直接调 common：调用点需要 `String`（用于黑名单比对与机器码派生），
+/// 而 common 返回 `IpAddr`；这层薄封装只做类型转换，不再持有任何判定逻辑。
 fn trusted_client_ip(
     headers: &axum::http::HeaderMap,
     peer: Option<std::net::SocketAddr>,
 ) -> Option<String> {
-    let peer_is_proxy = peer
-        .map(|p| crate::common::security::is_trusted_proxy_peer(p.ip()))
-        .unwrap_or(false);
-    // 对端是可信反代时才采信转发头(取最右,不可伪造);否则忽略 XFF 用对端。
-    if peer_is_proxy {
-        if let Some(ip) = extract_client_ip(headers) {
-            return Some(ip);
-        }
-    }
-    peer.map(|a| a.ip().to_string())
+    let trust = TRUST_FORWARDED_HEADER.load(std::sync::atomic::Ordering::Relaxed);
+    crate::common::security::client_ip_from_headers(headers, peer, trust)
+        .map(|ip| ip.to_string())
 }
 
 fn security_block_response(
@@ -241,6 +264,23 @@ pub fn set_cc_auto_buffer(enabled: bool) {
 
 fn cc_auto_buffer_enabled() -> bool {
     CC_AUTO_BUFFER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 是否把**估算的** prompt cache 记账下发给客户端（`promptCacheEnabled` 的进程镜像）。
+///
+/// 此前 `prompt_cache_enabled` 是**死配置**：全仓零读取点，而注入行为一直无条件发生
+/// ——用户显式写 `"promptCacheEnabled": false` 也照样注入，配置在说谎。这里把它接上。
+/// 默认 true 以保持既有可观测行为（详见 `config.rs` 的 `default_prompt_cache_enabled`）。
+static PROMPT_CACHE_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// 设置 prompt cache 记账下发开关（main 启动接线 / admin 热更调用，立即生效）。
+pub fn set_prompt_cache_enabled(enabled: bool) {
+    PROMPT_CACHE_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn prompt_cache_enabled() -> bool {
+    PROMPT_CACHE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 // ==================== 工具错误缓解开关（TIER3 进程镜像，admin 热更即时生效，默认全关）====================
@@ -454,8 +494,77 @@ struct TranslatedError {
     message: String,
 }
 
+/// 上游账户级限流的客户端退避建议秒数（`Retry-After` 头取值）。
+///
+/// 取值依据（2026-07-27 实测，5339 条请求样本）：上游 `USER_REQUEST_RATE_EXCEEDED` 是
+/// **状态型惩罚窗口**而非速率阈值——一旦触发就进入被罚态，窗口内继续打会持续被拒，
+/// 静置约 2 分钟自愈。「距上次 429 的间隔 → 新请求再被 429 的概率」实测衰减曲线：
+///   <1s 47.2% | 1-2s 35.7% | 2-3s 31.4% | 3-5s 26.8% | **5-8s 19.0%** | 12-20s 15.6%
+///   | 30-45s 12.3% | 60-120s 6.3% | >120s 0.9%（整体基线 13.3%）
+/// 取 8s：曲线上「命中率回落到接近基线」的拐点。再短退避无效（仍在高危档），
+/// 再长则白等吞吐。同期实测速率/并发/token 与 429 率的 spearman 仅 +0.09/-0.07/-0.02，
+/// 即**退避时长而非降低速率**才是有效手段。
+const UPSTREAM_RATE_LIMIT_RETRY_AFTER_SECS: u64 = 8;
+
+/// 是否为上游**账户级速率限流**（可重试，需退避）。
+///
+/// 判据（只匹配速率类，绝不吞配额类）：
+/// - `USER_REQUEST_RATE_EXCEEDED`：Kiro 账户级速率限流的 reason 码（实测当天 595 条）
+/// - `INSUFFICIENT_THROUGHPUT`：上游吞吐不足（`I am experiencing high traffic...`，实测 8 条）
+/// - `Too many requests`：兜底文案匹配，覆盖未来新增/变更的 reason 码
+///
+/// 刻意**不匹配** `MONTHLY_REQUEST_COUNT` / `QUOTA`：那是不可重试的月度配额耗尽，
+/// 虽同为 429 但不该带 `Retry-After`（要等下个计费周期，给秒数会诱导客户端反复砸死号）。
+fn is_upstream_rate_limited(err_str: &str) -> bool {
+    err_str.contains("USER_REQUEST_RATE_EXCEEDED")
+        || err_str.contains("INSUFFICIENT_THROUGHPUT")
+        || err_str.contains("Too many requests")
+}
+
+/// 上游 **403 账户级临时风控**（`temporarily is suspended`）。
+///
+/// # 为什么必须单独分类
+///
+/// 上游原文（实测）：
+/// ```text
+/// 403 Forbidden {"__type":"com.amazon.aws.codewhisperer#AccessDeniedException",
+///  "message":"Your User ID (450334904897) temporarily is suspended. ..."}
+/// ```
+///
+/// 这个串**匹配不上 `map_provider_error` 的任何分支**：无 `retry_after_secs=`、
+/// 无 `model_unsupported_by_pool=1`、不含 `USER_REQUEST_RATE_EXCEEDED` /
+/// `INSUFFICIENT_THROUGHPUT` / `Too many requests` / `MONTHLY_REQUEST_COUNT` / `QUOTA`，
+/// `is_transport_error` 也不认 → 落函数末尾兜底 → **502 且无 Retry-After**。
+///
+/// 而它是**限时态** —— 上游自己在文案里写了 `temporarily`，本仓也到处按限时态处理它
+/// （`cooldown.rs` 的 `SuspiciousActivity` 给 20s、`is_self_healable_reason` 把
+/// `SuspiciousActivityAuto` 列为可自愈、族级退避上限对齐 30min）。唯独**回给客户端时
+/// 表达成了永久性服务端故障**，客户端因此不退避、原样重发。
+///
+/// 线上实测量级：近 2 小时 `auth_failed` 占 **22.3%**（1485/6662），全部是这一种，
+/// 且呈**突发**形态（13:50 一次 928 条、14:50 一次 516 条，中间为 0）——
+/// 即典型的风控窗口开合，而非账号真被封。
+///
+/// # 判据为何要窄
+///
+/// 只匹配 `temporarily is suspended` / `TEMPORARILY_SUSPENDED`，**绝不**泛匹配
+/// `AccessDeniedException` 或裸 403：后者会把「账号真被永久封禁」也吞成可重试，
+/// 让客户端对一个永远不会恢复的号无限退避重试，同时把真实故障藏起来
+/// （与 `translate_quota_subscription` 刻意不吞配额类同理）。
+fn is_upstream_temporarily_suspended(err_str: &str) -> bool {
+    err_str.contains("temporarily is suspended") || err_str.contains("TEMPORARILY_SUSPENDED")
+}
+
+/// 403 临时风控的建议退避秒数。
+///
+/// 取 20 与 `cooldown.rs` 的 `CooldownReason::SuspiciousActivity`（20s）同源 ——
+/// 那是本仓对「这个状态持续多久」的既有判断，复用它而不是另立一个数字，
+/// 避免同一语义在两处各有一套时长。
+const UPSTREAM_SUSPENDED_RETRY_AFTER_SECS: u64 = 20;
+
 /// 把上游错误串翻译成带排障步骤的可读错误。命中已知类别返回 `Some`，未知返回 `None`（调用方透传）。
-/// 不处理需额外响应头的情形（429 + Retry-After 在 `map_provider_error` 单独处理）。
+/// 不处理需额外响应头的情形（429 + Retry-After 在 `map_provider_error` 单独处理，
+/// 含全池冷却与上游账户级限流两类）。
 fn translate_upstream_error(err_str: &str) -> Option<TranslatedError> {
     translate_quota_subscription(err_str)
         .or_else(|| translate_context_input(err_str))
@@ -598,6 +707,90 @@ fn map_provider_error(err: Error) -> Response {
             Json(ErrorResponse::new(
                 "rate_limit_error",
                 "All credentials are temporarily cooling down. Please retry after the indicated delay.",
+            )),
+        )
+            .into_response();
+    }
+
+    // 模型对本号池**永久**不可用（订阅档位不含 / 成本白名单未列）：映射成 404，**绝不带 Retry-After**。
+    //
+    // 为什么单列一条：号池里有可用号、只是没有一个支持这个模型 —— 这既不是"池子耗尽"(502)
+    // 也不是"稍后重试"(429)。给它 Retry-After 会让客户端（Claude Code）每 5 分钟重试一次
+    // 直到永远（等多久都不会变），那只是把 502 死循环换成 429 死循环。
+    //
+    // 用显式标记而非中文文案匹配：文案改动不该让分类失效（这正是"所有凭据均已禁用"落 502 的成因）。
+    if err_str.contains("model_unsupported_by_pool=1") {
+        tracing::warn!(error = %err, "请求的模型不被本号池支持（永久，重试无效），返回 404");
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "not_found_error",
+                "请求的模型不被当前号池支持（所有凭据的订阅档位或成本白名单均不含该模型）。这不是临时故障，重试无效：请换用号池支持的模型，或为凭据开通/放开该模型。",
+            )),
+        )
+            .into_response();
+    }
+
+    // 上游**账户级速率限流**：必须映射成 429 + Retry-After，绝不能落到下方兜底的 502。
+    //
+    // 🔴 修复的致命缺陷：此分支不存在时，上游 429 的错误串
+    // （`流式 API 请求失败: 429 Too Many Requests {...USER_REQUEST_RATE_EXCEEDED...}`）
+    // 匹配不上任何 translate_* 分支（translate_network 有 is_transport_error 闸门挡住），
+    // 于是落到本函数末尾的兜底 → 返回 502 BAD_GATEWAY 且无 Retry-After。
+    // 后果链（实测复现）：客户端（Claude Code）把 502 当「服务端故障」而非「太快了」，
+    // 其限流退避逻辑压根不启动 → 立刻原样重发 → 撞进上游惩罚窗口 → 又 502。
+    //
+    // 为什么放在此处而不是 translate_upstream_error 链里：该链的返回类型 TranslatedError
+    // 不携带响应头，而本分支的核心价值恰恰是 Retry-After 头（没有它客户端不会退避）。
+    // 与上方全池冷却分支同款处理，保持「需要额外响应头的情形都在本函数内联」的既有约定。
+    //
+    // 判据只匹配**速率**类，绝不吞配额类：MONTHLY_REQUEST_COUNT / QUOTA 是不可重试的月度
+    // 配额耗尽（要等下个计费周期），由下方 translate_quota_subscription 处理成不带
+    // Retry-After 的 429 —— 给配额耗尽发退避秒数会让客户端做无意义的短退避反复砸死号。
+    if is_upstream_rate_limited(&err_str) {
+        tracing::warn!(
+            error = %err,
+            retry_after_secs = UPSTREAM_RATE_LIMIT_RETRY_AFTER_SECS,
+            "上游账户级速率限流，返回 429 + Retry-After 让客户端退避（旧代码此处返 502 致客户端不退避）"
+        );
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(
+                header::RETRY_AFTER,
+                UPSTREAM_RATE_LIMIT_RETRY_AFTER_SECS.to_string(),
+            )],
+            Json(ErrorResponse::new(
+                "rate_limit_error",
+                "上游账户级速率限流（请求过于密集）。这是可重试的临时状态，请按 Retry-After 退避后重试。若持续出现：①降低客户端并发；②为号池补充更多凭据分摊速率；③面板『限流健康』确认是否单号承载了全部流量。",
+            )),
+        )
+            .into_response();
+    }
+
+    // 上游 **403 账户级临时风控**：映射成 429 + Retry-After，绝不落下方兜底的 502。
+    //
+    // 判据与理由见 `is_upstream_temporarily_suspended`。要点：上游文案自称 `temporarily`，
+    // 本仓各处也按限时态处理，但此前回给客户端的是 502（未识别兜底）→ 客户端把它当
+    // 服务端故障、退避逻辑不启动、原样重发。线上近 2h 占 **22.3%** 流量。
+    //
+    // 放在 `translate_upstream_error` **之前**：那条链的 `translate_quota_subscription`
+    // 会用 `QUOTA` 之类的宽判据先行命中一部分 403 文案，而配额类是**不可重试**的
+    // （不带 Retry-After）。临时风控必须拿到 Retry-After，故先判。
+    if is_upstream_temporarily_suspended(&err_str) {
+        tracing::warn!(
+            error = %err,
+            retry_after_secs = UPSTREAM_SUSPENDED_RETRY_AFTER_SECS,
+            "上游账户级临时风控（403 temporarily suspended），返回 429 + Retry-After（旧代码落 502 兜底致客户端不退避）"
+        );
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(
+                header::RETRY_AFTER,
+                UPSTREAM_SUSPENDED_RETRY_AFTER_SECS.to_string(),
+            )],
+            Json(ErrorResponse::new(
+                "rate_limit_error",
+                "上游账户级临时风控（账号被暂时限制，非永久封禁）。这是可恢复的限时状态，请按 Retry-After 退避后重试。若持续出现：①降低并发与请求密度；②为号池补充更多凭据分摊风控压力；③面板『限流健康』查看是否单号承载了全部流量。",
             )),
         )
             .into_response();
@@ -838,16 +1031,8 @@ pub async fn post_messages(
         payload.system.as_deref(),
         &payload.messages,
     );
-    let cache_breakdown: Option<CacheUsageBreakdown> = if prefix_tokens > 0 {
-        Some(CacheUsageBreakdown {
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: prefix_tokens.min(input_tokens),
-            cache_creation_5m_input_tokens: 0,
-            cache_creation_1h_input_tokens: 0,
-        })
-    } else {
-        None
-    };
+    let cache_breakdown =
+        estimate_cache_breakdown(prompt_cache_enabled(), prefix_tokens, input_tokens);
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -926,17 +1111,23 @@ async fn handle_stream_request(
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
 
+    // 响应头必须在第一个 chunk 之前定稿，故在建流前先读 ctx（消费 ctx 后就拿不到了）。
+    // 该头标注 SSE 里的 cache_* 数字是网关估算，见 CACHE_ESTIMATED_HEADER。
+    let cache_estimated = ctx.cache_usage.is_some();
+
     // 创建 SSE 流（流结束时用 meta + 最终 usage 埋点一条成功记录）
     let stream = create_sse_stream(provider, response, ctx, initial_events, meta, client);
 
     // 返回 SSE 响应
-    Response::builder()
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
-        .unwrap()
+        .header(header::CONNECTION, "keep-alive");
+    if cache_estimated {
+        builder = builder.header(CACHE_ESTIMATED_HEADER, CACHE_ESTIMATED_VALUE);
+    }
+    builder.body(Body::from_stream(stream)).unwrap()
 }
 
 /// 流结束时，用 provider 元数据 + StreamContext 最终 usage 埋点一条成功记录
@@ -954,12 +1145,21 @@ fn emit_stream_usage(
     record.credential_id = Some(meta.credential_id);
     record.session_id = meta.session_id.clone();
     record.is_streaming = meta.is_streaming;
+    // 注意：record.input_tokens 是 **gross 口径**（含 cache），与发给客户端的
+    // message_start/message_delta 里 billed 口径的同名字段不同源，详见 RequestRecord::input_tokens。
     record.input_tokens = usage.input_tokens;
     record.output_tokens = usage.output_tokens;
     record.cache_read_tokens = usage.cache_read_tokens;
     record.cache_creation_tokens = usage.cache_creation_tokens;
+    // cache 由本地前缀估算、input 优先取上游百分比反推，两者不同源 → 防御性收敛不变量。
+    record.clamp_cache_to_input();
     record.credits_used = usage.credits_used;
     record.latency_ms = meta.latency_ms;
+    // TTFB：与 latency_ms 同源起点（meta.started_at），故两者可直接相减得
+    // 「响应头 → 首 token」。无内容的响应（纯错误/空）保持 None → 落库 NULL。
+    record.first_token_ms = ctx
+        .first_token_at()
+        .map(|t| t.saturating_duration_since(meta.started_at).as_millis() as u64);
     record.retries = meta.retries;
     // 去硬编码 Success：按本次响应的真实完成状态记账，避免截断/上游错误被记成成功污染熔断信号。
     record.outcome = ctx.completion_outcome();
@@ -1159,6 +1359,89 @@ fn mark_invalid_tool_input(
     }
 }
 
+/// 标注响应里的 `cache_read_input_tokens` / `cache_creation_input_tokens` 是**网关估算**
+/// 而非上游真值的响应头。
+///
+/// 为什么需要：EXP-0 已实测确证上游 `metadataEvent` 只有 `stopReason`，从不回传
+/// `tokenUsage` / `cacheReadInputTokens`（见 `docs/CACHE-EXP0-RESULT.md`）。因此我们下发的
+/// 数字来自 `token::count_prefix_tokens` 的本地前缀估算 —— Claude Code 显示的
+/// 「缓存命中 N tokens」是我们算的，不是上游说的。
+///
+/// `docs/CACHE-RFC.md` 的 L2-1 曾建议**停止下发**，但那会让客户端缓存显示与面板统计
+/// 一起归零（一次没人要求的可观测性回退）。折中方案是继续下发 + 显式标注，
+/// 让需要分辨真伪的调用方有据可依，而不必去读源码或文档。
+///
+/// 只在**实际下发了** cache 字段时出现（`promptCacheEnabled=true` 且有前缀命中）；
+/// 字段缺失时不加，否则头与体自相矛盾。
+///
+/// 用自定义 `X-` 头而不是塞进 `usage` 对象：Anthropic 的 SDK 会对 usage 做结构化解析，
+/// 加未知字段有被严格校验拒绝的风险；而未知响应头对所有 HTTP 客户端都是安全可忽略的。
+pub(crate) const CACHE_ESTIMATED_HEADER: &str = "x-kirostudio-cache-estimated";
+
+/// [`CACHE_ESTIMATED_HEADER`] 的值。固定 `"true"` —— 该头存在即表示估算，
+/// 不存在即表示未下发 cache 字段，不需要 false 这个取值。
+pub(crate) const CACHE_ESTIMATED_VALUE: &str = "true";
+
+/// [`CACHE_ESTIMATED_VALUE`] 的 `HeaderValue` 形态（`headers_mut().insert` 需要它，
+/// 而 `Response::builder().header` 接受 `&str`，故两种形态都留着）。
+fn cache_estimated_header_value() -> axum::http::HeaderValue {
+    axum::http::HeaderValue::from_static(CACHE_ESTIMATED_VALUE)
+}
+
+/// 估算本次请求的 prompt cache 记账（供下发给客户端的 usage 字段）。
+///
+/// **这是本地估算，不是上游真值**：`docs/CACHE-EXP0-RESULT.md` 的 EXP-0 已实测确证上游
+/// `metadataEvent` 只有 `stopReason`，从不回传 `tokenUsage` / `cacheReadInputTokens`。
+/// 这里的 `cache_read_input_tokens` 就是 `count_prefix_tokens` 的前缀 token 估算值。
+///
+/// `enabled=false`（`promptCacheEnabled`）时返回 `None`，使**所有**下游注入点自然跳过
+/// ——注入点分散在 stream.rs 的五处，全部从 `cache_usage` 读，所以在源头收口比逐个加
+/// 判断更不容易漏。返回 `None` 而非 `Some(全 0)` 是刻意的：对 Anthropic 客户端来说
+/// `cache_read_input_tokens: 0` 表示"确实没命中"，字段缺失表示"本网关不做该记账"。
+///
+/// 两条路径（`/v1` 与 `/cc/v1`）此前各自内联一份完全相同的逻辑，收口到这里避免
+/// 「改了一处忘了另一处」——那会让开关在其中一条路径上静默失效。
+fn estimate_cache_breakdown(
+    enabled: bool,
+    prefix_tokens: i32,
+    input_tokens: i32,
+) -> Option<CacheUsageBreakdown> {
+    if !enabled || prefix_tokens <= 0 {
+        return None;
+    }
+    Some(CacheUsageBreakdown {
+        cache_creation_input_tokens: 0,
+        // 估算值按本地 count_all_tokens 收敛，防止前缀估算超过总输入。
+        cache_read_input_tokens: prefix_tokens.min(input_tokens),
+        cache_creation_5m_input_tokens: 0,
+        cache_creation_1h_input_tokens: 0,
+    })
+}
+
+/// 把影子缓存估算写入用量记录（None 视为无缓存命中 → 记 0）
+///
+/// 非流式路径没有 `StreamContext`，拿不到 `resolved_usage()`，只有原始的
+/// `Option<CacheUsageBreakdown>`。此处收口两个字段的赋值，保证落库数字与
+/// 返回给客户端的 `usage.cache_*` 同源（历史缺陷：埋点漏写这两列，
+/// 客户端显示 cache_read=12000 而面板恒 0）。
+///
+/// 写入后即收敛「cache ⊆ gross input」不变量：cache 来自本地前缀估算并按**本地**
+/// `count_all_tokens` 估算值 clamp，而 `record.input_tokens` 优先取 `contextUsageEvent`
+/// 百分比反推值，二者不同源；反推值偏小时会产出 `cache_read > input_tokens` 的矛盾记录。
+/// 故调用前请先设置好 `record.input_tokens`。
+fn apply_cache_breakdown(
+    record: &mut crate::usage::RequestRecord,
+    cache_breakdown: Option<CacheUsageBreakdown>,
+) {
+    let (read, creation) = match cache_breakdown {
+        Some(c) => (c.cache_read_input_tokens, c.cache_creation_input_tokens),
+        None => (0, 0),
+    };
+    record.cache_read_tokens = read;
+    record.cache_creation_tokens = creation;
+    record.clamp_cache_to_input();
+}
+
 /// 处理非流式请求
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
@@ -1201,6 +1484,9 @@ async fn handle_non_stream_request(
     }
 
     let mut text_content = String::new();
+    // E1：上游结构化 thinking 流（reasoningContentEvent）的累积。与正文分开攒 ——
+    // 混进 text_content 会让它被当成用户可见回答，而且下面的标签提取还会再解析一遍。
+    let mut reasoning_content = String::new();
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
@@ -1339,6 +1625,11 @@ async fn handle_non_stream_request(
                         Event::Metering(metering) => {
                             credits_used = Some(credits_used.unwrap_or(0.0) + metering.usage);
                         }
+                        // E1：结构化思考增量（纯 delta，直接追加）。此前落 `_ => {}` 被丢弃，
+                        // 非流式只能靠下方的 `<thinking>` 标签提取兜底。
+                        Event::ReasoningContent(r) => {
+                            reasoning_content.push_str(&r.text);
+                        }
                         Event::Exception { exception_type, message } => {
                             // 铁律：ContentLengthExceededException = max_tokens 干净收尾，绝不算失败。
                             if exception_type == "ContentLengthExceededException" {
@@ -1439,9 +1730,17 @@ async fn handle_non_stream_request(
     let mut content: Vec<serde_json::Value> = Vec::new();
 
     if thinking_enabled {
-        // 从完整文本中提取 thinking 块
-        let (thinking, remaining_text) =
+        // 从完整文本中提取 thinking 块（兜底路径：上游走内联 <thinking> 标签时用它）
+        let (sniffed_thinking, remaining_text) =
             super::stream::extract_thinking_from_complete_text(&text_content);
+
+        // E1：**优先用上游的结构化流**，标签嗅探仅在结构化流为空时兜底。
+        // 与生态实现同款优先级（Kiro-Go：`if thinking && reasoningOutput == "" && extracted != ""`）。
+        let thinking = if !reasoning_content.is_empty() {
+            Some(reasoning_content.clone())
+        } else {
+            sniffed_thinking
+        };
 
         if let Some(thinking_text) = thinking {
             // 补 signature 占位符：客户端 thinking 模式下本地校验 thinking 块必须带非空
@@ -1484,8 +1783,12 @@ async fn handle_non_stream_request(
         record.credential_id = Some(meta.credential_id);
         record.session_id = meta.session_id.clone();
         record.is_streaming = meta.is_streaming;
+        // gross 口径（含 cache）；下方返回客户端的 usage.input_tokens 才是 billed 口径。
         record.input_tokens = final_input_tokens;
         record.output_tokens = output_tokens;
+        // 与下方返回客户端的 usage.cache_* 同源，避免"客户端有值、面板恒 0"的矛盾数字。
+        // 必须在 input_tokens 赋值之后调用（内部要按 gross 收敛 cache 上限）。
+        apply_cache_breakdown(&mut record, cache_breakdown);
         record.credits_used = credits_used;
         record.latency_ms = meta.latency_ms;
         record.retries = meta.retries;
@@ -1517,6 +1820,9 @@ async fn handle_non_stream_request(
         usage["cache_creation_input_tokens"] = json!(c.cache_creation_input_tokens);
         usage["cache_read_input_tokens"] = json!(c.cache_read_input_tokens);
     }
+    // 是否需要标注「这些 cache 数字是网关估算」——仅在真的下发了字段时标，
+    // 否则响应头与响应体自相矛盾（见 CACHE_ESTIMATED_HEADER 的说明）。
+    let cache_estimated = cache_breakdown.is_some();
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -1530,7 +1836,12 @@ async fn handle_non_stream_request(
         "usage": usage
     });
 
-    (StatusCode::OK, Json(response_body)).into_response()
+    let mut resp = (StatusCode::OK, Json(response_body)).into_response();
+    if cache_estimated {
+        resp.headers_mut()
+            .insert(CACHE_ESTIMATED_HEADER, cache_estimated_header_value());
+    }
+    resp
 }
 
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
@@ -1718,16 +2029,8 @@ pub async fn post_messages_cc(
         payload.system.as_deref(),
         &payload.messages,
     );
-    let cache_breakdown: Option<CacheUsageBreakdown> = if prefix_tokens > 0 {
-        Some(CacheUsageBreakdown {
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: prefix_tokens.min(input_tokens),
-            cache_creation_5m_input_tokens: 0,
-            cache_creation_1h_input_tokens: 0,
-        })
-    } else {
-        None
-    };
+    let cache_breakdown =
+        estimate_cache_breakdown(prompt_cache_enabled(), prefix_tokens, input_tokens);
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -1820,17 +2123,23 @@ async fn handle_stream_request_buffered(
     // 注入影子缓存估算（finish_and_get_all_events 回补 message_start 时会携带 cache 字段）
     ctx.set_cache_usage(cache_breakdown);
 
+    // 响应头须在首个 chunk 前定稿，故在建流（消费 ctx）之前先取。
+    // 这条 buffered 路径是线上默认（ccAutoBuffer=true），标注不能只做在流式路径上。
+    let cache_estimated = cache_breakdown.is_some();
+
     // 创建缓冲 SSE 流（流结束时用 meta + 最终 usage 埋点）
     let stream = create_buffered_sse_stream(provider, response, ctx, meta, client);
 
     // 返回 SSE 响应
-    Response::builder()
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
-        .unwrap()
+        .header(header::CONNECTION, "keep-alive");
+    if cache_estimated {
+        builder = builder.header(CACHE_ESTIMATED_HEADER, CACHE_ESTIMATED_VALUE);
+    }
+    builder.body(Body::from_stream(stream)).unwrap()
 }
 
 /// 创建缓冲 SSE 事件流
@@ -1996,12 +2305,21 @@ fn emit_buffered_usage(
     record.credential_id = Some(meta.credential_id);
     record.session_id = meta.session_id.clone();
     record.is_streaming = meta.is_streaming;
+    // 同 emit_stream_usage：这里的 input_tokens 是 gross 口径（含 cache），
+    // 与 message_start 里 billed 口径的同名字段不是一回事。
     record.input_tokens = usage.input_tokens;
     record.output_tokens = usage.output_tokens;
     record.cache_read_tokens = usage.cache_read_tokens;
     record.cache_creation_tokens = usage.cache_creation_tokens;
+    // cache 由本地前缀估算、input 优先取上游百分比反推，两者不同源 → 防御性收敛不变量。
+    record.clamp_cache_to_input();
     record.credits_used = usage.credits_used;
     record.latency_ms = meta.latency_ms;
+    // TTFB：与 latency_ms 同源起点（meta.started_at），故两者可直接相减得
+    // 「响应头 → 首 token」。无内容的响应（纯错误/空）保持 None → 落库 NULL。
+    record.first_token_ms = ctx
+        .first_token_at()
+        .map(|t| t.saturating_duration_since(meta.started_at).as_millis() as u64);
     record.retries = meta.retries;
     // 去硬编码 Success：按真实完成状态记账（截断/上游错误不再被记成成功）。
     record.outcome = ctx.completion_outcome();
@@ -2011,6 +2329,161 @@ fn emit_buffered_usage(
     }
     client.apply(&mut record);
     crate::usage::emit_record(record);
+}
+
+#[cfg(test)]
+mod non_stream_cache_accounting_tests {
+    //! 非流式路径的 cache 记账：埋点必须与返回客户端的 usage.cache_* 同源。
+    //! 历史缺陷：埋点块漏写 cache_read_tokens/cache_creation_tokens，
+    //! 客户端拿到 cache_read=12000 而落库恒 0。
+    use super::*;
+
+    fn new_record() -> crate::usage::RequestRecord {
+        crate::usage::RequestRecord::new("req-1", "claude-sonnet-5")
+    }
+
+    #[test]
+    fn should_write_cache_read_and_creation_from_breakdown() {
+        let mut record = new_record();
+        // 契约：先设 gross input_tokens，再写 cache（apply 内部按 gross 收敛上限）
+        record.input_tokens = 20000;
+        apply_cache_breakdown(
+            &mut record,
+            Some(CacheUsageBreakdown {
+                cache_creation_input_tokens: 300,
+                cache_read_input_tokens: 12000,
+                cache_creation_5m_input_tokens: 300,
+                cache_creation_1h_input_tokens: 0,
+            }),
+        );
+        assert_eq!(record.cache_read_tokens, 12000, "cache_read 必须落库");
+        assert_eq!(record.cache_creation_tokens, 300, "cache_creation 必须落库");
+    }
+
+    #[test]
+    fn should_clamp_cache_read_to_gross_input_when_context_estimate_is_lower() {
+        // cache_read 由本地前缀估算并按本地 count_all_tokens clamp（=12000），
+        // 而落库 input_tokens 取 contextUsageEvent 百分比反推值（=5000）。
+        // 两者不同源，反推值偏小时会产出 cache_read > input_tokens 的矛盾记录。
+        let mut record = new_record();
+        record.input_tokens = 5000;
+        apply_cache_breakdown(
+            &mut record,
+            Some(CacheUsageBreakdown {
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 12000,
+                cache_creation_5m_input_tokens: 0,
+                cache_creation_1h_input_tokens: 0,
+            }),
+        );
+        assert_eq!(
+            record.cache_read_tokens, 5000,
+            "cache_read 不得超过 gross input_tokens"
+        );
+        assert_eq!(record.billed_input_tokens(), 0, "billed 不得为负");
+    }
+
+    /// `promptCacheEnabled=false` 必须让记账**整体缺失**（None），不是 Some(全 0)。
+    ///
+    /// 这个区别对客户端是实质性的：`cache_read_input_tokens: 0` 表示"确实一次都没命中"，
+    /// 字段缺失表示"本网关不做该记账"。注入 0 会把"未记账"误报成"缓存全未命中"。
+    #[test]
+    fn should_omit_cache_breakdown_entirely_when_disabled() {
+        assert!(
+            estimate_cache_breakdown(false, 12_000, 20_000).is_none(),
+            "关闭时必须返回 None（字段缺失），不能是 Some(0)"
+        );
+        // 开启且有前缀 → 正常记账
+        let on = estimate_cache_breakdown(true, 12_000, 20_000).expect("开启时应有记账");
+        assert_eq!(on.cache_read_input_tokens, 12_000);
+    }
+
+    /// 首轮请求（无历史前缀）在开启时也应为 None —— 没有可复用前缀就不该声称命中。
+    #[test]
+    fn should_omit_cache_breakdown_when_no_prefix_tokens() {
+        assert!(estimate_cache_breakdown(true, 0, 20_000).is_none());
+        assert!(estimate_cache_breakdown(true, -1, 20_000).is_none());
+    }
+
+    /// 标注头只在**真的下发了** cache 字段时出现，否则头与响应体自相矛盾。
+    ///
+    /// 三条响应路径（非流式 / 流式 SSE / buffered SSE）都用同一个判据
+    /// `cache_breakdown.is_some()` —— 与 estimate_cache_breakdown 的返回一致。
+    /// 这条测试守的是「判据同源」：只要下发条件变了，标注条件必须跟着变。
+    #[test]
+    fn should_mark_estimated_only_when_cache_fields_are_sent() {
+        // 开启且有前缀 → 下发字段 → 应标注
+        let sent = estimate_cache_breakdown(true, 12_000, 20_000);
+        assert!(sent.is_some(), "应下发 cache 字段");
+
+        // 开关关闭 → 不下发 → 不应标注
+        assert!(
+            estimate_cache_breakdown(false, 12_000, 20_000).is_none(),
+            "关闭时不下发，故不应加标注头"
+        );
+        // 首轮无前缀 → 不下发 → 不应标注
+        assert!(
+            estimate_cache_breakdown(true, 0, 20_000).is_none(),
+            "无前缀命中时不下发，故不应加标注头"
+        );
+    }
+
+    /// 头名与值必须是合法 HTTP 头（大小写、非法字符会在运行时 panic 而非编译期报错）。
+    #[test]
+    fn should_use_valid_lowercase_header_name_and_value() {
+        assert_eq!(
+            CACHE_ESTIMATED_HEADER,
+            CACHE_ESTIMATED_HEADER.to_ascii_lowercase(),
+            "HTTP/2 要求头名小写，写成大写会在某些客户端上出问题"
+        );
+        // from_static 对非法值会 panic —— 这里显式构造一次，把 panic 暴露在测试而非生产
+        let v = cache_estimated_header_value();
+        assert_eq!(v.to_str().unwrap(), "true");
+        assert!(
+            axum::http::HeaderName::try_from(CACHE_ESTIMATED_HEADER).is_ok(),
+            "头名必须是合法 HeaderName"
+        );
+    }
+
+    /// 前缀估算超过总输入时必须收敛到总输入（两个数字不同源，见 clamp_cache_to_input）。
+    #[test]
+    fn should_clamp_estimated_prefix_to_input_tokens() {
+        let c = estimate_cache_breakdown(true, 99_000, 4_000).expect("应有记账");
+        assert_eq!(
+            c.cache_read_input_tokens, 4_000,
+            "cache_read 不得超过本次输入总量"
+        );
+    }
+
+    #[test]
+    fn should_write_zero_when_no_cache_breakdown() {
+        let mut record = new_record();
+        record.cache_read_tokens = 999;
+        record.cache_creation_tokens = 999;
+        apply_cache_breakdown(&mut record, None);
+        assert_eq!(record.cache_read_tokens, 0, "首轮无前缀缓存应记 0");
+        assert_eq!(record.cache_creation_tokens, 0, "首轮无前缀缓存应记 0");
+    }
+
+    /// 源码级守卫：非流式成功埋点块必须调用 [`apply_cache_breakdown`]。
+    /// 纯单测覆盖不到 `handle_non_stream_request`（需真实上游 + `CallMeta`/`InflightGuard`），
+    /// 故用本文件源码断言把"埋点块漏写 cache 字段"这一具体回归钉死。
+    #[test]
+    fn should_call_apply_cache_breakdown_in_non_stream_emit_block() {
+        let src = include_str!("handlers.rs");
+        let block = src
+            .split("// 用量埋点：非流式成功记录")
+            .nth(1)
+            .expect("非流式成功埋点块的定位注释不应被删改");
+        let block = block
+            .split("crate::usage::emit_record(record);")
+            .next()
+            .expect("埋点块应以 emit_record 收尾");
+        assert!(
+            block.contains("apply_cache_breakdown(&mut record, cache_breakdown)"),
+            "非流式成功埋点块必须写入 cache 字段,否则落库与客户端 usage 矛盾"
+        );
+    }
 }
 
 /// 测试串行锁:IP/机器码黑名单是进程级全局静态(ArcSwap 镜像),多个测试并行读写会互相污染
@@ -2117,6 +2590,50 @@ mod machine_code_blocklist_tests {
         COLLECT_CLIENT_FINGERPRINT.store(saved, Ordering::Relaxed);
     }
 
+    /// 回归（已知问题 #6）：handler 层必须遵守 `trust_forwarded_header`。
+    ///
+    /// **旧代码为何 FAIL**：`trusted_client_ip` 自己实现了一份判定，只看
+    /// `is_trusted_proxy_peer(peer)`（对端是否私网/环回），**根本没有读**
+    /// `config.trust_forwarded_header` —— 该 flag 在 `main.rs` 里只喂给了 `SecurityState`。
+    /// 于是对端是**公网**反代时，无论开关开没开，handler 都退回 `peer`，
+    /// 本测试第二段断言（应取 XFF 最右段）必然 FAIL。
+    ///
+    /// 生产后果：反代在公网 IP（CDN 直连 / 跨网段 LB）且管理员开了 `trustForwardedHeader=true` 时，
+    /// security 中间件按 XFF 最右段判真实客户端，而业务层退回反代公网 IP →
+    /// **IP 黑名单实际封的是反代自己**，一封就封掉全部用户；且所有客户端共享同一个机器码，
+    /// 机器码黑名单同样一封封全部。
+    #[test]
+    fn test_trusted_client_ip_respects_trust_forwarded_header_config() {
+        use axum::http::HeaderMap;
+        use std::net::SocketAddr;
+
+        let _guard = BLOCKLIST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // 反代在**公网** IP —— 这是本缺陷唯一的受害场景（私网对端两种实现结果相同，测不出差异）。
+        let public_proxy: Option<SocketAddr> = Some("203.0.113.99:443".parse().unwrap());
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "1.2.3.4, 198.51.100.7".parse().unwrap());
+
+        // 开关关（默认）：忽略 XFF，用对端 —— 直连客户端伪造 XFF 时这是正确行为。
+        set_trust_forwarded_header(false);
+        assert_eq!(
+            trusted_client_ip(&h, public_proxy).as_deref(),
+            Some("203.0.113.99"),
+            "开关关闭时应忽略公网对端的 XFF（防伪造）"
+        );
+
+        // 开关开：应采信 XFF **最右**段（反代追加的、不可伪造的那段），与 security 中间件同口径。
+        set_trust_forwarded_header(true);
+        assert_eq!(
+            trusted_client_ip(&h, public_proxy).as_deref(),
+            Some("198.51.100.7"),
+            "开关开启时必须采信 XFF 最右段（旧代码无视该配置，恒返回反代 IP → 黑名单封掉反代自己）"
+        );
+
+        // 复位，避免污染同进程内其它测试（进程级 atomic 是全局状态）。
+        set_trust_forwarded_header(false);
+    }
+
     // A1 回归:业务层客户端 IP 取 XFF **最右**(不可伪造),客户端伪造的最左前缀不改变封禁。
     // A2 回归:对端是可信反代(私网)才采信 XFF;公网直连忽略伪造 XFF 用对端。
     #[test]
@@ -2172,6 +2689,185 @@ mod machine_code_blocklist_tests {
 mod error_translation_tests {
     //! 错误翻译层：已确证含义的上游错误 → 带排障步骤的可读错误；未知错误诚实透传（None）。
     use super::*;
+
+    /// ⭐ 致命缺陷回归（旧代码必失败）：上游账户级 429 曾被映射成 502 且无 Retry-After。
+    ///
+    /// 旧代码路径：该错误串匹配不上任何 translate_* 分支（translate_network 有
+    /// is_transport_error 闸门挡住）→ translate_upstream_error 返 None → map_provider_error
+    /// 落到兜底 → 502 BAD_GATEWAY。客户端（Claude Code）把 502 当服务故障、退避逻辑不启动、
+    /// 立刻重发 → 撞进上游惩罚窗口（实测窗口内命中率 47.2%）→ 单次拒绝被放大成
+    /// 最长 52min/431 次的持续发作（当天 3 个长发作占全部 429 的 84%）。
+    #[test]
+    fn test_upstream_429_maps_to_429_with_retry_after() {
+        // provider 实际组装的错误串原文（含 HTTP 状态码 + 上游 body）。
+        let raw = r#"流式 API 请求失败: 429 Too Many Requests {"message":"Too many requests, please wait before trying again.","reason":"USER_REQUEST_RATE_EXCEEDED"}"#;
+        let err = anyhow::Error::msg(raw);
+        let resp = map_provider_error(err);
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "上游速率限流必须映射成 429（旧代码返 502 → 客户端不退避）"
+        );
+        let hv = resp
+            .headers()
+            .get(header::RETRY_AFTER)
+            .expect("上游 429 必须带 Retry-After 头，否则客户端退避逻辑不启动");
+        assert_eq!(hv.to_str().unwrap(), "8");
+    }
+
+    /// ⭐ 致命缺陷回归（去掉 `retry_after_secs=` 标记即必失败）：**号池真耗尽**曾落 502 无 Retry-After。
+    ///
+    /// 与上面那条是同一类缺陷的不同实例。0.7.45 只修了情形②（模型硬门，加
+    /// `model_unsupported_by_pool=1` 标记），情形①「available == 0 真耗尽」当时未处理，
+    /// 而它才是量最大的那个：
+    ///
+    /// 线上 2026-08-03 01:55–02:10 号池被烧空的 15 分钟窗口里，`所有凭据均已禁用（0/0）`
+    /// 产生 2082 次，单个 5 分钟桶峰值 937 次 —— 且该窗口内**未识别兜底 502 全部是这一种**。
+    ///
+    /// 旧路径：该串既无 `retry_after_secs=`、也无 `model_unsupported_by_pool=1`、不含
+    /// QUOTA 等上游关键词、`is_transport_error` 也不认 → 逐条穿过所有分支 → 落
+    /// `map_provider_error` 末尾兜底 → 502 且无 Retry-After → 客户端不退避、原样重发。
+    ///
+    /// 为什么"真耗尽"该给退避而不是当永久故障：它**会自愈**（全池自愈实测 41 分钟触发 36 次），
+    /// 403 `TEMPORARILY_SUSPENDED` 本身也是限时态。
+    #[test]
+    fn test_pool_truly_exhausted_maps_to_429_with_retry_after_not_502() {
+        // token_manager 的两个 bail 点实际组装的错误串原文。
+        let err = anyhow::Error::msg("所有凭据均已禁用（0/0）retry_after_secs=10");
+        let resp = map_provider_error(err);
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "号池真耗尽必须映射成可重试的 429（旧代码落兜底 → 502 且无 Retry-After → \
+             客户端把它当服务故障、退避不启动、原样重发；实测 15 分钟内 2082 次）"
+        );
+        let hv = resp
+            .headers()
+            .get(header::RETRY_AFTER)
+            .expect("号池耗尽必须带 Retry-After，否则客户端退避逻辑不启动");
+        assert_eq!(hv.to_str().unwrap(), "10");
+    }
+
+    /// ⭐ 致命缺陷回归（去掉分类分支即 FAIL）：**403 账户级临时风控**曾落 502 无 Retry-After。
+    ///
+    /// 与「上游 429」「号池真耗尽」是同一类缺陷的第三个实例，也是**量最大**的一个：
+    /// 线上近 2 小时 `auth_failed` 占 **22.3%**（1485/6662），全部是这一种，
+    /// 且呈突发形态（13:50 一次 928 条、14:50 一次 516 条，中间为 0）= 风控窗口开合。
+    ///
+    /// 旧路径：该串不含任何已知关键词 → 逐条穿过所有分支 → 末尾兜底 502 无 Retry-After
+    /// → 客户端把限时风控当服务端故障、不退避、原样重发 → 加深上游风控判定。
+    #[test]
+    fn test_upstream_temporarily_suspended_maps_to_429_with_retry_after() {
+        // provider 实际组装的错误串原文（线上 traces.db 取出，账号 id 已改）。
+        let raw = r#"流式 API 请求失败: 403 Forbidden {"__type":"com.amazon.aws.codewhisperer#AccessDeniedException","message":"Your User ID (450334904897) temporarily is suspended. We've locked your account as a security precaution. To restore access, please contact our support team to verify your identity: https://aws.amazon.com/contact-us/"}"#;
+        let resp = map_provider_error(anyhow::Error::msg(raw));
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "403 临时风控必须映射成可重试的 429（旧代码落兜底 → 502 无 Retry-After → \
+             客户端不退避、原样重发；实测占 22.3% 流量）"
+        );
+        let hv = resp
+            .headers()
+            .get(header::RETRY_AFTER)
+            .expect("403 临时风控必须带 Retry-After，否则客户端退避逻辑不启动");
+        assert_eq!(hv.to_str().unwrap(), "20");
+    }
+
+    /// 边界：判据必须**窄** —— 不带 `temporarily` 的 403 不得被吞成可重试。
+    ///
+    /// 若泛匹配 `AccessDeniedException` 或裸 403，账号**真被永久封禁**时也会返回
+    /// 429 + Retry-After，客户端会对一个永远不会恢复的号无限退避重试，
+    /// 同时把真实故障藏起来。与 `translate_quota_subscription` 刻意不吞配额类同理。
+    #[test]
+    fn test_permanent_access_denied_is_not_absorbed_as_retryable() {
+        let raw = r#"流式 API 请求失败: 403 Forbidden {"__type":"com.amazon.aws.codewhisperer#AccessDeniedException","message":"Your account has been permanently disabled for violating the terms of service."}"#;
+        let resp = map_provider_error(anyhow::Error::msg(raw));
+        assert_ne!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "永久封禁不得被判成可重试的 429（会让客户端对死号无限重试并掩盖真实故障）"
+        );
+        assert!(
+            resp.headers().get(header::RETRY_AFTER).is_none(),
+            "永久封禁不该带 Retry-After"
+        );
+    }
+
+    /// 边界：坐实上面那条测的是**标记**而非中文文案 —— 不带标记的同款文案仍落 502 兜底。
+    ///
+    /// 这条的作用是防止将来有人"顺手"改成按 `所有凭据均已禁用` 文案匹配：那正是本类缺陷
+    /// 反复出现的成因（文案一改分类就失效）。它同时证明修复的承重点在 token_manager
+    /// 那两个 bail 串上，而不在本函数里。
+    #[test]
+    fn test_pool_exhausted_without_marker_still_falls_through_to_502() {
+        let err = anyhow::Error::msg("所有凭据均已禁用（0/0）");
+        let resp = map_provider_error(err);
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_GATEWAY,
+            "不带 retry_after_secs 标记时应仍落兜底 —— 说明分类判据是标记而非中文文案"
+        );
+    }
+
+    #[test]
+    fn test_insufficient_throughput_also_maps_to_429() {
+        // 另一种上游限流文案（实测 8 条）：high traffic / INSUFFICIENT_THROUGHPUT。
+        let raw = r#"流式 API 请求失败: 429 Too Many Requests {"message":"I am experiencing high traffic, please try again shortly.","reason":"INSUFFICIENT_THROUGHPUT"}"#;
+        let err = anyhow::Error::msg(raw);
+        let resp = map_provider_error(err);
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().get(header::RETRY_AFTER).is_some());
+    }
+
+    #[test]
+    fn test_quota_exhausted_stays_429_without_retry_after() {
+        // 边界：配额耗尽同为 429 但**不可重试**（要等下个计费周期）→ 绝不能带 Retry-After，
+        // 否则客户端会做无意义的 8s 退避后反复砸一个本月已无额度的号。
+        // 同时验证限流判据没有误吞它（is_upstream_rate_limited 不匹配 MONTHLY_REQUEST_COUNT）。
+        let err = anyhow::Error::msg("upstream: MONTHLY_REQUEST_COUNT limit reached");
+        let resp = map_provider_error(err);
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            resp.headers().get(header::RETRY_AFTER).is_none(),
+            "配额耗尽不该带 Retry-After（不可重试）"
+        );
+    }
+
+    #[test]
+    fn test_rate_limit_judgement_does_not_swallow_quota() {
+        // 判据单测：速率类命中、配额类不命中。防止后续有人放宽判据把配额也吞进来。
+        assert!(is_upstream_rate_limited(
+            r#"{"reason":"USER_REQUEST_RATE_EXCEEDED"}"#
+        ));
+        assert!(is_upstream_rate_limited(
+            r#"{"reason":"INSUFFICIENT_THROUGHPUT"}"#
+        ));
+        assert!(is_upstream_rate_limited("429 Too many requests"));
+        assert!(!is_upstream_rate_limited(
+            "upstream: MONTHLY_REQUEST_COUNT limit reached"
+        ));
+        assert!(!is_upstream_rate_limited("403 FEATURE_NOT_SUPPORTED"));
+        assert!(!is_upstream_rate_limited("CONTENT_LENGTH_EXCEEDS_THRESHOLD"));
+    }
+
+    #[test]
+    fn test_pool_cooling_retry_after_still_takes_precedence() {
+        // 零回归：全池冷却分支（带 retry_after_secs=N 标记）在限流判据之前，
+        // 其上游给定的精确秒数不该被本次新增的固定 8s 覆盖。
+        let err = anyhow::Error::msg("所有凭据均在冷却（1/5）retry_after_secs=14");
+        let resp = map_provider_error(err);
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers()
+                .get(header::RETRY_AFTER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "14",
+            "全池冷却的精确 retry_after 不该被固定 8s 覆盖"
+        );
+    }
 
     #[test]
     fn test_translate_quota_exhausted() {

@@ -60,6 +60,7 @@ import {
   BgCacheDetailDialog,
 } from '@/components/ops-detail-dialogs'
 import { Eye } from 'lucide-react'
+import { disabledReasonLabel } from '@/lib/i18n-labels'
 
 // 版本字段的常见预设（可点选，也可自定义输入）。与 Kiro IDE 实际发行的标识对齐，
 // 便于伪装成主流客户端指纹；不在列表里的值直接手敲即可。
@@ -444,6 +445,26 @@ function ReadonlyRow({ label, value, mono }: { label: string; value: React.React
   )
 }
 
+/* ============ 卡片级"数据过期"角标 ============ */
+// 子卡片后台刷新失败但仍有上次成功数据时，挂在标题旁的小角标。
+// 为什么不复用整块"加载失败"文案：那会把仍然有效的旧值整段抹掉；
+// 网关 502 期间数据本身没坏，只是停更了，让用户看到旧值 + 一个明确的"已过期"标记信息量更大。
+function StaleBadge({ updatedAt }: { updatedAt?: number }) {
+  const { t } = useTranslation()
+  return (
+    <span
+      className="inline-flex items-center gap-1 rounded-full bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium text-amber-500"
+      title={
+        updatedAt
+          ? `${t('common.stale.banner')} · ${t('common.stale.lastUpdated', { time: new Date(updatedAt).toLocaleTimeString() })}`
+          : t('common.stale.banner')
+      }
+    >
+      {t('common.stale.short')}
+    </span>
+  )
+}
+
 /* ============ 通用二次确认弹框 ============ */
 // 危险操作前的确认：标题 + 描述 + 可选额外内容（如保留天数输入），确认色可选危险红。
 // ConfirmDialog 已抽到 @/components/ui/confirm-dialog(供运维页共享),此处从该模块 import。
@@ -649,7 +670,16 @@ function StoragePartitionRow({
           </Button>
         )}
         {cleanable && (
-          <Button variant="outline" size="sm" onClick={() => onCleanup(p)}>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => onCleanup(p)}
+            // 分区已空时禁用：点了必然清 0 项，观感就是"按钮没反应"。
+            // 这正是用户反馈"背景图缓存无法清理"的由来——池空（后台 12 分钟补一次，
+            // 或 loginBackgroundEnabled 关着）时按钮可点但毫无效果。
+            disabled={p.items === 0}
+            title={p.items === 0 ? t('settingspage.storage.cleanEmpty') : undefined}
+          >
             <Trash className="mr-1 h-3.5 w-3.5" />
             {t('settingspage.common.clean')}
           </Button>
@@ -661,7 +691,7 @@ function StoragePartitionRow({
 
 function StorageStatsCard() {
   const { t } = useTranslation()
-  const { data, isLoading, error, refetch } = useStorageStats()
+  const { data, isLoading, error, refetch, dataUpdatedAt } = useStorageStats()
   const { mutate: cleanup, isPending } = useCleanupStorage()
 
   // 清理弹框状态：target 分区 + 可选保留天数（空=按配置默认保留期）
@@ -691,10 +721,16 @@ function StorageStatsCard() {
       {
         target: target.key as StorageCleanupTarget,
         olderThanDays: supportsDays && Number.isFinite(days) ? days : undefined,
+        // 无时间维度的分区（回收站 / 背景图池）必须显式请求全清：后端按天数清
+        // 清不掉刚删除的条目，而保留天数 0 在后端是「永久保留」而非「全清」。
+        // 历史缺陷正是这里——点清理只提示「共移除 0 项」，67 条回收站条目清不掉。
+        purgeAll: supportsDays ? undefined : true,
       },
       {
         onSuccess: (resp) => {
-          toast.success(resp.message)
+          // 后端 note 里带了「清了几条 / 为什么是 0 / 还剩几条」，比笼统的 message 有用。
+          const note = resp.results.find((r) => r.key === target.key)?.note
+          toast.success(note ? `${resp.message}｜${note}` : resp.message)
           setTarget(null)
         },
         onError: (err) => toast.error(extractErrorMessage(err)),
@@ -708,6 +744,7 @@ function StorageStatsCard() {
         <CardTitle className="text-base flex items-center gap-2">
           <Database className="h-4 w-4 text-muted-foreground" />
           <Highlight text={t('settingspage.card.storage')} />
+          {error && data && <StaleBadge updatedAt={dataUpdatedAt} />}
         </CardTitle>
         <Button variant="outline" size="sm" onClick={() => refetch()} disabled={isLoading}>
           {t('settingspage.common.refresh')}
@@ -720,7 +757,9 @@ function StorageStatsCard() {
             <Skeleton className="h-14 w-full" />
             <Skeleton className="h-14 w-full" />
           </div>
-        ) : error ? (
+        ) : error && !data ? (
+          // 有 data 时不走这条：v5 后台 refetch 失败会保留上次成功的 data，
+          // 用 error 单条件会把可用旧值换成一行报错。改由标题旁的过期角标提示。
           <div className="py-4 text-center text-sm text-red-400">
             {t('settingspage.storage.loadFail', { error: extractErrorMessage(error) })}
           </div>
@@ -852,7 +891,7 @@ function ClientRow({ c }: { c: ClientRpm }) {
 
 function ClientRpmCard() {
   const { t } = useTranslation()
-  const { data, isLoading, error, isFetching } = useUsageClients()
+  const { data, isLoading, error, isFetching, dataUpdatedAt } = useUsageClients()
 
   const totalRpm = useMemo(() => (data ?? []).reduce((s, c) => s + c.rpm, 0), [data])
   const totalWindows = useMemo(
@@ -867,6 +906,7 @@ function ClientRpmCard() {
           <Activity className="h-4 w-4 text-muted-foreground" />
           <Highlight text={t('settingspage.card.clientRpm')} />
           {isFetching && <Loader className="h-3.5 w-3.5 animate-spin text-muted-foreground" />}
+          {error && data && <StaleBadge updatedAt={dataUpdatedAt} />}
         </CardTitle>
         <span className="text-xs text-muted-foreground">{t('settingspage.clientRpm.refreshHint')}</span>
       </CardHeader>
@@ -883,7 +923,8 @@ function ClientRpmCard() {
             <Skeleton className="h-12 w-full" />
             <Skeleton className="h-12 w-full" />
           </div>
-        ) : error ? (
+        ) : error && !data ? (
+          // 同上：仅在连一份缓存都没有时才整块报错，否则渲染旧值 + 标题过期角标。
           <div className="py-4 text-center text-sm text-red-400">
             {t('settingspage.clientRpm.loadFail', { error: extractErrorMessage(error) })}
           </div>
@@ -948,7 +989,7 @@ function PrivacyCard() {
 /* ============ 5. 令牌导出：单个 / 全部凭据 JSON 下载 ============ */
 function TokenExportCard() {
   const { t } = useTranslation()
-  const { data: creds, isLoading, error, refetch } = useCredentials()
+  const { data: creds, isLoading, error, refetch, dataUpdatedAt } = useCredentials()
   // 记录正在导出的凭据 id（单个），以及“导出全部”进行中标志，避免重复点击。
   const [exportingId, setExportingId] = useState<number | null>(null)
   const [exportingAll, setExportingAll] = useState(false)
@@ -1040,6 +1081,7 @@ function TokenExportCard() {
         <CardTitle className="text-base flex items-center gap-2">
           <Download className="h-4 w-4 text-muted-foreground" />
           <Highlight text={t('settingspage.card.export')} />
+          {error && creds && <StaleBadge updatedAt={dataUpdatedAt} />}
         </CardTitle>
         <Button
           variant="outline"
@@ -1064,7 +1106,8 @@ function TokenExportCard() {
             <Skeleton className="h-10 w-full" />
             <Skeleton className="h-10 w-full" />
           </div>
-        ) : error ? (
+        ) : error && !creds ? (
+          // 同上：有缓存凭据列表时照常渲染，避免刷新失败就无法导出已有的号。
           <div className="py-3 text-center text-sm text-red-400">
             {t('settingspage.export.loadFail', { error: extractErrorMessage(error) })}
             <Button variant="outline" size="sm" className="ml-2" onClick={() => refetch()}>
@@ -1182,6 +1225,14 @@ function TrashRow({
             <span title={item.deletedAt}>{t('settingspage.trash.deletedAt', { when: timeAgo(item.deletedAt, t) })}</span>
             <span>·</span>
             <span>{t('settingspage.trash.successCount', { n: item.successCount })}</span>
+            {/* 删除前的死因：号被判死后往往紧接着被删，这是唯一还能看到原因的地方。
+                老回收站数据无此字段，不渲染（而非显示"未知"，避免与真·手动删除混淆）。 */}
+            {item.disabledReason && (
+              <>
+                <span>·</span>
+                <span title={item.disabledAt}>{disabledReasonLabel(item.disabledReason)}</span>
+              </>
+            )}
           </div>
         </div>
       </div>
@@ -1202,7 +1253,7 @@ function TrashRow({
 function TrashCard() {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
-  const { data, isLoading, error, refetch, isFetching } = useQuery({
+  const { data, isLoading, error, refetch, isFetching, dataUpdatedAt } = useQuery({
     queryKey: ['trash'],
     queryFn: listTrash,
     refetchInterval: 30000,
@@ -1300,6 +1351,7 @@ function TrashCard() {
           <Trash2 className="h-4 w-4 text-muted-foreground" />
           <Highlight text={t('settingspage.card.trash')} />
           {isFetching && <Loader className="h-3.5 w-3.5 animate-spin text-muted-foreground" />}
+          {error && data && <StaleBadge updatedAt={dataUpdatedAt} />}
         </CardTitle>
         <Button variant="outline" size="sm" onClick={() => refetch()} disabled={isLoading}>
           {t('settingspage.common.refresh')}
@@ -1318,7 +1370,8 @@ function TrashCard() {
             <Skeleton className="h-12 w-full" />
             <Skeleton className="h-12 w-full" />
           </div>
-        ) : error ? (
+        ) : error && !data ? (
+          // 同上：30s 轮询里一次 502 不该把回收站列表清空成一行报错（用户可能正在批量勾选）。
           <div className="py-4 text-center text-sm text-red-400">
             {t('settingspage.trash.loadFail', { error: extractErrorMessage(error) })}
             <Button variant="outline" size="sm" className="ml-2" onClick={() => refetch()}>
@@ -1602,13 +1655,33 @@ export function SettingsPage() {
     return <PageSkeleton kind="settings" />
   }
 
-  if (error || !config) {
+  // 只有"错了且没有任何缓存配置"才整页换错误卡。
+  // React Query v5 后台 refetch 失败会保留上一次成功的 config；原来的 `error || !config`
+  // 会在任意一次 502 时把可用缓存换成错误卡，用户正在编辑的设置页当场清屏。
+  // （!config 的兜底不必单列：上方 `isLoading || !form` 已经拦住了 config 尚未到手的首屏。）
+  if (error && !config) {
     return (
       <div className="flex items-center justify-center py-24">
         <Card className="w-full max-w-md">
           <CardContent className="pt-6 text-center">
             <div className="text-red-500 mb-4">{t('settingspage.page.loadFailed')}</div>
-            <p className="text-muted-foreground mb-4">{error ? (error as Error).message : t('settingspage.page.noData')}</p>
+            <p className="text-muted-foreground mb-4">{(error as Error).message}</p>
+            <Button onClick={() => refetch()}>{t('settingspage.common.retry')}</Button>
+          </CardContent>
+        </Card>
+      </div>
+    )
+  }
+
+  // form 存在即意味着 config 曾经到手（form 由 config 派生），但类型上仍是可空；
+  // 这里显式收口，下方几十处 config.xxx 才能非空访问。
+  if (!config) {
+    return (
+      <div className="flex items-center justify-center py-24">
+        <Card className="w-full max-w-md">
+          <CardContent className="pt-6 text-center">
+            <div className="text-red-500 mb-4">{t('settingspage.page.loadFailed')}</div>
+            <p className="text-muted-foreground mb-4">{t('settingspage.page.noData')}</p>
             <Button onClick={() => refetch()}>{t('settingspage.common.retry')}</Button>
           </CardContent>
         </Card>

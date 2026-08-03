@@ -84,14 +84,31 @@ pub struct Aggregate {
     pub success: u64,
     /// 失败数
     pub failure: u64,
-    /// 输入 tokens 累计
+    /// 输入 tokens 累计（**gross 口径**，见 [`RequestRecord::input_tokens`]，已含 cache 两项）
     pub input_tokens: i64,
     /// 输出 tokens 累计
     pub output_tokens: i64,
+    /// 缓存读取 tokens 累计（`cache_read_input_tokens`）。
+    ///
+    /// 是 [`Self::input_tokens`] 的**子集**，不是额外增量 —— 算「总输入」时不得再加它。
+    /// 用 i64 而 record 侧是 i32：单条上限 2^31，但累计上百万条会溢出 i32。
+    pub cache_read_tokens: i64,
+    /// 缓存新建 tokens 累计（`cache_creation_input_tokens`）。同样是 input 的子集。
+    pub cache_creation_tokens: i64,
     /// credits 累计（仅累加有值的记录）
     pub credits_used: f64,
     /// 延迟累计（毫秒，用于算平均）
     pub latency_sum_ms: u64,
+    /// TTFB 累计（毫秒）。**只累加有值的记录**，故必须配一个独立计数分母。
+    #[serde(default)]
+    pub first_token_sum_ms: u64,
+    /// 有 TTFB 值的记录数（分母）。
+    ///
+    /// 为什么不能用 `requests` 当分母：`first_token_ms` 是 `Option` ——
+    /// 非流式路径、纯错误响应、无内容响应都是 None。用 `requests` 平均会把这些
+    /// 当成 0ms 摊进去，系统性拉低平均值。
+    #[serde(default)]
+    pub first_token_count: u64,
 }
 
 impl Aggregate {
@@ -105,10 +122,18 @@ impl Aggregate {
         }
         self.input_tokens += r.input_tokens as i64;
         self.output_tokens += r.output_tokens as i64;
+        // 历史 JSONL 无这两个字段时 serde default 给 0，累加即无影响
+        self.cache_read_tokens += r.cache_read_tokens as i64;
+        self.cache_creation_tokens += r.cache_creation_tokens as i64;
         if let Some(c) = r.credits_used {
             self.credits_used += c;
         }
         self.latency_sum_ms += r.latency_ms;
+        // TTFB 只在有值时累加（见 first_token_count 的说明）
+        if let Some(ft) = r.first_token_ms {
+            self.first_token_sum_ms += ft;
+            self.first_token_count += 1;
+        }
     }
 
     /// 把另一个聚合并入本聚合（用于跨桶汇总）
@@ -118,8 +143,12 @@ impl Aggregate {
         self.failure += other.failure;
         self.input_tokens += other.input_tokens;
         self.output_tokens += other.output_tokens;
+        self.cache_read_tokens += other.cache_read_tokens;
+        self.cache_creation_tokens += other.cache_creation_tokens;
         self.credits_used += other.credits_used;
         self.latency_sum_ms += other.latency_sum_ms;
+        self.first_token_sum_ms += other.first_token_sum_ms;
+        self.first_token_count += other.first_token_count;
     }
 
     /// 成功率（0.0~1.0），无请求时为 0
@@ -137,6 +166,19 @@ impl Aggregate {
             0.0
         } else {
             self.latency_sum_ms as f64 / self.requests as f64
+        }
+    }
+
+    /// 平均 TTFB（毫秒）。**无有效样本时返回 None**（而非 0）。
+    ///
+    /// 返回 Option 而非 0 是刻意的：0ms 的 TTFB 在物理上不可能，把"没数据"显示成 0
+    /// 比显示"—"危险得多（看起来像"快到测不出"）。这与 overview-page 故障时显示 '—'
+    /// 而非 0 的既有约定一致。
+    pub fn avg_first_token_ms(&self) -> Option<f64> {
+        if self.first_token_count == 0 {
+            None
+        } else {
+            Some(self.first_token_sum_ms as f64 / self.first_token_count as f64)
         }
     }
 }
@@ -569,6 +611,37 @@ struct Inner {
 }
 
 impl Inner {
+    /// `by_model` 的模型名最大保留长度（超出即截断）。
+    ///
+    /// 模型名正常都在 40 字符内（目录里最长约 30）。128 留足余量，
+    /// 同时阻断"用超长字符串放大单条内存"这一路。
+    const MODEL_KEY_MAX_LEN: usize = 128;
+    /// `by_model` 的最大不同模型数。超过后新模型名一律归入 [`Self::MODEL_KEY_OTHER`]。
+    ///
+    /// 目录里的模型数是十几个量级，256 足以容纳"全部真实模型 + 少量历史遗留名"，
+    /// 又把无界增长封死在常数级。
+    const MODEL_KEY_CAP: usize = 256;
+    /// 超出 [`Self::MODEL_KEY_CAP`] 后的归并桶名。
+    const MODEL_KEY_OTHER: &'static str = "(other)";
+
+    /// 把模型名收敛成**有界**的 by_model key。
+    ///
+    /// 两道：① 超长截断（UTF-8 安全，按字符边界）；② 表满则归入 OTHER 桶。
+    /// 已存在的 key 永远直接命中（调用方先查 entry），所以真实模型一旦入表不会被挤进 OTHER。
+    fn normalize_model_key(model: &str, current_len: usize) -> String {
+        // 按**字符**截断而非字节，避免切裂多字节序列。
+        let truncated: String = if model.len() > Self::MODEL_KEY_MAX_LEN {
+            model.chars().take(Self::MODEL_KEY_MAX_LEN).collect()
+        } else {
+            model.to_string()
+        };
+        // current_len 是插入**前**的长度，故用 >= 判定。
+        if current_len >= Self::MODEL_KEY_CAP {
+            return Self::MODEL_KEY_OTHER.to_string();
+        }
+        truncated
+    }
+
     fn new() -> Self {
         Inner {
             hours: vec![TimeBucket::new(); HOUR_BUCKETS],
@@ -604,8 +677,29 @@ impl Inner {
         }
         db.agg.add(r);
 
-        // 按模型累计
-        self.by_model.entry(r.model.clone()).or_default().add(r);
+        // 按模型累计。
+        //
+        // 🔴 修复的缺陷：`by_model` 的 key 是**外部可控字符串**，而这张表**永不回收** ——
+        // `ClientAgg::prune` 只清 by_session / by_client / by_machine，不碰 by_model，
+        // 全仓也没有任何 retain / 上限。
+        //
+        // 可控性链路（逐跳确认）：`handlers.rs` 的 custom_api 透传在 `should_try_custom_api_first()`
+        // 为真时**先于** `convert_request` 执行，而它建 record 用的是
+        // `meta.model.unwrap_or_else(|| payload.model.clone())` —— 即客户端 JSON 里的**原始**
+        // model 字符串，从未过 `map_model` 校验（Kiro 主路径的 model 来自映射后的 kiro id，是受控的）。
+        //
+        // 后果：持有效 API key 的客户端用随机 model 名反复打 `/v1/messages`（服务端配了代挂号时），
+        // 每次都在 by_model 里多一个永久条目 → 内存单调增长，重启才清；更糟的是
+        // `rebuild_from_logs` 冷启动会把 30 天内 JSONL 里的全部脏 key **重放回内存**。
+        // 且 `GET /api/admin/usage/models` 会把整张表序列化返回，面板一并被拖垮。
+        // 实测：500 个随机 model 名 → 500 个条目，无任何回收。
+        //
+        // 修法是在**边界**收敛而非事后清理：超长名截断、表满则归入 OTHER 桶。
+        // 归桶而不是丢弃，是为了保住"总量守恒"——面板的模型分布仍能对上总请求数。
+        self.by_model
+            .entry(Self::normalize_model_key(&r.model, self.by_model.len()))
+            .or_default()
+            .add(r);
 
         // 按凭据累计 + 速率环
         let rate_slot = r.ts_ms.div_euclid(RATE_BUCKET_SECS * 1000);
@@ -636,12 +730,16 @@ pub struct WindowSummary {
     pub failure: u64,
     /// 成功率（0.0~1.0）
     pub success_rate: f64,
-    /// 输入 tokens 累计
+    /// 输入 tokens 累计（gross，已含 cache 两项）
     pub input_tokens: i64,
     /// 输出 tokens 累计
     pub output_tokens: i64,
     /// tokens 总计（输入+输出）
     pub total_tokens: i64,
+    /// 缓存读取 tokens 累计（是 [`Self::input_tokens`] 的子集，不可再加）
+    pub cache_read_tokens: i64,
+    /// 缓存新建 tokens 累计（同为 [`Self::input_tokens`] 的子集）
+    pub cache_creation_tokens: i64,
     /// credits 累计
     pub credits_used: f64,
     /// 平均延迟（毫秒）
@@ -658,6 +756,8 @@ impl From<Aggregate> for WindowSummary {
             input_tokens: a.input_tokens,
             output_tokens: a.output_tokens,
             total_tokens: a.input_tokens + a.output_tokens,
+            cache_read_tokens: a.cache_read_tokens,
+            cache_creation_tokens: a.cache_creation_tokens,
             credits_used: a.credits_used,
             avg_latency_ms: a.avg_latency_ms(),
         }
@@ -688,10 +788,14 @@ pub struct SeriesPoint {
     pub success: u64,
     /// 失败数
     pub failure: u64,
-    /// 输入 tokens
+    /// 输入 tokens（gross，已含 cache 两项）
     pub input_tokens: i64,
     /// 输出 tokens
     pub output_tokens: i64,
+    /// 缓存读取 tokens（是 [`Self::input_tokens`] 的子集，不可再加）
+    pub cache_read_tokens: i64,
+    /// 缓存新建 tokens（同为 [`Self::input_tokens`] 的子集）
+    pub cache_creation_tokens: i64,
     /// credits 累计
     pub credits_used: f64,
     /// 平均延迟（毫秒）
@@ -707,10 +811,14 @@ pub struct GroupStat {
     pub requests: u64,
     /// 成功率
     pub success_rate: f64,
-    /// 输入 tokens
+    /// 输入 tokens（gross，已含 cache 两项）
     pub input_tokens: i64,
     /// 输出 tokens
     pub output_tokens: i64,
+    /// 缓存读取 tokens（是 [`Self::input_tokens`] 的子集，不可再加）
+    pub cache_read_tokens: i64,
+    /// 缓存新建 tokens（同为 [`Self::input_tokens`] 的子集）
+    pub cache_creation_tokens: i64,
     /// credits 累计
     pub credits_used: f64,
     /// 平均延迟（毫秒）
@@ -725,6 +833,8 @@ impl GroupStat {
             success_rate: a.success_rate(),
             input_tokens: a.input_tokens,
             output_tokens: a.output_tokens,
+            cache_read_tokens: a.cache_read_tokens,
+            cache_creation_tokens: a.cache_creation_tokens,
             credits_used: a.credits_used,
             avg_latency_ms: a.avg_latency_ms(),
         }
@@ -1041,6 +1151,8 @@ impl UsageStats {
                 failure: agg.failure,
                 input_tokens: agg.input_tokens,
                 output_tokens: agg.output_tokens,
+                cache_read_tokens: agg.cache_read_tokens,
+                cache_creation_tokens: agg.cache_creation_tokens,
                 credits_used: agg.credits_used,
                 avg_latency_ms: agg.avg_latency_ms(),
             });
@@ -1075,6 +1187,8 @@ impl UsageStats {
                 failure: agg.failure,
                 input_tokens: agg.input_tokens,
                 output_tokens: agg.output_tokens,
+                cache_read_tokens: agg.cache_read_tokens,
+                cache_creation_tokens: agg.cache_creation_tokens,
                 credits_used: agg.credits_used,
                 avg_latency_ms: agg.avg_latency_ms(),
             });
@@ -1354,6 +1468,29 @@ mod tests {
         r.input_tokens = input;
         r.output_tokens = output;
         r.latency_ms = 100;
+        r
+    }
+
+    /// 同 [`rec`]，额外指定 cache 读取/新建 tokens（两者均为 input 的子集）
+    fn rec_cache(
+        offset_ms: i64,
+        cid: Option<u64>,
+        model: &str,
+        input: i32,
+        output: i32,
+        cache_read: i32,
+        cache_creation: i32,
+    ) -> RequestRecord {
+        let mut r = rec(
+            offset_ms,
+            cid,
+            model,
+            RequestOutcome::Success,
+            input,
+            output,
+        );
+        r.cache_read_tokens = cache_read;
+        r.cache_creation_tokens = cache_creation;
         r
     }
 
@@ -1735,6 +1872,147 @@ mod tests {
     }
 
     #[test]
+    fn should_accumulate_cache_tokens_in_all_overview_windows() {
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        // 同一小时两条：cache_read 12000+3000，cache_creation 500+0
+        s.on_record(&rec_cache(0, Some(1), "m", 20_000, 100, 12_000, 500));
+        s.on_record(&rec_cache(60_000, Some(1), "m", 5_000, 50, 3_000, 0));
+
+        let ov = s.overview_at(BASE_MS + 60_000);
+        for (name, w) in [
+            ("last_24h", &ov.last_24h),
+            ("last_7d", &ov.last_7d),
+            ("last_30d", &ov.last_30d),
+            ("all_time", &ov.all_time),
+        ] {
+            assert_eq!(w.cache_read_tokens, 15_000, "{name} cache_read 累计");
+            assert_eq!(w.cache_creation_tokens, 500, "{name} cache_creation 累计");
+            // cache 是 gross input 的子集：不得超过 input_tokens
+            assert_eq!(w.input_tokens, 25_000, "{name} input 保持 gross 口径");
+            assert!(
+                w.cache_read_tokens + w.cache_creation_tokens <= w.input_tokens,
+                "{name} cache 合计不得超过 gross input"
+            );
+            // total_tokens 口径不变（仍是 input+output，不因 cache 字段而变）
+            assert_eq!(w.total_tokens, 25_150, "{name} total_tokens 口径不变");
+        }
+    }
+
+    #[test]
+    fn should_expose_cache_tokens_in_hourly_and_daily_timeseries() {
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        s.on_record(&rec_cache(0, Some(1), "m", 1_000, 10, 800, 100));
+        s.on_record(&rec_cache(HOUR_MS, Some(1), "m", 2_000, 20, 1_500, 0));
+        s.on_record(&rec_cache(DAY_MS, Some(1), "m", 3_000, 30, 2_000, 200));
+
+        let hourly = s.timeseries_hourly_at(BASE_MS + HOUR_MS, 2);
+        assert_eq!(hourly[0].cache_read_tokens, 800);
+        assert_eq!(hourly[0].cache_creation_tokens, 100);
+        assert_eq!(hourly[1].cache_read_tokens, 1_500);
+        assert_eq!(hourly[1].cache_creation_tokens, 0);
+
+        let daily = s.timeseries_daily_at(BASE_MS + DAY_MS, 2);
+        assert_eq!(daily[0].cache_read_tokens, 2_300, "第一天两条合计");
+        assert_eq!(daily[0].cache_creation_tokens, 100);
+        assert_eq!(daily[1].cache_read_tokens, 2_000, "第二天一条");
+        assert_eq!(daily[1].cache_creation_tokens, 200);
+    }
+
+    #[test]
+    fn should_expose_cache_tokens_in_by_model_and_by_credential() {
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        s.on_record(&rec_cache(0, Some(1), "sonnet", 1_000, 10, 900, 50));
+        s.on_record(&rec_cache(1_000, Some(1), "sonnet", 1_000, 10, 600, 0));
+        s.on_record(&rec_cache(2_000, Some(2), "opus", 500, 5, 400, 20));
+
+        let models = s.by_model();
+        let sonnet = models.iter().find(|m| m.key == "sonnet").unwrap();
+        assert_eq!(sonnet.cache_read_tokens, 1_500);
+        assert_eq!(sonnet.cache_creation_tokens, 50);
+        let opus = models.iter().find(|m| m.key == "opus").unwrap();
+        assert_eq!(opus.cache_read_tokens, 400);
+        assert_eq!(opus.cache_creation_tokens, 20);
+
+        let creds = s.by_credential();
+        let c1 = creds.iter().find(|c| c.key == "1").unwrap();
+        assert_eq!(c1.cache_read_tokens, 1_500);
+        assert_eq!(c1.cache_creation_tokens, 50);
+        let c2 = creds.iter().find(|c| c.key == "2").unwrap();
+        assert_eq!(c2.cache_read_tokens, 400);
+        assert_eq!(c2.cache_creation_tokens, 20);
+    }
+
+    #[test]
+    fn should_keep_cache_totals_zero_for_legacy_records_without_cache() {
+        // 旧数据（cache 字段缺失 → serde default 0）灌进来后，各出口 cache 累计必须恒为 0，
+        // 且原有 requests/tokens 统计不受新字段影响。
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        s.on_record(&rec(0, Some(1), "m", RequestOutcome::Success, 10, 5));
+        s.on_record(&rec(1_000, Some(1), "m", RequestOutcome::RateLimited, 0, 0));
+
+        let ov = s.overview_at(BASE_MS + 1_000);
+        assert_eq!(ov.last_24h.requests, 2);
+        assert_eq!(ov.last_24h.input_tokens, 10);
+        assert_eq!(ov.last_24h.cache_read_tokens, 0);
+        assert_eq!(ov.last_24h.cache_creation_tokens, 0);
+        let point = s.timeseries_hourly_at(BASE_MS, 1);
+        assert_eq!(point[0].cache_read_tokens, 0);
+        assert_eq!(point[0].cache_creation_tokens, 0);
+        assert_eq!(s.by_model()[0].cache_read_tokens, 0);
+        assert_eq!(s.by_credential()[0].cache_creation_tokens, 0);
+    }
+
+    #[test]
+    fn should_reset_cache_totals_when_ring_bucket_is_reused() {
+        // 环形桶被新时间段复用时 cache 累计必须跟着清零，不能残留上一圈的数据
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        s.on_record(&rec_cache(0, Some(1), "m", 10_000, 10, 9_000, 500));
+        let ring_span = HOUR_BUCKETS as i64 * HOUR_MS;
+        s.on_record(&rec_cache(ring_span, Some(1), "m", 100, 1, 70, 0));
+
+        let series = s.timeseries_hourly_at(BASE_MS + ring_span, 1);
+        assert_eq!(series[0].cache_read_tokens, 70, "旧圈 cache 应已被覆盖");
+        assert_eq!(series[0].cache_creation_tokens, 0);
+    }
+
+    #[test]
+    fn should_restore_cache_totals_after_rebuild_from_jsonl() {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro_us_cache_rebuild_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        {
+            let s = UsageStats::new(dir.clone());
+            s.on_record(&rec_cache(0, Some(1), "m1", 1_000, 10, 800, 100));
+            s.on_record(&rec_cache(1_000, Some(1), "m1", 2_000, 20, 1_200, 0));
+        }
+        let s2 = UsageStats::new(dir.clone());
+        s2.rebuild_from_logs();
+        let ov = s2.overview_at(BASE_MS + 1_000);
+        assert_eq!(ov.last_24h.cache_read_tokens, 2_000);
+        assert_eq!(ov.last_24h.cache_creation_tokens, 100);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn should_serialize_cache_fields_in_snake_case() {
+        // 聚合出口沿用 snake_case（无 rename_all），前端按此字段名对接
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        s.on_record(&rec_cache(0, Some(1), "m", 1_000, 10, 800, 100));
+        let ov = serde_json::to_string(&s.overview_at(BASE_MS)).unwrap();
+        assert!(ov.contains("\"cache_read_tokens\":800"), "{ov}");
+        assert!(ov.contains("\"cache_creation_tokens\":100"), "{ov}");
+        let series = serde_json::to_string(&s.timeseries_hourly_at(BASE_MS, 1)).unwrap();
+        assert!(series.contains("\"cache_read_tokens\":800"), "{series}");
+        let models = serde_json::to_string(&s.by_model()).unwrap();
+        assert!(models.contains("\"cache_creation_tokens\":100"), "{models}");
+        let creds = serde_json::to_string(&s.by_credential()).unwrap();
+        assert!(creds.contains("\"cache_read_tokens\":800"), "{creds}");
+    }
+
+    #[test]
     fn test_jsonl_write_and_rebuild() {
         // 用唯一临时目录，落盘后新建实例重放，聚合应一致
         let dir = std::env::temp_dir().join(format!(
@@ -1907,6 +2185,35 @@ mod tests {
         assert_eq!(m.machine_code, machine_code("203.0.113.23"));
     }
 
+    /// TTFB 平均必须只按**有值样本**平均，且无样本时返回 None 而非 0。
+    ///
+    /// 为什么单独测：`first_token_ms` 是 Option（非流式/纯错误/无内容都是 None）。
+    /// 若用 `requests` 当分母，那些 None 会被当 0ms 摊进去 → 平均值系统性偏低；
+    /// 而返回 0 会让面板显示"0ms TTFB"（物理不可能，却看起来像"快到测不出"）。
+    #[test]
+    fn aggregate_averages_ttfb_over_valued_samples_only() {
+        let mut agg = Aggregate::default();
+        assert_eq!(agg.avg_first_token_ms(), None, "无样本应为 None，不是 0");
+
+        let mut r1 = RequestRecord::new("a", "m");
+        r1.latency_ms = 1000;
+        r1.first_token_ms = Some(200);
+        agg.add(&r1);
+
+        // 一条没有 TTFB 的记录（模拟非流式）：不得进分母
+        let mut r2 = RequestRecord::new("b", "m");
+        r2.latency_ms = 3000;
+        r2.first_token_ms = None;
+        agg.add(&r2);
+
+        assert_eq!(agg.requests, 2);
+        assert_eq!(
+            agg.avg_first_token_ms(),
+            Some(200.0),
+            "只有 1 条有 TTFB，平均应是 200 而非 100（用 requests 当分母就会得到 100）"
+        );
+    }
+
     #[test]
     fn test_machine_ip_codes_cover_every_roaming_ip() {
         // F1 回归:同一 session 漫游多 IP 会被粘滞合并成一台机器(主键=首个真实 IP)。
@@ -1948,6 +2255,61 @@ mod tests {
         let second_code = m.ip_codes.iter().find(|c| c.ip == "203.0.113.99").unwrap();
         assert_ne!(second_code.code, m.machine_code, "漫游第二 IP 的码应独立于主键码");
     }
+    /// 回归：`by_model` 对**外部可控**的模型名必须有界。
+    ///
+    /// **旧代码为何 FAIL**：`by_model` 的 key 直接用 `r.model`，而这张表**永不回收**
+    /// （`ClientAgg::prune` 只清 by_session/by_client/by_machine，全仓无 retain 也无上限）。
+    /// 实测 500 个随机 model 名 → **500 个永久条目**。
+    ///
+    /// 可控性链路：custom_api 透传在 `should_try_custom_api_first()` 为真时**先于**
+    /// `convert_request` 执行，其 record 用的是客户端 JSON 里的**原始** `payload.model`，
+    /// 从未过 `map_model` 校验（Kiro 主路径用映射后的 kiro id，受控）。
+    /// 于是持有效 key 的客户端可用随机 model 名把内存推到无界；
+    /// 且 `rebuild_from_logs` 冷启动会把 30 天 JSONL 里的脏 key **重放回内存**，
+    /// `GET /api/admin/usage/models` 还会把整张表序列化返回。
+    #[test]
+    fn by_model_is_bounded_against_arbitrary_model_names() {
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_bymodel_bounded"));
+        // 远超上限的不同模型名
+        for i in 0..(Inner::MODEL_KEY_CAP * 2) {
+            s.on_record(&rec(i as i64 * 10, Some(1), &format!("junk-model-{i}"), RequestOutcome::Success, 1, 1));
+        }
+        let models = s.by_model();
+        assert!(
+            models.len() <= Inner::MODEL_KEY_CAP + 1,
+            "by_model 无界增长：{} 个条目（上限 {} + OTHER 桶）",
+            models.len(),
+            Inner::MODEL_KEY_CAP
+        );
+        // 超限的都归入 OTHER 桶，总量守恒（面板的模型分布仍要对上总请求数）
+        let total: u64 = models.iter().map(|m| m.requests).sum();
+        assert_eq!(
+            total,
+            (Inner::MODEL_KEY_CAP * 2) as u64,
+            "归并不得丢请求数：模型分布之和必须等于总请求数"
+        );
+        assert!(
+            models.iter().any(|m| m.key == Inner::MODEL_KEY_OTHER),
+            "超限的模型名应归入 {} 桶而非被丢弃",
+            Inner::MODEL_KEY_OTHER
+        );
+    }
+
+    /// 回归：超长模型名必须被截断（阻断"用超长字符串放大单条内存"）。
+    #[test]
+    fn by_model_truncates_overlong_names() {
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_bymodel_trunc"));
+        let huge = "x".repeat(10_000);
+        s.on_record(&rec(0, Some(1), &huge, RequestOutcome::Success, 1, 1));
+        let models = s.by_model();
+        assert_eq!(models.len(), 1);
+        assert!(
+            models[0].key.chars().count() <= Inner::MODEL_KEY_MAX_LEN,
+            "模型名未截断：{} 字符",
+            models[0].key.chars().count()
+        );
+    }
+
 }
 
 

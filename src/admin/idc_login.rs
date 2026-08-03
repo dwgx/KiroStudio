@@ -188,6 +188,8 @@ impl IdcLoginManager {
                     proxy_username: session.custom_proxy.as_ref().and_then(|p| p.username.clone()),
                     proxy_password: session.custom_proxy.as_ref().and_then(|p| p.password.clone()),
                     disabled: false,
+                    disabled_reason: None,
+                    disabled_at: None,
                     kiro_api_key: None,
                     endpoint: None,
                 };

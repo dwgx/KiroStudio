@@ -32,10 +32,12 @@ import {
   useSetPriority,
   useSetRpmLimit,
   useSetCustomApiConfig,
+  useSetCredentialEndpoint,
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
   useCachedBalances,
+  useConfigSnapshot,
 } from '@/hooks/use-credentials'
 import { useCtrlHeld } from '@/hooks/use-ctrl-held'
 
@@ -153,6 +155,11 @@ export function CredentialCard({
   const setPriority = useSetPriority()
   const setRpmLimit = useSetRpmLimit()
   const setCustomApiConfig = useSetCustomApiConfig()
+  const setEndpoint = useSetCredentialEndpoint()
+  // 可选端点由后端注册表给出（config.endpointNames），不在前端硬编码 ide/cli——
+  // 后端加了新端点，面板自动多一个按钮。
+  const configSnapshot = useConfigSnapshot()
+  const endpointNames = configSnapshot.data?.endpointNames ?? []
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
@@ -301,6 +308,17 @@ export function CredentialCard({
     }
     setRpmLimit.mutate(
       { id: credential.id, rpmLimit: v },
+      {
+        onSuccess: (res) => toast.success(res.message),
+        onError: (err) => toast.error(t('credentialcard.toast.operationFailed') + (err as Error).message),
+      }
+    )
+  }
+
+  // endpoint=null → 清除固定，回到自动路由（ksk_ 号自动 cli）
+  const handleEndpointChange = (endpoint: string | null) => {
+    setEndpoint.mutate(
+      { id: credential.id, endpoint },
       {
         onSuccess: (res) => toast.success(res.message),
         onError: (err) => toast.error(t('credentialcard.toast.operationFailed') + (err as Error).message),
@@ -552,7 +570,23 @@ export function CredentialCard({
                     {credential.authMethod === 'api_key' ? 'API Key' : authShortLabel(credential.authMethod)}
                   </Badge>
                 )}
-                {credential.endpoint && <Badge variant="outline">{credential.endpoint}</Badge>}
+                {/* 端点徽标展示**实际生效**值；未被显式固定时加 "·auto" 后缀，
+                    让「系统替我选了 cli」与「我固定了 cli」一眼可辨。 */}
+                {credential.endpoint && (
+                  <Badge
+                    variant="outline"
+                    title={
+                      credential.endpointPinned
+                        ? t('credentialcard.endpoint.pinnedTitle', { name: credential.endpoint })
+                        : t('credentialcard.endpoint.autoTitle', { name: credential.endpoint })
+                    }
+                  >
+                    {credential.endpoint}
+                    {credential.endpointPinned === false && (
+                      <span className="ml-1 opacity-60">·auto</span>
+                    )}
+                  </Badge>
+                )}
               </CardTitle>
             </div>
             {/* 设置齿轮：集中优先级/启用/删除等操作，让卡片主体更干净 */}
@@ -1058,6 +1092,55 @@ export function CredentialCard({
                       <Check className="h-4 w-4" />
                     )}
                   </Button>
+                </div>
+              </div>
+              )}
+              {/* 端点切换：默认「自动」——ksk_ 号自动走 cli，其余回退全局默认。
+                  固定成具体端点是**救急旋钮**（上游协议变化时不改代码即可切）。
+                  custom_api 透传号不走 Kiro 端点体系，故隐藏。 */}
+              {!isCustomApi && (
+              <div className="space-y-1.5 sm:col-span-2">
+                <div className="text-sm font-medium">{t('credentialcard.settings.endpointLabel')}</div>
+                <div className="text-xs text-muted-foreground">
+                  {t('credentialcard.settings.endpointHint', {
+                    current: credential.endpoint,
+                    mode: credential.endpointPinned
+                      ? t('credentialcard.settings.endpointModePinned')
+                      : t('credentialcard.settings.endpointModeAuto'),
+                  })}
+                </div>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <Button
+                    size="sm"
+                    variant={credential.endpointPinned === false ? 'default' : 'outline'}
+                    className="h-9"
+                    onClick={() => handleEndpointChange(null)}
+                    disabled={setEndpoint.isPending || credential.endpointPinned === false}
+                    title={t('credentialcard.settings.endpointAutoTitle')}
+                  >
+                    {t('credentialcard.settings.endpointAuto')}
+                  </Button>
+                  {endpointNames.map((name) => (
+                    <Button
+                      key={name}
+                      size="sm"
+                      variant={
+                        credential.endpointPinned && credential.endpoint === name
+                          ? 'default'
+                          : 'outline'
+                      }
+                      className="h-9"
+                      onClick={() => handleEndpointChange(name)}
+                      disabled={
+                        setEndpoint.isPending ||
+                        (credential.endpointPinned === true && credential.endpoint === name)
+                      }
+                      title={t('credentialcard.settings.endpointPinTitle', { name })}
+                    >
+                      {name}
+                    </Button>
+                  ))}
+                  {setEndpoint.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
                 </div>
               </div>
               )}

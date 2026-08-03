@@ -390,6 +390,32 @@ pub struct SseEvent {
     pub data: serde_json::Value,
 }
 
+/// 判定一个 SSE 事件是否是「首 token」候选 —— 即**真实模型输出**的第一片。
+///
+/// 只认三种 delta：
+/// - `text_delta`（正文）、`thinking_delta`（思考）：必须**非空**。空 delta 是关块占位
+///   （见 `generate_final_events` 里补空 thinking_delta 的那几处），不代表有内容产出。
+/// - `input_json_delta`（工具参数）：工具调用本身就是输出，无需判空。
+///
+/// 明确**不算**首 token 的：`message_start` / `ping` / `content_block_start`
+/// （都不含模型输出，且 `message_start` 在流开始前就发了）、`signature_delta`
+/// （thinking 块的签名收尾，不是内容）。
+///
+/// 判空是刻意的保险：`create_text_delta_events` 自身无空串守卫且有 8 处调用方，
+/// 未逐一验证是否都传非空 —— 若某处传空，这里挡住，不会把空 delta 误当首 token。
+fn is_first_content_delta(e: &SseEvent) -> bool {
+    if e.event != "content_block_delta" {
+        return false;
+    }
+    let d = &e.data["delta"];
+    match d["type"].as_str() {
+        Some("text_delta") => !d["text"].as_str().unwrap_or("").is_empty(),
+        Some("thinking_delta") => !d["thinking"].as_str().unwrap_or("").is_empty(),
+        Some("input_json_delta") => true,
+        _ => false,
+    }
+}
+
 impl SseEvent {
     pub fn new(event: impl Into<String>, data: serde_json::Value) -> Self {
         Self {
@@ -702,15 +728,20 @@ use super::converter::get_context_window_size;
 /// 一次请求解析出的最终用量快照（供用量统计埋点消费）
 #[derive(Debug, Clone, Copy)]
 pub struct ResolvedUsage {
-    /// 输入 tokens（优先精确值，回退估算）
+    /// 输入 tokens —— **gross 口径**（含 cache 读写，优先 `contextUsageEvent` 精确值，回退估算）。
+    ///
+    /// ⚠ 与发给客户端的 `usage.input_tokens` 口径相反：响应体那个是 billed 口径
+    /// （已经 [`billed_input_tokens`] 剔除过 cache 读写，与 `cache_read_input_tokens` 互斥），
+    /// 本字段是**未剔除的全量**，落进 [`crate::usage::RequestRecord::input_tokens`] 也是 gross。
+    /// 消费方算「总输入」直接用本字段，**不可再加 `cache_read_tokens`**（会把缓存计两次）。
     pub input_tokens: i32,
     /// 输出 tokens
     pub output_tokens: i32,
     /// 上游返回的真实 credit 消耗量（无 meteringEvent 时为 None）
     pub credits_used: Option<f64>,
-    /// 本次命中缓存读取的 tokens（无缓存记账时为 0）
+    /// 本次命中缓存读取的 tokens（无缓存记账时为 0）。是 `input_tokens` 的子集，非增量。
     pub cache_read_tokens: i32,
-    /// 本次新建缓存写入的 tokens（无缓存记账时为 0）
+    /// 本次新建缓存写入的 tokens（无缓存记账时为 0）。是 `input_tokens` 的子集，非增量。
     pub cache_creation_tokens: i32,
 }
 
@@ -806,6 +837,27 @@ pub struct StreamContext {
     stray_inline_seen: u32,
     /// 重组容错总开关(config tool_reclaim_textified_invoke;默认开)。关=退回纯转发(原样吐文本)。
     reclaim_enabled: bool,
+    /// 首个**真实内容** delta 落定的时刻（TTFB 打点）。
+    ///
+    /// `None` = 本轮从未产生内容（纯错误 / 空响应）→ `first_token_ms` 落库 NULL，这是正确的。
+    /// 只认 text_delta / thinking_delta / input_json_delta；`message_start` / `ping` /
+    /// `content_block_start` / `signature_delta` / 关块用的空 delta 都不算首 token。
+    first_token_at: Option<std::time::Instant>,
+    /// 本轮是否出现过**结构化** reasoning 流（`reasoningContentEvent`）。
+    ///
+    /// # 为什么需要这个标志（E1 的关键约束）
+    ///
+    /// 结构化 reasoning 是**纯增量且没有终止帧** —— 上游不会告诉我们"思考结束了"。
+    /// 真实形态是：N 帧 `reasoningContentEvent`，紧接着 `assistantResponseEvent` 携带普通正文。
+    ///
+    /// 而文本嗅探路径的分支是 `else if self.in_thinking_block`：一旦结构化流开过 thinking 块，
+    /// 后续**不带任何标签**的正文就会落进那个分支，被当作思考内容发成 `thinking_delta`
+    /// → **用户可见的答案整段消失进思考面板**，且 `has_non_thinking_blocks()` 为 false 会让
+    /// 收尾把 stop_reason 置成 max_tokens、只吐一个空格文本块 = 客户端显示空答案。
+    ///
+    /// 所以两条路径必须**互斥**而不是共享状态：本标志置位后，首个非空正文 delta
+    /// 先关掉 reasoning 开的 thinking 块，再按普通文本走 —— 见 `process_assistant_response`。
+    reasoning_stream_seen: bool,
 }
 
 /// 泄漏 token 剥离的命中信息（诊断计数用，不影响剥离判据）。
@@ -885,6 +937,8 @@ impl StreamContext {
             stray_standalone_seen: 0,
             stray_inline_seen: 0,
             reclaim_enabled: super::handlers::tool_reclaim_textified_invoke_enabled(),
+            first_token_at: None,
+            reasoning_stream_seen: false,
         }
     }
 
@@ -970,11 +1024,40 @@ impl StreamContext {
         events
     }
 
-    /// 处理 Kiro 事件并转换为 Anthropic SSE 事件
+    /// 处理 Kiro 事件并转换为 Anthropic SSE 事件。
+    ///
+    /// 本函数是**唯一 choke point**：流式（handlers 的 SSE 循环）与 buffered
+    /// （`BufferedStreamContext::process_and_buffer`）都走它，故 TTFB 打点放这里
+    /// 一处即可覆盖两条路径，而不必在 4 个 delta 构造点分别插桩（易漏）。
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
+        let events = self.process_kiro_event_inner(event);
+        self.mark_first_token_if_content(&events);
+        events
+    }
+
+    /// 若本批事件含首个**真实内容** delta，则打点（幂等：只记第一次）。
+    fn mark_first_token_if_content(&mut self, events: &[SseEvent]) {
+        if self.first_token_at.is_some() {
+            return;
+        }
+        if events.iter().any(is_first_content_delta) {
+            self.first_token_at = Some(std::time::Instant::now());
+        }
+    }
+
+    /// 首个真实内容 delta 落定的时刻（供 handler 算 `first_token_ms`）。
+    pub fn first_token_at(&self) -> Option<std::time::Instant> {
+        self.first_token_at
+    }
+
+    fn process_kiro_event_inner(&mut self, event: &Event) -> Vec<SseEvent> {
         match event {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
+            // ⭐ E1：上游的**结构化** thinking 增量流。此前落 EventType::Unknown 被丢弃，
+            // 我们转而从正文里嗅探 `<thinking>` 标签把边界猜回来（见 process_thinking_content）。
+            // 现在直接用上游给的边界，不再猜。
+            Event::ReasoningContent(reasoning) => self.process_reasoning_content(&reasoning.text),
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
                 let window_size = get_context_window_size(&self.model);
@@ -1058,7 +1141,9 @@ impl StreamContext {
 
     /// 返回本次请求已解析出的最终用量（供统计埋点使用）
     ///
-    /// - `input_tokens` 优先用 contextUsageEvent 计算的精确值，回退到估算
+    /// - `input_tokens` 优先用 contextUsageEvent 计算的精确值，回退到估算；
+    ///   **gross 口径**（含 cache），与 message_start/message_delta 里发给客户端的
+    ///   billed 口径同名字段刻意不同，详见 [`ResolvedUsage::input_tokens`]
     /// - `output_tokens` 为流式累计
     /// - `credits_used` 为 meteringEvent 的真实计费量（可能为 None）
     pub fn resolved_usage(&self) -> ResolvedUsage {
@@ -1391,6 +1476,21 @@ impl StreamContext {
 
         // 如果启用了thinking，需要处理thinking块
         if self.thinking_enabled {
+            // ⭐ E1 关键约束：**结构化 reasoning 流与文本嗅探必须互斥**。
+            //
+            // 结构化 reasoning 无终止帧，真实形态是「N 帧 reasoning → 普通正文（无标签）」。
+            // 而嗅探路径的分支是 `else if self.in_thinking_block`：若 reasoning 已开过 thinking 块，
+            // 这段不带标签的正文会被当思考内容发成 thinking_delta →
+            // **用户可见答案整段消失进思考面板**，且 has_non_thinking_blocks()=false 会让收尾
+            // 把 stop_reason 置 max_tokens、只吐一个空格文本块 = 客户端显示空答案。
+            //
+            // 所以在这里先关掉 reasoning 开的块：首个非空正文 delta 即视为「思考结束」，
+            // 之后正文照常走 text_delta。thinking_extracted 置位使嗅探路径也不再重新开块。
+            if self.reasoning_stream_seen && self.in_thinking_block {
+                let mut events = self.close_reasoning_thinking_block();
+                events.extend(self.process_content_with_thinking(content));
+                return events;
+            }
             return self.process_content_with_thinking(content);
         }
 
@@ -1846,6 +1946,79 @@ impl StreamContext {
             return Vec::new();
         }
         self.drain_invoke_sniff_buffer(true)
+    }
+
+    /// 处理上游 `reasoningContentEvent` 的一帧结构化思考增量（E1）。
+    ///
+    /// # 与文本嗅探路径的关系
+    ///
+    /// 文本嗅探（`process_thinking_content` 里找 `<thinking>` 标签）**保留作兜底**不删：
+    /// 上游可能对某些模型仍走内联标签，两条路径都可能触发。因此两者**共用同一个**
+    /// `in_thinking_block` / `thinking_block_index` 状态 —— 这是"绝不重复开块"的保证：
+    /// 若嗅探路径已经开过 thinking 块，本函数直接往同一个 index 追加 delta。
+    ///
+    /// # 为什么不在这里关块
+    ///
+    /// 上游不发"思考结束"信号（`reasoningContentEvent` 是纯增量，没有终止帧），
+    /// 收尾统一由 `generate_final_events` 处理（它会补 signature_delta + content_block_stop）——
+    /// 与嗅探路径遇不到 `</thinking>` 时的收尾走同一条路，不新增第二套收尾逻辑。
+    fn process_reasoning_content(&mut self, text: &str) -> Vec<SseEvent> {
+        // thinking 未开启（客户端没要 thinking）→ 整帧丢弃。
+        // 不能当正文下发：那会把模型的内部推理混进用户可见回答里。
+        if !self.thinking_enabled {
+            return Vec::new();
+        }
+        if text.is_empty() {
+            return Vec::new();
+        }
+
+        // 标记本轮走过结构化流：供 process_assistant_response 判定「正文到来即关块」，
+        // 使两条路径互斥（否则正文会被当思考内容，答案消失）。
+        self.reasoning_stream_seen = true;
+
+        let mut events = Vec::new();
+        // 首帧才开块；若嗅探路径已开过，复用它的 index（不重复开块）。
+        if !self.in_thinking_block {
+            self.in_thinking_block = true;
+            let idx = self.state_manager.next_block_index();
+            self.thinking_block_index = Some(idx);
+            events.extend(self.state_manager.handle_content_block_start(
+                idx,
+                "thinking",
+                json!({
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": { "type": "thinking", "thinking": "" }
+                }),
+            ));
+        }
+
+        if let Some(idx) = self.thinking_block_index {
+            events.push(self.create_thinking_delta_event(idx, text));
+        }
+        events
+    }
+
+    /// 关闭由**结构化 reasoning 流**开启的 thinking 块（首个正文 delta 到来时调用）。
+    ///
+    /// 上游不发"思考结束"信号，所以以「首个非空 assistantResponse 正文」作为结束标志。
+    /// 收尾顺序与嗅探路径遇到 `</thinking>` 时一致：空 thinking_delta → signature_delta →
+    /// content_block_stop，保证客户端侧 thinking 块结构完整（Anthropic SDK 会校验 signature 非空）。
+    ///
+    /// 置 `thinking_extracted = true` 使嗅探路径此后不再重新开块（`process_content_with_thinking`
+    /// 的首个分支条件含 `!self.thinking_extracted`）。
+    fn close_reasoning_thinking_block(&mut self) -> Vec<SseEvent> {
+        let Some(idx) = self.thinking_block_index else {
+            self.in_thinking_block = false;
+            return Vec::new();
+        };
+        let mut events = Vec::new();
+        events.push(self.create_thinking_delta_event(idx, ""));
+        events.push(self.create_signature_delta_event(idx));
+        events.extend(self.state_manager.handle_content_block_stop(idx));
+        self.in_thinking_block = false;
+        self.thinking_extracted = true;
+        events
     }
 
     /// 创建 thinking_delta 事件
@@ -2345,6 +2518,14 @@ impl StreamContext {
             );
         }
 
+        // TTFB 兜底：整轮文本被 hold 在 invoke_sniff_buffer / dsml_tail_buffer / thinking_buffer
+        // 里、直到流末才 flush 的响应，其首个内容 delta 是在**本函数**产生的，不经过
+        // process_kiro_event 的打点。不补这一处，这批响应的 first_token_ms 会永远是 NULL，
+        // 等于把一个已知形态的缺陷藏进数据里。
+        // 注：此时的数值 ≈ 整轮耗时（因为内容确实是到最后才吐出来的），语义正确但与
+        // "TTFB 应该很小" 的直觉相反 —— 这反映的是真实用户体验，不是打点错误。
+        self.mark_first_token_if_content(&events);
+
         events
     }
 }
@@ -2412,6 +2593,15 @@ impl BufferedStreamContext {
     }
 
     /// 返回本次请求解析出的最终用量（供用量统计埋点使用）
+    /// 首个真实内容 delta 时刻（透传内部 StreamContext）。
+    ///
+    /// ⚠️ 语义：这是**上游首 token 到达网关**的时刻，**不是客户端看到的时刻** ——
+    /// buffered 分发把整轮憋到流末才吐，客户端观测到的 TTFB ≈ latency_ms 总值。
+    /// 两者的差正是 ccAutoBuffer 的代价，分开记录才能量化它。
+    pub fn first_token_at(&self) -> Option<std::time::Instant> {
+        self.inner.first_token_at()
+    }
+
     pub fn resolved_usage(&self) -> ResolvedUsage {
         self.inner.resolved_usage()
     }
@@ -3784,6 +3974,91 @@ pub(crate) fn merge_tool_input(buf: &str, frame: &str) -> String {
 }
 
 #[cfg(test)]
+mod usage_caliber_tests {
+    //! `input_tokens` 的**两个口径**：
+    //! - 发给客户端的 `usage.input_tokens` = billed（已剔除 cache，与 cache_read 互斥）
+    //! - 落进 `RequestRecord` 的 `input_tokens` = gross（含 cache，是 cache_read 的超集）
+    //!
+    //! 同名不同义，零注释时极易被下游当同一口径而把 cache 计两次。此处把契约钉死：
+    //! 谁改动其中一侧的口径，本模块必失败。
+    use super::*;
+
+    fn ctx_with_cache(input_tokens: i32, cache_read: i32, cache_creation: i32) -> StreamContext {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-sonnet-5",
+            input_tokens,
+            false,
+            HashMap::new(),
+        );
+        ctx.set_cache_usage(Some(CacheUsageBreakdown {
+            cache_creation_input_tokens: cache_creation,
+            cache_read_input_tokens: cache_read,
+            cache_creation_5m_input_tokens: cache_creation,
+            cache_creation_1h_input_tokens: 0,
+        }));
+        ctx
+    }
+
+    #[test]
+    fn should_report_gross_input_to_record_and_billed_to_client() {
+        let ctx = ctx_with_cache(12_500, 12_000, 300);
+
+        // 客户端侧：billed 口径（12500 - 300 - 12000 = 200）
+        let msg_start = ctx.create_message_start_event();
+        assert_eq!(msg_start["message"]["usage"]["input_tokens"], 200);
+        assert_eq!(msg_start["message"]["usage"]["cache_read_input_tokens"], 12_000);
+
+        // 统计侧：gross 口径（未剔除 cache）
+        let usage = ctx.resolved_usage();
+        assert_eq!(
+            usage.input_tokens, 12_500,
+            "ResolvedUsage.input_tokens 必须是 gross，改成 billed 会让历史统计数据断裂"
+        );
+        assert_eq!(usage.cache_read_tokens, 12_000);
+        assert_eq!(usage.cache_creation_tokens, 300);
+    }
+
+    #[test]
+    fn should_keep_gross_input_as_superset_of_cache_in_record() {
+        // 落库后：cache 是 input 的子集，消费方直接用 input_tokens 即为总输入
+        let ctx = ctx_with_cache(12_500, 12_000, 300);
+        let usage = ctx.resolved_usage();
+        let mut record = crate::usage::RequestRecord::new("req-caliber", "claude-sonnet-5");
+        record.input_tokens = usage.input_tokens;
+        record.cache_read_tokens = usage.cache_read_tokens;
+        record.cache_creation_tokens = usage.cache_creation_tokens;
+        record.clamp_cache_to_input();
+
+        assert!(
+            record.cache_read_tokens + record.cache_creation_tokens <= record.input_tokens,
+            "cache 必须是 gross input 的子集"
+        );
+        // 还原客户端口径应与 message_start 一致
+        assert_eq!(
+            record.billed_input_tokens(),
+            ctx.create_message_start_event()["message"]["usage"]["input_tokens"]
+                .as_i64()
+                .unwrap() as i32
+        );
+    }
+
+    #[test]
+    fn should_prefer_context_usage_over_estimate_for_gross_input() {
+        // resolved_usage 优先上游反推值；这正是它与 cache（本地估算）不同源的根因
+        let mut ctx = ctx_with_cache(10_000, 9_000, 0);
+        ctx.context_input_tokens = Some(4_000);
+        assert_eq!(ctx.resolved_usage().input_tokens, 4_000);
+        // 此时 cache_read(9000) > input(4000) → 落库前必须收敛，否则面板出现矛盾数字
+        let usage = ctx.resolved_usage();
+        let mut record = crate::usage::RequestRecord::new("req-mismatch", "claude-sonnet-5");
+        record.input_tokens = usage.input_tokens;
+        record.cache_read_tokens = usage.cache_read_tokens;
+        record.clamp_cache_to_input();
+        assert_eq!(record.cache_read_tokens, 4_000);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -4129,6 +4404,201 @@ mod tests {
 
     fn mk_ctx() -> StreamContext {
         StreamContext::new_with_thinking("deepseek", 10, false, HashMap::new())
+    }
+
+    /// 回归：TTFB 打点必须在**首个真实内容 delta** 落定时发生，且只记第一次。
+    ///
+    /// **旧代码为何 FAIL**：`first_token_ms` 全仓 **0 个生产赋值点**，线上 traces.db
+    /// 24 小时 59458 条该列**全 NULL** —— 所有延迟分析失效，并且它阻塞了
+    /// 「用量/额度动态刷新」与缓存实验两条线（都需要能分解端到端延迟）。
+    /// 旧代码下 `first_token_at()` 恒为 None，第二个断言必然 FAIL。
+    #[test]
+    fn first_token_is_marked_on_first_real_content_delta_only() {
+        let mut ctx = mk_thinking_ctx();
+        assert!(ctx.first_token_at().is_none(), "初始未产出内容，不该有打点");
+
+        // 首个真实内容（thinking_delta）→ 应打点
+        ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent { text: "思考".into() },
+        ));
+        let first = ctx.first_token_at().expect("首个真实内容 delta 后必须有打点");
+
+        // 再来内容 → 打点**不得**被刷新（TTFB 是"第一次"，不是"最后一次"）
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent { text: "更多思考".into() },
+        ));
+        assert_eq!(
+            ctx.first_token_at(),
+            Some(first),
+            "打点必须幂等：后续内容不得覆盖首 token 时刻，否则测的是最后一片而非 TTFB"
+        );
+    }
+
+    /// 非内容事件（metering / contextUsage）绝不能被当成首 token。
+    ///
+    /// 这条守住的是最容易错的边界：这些事件也会经过同一个 choke point，
+    /// 若判据写成"有事件产出就打点"，TTFB 会变成"首个任意帧"，数值系统性偏小。
+    #[test]
+    fn non_content_events_do_not_mark_first_token() {
+        let mut ctx = mk_thinking_ctx();
+        ctx.process_kiro_event(&Event::ContextUsage(
+            crate::kiro::model::events::ContextUsageEvent { context_usage_percentage: 12.0 },
+        ));
+        assert!(
+            ctx.first_token_at().is_none(),
+            "contextUsageEvent 不含模型输出，不得触发 TTFB 打点"
+        );
+    }
+
+    /// 空 delta（关块占位）不算首 token。
+    #[test]
+    fn empty_delta_is_not_first_token() {
+        assert!(
+            !is_first_content_delta(&SseEvent::new(
+                "content_block_delta",
+                json!({"delta": {"type": "thinking_delta", "thinking": ""}})
+            )),
+            "空 thinking_delta 是关块占位，不代表有内容产出"
+        );
+        assert!(
+            is_first_content_delta(&SseEvent::new(
+                "content_block_delta",
+                json!({"delta": {"type": "text_delta", "text": "hi"}})
+            )),
+            "非空 text_delta 应算首 token（对照组，防止判据过严把真内容也挡掉）"
+        );
+        assert!(
+            !is_first_content_delta(&SseEvent::new(
+                "message_start",
+                json!({"type": "message_start"})
+            )),
+            "message_start 在内容产出前就发了，绝不能算首 token"
+        );
+    }
+
+    /// 回归（E1）：`reasoningContentEvent` 必须产出 `thinking_delta`。
+    ///
+    /// **旧代码为何 FAIL**：该事件此前落 `EventType::Unknown`，payload 被**直接丢弃**
+    /// （只按类型 warn 一次），产出零个 SSE 事件。本测试断言至少有一个
+    /// `content_block_delta` 且 `delta.type == "thinking_delta"`，旧代码下事件列表是空的。
+    ///
+    /// 价值不在"多一个功能"：上游本就给了结构化思考边界，我们扔掉后改用文本嗅探
+    /// `<thinking>` 标签把边界猜回来 —— 已知致命缺陷 #14（invoke_sniff_buffer 无界持有
+    /// 导致整条流停摆）就出在那套嗅探上。接入结构化流是**移除一整类缺陷的来源**。
+    /// thinking **开启**的 ctx（mk_ctx 的第三参 thinking_enabled 是 false，E1 需要 true）。
+    fn mk_thinking_ctx() -> StreamContext {
+        StreamContext::new_with_thinking("deepseek", 10, true, HashMap::new())
+    }
+
+    #[test]
+    fn should_emit_thinking_delta_from_reasoning_content_event() {
+        let mut ctx = mk_thinking_ctx();
+        let ev = Event::ReasoningContent(crate::kiro::model::events::ReasoningContentEvent {
+            text: "让我先看一下目录结构".to_string(),
+        });
+        let out = ctx.process_kiro_event(&ev);
+
+        assert!(!out.is_empty(), "结构化思考帧不应产出零事件（旧代码丢弃 payload）");
+        let joined: String = out.iter().map(|e| e.to_sse_string()).collect();
+        assert!(
+            joined.contains("\"type\":\"thinking_delta\""),
+            "应产出 thinking_delta，实际: {joined}"
+        );
+        assert!(
+            joined.contains("让我先看一下目录结构"),
+            "思考内容应被下发，实际: {joined}"
+        );
+    }
+
+    /// 回归（E1）：结构化流与文本嗅探**共用**同一个 thinking 块，绝不重复开块。
+    ///
+    /// 两条路径都保留（上游可能对某些模型仍走内联标签），所以必须共享
+    /// `in_thinking_block` / `thinking_block_index`。若各自开块，客户端会收到两个
+    /// `content_block_start(thinking)`，Anthropic SDK 侧属协议违规。
+    #[test]
+    fn should_not_double_open_thinking_block_when_both_paths_fire() {
+        let mut ctx = mk_thinking_ctx();
+        let mut all = String::new();
+
+        // 先走结构化流（开块）
+        all.push_str(
+            &ctx.process_kiro_event(&Event::ReasoningContent(
+                crate::kiro::model::events::ReasoningContentEvent { text: "结构化思考".into() },
+            ))
+            .iter()
+            .map(|e| e.to_sse_string())
+            .collect::<String>(),
+        );
+        // 再喂含 <thinking> 的正文（嗅探路径）
+        all.push_str(
+            &ctx.process_kiro_event(&Event::AssistantResponse(
+                crate::kiro::model::events::AssistantResponseEvent {
+                    content: "<thinking>内联思考</thinking>正文".into(),
+                },
+            ))
+            .iter()
+            .map(|e| e.to_sse_string())
+            .collect::<String>(),
+        );
+
+        let opens = all.matches("\"type\":\"thinking\"").count();
+        assert!(
+            opens <= 1,
+            "thinking 块只应被开一次，实际匹配 {opens} 次；两条路径必须共用同一个块。全文: {all}"
+        );
+    }
+
+    /// 回归（E1 最严重的坑）：结构化 reasoning 之后的**普通正文**必须走 `text_delta`，
+    /// 绝不能被当成思考内容。
+    ///
+    /// **旧代码（E1 首版）为何 FAIL**：结构化 reasoning 是**纯增量、无终止帧**的，
+    /// 真实上游形态是「N 帧 reasoningContentEvent → assistantResponseEvent 携带普通正文」。
+    /// 而文本嗅探路径的分支是 `else if self.in_thinking_block` —— reasoning 一旦开过 thinking 块，
+    /// 后续**不带任何标签**的正文就落进那个分支，被发成 `thinking_delta`。
+    ///
+    /// 实测旧代码的输出（本测试抓到的原始报文）：
+    /// ```text
+    /// data: {"delta":{"thinking":"这是给用","type":"thinking_delta"},...}
+    /// ```
+    /// 即**用户可见的答案整段消失进思考面板**；更糟的是 `has_non_thinking_blocks()` 为 false
+    /// 会让收尾把 `stop_reason` 置成 `max_tokens` 并只吐一个空格文本块 → 客户端显示**空答案**。
+    ///
+    /// 修法是让两条路径**互斥**（`reasoning_stream_seen` + 首个正文即关块），
+    /// 而不是共享 `in_thinking_block` 状态。原先那个"共用同一个块"的测试只喂了含完整
+    /// `<thinking>…</thinking>` 配对的正文 —— 恰好是代码能处理的那种，所以漏掉了这个形态。
+    #[test]
+    fn prose_after_reasoning_stream_goes_to_text_not_thinking() {
+        let mut ctx = mk_thinking_ctx();
+        ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent { text: "先想一下".into() },
+        ));
+        // 真实上游形态：reasoning 无终止符，紧接着就是普通正文（不带任何标签）
+        let out = ctx.process_kiro_event(&Event::AssistantResponse(
+            crate::kiro::model::events::AssistantResponseEvent {
+                content: "这是给用户看的答案".into(),
+            },
+        ));
+        let j: String = out.iter().map(|e| e.to_sse_string()).collect();
+        assert!(
+            j.contains("text_delta") && j.contains("这是给用户看的答案"),
+            "正文必须作为 text_delta 下发，否则答案会消失进 thinking 面板。实际: {j}"
+        );
+    }
+
+    /// thinking 未开启时结构化思考帧必须**整帧丢弃**，绝不能混进用户可见正文。
+    #[test]
+    fn reasoning_content_is_dropped_when_thinking_disabled() {
+        // thinking_enabled = false
+        let mut ctx = StreamContext::new_with_thinking("deepseek", 10, false, HashMap::new());
+        let out = ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent { text: "内部推理".into() },
+        ));
+        let joined: String = out.iter().map(|e| e.to_sse_string()).collect();
+        assert!(
+            !joined.contains("内部推理"),
+            "未开 thinking 时内部推理绝不能下发给客户端，实际: {joined}"
+        );
     }
 
     #[test]

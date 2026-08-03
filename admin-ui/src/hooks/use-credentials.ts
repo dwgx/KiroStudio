@@ -6,6 +6,7 @@ import {
   setCredentialRpmLimit,
   setCredentialAllowedModels,
   setCredentialCustomApi,
+  setCredentialEndpoint,
   type SetCustomApiConfigInput,
   resetCredentialFailure,
   forceRefreshToken,
@@ -13,6 +14,7 @@ import {
   getCachedBalances,
   addCredential,
   deleteCredential,
+  deleteCredentialsBatch,
   getLoadBalancingMode,
   setLoadBalancingMode,
   getConfigSnapshot,
@@ -118,6 +120,18 @@ export function useSetAllowedModels() {
   })
 }
 
+// 固定/解除该号走的端点（endpoint=null → 回到自动路由）
+export function useSetCredentialEndpoint() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, endpoint }: { id: number; endpoint: string | null }) =>
+      setCredentialEndpoint(id, endpoint),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
 // 修改自定义 API 凭据的 base_url / api_key / 请求上限
 export function useSetCustomApiConfig() {
   const queryClient = useQueryClient()
@@ -170,6 +184,28 @@ export function useDeleteCredential() {
     mutationFn: (id: number) => deleteCredential(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      // 删除是**软删**（号进回收站），故回收站列表也失效 —— 否则切到设置→回收站
+      // 会看到不含刚删项的旧缓存（gcTime 已放宽到 30min，缓存活得更久，更容易看到）。
+      queryClient.invalidateQueries({ queryKey: ['trash'] })
+    },
+  })
+}
+
+/**
+ * 批量删除凭据（一次请求，支持 force 跳过「必须先禁用」门）。
+ *
+ * 取代此前"逐个 DELETE + 先 PATCH 禁用"的 2N 次往返写法。
+ * 注意：部分失败仍是 resolve（HTTP 200），调用方必须看返回的 failed/results。
+ */
+export function useDeleteCredentialsBatch() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ ids, force }: { ids: number[]; force?: boolean }) =>
+      deleteCredentialsBatch(ids, force ?? false),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      // 同上：批量删除同样落回收站。
+      queryClient.invalidateQueries({ queryKey: ['trash'] })
     },
   })
 }

@@ -281,16 +281,31 @@ pub struct Config {
 
     /// 是否启用 prompt 缓存记账（默认 false）
     ///
-    /// Kiro 上游不回传 Anthropic 的 cache_read / cache_creation 记账字段。
-    /// 开启后，网关侧维护本地影子缓存表，按凭据推算并注入这些字段，
-    /// 让下游客户端（Claude Code 等）能显示缓存命中情况。
-    /// 这是估算展示，非真实计费（真实计费以 meteringEvent 为准）。
-    /// 当前默认关：热路径的 build_profile（JSON 规范化 + SHA256 指纹）对超大对话有
-    /// 可观 CPU 开销。开启后结果写入 StreamContext.cache_usage 并注入响应 usage 字段。
+    /// 是否把**估算的** cache_read / cache_creation 记账字段下发给下游客户端。
+    ///
+    /// Kiro 上游不回传这两个字段——`docs/CACHE-EXP0-RESULT.md` 的 EXP-0 已实测确证：
+    /// `metadataEvent` 的 payload 只有 `{"stopReason":...}`，全窗口 grep
+    /// `tokenUsage|cacheReadInputTokens|cacheWriteInputTokens` 零命中。
+    /// 所以网关下发的 `cache_read_input_tokens` 是**本地前缀 token 估算**
+    /// （`token::count_prefix_tokens`，见 `handlers.rs`），不是上游真值、也不是真实计费依据。
+    ///
+    /// 开启（默认）：注入该字段，Claude Code 等客户端会显示"缓存命中 N tokens"。
+    /// 关闭：**不注入该字段**（而非注入 0）。这个区别是有意的——对 Anthropic 客户端来说
+    /// `cache_read_input_tokens: 0` 表示"确实一次都没命中"，字段缺失表示"本网关不做该记账"，
+    /// 语义完全不同；注入 0 会让客户端把"未记账"误报成"缓存全未命中"。
+    ///
+    /// ⚠️ 该开关**只管下发**，不影响用量统计侧的 cache 字段：面板/SQLite 仍照常记录估算值，
+    /// 否则关掉开关会让统计恒 0，把一个"要不要给客户端看"的选择变成"要不要留数据"。
     #[serde(default = "default_prompt_cache_enabled")]
     pub prompt_cache_enabled: bool,
 
-    /// prompt 缓存记账的最大 TTL 秒数（默认 3600，支持 5m/1h 断点）
+    /// prompt 缓存估算的有效期上限（秒）。
+    ///
+    /// ⚠️ 当前**无实际读取点**：现行估算是无状态的（每请求按 `count_prefix_tokens`
+    /// 重算前缀 token），没有需要按时间过期的缓存表，所以这个值改成什么都不影响行为。
+    /// 保留该字段是为兼容既有 config.json 不因未知键报错。
+    /// 若将来实现 `docs/CACHE-RFC.md` 的 L2 度量层（带过期的影子缓存表），
+    /// 应对齐上游 5 分钟窗口（即 300），而不是沿用这里的 3600。
     #[serde(default = "default_prompt_cache_ttl_seconds")]
     pub prompt_cache_ttl_seconds: u64,
 
@@ -728,15 +743,18 @@ fn default_rate_limit_min_interval_ms() -> u64 {
 }
 
 fn default_prompt_cache_enabled() -> bool {
-    // 默认关闭影子 prompt 缓存记账。
-    // 该记账在请求热路径同步跑 build_profile（逐块 serde 序列化 + canonicalize_json
-    // 递归排序所有 JSON key + SHA256 前缀指纹），对超大对话（30-40 万 token / 数百块）
-    // 有可观固定 CPU 开销，叠加在发上游之前。它只影响向下游客户端复现 Anthropic 风格的
-    // cache_read / cache_creation 展示，不影响真实上游 prefix 缓存（那由客户端断点 +
-    // Bedrock 决定，网关左右不了）。默认关以砍掉这块热路径开销；需要展示缓存命中统计时
-    // 再显式设 "promptCacheEnabled": true——开启后，记账结果写入 StreamContext.cache_usage
-    // 并在每条响应的 usage 字段注入 cache_read_input_tokens / cache_creation_input_tokens。
-    false
+    // 默认**开启**下发。
+    //
+    // 为什么由 false 改为 true：这个开关此前是死配置（全仓零读取点），而注入行为一直在
+    // 无条件发生——即用户显式写 "promptCacheEnabled": false 也照样注入，配置在说谎。
+    // 现在把它接上真实读取点时，必须在两个方向里选一个作为默认，而"保持既有可观测行为
+    // 不变"比"忠于一个从未生效过的默认值"更重要：沿用 false 会让所有现网客户端的缓存
+    // 显示在升级后**突然消失**，那是一次没人要求的行为回退。
+    //
+    // 旧注释声称的 build_profile（JSON 规范化 + SHA256 指纹）热路径开销**已不存在**：
+    // 现行实现是 token::count_prefix_tokens 的一次线性估算，开销与原本就要做的
+    // count_all_tokens 同量级，不再是需要靠默认关来规避的成本。
+    true
 }
 
 fn default_prompt_cache_ttl_seconds() -> u64 {

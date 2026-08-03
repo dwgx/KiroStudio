@@ -646,6 +646,12 @@ pub(crate) async fn get_usage_limits(
 ///
 /// `allow_http=true`（dwgx 定：允许明文 http 中转站）——scheme 放宽，但 IP 层禁止段仍拦截，
 /// 元数据端点 169.254.x 一律挡下。出站另有禁重定向做纵深。
+///
+/// 策略取 [`SsrfPolicy::AdminConfigured`]：这个 base_url 是管理员过了 adminKey 鉴权后
+/// 亲手填的，与匿名可达的背景图代理不是同一威胁模型。它只额外豁免 198.18.0.0/15
+/// （代理软件 fake-IP 池默认段）——否则开着 Clash fake-IP 的机器上**任何**中转站域名
+/// 都会解析到该段而无法添加（实测 api.uu6.top → 198.18.0.46）。私有段、环回、
+/// 云元数据端点仍然全部拦下。理由详见 `ssrf::is_forbidden_ipv4_with` 的文档。
 async fn validate_custom_api_base_url(base_raw: &str) -> anyhow::Result<()> {
     let base = base_raw.trim().trim_end_matches('/');
     let url = if base.ends_with("/v1") || base.contains("/v1/") {
@@ -653,9 +659,13 @@ async fn validate_custom_api_base_url(base_raw: &str) -> anyhow::Result<()> {
     } else {
         format!("{base}/v1/messages")
     };
-    crate::common::ssrf::validate_outbound_url(&url, /*allow_http=*/ true)
-        .await
-        .map_err(|e| anyhow::anyhow!("自定义 API base_url 校验失败(SSRF 防护): {e}"))
+    crate::common::ssrf::validate_outbound_url_with(
+        &url,
+        /*allow_http=*/ true,
+        crate::common::ssrf::SsrfPolicy::AdminConfigured,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("自定义 API base_url 校验失败: {e}"))
 }
 
 /// 运行时动态解析真实 profileArn（Kiro management ControlPlane 的 ListAvailableProfiles）。
@@ -1068,10 +1078,75 @@ struct CredentialEntry {
     failure_count: u32,
     /// Token 刷新连续失败次数
     refresh_failure_count: u32,
+    /// 账户级风控（403 `TEMPORARILY_SUSPENDED` 等）**连续无成功**次数。
+    ///
+    /// ## 为什么不复用 `CooldownManager::trigger_count`
+    ///
+    /// 曾经就是复用它，结果自动禁用**从未生效过**：`report_success` 调
+    /// `clear_cooldown` → `entries.remove()` 把整个冷却条目删掉，`trigger_count`
+    /// 随之归零。半死号（偶尔成功一次）因此永远回不到禁用阈值，实测线上 8 个
+    /// 成功率恒 0% 的死号跑了几小时仍全部 `disabled=false` / `failureCount=0`，
+    /// 每条客户端请求都要在它们身上白撞一遍（最坏 43 次 / 45 秒墙钟）。
+    ///
+    /// 所以计数必须挂在**凭据条目**上，与冷却条目的生命周期解耦：
+    /// - 风控命中 → +1（无论 `cooldown_enabled` 开关如何，见 `report_suspicious_activity`）
+    /// - 任意一次成功 → 归零（`report_success`），保证健康号永不误禁
+    ///
+    /// 非持久化：进程内计数。重启后从 0 开始重新累计，至多多撞几次即再次禁用；
+    /// 而**禁用状态本身**是持久化的（`persist_disabled_state`），不会重启复活。
+    consecutive_suspicious: u32,
+    /// **代挂号专用**：连续「非瞬态」失败次数（任一次成功即归零）。
+    ///
+    /// # 为什么代挂号需要独立的判据
+    ///
+    /// 代挂号（`auth_method=custom_api`）是用户自购的第三方 Anthropic 兼容中转站，
+    /// 与 Kiro 号的失败语义**根本不同**：
+    /// - Kiro 号有**封号风险**，砸多了会真死 → 需要冷却、退避、族级连坐。
+    /// - 代挂号只是一个付费上游，429 只代表「它现在忙」，**没有"被风控"这个状态**。
+    ///   对它退避是白等（用户已经付过钱），而 failover 到下一个代挂号才是正解。
+    ///
+    /// 所以 dwgx 定的语义是：**瞬态信号完全不留痕**（429/5xx/超时 → 只 failover，
+    /// 不冷却不计数），**只有非瞬态失败才累加本计数**，达阈值即自动禁用。
+    ///
+    /// # 为什么用「连续 + 成功归零」而不是累计
+    ///
+    /// 项目实测过死号与好号「分界干净、无过渡态」（8 个死号成功率恒 0%，9 个好号 90~100%），
+    /// 因此「连续失败且期间零成功」抓得准。反例是旧的 `cooldown.trigger_count >= 10`：
+    /// 它在数学上**不可达**（`report_success` 会删掉整个冷却条目使计数归零），
+    /// 导致自动禁用从未生效过。本字段挂在凭据条目上，与冷却条目生命周期解耦。
+    ///
+    /// 非持久化：进程内计数，重启从 0 累计（至多多撞几次即再次禁用）；
+    /// 而**禁用状态本身**持久化，不会重启复活。
+    consecutive_passthrough_failures: u32,
+    /// **代挂号专用**：进入「持续过载」观察窗的起点（首次 429 且此后零成功的时刻）。
+    ///
+    /// 用于兼顾两条看似矛盾的要求：「偶尔 429 绝不冷却」与「一直错误就自动禁用」。
+    /// 单次乃至一阵 429 完全放行（不冷却不计数）；但若**整个窗口内零成功且一直在 429**
+    /// （见 `PASSTHROUGH_OVERLOAD_WINDOW`），说明这个中转站已经不能用了，
+    /// 而不是"偶尔忙" → 按独立原因禁用，便于运维区分「key 失效」与「站点持续过载」。
+    ///
+    /// 任一次成功即清空（`None`），所以只要站点还能出活就永远不会命中。
+    passthrough_overload_since: Option<Instant>,
+    /// **代挂号专用**：最近一次 429 的时刻，用于判断 429 是否「连续」。
+    ///
+    /// 没有它就无法区分「窗口内密集 429」与「相隔十分钟的两次 429」——
+    /// 后者中间可能整段空闲（零请求，因此也没有成功来重置观察窗），
+    /// 不该被判成"持续过载"。见 `record_passthrough_result` 的 RateLimited 分支。
+    last_passthrough_429_at: Option<Instant>,
+    /// 上次被选号**真正选中**的时刻（`commit_selection` 里更新）。
+    ///
+    /// 用于 [`STARVATION_PROBE_SECS`] 的反饥饿强制探测。**不能用 `RpmTracker` 代替**：
+    /// 它是 60s 滑窗，超窗即无数据，无法区分"61 秒没选中"与"20 分钟没选中"，
+    /// 而饥饿自锁的典型时长是分钟级（实测 192 秒）。
+    ///
+    /// 非持久化：进程内状态。重启后视为"刚被选中"（乐观），至多延迟一个探测窗口。
+    last_selected_at: std::cell::Cell<Instant>,
     /// 是否已禁用
     disabled: bool,
-    /// 禁用原因（用于区分手动禁用 vs 自动禁用，便于自愈）
+    /// 禁用原因（用于区分手动禁用 vs 自动禁用，便于自愈）。**持久化**（见 `persist_credentials`）。
     disabled_reason: Option<DisabledReason>,
+    /// 被禁用的时刻（RFC3339）。**持久化**，供运维判断"这号坏了多久"。
+    disabled_at: Option<String>,
     /// API 调用成功次数
     success_count: u64,
     /// 累计请求数（用于 `request_limit` 上限自动禁用；主要自定义 API 代挂计数）。
@@ -1122,9 +1197,71 @@ struct CredentialEntry {
     refresh_lock: Arc<TokioMutex<()>>,
 }
 
-/// 禁用原因
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DisabledReason {
+impl CredentialEntry {
+    /// 复活凭据（从禁用态恢复）时必须清零的**全部进程内惩罚计数**，单一收口。
+    ///
+    /// # 为什么要收口成一个方法
+    ///
+    /// 复活路径有三条（`reset_and_enable` / `set_disabled(false)` / 全池 `TooManyFailures`
+    /// 自愈块），此前**各自手写清零列表**，于是三处都漏了同一个字段
+    /// `consecutive_suspicious` —— 而它唯一的清零点是 `report_success`。
+    ///
+    /// 后果：被 `SuspiciousActivityAuto` 禁用的号（计数已达阈值 6）人工「重置并启用」后，
+    /// 计数仍是 6，**下一次风控命中即秒禁**，「重置」形同虚设。且自动禁用落盘后
+    /// （`persist_disabled_state`）这个秒禁**重启也回不来**，代价从"重启即恢复"
+    /// 恶化成"永久死号"。
+    ///
+    /// 与 `RequestLimitReached` 的 `request_count` 清零是同型 bug（那处已修），
+    /// 差别只是当时只想到了一个字段。收口后新增惩罚计数只需改这一个地方。
+    ///
+    /// # 不在此清零的东西
+    ///
+    /// `cooldown` / `rate_limiter` 是**独立锁下的旁挂结构**，不属于本 entry，
+    /// 由调用方在 entries 锁外单独清（见 `reset_and_enable`）。
+    /// `request_count` 只在 `RequestLimitReached` 语义下才该清，由调用方按原因判定。
+    fn clear_transient_counters(&mut self) {
+        self.failure_count = 0;
+        self.refresh_failure_count = 0;
+        // 账户级风控计数：漏清它会让复活的号一次风控即秒禁（见方法文档）。
+        self.consecutive_suspicious = 0;
+    }
+}
+
+/// 禁用原因。
+///
+/// ## 为什么要可序列化（本轮修复的缺陷）
+///
+/// 此前 `KiroCredentials` **只有 `disabled: bool`**、没有原因字段，`persist_credentials`
+/// 也只写 `cred.disabled = e.disabled`。而加载时对所有 `disabled` 号一律回填
+/// `Some(DisabledReason::Manual)` —— 于是 `SuspiciousActivityAuto` / `QuotaExceeded` /
+/// `AccountSuspended` / `TooManyFailures` 等**自动禁用原因在重启后全部变成「手动禁用」**。
+///
+/// 后果不只是展示不准：还连带击穿以 reason 为判据的自愈逻辑
+/// （把自动禁用误判成人工禁用 → 自愈不敢重新启用 → 整池禁用后永久死锁）。
+///
+/// `serde` 用 **camelCase 稳定线格式**。
+///
+/// # ⚠️ 为什么必须有 `#[serde(other)]` 兜底变体（回滚安全）
+///
+/// 原注释只说了「新增变体时**旧文件**仍可读」——那是**前向**兼容，方向说反了一半。
+/// 真正会炸的是**反向**：新版本写进 `credentials.json` 的新变体，**旧版本读不了**。
+///
+/// 实测坐实（正确复现下）：旧枚举反序列化 `"passthroughFailed"` 报
+/// `unknown variant 'passthroughFailed', expected one of ...`。而
+/// `CredentialsConfig::load` 失败会让 `main.rs` 直接 `std::process::exit(1)`
+/// （那是刻意的 fail-safe：宁可拒绝启动也不用空池覆盖真实凭据）。
+/// 于是**回滚到旧二进制 = 服务起不来**，且必须手工编辑 `credentials.json`
+/// 删掉那个字段才能恢复 —— 在生产回滚的时间压力下这是最糟的失败形态。
+///
+/// `#[serde(other)]` 让任何**未知**变体退化成 `Unknown` 而不是解析失败。
+/// 它对**当前**版本没有行为影响（我们永远不会主动写出 `Unknown`），
+/// 价值全在「未来任一版本都能读其它版本写的文件」——
+/// 这是保住零空窗回滚能力的前提。
+///
+/// ⚠️ 新增变体时无需再动这里，但**绝不要删掉 `Unknown`**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DisabledReason {
     /// Admin API 手动禁用
     Manual,
     /// 连续失败达到阈值后自动禁用
@@ -1145,6 +1282,75 @@ enum DisabledReason {
     /// 累计请求数达到 `request_limit` 上限后自动禁用（主要用于自定义 API 代挂计费防护）。
     /// 属"自动禁用",重置计数(reset)或人工可重新启用。
     RequestLimitReached,
+    /// **代挂号**连续多次「非瞬态」失败后自动禁用（key 失效 / 额度耗尽 / base_url 配错等
+    /// 再试无用的信号，阈值 [`MAX_PASSTHROUGH_FAILURES`]）。属"自动禁用"，人工修好配置后可重新启用。
+    ///
+    /// 与 `TooManyFailures` 分开是因为处置动作完全不同：那条指 Kiro 号（要查是否被风控），
+    /// 这条指第三方中转站（要查 key/余额/地址）。运维看到原因就知道该去哪儿排查。
+    PassthroughFailed,
+    /// **代挂号**在 [`PASSTHROUGH_OVERLOAD_WINDOW`] 内零成功且持续 429 → 判定该中转站已不可用。
+    ///
+    /// 独立于 `PassthroughFailed`：偶尔 429 是正常的（绝不惩罚），只有"一直 429 且完全出不了活"
+    /// 才是站点挂了。分开记录让运维能区分「站点过载」与「凭据本身有问题」。
+    PassthroughOverloaded,
+    /// 未知原因（**仅**用于反序列化兜底：读到本版本不认识的变体时落这里）。
+    ///
+    /// 绝不主动写出。存在的唯一目的是让**旧版本能读新版本写的文件**，
+    /// 从而不破坏回滚路径（见枚举文档）。
+    #[serde(other)]
+    #[default]
+    Unknown,
+}
+
+impl DisabledReason {
+    /// 稳定的字符串枚举名，供 Admin API 下发、前端按它做 i18n 映射。
+    ///
+    /// 单一收口：此前 `snapshot()` 内联了一份 match，回收站要展示原因时若各写一份，
+    /// 新增变体就得改 N 处且漏一处只会静默少个标签。改动这些字面量等于改 API 契约
+    /// （前端 `lib/i18n-labels.ts` 按同名键查表），务必与前端同步。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Manual => "Manual",
+            Self::TooManyFailures => "TooManyFailures",
+            Self::TooManyRefreshFailures => "TooManyRefreshFailures",
+            Self::QuotaExceeded => "QuotaExceeded",
+            Self::AccountSuspended => "AccountSuspended",
+            Self::SuspiciousActivityAuto => "SuspiciousActivityAuto",
+            Self::InvalidRefreshToken => "InvalidRefreshToken",
+            Self::InvalidConfig => "InvalidConfig",
+            Self::RequestLimitReached => "RequestLimitReached",
+            Self::PassthroughFailed => "PassthroughFailed",
+            Self::PassthroughOverloaded => "PassthroughOverloaded",
+            // 读到本版本不认识的变体（例如回滚后读新版写的文件）时落这里。
+            Self::Unknown => "Unknown",
+        }
+    }
+}
+
+/// 该禁用原因是否属于**可自愈**（全池被自动禁用时允许一次性复活重试）。
+///
+/// # 判据
+///
+/// 只包含**瞬时/可恢复**的自动禁用原因：
+/// - `TooManyFailures`：连续失败达阈值。失败可能是上游抖动，值得再试。
+/// - `SuspiciousActivityAuto`：403 账户级风控。**这是整池瞬时风控**，
+///   历史事故明确记录 403 `TEMPORARILY_SUSPENDED` 是**临时态**
+///   （曾被当永久封禁处理 → 12h 内 88 次误禁 + 36 次全池自愈活锁 → 拒绝率升到 100%）。
+///
+/// # 刻意排除的（复活只会白撞，且掩盖真实问题）
+///
+/// - `AccountSuspended`：真被封，需人工处理（有专门的回归测试锁住这条）
+/// - `QuotaExceeded`：额度耗尽，要等下个计费周期
+/// - `InvalidRefreshToken` / `InvalidConfig`：凭据本身坏了
+/// - `RequestLimitReached`：终身预算护栏，复活等于绕过它
+/// - `PassthroughFailed` / `PassthroughOverloaded`：第三方中转站的 key/额度/站点问题
+/// - `Manual`：人工禁用，绝不能被自动复活
+/// - `Unknown`：读不懂的原因，保守不动
+fn is_self_healable_reason(reason: Option<DisabledReason>) -> bool {
+    matches!(
+        reason,
+        Some(DisabledReason::TooManyFailures) | Some(DisabledReason::SuspiciousActivityAuto)
+    )
 }
 
 /// 统计数据持久化条目
@@ -1222,9 +1428,18 @@ pub struct CredentialEntrySnapshot {
     /// 禁用原因
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
+    /// 被禁用的时刻（RFC3339）。与 `disabled_reason` 是一对：运维靠它判断"这号坏了多久"，
+    /// 从而区分「刚坏，可能只是瞬时风控」与「坏了很久，基本可以确认要换号」。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_at: Option<String>,
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// **实际生效**的端点名（显式配置 > 按凭据类型自动路由 > 全局默认，恒有值）。
+    ///
+    /// 与 [`Self::endpoint`] 的区别正是"是否被人工固定"：`endpoint=None` 且
+    /// `effective_endpoint="cli"` 表示这是 `ksk_` 号被自动路由的结果。
+    pub effective_endpoint: String,
     /// 当前在途（in-flight）请求数（实时负载，用于观测均衡效果）
     pub inflight: u32,
     /// 最近 60 秒滚动窗口内的请求数（RPM 观测）
@@ -1257,6 +1472,15 @@ pub struct TrashSnapshot {
     pub success_count: u64,
     /// 删除前最后一次调用时间
     pub last_used_at: Option<String>,
+    /// 删除前的禁用原因（`None` = 老回收站数据或手动删除未记录）。
+    ///
+    /// 用户要求「认定封号必须标明原因」，而号被判死后往往紧接着就被删除——回收站不带原因时，
+    /// 恰恰在最需要它的时刻（判断该换号还是该申诉）信息就丢了。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<DisabledReason>,
+    /// 删除前被禁用的时刻（RFC3339）。用于区分「刚坏就删」与「坏了很久才删」。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_at: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -1377,8 +1601,53 @@ pub struct BalanceSnapshot {
     pub credits_used_at_cache: f64,
 }
 
+/// 反饥饿强制探测窗口（秒）：任何**可选**凭据超过这么久没被选中，
+/// 下一轮选号无条件排到最前，强制给它一次探测机会。
+///
+/// ## 这一条是结构性兜底，不是修某个具体 bug
+///
+/// 本仓已实测过两次"单向状态无法自行恢复 → 号被永久排除"的缺陷：
+/// ① `ewma_429`/`ewma_success` 只在成功时更新 → 拿不到请求就永不回升
+///    （实测 6 号池 4 个进 T2 坏档、`rpm=0 inflight=0` 空转，有效容量 6→3，全程零 429）；
+/// ② `open_count`/`admit_prob_seed` 只在"半开内连续 5 次成功"才恢复 →
+///    seed 收缩到 0.02 后拿不到那 2% 试探 → 凑不齐成功 → 永久化。
+/// 两者都已加时间衰减修掉，但**靠逐个字段审查保证"每个惩罚状态都有下降路径"已证明不可靠**
+/// （上一版的衰减修复本身就带着测试上线、却因时钟被读路径刷新而完全失效）。
+///
+/// 本探测的价值在于：**它不依赖任何具体字段是否有衰减路径**。
+/// 即使将来又引入一个新的单向惩罚状态，最坏后果也只是"偶尔损失一个探测请求"，
+/// 而不是号池有效容量不可逆缩水。
+///
+/// ## 为什么是 180 秒
+///
+/// 实测饥饿自锁的观测时长是 192 秒（#211 连续零请求）。取 180s 略小于它，
+/// 保证同类情形能被兜住；同时远大于正常轮转间隔（满负载下每号每秒都可能被选中），
+/// 所以健康池里这条键**恒不生效**，零性能与零行为影响。
+///
+/// ## 探测不绕过任何硬门
+///
+/// 排序键里它排在 `unusable` **之后**：真不可用的号（熔断 Open → p_avail=0、
+/// RPM 已饱和）仍然沉底。探测只在"本来就可选、只是被健康分档压住"时起作用。
+const STARVATION_PROBE_SECS: u64 = 180;
+
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
+/// 账户级风控（403 `TEMPORARILY_SUSPENDED` 等）**连续无成功**多少次后自动禁用该号。
+///
+/// ## 为什么需要独立于 `MAX_FAILURES_PER_CREDENTIAL`
+///
+/// 403 风控是**临时**态（上游原文 temporarily + 附申诉链接），历史上曾被当永久封禁
+/// 处理并造成生产事故（12 小时 88 次误禁 + 逐小时拒绝率升到 100%，见
+/// `endpoint/mod.rs::default_is_account_suspended` 的说明）。所以判据**不能是"见过
+/// 403"**，而必须是"连续 403 且期间一次都没成功过"——后者才能区分：
+///
+/// - 真死号：实测成功率恒 **0%**（线上 8 个号 n=4~48 全部 403，无一次成功）
+/// - 健康号：成功率 90~100%，但同样会**偶发**命中 403
+///
+/// 取 6 而非 3：403 常伴随同出口 IP 的整池瞬时风控，健康号也可能连吃 2~3 次。
+/// 6 次连续零成功足以把"真死"与"偶发"分开，而任意一次成功都会清零（见
+/// `report_success`），所以健康号永远到不了 6。
+const MAX_CONSECUTIVE_SUSPICIOUS_BEFORE_DISABLE: u32 = 6;
 /// 凭据自定义字段的服务端防呆上界(不信任前端校验,直打 admin API 的越界值也自动修补)。
 /// priority:优先级(越小越优先),上界够大覆盖任意分层又防 u32 极值污染排序。
 const MAX_PRIORITY: u32 = 9999;
@@ -1394,6 +1663,17 @@ const MAX_NAME_CHARS: usize = 64;
 const MAX_TRANSIENT_WAIT_SECS: u64 = 20;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
+/// 池子真耗尽（available == 0）时回给客户端的建议退避秒数。
+///
+/// 为什么"真耗尽"也需要退避秒数而不是当永久故障：这个状态**会自愈**。
+/// `is_self_healable_reason` 覆盖的原因（`TooManyFailures` / `SuspiciousActivityAuto` 等）
+/// 会触发全池自愈"重置失败计数并重新启用"，线上实测 41 分钟内触发 36 次
+/// （≈68s 一次）。而 403 `TEMPORARILY_SUSPENDED` 本身也是限时态。
+///
+/// 取 10s 的理由：与自愈触发间隔同量级但明显更短，让客户端在池子恢复后尽快回来；
+/// 又足够长到不等于"不退避"。⚠️ 这是个**未经控制实验的可调参数**，不是实测结论——
+/// 若要精确化，需要按"耗尽窗口时长分布"来定，而那需要先积累样本。
+const POOL_EXHAUSTED_RETRY_AFTER_SECS: u64 = 10;
 
 /// 全池无立即可用候选时,一个候选为何在等待——决定调用方终态处理与文案类别。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1415,9 +1695,34 @@ enum WaitOutcome {
     Wait(StdDuration, WaitReason),
 }
 
+/// `load_balancing_mode` 归一化后的生效调度语义（见 `effective_scheduling`）。
+///
+/// 存在的意义：把"配置字符串 → 实际调度行为"的映射收敛到**一处**。历史上 `priority` 与
+/// `balanced` 是两套并列实现，其中 priority 那套缺失全部保护且无人测试覆盖，
+/// 归一化后只剩一套排序键，差异只体现为本结构体的字段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SchedulingSemantics {
+    /// 是否按 priority **分层**分发（层内仍按健康/负载均衡，整层打爆才溢出到下一层）。
+    priority_layered: bool,
+}
+
 /// 模型级不支持黑名单的 TTL：某号对某模型返回 INVALID_MODEL_ID 后，这段时间内选号跳过
 /// "该号+该模型"组合。取中长窗（订阅权益变化是较慢的事），到期后自动允许重试探。
 const MODEL_BLOCK_TTL: StdDuration = StdDuration::from_secs(1800);
+
+/// 代挂号（`custom_api`）连续「非瞬态」失败多少次后自动禁用。
+///
+/// 与 Kiro 侧 `MAX_FAILURES_PER_CREDENTIAL` 取同一量级（少一个需要记的概念）。
+/// 非瞬态 = 401/403（key 失效）、402（额度耗尽）、404（base_url 错）等**再试也一样**的信号：
+/// 等 N 次纯属浪费，3 次足够排除「一次性抖动」。瞬态信号（429/5xx/超时）**不进这个计数**。
+const MAX_PASSTHROUGH_FAILURES: u32 = 3;
+
+/// 代挂号「持续过载」判定窗口：窗口内**零成功且一直 429** 才判定该站不可用。
+///
+/// 存在理由是同时满足两条要求：「偶尔 429 绝不冷却/不惩罚」+「一直错误就自动禁用」。
+/// 单次或一阵 429 完全放行；只有连续 5 分钟一次都没成功过，才认定不是"偶尔忙"。
+/// 任一次成功即清空计时器，所以还能出活的站永远不会命中。
+const PASSTHROUGH_OVERLOAD_WINDOW: StdDuration = StdDuration::from_secs(300);
 
 // 原子写 + 权限收紧已提取为共享单一真相源 `common::fs_atomic`(供 config.rs 等复用,
 // 并补了 Windows 句柄占用的 rename 重试)。此处 re-import 保持调用点不变。
@@ -1501,12 +1806,20 @@ impl MultiTokenManager {
                     credentials: cred.clone(),
                     failure_count: 0,
                     refresh_failure_count: 0,
+                    consecutive_suspicious: 0,
+                    consecutive_passthrough_failures: 0,
+                    passthrough_overload_since: None,
+                    last_passthrough_429_at: None,
+                    last_selected_at: std::cell::Cell::new(Instant::now()),
                     disabled: cred.disabled, // 从配置文件读取 disabled 状态
+                    // ⭐ 优先用持久化的真实原因；只有旧文件（无该字段）才回落 Manual。
+                    // 旧代码无条件回落 Manual，导致自动禁用原因重启即丢失（见 DisabledReason 说明）。
                     disabled_reason: if cred.disabled {
-                        Some(DisabledReason::Manual)
+                        Some(cred.disabled_reason.unwrap_or(DisabledReason::Manual))
                     } else {
                         None
                     },
+                    disabled_at: cred.disabled_at.clone(),
                     success_count: 0,
                     request_count: 0,
                     total_credits_used: 0.0,
@@ -1563,6 +1876,7 @@ impl MultiTokenManager {
                 );
                 entry.disabled = true;
                 entry.disabled_reason = Some(DisabledReason::InvalidConfig);
+                entry.disabled_at = Some(Utc::now().to_rfc3339());
             }
         }
 
@@ -1973,18 +2287,26 @@ impl MultiTokenManager {
         //    两者都会二次加 entries 锁(parking_lot 非可重入),同函数持锁调用即同线程自死锁。
         //    照 report_success/add_credits 同款范式:块结束释放锁后再落盘。
         let mut limit_just_reached = false;
+        // 自动禁用(非请求上限那条)也必须立即落盘：禁用状态是持久化字段，
+        // 若只改内存则重启后死站以 enabled 回池，重新走一遍失败流程（#13 同型）。
+        let mut disable_just_happened = false;
         {
             let mut entries = self.entries.lock();
             if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
                 e.last_used_at = Some(Utc::now().to_rfc3339());
                 match outcome {
                     RO::Success => {
+                        // 成功即清空两个「持续坏」判据：健康号永不误禁（与 report_success 同款保证）。
+                        e.consecutive_passthrough_failures = 0;
+                        e.passthrough_overload_since = None;
+                        e.last_passthrough_429_at = None;
                         e.success_count = e.success_count.saturating_add(1);
                         e.request_count = e.request_count.saturating_add(1);
                         if let Some(limit) = e.credentials.request_limit {
                             if limit > 0 && e.request_count >= limit && !e.disabled {
                                 e.disabled = true;
                                 e.disabled_reason = Some(DisabledReason::RequestLimitReached);
+                                e.disabled_at = Some(Utc::now().to_rfc3339());
                                 limit_just_reached = true;
                                 tracing::warn!(
                                     credential_id = id,
@@ -1995,12 +2317,98 @@ impl MultiTokenManager {
                             }
                         }
                     }
-                    // 上游/链路真失败:仅计数供展示,绝不 auto-disable(隔离铁律:透传号不走 Kiro 失败处置)。
+                    // 🟢 **瞬态**失败:5xx / 连接错误 / 超时。仅计数供展示,**绝不**进
+                    // consecutive_passthrough_failures、绝不 auto-disable。
+                    // 中转站抖一下不代表它坏了,failover 到下一个号即可(见 provider 的透传循环)。
                     RO::ServerError | RO::NetworkError => {
                         e.failure_count = e.failure_count.saturating_add(1);
                     }
-                    // 429 / 4xx / 认证类:透传给客户端,不计号失败(避免误判健康、误触发状态条红)。
-                    _ => {}
+                    // 🟢 **429 限流**:dwgx 明确定过——「偶尔 429 绝不需要冷却」。
+                    // 所以这里既不冷却、不计失败、也不动 consecutive 计数,只启动/维持
+                    // 「持续过载」观察窗。单次或一阵 429 完全放行;只有整个
+                    // PASSTHROUGH_OVERLOAD_WINDOW 内**零成功且一直 429**(任一次成功都会把
+                    // since 清成 None)才判定该站已不可用 → 按独立原因禁用,便于运维区分
+                    // 「key 失效」与「站点持续过载」。
+                    RO::RateLimited => {
+                        let now = Instant::now();
+                        // ⚠️ 必须先判「上一次 429 距今是否太久」再累积，否则**空闲时间会被算成过载**。
+                        //
+                        // 审查发现的缺陷：原实现只 `get_or_insert(now)` 且除成功外永不重置，
+                        // 于是判据实际是「距第一次未被成功打断的 429 已过 300s」。
+                        // 一个只在突发时偶尔 429 的健康站：T=0 一次 429 → 打上戳；随后该号
+                        // **完全空闲** 10 分钟（零请求，所以也没有成功来清零）→ 再来一次 429
+                        // → `now - since = 600s ≥ 300s` → 仅凭**相隔十分钟的两次 429** 就被禁用并落盘。
+                        //
+                        // 修法：429 之间的间隔超过窗口即视为「不连续」，重新起算。
+                        // 这样"持续过载"才真的要求窗口内**密集**的 429，而不只是首尾两个点。
+                        let stale = e
+                            .passthrough_overload_since
+                            .zip(e.last_passthrough_429_at)
+                            .map(|(_, last)| now.duration_since(last) >= PASSTHROUGH_OVERLOAD_WINDOW)
+                            .unwrap_or(false);
+                        if stale {
+                            e.passthrough_overload_since = None;
+                        }
+                        let since = *e.passthrough_overload_since.get_or_insert(now);
+                        e.last_passthrough_429_at = Some(now);
+                        if now.duration_since(since) >= PASSTHROUGH_OVERLOAD_WINDOW && !e.disabled {
+                            e.disabled = true;
+                            e.disabled_reason = Some(DisabledReason::PassthroughOverloaded);
+                            e.disabled_at = Some(Utc::now().to_rfc3339());
+                            disable_just_happened = true;
+                            tracing::error!(
+                                credential_id = id,
+                                window_secs = PASSTHROUGH_OVERLOAD_WINDOW.as_secs(),
+                                "代挂号连续 {}s 内零成功且持续 429,判定该中转站不可用并自动禁用\
+                                 (偶尔 429 不会触发:任一次成功即重置观察窗)",
+                                PASSTHROUGH_OVERLOAD_WINDOW.as_secs()
+                            );
+                        }
+                    }
+                    // 🔴 **非瞬态**失败:401/403(key 失效/被拒)、402(额度耗尽)、
+                    // 4xx(base_url 配错、404 等)。这些**再试一万次也一样**,累加连续计数,
+                    // 达 MAX_PASSTHROUGH_FAILURES 即自动禁用——等更多次纯属浪费用户的请求。
+                    // 任一次成功归零,所以健康号不会被偶发 4xx 误禁。
+                    // 🟢 **客户端请求错误**（400/404/422）：**绝不计入号的健康**。
+                    //
+                    // 这是坏的请求，不是坏的号 —— 换任何号都一样错。
+                    // 实测依据（线上 traces.db）：代挂号 #216 成功率 80.3%（2910/3622）是个**健康号**，
+                    // 但它历史上有 712 次 bad_request、其中 **119 次是 ≥3 连**、最长 6 连。
+                    // 若把 BadRequest 计入连续失败计数（阈值 3），这个健康号会被误禁 119 次。
+                    // 而且代挂号历史 429 次数为 **0**、失败形态**全是** bad_request ——
+                    // 也就是说"把 bad_request 当号坏了"恰好会命中唯一真实存在的失败形态。
+                    RO::BadRequest => {}
+                    // 🔴 **非瞬态的凭据/账户问题**：401/403（key 失效/被拒）、402（额度耗尽）、
+                    // 站点封号、站点不供该模型。这些**再试一万次也一样**，累加连续计数，
+                    // 达 MAX_PASSTHROUGH_FAILURES 即自动禁用——等更多次纯属浪费用户的请求。
+                    // 任一次成功归零，所以健康号不会被偶发失败误禁。
+                    //
+                    // OtherError 也归此类但要注意：它是兜底桶（含未分类状态码），
+                    // 若将来发现它混进了瞬态信号，应把那类单独摘出去而不是放宽阈值。
+                    RO::AuthFailed
+                    | RO::QuotaExhausted
+                    | RO::OtherError
+                    | RO::AccountSuspended
+                    | RO::ModelUnavailable => {
+                        e.failure_count = e.failure_count.saturating_add(1);
+                        e.consecutive_passthrough_failures =
+                            e.consecutive_passthrough_failures.saturating_add(1);
+                        if e.consecutive_passthrough_failures >= MAX_PASSTHROUGH_FAILURES
+                            && !e.disabled
+                        {
+                            e.disabled = true;
+                            e.disabled_reason = Some(DisabledReason::PassthroughFailed);
+                            e.disabled_at = Some(Utc::now().to_rfc3339());
+                            disable_just_happened = true;
+                            tracing::error!(
+                                credential_id = id,
+                                count = e.consecutive_passthrough_failures,
+                                "代挂号连续 {} 次非瞬态失败(key 失效/额度耗尽/配置错等再试无用的信号),\
+                                 自动禁用",
+                                e.consecutive_passthrough_failures
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -2014,6 +2422,12 @@ impl MultiTokenManager {
             if let Err(e) = self.persist_credentials() {
                 tracing::warn!(credential_id = id, "达请求上限后持久化禁用状态失败: {}", e);
             }
+        } else if disable_just_happened {
+            // 代挂号自动禁用（key 失效 / 持续过载）→ 立即落盘，否则重启即复活。
+            self.save_stats_debounced();
+            if let Err(e) = self.persist_credentials() {
+                tracing::warn!(credential_id = id, "代挂号自动禁用后持久化失败: {}", e);
+            }
         } else {
             self.save_stats_debounced();
         }
@@ -2022,6 +2436,25 @@ impl MultiTokenManager {
     /// 获取可用凭据数量
     pub fn available_count(&self) -> usize {
         self.entries.lock().iter().filter(|e| !e.disabled).count()
+    }
+
+    /// **Kiro 路径**实际可选的凭据数（供重试预算计算）。
+    ///
+    /// 与 [`Self::total_count`]（= `entries.len()`）的区别是排除两类永不可选的条目：
+    /// - `disabled` 的号；
+    /// - `custom_api` 代挂号 —— `is_entry_selectable` 明确拒绝它们，Kiro 路径**永远**
+    ///   选不到（它们走独立的 passthrough 路径）。
+    ///
+    /// 为什么重要：重试预算此前按 `total_count * 3` 算，于是禁用号与 custom_api 号会把
+    /// 预算凭空抬高（生产日志里的 `尝试 8/36`、`27 = 9×3` 就是这么来的）。预算越大，
+    /// 一条请求就能连打越多号、烧掉越多账号，叠加 sub2api 侧的重试后单请求最坏可放大到
+    /// 约 70~108 次上游调用。按真正可选的号数算，预算才与「每个可用号各摸一次」对齐。
+    pub fn kiro_selectable_count(&self) -> usize {
+        self.entries
+            .lock()
+            .iter()
+            .filter(|e| !e.disabled && !e.credentials.is_custom_api_credential())
+            .count()
     }
 
     /// 获取当前所有处于冷却中的凭据快照（供 admin 面板展示 429/限流感官）。
@@ -2087,18 +2520,25 @@ impl MultiTokenManager {
                         // 用无锁版:此处已持 entries 锁,直传 e.credentials.rpm_limit(per-cred 容量优先)。
                         // L5:饱和判定含 L3 headroom 折扣(effective_saturation_limit),即绑定号达 headroom
                         // 后阈值(如 25 而非硬限 30)就让路,防单会话高吞吐把一个号顶到贴顶再让路。
-                        let bound_saturated =
-                            self.is_rpm_saturated_with_limit(entry.id, entry.credentials.rpm_limit);
-                        if !bound_saturated {
+                        // ⭐ 复用前提收敛到 is_sticky_reuse_healthy：**未饱和 且 熔断未 Open**
+                        //   （半开期按 admit_prob 概率放行）。
+                        //   此前只查饱和、不查熔断 —— 而亲和命中同样是 `return` 直接跳过下方排序键的
+                        //   旁路，于是熔断 Open（p_avail=0）的号只要 rpm 未饱和就会被会话死粘，
+                        //   排序键里那道"熔断沉底"完全够不着它。与 sticky current_id 是同一类漏洞，
+                        //   故共用同一个判据函数，避免将来再次各自漂移。
+                        if self.is_sticky_reuse_healthy(entry) {
                             tracing::debug!(user_id = %uid, credential_id = %bound_id, "亲和性复用凭据");
                             // 续期，使持续活跃的会话不因 TTL 到期而解绑
                             self.affinity.touch(uid);
                             return Some(self.commit_selection(entry));
                         }
+                        // 注：归一化后两种模式都走下方同一套排序键，所以这条"落到下方分流"
+                        // 现在**真的会分流**。此前 priority 模式下下方是裸 min_by_key(priority)，
+                        // 解绑后重选常常又选回同一个饱和号并 affinity.set 重绑 → 解绑每次白做（活锁）。
                         tracing::debug!(
                             user_id = %uid,
                             credential_id = %bound_id,
-                            "亲和性绑定号已 RPM 饱和，本次不复用，改走 balanced 分流到空闲号"
+                            "亲和性绑定号已饱和或熔断，本次不复用，改走均衡分流到健康空闲号"
                         );
                     } else {
                         // 绑定的凭据已不可用（禁用/冷却/限流），解绑后按常规策略重选
@@ -2112,22 +2552,73 @@ impl MultiTokenManager {
             }
         }
 
-        let mode = self.load_balancing_mode.lock().clone();
-        let mode = mode.as_str();
+        // ⭐ 归一化：`priority` 模式走与 `balanced` **完全同一套**排序键逻辑（见 effective_scheduling）。
+        // 裸 priority 分支（仅 min_by_key(priority)）已删除——它缺失 balanced 的全部 5 项保护
+        // （RPM 饱和硬门 / 熔断沉底 / inflight 均衡 / 余额加权 / 族级连坐），且平局恒选下标最小的号。
+        let sched = self.effective_scheduling();
 
-        let selected = match mode {
-            "balanced" => {
-                // 自适应分流排序键（升序 min_by_key）：
-                // ① ⭐**健康分档 neg_p_bucket**（首要）：p_avail = 熔断门×健康×(1-RPM压力)×(1-负载),
-                //    量化成 0..100 桶取负 → p_avail 越高排越前。熔断 Open 的号/族 p_avail=0 自然沉底、
-                //    半开期按 admit_prob 概率软降权(试探性放回)、健康差的号被压后。族键连坐:M365 同租户
-                //    共享一个 health(整族一起沉),IdC/social 各自 cred:{id} 独立(坚强兜底不受连坐)。
-                // ② rpm 饱和(硬软上限)③在途④近60s RPM⑤终身成功数⑥优先级:同健康档内的精细分流兜底。
-                // p_avail 已内含 rpm 压力/在途,②③④作同档兜底仍保留(粒度更细+rpm_limit=0 时 p_avail 不含压力)。
+        let selected = {
+            {
+                // 自适应分流排序键（升序 min_by_key）——**共 10 位**，完整定义见本闭包末尾的元组，
+                // 那里是唯一权威；本概览只说明各位的作用与次序，改元组时必须同步这里。
+                //
+                // ① unusable                真不可用(p_avail=0 或 RPM 饱和)沉底 —— 优雅溢出
+                // ② starved                 ⭐反饥饿强制探测(0=已饥饿排最前)；排在 ① 之后故不绕硬门
+                // ③ prio_key                开关开则按 priority 分层；关时恒 0
+                // ④ health_tier             健康 3 档粗门。p_avail = 熔断门×健康×(1-RPM压力)×(1-负载)。
+                //                           熔断 Open 的号/族 p_avail=0 自然沉底、半开期按 admit_prob
+                //                           软降权。族键连坐：M365 同租户共享一个 health(整族一起沉)，
+                //                           IdC/social/api_key 各自 cred:{id} 独立(坚强兜底不受连坐)。
+                // ⑤ inflight_now            ⭐同档内在途最少优先 —— 治惊群核心
+                // ⑥ slot_pressure_permille  ⭐在途/自身容量千分比(大池高基数区分)
+                // ⑦ rpm_usage_permille      RPM 已用率低的先选(按容量比例分流)
+                // ⑧ neg_p_fine              p_avail 精细兜底(含余额加权)
+                // ⑨ success_count           终身成功数
+                // ⑩ priority_tiebreaker     优先级末位兜底(同开关门控，关时恒 0)
+                //
+                // ⚠️ 健康分档**不是**首要键（历史注释曾如此描述，已不成立）：①② 先于它。
+                // 这是刻意的 —— 真不可用的号必须沉底，饥饿号必须能拿到探测机会，
+                // 二者都优先于"谁更健康"。
+                // p_avail 已内含 rpm 压力/在途，⑤⑥⑦ 作同档兜底仍保留
+                // （粒度更细 + rpm_limit=0 时 p_avail 不含压力）。
                 // 是否叠加优先级分发（热更开关）。开启时:先按可用性粗分层(不可用/饱和的沉底),
                 // 再按 priority 分层(越小越优先),层内仍按健康/负载均衡。这样高优先级号被优先用,
                 // 但整层被打爆(p_avail=0 或饱和)时优雅溢出到下一优先级层,不死磕单个坏号。
-                let prio_first = self.priority_in_balanced.load(Ordering::Relaxed);
+                // 归一化后 prio_first 由 effective_scheduling 决定：
+                // - 配置 "priority" → 恒 true（priority 语义 = 按优先级分层，层内均衡，整层打爆才溢出）
+                // - 配置 "balanced" → 沿用 priority_in_balanced 开关（默认 false，纯健康/负载均衡）
+                let prio_first = sched.priority_layered;
+                // ⭐ 自适应 inflight 归一基准：**本轮选号只算一次**，所有候选共用同一分母。
+                //
+                // 必须一次算定（而非每个候选各算）：否则各候选分母不同 → 排序键非传递 →
+                // min_by_key 的比较器失去全序 → 偶发选到负载更高的号（与下方"快照后是稳定全序"
+                // 的既有约定一致）。
+                //
+                // 为什么需要自适应（实测确证的企业级真断点）：固定 LOAD_REF=8 时，
+                // p90 延迟(17.1s)下 6000 RPM/200 号 → 每号常态在途 8.6 → 全池 load 同时 clamp 到 1.0
+                // → p_avail 的 (1-0.5*load) 退化成常数 → 负载维度整体失效。
+                // adaptive_load_ref 用 max(8.0, 平均在途×2)：小池恒取地板 8.0（零回归），
+                // 高负载时随平均放大，保证池内**相对**负载差异始终可分辨。
+                let total_inflight: u64 = available
+                    .iter()
+                    .map(|e| e.inflight.load(Ordering::Acquire) as u64)
+                    .sum();
+                let load_ref =
+                    crate::kiro::health::adaptive_load_ref(total_inflight, available.len());
+                // ⭐ RPM 计数**一次加锁批量取回**（企业级并发前提）。
+                //
+                // 此前排序键闭包对每个候选各调一次 `self.rpm.count(e.id)`（键里 2 处 +
+                // 饱和判定 1 处），每次都独立加 `RpmTracker` 的锁 —— 43 号池一次选号
+                // 最多 129 次加锁，而这整段都在 `entries` 锁临界区内。1000 RPM
+                // （≈17 次选号/秒）下锁竞争与临界区时长被成倍放大，选号成为串行瓶颈。
+                //
+                // 现在一次取回全部候选的计数：锁获取 O(n) → O(1)，且闭包内变成纯
+                // HashMap 查表（无锁、无扫描）。配合 `RpmTracker` 内部改用 VecDeque
+                // 前缀弹出（摊还 O(1) 而非 O(w) 全扫），选号临界区从
+                // O(n×w) 降到 O(n)。
+                let cand_ids: Vec<u64> = available.iter().map(|e| e.id).collect();
+                let rpm_counts = self.rpm.counts_for(&cand_ids);
+                let rpm_of = |id: u64| rpm_counts.get(&id).copied().unwrap_or(0);
                 // L4 排序键闭包(供两趟复用):入参 &CredentialEntry,升序 min_by_key。
                 let sort_key = |e: &CredentialEntry| {
                         let key = e.credentials.family_key(e.id);
@@ -2136,18 +2627,35 @@ impl MultiTokenManager {
                         // p_avail 的 rpm_pressure 恒 0、速率维度从主键被剔除。effective_saturation_limit
                         // 只读原子镜像不锁 entries,闭包内调用安全。
                         let cred_rpm_cap = self.effective_saturation_limit(e.credentials.rpm_limit);
-                        let p = self.health.p_avail(
+                        // inflight 在**整个排序键内只读一次**。
+                        //
+                        // 此前这里与下方 `slot_pressure_permille` 各自 `load(Acquire)` 一次，
+                        // 于是同一个候选的排序键内部两组位可能来自不同时刻的 inflight：
+                        // 喂给 p_avail 的那次决定第④位 health_tier 与第⑧位 neg_p_fine，
+                        // 另一次决定第⑤位 inflight_now 与第⑥位 slot_pressure_permille。
+                        // 并发下（inflight 由 InflightGuard 无锁增减）两者可以相差 ±1，
+                        // 即键内自相矛盾。
+                        //
+                        // 而本闭包末尾的注释已明确「每个候选的排序键**只求值一次**快照」——
+                        // 双读违背该意图。收口成单次读既消除不一致，也少一次原子加载。
+                        //
+                        // ⚠️ 无法用测试覆盖：这是并发时序，构造不出「移除即失败」的确定性用例。
+                        // 依据是"与周边代码自述意图一致"而非实测收益，故刻意不改任何数值语义。
+                        let inflight_now = e.inflight.load(Ordering::Acquire);
+                        let p = self.health.p_avail_with_load_ref(
                             &key,
-                            self.rpm.count(e.id),
-                            e.inflight.load(Ordering::Acquire),
+                            rpm_of(e.id),
+                            inflight_now,
                             cred_rpm_cap,
+                            load_ref,
                         );
                         // L2:健康降为 3 档粗门(不再是首要连续键),让"负载"成为同档内一等分流键。
                         // 治惠群根因——旧代码 neg_p_bucket 首排,最健康的号哪怕背 7 个在途也压过空闲的
                         // 稍弱号,突发全被它吸走。现同档内按 在途 + 剩余名额 分流。
                         // ⚠️健康分档用**原始 p**(不含余额加权):余额绝不该把健康号打进坏档,只在同档细分。
                         let health_tier = crate::kiro::health::health_tier(p);
-                        let saturated = self.is_rpm_saturated_with_limit(e.id, e.credentials.rpm_limit);
+                        // 饱和判定复用批量计数,避免又一次独立加锁(口径与 effective_saturation_limit 一致)
+                        let saturated = rpm_of(e.id) >= cred_rpm_cap;
                         // 溢出闸:仅当该号"真不可用"(熔断 Open→p_avail=0 或 RPM 已饱和)时置 1 沉底,
                         // 保证优先级分层不会把流量钉死在一个已打爆的高优先级号上。用原始 p(余额不该把
                         // 健康号判成不可用)。
@@ -2156,7 +2664,7 @@ impl MultiTokenManager {
                         // 更贴"容量差异化的号"(大容量号能接更多)。用整数千分比避免浮点排序不确定。
                         // cred_rpm_cap 恒 >0(effective_saturation_limit 保证),不会除零。
                         let rpm_usage_permille =
-                            ((self.rpm.count(e.id) as u64 * 1000) / cred_rpm_cap as u64) as u32;
+                            ((rpm_of(e.id) as u64 * 1000) / cred_rpm_cap as u64) as u32;
                         // 余额加权(软偏置微调):同档、同在途、同 RPM 已用率时,按剩余额度比例细分——
                         // 余额多的号 p_weighted 略高(neg 更小)→ 先选,长期拉平号池余额。开关关/缺快照=因子1.0。
                         // 只作用在 neg_p_fine(第 6 位末位兜底键),前面在途/已用率相等才轮到 → 不掀翻 0.7.23 分流。
@@ -2168,15 +2676,80 @@ impl MultiTokenManager {
                         // 末位兜底同样受开关门控:关闭时置 0,确保 priority_in_balanced=false 时
                         // 优先级在整个排序键中完全不起作用,均衡纯粹由健康/在途/用率决定。
                         let priority_tiebreaker = if prio_first { e.credentials.priority } else { 0u32 };
+                        // ⭐ 高基数负载维度（企业级分流精度）：在途占**该号自身容量**的千分比。
+                        //
+                        // 为什么需要它：第④位是**裸 inflight**（绝对值）。400 号池中同 health_tier
+                        // 的号 inflight 普遍落在 5~7，只有 3 档区分度 → 大量候选在 ④ 上完全平局；
+                        // 若各号 rpm_limit 相同，第⑤位 rpm_usage_permille 也高度重合 →
+                        // 一路平局到第⑥位 neg_p_fine。实测（5 号小池即已如此）：
+                        // gini(inflight) median 0.524、最热/最冷 2.4x。
+                        //
+                        // 为什么不替换④：④的语义是"绝对在途最少优先"，是治惊群的核心
+                        // （突发涌入时必须优先给完全空闲的号，不管它容量多大）。本维度是
+                        // **容量归一**后的相对压力，回答的是"按各自体量谁更该接"——两者互补：
+                        //   同 inflight 但容量不同的号，本维度把大容量号排前（它更能扛）；
+                        //   同容量不同 inflight 的号，④已先分开，本维度不改变其相对次序。
+                        //
+                        // 与改动④（自适应 LOAD_REF）不重复惩罚：那一项作用在 p_avail 内部、
+                        // 归一分母是**池平均在途**（跨号横向比较）；本项归一分母是**该号自身容量**
+                        // （纵向比较自身余量），信息源不同、且分别落在排序键的第⑥位与第⑤位，
+                        // 不构成同一信号的二次放大。
+                        //
+                        // 整数千分比（非浮点）：保证排序确定性，不引入浮点比较的不稳定性。
+                        // cred_rpm_cap 恒 >0（effective_saturation_limit 保证），不会除零。
+                        // 复用上方那次读（键内单一快照），不再重复 load。
+                        let slot_pressure_permille =
+                            ((inflight_now as u64 * 1000) / cred_rpm_cap as u64) as u32;
+                        // ⭐ 第②位 starved —— 反饥饿强制探测。
+                        //
+                        // ⚠️ 以下"实测缺陷"一节记录的是**低负载全平局导致偏斜**这个问题本身，
+                        // 它仍然真实。但当年针对它引入的那个**随机打散键 `tie_break_jitter`
+                        // 已被删除**（理由：拿不出"移除它即失败"的测试，属无证据支撑的改动），
+                        // 现在真正兜住这个问题的是本键 `starved` + 下方 STARVATION_PROBE_SECS。
+                        // 读到下面"为什么用随机数"那一段时请注意：**排序键里已没有随机项**。
+                        //
+                        // ## 实测缺陷（问题描述，仍有效）
+                        //
+                        // 线上 6 号池、52 次请求全部成功（无坏号）实测：
+                        //   gini 0.378、最热/最冷 **6.67x**（idx0 的 #208 拿 20 次，idx5 的 #213 只 3 次）。
+                        //
+                        // 根因是**低负载下前六个键会全部平局**：
+                        //   - 全池健康 → ①②③ 恒等；
+                        //   - 每秒几个请求、响应即归零 → `inflight` 大部分时刻恒 0 → ④⑤ 恒 0；
+                        //   - `rpm_usage_permille` 用的是 60s 滑窗，**过期即归零** → 刚服务过的号
+                        //     一分钟后又变回 0，⑥ 也追不上；
+                        //   - ⑦ 的 p_avail 在全健康时高度重合。
+                        // 而 `min_by_key` 在全平局时**恒返回第一个元素**，于是流量持续偏向
+                        // `entries` 里下标靠前的号 —— 与观测到的 idx0 最热完全一致。
+                        //
+                        // ⑧ `success_count`（终身成功数）本该纠正这个，但它排在 ⑥ 之后：
+                        // 刚服务过的号一旦滑窗过期，⑥ 就回到 0 并再次胜出，⑧ 根本轮不到。
+                        //
+                        // ## 为什么不把 ⑨ success_count 提前来纠正
+                        //
+                        // 把终身成功数提前会造成**新号饥饿的反向倾斜**：新入池的号 success=0，
+                        // 会被连续灌满直到追平全池，期间既打爆新号又浪费老号容量。
+                        // （历史上这里曾用随机打散键解决，那个键已删除，见本块开头的说明。）
+                        //
+                        // ⭐ 反饥饿强制探测（结构性兜底，见 STARVATION_PROBE_SECS）：
+                        // 0 = 已饥饿(超窗未被选中) → 排到最前；1 = 正常。
+                        // 排在 unusable 之后：真不可用的号仍沉底，探测不绕过硬门。
+                        // 排在 prio_key 之前：代价是"偶尔一个低优先级饥饿号插队一次"，
+                        // 换来的是任何单向状态缺陷都不会让号被永久排除 —— 这个交换是刻意的。
+                        let starved = u8::from(
+                            e.last_selected_at.get().elapsed().as_secs() < STARVATION_PROBE_SECS,
+                        );
                         (
-                            unusable,                           // ① 真不可用沉底(优雅溢出)
-                            prio_key,                           // ② 开关开:按优先级分层;关:恒 0
-                            health_tier,                        // ③ 健康 3 档粗门(坏号沉档)
-                            e.inflight.load(Ordering::Acquire), // ④ ⭐同档内在途最少优先(治惠群核心)
-                            rpm_usage_permille,                 // ⑤ 已用率低的先选(按容量比例分流)
-                            neg_p_fine,                         // ⑥ p_avail 精细兜底(确定性,防抖动)
-                            e.success_count,                    // ⑦ 终身成功数
-                            priority_tiebreaker,                // ⑧ 优先级末位兜底(同开关门控,关:恒 0)
+                            unusable,                // ① 真不可用沉底(优雅溢出)
+                            starved,                 // ② ⭐饥饿号强制探测(0=饥饿排前)
+                            prio_key,                // ③ 开关开:按优先级分层;关:恒 0
+                            health_tier,             // ④ 健康 3 档粗门(坏号沉档)
+                            inflight_now,            // ⑤ ⭐同档内在途最少优先(治惠群核心)
+                            slot_pressure_permille,  // ⑥ ⭐在途/自身容量千分比(大池高基数区分)
+                            rpm_usage_permille,      // ⑦ RPM 已用率低的先选(按容量比例分流)
+                            neg_p_fine,              // ⑧ p_avail 精细兜底(含余额加权)
+                            e.success_count,         // ⑨ 终身成功数
+                            priority_tiebreaker,     // ⑩ 优先级末位兜底(同开关门控,关:恒 0)
                         )
                 };
                 // L4:两趟选号。第一趟只在**非饱和**候选里选(硬门,RPM 成真天花板);
@@ -2186,10 +2759,14 @@ impl MultiTokenManager {
                 // 不用 min_by(闭包每次比较重算 sort_key):sort_key 读 inflight(无锁 fetch_update)、
                 // p_avail(独立 Mutex,锁外调用)等并发可变态,重算会让比较器非传递——中途某号被 429
                 // 降档时,已被早期淘汰的真最优号不会回来,偶发选到负载更高的号。快照后是稳定全序。
+                // 第一趟的饱和过滤同样复用批量计数（原先每个候选再各加一次 RpmTracker 锁）。
                 let non_saturated: Vec<_> = available
                     .iter()
                     .copied()
-                    .filter(|e| !self.is_rpm_saturated_with_limit(e.id, e.credentials.rpm_limit))
+                    .filter(|e| {
+                        rpm_of(e.id)
+                            < self.effective_saturation_limit(e.credentials.rpm_limit)
+                    })
                     .map(|e| (sort_key(e), e))
                     .collect();
                 if !non_saturated.is_empty() {
@@ -2207,13 +2784,6 @@ impl MultiTokenManager {
                         .min_by_key(|(k, _)| *k)
                         .map(|(_, e)| e)
                 }
-            }
-            _ => {
-                // priority 模式（默认）：选择优先级最高的
-                available
-                    .iter()
-                    .min_by_key(|e| e.credentials.priority)
-                    .copied()
             }
         };
 
@@ -2371,6 +2941,9 @@ impl MultiTokenManager {
     fn commit_selection(&self, entry: &CredentialEntry) -> (u64, KiroCredentials, InflightGuard) {
         let guard = InflightGuard::acquire(entry.inflight.clone());
         self.rpm.record(entry.id);
+        // 反饥饿探测的时间基准（见 STARVATION_PROBE_SECS）。用 Cell 而非 &mut：
+        // 本函数按既有约定收 &CredentialEntry（选号闭包里持的是不可变引用）。
+        entry.last_selected_at.set(Instant::now());
         (entry.id, entry.credentials.clone(), guard)
     }
 
@@ -2435,6 +3008,103 @@ impl MultiTokenManager {
         discounted.saturating_sub(reserve).max(1)
     }
 
+    /// RPM 硬门在当前配置下是否**真的**对调度生效(而非仅仅是一个数字)。
+    ///
+    /// 只报告"是否生效"，绝不改变 `effective_saturation_limit` 的返回值语义——那是
+    /// balanced 排序键 `rpm_usage_permille` 与 `health::p_avail` 的 rpm_pressure 共用的
+    /// 调度真相源，改它会掀翻分流。这里只回答"对外要不要把 rpm>=阈值 报告为饱和"。
+    ///
+    /// 推导依据(见 select_next_credential / transient_wait_outcome 逐路径读码):
+    /// - `balanced` 模式下 `non_saturated` 两趟选号硬门(2194-2214)才真正按饱和降权候选；
+    ///   `priority` 模式的 `min_by_key(priority)` 分支完全不读饱和，饱和判定对结果零影响。
+    /// - 亲和解绑(2085-2118)即便判定 `bound_saturated` 解绑，解绑后仍落进上面的 mode 分支，
+    ///   在 priority 模式下同样不受影响——解绑本身不改变最终选中的凭据。
+    /// - `transient_wait_outcome` 的背压分支(2340-2354)只在 `select_next_credential` 返回
+    ///   `None` 时才可能被读到；priority 模式下 `is_entry_selectable` 不含 RPM 判定，只要还有
+    ///   未冷却未限流的候选就必返 `Some`，该分支实际不可达。
+    /// 因此"硬门生效"当且仅当 `balanced` 模式——`rpm_hard_gate_overload_wait` 单独存在时
+    /// 不改变 priority 模式下的调度结果，故不纳入本判据。
+    ///
+    /// 另外:只有 1 个凭据时"分流"概念不适用(无处可分)，恒不算生效。
+    ///
+    /// pub:供 admin/service.rs 的 `ratelimit_insights` 复用，避免 UI 侧另起一套判据
+    /// 与调度真实生效条件失配(那正是本次要修的"虚假饱和"问题本身)。
+    pub fn rpm_saturation_gate_active(&self) -> bool {
+        if self.total_count() <= 1 {
+            return false;
+        }
+        // ⚠️ 归一化后**两种模式都走同一套排序键**（见 effective_scheduling），
+        // 故 RPM 饱和硬门在两种模式下都真实生效——不能再只认 "balanced"，
+        // 否则 priority 模式下调度已按饱和拦下、面板却报 rpmSaturated=false（观测口径反向漂移）。
+        true
+    }
+
+    /// sticky `current_id` 复用的**健康前提**：未 RPM 饱和 且 熔断未 Open。
+    ///
+    /// 为什么需要（见 acquire_context 里 current_hit 处的完整根因说明）：sticky 命中会**整段跳过**
+    /// `select_next_credential`，而 `is_entry_selectable` 不含熔断/饱和判定，导致坏号被无限复用。
+    ///
+    /// 半开期（`HalfOpen { admit_prob }`）按概率放行而非一律拒绝：熔断退避到期后必须允许
+    /// 试探性流量回到该号，否则它永远回不到 current 位置、也永远无法通过连续成功恢复 Closed。
+    ///
+    /// 随机性说明：本函数在一次请求里**只被调用一次**（只判 current_id 那一个号），
+    /// 不像 `is_entry_selectable` 会在一轮选号里对每个候选各调一次——故用随机数不会造成
+    /// 同一轮内自相矛盾的判定。
+    ///
+    /// 调用约定：调用方已持 `entries` 锁；本函数只读原子镜像与 health/rpm 的独立锁，不重入 entries。
+    fn is_sticky_reuse_healthy(&self, entry: &CredentialEntry) -> bool {
+        if self.is_rpm_saturated_with_limit(entry.id, entry.credentials.rpm_limit) {
+            return false;
+        }
+        let fam = entry.credentials.family_key(entry.id);
+        match self.health.snapshot(&fam) {
+            // 无 health 记录 = 从未出问题，视为满血（与 p_avail 的 or_default 语义一致）。
+            None => true,
+            Some(s) => {
+                if s.circuit_open {
+                    return false;
+                }
+                if s.half_open {
+                    // 半开：按 admit_prob 概率放行，给恢复留通路。
+                    return fastrand::f64() < s.admit_prob;
+                }
+                true
+            }
+        }
+    }
+
+    /// 生效的调度语义（`load_balancing_mode` 归一化的**唯一真相源**）。
+    ///
+    /// ## 为什么归一化
+    /// 历史上 `priority` 模式（**出厂默认**，`config.rs` 的 `default_load_balancing_mode`）的选号
+    /// 只有一行 `min_by_key(|e| e.credentials.priority)`，与 `balanced` 那套完整排序键**并列存在**，
+    /// 于是 balanced 独有的 5 项保护在默认部署下全部失效：
+    ///   ① RPM 饱和硬门（两趟选号）② health 熔断 Open 沉底 ③ inflight 负载均衡
+    ///   ④ 余额加权 ⑤ 族级连坐
+    /// 且 `min_by_key` 平局取第一个 → 同优先级多号**恒选 entries 里下标最小（最早创建）那个**。
+    ///
+    /// 实测后果（5 号池、priority 全为 0）：某号 rpm=23 而另一号 rpm=1（负载差 23 倍）；
+    /// 5 个号里 4 个熔断 `Open`（`admit_prob=0`）却照样接流量（熔断只经 `p_avail` 进 balanced
+    /// 排序键，而 `is_entry_selectable` 不含熔断判定）；亲和饱和解绑后重选又回到同一个饱和号
+    /// （解绑逻辑每次正确触发、每次白做——注释里写的"落到下方 balanced 分流"在 priority 模式并不存在）。
+    ///
+    /// ## 归一化语义
+    /// `priority` ≡ `balanced` + `priority_in_balanced=true`。后者的既有语义（见 `config.rs` 注释）
+    /// 正是"先按 priority 分层（越小越优先），**层内**仍按健康/负载均衡，整层饱和/熔断才优雅溢出
+    /// 到下一优先级层"——功能上是裸 priority 的**严格超集**：优先级语义完整保留，且不再死磕单个坏号。
+    ///
+    /// ## 兼容性
+    /// **只在读取时归一化，绝不改写用户 `config.json`**：配置里的 `"priority"` 字符串保持不动，
+    /// 面板照常显示原值，`set_load_balancing_mode` 的合法值校验不变。用户无需改配置即受益。
+    fn effective_scheduling(&self) -> SchedulingSemantics {
+        let is_priority_mode = self.load_balancing_mode.lock().as_str() != "balanced";
+        SchedulingSemantics {
+            // priority 模式恒按优先级分层；balanced 模式沿用开关（默认 false = 纯健康/负载均衡）。
+            priority_layered: is_priority_mode
+                || self.priority_in_balanced.load(Ordering::Relaxed),
+        }
+    }
+
     /// 获取 API 调用上下文
     ///
     /// 返回绑定了 id、credentials 和 token 的调用上下文
@@ -2459,6 +3129,19 @@ impl MultiTokenManager {
 
     /// 上游 429 反馈:让入站整形的 RPM 自动挡乘性降档(provider 检到上游限流时调用)。
     pub fn report_upstream_rate_limited(&self) {
+        self.throttle.report_upstream_429();
+    }
+
+    /// 报告**非 429 的上游压力信号**（账户被暂停 / 5xx 风暴），同样触发入站 AIMD 降档。
+    ///
+    /// 为什么需要：AIMD 此前只由 429 驱动（`report_upstream_429` 仅在 provider 的两处
+    /// 429 分支被调），于是 403 suspend 风暴与 500 风暴**完全不会**让入站 RPM 降档 ——
+    /// 网关继续按原速率往已经在拒绝我们的上游灌流量，把风控进一步激化。
+    /// 实测：一小时 408 次 500 + 12 小时 88 次 suspend 期间，入站整形毫无反应。
+    ///
+    /// 复用 `report_upstream_429` 的降档路径（含去抖与「升档饿死」死锁修复），
+    /// 不另造一套乘性降档逻辑 —— 那会绕开已经修好的 `last_md_nanos` 语义。
+    pub fn report_upstream_pressure(&self) {
         self.throttle.report_upstream_429();
     }
 
@@ -2491,9 +3174,6 @@ impl MultiTokenManager {
         let mut race_reselect_count = 0usize;
         const MAX_RACE_RESELECT: usize = 64;
         let wait_started = Instant::now();
-        let is_opus = model
-            .map(|m| m.to_lowercase().contains("opus"))
-            .unwrap_or(false);
 
         loop {
             if attempt_count >= max_attempts {
@@ -2507,46 +3187,90 @@ impl MultiTokenManager {
             // credentials 快照仅用于选号阶段（commit_selection 已占在途名额）；
             // token 获取改由 try_ensure_token 内部按 id 重读最新凭据，故此处不再透传。
             let (id, _credentials, inflight) = {
-                let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
-
-                // balanced 模式：每次请求都重新均衡选择，不固定 current_id
-                // priority 模式：优先使用 current_id 指向的凭据
-                // 命中时在同一 entries 锁内占用在途名额（commit_selection），
-                // 保证 inflight 计数相对并发选号原子可见。
-                let current_hit = if is_balanced {
-                    None
-                } else {
-                    let entries = self.entries.lock();
-                    let current_id = *self.current_id.lock();
-                    entries
-                        .iter()
-                        .find(|e| e.id == current_id && self.is_entry_selectable(e, is_opus, model.unwrap_or("")))
-                        .map(|e| self.commit_selection(e))
-                };
-
-                if let Some(hit) = current_hit {
-                    hit
-                } else {
-                    // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
+                // 🔴 已删除的 sticky `current_id` 选号捷径（实测负载失衡的真正元凶）
+                //
+                // 旧逻辑：`priority` 模式下（出厂默认）只要 `current_id` 指向的号通过
+                // `is_entry_selectable`，就直接 `commit_selection` 复用，
+                // **`select_next_credential` 压根不执行** → 排序键、两趟饱和硬门、亲和解绑全部不运行。
+                // 而 `is_entry_selectable` 只查 disabled / custom_api / opus / allowed_models /
+                // model_blocklist / cooldown / rate_limiter —— **不含熔断、不含饱和、不含 inflight**。
+                // 于是一个熔断 Open（admit_prob=0）+ rpm 饱和 + inflight 爆满的号会被**无限复用**，
+                // 直到它恰好进入 cooldown 或被禁用才换人。
+                //
+                // 实测（5 号池）：currentId 指向的号被钉住吃流量、同池另一号 rpm=0 完全空转；
+                // gini(rpm) 随时间从 0.06 单调恶化到 0.41；5 个号里 4 个熔断 Open 却仍在接流量。
+                //
+                // 为什么是**删除**而非"加健康前提"：先前尝试过只在"饱和或熔断"时放弃粘性，但
+                // 回归测试 `test_priority_mode_same_priority_spreads_load` 证明这不够——号**健康时**
+                // 粘性合法生效，于是 6 个连续请求全落同一号（`{1: 6}`），负载压根不分摊。
+                // sticky 的语义（钉住一个号直到它坏掉）与"按在途/RPM 均衡分摊"在根本上互斥，
+                // 而它唯一存在的分支正是刚被归一化掉的 priority 模式（见 effective_scheduling）。
+                // 保留它就等于保留"归一化前的旧行为"，故整段移除，两种模式都每次走完整均衡选号。
+                //
+                // `current_id` 字段本身**保留**：它仍是有意义的可观测状态（面板 currentId、
+                // 优先级变更后的 select_highest_priority 切换、failover 轨迹），只是不再作为选号捷径。
+                {
+                    // 每次请求都走完整的均衡选号（两种模式统一）。
                     let mut best = self.select_next_credential(model, user_id);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
                         let mut entries = self.entries.lock();
+                        // ⭐ 可自愈的原因集合（**刻意不含** AccountSuspended / QuotaExceeded /
+                        // InvalidRefreshToken / RequestLimitReached / Passthrough* ——
+                        // 那些要么真被封、要么额度耗尽、要么配置坏，复活只会白撞）。
+                        //
+                        // 🔴 修复的缺陷（另一位 review 抓到，线上数据确证）：此前只匹配
+                        // `TooManyFailures`，而 403 风控走的是 `SuspiciousActivityAuto` ——
+                        // 它自己的注释明写 403 是**整池瞬时风控**（历史事故：403 曾被当永久封禁
+                        // → 12h 内 88 次误禁 + 36 次全池活锁）。于是一次 IP 级风控把全池打成
+                        // SuspiciousActivityAuto 后**没有任何自动恢复路径**。
+                        //
+                        // 线上实测（48h）：`判定为死号并自动禁用` 46 次，而
+                        // `执行自愈` **0 次** —— 自愈从未对这个原因生效过。
                         if entries.iter().any(|e| {
-                            e.disabled && e.disabled_reason == Some(DisabledReason::TooManyFailures)
+                            e.disabled && is_self_healable_reason(e.disabled_reason)
                         }) {
                             tracing::warn!(
                                 "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
                             );
+                            // 被自愈复活的号 id，供放锁后清旁挂结构 + 落盘。
+                            let mut healed_ids: Vec<u64> = Vec::new();
                             for e in entries.iter_mut() {
-                                if e.disabled_reason == Some(DisabledReason::TooManyFailures) {
+                                if is_self_healable_reason(e.disabled_reason) {
                                     e.disabled = false;
                                     e.disabled_reason = None;
-                                    e.failure_count = 0;
+                                    e.disabled_at = None;
+                                    // 走单一收口：原先只清 failure_count，漏了
+                                    // refresh_failure_count 与 consecutive_suspicious
+                                    // → 复活的号一次风控/刷新失败即再次禁用。
+                                    e.clear_transient_counters();
+                                    healed_ids.push(e.id);
                                 }
                             }
                             drop(entries);
+
+                            // 清旁挂结构（各有独立锁，必须在 entries 锁外）：残留冷却/退避
+                            // 会让刚复活的号立刻又被选号硬门跳过，自愈等于没做。
+                            for id in &healed_ids {
+                                self.cooldown.clear_cooldown(*id);
+                                self.rate_limiter.reset(*id);
+                            }
+
+                            // 落盘：自愈此前**只改内存**，磁盘仍是 disabled=true。
+                            // 自动禁用落盘（persist_disabled_state）上线后，这个洞从
+                            // "重启即恢复"恶化成"重启回死态"——面板显示可用、磁盘却全死，
+                            // 重启后整池以 disabled 读回，且没有任何请求能触发下一次自愈
+                            // （自愈的前提是"池中存在 TooManyFailures 禁用号"，重启后
+                            // disabled_reason 仍在，但用户看到的是整池不可用）。
+                            // 落盘失败不能中断请求：内存已复活，记 error 让运维可见即可。
+                            if let Err(e) = self.persist_credentials() {
+                                tracing::error!(
+                                    "全池自愈已在内存生效，但落盘失败（重启后将回到禁用态）: {}",
+                                    e
+                                );
+                            }
+
                             best = self.select_next_credential(model, user_id);
                         }
                     }
@@ -2635,12 +3359,80 @@ impl MultiTokenManager {
                                     retry_after
                                 );
                             }
-                            // 无任何可用候选(全禁用/硬门过滤):终态报"已禁用"。
+                            // 无任何可用候选。**必须区分两种成因**,否则把可重试的临时态报成永久态:
+                            //
+                            // ① `available == 0`:池子真的全禁用 → 报"已禁用",这是终态。
+                            // ② `available > 0`:号没被禁用,是被**模型级硬门**挡掉的
+                            //    (model_blocklist / allows_model 白名单 / supports_opus)。
+                            //
+                            // 🔴 修复的缺陷:旧代码两种情形都报同一句"所有凭据均已禁用({available}/{total})"。
+                            // 于是 ② 会产出自相矛盾的 `所有凭据均已禁用（2/2）`——2 个可用却说全禁用。更糟的是
+                            // 该串匹配不上 `map_provider_error` 的任何分支(既无 429/QUOTA 等关键词,也无
+                            // retry_after_secs 标记),落到末尾兜底 → **502 BAD_GATEWAY 且无 Retry-After**。
+                            // 而 ② 的绝大多数是 `model_blocklist`(某号对某模型返 INVALID_MODEL_ID 后加黑,
+                            // TTL 1800s),它是**限时的临时态**:TTL 到期即自动放行重试探。
+                            //
+                            // 后果链(线上 24h 实测):577 次 ② 类假报,集中在订阅不含的模型
+                            // (gpt-5.6-sol/luna/terra 各 ~87、deepseek-3.2 84、glm-5 83)以及
+                            // claude-opus-5 88。客户端(Claude Code)把 502 当"服务端故障"而非"这个模型现在
+                            // 不可用",既不退避也不换模型,原样重发 → 再 502。同时这 577 条污染了
+                            // "池子耗尽"的统计口径,让真实耗尽(3221 次 available=0)的严重度无法评估。
+                            //
+                            // 修法:② 带 `retry_after_secs=` 标记走 `map_provider_error` 的既有 429 分支
+                            // (与"全池冷却"同款语义:可重试 + 明确退避秒数)。不新增字符串判据——那正是
+                            // 本缺陷的成因;复用已有的 retry_after_secs 协议,中文文案改动不会再让它失效。
                             WaitOutcome::NoCandidate => {
-                                let entries = self.entries.lock();
-                                // 注意:必须在 bail! 之前算 available,available_count() 会再锁 entries 致死锁。
-                                let available = entries.iter().filter(|e| !e.disabled).count();
-                                anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
+                                let available = {
+                                    let entries = self.entries.lock();
+                                    // 注意:必须在 bail! 之前算完并放锁,available_count() 会再锁 entries 致死锁。
+                                    entries.iter().filter(|e| !e.disabled).count()
+                                };
+                                if available == 0 {
+                                    // 🔴 必须带 `retry_after_secs=`：不带的话这个串**匹配不上
+                                    // `map_provider_error` 的任何分支**（既无该标记、也无
+                                    // model_unsupported_by_pool=1、也不含 QUOTA 等上游关键词）
+                                    // → 落到函数末尾兜底 → **502 且无 Retry-After**。
+                                    //
+                                    // 后果链（线上实测）：客户端（Claude Code）把 502 当"服务端
+                                    // 故障"而非"稍后重试"，其退避逻辑压根不启动 → 原样重发 →
+                                    // 又 502。2026-08-03 01:55–02:10 的耗尽窗口里，单个 5 分钟
+                                    // 桶就产生 937 次，全部是这一种。
+                                    //
+                                    // 0.7.45 修的是同一函数里的情形②（模型硬门，用
+                                    // model_unsupported_by_pool=1 标记），情形①（真耗尽）当时
+                                    // 未处理 —— 而它才是量最大的那个。
+                                    //
+                                    // 复用既有 retry_after_secs 协议而不新增字符串判据：后者正是
+                                    // 本类缺陷反复出现的成因（中文文案一改分类就失效）。
+                                    anyhow::bail!(
+                                        "所有凭据均已禁用（0/{}）retry_after_secs={}",
+                                        total,
+                                        POOL_EXHAUSTED_RETRY_AFTER_SECS
+                                    );
+                                }
+                                // ⚠️ 必须区分「限时」与「永久」两类模型硬门，否则只是把 502 死循环
+                                // 换成 429 死循环：
+                                // - `model_blocklist` 命中 → **限时**（TTL 到期自动放行）→ 可重试，带 retry_after。
+                                // - 拿不到 TTL（`allowed_models` 白名单不含该模型 / FREE 档不支持 opus）
+                                //   → 对这个模型是**永久**的，等多久都不会变 → 报不可重试的错误。
+                                //   若也带 retry_after，客户端（Claude Code）会每 5 分钟重试一次直到永远
+                                //   （下游 `map_provider_error` 还会把秒数 clamp 到 300）。
+                                let Some(remaining) = self.model_block_min_remaining(model) else {
+                                    anyhow::bail!(
+                                        "模型 {:?} 不被本号池支持（{}/{} 个号均因订阅档位或成本白名单不含该模型而被过滤，非号池耗尽，重试无效）model_unsupported_by_pool=1",
+                                        model.unwrap_or(""),
+                                        available,
+                                        total
+                                    );
+                                };
+                                let retry_after = remaining.as_secs().max(1);
+                                anyhow::bail!(
+                                    "模型 {:?} 当前无可用凭据（{}/{} 个号均被模型级过滤，非号池耗尽）retry_after_secs={}",
+                                    model.unwrap_or(""),
+                                    available,
+                                    total,
+                                    retry_after
+                                );
                             }
                         }
                     }
@@ -2673,7 +3465,13 @@ impl MultiTokenManager {
                         };
                     attempt_count += 1;
                     if !has_available {
-                        anyhow::bail!("所有凭据均已禁用（0/{}）", total);
+                        // 与上面 NoCandidate 那处同理：不带标记就落 502 无 Retry-After。
+                        // 这条路径是"刷新失败把最后一个号也禁用了"，同样可自愈。
+                        anyhow::bail!(
+                            "所有凭据均已禁用（0/{}）retry_after_secs={}",
+                            total,
+                            POOL_EXHAUSTED_RETRY_AFTER_SECS
+                        );
                     }
                 }
             }
@@ -2862,6 +3660,11 @@ impl MultiTokenManager {
                     cred.canonicalize_auth_method();
                     // 同步 disabled 状态到凭据对象
                     cred.disabled = e.disabled;
+                    // ⭐ 同步禁用原因与时刻。不落盘这两项时，重启后加载路径会把所有禁用号
+                    // 一律当成"手动禁用"，自动禁用原因（配额耗尽/被封/风控/连续失败）全部丢失，
+                    // 且以 reason 为判据的自愈逻辑被一并击穿。
+                    cred.disabled_reason = e.disabled_reason;
+                    cred.disabled_at = e.disabled_at.clone();
                     cred
                 })
                 .collect()
@@ -3109,6 +3912,10 @@ impl MultiTokenManager {
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
+                // 账户级风控计数归零：这正是"连续零成功"判据的另一半——健康号哪怕
+                // 偶发命中几次 403，一次成功就把计数清掉，永远到不了禁用阈值；
+                // 只有**真死号**（实测成功率恒 0%）才能一路累加到阈值。
+                entry.consecutive_suspicious = 0;
                 entry.success_count += 1;
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
                 tracing::debug!(
@@ -3150,6 +3957,31 @@ impl MultiTokenManager {
             }
         }
         self.save_stats_debounced();
+    }
+
+    /// 各号当前的生命周期累计 credit 花费（供面板做余额乐观修正）。
+    ///
+    /// 与 `balance_baselines()` 配对使用：两者之差 = 上次取余额真值**之后**新花掉的量。
+    /// 只读快照，不持锁外泄。
+    pub fn credits_used_snapshot(&self) -> HashMap<u64, f64> {
+        self.entries
+            .lock()
+            .iter()
+            .map(|e| (e.id, e.total_credits_used))
+            .collect()
+    }
+
+    /// 各号在「上次取到余额真值」那一刻的 credit 花费基线。
+    ///
+    /// 即 `BalanceSnapshot::credits_used_at_cache`。余额加权分流已在用它
+    /// （见 `balance_factor`），此处复用同一份数据供面板做乐观修正，
+    /// 避免为展示再造一条并行的基线链路。
+    pub fn balance_baselines(&self) -> HashMap<u64, f64> {
+        self.balance_snapshots
+            .read()
+            .iter()
+            .map(|(id, s)| (*id, s.credits_used_at_cache))
+            .collect()
     }
 
     /// 回推余额快照(AdminService 每 30 分钟余额刷新后调用)。一次性替换全表(读多写少)。
@@ -3270,6 +4102,7 @@ impl MultiTokenManager {
             if failure_count >= MAX_FAILURES_PER_CREDENTIAL {
                 entry.disabled = true;
                 entry.disabled_reason = Some(DisabledReason::TooManyFailures);
+                entry.disabled_at = Some(Utc::now().to_rfc3339());
                 disabled_now = true;
                 tracing::error!("凭据 #{} 已连续失败 {} 次，已被禁用", id, failure_count);
 
@@ -3365,14 +4198,100 @@ impl MultiTokenManager {
         self.health.on_429(&self.family_key_of(id));
     }
 
-    /// 报告凭据触发**账户级可疑活动风控**（`suspicious activity`+`temporary limits`）。
+    /// 报告凭据遇到上游 **5xx**，设 [`CooldownReason::ServerError`] 短冷却（30s，自动恢复）。
     ///
-    /// 与普通 429 的关键区别：走 [`CooldownReason::SuspiciousActivity`] 的**分钟级冷却**
-    /// （基线 3min，递增至上限 30min），而非普通限速的 15s 瞬时冷却。
-    /// 原因：可疑活动是账户级风控、持续数分钟且 Kiro 正在"调查"——15s 后重新入池会被
-    /// 立刻再限，反复砸只会加重可疑度、把账户推向真封禁。此处让该号**真正退避**，
-    /// 冷却期内不参与选号，等调查窗口过去自愈。不禁用、不计永久失败、不改发往上游字节。
+    /// 为什么需要它：此前非 429 的 5xx 只在 provider 里 sleep 200ms~2s 就换号，**不设任何
+    /// 冷却**，失败的号下一轮立刻又可能被选中。于是上游 500 风暴时（实测一小时 408 次 500）
+    /// 请求在同一批坏号之间来回打，把重试预算烧光却始终打在同一批号上。
+    /// `CooldownReason::ServerError` 这个枚举早就定义好了（cooldown.rs 含 30s 时长与
+    /// is_auto_recoverable=true），但在生产路径上**从未被设置过**——唯一调用方是 admin
+    /// 的手工冷却接口。这里把它接上。
+    ///
+    /// 与 429 的区别：5xx 多为上游整体故障而非该号的问题，故只设短冷却、不计永久失败、
+    /// 不碰 rate_limiter，也不动 health 的 429 计数（那是限流信号，不该被 5xx 污染）。
+    pub fn report_server_error(&self, id: u64) {
+        if self.cooldown_enabled.load(Ordering::Relaxed) {
+            let dur = self
+                .cooldown
+                .set_transient_cooldown(id, CooldownReason::ServerError);
+            tracing::warn!("凭据 #{} 遇上游 5xx，冷却 {:?}（自动恢复）", id, dur);
+        }
+    }
+
+    /// 报告凭据触发**账户级可疑活动风控**（`suspicious activity`+`temporary limits`，
+    /// 即上游 403 `TEMPORARILY_SUSPENDED`）。
+    ///
+    /// 三件事，**职责各自独立、互不 gate**：
+    /// 1. **计数**（恒执行）：`consecutive_suspicious += 1`，达
+    ///    [`MAX_CONSECUTIVE_SUSPICIOUS_BEFORE_DISABLE`] 即自动禁用该号。
+    /// 2. **冷却 + 族级健康惩罚**（受 `cooldown_enabled` 门控）：走
+    ///    [`CooldownReason::SuspiciousActivity`] 的递增退避（基线 20s → 上限 30min）。
+    /// 3. **限速器退避**（受 `rate_limit_enabled` 门控）。
+    ///
+    /// ## 为什么计数与自动禁用**必须**在 `cooldown_enabled` 之外（本轮修复的核心）
+    ///
+    /// 此前整个函数体被一个 `if self.cooldown_enabled` 包住，于是关掉"冷却"这个
+    /// 开关会连带关掉**识别坏号**的能力——三种不相关的职责被一个开关耦合。线上
+    /// `cooldownEnabled=false` 时实测：8 个成功率恒 0% 的死号跑了几小时，仍全部
+    /// `disabled=false` / `failureCount=0` / `healthStatus=null`，巡检显示"43 个号
+    /// 全可用"（假绿），而每条客户端请求都要在它们身上白撞一遍 → 最坏 43 次上游
+    /// 调用、耗尽 45s 墙钟预算才失败。用户体感就是"网关很慢"。
+    ///
+    /// 而且旧判据 `cooldown.trigger_count(id) >= 10` 本身也不可达：`report_success`
+    /// 调 `clear_cooldown` 会 `entries.remove()` 删掉冷却条目、`trigger_count` 归零，
+    /// 半死号（偶尔成功）永远到不了 10。故改用挂在凭据条目上的
+    /// `consecutive_suspicious`（详见其字段说明）。
+    ///
+    /// ## 为什么阈值是"连续零成功"而非"见过 403"
+    ///
+    /// 403 是**临时**态，历史上按永久封禁处理造成过生产事故（见
+    /// `endpoint/mod.rs::default_is_account_suspended`）。实测健康号（成功率
+    /// 90~100%）也会偶发命中 403，只有真死号才**连续**命中且期间零成功。
+    /// 任意一次成功即清零 → 健康号永不误禁。
     pub fn report_suspicious_activity(&self, id: u64) {
+        // ── 1. 计数 + 自动禁用（恒执行，不受任何冷却/限速开关影响）
+        let mut disabled_now = false;
+        let mut hit_count = 0u32;
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                if !entry.disabled {
+                    entry.consecutive_suspicious += 1;
+                    hit_count = entry.consecutive_suspicious;
+                    if self.auto_disable_suspicious.load(Ordering::Relaxed)
+                        && hit_count >= MAX_CONSECUTIVE_SUSPICIOUS_BEFORE_DISABLE
+                    {
+                        entry.disabled = true;
+                        entry.disabled_reason = Some(DisabledReason::SuspiciousActivityAuto);
+                        entry.disabled_at = Some(Utc::now().to_rfc3339());
+                        disabled_now = true;
+                        crate::common::recovery_metrics::bump_dead_token_disabled();
+                    }
+                }
+            }
+        }
+        if disabled_now {
+            tracing::error!(
+                "凭据 #{} 连续 {} 次账户级风控且期间零成功，判定为死号并自动禁用\
+                 （SuspiciousActivityAuto）；移出调度以免每个请求都在它身上白撞",
+                id,
+                hit_count
+            );
+            // 清亲和：否则绑定该号的会话会反复重选到已禁用凭据。
+            self.affinity.remove_by_credential(id);
+            // 必须落盘：save_stats_debounced 写的 StatsEntry 不含 disabled/disabled_reason，
+            // 不落盘则重启后死号以 enabled 回池、重走一遍禁用流程（白耗上游请求）。
+            self.persist_disabled_state(id);
+        } else if hit_count > 0 {
+            tracing::debug!(
+                "凭据 #{} 账户级风控连续第 {}/{} 次（一次成功即清零）",
+                id,
+                hit_count,
+                MAX_CONSECUTIVE_SUSPICIOUS_BEFORE_DISABLE
+            );
+        }
+
+        // ── 2. 冷却 + 族级健康惩罚（受 cooldown_enabled 门控）
         if self.cooldown_enabled.load(Ordering::Relaxed) {
             let dur = self
                 .cooldown
@@ -3389,29 +4308,9 @@ impl MultiTokenManager {
             // 选号时同族其它号 p_avail=0 一起沉底、不再逐个砸(治雪崩)。IdC/social 的 cred:{id}
             // 只连坐它自己(键独立),坚强兜底不受影响。冷却硬窗过后 health 走半开渐进放回。
             self.health.report_family_suspicious(&self.family_key_of(id), dur);
-
-            // 自动禁用(dwgx:账户不行了就自动禁用)：连续可疑活动触发达阈值,说明该号已被 Kiro 盯死、
-            // 冷却也顶格(30min)仍反复被限——继续放它参与调度只会不停砸、加重风控甚至触发真封禁。
-            // 达阈值即自动禁用并标注 SuspiciousActivityAuto(可人工/自愈重新启用),把它移出轮转。
-            const AUTO_DISABLE_TRIGGER: u32 = 10;
-            if self.auto_disable_suspicious.load(Ordering::Relaxed) && self.cooldown.trigger_count(id) >= AUTO_DISABLE_TRIGGER {
-                let mut entries = self.entries.lock();
-                if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                    if !entry.disabled {
-                        entry.disabled = true;
-                        entry.disabled_reason = Some(DisabledReason::SuspiciousActivityAuto);
-                        crate::common::recovery_metrics::bump_dead_token_disabled();
-                        tracing::warn!(
-                            "凭据 #{} 连续可疑活动风控达 {} 次，自动禁用（SuspiciousActivityAuto），移出调度避免继续加重风控",
-                            id,
-                            AUTO_DISABLE_TRIGGER
-                        );
-                        drop(entries);
-                        let _ = self.persist_credentials();
-                    }
-                }
-            }
         }
+
+        // ── 3. 限速器退避（受 rate_limit_enabled 门控）
         if self.rate_limit_enabled.load(Ordering::Relaxed) {
             // 可疑活动风控是瞬态（账户级软风控，会自愈）：限速器只需秒级退避即可，
             // 真正的分钟级退避由上面的 cooldown（SuspiciousActivity）承担；这里绝不长冻。
@@ -3466,6 +4365,22 @@ impl MultiTokenManager {
         }
     }
 
+    /// 该模型在**任意**凭据上的模型级黑名单最短剩余 TTL。全池都没被该模型加黑时返回 `None`。
+    ///
+    /// 用途：`WaitOutcome::NoCandidate` 且仍有未禁用号时，需要给客户端一个**准确的**退避秒数。
+    /// 黑名单是限时态（`MODEL_BLOCK_TTL`），最短剩余即"最早有号重新可试探"的时刻——比固定值更贴合
+    /// 实际恢复时间，避免客户端过早重发（撞进同一道硬门）或过晚重发（白等）。
+    ///
+    /// 只读不清理：调用点在错误路径上，惰性清理由 `is_model_blocked` 负责，此处避免额外写锁语义。
+    fn model_block_min_remaining(&self, model: Option<&str>) -> Option<StdDuration> {
+        let model = model.filter(|m| !m.is_empty())?;
+        let bl = self.model_blocklist.lock();
+        bl.iter()
+            .filter(|((_, m), _)| m == model)
+            .filter_map(|(_, &t)| MODEL_BLOCK_TTL.checked_sub(t.elapsed()))
+            .min()
+    }
+
     /// 统计对指定模型仍可选的凭据数（未禁用 && 未对该模型进黑名单）。
     /// model 为空串时退化为 available_count（无模型维度）。
     fn count_selectable_for_model(&self, model: &str) -> usize {
@@ -3499,6 +4414,7 @@ impl MultiTokenManager {
 
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
+            entry.disabled_at = Some(Utc::now().to_rfc3339());
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             // 设为阈值，便于在管理面板中直观看到该凭据已不可用
             entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
@@ -3554,6 +4470,7 @@ impl MultiTokenManager {
 
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::AccountSuspended);
+            entry.disabled_at = Some(Utc::now().to_rfc3339());
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
             crate::common::recovery_metrics::bump_dead_token_disabled();
@@ -3623,6 +4540,7 @@ impl MultiTokenManager {
 
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::TooManyRefreshFailures);
+            entry.disabled_at = Some(Utc::now().to_rfc3339());
 
             tracing::error!(
                 "凭据 #{} Token 已连续刷新失败 {} 次，已被禁用",
@@ -3677,6 +4595,7 @@ impl MultiTokenManager {
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::InvalidRefreshToken);
+            entry.disabled_at = Some(Utc::now().to_rfc3339());
             crate::common::recovery_metrics::bump_dead_token_disabled();
 
             tracing::error!(
@@ -3744,6 +4663,8 @@ impl MultiTokenManager {
         let entries = self.entries.lock();
         let current_id = *self.current_id.lock();
         let available = entries.iter().filter(|e| !e.disabled).count();
+        // 自动路由需要全局默认端点名参与解析（见 effective_endpoint）。
+        let cfg = self.config.load();
 
         ManagerSnapshot {
             entries: entries
@@ -3800,18 +4721,17 @@ impl MultiTokenManager {
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
                     refresh_failure_count: e.refresh_failure_count,
-                    disabled_reason: e.disabled_reason.map(|r| match r {
-                        DisabledReason::Manual => "Manual",
-                        DisabledReason::TooManyFailures => "TooManyFailures",
-                        DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
-                        DisabledReason::QuotaExceeded => "QuotaExceeded",
-                        DisabledReason::AccountSuspended => "AccountSuspended",
-                        DisabledReason::SuspiciousActivityAuto => "SuspiciousActivityAuto",
-                        DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
-                        DisabledReason::InvalidConfig => "InvalidConfig",
-                        DisabledReason::RequestLimitReached => "RequestLimitReached",
-                    }.to_string()),
+                    // 走单一收口 DisabledReason::as_str（回收站展示也用它，避免两份 match 漂移）。
+                    disabled_reason: e.disabled_reason.map(|r| r.as_str().to_string()),
+                    // 与 disabled_reason 成对下发（此前整条链都没接，面板恒 null）。
+                    disabled_at: e.disabled_at.clone(),
                     endpoint: e.credentials.endpoint.clone(),
+                    // 实际生效的端点（含自动路由结果）：面板要能区分"我固定了 cli"与
+                    // "系统替我自动选了 cli"，否则用户看不出 ksk_ 号究竟走了哪条协议。
+                    effective_endpoint: e
+                        .credentials
+                        .effective_endpoint(&cfg.default_endpoint)
+                        .to_string(),
                     inflight: e.inflight.load(Ordering::Acquire),
                     rpm: self.rpm.count(e.id),
                 })
@@ -3832,12 +4752,12 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             entry.disabled = disabled;
             if !disabled {
-                // 启用时重置失败计数
-                entry.failure_count = 0;
-                entry.refresh_failure_count = 0;
+                // 启用时重置全部进程内惩罚计数（单一收口，含 consecutive_suspicious）。
+                entry.clear_transient_counters();
                 entry.disabled_reason = None;
             } else {
                 entry.disabled_reason = Some(DisabledReason::Manual);
+                entry.disabled_at = Some(Utc::now().to_rfc3339());
             }
         }
         // 禁用凭据时清除其会话亲和性绑定，避免后续请求重选时反复尝试已禁用凭据
@@ -3881,6 +4801,32 @@ impl MultiTokenManager {
             // 0 归一为 None(继承全局),避免存 Some(0) 语义歧义;非 0 clamp 到合理上界
             // (服务端防呆:直打 API 的 u32 极值也自动修补,不信任前端校验)。
             entry.credentials.rpm_limit = rpm_limit.filter(|&v| v > 0).map(|v| v.min(MAX_RPM_LIMIT));
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 设置凭据级端点（走哪套 Kiro 协议）。`None`/空串 = 清除显式固定，回到**自动路由**
+    /// （`ksk_` 号 → `cli`，其余 → `config.defaultEndpoint`）。即时生效于下次请求。
+    ///
+    /// 端点名必须已注册，否则拒绝——存了不存在的名字会让该号的每个请求都在热路径上
+    /// 拿到「未知端点」错误（provider 的 `endpoint_for` 返 Err），等于静默废号。
+    pub fn set_credential_endpoint(&self, id: u64, endpoint: Option<String>) -> anyhow::Result<()> {
+        let cleaned = endpoint
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if let Some(ref name) = cleaned {
+            if crate::kiro::endpoint::build(name).is_none() {
+                anyhow::bail!("未知端点: {}", name);
+            }
+        }
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.endpoint = cleaned;
         }
         self.persist_credentials()?;
         Ok(())
@@ -4070,8 +5016,8 @@ impl MultiTokenManager {
             if entry.disabled_reason == Some(DisabledReason::RequestLimitReached) {
                 entry.request_count = 0;
             }
-            entry.failure_count = 0;
-            entry.refresh_failure_count = 0;
+            // 全部进程内惩罚计数走单一收口（含此前漏清的 consecutive_suspicious）。
+            entry.clear_transient_counters();
             entry.disabled = false;
             entry.disabled_reason = None;
         }
@@ -4224,25 +5170,29 @@ impl MultiTokenManager {
         let (credentials, token) = self.ensure_valid_token(id).await?;
 
         let cfg = self.config.load();
-        // 与主对话路径(endpoint/ide.rs)对齐:上游已迁 runtime.{region}.kiro.dev,
-        // 旧 q.{region}.amazonaws.com 已停用。此处深度验活曾漏迁,旧端点若停用会导致
-        // 验活恒失败 → 把活号误判成死号禁用。region 用稳健版(profileArn 严格解析)。
-        let region = credentials.effective_upstream_region(&cfg);
-        let host = format!("runtime.{}.kiro.dev", region);
-        let url = format!("https://{}/generateAssistantResponse", host);
+        // URL / 请求头 / body 加工全部交给**该凭据实际会用的端点实现**，与对话热路径
+        // (`KiroProvider::endpoint_for`) 同一口径。
+        //
+        // 为何不再手搓 `runtime.{region}.kiro.dev`：CLI(ksk_)号必须走
+        // `q.{region}.amazonaws.com` 服务根 + X-Amz-Target + 不带 profileArn，打 IDE 端点
+        // 稳定 403。而本函数把 403 当「权限被拒/疑似封号」上报，classify_balance_error 据此
+        // **自动禁用凭据** → 一个完全健康的 ksk_ 号会被验活自己弄死。交给端点抽象后，
+        // 将来新增端点也不必再改这里（历史上这里就漏迁过一次 host）。
+        let endpoint = crate::kiro::endpoint::for_credentials(&credentials, &cfg.default_endpoint);
         let machine_id = machine_id::generate_from_credentials(&credentials, &cfg);
-        let kiro_version = &cfg.kiro_version;
-        let os_name = &cfg.system_version;
-        let node_version = &cfg.node_version;
+        let rctx = crate::kiro::endpoint::RequestContext {
+            credentials: &credentials,
+            token: &token,
+            machine_id: &machine_id,
+            config: &cfg,
+            // 验活不涉及 1M 变体（探测体只有一句 "hi"），固定 false。
+            is_1m: false,
+        };
+        let url = endpoint.api_url(&rctx);
 
-        let user_agent = format!(
-            "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
-            os_name, node_version, kiro_version, machine_id
-        );
-        let x_amz_user_agent = format!("aws-sdk-js/1.0.34 KiroIDE-{}-{}", kiro_version, machine_id);
-
-        // 构建最小请求体（故意不合法，只为触发 suspend 检查）
-        let mut body = serde_json::json!({
+        // 构建最小请求体（故意不完整——缺 modelId 等必填字段，只为触发认证/suspend 检查）。
+        // profileArn 由端点的 transform_api_body 按各自规则注入（IDE 注入、CLI 绝不注入）。
+        let body = serde_json::json!({
             "conversationState": {
                 "conversationId": uuid::Uuid::new_v4().to_string(),
                 "currentMessage": {
@@ -4251,35 +5201,21 @@ impl MultiTokenManager {
                     }
                 }
             }
-        });
-        // 用 effective_profile_arn（与对话路径 endpoint/ide.rs 统一口径）:idc/social 缺
-        // arn 回退默认 BuilderId,external_idp 用动态解析到的真实 ARN。直接读
-        // profile_arn.unwrap() 会在 idc 号回退默认 ARN(profile_arn 本身仍 None)时 panic。
-        if let Some(arn) = credentials.effective_profile_arn() {
-            body["profileArn"] = serde_json::Value::String(arn);
-        }
+        })
+        .to_string();
+        let body = endpoint.transform_api_body(&body, &rctx);
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let client = build_client(effective_proxy.as_ref(), 30, self.config.load().tls_backend)?;
+        let client = build_client(effective_proxy.as_ref(), 30, cfg.tls_backend)?;
 
-        let mut request = client
-            .post(&url)
-            .header("content-type", "application/json")
-            .header("x-amzn-codewhisperer-optout", "true")
-            .header("x-amz-user-agent", &x_amz_user_agent)
-            .header("user-agent", &user_agent)
-            .header("host", &host)
-            .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-            .header("amz-sdk-request", "attempt=1; max=1")
-            .header("Authorization", format!("Bearer {}", token));
+        let request = endpoint.decorate_api(
+            client
+                .post(&url)
+                .header("content-type", endpoint.content_type()),
+            &rctx,
+        );
 
-        if credentials.is_api_key_credential() {
-            request = request.header("tokentype", "API_KEY");
-        } else if credentials.is_external_idp_credential() {
-            request = request.header("tokentype", "EXTERNAL_IDP");
-        }
-
-        let response = request.body(body.to_string()).send().await?;
+        let response = request.body(body).send().await?;
         let status = response.status();
 
         // 403 = suspended 或权限问题
@@ -4432,16 +5368,20 @@ impl MultiTokenManager {
     ) -> anyhow::Result<Option<(bool, f64)>> {
         let (credentials, token) = self.ensure_valid_token(id).await?;
         let cfg = self.config.load();
-        let region = credentials.effective_upstream_region(&cfg);
-        let host = format!("runtime.{}.kiro.dev", region);
-        let url = format!("https://{}/generateAssistantResponse", host);
+        // 与对话热路径同一端点抽象：CLI(ksk_)号走 q.{region}.amazonaws.com + X-Amz-Target，
+        // 不带 profileArn。若继续硬编码 IDE host，CLI 号每个模型都会 401/403，而本函数把
+        // 401/403 当"认证/账号级问题"直接 bail → 整轮探测中止并向面板报"账号有问题"。
+        let endpoint = crate::kiro::endpoint::for_credentials(&credentials, &cfg.default_endpoint);
         let machine_id = machine_id::generate_from_credentials(&credentials, &cfg);
-        let user_agent = format!(
-            "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
-            cfg.system_version, cfg.node_version, cfg.kiro_version, machine_id
-        );
-        let x_amz_user_agent =
-            format!("aws-sdk-js/1.0.34 KiroIDE-{}-{}", cfg.kiro_version, machine_id);
+        let rctx = crate::kiro::endpoint::RequestContext {
+            credentials: &credentials,
+            token: &token,
+            machine_id: &machine_id,
+            config: &cfg,
+            // 探测按原生 modelId 直发，不涉及 `[1m]` 变体。
+            is_1m: false,
+        };
+        let url = endpoint.api_url(&rctx);
 
         // 构造**与真实对话同构**的合法请求体（关键修复）：此前手搓的最小体缺 chatTriggerType/
         // origin 等必填字段，上游一律回通用 400（与"模型没权限"无关），导致探测非全绿即全红、
@@ -4470,39 +5410,28 @@ impl MultiTokenManager {
             .conversation_state;
         // 覆盖为探测目标模型 id（原生 Kiro modelId，如 qwen3-coder-next / claude-opus-4.8）
         conv.current_message.user_input_message.model_id = model_id.to_string();
-        let mut kiro_req = serde_json::to_value(&crate::kiro::model::requests::kiro::KiroRequest {
+        let kiro_req = serde_json::to_value(&crate::kiro::model::requests::kiro::KiroRequest {
             conversation_state: conv,
             profile_arn: None,
         })?;
-        // profileArn 注入：与对话路径统一口径（idc/social 回退默认，external_idp 用真实 arn）
-        if let Some(arn) = credentials.effective_profile_arn() {
-            kiro_req["profileArn"] = serde_json::Value::String(arn);
-        }
-        let body = kiro_req;
+        // profileArn 注入与端点特有 body 加工统一交给端点实现（IDE 注入 arn，CLI 注入
+        // agentTaskType/agentMode 且**绝不**注入 arn）。手写 arn 注入会让 CLI 号 403。
+        let body = endpoint.transform_api_body(&kiro_req.to_string(), &rctx);
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
         // 探测要消费完整生成流,用 read_timeout(空闲间隔)而非总超时,否则慢模型生成中途被 30s
         // 总超时掐断→误判 unknown/失败(与 mid-response 同类)。空闲上限 60s:探测请求 content="hi"
         // 生成极短,只要上游在吐数据就不该超时;真卡死 60s 无数据才放弃,比对话路径更快止损。
         let client = build_streaming_client(effective_proxy.as_ref(), 60, cfg.tls_backend)?;
-        let mut request = client
-            .post(&url)
-            .header("content-type", "application/json")
-            .header("x-amzn-codewhisperer-optout", "true")
-            .header("x-amz-user-agent", &x_amz_user_agent)
-            .header("user-agent", &user_agent)
-            .header("host", &host)
-            .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-            .header("amz-sdk-request", "attempt=1; max=1")
-            .header("Authorization", format!("Bearer {}", token));
-        if credentials.is_api_key_credential() {
-            request = request.header("tokentype", "API_KEY");
-        } else if credentials.is_external_idp_credential() {
-            request = request.header("tokentype", "EXTERNAL_IDP");
-        }
+        let request = endpoint.decorate_api(
+            client
+                .post(&url)
+                .header("content-type", endpoint.content_type()),
+            &rctx,
+        );
 
         // 单个模型探测的网络错误不应中止整轮：吞掉转成 None(unknown) 继续探下一个。
-        let response = match request.body(body.to_string()).send().await {
+        let response = match request.body(body).send().await {
             Ok(r) => r,
             Err(e) => {
                 tracing::debug!("探测模型 {} 网络错误(记为 unknown): {}", model_id, e);
@@ -4597,6 +5526,49 @@ impl MultiTokenManager {
     /// - `Ok(u64)` - 新凭据 ID
     /// - `Err(_)` - 验证失败或添加失败
     pub async fn add_credential(&self, new_cred: KiroCredentials) -> anyhow::Result<u64> {
+        self.add_credential_inner(new_cred, false).await
+    }
+
+    /// 添加凭据，**刻意允许与池中已有号重复**（同一账号多开）。
+    ///
+    /// # 用途
+    ///
+    /// 同一个账号导入多份、每份配不同 `machineId` 与不同代理，让上游把它们看成
+    /// 「同一用户的多台设备」，以试探能否提高并发。三个前提都已现成：
+    ///
+    /// - **machineId 天然不同**：`generate_from_credentials` 对 api_key 号是
+    ///   `sha256("KiroAPIKey/" + key)`（确定性），故 N 份派生出同一个指纹，随后
+    ///   入池处的撞车检测（见本函数下方 `collides` 分支）把第 2..N 份轮换成独立随机值。
+    /// - **不会被族级连坐**：`family_key()` 对 api_key/idc/social 返回 `cred:{id}`，
+    ///   每份独立成族。只有 M365 external_idp 才共享 `m365:{tenant}`。
+    /// - **每份可独立走代理**：`effective_proxy(global)` 每号可覆盖全局，且 provider
+    ///   的 Client 缓存 key 就是 effective proxy，故每份各自建连接池、各自出口 IP。
+    ///
+    /// # ⚠️ 与去重保护的关系
+    ///
+    /// 去重（`kiroApiKey 重复` / `refreshToken 重复`）本是防**误操作**重复上号的护栏，
+    /// 这里绕过它是**显式意图**，故只在调用方明确要求多份时使用，绝不设为默认 ——
+    /// 否则误双击上号就会静默多出一条号，而多开的号共用同一份上游配额，
+    /// 悄悄多出来的那条会稀释调度而不增加容量。
+    ///
+    /// # ⚠️ RPM 语义（会影响实验结论）
+    ///
+    /// `rpm_limit` 是**每凭据**的。导 N 份则网关侧放行量变为 N × 每份上限。
+    /// 若上游实际按**账号**限流（而非按设备），多开只是把同一份配额切成 N 刀、
+    /// 并更早撞上惩罚窗口。故每份的 `rpm_limit` 应在导入后按账号实测上限 ÷ N 调整
+    /// （该字段在面板凭据卡片里可逐号设置，`0` 归一为 None＝继承全局）。
+    pub async fn add_credential_allowing_duplicate(
+        &self,
+        new_cred: KiroCredentials,
+    ) -> anyhow::Result<u64> {
+        self.add_credential_inner(new_cred, true).await
+    }
+
+    async fn add_credential_inner(
+        &self,
+        new_cred: KiroCredentials,
+        allow_duplicate: bool,
+    ) -> anyhow::Result<u64> {
         // 1. 基本验证
         if new_cred.is_custom_api_credential() {
             // 自定义 API 代挂:只需 base_url(Anthropic 兼容上游),不需要 refreshToken/kiroApiKey。
@@ -4622,7 +5594,15 @@ impl MultiTokenManager {
         }
 
         // 2. 基于哈希检测重复
-        if new_cred.is_custom_api_credential() {
+        //
+        // `allow_duplicate` 为 true 时整段跳过 —— 那是「同一账号多开」的显式意图
+        // （见 `add_credential_allowing_duplicate` 的文档）。写成 if 链的第一个分支
+        // 而不是把下面三段包进 `if !allow_duplicate {}`：后者要对 68 行做整体重新缩进，
+        // 而本仓明确禁止用脚本批量改代码（历史事故：正则改动造成 209 个编译错误）。
+        if allow_duplicate {
+            // 刻意不去重。machineId 的撞车轮换仍会执行（见下方 `collides` 分支），
+            // 故 N 份副本各自拿到独立设备指纹。
+        } else if new_cred.is_custom_api_credential() {
             // 自定义 API 去重键 = base_url + api_key(允许同一上游用不同 key,或不同上游)。
             let dup_key = format!(
                 "{}|{}",
@@ -4780,13 +5760,35 @@ impl MultiTokenManager {
                     validated_cred.machine_id = Some(fresh);
                 }
             }
+            // 尊重传入凭据自带的 disabled，而不是无条件置 false。
+            //
+            // 🔴 修复的实际事故：此处原为硬编码 `disabled: false`，于是「重新导入一个
+            // 已知被上游封禁的号」会让它以**启用态**回池。而 persist_credentials 是从
+            // 内存 entries 全量重写 credentials.json 的，所以一次导入还会把同批次其它
+            // 号刚落盘的禁用状态一起刷掉——现场表现就是「第二次导入后全部凭据都启用了」。
+            //
+            // 危害不只是状态显示错：被封号回池后网关会拿它继续打上游，每次都换来一个
+            // 403 TEMPORARILY_SUSPENDED，反而加深上游对该批号的风控判定。
+            //
+            // 语义：credentials.json 与 import 接口的 items[].disabled 都是既有字段，
+            // 调用方契约不变；这里只是不再丢弃它。未提供时 serde default = false，
+            // 与旧行为完全一致（新号仍默认启用），故无回归。
+            let initial_disabled = validated_cred.disabled;
             entries.push(CredentialEntry {
                 id: new_id,
                 credentials: validated_cred,
                 failure_count: 0,
                 refresh_failure_count: 0,
-                disabled: false,
-                disabled_reason: None,
+                disabled_at: None,
+                    consecutive_suspicious: 0,
+                    consecutive_passthrough_failures: 0,
+                    passthrough_overload_since: None,
+                    last_passthrough_429_at: None,
+                    last_selected_at: std::cell::Cell::new(Instant::now()),
+                disabled: initial_disabled,
+                // 复用既有的 Manual 语义：调用方显式要求禁用，非自动判定的死号，
+                // 便于面板区分「人工/导入时置禁用」与「上游封禁/配额耗尽」。
+                disabled_reason: initial_disabled.then_some(DisabledReason::Manual),
                 success_count: 0,
                 request_count: 0,
                 total_credits_used: 0.0,
@@ -4841,6 +5843,30 @@ impl MultiTokenManager {
     /// - `Ok(())` - 删除成功
     /// - `Err(_)` - 凭据不存在、未禁用或持久化失败
     pub fn delete_credential(&self, id: u64) -> anyhow::Result<()> {
+        self.delete_credential_forced(id, false)
+    }
+
+    /// 删除凭据，`force=true` 时**跳过「必须先禁用」这道门**。
+    ///
+    /// # 为什么需要 force
+    ///
+    /// 用户原话要的是「多选菜单里加一个强制删除」。现状是删一个号要两次调用
+    /// （先 `PATCH` 禁用、再 `DELETE`），批量删 N 个 = **2N 次往返**；而"号卡住了要拔掉"
+    /// 正是强制删除的核心动机——要求先禁用等于让这个场景多绕一圈。
+    ///
+    /// # 只绕禁用门，**不**跳过回收站
+    ///
+    /// 删除仍是软删（进 `trash.json`，可 `restore_credential` 恢复）。理由：adminKey 明文存
+    /// localStorage 且全仓无 CSP，一旦 XSS 就能整池清空，**回收站是被打穿后唯一的兜底**；
+    /// 而 trash 受 `trashRetentionDays` 自动清理，留存成本近零。
+    /// 真正的物理删除走既有的 `purge_credential`（回收站内二次确认），语义分层不变。
+    ///
+    /// # inflight > 0 的号也允许强删
+    ///
+    /// 已核实安全：`InflightGuard` 直接持 `Arc<AtomicU32>`，Drop 只对自己那个 Arc 做
+    /// `saturating_sub`，与 entry 生命周期解耦；`report_failure` 在 entry 缺失时 early-return，
+    /// 不 panic 不误伤其它号。在途请求会正常读完自己的流。
+    pub fn delete_credential_forced(&self, id: u64, force: bool) -> anyhow::Result<()> {
         let was_current = {
             let mut entries = self.entries.lock();
 
@@ -4850,9 +5876,18 @@ impl MultiTokenManager {
                 .position(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
 
-            // 检查是否已禁用
-            if !entries[idx].disabled {
+            // 检查是否已禁用（force 时跳过这道门，见 delete_credential_forced 的文档）
+            if !entries[idx].disabled && !force {
                 anyhow::bail!("只能删除已禁用的凭据（请先禁用凭据 #{}）", id);
+            }
+            if force && !entries[idx].disabled {
+                // 强删一个**仍在服务**的号值得留痕：便于事后对照「用户投诉的中断」与这条记录。
+                // inflight 一并记下——它是"这次强删影响了多少在途请求"的唯一证据。
+                tracing::warn!(
+                    credential_id = id,
+                    inflight = entries[idx].inflight.load(Ordering::Acquire),
+                    "强制删除**未禁用**的凭据（绕过先禁用门）；在途请求会正常读完自己的流"
+                );
             }
 
             // 记录是否是当前凭据
@@ -4863,6 +5898,25 @@ impl MultiTokenManager {
             let removed = entries.remove(idx);
             let mut cred = removed.credentials;
             cred.id = Some(removed.id); // 确保 id 落在凭据内，便于恢复
+            // ⭐ 同步禁用状态三元组（与 persist_credentials 同一口径，见其内的同步块）。
+            //
+            // 🔴 修复的缺陷：`disabled` / `disabled_reason` / `disabled_at` 的**权威副本在
+            // `CredentialEntry` 上**，`KiroCredentials` 里那份只在 `persist_credentials()` 落盘时
+            // 被同步。而本路径直接把 `removed.credentials` 塞进 `TrashEntry`，**绕过了那次同步**，
+            // 于是回收站里的凭据恒为 `disabled=false / reason=None / at=None`。
+            //
+            // 实测证据：线上 07-30 之后删除的 31 个号（此时 reason 持久化已上线），
+            // trash.json 里三字段全是 `(False, None, None)`；175 条回收站记录**无一条**带禁用原因。
+            //
+            // 后果有三层：
+            // ① 用户明确要求「认定封号必须标明原因」，而号被判死→删除后原因即丢失——恰恰是最需要它
+            //    的时刻（判断该换号还是该申诉）。
+            // ② `restore_credential` 恢复时因读不到真实原因，只能一律落 `Manual`，
+            //    即批 2 修掉的「自动禁用原因变手动」在回收站路径上的翻版（同型漏修）。
+            // ③ 以 reason 为判据的自愈/诊断逻辑对恢复出来的号全部失效。
+            cred.disabled = removed.disabled;
+            cred.disabled_reason = removed.disabled_reason;
+            cred.disabled_at = removed.disabled_at.clone();
             self.trash.lock().push(TrashEntry {
                 credentials: cred,
                 deleted_at: Utc::now().to_rfc3339(),
@@ -4920,6 +5974,12 @@ impl MultiTokenManager {
                     credentials: cred,
                     failure_count: 0,
                     refresh_failure_count: 0,
+                    disabled_at: None,
+                    consecutive_suspicious: 0,
+                    consecutive_passthrough_failures: 0,
+                    passthrough_overload_since: None,
+                    last_passthrough_429_at: None,
+                    last_selected_at: std::cell::Cell::new(Instant::now()),
                     disabled: true,
                     disabled_reason: Some(DisabledReason::Manual),
                     success_count: 0,
@@ -4989,6 +6049,10 @@ impl MultiTokenManager {
                     deleted_at: t.deleted_at.clone(),
                     success_count: t.success_count,
                     last_used_at: t.last_used_at.clone(),
+                    // 删除前的禁用原因/时刻。回收站此前不带这两项（见 delete_credential 的同步块），
+                    // 面板即便想显示也拿不到；老数据为 None，前端按缺省处理。
+                    disabled_reason: c.disabled_reason,
+                    disabled_at: c.disabled_at.clone(),
                 }
             })
             .collect()
@@ -5040,13 +6104,34 @@ impl MultiTokenManager {
             let mut cred = restored_entry.credentials;
             cred.id = Some(id);
             cred.disabled = true;
+            // 保留删除前的真实禁用原因/时刻（回收站现在会带上它们，见 delete_credential 的同步块）。
+            // 恢复态仍是 disabled=true（不自动回池，交由 Admin 手动启用），但**原因不再被抹成 Manual**：
+            // 运维需要知道这号当初是「额度耗尽」还是「被封」才能决定启不启用。
+            // 老回收站数据无该字段 → None，此时才回落 Manual（与加载路径同一兼容策略）。
+            let restored_reason = cred.disabled_reason.or(Some(DisabledReason::Manual));
+            // 时刻同样保留；**但缺失时必须补当前时间**而不是留 None。
+            // 缺失的真实路径（smoke 实测到的）：号在**启用**态被强制删除 → 它从来没有 disabled_at，
+            // 恢复时却被置成 disabled=true。若不补时间戳，面板会显示一个"已禁用但不知何时禁用"的号，
+            // 而 disabled_at 的整个用途就是让运维判断"这号坏了多久"。此处恢复即是它被禁用的时刻。
+            let restored_at = cred
+                .disabled_at
+                .clone()
+                .or_else(|| Some(Utc::now().to_rfc3339()));
+            cred.disabled_reason = restored_reason;
+            cred.disabled_at = restored_at.clone();
             entries.push(CredentialEntry {
                 id,
                 credentials: cred,
                 failure_count: 0,
                 refresh_failure_count: 0,
+                disabled_at: restored_at,
+                    consecutive_suspicious: 0,
+                    consecutive_passthrough_failures: 0,
+                    passthrough_overload_since: None,
+                    last_passthrough_429_at: None,
+                    last_selected_at: std::cell::Cell::new(Instant::now()),
                 disabled: true,
-                disabled_reason: Some(DisabledReason::Manual),
+                disabled_reason: restored_reason,
                 success_count: restored_entry.success_count,
                 request_count: 0,
                 total_credits_used: restored_entry.total_credits_used,
@@ -5085,9 +6170,36 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 清空整个回收站（管理员在面板点「清理」时的显式全清）。
+    ///
+    /// 与 [`Self::purge_expired_trash`] 的区别是**没有时间维度**：它不看 `deleted_at`，
+    /// 一次清空全部条目。这道独立入口是必要的，因为 `retention_days` 的 `0` 已经被
+    /// 后台任务占用为「永久保留、永不自动清」的语义，导致按天数的接口**无法表达
+    /// 「现在就全清」**——传 0 会被解释成永久保留而直接返回 0，传 N 则清不掉 N 天内
+    /// 新删除的条目。历史缺陷正是这个：面板点清理，67 条刚删的凭据一条都清不掉，
+    /// 用户看到「清理完成，共移除 0 项」以为按钮坏了。
+    ///
+    /// 返回被清空的条目数量。不可逆，调用方（面板）须自行做二次确认。
+    pub fn purge_all_trash(&self) -> usize {
+        let removed = {
+            let mut trash = self.trash.lock();
+            let n = trash.len();
+            trash.clear();
+            n
+        };
+        if removed > 0 {
+            if let Err(e) = self.persist_trash() {
+                tracing::warn!("清空回收站后回写失败: {}", e);
+            }
+            tracing::info!("回收站已全部清空：彻底删除 {} 条凭据", removed);
+        }
+        removed
+    }
+
     /// 清理回收站中超过保留期的条目（由后台定时任务周期调用）
     ///
-    /// `retention_days == 0` 表示永久保留，直接返回 0。
+    /// `retention_days == 0` 表示永久保留，直接返回 0 —— 这是**后台任务**的语义。
+    /// 管理员要立即全清请走 [`Self::purge_all_trash`]，不要给本函数传 0。
     /// 返回被清理的条目数量。
     pub fn purge_expired_trash(&self, retention_days: u32) -> usize {
         if retention_days == 0 {
@@ -5529,7 +6641,17 @@ impl MultiTokenManager {
                             && !e.to_string().contains("410")
                             && !e.to_string().contains("422")
                             && !e.to_string().contains("429")
-                            && !e.to_string().contains("invalid_grant");
+                            && !e.to_string().contains("invalid_grant")
+                            // ⭐ 结构性不可刷新：api_key 号没有 refreshToken，`refresh_token()`
+                            // 对它是契约级 bail。该串**不含任何 HTTP 状态码**，故上面那串
+                            // 排除条件一个都命中不了 → 本黑名单式判据会把它当"网络瞬态错误"
+                            // 重试满 3 次（1s + 2s 白等）。重试一个结构上永不可能成功的操作
+                            // 是纯损耗，且每轮都计一次失败 → 加速把号判成死号。
+                            //
+                            // 根因已在 provider.rs 的两处 force-refresh 调用点堵住
+                            // （api_key 号不再进入刷新）；这里是**纵深防御**：任何将来新增的
+                            // 调用方即使漏判，也只会失败一次而不是被退避重试三次。
+                            && !e.to_string().contains("API Key 凭据不支持刷新");
                         if (is_5xx || is_network) && attempt + 1 < MAX_ATTEMPTS {
                             let backoff_secs = 1u64 << attempt; // 1, 2
                             tracing::warn!(
@@ -5727,6 +6849,77 @@ impl Drop for MultiTokenManager {
         if self.stats_dirty.load(Ordering::Relaxed) {
             self.save_stats();
         }
+    }
+}
+
+#[cfg(test)]
+mod endpoint_bypass_guard_tests {
+    //! 源码级守卫：**不经 provider** 的上游调用路径（深度验活 / 模型探测）必须走端点抽象，
+    //! 不得手搓 IDE 的 host 与 profileArn 注入。
+    //!
+    //! 为何用源码断言：这两个函数都需要真实上游 + 号池才能跑通，纯单测覆盖不到；而它们正是
+    //! CLI(ksk_)号的**自伤点** —— 硬编码 `runtime.{region}.kiro.dev` 会让 ksk_ 号稳定 403，
+    //! 两者又都把 403/401 当"认证/账号级问题"上报：验活侧经 classify_balance_error
+    //! **自动禁用凭据**，探测侧整轮中止并向面板报账号有问题。历史上这里已漏迁过一次 host
+    //! （q.* → runtime.*），故把"必须走抽象"这条钉死。
+
+    /// 取源码中某函数体的近似切片：从函数签名到下一个同缩进 `    }` 之前。
+    fn fn_body(src: &str, signature: &str) -> String {
+        let after = src
+            .split(signature)
+            .nth(1)
+            .unwrap_or_else(|| panic!("函数 {signature} 不应被改名/删除"));
+        // 4 空格缩进的收尾花括号即函数结束（本文件所有方法都在 impl 内，缩进固定）。
+        after
+            .split("\n    }")
+            .next()
+            .unwrap_or(after)
+            .to_string()
+    }
+
+    #[test]
+    fn should_use_endpoint_abstraction_in_deep_verify() {
+        let body = fn_body(
+            include_str!("token_manager.rs"),
+            "pub async fn deep_verify_credential(&self, id: u64)",
+        );
+        assert!(
+            body.contains("endpoint::for_credentials"),
+            "深度验活必须按凭据解析端点，否则 CLI 号 403 → 被自动禁用"
+        );
+        assert!(
+            body.contains("endpoint.api_url(&rctx)"),
+            "URL 必须来自端点实现"
+        );
+        assert!(
+            !body.contains("runtime.{}.kiro.dev"),
+            "不得硬编码 IDE host（CLI 号必须打 q.{{region}}.amazonaws.com）"
+        );
+        assert!(
+            !body.contains("effective_profile_arn"),
+            "profileArn 注入必须交给端点的 transform_api_body（CLI 带 ARN 会 403）"
+        );
+    }
+
+    #[test]
+    fn should_use_endpoint_abstraction_in_model_probe() {
+        let body = fn_body(
+            include_str!("token_manager.rs"),
+            "async fn probe_single_model(",
+        );
+        assert!(
+            body.contains("endpoint::for_credentials"),
+            "模型探测必须按凭据解析端点，否则 CLI 号每个模型都 401/403 → 整轮中止"
+        );
+        assert!(body.contains("endpoint.api_url(&rctx)"), "URL 必须来自端点实现");
+        assert!(
+            !body.contains("runtime.{}.kiro.dev"),
+            "不得硬编码 IDE host"
+        );
+        assert!(
+            !body.contains("effective_profile_arn"),
+            "profileArn 注入必须交给端点的 transform_api_body"
+        );
     }
 }
 
@@ -6051,6 +7244,44 @@ mod tests {
         );
     }
 
+    /// ⭐ 回归：api_key 号的"不支持刷新"必须**快速失败**，不得被当瞬态错误退避重试。
+    ///
+    /// 缺陷（本轮多开时线上暴露）：刷新层的瞬态判据是**黑名单式**——
+    /// 错误串不含 400/401/403/404/410/422/429/invalid_grant 就当"网络瞬态错误"。
+    /// 而 "API Key 凭据不支持刷新 Token" 一个都不含 → 被判瞬态 →
+    /// 退避重试满 3 次（白等 1s + 2s），且每轮计一次失败。
+    ///
+    /// 线上后果：api_key 号遇 403 后每轮白等约 3 秒、连计 3 次失败即判死号自动禁用，
+    /// 相当于**把它的死亡速度放大三倍**（实测 #421-424 就是这样被反复禁用的）。
+    ///
+    /// 用耗时做判据而非日志：重试是可观测的时间代价（1s + 2s ≥ 3s），
+    /// 而快速失败 < 1s。回退分类器里那条排除条件即 FAIL。
+    #[tokio::test]
+    async fn api_key_refresh_rejection_must_fail_fast_not_retry() {
+        let mut cred = KiroCredentials::default();
+        cred.id = Some(1);
+        cred.kiro_api_key = Some("ksk_fail_fast_probe".to_string());
+        cred.auth_method = Some("api_key".to_string());
+        let mgr = MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap();
+
+        let started = std::time::Instant::now();
+        let err = mgr
+            .refresh_token_locked(1, None)
+            .await
+            .expect_err("api_key 号刷新必须失败");
+        let elapsed = started.elapsed();
+
+        assert!(
+            err.to_string().contains("API Key 凭据不支持刷新"),
+            "错误应是契约级拒绝，实际: {err}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(900),
+            "必须快速失败：结构上不可能成功的刷新被退避重试了（耗时 {elapsed:?}，\
+             重试 3 次会花 1s+2s）。这会让 api_key 号每轮白等 3 秒并加速判死"
+        );
+    }
+
     #[tokio::test]
     async fn test_ensure_valid_token_returns_api_key_without_refresh() {
         // API Key 凭据：ensure_valid_token 直接返回 kiroApiKey，绝不触发刷新（无网络）。
@@ -6202,6 +7433,147 @@ mod tests {
         let result = manager.add_credential(duplicate).await;
         assert!(result.is_err());
         assert!(result.err().unwrap().to_string().contains("凭据已存在"));
+    }
+
+    /// 多开：同一账号可导入多份，且**每份 machineId 必须不同**。
+    ///
+    /// 这是「一个号导入多次、每次机器码不同、再各配代理试探并发」这个需求的承重测试。
+    /// 三条断言分别锁住它成立的三个前提：
+    ///
+    /// 1. 默认路径**仍然去重**（多开不能把误双击上号的护栏一起拆掉）；
+    /// 2. 显式路径能绕过去重；
+    /// 3. 两份的 machineId **不相同** —— 若相同，上游会按设备指纹把它们关联封禁，
+    ///    多开反而变成"把两份一起烧掉"。
+    ///
+    /// 第 3 条的机制：`generate_from_credentials` 对 api_key 号是
+    /// `sha256("KiroAPIKey/" + key)`（**确定性**），故两份派生出同一个指纹，
+    /// 随后入池处的撞车检测把第 2 份轮换成独立随机值。测试直接验最终状态而不验机制，
+    /// 这样将来换实现（比如改成入池即随机）也不会误报失败。
+    #[tokio::test]
+    async fn test_multi_open_allows_duplicate_with_distinct_machine_ids() {
+        const KEY: &str = "ksk_multi_open_probe_key";
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap();
+
+        let mk = || {
+            let mut c = KiroCredentials::default();
+            c.auth_method = Some("api_key".to_string());
+            c.kiro_api_key = Some(KEY.to_string());
+            c
+        };
+
+        let id1 = manager.add_credential(mk()).await.expect("第 1 份应成功");
+
+        // ① 默认路径仍去重：多开不得削弱误操作护栏。
+        let dup = manager.add_credential(mk()).await;
+        assert!(
+            dup.is_err() && dup.as_ref().err().unwrap().to_string().contains("凭据已存在"),
+            "默认路径必须仍然拒绝重复 kiroApiKey（否则误双击上号会静默多出一条号）"
+        );
+
+        // ② 显式多开路径放行。
+        let id2 = manager
+            .add_credential_allowing_duplicate(mk())
+            .await
+            .expect("显式多开必须允许同 key 再入池");
+        assert_ne!(id1, id2, "两份必须是独立凭据（各自独立的 id）");
+
+        // ③ machineId 必须不同 —— 这是多开有意义的前提。
+        let m1 = manager
+            .export_credential(id1)
+            .and_then(|c| c.machine_id)
+            .expect("第 1 份应已冻结 machineId");
+        let m2 = manager
+            .export_credential(id2)
+            .and_then(|c| c.machine_id)
+            .expect("第 2 份应已冻结 machineId");
+        assert_ne!(
+            m1, m2,
+            "两份 machineId 相同 → 上游按设备指纹关联封禁，多开等于把两份一起烧掉"
+        );
+        assert_eq!(m2.len(), 64, "轮换后的指纹应是 64 位 hex");
+    }
+
+    /// 多开的第二个前提：每份**各自独立成族**，不会被族级连坐一锅端。
+    ///
+    /// `family_key` 是限流/健康的分组单位。若多开的 N 份共享族键，则一份被 403 风控
+    /// 会让整族退避 —— 多开就完全失去意义（等于 N 份同生共死）。
+    /// api_key/idc/social 号返回 `cred:{id}` 各自独立；只有 M365 external_idp 才共享
+    /// `m365:{tenant}`。本测试锁住 api_key 这条路径。
+    #[tokio::test]
+    async fn test_multi_open_copies_are_in_separate_families() {
+        const KEY: &str = "ksk_family_isolation_probe";
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap();
+
+        let mk = || {
+            let mut c = KiroCredentials::default();
+            c.auth_method = Some("api_key".to_string());
+            c.kiro_api_key = Some(KEY.to_string());
+            c
+        };
+
+        let id1 = manager.add_credential(mk()).await.expect("第 1 份");
+        let id2 = manager
+            .add_credential_allowing_duplicate(mk())
+            .await
+            .expect("第 2 份");
+
+        let f1 = manager.family_key_of(id1);
+        let f2 = manager.family_key_of(id2);
+        assert_ne!(
+            f1, f2,
+            "多开的两份共享了族键 → 一份被 403 风控会让整族退避，多开失去意义"
+        );
+        assert_eq!(f1, format!("cred:{id1}"), "api_key 号应各自独立成族");
+        assert_eq!(f2, format!("cred:{id2}"));
+    }
+
+    /// 回归：导入一个标了 disabled 的凭据，必须以**禁用态**入池。
+    ///
+    /// 事故现场：此前 add_credential 硬编码 `disabled: false`，于是重新导入已知被上游
+    /// 封禁的号会让它以启用态回池；而 persist_credentials 从内存全量重写
+    /// credentials.json，一次导入还会把同批次其它号刚落盘的禁用状态一起刷掉，
+    /// 表现为「第二次导入后全部凭据都启用了」。
+    #[tokio::test]
+    async fn test_add_credential_preserves_disabled_flag() {
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap();
+
+        let mut cred = KiroCredentials::default();
+        cred.kiro_api_key = Some("ksk_banned_account_key".to_string());
+        cred.auth_method = Some("api_key".to_string());
+        cred.disabled = true;
+
+        let id = manager.add_credential(cred).await.unwrap();
+
+        let entries = manager.entries.lock();
+        let entry = entries.iter().find(|e| e.id == id).expect("凭据应已入池");
+        assert!(entry.disabled, "标了 disabled 的凭据必须以禁用态入池");
+        assert_eq!(
+            entry.disabled_reason,
+            Some(DisabledReason::Manual),
+            "调用方显式要求的禁用应记为 Manual，与上游封禁等自动判定区分"
+        );
+    }
+
+    /// 对照组：未指定 disabled 时仍默认启用（serde default = false），确保无回归。
+    #[tokio::test]
+    async fn test_add_credential_defaults_to_enabled() {
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap();
+
+        let mut cred = KiroCredentials::default();
+        cred.kiro_api_key = Some("ksk_normal_account_key".to_string());
+        cred.auth_method = Some("api_key".to_string());
+        // 不设 disabled，走 Default
+
+        let id = manager.add_credential(cred).await.unwrap();
+
+        let entries = manager.entries.lock();
+        let entry = entries.iter().find(|e| e.id == id).expect("凭据应已入池");
+        assert!(!entry.disabled, "未指定 disabled 的新号应默认启用");
+        assert_eq!(entry.disabled_reason, None);
     }
 
     #[tokio::test]
@@ -6432,6 +7804,163 @@ mod tests {
         // 全部排除 → None(上层据此落 Kiro 主力路径)。
         ex.insert(3);
         assert!(mgr.select_custom_api(&ex).is_none(), "全部 custom_api 排除后应返回 None");
+    }
+
+    /// 造一个代挂号管理器（单号，供透传惩罚策略测试用）。
+    fn mk_passthrough_mgr() -> MultiTokenManager {
+        let mut c = KiroCredentials::default();
+        c.id = Some(1);
+        c.auth_method = Some("custom_api".to_string());
+        c.base_url = Some("https://relay.example.invalid".to_string());
+        c.api_key = Some("sk-relay".to_string());
+        MultiTokenManager::new(Config::default(), vec![c], None, None, false).unwrap()
+    }
+
+    /// 回归（dwgx 明确要求）：代挂号**偶尔 429 绝不受任何惩罚**。
+    ///
+    /// 语义依据：代挂号是用户自购的付费第三方中转站，**没有"被风控"这个状态**，
+    /// 429 只代表"它现在忙"。把它按下去既不能让它变快，又白白缩小可用池
+    /// （两个号轮流 429 就会两个都被冷却 → 整池不可用 → 回落 Kiro，而 Kiro 侧此刻
+    /// 可能正被风控烧号）。
+    ///
+    /// **旧代码为何 FAIL**：`provider.rs` 的透传 failover 对 429 给 30s 冷却
+    /// （`429 => 30`），于是一次 429 就让该号在 `select_custom_api` 里被跳过 30 秒。
+    #[test]
+    fn test_passthrough_occasional_429_incurs_no_cooldown_and_no_penalty() {
+        use std::collections::HashSet;
+        let mgr = mk_passthrough_mgr();
+
+        // 连打若干次 429（远超任何失败阈值），中间不成功。
+        for _ in 0..10 {
+            mgr.record_passthrough_result(1, crate::usage::RequestOutcome::RateLimited);
+        }
+
+        assert_eq!(
+            mgr.available_count(),
+            1,
+            "偶尔/连续 429 不得禁用代挂号（未到持续过载窗口）"
+        );
+        assert!(
+            mgr.select_custom_api(&HashSet::new()).is_some(),
+            "429 不得进入惩罚系统：号必须仍可被选中（旧代码 429=>30s 惩罚性冷却，此处会是 None）"
+        );
+        // 边界说明：provider 的透传 failover 另有一个 **5s 调度级跳过**（不进 health、不计失败、
+        // 不影响自动禁用判据），用于避免 100% 429 的站被每个新请求重新撞一次。
+        // 那不是惩罚，且不经过本函数 —— 故本测试只锁「惩罚系统不得介入」这条。
+    }
+
+    /// 回归：代挂号连续「非瞬态」失败达阈值即自动禁用，且原因可辨。
+    ///
+    /// 非瞬态 = key 失效(401/403) / 额度耗尽(402) / 配置错(4xx)——**再试一万次也一样**，
+    /// 等更多次纯属浪费用户请求。
+    ///
+    /// **旧代码为何 FAIL**：`record_passthrough_result` 对这些 outcome 走
+    /// `_ => {}` 空分支，**永不自动禁用**（注释写的是"透传给客户端由其处理"）。
+    /// 于是一个 key 已失效的中转站会永久留在池里，每条请求都先白撞它一次。
+    #[test]
+    fn test_passthrough_consecutive_nontransient_failures_auto_disable() {
+        let mgr = mk_passthrough_mgr();
+
+        for _ in 0..MAX_PASSTHROUGH_FAILURES {
+            mgr.record_passthrough_result(1, crate::usage::RequestOutcome::AuthFailed);
+        }
+
+        assert_eq!(
+            mgr.available_count(),
+            0,
+            "连续 {} 次非瞬态失败应自动禁用（旧代码永不禁用）",
+            MAX_PASSTHROUGH_FAILURES
+        );
+        let snap = mgr.snapshot();
+        let e = snap.entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(
+            e.disabled_reason.as_deref(),
+            Some("PassthroughFailed"),
+            "原因须可区分「中转站凭据问题」与 Kiro 号的 TooManyFailures（排查方向完全不同）"
+        );
+    }
+
+    /// 回归：任一次成功即清零连续失败计数 —— 健康号永不被偶发 4xx 误禁。
+    ///
+    /// 这是「连续 + 成功归零」判据的核心保证。反例是旧的
+    /// `cooldown.trigger_count >= 10` 累计式判据：它在数学上不可达
+    /// （`report_success` 删掉整个冷却条目使计数归零），导致自动禁用从未生效。
+    #[test]
+    fn test_passthrough_success_resets_consecutive_failures() {
+        let mgr = mk_passthrough_mgr();
+
+        // 差一次到阈值
+        for _ in 0..(MAX_PASSTHROUGH_FAILURES - 1) {
+            mgr.record_passthrough_result(1, crate::usage::RequestOutcome::AuthFailed);
+        }
+        assert_eq!(mgr.available_count(), 1, "未达阈值不应禁用");
+
+        // 成功一次 → 计数归零
+        mgr.record_passthrough_result(1, crate::usage::RequestOutcome::Success);
+
+        // 再来 阈值-1 次失败：若计数没归零，这里就会命中阈值被禁用
+        for _ in 0..(MAX_PASSTHROUGH_FAILURES - 1) {
+            mgr.record_passthrough_result(1, crate::usage::RequestOutcome::AuthFailed);
+        }
+        assert_eq!(
+            mgr.available_count(),
+            1,
+            "成功后计数未归零 → 健康号被偶发 4xx 误禁（间歇性失败的站会被冤杀）"
+        );
+    }
+
+    /// 回归（实测驱动）：`bad_request` 绝不计入号的健康 —— 那是坏请求，不是坏号。
+    ///
+    /// **依据是线上真实数据**，不是推理：代挂号 #216 成功率 **80.3%**（2910/3622）是个健康号，
+    /// 却有 712 次 `bad_request`，其中 **119 次达到 ≥3 连**、最长 6 连。若把它计入连续失败
+    /// 计数（阈值 3），这个健康号会被**误禁 119 次**。
+    ///
+    /// 更关键：代挂号历史 429 次数为 **0**，失败形态**全是** bad_request —— 所以"把 400 当号坏了"
+    /// 恰好命中唯一真实存在的失败形态，是最容易踩的那个坑。
+    ///
+    /// 本测试锁住这条边界，防止将来有人"顺手"把 4xx 一起算进健康判据。
+    #[test]
+    fn test_passthrough_bad_request_never_counts_against_credential_health() {
+        let mgr = mk_passthrough_mgr();
+
+        // 远超阈值的连续 400：一次都不该惩罚（换号也一样错）。
+        for _ in 0..(MAX_PASSTHROUGH_FAILURES * 4) {
+            mgr.record_passthrough_result(1, crate::usage::RequestOutcome::BadRequest);
+        }
+        assert_eq!(
+            mgr.available_count(),
+            1,
+            "客户端请求错误(400/404/422)不得禁用代挂号 —— 实测健康号有 119 次 ≥3 连 bad_request"
+        );
+
+        // 且不得污染连续计数：紧接着来 阈值-1 次真·非瞬态失败，仍不该被禁。
+        for _ in 0..(MAX_PASSTHROUGH_FAILURES - 1) {
+            mgr.record_passthrough_result(1, crate::usage::RequestOutcome::AuthFailed);
+        }
+        assert_eq!(
+            mgr.available_count(),
+            1,
+            "bad_request 不得把连续计数垫高，否则等效于降低了真实阈值"
+        );
+    }
+
+    /// 回归：瞬态失败（5xx / 网络错误）永不进连续计数、永不自动禁用。
+    ///
+    /// 中转站抖一下不代表它坏了，failover 换号即可。只有"再试无用"的信号才该累加。
+    #[test]
+    fn test_passthrough_transient_failures_never_auto_disable() {
+        let mgr = mk_passthrough_mgr();
+
+        for _ in 0..(MAX_PASSTHROUGH_FAILURES * 5) {
+            mgr.record_passthrough_result(1, crate::usage::RequestOutcome::ServerError);
+            mgr.record_passthrough_result(1, crate::usage::RequestOutcome::NetworkError);
+        }
+
+        assert_eq!(
+            mgr.available_count(),
+            1,
+            "5xx/网络错误是瞬态信号，不得触发自动禁用（否则上游抖动会清空代挂池）"
+        );
     }
 
     #[test]
@@ -6731,6 +8260,151 @@ mod tests {
                 "不该退化到竞态兜底上限才结束,说明过滤仍不对齐: {e}"
             ),
         }
+    }
+
+    /// 回归（审查发现）：**永久性**模型硬门（订阅档位/成本白名单）不得报成可重试的 429。
+    ///
+    /// **首版修复为何不够**：我原先对拿不到 blocklist TTL 的情形一律 `unwrap_or(MODEL_BLOCK_TTL)`
+    /// 兜底 → 带 `retry_after_secs`。但 `allowed_models` 白名单不含该模型、或 FREE 档请求 opus，
+    /// 是**永久**状态（等多久都不会变）。带退避秒数会让客户端每 5 分钟重试一次直到永远
+    /// （下游还会把秒数 clamp 到 300）—— 只是把 502 死循环换成了 429 死循环。
+    ///
+    /// 本测试用 `allowed_models` 白名单造永久门，断言错误里**没有** retry_after 标记、
+    /// 且带 `model_unsupported_by_pool=1`（供 map_provider_error 映射成不可重试的 404）。
+    #[tokio::test]
+    async fn test_permanent_model_gate_is_not_reported_as_retryable() {
+        let config = Config::default();
+        let mut c = KiroCredentials::default();
+        c.id = Some(1);
+        c.auth_method = Some("api_key".to_string());
+        c.kiro_api_key = Some("sk-test-key".to_string());
+        // 成本白名单只允许一个便宜模型 → 请求其它模型时是**永久**不可用，不是限时
+        c.allowed_models = Some(vec!["qwen3-coder-next".to_string()]);
+        let mgr = MultiTokenManager::new(config, vec![c], None, None, false).unwrap();
+
+        let msg = match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            mgr.acquire_context(Some("claude-opus-5"), None),
+        )
+        .await
+        {
+            Err(_) => panic!("不应挂死"),
+            Ok(Ok(_)) => panic!("白名单不含该模型，不该选出号"),
+            Ok(Err(e)) => e.to_string(),
+        };
+
+        assert!(
+            !msg.contains("retry_after_secs="),
+            "永久性硬门绝不能带退避秒数（会让客户端无限重试一个永不成功的请求）: {msg}"
+        );
+        assert!(
+            msg.contains("model_unsupported_by_pool=1"),
+            "须带显式标记供 map_provider_error 映射成不可重试的 404（不靠中文文案匹配）: {msg}"
+        );
+    }
+
+    /// 回归：模型级硬门挡掉全部号时，错误必须是**可重试的模型态**，而不是"号池已禁用"。
+    ///
+    /// **旧代码为何 FAIL**：`WaitOutcome::NoCandidate` 分支对两种成因报同一句
+    /// `所有凭据均已禁用（{available}/{total}）`。号没被禁用、只是被 `model_blocklist` 挡掉时，
+    /// 它会产出自相矛盾的 `所有凭据均已禁用（1/1）`，且该串**匹配不上 `map_provider_error`
+    /// 的任何分支**（无 429/QUOTA 类关键词、无 `retry_after_secs` 标记）→ 落末尾兜底
+    /// **502 BAD_GATEWAY 且无 Retry-After**。
+    ///
+    /// 而 `model_blocklist` 是**限时态**（`MODEL_BLOCK_TTL` = 1800s，到期自动放行重试探），
+    /// 报成 502 等于把可重试的临时态表达成服务端故障：客户端（Claude Code）既不退避也不换模型，
+    /// 原样重发 → 再 502。线上 24h 实测 577 次此类假报（订阅不含的 gpt-5.6-* / deepseek / glm 各 ~85，
+    /// claude-opus-5 88），同时污染"号池耗尽"统计口径，使真实耗尽（3221 次 available=0）无法评估。
+    ///
+    /// 本测试的两条断言分别锁住"不再谎报禁用"与"必须带可退避标记"，去掉修复中任一半都会 FAIL。
+    #[tokio::test]
+    async fn test_model_gated_pool_reports_retryable_model_error_not_pool_exhausted() {
+        let config = Config::default();
+        let mut c = KiroCredentials::default();
+        c.id = Some(1);
+        c.auth_method = Some("api_key".to_string());
+        c.kiro_api_key = Some("sk-test-key".to_string());
+        let mgr = MultiTokenManager::new(config, vec![c], None, None, false).unwrap();
+
+        const MODEL: &str = "gpt-5.6-sol";
+        // 唯一的号对该模型返 INVALID_MODEL_ID → 进模型级黑名单。号本身**未被禁用**。
+        mgr.report_model_invalid(1, Some(MODEL));
+        assert_eq!(mgr.available_count(), 1, "前提：号未被禁用，只是被模型硬门挡住");
+
+        // 用 match 而非 expect_err：CallContext 不实现 Debug，且不该为测试便利给生产类型加 derive。
+        let msg = match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            mgr.acquire_context(Some(MODEL), None),
+        )
+        .await
+        {
+            Err(_) => panic!("acquire_context 不应挂死"),
+            Ok(Ok(_)) => panic!("该模型已被唯一的号拉黑，不该还能选出号"),
+            Ok(Err(e)) => e.to_string(),
+        };
+
+        assert!(
+            !msg.contains("所有凭据均已禁用"),
+            "号未被禁用却谎报'所有凭据均已禁用'（旧代码即如此，且该串会落 502 兜底）: {msg}"
+        );
+        assert!(
+            msg.contains("retry_after_secs="),
+            "模型级黑名单是限时态，必须带 retry_after_secs 才能被 map_provider_error 映射成 \
+             可重试的 429（旧代码无此标记 → 502 无 Retry-After）: {msg}"
+        );
+    }
+
+    /// ⭐ 致命缺陷回归（去掉 bail 串里的 `retry_after_secs=` 即 FAIL）：
+    /// **号池真耗尽**（`available == 0`）必须带可退避标记。
+    ///
+    /// 与上面 `test_model_gated_pool_reports_retryable_model_error_not_pool_exhausted` 是
+    /// 同一类缺陷的两个实例。0.7.45 修了情形②（模型硬门），情形①「真耗尽」当时漏了 ——
+    /// 而线上量最大的是①：2026-08-03 01:55–02:10 号池被上游风控烧空的 15 分钟窗口里，
+    /// `所有凭据均已禁用（0/0）` 产生 **2082 次**，单个 5 分钟桶峰值 937 次，
+    /// 且该窗口内未识别兜底 502 **全部**是这一种。
+    ///
+    /// 不带标记时该串逐条穿过 `map_provider_error` 的所有分支 → 落末尾兜底 →
+    /// 502 无 Retry-After → 客户端（Claude Code）把它当服务端故障、退避逻辑不启动、
+    /// 原样重发 → 又 502（放大了耗尽窗口内的请求量）。
+    ///
+    /// 用 `AccountSuspended` 禁用而非 `TooManyFailures`：后者在
+    /// `is_self_healable_reason` 覆盖范围内，会触发全池自愈把号重新启用 →
+    /// 走不到 bail 分支。`AccountSuspended` 被刻意排除在自愈之外（见该函数文档），
+    /// 故能稳定复现"池子确实空且不会自愈"这个终态。
+    #[tokio::test]
+    async fn test_truly_exhausted_pool_bail_carries_retry_after_marker() {
+        let config = Config::default();
+        let mut c = KiroCredentials::default();
+        c.id = Some(1);
+        c.auth_method = Some("api_key".to_string());
+        c.kiro_api_key = Some("sk-test-key".to_string());
+        let mgr = MultiTokenManager::new(config, vec![c], None, None, false).unwrap();
+
+        // 唯一的号被真封禁用（不可自愈）→ available 归零。
+        mgr.report_account_suspended(1);
+        assert_eq!(mgr.available_count(), 0, "前提：池子必须真的空");
+
+        let msg = match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            mgr.acquire_context(None, None),
+        )
+        .await
+        {
+            Err(_) => panic!("acquire_context 不应挂死"),
+            Ok(Ok(_)) => panic!("池子已空，不该还能选出号"),
+            Ok(Err(e)) => e.to_string(),
+        };
+
+        assert!(
+            msg.contains("所有凭据均已禁用"),
+            "真耗尽应如实报耗尽（这条是与模型硬门情形的分界，不该混淆）: {msg}"
+        );
+        assert!(
+            msg.contains("retry_after_secs="),
+            "真耗尽是可自愈的临时态，必须带 retry_after_secs 才能被 map_provider_error \
+             映射成 429 + Retry-After（旧代码无此标记 → 502 无 Retry-After → 客户端不退避 \
+             → 线上 15 分钟内 2082 次）: {msg}"
+        );
     }
 
     #[test]
@@ -7051,6 +8725,220 @@ mod tests {
         assert!((m.balance_factor(1, 250.0) - 0.75).abs() < 1e-9, "快照后花 50 → 估半额 0.75");
         // 花费退回(重置/负增量)钳到 0 → 满额,不因时钟/重置乱跳。
         assert!((m.balance_factor(1, 150.0) - 1.0).abs() < 1e-9, "负增量钳 0 → 满额");
+    }
+
+    /// 性质守卫：**全新号池（所有排序键平局）必须把流量铺开**，不得钉在下标最小的号上。
+    ///
+    /// 平局条件（缺一个就会被别的键打破、测不出 jitter 的作用）：
+    /// - `credential_rpm_limit` 设极大 → `rpm_usage_permille = rpm*1000/cap` 恒为 0
+    ///   （否则 `commit_selection` 的 `rpm.record` 会立刻让它分叉）；
+    /// - 每次取号后立即 drop → `inflight` 归零；
+    /// - 不调 `report_success` → `success_count` 恒 0；
+    /// - 同 priority、同健康（全新号 EWMA 均为乐观初值）。
+    ///
+    /// 这是"刚补一批新号、池子空闲"时的真实形态（新号 success_count 全为 0）。
+    ///
+    /// ⚠️ 本测试**不断言实现方式**，只断言可观测性质。历史注记：曾为此加过一个随机
+    /// 打散键 `tie_break_jitter`，但两次尝试都无法构造出"移除它即失败"的测试
+    /// （本测试在有无该键时都通过），说明平局在实际调用序列里已被其它键打破。
+    /// 按"无证据支撑的改动不保留"的原则该键已删除，本测试作为性质回归留下。
+    #[tokio::test]
+    async fn test_jitter_breaks_full_tie_among_fresh_credentials() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.affinity_enabled = false;
+        // 关键：容量极大，让 rpm_usage_permille 恒为 0，不去打破平局
+        config.credential_rpm_limit = 1_000_000;
+        let creds: Vec<KiroCredentials> = (0..4)
+            .map(|i| {
+                let mut c = KiroCredentials::default();
+                c.priority = 0;
+                c.access_token = Some(format!("tok-{i}"));
+                c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+                c
+            })
+            .collect();
+        let manager = MultiTokenManager::new(config, creds, None, None, false).unwrap();
+
+        let mut hits: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        for _ in 0..80 {
+            let g = manager.acquire_context(None, None).await.unwrap();
+            *hits.entry(g.id).or_default() += 1;
+            drop(g); // inflight 归零，下一轮重新全平局
+        }
+        assert!(
+            hits.len() >= 3,
+            "全新号池应把流量铺开到多个号，实际只用了 {} 个：{hits:?}",
+            hits.len()
+        );
+    }
+
+    /// 回归（S2 封号原因持久化）：自动禁用原因**不得**在重启后退化成「手动禁用」。
+    ///
+    /// **旧代码为何失败**：`KiroCredentials` 只有 `disabled: bool`、没有原因字段；
+    /// `persist_credentials` 只写 `cred.disabled`；而加载路径对**所有** disabled 号
+    /// 一律回填 `Some(DisabledReason::Manual)`。于是 `QuotaExceeded` / `AccountSuspended` /
+    /// `SuspiciousActivityAuto` / `TooManyFailures` 等自动禁用原因重启即全部丢失
+    /// —— 用户明确要求的「认定封号必须标明原因」当前是重启即失效。
+    /// 并且以 reason 为判据的自愈逻辑会把自动禁用误判成人工禁用。
+    ///
+    /// 本测试走**真实的序列化往返**（serde_json），断言原因与时刻都能穿过重启。
+    /// 旧代码下 `KiroCredentials` 连这两个字段都没有，反序列化后 `disabled_reason` 为 None
+    /// → 加载路径回填 Manual → 断言失败。
+    #[test]
+    fn test_disabled_reason_survives_persist_roundtrip() {
+        let mut cred = KiroCredentials::default();
+        cred.id = Some(7);
+        cred.disabled = true;
+        cred.disabled_reason = Some(DisabledReason::AccountSuspended);
+        cred.disabled_at = Some("2026-07-29T10:00:00+00:00".to_string());
+
+        // 真实往返：写盘格式 → 读回
+        let json = serde_json::to_string(&cred).expect("序列化");
+        let back: KiroCredentials = serde_json::from_str(&json).expect("反序列化");
+
+        assert_eq!(
+            back.disabled_reason,
+            Some(DisabledReason::AccountSuspended),
+            "自动禁用原因必须穿过持久化往返（旧代码无此字段 → 恒 None → 加载时被回填成 Manual）"
+        );
+        assert_eq!(
+            back.disabled_at.as_deref(),
+            Some("2026-07-29T10:00:00+00:00"),
+            "禁用时刻必须持久化，运维需要它判断『这号坏了多久』"
+        );
+        assert!(back.disabled, "disabled 本身当然也要保留");
+
+        // 线格式必须是稳定的 camelCase（外部脚本/前端按它读）
+        assert!(
+            json.contains("\"disabledReason\":\"accountSuspended\""),
+            "线格式应为 camelCase 稳定命名，实际 json={json}"
+        );
+    }
+
+    /// 回归（S2 向后兼容）：旧凭据文件（无 `disabledReason` 字段）必须仍能加载。
+    ///
+    /// 新增字段用 `#[serde(default)]`，所以旧文件读回来是 `None`，
+    /// 加载路径再回落 `Manual` —— 这是**刻意保留**的降级行为，不是缺陷。
+    #[test]
+    fn test_legacy_credentials_without_reason_still_load() {
+        let legacy = r#"{"id":9,"accessToken":"t","refreshToken":"r","disabled":true}"#;
+        let cred: KiroCredentials = serde_json::from_str(legacy).expect("旧格式必须仍可解析");
+        assert!(cred.disabled);
+        assert_eq!(cred.disabled_reason, None, "旧文件无该字段 → None（加载路径回落 Manual）");
+        assert_eq!(cred.disabled_at, None);
+    }
+
+    /// 回归（G2 反饥饿强制探测 · 结构性兜底）：健康分最差的可选号也不得被永久排除。
+    ///
+    /// **旧代码为何失败**：`health_tier` 在排序键的高位，最差档号只在高档全部不可用时才被选到。
+    /// 而健康分的上升路径依赖 `on_success` —— 拿不到请求就没有成功 → 永久留在最差档。
+    /// 线上实测：6 号池 4 个号进 T2 且 `rpm=0 inflight=0` 空转，有效容量 6→3，全程零 429。
+    ///
+    /// 本测试用**两个号 + 极少轮次**保证对照干净：
+    /// - `credential_rpm_limit` 设很大，避免多轮选号把 RPM 打饱和从而污染排序（那会让
+    ///   两个号都变 `unusable`、测试失去区分度 —— 这正是本测试第一版失败的原因）；
+    /// - 只跑 6 轮，远小于任何饱和阈值；
+    /// - #1 打成"健康分最差 + 已饥饿"，#2 保持健康。
+    ///
+    /// 有反饥饿键时 #1 至少被探测到一次；把 `starved` 常量化（模拟旧代码）后 #1 恒 0 次。
+    #[tokio::test]
+    async fn test_starved_credential_is_force_probed() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.affinity_enabled = false;
+        // 关键：抬高 RPM 容量，确保 6 轮选号绝不触发饱和（饱和会让两个号都 unusable）
+        config.credential_rpm_limit = 100_000;
+        let creds: Vec<KiroCredentials> = (0..2)
+            .map(|i| {
+                let mut c = KiroCredentials::default();
+                c.priority = 0;
+                c.access_token = Some(format!("tok-{i}"));
+                c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+                c
+            })
+            .collect();
+        let manager = MultiTokenManager::new(config, creds, None, None, false).unwrap();
+
+        // #1 健康分打到最差档（连续 429），但**不让它熔断沉底**：
+        // 熔断 Open 会让 p_avail=0 → unusable=1 → 本就该沉底，那不是饥饿场景。
+        // 故只打到 TRIP_THRESHOLD-1 次，保持 Closed 但健康分很低。
+        let fam1 = manager.family_key_of(1);
+        for _ in 0..(crate::kiro::health::TRIP_THRESHOLD - 1) {
+            manager.health.on_429(&fam1);
+        }
+        {
+            let snap = manager.health.snapshot(&fam1).unwrap();
+            assert!(!snap.circuit_open, "前置：#1 不应熔断（否则测的不是饥饿）");
+            assert!(
+                snap.health < crate::kiro::health::HEALTH_TIER_HEALTHY_MIN,
+                "前置：#1 应已跌出健康档，实际 {}",
+                snap.health
+            );
+        }
+        // 让 #1 处于"已饥饿"（上次被选中远在探测窗口外）
+        {
+            let entries = manager.entries.lock();
+            let e1 = entries.iter().find(|e| e.id == 1).unwrap();
+            e1.last_selected_at.set(
+                Instant::now() - StdDuration::from_secs(STARVATION_PROBE_SECS + 60),
+            );
+        }
+
+        let mut hit_1 = 0usize;
+        for _ in 0..6 {
+            let g = manager.acquire_context(None, None).await.unwrap();
+            if g.id == 1 {
+                hit_1 += 1;
+            }
+            drop(g);
+        }
+        assert!(
+            hit_1 > 0,
+            "健康分最差但仍可选的饥饿号必须被强制探测到（旧代码 0 次），实际 {hit_1} 次"
+        );
+    }
+
+    /// 回归（低负载分流偏斜 · 本轮修复）：请求归零后再选，不得恒偏向同一个号。
+    ///
+    /// **旧代码为何失败**：低负载下排序键的前几位会**全部平局** —— 全池健康（①②③ 恒等）、
+    /// 每个请求处理完 inflight 即归零（④⑤ 恒 0）、`rpm_usage_permille` 用 60s 滑窗且
+    /// 过期即归零（⑥ 追不上）。而 `min_by_key` 全平局时**恒返回第一个元素**，于是流量
+    /// 持续偏向 `entries` 里下标靠前的号。
+    ///
+    /// 线上 6 号池实测（52 次请求全部成功、无坏号）：gini **0.378**、最热/最冷 **6.67x**，
+    /// idx0 的 #208 拿 20 次而 idx5 的 #213 只拿 3 次。
+    ///
+    /// 本测试每次取号后**立即 drop guard**（inflight 归零），复现那个"每次都从全平局
+    /// 开始"的低负载场景。旧代码下会 100% 选中 id=1，`distinct == 1` → 断言失败。
+    #[tokio::test]
+    async fn test_low_load_selection_does_not_always_pick_first_entry() {
+        let manager = make_balanced_manager(6);
+        // 同优先级才是真并列（make_balanced_manager 给的是 0..n）
+        {
+            let mut entries = manager.entries.lock();
+            for e in entries.iter_mut() {
+                e.credentials.priority = 0;
+            }
+        }
+        let mut hits: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        for _ in 0..120 {
+            let g = manager.acquire_context(None, None).await.unwrap();
+            *hits.entry(g.id).or_default() += 1;
+            drop(g); // 立即归零 inflight —— 关键：让下一轮又从"全平局"开始
+        }
+        let distinct = hits.len();
+        assert!(
+            distinct >= 5,
+            "6 号池 120 次低负载选号应铺开到几乎所有号，实际只用了 {distinct} 个：{hits:?}\
+             （旧代码恒选下标最小的号，distinct==1）"
+        );
+        // 最热号不应垄断：完美均分是 20 次/号，给足容差但要挡住 6.67x 那种偏斜。
+        let max = *hits.values().max().unwrap();
+        assert!(
+            max <= 60,
+            "最热号拿了 {max}/120 次，偏斜过大：{hits:?}"
+        );
     }
 
     /// 余额加权作为末位 tie-break 生效:两号同优先级/同健康/同在途 0/同 RPM 时,余额多的先选。
@@ -7548,6 +9436,208 @@ mod tests {
         assert!(manager.is_rpm_saturated(1), "打到 25(headroom 后阈值)应触发饱和");
     }
 
+    // ============ rpm_saturation_gate_active(虚假饱和告警修复,旧代码没有此函数,
+    // 下面的"旧行为"用等价断言复现) ============
+
+    /// ⭐⭐ 调度归一化回归（**旧代码必失败**）：priority 模式下 RPM 饱和硬门**必须真正生效**，
+    /// 饱和的高优先级号必须优雅溢出到下一优先级层。
+    ///
+    /// 本测试的前身断言的是相反的事（"priority 模式下饱和不影响选号，仍选 #1"）——那记录的是
+    /// 归一化前的**缺陷行为**：priority 分支只有 `min_by_key(|e| e.credentials.priority)` 一行，
+    /// 不看饱和/熔断/inflight，于是 #1 被打爆后流量仍全压在它身上，旁边空闲的 #2 一个都接不到。
+    /// 归一化（priority ≡ balanced + priority_in_balanced=true）后，priority 语义保留为
+    /// "按优先级**分层**"，但排序键第①位 `unusable`（含饱和判定）会让打爆的整层沉底 → 溢出到 #2。
+    #[tokio::test]
+    async fn test_priority_mode_saturated_credential_spills_over() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority".to_string(); // 出厂默认值，写明意图
+        config.affinity_enabled = false;
+        config.credential_rpm_limit = 2;
+        config.rpm_headroom_factor = 100; // 隔离 headroom，让阈值恰为 2
+
+        let mut c1 = KiroCredentials::default();
+        c1.priority = 0; // 高优先级
+        c1.access_token = Some("tok1".to_string());
+        c1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut c2 = KiroCredentials::default();
+        c2.priority = 1; // 低优先级
+        c2.access_token = Some("tok2".to_string());
+        c2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(config, vec![c1, c2], None, None, false).unwrap();
+
+        // 把 #1 打到远超阈值 → 饱和
+        for _ in 0..6 {
+            manager.rpm.record(1);
+        }
+        assert!(manager.is_rpm_saturated(1), "前置条件:#1 已超过软上限");
+
+        // 归一化后硬门在两种模式下都生效（面板据此报告 rpmSaturated 才与调度一致）
+        assert!(
+            manager.rpm_saturation_gate_active(),
+            "归一化后 priority 模式同样走排序键，饱和硬门必须生效"
+        );
+
+        // ⭐核心断言：应溢出到未饱和的 #2，而不是死磕已打爆的高优先级 #1。
+        let ctx = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(
+            ctx.id, 2,
+            "高优先级号已饱和时必须优雅溢出到 #2（旧代码恒返 1：裸 min_by_key(priority) 不看饱和）"
+        );
+    }
+
+    /// ⭐ 零回归对照：priority 语义**必须保留** —— 高优先级号健康时绝不提前用低优先级号。
+    /// 与上一个测试构成一对，证明归一化不是"把 priority 变成纯均衡"，而是"分层 + 层内均衡"。
+    #[tokio::test]
+    async fn test_priority_mode_healthy_high_priority_not_bypassed() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority".to_string();
+        config.affinity_enabled = false;
+        config.credential_rpm_limit = 100; // 阈值放大，保证不饱和
+
+        let mut c1 = KiroCredentials::default();
+        c1.priority = 0;
+        c1.access_token = Some("tok1".to_string());
+        c1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut c2 = KiroCredentials::default();
+        c2.priority = 1;
+        c2.access_token = Some("tok2".to_string());
+        c2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(config, vec![c1, c2], None, None, false).unwrap();
+
+        let ctx = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(ctx.id, 1, "高优先级号健康时必须优先使用，priority 语义不能丢");
+    }
+
+    /// ⭐ 归一化回归（**旧代码必失败**）：同优先级多号必须**分流**，不能恒选下标最小那个。
+    ///
+    /// 旧代码 `min_by_key(|e| e.credentials.priority)` 遇平局取第一个遇到的元素，而 `available`
+    /// 的顺序 = 凭据入池顺序，于是同 priority 的号里**恒定选中最早创建的那个**，与运行时负载无关。
+    /// 实测后果：5 号池 priority 全为 0 时，某号 rpm=23 而另一号 rpm=1（负载差 23 倍）。
+    #[tokio::test]
+    async fn test_priority_mode_same_priority_spreads_load() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority".to_string();
+        config.affinity_enabled = false;
+        config.credential_rpm_limit = 1000; // 不触发饱和，纯看负载分流
+
+        // 三个号 priority 全为 0（平局）——正是实机现场的配置
+        let creds: Vec<KiroCredentials> = (0..3)
+            .map(|i| {
+                let mut c = KiroCredentials::default();
+                c.priority = 0;
+                c.access_token = Some(format!("tok{i}"));
+                c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+                c
+            })
+            .collect();
+
+        let manager = MultiTokenManager::new(config, creds, None, None, false).unwrap();
+
+        // 连续取 6 次上下文，**持有不释放**（inflight 累积），观察是否分摊。
+        let mut ctxs = Vec::new();
+        for _ in 0..6 {
+            ctxs.push(manager.acquire_context(None, None).await.unwrap());
+        }
+        let mut hits = std::collections::HashMap::new();
+        for c in &ctxs {
+            *hits.entry(c.id).or_insert(0u32) += 1;
+        }
+        assert!(
+            hits.len() >= 2,
+            "同优先级多号必须分流到至少 2 个号，实际只用了 {:?}（旧代码恒选下标最小的那一个）",
+            hits
+        );
+        // 排序键第④位是 inflight 最少优先 → 3 个号 6 次应各 2 次，最热号不该独吞过半。
+        let max_hit = hits.values().copied().max().unwrap();
+        assert!(
+            max_hit <= 3,
+            "最热号占了 {max_hit}/6 次，分流失效（in-flight 维度未生效）：{hits:?}"
+        );
+    }
+
+    /// ⭐回归:balanced 模式 + 池号数 >1 时硬门才真正生效(与 test_rpm_saturation_deprioritizes_credential
+    /// 描述的调度行为一致)。
+    #[test]
+    fn test_rpm_saturation_gate_active_in_balanced_multi_credential() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut c1 = KiroCredentials::default();
+        c1.access_token = Some("tok1".to_string());
+        c1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut c2 = KiroCredentials::default();
+        c2.access_token = Some("tok2".to_string());
+        c2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(config, vec![c1, c2], None, None, false).unwrap();
+        assert!(
+            manager.rpm_saturation_gate_active(),
+            "balanced 模式 + 池号数>1 应报硬门生效"
+        );
+    }
+
+    /// ⭐回归:即便是 balanced 模式，只要池里只有 1 个号，"分流"这个概念本身就不适用
+    /// (无处可分)，硬门也不该报生效——否则 UI 会显示"建议分流"却根本没有第二个号。
+    #[test]
+    fn test_rpm_saturation_gate_inactive_with_single_credential() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string(); // 即便开了 balanced
+
+        let mut c1 = KiroCredentials::default();
+        c1.access_token = Some("tok1".to_string());
+        c1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(config, vec![c1], None, None, false).unwrap();
+        assert!(
+            !manager.rpm_saturation_gate_active(),
+            "单号池下无分流对象，硬门不应报生效，即便是 balanced 模式"
+        );
+    }
+
+    /// ⭐ 归一化回归（**旧代码必失败**）：priority 模式下硬门同样生效，与 balanced 无差别。
+    ///
+    /// 本测试的前身断言相反（"priority 模式下硬门不生效"）——那记录的是归一化前的事实：
+    /// 裸 priority 分支不读饱和，所以那个阈值确实从未拦过请求（面板据此报"已达软上限"即虚假告警）。
+    /// 归一化后两种模式共用同一套排序键，饱和硬门真实生效，面板报告与调度重新对齐。
+    #[test]
+    fn test_rpm_saturation_gate_active_in_priority_mode_after_normalization() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority".to_string();
+
+        let mut c1 = KiroCredentials::default();
+        c1.access_token = Some("tok1".to_string());
+        c1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut c2 = KiroCredentials::default();
+        c2.access_token = Some("tok2".to_string());
+        c2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(config, vec![c1, c2], None, None, false).unwrap();
+        assert!(
+            manager.rpm_saturation_gate_active(),
+            "归一化后 priority 模式也走排序键，饱和硬门必须生效（旧代码此处为 false）"
+        );
+    }
+
+    /// ⭐ 零回归：单号池下无论何种模式，硬门都不该报生效（无分流对象，"饱和"概念不适用）。
+    /// 这条不受归一化影响，用于确认归一化没把单号池的特例判断一起吃掉。
+    #[test]
+    fn test_rpm_saturation_gate_still_inactive_for_single_credential_in_priority() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority".to_string();
+
+        let mut c1 = KiroCredentials::default();
+        c1.access_token = Some("tok1".to_string());
+        c1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(config, vec![c1], None, None, false).unwrap();
+        assert!(
+            !manager.rpm_saturation_gate_active(),
+            "单号池无分流对象，硬门恒不生效（归一化不改变这条特例）"
+        );
+    }
+
     // ============ L3 headroom 折扣(旧代码上会失败:旧代码无折扣恒等于 base)============
 
     #[test]
@@ -7699,6 +9789,252 @@ mod tests {
         // 封禁凭据 2 后无可用凭据
         assert!(!manager.report_account_suspended(2));
         assert_eq!(manager.available_count(), 0);
+    }
+
+    /// 回归（死号自动禁用 · 本轮核心）：连续账户级风控且期间零成功 → 自动禁用。
+    ///
+    /// **旧代码为何失败**：判据是 `cooldown.trigger_count(id) >= 10`，而
+    /// `cooldown_enabled=false` 时 `set_cooldown` 根本不被调用 → `trigger_count`
+    /// 恒 0 → 阈值永不可达。且整个自动禁用块被 `if cooldown_enabled` 包住，
+    /// 该开关关闭时连计数都不发生。线上实测正是这个组合：8 个成功率恒 0% 的死号
+    /// 跑几小时仍全部 `disabled=false`，每个请求都在它们身上白撞。
+    #[test]
+    fn test_suspicious_auto_disable_works_with_cooldown_disabled() {
+        let mut config = Config::default();
+        // 关键：冷却关闭。自动禁用**不得**依赖这个不相关的开关。
+        config.cooldown_enabled = false;
+        let manager = MultiTokenManager::new(
+            config,
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 阈值前一次：仍在池内（临时风控不能一见 403 就禁，会误伤健康号）
+        for _ in 0..(MAX_CONSECUTIVE_SUSPICIOUS_BEFORE_DISABLE - 1) {
+            manager.report_suspicious_activity(1);
+        }
+        assert_eq!(
+            manager.available_count(),
+            2,
+            "未达阈值前不得禁用（403 是临时态，历史上误判成永久封禁造成过生产事故）"
+        );
+
+        // 达阈值：自动禁用，移出调度
+        manager.report_suspicious_activity(1);
+        assert_eq!(
+            manager.available_count(),
+            1,
+            "连续 {} 次风控且零成功应自动禁用（旧代码 trigger_count 恒 0，永不触发）",
+            MAX_CONSECUTIVE_SUSPICIOUS_BEFORE_DISABLE
+        );
+    }
+
+    /// 回归（健康号永不误禁）：一次成功即清零连续风控计数。
+    ///
+    /// **旧代码为何失败**：计数依赖 `cooldown.trigger_count`，而 `report_success`
+    /// 调 `clear_cooldown` → `entries.remove()` 删掉整个冷却条目 → 计数归零。
+    /// 表面上"成功会清零"是对的，但副作用是**半死号也永远回不到阈值**，
+    /// 于是自动禁用整体失效。新实现把计数挂在凭据条目上，与冷却条目解耦：
+    /// 成功仍然清零（本测试），但失败能持续累加（上一个测试）。
+    #[test]
+    fn test_success_resets_suspicious_counter_so_healthy_cred_never_disabled() {
+        let config = Config::default();
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+
+        // 模拟实测中的健康号：偶发 403，但成功率 90~100%。
+        // 循环远超阈值；若成功没能清零，早就被误禁了。
+        for _ in 0..(MAX_CONSECUTIVE_SUSPICIOUS_BEFORE_DISABLE * 5) {
+            for _ in 0..(MAX_CONSECUTIVE_SUSPICIOUS_BEFORE_DISABLE - 1) {
+                manager.report_suspicious_activity(1);
+            }
+            manager.report_success(1); // 一次成功即清零
+        }
+        assert_eq!(
+            manager.available_count(),
+            1,
+            "健康号（偶发风控但持续有成功）绝不能被自动禁用——这正是 403 不可按\
+             『见过即封』处理的原因"
+        );
+    }
+
+    /// 回归（**回滚安全**，发布前 review 抓到的 BLOCKER）：
+    /// 未知的 `disabledReason` 必须退化成 `Unknown`，**绝不能让整个凭据文件解析失败**。
+    ///
+    /// **为什么这是 BLOCKER**：`DisabledReason` 每次新增变体（本轮加了
+    /// `PassthroughFailed` / `PassthroughOverloaded`），新版本就会把它写进
+    /// `credentials.json`。而**旧版本**读到未知变体时 serde 报
+    /// `unknown variant 'passthroughFailed', expected one of ...` →
+    /// `CredentialsConfig::load` 返 Err → `main.rs` 直接 `std::process::exit(1)`
+    /// （刻意的 fail-safe：宁可拒绝启动也不用空池覆盖真实凭据）。
+    ///
+    /// 于是 **回滚到旧二进制 = 服务起不来**，且必须在生产压力下手工编辑 JSON 才能恢复。
+    /// 这条实测验证过：去掉 `#[serde(other)]` 后本测试 FAIL 并给出上述 serde 报错。
+    ///
+    /// ⚠️ 本测试同时守着「未知变体不得让**其它字段**丢失」——
+    /// 退化成 Unknown 后 disabled 等字段必须照常读出来。
+    #[test]
+    fn test_unknown_disabled_reason_degrades_instead_of_failing_load() {
+        // 模拟"未来版本"写出的凭据文件（含本版本不认识的 reason）
+        let json = r#"[{
+            "authMethod": "api_key",
+            "kiroApiKey": "ksk_future",
+            "disabled": true,
+            "disabledReason": "someFutureReasonFromNewerVersion",
+            "disabledAt": "2026-07-31T00:00:00+00:00"
+        }]"#;
+        let creds: Vec<KiroCredentials> =
+            serde_json::from_str(json).expect("未知 reason 绝不能让整个凭据文件解析失败（回滚会因此起不来）");
+        assert_eq!(creds.len(), 1);
+        assert_eq!(
+            creds[0].disabled_reason,
+            Some(DisabledReason::Unknown),
+            "未知变体应退化成 Unknown"
+        );
+        // 关键：退化不得连带丢掉其它字段
+        assert!(creds[0].disabled, "disabled 必须照常读出（退化不应影响其它字段）");
+        assert!(creds[0].disabled_at.is_some(), "disabled_at 必须照常读出");
+        assert_eq!(creds[0].kiro_api_key.as_deref(), Some("ksk_future"));
+    }
+
+    /// 回归（回滚安全 · 对照组）：**已知**变体必须精确解析，不得被 `Unknown` 吞掉。
+    ///
+    /// 防止"修过头"——`#[serde(other)]` 若误配成捕获全部，所有原因都会变成 Unknown，
+    /// 那等于把「标明封号原因」这个需求整体废掉。
+    #[test]
+    fn test_known_disabled_reasons_still_parse_exactly() {
+        for (wire, expect) in [
+            ("manual", DisabledReason::Manual),
+            ("quotaExceeded", DisabledReason::QuotaExceeded),
+            ("passthroughFailed", DisabledReason::PassthroughFailed),
+            ("passthroughOverloaded", DisabledReason::PassthroughOverloaded),
+        ] {
+            let got: DisabledReason =
+                serde_json::from_str(&format!("\"{wire}\"")).unwrap_or_else(|e| panic!("{wire} 应可解析: {e}"));
+            assert_eq!(got, expect, "{wire} 被解析错了（serde(other) 不应吞掉已知变体）");
+        }
+    }
+
+    /// 回归（E3 · 复活必须清全部惩罚计数）：`reset_and_enable` 后再来一次风控不得秒禁。
+    ///
+    /// **旧代码为何失败**：`reset_and_enable` 只清 `failure_count` /
+    /// `refresh_failure_count` / `request_count`，**漏了 `consecutive_suspicious`**
+    /// （该字段唯一清零点是 `report_success`）。于是被 `SuspiciousActivityAuto` 禁用的号
+    /// （计数已达阈值）人工「重置并启用」后计数仍在阈值上，**下一次风控即再次禁用**，
+    /// 「重置」形同虚设。且自动禁用落盘后该秒禁重启也回不来。
+    #[test]
+    fn test_reset_and_enable_clears_suspicious_counter_so_revived_cred_survives_one_hit() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 打到阈值 → 自动禁用
+        for _ in 0..MAX_CONSECUTIVE_SUSPICIOUS_BEFORE_DISABLE {
+            manager.report_suspicious_activity(1);
+        }
+        assert_eq!(manager.available_count(), 1, "达阈值应已自动禁用");
+
+        // 人工复活
+        manager.reset_and_enable(1).unwrap();
+        assert_eq!(manager.available_count(), 2, "重置并启用后应回池");
+
+        // 复活后再来一次风控：绝不能立即再禁（计数应已归零，距阈值还差 N-1 次）
+        manager.report_suspicious_activity(1);
+        assert_eq!(
+            manager.available_count(),
+            2,
+            "复活后一次风控就秒禁 = consecutive_suspicious 没被清零（旧代码即如此）"
+        );
+    }
+
+    /// 回归（E3 · 同上，覆盖 `set_disabled(false)` 这条复活路径）。
+    ///
+    /// 三条复活路径此前各自手写清零列表且都漏同一个字段，故三条都要有守卫。
+    #[test]
+    fn test_set_disabled_false_clears_suspicious_counter() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        for _ in 0..MAX_CONSECUTIVE_SUSPICIOUS_BEFORE_DISABLE {
+            manager.report_suspicious_activity(1);
+        }
+        assert_eq!(manager.available_count(), 1, "达阈值应已自动禁用");
+
+        // 走 Admin 的启用开关复活
+        manager.set_disabled(1, false).unwrap();
+        assert_eq!(manager.available_count(), 2, "启用后应回池");
+
+        manager.report_suspicious_activity(1);
+        assert_eq!(
+            manager.available_count(),
+            2,
+            "set_disabled(false) 同样必须清 consecutive_suspicious"
+        );
+    }
+
+    /// 回归（🔴 会让整池永久死锁）：全池被 403 风控打成 `SuspiciousActivityAuto` 后必须能自愈。
+    ///
+    /// **旧代码为何 FAIL**：自愈的判定条件只匹配 `TooManyFailures`，
+    /// 而 403 风控走的是 `SuspiciousActivityAuto`。于是一次 IP 级风控把全池打死后
+    /// **没有任何自动恢复路径** —— 只能人工介入或重启。
+    ///
+    /// 而 403 `TEMPORARILY_SUSPENDED` 是**临时态**（代码注释与历史事故都明确记录：
+    /// 曾被当永久封禁处理 → 12h 内 88 次误禁 + 36 次全池活锁 → 逐小时拒绝率升到 100%）。
+    ///
+    /// 线上实测（48h）：`判定为死号并自动禁用` **46 次**，而 `执行自愈` **0 次**
+    /// —— 坐实自愈对这个原因从未生效过。
+    #[tokio::test]
+    async fn test_pool_wide_suspicious_auto_disable_can_self_heal() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 打到阈值 → 以 SuspiciousActivityAuto 自动禁用（全池只有这一个号）
+        for _ in 0..MAX_CONSECUTIVE_SUSPICIOUS_BEFORE_DISABLE {
+            manager.report_suspicious_activity(1);
+        }
+        assert_eq!(manager.available_count(), 0, "前提：全池应已被自动禁用");
+
+        // 自愈：acquire_context 应把它复活并重试。
+        //
+        // ⚠️ 断言口径很关键：**不能**在调用后查 `available_count()`。
+        // 测试凭据是假的（没有真 token），复活后必然刷新失败并被重新禁用为
+        // `TooManyRefreshFailures` —— 那是**预期行为**，不是自愈没生效。
+        // 所以判据取"最终禁用原因已不再是 SuspiciousActivityAuto"：
+        // 说明它确实被复活过并走到了刷新阶段（旧代码下会原地卡在 SuspiciousActivityAuto）。
+        let _ = manager.acquire_context(None, None).await;
+        let snap = manager.snapshot();
+        let entry = snap.entries.iter().find(|e| e.id == 1).expect("号应仍在池中");
+        assert_ne!(
+            entry.disabled_reason.as_deref(),
+            Some("SuspiciousActivityAuto"),
+            "全池被 403 风控打死后必须能自愈并重新参与调度（旧代码只认 TooManyFailures → \
+             原地死锁在 SuspiciousActivityAuto，永无恢复路径）。实际原因: {:?}",
+            entry.disabled_reason
+        );
     }
 
     #[tokio::test]
@@ -7947,6 +10283,92 @@ mod tests {
         assert!(!trash[0].deleted_at.is_empty());
     }
 
+    /// 回归：删号进回收站必须保留禁用状态三元组，恢复时不得把真实原因抹成 `Manual`。
+    ///
+    /// **旧代码为何 FAIL**：`disabled` / `disabled_reason` / `disabled_at` 的权威副本在
+    /// `CredentialEntry` 上，`KiroCredentials` 里那份只在 `persist_credentials()` 落盘时同步。
+    /// 而 `delete_credential` 直接把 `removed.credentials` 塞进 `TrashEntry`，**绕过那次同步**
+    /// → 回收站条目恒为 `(false, None, None)`，第一个断言即 FAIL。
+    ///
+    /// 实测：线上 07-30 之后删的 31 个号（reason 持久化已上线）在 trash.json 里三字段全空，
+    /// 175 条回收站记录无一条带原因。用户明确要求过「认定封号必须标明原因」，而这恰在最需要
+    /// 该信息的时刻（判断换号还是申诉）丢失；且 `restore_credential` 因读不到原因只能一律落
+    /// `Manual`，是批 2 修掉的「自动原因变手动」在回收站路径上的同型漏修。
+    #[test]
+    fn test_trash_preserves_disable_reason_and_restore_does_not_downgrade_to_manual() {
+        let config = Config::default();
+        let mut c1 = KiroCredentials::default();
+        c1.refresh_token = Some("refresh-trash-reason".to_string());
+        let manager = MultiTokenManager::new(config, vec![c1], None, None, false).unwrap();
+
+        // 自动禁用（额度耗尽），而非手动禁用 —— 这是原因会不会被抹掉的关键区别。
+        manager.report_quota_exhausted(1);
+        manager.delete_credential(1).unwrap();
+
+        // ① 回收站快照必须带上真实原因与时刻
+        let trash = manager.list_trash();
+        assert_eq!(trash.len(), 1);
+        assert_eq!(
+            trash[0].disabled_reason,
+            Some(DisabledReason::QuotaExceeded),
+            "回收站丢了禁用原因（旧代码即如此：绕过 persist_credentials 的同步块）"
+        );
+        assert!(
+            trash[0].disabled_at.is_some(),
+            "回收站丢了禁用时刻，无法区分「刚坏就删」与「坏了很久」"
+        );
+
+        // ② 恢复后原因不得被降级成 Manual（仍保持 disabled，交由 Admin 手动启用）
+        manager.restore_credential(1).unwrap();
+        let snap = manager.snapshot();
+        let e = snap.entries.iter().find(|e| e.id == 1).expect("应已回池");
+        assert!(e.disabled, "恢复后应仍为禁用态，不自动回池");
+        // 注意：面板快照里 disabled_reason 是字符串（前端 i18n 用），非枚举。
+        assert_eq!(
+            e.disabled_reason.as_deref(),
+            Some("QuotaExceeded"),
+            "恢复把自动禁用原因抹成了 Manual —— 运维据此无法判断该不该启用"
+        );
+    }
+
+    /// 回归（用户要求的「强制删除」）：`force=true` 可直接删掉**未禁用**的号，且仍进回收站。
+    ///
+    /// **旧代码为何 FAIL**：`delete_credential` 无条件 bail
+    /// `只能删除已禁用的凭据（请先禁用凭据 #N）`，删一个号必须两次调用（禁用 + 删除），
+    /// 批量删 N 个 = **2N 次往返**；而"号卡住了要拔掉"正是强制删除的核心动机。
+    ///
+    /// 同时锁住**不能修过头**：force 只绕"必须先禁用"这道门，**不跳过回收站** ——
+    /// adminKey 明文存 localStorage 且全仓无 CSP，一旦 XSS 就能整池清空，
+    /// 回收站是被打穿后唯一的兜底。物理删除仍走 `purge_credential`。
+    #[test]
+    fn test_force_delete_bypasses_disable_gate_but_still_goes_to_trash() {
+        let config = Config::default();
+        let mut c1 = KiroCredentials::default();
+        c1.refresh_token = Some("refresh-force".to_string());
+        let manager = MultiTokenManager::new(config, vec![c1], None, None, false).unwrap();
+
+        // 前提：号是**启用**状态 —— 非 force 路径会被拒绝。
+        assert_eq!(manager.available_count(), 1);
+        let err = manager.delete_credential(1).unwrap_err().to_string();
+        assert!(
+            err.contains("只能删除已禁用的凭据"),
+            "非 force 必须保持原有保守语义（旧客户端不发 force 时行为不变）: {err}"
+        );
+
+        // force：直接删掉，无需先禁用。
+        manager
+            .delete_credential_forced(1, true)
+            .expect("force 应能删除未禁用的号");
+        assert_eq!(manager.total_count(), 0, "号应已从调度池移出");
+
+        // 仍在回收站里 → 可恢复（force 不等于 purge）。
+        let trash = manager.list_trash();
+        assert_eq!(trash.len(), 1, "force 删除仍须进回收站（XSS 兜底不能被绕过）");
+        assert_eq!(trash[0].id, 1);
+        manager.restore_credential(1).expect("回收站里的号应可恢复");
+        assert_eq!(manager.total_count(), 1, "恢复后应回到凭据池");
+    }
+
     /// 删除未禁用凭据应被拒绝，且不进入回收站
     #[test]
     fn test_delete_requires_disabled() {
@@ -8089,6 +10511,149 @@ mod tests {
         // retention=30：40 天前的条目应被清理
         assert_eq!(manager.purge_expired_trash(30), 1);
         assert_eq!(manager.list_trash().len(), 0);
+    }
+
+    /// 上游 5xx 必须给该号设冷却，否则失败的号下一轮立刻又被选中。
+    ///
+    /// 回归背景：`CooldownReason::ServerError`（30s，自动恢复）早已定义，但在**生产路径上
+    /// 从未被设置过** —— 唯一调用方是 admin 的手工冷却接口。于是 500 风暴时（实测一小时
+    /// 408 次 500）请求只 sleep 200ms~2s 就换号，在同一批坏号之间来回打。
+    #[test]
+    fn should_set_cooldown_on_upstream_server_error() {
+        let config = Config::default();
+        let mut c1 = KiroCredentials::default();
+        c1.refresh_token = Some("refresh-1".to_string());
+        let manager = MultiTokenManager::new(config, vec![c1], None, None, false).unwrap();
+
+        assert!(
+            !manager
+                .cooldown_snapshot()
+                .iter()
+                .any(|i| i.credential_id == 1),
+            "初始不应有冷却"
+        );
+
+        manager.report_server_error(1);
+
+        let info = manager
+            .cooldown_snapshot()
+            .into_iter()
+            .find(|i| i.credential_id == 1)
+            .expect("5xx 后该号必须处于冷却中（此前完全不设冷却）");
+        assert_eq!(
+            info.reason,
+            crate::kiro::cooldown::CooldownReason::ServerError,
+            "应使用早已定义却从未在生产路径被用过的 ServerError 原因"
+        );
+        assert!(
+            info.reason.is_auto_recoverable(),
+            "5xx 是上游整体故障，必须能自动恢复，不可要求人工介入"
+        );
+    }
+
+    /// `cooldownEnabled=false` 时 5xx 不设冷却（尊重全局开关，不绕过门禁）。
+    #[test]
+    fn should_skip_server_error_cooldown_when_cooldown_disabled() {
+        let mut config = Config::default();
+        config.cooldown_enabled = false;
+        let mut c1 = KiroCredentials::default();
+        c1.refresh_token = Some("refresh-1".to_string());
+        let manager = MultiTokenManager::new(config, vec![c1], None, None, false).unwrap();
+
+        manager.report_server_error(1);
+        assert!(
+            !manager
+                .cooldown_snapshot()
+                .iter()
+                .any(|i| i.credential_id == 1),
+            "冷却总开关关闭时不应设冷却"
+        );
+    }
+
+    /// 重试预算必须只数 Kiro 路径**真正可选**的号：排除 disabled 与 custom_api。
+    ///
+    /// 回归背景：预算此前按 `total_count()`（= entries.len()）× 3 计算，把永不可选的
+    /// custom_api 与已禁用号也算进去，凭空抬高预算 —— 生产日志 `尝试 8/36` 即由此而来。
+    #[test]
+    fn should_count_only_kiro_selectable_credentials_for_retry_budget() {
+        let config = Config::default();
+        let mut kiro1 = KiroCredentials::default();
+        kiro1.refresh_token = Some("refresh-1".to_string());
+        let mut kiro2 = KiroCredentials::default();
+        kiro2.refresh_token = Some("refresh-2".to_string());
+        // custom_api 代挂号：is_entry_selectable 永远拒绝它走 Kiro 路径
+        let mut custom = KiroCredentials::default();
+        custom.auth_method = Some("custom_api".to_string());
+        custom.base_url = Some("https://relay.invalid".to_string());
+        custom.api_key = Some("sk-x".to_string());
+
+        let manager =
+            MultiTokenManager::new(config, vec![kiro1, kiro2, custom], None, None, false).unwrap();
+
+        assert_eq!(manager.total_count(), 3, "entries 总数含 custom_api");
+        assert_eq!(
+            manager.kiro_selectable_count(),
+            2,
+            "Kiro 可选数必须排除 custom_api"
+        );
+
+        // 禁用其中一个 Kiro 号 → 可选数再降
+        manager.set_disabled(1, true).unwrap();
+        assert_eq!(
+            manager.kiro_selectable_count(),
+            1,
+            "disabled 号不可选，必须从预算基数里剔除"
+        );
+        assert_eq!(manager.total_count(), 3, "total_count 仍含全部条目（对照）");
+    }
+
+    /// 面板「全部清空」必须能清掉**刚删除**的条目。
+    ///
+    /// 这是历史缺陷的回归守卫：按天数的接口无法表达「立即全清」——传 0 被解释成
+    /// 永久保留（返回 0），传 N 又清不掉 N 天内新删的条目。于是面板点清理时 67 条
+    /// 刚删的凭据一条都清不掉，只提示「共移除 0 项」。
+    #[test]
+    fn should_purge_all_trash_including_freshly_deleted_entries() {
+        let config = Config::default();
+        let mut c1 = KiroCredentials::default();
+        c1.refresh_token = Some("refresh-1".to_string());
+        let mut c2 = KiroCredentials::default();
+        c2.refresh_token = Some("refresh-2".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![c1, c2], None, None, false).unwrap();
+        for id in [1, 2] {
+            manager.set_disabled(id, true).unwrap();
+            manager.delete_credential(id).unwrap();
+        }
+        assert_eq!(manager.list_trash().len(), 2, "两条都应在回收站");
+
+        // 按天数的两条路径都清不掉刚删的条目（这正是缺陷本身）
+        assert_eq!(
+            manager.purge_expired_trash(0),
+            0,
+            "0 被解释为永久保留，清不掉"
+        );
+        assert_eq!(
+            manager.purge_expired_trash(30),
+            0,
+            "刚删除的条目未超过 30 天，清不掉"
+        );
+        assert_eq!(manager.list_trash().len(), 2, "此时回收站仍有 2 条");
+
+        // 全清入口必须真的清空
+        assert_eq!(manager.purge_all_trash(), 2, "全清应返回被清条目数");
+        assert_eq!(manager.list_trash().len(), 0, "回收站应为空");
+    }
+
+    /// 空回收站上全清应返回 0 且不报错（幂等，前端可重复点）。
+    #[test]
+    fn should_return_zero_when_purging_empty_trash() {
+        let config = Config::default();
+        let mut c1 = KiroCredentials::default();
+        c1.refresh_token = Some("refresh-1".to_string());
+        let manager = MultiTokenManager::new(config, vec![c1], None, None, false).unwrap();
+        assert_eq!(manager.purge_all_trash(), 0);
+        assert_eq!(manager.purge_all_trash(), 0, "重复调用仍为 0，不 panic");
     }
 
     /// trash.json 持久化往返：多凭据格式下删除落盘，重建后回收站仍在
@@ -8436,4 +11001,5 @@ mod tests {
             Err(_) => println!("F1b-REPRO: acquire_context 5s 内未返回（忙等热循环成立）"),
         }
     }
+
 }

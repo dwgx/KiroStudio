@@ -8,13 +8,15 @@ use axum::{
 use super::{
     handlers::{
         add_credential, deep_verify_credential, delete_credential, disable_overage,
-        enable_overage, export_credential, force_refresh_token, get_all_credentials,
+        delete_credentials_batch, enable_overage, export_credential, force_refresh_token,
+        get_all_credentials,
         get_cached_balances, get_credential_balance, get_load_balancing_mode, get_config,
-        get_overage_status, list_trash, purge_credential, poll_social_login, reset_failure_count,
+        get_overage_status, import_keys, list_trash, purge_credential, poll_social_login,
+        reset_failure_count,
         restart_service, restore_credential, set_credential_disabled, set_credential_name,
         set_credential_proxy,
         set_credential_priority, set_credential_rpm_limit, set_credential_allowed_models,
-        set_credential_custom_api,
+        set_credential_custom_api, set_credential_endpoint,
         purge_trash_batch, probe_available_models, proxy_test,
         probe_regions, switch_profile_region,
         set_load_balancing_mode, social_callback, start_social_login, storage_cleanup,
@@ -36,6 +38,7 @@ use super::{
 /// # 端点
 /// - `GET /credentials` - 获取所有凭据状态
 /// - `POST /credentials` - 添加新凭据
+/// - `POST /import/keys` - 批量导入 Kiro API Key
 /// - `DELETE /credentials/:id` - 删除凭据
 /// - `POST /credentials/:id/disabled` - 设置凭据禁用状态
 /// - `POST /credentials/:id/priority` - 设置凭据优先级
@@ -57,6 +60,11 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_all_credentials).post(add_credential),
         )
         .route("/credentials/{id}", delete(delete_credential))
+        // 批量删除（静态段 batch-delete 与 {id} 同层，matchit 静态优先）。
+        // 支持 force=true 跳过「必须先禁用」门，把批量删 N 个从 2N 次往返降到 1 次。
+        .route("/credentials/batch-delete", post(delete_credentials_batch))
+        // 批量导入 Kiro API Key（ksk_ 号）：兼容 items[] / keys[] / apiKey / kiroApiKey 四种体
+        .route("/import/keys", post(import_keys))
         // 凭据回收站（静态段 trash 与 {id} 同层共存，matchit 静态段优先匹配）
         .route("/credentials/trash", get(list_trash))
         // 批量清空回收站（静态段 purge 优先于 trash/{id}）
@@ -68,6 +76,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/rpm-limit", post(set_credential_rpm_limit))
         .route("/credentials/{id}/allowed-models", post(set_credential_allowed_models))
         .route("/credentials/{id}/custom-api", post(set_credential_custom_api))
+        // 固定/解除该号走的端点（ide / cli）；null=回到自动路由（ksk_ 号自动 cli）
+        .route("/credentials/{id}/endpoint", post(set_credential_endpoint))
         .route("/credentials/{id}/name", post(set_credential_name))
         .route("/credentials/{id}/proxy", post(set_credential_proxy))
         .route("/credentials/{id}/reset", post(reset_failure_count))
@@ -144,4 +154,30 @@ pub fn create_admin_router(state: AdminState) -> Router {
     let public = Router::new().route("/auth/callback", get(social_callback));
 
     authed.merge(public).with_state(state)
+}
+
+/// 批量导入的**兼容别名路由**，挂在 `/api` 而非 `/api/admin`。
+///
+/// 为什么需要它：外部对接方（kiro-accounting 一类）的请求路径固定为
+/// `POST /api/import/keys`，改不了。而本仓的 admin 路由整树 nest 在 `/api/admin` 下
+/// （`main.rs` 的 `.nest("/api/admin", ...)`），所以那个路径是 404。
+///
+/// 刻意只暴露这一个端点，不是把整个 admin 树也挂到 `/api`：
+/// 后者会让 `/api/credentials`、`/api/config` 等全部多出一条等价入口，
+/// 凭据管理面多一倍且日后新增端点会自动跟着暴露——那是隐性的攻击面扩张。
+///
+/// 鉴权与 `/api/admin/import/keys` **完全一致**（同一个 `admin_auth_middleware`，
+/// 读同一个 adminKey），不存在"别名路径绕过鉴权"的问题。
+///
+/// ⚠️ 路径不带尾斜杠，且 axum 默认不做 `/api/import/keys` → `/api/import/keys/` 的
+/// 重定向，因此 POST 不会被 307/308 转走（对接方明确要求这一点：重定向会让部分
+/// HTTP 客户端把 POST 降级为 GET 或丢弃请求体）。
+pub fn create_import_alias_router(state: AdminState) -> Router {
+    Router::new()
+        .route("/import/keys", post(import_keys))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            admin_auth_middleware,
+        ))
+        .with_state(state)
 }

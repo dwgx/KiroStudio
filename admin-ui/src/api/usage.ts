@@ -14,6 +14,10 @@ import type {
 // 复用与 credentials 相同的 baseURL 与鉴权拦截
 const api = axios.create({
   baseURL: '/api/admin',
+  // 超时兜底（与 credentials.ts 同值）：axios 默认 timeout=0 即"永远等"。
+  // 请求挂在反代那一跳时会一直挂到上游超时（实测 p90 71s / max 1077s），
+  // 而 React Query 在上一次 fetch 未 settle 前不会发下一轮轮询 → 整块面板静默冻结。
+  timeout: 15000,
   headers: { 'Content-Type': 'application/json' },
 })
 

@@ -247,6 +247,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [customApiKey, setCustomApiKey] = useState('')
   const [requestLimit, setRequestLimit] = useState('')
   const [priority, setPriority] = useState('0')
+  // 多开份数：同一账号导入 N 份，每份自动分配独立 machineId。1 = 普通上号。
+  const [copies, setCopies] = useState('1')
   const [machineId, setMachineId] = useState('')
   const [proxyUrl, setProxyUrl] = useState('')
   const [proxyUsername, setProxyUsername] = useState('')
@@ -276,6 +278,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setScopes('')
     setProfileArn('')
     setPriority('0')
+    setCopies('1')
     setMachineId('')
     setProxyUrl('')
     setProxyUsername('')
@@ -339,6 +342,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         apiKey: authMethod === 'custom_api' ? customApiKey.trim() || undefined : undefined,
         requestLimit: authMethod === 'custom_api' ? (parseInt(requestLimit) || undefined) : undefined,
         priority: parseInt(priority) || 0,
+        // 只在 >1 时下发：缺省不带该字段，后端走完全不变的普通上号路径（含去重保护）。
+        copies: Math.max(1, parseInt(copies) || 1) > 1 ? Math.max(1, parseInt(copies) || 1) : undefined,
         machineId: machineId.trim() || undefined,
         proxyUrl: proxyUrl.trim() || undefined,
         proxyUsername: proxyUsername.trim() || undefined,
@@ -760,6 +765,33 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   {t('addcredentialdialog.field.priority.help')}
                 </p>
               </div>
+
+              {/* 多开份数。代挂号(custom_api)不显示:它的去重键是 base_url+api_key、
+                  没有设备指纹概念,多开在那条路径上没有意义。 */}
+              {authMethod !== 'custom_api' && (
+                <div className="space-y-2">
+                  <label htmlFor="copies" className="text-sm font-medium">
+                    {t('addcredentialdialog.field.copies.label')}
+                  </label>
+                  <NumberStepper
+                    value={Number(copies) || 1}
+                    onChange={(n) => setCopies(String(n))}
+                    min={1}
+                    max={16}
+                    disabled={isPending}
+                    className="w-full"
+                    aria-label={t('addcredentialdialog.field.copies.label')}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    {t('addcredentialdialog.field.copies.help')}
+                  </p>
+                  {(Number(copies) || 1) > 1 && (
+                    <p className="text-xs text-amber-600 dark:text-amber-500">
+                      {t('addcredentialdialog.field.copies.warn')}
+                    </p>
+                  )}
+                </div>
+              )}
 
               {/* Machine ID + 端点 均为 Kiro 专属(设备指纹/Kiro API 路由)。
                   自定义 API 代挂透传号无 refreshToken、直接打上游 base_url,不适用,不显示。 */}

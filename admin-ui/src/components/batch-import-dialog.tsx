@@ -155,7 +155,15 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     let credentials: CredentialInput[]
     try {
       const parsed = JSON.parse(jsonInput)
-      credentials = (Array.isArray(parsed) ? parsed : [parsed]).map(normalizeCredentialInput)
+      // 兼容三种形态：① 数组 [...]；② 单对象 {...}；③ 导出包装
+      // {"version":"...","credentials":[...]}（kiro 账号管理器 / ksk_ 导出格式）。
+      const rawList =
+        parsed && typeof parsed === 'object' && !Array.isArray(parsed) && Array.isArray(parsed.credentials)
+          ? parsed.credentials
+          : Array.isArray(parsed)
+            ? parsed
+            : [parsed]
+      credentials = rawList.map(normalizeCredentialInput)
     } catch (error) {
       toast.error(t('batchimportdialog.toast.jsonParseError') + extractErrorMessage(error))
       return

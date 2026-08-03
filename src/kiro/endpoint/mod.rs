@@ -6,14 +6,61 @@
 //! [`KiroEndpoint`] 抽象了请求侧的差异点；`KiroProvider` 持有一个 endpoint 注册表，
 //! 按凭据的 `endpoint` 字段选择对应实现。
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use reqwest::RequestBuilder;
 
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
+pub mod cli;
 pub mod ide;
 
+pub use cli::CliEndpoint;
 pub use ide::IdeEndpoint;
+
+/// 按端点名构造实现；未知名字返回 `None`。
+///
+/// **所有**端点的注册都收口在这里（[`registry`] 与 [`for_credentials`] 都走它），
+/// 避免"注册表加了新端点、但某条旁路仍只认 ide/cli 两种"这类漂移。
+pub fn build(name: &str) -> Option<Arc<dyn KiroEndpoint>> {
+    match name {
+        ide::IDE_ENDPOINT_NAME => Some(Arc::new(IdeEndpoint::new())),
+        cli::CLI_ENDPOINT_NAME => Some(Arc::new(CliEndpoint::new())),
+        _ => None,
+    }
+}
+
+/// 全部已知端点的名字（新增端点时**只需**改这里和 [`build`]）。
+pub const ENDPOINT_NAMES: &[&str] = &[ide::IDE_ENDPOINT_NAME, cli::CLI_ENDPOINT_NAME];
+
+/// 全部已知端点的注册表（供 `main.rs` 启动时装配 provider）。
+///
+/// 键取实现自报的 [`KiroEndpoint::name`]，而非 [`ENDPOINT_NAMES`] 里的字符串：两者若
+/// 不一致（改了常量忘了改实现，或反之），`endpoint_for` 会查不到自己注册的端点 →
+/// 该端点的号全部在热路径上拿「未知端点」。以 name() 为准可让这种笔误不可能发生。
+pub fn registry() -> HashMap<String, Arc<dyn KiroEndpoint>> {
+    ENDPOINT_NAMES
+        .iter()
+        .filter_map(|name| build(name).map(|ep| (ep.name().to_string(), ep)))
+        .collect()
+}
+
+/// 按凭据解析出该走的端点实现，供**不经 `KiroProvider`** 的旁路使用
+/// （深度验活 / 模型探测等）。
+///
+/// 口径与 `KiroProvider::endpoint_for` 完全一致（同走
+/// [`KiroCredentials::effective_endpoint`]）：显式 `endpoint` 优先 → `ksk_` 号自动路由到
+/// `cli` → 回退全局默认。名字无法识别时回退 IDE 实现而非报错：旁路的职责是"验活/探测"，
+/// 不该因为端点名拼错就整条失败（真正的门禁在启动校验与 provider 侧）。
+pub fn for_credentials(
+    credentials: &KiroCredentials,
+    default_endpoint: &str,
+) -> Arc<dyn KiroEndpoint> {
+    let name = credentials.effective_endpoint(default_endpoint);
+    build(name).unwrap_or_else(|| Arc::new(IdeEndpoint::new()))
+}
 
 /// Kiro 端点
 ///
@@ -24,6 +71,15 @@ pub trait KiroEndpoint: Send + Sync {
 
     /// API endpoint URL
     fn api_url(&self, ctx: &RequestContext<'_>) -> String;
+
+    /// API 请求的 `content-type`（默认 `application/json`）。
+    ///
+    /// CLI 端点（Amazon Q CLI 协议）**必须**用 `application/x-amz-json-1.0`：否则上游把请求
+    /// 当普通 REST 而非 X-Amz-Target 路由，返回 `UnknownOperationException` 的 JSON（非
+    /// event-stream），下游解码器读到非法帧长直接中断（实测 502「消息长度超限」）。
+    fn content_type(&self) -> &'static str {
+        "application/json"
+    }
 
     /// MCP endpoint URL
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String;
@@ -158,11 +214,32 @@ pub struct RequestContext<'a> {
     pub is_1m: bool,
 }
 
-/// 默认的 MONTHLY_REQUEST_COUNT 判断逻辑
+/// 上游表示"额度用尽"的 `reason` 取值。
+///
+/// - `MONTHLY_REQUEST_COUNT`：免费/订阅额度的月度请求数用尽。
+/// - `OVERAGE_REQUEST_LIMIT_EXCEEDED`：**按量付费(overage)的上限也用尽**。
+///
+/// 🔴 修复的缺陷（线上 8 小时日志确证）：此前只认 `MONTHLY_REQUEST_COUNT`，
+/// 而生产环境最高频的错误恰恰是 overage 那一个 —— 594 次
+/// `{"message":"You have reached the limit for overages.","reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}`。
+/// 它不被识别为额度耗尽，于是走通用可重试分支、**只冷却 1.5s** 就再撞一次。
+///
+/// 后果是一个活锁：额度已尽的号被反复轰炸 → 上游风控判定异常
+/// → 403 `TEMPORARILY_SUSPENDED`（68 次）→ 连续 6 次判死号自动禁用
+/// → 自愈把它复活（193 次）→ 回到第一步。号池因此永远稳不下来。
+///
+/// 归类为额度耗尽后走 `QuotaExceeded`，而它**刻意不在自愈白名单里**
+/// （见 `is_self_healable_reason`）—— 额度要等下个计费周期或人工提额，
+/// 复活只会继续撞墙并招来风控。这正是打断活锁的关键。
+const QUOTA_EXHAUSTED_REASONS: &[&str] =
+    &["MONTHLY_REQUEST_COUNT", "OVERAGE_REQUEST_LIMIT_EXCEEDED"];
+
+/// 默认的"额度用尽"判断逻辑（月度额度 + 按量付费上限）
 ///
 /// 同时识别顶层 `reason` 字段和嵌套 `error.reason` 字段。
 pub fn default_is_monthly_request_limit(body: &str) -> bool {
-    if body.contains("MONTHLY_REQUEST_COUNT") {
+    // 子串兜底：部分响应不是合法 JSON（截断/包裹），先按原文匹配。
+    if QUOTA_EXHAUSTED_REASONS.iter().any(|r| body.contains(r)) {
         return true;
     }
 
@@ -170,18 +247,12 @@ pub fn default_is_monthly_request_limit(body: &str) -> bool {
         return false;
     };
 
-    if value
-        .get("reason")
-        .and_then(|v| v.as_str())
-        .is_some_and(|v| v == "MONTHLY_REQUEST_COUNT")
-    {
-        return true;
-    }
+    let matches_reason = |v: Option<&serde_json::Value>| {
+        v.and_then(|v| v.as_str())
+            .is_some_and(|s| QUOTA_EXHAUSTED_REASONS.contains(&s))
+    };
 
-    value
-        .pointer("/error/reason")
-        .and_then(|v| v.as_str())
-        .is_some_and(|v| v == "MONTHLY_REQUEST_COUNT")
+    matches_reason(value.get("reason")) || matches_reason(value.pointer("/error/reason"))
 }
 
 /// 默认的 bearer token 失效判断逻辑
@@ -197,8 +268,17 @@ pub fn default_is_bearer_token_invalid(body: &str) -> bool {
 pub fn default_is_account_suspended(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
     // 明确的封禁/暂停/停用信号
+    //
+    // ⚠️ `temporarily_suspended` **刻意不在此表内**（曾在，造成生产事故）：
+    // 上游 `AccessDeniedException` 的真实 body 是
+    //   {"message":"Your User ID is temporarily suspended. We detected unusual user
+    //    activity and locked it as a security precaution...","reason":"TEMPORARILY_SUSPENDED"}
+    // 上游明确说 temporarily 且附申诉链接，是**临时**风控态。此前它命中本表 →
+    // 按永久封禁处理（disabled=true + failure_count=MAX），而 is_temporary_rate_limit
+    // 又因 SUSPICIOUS_SIGNALS 少一个 "unusual user activity" 变体而漏判 → 号被永久禁用。
+    // 实测后果：12 小时 88 次 suspend 禁用 + 51 次「所有凭据已用尽」+ 36 次全池自愈活锁，
+    // 逐小时拒绝率一路升到 100%。该形态现由 default_is_temporary_rate_limit 接管。
     const SUSPEND_KEYWORDS: &[&str] = &[
-        "temporarily_suspended",
         "account suspended",
         "account_suspended",
         "account has been suspended",
@@ -223,7 +303,16 @@ pub fn default_is_temporary_rate_limit(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
 
     // 可疑活动信号（风控触发的标志）
-    const SUSPICIOUS_SIGNALS: &[&str] = &["suspicious activity", "unusual activity"];
+    //
+    // ⚠️ 不要退回成 `"unusual activity"` 这类整段字面量：生产实际文案是
+    // "We detected unusual **user** activity"，中间多一个词就整条漏判 —— 这正是
+    // 上游说「临时」而我们按「永久」处理、进而引发禁用/自愈活锁的直接原因。
+    // 故 unusual 一族改为 `unusual` + `activity` 两词分别匹配，
+    // 顺带覆盖 unusual login activity / unusual account activity 等未知变体。
+    const SUSPICIOUS_PHRASES: &[&str] = &["suspicious activity"];
+    let has_suspicious = SUSPICIOUS_PHRASES.iter().any(|kw| lower.contains(kw))
+        || (lower.contains("unusual") && lower.contains("activity"));
+
     // 临时/限速信号（表明是限速而非永久封）
     const TEMPORARY_SIGNALS: &[&str] = &[
         "temporary limits",
@@ -233,10 +322,15 @@ pub fn default_is_temporary_rate_limit(body: &str) -> bool {
         "temporarily rate",
         "rate limits applied",
         "rate limit applied",
+        // 上游 TEMPORARILY_SUSPENDED 的两种书写：JSON 的 reason 字段用下划线，
+        // message 正文用空格（"Your User ID is temporarily suspended"）。
+        // 二者都是**临时**态（上游原文 temporarily + 附申诉链接），
+        // 故归入临时信号而非 SUSPEND_KEYWORDS，详见后者的说明。
+        "temporarily suspended",
+        "temporarily_suspended",
     ];
-
-    let has_suspicious = SUSPICIOUS_SIGNALS.iter().any(|kw| lower.contains(kw));
     let has_temporary = TEMPORARY_SIGNALS.iter().any(|kw| lower.contains(kw));
+
     has_suspicious && has_temporary
 }
 
@@ -293,6 +387,73 @@ pub fn default_extract_retry_after_secs(body: &str) -> Option<u64> {
 }
 
 #[cfg(test)]
+mod registry_tests {
+    use super::*;
+    use crate::kiro::model::credentials::KiroCredentials;
+
+    #[test]
+    fn should_register_both_known_endpoints() {
+        let reg = registry();
+        assert!(reg.contains_key(ide::IDE_ENDPOINT_NAME));
+        assert!(reg.contains_key(cli::CLI_ENDPOINT_NAME));
+        assert_eq!(reg.len(), ENDPOINT_NAMES.len(), "每个已知名字都应注册成功");
+        // 注册表的键必须与实现自报的 name() 一致，否则 endpoint_for 查不到自己注册的端点。
+        for (name, ep) in &reg {
+            assert_eq!(name, ep.name(), "注册键与 name() 必须一致");
+            // 反向：name() 必须也在已知名字表里（防"实现改了名字但常量表没同步"）。
+            assert!(
+                ENDPOINT_NAMES.contains(&ep.name()),
+                "端点 {} 未登记在 ENDPOINT_NAMES",
+                ep.name()
+            );
+        }
+    }
+
+    #[test]
+    fn should_reject_unknown_endpoint_name() {
+        assert!(build("nope").is_none());
+        assert!(build("").is_none());
+    }
+
+    /// 旁路（验活/探测）的端点解析必须与 provider 同口径：ksk_ 号拿到 CLI 实现。
+    /// 这是"验活把健康 ksk_ 号打成死号"那条缺陷的守卫。
+    #[test]
+    fn should_resolve_cli_endpoint_for_api_key_credentials() {
+        let mut ak = KiroCredentials::default();
+        ak.kiro_api_key = Some("ksk_test".to_string());
+        assert_eq!(for_credentials(&ak, "ide").name(), cli::CLI_ENDPOINT_NAME);
+
+        let social = KiroCredentials::default();
+        assert_eq!(
+            for_credentials(&social, "ide").name(),
+            ide::IDE_ENDPOINT_NAME
+        );
+    }
+
+    /// 端点名无法识别时旁路回退 IDE 而非 panic/失败（职责是验活，不是做门禁）。
+    #[test]
+    fn should_fall_back_to_ide_when_endpoint_name_unknown() {
+        let mut bad = KiroCredentials::default();
+        bad.endpoint = Some("typo".to_string());
+        assert_eq!(for_credentials(&bad, "ide").name(), ide::IDE_ENDPOINT_NAME);
+    }
+
+    /// CLI 与 IDE 的 content-type 必须不同：CLI 走 X-Amz-Target 路由，用错会拿到
+    /// UnknownOperationException 的 JSON（非 event-stream）→ 解码器读到非法帧长而中断。
+    #[test]
+    fn should_use_amz_json_content_type_only_for_cli() {
+        assert_eq!(
+            build(cli::CLI_ENDPOINT_NAME).unwrap().content_type(),
+            "application/x-amz-json-1.0"
+        );
+        assert_eq!(
+            build(ide::IDE_ENDPOINT_NAME).unwrap().content_type(),
+            "application/json"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -319,6 +480,41 @@ mod tests {
         assert!(default_is_monthly_request_limit(body));
     }
 
+    /// 回归（🔴 会烧号的活锁）：按量付费上限用尽必须也算"额度耗尽"。
+    ///
+    /// **旧代码为何 FAIL**：只认 `MONTHLY_REQUEST_COUNT`。而线上 8 小时日志里
+    /// 最高频的错误是 overage 那一个（594 次），它落不进额度分支，
+    /// 于是按通用可重试处理、**冷却仅 1.5s** 就再撞。
+    ///
+    /// **为什么严重**：额度已尽的号被持续轰炸 → 上游风控 403
+    /// `TEMPORARILY_SUSPENDED`（68 次）→ 连续 6 次判死号自动禁用
+    /// → 自愈复活（193 次）→ 回到轰炸。这是个自持活锁，号池永远稳不下来。
+    /// 归为 `QuotaExceeded` 后不进自愈白名单，活锁才被打断。
+    #[test]
+    fn overage_limit_must_count_as_quota_exhausted() {
+        // 生产原文（逐字取自 journalctl）
+        let body = r#"{"message":"You have reached the limit for overages.","reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}"#;
+        assert!(
+            default_is_monthly_request_limit(body),
+            "overage 上限用尽必须判为额度耗尽，否则只冷却 1.5s 反复重试 → 招来风控 → 烧号活锁"
+        );
+        // 嵌套形态同样要认
+        assert!(default_is_monthly_request_limit(
+            r#"{"error":{"reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}}"#
+        ));
+        // 非法 JSON 的子串兜底
+        assert!(default_is_monthly_request_limit(
+            "403 Forbidden OVERAGE_REQUEST_LIMIT_EXCEEDED (truncated"
+        ));
+        // 不误伤：限速与风控各有分类，绝不能被吞进额度分支
+        assert!(!default_is_monthly_request_limit(
+            r#"{"message":"Too many requests, please wait before trying again."}"#
+        ));
+        assert!(!default_is_monthly_request_limit(
+            r#"{"reason":"TEMPORARILY_SUSPENDED"}"#
+        ));
+    }
+
     #[test]
     fn test_default_monthly_request_limit_false() {
         let body = r#"{"message":"nope","reason":"DAILY_REQUEST_COUNT"}"#;
@@ -333,11 +529,67 @@ mod tests {
         assert!(!default_is_bearer_token_invalid("unrelated error"));
     }
 
+    /// 生产事故回归：上游的 TEMPORARILY_SUSPENDED 是**临时**态，绝不能按永久封禁处理。
+    ///
+    /// 输入用生产日志抓到的原文（未删减关键措辞）。旧实现下：
+    /// is_account_suspended=true（命中 "temporarily_suspended"）而
+    /// is_temporary_rate_limit=false（SUSPICIOUS_SIGNALS 的 "unusual activity" 匹配不到
+    /// "unusual **user** activity"）→ 号被 disabled=true + failure_count=MAX 永久禁用。
+    /// 实测 12 小时 88 次 suspend 禁用、51 次凭据用尽、36 次全池自愈活锁。
+    #[test]
+    fn should_treat_production_temporarily_suspended_body_as_temporary() {
+        let body = r#"{"__type":"com.amazon.kiro.runtimeservice#AccessDeniedException",
+ "message":"Your User ID is temporarily suspended. We detected unusual user activity and locked it as a security precaution...",
+ "reason":"TEMPORARILY_SUSPENDED"}"#;
+
+        assert!(
+            default_is_temporary_rate_limit(body),
+            "上游原文说 temporarily，必须判为临时限速（只设短冷却 + failover）"
+        );
+        assert!(
+            !default_is_account_suspended(body),
+            "绝不能判为永久封禁 —— 那会把还能用的号 disabled 掉并驱动禁用/自愈活锁"
+        );
+    }
+
+    /// `unusual` 与 `activity` 之间插任意词都应识别（生产漏判的根因是整段字面量匹配）。
+    #[test]
+    fn should_match_unusual_activity_variants_with_words_in_between() {
+        for phrase in [
+            "unusual activity",
+            "unusual user activity",
+            "unusual login activity",
+            "unusual account activity",
+        ] {
+            let body = format!("We detected {phrase}. Your User ID is temporarily suspended.");
+            assert!(
+                default_is_temporary_rate_limit(&body),
+                "应识别为临时限速: {phrase}"
+            );
+        }
+    }
+
+    /// 真正的永久封禁仍须被识别（放宽临时判据不能把永久态也漏掉）。
+    #[test]
+    fn should_still_detect_genuinely_permanent_suspension() {
+        for body in [
+            r#"{"message":"account_disabled"}"#,
+            "Your account has been suspended",
+            "this account was permanently banned",
+        ] {
+            assert!(
+                default_is_account_suspended(body),
+                "永久封禁必须仍被识别: {body}"
+            );
+            assert!(
+                !default_is_temporary_rate_limit(body),
+                "无临时信号，不应误判为临时: {body}"
+            );
+        }
+    }
+
     #[test]
     fn test_default_is_account_suspended() {
-        assert!(default_is_account_suspended(
-            r#"{"reason":"TEMPORARILY_SUSPENDED"}"#
-        ));
         assert!(default_is_account_suspended(
             "Your account has been suspended due to suspicious activity"
         ));
@@ -383,7 +635,23 @@ mod tests {
         );
         assert!(
             default_is_account_suspended(body),
-            "该文案也含 suspend 关键词——正是需要靠判定顺序避免误冻的场景"
+            "该文案也含 \"account suspended\" 关键词——正是需要靠判定顺序避免误冻的场景"
+        );
+    }
+
+    /// 判定顺序仍然是必要防线：存在「两个判据同时命中」的 body，
+    /// provider 必须先问 is_temporary_rate_limit（provider.rs:733 早于 :802）。
+    ///
+    /// 把 temporarily_suspended 移出永久表后，生产那条 body 已不再双命中，
+    /// 但「account suspended + temporary limits」这类组合仍会双命中，
+    /// 所以顺序不能因本次修复而被认为多余。
+    #[test]
+    fn should_keep_precedence_meaningful_for_dual_match_bodies() {
+        let body = "account suspended: unusual user activity, temporary limits applied";
+        assert!(default_is_temporary_rate_limit(body), "临时判据须命中");
+        assert!(
+            default_is_account_suspended(body),
+            "永久判据也命中 —— 故 provider 的判定顺序仍是防误冻的关键"
         );
     }
 

@@ -287,6 +287,8 @@ impl SocialLoginManager {
             proxy_username,
             proxy_password,
             disabled: false,
+            disabled_reason: None,
+            disabled_at: None,
             kiro_api_key: None,
             endpoint: None,
         };

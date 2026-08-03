@@ -1296,43 +1296,54 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
     let thinking_prefix = generate_thinking_prefix(req);
 
     // 1. 处理系统消息
-    if let Some(ref system) = req.system {
+    //
+    // 先把 system 归一化成"有效文本或无"，再统一决策注入内容。
+    // 这里刻意不用 `if let Some(system) = .. {} else if let Some(prefix) = ..`：
+    // `system` 存在但归一化后为空（如 `"system": ""` 被 types.rs 的 visit_str 变成
+    // `Some(vec![{text:""}])`，或整块被环境噪音剥空）时，外层分支已匹配，控制流永远到不了
+    // else 分支 → thinking 前缀被静默丢弃，扩展思考不生效且无任何日志。
+    let system_content: Option<String> = req.system.as_ref().and_then(|system| {
         // 归一化每一块 system 文本：折叠 CC 归因头（第一块，每请求漂移）+ 剥离环境噪音
         // （<env> 块 / gitStatus / Recent commits / 模型名行等，每请求漂移）。
         // 稳定住转发给上游的 prompt 前缀，避免 Bedrock prefix cache 因这些漂移而 0 命中，
         // 同时省 token、降 CC 身份被关联风险。空块（整块被剥空）直接丢弃不参与拼接。
-        let system_content: String = system
+        let joined: String = system
             .iter()
             .map(|s| canonicalize_system_text(&s.text).into_owned())
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join("\n");
-
-        if !system_content.is_empty() {
-            // 追加分块写入策略到系统消息
-            let system_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
-
-            // 注入thinking标签到系统消息最前面（如果需要且不存在）
-            let final_content = if let Some(ref prefix) = thinking_prefix {
-                if !has_thinking_tags(&system_content) {
-                    format!("{}\n{}", prefix, system_content)
-                } else {
-                    system_content
-                }
-            } else {
-                system_content
-            };
-
-            // 系统消息作为 user + assistant 配对
-            let user_msg = HistoryUserMessage::new(final_content, model_id);
-            history.push(Message::User(user_msg));
-
-            let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
-            history.push(Message::Assistant(assistant_msg));
+        if joined.is_empty() {
+            None
+        } else {
+            Some(joined)
         }
-    } else if let Some(ref prefix) = thinking_prefix {
-        // 没有系统消息但有thinking配置，插入新的系统消息
-        let user_msg = HistoryUserMessage::new(prefix.clone(), model_id);
+    });
+
+    // 最终要写入首条 user 消息的内容：三种情形共用一个出口
+    //   ① 有 system 有效文本 → [thinking 前缀 +] system + 分块策略
+    //   ② 无 system 有效文本但有 thinking → 仅 thinking 前缀
+    //   ③ 两者都无 → 不插入 system 配对
+    let system_injection: Option<String> = match (system_content, thinking_prefix.as_ref()) {
+        (Some(content), prefix) => {
+            // 追加分块写入策略到系统消息
+            let content = format!("{}\n{}", content, SYSTEM_CHUNKED_POLICY);
+            // 注入thinking标签到系统消息最前面（如果需要且不存在）
+            Some(match prefix {
+                Some(p) if !has_thinking_tags(&content) => format!("{}\n{}", p, content),
+                _ => content,
+            })
+        }
+        (None, Some(prefix)) => {
+            // 没有可用系统文本但有 thinking 配置，仅以 thinking 前缀插入系统消息
+            Some(prefix.clone())
+        }
+        (None, None) => None,
+    };
+
+    if let Some(final_content) = system_injection {
+        // 系统消息作为 user + assistant 配对
+        let user_msg = HistoryUserMessage::new(final_content, model_id);
         history.push(Message::User(user_msg));
 
         let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
@@ -1810,6 +1821,143 @@ mod tests {
         assert_eq!(sys_a, sys_b, "env 漂移剥离后转发字节应一致");
         assert!(!sys_a.contains("Working directory"), "漂移的 cwd 不应泄漏到转发字节");
         assert!(sys_a.contains("Help the user."), "稳定正文应保留");
+    }
+
+    /// 构造只有一条 user 消息的最小请求，system/thinking 可控。
+    fn mk_thinking_req(
+        system: Option<Vec<super::super::types::SystemMessage>>,
+        thinking: Option<super::super::types::Thinking>,
+    ) -> MessagesRequest {
+        use super::super::types::Message as AnthropicMessage;
+        MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hi"),
+            }],
+            stream: false,
+            system,
+            tools: None,
+            tool_choice: None,
+            thinking,
+            output_config: None,
+            metadata: None,
+        }
+    }
+
+    fn first_history_user_content(req: &MessagesRequest) -> Option<String> {
+        let history =
+            build_history(req, &req.messages, "claude-sonnet-4.5", &mut HashMap::new()).unwrap();
+        match history.first() {
+            Some(Message::User(u)) => Some(u.user_input_message.content.clone()),
+            _ => None,
+        }
+    }
+
+    /// 回归：`"system": ""` 经 types.rs 的 visit_str 变成 `Some(vec![{text:""}])`，
+    /// 归一化后为空。旧代码外层 `if let Some(system)` 已匹配、内层 is_empty 跳过，
+    /// 控制流到不了 else 分支 → thinking 前缀被静默丢弃。修复后必须仍注入。
+    #[test]
+    fn should_inject_thinking_prefix_when_system_is_empty_string() {
+        use super::super::types::SystemMessage;
+
+        let req = mk_thinking_req(
+            Some(vec![SystemMessage {
+                text: String::new(),
+                block_type: Some("text".to_string()),
+                cache_control: None,
+            }]),
+            Some(super::super::types::Thinking {
+                thinking_type: "enabled".to_string(),
+                budget_tokens: 8192,
+            }),
+        );
+
+        let content = first_history_user_content(&req)
+            .expect("system 空但 thinking 开启时，首条历史应为注入 thinking 前缀的 user 消息");
+        assert!(
+            has_thinking_tags(&content),
+            "thinking 前缀必须注入，实际内容：{content}"
+        );
+        assert!(content.contains("<max_thinking_length>8192</max_thinking_length>"));
+        // 无有效 system 文本时不应附带分块策略（保持与 system=None 路径一致）
+        assert!(!content.contains(SYSTEM_CHUNKED_POLICY));
+    }
+
+    /// 回归：system 整块是环境噪音，剥离后为空 —— 同一条控制流缺陷的第二条触发路径。
+    #[test]
+    fn should_inject_thinking_prefix_when_system_stripped_to_empty_by_env_noise() {
+        use super::super::types::SystemMessage;
+        let _g = EnvNoiseGuard::enable();
+
+        let req = mk_thinking_req(
+            Some(vec![SystemMessage {
+                text: "<env>\nWorking directory: /home/a\nPlatform: linux\n</env>".to_string(),
+                block_type: Some("text".to_string()),
+                cache_control: None,
+            }]),
+            Some(super::super::types::Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 0,
+            }),
+        );
+
+        let content = first_history_user_content(&req)
+            .expect("system 被剥空但 thinking 开启时，首条历史应为 thinking 前缀");
+        assert!(has_thinking_tags(&content), "实际内容：{content}");
+        assert!(content.contains("<thinking_effort>high</thinking_effort>"));
+    }
+
+    /// 正常路径不变：有有效 system + thinking → 前缀在最前，system 正文与分块策略都在。
+    #[test]
+    fn should_keep_thinking_prefix_ahead_of_non_empty_system() {
+        use super::super::types::SystemMessage;
+
+        let req = mk_thinking_req(
+            Some(vec![SystemMessage {
+                text: "You are a helpful assistant.".to_string(),
+                block_type: Some("text".to_string()),
+                cache_control: None,
+            }]),
+            Some(super::super::types::Thinking {
+                thinking_type: "enabled".to_string(),
+                budget_tokens: 1024,
+            }),
+        );
+
+        let content = first_history_user_content(&req).expect("首条历史应为 system 对应的 user");
+        assert!(content.starts_with("<thinking_mode>enabled</thinking_mode>"));
+        assert!(content.contains("You are a helpful assistant."));
+        assert!(content.contains(SYSTEM_CHUNKED_POLICY));
+    }
+
+    /// 两者都无时不插入 system 配对（首条历史不再是 system 伪装的 user）。
+    #[test]
+    fn should_not_inject_system_pair_when_system_empty_and_thinking_off() {
+        use super::super::types::SystemMessage;
+
+        let req = mk_thinking_req(
+            Some(vec![SystemMessage {
+                text: String::new(),
+                block_type: Some("text".to_string()),
+                cache_control: None,
+            }]),
+            None,
+        );
+
+        let history = build_history(
+            &req,
+            &req.messages,
+            "claude-sonnet-4.5",
+            &mut HashMap::new(),
+        )
+        .unwrap();
+        // 只有一条 user 消息 → 作为 currentMessage 不入历史，历史应为空
+        assert!(
+            history.is_empty(),
+            "无 system 无 thinking 时不应插入任何历史"
+        );
     }
 
     #[test]

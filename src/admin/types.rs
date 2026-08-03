@@ -85,8 +85,17 @@ pub struct CredentialStatusItem {
     /// 禁用原因
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
-    /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
+    /// 被禁用的时刻（RFC3339）。与 `disabled_reason` 成对下发，供面板显示"坏了多久"。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_at: Option<String>,
+    /// 端点名称（决定该凭据走哪套 Kiro API）——**实际生效值**，含自动路由与默认回退。
     pub endpoint: String,
+    /// 该端点是否由用户**显式固定**（凭据里写了 `endpoint` 字段）。
+    ///
+    /// `false` 表示 [`Self::endpoint`] 是系统推断的结果（`ksk_` 号自动路由到 `cli`，
+    /// 或回退 `config.defaultEndpoint`）。面板据此区分「已固定」与「自动」两种状态，
+    /// 并决定「恢复自动」按钮是否可用。
+    pub endpoint_pinned: bool,
     /// 当前在途（in-flight）请求数（实时负载，用于观测均衡是否生效）
     pub inflight: u32,
     /// 最近 60 秒滚动窗口内的请求数（RPM 观测）
@@ -143,6 +152,59 @@ pub struct TrashItemResponse {
     pub success_count: u64,
     /// 删除前最后一次调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
+    /// 删除前的禁用原因（`None` = 老回收站数据或手动删除未记录）。
+    ///
+    /// 与 `CredentialResponse.disabled_reason` 同为字符串枚举名，前端复用同一份 i18n 映射。
+    /// 用户要求「认定封号必须标明原因」，而号被判死后往往紧接着被删——回收站不带原因时，
+    /// 恰在最需要它的时刻（判断换号还是申诉）信息就丢了。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
+    /// 删除前被禁用的时刻（RFC3339）。用于区分「刚坏就删」与「坏了很久才删」。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_at: Option<String>,
+}
+
+/// 批量删除的逐条结果。
+///
+/// 部分失败仍返 200（HTTP 层成功），由本结构逐条标注 —— 与 `import/keys` 的既有模式一致。
+/// 删除是逐号独立的软删，没有跨号事务语义；整体回滚会让"10 选 1 个 id 不存在"连带
+/// 另外 9 个都删不掉。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchDeleteItemResult {
+    /// 凭据 ID
+    pub id: u64,
+    /// 该条是否成功
+    pub ok: bool,
+    /// 失败原因（成功时为 None）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// 批量删除凭据请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchDeleteRequest {
+    /// 待删除的凭据 ID 列表。上限见 `MAX_BATCH_DELETE_IDS`。
+    pub ids: Vec<u64>,
+    /// 是否**强制删除**：跳过「必须先禁用」这道门。仍进回收站，可恢复。
+    ///
+    /// 默认 false —— 旧客户端不发该字段时必须保持原有的保守语义，
+    /// 不能因为新增字段就让所有删除都变成强删。
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// 批量删除响应。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchDeleteResponse {
+    /// 成功条数
+    pub deleted: usize,
+    /// 失败条数
+    pub failed: usize,
+    /// 逐条结果（顺序与请求的 ids 一致）
+    pub results: Vec<BatchDeleteItemResult>,
 }
 
 // ============ 操作请求 ============
@@ -168,6 +230,19 @@ pub struct SetPriorityRequest {
 pub struct SetRpmLimitRequest {
     /// 新 RPM 容量（0/null = 继承全局）
     pub rpm_limit: Option<u32>,
+}
+
+/// 设置凭据级端点（走哪套 Kiro 协议）的请求。
+///
+/// `endpoint = None`（或空串）→ 清除显式配置，回到**自动路由**：`ksk_` API Key 号自动走
+/// `cli`，其余凭据回退 `config.defaultEndpoint`。传具体名字则强制固定，用于上游协议变化时
+/// 不改代码救急。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetEndpointRequest {
+    /// 端点名（如 `"ide"` / `"cli"`）。null/空串 = 清除，回到自动路由。
+    #[serde(default)]
+    pub endpoint: Option<String>,
 }
 
 /// 修改自定义 API(代挂透传)凭据配置的请求。字段均可选:None=不改。
@@ -199,7 +274,10 @@ pub struct SetAllowedModelsRequest {
 }
 
 /// 添加凭据请求
-#[derive(Debug, Deserialize)]
+///
+/// `Default` 供批量导入等内部构造路径用 `..Default::default()` 只填关心的字段
+/// （注意：`Default` 的 `auth_method` 是空串，内部构造必须显式赋值）。
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddCredentialRequest {
     pub access_token: Option<String>,
@@ -271,6 +349,35 @@ pub struct AddCredentialRequest {
     #[serde(default)]
     pub name: Option<String>,
 
+    /// 入池时是否直接置为禁用态（默认 false = 启用，与旧行为一致）。
+    ///
+    /// 存在的理由：重新导入一个**已知被上游封禁**的号时，必须能让它以禁用态入池。
+    /// 否则它会被立刻投入调度、换回一个 403 TEMPORARILY_SUSPENDED，反而加深上游
+    /// 对该批号的风控判定。`credentials.json` 本就有 `disabled` 字段，这里是把它
+    /// 在 API 添加路径上打通（此前被 `add_credential` 无条件丢弃）。
+    #[serde(default)]
+    pub disabled: bool,
+
+    /// 「多开」份数：把同一个账号导入 N 份，每份自动获得**独立 machineId**。
+    ///
+    /// **字段缺失** = 普通上号，行为与此字段不存在时完全一致（含"凭据已存在"去重保护）。
+    ///
+    /// **显式给值** = 多开意图，**全部份都绕过去重**。这样「已导过的号再加 N 个分身」
+    /// 才走得通 —— 若第 1 份仍去重，它会撞 `凭据已存在（kiroApiKey 重复）` 让整个请求失败，
+    /// 一个分身也建不出来。绕过在此安全，因为误双击不会带上这个字段
+    /// （前端只在份数 >1 时下发）。
+    ///
+    /// 值被 clamp 到 `[1, MAX_CREDENTIAL_COPIES]`（`0` 与超限都不报错）。
+    ///
+    /// # 用途与注意
+    ///
+    /// 每份独立 machineId + 各自配代理 → 上游看到的是「同一用户的多台设备」，
+    /// 用来试探能否提高并发。但 `rpm_limit` 是**每凭据**的，N 份使网关侧放行量变 N 倍，
+    /// 而这 N 份**共用同一个上游账号配额**。若上游按账号限流，多开只会更早撞惩罚窗口。
+    /// 故导入后应按「账号实测上限 ÷ 份数」逐号调 `rpmLimit`（面板卡片里可设，0 = 继承全局）。
+    #[serde(default)]
+    pub copies: Option<u32>,
+
     /// 凭据级代理 URL（可选，特殊值 "direct" 表示不使用代理）
     pub proxy_url: Option<String>,
 
@@ -300,8 +407,17 @@ fn default_auth_method() -> String {
 pub struct AddCredentialResponse {
     pub success: bool,
     pub message: String,
-    /// 新添加的凭据 ID
+    /// 新添加的凭据 ID。
+    ///
+    /// 多开（`copies > 1`）时这里是**第 1 份**的 id，全部 id 见 `credential_ids`。
+    /// 保持该字段语义不变是为了不破坏既有调用方（前端与 kiro-accounting 都读它）。
     pub credential_id: u64,
+    /// 多开时全部新建凭据的 id（含第 1 份）。`copies == 1` 时不下发该字段。
+    ///
+    /// 部分失败不回滚：若第 2..N 份中某几份失败，这里只含成功的那些，
+    /// `message` 会写明 `成功/请求` 份数。与 `import/keys` 的既有约定一致。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_ids: Option<Vec<u64>>,
     /// 用户邮箱（如果获取成功）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
@@ -336,6 +452,19 @@ pub struct BalanceResponse {
     /// 有效使用限额（base + overage cap）。serde default 兼容旧磁盘缓存。
     #[serde(default)]
     pub effective_limit: f64,
+    /// 本次返回的是否是**过期的**上次已知值（上游超时/失败时的降级）。
+    ///
+    /// `false`（默认）= 新鲜值。前端据此显示"数据可能已过期"提示而不是把它当当前额度。
+    /// 用 `skip_serializing_if` 使新鲜响应不带该字段，旧前端不受影响。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stale: bool,
+    /// 本次的 usage/remaining 是否**含本地乐观推算**（真值 + 缓存后新花掉的 credit）。
+    ///
+    /// 余额真值由后台每 30 分钟刷新一次，若不做推算，跑完一批请求后面板上的额度
+    /// 最多 30 分钟不动（用户以为没生效）。置 true 时前端可加"约"字样。
+    /// 绝不为此每请求打上游 —— 那是 web_portal 探测，会加重风控。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub optimistic: bool,
 }
 
 // ============ 批量缓存余额（A10）============
@@ -522,6 +651,8 @@ pub struct ConfigSnapshotResponse {
     pub extract_thinking: bool,
     /// Claude Code 自动切缓冲协议（识别到 CC 请求时 /v1 流式自动走 buffered，准确 input_tokens）
     pub cc_auto_buffer: bool,
+    /// 是否把估算的 prompt cache 记账下发给客户端（估算值，上游不提供真值）
+    pub prompt_cache_enabled: bool,
     /// 是否剥离转发给上游的 system 环境噪音（省 token / 提缓存命中 / 降关联，立即生效）
     pub strip_env_noise: bool,
     /// 工具错误缓解：泄漏控制 token 清洗 / 流式失败态对齐 / 如实暴露错误（均立即生效，默认关）
@@ -637,6 +768,9 @@ pub struct UpdateConfigRequest {
     pub default_endpoint: Option<String>,
     pub extract_thinking: Option<bool>,
     pub cc_auto_buffer: Option<bool>,
+    /// 是否把**估算的** cache_read/cache_creation 下发给客户端（详见 config 同名字段）。
+    /// 关闭时字段整体缺失而非置 0——两者对客户端语义不同。
+    pub prompt_cache_enabled: Option<bool>,
     pub strip_env_noise: Option<bool>,
     pub tool_clean_leaked_tokens: Option<bool>,
     pub tool_reclaim_textified_invoke: Option<bool>,
@@ -773,6 +907,14 @@ pub struct StorageCleanupRequest {
     /// 保留天数：删除早于 N 天前的数据。省略时按各分区的配置默认保留期。
     #[serde(default)]
     pub older_than_days: Option<i64>,
+    /// 全清标记：忽略时间维度，清空该分区的**全部**条目。
+    ///
+    /// 为什么需要独立于 `older_than_days`：回收站的保留天数里 `0` 已被后台任务占用为
+    /// 「永久保留、永不自动清」，因此按天数的入参**无法表达「现在就全清」**——
+    /// 传 0 会被当成永久保留而清 0 条，传 N 又清不掉 N 天内新删的条目。
+    /// 该标记为 true 时 `older_than_days` 被忽略。不可逆，前端须二次确认。
+    #[serde(default)]
+    pub purge_all: bool,
 }
 
 /// 单个分区的清理结果
@@ -800,6 +942,236 @@ pub struct StorageCleanupResponse {
     pub results: Vec<StorageCleanupItem>,
 }
 
+// ============ 批量导入 Kiro API Key ============
+
+/// `concurrencyLimit` 合法区间上界（含）。超出即 400，不做静默截断。
+pub const IMPORT_CONCURRENCY_LIMIT_MAX: i64 = 999;
+
+/// 单条待导入 Key（四种请求体归一化后的内部表示）。
+#[derive(Debug, Clone)]
+pub struct ImportKeyItem {
+    /// Kiro API Key 明文（仅进程内传递，响应/日志一律走 [`mask_import_key`]）
+    pub key: String,
+    /// 固定端点名（可选）；None = 走自动路由（`ksk_` 号自动 cli）
+    pub endpoint: Option<String>,
+    /// 是否导入后立即置禁用态
+    pub disabled: bool,
+}
+
+/// 批量导入请求（归一化后的内部表示）。
+#[derive(Debug, Clone)]
+pub struct ImportKeysRequest {
+    /// 待导入 Key 列表（至少一条，否则解析阶段即 400）
+    pub items: Vec<ImportKeyItem>,
+    /// 客户端声明的并发上限（0~999）。当前仅回显，见 `AdminService::import_keys` 注释。
+    pub concurrency_limit: Option<u32>,
+}
+
+/// 单条导入结果（`key` 恒为脱敏形态）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportKeyResult {
+    /// 该条是否导入成功
+    pub ok: bool,
+    /// 脱敏后的 Key（`ksk_xxxx…xxxx`），绝不含明文
+    pub key: String,
+    /// 失败原因（成功为 None）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// 批量导入响应（部分失败也是 HTTP 200，逐条看 `results[].ok`）。
+///
+/// 字段有意冗余，为的是同时满足两类调用方而无需任何一方改代码：
+/// - 本仓前端与既有脚本读 `results` / `elapsedMs` / `concurrencyLimit`
+/// - 外部对接方（kiro-accounting 一类）读 `success` / `items`
+///
+/// `items` 与 `results` 是**同一份数据的两个名字**（见 [`ImportKeysResponse::new`]），
+/// 不是两次导入结果；`success` 表示「请求被成功处理」而非「每条都成功」——
+/// 逐条成败一律看 `ok`，这与「部分失败仍返 200」的既有语义一致。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportKeysResponse {
+    /// 请求是否被成功处理（≠ 每条都成功）。恒 true——真正的失败走 4xx/5xx，
+    /// 不会走到这个结构体。为兼容以 `success` 判定的调用方而存在。
+    pub success: bool,
+    /// 提交条目总数
+    pub total: usize,
+    /// 成功导入数
+    pub imported: usize,
+    /// 失败数
+    pub failed: usize,
+    /// 原样回显请求里的 concurrencyLimit（未提交为 null；当前不生效）
+    pub concurrency_limit: Option<u32>,
+    /// 端到端耗时（毫秒）
+    pub elapsed_ms: u64,
+    /// 逐条结果（顺序与请求一致）
+    pub results: Vec<ImportKeyResult>,
+    /// `results` 的别名，内容完全相同。外部对接方按 `items` 读取。
+    pub items: Vec<ImportKeyResult>,
+}
+
+impl ImportKeysResponse {
+    /// 由逐条结果装配响应，自动算出 total/imported/failed 并同步 `items` 别名。
+    ///
+    /// 走这个构造器而不是手写字面量，是为了让 `results` 与 `items` 不可能不一致——
+    /// 若将来有人只更新一处，编译器不会报错但调用方会看到矛盾数据。
+    pub fn new(
+        results: Vec<ImportKeyResult>,
+        concurrency_limit: Option<u32>,
+        elapsed_ms: u64,
+    ) -> Self {
+        let total = results.len();
+        let imported = results.iter().filter(|r| r.ok).count();
+        Self {
+            success: true,
+            total,
+            imported,
+            failed: total - imported,
+            concurrency_limit,
+            elapsed_ms,
+            items: results.clone(),
+            results,
+        }
+    }
+}
+
+/// Key 脱敏：前 8 字符 + `…` + 后 4 字符；长度不足 13 一律 `***`。
+///
+/// 响应体与日志只允许出现这个形态，杜绝完整 Key 落盘/回显。按 char 切分，非 ASCII 也安全。
+pub fn mask_import_key(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() <= 12 {
+        // 太短，前后拼起来就等于原文，直接整体打码
+        return "***".to_string();
+    }
+    let head: String = chars[..8].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("{head}…{tail}")
+}
+
+/// 解析批量导入请求体，兼容 4 种历史/新格式（任一命中即可，互斥优先级见实现）。
+///
+/// 1. 新格式：`{"items":[{"key":"ksk_x","groups":[],"endpoint":null,"disabled":false}],"concurrencyLimit":300}`
+/// 2. 旧格式：`{"keys":["ksk_x", ...]}`
+/// 3. 旧格式：`{"apiKey":"ksk_x"}`
+/// 4. 旧格式：`{"kiroApiKey":"ksk_x"}`
+///
+/// 返回 `Err(msg)` 时上层一律回 400（格式错误由调用方转 `invalid_request`）。
+pub fn parse_import_keys_request(body: &serde_json::Value) -> Result<ImportKeysRequest, String> {
+    let obj = body
+        .as_object()
+        .ok_or_else(|| "请求体必须是 JSON 对象".to_string())?;
+
+    // concurrencyLimit：可选整数，0..=999；类型不对或越界一律 400（不静默夹取，避免用户以为生效）。
+    let concurrency_limit = match obj.get("concurrencyLimit") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => {
+            let n = v
+                .as_i64()
+                .ok_or_else(|| "concurrencyLimit 必须是整数".to_string())?;
+            if !(0..=IMPORT_CONCURRENCY_LIMIT_MAX).contains(&n) {
+                return Err(format!(
+                    "concurrencyLimit 越界：{n}（合法范围 0~{IMPORT_CONCURRENCY_LIMIT_MAX}）"
+                ));
+            }
+            Some(n as u32)
+        }
+    };
+
+    let items = if let Some(raw_items) = obj.get("items") {
+        // 格式 1：items 必须是数组（对象/字符串一律 400，不做宽容猜测）。
+        let arr = raw_items
+            .as_array()
+            .ok_or_else(|| "items 必须是数组".to_string())?;
+        let mut items = Vec::with_capacity(arr.len());
+        for (idx, raw) in arr.iter().enumerate() {
+            let item = raw
+                .as_object()
+                .ok_or_else(|| format!("items[{idx}] 必须是对象"))?;
+            let key = item
+                .get("key")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| format!("items[{idx}].key 缺失或为空"))?;
+            // groups：为兼容 kiro-accounting 的导出格式保留的占位字段。KiroStudio 没有
+            // 分组概念，这里**接受但忽略**（不报错），避免旧客户端整批导入失败。
+            let endpoint = item
+                .get("endpoint")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let disabled = item
+                .get("disabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            items.push(ImportKeyItem {
+                key: key.to_string(),
+                endpoint,
+                disabled,
+            });
+        }
+        items
+    } else if let Some(raw_keys) = obj.get("keys") {
+        // 格式 2：字符串数组
+        let arr = raw_keys
+            .as_array()
+            .ok_or_else(|| "keys 必须是数组".to_string())?;
+        let mut items = Vec::with_capacity(arr.len());
+        for (idx, raw) in arr.iter().enumerate() {
+            let key = raw
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| format!("keys[{idx}] 必须是非空字符串"))?;
+            items.push(ImportKeyItem {
+                key: key.to_string(),
+                endpoint: None,
+                disabled: false,
+            });
+        }
+        items
+    } else if let Some(key) = obj
+        .get("apiKey")
+        .or_else(|| obj.get("kiroApiKey"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        // 格式 3/4：单个 Key
+        vec![ImportKeyItem {
+            key: key.to_string(),
+            endpoint: None,
+            disabled: false,
+        }]
+    } else {
+        return Err(
+            "缺少可识别的 Key 字段（支持 items[].key / keys[] / apiKey / kiroApiKey）".to_string(),
+        );
+    };
+
+    if items.is_empty() {
+        return Err("没有待导入的 Key".to_string());
+    }
+
+    Ok(ImportKeysRequest {
+        items,
+        concurrency_limit,
+    })
+}
+
+/// 汇总逐条结果 → 响应体（imported/failed 计数唯一收口）。
+pub fn build_import_response(
+    results: Vec<ImportKeyResult>,
+    concurrency_limit: Option<u32>,
+    elapsed_ms: u64,
+) -> ImportKeysResponse {
+    // 委托给 ImportKeysResponse::new，保证 results/items 别名与计数只有一处真相源。
+    ImportKeysResponse::new(results, concurrency_limit, elapsed_ms)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -821,6 +1193,227 @@ mod tests {
         assert_eq!(req.login_background_r18, None);
     }
 
+    // ---- 存储清理请求 ----
+
+    /// 旧客户端不发 `purgeAll` 时必须默认 false（按天数清），不能变成"静默全清"。
+    #[test]
+    fn storage_cleanup_defaults_purge_all_to_false() {
+        let req: StorageCleanupRequest =
+            serde_json::from_str(r#"{"target":"trash"}"#).expect("最小请求体应可解析");
+        assert_eq!(req.target, "trash");
+        assert_eq!(req.older_than_days, None);
+        assert!(
+            !req.purge_all,
+            "未提交 purgeAll 时必须是 false —— 默认全清会让旧客户端误删整个回收站"
+        );
+    }
+
+    /// 面板「全部清空」提交 camelCase 的 purgeAll，必须落到 snake_case 字段。
+    #[test]
+    fn storage_cleanup_parses_purge_all_camel_case() {
+        let req: StorageCleanupRequest =
+            serde_json::from_str(r#"{"target":"trash","purgeAll":true}"#).expect("应可解析");
+        assert!(req.purge_all, "purgeAll=true 应落到 purge_all");
+    }
+
+    // ---- 批量导入 Kiro API Key ----
+
+    fn parse(json: &str) -> Result<ImportKeysRequest, String> {
+        let v: serde_json::Value = serde_json::from_str(json).expect("测试 JSON 必须合法");
+        parse_import_keys_request(&v)
+    }
+
+    /// 格式 1（新）：items[] + concurrencyLimit；groups 被接受但忽略。
+    #[test]
+    fn import_parses_items_format() {
+        let req = parse(
+            r#"{"items":[{"key":"ksk_abcdefgh1234","groups":["a"],"endpoint":null,"disabled":false}],
+                "concurrencyLimit":300}"#,
+        )
+        .expect("items 格式应解析成功");
+        assert_eq!(req.items.len(), 1);
+        assert_eq!(req.items[0].key, "ksk_abcdefgh1234");
+        assert_eq!(req.items[0].endpoint, None);
+        assert!(!req.items[0].disabled);
+        assert_eq!(req.concurrency_limit, Some(300));
+    }
+
+    /// items[] 的可选字段生效：endpoint 固定 + disabled=true。
+    #[test]
+    fn import_items_optional_fields_apply() {
+        let req = parse(r#"{"items":[{"key":"ksk_abcdefgh1234","endpoint":"cli","disabled":true}]}"#)
+            .expect("可选字段应解析成功");
+        assert_eq!(req.items[0].endpoint.as_deref(), Some("cli"));
+        assert!(req.items[0].disabled);
+        // 未提交 concurrencyLimit → None（响应回显 null）
+        assert_eq!(req.concurrency_limit, None);
+    }
+
+    /// 格式 2（旧）：keys 字符串数组。
+    #[test]
+    fn import_parses_keys_array_format() {
+        let req = parse(r#"{"keys":["ksk_abcdefgh1234","ksk_zyxwvuts9876"]}"#)
+            .expect("keys 格式应解析成功");
+        assert_eq!(req.items.len(), 2);
+        assert_eq!(req.items[1].key, "ksk_zyxwvuts9876");
+        assert!(req.items.iter().all(|i| i.endpoint.is_none() && !i.disabled));
+    }
+
+    /// 格式 3（旧）：单个 apiKey。
+    #[test]
+    fn import_parses_single_api_key_format() {
+        let req = parse(r#"{"apiKey":"ksk_abcdefgh1234"}"#).expect("apiKey 格式应解析成功");
+        assert_eq!(req.items.len(), 1);
+        assert_eq!(req.items[0].key, "ksk_abcdefgh1234");
+    }
+
+    /// 格式 4（旧）：单个 kiroApiKey。
+    #[test]
+    fn import_parses_single_kiro_api_key_format() {
+        let req = parse(r#"{"kiroApiKey":"ksk_abcdefgh1234"}"#).expect("kiroApiKey 应解析成功");
+        assert_eq!(req.items.len(), 1);
+        assert_eq!(req.items[0].key, "ksk_abcdefgh1234");
+    }
+
+    /// concurrencyLimit 越界（>999 / 负数 / 非整数）一律报错 → 上层 400。
+    #[test]
+    fn import_rejects_out_of_range_concurrency_limit() {
+        let err = parse(r#"{"keys":["ksk_abcdefgh1234"],"concurrencyLimit":1000}"#)
+            .expect_err("1000 应越界");
+        assert!(err.contains("越界"), "错误应说明越界: {err}");
+        assert!(parse(r#"{"keys":["ksk_abcdefgh1234"],"concurrencyLimit":-1}"#).is_err());
+        assert!(parse(r#"{"keys":["ksk_abcdefgh1234"],"concurrencyLimit":"300"}"#).is_err());
+        // 边界内合法：0 与 999
+        assert_eq!(
+            parse(r#"{"keys":["ksk_abcdefgh1234"],"concurrencyLimit":0}"#)
+                .unwrap()
+                .concurrency_limit,
+            Some(0)
+        );
+        assert_eq!(
+            parse(r#"{"keys":["ksk_abcdefgh1234"],"concurrencyLimit":999}"#)
+                .unwrap()
+                .concurrency_limit,
+            Some(999)
+        );
+    }
+
+    /// 结构非法：items 非数组 / 缺 key / 无任何可识别字段 / 空列表 → 全部 Err（400）。
+    #[test]
+    fn import_rejects_malformed_bodies() {
+        assert!(parse(r#"{"items":"ksk_x"}"#).is_err(), "items 非数组应拒绝");
+        assert!(parse(r#"{"items":[{"groups":[]}]}"#).is_err(), "缺 key 应拒绝");
+        assert!(parse(r#"{"items":[{"key":"  "}]}"#).is_err(), "空白 key 应拒绝");
+        assert!(parse(r#"{"items":[]}"#).is_err(), "空 items 应拒绝");
+        assert!(parse(r#"{"foo":1}"#).is_err(), "无可识别字段应拒绝");
+        assert!(parse(r#"[]"#).is_err(), "非对象体应拒绝");
+    }
+
+    /// 脱敏：只保留前 8 + 后 4，中间必须被省略号吃掉，绝不含完整 Key。
+    #[test]
+    fn import_masks_key_without_leaking_plaintext() {
+        let key = "ksk_1234567890abcdefFEDCBA";
+        let masked = mask_import_key(key);
+        assert_eq!(masked, "ksk_1234…DCBA");
+        assert!(!masked.contains(key), "脱敏结果不得含完整 Key");
+        assert!(!key.contains(&masked), "脱敏结果不应是原文的连续子串");
+        // 短 Key（<=12 字符）整体打码，避免前后拼接等于原文
+        assert_eq!(mask_import_key("ksk_12345678"), "***");
+        assert_eq!(mask_import_key(""), "***");
+        // 非 ASCII 也按 char 切，不会 panic
+        assert_eq!(mask_import_key("密钥密钥密钥密钥密钥密钥密"), "密钥密钥密钥密钥…钥密钥密");
+    }
+
+    /// 部分失败：total/imported/failed 由逐条结果汇总，失败条目带 error 且 key 脱敏。
+    #[test]
+    /// 外部对接方（kiro-accounting 一类）的响应契约：`success` / `items` 必须存在，
+    /// 且 `items` 与 `results` 是同一份数据。
+    ///
+    /// 这条测试锁的是**兼容承诺**：对接方路径与字段名都固定改不了，任何一方漂移
+    /// 都会让线上导入静默失败（他们按 `items` 读，读到 undefined 就当零条）。
+    #[test]
+    fn import_response_exposes_external_compat_fields() {
+        let results = vec![
+            ImportKeyResult { ok: true, key: mask_import_key("ksk_1234567890abcdef"), error: None },
+            ImportKeyResult {
+                ok: false,
+                key: mask_import_key("ksk_zyxwvutsrq987654"),
+                error: Some("凭据已存在（kiroApiKey 重复）".to_string()),
+            },
+        ];
+        let resp = build_import_response(results, Some(100), 42);
+
+        assert!(resp.success, "success 恒 true——真正的失败走 4xx/5xx 不会到这里");
+        assert_eq!(resp.items.len(), resp.results.len(), "items 是 results 的别名");
+        for (a, b) in resp.items.iter().zip(resp.results.iter()) {
+            assert_eq!(a.ok, b.ok);
+            assert_eq!(a.key, b.key);
+            assert_eq!(a.error, b.error);
+        }
+
+        let s = serde_json::to_string(&resp).expect("序列化应成功");
+        assert!(s.contains("\"success\":true"), "缺 success 字段");
+        assert!(s.contains("\"items\":["), "缺 items 字段");
+        assert!(s.contains("\"results\":["), "results 必须保留，本仓前端在读它");
+        assert!(s.contains("\"total\":2"));
+        assert!(s.contains("\"imported\":1"));
+        assert!(s.contains("\"failed\":1"));
+        // 无论走哪个字段名，key 都必须是脱敏的
+        assert!(!s.contains("ksk_1234567890abcdef"), "响应体不得含明文 Key");
+        assert!(!s.contains("ksk_zyxwvutsrq987654"), "响应体不得含明文 Key");
+    }
+
+    /// 对接方给的示例请求体必须原样可解析（含 `groups: []` 与 `endpoint: null`）。
+    #[test]
+    fn import_parses_external_partner_exact_payload() {
+        let body = serde_json::json!({
+            "items": [{
+                "key": "ksk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                "groups": [],
+                "endpoint": null
+            }],
+            "concurrencyLimit": 100
+        });
+        let req = parse_import_keys_request(&body).expect("对接方的固定请求体必须可解析");
+        assert_eq!(req.items.len(), 1);
+        assert_eq!(req.items[0].key, "ksk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+        assert_eq!(req.items[0].endpoint, None, "endpoint: null 应视作未指定");
+        assert!(!req.items[0].disabled, "未给 disabled 时默认启用");
+        assert_eq!(req.concurrency_limit, Some(100));
+    }
+
+    #[test]
+    fn import_response_counts_partial_failure() {
+        let results = vec![
+            ImportKeyResult {
+                ok: true,
+                key: mask_import_key("ksk_1234567890abcdef"),
+                error: None,
+            },
+            ImportKeyResult {
+                ok: false,
+                key: mask_import_key("ksk_zyxwvutsrq987654"),
+                error: Some("凭据已存在（kiroApiKey 重复）".to_string()),
+            },
+        ];
+        let resp = build_import_response(results, Some(300), 123);
+        assert_eq!(resp.total, 2);
+        assert_eq!(resp.imported, 1);
+        assert_eq!(resp.failed, 1);
+        assert_eq!(resp.concurrency_limit, Some(300));
+        assert_eq!(resp.elapsed_ms, 123);
+
+        let s = serde_json::to_string(&resp).expect("序列化应成功");
+        // 契约字段以 camelCase 下发
+        assert!(s.contains("\"concurrencyLimit\":300"));
+        assert!(s.contains("\"elapsedMs\":123"));
+        // 明文 Key 绝不出现在响应里
+        assert!(!s.contains("ksk_1234567890abcdef"));
+        assert!(!s.contains("ksk_zyxwvutsrq987654"));
+        // 成功条目省略 error 字段
+        assert!(s.contains("{\"ok\":true,\"key\":\"ksk_1234…cdef\"}"));
+    }
+
     #[test]
     fn config_snapshot_serializes_login_background_r18() {
         // 快照以 camelCase 下发，前端据此渲染开关初值。
@@ -838,6 +1431,7 @@ mod tests {
             endpoint_names: vec![],
             extract_thinking: true,
             cc_auto_buffer: true,
+            prompt_cache_enabled: true,
             cooldown_enabled: true,
             all_cooling_fast_fail: true,
             rate_limit_enabled: false,

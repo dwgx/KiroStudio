@@ -9,6 +9,7 @@ import {
   Clock,
   TrendingUp,
   Coins,
+  Database,
   TerminalSquare,
   Terminal,
   Monitor,
@@ -59,6 +60,27 @@ function compact(n: number): string {
   if (n < 1000) return n.toLocaleString()
   if (n < 1_000_000) return `${(n / 1000).toFixed(1)}k`
   return `${(n / 1_000_000).toFixed(1)}M`
+}
+
+// 表格/总计条用的紧凑数字（不带千分位，节省横向空间）
+function fmtNum(n: number): string {
+  return n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
+}
+
+/* ============ 缓存派生量 ============ */
+// 后端只给 input_tokens(gross) / cache_read_tokens / cache_creation_tokens 三个原始量，
+// 下面两个派生量与 RequestRecord::billed_input_tokens 同算法，避免多一套口径。
+
+// 计费输入 = gross 输入 - 缓存读 - 缓存写（饱和不为负）
+function billedInput(input: number, cacheRead: number, cacheWrite: number): number {
+  return Math.max(0, input - cacheRead - cacheWrite)
+}
+
+// 缓存命中占比 = 缓存读 / gross 输入（input 已含 cache_read，故不得把它再加进分母）。
+// 无输入时返回 null，调用方显示「—」而不是 0%。
+function cacheHitPct(input: number, cacheRead: number): number | null {
+  if (input <= 0) return null
+  return Math.round((cacheRead / input) * 100)
 }
 
 // 成功率(0~100)映射到 StatCard 语义色
@@ -268,6 +290,8 @@ function WindowCard({
   const { t } = useTranslation()
   const hasReq = w.requests > 0
   const rate = hasReq ? Math.round(w.success_rate * 100) : null
+  // 缓存命中占比：cache_read / gross input（input_tokens 已含 cache_read，不再相加）
+  const hitPct = cacheHitPct(w.input_tokens, w.cache_read_tokens)
   return (
     <StatCard
       label={label}
@@ -299,9 +323,56 @@ function WindowCard({
             <span className="text-muted-foreground">{t('usagepage.window.avgLatency')}</span>
             <span className="font-medium text-foreground">{Math.round(w.avg_latency_ms)}ms</span>
           </span>
+          {/* 缓存读 + 命中占比（估算值，见「缓存复用」区块说明） */}
+          <span className="flex justify-between" title={t('usagepage.cache.readTooltip')}>
+            <span className="text-muted-foreground">{t('usagepage.cache.read')}</span>
+            <span className="font-medium text-foreground">{compact(w.cache_read_tokens)}</span>
+          </span>
+          <span className="flex justify-between" title={t('usagepage.cache.hitTooltip')}>
+            <span className="text-muted-foreground">{t('usagepage.cache.hit')}</span>
+            <span className="font-medium text-foreground">{hitPct === null ? '—' : `${hitPct}%`}</span>
+          </span>
         </div>
       }
     />
+  )
+}
+
+/* ============ 缓存复用（窗口维度）============ */
+
+// 单个窗口一行：命中占比横条（沿用榜单横条设计语言）+ 缓存读 / 计费输入 / 缓存写。
+// 口径提醒：input_tokens 是 gross（已含缓存读写），所以命中占比分母直接用 input_tokens。
+function CacheWindowRow({ label, w }: { label: string; w: WindowSummary }) {
+  const { t } = useTranslation()
+  const hit = cacheHitPct(w.input_tokens, w.cache_read_tokens)
+  const billed = billedInput(w.input_tokens, w.cache_read_tokens, w.cache_creation_tokens)
+  return (
+    <li className="space-y-1.5">
+      <div className="flex items-center justify-between gap-2 text-xs">
+        <span className="truncate text-muted-foreground">{label}</span>
+        <span className="flex shrink-0 items-baseline gap-3 tabular-nums">
+          <span className="font-medium text-sky-300">{hit === null ? '—' : `${hit}%`}</span>
+          <span className="w-14 text-right font-medium text-foreground">{compact(w.cache_read_tokens)}</span>
+        </span>
+      </div>
+      <div className="h-2 w-full overflow-hidden rounded-full bg-muted">
+        <div
+          className="h-full rounded-full transition-[width] duration-700 ease-out-expo motion-reduce:transition-none"
+          style={{
+            width: `${hit ?? 0}%`,
+            background: 'linear-gradient(90deg, hsl(199 89% 48%/0.55), hsl(199 89% 48%))',
+          }}
+        />
+      </div>
+      <div className="flex flex-wrap justify-between gap-x-3 text-[10px] text-muted-foreground tabular-nums">
+        <span title={t('usagepage.cache.billedTooltip')}>
+          {t('usagepage.cache.billed')} {compact(billed)} / {t('usagepage.cache.grossInput')} {compact(w.input_tokens)}
+        </span>
+        <span title={t('usagepage.cache.writeTooltip')}>
+          {t('usagepage.cache.write')} {w.cache_creation_tokens > 0 ? compact(w.cache_creation_tokens) : t('usagepage.cache.writeUnavailable')}
+        </span>
+      </div>
+    </li>
   )
 }
 
@@ -331,6 +402,7 @@ function GroupRankList({
       {sorted.map((r, i) => {
         const pct = Math.round((r.requests / max) * 100)
         const rate = r.requests > 0 ? Math.round(r.success_rate * 100) : null
+        const hit = cacheHitPct(r.input_tokens, r.cache_read_tokens)
         const rateColor =
           rate === null
             ? 'text-muted-foreground'
@@ -374,6 +446,16 @@ function GroupRankList({
               <span>{compact(r.input_tokens + r.output_tokens)} tokens</span>
               <span>
                 {r.credits_used.toFixed(2)} credits · {Math.round(r.avg_latency_ms)}ms
+              </span>
+            </div>
+            {/* 缓存列：缓存读总量 + 命中占比（估算值）。写入恒 0 时只在 tooltip 交代，不占版面。 */}
+            <div className="flex justify-between text-[10px] tabular-nums">
+              <span className="text-muted-foreground" title={t('usagepage.cache.readTooltip')}>
+                {t('usagepage.cache.read')} <span className="text-sky-300/90">{compact(r.cache_read_tokens)}</span>
+              </span>
+              <span className="text-muted-foreground" title={t('usagepage.cache.hitTooltip')}>
+                {t('usagepage.cache.hit')}{' '}
+                <span className="text-sky-300/90">{hit === null ? '—' : `${hit}%`}</span>
               </span>
             </div>
           </li>
@@ -669,6 +751,21 @@ function RequestDetail({ record: r }: { record: RequestRecord }) {
         label={t('usagepage.detail.tokenInOut')}
         value={`${r.input_tokens.toLocaleString()} / ${r.output_tokens.toLocaleString()}`}
       />
+      {/* 缓存读写各占一行（不再合并成一个字符串），写入恒 0 时显示「上游不提供」 */}
+      <DetailRow
+        label={t('usagepage.detail.cacheRead')}
+        value={(r.cache_read_tokens ?? 0).toLocaleString()}
+      />
+      <DetailRow
+        label={t('usagepage.detail.cacheWrite')}
+        value={
+          (r.cache_creation_tokens ?? 0) > 0 ? (
+            (r.cache_creation_tokens ?? 0).toLocaleString()
+          ) : (
+            <span className="text-muted-foreground/60">{t('usagepage.cache.writeUnavailable')}</span>
+          )
+        }
+      />
       {r.credits_used != null && (
         <DetailRow label="Credits" value={r.credits_used.toFixed(2)} />
       )}
@@ -705,8 +802,8 @@ function RequestDetailSpread({ record: r }: { record: RequestRecord }) {
   const { t } = useTranslation()
   const dev = deviceMeta(r.client_device, t)
   const deviceLine = [dev.label, r.client_os, r.client_browser].filter(Boolean).join(' · ')
-  const cacheR = (r as { cache_read_tokens?: number }).cache_read_tokens
-  const cacheW = (r as { cache_creation_tokens?: number }).cache_creation_tokens
+  const cacheR = r.cache_read_tokens ?? 0
+  const cacheW = r.cache_creation_tokens ?? 0
   // 字段项:label + value,自动流式排布(auto-fill 网格,窄屏少列宽屏多列,自然铺成几行)。
   const items: { label: string; value: React.ReactNode; mono?: boolean }[] = [
     { label: t('usagepage.detail.time'), value: new Date(r.ts_ms).toLocaleString() },
@@ -716,7 +813,11 @@ function RequestDetailSpread({ record: r }: { record: RequestRecord }) {
     { label: t('usagepage.detail.device'), value: deviceLine || '—', mono: false },
     { label: t('usagepage.detail.clientIp'), value: r.client_ip || '—' },
     { label: t('usagepage.detail.tokenInOutShort'), value: `${r.input_tokens.toLocaleString()} / ${r.output_tokens.toLocaleString()}` },
-    ...(cacheR != null || cacheW != null ? [{ label: t('usagepage.detail.cacheReadWrite'), value: `${(cacheR ?? 0).toLocaleString()} / ${(cacheW ?? 0).toLocaleString()}` }] : []),
+    // 缓存读 / 缓存写各占一格（原先合并成「读 / 写」一个字符串，看不出哪个是哪个）。
+    { label: t('usagepage.detail.cacheRead'), value: cacheR.toLocaleString() },
+    { label: t('usagepage.detail.cacheWrite'), value: cacheW > 0 ? cacheW.toLocaleString() : t('usagepage.cache.writeUnavailable'), mono: false },
+    // 计费输入 = gross - 读 - 写，即客户端 usage.input_tokens 口径。
+    { label: t('usagepage.cache.billed'), value: billedInput(r.input_tokens, cacheR, cacheW).toLocaleString() },
     ...(r.credits_used != null ? [{ label: 'Credits', value: r.credits_used.toFixed(2) }] : []),
     { label: t('usagepage.detail.latency'), value: `${r.latency_ms.toLocaleString()}ms${r.first_token_ms != null ? ` · ${t('usagepage.detail.firstToken')} ${r.first_token_ms.toLocaleString()}ms` : ''}` },
     { label: t('usagepage.detail.retryStream'), value: `${r.retries} ${t('usagepage.detail.timesUnit')} · ${r.is_streaming ? t('usagepage.detail.yes') : t('usagepage.detail.no')}` },
@@ -785,7 +886,27 @@ function RequestPopover({ record, x, y, onClose }: { record: RequestRecord; x: n
   )
 }
 
-// 列：时间 / 模型 / 设备 / 凭据 / 结果 / In-Out / 延迟。
+// 表格「缓存」单元：缓存读 token + 命中占比小字。0 缓存显示「—」，不用 0 占视觉。
+function CacheCell({ record: r }: { record: RequestRecord }) {
+  const { t } = useTranslation()
+  const cacheR = r.cache_read_tokens ?? 0
+  const cacheW = r.cache_creation_tokens ?? 0
+  if (cacheR === 0 && cacheW === 0) {
+    return <span className="text-muted-foreground/50">—</span>
+  }
+  const hit = cacheHitPct(r.input_tokens, cacheR)
+  return (
+    <span
+      className="inline-flex items-baseline gap-1"
+      title={`${t('usagepage.cache.read')} ${cacheR.toLocaleString()} · ${t('usagepage.cache.write')} ${cacheW.toLocaleString()} · ${t('usagepage.cache.estimateNote')}`}
+    >
+      <span className="text-sky-300/90">{fmtNum(cacheR)}</span>
+      {hit !== null && <span className="text-[10px] text-muted-foreground">{hit}%</span>}
+    </span>
+  )
+}
+
+// 列：时间 / 模型 / 设备 / 凭据 / 结果 / In-Out / 缓存 / 延迟。
 // 交互(dwgx):左键点击行=行下方内联展开详情(手风琴);右键行=跟随鼠标浮窗看全部。
 function RecentTable({ rows }: { rows: RequestRecord[] }) {
   const { t } = useTranslation()
@@ -813,6 +934,9 @@ function RecentTable({ rows }: { rows: RequestRecord[] }) {
             <th className="py-2 pr-3 text-right font-medium">{t('usagepage.detail.credential')}</th>
             <th className="py-2 pr-3 text-center font-medium">{t('usagepage.detail.result')}</th>
             <th className="py-2 pr-3 text-right font-medium">In/Out</th>
+            <th className="py-2 pr-3 text-right font-medium" title={t('usagepage.cache.colTooltip')}>
+              {t('usagepage.cache.col')}
+            </th>
             <th className="py-2 text-right font-medium">{t('usagepage.detail.latency')}</th>
           </tr>
         </thead>
@@ -840,11 +964,15 @@ function RecentTable({ rows }: { rows: RequestRecord[] }) {
                   </td>
                   <td className="py-2 pr-3 text-center"><OutcomeBadge outcome={r.outcome} /></td>
                   <td className="py-2 pr-3 text-right tabular-nums">{r.input_tokens}/{r.output_tokens}</td>
+                  {/* 缓存列：主数字=缓存读，右侧小字=命中占比；无缓存记账显示「—」 */}
+                  <td className="whitespace-nowrap py-2 pr-3 text-right tabular-nums">
+                    <CacheCell record={r} />
+                  </td>
                   <td className="py-2 text-right tabular-nums text-muted-foreground">{r.latency_ms}ms</td>
                 </tr>
                 {open && (
                   <tr className="border-b border-border/40 bg-secondary/20">
-                    <td colSpan={7} className="px-3 py-3">
+                    <td colSpan={8} className="px-3 py-3">
                       <RequestDetailSpread record={r} />
                     </td>
                   </tr>
@@ -912,10 +1040,20 @@ function RecentRequestsPanel({
       if (r.outcome === 'success') ok++; else fail++
       inTok += r.input_tokens || 0
       outTok += r.output_tokens || 0
-      cacheR += (r as { cache_read_tokens?: number }).cache_read_tokens || 0
-      cacheW += (r as { cache_creation_tokens?: number }).cache_creation_tokens || 0
+      cacheR += r.cache_read_tokens ?? 0
+      cacheW += r.cache_creation_tokens ?? 0
     }
-    return { count: filtered.length, ok, fail, inTok, outTok, cacheR, cacheW }
+    return {
+      count: filtered.length,
+      ok,
+      fail,
+      inTok,
+      outTok,
+      cacheR,
+      cacheW,
+      hit: cacheHitPct(inTok, cacheR),
+      billed: billedInput(inTok, cacheR, cacheW),
+    }
   }, [filtered])
 
   // 筛选/搜索变化时回到第一页。
@@ -924,8 +1062,6 @@ function RecentRequestsPanel({
   const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE))
   const clampedPage = Math.min(page, pageCount - 1)
   const paged = filtered.slice(clampedPage * PAGE_SIZE, clampedPage * PAGE_SIZE + PAGE_SIZE)
-
-  const fmtNum = (n: number) => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n))
 
   return (
     <div className="space-y-3">
@@ -965,8 +1101,10 @@ function RecentRequestsPanel({
         <span className="text-emerald-400">{t('usagepage.recent.successCount')} {totals.ok}</span>
         {totals.fail > 0 && <span className="text-red-400">{t('usagepage.recent.failCount')} {totals.fail}</span>}
         <span>In/Out {fmtNum(totals.inTok)}/{fmtNum(totals.outTok)}</span>
-        <span title={t('usagepage.recent.cacheReadTooltip')}>{t('usagepage.recent.cacheRead')} {fmtNum(totals.cacheR)}</span>
-        <span title={t('usagepage.recent.cacheWriteTooltip')}>{t('usagepage.recent.cacheWrite')} {fmtNum(totals.cacheW)}</span>
+        <span className="text-sky-300/90" title={t('usagepage.recent.cacheReadTooltip')}>{t('usagepage.recent.cacheRead')} {fmtNum(totals.cacheR)}</span>
+        <span className="text-sky-300/90" title={t('usagepage.cache.hitTooltip')}>{t('usagepage.cache.hit')} {totals.hit === null ? '—' : `${totals.hit}%`}</span>
+        <span title={t('usagepage.cache.billedTooltip')}>{t('usagepage.cache.billed')} {fmtNum(totals.billed)}</span>
+        <span title={t('usagepage.recent.cacheWriteTooltip')}>{t('usagepage.recent.cacheWrite')} {totals.cacheW > 0 ? fmtNum(totals.cacheW) : t('usagepage.cache.writeUnavailable')}</span>
         {ipFilter && <span className="text-primary">· {t('usagepage.recent.filteredBy')} {ipFilter}</span>}
         {sessionFilter && (
           <button
@@ -1023,8 +1161,9 @@ function WindowCardSkeleton() {
         <Skeleton className="h-7 w-20" />
         <Skeleton className="h-11 w-11 rounded-full" />
       </div>
+      {/* 6 项分项：Tokens / Credits / In-Out / 均延迟 / 缓存读 / 命中，与 WindowCard 一致 */}
       <div className="mt-4 grid grid-cols-2 gap-x-4 gap-y-2">
-        {Array.from({ length: 4 }).map((_, i) => (
+        {Array.from({ length: 6 }).map((_, i) => (
           <Skeleton key={i} className="h-3 w-full" />
         ))}
       </div>
@@ -1174,6 +1313,34 @@ export function UsagePage() {
         )}
       </div>
 
+      {/* 1.5) 缓存复用：三窗口同口径的缓存读总量 + 命中占比 + 计费输入。
+              数字是网关本地估算（上游 Kiro 不返回 token/cache 真值），缓存写上游完全不提供。 */}
+      <Card className="p-5">
+        <div className="mb-4 flex flex-wrap items-baseline justify-between gap-2">
+          <h3 className="flex items-center gap-2 text-sm font-medium text-foreground">
+            <Database className="h-4 w-4 text-sky-400/80" />
+            {t('usagepage.cache.sectionTitle')}
+          </h3>
+          <span className="text-xs text-muted-foreground" title={t('usagepage.cache.estimateNote')}>
+            {t('usagepage.cache.sectionHint')}
+          </span>
+        </div>
+        {overview.data ? (
+          <>
+            <ol className="space-y-3">
+              <CacheWindowRow label={t('usagepage.window.last24h')} w={overview.data.last_24h} />
+              <CacheWindowRow label={t('usagepage.window.last7d')} w={overview.data.last_7d} />
+              <CacheWindowRow label={t('usagepage.window.last30d')} w={overview.data.last_30d} />
+            </ol>
+            <p className="mt-4 border-t border-border/60 pt-3 text-[11px] leading-relaxed text-muted-foreground">
+              {t('usagepage.cache.estimateNote')}
+            </p>
+          </>
+        ) : (
+          <RankListSkeleton rows={3} />
+        )}
+      </Card>
+
       {/* 2) 全宽请求趋势：AreaTrendChart（面积渐变 + 平滑曲线 + 跟随鼠标 tooltip） */}
       <Card className="p-5">
         <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
@@ -1244,6 +1411,7 @@ export function UsagePage() {
               points={chartSeries}
               height={280}
               showRate
+              showCacheRead
               granularity={granularity}
             />
 
@@ -1253,6 +1421,10 @@ export function UsagePage() {
               </span>
               <span className="flex items-center gap-1.5">
                 <span className="h-0 w-4 border-t-2 border-dashed border-emerald-500" /> {t('usagepage.trend.legendRate')}
+              </span>
+              {/* 缓存读副线走独立标尺（与请求量不共轴），legend 里点明，避免误读为同一量纲 */}
+              <span className="flex items-center gap-1.5" title={t('usagepage.trend.legendCacheReadTooltip')}>
+                <span className="h-0.5 w-4 rounded bg-sky-400/70" /> {t('usagepage.trend.legendCacheRead')}
               </span>
               <span className="flex items-center gap-1.5">
                 <span className="h-1.5 w-1.5 rounded-full bg-red-500/60" /> {t('usagepage.trend.legendHasFailure')}
