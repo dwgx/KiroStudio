@@ -75,7 +75,9 @@ fn drop_orphan_tool_results(mut tail: Vec<Message>) -> Vec<Message> {
             Some(Message::User(u)) => {
                 let results = &u.user_input_message.user_input_message_context.tool_results;
                 !results.is_empty()
-                    && results.iter().any(|r| !known.contains(r.tool_use_id.as_str()))
+                    && results
+                        .iter()
+                        .any(|r| !known.contains(r.tool_use_id.as_str()))
             }
             _ => false,
         };
@@ -272,7 +274,8 @@ mod regression_tests {
         for (i, w) in s.history.windows(2).enumerate() {
             let same = matches!(
                 (&w[0], &w[1]),
-                (Message::User(_), Message::User(_)) | (Message::Assistant(_), Message::Assistant(_))
+                (Message::User(_), Message::User(_))
+                    | (Message::Assistant(_), Message::Assistant(_))
             );
             assert!(!same, "位置 {i} 出现连续同角色消息，会导致上游 400");
         }
@@ -356,20 +359,30 @@ mod tool_pairing_tests {
 #[cfg(test)]
 mod orphan_unit {
     use super::*;
-    use crate::kiro::model::requests::conversation::{HistoryAssistantMessage, UserInputMessageContext};
+    use crate::kiro::model::requests::conversation::{
+        HistoryAssistantMessage, UserInputMessageContext,
+    };
     use crate::kiro::model::requests::tool::{ToolResult, ToolUseEntry};
 
     fn u_with_result(id: &str) -> Message {
         let mut m = HistoryUserMessage::new("result", "auto");
         let mut ctx = UserInputMessageContext::default();
-        ctx.tool_results = vec![ToolResult{tool_use_id:id.into(),content:vec![],status:Some("success".into()),is_error:false}];
+        ctx.tool_results = vec![ToolResult {
+            tool_use_id: id.into(),
+            content: vec![],
+            status: Some("success".into()),
+            is_error: false,
+        }];
         m.user_input_message.user_input_message_context = ctx;
         Message::User(m)
     }
     fn a_with_use(id: &str) -> Message {
         let mut a = HistoryAssistantMessage::new("calling");
-        a.assistant_response_message.tool_uses = Some(vec![ToolUseEntry{
-            tool_use_id:id.into(), name:"read".into(), input: serde_json::json!({})}]);
+        a.assistant_response_message.tool_uses = Some(vec![ToolUseEntry {
+            tool_use_id: id.into(),
+            name: "read".into(),
+            input: serde_json::json!({}),
+        }]);
         Message::Assistant(a)
     }
 
@@ -377,7 +390,7 @@ mod orphan_unit {
     #[test]
     fn test_drops_orphan_leading_result() {
         let tail = vec![
-            u_with_result("tu_gone"),                       // 孤立：tu_gone 的 toolUse 已被丢
+            u_with_result("tu_gone"), // 孤立：tu_gone 的 toolUse 已被丢
             Message::Assistant(HistoryAssistantMessage::new("ok")),
             Message::User(HistoryUserMessage::new("next", "auto")),
         ];

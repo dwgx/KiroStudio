@@ -2,11 +2,11 @@
 
 use std::convert::Infallible;
 
-use anyhow::Error;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
+use anyhow::Error;
 use axum::{
     Json as JsonExtractor,
     body::Body,
@@ -23,8 +23,13 @@ use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
-use super::stream::{BufferedStreamContext, CacheUsageBreakdown, CompletionStatus, SseEvent, StreamContext};
-use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
+use super::stream::{
+    BufferedStreamContext, CacheUsageBreakdown, CompletionStatus, SseEvent, StreamContext,
+};
+use super::types::{
+    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
+    OutputConfig, Thinking,
+};
 use super::websearch;
 
 /// 从入站请求头提取客户端 IP（仅头部来源，不含连接层回退）。
@@ -215,8 +220,7 @@ fn collect_client_fingerprint() -> bool {
 /// 沿用 [`COLLECT_CLIENT_FINGERPRINT`] 已验证的范式，把 admin 可热改的开关搬到
 /// 进程级 static 原子镜像：main 启动写入、admin 改配置立即改写、handler 热路径读镜像，
 /// 全程无需重启、无锁近零成本。initial 默认与 config 默认一致。
-static EXTRACT_THINKING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static EXTRACT_THINKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 设置非流式 thinking 提取开关（main 启动接线 / admin 热更调用，立即生效）。
 pub fn set_extract_thinking(enabled: bool) {
@@ -338,7 +342,9 @@ fn is_claude_code_request(headers: &axum::http::HeaderMap) -> bool {
     if headers.contains_key("x-anthropic-billing-header") {
         return true;
     }
-    let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
+    let ua = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok());
     crate::usage::classify_device(ua).as_deref() == Some("claude-code")
 }
 
@@ -347,8 +353,9 @@ fn is_claude_code_request(headers: &axum::http::HeaderMap) -> bool {
 /// `CompressionConfig` 非标量（阈值 + 开关），用 `ArcSwap` 承载：admin 改配置时整份原子换、
 /// handler 热路径 `load_full()` 拿 `Arc` 快照（无锁近零成本）。`OnceLock` 惰性初始化，
 /// main 启动即 `set_compression` 写入真配置；未初始化时回退默认（与 config 默认一致）。
-static COMPRESSION: std::sync::OnceLock<arc_swap::ArcSwap<crate::model::config::CompressionConfig>> =
-    std::sync::OnceLock::new();
+static COMPRESSION: std::sync::OnceLock<
+    arc_swap::ArcSwap<crate::model::config::CompressionConfig>,
+> = std::sync::OnceLock::new();
 
 fn compression_cell() -> &'static arc_swap::ArcSwap<crate::model::config::CompressionConfig> {
     COMPRESSION.get_or_init(|| {
@@ -391,7 +398,9 @@ impl ClientInfo {
         if !collect_client_fingerprint() {
             return Self::default();
         }
-        let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
+        let ua = headers
+            .get(header::USER_AGENT)
+            .and_then(|v| v.to_str().ok());
         let ip = trusted_client_ip(headers, peer);
         Self {
             device: crate::usage::classify_device(ua),
@@ -496,7 +505,10 @@ fn translate_quota_subscription(err_str: &str) -> Option<TranslatedError> {
             message: "上游拒收请求体格式（REQUEST_BODY_INVALID，与凭据无关）。排障：①检查会话历史是否严格 user/assistant 交替、首条为 user；②确认工具定义与 tool_result 配对完整；③查看网关日志中同一时刻是否发生过历史截断。".to_string(),
         });
     }
-    if err_str.contains("Improperly formed") || err_str.contains("Invalid token") || err_str.contains("subscription") {
+    if err_str.contains("Improperly formed")
+        || err_str.contains("Invalid token")
+        || err_str.contains("subscription")
+    {
         return Some(TranslatedError {
             status: StatusCode::BAD_GATEWAY,
             error_type: "api_error",
@@ -555,8 +567,11 @@ fn translate_network(err_str: &str) -> Option<TranslatedError> {
     if !is_transport_error(&low) {
         return None;
     }
-    if low.contains("dns") || low.contains("resolve") || low.contains("name resolution")
-        || low.contains("failed to lookup") {
+    if low.contains("dns")
+        || low.contains("resolve")
+        || low.contains("name resolution")
+        || low.contains("failed to lookup")
+    {
         return Some(TranslatedError {
             status: StatusCode::BAD_GATEWAY,
             error_type: "api_error",
@@ -601,7 +616,10 @@ fn map_provider_error(err: Error) -> Response {
         .and_then(|d| d.parse::<u64>().ok())
     {
         let retry_after = secs.clamp(1, 300);
-        tracing::warn!(retry_after_secs = retry_after, "全池冷却，返回 429 + Retry-After 让客户端退避");
+        tracing::warn!(
+            retry_after_secs = retry_after,
+            "全池冷却，返回 429 + Retry-After 让客户端退避"
+        );
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [(header::RETRY_AFTER, retry_after.to_string())],
@@ -622,7 +640,10 @@ fn map_provider_error(err: Error) -> Response {
     // 未知错误:**完整原文只进服务端日志**(便于 dwgx 排障),**不回给客户端**——原始错误链可能
     // 含上游响应体里的 profileArn / AWS 账号号 / region / 内部 URL 等敏感信息(review 泄露发现)。
     // 客户端只得通用提示 + 引导查网关日志,不泄露任何上游内部细节。
-    tracing::error!("Kiro API 调用失败（未识别，原文仅进日志不回客户端）: {}", err);
+    tracing::error!(
+        "Kiro API 调用失败（未识别，原文仅进日志不回客户端）: {}",
+        err
+    );
     (
         StatusCode::BAD_GATEWAY,
         Json(ErrorResponse::new(
@@ -644,7 +665,10 @@ pub async fn get_models() -> impl IntoResponse {
     // supports_1m 的模型额外广告一条 `<id>[1m]` 变体,供只能传纯模型名的客户端选 1M 上下文。
     const ADVERTISED_CREATED: i64 = 1_759_104_000;
     let mut models: Vec<Model> = Vec::new();
-    for s in crate::anthropic::model_catalog::CATALOG.iter().filter(|s| s.advertised) {
+    for s in crate::anthropic::model_catalog::CATALOG
+        .iter()
+        .filter(|s| s.advertised)
+    {
         models.push(Model {
             id: s.advertised_id().to_string(),
             object: "model".to_string(),
@@ -690,7 +714,10 @@ pub async fn post_messages(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new("invalid_request_error", format!("请求体解析失败: {e}"))),
+                Json(ErrorResponse::new(
+                    "invalid_request_error",
+                    format!("请求体解析失败: {e}"),
+                )),
             )
                 .into_response();
         }
@@ -823,23 +850,22 @@ pub async fn post_messages(
     };
 
     // 构建 Kiro 请求体（发上游前，超阈值时执行输入压缩；profile_arn 由 provider 层注入）
-    let request_body = match build_kiro_request_body(
-        conversion_result.conversation_state,
-        &current_compression(),
-    ) {
-        Ok(body) => body,
-        Err(e) => {
-            tracing::error!("序列化请求失败: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    "internal_error",
-                    format!("序列化请求失败: {}", e),
-                )),
-            )
-                .into_response();
-        }
-    };
+    let request_body =
+        match build_kiro_request_body(conversion_result.conversation_state, &current_compression())
+        {
+            Ok(body) => body,
+            Err(e) => {
+                tracing::error!("序列化请求失败: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse::new(
+                        "internal_error",
+                        format!("序列化请求失败: {}", e),
+                    )),
+                )
+                    .into_response();
+            }
+        };
 
     tracing::debug!("Kiro request body: {}", request_body);
 
@@ -888,7 +914,9 @@ pub async fn post_messages(
         // （等价 /cc/v1），让 message_start 的 input_tokens 用上游准确值——CC 会校验它。
         // 这样 CC 直接打 /v1 也能拿到正确行为，无需手动改用 /cc/v1 端点。
         if cc_auto_buffer_enabled() && is_claude_code_request(&headers) {
-            tracing::debug!("识别到 Claude Code 请求，/v1 流式自动切换为 buffered 分发（准确 input_tokens）");
+            tracing::debug!(
+                "识别到 Claude Code 请求，/v1 流式自动切换为 buffered 分发（准确 input_tokens）"
+            );
             handle_stream_request_buffered(
                 provider,
                 &request_body,
@@ -918,7 +946,17 @@ pub async fn post_messages(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = extract_thinking_enabled() && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, cache_breakdown, client).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+            cache_breakdown,
+            client,
+        )
+        .await
     }
 }
 
@@ -943,7 +981,13 @@ async fn handle_stream_request(
     };
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_full(model, input_tokens, thinking_enabled, tool_name_map, known_tool_names);
+    let mut ctx = StreamContext::new_full(
+        model,
+        input_tokens,
+        thinking_enabled,
+        tool_name_map,
+        known_tool_names,
+    );
     // 注入影子缓存估算（必须在 generate_initial_events 之前，message_start 才能携带 cache 字段）
     ctx.set_cache_usage(cache_breakdown);
 
@@ -1173,7 +1217,8 @@ fn mark_invalid_tool_input(
 ) {
     tracing::warn!(
         "工具输入 JSON 解析失败: {}, tool_use_id: {}（修复层也修不好,返回错误不静默空参）",
-        err, tool_use_id
+        err,
+        tool_use_id
     );
     if completion.is_ok() {
         *completion = CompletionStatus::UpstreamError {
@@ -1277,7 +1322,9 @@ async fn handle_non_stream_request(
                                             // 流式已 repair 的坏 JSON(非法转义/裸控制符/截断)在非流式白瞎。
                                             // 先尝试 repair_tool_json,复验通过则用修复结果、不置失败态。
                                             if super::handlers::tool_repair_json_enabled() {
-                                                if let Some(fixed) = super::stream::repair_tool_json(buffer) {
+                                                if let Some(fixed) =
+                                                    super::stream::repair_tool_json(buffer)
+                                                {
                                                     if let Ok(v) = serde_json::from_str(&fixed) {
                                                         tracing::info!(
                                                             "非流式工具 JSON 已修复为合法(tool_use_id={})",
@@ -1287,7 +1334,9 @@ async fn handle_non_stream_request(
                                                     } else {
                                                         // 理论不可达(repair 内部已复验),兜底走失败态。
                                                         mark_invalid_tool_input(
-                                                            &mut completion, &tool_use.tool_use_id, &e,
+                                                            &mut completion,
+                                                            &tool_use.tool_use_id,
+                                                            &e,
                                                         );
                                                         serde_json::json!({})
                                                     }
@@ -1296,13 +1345,17 @@ async fn handle_non_stream_request(
                                                     // 返回非 200，绝不静默吞成空参数——空参会让客户端把失败的
                                                     // 工具调用当成"无参数成功调用"执行，比报错更危险。
                                                     mark_invalid_tool_input(
-                                                        &mut completion, &tool_use.tool_use_id, &e,
+                                                        &mut completion,
+                                                        &tool_use.tool_use_id,
+                                                        &e,
                                                     );
                                                     serde_json::json!({})
                                                 }
                                             } else {
                                                 mark_invalid_tool_input(
-                                                    &mut completion, &tool_use.tool_use_id, &e,
+                                                    &mut completion,
+                                                    &tool_use.tool_use_id,
+                                                    &e,
                                                 );
                                                 serde_json::json!({})
                                             }
@@ -1345,10 +1398,9 @@ async fn handle_non_stream_request(
                         Event::ContextUsage(context_usage) => {
                             // 从上下文使用百分比计算实际的 input_tokens
                             let window_size = get_context_window_size(model);
-                            let actual_input_tokens = (context_usage.context_usage_percentage
-                                * (window_size as f64)
-                                / 100.0)
-                                as i32;
+                            let actual_input_tokens =
+                                (context_usage.context_usage_percentage * (window_size as f64)
+                                    / 100.0) as i32;
                             context_input_tokens = Some(actual_input_tokens);
                             // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                             if context_usage.context_usage_percentage >= 100.0 {
@@ -1363,24 +1415,38 @@ async fn handle_non_stream_request(
                         Event::Metering(metering) => {
                             credits_used = Some(credits_used.unwrap_or(0.0) + metering.usage);
                         }
-                        Event::Exception { exception_type, message } => {
+                        Event::Exception {
+                            exception_type,
+                            message,
+                        } => {
                             // 铁律：ContentLengthExceededException = max_tokens 干净收尾，绝不算失败。
                             if exception_type == "ContentLengthExceededException" {
                                 stop_reason = "max_tokens".to_string();
                             } else if completion.is_ok() {
                                 // 其它异常是上游真实失败，置失败态（保留首因）。
-                                tracing::error!("非流式收到 in-band 异常: {} - {}", exception_type, message);
+                                tracing::error!(
+                                    "非流式收到 in-band 异常: {} - {}",
+                                    exception_type,
+                                    message
+                                );
                                 completion = CompletionStatus::UpstreamError {
                                     code: exception_type,
                                     message,
                                 };
                             }
                         }
-                        Event::Error { error_code, error_message } => {
+                        Event::Error {
+                            error_code,
+                            error_message,
+                        } => {
                             // in-band 错误事件：落入历史的 `_ => {}` 会被静默忽略、照样返回 200，
                             // 这里显式置失败态，收尾时返回非 200 并按真实 outcome 记账。
                             if completion.is_ok() {
-                                tracing::error!("非流式收到 in-band 错误: {} - {}", error_code, error_message);
+                                tracing::error!(
+                                    "非流式收到 in-band 错误: {} - {}",
+                                    error_code,
+                                    error_message
+                                );
                                 completion = CompletionStatus::UpstreamError {
                                     code: error_code,
                                     message: error_message,
@@ -1395,14 +1461,21 @@ async fn handle_non_stream_request(
                         // （收尾靠下方 `if !completion.is_ok()` 返回 502+记账），避免截断被当成功。
                         // 非 tool 帧解析失败历史上就允许被忽略，仅告警不置失败态，防误伤正常流。
                         if et.as_deref() == Some("toolUseEvent") {
-                            tracing::warn!("非流式 toolUseEvent 帧解析失败,按响应截断处理: {}", err);
+                            tracing::warn!(
+                                "非流式 toolUseEvent 帧解析失败,按响应截断处理: {}",
+                                err
+                            );
                             if completion.is_ok() {
                                 completion = CompletionStatus::DecoderStopped {
                                     message: format!("toolUseEvent 帧解析失败: {}", err),
                                 };
                             }
                         } else {
-                            tracing::warn!("非流式事件帧解析失败(event_type={:?}),已忽略: {}", et.as_deref(), err);
+                            tracing::warn!(
+                                "非流式事件帧解析失败(event_type={:?}),已忽略: {}",
+                                et.as_deref(),
+                                err
+                            );
                         }
                     }
                 }
@@ -1444,12 +1517,15 @@ async fn handle_non_stream_request(
             client.apply(&mut record);
             crate::usage::emit_record(record);
         }
-        let status = StatusCode::from_u16(completion.http_status_u16())
-            .unwrap_or(StatusCode::BAD_GATEWAY);
+        let status =
+            StatusCode::from_u16(completion.http_status_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         let sse_error_type = completion.sse_error_type();
         return (
             status,
-            Json(ErrorResponse::new(sse_error_type, completion.client_message())),
+            Json(ErrorResponse::new(
+                sse_error_type,
+                completion.client_message(),
+            )),
         )
             .into_response();
     }
@@ -1572,14 +1648,10 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_opus_4_6 =
-        model_lower.contains("opus") && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+    let is_opus_4_6 = model_lower.contains("opus")
+        && (model_lower.contains("4-6") || model_lower.contains("4.6"));
 
-    let thinking_type = if is_opus_4_6 {
-        "adaptive"
-    } else {
-        "enabled"
-    };
+    let thinking_type = if is_opus_4_6 { "adaptive" } else { "enabled" };
 
     tracing::info!(
         model = %payload.model,
@@ -1591,7 +1663,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         thinking_type: thinking_type.to_string(),
         budget_tokens: 20000,
     });
-    
+
     if is_opus_4_6 && payload.output_config.is_none() {
         // 仅在用户未指定 effort 时默认 high
         payload.output_config = Some(OutputConfig {
@@ -1714,23 +1786,22 @@ pub async fn post_messages_cc(
     };
 
     // 构建 Kiro 请求体（发上游前，超阈值时执行输入压缩；profile_arn 由 provider 层注入）
-    let request_body = match build_kiro_request_body(
-        conversion_result.conversation_state,
-        &current_compression(),
-    ) {
-        Ok(body) => body,
-        Err(e) => {
-            tracing::error!("序列化请求失败: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    "internal_error",
-                    format!("序列化请求失败: {}", e),
-                )),
-            )
-                .into_response();
-        }
-    };
+    let request_body =
+        match build_kiro_request_body(conversion_result.conversation_state, &current_compression())
+        {
+            Ok(body) => body,
+            Err(e) => {
+                tracing::error!("序列化请求失败: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse::new(
+                        "internal_error",
+                        format!("序列化请求失败: {}", e),
+                    )),
+                )
+                    .into_response();
+            }
+        };
 
     tracing::debug!("Kiro request body: {}", request_body);
 
@@ -1823,7 +1894,17 @@ pub async fn post_messages_cc(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = extract_thinking_enabled() && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, cache_breakdown, client).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+            cache_breakdown,
+            client,
+        )
+        .await
     }
 }
 
@@ -1851,7 +1932,13 @@ async fn handle_stream_request_buffered(
     };
 
     // 创建缓冲流处理上下文
-    let mut ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map, known_tool_names);
+    let mut ctx = BufferedStreamContext::new(
+        model,
+        estimated_input_tokens,
+        thinking_enabled,
+        tool_name_map,
+        known_tool_names,
+    );
     // 注入影子缓存估算（finish_and_get_all_events 回补 message_start 时会携带 cache 字段）
     ctx.set_cache_usage(cache_breakdown);
 
@@ -2060,7 +2147,9 @@ mod ip_blocklist_tests {
 
     #[test]
     fn test_ip_blocklist_business_layer() {
-        let _guard = BLOCKLIST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = BLOCKLIST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // 空黑名单:任何 IP 都不拦。
         set_ip_blocklist(&[]);
         assert!(!ip_is_blocked("223.73.32.14"));
@@ -2083,7 +2172,9 @@ mod machine_code_blocklist_tests {
 
     #[test]
     fn test_machine_code_blocklist_business_layer() {
-        let _guard = BLOCKLIST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = BLOCKLIST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // 空黑名单:任何机器码都不拦。
         set_machine_code_blocklist(&[]);
         let code = crate::usage::machine_code_of(Some("223.73.32.14"), Some("claude-code"));
@@ -2093,14 +2184,20 @@ mod machine_code_blocklist_tests {
         set_machine_code_blocklist(&[code.clone()]);
         assert!(machine_code_is_blocked(&code), "命中机器码应拦");
         // 大小写不敏感。
-        assert!(machine_code_is_blocked(&code.to_uppercase()), "大写形式也应命中");
+        assert!(
+            machine_code_is_blocked(&code.to_uppercase()),
+            "大写形式也应命中"
+        );
         // 另一台机器(不同 IP → 不同码)不受影响。
         let other = crate::usage::machine_code_of(Some("8.8.8.8"), Some("claude-code"));
         assert!(!machine_code_is_blocked(&other), "未拉黑的机器码应放行");
 
         // 有 IP 时 device 不影响判定(machine_key = IP)。
         let same_ip_diff_dev = crate::usage::machine_code_of(Some("223.73.32.14"), Some("vscode"));
-        assert!(machine_code_is_blocked(&same_ip_diff_dev), "同 IP 不同 device 仍应命中");
+        assert!(
+            machine_code_is_blocked(&same_ip_diff_dev),
+            "同 IP 不同 device 仍应命中"
+        );
 
         // 清空恢复(避免污染其它测试的全局镜像)。
         set_machine_code_blocklist(&[]);
@@ -2115,7 +2212,9 @@ mod machine_code_blocklist_tests {
         use std::net::SocketAddr;
         use std::sync::atomic::Ordering;
 
-        let _guard = BLOCKLIST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = BLOCKLIST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         // 反代场景:对端=本机 openresty(127.0.0.1),XFF 最右=反代追加的真实客户端 IP。
         // (A1:最右不可伪造;此处 223.73.32.14 是反代追加的真实 IP。)
@@ -2144,7 +2243,10 @@ mod machine_code_blocklist_tests {
 
         // 场景 C:都不命中→放行(None)。
         set_machine_code_blocklist(&[]);
-        assert!(security_block_response(&headers, proxy_peer).is_none(), "未命中应放行");
+        assert!(
+            security_block_response(&headers, proxy_peer).is_none(),
+            "未命中应放行"
+        );
 
         // 恢复全局状态,避免污染其它测试。
         set_ip_blocklist(&[]);
@@ -2159,7 +2261,9 @@ mod machine_code_blocklist_tests {
         use axum::http::HeaderMap;
         use std::net::SocketAddr;
 
-        let _guard = BLOCKLIST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = BLOCKLIST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let proxy_peer: Option<SocketAddr> = Some("127.0.0.1:8990".parse().unwrap());
 
@@ -2245,7 +2349,8 @@ mod error_translation_tests {
 
     #[test]
     fn test_translate_network_dns() {
-        let t = translate_upstream_error("error trying to connect: dns error: failed to resolve").unwrap();
+        let t = translate_upstream_error("error trying to connect: dns error: failed to resolve")
+            .unwrap();
         assert_eq!(t.status, StatusCode::BAD_GATEWAY);
         assert!(t.message.contains("DNS") && t.message.contains("排障"));
     }
@@ -2296,9 +2401,21 @@ mod error_translation_tests {
         let text = String::from_utf8_lossy(&body);
         // 客户端拿到的响应体绝不含任何敏感片段。
         assert!(!text.contains("arn:aws"), "响应体泄露了 ARN: {}", text);
-        assert!(!text.contains("123456789012"), "响应体泄露了 AWS 账号号: {}", text);
-        assert!(!text.contains("SECRET"), "响应体泄露了 profile id: {}", text);
-        assert!(!text.contains("eu-central-1"), "响应体泄露了 region: {}", text);
+        assert!(
+            !text.contains("123456789012"),
+            "响应体泄露了 AWS 账号号: {}",
+            text
+        );
+        assert!(
+            !text.contains("SECRET"),
+            "响应体泄露了 profile id: {}",
+            text
+        );
+        assert!(
+            !text.contains("eu-central-1"),
+            "响应体泄露了 region: {}",
+            text
+        );
         // 仍给出通用引导。
         assert!(text.contains("未识别错误") && text.contains("网关日志"));
     }
@@ -2308,8 +2425,7 @@ mod error_translation_tests {
     #[test]
     fn test_translate_network_no_false_positive_on_upstream_body() {
         // 模拟 provider 格式化的上游错误串(含 HTTP 状态码 + body,body 里有 "timeout"/"proxy" 字样)。
-        let upstream_body =
-            "流式 API 请求失败: 400 {\"message\":\"your request proxy timeout config is invalid, tls off\"}";
+        let upstream_body = "流式 API 请求失败: 400 {\"message\":\"your request proxy timeout config is invalid, tls off\"}";
         // is_transport_error 应判 false → translate_network 返回 None → 整体不误翻译。
         assert!(!is_transport_error(&upstream_body.to_lowercase()));
         assert!(
@@ -2349,7 +2465,10 @@ mod tier3_hotreload_tests {
         set_extract_thinking(true);
         assert!(extract_thinking_enabled(), "set true 后热路径应读到 true");
         set_extract_thinking(false);
-        assert!(!extract_thinking_enabled(), "set false 后热路径应读到 false");
+        assert!(
+            !extract_thinking_enabled(),
+            "set false 后热路径应读到 false"
+        );
     }
 
     #[test]
@@ -2426,7 +2545,10 @@ mod truncation_completion_tests {
                     let et = frame.event_type().map(|s| s.to_string());
                     match Event::from_frame(frame) {
                         Ok(event) => match event {
-                            Event::Error { error_code, error_message } => {
+                            Event::Error {
+                                error_code,
+                                error_message,
+                            } => {
                                 if completion.is_ok() {
                                     completion = CompletionStatus::UpstreamError {
                                         code: error_code,
@@ -2434,7 +2556,10 @@ mod truncation_completion_tests {
                                     };
                                 }
                             }
-                            Event::Exception { exception_type, message } => {
+                            Event::Exception {
+                                exception_type,
+                                message,
+                            } => {
                                 if exception_type != "ContentLengthExceededException"
                                     && completion.is_ok()
                                 {
@@ -2472,7 +2597,10 @@ mod truncation_completion_tests {
         // 回归 BUG①：in-band error 帧过去落入 `_ => {}` 被忽略、照返 200。
         // 现在应被识别为 UpstreamError，映射非 200。
         let frame = build_frame(
-            &[(":message-type", "error"), (":error-code", "InternalServerException")],
+            &[
+                (":message-type", "error"),
+                (":error-code", "InternalServerException"),
+            ],
             b"upstream exploded",
         );
         let completion = decode_to_completion(&frame);
@@ -2480,18 +2608,27 @@ mod truncation_completion_tests {
         assert!(!completion.is_ok(), "in-band error 帧应被识别为失败");
         assert_ne!(completion.http_status_u16(), 200, "失败必须返回非 200");
         assert_eq!(completion.http_status_u16(), 502);
-        assert_eq!(completion.outcome(), crate::usage::RequestOutcome::ServerError);
+        assert_eq!(
+            completion.outcome(),
+            crate::usage::RequestOutcome::ServerError
+        );
     }
 
     #[test]
     fn test_inband_throttling_error_frame_maps_to_429() {
         let frame = build_frame(
-            &[(":message-type", "error"), (":error-code", "ThrottlingException")],
+            &[
+                (":message-type", "error"),
+                (":error-code", "ThrottlingException"),
+            ],
             b"slow down",
         );
         let completion = decode_to_completion(&frame);
         assert_eq!(completion.http_status_u16(), 429);
-        assert_eq!(completion.outcome(), crate::usage::RequestOutcome::RateLimited);
+        assert_eq!(
+            completion.outcome(),
+            crate::usage::RequestOutcome::RateLimited
+        );
     }
 
     #[test]
@@ -2521,7 +2658,10 @@ mod truncation_completion_tests {
         let completion = decode_to_completion(&frame);
         assert!(!completion.is_ok(), "toolUseEvent 解析失败应判失败态");
         assert_eq!(completion.http_status_u16(), 502);
-        assert_eq!(completion.outcome(), crate::usage::RequestOutcome::ServerError);
+        assert_eq!(
+            completion.outcome(),
+            crate::usage::RequestOutcome::ServerError
+        );
     }
 
     #[test]
@@ -2529,7 +2669,10 @@ mod truncation_completion_tests {
         // 零倒退承诺：非 tool 帧解析失败只应告警、不置失败态。
         // 注意 AssistantResponseEvent.content 有 serde(default)，故须用非法 JSON 而非 `{}` 才能触发反序列化失败。
         let frame = build_frame(
-            &[(":message-type", "event"), (":event-type", "assistantResponseEvent")],
+            &[
+                (":message-type", "event"),
+                (":event-type", "assistantResponseEvent"),
+            ],
             b"not valid json",
         );
         let completion = decode_to_completion(&frame);
