@@ -1272,6 +1272,20 @@ impl KiroProvider {
                     status,
                     body
                 );
+                // 瞬态 429 的确定性标记(附加到 last_error 串尾)。
+                //
+                // 为什么需要它:重试耗尽后 handler 的 map_provider_error 靠错误串分类。瞬态 429 的串
+                // 形如 `流式 API 请求失败: 429 Too Many Requests {...}`,**不含**任何已知关键字,于是
+                // 落入兜底 `502 api_error` —— 客户端(Claude Code)把限流当成网关故障,且 502 不带
+                // Retry-After,退避策略完全走偏(生产实证 2026-08-04:240 次 429 全部回成 502)。
+                //
+                // 标记随**这一条具体错误**走:后续尝试若换成别的错误(如 400),last_error 被覆盖、
+                // 标记自然消失,绝不会把非限流错误误报成限流。
+                //
+                // ⚠️ 命名刻意避开 `retry_after_secs=` 子串:那是「全池冷却」路径的标记,
+                // map_provider_error 用 `contains("retry_after_secs=")` 判定它。若本标记含该子串会
+                // 被那条分支抢先命中,回出「所有凭据都在冷却」的错误文案(实际是上游限流)。
+                let mut rl_marker = String::new();
                 // 429 限流：给该凭据设置短冷却，让调度优先换用其它凭据
                 // （仍不禁用、不计永久失败，冷却到期自动恢复）
                 if status.as_u16() == 429 {
@@ -1281,6 +1295,8 @@ impl KiroProvider {
                     // 优先用上游给出的精确重置时间：响应头 Retry-After 优先，其次错误 body
                     let retry_after =
                         retry_after_header.or_else(|| endpoint.extract_retry_after_secs(&body));
+                    // 0 = 上游未给出精确重置时间(裸 429),由 handler 用默认退避提示。
+                    rl_marker = format!(" upstream_429_retry={}", retry_after.unwrap_or(0));
                     // 本请求链内该号首次 429 才设冷却；再次 429 只换号 failover，不重复累加
                     // trigger_count / 延长冷却（见 rate_limited_this_call 定义处的根因说明）。
                     if rate_limited_this_call.insert(ctx.id) {
@@ -1296,10 +1312,11 @@ impl KiroProvider {
                     last_outcome = crate::usage::RequestOutcome::ServerError;
                 }
                 last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
+                    "{} API 请求失败: {} {}{}",
                     api_type,
                     status,
-                    body
+                    body,
+                    rl_marker
                 ));
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
