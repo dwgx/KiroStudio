@@ -32,22 +32,29 @@ impl CliEndpoint {
     }
 
     fn decorate(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
-        req.header("content-type", "application/x-amz-json-1.0")
-            .header(
-                "x-amz-target",
-                "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
-            )
-            .header("x-amzn-codewhisperer-optout", "true")
-            .header(
-                "x-amz-user-agent",
-                format!("aws-sdk-js/1.0.0 KiroIDE-{}", ctx.config.kiro_version),
-            )
-            .header("user-agent", self.user_agent(ctx))
-            .header("host", self.host(ctx))
-            .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
-            .header("amz-sdk-request", "attempt=1; max=3")
-            .header("Authorization", format!("Bearer {}", ctx.token))
-            .header("tokentype", "API_KEY")
+        // ⚠️ 绝不在此设 content-type：Provider 已按 [`KiroEndpoint::content_type`] 设过一次，
+        // 而 reqwest 的 `.header()` 语义是 **append 而非 insert**，在此再设会让请求带**两个**
+        // content-type 头。生产事故实证（2026-08-04，真实上游抓包）：
+        //   发 ["application/json", "application/x-amz-json-1.0"] → 服务端取第一个值 →
+        //   HTTP **200** + `{"Output":{"__type":"...#UnknownOperationException"},"Version":"1.0"}`
+        // 200 让网关记成功、健康分只升不降，JSON 又被喂进 event-stream 解码器读出
+        // `total_length = 2065846133`（即 ASCII `{"Ou`）——与生产日志数字逐位相同。
+        // 只发单个正确值时上游正常返回 400 ValidationException。
+        req.header(
+            "x-amz-target",
+            "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+        )
+        .header("x-amzn-codewhisperer-optout", "true")
+        .header(
+            "x-amz-user-agent",
+            format!("aws-sdk-js/1.0.0 KiroIDE-{}", ctx.config.kiro_version),
+        )
+        .header("user-agent", self.user_agent(ctx))
+        .header("host", self.host(ctx))
+        .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=3")
+        .header("Authorization", format!("Bearer {}", ctx.token))
+        .header("tokentype", "API_KEY")
     }
 }
 
@@ -60,6 +67,15 @@ impl Default for CliEndpoint {
 impl KiroEndpoint for CliEndpoint {
     fn name(&self) -> &'static str {
         CLI_ENDPOINT_NAME
+    }
+
+    /// CLI 端点走 AWS JSON 1.0 协议。
+    ///
+    /// 由 Provider 唯一设置（见 [`KiroEndpoint::content_type`]）：本实现的 `decorate`
+    /// 绝不再自己设 content-type，否则请求会带两个值、服务端取第一个（`application/json`）
+    /// 而回 200 + Coral `UnknownOperationException` 信封——生产事故根因，已实证。
+    fn content_type(&self) -> &'static str {
+        "application/x-amz-json-1.0"
     }
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
@@ -117,6 +133,85 @@ mod tests {
         assert_eq!(
             value.pointer("/conversationState/currentMessage/userInputMessage/origin"),
             Some(&serde_json::Value::String("KIRO_CLI".to_string()))
+        );
+    }
+
+    /// 回归（生产事故 2026-08-04，根因已实证）：**每个**端点发出的请求都必须恰好
+    /// 携带一个 content-type 头。
+    ///
+    /// 旧实现里 provider 先设 `application/json`，`CliEndpoint::decorate` 又设
+    /// `application/x-amz-json-1.0`，而 reqwest 的 `.header()` 是 `append` 而非
+    /// `insert` —— 于是请求真的带了两个值。实测上游取**第一个**（`application/json`），
+    /// Coral 框架不认这个操作，返回 `UnknownOperationException`，且以 **HTTP 200**
+    /// 包在 `{"Output":..,"Version":"1.0"}` 信封里下发：
+    ///
+    /// - 两个头   → 200 + `{"Ou..` → 记成功、喂进二进制解码器 → “19 亿字节” → 502
+    /// - 单个正确头 → 400 + 正常 `ValidationException`
+    ///
+    /// 现在 content-type 由 [`KiroEndpoint::content_type`] 单一声明、provider 单点设置，
+    /// 端点不再自行追加，重复在结构上不可能发生。这个测试遍历所有端点守住该不变量。
+    #[test]
+    fn every_endpoint_sends_exactly_one_content_type() {
+        use crate::kiro::endpoint::{
+            AmazonQEndpoint, CodeWhispererEndpoint, IdeEndpoint, KiroEndpoint,
+        };
+
+        let credentials = KiroCredentials::default();
+        let config = Config::default();
+        let endpoints: Vec<Box<dyn KiroEndpoint>> = vec![
+            Box::new(CliEndpoint::new()),
+            Box::new(IdeEndpoint::new()),
+            Box::new(CodeWhispererEndpoint),
+            Box::new(AmazonQEndpoint),
+        ];
+        let client = reqwest::Client::new();
+
+        for endpoint in &endpoints {
+            let ctx = RequestContext {
+                credentials: &credentials,
+                token: "tok",
+                machine_id: "machine",
+                config: &config,
+                is_1m: false,
+            };
+            // 复刻 provider 的构造顺序：单点设置 endpoint 声明的 content-type。
+            let base = client
+                .post("https://example.invalid/")
+                .body("{}")
+                .header("content-type", endpoint.content_type());
+            let req = endpoint.decorate_api(base, &ctx).build().unwrap();
+
+            let values: Vec<&str> = req
+                .headers()
+                .get_all("content-type")
+                .iter()
+                .map(|v| v.to_str().unwrap())
+                .collect();
+            assert_eq!(
+                values.len(),
+                1,
+                "端点 {} 发出了 {} 个 content-type ({:?})；重复头会让上游取错值、\
+                 以 HTTP 200 返回 Coral 错误信封，进而被记成功并喂进 event-stream 解码器",
+                endpoint.name(),
+                values.len(),
+                values
+            );
+            assert_eq!(
+                values[0],
+                endpoint.content_type(),
+                "端点 {} 实际发出的 content-type 与其声明不一致",
+                endpoint.name()
+            );
+        }
+    }
+
+    /// cli 端点必须声明 AWS JSON 1.0：它 POST 到 `runtime.*.kiro.dev` 的根路径，
+    /// 走的是 `x-amz-target` 寻址的 AWS JSON 协议，而非 ide 的 REST 风格路径。
+    #[test]
+    fn cli_declares_amz_json_content_type() {
+        assert_eq!(
+            CliEndpoint::new().content_type(),
+            "application/x-amz-json-1.0"
         );
     }
 }

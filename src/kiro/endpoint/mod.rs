@@ -41,6 +41,30 @@ pub trait KiroEndpoint: Send + Sync {
     /// 装饰 MCP 请求的端点特有 header
     fn decorate_mcp(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder;
 
+    /// 本端点请求体的 `content-type`。
+    ///
+    /// 由 Provider **唯一**设置（`decorate_api`/`decorate_mcp` 实现里绝不要再设，
+    /// 见下方"为何是 trait 方法"）。默认 `application/json`，与 ide/alt 既有行为一致；
+    /// 走 AWS JSON 1.0 协议的端点（如 `cli`）覆写为 `application/x-amz-json-1.0`。
+    ///
+    /// # 为何是 trait 方法而不是各实现自己加头
+    ///
+    /// reqwest 的 `RequestBuilder::header()` 内部是 `headers_mut().append()`——**追加**
+    /// 而非覆盖。Provider 统一设一次、端点又在 `decorate` 里设一次，请求就会带**两个**
+    /// content-type。生产事故实证（2026-08-04，真实上游抓包）：`cli` 端点发出
+    /// `["application/json", "application/x-amz-json-1.0"]`，服务端取**第一个**值，
+    /// 于是回 HTTP **200** +
+    /// `{"Output":{"__type":"com.amazon.coral.service#UnknownOperationException"},"Version":"1.0"}`。
+    ///
+    /// 这个组合是最坏的：200 让网关记成功（健康分只升不降、坏号永不退出轮转），
+    /// 而 JSON 文本被喂进 event-stream 解码器又读出 `total_length = 2065846133`
+    /// （ASCII `{"Ou`）——与生产日志里那个"19 亿字节"数字逐位相同。
+    ///
+    /// 把它收成单一真相源，重复头在类型层面就不可能再出现。
+    fn content_type(&self) -> &'static str {
+        "application/json"
+    }
+
     /// 对已序列化的 API 请求体做端点特有加工（如注入 profileArn）
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String;
 
