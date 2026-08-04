@@ -21,9 +21,10 @@ use crate::{
     kiro::{model::credentials::KiroCredentials, regions::KIRO_DIALOG_REGIONS},
 };
 
+/// 导入通道状态。**不含 key**：鉴权活读 [`crate::common::auth_keys`]，
+/// 这样 importApiKey 改动（含从未配置到启用）即时生效，无需重启。
 #[derive(Clone)]
 struct ImportState {
-    token: String,
     manager: Arc<MultiTokenManager>,
 }
 
@@ -98,22 +99,22 @@ struct ImportItemResponse {
     sent_groups: Vec<String>,
 }
 
-pub fn create_router(token: String, manager: Arc<MultiTokenManager>) -> Router {
-    let state = ImportState { token, manager };
+/// 构建导入路由。**总是挂载**——未配置 importApiKey 时由 [`import_auth`] 全拒（401），
+/// 这样运维在面板里填上 key 即可启用通道，不必重启。暴露面从 404 变 401，
+/// 两者都不泄露信息（见 auth_keys 模块级说明）。
+pub fn create_router(manager: Arc<MultiTokenManager>) -> Router {
+    let state = ImportState { manager };
     Router::new()
         .route("/keys", post(import_keys))
-        .layer(middleware::from_fn_with_state(state.clone(), import_auth))
+        .layer(middleware::from_fn(import_auth))
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .with_state(state)
 }
 
-async fn import_auth(
-    State(state): State<ImportState>,
-    request: Request<Body>,
-    next: Next,
-) -> Response {
+async fn import_auth(request: Request<Body>, next: Next) -> Response {
+    // 活读热更单元：未配置 / 已清除 → 空存储恒 false → 全部 401（fail-closed）。
     match auth::extract_api_key(&request) {
-        Some(key) if auth::constant_time_eq(&key, &state.token) => next.run(request).await,
+        Some(key) if crate::common::auth_keys::import_key_matches(&key) => next.run(request).await,
         _ => (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "invalid or missing bearer token"})),
