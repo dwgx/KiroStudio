@@ -548,21 +548,28 @@ async fn main() {
     };
 
     // 外部凭据推送入口使用独立密钥，不复用网关 key 或高权限 admin key。
-    let app = match config.import_api_key.as_deref().map(str::trim) {
+    //
+    // 路由**总是挂载**：鉴权活读 common::auth_keys，未配置时空存储恒 false → 全部 401。
+    // 这样运维在面板填上 importApiKey 即可启用通道（含「从未配置」的冷启用），不必重启。
+    // 旧行为是未配置就不挂载 → 想启用必须重启，而重启会掐断在途流式请求。
+    match config.import_api_key.as_deref().map(str::trim) {
         Some(import_key) if !import_key.is_empty() => {
-            tracing::info!("凭据批量导入 API 已启用: POST /api/import/keys");
-            // 让运维面板的导入卡片能区分「未配置」与「已启用但还没人推过」。
-            common::import_stats::set_enabled(true);
-            app.nest(
-                "/api/import",
-                import_api::create_router(import_key.to_string(), token_manager.clone()),
-            )
+            if let Err(e) = common::auth_keys::set_import_key(import_key) {
+                tracing::error!("importApiKey 播种失败，导入通道将全拒: {}", e);
+            } else {
+                tracing::info!("凭据批量导入 API 已启用: POST /api/import/keys");
+                // 让运维面板的导入卡片能区分「未配置」与「已启用但还没人推过」。
+                common::import_stats::set_enabled(true);
+            }
         }
         _ => {
-            tracing::info!("importApiKey 未配置，凭据批量导入 API 未启用");
-            app
+            tracing::info!("importApiKey 未配置，POST /api/import/keys 已挂载但全拒（401）");
         }
-    };
+    }
+    let app = app.nest(
+        "/api/import",
+        import_api::create_router(token_manager.clone()),
+    );
 
     // 启动服务器
     let addr = format!("{}:{}", config.host, config.port);

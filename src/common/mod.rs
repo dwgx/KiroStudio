@@ -1,6 +1,7 @@
 //! 公共工具模块
 
 pub mod auth;
+pub mod auth_keys;
 pub mod fs_atomic;
 pub mod health_marker;
 pub mod import_stats;
