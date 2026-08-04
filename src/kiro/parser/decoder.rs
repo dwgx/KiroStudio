@@ -99,6 +99,12 @@ pub struct EventStreamDecoder {
     max_buffer_size: usize,
     /// 跳过的字节数（用于调试）
     bytes_skipped: usize,
+    /// 是否因「响应根本不是 event-stream」而停止（协议不符，非数据损坏）
+    ///
+    /// 与 `error_count` 超限的停止语义完全不同：那是流中途损坏，这是**整条响应用错了协议**
+    /// （典型：上游把 `application/x-amz-json-1.0` 的 `{"Output":...}` 信封回给流式端点）。
+    /// 上层据此把「200 但内容不对」判为凭据/路由故障并 failover，而不是当成功记账。
+    protocol_mismatch: bool,
 }
 
 impl Default for EventStreamDecoder {
@@ -123,6 +129,7 @@ impl EventStreamDecoder {
             max_errors: DEFAULT_MAX_ERRORS,
             max_buffer_size: DEFAULT_MAX_BUFFER_SIZE,
             bytes_skipped: 0,
+            protocol_mismatch: false,
         }
     }
 
@@ -176,6 +183,14 @@ impl EventStreamDecoder {
         self.state = DecoderState::Parsing;
 
         match parse_frame(&self.buffer) {
+            // 协议不符是**确定性**的：整个响应体根本不是 event-stream，逐字节"恢复"只会
+            // 啃出 5 个天文数字后停止，把根因埋掉。立即进终止态并如实报错。
+            Err(e @ ParseError::NotEventStream { .. }) => {
+                self.state = DecoderState::Stopped;
+                self.protocol_mismatch = true;
+                tracing::warn!("上游响应不是 AWS event-stream，判定协议不符: {}", e);
+                Err(e)
+            }
             Ok(Some((frame, consumed))) => {
                 // 成功解析
                 self.buffer.advance(consumed);
@@ -227,6 +242,15 @@ impl EventStreamDecoder {
     /// 应停止 drain。注意：`Recovering` 只是**可恢复中间态**，不是终止态。
     pub fn is_stopped(&self) -> bool {
         self.state == DecoderState::Stopped
+    }
+
+    /// 是否因**协议不符**而停止（上游响应根本不是 AWS event-stream）。
+    ///
+    /// 与"帧损坏导致连续错误超限"区分开：协议不符意味着这条路由/端点在语义上就是错的
+    /// （host 不对、content-type 让上游降级成非流式 JSON 等），换号重试无用，
+    /// 应由调用方据此给该 (凭据, 端点) 记一次结构性失败并 failover。
+    pub fn is_protocol_mismatch(&self) -> bool {
+        self.protocol_mismatch
     }
 
     /// 尝试容错恢复
