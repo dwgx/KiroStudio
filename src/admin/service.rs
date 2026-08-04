@@ -1187,6 +1187,14 @@ impl AdminService {
         let mut tool_description_max_chars_changed: Option<usize> = None;
         // at-rest 加密开关变更:变更后立即重写凭据/回收站文件(明文↔密文),不等下次偶发变更。
         let mut encrypt_at_rest_changed = false;
+        // 三把 key 的轮换：存盘后调 auth_keys setter 即时生效（不再进 restart_fields）。
+        // 存 trim 后的新值而非 bool——setter 需要实际值，且 reload_config 会把 config 里的
+        // 这三把 key 钉回启动值（split-brain 防护），故热更单元是它们唯一的活真相源。
+        let mut user_key_changed: Option<String> = None;
+        let mut admin_key_changed: Option<String> = None;
+        // importApiKey 多一种状态：`Some(None)` = 显式清除（关闭导入通道），
+        // `Some(Some(k))` = 设为新值，`None` = 本次请求未提及此字段（不动）。
+        let mut import_key_changed: Option<Option<String>> = None;
 
         // —— 需重启生效的字段 ——
         if let Some(v) = req.host {
@@ -1560,15 +1568,45 @@ impl AdminService {
             }
         }
         // userKey（下游对话 api_key）：仅在非空白时更新（防 fail-open：空 key 会让 /v1 匿名可达）。
-        // 前端不回显现值，传空串=不改。需重启生效（auth 中间件启动时固化 key）。
+        // 前端不回显现值，传空串=不改。
+        // 【不再需要重启】鉴权已改为活读 `common::auth_keys` 的进程级单元，存盘后调 setter
+        // 即时生效——轮换密钥是常规运维动作，重启整个网关会掐断所有在途流式请求。
         if let Some(v) = req.api_key {
             let trimmed = v.trim();
             if !trimmed.is_empty() {
                 let new_val = Some(trimmed.to_string());
                 if new_val != config.api_key {
                     config.api_key = new_val;
-                    restart_fields.push("apiKey".into());
+                    user_key_changed = Some(trimmed.to_string());
                 }
+            }
+        }
+        // adminApiKey：同 userKey，空串=不改（防把管理面锁死成 fail-closed 全 401）。
+        // 【自锁风险】轮换后当前面板持有的旧 key 立即失效，前端须用新 key 重新鉴权——
+        // 这是热更的正确语义（旧 key 必须马上作废），前端负责换 header 而非后端延迟生效。
+        if let Some(v) = req.admin_api_key {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                let new_val = Some(trimmed.to_string());
+                if new_val != config.admin_api_key {
+                    config.admin_api_key = new_val;
+                    admin_key_changed = Some(trimmed.to_string());
+                }
+            }
+        }
+        // importApiKey：与上面两把**语义不同**——空串是合法输入，表示「关闭导入通道」。
+        // 未配置是这把 key 的正常状态（不对外提供导入），故必须能被显式清除；
+        // 而 userKey/adminApiKey 清空等于关掉整个网关/管理面，绝不允许。
+        if let Some(v) = req.import_api_key {
+            let trimmed = v.trim();
+            let new_val = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+            if new_val != config.import_api_key {
+                config.import_api_key = new_val.clone();
+                import_key_changed = Some(new_val);
             }
         }
 
@@ -1867,6 +1905,42 @@ impl AdminService {
             crate::anthropic::set_tool_description_max_chars(v);
         }
 
+        // userKey 轮换立即生效：下一个 /v1 请求即按新 key 判定，旧 key 同时失效。
+        // ⚠️必须放在 reload_config 之后——reload 会把 config 里的 userKey 钉回启动值
+        // （restart-only 字段的 split-brain 防护），但热更单元才是鉴权的活真相源，
+        // 故此处后写、以新值为准。setter 拒空，失败仅告警（旧 key 继续有效，不会裸奔）。
+        if let Some(v) = &user_key_changed {
+            match crate::common::auth_keys::set_user_key(v) {
+                Ok(()) => tracing::info!("userKey 已轮换并即时生效（无需重启）"),
+                Err(e) => tracing::error!("userKey 已存盘但热更失败，重启后生效: {}", e),
+            }
+        }
+        // adminApiKey 轮换：同上。旧 key 立即失效，面板须用新 key 重新鉴权。
+        if let Some(v) = &admin_key_changed {
+            match crate::common::auth_keys::set_admin_key(v) {
+                Ok(()) => tracing::info!("adminApiKey 已轮换并即时生效（无需重启）"),
+                Err(e) => tracing::error!("adminApiKey 已存盘但热更失败，重启后生效: {}", e),
+            }
+        }
+        // importApiKey：Some(Some) = 启用/轮换，Some(None) = 关闭通道。
+        // 路由总是挂载，故这里改完立刻生效——包括「从未配置」直接冷启用（旧行为要重启）。
+        // import_stats 的 enabled 标志同步跟上，否则面板会把已启用的通道显示成「未配置」。
+        match &import_key_changed {
+            Some(Some(v)) => match crate::common::auth_keys::set_import_key(v) {
+                Ok(()) => {
+                    crate::common::import_stats::set_enabled(true);
+                    tracing::info!("importApiKey 已设置并即时生效，POST /api/import/keys 可用");
+                }
+                Err(e) => tracing::error!("importApiKey 已存盘但热更失败，重启后生效: {}", e),
+            },
+            Some(None) => {
+                crate::common::auth_keys::clear_import_key();
+                crate::common::import_stats::set_enabled(false);
+                tracing::info!("importApiKey 已清除，导入通道即时关闭（后续请求全部 401）");
+            }
+            None => {}
+        }
+
         let immediate_changed = hot_changed
             || refresh_task_changed
             || balance_task_changed
@@ -1881,7 +1955,12 @@ impl AdminService {
             || tool_expose_error_to_client_changed.is_some()
             || tool_repair_json_changed.is_some()
             || tool_truncation_recovery_changed.is_some()
-            || tool_description_max_chars_changed.is_some();
+            || tool_description_max_chars_changed.is_some()
+            // 三把 key 走 auth_keys setter 即时生效，故算「立即生效」而非「需重启」。
+            // 不进 hot_or_display_changed：reload_config 会把它们钉回启动值，重载对它们无用。
+            || user_key_changed.is_some()
+            || admin_key_changed.is_some()
+            || import_key_changed.is_some();
         let restart_required = !restart_fields.is_empty();
         let message = if restart_required {
             format!("已保存。{} 个字段需重启服务后生效。", restart_fields.len())

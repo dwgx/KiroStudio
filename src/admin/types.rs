@@ -619,8 +619,9 @@ pub struct ConfigSnapshotResponse {
 /// 更新服务端配置请求
 ///
 /// 所有字段可选：仅提交的字段被修改并持久化到 config.json。
-/// 敏感字段（admin key / api key / 代理密码）不在此开放。
-/// 除 `load_balancing_mode` 立即生效外，其余字段需重启进程后生效。
+/// 三把鉴权 key（userKey / adminApiKey / importApiKey）可在此轮换：不回显现值、仅非空时更新，
+/// 存盘后走 `common::auth_keys` setter 即时生效（代理密码等其余敏感字段仍不开放）。
+/// 部分固化项（host/port/proxy/tls 等）需重启，由响应的 `restart_fields` 告知前端。
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateConfigRequest {
@@ -684,10 +685,18 @@ pub struct UpdateConfigRequest {
     pub proxy_password: Option<String>,
     /// 网页上号回调基地址；传空字符串表示清除（回退本地模式）
     pub callback_base_url: Option<String>,
-    /// 下游客户端对话 API Key（userKey，x-api-key）。出于安全前端不回显已存值，仅在非空时更新；
-    /// ⚠️需重启生效（认证中间件在启动时固化 key）。空白值会被后端拒绝（防 fail-open）。
+    /// 下游客户端对话 API Key（userKey，x-api-key）。出于安全前端不回显已存值，仅在非空时更新。
+    /// 存盘后走 `common::auth_keys` setter **即时生效、无需重启**。空白值会被后端拒绝（防 fail-open）。
     #[serde(default)]
     pub api_key: Option<String>,
+    /// 管理面 API Key（adminApiKey）。同 [`Self::api_key`]：不回显、仅非空时更新、即时生效。
+    /// ⚠️改这把 key 会让**当前面板会话立刻失效**（下一个请求就按新 key 判定），需用新 key 重新登录。
+    #[serde(default)]
+    pub admin_api_key: Option<String>,
+    /// 外部凭据推送 Key（importApiKey）。同上即时生效；空串在此表示**关闭导入通道**
+    /// （与另两把不同——它未配置是合法状态，见 `auth_keys::clear_import_key`）。
+    #[serde(default)]
+    pub import_api_key: Option<String>,
     // ---- 反代安全（批次3，均需重启生效）----
     /// CORS 允许来源列表（整表替换）
     pub cors_allowed_origins: Option<Vec<String>>,
