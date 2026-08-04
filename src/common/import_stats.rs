@@ -46,6 +46,27 @@ pub struct ImportItemRecord {
     /// 失败原因（成功时为 None）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// **推送方在请求里发来的 region 原值**。`None` = 对方没发这个字段。
+    ///
+    /// 与 [`Self::region`]（我们最终落库的值）分开记录：只看落库值分不清
+    /// 「对方指定了 us-east-1」和「对方没发、我们探测出 us-east-1」，
+    /// 而这两种情况在排查路由问题时含义完全不同。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sent_region: Option<String>,
+    /// **推送方发来的 endpoint 原值**。`None` = 对方没发（契约示例即 `null`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sent_endpoint: Option<String>,
+    /// **推送方发来的 groups 原值**，照实回显（契约称固定空数组，但不替它假设）。
+    pub sent_groups: Vec<String>,
+    /// 最终落库的 region（探测或重用的结果）。面板显示用——运维要能看出号被路由到哪。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// 最终落库的 endpoint。`None` = 未指定，运行时回退 `config.defaultEndpoint`。
+    ///
+    /// 【为何必须可见】93 号那次落成 `cli` 导致上游 400 + 解码器崩溃，但面板上只显示
+    /// key 和 #id，完全看不出路由是坏的。把它摆到明面上，同类问题一眼可辨。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
 }
 
 /// 一次推送（= 一个 HTTP 请求）的摘要。
@@ -188,6 +209,11 @@ mod tests {
             duplicate,
             credential_id: ok.then_some(1),
             error: (!ok).then(|| "boom".to_string()),
+            region: Some("us-east-1".to_string()),
+            endpoint: None,
+            sent_region: None,
+            sent_endpoint: None,
+            sent_groups: Vec::new(),
         }
     }
 

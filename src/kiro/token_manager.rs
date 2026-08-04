@@ -4753,6 +4753,7 @@ impl MultiTokenManager {
                 }
                 let old = entry.credentials.clone();
                 entry.credentials.auth_method = Some("api_key".to_string());
+                entry.credentials.auth_region = Some(region.clone());
                 entry.credentials.region = Some(region.clone());
                 entry.credentials.api_region = Some(region.clone());
                 entry.credentials.endpoint = endpoint.clone();
@@ -4790,6 +4791,7 @@ impl MultiTokenManager {
         let mut credentials = KiroCredentials {
             id: Some(id),
             auth_method: Some("api_key".to_string()),
+            auth_region: Some(region.clone()),
             region: Some(region.clone()),
             api_region: Some(region),
             kiro_api_key: Some(key),
