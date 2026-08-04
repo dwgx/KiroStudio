@@ -1122,6 +1122,16 @@ fn create_sse_stream(
                             // 解码器连续错误超限而永久停止：响应必然截断，置失败态供收尾记账，
                             // 并内联补发一个 SSE error 事件（若尚未发过），避免截断被当成功。
                             if decoder.is_stopped() {
+                                // 协议不符（上游给的根本不是 event-stream）是**确定性**判据，
+                                // 回报给 provider 以关闭自愈闭环：给该凭据记一次失败（否则
+                                // HTTP 200 已让它记过成功，健康分只升不降、被无限选中），
+                                // 并隔离这条 (端点, region) 路由让后续请求自动改道。
+                                if decoder.is_protocol_mismatch() {
+                                    provider.report_protocol_mismatch(
+                                        &meta,
+                                        last_decode_err.as_deref().unwrap_or("协议不符"),
+                                    );
+                                }
                                 ctx.mark_decoder_stopped(
                                     last_decode_err.unwrap_or_else(|| "解码器连续错误已停止".to_string()),
                                 );
@@ -1489,6 +1499,12 @@ async fn handle_non_stream_request(
 
     // 解码器永久停止：单 feed 中途连续错误超限，后续帧必然丢失、响应截断。
     if decoder.is_stopped() && completion.is_ok() {
+        // 协议不符（上游给的根本不是 event-stream）→ 回报 provider：隔离该路由 + 记一次
+        // 凭据失败。非流式路径同样必须回报，否则「只有流式请求才能发现坏路由」。
+        if decoder.is_protocol_mismatch() {
+            provider
+                .report_protocol_mismatch(&meta, last_decode_err.as_deref().unwrap_or("协议不符"));
+        }
         completion = CompletionStatus::DecoderStopped {
             message: last_decode_err.unwrap_or_else(|| "解码器连续错误已停止".to_string()),
         };
@@ -2043,6 +2059,13 @@ fn create_buffered_sse_stream(
                                 }
                                 // 解码器永久停止：响应必然截断，置失败态供收尾记账。
                                 if decoder.is_stopped() {
+                                    // 同流式路径：协议不符时回报，闭合"记失败 + 隔离路由"自愈环。
+                                    if decoder.is_protocol_mismatch() {
+                                        provider.report_protocol_mismatch(
+                                            &meta,
+                                            last_decode_err.as_deref().unwrap_or("协议不符"),
+                                        );
+                                    }
                                     ctx.mark_decoder_stopped(
                                         last_decode_err.unwrap_or_else(|| "解码器连续错误已停止".to_string()),
                                     );

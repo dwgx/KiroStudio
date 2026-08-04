@@ -23,6 +23,13 @@ use parking_lot::Mutex;
 /// 或 host 路由黑洞，但配置/网络可能临时修复，过期后自动重试。
 const DEAD_ENDPOINT_TTL: Duration = Duration::from_secs(1800);
 
+/// 协议不符隔离 TTL（30 分钟）。
+///
+/// 上游对某 (端点, region) 返回的不是 event-stream 而是 JSON/文本（协议降级），
+/// 说明这条**路由**当前不可用于对话。与 `dead_endpoints` 同为自动过期的软隔离：
+/// 上游修好、或部署方改了配置后，过期即自动重试，无需人工介入也无需重启。
+const PROTOCOL_BROKEN_TTL: Duration = Duration::from_secs(1800);
+
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
@@ -98,6 +105,14 @@ pub struct CallMeta {
     /// 触发 `Drop` 把 inflight -1，故 `#[allow(dead_code)]` 而非移除。
     #[allow(dead_code)]
     pub inflight: crate::kiro::scheduling::InflightGuard,
+    /// 实际服务本请求的端点名 + upstream region。
+    ///
+    /// 响应体是流式消费的，协议不符（上游把 event-stream 降级成 JSON/文本）只能在
+    /// **解码阶段**才发现，那时 provider 早已返回。handler 据此把"这条路由坏了"
+    /// 回报给 provider（见 [`KiroProvider::report_protocol_mismatch`]），实现
+    /// 自动隔离 + 自动换路，而不是每个请求重踩同一个坑。
+    pub endpoint_name: String,
+    pub upstream_region: String,
 }
 
 /// 一次自定义 API 透传的元数据,供 handler 做 usage 埋点。
@@ -140,6 +155,16 @@ pub struct KiroProvider {
     /// host 路由黑洞，端点回退逐一尝试会在每个请求上重复白跑 connect timeout。
     /// 记住首次失败的端点，30 分钟内跳过（避免瞬时网络抖动永久拉黑，过期自动重试）。
     dead_endpoints: Mutex<HashMap<String, Instant>>,
+    /// 协议不符的端点隔离缓存（key: "endpoint_name@region", value: 首次判定时刻）。
+    ///
+    /// 与 [`Self::dead_endpoints`] 互补：那个管「连不上」（DNS/TCP/TLS），这个管
+    /// 「连上了但说的不是同一种协议」——上游返回 HTTP 2xx 却给出 JSON/文本而非
+    /// AWS event-stream（生产实证 2026-08-04：`cli` 端点 845 次）。这类响应会被
+    /// 记成功、健康分只升不降，调度持续把流量喂给一条注定截断的路由。
+    ///
+    /// 隔离是**软**的且带 TTL：期内该 (端点, region) 在回退链里被降级到最后，
+    /// 期满自动放行重试。上游修好、配置改对都能自愈，无需人工干预或重启。
+    protocol_broken: Mutex<HashMap<String, Instant>>,
 }
 
 impl KiroProvider {
@@ -178,6 +203,7 @@ impl KiroProvider {
             endpoints,
             default_endpoint,
             dead_endpoints: Mutex::new(HashMap::new()),
+            protocol_broken: Mutex::new(HashMap::new()),
         }
     }
 
@@ -209,6 +235,34 @@ impl KiroProvider {
     fn mark_endpoint_alive(&self, endpoint_name: &str, region: &str) {
         let key = format!("{}@{}", endpoint_name, region);
         self.dead_endpoints.lock().remove(&key);
+    }
+
+    /// 该 (端点, region) 是否处于「协议不符」隔离窗口内。
+    ///
+    /// 与 [`Self::is_endpoint_dead`] 同款自愈语义：TTL 一到自动清条目并放行重试，
+    /// 因此上游恢复或配置改对之后无需人工干预、无需重启即自动回到轮转。
+    fn is_route_protocol_broken(&self, endpoint_name: &str, region: &str) -> bool {
+        let key = format!("{}@{}", endpoint_name, region);
+        let mut broken = self.protocol_broken.lock();
+        match broken.get(&key) {
+            Some(at) if at.elapsed() < PROTOCOL_BROKEN_TTL => true,
+            // TTL 已过 → 清掉条目，让它重新试一次（上游可能已修好）。
+            Some(_) => {
+                broken.remove(&key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// 记一次 (端点, region) 协议不符。仅由解码层在**确定性**判据命中时回报
+    /// （首字节不可能属于合法帧长度，见 `parser::frame::sniff_non_event_stream`），
+    /// 绝不因业务错误码或偶发截断进入这里。
+    fn mark_route_protocol_broken(&self, endpoint_name: &str, region: &str) {
+        let key = format!("{}@{}", endpoint_name, region);
+        self.protocol_broken
+            .lock()
+            .insert(key, std::time::Instant::now());
     }
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
@@ -244,20 +298,50 @@ impl KiroProvider {
         &self,
         credentials: &KiroCredentials,
         fallback_enabled: bool,
+        upstream_region: &str,
     ) -> anyhow::Result<Vec<Arc<dyn KiroEndpoint>>> {
         let primary = self.endpoint_for(credentials)?;
-        if !fallback_enabled || primary.name() == crate::kiro::endpoint::cli::CLI_ENDPOINT_NAME {
+        let primary_is_cli = primary.name() == crate::kiro::endpoint::cli::CLI_ENDPOINT_NAME;
+
+        // cli 端点历史上被排除在回退链外（单元素链）。但「主端点已被证实说的不是
+        // event-stream 协议」时，单元素链意味着**没有任何出路**——每个请求都必然
+        // 撞同一面墙，凭据被反复选中、反复返回截断响应（生产实证 2026-08-04：
+        // #142 是唯一 cli 号，845 次解码器停止，failureCount 始终 0）。
+        //
+        // 因此这里只在**已证实协议不符**时才为 cli 补上回退链：是纯增量的逃生通道，
+        // 不改变任何当前正常工作的路径；隔离 TTL 到期后自动恢复原有单元素行为。
+        let primary_broken = self.is_route_protocol_broken(primary.name(), upstream_region);
+        if !fallback_enabled || (primary_is_cli && !primary_broken) {
             return Ok(vec![primary]);
         }
+
         let primary_name = primary.name();
-        let mut chain = vec![primary];
+        // 主端点协议不符 → 它排在链尾（仍保留兜底位，避免整条链为空无人发送）。
+        let mut chain = if primary_broken {
+            tracing::warn!(
+                "端点 {} 在 region {} 处于协议不符隔离期，本次请求优先改走回退端点",
+                primary_name,
+                upstream_region
+            );
+            Vec::new()
+        } else {
+            vec![primary.clone()]
+        };
         for name in ENDPOINT_FALLBACK_ORDER {
             if *name == primary_name {
+                continue;
+            }
+            // 同样跳过其它已知协议不符的端点（链尾兜底除外，见下）。
+            if self.is_route_protocol_broken(name, upstream_region) {
                 continue;
             }
             if let Some(ep) = self.endpoints.get(*name) {
                 chain.push(ep.clone());
             }
+        }
+        // 兜底铁律：链绝不为空（否则 response 恒 None，请求无人发送）。
+        if chain.is_empty() {
+            chain.push(primary);
         }
         Ok(chain)
     }
@@ -388,6 +472,32 @@ impl KiroProvider {
     ///
     /// handler 在请求完成、从上游 meteringEvent 拿到真实计费量后调用；provider 持有
     /// token_manager，handler 只有 provider，故在此开一个薄 passthrough。
+    /// 回报一次「上游响应不是 event-stream」的协议不符（由 handler 在解码阶段发现）。
+    ///
+    /// 这是**全自动自愈**的入口。协议不符意味着这条 (端点, region) 路由本身坏了——
+    /// 上游用 200 回了一段 JSON/文本，凭据本身完全正常。处置：
+    ///
+    /// 1. **隔离路由**：把 (端点, region) 记入检疫表，后续请求自动绕开（TTL 到期自动重试，
+    ///    上游修好后无需人工干预）。
+    /// 2. **记凭据失败**：让健康分如实下降、触发 failover。这修的是最恶劣的那个洞——
+    ///    旧实现走 `status.is_success()` 就 `report_success`，坏号 `failureCount` 恒为 0、
+    ///    健康分只升不降，调度器于是持续挑它，每次都回截断响应（生产实证 2026-08-04：
+    ///    #142 累计 845 次解码器停止、`failureCount` 始终为 0）。
+    ///
+    /// 幂等且线程安全；同一路由重复回报只刷新检疫起始时刻。
+    pub fn report_protocol_mismatch(&self, meta: &CallMeta, detail: &str) {
+        self.mark_route_protocol_broken(&meta.endpoint_name, &meta.upstream_region);
+        tracing::error!(
+            "凭据 #{} 经端点 {}@{} 返回非 event-stream 响应，已隔离该路由 {}s 并记一次失败: {}",
+            meta.credential_id,
+            meta.endpoint_name,
+            meta.upstream_region,
+            PROTOCOL_BROKEN_TTL.as_secs(),
+            detail
+        );
+        self.token_manager.report_failure(meta.credential_id);
+    }
+
     pub fn report_credits(&self, credential_id: u64, credits: f64) {
         self.token_manager.add_credits(credential_id, credits);
     }
@@ -663,7 +773,13 @@ impl KiroProvider {
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
 
-            let chain = match self.endpoint_chain_for(&ctx.credentials, config.endpoint_fallback) {
+            let upstream_region = ctx.credentials.effective_upstream_region(&config);
+
+            let chain = match self.endpoint_chain_for(
+                &ctx.credentials,
+                config.endpoint_fallback,
+                &upstream_region,
+            ) {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -681,7 +797,6 @@ impl KiroProvider {
             let mut response: Option<reqwest::Response> = None;
             let last_idx = chain.len() - 1;
 
-            let upstream_region = ctx.credentials.effective_upstream_region(&config);
             for (idx, candidate) in chain.iter().enumerate() {
                 // 死端点负缓存：该 (端点, region) 近期连接层失败过 → 跳过本跳。
                 // 生产实证：codewhisperer.eu-central-1.amazonaws.com 根本不存在（DNS 无记录），
@@ -696,6 +811,20 @@ impl KiroProvider {
                     );
                     continue;
                 }
+                // 协议隔离：该 (端点, region) 近期被证实返回非 event-stream 响应 → 跳过本跳。
+                // 与死端点负缓存同构，但触发条件不同：那个是"连不上"，这个是"连上了但
+                // 说的不是同一种协议"。链尾同样绝不跳过（否则 response 恒 None）。
+                if idx != last_idx
+                    && self.is_route_protocol_broken(candidate.name(), &upstream_region)
+                {
+                    tracing::debug!(
+                        "端点 {} 在 region {} 近期返回非 event-stream 响应（协议隔离 {}s 内），跳过本跳",
+                        candidate.name(),
+                        upstream_region,
+                        PROTOCOL_BROKEN_TTL.as_secs()
+                    );
+                    continue;
+                }
                 let rctx = RequestContext {
                     credentials: &ctx.credentials,
                     token: &ctx.token,
@@ -707,11 +836,17 @@ impl KiroProvider {
                 let url = candidate.api_url(&rctx);
                 let body = candidate.transform_api_body(request_body, &rctx);
 
+                // content-type 由端点声明（单一真相源）。历史缺陷：这里硬编码
+                // application/json，而 cli 端点在 decorate_api 里又 append 了
+                // x-amz-json-1.0 —— reqwest 的 .header() 是 append 而非 insert，
+                // 于是请求带**两个** content-type。上游取第一个（application/json），
+                // Coral 框架不认该操作，回 200 + {"Output":{...UnknownOperationException}}，
+                // 被当成功记账后喂进 event-stream 解码器（生产实证 2026-08-04）。
                 let base = self
                     .client_for(&ctx.credentials)?
                     .post(&url)
                     .body(body)
-                    .header("content-type", "application/json");
+                    .header("content-type", candidate.content_type());
                 let request = candidate.decorate_api(base, &rctx);
 
                 match request.send().await {
@@ -790,6 +925,9 @@ impl KiroProvider {
                     is_streaming: is_stream,
                     retries: attempt as u32,
                     latency_ms: call_started.elapsed().as_millis() as u64,
+                    // 供解码侧回报协议不符时定位「哪条路由坏了」（见 report_protocol_mismatch）。
+                    endpoint_name: endpoint.name().to_string(),
+                    upstream_region: upstream_region.to_string(),
                     // 移交在途守卫：从此随响应流存活，流真正消费完才 -1
                     inflight: ctx.inflight,
                 };
@@ -1237,11 +1375,12 @@ impl KiroProvider {
                         };
                         let url = endpoint.api_url(&rctx);
                         let body = endpoint.transform_api_body(&fallback_body, &rctx);
+                        // 同上：content-type 由端点声明，避免重复头（见主路径注释）。
                         let base = self
                             .client_for(&ctx.credentials)?
                             .post(&url)
                             .body(body)
-                            .header("content-type", "application/json");
+                            .header("content-type", endpoint.content_type());
                         let request = endpoint.decorate_api(base, &rctx);
                         match request.send().await {
                             Ok(resp) if resp.status().is_success() => {
@@ -1253,6 +1392,13 @@ impl KiroProvider {
                                     is_streaming: is_stream,
                                     retries: (model_unavailable_attempts + 1) as u32,
                                     latency_ms: call_started.elapsed().as_millis() as u64,
+                                    endpoint_name: endpoint.name().to_string(),
+                                    // 本分支自己的凭据/config 现算，绝不借用主循环的
+                                    // upstream_region（那是另一个凭据的，会把隔离记到错的路由上）。
+                                    upstream_region: ctx
+                                        .credentials
+                                        .effective_upstream_region(&config)
+                                        .to_string(),
                                     inflight: ctx.inflight,
                                 };
                                 return Ok((resp, meta));
@@ -1500,5 +1646,228 @@ mod tests {
         let (model, session) = KiroProvider::extract_model_and_session(r#"{"foo":"bar"}"#);
         assert_eq!(model, None);
         assert_eq!(session, None);
+    }
+
+    // ===== 协议不符自愈闭环（生产事故 2026-08-04 回归） =====
+
+    /// 构造一个注册了全部端点的 provider，用于验证回退链/隔离逻辑。
+    fn provider_with_all_endpoints(default_endpoint: &str) -> KiroProvider {
+        use crate::kiro::endpoint::{
+            AmazonQEndpoint, CliEndpoint, CodeWhispererEndpoint, IdeEndpoint,
+        };
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                vec![],
+                None,
+                None,
+                false,
+            )
+            .expect("构建 token manager"),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert("ide".into(), Arc::new(IdeEndpoint::new()));
+        endpoints.insert("cli".into(), Arc::new(CliEndpoint::new()));
+        endpoints.insert("codewhisperer".into(), Arc::new(CodeWhispererEndpoint));
+        endpoints.insert("amazonq".into(), Arc::new(AmazonQEndpoint));
+        KiroProvider::with_proxy(manager, None, endpoints, default_endpoint.to_string())
+    }
+
+    fn cli_credential() -> KiroCredentials {
+        let mut c = KiroCredentials::default();
+        c.endpoint = Some("cli".to_string());
+        c.kiro_api_key = Some("ksk_test".to_string());
+        c.auth_method = Some("api_key".to_string());
+        c
+    }
+
+    /// 隔离是**软**的且自动过期：TTL 未到判 true，人工干预不是必需的。
+    #[test]
+    fn test_protocol_broken_quarantine_is_recorded_and_scoped() {
+        let p = provider_with_all_endpoints("ide");
+        assert!(
+            !p.is_route_protocol_broken("cli", "us-east-1"),
+            "初始不应有任何隔离"
+        );
+
+        p.mark_route_protocol_broken("cli", "us-east-1");
+        assert!(p.is_route_protocol_broken("cli", "us-east-1"));
+
+        // 隔离按 (端点, region) 精确划界：不连坐别的 region，也不连坐别的端点。
+        assert!(
+            !p.is_route_protocol_broken("cli", "eu-central-1"),
+            "隔离不得跨 region 连坐"
+        );
+        assert!(
+            !p.is_route_protocol_broken("ide", "us-east-1"),
+            "隔离不得跨端点连坐"
+        );
+    }
+
+    /// 核心回归：cli 号在**未**证实协议不符时保持既有单元素链（行为逐字不变）；
+    /// 一旦证实，自动获得回退链——这正是 #142 缺失的逃生通道。
+    #[test]
+    fn test_cli_gets_escape_hatch_only_after_protocol_mismatch() {
+        let p = provider_with_all_endpoints("ide");
+        let cred = cli_credential();
+
+        // 未隔离：单元素链，与改动前完全一致（不引入任何新行为）。
+        let chain = p.endpoint_chain_for(&cred, true, "us-east-1").unwrap();
+        assert_eq!(chain.len(), 1, "未证实协议不符时 cli 仍是单元素链");
+        assert_eq!(chain[0].name(), "cli");
+
+        // 证实协议不符后：获得回退链，且 cli 不再占链首。
+        p.mark_route_protocol_broken("cli", "us-east-1");
+        let chain = p.endpoint_chain_for(&cred, true, "us-east-1").unwrap();
+        assert!(
+            chain.len() > 1,
+            "协议不符后必须有逃生通道，否则每个请求都撞同一面墙（#142 的成因）"
+        );
+        assert_ne!(chain[0].name(), "cli", "已证实坏掉的端点绝不能继续占链首");
+    }
+
+    /// 铁律：回退链**绝不为空**。链为空 ⇒ 没有任何端点发送 ⇒ response 恒 None
+    /// ⇒ 请求静默无人处理。即使所有端点都被隔离，也必须留一个兜底。
+    #[test]
+    fn test_chain_never_empty_even_when_all_routes_quarantined() {
+        let p = provider_with_all_endpoints("ide");
+        for name in ["ide", "cli", "codewhisperer", "amazonq"] {
+            p.mark_route_protocol_broken(name, "us-east-1");
+        }
+
+        // cli 号（历史单元素路径）
+        let chain = p
+            .endpoint_chain_for(&cli_credential(), true, "us-east-1")
+            .unwrap();
+        assert!(!chain.is_empty(), "全隔离时 cli 链仍不得为空");
+
+        // 默认 ide 号
+        let chain = p
+            .endpoint_chain_for(&KiroCredentials::default(), true, "us-east-1")
+            .unwrap();
+        assert!(!chain.is_empty(), "全隔离时 ide 链仍不得为空");
+    }
+
+    /// `endpoint_fallback = false` 时行为不变（部署方显式关掉回退的意图必须被尊重）。
+    #[test]
+    fn test_fallback_disabled_still_single_element_even_if_broken() {
+        let p = provider_with_all_endpoints("ide");
+        p.mark_route_protocol_broken("cli", "us-east-1");
+        let chain = p
+            .endpoint_chain_for(&cli_credential(), false, "us-east-1")
+            .unwrap();
+        assert_eq!(chain.len(), 1, "显式关闭回退时绝不擅自加端点");
+    }
+
+    /// 隔离期内，健康端点排在被隔离端点之前（调度优先走能用的那条）。
+    #[test]
+    fn test_broken_primary_is_demoted_not_removed() {
+        let p = provider_with_all_endpoints("ide");
+        p.mark_route_protocol_broken("ide", "us-east-1");
+        let chain = p
+            .endpoint_chain_for(&KiroCredentials::default(), true, "us-east-1")
+            .unwrap();
+        assert!(!chain.is_empty());
+        assert_ne!(chain[0].name(), "ide", "被隔离的主端点不应仍占链首");
+    }
+
+    /// **端到端闭环**：这是整改的核心断言——单独验证每一层都不足以证明系统会自愈。
+    ///
+    /// 复刻生产事故的完整链路：
+    ///   ① 上游回 AWS JSON 信封（用生产日志里的真实字节）
+    ///   ② 解码器判定协议不符（而非啃出 19 亿字节后停止）
+    ///   ③ handler 回报 provider
+    ///   ④ 凭据被记一次**失败**（旧实现恒为 0，健康分只升不降 → 无限重选坏号）
+    ///   ⑤ 该路由进隔离，后续请求自动改走别的端点
+    #[test]
+    fn test_end_to_end_protocol_mismatch_closes_the_loop() {
+        use crate::kiro::parser::decoder::EventStreamDecoder;
+
+        // ① + ② 解码层：生产真实字节 → 判定协议不符，且**不是**误导性的长度错误
+        let production_body =
+            br#"{"Output":{"__type":"com.amazon.coral.service#InternalServerException"},"Version":"1.0"}"#;
+        let mut decoder = EventStreamDecoder::new();
+        decoder.feed(production_body).unwrap();
+        let mut saw_misleading_length = false;
+        for r in decoder.decode_iter() {
+            if let Err(e) = r {
+                if e.to_string().contains("1953527156") || e.to_string().contains("2065846133") {
+                    saw_misleading_length = true;
+                }
+            }
+        }
+        assert!(
+            decoder.is_protocol_mismatch(),
+            "解码层必须把 JSON 信封判为协议不符（这是闭环的起点）"
+        );
+        assert!(
+            !saw_misleading_length,
+            "绝不能再报出'消息长度 19 亿字节'——那会把根因彻底埋掉"
+        );
+
+        // ③ + ④ + ⑤ 回报层：凭据记失败 + 路由隔离
+        let cred = cli_credential();
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                vec![cred.clone()],
+                None,
+                None,
+                true,
+            )
+            .expect("构建 token manager"),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert(
+            "ide".into(),
+            Arc::new(crate::kiro::endpoint::IdeEndpoint::new()),
+        );
+        endpoints.insert(
+            "cli".into(),
+            Arc::new(crate::kiro::endpoint::CliEndpoint::new()),
+        );
+        endpoints.insert(
+            "codewhisperer".into(),
+            Arc::new(crate::kiro::endpoint::CodeWhispererEndpoint),
+        );
+        let provider =
+            KiroProvider::with_proxy(manager.clone(), None, endpoints, "ide".to_string());
+
+        let id = manager.snapshot().entries[0].id;
+        let before = manager.snapshot().entries[0].failure_count;
+
+        let meta = CallMeta {
+            credential_id: id,
+            model: None,
+            session_id: None,
+            is_streaming: true,
+            retries: 0,
+            latency_ms: 1,
+            endpoint_name: "cli".to_string(),
+            upstream_region: "us-east-1".to_string(),
+            inflight: crate::kiro::scheduling::InflightGuard::acquire(Default::default()),
+        };
+        provider.report_protocol_mismatch(&meta, "上游返回 AWS JSON 1.0 信封");
+
+        let after = manager.snapshot().entries[0].failure_count;
+        assert_eq!(
+            after,
+            before + 1,
+            "协议不符必须记一次失败——旧实现恒为 0，健康分只升不降，\
+             调度器于是无限重选这个必然截断的号（生产实证：845 次，failureCount 始终 0）"
+        );
+        assert!(
+            provider.is_route_protocol_broken("cli", "us-east-1"),
+            "该路由必须进隔离，否则下一个请求还会撞同一面墙"
+        );
+        // 隔离后 cli 凭据拿到逃生通道，不再是死路一条的单元素链。
+        let chain = provider
+            .endpoint_chain_for(&cred, true, "us-east-1")
+            .unwrap();
+        assert!(
+            chain.len() > 1,
+            "隔离后必须有逃生通道，否则每个请求都必然失败"
+        );
+        assert_ne!(chain[0].name(), "cli", "坏路由不应仍占链首");
     }
 }
