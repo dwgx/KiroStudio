@@ -40,8 +40,12 @@ struct ImportItem {
     key: String,
     #[serde(default)]
     region: Option<String>,
+    /// 推送方的分组标签。契约说「固定空数组」，但仍照实接收并回显到面板——
+    /// 【修一个静默 bug】此字段原名 `_groups`，serde 据此匹配 JSON key `"_groups"`，
+    /// 而对方发的是 `"groups"`，配上 `#[serde(default)]` 就永远静默落空数组：
+    /// 对方哪天真的开始发分组，我们会毫无察觉地丢掉。
     #[serde(default)]
-    _groups: Vec<serde_json::Value>,
+    groups: Vec<serde_json::Value>,
     #[serde(default)]
     endpoint: Option<String>,
 }
@@ -77,6 +81,21 @@ struct ImportItemResponse {
     /// 「导出凭据」端点同一防护级别。两者用途不同，故分成两个字段而非复用一个。
     #[serde(skip)]
     plain_key: String,
+    /// Region（探测或重用的结果），供本地面板显示，**不进线上响应**。
+    #[serde(skip)]
+    region: Option<String>,
+    /// Endpoint（归一或重用的结果），供本地面板显示，**不进线上响应**。
+    #[serde(skip)]
+    endpoint: Option<String>,
+    /// 推送方**原样发来**的 region（未发则 None），供面板区分「对方指定」与「我们探测」。
+    #[serde(skip)]
+    sent_region: Option<String>,
+    /// 推送方**原样发来**的 endpoint（未发则 None）。
+    #[serde(skip)]
+    sent_endpoint: Option<String>,
+    /// 推送方发来的 groups（契约约定固定空数组，但如实记录以便发现约定变化）。
+    #[serde(skip)]
+    sent_groups: Vec<String>,
 }
 
 pub fn create_router(token: String, manager: Arc<MultiTokenManager>) -> Router {
@@ -147,6 +166,11 @@ async fn import_keys(
                 duplicate: item.duplicate.unwrap_or(false),
                 credential_id: item.credential_id,
                 error: item.error.clone(),
+                region: item.region.clone(),
+                endpoint: item.endpoint.clone(),
+                sent_region: item.sent_region.clone(),
+                sent_endpoint: item.sent_endpoint.clone(),
+                sent_groups: item.sent_groups.clone(),
             })
             .collect(),
         started.elapsed().as_millis() as u64,
@@ -165,8 +189,26 @@ async fn process_item(state: &ImportState, item: ImportItem) -> ImportItemRespon
     let key = item.key.trim().to_string();
     let masked = mask_key(&key);
     let fingerprint = crate::common::key_mask::key_fingerprint(&key);
+    // 原样留存推送方**发来的**四个字段，与「我们最终落库的值」分开记账。
+    // 只记落库值会丢掉关键信息：无法区分「对方指定了 us-east-1」和「对方没发、我们探测出
+    // us-east-1」——前者是对方的路由决策，后者是我们的推断，排查责任归属时必须分得清。
+    // groups 契约固定为空数组、运行时不参与任何决策，故只留作原样回显（异常值也能被看见）。
+    let sent_region = item.region.clone();
+    let sent_endpoint = item.endpoint.clone();
+    let sent_groups: Vec<String> = item
+        .groups
+        .iter()
+        .map(|g| match g {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+        .collect();
+
     // 闭包持有自己的副本：末尾 upsert 会 move 掉 `key`，若闭包借用它则借用检查不通过。
     let plain_for_fail = key.clone();
+    let sent_region_for_fail = sent_region.clone();
+    let sent_endpoint_for_fail = sent_endpoint.clone();
+    let sent_groups_for_fail = sent_groups.clone();
     let fail = |error: String| ImportItemResponse {
         key: masked.clone(),
         plain_key: plain_for_fail.clone(),
@@ -175,6 +217,11 @@ async fn process_item(state: &ImportState, item: ImportItem) -> ImportItemRespon
         duplicate: None,
         credential_id: None,
         error: Some(error),
+        region: None,
+        endpoint: None,
+        sent_region: sent_region_for_fail.clone(),
+        sent_endpoint: sent_endpoint_for_fail.clone(),
+        sent_groups: sent_groups_for_fail.clone(),
     };
 
     if !key.starts_with("ksk_") || key.len() <= 4 {
@@ -236,6 +283,10 @@ async fn process_item(state: &ImportState, item: ImportItem) -> ImportItemRespon
 
     // upsert 会消费 key，先留一份给面板明细（明文仅存内存，见 ImportItemRecord.key 说明）。
     let plain_key = key.clone();
+    // 面板要显示"这个号最终落到哪个 region/哪条路由"——93 号那次 endpoint=cli 的坑，
+    // 从面板上完全看不出来。endpoint 为 None 时显示为 default（由 config.defaultEndpoint 决定）。
+    let landed_region = region.clone();
+    let landed_endpoint = endpoint.clone();
     match state
         .manager
         .upsert_imported_api_key(key, region, endpoint)
@@ -245,6 +296,11 @@ async fn process_item(state: &ImportState, item: ImportItem) -> ImportItemRespon
             key: masked,
             plain_key,
             fingerprint,
+            region: Some(landed_region),
+            endpoint: landed_endpoint,
+            sent_region,
+            sent_endpoint,
+            sent_groups,
             ok: true,
             duplicate: Some(result.duplicate),
             credential_id: Some(result.id),

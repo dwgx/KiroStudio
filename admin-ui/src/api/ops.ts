@@ -133,7 +133,7 @@ export async function getRecoveryMetrics(): Promise<RecoveryMetrics> {
 // 对方系统按契约往 POST /api/import/keys 推 ksk_ 凭据，这里是该通道的可观测快照。
 // 进程级内存、重启归零；key 已在后端打码，明文密钥绝不出现在响应里。
 export interface ImportItemRecord {
-  /** 打码后的 key（如 ksk_Xwbz...SwBh），不可用于认证 */
+  /** 完整明文 key（面板走 admin 鉴权，与「导出凭据」同级；给推送方的响应仍打码） */
   key: string
   /** key 指纹(SHA-256 前 8 位)。与凭据管理页显示的指纹同源,用于确认是同一个 key。 */
   fingerprint: string
@@ -141,6 +141,16 @@ export interface ImportItemRecord {
   duplicate: boolean
   credentialId?: number
   error?: string
+  /** 最终落库的 region（显式指定或探测所得） */
+  region?: string
+  /** 最终落库的 endpoint；缺省表示跟随 config.defaultEndpoint */
+  endpoint?: string
+  /** 推送方**发来的** region 原值；缺省 = 对方未提供（此时 region 为我们探测所得） */
+  sentRegion?: string
+  /** 推送方**发来的** endpoint 原值；缺省 = 对方未提供 */
+  sentEndpoint?: string
+  /** 推送方**发来的** groups 原值（契约固定空数组，非空即异常，需要能被看见） */
+  sentGroups: string[]
 }
 
 export interface ImportRecord {
