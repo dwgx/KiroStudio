@@ -29,6 +29,14 @@ pub enum ParseError {
     TooManyErrors { count: usize, last_error: String },
     /// 缓冲区溢出
     BufferOverflow { size: usize, max: usize },
+    /// 响应根本不是 AWS Event Stream（上游降级成 JSON/文本协议）
+    ///
+    /// 与 [`Self::MessageTooLarge`] 的区别是**语义**而非程度：后者意味着"是帧但太大"，
+    /// 会触发逐字节 resync；本错误意味着"这段字节流不是帧"，resync 永远不会成功，
+    /// 必须立刻上抛让上层换端点/换号，而不是把 JSON 文本当帧头啃出"19 亿字节"的误导报错。
+    ///
+    /// 判据见 [`super::frame::looks_like_frame_start`]（充分判据，非启发式）。
+    NotEventStream { head: String },
 }
 
 impl std::error::Error for ParseError {}
@@ -73,6 +81,13 @@ impl fmt::Display for ParseError {
             }
             Self::BufferOverflow { size, max } => {
                 write!(f, "缓冲区溢出: {} 字节 (最大 {})", size, max)
+            }
+            Self::NotEventStream { head } => {
+                write!(
+                    f,
+                    "上游响应不是 AWS Event Stream（疑似降级为 JSON/文本协议）: {}",
+                    head
+                )
             }
         }
     }
