@@ -21,14 +21,14 @@ Portal 用户查看凭据明文需消耗积分。**每把 key 独立结算**：�
 unit_price(N) = max(min_price, min(default_price, ceil(total_price / N)))
 ```
 
-- `N` = 该 key 的 distinct 解锁人数
+- `N` = 该 key 的 distinct 解锁人数，**上限 `max_unlockers` = 10**
 - `default_price` = 10（单人价，同时是价格上限）
-- `total_price` = 20（定价基数，见下方「两个必须知道的后果」）
-- `min_price` = 1（下限）
+- `total_price` = 20（定价基数，见下方「一个必须知道的后果」）
+- `min_price` = 1（下限，在默认参数下永不触发，见下）
 
-三个参数各自可配，可组合成 10/50/1 之类的任意取值。
+四个参数各自可配。
 
-代入验证（默认参数，已用脚本跑过）：
+代入验证（默认参数，已用脚本逐行跑过）：
 
 | N | ceil(20/N) | 单价 | 说明 |
 |---|---|---|---|
@@ -36,25 +36,40 @@ unit_price(N) = max(min_price, min(default_price, ceil(total_price / N)))
 | 2 | 10 | **10** | 恰好相等，无退款 |
 | 3 | 7 | **7** | 20/3=6.67 上取整 |
 | 4 | 5 | **5** | |
-| 10 | 2 | **2** | |
-| 20 | 1 | **1** | 触底 |
-| 50 | 1 | **1** | 保持触底 |
+| 5 | 4 | **4** | |
+| 6 | 4 | **4** | |
+| 7 | 3 | **3** | |
+| 8 | 3 | **3** | |
+| 9 | 3 | **3** | |
+| 10 | 2 | **2** | 满员，最低价 |
 
-### 两个必须知道的后果
+价格区间锁定 **2~10 分**。
 
-这两条不是缺陷，是所选规则（ceil + 下限）的算术必然。写在这里以免日后被当成 bug。
+### 人数上限 = 10
 
-**一、取整让总收入超过 total_price。** N=9 时每人 3 分，九人共 27 分，比 20 多 7 分：
+第 11 个人解锁被拒，返回「该凭据查看人数已满（10/10）」，不扣分。
+
+这个上限有三个作用：
+
+1. **把总收入偏差限在有界范围内**（见下方后果）。没有上限时，1 分下限一生效，总收入会随人数无限线性增长。
+2. **`min_price` 因此成为死参数**。默认参数下 N 最大为 10，`ceil(20/10)=2` 永远大于 1，下限触发不了。保留这个配置项是为了「改大 total_price 或改小 max_unlockers 时仍有兜底」，但默认部署下它不生效——**不要依赖它来控制最低价**。
+3. **让「谁在用这把 key」是个有限集合**。10 个人共享一把凭据已经是滥用风险的上限，再多则这把 key 的行为特征会杂乱到无法归因。
+
+### 一个必须知道的后果
+
+**取整让总收入超过 total_price，但有界。** N=9 时每人 3 分，九人共 27 分，比 20 多 7 分：
 
 | N | 单价 | 总收入 | 相对 20 的偏差 |
 |---|---|---|---|
+| 2 | 10 | 20 | 0 |
 | 3 | 7 | 21 | +1 |
 | 6 | 4 | 24 | +4 |
-| 9 | 3 | 27 | +7 |
+| 9 | 3 | 27 | **+7（最坏）** |
+| 10 | 2 | 20 | 0 |
 
-因此 `total_price` 的准确含义是**定价基数**，不是「系统对这把 key 只收 20 分」。若要求总收入严格等于 20，就必须让不同用户付不同价（有人 6 有人 7），那会破坏「人数相同则价格相同」的可解释性——不采用。
+因此 `total_price` 的准确含义是**定价基数**，不是「系统对这把 key 只收 20 分」。
 
-**二、N ≥ 20 后「均摊固定盘子」的说法失效。** 下限 1 分一生效，总收入随人数线性增长：50 人 = 50 分。这是下限带来的正常行为。
+若要求总收入严格等于 20，就必须让不同用户付不同价（有人 6 有人 7），那会破坏「人数相同则价格相同」的可解释性，也让退款算不清。不采用。偏差有界（最坏 +7）且可解释，接受。
 
 ### 已付/应付差额模型
 
@@ -159,25 +174,31 @@ src/portal/
 ```
 BEGIN IMMEDIATE
   1. 已解锁？ → 直接返回明文（幂等，不扣分，不写流水）
-  2. N_new = distinct_unlockers(cred) + 1
-  3. price  = unit_price(N_new)
-  4. 余额 < price？ → ROLLBACK，402 + 差额提示
-  5. 扣 price；写 unlocks(paid=price)；写 ledger(unlock)
-  6. 该 key 的其余 (N_new − 1) 人：
+  2. N_cur = distinct_unlockers(cred)
+  3. N_cur >= max_unlockers？ → ROLLBACK，409 + 「已满 (10/10)」
+  4. N_new = N_cur + 1
+  5. price = unit_price(N_new)
+  6. 余额 < price？ → ROLLBACK，402 + 差额提示
+  7. 扣 price；写 unlocks(paid=price)；写 ledger(unlock)
+  8. 该 key 的其余 (N_new − 1) 人：
        refund = paid − price
        refund > 0 → 加余额；paid = price；写 ledger(refund)
 COMMIT
 → 返回明文
 ```
 
-必须在一个事务内。两人同时点解锁时，若无 `BEGIN IMMEDIATE`，二者可能都读到 `N=2` 而各按 10 分扣，正确结果应是都按 7 分（N=3）。用 IMMEDIATE 提前拿写锁，避免读锁升级失败。
+**满员检查必须在事务内、在扣费之前。** 放到事务外就是一个 TOCTOU 竞态：10 人已满时两人同时点解锁，都读到 `N_cur=10` 之前的旧值而通过检查，最终变成 12 人。放在扣费之后则更糟——钱扣了才发现满员，得靠回滚兜住，多一条容易出错的路径。
+
+同理，整个流程必须在一个事务内。两人同时点解锁时若无 `BEGIN IMMEDIATE`，二者可能都读到 `N=2` 而各按 10 分扣，正确结果应是都按 7 分（N=3）。用 IMMEDIATE 提前拿写锁，避免读锁升级失败。
 
 ## 接口
 
 ### 用户侧
 
-- `POST /portal/api/unlock/{credential_id}` → `{ok, price, balance, key}`；余额不足返回 402 + `{needed, balance}`
-- `GET /portal/api/keys` → 每行新增 `unlocked`(bool)、`unlockPrice`(当前单价)、`unlockCount`(N，即上车人数)；**未解锁时 `key` 字段不下发**
+- `POST /portal/api/unlock/{credential_id}` → `{ok, price, balance, key}`
+  - 余额不足 → **402** + `{needed, balance}`
+  - 名额已满 → **409** + `{unlockCount, maxUnlockers}`（用 409 冲突而非 403：这是「状态冲突，换个 key 或等人退出」，不是「你没权限」）
+- `GET /portal/api/keys` → 每行新增 `unlocked`(bool)、`unlockPrice`(当前单价)、`unlockCount`(N，已上车人数)、`maxUnlockers`(上限)、`full`(bool，N 是否已达上限)；**未解锁时 `key` 字段不下发**
 - `GET /portal/api/wallet` → `{balance, topup, spent, ledger[]}`
 
 关键：未解锁的明文**不进响应体**。不是前端隐藏——那等于已经把明文发给了浏览器，F12 就能看到，门槛形同虚设。
@@ -195,24 +216,31 @@ COMMIT
   "portalCreditsEnabled": false,   // 默认关：不开就是现在的白给行为，升级不改变现状
   "portalKeyDefaultPrice": 10,     // 单人价 / 价格上限
   "portalKeyTotalPrice": 20,       // 定价基数
-  "portalKeyMinPrice": 1           // 下限
+  "portalKeyMaxUnlockers": 10,     // 每把 key 最多几人解锁（满员后拒绝）
+  "portalKeyMinPrice": 1           // 下限；默认参数下永不触发，见下
 }
 ```
 
 默认关闭的理由与 `portalEnabled` 一致：升级版本不该让已有部署突然开始收费、把现有用户挡在门外。
 
+**`portalKeyMinPrice` 在默认参数下是死参数。** 上限 10 人时最低单价是 `ceil(20/10)=2`，永远碰不到下限 1。保留它只为「把上限调大到 20+ 或把基数调小」这类改配置的场景兜底——那时它才开始起作用。不删除，但也不要指望它在默认配置下有任何效果。
+
 ## 测试
 
 `credits.rs` 纯函数：
-- N=1..100 全覆盖：单调不增、恒 ≥ min_price、恒 ≤ default_price
-- 差额模型：模拟 1→50 人陆续上车，断言**任何时刻**每人净支出 == `unit_price(N)`
-- 参数边界：`total < default`、`min > total`、三者为 0
+- N=1..max 全覆盖：单调不增、恒 ≥ min_price、恒 ≤ default_price
+- **默认参数下价格区间锁定 2~10 分**（N=10 时 ceil(20/10)=2 为最低）
+- 差额模型：模拟 1→10 人陆续上车，断言**任何时刻**每人净支出 == `unit_price(N)`（已用脚本预演，10 步零异常）
+- 满员判定：`N == max` 时新用户被拒，已解锁者不受影响
+- 参数边界：`total < default`、`min > total`、`max = 1`、三者为 0
 - 整数运算：ceil 用整数实现而非浮点（避免 20/3 的浮点表示误差）
 
 store 层事务：
 - 幂等：同一 (user, cred) 解锁两次 → 只扣一次、只一条 ledger
 - 余额不足：拒绝后 balances 与 unlocks **均无变化**（回滚彻底）
+- 满员：第 11 人被拒后，前 10 人的 paid 与余额均无变化
 - 并发：两线程同抢一把 key → 最终 N=2、各付 10、总扣 20
+- 并发满员：10 人已满时两线程同抢 → 都被拒，**不会出现 N=11**
 - 级联：删用户后 balances/unlocks 清空，ledger 保留
 
 http 层：
