@@ -4121,9 +4121,10 @@ impl MultiTokenManager {
         loop {
             if attempt_count >= max_attempts {
                 anyhow::bail!(
-                    "所有凭据均无法获取有效 Token（可用: {}/{}）",
+                    "所有凭据均无法获取有效 Token（可用: {}/{}）retry_after_secs={}",
                     self.available_count(),
-                    total
+                    total,
+                    POOL_EXHAUSTED_RETRY_AFTER_SECS
                 );
             }
 
@@ -15012,6 +15013,29 @@ mod tests {
              修法二选一：① 在 restore 块加 `new.X = old.X`（若有请求路径活读）\
              ② 加进本测试的 EXEMPT 并写明为什么无需 restore（须核实确无活读）。",
             missing.join("\n  ")
+        );
+    }
+
+    /// 源码级守卫：`所有凭据均无法获取有效 Token` 这条 bail 必须带 `retry_after_secs=`。
+    ///
+    /// 否则该串匹配不上 `map_provider_error` 的任何分支（无标记、无上游关键词）→ 落 502 无
+    /// Retry-After，客户端（Claude Code）把 502 当「服务端故障」、退避逻辑不启动、原样重发 ——
+    /// 与「所有凭据均已禁用」落 502 是同一类缺陷（见 acquire_context 内 NoCandidate 那两处注释）。
+    #[test]
+    fn bail_all_credentials_token_failure_carries_retry_after_marker() {
+        let src = include_str!("token_manager.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        // needle 运行时拼接：include_str! 会把测试自己的字面量也读进来（本仓库踩过三次）。
+        let needle = format!(
+            "所有凭据均无法获取有效 Token（可用: {{}}/{{}}）retry_after_secs={}",
+            "{}"
+        );
+        assert!(
+            prod.contains(&needle),
+            "`所有凭据均无法获取有效 Token` bail 必须带 retry_after_secs= 标记，\
+             否则 map_provider_error 匹配不上任何分支 → 502 无 Retry-After，\
+             客户端把 502 当服务端故障、不退避直接重发"
         );
     }
 

@@ -181,6 +181,12 @@ impl SocialLoginManager {
             None => return PollResult::Error("登录会话不存在或已过期".to_string()),
         };
 
+        // 超过 TTL 视为过期并回收会话（释放本地回调端口），对齐 idc_login 的 poll 行为。
+        if session.created_at.elapsed().as_secs() > SESSION_TTL_SECS {
+            self.sessions.lock().remove(session_id);
+            return PollResult::Error("登录会话已过期，请重新发起登录".to_string());
+        }
+
         // 尝试非阻塞读取回调
         let callback = {
             let mut guard = session.callback_rx.lock();
@@ -273,6 +279,7 @@ impl SocialLoginManager {
             tested_models: None,
             base_url: None,
             api_key: None,
+            deepseek_normalize: None,
             request_limit: None,
             // Social 上号产出的是 Kiro 号（非 custom_api 代挂号），该开关对它无意义 → 跟随全局。
             custom_api_first: None,

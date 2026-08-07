@@ -132,6 +132,16 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
 
+    /// 是否对该 custom_api 透传做 **deepseek 归一化**（opencodezen 代挂专用）。
+    ///
+    /// `Some(true)` 时，透传前把请求体按 fuckopencode 的 deepseek 协议修复逻辑改写：
+    /// `thinking: adaptive→enabled`、删 `budget_tokens`、`reasoning_effort→output_config.effort`、
+    /// 剥 `context_management` 等 deepseek 不认的字段。`None`/`Some(false)`（默认）原样透传。
+    /// 只在 auth_method=custom_api 且上游是 opencodezen 类 deepseek 网关时置 true。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deepseek_normalize: Option<bool>,
+
     /// 请求上限：累计请求数达到后自动禁用该凭据（None/0=不限）。通用字段,自定义API主用。
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1454,6 +1464,7 @@ mod tests {
             api_key: None,
             request_limit: None,
             custom_api_first: None,
+            deepseek_normalize: None,
             region: None,
             auth_region: None,
             api_region: None,
@@ -1589,6 +1600,7 @@ mod tests {
             api_key: None,
             request_limit: None,
             custom_api_first: None,
+            deepseek_normalize: None,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
             api_region: None,
@@ -1637,6 +1649,7 @@ mod tests {
             api_key: None,
             request_limit: None,
             custom_api_first: None,
+            deepseek_normalize: None,
             region: None,
             auth_region: None,
             api_region: None,
@@ -1770,6 +1783,7 @@ mod tests {
             api_key: None,
             request_limit: None,
             custom_api_first: None,
+            deepseek_normalize: None,
             region: Some("us-west-2".to_string()),
             auth_region: None,
             api_region: None,

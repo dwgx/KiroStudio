@@ -323,6 +323,27 @@ pub static CATALOG: &[ModelSpec] = &[
         supports_1m: false,
         advertised: true,
     },
+    // deepseek-v4-flash —— opencodezen 代挂（custom_api 透传）。
+    // 链路: KiroStudio 识别到 opencodezen 凭据(deepseekNormalize=true)后,透传前先按
+    // `kiro::deepseek_normalize`(fuckopencode 的 deepseek 协议修复逻辑)改写请求体,再转发
+    // opencodezen(真实上游 https://opencode.ai/zen/go,只认 deepseek-v4-flash,1M ctx,免费)。
+    // custom_api 透传不经过 Kiro 号池计费,credit_mult 置 0。
+    // 使用: admin 新增 custom_api 凭据,base_url 填 opencodezen 端点,api_key 填网关 key,
+    //       勾选 deepseekNormalize,模型选 deepseek-v4-flash。
+    ModelSpec {
+        kiro_id: "deepseek-v4-flash",
+        family: Family::DeepSeek,
+        version: None,
+        aliases: &["deepseek-v4-flash", "deepseek-v4", "deepseek-flash"],
+        owned_by: "deepseek",
+        display_name: "DeepSeek V4 Flash",
+        context_window: 1_000_000,
+        max_output: 64_000,
+        credit_mult: 0.0,
+        supports_thinking: true,
+        supports_1m: false,
+        advertised: true,
+    },
     ModelSpec {
         kiro_id: "glm-5",
         family: Family::Glm,
@@ -977,6 +998,8 @@ mod tests {
     fn test_official_context_windows() {
         // 窗口对齐官方表:DeepSeek 128K、Qwen 256K、Sonnet 5 1M。
         assert_eq!(context_window("deepseek-3.2"), 128_000);
+        // opencodezen 代挂的 deepseek-v4-flash 为 1M ctx。
+        assert_eq!(context_window("deepseek-v4-flash"), 1_000_000);
         assert_eq!(context_window("qwen3-coder-next"), 256_000);
         assert_eq!(context_window("claude-sonnet-5"), 1_000_000);
         assert_eq!(context_window("claude-sonnet-4.0"), 200_000);
@@ -996,6 +1019,9 @@ mod tests {
         assert_eq!(kid("qwen"), Some("qwen3-coder-next"));
         assert_eq!(kid("glm"), Some("glm-5"));
         assert_eq!(kid("deepseek"), Some("deepseek-3.2"));
+        // deepseek-v4-flash(opencodezen 代挂)精确名与别名都命中,不抢 deepseek-3.2 的短名。
+        assert_eq!(kid("deepseek-v4-flash"), Some("deepseek-v4-flash"));
+        assert_eq!(kid("deepseek-v4"), Some("deepseek-v4-flash"));
         assert_eq!(kid("minimax-m2.1"), Some("minimax-m2.1"));
         assert_eq!(kid("minimax"), Some("minimax-m2.5")); // 无版本回退最新
     }

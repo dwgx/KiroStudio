@@ -359,7 +359,12 @@ impl TraceDb {
     /// `keep_days <= 0` 时删除全部记录（无有效保留窗口）。
     pub fn retention_cleanup(&self, keep_days: i64) -> Result<usize> {
         // 保留窗口起点（Unix 毫秒）：早于此时间戳的记录被清理
-        let cutoff_ms = chrono::Utc::now().timestamp_millis() - keep_days * 86_400_000;
+        // ⚠️ 用 saturating_mul：keep_days 来自 admin API（older_than_days），
+        // 传 i64::MAX 时 `keep_days * 86_400_000` 在 release 下回绕成负数
+        // → cutoff 落到未来 → 一次清理把全部明细静默删光。饱和后 cutoff 落在
+        // 极遥远的过去 → 什么都不删（超大保留期=全保留，语义正确）。
+        let cutoff_ms = chrono::Utc::now().timestamp_millis()
+            - keep_days.saturating_mul(86_400_000);
         let conn = self.conn.lock();
         let deleted = conn
             .execute("DELETE FROM traces WHERE ts_ms < ?1", params![cutoff_ms])
@@ -596,6 +601,22 @@ mod tests {
         let got = db.recent(10).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].request_id, "fresh");
+    }
+
+    #[test]
+    fn test_retention_cleanup_huge_keep_days_does_not_wipe() {
+        // 回归：keep_days 来自 admin API（older_than_days），传 i64::MAX 时
+        // `keep_days * 86_400_000` 在 release 下溢出回绕成负数 → cutoff 落到未来
+        // → 一次清理把全部明细静默删光。saturating_mul 后 cutoff 落在极遥远的过去
+        // → 什么都不删（超大保留期 = 全保留）。旧代码在 debug 下直接 panic。
+        let tmp = TempDbPath::new("retention_huge");
+        let db = TraceDb::open(tmp.path()).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        db.on_record(&sample_record("keep", now));
+        let deleted = db.retention_cleanup(i64::MAX).unwrap();
+        assert_eq!(deleted, 0, "超大 keep_days 不得把全部明细删光");
+        let got = db.recent(10).unwrap();
+        assert_eq!(got.len(), 1, "明细应完整保留");
     }
 
     #[test]

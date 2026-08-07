@@ -495,6 +495,9 @@ const WRITE_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the content to writ
 /// 追加到 Edit 工具 description 末尾的内容
 const EDIT_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the `new_string` content exceeds 50 lines, you MUST split it into multiple Edit calls, each replacing no more than 50 lines at a time. If used to append content, leave a unique placeholder to help append content. On the final chunk, do NOT include the placeholder.";
 
+/// 追加到 Bash 工具 description 末尾的内容（对齐 kiro 生态：防大命令触发上游参数截断）。
+const BASH_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: Do not send very large commands, inline scripts, or heredocs through Bash. If a command would exceed 100 lines, 8,000 characters, or roughly 4,000 tokens, create or modify a script/file with chunked Write/Edit calls first, then run a short Bash command that executes it. If a Bash attempt fails due to argument size or truncation, do not retry the same large command; split it smaller.";
+
 /// 追加到系统提示词的分块写入策略
 const SYSTEM_CHUNKED_POLICY: &str = "\
 When the Write or Edit tool has content size limits, always comply silently. \
@@ -743,6 +746,11 @@ pub struct ConversionResult {
 pub enum ConversionError {
     UnsupportedModel(String),
     EmptyMessages,
+    /// Claude Code 工具参数无法映射到 Kiro 上游（如 `Read.pages` 无对应 Kiro 参数）。
+    ///
+    /// 由 [`map_tool_input_to_kiro`] 返回，convert_request 侧把它转成客户端可读的 400，
+    /// 而不是把无效参数透传给上游（那会得到更含糊的上游 400）。
+    UnsupportedToolMapping { tool_name: String, reason: String },
 }
 
 impl std::fmt::Display for ConversionError {
@@ -750,6 +758,9 @@ impl std::fmt::Display for ConversionError {
         match self {
             ConversionError::UnsupportedModel(model) => write!(f, "模型不支持: {}", model),
             ConversionError::EmptyMessages => write!(f, "消息列表为空"),
+            ConversionError::UnsupportedToolMapping { tool_name, reason } => {
+                write!(f, "工具参数无法映射: {tool_name} — {reason}")
+            }
         }
     }
 }
@@ -1295,6 +1306,21 @@ fn extract_kiro_image(
     dedup: &mut Option<&mut std::collections::HashSet<String>>,
     images: &mut Vec<KiroImage>,
 ) -> Option<String> {
+    // 单图 base64 大小上限（防御）：AWS Q / Kiro 上游有 per-field 大小硬限制，超大图
+    // （如 4K 截图转 base64 常超 1MiB）可能触发 CONTENT_LENGTH_EXCEEDS_THRESHOLD 400。
+    // 8MiB 是远超大图的阈值，正常图片永不触发；超限省略 + 占位符（不 fail 请求，
+    // 与 MAX_TOTAL_IMAGES 同风格）。完整 resize（GreyGunG image_resize）需 image crate +
+    // 热路径 CPU，线上 72h 0 次大图 400，暂不引入，保留本上限作零成本防线。
+    const MAX_SINGLE_IMAGE_BASE64_BYTES: usize = 8 * 1024 * 1024;
+    if source.data.len() > MAX_SINGLE_IMAGE_BASE64_BYTES {
+        tracing::warn!(
+            bytes = source.data.len(),
+            "单图 base64 超过 {} 字节，省略该图（防上游 per-field 大小限制）",
+            MAX_SINGLE_IMAGE_BASE64_BYTES
+        );
+        return Some("[image omitted: exceeds single-image size limit]".to_string());
+    }
+
     // 格式以 magic bytes 为准、声明值兜底；都定不出时无声跳过（与旧行为一致，不补占位符）
     let format = resolve_image_format(source)?;
 
@@ -1480,6 +1506,405 @@ fn remove_orphaned_tool_uses(
 /// Kiro API 工具名称最大长度限制（字节）
 const TOOL_NAME_MAX_LEN: usize = 63;
 /// 生成确定性短名称：截断前缀 + "_" + 8 位 SHA256 hex
+// ============ Claude Code ↔ Kiro 工具名/参数双向映射（对齐生态 kiro.rs） ============
+// 开关：默认开启（KiroStudio 的目标客户端是 Claude Code，8 个内置工具映射成 Kiro 原生名后
+// 与上游协议匹配）。若接入非 Claude Code 客户端且恰好使用同名自定义工具，可经
+// set_tool_compat_mapping(false) 关闭回退为透传（main.rs 可从 config/env 接入）。
+static TOOL_COMPAT_MAPPING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+pub(crate) fn set_tool_compat_mapping(enabled: bool) {
+    TOOL_COMPAT_MAPPING.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn tool_compat_mapping_enabled() -> bool {
+    TOOL_COMPAT_MAPPING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+// 背景：Claude Code 的 8 个内置工具（Write/Edit/Bash/Read/Glob/Grep/LS/WebSearch）与 Kiro
+// 上游的原生工具名不同（fs_write/str_replace/execute_bash/read_file/...），参数也不同
+// （file_path→path、content→text、old_string→oldStr、new_string→newStr、offset/limit→start_line/end_line）。
+// 本层在入站时把 Claude Code 工具名+参数映射成 Kiro 原生格式，出站时还原回 Claude Code 格式，
+// 根治 `Invalid tool parameters`（Claude Code 发 file_path 而上游只认 path 那类参数错配）。
+
+fn optional_number(value: &serde_json::Value) -> Option<i64> {
+    value.as_i64().or_else(|| value.as_u64().map(|v| v as i64))
+}
+
+fn take_first(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<serde_json::Value> {
+    keys.iter().find_map(|key| obj.get(*key).cloned())
+}
+
+fn maybe_insert(
+    out: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: Option<serde_json::Value>,
+) {
+    if let Some(value) = value {
+        if !value.is_null() {
+            out.insert(key.to_string(), value);
+        }
+    }
+}
+
+fn default_explanation(tool_name: &str) -> serde_json::Value {
+    serde_json::Value::String(format!("Mapped from Claude Code {} tool.", tool_name))
+}
+
+/// Claude Code 内置工具名 → Kiro 原生工具名（8 个固定映射）。
+/// 不在表内的工具（MCP/自定义）原样透传，不做映射。
+fn claude_code_tool_name_to_kiro(name: &str) -> Option<&'static str> {
+    match name {
+        "Write" => Some("fs_write"),
+        "Edit" => Some("str_replace"),
+        "Bash" => Some("execute_bash"),
+        "Read" => Some("read_file"),
+        "Glob" => Some("file_search"),
+        "Grep" => Some("grep_search"),
+        "LS" => Some("list_directory"),
+        "WebSearch" => Some("web_search"),
+        _ => None,
+    }
+}
+
+/// 客户端工具名 → Kiro 工具名：命中映射表用 Kiro 名并记录反向映射（Kiro名→客户端名）；
+/// 否则走 [`map_tool_name`]（超长缩短）。返回 Kiro 名。
+fn map_client_tool_name_to_kiro(
+    name: &str,
+    tool_name_map: &mut HashMap<String, String>,
+) -> String {
+    if let Some(kiro_name) = claude_code_tool_name_to_kiro(name) {
+        tool_name_map
+            .entry(kiro_name.to_string())
+            .or_insert_with(|| name.to_string());
+        return kiro_name.to_string();
+    }
+    map_tool_name(name, tool_name_map)
+}
+
+/// 入站参数转换：Claude Code 工具参数 → Kiro 原生参数。非内置工具或非对象输入原样返回。
+fn map_tool_input_to_kiro(
+    client_name: &str,
+    input: serde_json::Value,
+) -> Result<serde_json::Value, ConversionError> {
+    let Some(kiro_name) = claude_code_tool_name_to_kiro(client_name) else {
+        return Ok(input);
+    };
+    let serde_json::Value::Object(obj) = input else {
+        return Ok(input);
+    };
+
+    let mut out = serde_json::Map::new();
+    match (client_name, kiro_name) {
+        ("Write", "fs_write") => {
+            maybe_insert(&mut out, "path", take_first(&obj, &["file_path", "path"]));
+            maybe_insert(&mut out, "text", take_first(&obj, &["content", "text"]));
+        }
+        ("Edit", "str_replace") => {
+            maybe_insert(&mut out, "path", take_first(&obj, &["file_path", "path"]));
+            maybe_insert(&mut out, "oldStr", take_first(&obj, &["old_string", "oldStr"]));
+            maybe_insert(&mut out, "newStr", take_first(&obj, &["new_string", "newStr"]));
+        }
+        ("Bash", "execute_bash") => {
+            maybe_insert(&mut out, "command", take_first(&obj, &["command"]));
+            maybe_insert(&mut out, "timeout", take_first(&obj, &["timeout"]));
+        }
+        ("Read", "read_file") => {
+            // Kiro read_file 没有 Claude Code Read.pages 的等价参数：直接报错而非透传无效参数。
+            if obj.contains_key("pages") && !obj.get("pages").is_some_and(|v| v.is_null()) {
+                return Err(ConversionError::UnsupportedToolMapping {
+                    tool_name: client_name.to_string(),
+                    reason: "Claude Code Read.pages has no Kiro read_file equivalent".to_string(),
+                });
+            }
+            maybe_insert(&mut out, "path", take_first(&obj, &["file_path", "path"]));
+            let offset = obj.get("offset").and_then(optional_number);
+            let limit = obj.get("limit").and_then(optional_number);
+            if let Some(start) = offset {
+                out.insert("start_line".to_string(), serde_json::json!(start));
+            }
+            if let Some(limit) = limit {
+                let end = offset.map(|start| start + limit - 1).unwrap_or(limit);
+                out.insert("end_line".to_string(), serde_json::json!(end));
+            }
+            maybe_insert(&mut out, "explanation", take_first(&obj, &["explanation"]));
+            out.entry("explanation".to_string())
+                .or_insert_with(|| default_explanation(client_name));
+        }
+        ("Glob", "file_search") => {
+            maybe_insert(&mut out, "query", take_first(&obj, &["pattern", "query"]));
+            maybe_insert(
+                &mut out,
+                "excludePattern",
+                take_first(&obj, &["excludePattern", "exclude"]),
+            );
+            if let Some(v) = take_first(&obj, &["includeIgnoredFiles", "include_ignored"]) {
+                let mapped = match v {
+                    serde_json::Value::Bool(true) => serde_json::json!("yes"),
+                    serde_json::Value::Bool(false) => serde_json::json!("no"),
+                    other => other,
+                };
+                out.insert("includeIgnoredFiles".to_string(), mapped);
+            }
+            maybe_insert(&mut out, "explanation", take_first(&obj, &["explanation"]));
+            out.entry("explanation".to_string())
+                .or_insert_with(|| default_explanation(client_name));
+        }
+        ("Grep", "grep_search") => {
+            maybe_insert(&mut out, "query", take_first(&obj, &["pattern", "query"]));
+            maybe_insert(
+                &mut out,
+                "includePattern",
+                take_first(&obj, &["glob", "includePattern"]),
+            );
+            maybe_insert(
+                &mut out,
+                "excludePattern",
+                take_first(&obj, &["excludePattern", "exclude"]),
+            );
+            maybe_insert(
+                &mut out,
+                "caseSensitive",
+                take_first(&obj, &["caseSensitive", "case_sensitive"]),
+            );
+            maybe_insert(&mut out, "explanation", take_first(&obj, &["explanation"]));
+        }
+        ("LS", "list_directory") => {
+            maybe_insert(&mut out, "path", take_first(&obj, &["path"]));
+            maybe_insert(&mut out, "depth", take_first(&obj, &["depth"]));
+            maybe_insert(&mut out, "explanation", take_first(&obj, &["explanation"]));
+            out.entry("explanation".to_string())
+                .or_insert_with(|| default_explanation(client_name));
+        }
+        ("WebSearch", "web_search") => {
+            maybe_insert(&mut out, "query", take_first(&obj, &["query"]));
+        }
+        _ => return Ok(serde_json::Value::Object(obj)),
+    }
+
+    Ok(serde_json::Value::Object(out))
+}
+
+/// 出站参数还原：Kiro 原生参数 → Claude Code 工具参数。非内置工具原样返回。
+///
+/// `pub(crate)`：stream.rs / handlers.rs 在 tool_use 下发前用它把 Kiro 参数（path/oldStr/start_line…）
+/// 还原成 Claude Code 参数（file_path/old_string/offset…），保证客户端看到的工具调用与它发出的
+/// 参数形态一致（否则多轮 tool_result 上下文与当前轮 schema 错配）。
+pub(crate) fn map_tool_input_from_kiro(client_name: &str, input: serde_json::Value) -> serde_json::Value {
+    if claude_code_tool_name_to_kiro(client_name).is_none() {
+        return input;
+    }
+    let serde_json::Value::Object(obj) = input else {
+        return input;
+    };
+    // ⚠️ 从 obj 克隆而非空对象重建：旧实现把内置工具输入里所有未映射键静默丢弃
+    // （Write 带额外字段 → 还原后只剩 file_path/content，其余消失），既丢真实数据，
+    // 也破坏「tool input 原样透传」的既有契约（stream.rs 的 test_tool_input_not_stripped_by_dsml_*
+    // 靠它钉住）。改为保留未映射键、只重命名已知键。
+    let mut out = obj.clone();
+    match client_name {
+        "Write" => {
+            remap_tool_keys(&mut out, &["path", "file_path"], "file_path");
+            remap_tool_keys(&mut out, &["text", "content"], "content");
+        }
+        "Edit" => {
+            remap_tool_keys(&mut out, &["path", "file_path"], "file_path");
+            remap_tool_keys(&mut out, &["oldStr", "old_string"], "old_string");
+            remap_tool_keys(&mut out, &["newStr", "new_string"], "new_string");
+        }
+        "Bash" => {
+            remap_tool_keys(&mut out, &["command"], "command");
+            remap_tool_keys(&mut out, &["timeout"], "timeout");
+        }
+        "Read" => {
+            remap_tool_keys(&mut out, &["path", "file_path"], "file_path");
+            let start = obj.get("start_line").and_then(optional_number);
+            let end = obj.get("end_line").and_then(optional_number);
+            out.remove("start_line");
+            out.remove("end_line");
+            if let Some(start) = start {
+                out.insert("offset".to_string(), serde_json::json!(start));
+            }
+            if let Some(end) = end {
+                let limit = start.map(|s| end - s + 1).unwrap_or(end);
+                if limit > 0 {
+                    out.insert("limit".to_string(), serde_json::json!(limit));
+                }
+            }
+        }
+        "Glob" => {
+            remap_tool_keys(&mut out, &["query", "pattern"], "pattern");
+        }
+        "Grep" => {
+            remap_tool_keys(&mut out, &["query", "pattern"], "pattern");
+            remap_tool_keys(&mut out, &["includePattern", "glob"], "glob");
+            remap_tool_keys(
+                &mut out,
+                &["caseSensitive", "case_sensitive"],
+                "case_sensitive",
+            );
+        }
+        "LS" => {
+            remap_tool_keys(&mut out, &["path"], "path");
+        }
+        "WebSearch" => {
+            remap_tool_keys(&mut out, &["query"], "query");
+        }
+        _ => return serde_json::Value::Object(obj),
+    }
+    serde_json::Value::Object(out)
+}
+
+/// 出站还原辅助：把 `out` 里第一个命中的候选键移除并改插到目标键下，其余键原样保留。
+/// 未命中任何候选键时 no-op（保留原键，不产生新键）。
+fn remap_tool_keys(
+    out: &mut serde_json::Map<String, serde_json::Value>,
+    candidates: &[&str],
+    target: &str,
+) {
+    let value = candidates.iter().find_map(|k| out.remove(*k));
+    if let Some(v) = value {
+        if !v.is_null() {
+            out.insert(target.to_string(), v);
+        }
+    }
+}
+
+/// 出站工具名 + 参数还原：Kiro 名 → Claude Code 名（查 tool_name_map），参数同步还原。
+pub fn restore_tool_use_for_client(
+    kiro_name: &str,
+    input: serde_json::Value,
+    tool_name_map: &HashMap<String, String>,
+) -> (String, serde_json::Value) {
+    let client_name = tool_name_map
+        .get(kiro_name)
+        .cloned()
+        .unwrap_or_else(|| kiro_name.to_string());
+    let client_input = map_tool_input_from_kiro(&client_name, input);
+    (client_name, client_input)
+}
+
+/// 可选字段 schema：Kiro 的 read_file/file_search 等要求可选参数用 anyOf[type, null]。
+fn optional_schema(schema: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "anyOf": [schema, {"type": "null"}] })
+}
+
+/// Kiro 内置工具的描述：命中内置名用固定描述（拼接大文件分块提示），否则回退调用方描述。
+fn kiro_builtin_tool_description(name: &str, fallback: &str) -> String {
+    match name {
+        "fs_write" => format!(
+            "Write text content to a file.\n{}",
+            WRITE_TOOL_DESCRIPTION_SUFFIX
+        ),
+        "str_replace" => format!(
+            "Replace an exact string in a file.\n{}",
+            EDIT_TOOL_DESCRIPTION_SUFFIX
+        ),
+        "execute_bash" => format!(
+            "Execute the specified bash command.\n{}",
+            BASH_TOOL_DESCRIPTION_SUFFIX
+        ),
+        "read_file" => "Read a single file with optional line range specification.".to_string(),
+        "file_search" => "Search for files by fuzzy file path query.".to_string(),
+        "grep_search" => "Search file contents using a regex pattern.".to_string(),
+        "list_directory" => "List directory contents.".to_string(),
+        "web_search" => "Search the web for up-to-date information.".to_string(),
+        _ if fallback.trim().is_empty() => name.to_string(),
+        _ => fallback.to_string(),
+    }
+}
+
+/// Kiro 内置工具的 JSON schema 合成：命中内置名返回合成 schema（参数名已是 Kiro 原生形态，
+/// 与 [`map_tool_input_to_kiro`] 的输出一致），否则返回 None。
+fn kiro_builtin_tool_schema(name: &str) -> Option<serde_json::Value> {
+    Some(match name {
+        "fs_write" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Absolute path to file."},
+                "text": {"type": "string", "description": "Contents to write into the file."}
+            },
+            "required": ["path", "text"],
+            "additionalProperties": false
+        }),
+        "str_replace" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Absolute path to file."},
+                "oldStr": {"type": "string", "description": "Exact string to replace."},
+                "newStr": {"type": "string", "description": "Replacement string."}
+            },
+            "required": ["path", "oldStr", "newStr"],
+            "additionalProperties": false
+        }),
+        "execute_bash" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "Bash command to execute."},
+                "timeout": optional_schema(serde_json::json!({"type": "number", "description": "Optional timeout in milliseconds."}))
+            },
+            "required": ["command"],
+            "additionalProperties": false
+        }),
+        "read_file" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to file to read."},
+                "start_line": optional_schema(serde_json::json!({"type": "number", "description": "Starting line number."})),
+                "end_line": optional_schema(serde_json::json!({"type": "number", "description": "Ending line number."})),
+                "explanation": {"type": "string", "description": "Why this file is being read."}
+            },
+            "required": ["path", "explanation"],
+            "additionalProperties": false
+        }),
+        "file_search" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Fuzzy filename query."},
+                "explanation": {"type": "string", "description": "Why this search is being performed."},
+                "excludePattern": optional_schema(serde_json::json!({"type": "string", "description": "Glob pattern for files to exclude."})),
+                "includeIgnoredFiles": optional_schema(serde_json::json!({"type": "string", "description": "Whether to include ignored files, yes or no."}))
+            },
+            "required": ["query", "explanation"],
+            "additionalProperties": false
+        }),
+        "grep_search" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "minLength": 1, "description": "Regex pattern to search for."},
+                "caseSensitive": optional_schema(serde_json::json!({"type": "boolean", "description": "Whether the search should be case sensitive."})),
+                "includePattern": optional_schema(serde_json::json!({"type": "string", "description": "Glob pattern for files to include."})),
+                "excludePattern": optional_schema(serde_json::json!({"type": "string", "description": "Glob pattern for files to exclude."})),
+                "explanation": optional_schema(serde_json::json!({"type": "string", "description": "Why this search is being performed."}))
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        }),
+        "list_directory" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to directory."},
+                "depth": optional_schema(serde_json::json!({"type": "number", "description": "Depth of recursive listing."})),
+                "explanation": {"type": "string", "description": "Why this directory is being listed."}
+            },
+            "required": ["path", "explanation"],
+            "additionalProperties": false
+        }),
+        "web_search" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query."}
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        }),
+        _ => return None,
+    })
+}
+
 fn shorten_tool_name(name: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(name.as_bytes());
@@ -1555,29 +1980,52 @@ fn convert_tools(
             !is_web_search
         })
         .map(|t| {
-            let mut description = t.description.clone();
-
-            // 对 Write/Edit 工具追加自定义描述后缀
-            let suffix = match t.name.as_str() {
-                "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
-                "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
-                _ => "",
+            let map_enabled = tool_compat_mapping_enabled();
+            // Claude Code 内置工具名 → Kiro 原生名（Write→fs_write 等），记录反向映射；
+            // 非内置工具走 map_tool_name（超长缩短）。开关关闭时全部透传（仅超长缩短）。
+            let mapped_name = if map_enabled {
+                map_client_tool_name_to_kiro(&t.name, tool_name_map)
+            } else {
+                map_tool_name(&t.name, tool_name_map)
             };
-            if !suffix.is_empty() {
-                description.push('\n');
-                description.push_str(suffix);
-            }
+            let is_builtin = map_enabled && claude_code_tool_name_to_kiro(&t.name).is_some();
 
+            // 描述：内置工具用 Kiro 固定描述（已拼大文件分块提示，见 kiro_builtin_tool_description）；
+            // 非内置工具保留原描述 + Write/Edit/Bash 分块后缀。
+            let description = if is_builtin {
+                kiro_builtin_tool_description(&mapped_name, &t.description)
+            } else {
+                let mut description = t.description.clone();
+                let suffix = match t.name.as_str() {
+                    "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
+                    "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
+                    "Bash" => BASH_TOOL_DESCRIPTION_SUFFIX,
+                    _ => "",
+                };
+                if !suffix.is_empty() {
+                    description.push('\n');
+                    description.push_str(suffix);
+                }
+                description
+            };
             // 限制顶层描述长度（默认 10000 字符，可配置；安全截断 UTF-8，单次遍历）
             let description = truncate_chars(&description, tool_description_max_chars());
 
+            // schema：内置工具用合成 schema（参数名已是 Kiro 原生形态，与 map_tool_input_to_kiro
+            // 的输出一致）；非内置工具用客户端 schema 规范化（剥 $ref/null/anyOf 等）。
+            let schema = if is_builtin {
+                kiro_builtin_tool_schema(&mapped_name).unwrap_or_else(|| {
+                    normalize_json_schema(serde_json::json!(t.input_schema))
+                })
+            } else {
+                normalize_json_schema(serde_json::json!(t.input_schema))
+            };
+
             Tool {
                 tool_specification: ToolSpecification {
-                    name: map_tool_name(&t.name, tool_name_map),
+                    name: mapped_name,
                     description,
-                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(
-                        t.input_schema
-                    ))),
+                    input_schema: InputSchema::from_json(schema),
                 },
             }
         })
@@ -1808,7 +2256,21 @@ fn convert_assistant_message(
                         "tool_use" => {
                             if let (Some(id), Some(name)) = (block.id, block.name) {
                                 let input = block.input.unwrap_or(serde_json::json!({}));
-                                let mapped_name = map_tool_name(&name, tool_name_map);
+                                // 历史 tool_use 也走 CC↔Kiro 映射：名（Write→fs_write）+ 参数
+                                // （file_path→path、old_string→oldStr 等），否则多轮工具上下文
+                                // 与当前轮的工具协议不一致。Read.pages 无 Kiro 等价 → 传播错误。
+                                // 开关关闭时回退透传（仅超长缩短）。
+                                let map_enabled = tool_compat_mapping_enabled();
+                                let mapped_name = if map_enabled {
+                                    map_client_tool_name_to_kiro(&name, tool_name_map)
+                                } else {
+                                    map_tool_name(&name, tool_name_map)
+                                };
+                                let input = if map_enabled {
+                                    map_tool_input_to_kiro(&name, input)?
+                                } else {
+                                    input
+                                };
                                 tool_uses
                                     .push(ToolUseEntry::new(id, mapped_name).with_input(input));
                             }
@@ -2787,8 +3249,9 @@ mod tests {
             .map(|t| t.tool_specification.name.as_str())
             .collect();
         assert_eq!(names.len(), 2);
-        assert!(names.contains(&"Read"));
-        assert!(names.contains(&"Write"));
+        // Read/Write 是 Claude Code 内置工具，已映射为 Kiro 原生名（CC↔Kiro 映射层）。
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"fs_write"));
         assert!(!names.iter().any(|n| *n == "web_search"));
     }
 
@@ -2807,7 +3270,118 @@ mod tests {
         let mut map = HashMap::new();
         let converted = convert_tools(&tools, &mut map);
         assert_eq!(converted.len(), 1);
-        assert_eq!(converted[0].tool_specification.name, "Read");
+        // Read → read_file（CC↔Kiro 映射层）；tool_name_map 记录反向映射供出站还原。
+        assert_eq!(converted[0].tool_specification.name, "read_file");
+        assert_eq!(
+            map.get("read_file").map(|s| s.as_str()),
+            Some("Read"),
+            "应记录 Kiro名→Claude Code 名的反向映射"
+        );
+    }
+
+    /// CC↔Kiro 映射：Write → fs_write，且 schema 换成 Kiro 原生参数形态（path/text）。
+    #[test]
+    fn test_convert_tools_maps_builtin_to_kiro_schema() {
+        use super::super::types::Tool as AnthropicTool;
+
+        let tools = Some(vec![AnthropicTool {
+            name: "Write".to_string(),
+            description: String::new(),
+            input_schema: std::collections::HashMap::new(),
+            tool_type: None,
+            max_uses: None,
+            cache_control: None,
+        }]);
+        let mut map = HashMap::new();
+        let converted = convert_tools(&tools, &mut map);
+        assert_eq!(converted.len(), 1);
+        let spec = &converted[0].tool_specification;
+        assert_eq!(spec.name, "fs_write");
+        // schema 应为合成 schema：参数名已是 Kiro 形态（path/text），不是客户端 file_path/content。
+        let schema: serde_json::Value = spec.input_schema.json.clone();
+        let props = &schema["properties"];
+        assert!(props.get("path").is_some(), "合成 schema 应有 path");
+        assert!(props.get("text").is_some(), "合成 schema 应有 text");
+        assert!(
+            props.get("file_path").is_none(),
+            "合成 schema 不应残留客户端 file_path"
+        );
+        // 反向映射已记录
+        assert_eq!(map.get("fs_write").map(|s| s.as_str()), Some("Write"));
+    }
+
+    /// 入站参数转换：Claude Code 参数 → Kiro 参数（file_path→path、content→text、
+    /// old_string→oldStr、offset/limit→start_line/end_line）。
+    #[test]
+    fn test_map_tool_input_to_kiro_converts_params() {
+        // Write：file_path→path, content→text
+        let write_in = serde_json::json!({"file_path": "/a.txt", "content": "hi"});
+        let write_out = map_tool_input_to_kiro("Write", write_in).unwrap();
+        assert_eq!(
+            write_out,
+            serde_json::json!({"path": "/a.txt", "text": "hi"})
+        );
+
+        // Edit：old_string→oldStr, new_string→newStr
+        let edit_in = serde_json::json!({"file_path": "/a.txt", "old_string": "x", "new_string": "y"});
+        let edit_out = map_tool_input_to_kiro("Edit", edit_in).unwrap();
+        assert_eq!(
+            edit_out,
+            serde_json::json!({"path": "/a.txt", "oldStr": "x", "newStr": "y"})
+        );
+
+        // Read：offset/limit→start_line/end_line
+        let read_in = serde_json::json!({"file_path": "/a.txt", "offset": 10, "limit": 5});
+        let read_out = map_tool_input_to_kiro("Read", read_in).unwrap();
+        assert_eq!(
+            read_out,
+            serde_json::json!({"path": "/a.txt", "start_line": 10, "end_line": 14, "explanation": "Mapped from Claude Code Read tool."})
+        );
+
+        // 非内置工具原样
+        let custom = serde_json::json!({"x": 1});
+        assert_eq!(map_tool_input_to_kiro("my_tool", custom.clone()).unwrap(), custom);
+    }
+
+    /// 出站参数还原：Kiro 参数 → Claude Code 参数（path→file_path、oldStr→old_string、
+    /// start_line/end_line→offset/limit）。
+    #[test]
+    fn test_map_tool_input_from_kiro_restores_params() {
+        let kiro_in = serde_json::json!({"path": "/a.txt", "text": "hi"});
+        let restored = map_tool_input_from_kiro("Write", kiro_in);
+        assert_eq!(
+            restored,
+            serde_json::json!({"file_path": "/a.txt", "content": "hi"})
+        );
+
+        let kiro_edit = serde_json::json!({"path": "/a.txt", "oldStr": "x", "newStr": "y"});
+        assert_eq!(
+            map_tool_input_from_kiro("Edit", kiro_edit),
+            serde_json::json!({"file_path": "/a.txt", "old_string": "x", "new_string": "y"})
+        );
+
+        let kiro_read = serde_json::json!({"path": "/a.txt", "start_line": 10, "end_line": 14});
+        assert_eq!(
+            map_tool_input_from_kiro("Read", kiro_read),
+            serde_json::json!({"file_path": "/a.txt", "offset": 10, "limit": 5})
+        );
+    }
+
+    /// 出站完整还原：Kiro 名 + 参数 → Claude Code 名 + 参数（fs_write + path → Write + file_path）。
+    #[test]
+    fn test_restore_tool_use_for_client_roundtrip() {
+        let mut map = HashMap::new();
+        map.insert("fs_write".to_string(), "Write".to_string());
+        let (name, input) = restore_tool_use_for_client(
+            "fs_write",
+            serde_json::json!({"path": "/a.txt", "text": "hi"}),
+            &map,
+        );
+        assert_eq!(name, "Write");
+        assert_eq!(
+            input,
+            serde_json::json!({"file_path": "/a.txt", "content": "hi"})
+        );
     }
 
     #[test]

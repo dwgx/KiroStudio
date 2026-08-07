@@ -354,7 +354,24 @@ async fn fetch_from_json_source(client: &reqwest::Client, url: &str, batch_epoch
     };
     let mut fetched = 0usize;
     for u in urls {
-        if let Some(img) = download_bg_bytes(client, &u).await {
+        // ⚠️ SSRF 防护：URL 来自第三方 JSON 源（外部可控数据），下载前必须过
+        // crate::common::ssrf::build_guarded_client（DNS 固定到已校验 IP + 禁重定向 +
+        // 非公网段拒绝），与 bg_img_proxy_handler 同口径。不能复用入参的 plain client
+        // —— 它既不固定解析结果（rebinding）也会跟随 302 跳转到内网。
+        let guarded = match crate::common::ssrf::build_guarded_client(
+            &u,
+            Duration::from_secs(15),
+            &["https"],
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("背景图预取拒绝目标 URL（SSRF 防护）: {} - {}", u, e);
+                continue;
+            }
+        };
+        if let Some(img) = download_bg_bytes(&guarded, &u).await {
             // 代次已变则 push 被拒,停止本源(在途陈旧图不入池)。
             if !push_bg_to_pool(img, batch_epoch) {
                 break;
@@ -882,5 +899,35 @@ mod tests {
                 "合法图片 MIME {ok:?} 应原样保留"
             );
         }
+    }
+
+    /// ⭐ 源码级守卫：第三方 JSON 源下发的图片 URL 必须过 SSRF 防护。
+    ///
+    /// 回退即 FAIL：把 `fetch_from_json_source` 里的下载改回直接 `download_bg_bytes(client, &u)`
+    /// —— 编译过、正常源行为也看不出问题，但 URL 来自**外部可控**的 JSON（api.lolicon.app），
+    /// 若该源被劫持/返回恶意 URL，网关就会去抓内网/元数据端点。同文件 `bg_img_proxy_handler`
+    /// 已有 `build_guarded_client` 防护，这里钉住预取这条**入池**路径，两跳对称。
+    ///
+    /// ⚠️ 判据对空白不敏感（防 rustfmt 折行假红）；作用域限定在 `fetch_from_json_source`
+    /// 到 `fetch_bg_batch` 之间，避免 `bg_img_proxy_handler` 里同名的既有调用造成假绿。
+    #[test]
+    fn json_source_download_uses_ssrf_guard() {
+        let src = include_str!("router.rs");
+        let compact: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+        let start = compact
+            .find("asyncfnfetch_from_json_source")
+            .expect("fetch_from_json_source 应存在");
+        let end = compact[start..]
+            .find("asyncfnfetch_bg_batch")
+            .expect("fetch_bg_batch 应在 fetch_from_json_source 之后")
+            + start;
+        let body = &compact[start..end];
+        // needle 运行时拼接：写成完整字面量会被 include_str! 读到自己而多算一处。
+        let needle = format!("build_guarded_client{}", "(");
+        assert!(
+            body.contains(&needle),
+            "第三方 JSON 源下发的图片 URL 必须过 build_guarded_client 的 SSRF 校验，\
+             否则可被指使去打内网/元数据端点"
+        );
     }
 }

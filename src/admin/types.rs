@@ -431,6 +431,10 @@ pub struct AddCredentialRequest {
     /// None = 跟随全局 `config.customApiFirst`（默认 false = 与 Kiro 号按 priority 公平比较）。
     #[serde(default)]
     pub custom_api_first: Option<bool>,
+    /// 是否对该 custom_api 透传做 deepseek 归一化（opencodezen 代挂专用）。
+    /// true 时透传前按 fuckopencode 的 deepseek 协议修复改写请求体。
+    #[serde(default)]
+    pub deepseek_normalize: Option<bool>,
 
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region

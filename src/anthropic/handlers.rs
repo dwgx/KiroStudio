@@ -1481,6 +1481,9 @@ pub async fn post_messages(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
+                ConversionError::UnsupportedToolMapping { tool_name, reason } => {
+                    ("invalid_request_error", format!("工具参数无法映射: {} — {}", tool_name, reason))
+                }
             };
             tracing::warn!("请求转换失败: {}", e);
             return (
@@ -1997,6 +2000,9 @@ async fn handle_non_stream_request(
     // E1：上游结构化 thinking 流（reasoningContentEvent）的累积。与正文分开攒 ——
     // 混进 text_content 会让它被当成用户可见回答，而且下面的标签提取还会再解析一遍。
     let mut reasoning_content = String::new();
+    // 上游 reasoningContentEvent 携带的思考签名（若有）。下发 thinking 块时优先回传 ——
+    // Foxfishc 实测「伪造签名不被识别，cache_read 仍 0」；缺则回退占位符（行为与旧版一致）。
+    let mut reasoning_signature: Option<String> = None;
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
@@ -2114,11 +2120,24 @@ async fn handle_non_stream_request(
                                     .cloned()
                                     .unwrap_or_else(|| tool_use.name.clone());
 
+                                // 出站参数还原：Kiro 参数形态 → Claude Code 参数形态
+                                // （fs_write 的 path/text → Write 的 file_path/content）。
+                                // ⚠️ 仅当入站映射过（tool_name_map 有该 Kiro 名）才还原，否则
+                                // 原样透传（避免把不认识的参数清空）。与流式 stop 分支同口径。
+                                let client_input = if tool_name_map.contains_key(&tool_use.name) {
+                                    crate::anthropic::converter::map_tool_input_from_kiro(
+                                        &original_name,
+                                        input,
+                                    )
+                                } else {
+                                    input
+                                };
+
                                 tool_uses.push(json!({
                                     "type": "tool_use",
                                     "id": tool_use.tool_use_id,
                                     "name": original_name,
-                                    "input": input
+                                    "input": client_input
                                 }));
                             }
                         }
@@ -2163,6 +2182,12 @@ async fn handle_non_stream_request(
                         // 非流式只能靠下方的 `<thinking>` 标签提取兜底。
                         Event::ReasoningContent(r) => {
                             reasoning_content.push_str(&r.text);
+                            // 缓存上游真签名（若有），thinking 块组装处优先回传。
+                            if let Some(sig) = r.signature.as_deref() {
+                                if !sig.is_empty() {
+                                    reasoning_signature = Some(sig.to_string());
+                                }
+                            }
                         }
                         Event::Exception {
                             exception_type,
@@ -2301,13 +2326,16 @@ async fn handle_non_stream_request(
         };
 
         if let Some(thinking_text) = thinking {
-            // 补 signature 占位符：客户端 thinking 模式下本地校验 thinking 块必须带非空
-            // signature，非流式组装时同样需要（回传时 converter 只读 thinking，占位符被
-            // serde 静默丢弃，不会转发给 Kiro）。详见 stream::THINKING_SIGNATURE_PLACEHOLDER。
+            // 优先回传上游真签名（若 reasoningContentEvent 带过 signature）：Foxfishc 实测
+            // 真签名让多轮 cache 命中、伪造签名 cache_read 仍 0。缺则回退占位符 —— 客户端
+            // thinking 模式本地校验要求非空，而回传时 converter 只读 thinking、signature 被
+            // serde 静默丢弃，不会转发给 Kiro。详见 stream::THINKING_SIGNATURE_PLACEHOLDER。
             content.push(json!({
                 "type": "thinking",
                 "thinking": thinking_text,
-                "signature": super::stream::THINKING_SIGNATURE_PLACEHOLDER
+                "signature": reasoning_signature
+                    .clone()
+                    .unwrap_or_else(|| super::stream::THINKING_SIGNATURE_PLACEHOLDER.to_string())
             }));
         }
 
@@ -2545,6 +2573,9 @@ pub async fn post_messages_cc(
                 }
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
+                }
+                ConversionError::UnsupportedToolMapping { tool_name, reason } => {
+                    ("invalid_request_error", format!("工具参数无法映射: {} — {}", tool_name, reason))
                 }
             };
             tracing::warn!("请求转换失败: {}", e);

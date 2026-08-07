@@ -809,11 +809,22 @@ pub async fn handle_websearch_request(
     let (tool_use_id, mcp_request) = create_mcp_request(&query);
 
     // 3. 调用 Kiro MCP API
+    // 🔴 上游 MCP 调用失败不能伪装成「搜索无结果」：客户端会把 200 空结果当成
+    // 「真的没搜到」，掩盖网关/上游故障（已确认缺陷）。失败时返回 502 让客户端
+    // 能区分「搜索无结果」与「搜索服务故障」；正常「无结果」仍是合法 200 空结果
+    // （parse_search_results 返回 None，或 results 为空数组）。
     let search_results = match call_mcp_api(&provider, &mcp_request).await {
         Ok(response) => parse_search_results(&response),
         Err(e) => {
             tracing::warn!("MCP API 调用失败: {}", e);
-            None
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new(
+                    "upstream_error",
+                    format!("WebSearch 上游调用失败: {}", e),
+                )),
+            )
+                .into_response();
         }
     };
 
@@ -1307,5 +1318,32 @@ mod tests {
         // 不 panic 即说明截断边界落在字符边界上；再校验字符数与内容正确
         assert_eq!(truncated.chars().count(), 203); // 200 + "..."
         assert!(truncated.starts_with("a中a中"));
+    }
+
+    /// 源码级守卫：MCP 上游调用失败必须返回非 200，不得伪装成「搜索无结果」的
+    /// 200 空结果 SSE（已确认缺陷）。
+    ///
+    /// 单测覆盖不到该分支（需要真实 KiroProvider + 上游），用源码断言钉死：
+    /// 回归成「Err → None 落回 200」时本条 FAIL。
+    #[test]
+    fn websearch_upstream_failure_must_not_be_swallowed_as_empty_200() {
+        let full = include_str!("websearch.rs");
+        // 只查生产代码段：把本测试自身的 needle 排除在命中集外。
+        let prod = full
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(full);
+        let fn_body = prod
+            .split("async fn handle_websearch_request")
+            .nth(1)
+            .expect("handle_websearch_request 不应被改名");
+        assert!(
+            fn_body.contains("BAD_GATEWAY"),
+            "MCP 上游调用失败必须返回非 200（502），不能落回 200 空结果伪装成「无结果」"
+        );
+        assert!(
+            fn_body.contains("Ok(response) => parse_search_results(&response)"),
+            "Ok 分支必须继续 parse_search_results，正常「无结果」仍走 200 空结果路径"
+        );
     }
 }

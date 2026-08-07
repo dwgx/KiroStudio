@@ -129,11 +129,26 @@ const METRIC_ITEMS: { key: keyof RecoveryMetrics; labelKey: string; warn?: boole
   { key: 'strayGuardTripped', labelKey: 'opspage.metric.strayGuardTripped', warn: true },
   { key: 'strayStandaloneRequests', labelKey: 'opspage.metric.strayStandaloneRequests', warn: true },
   { key: 'strayInlineRequests', labelKey: 'opspage.metric.strayInlineRequests', warn: true },
-  // 上游 429 吸收层：recovered 是净收益(不告警)，其余三项越多越说明上游在压我们。
+  // 上游 429 吸收层：recovered 是净收益(不告警)，其余越多越说明上游在压我们。
   { key: 'absorbRounds', labelKey: 'opspage.metric.absorbRounds', warn: true },
   { key: 'absorbRecovered', labelKey: 'opspage.metric.absorbRecovered' },
   { key: 'absorbBudgetExhausted', labelKey: 'opspage.metric.absorbBudgetExhausted', warn: true },
   { key: 'absorbSuspendSkipped', labelKey: 'opspage.metric.absorbSuspendSkipped', warn: true },
+  // 吸收归因拆分：rounds = 该类真睡完退避并重打了一轮；*_skipped = 被分类出来但开关未开没吸收。
+  // 这两组一起看才知道「开了会救回多少」。backoffTruncated 该调 maxDelay、retryQuotaExhausted 是
+  // 每请求硬上限抬旋钮无效 —— 运维据此区分该动哪个旋钮。
+  { key: 'absorbBackoffTruncated', labelKey: 'opspage.metric.absorbBackoffTruncated', warn: true },
+  { key: 'absorbRetryQuotaExhausted', labelKey: 'opspage.metric.absorbRetryQuotaExhausted', warn: true },
+  { key: 'absorbRoundsPoolCooldown', labelKey: 'opspage.metric.absorbRoundsPoolCooldown', warn: true },
+  { key: 'absorbRoundsRateLimit', labelKey: 'opspage.metric.absorbRoundsRateLimit', warn: true },
+  { key: 'absorbRoundsSwapWindow', labelKey: 'opspage.metric.absorbRoundsSwapWindow', warn: true },
+  { key: 'absorbRoundsServerError', labelKey: 'opspage.metric.absorbRoundsServerError', warn: true },
+  { key: 'absorbRoundsCapacity400', labelKey: 'opspage.metric.absorbRoundsCapacity400', warn: true },
+  { key: 'absorbServerErrorSkipped', labelKey: 'opspage.metric.absorbServerErrorSkipped', warn: true },
+  { key: 'absorbCapacity400Skipped', labelKey: 'opspage.metric.absorbCapacity400Skipped', warn: true },
+  // 入站整形准入超时 / MCP 失败：此前失败路径零埋点，面板上完全不存在（成功率偏乐观）。
+  { key: 'inboundAdmissionTimeouts', labelKey: 'opspage.metric.inboundAdmissionTimeouts', warn: true },
+  { key: 'mcpFailures', labelKey: 'opspage.metric.mcpFailures', warn: true },
 ]
 
 // 后端日志 ts 是 UTC RFC3339(带 Z)。转成浏览器本地时区的 HH:MM:SS.mmm 显示——
@@ -298,7 +313,8 @@ function RecoveryMetricsCard() {
         ) : data ? (
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
             {METRIC_ITEMS.map((it) => {
-              // METRIC_ITEMS 里有 9 个 optional 字段（reclaimedInvokeCalls / stray* / absorb*）：
+              // METRIC_ITEMS 里有 19 个 optional 字段（reclaimedInvokeCalls / stray* / absorb* /
+              // 吸收归因拆分 / inboundAdmissionTimeouts / mcpFailures）：
               // 旧后端二进制不下发它们 ⇒ 直接 `as number` 会拿到 undefined，
               // AnimatedNumber 里 Math.round(undefined) → 界面显示 **NaN**（不是 0）。
               // 用 ?? 0 兜底：字段缺失语义上就是"该计数器还没有过"，显示 0 是对的。
@@ -886,7 +902,6 @@ function CredOpsDialog({
               >
                 {t('opspage.credops.disableOverage')}
               </Button>
-              {cred.overageEnabled && <Badge variant="warning">{t('opspage.credops.overageOn')}</Badge>}
             </div>
           </OpsSection>
         )}

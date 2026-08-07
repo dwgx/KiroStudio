@@ -36,7 +36,20 @@ fn stats_disabled() -> axum::response::Response {
 /// 最近 24h / 7d / 30d 三窗口概览
 pub async fn usage_overview(State(state): State<AdminState>) -> impl IntoResponse {
     match &state.usage_stats {
-        Some(stats) => Json(stats.overview()).into_response(),
+        Some(stats) => {
+            let ov = stats.overview();
+            // 追加统计丢失可观测性出口（已知问题 #12）：管道满丢弃数 + JSONL 重放解析失败数。
+            // 保持原有四窗口字段不变（前端类型按 last_24h 等键读取，追加键不影响）。
+            Json(serde_json::json!({
+                "last_24h": ov.last_24h,
+                "last_7d": ov.last_7d,
+                "last_30d": ov.last_30d,
+                "all_time": ov.all_time,
+                "dropped": crate::usage::pipeline::dropped_count(),
+                "parse_errors": stats.parse_error_count(),
+            }))
+            .into_response()
+        }
         None => stats_disabled(),
     }
 }
@@ -667,5 +680,37 @@ mod tests {
         let c = rows.iter().find(|r| r["key"] == "9").unwrap();
         assert_eq!(c["retries_sum"], 6, "{by_cred}");
         assert_eq!(c["retried_requests"], 2, "{by_cred}");
+    }
+
+    /// ⭐ 回归（已知问题 #12）：统计丢失（管道满丢弃 / JSONL 重放解析失败）必须可观测。
+    ///
+    /// 删除 `usage_overview` 里的 `dropped` / `parse_errors` 两个键 → 本测试 FAILED。
+    #[tokio::test]
+    async fn overview_endpoint_emits_dropped_and_parse_error_counters() {
+        // 造一个含坏行的 JSONL 目录，rebuild 后 parse_errors = 1
+        let dir = std::env::temp_dir().join(format!(
+            "kiro_usage_ov_obs_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("usage-2026-07-03.jsonl"), "NOT JSON\n").unwrap();
+
+        let stats = Arc::new(UsageStats::new(dir.clone()));
+        stats.rebuild_from_logs();
+        assert_eq!(stats.parse_error_count(), 1);
+
+        let mut st = AdminState::new("k", mk_service());
+        st.usage_stats = Some(stats);
+        let body = body_text(usage_overview(State(st)).await.into_response()).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["parse_errors"], 1, "{body}");
+        assert!(v.get("dropped").is_some(), "dropped 计数必须出现在 overview：{body}");
+        // 追加出口不得改变既有形状：四个窗口字段仍在
+        assert!(v.get("last_24h").is_some(), "{body}");
+        assert!(v.get("all_time").is_some(), "{body}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

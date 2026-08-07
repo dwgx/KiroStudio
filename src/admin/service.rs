@@ -1727,6 +1727,7 @@ impl AdminService {
             // 自定义 API 代挂透传字段（auth_method=custom_api 时由前端填入）。
             base_url: req.base_url,
             api_key: req.api_key,
+            deepseek_normalize: req.deepseek_normalize,
             request_limit: req.request_limit,
             custom_api_first: req.custom_api_first,
             // ⭐ 三个 region 字段多开时必须继承（见上方 `inherited` 处的长注释）：

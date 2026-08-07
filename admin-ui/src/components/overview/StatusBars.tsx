@@ -165,30 +165,13 @@ function CellFlow({
   litHealth: boolean
   onFire: boolean
 }) {
-  // 火力全开(自动挡):同一个 RPM 容器直接拉满成 effort-card WebGL 火焰。
-  // onFire 已由父级按名额裁过(pickFireCandidates),故并发上下文数恒 ≤ MAX_FIRE_INSTANCES。
-  if (onFire) {
-    return (
-      <div
-        className="relative flex h-4 w-[84px] shrink-0 items-center overflow-hidden rounded-[2px]"
-        title={i18n.t('overviewpage.bar.fireFull', { rpm, inflight })}
-        aria-hidden
-      >
-        {/* 火焰强度由 RPM/在途派生:越猛越偏 Ruby 红(满档最强);青→绿→金→橙→紫→白热→Ruby 红 7 档连续过渡 */}
-        <FireCanvas active intensity={fireIntensity(rpm, inflight)} className="absolute inset-0" />
-      </div>
-    )
-  }
-  // 算力利用率 0..1：RPM 为主（40 rpm 视为满占用），在途作为下限托底（有在途至少点亮小片）。
-  const rpmLevel = Math.min(rpm / 40, 1)
-  const inflightLevel = Math.min(inflight / 3, 1)
-  const level = litHealth ? Math.max(rpmLevel, inflightLevel * 0.5) : 0
-  const active = litHealth && level > 0
-
   // 每格的确定性静态参数（随 GRID_CELLS 生成一次，稳定）：
   // - order：黄金比低差异填充名次（散布均匀）——litCount 个格子总取名次最小的前 litCount 个点亮，
   //   负载升降时格子沿此次序一颗颗加/减（算法加减），不随机跳。
   // - phase/speed/depth：点亮后 opacity 微闪的相位/速度/深度扰动 → 整阵此起彼伏而非齐闪（凌晨观感）。
+  // ⚠️ 所有 hooks 必须先于 onFire 条件 return 调用完毕（Rules of Hooks）：号池跨越 fire 阈值时
+  //    该实例的 hooks 数量若在 0↔1 间切换，React 会抛 “Rendered fewer hooks than expected” → 整页白。
+  //    cells 的 useMemo 空依赖、不依赖任何 props，提前调用是安全的。
   const cells = useMemo(() => {
     const keyed = Array.from({ length: GRID_CELLS }, (_, i) => {
       const k = ((i + 1) * GOLDEN) % 1 // 填充序 key
@@ -208,6 +191,26 @@ function CellFlow({
       depth: 0.35 + c.r3 * 0.4,
     }))
   }, [])
+
+  // 火力全开(自动挡):同一个 RPM 容器直接拉满成 effort-card WebGL 火焰。
+  // onFire 已由父级按名额裁过(pickFireCandidates),故并发上下文数恒 ≤ MAX_FIRE_INSTANCES。
+  if (onFire) {
+    return (
+      <div
+        className="relative flex h-4 w-[84px] shrink-0 items-center overflow-hidden rounded-[2px]"
+        title={i18n.t('overviewpage.bar.fireFull', { rpm, inflight })}
+        aria-hidden
+      >
+        {/* 火焰强度由 RPM/在途派生:越猛越偏 Ruby 红(满档最强);青→绿→金→橙→紫→白热→Ruby 红 7 档连续过渡 */}
+        <FireCanvas active intensity={fireIntensity(rpm, inflight)} className="absolute inset-0" />
+      </div>
+    )
+  }
+  // 算力利用率 0..1：RPM 为主（40 rpm 视为满占用），在途作为下限托底（有在途至少点亮小片）。
+  const rpmLevel = Math.min(rpm / 40, 1)
+  const inflightLevel = Math.min(inflight / 3, 1)
+  const level = litHealth ? Math.max(rpmLevel, inflightLevel * 0.5) : 0
+  const active = litHealth && level > 0
 
   // 点亮格数：利用率量化成整数格（活跃时至少 MIN_LIT_WHEN_ACTIVE 个 → 有“心跳”）。
   const litCount = active

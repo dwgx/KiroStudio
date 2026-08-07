@@ -918,12 +918,26 @@ impl KiroProvider {
         let mut rate_limited_this_call: HashSet<u64> = HashSet::new();
         let mut suspicious_failovers_this_call: usize = 0;
         const MAX_SUSPICIOUS_FAILOVERS_PER_CALL: usize = 3;
+        // 已知问题 #11：MCP 路径失败零埋点 → 失败在面板上不可见。以下在所有失败出口
+        // （5 条 bail + client_for `?` + 重试耗尽）统一 emit_record + bump_mcp_failure。
+        let mut last_credential_id: Option<u64> = None;
+        let mut last_outcome = crate::usage::RequestOutcome::OtherError;
+        let mut attempts_used: u32 = 0;
 
         for attempt in 0..max_retries {
+            // 失败记录的 retries 用「已尝试次数 - 1」＝重试次数（与对话路径同口径）。
+            attempts_used = attempt as u32;
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
             let ctx = match self.token_manager.acquire_context(None, None).await {
-                Ok(c) => c,
+                Ok(c) => {
+                    last_credential_id = Some(c.id);
+                    c
+                }
                 Err(e) => {
+                    let es = e.to_string();
+                    if es.contains("retry_after_secs=") || es.contains("冷却") {
+                        last_outcome = crate::usage::RequestOutcome::RateLimited;
+                    }
                     last_error = Some(e);
                     continue;
                 }
@@ -935,6 +949,7 @@ impl KiroProvider {
             let endpoint = match self.select_endpoint(&ctx.credentials, ctx.id) {
                 Some(e) => e,
                 None => {
+                    last_outcome = crate::usage::RequestOutcome::RateLimited;
                     last_error = Some(anyhow::anyhow!(
                         "凭据 #{} 所有端点桶均处于 429 封禁期",
                         ctx.id
@@ -964,8 +979,22 @@ impl KiroProvider {
             let url = endpoint.mcp_url(&rctx);
             let body = endpoint.transform_mcp_body(request_body, &rctx);
 
-            let base = self
-                .client_for(&ctx.credentials)?
+            // client_for 失败（代理/TLS 配置错误等）也走失败埋点：此前 `?` 裸传播，
+            // 面板上这条请求同样不存在（已知问题 #11 的 7 个失败出口之一）。
+            let client = match self.client_for(&ctx.credentials) {
+                Ok(c) => c,
+                Err(e) => {
+                    crate::common::recovery_metrics::bump_mcp_failure();
+                    crate::usage::emit_record(build_mcp_record(
+                        ctx.id,
+                        crate::usage::RequestOutcome::OtherError,
+                        call_started.elapsed().as_millis() as u64,
+                        attempts_used,
+                    ));
+                    return Err(e);
+                }
+            };
+            let base = client
                 .post(&url)
                 .body(body)
                 .header("content-type", "application/json");
@@ -974,6 +1003,7 @@ impl KiroProvider {
             let response = match request.send().await {
                 Ok(resp) => resp,
                 Err(e) => {
+                    last_outcome = crate::usage::RequestOutcome::NetworkError;
                     tracing::warn!(
                         "MCP 请求发送失败（尝试 {}/{}）: {}",
                         attempt + 1,
@@ -1015,14 +1045,30 @@ impl KiroProvider {
             if endpoint.is_monthly_request_limit(&body) {
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if !has_available {
+                    // 失败埋点（#11）：此前裸 bail，失败在面板上不存在。
+                    crate::common::recovery_metrics::bump_mcp_failure();
+                    crate::usage::emit_record(build_mcp_record(
+                        ctx.id,
+                        crate::usage::RequestOutcome::QuotaExhausted,
+                        call_started.elapsed().as_millis() as u64,
+                        attempts_used,
+                    ));
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
                 }
+                last_outcome = crate::usage::RequestOutcome::QuotaExhausted;
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                 continue;
             }
 
             // 400 Bad Request
             if status.as_u16() == 400 {
+                crate::common::recovery_metrics::bump_mcp_failure();
+                crate::usage::emit_record(build_mcp_record(
+                    ctx.id,
+                    crate::usage::RequestOutcome::BadRequest,
+                    call_started.elapsed().as_millis() as u64,
+                    attempts_used,
+                ));
                 anyhow::bail!("MCP 请求失败: {} {}", status, body);
             }
 
@@ -1084,6 +1130,7 @@ impl KiroProvider {
                 // （403 曾被当永久封禁 → 12h 内 88 次误禁 + 36 次全池自愈活锁）。对话路径已修，
                 // 本路径此前漏修；且自动禁用落盘后（persist_disabled_state）该误禁**重启也回不来**。
                 if endpoint.is_temporary_rate_limit(&body) {
+                    last_outcome = crate::usage::RequestOutcome::RateLimited;
                     tracing::warn!(
                         "MCP 请求失败（账户临时风控限速，非永久封禁；分钟级退避后 failover，尝试 {}/{}）: {} {}",
                         attempt + 1,
@@ -1134,26 +1181,49 @@ impl KiroProvider {
                     self.token_manager.report_upstream_pressure();
                     let has_available = self.token_manager.report_account_suspended(ctx.id);
                     if !has_available {
+                        // 失败埋点（#11）。
+                        crate::common::recovery_metrics::bump_mcp_failure();
+                        crate::usage::emit_record(build_mcp_record(
+                            ctx.id,
+                            crate::usage::RequestOutcome::AccountSuspended,
+                            call_started.elapsed().as_millis() as u64,
+                            attempts_used,
+                        ));
                         anyhow::bail!(
                             "MCP 请求失败（账户被封禁且所有凭据已用尽）: {} {}",
                             status,
                             body
                         );
                     }
+                    last_outcome = crate::usage::RequestOutcome::AccountSuspended;
                     last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                     continue;
                 }
 
                 let has_available = self.token_manager.report_failure(ctx.id);
                 if !has_available {
+                    // 失败埋点（#11）。
+                    crate::common::recovery_metrics::bump_mcp_failure();
+                    crate::usage::emit_record(build_mcp_record(
+                        ctx.id,
+                        crate::usage::RequestOutcome::AuthFailed,
+                        call_started.elapsed().as_millis() as u64,
+                        attempts_used,
+                    ));
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
                 }
+                last_outcome = crate::usage::RequestOutcome::AuthFailed;
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                 continue;
             }
 
             // 瞬态错误
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+                last_outcome = if status.as_u16() == 429 {
+                    crate::usage::RequestOutcome::RateLimited
+                } else {
+                    crate::usage::RequestOutcome::ServerError
+                };
                 tracing::warn!(
                     "MCP 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -1183,16 +1253,37 @@ impl KiroProvider {
 
             // 其他 4xx
             if status.is_client_error() {
+                // 失败埋点（#11）。
+                crate::common::recovery_metrics::bump_mcp_failure();
+                crate::usage::emit_record(build_mcp_record(
+                    ctx.id,
+                    crate::usage::RequestOutcome::BadRequest,
+                    call_started.elapsed().as_millis() as u64,
+                    attempts_used,
+                ));
                 anyhow::bail!("MCP 请求失败: {} {}", status, body);
             }
 
             // 兜底
+            last_outcome = crate::usage::RequestOutcome::OtherError;
             last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }
         }
 
+        // 重试耗尽：失败也落一条记录（#11，第 7 个失败出口）。credential_id 未知时如实置 None。
+        crate::common::recovery_metrics::bump_mcp_failure();
+        let mut rec = build_mcp_record(
+            last_credential_id.unwrap_or_default(),
+            last_outcome,
+            call_started.elapsed().as_millis() as u64,
+            attempts_used,
+        );
+        if last_credential_id.is_none() {
+            rec.credential_id = None;
+        }
+        crate::usage::emit_record(rec);
         Err(last_error.unwrap_or_else(|| {
             anyhow::anyhow!("MCP 请求失败：已达到最大重试次数（{}次）", max_retries)
         }))
@@ -2315,13 +2406,6 @@ impl KiroProvider {
             }
 
             // ── 本轮 failover 链已耗尽,决定是否再吸收一轮 ────────────────────────────
-            // 可观测:仅当真的换号 failover 过(打了 >1 个号)才计「耗尽」——首个号即因客户端错误/
-            // 模型无效 break 的不算池耗尽,避免运维看错(误判池死实为客户端请求问题)。
-            // 放在轮内且每轮清零:每一轮真扫过一遍池子就该各计一次。
-            if real_failover_happened {
-                crate::common::recovery_metrics::bump_failover_exhausted();
-                real_failover_happened = false;
-            }
             // 下一轮的尝试计数从本轮末尾续上(+1 = 本轮最后那次尝试本身)。
             attempts_base = attempts_used + 1;
 
@@ -2476,6 +2560,15 @@ impl KiroProvider {
             // ⚠️ 刻意**不重置** last_error:若下一轮没产生新错误(如全池冷却 fast-fail 后 last_error
             // 未被覆盖),重置会让 final_error 落到「已达到最大重试次数」通用串 →
             // map_provider_error 认不出来 → 兜底 502 且无 Retry-After → 客户端从此不退避。
+        }
+
+        // 整条客户端请求失败收尾：failover 耗尽只在**吸收循环真正结束**且确有换号 failover 时
+        // 记一次（已知问题 #13）。此前放在轮内且每轮清零 ⇒ 一条请求跑 N 轮就计 N 次（多计）；
+        // 且成功路径在循环内 return，这里根本走不到 ⇒ 已恢复的请求不再误计为耗尽。
+        // 仅当真的换号 failover 过（打了 >1 个号）才计——首个号即因客户端错误/模型无效 break
+        // 的不算池耗尽（该区分语义不变，见 `real_failover_happened` 声明处）。
+        if real_failover_happened {
+            crate::common::recovery_metrics::bump_failover_exhausted();
         }
 
         // 所有吸收轮与重试都失败:埋点一条失败记录后返回错误。
@@ -2886,6 +2979,46 @@ mod tests {
         assert!(
             success_branch.contains("emit_record(build_mcp_record("),
             "MCP 成功分支必须落一条用量记录，否则凭据计数与用量库对不上账"
+        );
+    }
+
+    /// 源码级守卫（已知问题 #11）：MCP 路径的**失败出口**必须 emit_record + bump 计数器。
+    ///
+    /// 历史缺陷：`call_mcp_with_retry` 只有成功分支 emit_record，失败全部零埋点 ⇒
+    /// MCP 失败在面板与 recovery-metrics 端点上完全不存在，成功率的分子分母对不上账。
+    /// 单测覆盖不到（需真实上游 + 号池），用源码断言钉死 7 个失败出口。
+    #[test]
+    fn mcp_failure_exits_must_emit_record_and_bump_counter() {
+        let full = include_str!("provider.rs");
+        let src = full
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(full);
+        let mcp_fn = src
+            .split("async fn call_mcp_with_retry")
+            .nth(1)
+            .expect("call_mcp_with_retry 不应被改名");
+        // 只看成功分支之后的失败区（把本测试的 needle 排除在命中集外）。
+        let failure_region = mcp_fn
+            .split("// 失败响应")
+            .nth(1)
+            .expect("失败响应的定位注释不应被删改");
+        assert!(
+            failure_region.contains("crate::common::recovery_metrics::bump_mcp_failure()"),
+            "MCP 失败出口必须 bump 专用计数器，否则失败在 recovery-metrics 端点上不可见"
+        );
+        assert!(
+            failure_region.contains("emit_record(build_mcp_record("),
+            "MCP 失败出口必须 emit_record，否则失败在用量面板上不存在（#11）"
+        );
+        // client_for 那个出口在「// 失败响应」标记之前，故按整个 MCP 函数计数（排除测试段）。
+        assert_eq!(
+            mcp_fn
+                .matches("crate::common::recovery_metrics::bump_mcp_failure()")
+                .count(),
+            7,
+            "MCP 应有 7 个失败出口（5 条 bail + client_for `?` + 重试耗尽）各自 bump；\
+             数量变化说明出口新增/删除，需同步本守卫"
         );
     }
 
@@ -3916,6 +4049,41 @@ mod tests {
                  落 N 条失败记录，面板失败数被吸收轮次乘倍"
             );
         }
+    }
+
+    /// ⭐ 源码守卫（已知问题 #13）：`failover_exhausted` 只能在吸收循环**之外**、整条客户端
+    /// 请求失败后记一次。
+    ///
+    /// 历史缺陷：bump 放在轮内且每轮清零 ⇒ 一条请求跑 N 轮就计 N 次（多计）；成功路径在轮内
+    /// return 前也会被误计。回退即 FAIL：把 bump 挪回 'absorb 循环内 → `bump_at < loop_at`。
+    #[test]
+    fn failover_exhausted_bumped_once_outside_absorb_loop() {
+        let full = include_str!("provider.rs");
+        let src = full
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(full);
+        let retry_fn = src
+            .split("async fn call_api_with_retry")
+            .nth(1)
+            .expect("call_api_with_retry 不应被改名");
+        let loop_at = retry_fn
+            .find(format!("{}{}", "'absorb: ", "loop {").as_str())
+            .expect("'absorb: loop 不应被改名");
+        let bump_at = retry_fn
+            .find("crate::common::recovery_metrics::bump_failover_exhausted()")
+            .expect("failover_exhausted bump 不应被删除");
+        assert!(
+            bump_at > loop_at,
+            "failover_exhausted 必须在吸收循环之外记（一次/请求）：放在轮内会被吸收轮次乘倍（#13）"
+        );
+        assert_eq!(
+            retry_fn
+                .matches("crate::common::recovery_metrics::bump_failover_exhausted()")
+                .count(),
+            1,
+            "call_api_with_retry 内必须恰好一处 failover_exhausted bump（整条请求失败才记一次）"
+        );
     }
 
     /// ⭐ 源码守卫：链内去重集必须声明在吸收循环**之外**（跨轮共享）。
