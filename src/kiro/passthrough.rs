@@ -69,8 +69,11 @@ pub async fn forward(
     };
 
     // deepseek 归一化:opencodezen 代挂凭据(deepseekNormalize=true)时,转发前按 fuckopencode
-    // 的 deepseek 协议修复改写请求体(thinking adaptive→enabled、reasoning_effort→output_config、
-    // 剥 context_management 等),再原样转发;其余 custom_api 凭据保持零转换透传。
+    // 的 deepseek 协议修复改写请求体(模型名→deepseek-v4-flash、thinking adaptive→enabled、
+    // reasoning_effort→output_config、多轮 tool_use 注入 thinking、剥 context_management 等),
+    // 再原样转发;其余 custom_api 凭据保持零转换透传。
+    // ⚠️ 仅请求侧归一化;响应侧未过滤上游 thinking 块(thinking disabled 时 deepseek 仍吐
+    // thinking,客户端可能报 "Tool result missing"),见 deepseek_normalize 模块顶部范围边界。
     let body_bytes: Bytes = if cred.deepseek_normalize == Some(true) {
         match serde_json::from_slice::<serde_json::Value>(&raw_body) {
             Ok(mut v) => {

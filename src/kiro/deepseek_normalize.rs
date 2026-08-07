@@ -3,17 +3,28 @@
 //! 背景:opencodezen 类 deepseek 兼容网关只认 `deepseek-v4-flash` 且对标准 Anthropic
 //! 客户端的字段很挑剔(实测多个 400)。fuckopencode(OpenAI↔Anthropic 协议网关)把这些
 //! 坑逐一修掉了。本模块把那套修复逻辑用 Rust 复刻,供 custom_api 透传在转发前调用——
-//! 这样 KiroStudio 识别到 opencodezen 凭据(`deepseekNormalize=true`)时,请求先归一化再
-//! 转发,兼容性等价于直接走 fuckopencode。
+//! 这样 KiroStudio 识别到 opencodezen 凭据(`deepseekNormalize=true`)时,请求先归一化再转发。
+//!
+//! ⚠️ **范围边界（诚实标注，勿当 overclaim）**：本模块只做**请求侧**归一化（模型名/thinking/
+//! reasoning_effort/工具字段）。**响应侧**未实现 `filterThinkingFromStream`（fuckopencode 在
+//! thinking disabled 时仍会剥掉上游吐的 thinking 块，否则 Claude Code 报 "Tool result missing"；
+//! KiroStudio 的 passthrough 是字节流原样回流，未过滤）。因此说"兼容性等价于直接走 fuckopencode"
+//! 只对请求侧成立；响应侧在 thinking disabled 场景可能仍需客户端容忍 thinking 块。
 //!
 //! 已知 deepseek 坑(见 fuckopencode/src/deepseek.ts):
+//! - **模型名**：只认 `deepseek-v4-flash` 等精确名，`claude-*` 被上游 401，须重写。
 //! - `thinking:{type:"adaptive"}` + `budget_tokens` → 400,必须归一化
 //!   成 `{type:"enabled"|"disabled"}` 并去掉 budget_tokens。
 //! - `thinking:disabled` 时若仍带 `reasoning_effort` → 400,须连 effort 一起删。
-//! - `reasoning_effort` 需转成 `output_config.effort`。
+//! - `reasoning_effort` 需转成 `output_config.effort`；非字符串的 effort 直接删。
 //! - `context_management`、工具上的 `strict/defer_loading` → 400 "Extra inputs",须剥离。
+//! - **多轮带工具**：thinking 非 disabled 时，assistant 历史消息含 `tool_use` 而无 `thinking`
+//!   块 → 次轮间歇 400（deepseek 要求回传 reasoning 内容），须注入空 thinking 块。
 
 use serde_json::Value;
+
+/// opencodezen 只认的 fallback 模型名（对齐 fuckopencode `DEFAULT_FALLBACK_MODEL`）。
+const DEFAULT_FALLBACK_MODEL: &str = "deepseek-v4-flash";
 
 /// 对一次 Anthropic `/v1/messages` 请求体做 deepseek 归一化(就地修改)。
 ///
@@ -24,6 +35,15 @@ pub fn normalize_request(value: &mut Value) {
         Some(o) => o,
         None => return,
     };
+
+    // 0) 模型名重写：opencodezen 只认 deepseek-v4-flash 等精确名，claude-*/gpt-* 会被上游
+    //    401（对齐 fuckopencode `resolveModelName`：命中 map 用映射值，否则 fallback）。
+    //    KiroStudio 无 modelMap 配置，简单规则：deepseek-* 保留，其余统一映射到 fallback。
+    if let Some(model) = obj.get("model").and_then(|m| m.as_str()) {
+        if !model.starts_with("deepseek-") {
+            obj.insert("model".into(), serde_json::json!(DEFAULT_FALLBACK_MODEL));
+        }
+    }
 
     // 1) thinking 归一化:adaptive→enabled;enabled 去 budget_tokens;disabled 保留;未知形态删除。
     let mut thinking_disabled = false;
@@ -49,12 +69,15 @@ pub fn normalize_request(value: &mut Value) {
         None => {}
     }
 
-    // 2) reasoning_effort:disabled 时连 effort 一起删;否则映射到 output_config.effort。
+    // 2) reasoning_effort:disabled 时连 effort 一起删;否则字符串映射到 output_config.effort,
+    //    非字符串(数字/布尔)deepseek 不认,直接删(残留会 Extra inputs 400)。
     if thinking_disabled {
         obj.remove("reasoning_effort");
         obj.remove("output_config");
-    } else if let Some(effort) = obj.get("reasoning_effort").and_then(|x| x.as_str()).map(str::to_string) {
-        obj.insert("output_config".into(), serde_json::json!({ "effort": effort }));
+    } else {
+        if let Some(effort) = obj.get("reasoning_effort").and_then(|x| x.as_str()) {
+            obj.insert("output_config".into(), serde_json::json!({ "effort": effort }));
+        }
         obj.remove("reasoning_effort");
     }
 
@@ -62,11 +85,22 @@ pub fn normalize_request(value: &mut Value) {
     obj.remove("context_management");
     if let Some(oc) = obj.get_mut("output_config").and_then(|v| v.as_object_mut()) {
         // output_config 只留 effort,其余(format/task_budget 等)会 400。
+        // 非字符串 effort 也删（deepseek 只认 string，别的会 Extra inputs）。
         let effort = oc.remove("effort");
         oc.clear();
         if let Some(e) = effort {
-            oc.insert("effort".into(), e);
+            if e.is_string() {
+                oc.insert("effort".into(), e);
+            }
         }
+    }
+    // 空 output_config（effort 缺失/非字符串被清空）deepseek 同样 400，整体删除。
+    if obj
+        .get("output_config")
+        .and_then(|v| v.as_object())
+        .is_some_and(|o| o.is_empty())
+    {
+        obj.remove("output_config");
     }
 
     // 4) 工具上的 strict/defer_loading 也会 400,剥离。
@@ -76,6 +110,43 @@ pub fn normalize_request(value: &mut Value) {
                 t.remove("strict");
                 t.remove("defer_loading");
             }
+        }
+    }
+
+    // 5) 多轮带工具:thinking 非 disabled 时,assistant 历史含 tool_use 而无 thinking 块
+    //    则前插空 thinking 块(否则 deepseek 次轮 400)。对齐 fuckopencode injectMissingThinkingBlocks。
+    if !thinking_disabled {
+        inject_missing_thinking_blocks(obj);
+    }
+}
+
+/// 对齐 fuckopencode `injectMissingThinkingBlocks`：thinking 非 disabled 时，assistant
+/// 历史消息含 `tool_use` 但缺 `thinking` 块 → 在 content 头部前插空 thinking 块。
+/// deepseek 在「带工具 + thinking」的多轮里要求 assistant 回传 reasoning 内容，缺失会
+/// 400（间歇，取决于上游启发式检查）；Claude Code 这类客户端不回传，社区代理都注入空块。
+fn inject_missing_thinking_blocks(obj: &mut serde_json::Map<String, Value>) {
+    let Some(messages) = obj.get_mut("messages").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    for msg in messages {
+        let Some(msg_obj) = msg.as_object_mut() else { continue };
+        if msg_obj.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            continue;
+        }
+        let Some(content) = msg_obj.get_mut("content").and_then(|c| c.as_array_mut()) else {
+            continue;
+        };
+        let has_tool_use = content
+            .iter()
+            .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"));
+        let has_thinking = content
+            .iter()
+            .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("thinking"));
+        if has_tool_use && !has_thinking {
+            content.insert(
+                0,
+                serde_json::json!({ "type": "thinking", "thinking": "", "signature": "" }),
+            );
         }
     }
 }
@@ -160,5 +231,96 @@ mod tests {
             "output_config": { "effort": "max", "format": { "type": "json" }, "task_budget": 5 }
         }));
         assert_eq!(out["output_config"], serde_json::json!({ "effort": "max" }));
+    }
+
+    /// 模型名重写：非 deepseek-* 统一映射到 fallback（opencodezen 只认 flash），deepseek-* 保留。
+    #[test]
+    fn model_is_rewritten_to_fallback_when_not_deepseek() {
+        assert_eq!(norm(serde_json::json!({ "model": "claude-sonnet-4" }))["model"], "deepseek-v4-flash");
+        assert_eq!(norm(serde_json::json!({ "model": "gpt-4o" }))["model"], "deepseek-v4-flash");
+        assert_eq!(norm(serde_json::json!({ "model": "deepseek-v4-flash" }))["model"], "deepseek-v4-flash");
+        assert_eq!(norm(serde_json::json!({ "model": "deepseek-reasoner" }))["model"], "deepseek-reasoner");
+    }
+
+    /// 空 output_config 整体删除（非字符串 effort 被清空 / 无 effort 的 output_config 都删）。
+    #[test]
+    fn empty_output_config_is_removed() {
+        let out = norm(serde_json::json!({ "reasoning_effort": 5 }));
+        assert!(out.get("output_config").is_none(), "非字符串 effort 应被清空并删除 output_config");
+        assert!(out.get("reasoning_effort").is_none());
+
+        let out2 = norm(serde_json::json!({ "output_config": { "format": { "type": "json" } } }));
+        assert!(out2.get("output_config").is_none(), "无 effort 的 output_config 应删除");
+    }
+
+    /// thinking:null（字段存在但为 null）应被删除。
+    #[test]
+    fn thinking_null_is_removed() {
+        let out = norm(serde_json::json!({ "thinking": null }));
+        assert!(out.get("thinking").is_none());
+    }
+
+    /// 多轮带工具 + thinking 开启：assistant 历史含 tool_use 缺 thinking → 前插空块；
+    /// 已有 thinking 不重复；thinking disabled 不注入。
+    #[test]
+    fn injects_empty_thinking_for_tool_use_turns() {
+        let out = norm(serde_json::json!({
+            "thinking": { "type": "enabled" },
+            "messages": [
+                { "role": "user", "content": "hi" },
+                { "role": "assistant", "content": [
+                    { "type": "text", "text": "using tool" },
+                    { "type": "tool_use", "id": "t1", "name": "fs_write", "input": {} }
+                ]}
+            ]
+        }));
+        let msgs = out["messages"].as_array().unwrap();
+        let assistant = msgs.iter().find(|m| m["role"] == "assistant").unwrap();
+        let content = assistant["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "thinking", "tool_use 消息前应注入 thinking 块");
+        assert_eq!(content[0]["thinking"], "");
+        assert_eq!(content[0]["signature"], "");
+
+        // 已有 thinking 不重复注入
+        let out2 = norm(serde_json::json!({
+            "thinking": { "type": "enabled" },
+            "messages": [
+                { "role": "assistant", "content": [
+                    { "type": "thinking", "thinking": "reason", "signature": "s" },
+                    { "type": "tool_use", "id": "t1", "name": "fs_write", "input": {} }
+                ]}
+            ]
+        }));
+        let content2 = out2["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content2.len(), 2, "已有 thinking 不重复注入");
+
+        // thinking disabled 不注入
+        let out3 = norm(serde_json::json!({
+            "thinking": { "type": "disabled" },
+            "messages": [
+                { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "t1", "name": "fs_write", "input": {} }
+                ]}
+            ]
+        }));
+        let content3 = out3["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content3[0]["type"], "tool_use", "thinking disabled 不注入");
+    }
+
+    /// 幂等：对已归一化的请求再归一化，结果不变。
+    #[test]
+    fn normalize_is_idempotent() {
+        let input = serde_json::json!({
+            "model": "claude-opus-4",
+            "thinking": { "type": "adaptive", "budget_tokens": 4096 },
+            "reasoning_effort": "high",
+            "context_management": { "enable": true },
+            "tools": [ { "name": "a", "strict": true } ]
+        });
+        let mut once = input.clone();
+        normalize_request(&mut once);
+        let mut twice = once.clone();
+        normalize_request(&mut twice);
+        assert_eq!(once, twice, "二次归一化结果不变");
     }
 }
