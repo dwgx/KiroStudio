@@ -47,6 +47,32 @@ pub struct ReasoningContentEvent {
     /// 与 `AssistantResponseEvent::content` 同款容错策略。
     #[serde(default)]
     pub text: String,
+    /// 思考块签名（上游若下发则带上）。
+    ///
+    /// # 加它的理由：不加就永远观测不到
+    ///
+    /// 本结构体原先只有 `text`，于是上游若在帧里带了 `signature`，serde 会**静默丢弃**
+    /// 它 —— 不报错、不打日志。而我们下发给客户端的是自造的
+    /// `THINKING_SIGNATURE_PLACEHOLDER`（`anthropic::stream:140`）。两者叠加的后果是：
+    /// **如果上游一直在发真签名，我们一直在用假的盖住它，且无法发现。**
+    ///
+    /// # 上游到底发不发？未知，且刻意不假定
+    ///
+    /// 对照实现 `~/Documents/Project/_study/kiro-rs` 的同名结构体有这个字段
+    /// （`reasoning.rs:21`），但它的消费点 `stream.rs:2079-2082` 同样是
+    /// `.unwrap_or_else(|| THINKING_SIGNATURE_PLACEHOLDER)` —— 即**它也不知道上游发不发**，
+    /// 只是留了通路。它的两条测试只证明「若上游发了则能解析」，不证明上游会发。
+    ///
+    /// 所以这里只做**解析**，不改下发逻辑：解析是零风险的（`Option` + `default`，
+    /// 缺失即 `None`），而它把「上游是否发真签名」从推测变成可观测。
+    #[serde(default)]
+    pub signature: Option<String>,
+    /// 上游返回的加密思考内容（若有）。
+    ///
+    /// 同 `signature`：先解析、先能观测，暂不接入下发。真要下发需先确认上游确实发它、
+    /// 以及它的编码形态，那需要真实样本 —— 而拿到样本的前提就是先解析它。
+    #[serde(default)]
+    pub redacted_content: Option<String>,
 }
 
 impl EventPayload for ReasoningContentEvent {
@@ -84,5 +110,49 @@ mod tests {
         let e: ReasoningContentEvent =
             serde_json::from_str("{}").expect("缺字段应走 default，不应报错");
         assert!(e.text.is_empty());
+        // 两个新字段同样必须容缺（上游绝大多数帧只有 text）。
+        assert!(e.signature.is_none());
+        assert!(e.redacted_content.is_none());
+    }
+
+    /// ⭐ 回归：`signature` 必须被解析而不是被 serde 静默丢弃。
+    ///
+    /// 本结构体原先只有 `text`，于是上游若在同一帧带了 `signature`，它在反序列化时
+    /// **无声消失** —— 不报错、不打日志，只是永远拿不到。而我们下发给客户端的是自造的
+    /// `THINKING_SIGNATURE_PLACEHOLDER`，若上游其实一直在发真签名，那就是拿假的盖住真的。
+    ///
+    /// 删掉 `pub signature` 字段 → 本测试编译失败（比断言失败更早暴露）。
+    #[test]
+    fn parses_signature_instead_of_silently_dropping_it() {
+        let e: ReasoningContentEvent =
+            serde_json::from_str(r#"{"text":"reasoning","signature":"real-sig-from-upstream"}"#)
+                .expect("应可解析带 signature 的帧");
+        assert_eq!(e.text, "reasoning");
+        assert_eq!(
+            e.signature.as_deref(),
+            Some("real-sig-from-upstream"),
+            "signature 必须被解析 —— 旧结构体会把它静默丢掉"
+        );
+    }
+
+    /// ⭐ 回归：`redactedContent`（camelCase）必须映射到 `redacted_content`。
+    ///
+    /// 承重点在**命名转换**：结构体有 `#[serde(rename_all = "camelCase")]`，
+    /// 若哪天有人把它删掉或给字段加了错的 `rename`，这个字段会静默变成 None
+    /// （加密思考内容整块丢失，而且没有任何报错）。
+    #[test]
+    fn parses_redacted_content_with_camel_case_mapping() {
+        let e: ReasoningContentEvent =
+            serde_json::from_str(r#"{"redactedContent":"encrypted-blob"}"#)
+                .expect("应可解析加密思考帧");
+        assert_eq!(e.redacted_content.as_deref(), Some("encrypted-blob"));
+        // 反向守卫：snake_case 写法**不该**命中（证明 camelCase 转换确实在起作用，
+        // 而不是恰好因为字段名相同而通过）。
+        let snake: ReasoningContentEvent =
+            serde_json::from_str(r#"{"redacted_content":"nope"}"#).expect("未知字段应被忽略");
+        assert!(
+            snake.redacted_content.is_none(),
+            "snake_case 键不该命中 —— 上游用的是 camelCase"
+        );
     }
 }

@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::model::socks_node::{
+    MAX_SOCKS_NODES, SocksNode, SocksNodeFileCompat, SocksNodeTest,
+};
+use crate::kiro::token_manager::{DisabledReason, MultiTokenManager};
 
 use super::error::AdminServiceError;
 use super::external_idp_login::{
@@ -18,19 +21,20 @@ use super::external_idp_login::{
     ExternalIdpStartResult,
 };
 use super::idc_login::IdcLoginManager;
+use super::idc_login::{IdcPollResult, IdcStartResult};
 use super::social_login::SocialLoginManager;
 pub use super::social_login::{PollResult, StartResult};
-use super::idc_login::{IdcPollResult, IdcStartResult};
-use crate::kiro::auth::social::OAuthCallbackData;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, ConfigSnapshotResponse,
-    CredentialStatusItem, CredentialsStatusResponse, ImportKeyItem, ImportKeyResult,
-    ImportKeysRequest, ImportKeysResponse, LoadBalancingModeResponse,
-    SetLoadBalancingModeRequest, StorageCleanupItem, StorageCleanupResponse, StoragePartition,
-    BatchDeleteItemResult,
-    StorageStatsResponse, TrashItemResponse, TrashListResponse, UpdateConfigRequest,
-    UpdateConfigResponse, build_import_response, mask_import_key,
+    AddCredentialRequest, AddCredentialResponse, BalanceResponse, BatchDeleteItemResult,
+    CleanupDisabledResponse, CleanupSkippedItem, ConfigSnapshotResponse, CredentialStatusItem,
+    CredentialsStatusResponse, ImportKeyItem, ImportKeyResult, ImportKeysRequest,
+    ImportKeysResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    SocksNodeBulkImportItem, SocksNodeBulkImportOutcome, SocksNodeUpsertRequest, SocksNodeView,
+    StorageCleanupItem, StorageCleanupResponse, StoragePartition, StorageStatsResponse,
+    TrashItemResponse, TrashListResponse, UpdateConfigRequest, UpdateConfigResponse,
+    build_import_response, mask_import_key,
 };
+use crate::kiro::auth::social::OAuthCallbackData;
 use crate::usage::TraceDb;
 
 /// 余额缓存【新鲜度】阈值（秒），5 分钟。
@@ -98,6 +102,153 @@ const MAX_CREDENTIAL_COPIES: u32 = 16;
 /// 报错会让"想多开但填大了"的请求整个失败，而 clamp 后仍是可用结果。
 fn effective_copies(requested: Option<u32>) -> u32 {
     requested.unwrap_or(1).clamp(1, MAX_CREDENTIAL_COPIES)
+}
+
+/// 一次「批量清理已禁用凭据」最多删多少条（[`AdminService::cleanup_disabled_credentials`]）。
+///
+/// 200 与 `MAX_BATCH_DELETE_IDS` 同值同理由：adminKey 明文存 localStorage 且全仓无 CSP，
+/// 无上限的批量删除会放大 XSS 的破坏面。差别在于这个端点**不收 ids** —— 候选是服务端
+/// 自己算的，所以上限是唯一的量级闸门，比批量删除那条更承重。
+/// 超出部分留给下一次调用（`skipped` 里标 `over_limit`），不静默丢弃。
+const MAX_CLEANUP_DISABLED_IDS: usize = 200;
+
+/// 跳过原因：代挂号（`is_custom_api_credential()`）。
+const CLEANUP_SKIP_CUSTOM_API: &str = "custom_api";
+/// 跳过原因：禁用原因是代挂专属（`PassthroughFailed` / `PassthroughOverloaded`）。
+const CLEANUP_SKIP_PASSTHROUGH_REASON: &str = "passthrough_disabled";
+/// 跳过原因：禁用原因**可自愈**，号会自己回池（见 [`CLEANUP_SELF_HEALABLE_REASONS`]）。
+const CLEANUP_SKIP_SELF_HEALABLE: &str = "self_healable";
+/// 跳过原因：本次超出 [`MAX_CLEANUP_DISABLED_IDS`]，留给下一次调用。
+const CLEANUP_SKIP_OVER_LIMIT: &str = "over_limit";
+/// 跳过原因：候选算出来之后凭据已不在池里（并发删除的竞态）。
+const CLEANUP_SKIP_NOT_IN_POOL: &str = "not_in_pool";
+
+/// 「自愈会把号重新启用」的禁用原因，清理时必须排除。
+///
+/// # 为什么不删这几个：它们不是死号，是**几分钟后会自己复活**的健康号
+///
+/// `token_manager.rs` 的 `is_self_healable_reason` 把这三个原因定义为可自愈，全池无可用号时
+/// 会 `disabled=false` + `clear_transient_counters()` 把它们**原地复活**。也就是说被这三个
+/// 原因禁用的号，禁用态本身是**瞬时**的：
+///
+/// - `TooManyFailures`：连续失败达阈值，失败源多半是上游抖动；
+/// - `SuspiciousActivityAuto`：403 账户级风控，历史事故已确证是**临时态**；
+/// - `TooManyRefreshFailures`：走到阈值的典型成因是 token 端点抖了几十秒，凭据本身完好。
+///
+/// 清理走的是回收站（可恢复），但用户点「清理禁用号」时的心智模型是「删死号」——
+/// 把一个正在自愈途中的号删走，表现为**号池莫名变小**，而面板上看不出是自己删的。
+/// 方向上这是数据损失，所以判据必须与自愈白名单对齐。
+///
+/// # 为什么在这里抄一份而不是调那个函数
+///
+/// `is_self_healable_reason` 是 `token_manager` 的私有函数且吃枚举，而清理判据吃的是
+/// 快照下发的**字符串**（Admin API 契约）。这里用 `DisabledReason::as_str()` 取字面量，
+/// 保证两侧同源；漂移由 `self_healable_set_matches_token_manager_whitelist` 那条测试兜。
+const CLEANUP_SELF_HEALABLE_REASONS: [DisabledReason; 3] = [
+    DisabledReason::TooManyFailures,
+    DisabledReason::SuspiciousActivityAuto,
+    DisabledReason::TooManyRefreshFailures,
+];
+
+/// 一条**已禁用**凭据是否该被清理。返回 `Some(跳过原因)` = 不清；`None` = 清。
+///
+/// # 抽成纯函数只为可测
+///
+/// 这是「删」与「不删」的唯一判据，误判的代价不对称：漏清一个死号只是列表里多一行，
+/// 而误清一个代挂号 = 删掉用户自己配的第三方中转（回收站能捞回来，但配置得重来）。
+///
+/// # 四道排除各自独立，缺一不可
+///
+/// - `is_custom_api == None`：候选是先从快照算的，随后才去池里问"是不是代挂"。取不到 =
+///   这中间被别人删掉了。不清（下一次调用自然不会再列它），但原因必须与代挂**区分开**：
+///   报 `custom_api` 会让面板说"这号是代挂所以没删"，而真相是"它已经不在池里了"。
+/// - `is_custom_api == Some(true)`：代挂号有**独立的 passthrough 路径**，它被禁用不代表
+///   "号死了"，多半是中转站的 key/额度/地址问题，修好配置就能继续用 → 不该被当死号清掉。
+/// - 禁用原因是代挂专属：`PassthroughFailed` / `PassthroughOverloaded` 这两个原因
+///   **只可能**由代挂路径写入（见 `DisabledReason` 的文档）。它是第二道网 ——
+///   万一某条号的 `auth_method`/`base_url` 因历史数据缺失而认不出是代挂，
+///   禁用原因仍能把它捞出来。
+/// - 禁用原因可自愈：见 [`CLEANUP_SELF_HEALABLE_REASONS`]。这条拦的是**健康号**，
+///   与前三条拦"配置问题"性质不同，但方向一致：都不是死号。
+///
+/// # 顺序：不在池里 > 代挂 > 代挂原因 > 可自愈
+///
+/// 顺序决定的只是 `skipped` 里报哪个原因（四者都是"不清"），但那个原因是用户唯一能看到的
+/// 解释，所以按**信息量**排：先报"号没了"（其余判据此时全是猜的），再报最确定的号类型，
+/// 最后才报瞬时状态。
+///
+/// `reason` 取快照下发的字符串（`DisabledReason::as_str()` 的产物），而不是枚举：
+/// 那是 Admin API 的既有契约，两侧同源。
+fn cleanup_verdict(is_custom_api: Option<bool>, reason: Option<&str>) -> Option<&'static str> {
+    match is_custom_api {
+        None => return Some(CLEANUP_SKIP_NOT_IN_POOL),
+        Some(true) => return Some(CLEANUP_SKIP_CUSTOM_API),
+        Some(false) => {}
+    }
+    let passthrough_only = [
+        DisabledReason::PassthroughFailed.as_str(),
+        DisabledReason::PassthroughOverloaded.as_str(),
+    ];
+    if reason.is_some_and(|r| passthrough_only.contains(&r)) {
+        return Some(CLEANUP_SKIP_PASSTHROUGH_REASON);
+    }
+    if reason.is_some_and(|r| {
+        CLEANUP_SELF_HEALABLE_REASONS
+            .iter()
+            .any(|s| s.as_str() == r)
+    }) {
+        return Some(CLEANUP_SKIP_SELF_HEALABLE);
+    }
+    None
+}
+
+/// 多开是否适用于该凭据。返回 `Some(拒绝理由)` 表示不适用。
+///
+/// # 为什么必须拦：OAuth 号的分身**注定是死号**
+///
+/// `refreshToken` 在每次刷新时会被上游**轮换**（`token_manager.rs` 的
+/// `new_credentials.refresh_token = Some(new_refresh_token)`）。多开是把同一份凭据
+/// 复制 N 条，于是第 2..N 份带的是**同一个** refreshToken：
+///
+/// 1. 任意一份先刷新成功 → 上游把那个 refreshToken 作废、发一个新的给它；
+/// 2. 其余 N-1 份手里的那个已被消费 → 刷新拿 `invalid_grant`；
+/// 3. `report_refresh_token_invalid` 把它们逐个禁用（且现在会持久化禁用态）。
+///
+/// 结果是用户建了 N 个分身、看着入池成功，随后它们一个个变灰，
+/// 而面板上的原因是 `refresh_token_invalid` —— 极易被误读成「号被封了」。
+///
+/// api_key 号（`ksk_`）没有 refreshToken，压根不走刷新路径
+/// （`is_token_expired` 对它直接返回 false），复制多份是安全的 ——
+/// 这也是多开这个功能当初被设计出来时唯一验证过的形态。
+///
+/// 抽成独立函数**只为可测**：`add_credential` 会打真实上游
+/// （`get_usage_limits_for`），穿它的成功路径测不了。
+fn multi_open_rejection_reason(cred: &KiroCredentials) -> Option<String> {
+    if cred.is_api_key_credential() {
+        return None;
+    }
+    Some(format!(
+        "多开（copies > 1）只支持 API Key 凭据（ksk_）。当前凭据的 authMethod 是 \"{}\"，\
+         它靠 refreshToken 刷新，而 refreshToken 每次刷新都会被上游轮换：\
+         N 份带的是同一个 refreshToken，任一份刷新成功后其余份立刻拿 invalid_grant 被禁用。\
+         要给这类账号分散出口 IP，请逐个号在卡片上单独配代理，而不是多开。",
+        cred.auth_method.as_deref().unwrap_or("social")
+    ))
+}
+
+/// 一次多开的「节点 → 份」分配计划（由 [`AdminService::resolve_node_plan`] 算出）。
+///
+/// 拆成结构体而不是返回裸元组，是因为**被剔除的 id 必须能一路带到响应文案里**：
+/// 用户最容易踩空的正是「我选了节点却仍然直连」，而只返回可用节点的话，
+/// 无效 id 就在这一层被静默吃掉了。
+#[derive(Debug, Default)]
+struct NodePlan {
+    /// 按份序排好的代理三元组 `(url, username, password)`：`[0]` 给第 1 份、
+    /// `[1]` 给第 2 份，以此类推。长度可小于份数（不够的份直连，刻意不复用）。
+    assignments: Vec<(String, Option<String>, Option<String>)>,
+    /// 被剔除的 `(node_id, 原因)`。原因是静态串（`不存在` / `已禁用` / `重复`），
+    /// 供响应文案逐条点名。
+    rejected: Vec<(u64, &'static str)>,
 }
 
 /// 缓存的余额条目（含时间戳）
@@ -229,7 +380,17 @@ fn build_insight_text(
 /// 封装所有 Admin API 的业务逻辑
 pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
-    balance_cache: Mutex<HashMap<u64, CachedBalance>>,
+    /// 余额缓存。**键是「账号」而不是「凭据」** —— 见 [`AdminService::balance_cache_key`]。
+    ///
+    /// # 为什么不是 `id`
+    ///
+    /// 同一个 `ksk_` key 的多份分身是**同一个上游账号**，配额也是同一份。按 `id` 键会让
+    /// N 份分身各存一份余额，于是面板上同组各份显示的数字**互不相同**（谁最近刷过谁新），
+    /// 而它们描述的本来是同一个账号。线上实测缓存键是 `620/623/622/624` 四份分身各一条。
+    ///
+    /// 改成按账号键之后：任一份刷新即同组全部同步，且上游 `getUsageLimits` 探测从
+    /// N 次降到 1 次（那是 `web_portal` 往返，调多了会加重风控）。
+    balance_cache: Mutex<HashMap<String, CachedBalance>>,
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
@@ -242,6 +403,17 @@ pub struct AdminService {
     /// 后台温和余额刷新任务句柄（TIER2 热重载：改 balanceRefreshIntervalSecs 后 abort+respawn
     /// 即时生效不重启）。None = 当前未运行（间隔=0 或尚未启动）。
     balance_task: Mutex<Option<JoinHandle<()>>>,
+    /// 可复用代理节点表（「分身管理」页维护）。**不进请求热路径** ——
+    /// 凭据自己的 `proxy_*` 才是绑定结果，本表只是候选池，故无需三层热重载镜像。
+    socks_nodes: Mutex<Vec<SocksNode>>,
+    /// 节点表落盘路径（None = 单凭据格式，纯内存态，与 trash 同款约定）。
+    socks_nodes_path: Option<PathBuf>,
+    /// 节点表是否可安全回写。启动时文件**存在但读不出来**时为 false（只读降级）：
+    /// 此时内存是空表，回写就等于抹平原文件。见 `load_socks_nodes_from`。
+    socks_nodes_writable: bool,
+    /// 下一个要发放的节点 id。**只增不减**且随表落盘，故 id 永不复用
+    /// （`max(现有 id)+1` 会在删掉最大 id 后把它重新发出去）。
+    socks_next_id: std::sync::atomic::AtomicU64,
 }
 
 impl AdminService {
@@ -253,7 +425,16 @@ impl AdminService {
             .cache_dir()
             .map(|d| d.join("kiro_balance_cache.json"));
 
-        let balance_cache = Self::load_balance_cache_from(&cache_path);
+        // 传 token_manager 是为了把**旧格式**（按凭据 id 键）迁移成新格式（按账号键）。
+        // 不迁移不会崩，但会让升级后 api_key 号的缓存全部失效、面板集体转圈打
+        // getUsageLimits —— 那是上游探测。见 `load_balance_cache_from` 的迁移说明。
+        let balance_cache = Self::load_balance_cache_from(&cache_path, &token_manager);
+
+        let socks_nodes_path = token_manager
+            .cache_dir()
+            .map(|d| d.join("socks_nodes.json"));
+        let (socks_nodes, socks_next_id, socks_nodes_writable) =
+            Self::load_socks_nodes_from(&socks_nodes_path, &token_manager);
 
         Self {
             social_login: SocialLoginManager::new(token_manager.clone()),
@@ -264,6 +445,10 @@ impl AdminService {
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
             balance_task: Mutex::new(None),
+            socks_nodes: Mutex::new(socks_nodes),
+            socks_nodes_path,
+            socks_nodes_writable,
+            socks_next_id: std::sync::atomic::AtomicU64::new(socks_next_id),
         }
     }
 
@@ -382,48 +567,55 @@ impl AdminService {
             .map(|entry| {
                 let cd = cooldowns.get(&entry.id);
                 CredentialStatusItem {
-                id: entry.id,
-                priority: entry.priority,
-                rpm_limit: entry.rpm_limit,
-                allowed_models: entry.allowed_models,
-                tested_models: entry.tested_models,
-                disabled: entry.disabled,
-                failure_count: entry.failure_count,
-                is_current: entry.id == snapshot.current_id,
-                expires_at: entry.expires_at,
-                auth_method: entry.auth_method,
-                base_url: entry.base_url,
-                request_limit: entry.request_limit,
-                request_count: entry.request_count,
-                has_profile_arn: entry.has_profile_arn,
-                refresh_token_hash: entry.refresh_token_hash,
-                api_key_hash: entry.api_key_hash,
-                masked_api_key: entry.masked_api_key,
-                email: entry.email,
-                subscription_title: entry.subscription_title,
-                success_count: entry.success_count,
-                total_credits_used: entry.total_credits_used,
-                last_used_at: entry.last_used_at.clone(),
-                has_proxy: entry.has_proxy,
-                proxy_url: entry.proxy_url,
-                refresh_failure_count: entry.refresh_failure_count,
-                disabled_reason: entry.disabled_reason,
-                // ⭐ 此前**漏映射**：`CredentialResponse` 与 `CredentialEntrySnapshot` 两侧都有
-                // `disabled_at` 字段，但这里没接上 → 面板拿到的恒为 null，
-                // 「这号什么时候坏的」这个信息在最后一跳丢失（smoke 实测发现）。
-                // 与上面的 disabled_reason 是一对，必须同源同步。
-                disabled_at: entry.disabled_at,
-                // 展示**实际生效**的端点（含 ksk_ 自动路由结果），并单独标出是否被人工固定。
-                // 此前这里只做 `endpoint.unwrap_or(default)`，ksk_ 号会显示成 "ide"
-                // 而请求其实走 cli —— 面板与真实行为不一致，排障时极易误判。
-                endpoint_pinned: entry.endpoint.is_some(),
-                endpoint: entry.effective_endpoint,
-                inflight: entry.inflight,
-                rpm: entry.rpm,
-                name: entry.name,
-                cooling_down: cd.is_some(),
-                cooldown_remaining_ms: cd.map(|c| c.remaining_ms),
-                cooldown_reason: cd.map(|c| c.reason.description().to_string()),
+                    id: entry.id,
+                    priority: entry.priority,
+                    rpm_limit: entry.rpm_limit,
+                    allowed_models: entry.allowed_models,
+                    tested_models: entry.tested_models,
+                    disabled: entry.disabled,
+                    failure_count: entry.failure_count,
+                    is_current: entry.id == snapshot.current_id,
+                    expires_at: entry.expires_at,
+                    auth_method: entry.auth_method,
+                    base_url: entry.base_url,
+                    request_limit: entry.request_limit,
+                    request_count: entry.request_count,
+                    has_profile_arn: entry.has_profile_arn,
+                    refresh_token_hash: entry.refresh_token_hash,
+                    api_key_hash: entry.api_key_hash,
+                    masked_api_key: entry.masked_api_key,
+                    email: entry.email,
+                    subscription_title: entry.subscription_title,
+                    success_count: entry.success_count,
+                    total_credits_used: entry.total_credits_used,
+                    last_used_at: entry.last_used_at.clone(),
+                    has_proxy: entry.has_proxy,
+                    proxy_url: entry.proxy_url,
+                    refresh_failure_count: entry.refresh_failure_count,
+                    disabled_reason: entry.disabled_reason,
+                    // ⭐ 此前**漏映射**：`CredentialResponse` 与 `CredentialEntrySnapshot` 两侧都有
+                    // `disabled_at` 字段，但这里没接上 → 面板拿到的恒为 null，
+                    // 「这号什么时候坏的」这个信息在最后一跳丢失（smoke 实测发现）。
+                    // 与上面的 disabled_reason 是一对，必须同源同步。
+                    disabled_at: entry.disabled_at,
+                    // 展示**实际生效**的端点（含 ksk_ 自动路由结果），并单独标出是否被人工固定。
+                    // 此前这里只做 `endpoint.unwrap_or(default)`，ksk_ 号会显示成 "ide"
+                    // 而请求其实走 cli —— 面板与真实行为不一致，排障时极易误判。
+                    endpoint_pinned: entry.endpoint.is_some(),
+                    endpoint: entry.effective_endpoint,
+                    // 同款「实际生效值 + 是否被固定」二元组，理由见字段文档：
+                    // ksk_ 按区授权，打错区恒 403，而面板此前完全看不到 region。
+                    effective_region: Some(entry.effective_region),
+                    region_pinned: entry.region_pinned,
+                    inflight: entry.inflight,
+                    rpm: entry.rpm,
+                    name: entry.name,
+                    clone_group: entry.clone_group,
+                    clone_seq: entry.clone_seq,
+                    tag: entry.tag,
+                    cooling_down: cd.is_some(),
+                    cooldown_remaining_ms: cd.map(|c| c.remaining_ms),
+                    cooldown_reason: cd.map(|c| c.reason.description().to_string()),
                 }
             })
             .collect();
@@ -585,6 +777,23 @@ impl AdminService {
     ///
     /// 端点名先按 Admin 层已知端点列表校验，给出「可用: a, b」的友好提示；
     /// token_manager 侧还有一道 registry 校验兜底（直打 API 也进不去非法值）。
+    /// 设置凭据的 `apiRegion`（空=清除，回退全局 `config.region`）。
+    ///
+    /// 补的是一个真实运维缺口：`ksk_` 按 region 授权、打错区恒 403 且永不自愈，
+    /// 而此前全仓没有任何修改 `api_region` 的入口（`/regions` 与 `/switch-region`
+    /// 都是 ARN 门控，只对 external_idp 有意义）⇒ api_key 号 region 错了只能删号重建。
+    /// 实测 2026-08-05 02:42：4 个分身因缺 region 被打成 `TooManyFailures`，
+    /// 运维手上没有"补 region 再启用"的手段。
+    pub fn set_credential_api_region(
+        &self,
+        id: u64,
+        api_region: Option<String>,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_credential_api_region(id, api_region)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
     pub fn set_credential_endpoint(
         &self,
         id: u64,
@@ -628,6 +837,16 @@ impl AdminService {
     ) -> Result<(), AdminServiceError> {
         self.token_manager
             .set_credential_name(id, name)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    pub fn set_credential_tag(
+        &self,
+        id: u64,
+        tag: Option<String>,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_credential_tag(id, tag)
             .map_err(|e| self.classify_error(e, id))
     }
 
@@ -712,14 +931,30 @@ impl AdminService {
     ///
     /// 现在：上游超过 [`BALANCE_UPSTREAM_TIMEOUT_SECS`] 就放弃，**有旧缓存就返旧缓存并标 stale**，
     /// 让面板显示"上次已知值 + 过期提示"而不是转圈或报错。只有连旧缓存都没有时才报错。
-    pub async fn get_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
-        // 先查缓存（新鲜即直接返）
+    ///
+    /// # `force`：跳过 [`BALANCE_CACHE_TTL_SECS`] 这道新鲜度门
+    ///
+    /// 用户明确反馈「额度/积分刷新太慢」，而在 `force` 之前**没有任何路径**能让用户
+    /// 主动取一次真值：面板列表读的是缓存（30 分钟才由后台刷一次），而本端点在
+    /// 5 分钟 TTL 内直接返缓存 ⇒ 连点两次「查看余额」拿到的是同一个数字、零上游往返，
+    /// 看起来就是"刷新没反应"。
+    ///
+    /// 风险边界（封号红线）：`force` **只作用于显式的单号请求**，不存在批量入口
+    /// （`get_cached_balances` 恒零上游，后台刷新仍是 30 分钟 + 逐个 4 秒间隔）。
+    /// 与既有的 `GET /credentials/{id}/overage`（每次调用都真打上游）同一量级。
+    pub async fn get_balance(
+        &self,
+        id: u64,
+        force: bool,
+    ) -> Result<BalanceResponse, AdminServiceError> {
+        let cache_key = self.balance_cache_key(id);
+        // 先查缓存（新鲜即直接返；force 时只取降级值，不早返）
         let stale_fallback = {
             let cache = self.balance_cache.lock();
-            match cache.get(&id) {
+            match cache.get(&cache_key) {
                 Some(cached) => {
                     let now = Utc::now().timestamp() as f64;
-                    if (now - cached.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
+                    if !force && (now - cached.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
                         tracing::debug!("凭据 #{} 余额命中缓存", id);
                         return Ok(cached.data.clone());
                     }
@@ -760,20 +995,87 @@ impl AdminService {
             }
         };
 
-        // 更新缓存
-        {
-            let mut cache = self.balance_cache.lock();
-            cache.insert(
-                id,
-                CachedBalance {
-                    cached_at: Utc::now().timestamp() as f64,
-                    data: balance.clone(),
-                },
-            );
-        }
-        self.save_balance_cache();
+        // 落缓存 + **同步重置花费基线**（按账号键，于是同 key 的全部分身立刻共享这次结果）。
+        // ⚠️ 绝不在这里内联 `cache.insert`：那会漏掉基线重置 → 面板把已含在真值里的花费
+        // 再扣一次（见 `commit_fresh_balance` 的算例）。
+        self.commit_fresh_balance(cache_key, balance.clone());
 
         Ok(balance)
+    }
+
+    /// 余额缓存的键：**同一个上游账号只有一个键**。
+    ///
+    /// - api_key 号（`ksk_`）→ `sha256(kiroApiKey)`。同 key 的全部分身共享一条缓存 ⇒
+    ///   任一份刷新即全组同步，且上游 `getUsageLimits` 探测从 N 次降到 1 次。
+    /// - 其余（OAuth：social / idc / external_idp）→ 十进制 `id`，保持原行为。
+    ///
+    /// # 为什么 OAuth 必须继续按 id
+    ///
+    /// 它们没有 `kiroApiKey`，无从算账号指纹。若为了"统一"给它们编一个共享键，
+    /// 会把**互不相关的多个 OAuth 账号**的余额混成一条 —— 那是比不同步严重得多的错误
+    /// （面板会显示别人的额度）。判据复用 `is_api_key_credential()`，与
+    /// `api_key_hash` 字段的算法（`token_manager.rs:5484`：仅 api_key 号才算 sha256）同源。
+    ///
+    /// # 取不到凭据时
+    ///
+    /// 回落到 id。这只发生在凭据刚被删除的竞态里，此时缓存键正确与否都无意义。
+    fn balance_cache_key(&self, id: u64) -> String {
+        match self.token_manager.export_credential(id) {
+            Some(c) if c.is_api_key_credential() => match c.kiro_api_key.as_deref() {
+                Some(k) => crate::kiro::token_manager::sha256_hex(k),
+                // api_key 号但 key 为空：配置无效（`InvalidConfig` 会禁用它），
+                // 回落 id 而不是拿空串当共享键——空串会把所有这类号混成一条。
+                None => id.to_string(),
+            },
+            _ => id.to_string(),
+        }
+    }
+
+    /// 删凭据后清理它的余额缓存 —— **仅当没有别的凭据还共享同一个账号键**。
+    ///
+    /// # 为什么必须有条件
+    ///
+    /// 缓存按账号键存（`balance_cache_key`），一条被同 key 的 N 份分身共享。
+    /// 无条件 `remove` 会让「删掉一份分身」把**整组**的余额缓存清掉 ⇒ 剩下的份
+    /// 面板显示"暂无数据"，直到下次刷新（默认 30 分钟）或用户手点查余额。
+    ///
+    /// # 调用约定：`key` 必须在删除**之前**算好
+    ///
+    /// `balance_cache_key` 走 `export_credential`，凭据删掉后它返 `None` ⇒ 回落成 id
+    /// 字符串 ⇒ 清的是一个不存在的键，真正那条泄漏在缓存里。所以键由调用方在删除前传入。
+    fn prune_balance_cache_for_deleted(&self, key: &str) {
+        // 还有别的凭据共享这个键吗？（此刻目标凭据已从池中移除）
+        let still_shared = self
+            .token_manager
+            .snapshot()
+            .entries
+            .iter()
+            .any(|e| self.balance_cache_key(e.id) == key);
+        if still_shared {
+            return;
+        }
+        {
+            let mut cache = self.balance_cache.lock();
+            cache.remove(key);
+        }
+        self.save_balance_cache();
+    }
+
+    /// 账号缓存键 → 共享它的**全部**凭据 id。
+    ///
+    /// 缓存按账号键存（一条），而面板与调度器都按**凭据 id** 消费 —— 所以读回时必须把
+    /// 一条展开成 N 条。这就是「同 key 的分身余额必然一致」在 UI 上真正生效的地方：
+    /// 它们读的是同一条缓存，不存在各自一份、谁刷谁新的可能。
+    ///
+    /// 含禁用号：面板要显示禁用号的最后已知余额（判断是不是额度耗尽导致的禁用）。
+    fn balance_key_to_ids(&self) -> HashMap<String, Vec<u64>> {
+        let mut out: HashMap<String, Vec<u64>> = HashMap::new();
+        for e in self.token_manager.snapshot().entries {
+            out.entry(self.balance_cache_key(e.id))
+                .or_default()
+                .push(e.id);
+        }
+        out
     }
 
     /// 从上游获取余额（无缓存）
@@ -829,20 +1131,34 @@ impl AdminService {
         use super::types::{CachedBalanceItem, CachedBalancesResponse};
 
         let now = Utc::now().timestamp() as f64;
+        // 缓存按**账号**键存，而前端按**凭据 id** 展示 ⇒ 一条展开成共享它的全部 id。
+        // 同 key 的分身因此读到**同一条**缓存，余额必然一致（这是同步生效的落点）。
+        let key_to_ids = self.balance_key_to_ids();
         let cache = self.balance_cache.lock();
-        let balances: HashMap<u64, CachedBalanceItem> = cache
-            .iter()
-            .filter(|(_, c)| (now - c.cached_at) < BALANCE_CACHE_DISPLAY_MAX_AGE_SECS as f64)
-            .map(|(id, c)| {
-                (
-                    *id,
-                    CachedBalanceItem {
-                        balance: c.data.clone(),
-                        cached_at: c.cached_at,
-                    },
-                )
-            })
-            .collect();
+        let mut balances: HashMap<u64, CachedBalanceItem> = HashMap::new();
+        for (key, c) in cache.iter() {
+            if (now - c.cached_at) >= BALANCE_CACHE_DISPLAY_MAX_AGE_SECS as f64 {
+                continue;
+            }
+            let item = CachedBalanceItem {
+                balance: c.data.clone(),
+                cached_at: c.cached_at,
+            };
+            match key_to_ids.get(key) {
+                Some(ids) => {
+                    for id in ids {
+                        balances.insert(*id, item.clone());
+                    }
+                }
+                // 键在缓存里但池中已无对应凭据（号被删）。若键本身是十进制 id（旧格式
+                // 或 OAuth 号），仍按它展示，避免刚删号那一刻面板闪空。
+                None => {
+                    if let Ok(id) = key.parse::<u64>() {
+                        balances.insert(id, item);
+                    }
+                }
+            }
+        }
         drop(cache);
 
         // ⭐ dwgx 需求「用了余额之后要刷新额度显示」：用**本地累计的 credit 花费**做乐观修正。
@@ -900,7 +1216,7 @@ impl AdminService {
     /// 由 main.rs 的后台任务按长间隔调用（默认 30 分钟）。
     pub async fn refresh_all_balances_gently(&self, spacing_secs: u64) {
         // 取未禁用凭据 id 快照（只读，不持锁跨 await）
-        let ids: Vec<u64> = self
+        let all_ids: Vec<u64> = self
             .token_manager
             .snapshot()
             .entries
@@ -908,6 +1224,22 @@ impl AdminService {
             .filter(|e| !e.disabled)
             .map(|e| e.id)
             .collect();
+
+        // ⭐ 按**账号**去重：同一个 `ksk_` key 的 N 份分身共享一个上游账号与一份配额，
+        // 逐份打就是 N 次 `web_portal` 往返拿同一个数字。而 `web_portal` 是上游探测，
+        // 调多了会加重风控（本仓调优结论：绝不为展示类需求反复打它）。
+        //
+        // 缓存现在按账号键（`balance_cache_key`），所以同组只需刷一份 —— 结果自动
+        // 覆盖全组。实测线上一组 4 份分身，这一步把 4 次探测降到 1 次。
+        //
+        // 取组内**第一个**（id 升序，即主份优先）：与前端「查余额只打主份」同口径。
+        let ids: Vec<u64> = {
+            let mut seen: HashSet<String> = HashSet::new();
+            all_ids
+                .into_iter()
+                .filter(|id| seen.insert(self.balance_cache_key(*id)))
+                .collect()
+        };
 
         if ids.is_empty() {
             return;
@@ -924,17 +1256,11 @@ impl AdminService {
 
             match self.fetch_balance(*id).await {
                 Ok(balance) => {
-                    {
-                        let mut cache = self.balance_cache.lock();
-                        cache.insert(
-                            *id,
-                            CachedBalance {
-                                cached_at: Utc::now().timestamp() as f64,
-                                data: balance,
-                            },
-                        );
-                    }
-                    self.save_balance_cache();
+                    // 落缓存 + 重置该账号基线，走与「查看余额」**同一个**收口
+                    // （两条路径各写一份 insert 正是基线漏更新的根源）。
+                    // 逐个提交而不是攒到本轮末尾：一轮要走 N×4 秒，早提交的号能早点
+                    // 在面板/调度器上生效，且中途进程重启不会白刷。
+                    self.commit_fresh_balance(self.balance_cache_key(*id), balance);
                     tracing::debug!("后台温和余额刷新：凭据 #{} 已更新缓存", id);
                 }
                 Err(e) => {
@@ -944,17 +1270,72 @@ impl AdminService {
             }
         }
 
-        // 回推余额快照给调度器(余额加权分流用)。用当前缓存的 remaining/effective_limit + 该号此刻的
-        // total_credits_used 作本地累加修正基线。号被删/禁用则不含在表里(调度侧缺表=中性因子1.0)。
-        self.push_balance_snapshots_to_scheduler();
+        // 收尾回推：把**没能刷成功**但缓存里有值的号也补进表（否则调度侧缺表=中性因子 1.0，
+        // 余额加权对它们完全失效）。`fresh_keys` 传空 ⇒ 它们保留原基线，不会被误当成
+        // "刚取到真值"（见 `push_balance_snapshots_to_scheduler` 的 fresh_keys 文档）。
+        // 刷成功的那些已在循环里逐个提交过，这里对它们是幂等的。
+        self.push_balance_snapshots_to_scheduler(&HashSet::new());
 
         tracing::info!("后台温和余额刷新完成");
     }
 
+    /// 把一次**新取到的上游真值**落进缓存，并**同步重置该账号的花费基线**。
+    ///
+    /// # 为什么必须是一个函数（G-2 修的就是这里）
+    ///
+    /// 面板列表（`get_cached_balances`）在两次真值之间做**乐观修正**：
+    /// `delta = 当前 total_credits_used - credits_used_at_cache`，把 delta 从 remaining 里扣掉。
+    /// 这要求「缓存里的真值」与「基线」**成对更新**。
+    ///
+    /// 而此前只有后台温和刷新那条路径会更新基线（`refresh_all_balances_gently` 末尾那次
+    /// 回推），`get_balance`（面板「查看余额」）**只写缓存不动基线** ⇒ 新真值配着旧基线：
+    ///
+    /// - t0 后台刷新：remaining=100，基线=50 花费
+    /// - 期间花掉 20（total=70）→ 面板显示 100-20=80 ✅
+    /// - 用户点「查看余额」：上游真值 80（已含那 20），写进缓存，基线仍是 50
+    /// - 面板下一次轮询：80-(70-50)=**60** ❌ 那 20 被扣了两次
+    ///
+    /// 于是「查看余额」拿到 80、而列表显示 60，同一个号两个数字，且**越刷越低**，
+    /// 直到 30 分钟后的后台刷新才对上 —— 这正是"额度刷新不对/很慢"的一条实因。
+    ///
+    /// 收口成一个函数是刻意的：两条路径各写一份 `cache.insert` 正是漏改的根源
+    /// （与 `update.rs` 抽 `read_body_capped` 同一理由）。
+    fn commit_fresh_balance(&self, cache_key: String, balance: BalanceResponse) {
+        {
+            let mut cache = self.balance_cache.lock();
+            cache.insert(
+                cache_key.clone(),
+                CachedBalance {
+                    cached_at: Utc::now().timestamp() as f64,
+                    data: balance,
+                },
+            );
+        }
+        self.save_balance_cache();
+        // 只把**这一个账号**标记为"刚取到真值"。其余账号保留原基线 —— 见
+        // `push_balance_snapshots_to_scheduler` 的 `fresh_keys` 文档。
+        let mut fresh = HashSet::new();
+        fresh.insert(cache_key);
+        self.push_balance_snapshots_to_scheduler(&fresh);
+    }
+
     /// 把当前余额缓存 + 各号 total_credits_used 基线打包成 BalanceSnapshot 表,回推给调度器。
     /// 供余额加权分流:remaining/effective_limit 归一成剩余比例,credits_used 作累加修正基线。
-    fn push_balance_snapshots_to_scheduler(&self) {
+    ///
+    /// # `fresh_keys`：哪些账号的基线该被重置
+    ///
+    /// 只有**本次真的取到上游真值**的账号键才重置基线（`credits_used_at_cache` = 当前花费）。
+    /// 其余账号**保留原基线**。
+    ///
+    /// 为什么不能一律重置（原实现的缺陷）：基线与 `remaining_at_cache` 是一对，描述
+    /// 「在花费为 X 的那一刻剩余是 R」。若某号本轮刷新**失败**（cache 里仍是旧的 R），
+    /// 却把基线推到"现在"，那么 R 与新基线描述的不是同一时刻 ⇒ 期间已花掉的量被一次性
+    /// 抹掉 ⇒ 面板与调度器都把它当成**比实际更有余额**的号。
+    /// 表里原本没有该 id（新号 / 首次入表）时才回落到当前花费。
+    fn push_balance_snapshots_to_scheduler(&self, fresh_keys: &HashSet<String>) {
         use crate::kiro::token_manager::BalanceSnapshot;
+        // 上一轮的基线（保留用）。
+        let prev_baselines = self.token_manager.balance_baselines();
         // 各号当前累计花费(本地实时,作累加修正基线)。
         let used_by_id: std::collections::HashMap<u64, f64> = self
             .token_manager
@@ -963,30 +1344,52 @@ impl AdminService {
             .into_iter()
             .map(|e| (e.id, e.total_credits_used))
             .collect();
+        // 缓存按**账号**键 ⇒ 展开给共享它的每个凭据 id。
+        //
+        // 展开而非只给一个，是因为调度器按 id 查表：同组各份共享同一份上游配额，
+        // 它们的 remaining 本来就该相同。只给主份会让其余份「缺表」→ 调度侧按中性因子
+        // 1.0 处理 ⇒ 余额加权分流对分身完全失效（配额快耗尽时仍被当满额号选中）。
+        //
+        // `credits_used_at_cache` 仍**按各自 id 取**：那是本地累计花费的修正基线，
+        // 每份各自累加，不共享。
+        let key_to_ids = self.balance_key_to_ids();
         let snaps: std::collections::HashMap<u64, BalanceSnapshot> = {
             let cache = self.balance_cache.lock();
-            cache
-                .iter()
-                .filter_map(|(id, cb)| {
-                    let eff = if cb.data.effective_limit > 0.0 {
-                        cb.data.effective_limit
-                    } else {
-                        // 旧缓存可能无 effective_limit,回退 usage_limit(base)。<=0 则跳过(调度侧缺表=中性)。
-                        cb.data.usage_limit
-                    };
-                    if eff <= 0.0 {
-                        return None;
-                    }
-                    Some((
-                        *id,
+            let mut out: std::collections::HashMap<u64, BalanceSnapshot> =
+                std::collections::HashMap::new();
+            for (key, cb) in cache.iter() {
+                let eff = if cb.data.effective_limit > 0.0 {
+                    cb.data.effective_limit
+                } else {
+                    // 旧缓存可能无 effective_limit,回退 usage_limit(base)。<=0 则跳过(调度侧缺表=中性)。
+                    cb.data.usage_limit
+                };
+                if eff <= 0.0 {
+                    continue;
+                }
+                let ids: Vec<u64> = match key_to_ids.get(key) {
+                    Some(v) => v.clone(),
+                    None => key.parse::<u64>().map(|i| vec![i]).unwrap_or_default(),
+                };
+                let is_fresh = fresh_keys.contains(key);
+                for id in ids {
+                    let used_now = used_by_id.get(&id).copied().unwrap_or(0.0);
+                    out.insert(
+                        id,
                         BalanceSnapshot {
                             remaining_at_cache: cb.data.remaining,
                             effective_limit: eff,
-                            credits_used_at_cache: used_by_id.get(id).copied().unwrap_or(0.0),
+                            // 刚取到真值 → 基线归零到"现在"；否则保留原基线（缺表才回落）。
+                            credits_used_at_cache: if is_fresh {
+                                used_now
+                            } else {
+                                prev_baselines.get(&id).copied().unwrap_or(used_now)
+                            },
                         },
-                    ))
-                })
-                .collect()
+                    );
+                }
+            }
+            out
         };
         self.token_manager.set_balance_snapshots(snaps);
     }
@@ -1043,6 +1446,162 @@ impl AdminService {
         &self,
         req: AddCredentialRequest,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
+        // 普通上号路径：多开意图**只能**由 `copies > 1` 推断（去重保护的关键，
+        // 见下方 `is_multi_open` 处的长注释）。
+        self.add_credential_with_intent(req, false).await
+    }
+
+    /// 给**池中已有**的凭据再加 N 份分身（`POST /credentials/{id}/clone`）。
+    ///
+    /// # 为什么需要一个按 id 的端点
+    ///
+    /// 分身管理页列出的是凭据状态（`CredentialStatusItem`），里面只有 `apiKeyHash` 与
+    /// 掩码形式，**没有** `kiroApiKey` 原文 —— 这是刻意的（明文 key 不下发前端）。
+    /// 于是前端无法自己拼 `POST /credentials` 来给已有组加分身，只能让用户回到加号
+    /// 对话框重新粘一遍 key。按 id 走服务端读 key 是**严格更好**的方案：key 一步都不
+    /// 离开服务端。
+    ///
+    /// # 不重复实现份数逻辑
+    ///
+    /// 本方法只做「按 id 取出凭据 → 拼出等价的 AddCredentialRequest」，随后原样走
+    /// [`Self::add_credential_with_intent`]。去重绕过 / 组复用 / 序号原子预留 /
+    /// 节点池分配 / OAuth 拒绝 / 份数 clamp 全部沿用同一段实现，不存在第二条校验路径。
+    ///
+    /// # `force_multi_open` 为何是必须的
+    ///
+    /// 共享实现按 `copies > 1` 推断多开意图，于是 `copies == 1` 会走去重 →
+    /// 对一个**已在池中**的 key 必然撞 `凭据已存在`。而「再加 1 份」正是本端点最常见
+    /// 的用法，所以这里必须显式声明意图，而不是把判据改成 `copies.is_some()`
+    /// （后者会让普通上号路径永久丢掉误双击保护，那正是先前修掉的缺陷）。
+    ///
+    /// # `enabled` 缺省落到配置项 `cloneDefaultEnabled`（其默认 false ⇒ 建出来是**禁用**的）
+    ///
+    /// 见 [`CloneCredentialRequest::enabled`] 与
+    /// [`crate::model::config::Config::clone_default_enabled`] 的完整理由。要点：分身入池
+    /// 即被调度，而此刻出口/region 都还没核对过，实测出现过「4 个分身 24 秒内全被自动禁用、
+    /// 0% 成功」而真实流量正打在上面。显式请求值恒压过配置项。
+    ///
+    /// # `replace_primary = Some(true)` 时**先建后删**
+    ///
+    /// 建完 N 份再软删主份 `id`。顺序与用户原话（"先删后建"）相反是刻意的：主份是按 key
+    /// 继承 region 的唯一来源，先删会让每份分身 `apiRegion=None` → 恒 403。
+    /// 删除失败**不**判整个请求失败（分身已真的建出来了），只在 `message` 里点名。
+    /// 完整理由见 [`CloneCredentialRequest::replace_primary`]。
+    ///
+    /// ⚠️ 必须在**入池时**就是 disabled，不能"先建后批量禁用"——后者有中间窗口，
+    /// 那段时间调度器已经在往分身上发流量了。所以这里把意图翻译成
+    /// `AddCredentialRequest::disabled` 交给共享实现，由它写进每一份
+    /// （第 1 份走 `new_cred`，第 2..N 份是 `new_cred.clone()`，故天然逐份生效）。
+    /// **父号自身的启用状态不受影响**：本方法只读父号（`export_credential`），
+    /// 建出来的全是新条目。
+    pub async fn clone_credential(
+        &self,
+        id: u64,
+        copies: u32,
+        enabled: Option<bool>,
+        node_ids: Option<Vec<u64>>,
+        assign_primary_node: Option<bool>,
+        require_node_per_copy: Option<bool>,
+        replace_primary: Option<bool>,
+    ) -> Result<AddCredentialResponse, AdminServiceError> {
+        let cred = self
+            .token_manager
+            .export_credential(id)
+            .ok_or(AdminServiceError::NotFound { id })?;
+
+        // 先在这里拦一次 OAuth 号：共享实现也会拦（`multi_open_rejection_reason`），
+        // 但那要等构造完请求才判，而这里能给出带 id 的更直接的报错。
+        if let Some(reason) = multi_open_rejection_reason(&cred) {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "凭据 #{id} 不支持加分身：{reason}"
+            )));
+        }
+
+        let req = AddCredentialRequest {
+            // 只带身份字段。region 三兄弟 / subscriptionTitle / clone_group 都由共享
+            // 实现按 key 从池中既有号继承（那段逻辑本身就是为这个场景写的），
+            // 这里刻意不重复一遍，避免两处继承规则分叉。
+            auth_method: cred.auth_method.clone().unwrap_or_else(|| "api_key".into()),
+            kiro_api_key: cred.kiro_api_key.clone(),
+            // 与同组既有成员同调度档位：不带就会落 serde default 0，
+            // 新分身反而排在父号之前，凭空改变整池的调度顺序。
+            priority: cred.priority,
+            rpm_limit: cred.rpm_limit,
+            endpoint: cred.endpoint.clone(),
+            tag: cred.tag.clone(),
+            // ⭐ 分身默认**不启用**：`enabled` 缺省 → 落到配置项 `cloneDefaultEnabled`
+            // （其默认值 false ⇒ disabled = true，与本行之前的硬编码逐字节等价）。
+            //
+            // 必须是 `unwrap_or_else` 而不是把配置项 `unwrap_or` 到前面去：显式请求值
+            // （true **或** false）恒优先，配置项只在字段缺省时被查询 —— 否则服务端配成
+            // true 时面板上那个开关就"关不掉"了。
+            //
+            // 走 `AddCredentialRequest::disabled` 这个既有字段而不是另开一条路：
+            // 共享实现已经把它写进 `new_cred.disabled`，而第 2..N 份是 `new_cred.clone()`，
+            // 于是"每一份都禁用"不需要任何额外循环（也就不会撞上那道
+            // 「clone_credential 函数体里不得出现入池调用」的源码守卫）。
+            disabled: !enabled.unwrap_or_else(|| self.clone_default_enabled()),
+            // 调用方显式指定的节点 id 列表（可缺省）。原样透给共享实现 —— 解析 id、
+            // 跳过无效 id、按顺序逐份分配全部只有一份实现（见 `resolve_node_plan`）。
+            node_ids,
+            // ⭐ 本端点缺省 = **true**（第 1 份也从池里取节点），与
+            // `AddCredentialRequest` 的缺省相反。理由见 `CloneCredentialRequest`
+            // 上的长注释：这条路父号一字节不动，"主份"是本次新建的第 1 个分身，
+            // 与其余份完全同质；让它独独裸连而池里空着一个节点，正是 2026-08-05
+            // 修掉的那个缺陷。`unwrap_or(true)` 在这里而不在共享实现里，是因为
+            // 共享实现要为**两条入口的两个不同缺省**服务，把默认值写在入口侧才不打架。
+            assign_primary_node: Some(assign_primary_node.unwrap_or(true)),
+            require_node_per_copy,
+            // machineId 必须留空：分身的核心就是各自独立指纹（共享实现会派生+撞车轮换）。
+            // proxy_* 同样留空：本端点从不代用户决定出口，出口只来自节点池分配
+            // （`node_ids` 或自动），而 proxy_* 有值会被判成"调用方已显式指定代理"而不介入。
+            ..Default::default()
+        };
+        let mut created = self
+            .add_credential_with_intent(AddCredentialRequest { copies: Some(copies), ..req }, true)
+            .await?;
+
+        // ⭐ 勾了「删除主份」才走这里。**必须在共享实现之后**：主份是按 key 继承
+        // region/subscriptionTitle/cloneGroup 的唯一来源，先删就等于让每份分身丢 region
+        // → 恒 403（完整理由见 `CloneCredentialRequest::replace_primary`）。
+        //
+        // 删除失败不把整个请求判失败：N 份分身已经真的建出来了，回 Err 会让前端提示
+        // "生成失败"而池里凭空多了 N 份 —— 那比"主份没删掉"难排查得多。
+        // 所以失败只在 message 里点名，让用户手工删那一份。
+        if replace_primary.unwrap_or(false) {
+            match self.delete_credential_forced(id, true) {
+                Ok(()) => {
+                    created.message.push_str(&format!(
+                        "；已按「删除主份」删掉 #{id}（软删，可从「设置 → 回收站」恢复），\
+                         本组现由新建的 {copies} 份同质分身组成"
+                    ));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        credential_id = id,
+                        error = %e,
+                        "分身已建好但主份删除失败，需人工处理"
+                    );
+                    created.message.push_str(&format!(
+                        "；⚠️ 分身已建好，但主份 #{id} **删除失败**（{e}）—— \
+                         它仍在池中且没有独立出口，请手工删除或给它配一个节点"
+                    ));
+                }
+            }
+        }
+
+        Ok(created)
+    }
+
+    /// `add_credential` / `clone_credential` 共用的实现。
+    ///
+    /// `force_multi_open = true` 表示调用方**已显式声明多开意图**，此时即使
+    /// `copies == 1` 也按多开处理（绕去重 / 归组 / 预留序号）。
+    async fn add_credential_with_intent(
+        &self,
+        req: AddCredentialRequest,
+        force_multi_open: bool,
+    ) -> Result<AddCredentialResponse, AdminServiceError> {
         // 校验端点名：未指定则默认合法，指定则必须已注册
         if let Some(ref name) = req.endpoint {
             if !self.known_endpoints.contains(name) {
@@ -1069,16 +1628,86 @@ impl AdminService {
                     crate::http_client::split_proxy_credentials(raw);
                 (
                     Some(clean),
-                    req.proxy_username.clone().filter(|s| !s.is_empty()).or(inline_user),
-                    req.proxy_password.clone().filter(|s| !s.is_empty()).or(inline_pass),
+                    req.proxy_username
+                        .clone()
+                        .filter(|s| !s.is_empty())
+                        .or(inline_user),
+                    req.proxy_password
+                        .clone()
+                        .filter(|s| !s.is_empty())
+                        .or(inline_pass),
                 )
             }
             None => (None, None, None),
         };
 
+        // 份数（多开）：字段缺失 = 普通上号（默认，行为完全不变）。
+        // 显式给值时同一账号导入多份，每份自动获得独立 machineId，之后可各自配代理。
+        // 上限见 MAX_CREDENTIAL_COPIES 的说明。
+        //
+        // ⭐ 判据是**归一后的份数 > 1**（`is_multi_open`），不是「字段是否出现」。
+        // 先前写成 `req.copies.is_some()`：一个总是下发 `"copies": 1` 的 API 客户端
+        // （这是文档里那个"被 clamp 到 [1,16]"字段最自然的读法）就此**永久丢掉去重保护**，
+        // 还会得到一个只有 1 个成员的分身组 —— 而 copies=1 的语义明确就是"普通上号"
+        // （见 effective_copies：None 与 0 都归一为 1，三者同义）。
+        // 下面三处（inherited / clone_group / allow_dup）共用这一个判据，避免再次分叉。
+        //
+        // `force_multi_open` 是**另一条**入口的显式声明（`clone_credential`：按 id 给
+        // 已有号加分身）。它不改变本条推断规则 —— 普通上号路径恒传 false，
+        // 故 `copies: 1` 仍然享有去重保护。
+        let copies = effective_copies(req.copies);
+        let is_multi_open = force_multi_open || copies > 1;
+
+        // 真多开时，从**池中同 key 的既有号**继承请求未指定的关键字段。
+        //
+        // 🔴 修复的缺陷（线上实测复现）：分身只带 `authMethod` + `kiroApiKey` 时，
+        // `apiRegion` 为 None → CLI 端点的 `host()` 是 `q.{api_region}.amazonaws.com`，
+        // 拿不到就回退 config 默认（us-east-1）→ 而 `ksk_` token 是**按 region 授权**的
+        // → 上游回 403 `AccessDeniedException: The bearer token included in the request is invalid.`
+        //
+        // 实测对照：父号 `apiRegion=eu-central-1` 成功率 95%，而分身（region 为 None）
+        // **0% 成功、100% auth_failed**；补上 region 后同一批分身立刻变成 83/45/100/88%。
+        // 此前据此误判成「这个 key 不支持分身」，实际是本层丢了字段。
+        //
+        // 只继承「与身份/路由相关且分身必须一致」的字段。**刻意不继承**：
+        // - `machine_id` —— 分身的核心就是各自独立指纹（入池时自动轮换）
+        // - `proxy_*` —— 每份要配不同出口 IP，由调用方逐个设置
+        // - `disabled` / `disabled_reason` / `disabled_at` —— 父号被禁不该传染给分身
+        let inherited = if is_multi_open {
+            req.kiro_api_key
+                .as_deref()
+                .and_then(|k| self.token_manager.find_credential_by_api_key(k))
+        } else {
+            None
+        };
+        let inherit = |mine: Option<String>, pick: fn(&KiroCredentials) -> Option<String>| {
+            mine.or_else(|| inherited.as_ref().and_then(pick))
+        };
+
+        // 分身组标识：只在真多开（归一后份数 > 1）时赋予，单开保持 None。
+        // 判据用 `is_multi_open` 而非 `req.copies.is_some()`：后者会让 `copies: 1`
+        // 造出一个只有 1 个成员的分身组，分身管理页上凭空多出一组「独苗」。
+        //
+        // **优先复用池中同 key 既有号的组** —— 最常见的场景是「这个号已经导过了，
+        // 现在给它加 N 个分身」（正是 `allow_dup` 那段注释描述的场景）。若每次都生成新
+        // UUID，同一账号会在管理页上裂成两组，而用户看到的是同一个 key。
+        // 既有号没有组（多开功能之前导入的）时才新建一个。
+        let clone_group = if is_multi_open {
+            Some(
+                inherited
+                    .as_ref()
+                    .and_then(|c| c.clone_group.clone())
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            )
+        } else {
+            None
+        };
+
         // 构建凭据对象
         let email = req.email.clone();
-        let new_cred = KiroCredentials {
+        // `mut`：region 探测（见下方 probe_and_persist_api_region 后那段）需要把探到的
+        // api_region 回写进来，供 `for seq in 2..=copies` 的分身继承。
+        let mut new_cred = KiroCredentials {
             id: None,
             access_token: req.access_token,
             refresh_token: req.refresh_token,
@@ -1100,13 +1729,27 @@ impl AdminService {
             api_key: req.api_key,
             request_limit: req.request_limit,
             custom_api_first: req.custom_api_first,
-            region: req.region,
-            auth_region: req.auth_region,
-            api_region: req.api_region,
+            // ⭐ 三个 region 字段多开时必须继承（见上方 `inherited` 处的长注释）：
+            // `api_region` 决定 CLI 端点的 host（`q.{region}.amazonaws.com`），
+            // 而 ksk_ token 按 region 授权 —— 丢了它分身 100% 拿 403 bearer token invalid。
+            region: inherit(req.region, |c| c.region.clone()),
+            auth_region: inherit(req.auth_region, |c| c.auth_region.clone()),
+            api_region: inherit(req.api_region, |c| c.api_region.clone()),
+            // machine_id **刻意不继承**：分身的核心是各自独立指纹。
+            // 传 None 让入池逻辑按 key 派生（确定性）→ 与父号撞车 → 自动轮换成独立随机值。
             machine_id: req.machine_id,
             email: req.email,
             name: req.name,
-            subscription_title: None, // 将在首次获取使用额度时自动更新
+            clone_group: clone_group.clone(),
+            // 本份的序号在 `copies` 已知后才能定（要接着组内既有的最大值编号），
+            // 故此处留 None，由下方多开段统一回填。
+            clone_seq: None,
+            tag: req.tag.clone(),
+            // 订阅档位多开时继承：它是 opus 过滤的门控，父号已探到就不必再打一次
+            // web_portal（那是上游探测，会加重风控）。非多开时保持 None（首次用量查询自动填）。
+            subscription_title: inherited
+                .as_ref()
+                .and_then(|c| c.subscription_title.clone()),
             proxy_url,
             proxy_username,
             proxy_password,
@@ -1117,27 +1760,195 @@ impl AdminService {
             disabled_at: None,
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
+            // 新号默认跟随全局 `config.cliOriginKiroCli`（None）；本条为单号 A/B 排查
+            // 新增的旁路开关，尚未接入面板"新增凭据"表单，与既有面板行为零变化。
+            cli_origin_kiro_cli: None,
         };
 
-        // 份数（多开）：字段缺失 = 普通上号（默认，行为完全不变）。
-        // 显式给值时同一账号导入多份，每份自动获得独立 machineId，之后可各自配代理。
-        // 上限见 MAX_CREDENTIAL_COPIES 的说明。
-        let copies = effective_copies(req.copies);
+        // ⭐ OAuth 号不许多开：第 2..N 份带着同一个 refreshToken，而它每次刷新都被上游
+        // 轮换 → 除先刷新的那一份外全部 invalid_grant 被禁用。理由详见
+        // `multi_open_rejection_reason`。放在这里（构造完 new_cred、入池之前）：
+        // 判据要看归一后的字段（authMethod / kiroApiKey），且必须在任何写入之前。
+        if is_multi_open && let Some(reason) = multi_open_rejection_reason(&new_cred) {
+            return Err(AdminServiceError::InvalidCredential(reason));
+        }
 
-        // `copies` **是否出现**决定第 1 份要不要走去重，这是刻意的语义：
+        // ⭐ 节点分配计划必须在**第 1 份入池之前**算出来。
         //
-        // - 字段缺失（普通上号）→ 走正常去重，误双击仍会被 `凭据已存在` 拦住。
-        // - 字段显式给值（多开）→ **全部份都绕过去重**。
+        // 🔴 修复的缺陷：先前这段在 `copies > 1` 的块里（即第 1 份已经入池之后），
+        // 于是第 1 份**永远拿不到节点**。原注释把这写成一条刻意取舍（"它可能是池里已有
+        // 的号，覆盖会把在跑的号的出口换掉"），但那个理由只在「给已有号追加分身」时成立；
+        // 「选凭据生成分身」这条路建的是**全新条目**、`proxy_url` 为空，覆盖不掉任何东西。
+        // 实测：池里 5 个全启用、一次 copies=4，只有第 2/3/4 份拿到节点，主份裸连，
+        // 两个节点闲置 —— 而用户以为 4 份都分散了。
+        //
+        // 判据因此从「是不是第 1 份」改成「**这一份当前有没有代理**」：
+        // - 已有 `proxy_url` → 绝不覆盖（这才是那条注释真正要保护的东西）
+        // - 为空 → 从计划里取
+        // 主份本来就配了代理时行为与修复前完全一致（零回归）。
+        //
+        // 另两条取舍原样保留：**节点不足不轮询复用**（`assignments` 取完即止）、
+        // **调用方显式给了 proxy_url 时完全不介入**（下面这个 `is_none()` 门）。
+        //
+        // 「这一份有没有代理」——全部份共享同一个基线（第 2..N 份是 `new_cred.clone()`），
+        // 故这一个判断对所有份等价。**必须在主份点名节点之前算**：点名会写进
+        // `new_cred.proxy_url`，之后再读就恒为 false，第 2..N 份继承来的代理就不会被清 →
+        // 全部份共用主份那个出口（比直连更糟：直连至少看得出来没分散）。
+        let pool_may_assign = new_cred.proxy_url.is_none();
+
+        // 主份点名节点（对话框「出口 IP → 从池中选」）：解析成 (url, user, pass) 写进主份。
+        // 必须服务端按 id 解析 —— 节点密码从不下发前端，前端只有 hasPassword 布尔。
+        //
+        // `proxy_url` 已给时忽略本字段（显式 URL 是更强的意图），与 `pool_may_assign`
+        // 那道门同一原则。
+        let mut primary_pinned_node: Option<u64> = None;
+        if pool_may_assign && let Some(nid) = req.primary_node_id {
+            let picked = {
+                let nodes = self.socks_nodes.lock();
+                match nodes.iter().find(|n| n.id == nid) {
+                    // 已禁用也要拦：否则「禁用节点」这个开关在这条路上形同不存在。
+                    Some(n) if !n.enabled => Err("已禁用"),
+                    Some(n) => Ok((n.url.clone(), n.username.clone(), n.password.clone())),
+                    None => Err("不存在"),
+                }
+            };
+            match picked {
+                Ok((url, user, pass)) => {
+                    new_cred.proxy_url = Some(url);
+                    new_cred.proxy_username = user;
+                    new_cred.proxy_password = pass;
+                    primary_pinned_node = Some(nid);
+                }
+                // ⭐ 400 而不是"静默直连"或"静默换一个"：这是用户刚在下拉里点的节点，
+                // 两种静默都会让他以为出口是他选的那个（见 node_ids 的同款理由）。
+                Err(why) => {
+                    return Err(AdminServiceError::InvalidCredential(format!(
+                        "指定的出口节点 #{nid} {why}，已中止（**不会**静默改成直连或别的节点，\
+                         否则出口就不是你选的那个）。请在「分身管理」里确认该节点后重试。"
+                    )));
+                }
+            }
+        }
+
+        // 主份要不要参与池分配（4.1 的开关）。
+        //
+        // 缺省（`None`）按**份数**决定，而不是一律 false：
+        // - `copies == 1` → true。只有一份，池节点没有别的去处；此时"关掉"等于让
+        //   自动分配无处可去（下拉旁那个「自动分配」按钮就白点了）。
+        // - `copies > 1` → false（用户拍板的默认）。主份是用户亲手提交的那一条，
+        //   它的出口由表单里的「出口 IP」决定；池节点全部让给第 2..N 份，于是
+        //   `copies=N` 只需 **N-1** 个节点。
+        //
+        // `clone_credential` 这条路显式传 `Some(true)`：那里父号一字节不动，
+        // "主份"其实是本次新建的第 1 个分身，与其余份完全同质 —— 让它独独裸连而池里
+        // 空着一个节点，正是 2026-08-05 修掉的那个缺陷（见 `CloneCredentialRequest`
+        // 上的说明）。所以**这个默认值不改变既有那条路的行为**。
+        //
+        // 主份已点名节点时它已经有出口了，不再参与池分配（否则会被计划里的第 0 个顶掉）。
+        let assign_primary =
+            primary_pinned_node.is_none() && req.assign_primary_node.unwrap_or(copies == 1);
+
+        // 计划要留几个节点 = 本次真会去消费节点的份数。主份不参与时是 `copies - 1`；
+        // 传 `copies` 会多留一个永不被消费的节点，`rejected` 文案跟着不准。
+        let node_cap = if assign_primary {
+            copies as usize
+        } else {
+            copies.saturating_sub(1) as usize
+        };
+        // 非多开路径（普通上号）完全不进这里：计划恒空，否则每次上号都会被悄悄塞一个池节点。
+        // 例外是**调用方显式表达了池分配意图**（`assignPrimaryNode=true` / `nodeIds`），
+        // 否则「上号对话框选了池节点」这条路会变成一个静默无效的控件。
+        // （`primaryNodeId` 不在此列：它已在上面直接写进主份，不需要计划。）
+        let primary_intent = req.assign_primary_node == Some(true)
+            || req.node_ids.as_ref().is_some_and(|v| !v.is_empty());
+        let node_plan = if is_multi_open || primary_intent {
+            self.resolve_node_plan(req.node_ids.as_deref(), node_cap, primary_pinned_node)
+        } else {
+            NodePlan::default()
+        };
+
+        // 4.4 严格模式：凑不齐「每份一个独立节点」就整个请求失败，**一份也不建**。
+        //
+        // 位置是承重的：必须在 `reserve_clone_seqs`（下一段）与第 1 份入池之前。
+        // 放到入池之后就变成"建了一半再报错"，而放到号段预留之后会白烧掉一段组内序号
+        // → 分身管理页上出现永久空洞（#1 #2 #3 #7 #8），且每次重试都再烧一段。
+        //
+        // 只在池真的要介入时才判：`pool_may_assign` 为假（调用方显式给了 proxy_url）
+        // 时本次压根不走池分配，此时报"节点不够"是无中生有。
+        if req.require_node_per_copy == Some(true) && pool_may_assign && node_cap > 0 {
+            let have = node_plan.assignments.len();
+            if have < node_cap {
+                let rejected_note = if node_plan.rejected.is_empty() {
+                    String::new()
+                } else {
+                    let list = node_plan
+                        .rejected
+                        .iter()
+                        .map(|(id, why)| format!("#{id}（{why}）"))
+                        .collect::<Vec<_>>()
+                        .join("、");
+                    format!("（其中被跳过的：{list}）")
+                };
+                // 主份点名了节点 / 开关关着时，主份不消耗计划里的节点，故"能建几份"
+                // 要把它加回去（`have + 1`），否则建议值会少一份。
+                let primary_desc = if assign_primary {
+                    "参与分配"
+                } else {
+                    "不参与分配"
+                };
+                let suggest = if assign_primary { have } else { have + 1 };
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "节点不足：本次需要 {node_cap} 个可用节点（{copies} 份，主份{primary_desc}），\
+                     实际只有 {have} 个{rejected_note}。已**不建任何份**并中止 —— \
+                     绝不让多份共用同一个出口：那等于没分散，却让人以为分散了。\
+                     请先在「分身管理」里加节点/启用节点/重测失败节点，或把份数降到 {suggest}。"
+                )));
+            }
+        }
+
+        // ⭐ 组内序号**在任何 await 之前一次性全额预留**（见 `reserve_clone_seqs` 文档）。
+        //
+        // 🔴 修复的并发缺陷：先前是「入池后读一次 max 给第 1 份、循环前再读一次当基准」，
+        // 而这两次读之间、以及循环内每份入池都横跨 `.await`。两个并发的「给同一个 key
+        // 加 N 份」请求（两个面板标签页 / 脚本重试）会各自读到同一个 max，于是同一组里
+        // 出现两个 `#1`、两个 `#2` …… 管理页无法区分，删除时也无法指名。
+        //
+        // 预留放在这里的三个理由：
+        // - 在 OAuth 拒绝判断**之后** —— 被拒的请求不该白占号段（那会在组内留下永久空洞）。
+        // - 在**节点不足**判断之后 —— 同上，严格模式失败时不该烧号段。
+        // - 在第 1 份入池（下方 `.await`）**之前** —— 号段一旦发出就与入池进度无关，
+        //   这正是消除竞态的关键；放到入池之后就等于把竞态窗口原样留着。
+        let clone_seq_start = clone_group
+            .as_deref()
+            .map(|g| self.token_manager.reserve_clone_seqs(g, copies))
+            .unwrap_or(0);
+
+        let mut assigned_nodes = 0usize;
+        // 第 1 份：开关开着、有计划、且它本来没代理时才写。
+        if assign_primary
+            && pool_may_assign
+            && let Some((url, user, pass)) = node_plan.assignments.first()
+        {
+            new_cred.proxy_url = Some(url.clone());
+            new_cred.proxy_username = user.clone();
+            new_cred.proxy_password = pass.clone();
+            assigned_nodes += 1;
+        }
+
+        // **归一后份数 > 1** 决定第 1 份要不要走去重，这是刻意的语义：
+        //
+        // - 份数为 1（普通上号，含字段缺失 / `0` / `1`）→ 走正常去重，
+        //   误双击与「总是下发 copies:1 的客户端」都仍被 `凭据已存在` 拦住。
+        // - 份数 > 1（真多开）→ **全部份都绕过去重**。
         //
         // 为什么第 1 份也要绕：最常见的多开场景是「这个号已经导过了，现在给它加 N 个分身」。
         // 若第 1 份仍走去重，它会撞上 `凭据已存在（kiroApiKey 重复）` 并让整个请求失败，
         // 于是**给已有号加分身这条路根本走不通**（实测：#419/#420 已在池中，
         // 请求 copies=4 会在第 1 份就 bail，一个分身也建不出来）。
         //
-        // 绕过在此处是安全的：`copies` 是显式字段，误双击不会带上它
-        // （前端只在份数 >1 时才下发，见 add-credential-dialog.tsx）。
-        // 即"有 copies"本身就是调用方声明了多开意图，与 disabled 字段同款处理。
-        let allow_dup = req.copies.is_some();
+        // 绕过在此处是安全的：份数 >1 本身就是调用方声明了多开意图，误双击上号绕不到
+        // 这里（前端只在份数 >1 时才下发该字段，见 add-credential-dialog.tsx）。
+        let allow_dup = is_multi_open;
         let credential_id = if allow_dup {
             self.token_manager
                 .add_credential_allowing_duplicate(new_cred.clone())
@@ -1147,8 +1958,127 @@ impl AdminService {
         }
         .map_err(|e| self.classify_add_error(e))?;
 
-        // 主动获取订阅等级，避免首次请求时 Free 账号绕过 Opus 模型过滤
-        if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
+        // ⭐ region 自动探测：把该 `ksk_` 号真正可用的 region 写死进凭据。
+        //
+        // 必须在下面那次 `get_usage_limits_for` **之前** —— 那一次就是打
+        // `management.{region}.kiro.dev`，region 错的话它自己也会 403，
+        // 于是「订阅等级探测失败」只是错配的第一个受害者。
+        //
+        // 为什么必须有这一步（`region_probe.rs` 模块注释有完整实测表）：
+        // `ksk_` token 是**按 region 授权**的，打错区上游恒回 403
+        // `AccessDeniedException: The bearer token ... is invalid`。而不带任何 region
+        // 字段的凭据会一路回退到 `config.region`，于是它对不对纯靠运气。
+        // 实测无 region 号的「上号即废率」08-02=0% / 08-03=27% / 08-04=30%，正在恶化。
+        //
+        // 只探「api_key 且完全没有任何 region 字段」的号（判据在 probe_api_region 内），
+        // 已显式带 region 的是调用方的明确意图，绝不覆盖。
+        //
+        // ⭐ 判决必须接住（P0）：探不出可用 region 的号**保持禁用**，见下方处置。
+        let probe_outcome = self
+            .token_manager
+            .probe_and_persist_api_region(credential_id)
+            .await;
+
+        // 🔴 探测结果必须**回写进 `new_cred`**，否则下方 `for seq in 2..=copies` 里的
+        // `new_cred.clone()` 克隆的是**探测前的过期副本**（`api_region` 仍为 None）。
+        //
+        // 实测事故（2026-08-05 02:42，本行加入前）：父号 #525 被探测写上
+        // `eu-central-1` 并 95% 成功，而同批 4 个分身 #526–529 全部 `api_region=None`
+        // ⇒ 回退 `config.region=us-east-1` ⇒ `ksk_` 按区授权 ⇒ 恒 403
+        // `bearer token invalid` ⇒ 24 秒内三次失败全部被禁用、0% 成功。
+        //
+        // ⚠️ 这个缺陷是**接入探测才引入的**：探测之前父子都没有 region、一起废（症状一致，
+        // 一眼能看出是 region 问题）；接入之后变成「父好子坏」，反而更容易被误判成
+        // 「这个 key 不支持分身」。所以回写不是优化，是这条路径的正确性前提。
+        if let Some(probed) = self
+            .token_manager
+            .export_credential(credential_id)
+            .and_then(|c| c.api_region)
+        {
+            if new_cred.api_region.as_deref() != Some(probed.as_str()) {
+                tracing::info!(
+                    "分身继承：把父号 #{} 探测到的 api_region={} 回写进本次请求，供后续 {} 份分身继承",
+                    credential_id,
+                    probed,
+                    copies.saturating_sub(1)
+                );
+                new_cred.api_region = Some(probed);
+            }
+        }
+
+        // ⭐ P0：探不出可用 region 的号**保持禁用**，且让分身一并继承禁用态。
+        //
+        // 线上事故（2026-08-05 05:41–05:43）：#536–550 共 15 个号以**启用态**入池，
+        // 探测要 1~2 秒，窗口里真实流量打到错区恒回 403，`MAX_FAILURES_PER_CREDENTIAL=3`
+        // 三次即自动禁用 ⇒ 每个号只跑了 1~6 个请求、**0 成功**就死了。而 4 分钟后
+        // 同一批 key 的 #551–556 探到 `eu-central-1`，其中一个跑到 881/881 全成功。
+        // 差别只有几百毫秒的时序。
+        //
+        // ⚠️ **分身必须一并禁用**：分身继承父号的 `api_region`（上方回写块），父号探不到时
+        // 它们继承到的是 `None` ⇒ 回退 `config.region` ⇒ 与父号同样恒 403。
+        // 历史事故正是这个形态（父号 #525 探到 eu-central-1 而 4 个分身 api_region=None，
+        // 24 秒内全部被禁用）。所以这里改 `new_cred.disabled`，让下方
+        // `for seq in 2..=copies` 里的每一份 `new_cred.clone()` 都带上禁用态 ——
+        // 而不是建完再批量禁用（那有中间窗口，分身会先接一波流量）。
+        let region_probe_failed = matches!(
+            probe_outcome,
+            crate::kiro::region_probe::ProbeOutcome::NoUsableRegion
+                | crate::kiro::region_probe::ProbeOutcome::TokenDead
+        );
+        // custom_api 不属于 Kiro region 体系：即使未来探测层误返了失败判决，
+        // 这一层也必须保持管理员的 enabled 状态，不得让代挂站自动关闭。
+        if region_probe_failed && !new_cred.is_custom_api_credential() {
+            self.token_manager
+                .mark_region_probe_failed(credential_id, &probe_outcome);
+            new_cred.disabled = true;
+        }
+
+        // ⭐ 账户级临时风控（403 `TEMPORARILY_SUSPENDED`）挡住了探测：**刻意不禁用**。
+        //
+        // 这一条与上面的 `region_probe_failed` 是两种完全不同的结论，必须分开处置：
+        // - `NoUsableRegion` = 探过了、确定不行 → 禁用是对的
+        // - `AccountThrottled` = **探不了**（风控挡在 region 授权校验之前，拿不到任何 region 信息）
+        //
+        // 为什么不禁用（这条是承重的，改成禁用会造成真实损失）：
+        // ① `ids_needing_region_probe`（token_manager.rs 内）过滤 `!e.disabled` ——
+        //    一旦禁用，**连重启时的存量回填都不再重探**它，风控过去了也永远不会自愈。
+        // ② 不禁用的最坏态只是退回「探测接入前的基线」（api_region=None → 回退 config.region
+        //    轮盘）；而若真打错区，会走 `report_failure` → `TooManyFailures`，
+        //    **那个原因在 `is_self_healable_reason` 白名单里**，是可自愈的。
+        //    即不禁用的最坏态严格优于禁用（后者是需人工的永久态）。
+        //
+        // 事故背景：这类 403 占近 2h 流量 22.3%（CLAUDE.md），是常态不是罕见；而
+        // `MAX_CONSECUTIVE_SUSPICIOUS_BEFORE_DISABLE = 6` 存在的唯一理由就是
+        // 「见过一次 403 不足以判死」—— 探测路径若用一次 403 就判死，等于绕过那道阈值。
+        let region_probe_throttled = matches!(
+            probe_outcome,
+            crate::kiro::region_probe::ProbeOutcome::AccountThrottled
+        );
+        if region_probe_throttled {
+            tracing::warn!(
+                credential_id,
+                "region 探测被账户级临时风控挡住，未能确定 region：该号以 config.region 回退入池\
+                 （**未禁用**，见此处注释）。风控过去后重启会由存量回填自动重探；\
+                 若急需确定 region，可在面板手动设置 apiRegion"
+            );
+        }
+
+        // 主动获取订阅等级，避免首次请求时 Free 账号绕过 Opus 模型过滤。
+        //
+        // 探测失败时跳过：这一次打的正是 `management.{region}.kiro.dev`，region 都没探到
+        // 就必然 403 —— 白付一次上游往返，而上号是用户交互路径（面板要多转一次圈）。
+        // 订阅档位留 None 是安全的：`supports_opus()` 对 None 返 true（不误挡），
+        // 人工确认 region 并启用后，首次真实使用会自动补齐。
+        //
+        // ⭐ `AccountThrottled` 同样跳过，理由同源且更强：号正被账户级风控挡着，
+        // 打 `management.*` 查订阅等级**同样会 403** —— 白付一次上游往返，而这是用户交互路径。
+        if region_probe_failed || region_probe_throttled {
+            tracing::info!(
+                credential_id,
+                throttled = region_probe_throttled,
+                "region 探测未得出结论，跳过订阅等级探测（同一 region host 必然 403）"
+            );
+        } else if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
             tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
         }
 
@@ -1157,6 +2087,18 @@ impl AdminService {
         self.token_manager.spawn_initial_refresh(credential_id);
 
         let mut credential_ids = vec![credential_id];
+
+        // 回填第 1 份的组内序号。用**预留号段的首号**，绝不在这里重新扫 max ——
+        // 重新扫就是那条并发缺陷本身（此刻其它请求的份可能还没落进 entries）。
+        if let Some(ref group) = clone_group {
+            if let Err(e) = self.token_manager.set_clone_identity(
+                credential_id,
+                Some(group.clone()),
+                Some(clone_seq_start),
+            ) {
+                tracing::warn!("回填分身序号失败（不影响凭据可用性）: {}", e);
+            }
+        }
 
         if copies > 1 {
             // 订阅档位**只探一次**再透给其余份。
@@ -1173,9 +2115,48 @@ impl AdminService {
                 .export_credential(credential_id)
                 .and_then(|c| c.subscription_title);
 
+            // 第 2..N 份的节点：计划里**去掉已给第 1 份的那个**之后的尾巴。
+            //
+            // 这是节点池唯一的消费方 —— 没有它，节点表就是一张没人读的表
+            // （加了节点、建了分身，每份仍然直连、共用服务器同一个出口 IP，
+            // 而用户以为已经分散了）。
+            //
+            // 切尾巴而不是直接按 `seq-1` 索引整份计划：第 1 份可能因为已有 `proxy_url`
+            // 而没消费计划里的第 0 个（见上方 `pool_may_assign`），此时那个节点应当
+            // 顺延给第 2 份，而不是空掉。故尾巴的起点取决于第 1 份实际消费了几个。
+            //
+            // 两条刻意的取舍原样保留（第三条"第 1 份不分配"已被修掉，见上方长注释）：
+            // - **节点不足时不轮询复用**：复用同一节点的两份共用一个出口 IP，
+            //   等于没分散，却让人以为分散了。宁可让多出来的份直连并在响应里明说。
+            // - **调用方显式给了 proxy_url 时完全不介入**：那是明确意图，优先于池分配。
+            let assignable: &[(String, Option<String>, Option<String>)] = if pool_may_assign {
+                node_plan.assignments.get(assigned_nodes..).unwrap_or(&[])
+            } else {
+                &[]
+            };
             for seq in 2..=copies {
                 let mut copy = new_cred.clone();
                 copy.subscription_title = resolved_title.clone();
+                // 组内序号逐份递增，全部取自**本次预留的那一段**。`seq` 是本次请求内的
+                // 份号（2..=copies），而落盘的是**组内**序号 —— 两者在「给已有组加分身」
+                // 时不相等，不能混用。
+                copy.clone_seq = Some(clone_seq_start + seq - 1);
+                // ⚠️ 先清掉从 `new_cred` 继承来的代理，再按计划写本份的。
+                // 不清就会**继承第 1 份的出口** —— 那正是"两份共用一个出口 IP"，
+                // 比直连更糟（直连至少看得出来没分散）。
+                // `pool_may_assign` 为假（调用方显式给了代理）时不清，那是明确意图。
+                if pool_may_assign {
+                    copy.proxy_url = None;
+                    copy.proxy_username = None;
+                    copy.proxy_password = None;
+                }
+                // 逐份取一个不同节点；取完即止（不复用，见上）。
+                let picked = assignable.get(seq as usize - 2);
+                if let Some((url, user, pass)) = picked {
+                    copy.proxy_url = Some(url.clone());
+                    copy.proxy_username = user.clone();
+                    copy.proxy_password = pass.clone();
+                }
                 // machineId 置 None：让入池逻辑按 kiroApiKey/refreshToken 派生 —— 派生是
                 // 确定性的，故与第 1 份撞车，随后被撞车检测轮换成独立随机指纹（防关联）。
                 // 这正是"每份机器码不同"的来源，不需要调用方自己造。
@@ -1188,6 +2169,16 @@ impl AdminService {
                     Ok(id) => {
                         self.token_manager.spawn_initial_refresh(id);
                         credential_ids.push(id);
+                        // ⭐ 计数在**入池成功之后**才加。
+                        //
+                        // 修的是一处真实的文案偏差：先前 `assigned_nodes += 1` 紧跟在
+                        // 赋值处（入池之前），第 2..N 份入池失败时 `credential_ids`
+                        // 不增长而计数已增长 → 下方 `unassigned` 的两次
+                        // `saturating_sub` 把差额吃成 0 → 响应声称「已为 N 份分配独立
+                        // 出口 IP」，而那 N 份里有几份根本没建出来。
+                        if picked.is_some() {
+                            assigned_nodes += 1;
+                        }
                     }
                     // 部分失败不回滚已建成的份：与 `import/keys` 的既有约定一致
                     // （部分失败仍返回成功并逐条标记）。回滚反而会把第 1 份也删掉，
@@ -1205,13 +2196,167 @@ impl AdminService {
             }
         }
 
+        // ⭐ 同 key（= 同一个上游账号）的**其它**凭据。一次查、两处用：告警 + 组标识回填。
+        //
+        // 🔴 判据必须是 **key** 而不是 `clone_group`。线上实测的那组数据就是反例：
+        // `#776` keyHash=029fdd8929、**无 clone_group、无代理**，`#778–787` 同 key 同组
+        // 各有独立 SOCKS —— 11 份共用一个上游账号，其中 1 份从服务器裸 IP 出去。
+        // 按组去找同账号成员，漏掉的恰好是最该被看见的那一份（组标识是后来加分身才有的，
+        // 最先入池的那一份天然没有）。这就是本缺陷能长期存活的原因。
+        //
+        // ⚠️ 顺序是承重的：**必须在下面那段回填之前**取名单。回填会把父号补进组里，
+        // 之后再查就无法区分「按 key 查」与「按组查」了 —— 于是有人把判据改坏也测不出来。
+        let same_key_peers = new_cred
+            .kiro_api_key
+            .as_deref()
+            .filter(|_| is_multi_open)
+            .map(|k| self.token_manager.peers_sharing_api_key(k, &credential_ids))
+            .unwrap_or_default();
+
+        // ⛔ 只告警，**绝不**给这些号写 `proxy_url`。
+        //
+        // 用户已就此拍板：`proxy_url` 是**用户的显式配置**，「没有代理」也可能是一个刻意的
+        // 状态（比如留一份直连做对照）。本仓一贯范式（`effective_endpoint` / `api_region`
+        // 都是这样）：显式配置优先，绝不擅自覆盖。所以这里给的是判据 + 后果 + 处置建议，
+        // 由人来决定。
+        //
+        // 为什么这值得占一句响应文案：同账号流量集中在少数 IP 上会被上游按账号关联。
+        // 同一天的实测：克隆某号 10 份并全部启用，**15 分钟后**父号连同 10 份分身
+        // （线上 `[749, 766-775]` 共 11 个）全部被 `suspiciousActivityAuto` 禁用。
+        // 而这里的形态更隐蔽 —— 10 份有独立 IP、1 份没有，代理存在的意义在那一份上是空的，
+        // 而面板上它长得和别的份一样。
+        let bare_exit_peers: Vec<u64> = same_key_peers
+            .iter()
+            .filter(|p| !p.has_own_exit)
+            .map(|p| p.id)
+            .collect();
+
+        // ⭐ 给缺 `clone_group` 的同 key 成员回填组标识（用户已同意）。
+        //
+        // 与上面「不改父号代理」不矛盾，两者性质不同，这个区别必须写下来，否则将来会有人
+        // 照着本段的先例去改 `proxy_url`：
+        // - `clone_group` 是**系统内部的分组标识**，没有语义选择余地 —— 那个号确实属于
+        //   这个账号组，缺组只是「它入池时本字段还不存在」的历史债。
+        // - `proxy_url` 是**用户的显式配置**，有语义选择余地（直连也可能是刻意的）。
+        //
+        // 只写 `clone_group`：`clone_seq` 原样带回（老成员多为 `None`，本次不给它编号 ——
+        // 编号要走 `reserve_clone_seqs` 发号，在这里凭空塞一个会与组内既有号撞车）。
+        //
+        // ⚠️ 前端 `clone-management-card.tsx::groupClones` 那套 `apiKeyHash` 回落分组
+        // **本轮刻意不动**：线上还有历史数据一个组标识都没有（该文件注释记载：回收站 349 条
+        // 里 23 组 / 65 个凭据属于老数据，其中一组 9 份），删了它们的分组关系当场丢失。
+        // 本段只让**新产生的**数据不再欠这笔债。回落逻辑可以退役的判据写在那个函数的注释里。
+        for peer in same_key_peers.iter().filter(|p| p.clone_group.is_none()) {
+            if let Some(ref group) = clone_group {
+                if let Err(e) = self.token_manager.set_clone_identity(
+                    peer.id,
+                    Some(group.clone()),
+                    peer.clone_seq,
+                ) {
+                    tracing::warn!(
+                        "给同 key 的凭据 #{} 回填分身组失败（不影响本次新建的份）: {}",
+                        peer.id,
+                        e
+                    );
+                }
+            }
+        }
+
         let created = credential_ids.len();
-        let message = if copies > 1 {
+        let message = if is_multi_open {
+            // 如实报告节点分配结果：分了几份、还有几份直连、指定了哪些无效 id。
+            // 「加了节点却仍然直连」是这条路最容易踩空又最难自查的地方，
+            // 必须在响应里说清，而不是让用户逐个点开卡片才发现。
+            //
+            // ⚠️ 基数是「本次**该**去消费节点的份数」，不是 `created`，也不再是 `created - 1`：
+            // - 主份参与分配（`assignPrimaryNode` 开 / clone 路径）→ 基数 = `created`。
+            //   写死 `created - 1` 会让「2 份 2 节点」这种全额分配报成"有 1 份直连"。
+            // - 主份不参与（`POST /credentials` 的缺省）→ 基数 = `created - 1`。
+            //   写死 `created` 会把**按设置刻意直连**的主份算进"因启用节点不足而直连"，
+            //   那是一句假归因：用户明明凑齐了 N-1 个节点，却被告知节点不够。
+            let pool_targets = if assign_primary {
+                created
+            } else {
+                created.saturating_sub(1)
+            };
+            let unassigned = pool_targets.saturating_sub(assigned_nodes);
+            // 主份刻意不参与时必须单独说一句，否则用户看不出「为什么主份没有出口」
+            // 到底是设置如此还是节点不够 —— 这两件事的处理方式完全不同。
+            let primary_note = match primary_pinned_node {
+                Some(nid) => format!(
+                    "；主份走你点名的节点 #{nid}（未参与池分配，故第 2..N 份只需 {} 个节点）",
+                    copies.saturating_sub(1)
+                ),
+                None if !assign_primary && pool_may_assign && copies > 1 => format!(
+                    "；主份按「主份也从池取节点=关」保持自身出口（未参与池分配，\
+                     故本次只需 {} 个节点）",
+                    copies.saturating_sub(1)
+                ),
+                None => String::new(),
+            };
+            let proxy_note = if assigned_nodes == 0 {
+                // 主份点名了节点时不能说"未从节点池分配代理"——那是假的（它就来自池）。
+                // 这里说的是**第 2..N 份**一个都没分到。
+                let subject = if primary_pinned_node.is_some() || !assign_primary {
+                    "第 2..N 份未从节点池分配代理"
+                } else {
+                    "未从节点池分配代理"
+                };
+                format!(
+                    "{subject}（池内无启用节点/最近测活失败，或已显式指定代理）——\
+                     各份将共用服务器同一出口 IP，如需分散请在「分身管理」里添加节点后重建分身{primary_note}"
+                )
+            } else if unassigned == 0 {
+                format!("已从节点池为 {assigned_nodes} 份分配独立出口 IP{primary_note}")
+            } else {
+                format!(
+                    "已从节点池为 {assigned_nodes} 份分配独立出口 IP；\
+                     另有 {unassigned} 份因启用节点不足而直连（刻意不复用节点：\
+                     复用等于共用出口，反而掩盖问题）{primary_note}"
+                )
+            };
+            // 指定了却用不上的 node id 必须逐条点名。静默吃掉它们的话，用户看到的是
+            // 「我明明选了节点，怎么还是直连」——而这正是最容易踩空的那一步。
+            let rejected_note = if node_plan.rejected.is_empty() {
+                String::new()
+            } else {
+                let list = node_plan
+                    .rejected
+                    .iter()
+                    .map(|(id, why)| format!("#{id}（{why}）"))
+                    .collect::<Vec<_>>()
+                    .join("、");
+                format!(
+                    "；⚠️ 指定的节点 {list} 未生效，已跳过（**不会**静默替换成别的节点，\
+                     否则出口就不是你选的那个）"
+                )
+            };
+            // 同账号里有份走服务器裸 IP —— 必须点名，且必须说清「本次没动它」。
+            // 不点名的话，用户在面板上看到的是「N 份都有 socks」，那一份长得和别的一样
+            // （它甚至可能被显示成组里的最后一份），而它把整组的账号关联度拉满了。
+            let bare_exit_note = if bare_exit_peers.is_empty() {
+                String::new()
+            } else {
+                let list = bare_exit_peers
+                    .iter()
+                    .map(|id| format!("#{id}"))
+                    .collect::<Vec<_>>()
+                    .join("、");
+                format!(
+                    "；🔴 同一把 key 的凭据 {list} **没有独立出口**（proxyUrl 为空或 direct，\
+                     即走服务器裸 IP），而它与本组共用同一个上游账号 —— \
+                     同账号流量集中在一个 IP 上会被按账号关联风控（实测：一次克隆 10 份并全部启用，\
+                     15 分钟后父号连同 10 份分身全部被 suspiciousActivity 自动禁用）。\
+                     **本次未改动它的代理设置**（那是显式配置，不擅自覆盖）：\
+                     请在「分身管理」里给它配一个节点，或确认它就是要走服务器出口\
+                     （比如刻意留一份做对照）"
+                )
+            };
             format!(
-                "凭据添加成功（多开 {}/{} 份），ID: {:?}。每份已分配独立 machineId；\
-                 如需多出口 IP，请在各自卡片上配置代理。注意 rpmLimit 是每凭据的，\
-                 多份共用同一账号配额，建议按账号实测上限 ÷ 份数逐号调整。",
-                created, copies, credential_ids
+                "凭据添加成功（多开 {}/{} 份），ID: {:?}。每份已分配独立 machineId；{}{}{}。\
+                 注意 rpmLimit 是每凭据的，多份共用同一账号配额，\
+                 建议按账号实测上限 ÷ 份数逐号调整。",
+                created, copies, credential_ids, proxy_note, rejected_note, bare_exit_note
             )
         } else {
             format!("凭据添加成功，ID: {}", credential_id)
@@ -1221,7 +2366,7 @@ impl AdminService {
             success: true,
             message,
             credential_id,
-            credential_ids: if copies > 1 {
+            credential_ids: if is_multi_open {
                 Some(credential_ids)
             } else {
                 None
@@ -1253,7 +2398,10 @@ impl AdminService {
     /// 观测计数，二者语义都不是"最大并发数"。为不新造一套并发机制，该值**只在响应里
     /// 原样回显**，不写入任何凭据字段、不影响调度。它也**不是**本函数的导入并发度：
     /// 导入并发由 [`IMPORT_MAX_IN_FLIGHT`] 固定，避免调用方传个 300 就把上游打爆。
-    pub async fn import_keys(self: &std::sync::Arc<Self>, req: ImportKeysRequest) -> ImportKeysResponse {
+    pub async fn import_keys(
+        self: &std::sync::Arc<Self>,
+        req: ImportKeysRequest,
+    ) -> ImportKeysResponse {
         let started = std::time::Instant::now();
         let total = req.items.len();
 
@@ -1319,11 +2467,15 @@ impl AdminService {
         // 后者有一个真实的窗口：两步之间号已在池中且可被调度，若此时正好来请求，
         // 一个本该禁用的号（通常是已知被封的号）会被真的拿去打上游。
         // 一步到位后该窗口不存在，也省掉了「已导入但置禁用失败」这个半成功状态。
+        // `api_region` 必须透下去：`ksk_` 是按区授权的 token，打错区恒 403。
+        // 推号方给了就用（比探测权威——它知道这把 key 注册在哪，且省一次上游往返），
+        // 没给则留 None，由 `add_credential` 内的 `probe_and_persist_api_region` 去探。
         let add_req = AddCredentialRequest {
             auth_method: "api_key".to_string(),
             kiro_api_key: Some(item.key),
             endpoint: item.endpoint,
             disabled: item.disabled,
+            api_region: item.api_region,
             ..Default::default()
         };
         match self.add_credential(add_req).await {
@@ -1351,16 +2503,16 @@ impl AdminService {
 
     /// 删除凭据，`force=true` 跳过「必须先禁用」这道门（仍进回收站，可恢复）。
     pub fn delete_credential_forced(&self, id: u64, force: bool) -> Result<(), AdminServiceError> {
+        // ⚠️ 键必须在删除**之前**算：删掉后 export_credential 返 None，键会回落成 id
+        // 字符串，清的就不是真正那条账号键了（见 prune_balance_cache_for_deleted）。
+        let cache_key = self.balance_cache_key(id);
+
         self.token_manager
             .delete_credential_forced(id, force)
             .map_err(|e| self.classify_delete_error(e, id))?;
 
-        // 清理已删除凭据的余额缓存
-        {
-            let mut cache = self.balance_cache.lock();
-            cache.remove(&id);
-        }
-        self.save_balance_cache();
+        // 清理已删除凭据的余额缓存 —— 但同 key 的分身还在时**不清**（那是共享的一条）。
+        self.prune_balance_cache_for_deleted(&cache_key);
 
         Ok(())
     }
@@ -1377,14 +2529,14 @@ impl AdminService {
     /// 删除是逐号独立的软删（进回收站），没有跨号事务语义。整体回滚反而更糟：
     /// 用户选了 10 个号、其中 1 个 id 不存在，不该让另外 9 个都删不掉。
     /// 逐条返回 `ok`/`error` 让前端能精确提示"成功 9 个，失败 1 个（原因）"。
-    pub fn delete_credentials_batch(
-        &self,
-        ids: &[u64],
-        force: bool,
-    ) -> Vec<BatchDeleteItemResult> {
+    pub fn delete_credentials_batch(&self, ids: &[u64], force: bool) -> Vec<BatchDeleteItemResult> {
         ids.iter()
             .map(|&id| match self.delete_credential_forced(id, force) {
-                Ok(()) => BatchDeleteItemResult { id, ok: true, error: None },
+                Ok(()) => BatchDeleteItemResult {
+                    id,
+                    ok: true,
+                    error: None,
+                },
                 Err(e) => BatchDeleteItemResult {
                     id,
                     ok: false,
@@ -1392,6 +2544,107 @@ impl AdminService {
                 },
             })
             .collect()
+    }
+
+    /// 批量清理「已禁用」凭据：走 `delete_credential`（进**回收站**，可恢复），
+    /// 排除代挂号与**可自愈**原因。
+    ///
+    /// # 为什么排除可自愈原因
+    ///
+    /// 见 [`CLEANUP_SELF_HEALABLE_REASONS`]：被那几个原因禁用的号，禁用态本身是瞬时的，
+    /// 自愈会把它们原地复活。删掉它们不是"清死号"，是把健康号从池里拿走。
+    ///
+    /// # 为什么候选由服务端算
+    ///
+    /// 判据是「已禁用 且 不是代挂 且 原因不可自愈」，而"是不是代挂"的权威判据是
+    /// [`KiroCredentials::is_custom_api_credential`]（`auth_method == custom_api`
+    /// **或** `base_url.is_some()` 的旧数据兜底）。让前端自己按下发字段拼一份必然漂移
+    /// —— 漂移的后果是**误删代挂号**，而代挂号是用户真金白银买的第三方中转，
+    /// 删错了从回收站捞回来也得重配。所以判据只有服务端这一份。
+    ///
+    /// # 为什么不用 force
+    ///
+    /// 清理目标本来就是**已禁用**的号，`delete_credential`（force=false）那道
+    /// 「必须先禁用」的门天然满足。刻意不传 force：万一筛选逻辑将来出 bug 把一个
+    /// **在服务中**的号选进候选，那道门会挡住它 —— 这是最后一层护栏，白拿的。
+    ///
+    /// # 上限
+    ///
+    /// 与 `MAX_BATCH_DELETE_IDS` 同理由（adminKey 明文存 localStorage 且全仓无 CSP，
+    /// 无上限的批量删除会放大 XSS 的破坏面）。超出部分按 id 升序留给**下一次调用**，
+    /// 并在 `skipped` 里以 `over_limit` 显式告知，让重复调用能收敛，而不是静默丢弃。
+    pub fn cleanup_disabled_credentials(&self, dry_run: bool) -> CleanupDisabledResponse {
+        // 只看已禁用的号。未禁用的根本不是候选，连 skipped 都不进（那会把
+        // 整池都列进响应，噪音掩埋真正被排除的那几条）。
+        let disabled: Vec<(u64, Option<String>)> = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .filter(|e| e.disabled)
+            .map(|e| (e.id, e.disabled_reason))
+            .collect();
+        let disabled_total = disabled.len();
+
+        let mut candidates: Vec<u64> = Vec::new();
+        let mut skipped: Vec<CleanupSkippedItem> = Vec::new();
+        for (id, reason) in disabled {
+            // 代挂判据必须问**真凭据**而不是快照字段：快照的 auth_method 对
+            // 「custom_api 且带 kiroApiKey」的号会显示成 `api_key`（见 snapshot 里的
+            // is_api_key_credential 分支），只看快照会把这类号误判成 Kiro 死号。
+            // 取不到 = 刚被别人删掉的竞态。`None` 原样传下去，让判据报 `not_in_pool`
+            // 而不是塞成 `true` 混进代挂 —— 见 `cleanup_verdict` 第一道排除。
+            let is_custom_api = self
+                .token_manager
+                .export_credential(id)
+                .map(|c| c.is_custom_api_credential());
+            match cleanup_verdict(is_custom_api, reason.as_deref()) {
+                Some(reason) => skipped.push(CleanupSkippedItem { id, reason }),
+                None => candidates.push(id),
+            }
+        }
+
+        // 升序 + 截断：保证"超出上限时留下哪些"是确定的，重复调用才能逐批收敛。
+        candidates.sort_unstable();
+        if candidates.len() > MAX_CLEANUP_DISABLED_IDS {
+            for id in candidates.split_off(MAX_CLEANUP_DISABLED_IDS) {
+                skipped.push(CleanupSkippedItem {
+                    id,
+                    reason: CLEANUP_SKIP_OVER_LIMIT,
+                });
+            }
+        }
+
+        if dry_run || candidates.is_empty() {
+            return CleanupDisabledResponse {
+                dry_run,
+                disabled_total,
+                candidates,
+                skipped,
+                deleted: 0,
+                failed: 0,
+                results: Vec::new(),
+            };
+        }
+
+        tracing::info!(
+            count = candidates.len(),
+            skipped = skipped.len(),
+            "批量清理已禁用凭据（进回收站，可恢复；代挂号与可自愈原因已排除）"
+        );
+        // force=false：见本方法文档「为什么不用 force」。
+        let results = self.delete_credentials_batch(&candidates, false);
+        let deleted = results.iter().filter(|r| r.ok).count();
+        let failed = results.len() - deleted;
+        CleanupDisabledResponse {
+            dry_run,
+            disabled_total,
+            candidates,
+            skipped,
+            deleted,
+            failed,
+            results,
+        }
     }
 
     /// 列出回收站中的已删除凭据
@@ -1428,30 +2681,33 @@ impl AdminService {
     }
 
     /// 从回收站恢复凭据
-    pub fn restore_credential(&self, id: u64) -> Result<(), AdminServiceError> {
+    ///
+    /// `force`：跳过 key 重复校验，用于恢复**多开分身**（它与主凭据必然同 key）。
+    /// 默认路径（false）保留误操作护栏。恢复后仍是禁用态，故强制恢复不会立刻投入调度。
+    pub fn restore_credential(&self, id: u64, force: bool) -> Result<(), AdminServiceError> {
         self.token_manager
-            .restore_credential(id)
+            .restore_credential(id, force)
             .map_err(|e| self.classify_trash_error(e, id))
     }
 
     /// 从回收站彻底删除凭据（不可恢复）
     pub fn purge_credential(&self, id: u64) -> Result<(), AdminServiceError> {
+        // 同 delete_credential_forced：键在删除前算。
+        let cache_key = self.balance_cache_key(id);
+
         self.token_manager
             .purge_credential(id)
             .map_err(|e| self.classify_trash_error(e, id))?;
 
-        // 清理彻底删除凭据的余额缓存残留
-        {
-            let mut cache = self.balance_cache.lock();
-            cache.remove(&id);
-        }
-        self.save_balance_cache();
+        // 清理彻底删除凭据的余额缓存残留 —— 同 key 的分身还在时不清。
+        self.prune_balance_cache_for_deleted(&cache_key);
 
         Ok(())
     }
 
     /// 获取负载均衡模式
-    pub fn get_load_balancing_mode(&self) -> LoadBalancingModeResponse {        LoadBalancingModeResponse {
+    pub fn get_load_balancing_mode(&self) -> LoadBalancingModeResponse {
+        LoadBalancingModeResponse {
             mode: self.token_manager.get_load_balancing_mode(),
         }
     }
@@ -1459,6 +2715,21 @@ impl AdminService {
     /// 当前 TLS 后端（供出站 HTTP client 构建复用配置，如代理测活）。
     pub fn tls_backend(&self) -> crate::model::config::TlsBackend {
         self.token_manager.config().tls_backend
+    }
+
+    /// 批量推号入口是否启用。每次直接读 ArcSwap（无 TIER3 镜像），故开关热更即时生效。
+    pub fn import_keys_enabled(&self) -> bool {
+        self.token_manager.config().import_keys_enabled
+    }
+
+    /// 分身在请求未显式指定 `enabled` 时是否默认启用（见
+    /// [`crate::model::config::Config::clone_default_enabled`]）。
+    ///
+    /// 与 `import_keys_enabled` 同款：每次直接读 ArcSwap，无 TIER3 镜像 ⇒ 热更即时生效。
+    /// ⚠️ 只在 `enabled` **缺省**时才被查询（`clone_credential` 里是 `unwrap_or_else`），
+    /// 所以显式请求值永远压过配置项。
+    pub fn clone_default_enabled(&self) -> bool {
+        self.token_manager.config().clone_default_enabled
     }
 
     /// 获取服务端配置快照（敏感字段脱敏）
@@ -1495,6 +2766,14 @@ impl AdminService {
             endpoint_names,
             extract_thinking: config.extract_thinking,
             cc_auto_buffer: config.cc_auto_buffer,
+            import_keys_enabled: config.import_keys_enabled,
+            clone_default_enabled: config.clone_default_enabled,
+            upstream_retry_absorb_enabled: config.upstream_retry_absorb_enabled,
+            upstream_retry_absorb_budget_secs: config.upstream_retry_absorb_budget_secs,
+            upstream_retry_absorb_max_rounds: config.upstream_retry_absorb_max_rounds,
+            upstream_retry_absorb_min_delay_ms: config.upstream_retry_absorb_min_delay_ms,
+            upstream_retry_absorb_max_delay_secs: config.upstream_retry_absorb_max_delay_secs,
+            upstream_retry_absorb_suspended: config.upstream_retry_absorb_suspended,
             prompt_cache_enabled: config.prompt_cache_enabled,
             strip_env_noise: config.strip_env_noise,
             tool_clean_leaked_tokens: config.tool_clean_leaked_tokens,
@@ -1507,6 +2786,7 @@ impl AdminService {
             tool_description_max_chars: config.tool_description_max_chars,
             encrypt_credentials_at_rest: config.encrypt_credentials_at_rest,
             cooldown_enabled: config.cooldown_enabled,
+            auto_disable_suspicious: config.auto_disable_suspicious,
             all_cooling_fast_fail: config.all_cooling_fast_fail,
             rate_limit_enabled: config.rate_limit_enabled,
             rate_limit_daily_max: config.rate_limit_daily_max,
@@ -1527,7 +2807,19 @@ impl AdminService {
             inbound_burst_secs: config.inbound_burst_secs,
             inbound_queue_max_wait_secs: config.inbound_queue_max_wait_secs,
             inbound_queue_timeout_passthrough: config.inbound_queue_timeout_passthrough,
+            // ⚠️ 本字段是**目标**值，名字里的 "current" 指"当前生效的目标"。
+            // 实测吞吐在下面两个字段。别把它改成实测 —— 面板/autotune 都按"目标"读它。
             inbound_current_rpm: self.token_manager.inbound_target_rpm(),
+            // 🔴 实测三元组。此前只有上面那一个字段，且它返回 target ⇒ 面板"当前 RPM"
+            // 恒等于"目标 RPM"（实测面板 500 而客户端真实 50~70，差一个数量级，
+            // 运维据此做过两次限流分析）。三个数必须并排看：
+            //   inbound_current_rpm          整形闸门的目标
+            //   inbound_observed_rpm         客户端真实速率（不含重试）
+            //   inbound_observed_upstream_rpm 上游承受的尝试速率（含 failover 重试）
+            // 后两者之比即重试放大倍数（2026-08-06 实测 4.59×）。
+            inbound_observed_rpm: self.token_manager.observed_inbound_rpm(),
+            inbound_observed_upstream_rpm: self.token_manager.observed_upstream_rpm(),
+            inbound_admitted_total: self.token_manager.inbound_admitted_total(),
             balance_weight_enabled: config.balance_weight_enabled,
             balance_weight_floor: config.balance_weight_floor,
             health_429_weight_enabled: config.health_429_weight_enabled,
@@ -1600,9 +2892,7 @@ impl AdminService {
             .config_path()
             .map(|p| p.to_path_buf())
             .ok_or_else(|| {
-                AdminServiceError::InternalError(
-                    "配置文件路径未知，无法保存配置".to_string(),
-                )
+                AdminServiceError::InternalError("配置文件路径未知，无法保存配置".to_string())
             })?;
 
         // 从磁盘重新加载，避免覆盖进程外的改动
@@ -1619,6 +2909,17 @@ impl AdminService {
         let mut extract_thinking_changed: Option<bool> = None;
         // CC 自动切缓冲开关：改后调 handlers setter 即时生效（进程级镜像，不重启）。
         let mut cc_auto_buffer_changed: Option<bool> = None;
+        // 推号开关无 TIER3 镜像，只需让 reload_config 跑一次即可生效，故用 bool 而非 Option<bool>。
+        let mut import_keys_enabled_changed = false;
+        // 分身默认启用同款：`clone_default_enabled()` 每次直接读 config ArcSwap，
+        // 所以只要 reload_config 被触发就即时生效。**必须**进 hot_or_display_changed 的
+        // OR 链，漏掉就是"存了盘但 ArcSwap 仍是旧值"，面板开关静默无效。
+        let mut clone_default_enabled_changed = false;
+        // 上游 429 吸收层六项是否有变更。**无 TIER3 setter**：吸收层在 provider 内直接读
+        // token_manager 的 config ArcSwap，所以只要下面的 reload_config 被触发就即时生效。
+        // ⚠️ 正因如此，这个 flag **必须**进 hot_or_display_changed 的 OR 链 ——
+        // 漏掉就会「存了盘但 ArcSwap 仍是旧值」，面板开关静默无效。
+        let mut absorb_changed = false;
         let mut prompt_cache_enabled_changed: Option<bool> = None;
         // 环境噪音剥离开关：改后调 converter setter 即时生效（进程级镜像，不重启）。
         let mut strip_env_noise_changed: Option<bool> = None;
@@ -1733,6 +3034,59 @@ impl AdminService {
                 cc_auto_buffer_changed = Some(v);
             }
         }
+        // —— 批量推号入口开关（无 TIER3 setter：handler 每次直接读 config()，
+        //    存盘 + reload_config 换入 ArcSwap 后下一个请求即生效）——
+        if let Some(v) = req.import_keys_enabled {
+            if v != config.import_keys_enabled {
+                config.import_keys_enabled = v;
+                import_keys_enabled_changed = true;
+            }
+        }
+        // —— 分身默认启用（同上：无 TIER3 setter，靠 reload_config 换入 ArcSwap）——
+        if let Some(v) = req.clone_default_enabled {
+            if v != config.clone_default_enabled {
+                config.clone_default_enabled = v;
+                clone_default_enabled_changed = true;
+            }
+        }
+        // —— 上游 429 吸收层六项（存盘 + reload_config 即时生效，无 TIER3 setter）——
+        if let Some(v) = req.upstream_retry_absorb_enabled {
+            if v != config.upstream_retry_absorb_enabled {
+                config.upstream_retry_absorb_enabled = v;
+                absorb_changed = true;
+            }
+        }
+        if let Some(v) = req.upstream_retry_absorb_budget_secs {
+            if v != config.upstream_retry_absorb_budget_secs {
+                config.upstream_retry_absorb_budget_secs = v;
+                absorb_changed = true;
+            }
+        }
+        if let Some(v) = req.upstream_retry_absorb_max_rounds {
+            if v != config.upstream_retry_absorb_max_rounds {
+                config.upstream_retry_absorb_max_rounds = v;
+                absorb_changed = true;
+            }
+        }
+        if let Some(v) = req.upstream_retry_absorb_min_delay_ms {
+            if v != config.upstream_retry_absorb_min_delay_ms {
+                config.upstream_retry_absorb_min_delay_ms = v;
+                absorb_changed = true;
+            }
+        }
+        if let Some(v) = req.upstream_retry_absorb_max_delay_secs {
+            if v != config.upstream_retry_absorb_max_delay_secs {
+                config.upstream_retry_absorb_max_delay_secs = v;
+                absorb_changed = true;
+            }
+        }
+        if let Some(v) = req.upstream_retry_absorb_suspended {
+            if v != config.upstream_retry_absorb_suspended {
+                config.upstream_retry_absorb_suspended = v;
+                absorb_changed = true;
+            }
+        }
+
         // —— prompt cache 记账下发开关（TIER3 热更：改后调 handlers setter 即时生效不重启）——
         // 此前该配置既无读取点也不在 admin 请求里，等于面板改不了、改了也没用。
         if let Some(v) = req.prompt_cache_enabled {
@@ -1812,6 +3166,15 @@ impl AdminService {
         if let Some(v) = req.cooldown_enabled {
             if v != config.cooldown_enabled {
                 config.cooldown_enabled = v;
+                hot_changed = true;
+            }
+        }
+        // `reload_config`（token_manager.rs:2163）已经在读这个字段并 store 进 AtomicBool，
+        // 缺的只是「面板能把它写进 config」这一段 —— 所以补上这个分支即完成 TIER1 闭环，
+        // 不需要动 token_manager。绝不 push 进 restart_fields。
+        if let Some(v) = req.auto_disable_suspicious {
+            if v != config.auto_disable_suspicious {
+                config.auto_disable_suspicious = v;
                 hot_changed = true;
             }
         }
@@ -1932,6 +3295,47 @@ impl AdminService {
         if let Some(v) = req.inbound_queue_timeout_passthrough {
             if v != config.inbound_queue_timeout_passthrough {
                 config.inbound_queue_timeout_passthrough = v;
+                hot_changed = true;
+            }
+        }
+        // ⭐ 三个 RPM 字段的**交叉**不变量：`min <= target <= max`。
+        //
+        // 必须在三者都处理完之后统一收口 —— 上面每个字段各自只 clamp 到 [1,100_000]，
+        // 彼此不可见，于是能存出自相矛盾的组合。两个实测后果：
+        //
+        // ① **`min > max` 会 panic**：`throttle.rs` 的 `clamp(lo, hi)` 在 min>max 时
+        //    panic（`u32::clamp` 的契约）。面板保存一次这样的配置就打死正在服务的进程。
+        //    throttle 侧已加 `.max(lo)` 兜底，这里再拦一道，让**存下去的值**本身就自洽
+        //    （否则面板显示的与实际生效的永远不一致，排查时会被带偏）。
+        //
+        // ② **`target > max` 让自动调节永久失效**（线上实测）：throttle 把 target
+        //    clamp 到 max 后**只存在内存里**，config.json 仍留着未被 clamp 的原值。
+        //    VPS 上的 `throttle-autotune` 读的是**存储值**，于是它拿一个从未生效过的
+        //    数（614）跟自己的建议比 → 死区永远满足 → 永不调整，而实际生效的是 300。
+        //    实测该差距在两天内从 307 扩大到 614，且仍在扩大。
+        //    存储值与生效值统一后，autotune 读到的就是真值，死区判断才有意义。
+        {
+            let lo = config.inbound_rpm_min;
+            if config.inbound_rpm_max < lo {
+                tracing::warn!(
+                    inbound_rpm_min = lo,
+                    inbound_rpm_max = config.inbound_rpm_max,
+                    "inboundRpmMax 小于 inboundRpmMin，已抬到与下限相等（否则整形层 clamp 会 panic）"
+                );
+                config.inbound_rpm_max = lo;
+                hot_changed = true;
+            }
+            let clamped = config.inbound_target_rpm.clamp(lo, config.inbound_rpm_max);
+            if clamped != config.inbound_target_rpm {
+                tracing::warn!(
+                    requested = config.inbound_target_rpm,
+                    effective = clamped,
+                    inbound_rpm_min = lo,
+                    inbound_rpm_max = config.inbound_rpm_max,
+                    "inboundTargetRpm 超出 [min,max]，已按生效值落盘（存储值与生效值必须一致，\
+                     否则外部自动调节读到的是从未生效过的数）"
+                );
+                config.inbound_target_rpm = clamped;
                 hot_changed = true;
             }
         }
@@ -2204,6 +3608,10 @@ impl AdminService {
             || fingerprint_changed.is_some()
             || extract_thinking_changed.is_some()
             || cc_auto_buffer_changed.is_some()
+            || import_keys_enabled_changed
+            // 分身默认启用同样没有 TIER3 setter，**只**靠这一行触发 reload_config。
+            // 删掉它 → 面板改了、存了盘，但 clone_default_enabled() 读到的仍是旧值。
+            || clone_default_enabled_changed
             || prompt_cache_enabled_changed.is_some()
             || strip_env_noise_changed.is_some()
             || tool_clean_leaked_tokens_changed.is_some()
@@ -2211,7 +3619,11 @@ impl AdminService {
             || tool_expose_error_to_client_changed.is_some()
             || tool_repair_json_changed.is_some()
             || tool_truncation_recovery_changed.is_some()
-            || tool_description_max_chars_changed.is_some();
+            || tool_description_max_chars_changed.is_some()
+            // 🔴 吸收层没有 TIER3 setter，**只**靠这一行触发 reload_config 把新值换进 ArcSwap。
+            // 删掉它 → 面板改了、存了盘、但 provider 读到的仍是旧值 → 开关静默无效。
+            // 由 absorb_changed_is_in_hot_reload_or_chain 源码守卫钉死。
+            || absorb_changed;
         if hot_or_display_changed {
             if let Err(e) = self.token_manager.reload_config() {
                 tracing::warn!("配置已存盘但热重载失败,下次重启生效: {}", e);
@@ -2317,6 +3729,10 @@ impl AdminService {
             || fingerprint_changed.is_some()
             || extract_thinking_changed.is_some()
             || cc_auto_buffer_changed.is_some()
+            || import_keys_enabled_changed
+            // 立即生效项（reload_config 换 ArcSwap），漏掉这行只改本项时面板会回
+            // 「无改动」，与实际不符。
+            || clone_default_enabled_changed
             || prompt_cache_enabled_changed.is_some()
             || strip_env_noise_changed.is_some()
             || tool_clean_leaked_tokens_changed.is_some()
@@ -2324,13 +3740,13 @@ impl AdminService {
             || tool_expose_error_to_client_changed.is_some()
             || tool_repair_json_changed.is_some()
             || tool_truncation_recovery_changed.is_some()
-            || tool_description_max_chars_changed.is_some();
+            || tool_description_max_chars_changed.is_some()
+            // 吸收层是立即生效项（reload_config 换 ArcSwap），漏掉这行只改吸收层时面板会
+            // 回「未检测到变更」，与实际不符。
+            || absorb_changed;
         let restart_required = !restart_fields.is_empty();
         let message = if restart_required {
-            format!(
-                "已保存。{} 个字段需重启服务后生效。",
-                restart_fields.len()
-            )
+            format!("已保存。{} 个字段需重启服务后生效。", restart_fields.len())
         } else if immediate_changed {
             "已保存并立即生效（无需重启）。".to_string()
         } else {
@@ -2981,7 +4397,10 @@ impl AdminService {
 
     // ============ 余额缓存持久化 ============
 
-    fn load_balance_cache_from(cache_path: &Option<PathBuf>) -> HashMap<u64, CachedBalance> {
+    fn load_balance_cache_from(
+        cache_path: &Option<PathBuf>,
+        token_manager: &Arc<MultiTokenManager>,
+    ) -> HashMap<String, CachedBalance> {
         let path = match cache_path {
             Some(p) => p,
             None => return HashMap::new(),
@@ -3002,19 +4421,666 @@ impl AdminService {
         };
 
         let now = Utc::now().timestamp() as f64;
-        map.into_iter()
-            .filter_map(|(k, v)| {
-                let id = k.parse::<u64>().ok()?;
+
+        // ⭐ 旧格式迁移：**按凭据 id 键 → 按账号键**。
+        //
+        // # 为什么必须迁移（而不是"接受失效"）
+        //
+        // 缓存键从 `id` 改成 `sha256(apiKey)` 之后，旧文件里的十进制 id 键**永远不会被
+        // 命中** ⇒ 升级后 api_key 号的余额全部显示为空 ⇒ 面板集体转圈打
+        // `getUsageLimits`。那是 `web_portal` 上游探测，本仓调优结论是绝不为展示类需求
+        // 反复打它（线上号池正被风控烧号）。
+        //
+        // 实测规模：线上 5 条缓存 / 5 个 api_key 号 / **只有 1 个不同的 key** ⇒
+        // 迁移后并成 1 条。量级小，但方向是"少打一次上游探测"，且迁移只需十几行。
+        //
+        // # 并组时取最新的那条
+        //
+        // N 个 id 映射到同一个账号键时，按 `cached_at` 取最新 —— 它们描述的是同一个账号
+        // 同一份配额，旧的那些本来就是冗余副本（这正是本次改动要消除的东西）。
+        //
+        // # 无法映射的键原样保留
+        //
+        // OAuth 号的键本来就是 id（`balance_cache_key` 对非 api_key 号回落 id），
+        // 以及"号已被删但缓存还在"的残留 —— 两者都原样留着，由展示层的 7 天上限自然淘汰。
+        let mut migrated: HashMap<String, CachedBalance> = HashMap::new();
+        for (key, v) in map {
+            if (now - v.cached_at) >= BALANCE_CACHE_DISPLAY_MAX_AGE_SECS as f64 {
                 // 修复：启动恢复用【展示保留上限】(7 天)，而非 5 分钟新鲜度阈值。
                 // 这样重启后仍能立刻显示上次的余额数字（前端据 cached_at 标注新鲜度），
                 // 而不是因为磁盘缓存 >5 分钟就整批丢成“未知”。只有陈旧到 7 天才丢弃。
-                if (now - v.cached_at) < BALANCE_CACHE_DISPLAY_MAX_AGE_SECS as f64 {
-                    Some((id, v))
-                } else {
-                    None
+                continue;
+            }
+            // 旧格式判定：键能 parse 成 u64 且该 id 是 api_key 号 ⇒ 需要迁移成账号键。
+            // （新格式的账号键是 64 位 hex，parse::<u64> 必然失败，所以不会被误迁。）
+            let target = match key.parse::<u64>() {
+                Ok(id) => match token_manager.export_credential(id) {
+                    Some(c) if c.is_api_key_credential() => match c.kiro_api_key.as_deref() {
+                        Some(k) => crate::kiro::token_manager::sha256_hex(k),
+                        None => key.clone(),
+                    },
+                    // 非 api_key 号（OAuth）或号已不在池里 ⇒ 键保持 id，与
+                    // `balance_cache_key` 的回落一致。
+                    _ => key.clone(),
+                },
+                Err(_) => key.clone(),
+            };
+            match migrated.get(&target) {
+                // 已有更新的条目 ⇒ 丢弃这条旧副本
+                Some(existing) if existing.cached_at >= v.cached_at => {}
+                _ => {
+                    migrated.insert(target, v);
                 }
-            })
+            }
+        }
+        migrated
+    }
+
+    /// 从磁盘加载代理节点表。
+    ///
+    /// **fail-soft**：解密/解析失败一律 `warn!` + 空表，绝不 bail。
+    /// 理由：at-rest 密钥是机器绑定的，换机/重建 VPS 时 credentials 那条路径是
+    /// `exit(1)`（凭据没了服务本来就没意义），但节点表只是候选池 ——
+    /// 不该因为它解不开就让整个网关起不来。
+    /// 从磁盘加载代理节点表。返回 `(节点表, 是否可安全回写)`。
+    ///
+    /// **「文件缺失」与「文件在但读不出来」必须分开处理**，这是本函数唯一的要点：
+    ///
+    /// - 缺失 → 首次启动，空表 + 允许回写。
+    /// - 在但解不开/解析失败 → 空表 + **禁止回写**。
+    ///
+    /// 若两者都按「空表 + 允许回写」处理，就构成一条静默数据毁灭链：启动读不出来
+    /// → 内存空表 → 用户加**一个**节点 → `persist_socks_nodes` 把这张只有一条的表
+    /// 原子覆盖上去 → 原文件里那 20 个节点和它们的代理密码永久消失。
+    /// credentials.json 那条路径是靠 `main.rs` 直接 `exit(1)` 避免同类事故的；
+    /// 节点表不该让服务起不来（它只是候选池），所以改用「只读降级」而不是退出。
+    fn load_socks_nodes_from(
+        path: &Option<PathBuf>,
+        token_manager: &Arc<MultiTokenManager>,
+    ) -> (Vec<SocksNode>, u64, bool) {
+        let path = match path {
+            Some(p) => p,
+            None => return (Vec::new(), 1, true),
+        };
+        let raw = match std::fs::read(path) {
+            Ok(b) => b,
+            // 文件不存在是首次启动的正常状态，不打日志，允许回写。
+            Err(_) => return (Vec::new(), 1, true),
+        };
+        let key_path = crate::common::secret_store::key_path_for(path);
+        let text = match crate::common::secret_store::maybe_decrypt_to_string(&raw, &key_path) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(
+                    "代理节点表存在但解密失败，已进入**只读降级**（不会覆盖该文件）：{}。\
+                     常见原因是 at-rest 密钥丢失或与数据不匹配；修好密钥后重启即恢复。",
+                    e
+                );
+                return (Vec::new(), 1, false);
+            }
+        };
+        match serde_json::from_str::<SocksNodeFileCompat>(&text) {
+            Ok(compat) => {
+                let (v, next_id) = compat.normalize();
+                // 超限**不截断**：截断后第一次回写就把多出来的永久删掉。
+                // 只拒绝新增（见 upsert 的上限判断），已有的照常可用。
+                if v.len() > MAX_SOCKS_NODES {
+                    tracing::warn!(
+                        "代理节点表有 {} 条，超过上限 {}：全部保留可用，但不再允许新增",
+                        v.len(),
+                        MAX_SOCKS_NODES
+                    );
+                }
+                let _ = token_manager; // 预留：将来按节点校验凭据绑定
+                (v, next_id, true)
+            }
+            Err(e) => {
+                tracing::error!(
+                    "代理节点表存在但解析失败，已进入**只读降级**（不会覆盖该文件）：{}",
+                    e
+                );
+                (Vec::new(), 1, false)
+            }
+        }
+    }
+
+    /// 只读降级检查，**必须在改内存之前调用**。
+    ///
+    /// 为什么不能只靠 `persist_socks_nodes` 那道判断：那道判断在**改完内存之后**才跑，
+    /// 于是只读降级下的一次 upsert 会「内存里真的多出一个节点 + 调用方收到报错」——
+    /// 面板列表从此显示一个磁盘上并不存在的节点，直到重启才消失，
+    /// 而用户看到的是「保存失败但它出现了」，只会以为报错是假的、节点是真的。
+    /// 三个写入方法（upsert / delete / record_test）都在顶部调它，先判后改。
+    fn ensure_socks_writable(&self) -> Result<(), AdminServiceError> {
+        // path 为 None 是纯内存态（单凭据格式），此时 writable 恒 true，与 persist 同口径。
+        if self.socks_nodes_path.is_some() && !self.socks_nodes_writable {
+            return Err(AdminServiceError::InternalError(
+                "代理节点表处于只读降级（启动时该文件解密/解析失败）：\
+                 为避免覆盖原文件，本次修改未落盘。请修复 at-rest 密钥后重启。"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// 回写代理节点表（含密码，故与 credentials/trash 同开关同密钥做 at-rest 加密）。
+    ///
+    /// 两条护栏：
+    /// 1. **只读降级时拒绝写**（`socks_nodes_writable=false`）—— 启动时文件读不出来，
+    ///    内存里是空表，写下去就等于把原文件抹平。
+    /// 2. **序列化与写盘在同一把锁内**：先前把序列化放锁内、写盘放锁外，两个并发
+    ///    修改会各自持有一份快照，后完成的那次写把先完成的改动覆盖掉（丢写）。
+    fn persist_socks_nodes(&self) -> Result<(), AdminServiceError> {
+        let path = match &self.socks_nodes_path {
+            Some(p) => p,
+            // 单凭据格式：纯内存态（与 trash 同款约定）。
+            None => return Ok(()),
+        };
+        if !self.socks_nodes_writable {
+            return Err(AdminServiceError::InternalError(
+                "代理节点表处于只读降级（启动时该文件解密/解析失败）：\
+                 为避免覆盖原文件，本次修改未落盘。请修复 at-rest 密钥后重启。"
+                    .into(),
+            ));
+        }
+        let enc = self.token_manager.config().encrypt_credentials_at_rest;
+        let key_path = crate::common::secret_store::key_path_for(path);
+        // ⭐ 整段在锁内：序列化 → 编码 → 原子写。放开锁再写会丢写（见上）。
+        let nodes = self.socks_nodes.lock();
+        let file = crate::kiro::model::socks_node::SocksNodeFile {
+            nodes: nodes.clone(),
+            next_id: self
+                .socks_next_id
+                .load(std::sync::atomic::Ordering::Relaxed),
+        };
+        let json = serde_json::to_string_pretty(&file)
+            .map_err(|e| AdminServiceError::InternalError(format!("序列化节点表失败: {e}")))?;
+        let (bytes, encrypted) =
+            crate::common::secret_store::encode_for_disk(json.as_bytes(), enc, &key_path);
+        // 与 token_manager 的 persist_credentials 同口径：开了加密却落成明文时
+        // 必须把面板的 at-rest 健康灯打灭，否则密码明文落盘而界面显示一切正常。
+        crate::common::recovery_metrics::set_at_rest_healthy(!enc || encrypted);
+        crate::common::fs_atomic::write_atomic(path, &bytes)
+            .map_err(|e| AdminServiceError::InternalError(format!("回写节点表失败: {e}")))?;
+        Ok(())
+    }
+
+    /// 列出所有代理节点。**密码恒不外传**，只给 `hasPassword` 布尔。
+    ///
+    /// 同时带上「这个节点上已挂了几个凭据」（`boundCredentials`）：前端的节点下拉与
+    /// 「自动分配」按钮按它排序，必须与 `resolve_node_plan` 的自动分配同一口径，
+    /// 否则推荐顺序与实际分配结果不一致。计数表一次算好复用给全部节点（O(凭据数)），
+    /// 且在 `socks_nodes` 锁**之外**取（避免与 token_manager.entries 构成新锁序）。
+    pub fn list_socks_nodes(&self) -> Vec<SocksNodeView> {
+        let usage = self.token_manager.proxy_url_usage();
+        self.socks_nodes
+            .lock()
+            .iter()
+            .map(|n| SocksNodeView::from_node(n, usage.get(&n.url).copied().unwrap_or(0)))
             .collect()
+    }
+
+    /// 批量导入代理节点（整段粘贴节点商文档）。
+    ///
+    /// 返回四个聚合计数 + **逐行结果**（见 [`SocksNodeBulkImportOutcome`]）。
+    ///
+    /// # 为什么要逐行结果
+    ///
+    /// 原先只返回四个数，其中「跳过数」= 非链接行 + SSRF 拒绝 —— 用户看到「跳过 10 行」
+    /// 时无法区分「这行不是链接」「这行端口写错了」「这行地址是内网被拦了」，
+    /// 三者需要的动作完全不同。逐行结果让每一行都带上行号、脱敏原文和原因码。
+    ///
+    /// # 设计取舍
+    ///
+    /// - **默认不启用**（`enabled` 由调用方给，前端默认 false）：新导入的节点还没测活，
+    ///   直接参与分配会把未验证的出口塞给分身。与「生成分身时是否全部默认启用」同一原则。
+    /// - **URL 去重**：同一节点在节点商文档里会出现两次（整段区 + 明细区）。
+    ///   已在表里的 url 直接跳过，**不覆盖**已有节点的账密/启用状态 ——
+    ///   覆盖会把一个已测活启用的节点重置成未启用。
+    /// - **SSRF 校验逐条做**，任一条不过只跳过它，不让整批失败
+    ///   （用户粘的是一大段，为一行内网地址废掉整批很难用）。
+    pub async fn bulk_import_socks_nodes(
+        &self,
+        text: &str,
+        enabled: bool,
+    ) -> Result<SocksNodeBulkImportOutcome, AdminServiceError> {
+        self.ensure_socks_writable()?;
+        let report = crate::http_client::parse_proxy_lines_report(text);
+        let has_parsable = report.items.iter().any(|i| i.link.is_some());
+        if !has_parsable {
+            // 一条都解析不出来时仍报错（保持既有行为：前端据此弹 error toast）。
+            // 但把**失败原因**带上 —— 原先只说「跳过 N 行非链接文本」，
+            // 而真实原因常常是端口写错或格式判不定。
+            let why = report
+                .items
+                .iter()
+                .filter_map(|i| i.issue.map(|e| format!("第 {} 行 {}", i.lineno, e.code())))
+                .take(5)
+                .collect::<Vec<_>>()
+                .join("；");
+            let tail = if why.is_empty() {
+                String::new()
+            } else {
+                format!("。可疑行：{why}")
+            };
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "没有解析出任何节点（跳过 {} 行非链接文本）。\
+                 期望形如 socks://<base64 或 user:pass>@host:port#名字，\
+                 或 host:port:user:pass{tail}",
+                report.skipped
+            )));
+        }
+
+        let mut added = 0usize;
+        let mut dup = 0usize;
+        let mut over_cap = 0usize;
+        let mut rejected = 0usize;
+        let mut items: Vec<SocksNodeBulkImportItem> = Vec::with_capacity(report.items.len());
+
+        for it in report.items {
+            let lineno = it.lineno;
+            let raw = it.raw;
+            let p = match it.link {
+                Some(p) => p,
+                None => {
+                    // 解析失败：原因码原样带回（前端做 i18n 映射）。
+                    let code = it
+                        .issue
+                        .map(|e| e.code().to_string())
+                        .unwrap_or_else(|| "invalid".to_string());
+                    items.push(SocksNodeBulkImportItem {
+                        lineno,
+                        raw,
+                        status: "invalid".into(),
+                        reason: Some(code),
+                        address: None,
+                        username: None,
+                    });
+                    continue;
+                }
+            };
+            let address = Some(p.url.clone());
+            let username = p.username.clone();
+            // 同一次粘贴内重复：与「已在池中」同样算 duplicate（对用户是同一件事）。
+            if it.dup_in_paste {
+                dup += 1;
+                items.push(SocksNodeBulkImportItem {
+                    lineno,
+                    raw,
+                    status: "duplicate".into(),
+                    reason: Some("dup_in_paste".into()),
+                    address,
+                    username,
+                });
+                continue;
+            }
+            // 已存在（按 url）→ 跳过，绝不覆盖既有节点的账密/启用状态。
+            if self.socks_nodes.lock().iter().any(|n| n.url == p.url) {
+                dup += 1;
+                items.push(SocksNodeBulkImportItem {
+                    lineno,
+                    raw,
+                    status: "duplicate".into(),
+                    reason: Some("already_in_pool".into()),
+                    address,
+                    username,
+                });
+                continue;
+            }
+            // SSRF：逐条校验，不过则只跳过这一条（await 必须在锁外）。
+            if let Err(e) = crate::common::ssrf::validate_proxy_address(&p.url).await {
+                // 只跳过这一条并告警：用户粘的是一大段，为一行内网地址废掉整批很难用。
+                tracing::warn!("批量导入跳过节点 {}（地址校验未通过）: {}", p.url, e);
+                rejected += 1;
+                items.push(SocksNodeBulkImportItem {
+                    lineno,
+                    raw,
+                    status: "invalid".into(),
+                    // 与解析失败区分开：地址本身合法，是**策略**拦下的。
+                    reason: Some("address_rejected".into()),
+                    address,
+                    username,
+                });
+                continue;
+            }
+            let mut nodes = self.socks_nodes.lock();
+            if nodes.len() >= MAX_SOCKS_NODES {
+                over_cap += 1;
+                items.push(SocksNodeBulkImportItem {
+                    lineno,
+                    raw,
+                    status: "over_capacity".into(),
+                    reason: Some("over_capacity".into()),
+                    address,
+                    username,
+                });
+                continue;
+            }
+            let id = self
+                .socks_next_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            nodes.push(SocksNode {
+                id,
+                name: p.name.clone().unwrap_or_default(),
+                url: p.url.clone(),
+                username: p.username.clone(),
+                password: p.password.clone(),
+                enabled,
+                last_test: None,
+                created_at: Utc::now().timestamp().max(0) as u64,
+            });
+            added += 1;
+            items.push(SocksNodeBulkImportItem {
+                lineno,
+                raw,
+                status: "ok".into(),
+                reason: None,
+                address,
+                username,
+            });
+        }
+
+        if added > 0 {
+            self.persist_socks_nodes()?;
+        }
+        Ok(SocksNodeBulkImportOutcome {
+            added,
+            // 保持旧口径：非链接行 + SSRF 拒绝。含义比字面宽，
+            // 精确归因看 `items`（这正是加它的理由）。
+            skipped: report.skipped + rejected,
+            duplicate: dup,
+            over_capacity: over_cap,
+            items,
+        })
+    }
+
+    /// 新建或更新一个代理节点。
+    ///
+    /// `id = None` → 新建；`Some(existing)` → 更新；`Some(不存在)` → NotFound
+    /// （**不静默新建**：那会把一次误传的 id 变成一个用户没预期的新节点）。
+    pub async fn upsert_socks_node(
+        &self,
+        req: SocksNodeUpsertRequest,
+    ) -> Result<u64, AdminServiceError> {
+        // ⭐ 先判只读降级再改内存：否则内存表会多出一个磁盘上不存在的节点（见 ensure_socks_writable）。
+        self.ensure_socks_writable()?;
+        // 账密从 URL 里拆出来，避免密码明文留在 url 字段里（与 set_credential_proxy 同口径）。
+        let raw = req.url.trim();
+        if raw.is_empty() {
+            return Err(AdminServiceError::InvalidCredential("url 不能为空".into()));
+        }
+        // ⭐ 先试**分享链接**解析（`socks://base64(user:pass)@host:port#name`）——
+        // 机场/节点商下发的就是这个形式，而 `split_proxy_credentials` 只做百分号解码，
+        // 会把整个 base64 串当成用户名、密码为 None ⇒ 代理认证必然失败，
+        // 而那个失败长得像「节点不通」，会把排障带偏。`#name` 还会残留在 URL 里污染 host。
+        //
+        // 解析不出（普通 `socks5://host:port` 或已拆好账密的表单提交）时回落原路径，
+        // 行为逐字不变。
+        let (clean_url, inline_user, inline_pass, link_name) =
+            match crate::http_client::parse_proxy_link(raw) {
+                Some(p) => (p.url, p.username, p.password, p.name),
+                None => {
+                    let (u, iu, ip) = crate::http_client::split_proxy_credentials(raw);
+                    (u, iu, ip, None)
+                }
+            };
+
+        // 拦内网/环回：节点地址会被写进凭据并在热路径上使用。
+        // 策略是 SsrfPolicy::AdminConfigured（与 custom_api base_url 同口径）：管理员亲手填的
+        // 目标，只放开 198.18.0.0/15 那一段 —— 那是 Clash/Mihomo 的 fake-IP 池默认段，
+        // 用 Strict 会让开了 fake-IP 的机器一个域名形式的节点都加不进来。
+        // ⚠️ 环回与 RFC1918 **仍然被拒**（本机 ssh -D 隧道 / 局域网旁车加不进来），
+        // 这是当前的已知限制，不是 AdminConfigured 能解决的 —— 见 validate_proxy_address 文档。
+        // ⚠️ 这**不是**安全边界（DNS 失败放行、不在使用时复验、且 set_credential_proxy
+        // 与 /proxy/test 两条旁路完全不校验）—— 见 validate_proxy_address 的文档。
+        crate::common::ssrf::validate_proxy_address(&clean_url)
+            .await
+            .map_err(AdminServiceError::InvalidCredential)?;
+
+        let username = req
+            .username
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| inline_user.clone());
+
+        let mut nodes = self.socks_nodes.lock();
+
+        let id = match req.id {
+            Some(id) => {
+                let node = nodes
+                    .iter_mut()
+                    .find(|n| n.id == id)
+                    .ok_or(AdminServiceError::NotFound { id })?;
+                // 名字优先级：显式 req.name > 分享链接的 #fragment > 保持原值。
+                node.name = req
+                    .name
+                    .clone()
+                    .or_else(|| link_name.clone())
+                    .unwrap_or_else(|| node.name.clone());
+                node.url = clean_url;
+                // ⭐ 分享链接自带账密时，即使 req.username/password 都省略也要写入 ——
+                // 编辑场景下用户粘一条新链接进来，期望的是"整条替换"，而三态语义
+                // （省略=不改）会让新链接的账密被丢弃、继续用旧的 ⇒ 认证失败。
+                if req.username.is_none() {
+                    if let Some(u) = inline_user.clone() {
+                        node.username = Some(u);
+                    }
+                }
+                if req.password.is_none() {
+                    if let Some(p) = inline_pass.clone() {
+                        node.password = Some(p);
+                    }
+                }
+                // 用户名与密码同款三态：**省略该键 = 不改**，`Some("") = 清空`。
+                // 先前这里是无条件赋值，于是只发 {id,url,enabled} 的更新会把用户名
+                // 抹成 None 而密码留着 → `build_client` 的 `if let (Some(u), Some(p))`
+                // 不成立 → 认证被静默丢弃 → 该节点此后全部连不上。
+                match req.username.as_ref() {
+                    None => {}
+                    Some(u) if u.is_empty() => node.username = None,
+                    Some(_) => node.username = username,
+                }
+                // ⭐ 密码语义：**省略该键 = 不改**，`Some("") = 清空`。
+                // 绝不能写成必填 —— 那样「改个节点名」就会把密码抹掉，
+                // 已绑该节点的分身全部掉线（GET 抹密码 + 前端整体回填的经典坑）。
+                match req.password.as_ref() {
+                    None => {}
+                    Some(p) if p.is_empty() => node.password = None,
+                    Some(p) => node.password = Some(p.clone()),
+                }
+                if let Some(en) = req.enabled {
+                    node.enabled = en;
+                }
+                id
+            }
+            None => {
+                if nodes.len() >= MAX_SOCKS_NODES {
+                    return Err(AdminServiceError::InvalidCredential(format!(
+                        "节点数已达上限 {MAX_SOCKS_NODES}"
+                    )));
+                }
+                // id 从持久化高水位取，**不用** `max(现有 id)+1` —— 后者在删掉
+                // 最大 id 的节点后会把该 id 重新发出去，让仍持有旧列表的面板标签页
+                // 指向一个无关新节点。
+                let id = self
+                    .socks_next_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                nodes.push(SocksNode {
+                    id,
+                    // 名字优先级：显式 req.name > 分享链接的 #fragment > 空（前端回落 host:port）。
+                    // 用 #fragment 当名字是刻意的：粘一条链接进来就能得到「US-1-SOCKS5」
+                    // 这种可读标签，而不是一列长得一样的 IP。
+                    name: req
+                        .name
+                        .clone()
+                        .or_else(|| link_name.clone())
+                        .unwrap_or_default(),
+                    url: clean_url,
+                    username,
+                    password: req
+                        .password
+                        .clone()
+                        .filter(|s| !s.is_empty())
+                        .or(inline_pass),
+                    enabled: req.enabled.unwrap_or(true),
+                    last_test: None,
+                    created_at: Utc::now().timestamp().max(0) as u64,
+                });
+                id
+            }
+        };
+        drop(nodes);
+        self.persist_socks_nodes()?;
+        Ok(id)
+    }
+
+    /// 删除一个代理节点。**不动已绑该节点的凭据** —— 凭据的 `proxy_*` 是独立的绑定
+    /// 结果，删节点只是把它从候选池移除；否则删一个节点会让一批分身当场掉线。
+    pub fn delete_socks_node(&self, id: u64) -> Result<bool, AdminServiceError> {
+        // ⭐ 先判后改：只读降级下删除若先动内存，节点会从面板消失但磁盘上还在。
+        self.ensure_socks_writable()?;
+        let removed = {
+            let mut nodes = self.socks_nodes.lock();
+            let before = nodes.len();
+            nodes.retain(|n| n.id != id);
+            before != nodes.len()
+        };
+        if removed {
+            self.persist_socks_nodes()?;
+        }
+        Ok(removed)
+    }
+
+    /// 写回某节点的测速结果（由 `/socks/nodes/{id}/test` 调用）。
+    pub fn record_socks_node_test(
+        &self,
+        id: u64,
+        test: SocksNodeTest,
+    ) -> Result<(), AdminServiceError> {
+        // ⭐ 先判后改：只读降级下写测速结果若先动内存，面板会显示一个不会被持久化的结果。
+        self.ensure_socks_writable()?;
+        {
+            let mut nodes = self.socks_nodes.lock();
+            let node = nodes
+                .iter_mut()
+                .find(|n| n.id == id)
+                .ok_or(AdminServiceError::NotFound { id })?;
+            node.last_test = Some(test);
+        }
+        self.persist_socks_nodes()
+    }
+
+    /// 取某节点的完整代理配置（含密码），供测速与「一键生成分身」使用。
+    pub fn socks_node_proxy(&self, id: u64) -> Option<(String, Option<String>, Option<String>)> {
+        self.socks_nodes
+            .lock()
+            .iter()
+            .find(|n| n.id == id)
+            .map(|n| (n.url.clone(), n.username.clone(), n.password.clone()))
+    }
+
+    /// 算出本次多开的「节点 → 份」分配计划。**纯函数式**：只读节点表，不改任何状态。
+    ///
+    /// 两条来源二选一：
+    /// - `node_ids` 非空 → **只用这些**，按给定顺序；无效的逐条剔除并记进
+    ///   [`NodePlan::rejected`]（响应文案要点名，见下）。
+    /// - 缺省 / 空数组 → 自动分配：池里全部 `enabled` 节点，按插入顺序。
+    ///
+    /// 两条都**截断到 `cap` 个**（多余的节点忽略），且都**不复用**：节点不够时多出来
+    /// 的份直连。复用同一节点的两份共用一个出口 IP，等于没分散却让人以为分散了。
+    ///
+    /// `cap` 是「本次有几份会真的去消费节点」，由调用方算：主份参与时 = `copies`，
+    /// 不参与时 = `copies - 1`。传 `copies` 会在主份不参与时多留一个永不被消费的节点在
+    /// 计划里，`rejected` 文案就跟着不准（说得上「有效」的 id 其实没人用）。
+    ///
+    /// # 自动分配的顺序：先按「这个节点上已挂了几个凭据」升序，再按延迟升序
+    ///
+    /// 分身的意义就是分散出口，把多份塞进同一个节点等于没分。而池里的节点常常已经
+    /// 被前几批分身占了 —— 按插入顺序取会一直命中最前面那几个（它们正是被占最多的），
+    /// 于是"分散"只发生在本批内部，跨批看仍然挤在同几个出口上。
+    ///
+    /// 「已挂几个」是**启发式**（按 `proxy_url` 字符串比对，见
+    /// [`crate::kiro::token_manager::MultiTokenManager::proxy_url_usage`]）：手工填过
+    /// 代理的号可能因 scheme 未归一而漏算。漏算方向安全 —— 顶多是把一个已被占的节点
+    /// 当空闲用，而那正是节点不足时的既有行为。
+    ///
+    /// 延迟取自 `last_test.latency_ms`；**从未测过**（`last_test = None`）的节点排在
+    /// 所有测过的后面（当 `u64::MAX` 用）而不是被排除 —— 全新池子里所有节点都没测过，
+    /// 排除等于池空、全部落直连。同延迟按 id 升序兜底，让顺序稳定可测。
+    ///
+    /// **最近测活失败**（`last_test.ok == false`）的节点被排除在自动分配之外：
+    /// 已知不通的出口分出去只会让那一份必然失败。显式 `node_ids` 不受此限
+    /// （用户点名要的节点不该被静默跳过 —— 那正是下面这段说的"静默替换"的另一面）。
+    ///
+    /// # 无效 id 为什么必须剔除而不是替换
+    ///
+    /// 「我选了节点却仍然直连」是这条路最容易踩空的地方，而**静默换一个节点**更糟：
+    /// 用户以为出口是他挑的那个。故这里只剔除并记下原因，由调用方在响应文案里点名。
+    ///
+    /// 重复 id 同样记进 `rejected`（`重复`）：两份用同一个节点就是上面那条"复用"，
+    /// 调用方显式写两遍也不例外——只是这次要说出来。
+    fn resolve_node_plan(
+        &self,
+        node_ids: Option<&[u64]>,
+        cap: usize,
+        exclude_id: Option<u64>,
+    ) -> NodePlan {
+        let mut plan = NodePlan::default();
+        match node_ids.filter(|ids| !ids.is_empty()) {
+            Some(ids) => {
+                let nodes = self.socks_nodes.lock();
+                let mut seen: Vec<u64> = Vec::new();
+                for id in ids {
+                    // ⚠️ 先判重复再查表：`[5, 5]` 里第二个 5 是"重复"而不是"不存在"。
+                    // `exclude_id`（已给主份的那个）也算重复：它已经是某一份的出口了。
+                    if seen.contains(id) || exclude_id == Some(*id) {
+                        plan.rejected.push((*id, "重复"));
+                        continue;
+                    }
+                    seen.push(*id);
+                    match nodes.iter().find(|n| n.id == *id) {
+                        // 显式指定**也**要看 enabled：否则「禁用节点」这个开关在这条路上
+                        // 形同不存在，用户关掉的出口还会被用上。
+                        Some(n) if !n.enabled => plan.rejected.push((*id, "已禁用")),
+                        Some(n) => plan.assignments.push((
+                            n.url.clone(),
+                            n.username.clone(),
+                            n.password.clone(),
+                        )),
+                        None => plan.rejected.push((*id, "不存在")),
+                    }
+                }
+            }
+            None => {
+                // 「每个出口 URL 上已挂几个凭据」——排序主键。在锁外先算，避免同时
+                // 持有 socks_nodes 与 token_manager.entries 两把锁（全仓无此锁序）。
+                let usage = self.token_manager.proxy_url_usage();
+                // 排序键：(已挂数, 延迟, id)。`last_test = None` 的延迟当 MAX（排最后但**不排除**）。
+                let mut ranked: Vec<(usize, u64, u64, (String, Option<String>, Option<String>))> =
+                    self.socks_nodes
+                        .lock()
+                        .iter()
+                        .filter(|n| n.enabled)
+                        // 已知测活失败的不参与自动分配（从未测过的仍参与，见方法文档）。
+                        .filter(|n| n.last_test.as_ref().is_none_or(|t| t.ok))
+                        // 已经给主份的那个节点不再进计划：否则它会被再分一次，
+                        // 两份共用一个出口 —— 那正是本函数刻意不做的"复用"。
+                        .filter(|n| exclude_id != Some(n.id))
+                        .map(|n| {
+                            (
+                                usage.get(&n.url).copied().unwrap_or(0),
+                                n.last_test.as_ref().map_or(u64::MAX, |t| t.latency_ms),
+                                n.id,
+                                (n.url.clone(), n.username.clone(), n.password.clone()),
+                            )
+                        })
+                        .collect();
+                ranked.sort_by_key(|(used, latency, id, _)| (*used, *latency, *id));
+                plan.assignments = ranked.into_iter().map(|(_, _, _, proxy)| proxy).collect();
+            }
+        }
+        plan.assignments.truncate(cap);
+        plan
     }
 
     fn save_balance_cache(&self) {
@@ -3262,6 +5328,7 @@ mod insight_text_tests {
 mod multi_open_copies_tests {
     //! 多开份数归一。份数是**外部可控输入**且直接决定本次请求会建多少条凭据，
     //! 故硬上限必须有测试锁住 —— 去掉 clamp 后 `copies_above_cap_is_clamped` 必失败。
+    use super::balance_cache_tests::mk_service_with_one_credential;
     use super::*;
 
     #[test]
@@ -3296,6 +5363,197 @@ mod multi_open_copies_tests {
         assert_eq!(effective_copies(Some(4)), 4);
     }
 
+    /// ⭐ 源码级守卫：多开时 **`api_region` 必须继承父号**。
+    ///
+    /// 这是一条**线上真实发生过**的缺陷，而且我自己先误判成了「这个 key 不支持分身」：
+    ///
+    /// 分身请求通常只带 `authMethod` + `kiroApiKey` + `copies`，于是 `api_region` 为 None。
+    /// 而 CLI 端点的 host 是 `q.{api_region}.amazonaws.com`（`endpoint/cli.rs`），
+    /// 拿不到就回退 config 默认（us-east-1）—— 但 `ksk_` token 是**按 region 授权**的，
+    /// 于是上游回 403 `AccessDeniedException: The bearer token included in the request is invalid.`
+    ///
+    /// 实测对照（同一个 key、同一批代理）：
+    /// - 不继承 region → 4 个分身 **0% 成功、100% auth_failed**
+    /// - 继承 region   → 同一批分身 **83% / 45% / 100% / 88%**
+    ///
+    /// 用源码守卫而非行为测试：`add_credential` 会打真实上游（`get_usage_limits_for`），
+    /// 而本仓铁律禁止测试依赖网络。
+    #[test]
+    /// `POST /credentials/{id}/api-region` 必须存在且挂在鉴权路由树内。
+    ///
+    /// 补的是真实运维缺口：`ksk_` 按 region 授权、打错区恒 403 且**永不自愈**，
+    /// 而此前全仓没有任何修改 `api_region` 的入口 —— `/regions` 与 `/switch-region`
+    /// 都是 ARN 门控（只对有 `profileArn` 的 external_idp 号有意义）⇒
+    /// api_key 号 region 错了**只能删号重建**。
+    /// 实测 2026-08-05 02:42：4 个分身因缺 region 被打成 `TooManyFailures`，
+    /// 运维手上没有「补 region 再启用」的手段。
+    #[test]
+    fn api_region_setter_endpoint_is_wired() {
+        let router = include_str!("router.rs");
+        // ⚠️ 判据必须**对空白不敏感**：原写法把路径与 handler 拼成一整行去 contains，
+        // 而 rustfmt 会把这条 `.route(..)` 拆成三行（超过 fn_call_width）⇒ 一跑 fmt 就
+        // 假红。这不是路由掉了，是守卫写脆了。折叠空白后再比，语义（路径→handler 的
+        // 绑定关系）一个不少。同文件的 `clone_endpoint_is_registered_in_router`
+        // 是分开断言的，同一意图两种写法，这里对齐成不脆的那种。
+        let compact: String = router.chars().filter(|c| !c.is_whitespace()).collect();
+        // needle 运行时拼接，避免 include_str! 自匹配。
+        let route = format!(
+            "\"/credentials/{{id}}/api-region\",post(set_credential_api_region{}",
+            ")"
+        );
+        assert!(
+            compact.contains(&route),
+            "必须注册 POST /credentials/{{id}}/api-region，否则 api_key 号 region 错了只能删号重建"
+        );
+        // 校验必须存在：污染值会拼出 q.{垃圾}.amazonaws.com / runtime.{垃圾}.kiro.dev，
+        // DNS 失败或 502 —— 而那个失败长得像「号坏了」，会把排查带偏。
+        let tm = include_str!("../kiro/token_manager.rs");
+        let cut = tm.find("#[cfg(test)]").unwrap_or(tm.len());
+        let prod = &tm[..cut];
+        let fname = format!("pub fn set_credential_api_region{}", "(");
+        let fi = prod
+            .find(&fname)
+            .expect("token_manager 侧 setter 不该被改名");
+        let body_end = prod[fi..]
+            .find("\n    pub fn ")
+            .map(|i| i + fi)
+            .unwrap_or(prod.len());
+        let body = &prod[fi..body_end];
+        let guard = format!("is_supported_region{}", "(r)");
+        assert!(
+            body.contains(&guard),
+            "setter 必须过 is_supported_region 白名单：污染 region 会拼出无法解析的 host，\
+             而那个失败长得像「号坏了」会把排查带偏"
+        );
+    }
+
+    /// 🔴 承重：`AccountThrottled` **绝不能**导致 `new_cred.disabled = true`。
+    ///
+    /// # 为什么这条是承重的（改成禁用会造成真实损失）
+    ///
+    /// `AccountThrottled` 的语义是「**探不了**」（403 账户级临时风控挡在 region 授权校验之前，
+    /// 拿不到任何 region 信息），与 `NoUsableRegion`（探过了、确定不行）是两种不同结论。
+    ///
+    /// 一旦禁用：`ids_needing_region_probe` 过滤 `!e.disabled` ⇒ **连重启时的存量回填都不再
+    /// 重探**它，风控过去了也永远不会自愈 ⇒ 临时态被固化成需人工的永久态。
+    /// 而不禁用的最坏态只是退回「探测接入前的基线」（`api_region=None` → 回退 `config.region`），
+    /// 且若真打错区会走 `report_failure` → `TooManyFailures` ——
+    /// **那个原因在 `is_self_healable_reason` 白名单里**，是可自愈的。
+    /// 即不禁用的最坏态**严格优于**禁用。
+    ///
+    /// 严重度：这类 403 占近 2h 流量 22.3%（CLAUDE.md），是常态不是罕见；而
+    /// `MAX_CONSECUTIVE_SUSPICIOUS_BEFORE_DISABLE = 6` 存在的唯一理由就是
+    /// 「见过一次 403 不足以判死」—— 探测路径若用一次 403 就判死，等于绕过那道阈值。
+    ///
+    /// 用源码守卫而非行为测试：`add_credential` 会打真实上游（`get_usage_limits_for`），
+    /// 本仓铁律禁止测试依赖网络。
+    #[test]
+    fn account_throttled_must_not_disable_credential() {
+        let src = include_str!("service.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+
+        // needle 运行时拼接，避免 include_str! 把本测试自己的字面量算进匹配
+        // （本文件已有两处守卫因此踩过坑，见它们的注释）。
+        let throttled = format!("region_probe_throttled = {}", "matches!(");
+        let ti = prod
+            .find(&throttled)
+            .expect("AccountThrottled 必须被单独识别，不能与 region_probe_failed 混为一谈");
+
+        // 🔴 核心断言：禁用那句必须**只**在 region_probe_failed 的 if 里，
+        // 且必须出现在 throttled 判定**之前** —— 若有人把 throttled 并进那个 matches!，
+        // 禁用就会连带作用到它身上。
+        let disable = format!("new_cred.disabled = {}", "true;");
+        let di = prod.find(&disable).expect("禁用语句不该被改名");
+        assert!(
+            di < ti,
+            "禁用必须发生在 AccountThrottled 判定之前（即只属于 region_probe_failed 那条）——\
+             若顺序反了或两者被并进同一个 matches!，被风控的号会被永久禁用且不再重探"
+        );
+
+        // AccountThrottled 不得出现在决定禁用的那个 matches! 里。
+        let failed_marker = format!("region_probe_failed = {}", "matches!(");
+        let fi = prod
+            .find(&failed_marker)
+            .expect("region_probe_failed 不该被改名");
+        let failed_block = &prod[fi..di];
+        assert!(
+            !failed_block.contains("AccountThrottled"),
+            "AccountThrottled 绝不能进 region_probe_failed 的 matches! —— \
+             那等于让「探不了」和「确定不行」同样被禁用（见本测试文档的损失论证）"
+        );
+
+        // 跳过订阅等级探测的那道门必须**同时**覆盖两者：被风控的号打 management.* 查订阅
+        // 同样 403，白付一次上游往返，而上号是用户交互路径。
+        let skip_gate = format!("if region_probe_failed || {}", "region_probe_throttled");
+        assert!(
+            prod.contains(skip_gate.as_str()),
+            "跳过订阅等级探测的门必须同时覆盖 AccountThrottled（否则白付一次必然 403 的往返）"
+        );
+    }
+
+    /// 🔴 region 探测的结果必须**回写进 `new_cred`**，且必须在分身循环**之前**。
+    ///
+    /// # 实测事故（2026-08-05 02:42）
+    ///
+    /// 父号 #525 被探测写上 `eu-central-1`（95% 成功），而同批 4 个分身 #526–529
+    /// 全部 `api_region=None` ⇒ 回退 `config.region=us-east-1` ⇒ `ksk_` 按区授权
+    /// ⇒ 恒 403 `bearer token invalid` ⇒ **24 秒内三次失败全部被禁用、0% 成功**。
+    ///
+    /// 根因：`for seq in 2..=copies` 里 `new_cred.clone()` 克隆的是**探测前**的
+    /// 局部副本。探测只写了 entry，没写这个局部变量。
+    ///
+    /// ⚠️ 这个缺陷是**接入探测才引入的**：探测之前父子都没 region、一起废（症状一致）；
+    /// 接入之后变成「父好子坏」，更容易被误判成「这个 key 不支持分身」。
+    ///
+    /// 位置断言是承重的：回写若放在分身循环**之后**，等于没回写。
+    #[test]
+    fn probed_region_must_be_written_back_before_clone_loop() {
+        let src = include_str!("service.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        // needle 运行时拼接，避免 include_str! 把本测试自己的字面量算进匹配。
+        let writeback = format!("new_cred.api_region = {}", "Some(probed)");
+        let wi = prod.find(&writeback).expect(
+            "探测结果必须回写进 new_cred，否则分身克隆的是探测前的副本 ⇒ \
+             父号有 region、分身没有 ⇒ ksk_ 打错区恒 403 ⇒ 分身 0% 成功",
+        );
+        // ⚠️ 必须匹配**代码**而非注释：本文件里有两处注释在散文里提到这个循环
+        // （`:1294` 与 `:1413`），裸用 "for seq in 2..=copies" 会先命中注释、
+        // 让位置比较反向 → 守卫静默失效（我第一版就是这样，回退验证时才发现）。
+        // 故带上循环体的左花括号。
+        let loop_marker = format!("for seq in 2..=copies {}", "{");
+        let li = prod.find(&loop_marker).expect("分身循环不该被改名");
+        assert!(wi < li, "回写必须在分身循环之前（放之后等于没回写）");
+        // 且必须在探测调用之后 —— 放之前读到的还是 None。
+        let probe = format!("probe_and_persist_api_region{}", "(credential_id)");
+        let pi = prod.find(&probe).expect("探测调用不该被改名");
+        assert!(pi < wi, "回写必须在探测调用之后，否则读到的仍是探测前的值");
+    }
+
+    /// ⚠️ 本条此前**缺 `#[test]`、从未运行过** —— 属性被上一条测试的文档块吃掉了
+    /// （2026-08-06 全仓扫出 2 处同型，另一处在 `provider.rs`）。补属性时它一次通过，
+    /// 说明它守的东西一直是对的，只是守卫本身没生效。
+    #[test]
+    fn multi_open_must_inherit_api_region_from_parent() {
+        let src = include_str!("service.rs");
+        // needle 运行时拼接，避免字面量把自己也算进匹配（同 provider.rs 那个守卫的教训）。
+        let needle = format!("{}{}", "api_region: ", "inherit(req.api_region");
+        assert!(
+            src.contains(needle.as_str()),
+            "多开必须继承父号的 api_region：否则分身打到错误的 region host，\
+             ksk_ token 按 region 授权 → 上游 403 bearer token invalid → 分身 0% 成功"
+        );
+        // 同族的另外两个 region 字段一并锁住（三者共同决定路由与认证 region）。
+        for f in ["region", "auth_region"] {
+            let n = format!("{}: {}", f, "inherit(req.");
+            assert!(
+                src.contains(n.as_str()),
+                "多开也应继承 {f}（与 api_region 同族，共同决定路由/认证 region）"
+            );
+        }
+    }
+
     /// ⭐ 源码级守卫：`copies` **显式给值时第 1 份也必须绕过去重**。
     ///
     /// 单测覆盖不到 `add_credential`（它会调 `get_usage_limits_for`，那是真实上游网络往返，
@@ -3305,23 +5563,287 @@ mod multi_open_copies_tests {
     /// （不同 machineId + 不同代理出口 IP）。若第 1 份走去重，它撞
     /// `凭据已存在（kiroApiKey 重复）` → 整个请求失败 → 一个分身也建不出来。
     ///
-    /// 判据选 `req.copies.is_some()` 而非 `copies > 1`：前者才能表达"显式意图"。
-    /// 误双击上号不会带该字段（前端只在份数 >1 时下发），故绕过是安全的。
+    /// 判据是**归一后份数 > 1**（`is_multi_open`），不是「字段是否出现」——
+    /// 见 `copies_equal_one_must_not_bypass_dedup_or_create_a_group`。
+    /// 但真多开时第 1 份仍必须绕，这条锁的就是这半边。
     #[test]
     fn explicit_copies_must_bypass_dedup_for_first_copy_too() {
         let src = include_str!("service.rs");
+        // needle 运行时拼接：写成完整字面量时它会出现在 include_str! 读到的本测试自身里。
+        let judgement = format!("{}{}", "let allow_dup = ", "is_multi_open;");
         let block = src
-            .split("let allow_dup = req.copies.is_some();")
+            .split(judgement.as_str())
             .nth(1)
-            .expect("allow_dup 的判据必须是 req.copies.is_some()（不是 copies > 1）");
+            .expect("allow_dup 的判据必须是 is_multi_open（归一后份数 > 1）");
         let block = block
             .split("map_err(|e| self.classify_add_error(e))")
             .next()
             .expect("第 1 份的错误处理不应被改动");
         assert!(
             block.contains("add_credential_allowing_duplicate"),
-            "copies 显式给值时第 1 份必须走 add_credential_allowing_duplicate，\
+            "真多开（份数 >1）时第 1 份必须走 add_credential_allowing_duplicate，\
              否则给已存在的号加分身会在第 1 份就 bail"
+        );
+    }
+
+    /// ⭐ 源码级守卫：去重绕过与分身组都必须挂在 `is_multi_open` 上，
+    /// 而**不是** `req.copies.is_some()`。
+    ///
+    /// 回退即 FAIL：把任一处判据改回 `req.copies.is_some()`，下面的否定断言失败。
+    ///
+    /// 修的是一条静默且不可逆的缺陷：一个总是下发 `"copies": 1` 的 API 客户端
+    /// （文档说该字段被 clamp 到 [1,16]，"1 = 普通上号"，所以总是下发 1 是最自然的读法）
+    /// 会**永久失去去重保护** —— 重复上号不再报 `凭据已存在`，同一个号在池里越积越多，
+    /// 而它们共用一份上游配额；同时每次还造出一个只有 1 个成员的分身组，
+    /// 分身管理页上凭空多出一堆「独苗组」。
+    ///
+    /// clone_group 那半边只能用源码守卫：走行为测试要让 `add_credential` **成功**，
+    /// 而它内部会调 `get_usage_limits_for`（真实上游往返），本仓铁律禁止测试依赖网络。
+    /// 去重那半边有对应的行为测试（见下一条，它在 bail 处就返回，不碰网络）。
+    #[test]
+    fn dedup_bypass_and_clone_group_must_hinge_on_effective_copies() {
+        let src = include_str!("service.rs");
+        // needle 全部运行时拼接：字面量会被 include_str! 读到自己，让断言失真。
+        // 且只看**代码行**：注释里必须能写出这个错误判据（本条与上方那段长注释都要提它），
+        // 否则这条否定断言会被自己的文档打成恒失败。
+        let bug = format!("{}{}", "req.copies.", "is_some()");
+        let offending: Vec<&str> = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .filter(|l| l.contains(bug.as_str()))
+            .collect();
+        assert!(
+            offending.is_empty(),
+            "判据不得是「字段是否出现」：copies=1 会因此绕过去重并造出 1 人分身组。\
+             应改用归一后的份数（effective_copies → is_multi_open）。命中行: {offending:?}"
+        );
+        let group_judgement = format!("{}{}", "let clone_group = if ", "is_multi_open");
+        assert!(
+            src.contains(group_judgement.as_str()),
+            "clone_group 必须只在归一后份数 >1 时赋值"
+        );
+        let inherit_judgement = format!("{}{}", "let inherited = if ", "is_multi_open");
+        assert!(
+            src.contains(inherit_judgement.as_str()),
+            "字段继承也只在真多开时进行（与 clone_group 同一判据，避免两处再次分叉）"
+        );
+    }
+
+    /// ⭐ 承重（行为测试）：`copies: 1` **不得绕过去重**。
+    ///
+    /// 池里已有 `ksk_test`，再用同一个 key + `copies: Some(1)` 上号必须撞
+    /// `凭据已存在（kiroApiKey 重复）`。
+    ///
+    /// 回退即 FAIL：把 `allow_dup` 判据改回 `req.copies.is_some()` —— 去重被绕过，
+    /// 这里变成"添加成功"，`expect_err` 失败。
+    ///
+    /// 不碰网络：去重在 `add_credential_inner` 的第 2 步就 bail，
+    /// 早于第 3 步的刷新与之后的 `get_usage_limits_for`。
+    #[tokio::test]
+    async fn copies_equal_one_must_not_bypass_dedup() {
+        let svc = mk_service_with_one_credential();
+        let err = svc
+            .add_credential(AddCredentialRequest {
+                auth_method: "api_key".into(),
+                kiro_api_key: Some("ksk_test".into()),
+                copies: Some(1),
+                ..Default::default()
+            })
+            .await
+            .expect_err("copies=1 是普通上号，重复的 kiroApiKey 必须被去重拦住");
+        let msg = err.to_string();
+        assert!(msg.contains("已存在"), "应是去重报错，实际 {msg}");
+        assert_eq!(
+            svc.token_manager.total_count(),
+            1,
+            "池里不得多出一条同 key 的凭据"
+        );
+    }
+
+    /// ⭐ 承重：OAuth 号（social/idc/external_idp）多开必须被拒。
+    ///
+    /// 回退即 FAIL：删掉 `add_credential` 里那段 `multi_open_rejection_reason` 判断 ——
+    /// 本测试的 `expect_err` 失败（请求会继续走到入池与真实上游往返）。
+    ///
+    /// 为什么必须拒：refreshToken 每次刷新都被上游轮换，N 份带同一个 token →
+    /// 先刷新的那份把它作废 → 其余份 invalid_grant 被禁用。用户看到的是
+    /// 「分身建好了然后一个个变灰」，且原因写着 refresh_token_invalid，
+    /// 极易误判成号被封。
+    #[tokio::test]
+    async fn multi_open_on_oauth_credential_is_rejected() {
+        let svc = mk_service_with_one_credential();
+        let err = svc
+            .add_credential(AddCredentialRequest {
+                auth_method: "social".into(),
+                refresh_token: Some("rt_social_xyz".into()),
+                copies: Some(3),
+                ..Default::default()
+            })
+            .await
+            .expect_err("OAuth 号多开必须被拒");
+        assert!(
+            matches!(err, AdminServiceError::InvalidCredential(_)),
+            "应是 InvalidCredential，实际 {err:?}"
+        );
+        // ⭐ 承重断言是**报错内容**而不是错误种类：删掉这道门后请求会往下走到
+        // `validate_refresh_token`，那里同样返回 InvalidCredential（「refreshToken 已被截断」），
+        // 只看种类的话缺陷重现了测试照样过。必须断言这条错误确实是"多开不适用"那一条。
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refreshToken 每次刷新都会被上游轮换") && msg.contains("ksk_"),
+            "错误必须说清原因（refreshToken 轮换）与适用范围（ksk_），实际: {msg}"
+        );
+        assert_eq!(
+            svc.token_manager.total_count(),
+            1,
+            "被拒的请求不得留下任何新凭据"
+        );
+    }
+
+    /// 拒绝判据本身的正反两面（纯函数，不碰网络）。
+    #[test]
+    fn multi_open_rejection_applies_only_to_non_api_key_credentials() {
+        let mut api_key = KiroCredentials::default();
+        api_key.auth_method = Some("api_key".into());
+        api_key.kiro_api_key = Some("ksk_abc".into());
+        assert!(
+            multi_open_rejection_reason(&api_key).is_none(),
+            "api_key 号没有 refreshToken，多开是安全的，不得被这道检查拦住"
+        );
+
+        for method in ["social", "idc", "external_idp"] {
+            let mut oauth = KiroCredentials::default();
+            oauth.auth_method = Some(method.into());
+            oauth.refresh_token = Some("rt".into());
+            let reason = multi_open_rejection_reason(&oauth)
+                .unwrap_or_else(|| panic!("{method} 号多开必须被拒"));
+            assert!(
+                reason.contains(method),
+                "拒绝理由应点明 authMethod，实际: {reason}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod absorb_hot_reload_tests {
+    /// ⭐ 源码守卫：`absorb_changed` 必须出现在 `hot_or_display_changed` 的 OR 链里。
+    ///
+    /// 回退即 FAIL：删掉 `update_config` 里那行 `|| absorb_changed`，本测试失败。
+    ///
+    /// 为什么这条是本方案唯一新增的风险点：吸收层**没有** TIER3 setter（它在 provider 内
+    /// 直接读 token_manager 的 config ArcSwap），所以「面板改动生效」这件事完全依赖
+    /// `hot_or_display_changed` 触发 `reload_config` 把新配置从盘重读并原子换入 ArcSwap。
+    /// 漏掉这一行的表现极其隐蔽：面板显示保存成功、config.json 里确实写进去了、
+    /// 重启后也确实生效 —— 唯独**当次不生效**，排障时几乎不可能想到是这里。
+    ///
+    /// 单测无法真跑 `update_config`（需要真实 TokenManager + 磁盘 config），故用源码断言。
+    #[test]
+    fn absorb_changed_is_in_hot_reload_or_chain() {
+        let src = include_str!("service.rs");
+        let update_fn = src
+            .split("pub fn update_config")
+            .nth(1)
+            .expect("update_config 不应被改名");
+        // 截到 reload_config 调用处为止，只看它之前的那条 OR 链。
+        let or_chain = update_fn
+            .split("self.token_manager.reload_config()")
+            .next()
+            .expect("reload_config 调用点不应被改名");
+        let needle = format!("{}{}", "|| absorb_", "changed");
+        assert!(
+            or_chain.contains(needle.as_str()),
+            "hot_or_display_changed 的 OR 链必须包含 absorb_changed，否则面板改了吸收层配置\
+             会存盘但不触发 reload_config → ArcSwap 仍是旧值 → 开关当次静默无效"
+        );
+        // 六个字段都必须真的会把 absorb_changed 置位（防加了字段忘了置位）。
+        for field in [
+            "upstream_retry_absorb_enabled",
+            "upstream_retry_absorb_budget_secs",
+            "upstream_retry_absorb_max_rounds",
+            "upstream_retry_absorb_min_delay_ms",
+            "upstream_retry_absorb_max_delay_secs",
+            "upstream_retry_absorb_suspended",
+        ] {
+            assert!(
+                update_fn.contains(&format!("req.{field}")),
+                "update_config 必须读取 req.{field}，否则该字段面板改不了"
+            );
+        }
+        assert_eq!(
+            update_fn.matches("absorb_changed = true").count(),
+            6,
+            "六个吸收层字段各自都必须置位 absorb_changed（漏一个 → 只改那个字段时不热更）"
+        );
+    }
+
+    /// ⭐ 源码守卫：配置快照的吸收层六项必须**逐字段从 config 读**，不得写死。
+    ///
+    /// 回退即 FAIL：把任一项改成字面量（如 `upstream_retry_absorb_enabled: false,`），断言失败。
+    ///
+    /// 为什么这条替代了规格里那条「第三处默认值镜像」的守卫：`ConfigSnapshotResponse`
+    /// 其实**没有** `Default` impl（规格与我的设计文档都记错了，把 types.rs 里一个**测试夹具**
+    /// 的结构体字面量当成了 Default）。真实的漂移面不是"默认值三处不一致"，而是
+    /// "快照有没有真的把 config 的值读出来" —— 写死的话面板永远显示默认值、
+    /// 用户改了也看不到变化，而任何只比对默认值的测试都发现不了（默认态下两者恰好相等）。
+    #[test]
+    fn absorb_snapshot_maps_every_field_from_config() {
+        let src = include_str!("service.rs");
+        for field in [
+            "upstream_retry_absorb_enabled",
+            "upstream_retry_absorb_budget_secs",
+            "upstream_retry_absorb_max_rounds",
+            "upstream_retry_absorb_min_delay_ms",
+            "upstream_retry_absorb_max_delay_secs",
+            "upstream_retry_absorb_suspended",
+        ] {
+            let mapping = format!("{field}: config.{field},");
+            assert!(
+                src.contains(mapping.as_str()),
+                "配置快照必须写 `{mapping}`（逐字段从 config 读）；\
+                 写死字面量会让面板永远显示默认值、用户改了也看不到"
+            );
+        }
+    }
+
+    /// 🔴 回归：`auto_disable_suspicious` 必须**三处都接线**（快照 / 更新分支 / 不进重启集）。
+    ///
+    /// 这个字段此前只存在于 `Config` 与 `TokenManager`：`reload_config` 确实在读它，
+    /// 但 `admin/types.rs` 既没有响应字段也没有请求字段，`service.rs` 也没有更新分支
+    /// ⇒ **面板既看不到也改不了它**，只能手改 config.json + 重启。
+    ///
+    /// 实际造成的排查错误：线上有人「把三个自动禁用开关关掉」，而这一项其实改不到，
+    /// 于是配置 API 读回 `None`，看起来像"没有这个开关"。
+    ///
+    /// 回退即 FAIL：删掉任一处接线 → 对应断言失败。
+    #[test]
+    fn auto_disable_suspicious_is_fully_wired() {
+        let src = include_str!("service.rs");
+        let types = include_str!("types.rs");
+        // needle 运行时拼接：include_str! 会把本测试自己的字面量也读进来。
+        let field = format!("auto_disable{}", "_suspicious");
+
+        let snapshot = format!("{field}: config.{field},");
+        assert!(
+            src.contains(&snapshot),
+            "配置快照必须逐字段从 config 读 `{snapshot}`，否则面板读不到真实值"
+        );
+        let update = format!("req.{field}");
+        assert!(
+            src.contains(&update),
+            "必须有 `if let Some(v) = {update}` 的 TIER1 更新分支，否则面板改不动它"
+        );
+        // 响应结构与请求结构各一处。
+        assert!(
+            types.matches(&field).count() >= 2,
+            "types.rs 里响应结构与请求结构都必须有该字段（当前 {} 处）",
+            types.matches(&field).count()
+        );
+        // TIER1 语义守卫：它是热更字段，绝不能进 restart_fields。
+        let restart = format!("restart_fields.push(\"{}\"", "autoDisableSuspicious");
+        assert!(
+            !src.contains(&restart),
+            "该字段是 TIER1 热更（reload_config 已读它），不得要求重启"
         );
     }
 }
@@ -3353,15 +5875,21 @@ mod balance_cache_tests {
         )
     }
 
-    /// 造一个带单个凭据的 AdminService（余额展示测试用）。
-    fn mk_service_with_one_credential() -> AdminService {
+    /// 造一个带单个凭据的 AdminService（余额展示 / 节点池 / 多开测试共用）。
+    pub(super) fn mk_service_with_one_credential() -> AdminService {
         let mut c = crate::kiro::model::credentials::KiroCredentials::default();
         c.id = Some(1);
         c.auth_method = Some("api_key".to_string());
         c.kiro_api_key = Some("ksk_test".to_string());
         let tm = Arc::new(
-            MultiTokenManager::new(crate::model::config::Config::default(), vec![c], None, None, false)
-                .expect("构造 token manager"),
+            MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                vec![c],
+                None,
+                None,
+                false,
+            )
+            .expect("构造 token manager"),
         );
         AdminService::new(tm, Vec::<String>::new())
     }
@@ -3387,6 +5915,178 @@ mod balance_cache_tests {
         }
     }
 
+    /// 造一个池：`n` 份**同 key** 的 api_key 号（模拟分身组）+ 一个**不同 key** 的对照号。
+    fn mk_service_with_clone_group(n: u64) -> AdminService {
+        let mut creds = Vec::new();
+        for i in 1..=n {
+            let mut c = crate::kiro::model::credentials::KiroCredentials::default();
+            c.id = Some(i);
+            c.auth_method = Some("api_key".to_string());
+            // 同一个 key ⇒ 同一个上游账号 ⇒ 必须共享余额
+            c.kiro_api_key = Some("ksk_shared_group".to_string());
+            creds.push(c);
+        }
+        // 对照：不同 key，绝不能与上面那组混成一条
+        let mut other = crate::kiro::model::credentials::KiroCredentials::default();
+        other.id = Some(n + 1);
+        other.auth_method = Some("api_key".to_string());
+        other.kiro_api_key = Some("ksk_different".to_string());
+        creds.push(other);
+
+        let tm = Arc::new(
+            MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                creds,
+                None,
+                None,
+                false,
+            )
+            .expect("构造 token manager"),
+        );
+        AdminService::new(tm, Vec::<String>::new())
+    }
+
+    /// ⭐ 回归（dwgx 需求「同一个 key 的分身和凭据余额必须同步」）：
+    /// 缓存按**账号**键，一次写入即全组可见。
+    ///
+    /// # 旧代码为何 FAIL
+    ///
+    /// `balance_cache` 原先是 `HashMap<u64, _>` 按**凭据 id** 键，于是同一个 `ksk_` key 的
+    /// N 份分身各存一份余额 ⇒ 面板上同组各份显示的数字**互不相同**（谁最近刷过谁新），
+    /// 而它们描述的本来是同一个上游账号、同一份配额。
+    /// 线上实测缓存键是 `620/623/622/624` —— 四份分身四条独立记录。
+    ///
+    /// # 断言的是可观测状态
+    ///
+    /// 不断言内部键长什么样（那是实现细节），而是断言 `list_cached_balances` 这个
+    /// **前端真正消费的端点**对同组各份返回同一个 `remaining`。
+    ///
+    /// 把 `balance_cache` 改回按 id 键 → 本测试必 FAILED。
+    #[test]
+    fn same_api_key_credentials_share_one_balance() {
+        let svc = mk_service_with_clone_group(4);
+
+        // 只给**其中一份**写缓存（模拟"任一份刷新过"）
+        let now = Utc::now().timestamp() as f64;
+        {
+            let key = svc.balance_cache_key(2);
+            let mut cache = svc.balance_cache.lock();
+            cache.insert(key, mk_cached_balance(2, now));
+        }
+
+        let resp = svc.get_cached_balances();
+
+        // 同组四份**全部**应拿到余额，且数字一致
+        for id in 1..=4u64 {
+            let item = resp.balances.get(&id).unwrap_or_else(|| {
+                panic!("凭据 #{id} 应共享同组余额（旧代码按 id 键 ⇒ 只有 #2 有值）")
+            });
+            assert!(
+                (item.balance.remaining - 90.0).abs() < 1e-6,
+                "凭据 #{id} 的 remaining 应与同组一致，实际 {}",
+                item.balance.remaining
+            );
+        }
+
+        // ⭐ 承重反向断言：**不同 key** 的号绝不能被混进来。
+        // 若为了"统一"给所有号一个共享键，面板会显示别人的额度 —— 那比不同步严重得多。
+        assert!(
+            resp.balances.get(&5).is_none(),
+            "不同 key 的凭据 #5 不得共享这条余额（那会显示别的账号的额度）"
+        );
+    }
+
+    /// ⭐ 回归：旧格式缓存（按凭据 id 键）必须被**迁移**成账号键，而不是静默失效。
+    ///
+    /// # 不迁移的代价
+    ///
+    /// 键从 `id` 改成 `sha256(apiKey)` 后，旧文件里的十进制 id 键永远不会被命中 ⇒
+    /// 升级后 api_key 号余额全空 ⇒ 面板集体转圈打 `getUsageLimits`。那是 `web_portal`
+    /// 上游探测，本仓调优结论是绝不为展示类需求反复打它。
+    ///
+    /// 实测规模：线上 5 条缓存 / 5 个 api_key 号 / **只有 1 个不同的 key** ⇒ 并成 1 条。
+    ///
+    /// # 并组取最新
+    ///
+    /// N 个 id 映射到同一账号键时按 `cached_at` 取最新 —— 旧的那些本来就是冗余副本。
+    ///
+    /// 把迁移改回"键原样保留" → 本测试必 FAILED。
+    #[test]
+    fn old_id_keyed_cache_migrates_to_account_key() {
+        let dir = std::env::temp_dir().join(format!("kiro_bal_mig_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kiro_balance_cache.json");
+
+        let now = Utc::now().timestamp() as f64;
+        // 旧格式：三份同 key 分身各一条，cached_at 递增（#3 最新）
+        let mut map: HashMap<String, CachedBalance> = HashMap::new();
+        for (id, age) in [(1u64, 300.0), (2u64, 200.0), (3u64, 100.0)] {
+            let mut cb = mk_cached_balance(id, now - age);
+            // 用 remaining 标记是哪条，便于断言"取到的是最新那条"
+            cb.data.remaining = 90.0 - age;
+            map.insert(id.to_string(), cb);
+        }
+        std::fs::write(&path, serde_json::to_string(&map).unwrap()).unwrap();
+
+        // 池里是三份同 key 的 api_key 号（mk_service_with_clone_group 的构造）
+        let svc = mk_service_with_clone_group(3);
+        let loaded = AdminService::load_balance_cache_from(&Some(path.clone()), &svc.token_manager);
+
+        // 三条旧键并成一条账号键
+        assert_eq!(
+            loaded.len(),
+            1,
+            "三份同 key 分身的旧缓存应并成 1 条账号键，实际 {} 条：{:?}",
+            loaded.len(),
+            loaded.keys().collect::<Vec<_>>()
+        );
+        let account_key = svc.balance_cache_key(1);
+        let kept = loaded
+            .get(&account_key)
+            .expect("并组后的键应等于 balance_cache_key 算出的账号键");
+        // 取的是 cached_at 最新那条（age=100 ⇒ remaining = 90-100 = -10）
+        assert!(
+            (kept.data.remaining - (-10.0)).abs() < 1e-6,
+            "并组应保留 cached_at 最新的那条，实际 remaining={}",
+            kept.data.remaining
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⭐ 回归：删掉一份分身**不得**清掉整组共享的余额缓存。
+    ///
+    /// 无条件 `remove` 会让「删一份」把全组缓存清空 ⇒ 剩下的份面板显示"暂无数据"，
+    /// 直到下次后台刷新（默认 30 分钟）。而键必须在删除**之前**算 —— 删掉后
+    /// `export_credential` 返 `None`、键回落成 id 字符串，清的是不存在的键。
+    ///
+    /// 把 `prune_balance_cache_for_deleted` 改回无条件 remove → 本测试必 FAILED。
+    #[test]
+    fn deleting_one_clone_keeps_group_balance_cache() {
+        let svc = mk_service_with_clone_group(3);
+        let now = Utc::now().timestamp() as f64;
+        let group_key = svc.balance_cache_key(1);
+        {
+            let mut cache = svc.balance_cache.lock();
+            cache.insert(group_key.clone(), mk_cached_balance(1, now));
+        }
+
+        // 删掉组内一份（force 跳过"必须先禁用"那道门）
+        svc.delete_credential_forced(2, true).expect("删除应成功");
+
+        assert!(
+            svc.balance_cache.lock().contains_key(&group_key),
+            "删一份分身后，整组共享的余额缓存必须仍在（同 key 的其余份还要用它）"
+        );
+        // 剩下的份仍能读到
+        let resp = svc.get_cached_balances();
+        assert!(
+            resp.balances.contains_key(&1) && resp.balances.contains_key(&3),
+            "剩余份应仍有余额可显示"
+        );
+    }
+
     /// 回归（dwgx 需求「用了余额之后要刷新额度显示」）：展示路径必须用本地累计花费做乐观修正。
     ///
     /// **旧代码为何 FAIL**：余额真值由后台每 30 分钟刷新一次，展示端点原样吐缓存 →
@@ -3399,7 +6099,11 @@ mod balance_cache_tests {
     fn cached_balances_apply_optimistic_credit_adjustment() {
         let svc = mk_service_with_one_credential();
         // 播种：缓存里有真值（remaining=90），基线 credits_used=0
-        svc.balance_cache.lock().insert(1, mk_cached_balance(1, Utc::now().timestamp() as f64));
+        // 键走 balance_cache_key（缓存已改为按**账号**键，不再是凭据 id）。
+        let k = svc.balance_cache_key(1);
+        svc.balance_cache
+            .lock()
+            .insert(k, mk_cached_balance(1, Utc::now().timestamp() as f64));
         svc.token_manager.set_balance_snapshots(HashMap::from([(
             1u64,
             crate::kiro::token_manager::BalanceSnapshot {
@@ -3435,7 +6139,11 @@ mod balance_cache_tests {
     #[test]
     fn optimistic_adjustment_is_monotonic_and_clamped() {
         let svc = mk_service_with_one_credential();
-        svc.balance_cache.lock().insert(1, mk_cached_balance(1, Utc::now().timestamp() as f64));
+        // 键走 balance_cache_key（缓存已改为按**账号**键）。
+        let k = svc.balance_cache_key(1);
+        svc.balance_cache
+            .lock()
+            .insert(k, mk_cached_balance(1, Utc::now().timestamp() as f64));
         // 基线 999：远大于当前累计（0），delta 为负
         svc.token_manager.set_balance_snapshots(HashMap::from([(
             1u64,
@@ -3487,13 +6195,2900 @@ mod balance_cache_tests {
         map.insert(k2, v2);
         std::fs::write(&path, serde_json::to_string(&map).unwrap()).unwrap();
 
-        let loaded = AdminService::load_balance_cache_from(&Some(path.clone()));
+        // 传一个空池的 token_manager：本测试只验「7 天展示保留期」的淘汰，
+        // 不验账号键迁移（那条由 migration 专用测试覆盖）。空池 ⇒ 键原样保留。
+        let tm_empty = Arc::new(
+            MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                vec![],
+                None,
+                None,
+                false,
+            )
+            .expect("构造空池 token manager"),
+        );
+        let loaded = AdminService::load_balance_cache_from(&Some(path.clone()), &tm_empty);
 
+        // 键现在**原样保留为字符串**（缓存改按账号键后不再 parse 成 u64）。
+        // 磁盘格式不变（JSON 对象键本来就是字符串），所以旧文件仍能读回。
         // 陈旧但在展示窗口内 → 保留（重启后前端仍能显示上次数字）
-        assert!(loaded.contains_key(&1), "陈旧但在 7 天内的缓存必须保留");
+        assert!(loaded.contains_key("1"), "陈旧但在 7 天内的缓存必须保留");
         // 超过展示窗口 → 丢弃（避免无界陈旧）
-        assert!(!loaded.contains_key(&2), "超过 7 天的缓存应被丢弃");
+        assert!(!loaded.contains_key("2"), "超过 7 天的缓存应被丢弃");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn upsert_req(id: Option<u64>, url: &str, password: Option<&str>) -> SocksNodeUpsertRequest {
+        SocksNodeUpsertRequest {
+            id,
+            name: Some("n".into()),
+            url: url.into(),
+            username: Some("u".into()),
+            password: password.map(|s| s.to_string()),
+            enabled: None,
+        }
+    }
+
+    /// ⭐ 承重：**省略 `password` 键 = 不改密码**。
+    ///
+    /// 回退即 FAIL：把 upsert 里那个 `match req.password` 换成无条件
+    /// `node.password = req.password` → 改个节点名就把密码抹成 None，
+    /// 已绑该节点的分身在下次请求时全部因代理认证失败而掉线。
+    #[tokio::test]
+    async fn omitted_password_keeps_existing() {
+        let svc = mk_service_with_one_credential();
+        let id = svc
+            .upsert_socks_node(upsert_req(
+                None,
+                "socks5://node.invalid:40002",
+                Some("secret"),
+            ))
+            .await
+            .expect("新建节点");
+        assert_eq!(
+            svc.socks_node_proxy(id).and_then(|(_, _, p)| p).as_deref(),
+            Some("secret")
+        );
+
+        // 只改名，**不带** password 键。
+        svc.upsert_socks_node(SocksNodeUpsertRequest {
+            id: Some(id),
+            name: Some("renamed".into()),
+            url: "socks5://node.invalid:40002".into(),
+            username: Some("u".into()),
+            password: None,
+            enabled: None,
+        })
+        .await
+        .expect("更新节点");
+
+        assert_eq!(
+            svc.socks_node_proxy(id).and_then(|(_, _, p)| p).as_deref(),
+            Some("secret"),
+            "省略 password 键必须保留原密码"
+        );
+    }
+
+    /// `password: ""` 才是清空。
+    #[tokio::test]
+    async fn empty_password_clears() {
+        let svc = mk_service_with_one_credential();
+        let id = svc
+            .upsert_socks_node(upsert_req(
+                None,
+                "socks5://node.invalid:40002",
+                Some("secret"),
+            ))
+            .await
+            .unwrap();
+        svc.upsert_socks_node(upsert_req(
+            Some(id),
+            "socks5://node.invalid:40002",
+            Some(""),
+        ))
+        .await
+        .unwrap();
+        assert!(
+            svc.socks_node_proxy(id).and_then(|(_, _, p)| p).is_none(),
+            "显式空字符串必须清空密码"
+        );
+    }
+
+    /// 列表视图**绝不外传密码**，只给 hasPassword。
+    #[tokio::test]
+    async fn list_never_leaks_password() {
+        let svc = mk_service_with_one_credential();
+        svc.upsert_socks_node(upsert_req(
+            None,
+            "socks5://node.invalid:40002",
+            Some("secret"),
+        ))
+        .await
+        .unwrap();
+        let view = svc.list_socks_nodes();
+        assert_eq!(view.len(), 1);
+        assert!(view[0].has_password, "应报告设了密码");
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains("secret"), "序列化后绝不能含密码明文: {json}");
+    }
+
+    /// 更新一个**不存在**的 id 必须 404，不得静默新建。
+    #[tokio::test]
+    async fn upsert_unknown_id_is_not_found() {
+        let svc = mk_service_with_one_credential();
+        let err = svc
+            .upsert_socks_node(upsert_req(Some(999), "socks5://node.invalid:40002", None))
+            .await
+            .expect_err("不存在的 id 应报错");
+        assert!(
+            matches!(err, AdminServiceError::NotFound { id: 999 }),
+            "应是 NotFound，实际 {err:?}"
+        );
+        assert!(svc.list_socks_nodes().is_empty(), "不得静默新建");
+    }
+
+    /// 内网 IP 字面量的节点地址必须被拒（只覆盖字面量，见 validate_proxy_address 文档）。
+    ///
+    /// 用**云元数据地址**（169.254.169.254）而不是 127.0.0.1 做样本：节点地址走
+    /// `SsrfPolicy::AdminConfigured`，而链路本地段是它明确不豁免的（唯一豁免的是
+    /// 198.18.0.0/15 fake-IP 池段，见下方第二条断言）。挑一个策略切换后语义仍然
+    /// 明确的地址，测试才不会随策略调整而变成「碰巧还过」。
+    #[tokio::test]
+    async fn internal_node_address_is_rejected() {
+        let svc = mk_service_with_one_credential();
+        let err = svc
+            .upsert_socks_node(upsert_req(None, "socks5://169.254.169.254:1080", None))
+            .await
+            .expect_err("云元数据链路本地地址应被拒");
+        assert!(matches!(err, AdminServiceError::InvalidCredential(_)));
+        assert!(svc.list_socks_nodes().is_empty());
+
+        // ⭐ 承重：fake-IP 池段必须能加进来（这才是 AdminConfigured 的目的）。
+        // 回退即 FAIL：把 validate_proxy_address 的策略改回 Strict —— 开了 Clash
+        // fake-IP 的机器上任意域名都解析到该段，节点池对这些用户完全不可用。
+        svc.upsert_socks_node(upsert_req(None, "socks5://198.18.0.46:40002", None))
+            .await
+            .expect("fake-IP 池段（198.18.0.0/15）在 AdminConfigured 下必须放行");
+        assert_eq!(svc.list_socks_nodes().len(), 1);
+    }
+
+    /// 删节点**不动**已绑该节点的凭据（删一个节点不该让一批分身掉线）。
+    #[tokio::test]
+    async fn deleting_node_leaves_credential_proxy_untouched() {
+        let svc = mk_service_with_one_credential();
+        let id = svc
+            .upsert_socks_node(upsert_req(None, "socks5://node.invalid:40002", Some("p")))
+            .await
+            .unwrap();
+        // 把节点地址绑到凭据上（模拟「生成分身时写进凭据」）。
+        svc.token_manager
+            .set_credential_proxy(
+                1,
+                Some("socks5://node.invalid:40002".into()),
+                Some("u".into()),
+                Some("p".into()),
+            )
+            .expect("绑定代理");
+
+        assert!(svc.delete_socks_node(id).unwrap());
+
+        let cred = svc.token_manager.export_credential(1).expect("凭据仍在");
+        assert_eq!(
+            cred.proxy_url.as_deref(),
+            Some("socks5://node.invalid:40002"),
+            "删节点不得清掉凭据上已生效的代理绑定"
+        );
+    }
+
+    /// ⭐ 最重要的一条：**文件在但读不出来时，绝不能把它覆盖掉**。
+    ///
+    /// 回退即 FAIL：把 `load_socks_nodes_from` 的解析失败分支改回
+    /// `(Vec::new(), 1, true)`（即「空表 + 允许回写」），或删掉
+    /// `persist_socks_nodes` 里那道 `socks_nodes_writable` 判断 —— 两者任一都会让
+    /// 下面最后那条断言失败：原文件里的节点与代理密码被一张只有 1 条的表原子覆盖，
+    /// 永久丢失。这是把 credentials.json 那条 `exit(1)` 换成只读降级的代价，
+    /// 必须有测试兜住。
+    #[test]
+    fn unreadable_node_file_is_never_overwritten() {
+        let dir = std::env::temp_dir().join(format!(
+            "ks_socks_ro_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("socks_nodes.json");
+
+        // 写一份**读不出来**的内容（既非合法 JSON 也非 KSENC1 密文）。
+        let garbage = b"{ this is not valid json at all";
+        std::fs::write(&path, garbage).unwrap();
+
+        let (nodes, next_id, writable) =
+            AdminService::load_socks_nodes_from(&Some(path.clone()), &{
+                let mut c = crate::kiro::model::credentials::KiroCredentials::default();
+                c.id = Some(1);
+                c.auth_method = Some("api_key".into());
+                c.kiro_api_key = Some("ksk_ro".into());
+                Arc::new(
+                    MultiTokenManager::new(
+                        crate::model::config::Config::default(),
+                        vec![c],
+                        None,
+                        None,
+                        false,
+                    )
+                    .expect("token manager"),
+                )
+            });
+
+        assert!(nodes.is_empty(), "读不出来时内存表应为空");
+        assert_eq!(next_id, 1);
+        assert!(
+            !writable,
+            "文件存在但解析失败必须进入只读降级，否则下一次修改会抹平它"
+        );
+
+        // ⭐ 承重：真的走一遍**写路径**，再核对磁盘。
+        //
+        // 只调 loader 是不够的（本测试第一版就只做了这一半）：那样删掉
+        // `persist_socks_nodes` 里的 writable 判断，测试**照样通过** ——
+        // 因为它从没写过。必须构造一个 socks_nodes_path 指向该文件、
+        // socks_nodes_writable=false 的 service，然后调 persist 并断言两件事：
+        // 调用被拒 + 文件逐字节未变。
+        let svc = AdminService {
+            socks_nodes: Mutex::new(vec![SocksNode {
+                id: 1,
+                name: "n".into(),
+                url: "socks5://node.invalid:40002".into(),
+                username: None,
+                password: Some("would-be-written".into()),
+                enabled: true,
+                last_test: None,
+                created_at: 0,
+            }]),
+            socks_nodes_path: Some(path.clone()),
+            socks_nodes_writable: writable, // = false
+            ..AdminService::new(
+                {
+                    let mut c = crate::kiro::model::credentials::KiroCredentials::default();
+                    c.id = Some(1);
+                    c.auth_method = Some("api_key".into());
+                    c.kiro_api_key = Some("ksk_ro2".into());
+                    Arc::new(
+                        MultiTokenManager::new(
+                            crate::model::config::Config::default(),
+                            vec![c],
+                            None,
+                            None,
+                            false,
+                        )
+                        .expect("token manager"),
+                    )
+                },
+                Vec::<String>::new(),
+            )
+        };
+        let err = svc
+            .persist_socks_nodes()
+            .expect_err("只读降级下回写必须被拒绝");
+        assert!(
+            matches!(err, AdminServiceError::InternalError(_)),
+            "应是 InternalError，实际 {err:?}"
+        );
+
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            after, garbage,
+            "只读降级下原文件必须逐字节保持不变（这是防数据毁灭的唯一护栏）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⭐ 承重：只读降级下的 upsert **不得改内存**。
+    ///
+    /// 回退即 FAIL：把 `upsert_socks_node` 顶部那句 `self.ensure_socks_writable()?` 删掉
+    /// （即回到「先 push 进内存、再由 persist 报错」的顺序）—— 下面第 2 条断言失败：
+    /// 调用方收到报错、磁盘上什么都没有，但 `list_socks_nodes()` 里凭空多出一个节点，
+    /// 面板会一直显示它直到重启。
+    #[tokio::test]
+    async fn readonly_degraded_upsert_leaves_memory_untouched() {
+        let dir = std::env::temp_dir().join(format!(
+            "ks_socks_ro_upsert_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("socks_nodes.json");
+        let garbage = b"{ not json";
+        std::fs::write(&path, garbage).unwrap();
+
+        let svc = AdminService {
+            socks_nodes: Mutex::new(Vec::new()),
+            socks_nodes_path: Some(path.clone()),
+            socks_nodes_writable: false,
+            ..mk_service_with_one_credential()
+        };
+
+        let err = svc
+            .upsert_socks_node(upsert_req(None, "socks5://node.invalid:40002", Some("p")))
+            .await
+            .expect_err("只读降级下新增节点必须报错");
+        assert!(
+            matches!(err, AdminServiceError::InternalError(_)),
+            "应是 InternalError，实际 {err:?}"
+        );
+        assert!(
+            svc.list_socks_nodes().is_empty(),
+            "只读降级下报错后内存表必须仍为空，否则面板显示一个磁盘上不存在的节点"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            garbage,
+            "原文件必须逐字节未变"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⭐ 承重：只读降级下的 delete / record_test 同样不得改内存。
+    ///
+    /// 回退即 FAIL：删掉这两个方法顶部的 `ensure_socks_writable()?` —— 删除会让节点
+    /// 从面板消失（磁盘上还在），测速结果会写进一张永不落盘的表，两者都是「报错了但
+    /// 界面显示已生效」。
+    #[test]
+    fn readonly_degraded_delete_and_test_leave_memory_untouched() {
+        let dir = std::env::temp_dir().join(format!(
+            "ks_socks_ro_del_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("socks_nodes.json");
+        std::fs::write(&path, b"{ not json").unwrap();
+
+        let svc = AdminService {
+            socks_nodes: Mutex::new(vec![SocksNode {
+                id: 7,
+                name: "n".into(),
+                url: "socks5://node.invalid:40002".into(),
+                username: None,
+                password: None,
+                enabled: true,
+                last_test: None,
+                created_at: 0,
+            }]),
+            socks_nodes_path: Some(path.clone()),
+            socks_nodes_writable: false,
+            ..mk_service_with_one_credential()
+        };
+
+        assert!(svc.delete_socks_node(7).is_err(), "只读降级下删除必须报错");
+        assert_eq!(
+            svc.list_socks_nodes().len(),
+            1,
+            "报错后节点必须还在内存表里（否则面板上它消失了而磁盘上还在）"
+        );
+
+        assert!(
+            svc.record_socks_node_test(
+                7,
+                SocksNodeTest {
+                    ok: true,
+                    latency_ms: 12,
+                    error: None,
+                    tested_at: 0,
+                    exit_ip: None,
+                }
+            )
+            .is_err(),
+            "只读降级下写测速结果必须报错"
+        );
+        assert!(
+            svc.list_socks_nodes()[0].last_test.is_none(),
+            "报错后不得留下一个永不落盘的测速结果"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 缺失文件与不可读文件必须走不同分支：缺失是首次启动（可写），不可读是降级（只读）。
+    #[test]
+    fn missing_node_file_is_writable_unlike_unreadable_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "ks_socks_missing_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tm = {
+            let mut c = crate::kiro::model::credentials::KiroCredentials::default();
+            c.id = Some(1);
+            c.auth_method = Some("api_key".into());
+            c.kiro_api_key = Some("ksk_missing".into());
+            Arc::new(
+                MultiTokenManager::new(
+                    crate::model::config::Config::default(),
+                    vec![c],
+                    None,
+                    None,
+                    false,
+                )
+                .expect("token manager"),
+            )
+        };
+        let (nodes, next_id, writable) =
+            AdminService::load_socks_nodes_from(&Some(dir.join("socks_nodes.json")), &tm);
+        assert!(nodes.is_empty());
+        assert_eq!(next_id, 1, "首次启动的 next_id 应为 1");
+        assert!(writable, "文件不存在是首次启动，必须允许回写");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⭐ 更新只发 `{id, url, enabled}` 时，用户名与密码都必须保留。
+    ///
+    /// 回退即 FAIL：把 username 改回无条件 `node.username = username` ——
+    /// 用户名被抹成 None 而密码留着，`build_client` 的
+    /// `if let (Some(u), Some(p))` 不成立 → 认证被静默丢弃 → 该节点全部连不上，
+    /// 而面板上它看起来一切正常（仍显示「已设密码」）。
+    #[tokio::test]
+    async fn partial_update_preserves_both_username_and_password() {
+        let svc = mk_service_with_one_credential();
+        let id = svc
+            .upsert_socks_node(SocksNodeUpsertRequest {
+                id: None,
+                name: Some("n".into()),
+                url: "socks5://node.invalid:40002".into(),
+                username: Some("alice".into()),
+                password: Some("secret".into()),
+                enabled: None,
+            })
+            .await
+            .expect("新建");
+
+        // 只改 enabled，username/password 两个键都不带。
+        svc.upsert_socks_node(SocksNodeUpsertRequest {
+            id: Some(id),
+            name: None,
+            url: "socks5://node.invalid:40002".into(),
+            username: None,
+            password: None,
+            enabled: Some(false),
+        })
+        .await
+        .expect("局部更新");
+
+        let (_, user, pass) = svc.socks_node_proxy(id).expect("节点仍在");
+        assert_eq!(
+            user.as_deref(),
+            Some("alice"),
+            "省略 username 键必须保留原值"
+        );
+        assert_eq!(
+            pass.as_deref(),
+            Some("secret"),
+            "省略 password 键必须保留原值"
+        );
+
+        // 显式空串仍必须清空（否则「清除用户名」这个操作不存在）。
+        svc.upsert_socks_node(SocksNodeUpsertRequest {
+            id: Some(id),
+            name: None,
+            url: "socks5://node.invalid:40002".into(),
+            username: Some(String::new()),
+            password: None,
+            enabled: None,
+        })
+        .await
+        .expect("清空用户名");
+        let (_, user, pass) = svc.socks_node_proxy(id).unwrap();
+        assert!(user.is_none(), "显式空串必须清空 username");
+        assert_eq!(
+            pass.as_deref(),
+            Some("secret"),
+            "清 username 不该动 password"
+        );
+    }
+
+    /// ⭐ 源码级守卫：多开必须**消费**节点池，且不得复用节点。
+    ///
+    /// 用源码断言而非行为测试：`add_credential` 会调 `get_usage_limits_for`
+    /// （真实上游往返），穿它的行为测试写不了 —— 本仓既有惯例，见
+    /// `provider.rs` 的 `should_emit_usage_record_in_mcp_success_branch`。
+    ///
+    /// 回退即 FAIL：删掉 copies 循环里那段 `assignable.get(...)` 赋值 ——
+    /// 节点池就再次变成一张没人读的表：用户加了节点、建了分身，每份仍然直连、
+    /// 共用服务器同一个出口 IP，而面板上看起来一切正常。这正是本批第一版的状态。
+    #[test]
+    fn clone_creation_must_consume_the_node_pool_without_reuse() {
+        let src = include_str!("service.rs");
+        // needle 运行时拼接，避免被 include_str! 读到自己而多算一处。
+        let consume = format!("{}{}", "assignable.get(seq as usize", " - 2)");
+        assert!(
+            src.contains(consume.as_str()),
+            "多开循环必须按份从节点池取节点，否则节点池无任何消费方"
+        );
+        // 只取启用节点。
+        let enabled_filter = format!("{}{}", ".filter(|n| n.", "enabled)");
+        assert!(
+            src.contains(enabled_filter.as_str()),
+            "只能分配 enabled 的节点，否则「禁用节点」这个开关没有意义"
+        );
+        // ⭐ 承重：索引式取用（取完即止）而不是取模复用。
+        // needle 必须运行时拼接 —— 写成完整字面量时它会出现在 include_str! 读到的
+        // 本测试自身里，于是这条**否定**断言恒失败（本文件已两次踩到同一个坑）。
+        let reuse = format!("{}{}", "assignable[seq as usize", " % ");
+        assert!(
+            !src.contains(reuse.as_str()),
+            "不得对节点取模复用：两份共用一个出口 IP 等于没分散，却让人以为分散了"
+        );
+    }
+
+    // ===================== 节点表落盘路径（round-trip）=====================
+    //
+    // 上面 11 条节点测试全部用 `mk_service_with_one_credential()`，它给
+    // `MultiTokenManager::new` 传的 credentials_path 是 `None` → `cache_dir()` 为 None
+    // → `socks_nodes_path` 为 None → `persist_socks_nodes` 在开头就 `return Ok(())`。
+    // 也就是说**它们一次都没真的写过盘**，于是以下四件事此前零覆盖：
+    // 密码的 at-rest 加解密往返、`next_id` 高水位跨存取存活、`SocksNodeFileCompat`
+    // 的裸数组兼容分支（生产上唯一引用点是 `load_socks_nodes_from`，测试侧此前为零）、
+    // 明文↔密文开关。
+    //
+    // 下面这组测试建一个 credentials_path 落在**独立临时目录**里的 service，
+    // 从而让 `cache_dir()` 派生出真实的 socks_nodes_path（刻意走真实派生链，
+    // 而不是直接塞 socks_nodes_path 字段 —— 后者测不到派生本身）。
+
+    /// 造一个节点表真的落在 `dir` 里的 service。`encrypt` 控制 at-rest 开关。
+    fn mk_service_rooted_at(dir: &std::path::Path, encrypt: bool) -> AdminService {
+        let mut c = crate::kiro::model::credentials::KiroCredentials::default();
+        c.id = Some(1);
+        c.auth_method = Some("api_key".to_string());
+        c.kiro_api_key = Some("ksk_rt".to_string());
+        let mut cfg = crate::model::config::Config::default();
+        cfg.encrypt_credentials_at_rest = encrypt;
+        let tm = Arc::new(
+            MultiTokenManager::new(cfg, vec![c], None, Some(dir.join("credentials.json")), true)
+                .expect("构造 token manager"),
+        );
+        AdminService::new(tm, Vec::<String>::new())
+    }
+
+    /// 每条测试独立临时目录（密钥文件 `.at_rest.key` 也落在里面，互不污染）。
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("ks_socks_rt_{tag}_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// (a) 明文落盘往返：字段逐个还原，**含密码**。
+    ///
+    /// 回退即 FAIL：把 `persist_socks_nodes` 里那句 `write_atomic` 删掉（或让它写
+    /// `nodes` 而不带 `next_id`，见下一条）—— 重启后节点表整张消失，
+    /// 用户配好的一池代理与密码全部丢失，而面板只会显示「暂无节点」。
+    ///
+    /// ⚠️ 必须 `multi_thread`：`MultiTokenManager::new` 带真实 credentials_path 时会
+    /// 回写凭据文件，而 `persist_credentials` 在 runtime 内走 `block_in_place`
+    /// （current_thread runtime 上直接 panic）。本组其余落盘测试同理。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nodes_round_trip_plaintext_preserves_every_field() {
+        let dir = tmp_dir("plain");
+        let svc = mk_service_rooted_at(&dir, false);
+        let id = svc
+            .upsert_socks_node(SocksNodeUpsertRequest {
+                id: None,
+                name: Some("JP-1".into()),
+                url: "socks5://node.invalid:40002".into(),
+                username: Some("alice".into()),
+                password: Some("p@ss-w0rd".into()),
+                enabled: Some(true),
+            })
+            .await
+            .expect("新建节点");
+
+        let path = dir.join("socks_nodes.json");
+        assert!(path.exists(), "cache_dir 派生的节点表必须真的落盘");
+        // 关了加密 → 磁盘上是明文（这一条同时锁住「开关真的有效」）。
+        let raw = std::fs::read(&path).unwrap();
+        assert!(
+            !crate::common::secret_store::is_encrypted(&raw),
+            "encrypt_credentials_at_rest=false 时不得写成密文"
+        );
+
+        // 模拟重启：从同一路径重新加载。
+        let svc2 = mk_service_rooted_at(&dir, false);
+        let nodes = svc2.list_socks_nodes();
+        assert_eq!(nodes.len(), 1, "重启后节点必须还在");
+        assert_eq!(nodes[0].id, id);
+        assert_eq!(nodes[0].label, "JP-1");
+        assert_eq!(nodes[0].url, "socks5://node.invalid:40002");
+        assert!(nodes[0].enabled);
+        assert!(nodes[0].has_password);
+        let (url, user, pass) = svc2.socks_node_proxy(id).expect("节点仍在");
+        assert_eq!(url, "socks5://node.invalid:40002");
+        assert_eq!(user.as_deref(), Some("alice"), "用户名必须随文件存活");
+        assert_eq!(
+            pass.as_deref(),
+            Some("p@ss-w0rd"),
+            "密码必须随文件存活，否则重启后该节点全部连不上"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (b) 加密落盘往返：磁盘字节**不得含密码明文**，但加载后密码完好。
+    ///
+    /// 回退即 FAIL：把 `persist_socks_nodes` 里的 `encode_for_disk(..., enc, ...)`
+    /// 改成 `encode_for_disk(..., false, ...)`（即忽略 at-rest 开关）——
+    /// 第 2 条断言失败：代理密码明文躺在磁盘上，而面板的 at-rest 健康灯仍然是绿的。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nodes_round_trip_encrypted_hides_password_on_disk() {
+        let dir = tmp_dir("enc");
+        let svc = mk_service_rooted_at(&dir, true);
+        svc.upsert_socks_node(SocksNodeUpsertRequest {
+            id: None,
+            name: Some("enc".into()),
+            url: "socks5://node.invalid:40002".into(),
+            username: Some("bob".into()),
+            password: Some("super-secret-pw".into()),
+            enabled: None,
+        })
+        .await
+        .expect("新建节点");
+
+        let path = dir.join("socks_nodes.json");
+        let raw = std::fs::read(&path).unwrap();
+        assert!(
+            crate::common::secret_store::is_encrypted(&raw),
+            "开了 at-rest 时节点表必须带 KSENC1 magic 前缀"
+        );
+        let needle = b"super-secret-pw";
+        assert!(
+            !raw.windows(needle.len()).any(|w| w == needle),
+            "磁盘字节里绝不能出现代理密码明文"
+        );
+        assert!(
+            dir.join(".at_rest.key").exists(),
+            "首次加密应在同目录创建密钥文件"
+        );
+
+        // 重启后必须能解开（同目录密钥在）。
+        let svc2 = mk_service_rooted_at(&dir, true);
+        let nodes = svc2.list_socks_nodes();
+        assert_eq!(nodes.len(), 1, "密文必须能被解开并加载");
+        let (_, user, pass) = svc2.socks_node_proxy(nodes[0].id).expect("节点仍在");
+        assert_eq!(user.as_deref(), Some("bob"));
+        assert_eq!(pass.as_deref(), Some("super-secret-pw"), "解密后密码应完好");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (c) `next_id` 高水位**跨重启**存活：删掉最大 id 的节点后重启，新号仍更大。
+    ///
+    /// 这是 `SocksNodeFile` 存在的全部理由（见其文档），而此前没有任何测试真的
+    /// 存过一次盘 —— 于是"高水位被持久化"这件事从未被验证过。
+    ///
+    /// 回退即 FAIL：把 `persist_socks_nodes` 里的 `SocksNodeFile { nodes, next_id }`
+    /// 换成直接序列化 `nodes` 裸数组（即回到"只存数组"）—— 重启后 next_id 只能按
+    /// `max(id)+1` 现算，而最大那个刚被删掉，于是它的 id 被重新发出去：
+    /// 面板另一个标签页仍持有删除前的列表，点它的「测活」会打到这个无关的新节点上。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn next_id_high_water_mark_survives_save_and_load() {
+        let dir = tmp_dir("hwm");
+        let svc = mk_service_rooted_at(&dir, false);
+        let mk = |n: u16| SocksNodeUpsertRequest {
+            id: None,
+            name: Some(format!("n{n}")),
+            url: format!("socks5://node{n}.invalid:40002"),
+            username: None,
+            password: None,
+            enabled: None,
+        };
+        let a = svc.upsert_socks_node(mk(1)).await.unwrap();
+        let b = svc.upsert_socks_node(mk(2)).await.unwrap();
+        let c = svc.upsert_socks_node(mk(3)).await.unwrap();
+        assert!(c > b && b > a);
+
+        // 删掉**最大** id 那个（这正是"只存数组"会翻车的场景）。
+        assert!(svc.delete_socks_node(c).unwrap());
+
+        // 重启（从磁盘重新加载）后再建一个。
+        let svc2 = mk_service_rooted_at(&dir, false);
+        assert_eq!(svc2.list_socks_nodes().len(), 2, "剩下两个节点应被加载回来");
+        let d = svc2.upsert_socks_node(mk(4)).await.unwrap();
+        assert!(
+            d > c,
+            "重启后新节点 id（{d}）必须大于历史上发放过的任何 id（已发过 {c}）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (d) `SocksNodeFileCompat` 的**裸数组**（旧形态）分支：能加载且高水位补齐。
+    ///
+    /// 该枚举在生产上唯一的引用点是 `load_socks_nodes_from`，测试侧此前为零 ——
+    /// 也就是说"旧文件还能不能读"这条兼容承诺从未被验证。
+    ///
+    /// 回退即 FAIL：删掉 `SocksNodeFileCompat` 的 `BareArray` 变体（只留结构体形态），
+    /// 裸数组解析失败 → `load_socks_nodes_from` 走**只读降级**：用户升级后节点表在面板上
+    /// 整张消失，且此后任何修改都被拒（"只读降级"），而文件其实是好的。
+    #[test]
+    fn legacy_bare_array_node_file_loads_and_backfills_next_id() {
+        let dir = tmp_dir("compat");
+        let path = dir.join("socks_nodes.json");
+        // 旧形态：**裸数组**，没有 nextId 这一层。
+        std::fs::write(
+            &path,
+            r#"[{"id":5,"name":"old","url":"socks5://legacy.invalid:1080","enabled":true}]"#,
+        )
+        .unwrap();
+
+        let svc = mk_service_rooted_at(&dir, false);
+        let nodes = svc.list_socks_nodes();
+        assert_eq!(nodes.len(), 1, "裸数组旧文件必须能读出来（不得降级成空表）");
+        assert_eq!(nodes[0].id, 5);
+        assert_eq!(nodes[0].label, "old");
+        assert!(nodes[0].enabled, "缺 enabled 字段时应默认 true");
+
+        // 高水位按 max(id)+1 补齐 → 新节点 id 必须 > 5（而不是又发 1）。
+        let new_id = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                svc.upsert_socks_node(SocksNodeUpsertRequest {
+                    id: None,
+                    name: Some("fresh".into()),
+                    url: "socks5://fresh.invalid:1080".into(),
+                    username: None,
+                    password: None,
+                    enabled: None,
+                })
+                .await
+            })
+            .expect("旧文件之上新建节点");
+        assert!(
+            new_id > 5,
+            "裸数组归一化后 next_id 应至少是 max(id)+1，实得 {new_id}"
+        );
+
+        // 回写后应升级成新形态（带 nextId），且旧节点仍在。
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("\"nextId\""),
+            "回写应升级为带高水位的新形态: {raw}"
+        );
+        let svc2 = mk_service_rooted_at(&dir, false);
+        assert_eq!(svc2.list_socks_nodes().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 明文 ↔ 密文开关：同一份数据先明文落盘，改开关后回写即变密文（反之亦然）。
+    ///
+    /// 这是"透明迁移"承诺的两个方向。回退即 FAIL：`load_socks_nodes_from` 里若去掉
+    /// `maybe_decrypt_to_string` 而直接当明文 parse，第二段（密文 → 加载）会解析失败
+    /// 进只读降级 —— 开了加密的用户重启后节点表整张消失且无法修改。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn at_rest_toggle_migrates_both_directions() {
+        let dir = tmp_dir("toggle");
+        // 先明文写一份。
+        let svc_plain = mk_service_rooted_at(&dir, false);
+        svc_plain
+            .upsert_socks_node(SocksNodeUpsertRequest {
+                id: None,
+                name: Some("mig".into()),
+                url: "socks5://node.invalid:40002".into(),
+                username: None,
+                password: Some("pw-1".into()),
+                enabled: None,
+            })
+            .await
+            .unwrap();
+        let path = dir.join("socks_nodes.json");
+        assert!(!crate::common::secret_store::is_encrypted(
+            &std::fs::read(&path).unwrap()
+        ));
+
+        // 打开加密后重启：明文照旧能读（透明迁移），下一次回写才变密文。
+        let svc_enc = mk_service_rooted_at(&dir, true);
+        assert_eq!(
+            svc_enc.list_socks_nodes().len(),
+            1,
+            "明文文件在开了加密后仍必须能读"
+        );
+        svc_enc
+            .upsert_socks_node(SocksNodeUpsertRequest {
+                id: None,
+                name: Some("mig2".into()),
+                url: "socks5://node2.invalid:40002".into(),
+                username: None,
+                password: Some("pw-2".into()),
+                enabled: None,
+            })
+            .await
+            .unwrap();
+        let raw = std::fs::read(&path).unwrap();
+        assert!(
+            crate::common::secret_store::is_encrypted(&raw),
+            "开了加密后的第一次回写应产出密文"
+        );
+        for needle in [b"pw-1".as_slice(), b"pw-2".as_slice()] {
+            assert!(
+                !raw.windows(needle.len()).any(|w| w == needle),
+                "迁移后旧密码也不得残留明文"
+            );
+        }
+
+        // 再关掉加密：密文仍能读（走解密），回写后落回明文。
+        let svc_back = mk_service_rooted_at(&dir, false);
+        assert_eq!(
+            svc_back.list_socks_nodes().len(),
+            2,
+            "密文在关了加密后仍必须能读"
+        );
+        svc_back.delete_socks_node(1).ok();
+        let raw2 = std::fs::read(&path).unwrap();
+        assert!(
+            !crate::common::secret_store::is_encrypted(&raw2),
+            "关掉加密后的回写应落回明文"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⭐ 源码级守卫：组内序号必须在**任何 await 之前**一次性预留完，
+    /// 且 `add_credential` 里不得再出现「扫 max 现算」。
+    ///
+    /// 用源码断言而非行为测试：`add_credential` 会调 `get_usage_limits_for`
+    /// （真实上游往返），穿它的行为测试写不了 —— 与本文件既有的
+    /// `clone_creation_must_consume_the_node_pool_without_reuse` 同款理由。
+    /// 并发正确性本身由 `token_manager` 的
+    /// `concurrent_clone_seq_reservations_never_overlap` 覆盖。
+    ///
+    /// 回退即 FAIL：把序号来源改回 `max_clone_seq_in_group`（无论放在入池前还是入池后）
+    /// —— 第 1 条断言立刻失败。两个并发的「给同一 key 加 N 份」请求会各自读到同一个
+    /// max，同一组里出现两个 `分身 #2`，管理页无法区分、删除时无法指名。
+    #[test]
+    fn clone_seq_must_be_reserved_before_any_await() {
+        let src = include_str!("service.rs");
+        // ⚠️ 两个 needle 都**运行时拼接**：写成完整字面量时它会出现在 include_str!
+        // 读到的本测试自身里 —— 否定断言恒失败、肯定断言恒成立（即测试被静默作废）。
+        // 本文件已两次踩到这个坑，见节点池那条守卫的注释。
+        let scan = format!("{}{}", "max_clone_seq_in", "_group(");
+        assert!(
+            !src.contains(scan.as_str()),
+            "add_credential 不得自行扫 max 现算组内序号：发号与入池之间横跨 await，\
+             两个并发请求会读到同一个 max 而重号。序号必须走 token_manager 的原子预留。"
+        );
+        let reserve = format!("{}{}", "reserve_clone", "_seqs(g, copies)");
+        assert!(
+            src.contains(reserve.as_str()),
+            "必须一次性预留本次全部份数的号段（copies 份），否则第 2..N 份仍会与并发请求撞号"
+        );
+
+        // ⭐ 承重的**顺序**断言：预留必须在第一个入池 await 之前。
+        // 预留放到入池之后就等于把竞态窗口原样留着（旧代码正是那样）。
+        let reserve_at = src.find(reserve.as_str()).expect("上一条断言已保证存在");
+        let first_await = format!(
+            "{}{}",
+            "add_credential_allowing_", "duplicate(new_cred.clone())"
+        );
+        let await_at = src
+            .find(first_await.as_str())
+            .expect("第 1 份入池调用应存在");
+        assert!(
+            reserve_at < await_at,
+            "号段预留（位置 {reserve_at}）必须早于第 1 份入池 await（位置 {await_at}）：\
+             放在 await 之后等于竞态窗口原封不动"
+        );
+    }
+
+    /// ⭐ 源码级守卫：`clone_credential` **不得重新实现份数逻辑**，必须复用共享实现。
+    ///
+    /// 用源码断言而非行为测试：这条路同样会调 `get_usage_limits_for`（真实上游往返）。
+    ///
+    /// 回退即 FAIL：在 `clone_credential` 里自己抄一遍 copies 循环（哪怕只抄
+    /// `add_credential_allowing_duplicate` 那一句）—— 第 2 条断言失败。那会造出第二条
+    /// 校验路径：去重绕过、组复用、**序号原子预留**、节点分配、OAuth 拒绝五件事
+    /// 各有两份实现，其中任一份漏改就是一个只在某条入口上出现的缺陷。
+    #[test]
+    fn clone_endpoint_must_reuse_the_shared_copies_path() {
+        // ⚠️ 本守卫读源码，必须做**两步归一**，否则它是纸面测试（CLAUDE.md 记载的必备两步）：
+        //   ① 剔掉 `//` 开头的行 —— 否则匹配到被注释掉的实现或文档注释里的符号名，
+        //      实现被删了守卫仍绿；
+        //   ② **去掉全部空白** —— 否则 rustfmt 一次换行就让 needle 失配。
+        //
+        // 🔴 第 ② 步是 2026-08-06 实测补上的，代价是一次真实红灯：有人给
+        // `AddCredentialRequest` 加了字段使调用行变长，rustfmt 于是把
+        //     let mut created = self.add_credential_with_intent(
+        // 折成
+        //     let mut created = self
+        //         .add_credential_with_intent(
+        // 于是含 `self.` 的 needle 计数从 2 掉到 1、守卫报红，而**代码完全正确**。
+        // 当时最省事的"修法"是把断言里的 2 改成 1 —— 那会把守卫彻底作废（它防的是
+        // 去重绕过/组复用/序号原子预留/节点分配/OAuth 拒绝五件事各有两份实现）。
+        // 归一化之后断言与排版无关，这类假红灯不会再来。
+        let raw = include_str!("service.rs");
+        let src = normalize_src_for_guard(raw);
+
+        // needle 全部运行时拼接（见节点池守卫处的说明：字面量会匹配到本测试自身，
+        // 从而把断言静默作废 —— 本文件已三次踩到这个坑）。
+        // ⚠️ 这里的 count 断言尤其要小心：needle 若在本测试源码里出现，它会把自己算进
+        // 计数，于是"两处调用都被删掉"仍然满足 `>= 2`。
+        // 归一化后本测试自身的拼接式 `format!("{}{}", "self.add_credential_with", ...)`
+        // 仍是分开的两段字符串字面量，**不会**自匹配 —— 这是拼接写法在归一化下依然承重的原因。
+        let shared = format!("{}{}", "self.add_credential_with", "_intent(");
+        assert_eq!(
+            src.matches(shared.as_str()).count(),
+            2,
+            "add_credential 与 clone_credential 必须**都且只**走同一个共享实现\
+             （断言已对空白归一，报红说明真的少了一处调用，不是排版问题）"
+        );
+
+        // ⭐ 承重：clone_credential 的函数体里不得出现入池调用。
+        // ⚠️ needle 按**无空白形状**写（`pub async fn` → `pubasyncfn`），因为 src 已归一化。
+        // 原来的带空格写法在归一化后恒不命中 ⇒ `expect` 直接 panic，守卫变成"总是报错"。
+        let body_start = src
+            .find(format!("{}{}", "pubasyncfnclone_", "credential(").as_str())
+            .expect("clone_credential 应存在");
+        let body_end = src[body_start..]
+            .find(format!("{}{}", "asyncfnadd_credential_with_", "intent(").as_str())
+            .map(|off| body_start + off)
+            .expect("clone_credential 之后应紧跟共享实现");
+        let body = &src[body_start..body_end];
+        let insert = format!("{}{}", "add_credential_allowing_", "duplicate");
+        assert!(
+            !body.contains(insert.as_str()),
+            "clone_credential 不得自己入池：份数/去重/序号/节点分配必须只有一份实现"
+        );
+        let reserve = format!("{}{}", "reserve_clone", "_seqs");
+        assert!(
+            !body.contains(reserve.as_str()),
+            "clone_credential 不得自己预留序号（那会与共享实现各发一段号，重号回归）"
+        );
+
+        // 显式意图必须传 true，否则 `copies == 1` 会走去重 → 对已在池中的 key 必然
+        // 撞 `凭据已存在`，而「再加 1 份」正是本端点最常见的用法。
+        //
+        // 🔴 本断言此前的 needle 是 `"            true,\n" + "        )\n        .await"`
+        // —— 把**缩进宽度与换行位置**都写进了判据。实测它已经失配到 0 命中（rustfmt
+        // 把这个调用收成了一行），只是 `assert_eq!` 在它之前先 panic，所以这条**一直没被
+        // 执行过**，没人发现它坏了。这正是"守卫自己烂掉而无人知"的形态：
+        // 它比没有守卫更糟，因为它让人以为这件事被钉住了。
+        // 归一化后按「无空白形状」写：`...},true).await`。
+        let forced = format!("{}{}", "..req},", "true).await");
+        assert!(
+            src.contains(forced.as_str()),
+            "clone_credential 必须以 force_multi_open=true 调共享实现\
+             （否则 copies==1 会走去重，对已在池中的 key 必然撞『凭据已存在』）"
+        );
+    }
+
+    /// 源码级守卫专用的归一化：**剔注释行 + 去全部空白**。
+    ///
+    /// 这两步是 `CLAUDE.md` 记载的「写源码守卫的必备两步」，缺任一步守卫就是纸面测试：
+    ///
+    /// - **不剔注释** ⇒ `include_str!` 读到的是含注释的原始文本，把实现整段注释掉后
+    ///   `contains` 仍匹配到注释里那行 ⇒ 实现没了守卫还绿。本文件已三次踩到。
+    /// - **不去空白** ⇒ rustfmt 把一句调用折成多行就让 needle 失配 ⇒ 代码完全正确却报红。
+    ///   2026-08-06 实测发生过：加了个字段使行变长 → rustfmt 换行 → 守卫假红，
+    ///   而当时最省事的"修法"是改断言期望值，那等于把守卫作废。
+    ///
+    /// 去空白而非「归一成单空格」是刻意的：单空格仍然区分 `self .foo(` 与 `self.foo(`，
+    /// 而这两者语义完全相同、只差 rustfmt 的一次决定。全去掉才真正与排版无关。
+    ///
+    /// ⚠️ 代价：needle 也必须写成无空白形状。跨 token 的 needle（如 `fn foo (`）会失配，
+    /// 写 needle 时按「删掉所有空格后的样子」写。
+    fn normalize_src_for_guard(raw: &str) -> String {
+        raw.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .split_whitespace()
+            .collect::<String>()
+    }
+
+    /// ⭐ 源码级守卫：新端点必须**真的注册进路由**。
+    ///
+    /// 回退即 FAIL：删掉 `router.rs` 里那行 `.route(...clone...)` —— service 层代码
+    /// 还在、编译还过、测试还绿，但前端拿到 404。本仓已有多个"实现了却没挂路由"
+    /// 的同类风险点，故把注册这件事钉死。
+    #[test]
+    fn clone_endpoint_is_registered_in_router() {
+        let router = include_str!("router.rs");
+        let path = format!("{}{}", "/credentials/{id}", "/clone");
+        assert!(
+            router.contains(path.as_str()),
+            "clone 端点必须注册在 admin 路由树上"
+        );
+        let handler = format!("{}{}", "post(clone_", "credential)");
+        assert!(
+            router.contains(handler.as_str()),
+            "clone 路由必须绑到 clone_credential 处理器（且是 POST）"
+        );
+    }
+
+    /// 不存在的 id 必须 404，且**不得**建出任何凭据。
+    ///
+    /// 这条是 `clone_credential` 唯一不打网络就能穿到底的分支（NotFound 在
+    /// `export_credential` 之后立即返回），故可以写真行为测试。
+    #[tokio::test]
+    async fn cloning_unknown_credential_is_not_found() {
+        let svc = mk_service_with_one_credential();
+        let before = svc.token_manager.total_count();
+        let err = svc
+            .clone_credential(9999, 2, None, None, None, None, None)
+            .await
+            .expect_err("不存在的 id 应报错");
+        assert!(
+            matches!(err, AdminServiceError::NotFound { id: 9999 }),
+            "应是 NotFound，实际 {err:?}"
+        );
+        assert_eq!(svc.token_manager.total_count(), before, "不得建出任何凭据");
+    }
+
+    /// OAuth 号加分身必须被拒，且报错要点名是哪个 id。
+    ///
+    /// 回退即 FAIL：删掉 `clone_credential` 里那道 `multi_open_rejection_reason` ——
+    /// 请求会继续走下去并真的建出 N 份带同一个 refreshToken 的分身，
+    /// 它们随后被 `invalid_grant` 逐个自动禁用（面板上显示成"号被封了"）。
+    #[tokio::test]
+    async fn cloning_oauth_credential_is_rejected_with_id() {
+        let mut c = crate::kiro::model::credentials::KiroCredentials::default();
+        c.id = Some(1);
+        c.auth_method = Some("social".to_string());
+        c.refresh_token = Some("rt-oauth".to_string());
+        let tm = Arc::new(
+            MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                vec![c],
+                None,
+                None,
+                false,
+            )
+            .expect("token manager"),
+        );
+        let svc = AdminService::new(tm, Vec::<String>::new());
+
+        let err = svc
+            .clone_credential(1, 3, None, None, None, None, None)
+            .await
+            .expect_err("OAuth 号不该能加分身");
+        let msg = match err {
+            AdminServiceError::InvalidCredential(m) => m,
+            other => panic!("应是 InvalidCredential，实际 {other:?}"),
+        };
+        assert!(msg.contains("#1"), "报错应点名 id，实际: {msg}");
+        assert!(
+            msg.contains("refreshToken"),
+            "报错应说明 refreshToken 轮换这个根因，实际: {msg}"
+        );
+        assert_eq!(svc.token_manager.total_count(), 1, "被拒时不得建出任何份");
+    }
+
+    // ============ 分身默认不启用（clone_credential 的 enabled 语义）============
+    //
+    // 这三条是**真行为**测试，不是源码守卫：断言的是「分身入池后在面板上是 disabled」，
+    // 也就是 `get_all_credentials()`（`/credentials/status` 的实现）看到的那个字段。
+    //
+    // 之所以能穿到底而不打真实上游：`mk_clone_service` 给 token manager 配了一个
+    // **必然连不上的本地代理**（`127.0.0.1:1`），于是共享实现里那一次
+    // `get_usage_limits_for` 立刻拿 connection refused 并被 `tracing::warn!` 吞掉
+    // （它本就是"失败不影响上号"的路径）。同时父号预置了 `region`，共享实现按 key 继承给
+    // 分身，于是 `probe_and_persist_api_region` 在廉价预判处就 return —— 全程零 DNS。
+
+    /// 造一个「加分身能穿到底且不出网」的 service：父号是 api_key + 预置 region，
+    /// 全局代理指向必然拒连的 127.0.0.1:1。
+    fn mk_clone_service() -> AdminService {
+        let mut c = crate::kiro::model::credentials::KiroCredentials::default();
+        c.id = Some(1);
+        c.auth_method = Some("api_key".to_string());
+        c.kiro_api_key = Some("ksk_clone_enabled_test".to_string());
+        // 预置 region → 共享实现继承给每份 → region 探测在预判处返回，不出网。
+        c.region = Some("us-east-1".to_string());
+        let tm = Arc::new(
+            MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                vec![c],
+                // 拒连代理：让唯一那次上游往返立刻失败，测试与网络环境无关。
+                Some(crate::http_client::ProxyConfig::new("http://127.0.0.1:1")),
+                None,
+                false,
+            )
+            .expect("token manager"),
+        );
+        AdminService::new(tm, Vec::<String>::new())
+    }
+
+    /// 面板视角下「除父号 #1 之外的每一份」的 disabled 状态。
+    fn clone_disabled_flags(svc: &AdminService) -> Vec<(u64, bool)> {
+        let mut v: Vec<(u64, bool)> = svc
+            .get_all_credentials()
+            .credentials
+            .into_iter()
+            .filter(|c| c.id != 1)
+            .map(|c| (c.id, c.disabled))
+            .collect();
+        v.sort_by_key(|(id, _)| *id);
+        v
+    }
+
+    /// ⭐ `enabled` 省略 → **每一份**分身入池即禁用，父号状态不变。
+    ///
+    /// 回退即 FAIL：把 `clone_credential` 里那句 `disabled: !enabled.unwrap_or(false)`
+    /// 改回旧行为（删掉该字段 / 写 `disabled: false`）—— 本条的 `all disabled` 断言变红。
+    ///
+    /// 为什么必须是"入池时就 disabled"而不是"建完再批量禁用"：后者有中间窗口，
+    /// 分身在那段时间里是启用的，调度器立刻往它们发流量。实测事故
+    /// （2026-08-05 02:42）一次 copies=5，4 个分身 region 错配 → 恒 403 →
+    /// **24 秒内全部被自动禁用、0% 成功**，那 24 秒的真实用户请求全打在必废的号上。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cloned_credentials_are_disabled_by_default() {
+        let svc = mk_clone_service();
+        let resp = svc
+            .clone_credential(1, 3, None, None, None, None, None)
+            .await
+            .expect("加分身应成功");
+
+        let ids = resp.credential_ids.expect("多开必须下发全部 id");
+        assert_eq!(ids.len(), 3, "copies=3 应建出 3 份，实际 {ids:?}");
+        assert_eq!(svc.token_manager.total_count(), 4, "父号 + 3 份分身");
+
+        let flags = clone_disabled_flags(&svc);
+        assert_eq!(flags.len(), 3, "父号之外应恰好 3 份，实际 {flags:?}");
+        assert!(
+            flags.iter().all(|(_, disabled)| *disabled),
+            "省略 enabled 时每一份分身都必须是禁用态，实际 {flags:?}"
+        );
+
+        // 父号本身绝不能被顺手改状态。
+        let parent = svc
+            .get_all_credentials()
+            .credentials
+            .into_iter()
+            .find(|c| c.id == 1)
+            .expect("父号必须还在");
+        assert!(!parent.disabled, "父号的启用状态不该被加分身影响");
+
+        // available 只数未禁用的 → 仍然只有父号一个可用。
+        assert_eq!(
+            svc.get_all_credentials().available,
+            1,
+            "禁用的分身不得计入可用数（否则面板容量与调度池对不上）"
+        );
+    }
+
+    /// `enabled: true` → 分身建出来就是启用的（这个开关必须真的双向可控）。
+    ///
+    /// 回退即 FAIL：把那句改成硬编码 `disabled: true` —— 本条变红。
+    /// 有这一条，上一条才不可能靠"永远禁用"蒙过去。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cloned_credentials_can_be_created_enabled_on_request() {
+        let svc = mk_clone_service();
+        svc.clone_credential(1, 2, Some(true), None, None, None, None)
+            .await
+            .expect("加分身应成功");
+
+        let flags = clone_disabled_flags(&svc);
+        assert_eq!(flags.len(), 2, "copies=2 应建出 2 份，实际 {flags:?}");
+        assert!(
+            flags.iter().all(|(_, disabled)| !*disabled),
+            "显式 enabled=true 时分身必须是启用态，实际 {flags:?}"
+        );
+        assert_eq!(svc.get_all_credentials().available, 3, "父号 + 2 份都可用");
+    }
+
+    /// `enabled: false` 显式给出时与省略同义（前端可能两种都发）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn explicit_enabled_false_matches_the_omitted_default() {
+        let svc = mk_clone_service();
+        svc.clone_credential(1, 2, Some(false), None, None, None, None)
+            .await
+            .expect("加分身应成功");
+        let flags = clone_disabled_flags(&svc);
+        assert_eq!(flags.len(), 2);
+        assert!(
+            flags.iter().all(|(_, disabled)| *disabled),
+            "显式 false 必须与省略同义，实际 {flags:?}"
+        );
+    }
+
+    /// `enabled` 的 JSON 契约：省略 → `None`（由 service 落到"禁用"），
+    /// 显式 `true` / `false` 各自原样解出。
+    ///
+    /// 回退即 FAIL：给该字段加上 `#[serde(default = "...")]` 之类把 None 提前吃掉的
+    /// 默认值 —— 第一条断言变红（service 层就再也分不清"没给"与"给了 false"）。
+    #[test]
+    fn clone_request_parses_enabled_as_optional_camel_case() {
+        use super::super::types::CloneCredentialRequest;
+
+        let omitted: CloneCredentialRequest =
+            serde_json::from_str(r#"{"copies":3}"#).expect("省略 enabled 应能解析");
+        assert_eq!(omitted.copies, Some(3));
+        assert_eq!(omitted.enabled, None, "省略时必须是 None，不能被吃成 false");
+
+        let on: CloneCredentialRequest =
+            serde_json::from_str(r#"{"copies":2,"enabled":true}"#).expect("解析 enabled=true");
+        assert_eq!(on.enabled, Some(true));
+
+        let off: CloneCredentialRequest =
+            serde_json::from_str(r#"{"copies":2,"enabled":false}"#).expect("解析 enabled=false");
+        assert_eq!(off.enabled, Some(false));
+    }
+
+    // ============ 节点池 → 各份的分配（含主份）============
+    //
+    // 这一组是**真行为**测试而不是源码守卫：断言的是「入池后每一份的 proxyUrl 到底是什么」，
+    // 也就是 `export_credential` 看到的那个字段。能穿到底不出网的理由与上面 `enabled`
+    // 那三条相同（`mk_clone_service` 的拒连代理 + 预置 region）。
+    //
+    // ⚠️ 节点 URL 一律用 RFC 6761 保留的 `.invalid` TLD（与既有节点测试同款）：
+    // `upsert_socks_node` 会对节点 URL 做 SSRF 校验，`127.0.0.1` 会被**正确地**拒绝
+    // （`目标解析到非公网地址 127.0.0.1`），所以环回地址在这条路上根本进不了池。
+    // `.invalid` 保证永不解析 → 走 DNS 失败的 fail-open 分支入池，而随后那一次
+    // `get_usage_limits_for` 也在 DNS 处即失败，测试与本机 DNS/代理环境无关
+    // （见 CLAUDE.md 已知问题 #19 的同款理由）。
+
+    /// 节点 i（0-based）的 URL。逐个不同，断言才能区分是哪个节点。
+    fn node_url(i: usize) -> String {
+        format!("socks5://node{}.invalid:{}", i + 1, 40001 + i)
+    }
+
+    /// 往池里塞 n 个启用节点，返回它们的 id（顺序 = 插入顺序）。
+    async fn seed_nodes(svc: &AdminService, n: usize) -> Vec<u64> {
+        let mut ids = Vec::new();
+        for i in 0..n {
+            let id = svc
+                .upsert_socks_node(SocksNodeUpsertRequest {
+                    id: None,
+                    name: Some(format!("n{i}")),
+                    url: node_url(i),
+                    username: None,
+                    password: None,
+                    enabled: Some(true),
+                })
+                .await
+                .expect("加节点应成功");
+            ids.push(id);
+        }
+        ids
+    }
+
+    /// 逐 id 取「这一份的 proxyUrl」。
+    ///
+    /// 走 `token_manager.export_credential`（原始值）而不是 `AdminService::export_credential`
+    /// —— 后者是给导出用的、会做脱敏，断言出口 URL 必须看原始值。
+    fn proxy_urls_by_id(svc: &AdminService, ids: &[u64]) -> Vec<Option<String>> {
+        ids.iter()
+            .map(|id| {
+                svc.token_manager
+                    .export_credential(*id)
+                    .unwrap_or_else(|| panic!("凭据 #{id} 应存在"))
+                    .proxy_url
+            })
+            .collect()
+    }
+
+    /// 🔴 承重（缺陷 A）：**主份也要拿节点**，只要它自己没有代理。
+    ///
+    /// 实测的旧行为：池里 5 个全启用、一次 `copies=4`，只有第 2/3/4 份拿到节点，
+    /// **主份裸连**，两个节点闲置 —— 而用户以为 4 份都分散了。
+    ///
+    /// 回退即 FAILED：把节点计划挪回 `copies > 1` 块内（即第 1 份入池之后再算），
+    /// 或把 `pool_may_assign` 的判据改回「是不是第 1 份」—— 第一条断言变红
+    /// （`urls[0]` 是 None）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn first_copy_must_get_a_node_when_it_has_no_proxy_of_its_own() {
+        let svc = mk_clone_service();
+        seed_nodes(&svc, 3).await;
+
+        let resp = svc
+            .clone_credential(1, 3, None, None, None, None, None)
+            .await
+            .expect("加分身应成功");
+        let ids = resp.credential_ids.expect("多开必须下发全部 id");
+        assert_eq!(ids.len(), 3, "copies=3 应建出 3 份，实际 {ids:?}");
+
+        let urls = proxy_urls_by_id(&svc, &ids);
+        // ⭐ 这一条是整个缺陷 A：修复前它恒为 None。
+        assert!(
+            urls[0].is_some(),
+            "主份必须也从节点池拿到出口（它是全新条目、本来没代理），实际 {urls:?}"
+        );
+        // 三份三节点 → 每份都有，且**互不相同**（不复用）。
+        assert!(
+            urls.iter().all(|u| u.is_some()),
+            "3 个启用节点 / 3 份应全部分到，实际 {urls:?}"
+        );
+        let mut distinct: Vec<&str> = urls.iter().map(|u| u.as_deref().unwrap()).collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "各份出口必须互不相同（复用等于没分散），实际 {urls:?}"
+        );
+
+        // 文案要如实：3 份全额分配 → 不得出现"直连"字样。
+        assert!(
+            resp.message.contains("已从节点池为 3 份分配独立出口 IP"),
+            "文案应如实报 3 份，实际: {}",
+            resp.message
+        );
+        assert!(
+            !resp.message.contains("直连"),
+            "全额分配时不得声称有份直连，实际: {}",
+            resp.message
+        );
+    }
+
+    /// 🔴 承重（缺陷 A 的另一半 / 零回归）：主份**已有代理**时绝不覆盖。
+    ///
+    /// 这是原注释真正要保护的东西（"覆盖会把一个在跑的号的出口换掉"），
+    /// 修复后必须仍然成立。走 `add_credential_with_intent` 而不是 `clone_credential`：
+    /// 后者刻意把 proxy_* 留空，构造不出"调用方已显式指定代理"这个场景。
+    ///
+    /// 回退即 FAILED：把 `pool_may_assign` 恒设为 true（即不再看这一份有没有代理）
+    /// —— 第一条断言变红（主份的出口被池节点顶掉）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn explicit_proxy_must_never_be_overwritten_by_the_pool() {
+        let svc = mk_clone_service();
+        seed_nodes(&svc, 3).await;
+
+        let resp = svc
+            .add_credential_with_intent(
+                AddCredentialRequest {
+                    auth_method: "api_key".into(),
+                    kiro_api_key: Some("ksk_clone_enabled_test".into()),
+                    copies: Some(2),
+                    // 调用方的明确意图：这一批就要走这个出口。
+                    proxy_url: Some("socks5://127.0.0.1:9".into()),
+                    disabled: true,
+                    ..Default::default()
+                },
+                false,
+            )
+            .await
+            .expect("多开应成功");
+        let ids = resp.credential_ids.expect("多开必须下发全部 id");
+        let urls = proxy_urls_by_id(&svc, &ids);
+        assert!(
+            urls.iter()
+                .all(|u| u.as_deref() == Some("socks5://127.0.0.1:9")),
+            "显式给了 proxy_url 时池分配必须完全不介入（每份都保持调用方给的那个），实际 {urls:?}"
+        );
+        assert!(
+            resp.message.contains("未从节点池分配代理"),
+            "文案应说明本次没走池分配，实际: {}",
+            resp.message
+        );
+    }
+
+    /// ⭐ 承重（缺陷 B）：`nodeIds` 给了就**按顺序**分给各份，池里其余节点一律不用。
+    ///
+    /// 回退即 FAILED：让 `resolve_node_plan` 忽略 `node_ids`（恒走"池里全部启用节点"
+    /// 那一支）—— 各份会拿到 #1/#2/#3 也就是端口 1/2/3，而本条要求的是端口 3/1
+    /// （用户挑的那两个，且顺序是他给的顺序）→ 断言变红。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn explicit_node_ids_are_assigned_in_the_given_order() {
+        let svc = mk_clone_service();
+        let nodes = seed_nodes(&svc, 3).await;
+
+        let resp = svc
+            // 刻意**倒序**且只挑两个：既验证"按给定顺序"，也验证"没挑的节点不会被顶上来"。
+            .clone_credential(1, 2, None, Some(vec![nodes[2], nodes[0]]), None, None, None)
+            .await
+            .expect("加分身应成功");
+        let ids = resp.credential_ids.expect("多开必须下发全部 id");
+        let urls = proxy_urls_by_id(&svc, &ids);
+        assert_eq!(
+            urls,
+            vec![Some(node_url(2)), Some(node_url(0))],
+            "必须严格按 nodeIds 的顺序分（第 1 个给主份），实际 {urls:?}"
+        );
+        // 没被挑中的第 2 个节点绝不能出现。
+        assert!(
+            !urls
+                .iter()
+                .any(|u| u.as_deref() == Some(node_url(1).as_str())),
+            "未被指定的节点不得被用上，实际 {urls:?}"
+        );
+        assert!(
+            resp.message.contains("已从节点池为 2 份分配独立出口 IP"),
+            "文案应如实报 2 份，实际: {}",
+            resp.message
+        );
+    }
+
+    /// ⭐ 承重（缺陷 B + C）：不存在 / 已禁用的 node id **跳过并点名**，绝不静默替换。
+    ///
+    /// 这是需求 C 的核心：「我选了节点却仍然直连」是最容易踩空的一步，
+    /// 而**静默换一个节点**更糟 —— 用户以为出口是他挑的那个。
+    ///
+    /// 回退即 FAILED：
+    /// - 让 `resolve_node_plan` 把无效 id 静默替换成池里下一个可用节点 →
+    ///   第 2 份会拿到端口 2 而不是直连 → 第二条断言变红；
+    /// - 或者把 `rejected` 从文案里删掉 → 后两条断言变红。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invalid_node_ids_are_skipped_and_named_in_the_message() {
+        let svc = mk_clone_service();
+        let nodes = seed_nodes(&svc, 2).await;
+        // 把第 2 个关掉：显式指定也不该用它（否则「禁用」这个开关在这条路上形同不存在）。
+        svc.upsert_socks_node(SocksNodeUpsertRequest {
+            id: Some(nodes[1]),
+            name: None,
+            url: node_url(1),
+            username: None,
+            password: None,
+            enabled: Some(false),
+        })
+        .await
+        .expect("禁用节点应成功");
+
+        let missing = 9999u64;
+        let resp = svc
+            .clone_credential(
+                1,
+                2,
+                None,
+                Some(vec![nodes[0], nodes[1], missing]),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("加分身应成功（无效 id 不该让整个请求失败）");
+        let ids = resp.credential_ids.expect("多开必须下发全部 id");
+        let urls = proxy_urls_by_id(&svc, &ids);
+
+        assert_eq!(
+            urls[0].as_deref(),
+            Some(node_url(0).as_str()),
+            "有效的那个必须生效，实际 {urls:?}"
+        );
+        // ⭐ 承重：第 2 份**直连**，而不是被悄悄塞上别的节点。
+        assert!(
+            urls[1].is_none(),
+            "无效 id 必须跳过、该份直连；静默替换会让用户以为出口是他选的那个。实际 {urls:?}"
+        );
+
+        // ⭐ 需求 C：两个无效 id 都要在文案里点名，且写清各自原因。
+        let msg = &resp.message;
+        assert!(
+            msg.contains(&format!("#{}（已禁用）", nodes[1])),
+            "被禁用的节点必须点名且注明原因，实际: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("#{missing}（不存在）")),
+            "不存在的节点必须点名且注明原因，实际: {msg}"
+        );
+        assert!(
+            msg.contains("已从节点池为 1 份分配独立出口 IP")
+                && msg.contains("另有 1 份因启用节点不足而直连"),
+            "文案必须同时报「分了几份」与「几份直连」，实际: {msg}"
+        );
+    }
+
+    /// 重复的 node id 记作 `重复` 并只用一次（两份共用一个出口就是"复用"，
+    /// 而复用等于没分散 —— 调用方显式写两遍也不例外，只是这次要说出来）。
+    ///
+    /// 回退即 FAILED：去掉 `resolve_node_plan` 里的查重 —— 两份都拿到端口 1，
+    /// 第二条断言变红。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn duplicate_node_ids_are_used_once_and_reported() {
+        let svc = mk_clone_service();
+        let nodes = seed_nodes(&svc, 2).await;
+
+        let resp = svc
+            .clone_credential(1, 2, None, Some(vec![nodes[0], nodes[0]]), None, None, None)
+            .await
+            .expect("加分身应成功");
+        let ids = resp.credential_ids.expect("多开必须下发全部 id");
+        let urls = proxy_urls_by_id(&svc, &ids);
+        assert_eq!(
+            urls[0].as_deref(),
+            Some(node_url(0).as_str()),
+            "第一次出现的应生效，实际 {urls:?}"
+        );
+        assert!(
+            urls[1].is_none(),
+            "同一个节点不得被两份共用（那等于没分散），实际 {urls:?}"
+        );
+        assert!(
+            resp.message.contains(&format!("#{}（重复）", nodes[0])),
+            "重复的 id 必须点名，实际: {}",
+            resp.message
+        );
+    }
+
+    /// 启用节点少于份数时：够的份分到，其余**直连**（刻意不轮询复用），文案如实。
+    ///
+    /// 回退即 FAILED：把取用改成取模复用（`% assignable.len()`）—— 第二条
+    /// "互不相同"的断言变红。这条同时是那道源码守卫
+    /// `clone_creation_must_consume_the_node_pool_without_reuse` 的行为侧对照。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fewer_nodes_than_copies_leaves_the_rest_direct_without_reuse() {
+        let svc = mk_clone_service();
+        seed_nodes(&svc, 2).await;
+
+        let resp = svc
+            .clone_credential(1, 4, None, None, None, None, None)
+            .await
+            .expect("加分身应成功");
+        let ids = resp.credential_ids.expect("多开必须下发全部 id");
+        assert_eq!(ids.len(), 4, "copies=4 应建出 4 份，实际 {ids:?}");
+        let urls = proxy_urls_by_id(&svc, &ids);
+
+        let with_proxy: Vec<&str> = urls.iter().filter_map(|u| u.as_deref()).collect();
+        assert_eq!(
+            with_proxy.len(),
+            2,
+            "只有 2 个节点 → 只能有 2 份带出口，实际 {urls:?}"
+        );
+        let mut d = with_proxy.clone();
+        d.sort_unstable();
+        d.dedup();
+        assert_eq!(
+            d.len(),
+            2,
+            "带出口的两份必须用不同节点（不复用），实际 {urls:?}"
+        );
+        // 前两份拿到、后两份直连（顺序是承重的：份序与节点序一一对应）。
+        assert!(
+            urls[0].is_some() && urls[1].is_some() && urls[2].is_none() && urls[3].is_none(),
+            "应按份序分配、不够的份直连，实际 {urls:?}"
+        );
+        assert!(
+            resp.message.contains("已从节点池为 2 份分配独立出口 IP")
+                && resp.message.contains("另有 2 份因启用节点不足而直连"),
+            "文案必须如实报 2 分配 / 2 直连，实际: {}",
+            resp.message
+        );
+    }
+
+    // ============ 主份开关 / 自动分配排序 / 节点不足（4.1 · 4.3 · 4.4）============
+    //
+    // 全部穿 `add_credential_with_intent` 或 `clone_credential` 这两条**真实入口**，
+    // 断言的是「入池后每一份的 proxyUrl 到底是什么」。
+    // 刻意不直接测 `resolve_node_plan`：它是私有纯函数，而真实链路上排在它之前的
+    // `pool_may_assign` / `primary_pinned_node` / `is_multi_open` 三道门都能把它的结果
+    // 全部作废 —— 只测纯函数就是「测了分支内部，没测分支之间」那一类无效修复。
+
+    /// 走普通上号入口（`POST /credentials` 等价路径）建 N 份。
+    async fn add_copies(
+        svc: &AdminService,
+        copies: u32,
+        mutate: impl FnOnce(&mut AddCredentialRequest),
+    ) -> Result<AddCredentialResponse, AdminServiceError> {
+        let mut req = AddCredentialRequest {
+            auth_method: "api_key".into(),
+            kiro_api_key: Some("ksk_clone_enabled_test".into()),
+            copies: Some(copies),
+            disabled: true,
+            ..Default::default()
+        };
+        mutate(&mut req);
+        svc.add_credential_with_intent(req, false).await
+    }
+
+    /// 🔴 承重（4.1，开关**关**=缺省）：`POST /credentials` + `copies=3` 时
+    /// **主份不从池取节点**，三个节点里只有 2 个被第 2/3 份消费。
+    ///
+    /// 回退即 FAILED：把 `assign_primary` 改回恒 true（即删掉
+    /// `req.assign_primary_node.unwrap_or(copies == 1)` 这道门）—— 主份会拿到节点，
+    /// 第一条断言变红。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn primary_does_not_take_a_pool_node_by_default_on_the_add_path() {
+        let svc = mk_clone_service();
+        seed_nodes(&svc, 3).await;
+
+        let resp = add_copies(&svc, 3, |_| {}).await.expect("多开应成功");
+        let ids = resp.credential_ids.expect("多开必须下发全部 id");
+        let urls = proxy_urls_by_id(&svc, &ids);
+
+        assert!(
+            urls[0].is_none(),
+            "开关缺省（关）时主份必须保持自身出口（这里是无代理），实际 {urls:?}"
+        );
+        assert!(
+            urls[1].is_some() && urls[2].is_some(),
+            "第 2/3 份必须各拿到一个节点，实际 {urls:?}"
+        );
+        assert_ne!(urls[1], urls[2], "两份不得共用一个出口，实际 {urls:?}");
+        // ⭐ 文案不得把「按设置刻意直连的主份」算进"因启用节点不足而直连"。
+        assert!(
+            resp.message.contains("已从节点池为 2 份分配独立出口 IP"),
+            "应如实报 2 份，实际: {}",
+            resp.message
+        );
+        assert!(
+            !resp.message.contains("因启用节点不足而直连"),
+            "主份是按设置直连，不是节点不够——这句是假归因。实际: {}",
+            resp.message
+        );
+        assert!(
+            resp.message.contains("主份按「主份也从池取节点=关」"),
+            "必须说明主份为何没有出口，实际: {}",
+            resp.message
+        );
+    }
+
+    /// 🔴 承重（4.1，开关**开**）：显式 `assignPrimaryNode=true` 时主份也拿节点，
+    /// 三份三节点全额分配。
+    ///
+    /// 回退即 FAILED：让 `assign_primary` 恒 false —— 主份不再拿节点，第一条断言变红。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn primary_takes_a_pool_node_when_the_switch_is_on() {
+        let svc = mk_clone_service();
+        seed_nodes(&svc, 3).await;
+
+        let resp = add_copies(&svc, 3, |r| r.assign_primary_node = Some(true))
+            .await
+            .expect("多开应成功");
+        let ids = resp.credential_ids.expect("多开必须下发全部 id");
+        let urls = proxy_urls_by_id(&svc, &ids);
+
+        assert!(urls[0].is_some(), "开关开时主份必须拿到节点，实际 {urls:?}");
+        let mut d: Vec<&str> = urls.iter().map(|u| u.as_deref().unwrap()).collect();
+        d.sort_unstable();
+        d.dedup();
+        assert_eq!(d.len(), 3, "三份必须各自不同出口，实际 {urls:?}");
+        assert!(
+            resp.message.contains("已从节点池为 3 份分配独立出口 IP")
+                && !resp.message.contains("主份按"),
+            "开关开时不该出现「主份不参与」那句，实际: {}",
+            resp.message
+        );
+    }
+
+    /// 反序列化兼容（4.1 的硬要求）：两个请求体缺字段时都必须能解析成 `None`，
+    /// 且 `None` 在各自入口上被解读成**各自的既有行为**。
+    ///
+    /// 回退即 FAILED：把字段写成非 `Option`（或去掉 `#[serde(default)]`）——
+    /// 前两条 `expect` 直接 panic（老前端只发 `{"copies":3}` / 一堆身份字段）。
+    #[test]
+    fn new_node_switches_are_optional_and_default_to_existing_behavior() {
+        use super::super::types::CloneCredentialRequest;
+
+        // ① clone 入口：老前端的请求体必须照旧能解析。
+        let old_clone: CloneCredentialRequest =
+            serde_json::from_str(r#"{"copies":3}"#).expect("老 clone 请求体必须能解析");
+        assert_eq!(old_clone.assign_primary_node, None);
+        assert_eq!(old_clone.require_node_per_copy, None);
+
+        // ② add 入口：老前端的请求体必须照旧能解析。
+        let old_add: AddCredentialRequest =
+            serde_json::from_str(r#"{"authMethod":"api_key","kiroApiKey":"ksk_x","copies":2}"#)
+                .expect("老 add 请求体必须能解析");
+        assert_eq!(old_add.assign_primary_node, None);
+        assert_eq!(old_add.require_node_per_copy, None);
+        assert_eq!(old_add.primary_node_id, None);
+
+        // ③ camelCase 线上格式必须解得出（写成 snake_case 就永远收不到前端的值）。
+        let given: AddCredentialRequest = serde_json::from_str(
+            r#"{"authMethod":"api_key","assignPrimaryNode":true,"requireNodePerCopy":true,"primaryNodeId":7}"#,
+        )
+        .expect("camelCase 必须能解析");
+        assert_eq!(given.assign_primary_node, Some(true));
+        assert_eq!(given.require_node_per_copy, Some(true));
+        assert_eq!(given.primary_node_id, Some(7));
+
+        // ④ clone 入口的 `None` 必须被解读成 true —— 这是"升级后行为不变"的那一半：
+        //    裸 `#[serde(default)]` 的 false 会让老前端静默退回 2026-08-05 修掉的缺陷
+        //    （主份裸连、池里空着一个节点）。这里锁的是 service 层那句 `unwrap_or(true)`。
+        let src = include_str!("service.rs");
+        let needle = format!(
+            "{}{}",
+            "assign_primary_node: Some(assign_primary_node.", "unwrap_or(true))"
+        );
+        assert!(
+            src.contains(needle.as_str()),
+            "clone_credential 必须把缺省解读成 true，否则老前端退回主份裸连的旧缺陷"
+        );
+    }
+
+    /// 🔴 承重（4.3）：自动分配按「已绑凭据数」升序、同数按延迟升序。
+    ///
+    /// 构造（3 个启用节点 + 1 个测活失败的）：
+    /// | 节点 | 已绑 | 延迟 | 期望顺序 |
+    /// |---|---|---|---|
+    /// | n0 | 0 | 300ms | 第 2 |
+    /// | n1 | **1**（父号绑着它）| 100ms | 第 3（已绑数是主键，延迟最低也排最后）|
+    /// | n2 | 0 | 200ms | **第 1** |
+    /// | n3 | 0 | 50ms + `ok=false` | 不参与（已知不通）|
+    ///
+    /// 一条断言同时钉住三件事：已绑数是主键（n1 最后）、延迟是次键（n2 在 n0 前）、
+    /// 测活失败被排除（n3 不出现，尽管它延迟最低）。
+    ///
+    /// 回退即 FAILED：把排序键改回插入顺序（`sort_by_key` 那行删掉）→ 顺序变 n0/n1/n2；
+    /// 或去掉 `last_test` 的 ok 过滤 → n3 会以 50ms 排到第一。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auto_assignment_orders_by_bound_count_then_latency() {
+        let svc = mk_clone_service();
+        let nodes = seed_nodes(&svc, 4).await;
+
+        // 父号 #1 绑上 n1 → n1 的「已绑数」= 1（启发式按 proxy_url 字符串比对）。
+        svc.token_manager
+            .set_credential_proxy(1, Some(node_url(1)), None, None)
+            .expect("给父号绑节点应成功");
+
+        let mk_test = |ok: bool, latency: u64| crate::kiro::model::socks_node::SocksNodeTest {
+            ok,
+            latency_ms: latency,
+            exit_ip: None,
+            error: None,
+            tested_at: 1,
+        };
+        svc.record_socks_node_test(nodes[0], mk_test(true, 300))
+            .unwrap();
+        svc.record_socks_node_test(nodes[1], mk_test(true, 100))
+            .unwrap();
+        svc.record_socks_node_test(nodes[2], mk_test(true, 200))
+            .unwrap();
+        // 已知不通：延迟最低但必须被排除。
+        svc.record_socks_node_test(nodes[3], mk_test(false, 50))
+            .unwrap();
+
+        // clone 路径（主份也参与，缺省 true）建 3 份 → 按序应拿 n2 / n0 / n1。
+        let resp = svc
+            .clone_credential(1, 3, None, None, None, None, None)
+            .await
+            .expect("加分身应成功");
+        let ids = resp.credential_ids.expect("多开必须下发全部 id");
+        let urls = proxy_urls_by_id(&svc, &ids);
+
+        assert_eq!(
+            urls,
+            vec![Some(node_url(2)), Some(node_url(0)), Some(node_url(1))],
+            "顺序必须是 (已绑数↑, 延迟↑)：n2(0/200) → n0(0/300) → n1(1/100)。实际 {urls:?}"
+        );
+        assert!(
+            !urls
+                .iter()
+                .any(|u| u.as_deref() == Some(node_url(3).as_str())),
+            "最近测活失败的节点不得参与自动分配（它延迟最低，靠这条才能区分排序与过滤），实际 {urls:?}"
+        );
+    }
+
+    /// 4.3 的另一半：`boundCredentials` 必须真的下发给前端。
+    ///
+    /// 前端的节点下拉与「自动分配」按钮按它排序，与后端 `resolve_node_plan` 同一口径。
+    /// 回退即 FAILED：`list_socks_nodes` 改回 `map(SocksNodeView::from_node)`（恒 0）——
+    /// 第二条断言变红，前端排序退化成插入顺序而后端仍按已绑数，两边推荐不一致。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_list_reports_bound_credential_count() {
+        let svc = mk_clone_service();
+        let nodes = seed_nodes(&svc, 2).await;
+        svc.token_manager
+            .set_credential_proxy(1, Some(node_url(1)), None, None)
+            .expect("绑节点应成功");
+
+        let listed = svc.list_socks_nodes();
+        let by_id = |id: u64| {
+            listed
+                .iter()
+                .find(|v| v.id == id)
+                .unwrap_or_else(|| panic!("节点 #{id} 应在列表里"))
+                .bound_credentials
+        };
+        assert_eq!(by_id(nodes[0]), 0, "没号绑它 → 0");
+        assert_eq!(by_id(nodes[1]), 1, "父号绑着它 → 1");
+    }
+
+    /// 🔴 承重（4.4）：严格模式下节点不足 → **报错且一份也不建**，绝不复用。
+    ///
+    /// 回退即 FAILED：删掉那段 `require_node_per_copy == Some(true)` 的检查 ——
+    /// 请求会成功建出 4 份（2 份带出口、2 份直连），前两条断言变红。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strict_mode_errors_instead_of_creating_copies_without_nodes() {
+        let svc = mk_clone_service();
+        seed_nodes(&svc, 2).await;
+        let before = svc.token_manager.total_count();
+
+        let err = add_copies(&svc, 4, |r| {
+            r.assign_primary_node = Some(true);
+            r.require_node_per_copy = Some(true);
+        })
+        .await
+        .expect_err("节点不足时必须报错，而不是建出一堆共用出口的份");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("节点不足") && msg.contains("需要 4 个") && msg.contains("只有 2 个"),
+            "报错必须说清需要几个/实际几个，实际: {msg}"
+        );
+        assert_eq!(
+            svc.token_manager.total_count(),
+            before,
+            "严格模式失败时**一份都不该建出来**（否则是「建了一半再报错」）"
+        );
+    }
+
+    /// 4.4 的宽松侧（零回归）：不开严格模式时行为逐字不变 —— 节点不够就直连，不报错。
+    ///
+    /// 这条是上一条的对照组：没有它，「严格模式」可能被写成"恒严格"而测不出来。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lenient_mode_still_falls_back_to_direct_without_error() {
+        let svc = mk_clone_service();
+        seed_nodes(&svc, 2).await;
+
+        let resp = add_copies(&svc, 4, |r| r.assign_primary_node = Some(true))
+            .await
+            .expect("缺省（宽松）时节点不够也必须成功");
+        let ids = resp.credential_ids.expect("多开必须下发全部 id");
+        assert_eq!(ids.len(), 4, "宽松模式应照旧建出 4 份，实际 {ids:?}");
+        let urls = proxy_urls_by_id(&svc, &ids);
+        assert_eq!(
+            urls.iter().filter(|u| u.is_some()).count(),
+            2,
+            "只有 2 个节点 → 只能有 2 份带出口（其余直连，不复用），实际 {urls:?}"
+        );
+    }
+
+    /// 🔴 承重（4.4 的位置）：严格模式的检查必须排在 `reserve_clone_seqs` **之前**。
+    ///
+    /// 源码级顺序断言（同款范式见 `clone_seq_must_be_reserved_before_any_await`）：
+    /// 放在号段预留之后时，每次"节点不够"的失败都会白烧掉一段组内序号 →
+    /// 分身管理页上留下永久空洞（#1 #2 #3 #7 #8），而重试一次就再烧一段。
+    /// 这一条测的是**分支之间的顺序**，行为测试测不出来（两种顺序都返回同一个错误）。
+    #[test]
+    fn strict_node_check_must_run_before_reserving_clone_seqs() {
+        let src = include_str!("service.rs");
+        // needle 运行时拼接：写成字面量会被 include_str! 读到本测试自身，
+        // 于是两个 find 都命中这里、顺序恒成立 —— 断言静默作废。
+        let check = format!(
+            "{}{}",
+            "req.require_node_per_copy == ", "Some(true) && pool_may_assign"
+        );
+        let reserve = format!(
+            "{}{}",
+            "self.token_manager.reserve_clone", "_seqs(g, copies)"
+        );
+        let check_at = src.find(check.as_str()).expect("严格模式检查应存在");
+        let reserve_at = src.find(reserve.as_str()).expect("号段预留应存在");
+        assert!(
+            check_at < reserve_at,
+            "节点不足检查（位置 {check_at}）必须早于号段预留（位置 {reserve_at}）：\
+             放在之后会让每次失败都白烧一段组内序号，分身页上留永久空洞"
+        );
+    }
+
+    /// 🔴 承重（4.2 的后端侧）：`primaryNodeId` 点名的节点写进主份，
+    /// 且该节点**不会**再被第 2..N 份分到。
+    ///
+    /// 为什么不复用 `nodeIds[0]`：`nodeIds` 的语义是"本次只用这些"，于是
+    /// `copies=3 + nodeIds=[X]` 会让第 2/3 份一个节点都拿不到。本字段只钉主份，
+    /// 其余份仍从池里自动补。
+    ///
+    /// 回退即 FAILED：把 `primary_node_id` 的处理删掉 → 主份变直连（第一条断言红）；
+    /// 或不把它从计划里排除（`exclude_id` 那两个 filter）→ 有一份会与主份共用出口
+    /// （第三条断言红）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn primary_node_id_pins_the_primary_and_is_excluded_from_the_rest() {
+        let svc = mk_clone_service();
+        let nodes = seed_nodes(&svc, 3).await;
+
+        let resp = add_copies(&svc, 3, |r| r.primary_node_id = Some(nodes[1]))
+            .await
+            .expect("多开应成功");
+        let ids = resp.credential_ids.expect("多开必须下发全部 id");
+        let urls = proxy_urls_by_id(&svc, &ids);
+
+        assert_eq!(
+            urls[0].as_deref(),
+            Some(node_url(1).as_str()),
+            "主份必须走点名的那个节点，实际 {urls:?}"
+        );
+        assert!(
+            urls[1].is_some() && urls[2].is_some(),
+            "第 2/3 份仍应从池里自动补（点名主份不该把池锁死），实际 {urls:?}"
+        );
+        let mut d: Vec<&str> = urls.iter().map(|u| u.as_deref().unwrap()).collect();
+        d.sort_unstable();
+        d.dedup();
+        assert_eq!(
+            d.len(),
+            3,
+            "点名的节点不得被第 2..N 份再分一次，实际 {urls:?}"
+        );
+    }
+
+    /// `primaryNodeId` 指向不存在 / 已禁用的节点 → **400 且不建任何份**。
+    ///
+    /// 静默直连或静默换一个节点都会让用户以为出口是他刚点的那个（与 `nodeIds`
+    /// 那条"不静默替换"同一原则，只是这里是他唯一的选择，故直接拒绝而不是跳过）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_primary_node_id_is_rejected_without_creating_anything() {
+        let svc = mk_clone_service();
+        seed_nodes(&svc, 1).await;
+        let before = svc.token_manager.total_count();
+
+        let err = add_copies(&svc, 2, |r| r.primary_node_id = Some(9999))
+            .await
+            .expect_err("不存在的节点 id 必须报错");
+        assert!(
+            err.to_string().contains("#9999 不存在"),
+            "必须点名那个 id 与原因，实际: {err}"
+        );
+        assert_eq!(
+            svc.token_manager.total_count(),
+            before,
+            "报错时不得建出任何份"
+        );
+    }
+
+    /// `nodeIds` 的 JSON 契约：省略 → `None`（走自动分配），给了则原样解出。
+    ///
+    /// 回退即 FAILED：把字段写成非 `Option` 或去掉 `#[serde(default)]` ——
+    /// 第一条断言（老前端只发 `{"copies":3}`）直接解析失败。
+    #[test]
+    fn clone_request_parses_node_ids_as_optional_camel_case() {
+        use super::super::types::CloneCredentialRequest;
+
+        let omitted: CloneCredentialRequest =
+            serde_json::from_str(r#"{"copies":3}"#).expect("省略 nodeIds 应能解析");
+        assert_eq!(omitted.node_ids, None, "省略时必须是 None（走自动分配）");
+
+        let given: CloneCredentialRequest =
+            serde_json::from_str(r#"{"copies":4,"enabled":false,"nodeIds":[1,5,6,9]}"#)
+                .expect("解析 nodeIds");
+        assert_eq!(given.node_ids, Some(vec![1, 5, 6, 9]));
+        assert_eq!(given.copies, Some(4));
+        assert_eq!(given.enabled, Some(false));
+
+        // 空数组与省略同义（前端可能两种都发）——语义在 service 层收口，
+        // 这里只锁「能解析成空 Vec 而不是报错」。
+        let empty: CloneCredentialRequest =
+            serde_json::from_str(r#"{"copies":2,"nodeIds":[]}"#).expect("解析空 nodeIds");
+        assert_eq!(empty.node_ids, Some(vec![]));
+    }
+
+    /// ⭐ 节点 id **永不复用**，包括「删掉最大 id 后再新建」。
+    ///
+    /// 回退即 FAIL：把 id 分配改回 `nodes.iter().map(|n| n.id).max().unwrap_or(0) + 1`
+    /// —— 删掉 #2 后新建又得到 #2，而面板另一个标签页仍持有删除前的列表，
+    /// 点它的「测活」会打到这个无关的新节点上。
+    #[tokio::test]
+    async fn node_ids_are_never_reused_after_deleting_the_highest() {
+        let svc = mk_service_with_one_credential();
+        let mk = |n: u16| SocksNodeUpsertRequest {
+            id: None,
+            name: Some(format!("n{n}")),
+            url: format!("socks5://node{n}.invalid:40002"),
+            username: None,
+            password: None,
+            enabled: None,
+        };
+        let a = svc.upsert_socks_node(mk(1)).await.unwrap();
+        let b = svc.upsert_socks_node(mk(2)).await.unwrap();
+        assert!(b > a);
+
+        assert!(svc.delete_socks_node(b).await_ok());
+        let c = svc.upsert_socks_node(mk(3)).await.unwrap();
+        assert!(
+            c > b,
+            "删掉最大 id 后新建必须拿到更大的 id（实得 {c}，已发放过 {b}）"
+        );
+    }
+
+    // ============ 同 key「无独立出口」告警 + 组标识回填 ============
+    //
+    // 线上实测的形态（本组测试的依据）：`#776` keyHash=029fdd8929、**无 cloneGroup、
+    // 无代理**；`#778–787` 同 key 同组、各有独立 SOCKS ⇒ 11 份共用一个上游账号，
+    // 其中 1 份走服务器裸 IP。`mk_clone_service` 的父号 `#1` 与 `#776` 完全同构
+    // （api_key、无 proxy_url、无 clone_group），所以这组测试就是那个场景本身。
+
+    /// 父号在池中的原始快照（用来断言「除了组标识，一个字段都没被动」）。
+    fn parent_snapshot(svc: &AdminService) -> crate::kiro::model::credentials::KiroCredentials {
+        svc.token_manager
+            .export_credential(1)
+            .expect("父号 #1 必须存在")
+    }
+
+    /// 🔴 承重（任务一）：同 key 有份**没有独立出口**时必须告警，
+    /// 且**绝不**因此改动它的 `proxy_url`。
+    ///
+    /// 两条断言各自钉一件事，缺任何一条都会漏掉一类回归：
+    /// - 告警出现 → 防「静默」（用户在面板上看到 N 份都有 socks，唯独那一份看不出来）
+    /// - 父号 `proxy_url` 仍为 `None` → 防「好心自动分配」（用户已明确拍板不要，
+    ///   `proxy_url` 是显式配置，直连也可能是刻意留的对照）
+    ///
+    /// 回退即 FAILED：删掉 `bare_exit_note` 那段 → 第一条变红；
+    /// 把它改成「顺手给无出口的号 `set_credential_proxy`」→ 第二条变红。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cloning_warns_about_same_key_members_without_their_own_exit() {
+        let svc = mk_clone_service();
+        seed_nodes(&svc, 2).await;
+        // 前提：父号确实没有出口（与线上 #776 同构）。
+        assert!(
+            parent_snapshot(&svc).proxy_url.is_none(),
+            "构造前提：父号必须无代理"
+        );
+
+        let resp = svc
+            .clone_credential(1, 2, None, None, None, None, None)
+            .await
+            .expect("加分身应成功");
+
+        assert!(
+            resp.message.contains("没有独立出口") && resp.message.contains("#1"),
+            "同 key 的 #1 无出口必须被点名告警，实际: {}",
+            resp.message
+        );
+        // ⭐ 承重：告警不得升级成"自动改配置"。
+        assert!(
+            parent_snapshot(&svc).proxy_url.is_none(),
+            "父号的 proxy_url 是显式配置，克隆路径只许告警、绝不许写它，实际 {:?}",
+            parent_snapshot(&svc).proxy_url
+        );
+        // 新建的两份该拿到节点 —— 否则"父号无出口"这句可能只是因为整池都没分到。
+        let ids = resp.credential_ids.expect("多开必须下发全部 id");
+        let urls = proxy_urls_by_id(&svc, &ids);
+        assert!(
+            urls.iter().all(|u| u.is_some()),
+            "两个节点两份，应各自拿到出口，实际 {urls:?}"
+        );
+    }
+
+    /// 🔴 承重（任务一的判据）：查找必须按 **key**，不能按 `cloneGroup`。
+    ///
+    /// 这是缺陷能长期存活的原因：同账号里最先入池的那一份**天然没有组标识**
+    /// （组是后来加分身才产生的），按组去找就恰好漏掉它 —— 而它正是那个裸 IP。
+    ///
+    /// 构造让两种判据结果不同：父号 `#1` 无 `cloneGroup`，新建的份拿到一个新组。
+    /// 按 key 查 → 找到 `#1` → 告警；按组查 → `#1` 不在任何组里 → 静默。
+    ///
+    /// ⚠️ 这条能成立依赖**顺序**：名单必须在组标识回填**之前**取。回填之后父号也在组里了，
+    /// 两种判据就再也分不出来（那正是本仓「测了分支内部、没测分支顺序」的老毛病）。
+    ///
+    /// 回退即 FAILED：把 `same_key_peers` 改成按 `clone_group` 过滤，
+    /// 或把回填那段挪到取名单之前 —— 告警消失，本条变红。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_bare_exit_lookup_keys_on_the_api_key_not_the_clone_group() {
+        let svc = mk_clone_service();
+        seed_nodes(&svc, 1).await;
+        // 前提：父号一个组标识都没有（线上 #776 就是这样）。
+        assert!(
+            parent_snapshot(&svc).clone_group.is_none(),
+            "构造前提：父号必须无 cloneGroup"
+        );
+
+        let resp = svc
+            .clone_credential(1, 1, None, None, None, None, None)
+            .await
+            .expect("加 1 份应成功");
+
+        assert!(
+            resp.message.contains("没有独立出口") && resp.message.contains("#1"),
+            "父号无组标识时仍必须被发现（按组查会漏掉它，那就是本缺陷），实际: {}",
+            resp.message
+        );
+    }
+
+    /// 🔴 源码级守卫：**取名单**必须早于**回填组标识**。
+    ///
+    /// 为什么必须额外有这一条（这是本仓「测了分支内部、没测分支顺序」那一类的正解）：
+    /// 上面那条按-key 行为测试的判别力**依赖这个顺序**。实测过：只把判据改成按组 →
+    /// 那条测试红；但**同时**把回填提到取名单之前 → 它又变绿了（回填先把父号补进组里，
+    /// 按组查也能查到）。也就是说没有本条守卫时，两处一起改就能让缺陷重新隐形。
+    ///
+    /// 回退即 FAILED：把回填那段挪到 `same_key_peers` 之前 —— 位置比较翻转，本条变红。
+    #[test]
+    fn the_same_key_peer_snapshot_must_be_taken_before_the_group_backfill() {
+        let src = include_str!("service.rs");
+        // needle 运行时拼接：写成字面量会被 include_str! 读到本测试自身，
+        // 两个 find 都命中这里 → 顺序恒成立 → 断言静默作废（同 strict_node_check 那条）。
+        let snapshot = format!("{}{}", "let same_key_peers = ", "new_cred");
+        let backfill = format!(
+            "{}{}",
+            "for peer in same_key_peers.iter()", ".filter(|p| p.clone_group.is_none())"
+        );
+        let snapshot_at = src.find(snapshot.as_str()).expect("同 key 名单快照应存在");
+        let backfill_at = src.find(backfill.as_str()).expect("组标识回填应存在");
+        assert!(
+            snapshot_at < backfill_at,
+            "取名单（位置 {snapshot_at}）必须早于回填（位置 {backfill_at}）：\
+             反过来会让「按 key 查」与「按组查」再也无法区分，判据被改坏也测不出来"
+        );
+    }
+
+    /// 对照组：同 key 的成员**都有**独立出口时不得告警。
+    ///
+    /// 没有这一条，上面两条可以靠"永远告警"蒙过去 —— 而永远告警等于没有告警
+    /// （用户会学会忽略它），本仓已有多起同类文案失效。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_warning_when_every_same_key_member_already_has_an_exit() {
+        let svc = mk_clone_service();
+        let nodes = seed_nodes(&svc, 3).await;
+        // 父号自己先绑一个节点（面板上"给这一份配个出口"的等价操作）。
+        svc.token_manager
+            .set_credential_proxy(1, Some(node_url(0)), None, None)
+            .expect("给父号绑节点应成功");
+        assert_eq!(nodes.len(), 3);
+
+        let resp = svc
+            .clone_credential(1, 2, None, None, None, None, None)
+            .await
+            .expect("加分身应成功");
+
+        assert!(
+            !resp.message.contains("没有独立出口"),
+            "同 key 全员有出口时不得告警（狼来了会让告警失效），实际: {}",
+            resp.message
+        );
+        // 顺带钉住：父号已有的出口不得被本次克隆改掉。
+        assert_eq!(
+            parent_snapshot(&svc).proxy_url.as_deref(),
+            Some(node_url(0).as_str()),
+            "父号已配的出口不得被克隆路径覆盖"
+        );
+    }
+
+    /// 🔴 承重（任务二）：回填后父号的 `cloneGroup` 与新建的份一致，
+    /// 且**除它之外一个字段都没被动**。
+    ///
+    /// 为什么要回填：前端 `groupClones` 为「父号早于 cloneGroup 字段入池」维护了一整套
+    /// `apiKeyHash` 回落分组。回填让**新产生的**数据不再欠这笔债（老数据仍靠回落兜住，
+    /// 本轮刻意不删回落逻辑）。
+    ///
+    /// 为什么这与「不改父号 proxy_url」不矛盾：`cloneGroup` 是系统内部的分组标识，
+    /// 没有语义选择余地（父号确实属于那个组）；`proxy_url` 是用户的显式配置。
+    ///
+    /// 回退即 FAILED：删掉 service 里那段 `set_clone_identity` 回填循环 —— 第一条变红。
+    /// 把回填改成连 `clone_seq` 一起写（或顺手写别的字段）—— 第三条变红。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cloning_backfills_the_clone_group_onto_the_same_key_parent() {
+        let svc = mk_clone_service();
+        seed_nodes(&svc, 2).await;
+        let before = parent_snapshot(&svc);
+        assert!(before.clone_group.is_none(), "构造前提：父号无 cloneGroup");
+
+        let resp = svc
+            .clone_credential(1, 2, None, None, None, None, None)
+            .await
+            .expect("加分身应成功");
+        let ids = resp.credential_ids.expect("多开必须下发全部 id");
+
+        let after = parent_snapshot(&svc);
+        let group = after
+            .clone_group
+            .clone()
+            .expect("父号必须被回填 cloneGroup（否则前端只能靠 apiKeyHash 回落分组）");
+        // 与新建的每一份同组 —— 回填一个**不同**的 UUID 比不回填更糟（面板上裂成两组）。
+        for id in &ids {
+            let child = svc
+                .token_manager
+                .export_credential(*id)
+                .expect("分身应存在");
+            assert_eq!(
+                child.clone_group.as_deref(),
+                Some(group.as_str()),
+                "分身 #{id} 必须与回填后的父号同组"
+            );
+        }
+
+        // ⭐ 承重：回填**只**动 clone_group。逐字段比对（比挑几个字段断言更难被绕过）。
+        assert_eq!(
+            after.clone_seq, before.clone_seq,
+            "回填不得给父号凭空编号（编号必须走 reserve_clone_seqs，否则与组内既有号撞车）"
+        );
+        let mut expected = before.clone();
+        expected.clone_group = after.clone_group.clone();
+        assert_eq!(
+            serde_json::to_value(&expected).expect("序列化父号快照"),
+            serde_json::to_value(&after).expect("序列化父号现状"),
+            "回填只许改 cloneGroup，其它字段一个都不能动"
+        );
+    }
+}
+
+/// 测试用小助手：把 `Result<bool, _>` 当成断言用，避免每处都 unwrap。
+#[cfg(test)]
+trait AwaitOk {
+    fn await_ok(self) -> bool;
+}
+
+#[cfg(test)]
+impl AwaitOk for Result<bool, AdminServiceError> {
+    fn await_ok(self) -> bool {
+        self.expect("操作应成功")
+    }
+}
+
+#[cfg(test)]
+mod balance_baseline_tests {
+    //! G-2：新取到的余额真值与「花费基线」必须**成对更新**。
+    //!
+    //! 断言的全是 `get_cached_balances()` 的输出（前端真正消费的那个端点），
+    //! 不断言内部表长什么样。
+    use super::balance_cache_tests::mk_service_with_one_credential;
+    use super::*;
+
+    fn mk_balance(remaining: f64, used: f64) -> BalanceResponse {
+        BalanceResponse {
+            id: 1,
+            subscription_title: Some("Kiro Pro".to_string()),
+            current_usage: used,
+            usage_limit: 100.0,
+            remaining,
+            usage_percentage: used,
+            next_reset_at: None,
+            overage_enabled: false,
+            overage_cap: 0.0,
+            effective_limit: 100.0,
+            stale: false,
+            optimistic: false,
+        }
+    }
+
+    /// 面板上那个号当前显示的 remaining。
+    fn shown_remaining(svc: &AdminService, id: u64) -> f64 {
+        svc.get_cached_balances()
+            .balances
+            .get(&id)
+            .unwrap_or_else(|| panic!("凭据 #{id} 应有缓存余额"))
+            .balance
+            .remaining
+    }
+
+    /// ⭐ 回归（用户反馈「额度/积分刷新太慢/不对」）：取到新真值后**不得再扣一次**已花掉的量。
+    ///
+    /// # 旧代码为何 FAIL
+    ///
+    /// `get_balance` 只 `cache.insert` 而不动基线 ⇒ 新真值（已含那 20）配着旧基线（50）
+    /// ⇒ 面板再扣一次 delta=70-50=20 ⇒ 显示 60 而真值是 80。
+    /// 把 `commit_fresh_balance` 里的 `push_balance_snapshots_to_scheduler` 那行删掉
+    /// （= 回到旧行为），本测试最后一条断言必 FAILED（拿到 60）。
+    #[test]
+    fn fresh_truth_resets_the_spend_baseline_so_it_is_not_double_counted() {
+        let svc = mk_service_with_one_credential();
+        let key = svc.balance_cache_key(1);
+
+        // t0：拿到真值 remaining=100，此刻本地累计花费 50
+        svc.token_manager.add_credits(1, 50.0);
+        svc.commit_fresh_balance(key.clone(), mk_balance(100.0, 0.0));
+        assert_eq!(shown_remaining(&svc, 1), 100.0, "刚取到真值时不应有修正");
+
+        // 期间花掉 20 → 乐观修正把它扣掉（这是既有的、正确的行为）
+        svc.token_manager.add_credits(1, 20.0);
+        assert_eq!(
+            shown_remaining(&svc, 1),
+            80.0,
+            "两次真值之间应按本地花费乐观推进"
+        );
+
+        // 用户点「查看余额」，上游返回的真值 80 **已经包含**那 20。
+        svc.commit_fresh_balance(key, mk_balance(80.0, 20.0));
+        assert_eq!(
+            shown_remaining(&svc, 1),
+            80.0,
+            "新真值已含那 20，绝不能再扣一次（旧代码在这里给出 60）"
+        );
+    }
+
+    /// 只有**本次取到真值**的账号才重置基线；其余账号保留原基线。
+    ///
+    /// # 旧代码为何 FAIL
+    ///
+    /// 原 `push_balance_snapshots_to_scheduler` 无条件把所有账号的基线推到"现在"。
+    /// 于是刷新失败（缓存仍是旧真值）的号，其"缓存之后已花掉的量"被一次性抹掉 ⇒
+    /// 面板与调度器都把它当成比实际更有余额的号。
+    /// 把 `fresh_keys` 判断改回无条件 `used_now`，第二条断言必 FAILED（拿到 100）。
+    #[test]
+    fn non_fresh_accounts_keep_their_baseline() {
+        let svc = mk_service_with_one_credential();
+        let key = svc.balance_cache_key(1);
+
+        svc.token_manager.add_credits(1, 50.0);
+        svc.commit_fresh_balance(key, mk_balance(100.0, 0.0));
+        svc.token_manager.add_credits(1, 30.0);
+        assert_eq!(shown_remaining(&svc, 1), 70.0);
+
+        // 模拟「本轮该号刷新失败」的收尾回推：fresh_keys 为空。
+        svc.push_balance_snapshots_to_scheduler(&HashSet::new());
+        assert_eq!(
+            shown_remaining(&svc, 1),
+            70.0,
+            "没取到新真值的号必须保留原基线，否则已花掉的 30 被抹掉、显示回 100"
+        );
+    }
+
+    /// 源码守卫：`get_balance` 不得再内联 `cache.insert`（那会绕过基线重置）。
+    ///
+    /// 这条锁的是**接线**而非逻辑：上面两条测的是 `commit_fresh_balance` 的行为，
+    /// 但真正的用户路径是 `get_balance`；若哪天有人在那里又写回一个裸 insert，
+    /// 行为测试全绿而缺陷回归。单测无法真跑 `get_balance`（要打 app.kiro.dev），故用源码断言。
+    #[test]
+    fn get_balance_writes_through_the_single_commit_path() {
+        let src = include_str!("service.rs");
+        let body = src
+            .split("pub async fn get_balance")
+            .nth(1)
+            .expect("get_balance 不应被改名")
+            .split("fn balance_cache_key")
+            .next()
+            .expect("balance_cache_key 应紧随其后");
+        // needle 运行时拼接：include_str! 会把本测试自己的字面量也读进来。
+        let commit = format!("self.commit_fresh{}", "_balance(");
+        assert!(
+            body.contains(commit.as_str()),
+            "get_balance 必须走 commit_fresh_balance 收口（它负责同步重置花费基线）"
+        );
+        let inline_insert = format!("cache.insert{}", "(");
+        assert!(
+            !body.contains(inline_insert.as_str()),
+            "get_balance 里不得内联 cache.insert —— 那会漏掉基线重置，面板把已花掉的量扣两次"
+        );
+    }
+
+    /// 后台温和刷新同样必须走那个收口（同一漏改面）。
+    #[test]
+    fn background_refresh_writes_through_the_single_commit_path() {
+        let src = include_str!("service.rs");
+        let body = src
+            .split("pub async fn refresh_all_balances_gently")
+            .nth(1)
+            .expect("refresh_all_balances_gently 不应被改名")
+            .split("fn commit_fresh_balance")
+            .next()
+            .expect("commit_fresh_balance 应紧随其后");
+        let commit = format!("self.commit_fresh{}", "_balance(");
+        assert!(
+            body.contains(commit.as_str()),
+            "后台刷新也必须走 commit_fresh_balance（两条路径各写一份 insert 正是漏改根源）"
+        );
+    }
+
+    /// `force` 查询串契约：**省略必须是 false**（老前端不带该参数时保持走缓存的原语义）。
+    ///
+    /// 走真实的 axum `Query` 提取器而不是直接反序列化 —— 要锁的正是"没带这个参数的请求
+    /// 不会 400、且不会变成强制打上游"。回退即 FAIL：去掉 `#[serde(default)]` →
+    /// 第一条断言（无查询串）直接解析失败。
+    #[test]
+    fn balance_query_force_defaults_to_false() {
+        use super::super::handlers::BalanceQuery;
+        use axum::extract::Query;
+
+        let bare: Query<BalanceQuery> = Query::try_from_uri(
+            &"http://x/api/admin/credentials/1/balance"
+                .parse::<axum::http::Uri>()
+                .unwrap(),
+        )
+        .expect("不带查询串的请求必须能解析（老前端就是这么发的）");
+        assert!(!bare.0.force, "省略 force 必须走缓存（不改既有行为）");
+
+        let forced: Query<BalanceQuery> = Query::try_from_uri(
+            &"http://x/api/admin/credentials/1/balance?force=true"
+                .parse::<axum::http::Uri>()
+                .unwrap(),
+        )
+        .expect("解析 force=true");
+        assert!(forced.0.force);
+    }
+}
+
+#[cfg(test)]
+mod cleanup_disabled_tests {
+    //! 批量清理已禁用凭据（G-1）。
+    //!
+    //! 承重点不是"能删"，而是**该不该删的判据**：误清一个代挂号 =
+    //! 删掉用户自配的第三方中转。所以每条排除都有一条对照断言。
+    use super::*;
+
+    /// 造一条凭据。`base_url` 非 None 即为代挂号（`is_custom_api_credential` 的旧数据判据）。
+    fn mk(
+        id: u64,
+        auth_method: &str,
+        base_url: Option<&str>,
+        disabled: bool,
+        reason: Option<DisabledReason>,
+    ) -> KiroCredentials {
+        KiroCredentials {
+            id: Some(id),
+            auth_method: Some(auth_method.to_string()),
+            // `.invalid` 是 RFC 6761 保留 TLD，保证永不解析 —— 测试不依赖本机 DNS
+            // （历史事故：fake-IP 模式代理把 example.com 解到 198.18/16，被 SSRF 正确拦掉）。
+            base_url: base_url.map(|s| s.to_string()),
+            kiro_api_key: match auth_method {
+                "api_key" | "custom_api" => Some(format!("ksk_test_{id}")),
+                _ => None,
+            },
+            disabled,
+            disabled_reason: reason,
+            ..Default::default()
+        }
+    }
+
+    fn mk_service(creds: Vec<KiroCredentials>) -> AdminService {
+        let tm = Arc::new(
+            MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                creds,
+                None,
+                None,
+                // 单凭据格式 ⇒ persist 是 no-op，删除只走内存 + 内存回收站。
+                false,
+            )
+            .expect("构造 token manager"),
+        );
+        AdminService::new(tm, Vec::<String>::new())
+    }
+
+    /// 判据本身：四道排除各一条，加上"该清的真会被清"的对照。
+    ///
+    /// 回退即 FAIL：删掉 `cleanup_verdict` 里的 `is_custom_api` 分支 → 第 1 条失败；
+    /// 删掉禁用原因那道 → 第 2/3 条失败；删掉可自愈那道 → 第 4 组失败。
+    #[test]
+    fn verdict_excludes_custom_api_and_passthrough_reasons() {
+        // 代挂号：无论禁用原因是什么都不清
+        assert_eq!(cleanup_verdict(Some(true), None), Some("custom_api"));
+        assert_eq!(
+            cleanup_verdict(Some(true), Some("QuotaExceeded")),
+            Some("custom_api"),
+            "代挂号即便原因看着像死号也不清（它的额度是中转站的，充值即可用）"
+        );
+
+        // 代挂专属原因：即便认不出是代挂（历史数据缺 auth_method/base_url）也要拦住
+        assert_eq!(
+            cleanup_verdict(Some(false), Some("PassthroughFailed")),
+            Some("passthrough_disabled")
+        );
+        assert_eq!(
+            cleanup_verdict(Some(false), Some("PassthroughOverloaded")),
+            Some("passthrough_disabled")
+        );
+
+        // 可自愈原因：号会自己回池，删它等于拿走健康号
+        for r in [
+            "TooManyFailures",
+            "SuspiciousActivityAuto",
+            "TooManyRefreshFailures",
+        ] {
+            assert_eq!(
+                cleanup_verdict(Some(false), Some(r)),
+                Some("self_healable"),
+                "{r} 在自愈白名单里，禁用态是瞬时的，不能当死号删"
+            );
+        }
+
+        // 竞态：号已不在池里 → 不清，且原因不能报成代挂
+        assert_eq!(cleanup_verdict(None, None), Some("not_in_pool"));
+        assert_eq!(
+            cleanup_verdict(None, Some("QuotaExceeded")),
+            Some("not_in_pool"),
+            "拿不到凭据时其余判据全是猜的，只能报'号没了'"
+        );
+
+        // 对照：真死号该清
+        for r in [
+            "Manual",
+            "QuotaExceeded",
+            "AccountSuspended",
+            "InvalidRefreshToken",
+            "InvalidConfig",
+            "RequestLimitReached",
+            "RegionProbeFailed",
+            "RegionProbeTokenDead",
+        ] {
+            assert_eq!(
+                cleanup_verdict(Some(false), Some(r)),
+                None,
+                "{r} 是 Kiro 号的死因（不在自愈白名单里），必须被清"
+            );
+        }
+        // 禁用但无原因（老数据）也该清 —— 它已经是禁用态，本来就不参与调度。
+        assert_eq!(cleanup_verdict(Some(false), None), None);
+    }
+
+    /// ⭐ 可自愈集合必须与 `token_manager::is_self_healable_reason` 的白名单**逐字符相同**。
+    ///
+    /// 那个函数是私有的、且吃枚举，这里没法直接调它，所以抄了一份。抄本会漂，而漂移的后果是
+    /// 静默的：白名单加了新变体、这里没跟 → 那种号又会被当死号删走（正是本轮修的 bug）。
+    ///
+    /// 用**穷举 match** 而不是列表相等来锁：`DisabledReason` 新增变体时这条 match
+    /// 会编译不过，逼作者当场判断"新原因可不可自愈"，而不是等线上删错号。
+    ///
+    /// 回退即 FAIL：从 `CLEANUP_SELF_HEALABLE_REASONS` 里删掉任一项 → 对应断言失败。
+    #[test]
+    fn self_healable_set_matches_token_manager_whitelist() {
+        // 穷举全部变体，逐个声明期望值。expected 的取值依据是
+        // `token_manager.rs::is_self_healable_reason` 的 matches! 白名单。
+        let all: [(DisabledReason, bool); 14] = [
+            (DisabledReason::Manual, false),
+            (DisabledReason::TooManyFailures, true),
+            (DisabledReason::TooManyRefreshFailures, true),
+            (DisabledReason::QuotaExceeded, false),
+            (DisabledReason::AccountSuspended, false),
+            (DisabledReason::SuspiciousActivityAuto, true),
+            (DisabledReason::InvalidRefreshToken, false),
+            (DisabledReason::InvalidConfig, false),
+            (DisabledReason::RequestLimitReached, false),
+            (DisabledReason::PassthroughFailed, false),
+            (DisabledReason::PassthroughOverloaded, false),
+            (DisabledReason::RegionProbeFailed, false),
+            (DisabledReason::RegionProbeTokenDead, false),
+            (DisabledReason::Unknown, false),
+        ];
+        // 编译期门禁：新增变体后这个 match 缺分支即编译失败，届时必须回到上面的表里补一行。
+        for (r, _) in &all {
+            match r {
+                DisabledReason::Manual
+                | DisabledReason::TooManyFailures
+                | DisabledReason::TooManyRefreshFailures
+                | DisabledReason::QuotaExceeded
+                | DisabledReason::AccountSuspended
+                | DisabledReason::SuspiciousActivityAuto
+                | DisabledReason::InvalidRefreshToken
+                | DisabledReason::InvalidConfig
+                | DisabledReason::RequestLimitReached
+                | DisabledReason::PassthroughFailed
+                | DisabledReason::PassthroughOverloaded
+                | DisabledReason::RegionProbeFailed
+                | DisabledReason::RegionProbeTokenDead
+                | DisabledReason::Unknown => {}
+            }
+        }
+
+        for (reason, healable) in all {
+            assert_eq!(
+                CLEANUP_SELF_HEALABLE_REASONS.contains(&reason),
+                healable,
+                "{} 的可自愈判定与 token_manager 白名单不一致",
+                reason.as_str()
+            );
+        }
+    }
+
+    /// 判据里那两个字符串必须与 `DisabledReason::as_str()` 同源。
+    ///
+    /// 回退即 FAIL：把 `cleanup_verdict` 里的枚举调用换成手写字面量
+    /// （例如 `"passthroughFailed"` 这种 camelCase 拼法）→ 本测试的 as_str 对不上。
+    /// 这条锁的是**契约同源**：`as_str` 的字面量就是 Admin API 下发给前端的值，
+    /// 而快照给我们的 `disabled_reason` 正是它的产物，两侧一旦分叉，排除会静默失效。
+    #[test]
+    fn passthrough_reason_strings_come_from_disabled_reason_as_str() {
+        assert_eq!(
+            cleanup_verdict(
+                Some(false),
+                Some(DisabledReason::PassthroughFailed.as_str())
+            ),
+            Some("passthrough_disabled")
+        );
+        assert_eq!(
+            cleanup_verdict(
+                Some(false),
+                Some(DisabledReason::PassthroughOverloaded.as_str())
+            ),
+            Some("passthrough_disabled")
+        );
+    }
+
+    /// ⭐ 端到端：真删一遍，代挂号必须**还在池里**、死号必须**进了回收站**。
+    ///
+    /// 这条测的是可观测状态（池 + 回收站），不是分支形状 —— 把
+    /// `cleanup_disabled_credentials` 里的 `cleanup_verdict` 调用去掉（无条件收进候选），
+    /// 第一组断言立刻 FAIL。
+    #[test]
+    fn cleanup_deletes_dead_kiro_credentials_and_keeps_passthrough() {
+        let svc = mk_service(vec![
+            // #1 未禁用 → 压根不是候选
+            mk(1, "api_key", None, false, None),
+            // #2 禁用的 Kiro 死号 → 清
+            mk(
+                2,
+                "api_key",
+                None,
+                true,
+                Some(DisabledReason::QuotaExceeded),
+            ),
+            // #3 管理员手动禁用的代挂号 → 留
+            mk(
+                3,
+                "custom_api",
+                Some("https://relay3.invalid/v1"),
+                true,
+                Some(DisabledReason::Manual),
+            ),
+            // #4 代挂号，但禁用原因是非代挂专属的未知值 → 仍靠 is_custom_api 拦住
+            mk(
+                4,
+                "custom_api",
+                Some("https://relay4.invalid/v1"),
+                true,
+                Some(DisabledReason::Unknown),
+            ),
+            // #5 认不出是代挂（api_key + 无 base_url），但原因是代挂专属 → 靠第二道网留
+            mk(
+                5,
+                "api_key",
+                None,
+                true,
+                Some(DisabledReason::PassthroughOverloaded),
+            ),
+            // #6 禁用无原因的老数据 → 清
+            mk(6, "api_key", None, true, None),
+            // #7 Kiro 号，但原因可自愈（自愈会把它复活）→ 留。删它 = 拿走健康号。
+            mk(
+                7,
+                "api_key",
+                None,
+                true,
+                Some(DisabledReason::TooManyFailures),
+            ),
+        ]);
+
+        let resp = svc.cleanup_disabled_credentials(false);
+
+        assert!(!resp.dry_run);
+        assert_eq!(resp.disabled_total, 6, "#2..#7 共 6 个禁用号");
+        assert_eq!(resp.candidates, vec![2, 6], "只有 #2/#6 是死号（且已升序）");
+        assert_eq!(resp.deleted, 2);
+        assert_eq!(resp.failed, 0);
+        assert!(resp.results.iter().all(|r| r.ok));
+
+        // 池里剩下：#1（未禁用）+ #3/#4/#5（代挂被排除）
+        let remaining: Vec<u64> = {
+            let mut v: Vec<u64> = svc
+                .token_manager
+                .snapshot()
+                .entries
+                .iter()
+                .map(|e| e.id)
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(
+            remaining,
+            vec![1, 3, 4, 5, 7],
+            "代挂号 #3/#4/#5 必须还在池里（它们不是死号，修好配置就能用）；\
+             #7 是自愈途中的健康号，更不能删"
+        );
+
+        // 回收站里只有那两个死号 —— 「进回收站可恢复」而不是 purge。
+        let mut trashed: Vec<u64> = svc.list_trash().trash.iter().map(|t| t.id).collect();
+        trashed.sort_unstable();
+        assert_eq!(trashed, vec![2, 6], "删掉的号必须进回收站（可恢复）");
+
+        // skipped 逐条带原因，供前端解释"为什么这几个没删"
+        let mut skipped: Vec<(u64, &str)> = resp.skipped.iter().map(|s| (s.id, s.reason)).collect();
+        skipped.sort_unstable();
+        assert_eq!(
+            skipped,
+            vec![
+                (3, "custom_api"),
+                (4, "custom_api"),
+                (5, "passthrough_disabled"),
+                (7, "self_healable"),
+            ]
+        );
+    }
+
+    /// dry-run 必须**一个号都不动**，但候选与真删完全一致（同一段筛选）。
+    ///
+    /// 回退即 FAIL：把 `if dry_run` 那道早返回删掉 → 预览会真删，池子少两个号。
+    #[test]
+    fn dry_run_reports_candidates_without_deleting() {
+        let creds = vec![
+            mk(
+                1,
+                "api_key",
+                None,
+                true,
+                Some(DisabledReason::QuotaExceeded),
+            ),
+            mk(
+                2,
+                "custom_api",
+                Some("https://relay.invalid/v1"),
+                true,
+                Some(DisabledReason::Manual),
+            ),
+            mk(
+                3,
+                "api_key",
+                None,
+                true,
+                Some(DisabledReason::AccountSuspended),
+            ),
+        ];
+        let svc = mk_service(creds);
+
+        let preview = svc.cleanup_disabled_credentials(true);
+        assert!(preview.dry_run);
+        assert_eq!(preview.candidates, vec![1, 3]);
+        assert_eq!(preview.deleted, 0, "预览不得删任何号");
+        assert!(preview.results.is_empty(), "预览没有逐条删除结果");
+        assert_eq!(svc.token_manager.total_count(), 3, "预览后池子必须原样");
+        assert!(svc.list_trash().trash.is_empty(), "预览不得往回收站放东西");
+
+        // 同一段筛选 ⇒ 真删的候选与预览逐字相同
+        let real = svc.cleanup_disabled_credentials(false);
+        assert_eq!(
+            real.candidates, preview.candidates,
+            "预览与真删必须同源（否则用户看到的和实际删的不是一回事）"
+        );
+        assert_eq!(real.deleted, 2);
+    }
+
+    /// 上限：超出部分**留给下一次**且在 skipped 里标 `over_limit`，不静默丢弃。
+    ///
+    /// 回退即 FAIL：去掉 `split_off` 那段 → 一次就把 201 个全删了，
+    /// 第一条断言（deleted == 200）失败。
+    #[test]
+    fn cleanup_caps_at_limit_and_reports_the_rest() {
+        let n = MAX_CLEANUP_DISABLED_IDS as u64 + 1;
+        // 原因必须是**不可自愈**的死因，否则整批都会被 self_healable 那道排除掉，
+        // 这条测的上限逻辑就一个候选都碰不到（测了个空）。
+        let creds: Vec<KiroCredentials> = (1..=n)
+            .map(|i| {
+                mk(
+                    i,
+                    "api_key",
+                    None,
+                    true,
+                    Some(DisabledReason::QuotaExceeded),
+                )
+            })
+            .collect();
+        let svc = mk_service(creds);
+
+        let resp = svc.cleanup_disabled_credentials(false);
+        assert_eq!(resp.disabled_total, n as usize);
+        assert_eq!(resp.candidates.len(), MAX_CLEANUP_DISABLED_IDS);
+        assert_eq!(resp.deleted, MAX_CLEANUP_DISABLED_IDS);
+        // 升序截断 ⇒ 留下的必然是最大的那个 id（确定性，重复调用可收敛）
+        assert_eq!(
+            resp.skipped
+                .iter()
+                .filter(|s| s.reason == "over_limit")
+                .map(|s| s.id)
+                .collect::<Vec<_>>(),
+            vec![n]
+        );
+        assert_eq!(svc.token_manager.total_count(), 1, "只剩超出上限那一个");
+
+        // 第二次调用把剩下那个清完 —— 这就是"留给下一次"的可收敛性。
+        let again = svc.cleanup_disabled_credentials(false);
+        assert_eq!(again.deleted, 1);
+        assert_eq!(svc.token_manager.total_count(), 0);
+    }
+
+    /// ⭐ **顺序**断言：截断必须排在 `if dry_run` 早返**之前**。
+    ///
+    /// # 为什么单独测顺序，而不是各测一遍
+    ///
+    /// 「dry-run 会早返」和「超上限会截断」两个分支各自都是对的，现有测试也都覆盖了，
+    /// 但它们**互相不知道对方存在**：把 `if dry_run` 那段整块挪到 `split_off` 之前，
+    /// 两条旧测试仍全绿（一条不超限、一条不 dry-run），而预览会报 201 个候选、
+    /// 真删只删 200 —— 用户看到的和实际删的不是一回事，正是 dry-run 唯一要防的事。
+    ///
+    /// 所以这条的断言不是"分支内容对不对"，而是**同一个池上预览与真删的候选逐字相等**，
+    /// 且这个池刻意造在上限边界上（201），只有顺序错了才会分叉。
+    ///
+    /// 回退即 FAIL：把 `if dry_run || candidates.is_empty()` 那个 return 块移到
+    /// `candidates.sort_unstable()` 之前 → 预览候选变 201 个，第一条断言失败。
+    #[test]
+    fn truncation_happens_before_dry_run_early_return() {
+        let n = MAX_CLEANUP_DISABLED_IDS as u64 + 1;
+        let creds: Vec<KiroCredentials> = (1..=n)
+            .map(|i| {
+                mk(
+                    i,
+                    "api_key",
+                    None,
+                    true,
+                    Some(DisabledReason::QuotaExceeded),
+                )
+            })
+            .collect();
+        let svc = mk_service(creds);
+
+        let preview = svc.cleanup_disabled_credentials(true);
+        assert_eq!(
+            preview.candidates.len(),
+            MAX_CLEANUP_DISABLED_IDS,
+            "预览也必须先截断：报 201 个而真删 200 个，预览就骗人了"
+        );
+        assert_eq!(
+            preview
+                .skipped
+                .iter()
+                .filter(|s| s.reason == CLEANUP_SKIP_OVER_LIMIT)
+                .map(|s| s.id)
+                .collect::<Vec<_>>(),
+            vec![n],
+            "预览必须把'留给下一次'的那条也标出来（否则用户不知道还得再点一次）"
+        );
+        assert_eq!(
+            svc.token_manager.total_count(),
+            n as usize,
+            "预览不得动池子"
+        );
+
+        // 同一个池、同一段筛选 ⇒ 真删的候选与预览逐字相等。这才是顺序正确的可观测证据。
+        let real = svc.cleanup_disabled_credentials(false);
+        assert_eq!(
+            real.candidates, preview.candidates,
+            "预览与真删的候选必须逐字相同（上限边界上尤其如此）"
+        );
+        assert_eq!(real.deleted, MAX_CLEANUP_DISABLED_IDS);
+    }
+
+    /// `disabled_total` 的恒等式：`== candidates.len() + skipped.len()`，**含** over_limit 那批。
+    ///
+    /// 锁的是 `types.rs` 上那句文档（原注释写"非 over_limit 的条数"，与实现不符）。
+    /// 前端拿它当"池里有多少禁用号"的分母，少算一批会显示错的数。
+    ///
+    /// 回退即 FAIL：把实现改成注释描述的样子（`disabled_total` 减去 over_limit 条数）
+    /// → 第二条断言失败。
+    #[test]
+    fn disabled_total_counts_every_disabled_credential_including_over_limit() {
+        let n = MAX_CLEANUP_DISABLED_IDS as u64 + 3;
+        let creds: Vec<KiroCredentials> = (1..=n)
+            .map(|i| {
+                // 混入两条被排除的，保证恒等式不是"candidates 恰好等于全部"的巧合
+                match i % 100 {
+                    7 => mk(
+                        i,
+                        "custom_api",
+                        Some("https://relay.invalid/v1"),
+                        true,
+                        Some(DisabledReason::Manual),
+                    ),
+                    _ => mk(
+                        i,
+                        "api_key",
+                        None,
+                        true,
+                        Some(DisabledReason::QuotaExceeded),
+                    ),
+                }
+            })
+            .collect();
+        let svc = mk_service(creds);
+
+        let resp = svc.cleanup_disabled_credentials(true);
+        assert_eq!(resp.disabled_total, n as usize, "池里所有禁用号都要计入");
+        assert_eq!(
+            resp.disabled_total,
+            resp.candidates.len() + resp.skipped.len(),
+            "恒等式：每个禁用号必然落进 candidates 或 skipped 之一"
+        );
+        assert!(
+            resp.skipped
+                .iter()
+                .any(|s| s.reason == CLEANUP_SKIP_OVER_LIMIT),
+            "这个池刻意超上限，必须真触发 over_limit（否则本条测了个空）"
+        );
+    }
+
+    /// 空池 / 全是未禁用号：安静返回零，不报错也不删。
+    #[test]
+    fn nothing_to_clean_is_a_quiet_zero() {
+        let svc = mk_service(vec![mk(1, "api_key", None, false, None)]);
+        let resp = svc.cleanup_disabled_credentials(false);
+        assert_eq!(resp.disabled_total, 0);
+        assert!(resp.candidates.is_empty());
+        assert!(resp.skipped.is_empty(), "未禁用号不进 skipped（否则噪音）");
+        assert_eq!(resp.deleted, 0);
+        assert_eq!(svc.token_manager.total_count(), 1);
+    }
+
+    /// 请求体契约：`{}` / 缺体 / `{"dryRun":true}` 三种都得能解。
+    ///
+    /// 回退即 FAIL：去掉 `#[serde(default)]` → 第一条（`{}`）解析失败，
+    /// 而"不带任何参数直接清理"正是最常见用法。
+    #[test]
+    fn request_body_parses_camel_case_and_defaults_to_real_delete() {
+        use super::super::types::CleanupDisabledRequest;
+        let empty: CleanupDisabledRequest = serde_json::from_str("{}").expect("空体应能解析");
+        assert!(
+            !empty.dry_run,
+            "缺字段必须是真删（与既有 force 同款保守语义）"
+        );
+        let preview: CleanupDisabledRequest =
+            serde_json::from_str(r#"{"dryRun":true}"#).expect("camelCase 应能解析");
+        assert!(preview.dry_run);
     }
 }

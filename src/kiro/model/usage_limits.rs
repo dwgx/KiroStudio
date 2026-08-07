@@ -289,8 +289,9 @@ mod tests {
                 usage_limit_with_precision: limit,
                 overage_cap,
             }],
-            overage_configuration: overage_enabled
-                .map(|e| OverageConfiguration { overage_enabled: Some(e) }),
+            overage_configuration: overage_enabled.map(|e| OverageConfiguration {
+                overage_enabled: Some(e),
+            }),
         }
     }
 

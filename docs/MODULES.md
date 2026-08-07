@@ -1,7 +1,14 @@
 # KiroStudio 模块参考手册
 
 > 按模块分组，列出每个文件的核心结构体/枚举、关键函数签名及用途、模块间调用关系。
-> 行数为当前实测（约 35,800 行 Rust）。用 codegraph 索引 + 源码逐一核对。
+>
+> 🔴 **本文件标题里的每个行数都已过期**（2026-08-07 实测：全仓 **90,032 行**而非「约 35,800」；
+> `token_manager.rs` **14927** 而非 5239、`stream.rs` **9205** 而非 2599、`service.rs` **9163**
+> 而非 1990、`main.rs` **1139** 而非 481）。**别引用这些数**，现读：
+> `python3 tools/codegraph/cg.py stat`。符号是否还存在同样要现查：
+> `cg.py sym '<名字>'` / `cg.py file <文件>`（工具与边界见 `tools/codegraph/README.md`）。
+> 本文件也缺 `src/openai/`（convert/handlers/types/mod 四个文件）一节。
+> 结构性描述（谁调谁、职责划分）大体仍成立，被证否的个别条目已就地标注。
 > 架构总览与请求链路见 `docs/ARCHITECTURE.md`；变更史见 `CHANGELOG.md`。
 
 ---
@@ -142,7 +149,9 @@ AWS SSO-OIDC 设备码：`register_client(region)` / `start_device_authorization
 ### kiro/endpoint/ide.rs (181)
 `IdeEndpoint`（`IDE_ENDPOINT_NAME="ide"`）。
 - API：`https://runtime.{region}.kiro.dev/generateAssistantResponse`
-- MCP：`https://runtime.{region}.kiro.dev/mcp`（旧 `q.{region}.amazonaws.com` 已停用）
+- MCP：`https://runtime.{region}.kiro.dev/mcp`
+  （⚠️ 原写「旧 `q.{region}.amazonaws.com` 已停用」**无依据且有反证**，2026-08-06 更正：
+  `q.*` 是 **CLI 端点**的 host，见 `kiro/endpoint/cli.rs`，两个端点按凭据类型绑定、不可互换）
 - 请求头：Authorization Bearer + tokentype(API_KEY/EXTERNAL_IDP) + x-amzn-codewhisperer-optout +
   x-amzn-kiro-agent-mode + UA/host/amz-sdk-*
 - `transform_api_body` 注入 `effective_profile_arn`（external_idp 用动态解析真实租户 ARN，缺则上游 400）

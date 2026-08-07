@@ -33,6 +33,65 @@ struct Bucket {
     last_probe_nanos: u64,
 }
 
+/// 实测入站速率的滑窗（每秒一个桶的环形缓冲）。
+///
+/// # 为什么需要它（🔴 这是一个真实故障的修复，不是锦上添花）
+///
+/// 在此之前 `inboundCurrentRpm` 直接返回 **target**（`admin/service.rs` 的
+/// `inbound_current_rpm: ...inbound_target_rpm()`），即「当前速率」这个字段恒等于
+/// 「目标速率」，与真实吞吐**无关**。全仓没有任何观测入站速率的计数器。
+///
+/// 2026-08-06 实测后果：面板显示 500 RPM，而客户端侧实际只有 50~70 RPM。
+/// 两个数字差一个数量级，运维据此做过两次限流分析、差点据此改线上 `inboundTargetRpm`。
+/// 而真实差距的来源是**重试放大**（实测 4.59×：1317 客户端请求 → 6040 次上游尝试），
+/// 那是整形层根本看不见的量 —— 整形在 failover 循环**之外**每请求取 1 个令牌，
+/// 而逐号 `RpmTracker` 在**选号时**记账，即每次 failover 尝试都记一次。
+/// 两者量纲不同，混着读必然得出错误结论。
+///
+/// # 为什么用环形桶而不是复用 `RpmTracker`
+///
+/// `RpmTracker` 按凭据 id 存 `VecDeque<Instant>`，每次 record 都要 prune 一条队列。
+/// 这里是**全局单一序列**且只需要总数，用 60 个定长桶即可 O(1) 记账、零分配。
+///
+/// # 为什么用 Mutex 而不是原子数组
+///
+/// 与同文件 `Bucket` 同一个理由（见其注释）：跨桶清零是 read-modify-write，裸原子会
+/// 相互覆盖丢更新；而整形不在 CPU 热路径（每请求后面紧跟一次上游 HTTP），锁开销可忽略。
+struct ObservedRate {
+    /// 每秒一个桶，`buckets[sec % 60]`。
+    buckets: [u32; OBSERVED_WINDOW_SECS],
+    /// 上次记账所处的「进程启动以来的秒数」，用于判断要清掉哪些过期桶。
+    last_sec: u64,
+}
+
+impl ObservedRate {
+    fn new() -> Self {
+        Self {
+            buckets: [0; OBSERVED_WINDOW_SECS],
+            last_sec: 0,
+        }
+    }
+
+    /// 把 `last_sec` 推进到 `now_sec`，途经的桶全部清零。
+    ///
+    /// ⚠️ 跨度 ≥ 窗口时必须整体清零而不是逐桶走：空闲 1 小时后回来若逐桶推进，
+    /// 要循环 3600 次；而超过一窗的历史本来就该全丢。
+    fn advance(&mut self, now_sec: u64) {
+        if now_sec == self.last_sec {
+            return;
+        }
+        let gap = now_sec.saturating_sub(self.last_sec);
+        if gap >= OBSERVED_WINDOW_SECS as u64 {
+            self.buckets = [0; OBSERVED_WINDOW_SECS];
+        } else {
+            for s in (self.last_sec + 1)..=now_sec {
+                self.buckets[(s as usize) % OBSERVED_WINDOW_SECS] = 0;
+            }
+        }
+        self.last_sec = now_sec;
+    }
+}
+
 /// AIMD 参数(内置,可由 config 覆盖初始值)。
 const DEFAULT_STEP_UP: u32 = 10; // 每个探测周期无 429 就 +10 RPM
 const AIMD_PROBE_SECS: u64 = 20; // 探测周期:距上次降档 ≥20s 且无新 429 才升档
@@ -42,6 +101,28 @@ const MD_DEBOUNCE_SECS: u64 = 3; // MD 去抖窗口:此窗内重复 429(如单�
 /// 一个令牌的定点值。令牌数全程按 ×1000 定点存储以避免浮点，故"取走一个令牌"= 扣 1000 milli。
 /// 桶容量必须 ≥ 此值，否则永远攒不满一个令牌（见 capacity_milli_locked 的容量塌陷说明）。
 const ONE_TOKEN_MILLI: u64 = 1000;
+
+/// 启动 slow-start 窗口（秒）。见 [`GlobalThrottle::boot_ramp_rpm`] 的完整依据。
+///
+/// 取 60s：`RpmTracker` 的滑窗正是 60s，所以窗口结束的那一刻，选号层的爬坡限制
+/// 恰好已经攒够一整窗样本、开始正常工作 —— 两层无缝接力，中间不留空档。
+const BOOT_SLOW_START_SECS: u64 = 60;
+
+/// 实测入站速率的滑窗秒数。
+///
+/// 取 60 与 [`crate::kiro::scheduling::RpmTracker`] 的窗口一致：面板会把「入站实测 RPM」
+/// 与「逐号 RPM 之和」并排显示，两者窗口不同会让读者以为放大倍数在变，而那只是窗口差异。
+const OBSERVED_WINDOW_SECS: usize = 60;
+
+/// 启动瞬间的有效 RPM 百分比（随后线性升到 100%）。
+///
+/// 取 25%：线上实测健康号平缓上量到 100+ req/min 只有 2.9% 429，而突然跃升
+/// ≥5x 有 48.3%。从 25% 起步意味着首秒的跃升幅度被限制在 4x 以内（低于 5x 那档），
+/// 且 60s 内均匀放开，全程不进「≥5x」区间。
+///
+/// 不取更低（如 10%）：重启后客户端本来就在积压，压太狠会让 queue_max_wait
+/// 排满、把延迟转嫁给用户；25% 在「削平 burst」与「别让重启变成一次停服」之间。
+const BOOT_START_PCT: u32 = 25;
 
 /// 全局入站节流器。挂在 TokenManager 上,acquire_context 进入时先 await throttle.acquire()。
 pub struct GlobalThrottle {
@@ -72,6 +153,14 @@ pub struct GlobalThrottle {
     pub queued_total: AtomicU64,
     pub md_total: AtomicU64,
     pub ai_total: AtomicU64,
+
+    /// 实测入站速率滑窗（见 [`ObservedRate`] 的完整依据）。
+    ///
+    /// ⚠️ 它统计的是**客户端请求数**，与逐号 `RpmTracker` 的**上游尝试数**量纲不同。
+    /// 两者的比值就是重试放大倍数，别把它们当同一个量比较。
+    observed: parking_lot::Mutex<ObservedRate>,
+    /// 累计放行数（不受滑窗影响，用于对账"滑窗是否在正常滚动"）。
+    pub admitted_total: AtomicU64,
 }
 
 impl GlobalThrottle {
@@ -86,12 +175,23 @@ impl GlobalThrottle {
         queue_max_wait_secs: u32,
         queue_timeout_passthrough: bool,
     ) -> Self {
-        let target = target_rpm.clamp(rpm_min.max(1), rpm_max.max(1));
+        // ⚠️ `hi` 必须 `.max(lo)`：`u32::clamp` 在 `min > max` 时**panic**，而
+        // `inbound_rpm_min` / `inbound_rpm_max` 在 admin 配置 API 里是**各自独立**
+        // clamp 到 [1,100_000] 的，没有任何交叉校验 ⇒ 面板上把 min 填得比 max 大
+        // （或手改 config.json）即可让进程在**启动时**panic。实测 min=500/max=300
+        // 直接命中本行。这里取"上限不低于下限"而非静默交换两者：交换会让整形阈值
+        // 变成用户没填过的值，更难排查。
+        let lo = rpm_min.max(1);
+        let hi = rpm_max.max(1).max(lo);
+        let target = target_rpm.clamp(lo, hi);
         Self {
             enabled: AtomicBool::new(enabled),
             auto: AtomicBool::new(auto),
-            rpm_min: AtomicU32::new(rpm_min.max(1)),
-            rpm_max: AtomicU32::new(rpm_max.max(1)),
+            rpm_min: AtomicU32::new(lo),
+            // 存 `hi`（已 `.max(lo)`）而不是裸 `rpm_max`：否则 `rpm_max` 留 300 而
+            // `target` 已被 clamp 到 lo=500，两者互相矛盾 —— `maybe_step_up` 读
+            // `rpm_max` 当上限，会立刻把 target 压回 300，而 `rpm_min` 又要求 ≥500。
+            rpm_max: AtomicU32::new(hi),
             burst_secs: AtomicU32::new(burst_secs.max(1)),
             queue_max_wait_secs: AtomicU32::new(queue_max_wait_secs.max(1)),
             queue_timeout_passthrough: AtomicBool::new(queue_timeout_passthrough),
@@ -99,7 +199,14 @@ impl GlobalThrottle {
                 // 初始给满桶(允许启动后一个小突发)。与 capacity_milli_locked 同口径：
                 // 必须 .max(ONE_TOKEN_MILLI)，否则低 target_rpm 启动时初始桶连一个令牌都装不下，
                 // 首个请求就得白排队(容量塌陷)。
-                tokens_milli: (((target as u64) * 1000 / 60).max(1) * (burst_secs.max(1) as u64))
+                //
+                // ⭐ 初始桶同样按 BOOT_START_PCT 折算：否则 `try_take` 的启动爬坡
+                // （按折算后 RPM 算容量）会被这个**未折算**的初始桶绕过 —— 进程刚起来
+                // 那一瞬间仍放行一个满量突发，而那正是 slow-start 要削掉的东西
+                // （实测重启后第一分钟是爬坡完全不设防的窗口，见 boot_ramp_rpm）。
+                tokens_milli: ((((target as u64) * BOOT_START_PCT as u64 / 100) * 1000 / 60)
+                    .max(1)
+                    * (burst_secs.max(1) as u64))
                     .max(ONE_TOKEN_MILLI),
                 last_refill_nanos: 0,
                 target_rpm: target,
@@ -111,6 +218,8 @@ impl GlobalThrottle {
             queued_total: AtomicU64::new(0),
             md_total: AtomicU64::new(0),
             ai_total: AtomicU64::new(0),
+            observed: parking_lot::Mutex::new(ObservedRate::new()),
+            admitted_total: AtomicU64::new(0),
         }
     }
 
@@ -143,8 +252,10 @@ impl GlobalThrottle {
     fn try_take(&self) -> bool {
         let now = self.now_nanos();
         let mut b = self.bucket.lock();
-        let per_sec_milli = (b.target_rpm as u64) * 1000 / 60;
-        let cap = self.capacity_milli_locked(b.target_rpm);
+        // ⭐ 启动 slow-start：进程刚起来时按爬坡因子折算有效 RPM（见 boot_ramp_rpm）。
+        let effective_rpm = self.boot_ramp_rpm(b.target_rpm);
+        let per_sec_milli = (effective_rpm as u64) * 1000 / 60;
+        let cap = self.capacity_milli_locked(effective_rpm);
         let elapsed = now.saturating_sub(b.last_refill_nanos);
         if per_sec_milli > 0 {
             let add = per_sec_milli.saturating_mul(elapsed) / 1_000_000_000;
@@ -170,9 +281,45 @@ impl GlobalThrottle {
         }
     }
 
+    /// 记一次「被放行的客户端请求」。
+    ///
+    /// ⚠️ 只在 [`Self::acquire`] 的**唯一出口**调用，不要在各 `return Ok(())` 分支里分别调。
+    /// 原实现有四条放行路径（关闭直接放行 / 首次取到令牌 / 排队后取到 / 排队超时 passthrough），
+    /// 逐条埋点意味着**将来新增一条就漏一条**，而漏了以后表现是「实测 RPM 偏低」——
+    /// 与它要修的那个假数字症状一模一样，几乎不可能被发现。
+    fn record_admitted(&self) {
+        self.admitted_total.fetch_add(1, Ordering::Relaxed);
+        let now_sec = self.start.elapsed().as_secs();
+        let mut o = self.observed.lock();
+        o.advance(now_sec);
+        let idx = (now_sec as usize) % OBSERVED_WINDOW_SECS;
+        o.buckets[idx] = o.buckets[idx].saturating_add(1);
+    }
+
+    /// 最近 60 秒**实测**放行的客户端请求数（即真实入站 RPM）。
+    ///
+    /// 与 [`Self::current_target_rpm`] 是两个完全不同的量：后者是配置/AIMD 的**目标**。
+    /// 面板此前把 target 当 current 显示，见 [`ObservedRate`] 的故障记录。
+    pub fn observed_inbound_rpm(&self) -> u32 {
+        let now_sec = self.start.elapsed().as_secs();
+        let mut o = self.observed.lock();
+        o.advance(now_sec);
+        o.buckets.iter().copied().sum()
+    }
+
     /// 入站准入:有令牌立即放行;否则异步排队等待,直到拿到令牌或超时。
     /// 超时返回 Err(建议 Retry-After 秒数),上层据此给客户端带 Retry-After 的 429。
+    ///
+    /// 放行计数收口在这里（见 [`Self::record_admitted`]），内部逻辑在 `acquire_inner`。
     pub async fn acquire(&self) -> Result<(), u64> {
+        let r = self.acquire_inner().await;
+        if r.is_ok() {
+            self.record_admitted();
+        }
+        r
+    }
+
+    async fn acquire_inner(&self) -> Result<(), u64> {
         if !self.enabled.load(Ordering::Relaxed) {
             return Ok(());
         }
@@ -181,8 +328,8 @@ impl GlobalThrottle {
         }
         // 需要排队。
         self.queued_total.fetch_add(1, Ordering::Relaxed);
-        let deadline =
-            Instant::now() + Duration::from_secs(self.queue_max_wait_secs.load(Ordering::Relaxed) as u64);
+        let deadline = Instant::now()
+            + Duration::from_secs(self.queue_max_wait_secs.load(Ordering::Relaxed) as u64);
         loop {
             // 估算下一个令牌到达时间,睡到那时或被 notify 唤醒(取先到)。
             let rpm = self.current_target_rpm().max(1) as u64;
@@ -303,7 +450,9 @@ impl GlobalThrottle {
         self.queue_timeout_passthrough
             .store(queue_timeout_passthrough, Ordering::Relaxed);
         let lo = rpm_min.max(1);
-        let hi = rpm_max.max(1);
+        // 同 `new()`：`hi` 必须 `.max(lo)`，否则下面 `clamp(lo, hi)` 在 min>max 时 panic。
+        // 热更路径上 panic 的后果比启动时更糟 —— 面板保存一次配置就打死正在服务的进程。
+        let hi = rpm_max.max(1).max(lo);
         self.rpm_min.store(lo, Ordering::Relaxed);
         self.rpm_max.store(hi, Ordering::Relaxed);
         self.burst_secs.store(burst_secs.max(1), Ordering::Relaxed);
@@ -327,6 +476,47 @@ impl GlobalThrottle {
     pub fn current_target_rpm(&self) -> u32 {
         self.bucket.lock().target_rpm
     }
+
+    /// 启动 slow-start：把有效 RPM 从 [`BOOT_START_PCT`]% 线性升到 100%，
+    /// 历时 [`BOOT_SLOW_START_SECS`] 秒。窗口过后恒等于入参（零开销、零影响）。
+    ///
+    /// # 为什么需要它（实测）
+    ///
+    /// 上游惩罚的是**速率的跃升**而非绝对吞吐：控制「前一分钟无 429」后，
+    /// ≥5x 跃升 = **48.3%** 429，平稳 = **0.7%**（24h 全量，凭据×分钟配对）。
+    ///
+    /// 而 `RpmTracker` 是**纯内存**的 ⇒ 每次重启爬坡历史清零 ⇒ 重启后每个号
+    /// `total=0` 落到「样本不足不判」分支 ⇒ **选号层的爬坡限制在重启后第一分钟
+    /// 完全不设防**，客户端积压的请求瞬间满量灌向刚回池的号。
+    ///
+    /// 线上 20:00 起实测 **23 次重启 / 27 次热重载**（用户确认是他自己换号的脚本），
+    /// 每次都造一次这样的 burst。日志里可见 20:20:30 启动、**20:20:32 就打死一个
+    /// 93.9% 成功率的号**。
+    ///
+    /// # 为什么放在入站整形而不是选号层
+    ///
+    /// 选号排序键只能**重新分配**流量，不能降低总量 —— 刚重启时全池都是空白，
+    /// 它无从区分谁该让路。而这里是令牌桶：超出的请求被**排队削平**（线上
+    /// `inboundQueueTimeoutPassthrough=true` ⇒ 排队到期后放行而非拒绝），
+    /// 所以它平滑而不拒绝，正是 slow-start 该有的语义。
+    ///
+    /// # 与 AIMD 的关系
+    ///
+    /// 这是**读时乘数**，不写 `b.target_rpm` ⇒ AIMD 的降档/升档状态完全不受影响，
+    /// 窗口结束后自动回到 AIMD 自己算出来的值。若写进 target_rpm 会与 AIMD
+    /// 的 load-compute-store 打架（那正是本文件 review Finding 3 修过的那类缺陷）。
+    fn boot_ramp_rpm(&self, target_rpm: u32) -> u32 {
+        let elapsed = self.start.elapsed().as_secs();
+        if elapsed >= BOOT_SLOW_START_SECS {
+            return target_rpm;
+        }
+        // pct 从 BOOT_START_PCT 线性升到 100。
+        let span = 100u64.saturating_sub(BOOT_START_PCT as u64);
+        let pct = BOOT_START_PCT as u64 + span * elapsed / BOOT_SLOW_START_SECS.max(1);
+        // 下限 1：折算后为 0 会让令牌桶永不补充（capacity_milli_locked 有 .max 兜底，
+        // 但补充速率为 0 时排队者只能靠 passthrough 超时放行，等于白等满 queue_max_wait）。
+        (((target_rpm as u64) * pct / 100) as u32).max(1)
+    }
 }
 
 #[cfg(test)]
@@ -338,6 +528,133 @@ mod tests {
         GlobalThrottle::new(enabled, auto, rpm, 20, 300, 2, 30, false)
     }
 
+    /// 🔴 实测入站 RPM 必须是**实测**，不能等于 target。
+    ///
+    /// 这是那个假数字的直接回归：`inboundCurrentRpm` 曾返回 target，于是面板显示 500
+    /// 而客户端实际只有 50~70。本测试钉死「没放行过任何请求时实测必须是 0，而 target 是
+    /// 配置值」—— 只要有人再把 current 接回 target，这条立刻红。
+    #[tokio::test]
+    async fn observed_rpm_must_not_equal_target_when_idle() {
+        // 注意 rpm 取 200：`mk` 的 rpm_max 是 300，传 600 会被正确 clamp 成 300，
+        // 那样这条测试就在测 clamp 而不是测实测/target 的区分。
+        let t = mk(true, false, 200);
+        assert_eq!(
+            t.current_target_rpm(),
+            200,
+            "target 应为配置值（对照组，证明 200 这个数确实存在）"
+        );
+        assert_eq!(
+            t.observed_inbound_rpm(),
+            0,
+            "零流量时实测入站必须是 0；若它返回 200 说明又把 target 当 current 了"
+        );
+
+        // 放行 3 个请求后，实测应恰好是 3（而 target 不变）。
+        for _ in 0..3 {
+            t.acquire().await.expect("容量足够，不该排队超时");
+        }
+        assert_eq!(t.observed_inbound_rpm(), 3, "实测应等于真实放行数");
+        assert_eq!(t.current_target_rpm(), 200, "target 不该被放行影响");
+        assert_eq!(t.admitted_total.load(Ordering::Relaxed), 3);
+    }
+
+    /// 整形**关闭**时也必须计数。
+    ///
+    /// 关闭时 `acquire_inner` 在第一行就 `return Ok(())`。若把埋点写在「取到令牌」那条
+    /// 分支里，关闭整形的部署实测 RPM 恒 0 —— 而线上确实存在 `inboundThrottleEnabled=false`
+    /// 的配置，那种部署会完全失去入站可观测性。
+    #[tokio::test]
+    async fn observed_rpm_must_count_when_throttle_disabled() {
+        let t = mk(false, false, 600);
+        for _ in 0..5 {
+            t.acquire().await.expect("关闭时必然放行");
+        }
+        assert_eq!(
+            t.observed_inbound_rpm(),
+            5,
+            "整形关闭时仍须记账，否则该部署没有任何入站实测数字"
+        );
+    }
+
+    /// 排队超时 passthrough 放行的请求也要计数。
+    ///
+    /// 那条路径**确实打了上游**，不计入会让实测 RPM 系统性偏低，而偏低正是本次要修的症状。
+    #[tokio::test]
+    async fn observed_rpm_must_count_passthrough_admits() {
+        // rpm=1 + burst=1 → 桶极小；passthrough=true；queue_wait=0 使其立即超时放行。
+        let t = GlobalThrottle::new(true, false, 1, 1, 300, 1, 0, true);
+        let mut admitted = 0;
+        for _ in 0..4 {
+            if t.acquire().await.is_ok() {
+                admitted += 1;
+            }
+        }
+        assert_eq!(admitted, 4, "passthrough=true 时全部放行");
+        assert_eq!(
+            t.observed_inbound_rpm(),
+            4,
+            "passthrough 放行的请求打了上游，必须计入实测"
+        );
+    }
+
+    /// 滑窗跨度超过一整窗时必须整体清零，而不是逐桶循环。
+    ///
+    /// 直接驱动 `ObservedRate` 而不是等 60 秒真实时间（测试不该睡一分钟）。
+    #[test]
+    fn observed_window_advance_clears_stale_buckets() {
+        let mut o = ObservedRate::new();
+        o.buckets[0] = 7;
+        o.last_sec = 0;
+
+        // 窗口内推进：只清途经的桶，桶 0 的值应仍在（尚未离开窗口）。
+        o.advance(5);
+        assert_eq!(o.buckets[0], 7, "窗口内推进不该清掉仍在窗内的桶");
+        assert_eq!(o.buckets[5], 0);
+
+        // 跨越整窗：全清。
+        o.advance(5 + OBSERVED_WINDOW_SECS as u64 + 10);
+        assert!(
+            o.buckets.iter().all(|&b| b == 0),
+            "跨度 ≥ 一窗必须整体清零"
+        );
+    }
+
+    /// ⭐ 回归：`inbound_rpm_min > inbound_rpm_max` 不得 panic。
+    ///
+    /// `u32::clamp` 的契约是 `min <= max`，否则 **panic**。而 admin 配置 API 把
+    /// `inboundRpmMin` / `inboundRpmMax` **各自独立**clamp 到 [1,100_000]，彼此不可见
+    /// ⇒ 面板上把 min 填得比 max 大（或手改 config.json）即可让进程 panic。
+    ///
+    /// 两条路径都要覆盖：`new()` 是启动时 panic（服务起不来），`update()` 是**热更时**
+    /// panic（面板保存一次配置就打死正在服务的进程，后果更糟）。
+    ///
+    /// 把 `.max(lo)` 去掉 → 本测试必 panic ⇒ FAILED。
+    #[test]
+    fn min_greater_than_max_must_not_panic() {
+        // 启动路径
+        let t = GlobalThrottle::new(true, true, 100, 500, 300, 2, 30, false);
+        assert!(
+            t.current_target_rpm() >= 500,
+            "min=500 时 target 不得低于下限，实际 {}",
+            t.current_target_rpm()
+        );
+        // 承重：存下来的上下限必须自洽，否则 maybe_step_up 读 rpm_max 当上限会与
+        // rpm_min 互相矛盾（一个要求 ≥500、一个要求 ≤300）。
+        assert!(
+            t.rpm_max.load(Ordering::Relaxed) >= t.rpm_min.load(Ordering::Relaxed),
+            "存储的 rpm_max({}) 不得小于 rpm_min({})",
+            t.rpm_max.load(Ordering::Relaxed),
+            t.rpm_min.load(Ordering::Relaxed)
+        );
+        // 热更路径（同一个进程内改配置）
+        let t2 = mk(true, true, 100);
+        t2.update(true, true, 100, 900, 400, 2, 30, false);
+        assert!(
+            t2.rpm_max.load(Ordering::Relaxed) >= t2.rpm_min.load(Ordering::Relaxed),
+            "热更后存储的上下限同样必须自洽"
+        );
+    }
+
     #[tokio::test]
     async fn test_queue_timeout_passthrough_admits_not_reject() {
         // 单号/高RPM不流通根治:passthrough=true 时排队超时应**放行**(Ok)而非拒绝(Err)。
@@ -345,7 +662,10 @@ mod tests {
         let t = GlobalThrottle::new(true, false, 1, 1, 300, 1, 1, true);
         while t.try_take() {} // 抽干初始桶
         // passthrough=true:超时放行,返回 Ok。
-        assert!(t.acquire().await.is_ok(), "passthrough 开:排队超时应放行(Ok)不拒绝");
+        assert!(
+            t.acquire().await.is_ok(),
+            "passthrough 开:排队超时应放行(Ok)不拒绝"
+        );
     }
 
     #[tokio::test]
@@ -353,7 +673,10 @@ mod tests {
         // passthrough=false 时保持旧行为:排队超时返回 Err(retry 秒数)。
         let t = GlobalThrottle::new(true, false, 1, 1, 300, 1, 1, false);
         while t.try_take() {} // 抽干初始桶
-        assert!(t.acquire().await.is_err(), "passthrough 关:排队超时应返回 Err(拒绝)");
+        assert!(
+            t.acquire().await.is_err(),
+            "passthrough 关:排队超时应返回 Err(拒绝)"
+        );
     }
 
     #[tokio::test]
@@ -536,6 +859,144 @@ mod tests {
         assert_eq!(t.current_target_rpm(), 200, "手动挡不受 429 影响");
     }
 
+    /// 🔴 启动 slow-start：进程刚起来时有效 RPM 必须被折算，窗口后必须完全恢复。
+    ///
+    /// 依据：上游惩罚速率跃升（≥5x = 48.3% 429 / 平稳 = 0.7%），而 `RpmTracker`
+    /// 是纯内存的 ⇒ 每次重启爬坡历史清零 ⇒ 选号层的爬坡限制在重启后第一分钟
+    /// 完全不设防。线上 20:00 起 23 次重启，每次都造一次满量 burst。
+    ///
+    /// 回退即 FAIL：把 `try_take` 里的 `boot_ramp_rpm(b.target_rpm)` 改回
+    /// `b.target_rpm` → 本条第一个断言失败。
+    #[test]
+    fn test_boot_slow_start_scales_then_fully_recovers() {
+        let t = mk(true, false, 400);
+        let at_boot = t.boot_ramp_rpm(400);
+        assert!(
+            at_boot < 400,
+            "启动瞬间有效 RPM 必须被折算（否则重启后第一分钟是满量 burst）；实得 {at_boot}"
+        );
+        assert_eq!(
+            at_boot,
+            400 * BOOT_START_PCT / 100,
+            "启动瞬间应恰为 BOOT_START_PCT%"
+        );
+        // 折算后绝不为 0：补充速率为 0 会让排队者只能靠 passthrough 超时放行，
+        // 等于白等满 queue_max_wait。
+        assert!(
+            t.boot_ramp_rpm(1) >= 1,
+            "折算下限必须 >=1，否则令牌桶永不补充"
+        );
+        assert!(t.boot_ramp_rpm(3) >= 1);
+    }
+
+    /// 与上一条配对：窗口**结束后**必须逐字节等于入参（零残留影响）。
+    ///
+    /// 只有上一条时，把折算写成永久生效（忘记 elapsed 判断）也能通过 ——
+    /// 那会让整形永久跑在 25%，把吞吐掐掉四分之三。
+    #[test]
+    fn test_boot_ramp_is_identity_after_window() {
+        let t = mk(true, false, 400);
+        let mut t2 = mk(true, false, 400);
+        // start 是同模块私有字段，测试可直接改，用它模拟"窗口已过"。
+        t2.start = Instant::now() - Duration::from_secs(BOOT_SLOW_START_SECS + 1);
+        for rpm in [1u32, 20, 60, 300, 400, 1200] {
+            assert_eq!(
+                t2.boot_ramp_rpm(rpm),
+                rpm,
+                "窗口结束后必须恒等于入参（否则整形永久跑在 {BOOT_START_PCT}%，吞吐被掐掉大半）"
+            );
+        }
+        t2.start = Instant::now() - Duration::from_secs(BOOT_SLOW_START_SECS);
+        assert_eq!(t2.boot_ramp_rpm(400), 400, "elapsed == 窗口长度应已恢复");
+        assert!(t.boot_ramp_rpm(400) < 400, "对照：未过窗口的仍在折算");
+    }
+
+    /// 爬坡必须**单调不减**：窗口内回落会自己造出一次「低 → 高」跃升，
+    /// 那正是本机制要消除的形态（自造 burst）。
+    #[test]
+    fn test_boot_ramp_is_monotonic_across_window() {
+        let mut t = mk(true, false, 400);
+        let mut last = 0u32;
+        for sec in 0..=BOOT_SLOW_START_SECS {
+            t.start = Instant::now() - Duration::from_secs(sec);
+            let v = t.boot_ramp_rpm(400);
+            assert!(
+                v >= last,
+                "第 {sec}s 的有效 RPM {v} 小于前一秒的 {last} —— 窗口内回落会自造一次跃升"
+            );
+            assert!(v <= 400, "折算值不得超过 target_rpm");
+            last = v;
+        }
+        assert_eq!(last, 400, "窗口末尾必须已经升到满量");
+    }
+
+    /// `try_take` 必须**真的**用折算后的 RPM 补充令牌（而非只有 `boot_ramp_rpm` 存在）。
+    ///
+    /// # 为什么需要单独一条
+    ///
+    /// 前面几条都直接调 `boot_ramp_rpm`，所以把 `try_take` 里那行改回
+    /// `b.target_rpm` 它们**照样绿** —— 函数存在但没接线，等于没实现。
+    /// （我第一版就是这样，回退验证时发现的。）
+    ///
+    /// 判据：把 `start` 推到窗口正中（≈50% 折算），耗干桶后让它补充一整个窗口的量，
+    /// 观察补到的令牌数落在「折算后容量」而不是「满量容量」。
+    #[test]
+    fn test_try_take_actually_applies_boot_ramp() {
+        // ⚠️ 必须用**实际生效**的 target 算期望值：`mk` 传的 rpm 会被 clamp 到
+        // rpm_max(300)，我第一版拿传入的 1200 去算 full_cap，于是两种实现都远小于它、
+        // 断言恒真（回退验证时才发现）。这里直接用 GlobalThrottle::new 显式放开上限。
+        let mut t = GlobalThrottle::new(true, false, 1200, 20, 1200, 2, 30, false);
+        let target = t.current_target_rpm();
+        assert_eq!(target, 1200, "前提：target 未被 clamp，否则期望值算错");
+        // 窗口正中：pct = 25 + 75*30/60 ≈ 62%。
+        t.start = Instant::now() - Duration::from_secs(BOOT_SLOW_START_SECS / 2);
+        // 先耗干初始桶。
+        while t.try_take() {}
+        // 让时间过去足够久以补满桶：直接把 last_refill 推回去（同模块可访问）。
+        {
+            let mut b = t.bucket.lock();
+            b.last_refill_nanos = 0;
+        }
+        // 此刻 now_nanos ≈ 30s，补充按折算后速率算，且被折算后容量夹住。
+        let mut got = 0;
+        while t.try_take() {
+            got += 1;
+            if got > 200 {
+                break;
+            }
+        }
+        // 满量容量 = target/60*burst = 1200/60*2 = 40 令牌；折算 62% ≈ 24。
+        let full_cap = target / 60 * 2;
+        assert!(
+            got < full_cap,
+            "try_take 必须按折算后 RPM 算容量：实得 {got} 已达满量容量 {full_cap}，\
+             说明 boot_ramp_rpm 没有被接进 try_take（函数存在但没生效）"
+        );
+        assert!(got >= 1, "折算后仍应能放行若干令牌，实得 {got}");
+    }
+
+    /// 初始桶也必须按 `BOOT_START_PCT` 折算 —— 否则启动瞬间的突发绕过 slow-start。
+    ///
+    /// 回退即 FAIL：把构造函数里的初始 `tokens_milli` 改回未折算版本 → 本条失败。
+    #[test]
+    fn test_initial_bucket_respects_boot_start_pct() {
+        // 400 RPM / burst 2s：未折算桶 ≈ 400/60*2 = 13 令牌；折算 25% ≈ 3 令牌。
+        let t = mk(true, false, 400);
+        let mut immediate = 0;
+        while t.try_take() {
+            immediate += 1;
+            if immediate > 50 {
+                break; // 防御：不该到这里
+            }
+        }
+        assert!(
+            immediate <= 5,
+            "启动瞬间可取令牌数应≈折算后桶容量(25% ⇒ ~3)，实得 {immediate}\
+             （未折算会是 ~13，等于 slow-start 被初始桶绕过）"
+        );
+        assert!(immediate >= 1, "至少要能立即放行一个，否则首个请求白排队");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn test_concurrent_no_overadmit() {
         // review 修复验证:高并发下令牌桶不超发。60 RPM + burst 2s → 桶容量 = 60/60*2 = 2 令牌。
@@ -553,7 +1014,10 @@ mod tests {
                 ok += 1;
             }
         }
-        assert!(ok <= 4, "瞬时并发只应放行≈桶容量个令牌,实得 {ok}(超发=丢更新bug复现)");
+        assert!(
+            ok <= 4,
+            "瞬时并发只应放行≈桶容量个令牌,实得 {ok}(超发=丢更新bug复现)"
+        );
         assert!(ok >= 1, "至少应放行初始桶里的令牌");
     }
 
@@ -581,6 +1045,10 @@ mod tests {
         assert_eq!(t.current_target_rpm(), 50, "自动挡保存无关配置不应打回初值");
         // 若新下限抬高到 80,则学到的 50 被 clamp 到 80。
         t.update(true, true, 200, 80, 300, 2, 30, false);
-        assert_eq!(t.current_target_rpm(), 80, "学到值低于新下限时 clamp 到下限");
+        assert_eq!(
+            t.current_target_rpm(),
+            80,
+            "学到值低于新下限时 clamp 到下限"
+        );
     }
 }

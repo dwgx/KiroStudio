@@ -358,6 +358,27 @@ async fn main() {
         }
     }
 
+    // CLI body 对齐 kiro-rs 的开关（默认关）。开着时启动期就说清楚"影响几个号"——
+    // 这是个拿线上流量换数据的 A/B，事后看日志必须能确定当时是开还是关、覆盖面多大。
+    // 不设运行时原子镜像：`CliEndpoint::transform_api_body` 从 `ctx.config` 读，而那份
+    // Config 是 provider 每次调用时从 ArcSwap `load_full()` 取的新快照 ⇒ 改配置后下一个
+    // 请求即生效，加镜像只会多一份要同步的真值（详见该字段的文档注释）。
+    if config.cli_origin_kiro_cli {
+        let cli_count = credentials_list
+            .iter()
+            .filter(|c| {
+                c.effective_endpoint(&config.default_endpoint)
+                    == kiro::endpoint::cli::CLI_ENDPOINT_NAME
+            })
+            .count();
+        tracing::warn!(
+            "cliOriginKiroCli 已开启：{} 个 CLI(ksk_) 号的请求体将按真实 Kiro CLI 形状发送\
+             （origin=KIRO_CLI + 去 agentContinuationId + 去 history.modelId）。\
+             这是未经线上长期验证的上游协议形状，出现异常先关掉此项。IDE 号不受影响",
+            cli_count
+        );
+    }
+
     let endpoint_names: Vec<String> = endpoints.keys().cloned().collect();
 
     // 托盘「重启服务」复用启动时的 config/credentials 路径拉起新进程（Windows）。
@@ -387,6 +408,49 @@ async fn main() {
     // TIER2 热重载：spawn 交由 token_manager 的受管任务槽（respawn_refresh_task），
     // 启动即受管，admin 改 proactive/lead/interval 后 abort+respawn 即时生效不重启。
     token_manager.respawn_refresh_task();
+
+    // 存量号 region 回填（后台、串行、绝不阻塞启动）。
+    //
+    // `add_credential` 里的探测只覆盖**新**号，救不了已经在池里的。而线上真实状态是
+    // 池里的 `ksk_` 号没有 region 字段、靠回退 `config.region` **恰好**对 ——
+    // 谁改一次全局 region，这些号当场 100% 403，然后被误判成「凭据坏了」。
+    //
+    // 三条设计约束：
+    // ① `spawn` 后台跑 —— 探测是真实上游往返，绝不能进启动关键路径（服务要立刻能收流量）。
+    // ② **串行 + 间隔** —— 并发探 N 个号 = 同出口 IP 短时间打一批 management 端点，
+    //    那是风控要抓的突发特征。补号场景下这个循环可能有十几个号。
+    // ③ 只探「api_key 且完全没有任何 region 字段」的 —— 判据在 probe_api_region 内，
+    //    带 region 的是运维/推号方的明确意图，绝不覆盖。
+    {
+        let region_mgr = token_manager.clone();
+        tokio::spawn(async move {
+            // 先让启动流程与首批请求跑起来，避免和 token 预刷新抢同一批上游往返。
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            let ids = region_mgr.ids_needing_region_probe();
+            if ids.is_empty() {
+                return;
+            }
+            tracing::info!(
+                "存量 region 回填：{} 个 api_key 号无 region 字段，后台逐个探测（串行，每个间隔 3s）",
+                ids.len()
+            );
+            for id in ids {
+                // ⚠️ 启动回填**刻意忽略判决**，绝不据此禁用 —— 与上号路径相反。
+                //
+                // 这里面对的是**已在服役**的存量号：它们没有 region 字段，但正靠
+                // `config.region` 回退恰好打对（线上实测就有这种号在 90%+ 成功率地出活）。
+                // 探测在这种号上返 `NoUsableRegion` 完全可能只是探测那一刻上游抖动，
+                // 而据此禁用会把一个正在成功出活的号打掉 —— 那比不回填糟得多。
+                //
+                // 上号路径必须禁用是因为那里的号**尚未接过任何流量**，禁用的代价只是
+                // 「多一次人工确认」；这里的代价是「打断正在服务的号」。同一个判决，
+                // 两条路径的正确处置相反，故判决权归调用方（见
+                // `probe_and_persist_api_region` 的返回值注释）。
+                let _ = region_mgr.probe_and_persist_api_region(id).await;
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+        });
+    }
 
     // 会话亲和性定时清理：affinity map 的 key 是客户端可控的 session id，
     // 仅靠 get() 惰性删除无法回收「不再出现的 session」，长跑会内存泄漏。
@@ -513,8 +577,8 @@ async fn main() {
             let mut admin_state = admin::AdminState::new(admin_key, admin_service);
             // 注入用量查询句柄（未启用统计时为 None，端点返回 503）
             if let Some(handles) = &usage_handles {
-                admin_state = admin_state
-                    .with_usage(handles.stats.clone(), handles.trace_db.clone());
+                admin_state =
+                    admin_state.with_usage(handles.stats.clone(), handles.trace_db.clone());
             }
 
             // A6：温和的周期性余额刷新（严格受控）。
@@ -664,13 +728,42 @@ async fn main() {
     }
     // into_make_service_with_connect_info 让中间件可通过 ConnectInfo 拿到对端 IP
     // with_graceful_shutdown：收到 SIGTERM/Ctrl-C 后停止接新连接，等在途请求（含 SSE 流）drain
-    axum::serve(
+    //
+    // ⭐ drain 上限必须在**这里**用 select! 竞速，不能只靠 shutdown future 里 sleep：
+    // `with_graceful_shutdown` 的语义是「此 future 完成 ⇒ 停止接新连接」，之后
+    // `serve().await` 仍会**无上限**等在途请求。于是把 sleep 放在 shutdown future 里
+    // 两个承诺一个都不成立 ——
+    //   · 在途请求早已 drain 完也白等满 SHUTDOWN_DRAIN_CAP_SECS（部署窗口凭空变长）；
+    //   · 真有长流式 SSE 时也**不会**按注释承诺断开（那才是 74s 停服 / 167 次 502 的成因）。
+    // 竞速取先到者：drain 完就立刻走；到上限则 drop 掉 serve future ⇒ 监听套接字与
+    // 连接任务一并释放 ⇒ 残余连接真的被断开（客户端看到流中断，可重试，好过 502 全量失败）。
+    let drain_deadline = std::sync::Arc::new(tokio::sync::Notify::new());
+    let serve_fut = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_with_drain_cap())
+    .with_graceful_shutdown(shutdown_with_drain_cap(
+        token_manager.clone(),
+        drain_deadline.clone(),
+    ));
+    match race_serve_against_drain_cap(
+        serve_fut,
+        drain_deadline,
+        std::time::Duration::from_secs(SHUTDOWN_DRAIN_CAP_SECS),
+    )
     .await
-    .unwrap();
+    {
+        DrainOutcome::Drained(r) => {
+            r.unwrap();
+            tracing::info!("在途请求已全部 drain 完毕");
+        }
+        DrainOutcome::CapReached => {
+            tracing::warn!(
+                cap_secs = SHUTDOWN_DRAIN_CAP_SECS,
+                "drain 宽限期到上限，断开残余连接以尽快让位给新进程"
+            );
+        }
+    }
 
     tracing::info!("服务已优雅停机");
     // 托盘「退出」触发的停机：以退出码 3 退出,让 start.bat/run.bat 监督循环识别为「用户主动退出」
@@ -699,23 +792,86 @@ async fn main() {
 /// 实测非流式与短流式请求 p50 约 2.6s、p90 约 3.4s，8s 覆盖到 p99 量级；
 /// 而真正的长响应本来就会被客户端重试（Claude Code 有自身退避重试）。
 ///
-/// 超时后直接返回让进程退出：未 drain 完的连接被断开，客户端看到流中断而非 502
-/// —— 前者可重试，后者在部署窗口里是全量失败。这个交换明显更好。
+/// 上限到点后 drop 掉 serve future 让进程退出：未 drain 完的连接被断开，客户端看到
+/// 流中断而非 502 —— 前者可重试，后者在部署窗口里是全量失败。这个交换明显更好。
+///
+/// ⚠️ 竞速在 `main` 的 `select!` 里，**不在** [`shutdown_with_drain_cap`] 内部。
+/// 后者只是 `with_graceful_shutdown` 的触发器，它返回只意味着"停止接新连接"，
+/// `serve().await` 之后仍无上限地等 —— 把 sleep 放在它里面两个承诺都不成立。
 const SHUTDOWN_DRAIN_CAP_SECS: u64 = 8;
+
+/// [`race_serve_against_drain_cap`] 的结果：drain 自然完成，还是撞上宽限期上限。
+enum DrainOutcome {
+    /// `serve()` 先返回 —— 在途请求全部 drain 完（携带它的返回值）。
+    Drained(std::io::Result<()>),
+    /// 宽限期到点 —— serve future 被 drop，残余连接断开。
+    CapReached,
+}
+
+/// 让 `serve()` 与「停机信号后的宽限期」竞速，取先到者。
+///
+/// 抽成独立函数**只为可测**：竞速逻辑原先内联在 `main` 里，而 `main` 需要真实
+/// listener + 真实信号，任何测试都到不了 —— 于是 #22 那种「注释承诺的行为代码里
+/// 不存在」的缺陷可以长期无人发现。这里泛化掉 serve future 后，测试能用假 future
+/// 覆盖三条路径（提前 drain / 撞上限 / **无信号时永不超时**）。
+///
+/// 第三条是承重的：宽限期必须从**信号到达**起算，不是从进程启动起算。
+/// 若实现成后者，服务会在启动 [`SHUTDOWN_DRAIN_CAP_SECS`] 秒后自己退出。
+/// `cap` 由调用方传入（生产是 [`SHUTDOWN_DRAIN_CAP_SECS`]）：测试传毫秒级值即可用
+/// 真实时钟跑完，不必引入 tokio 的 `test-util` feature（它不在 `full` 里，
+/// 为一个测试新增 dev-dependency 不值得）。
+///
+/// 泛型是 `IntoFuture` 而非 `Future`：axum 的 `WithGracefulShutdown` 只实现前者。
+async fn race_serve_against_drain_cap<F>(
+    serve_fut: F,
+    drain_deadline: Arc<tokio::sync::Notify>,
+    cap: std::time::Duration,
+) -> DrainOutcome
+where
+    F: std::future::IntoFuture<Output = std::io::Result<()>>,
+{
+    tokio::select! {
+        r = serve_fut.into_future() => DrainOutcome::Drained(r),
+        _ = async {
+            // 先等停机信号到达（由 shutdown future 通知），再从那一刻起算宽限期。
+            drain_deadline.notified().await;
+            tokio::time::sleep(cap).await;
+        } => DrainOutcome::CapReached,
+    }
+}
 
 /// 停机信号 + drain 上限：收到信号后最多再等 [`SHUTDOWN_DRAIN_CAP_SECS`]。
 ///
 /// axum 的 `with_graceful_shutdown` 语义是"此 future 完成即停止接新连接、
 /// 然后等在途完成"。所以上限要加在**信号之后**：先等信号，再给一个封顶的宽限期，
 /// 宽限期一到就让 future 返回，axum 随即结束。
-async fn shutdown_with_drain_cap() {
+async fn shutdown_with_drain_cap(
+    token_manager: Arc<crate::kiro::token_manager::MultiTokenManager>,
+    drain_deadline: Arc<tokio::sync::Notify>,
+) {
     shutdown_signal().await;
+    // ⭐ 收到信号后**立刻**强制落盘统计，不等 drain 结束。
+    //
+    // 必须在 sleep **之前**：线上 `TimeoutStopSec=10`，而 `serve().await` 在长流式 SSE
+    // 上会超过它 ⇒ 今天 41 次 SIGTERM 里 39 次走到 SIGKILL ⇒ 放在 sleep 之后的收尾
+    // 代码有很大概率压根不执行。放在信号后第一行则只要进程还活着就一定跑到。
+    //
+    // 为什么这件事重要（不是"统计好看"）：`has_ever_succeeded()` 读的是从 stats 恢复的
+    // `success_count`，它是 provider 判「bearer-invalid 403 = 瞬态抖动 or 真 region 错配」
+    // 的唯一判据。debounce 窗口内的成功增量被硬杀丢掉 ⇒ 重启后新号变成"从未成功过"
+    // ⇒ 瞬态 403 三次即禁用。实测 20:20:30 启动、20:20:32 就把健康号 #483 打死。
+    token_manager.flush_stats_now();
     tracing::info!(
-        "收到停机信号，开始 drain（最多 {}s，超时则断开残余连接以尽快让位给新进程）",
+        "收到停机信号，已强制落盘凭据统计，开始 drain（最多 {}s，超时则断开残余连接以尽快让位给新进程）",
         SHUTDOWN_DRAIN_CAP_SECS
     );
-    tokio::time::sleep(std::time::Duration::from_secs(SHUTDOWN_DRAIN_CAP_SECS)).await;
-    tracing::info!("drain 宽限期结束，进入停机");
+    // 通知 main 的竞速分支从**此刻**开始算宽限期，然后立即返回 ——
+    // 返回即触发 axum「停止接新连接、等在途 drain」。
+    //
+    // ⚠️ 这里**不能**再 sleep：本 future 完成是 axum 开始 drain 的信号，在这里睡
+    // 只是延后 drain 开始的时刻（那段时间还在接新连接），而 `serve().await` 之后
+    // 依旧无上限。上限只能在外层 select! 里对 `serve()` 本身竞速。
+    drain_deadline.notify_one();
 }
 
 /// 等待停机信号：Ctrl-C（全平台）或 SIGTERM（Unix，容器编排 docker stop / k8s 用）。
@@ -814,7 +970,8 @@ fn bind_listener(addr: &str) -> anyhow::Result<tokio::net::TcpListener> {
 }
 
 /// 是否由托盘「退出」触发的停机（决定 main 的退出码：3=用户主动退出，监督脚本不重拉）。
-static TRAY_QUIT_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TRAY_QUIT_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// 装配用量统计管道：打开 SQLite、构造 JSONL 统计、冷启动重放、启动保留清理任务。
 ///
@@ -892,8 +1049,82 @@ fn init_usage_pipeline(config: &Config) -> Option<UsageHandles> {
         data_dir.display(),
         retention_days
     );
-    Some(UsageHandles {
-        stats,
-        trace_db,
-    })
+    Some(UsageHandles { stats, trace_db })
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// 测试用宽限期：毫秒级，走真实时钟（避免为一个测试引入 tokio `test-util` feature）。
+    const TEST_CAP: Duration = Duration::from_millis(120);
+
+    /// ⭐ 回归（#22）：在途请求 drain 完毕后必须**立刻**返回，不得白等满宽限期。
+    ///
+    /// 旧实现把 `sleep(SHUTDOWN_DRAIN_CAP_SECS)` 放在 shutdown future 里，而
+    /// `with_graceful_shutdown` 的语义是「该 future 完成 ⇒ 停止接新连接」——
+    /// 之后 `serve().await` 仍**无上限**地等。于是注释承诺的两件事一件都不成立，
+    /// 其中一条就是：在途请求早已 drain 完也白等满 8 秒（部署窗口凭空变长）。
+    ///
+    /// 把竞速换回「先睡满 cap 再返回」→ 本测试必 FAILED。
+    #[tokio::test]
+    async fn drained_early_returns_immediately() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        notify.notify_one(); // 信号已到（模拟 SIGTERM），宽限期开始计时
+        let began = std::time::Instant::now();
+        let serve = async { Ok(()) }; // serve 立刻返回：在途请求已 drain 完
+        let out = race_serve_against_drain_cap(serve, notify, TEST_CAP).await;
+        assert!(
+            matches!(out, DrainOutcome::Drained(Ok(()))),
+            "应判为自然 drain 完成"
+        );
+        assert!(
+            began.elapsed() < TEST_CAP,
+            "drain 完成后必须立刻返回，实际等了 {:?}（>= 宽限期 {:?} 即回归）",
+            began.elapsed(),
+            TEST_CAP
+        );
+    }
+
+    /// ⭐ 回归（#22）：长流式 SSE 挂住时必须在宽限期到点后**真的**放弃等待。
+    ///
+    /// 这是线上 74 秒停服 / 单次部署 167 次 502 的成因：`serve().await` 无上限，
+    /// systemd 只能等到 TimeoutStopSec 超时再 SIGKILL。
+    #[tokio::test]
+    async fn cap_reached_when_serve_hangs() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        notify.notify_one();
+        // serve 永挂（模拟长流式 SSE 不结束）
+        let serve = async {
+            std::future::pending::<()>().await;
+            Ok(())
+        };
+        let out = race_serve_against_drain_cap(serve, notify, TEST_CAP).await;
+        assert!(
+            matches!(out, DrainOutcome::CapReached),
+            "serve 挂住时必须在宽限期到点后放弃等待并断开残余连接"
+        );
+    }
+
+    /// ⭐ 承重回归（#22）：**没有**停机信号时宽限期不得起算。
+    ///
+    /// 若把竞速分支里的 `notified().await` 去掉（直接 sleep 上限），服务会在启动
+    /// `SHUTDOWN_DRAIN_CAP_SECS` 秒后**自己退出** —— 比原缺陷严重得多。
+    /// 去掉那个 await → 本测试必 FAILED。
+    #[tokio::test]
+    async fn cap_does_not_start_without_shutdown_signal() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        // 刻意**不** notify：模拟进程正常服务、无人发信号
+        let serve = async {
+            // 远超宽限期后才返回，模拟"跑了一段时间的正常服务"
+            tokio::time::sleep(TEST_CAP * 3).await;
+            Ok(())
+        };
+        let out = race_serve_against_drain_cap(serve, notify, TEST_CAP).await;
+        assert!(
+            matches!(out, DrainOutcome::Drained(Ok(()))),
+            "无停机信号时宽限期不得起算，否则服务会在启动 {SHUTDOWN_DRAIN_CAP_SECS}s 后自杀"
+        );
+    }
 }

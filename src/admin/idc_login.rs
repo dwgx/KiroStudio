@@ -182,6 +182,10 @@ impl IdcLoginManager {
                     machine_id: None,
                     email: None,
                     name: None,
+                    // IDC 上号是单开路径：分身身份由 service.rs 的多开循环赋予。
+                    clone_group: None,
+                    clone_seq: None,
+                    tag: None,
                     subscription_title: None,
                     // 上号时显式填的代理持久化到该凭据（拆好账密），global 回落不持久化。
                     proxy_url: session.custom_proxy.as_ref().map(|p| p.url.clone()),
@@ -192,6 +196,8 @@ impl IdcLoginManager {
                     disabled_at: None,
                     kiro_api_key: None,
                     endpoint: None,
+                    // IdC 上号产出的是 Kiro 号，非 CLI(ksk_)号，该开关对它无意义 → 跟随全局。
+                    cli_origin_kiro_cli: None,
                 };
 
                 let credential_id = match self.token_manager.add_credential(new_cred).await {

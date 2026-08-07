@@ -1,6 +1,5 @@
 import { useState, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
-import i18n from '@/i18n'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { Settings, RefreshCw, Wallet, Trash2, Loader2, ClipboardCopy, ShieldAlert, Gauge, Check, Ban, Power } from 'lucide-react'
@@ -13,6 +12,7 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { Skeleton } from '@/components/ui/skeleton'
 import { NumberStepper } from '@/components/ui/number-stepper'
 import { RegionSwitcher } from '@/components/region-switcher'
+import { RegionSelect } from '@/components/ui/region-select'
 import { ProxyTestButton } from '@/components/proxy-test-button'
 import {
   Dialog,
@@ -24,7 +24,15 @@ import {
 } from '@/components/ui/dialog'
 import type { CredentialStatusItem, BalanceResponse, OnboardingDiagnosis } from '@/types/api'
 import { cn, copyToClipboard, extractErrorMessage, extractDiagnosis } from '@/lib/utils'
+import {
+  formatCredits,
+  formatLastUsed,
+  formatCachedAt,
+  maskProxyUrl,
+  formatAmount,
+} from '@/lib/credential-format'
 import { DiagnosisCard } from '@/components/diagnosis-card'
+import { CredentialRowBody } from '@/components/credential-row'
 import { enableOverage, disableOverage, setCredentialName, setCredentialProxy } from '@/api/credentials'
 import { authShortLabel, disabledReasonLabel, subscriptionLabel } from '@/lib/i18n-labels'
 import {
@@ -33,6 +41,7 @@ import {
   useSetRpmLimit,
   useSetCustomApiConfig,
   useSetCredentialEndpoint,
+  useSetCredentialApiRegion,
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
@@ -50,65 +59,49 @@ interface CredentialCardProps {
   /** 按需（hover/“查询信息”）拉取的余额；若存在则优先于自动缓存快照展示。可为 null。 */
   balance: BalanceResponse | null
   loadingBalance: boolean
-}
-
-/** 累计花费展示：0 显示 0，小数保留两位，过千用 k 简写，避免长号占满卡片。 */
-function formatCredits(v: number | undefined | null): string {
-  const n = typeof v === 'number' && isFinite(v) ? v : 0
-  if (n === 0) return '0'
-  if (n >= 10000) return `${(n / 1000).toFixed(1)}k`
-  return n.toFixed(2)
-}
-
-// 每次渲染调用：i18n 单例取当前语言。
-function formatLastUsed(lastUsedAt: string | null): string {
-  if (!lastUsedAt) return i18n.t('credentialcard.lastUsed.never')
-  const date = new Date(lastUsedAt)
-  const now = new Date()
-  const diff = now.getTime() - date.getTime()
-  if (diff < 0) return i18n.t('credentialcard.lastUsed.justNow')
-  const seconds = Math.floor(diff / 1000)
-  if (seconds < 60) return i18n.t('credentialcard.lastUsed.secondsAgo', { n: seconds })
-  const minutes = Math.floor(seconds / 60)
-  if (minutes < 60) return i18n.t('credentialcard.lastUsed.minutesAgo', { n: minutes })
-  const hours = Math.floor(minutes / 60)
-  if (hours < 24) return i18n.t('credentialcard.lastUsed.hoursAgo', { n: hours })
-  const days = Math.floor(hours / 24)
-  return i18n.t('credentialcard.lastUsed.daysAgo', { n: days })
-}
-
-// 缓存新鲜度：把 cachedAt（Unix 秒）转成“截至 X 分钟前”，不抹掉数字，只标注时效。
-function formatCachedAt(cachedAt: number): string {
-  const diffMs = Date.now() - cachedAt * 1000
-  if (diffMs < 0) return i18n.t('credentialcard.lastUsed.justNow')
-  const minutes = Math.floor(diffMs / 60000)
-  if (minutes < 1) return i18n.t('credentialcard.lastUsed.justNow')
-  if (minutes < 60) return i18n.t('credentialcard.lastUsed.minutesAgo', { n: minutes })
-  const hours = Math.floor(minutes / 60)
-  if (hours < 24) return i18n.t('credentialcard.lastUsed.hoursAgo', { n: hours })
-  const days = Math.floor(hours / 24)
-  return i18n.t('credentialcard.lastUsed.daysAgo', { n: days })
-}
-
-// 代理 URL 脱敏：隐藏 user:pass@ 凭据段，仅保留协议 + 主机:端口。
-// socks5://user:pass@1.2.3.4:1080 -> socks5://…@1.2.3.4:1080
-function maskProxyUrl(url: string): string {
-  try {
-    const u = new URL(url)
-    const host = u.host || u.hostname
-    if (u.username || u.password) {
-      return `${u.protocol}//…@${host}`
-    }
-    return `${u.protocol}//${host}`
-  } catch {
-    // 非标准 URL：正则兜底去掉 //cred@ 段
-    return url.replace(/\/\/[^@/]*@/, '//…@')
+  /**
+   * 视图形态。缺省 / `'card'` = 原卡片，**行为逐字不变**（全部旧调用点无需改）。
+   * `'row'` 时只把 `<Card>` 主体换成 `<CredentialRowBody>`，
+   * 三个弹框（设置 / 删除确认 / 超额确认）与全部 handler **原地复用**，不重造。
+   */
+  view?: 'card' | 'row'
+  /** 行视图专用：多选 >1 时右键菜单变批量操作。卡片视图忽略。 */
+  rowBatch?: {
+    count: number
+    onBatchDisable: () => void
+    onBatchDelete: () => void
   }
 }
 
-// 金额数字格式化：整数时不带小数（6484），有小数时保留一位（87.5）。
-function formatAmount(n: number): string {
-  return Number.isInteger(n) ? String(n) : n.toFixed(1)
+// 五个展示格式化函数已提取到 `@/lib/credential-format`（卡片视图 / 行视图共用，
+// 避免同一个数字在两个视图里显示不同）。行为逐字不变。
+
+/**
+ * region 快捷键：**实测真实命中集**，不是"常用区"。
+ *
+ * 依据：同一把 `ksk_` 在 eu-central-1 有 98.9% 成功率、在 us-east-1 是 100% 403
+ * —— 即真正需要一键切换的只有这两个方向。其余区放搜索选择器里（AWS_REGIONS 20+ 个），
+ * 全铺成按钮会把这两个真正有用的埋掉。
+ */
+const REGION_QUICK_PICKS = ['us-east-1', 'eu-central-1'] as const
+
+/** 端点 → 实际 host（tooltip 展示"打哪个域名"）。与后端 host 构建保持一致：
+ * cli=q.* / cli-runtime=runtime.*（两者都是 CLI 协议，host 不同 = 上游独立限流桶）、
+ * ide=runtime.* 路径寻址。后端新增端点时需同步补充。
+ * 空 region 回退 `us-east-1`：与后端 `effective_upstream_region` 的最终回退一致，
+ * 避免 tooltip 显示 `q..amazonaws.com` 这类坏 host。 */
+function endpointHost(name: string, region: string): string {
+  const r = region || 'us-east-1'
+  switch (name) {
+    case 'cli':
+      return `q.${r}.amazonaws.com`
+    case 'cli-runtime':
+      return `runtime.${r}.kiro.dev`
+    case 'ide':
+      return `runtime.${r}.kiro.dev/generateAssistantResponse`
+    default:
+      return name
+  }
 }
 
 export function CredentialCard({
@@ -118,6 +111,8 @@ export function CredentialCard({
   onToggleSelect,
   balance,
   loadingBalance,
+  view = 'card',
+  rowBatch,
 }: CredentialCardProps) {
   const { t } = useTranslation()
   const [showSettings, setShowSettings] = useState(false)
@@ -156,6 +151,7 @@ export function CredentialCard({
   const setRpmLimit = useSetRpmLimit()
   const setCustomApiConfig = useSetCustomApiConfig()
   const setEndpoint = useSetCredentialEndpoint()
+  const setApiRegion = useSetCredentialApiRegion()
   // 可选端点由后端注册表给出（config.endpointNames），不在前端硬编码 ide/cli——
   // 后端加了新端点，面板自动多一个按钮。
   const configSnapshot = useConfigSnapshot()
@@ -267,6 +263,8 @@ export function CredentialCard({
   // 自定义 API 代挂号:不是 Kiro 号,订阅/余额/profileArn/刷新Token 全无意义,卡片显示专属信息。
   // 判据与后端 is_custom_api_credential + StatusBars 对齐(authMethod 优先,baseUrl 兜底旧数据)。
   const isCustomApi = credential.authMethod === 'custom_api' || !!credential.baseUrl
+  // ksk_ API Key 号：自动端点 = q.*(cli) 优先、runtime.*(cli-runtime) 回退（两个独立限流桶）。
+  const isApiKeyCred = credential.authMethod === 'api_key'
   // 「Profile ARN 区域」探测/切换:External IdP(微软 M365 等,同账号多 region 各有独立 profile 只部分
   // 开通)+ IdC(AWS SSO)。后端 probe_regions_for/switch 已放开到 external_idp||idc(排除 social/api_key
   // /custom_api)。**IdC 实例通常绑单一 region,探测多用于确认/重新解析该号 profileArn,一般只返回一个
@@ -322,6 +320,28 @@ export function CredentialCard({
       {
         onSuccess: (res) => toast.success(res.message),
         onError: (err) => toast.error(t('credentialcard.toast.operationFailed') + (err as Error).message),
+      }
+    )
+  }
+
+  /**
+   * 手动指定该号的上游 region；`null` → 清除，回退全局默认。
+   *
+   * 为什么必须有这个入口：`ksk_` 是**按区授权**的 token，打错区上游恒 403
+   * （实测同一把 key 在 eu-central-1 98.9% 成功、在 us-east-1 100% 403），
+   * 而自动探测可能探错；`RegionSwitcher` 那条路对 api_key 号直接报「仅
+   * External IdP / IdC 凭据支持」⇒ 在此之前面板上没有任何能改 ksk_ 号 region 的地方，
+   * 探错了只能手改 credentials.json。
+   *
+   * 非法值由后端白名单拦（`is_supported_region`），错误原样 toast 出来 ——
+   * 前端不再自己校验一遍，两份白名单迟早分叉。
+   */
+  const handleApiRegionChange = (apiRegion: string | null) => {
+    setApiRegion.mutate(
+      { id: credential.id, apiRegion },
+      {
+        onSuccess: (res) => toast.success(res.message),
+        onError: (err) => toast.error(t('credentialcard.toast.operationFailed') + extractErrorMessage(err)),
       }
     )
   }
@@ -525,8 +545,31 @@ export function CredentialCard({
     )
   }
 
+  // 打开本卡设置弹框（齿轮 / 右键 / 行视图「编辑…」三处共用同一份初始化）。
+  const openSettings = () => {
+    setPriorityValue(credential.priority)
+    setRpmLimitValue(credential.rpmLimit ?? 0)
+    setNameValue(credential.name ?? '')
+    setShowSettings(true)
+  }
+
   return (
     <>
+      {view === 'row' ? (
+        <CredentialRowBody
+          credential={credential}
+          selected={selected}
+          onToggleSelect={() => onToggleSelect(true)}
+          onEdit={openSettings}
+          onViewBalance={onViewBalance}
+          shownBalance={shownBalance}
+          balancePending={balancePending}
+          // 缓存快照带 cachedAt（按需拉取的 balance prop 没有）→ 与卡片余额条同判据。
+          cachedAt={balance ? null : cached?.cachedAt ?? null}
+          endpointNames={endpointNames}
+          batch={rowBatch}
+        />
+      ) : (
       <Card
         aria-selected={selected}
         onClick={handleCardClick}
@@ -594,12 +637,7 @@ export function CredentialCard({
               size="sm"
               variant="ghost"
               className="h-8 w-8 shrink-0 p-0"
-              onClick={() => {
-                setPriorityValue(credential.priority)
-                setRpmLimitValue(credential.rpmLimit ?? 0)
-                setNameValue(credential.name ?? '')
-                setShowSettings(true)
-              }}
+              onClick={openSettings}
               title={t('credentialcard.gearButton.title')}
               aria-label={t('credentialcard.gearButton.ariaLabel')}
             >
@@ -873,6 +911,7 @@ export function CredentialCard({
           </div>
         </CardContent>
       </Card>
+      )}
       {/* 设置对话框：集中别名/代理/超额/优先级/RPM/启用/删除。
           紧凑化：调度参数与开关双列并排、次要项(删除)收进底部危险区、
           弹框限高 max-h 内部滚动而非整页滚。 */}
@@ -1095,7 +1134,69 @@ export function CredentialCard({
                 </div>
               </div>
               )}
-              {/* 端点切换：默认「自动」——ksk_ 号自动走 cli，其余回退全局默认。
+              {/* 上游 region：与端点同款「实际生效值 + 是否被固定」二元组。
+                  两个快捷键是**实测命中集**（us-east-1 / eu-central-1），其余走搜索选择器。
+                  custom_api 透传号直接打 base_url，不拼 Kiro host，故隐藏。 */}
+              {!isCustomApi && (
+              <div className="space-y-1.5 sm:col-span-2">
+                <div className="text-sm font-medium">{t('credentialcard.settings.regionLabel')}</div>
+                <div className="text-xs text-muted-foreground">
+                  {t('credentialcard.settings.regionHint', {
+                    current: credential.effectiveRegion || t('labels.region.unset'),
+                    mode: credential.regionPinned
+                      ? t('credentialcard.settings.regionModePinned')
+                      : t('credentialcard.settings.regionModeAuto'),
+                  })}
+                </div>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <Button
+                    size="sm"
+                    variant={credential.regionPinned === false ? 'default' : 'outline'}
+                    className="h-9"
+                    onClick={() => handleApiRegionChange(null)}
+                    disabled={setApiRegion.isPending || credential.regionPinned === false}
+                    title={t('credentialcard.settings.regionAutoTitle')}
+                  >
+                    {t('credentialcard.settings.regionAuto')}
+                  </Button>
+                  {REGION_QUICK_PICKS.map((code) => (
+                    <Button
+                      key={code}
+                      size="sm"
+                      variant={
+                        credential.regionPinned && credential.effectiveRegion === code
+                          ? 'default'
+                          : 'outline'
+                      }
+                      className="h-9 font-mono text-xs"
+                      onClick={() => handleApiRegionChange(code)}
+                      disabled={
+                        setApiRegion.isPending ||
+                        (credential.regionPinned === true && credential.effectiveRegion === code)
+                      }
+                      title={t('credentialcard.settings.regionPinTitle', { name: code })}
+                    >
+                      {code}
+                    </Button>
+                  ))}
+                  {setApiRegion.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+                </div>
+                {/* 其余 20+ 个区走搜索选择器。value 只在**已固定**时回填 ——
+                    auto 态回填现值会让人以为已经定过区了（那正是探错时看不出来的原因）。 */}
+                <RegionSelect
+                  value={credential.regionPinned ? credential.effectiveRegion ?? '' : ''}
+                  onChange={(code) => {
+                    const c = code.trim()
+                    if (c) handleApiRegionChange(c)
+                  }}
+                  disabled={setApiRegion.isPending}
+                  triggerClassName="h-9"
+                  placeholder={t('credentialcard.settings.regionSelectPlaceholder')}
+                />
+              </div>
+              )}
+              {/* 端点切换：默认「自动」——ksk_ 号 q.*(cli) 优先、runtime.*(cli-runtime) 回退
+                  （两个 host = 上游独立限流桶），其余回退全局默认。
                   固定成具体端点是**救急旋钮**（上游协议变化时不改代码即可切）。
                   custom_api 透传号不走 Kiro 端点体系，故隐藏。 */}
               {!isCustomApi && (
@@ -1118,7 +1219,9 @@ export function CredentialCard({
                     disabled={setEndpoint.isPending || credential.endpointPinned === false}
                     title={t('credentialcard.settings.endpointAutoTitle')}
                   >
-                    {t('credentialcard.settings.endpointAuto')}
+                    {isApiKeyCred
+                      ? t('credentialcard.settings.endpointAutoBucket')
+                      : t('credentialcard.settings.endpointAuto')}
                   </Button>
                   {endpointNames.map((name) => (
                     <Button
@@ -1129,13 +1232,15 @@ export function CredentialCard({
                           ? 'default'
                           : 'outline'
                       }
-                      className="h-9"
+                      className="h-9 font-mono text-xs"
                       onClick={() => handleEndpointChange(name)}
                       disabled={
                         setEndpoint.isPending ||
                         (credential.endpointPinned === true && credential.endpoint === name)
                       }
-                      title={t('credentialcard.settings.endpointPinTitle', { name })}
+                      title={t('credentialcard.settings.endpointHostTitle', {
+                        host: endpointHost(name, credential.effectiveRegion ?? ''),
+                      })}
                     >
                       {name}
                     </Button>

@@ -1,10 +1,17 @@
 # KiroStudio 系统架构文档
 
-> **定位**：KiroStudio 是一个 Anthropic API 兼容的反向代理网关（约 35,800 行 Rust / Axum 0.8 / Tokio），
+> **定位**：KiroStudio 是一个 Anthropic API 兼容的反向代理网关（**90,032 行 Rust**，2026-08-07 实测
+> `find src -name '*.rs' | xargs wc -l`；⚠️ 原写「约 35,800 行」已过期约 2.5 倍 / Axum 0.8 / Tokio），
 > 把下游客户端的标准 Anthropic 格式请求透明转换为 Kiro 上游的 AWS event-stream 二进制协议，
 > 并把响应实时流式转换回 Anthropic SSE。聚合多个 Kiro 凭据做多号调度、限流熔断、防关联、上号管理。
-> 上游已随 Kiro 迁移到 `runtime.{region}.kiro.dev`（旧的 `q.{region}.amazonaws.com` 已停用）。
-> 当前 **v0.4.0**。本文档按当前代码校准（用 codegraph 索引 + 源码逐一取证）。
+> 上游按凭据类型分两个端点：OAuth 号（social/idc/external_idp）走 **IDE** 端点
+> `runtime.{region}.kiro.dev`；`ksk_` API Key 号走 **CLI** 端点 `q.{region}.amazonaws.com`
+> （服务根 `/` + `X-Amz-Target` 头）。⚠️ 本行原写「旧的 `q.*` 已停用」——**那句无依据且有反证**
+> （2026-08 实测 `ksk_` 号在 `q.*` 拿 HTTP 200），2026-08-06 更正；依据见 `src/kiro/endpoint/ide.rs` 头注释。
+> 当前 **v0.7.46**（`Cargo.toml` 实读；⚠️ 本行原写 v0.4.0，与 `Cargo.toml` 差 3 个小版本，
+> 且本文档下方多处仍以「v0.4.0 删除了 …」的口径叙述，读到那类措辞请按历史注记理解）。
+> 本文档按当前代码校准（用 `tools/codegraph/` 索引 + 源码逐一取证；索引的边界见
+> `tools/codegraph/README.md`，**`[ambig]` 标签的边不能当结论**）。
 
 ---
 
@@ -54,7 +61,7 @@ main()
  ├─ 4. CredentialsConfig::load(path)              单对象或数组格式 → into_sorted_credentials()
  │      └─ KIRO_API_KEY 环境变量 → 自动插入最高优先级 API Key 凭据
  ├─ 5. api_key 空值校验                            空白 apiKey 拒绝启动（防 fail-open 匿名消耗）
- ├─ 6. 构建端点注册表                              目前仅 IdeEndpoint（name="ide"）
+ ├─ 6. 构建端点注册表                              IdeEndpoint("ide") + CliEndpoint("cli")
  ├─ 7. MultiTokenManager::new(config, creds, ...)  多凭据管理器（含缓存加载 + 每号 RateLimiter）
  ├─ 8. token_manager.respawn_refresh_task()        TIER2：受管的后台预刷新任务（改配置 abort+respawn）
  ├─ 9. spawn 亲和清理(5min) + 回收站清理(6h)        惰性 TTL 之外的主动回收
@@ -222,7 +229,7 @@ main()
 | tool_result 在 user.content[] | UserInputMessageContext.tool_results |
 | model: "claude-sonnet-4-*" | map_model → "claude-sonnet-4.5" 等模型串（contains 匹配 + 无版本号回退） |
 | stream: true/false | 上游始终 event-stream；非流式由我方聚合 |
-| conversationId | continuationId 确定性派生（命中上游 prefix 缓存，实测省 ~47% credit） |
+| conversationId | continuationId 确定性派生（稳定前缀 ⇒ 省 token + 稳会话亲和。⚠️ 原写「实测省 ~47% credit」**已证否**，依据 `docs/prefix-stability-2026-08-06.md`） |
 
 ### 6.2 对话状态机（三态）
 
@@ -307,7 +314,7 @@ main()
 | 5 | 选号 + inflight+1 + rpm.record 同一锁临界区 | 原子选号，根治并发惊群/Top5 热点 |
 | 6 | 健康熔断器与冷却分层（软放回 vs 硬退场） | 冷却到期不全量涌回把缓过来的号又打进风控 |
 | 7 | M365 族级连坐（family_key） | 账户级风控整族退避，不逐个砸 |
-| 8 | continuationId 确定性派生 | 命中上游 prefix 缓存，实测省 ~47% credit |
+| 8 | continuationId 确定性派生 | 稳定前缀 ⇒ 省 token + 稳会话亲和。⚠️ **不要再写「实测省 ~47% credit」** —— 那个观测已被证否（单次孤例、落在噪声内；2026-08-05/06 用线上 46 万条 traces 判定**上游没有可观测的隐式前缀 credit 折扣**）。依据：`docs/prefix-stability-2026-08-06.md`。**改动本身不要回滚**，token 节省与亲和收益仍成立，只是原始依据作废 |
 | 9 | 每号独立 machineId（撞车自动轮换）+ 环境噪音剥离 | 防关联 + 省 token + 提缓存 |
 | 10 | 自实现 AWS event-stream 解码器 | 无现成 Rust 库支持流式零拷贝解码 |
 | 11 | 双端点 /v1 和 /cc/v1 | Claude Code 依赖精确 input_tokens，需缓冲等 contextUsageEvent |
@@ -337,7 +344,12 @@ main()
 
 ---
 
-## 十二、源码目录结构（约 35,800 行）
+## 十二、源码目录结构（90,032 行，2026-08-07 实测）
+
+> ⚠️ 下面每个文件后括号里的行数是**旧快照**，已整体漂移（实测 `token_manager.rs` 14927 行
+> 而非 5239、`stream.rs` 9205 而非 2599、`service.rs` 9163 而非 1990、`main.rs` 1139 而非 481）。
+> 当前行数与最大文件排行一律现读：`python3 tools/codegraph/cg.py stat`。
+> 本节也**缺 `src/openai/`**（convert.rs / handlers.rs / types.rs / mod.rs，共 4 个文件）。
 
 ```
 src/

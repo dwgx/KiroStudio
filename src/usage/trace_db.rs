@@ -15,7 +15,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
-use rusqlite::{params, params_from_iter, Connection, Row, ToSql};
+use rusqlite::{Connection, Row, ToSql, params, params_from_iter};
 
 use super::pipeline::UsageSink;
 use super::record::{RequestOutcome, RequestRecord};
@@ -320,7 +320,10 @@ impl TraceDb {
 
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(binds.iter().map(|b| b.as_ref())), row_to_record)?;
+        let rows = stmt.query_map(
+            params_from_iter(binds.iter().map(|b| b.as_ref())),
+            row_to_record,
+        )?;
 
         let mut out = Vec::new();
         for r in rows {
@@ -336,10 +339,9 @@ impl TraceDb {
 
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(&sql)?;
-        let n: i64 = stmt.query_row(
-            params_from_iter(binds.iter().map(|b| b.as_ref())),
-            |row| row.get(0),
-        )?;
+        let n: i64 = stmt.query_row(params_from_iter(binds.iter().map(|b| b.as_ref())), |row| {
+            row.get(0)
+        })?;
         Ok(n.max(0))
     }
 
@@ -940,7 +942,10 @@ mod tests {
         // 3) 迁移后可正常写入带 device 的新记录并读回
         db.on_record(&sample_record("new-with-device", 100));
         let got = db.recent(10).unwrap();
-        let rec = got.iter().find(|r| r.request_id == "new-with-device").unwrap();
+        let rec = got
+            .iter()
+            .find(|r| r.request_id == "new-with-device")
+            .unwrap();
         assert_eq!(rec.client_device, Some("claude-code".to_string()));
 
         // 4) 再次 open 同一库，迁移应幂等（不因列已存在而报错）

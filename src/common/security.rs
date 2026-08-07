@@ -248,7 +248,11 @@ impl IngressRateLimiter {
 /// - 否则（默认）**自动判定**：TCP 对端是私网/环回地址（=本机 openresty/nginx 反代）时，
 ///   同样信任 XFF 最右段（A2 修复：反代后中间件白名单/限流不再只看到反代内网 IP）；
 ///   对端是公网地址（=客户端直连本服务）时，直接用对端 IP、忽略可被伪造的 XFF。
-pub fn client_ip(req: &Request<Body>, peer: Option<SocketAddr>, trust_forwarded: bool) -> Option<IpAddr> {
+pub fn client_ip(
+    req: &Request<Body>,
+    peer: Option<SocketAddr>,
+    trust_forwarded: bool,
+) -> Option<IpAddr> {
     client_ip_from_headers(req.headers(), peer, trust_forwarded)
 }
 
@@ -305,17 +309,15 @@ pub fn client_ip_from_headers(
 /// 用于 A2 自动判定——只有当请求来自本机/内网反代时才信任其追加的 XFF 最右段。
 pub fn is_trusted_proxy_peer(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback() || v4.is_private() || v4.is_link_local()
-        }
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
         IpAddr::V6(v6) => {
             // 环回 ::1 / 唯一本地 fc00::/7 / 链路本地 fe80::/10 / IPv4-mapped 私网
             v6.is_loopback()
                 || (v6.segments()[0] & 0xfe00) == 0xfc00
                 || (v6.segments()[0] & 0xffc0) == 0xfe80
-                || v6.to_ipv4_mapped().is_some_and(|v4| {
-                    v4.is_loopback() || v4.is_private() || v4.is_link_local()
-                })
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| v4.is_loopback() || v4.is_private() || v4.is_link_local())
         }
     }
 }
@@ -370,10 +372,7 @@ pub async fn security_middleware(
                 tracing::debug!("入口 IP 黑名单拒绝: {:?}", ip);
                 return (
                     StatusCode::FORBIDDEN,
-                    Json(ErrorResponse::new(
-                        "permission_error",
-                        "来源 IP 已被封禁",
-                    )),
+                    Json(ErrorResponse::new("permission_error", "来源 IP 已被封禁")),
                 )
                     .into_response();
             }

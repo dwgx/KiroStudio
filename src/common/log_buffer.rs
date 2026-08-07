@@ -119,14 +119,18 @@ impl tracing::field::Visit for FieldCollector {
         if field.name() == "message" {
             self.message = format!("{:?}", value);
             // strip 掉 Debug 给字符串加的引号(message 通常是 &str)。
-            if self.message.starts_with('"') && self.message.ends_with('"') && self.message.len() >= 2 {
+            if self.message.starts_with('"')
+                && self.message.ends_with('"')
+                && self.message.len() >= 2
+            {
                 self.message = self.message[1..self.message.len() - 1].to_string();
             }
         } else {
             if !self.extra.is_empty() {
                 self.extra.push(' ');
             }
-            self.extra.push_str(&format!("{}={:?}", field.name(), value));
+            self.extra
+                .push_str(&format!("{}={:?}", field.name(), value));
         }
     }
 }

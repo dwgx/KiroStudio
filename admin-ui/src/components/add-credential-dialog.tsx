@@ -1,8 +1,8 @@
-import { useState } from 'react'
+import { useState, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { CheckCircle2, XCircle, AlertCircle, AlertTriangle, Loader2 } from 'lucide-react'
-import { useQueryClient } from '@tanstack/react-query'
+import { useQueryClient, useQuery } from '@tanstack/react-query'
 import {
   Dialog,
   DialogContent,
@@ -18,7 +18,9 @@ import { ProxyTestButton } from '@/components/proxy-test-button'
 import { useAddCredential, useCredentials } from '@/hooks/use-credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
 import { LoginDialog } from '@/components/login-dialog'
-import type { AddCredentialRequest } from '@/types/api'
+import { listSocksNodes } from '@/api/credentials'
+import { pickBestNode, rankAssignableNodes } from '@/lib/socks-node-rank'
+import type { AddCredentialRequest, SocksNode } from '@/types/api'
 
 interface AddCredentialDialogProps {
   open: boolean
@@ -27,6 +29,27 @@ interface AddCredentialDialogProps {
 
 type AuthMethod = 'social' | 'idc' | 'external_idp' | 'api_key' | 'custom_api'
 type Tab = 'manual' | 'paste' | 'login'
+
+/**
+ * 出口 IP 三选一。
+ *
+ * - `inherit`（默认）—— 不下发任何 proxy 字段。后端 `proxy_url=None` = **回退全局代理**，
+ *   没配全局代理时才是真直连。故文案说的是「默认（跟随全局代理）」而不是「直连」：
+ *   写"直连"会让配了全局代理的用户以为这一份不走代理。
+ * - `pool` —— 从节点池点名一个（下发 `primaryNodeId`）。密码留在服务端。
+ * - `manual` —— 手填 URL/账密（既有的三个输入框，行为不变）。
+ */
+type ExitMode = 'inherit' | 'pool' | 'manual'
+
+/** 「N 分钟前」。`testedAt` 是 Unix **秒**（后端 socks_node.rs 的 tested_at）。 */
+function formatAgo(testedAtSec: number, t: (k: string, o?: Record<string, unknown>) => string): string {
+  if (!testedAtSec) return t('addcredentialdialog.field.exit.pool.agoUnknown')
+  const sec = Math.max(0, Math.floor(Date.now() / 1000) - testedAtSec)
+  if (sec < 60) return t('addcredentialdialog.field.exit.pool.agoSeconds', { n: sec })
+  if (sec < 3600) return t('addcredentialdialog.field.exit.pool.agoMinutes', { n: Math.floor(sec / 60) })
+  if (sec < 86400) return t('addcredentialdialog.field.exit.pool.agoHours', { n: Math.floor(sec / 3600) })
+  return t('addcredentialdialog.field.exit.pool.agoDays', { n: Math.floor(sec / 86400) })
+}
 
 // 从字符串中挑第一个非空值
 const pickString = (...values: unknown[]): string | undefined => {
@@ -156,7 +179,12 @@ function toAddRequest(raw: Record<string, unknown>): AddCredentialRequest | null
       kiroApiKey,
       priority: typeof g('priority') === 'number' ? (g('priority') as number) : undefined,
       authRegion: pickString(g('authRegion', 'auth_region', 'region')),
-      apiRegion: pickString(g('apiRegion', 'api_region')),
+      // ksk_ 号的 region 也要落到 apiRegion：它才是 CLI 端点 host
+      // (q.{region}.amazonaws.com) 的决定字段，且任一 region 字段存在就会让
+      // 后端自动探测整个跳过 —— 只写 authRegion 会让错的区既不生效也不被纠正。
+      apiRegion: pickString(
+        g('apiRegion', 'api_region', 'authRegion', 'auth_region', 'region'),
+      ),
       machineId: pickString(g('machineId', 'machine_id')),
       endpoint: pickString(g('endpoint')),
     }
@@ -253,6 +281,14 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [proxyUrl, setProxyUrl] = useState('')
   const [proxyUsername, setProxyUsername] = useState('')
   const [proxyPassword, setProxyPassword] = useState('')
+  // 出口 IP 三选一。默认 'inherit'：不下发任何 proxy 字段，与该三选一存在之前的
+  // 行为逐字相同（后端 proxy_url=None → 回退全局代理）。改默认值就等于悄悄改所有
+  // 老用户的上号行为。
+  const [exitMode, setExitMode] = useState<ExitMode>('inherit')
+  // 'pool' 模式下选中的节点 id（空串 = 还没选）。存字符串是因为 Select 的值是 string。
+  const [poolNodeId, setPoolNodeId] = useState('')
+  // 4.1 的主份开关，**默认关**：多开时池节点全给第 2..N 份，N 份只需 N-1 个节点。
+  const [assignPrimaryFromPool, setAssignPrimaryFromPool] = useState(false)
   const [endpoint, setEndpoint] = useState('')
 
   // 导入（粘贴）
@@ -264,6 +300,53 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const { mutateAsync: addCredentialAsync } = useAddCredential()
   const { data: existingCredentials } = useCredentials()
   const queryClient = useQueryClient()
+
+  // 节点池。`enabled: open` —— 对话框没开时不发请求（这个页面每次渲染都会挂载它）。
+  // queryKey 与「分身管理」页同一个 ['socks-nodes']，于是那边改完节点这边自动新鲜。
+  const { data: socksNodes } = useQuery({
+    queryKey: ['socks-nodes'],
+    queryFn: listSocksNodes,
+    enabled: open,
+  })
+  const nodes: SocksNode[] = socksNodes?.nodes ?? []
+  // 可分配的（enabled 且不是已知不通），按后端自动分配的同一口径排序。
+  const assignableNodes = useMemo(() => rankAssignableNodes(nodes), [nodes])
+  // 下拉选项：主行是「名字 + host:port」，`hint` 直接给 lastTest 的四个字段
+  // （ok / latencyMs / exitIp / testedAt）—— 那是白拿的信息，不显示就浪费了，
+  // 而"这个出口通不通、多快、出口 IP 是什么"恰好是挑节点时唯一要看的东西。
+  const nodeOptions = useMemo(
+    () =>
+      assignableNodes.map((n) => {
+        const t0 = n.lastTest
+        const bound = n.boundCredentials ?? 0
+        const parts: string[] = []
+        if (!t0) {
+          // 从未测过：标出来但仍可选（后端也不排除它，只是排在测过的后面）。
+          parts.push(t('addcredentialdialog.field.exit.pool.untested'))
+        } else {
+          parts.push(
+            t0.ok
+              ? t('addcredentialdialog.field.exit.pool.ok', { ms: t0.latencyMs })
+              : t('addcredentialdialog.field.exit.pool.failed')
+          )
+          if (t0.exitIp) {
+            parts.push(t('addcredentialdialog.field.exit.pool.exitIp', { ip: t0.exitIp }))
+          }
+          parts.push(
+            t('addcredentialdialog.field.exit.pool.testedAgo', {
+              ago: formatAgo(t0.testedAt, t),
+            })
+          )
+        }
+        parts.push(t('addcredentialdialog.field.exit.pool.bound', { count: bound }))
+        return {
+          value: String(n.id),
+          label: n.name.trim() ? `${n.name} · ${n.url}` : n.url,
+          hint: parts.join(' · '),
+        }
+      }),
+    [assignableNodes, t]
+  )
 
   const resetManual = () => {
     setRefreshToken('')
@@ -283,6 +366,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setProxyUrl('')
     setProxyUsername('')
     setProxyPassword('')
+    setExitMode('inherit')
+    setPoolNodeId('')
+    setAssignPrimaryFromPool(false)
     setEndpoint('')
     setBaseUrl('')
     setCustomApiKey('')
@@ -325,6 +411,16 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       }
     }
 
+    // 选了「从池中选」却没挑节点：本地就拦掉。让它下发 undefined 的话，后端会退回
+    // 自动分配并成功返回 —— 用户以为出口是他挑的那个，而他压根没挑。
+    //
+    // 第二个条件覆盖「选完之后那个节点被禁用/删掉了」（对话框开着时另一个标签页改的）：
+    // 此时下拉已经不含它，但 `poolNodeId` 还指着它。后端也会 400，这里只是早一步。
+    if (exitMode === 'pool' && !nodeOptions.some((o) => o.value === poolNodeId)) {
+      toast.error(t('addcredentialdialog.field.exit.validate.pickOne'))
+      return
+    }
+
     mutate(
       {
         authMethod,
@@ -345,9 +441,26 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         // 只在 >1 时下发：缺省不带该字段，后端走完全不变的普通上号路径（含去重保护）。
         copies: Math.max(1, parseInt(copies) || 1) > 1 ? Math.max(1, parseInt(copies) || 1) : undefined,
         machineId: machineId.trim() || undefined,
-        proxyUrl: proxyUrl.trim() || undefined,
-        proxyUsername: proxyUsername.trim() || undefined,
-        proxyPassword: proxyPassword.trim() || undefined,
+        // 出口 IP 三选一：只有 'manual' 才下发 proxy_* 三兄弟，只有 'pool' 才下发
+        // primaryNodeId。'inherit' 三个都不带 —— 那正是这个三选一存在之前的请求形态
+        // （后端 proxy_url=None → 回退全局代理），所以默认值不改变任何既有行为。
+        proxyUrl: exitMode === 'manual' ? proxyUrl.trim() || undefined : undefined,
+        proxyUsername: exitMode === 'manual' ? proxyUsername.trim() || undefined : undefined,
+        proxyPassword: exitMode === 'manual' ? proxyPassword.trim() || undefined : undefined,
+        primaryNodeId: exitMode === 'pool' ? Number(poolNodeId) : undefined,
+        // 4.1 的开关。只在 'inherit' 下有意义：'pool' 时主份已点名节点（后端会忽略它），
+        // 'manual' 时主份有显式代理（`pool_may_assign` 那道门在前）。
+        // 不下发 = 后端按份数定缺省（1 份→true，多份→false），即"主份保持自身出口"。
+        assignPrimaryNode: exitMode === 'inherit' && assignPrimaryFromPool ? true : undefined,
+        // 严格模式只在**用户明确表达了分散意图**时开：
+        // - 'pool'：他亲手挑了池里的节点；
+        // - 'inherit' + 主份开关：他明确要求主份也从池里取。
+        // 缺省的 'inherit' 路径**不开** —— 那是既有行为（节点不够就直连并在文案里说明），
+        // 在那条路上突然开始报错是回归：老用户什么都没改却上不了号了。
+        requireNodePerCopy:
+          exitMode === 'pool' || (exitMode === 'inherit' && assignPrimaryFromPool)
+            ? true
+            : undefined,
         endpoint: endpoint.trim() || undefined,
       },
       {
@@ -833,8 +946,119 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               </>
               )}
 
-              {/* 代理配置 */}
+              {/* 出口 IP：直连（跟随全局）/ 从池中选 / 手填 */}
               <div className="space-y-2">
+                <label className="text-sm font-medium">
+                  {t('addcredentialdialog.field.exit.label')}
+                </label>
+                <div className="flex flex-wrap gap-1 rounded-md border border-input bg-background p-1">
+                  {(['inherit', 'pool', 'manual'] as ExitMode[]).map((m) => (
+                    <button
+                      key={m}
+                      type="button"
+                      aria-pressed={exitMode === m}
+                      disabled={isPending}
+                      onClick={() => setExitMode(m)}
+                      className={
+                        'flex-1 rounded px-3 py-1.5 text-xs transition-colors duration-150 disabled:opacity-50 ' +
+                        (exitMode === m
+                          ? 'bg-accent text-foreground'
+                          : 'text-muted-foreground hover:text-foreground')
+                      }
+                    >
+                      {t(`addcredentialdialog.field.exit.mode.${m}`)}
+                    </button>
+                  ))}
+                </div>
+
+                {exitMode === 'inherit' && (
+                  <p className="text-xs text-muted-foreground">
+                    {t('addcredentialdialog.field.exit.mode.inherit.help')}
+                  </p>
+                )}
+
+                {exitMode === 'pool' && (
+                  <div className="space-y-2">
+                    {assignableNodes.length === 0 ? (
+                      <p className="text-xs text-amber-500">
+                        {t('addcredentialdialog.field.exit.pool.empty')}
+                      </p>
+                    ) : (
+                      <>
+                        <div className="flex items-center gap-2">
+                          <Select
+                            className="flex-1"
+                            id="poolNodeId"
+                            aria-label={t('addcredentialdialog.field.exit.pool.label')}
+                            placeholder={t('addcredentialdialog.field.exit.pool.placeholder')}
+                            value={poolNodeId}
+                            onChange={setPoolNodeId}
+                            disabled={isPending}
+                            options={nodeOptions}
+                          />
+                          {/* 「自动分配」= 按后端同一口径（已绑数↑ → 延迟↑）挑第一个。
+                              刻意把结果**填进下拉**而不是留给服务端决定：用户得在提交前
+                              看见自己将要走哪个出口。 */}
+                          <Button
+                            type="button"
+                            variant="outline"
+                            disabled={isPending}
+                            onClick={() => {
+                              const best = pickBestNode(nodes)
+                              if (!best) {
+                                toast.error(t('addcredentialdialog.field.exit.pool.empty'))
+                                return
+                              }
+                              setPoolNodeId(String(best.id))
+                              toast.success(
+                                t('addcredentialdialog.field.exit.pool.autoPicked', {
+                                  label: best.label,
+                                })
+                              )
+                            }}
+                          >
+                            {t('addcredentialdialog.field.exit.pool.auto')}
+                          </Button>
+                        </div>
+                        <p className="text-xs text-muted-foreground">
+                          {t('addcredentialdialog.field.exit.pool.help')}
+                        </p>
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* 主份开关（4.1）：只在多开且走「默认」出口时才有意义 —— 'pool' 下主份
+                  已点名节点、'manual' 下主份有显式代理，两者后端都会忽略这个开关，
+                  把它显示出来只会让人以为改了什么。 */}
+              {(Number(copies) || 1) > 1 && exitMode === 'inherit' && (
+                <label className="flex items-start gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5 h-4 w-4 shrink-0 accent-primary"
+                    checked={assignPrimaryFromPool}
+                    disabled={isPending}
+                    onChange={(e) => setAssignPrimaryFromPool(e.target.checked)}
+                  />
+                  <span className="min-w-0">
+                    <span className="font-medium">
+                      {t('addcredentialdialog.field.assignPrimaryNode.label')}
+                    </span>
+                    <span className="mt-0.5 block text-xs text-muted-foreground">
+                      {t(
+                        assignPrimaryFromPool
+                          ? 'addcredentialdialog.field.assignPrimaryNode.helpOn'
+                          : 'addcredentialdialog.field.assignPrimaryNode.helpOff',
+                        { copies: Number(copies) || 1, needed: (Number(copies) || 1) - 1 }
+                      )}
+                    </span>
+                  </span>
+                </label>
+              )}
+
+              {/* 代理配置（手填） */}
+              <div className={exitMode === 'manual' ? 'space-y-2' : 'hidden'}>
                 <label className="text-sm font-medium">{t('addcredentialdialog.field.proxy.label')}</label>
                 <div className="flex items-center gap-2">
                   <Input

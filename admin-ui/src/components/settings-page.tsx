@@ -8,6 +8,8 @@ import {
   Trash,
   Trash2,
   Activity,
+  AlertTriangle,
+  FlaskConical,
   ChevronDown,
   ChevronUp,
   RotateCcw,
@@ -24,14 +26,17 @@ import {
   ClipboardCopy,
   Image as ImageIcon,
   LayoutGrid,
+  Users,
   X,
 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
+import { Callout } from '@/components/ui/callout'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { ProxyTestButton } from '@/components/proxy-test-button'
+import { CloneManagementCard } from '@/components/clone-management-card'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Skeleton } from '@/components/ui/skeleton'
 import { PageSkeleton } from '@/components/ui/page-skeleton'
@@ -122,12 +127,14 @@ function timeAgo(iso: string | null | undefined, t: TFunction): string {
 /* ============ 分区导航 + 搜索 基础设施 ============ */
 
 // 设置分区（顶部 tab）。id 用于 tab 切换与卡片归属；label 经 i18n 在渲染时解析。
-type SectionId = 'basic' | 'security' | 'scheduling' | 'storage' | 'service' | 'privacy' | 'appearance' | 'export' | 'trash'
+type SectionId = 'basic' | 'security' | 'scheduling' | 'advanced' | 'clones' | 'storage' | 'service' | 'privacy' | 'appearance' | 'export' | 'trash'
 
 const SECTION_DEFS: { id: SectionId; labelKey: string; icon: React.ComponentType<{ className?: string }> }[] = [
   { id: 'basic', labelKey: 'settingspage.section.basic', icon: SlidersHorizontal },
   { id: 'security', labelKey: 'settingspage.section.security', icon: ShieldCheck },
   { id: 'scheduling', labelKey: 'settingspage.section.scheduling', icon: Activity },
+  { id: 'advanced', labelKey: 'settingspage.section.advanced', icon: FlaskConical },
+  { id: 'clones', labelKey: 'settingspage.section.clones', icon: Users },
   { id: 'storage', labelKey: 'settingspage.section.storage', icon: Database },
   { id: 'service', labelKey: 'settingspage.section.service', icon: Server },
   { id: 'privacy', labelKey: 'settingspage.section.privacy', icon: Fingerprint },
@@ -142,14 +149,18 @@ const CARD_INDEX_DEFS: { section: SectionId; titleKey: string; kwKey: string }[]
   { section: 'basic', titleKey: 'settingspage.card.serviceInfo', kwKey: 'settingspage.card.serviceInfo.kw' },
   { section: 'basic', titleKey: 'settingspage.card.clientSpoof', kwKey: 'settingspage.card.clientSpoof.kw' },
   { section: 'basic', titleKey: 'settingspage.card.protocol', kwKey: 'settingspage.card.protocol.kw' },
-  { section: 'basic', titleKey: 'settingspage.card.toolFault', kwKey: 'settingspage.card.toolFault.kw' },
   { section: 'basic', titleKey: 'settingspage.card.network', kwKey: 'settingspage.card.network.kw' },
+  // 高级选项三卡：工具容错（原属 basic，随分组迁来）/ 吸收层（原在协议卡内的小节）/ 缓存记账
+  { section: 'advanced', titleKey: 'settingspage.card.toolFault', kwKey: 'settingspage.card.toolFault.kw' },
+  { section: 'advanced', titleKey: 'settingspage.card.advAbsorb', kwKey: 'settingspage.card.advAbsorb.kw' },
+  { section: 'advanced', titleKey: 'settingspage.card.advCache', kwKey: 'settingspage.card.advCache.kw' },
   { section: 'basic', titleKey: 'settingspage.card.loginBg', kwKey: 'settingspage.card.loginBg.kw' },
   { section: 'security', titleKey: 'settingspage.card.security', kwKey: 'settingspage.card.security.kw' },
   { section: 'scheduling', titleKey: 'settingspage.card.loadBalance', kwKey: 'settingspage.card.loadBalance.kw' },
   { section: 'scheduling', titleKey: 'settingspage.card.antiAssoc', kwKey: 'settingspage.card.antiAssoc.kw' },
   { section: 'scheduling', titleKey: 'settingspage.card.smartSchedule', kwKey: 'settingspage.card.smartSchedule.kw' },
   { section: 'scheduling', titleKey: 'settingspage.card.tokenRefresh', kwKey: 'settingspage.card.tokenRefresh.kw' },
+  { section: 'clones', titleKey: 'settingspage.card.clones', kwKey: 'settingspage.card.clones.kw' },
   { section: 'storage', titleKey: 'settingspage.card.storage', kwKey: 'settingspage.card.storage.kw' },
   { section: 'service', titleKey: 'settingspage.card.service', kwKey: 'settingspage.card.service.kw' },
   { section: 'service', titleKey: 'settingspage.card.clientRpm', kwKey: 'settingspage.card.clientRpm.kw' },
@@ -228,6 +239,14 @@ interface FormState {
   defaultEndpoint: string
   extractThinking: boolean
   ccAutoBuffer: boolean
+  importKeysEnabled: boolean
+  // 上游 429 吸收层（数值字段同样字符串化，与其余受控数字输入一致）
+  upstreamRetryAbsorbEnabled: boolean
+  upstreamRetryAbsorbBudgetSecs: string
+  upstreamRetryAbsorbMaxRounds: string
+  upstreamRetryAbsorbMinDelayMs: string
+  upstreamRetryAbsorbMaxDelaySecs: string
+  upstreamRetryAbsorbSuspended: boolean
   stripEnvNoise: boolean
   toolCleanLeakedTokens: boolean
   toolReclaimTextifiedInvoke: boolean
@@ -237,8 +256,11 @@ interface FormState {
   toolRepairJson: boolean
   toolTruncationRecovery: boolean
   toolDescriptionMaxChars: string
+  // prompt cache 记账下发开关（估算值，非上游真值）
+  promptCacheEnabled: boolean
   encryptCredentialsAtRest: boolean
   cooldownEnabled: boolean
+  autoDisableSuspicious: boolean
   allCoolingFastFail: boolean
   rateLimitEnabled: boolean
   rateLimitDailyMax: string
@@ -289,6 +311,17 @@ interface FormState {
   cardSize: CardSize
 }
 
+/* ============ promptCacheEnabled 的本地类型补丁 ============ */
+// 后端两侧都已有该字段（`src/admin/types.rs:898` 响应 / `:1031` 请求，serde camelCase），
+// 但 `src/types/api.ts` 的两个接口里还没有它。api.ts 此刻正被其他会话改，
+// 不在本次可改文件内，故在本文件内做最小补丁；等 api.ts 补上字段后删掉这两个别名即可。
+type ConfigWithCache = ConfigSnapshotResponse & { promptCacheEnabled?: boolean }
+type UpdateWithCache = UpdateConfigRequest & { promptCacheEnabled?: boolean }
+
+// 后端 `default_prompt_cache_enabled()`（`src/model/config.rs:885`）返回 true，
+// 字段缺失时按 true 兜底，避免面板把"未下发"显示成"已关闭"。
+const PROMPT_CACHE_DEFAULT = true
+
 // 多行文本 <-> 字符串列表（去空白、去空行）
 function linesToList(s: string): string[] {
   return s
@@ -319,6 +352,13 @@ function toForm(c: ConfigSnapshotResponse, ui: UiLayoutPrefs): FormState {
     defaultEndpoint: c.defaultEndpoint,
     extractThinking: c.extractThinking,
     ccAutoBuffer: c.ccAutoBuffer,
+    importKeysEnabled: c.importKeysEnabled,
+    upstreamRetryAbsorbEnabled: c.upstreamRetryAbsorbEnabled ?? false,
+    upstreamRetryAbsorbBudgetSecs: String(c.upstreamRetryAbsorbBudgetSecs ?? 45),
+    upstreamRetryAbsorbMaxRounds: String(c.upstreamRetryAbsorbMaxRounds ?? 3),
+    upstreamRetryAbsorbMinDelayMs: String(c.upstreamRetryAbsorbMinDelayMs ?? 150),
+    upstreamRetryAbsorbMaxDelaySecs: String(c.upstreamRetryAbsorbMaxDelaySecs ?? 15),
+    upstreamRetryAbsorbSuspended: c.upstreamRetryAbsorbSuspended ?? false,
     stripEnvNoise: c.stripEnvNoise,
     toolCleanLeakedTokens: c.toolCleanLeakedTokens ?? true,
     toolReclaimTextifiedInvoke: c.toolReclaimTextifiedInvoke ?? true,
@@ -328,8 +368,10 @@ function toForm(c: ConfigSnapshotResponse, ui: UiLayoutPrefs): FormState {
     toolRepairJson: c.toolRepairJson ?? true,
     toolTruncationRecovery: c.toolTruncationRecovery ?? false,
     toolDescriptionMaxChars: String(c.toolDescriptionMaxChars ?? 10000),
+    promptCacheEnabled: (c as ConfigWithCache).promptCacheEnabled ?? PROMPT_CACHE_DEFAULT,
     encryptCredentialsAtRest: c.encryptCredentialsAtRest ?? false,
     cooldownEnabled: c.cooldownEnabled,
+    autoDisableSuspicious: c.autoDisableSuspicious ?? true,
     allCoolingFastFail: c.allCoolingFastFail ?? true,
     rateLimitEnabled: c.rateLimitEnabled,
     rateLimitDailyMax: String(c.rateLimitDailyMax),
@@ -398,6 +440,115 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
       </div>
       <div className="shrink-0 flex justify-end pt-0.5">{children}</div>
     </div>
+  )
+}
+
+// 卡内小节标题（同一张卡里再分组用）。搜索态下标题自身不命中就隐藏，
+// 避免留下一个下面没有任何行的孤立小标题。
+function GroupHeading({ label }: { label: string }) {
+  const { query } = useContext(SearchContext)
+  if (!rowMatches(query, label)) return null
+  return (
+    <div className="pt-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+      <Highlight text={label} />
+    </div>
+  )
+}
+
+/* ============ 高级选项：默认折叠的外壳 ============ */
+
+// 高级选项整组的折叠壳。默认收起——组内开关改错会造成真实故障（吸收层与外置
+// shield 叠乘、关掉工具容错会让客户端直接看到坏 JSON），所以要求显式展开一次。
+//
+// 搜索态强制展开：SectionGate 在搜索时会跨区展示命中卡片，若壳子仍收着，
+// 用户搜到的项在页面上不可见——那等于搜索对这一组失效。
+function AdvancedDisclosure({ children }: { children: React.ReactNode }) {
+  const { t } = useTranslation()
+  const { query } = useContext(SearchContext)
+  const [open, setOpen] = useState(false)
+  const expanded = open || !!query
+  return (
+    <div className="space-y-4">
+      <Card className="border-amber-500/20">
+        <CardHeader className="pb-3">
+          <div className="flex items-start justify-between gap-4">
+            <div className="min-w-0">
+              <CardTitle className="text-base flex items-center gap-2">
+                <AlertTriangle className="h-4 w-4 text-amber-500" />
+                <Highlight text={t('settingspage.advanced.title')} />
+              </CardTitle>
+              <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                {t('settingspage.advanced.subtitle')}
+              </p>
+            </div>
+            {/* 搜索态下按钮无意义（强制展开），隐藏以免给出一个点了没反应的控件 */}
+            {!query && (
+              <Button variant="outline" size="sm" onClick={() => setOpen((v) => !v)} aria-expanded={expanded}>
+                {expanded ? (
+                  <>
+                    <ChevronUp className="mr-1.5 h-4 w-4" />
+                    {t('settingspage.advanced.collapse')}
+                  </>
+                ) : (
+                  <>
+                    <ChevronDown className="mr-1.5 h-4 w-4" />
+                    {t('settingspage.advanced.expand')}
+                  </>
+                )}
+              </Button>
+            )}
+          </div>
+        </CardHeader>
+      </Card>
+      {expanded && children}
+    </div>
+  )
+}
+
+/* ============ 工具容错：偏离线上推荐值的提示 ============ */
+
+// 工具容错七项开关在 FormState 里的键。线上推荐值 = 全开（含默认关的截断跨轮恢复）：
+// 宁可整轮重试也不下发半截参数。这里只用于统计"关了几项"做提示，不做任何强制。
+const TOOL_FAULT_SWITCH_KEYS = [
+  'toolRepairJson',
+  'toolStreamAlignFailure',
+  'toolExposeErrorToClient',
+  'toolCleanLeakedTokens',
+  'toolReclaimTextifiedInvoke',
+  'toolStrayRepeatGuard',
+  'toolTruncationRecovery',
+] as const
+
+// 七项里当前处于关闭状态的数量（0 = 与线上推荐一致）。
+function countToolFaultOff(form: FormState): number {
+  return TOOL_FAULT_SWITCH_KEYS.filter((k) => form[k] === false).length
+}
+
+// 单项工具容错行：关掉时在开关旁挂一个"偏离推荐值"角标。
+// 不做成不可关——运维需要逐项关掉排障。
+function ToolFaultRow({
+  label,
+  hint,
+  checked,
+  onChange,
+}: {
+  label: string
+  hint: string
+  checked: boolean
+  onChange: (v: boolean) => void
+}) {
+  const { t } = useTranslation()
+  return (
+    <Field label={label} hint={hint}>
+      <div className="flex items-center gap-2">
+        {!checked && (
+          <span className="rounded-full bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium text-amber-500">
+            {t('settingspage.advanced.tool.offBadge')}
+          </span>
+        )}
+        <Switch checked={checked} onCheckedChange={onChange} />
+      </div>
+    </Field>
   )
 }
 
@@ -1304,7 +1455,22 @@ function TrashCard() {
       toast.success(t('settingspage.trash.toast.restored', { id: item.id }))
       invalidate()
     } catch (err) {
-      toast.error(extractErrorMessage(err))
+      const msg = extractErrorMessage(err)
+      // 多开分身与主凭据**必然同 key**，默认路径会被 key 去重挡住。
+      // 这里自动重试一次强制恢复：恢复后仍是禁用态，不会跳过运维确认直接投入调度，
+      // 故这个自动重试是安全的。仍失败才把错误抛给用户。
+      if (msg.includes('重复')) {
+        try {
+          await restoreCredential(item.id, true)
+          toast.success(t('settingspage.trash.toast.restoredForced', { id: item.id }))
+          invalidate()
+          return
+        } catch (err2) {
+          toast.error(extractErrorMessage(err2))
+          return
+        }
+      }
+      toast.error(msg)
     } finally {
       setBusy(false)
     }
@@ -1505,9 +1671,9 @@ export function SettingsPage() {
     setForm((prev) => (prev ? { ...prev, [key]: value } : prev))
 
   // 计算与基线的差异，只提交改动的字段
-  const diff = useMemo<UpdateConfigRequest>(() => {
+  const diff = useMemo<UpdateWithCache>(() => {
     if (!config || !form) return {}
-    const d: UpdateConfigRequest = {}
+    const d: UpdateWithCache = {}
     if (form.host.trim() !== config.host) d.host = form.host.trim()
     const port = Number(form.port)
     if (Number.isFinite(port) && port !== config.port) d.port = port
@@ -1520,6 +1686,18 @@ export function SettingsPage() {
     if (form.defaultEndpoint.trim() !== config.defaultEndpoint) d.defaultEndpoint = form.defaultEndpoint.trim()
     if (form.extractThinking !== config.extractThinking) d.extractThinking = form.extractThinking
     if (form.ccAutoBuffer !== config.ccAutoBuffer) d.ccAutoBuffer = form.ccAutoBuffer
+    if (form.importKeysEnabled !== config.importKeysEnabled) d.importKeysEnabled = form.importKeysEnabled
+    // 上游 429 吸收层：布尔直比，整数解析后比对（空/非法不发）
+    if (form.upstreamRetryAbsorbEnabled !== (config.upstreamRetryAbsorbEnabled ?? false)) d.upstreamRetryAbsorbEnabled = form.upstreamRetryAbsorbEnabled
+    const nAbsorbBudget = parseInt(form.upstreamRetryAbsorbBudgetSecs, 10)
+    if (Number.isFinite(nAbsorbBudget) && nAbsorbBudget !== (config.upstreamRetryAbsorbBudgetSecs ?? 45)) d.upstreamRetryAbsorbBudgetSecs = nAbsorbBudget
+    const nAbsorbRounds = parseInt(form.upstreamRetryAbsorbMaxRounds, 10)
+    if (Number.isFinite(nAbsorbRounds) && nAbsorbRounds !== (config.upstreamRetryAbsorbMaxRounds ?? 3)) d.upstreamRetryAbsorbMaxRounds = nAbsorbRounds
+    const nAbsorbMinDelay = parseInt(form.upstreamRetryAbsorbMinDelayMs, 10)
+    if (Number.isFinite(nAbsorbMinDelay) && nAbsorbMinDelay !== (config.upstreamRetryAbsorbMinDelayMs ?? 150)) d.upstreamRetryAbsorbMinDelayMs = nAbsorbMinDelay
+    const nAbsorbMaxDelay = parseInt(form.upstreamRetryAbsorbMaxDelaySecs, 10)
+    if (Number.isFinite(nAbsorbMaxDelay) && nAbsorbMaxDelay !== (config.upstreamRetryAbsorbMaxDelaySecs ?? 15)) d.upstreamRetryAbsorbMaxDelaySecs = nAbsorbMaxDelay
+    if (form.upstreamRetryAbsorbSuspended !== (config.upstreamRetryAbsorbSuspended ?? false)) d.upstreamRetryAbsorbSuspended = form.upstreamRetryAbsorbSuspended
     if (form.stripEnvNoise !== config.stripEnvNoise) d.stripEnvNoise = form.stripEnvNoise
     if (form.toolCleanLeakedTokens !== (config.toolCleanLeakedTokens ?? true)) d.toolCleanLeakedTokens = form.toolCleanLeakedTokens
     if (form.toolReclaimTextifiedInvoke !== (config.toolReclaimTextifiedInvoke ?? true)) d.toolReclaimTextifiedInvoke = form.toolReclaimTextifiedInvoke
@@ -1530,8 +1708,12 @@ export function SettingsPage() {
     if (form.toolTruncationRecovery !== (config.toolTruncationRecovery ?? false)) d.toolTruncationRecovery = form.toolTruncationRecovery
     const descMax = Number(form.toolDescriptionMaxChars)
     if (Number.isFinite(descMax) && descMax >= 0 && descMax !== (config.toolDescriptionMaxChars ?? 10000)) d.toolDescriptionMaxChars = descMax
+    if (form.promptCacheEnabled !== ((config as ConfigWithCache).promptCacheEnabled ?? PROMPT_CACHE_DEFAULT))
+      d.promptCacheEnabled = form.promptCacheEnabled
     if (form.encryptCredentialsAtRest !== (config.encryptCredentialsAtRest ?? false)) d.encryptCredentialsAtRest = form.encryptCredentialsAtRest
     if (form.cooldownEnabled !== config.cooldownEnabled) d.cooldownEnabled = form.cooldownEnabled
+    if (form.autoDisableSuspicious !== config.autoDisableSuspicious)
+      d.autoDisableSuspicious = form.autoDisableSuspicious
     if (form.allCoolingFastFail !== (config.allCoolingFastFail ?? true)) d.allCoolingFastFail = form.allCoolingFastFail
     if (form.rateLimitEnabled !== config.rateLimitEnabled) d.rateLimitEnabled = form.rateLimitEnabled
     const daily = Number(form.rateLimitDailyMax)
@@ -1730,9 +1912,11 @@ export function SettingsPage() {
         </div>
       </div>
 
-      {/* 分区导航 tab：搜索态下隐藏（改为跨区展示命中项） */}
+      {/* 分区导航 tab：搜索态下隐藏（改为跨区展示命中项）。
+          flex-nowrap + overflow-x-auto = 11 个分区**单行并排**，超出横向滚动（不换行）。
+          whitespace-nowrap shrink-0 防按钮文字换行/收缩。 */}
       {!query && (
-        <div className="flex flex-wrap gap-2 border-b pb-3">
+        <div className="flex flex-nowrap gap-1 overflow-x-auto border-b pb-3">
           {SECTION_DEFS.map((s) => {
             const Icon = s.icon
             const isActive = s.id === activeSection
@@ -1741,6 +1925,7 @@ export function SettingsPage() {
                 key={s.id}
                 variant={isActive ? 'default' : 'outline'}
                 size="sm"
+                className="shrink-0 whitespace-nowrap"
                 onClick={() => setActiveSection(s.id)}
               >
                 <Icon className="mr-1.5 h-4 w-4" />
@@ -1814,6 +1999,11 @@ export function SettingsPage() {
       {/* 令牌导出分区：单个 / 全部凭据 JSON 下载 */}
       <SectionGate section="export" titleKey="settingspage.card.export" kwKey="settingspage.card.export.kw">
         <TokenExportCard />
+      </SectionGate>
+
+      {/* 分身管理分区：分身组视图 + 可复用代理节点池 */}
+      <SectionGate section="clones" titleKey="settingspage.card.clones" kwKey="settingspage.card.clones.kw">
+        <CloneManagementCard />
       </SectionGate>
 
       {/* 回收站分区：已删除凭据的恢复 / 永久清除 */}
@@ -2101,6 +2291,8 @@ export function SettingsPage() {
           <Field label={t('settingspage.protocol.ccAuto.label')} hint={`${t('settingspage.protocol.ccAuto.hint')}${hotParen}`}>
             <Switch checked={form.ccAutoBuffer} onCheckedChange={(v) => set('ccAutoBuffer', v)} />
           </Field>
+          {/* 上游 429 吸收层已迁到「高级选项」分区：它与外置 shield 叠乘放大，
+              放在基础协议卡里容易被顺手打开。 */}
           <Field label={t('settingspage.protocol.stripEnv.label')} hint={`${t('settingspage.protocol.stripEnv.hint')}${hotParen}`}>
             <Switch checked={form.stripEnvNoise} onCheckedChange={(v) => set('stripEnvNoise', v)} />
           </Field>
@@ -2108,40 +2300,139 @@ export function SettingsPage() {
       </Card>
       </SectionGate>
 
-      <SectionGate section="basic" titleKey="settingspage.card.toolFault" kwKey="settingspage.card.toolFault.kw">
+      {/* 高级选项分区：工具容错 / 吸收层 / 缓存记账。整组默认折叠（搜索态强制展开）。
+          外层这道判定只管折叠壳本身：搜索时若三张卡都没命中，连壳子也不该出现，
+          否则在别的分区搜东西会白挂一个"高级选项"标题。卡片各自的显隐仍由 SectionGate 管。 */}
+      {(query ? matchedSections.has('advanced') : activeSection === 'advanced') && (
+      <AdvancedDisclosure>
+      <SectionGate section="advanced" titleKey="settingspage.card.toolFault" kwKey="settingspage.card.toolFault.kw">
       <Card>
         <CardHeader className="pb-2">
           <CardTitle className="text-base"><Highlight text={t('settingspage.card.toolFault')} /></CardTitle>
           <p className="text-xs text-muted-foreground">{t('settingspage.tool.cardSubtitle')}</p>
         </CardHeader>
         <CardContent className="py-0">
-          <Field label={t('settingspage.tool.repairJson.label')} hint={t('settingspage.tool.repairJson.hint')}>
-            <Switch checked={form.toolRepairJson} onCheckedChange={(v) => set('toolRepairJson', v)} />
-          </Field>
-          <Field label={t('settingspage.tool.streamAlign.label')} hint={t('settingspage.tool.streamAlign.hint')}>
-            <Switch checked={form.toolStreamAlignFailure} onCheckedChange={(v) => set('toolStreamAlignFailure', v)} />
-          </Field>
-          <Field label={t('settingspage.tool.exposeError.label')} hint={t('settingspage.tool.exposeError.hint')}>
-            <Switch checked={form.toolExposeErrorToClient} onCheckedChange={(v) => set('toolExposeErrorToClient', v)} />
-          </Field>
-          <Field label={t('settingspage.tool.cleanLeaked.label')} hint={t('settingspage.tool.cleanLeaked.hint')}>
-            <Switch checked={form.toolCleanLeakedTokens} onCheckedChange={(v) => set('toolCleanLeakedTokens', v)} />
-          </Field>
-          <Field label={t('settingspage.tool.reclaim.label')} hint={t('settingspage.tool.reclaim.hint')}>
-            <Switch checked={form.toolReclaimTextifiedInvoke} onCheckedChange={(v) => set('toolReclaimTextifiedInvoke', v)} />
-          </Field>
-          <Field label={t('settingspage.tool.strayGuard.label')} hint={t('settingspage.tool.strayGuard.hint')}>
-            <Switch checked={form.toolStrayRepeatGuard} onCheckedChange={(v) => set('toolStrayRepeatGuard', v)} />
-          </Field>
-          <Field label={t('settingspage.tool.truncation.label')} hint={t('settingspage.tool.truncation.hint')}>
-            <Switch checked={form.toolTruncationRecovery} onCheckedChange={(v) => set('toolTruncationRecovery', v)} />
-          </Field>
+          {/* 线上七项全开的依据写进文案；关了几项就提示几项，但不阻止关闭。 */}
+          <Callout variant={countToolFaultOff(form) > 0 ? 'warning' : 'info'} className="my-3 text-xs">
+            <div>{t('settingspage.advanced.tool.recommend')}</div>
+            {countToolFaultOff(form) > 0 && (
+              <div className="mt-1 font-medium">
+                {t('settingspage.advanced.tool.offCount', { n: countToolFaultOff(form) })}
+              </div>
+            )}
+          </Callout>
+          <ToolFaultRow
+            label={t('settingspage.tool.repairJson.label')}
+            hint={t('settingspage.tool.repairJson.hint')}
+            checked={form.toolRepairJson}
+            onChange={(v) => set('toolRepairJson', v)}
+          />
+          <ToolFaultRow
+            label={t('settingspage.tool.streamAlign.label')}
+            hint={t('settingspage.tool.streamAlign.hint')}
+            checked={form.toolStreamAlignFailure}
+            onChange={(v) => set('toolStreamAlignFailure', v)}
+          />
+          <ToolFaultRow
+            label={t('settingspage.tool.exposeError.label')}
+            hint={t('settingspage.tool.exposeError.hint')}
+            checked={form.toolExposeErrorToClient}
+            onChange={(v) => set('toolExposeErrorToClient', v)}
+          />
+          <ToolFaultRow
+            label={t('settingspage.tool.cleanLeaked.label')}
+            hint={t('settingspage.tool.cleanLeaked.hint')}
+            checked={form.toolCleanLeakedTokens}
+            onChange={(v) => set('toolCleanLeakedTokens', v)}
+          />
+          <ToolFaultRow
+            label={t('settingspage.tool.reclaim.label')}
+            hint={t('settingspage.tool.reclaim.hint')}
+            checked={form.toolReclaimTextifiedInvoke}
+            onChange={(v) => set('toolReclaimTextifiedInvoke', v)}
+          />
+          <ToolFaultRow
+            label={t('settingspage.tool.strayGuard.label')}
+            hint={t('settingspage.tool.strayGuard.hint')}
+            checked={form.toolStrayRepeatGuard}
+            onChange={(v) => set('toolStrayRepeatGuard', v)}
+          />
+          <ToolFaultRow
+            label={t('settingspage.tool.truncation.label')}
+            hint={t('settingspage.tool.truncation.hint')}
+            checked={form.toolTruncationRecovery}
+            onChange={(v) => set('toolTruncationRecovery', v)}
+          />
           <Field label={t('settingspage.tool.descMax.label')} hint={t('settingspage.tool.descMax.hint')}>
             <NumberStepper value={Number(form.toolDescriptionMaxChars) || 0} onChange={(v) => set('toolDescriptionMaxChars', String(v))} min={0} step={1000} className="w-32" aria-label={t('settingspage.tool.descMax.aria')} />
           </Field>
         </CardContent>
       </Card>
       </SectionGate>
+
+      {/* 高级选项：上游 429 吸收层。带显著警告——与外置 shield 叠乘 + 预算缺口未修完。 */}
+      <SectionGate section="advanced" titleKey="settingspage.card.advAbsorb" kwKey="settingspage.card.advAbsorb.kw">
+      <Card className="border-amber-500/20">
+        <CardHeader className="pb-2">
+          <CardTitle className="text-base flex items-center gap-2">
+            <AlertTriangle className="h-4 w-4 text-amber-500" />
+            <Highlight text={t('settingspage.card.advAbsorb')} />
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="py-0">
+          <Callout variant="warning" className="my-3 text-xs">
+            <div className="font-medium">{t('settingspage.advanced.absorb.warnTitle')}</div>
+            <ul className="mt-1 list-disc space-y-1 pl-4">
+              <li>{t('settingspage.advanced.absorb.warnGap')}</li>
+              <li>{t('settingspage.advanced.absorb.warnShield')}</li>
+            </ul>
+          </Callout>
+          <Field label={t('settings.absorb.enabled')} hint={`${t('settings.absorb.enabledHint')}${hotParen}`}>
+            <Switch checked={form.upstreamRetryAbsorbEnabled} onCheckedChange={(v) => set('upstreamRetryAbsorbEnabled', v)} />
+          </Field>
+          <GroupHeading label={t('settingspage.advanced.absorb.tuningGroup')} />
+          {/* min=45 与后端 from_config 的 budget 下限一致：低于 45 会反向砍掉既有的
+              failover 墙钟（round_budget 是 min(45s, 剩余预算)），后端已强制抬回，
+              这里同步 min 是为了让面板不给出一个「填了不生效」的值。 */}
+          <Field label={t('settings.absorb.budgetSecs')} hint={t('settings.absorb.budgetSecsHint')}>
+            <NumberStepper value={Number(form.upstreamRetryAbsorbBudgetSecs) || 0} onChange={(v) => set('upstreamRetryAbsorbBudgetSecs', String(v))} min={45} max={600} step={5} className="w-28" disabled={!form.upstreamRetryAbsorbEnabled} aria-label={t('settings.absorb.budgetSecs')} />
+          </Field>
+          <Field label={t('settings.absorb.maxRounds')} hint={t('settings.absorb.maxRoundsHint')}>
+            <NumberStepper value={Number(form.upstreamRetryAbsorbMaxRounds) || 0} onChange={(v) => set('upstreamRetryAbsorbMaxRounds', String(v))} min={1} max={64} className="w-28" disabled={!form.upstreamRetryAbsorbEnabled} aria-label={t('settings.absorb.maxRounds')} />
+          </Field>
+          <Field label={t('settings.absorb.minDelayMs')} hint={t('settingspage.advanced.absorb.minDelayHint')}>
+            <NumberStepper value={Number(form.upstreamRetryAbsorbMinDelayMs) || 0} onChange={(v) => set('upstreamRetryAbsorbMinDelayMs', String(v))} min={0} max={60000} step={50} className="w-28" disabled={!form.upstreamRetryAbsorbEnabled} aria-label={t('settings.absorb.minDelayMs')} />
+          </Field>
+          <Field label={t('settings.absorb.maxDelaySecs')} hint={t('settingspage.advanced.absorb.maxDelayHint')}>
+            <NumberStepper value={Number(form.upstreamRetryAbsorbMaxDelaySecs) || 0} onChange={(v) => set('upstreamRetryAbsorbMaxDelaySecs', String(v))} min={1} max={600} className="w-28" disabled={!form.upstreamRetryAbsorbEnabled} aria-label={t('settings.absorb.maxDelaySecs')} />
+          </Field>
+          <Field label={t('settings.absorb.suspended')} hint={t('settingspage.advanced.absorb.suspendedHint')}>
+            <Switch checked={form.upstreamRetryAbsorbSuspended} onCheckedChange={(v) => set('upstreamRetryAbsorbSuspended', v)} disabled={!form.upstreamRetryAbsorbEnabled} />
+          </Field>
+        </CardContent>
+      </Card>
+      </SectionGate>
+
+      {/* 高级选项：prompt 缓存记账。文案必须说清这个数是网关本地估算、不是上游真值。 */}
+      <SectionGate section="advanced" titleKey="settingspage.card.advCache" kwKey="settingspage.card.advCache.kw">
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="text-base"><Highlight text={t('settingspage.card.advCache')} /></CardTitle>
+        </CardHeader>
+        <CardContent className="py-0">
+          <Callout variant="info" className="my-3 text-xs">
+            <div>{t('settingspage.advanced.cache.estimateNote')}</div>
+            <div className="mt-1">{t('settingspage.advanced.cache.noSavingsClaim')}</div>
+          </Callout>
+          <Field label={t('settingspage.advanced.cache.enabled.label')} hint={`${t('settingspage.advanced.cache.enabled.hint')}${hotParen}`}>
+            <Switch checked={form.promptCacheEnabled} onCheckedChange={(v) => set('promptCacheEnabled', v)} />
+          </Field>
+          <ReadonlyRow label={t('settingspage.advanced.cache.ttl.label')} value={t('settingspage.advanced.cache.ttl.value')} />
+        </CardContent>
+      </Card>
+      </SectionGate>
+      </AdvancedDisclosure>
+      )}
 
       {/* 调度分区：防关联 / 限流（需重启） */}
       <SectionGate section="scheduling" titleKey="settingspage.card.antiAssoc" kwKey="settingspage.card.antiAssoc.kw">
@@ -2175,6 +2466,17 @@ export function SettingsPage() {
                       className="w-28"
                       disabled={!form.cooldownEnabled}
                       aria-label={t('settingspage.anti.cooldownScale.aria')}
+                    />
+                  </Field>
+                  {/* 账户级 403 风控自动禁用。此前该项只存在于 config.json，面板既看不到
+                      也改不了（后端缺 types/service 接线），排查时会得出错误结论。 */}
+                  <Field
+                    label={t('settingspage.anti.autoDisableSuspicious.label')}
+                    hint={`${t('settingspage.anti.autoDisableSuspicious.hint')}${hotParen}`}
+                  >
+                    <Switch
+                      checked={form.autoDisableSuspicious}
+                      onCheckedChange={(v) => set('autoDisableSuspicious', v)}
                     />
                   </Field>
                 </SearchContext.Provider>
@@ -2338,6 +2640,17 @@ export function SettingsPage() {
             <Switch
               checked={form.encryptCredentialsAtRest}
               onCheckedChange={(v) => set('encryptCredentialsAtRest', v)}
+            />
+          </Field>
+          {/* 批量推号入口开关：门在 handler 内（解析请求体之前），故热更即时生效。
+              默认开 —— 该端点先于开关存在且外部 kiro-accounting 正在用。 */}
+          <Field
+            label={t('settingspage.security.importKeys.label')}
+            hint={`${t('settingspage.security.importKeys.hint')}${hotParen}`}
+          >
+            <Switch
+              checked={form.importKeysEnabled}
+              onCheckedChange={(v) => set('importKeysEnabled', v)}
             />
           </Field>
           <Field

@@ -340,7 +340,13 @@ export function OverviewPage() {
   const recent = useUsageRecentLive(60)
   // 限流健康 insights（10s 轮询，只读内存零上游）。
   const insights = useRatelimitInsights()
-  // 火力全开号集合（RPM 饱和）：状态条据此点燃 WebGL 火焰。同时通常仅 1-2 个。
+  // 火力全开号集合（RPM 饱和）：状态条据此判断**哪些号够资格**点燃 WebGL 火焰。
+  //
+  // ⚠️ 这里原先写的是"同时通常仅 1-2 个"——那是**假设，不是约束**，且实测不成立：
+  // 多号同时打猛时会挂出十几个 WebGL 上下文，越过浏览器硬上限（WebKit/Chrome 都在 16 附近）
+  // 后最老的上下文被强制丢弃，canvas 静默变空白而 RAF 仍每帧对死上下文发一整套 GL 命令
+  // —— 画面没了、开销全在（实测 WebKit.GPU 102% 而 WebContent 0.0%，刷新后掉到 7%）。
+  // 真正的上限现在由 `pickFireCandidates` 硬顶在 `MAX_FIRE_INSTANCES`，见 FireCanvas.tsx。
   const saturatedIds = useMemo(
     () => new Set((insights.data ?? []).filter((it) => it.rpmSaturated).map((it) => it.id)),
     [insights.data],

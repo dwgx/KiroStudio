@@ -7,13 +7,13 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use axum::{
+    Json,
     extract::{Query, State},
     http::StatusCode,
     response::{
-        sse::{Event, KeepAlive, Sse},
         IntoResponse,
+        sse::{Event, KeepAlive, Sse},
     },
-    Json,
 };
 use futures::Stream;
 use serde::{Deserialize, Serialize};
@@ -483,7 +483,7 @@ pub async fn logs_export(Query(q): Query<LogsQuery>) -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_recent_limit, MAX_RECENT_LIMIT};
+    use super::{MAX_RECENT_LIMIT, resolve_recent_limit};
 
     #[test]
     fn test_resolve_recent_limit_default_when_absent() {
@@ -503,13 +503,19 @@ mod tests {
         assert_eq!(resolve_recent_limit(Some(200)), 200);
         // 用**符号**而非字面量：硬上限已从 50000 降到 2000（见 MAX_RECENT_LIMIT 的说明），
         // 写死字面量会让上限的每次调整都连带改这里，且容易写出 > 上限的值。
-        assert_eq!(resolve_recent_limit(Some(MAX_RECENT_LIMIT)), MAX_RECENT_LIMIT);
+        assert_eq!(
+            resolve_recent_limit(Some(MAX_RECENT_LIMIT)),
+            MAX_RECENT_LIMIT
+        );
     }
 
     #[test]
     fn test_resolve_recent_limit_clamped_to_hard_cap() {
         // 超过硬上限（含旧的 5000 之上）一律裁剪到 MAX_RECENT_LIMIT，防拖垮服务
-        assert_eq!(resolve_recent_limit(Some(MAX_RECENT_LIMIT + 1)), MAX_RECENT_LIMIT);
+        assert_eq!(
+            resolve_recent_limit(Some(MAX_RECENT_LIMIT + 1)),
+            MAX_RECENT_LIMIT
+        );
         assert_eq!(resolve_recent_limit(Some(usize::MAX)), MAX_RECENT_LIMIT);
         // 回归（实测驱动）：上限必须足够小，使单次查询的**持锁时间**不会顶住用量写入管道。
         //
@@ -523,5 +529,143 @@ mod tests {
             "MAX_RECENT_LIMIT={MAX_RECENT_LIMIT} 过大：单次查询持锁会顶住用量写入管道并丢记录。\
              需要更大范围请走 traces_search 的分页/过滤，不要一次性拉全量"
         );
+    }
+
+    // ===== 端点级：retries 指标必须真的出现在 HTTP 响应体里 =====
+    //
+    // 为什么要在**端点**层再测一遍（`usage_stats.rs` 已测过 DTO 序列化）：
+    // 那边测的是 `serde_json::to_string(dto)`，而这里过的是 axum 的 `Json(..)`
+    // + `IntoResponse` 全链路。两者之间还能出岔子（handler 拿错方法、包了层
+    // 别的 DTO、状态未启用时静默 503），只有读**响应体**才能证明前端真拿得到。
+
+    use std::sync::Arc;
+
+    use axum::body::to_bytes;
+    use axum::extract::{Query, State};
+    use axum::response::IntoResponse;
+
+    use super::{
+        TimeseriesQuery, usage_by_credential, usage_by_model, usage_overview, usage_timeseries,
+    };
+    use crate::admin::middleware::AdminState;
+    use crate::admin::service::AdminService;
+    use crate::kiro::token_manager::MultiTokenManager;
+    use crate::usage::pipeline::UsageSink;
+    use crate::usage::record::{RequestOutcome, RequestRecord};
+    use crate::usage::usage_stats::UsageStats;
+
+    /// 造一个最小 AdminService（单个 api_key 凭据，零上游调用）。
+    fn mk_service() -> AdminService {
+        let mut c = crate::kiro::model::credentials::KiroCredentials::default();
+        c.id = Some(1);
+        c.auth_method = Some("api_key".to_string());
+        c.kiro_api_key = Some("ksk_test".to_string());
+        let tm = Arc::new(
+            MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                vec![c],
+                None,
+                None,
+                false,
+            )
+            .expect("构造 token manager"),
+        );
+        AdminService::new(tm, Vec::<String>::new())
+    }
+
+    /// 造一个挂了用量统计的 AdminState：3 条记录（2 条各重试 3 次 + 1 条零重试）。
+    fn state_with_retry_records() -> AdminState {
+        let stats = Arc::new(UsageStats::new(
+            std::env::temp_dir().join("kiro_usage_handlers_test_ignore"),
+        ));
+        for retries in [3u32, 3, 0] {
+            let mut r = RequestRecord::new("req", "sonnet");
+            r.credential_id = Some(9);
+            r.outcome = RequestOutcome::RateLimited;
+            r.input_tokens = 10;
+            r.output_tokens = 5;
+            r.latency_ms = 100;
+            r.retries = retries;
+            stats.on_record(&r);
+        }
+        let mut st = AdminState::new("k", mk_service());
+        st.usage_stats = Some(stats);
+        st
+    }
+
+    /// 取 handler 响应体文本（响应体不大，直接全读）。
+    async fn body_text(resp: axum::response::Response) -> String {
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// ⭐ 回归（已知问题 #21 出口部分）：`GET /usage/overview` 必须下发 retries 两项计数。
+    ///
+    /// 删掉 `WindowSummary` 的 `retries_sum:` 那行 → 编译期就断（字段必填），
+    /// 改成 `#[serde(skip)]` 或加 `rename_all = "camelCase"` → 本测试 FAILED。
+    #[tokio::test]
+    async fn overview_endpoint_emits_retries_fields() {
+        let body = body_text(
+            usage_overview(State(state_with_retry_records()))
+                .await
+                .into_response(),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let w = &v["last_24h"];
+        assert_eq!(w["retries_sum"], 6, "{body}");
+        assert_eq!(w["retried_requests"], 2, "{body}");
+        assert_eq!(w["avg_retries_per_request"], 2.0, "6/3 = 2.0；{body}");
+        assert_eq!(w["avg_retries_when_retried"], 3.0, "6/2 = 3.0；{body}");
+        // 前端类型按 snake_case 写死 —— camelCase 出现即等于前端读不到
+        assert!(!body.contains("retriesSum"), "出口不得 camelCase：{body}");
+    }
+
+    /// `GET /usage/timeseries` 两种粒度都必须带 retries（漏一个 = 切粒度后趋势归零）。
+    #[tokio::test]
+    async fn timeseries_endpoint_emits_retries_for_both_granularities() {
+        for g in ["hourly", "daily"] {
+            let st = state_with_retry_records();
+            let resp = usage_timeseries(
+                State(st),
+                Query(TimeseriesQuery {
+                    granularity: Some(g.to_string()),
+                }),
+            )
+            .await
+            .into_response();
+            let body = body_text(resp).await;
+            let pts: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+            let last = pts.last().expect("至少一个桶");
+            assert_eq!(last["retries_sum"], 6, "granularity={g}；{body}");
+            assert_eq!(last["retried_requests"], 2, "granularity={g}；{body}");
+        }
+    }
+
+    /// `GET /usage/by-model` 与 `/usage/by-credential` 都走 `GroupStat`，两条路径各断言一次。
+    #[tokio::test]
+    async fn group_endpoints_emit_retries_fields() {
+        let by_model = body_text(
+            usage_by_model(State(state_with_retry_records()))
+                .await
+                .into_response(),
+        )
+        .await;
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&by_model).unwrap();
+        let m = rows.iter().find(|r| r["key"] == "sonnet").unwrap();
+        assert_eq!(m["retries_sum"], 6, "{by_model}");
+        assert_eq!(m["retried_requests"], 2, "{by_model}");
+        assert_eq!(m["avg_retries_per_request"], 2.0, "{by_model}");
+
+        let by_cred = body_text(
+            usage_by_credential(State(state_with_retry_records()))
+                .await
+                .into_response(),
+        )
+        .await;
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&by_cred).unwrap();
+        let c = rows.iter().find(|r| r["key"] == "9").unwrap();
+        assert_eq!(c["retries_sum"], 6, "{by_cred}");
+        assert_eq!(c["retried_requests"], 2, "{by_cred}");
     }
 }

@@ -104,9 +104,15 @@ mod tests {
             let payload = vec![b'A'; 64 * 1024];
             let head = format!("{:x}\r\n", payload.len());
             for _ in 0..chunks {
-                if sock.write_all(head.as_bytes()).await.is_err() { return; }
-                if sock.write_all(&payload).await.is_err() { return; }
-                if sock.write_all(b"\r\n").await.is_err() { return; }
+                if sock.write_all(head.as_bytes()).await.is_err() {
+                    return;
+                }
+                if sock.write_all(&payload).await.is_err() {
+                    return;
+                }
+                if sock.write_all(b"\r\n").await.is_err() {
+                    return;
+                }
             }
             let _ = sock.write_all(b"0\r\n\r\n").await;
             let _ = sock.flush().await;
@@ -119,7 +125,10 @@ mod tests {
     /// → 握手失败，报 hyper IncompleteMessage（与被测逻辑无关）。
     /// 这与已知问题 #19 同型：测试必须与本机网络环境无关。
     fn test_client() -> reqwest::Client {
-        reqwest::Client::builder().no_proxy().build().expect("构造测试 client")
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("构造测试 client")
     }
 
     /// 核心回归：**chunked 响应（无 Content-Length）也必须受上限约束**。

@@ -26,14 +26,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail};
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 
-use crate::http_client::{build_client, ProxyConfig};
+use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::auth::social::generate_pkce;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::{validate_microsoft_token_endpoint, MultiTokenManager};
+use crate::kiro::token_manager::{MultiTokenManager, validate_microsoft_token_endpoint};
 
 /// Kiro 托管登录页（用户在浏览器打开）。
 const KIRO_SIGNIN_URL: &str = "https://app.kiro.dev/signin";
@@ -153,7 +153,10 @@ impl ExternalIdpLoginManager {
     ///
     /// 用户可能把账密内嵌 URL（socks5://user:pass@host:port）——拆出账密独立设置，
     /// 否则 SOCKS5 无法认证；同时避免密码明文留 URL。
-    fn resolve_proxy(&self, proxy_url: Option<String>) -> (Option<ProxyConfig>, Option<ProxyConfig>) {
+    fn resolve_proxy(
+        &self,
+        proxy_url: Option<String>,
+    ) -> (Option<ProxyConfig>, Option<ProxyConfig>) {
         let config = self.token_manager.config();
         let global = config.proxy_url.as_ref().map(|url| {
             let mut p = ProxyConfig::new(url);
@@ -269,16 +272,26 @@ impl ExternalIdpLoginManager {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .ok_or_else(|| anyhow!("外部 IdP descriptor 缺少 client_id"))?;
-        let scopes = params.get("scopes").map(|s| s.trim().to_string()).unwrap_or_default();
-        let login_hint = params.get("login_hint").map(|s| s.trim().to_string()).unwrap_or_default();
+        let scopes = params
+            .get("scopes")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let login_hint = params
+            .get("login_hint")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
 
         // SSRF：issuer 来自 portal 回调（可被诱导），先按 Microsoft 登录域白名单校验，
         // 再 discover；discover 拿到的 authorize/token 端点也逐一校验。
         validate_microsoft_token_endpoint(&issuer_url)
             .context("外部 IdP issuer_url 未通过 Microsoft 登录域白名单校验")?;
 
-        let (auth_endpoint, token_endpoint) =
-            oidc_discover(&issuer_url, proxy.as_ref(), self.token_manager.config().tls_backend).await?;
+        let (auth_endpoint, token_endpoint) = oidc_discover(
+            &issuer_url,
+            proxy.as_ref(),
+            self.token_manager.config().tls_backend,
+        )
+        .await?;
         validate_microsoft_token_endpoint(&auth_endpoint)
             .context("OIDC discovery 的 authorization_endpoint 未通过白名单校验")?;
         validate_microsoft_token_endpoint(&token_endpoint)
@@ -373,7 +386,9 @@ impl ExternalIdpLoginManager {
             preferred_region.as_deref(),
         )
         .await
-        .context("解析 CodeWhisperer profileArn 失败（该 M365 账号可能未开通 Kiro/CodeWhisperer）")?;
+        .context(
+            "解析 CodeWhisperer profileArn 失败（该 M365 账号可能未开通 Kiro/CodeWhisperer）",
+        )?;
 
         if profiles.is_empty() {
             bail!("该账号在候选 region 均无可用 profile（可能未开通 Kiro/CodeWhisperer）");
@@ -447,16 +462,14 @@ impl ExternalIdpLoginManager {
         arn: &str,
     ) -> anyhow::Result<ExternalIdpSelectResult> {
         let cred_id = self.build_and_add_credential(session_id, arn).await?;
-        Ok(ExternalIdpSelectResult { credential_id: cred_id })
+        Ok(ExternalIdpSelectResult {
+            credential_id: cred_id,
+        })
     }
 
     /// 用 session 暂存的 token + 指定 arn 构建凭据并入池。arn 必须在暂存 profiles 内。
     /// region/auth_region 全部取 **arn 内的 region**(防呆铁律:region 与 ARN 物理绑定)。
-    async fn build_and_add_credential(
-        &self,
-        session_id: &str,
-        arn: &str,
-    ) -> anyhow::Result<u64> {
+    async fn build_and_add_credential(&self, session_id: &str, arn: &str) -> anyhow::Result<u64> {
         let (pending, priority, custom_proxy) = {
             let sessions = self.sessions.lock();
             let s = sessions
@@ -813,7 +826,10 @@ fn merge_probe_regions(preferred_region: Option<&str>) -> Vec<String> {
     use crate::kiro::token_manager::PROFILE_PROBE_REGIONS;
     let mut seen = std::collections::HashSet::new();
     let mut out: Vec<String> = Vec::new();
-    if let Some(pref) = preferred_region.map(|r| r.trim().to_lowercase()).filter(|r| !r.is_empty()) {
+    if let Some(pref) = preferred_region
+        .map(|r| r.trim().to_lowercase())
+        .filter(|r| !r.is_empty())
+    {
         if seen.insert(pref.clone()) {
             out.push(pref);
         }
@@ -891,7 +907,7 @@ async fn probe_profiles_usable(
     config: &crate::model::config::Config,
     proxy: Option<&ProxyConfig>,
 ) {
-    use crate::kiro::token_manager::{probe_profile_usable, ProfileProbeOutcome};
+    use crate::kiro::token_manager::{ProfileProbeOutcome, probe_profile_usable};
     // 临时 external_idp 基准凭据：只需 auth_method + token 供 probe 构造请求。
     let base = KiroCredentials {
         access_token: Some(access_token.to_string()),
@@ -915,13 +931,19 @@ async fn probe_profiles_usable(
 /// 从 `arn:aws:codewhisperer:{region}:...` 提取 region（index 3）。
 fn region_from_profile_arn(arn: &str) -> Option<String> {
     let parts: Vec<&str> = arn.trim().split(':').collect();
-    parts.get(3).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    parts
+        .get(3)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// 从 `arn:aws:codewhisperer:{region}:{account}:...` 提取 account（index 4，供前端展示区分账号）。
 fn account_from_profile_arn(arn: &str) -> Option<String> {
     let parts: Vec<&str> = arn.trim().split(':').collect();
-    parts.get(4).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    parts
+        .get(4)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// SHA-256 十六进制。
@@ -965,7 +987,10 @@ mod tests {
         use crate::kiro::token_manager::PROFILE_PROBE_REGIONS;
         // 无优先区域 → 恰好等于默认候选表（顺序不变）。
         let got = merge_probe_regions(None);
-        let want: Vec<String> = PROFILE_PROBE_REGIONS.iter().map(|s| s.to_string()).collect();
+        let want: Vec<String> = PROFILE_PROBE_REGIONS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         assert_eq!(got, want);
     }
 
@@ -974,7 +999,10 @@ mod tests {
         use crate::kiro::token_manager::PROFILE_PROBE_REGIONS;
         // 冷门区域（不在默认表内）→ 排头、其余原样、总数 +1。
         let cold = "ap-northeast-3";
-        assert!(!PROFILE_PROBE_REGIONS.contains(&cold), "该测试要求 cold 不在默认表内");
+        assert!(
+            !PROFILE_PROBE_REGIONS.contains(&cold),
+            "该测试要求 cold 不在默认表内"
+        );
         let got = merge_probe_regions(Some(cold));
         assert_eq!(got.first().map(|s| s.as_str()), Some(cold));
         assert_eq!(got.len(), PROFILE_PROBE_REGIONS.len() + 1);
@@ -995,7 +1023,10 @@ mod tests {
         let dup_upper = PROFILE_PROBE_REGIONS[0].to_uppercase();
         let got = merge_probe_regions(Some(&dup_upper));
         assert_eq!(got.len(), PROFILE_PROBE_REGIONS.len());
-        assert_eq!(got.first().map(|s| s.as_str()), Some(PROFILE_PROBE_REGIONS[0]));
+        assert_eq!(
+            got.first().map(|s| s.as_str()),
+            Some(PROFILE_PROBE_REGIONS[0])
+        );
     }
 
     #[test]

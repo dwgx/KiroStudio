@@ -350,7 +350,8 @@ mod tests {
 
     #[test]
     fn test_extract_meta_basic() {
-        let html = r#"<meta name="csrf-token" content="abc123"><meta name="user-id" content="u-42">"#;
+        let html =
+            r#"<meta name="csrf-token" content="abc123"><meta name="user-id" content="u-42">"#;
         assert_eq!(extract_meta(html, "csrf-token"), Some("abc123".to_string()));
         assert_eq!(extract_meta(html, "user-id"), Some("u-42".to_string()));
     }
@@ -395,13 +396,6 @@ mod tests {
             TlsBackend::Rustls,
         ));
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("profileArn")
-        );
+        assert!(result.unwrap_err().to_string().contains("profileArn"));
     }
 }
-
-

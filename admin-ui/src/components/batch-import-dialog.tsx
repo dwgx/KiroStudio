@@ -305,7 +305,15 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               kiroApiKey: cred.kiroApiKey?.trim(),
               priority: cred.priority || 0,
               authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
-              apiRegion: cred.apiRegion?.trim() || undefined,
+              // ksk_ 号的 region 必须同时写进 apiRegion：它才是 CLI 端点 host
+              // (q.{region}.amazonaws.com) 的决定字段。只写 authRegion 有两个后果：
+              // ① 该值不直接决定 host；② 任一 region 字段存在就让后端的自动探测
+              // 整个跳过 —— 于是错的区既不被纠正、也不被用作 host。
+              apiRegion:
+                cred.apiRegion?.trim() ||
+                cred.authRegion?.trim() ||
+                cred.region?.trim() ||
+                undefined,
               machineId: cred.machineId?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
             })

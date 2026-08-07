@@ -4,7 +4,7 @@
 //! Anthropic 上游,与我们方向一致)+ sub2api apicompat 的踩坑规则。用 serde_json::Value 做字段级
 //! 改写(对应 Go 的 gjson/sjson)。所有规则都为防我们上游(CodeWhisperer,吃 Anthropic 格式)400。
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 /// 默认 max_tokens(OpenAI 请求可不带,Anthropic 必填)。
 const DEFAULT_MAX_TOKENS: i64 = 32000;
@@ -14,7 +14,10 @@ pub fn random_hex(n: usize) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     // 轻量随机:时间 + 进程内计数器 + 地址熵,足够做 id(非安全用途)。
     static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let t = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
     let c = CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut seed = t ^ (c.wrapping_mul(0x9E3779B97F4A7C15)) ^ (&CTR as *const _ as u64);
     let mut out = String::with_capacity(n);
@@ -62,7 +65,10 @@ fn response_format_instruction(rf: &Value) -> Option<String> {
             // json_schema 既可能是 {json_schema:{schema:{..}}}(chat),也可能扁平在顶层(responses)。
             let js = rf.get("json_schema").unwrap_or(rf);
             let schema = js.get("schema").or_else(|| rf.get("schema"));
-            let name = js.get("name").and_then(|v| v.as_str()).unwrap_or("Response");
+            let name = js
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Response");
             let mut instr = format!(
                 "You must respond with a single valid JSON value only, with no prose, explanation, \
                  or markdown fences. The JSON must conform to this JSON Schema (named \"{name}\")"
@@ -200,7 +206,10 @@ pub fn openai_chat_to_anthropic(model: &str, raw: &Value, stream: bool) -> Value
             if t.get("type").and_then(|v| v.as_str()) == Some("function") {
                 if let Some(func) = t.get("function") {
                     let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    let desc = func.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                    let desc = func
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     let schema = func
                         .get("parameters")
                         .or_else(|| func.get("parametersJsonSchema"))
@@ -224,16 +233,26 @@ pub fn openai_chat_to_anthropic(model: &str, raw: &Value, stream: bool) -> Value
         if let Some(tc) = raw.get("tool_choice") {
             match tc {
                 Value::String(s) => match s.as_str() {
-                    "auto" => { out.insert("tool_choice".into(), json!({"type": "auto"})); }
-                    "required" => { out.insert("tool_choice".into(), json!({"type": "any"})); }
+                    "auto" => {
+                        out.insert("tool_choice".into(), json!({"type": "auto"}));
+                    }
+                    "required" => {
+                        out.insert("tool_choice".into(), json!({"type": "any"}));
+                    }
                     // "none" = 客户端明确禁止调用工具 → 显式下发 {type:none},绝不能不设(不设=回落默认 auto,
                     // 模型仍可能调工具,违背客户端意图)。Kiro 转换层不认时会忽略,无害。
-                    "none" => { out.insert("tool_choice".into(), json!({"type": "none"})); }
+                    "none" => {
+                        out.insert("tool_choice".into(), json!({"type": "none"}));
+                    }
                     _ => {}
                 },
                 Value::Object(_) => {
                     if tc.get("type").and_then(|v| v.as_str()) == Some("function") {
-                        if let Some(name) = tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()) {
+                        if let Some(name) = tc
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|v| v.as_str())
+                        {
                             out.insert("tool_choice".into(), json!({"type": "tool", "name": name}));
                         }
                     }
@@ -312,7 +331,10 @@ fn build_user_or_assistant(role: &str, m: &Value) -> Option<Value> {
                         .map(sanitize_tool_id)
                         .unwrap_or_else(gen_tool_call_id);
                     let func = call.get("function");
-                    let name = func.and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+                    let name = func
+                        .and_then(|f| f.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     let input = func
                         .and_then(|f| f.get("arguments"))
                         .and_then(|v| v.as_str())
@@ -320,7 +342,8 @@ fn build_user_or_assistant(role: &str, m: &Value) -> Option<Value> {
                         .and_then(|s| serde_json::from_str::<Value>(s).ok())
                         .filter(|v| v.is_object())
                         .unwrap_or_else(|| json!({}));
-                    content.push(json!({"type": "tool_use", "id": id, "name": name, "input": input}));
+                    content
+                        .push(json!({"type": "tool_use", "id": id, "name": name, "input": input}));
                 }
             }
         }
@@ -366,7 +389,11 @@ fn build_legacy_function_result(m: &Value) -> Value {
 fn tool_result_content(content: Option<&Value>) -> Value {
     match content {
         Some(Value::String(s)) => {
-            if s.is_empty() { json!("(empty)") } else { json!(s) }
+            if s.is_empty() {
+                json!("(empty)")
+            } else {
+                json!(s)
+            }
         }
         Some(Value::Array(parts)) => {
             let mut blocks: Vec<Value> = Vec::new();
@@ -377,7 +404,11 @@ fn tool_result_content(content: Option<&Value>) -> Value {
                     blocks.push(b);
                 }
             }
-            if blocks.is_empty() { json!("(empty)") } else { json!(blocks) }
+            if blocks.is_empty() {
+                json!("(empty)")
+            } else {
+                json!(blocks)
+            }
         }
         _ => json!("(empty)"),
     }
@@ -391,11 +422,19 @@ fn openai_content_part_to_anthropic(part: &Value) -> Option<Value> {
             Some(json!({"type": "text", "text": t}))
         }
         Some("image_url") => {
-            let url = part.get("image_url").and_then(|u| u.get("url")).and_then(|v| v.as_str()).unwrap_or("");
+            let url = part
+                .get("image_url")
+                .and_then(|u| u.get("url"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             image_url_to_anthropic(url)
         }
         Some("file") => {
-            let data = part.get("file").and_then(|f| f.get("file_data")).and_then(|v| v.as_str()).unwrap_or("");
+            let data = part
+                .get("file")
+                .and_then(|f| f.get("file_data"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             data_uri_to_document(data)
         }
         _ => None,
@@ -414,7 +453,11 @@ fn image_url_to_anthropic(url: &str) -> Option<Value> {
         if data.is_empty() {
             return None; // 空 base64 data URI 丢弃(上游报错)
         }
-        let media_type = meta.split(';').next().filter(|s| !s.is_empty()).unwrap_or("image/png");
+        let media_type = meta
+            .split(';')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("image/png");
         Some(json!({
             "type": "image",
             "source": {"type": "base64", "media_type": media_type, "data": data}
@@ -442,7 +485,10 @@ fn data_uri_to_document(data: &str) -> Option<Value> {
 
 /// 清洗工具 id(Anthropic id 只接受安全字符;这里保守只留字母数字_-)。
 fn sanitize_tool_id(id: &str) -> String {
-    let s: String = id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect();
+    let s: String = id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
     if s.is_empty() { gen_tool_call_id() } else { s }
 }
 
@@ -488,7 +534,11 @@ fn normalize_tool_pairing_and_merge(messages: Vec<Value>) -> Vec<Value> {
     // ② 过滤块。
     let mut filtered: Vec<Value> = Vec::new();
     for m in messages {
-        let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let role = m
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let content = match m.get("content") {
             Some(Value::Array(c)) => c.clone(),
             other => {
@@ -527,14 +577,22 @@ fn normalize_tool_pairing_and_merge(messages: Vec<Value>) -> Vec<Value> {
     // ③ 合并连续同角色消息(content 数组拼接)。
     let mut merged: Vec<Value> = Vec::new();
     for m in filtered {
-        let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let role = m
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let same_as_prev = merged
             .last()
             .and_then(|l| l.get("role").and_then(|v| v.as_str()))
             == Some(role.as_str());
         if same_as_prev {
             // 同角色:把本条 content 追加到上一条的 content 数组。
-            let cur_content = m.get("content").and_then(|c| c.as_array()).cloned().unwrap_or_default();
+            let cur_content = m
+                .get("content")
+                .and_then(|c| c.as_array())
+                .cloned()
+                .unwrap_or_default();
             if let Some(prev_arr) = merged
                 .last_mut()
                 .and_then(|l| l.get_mut("content"))
@@ -554,7 +612,10 @@ fn normalize_tool_pairing_and_merge(messages: Vec<Value>) -> Vec<Value> {
         .and_then(|m| m.get("role").and_then(|v| v.as_str()))
         == Some("assistant")
     {
-        merged.insert(0, json!({"role": "user", "content": [{"type": "text", "text": ""}]}));
+        merged.insert(
+            0,
+            json!({"role": "user", "content": [{"type": "text", "text": ""}]}),
+        );
     }
 
     merged
@@ -584,7 +645,11 @@ pub fn openai_responses_to_anthropic(model: &str, raw: &Value, stream: bool) -> 
 
     // reasoning.effort → thinking(none→disabled,其余→enabled)。
     let mut thinking_enabled = false;
-    if let Some(effort) = raw.get("reasoning").and_then(|r| r.get("effort")).and_then(|v| v.as_str()) {
+    if let Some(effort) = raw
+        .get("reasoning")
+        .and_then(|r| r.get("effort"))
+        .and_then(|v| v.as_str())
+    {
         let e = effort.trim().to_lowercase();
         if e == "none" {
             out.insert("thinking".into(), json!({"type": "disabled"}));
@@ -605,7 +670,11 @@ pub fn openai_responses_to_anthropic(model: &str, raw: &Value, stream: bool) -> 
 
     // system:instructions 顶层字段(Responses 惯例)。
     let mut system_blocks: Vec<Value> = Vec::new();
-    if let Some(instr) = raw.get("instructions").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+    if let Some(instr) = raw
+        .get("instructions")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
         system_blocks.push(json!({"type": "text", "text": instr}));
     }
 
@@ -619,10 +688,17 @@ pub fn openai_responses_to_anthropic(model: &str, raw: &Value, stream: bool) -> 
         }
         Some(Value::Array(items)) => {
             for item in items {
-                let typ = item.get("type").and_then(|v| v.as_str()).unwrap_or_else(|| {
-                    // 无 type 但有 role → 当 message。
-                    if item.get("role").is_some() { "message" } else { "" }
-                });
+                let typ = item
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_else(|| {
+                        // 无 type 但有 role → 当 message。
+                        if item.get("role").is_some() {
+                            "message"
+                        } else {
+                            ""
+                        }
+                    });
                 match typ {
                     "message" => {
                         let role_raw = item.get("role").and_then(|v| v.as_str()).unwrap_or("user");
@@ -649,14 +725,15 @@ pub fn openai_responses_to_anthropic(model: &str, raw: &Value, stream: bool) -> 
                             .or_else(|| item.get("input"))
                             .and_then(|v| v.as_str())
                             .filter(|s| !s.is_empty());
-                        let input = match raw_args.and_then(|s| serde_json::from_str::<Value>(s).ok()) {
-                            Some(v) if v.is_object() => v,
-                            // 非 JSON object(自由文本/JSON 标量)→ 包进 {"input": ...} 保内容不丢。
-                            _ => match raw_args {
-                                Some(s) => json!({"input": s}),
-                                None => json!({}),
-                            },
-                        };
+                        let input =
+                            match raw_args.and_then(|s| serde_json::from_str::<Value>(s).ok()) {
+                                Some(v) if v.is_object() => v,
+                                // 非 JSON object(自由文本/JSON 标量)→ 包进 {"input": ...} 保内容不丢。
+                                _ => match raw_args {
+                                    Some(s) => json!({"input": s}),
+                                    None => json!({}),
+                                },
+                            };
                         messages.push(json!({
                             "role": "assistant",
                             "content": [{"type": "tool_use", "id": call_id, "name": name, "input": input}]
@@ -687,7 +764,8 @@ pub fn openai_responses_to_anthropic(model: &str, raw: &Value, stream: bool) -> 
     if let Some(Value::Array(tools)) = raw.get("tools") {
         let mut anth_tools: Vec<Value> = Vec::new();
         for t in tools {
-            if t.get("type").and_then(|v| v.as_str()) == Some("function") {
+            let ttype = t.get("type").and_then(|v| v.as_str());
+            if ttype == Some("function") {
                 let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let desc = t.get("description").and_then(|v| v.as_str()).unwrap_or("");
                 let schema = t.get("parameters").cloned();
@@ -696,6 +774,44 @@ pub fn openai_responses_to_anthropic(model: &str, raw: &Value, stream: bool) -> 
                     "description": desc,
                     "input_schema": normalize_input_schema(schema),
                 }));
+            } else if ttype == Some("custom") {
+                // Codex 的 custom 工具(apply_patch 类自由文本工具):顶层 name/description,
+                // 没有 parameters —— 它的入参本身就是自由文本,不是 JSON object。
+                // Anthropic input_schema 必须是 object,故用单个 string 属性 "input" 容纳自由文本。
+                // 这个形状不是随便选的:必须与入站 custom_tool_call 分支对齐(见下方
+                // "function_call" | "custom_tool_call" 处理)——那里非 JSON-object 的 input 原文会被
+                // 包成 {"input": <原文>} 才塞进 Anthropic tool_use.input。这里把 schema 声明为
+                // {input: string},使模型看到的"该传什么形状"与入站实际收到的"包壳后长什么样"一致,
+                // 往返自洽。若 input 恰是合法 JSON object 则入站侧原样使用不套壳,不受此 schema 约束。
+                let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let desc = t.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                anth_tools.push(json!({
+                    "name": name,
+                    "description": desc,
+                    "input_schema": {
+                        "type": "object",
+                        "properties": { "input": { "type": "string" } },
+                        "required": ["input"]
+                    },
+                }));
+            } else {
+                // 未识别的 tool type:留痕而非静默丢弃整条工具声明。将来 OpenAI 再加新 type 时,
+                // 至少能在日志里看到"这个工具被跳过了",而不是模型莫名其妙不知道该工具存在。
+                let skipped_type = ttype.unwrap_or("<missing>");
+                let skipped_name = t
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| {
+                        t.get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|v| v.as_str())
+                    })
+                    .unwrap_or("<unknown>");
+                tracing::debug!(
+                    tool_type = skipped_type,
+                    tool_name = skipped_name,
+                    "openai_responses_to_anthropic: 跳过未识别的 tool type"
+                );
             }
         }
         if !anth_tools.is_empty() {
@@ -709,9 +825,15 @@ pub fn openai_responses_to_anthropic(model: &str, raw: &Value, stream: bool) -> 
         if let Some(tc) = raw.get("tool_choice") {
             match tc {
                 Value::String(s) => match s.as_str() {
-                    "auto" => { out.insert("tool_choice".into(), json!({"type": "auto"})); }
-                    "required" => { out.insert("tool_choice".into(), json!({"type": "any"})); }
-                    "none" => { out.insert("tool_choice".into(), json!({"type": "none"})); }
+                    "auto" => {
+                        out.insert("tool_choice".into(), json!({"type": "auto"}));
+                    }
+                    "required" => {
+                        out.insert("tool_choice".into(), json!({"type": "any"}));
+                    }
+                    "none" => {
+                        out.insert("tool_choice".into(), json!({"type": "none"}));
+                    }
                     _ => {}
                 },
                 Value::Object(_) => {
@@ -787,8 +909,11 @@ fn build_responses_message(role_hint: &str, item: &Value) -> Option<Value> {
                         content.push(json!({"type": "text", "text": p.get("text").and_then(|v| v.as_str()).unwrap_or("")}));
                     }
                     Some("input_image") => {
-                        let url = p.get("image_url").and_then(|v| v.as_str())
-                            .or_else(|| p.get("url").and_then(|v| v.as_str())).unwrap_or("");
+                        let url = p
+                            .get("image_url")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| p.get("url").and_then(|v| v.as_str()))
+                            .unwrap_or("");
                         if let Some(b) = image_url_to_anthropic(url) {
                             content.push(b);
                             inferred_role.get_or_insert("user");
@@ -820,7 +945,13 @@ fn build_responses_message(role_hint: &str, item: &Value) -> Option<Value> {
 /// Responses function_call_output 的 output(字符串或结构)→ Anthropic tool_result content。
 fn responses_output_content(output: Option<&Value>) -> Value {
     match output {
-        Some(Value::String(s)) => if s.is_empty() { json!("(empty)") } else { json!(s) },
+        Some(Value::String(s)) => {
+            if s.is_empty() {
+                json!("(empty)")
+            } else {
+                json!(s)
+            }
+        }
         Some(Value::Array(parts)) => {
             let mut blocks = Vec::new();
             for p in parts {
@@ -830,7 +961,11 @@ fn responses_output_content(output: Option<&Value>) -> Value {
                     blocks.push(json!({"type": "text", "text": t}));
                 }
             }
-            if blocks.is_empty() { json!("(empty)") } else { json!(blocks) }
+            if blocks.is_empty() {
+                json!("(empty)")
+            } else {
+                json!(blocks)
+            }
         }
         Some(v) => json!(v.to_string()),
         None => json!("(empty)"),
@@ -866,10 +1001,24 @@ impl UsageTokens {
             return;
         }
         self.has = true;
-        if let Some(v) = usage.get("input_tokens").and_then(|v| v.as_i64()) { self.input = v; }
-        if let Some(v) = usage.get("output_tokens").and_then(|v| v.as_i64()) { self.output = v; }
-        if let Some(v) = usage.get("cache_creation_input_tokens").and_then(|v| v.as_i64()) { self.cache_creation = v; }
-        if let Some(v) = usage.get("cache_read_input_tokens").and_then(|v| v.as_i64()) { self.cache_read = v; }
+        if let Some(v) = usage.get("input_tokens").and_then(|v| v.as_i64()) {
+            self.input = v;
+        }
+        if let Some(v) = usage.get("output_tokens").and_then(|v| v.as_i64()) {
+            self.output = v;
+        }
+        if let Some(v) = usage
+            .get("cache_creation_input_tokens")
+            .and_then(|v| v.as_i64())
+        {
+            self.cache_creation = v;
+        }
+        if let Some(v) = usage
+            .get("cache_read_input_tokens")
+            .and_then(|v| v.as_i64())
+        {
+            self.cache_read = v;
+        }
     }
     /// (prompt, completion, total, cached)
     fn openai(&self) -> (i64, i64, i64, i64) {
@@ -932,12 +1081,18 @@ impl ChatStreamConverter {
         match event_type {
             "message_start" => {
                 if let Some(msg) = ev.get("message") {
-                    self.response_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    self.response_id = msg
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     if self.response_id.is_empty() {
                         self.response_id = crate::openai::types::gen_chat_completion_id();
                     }
                     self.created = now_unix();
-                    if let Some(u) = msg.get("usage") { self.usage.merge(u); }
+                    if let Some(u) = msg.get("usage") {
+                        self.usage.merge(u);
+                    }
                     let mut chunk = self.base_chunk();
                     chunk["choices"][0]["delta"] = json!({"role": "assistant"});
                     return vec![chunk];
@@ -948,17 +1103,36 @@ impl ChatStreamConverter {
                 let cb = ev.get("content_block");
                 if cb.and_then(|c| c.get("type")).and_then(|v| v.as_str()) == Some("tool_use") {
                     let index = ev.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let id = cb.and_then(|c| c.get("id")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let name = cb.and_then(|c| c.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let id = cb
+                        .and_then(|c| c.get("id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let name = cb
+                        .and_then(|c| c.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     // 分配连续的 OpenAI tool_calls 位序(与 Anthropic content-block index 解耦)。
                     let openai_index = self.next_tool_index;
                     self.next_tool_index += 1;
-                    self.tools.insert(index, ToolAccum { id, name, args: String::new(), openai_index });
+                    self.tools.insert(
+                        index,
+                        ToolAccum {
+                            id,
+                            name,
+                            args: String::new(),
+                            openai_index,
+                        },
+                    );
                 }
                 vec![]
             }
             "content_block_delta" => {
-                let delta = match ev.get("delta") { Some(d) => d, None => return vec![] };
+                let delta = match ev.get("delta") {
+                    Some(d) => d,
+                    None => return vec![],
+                };
                 match delta.get("type").and_then(|v| v.as_str()) {
                     Some("text_delta") => {
                         if let Some(t) = delta.get("text").and_then(|v| v.as_str()) {
@@ -992,7 +1166,11 @@ impl ChatStreamConverter {
             "content_block_stop" => {
                 let index = ev.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
                 if let Some(acc) = self.tools.remove(&index) {
-                    let args = if acc.args.is_empty() { "{}".to_string() } else { acc.args };
+                    let args = if acc.args.is_empty() {
+                        "{}".to_string()
+                    } else {
+                        acc.args
+                    };
                     let mut chunk = self.base_chunk();
                     chunk["choices"][0]["delta"] = json!({
                         "tool_calls": [{
@@ -1011,7 +1189,11 @@ impl ChatStreamConverter {
                 // choices:[] 的 chunk**(紧邻 [DONE])。此前把 usage 塞在 finish_reason 同一 chunk 上,
                 // 严格 SDK 在 choices[0] 找不到独立 usage。拆成两个 chunk:先 finish_reason,再 usage。
                 let mut out = Vec::new();
-                if let Some(sr) = ev.get("delta").and_then(|d| d.get("stop_reason")).and_then(|v| v.as_str()) {
+                if let Some(sr) = ev
+                    .get("delta")
+                    .and_then(|d| d.get("stop_reason"))
+                    .and_then(|v| v.as_str())
+                {
                     let mut chunk = self.base_chunk();
                     chunk["choices"][0]["finish_reason"] = json!(map_stop_reason(sr));
                     out.push(chunk);
@@ -1032,8 +1214,14 @@ impl ChatStreamConverter {
             }
             "error" => {
                 if let Some(e) = ev.get("error") {
-                    let msg = e.get("message").and_then(|v| v.as_str()).unwrap_or("upstream error");
-                    let typ = e.get("type").and_then(|v| v.as_str()).unwrap_or("api_error");
+                    let msg = e
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("upstream error");
+                    let typ = e
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("api_error");
                     return vec![json!({"error": {"message": msg, "type": typ}})];
                 }
                 vec![]
@@ -1052,23 +1240,43 @@ pub fn aggregate_chat_completion(model: &str, events: &[Value]) -> Value {
     let mut text = String::new();
     let mut reasoning = String::new();
     // index → (id, name, args)
-    let mut tools: std::collections::BTreeMap<i64, (String, String, String)> = std::collections::BTreeMap::new();
+    let mut tools: std::collections::BTreeMap<i64, (String, String, String)> =
+        std::collections::BTreeMap::new();
 
     for ev in events {
         match ev.get("type").and_then(|v| v.as_str()).unwrap_or("") {
             "message_start" => {
                 if let Some(m) = ev.get("message") {
-                    message_id = m.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    message_id = m
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     created = now_unix();
-                    if let Some(u) = m.get("usage") { usage.merge(u); }
+                    if let Some(u) = m.get("usage") {
+                        usage.merge(u);
+                    }
                 }
             }
             "content_block_start" => {
-                if ev.get("content_block").and_then(|c| c.get("type")).and_then(|v| v.as_str()) == Some("tool_use") {
+                if ev
+                    .get("content_block")
+                    .and_then(|c| c.get("type"))
+                    .and_then(|v| v.as_str())
+                    == Some("tool_use")
+                {
                     let index = ev.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
                     let cb = ev.get("content_block");
-                    let id = cb.and_then(|c| c.get("id")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let name = cb.and_then(|c| c.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let id = cb
+                        .and_then(|c| c.get("id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let name = cb
+                        .and_then(|c| c.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     tools.insert(index, (id, name, String::new()));
                 }
             }
@@ -1076,15 +1284,21 @@ pub fn aggregate_chat_completion(model: &str, events: &[Value]) -> Value {
                 if let Some(delta) = ev.get("delta") {
                     match delta.get("type").and_then(|v| v.as_str()) {
                         Some("text_delta") => {
-                            if let Some(t) = delta.get("text").and_then(|v| v.as_str()) { text.push_str(t); }
+                            if let Some(t) = delta.get("text").and_then(|v| v.as_str()) {
+                                text.push_str(t);
+                            }
                         }
                         Some("thinking_delta") => {
-                            if let Some(t) = delta.get("thinking").and_then(|v| v.as_str()) { reasoning.push_str(t); }
+                            if let Some(t) = delta.get("thinking").and_then(|v| v.as_str()) {
+                                reasoning.push_str(t);
+                            }
                         }
                         Some("input_json_delta") => {
                             if let Some(pj) = delta.get("partial_json").and_then(|v| v.as_str()) {
                                 let index = ev.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
-                                if let Some(e) = tools.get_mut(&index) { e.2.push_str(pj); }
+                                if let Some(e) = tools.get_mut(&index) {
+                                    e.2.push_str(pj);
+                                }
                             }
                         }
                         _ => {}
@@ -1092,10 +1306,16 @@ pub fn aggregate_chat_completion(model: &str, events: &[Value]) -> Value {
                 }
             }
             "message_delta" => {
-                if let Some(sr) = ev.get("delta").and_then(|d| d.get("stop_reason")).and_then(|v| v.as_str()) {
+                if let Some(sr) = ev
+                    .get("delta")
+                    .and_then(|d| d.get("stop_reason"))
+                    .and_then(|v| v.as_str())
+                {
                     stop_reason = sr.to_string();
                 }
-                if let Some(u) = ev.get("usage") { usage.merge(u); }
+                if let Some(u) = ev.get("usage") {
+                    usage.merge(u);
+                }
             }
             _ => {}
         }
@@ -1129,7 +1349,11 @@ pub fn aggregate_chat_completion(model: &str, events: &[Value]) -> Value {
     };
 
     let (p, c, t, cached) = usage.openai();
-    let id = if message_id.is_empty() { crate::openai::types::gen_chat_completion_id() } else { message_id };
+    let id = if message_id.is_empty() {
+        crate::openai::types::gen_chat_completion_id()
+    } else {
+        message_id
+    };
     json!({
         "id": id,
         "object": "chat.completion",
@@ -1231,12 +1455,20 @@ impl ResponsesStreamConverter {
         let et = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
         match et {
             "message_start" => {
-                let msg = match ev.get("message") { Some(m) => m, None => return vec![] };
-                self.response_id = msg.get("id").and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty()).map(String::from)
+                let msg = match ev.get("message") {
+                    Some(m) => m,
+                    None => return vec![],
+                };
+                self.response_id = msg
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
                     .unwrap_or_else(|| gen_responses_id("resp"));
                 self.created = now_unix();
-                if let Some(u) = msg.get("usage") { self.usage.merge(u); }
+                if let Some(u) = msg.get("usage") {
+                    self.usage.merge(u);
+                }
                 self.started = true;
                 let s1 = self.next_seq();
                 let created = json!({
@@ -1249,20 +1481,44 @@ impl ResponsesStreamConverter {
                     "type": "response.in_progress", "sequence_number": s2,
                     "response": {"id": self.response_id, "object": "response", "created_at": self.created, "status": "in_progress"}
                 });
-                vec![("response.created".into(), created), ("response.in_progress".into(), inprog)]
+                vec![
+                    ("response.created".into(), created),
+                    ("response.in_progress".into(), inprog),
+                ]
             }
             "content_block_start" => {
                 let index = ev.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
                 let cb = ev.get("content_block");
-                let btype = cb.and_then(|c| c.get("type")).and_then(|v| v.as_str()).unwrap_or("text");
+                let btype = cb
+                    .and_then(|c| c.get("type"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("text");
                 let output_index = self.next_output_index;
                 self.next_output_index += 1;
                 match btype {
                     "tool_use" => {
-                        let call_id = cb.and_then(|c| c.get("id")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let name = cb.and_then(|c| c.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let call_id = cb
+                            .and_then(|c| c.get("id"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = cb
+                            .and_then(|c| c.get("name"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
                         let item_id = gen_responses_id("fc");
-                        self.blocks.insert(index, BlockState { kind: "tool", item_id: item_id.clone(), output_index, call_id: call_id.clone(), name: name.clone(), buf: String::new() });
+                        self.blocks.insert(
+                            index,
+                            BlockState {
+                                kind: "tool",
+                                item_id: item_id.clone(),
+                                output_index,
+                                call_id: call_id.clone(),
+                                name: name.clone(),
+                                buf: String::new(),
+                            },
+                        );
                         let s = self.next_seq();
                         let item = json!({
                             "type": "response.output_item.added", "sequence_number": s, "output_index": output_index,
@@ -1273,7 +1529,17 @@ impl ResponsesStreamConverter {
                     "thinking" => {
                         // reasoning:发 item + summary_part（不带 encrypted_content,签名不兼容）。
                         let item_id = gen_responses_id("rs");
-                        self.blocks.insert(index, BlockState { kind: "reasoning", item_id: item_id.clone(), output_index, call_id: String::new(), name: String::new(), buf: String::new() });
+                        self.blocks.insert(
+                            index,
+                            BlockState {
+                                kind: "reasoning",
+                                item_id: item_id.clone(),
+                                output_index,
+                                call_id: String::new(),
+                                name: String::new(),
+                                buf: String::new(),
+                            },
+                        );
                         let s1 = self.next_seq();
                         let item = json!({
                             "type": "response.output_item.added", "sequence_number": s1, "output_index": output_index,
@@ -1285,12 +1551,25 @@ impl ResponsesStreamConverter {
                             "item_id": self.blocks[&index].item_id, "output_index": output_index, "summary_index": 0,
                             "part": {"type": "summary_text", "text": ""}
                         });
-                        vec![("response.output_item.added".into(), item), ("response.reasoning_summary_part.added".into(), part)]
+                        vec![
+                            ("response.output_item.added".into(), item),
+                            ("response.reasoning_summary_part.added".into(), part),
+                        ]
                     }
                     _ => {
                         // text/message
                         let item_id = gen_responses_id("msg");
-                        self.blocks.insert(index, BlockState { kind: "text", item_id: item_id.clone(), output_index, call_id: String::new(), name: String::new(), buf: String::new() });
+                        self.blocks.insert(
+                            index,
+                            BlockState {
+                                kind: "text",
+                                item_id: item_id.clone(),
+                                output_index,
+                                call_id: String::new(),
+                                name: String::new(),
+                                buf: String::new(),
+                            },
+                        );
                         let s1 = self.next_seq();
                         let item = json!({
                             "type": "response.output_item.added", "sequence_number": s1, "output_index": output_index,
@@ -1302,13 +1581,19 @@ impl ResponsesStreamConverter {
                             "item_id": self.blocks[&index].item_id, "output_index": output_index, "content_index": 0,
                             "part": {"type": "output_text", "text": "", "annotations": []}
                         });
-                        vec![("response.output_item.added".into(), item), ("response.content_part.added".into(), part)]
+                        vec![
+                            ("response.output_item.added".into(), item),
+                            ("response.content_part.added".into(), part),
+                        ]
                     }
                 }
             }
             "content_block_delta" => {
                 let index = ev.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
-                let delta = match ev.get("delta") { Some(d) => d, None => return vec![] };
+                let delta = match ev.get("delta") {
+                    Some(d) => d,
+                    None => return vec![],
+                };
                 // 先取 item_id/output_index(不可变),累加缓冲用可变借用,避免同时借用冲突。
                 let (item_id, output_index) = match self.blocks.get(&index) {
                     Some(b) => (b.item_id.clone(), b.output_index),
@@ -1317,50 +1602,81 @@ impl ResponsesStreamConverter {
                 match delta.get("type").and_then(|v| v.as_str()) {
                     Some("text_delta") => {
                         let t = delta.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                        if let Some(b) = self.blocks.get_mut(&index) { b.buf.push_str(t); }
+                        if let Some(b) = self.blocks.get_mut(&index) {
+                            b.buf.push_str(t);
+                        }
                         let s = self.next_seq();
-                        vec![("response.output_text.delta".into(), json!({
-                            "type": "response.output_text.delta", "sequence_number": s,
-                            "item_id": item_id, "output_index": output_index, "content_index": 0, "delta": t
-                        }))]
+                        vec![(
+                            "response.output_text.delta".into(),
+                            json!({
+                                "type": "response.output_text.delta", "sequence_number": s,
+                                "item_id": item_id, "output_index": output_index, "content_index": 0, "delta": t
+                            }),
+                        )]
                     }
                     Some("input_json_delta") => {
-                        let pj = delta.get("partial_json").and_then(|v| v.as_str()).unwrap_or("");
-                        if let Some(b) = self.blocks.get_mut(&index) { b.buf.push_str(pj); }
+                        let pj = delta
+                            .get("partial_json")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if let Some(b) = self.blocks.get_mut(&index) {
+                            b.buf.push_str(pj);
+                        }
                         let s = self.next_seq();
-                        vec![("response.function_call_arguments.delta".into(), json!({
-                            "type": "response.function_call_arguments.delta", "sequence_number": s,
-                            "item_id": item_id, "output_index": output_index, "delta": pj
-                        }))]
+                        vec![(
+                            "response.function_call_arguments.delta".into(),
+                            json!({
+                                "type": "response.function_call_arguments.delta", "sequence_number": s,
+                                "item_id": item_id, "output_index": output_index, "delta": pj
+                            }),
+                        )]
                     }
                     Some("thinking_delta") => {
                         let t = delta.get("thinking").and_then(|v| v.as_str()).unwrap_or("");
-                        if let Some(b) = self.blocks.get_mut(&index) { b.buf.push_str(t); }
+                        if let Some(b) = self.blocks.get_mut(&index) {
+                            b.buf.push_str(t);
+                        }
                         let s = self.next_seq();
-                        vec![("response.reasoning_summary_text.delta".into(), json!({
-                            "type": "response.reasoning_summary_text.delta", "sequence_number": s,
-                            "item_id": item_id, "output_index": output_index, "summary_index": 0, "delta": t
-                        }))]
+                        vec![(
+                            "response.reasoning_summary_text.delta".into(),
+                            json!({
+                                "type": "response.reasoning_summary_text.delta", "sequence_number": s,
+                                "item_id": item_id, "output_index": output_index, "summary_index": 0, "delta": t
+                            }),
+                        )]
                     }
                     _ => vec![],
                 }
             }
             "content_block_stop" => {
                 let index = ev.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
-                let bs = match self.blocks.remove(&index) { Some(b) => b, None => return vec![] };
+                let bs = match self.blocks.remove(&index) {
+                    Some(b) => b,
+                    None => return vec![],
+                };
                 self.close_block(bs)
             }
             "message_delta" => {
-                if let Some(sr) = ev.get("delta").and_then(|d| d.get("stop_reason")).and_then(|v| v.as_str()) {
+                if let Some(sr) = ev
+                    .get("delta")
+                    .and_then(|d| d.get("stop_reason"))
+                    .and_then(|v| v.as_str())
+                {
                     self.stop_reason = sr.to_string();
                 }
-                if let Some(u) = ev.get("usage") { self.usage.merge(u); }
+                if let Some(u) = ev.get("usage") {
+                    self.usage.merge(u);
+                }
                 vec![]
             }
             "message_stop" => {
                 // 完成:发 response.completed（含 usage + status + **回填的 output 数组**)。
                 let (p, c, t, cached) = self.usage.openai();
-                let status = if self.stop_reason == "max_tokens" { "incomplete" } else { "completed" };
+                let status = if self.stop_reason == "max_tokens" {
+                    "incomplete"
+                } else {
+                    "completed"
+                };
                 let output = self.build_output();
                 let s = self.next_seq();
                 // 骨架补全 background:false / error:null(Codex 严格解析器期望完整骨架,见参考 response.go)。
@@ -1374,18 +1690,27 @@ impl ResponsesStreamConverter {
                 if status == "incomplete" {
                     resp["incomplete_details"] = json!({"reason": "max_output_tokens"});
                 }
-                vec![("response.completed".into(), json!({
-                    "type": "response.completed", "sequence_number": s, "response": resp
-                }))]
+                vec![(
+                    "response.completed".into(),
+                    json!({
+                        "type": "response.completed", "sequence_number": s, "response": resp
+                    }),
+                )]
             }
             "error" => {
                 if let Some(e) = ev.get("error") {
-                    let msg = e.get("message").and_then(|v| v.as_str()).unwrap_or("upstream error");
+                    let msg = e
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("upstream error");
                     let s = self.next_seq();
-                    return vec![("response.failed".into(), json!({
-                        "type": "response.failed", "sequence_number": s,
-                        "response": {"id": self.response_id, "status": "failed", "error": {"message": msg}}
-                    }))];
+                    return vec![(
+                        "response.failed".into(),
+                        json!({
+                            "type": "response.failed", "sequence_number": s,
+                            "response": {"id": self.response_id, "status": "failed", "error": {"message": msg}}
+                        }),
+                    )];
                 }
                 vec![]
             }
@@ -1399,19 +1724,36 @@ impl ResponsesStreamConverter {
         let mut out = Vec::new();
         match bs.kind {
             "tool" => {
-                let args = if bs.buf.is_empty() { "{}".to_string() } else { bs.buf.clone() };
+                let args = if bs.buf.is_empty() {
+                    "{}".to_string()
+                } else {
+                    bs.buf.clone()
+                };
                 let s1 = self.next_seq();
-                out.push(("response.function_call_arguments.done".into(), json!({
-                    "type": "response.function_call_arguments.done", "sequence_number": s1,
-                    "item_id": bs.item_id, "output_index": bs.output_index, "arguments": args
-                })));
+                out.push((
+                    "response.function_call_arguments.done".into(),
+                    json!({
+                        "type": "response.function_call_arguments.done", "sequence_number": s1,
+                        "item_id": bs.item_id, "output_index": bs.output_index, "arguments": args
+                    }),
+                ));
                 let s2 = self.next_seq();
                 out.push(("response.output_item.done".into(), json!({
                     "type": "response.output_item.done", "sequence_number": s2, "output_index": bs.output_index,
                     "item": {"id": bs.item_id, "type": "function_call", "status": "completed",
                         "call_id": bs.call_id, "name": bs.name, "arguments": args}
                 })));
-                self.finished.push(FinishedItem { kind: "tool", item_id: bs.item_id, call_id: bs.call_id, name: bs.name, text: if bs.buf.is_empty() { "{}".into() } else { bs.buf } });
+                self.finished.push(FinishedItem {
+                    kind: "tool",
+                    item_id: bs.item_id,
+                    call_id: bs.call_id,
+                    name: bs.name,
+                    text: if bs.buf.is_empty() {
+                        "{}".into()
+                    } else {
+                        bs.buf
+                    },
+                });
             }
             "reasoning" => {
                 let text = bs.buf.clone();
@@ -1422,18 +1764,27 @@ impl ResponsesStreamConverter {
                     "item_id": bs.item_id, "output_index": bs.output_index, "summary_index": 0, "text": text
                 })));
                 let s1 = self.next_seq();
-                out.push(("response.reasoning_summary_part.done".into(), json!({
-                    "type": "response.reasoning_summary_part.done", "sequence_number": s1,
-                    "item_id": bs.item_id, "output_index": bs.output_index, "summary_index": 0,
-                    "part": {"type": "summary_text", "text": text}
-                })));
+                out.push((
+                    "response.reasoning_summary_part.done".into(),
+                    json!({
+                        "type": "response.reasoning_summary_part.done", "sequence_number": s1,
+                        "item_id": bs.item_id, "output_index": bs.output_index, "summary_index": 0,
+                        "part": {"type": "summary_text", "text": text}
+                    }),
+                ));
                 let s2 = self.next_seq();
                 out.push(("response.output_item.done".into(), json!({
                     "type": "response.output_item.done", "sequence_number": s2, "output_index": bs.output_index,
                     "item": {"id": bs.item_id, "type": "reasoning", "status": "completed",
                         "summary": [{"type": "summary_text", "text": text}]}
                 })));
-                self.finished.push(FinishedItem { kind: "reasoning", item_id: bs.item_id, call_id: String::new(), name: String::new(), text: bs.buf });
+                self.finished.push(FinishedItem {
+                    kind: "reasoning",
+                    item_id: bs.item_id,
+                    call_id: String::new(),
+                    name: String::new(),
+                    text: bs.buf,
+                });
             }
             _ => {
                 let text = bs.buf.clone();
@@ -1443,18 +1794,27 @@ impl ResponsesStreamConverter {
                     "item_id": bs.item_id, "output_index": bs.output_index, "content_index": 0, "text": text
                 })));
                 let s2 = self.next_seq();
-                out.push(("response.content_part.done".into(), json!({
-                    "type": "response.content_part.done", "sequence_number": s2,
-                    "item_id": bs.item_id, "output_index": bs.output_index, "content_index": 0,
-                    "part": {"type": "output_text", "text": text, "annotations": []}
-                })));
+                out.push((
+                    "response.content_part.done".into(),
+                    json!({
+                        "type": "response.content_part.done", "sequence_number": s2,
+                        "item_id": bs.item_id, "output_index": bs.output_index, "content_index": 0,
+                        "part": {"type": "output_text", "text": text, "annotations": []}
+                    }),
+                ));
                 let s3 = self.next_seq();
                 out.push(("response.output_item.done".into(), json!({
                     "type": "response.output_item.done", "sequence_number": s3, "output_index": bs.output_index,
                     "item": {"id": bs.item_id, "type": "message", "status": "completed", "role": "assistant",
                         "content": [{"type": "output_text", "text": text, "annotations": []}]}
                 })));
-                self.finished.push(FinishedItem { kind: "text", item_id: bs.item_id, call_id: String::new(), name: String::new(), text: bs.buf });
+                self.finished.push(FinishedItem {
+                    kind: "text",
+                    item_id: bs.item_id,
+                    call_id: String::new(),
+                    name: String::new(),
+                    text: bs.buf,
+                });
             }
         }
         out
@@ -1489,35 +1849,79 @@ pub fn aggregate_responses(model: &str, events: &[Value]) -> Value {
         match ev.get("type").and_then(|v| v.as_str()).unwrap_or("") {
             "message_start" => {
                 if let Some(m) = ev.get("message") {
-                    response_id = m.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    response_id = m
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     created = now_unix();
-                    if let Some(u) = m.get("usage") { usage.merge(u); }
+                    if let Some(u) = m.get("usage") {
+                        usage.merge(u);
+                    }
                 }
             }
             "content_block_start" => {
-                if ev.get("content_block").and_then(|c| c.get("type")).and_then(|v| v.as_str()) == Some("tool_use") {
+                if ev
+                    .get("content_block")
+                    .and_then(|c| c.get("type"))
+                    .and_then(|v| v.as_str())
+                    == Some("tool_use")
+                {
                     let cb = ev.get("content_block");
-                    let id = cb.and_then(|c| c.get("id")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let name = cb.and_then(|c| c.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let id = cb
+                        .and_then(|c| c.get("id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let name = cb
+                        .and_then(|c| c.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     cur_tool = Some((id, name, String::new()));
                 }
             }
             "content_block_delta" => {
                 if let Some(d) = ev.get("delta") {
                     match d.get("type").and_then(|v| v.as_str()) {
-                        Some("text_delta") => { if let Some(t) = d.get("text").and_then(|v| v.as_str()) { text.push_str(t); } }
-                        Some("thinking_delta") => { if let Some(t) = d.get("thinking").and_then(|v| v.as_str()) { reasoning.push_str(t); } }
-                        Some("input_json_delta") => { if let (Some(pj), Some(ct)) = (d.get("partial_json").and_then(|v| v.as_str()), cur_tool.as_mut()) { ct.2.push_str(pj); } }
+                        Some("text_delta") => {
+                            if let Some(t) = d.get("text").and_then(|v| v.as_str()) {
+                                text.push_str(t);
+                            }
+                        }
+                        Some("thinking_delta") => {
+                            if let Some(t) = d.get("thinking").and_then(|v| v.as_str()) {
+                                reasoning.push_str(t);
+                            }
+                        }
+                        Some("input_json_delta") => {
+                            if let (Some(pj), Some(ct)) = (
+                                d.get("partial_json").and_then(|v| v.as_str()),
+                                cur_tool.as_mut(),
+                            ) {
+                                ct.2.push_str(pj);
+                            }
+                        }
                         _ => {}
                     }
                 }
             }
             "content_block_stop" => {
-                if let Some(t) = cur_tool.take() { tools.push(t); }
+                if let Some(t) = cur_tool.take() {
+                    tools.push(t);
+                }
             }
             "message_delta" => {
-                if let Some(sr) = ev.get("delta").and_then(|d| d.get("stop_reason")).and_then(|v| v.as_str()) { stop_reason = sr.to_string(); }
-                if let Some(u) = ev.get("usage") { usage.merge(u); }
+                if let Some(sr) = ev
+                    .get("delta")
+                    .and_then(|d| d.get("stop_reason"))
+                    .and_then(|v| v.as_str())
+                {
+                    stop_reason = sr.to_string();
+                }
+                if let Some(u) = ev.get("usage") {
+                    usage.merge(u);
+                }
             }
             _ => {}
         }
@@ -1526,8 +1930,10 @@ pub fn aggregate_responses(model: &str, events: &[Value]) -> Value {
     // 组 output 数组:reasoning → message → function_calls(顺序对齐 Responses 惯例)。
     let mut output: Vec<Value> = Vec::new();
     if !reasoning.is_empty() {
-        output.push(json!({"id": gen_responses_id("rs"), "type": "reasoning", "status": "completed",
-            "summary": [{"type": "summary_text", "text": reasoning}]}));
+        output.push(
+            json!({"id": gen_responses_id("rs"), "type": "reasoning", "status": "completed",
+            "summary": [{"type": "summary_text", "text": reasoning}]}),
+        );
     }
     if !text.is_empty() {
         output.push(json!({"id": gen_responses_id("msg"), "type": "message", "status": "completed", "role": "assistant",
@@ -1535,13 +1941,23 @@ pub fn aggregate_responses(model: &str, events: &[Value]) -> Value {
     }
     for (call_id, name, args) in &tools {
         let a = if args.is_empty() { "{}" } else { args.as_str() };
-        output.push(json!({"id": gen_responses_id("fc"), "type": "function_call", "status": "completed",
-            "call_id": call_id, "name": name, "arguments": a}));
+        output.push(
+            json!({"id": gen_responses_id("fc"), "type": "function_call", "status": "completed",
+            "call_id": call_id, "name": name, "arguments": a}),
+        );
     }
 
     let (p, c, t, cached) = usage.openai();
-    let status = if stop_reason == "max_tokens" { "incomplete" } else { "completed" };
-    let id = if response_id.is_empty() { gen_responses_id("resp") } else { response_id };
+    let status = if stop_reason == "max_tokens" {
+        "incomplete"
+    } else {
+        "completed"
+    };
+    let id = if response_id.is_empty() {
+        gen_responses_id("resp")
+    } else {
+        response_id
+    };
     // 骨架补全 background:false / error:null(与流式 response.completed 对齐,Codex 期望完整骨架)。
     let mut resp = json!({
         "id": id, "object": "response", "created_at": created, "status": status,
@@ -1584,11 +2000,15 @@ mod tests {
 
     #[test]
     fn test_request_max_tokens_precedence() {
-        let raw = json!({"model": "m", "max_completion_tokens": 100, "max_tokens": 50, "messages": []});
+        let raw =
+            json!({"model": "m", "max_completion_tokens": 100, "max_tokens": 50, "messages": []});
         let a = openai_chat_to_anthropic("m", &raw, false);
         assert_eq!(a["max_tokens"], 100, "max_completion_tokens 优先");
         let raw2 = json!({"model": "m", "max_tokens": 50, "messages": []});
-        assert_eq!(openai_chat_to_anthropic("m", &raw2, false)["max_tokens"], 50);
+        assert_eq!(
+            openai_chat_to_anthropic("m", &raw2, false)["max_tokens"],
+            50
+        );
     }
 
     #[test]
@@ -1612,7 +2032,12 @@ mod tests {
         let a = openai_chat_to_anthropic("m", &raw, false);
         // messages[1] = assistant(含 tool_use)
         let content = &a["messages"][1]["content"];
-        let tu = content.as_array().unwrap().iter().find(|b| b["type"] == "tool_use").unwrap();
+        let tu = content
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["type"] == "tool_use")
+            .unwrap();
         assert_eq!(tu["id"], "call_abc");
         assert_eq!(tu["name"], "get_weather");
         assert_eq!(tu["input"]["city"], "NYC");
@@ -1722,8 +2147,15 @@ mod tests {
         let md = conv.push_event(&json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5}}));
         // OpenAI 规范:finish_reason chunk 与 usage chunk 分开;usage chunk 的 choices 为空。
         assert_eq!(md[0]["choices"][0]["finish_reason"], "stop");
-        assert!(md[0].get("usage").is_none(), "finish_reason chunk 不带 usage");
-        assert_eq!(md[1]["choices"], json!([]), "usage chunk 的 choices 为空数组");
+        assert!(
+            md[0].get("usage").is_none(),
+            "finish_reason chunk 不带 usage"
+        );
+        assert_eq!(
+            md[1]["choices"],
+            json!([]),
+            "usage chunk 的 choices 为空数组"
+        );
         assert_eq!(md[1]["usage"]["completion_tokens"], 5);
     }
 
@@ -1792,13 +2224,18 @@ mod tests {
         let mut conv = ChatStreamConverter::new("m");
         conv.push_event(&json!({"type": "message_start", "message": {"id": "m1"}}));
         // 先来个 text 块(index 0)
-        conv.push_event(&json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}));
+        conv.push_event(
+            &json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}),
+        );
         conv.push_event(&json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hi"}}));
         conv.push_event(&json!({"type": "content_block_stop", "index": 0}));
         // 第一个 tool_use 在 content-block index 1
         conv.push_event(&json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "t1", "name": "f"}}));
         let stop1 = conv.push_event(&json!({"type": "content_block_stop", "index": 1}));
-        assert_eq!(stop1[0]["choices"][0]["delta"]["tool_calls"][0]["index"], 0, "首个工具应是 OpenAI index 0,非 content-block 1");
+        assert_eq!(
+            stop1[0]["choices"][0]["delta"]["tool_calls"][0]["index"], 0,
+            "首个工具应是 OpenAI index 0,非 content-block 1"
+        );
         // 第二个 tool_use 在 content-block index 2 → OpenAI index 1
         conv.push_event(&json!({"type": "content_block_start", "index": 2, "content_block": {"type": "tool_use", "id": "t2", "name": "g"}}));
         let stop2 = conv.push_event(&json!({"type": "content_block_stop", "index": 2}));
@@ -1808,13 +2245,20 @@ mod tests {
     #[test]
     fn test_temperature_dropped_when_thinking_enabled() {
         // 回归(review):thinking 开启时不透传 temperature(Anthropic 只接受 1,透传非1值→400)。
-        let raw = json!({"model": "m", "messages": [], "reasoning_effort": "high", "temperature": 0.5});
+        let raw =
+            json!({"model": "m", "messages": [], "reasoning_effort": "high", "temperature": 0.5});
         let a = openai_chat_to_anthropic("m", &raw, false);
         assert_eq!(a["thinking"]["type"], "enabled");
-        assert!(a.get("temperature").is_none(), "thinking 开时不应透传 temperature");
+        assert!(
+            a.get("temperature").is_none(),
+            "thinking 开时不应透传 temperature"
+        );
         // thinking 关时正常透传。
         let raw2 = json!({"model": "m", "messages": [], "temperature": 0.5});
-        assert_eq!(openai_chat_to_anthropic("m", &raw2, false)["temperature"], 0.5);
+        assert_eq!(
+            openai_chat_to_anthropic("m", &raw2, false)["temperature"],
+            0.5
+        );
     }
 
     #[test]
@@ -1830,12 +2274,10 @@ mod tests {
     #[test]
     fn test_normalize_drops_unanswered_tool_use() {
         // 悬空 tool_use(无对应 tool_result)丢弃;保留文本。
-        let msgs = vec![
-            json!({"role": "assistant", "content": [
-                {"type": "text", "text": "hi"},
-                {"type": "tool_use", "id": "t1", "name": "f", "input": {}}
-            ]}),
-        ];
+        let msgs = vec![json!({"role": "assistant", "content": [
+            {"type": "text", "text": "hi"},
+            {"type": "tool_use", "id": "t1", "name": "f", "input": {}}
+        ]})];
         let out = normalize_tool_pairing_and_merge(msgs);
         // 首条本是 assistant(丢悬空 tool_use 后剩 text)→ 补空 user 打头。
         assert_eq!(out.len(), 2);
@@ -1868,10 +2310,16 @@ mod tests {
         assert_eq!(a["temperature"], 1.0, "temperature 1.7 应 clamp 到 1.0");
         // 范围内不动。
         let raw2 = json!({"model": "m", "messages": [], "temperature": 0.3});
-        assert_eq!(openai_chat_to_anthropic("m", &raw2, false)["temperature"], 0.3);
+        assert_eq!(
+            openai_chat_to_anthropic("m", &raw2, false)["temperature"],
+            0.3
+        );
         // responses 路径同样 clamp。
         let raw3 = json!({"model": "m", "input": "x", "temperature": 2.0});
-        assert_eq!(openai_responses_to_anthropic("m", &raw3, false)["temperature"], 1.0);
+        assert_eq!(
+            openai_responses_to_anthropic("m", &raw3, false)["temperature"],
+            1.0
+        );
     }
 
     #[test]
@@ -1883,10 +2331,18 @@ mod tests {
         assert_eq!(a["stop_sequences"], json!(["END"]));
         // 全空数组:不下发 stop_sequences。
         let raw2 = json!({"model": "m", "messages": [], "stop": ["", ""]});
-        assert!(openai_chat_to_anthropic("m", &raw2, false).get("stop_sequences").is_none());
+        assert!(
+            openai_chat_to_anthropic("m", &raw2, false)
+                .get("stop_sequences")
+                .is_none()
+        );
         // 单个空串:不下发。
         let raw3 = json!({"model": "m", "messages": [], "stop": ""});
-        assert!(openai_chat_to_anthropic("m", &raw3, false).get("stop_sequences").is_none());
+        assert!(
+            openai_chat_to_anthropic("m", &raw3, false)
+                .get("stop_sequences")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1916,7 +2372,10 @@ mod tests {
             json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}}),
         ];
         let c = aggregate_chat_completion("m", &events);
-        assert!(c["choices"][0]["message"]["content"].is_null(), "只有 tool_calls 时 content 应为 null");
+        assert!(
+            c["choices"][0]["message"]["content"].is_null(),
+            "只有 tool_calls 时 content 应为 null"
+        );
         assert_eq!(c["choices"][0]["finish_reason"], "tool_calls");
         // 有文本时 content 仍是字符串(不误伤)。
         let events2 = vec![
@@ -1971,14 +2430,21 @@ mod tests {
         let a = openai_chat_to_anthropic("m", &raw, false);
         assert_eq!(a["thinking"]["type"], "enabled");
         assert!(a.get("top_p").is_none(), "thinking 开时不应透传 top_p");
-        assert!(a.get("temperature").is_none(), "thinking 开时不应透传 temperature");
+        assert!(
+            a.get("temperature").is_none(),
+            "thinking 开时不应透传 temperature"
+        );
         // thinking 关时 top_p 正常透传。
         let raw2 = json!({"model": "m", "messages": [], "top_p": 0.9});
         assert_eq!(openai_chat_to_anthropic("m", &raw2, false)["top_p"], 0.9);
         // responses 路径同样 gate。
-        let raw3 = json!({"model": "m", "input": "x", "reasoning": {"effort": "high"}, "top_p": 0.5});
+        let raw3 =
+            json!({"model": "m", "input": "x", "reasoning": {"effort": "high"}, "top_p": 0.5});
         let a3 = openai_responses_to_anthropic("m", &raw3, false);
-        assert!(a3.get("top_p").is_none(), "responses thinking 开时不应透传 top_p");
+        assert!(
+            a3.get("top_p").is_none(),
+            "responses thinking 开时不应透传 top_p"
+        );
     }
 
     #[test]
@@ -1987,7 +2453,10 @@ mod tests {
         // 客户端发 tool_choice 但无 tools。
         let raw = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}], "tool_choice": "auto"});
         let a = openai_chat_to_anthropic("m", &raw, false);
-        assert!(a.get("tool_choice").is_none(), "无 tools 时不应下发 tool_choice");
+        assert!(
+            a.get("tool_choice").is_none(),
+            "无 tools 时不应下发 tool_choice"
+        );
         assert!(a.get("tools").is_none());
         // tools 全被过滤(非 function 类型)→ 同样不下发 tool_choice。
         let raw2 = json!({
@@ -1996,11 +2465,17 @@ mod tests {
         });
         let a2 = openai_chat_to_anthropic("m", &raw2, false);
         assert!(a2.get("tools").is_none(), "非 function 工具被过滤");
-        assert!(a2.get("tool_choice").is_none(), "工具全过滤后不下发 tool_choice");
+        assert!(
+            a2.get("tool_choice").is_none(),
+            "工具全过滤后不下发 tool_choice"
+        );
         // responses 路径同样。
         let raw3 = json!({"model": "m", "input": "hi", "tool_choice": "auto"});
         let a3 = openai_responses_to_anthropic("m", &raw3, false);
-        assert!(a3.get("tool_choice").is_none(), "responses 无 tools 时不下发 tool_choice");
+        assert!(
+            a3.get("tool_choice").is_none(),
+            "responses 无 tools 时不下发 tool_choice"
+        );
     }
 
     #[test]
@@ -2017,7 +2492,12 @@ mod tests {
         });
         let a = openai_responses_to_anthropic("m", &raw, false);
         let msgs = a["messages"].as_array().unwrap();
-        let tu = msgs[1]["content"].as_array().unwrap().iter().find(|b| b["type"] == "tool_use").unwrap();
+        let tu = msgs[1]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["type"] == "tool_use")
+            .unwrap();
         assert_eq!(tu["id"], "ct1");
         assert_eq!(tu["name"], "apply_patch");
         // 自由文本 input 包进 {"input": <原文>}(Anthropic input 必须 object)。
@@ -2033,10 +2513,118 @@ mod tests {
         ]});
         let a2 = openai_responses_to_anthropic("m", &raw2, false);
         // 首条 assistant(tool_use)会被 normalize 补空 user 打头,故跨消息找 tool_use。
-        let tu2 = a2["messages"].as_array().unwrap().iter()
+        let tu2 = a2["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
             .flat_map(|m| m["content"].as_array().cloned().unwrap_or_default())
-            .find(|b| b["type"] == "tool_use").unwrap();
+            .find(|b| b["type"] == "tool_use")
+            .unwrap();
         assert_eq!(tu2["input"]["k"], 1, "合法 JSON object input 原样用");
+    }
+
+    #[test]
+    fn test_responses_custom_tool_declaration_is_not_dropped() {
+        // 回归 #🟠:Codex 的 custom 工具声明(apply_patch 类)曾被请求侧 tools 循环静默丢弃
+        // (循环只认 type=="function",custom 分支缺失、无 else、无日志)。这里直接断言
+        // 下发给 Anthropic 的 tools 数组里含有它——不是"不报错"这种纸面断言。
+        let raw = json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [
+                {"type": "custom", "name": "apply_patch", "description": "Apply a code patch"}
+            ]
+        });
+        let a = openai_responses_to_anthropic("m", &raw, false);
+        let tools = a
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("custom 工具被丢弃:tools 字段缺失或非数组,a={a}"));
+        let t = tools
+            .iter()
+            .find(|t| t["name"] == "apply_patch")
+            .unwrap_or_else(|| {
+                panic!("custom 工具 apply_patch 不在下发的 tools 里,tools={tools:?}")
+            });
+        // 显式断言序列化后的字段名(而非只断言"存在某个 schema"),防止漏了
+        // #[serde(rename_all)] 之类导致字段名对不上却"测试通过"的纸面测试。
+        assert_eq!(t["name"], "apply_patch");
+        assert_eq!(t["description"], "Apply a code patch");
+        assert_eq!(t["input_schema"]["type"], "object");
+        assert_eq!(t["input_schema"]["properties"]["input"]["type"], "string");
+        assert_eq!(t["input_schema"]["required"], json!(["input"]));
+    }
+
+    #[test]
+    fn test_responses_custom_tool_roundtrip_shape_matches_inbound_wrapping() {
+        // 往返自洽:请求侧给模型看的 schema({input: string})必须与入站
+        // custom_tool_call 分支实际包壳自由文本时用的键名一致,否则模型按 schema 生成的
+        // 参数名和入站代码解析时用的键名对不上。
+        let decl = json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [{"type": "custom", "name": "apply_patch", "description": "d"}]
+        });
+        let a = openai_responses_to_anthropic("m", &decl, false);
+        let schema = &a["tools"][0]["input_schema"];
+        let declared_free_text_key = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .next()
+            .cloned()
+            .unwrap();
+        assert_eq!(declared_free_text_key, "input", "声明的自由文本属性名");
+
+        // 入站:client 回传一次 custom_tool_call,input 是非 JSON 的自由文本。
+        // 配上 custom_tool_call_output,否则 normalize_tool_pairing_and_merge 会把
+        // 无对应 tool_result 的悬空 tool_use 丢弃(见该函数文档),测不到东西。
+        let call = json!({
+            "model": "m",
+            "input": [
+                {"type": "custom_tool_call", "call_id": "ct9", "name": "apply_patch", "input": "*** free text ***"},
+                {"type": "custom_tool_call_output", "call_id": "ct9", "output": "done"}
+            ]
+        });
+        let a2 = openai_responses_to_anthropic("m", &call, false);
+        let tu = a2["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|m| m["content"].as_array().cloned().unwrap_or_default())
+            .find(|b| b["type"] == "tool_use")
+            .unwrap();
+        // 入站包壳用的键必须与请求侧 schema 声明的键同名,否则模型按 schema 填的参数名
+        // 与运行时实际解析的键名不一致——这正是"两侧看起来都对但互相不认"的隐性缺陷。
+        let wrapped_key = tu["input"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .next()
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            wrapped_key, declared_free_text_key,
+            "入站包壳键名应与请求侧声明的 schema 属性名一致"
+        );
+        assert_eq!(tu["input"]["input"], "*** free text ***");
+    }
+
+    #[test]
+    fn test_responses_unrecognized_tool_type_does_not_crash_and_others_still_pass() {
+        // 未识别的 type 不应 panic,也不应影响同批次里其它合法工具被正常下发。
+        let raw = json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [
+                {"type": "mcp", "name": "some_future_type"},
+                {"type": "function", "name": "f", "parameters": {"type": "object"}}
+            ]
+        });
+        let a = openai_responses_to_anthropic("m", &raw, false);
+        let tools = a["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1, "未识别 type 被跳过,不出现在下发列表里");
+        assert_eq!(tools[0]["name"], "f");
     }
 
     #[test]
@@ -2045,7 +2633,9 @@ mod tests {
         // 流式:
         let mut conv = ResponsesStreamConverter::new("m");
         conv.push_event(&json!({"type": "message_start", "message": {"id": "r1"}}));
-        conv.push_event(&json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}));
+        conv.push_event(
+            &json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}),
+        );
         conv.push_event(&json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hi"}}));
         conv.push_event(&json!({"type": "content_block_stop", "index": 0}));
         let done = conv.push_event(&json!({"type": "message_stop"}));
@@ -2071,11 +2661,21 @@ mod tests {
         // Responses API 原生 text.format 路径。
         let raw = json!({"model": "m", "input": "hi", "text": {"format": {"type": "json_object"}}});
         let a = openai_responses_to_anthropic("m", &raw, false);
-        assert!(a["system"][0]["text"].as_str().unwrap().contains("valid JSON"));
+        assert!(
+            a["system"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("valid JSON")
+        );
         // 也认 response_format(部分客户端仍发)。
         let raw2 = json!({"model": "m", "input": "hi", "response_format": {"type": "json_object"}});
         let a2 = openai_responses_to_anthropic("m", &raw2, false);
-        assert!(a2["system"][0]["text"].as_str().unwrap().contains("valid JSON"));
+        assert!(
+            a2["system"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("valid JSON")
+        );
     }
 
     #[test]
@@ -2094,7 +2694,11 @@ mod tests {
         assert_eq!(out[1]["role"], "assistant");
         assert_eq!(out[1]["content"][0]["type"], "tool_use");
         assert_eq!(out[2]["role"], "user");
-        assert_eq!(out[2]["content"].as_array().unwrap().len(), 2, "两条 user 合并");
+        assert_eq!(
+            out[2]["content"].as_array().unwrap().len(),
+            2,
+            "两条 user 合并"
+        );
     }
 
     // ===== /v1/responses 测试 =====
@@ -2125,7 +2729,12 @@ mod tests {
         // user(q) + assistant(tool_use fc1) + user(tool_result fc1)
         assert_eq!(msgs[0]["role"], "user");
         assert_eq!(msgs[1]["role"], "assistant");
-        let tu = msgs[1]["content"].as_array().unwrap().iter().find(|b| b["type"] == "tool_use").unwrap();
+        let tu = msgs[1]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["type"] == "tool_use")
+            .unwrap();
         assert_eq!(tu["id"], "fc1");
         assert_eq!(tu["name"], "get");
         assert_eq!(tu["input"]["k"], 1);
@@ -2137,7 +2746,10 @@ mod tests {
     #[test]
     fn test_responses_request_max_output_tokens() {
         let raw = json!({"model": "m", "input": "x", "max_output_tokens": 500});
-        assert_eq!(openai_responses_to_anthropic("m", &raw, false)["max_tokens"], 500);
+        assert_eq!(
+            openai_responses_to_anthropic("m", &raw, false)["max_tokens"],
+            500
+        );
     }
 
     #[test]
@@ -2147,7 +2759,9 @@ mod tests {
         assert_eq!(start[0].0, "response.created");
         assert_eq!(start[1].0, "response.in_progress");
         // text 块生命周期
-        let cbs = conv.push_event(&json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}));
+        let cbs = conv.push_event(
+            &json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}),
+        );
         assert_eq!(cbs[0].0, "response.output_item.added");
         assert_eq!(cbs[1].0, "response.content_part.added");
         let d = conv.push_event(&json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hi"}}));
@@ -2155,9 +2769,15 @@ mod tests {
         assert_eq!(d[0].1["delta"], "Hi");
         let stop = conv.push_event(&json!({"type": "content_block_stop", "index": 0}));
         assert_eq!(stop[0].0, "response.output_text.done");
-        assert_eq!(stop[0].1["text"], "Hi", "output_text.done 必须回填全量 text");
+        assert_eq!(
+            stop[0].1["text"], "Hi",
+            "output_text.done 必须回填全量 text"
+        );
         assert_eq!(stop[2].0, "response.output_item.done");
-        assert_eq!(stop[2].1["item"]["content"][0]["text"], "Hi", "message item 回填 content");
+        assert_eq!(
+            stop[2].1["item"]["content"][0]["text"], "Hi",
+            "message item 回填 content"
+        );
         conv.push_event(&json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 3}}));
         let done = conv.push_event(&json!({"type": "message_stop"}));
         assert_eq!(done[0].0, "response.completed");
@@ -2165,10 +2785,17 @@ mod tests {
         // response.completed.output 必须回填(非空壳)
         let output = done[0].1["response"]["output"].as_array().unwrap();
         assert_eq!(output.len(), 1);
-        assert_eq!(output[0]["content"][0]["text"], "Hi", "completed.output 回填全量内容");
+        assert_eq!(
+            output[0]["content"][0]["text"], "Hi",
+            "completed.output 回填全量内容"
+        );
         // sequence_number 单调递增
         let s_created = start[0].1["sequence_number"].as_i64().unwrap();
-        let s_completed = done[0].1["response"].get("id").map(|_| ()).and(done[0].1["sequence_number"].as_i64()).unwrap();
+        let s_completed = done[0].1["response"]
+            .get("id")
+            .map(|_| ())
+            .and(done[0].1["sequence_number"].as_i64())
+            .unwrap();
         assert!(s_completed > s_created);
     }
 
@@ -2184,9 +2811,15 @@ mod tests {
         assert_eq!(d[0].0, "response.function_call_arguments.delta");
         let stop = conv.push_event(&json!({"type": "content_block_stop", "index": 0}));
         assert_eq!(stop[0].0, "response.function_call_arguments.done");
-        assert_eq!(stop[0].1["arguments"], "{\"a\":1}", "arguments.done 必须回填全量参数");
+        assert_eq!(
+            stop[0].1["arguments"], "{\"a\":1}",
+            "arguments.done 必须回填全量参数"
+        );
         assert_eq!(stop[1].0, "response.output_item.done");
-        assert_eq!(stop[1].1["item"]["arguments"], "{\"a\":1}", "function_call item 回填 arguments");
+        assert_eq!(
+            stop[1].1["item"]["arguments"], "{\"a\":1}",
+            "function_call item 回填 arguments"
+        );
         assert_eq!(stop[1].1["item"]["call_id"], "t1");
         // completed.output 回填 function_call
         let done = conv.push_event(&json!({"type": "message_stop"}));
@@ -2207,10 +2840,14 @@ mod tests {
         let r = aggregate_responses("m", &events);
         assert_eq!(r["object"], "response");
         assert_eq!(r["status"], "completed");
-        let msg = r["output"].as_array().unwrap().iter().find(|o| o["type"] == "message").unwrap();
+        let msg = r["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["type"] == "message")
+            .unwrap();
         assert_eq!(msg["content"][0]["text"], "Hello");
         assert_eq!(r["usage"]["input_tokens"], 5);
         assert_eq!(r["usage"]["output_tokens"], 2);
     }
-
 }

@@ -195,7 +195,10 @@ mod tests {
         };
         let json = serde_json::to_value(&st).unwrap();
         assert_eq!(json["enabled"], serde_json::json!(true));
-        assert!(json.get("confirmed").is_none(), "只读查询不应带 confirmed 字段");
+        assert!(
+            json.get("confirmed").is_none(),
+            "只读查询不应带 confirmed 字段"
+        );
         assert!(json.get("note").is_none(), "只读查询不应带 note 字段");
     }
 

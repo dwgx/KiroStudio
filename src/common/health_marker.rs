@@ -32,7 +32,9 @@ const HEALTH_CONFIRM_DELAY_SECS: u64 = 30;
 /// 由当前 exe 路径派生一个同目录的兄弟标记文件路径（`<exe>.<ext>`）。
 /// 与 `src/admin/update.rs` 的 `exe.with_extension("bak"/"new")` 约定一致。
 fn marker_path(ext: &str) -> Option<PathBuf> {
-    std::env::current_exe().ok().map(|exe| exe.with_extension(ext))
+    std::env::current_exe()
+        .ok()
+        .map(|exe| exe.with_extension(ext))
 }
 
 /// bind 成功后立即调用：清零启动计数器，向守卫脚本表明「已越过启动门，非 crashloop」。
@@ -82,7 +84,11 @@ pub fn spawn_health_confirm(version: String) {
             if let Err(e) = std::fs::write(&health, body) {
                 tracing::warn!("写健康标记 {:?} 失败（不影响运行）: {}", health, e);
             } else {
-                tracing::info!("已写健康标记 {:?}（本版稳定运行 {}s，可信）", health, HEALTH_CONFIRM_DELAY_SECS);
+                tracing::info!(
+                    "已写健康标记 {:?}（本版稳定运行 {}s，可信）",
+                    health,
+                    HEALTH_CONFIRM_DELAY_SECS
+                );
             }
         }
 
@@ -182,8 +188,13 @@ mod tests {
             rolled_back_binary_present: false,
         };
         let json = serde_json::to_string(&s).unwrap();
-        assert!(json.contains("\"healthConfirmed\":true"), "应为 camelCase: {json}");
-        assert!(json.contains("\"rollbackPointPresent\":false"), "应为 camelCase: {json}");
+        assert!(
+            json.contains("\"healthConfirmed\":true"),
+            "应为 camelCase: {json}"
+        );
+        assert!(
+            json.contains("\"rollbackPointPresent\":false"),
+            "应为 camelCase: {json}"
+        );
     }
 }
-

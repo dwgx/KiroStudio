@@ -581,4 +581,3 @@ mod tests {
         assert_eq!(text, original);
     }
 }
-

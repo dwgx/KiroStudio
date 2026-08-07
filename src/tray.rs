@@ -86,7 +86,7 @@ pub struct RelaunchInfo {
 /// 必须在专用 std 线程调用（main 负责 spawn），不可占 tokio 主线程。
 pub fn run(cfg: TrayConfig) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, GetMessageW, TranslateMessage, MSG, WM_QUIT,
+        DispatchMessageW, GetMessageW, MSG, TranslateMessage, WM_QUIT,
     };
 
     // 构建菜单：打开网页 / 复制密钥 / 重启服务 / 版本(置灰) / 退出。
@@ -114,7 +114,12 @@ pub fn run(cfg: TrayConfig) {
     // 构建托盘图标（渲染 svg；失败则无图标仍可用菜单）。
     let mut builder = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip(format!("KiroStudio v{} — {}:{}", env!("CARGO_PKG_VERSION"), cfg.host, cfg.port));
+        .with_tooltip(format!(
+            "KiroStudio v{} — {}:{}",
+            env!("CARGO_PKG_VERSION"),
+            cfg.host,
+            cfg.port
+        ));
     if let Some((rgba, w, h)) = render_icon_rgba(32) {
         if let Ok(icon) = Icon::from_rgba(rgba, w, h) {
             builder = builder.with_icon(icon);
@@ -172,11 +177,7 @@ pub fn run(cfg: TrayConfig) {
 
 /// host 为 0.0.0.0 时用 127.0.0.1 打开本机面板。
 fn browse_host(host: &str) -> &str {
-    if host == "0.0.0.0" {
-        "127.0.0.1"
-    } else {
-        host
-    }
+    if host == "0.0.0.0" { "127.0.0.1" } else { host }
 }
 
 /// 打开默认浏览器（detached cmd start，不阻塞、不弹窗）。
@@ -206,4 +207,3 @@ fn copy_to_clipboard(text: &str) {
         Err(e) => tracing::warn!("[托盘] 打开剪贴板失败: {}", e),
     }
 }
-

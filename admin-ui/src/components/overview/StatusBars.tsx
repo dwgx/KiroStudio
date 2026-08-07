@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import i18n from '@/i18n'
 import type { CredentialStatusItem, CachedBalanceItem } from '@/types/api'
@@ -7,7 +7,7 @@ import { healthOf, HEALTH_RGB, EmptyPool, useHoverCard } from '@/components/over
 import { useCachedBalances } from '@/hooks/use-credentials'
 import { subscriptionLabel } from '@/lib/i18n-labels'
 import { X } from 'lucide-react'
-import { FireCanvas } from '@/components/overview/FireCanvas'
+import { FireCanvas, pickFireCandidates, type FireCandidate } from '@/components/overview/FireCanvas'
 import { useFlip } from '@/hooks/use-flip'
 import './status-bars.css'
 
@@ -17,8 +17,11 @@ export interface StatusBarsProps {
   activity?: Map<number, CellActivity>
   /**
    * 火力全开(RPM 饱和)的凭据 id 集合——由概览页从 /ratelimit/insights 的 rpmSaturated 派生传入。
-   * 命中的号条会点燃 effort-card 风格的 WebGL 火焰(条件挂载,同时通常仅 1-2 个,数百号不崩)。
-   * 不传则不点火(优雅降级)。
+   * 命中的号**够资格**点燃 effort-card 风格的 WebGL 火焰,但真正点火的至多
+   * `MAX_FIRE_INSTANCES` 个(按强度取前 N,见 `pickFireCandidates`)——
+   * ⚠️ 这里原先写的是"同时通常仅 1-2 个",那是**假设不是约束**:实测有多号同时打猛时会挂出十几个
+   * WebGL 上下文,超硬上限后被浏览器强制丢弃,RAF 却继续对死上下文空转 → GPU 进程跑满一核。
+   * 现在数量由 pickFireCandidates 硬顶,落选的号退回 CellFlow 格子流。不传则只按在途/RPM 判定。
    */
   saturatedIds?: Set<number>
   /**
@@ -72,12 +75,20 @@ function hostOf(url?: string): string | null {
   }
 }
 
-// ── 算力格子阵列可调常量 ──（合并版：凌晨观感 + 算法加减；参数集中此处便于调）
+// ── 算力格子阵列可调常量 ──（参数集中此处便于调）
 // 窄条(84×16px)上排 COLS×ROWS 个小核心，像 GPU die 上的 SM 阵列。
-const GRID_COLS = 14
-const GRID_ROWS = 3
+// ⚠️ 密度是**刻意压低**过的（14×3=42 → 10×2=20 格/号）：42 格 × 几十个号的常驻满格阵列
+//    在真实号池上叠出「一屏密密麻麻的绿格子」，观感上是密集恐惧而不是算力表（详见下方
+//    CellFlow 文档注释里"为什么反转满格设计"）。改回去前先想清楚 N 个号叠加后的样子。
+//    几何：84px/10 列 ≈ 7.0px、16px/2 行 ≈ 7.2px（近方形）；列/行都是 1fr，恒不溢出容器。
+const GRID_COLS = 10
+const GRID_ROWS = 2
 const GRID_CELLS = GRID_COLS * GRID_ROWS
 // 点亮格数 = round(利用率 × 总格数)（算法加减：量化成整数格，负载升降时格子沿固定次序一颗颗加/减）。
+// 活跃下限：至少亮 1 格 → "有负载就一定看得见心跳"，不会出现在途请求却整条空白。
+// 20 格下 1 格 = 5% 利用率的显示分辨率（42 格时为 2.4%），下限 1 依然是"最小可见心跳"故保持不变；
+// **不要**因为格数减半就把它上调到 2 —— rpm=1 这类真·轻载会被虚报成 10% 占用，
+// 与本轮"密度必须随真实负载走"的目标直接冲突。
 const MIN_LIT_WHEN_ACTIVE = 1
 // 加/减一颗格子的亮灭过渡时长(ms)：新格点亮/旧格熄灭平滑淡入淡出，不硬跳。
 const CELL_TRANSITION_MS = 420
@@ -87,6 +98,20 @@ const CELL_STAGGER_MS = 26
 const CELL_STAGGER_CAP_MS = 520
 // 黄金比低差异序列常数：给格子排一个“散布均匀”的填充次序（负载升时匀称铺满整片 die）。
 const GOLDEN = 0.6180339887498949
+// 熄灭格：**只压暗、不缩小**，整片 die 始终满格（"凌晨满格观感"，用户明确要的就是这个）。
+//
+// 这里曾被改成 `scale(0.28)` 缩成小点，理由是"1092 个绿格子同屏 = 密集恐惧"。那个理由
+// 混了两件事：视觉密度是**取向**问题（由用户拍板），而当时真正的性能问题是每个格子上的
+// `will-change`（约 1200 个常驻合成层，见 status-bars.css 的说明）。缩小格子并不能省掉
+// 合成层，所以它付了观感的代价却没换来性能。现已分开处理：观感回满格，性能改在 will-change。
+//
+// 满格与火焰名额（MAX_FIRE_INSTANCES）**不是跷跷板**：格子是 DOM/CSS、火焰是 WebGL，
+// 两者独立。恢复满格不需要动火焰名额，那个 20 个 WebGL 上下文被丢弃的 bug 不会因此复活。
+const OFF_CELL_BG_ALPHA_ACTIVE = 0.14
+const OFF_CELL_BG_ALPHA_IDLE = 0.1
+// 熄灭格不透明度：极低但**刻意不取 0** —— 全隐时"号空闲"与"这条坏了/没渲染"在视觉上
+// 无从区分，留一丝痕迹保住格位的可见性(affordance)。
+const OFF_CELL_OPACITY = 0.12
 
 // 火焰强度 0..1:由 RPM 与在途综合派生(RPM 60/min 视为满档,在途 6 视为满档,取较大者)。
 // 驱动 FireCanvas 配色分级——越猛越偏 Ruby 红(全满=最强),否则青/绿/橙/紫渐变。
@@ -102,11 +127,27 @@ function fireIntensity(rpm: number, inflight: number): number {
  * 【合并要点】
  * - **算法加减**（取自后一版）：点亮格数 litCount = round(利用率 × 总格数)，格子按**黄金比填充序**
  *   固定次序取前 litCount 个点亮 → 负载升降时格子一颗颗匀称地加/减，并按“到填充前沿距离”错峰过渡（涟漪）。
- * - **凌晨观感**（取自凌晨版）：熄灭格**只压暗、不缩小**（整片 die 始终满格，无“缩成小点”的空洞感）；
- *   点亮格保留 opacity 微闪（相位/速度/深度各异，此起彼伏不齐刷刷）。
+ * - 点亮格保留 opacity 微闪（相位/速度/深度各异，此起彼伏不齐刷刷）。
+ *
+ * 【满格观感：当前取向，由用户拍板】
+ * 熄灭格**只压暗、不缩小**，整片 die 始终满格，无缩成小点的空洞感。
+ *
+ * 这里曾被改成 `scale(0.28)` 缩成小点，理由是「`MAX_FIRE_INSTANCES = 4` 之后 CellFlow 成了
+ * 多数号的常驻形态，满格 × N 条 = 密集恐惧」。那个改动混了两件事：
+ *   - **视觉密度**是取向问题 → 用户已明确要满格，以此为准。
+ *   - **当时真正的性能问题**是每个格子上的 `will-change`（20 格/条 × 30 号 = 600 条常驻合成层）。
+ *     缩小格子并不能省掉合成层，所以它付了观感的代价却没换来性能。
+ * 现已分开处理：观感回满格；性能改在 status-bars.css —— 去掉 `.sbar-cell` 的 `will-change`。
+ *
+ * 另外纠正一处：满格与火焰名额**不是跷跷板**。格子是 DOM/CSS、火焰是 WebGL，两者独立；
+ * 恢复满格不需要动 `MAX_FIRE_INSTANCES`，那个「WebGL 上下文被丢弃后 RAF 仍发 GL 命令」的
+ * bug 不会因此复活。火焰名额该留着（它治的是并发 WebGL 上下文数），与格子观感无关。
+ *
  * ① 利用率 level(0..1) 由真实 RPM/在途派生：决定点亮多少格、闪动多快。
  * ② 每个真实请求（pulse）→ 一道**点火波**自左向右穿过整阵（overlay 按列错峰 ignite，key=pulse 单次重放）。
- * ③ 空闲/禁用：暗格静止零动画（GPU 不空转）。火力全开(onFire)：整容器换成 WebGL 火焰，保持现状不动。
+ * ③ 空闲/禁用：格子压到极暗（仍满格）且零动画（GPU 不空转）。火力全开(onFire)：整容器换成 WebGL 火焰。
+ *    ⚠️ 只有拿到火焰名额的至多 MAX_FIRE_INSTANCES 个号才 onFire；够资格但没抢到名额的号
+ *    **退回本格子流**（这就是它的降级形态，负载照样由亮格数表达，只是不烧 WebGL 上下文）。
  * 全走 opacity/transform（GPU 合成，keyframes 见 status-bars.css）；motion-reduce 退化为静态占用格。
  */
 function CellFlow({
@@ -124,7 +165,8 @@ function CellFlow({
   litHealth: boolean
   onFire: boolean
 }) {
-  // 火力全开(自动挡):同一个 RPM 容器直接拉满成 effort-card WebGL 火焰(条件挂载,只有饱满号有上下文)。
+  // 火力全开(自动挡):同一个 RPM 容器直接拉满成 effort-card WebGL 火焰。
+  // onFire 已由父级按名额裁过(pickFireCandidates),故并发上下文数恒 ≤ MAX_FIRE_INSTANCES。
   if (onFire) {
     return (
       <div
@@ -201,19 +243,22 @@ function CellFlow({
         // 到填充前沿的距离 → 加减错峰 delay，让一颗颗加/减像涟漪从前沿扩散。
         const stagger = Math.min(Math.abs(c.order - litCount) * CELL_STAGGER_MS, CELL_STAGGER_CAP_MS)
         // 点亮格闪动的高/低 opacity：越忙峰值越高、谷越浅（更饱满）。
-        const hi = on ? Math.min(0.55 + level * 0.45, 1) : 0.12
-        const lo = on ? Math.max(hi * c.depth, 0.2) : 0.12
+        // 熄灭格不参与 flicker（无动画），两个变量此时只是占位、不生效。
+        const hi = on ? Math.min(0.55 + level * 0.45, 1) : 0
+        const lo = on ? Math.max(hi * c.depth, 0.2) : 0
         return (
           <span
             key={i}
             className={`sbar-cell ${on ? 'sbar-cell-run motion-reduce:animate-none' : ''}`}
             style={{
-              // 凌晨观感：熄灭格只压暗、不缩小（整片 die 始终满格，无空洞感）。
+              // 熄灭格：只压暗、不缩小 → 整片 die 始终满格，无缩成小点的空洞感。
+              // 不设 transform：格子不参与缩放，省掉 1200 个元素的 transform 合成开销。
               background: on
                 ? `rgb(${rgb} / 0.95)`
-                : `rgb(${rgb} / ${active ? 0.14 : 0.1})`,
+                : `rgb(${rgb} / ${active ? OFF_CELL_BG_ALPHA_ACTIVE : OFF_CELL_BG_ALPHA_IDLE})`,
               boxShadow: on ? `0 0 3px rgb(${rgb} / 0.55)` : 'none',
-              opacity: on ? undefined : lo,
+              // 点亮格的 opacity 交给 flicker 动画（故留 undefined），熄灭格用静态低值。
+              opacity: on ? undefined : OFF_CELL_OPACITY,
               // 加减时的亮灭过渡（仅淡入淡出，无 scale）+ 按前沿距离错峰。
               transitionDuration: `${CELL_TRANSITION_MS}ms`,
               transitionDelay: `${stagger}ms`,
@@ -267,6 +312,25 @@ export function StatusBars({ credentials, activity, balances, saturatedIds, clas
   // FLIP 平滑重排:排序模式切换/显隐变化导致 id 顺序变时,列表项从旧位滑到新位(不瞬跳)。
   const flipRef = useFlip<HTMLDivElement>([credentials.map((c) => c.id).join(',')])
 
+  // ── 火焰名额分配(P0)──
+  // 够资格点火的号可能有几十个,但 WebGL 上下文有硬上限,故只让最猛的前 N 个真的挂 FireCanvas。
+  // burningRef 存上一帧的结果喂给滞后判定(在位者不被小差距顶掉);它只在 commit 后更新,
+  // 因此同一次渲染里 useMemo 读到的输入是稳定的(StrictMode 双跑也算出同一个结果)。
+  const burningRef = useRef<Set<number>>(new Set())
+  const fireIds = useMemo(() => {
+    const cands: FireCandidate[] = credentials.map((c) => ({
+      id: c.id,
+      saturated: !!saturatedIds?.has(c.id),
+      inflight: c.inflight ?? 0,
+      rpm: c.rpm ?? 0,
+      lit: healthOf(c) !== 'disabled',
+    }))
+    return new Set(pickFireCandidates(cands, burningRef.current))
+  }, [credentials, saturatedIds])
+  useEffect(() => {
+    burningRef.current = fireIds
+  }, [fireIds])
+
   if (credentials.length === 0) {
     return <EmptyPool className={className} />
   }
@@ -280,10 +344,10 @@ export function StatusBars({ credentials, activity, balances, saturatedIds, clas
           const lit = h !== 'disabled'
           const inflight = c.inflight ?? 0
           const rpm = c.rpm ?? 0
-          // 火力全开(触发率放宽,dwgx 要多能看到):非禁用号,满足任一即点火——
-          // ①后端判定 RPM 饱和(saturatedIds,含 rpm_limit=0 时的高水位兜底)
-          // ②在途 ≥2(并发打满)③RPM ≥20(打得猛)。任一即拉满成 WebGL 火焰。
-          const onFire = lit && (!!saturatedIds?.has(c.id) || inflight >= 2 || rpm >= 20)
+          // 火力全开:判定已整体搬进 FireCanvas 的 pickFireCandidates(见上 fireIds)——
+          // 资格条件不变(饱和 | 在途 ≥2 | RPM ≥20),但**再叠一道数量上限**,故这里只查名单。
+          // 原先在这一行直接算 onFire 的写法没有上限:够条件的号有多少就挂多少个 WebGL 上下文。
+          const onFire = fireIds.has(c.id)
 
           // 订阅等级：凭据持久化字段优先，回退缓存快照；缺失则不显（不占“未知”）。
           const sub = c.subscriptionTitle ?? balanceMap?.[String(c.id)]?.subscriptionTitle ?? null

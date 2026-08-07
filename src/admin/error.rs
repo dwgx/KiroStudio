@@ -85,7 +85,9 @@ impl AdminServiceError {
             AdminServiceError::InvalidCredential(_) => {
                 AdminErrorResponse::invalid_request(self.to_string())
             }
-            AdminServiceError::UpstreamTimeout(_) => AdminErrorResponse::api_error(self.to_string()),
+            AdminServiceError::UpstreamTimeout(_) => {
+                AdminErrorResponse::api_error(self.to_string())
+            }
             AdminServiceError::Diagnosed(d) => AdminErrorResponse::diagnosed(d.clone()),
         }
     }

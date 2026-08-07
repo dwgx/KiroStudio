@@ -160,7 +160,13 @@ fn is_forbidden_ipv6_native(ip: Ipv6Addr, policy: SsrfPolicy) -> bool {
         return true;
     }
     // 64:ff9b::/96 NAT64 —— 内嵌 v4 目标，按 v4 判定后 32 位
-    if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0 {
+    if seg[0] == 0x0064
+        && seg[1] == 0xff9b
+        && seg[2] == 0
+        && seg[3] == 0
+        && seg[4] == 0
+        && seg[5] == 0
+    {
         let v4 = Ipv4Addr::new(
             (seg[6] >> 8) as u8,
             (seg[6] & 0xff) as u8,
@@ -233,14 +239,18 @@ fn parse_host_port(url: &str) -> Result<(String, u16), String> {
     let default_port: u16 = match scheme.as_str() {
         "https" => 443,
         "http" => 80,
+        // 代理节点地址（`validate_proxy_address`）。1080 是 SOCKS 的惯例端口。
+        // 放在这里而不是在 `validate_proxy_address` 里另写一份解析：userinfo 剥离与
+        // IPv6 字面量这两段是安全承重的（`host@内网` 混淆、`[::1]:port`），
+        // 复制一份必然与本函数漂移。**不放宽任何调用方**：
+        // `validate_outbound_url` 在调用本函数**之前**先过自己的 scheme 白名单
+        // （只有 https/http），所以 socks 到不了那条路径。
+        "socks5" | "socks5h" => 1080,
         _ => return Err(format!("不支持的 scheme: {scheme}")),
     };
 
     // 去掉 path/query/fragment，只留 authority
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or("");
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     if authority.is_empty() {
         return Err("URL 缺少主机".to_string());
     }
@@ -334,6 +344,67 @@ pub async fn validate_outbound_url_with(
     }
 }
 
+/// 校验一个**代理节点地址**（`socks5://` / `socks5h://` / `http://` / `https://`）。
+///
+/// 为什么不能直接用 [`validate_outbound_url`]：那个函数的 scheme 白名单只有
+/// `https`/`http`，代理节点的 `socks5://` 会被它直接拒掉。
+///
+/// # 这不是 fail-closed，别当它是
+///
+/// 本函数只拦**当场解析得到的**内网/保留地址。三个已知缺口：
+///
+/// 1. **DNS 失败放行**（下方 `Err(_) => Ok(())`）。与 `validate_outbound_url` 同口径，
+///    但那个函数的 fail-open 有「出站禁重定向」兜底，代理隧道**没有**对应兜底。
+/// 2. **不在使用时复验**。入表时解析到公网、之后 DNS 重指到内网（短 TTL / DNS 重绑定），
+///    reqwest 每次连接自行解析，没有 `resolve_to_addrs` 固定，于是照走内网。
+/// 3. **旁路存在**：`set_credential_proxy` 与 `/proxy/test` 都不做任何地址校验，
+///    同一个内网地址从那两条路进来不受本函数管辖。
+///
+/// 所以本函数的定位是**降低误配概率**（管理员手滑填了 `127.0.0.1`），
+/// 不是安全边界。要真正封住需要：使用时复验 + 固定解析结果 + 覆盖另两条入口。
+///
+/// 之所以仍然拦：节点地址会被写进凭据并在请求热路径上使用，
+/// 允许 `socks5://127.0.0.1:x` 等于把网关变成一个可被指使的内网探测器
+/// （逐个试 `socks5://10.0.0.x:port`，靠测速的成功/失败与延迟当信号）。
+///
+/// # 策略：[`SsrfPolicy::AdminConfigured`]（与 custom_api base_url 同口径）
+///
+/// 节点地址是**管理员过了 adminKey 鉴权后亲手填的**，与 custom_api 的 base_url 同类，
+/// 故用同一套策略。这只放开 198.18.0.0/15（RFC 2544 基准段）一段，理由见
+/// [`is_forbidden_ipv4_with`]：Clash / Mihomo / Surge 的 fake-IP 池默认就是该段，
+/// 开了 fake-IP 的机器上**任意域名**都解析到 198.18.x.x —— `Strict` 会让管理员
+/// 连一个域名形式的代理节点都加不进来（本仓已知问题 #19 的同源缺陷）。
+///
+/// ⚠️ **它并没有放开环回与 RFC1918**：`socks5://127.0.0.1:40002`（本机 `ssh -D` 隧道）
+/// 与 `socks5://192.168.x.x:7890`（局域网 Clash/gluetun 旁车）**仍然被拒**，
+/// 而这两个恰是自建分身出口最常见的形态。要支持它们需要一个显式的配置开关
+/// （类似 `trustForwardedHeader` 那种「管理员知情下放开」的旋钮），
+/// 不能靠换策略解决 —— `AdminConfigured` 的豁免范围只有基准段这一条。
+pub async fn validate_proxy_address(url: &str) -> Result<(), String> {
+    let scheme = url
+        .split_once("://")
+        .map(|(s, _)| s.to_ascii_lowercase())
+        .ok_or_else(|| "代理地址缺少 scheme（应形如 socks5://host:port）".to_string())?;
+    const ALLOWED: &[&str] = &["socks5", "socks5h", "http", "https"];
+    if !ALLOWED.iter().any(|s| *s == scheme) {
+        return Err(format!(
+            "代理 scheme 不被允许（仅 socks5/socks5h/http/https）: {scheme}"
+        ));
+    }
+    let (host, port) = parse_host_port(url)?;
+    match tokio::net::lookup_host((host.as_str(), port)).await {
+        Ok(iter) => {
+            for sa in iter {
+                if is_forbidden_ip_with(sa.ip(), SsrfPolicy::AdminConfigured) {
+                    return Err(describe_rejection(sa.ip()));
+                }
+            }
+            Ok(())
+        }
+        Err(_) => Ok(()),
+    }
+}
+
 /// 校验一个出站 URL 并构造「已固定 DNS + 禁重定向」的安全 reqwest 客户端。
 ///
 /// 成功返回的 `Client` 已把目标域名固定到本次校验通过的 IP 集合，直接对同一
@@ -353,7 +424,10 @@ pub async fn build_guarded_client(
         .split_once("://")
         .map(|(s, _)| s.to_ascii_lowercase())
         .ok_or_else(|| "URL 缺少 scheme".to_string())?;
-    if !allowed_schemes.iter().any(|s| s.eq_ignore_ascii_case(&scheme)) {
+    if !allowed_schemes
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(&scheme))
+    {
         return Err(format!("scheme 不被允许: {scheme}"));
     }
 
@@ -394,29 +468,103 @@ pub async fn build_guarded_client(
 mod tests {
     use super::*;
 
+    /// `socks5://` 必须被接受 —— 这正是不能复用 `validate_outbound_url` 的原因。
+    ///
+    /// 回退即 FAIL：把 `validate_proxy_address` 换成 `validate_outbound_url(url, true)`，
+    /// 第一条断言失败（scheme 白名单只有 https/http）→ 任何 SOCKS 节点都存不进去。
+    ///
+    /// ⚠️ 用 `.invalid` TLD（RFC 6761 保证永不解析）：测试不得依赖真实 DNS，
+    /// 否则开 fake-IP 代理的机器上会走到禁止段判定（本仓已知问题 #19 的成因）。
+    ///
+    /// 最后那条 198.18.0.46 是**策略断言**：节点地址走
+    /// [`SsrfPolicy::AdminConfigured`]，故 fake-IP 池默认段（198.18.0.0/15）必须放行。
+    /// 回退即 FAIL：把策略改回 `Strict`，该条失败 —— 开了 Clash fake-IP 的机器上
+    /// 任意域名都解析到这一段，管理员一个域名形式的节点都加不进来。
+    #[tokio::test]
+    async fn proxy_address_accepts_socks_schemes_and_rejects_others() {
+        for ok in [
+            "socks5://node.invalid:40002",
+            "socks5h://node.invalid:40002",
+            "http://node.invalid:8080",
+            "https://node.invalid:443",
+            // fake-IP 池段：AdminConfigured 下唯一被豁免的禁止段。
+            "socks5://198.18.0.46:40002",
+        ] {
+            assert!(
+                validate_proxy_address(ok).await.is_ok(),
+                "{ok} 应被接受（代理节点允许 socks5）"
+            );
+        }
+        for bad in [
+            "ftp://node.invalid:21",
+            "file:///etc/passwd",
+            "node.invalid:1080",
+        ] {
+            assert!(validate_proxy_address(bad).await.is_err(), "{bad} 应被拒绝");
+        }
+    }
+
+    /// 内网/环回**IP 字面量**必须拒绝 —— 换用 `AdminConfigured` 后**依然如此**。
+    ///
+    /// 这条同时是策略豁免范围的边界断言：`AdminConfigured` 只放开
+    /// 198.18.0.0/15（见上一条测试），**其余禁止段一个都没放开**。
+    /// 逐条按 `is_forbidden_ip_with` 的实际判据挑：环回 / RFC1918 两段 / CGNAT /
+    /// 链路本地(含云元数据) / 文档段 / IPv6 环回 / ULA / 6to4 内嵌元数据地址。
+    ///
+    /// ⚠️ 这条只覆盖字面量。域名走 DNS 失败分支时是**放行**的，
+    /// 且没有使用时复验 —— 见 `validate_proxy_address` 的「这不是 fail-closed」一节。
+    ///
+    /// 回退即 FAIL：删掉 `is_forbidden_ip_with` 那道检查 → 管理员可填
+    /// `socks5://127.0.0.1:x` / `socks5://10.0.0.x:x`，把网关变成可被指使的
+    /// 内网扫描器（用测速接口的成功/失败当探测信号）。
+    #[tokio::test]
+    async fn proxy_address_rejects_internal_targets() {
+        for bad in [
+            "socks5://127.0.0.1:1080",
+            "socks5://10.0.0.5:1080",
+            "socks5://192.168.1.1:1080",
+            "socks5://172.16.0.1:1080",
+            "socks5://100.64.0.1:1080",
+            "socks5://169.254.169.254:1080",
+            "socks5://198.51.100.7:1080",
+            "http://[::1]:8080",
+            "http://[fc00::1]:8080",
+            // 6to4 内嵌 169.254.169.254：AdminConfigured 也不豁免内嵌形式。
+            "http://[2002:a9fe:a9fe::1]:8080",
+        ] {
+            assert!(
+                validate_proxy_address(bad).await.is_err(),
+                "{bad} 指向内网/环回/保留段，AdminConfigured 下必须仍然拒绝"
+            );
+        }
+    }
+
     #[test]
     fn test_forbidden_ipv4() {
         // 内网/环回/链路本地/元数据/多播/保留一律禁止
         for ip in [
-            "127.0.0.1", "10.0.0.1", "172.16.5.5", "172.31.255.255",
-            "192.168.1.1", "169.254.169.254", "100.64.0.1", "0.0.0.0",
-            "224.0.0.1", "240.0.0.1", "255.255.255.255", "192.0.2.5",
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.5.5",
+            "172.31.255.255",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "192.0.2.5",
             "198.18.0.1",
         ] {
-            assert!(
-                is_forbidden_ip(ip.parse().unwrap()),
-                "{ip} 应被禁止"
-            );
+            assert!(is_forbidden_ip(ip.parse().unwrap()), "{ip} 应被禁止");
         }
     }
 
     #[test]
     fn test_allowed_ipv4() {
         for ip in ["8.8.8.8", "1.1.1.1", "210.140.92.183"] {
-            assert!(
-                !is_forbidden_ip(ip.parse().unwrap()),
-                "{ip} 应被放行"
-            );
+            assert!(!is_forbidden_ip(ip.parse().unwrap()), "{ip} 应被放行");
         }
     }
 
@@ -456,7 +604,7 @@ mod tests {
             "0.0.0.0",
             "224.0.0.1",
             "255.255.255.255",
-            "192.0.2.5",       // 文档段：与基准段相邻但不豁免
+            "192.0.2.5", // 文档段：与基准段相邻但不豁免
             "198.51.100.7",
             "203.0.113.9",
         ] {
@@ -471,7 +619,11 @@ mod tests {
     #[test]
     fn should_apply_same_policy_to_v4_mapped_and_nat64_and_6to4() {
         // 基准段：AdminConfigured 下三种内嵌形式都应与裸 IP 一样被放行
-        for ip in ["::ffff:198.18.0.46", "64:ff9b::198.18.0.46", "2002:c612:002e::"] {
+        for ip in [
+            "::ffff:198.18.0.46",
+            "64:ff9b::198.18.0.46",
+            "2002:c612:002e::",
+        ] {
             let addr: IpAddr = ip.parse().unwrap();
             assert!(
                 !is_forbidden_ip_with(addr, SsrfPolicy::AdminConfigured),
@@ -483,7 +635,11 @@ mod tests {
             );
         }
         // 元数据端点：任何内嵌形式在任何策略下都必须拦
-        for ip in ["::ffff:169.254.169.254", "64:ff9b::169.254.169.254", "2002:a9fe:a9fe::"] {
+        for ip in [
+            "::ffff:169.254.169.254",
+            "64:ff9b::169.254.169.254",
+            "2002:a9fe:a9fe::",
+        ] {
             assert!(
                 is_forbidden_ip_with(ip.parse().unwrap(), SsrfPolicy::AdminConfigured),
                 "{ip} 内嵌元数据端点，必须拒绝"
@@ -496,7 +652,10 @@ mod tests {
     fn should_explain_fake_ip_cause_in_rejection_message() {
         let msg = describe_rejection("198.18.0.46".parse().unwrap());
         assert!(msg.contains("198.18.0.46"), "要带上实际解析到的 IP: {msg}");
-        assert!(msg.contains("fake-IP"), "要点出 fake-IP 这个真实原因: {msg}");
+        assert!(
+            msg.contains("fake-IP"),
+            "要点出 fake-IP 这个真实原因: {msg}"
+        );
 
         // 内网目标不应误报成 fake-IP 问题
         let msg2 = describe_rejection("169.254.169.254".parse().unwrap());
@@ -507,13 +666,19 @@ mod tests {
     #[test]
     fn test_forbidden_ipv6() {
         for ip in [
-            "::1", "::", "fe80::1", "fc00::1", "fd12:3456::1",
-            "ff02::1", "::ffff:127.0.0.1", "::ffff:169.254.169.254",
+            "::1",
+            "::",
+            "fe80::1",
+            "fc00::1",
+            "fd12:3456::1",
+            "ff02::1",
+            "::ffff:127.0.0.1",
+            "::ffff:169.254.169.254",
             // 6to4 (RFC 3056): 2002::/16 内嵌私有/回环 IPv4
-            "2002:7f00:0001::",   // 内嵌 127.0.0.1
-            "2002:a9fe:a9fe::",   // 内嵌 169.254.169.254
-            "2002:0a00:0001::",   // 内嵌 10.0.0.1
-            "2002:c0a8:0101::",   // 内嵌 192.168.1.1
+            "2002:7f00:0001::", // 内嵌 127.0.0.1
+            "2002:a9fe:a9fe::", // 内嵌 169.254.169.254
+            "2002:0a00:0001::", // 内嵌 10.0.0.1
+            "2002:c0a8:0101::", // 内嵌 192.168.1.1
         ] {
             assert!(
                 is_forbidden_ip(ip.parse().unwrap()),
@@ -528,7 +693,8 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_host_port() {        assert_eq!(
+    fn test_parse_host_port() {
+        assert_eq!(
             parse_host_port("https://example.com/a/b?x=1").unwrap(),
             ("example.com".to_string(), 443)
         );
@@ -556,24 +722,60 @@ mod tests {
     #[tokio::test]
     async fn test_validate_outbound_url_rejects_internal_and_scheme() {
         // 元数据/环回/内网 IP 字面量：拒绝（IP 字面量 lookup_host 直接返回，不走真实 DNS）。
-        assert!(validate_outbound_url("http://169.254.169.254/latest/meta-data", true).await.is_err());
-        assert!(validate_outbound_url("https://127.0.0.1/v1/messages", true).await.is_err());
-        assert!(validate_outbound_url("http://10.0.0.1:6379", true).await.is_err());
+        assert!(
+            validate_outbound_url("http://169.254.169.254/latest/meta-data", true)
+                .await
+                .is_err()
+        );
+        assert!(
+            validate_outbound_url("https://127.0.0.1/v1/messages", true)
+                .await
+                .is_err()
+        );
+        assert!(
+            validate_outbound_url("http://10.0.0.1:6379", true)
+                .await
+                .is_err()
+        );
         assert!(validate_outbound_url("http://[::1]/x", true).await.is_err());
         // userinfo 混淆：@ 后是内网 → 拒绝（parse_host_port 剥 userinfo 取真实 host）。
-        assert!(validate_outbound_url("https://ok.com@169.254.169.254/x", true).await.is_err());
+        assert!(
+            validate_outbound_url("https://ok.com@169.254.169.254/x", true)
+                .await
+                .is_err()
+        );
         // scheme 门：allow_http=false 时 http 被拒。
-        assert!(validate_outbound_url("http://8.8.8.8/x", false).await.is_err());
+        assert!(
+            validate_outbound_url("http://8.8.8.8/x", false)
+                .await
+                .is_err()
+        );
         // 非 http(s) scheme 一律拒。
-        assert!(validate_outbound_url("ftp://8.8.8.8/x", true).await.is_err());
+        assert!(
+            validate_outbound_url("ftp://8.8.8.8/x", true)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
     async fn test_validate_outbound_url_allows_public_ip() {
         // 公网 IP 字面量放行（用 IP 免真实 DNS 依赖）。
-        assert!(validate_outbound_url("https://8.8.8.8/v1/messages", false).await.is_ok());
-        assert!(validate_outbound_url("http://1.1.1.1/x", true).await.is_ok());
+        assert!(
+            validate_outbound_url("https://8.8.8.8/v1/messages", false)
+                .await
+                .is_ok()
+        );
+        assert!(
+            validate_outbound_url("http://1.1.1.1/x", true)
+                .await
+                .is_ok()
+        );
         // allow_http=false 下 https 公网放行。
-        assert!(validate_outbound_url("https://1.1.1.1/x", false).await.is_ok());
+        assert!(
+            validate_outbound_url("https://1.1.1.1/x", false)
+                .await
+                .is_ok()
+        );
     }
 }

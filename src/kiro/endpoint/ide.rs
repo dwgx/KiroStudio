@@ -1,9 +1,41 @@
 //! Kiro IDE 端点
 //!
-//! 对应 Kiro IDE 客户端目前使用的端点（已随 Kiro 迁移到 kiro.dev；旧的
-//! `q.{region}.amazonaws.com` 已停用）：
+//! 对应 Kiro IDE 客户端目前使用的端点（已随 Kiro 迁移到 kiro.dev）：
 //! - API: `https://runtime.{region}.kiro.dev/generateAssistantResponse`
 //! - MCP: `https://runtime.{region}.kiro.dev/mcp`
+//!
+//! # 为什么 IDE 端点用 `runtime.*` 而不是 `q.*`（2026-08-06 更正，别再改回原说法）
+//!
+//! 本注释此前写「旧的 `q.{region}.amazonaws.com` **已停用**」——**那句无依据且有反证**：
+//! 同目录 `cli.rs` 的头注释记载 2026-08 实测四个 `ksk_` 号在 `q.*` 拿到 HTTP 200。
+//! `q.*` **没有停用**，它是 **CLI 协议**（Amazon Q Developer CLI）的 host。
+//! 那句错断言曾直接导致一次错误的架构决策（改坏 region 探测 → US 号恒 403，上线后回滚）。
+//!
+//! 仍然用 `runtime.*` 的真实理由是**证据不对称**，不是「对面已停用」：
+//! - `runtime.*` 有 **4360 请求 / 99.9% 成功**的 **IDE 协议**实测。
+//! - 本仓所有 `q.*` 成功记录**全是 CLI 协议**（服务根 `/` + `X-Amz-Target` 头 +
+//!   `tokentype: API_KEY` + 绝不注入 profileArn）。**没有一条**是 IDE 协议路径在 `q.*`
+//!   上的实测 —— 两个协议的请求形状根本不同，CLI 的 200 不能外推成 IDE 的 200。
+//! - DNS 实测（`dig @1.1.1.1`，绕开本机 fake-IP 代理）：两个域名族**都只在 `us-east-1`
+//!   与 `eu-central-1` 解析**，其余 7 区两者都只返 SOA。⇒ 换 host 不解决区域覆盖。
+//!
+//! ⇒ **要把 IDE 端点迁到 `q.*`，前置条件是先补 IDE 协议在 `q.*` 上的实测**（同号同区，
+//! 确认 200 而非 403/400）。在那之前迁移是拿 4360 请求的已知good换一个未验证路径。
+//!
+//! ## ⚠️ 未解决的矛盾（两条观测冲突，谁都还没被证否）
+//!
+//! 1. 本仓实测：`runtime.*` **4360 请求 / 99.9% 成功**（IDE 协议，生产流量）。
+//! 2. 另一个 kiro 实现的注释（用户多次引用）：
+//!    > `runtime.<region>.kiro.dev` serves the same data plane but throttles far harder:
+//!    > under load it returns 25-40% 429 where `q.<region>` returns none.
+//!    同向的还有本仓 `docs/batch2-region-endpoint-matrix.md` 记的「300 并发 `q.*` 0 个 429
+//!    vs `runtime.*` 31%」。
+//!
+//! **不要替这两条下结论。** 它们可能都对（99.9% 那批是常规负载、429 那批是高并发压测），
+//! 也可能有一条口径错（例如把 403 记进了别的桶）。**判定它需要的实验**：
+//! **同一个号、同一个 region、同一并发梯度，对打两个 host 比 429 率** —— 且 `q.*` 侧必须
+//! 用 CLI 协议形状、`runtime.*` 侧用 IDE 协议形状（否则测的是协议差异不是 host 差异）。
+//! 在这个对打实验做出来之前，「哪个 host 更抗限流」是**未知**，不是已知。
 //!
 //! region 优先从凭据 `profileArn` 的第 4 段提取（与 Kiro IDE 一致），回退到凭据/config region。
 //! 请求头使用 aws-sdk-js User-Agent 标识。请求体按凭据类型条件注入 `profileArn`
@@ -159,7 +191,7 @@ fn inject_profile_arn(request_body: &str, profile_arn: &Option<String>) -> Strin
 
 #[cfg(test)]
 mod tests {
-    use super::{beta_header_for_1m, inject_profile_arn, BETA_1M};
+    use super::{BETA_1M, beta_header_for_1m, inject_profile_arn};
     use serde_json::Value;
 
     #[test]

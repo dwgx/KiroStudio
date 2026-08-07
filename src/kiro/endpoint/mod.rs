@@ -15,9 +15,11 @@ use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
 pub mod cli;
+pub mod cli_runtime;
 pub mod ide;
 
 pub use cli::CliEndpoint;
+pub use cli_runtime::CliRuntimeEndpoint;
 pub use ide::IdeEndpoint;
 
 /// 按端点名构造实现；未知名字返回 `None`。
@@ -28,12 +30,17 @@ pub fn build(name: &str) -> Option<Arc<dyn KiroEndpoint>> {
     match name {
         ide::IDE_ENDPOINT_NAME => Some(Arc::new(IdeEndpoint::new())),
         cli::CLI_ENDPOINT_NAME => Some(Arc::new(CliEndpoint::new())),
+        cli_runtime::CLI_RUNTIME_ENDPOINT_NAME => Some(Arc::new(CliRuntimeEndpoint::new())),
         _ => None,
     }
 }
 
 /// 全部已知端点的名字（新增端点时**只需**改这里和 [`build`]）。
-pub const ENDPOINT_NAMES: &[&str] = &[ide::IDE_ENDPOINT_NAME, cli::CLI_ENDPOINT_NAME];
+pub const ENDPOINT_NAMES: &[&str] = &[
+    ide::IDE_ENDPOINT_NAME,
+    cli::CLI_ENDPOINT_NAME,
+    cli_runtime::CLI_RUNTIME_ENDPOINT_NAME,
+];
 
 /// 全部已知端点的注册表（供 `main.rs` 启动时装配 provider）。
 ///
@@ -302,6 +309,41 @@ pub fn default_is_account_suspended(body: &str) -> bool {
 pub fn default_is_temporary_rate_limit(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
 
+    // 🔴 **显式 TEMPORARILY_SUSPENDED 单独一条，不参与下面的 `&&`**（2026-08-04 修）。
+    //
+    // 实测漏判形态（线上 19:09/19:12 连续两次把一个只是被临时限速的号判死）：
+    // ```
+    // 403 {"__type":"com.amazon.aws.codewhisperer#AccessDeniedException",
+    //      "message":"Your User ID (1866...) temporarily is suspended.
+    //                 We've locked your account as a security precaution.
+    //                 To restore access, please contact our support team..."}
+    // ```
+    // 两个条件**都**不命中：
+    // - `has_temporary` 失败 —— 信号表里是 `"temporarily suspended"`（两词相邻），
+    //   而上游写的是 `temporarily **is** suspended`，中间多一个 `is` 就漏。
+    //   这与本函数下方注释警告的 `unusual **user** activity` 是**同一类**错误，
+    //   那次修了 unusual 一族，这条漏了。
+    // - `has_suspicious` 失败 —— 这个变体说的是 "locked your account as a security
+    //   precaution"，既无 `suspicious activity` 也无 `unusual`+`activity`。
+    //
+    // 后果链（这才是它值得单列的原因）：漏判 → 落 `report_failure` →
+    // 3 次即以 `TooManyFailures`（**永久型**标签）禁用并落盘 → 号池从 2 个掉到 1 个
+    // → 剩下那个号吃下全部流量 → 撞进它自己的惩罚窗口 → 429 风暴
+    // （实测 19:16–19:21：单号 152 请求/分钟、144 个 429）。
+    // 即「一个号被临时限速」被放大成「整池 429 风暴」。
+    //
+    // 为什么可以脱离 `&&` 单独成立：`temporarily` 这个词本身就是上游对**临时性**的
+    // 明确声明，永久封禁的文案不会用它（见 `SUSPEND_KEYWORDS` 那边的说明）。
+    // 判据与 `anthropic::handlers::is_upstream_temporarily_suspended` 对齐 ——
+    // 那侧一直认 `"temporarily is suspended"`，所以**客户端**拿到的是正确的 429，
+    // 而本侧漏判让**凭据**被算成失败：同一个 403，两处结论相反。
+    if lower.contains("temporarily is suspended")
+        || lower.contains("temporarily suspended")
+        || lower.contains("temporarily_suspended")
+    {
+        return true;
+    }
+
     // 可疑活动信号（风控触发的标志）
     //
     // ⚠️ 不要退回成 `"unusual activity"` 这类整段字面量：生产实际文案是
@@ -341,6 +383,39 @@ pub fn default_is_client_validation_error(body: &str) -> bool {
     body.contains("TOOL_USE_RESULT_MISMATCH")
 }
 
+/// 图片声明的 `media_type` 与实际字节格式不符（400 `IMAGE_MIME_MISMATCH`）。
+///
+/// 上游原文（用户线上实测，逐字）：
+/// ```text
+/// 非流式 API 请求失败: 400 Bad Request {"__type":"com.amazon.aws.codewhisperer#ValidationException",
+///  "message":"messages.2.content.1.image.source.base64: The image was specified using the
+///             image/png media type, but the image appears to be a image/jpeg image",
+///  "reason":"IMAGE_MIME_MISMATCH"}
+/// ```
+///
+/// # 为什么单独一条判据（它的价值是**度量**，不是处置）
+///
+/// 处置上它与通用 400 同类：请求构造问题，换号/重试都无意义。真正的理由是可观测性 ——
+/// `converter.rs` 的 `resolve_image_format` 已按 magic bytes 校正客户端声明的
+/// `media_type`（声明 png 而字节是 jpeg 时改写成 jpeg）。但那条修复**没有效果度量**：
+/// 若仍有边缘情况漏掉（magic 认不出而回退声明值、上游对同一格式有更细的子类判断等），
+/// 那些 400 会与所有其它 400（工具参数错、上下文超限、请求体畸形）混进同一个
+/// `bad_request` 桶，面板上分辨不出来 ⇒ **无法回答「那条修干净了没有」**。
+///
+/// 与 `INSUFFICIENT_MODEL_CAPACITY` / `OVERAGE_REQUEST_LIMIT_EXCEEDED` /
+/// `MONTHLY_REQUEST_COUNT` / `TEMPORARILY_SUSPENDED` 都各有专门分支同理：本仓的既有
+/// 惯例是**给每种已确证的 reason 码一条判据**，让它在日志/面板上可数。
+///
+/// # 判据为何只认 reason 字面量
+///
+/// 不认 `ValidationException`：那个 `__type` 被上游多种校验错误共用
+/// （`TOOL_USE_RESULT_MISMATCH` 一类也是它），泛匹配会把处置不同的错误混成一类。
+/// 也不认 message 里的 `media type` 散文：那句话的措辞随格式组合变化
+/// （`image/png` ↔ `image/jpeg` 可任意互换），按散文匹配等于赌上游文案不变。
+pub fn default_is_image_mime_mismatch(body: &str) -> bool {
+    body.contains("IMAGE_MIME_MISMATCH")
+}
+
 /// 默认的 MODEL_TEMPORARILY_UNAVAILABLE 判断逻辑。
 ///
 /// 503 且 body 含该信号时表示**模型容量**问题，非凭据问题。
@@ -348,6 +423,27 @@ pub fn default_is_client_validation_error(body: &str) -> bool {
 pub fn default_is_model_temporarily_unavailable(body: &str) -> bool {
     body.contains("MODEL_TEMPORARILY_UNAVAILABLE")
         || body.contains("model is temporarily unavailable")
+        // ⭐ `INSUFFICIENT_MODEL_CAPACITY`：同一语义的**另一种上游形态**，实测 24h 内 272 次。
+        //
+        // 上游原文：
+        // ```text
+        // 400 Bad Request {"__type":"com.amazon.aws.codewhisperer#ThrottlingException",
+        //  "message":"I am experiencing high traffic, please try again shortly.",
+        //  "reason":"INSUFFICIENT_MODEL_CAPACITY"}
+        // ```
+        //
+        // 归到本判据而不是新开一条分支，是因为它与 `MODEL_TEMPORARILY_UNAVAILABLE`
+        // **处置完全相同**：全局容量问题、非凭据级、所有凭据对同一模型等价受影响 ⇒
+        // 慢速退避重试且**绝不**惩罚凭据健康。新开分支必然要把那整套处置抄一遍，
+        // 而两份处置一旦漂移，后果是「某种形态会拖低无辜凭据的健康分」。
+        //
+        // ⚠️ 判据只认 `reason` 字面量，**不认** `ThrottlingException`：后者 429 也在用
+        // （`USER_REQUEST_RATE_EXCEEDED` 那类是真限流，该走冷却 + 换号），两者混判会
+        // 让真限流走进"不惩罚健康"的路径 —— 那等于关掉对被限流号的调度规避。
+        //
+        // ⚠️ 它的 HTTP 状态是 **400**，而调用点原先写死 `status == 503`。只加本判据
+        // 不放宽那道状态门 ⇒ 修复完全无效（见 `provider.rs` 该分支的说明）。
+        || body.contains("INSUFFICIENT_MODEL_CAPACITY")
 }
 
 /// 默认的"从错误 body 提取重置秒数"逻辑
@@ -384,6 +480,126 @@ pub fn default_extract_retry_after_secs(body: &str) -> Option<u64> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod capacity_signature_tests {
+    use super::*;
+
+    /// ⭐ 回归：`INSUFFICIENT_MODEL_CAPACITY` 必须被判为「模型容量问题」。
+    ///
+    /// 上游实测原文（24h 内 272 次）：
+    /// ```text
+    /// 400 Bad Request {"__type":"com.amazon.aws.codewhisperer#ThrottlingException",
+    ///  "message":"I am experiencing high traffic, please try again shortly.",
+    ///  "reason":"INSUFFICIENT_MODEL_CAPACITY"}
+    /// ```
+    ///
+    /// 旧判据只认 `MODEL_TEMPORARILY_UNAVAILABLE` / `model is temporarily unavailable`，
+    /// 于是这 272 次逐条落空所有分支 → 走到 `map_provider_error` 末尾兜底 →
+    /// **502 且无 Retry-After** → 客户端按永久故障处理、不退避、原样重发。
+    ///
+    /// 删掉那条 `|| body.contains("INSUFFICIENT_MODEL_CAPACITY")` → 本测试必 FAILED。
+    #[test]
+    fn insufficient_model_capacity_is_a_capacity_problem() {
+        let real = r#"400 Bad Request {"__type":"com.amazon.aws.codewhisperer#ThrottlingException","message":"I am experiencing high traffic, please try again shortly.","reason":"INSUFFICIENT_MODEL_CAPACITY"}"#;
+        assert!(
+            default_is_model_temporarily_unavailable(real),
+            "上游实测原文必须被判为容量问题（否则落兜底 502，客户端不退避）"
+        );
+        // 既有两种形态不得因本次改动失效。
+        assert!(default_is_model_temporarily_unavailable(
+            r#"503 {"reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#
+        ));
+        assert!(default_is_model_temporarily_unavailable(
+            "the model is temporarily unavailable"
+        ));
+    }
+
+    /// ⭐ 承重反向守卫：**真限流不得**被判成容量问题。
+    ///
+    /// `ThrottlingException` 这个 `__type` 被两类错误共用 —— 真限流
+    /// （`USER_REQUEST_RATE_EXCEEDED`，该走冷却 + 换号）与容量不足
+    /// （`INSUFFICIENT_MODEL_CAPACITY`，不该惩罚凭据）。
+    ///
+    /// 若把判据放宽到认 `ThrottlingException`，真限流会走进「不惩罚凭据健康」的路径 ⇒
+    /// 等于**关掉了对被限流号的调度规避**：那个号会被反复选中、反复 429。
+    /// 所以判据只能认 `reason` 字面量。
+    ///
+    /// 把判据改成 `body.contains("ThrottlingException")` → 本测试必 FAILED。
+    #[test]
+    fn real_rate_limit_must_not_be_mistaken_for_capacity() {
+        let rate_limited = r#"429 Too Many Requests {"__type":"com.amazon.kiro.runtimeservice#ThrottlingException","message":"Too many requests, please wait before trying again.","reason":"USER_REQUEST_RATE_EXCEEDED"}"#;
+        assert!(
+            !default_is_model_temporarily_unavailable(rate_limited),
+            "真限流不得判成容量问题 —— 那会让被限流的号不被冷却、反复被选中"
+        );
+        // 裸 ThrottlingException（无 reason）同样不认：无法判定是哪一类，按未知处理更安全。
+        assert!(!default_is_model_temporarily_unavailable(
+            r#"{"__type":"ThrottlingException"}"#
+        ));
+    }
+
+    /// ⭐ 源码级守卫：provider 的容量分支状态门必须同时收 503 与 400。
+    ///
+    /// 判据改对了但状态门仍写死 `== 503`，则修复**完全无效**（400 那种形态永远进不来）。
+    /// 这是本修复里最容易漏的一处 —— 判据在 endpoint 层、状态门在 provider 层，
+    /// 改一处看不到另一处。
+    ///
+    /// 锚点选**代码**并切掉注释行：本仓踩过五次「needle 命中注释里的散文」。
+    #[test]
+    fn provider_capacity_gate_accepts_both_statuses() {
+        let src = include_str!("../provider.rs");
+        let prod: String = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("生产段应存在")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // needle 运行时拼接，避免 include_str! 自匹配。
+        let gate = ["is_model_temporarily_unavailable", "(&body)"].concat();
+        // 状态门必须收 503 与 400 两个码。取**最后一处**调用点（真正的容量处置分支）
+        // 之前的窗口 —— 前面还有一处只用于"别被通用 400 吃掉"的预判（见下方顺序断言）。
+        let last = prod.rfind(gate.as_str()).expect("容量判据调用点不应被改名");
+        let window = &prod[last.saturating_sub(400)..last];
+        assert!(
+            window.contains("503"),
+            "状态门必须仍收 503（既有形态 MODEL_TEMPORARILY_UNAVAILABLE）"
+        );
+        assert!(
+            window.contains("400"),
+            "状态门必须同时收 400 —— INSUFFICIENT_MODEL_CAPACITY 的 HTTP 状态是 400"
+        );
+
+        // ⭐⭐ 承重：**容量判定必须排在通用 400 分支之前**。
+        //
+        // 这是上一版守卫**没抓住**的缺陷，代价是修复完全无效地上线了：
+        // endpoint 判据改对、状态门改对、handlers 映射改对、四条测试全绿，
+        // 但通用 400 分支（`if status.as_u16() == 400 { … break }`）排在容量分支
+        // **之前 178 行**，先接住所有 400 并 break ⇒ 容量分支永远走不到。
+        //
+        // 实测：修复上线后（19:05:15）逐分钟仍全部落 `bad_request`
+        // （19:19 / 19:21 / …… / 19:45），近 6h 共 590 次。
+        //
+        // 上一版守卫只断言"状态门里有 400 和 503"，那是**分支内部**的形状，
+        // 与**分支之间的顺序**无关 —— 所以它对这个缺陷完全不可见。这条补上顺序。
+        let generic400 = ["if status.as_u16() == 400 &&", " !is_capacity_400"].concat();
+        let gi = prod.find(generic400.as_str()).unwrap_or_else(|| {
+            panic!(
+                "通用 400 分支必须显式排除容量 400（形如 `{generic400}`）——\
+                 否则它会先 break，让容量分支永远走不到"
+            )
+        });
+        let first_capacity = prod.find(gate.as_str()).expect("容量判据调用点不应被改名");
+        assert!(
+            first_capacity < gi,
+            "容量判定必须在通用 400 分支**之前**求值。实测顺序错时 590 次/6h 全部落 \
+             bad_request 且客户端拿 502 不退避，而三处判据都已改对、测试全绿 —— \
+             因为它们测的是纯函数，看不见分支顺序。"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -468,9 +684,13 @@ mod tests {
         assert!(default_is_feature_not_supported(
             r#"{"__type":"AccessDeniedException","message":"FEATURE_NOT_SUPPORTED"}"#
         ));
-        assert!(default_is_feature_not_supported("403 FEATURE_NOT_SUPPORTED for region"));
+        assert!(default_is_feature_not_supported(
+            "403 FEATURE_NOT_SUPPORTED for region"
+        ));
         // 不误命中普通错误。
-        assert!(!default_is_feature_not_supported(r#"{"reason":"MONTHLY_REQUEST_COUNT"}"#));
+        assert!(!default_is_feature_not_supported(
+            r#"{"reason":"MONTHLY_REQUEST_COUNT"}"#
+        ));
         assert!(!default_is_feature_not_supported("INVALID_MODEL_ID"));
     }
 
@@ -603,6 +823,52 @@ mod tests {
         assert!(!default_is_account_suspended("too many requests"));
     }
 
+    /// ⭐ 生产漏判形态二（2026-08-04 实测）：`temporarily **is** suspended` +
+    /// `security precaution`，**两个信号都不命中**。
+    ///
+    /// 与上面那条（`unusual user activity` 变体）是**同一类**错误的第二个实例：
+    /// 上一次修了 unusual 一族，这个 `is` 插在中间的写法漏了。
+    ///
+    /// 回退即 FAIL：删掉 `default_is_temporary_rate_limit` 开头那个提前 return —— 该 body
+    /// 会落 `has_suspicious && has_temporary` 的 `&&` 判定，两边都 false → 判成**非**临时
+    /// → provider 落 `report_failure` → 3 次即以 `TooManyFailures`（永久型标签）禁用并落盘。
+    ///
+    /// 线上后果链（这才是它值得单列一条测试的原因）：
+    /// 19:09 与 19:12 两次把 #479 判死 → 池子 2 个掉到 1 个 → 剩下的 #480 吃全部流量
+    /// → 撞进它自己的惩罚窗口 → 19:16–19:21 单号 152 请求/分钟、144 个 429。
+    /// 一个号被临时限速，被放大成整池 429 风暴。
+    #[test]
+    fn should_treat_temporarily_is_suspended_variant_as_temporary() {
+        // 线上原文（逐字），注意 "temporarily is suspended" 与 "security precaution"。
+        let body = r#"{"__type":"com.amazon.aws.codewhisperer#AccessDeniedException","message":"Your User ID (186648603162) temporarily is suspended. We've locked your account as a security precaution. To restore access, please contact our support team to verify your identity: https://aws.amazon.com/contact-us/"}"#;
+
+        assert!(
+            default_is_temporary_rate_limit(body),
+            "上游写 temporarily 就是临时态；漏判会让它落 report_failure 并被永久型标签禁用"
+        );
+        assert!(!default_is_account_suspended(body), "绝不能判永久封禁");
+
+        // 三种书写都必须命中（reason 字段用下划线、message 正文两种词序）。
+        for s in [
+            "Your User ID is temporarily suspended.",
+            "Your User ID (1) temporarily is suspended.",
+            r#"{"reason":"TEMPORARILY_SUSPENDED"}"#,
+        ] {
+            assert!(
+                default_is_temporary_rate_limit(s),
+                "TEMPORARILY_SUSPENDED 的书写变体必须全部命中: {s}"
+            );
+        }
+
+        // ⭐ 与 handlers 侧的判据必须同口径 —— 同一个 403 不该在两处得出相反结论。
+        // 那侧认 "temporarily is suspended"，本侧此前不认，于是客户端拿到正确的 429
+        // 而凭据被算成失败。这条断言把两处钉在一起。
+        assert!(
+            crate::anthropic::handlers::is_upstream_temporarily_suspended(body),
+            "handlers 侧判据也必须命中同一个 body（两处口径必须一致）"
+        );
+    }
+
     #[test]
     fn test_temporary_rate_limit_requires_both_signals() {
         // 同时含可疑活动 + 临时限速 → 临时风控（非永久封）
@@ -627,8 +893,7 @@ mod tests {
         // ⚠️ 防误冻核心边界：一段"临时限速但文案里带 suspended"的 body，
         // is_temporary_rate_limit 必须命中（provider 会先判它，从而只设短冷却）。
         // 同时该 body 也会被 is_account_suspended 命中——正因如此顺序才关键。
-        let body =
-            "Your account has been suspended due to suspicious activity. temporary limits applied, try again later.";
+        let body = "Your account has been suspended due to suspicious activity. temporary limits applied, try again later.";
         assert!(
             default_is_temporary_rate_limit(body),
             "临时风控文案必须先被识别为临时限速"
@@ -653,6 +918,53 @@ mod tests {
             default_is_account_suspended(body),
             "永久判据也命中 —— 故 provider 的判定顺序仍是防误冻的关键"
         );
+    }
+
+    /// ⭐ 新增判据（用户线上实测原文，逐字）：`IMAGE_MIME_MISMATCH` 必须可识别。
+    ///
+    /// 它此前**全仓零判据**，落通用 `bad_request` 桶 ⇒ 与工具参数错、上下文超限、
+    /// 请求体畸形混在一起，面板上分辨不出来。而 `converter.rs` 的 magic bytes 校正
+    /// 需要一个效果度量：若仍有边缘情况漏掉，只有这条判据能把它数出来。
+    ///
+    /// 删掉 `default_is_image_mime_mismatch` 里那行 → 本测试必 FAILED。
+    #[test]
+    fn image_mime_mismatch_is_recognized() {
+        let real = r#"非流式 API 请求失败: 400 Bad Request {"__type":"com.amazon.aws.codewhisperer#ValidationException","message":"messages.2.content.1.image.source.base64: The image was specified using the image/png media type, but the image appears to be a image/jpeg image","reason":"IMAGE_MIME_MISMATCH"}"#;
+        assert!(
+            default_is_image_mime_mismatch(real),
+            "用户线上原文必须命中（否则那 400 混进通用桶，magic bytes 修复无法度量）"
+        );
+    }
+
+    /// ⭐ 承重反向守卫：判据必须**窄** —— 只认 reason 字面量。
+    ///
+    /// `ValidationException` 这个 `__type` 被多种校验错误共用，而它们处置不同：
+    /// - `TOOL_USE_RESULT_MISMATCH` → `is_client_validation_error`（立即终止）；
+    /// - `IMAGE_MIME_MISMATCH` → 400 + 图片专属排障文案。
+    /// 泛匹配 `__type` 会把两者混成一类，给出错误的排障方向。
+    ///
+    /// 同理不认 message 里的 `media type` 散文：那句话的措辞随格式组合变化
+    /// （`image/png` ↔ `image/jpeg` 可任意互换），按散文匹配等于赌上游文案不变 ——
+    /// 本仓已因「按整段字面量匹配上游散文」踩过两次
+    /// （`unusual user activity` / `temporarily is suspended`）。
+    ///
+    /// 把判据改成 `body.contains("ValidationException")` → 本测试必 FAILED。
+    #[test]
+    fn image_mime_judgement_must_not_swallow_other_validation_errors() {
+        assert!(!default_is_image_mime_mismatch(
+            r#"{"__type":"com.amazon.aws.codewhisperer#ValidationException","reason":"TOOL_USE_RESULT_MISMATCH"}"#
+        ));
+        // 容量不足同为 400，但必须拿 503（可退避重试），绝不能被图片判据吞掉。
+        assert!(!default_is_image_mime_mismatch(
+            r#"400 Bad Request {"__type":"com.amazon.aws.codewhisperer#ThrottlingException","message":"I am experiencing high traffic, please try again shortly.","reason":"INSUFFICIENT_MODEL_CAPACITY"}"#
+        ));
+        assert!(!default_is_image_mime_mismatch(
+            r#"{"reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#
+        ));
+        // 裸 ValidationException（无 reason）：判不出是哪一类，不认更安全。
+        assert!(!default_is_image_mime_mismatch(
+            r#"{"__type":"ValidationException"}"#
+        ));
     }
 
     #[test]

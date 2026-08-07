@@ -27,6 +27,7 @@ import {
   Server,
   Copy,
   Check,
+  RefreshCw,
   type LucideIcon,
 } from 'lucide-react'
 import { copyToClipboard } from '@/lib/utils'
@@ -81,6 +82,22 @@ function billedInput(input: number, cacheRead: number, cacheWrite: number): numb
 function cacheHitPct(input: number, cacheRead: number): number | null {
   if (input <= 0) return null
   return Math.round((cacheRead / input) * 100)
+}
+
+/* ============ 重试派生量 ============ */
+// 后端下发 retries_sum / retried_requests 两个原始计数 + 两个已算好的平均值。
+// 两个字段是 optional：旧后端二进制真的不下发，此时必须显示「—」而不是 0
+// （0 会被读成"完全没重试"，而真相是"这个版本测不出来"）。
+
+// 重试占比 = 发生过重试的请求 / 总请求（0~100）。数据缺失或无请求时返回 null。
+function retriedSharePct(w: WindowSummary): number | null {
+  if (w.retried_requests === undefined || w.requests <= 0) return null
+  return Math.round((w.retried_requests / w.requests) * 100)
+}
+
+// 该窗口是否拿到了重试数据（两个原始计数成对判定，缺一即视为不可用）。
+function hasRetryData(w: WindowSummary): boolean {
+  return w.retries_sum !== undefined && w.retried_requests !== undefined
 }
 
 // 成功率(0~100)映射到 StatCard 语义色
@@ -376,6 +393,63 @@ function CacheWindowRow({ label, w }: { label: string; w: WindowSummary }) {
   )
 }
 
+/* ============ 重试放大（窗口维度）============ */
+
+// 单个窗口一行：重试占比横条 + 放大倍数 / 真重试时均值 / 换号总次数。
+//
+// 为什么必须同时给两个平均值：绝大多数请求 retries=0，只看「放大倍数」（分母=全部请求）
+// 会把"少数请求疯狂换号"稀释成"几乎不重试"。而只看「真重试时」又看不出整池压力。
+// 横条画的是 retried_requests / requests（占比），与两个平均值互补。
+function RetryWindowRow({ label, w }: { label: string; w: WindowSummary }) {
+  const { t } = useTranslation()
+  const available = hasRetryData(w)
+  const share = retriedSharePct(w)
+  const amp = w.avg_retries_per_request
+  // avg_retries_when_retried 后端在无重试样本时给 null —— 0 会被读成"重试过但重试 0 次"
+  const whenRetried = w.avg_retries_when_retried
+  return (
+    <li className="space-y-1.5">
+      <div className="flex items-center justify-between gap-2 text-xs">
+        <span className="truncate text-muted-foreground">{label}</span>
+        <span className="flex shrink-0 items-baseline gap-3 tabular-nums">
+          <span className="font-medium text-amber-300" title={t('usagepage.retry.ampTooltip')}>
+            {amp === undefined ? '—' : `${amp.toFixed(2)}x`}
+          </span>
+          <span className="w-14 text-right font-medium text-foreground" title={t('usagepage.retry.shareTooltip')}>
+            {share === null ? '—' : `${share}%`}
+          </span>
+        </span>
+      </div>
+      <div className="h-2 w-full overflow-hidden rounded-full bg-muted">
+        <div
+          className="h-full rounded-full transition-[width] duration-700 ease-out-expo motion-reduce:transition-none"
+          style={{
+            width: `${share ?? 0}%`,
+            background: 'linear-gradient(90deg, hsl(38 92% 50%/0.55), hsl(38 92% 50%))',
+          }}
+        />
+      </div>
+      <div className="flex flex-wrap justify-between gap-x-3 text-[10px] text-muted-foreground tabular-nums">
+        {available ? (
+          <>
+            <span title={t('usagepage.retry.whenRetriedTooltip')}>
+              {t('usagepage.retry.whenRetried')}{' '}
+              {whenRetried === undefined || whenRetried === null
+                ? '—'
+                : `${whenRetried.toFixed(2)} ${t('usagepage.detail.timesUnit')}`}
+            </span>
+            <span title={t('usagepage.retry.ampTooltip')}>
+              {t('usagepage.retry.total')} {compact(w.retries_sum ?? 0)}
+            </span>
+          </>
+        ) : (
+          <span>{t('usagepage.retry.unavailable')}</span>
+        )}
+      </div>
+    </li>
+  )
+}
+
 /* ============ 分组榜单（按模型 / 按凭据）============ */
 
 // 沿用概览 RankBars 设计语言（序号徽标 + 渐变横条 + 宽度动画），横条右侧并列成功率着色数字。
@@ -458,6 +532,26 @@ function GroupRankList({
                 <span className="text-sky-300/90">{hit === null ? '—' : `${hit}%`}</span>
               </span>
             </div>
+            {/* 重试列：该分组换号总次数 + 每请求平均。这是「哪个模型/哪个号在烧重试预算」
+                唯一的分维度视图 —— 窗口维度只看得到整池总量。retries_sum 缺失(旧后端)时整行不渲染。 */}
+            {r.retries_sum !== undefined && (
+              <div className="flex justify-between text-[10px] tabular-nums">
+                <span className="text-muted-foreground" title={t('usagepage.retry.groupTooltip')}>
+                  {t('usagepage.retry.groupLabel')}{' '}
+                  <span className={r.retries_sum > 0 ? 'text-amber-300/90' : 'text-muted-foreground'}>
+                    {compact(r.retries_sum)}
+                  </span>
+                </span>
+                <span className="text-muted-foreground" title={t('usagepage.retry.ampTooltip')}>
+                  {t('usagepage.retry.amp')}{' '}
+                  <span className={(r.avg_retries_per_request ?? 0) > 0 ? 'text-amber-300/90' : 'text-muted-foreground'}>
+                    {r.avg_retries_per_request === undefined
+                      ? '—'
+                      : `${r.avg_retries_per_request.toFixed(2)}x`}
+                  </span>
+                </span>
+              </div>
+            )}
           </li>
         )
       })}
@@ -1334,6 +1428,34 @@ export function UsagePage() {
             </ol>
             <p className="mt-4 border-t border-border/60 pt-3 text-[11px] leading-relaxed text-muted-foreground">
               {t('usagepage.cache.estimateNote')}
+            </p>
+          </>
+        ) : (
+          <RankListSkeleton rows={3} />
+        )}
+      </Card>
+
+      {/* 1b) 重试放大：与缓存卡同结构的三窗口聚合。
+              此前面板只有逐条详情（2 处），没有聚合视图 ⇒ 画不出趋势也算不出分布：
+              `absorbRounds=100` 无法区分「100 个请求各 1 轮」（健康）与「33 个各 3 轮」（预算接近不够）。
+              两个平均值必须并列，理由见 RetryWindowRow 的注释。 */}
+      <Card className="p-5">
+        <div className="mb-4 flex flex-wrap items-baseline justify-between gap-2">
+          <h3 className="flex items-center gap-2 text-sm font-medium text-foreground">
+            <RefreshCw className="h-4 w-4 text-amber-400/80" />
+            {t('usagepage.retry.sectionTitle')}
+          </h3>
+          <span className="text-xs text-muted-foreground">{t('usagepage.retry.sectionHint')}</span>
+        </div>
+        {overview.data ? (
+          <>
+            <ol className="space-y-3">
+              <RetryWindowRow label={t('usagepage.window.last24h')} w={overview.data.last_24h} />
+              <RetryWindowRow label={t('usagepage.window.last7d')} w={overview.data.last_7d} />
+              <RetryWindowRow label={t('usagepage.window.last30d')} w={overview.data.last_30d} />
+            </ol>
+            <p className="mt-4 border-t border-border/60 pt-3 text-[11px] leading-relaxed text-muted-foreground">
+              {t('usagepage.retry.note')}
             </p>
           </>
         ) : (

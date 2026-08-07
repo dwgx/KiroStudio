@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo, type ReactNode } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo, memo, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import i18n from '@/i18n'
 import { useQuery } from '@tanstack/react-query'
@@ -129,6 +129,11 @@ const METRIC_ITEMS: { key: keyof RecoveryMetrics; labelKey: string; warn?: boole
   { key: 'strayGuardTripped', labelKey: 'opspage.metric.strayGuardTripped', warn: true },
   { key: 'strayStandaloneRequests', labelKey: 'opspage.metric.strayStandaloneRequests', warn: true },
   { key: 'strayInlineRequests', labelKey: 'opspage.metric.strayInlineRequests', warn: true },
+  // 上游 429 吸收层：recovered 是净收益(不告警)，其余三项越多越说明上游在压我们。
+  { key: 'absorbRounds', labelKey: 'opspage.metric.absorbRounds', warn: true },
+  { key: 'absorbRecovered', labelKey: 'opspage.metric.absorbRecovered' },
+  { key: 'absorbBudgetExhausted', labelKey: 'opspage.metric.absorbBudgetExhausted', warn: true },
+  { key: 'absorbSuspendSkipped', labelKey: 'opspage.metric.absorbSuspendSkipped', warn: true },
 ]
 
 // 后端日志 ts 是 UTC RFC3339(带 Z)。转成浏览器本地时区的 HH:MM:SS.mmm 显示——
@@ -293,7 +298,11 @@ function RecoveryMetricsCard() {
         ) : data ? (
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
             {METRIC_ITEMS.map((it) => {
-              const v = data[it.key] as number
+              // METRIC_ITEMS 里有 9 个 optional 字段（reclaimedInvokeCalls / stray* / absorb*）：
+              // 旧后端二进制不下发它们 ⇒ 直接 `as number` 会拿到 undefined，
+              // AnimatedNumber 里 Math.round(undefined) → 界面显示 **NaN**（不是 0）。
+              // 用 ?? 0 兜底：字段缺失语义上就是"该计数器还没有过"，显示 0 是对的。
+              const v = (data[it.key] as number | undefined) ?? 0
               return (
                 <StatCard
                   key={it.key}
@@ -491,23 +500,32 @@ function PoolHealthCard({ live }: { live: ReturnType<typeof useLiveStream> }) {
   )
 
   // 用 SSE live 帧的实时值覆盖 insights 的对应字段(id 对齐;live 帧缺该号则保留 insights 值)。
-  const liveById = new Map((frame?.creds ?? []).map((c) => [c.id, c]))
-  const insights: RateLimitInsight[] = (data ?? []).map((it) => {
-    const lv = liveById.get(it.id)
-    if (!lv) return it
-    return {
-      ...it,
-      rpm: lv.rpm,
-      inflight: lv.inflight,
-      // 实时熔断态/健康分覆盖(insights.health 可能为 10s 前的);其余 health 字段保留。
-      health: it.health
-        ? { ...it.health, circuitOpen: lv.circuitOpen, health: lv.healthScore }
-        : it.health,
-    }
-  })
+  // ⚠️ 三个派生都 memo：OpsPage 每 ~1.5s live frame 变化就重渲染本卡，不 memo 的话每帧
+  // 重建 Map + map + sort 空跑一遍（号池几十个号时是纯开销）。
+  const liveById = useMemo(
+    () => new Map((frame?.creds ?? []).map((c) => [c.id, c])),
+    [frame],
+  )
+  const insights: RateLimitInsight[] = useMemo(() => {
+    return (data ?? []).map((it) => {
+      const lv = liveById.get(it.id)
+      if (!lv) return it
+      return {
+        ...it,
+        rpm: lv.rpm,
+        inflight: lv.inflight,
+        // 实时熔断态/健康分覆盖(insights.health 可能为 10s 前的);其余 health 字段保留。
+        health: it.health
+          ? { ...it.health, circuitOpen: lv.circuitOpen, health: lv.healthScore }
+          : it.health,
+      }
+    })
+  }, [data, liveById])
   // 排序:最需要关注的排前(熔断/半开/冷却/亚健康 > 健康 > 禁用)。
-  const order: Record<CircuitState, number> = { open: 0, halfOpen: 1, cooldown: 2, warn: 3, healthy: 4, disabled: 5 }
-  const sorted = [...insights].sort((a, b) => order[circuitStateOf(a)] - order[circuitStateOf(b)] || a.id - b.id)
+  const sorted = useMemo(() => {
+    const order: Record<CircuitState, number> = { open: 0, halfOpen: 1, cooldown: 2, warn: 3, healthy: 4, disabled: 5 }
+    return [...insights].sort((a, b) => order[circuitStateOf(a)] - order[circuitStateOf(b)] || a.id - b.id)
+  }, [insights])
 
   // 全局 busy(禁用类互斥操作时锁整行);验活/探模型走 per-id pending(见下),不进 busy。
   const busy = setDisabled.isPending || resetFailure.isPending || forceRefresh.isPending
@@ -974,7 +992,9 @@ const CLEANABLE_KEYS: StorageCleanupTarget[] = ['traces', 'usage_jsonl', 'trash'
 
 // 聚合运维卡:重启服务 / OTA 升级回滚观测 / 存储占用清理。
 // 与 settings 页调用同一批 hooks(同 queryKey,两处并存无冲突);此处复用 hooks 不复用组件。
-function OpsAggregationCard({ onFocusLog }: { onFocusLog?: (term: string) => void } = {}) {
+// 🔴 memo：OpsPage 每 ~1.5s live frame 变化就整体重渲染；本卡不依赖 frame，memo 后
+// 不再被连带重渲染（聚合统计常含几十行列表，重渲是纯开销）。
+const OpsAggregationCard = memo(function OpsAggregationCard({ onFocusLog }: { onFocusLog?: (term: string) => void } = {}) {
   const { t } = useTranslation()
   const restart = useRestartService()
   const checkUpd = useCheckUpdate()
@@ -1215,7 +1235,7 @@ function OpsAggregationCard({ onFocusLog }: { onFocusLog?: (term: string) => voi
       />
     </Card>
   )
-}
+})
 
 const LEVEL_FILTERS = ['ALL', 'ERROR', 'WARN', 'INFO', 'DEBUG'] as const
 type LevelFilter = (typeof LEVEL_FILTERS)[number]
@@ -1234,7 +1254,10 @@ function rankOk(entryLevel: string, minLevel: string): boolean {
   return (rank[entryLevel.toUpperCase()] ?? 0) >= (rank[minLevel.toUpperCase()] ?? 0)
 }
 
-function LogViewer({ focusToken = 0, focusTerm = '' }: { focusToken?: number; focusTerm?: string } = {}) {
+// 🔴 memo：OpsPage 每 ~1.5s live frame 变化就整体重渲染；本卡不依赖 frame，memo 后不再被
+// 连带重渲染。props 是 focusToken/focusTerm 数字/字符串，浅比较稳定；否则 200 行富文本
+// 日志会在每次实时帧到来时全量 reconcile，是「运维页点开日志就卡」的直接原因之一。
+const LogViewer = memo(function LogViewer({ focusToken = 0, focusTerm = '' }: { focusToken?: number; focusTerm?: string } = {}) {
   const { t } = useTranslation()
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [level, setLevel] = useState<LevelFilter>('INFO')
@@ -1269,6 +1292,8 @@ function LogViewer({ focusToken = 0, focusTerm = '' }: { focusToken?: number; fo
     })
   }, [])
   const scrollRef = useRef<HTMLDivElement>(null)
+  // rAF 句柄：滚底节流用（合并高频 append 的多次滚底为一次，避免 layout thrash）。
+  const scrollRafRef = useRef<number | null>(null)
   // OTA 聚焦:检查更新/升级触发(focusToken 自增)时,展开日志 + 把搜索设为 [Update],
   // 让升级步骤日志(perform_update 发的 [Update] tracing)在实时日志里流动显示。
   useEffect(() => {
@@ -1303,6 +1328,26 @@ function LogViewer({ focusToken = 0, focusTerm = '' }: { focusToken?: number; fo
       return merged.length > CLIENT_LOG_CAP ? merged.slice(merged.length - CLIENT_LOG_CAP) : merged
     })
   }, [])
+
+  // 🔀 追加批处理：SSE 高频时（一条日志 = 一次 append = 一次 setLogs = 一次派生/渲染重算）
+  // 把多条攒进缓冲，定时 flush 成**一次** setLogs。100ms 窗口内风暴式日志从 N 次渲染降到 1 次。
+  const pendingRef = useRef<LogEntry[]>([])
+  const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const flushPending = useCallback(() => {
+    flushTimerRef.current = null
+    if (pendingRef.current.length === 0) return
+    const batch = pendingRef.current
+    pendingRef.current = []
+    append(batch)
+  }, [append])
+  const queueAppend = useCallback(
+    (entry: LogEntry) => {
+      pendingRef.current.push(entry)
+      if (flushTimerRef.current) return // 已有排定的 flush，只追加
+      flushTimerRef.current = setTimeout(flushPending, 100)
+    },
+    [flushPending]
+  )
 
   // 实时 SSE 流：EventSource 无法带自定义 header，故用 fetch + ReadableStream 手动读 SSE。
   // 断连(服务重启/网络抖动)会自动重连，并用 connected 状态如实反映连接态——绝不让
@@ -1344,7 +1389,7 @@ function LogViewer({ focusToken = 0, focusTerm = '' }: { focusToken?: number; fo
             if (!dataLine) continue
             try {
               const entry = JSON.parse(dataLine.slice(5).trim()) as LogEntry
-              if (!levelParam || rankOk(entry.level, levelParam)) append([entry])
+              if (!levelParam || rankOk(entry.level, levelParam)) queueAppend(entry)
             } catch {
               /* 心跳/非 JSON 行忽略 */
             }
@@ -1364,6 +1409,14 @@ function LogViewer({ focusToken = 0, focusTerm = '' }: { focusToken?: number; fo
     return () => {
       cancelled = true
       if (retryTimer) clearTimeout(retryTimer)
+      if (flushTimerRef.current) clearTimeout(flushTimerRef.current)
+      flushTimerRef.current = null
+      // 卸载/切 live 前 flush 缓冲里剩余的日志，避免丢尾巴。
+      if (pendingRef.current.length > 0) {
+        const tail = pendingRef.current
+        pendingRef.current = []
+        append(tail)
+      }
       ctrl.abort()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1384,9 +1437,20 @@ function LogViewer({ focusToken = 0, focusTerm = '' }: { focusToken?: number; fo
   }, [live, level])
 
   // 新日志自动滚到底（仅实时模式 + 用户当前贴底时；上滚看历史则不打断）。
+  // 用 rAF 合并：高频 append（批处理后仍 ~10 次/s）时，一次一滚会反复写读
+  // scrollHeight/scrollTop 强制 layout（layout thrash）。合并到同一帧只滚一次。
   useEffect(() => {
-    if (live && atBottomRef.current && scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight
+    if (!live || !atBottomRef.current || !scrollRef.current) return
+    if (scrollRafRef.current !== null) return // 已排定，合并
+    scrollRafRef.current = requestAnimationFrame(() => {
+      scrollRafRef.current = null
+      if (scrollRef.current && atBottomRef.current) {
+        scrollRef.current.scrollTop = scrollRef.current.scrollHeight
+      }
+    })
+    return () => {
+      if (scrollRafRef.current !== null) cancelAnimationFrame(scrollRafRef.current)
+      scrollRafRef.current = null
     }
   }, [logs, live])
 
@@ -1599,7 +1663,7 @@ function LogViewer({ focusToken = 0, focusTerm = '' }: { focusToken?: number; fo
       </AnimatedHeight>
     </Card>
   )
-}
+})
 
 // 单条日志行：点击展开看全文 + 复制；搜索命中高亮。
 function LogRow({

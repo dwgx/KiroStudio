@@ -347,8 +347,25 @@ fn normalize_html_text(input: &str) -> String {
 fn strip_html_tags(input: &str) -> String {
     // 块级/换行标签名单：命中即输出一个换行；不在名单里的标签只剥不换行。
     const BLOCK_TAGS: &[&str] = &[
-        "br", "p", "div", "li", "ul", "ol", "tr", "table", "h1", "h2", "h3", "h4", "h5", "h6",
-        "section", "article", "blockquote", "header", "footer",
+        "br",
+        "p",
+        "div",
+        "li",
+        "ul",
+        "ol",
+        "tr",
+        "table",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "section",
+        "article",
+        "blockquote",
+        "header",
+        "footer",
     ];
 
     let chars: Vec<char> = input.chars().collect();
@@ -903,7 +920,10 @@ mod tests {
 
     // 测试辅助：构造一个带 user 消息与指定 tools 的请求
     #[cfg(test)]
-    fn mk_req(user_text: &str, tools: Option<Vec<crate::anthropic::types::Tool>>) -> MessagesRequest {
+    fn mk_req(
+        user_text: &str,
+        tools: Option<Vec<crate::anthropic::types::Tool>>,
+    ) -> MessagesRequest {
         use crate::anthropic::types::Message;
         MessagesRequest {
             model: "claude-sonnet-4".to_string(),

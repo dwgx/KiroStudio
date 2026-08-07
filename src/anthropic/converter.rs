@@ -29,11 +29,32 @@ use super::types::{ContentBlock, ImageSource, MessagesRequest};
 /// 结构。展开后再逐层规范化 type/properties/required/items/additionalProperties，
 /// 丢弃 Kiro 兼容性差的 anyOf/oneOf/allOf，只保留白名单字段。
 fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
+    normalize_json_schema_with_node_budget(schema, MAX_SCHEMA_NODES)
+}
+
+/// `normalize_json_schema` 的可注入预算版本：只为让测试用**小预算 + 小 schema**
+/// 验证预算机制本身（用真实的 5 万预算去测就得先展开 5 万节点，测试自身变成压力测试）。
+/// 生产路径固定走 `MAX_SCHEMA_NODES`。
+fn normalize_json_schema_with_node_budget(
+    schema: serde_json::Value,
+    max_nodes: usize,
+) -> serde_json::Value {
     // 先就地展开 $ref（依赖 $defs/definitions），再规范化。总是运行 resolve：即便没有
     // $defs，也需把无法展开的 $ref（OpenAPI/外部形式）显式降级为宽松 object，
     // 否则会被后续 retain 白名单清成空壳。
     let defs = extract_schema_defs(&schema);
-    let resolved = resolve_schema_refs(schema, &defs, 0);
+    let mut budget = SchemaRefBudget::new(max_nodes);
+    let resolved = resolve_schema_refs(schema, &defs, 0, &mut budget);
+    // 降级必须留痕：否则线上被 $ref 炸弹打到（或某个 MCP server 发了异常巨大的 schema）时，
+    // 现象只是"模型看到的参数约束莫名变宽松"，没有任何线索能定位到这里。
+    if budget.truncated_nodes > 0 {
+        tracing::warn!(
+            nodes_visited = budget.visited,
+            max_schema_nodes = budget.max_nodes,
+            truncated_nodes = budget.truncated_nodes,
+            "工具 JSON Schema 的 $ref 展开触达节点预算上限，超限子树已降级为宽松 object（疑似 $ref 放大攻击或异常巨大的 schema）"
+        );
+    }
     normalize_json_schema_inner(resolved, true)
 }
 
@@ -52,17 +73,103 @@ fn extract_schema_defs(schema: &serde_json::Value) -> serde_json::Map<String, se
     defs
 }
 
+/// 单次 schema 展开允许访问的**节点总数**上限（整次展开共享一个预算，不是每层各自计数）。
+///
+/// 怎么定的（数都是实测的，别凭感觉调）：
+/// - **合法侧**：一个 25KB / 120 个属性、每属性再嵌 object+array 的"大 schema"整棵树只
+///   访问 **1803** 个节点。真实 MCP / pydantic / zod 工具 schema 都在 O(10^3) 量级。
+///   5 万 ≈ 合法最坏情形的 **28 倍**冗余 ⇒ 正常请求不可能被截断。
+/// - **攻击侧**：不设总量预算时，**159 字节**的自引用 `$ref` 输入就能展开出 **800 万+**
+///   节点（b=2 时；b=3/b=4 更快），而这是跑在 tokio worker 上的同步 CPU 展开 ⇒ 单个请求
+///   即可钉死一个 worker 数秒并把内存顶爆。
+/// - **上界代价**：5 万个 `serde_json` 节点的克隆+插入是个位数毫秒级，同步跑在 async
+///   runtime 上可接受。
+const MAX_SCHEMA_NODES: usize = 50_000;
+
+/// `$ref` 展开的全局节点预算 + 降级痕迹。
+///
+/// 存在的理由：`MAX_REF_DEPTH` 限的是**引用链有多长**，而 `depth` 只在 `$ref` 跳转时 +1、
+/// 同级递归复用同一个 depth ⇒ 一个 `$defs` 条目里放 b 个指回自己的兄弟属性，展开量就是
+/// b^MAX_REF_DEPTH，**链长限制对扇出爆炸完全无效**。所以必须再有一道按**节点总数**算的闸门。
+///
+/// ⚠️ 不要把这道闸门"简化"成同级递归也 `depth + 1`：那会把正常大 schema 的同级字段数
+/// 算进链长，合法请求会被误杀。两道闸门是互补的，都要留着。
+struct SchemaRefBudget {
+    /// 本次展开的节点上限（生产恒为 `MAX_SCHEMA_NODES`，测试可注入小值）。
+    max_nodes: usize,
+    /// 已访问节点数（整棵树累计）。
+    visited: usize,
+    /// 因预算耗尽而被降级掉的节点数（>0 即本次发生了截断，供日志取证）。
+    truncated_nodes: usize,
+}
+
+impl SchemaRefBudget {
+    fn new(max_nodes: usize) -> Self {
+        Self {
+            max_nodes,
+            visited: 0,
+            truncated_nodes: 0,
+        }
+    }
+}
+
+/// 无法展开 / 触达闸门时的降级占位 schema。
+///
+/// 语义选择：**宽松 object 而不是删掉该节点**。删节点会让父级的 `required` 指向不存在的
+/// 属性，上游直接回 400 "Improperly formed request"（整个工具列表连坐失效）；宽松 object
+/// 只是让模型在这一处看不到细粒度约束，工具仍可用。两处闸门（链长/总量）与"$ref 目标缺失"
+/// 共用同一语义，避免降级形态各写一份再各自漂移。
+fn degraded_object_schema() -> serde_json::Value {
+    serde_json::json!({ "type": "object", "additionalProperties": true })
+}
+
 /// 深度优先展开所有 `$ref`（支持 `#/$defs/<name>` 与 `#/definitions/<name>`）。
-/// `depth` 仅在 `$ref` 跳转时递增，超上限视为循环引用，降级为宽松 object 兜底。
+///
+/// 两道**互补**的闸门：
+/// - `depth`（仅在 `$ref` 跳转时递增）限引用**链长**，超限视为循环引用。
+/// - `budget` 限整次展开的**节点总数**，防同级扇出把 159 字节输入放大成百万节点。
+///
+/// 任一闸门触发都降级为宽松 object 兜底（见 `degraded_object_schema`）。
 fn resolve_schema_refs(
     value: serde_json::Value,
     defs: &serde_json::Map<String, serde_json::Value>,
     depth: usize,
+    budget: &mut SchemaRefBudget,
 ) -> serde_json::Value {
     const MAX_REF_DEPTH: usize = 16;
     if depth > MAX_REF_DEPTH {
-        return serde_json::json!({ "type": "object", "additionalProperties": true });
+        return degraded_object_schema();
     }
+    // 🔴 **数组分支必须排在预算闸门之前**：数组容器自身不消耗预算、也不被替换，
+    // 只有它的对象元素消耗。
+    //
+    // 为什么承重：降级产物 `degraded_object_schema()` 是一个 **object**。若预算在一个
+    // `Value::Array` 节点上耗尽，那个数组会被整体换成对象 —— 而 JSON Schema 里
+    // `anyOf` / `oneOf` / `allOf` / 元组式 `items` **必须是数组**，换成对象即产出
+    // 结构非法的 schema，上游会 400。而本预算存在的全部目的就是避免上游报错，
+    // 那就自相矛盾了。
+    //
+    // 这样耗尽时数组仍是**合法数组**（元素各自退化为 object 占位），结构不变形。
+    // 判据取自参考实现 `WindsurfAPI/src/handlers/tool-emulation.js`（MIT）的
+    // `stripSchemaDocs`：`if (Array.isArray(schema)) return schema.map(...)` 排在
+    // `if (budget.remaining <= 0)` 之前，注释原话是 "keeps `anyOf`/tuple `items`
+    // a valid ARRAY under exhaustion instead of being replaced wholesale by an
+    // object placeholder"。
+    //
+    // ⚠️ 全树共享语义不变：`&mut budget` 照样贯穿数组元素，元素仍逐个计数。
+    // 改的只是「数组这个容器节点自己不计数、也不被替换」。
+    if let serde_json::Value::Array(arr) = value {
+        return serde_json::Value::Array(
+            arr.into_iter()
+                .map(|v| resolve_schema_refs(v, defs, depth, budget))
+                .collect(),
+        );
+    }
+    if budget.visited >= budget.max_nodes {
+        budget.truncated_nodes += 1;
+        return degraded_object_schema();
+    }
+    budget.visited += 1;
     match value {
         serde_json::Value::Object(mut obj) => {
             if let Some(serde_json::Value::String(ref_str)) = obj.get("$ref") {
@@ -75,7 +182,7 @@ fn resolve_schema_refs(
                 match name.as_ref().and_then(|n| defs.get(n)) {
                     Some(target) => {
                         // 展开目标后并入同级字段（不覆盖 $ref 旁已有的 description 等）。
-                        let resolved = resolve_schema_refs(target.clone(), defs, depth + 1);
+                        let resolved = resolve_schema_refs(target.clone(), defs, depth + 1, budget);
                         if let serde_json::Value::Object(robj) = resolved {
                             for (k, v) in robj {
                                 obj.entry(k).or_insert(v);
@@ -96,13 +203,18 @@ fn resolve_schema_refs(
             }
             let mut new_obj = serde_json::Map::new();
             for (k, v) in obj {
-                new_obj.insert(k, resolve_schema_refs(v, defs, depth));
+                new_obj.insert(k, resolve_schema_refs(v, defs, depth, budget));
             }
             serde_json::Value::Object(new_obj)
         }
+        // 数组已在预算闸门**之前**提前返回（见函数开头那段），此处恒不可达。
+        // 保留一条显式分支而不是让它落 `other => other`：若将来有人把前面那个提前返回
+        // 删掉（那正是本文件修过的缺陷），数组会落到这里继续正确递归，而不是被
+        // `other => other` 原样返回、内部 `$ref` 一个都不展开。即这是**降级兜底**，
+        // 不是重复实现。
         serde_json::Value::Array(arr) => serde_json::Value::Array(
             arr.into_iter()
-                .map(|v| resolve_schema_refs(v, defs, depth))
+                .map(|v| resolve_schema_refs(v, defs, depth, budget))
                 .collect(),
         ),
         other => other,
@@ -137,7 +249,10 @@ fn normalize_json_schema_inner(schema: serde_json::Value, root: bool) -> serde_j
         || (normalized_type.is_none() && obj.contains_key("properties"));
 
     if is_object_schema {
-        obj.insert("type".to_string(), serde_json::Value::String("object".to_string()));
+        obj.insert(
+            "type".to_string(),
+            serde_json::Value::String("object".to_string()),
+        );
     } else if let Some(t) = normalized_type {
         obj.insert("type".to_string(), serde_json::Value::String(t));
     }
@@ -149,10 +264,16 @@ fn normalize_json_schema_inner(schema: serde_json::Value, root: bool) -> serde_j
                 for (name, prop_schema) in props {
                     normalized.insert(name, normalize_json_schema_inner(prop_schema, false));
                 }
-                obj.insert("properties".to_string(), serde_json::Value::Object(normalized));
+                obj.insert(
+                    "properties".to_string(),
+                    serde_json::Value::Object(normalized),
+                );
             }
             _ => {
-                obj.insert("properties".to_string(), serde_json::Value::Object(serde_json::Map::new()));
+                obj.insert(
+                    "properties".to_string(),
+                    serde_json::Value::Object(serde_json::Map::new()),
+                );
             }
         }
         let required = match obj.remove("required") {
@@ -198,10 +319,16 @@ fn normalize_json_schema_inner(schema: serde_json::Value, root: bool) -> serde_j
             );
         }
         Some(serde_json::Value::Bool(value)) => {
-            obj.insert("additionalProperties".to_string(), serde_json::Value::Bool(value));
+            obj.insert(
+                "additionalProperties".to_string(),
+                serde_json::Value::Bool(value),
+            );
         }
         Some(_) => {
-            obj.insert("additionalProperties".to_string(), serde_json::Value::Bool(true));
+            obj.insert(
+                "additionalProperties".to_string(),
+                serde_json::Value::Bool(true),
+            );
         }
         None => {}
     }
@@ -211,7 +338,10 @@ fn normalize_json_schema_inner(schema: serde_json::Value, root: bool) -> serde_j
         && let Some(description) = description.as_str()
     {
         let description = truncate_chars(description, schema_description_max_chars());
-        obj.insert("description".to_string(), serde_json::Value::String(description));
+        obj.insert(
+            "description".to_string(),
+            serde_json::Value::String(description),
+        );
     }
 
     // enum 只保留 string/number/bool 值
@@ -231,7 +361,13 @@ fn normalize_json_schema_inner(schema: serde_json::Value, root: bool) -> serde_j
     obj.retain(|key, _| {
         matches!(
             key.as_str(),
-            "type" | "properties" | "required" | "items" | "additionalProperties" | "description" | "enum"
+            "type"
+                | "properties"
+                | "required"
+                | "items"
+                | "additionalProperties"
+                | "description"
+                | "enum"
         )
     });
 
@@ -255,8 +391,14 @@ fn normalize_schema_type(raw: &str) -> Option<String> {
 /// 文本转成 `<document>` 文本块随消息下发，让模型至少能读到 PDF 内容。
 fn extract_pdf_text_from_base64(data: &str) -> Option<String> {
     use base64::Engine;
-    let data = data.rsplit_once(',').map(|(_, tail)| tail).unwrap_or(data).trim();
-    let bytes = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
+    let data = data
+        .rsplit_once(',')
+        .map(|(_, tail)| tail)
+        .unwrap_or(data)
+        .trim();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .ok()?;
     extract_pdf_text_from_bytes(&bytes)
 }
 
@@ -430,11 +572,7 @@ fn tool_description_max_chars() -> usize {
 /// schema 内嵌 description 上限：顶层的 1/5（保持既有 10000→2000 比例）。0（不截断）时同样不截断。
 fn schema_description_max_chars() -> usize {
     let top = tool_description_max_chars();
-    if top == 0 {
-        0
-    } else {
-        (top / 5).max(1)
-    }
+    if top == 0 { 0 } else { (top / 5).max(1) }
 }
 
 /// 按字符边界安全截断（防多字节切断）。`max==0` 表示不截断，原样返回。
@@ -635,7 +773,22 @@ fn derive_agent_continuation_id(conversation_id: &str) -> String {
     let r = hasher.finalize();
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15]
+        r[0],
+        r[1],
+        r[2],
+        r[3],
+        r[4],
+        r[5],
+        r[6],
+        r[7],
+        r[8],
+        r[9],
+        r[10],
+        r[11],
+        r[12],
+        r[13],
+        r[14],
+        r[15]
     )
 }
 
@@ -669,6 +822,102 @@ fn extract_session_id(user_id: &str) -> Option<String> {
 /// 简单验证 UUID 格式（36 字符，包含 4 个连字符）
 fn is_valid_uuid(s: &str) -> bool {
     s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4
+}
+
+/// 无 `metadata.user_id` 时，从「工作上下文」派生稳定 conversationId。
+///
+/// # 为什么需要
+///
+/// 只有 Claude Code 会发 `metadata.user_id`（内含 session UUID）。`python` / `curl` /
+/// `opencode` 等客户端不发，旧实现回落到 `Uuid::new_v4()` —— **每个请求都是全新会话键，
+/// 于是同一工作上下文的连续请求永远拿不到上游 prefix 缓存的 credit 折扣**。
+///
+/// 2026-08-04 实测（08-03 全天 40,634 请求）：15,776 个「单轮会话」占 38.8% 的请求，
+/// 其中 `unknown`/`python`/`curl`/`opencode` 客户端 15,614 个。这批请求输入中位
+/// 173,482 token、p90 657,907 —— **不是小请求**，而是永久零命中的大请求。
+///
+/// # 派生输入的选择
+///
+/// 用 `system` 文本 + 排序后的工具名集合，二者都经过与请求路径同一套归一化：
+///
+/// - **system 走 [`canonicalize_system_text`]** —— 它已剥掉每请求漂移的段（`<env>` 块、
+///   `gitStatus:`、`# Environment` 等）。不复用它就会让工作目录或日期的变化把键打散，
+///   等于没修。
+/// - **工具名排序** —— 官方自认造过「工具排序非确定」的事故；不排序则同一上下文因工具
+///   顺序抖动而分裂成多个键。
+/// - **不含 messages** —— 历史每轮都在变，含进去等于每请求一个新键，回到原问题。
+///
+/// 加固定前缀 `derived-conversation:` 避免与 [`derive_agent_continuation_id`] 的哈希
+/// 用途碰撞。返回 UUID 形状是因为下游 `derive_agent_continuation_id` 与上游都按 UUID
+/// 形状消费该字段。
+///
+/// # 边界
+///
+/// system 与 tools 双双为空时返回 `None`，让调用方回落到随机 UUID —— 那种请求没有可
+/// 稳定的前缀可言，强行归到同一个键只会让无关请求互相污染上游会话。
+///
+/// # 多租户：为何跨用户撞键是安全的
+///
+/// 不同用户若 system + tools 完全相同，会派生出同一个 conversationId。**这不会串话**：
+/// [`ConversationState`] 每次请求都携带完整 `history`（由 [`build_history`] 现场构建），
+/// 上游不靠 `continuationId` 重建历史。撞键的后果仅是两人共用一个上游会话键，而前缀
+/// 字节不同 → 缓存未命中，退化到修复前的状态，不会读到对方的内容。
+///
+/// 因此没有按用户加盐。要加盐就得给 [`convert_request`] 传租户标识，那会改动全部调用点，
+/// 而换来的只是「本来就不会发生的泄漏」不发生 —— 不值得。若将来上游改为按
+/// `continuationId` 服务端保存历史，此处必须立刻改为加盐。
+fn derive_conversation_id_from_context(req: &MessagesRequest) -> Option<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"derived-conversation:");
+
+    let mut has_material = false;
+
+    if let Some(system) = req.system.as_deref() {
+        for msg in system {
+            let canonical = canonicalize_system_text(&msg.text);
+            if !canonical.trim().is_empty() {
+                has_material = true;
+                hasher.update(canonical.as_bytes());
+                // 分隔符防止拼接歧义（["ab","c"] 与 ["a","bc"] 必须不同键）
+                hasher.update(b"\x1f");
+            }
+        }
+    }
+
+    if let Some(tools) = req.tools.as_deref() {
+        let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        names.sort_unstable();
+        for name in names {
+            has_material = true;
+            hasher.update(name.as_bytes());
+            hasher.update(b"\x1f");
+        }
+    }
+
+    if !has_material {
+        return None;
+    }
+
+    let r = hasher.finalize();
+    Some(format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        r[0],
+        r[1],
+        r[2],
+        r[3],
+        r[4],
+        r[5],
+        r[6],
+        r[7],
+        r[8],
+        r[9],
+        r[10],
+        r[11],
+        r[12],
+        r[13],
+        r[14],
+        r[15]
+    ))
 }
 
 /// 收集历史消息中使用的所有工具名称
@@ -735,11 +984,16 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     // 3. 生成会话 ID 和代理 ID
     // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId
+    // 三级回落：客户端显式 session_id → 工作上下文派生 → 随机。
+    // 中间这级是 2026-08-04 新增（L0-5）：不发 metadata 的客户端（python/curl/opencode）
+    // 此前每请求一个随机键 → 永久零命中，占全站 38.8% 的请求。见
+    // `derive_conversation_id_from_context` 的实测数据。
     let conversation_id = req
         .metadata
         .as_ref()
         .and_then(|m| m.user_id.as_ref())
         .and_then(|user_id| extract_session_id(user_id))
+        .or_else(|| derive_conversation_id_from_context(req))
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     // agentContinuationId 从 conversationId 确定性派生（SHA256），而非每请求随机。
     //
@@ -828,10 +1082,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         .with_history(history);
 
     if !tool_name_map.is_empty() {
-        tracing::info!(
-            "工具名称映射: {} 个超长名称已缩短",
-            tool_name_map.len()
-        );
+        tracing::info!("工具名称映射: {} 个超长名称已缩短", tool_name_map.len());
     }
 
     Ok(ConversionResult {
@@ -957,6 +1208,79 @@ fn get_image_format(media_type: &str) -> Option<String> {
     }
 }
 
+/// 嗅探图片 magic bytes 所需的字节数。
+///
+/// webp 判据最长：`RIFF`(4) + 文件长度(4) + `WEBP`(4) = 12 字节，其余格式都更短。
+const IMAGE_MAGIC_PROBE_BYTES: usize = 12;
+
+/// 只解码 base64 头部若干字节，够判类型即止。
+///
+/// 图片动辄几百 KB，为判类型解整张图纯属浪费。base64 每 4 字符对应 3 字节，故取
+/// 前 16 个有效字符（=12 字节，正好覆盖 webp 判据）单独解码——切在 4 的整数倍上，
+/// 无需补 padding。客户端偶尔发 `data:image/png;base64,` 前缀或带换行的 base64，
+/// 这里一并剥掉，否则解码直接失败、退化成"认不出"。
+fn decode_base64_head(data: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    let payload = data.rsplit_once(',').map(|(_, tail)| tail).unwrap_or(data);
+    // 过滤空白（换行/缩进）后再截取，避免把有效字符数算少
+    let head: Vec<u8> = payload
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace())
+        .take(IMAGE_MAGIC_PROBE_BYTES.div_ceil(3) * 4)
+        .collect();
+    // 不足 4 字符无法解出任何完整字节；非 4 倍数说明整张图本就极短，交给下游按原样处理
+    if head.len() < 4 || head.len() % 4 != 0 {
+        return None;
+    }
+    base64::engine::general_purpose::STANDARD.decode(&head).ok()
+}
+
+/// 按 magic bytes 判断图片真实格式，认不出返回 None（不猜）。
+fn sniff_image_format(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xFF, 0xD8]) {
+        return Some("jpeg");
+    }
+    if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+        return Some("png");
+    }
+    if bytes.starts_with(b"GIF8") {
+        return Some("gif");
+    }
+    // RIFF 容器还装 wav/avi，必须连偏移 8 处的 `WEBP` 一起验
+    if bytes.starts_with(b"RIFF") && bytes.len() >= 12 && &bytes[8..12] == b"WEBP" {
+        return Some("webp");
+    }
+    None
+}
+
+/// 定出下发给上游的图片格式：**magic bytes 优先于客户端声明的 media_type**。
+///
+/// 客户端（尤其截图工具链）经常声明 `image/png` 而实际字节是 jpeg，上游据此回
+/// `ValidationException` 400。实测这类 400 有 49 次，纯本地可修。
+///
+/// 顺序是本函数的全部意义：先嗅探、认出就用嗅探结果覆盖声明值；只有**认不出**
+/// （不匹配任何 magic）才回退到声明值——不猜，否则会把上游本来能接受的格式改坏。
+fn resolve_image_format(source: &ImageSource) -> Option<String> {
+    let declared = get_image_format(&source.media_type);
+    let sniffed = decode_base64_head(&source.data)
+        .as_deref()
+        .and_then(sniff_image_format);
+
+    match sniffed {
+        Some(actual) => {
+            if declared.as_deref() != Some(actual) {
+                tracing::debug!(
+                    declared = %source.media_type,
+                    actual = %actual,
+                    "图片 media_type 与 magic bytes 不符，按实际字节纠正"
+                );
+            }
+            Some(actual.to_string())
+        }
+        None => declared,
+    }
+}
+
 /// 把一个 image 块的 source 转成 `KiroImage` 并上浮到顶层 `images`。
 ///
 /// tool_result 内的图片与顶层 image 块走同一条转换链（mime 校验 + SHA256 去重 + 上浮），
@@ -965,14 +1289,14 @@ fn get_image_format(media_type: &str) -> Option<String> {
 ///
 /// 返回值：
 /// - `Some(placeholder)`：历史去重命中、或历史图片数超过 [`MAX_TOTAL_IMAGES`] 上限，图片被省略；
-/// - `None`：图片已上浮到 `images`，或 media_type 不支持（无法转换）。
+/// - `None`：图片已上浮到 `images`，或格式不支持（无法转换）。
 fn extract_kiro_image(
     source: &ImageSource,
     dedup: &mut Option<&mut std::collections::HashSet<String>>,
     images: &mut Vec<KiroImage>,
 ) -> Option<String> {
-    // media_type 不支持时无声跳过（与旧行为一致，不补占位符）
-    let format = get_image_format(&source.media_type)?;
+    // 格式以 magic bytes 为准、声明值兜底；都定不出时无声跳过（与旧行为一致，不补占位符）
+    let format = resolve_image_format(source)?;
 
     // 历史去重：只在 dedup 为 Some（历史路径）时生效，当前轮图片永远保留
     if let Some(seen) = dedup.as_deref_mut() {
@@ -1198,14 +1522,19 @@ fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, String>) -> Str
     debug_assert!(
         short.len() <= TOOL_NAME_MAX_LEN,
         "shorten_tool_name 生成的短名 {:?} ({} 字节) 仍超过 Kiro 上限 {} 字节",
-        short, short.len(), TOOL_NAME_MAX_LEN
+        short,
+        short.len(),
+        TOOL_NAME_MAX_LEN
     );
     tool_name_map.insert(short.clone(), name.to_string());
     short
 }
 
 /// 转换工具定义
-fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut HashMap<String, String>) -> Vec<Tool> {
+fn convert_tools(
+    tools: &Option<Vec<super::types::Tool>>,
+    tool_name_map: &mut HashMap<String, String>,
+) -> Vec<Tool> {
     let Some(tools) = tools else {
         return Vec::new();
     };
@@ -1246,7 +1575,9 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut Ha
                 tool_specification: ToolSpecification {
                     name: map_tool_name(&t.name, tool_name_map),
                     description,
-                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(t.input_schema))),
+                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(
+                        t.input_schema
+                    ))),
                 },
             }
         })
@@ -1289,7 +1620,12 @@ fn has_thinking_tags(content: &str) -> bool {
 ///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息），
 ///   调用方应始终使用此参数而非 `req.messages`。
 /// * `model_id` - 已映射的 Kiro 模型 ID
-fn build_history(req: &MessagesRequest, messages: &[super::types::Message], model_id: &str, tool_name_map: &mut HashMap<String, String>) -> Result<Vec<Message>, ConversionError> {
+fn build_history(
+    req: &MessagesRequest,
+    messages: &[super::types::Message],
+    model_id: &str,
+    tool_name_map: &mut HashMap<String, String>,
+) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
@@ -1473,7 +1809,8 @@ fn convert_assistant_message(
                             if let (Some(id), Some(name)) = (block.id, block.name) {
                                 let input = block.input.unwrap_or(serde_json::json!({}));
                                 let mapped_name = map_tool_name(&name, tool_name_map);
-                                tool_uses.push(ToolUseEntry::new(id, mapped_name).with_input(input));
+                                tool_uses
+                                    .push(ToolUseEntry::new(id, mapped_name).with_input(input));
                             }
                         }
                         _ => {}
@@ -1709,7 +2046,10 @@ mod tests {
         assert!(!out.contains("<env>"), "env 起始标签应被剥离");
         assert!(!out.contains("Working directory"), "cwd 行应被剥离");
         assert!(!out.contains("Today's date"), "日期行应被剥离");
-        assert!(out.contains("You are a helpful assistant."), "稳定正文应保留");
+        assert!(
+            out.contains("You are a helpful assistant."),
+            "稳定正文应保留"
+        );
         assert!(out.contains("Follow the task."), "env 后正文应保留");
     }
 
@@ -1729,7 +2069,8 @@ mod tests {
     fn test_strip_env_noise_removes_environment_section() {
         let _g = EnvNoiseGuard::enable();
         // # Environment 段剥到下一个 # 标题为止，后续标题及正文保留
-        let text = "# Task\nDo the work.\n# Environment\nfoo\nbar\ngitStatus: x\n# Rules\nBe concise.";
+        let text =
+            "# Task\nDo the work.\n# Environment\nfoo\nbar\ngitStatus: x\n# Rules\nBe concise.";
         let out = canonicalize_system_text(text);
         assert!(out.contains("# Task"));
         assert!(out.contains("Do the work."));
@@ -1744,10 +2085,14 @@ mod tests {
     fn test_strip_env_noise_stable_content_untouched() {
         let _g = EnvNoiseGuard::enable();
         // 纯稳定正文：无任何噪音标记 → 原样借用不改写
-        let text = "You are an expert engineer.\nWrite clean, tested code.\nExplain your reasoning.";
+        let text =
+            "You are an expert engineer.\nWrite clean, tested code.\nExplain your reasoning.";
         let out = canonicalize_system_text(text);
         assert_eq!(out.as_ref(), text, "稳定正文一字节不改");
-        assert!(matches!(out, std::borrow::Cow::Borrowed(_)), "未改写应零分配借用");
+        assert!(
+            matches!(out, std::borrow::Cow::Borrowed(_)),
+            "未改写应零分配借用"
+        );
     }
 
     #[test]
@@ -1819,7 +2164,10 @@ mod tests {
         let sys_b = extract(&req_b);
 
         assert_eq!(sys_a, sys_b, "env 漂移剥离后转发字节应一致");
-        assert!(!sys_a.contains("Working directory"), "漂移的 cwd 不应泄漏到转发字节");
+        assert!(
+            !sys_a.contains("Working directory"),
+            "漂移的 cwd 不应泄漏到转发字节"
+        );
         assert!(sys_a.contains("Help the user."), "稳定正文应保留");
     }
 
@@ -1841,6 +2189,49 @@ mod tests {
             tools: None,
             tool_choice: None,
             thinking,
+            output_config: None,
+            metadata: None,
+        }
+    }
+
+    /// 构造只控制「工作上下文」（system 文本 + 工具名）的最小请求，供 L0-5 派生用例使用。
+    fn req_with_context(system: Option<&str>, tool_names: &[&str]) -> MessagesRequest {
+        use super::super::types::Message as AnthropicMessage;
+        use super::super::types::{SystemMessage, Tool};
+        MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hi"),
+            }],
+            stream: false,
+            system: system.map(|t| {
+                vec![SystemMessage {
+                    text: t.to_string(),
+                    block_type: Some("text".to_string()),
+                    cache_control: None,
+                }]
+            }),
+            tools: if tool_names.is_empty() {
+                None
+            } else {
+                Some(
+                    tool_names
+                        .iter()
+                        .map(|n| Tool {
+                            tool_type: None,
+                            name: n.to_string(),
+                            description: String::new(),
+                            input_schema: HashMap::new(),
+                            cache_control: None,
+                            max_uses: None,
+                        })
+                        .collect(),
+                )
+            },
+            tool_choice: None,
+            thinking: None,
             output_config: None,
             metadata: None,
         }
@@ -1910,6 +2301,103 @@ mod tests {
     }
 
     /// 正常路径不变：有有效 system + thinking → 前缀在最前，system 正文与分块策略都在。
+    #[test]
+    fn derived_conversation_id_is_stable_across_requests() {
+        // 同一工作上下文（system + tools 不变）必须派生出同一个键 —— 这正是 L0-5 的目的。
+        let a = req_with_context(Some("you are a helpful agent"), &["read", "write"]);
+        let b = req_with_context(Some("you are a helpful agent"), &["read", "write"]);
+        let ka = derive_conversation_id_from_context(&a).expect("应能派生");
+        let kb = derive_conversation_id_from_context(&b).expect("应能派生");
+        assert_eq!(ka, kb, "同上下文必须稳定派生同一键，否则等于没修");
+        assert!(is_valid_uuid(&ka), "必须是 UUID 形状：下游与上游都按此消费");
+    }
+
+    #[test]
+    fn derived_conversation_id_ignores_tool_order() {
+        // 官方自认造过「工具排序非确定」的事故；不排序会让同上下文分裂成多个键。
+        let a = req_with_context(Some("sys"), &["alpha", "beta", "gamma"]);
+        let b = req_with_context(Some("sys"), &["gamma", "alpha", "beta"]);
+        assert_eq!(
+            derive_conversation_id_from_context(&a),
+            derive_conversation_id_from_context(&b),
+            "工具名顺序抖动不得改变派生键"
+        );
+    }
+
+    #[test]
+    fn derived_conversation_id_separates_distinct_contexts() {
+        let a = req_with_context(Some("agent A"), &["read"]);
+        let b = req_with_context(Some("agent B"), &["read"]);
+        assert_ne!(
+            derive_conversation_id_from_context(&a),
+            derive_conversation_id_from_context(&b),
+            "不同工作上下文必须隔离，否则无关请求会互相污染上游会话"
+        );
+    }
+
+    #[test]
+    fn derived_conversation_id_resists_concat_ambiguity() {
+        // 无分隔符时 ["ab","c"] 与 ["a","bc"] 会哈希成同一串。
+        let a = req_with_context(None, &["ab", "c"]);
+        let b = req_with_context(None, &["a", "bc"]);
+        assert_ne!(
+            derive_conversation_id_from_context(&a),
+            derive_conversation_id_from_context(&b),
+            "拼接歧义必须由分隔符消除"
+        );
+    }
+
+    #[test]
+    fn derived_conversation_id_is_none_without_material() {
+        // system 与 tools 双空：没有可稳定的前缀，应回落随机而非归到同一个键。
+        let empty = req_with_context(None, &[]);
+        assert!(
+            derive_conversation_id_from_context(&empty).is_none(),
+            "无材料时必须返回 None，让调用方回落随机 UUID"
+        );
+        let blank = req_with_context(Some("   "), &[]);
+        assert!(
+            derive_conversation_id_from_context(&blank).is_none(),
+            "纯空白 system 不算材料"
+        );
+    }
+
+    #[test]
+    fn derived_conversation_id_survives_env_noise_drift() {
+        // 关键回归：工作目录/日期漂移不得打散键。不复用 canonicalize_system_text
+        // 就会在这里失败，而那等于 L0-5 没修。
+        let a = req_with_context(
+            Some("stable instructions\n<env>cwd: /home/a\ntoday: 2026-08-04</env>"),
+            &["read"],
+        );
+        let b = req_with_context(
+            Some("stable instructions\n<env>cwd: /home/b\ntoday: 2026-08-05</env>"),
+            &["read"],
+        );
+        assert_eq!(
+            derive_conversation_id_from_context(&a),
+            derive_conversation_id_from_context(&b),
+            "环境噪音漂移必须被归一化吸收"
+        );
+    }
+
+    #[test]
+    fn explicit_session_id_wins_over_derivation() {
+        // 回落顺序不能反：Claude Code 给了 session_id 就必须用它。
+        let mut req = req_with_context(Some("sys"), &["read"]);
+        let sid = "11111111-2222-3333-4444-555555555555";
+        req.metadata = Some(super::super::types::Metadata {
+            user_id: Some(format!("user_x_session_{sid}")),
+        });
+        let result = convert_request(&req).expect("转换应成功");
+        let derived = derive_conversation_id_from_context(&req).expect("应能派生");
+        assert_ne!(
+            result.conversation_state.conversation_id, derived,
+            "显式 session_id 优先于上下文派生"
+        );
+        assert_eq!(result.conversation_state.conversation_id, sid);
+    }
+
     #[test]
     fn should_keep_thinking_prefix_ahead_of_non_empty_system() {
         use super::super::types::SystemMessage;
@@ -2004,7 +2492,10 @@ mod tests {
         // 完整原生 id 直透（含子串，映射回自身）
         assert_eq!(map_model("deepseek-3.2"), Some("deepseek-3.2".to_string()));
         assert_eq!(map_model("glm-5"), Some("glm-5".to_string()));
-        assert_eq!(map_model("qwen3-coder-next"), Some("qwen3-coder-next".to_string()));
+        assert_eq!(
+            map_model("qwen3-coder-next"),
+            Some("qwen3-coder-next".to_string())
+        );
         assert_eq!(map_model("minimax-m2.5"), Some("minimax-m2.5".to_string()));
         // minimax 版本细分
         assert_eq!(map_model("minimax-m2.1"), Some("minimax-m2.1".to_string()));
@@ -2117,13 +2608,18 @@ mod tests {
 
     #[test]
     fn test_shorten_tool_name_deterministic() {
-        let long_name = "mcp__some_very_long_server_name__some_very_long_tool_name_that_exceeds_limit";
+        let long_name =
+            "mcp__some_very_long_server_name__some_very_long_tool_name_that_exceeds_limit";
         assert!(long_name.len() > TOOL_NAME_MAX_LEN);
 
         let short1 = shorten_tool_name(long_name);
         let short2 = shorten_tool_name(long_name);
         assert_eq!(short1, short2, "相同输入应产生相同的短名称");
-        assert!(short1.len() <= TOOL_NAME_MAX_LEN, "短名称长度应 <= 63，实际 {}", short1.len());
+        assert!(
+            short1.len() <= TOOL_NAME_MAX_LEN,
+            "短名称长度应 <= 63，实际 {}",
+            short1.len()
+        );
     }
 
     #[test]
@@ -2140,13 +2636,17 @@ mod tests {
             assert!(
                 short.len() <= TOOL_NAME_MAX_LEN,
                 "{n} 个汉字({} 字节)的工具名缩短后为 {} 字节(>{}上限): {:?}",
-                cjk_name.len(), short.len(), TOOL_NAME_MAX_LEN, short
+                cjk_name.len(),
+                short.len(),
+                TOOL_NAME_MAX_LEN,
+                short
             );
             if cjk_name.len() > TOOL_NAME_MAX_LEN {
                 assert!(
                     short.len() < cjk_name.len(),
                     "缩短后必须比原名更短,否则毫无意义(原 {} 字节 → 短 {} 字节)",
-                    cjk_name.len(), short.len()
+                    cjk_name.len(),
+                    short.len()
                 );
                 assert_eq!(
                     map.get(&short).map(String::as_str),
@@ -2168,7 +2668,8 @@ mod tests {
                 assert!(
                     short.len() <= TOOL_NAME_MAX_LEN,
                     "name({} 字节) → short({} 字节) 超限",
-                    name.len(), short.len()
+                    name.len(),
+                    short.len()
                 );
                 // 未超限的名字必须原样返回(不该被无谓改写)。
                 if name.len() <= TOOL_NAME_MAX_LEN {
@@ -2208,7 +2709,8 @@ mod tests {
     fn test_tool_name_mapping_in_convert_request() {
         use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
-        let long_tool_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
+        let long_tool_name =
+            "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
         assert!(long_tool_name.len() > TOOL_NAME_MAX_LEN);
 
         let mut schema = std::collections::HashMap::new();
@@ -2218,12 +2720,10 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
-            messages: vec![
-                AnthropicMessage {
-                    role: "user".to_string(),
-                    content: serde_json::json!("test"),
-                },
-            ],
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
             system: None,
             stream: false,
             tools: Some(vec![AnthropicTool {
@@ -2251,8 +2751,12 @@ mod tests {
         assert!(short.len() <= TOOL_NAME_MAX_LEN);
 
         // Kiro 请求中的工具名应该是短名称
-        let tools = &result.conversation_state.current_message.user_input_message
-            .user_input_message_context.tools;
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
         assert_eq!(tools[0].tool_specification.name, *short);
     }
 
@@ -2310,7 +2814,8 @@ mod tests {
     fn test_tool_name_mapping_in_history() {
         use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
-        let long_tool_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
+        let long_tool_name =
+            "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
 
         let mut schema = std::collections::HashMap::new();
         schema.insert("type".to_string(), serde_json::json!("object"));
@@ -2418,6 +2923,225 @@ mod tests {
         // 不 panic 即通过；顶层结构正常
         assert_eq!(out["type"], "object");
         assert!(out["properties"].get("node").is_some());
+    }
+
+    /// 构造一个自引用扇出（fan-out）schema：`$defs.T` 的 `properties` 里放 `b` 个
+    /// 都指回 `T` 自身的属性（`c0..c{b-1}`），根节点的 `node` 属性再引用 `T`。
+    ///
+    /// 这是节点预算文档注释里描述的攻击最小形态：链长闸门（`MAX_REF_DEPTH=16`）只限
+    /// "跳了多少次 `$ref`"，同级的 b 个属性复用同一个 `depth`，于是不设总量预算时
+    /// 节点数是 b^16 量级（实测 b=2 时六百万+，`resolve_schema_refs` 内联文档写的
+    /// "800 万+" 与之量级一致）。b=1（唯一安全的分叉因子）不会触发这条路径，因为
+    /// 链长闸门本身就先拦住了它——这正是本测试要补的缺口。
+    fn build_fanout_ref_schema(b: usize) -> serde_json::Value {
+        let mut props = serde_json::Map::new();
+        for i in 0..b {
+            props.insert(format!("c{i}"), serde_json::json!({ "$ref": "#/$defs/T" }));
+        }
+        serde_json::json!({
+            "type": "object",
+            "properties": { "node": { "$ref": "#/$defs/T" } },
+            "$defs": {
+                "T": { "type": "object", "properties": props }
+            }
+        })
+    }
+
+    /// 构造一条**有限**的分叉引用链：`T0 -> T1 -> ... -> T{depth-1} -> leaf`，每层都
+    /// fan-out `b` way（`c0..c{b-1}` 都指向下一层，而不是指回自己）。
+    ///
+    /// 与 `build_fanout_ref_schema` 的关键区别：这不是自引用循环，链长本身就有限
+    /// （`depth` 层后落到叶子 `"type": "string"`），无论有没有节点预算 / 深度闸门都会
+    /// 自然终止 —— 这正是"预算充足时应正常展开"这条对照要验证的场景：一个真实存在
+    /// （只是层数多、扇出大）的合法 schema，不该被节点预算误杀成宽松 object。
+    fn build_bounded_fanout_chain_schema(b: usize, depth: usize) -> serde_json::Value {
+        let mut defs = serde_json::Map::new();
+        defs.insert(format!("T{depth}"), serde_json::json!({ "type": "string" }));
+        for lvl in (0..depth).rev() {
+            let mut props = serde_json::Map::new();
+            for i in 0..b {
+                props.insert(
+                    format!("c{i}"),
+                    serde_json::json!({ "$ref": format!("#/$defs/T{}", lvl + 1) }),
+                );
+            }
+            defs.insert(
+                format!("T{lvl}"),
+                serde_json::json!({ "type": "object", "properties": props }),
+            );
+        }
+        serde_json::json!({
+            "type": "object",
+            "properties": { "node": { "$ref": "#/$defs/T0" } },
+            "$defs": serde_json::Value::Object(defs)
+        })
+    }
+
+    /// 递归统计 JSON 节点总数（object/array 记 1 再加子节点，标量记 1），用来断言
+    /// 展开结果确实被节点预算钉住了上界，而不是靠"没崩就算过"这种弱断言。
+    fn count_json_nodes(v: &serde_json::Value) -> usize {
+        match v {
+            serde_json::Value::Object(obj) => 1 + obj.values().map(count_json_nodes).sum::<usize>(),
+            serde_json::Value::Array(arr) => 1 + arr.iter().map(count_json_nodes).sum::<usize>(),
+            _ => 1,
+        }
+    }
+
+    #[test]
+    fn test_normalize_schema_fanout_b2_bounded_by_small_budget() {
+        // b=2：最小的真实扇出因子。小预算下必须返回（不挂死）且被截断（预算生效）。
+        let schema = build_fanout_ref_schema(2);
+        let out = normalize_json_schema_with_node_budget(schema, 100);
+        // 上界：展开结果的节点数不能超过注入的预算（+ 少量白名单/顶层字段的常数开销）。
+        // 100 节点的预算下，实测输出稳定在个位数到十几个节点，远小于无预算时的
+        // 6,488,067（b=2, 深度 16）——这就是本测试要守住的差异。
+        assert!(
+            count_json_nodes(&out) <= 100,
+            "b=2 小预算展开结果应被节点预算钉住上界，实际 {} 个节点",
+            count_json_nodes(&out)
+        );
+        // 结构仍是合法 schema（顶层未被整体判 malformed）。
+        assert_eq!(out["type"], "object");
+    }
+
+    #[test]
+    fn test_normalize_schema_fanout_b3_bounded_by_small_budget() {
+        // b=3：分叉因子更大，无预算时展开量比 b=2 大得多（指数级），链长闸门
+        // （depth 只在 $ref 跳转时 +1，不算同级扇出）对此完全无效，必须靠节点预算拦。
+        let schema = build_fanout_ref_schema(3);
+        let out = normalize_json_schema_with_node_budget(schema, 100);
+        assert!(
+            count_json_nodes(&out) <= 100,
+            "b=3 小预算展开结果应被节点预算钉住上界，实际 {} 个节点",
+            count_json_nodes(&out)
+        );
+        assert_eq!(out["type"], "object");
+    }
+
+    #[test]
+    fn test_normalize_schema_fanout_b3_expands_fully_when_budget_sufficient() {
+        // 对照组：证明节点预算**不是无脑截断** —— 一个合法的大 schema 在**生产预算**下
+        // 必须完整展开、零截断。对应生产注释里"合法请求不可能被截断"的担忧。
+        //
+        // ⚠️ 参数是**实测**定的，不是估的（本测试上一版就是估错才长期为红）：
+        //   b=3 深度 3 → visited   825 / 输出  110
+        //   b=3 深度 4 → visited 3,168 / 输出  326
+        //   b=3 深度 5 → visited 11,613 / 输出  974   ← 本测试用这档
+        //   b=3 深度 6 → visited 41,199 / 输出 2,918   （旧版注释写"18,774"，错了一倍多）
+        // 深度 6 在 20,000 预算下**必然**被截断（41,199 > 20,000），而旧版断言它不该截断，
+        // 于是实现正确、测试为红。深度 5 的 11,613 在生产预算 50,000 下余量约 4 倍。
+        //
+        // 刻意用生产常量 `MAX_SCHEMA_NODES` 而非注入一个更大的数：注入 60,000 也能让深度 6
+        // 通过，但那证明的是"给足够大的预算就不截断"（同义反复），而这里要证明的是
+        // **真实生产配置下合法 schema 不受影响**。
+        let schema = build_bounded_fanout_chain_schema(3, 5);
+        let defs = extract_schema_defs(&schema);
+        let mut budget = SchemaRefBudget::new(MAX_SCHEMA_NODES);
+        let resolved = resolve_schema_refs(schema.clone(), &defs, 0, &mut budget);
+
+        // 🔴 承重断言：**零截断**。这比"输出节点数 > N"强得多 ——
+        // 后者在部分截断时仍可能成立（截断只降级末梢子树，总数照样很大）。
+        assert_eq!(
+            budget.truncated_nodes, 0,
+            "生产预算下合法 schema 不得被截断，实际截断 {} 次（visited={}）",
+            budget.truncated_nodes, budget.visited
+        );
+        // 预算确实被消耗了（防"夹具没触发展开"这种恒真断言：若 $defs 拼错导致
+        // 一个 $ref 都没展开，visited 会是个位数而零截断照样成立）。
+        assert!(
+            budget.visited > 10_000,
+            "夹具自检：深度 5 应访问约 11,613 个节点，实际 {} —— 太少说明 $ref 没被展开",
+            budget.visited
+        );
+        assert!(
+            resolved.get("properties").is_some(),
+            "展开结果应保留 properties"
+        );
+
+        let out = normalize_json_schema_with_node_budget(schema, MAX_SCHEMA_NODES);
+        let node = &out["properties"]["node"];
+        // 未被截断：$ref 已展开为真实子 schema，属性里应能看到 c0/c1/c2，
+        // 而不是降级后的 { "type": "object", "additionalProperties": true } 空壳。
+        assert_eq!(node["type"], "object");
+        assert!(
+            node["properties"].get("c0").is_some(),
+            "预算充足时应展开出真实子属性 c0，而非降级空壳: {node:?}"
+        );
+        // 再深一层同样展开（证明是整棵树展开，不只是第一层）。
+        assert_eq!(node["properties"]["c0"]["type"], "object");
+        assert!(
+            node["properties"]["c0"]["properties"].get("c0").is_some(),
+            "第二层也应展开出 c0（整棵树而非仅首层）"
+        );
+    }
+
+    /// 🔴 预算耗尽时**数组必须仍是数组**，不得被换成 object 占位。
+    ///
+    /// 缺陷形态：`degraded_object_schema()` 是个 object，若预算在一个 `Value::Array`
+    /// 节点上耗尽，整个数组被替换成对象。而 `anyOf` / `oneOf` / `allOf` / 元组式
+    /// `items` **必须是数组** ⇒ 产出结构非法的 JSON Schema ⇒ 上游 400。
+    /// 而节点预算存在的全部目的就是避免上游报错，那就自相矛盾了。
+    ///
+    /// 回退即 FAILED：把函数开头那个数组提前返回删掉（让数组重新落到预算闸门之后），
+    /// 本测试必红。
+    #[test]
+    fn test_budget_exhaustion_keeps_arrays_as_arrays() {
+        // ⚠️ 数组必须放在**根的直接键**上。实测过一版把它们埋在 `properties.pick` /
+        // `properties.tuple` 之下：预算在那两个**对象**上就耗尽 ⇒ 对象被换成 object 占位
+        // ⇒ `anyOf`/`items` 这两个键**整个消失**，断言拿到 `Null` 而不是「数组变对象」。
+        // 那测的是父节点降级，不是本缺陷。放根上才让断言只关心数组本身。
+        let big = serde_json::json!({ "type": "object", "properties": {
+            "a": {"type":"string"}, "b": {"type":"string"}, "c": {"type":"string"},
+            "d": {"type":"string"}, "e": {"type":"string"}, "f": {"type":"string"}
+        }});
+
+        // 每个 case 一份独立夹具：`anyOf` 与元组式 `items` 各自在根上。
+        for (label, schema) in [
+            (
+                "anyOf",
+                serde_json::json!({
+                    "anyOf": [
+                        { "$ref": "#/$defs/Big" },
+                        { "$ref": "#/$defs/Big" },
+                        { "$ref": "#/$defs/Big" }
+                    ],
+                    "$defs": { "Big": big.clone() }
+                }),
+            ),
+            (
+                "items",
+                serde_json::json!({
+                    "items": [ { "$ref": "#/$defs/Big" }, { "$ref": "#/$defs/Big" } ],
+                    "$defs": { "Big": big.clone() }
+                }),
+            ),
+        ] {
+            let defs = extract_schema_defs(&schema);
+            // 预算 3：足够访问根对象，但展开第一个 $ref 就耗尽。
+            let mut budget = SchemaRefBudget::new(3);
+            let resolved = resolve_schema_refs(schema.clone(), &defs, 0, &mut budget);
+
+            // 夹具自检：预算必须真的被耗尽，否则本断言恒真（本仓「纸面测试」形态之一）。
+            assert!(
+                budget.truncated_nodes > 0,
+                "[{label}] 夹具自检失败：预算未被耗尽（truncated=0, visited={}）⇒ 本测试恒真",
+                budget.visited
+            );
+
+            // 🔴 承重断言：耗尽后该位置仍是数组。
+            let arr = &resolved[label];
+            assert!(
+                arr.is_array(),
+                "[{label}] 预算耗尽后必须仍是数组（否则 schema 结构非法、上游 400），实际: {arr:?}"
+            );
+            // 元素数不变（元素可退化成 object 占位，但不能少 —— 少了元组语义就变了）。
+            let expected = if label == "anyOf" { 3 } else { 2 };
+            assert_eq!(
+                arr.as_array().map(|a| a.len()),
+                Some(expected),
+                "[{label}] 元素数不得改变"
+            );
+        }
     }
 
     #[test]
@@ -2618,7 +3342,8 @@ mod tests {
     fn test_convert_request_without_metadata() {
         use super::super::types::Message as AnthropicMessage;
 
-        // 测试没有 metadata 的请求，应该生成新的 UUID
+        // 无 metadata **且** system/tools 双空 —— 三级回落链的最后一级（随机 UUID）。
+        // 有 system 或 tools 时走上下文派生，见 `derived_conversation_id_*` 系列用例。
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
@@ -3014,9 +3739,15 @@ mod tests {
 
         let content = &result.assistant_response_message.content;
         assert!(content.contains("<thinking>"), "应包含 thinking 标签");
-        assert!(content.contains("Let me read that file"), "应包含第二条消息的 text 内容");
+        assert!(
+            content.contains("Let me read that file"),
+            "应包含第二条消息的 text 内容"
+        );
 
-        let tool_uses = result.assistant_response_message.tool_uses.expect("应有 tool_uses");
+        let tool_uses = result
+            .assistant_response_message
+            .tool_uses
+            .expect("应有 tool_uses");
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].tool_use_id, "toolu_01ABC");
     }
@@ -3066,7 +3797,11 @@ mod tests {
         };
 
         let result = convert_request(&req);
-        assert!(result.is_ok(), "连续 assistant 消息场景不应报错: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "连续 assistant 消息场景不应报错: {:?}",
+            result.err()
+        );
 
         let state = result.unwrap().conversation_state;
         let mut found_tool_use = false;
@@ -3146,7 +3881,10 @@ mod tests {
                 // tool_result 只保留文本，base64 不应出现在 tool_result content 里
                 for tr in &u.user_input_message.user_input_message_context.tool_results {
                     if tr.tool_use_id == "tool-1" {
-                        let text = tr.content[0].get("text").and_then(|v| v.as_str()).unwrap_or("");
+                        let text = tr.content[0]
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
                         assert_eq!(text, "here is the screen");
                         assert!(!text.contains(TINY_PNG_B64), "tool_result 不应含 base64");
                         tool_result_text_ok = true;
@@ -3228,16 +3966,146 @@ mod tests {
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": TINY_PNG_B64}}
         ]);
 
-        let (_t1, imgs1, _) =
-            process_message_content_dedup(&content, Some(&mut dedup)).unwrap();
+        let (_t1, imgs1, _) = process_message_content_dedup(&content, Some(&mut dedup)).unwrap();
         assert_eq!(imgs1.len(), 1, "首次出现应保留图片");
 
-        let (text2, imgs2, _) =
-            process_message_content_dedup(&content, Some(&mut dedup)).unwrap();
+        let (text2, imgs2, _) = process_message_content_dedup(&content, Some(&mut dedup)).unwrap();
         assert!(imgs2.is_empty(), "重复图片不应再次上浮");
         assert!(
             text2.contains("identical to an earlier screenshot"),
             "重复图片应替换为去重占位符"
+        );
+    }
+
+    // === H3 回归：图片格式按 magic bytes 校正（客户端声明值不可信）===
+
+    /// 造一张以 `magic` 开头、填充到 24 字节的假图，返回其 base64。
+    ///
+    /// 只需头部字节能被嗅探到，后续内容与判类型无关，故不必用真图。
+    fn fake_image_b64(magic: &[u8]) -> String {
+        use base64::Engine;
+        let mut bytes = magic.to_vec();
+        bytes.resize(24, 0x00);
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    }
+
+    /// 走真实调用点（`process_message_content` → `extract_kiro_image`）取下发格式。
+    ///
+    /// 直接测 `resolve_image_format` 会变成纸面测试：函数本身对了但调用点没接上一样是 400。
+    fn format_via_real_path(media_type: &str, data: &str) -> Option<String> {
+        let content = serde_json::json!([
+            {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}}
+        ]);
+        let (_text, images, _tr) = process_message_content(&content).unwrap();
+        images.first().map(|img| img.format.clone())
+    }
+
+    #[test]
+    fn test_image_format_corrected_to_jpeg_by_magic_bytes() {
+        let data = fake_image_b64(&[0xFF, 0xD8, 0xFF, 0xE0]);
+        assert_eq!(
+            format_via_real_path("image/png", &data).as_deref(),
+            Some("jpeg"),
+            "声明 png 而字节是 jpeg，应按 magic bytes 纠正为 jpeg"
+        );
+    }
+
+    #[test]
+    fn test_image_format_corrected_to_png_by_magic_bytes() {
+        let data = fake_image_b64(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+        assert_eq!(
+            format_via_real_path("image/jpeg", &data).as_deref(),
+            Some("png"),
+            "声明 jpeg 而字节是 png，应按 magic bytes 纠正为 png"
+        );
+    }
+
+    #[test]
+    fn test_image_format_corrected_to_gif_by_magic_bytes() {
+        let data = fake_image_b64(b"GIF89a");
+        assert_eq!(
+            format_via_real_path("image/webp", &data).as_deref(),
+            Some("gif"),
+            "声明 webp 而字节是 gif，应按 magic bytes 纠正为 gif"
+        );
+    }
+
+    #[test]
+    fn test_image_format_corrected_to_webp_by_magic_bytes() {
+        // RIFF + 4 字节长度占位 + WEBP：偏移 8 处的 WEBP 必须一起验，否则 wav/avi 也会命中
+        let mut magic = b"RIFF".to_vec();
+        magic.extend_from_slice(&[0x10, 0x00, 0x00, 0x00]);
+        magic.extend_from_slice(b"WEBP");
+        let data = fake_image_b64(&magic);
+        assert_eq!(
+            format_via_real_path("image/png", &data).as_deref(),
+            Some("webp"),
+            "声明 png 而字节是 webp，应按 magic bytes 纠正为 webp"
+        );
+    }
+
+    #[test]
+    fn test_image_format_keeps_declared_when_magic_unknown() {
+        // 不匹配任何 magic：保留声明值，不猜——瞎猜会把上游本来能接受的格式改坏
+        let data = fake_image_b64(&[0x00, 0x01, 0x02, 0x03]);
+        assert_eq!(
+            format_via_real_path("image/png", &data).as_deref(),
+            Some("png"),
+            "magic 认不出时应保留客户端声明的 png"
+        );
+        // RIFF 但偏移 8 不是 WEBP（wav 容器）同样算认不出
+        let mut wav = b"RIFF".to_vec();
+        wav.extend_from_slice(&[0x10, 0x00, 0x00, 0x00]);
+        wav.extend_from_slice(b"WAVE");
+        assert_eq!(
+            format_via_real_path("image/gif", &fake_image_b64(&wav)).as_deref(),
+            Some("gif"),
+            "RIFF/WAVE 不是 webp，应保留声明的 gif"
+        );
+    }
+
+    #[test]
+    fn test_image_format_unchanged_when_declaration_matches_magic() {
+        // 真 1x1 PNG：声明与 magic 一致，格式不变
+        assert_eq!(
+            format_via_real_path("image/png", TINY_PNG_B64).as_deref(),
+            Some("png"),
+            "声明与 magic 一致时格式应保持 png"
+        );
+    }
+
+    #[test]
+    fn test_image_format_unsupported_declaration_rescued_by_magic() {
+        // 声明是不支持的 media_type 但字节认得出：旧行为整张图无声丢弃，现在按 magic 下发
+        let data = fake_image_b64(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+        assert_eq!(
+            format_via_real_path("image/bmp", &data).as_deref(),
+            Some("png"),
+            "声明 image/bmp 而字节是 png，应按 magic 下发 png 而非丢图"
+        );
+        // 真 BMP（magic `BM` 不在判据内）仍认不出 → 声明值也不支持 → 维持旧的丢弃行为
+        assert!(
+            format_via_real_path("image/bmp", &fake_image_b64(b"BM")).is_none(),
+            "magic 与声明都定不出格式时应维持旧的无声跳过"
+        );
+    }
+
+    #[test]
+    fn test_image_format_sniff_tolerates_data_url_prefix_and_newlines() {
+        // 客户端偶发 data: 前缀 / 带换行的 base64，剥不掉就退化成"认不出"、纠正失效
+        let jpeg = fake_image_b64(&[0xFF, 0xD8, 0xFF, 0xDB]);
+        let with_prefix = format!("data:image/png;base64,{}", jpeg);
+        assert_eq!(
+            format_via_real_path("image/png", &with_prefix).as_deref(),
+            Some("jpeg"),
+            "带 data: 前缀时仍应按 magic bytes 纠正"
+        );
+
+        let wrapped = format!("{}\n{}", &jpeg[..8], &jpeg[8..]);
+        assert_eq!(
+            format_via_real_path("image/png", &wrapped).as_deref(),
+            Some("jpeg"),
+            "base64 带换行时仍应按 magic bytes 纠正"
         );
     }
 }

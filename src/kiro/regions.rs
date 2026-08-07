@@ -18,20 +18,39 @@
 /// 参考 kiro-account-manager 的 SUPPORTED_KIRO_REGIONS。凡要拼进 `*.kiro.dev` host 或
 /// 从 profileArn 解析出的 region，都必须命中此白名单，否则回退可信 config（防污染值攻击）。
 pub const KIRO_DIALOG_REGIONS: &[&str] = &[
-    "us-east-1", "us-east-2", "us-west-1", "us-west-2",
-    "ca-central-1", "ca-west-1",
-    "eu-west-1", "eu-west-2", "eu-west-3", "eu-central-1", "eu-central-2",
-    "eu-north-1", "eu-south-1", "eu-south-2",
-    "ap-south-1", "ap-south-2",
-    "ap-southeast-1", "ap-southeast-2", "ap-southeast-3", "ap-southeast-4",
-    "ap-northeast-1", "ap-northeast-2", "ap-northeast-3",
+    "us-east-1",
+    "us-east-2",
+    "us-west-1",
+    "us-west-2",
+    "ca-central-1",
+    "ca-west-1",
+    "eu-west-1",
+    "eu-west-2",
+    "eu-west-3",
+    "eu-central-1",
+    "eu-central-2",
+    "eu-north-1",
+    "eu-south-1",
+    "eu-south-2",
+    "ap-south-1",
+    "ap-south-2",
+    "ap-southeast-1",
+    "ap-southeast-2",
+    "ap-southeast-3",
+    "ap-southeast-4",
+    "ap-northeast-1",
+    "ap-northeast-2",
+    "ap-northeast-3",
     "ap-east-1",
     "sa-east-1",
-    "me-south-1", "me-central-1",
+    "me-south-1",
+    "me-central-1",
     "af-south-1",
     "il-central-1",
-    "us-gov-east-1", "us-gov-west-1",
-    "cn-north-1", "cn-northwest-1",
+    "us-gov-east-1",
+    "us-gov-west-1",
+    "cn-north-1",
+    "cn-northwest-1",
 ];
 
 /// AWS SSO-OIDC（`oidc.{region}.amazonaws.com`）端点的探测候选（主流商业 region）。
@@ -41,14 +60,30 @@ pub const KIRO_DIALOG_REGIONS: &[&str] = &[
 /// 用户填的 region 不对时自动顺次探测纠正（防呆）。**不含 gov/cn 隔离分区**（其 startUrl 域名不同、
 /// OIDC 端点分区隔离，探测无意义）。覆盖 AWS SSO-OIDC 实际有端点的主流商业 region。
 pub const OIDC_PROBE_REGIONS: &[&str] = &[
-    "us-east-1", "us-east-2", "us-west-2",
-    "eu-central-1", "eu-central-2", "eu-west-1", "eu-west-2", "eu-west-3",
-    "eu-north-1", "eu-south-1", "eu-south-2",
-    "ap-southeast-1", "ap-southeast-2", "ap-southeast-3",
-    "ap-northeast-1", "ap-northeast-2", "ap-northeast-3",
-    "ap-south-1", "ap-east-1",
-    "ca-central-1", "sa-east-1",
-    "me-central-1", "il-central-1", "af-south-1",
+    "us-east-1",
+    "us-east-2",
+    "us-west-2",
+    "eu-central-1",
+    "eu-central-2",
+    "eu-west-1",
+    "eu-west-2",
+    "eu-west-3",
+    "eu-north-1",
+    "eu-south-1",
+    "eu-south-2",
+    "ap-southeast-1",
+    "ap-southeast-2",
+    "ap-southeast-3",
+    "ap-northeast-1",
+    "ap-northeast-2",
+    "ap-northeast-3",
+    "ap-south-1",
+    "ap-east-1",
+    "ca-central-1",
+    "sa-east-1",
+    "me-central-1",
+    "il-central-1",
+    "af-south-1",
 ];
 
 /// external_idp / Enterprise 号动态解析 profileArn 的多 region 探测候选。
@@ -57,8 +92,12 @@ pub const OIDC_PROBE_REGIONS: &[&str] = &[
 /// 的 region（拿到 region 与 ARN 自洽的 profile），此表作兜底补充。覆盖 Kiro 最普遍开通的 region。
 /// 将来账号在更多 region 有 profile 可继续扩充此表。
 pub const PROFILE_PROBE_REGIONS: &[&str] = &[
-    "us-east-1", "eu-central-1", "us-west-2", "eu-west-1",
-    "ap-southeast-1", "ap-northeast-1",
+    "us-east-1",
+    "eu-central-1",
+    "us-west-2",
+    "eu-west-1",
+    "ap-southeast-1",
+    "ap-northeast-1",
 ];
 
 #[cfg(test)]
@@ -83,10 +122,18 @@ mod tests {
     fn test_probe_tables_are_subset_of_dialog_whitelist() {
         // OIDC/PROFILE 探测候选都应是合法 Kiro region（在对话白名单内），否则探到也用不了。
         for r in OIDC_PROBE_REGIONS {
-            assert!(KIRO_DIALOG_REGIONS.contains(r), "OIDC 候选 {} 不在对话白名单", r);
+            assert!(
+                KIRO_DIALOG_REGIONS.contains(r),
+                "OIDC 候选 {} 不在对话白名单",
+                r
+            );
         }
         for r in PROFILE_PROBE_REGIONS {
-            assert!(KIRO_DIALOG_REGIONS.contains(r), "PROFILE 候选 {} 不在对话白名单", r);
+            assert!(
+                KIRO_DIALOG_REGIONS.contains(r),
+                "PROFILE 候选 {} 不在对话白名单",
+                r
+            );
         }
     }
 }

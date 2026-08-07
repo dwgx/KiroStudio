@@ -2,7 +2,7 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::IntoResponse,
 };
 use serde::Deserialize;
@@ -10,12 +10,11 @@ use serde::Deserialize;
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, BatchDeleteRequest, BatchDeleteResponse,
-        SetAllowedModelsRequest, SetCustomApiConfigRequest,
-        SetDisabledRequest, SetEndpointRequest,
-        SetLoadBalancingModeRequest, SetPriorityRequest,
-        SetRpmLimitRequest,
-        SuccessResponse, parse_import_keys_request,
+        AddCredentialRequest, BatchDeleteRequest, BatchDeleteResponse, CleanupDisabledRequest,
+        CloneCredentialRequest, SetAllowedModelsRequest, SetApiRegionRequest,
+        SetCustomApiConfigRequest, SetDisabledRequest, SetEndpointRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SetRpmLimitRequest, SuccessResponse,
+        parse_import_keys_request,
     },
 };
 
@@ -79,6 +78,35 @@ pub async fn set_credential_rpm_limit(
 /// POST /api/admin/credentials/:id/endpoint
 /// 固定该凭据走的端点（`ide` / `cli`）；传 null 或空串清除，回到自动路由
 /// （`ksk_` API Key 号自动走 `cli`，其余回退 `config.defaultEndpoint`）。
+/// POST /api/admin/credentials/:id/api-region  body: `{ "apiRegion": "eu-central-1" }`
+///
+/// 补运维缺口：`ksk_` 按 region 授权、打错区恒 403 且永不自愈，而此前没有任何
+/// 修改它的入口（`/regions` / `/switch-region` 都是 ARN 门控）⇒ 只能删号重建。
+pub async fn set_credential_api_region(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetApiRegionRequest>,
+) -> impl IntoResponse {
+    let requested = payload.api_region.clone();
+    match state
+        .service
+        .set_credential_api_region(id, payload.api_region)
+    {
+        Ok(_) => {
+            let msg = match requested
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(r) => format!("凭据 #{} apiRegion 已设为 {}", id, r),
+                None => format!("凭据 #{} apiRegion 已清除（回退全局 region）", id),
+            };
+            Json(SuccessResponse::new(msg)).into_response()
+        }
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 pub async fn set_credential_endpoint(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
@@ -87,7 +115,11 @@ pub async fn set_credential_endpoint(
     let requested = payload.endpoint.clone();
     match state.service.set_credential_endpoint(id, payload.endpoint) {
         Ok(_) => {
-            let msg = match requested.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let msg = match requested
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
                 Some(name) => format!("凭据 #{} 端点已固定为 {}", id, name),
                 None => format!("凭据 #{} 已恢复自动选择端点", id),
             };
@@ -104,15 +136,22 @@ pub async fn set_credential_custom_api(
     Path(id): Path<u64>,
     Json(payload): Json<SetCustomApiConfigRequest>,
 ) -> impl IntoResponse {
-    match state.service.set_custom_api_config(
-        id,
-        payload.base_url,
-        payload.api_key,
-        payload.request_limit,
-        payload.reset_count,
-    ).await {
-        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 自定义 API 配置已更新", id)))
-            .into_response(),
+    match state
+        .service
+        .set_custom_api_config(
+            id,
+            payload.base_url,
+            payload.api_key,
+            payload.request_limit,
+            payload.reset_count,
+        )
+        .await
+    {
+        Ok(_) => Json(SuccessResponse::new(format!(
+            "凭据 #{} 自定义 API 配置已更新",
+            id
+        )))
+        .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -124,11 +163,18 @@ pub async fn set_credential_allowed_models(
     Path(id): Path<u64>,
     Json(payload): Json<SetAllowedModelsRequest>,
 ) -> impl IntoResponse {
-    match state.service.set_allowed_models(id, payload.allowed_models.clone()) {
+    match state
+        .service
+        .set_allowed_models(id, payload.allowed_models.clone())
+    {
         Ok(_) => Json(SuccessResponse::new(format!(
             "凭据 #{} 允许模型白名单已更新（{} 项，空=不限制）",
             id,
-            payload.allowed_models.as_ref().map(|l| l.len()).unwrap_or(0)
+            payload
+                .allowed_models
+                .as_ref()
+                .map(|l| l.len())
+                .unwrap_or(0)
         )))
         .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
@@ -144,6 +190,19 @@ pub async fn set_credential_name(
 ) -> impl IntoResponse {
     match state.service.set_credential_name(id, payload.name.clone()) {
         Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 别名已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/tag
+/// 设置分身标签（这一份的用途标记，与 name 是账号别名不同）
+pub async fn set_credential_tag(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetTagRequest>,
+) -> impl IntoResponse {
+    match state.service.set_credential_tag(id, payload.tag.clone()) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 标签已更新", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -173,7 +232,10 @@ pub async fn purge_trash_batch(
     Json(payload): Json<PurgeTrashRequest>,
 ) -> impl IntoResponse {
     let n = state.service.purge_trash_batch(payload.ids);
-    Json(SuccessResponse::new(format!("已永久清除 {} 个回收站条目", n)))
+    Json(SuccessResponse::new(format!(
+        "已永久清除 {} 个回收站条目",
+        n
+    )))
 }
 
 #[derive(serde::Deserialize)]
@@ -181,6 +243,16 @@ pub async fn purge_trash_batch(
 pub struct SetNameRequest {
     /// 别名/备注;传 null 或空字符串清除
     pub name: Option<String>,
+}
+
+/// POST /api/admin/credentials/:id/tag 请求体。
+///
+/// ⚠️ 与 `SetProxyRequest` 不同，这里**带** `rename_all="camelCase"`（本仓惯例）。
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetTagRequest {
+    /// 分身标签;传 null 或空字符串清除
+    pub tag: Option<String>,
 }
 
 /// POST /api/admin/proxy/test 请求体。
@@ -226,27 +298,43 @@ pub async fn proxy_test(
     State(state): State<AdminState>,
     Json(payload): Json<ProxyTestRequest>,
 ) -> impl IntoResponse {
-    use crate::http_client::{build_client, split_proxy_credentials, ProxyConfig};
+    Json(
+        run_proxy_probe(
+            &state,
+            &payload.proxy_url,
+            payload.proxy_username.clone(),
+            payload.proxy_password.clone(),
+        )
+        .await,
+    )
+    .into_response()
+}
+
+/// 跑一次代理测活探针，返回结构化结果。
+///
+/// 抽出来供两个调用方共用：`/proxy/test`（临时地址）与
+/// `/socks/nodes/{id}/test`（节点表里已存的地址）。**不要各写一份** ——
+/// 探针 URL 是 SSRF 防线（请求方无法左右访问目标），复制一份必然漂移，
+/// 而漂移的那一份就是可被指使的出站。
+pub(super) async fn run_proxy_probe(
+    state: &AdminState,
+    proxy_url: &str,
+    username: Option<String>,
+    password: Option<String>,
+) -> ProxyTestResponse {
+    use crate::http_client::{ProxyConfig, build_client, split_proxy_credentials};
 
     let started = std::time::Instant::now();
 
     // 拆出干净 URL 与内嵌账密；显式字段优先覆盖内嵌账密。
-    let (clean_url, embedded_user, embedded_pass) = split_proxy_credentials(&payload.proxy_url);
+    let (clean_url, embedded_user, embedded_pass) = split_proxy_credentials(proxy_url);
     let is_direct = clean_url.is_empty() || clean_url.eq_ignore_ascii_case("direct");
 
     let proxy_config = if is_direct {
         None
     } else {
-        let username = payload
-            .proxy_username
-            .clone()
-            .filter(|s| !s.trim().is_empty())
-            .or(embedded_user);
-        let password = payload
-            .proxy_password
-            .clone()
-            .filter(|s| !s.is_empty())
-            .or(embedded_pass);
+        let username = username.filter(|s| !s.trim().is_empty()).or(embedded_user);
+        let password = password.filter(|s| !s.is_empty()).or(embedded_pass);
         let mut cfg = ProxyConfig::new(clean_url);
         if let (Some(u), Some(p)) = (username, password) {
             cfg = cfg.with_auth(u, p);
@@ -258,13 +346,12 @@ pub async fn proxy_test(
     let client = match build_client(proxy_config.as_ref(), 10, state.service.tls_backend()) {
         Ok(c) => c,
         Err(e) => {
-            return Json(ProxyTestResponse {
+            return ProxyTestResponse {
                 ok: false,
                 latency_ms: started.elapsed().as_millis() as u64,
                 exit_ip: None,
                 error: Some(format!("构建代理客户端失败: {e}")),
-            })
-            .into_response();
+            };
         }
     };
 
@@ -274,37 +361,149 @@ pub async fn proxy_test(
             let status = resp.status();
             let latency_ms = started.elapsed().as_millis() as u64;
             if !status.is_success() {
-                return Json(ProxyTestResponse {
+                return ProxyTestResponse {
                     ok: false,
                     latency_ms,
                     exit_ip: None,
                     error: Some(format!("探针返回非 2xx 状态: {status}")),
-                })
-                .into_response();
+                };
             }
             // 解析 {"ip":"..."}；解析失败不影响连通性判定，仅 exit_ip 为 None。
-            let exit_ip = resp
-                .json::<serde_json::Value>()
-                .await
-                .ok()
-                .and_then(|v| v.get("ip").and_then(|ip| ip.as_str().map(|s| s.to_string())));
-            Json(ProxyTestResponse {
+            let exit_ip = resp.json::<serde_json::Value>().await.ok().and_then(|v| {
+                v.get("ip")
+                    .and_then(|ip| ip.as_str().map(|s| s.to_string()))
+            });
+            ProxyTestResponse {
                 ok: true,
                 latency_ms,
                 exit_ip,
                 error: None,
-            })
-            .into_response()
+            }
         }
-        Err(e) => Json(ProxyTestResponse {
+        Err(e) => ProxyTestResponse {
             ok: false,
             latency_ms: started.elapsed().as_millis() as u64,
             exit_ip: None,
             // reqwest 错误可能含代理地址，保留原因文本便于诊断（不含用户密码，账密在 ProxyConfig 内）。
             error: Some(format!("代理连通失败: {e}")),
-        })
-        .into_response(),
+        },
     }
+}
+
+/// GET /api/admin/socks/nodes — 列出代理节点（密码恒不外传）
+pub async fn list_socks_nodes(State(state): State<AdminState>) -> impl IntoResponse {
+    let nodes = state.service.list_socks_nodes();
+    Json(serde_json::json!({ "total": nodes.len(), "nodes": nodes })).into_response()
+}
+
+/// POST /api/admin/socks/nodes — 新建/更新代理节点
+/// POST /api/admin/socks/nodes/bulk-import — 整段粘贴节点商文档批量导入
+///
+/// 节点商下发的是 `socks://base64(user:pass)@host:port#name`，混在含标题/分隔线/
+/// `端口: 40002`/curl 示例的文档里，同一节点还出现两次。逐条手填 5 台 = 25 个字段，
+/// 且极易把 base64 串当用户名填进去（认证失败长得像"节点不通"）。
+pub async fn bulk_import_socks_nodes(
+    State(state): State<AdminState>,
+    Json(payload): Json<super::types::SocksNodeBulkImportRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .bulk_import_socks_nodes(&payload.text, payload.enabled)
+        .await
+    {
+        Ok(out) => {
+            let (added, skipped, dup, over_cap) =
+                (out.added, out.skipped, out.duplicate, out.over_capacity);
+            let mut msg = format!("已导入 {added} 个节点");
+            if dup > 0 {
+                msg.push_str(&format!("，{dup} 个已存在（按地址去重，未覆盖原有账密）"));
+            }
+            if over_cap > 0 {
+                msg.push_str(&format!("，{over_cap} 个因超出节点数上限未导入"));
+            }
+            if skipped > 0 {
+                msg.push_str(&format!("，跳过 {skipped} 行非链接文本"));
+            }
+            if !payload.enabled {
+                msg.push_str("。默认未启用 —— 测活后再启用才会参与分身分配");
+            }
+            // 四个聚合字段逐字保留（旧客户端只读它们），`items` 是新增的逐行明细。
+            Json(serde_json::json!({
+                "added": added, "skipped": skipped, "duplicate": dup,
+                "overCapacity": over_cap, "message": msg,
+                "items": out.items,
+            }))
+            .into_response()
+        }
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+pub async fn upsert_socks_node(
+    State(state): State<AdminState>,
+    Json(payload): Json<super::types::SocksNodeUpsertRequest>,
+) -> impl IntoResponse {
+    match state.service.upsert_socks_node(payload).await {
+        Ok(id) => Json(serde_json::json!({
+            "id": id,
+            "message": format!("代理节点 #{} 已保存", id),
+        }))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// DELETE /api/admin/socks/nodes/{id} — 删除代理节点
+///
+/// **不动已绑该节点的凭据**：凭据的 `proxy_*` 是独立的绑定结果，
+/// 删节点只把它从候选池移除，否则删一个节点会让一批分身当场掉线。
+pub async fn delete_socks_node(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.delete_socks_node(id) {
+        Ok(deleted) => Json(serde_json::json!({ "deleted": deleted })).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/socks/nodes/{id}/test — 测活并写回结果
+pub async fn test_socks_node(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    let Some((url, username, password)) = state.service.socks_node_proxy(id) else {
+        let e = super::error::AdminServiceError::NotFound { id };
+        return (e.status_code(), Json(e.into_response())).into_response();
+    };
+    let result = run_proxy_probe(&state, &url, username, password).await;
+    // 写回失败不影响本次测速结果返回（结果本身是有效信息）。
+    if let Err(e) = state.service.record_socks_node_test(
+        id,
+        crate::kiro::model::socks_node::SocksNodeTest {
+            ok: result.ok,
+            latency_ms: result.latency_ms,
+            exit_ip: result.exit_ip.clone(),
+            error: result.error.clone(),
+            tested_at: chrono::Utc::now().timestamp().max(0) as u64,
+        },
+    ) {
+        tracing::warn!("写回节点 #{} 测速结果失败: {:?}", id, e);
+    }
+    Json(result).into_response()
+}
+
+/// `POST /api/admin/credentials/trash/{id}/restore` 的可选请求体。
+///
+/// 整个 body 可省略（`Option<Json<_>>`），此时 `force = false`。
+/// 加 `rename_all = "camelCase"` 与本仓多数 Admin 类型一致；
+/// 字段只有一个 `force`，两种命名恰好相同，故前端发 `{"force":true}` 即可。
+#[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreCredentialRequest {
+    /// 跳过 key 重复校验（多开分身与主凭据必然同 key）。默认 false。
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -343,13 +542,27 @@ pub async fn reset_failure_count(
     }
 }
 
-/// GET /api/admin/credentials/:id/balance
-/// 获取指定凭据的余额
+/// `GET /api/admin/credentials/:id/balance` 的查询参数。
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BalanceQuery {
+    /// `force=true` 跳过 5 分钟新鲜度缓存，**真打一次上游**。
+    ///
+    /// 存在的理由：不带它时 TTL 内连点两次拿到同一个数字、零上游往返，用户看到的就是
+    /// "刷新没反应"（这是「额度/积分刷新太慢」的一条实因）。
+    /// 仅作用于显式单号请求，无批量入口 —— 详见 `AdminService::get_balance` 的文档。
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// GET /api/admin/credentials/:id/balance[?force=true]
+/// 获取指定凭据的余额（默认走 5 分钟缓存；`force=true` 强制取上游真值）
 pub async fn get_credential_balance(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
+    Query(q): Query<BalanceQuery>,
 ) -> impl IntoResponse {
-    match state.service.get_balance(id).await {
+    match state.service.get_balance(id, q.force).await {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
@@ -411,6 +624,53 @@ pub async fn add_credential(
     }
 }
 
+/// POST /api/admin/credentials/{id}/clone
+/// 给**池中已有**的凭据再加 N 份分身。
+///
+/// 与 `POST /credentials` + `copies` 的区别只在入口：key 由服务端按 id 自己读，
+/// 一步都不经前端（分身管理页只有 `apiKeyHash` 与掩码，拿不到原文）。
+///
+/// 请求体
+/// `{ copies, enabled?, nodeIds?, assignPrimaryNode?, requireNodePerCopy?, replacePrimary? }`。
+/// **`enabled` 省略时落到配置项 `cloneDefaultEnabled`**（默认 false = 建出来是禁用的，
+/// 与普通上号默认启用相反，理由见 `CloneCredentialRequest::enabled`）。
+/// `replacePrimary` 省略 = false（保留主份，只追加分身）；`true` = 建完 N 份后把主份
+/// 软删进回收站，使组内 N 份彼此同质（见 `CloneCredentialRequest::replace_primary`）。
+/// `nodeIds` 省略 = 从节点池自动分配；给了则按顺序逐份指定（见
+/// `AddCredentialRequest::node_ids`）。
+/// `assignPrimaryNode` 省略 = **true**（本次新建的第 1 份也从池里取节点，行为不变）；
+/// `requireNodePerCopy` 省略 = false（节点不够时多出来的份直连，行为不变）。
+///
+/// 份数逻辑本身完全复用 `add_credential` 那一段实现，见
+/// [`crate::admin::service::AdminService::clone_credential`]。
+pub async fn clone_credential(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<CloneCredentialRequest>,
+) -> impl IntoResponse {
+    // 份数缺失按 1（"再加一份"是最常见用法）；上限 clamp 在 service 层，与 copies 同源。
+    //
+    // `enabled` 与 `nodeIds` **原样下传**（不在这里 `unwrap_or` / 不在这里校验节点是否
+    // 存在）：默认值与"无效 id 怎么报"的语义属于业务层，放在 service 里才有一份可测的
+    // 定义，否则这些规则会散在每个调用方手上。
+    match state
+        .service
+        .clone_credential(
+            id,
+            payload.copies.unwrap_or(1),
+            payload.enabled,
+            payload.node_ids,
+            payload.assign_primary_node,
+            payload.require_node_per_copy,
+            payload.replace_primary,
+        )
+        .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/import/keys
 /// 批量导入 Kiro API Key（`ksk_` 号）。
 ///
@@ -424,6 +684,21 @@ pub async fn import_keys(
     State(state): State<AdminState>,
     Json(payload): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    // 开关闸门：**必须在解析之前**。关闭时不解析、不入池，直接 403。
+    // 放在 handler 内而不是建路由时判：config 是热重载的（ArcSwap），
+    // 按建树时的值决定路由存在与否会让开关只在重启后生效。
+    //
+    // 两个挂载点（`/api/admin/import/keys` 与外部对接方的 `/api/import/keys`）
+    // 共用本 handler，所以这一道闸同时覆盖两者。
+    if !state.service.import_keys_enabled() {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(super::types::AdminErrorResponse::invalid_request(
+                "批量推号入口已在设置中关闭（importKeysEnabled=false）".to_string(),
+            )),
+        )
+            .into_response();
+    }
     // 手工解析而非 #[derive(Deserialize)]：4 种互斥格式 + 越界校验要区分「字段缺失」
     // 与「类型/范围非法」，serde 的 untagged 无法给出可读的 400 原因。
     let req = match parse_import_keys_request(&payload) {
@@ -489,15 +764,47 @@ pub async fn delete_credentials_batch(
     // 去重：同一 id 传两次时第二次必然失败（已从 entries 移出），会产生令人困惑的
     // "部分失败"。这是前端多选去重不严时的常见输入，在边界处收敛掉。
     let mut seen = std::collections::HashSet::new();
-    let ids: Vec<u64> = payload.ids.iter().copied().filter(|id| seen.insert(*id)).collect();
+    let ids: Vec<u64> = payload
+        .ids
+        .iter()
+        .copied()
+        .filter(|id| seen.insert(*id))
+        .collect();
 
     if payload.force {
-        tracing::warn!(count = ids.len(), "批量**强制**删除凭据（绕过先禁用门，仍进回收站）");
+        tracing::warn!(
+            count = ids.len(),
+            "批量**强制**删除凭据（绕过先禁用门，仍进回收站）"
+        );
     }
     let results = state.service.delete_credentials_batch(&ids, payload.force);
     let deleted = results.iter().filter(|r| r.ok).count();
     let failed = results.len() - deleted;
-    Json(BatchDeleteResponse { deleted, failed, results }).into_response()
+    Json(BatchDeleteResponse {
+        deleted,
+        failed,
+        results,
+    })
+    .into_response()
+}
+
+/// POST /api/admin/credentials/cleanup-disabled
+///
+/// 批量清理**已禁用**的凭据（走 `delete_credential` → 进**回收站**，可恢复）。
+/// 排除代挂号（`custom_api` / `PassthroughFailed` / `PassthroughOverloaded`）——
+/// 判据在服务端唯一收口，见 [`crate::admin::service::AdminService::cleanup_disabled_credentials`]。
+///
+/// 请求体可选：`{"dryRun": true}` 只预览不删。**体缺失/为空也接受**（等价 `dryRun=false`），
+/// 与 `restore_credential` 同款宽松语义 —— 一个不带任何参数的清理请求是最常见的用法，
+/// 不该因为少一个 `{}` 就 400。
+///
+/// 与批量删除一致：**部分失败仍返 200**，逐条标 ok/error。
+pub async fn cleanup_disabled_credentials(
+    State(state): State<AdminState>,
+    body: Option<Json<CleanupDisabledRequest>>,
+) -> impl IntoResponse {
+    let dry_run = body.map(|Json(b)| b.dry_run).unwrap_or(false);
+    Json(state.service.cleanup_disabled_credentials(dry_run))
 }
 
 /// GET /api/admin/credentials/trash
@@ -509,11 +816,17 @@ pub async fn list_trash(State(state): State<AdminState>) -> impl IntoResponse {
 
 /// POST /api/admin/credentials/trash/:id/restore
 /// 从回收站恢复凭据（恢复为禁用态，id 不变）
+///
+/// 请求体可选 `{"force": true}`：跳过 key 重复校验，用于恢复**多开分身**
+/// （分身与主凭据必然同 key，不给这个出口的话删掉的分身永远恢复不了）。
+/// 请求体缺失/为空时 `force = false`，保留误操作护栏。
 pub async fn restore_credential(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
+    body: Option<Json<RestoreCredentialRequest>>,
 ) -> impl IntoResponse {
-    match state.service.restore_credential(id) {
+    let force = body.map(|Json(b)| b.force).unwrap_or(false);
+    match state.service.restore_credential(id, force) {
         Ok(_) => Json(SuccessResponse::new(format!(
             "凭据 #{} 已从回收站恢复（当前为禁用态，可手动启用）",
             id
@@ -541,7 +854,8 @@ pub async fn purge_credential(
 
 /// POST /api/admin/credentials/:id/refresh
 /// 强制刷新凭据 Token
-pub async fn force_refresh_token(    State(state): State<AdminState>,
+pub async fn force_refresh_token(
+    State(state): State<AdminState>,
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     match state.service.force_refresh_token(id).await {
@@ -561,11 +875,7 @@ pub async fn deep_verify_credential(
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     match state.service.deep_verify_credential(id).await {
-        Ok(_) => Json(SuccessResponse::new(format!(
-            "凭据 #{} 验活通过",
-            id
-        )))
-        .into_response(),
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 验活通过", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -693,11 +1003,9 @@ pub async fn recovery_metrics() -> impl IntoResponse {
 // ============ 网页上号（Social OAuth）============
 
 use super::service::PollResult;
-use super::types::{
-    PollSocialLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse,
-};
+use super::types::{PollSocialLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse};
 use crate::kiro::auth::social::OAuthCallbackData;
-use axum::extract::Query;
+// `Query` 已在文件顶部的 axum::extract 里导入（余额端点的 force 参数用它）。
 use std::collections::HashMap;
 
 /// POST /api/admin/auth/social/start
@@ -761,12 +1069,18 @@ pub async fn social_callback(
     use axum::response::Html;
 
     // 有 error 参数 → 失败页
-    if let Some(err) = params.get("error_description").or_else(|| params.get("error")) {
+    if let Some(err) = params
+        .get("error_description")
+        .or_else(|| params.get("error"))
+    {
         let body = format!(
             "<html><head><meta charset='utf-8'><title>登录失败</title></head><body style='font-family:sans-serif;text-align:center;padding:60px'><h2>&#10007; 登录失败</h2><p>{}</p><p style='color:#888;font-size:13px'>请关闭此标签页并重试。</p></body></html>",
             html_escape(err)
         );
-        return ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], Html(body));
+        return (
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            Html(body),
+        );
     }
 
     let code = params.get("code").cloned().unwrap_or_default();
@@ -789,7 +1103,10 @@ pub async fn social_callback(
     } else {
         "<html><head><meta charset='utf-8'><title>登录异常</title></head><body style='font-family:sans-serif;text-align:center;padding:60px'><h2>登录会话未匹配</h2><p>可能已超时，请返回 Admin UI 重新发起。</p></body></html>".to_string()
     };
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], Html(body))
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        Html(body),
+    )
 }
 
 /// 极简 HTML 转义，避免回调错误信息注入
@@ -825,7 +1142,12 @@ pub async fn start_idc_login(
     }
     match state
         .service
-        .start_idc_login(&payload.start_url, region, payload.priority, payload.proxy_url)
+        .start_idc_login(
+            &payload.start_url,
+            region,
+            payload.priority,
+            payload.proxy_url,
+        )
         .await
     {
         Ok(result) => Json(serde_json::json!({
@@ -881,10 +1203,11 @@ pub async fn start_external_idp_login(
     State(state): State<AdminState>,
     Json(payload): Json<StartExternalIdpLoginRequest>,
 ) -> impl IntoResponse {
-    match state
-        .service
-        .start_external_idp_login(payload.priority, payload.proxy_url, payload.region)
-    {
+    match state.service.start_external_idp_login(
+        payload.priority,
+        payload.proxy_url,
+        payload.region,
+    ) {
         Ok(result) => Json(serde_json::json!({
             "sessionId": result.session_id,
             "signinUrl": result.signin_url,
@@ -1097,4 +1420,34 @@ pub async fn perform_update(
 pub struct UpdatePerformRequest {
     #[serde(default)]
     pub version: Option<String>,
+}
+
+#[cfg(test)]
+mod guard_tests {
+    /// ⭐ 源码级守卫：推号开关的闸门必须在 `parse_import_keys_request` **之前**。
+    ///
+    /// ⚠️ 名字里的 "body_parse" 指的是**解析成导入项**那一步，**不是**读请求体：
+    /// handler 签名是 `Json(payload): Json<Value>`，axum 提取器先于函数体运行，
+    /// 所以字节早已被读完并反序列化。本守卫保证的是「不解析成导入项、不碰号池」。
+    ///
+    /// 单测覆盖不到（handler 需要完整 AdminState + 真实号池），故用源码断言。
+    ///
+    /// 回退即 FAIL：把 `import_keys_enabled()` 那道 `if` 移到
+    /// `parse_import_keys_request` 之后 —— 那样开关虽然仍会返 403，但**已经解析并
+    /// 校验过一批 key**，等于关掉开关后仍为对接方做一遍工作；若将来有人在解析处
+    /// 加副作用（写日志/落库/去重表），关掉的入口就会继续产生副作用。
+    #[test]
+    fn import_keys_gate_precedes_body_parse() {
+        let src = include_str!("handlers.rs");
+        // needle 运行时拼接：写成完整字面量会被 include_str! 读到自己而多算一处。
+        let gate = format!("{}{}", "state.service.import_keys_enabled", "()");
+        let parse = format!("{}{}", "parse_import_keys_request", "(&payload)");
+
+        let gate_at = src.find(gate.as_str()).expect("推号开关闸门不应被改名");
+        let parse_at = src.find(parse.as_str()).expect("解析调用点不应被改名");
+        assert!(
+            gate_at < parse_at,
+            "开关闸门必须在解析请求体之前，否则关掉入口后仍会为对接方解析并校验一批 key"
+        );
+    }
 }

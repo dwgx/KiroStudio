@@ -102,7 +102,10 @@ fn get_or_create_key(key_path: &Path) -> anyhow::Result<[u8; 32]> {
                     );
                 });
             }
-            tracing::info!("已生成 at-rest 加密密钥文件: {:?}(0600,勿删,勿随 credentials 导出)", key_path);
+            tracing::info!(
+                "已生成 at-rest 加密密钥文件: {:?}(0600,勿删,勿随 credentials 导出)",
+                key_path
+            );
             Ok(candidate)
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -110,7 +113,11 @@ fn get_or_create_key(key_path: &Path) -> anyhow::Result<[u8; 32]> {
             let bytes = std::fs::read(key_path)
                 .map_err(|e| anyhow::anyhow!("竞态后回读密钥文件失败 {:?}: {e}", key_path))?;
             if bytes.len() != 32 {
-                anyhow::bail!("密钥文件 {:?} 长度异常({} 字节,应 32)", key_path, bytes.len());
+                anyhow::bail!(
+                    "密钥文件 {:?} 长度异常({} 字节,应 32)",
+                    key_path,
+                    bytes.len()
+                );
             }
             Ok(key_from_slice(&bytes))
         }
@@ -128,7 +135,11 @@ fn read_existing_key(key_path: &Path) -> anyhow::Result<[u8; 32]> {
         )
     })?;
     if bytes.len() != 32 {
-        anyhow::bail!("密钥文件 {:?} 长度异常({} 字节,应 32),无法解密。", key_path, bytes.len());
+        anyhow::bail!(
+            "密钥文件 {:?} 长度异常({} 字节,应 32),无法解密。",
+            key_path,
+            bytes.len()
+        );
     }
     Ok(key_from_slice(&bytes))
 }
@@ -224,7 +235,10 @@ mod tests {
         let (ct, encd) = encode_for_disk(plain, true, &kp);
         assert!(encd, "应真加密");
         assert!(is_encrypted(&ct), "密文应带 magic 前缀");
-        assert!(!ct.windows(plain.len()).any(|w| w == plain), "密文不应含明文");
+        assert!(
+            !ct.windows(plain.len()).any(|w| w == plain),
+            "密文不应含明文"
+        );
         assert!(kp.exists(), "首次加密应创建密钥文件");
         let back = maybe_decrypt_to_string(&ct, &kp).unwrap();
         assert_eq!(back.as_bytes(), plain, "解密应还原明文");
@@ -305,7 +319,10 @@ mod tests {
         let (ct, _) = encode_for_disk(b"data", true, &kp);
         std::fs::remove_file(&kp).unwrap();
         let err = maybe_decrypt_to_string(&ct, &kp).unwrap_err();
-        assert!(err.to_string().contains("密钥文件"), "错误应指明密钥文件问题");
+        assert!(
+            err.to_string().contains("密钥文件"),
+            "错误应指明密钥文件问题"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -315,7 +332,10 @@ mod tests {
         let (mut ct, _) = encode_for_disk(b"important", true, &kp);
         let last = ct.len() - 1;
         ct[last] ^= 0xff;
-        assert!(maybe_decrypt_to_string(&ct, &kp).is_err(), "篡改的密文应解密失败");
+        assert!(
+            maybe_decrypt_to_string(&ct, &kp).is_err(),
+            "篡改的密文应解密失败"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
