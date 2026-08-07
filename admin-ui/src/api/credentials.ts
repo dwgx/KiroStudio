@@ -199,6 +199,12 @@ export async function setCredentialDeepseekNormalize(
   return data
 }
 
+// 探测代挂上游的可用模型列表（GET /credentials/{id}/upstream-models，custom_api 专属）。
+export async function probeUpstreamModels(id: number): Promise<string[]> {
+  const { data } = await api.get<{ models: string[] }>(`/credentials/${id}/upstream-models`)
+  return data.models ?? []
+}
+
 // 设置凭据别名/备注（传空字符串清除）
 export async function setCredentialName(
   id: number,

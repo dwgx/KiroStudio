@@ -806,6 +806,30 @@ impl AdminService {
             .map_err(|e| self.classify_error(e, id))
     }
 
+    /// 探测代挂凭据上游的可用模型列表（`GET {base_url}/v1/models`，OpenAI 兼容格式）。
+    ///
+    /// 现实约束：模型只能从上游获取，不硬编码。结果供前端展示 + 勾选写入 allowed_models。
+    /// 仅 custom_api 代挂号有意义；SSRF 防护走 `build_streaming_client_no_redirect`（禁重定向）。
+    pub async fn probe_upstream_models(&self, id: u64) -> Result<Vec<String>, AdminServiceError> {
+        let cred = self
+            .token_manager
+            .export_credential(id)
+            .ok_or(AdminServiceError::NotFound { id })?;
+        if !cred.is_custom_api_credential() {
+            return Err(AdminServiceError::InvalidCredential(
+                "仅 custom_api 代挂凭据可探测上游模型".to_string(),
+            ));
+        }
+        let cfg = self.token_manager.config();
+        let proxy = cfg
+            .proxy_url
+            .as_deref()
+            .map(|u| crate::http_client::ProxyConfig::new(u.to_string()));
+        crate::kiro::passthrough::fetch_upstream_models(&cred, proxy.as_ref(), cfg.tls_backend)
+            .await
+            .map_err(|e| AdminServiceError::UpstreamError(e.to_string()))
+    }
+
     pub fn set_credential_endpoint(
         &self,
         id: u64,

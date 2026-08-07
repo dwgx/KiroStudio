@@ -2903,6 +2903,7 @@ impl MultiTokenManager {
     pub fn select_custom_api(
         &self,
         exclude: &std::collections::HashSet<u64>,
+        model: Option<&str>,
     ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
         let cooldown_on = self.cooldown_enabled.load(Ordering::Relaxed);
@@ -2913,6 +2914,9 @@ impl MultiTokenManager {
                     && e.credentials.is_custom_api_credential()
                     && !exclude.contains(&e.id)
                     && (!cooldown_on || self.cooldown.is_available(e.id))
+                    // 模型白名单硬门（与 Kiro 路径同款）：设了 allowed_models 且当前模型不在其中
+                    // → 过滤掉；model 为空（无模型语义的调用）放行。
+                    && model.is_none_or(|m| e.credentials.allows_model(m))
             })
             // 均衡分流键(升序):优先级 → 近 60s RPM → 在途。rpm 用独立 mutex,与 Kiro balanced 同款模式。
             .min_by_key(|e| {
@@ -9631,7 +9635,7 @@ mod tests {
 
         let empty = HashSet::new();
         // 初选:priority 最小(0)的 #1/#2 之一(同级按 RPM 均衡,初始 RPM 全 0 → 取 id 最小 #1)。
-        let first = mgr.select_custom_api(&empty).expect("应选到 custom_api 号");
+        let first = mgr.select_custom_api(&empty, None).expect("应选到 custom_api 号");
         assert!(
             first.0 == 1 || first.0 == 2,
             "应先选 priority=0 的号,得到 #{}",
@@ -9643,14 +9647,14 @@ mod tests {
         ex.insert(1);
         ex.insert(2);
         let third = mgr
-            .select_custom_api(&ex)
+            .select_custom_api(&ex, None)
             .expect("排除两个 prio0 后应选 #3");
         assert_eq!(third.0, 3, "failover 应落到 priority=1 的 #3");
 
         // 全部排除 → None(上层据此落 Kiro 主力路径)。
         ex.insert(3);
         assert!(
-            mgr.select_custom_api(&ex).is_none(),
+            mgr.select_custom_api(&ex, None).is_none(),
             "全部 custom_api 排除后应返回 None"
         );
     }
@@ -9690,7 +9694,7 @@ mod tests {
             "偶尔/连续 429 无论持续多久都不得禁用代挂号"
         );
         assert!(
-            mgr.select_custom_api(&HashSet::new()).is_some(),
+            mgr.select_custom_api(&HashSet::new(), None).is_some(),
             "429 不得进入惩罚系统：号必须仍可被选中（旧代码 429=>30s 惩罚性冷却，此处会是 None）"
         );
         // 边界说明：provider 的透传 failover 另有一个 **5s 调度级跳过**（不进 health、不计失败、
@@ -9954,7 +9958,7 @@ mod tests {
         // 给 #1 设冷却(模拟它 403 额度满被 failover 冷却)→ 选号应跳过 #1 选 #2。
         mgr.cooldown_custom_api(1, 180);
         let empty = HashSet::new();
-        let sel = mgr.select_custom_api(&empty).expect("应选到未冷却的 #2");
+        let sel = mgr.select_custom_api(&empty, None).expect("应选到未冷却的 #2");
         assert_eq!(sel.0, 2, "#1 冷却中,应选 #2");
     }
 

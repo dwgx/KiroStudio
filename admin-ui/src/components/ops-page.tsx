@@ -175,6 +175,7 @@ function formatUptime(ms: number): string {
 
 // 实时日志卡收缩状态持久化 key（纯前端偏好,localStorage 直存,与 use-ui-layout-prefs 同 try/catch 惯例）。
 const LOGVIEWER_COLLAPSED_KEY = 'ops.logviewer.collapsed'
+const LOGVIEWER_LIVE_KEY = 'ops.logviewer.live'
 
 const LEVEL_COLORS: Record<string, string> = {
   ERROR: 'text-red-400',
@@ -1276,7 +1277,14 @@ const LogViewer = memo(function LogViewer({ focusToken = 0, focusTerm = '' }: { 
   const { t } = useTranslation()
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [level, setLevel] = useState<LevelFilter>('INFO')
-  const [live, setLive] = useState(true)
+  // 实时开关从 localStorage 恢复（暂停状态跨会话保留）：'0' = 暂停，其它/缺失 = 实时。
+  const [live, setLive] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(LOGVIEWER_LIVE_KEY) !== '0'
+    } catch {
+      return true
+    }
+  })
   const [connected, setConnected] = useState(false)
   const [downloading, setDownloading] = useState(false)
   // 关键字搜索（匹配 message + target，大小写不敏感）。
@@ -1565,7 +1573,17 @@ const LogViewer = memo(function LogViewer({ focusToken = 0, focusTerm = '' }: { 
           <Button
             variant={live ? 'default' : 'outline'}
             size="sm"
-            onClick={() => setLive((v) => !v)}
+            onClick={() =>
+              setLive((v) => {
+                const next = !v
+                try {
+                  localStorage.setItem(LOGVIEWER_LIVE_KEY, next ? '1' : '0')
+                } catch {
+                  /* 隐私模式/配额满:偏好写失败不影响功能 */
+                }
+                return next
+              })
+            }
             className="h-7 gap-1 px-2 text-xs"
             title={live && !connected ? t('opspage.log.reconnectingTip') : undefined}
           >
