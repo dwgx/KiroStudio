@@ -188,6 +188,17 @@ export async function setCredentialApiRegion(
   return data
 }
 
+// 设置代挂凭据的 deepseek 协议归一化开关（仅 custom_api 有意义，后端 gate 拒绝其它类型）。
+export async function setCredentialDeepseekNormalize(
+  id: number,
+  deepseekNormalize: boolean
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/deepseek-normalize`, {
+    deepseekNormalize,
+  })
+  return data
+}
+
 // 设置凭据别名/备注（传空字符串清除）
 export async function setCredentialName(
   id: number,

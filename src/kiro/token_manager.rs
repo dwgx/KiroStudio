@@ -1651,6 +1651,8 @@ pub struct CredentialEntrySnapshot {
     pub request_limit: Option<u64>,
     /// 自定义 API 代挂:累计已发请求数
     pub request_count: u64,
+    /// 自定义 API 代挂:deepseek 协议归一化开关(None=false)
+    pub deepseek_normalize: Option<bool>,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
     /// Token 过期时间
@@ -5966,6 +5968,7 @@ impl MultiTokenManager {
                     base_url: e.credentials.base_url.clone(),
                     request_limit: e.credentials.request_limit,
                     request_count: e.request_count,
+                    deepseek_normalize: e.credentials.deepseek_normalize,
                     has_profile_arn: e.credentials.profile_arn.is_some(),
                     expires_at: if e.credentials.is_api_key_credential() {
                         None // API Key 凭据本地不维护过期时间（服务端策略未知）
@@ -6132,6 +6135,31 @@ impl MultiTokenManager {
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             entry.credentials.api_region = cleaned;
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 设置代挂凭据的 deepseek 协议归一化开关（`deepseekNormalize`）。
+    ///
+    /// 只对 `custom_api` 代挂号有意义（passthrough 路径按它决定是否先归一化再转发）；
+    /// 非 custom_api 凭据设置它没有效果，直接拒绝以免误导。`None` = 清除（关闭）。
+    /// 写盘走 `persist_credentials`（与其它凭据级 setter 同款），立即生效无需重启。
+    pub fn set_credential_deepseek_normalize(
+        &self,
+        id: u64,
+        enabled: Option<bool>,
+    ) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            if !entry.credentials.is_custom_api_credential() {
+                anyhow::bail!("deepseek 归一化仅对 custom_api 代挂凭据有意义");
+            }
+            entry.credentials.deepseek_normalize = enabled;
         }
         self.persist_credentials()?;
         Ok(())

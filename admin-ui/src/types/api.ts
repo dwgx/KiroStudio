@@ -22,6 +22,8 @@ export interface CredentialStatusItem {
   requestLimit?: number
   /** 自定义 API 代挂:累计已发请求数 */
   requestCount?: number
+  /** 自定义 API 代挂:deepseek 协议归一化开关 */
+  deepseekNormalize?: boolean
   /** 「允许模型」白名单（成本安全硬门；空/缺省 = 不限制） */
   allowedModels?: string[]
   /** 「测试可用模型」历史结果（探测打的标签） */
@@ -250,6 +252,8 @@ export interface AddCredentialRequest {
   baseUrl?: string
   apiKey?: string
   requestLimit?: number
+  /** 自定义 API 代挂:deepseek 协议归一化开关（创建时设；改凭据走 deepseek-normalize 端点） */
+  deepseekNormalize?: boolean
 }
 
 /**

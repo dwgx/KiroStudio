@@ -54,6 +54,9 @@ pub struct CredentialStatusItem {
     /// 自定义 API 代挂:累计已发请求数
     #[serde(default)]
     pub request_count: u64,
+    /// 自定义 API 代挂:deepseek 协议归一化开关（None=false；前端展示/开关用）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deepseek_normalize: Option<bool>,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
     /// refreshToken 的 SHA-256 哈希（仅 OAuth 凭据，用于前端去重）
@@ -366,6 +369,20 @@ pub struct SetCustomApiConfigRequest {
     /// 是否归零调用次数(换上游/换 key 时前端可勾选,避免旧计数残留触顶)。
     #[serde(default)]
     pub reset_count: bool,
+}
+
+/// 设置代挂凭据 deepseek 协议归一化开关的请求。
+///
+/// deepseek 归一化：开启后透传前按 fuckopencode 的 deepseek 协议修复改写请求体
+/// （模型名→deepseek-v4-flash、thinking adaptive→enabled、reasoning_effort→output_config、
+/// 多轮 tool_use 注入 thinking、剥 context_management 等），仅对 custom_api 代挂号有意义。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetDeepseekNormalizeRequest {
+    /// true=开启;false=关闭。null 默认按 false 处理（Rust Option<bool> 反序列化 null → None，
+    /// 这里显式 Option 让前端可传 null 表示关闭）。
+    #[serde(default)]
+    pub deepseek_normalize: Option<bool>,
 }
 
 /// 设置凭据级「允许模型」白名单的请求（成本安全硬门；空/null = 不限制）
