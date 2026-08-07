@@ -33,7 +33,14 @@ import {
 } from '@/lib/credential-format'
 import { DiagnosisCard } from '@/components/diagnosis-card'
 import { CredentialRowBody } from '@/components/credential-row'
-import { enableOverage, disableOverage, setCredentialName, setCredentialProxy } from '@/api/credentials'
+import {
+  enableOverage,
+  disableOverage,
+  setCredentialName,
+  setCredentialProxy,
+  setCredentialAllowedModels,
+  probeUpstreamModels,
+} from '@/api/credentials'
 import { authShortLabel, disabledReasonLabel, subscriptionLabel } from '@/lib/i18n-labels'
 import {
   useSetDisabled,
@@ -139,6 +146,11 @@ export function CredentialCard({
   const [customRequestLimit, setCustomRequestLimit] = useState(credential.requestLimit ?? 0)
   const [customResetCount, setCustomResetCount] = useState(false)
   const [customDeepseek, setCustomDeepseek] = useState(credential.deepseekNormalize ?? false)
+  // 上游模型探测：模型只能从上游获取（不硬编码）。探测结果 + 勾选（写 allowed_models）。
+  const [upstreamModels, setUpstreamModels] = useState<string[] | null>(null)
+  const [probeLoading, setProbeLoading] = useState(false)
+  const [probeError, setProbeError] = useState('')
+  const [upstreamSelected, setUpstreamSelected] = useState<Set<string>>(new Set())
   const [savingCustomApi, setSavingCustomApi] = useState(false)
 
   // 刷新 Token 失败诊断（结构化，如 client 过期引导重新上号）。
@@ -248,6 +260,41 @@ export function CredentialCard({
       toast.error(t('credentialcard.toast.saveFailed') + (err as Error).message)
     } finally {
       setSavingCustomApi(false)
+    }
+  }
+
+  // 探测代挂上游可用模型：模型只能从上游获取，网关不硬编码。结果填充 checkbox 供勾选。
+  const handleProbeUpstream = async () => {
+    if (!customBaseUrl.trim()) {
+      toast.error(t('credentialcard.toast.baseUrlRequired'))
+      return
+    }
+    setProbeLoading(true)
+    setProbeError('')
+    try {
+      const models = await probeUpstreamModels(credential.id)
+      setUpstreamModels(models)
+      if (models.length === 0) {
+        setProbeError(t('credentialcard.toast.upstreamNoModels'))
+      }
+      // 初始勾选 = 当前已设的白名单（若已存在）。
+      setUpstreamSelected(new Set(credential.allowedModels ?? []))
+    } catch (err) {
+      setUpstreamModels(null)
+      setProbeError(extractErrorMessage(err))
+    } finally {
+      setProbeLoading(false)
+    }
+  }
+
+  // 保存勾选的模型白名单（复用现有 allowed_models 硬门；空 = 不限制）。
+  const handleSaveUpstreamModels = async () => {
+    try {
+      await setCredentialAllowedModels(credential.id, Array.from(upstreamSelected))
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      toast.success(t('credentialcard.toast.allowedModelsSaved'))
+    } catch (err) {
+      toast.error(extractErrorMessage(err))
     }
   }
 
@@ -1077,6 +1124,64 @@ export function CredentialCard({
                   />
                   {t('credentialcard.settings.deepseekNormalizeLabel')}
                 </label>
+
+                {/* 上游模型探测：模型只能从上游获取（不硬编码）。探测结果勾选 = allowed_models 白名单。 */}
+                <div className="space-y-1.5 border-t pt-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <label className="text-xs text-muted-foreground">
+                      {t('credentialcard.settings.upstreamModelsLabel')}
+                    </label>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-7 text-xs"
+                      onClick={handleProbeUpstream}
+                      disabled={probeLoading}
+                    >
+                      {probeLoading ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <RefreshCw className="h-3.5 w-3.5" />
+                      )}
+                      <span className="ml-1">{t('credentialcard.settings.probeUpstream')}</span>
+                    </Button>
+                  </div>
+                  {probeError && <p className="text-xs text-red-400">{probeError}</p>}
+                  {upstreamModels && (
+                    <>
+                      <div className="max-h-40 overflow-y-auto rounded-md border border-border/60 p-2">
+                        {upstreamModels.map((m) => (
+                          <label
+                            key={m}
+                            className="flex cursor-pointer items-center gap-2 py-0.5 text-xs"
+                          >
+                            <Checkbox
+                              checked={upstreamSelected.has(m)}
+                              onCheckedChange={(v) => {
+                                setUpstreamSelected((prev) => {
+                                  const next = new Set(prev)
+                                  if (v) next.add(m)
+                                  else next.delete(m)
+                                  return next
+                                })
+                              }}
+                              className="h-3.5 w-3.5"
+                            />
+                            <span className="min-w-0 truncate font-mono">{m}</span>
+                          </label>
+                        ))}
+                      </div>
+                      <Button
+                        size="sm"
+                        className="h-7 w-full text-xs"
+                        onClick={handleSaveUpstreamModels}
+                      >
+                        <Check className="mr-1 h-3.5 w-3.5" />
+                        {t('credentialcard.settings.saveUpstreamModels')}
+                      </Button>
+                    </>
+                  )}
+                </div>
                 <label className="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
                   <Checkbox
                     checked={customResetCount}

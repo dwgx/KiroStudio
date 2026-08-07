@@ -156,6 +156,81 @@ pub async fn forward(
     (resp, status)
 }
 
+/// 探测自定义 API 上游的可用模型列表（`GET {base}/v1/models`，OpenAI 兼容格式）。
+///
+/// 兼容三种响应形态：`{data:[{id}]}`（OpenAI 标准）、`{models:[...]}`（字符串或对象数组）、
+/// 纯数组 `[string]`。排序去重后返回。
+///
+/// base_url 与 [`forward`] 同源（含 `/v1` 则不重复拼），SSRF 防护走
+/// `build_streaming_client_no_redirect`（禁重定向），写入 base_url 时的 IP 校验在 admin 层已做。
+pub async fn fetch_upstream_models(
+    cred: &KiroCredentials,
+    global_proxy: Option<&crate::http_client::ProxyConfig>,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<Vec<String>> {
+    let base = cred
+        .base_url
+        .as_deref()
+        .filter(|b| !b.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("自定义 API 凭据缺少 base_url"))?;
+    let base = base.trim_end_matches('/');
+    let url = if base.ends_with("/v1") || base.contains("/v1/") {
+        format!("{base}/models")
+    } else {
+        format!("{base}/v1/models")
+    };
+
+    let proxy = cred.effective_proxy(global_proxy);
+    let client = build_streaming_client_no_redirect(proxy.as_ref(), 30, tls_backend)?;
+    let mut req = client.get(&url);
+    if let Some(key) = cred.api_key.as_deref().filter(|k| !k.is_empty()) {
+        req = req.header("Authorization", format!("Bearer {key}"));
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("请求上游模型列表失败: {e}"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("上游返回 {} 获取模型列表失败", resp.status());
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| anyhow::anyhow!("解析上游模型列表失败: {e}"))?;
+
+    let mut models: Vec<String> = Vec::new();
+    // {data:[{id}]}（OpenAI 标准）
+    if let Some(data) = body.get("data").and_then(|v| v.as_array()) {
+        for m in data {
+            if let Some(id) = m.get("id").and_then(|x| x.as_str()) {
+                models.push(id.to_string());
+            }
+        }
+    }
+    // {models:[...]}（字符串数组或对象数组）
+    if let Some(arr) = body.get("models").and_then(|v| v.as_array()) {
+        for m in arr {
+            if let Some(s) = m.as_str() {
+                models.push(s.to_string());
+            } else if let Some(id) = m.get("id").and_then(|x| x.as_str()) {
+                models.push(id.to_string());
+            }
+        }
+    }
+    // 纯数组 [string]
+    if let Some(arr) = body.as_array() {
+        for m in arr {
+            if let Some(s) = m.as_str() {
+                models.push(s.to_string());
+            }
+        }
+    }
+
+    models.sort();
+    models.dedup();
+    Ok(models)
+}
+
 /// 构建一个 Anthropic 风格的错误响应(供透传失败时返回)。
 fn err_response(status: StatusCode, msg: &str) -> Response {
     let body = serde_json::json!({

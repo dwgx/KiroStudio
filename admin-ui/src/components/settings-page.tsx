@@ -1426,6 +1426,39 @@ function TrashCard() {
   const [confirm, setConfirm] = useState<TrashConfirm | null>(null)
   const [busy, setBusy] = useState(false)
 
+  // 回收站分页 + 搜索 + 每页大小（100/200，localStorage 持久）。
+  // 后端返回全量 trash，前端做过滤/分页——回收站通常几百条，全量铺 DOM 会卡。
+  const [trashSearch, setTrashSearch] = useState('')
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState<number>(() => {
+    try {
+      const n = parseInt(localStorage.getItem('ops.trash.pageSize') ?? '', 10)
+      return n === 100 || n === 200 ? n : 200
+    } catch {
+      return 200
+    }
+  })
+  // 过滤：匹配 id / email / authMethod / 掩码 key / 禁用原因。
+  const filteredList = useMemo(() => {
+    const q = trashSearch.trim().toLowerCase()
+    if (!q) return list
+    return list.filter(
+      (item) =>
+        String(item.id).includes(q) ||
+        (item.email ?? '').toLowerCase().includes(q) ||
+        (item.authMethod ?? '').toLowerCase().includes(q) ||
+        (item.maskedApiKey ?? '').toLowerCase().includes(q) ||
+        (item.disabledReason ?? '').toLowerCase().includes(q)
+    )
+  }, [list, trashSearch])
+  // 分页切片。page 越界时 clamp 到最后一页（搜索词变化后 page 可能失效）。
+  const pageCount = Math.max(1, Math.ceil(filteredList.length / pageSize))
+  const safePage = Math.min(page, pageCount)
+  const pagedList = useMemo(
+    () => filteredList.slice((safePage - 1) * pageSize, safePage * pageSize),
+    [filteredList, safePage, pageSize]
+  )
+
   const allChecked = list.length > 0 && selected.size === list.length
   const someChecked = selected.size > 0 && !allChecked
 
@@ -1590,8 +1623,53 @@ function TrashCard() {
               </div>
             </div>
 
+            {/* 搜索 + 每页大小 + 计数（回收站几百条时全量铺 DOM 会卡，前端分页） */}
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="relative w-full max-w-xs">
+                <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  value={trashSearch}
+                  onChange={(e) => {
+                    setTrashSearch(e.target.value)
+                    setPage(1)
+                  }}
+                  placeholder={t('settingspage.trash.searchPlaceholder')}
+                  className="h-8 pl-8 text-xs"
+                  aria-label={t('settingspage.trash.searchAria')}
+                />
+              </div>
+              <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                <span>{t('settingspage.trash.perPage')}</span>
+                <select
+                  value={pageSize}
+                  onChange={(e) => {
+                    const n = Number(e.target.value)
+                    setPageSize(n)
+                    setPage(1)
+                    try {
+                      localStorage.setItem('ops.trash.pageSize', String(n))
+                    } catch {
+                      /* 隐私模式:偏好写失败不影响功能 */
+                    }
+                  }}
+                  className="h-8 rounded-md border border-input bg-background px-1.5 text-xs"
+                >
+                  <option value={100}>100</option>
+                  <option value={200}>200</option>
+                </select>
+                <span className="tabular-nums">
+                  {t('settingspage.trash.pageInfo', {
+                    from: filteredList.length === 0 ? 0 : (safePage - 1) * pageSize + 1,
+                    to: Math.min(safePage * pageSize, filteredList.length),
+                    total: filteredList.length,
+                  })}
+                </span>
+              </div>
+            </div>
+
+            {/* 当前页列表 */}
             <div>
-              {list.map((item) => (
+              {pagedList.map((item) => (
                 <TrashRow
                   key={item.id}
                   item={item}
@@ -1603,6 +1681,31 @@ function TrashCard() {
                 />
               ))}
             </div>
+
+            {/* 分页导航（多于 1 页才显示） */}
+            {pageCount > 1 && (
+              <div className="flex items-center justify-center gap-2 pt-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={safePage <= 1}
+                  onClick={() => setPage(safePage - 1)}
+                >
+                  {t('settingspage.common.prev')}
+                </Button>
+                <span className="text-xs text-muted-foreground tabular-nums">
+                  {t('settingspage.trash.pageNav', { page: safePage, pages: pageCount })}
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={safePage >= pageCount}
+                  onClick={() => setPage(safePage + 1)}
+                >
+                  {t('settingspage.common.next')}
+                </Button>
+              </div>
+            )}
           </>
         )}
       </CardContent>

@@ -774,7 +774,7 @@ impl KiroProvider {
         // 注:model/user_id 暂不参与 custom_api 选号(代挂上游自行处理模型),仅随 meta 供埋点关联。
         let mut excluded: HashSet<u64> = HashSet::new();
         loop {
-            let (id, cred) = match self.token_manager.select_custom_api(&excluded) {
+            let (id, cred) = match self.token_manager.select_custom_api(&excluded, model) {
                 Some(x) => x,
                 // 无更多可用 custom_api 号:①一开始就没(excluded 空)→ 池里无透传号,零开销落 Kiro;
                 // ②都试过失败(excluded 非空)→ custom_api 全额度满/失败,failover 落 Kiro 主力。

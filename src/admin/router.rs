@@ -14,8 +14,8 @@ use super::{
         get_cached_balances, get_config, get_credential_balance, get_load_balancing_mode,
         get_overage_status, import_keys, list_socks_nodes, list_trash, perform_update,
         poll_idc_login, poll_social_login, probe_available_models, probe_regions, proxy_test,
-        purge_credential, purge_trash_batch, recovery_metrics, reset_failure_count,
-        restart_service, restore_credential, set_credential_allowed_models,
+        probe_upstream_models, purge_credential, purge_trash_batch, recovery_metrics,
+        reset_failure_count, restart_service, restore_credential, set_credential_allowed_models,
         set_credential_api_region, set_credential_custom_api,
         set_credential_deepseek_normalize, set_credential_disabled,
         set_credential_endpoint, set_credential_name, set_credential_priority,
@@ -105,6 +105,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/credentials/{id}/deepseek-normalize",
             post(set_credential_deepseek_normalize),
         )
+        // 代挂凭据探测上游可用模型（custom_api 专属）。
+        .route("/credentials/{id}/upstream-models", get(probe_upstream_models))
         .route("/credentials/{id}/name", post(set_credential_name))
         .route("/credentials/{id}/tag", post(set_credential_tag))
         // 给已有号再加 N 份分身。刻意按 id 而不是让前端重发 key：

@@ -107,6 +107,17 @@ pub async fn set_credential_api_region(
     }
 }
 
+/// GET /api/admin/credentials/:id/upstream-models —— 探测代挂上游可用模型列表（custom_api 专属）。
+pub async fn probe_upstream_models(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.probe_upstream_models(id).await {
+        Ok(models) => Json(serde_json::json!({ "models": models })).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/credentials/:id/deepseek-normalize  body: `{ "deepseekNormalize": true }`
 ///
 /// 设置代挂凭据的 deepseek 协议归一化开关（仅 custom_api 有意义；非 custom_api 后端 gate 拒绝）。
