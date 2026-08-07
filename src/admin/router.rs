@@ -16,7 +16,8 @@ use super::{
         poll_idc_login, poll_social_login, probe_available_models, probe_regions, proxy_test,
         purge_credential, purge_trash_batch, recovery_metrics, reset_failure_count,
         restart_service, restore_credential, set_credential_allowed_models,
-        set_credential_api_region, set_credential_custom_api, set_credential_disabled,
+        set_credential_api_region, set_credential_custom_api,
+        set_credential_deepseek_normalize, set_credential_disabled,
         set_credential_endpoint, set_credential_name, set_credential_priority,
         set_credential_proxy, set_credential_rpm_limit, set_credential_tag,
         set_load_balancing_mode, social_callback, start_external_idp_login, start_idc_login,
@@ -98,6 +99,11 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/credentials/{id}/api-region",
             post(set_credential_api_region),
+        )
+        // 代挂凭据的 deepseek 协议归一化开关（仅 custom_api 有意义）。
+        .route(
+            "/credentials/{id}/deepseek-normalize",
+            post(set_credential_deepseek_normalize),
         )
         .route("/credentials/{id}/name", post(set_credential_name))
         .route("/credentials/{id}/tag", post(set_credential_tag))

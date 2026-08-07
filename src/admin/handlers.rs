@@ -12,9 +12,9 @@ use super::{
     types::{
         AddCredentialRequest, BatchDeleteRequest, BatchDeleteResponse, CleanupDisabledRequest,
         CloneCredentialRequest, SetAllowedModelsRequest, SetApiRegionRequest,
-        SetCustomApiConfigRequest, SetDisabledRequest, SetEndpointRequest,
-        SetLoadBalancingModeRequest, SetPriorityRequest, SetRpmLimitRequest, SuccessResponse,
-        parse_import_keys_request,
+        SetCustomApiConfigRequest, SetDeepseekNormalizeRequest, SetDisabledRequest,
+        SetEndpointRequest, SetLoadBalancingModeRequest, SetPriorityRequest, SetRpmLimitRequest,
+        SuccessResponse, parse_import_keys_request,
     },
 };
 
@@ -100,6 +100,31 @@ pub async fn set_credential_api_region(
             {
                 Some(r) => format!("凭据 #{} apiRegion 已设为 {}", id, r),
                 None => format!("凭据 #{} apiRegion 已清除（回退全局 region）", id),
+            };
+            Json(SuccessResponse::new(msg)).into_response()
+        }
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/deepseek-normalize  body: `{ "deepseekNormalize": true }`
+///
+/// 设置代挂凭据的 deepseek 协议归一化开关（仅 custom_api 有意义；非 custom_api 后端 gate 拒绝）。
+pub async fn set_credential_deepseek_normalize(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetDeepseekNormalizeRequest>,
+) -> impl IntoResponse {
+    let enabled = payload.deepseek_normalize.unwrap_or(false);
+    match state
+        .service
+        .set_credential_deepseek_normalize(id, payload.deepseek_normalize)
+    {
+        Ok(_) => {
+            let msg = if enabled {
+                format!("凭据 #{} deepseek 归一化已开启", id)
+            } else {
+                format!("凭据 #{} deepseek 归一化已关闭", id)
             };
             Json(SuccessResponse::new(msg)).into_response()
         }

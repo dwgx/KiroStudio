@@ -42,6 +42,7 @@ import {
   useSetCustomApiConfig,
   useSetCredentialEndpoint,
   useSetCredentialApiRegion,
+  useSetCredentialDeepseekNormalize,
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
@@ -137,6 +138,7 @@ export function CredentialCard({
   const [customApiKeyInput, setCustomApiKeyInput] = useState('')
   const [customRequestLimit, setCustomRequestLimit] = useState(credential.requestLimit ?? 0)
   const [customResetCount, setCustomResetCount] = useState(false)
+  const [customDeepseek, setCustomDeepseek] = useState(credential.deepseekNormalize ?? false)
   const [savingCustomApi, setSavingCustomApi] = useState(false)
 
   // 刷新 Token 失败诊断（结构化，如 client 过期引导重新上号）。
@@ -152,6 +154,7 @@ export function CredentialCard({
   const setCustomApiConfig = useSetCustomApiConfig()
   const setEndpoint = useSetCredentialEndpoint()
   const setApiRegion = useSetCredentialApiRegion()
+  const setDeepseekNormalize = useSetCredentialDeepseekNormalize()
   // 可选端点由后端注册表给出（config.endpointNames），不在前端硬编码 ide/cli——
   // 后端加了新端点，面板自动多一个按钮。
   const configSnapshot = useConfigSnapshot()
@@ -1051,6 +1054,29 @@ export function CredentialCard({
                     aria-label={t('credentialcard.settings.requestLimitAria')}
                   />
                 </div>
+                {/* deepseek 协议归一化：开启后透传前修复请求体（模型名→deepseek-v4-flash、
+                    thinking/effort 归一化、多轮 thinking 注入等），兼容 opencodezen 类上游。
+                    即时保存（开关变化即调后端，不并入「保存自定义 API」按钮）。 */}
+                <label className="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+                  <Checkbox
+                    checked={customDeepseek}
+                    onCheckedChange={(v) => {
+                      const next = v === true
+                      setCustomDeepseek(next)
+                      setDeepseekNormalize.mutate(
+                        { id: credential.id, enabled: next },
+                        {
+                          onSuccess: () => toast.success(t('credentialcard.toast.deepseekSaved')),
+                          onError: (err) =>
+                            toast.error(t('credentialcard.toast.operationFailed') + (err as Error).message),
+                        }
+                      )
+                    }}
+                    className="h-3.5 w-3.5"
+                    aria-label={t('credentialcard.settings.deepseekNormalizeAria')}
+                  />
+                  {t('credentialcard.settings.deepseekNormalizeLabel')}
+                </label>
                 <label className="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
                   <Checkbox
                     checked={customResetCount}

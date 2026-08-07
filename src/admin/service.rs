@@ -580,6 +580,7 @@ impl AdminService {
                     base_url: entry.base_url,
                     request_limit: entry.request_limit,
                     request_count: entry.request_count,
+                    deepseek_normalize: entry.deepseek_normalize,
                     has_profile_arn: entry.has_profile_arn,
                     refresh_token_hash: entry.refresh_token_hash,
                     api_key_hash: entry.api_key_hash,
@@ -791,6 +792,17 @@ impl AdminService {
     ) -> Result<(), AdminServiceError> {
         self.token_manager
             .set_credential_api_region(id, api_region)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 设置代挂凭据的 deepseek 协议归一化开关（仅 custom_api 有意义，见 token_manager 对应方法）。
+    pub fn set_credential_deepseek_normalize(
+        &self,
+        id: u64,
+        enabled: Option<bool>,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_credential_deepseek_normalize(id, enabled)
             .map_err(|e| self.classify_error(e, id))
     }
 
