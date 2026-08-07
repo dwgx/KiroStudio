@@ -180,7 +180,12 @@ impl KiroEndpoint for IdeEndpoint {
 fn inject_profile_arn(request_body: &str, profile_arn: &Option<String>) -> String {
     if let Some(arn) = profile_arn {
         if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(request_body) {
-            json["profileArn"] = serde_json::Value::String(arn.clone());
+            // 用 as_object_mut 而非 `json["profileArn"] = …`：后者是 serde_json 的 IndexMut，
+            // 对非对象 JSON（数组/标量）会 panic（"cannot access key ... in JSON"）。
+            // 与 cli.rs 的 inject_cli_agent_fields 同款安全模式：非对象原样透传。
+            if let Some(obj) = json.as_object_mut() {
+                obj.insert("profileArn".to_string(), serde_json::Value::String(arn.clone()));
+            }
             if let Ok(body) = serde_json::to_string(&json) {
                 return body;
             }
@@ -238,5 +243,22 @@ mod tests {
         let arn = Some("arn:test".to_string());
         let result = inject_profile_arn(body, &arn);
         assert_eq!(result, "not-valid-json");
+    }
+
+    /// 回归：非对象 JSON（数组/标量/字符串）不得 panic，必须原样透传。
+    ///
+    /// `json["profileArn"] = …` 走 serde_json 的 IndexMut，对非容器值会 panic
+    /// （"cannot access key ... in JSON"）。与 cli.rs 的 inject_cli_agent_fields
+    /// 同款安全模式：as_object_mut 在非对象上返回 None，不注入即透传。
+    #[test]
+    fn test_inject_profile_arn_non_object_passthrough() {
+        let arn = Some("arn:aws:codewhisperer:us-east-1:1:profile/X".to_string());
+        for body in [r#"[{"a":1}]"#, "42", r#""hi""#] {
+            assert_eq!(
+                inject_profile_arn(body, &arn),
+                body,
+                "非对象 JSON 必须原样透传且不 panic: {body}"
+            );
+        }
     }
 }

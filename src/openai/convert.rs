@@ -347,6 +347,24 @@ fn build_user_or_assistant(role: &str, m: &Value) -> Option<Value> {
                 }
             }
         }
+        // legacy `function_call`(单对象):翻成 tool_use,id 用函数名 —— 必须与
+        // [`build_legacy_function_result`] 用 name 当 call_id 对齐,否则函数结果在
+        // [`normalize_tool_pairing_and_merge`] 里因无对应 tool_use 被双双丢弃,整段函数调用丢失。
+        if let Some(fc) = m.get("function_call") {
+            let name = fc.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if !name.is_empty() {
+                let id = sanitize_tool_id(name);
+                let input = fc
+                    .get("arguments")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                    .filter(|v| v.is_object())
+                    .unwrap_or_else(|| json!({}));
+                content
+                    .push(json!({"type": "tool_use", "id": id, "name": name, "input": input}));
+            }
+        }
     }
 
     // assistant 只有 tool_use 没文本时,content 已含 tool_use;user 空内容则跳过发一条空块防呆。
@@ -414,6 +432,20 @@ fn tool_result_content(content: Option<&Value>) -> Value {
     }
 }
 
+/// 从 OpenAI 的 `image_url` 字段里取出 URL 字符串。
+///
+/// 兼容两种形态：`{"image_url": "https://…"}`（字符串）与 `{"image_url": {"url": "https://…"}}`（对象）。
+/// 只认对象形态会静默丢掉字符串形态的图片（部分客户端/框架发字符串形态，responses 路径本就认字符串，
+/// 两条路径不一致属同一类缺陷）。
+fn extract_image_url(image_url: &Value) -> Option<String> {
+    image_url.as_str().map(String::from).or_else(|| {
+        image_url
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    })
+}
+
 /// OpenAI content part → Anthropic 块(text / image_url / file)。
 fn openai_content_part_to_anthropic(part: &Value) -> Option<Value> {
     match part.get("type").and_then(|v| v.as_str()) {
@@ -424,10 +456,9 @@ fn openai_content_part_to_anthropic(part: &Value) -> Option<Value> {
         Some("image_url") => {
             let url = part
                 .get("image_url")
-                .and_then(|u| u.get("url"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            image_url_to_anthropic(url)
+                .and_then(extract_image_url)
+                .unwrap_or_default();
+            image_url_to_anthropic(&url)
         }
         Some("file") => {
             let data = part
@@ -911,10 +942,12 @@ fn build_responses_message(role_hint: &str, item: &Value) -> Option<Value> {
                     Some("input_image") => {
                         let url = p
                             .get("image_url")
-                            .and_then(|v| v.as_str())
-                            .or_else(|| p.get("url").and_then(|v| v.as_str()))
-                            .unwrap_or("");
-                        if let Some(b) = image_url_to_anthropic(url) {
+                            .and_then(extract_image_url)
+                            .or_else(|| {
+                                p.get("url").and_then(|v| v.as_str()).map(String::from)
+                            })
+                            .unwrap_or_default();
+                        if let Some(b) = image_url_to_anthropic(&url) {
                             content.push(b);
                             inferred_role.get_or_insert("user");
                         }
@@ -2044,6 +2077,43 @@ mod tests {
     }
 
     #[test]
+    fn test_request_legacy_function_call_roundtrip() {
+        // 回归:legacy function role 此前是坏的 —— assistant 的 function_call 不被转成 tool_use,
+        // 后续 function role 的结果(tool_use_id=函数名)因无对应 tool_use 被配对归一丢弃,
+        // 整段函数调用对模型不可见。这里要求两端都存活且能配对。
+        let raw = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "天气?"},
+                {"role": "assistant", "content": null,
+                 "function_call": {"name": "get_weather", "arguments": "{\"city\":\"NYC\"}"}},
+                {"role": "function", "name": "get_weather", "content": "sunny"}
+            ]
+        });
+        let a = openai_chat_to_anthropic("m", &raw, false);
+        let msgs = a["messages"].as_array().unwrap();
+        // assistant 的 function_call → tool_use(id = 函数名)
+        let tu = msgs[1]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["type"] == "tool_use")
+            .unwrap_or_else(|| panic!("function_call 未被转成 tool_use,msgs={msgs:?}"));
+        assert_eq!(tu["id"], "get_weather");
+        assert_eq!(tu["name"], "get_weather");
+        assert_eq!(tu["input"]["city"], "NYC");
+        // function role 结果 → tool_result,与 tool_use 配对成功(未被归一丢弃)
+        let tr = msgs[2]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["type"] == "tool_result")
+            .unwrap_or_else(|| panic!("function 结果未被保留,msgs={msgs:?}"));
+        assert_eq!(tr["tool_use_id"], "get_weather");
+        assert_eq!(tr["content"], "sunny");
+    }
+
+    #[test]
     fn test_request_tool_role_to_tool_result() {
         // 配对输入(assistant 先声明 tool_use call_abc)。
         let raw = json!({
@@ -2134,6 +2204,57 @@ mod tests {
         assert_eq!(block["source"]["type"], "base64");
         assert_eq!(block["source"]["media_type"], "image/jpeg");
         assert_eq!(block["source"]["data"], "QUJD");
+    }
+
+    #[test]
+    fn test_request_image_url_string_form_not_dropped() {
+        // 回归:image_url 只认对象形态时,字符串形态被静默丢弃(图片从多模态请求里消失)。
+        let raw = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": "https://example.com/a.png"}
+            ]}]
+        });
+        let a = openai_chat_to_anthropic("m", &raw, false);
+        let block = &a["messages"][0]["content"][0];
+        assert_eq!(block["type"], "image", "字符串形态的 image_url 必须产出 image 块");
+        assert_eq!(block["source"]["type"], "url");
+        assert_eq!(block["source"]["url"], "https://example.com/a.png");
+        // 对象形态仍正常(回归不误伤)。
+        let raw2 = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "https://example.com/b.png"}}
+            ]}]
+        });
+        let a2 = openai_chat_to_anthropic("m", &raw2, false);
+        assert_eq!(a2["messages"][0]["content"][0]["source"]["url"], "https://example.com/b.png");
+    }
+
+    #[test]
+    fn test_responses_input_image_object_form_not_dropped() {
+        // 回归:Responses input_image 若客户端复用 chat 形态({image_url:{url:...}})也会被丢,
+        // 与 chat 路径同源(只认一种形态)。对象形态也必须产出 image 块。
+        let raw = json!({
+            "model": "m",
+            "input": [{"type": "message", "role": "user", "content": [
+                {"type": "input_image", "image_url": {"url": "data:image/jpeg;base64,QUJD"}}
+            ]}]
+        });
+        let a = openai_responses_to_anthropic("m", &raw, false);
+        let block = &a["messages"][0]["content"][0];
+        assert_eq!(block["type"], "image");
+        assert_eq!(block["source"]["type"], "base64");
+        assert_eq!(block["source"]["data"], "QUJD");
+        // 字符串形态仍正常(回归不误伤,Responses 原生形态)。
+        let raw2 = json!({
+            "model": "m",
+            "input": [{"type": "message", "role": "user", "content": [
+                {"type": "input_image", "image_url": "data:image/png;base64,QUJD"}
+            ]}]
+        });
+        let a2 = openai_responses_to_anthropic("m", &raw2, false);
+        assert_eq!(a2["messages"][0]["content"][0]["source"]["data"], "QUJD");
     }
 
     #[test]

@@ -778,6 +778,7 @@ const OUTCOME_LABEL_KEYS: Record<RequestOutcome, string> = {
   server_error: 'usagepage.outcome.serverError',
   bad_request: 'usagepage.outcome.badRequest',
   network_error: 'usagepage.outcome.networkError',
+  model_unavailable: 'usagepage.outcome.modelUnavailable',
   other_error: 'usagepage.outcome.otherError',
 }
 

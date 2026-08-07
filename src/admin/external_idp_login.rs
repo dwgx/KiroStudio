@@ -475,6 +475,10 @@ impl ExternalIdpLoginManager {
             let s = sessions
                 .get(session_id)
                 .ok_or_else(|| anyhow!("外部 IdP 上号会话不存在或已过期"))?;
+            // 与 submit_leg1/submit_leg2 一致：会话超过 TTL 视为过期，禁止再建号。
+            if s.created_at.elapsed().as_secs() > SESSION_TTL_SECS {
+                bail!("外部 IdP 上号会话已超时，请重新发起");
+            }
             let pending = s
                 .pending
                 .clone()

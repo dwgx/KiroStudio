@@ -147,6 +147,32 @@ export interface RecoveryMetrics {
   absorbBudgetExhausted?: number
   /** 因 403 临时风控开关关闭而跳过吸收的次数。 */
   absorbSuspendSkipped?: number
+  /**
+   * 号池给出的真实恢复时刻 > 我们愿意睡的上限(`upstreamRetryAbsorbMaxDelaySecs`)。
+   * 睡醒了池子还在冷却,这一轮结构上必然拿回同一个错误。与 budget 耗尽的区别:
+   * 该调的是 maxDelay 而非 budget,两者旋钮相反。
+   */
+  absorbBackoffTruncated?: number
+  /** 跨轮总额度 `ABSOLUTE_MAX_TOTAL_RETRIES` 用尽:每请求硬上限,抬任何吸收旋钮都无效。 */
+  absorbRetryQuotaExhausted?: number
+  /** 吸收轮次归因:池冷却类(睡完退避并重打了一轮)。 */
+  absorbRoundsPoolCooldown?: number
+  /** 吸收轮次归因:上游 429 限流类。 */
+  absorbRoundsRateLimit?: number
+  /** 吸收轮次归因:换号空窗类。 */
+  absorbRoundsSwapWindow?: number
+  /** 吸收轮次归因:5xx 服务错误类。 */
+  absorbRoundsServerError?: number
+  /** 吸收轮次归因:容量 400 类。 */
+  absorbRoundsCapacity400?: number
+  /** 5xx 类被分类出来但开关未开而没吸收(与 absorbRoundsServerError 一起看才知道开了会救回多少)。 */
+  absorbServerErrorSkipped?: number
+  /** 容量 400 类被分类出来但开关未开而没吸收。 */
+  absorbCapacity400Skipped?: number
+  /** 被**网关自己**的入站整形准入闸门超时挡在门外、上游根本没被请求过的客户端请求数。 */
+  inboundAdmissionTimeouts?: number
+  /** MCP/WebSearch 工具调用路径的失败请求数(此前失败出口零埋点,面板不可见)。 */
+  mcpFailures?: number
 }
 
 export async function getRecoveryMetrics(): Promise<RecoveryMetrics> {

@@ -46,6 +46,8 @@ export interface CredentialStatusItem {
   proxyUrl?: string
   refreshFailureCount: number
   disabledReason?: string
+  /** 被禁用的时刻（RFC3339）。与 disabledReason 成对下发，用于展示"这号坏了多久"。 */
+  disabledAt?: string
   /** **实际生效**的端点名（含自动路由与默认回退），如 "ide" / "cli"。 */
   endpoint: string
   /** 该端点是否被用户显式固定。false = 系统自动推断（ksk_ 号自动走 cli，其余回退全局默认）。 */
@@ -426,6 +428,8 @@ export interface ConfigSnapshotResponse {
   endpointNames: string[]
   extractThinking: boolean
   ccAutoBuffer: boolean
+  /** 影子缓存记账：是否把估算的 prompt cache 命中下发给客户端（默认 true）。 */
+  promptCacheEnabled: boolean
   /** 批量推号入口 POST /api/import/keys 是否启用（默认**开**：端点先于开关存在，
       外部 kiro-accounting 正在用；关掉后两个挂载点一起返 403）。 */
   importKeysEnabled: boolean
@@ -451,6 +455,8 @@ export interface ConfigSnapshotResponse {
   cooldownEnabled: boolean
   /** 账户级 403 风控连续 N 次零成功后自动禁用该号。默认开。 */
   autoDisableSuspicious: boolean
+  /** 分身（clone）新建时默认是否启用（默认 false = 建出来是禁用的）。 */
+  cloneDefaultEnabled: boolean
   allCoolingFastFail: boolean
   rateLimitEnabled: boolean
   rateLimitDailyMax: number
@@ -521,6 +527,8 @@ export interface ConfigSnapshotResponse {
   proactiveTokenRefresh: boolean
   tokenRefreshLeadMinutes: number
   tokenRefreshIntervalSecs: number
+  // 后台温和余额刷新间隔（秒；0 = 禁用）
+  balanceRefreshIntervalSecs: number
   // Admin UI 登录页：是否显示随机背景图（立即生效，无需重启）。缺省视为开启。
   loginBackgroundEnabled?: boolean
   // Admin UI 登录页：背景图是否走 R18 图源（立即生效，无需重启）。缺省视为开启。
@@ -544,6 +552,7 @@ export interface UpdateConfigRequest {
   extractThinking?: boolean
   ccAutoBuffer?: boolean
   importKeysEnabled?: boolean
+  promptCacheEnabled?: boolean
   // 上游 429 吸收层
   upstreamRetryAbsorbEnabled?: boolean
   upstreamRetryAbsorbBudgetSecs?: number
@@ -563,6 +572,7 @@ export interface UpdateConfigRequest {
   encryptCredentialsAtRest?: boolean
   cooldownEnabled?: boolean
   autoDisableSuspicious?: boolean
+  cloneDefaultEnabled?: boolean
   allCoolingFastFail?: boolean
   rateLimitEnabled?: boolean
   rateLimitDailyMax?: number
@@ -604,6 +614,8 @@ export interface UpdateConfigRequest {
   proactiveTokenRefresh?: boolean
   tokenRefreshLeadMinutes?: number
   tokenRefreshIntervalSecs?: number
+  // 后台温和余额刷新间隔（秒；0 = 禁用）
+  balanceRefreshIntervalSecs?: number
   // Admin UI 登录页：显示背景图开关（立即生效，无需重启）
   loginBackgroundEnabled?: boolean
   // Admin UI 登录页：R18 图源开关（立即生效，无需重启）
@@ -738,6 +750,7 @@ export type RequestOutcome =
   | 'server_error'
   | 'bad_request'
   | 'network_error'
+  | 'model_unavailable'
   | 'other_error'
 
 // ============ 运维：存储统计 / 清理（对接 GET /storage/stats, POST /storage/cleanup） ============

@@ -160,6 +160,10 @@ counters! {
     // 限流(重试只是把同一个请求塞回同一个已满的桶)。两者混在一个桶里会让人把网关的背压
     // 误判成上游风控,进而去调**错**的旋钮(调 credentialRpmLimit 而不是 inboundTargetRpm)。
     inbound_admission_timeouts: bump_inbound_admission_timeout,
+    // MCP/WebSearch 工具调用路径的失败请求数(provider.rs call_mcp_with_retry 的失败出口)。
+    // 此前 MCP 只有成功分支 emit_record,失败 bail 零埋点 ⇒ 失败在面板上不可见。
+    // 与 failover_exhausted 分离:那是 Kiro 对话路径的池耗尽,混在一个桶里无法归因。
+    mcp_failures: bump_mcp_failure,
 }
 
 #[cfg(test)]

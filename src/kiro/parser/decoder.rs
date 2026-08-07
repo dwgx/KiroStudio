@@ -457,4 +457,68 @@ mod tests {
         // 终止态后再次迭代应立即返回 None（不再产出）
         assert!(decoder.decode_iter().next().is_none());
     }
+
+    /// 确定性 xorshift64*（不引入外部依赖），保证测试可复现。
+    fn lcg_seeded(seed: u64) -> impl FnMut() -> u64 {
+        let mut s = seed;
+        move || {
+            s ^= s >> 12;
+            s ^= s << 25;
+            s ^= s >> 27;
+            s.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+    }
+
+    /// 审计：随机畸形输入不得 panic（`try_recover` / `parse_frame` / `parse_headers`
+    /// 全部走边界检查，任何输入只能产出 Ok/Err，且 drain 必须在有界步数内终止）。
+    #[test]
+    fn fuzz_random_bytes_never_panics() {
+        let mut rng = lcg_seeded(0x1234_5678_9abc_def0);
+        for _ in 0..2000 {
+            let len = (rng() % 300) as usize;
+            let buf: Vec<u8> = (0..len).map(|_| (rng() & 0xff) as u8).collect();
+
+            let mut decoder = EventStreamDecoder::new();
+            decoder.feed(&buf).unwrap();
+            let mut steps = 0usize;
+            for result in decoder.decode_iter() {
+                let _ = result;
+                steps += 1;
+                assert!(steps < 1000, "drain 必须有界（每次错误至少推进 1 字节）");
+            }
+        }
+    }
+
+    /// 审计：prelude 合法（CRC 通过）但头部/payload/Message CRC 随机构造的帧不得 panic，
+    /// 必须覆盖 `MessageCrcMismatch` / `HeaderParseFailed` 两条恢复路径。
+    #[test]
+    fn fuzz_valid_prelude_malformed_body_never_panics() {
+        use super::super::crc::crc32;
+        let mut rng = lcg_seeded(0xdead_beef_cafe_f00d);
+        for _ in 0..2000 {
+            let payload_len = (rng() % 400) as u32;
+            let header_len = (rng() % 64) as u32;
+            // total >= PRELUDE_SIZE(12) + 0 + 0 + 4 = 16 = MIN_MESSAGE_SIZE，天然合法
+            let total = PRELUDE_SIZE as u32 + header_len + payload_len + 4;
+
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&total.to_be_bytes());
+            buf.extend_from_slice(&header_len.to_be_bytes());
+            let prelude_crc = crc32(&buf[..8]);
+            buf.extend_from_slice(&prelude_crc.to_be_bytes());
+            for _ in 0..(total as usize - PRELUDE_SIZE - 4) {
+                buf.push((rng() & 0xff) as u8);
+            }
+            // 随机一半帧 Message CRC 合法、一半损坏，覆盖两个分支
+            let msg_crc = crc32(&buf);
+            let crc = if rng() & 1 == 0 { msg_crc } else { msg_crc ^ 0xffff_ffff };
+            buf.extend_from_slice(&crc.to_be_bytes());
+
+            let mut decoder = EventStreamDecoder::new();
+            decoder.feed(&buf).unwrap();
+            for result in decoder.decode_iter() {
+                let _ = result;
+            }
+        }
+    }
 }

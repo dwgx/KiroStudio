@@ -589,14 +589,27 @@ async fn main() {
             // 启动即受管，admin 改 balanceRefreshIntervalSecs 后 abort+respawn 即时生效不重启。
             admin_state.service.respawn_balance_task();
 
+            // admin 树的 body 上限：axum 默认 2MiB 会卡住批量推号（/import/keys）——
+            // 批量导入一次可含上千个 ksk_ key，体量远超 2MiB。与 /v1 同口径复用
+            // max_body_bytes（0 = 不限制，与 anthropic/router.rs 的语义一致；若这里
+            // 直接 DefaultBodyLimit::max(0) 会把所有非空 body 全 413，故必须走同样的分支）。
+            let admin_body_limit = if config.max_body_bytes == 0 {
+                axum::extract::DefaultBodyLimit::disable()
+            } else {
+                axum::extract::DefaultBodyLimit::max(config.max_body_bytes)
+            };
+
             // 兼容别名路由必须在 admin_app 之前建（后者会 move 掉 admin_state）。
             // 只含 POST /import/keys 一个端点，鉴权与 admin 树一致，见
             // create_import_alias_router 的说明。
-            let import_alias_app = admin::create_import_alias_router(admin_state.clone());
+            let import_alias_app =
+                admin::create_import_alias_router(admin_state.clone()).layer(admin_body_limit);
 
-            let admin_app = admin::create_admin_router(admin_state);
+            let admin_app =
+                admin::create_admin_router(admin_state).layer(admin_body_limit);
 
             // 创建 Admin UI 路由
+            //（纯 GET：静态资源 + 背景图端点，无请求体，不需要 body limit layer）
             let admin_ui_app = admin_ui::create_admin_ui_router();
 
             tracing::info!("Admin API 已启用");
@@ -754,7 +767,12 @@ async fn main() {
     .await
     {
         DrainOutcome::Drained(r) => {
-            r.unwrap();
+            if let Err(e) = r {
+                // serve() 的 IO 错误（如监听套接字在停机瞬间失效）不该 panic——
+                // panic 会绕过下方托盘退出的 exit(3) 与优雅停机收尾。记录后走统一的失败退出路径。
+                tracing::error!("serve 结束但返回错误: {:#}", e);
+                std::process::exit(1);
+            }
             tracing::info!("在途请求已全部 drain 完毕");
         }
         DrainOutcome::CapReached => {
@@ -973,6 +991,16 @@ fn bind_listener(addr: &str) -> anyhow::Result<tokio::net::TcpListener> {
 static TRAY_QUIT_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// 用量明细保留天数下限钳到 0。
+///
+/// 负值会让 `trace_db::retention_cleanup` 的 cutoff 落到未来
+/// （`DELETE WHERE ts_ms < now - keep_days*86400000`，负 keep_days → cutoff 在未来）
+/// → 启动即清空整张 traces 表，且 interval 首 tick 立即触发。与
+/// `admin::service::cleanup_traces` 的 `.max(0)` 口径一致。
+fn clamp_retention_days(days: i64) -> i64 {
+    days.max(0)
+}
+
 /// 装配用量统计管道：打开 SQLite、构造 JSONL 统计、冷启动重放、启动保留清理任务。
 ///
 /// 任一 sink 初始化失败都不致命——记录告警并退化（返回 None 或跳过该 sink），
@@ -1010,7 +1038,7 @@ fn init_usage_pipeline(config: &Config) -> Option<UsageHandles> {
     ]);
 
     // 保留清理任务：启动清理一次 + 每 6 小时清理一次过期明细
-    let retention_days = config.usage_retention_days;
+    let retention_days = clamp_retention_days(config.usage_retention_days);
     let cleanup_db = trace_db.clone();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
@@ -1056,6 +1084,18 @@ fn init_usage_pipeline(config: &Config) -> Option<UsageHandles> {
 mod shutdown_tests {
     use super::*;
     use std::time::Duration;
+
+    /// ⭐ 回归：负的 `usage_retention_days` 必须被钳到 0，否则 `retention_cleanup` 的
+    /// cutoff 落到未来 → DELETE WHERE ts_ms < 未来 → 启动即清空整张 traces 表。
+    /// 回退即 FAIL：把 `clamp_retention_days` 里的 `.max(0)` 去掉（或改负值直接透传）。
+    #[test]
+    fn clamp_retention_days_never_negative() {
+        assert_eq!(clamp_retention_days(-30), 0, "负值必须钳到 0，否则清空全部 traces");
+        assert_eq!(clamp_retention_days(-1), 0);
+        assert_eq!(clamp_retention_days(0), 0);
+        assert_eq!(clamp_retention_days(30), 30, "正常保留天数不得被改动");
+        assert_eq!(clamp_retention_days(1), 1);
+    }
 
     /// 测试用宽限期：毫秒级，走真实时钟（避免为一个测试引入 tokio `test-util` feature）。
     const TEST_CAP: Duration = Duration::from_millis(120);

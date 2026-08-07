@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::kiro::model::events::Event;
+use crate::kiro::model::events::{Event, ReasoningContentEvent};
 use crate::usage::RequestOutcome;
 
 /// 一次响应的**完成状态**，贯穿流式 / 缓冲 / 非流式三条收尾路径。
@@ -1184,6 +1184,12 @@ pub struct StreamContext {
     pub credits_used: Option<f64>,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
+    /// 出站工具名映射 (tool_use_id -> 还原后的 Claude Code 名)。
+    ///
+    /// 供 `generate_final_events` 的截断兜底用：残留 `tool_input_sent`（流在 stop 前结束）
+    /// 需要把 Kiro 参数还原成客户端形态，而兜底路径没有 `ToolUseEvent` 只有 id —— 必须从
+    /// 这里查名字。正常 stop 路径直接拿 `tool_use.name`，不依赖本 map。
+    tool_use_names: HashMap<String, String>,
     /// 每个 tool_use_id 已经转发给客户端的 input JSON 累计内容。
     ///
     /// 用于修复 `Invalid tool parameters`：Kiro 的 `ToolUseEvent.input` 在同一 tool_use_id 上
@@ -1203,6 +1209,12 @@ pub struct StreamContext {
     pub thinking_extracted: bool,
     /// thinking 块索引
     pub thinking_block_index: Option<i32>,
+    /// 上游 `reasoningContentEvent` 携带的思考签名（若有）。
+    ///
+    /// 关闭 thinking 块时优先回传它 —— Foxfishc 实测（Round 6, 2026-05-13）：
+    /// 「伪造签名不被上游识别，cache_read 仍 0」；真签名是多轮 cache 命中的关键。
+    /// 若上游不发（`None`），`create_signature_delta_event` 回退占位符，行为与改动前逐字节一致。
+    pub pending_reasoning_signature: Option<String>,
     /// 文本块索引（thinking 启用时动态分配）
     pub text_block_index: Option<i32>,
     /// 是否需要剥离 thinking 内容开头的换行符
@@ -1361,6 +1373,7 @@ impl StreamContext {
             output_tokens: 0,
             credits_used: None,
             tool_block_indices: HashMap::new(),
+            tool_use_names: HashMap::new(),
             tool_input_sent: HashMap::new(),
             tool_name_map,
             thinking_enabled,
@@ -1368,6 +1381,7 @@ impl StreamContext {
             in_thinking_block: false,
             thinking_extracted: false,
             thinking_block_index: None,
+            pending_reasoning_signature: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
             dsml_tail_buffer: String::new(),
@@ -1524,7 +1538,7 @@ impl StreamContext {
             // ⭐ E1：上游的**结构化** thinking 增量流。此前落 EventType::Unknown 被丢弃，
             // 我们转而从正文里嗅探 `<thinking>` 标签把边界猜回来（见 process_thinking_content）。
             // 现在直接用上游给的边界，不再猜。
-            Event::ReasoningContent(reasoning) => self.process_reasoning_content(&reasoning.text),
+            Event::ReasoningContent(reasoning) => self.process_reasoning_content(&reasoning),
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
                 let window_size = get_context_window_size(&self.model);
@@ -2644,7 +2658,16 @@ impl StreamContext {
     /// 上游不发"思考结束"信号（`reasoningContentEvent` 是纯增量，没有终止帧），
     /// 收尾统一由 `generate_final_events` 处理（它会补 signature_delta + content_block_stop）——
     /// 与嗅探路径遇不到 `</thinking>` 时的收尾走同一条路，不新增第二套收尾逻辑。
-    fn process_reasoning_content(&mut self, text: &str) -> Vec<SseEvent> {
+    fn process_reasoning_content(&mut self, reasoning: &ReasoningContentEvent) -> Vec<SseEvent> {
+        // 缓存上游真签名（若有）：关闭 thinking 块时 `create_signature_delta_event` 优先回传它。
+        // Foxfishc 实测「伪造签名不被识别，cache_read 仍 0」——真签名是多轮 cache 命中的关键。
+        // 上游不发则保持 None，收尾回退占位符，行为与改动前逐字节一致。
+        if let Some(sig) = reasoning.signature.as_deref() {
+            if !sig.is_empty() {
+                self.pending_reasoning_signature = Some(sig.to_string());
+            }
+        }
+        let text = &reasoning.text;
         // thinking 未开启（客户端没要 thinking）→ 本帧不下发。
         // 不能当正文发：那会把模型的内部推理混进用户可见回答里。
         //
@@ -2781,9 +2804,17 @@ impl StreamContext {
     /// 创建 signature_delta 事件
     ///
     /// thinking 块流式结束前（`content_block_stop` 之前）必须发一个 signature_delta，
-    /// 携带非空占位签名，满足客户端 thinking 模式下的本地校验。详见
+    /// 携带非空签名，满足客户端 thinking 模式下的本地校验。详见
     /// [`THINKING_SIGNATURE_PLACEHOLDER`]。
-    fn create_signature_delta_event(&self, index: i32) -> SseEvent {
+    ///
+    /// 优先回传**上游真签名**（若本流收到过 `reasoningContentEvent` 且带 `signature`）：
+    /// Foxfishc 实测「伪造签名不被上游识别，cache_read 仍 0」，真签名是多轮 cache 命中的关键。
+    /// 上游不发则回退占位符（`take` 只消费一次，thinking 块只在流末尾关一次）。
+    fn create_signature_delta_event(&mut self, index: i32) -> SseEvent {
+        let signature = self
+            .pending_reasoning_signature
+            .take()
+            .unwrap_or_else(|| THINKING_SIGNATURE_PLACEHOLDER.to_string());
         SseEvent::new(
             "content_block_delta",
             json!({
@@ -2791,7 +2822,7 @@ impl StreamContext {
                 "index": index,
                 "delta": {
                     "type": "signature_delta",
-                    "signature": THINKING_SIGNATURE_PLACEHOLDER
+                    "signature": signature
                 }
             }),
         )
@@ -2844,6 +2875,20 @@ impl StreamContext {
                 if !remaining.is_empty() {
                     events.extend(self.create_text_delta_events(&remaining));
                 }
+            } else if self.reasoning_stream_seen {
+                // 结构化 reasoning 开的 thinking 块：内容直接以 thinking_delta 下发、不进
+                // thinking_buffer，故上面的 `find_real_thinking_end_tag_at_buffer_end` 恒为 None。
+                // 工具调用前必须先把块关掉 —— 否则 tool_use 块 start 时 thinking 块仍未 stop，
+                // 违反 Anthropic SSE「先 stop 当前块、再 start 下一块」的顺序契约（CC 解析报错）。
+                // 兜底 flush buffer：极边缘的「嗅探开块 → 又来 reasoning」混合场景里，
+                // buffer 可能还有嗅探暂存的内容，关块前先作为 thinking_delta 补发（不吞字）。
+                if !self.thinking_buffer.is_empty() {
+                    if let Some(idx) = self.thinking_block_index {
+                        events.push(self.create_thinking_delta_event(idx, &self.thinking_buffer));
+                    }
+                    self.thinking_buffer.clear();
+                }
+                events.extend(self.close_reasoning_thinking_block());
             }
         }
 
@@ -2875,6 +2920,13 @@ impl StreamContext {
             .get(&tool_use.name)
             .cloned()
             .unwrap_or_else(|| tool_use.name.clone());
+        // 仅当入站映射过才记下 tool_use_id → 还原名，供 generate_final_events 截断兜底
+        // 做参数还原。未映射的（Kiro 直接发同名工具）不记 —— 兜底据此区分「该还原」与
+        // 「该原样透传」，避免把不认识的参数清空。
+        if self.tool_name_map.contains_key(&tool_use.name) {
+            self.tool_use_names
+                .insert(tool_use.tool_use_id.clone(), original_name.clone());
+        }
 
         // 发送 content_block_start
         let start_events = self.state_manager.handle_content_block_start(
@@ -2926,10 +2978,24 @@ impl StreamContext {
 
         // 仅在 stop 时把完整缓冲一次性发出 + 关闭块（此前只累积、不发 partial_json）。
         if tool_use.stop {
-            let assembled = self
+            let mut assembled = self
                 .tool_input_sent
                 .remove(&tool_use.tool_use_id)
                 .unwrap_or_default();
+            // 出站参数还原：把 Kiro 参数形态还原成 Claude Code 参数形态
+            // （fs_write 的 path/text → Write 的 file_path/content、read_file 的 start_line →
+            // Read 的 offset）。
+            // ⚠️ **仅当该 Kiro 工具名入站时映射过**（tool_name_map 有记录）才做还原；否则
+            // （Kiro 直接发同名工具，未经历入站映射，如 DSML 调试场景的裸 "Write"）原样透传，
+            // 避免 map_tool_input_from_kiro 把不认识的参数（code/note/DSML 标记）清空成 {}。
+            // 仅对合法 JSON 生效；非法串交 flush_tool_input 的 repair 层。
+            if !assembled.is_empty() && self.tool_name_map.contains_key(&tool_use.name) {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&assembled) {
+                    assembled =
+                        crate::anthropic::converter::map_tool_input_from_kiro(&original_name, value)
+                            .to_string();
+                }
+            }
             events.extend(self.flush_tool_input(block_index, assembled));
             if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
                 events.push(stop_event);
@@ -3104,8 +3170,22 @@ impl StreamContext {
         // tool_use 块上。（正常路径 stop 时已 flush + remove，此处只处理未收到 stop 的残留。）
         if !self.tool_input_sent.is_empty() {
             let pending: Vec<(String, String)> = self.tool_input_sent.drain().collect();
-            for (tool_use_id, assembled) in pending {
+            for (tool_use_id, mut assembled) in pending {
                 if let Some(&idx) = self.tool_block_indices.get(&tool_use_id) {
+                    // 截断兜底同样做参数还原：块 start 已用还原名（tool_use_names 记录，
+                    // 且只记录映射过的），残留 input 需还原成客户端形态，否则名参错配
+                    // （Write + {path,text}）。未映射的（tool_use_names 无记录）原样透传。
+                    if let Some(cname) = self.tool_use_names.get(&tool_use_id).cloned() {
+                        if let Ok(value) =
+                            serde_json::from_str::<serde_json::Value>(&assembled)
+                        {
+                            assembled = crate::anthropic::converter::map_tool_input_from_kiro(
+                                &cname,
+                                value,
+                            )
+                            .to_string();
+                        }
+                    }
                     events.extend(self.flush_tool_input(idx, assembled));
                     if let Some(stop_event) = self.state_manager.handle_content_block_stop(idx) {
                         events.push(stop_event);
@@ -8259,6 +8339,101 @@ mod tests {
         assert!(
             pos_sig.unwrap() < pos_stop.unwrap(),
             "signature_delta 必须排在 content_block_stop 之前"
+        );
+    }
+
+    /// ⭐ 回归（P3-1）：`reasoningContentEvent` 带真签名 → `signature_delta` 必须用**上游真签名**，
+    /// 而不是占位符。Foxfishc 实测「伪造签名不被上游识别，cache_read 仍 0」——真签名是
+    /// 多轮 cache 命中的关键。把 `create_signature_delta_event` 里的
+    /// `pending_reasoning_signature.take()` 改回恒占位符 → 本测试 FAILED。
+    #[test]
+    fn reasoning_signature_is_forwarded_to_client_instead_of_placeholder() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let _initial_events = ctx.generate_initial_events();
+
+        let ev = Event::ReasoningContent(crate::kiro::model::events::ReasoningContentEvent {
+            text: "思考过程".to_string(),
+            signature: Some("upstream-real-signature-abc123".to_string()),
+            ..Default::default()
+        });
+        ctx.process_kiro_event(&ev);
+        let all_events = ctx.generate_final_events();
+
+        let sig = all_events
+            .iter()
+            .find(|e| e.data["delta"]["type"] == "signature_delta")
+            .expect("应发出 signature_delta")
+            .data["delta"]["signature"]
+            .as_str()
+            .expect("signature 应为字符串");
+        assert_eq!(
+            sig, "upstream-real-signature-abc123",
+            "必须回传上游真签名（否则多轮 cache 永不命中）"
+        );
+    }
+
+    /// 对照：上游 reasoningContentEvent 不带签名 → 回退占位符，行为与改动前逐字节一致。
+    #[test]
+    fn reasoning_without_signature_falls_back_to_placeholder() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let _initial_events = ctx.generate_initial_events();
+
+        let ev = Event::ReasoningContent(crate::kiro::model::events::ReasoningContentEvent {
+            text: "思考".to_string(),
+            ..Default::default()
+        });
+        ctx.process_kiro_event(&ev);
+        let all_events = ctx.generate_final_events();
+
+        let sig = all_events
+            .iter()
+            .find(|e| e.data["delta"]["type"] == "signature_delta")
+            .expect("应发出 signature_delta")
+            .data["delta"]["signature"]
+            .as_str()
+            .expect("signature 应为字符串");
+        assert_eq!(
+            sig, THINKING_SIGNATURE_PLACEHOLDER,
+            "无上游签名应回退占位符"
+        );
+    }
+
+    /// ⭐ 回归（P3-2）：thinking 开启 + 结构化 reasoning 开块 + 直接 tool_use（无正文）——
+    /// thinking 块必须**先 stop 再 start tool_use 块**（Anthropic SSE 块顺序契约）。
+    ///
+    /// 旧代码缺这条：`process_tool_use` 只按 sniff 路径（`thinking_buffer` 里有
+    /// `</thinking>`）关块，而 reasoning 开的块内容直接以 thinking_delta 下发、buffer 恒空，
+    /// 于是 tool_use 块 start 时 thinking 块仍未 stop → SSE 出现「新块 start → 旧块 stop」
+    /// 交错（工具块 index 1 先于思考块 index 0 收尾），CC 解析报错。把
+    /// `close_reasoning_thinking_block` 接进 `process_tool_use` 的 reasoning 分支 → 本测试 FAILED。
+    #[test]
+    fn reasoning_opened_thinking_block_closed_before_tool_use() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-4.5", 10, true, HashMap::new());
+        let mut all = ctx.generate_initial_events();
+        all.extend(ctx.process_kiro_event(&reasoning_ev("思考如何调用工具")));
+        all.extend(ctx.process_kiro_event(&Event::ToolUse(
+            crate::kiro::model::events::ToolUseEvent {
+                name: "Bash".into(),
+                tool_use_id: "toolu_1".into(),
+                input: "{\"command\":\"ls\"}".into(),
+                stop: true,
+            },
+        )));
+        all.extend(ctx.generate_final_events());
+
+        // 思考块 stop（index 0）必须出现在工具块 start（index 1）之前。
+        let thinking_stop_pos = all
+            .iter()
+            .position(|e| e.event == "content_block_stop" && e.data["index"].as_i64() == Some(0))
+            .expect("thinking 块必须收尾");
+        let tool_start_pos = all
+            .iter()
+            .position(|e| e.event == "content_block_start" && e.data["index"].as_i64() == Some(1))
+            .expect("tool_use 块必须存在");
+        assert!(
+            thinking_stop_pos < tool_start_pos,
+            "thinking 块必须在 tool_use 块 start 之前 stop（SSE 块顺序契约）"
         );
     }
 

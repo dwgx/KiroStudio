@@ -68,13 +68,28 @@ pub async fn forward(
         }
     };
 
+    // deepseek 归一化:opencodezen 代挂凭据(deepseekNormalize=true)时,转发前按 fuckopencode
+    // 的 deepseek 协议修复改写请求体(thinking adaptive→enabled、reasoning_effort→output_config、
+    // 剥 context_management 等),再原样转发;其余 custom_api 凭据保持零转换透传。
+    let body_bytes: Bytes = if cred.deepseek_normalize == Some(true) {
+        match serde_json::from_slice::<serde_json::Value>(&raw_body) {
+            Ok(mut v) => {
+                crate::kiro::deepseek_normalize::normalize_request(&mut v);
+                serde_json::to_vec(&v).map(Bytes::from).unwrap_or_else(|_| raw_body.clone())
+            }
+            Err(_) => raw_body.clone(), // 非 JSON(理论不该出现),回落原样透传
+        }
+    } else {
+        raw_body.clone()
+    };
+
     // 组装转发请求:换上该凭据的 api_key(Anthropic 双头兼容:x-api-key + Authorization),
-    // 带上 anthropic-version(上游中转站通常要求),content-type json。原样发送 raw_body。
+    // 带上 anthropic-version(上游中转站通常要求),content-type json。发送处理后的 body。
     let mut req = client
         .post(&url)
         .header(header::CONTENT_TYPE, "application/json")
         .header("anthropic-version", "2023-06-01")
-        .body(raw_body);
+        .body(body_bytes);
     if let Some(key) = cred.api_key.as_deref().filter(|k| !k.is_empty()) {
         req = req
             .header("x-api-key", key)

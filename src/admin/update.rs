@@ -16,7 +16,7 @@
 //!   .new→原路径」，重启由 start.bat/run.bat 的监督循环按原路径拉起新二进制（exit(0) 即重拉）。
 //!
 //! OTA 资产按运行平台 **OS × 架构** 自动选择（`ASSET_BIN`）：Windows 下 `kirostudio-windows-x86_64.exe`，
-//! Linux 下 `kirostudio-linux-{x86_64,aarch64}`，macOS 下 `kirostudio-macos-{x86_64,aarch64}`。
+//! Linux 下 `kirostudio-linux-x86_64`，macOS 下 `kirostudio-macos-{x86_64,aarch64}`。
 //! 下错平台/架构的二进制即便 sha256 自洽也无法运行（覆盖后服务当场死亡），故必须精确匹配；
 //! 未适配的组合在编译期直接 `compile_error!`，绝不静默回退到某个默认资产名。
 
@@ -25,8 +25,8 @@ use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 /// 上游仓库（owner/repo）。发布产物见 .github/workflows/release.yml，每个平台一份二进制 + 同名 .sha256：
-/// `kirostudio-linux-x86_64` / `kirostudio-linux-aarch64` /
-/// `kirostudio-macos-x86_64` / `kirostudio-macos-aarch64` / `kirostudio-windows-x86_64.exe`。
+/// `kirostudio-linux-x86_64` / `kirostudio-macos-x86_64` /
+/// `kirostudio-macos-aarch64` / `kirostudio-windows-x86_64.exe`。
 /// ⚠️ 这份清单必须与 `ASSET_BIN` 的 cfg 分支、release.yml 的产出**三方保持一致**，
 /// 少一个平台就意味着该平台的用户点 OTA 会 404（好）或下到错误资产（灾难）。
 const DEFAULT_GITHUB_REPO: &str = "dwgx/KiroStudio";
@@ -91,12 +91,8 @@ fn with_update_auth(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
 /// 避免"静默落到某个错误的默认值"这种最危险的形态再次发生。
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 const ASSET_BIN: &str = "kirostudio-windows-x86_64.exe";
-#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
-const ASSET_BIN: &str = "kirostudio-windows-aarch64.exe";
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const ASSET_BIN: &str = "kirostudio-linux-x86_64";
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-const ASSET_BIN: &str = "kirostudio-linux-aarch64";
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 const ASSET_BIN: &str = "kirostudio-macos-x86_64";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -104,14 +100,8 @@ const ASSET_BIN: &str = "kirostudio-macos-aarch64";
 
 // 未覆盖的 OS×ARCH 组合：宁可编译失败，也绝不静默下载一个不匹配的二进制去覆盖自己。
 #[cfg(not(any(
-    all(
-        target_os = "windows",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64"),
     all(
         target_os = "macos",
         any(target_arch = "x86_64", target_arch = "aarch64")

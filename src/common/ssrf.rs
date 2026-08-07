@@ -189,6 +189,33 @@ fn is_forbidden_ipv6_native(ip: Ipv6Addr, policy: SsrfPolicy) -> bool {
             return true;
         }
     }
+    // Teredo (RFC 4380): 2001:0000::/32 —— 客户端 IPv4 在最后 32 位、按位取反混淆。
+    // 例：2001:0000:...:80ff:fffe 解混淆后是 127.0.0.1。`to_ipv4()` 不覆盖它，
+    // 但攻击者同样可用它在支持 Teredo 的主机上把出站打向内网，故按裸 v4 同口径判定。
+    if seg[0] == 0x2001 && seg[1] == 0x0000 {
+        let teredo_v4 = Ipv4Addr::new(
+            (!seg[6] >> 8) as u8,
+            (!seg[6] & 0xff) as u8,
+            (!seg[7] >> 8) as u8,
+            (!seg[7] & 0xff) as u8,
+        );
+        if is_forbidden_ipv4_with(teredo_v4, policy) {
+            return true;
+        }
+    }
+    // ISATAP (RFC 5214): 接口标识符形如 0000:5EFE:xxxx:xxxx（或 u 位置位的 0200:5EFE:），
+    // 后 32 位为内嵌 IPv4。例：2001:db8::5efe:7f00:1 内嵌 127.0.0.1。
+    if (seg[4] == 0x0000 || seg[4] == 0x0200) && seg[5] == 0x5efe {
+        let isatap_v4 = Ipv4Addr::new(
+            (seg[6] >> 8) as u8,
+            (seg[6] & 0xff) as u8,
+            (seg[7] >> 8) as u8,
+            (seg[7] & 0xff) as u8,
+        );
+        if is_forbidden_ipv4_with(isatap_v4, policy) {
+            return true;
+        }
+    }
     false
 }
 
@@ -645,6 +672,45 @@ mod tests {
                 "{ip} 内嵌元数据端点，必须拒绝"
             );
         }
+    }
+
+    /// Teredo / ISATAP 内嵌 v4 同样必须按裸 IPv4 同口径判定（否则成为绕过口）。
+    ///
+    /// - Teredo (RFC 4380): `2001:0000::/32`，客户端 v4 在最后 32 位且按位取反混淆。
+    ///   `2001:0000:1234:5678:8000:0000:8000:00fe` 解混淆后 = 127.255.255.1（环回）。
+    /// - ISATAP (RFC 5214): 接口标识符 `0000:5EFE:xxxx:xxxx`，后 32 位为内嵌 v4。
+    ///   `2001:db8::5efe:7f00:1` = 127.0.0.1；`2001:db8::5efe:a9fe:a9fe` = 169.254.169.254。
+    ///
+    /// 内嵌**公网** v4 时仍放行（只按内嵌的 v4 是否命中禁止段判定，与 6to4/NAT64 同口径）。
+    #[test]
+    fn should_apply_same_policy_to_teredo_and_isatap() {
+        // 内嵌环回/链路本地：两种策略下都必须拦
+        for ip in [
+            "2001:0000:1234:5678:8000:0000:8000:00fe", // Teredo → 127.255.255.1
+            "2001:0000:1234:5678:ffff:ffff:ffff:fffe", // Teredo → 0.0.0.0
+            "2001:db8::5efe:7f00:1",                   // ISATAP → 127.0.0.1
+            "2001:db8::5efe:a9fe:a9fe",                // ISATAP → 169.254.169.254
+        ] {
+            assert!(
+                is_forbidden_ip_with(ip.parse().unwrap(), SsrfPolicy::Strict),
+                "{ip} 严格策略下内嵌环回/元数据必须拒绝"
+            );
+            assert!(
+                is_forbidden_ip_with(ip.parse().unwrap(), SsrfPolicy::AdminConfigured),
+                "{ip} 管理员配置下内嵌环回/元数据也必须拒绝"
+            );
+        }
+        // 内嵌公网 v4：放行（与裸 8.8.8.8 一致）
+        let teredo_public = "2001:0000:1234:5678:ffff:ffff:f7f7:f7f7"; // Teredo → 8.8.8.8
+        assert!(
+            !is_forbidden_ip(teredo_public.parse().unwrap()),
+            "Teredo 内嵌公网 v4 应放行: {teredo_public}"
+        );
+        let isatap_public = "2001:db8::5efe:808:808"; // ISATAP → 8.8.8.8
+        assert!(
+            !is_forbidden_ip(isatap_public.parse().unwrap()),
+            "ISATAP 内嵌公网 v4 应放行: {isatap_public}"
+        );
     }
 
     /// 拒绝原因必须可诊断：命中基准段时要点出「代理 fake-IP」这个真实原因。
