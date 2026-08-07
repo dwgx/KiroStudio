@@ -178,6 +178,36 @@ pub struct KiroCredentials {
     #[serde(alias = "alias")]
     pub name: Option<String>,
 
+    /// 分身组标识：同一次多开（`copies`）产生的**全部**份共享同一个随机 UUID，
+    /// 第 1 份也带（否则"主号 + 分身"无法作为一组呈现）。单开凭据为 None。
+    ///
+    /// # 为什么是持久化的随机 UUID，而不是父号 id 或 key 的哈希
+    ///
+    /// - **不用 `cred:{parent_id}`**：重启时 `next_id = max_existing_id + 1`，
+    ///   若父号恰是最大 id、被删且回收站清空，该 id 会被**重新发放**给一个无关新号，
+    ///   于是新号凭空并进旧组（设计评审 BLOCKER 7）。
+    /// - **不用 `kiro_api_key` 的哈希**：`add_credential` 会覆写 `kiro_api_key`，
+    ///   key 轮换后**同一组的成员算出不同组键**，一组裂成两组（BLOCKER 8）。
+    ///   已有的 `api_key_hash` 是展示用派生值，正因如此不能当组键。
+    ///
+    /// 随机 UUID 一次生成、随凭据落盘，两个风险都不存在：它不随 id 空间变化，
+    /// 也不随任何可变字段漂移。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "clone_group")]
+    pub clone_group: Option<String>,
+
+    /// 组内序号（1-based，1 = 主份）。仅在 `clone_group` 存在时有意义。
+    /// 展示为「分身 #2/5」，不参与任何调度判定。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "clone_seq")]
+    pub clone_seq: Option<u32>,
+
+    /// 分身标签：用户可编辑的短文本，用于在分身管理页标记这一份的用途
+    /// （如「日本出口」「备用」）。与 `name` 分开是因为 `name` 是**账号**别名、
+    /// 多开时各份复制自同一个源，而 tag 描述的是**这一份**的差异。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+
     /// 订阅等级（KIRO PRO+ / KIRO FREE 等）
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
@@ -230,6 +260,22 @@ pub struct KiroCredentials {
     /// 端点名必须在启动时注册的端点 registry 中存在。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+
+    /// **凭据级** CLI body 对齐开关（对齐 kiro-rs 的 `origin` 字段形状，仅对 CLI 端点
+    /// `ksk_` 号有意义）。
+    ///
+    /// `None`（默认）= 跟随全局 `config.cliOriginKiroCli`（其默认值是 `false`）。
+    /// `Some(true)`  = 该号的请求体 `origin` 改写为 `KIRO_CLI`（并去掉
+    ///                 `agentContinuationId` / history `modelId`，见
+    ///                 [`crate::kiro::endpoint::cli`] 的 `set_origin_kiro_cli`）。
+    /// `Some(false)` = 该号强制保持旧形状（`origin=AI_EDITOR`），即使全局开关已打开。
+    ///
+    /// 背景：全局开关一开就是全池切换，做不到「单号开、对比 429 率」的 A/B——而这正是
+    /// 排查 ksk_ 号 429 疑因（origin 字段参与上游配额分档）时最需要的能力。字段范式照抄
+    /// [`Self::custom_api_first`]：凭据级 `Option<bool>` 覆盖，`None` 时回落全局。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cli_origin_kiro_cli: Option<bool>,
 }
 
 /// 脱敏展示敏感字段：有值 → `"<set:N>"`（标注长度便于排障但不泄露内容），无值 → `None`。
@@ -473,6 +519,28 @@ impl KiroCredentials {
         {
             return region;
         }
+        // ⭐ `ksk_` API Key 号:`api_region` 压过 `region`/`auth_region`。
+        //
+        // 这两类字段的**可信度完全不同**,不能按「谁先出现谁赢」排:
+        // - `api_region` 只有两个写入者,都是**已验证的判断**:面板的
+        //   `set_credential_api_region`(运维手动指定)与 `region_probe`(探测后写死)。
+        // - `region` / `auth_region` 是**推号方随号带进来的未验证值**(批量 import 会
+        //   原样收下),它们描述的是账号注册区,不等于 `ksk_` token 的授权区。
+        //
+        // 事故形态(实测):一个实际授权在 us-east-1 的 key,推号方带来
+        // `authRegion=eu-central-1`;运维在面板手动改 `apiRegion=us-east-1` 后
+        // **host 依旧是 `q.eu-central-1.amazonaws.com`** —— 手动修正被压住、完全不生效,
+        // 号恒 403。这也是 KiroStudio 与 kiro-rs 在同一把 key 上行为分叉的原因:
+        // kiro-rs 的 CLI 端点只看 `api_region`(其 `effective_api_region`),没有这层遮蔽。
+        //
+        // 只对 api_key 号放开:OAuth 号的权威 region 是 `profileArn`(上面第一优先已处理),
+        // 其 `region` 字段由 `sync_region_from_arn` 与 ARN 物理绑定,不能被 `api_region` 掀翻
+        // (否则 host 与 ARN 里的 region 错配 → 400 Improperly formed)。
+        if self.is_api_key_credential() {
+            if let Some(region) = self.api_region.as_deref().and_then(Self::sanitized_region) {
+                return region;
+            }
+        }
         // 凭据 region/auth_region 字段先过白名单(H3:防污染值拼坏 host 泄漏 token),
         // 不命中回退 config（config 由部署方掌控,视为可信）。
         self.region
@@ -534,9 +602,7 @@ impl KiroCredentials {
         // OIDC 端点 → clientId 跨 region 失配 → AWS 拒 → 网关 502(0.7.12 收口引入的回归)。故 IdC 号
         // **只同步 region(对话/余额),绝不碰 auth_region**。external_idp 的 auth_region 不参与刷新
         // (用微软 token_endpoint)、social 的走 kiro.dev,故仅 IdC 需此豁免。
-        if !self.is_idc_credential()
-            && self.auth_region.as_deref() != Some(arn_region.as_str())
-        {
+        if !self.is_idc_credential() && self.auth_region.as_deref() != Some(arn_region.as_str()) {
             self.auth_region = Some(arn_region.clone());
             changed = true;
         }
@@ -708,21 +774,55 @@ impl KiroCredentials {
     /// # 参数
     /// `default_endpoint` 为 `config.defaultEndpoint`，仅在既无显式字段、又不命中任何
     /// 自动路由规则时使用（即普通 social/idc/external_idp 号的既有行为，完全不变）。
-    pub fn effective_endpoint<'a>(&'a self, default_endpoint: &'a str) -> &'a str {
+    /// 端点候选顺序（从首选到回退），供 provider 的"429 换桶"机制使用。
+    ///
+    /// # 返回值语义
+    /// - 显式 `endpoint` 字段（非空）→ `vec![该值]`：固定 = **仅用这一个**，不自动回退
+    ///   （救急旋钮：上游协议变化时不改代码即可硬切）。
+    /// - ksk_ API Key 号 → `["cli", "cli-runtime"]`：**q.* 优先、runtime.* 回退**。
+    ///   两个 host 是上游的**独立限流桶**（参考 kiro2cc `endpoint.rs`）；实测 `q.*` 300 并发
+    ///   0 个 429、`runtime.*` 31%（`docs/batch2-region-endpoint-matrix.md`），故 q.* 默认优先，
+    ///   其桶被 429 封禁时自动落到 runtime.* 桶。该顺序**不依赖 region** ⇒ us/eu 天然同步。
+    /// - 其余（OAuth 号）→ `vec![default_endpoint]`：既有行为逐字节不变。
+    pub fn effective_endpoint_order<'a>(&'a self, default_endpoint: &'a str) -> Vec<&'a str> {
         // ① 显式配置优先（面板可改、可切回 ide 救急）。
         if let Some(name) = self.endpoint.as_deref() {
             let name = name.trim();
             if !name.is_empty() {
-                return name;
+                return vec![name];
             }
         }
-        // ② 自动路由：ksk_ API Key 号 → CLI 端点。custom_api 透传号不走 Kiro 端点体系
-        //    （它有独立的 passthrough 路径），这里显式排除以免误判——它也可能带 api_key 字段。
+        // ② 自动路由：ksk_ API Key 号 → q.* 优先、runtime.* 回退。custom_api 透传号不走
+        //    Kiro 端点体系（它有独立的 passthrough 路径），这里显式排除以免误判——
+        //    它也可能带 api_key 字段。
         if !self.is_custom_api_credential() && self.is_api_key_credential() {
-            return crate::kiro::endpoint::cli::CLI_ENDPOINT_NAME;
+            return vec![
+                crate::kiro::endpoint::cli::CLI_ENDPOINT_NAME,
+                crate::kiro::endpoint::cli_runtime::CLI_RUNTIME_ENDPOINT_NAME,
+            ];
         }
         // ③ 其余凭据沿用全局默认（既有行为）。
-        default_endpoint
+        vec![default_endpoint]
+    }
+
+    pub fn effective_endpoint<'a>(&'a self, default_endpoint: &'a str) -> &'a str {
+        // 单值视角 = 候选顺序的首选。ksk_ 号 → "cli"（q.*），与历史行为一致；旁路
+        // （验活/探测，endpoint/mod.rs::for_credentials）只认单值，故保留本函数。
+        self.effective_endpoint_order(default_endpoint)
+            .first()
+            .copied()
+            .unwrap_or(default_endpoint)
+    }
+
+    /// 该凭据的 `cliOriginKiroCli` 生效值：**凭据级 `cli_origin_kiro_cli` 优先，未设时
+    /// 回落全局 `config.cliOriginKiroCli`**。
+    ///
+    /// 字段范式与 [`Self::effective_endpoint`] / [`token_manager`](crate::kiro::token_manager)
+    /// 里 `custom_api_first` 的用法一致：`Option<bool>` 覆盖 + 全局兜底，让单个号能独立
+    /// 做 A/B（对比开/关两侧的 429 率），而不必像全局开关那样一开就是全池切换。
+    pub fn effective_cli_origin_kiro_cli(&self, global_cli_origin_kiro_cli: bool) -> bool {
+        self.cli_origin_kiro_cli
+            .unwrap_or(global_cli_origin_kiro_cli)
     }
 
     pub fn is_external_idp_credential(&self) -> bool {
@@ -834,7 +934,10 @@ mod tests {
         .unwrap();
         assert!(c.allows_model("deepseek-3.2"), "白名单内应允许");
         assert!(c.allows_model("glm-5"));
-        assert!(!c.allows_model("claude-opus-4.8"), "白名单外的贵模型绝不允许(防溢出)");
+        assert!(
+            !c.allows_model("claude-opus-4.8"),
+            "白名单外的贵模型绝不允许(防溢出)"
+        );
         // 大小写不敏感
         assert!(c.allows_model("DeepSeek-3.2"));
     }
@@ -886,12 +989,21 @@ mod tests {
         let mut c = KiroCredentials::default();
         c.region = Some("us-east-1".to_string());
         c.auth_region = Some("us-east-1".to_string());
-        c.profile_arn =
-            Some("arn:aws:codewhisperer:eu-central-1:155119901513:profile/ACPYXKUPYE3H".to_string());
+        c.profile_arn = Some(
+            "arn:aws:codewhisperer:eu-central-1:155119901513:profile/ACPYXKUPYE3H".to_string(),
+        );
         let changed = c.sync_region_from_arn();
         assert!(changed, "region 不符时应发生修正");
-        assert_eq!(c.region.as_deref(), Some("eu-central-1"), "region 应被 ARN region 覆盖");
-        assert_eq!(c.auth_region.as_deref(), Some("eu-central-1"), "auth_region 同步");
+        assert_eq!(
+            c.region.as_deref(),
+            Some("eu-central-1"),
+            "region 应被 ARN region 覆盖"
+        );
+        assert_eq!(
+            c.auth_region.as_deref(),
+            Some("eu-central-1"),
+            "auth_region 同步"
+        );
     }
 
     #[test]
@@ -902,11 +1014,14 @@ mod tests {
         c.auth_method = Some("idc".to_string());
         c.region = Some("us-east-1".to_string());
         c.auth_region = Some("us-east-1".to_string()); // = R_sso(SSO-OIDC 注册 region)
-        c.profile_arn =
-            Some("arn:aws:codewhisperer:eu-central-1:1:profile/X".to_string()); // R_arn 不同
+        c.profile_arn = Some("arn:aws:codewhisperer:eu-central-1:1:profile/X".to_string()); // R_arn 不同
         let changed = c.sync_region_from_arn();
         assert!(changed, "region 不符仍应同步(返回 true)");
-        assert_eq!(c.region.as_deref(), Some("eu-central-1"), "IdC 对话 region 应同步为 ARN region");
+        assert_eq!(
+            c.region.as_deref(),
+            Some("eu-central-1"),
+            "IdC 对话 region 应同步为 ARN region"
+        );
         assert_eq!(
             c.auth_region.as_deref(),
             Some("us-east-1"),
@@ -918,7 +1033,11 @@ mod tests {
         c2.auth_region = Some("us-west-2".to_string());
         c2.profile_arn = Some("arn:aws:codewhisperer:eu-central-1:1:profile/X".to_string());
         c2.sync_region_from_arn();
-        assert_eq!(c2.auth_region.as_deref(), Some("us-west-2"), "builder-id 也豁免 auth_region");
+        assert_eq!(
+            c2.auth_region.as_deref(),
+            Some("us-west-2"),
+            "builder-id 也豁免 auth_region"
+        );
     }
 
     #[test]
@@ -934,13 +1053,21 @@ mod tests {
         c2.region = Some("ap-southeast-1".to_string());
         c2.profile_arn = None;
         assert!(!c2.sync_region_from_arn());
-        assert_eq!(c2.region.as_deref(), Some("ap-southeast-1"), "无 ARN 不碰 region");
+        assert_eq!(
+            c2.region.as_deref(),
+            Some("ap-southeast-1"),
+            "无 ARN 不碰 region"
+        );
         // ARN region 非白名单 → 不动（不会把 region 改成垃圾值）
         let mut c3 = KiroCredentials::default();
         c3.region = Some("us-east-1".to_string());
         c3.profile_arn = Some("arn:aws:codewhisperer:not-a-region:1:profile/X".to_string());
         assert!(!c3.sync_region_from_arn());
-        assert_eq!(c3.region.as_deref(), Some("us-east-1"), "非法 ARN region 不覆盖");
+        assert_eq!(
+            c3.region.as_deref(),
+            Some("us-east-1"),
+            "非法 ARN region 不覆盖"
+        );
     }
 
     #[test]
@@ -1045,6 +1172,62 @@ mod tests {
         assert_eq!(idc.effective_endpoint("ide"), "ide");
     }
 
+    /// ⭐ 端点候选顺序（429 换桶的基础）：ksk_ 号 = q.*(cli) 优先、runtime.*(cli-runtime) 回退。
+    /// 两个 host 是上游独立限流桶；顺序**不依赖 region** ⇒ us/eu 天然同步。
+    #[test]
+    fn should_order_api_key_endpoints_cli_first_then_cli_runtime() {
+        let mut ak = KiroCredentials::default();
+        ak.kiro_api_key = Some("ksk_test".to_string());
+        // region 变化不影响顺序（us/eu 同步的保证）。
+        ak.region = Some("eu-central-1".to_string());
+        assert_eq!(
+            ak.effective_endpoint_order("ide"),
+            vec!["cli", "cli-runtime"],
+            "ksk_ 号必须 q.* 优先、runtime.* 回退"
+        );
+
+        // 显式固定 endpoint 时仅用该端点（固定 = 不自动回退）。
+        ak.endpoint = Some("cli-runtime".to_string());
+        assert_eq!(
+            ak.effective_endpoint_order("ide"),
+            vec!["cli-runtime"],
+            "显式固定后只保留该端点"
+        );
+        ak.endpoint = None;
+
+        // 空白值视为未配置 → 回到自动顺序。
+        ak.endpoint = Some("   ".to_string());
+        assert_eq!(
+            ak.effective_endpoint_order("ide"),
+            vec!["cli", "cli-runtime"]
+        );
+    }
+
+    /// custom_api 透传号不参与 ksk_ 端点顺序（它可能带 api_key 字段会被 is_api_key_credential 误判）。
+    #[test]
+    fn should_not_order_custom_api_as_api_key_bucket_fallback() {
+        let mut custom = KiroCredentials::default();
+        custom.auth_method = Some("custom_api".to_string());
+        custom.base_url = Some("https://relay.invalid".to_string());
+        custom.kiro_api_key = Some("ksk_wrong".to_string());
+        assert_eq!(
+            custom.effective_endpoint_order("ide"),
+            vec!["ide"],
+            "custom_api 号应回退全局默认，不按 ksk_ 双桶顺序"
+        );
+    }
+
+    /// 其余（OAuth）号端点顺序 = 单元素 `[default_endpoint]`（既有行为逐字节不变）。
+    #[test]
+    fn should_order_oauth_as_single_default() {
+        let social = KiroCredentials::default();
+        assert_eq!(social.effective_endpoint_order("ide"), vec!["ide"]);
+
+        let mut idc = KiroCredentials::default();
+        idc.auth_method = Some("idc".to_string());
+        assert_eq!(idc.effective_endpoint_order("cli"), vec!["cli"]);
+    }
+
     /// custom_api 透传号**绝不**被自动路由到 cli：它不走 Kiro 端点体系（有独立
     /// passthrough 路径），且其 `api_key` 字段会让 is_api_key_credential 误判。
     #[test]
@@ -1096,9 +1279,68 @@ mod tests {
         c.region = Some("eu-central-1".to_string());
         assert_eq!(c.effective_upstream_region(&config), "eu-central-1");
         // profileArn 合法 → 优先用 ARN region（压过凭据 region）
-        c.profile_arn =
-            Some("arn:aws:codewhisperer:ap-northeast-1:1:profile/X".to_string());
+        c.profile_arn = Some("arn:aws:codewhisperer:ap-northeast-1:1:profile/X".to_string());
         assert_eq!(c.effective_upstream_region(&config), "ap-northeast-1");
+    }
+
+    /// ⭐ 承重：`ksk_` 号的 `api_region` 必须压过 `region` / `auth_region`。
+    ///
+    /// 回退即 FAIL。事故形态（线上实测）：推号方带来 `authRegion=eu-central-1`，
+    /// 但这把 key 实际只在 `us-east-1` 授权。运维在面板手动改 `apiRegion=us-east-1`
+    /// 后 host **依旧**是 `q.eu-central-1.amazonaws.com` —— 手动修正被 `auth_region`
+    /// 遮蔽、完全不生效，号恒 403。这也是 KiroStudio 与 kiro-rs 在同一把 key 上
+    /// 行为分叉的原因（kiro-rs 的 CLI 端点只看 `api_region`，没有这层遮蔽）。
+    #[test]
+    fn test_api_region_overrides_auth_region_for_api_key() {
+        let mut config = Config::default();
+        config.region = "us-east-1".to_string();
+
+        let mut c = KiroCredentials::default();
+        c.auth_method = Some("api_key".to_string());
+        c.kiro_api_key = Some("ksk_test".to_string());
+        // 推号方带进来的未验证值
+        c.auth_region = Some("eu-central-1".to_string());
+        c.region = Some("eu-central-1".to_string());
+        // 运维手动修正 / 探测写死的权威值
+        c.api_region = Some("us-east-1".to_string());
+
+        assert_eq!(
+            c.effective_upstream_region(&config),
+            "us-east-1",
+            "api_region 必须压过 region/auth_region，否则面板上的手动修正不生效"
+        );
+
+        // api_region 为 None 时不改变既有优先级（region > auth_region）
+        c.api_region = None;
+        assert_eq!(c.effective_upstream_region(&config), "eu-central-1");
+
+        // 污染的 api_region 不得放行（白名单仍然生效），回退 region
+        c.api_region = Some("evil.attacker.com/".to_string());
+        assert_eq!(c.effective_upstream_region(&config), "eu-central-1");
+    }
+
+    /// OAuth 号（非 `ksk_`）的 `api_region` **不得**掀翻 `profileArn` / `region`。
+    ///
+    /// 上游对话 host 的 region 必须与 profileArn 第 4 段一致，否则 400
+    /// Improperly formed（见 `sync_region_from_arn` 文档）。上一条测试放开的是
+    /// api_key 专属通道，这条钉死它没有溢出到 OAuth 号。
+    #[test]
+    fn test_api_region_does_not_override_arn_for_oauth() {
+        let config = Config::default();
+        let mut c = KiroCredentials::default();
+        c.auth_method = Some("social".to_string());
+        c.profile_arn = Some("arn:aws:codewhisperer:eu-central-1:1:profile/X".to_string());
+        c.api_region = Some("us-east-1".to_string());
+        assert_eq!(
+            c.effective_upstream_region(&config),
+            "eu-central-1",
+            "OAuth 号必须以 profileArn 的 region 为准，否则 host 与 ARN 错配 → 400"
+        );
+
+        // 无 ARN 的 OAuth 号：region 仍压过 api_region（api_region 只是 api_key 的通道）
+        c.profile_arn = None;
+        c.region = Some("eu-central-1".to_string());
+        assert_eq!(c.effective_upstream_region(&config), "eu-central-1");
     }
 
     /// 安全回归(H3):被污染的凭据 region/auth_region 字段(来自不可信导入的凭据 JSON)
@@ -1218,6 +1460,9 @@ mod tests {
             machine_id: None,
             email: None,
             name: None,
+            clone_group: None,
+            clone_seq: None,
+            tag: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
@@ -1227,6 +1472,7 @@ mod tests {
             disabled_at: None,
             kiro_api_key: None,
             endpoint: None,
+            cli_origin_kiro_cli: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -1349,6 +1595,9 @@ mod tests {
             machine_id: None,
             email: None,
             name: None,
+            clone_group: None,
+            clone_seq: None,
+            tag: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
@@ -1358,6 +1607,7 @@ mod tests {
             disabled_at: None,
             kiro_api_key: None,
             endpoint: None,
+            cli_origin_kiro_cli: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -1393,6 +1643,9 @@ mod tests {
             machine_id: None,
             email: None,
             name: None,
+            clone_group: None,
+            clone_seq: None,
+            tag: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
@@ -1402,6 +1655,7 @@ mod tests {
             disabled_at: None,
             kiro_api_key: None,
             endpoint: None,
+            cli_origin_kiro_cli: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -1522,6 +1776,9 @@ mod tests {
             machine_id: Some("c".repeat(64)),
             email: None,
             name: None,
+            clone_group: None,
+            clone_seq: None,
+            tag: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
@@ -1529,6 +1786,7 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            cli_origin_kiro_cli: None,
         };
 
         let json = original.to_pretty_json().unwrap();
@@ -1741,11 +1999,20 @@ mod tests {
         // 注：租户 GUID 用占位假值（脱敏，不含真实账户标识）。
         let mut a = KiroCredentials::default();
         a.auth_method = Some("external_idp".to_string());
-        a.issuer_url = Some("https://login.microsoftonline.com/00000000-0000-0000-0000-000000000001/v2.0".to_string());
+        a.issuer_url = Some(
+            "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000001/v2.0"
+                .to_string(),
+        );
         let mut b = KiroCredentials::default();
         b.auth_method = Some("external_idp".to_string());
-        b.issuer_url = Some("https://login.microsoftonline.com/00000000-0000-0000-0000-000000000001/v2.0".to_string());
-        assert_eq!(a.family_key(53), "m365:00000000-0000-0000-0000-000000000001");
+        b.issuer_url = Some(
+            "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000001/v2.0"
+                .to_string(),
+        );
+        assert_eq!(
+            a.family_key(53),
+            "m365:00000000-0000-0000-0000-000000000001"
+        );
         assert_eq!(a.family_key(53), b.family_key(54), "同租户号必须同族键");
     }
 
@@ -1754,7 +2021,8 @@ mod tests {
         // issuer 缺失但有 profileArn → aws:{account}（AWS 账户号用占位假值，脱敏）
         let mut c = KiroCredentials::default();
         c.auth_method = Some("external_idp".to_string());
-        c.profile_arn = Some("arn:aws:codewhisperer:us-east-1:000000000000:profile/EXAMPLE".to_string());
+        c.profile_arn =
+            Some("arn:aws:codewhisperer:us-east-1:000000000000:profile/EXAMPLE".to_string());
         assert_eq!(c.family_key(53), "aws:000000000000");
     }
 

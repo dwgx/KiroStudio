@@ -2,11 +2,11 @@
 
 use std::convert::Infallible;
 
-use anyhow::Error;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
+use anyhow::Error;
 use axum::{
     Json as JsonExtractor,
     body::Body,
@@ -23,8 +23,13 @@ use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
-use super::stream::{BufferedStreamContext, CacheUsageBreakdown, CompletionStatus, SseEvent, StreamContext};
-use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
+use super::stream::{
+    BufferedStreamContext, CacheUsageBreakdown, CompletionStatus, SseEvent, StreamContext,
+};
+use super::types::{
+    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
+    OutputConfig, Thinking,
+};
 use super::websearch;
 
 /// 从入站请求头提取客户端 IP（仅头部来源，不含连接层回退）。
@@ -187,8 +192,7 @@ fn trusted_client_ip(
     peer: Option<std::net::SocketAddr>,
 ) -> Option<String> {
     let trust = TRUST_FORWARDED_HEADER.load(std::sync::atomic::Ordering::Relaxed);
-    crate::common::security::client_ip_from_headers(headers, peer, trust)
-        .map(|ip| ip.to_string())
+    crate::common::security::client_ip_from_headers(headers, peer, trust).map(|ip| ip.to_string())
 }
 
 fn security_block_response(
@@ -238,8 +242,7 @@ fn collect_client_fingerprint() -> bool {
 /// 沿用 [`COLLECT_CLIENT_FINGERPRINT`] 已验证的范式，把 admin 可热改的开关搬到
 /// 进程级 static 原子镜像：main 启动写入、admin 改配置立即改写、handler 热路径读镜像，
 /// 全程无需重启、无锁近零成本。initial 默认与 config 默认一致。
-static EXTRACT_THINKING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static EXTRACT_THINKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 设置非流式 thinking 提取开关（main 启动接线 / admin 热更调用，立即生效）。
 pub fn set_extract_thinking(enabled: bool) {
@@ -378,7 +381,9 @@ fn is_claude_code_request(headers: &axum::http::HeaderMap) -> bool {
     if headers.contains_key("x-anthropic-billing-header") {
         return true;
     }
-    let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
+    let ua = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok());
     crate::usage::classify_device(ua).as_deref() == Some("claude-code")
 }
 
@@ -387,8 +392,9 @@ fn is_claude_code_request(headers: &axum::http::HeaderMap) -> bool {
 /// `CompressionConfig` 非标量（阈值 + 开关），用 `ArcSwap` 承载：admin 改配置时整份原子换、
 /// handler 热路径 `load_full()` 拿 `Arc` 快照（无锁近零成本）。`OnceLock` 惰性初始化，
 /// main 启动即 `set_compression` 写入真配置；未初始化时回退默认（与 config 默认一致）。
-static COMPRESSION: std::sync::OnceLock<arc_swap::ArcSwap<crate::model::config::CompressionConfig>> =
-    std::sync::OnceLock::new();
+static COMPRESSION: std::sync::OnceLock<
+    arc_swap::ArcSwap<crate::model::config::CompressionConfig>,
+> = std::sync::OnceLock::new();
 
 fn compression_cell() -> &'static arc_swap::ArcSwap<crate::model::config::CompressionConfig> {
     COMPRESSION.get_or_init(|| {
@@ -431,7 +437,9 @@ impl ClientInfo {
         if !collect_client_fingerprint() {
             return Self::default();
         }
-        let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
+        let ua = headers
+            .get(header::USER_AGENT)
+            .and_then(|v| v.to_str().ok());
         let ip = trusted_client_ip(headers, peer);
         Self {
             device: crate::usage::classify_device(ua),
@@ -515,7 +523,7 @@ const UPSTREAM_RATE_LIMIT_RETRY_AFTER_SECS: u64 = 8;
 ///
 /// 刻意**不匹配** `MONTHLY_REQUEST_COUNT` / `QUOTA`：那是不可重试的月度配额耗尽，
 /// 虽同为 429 但不该带 `Retry-After`（要等下个计费周期，给秒数会诱导客户端反复砸死号）。
-fn is_upstream_rate_limited(err_str: &str) -> bool {
+pub(crate) fn is_upstream_rate_limited(err_str: &str) -> bool {
     err_str.contains("USER_REQUEST_RATE_EXCEEDED")
         || err_str.contains("INSUFFICIENT_THROUGHPUT")
         || err_str.contains("Too many requests")
@@ -551,7 +559,7 @@ fn is_upstream_rate_limited(err_str: &str) -> bool {
 /// `AccessDeniedException` 或裸 403：后者会把「账号真被永久封禁」也吞成可重试，
 /// 让客户端对一个永远不会恢复的号无限退避重试，同时把真实故障藏起来
 /// （与 `translate_quota_subscription` 刻意不吞配额类同理）。
-fn is_upstream_temporarily_suspended(err_str: &str) -> bool {
+pub(crate) fn is_upstream_temporarily_suspended(err_str: &str) -> bool {
     err_str.contains("temporarily is suspended") || err_str.contains("TEMPORARILY_SUSPENDED")
 }
 
@@ -561,6 +569,101 @@ fn is_upstream_temporarily_suspended(err_str: &str) -> bool {
 /// 那是本仓对「这个状态持续多久」的既有判断，复用它而不是另立一个数字，
 /// 避免同一语义在两处各有一套时长。
 const UPSTREAM_SUSPENDED_RETRY_AFTER_SECS: u64 = 20;
+
+/// provider 打在「bearer-invalid 但该号已成功过」那条 bail 串上的机器可读标记。
+///
+/// 逐字节与 `provider.rs` 侧一致。用标记而非中文文案，理由同
+/// `pool_permanently_exhausted=1`：文案改动不该让分类失效。
+pub(crate) const BEARER_INVALID_TRANSIENT_MARKER: &str = "bearer_invalid_transient=1";
+
+/// 上游 **403 region 错配**（`The bearer token included in the request is invalid`）。
+///
+/// # 为什么必须单独一条
+///
+/// 上游原文（实测）：
+/// ```text
+/// 403 Forbidden {"__type":"com.amazon.aws.codewhisperer#AccessDeniedException",
+///  "message":"The bearer token included in the request is invalid."}
+/// ```
+///
+/// 这个串**匹配不上 `map_provider_error` 的任何分支**：不带 `retry_after_secs=`、
+/// 不含 `USER_REQUEST_RATE_EXCEEDED` / `Too many requests` / `temporarily is suspended`，
+/// 也不含 `translate_quota_subscription` 认的 `Invalid token`（那条要求首字母大写的
+/// `Invalid token`，而上游写的是句末 `is invalid.`）→ 落函数末尾兜底 →
+/// **502 且无 Retry-After**。实测 397 次全部走的这条路。
+///
+/// 而 502 对它是**错的方向**：`ksk_` token 按 region 授权，打错区恒 403，
+/// 这既不是服务端故障、也不是「稍后会好」。上游/外挂（`kiro_shield.py` 的
+/// `RETRYABLE={429,500,502,503,504}`）看见 5xx 会按服务器错误盲退避重打，
+/// 而正确处置是**改这个号的 region**（或让网关的 region 探测重选）——
+/// 重试多少次都不会变。故映射成 403 `permission_error` 且**不带 Retry-After**：
+/// 4xx 不在外挂的重试集内，客户端立刻拿到诚实结论，管理员也能从文案看到真实动作。
+///
+/// # 判据为何要窄，以及为何复用 endpoint 侧的谓词
+///
+/// 字符串判据直接调 [`crate::kiro::endpoint::default_is_bearer_token_invalid`] ——
+/// 那是 provider「要不要强制刷新 / 要不要判瞬态」用的**同一个**谓词
+/// （`provider.rs` 的 `endpoint.is_bearer_token_invalid(&body)`）。不在这里新写一份
+/// 子串匹配：新写一套必然与那侧漂移，而「同一个 403 两处结论相反」正是本仓已经
+/// 发生过的事故（见 HANDOFF-2026-08-04 §2.1：`temporarily is suspended`
+/// 在 handlers 认、在 endpoint 不认）。
+///
+/// **绝不**泛匹配 `AccessDeniedException` 或裸 403：那会把「账号真被永久封禁」
+/// 也归成 region 问题，给出错误的排障动作，同时与
+/// `is_upstream_temporarily_suspended` 的窄判据（`:548` 一带写明了理由）互相拆台。
+///
+/// # 顺序（承重）
+///
+/// - **401 必须让路**：同一响应体可能同时提两个码，而 401 的含义是「token 本身死了」，
+///   处置是刷新/换号而不是改 region。判据显式排除 401，与 `region_probe.rs`
+///   `classify_probe_result` 的「401 必须排在 403 之前判」同源 —— 那是本仓对
+///   **同一个分类问题**已经定下的顺序，这里照抄而不是另立一套。
+/// - **429 必须优先**：由 `map_provider_error` 的分支顺序保证
+///   （`is_upstream_rate_limited` 与全池冷却都在本条之前），本条不做重复判断。
+///
+/// 状态码用裸 `403` 子串匹配（同 `region_probe.rs`），而非
+/// `is_upstream_transient_5xx` 那种「必须带完整 HTTP 语境」的写法：这里已经有
+/// bearer-invalid 那句确切文案当主判据，`403` 只是辅助定位状态码。
+/// 代价是响应体里的 `requestId` 恰好含 `401` 时会**漏判**（退回旧的 502 兜底行为）——
+/// 方向上是安全的那一侧：漏判只是少修一次，误判会给出错误的排障动作。
+///
+/// # 为什么必须排除 provider 的瞬态标记（🔴 收窄，2026-08-06）
+///
+/// 同一句 bearer-invalid 文案，provider 自己已经分成了两类
+/// （`provider.rs` 的 `bearer_invalid_but_proven`，判据是 `has_ever_succeeded`）：
+/// - **从未成功过**的号 → 大概率真 region 错配（实测 3 个号共吃 17 次）；
+/// - **已成功过**的号 → token 对该端点证明有效，403 只能是抖动
+///   （实测 4 个号累计 3393 次成功、共吃 42 次这种 403）。
+///
+/// 即按本仓自己的取证，这个串的**多数出现不是 region 错配**。此前本判据只看
+/// 「bearer-invalid + 403 + 无 401」，于是把瞬态那一类也吞了，两个后果：
+/// ① 排障文案让管理员去查 region，而那个号的 region 是对的；
+/// ② 状态码从 502 变 403 —— 502 在外挂 `kiro_shield.py` 的
+/// `RETRYABLE={429,500,502,503,504}` 内会被重试，403 是 4xx 不重试。而瞬态那一类
+/// 下一次重试大概率落到别的号上成功（实测 #481 成功率 93.9%）⇒ 收窄之后这类退回
+/// 兜底的 502/可重试路径，是**恢复**了本该有的重试机会。
+///
+/// 判据用 provider 那条 bail 串里的机器可读标记 `bearer_invalid_transient=1`
+/// （与既有 `pool_permanently_exhausted=1` / `model_unsupported_by_pool=1` 同款范式），
+/// 不按中文文案匹配：文案改动不该让分类失效，那正是本类缺陷反复出现的成因。
+pub(crate) fn is_upstream_region_mismatch_403(err_str: &str) -> bool {
+    if !crate::kiro::endpoint::default_is_bearer_token_invalid(err_str) {
+        return false;
+    }
+    // provider 已判为瞬态抖动（该号成功过）→ 不是 region 错配，让它退回可重试路径。
+    // 必须排在 403 语境判断之前：瞬态那条 bail 串本身就带 `403 Forbidden`。
+    if err_str.contains(BEARER_INVALID_TRANSIENT_MARKER) {
+        return false;
+    }
+    let low = err_str.to_ascii_lowercase();
+    // 401 让路：token 死了 ≠ region 错了，两者处置动作不同。
+    if low.contains("401") || low.contains("认证失败") {
+        return false;
+    }
+    // 要求 403 语境（provider 把 `StatusCode` 原样 Display 成 `403 Forbidden`），
+    // 不是只看那句 message —— 同一句话若出现在别的状态码下，含义未必是授权层拒绝。
+    low.contains("403")
+}
 
 /// 把上游错误串翻译成带排障步骤的可读错误。命中已知类别返回 `Some`，未知返回 `None`（调用方透传）。
 /// 不处理需额外响应头的情形（429 + Retry-After 在 `map_provider_error` 单独处理，
@@ -581,7 +684,18 @@ fn translate_quota_subscription(err_str: &str) -> Option<TranslatedError> {
         });
     }
     // 上游容量紧张/模型短暂不可用：临时状态，稍后重试即可（常见于新模型发布初期）。
-    if err_str.contains("MODEL_TEMPORARILY_UNAVAILABLE") {
+    //
+    // 两个字面量是**同一语义的两种上游形态**（判据同款收口在
+    // `endpoint::default_is_model_temporarily_unavailable`）：
+    //   · 503 `MODEL_TEMPORARILY_UNAVAILABLE`
+    //   · 400 `ThrottlingException` + `reason:INSUFFICIENT_MODEL_CAPACITY`（实测 24h 272 次）
+    //
+    // 后者此前不命中**任何**分支 → 落 `map_provider_error` 末尾兜底 → **502 无 Retry-After**
+    // → 客户端当永久故障、不退避、原样重发。归到这里后与前者同样返 503 `overloaded_error`，
+    // 那是客户端会退避重试的形态。
+    if err_str.contains("MODEL_TEMPORARILY_UNAVAILABLE")
+        || err_str.contains("INSUFFICIENT_MODEL_CAPACITY")
+    {
         return Some(TranslatedError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             error_type: "overloaded_error",
@@ -595,7 +709,10 @@ fn translate_quota_subscription(err_str: &str) -> Option<TranslatedError> {
             message: "当前凭据所在 region 未开通该功能（profile 未激活）。排障：①网关会在刷新时自动验活重选可用 region；②如持续，右键该凭据切换 Profile ARN 到已开通 region（如 eu-central-1）；③确认该账号确在某 region 开通了 Kiro。".to_string(),
         });
     }
-    if err_str.contains("Improperly formed") || err_str.contains("Invalid token") || err_str.contains("subscription") {
+    if err_str.contains("Improperly formed")
+        || err_str.contains("Invalid token")
+        || err_str.contains("subscription")
+    {
         return Some(TranslatedError {
             status: StatusCode::BAD_GATEWAY,
             error_type: "api_error",
@@ -605,20 +722,77 @@ fn translate_quota_subscription(err_str: &str) -> Option<TranslatedError> {
     None
 }
 
+/// 「请求装不下」类错误对外 message 的**英文哨兵前缀** —— 这是给**外部消费者**看的契约，
+/// 不是给人读的文案。
+///
+/// # 为什么必须存在（2026-08-06 实测，Claude Code 本机二进制 2.1.220）
+///
+/// Claude Code 有两条压缩路径，网关模式下**只有第二条能用**：
+///
+/// 1. **反应式 auto-compact**（按 token 水位主动压）—— 入口有一道门：解析「上下文窗口」时
+///    若最终落到兜底档（六档优先级里的最后一档），该门直接 return false ⇒ **永不压缩**。
+///    那六档里唯一可能替网关发声的一档要求把窗口写进本地 bootstrap 缓存，而网关
+///    自身不实现那个 bootstrap 端点 ⇒ 该档恒空。详见
+///    `docs/auto-compact-fix-2026-08-06.md`。
+/// 2. **compact-and-retry**（撞到「装不下」后压缩再重试）—— 它的判据是对错误 message 做
+///    **小写化子串匹配**（形如 `msg.toLowerCase().includes("prompt is too long")
+///    || includes("input is too long for requested model")`），**与上面那道门无关**
+///    （实测其前置条件只有「auto-compact 总开关开」+「非远端会话」两项）。
+///
+/// ⇒ 服务端唯一能做的补救就是让「装不下」类错误的 message **含**那个子串。前缀而非替换：
+/// 后面的中文排障文案是给人读的，两者各服务一个受众。
+///
+/// ⚠️ **改这两条文案时必须保留这个前缀**。删掉它不会有任何编译或运行期报错，只会让用户的
+/// 自动压缩静默失效（撞满上下文后直接报错而不是压缩重试）—— 正是那种「没人会注意到」的失效。
+/// 承重测试 `overflow_errors_must_match_claude_code_compact_retry_predicate` 钉住它，
+/// 那条测试刻意写**字面量**而不引用本常量（引用了就变成同义反复，删前缀照样绿）。
+///
+/// ⚠️ 上面的机制是从某一个 build 抽出来的：**符号名会随版本漂移**（故此处不记符号名），
+/// 但「小写子串匹配」这个判据形态是稳定的可观测事实。
+const OVERFLOW_COMPACT_HINT: &str = "prompt is too long";
+
 /// 上下文/输入体积类（不可重试，需减小请求）。
 fn translate_context_input(err_str: &str) -> Option<TranslatedError> {
+    // 图片声明格式与实际字节不符（400 `IMAGE_MIME_MISMATCH`，用户线上实测）。
+    //
+    // 状态码保持 400 `invalid_request_error`：这确实是**请求构造**问题，重试/换号无意义
+    // （与通用 400 同处置）。单列一条的价值在**度量**：`converter.rs` 已按 magic bytes
+    // 校正声明的 media_type，但若仍有边缘情况漏掉，那些 400 混进通用 `bad_request` 桶
+    // 后在面板上不可分辨 ⇒ 无法回答「那条修干净了没有」。判据收口在
+    // `endpoint::default_is_image_mime_mismatch`（`default_is_*` 系列的家），
+    // 不在此处新写子串匹配 —— 两处各写一份必然漂移。
+    //
+    // 位置：在 `translate_quota_subscription` **之后**（`.or_else` 链的顺序保证）。
+    // 那条链里的容量判据 `INSUFFICIENT_MODEL_CAPACITY` **也是 400**，且必须拿 503
+    // `overloaded_error`（可退避重试）。顺序反了就把「上游没容量」说成「你的图片格式错」，
+    // 既误导用户、又让客户端不再退避。
+    if crate::kiro::endpoint::default_is_image_mime_mismatch(err_str) {
+        return Some(TranslatedError {
+            status: StatusCode::BAD_REQUEST,
+            error_type: "invalid_request_error",
+            message: "图片声明的 media_type 与实际字节格式不符（上游 IMAGE_MIME_MISMATCH）。这是请求构造问题，重试无效。排障：①按图片真实格式填写 media_type（如 JPEG 字节不要声明 image/png）；②不要在改扩展名后沿用旧的 media_type；③重新读取并重新编码该图片后再发。".to_string(),
+        });
+    }
+    // 两条都带 `OVERFLOW_COMPACT_HINT` 前缀：状态码与中文文案一字未改，只在最前面挂哨兵，
+    // 让 Claude Code 的 compact-and-retry 认出「这是装不下，压缩后重试还有戏」。
+    // 不改 400：这确实是「请求本身太大」，重试原请求无意义 —— 客户端要做的是**先压缩再重试**，
+    // 而它认的正是 message 而非状态码（实测那条判据只看 message 子串）。
     if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
         return Some(TranslatedError {
             status: StatusCode::BAD_REQUEST,
             error_type: "invalid_request_error",
-            message: "上下文窗口已满（对话历史累积超出模型上下文上限）。排障：①精简对话历史或开新会话；②缩短 system prompt；③减少同时挂载的工具数量。".to_string(),
+            message: format!(
+                "{OVERFLOW_COMPACT_HINT}: 上下文窗口已满（对话历史累积超出模型上下文上限）。排障：①精简对话历史或开新会话；②缩短 system prompt；③减少同时挂载的工具数量。"
+            ),
         });
     }
     if err_str.contains("Input is too long") {
         return Some(TranslatedError {
             status: StatusCode::BAD_REQUEST,
             error_type: "invalid_request_error",
-            message: "单次输入过长（请求体本身超出上游限制）。排障：①拆分过大的消息或附件；②减少一次性粘贴的文件内容；③对超大工具结果先做摘要。".to_string(),
+            message: format!(
+                "{OVERFLOW_COMPACT_HINT}: 单次输入过长（请求体本身超出上游限制）。排障：①拆分过大的消息或附件；②减少一次性粘贴的文件内容；③对超大工具结果先做摘要。"
+            ),
         });
     }
     None
@@ -644,6 +818,29 @@ fn is_transport_error(low: &str) -> bool {
         || (low.contains("operation timed out") && !low.contains("api 请求失败"))
 }
 
+/// 上游 **5xx 或传输层失败** —— 明确可重试的瞬态错误。
+///
+/// 用途：让这两类不再落 `map_provider_error` 末尾的「未识别兜底」（502 无 Retry-After）。
+///
+/// 判据刻意**只认四个确切的 HTTP 5xx 字样** + [`is_transport_error`]，绝不泛匹配
+/// 「含 5 开头的三位数」：上游错误体里带 `requestId` / 计数 / 时间戳时很容易出现
+/// `500` 之类的片段，泛匹配会把 4xx（配额耗尽、封号、参数错）误判成可重试 →
+/// 客户端对永久错误无限退避重试，正是本仓反复出现的那类缺陷。
+///
+/// 与 provider 内部「换不换号」的判据是**两回事**：这里只决定回给客户端的状态码。
+fn is_upstream_transient_5xx(err_str: &str) -> bool {
+    let low = err_str.to_ascii_lowercase();
+    if is_transport_error(&low) {
+        return true;
+    }
+    // 必须带 HTTP 语境（"500 internal server error" 这种完整形态），不裸匹配数字。
+    low.contains("500 internal server error")
+        || low.contains("502 bad gateway")
+        || low.contains("503 service unavailable")
+        || low.contains("504 gateway timeout")
+        || low.contains("internalserverexception")
+}
+
 /// 网络/传输类（多为可重试的暂时故障，常与代理配置相关）。
 ///
 /// **闸门**:仅当 [`is_transport_error`] 判定为真正的传输层错误才分类,否则返回 None——避免对
@@ -654,8 +851,11 @@ fn translate_network(err_str: &str) -> Option<TranslatedError> {
     if !is_transport_error(&low) {
         return None;
     }
-    if low.contains("dns") || low.contains("resolve") || low.contains("name resolution")
-        || low.contains("failed to lookup") {
+    if low.contains("dns")
+        || low.contains("resolve")
+        || low.contains("name resolution")
+        || low.contains("failed to lookup")
+    {
         return Some(TranslatedError {
             status: StatusCode::BAD_GATEWAY,
             error_type: "api_error",
@@ -686,21 +886,238 @@ fn translate_network(err_str: &str) -> Option<TranslatedError> {
     None
 }
 
-/// 将 KiroProvider 错误映射为 HTTP 响应
-fn map_provider_error(err: Error) -> Response {
-    let err_str = err.to_string();
-
-    // 全池冷却快速失败：token_manager 全池都在冷却时会带 retry_after_secs=N 快速 bail。
-    // 这里透传成标准 429 + Retry-After 头，让客户端(Claude Code)按其自身退避策略重试——
-    // 比网关内硬扛温和，也减少对被风控号的试探。
-    if let Some(secs) = err_str
+/// 从错误串里取 `retry_after_secs=N` 的 N。
+///
+/// 抽出成公共函数的理由：这段解析此前在 `map_provider_error` 内**复制了两份**（准入超时分支
+/// 与全池冷却分支各一份），而内置吸收层需要第三份。同一逻辑各写一份正是本仓漏改事故的形态
+/// （见 `update.rs` 的 chunked 缺口：第一轮只改了两处中的一处）。三个调用点共用一份，
+/// 消掉漂移面本身，而不是靠测试去比对两份拷贝是否仍然一致。
+pub(crate) fn parse_retry_after_secs(err_str: &str) -> Option<u64> {
+    err_str
         .split("retry_after_secs=")
         .nth(1)
         .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
         .and_then(|d| d.parse::<u64>().ok())
-    {
+}
+
+/// 内置「上游 429 吸收层」的可吸收类别。`None` = 不可吸收（详见 [`absorb_class_of`]）。
+///
+/// # 与外挂 `kiro_shield.py` 的类别对照（合并的依据）
+///
+/// | 外挂那侧 | 本枚举 | 退避节奏 |
+/// |---|---|---|
+/// | `RETRYABLE` 里的 429 | [`Self::UpstreamRateLimit`] | 指数（min_delay 起） |
+/// | `Retry-After` 头（它只看 HTTP 头） | [`Self::PoolCooldown`] | **号池进程内真值**，不需 HTTP 头往返 |
+/// | `SWAP_WINDOW_MARKERS` | [`Self::SwapWindow`] | 长阶梯 20/40/60s（需显式开预算） |
+/// | `RETRYABLE` 里的 5xx | [`Self::TransientServerError`] | 1s 起指数 |
+/// | 瞬态 400 标记白名单 | [`Self::TransientCapacity400`] | 中等（2s 起） |
+///
+/// 外挂白名单里未被本枚举覆盖的：`ServiceUnavailable` / `InternalFailure` / `SlowDown` /
+/// 裸 `ThrottlingException`。前三个本仓没有既有谓词、也没有实测样本证明它们真出现过
+/// （`InternalServerException` 已被 [`is_upstream_transient_5xx`] 覆盖）；裸
+/// `ThrottlingException` 是**刻意不认**——那个 `__type` 被真限流共用，详见
+/// `endpoint::default_is_model_temporarily_unavailable` 处的说明。新写一套字符串匹配
+/// 去覆盖它们，必然与渲染侧漂移，而那正是本仓反复出现的缺陷成因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AbsorbClass {
+    /// 全池冷却 / 整池 RPM 饱和 / 池真耗尽：`retry_after_secs=N` 带号池算出的**真实**恢复秒数。
+    PoolCooldown(u64),
+    /// 上游账户级速率限流（`USER_REQUEST_RATE_EXCEEDED` 一类）。可重试。
+    UpstreamRateLimit,
+    /// 403 账户级**临时风控** = 外挂所称的「换号空窗」：账号被风控 → 网关 auto_disable →
+    /// 切下一个凭据 → 推送补号，实测空窗约 **10 分钟**，期间该账号的请求全是 403。
+    ///
+    /// 默认**不吸收**（`upstream_retry_absorb_suspended`）；开启后若还想要长阶梯节奏，
+    /// 需另设 `upstream_retry_absorb_swap_budget_secs`。
+    ///
+    /// ⚠️ 与 [`Self::PoolCooldown`] **必须严格分开**，且那条判据排在前面（见
+    /// [`absorb_class_of`] 的顺序说明）：外挂 2026-08-04 踩过的坑正是把
+    /// `"All credentials"` 挂进 `SWAP_WINDOW_MARKERS` → 全池冷却被套上长阶梯 →
+    /// 本该等 10 秒（网关明确给了 `Retry-After: 10`）的等了几十秒。
+    /// 号池冷却**必须听网关真值**，换号空窗才用长阶梯。
+    SwapWindow,
+    /// 上游 **5xx**（网关/上游抖动）。默认**不吸收**，见 `upstream_retry_absorb_server_error`。
+    ///
+    /// 刻意**不含传输层**失败：连不上上游时 provider 内部换号已把每个号各试一遍，
+    /// 吸收层再套一层只是把同一个网络故障重打 N 遍。
+    TransientServerError,
+    /// 带**瞬态标记的 400**（模型容量不足）。默认**不吸收**，见 `upstream_retry_absorb_capacity_400`。
+    ///
+    /// 上游把这类瞬态故障塞进 400，与「请求写错了」同一个状态码，故判据必须窄到只认
+    /// 既有谓词认的那两个 reason 字面量，其余 400 一律透传。
+    TransientCapacity400,
+}
+
+/// 吸收层分类器：判据完全复用 `map_provider_error` 的既有谓词，不新写字符串匹配
+/// （新写一套必然与渲染侧漂移，那正是「所有凭据均已禁用落 502」的成因）。
+///
+/// ⚠️ 分支顺序是承重的，两处不能调换：
+/// 1. **准入超时必须最先判且返 `None`**。它与全池冷却共用 `retry_after_secs=` 标记，
+///    但语义正好相反：全池冷却是「上游没准备好，等等真的会好」，而准入超时是「网关自己在
+///    限流保护上游」—— 重试只是把同一个请求塞回同一个已经满的桶，队列更长、客户端等更久，
+///    且拿不到任何额外成功概率。下沉架构下这条串结构上到不了吸收层（provider 的 bail 在
+///    吸收循环之外），显式列出是为了防将来有人把准入闸门移进循环。
+/// 2. **`model_unsupported_by_pool=1` 必须排在 `retry_after_secs=` 之前**。号池对该模型是
+///    **永久**不可用，重试无效（吸收它等于把 404 死循环搬进网关）；而「模型级过滤但可恢复」
+///    那条 bail **带** `retry_after_secs=`。顺序反了就把永久态当可恢复态吸收。
+/// 3. **`PoolCooldown`（`retry_after_secs=`）必须排在 `SwapWindow` 之前**。两者都可能出现在
+///    同一个 403 语境里（全池冷却的 bail 串与被风控账号的响应体都能提到 suspend 字样），
+///    而处置**相反**：冷却听网关算出的真值（常是个位数秒），换号空窗走 20~60s 长阶梯。
+///    外挂 2026-08-04 就是把 `"All credentials"` 挂进 `SWAP_WINDOW_MARKERS` 才踩的坑 ——
+///    本该等 10 秒的等了几十秒。
+/// 4. **`TransientCapacity400` 必须排在 `TransientServerError` 之前**。容量类的一种上游形态是
+///    `503 Service Unavailable`（另一种是 400），而 5xx 判据认那句 `503 service unavailable`
+///    字样 ⇒ 顺序反了，容量类会被 5xx 抢走，套上 1s 起的短曲线而不是容量该有的中等曲线，
+///    且两个开关（`server_error` / `capacity_400`）的语义互相串台。
+/// 5. **新增的三条判据一律排在上面三条 `None` 之后**。那三条是「网关自己的背压」与「永久态」，
+///    任何通用判据排到它们前面都会把不该重试的东西吸收掉——本仓已有的守卫测试钉着这个顺序。
+pub(crate) fn absorb_class_of(err_str: &str) -> Option<AbsorbClass> {
+    if err_str.contains("inbound_admission_timeout=1") {
+        return None;
+    }
+    if err_str.contains("model_unsupported_by_pool=1") {
+        return None;
+    }
+    // 池**永久**耗尽：池里一个可自愈的号都没有（全是 QuotaExhausted /
+    // RefreshTokenInvalid / AccountSuspended 这类需人工处置的终态）。
+    // 必须排在 `retry_after_secs=` 之前 —— 它**带**那个标记（对客户端而言 429 +
+    // Retry-After 是对的：人工补号后确实会好），但在**单请求的 45s 预算内**
+    // 等多久都不会变，吸收它只是占着客户端连接空转满预算再返回同一个 429。
+    if err_str.contains("pool_permanently_exhausted=1") {
+        return None;
+    }
+    if let Some(secs) = parse_retry_after_secs(err_str) {
+        return Some(AbsorbClass::PoolCooldown(secs));
+    }
+    if is_upstream_rate_limited(err_str) {
+        return Some(AbsorbClass::UpstreamRateLimit);
+    }
+    if is_upstream_temporarily_suspended(err_str) {
+        return Some(AbsorbClass::SwapWindow);
+    }
+    // region 错配让路：它与瞬态 5xx/容量类都不沾，但**永久封禁**那类 403 的响应体里可能
+    // 带别的字样。显式排除一次，把「不可吸收的 403」全部挡在下面两条通用判据之前。
+    // 判据复用既有谓词（那侧自己已排除了 provider 打的瞬态标记）。
+    if is_upstream_region_mismatch_403(err_str) {
+        return None;
+    }
+    // 容量类**必须在 5xx 之前**：它的一种上游形态就是 503（另一种是 400），
+    // 而下面那条 5xx 判据认 `503 service unavailable` 字样。顺序反了容量类会被吞。
+    // 判据只调既有谓词，不新写字符串匹配。
+    if crate::kiro::endpoint::default_is_model_temporarily_unavailable(err_str) {
+        return Some(AbsorbClass::TransientCapacity400);
+    }
+    // 上游 5xx。`is_upstream_transient_5xx` 同时认传输层，这里显式减掉它：
+    // 传输层故障由 provider 内部换号已覆盖（每个号各试一遍），吸收层再套一层只是把
+    // 同一个网络故障重打 N 遍。这也保住既有测试
+    // `non_retryable_errors_are_not_absorbable` 里那条传输层用例的语义。
+    if is_upstream_transient_5xx(err_str) && !is_transport_error(&err_str.to_ascii_lowercase()) {
+        return Some(AbsorbClass::TransientServerError);
+    }
+    // 配额耗尽（MONTHLY_REQUEST_COUNT / QUOTA）/ 网络 / TLS / 其它 4xx / 未知：一律不吸收。
+    // 配额类要等下个计费周期，网络类由 provider 内部的换号已覆盖，再套一层只是放大。
+    None
+}
+
+/// provider 在「吸收层跑过至少一轮但仍放弃」时打在错误串上的机器可读标记。
+///
+/// 用途只有一个：让 [`map_provider_error`] 能把这类**且仅这类**请求的终态状态码换成 503
+/// （`upstream_retry_absorb_exhausted_status=503` 时）。没进过吸收层的 429 照旧是 429。
+///
+/// 用标记而非按中文文案匹配，理由同 `pool_permanently_exhausted=1` / `bearer_invalid_transient=1`：
+/// 文案改动不该让分类失效。
+pub(crate) const ABSORB_BUDGET_EXHAUSTED_MARKER: &str = "absorb_budget_exhausted=1";
+
+/// 吸收层耗尽后回 503 时的 Retry-After 秒数（无更精确真值时的兜底）。
+///
+/// 取值与 `UPSTREAM_RATE_LIMIT_RETRY_AFTER_SECS`（8）同源而非另立数字：这条路径的绝大多数
+/// 来源就是上游 429，8s 是那边实测曲线上「命中率回落到接近基线」的拐点。带 `retry_after_secs=`
+/// 真值时优先用真值（号池算出来的剩余秒数比任何常数都准）。
+const ABSORB_EXHAUSTED_RETRY_AFTER_SECS: u64 = UPSTREAM_RATE_LIMIT_RETRY_AFTER_SECS;
+
+/// 将 KiroProvider 错误映射为 HTTP 响应
+fn map_provider_error(err: Error) -> Response {
+    let err_str = err.to_string();
+
+    // ⭐ 吸收层已尽力重试仍失败，且部署侧显式要求这类终态回 503 —— **必须是第一条分支**。
+    //
+    // 为什么排最前：这个标记只可能打在**已经被判为可吸收**的错误串上，而那些串必然还带着
+    // 各自的原始特征（`retry_after_secs=` / `USER_REQUEST_RATE_EXCEEDED` /
+    // `temporarily is suspended` / 5xx 字样）—— 下面任何一条分支都会先把它们接走并返回 429。
+    // 排在后面等于这个开关静默失效。
+    //
+    // 为什么标记由 provider 打而不是在这里判「是不是可吸收类」：本函数拿到的错误串**分不出**
+    // 「吸收层真的跑过并放弃」与「吸收层根本没开、429 原样透传」。后者改成 503 是错的
+    // （网关一次都没重试，却告诉客户端「我们这边暂时不可用」）。
+    //
+    // 依据（外挂 `kiro_shield.py` 原注释）：Cursor 见 429 会**掐会话**，对 503 不会。
+    // 即同一个「网关已尽力但没成」的事实，用 429 表达让客户端直接放弃，用 503 表达让它
+    // 自己再退避重试。默认仍是 429（语义正确的那个，且 Claude Code 对 429 退避正常），
+    // 503 是为特定客户端做的兼容让步 —— 见 `upstream_retry_absorb_exhausted_status`。
+    if err_str.contains(ABSORB_BUDGET_EXHAUSTED_MARKER) {
+        // Retry-After 优先用号池真值（`retry_after_secs=N`），其次按类别兜底。
+        let retry_after = parse_retry_after_secs(&err_str)
+            .or_else(|| {
+                is_upstream_temporarily_suspended(&err_str)
+                    .then_some(UPSTREAM_SUSPENDED_RETRY_AFTER_SECS)
+            })
+            .unwrap_or(ABSORB_EXHAUSTED_RETRY_AFTER_SECS)
+            .clamp(1, 300);
+        tracing::warn!(
+            error = %err,
+            retry_after_secs = retry_after,
+            "内置吸收层已用尽预算仍未成功，按配置回 503（而非透传 429）：\
+             Cursor 一类客户端见 429 会掐会话，见 503 会自行退避重试"
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, retry_after.to_string())],
+            Json(ErrorResponse::new(
+                "api_error",
+                "网关已就该请求重试至预算上限，上游仍不可用。这是可重试的瞬态状态，\
+                 请按 Retry-After 退避后重试。若持续出现：①面板『限流健康』查看号池容量与冷却分布；\
+                 ②补充凭据分摊上游压力；③必要时调高 upstreamRetryAbsorb* 预算。",
+            )),
+        )
+            .into_response();
+    }
+
+    // 入站准入超时（网关自己的背压）——**必须排在全池冷却之前**，因为它同样带
+    // `retry_after_secs=`，顺序反了就会被下面那条抢走、又变回不可区分。
+    //
+    // 与全池冷却的语义正好相反：全池冷却是「上游没准备好，等等真的会好」，
+    // 而这条是「网关在主动限流保护上游」——重试只是把同一个请求塞回同一个满桶。
+    // 状态码仍是 429 + Retry-After（对**客户端**而言那是正确的：它该退避），
+    // 但 message 刻意与冷却不同，好让**重试层**（内置吸收层 / 外挂 kiro_shield）
+    // 能靠响应体分辨出「这是网关的背压，不该重试」。
+    // 两者若共用同一句文案，任何按 body 判定的重试层都会重试网关自己的背压信号。
+    if err_str.contains("inbound_admission_timeout=1") {
+        let retry_after = parse_retry_after_secs(&err_str).unwrap_or(1).clamp(1, 300);
+        tracing::warn!(
+            retry_after_secs = retry_after,
+            "入站准入排队超时（网关背压），返回 429 + Retry-After；不可吸收"
+        );
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, retry_after.to_string())],
+            Json(ErrorResponse::new(
+                "rate_limit_error",
+                "Gateway inbound rate shaping is at capacity (request admission timed out). \
+                 This is gateway-side backpressure, not an upstream cooldown; retrying immediately will not help.",
+            )),
+        )
+            .into_response();
+    }
+
+    // 全池冷却快速失败：token_manager 全池都在冷却时会带 retry_after_secs=N 快速 bail。
+    // 这里透传成标准 429 + Retry-After 头，让客户端(Claude Code)按其自身退避策略重试——
+    // 比网关内硬扛温和，也减少对被风控号的试探。
+    if let Some(secs) = parse_retry_after_secs(&err_str) {
         let retry_after = secs.clamp(1, 300);
-        tracing::warn!(retry_after_secs = retry_after, "全池冷却，返回 429 + Retry-After 让客户端退避");
+        tracing::warn!(
+            retry_after_secs = retry_after,
+            "全池冷却，返回 429 + Retry-After 让客户端退避"
+        );
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [(header::RETRY_AFTER, retry_after.to_string())],
@@ -796,16 +1213,88 @@ fn map_provider_error(err: Error) -> Response {
             .into_response();
     }
 
+    // 上游 **403 region 错配**（`bearer token ... is invalid`）：映射成 403 `permission_error`，
+    // 绝不落下方兜底的 502。实测 397 次全部落的兜底。
+    //
+    // 判据与理由见 `is_upstream_region_mismatch_403`。要点：这是**授权层**拒绝
+    // （`ksk_` token 按 region 授权，打错区恒 403），不是服务端故障、也不是「稍后会好」。
+    // 旧路径返 502 → 外挂 `kiro_shield.py`（`RETRYABLE={429,500,502,503,504}`）与客户端
+    // 都按 5xx 盲退避重打，而重打多少次都不会变；正确动作是改 region / 让 region 探测重选。
+    //
+    // 为什么不给 Retry-After、也不返 429：给了就等于宣称「等一会儿会好」，会把
+    // 一个需要人工（或探测器）介入的配置错误变成客户端侧的无限退避重试 ——
+    // 与 `is_upstream_temporarily_suspended` 刻意不吞永久封禁是同一条理由。
+    //
+    // 位置：在 429/临时风控**之后**（同一响应体可能同时提多个码，那两类的可重试语义优先），
+    // 在 `translate_upstream_error` **之前**（该链的 `Invalid token` / `subscription`
+    // 宽判据将来若被放宽，会先行吞掉这条并给出「刷新 Token」的错误排障动作）。
+    if is_upstream_region_mismatch_403(&err_str) {
+        tracing::warn!(
+            error = %err,
+            "上游 403 region 错配（bearer token invalid），返回 403 permission_error（旧代码落 502 兜底致上游/外挂按 5xx 盲退避）"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(
+                "permission_error",
+                "上游拒绝该凭据的授权（bearer token 对目标 region 无效）。这不是服务端故障，重试无效：\
+                 `ksk_` 类 token 按 region 授权，打错 region 恒被拒。排障：①面板查看该凭据的 region 是否与签发 region 一致；\
+                 ②对该凭据手动改 region（或等网关 region 探测自动重选）；③若整池同区，确认推号来源给的 region 正确。",
+            )),
+        )
+            .into_response();
+    }
+
     // 已确证含义的上游错误：翻译成带排障步骤的可读错误。
     if let Some(t) = translate_upstream_error(&err_str) {
         tracing::warn!(error = %err, error_type = t.error_type, "上游错误已翻译为可读排障提示");
         return (t.status, Json(ErrorResponse::new(t.error_type, t.message))).into_response();
     }
 
+    // 上游 5xx / 传输层错误：**503 + Retry-After**，不落未识别兜底的 502。
+    //
+    // 🔴 修复的缺陷（24h 实测）：上游 `InternalServerException`（160 条）与传输层失败
+    // （148 条）匹配不上上面任何分支 → 落末尾兜底 → **502 且无 Retry-After**。
+    // 后果与「所有凭据均已禁用落 502」同型：客户端（Claude Code）把 502 当服务端故障，
+    // 退避逻辑压根不启动，原样重发 → 又 502。而这两类都是**明确可重试的瞬态错误**。
+    //
+    // 更糟的是重试预算：`compute_max_retries` 按池子大小算，池里只剩 1 个可用号时
+    // 算出的是 1 —— 日志里那句 `尝试 1/1` 就是它。所以上游一次 500 **一次都没重试**
+    // 就吐给客户端了（实测 `server_error` 的 retries 分布：296 个 0 次、34 个 1 次）。
+    // 网关侧重试预算这条要单独修（它碰选号热路径），但**至少要让客户端知道该退避**。
+    //
+    // 判据复用 `is_retryable_upstream_error`（provider 决定是否换号用的同一个谓词），
+    // 不新写字符串匹配 —— 新写一套必然与那侧漂移，那正是本类缺陷反复出现的成因。
+    // 位置必须在兜底**之前**、在上面所有已识别分支**之后**：它只捡剩下的 5xx。
+    if is_upstream_transient_5xx(&err_str) {
+        const UPSTREAM_5XX_RETRY_AFTER_SECS: u64 = 3;
+        tracing::warn!(
+            error = %err,
+            retry_after_secs = UPSTREAM_5XX_RETRY_AFTER_SECS,
+            "上游 5xx/传输层瞬态错误，返回 503 + Retry-After（旧代码落 502 无 Retry-After 致客户端不退避）"
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(
+                header::RETRY_AFTER,
+                UPSTREAM_5XX_RETRY_AFTER_SECS.to_string(),
+            )],
+            Json(ErrorResponse::new(
+                "api_error",
+                "上游服务暂时不可用（5xx 或连接失败），这是可重试的瞬态错误。\
+                 请按 Retry-After 退避后重试；若持续出现，请查看网关日志。",
+            )),
+        )
+            .into_response();
+    }
+
     // 未知错误:**完整原文只进服务端日志**(便于 dwgx 排障),**不回给客户端**——原始错误链可能
     // 含上游响应体里的 profileArn / AWS 账号号 / region / 内部 URL 等敏感信息(review 泄露发现)。
     // 客户端只得通用提示 + 引导查网关日志,不泄露任何上游内部细节。
-    tracing::error!("Kiro API 调用失败（未识别，原文仅进日志不回客户端）: {}", err);
+    tracing::error!(
+        "Kiro API 调用失败（未识别，原文仅进日志不回客户端）: {}",
+        err
+    );
     (
         StatusCode::BAD_GATEWAY,
         Json(ErrorResponse::new(
@@ -827,7 +1316,10 @@ pub async fn get_models() -> impl IntoResponse {
     // supports_1m 的模型额外广告一条 `<id>[1m]` 变体,供只能传纯模型名的客户端选 1M 上下文。
     const ADVERTISED_CREATED: i64 = 1_759_104_000;
     let mut models: Vec<Model> = Vec::new();
-    for s in crate::anthropic::model_catalog::CATALOG.iter().filter(|s| s.advertised) {
+    for s in crate::anthropic::model_catalog::CATALOG
+        .iter()
+        .filter(|s| s.advertised)
+    {
         models.push(Model {
             id: s.advertised_id().to_string(),
             object: "model".to_string(),
@@ -873,7 +1365,10 @@ pub async fn post_messages(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new("invalid_request_error", format!("请求体解析失败: {e}"))),
+                Json(ErrorResponse::new(
+                    "invalid_request_error",
+                    format!("请求体解析失败: {e}"),
+                )),
             )
                 .into_response();
         }
@@ -997,23 +1492,22 @@ pub async fn post_messages(
     };
 
     // 构建 Kiro 请求体（发上游前，超阈值时执行输入压缩；profile_arn 由 provider 层注入）
-    let request_body = match build_kiro_request_body(
-        conversion_result.conversation_state,
-        &current_compression(),
-    ) {
-        Ok(body) => body,
-        Err(e) => {
-            tracing::error!("序列化请求失败: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    "internal_error",
-                    format!("序列化请求失败: {}", e),
-                )),
-            )
-                .into_response();
-        }
-    };
+    let request_body =
+        match build_kiro_request_body(conversion_result.conversation_state, &current_compression())
+        {
+            Ok(body) => body,
+            Err(e) => {
+                tracing::error!("序列化请求失败: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse::new(
+                        "internal_error",
+                        format!("序列化请求失败: {}", e),
+                    )),
+                )
+                    .into_response();
+            }
+        };
 
     tracing::debug!("Kiro request body: {}", request_body);
 
@@ -1027,10 +1521,7 @@ pub async fn post_messages(
 
     // 估算影子缓存：系统提示 + 历史轮次已被 Bedrock prefix cache 缓存（通过 agentContinuationId）。
     // 仅在有历史轮次时（messages.len() > 1）估算；首轮返回 0 保守不注入。
-    let prefix_tokens = token::count_prefix_tokens(
-        payload.system.as_deref(),
-        &payload.messages,
-    );
+    let prefix_tokens = token::count_prefix_tokens(payload.system.as_deref(), &payload.messages);
     let cache_breakdown =
         estimate_cache_breakdown(prompt_cache_enabled(), prefix_tokens, input_tokens);
 
@@ -1049,7 +1540,9 @@ pub async fn post_messages(
         // （等价 /cc/v1），让 message_start 的 input_tokens 用上游准确值——CC 会校验它。
         // 这样 CC 直接打 /v1 也能拿到正确行为，无需手动改用 /cc/v1 端点。
         if cc_auto_buffer_enabled() && is_claude_code_request(&headers) {
-            tracing::debug!("识别到 Claude Code 请求，/v1 流式自动切换为 buffered 分发（准确 input_tokens）");
+            tracing::debug!(
+                "识别到 Claude Code 请求，/v1 流式自动切换为 buffered 分发（准确 input_tokens）"
+            );
             handle_stream_request_buffered(
                 provider,
                 &request_body,
@@ -1079,7 +1572,17 @@ pub async fn post_messages(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = extract_thinking_enabled() && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, cache_breakdown, client).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+            cache_breakdown,
+            client,
+        )
+        .await
     }
 }
 
@@ -1104,7 +1607,13 @@ async fn handle_stream_request(
     };
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_full(model, input_tokens, thinking_enabled, tool_name_map, known_tool_names);
+    let mut ctx = StreamContext::new_full(
+        model,
+        input_tokens,
+        thinking_enabled,
+        tool_name_map,
+        known_tool_names,
+    );
     // 注入影子缓存估算（必须在 generate_initial_events 之前，message_start 才能携带 cache 字段）
     ctx.set_cache_usage(cache_breakdown);
 
@@ -1349,7 +1858,8 @@ fn mark_invalid_tool_input(
 ) {
     tracing::warn!(
         "工具输入 JSON 解析失败: {}, tool_use_id: {}（修复层也修不好,返回错误不静默空参）",
-        err, tool_use_id
+        err,
+        tool_use_id
     );
     if completion.is_ok() {
         *completion = CompletionStatus::UpstreamError {
@@ -1539,7 +2049,9 @@ async fn handle_non_stream_request(
                                             // 流式已 repair 的坏 JSON(非法转义/裸控制符/截断)在非流式白瞎。
                                             // 先尝试 repair_tool_json,复验通过则用修复结果、不置失败态。
                                             if super::handlers::tool_repair_json_enabled() {
-                                                if let Some(fixed) = super::stream::repair_tool_json(buffer) {
+                                                if let Some(fixed) =
+                                                    super::stream::repair_tool_json(buffer)
+                                                {
                                                     if let Ok(v) = serde_json::from_str(&fixed) {
                                                         tracing::info!(
                                                             "非流式工具 JSON 已修复为合法(tool_use_id={})",
@@ -1549,7 +2061,9 @@ async fn handle_non_stream_request(
                                                     } else {
                                                         // 理论不可达(repair 内部已复验),兜底走失败态。
                                                         mark_invalid_tool_input(
-                                                            &mut completion, &tool_use.tool_use_id, &e,
+                                                            &mut completion,
+                                                            &tool_use.tool_use_id,
+                                                            &e,
                                                         );
                                                         serde_json::json!({})
                                                     }
@@ -1558,13 +2072,17 @@ async fn handle_non_stream_request(
                                                     // 返回非 200，绝不静默吞成空参数——空参会让客户端把失败的
                                                     // 工具调用当成"无参数成功调用"执行，比报错更危险。
                                                     mark_invalid_tool_input(
-                                                        &mut completion, &tool_use.tool_use_id, &e,
+                                                        &mut completion,
+                                                        &tool_use.tool_use_id,
+                                                        &e,
                                                     );
                                                     serde_json::json!({})
                                                 }
                                             } else {
                                                 mark_invalid_tool_input(
-                                                    &mut completion, &tool_use.tool_use_id, &e,
+                                                    &mut completion,
+                                                    &tool_use.tool_use_id,
+                                                    &e,
                                                 );
                                                 serde_json::json!({})
                                             }
@@ -1605,22 +2123,38 @@ async fn handle_non_stream_request(
                             }
                         }
                         Event::ContextUsage(context_usage) => {
-                            // 从上下文使用百分比计算实际的 input_tokens
                             let window_size = get_context_window_size(model);
-                            let actual_input_tokens = (context_usage.context_usage_percentage
-                                * (window_size as f64)
-                                / 100.0)
-                                as i32;
-                            context_input_tokens = Some(actual_input_tokens);
-                            // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
-                            if context_usage.context_usage_percentage >= 100.0 {
+                            let pct = context_usage.context_usage_percentage;
+                            // ⭐ 判据与流式路径**共用同一个函数**（见其文档注释：两份独立实现
+                            // 曾导致同一个上游异常在两条路径上表现不同 —— 流式忽略脏值、
+                            // 非流式把计费口径的 input_tokens 写成 0 或 i32::MAX）。
+                            // 由源码守卫 `context_usage_predicate_must_be_shared` 钉死。
+                            match crate::anthropic::stream::context_input_tokens_from_pct(
+                                pct,
+                                window_size,
+                            ) {
+                                Some(actual_input_tokens) => {
+                                    context_input_tokens = Some(actual_input_tokens);
+                                    tracing::debug!(
+                                        "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
+                                        pct,
+                                        actual_input_tokens
+                                    );
+                                }
+                                None => {
+                                    // 不覆盖 `context_input_tokens`：保留上一次有效值，或让
+                                    // 下游 `unwrap_or` 退回本地估算。warn 因为这代表上游协议异常。
+                                    tracing::warn!(
+                                        "收到无效 contextUsageEvent（{}%，非正或非有限值），\
+                                         忽略该信号、不覆盖已有 input_tokens（避免计费口径被归零）",
+                                        pct
+                                    );
+                                }
+                            }
+                            // 上界判定与下界守卫**互不依赖**：即便将来下界改动，这条照旧生效。
+                            if pct >= 100.0 {
                                 stop_reason = "model_context_window_exceeded".to_string();
                             }
-                            tracing::debug!(
-                                "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
-                                context_usage.context_usage_percentage,
-                                actual_input_tokens
-                            );
                         }
                         Event::Metering(metering) => {
                             credits_used = Some(credits_used.unwrap_or(0.0) + metering.usage);
@@ -1630,24 +2164,38 @@ async fn handle_non_stream_request(
                         Event::ReasoningContent(r) => {
                             reasoning_content.push_str(&r.text);
                         }
-                        Event::Exception { exception_type, message } => {
+                        Event::Exception {
+                            exception_type,
+                            message,
+                        } => {
                             // 铁律：ContentLengthExceededException = max_tokens 干净收尾，绝不算失败。
                             if exception_type == "ContentLengthExceededException" {
                                 stop_reason = "max_tokens".to_string();
                             } else if completion.is_ok() {
                                 // 其它异常是上游真实失败，置失败态（保留首因）。
-                                tracing::error!("非流式收到 in-band 异常: {} - {}", exception_type, message);
+                                tracing::error!(
+                                    "非流式收到 in-band 异常: {} - {}",
+                                    exception_type,
+                                    message
+                                );
                                 completion = CompletionStatus::UpstreamError {
                                     code: exception_type,
                                     message,
                                 };
                             }
                         }
-                        Event::Error { error_code, error_message } => {
+                        Event::Error {
+                            error_code,
+                            error_message,
+                        } => {
                             // in-band 错误事件：落入历史的 `_ => {}` 会被静默忽略、照样返回 200，
                             // 这里显式置失败态，收尾时返回非 200 并按真实 outcome 记账。
                             if completion.is_ok() {
-                                tracing::error!("非流式收到 in-band 错误: {} - {}", error_code, error_message);
+                                tracing::error!(
+                                    "非流式收到 in-band 错误: {} - {}",
+                                    error_code,
+                                    error_message
+                                );
                                 completion = CompletionStatus::UpstreamError {
                                     code: error_code,
                                     message: error_message,
@@ -1662,14 +2210,21 @@ async fn handle_non_stream_request(
                         // （收尾靠下方 `if !completion.is_ok()` 返回 502+记账），避免截断被当成功。
                         // 非 tool 帧解析失败历史上就允许被忽略，仅告警不置失败态，防误伤正常流。
                         if et.as_deref() == Some("toolUseEvent") {
-                            tracing::warn!("非流式 toolUseEvent 帧解析失败,按响应截断处理: {}", err);
+                            tracing::warn!(
+                                "非流式 toolUseEvent 帧解析失败,按响应截断处理: {}",
+                                err
+                            );
                             if completion.is_ok() {
                                 completion = CompletionStatus::DecoderStopped {
                                     message: format!("toolUseEvent 帧解析失败: {}", err),
                                 };
                             }
                         } else {
-                            tracing::warn!("非流式事件帧解析失败(event_type={:?}),已忽略: {}", et.as_deref(), err);
+                            tracing::warn!(
+                                "非流式事件帧解析失败(event_type={:?}),已忽略: {}",
+                                et.as_deref(),
+                                err
+                            );
                         }
                     }
                 }
@@ -1711,12 +2266,15 @@ async fn handle_non_stream_request(
             client.apply(&mut record);
             crate::usage::emit_record(record);
         }
-        let status = StatusCode::from_u16(completion.http_status_u16())
-            .unwrap_or(StatusCode::BAD_GATEWAY);
+        let status =
+            StatusCode::from_u16(completion.http_status_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         let sse_error_type = completion.sse_error_type();
         return (
             status,
-            Json(ErrorResponse::new(sse_error_type, completion.client_message())),
+            Json(ErrorResponse::new(
+                sse_error_type,
+                completion.client_message(),
+            )),
         )
             .into_response();
     }
@@ -1760,10 +2318,17 @@ async fn handle_non_stream_request(
             }));
         }
     } else if !text_content.is_empty() {
-        content.push(json!({
-            "type": "text",
-            "text": text_content
-        }));
+        // 客户端没声明 thinking，但模型仍可能吐内联 `<thinking>` 标签 —— 剥掉再下发。
+        // 此前这里是 `"text": text_content` 原样塞入 ⇒ 标签与模型内部推理逐字泄漏。
+        // 口径与流式的 `strip_inline_thinking_when_disabled`、以及
+        // `process_reasoning_content` 在 !thinking_enabled 时直接丢帧一致。
+        let stripped = super::stream::strip_thinking_from_complete_text(&text_content);
+        if !stripped.is_empty() {
+            content.push(json!({
+                "type": "text",
+                "text": stripped
+            }));
+        }
     }
 
     content.extend(tool_uses);
@@ -1855,14 +2420,10 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_opus_4_6 =
-        model_lower.contains("opus") && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+    let is_opus_4_6 = model_lower.contains("opus")
+        && (model_lower.contains("4-6") || model_lower.contains("4.6"));
 
-    let thinking_type = if is_opus_4_6 {
-        "adaptive"
-    } else {
-        "enabled"
-    };
+    let thinking_type = if is_opus_4_6 { "adaptive" } else { "enabled" };
 
     tracing::info!(
         model = %payload.model,
@@ -1874,7 +2435,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         thinking_type: thinking_type.to_string(),
         budget_tokens: 20000,
     });
-    
+
     if is_opus_4_6 {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
@@ -1996,23 +2557,22 @@ pub async fn post_messages_cc(
     };
 
     // 构建 Kiro 请求体（发上游前，超阈值时执行输入压缩；profile_arn 由 provider 层注入）
-    let request_body = match build_kiro_request_body(
-        conversion_result.conversation_state,
-        &current_compression(),
-    ) {
-        Ok(body) => body,
-        Err(e) => {
-            tracing::error!("序列化请求失败: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    "internal_error",
-                    format!("序列化请求失败: {}", e),
-                )),
-            )
-                .into_response();
-        }
-    };
+    let request_body =
+        match build_kiro_request_body(conversion_result.conversation_state, &current_compression())
+        {
+            Ok(body) => body,
+            Err(e) => {
+                tracing::error!("序列化请求失败: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse::new(
+                        "internal_error",
+                        format!("序列化请求失败: {}", e),
+                    )),
+                )
+                    .into_response();
+            }
+        };
 
     tracing::debug!("Kiro request body: {}", request_body);
 
@@ -2025,10 +2585,7 @@ pub async fn post_messages_cc(
     ) as i32;
 
     // 估算影子缓存（与 /v1 路径逻辑一致）
-    let prefix_tokens = token::count_prefix_tokens(
-        payload.system.as_deref(),
-        &payload.messages,
-    );
+    let prefix_tokens = token::count_prefix_tokens(payload.system.as_deref(), &payload.messages);
     let cache_breakdown =
         estimate_cache_breakdown(prompt_cache_enabled(), prefix_tokens, input_tokens);
 
@@ -2091,7 +2648,17 @@ pub async fn post_messages_cc(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = extract_thinking_enabled() && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, cache_breakdown, client).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+            cache_breakdown,
+            client,
+        )
+        .await
     }
 }
 
@@ -2119,7 +2686,13 @@ async fn handle_stream_request_buffered(
     };
 
     // 创建缓冲流处理上下文
-    let mut ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map, known_tool_names);
+    let mut ctx = BufferedStreamContext::new(
+        model,
+        estimated_input_tokens,
+        thinking_enabled,
+        tool_name_map,
+        known_tool_names,
+    );
     // 注入影子缓存估算（finish_and_get_all_events 回补 message_start 时会携带 cache 字段）
     ctx.set_cache_usage(cache_breakdown);
 
@@ -2465,6 +3038,56 @@ mod non_stream_cache_accounting_tests {
         assert_eq!(record.cache_creation_tokens, 0, "首轮无前缀缓存应记 0");
     }
 
+    /// 🔴 源码级守卫：`contextUsageEvent` 的判据必须**与流式路径共用同一个函数**，
+    /// 不得在本文件里重新算一遍。
+    ///
+    /// # 为什么需要这条
+    ///
+    /// 这个判据有两个调用点（流式 `StreamContext` / 非流式本文件的缓冲聚合循环）。
+    /// 它们曾是两份独立实现，**只有流式那份有下界守卫** ⇒ 同一个上游异常在两条路径上
+    /// 表现不同：流式忽略脏值，非流式把计费口径的 `input_tokens` 写成 0
+    /// （或 NaN 经 `as i32` 饱和成的 `i32::MAX`）。
+    ///
+    /// 本仓已多次踩「同一判据两份实现、只修了其中一份」这个形态（`endpoint_for` 与
+    /// `for_credentials`、`restart_fields` 与 reload restore 表、`cleanup_verdict` 与
+    /// `batch-delete`）。给第二处也加个守卫治不了根 —— 两份实现仍会各自演化。
+    /// 本守卫钉的是**物理共用**：本文件不得出现自己的百分比乘算。
+    #[test]
+    fn context_usage_predicate_must_be_shared() {
+        let src = include_str!("handlers.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        // 只看生产段，且剔掉注释行（否则本守卫会匹配到注释里的说明文字或被注释掉的实现，
+        // 变成「把实现注释掉守卫仍绿」的纸面测试 —— 该形态本轮实测踩过一次）。
+        // ⚠️ 还要把连续空白归一成单空格。否则 rustfmt 在表达式中间插一个换行就能让
+        // 下面的反向断言失配 ⇒ 守卫静默失效（本轮实测踩到：手工回退时那句乘算被格式化成
+        // 三行，含换行的 needle 匹配不上，守卫报绿）。归一后断言与排版无关。
+        let prod: String = src[..cut]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        // needle 运行时拼接，避免 include_str! 把本测试自己的字面量算进匹配。
+        let shared_call = format!("stream::context_input_tokens_from_pct{}", "(");
+        assert!(
+            prod.contains(&shared_call),
+            "非流式路径必须调用共享判据 `context_input_tokens_from_pct`，\
+             不得自行判定 —— 否则两条路径会再次分叉（只有一侧有下界守卫）"
+        );
+
+        // 反向断言：不得再出现自己的乘算。历史实现是
+        // `context_usage.context_usage_percentage * (window_size as f64) / 100.0`。
+        let own_math = format!("context_usage_percentage {}", "* (window_size as f64)");
+        assert!(
+            !prod.contains(&own_math),
+            "本文件不得自行用百分比乘算 input_tokens（发现历史实现的形状）：\
+             那正是下界守卫缺失的那一份。改为调用 `context_input_tokens_from_pct`。"
+        );
+    }
+
     /// 源码级守卫：非流式成功埋点块必须调用 [`apply_cache_breakdown`]。
     /// 纯单测覆盖不到 `handle_non_stream_request`（需真实上游 + `CallMeta`/`InflightGuard`），
     /// 故用本文件源码断言把"埋点块漏写 cache 字段"这一具体回归钉死。
@@ -2498,7 +3121,9 @@ mod ip_blocklist_tests {
 
     #[test]
     fn test_ip_blocklist_business_layer() {
-        let _guard = BLOCKLIST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = BLOCKLIST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // 空黑名单:任何 IP 都不拦。
         set_ip_blocklist(&[]);
         assert!(!ip_is_blocked("223.73.32.14"));
@@ -2521,7 +3146,9 @@ mod machine_code_blocklist_tests {
 
     #[test]
     fn test_machine_code_blocklist_business_layer() {
-        let _guard = BLOCKLIST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = BLOCKLIST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // 空黑名单:任何机器码都不拦。
         set_machine_code_blocklist(&[]);
         let code = crate::usage::machine_code_of(Some("223.73.32.14"), Some("claude-code"));
@@ -2531,14 +3158,20 @@ mod machine_code_blocklist_tests {
         set_machine_code_blocklist(&[code.clone()]);
         assert!(machine_code_is_blocked(&code), "命中机器码应拦");
         // 大小写不敏感。
-        assert!(machine_code_is_blocked(&code.to_uppercase()), "大写形式也应命中");
+        assert!(
+            machine_code_is_blocked(&code.to_uppercase()),
+            "大写形式也应命中"
+        );
         // 另一台机器(不同 IP → 不同码)不受影响。
         let other = crate::usage::machine_code_of(Some("8.8.8.8"), Some("claude-code"));
         assert!(!machine_code_is_blocked(&other), "未拉黑的机器码应放行");
 
         // 有 IP 时 device 不影响判定(machine_key = IP)。
         let same_ip_diff_dev = crate::usage::machine_code_of(Some("223.73.32.14"), Some("vscode"));
-        assert!(machine_code_is_blocked(&same_ip_diff_dev), "同 IP 不同 device 仍应命中");
+        assert!(
+            machine_code_is_blocked(&same_ip_diff_dev),
+            "同 IP 不同 device 仍应命中"
+        );
 
         // 清空恢复(避免污染其它测试的全局镜像)。
         set_machine_code_blocklist(&[]);
@@ -2553,7 +3186,9 @@ mod machine_code_blocklist_tests {
         use std::net::SocketAddr;
         use std::sync::atomic::Ordering;
 
-        let _guard = BLOCKLIST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = BLOCKLIST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         // 反代场景:对端=本机 openresty(127.0.0.1),XFF 最右=反代追加的真实客户端 IP。
         // (A1:最右不可伪造;此处 223.73.32.14 是反代追加的真实 IP。)
@@ -2582,7 +3217,10 @@ mod machine_code_blocklist_tests {
 
         // 场景 C:都不命中→放行(None)。
         set_machine_code_blocklist(&[]);
-        assert!(security_block_response(&headers, proxy_peer).is_none(), "未命中应放行");
+        assert!(
+            security_block_response(&headers, proxy_peer).is_none(),
+            "未命中应放行"
+        );
 
         // 恢复全局状态,避免污染其它测试。
         set_ip_blocklist(&[]);
@@ -2607,7 +3245,9 @@ mod machine_code_blocklist_tests {
         use axum::http::HeaderMap;
         use std::net::SocketAddr;
 
-        let _guard = BLOCKLIST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = BLOCKLIST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         // 反代在**公网** IP —— 这是本缺陷唯一的受害场景（私网对端两种实现结果相同，测不出差异）。
         let public_proxy: Option<SocketAddr> = Some("203.0.113.99:443".parse().unwrap());
@@ -2641,7 +3281,9 @@ mod machine_code_blocklist_tests {
         use axum::http::HeaderMap;
         use std::net::SocketAddr;
 
-        let _guard = BLOCKLIST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = BLOCKLIST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let proxy_peer: Option<SocketAddr> = Some("127.0.0.1:8990".parse().unwrap());
 
@@ -2697,6 +3339,38 @@ mod error_translation_tests {
     /// 落到兜底 → 502 BAD_GATEWAY。客户端（Claude Code）把 502 当服务故障、退避逻辑不启动、
     /// 立刻重发 → 撞进上游惩罚窗口（实测窗口内命中率 47.2%）→ 单次拒绝被放大成
     /// 最长 52min/431 次的持续发作（当天 3 个长发作占全部 429 的 84%）。
+    /// ⭐ 回归（走真实 `map_provider_error` 出口）：400 `INSUFFICIENT_MODEL_CAPACITY`
+    /// 必须映射成 **503 `overloaded_error`**，而不是兜底的 502。
+    ///
+    /// 这是与上面那条 429 缺陷**完全同型**的第二例，只是形态不同：
+    /// 上游发的是 HTTP 400 + `ThrottlingException` + `reason:INSUFFICIENT_MODEL_CAPACITY`
+    /// （实测 24h **272 次**）。它逐条落空所有分支 → 落末尾兜底 →
+    /// **502 Bad Gateway 且无 Retry-After** → 客户端按永久性服务端故障处理 →
+    /// 不退避、原样重发 → 在上游容量本就不足时继续加压。
+    ///
+    /// 断言落在**客户端实际看到的状态码**上，不是只断言谓词函数 ——
+    /// 后者是纸面测试（本仓已踩过两次）：把 `translate_upstream_error` 里那条
+    /// `|| err_str.contains("INSUFFICIENT_MODEL_CAPACITY")` 删掉，谓词测试仍会全绿。
+    ///
+    /// 删掉那条 → 本测试必 FAILED（实得 502）。
+    #[test]
+    fn insufficient_model_capacity_maps_to_503_not_bad_gateway() {
+        let raw = r#"流式 API 请求失败: 400 Bad Request {"__type":"com.amazon.aws.codewhisperer#ThrottlingException","message":"I am experiencing high traffic, please try again shortly.","reason":"INSUFFICIENT_MODEL_CAPACITY"}"#;
+        let resp = map_provider_error(anyhow::Error::msg(raw));
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "容量不足必须返 503（客户端会退避重试），而非兜底的 502（客户端当永久故障不退避）"
+        );
+        // 对照：既有的 503 形态必须仍然同样映射，不得因本次改动漂移。
+        let legacy = r#"流式 API 请求失败: 503 Service Unavailable {"reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#;
+        assert_eq!(
+            map_provider_error(anyhow::Error::msg(legacy)).status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "既有 MODEL_TEMPORARILY_UNAVAILABLE 形态不得回退"
+        );
+    }
+
     #[test]
     fn test_upstream_429_maps_to_429_with_retry_after() {
         // provider 实际组装的错误串原文（含 HTTP 状态码 + 上游 body）。
@@ -2730,6 +3404,84 @@ mod error_translation_tests {
     ///
     /// 为什么"真耗尽"该给退避而不是当永久故障：它**会自愈**（全池自愈实测 41 分钟触发 36 次），
     /// 403 `TEMPORARILY_SUSPENDED` 本身也是限时态。
+    /// ⭐ 上游 5xx / 传输层失败 → **503 + Retry-After**，不落未识别兜底的 502。
+    ///
+    /// 回退即 FAIL：删掉 `map_provider_error` 里那条 `is_upstream_transient_5xx` 分支 ——
+    /// 这两类会逐条穿过所有已识别分支、落末尾兜底 → **502 且无 Retry-After** →
+    /// 客户端（Claude Code）把 502 当服务端故障，退避逻辑压根不启动、原样重发。
+    ///
+    /// 实测量级（24h）：上游 `InternalServerException` 160 条 + 传输层失败 148 条，
+    /// 其中 296 条 `retries=0` —— 因为 `compute_max_retries` 按池子大小算，
+    /// 只剩 1 个可用号时算出的是 1（日志那句 `尝试 1/1`），所以上游一次 500
+    /// **一次都没重试**就吐给客户端。网关侧重试预算要单独修（碰选号热路径），
+    /// 但至少要让客户端知道该退避。
+    #[test]
+    fn upstream_5xx_and_transport_errors_map_to_503_with_retry_after() {
+        for err_str in [
+            // 线上原文（provider 格式化后的形态）
+            r#"非流式 API 请求失败: 500 Internal Server Error {"__type":"com.amazon.aws.codewhisperer#InternalServerException","message":"Encountered an unexpected error when processing the request, please try again."}"#,
+            r#"流式 API 请求失败: 502 Bad Gateway {"message":"upstream"}"#,
+            r#"流式 API 请求失败: 503 Service Unavailable {"message":"x"}"#,
+            r#"流式 API 请求失败: 504 Gateway Timeout {"message":"x"}"#,
+            "error sending request for url (https://runtime.us-east-1.kiro.dev/generateAssistantResponse)",
+        ] {
+            let resp = map_provider_error(anyhow::Error::msg(err_str.to_string()));
+            assert_eq!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "上游 5xx/传输层必须映射成 503（旧代码落兜底 502 无 Retry-After）: {err_str}"
+            );
+            assert!(
+                resp.headers().get(header::RETRY_AFTER).is_some(),
+                "必须带 Retry-After，否则客户端不退避: {err_str}"
+            );
+        }
+    }
+
+    /// ⭐ 顺序守卫：5xx 判据**绝不能**抢走已识别的分支，也不能误判 4xx。
+    ///
+    /// 回退即 FAIL：把 `is_upstream_transient_5xx` 那条 `if` 移到 `map_provider_error`
+    /// 靠前的位置（例如 429/403/model-unsupported 之前）——那些本该拿 429/404 的错误
+    /// 会被当成 5xx 返 503，客户端的退避语义整体错位。
+    #[test]
+    fn transient_5xx_branch_must_not_shadow_more_specific_ones() {
+        // 429 仍必须是 429
+        // 线上真实 429 原文（19855/19855 条都含小写 "Too many requests" 这句 message；
+        // 判据故意不认 HTTP reason phrase 的大写 "Too Many Requests"，实测零漏判）。
+        let r = map_provider_error(anyhow::Error::msg(
+            r#"流式 API 请求失败: 429 Too Many Requests {"__type":"com.amazon.kiro.runtimeservice#ThrottlingException","message":"Too many requests, please wait before trying again.","reason":"USER_REQUEST_RATE_EXCEEDED"}"#.to_string(),
+        ));
+        assert_eq!(
+            r.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "429 不得被 5xx 分支抢走"
+        );
+
+        // 全池冷却（带 retry_after_secs=）仍必须是 429
+        let r = map_provider_error(anyhow::Error::msg(
+            "所有凭据均已禁用（0/2）retry_after_secs=10".to_string(),
+        ));
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // 模型永久不可用仍必须是 404 且无 Retry-After
+        let r = map_provider_error(anyhow::Error::msg(
+            "模型不被本号池支持 model_unsupported_by_pool=1".to_string(),
+        ));
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        assert!(r.headers().get(header::RETRY_AFTER).is_none());
+
+        // ⭐ 4xx 绝不能被误判成瞬态 5xx（判据只认确切的 5xx 字样，不裸匹配数字）
+        for s in [
+            r#"400 Bad Request {"requestId":"abc-500-def"}"#,
+            r#"403 Forbidden {"message":"quota exceeded, 500 requests used"}"#,
+        ] {
+            assert!(
+                !is_upstream_transient_5xx(s),
+                "4xx 不得被当成可重试的 5xx（响应体里含 500 之类的数字很常见）: {s}"
+            );
+        }
+    }
+
     #[test]
     fn test_pool_truly_exhausted_maps_to_429_with_retry_after_not_502() {
         // token_manager 的两个 bail 点实际组装的错误串原文。
@@ -2794,6 +3546,297 @@ mod error_translation_tests {
         );
     }
 
+    /// ⭐ 致命缺陷回归（删掉分支即 FAIL）：**403 region 错配**曾落 502 兜底，实测 397 次。
+    ///
+    /// 旧路径：该串不带 `retry_after_secs=`、不含 `USER_REQUEST_RATE_EXCEEDED` /
+    /// `Too many requests` / `temporarily is suspended`，也不含 `translate_quota_subscription`
+    /// 认的首字母大写 `Invalid token`（上游写的是句末 `is invalid.`）→ 穿过所有分支 →
+    /// 末尾兜底 **502 无 Retry-After** → 外挂 `kiro_shield.py`
+    /// （`RETRYABLE={429,500,502,503,504}`）与客户端都按 5xx 盲退避重打，
+    /// 而 `ksk_` token 按 region 授权、打错区恒 403，重打多少次都不会变。
+    #[test]
+    fn test_region_mismatch_403_maps_to_permission_error_not_502() {
+        // provider 实际组装的错误串原文（`{api_type} API 请求失败: {status} {body}`）。
+        for raw in [
+            r#"流式 API 请求失败: 403 Forbidden {"__type":"com.amazon.aws.codewhisperer#AccessDeniedException","message":"The bearer token included in the request is invalid."}"#,
+            r#"非流式 API 请求失败（所有凭据已用尽）: 403 Forbidden {"__type":"com.amazon.kiro.runtimeservice#AccessDeniedException","message":"The bearer token included in the request is invalid."}"#,
+        ] {
+            let resp = map_provider_error(anyhow::Error::msg(raw.to_string()));
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "region 错配型 403 必须映射成 403 permission_error（旧代码落兜底 502 → \
+                 外挂按 5xx 盲退避重打一个永远不会变的授权错误）: {raw}"
+            );
+            assert!(
+                resp.headers().get(header::RETRY_AFTER).is_none(),
+                "region 错配不该带 Retry-After —— 给了就等于宣称「等一会儿会好」: {raw}"
+            );
+        }
+    }
+
+    /// 边界：判据必须**窄** —— 永久封禁串不得命中 region 错配分支。
+    ///
+    /// 若为了接住那 397 次而泛匹配 `AccessDeniedException` 或裸 403，账号真被永久封禁时
+    /// 会被告知「改 region」，给出完全错误的排障动作，同时与
+    /// `is_upstream_temporarily_suspended` 的窄判据互相拆台。
+    #[test]
+    fn test_region_mismatch_judgement_is_narrow() {
+        // ① 永久封禁：同为 403 + AccessDeniedException，但不含 bearer-invalid 那句。
+        let banned = r#"流式 API 请求失败: 403 Forbidden {"__type":"com.amazon.aws.codewhisperer#AccessDeniedException","message":"Your account has been permanently disabled for violating the terms of service."}"#;
+        assert!(
+            !is_upstream_region_mismatch_403(banned),
+            "永久封禁不得被判成 region 错配（否则排障动作完全错，且掩盖真实故障）"
+        );
+        // ② 临时风控：同为 403 + AccessDeniedException，也不含那句。
+        let suspended = r#"流式 API 请求失败: 403 Forbidden {"__type":"com.amazon.aws.codewhisperer#AccessDeniedException","message":"Your User ID (450334904897) temporarily is suspended."}"#;
+        assert!(
+            !is_upstream_region_mismatch_403(suspended),
+            "临时风控不得被 region 分支抢走（它必须拿 429 + Retry-After）"
+        );
+        // ③ 401：token 本身死了 ≠ region 错了。处置是刷新/换号，不是改 region。
+        //    与 `region_probe.rs::classify_probe_result` 的「401 排在 403 之前」同源。
+        let dead_token = r#"流式 API 请求失败: 401 Unauthorized {"message":"The bearer token included in the request is invalid.","requestId":"403-ish-id"}"#;
+        assert!(
+            !is_upstream_region_mismatch_403(dead_token),
+            "401 必须让路：token 死了要刷新/换号，不是改 region"
+        );
+        // ④ 裸 403 无任何 message：不得命中（判据要求那句确切文案）。
+        assert!(!is_upstream_region_mismatch_403("403 Forbidden"));
+    }
+
+    /// provider 组装 bearer-invalid 型 403 时的**真实**错误串。
+    ///
+    /// 形状逐字取自 `provider.rs`：`"{api_type} API 请求失败: {status} {body}"`
+    /// （`api_type` = `流式` / `非流式`，`status` 是 `StatusCode` 的 Display ⇒ `403 Forbidden`）。
+    const REAL_BEARER_INVALID_403: &str = r#"流式 API 请求失败: 403 Forbidden {"__type":"com.amazon.aws.codewhisperer#AccessDeniedException","message":"The bearer token included in the request is invalid."}"#;
+
+    /// ⭐ 顺序守卫：region 错配分支**绝不能**抢走 429 / 全池冷却 / 临时风控 / 模型不支持。
+    ///
+    /// 回退即 FAIL 的形态是「把 `is_upstream_region_mismatch_403` 那条 `if` 上移到
+    /// `is_upstream_rate_limited` / `is_upstream_temporarily_suspended` 之前」——
+    /// 那些本该拿 429 + Retry-After 的错误会变成不带退避的 403，客户端退避逻辑整体失效。
+    ///
+    /// 断言的是**分支顺序**而非分支内容：每个用例都先钉死「region 判据确实命中它」，
+    /// 再断言 `map_provider_error` 仍返回那条更优先的分支的结果。少了前半句，
+    /// 测试就退化成「本来也不会命中」的纸面断言。
+    ///
+    /// # 夹具的诚实说明（上一版是自己编的串，2026-08-06 重写）
+    ///
+    /// 每个用例的**两个半段各自都是真串**，逐字取自生产链路的 `format!`：
+    /// - 上游响应型：`provider.rs` 的 `"{api_type} API 请求失败: {status} {body}"`；
+    /// - 号池 bail 型：`token_manager.rs` 的 `"所有凭据均在冷却（{}/{}）retry_after_secs={}"`
+    ///   与 `"模型 {:?} 不被本号池支持（{}/{} …）model_unsupported_by_pool=1"`。
+    ///
+    /// 但**拼接本身是测试构造的**，真实链路不会产出这种双命中串：`last_error` 每次只装
+    /// 一个错误（号池 bail 与上游 body 是两条互斥来源，中间没有"；最后错误:"这种拼接）。
+    /// 上一版夹具凭空造了那个拼接词和 `"detail"` 字段，这里改掉 —— 编的串与真串差一个
+    /// 字段就可能让判据形同虚设，那时守卫看着绿实则没在守。
+    ///
+    /// 保留这条守卫的理由：承重点是**分支顺序**，而顺序在「某天上游 body 里同时提两件事」
+    /// 或「某天有人把两个错误拼起来」时才暴露。用真半段拼出来的串是能触到该顺序的最小输入，
+    /// 也是唯一能触到的 —— 所以拼接是刻意的，并在此写明它是构造的而非采集的。
+    #[test]
+    fn region_mismatch_branch_must_not_shadow_rate_limit_or_suspended() {
+        // 先钉死：单独的真 bearer-invalid 串确实走 region 分支（403）。
+        // 否则下面每条"不得被抢走"都可能只是因为 region 分支本来就不参与竞争。
+        assert_eq!(
+            map_provider_error(anyhow::Error::msg(REAL_BEARER_INVALID_403)).status(),
+            StatusCode::FORBIDDEN,
+            "前提：真 bearer-invalid 串单独出现时确实落 region 分支，下面的竞争才成立"
+        );
+
+        // ① 上游 429 真串（`token_manager` 之外，provider 把上游 body 原样带出）
+        //    + bearer-invalid 真串：必须仍是 429 + Retry-After。
+        let real_429 = r#"流式 API 请求失败: 429 Too Many Requests {"message":"Too many requests, please wait before trying again.","reason":"USER_REQUEST_RATE_EXCEEDED"}"#;
+        let both_429 = format!("{real_429} / {REAL_BEARER_INVALID_403}");
+        assert!(
+            is_upstream_region_mismatch_403(&both_429),
+            "前提：region 判据确实命中该串（否则下面的顺序断言是空的）"
+        );
+        let r = map_provider_error(anyhow::Error::msg(both_429));
+        assert_eq!(
+            r.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "429 不得被 region 分支抢走：限流是可重试态，必须拿 429 + Retry-After"
+        );
+        assert!(r.headers().get(header::RETRY_AFTER).is_some());
+
+        // ② 全池冷却真 bail 串（`token_manager.rs` 的 `所有凭据均在冷却（{}/{}）
+        //    retry_after_secs={}`，全角括号、无任何后缀）+ bearer-invalid 真串：
+        //    必须仍是 429 且用号池算出的精确秒数。
+        let real_cooldown = "所有凭据均在冷却（0/3）retry_after_secs=14";
+        let both_cooldown = format!("{real_cooldown} / {REAL_BEARER_INVALID_403}");
+        assert!(
+            is_upstream_region_mismatch_403(&both_cooldown),
+            "前提：region 判据确实命中该串"
+        );
+        let r = map_provider_error(anyhow::Error::msg(both_cooldown));
+        assert_eq!(
+            r.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "全池冷却不得被 region 分支抢走"
+        );
+        assert_eq!(
+            r.headers()
+                .get(header::RETRY_AFTER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "14",
+            "全池冷却的精确 retry_after 不该被 region 分支吃掉"
+        );
+
+        // ③ 临时风控真串（线上原文，`temporarily is suspended` + `security precaution`）
+        //    + bearer-invalid 真串：必须仍是 429 + Retry-After: 20。
+        let real_suspended = r#"非流式 API 请求失败: 403 Forbidden {"__type":"com.amazon.aws.codewhisperer#AccessDeniedException","message":"Your User ID (186648603162) temporarily is suspended. We've locked your account as a security precaution. To restore access, please contact our support team to verify your identity: https://aws.amazon.com/contact-us/"}"#;
+        let both_suspended = format!("{real_suspended} / {REAL_BEARER_INVALID_403}");
+        assert!(
+            is_upstream_region_mismatch_403(&both_suspended),
+            "前提：region 判据确实命中该串"
+        );
+        let r = map_provider_error(anyhow::Error::msg(both_suspended));
+        assert_eq!(
+            r.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "临时风控不得被 region 分支抢走：它自称 temporarily，是可恢复限时态"
+        );
+        assert_eq!(
+            r.headers()
+                .get(header::RETRY_AFTER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "20"
+        );
+
+        // ④ 模型永久不可用真 bail 串（`token_manager.rs` 那条，`{:?}` 让模型名带引号）
+        //    + bearer-invalid 真串：必须仍是 404，不得被 region 分支抢走。
+        let real_model = r#"模型 "claude-opus-5" 不被本号池支持（2/2 个号均因订阅档位或成本白名单不含该模型而被过滤，非号池耗尽，重试无效）model_unsupported_by_pool=1"#;
+        let both_model = format!("{real_model} / {REAL_BEARER_INVALID_403}");
+        assert!(
+            is_upstream_region_mismatch_403(&both_model),
+            "前提：region 判据确实命中该串"
+        );
+        let r = map_provider_error(anyhow::Error::msg(both_model));
+        assert_eq!(
+            r.status(),
+            StatusCode::NOT_FOUND,
+            "model_unsupported 不得被 region 分支抢走"
+        );
+    }
+
+    /// ⭐ 收窄回归（删掉那条排除即 FAIL）：provider 已判为**瞬态抖动**的 bearer-invalid
+    /// 不得被判成 region 错配。
+    ///
+    /// 依据（`provider.rs` 的 `bearer_invalid_but_proven`，判据 `has_ever_succeeded`）：
+    /// - 从未成功过的号 → 真 region 错配（实测 3 个号共吃 17 次）；
+    /// - 已成功过的号 → 抖动（实测 4 个号累计 3393 次成功、共吃 42 次）。
+    /// 即这个串的**多数出现不是 region 错配**，而两者的上游文案逐字节相同 ——
+    /// 只有 provider 分得出来，所以它把结论写成机器可读标记带出来。
+    ///
+    /// 收窄前的两个后果：
+    /// ① 排障文案让管理员去查 region，而那个号的 region 是对的；
+    /// ② 状态码 502 → 403。502 在外挂 `kiro_shield.py` 的
+    ///    `RETRYABLE={429,500,502,503,504}` 内会被重试，403 是 4xx 不重试；
+    ///    而这一类下一次重试大概率落到别的号上成功（实测 #481 成功率 93.9%）⇒
+    ///    收窄等于把本该有的重试机会还回去。
+    ///
+    /// 夹具是 `provider.rs:1661` 的**真串**（`{api_type} API 请求失败（token 瞬态失效，
+    /// 已冷却换号）bearer_invalid_transient=1: {status} {body}`），不是编的。
+    #[test]
+    fn provider_marked_transient_bearer_invalid_is_not_region_mismatch() {
+        // provider 真串：流式与非流式两种 api_type 都要覆盖（只有前缀不同）。
+        for raw in [
+            r#"流式 API 请求失败（token 瞬态失效，已冷却换号）bearer_invalid_transient=1: 403 Forbidden {"__type":"com.amazon.aws.codewhisperer#AccessDeniedException","message":"The bearer token included in the request is invalid."}"#,
+            r#"非流式 API 请求失败（token 瞬态失效，已冷却换号）bearer_invalid_transient=1: 403 Forbidden {"__type":"com.amazon.kiro.runtimeservice#AccessDeniedException","message":"The bearer token included in the request is invalid."}"#,
+        ] {
+            assert!(
+                !is_upstream_region_mismatch_403(raw),
+                "provider 已判瞬态，不得再判成 region 错配（排障方向会错，且 403 让外挂不再重试）: {raw}"
+            );
+            let resp = map_provider_error(anyhow::Error::msg(raw.to_string()));
+            assert_ne!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "瞬态抖动不得拿 403 —— 4xx 不在外挂 RETRYABLE 集内，一次抖动会固化成硬失败: {raw}"
+            );
+            // 落回兜底 502：它在 `RETRYABLE={429,500,502,503,504}` 内 ⇒ 会被重试，
+            // 而下一跳大概率是另一个号 ⇒ 成功。这正是收窄要恢复的行为。
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_GATEWAY,
+                "瞬态抖动应退回可重试路径（502 在外挂 RETRYABLE 集内）: {raw}"
+            );
+        }
+
+        // 对照组（承重）：**不带**标记的同款上游文案仍必须判 region 错配 →
+        // 证明收窄只切掉了带标记的那一类，没有把整条修复关掉。
+        assert!(
+            is_upstream_region_mismatch_403(REAL_BEARER_INVALID_403),
+            "不带标记的 bearer-invalid（从未成功过的号）仍须判 region 错配"
+        );
+        assert_eq!(
+            map_provider_error(anyhow::Error::msg(REAL_BEARER_INVALID_403)).status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    /// ⭐ 源码级守卫：`bearer_invalid_transient=1` 这个字面量必须在 provider 侧真的存在。
+    ///
+    /// 上面那条测试只证明「handlers 侧看见标记会排除」。若 provider 改名/改大小写/加空格，
+    /// 排除会**静默失效**（回到误判）且编译不报错 —— 因为两侧靠字符串约定，没有类型联系。
+    /// 本仓已因「判据在一层、承重点在另一层」踩过多次（见 endpoint 侧那条状态门守卫）。
+    ///
+    /// 锚点切掉注释行：本仓踩过五次「needle 命中注释里的散文」——
+    /// provider 那处的注释里就写了这个字面量。
+    #[test]
+    fn provider_must_still_emit_the_transient_marker() {
+        let src = include_str!("../kiro/provider.rs");
+        let prod: String = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("生产段应存在")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            prod.contains(BEARER_INVALID_TRANSIENT_MARKER),
+            "provider 必须仍在瞬态 bail 串里带 `{BEARER_INVALID_TRANSIENT_MARKER}` —— \
+             改掉它 handlers 侧的排除会静默失效，回到「把健康号判成 region 错配」"
+        );
+        // 且必须与 `has_ever_succeeded` 那个二分在同一处：标记若被挪到别的分支，
+        // 语义就从「已证明有效的号」变成别的东西，而排除逻辑不会察觉。
+        let mi = prod
+            .find(BEARER_INVALID_TRANSIENT_MARKER)
+            .expect("上一条断言已保证存在");
+        let window = &prod[mi.saturating_sub(1200)..mi];
+        assert!(
+            window.contains(&["has_ever_", "succeeded(ctx.id)"].concat()),
+            "标记必须仍打在 `has_ever_succeeded` 那个二分的分支里 —— \
+             否则它标的不再是「已证明有效的号」，而 handlers 侧照旧排除"
+        );
+    }
+
+    /// 边界：region 错配**不可吸收**。
+    ///
+    /// 吸收层的对象是「等一会儿真的会好」的态。region 错配在单请求的 45s 预算内
+    /// 等多久都不会变（要改配置或等探测器重选），吸收它只是占着客户端连接空转满预算。
+    /// 这条同时防止将来有人顺手把它加进 `absorb_class_of`。
+    #[test]
+    fn region_mismatch_403_is_never_absorbable() {
+        let raw = r#"流式 API 请求失败: 403 Forbidden {"__type":"com.amazon.aws.codewhisperer#AccessDeniedException","message":"The bearer token included in the request is invalid."}"#;
+        assert!(
+            is_upstream_region_mismatch_403(raw),
+            "前提：region 判据确实命中该串"
+        );
+        assert!(
+            absorb_class_of(raw).is_none(),
+            "region 错配不可吸收：45s 预算内等多久都不会变（要改 region 或等探测重选）"
+        );
+    }
+
     /// 边界：坐实上面那条测的是**标记**而非中文文案 —— 不带标记的同款文案仍落 502 兜底。
     ///
     /// 这条的作用是防止将来有人"顺手"改成按 `所有凭据均已禁用` 文案匹配：那正是本类缺陷
@@ -2807,6 +3850,87 @@ mod error_translation_tests {
             resp.status(),
             StatusCode::BAD_GATEWAY,
             "不带 retry_after_secs 标记时应仍落兜底 —— 说明分类判据是标记而非中文文案"
+        );
+    }
+
+    /// 用户线上实测原文（逐字，未改一个字符）：图片声明 `image/png` 而字节是 jpeg。
+    const REAL_IMAGE_MIME_MISMATCH: &str = r#"非流式 API 请求失败: 400 Bad Request {"__type":"com.amazon.aws.codewhisperer#ValidationException","message":"messages.2.content.1.image.source.base64: The image was specified using the image/png media type, but the image appears to be a image/jpeg image","reason":"IMAGE_MIME_MISMATCH"}"#;
+
+    /// ⭐ 新增判据回归（删掉 `translate_context_input` 里那条即 FAIL）：
+    /// `IMAGE_MIME_MISMATCH` 必须映射成 400 `invalid_request_error` 且带图片专属排障文案。
+    ///
+    /// 这个 reason 码此前**全仓零判据**，落通用兜底 → 客户端拿 502 `api_error`
+    /// 「上游 API 调用失败（未识别错误）」：既说错了性质（这是客户端请求构造问题，
+    /// 不是上游故障），又让它进了外挂 `kiro_shield.py` 的 `RETRYABLE` 集
+    /// （`{429,500,502,503,504}`）⇒ 一个**重试永远不会变**的请求被重打到预算耗尽。
+    ///
+    /// 而它的主要价值是**度量**：`converter.rs` 的 `resolve_image_format` 已按 magic bytes
+    /// 校正声明的 media_type，但若仍有边缘情况漏掉（magic 认不出而回退声明值等），
+    /// 那些 400 会混进通用 `bad_request` 桶 ⇒ 无法回答「那条修干净了没有」。
+    /// 这条判据是那条修复唯一的效果度量。
+    #[test]
+    fn image_mime_mismatch_maps_to_400_invalid_request_not_502() {
+        // 判据本身（收口在 endpoint 侧，与 `default_is_*` 系列同处）。
+        assert!(
+            crate::kiro::endpoint::default_is_image_mime_mismatch(REAL_IMAGE_MIME_MISMATCH),
+            "用户线上原文必须命中判据"
+        );
+        let resp = map_provider_error(anyhow::Error::msg(REAL_IMAGE_MIME_MISMATCH));
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "IMAGE_MIME_MISMATCH 是请求构造问题，必须 400（旧路径落兜底 502 → \
+             性质说错，且进外挂 RETRYABLE 集被反复重打）"
+        );
+        assert!(
+            resp.headers().get(header::RETRY_AFTER).is_none(),
+            "重试无效的错误绝不带 Retry-After"
+        );
+    }
+
+    /// ⭐ 顺序守卫（承重）：`IMAGE_MIME_MISMATCH` **不得**抢走同为 400 的
+    /// `INSUFFICIENT_MODEL_CAPACITY`。
+    ///
+    /// 两者都是 HTTP 400，但处置相反：容量不足必须拿 **503 `overloaded_error`**
+    /// （可退避重试，实测 24h 272 次），图片格式错必须拿 **400**（重试无效）。
+    /// 若把图片判据放到 `translate_quota_subscription` **之前**（或放宽成认
+    /// `ValidationException` / 认 message 里的 `media type` 散文），容量不足会被说成
+    /// 「你的图片格式错」：既误导用户，又让客户端不再退避 —— 而那正是本仓
+    /// `INSUFFICIENT_MODEL_CAPACITY` 那批修复要解决的问题，等于把它退回去。
+    ///
+    /// 回退即 FAIL 的形态：把 `translate_upstream_error` 的 `.or_else` 链改成
+    /// `translate_context_input(...).or_else(|| translate_quota_subscription(...))`。
+    /// 断言的是**分支顺序**，不是判据内部形状 —— 后者对顺序缺陷完全不可见
+    /// （本仓已因此让一条"三处都改对、四测全绿"的修复无效上线过）。
+    #[test]
+    fn image_mime_mismatch_must_not_shadow_capacity_400() {
+        // 真容量串（线上原文）单独出现：必须仍是 503。
+        let real_capacity = r#"流式 API 请求失败: 400 Bad Request {"__type":"com.amazon.aws.codewhisperer#ThrottlingException","message":"I am experiencing high traffic, please try again shortly.","reason":"INSUFFICIENT_MODEL_CAPACITY"}"#;
+        assert_eq!(
+            map_provider_error(anyhow::Error::msg(real_capacity)).status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "前提：容量 400 单独出现时确实拿 503，下面的竞争才成立"
+        );
+
+        // 双命中串（两个半段各自都是真串，拼接是测试构造的 —— 真实链路一次只带一个错误，
+        // 但顺序缺陷只有这种输入触得到）：必须仍按容量处置返 503。
+        let both = format!("{real_capacity} / {REAL_IMAGE_MIME_MISMATCH}");
+        assert!(
+            crate::kiro::endpoint::default_is_image_mime_mismatch(&both),
+            "前提：图片判据确实命中该串（否则顺序断言是空的）"
+        );
+        assert_eq!(
+            map_provider_error(anyhow::Error::msg(both)).status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "容量 400 不得被图片判据抢走：它必须拿 503 才会被客户端退避重试"
+        );
+
+        // 反向边界：图片判据只认 reason 字面量，不得因 `ValidationException` 泛匹配而
+        // 吞掉别的校验错误（`TOOL_USE_RESULT_MISMATCH` 也是这个 `__type`）。
+        let tool_mismatch = r#"非流式 API 请求失败: 400 Bad Request {"__type":"com.amazon.aws.codewhisperer#ValidationException","message":"...","reason":"TOOL_USE_RESULT_MISMATCH"}"#;
+        assert!(
+            !crate::kiro::endpoint::default_is_image_mime_mismatch(tool_mismatch),
+            "同 __type 的其它校验错误不得被图片判据吞掉（处置不同，混判会给错排障方向）"
         );
     }
 
@@ -2848,7 +3972,9 @@ mod error_translation_tests {
             "upstream: MONTHLY_REQUEST_COUNT limit reached"
         ));
         assert!(!is_upstream_rate_limited("403 FEATURE_NOT_SUPPORTED"));
-        assert!(!is_upstream_rate_limited("CONTENT_LENGTH_EXCEEDS_THRESHOLD"));
+        assert!(!is_upstream_rate_limited(
+            "CONTENT_LENGTH_EXCEEDS_THRESHOLD"
+        ));
     }
 
     #[test]
@@ -2866,6 +3992,510 @@ mod error_translation_tests {
                 .unwrap(),
             "14",
             "全池冷却的精确 retry_after 不该被固定 8s 覆盖"
+        );
+    }
+
+    /// ⭐ BLOCKER 2 守卫：入站准入超时**绝不可吸收**。
+    ///
+    /// 回退即 FAIL：删掉 `absorb_class_of` 里第一条 `inbound_admission_timeout=1 → None`，
+    /// 该串会落到下面的 `retry_after_secs=` 分支被判成 `PoolCooldown` → 吸收层去重试
+    /// **网关自己的背压信号**：把同一个请求塞回同一个已经满的桶，队列更长、客户端等更久，
+    /// 且拿不到任何额外成功概率（实测 2 轮 × 30s = 客户端等 60s 才拿到 429，正确是 <2s）。
+    #[test]
+    fn admission_timeout_is_never_absorbable() {
+        // provider.rs:820 那条 bail 的原文形态（同时带两个标记）。
+        let s = "入站限速排队超时(网关目标 300 RPM 保护上游)inbound_admission_timeout=1 retry_after_secs=3";
+        assert!(
+            absorb_class_of(s).is_none(),
+            "准入超时必须不可吸收；它与全池冷却共用 retry_after_secs= 标记，\
+             靠 inbound_admission_timeout=1 这道显式判据区分"
+        );
+        // 对照组：同样带 retry_after_secs= 但**不带**准入标记的全池冷却，必须可吸收。
+        assert_eq!(
+            absorb_class_of("所有凭据均在冷却（0/1）retry_after_secs=3"),
+            Some(AbsorbClass::PoolCooldown(3)),
+            "全池冷却是「上游稍后真的会好」，必须可吸收（否则吸收层没有任何作用对象）"
+        );
+    }
+
+    /// ⭐ 顺序守卫：`model_unsupported_by_pool=1` 永久不可吸收，且判据必须排在
+    /// `retry_after_secs=` **之前**。
+    ///
+    /// 回退即 FAIL：删掉那条 `None`，或把它移到 `retry_after_secs=` 之后 —— 后者更隐蔽：
+    /// 「模型级过滤但可恢复」那条 bail **带** `retry_after_secs=`，顺序反了就会把
+    /// **永久**不可用当成可恢复态反复吸收，等于把 404 死循环搬进网关。
+    #[test]
+    fn model_unsupported_by_pool_is_never_absorbable() {
+        // token_manager 那条 bail 的原文形态（不带 retry_after_secs）。
+        let permanent = "模型 \"claude-opus-5\" 不被本号池支持（0/1 个号均因订阅档位或成本白名单不含该模型而被过滤，非号池耗尽，重试无效）model_unsupported_by_pool=1";
+        assert!(
+            absorb_class_of(permanent).is_none(),
+            "模型对号池永久不可用时重试无效，必须不可吸收"
+        );
+        // ⭐ 承重：两个标记同时出现时，永久态必须赢（顺序守卫）。
+        let both = "模型不被本号池支持 model_unsupported_by_pool=1 retry_after_secs=30";
+        assert!(
+            absorb_class_of(both).is_none(),
+            "同时带 model_unsupported_by_pool=1 与 retry_after_secs= 时必须判不可吸收 —— \
+             说明永久态判据排在 retry_after_secs 之前"
+        );
+    }
+
+    /// ⭐ 池**永久**耗尽不可吸收，且判据必须排在 `retry_after_secs=` **之前**。
+    ///
+    /// 回退即 FAIL：删掉 `absorb_class_of` 里 `pool_permanently_exhausted=1 → None`
+    /// （或把它移到 `retry_after_secs=` 之后），该串会被判成 `PoolCooldown(10)` →
+    /// 吸收层对一个**一个可自愈的号都没有**的池（全 QuotaExhausted /
+    /// RefreshTokenInvalid / AccountSuspended）拿满 45s 预算空转，客户端从 <2s
+    /// 拿到 429 变成 45s 才拿到，且这 45s 内它一直占着连接。
+    #[test]
+    fn permanently_exhausted_pool_is_never_absorbable() {
+        // token_manager 两处 bail 的原文形态（**带** retry_after_secs=，因为对客户端
+        // 而言 429 + Retry-After 仍是对的：人工补号后确实会好）。
+        let dead = "所有凭据均已禁用（0/2）pool_permanently_exhausted=1 retry_after_secs=10";
+        assert!(
+            absorb_class_of(dead).is_none(),
+            "池里没有任何可自愈的号时，单请求预算内等多久都不会变，必须不可吸收"
+        );
+        // 对照组：同样是「全禁用」，但有可自愈的号 ⇒ 不带该标记 ⇒ 必须可吸收。
+        // 这是 pool-empty 类占 24h 流量 16.5% 的那一大类，吸收层的主要作用对象。
+        assert_eq!(
+            absorb_class_of("所有凭据均已禁用（0/2）retry_after_secs=10"),
+            Some(AbsorbClass::PoolCooldown(10)),
+            "可自愈的全禁用必须可吸收，否则吸收层对最大的一类失败没有作用"
+        );
+    }
+
+    /// 永久耗尽对**客户端**仍必须是 429 + Retry-After —— 只对「单请求内重试」说不。
+    ///
+    /// 回退即 FAIL：若有人把该标记也加进 `map_provider_error` 的早退分支、
+    /// 或把它渲染成 404/502，这条断言会失败。人工补号后池子确实会恢复，
+    /// 所以客户端该退避重试；不可吸收针对的只是**同一条请求内**的重试。
+    #[test]
+    fn permanently_exhausted_pool_still_renders_429_to_client() {
+        let resp = map_provider_error(anyhow::anyhow!(
+            "所有凭据均已禁用（0/2）pool_permanently_exhausted=1 retry_after_secs=10"
+        ));
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "对客户端必须仍是 429（人工补号后会恢复，客户端该退避）"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("10"),
+            "必须带 Retry-After，否则客户端把它当服务端故障、退避逻辑不启动"
+        );
+    }
+
+    /// 不可重试类一律不吸收：月度配额耗尽 / 传输层故障 / 普通 4xx / 未知。
+    ///
+    /// 回退即 FAIL：把 `is_upstream_temporarily_suspended` 放宽成裸 403 或
+    /// `AccessDeniedException`，配额串与永久封禁串会被判成可吸收 → 对一个永远不会恢复的号
+    /// 反复重试，同时把真实故障藏起来。
+    #[test]
+    fn non_retryable_errors_are_not_absorbable() {
+        for s in [
+            "流式 API 请求失败: 429 Too Many Requests {\"reason\":\"MONTHLY_REQUEST_COUNT\"}",
+            "error sending request for url (https://runtime.eu-central-1.kiro.dev)",
+            "流式 API 请求失败: 400 Bad Request {\"message\":\"Improperly formed request\"}",
+            "某个谁也没见过的错误",
+        ] {
+            assert!(
+                absorb_class_of(s).is_none(),
+                "不可重试类必须不吸收，但 {s:?} 被判成了 {:?}",
+                absorb_class_of(s)
+            );
+        }
+    }
+
+    /// 可吸收的两类正例 + 403 临时风控被单独归类（是否真吸收由配置决定，不在分类器里判）。
+    #[test]
+    fn retryable_upstream_errors_are_classified() {
+        assert_eq!(
+            absorb_class_of("流式 API 请求失败: 429 {\"reason\":\"USER_REQUEST_RATE_EXCEEDED\"}"),
+            Some(AbsorbClass::UpstreamRateLimit)
+        );
+        assert_eq!(
+            absorb_class_of(
+                "403 Forbidden {\"message\":\"Your User ID (450334904897) temporarily is suspended.\"}"
+            ),
+            Some(AbsorbClass::SwapWindow),
+            "403 临时风控（换号空窗）要能被识别出来（默认不吸收，但必须可分类，否则配置开了也没用）"
+        );
+    }
+
+    /// ⭐ 合并外挂缺口 1：**上游 5xx 可分类**（此前对所有 5xx 返 None ⇒ 吸收层完全不覆盖）。
+    ///
+    /// 依据：外挂 `RETRYABLE={429,500,502,503,504}`，注释原文「500/502/503/504 = 网关/上游抖动，
+    /// 也含『凭据全禁用』这类换号空窗」，且线上 shield 日志实见
+    /// `502 -> wait 1.0s, attempt 1/60`。
+    ///
+    /// 回退即 FAIL：删掉 `absorb_class_of` 里那条 `is_upstream_transient_5xx` 分支。
+    ///
+    /// 夹具是 provider 真实组装的串：`"{api_type} API 请求失败: {status} {body}"`
+    /// （provider.rs 通用 5xx 分支，`api_type` = 流式/非流式，`status` 是 `StatusCode` 的 Display）。
+    #[test]
+    fn transient_5xx_is_absorbable_but_transport_failure_is_not() {
+        for raw in [
+            "流式 API 请求失败: 502 Bad Gateway <html>502 Bad Gateway</html>",
+            r#"非流式 API 请求失败: 500 Internal Server Error {"__type":"com.amazon.aws.codewhisperer#InternalServerException","message":"Internal server error"}"#,
+            "流式 API 请求失败: 504 Gateway Timeout upstream timed out",
+        ] {
+            assert_eq!(
+                absorb_class_of(raw),
+                Some(AbsorbClass::TransientServerError),
+                "上游 5xx 必须可分类（外挂把它们放进 RETRYABLE 且线上实见 502）: {raw}"
+            );
+        }
+        // ⭐ 边界（承重）：**传输层**失败仍必须不可吸收。provider 内部换号已把每个号各试过
+        // 一遍，吸收层再套一层只是把同一个网络故障重打 N 遍。
+        // 回退即 FAIL：把分类器里那条 `&& !is_transport_error(...)` 删掉。
+        for raw in [
+            "error sending request for url (https://runtime.eu-central-1.kiro.dev)",
+            "error trying to connect: dns error: failed to lookup address information",
+        ] {
+            assert!(
+                absorb_class_of(raw).is_none(),
+                "传输层故障不可吸收（provider 内部换号已覆盖）: {raw}"
+            );
+        }
+    }
+
+    /// ⭐ 合并外挂缺口 2：**带瞬态标记的 400 可分类**，其余 400 一律不吸收。
+    ///
+    /// 依据（外挂注释原文，带实测）：「Kiro 会把一部分瞬态故障塞进 400，跟『请求写错了』同一个
+    /// 状态码。实测 6 小时样本里 400 共 165 次，其中容量类 101 次、格式错 80 次。只认这些明确的
+    /// 瞬态标记，其余 400 一律透传，避免把真正的格式错误重试 60 次。」
+    ///
+    /// 判据**复用既有谓词** `endpoint::default_is_model_temporarily_unavailable`
+    /// （认 `MODEL_TEMPORARILY_UNAVAILABLE` / `INSUFFICIENT_MODEL_CAPACITY`），不新写匹配。
+    ///
+    /// 回退即 FAIL：删掉分类器里那条容量分支 → 400 容量类落 None、503 容量类被 5xx 抢走。
+    #[test]
+    fn transient_capacity_400_is_absorbable_but_real_bad_request_is_not() {
+        // provider.rs 容量分支的真实串（上游原文逐字，见 endpoint/mod.rs 该谓词处的实测记录）。
+        let capacity_400 = r#"流式 API 请求失败（模型暂时不可用，建议稍后重试）: 400 Bad Request {"__type":"com.amazon.aws.codewhisperer#ThrottlingException","message":"I am experiencing high traffic, please try again shortly.","reason":"INSUFFICIENT_MODEL_CAPACITY"}"#;
+        assert_eq!(
+            absorb_class_of(capacity_400),
+            Some(AbsorbClass::TransientCapacity400),
+            "400 + INSUFFICIENT_MODEL_CAPACITY 是**瞬态**容量问题，必须可分类"
+        );
+        // ⭐ 顺序守卫：容量类的另一种上游形态是 **503**，必须仍判容量类而**不是** 5xx。
+        // 回退即 FAIL：把容量分支移到 5xx 分支之后 —— 那条 5xx 判据认
+        // `503 service unavailable` 字样，会把这一串抢走并套上 1s 起的短曲线。
+        let capacity_503 = r#"非流式 API 请求失败（模型暂时不可用，建议稍后重试）: 503 Service Unavailable {"reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#;
+        assert_eq!(
+            absorb_class_of(capacity_503),
+            Some(AbsorbClass::TransientCapacity400),
+            "503 形态的容量类必须仍归容量（它与 400 形态处置相同）——说明容量判据排在 5xx 之前"
+        );
+        // 真格式错的 400（实测 6h 内 80 次）必须仍不可吸收：重试 60 次也永远不会成功。
+        for raw in [
+            r#"流式 API 请求失败: 400 Bad Request {"__type":"com.amazon.aws.codewhisperer#ValidationException","message":"Improperly formed request"}"#,
+            r#"非流式 API 请求失败: 400 Bad Request {"reason":"IMAGE_MIME_MISMATCH"}"#,
+        ] {
+            assert!(
+                absorb_class_of(raw).is_none(),
+                "真格式错的 400 必须不可吸收（重试永远不会成功）: {raw}"
+            );
+        }
+        // 裸 `ThrottlingException`（无 reason）**刻意不认**：那个 __type 被真限流共用。
+        assert!(
+            absorb_class_of(
+                r#"流式 API 请求失败: 400 Bad Request {"__type":"ThrottlingException"}"#
+            )
+            .is_none(),
+            "裸 ThrottlingException 不得被判成容量类（外挂白名单认它，本仓刻意不认：\
+             `USER_REQUEST_RATE_EXCEEDED` 真限流共用同一个 __type）"
+        );
+    }
+
+    /// ⭐ 顺序守卫（承重，外挂 2026-08-04 实测踩过的坑）：
+    /// **`PoolCooldown` 判据必须排在 `SwapWindow` 之前**。
+    ///
+    /// 外挂原文：「全池不可用时返回 429 + `Retry-After: 10`，body 是
+    /// "All credentials are temporarily cooling down..."，而 `"All credentials"` 原先挂在
+    /// SWAP_WINDOW_MARKERS 里 → 判 swap → 套了长阶梯 → 本该等 10 秒的等了几十秒。」
+    ///
+    /// 即：号池冷却必须**听网关算出的真值**，换号空窗才用 20~60s 长阶梯。两者混判的代价是
+    /// 客户端白等几十秒。
+    ///
+    /// 本测试有两道断言，第二道是源码级顺序守卫 —— 因为第一道只能证明「当前判据不冲突」，
+    /// 证明不了「顺序对」（这正是本仓第 8 种纸面测试形态：测了分支内部，没测分支顺序）。
+    #[test]
+    fn pool_cooldown_wins_over_swap_window_ordering() {
+        // 夹具：同时带 `retry_after_secs=`（号池真值）与 suspend 字样的串。
+        // 真实来源：吸收轮之间 `last_error` 刻意不重置，某一轮拿到 403 风控、下一轮拿到全池
+        // 冷却 bail 时，两种特征会先后出现在同一条请求的错误链上；而 KiroStudio 作为上游被
+        // 串联时（custom_api 代挂），它自己渲染的 429 body 就带 "temporarily cooling down"。
+        let both = "所有凭据均在冷却（0/4）retry_after_secs=10 \
+                    上游原文: 403 Forbidden {\"message\":\"Your User ID temporarily is suspended.\"}";
+        assert_eq!(
+            absorb_class_of(both),
+            Some(AbsorbClass::PoolCooldown(10)),
+            "同时带号池真值与 suspend 字样时，**必须**判 PoolCooldown 并用真值 10s —— \
+             判成 SwapWindow 会套 20~60s 长阶梯，本该等 10 秒的等几十秒（外挂实测踩过）"
+        );
+
+        // ⭐ 源码级顺序守卫：`parse_retry_after_secs`（PoolCooldown）必须出现在
+        // `is_upstream_temporarily_suspended`（SwapWindow）之前。
+        // 回退即 FAIL：把 SwapWindow 那条分支上移到 `retry_after_secs=` 之前。
+        let body = absorb_class_of_source();
+        let pool_at = body
+            .find("parse_retry_after_secs")
+            .expect("分类器必须仍用 parse_retry_after_secs 判 PoolCooldown");
+        let swap_at = body
+            .find("is_upstream_temporarily_suspended")
+            .expect("分类器必须仍用既有谓词判 SwapWindow（不新写字符串匹配）");
+        assert!(
+            pool_at < swap_at,
+            "PoolCooldown 判据必须排在 SwapWindow 之前（听网关真值 vs 套长阶梯，混判即白等）"
+        );
+    }
+
+    /// ⭐ 顺序守卫（承重）：新增的三条判据必须全部排在**三条 `None`** 之后。
+    ///
+    /// 那三条是「网关自己的背压」（`inbound_admission_timeout=1`）与两种「永久态」
+    /// （`model_unsupported_by_pool=1` / `pool_permanently_exhausted=1`）。任何通用判据排到
+    /// 它们前面，都会把不该重试的东西吸收掉。
+    ///
+    /// 回退即 FAIL：把任一条新判据上移到那三条 `None` 之前。
+    #[test]
+    fn new_absorb_predicates_come_after_the_three_none_gates() {
+        let body = absorb_class_of_source();
+        // 三道 None 各自的位置（按机器可读标记定位，不依赖注释文案）。
+        let gates = [
+            "inbound_admission_timeout=1",
+            "model_unsupported_by_pool=1",
+            "pool_permanently_exhausted=1",
+        ]
+        .map(|m| {
+            body.find(m)
+                .unwrap_or_else(|| panic!("分类器必须仍有 {m} 这道 None 闸门"))
+        });
+        let last_gate = *gates.iter().max().expect("三道闸门非空");
+        for needle in [
+            "default_is_model_temporarily_unavailable",
+            "is_upstream_transient_5xx",
+            "is_upstream_region_mismatch_403",
+        ] {
+            let at = body
+                .find(needle)
+                .unwrap_or_else(|| panic!("分类器必须仍调 {needle}（复用既有谓词）"));
+            assert!(
+                at > last_gate,
+                "{needle} 必须排在三条 None 闸门之后 —— 排前面会把网关背压/永久态当可吸收"
+            );
+        }
+
+        // ⭐ 容量类必须排在 5xx 之前（容量类的一种形态是 503，会被 5xx 判据抢走）。
+        assert!(
+            body.find("default_is_model_temporarily_unavailable")
+                .unwrap()
+                < body.find("is_upstream_transient_5xx").unwrap(),
+            "容量判据必须排在 5xx 之前，否则 503 形态的容量类被 5xx 抢走、套错退避曲线"
+        );
+    }
+
+    /// 取 `absorb_class_of` 的**函数体**源码（供顺序守卫用）。
+    ///
+    /// 为什么要切片而不是直接用整个文件：`include_str!` 会把本测试模块自己的字面量也读进来，
+    /// 按全文件找位置会命中测试里的字符串（本仓 `absorb_stop_reasons_are_distinguishable_in_logs`
+    /// 就吃过这个坑：短名在注释里也出现，实测 left=3 right=2）。
+    fn absorb_class_of_source() -> &'static str {
+        let full = include_str!("handlers.rs");
+        let start = full
+            .find("pub(crate) fn absorb_class_of")
+            .expect("函数签名必须存在");
+        let rest = &full[start..];
+        // 函数体结束于下一个顶层 `\n}\n`（本函数内所有 `}` 都有缩进）。
+        let end = rest.find("\n}\n").expect("函数必须有结尾");
+        &rest[..end]
+    }
+
+    /// ⭐ 合并外挂缺口 4：预算耗尽后按配置回 **503**（而非透传 429）。
+    ///
+    /// 依据（外挂注释原文）：「有总时间预算，超预算返回 **503（不是 429）** —— Cursor 对 503
+    /// 不会像对 429 那样立刻停止会话。」这是产品级行为差异：同一个「网关已尽力但没成」的事实，
+    /// 用 429 表达会让 Cursor 直接掐会话，用 503 表达会让它自己再退避重试。
+    ///
+    /// 回退即 FAIL：删掉 `map_provider_error` 的第一条分支（标记分支），该串会落到下面的
+    /// 全池冷却分支返回 429 —— 即这个开关静默失效。
+    #[test]
+    fn absorb_exhausted_marker_renders_503_with_retry_after() {
+        // provider 在 `absorb_gave_up_after_rounds && exhausted_as_503` 时组装的串形态：
+        // 原错误 + 空格 + 标记。
+        let raw = format!(
+            "所有凭据均在冷却（0/4）retry_after_secs=10 {}",
+            ABSORB_BUDGET_EXHAUSTED_MARKER
+        );
+        let resp = map_provider_error(anyhow::Error::msg(raw));
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "带耗尽标记时必须回 503（Cursor 见 429 会掐会话，见 503 会自行退避）"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("10"),
+            "必须优先用号池真值 10s 而不是常数兜底 —— 真值比任何常数都准"
+        );
+
+        // ⭐ 边界（承重）：**不带**标记的同一条串必须仍是 429。
+        // 这坐实了状态码只对「吸收层真的跑过并放弃」的请求变化，没进过吸收层的 429 照旧。
+        let untouched = map_provider_error(anyhow::Error::msg(
+            "所有凭据均在冷却（0/4）retry_after_secs=10",
+        ));
+        assert_eq!(
+            untouched.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "没有标记就必须仍是 429（默认配置下 provider 不打标记 ⇒ 渲染路径逐字节不变）"
+        );
+
+        // 无号池真值时按类别兜底：403 风控用 20s（与 cooldown.rs 的 SuspiciousActivity 同源）。
+        let swap = map_provider_error(anyhow::Error::msg(format!(
+            "403 Forbidden {{\"message\":\"Your User ID temporarily is suspended.\"}} {}",
+            ABSORB_BUDGET_EXHAUSTED_MARKER
+        )));
+        assert_eq!(swap.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            swap.headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("20")
+        );
+    }
+
+    /// ⭐ 承重：标记分支必须是 `map_provider_error` 的**第一条**。
+    ///
+    /// 这个标记只可能打在**已被判为可吸收**的错误串上，而那些串必然还带着各自的原始特征
+    /// （`retry_after_secs=` / `USER_REQUEST_RATE_EXCEEDED` / `temporarily is suspended` /
+    /// 5xx 字样）—— 后面任何一条分支都会先把它们接走并返回 429。排在后面等于开关静默失效。
+    ///
+    /// 回退即 FAIL：把标记分支下移到准入超时分支之后 —— 上面那条 `retry_after_secs=10`
+    /// 的夹具会被全池冷却分支抢走返 429。这里再加一道源码级顺序断言，
+    /// 因为运行时断言只能证明「当前夹具通过」，证明不了顺序本身。
+    #[test]
+    fn absorb_exhausted_branch_is_first_in_map_provider_error() {
+        let full = include_str!("handlers.rs");
+        let start = full
+            .find("fn map_provider_error(err: Error) -> Response {")
+            .expect("函数签名必须存在");
+        let body = &full[start..];
+        let marker_at = body
+            .find("ABSORB_BUDGET_EXHAUSTED_MARKER")
+            .expect("必须有耗尽标记分支");
+        for later in [
+            "inbound_admission_timeout=1",
+            "parse_retry_after_secs(&err_str)",
+            "is_upstream_rate_limited(&err_str)",
+            "is_upstream_temporarily_suspended(&err_str)",
+        ] {
+            let at = body
+                .find(later)
+                .unwrap_or_else(|| panic!("{later} 分支必须仍存在"));
+            assert!(
+                marker_at < at,
+                "耗尽标记分支必须排在 {later} 之前，否则那条分支会先把串接走返 429（开关静默失效）"
+            );
+        }
+    }
+
+    /// 抽出的 `parse_retry_after_secs` 与它替换掉的两份内联拷贝行为一致。
+    ///
+    /// 回退即 FAIL：若有人把解析逻辑改回各写一份并写歪一处，这里的边界断言会失败。
+    #[test]
+    fn parse_retry_after_secs_handles_boundaries() {
+        assert_eq!(parse_retry_after_secs("x retry_after_secs=14"), Some(14));
+        assert_eq!(parse_retry_after_secs("x retry_after_secs=7 y"), Some(7));
+        assert_eq!(parse_retry_after_secs("x retry_after_secs=0"), Some(0));
+        assert_eq!(parse_retry_after_secs("没有这个标记"), None);
+        assert_eq!(parse_retry_after_secs("retry_after_secs=abc"), None);
+    }
+
+    #[test]
+    fn test_inbound_admission_timeout_is_distinguishable_from_pool_cooling() {
+        // ⭐ 回归（把 `inbound_admission_timeout=1` 那条分支删掉即必失败）：
+        // 准入超时（网关自己的背压）与全池冷却（上游没准备好）**语义相反**，
+        // 但两者都带 `retry_after_secs=`。若响应体上不可区分，任何按 body 判定的
+        // 重试层（内置吸收层 / 外挂 kiro_shield）都会去重试网关自己的背压信号
+        // —— 实测形态：2 轮 × 30s = 客户端等 60s 才拿到 429，而正确是 <2s。
+        let admission = map_provider_error(anyhow::Error::msg(
+            "入站限速排队超时(网关目标 300 RPM 保护上游)inbound_admission_timeout=1 retry_after_secs=3",
+        ));
+        let cooling = map_provider_error(anyhow::Error::msg(
+            "所有凭据均在冷却（0/1）retry_after_secs=3",
+        ));
+
+        // 对客户端而言两者都该是 429 + Retry-After（它就该退避）。
+        assert_eq!(admission.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(cooling.status(), StatusCode::TOO_MANY_REQUESTS);
+        for (name, resp) in [("准入超时", &admission), ("全池冷却", &cooling)] {
+            assert_eq!(
+                resp.headers()
+                    .get(header::RETRY_AFTER)
+                    .unwrap_or_else(|| panic!("{name} 应带 Retry-After"))
+                    .to_str()
+                    .unwrap(),
+                "3",
+                "{name} 的 Retry-After 应透传上游/网关给的精确秒数"
+            );
+        }
+
+        // 但对**重试层**必须可区分：响应体文案不同。
+        let dump = |resp: axum::response::Response| async move {
+            let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .expect("读取响应体");
+            String::from_utf8_lossy(&bytes).to_string()
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (a_body, c_body) = rt.block_on(async { (dump(admission).await, dump(cooling).await) });
+
+        assert_ne!(
+            a_body, c_body,
+            "准入超时与全池冷却的响应体必须不同，否则重试层无法分辨（这正是缺陷本体）"
+        );
+        assert!(
+            a_body.contains("backpressure"),
+            "准入超时的文案应自述为网关背压，实际: {a_body}"
+        );
+        assert!(
+            !a_body.contains("cooling down"),
+            "准入超时绝不能复用全池冷却的 `cooling down` 文案 —— \
+             kiro_shield 的 COOLING_MARKERS 命中它就会重试网关自己的背压。实际: {a_body}"
+        );
+        assert!(
+            c_body.contains("cooling down"),
+            "全池冷却的文案应保持不变（零回归），实际: {c_body}"
+        );
+    }
+
+    #[test]
+    fn admission_timeout_bail_must_carry_its_own_marker() {
+        // 源码级守卫：provider 侧那条 bail 必须带 `inbound_admission_timeout=1`。
+        // 只靠上面那条行为测试不够 —— 它喂的是手写字符串，而真正的风险是
+        // **provider 改了 bail 文案却没带标记**，那样行为测试照样绿、线上照样不可区分。
+        //
+        // ⚠️ needle 必须**跨越** bail 格式串里紧邻的两段（`保护上游)` + 标记），
+        // 不能只找标记本身：provider.rs 的注释里也解释了这个标记，只找标记会命中注释
+        // → 把 bail 里的标记删掉测试照样绿（我第一版就是这样，删了标记仍 PASS）。
+        // 这是本仓已记录过的「源码级守卫自匹配」陷阱的同一形态。
+        let src = include_str!("../kiro/provider.rs");
+        let needle = format!("{}{}{}", "保护上游)", "inbound_admission_timeout", "=1");
+        assert!(
+            src.contains(&needle),
+            "provider.rs 的准入超时 bail 格式串必须紧接 `保护上游)` 带上 \
+             inbound_admission_timeout=1 标记，否则分类器无法把它与全池冷却区分开\
+             （两者都带 retry_after_secs=）"
         );
     }
 
@@ -2895,6 +4525,9 @@ mod error_translation_tests {
         let t = translate_upstream_error("CONTENT_LENGTH_EXCEEDS_THRESHOLD").unwrap();
         assert_eq!(t.status, StatusCode::BAD_REQUEST);
         assert!(t.message.contains("上下文") && t.message.contains("精简"));
+        // 英文哨兵与中文文案**同时**存在（前缀不是替换）。子串契约本身由
+        // `overflow_errors_must_match_claude_code_compact_retry_predicate` 钉死。
+        assert!(t.message.starts_with(OVERFLOW_COMPACT_HINT));
     }
 
     #[test]
@@ -2902,11 +4535,86 @@ mod error_translation_tests {
         let t = translate_upstream_error("Input is too long for the model").unwrap();
         assert_eq!(t.status, StatusCode::BAD_REQUEST);
         assert!(t.message.contains("输入过长") && t.message.contains("拆分"));
+        assert!(t.message.starts_with(OVERFLOW_COMPACT_HINT));
+    }
+
+    /// ⭐ 外部契约守卫（承重）：「装不下」类错误的 message **必须**命中 Claude Code 的
+    /// compact-and-retry 判据，否则用户的自动压缩静默失效。
+    ///
+    /// # 这条断言在保护什么
+    ///
+    /// Claude Code（本机 2.1.220 实测）判「该压缩后重试」的方式是对错误 message 做
+    /// **小写化子串匹配**，形如：
+    ///
+    /// ```text
+    /// msg.toLowerCase().includes("prompt is too long")
+    ///   || msg.toLowerCase().includes("input is too long for requested model")
+    /// ```
+    ///
+    /// 命中后它会压缩上下文并**自动重试**；不命中就只是把错误打给用户。而它的另一条
+    /// 「按水位主动压缩」的路径在网关模式下结构性不可用（见
+    /// `docs/auto-compact-fix-2026-08-06.md`）⇒ 这个子串是网关唯一能给用户的自动压缩。
+    ///
+    /// # 为什么必须单列一条，而不是靠上面两条整串比对
+    ///
+    /// 上面两条测的是**中文文案还在不在**。有人润色文案时顺手去掉英文前缀，那两条照样绿
+    /// （它们断言的是"上下文"/"输入过长"这些中文词），而保险丝已经烧了。本条直接断言
+    /// **外部消费者的判据能命中**，是唯一一处「改文案会立刻变红」的地方。
+    ///
+    /// ⚠️ 这里刻意写**字面量**而不是引用 `OVERFLOW_COMPACT_HINT`：引用了就是同义反复
+    /// （把常量改成空串，断言依然成立），钉不住任何东西。契约的对面是别人的二进制，
+    /// 本仓这侧只能用字面量表达。
+    ///
+    /// ⚠️ 大小写：判据先 `toLowerCase()`，故本断言也先 `to_lowercase()` —— 文案首字母
+    /// 将来若改成大写，契约仍然成立，测试不该因此误红。
+    #[test]
+    fn overflow_errors_must_match_claude_code_compact_retry_predicate() {
+        use axum::body::to_bytes;
+
+        // Claude Code 侧的两个判据字面量（小写形态）。任一命中即触发 compact-and-retry。
+        const CC_SENTINELS: [&str; 2] = [
+            "prompt is too long",
+            "input is too long for requested model",
+        ];
+
+        // 两类上游「装不下」原文（实测形态）。
+        for upstream in [
+            "非流式 API 请求失败: 400 Bad Request {\"reason\":\"CONTENT_LENGTH_EXCEEDS_THRESHOLD\"}",
+            "流式 API 请求失败: 400 Bad Request {\"message\":\"Input is too long for the model\"}",
+        ] {
+            // ⭐ 走 `map_provider_error` **全路径**读真实响应体，不是只调 `translate_*`。
+            //
+            // 理由（本仓「纸面测试」的第 8 种形态）：只测分支内部，对**分支顺序**完全不可见。
+            // 客户端真正拿到的是本函数的输出，而它前面还排着若干条 return（吸收层耗尽的 503
+            // 覆盖、准入超时、全池冷却、限流、临时风控、region 错配…）。将来任何一条被放宽到
+            // 能匹配这两个 400 串，客户端拿到的 message 里就不再有哨兵 —— 而只调
+            // `translate_upstream_error` 的断言那时**依然全绿**。
+            let resp = map_provider_error(anyhow::Error::msg(upstream));
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "「装不下」必须仍是 400（重试原请求无意义，客户端要做的是压缩后重试）：{upstream}"
+            );
+            let body = futures::executor::block_on(to_bytes(resp.into_body(), usize::MAX)).unwrap();
+            let text = String::from_utf8_lossy(&body);
+            let low = text.to_lowercase();
+            assert!(
+                CC_SENTINELS.iter().any(|s| low.contains(s)),
+                "响应体未命中 Claude Code 的 compact-and-retry 判据 ⇒ 用户撞满上下文后不会自动\
+                 压缩重试，只会看到报错。改文案时必须保留英文哨兵子串。实际响应体: {text}"
+            );
+            // 中文排障文案不得因为加哨兵而丢失（两个受众各拿到自己那份）。
+            assert!(
+                text.contains("排障"),
+                "英文哨兵是**前缀**不是替换，中文排障步骤必须仍在: {text}"
+            );
+        }
     }
 
     #[test]
     fn test_translate_network_dns() {
-        let t = translate_upstream_error("error trying to connect: dns error: failed to resolve").unwrap();
+        let t = translate_upstream_error("error trying to connect: dns error: failed to resolve")
+            .unwrap();
         assert_eq!(t.status, StatusCode::BAD_GATEWAY);
         assert!(t.message.contains("DNS") && t.message.contains("排障"));
     }
@@ -2957,9 +4665,21 @@ mod error_translation_tests {
         let text = String::from_utf8_lossy(&body);
         // 客户端拿到的响应体绝不含任何敏感片段。
         assert!(!text.contains("arn:aws"), "响应体泄露了 ARN: {}", text);
-        assert!(!text.contains("123456789012"), "响应体泄露了 AWS 账号号: {}", text);
-        assert!(!text.contains("SECRET"), "响应体泄露了 profile id: {}", text);
-        assert!(!text.contains("eu-central-1"), "响应体泄露了 region: {}", text);
+        assert!(
+            !text.contains("123456789012"),
+            "响应体泄露了 AWS 账号号: {}",
+            text
+        );
+        assert!(
+            !text.contains("SECRET"),
+            "响应体泄露了 profile id: {}",
+            text
+        );
+        assert!(
+            !text.contains("eu-central-1"),
+            "响应体泄露了 region: {}",
+            text
+        );
         // 仍给出通用引导。
         assert!(text.contains("未识别错误") && text.contains("网关日志"));
     }
@@ -2969,8 +4689,7 @@ mod error_translation_tests {
     #[test]
     fn test_translate_network_no_false_positive_on_upstream_body() {
         // 模拟 provider 格式化的上游错误串(含 HTTP 状态码 + body,body 里有 "timeout"/"proxy" 字样)。
-        let upstream_body =
-            "流式 API 请求失败: 400 {\"message\":\"your request proxy timeout config is invalid, tls off\"}";
+        let upstream_body = "流式 API 请求失败: 400 {\"message\":\"your request proxy timeout config is invalid, tls off\"}";
         // is_transport_error 应判 false → translate_network 返回 None → 整体不误翻译。
         assert!(!is_transport_error(&upstream_body.to_lowercase()));
         assert!(
@@ -3010,7 +4729,10 @@ mod tier3_hotreload_tests {
         set_extract_thinking(true);
         assert!(extract_thinking_enabled(), "set true 后热路径应读到 true");
         set_extract_thinking(false);
-        assert!(!extract_thinking_enabled(), "set false 后热路径应读到 false");
+        assert!(
+            !extract_thinking_enabled(),
+            "set false 后热路径应读到 false"
+        );
     }
 
     #[test]
@@ -3087,7 +4809,10 @@ mod truncation_completion_tests {
                     let et = frame.event_type().map(|s| s.to_string());
                     match Event::from_frame(frame) {
                         Ok(event) => match event {
-                            Event::Error { error_code, error_message } => {
+                            Event::Error {
+                                error_code,
+                                error_message,
+                            } => {
                                 if completion.is_ok() {
                                     completion = CompletionStatus::UpstreamError {
                                         code: error_code,
@@ -3095,7 +4820,10 @@ mod truncation_completion_tests {
                                     };
                                 }
                             }
-                            Event::Exception { exception_type, message } => {
+                            Event::Exception {
+                                exception_type,
+                                message,
+                            } => {
                                 if exception_type != "ContentLengthExceededException"
                                     && completion.is_ok()
                                 {
@@ -3133,7 +4861,10 @@ mod truncation_completion_tests {
         // 回归 BUG①：in-band error 帧过去落入 `_ => {}` 被忽略、照返 200。
         // 现在应被识别为 UpstreamError，映射非 200。
         let frame = build_frame(
-            &[(":message-type", "error"), (":error-code", "InternalServerException")],
+            &[
+                (":message-type", "error"),
+                (":error-code", "InternalServerException"),
+            ],
             b"upstream exploded",
         );
         let completion = decode_to_completion(&frame);
@@ -3141,18 +4872,27 @@ mod truncation_completion_tests {
         assert!(!completion.is_ok(), "in-band error 帧应被识别为失败");
         assert_ne!(completion.http_status_u16(), 200, "失败必须返回非 200");
         assert_eq!(completion.http_status_u16(), 502);
-        assert_eq!(completion.outcome(), crate::usage::RequestOutcome::ServerError);
+        assert_eq!(
+            completion.outcome(),
+            crate::usage::RequestOutcome::ServerError
+        );
     }
 
     #[test]
     fn test_inband_throttling_error_frame_maps_to_429() {
         let frame = build_frame(
-            &[(":message-type", "error"), (":error-code", "ThrottlingException")],
+            &[
+                (":message-type", "error"),
+                (":error-code", "ThrottlingException"),
+            ],
             b"slow down",
         );
         let completion = decode_to_completion(&frame);
         assert_eq!(completion.http_status_u16(), 429);
-        assert_eq!(completion.outcome(), crate::usage::RequestOutcome::RateLimited);
+        assert_eq!(
+            completion.outcome(),
+            crate::usage::RequestOutcome::RateLimited
+        );
     }
 
     #[test]
@@ -3182,7 +4922,10 @@ mod truncation_completion_tests {
         let completion = decode_to_completion(&frame);
         assert!(!completion.is_ok(), "toolUseEvent 解析失败应判失败态");
         assert_eq!(completion.http_status_u16(), 502);
-        assert_eq!(completion.outcome(), crate::usage::RequestOutcome::ServerError);
+        assert_eq!(
+            completion.outcome(),
+            crate::usage::RequestOutcome::ServerError
+        );
     }
 
     #[test]
@@ -3190,7 +4933,10 @@ mod truncation_completion_tests {
         // 零倒退承诺：非 tool 帧解析失败只应告警、不置失败态。
         // 注意 AssistantResponseEvent.content 有 serde(default)，故须用非法 JSON 而非 `{}` 才能触发反序列化失败。
         let frame = build_frame(
-            &[(":message-type", "event"), (":event-type", "assistantResponseEvent")],
+            &[
+                (":message-type", "event"),
+                (":event-type", "assistantResponseEvent"),
+            ],
             b"not valid json",
         );
         let completion = decode_to_completion(&frame);

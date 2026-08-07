@@ -193,7 +193,21 @@ payload       = buffer[payload_start..payload_end]
 
 ## 3. Kiro 请求格式 (KiroRequest)
 
-请求体为 JSON，发往 `POST https://q.{region}.amazonaws.com/generateAssistantResponse`。
+请求体为 JSON。**发往哪个 host 取决于凭据类型** —— 本仓有两个端点实现，
+它们**按凭据类型绑定、不可互换**（互换实测 403）：
+
+| 端点 | 凭据类型 | 请求行 | 操作路由方式 |
+|---|---|---|---|
+| **IDE**（`src/kiro/endpoint/ide.rs`） | social / idc / external_idp（OAuth 号） | `POST https://runtime.{region}.kiro.dev/generateAssistantResponse` | **URL 路径** |
+| **CLI**（`src/kiro/endpoint/cli.rs`） | Kiro API Key（`ksk_` 前缀） | `POST https://q.{region}.amazonaws.com/`（**服务根，路径为空**） | **`X-Amz-Target` 头**：`AmazonCodeWhispererStreamingService.GenerateAssistantResponse` |
+
+> ⚠️ 本节此前只写 `q.{region}.amazonaws.com/generateAssistantResponse` —— 那是**两个端点
+> 各取一半拼出来的，任何一条链路上都不存在**（CLI 端点的路径是 `/` 而非
+> `/generateAssistantResponse`）。2026-08-06 更正。
+
+其余协议差异（`tokentype: API_KEY`、profileArn 注入与否、User-Agent）见两个模块的头部注释；
+响应体两者同为 AWS event-stream，复用同一套 `parser/` 解码。
+下面 3.x 各节描述的是**请求体结构**，两个端点共用（差异仅在 profileArn 与少数顶层字段）。
 
 ### 3.1 顶层结构
 

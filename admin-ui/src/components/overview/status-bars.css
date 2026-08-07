@@ -8,11 +8,18 @@
    动画走 transform/opacity(GPU 合成);motion-reduce 退化为静态档位条。
    ============================================================ */
 
-/* 算力格子本体:加减(点亮/熄灭)走 transition(仅亮灭淡入淡出,无 scale=保持凌晨满格观感)。
-   transition-duration/delay 由行内按填充前沿距离错峰给出;真正的“计算跳动”走下方 flicker 动画。 */
+/* 算力格子本体:加减(点亮/熄灭)仅走亮灭淡入淡出(无 scale) —— 保持"凌晨满格观感"。
+   transition-duration/delay 由行内按填充前沿距离错峰给出;真正的“计算跳动”走下方 flicker 动画。
+
+   ⚠️ 刻意**不写 `will-change`**（这条是性能修复，别加回来）：
+   `.sbar-cell` 是 GRID_COLS×GRID_ROWS = 20 个/条且**常驻**，30 个号同屏就是 600 个。
+   `will-change` 不是"提示浏览器优化"，它是**立即且长期**为每个元素分配一条合成层 —— 600 层
+   会吃掉大量 GPU 内存，反而拖慢合成。它只适合少数、且动画即将发生的元素。
+   而这里唯一的动画（flicker）只动 opacity，那本就是浏览器已高度优化的合成属性，不需要加持。
+   对比 `.sbar-cell-ignite`：它保留 will-change 是有理据的 —— 每条只有 GRID_COLS = 10 个、
+   仅在 `active && pulse > 0` 时挂载（一次性扫光），且真的动 transform(0.65→1)。 */
 .sbar-cell {
   border-radius: 1px;
-  will-change: opacity;
   transition-property: background-color, box-shadow, opacity;
   transition-timing-function: ease;
 }
@@ -60,6 +67,11 @@
   will-change: opacity, transform;
 }
 
+/* motion-reduce:只去掉"动",不去掉"信息"。
+   - 格子仍按行内 opacity/背景呈现最终态(点亮=实心亮格、熄灭=极暗满格),只是不再过渡/闪动
+     → 负载依旧由亮格数读出,不会退化成"格子全消失看不出负载"。
+   - flicker 停在 opacity 默认值(1) = 点亮格恒亮,比闪动更清晰。
+   - 只有点火波(纯装饰的一次性扫光)整层隐藏。 */
 @media (prefers-reduced-motion: reduce) {
   .sbar-cell {
     transition: none;

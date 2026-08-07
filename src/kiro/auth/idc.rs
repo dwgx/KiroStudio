@@ -165,14 +165,8 @@ pub async fn start_device_authorization(
 
     let data: serde_json::Value = resp.json().await?;
     Ok(DeviceAuth {
-        device_code: data["deviceCode"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string(),
-        user_code: data["userCode"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string(),
+        device_code: data["deviceCode"].as_str().unwrap_or_default().to_string(),
+        user_code: data["userCode"].as_str().unwrap_or_default().to_string(),
         verification_uri: data["verificationUri"]
             .as_str()
             .unwrap_or_default()
@@ -221,7 +215,11 @@ pub async fn register_and_authorize_probing(
         let oidc_client = match register_client(region, config, proxy).await {
             Ok(c) => c,
             Err(e) => {
-                tracing::debug!("IdC region={} register_client 失败(试下一个): {}", region, e);
+                tracing::debug!(
+                    "IdC region={} register_client 失败(试下一个): {}",
+                    region,
+                    e
+                );
                 last_err = Some(format!("register_client@{}: {}", region, e));
                 continue;
             }
@@ -231,14 +229,19 @@ pub async fn register_and_authorize_probing(
                 tracing::info!(
                     "IdC 探测到实例 region={}（用户填 {}）",
                     region,
-                    if user_region.trim().is_empty() { "<空>" } else { user_region.trim() }
+                    if user_region.trim().is_empty() {
+                        "<空>"
+                    } else {
+                        user_region.trim()
+                    }
                 );
                 return Ok((region.clone(), oidc_client, device_auth));
             }
             Err(e) => {
                 tracing::debug!(
                     "IdC region={} device_authorization 未命中(试下一个): {}",
-                    region, e
+                    region,
+                    e
                 );
                 last_err = Some(format!("device_authorization@{}: {}", region, e));
                 continue;
@@ -247,10 +250,8 @@ pub async fn register_and_authorize_probing(
     }
     // 全 region 都不成 → 结构化诊断 REGION_MISMATCH（归因 UserInput + 引导查 IAM Identity Center），
     // 取代裸 bail 字符串,前端渲染成引导卡片。
-    let diagnosis = crate::kiro::diagnosis::diagnose_device_auth_all_failed(
-        order.len(),
-        last_err.as_deref(),
-    );
+    let diagnosis =
+        crate::kiro::diagnosis::diagnose_device_auth_all_failed(order.len(), last_err.as_deref());
     tracing::warn!("IdC device flow 全 region 失败：{}", diagnosis.log_line());
     Err(crate::kiro::token_manager::DiagnosedError { diagnosis }.into())
 }
@@ -305,10 +306,7 @@ pub async fn poll_create_token(
             Err(e) => return PollTokenResult::Error(format!("解析 JSON 失败: {}", e)),
         };
         return PollTokenResult::Done(IdcTokenResult {
-            access_token: data["accessToken"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
+            access_token: data["accessToken"].as_str().unwrap_or_default().to_string(),
             refresh_token: data["refreshToken"].as_str().map(|s| s.to_string()),
             expires_in: data["expiresIn"].as_u64().unwrap_or(28800),
         });
@@ -352,7 +350,10 @@ mod tests {
         // 用户填了候选表没有的 region → 打头,总数 = 候选表 + 1。
         // 用一个确定不在 OIDC_PROBE_REGIONS 里的 region(us-west-1 只在对话白名单,不在 OIDC 探测表)。
         let novel = "us-west-1";
-        assert!(!IDC_OIDC_PROBE_REGIONS.contains(&novel), "测试前提:该 region 不在 OIDC 候选表");
+        assert!(
+            !IDC_OIDC_PROBE_REGIONS.contains(&novel),
+            "测试前提:该 region 不在 OIDC 候选表"
+        );
         let order = probe_region_order(novel);
         assert_eq!(order.first().map(|s| s.as_str()), Some(novel));
         assert_eq!(order.len(), IDC_OIDC_PROBE_REGIONS.len() + 1);

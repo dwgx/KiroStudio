@@ -12,6 +12,18 @@ import { useSyncExternalStore, useCallback } from 'react'
 export type PoolSortMode = 'health' | 'sequence' | 'concurrency' | 'lastUsed'
 /** 凭据卡片尺寸档位。 */
 export type CardSize = 'compact' | 'standard' | 'large'
+/**
+ * 凭据管理页视图形态:card=卡片(默认,行为不变) / row=紧凑行(一行一个号,适合 50+ 号)
+ * / canvas=自由画布(框选 + 拖动位置 + 拖角改大小)。
+ *
+ * ⚠️ 上面那段设计取舍否决了「拖拽固定位置」,理由是**会被自动排序/轮询冲掉** ——
+ * 该理由对 card/row 两档**仍然成立**(它们的位置是数据顺序的产物)。
+ * canvas 档绕开它的方式是把空间位置与数据顺序**彻底解耦**:位置只来自
+ * `use-canvas-layout.ts` 的持久化 store,轮询数据只决定外观(健康色/在途)。
+ * 于是「轮询冲掉位置」在结构上不可能发生。**card/row 的行为一个字节都没动。**
+ * 详见 `use-canvas-layout.ts` 顶部的完整推导。
+ */
+export type CredentialView = 'card' | 'row' | 'canvas'
 
 export interface UiLayoutPrefs {
   /** 号池排序:health=健康度(默认) / sequence=按 id 顺序 / concurrency=并发在途多优先 / lastUsed=最近调用优先 */
@@ -20,6 +32,9 @@ export interface UiLayoutPrefs {
   poolShowDisabled: boolean
   /** 凭据管理卡片尺寸档位 */
   cardSize: CardSize
+  /** 凭据管理视图形态(卡片 / 紧凑行)。刻意复用本键而非新开 localStorage 键:
+      与 cardSize 同属"凭据管理排版偏好",`{...DEFAULTS, ...parsed}` 让旧数据自动补默认值。 */
+  credentialView: CredentialView
 }
 
 const STORAGE_KEY = 'uiLayoutPrefs'
@@ -27,6 +42,7 @@ const DEFAULTS: UiLayoutPrefs = {
   poolSort: 'health',
   poolShowDisabled: true,
   cardSize: 'standard',
+  credentialView: 'card',
 }
 
 // 同一 tab 内 localStorage 写入不触发 storage 事件,用自定义事件广播让所有组件实时同步。

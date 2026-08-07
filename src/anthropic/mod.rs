@@ -24,20 +24,24 @@
 
 pub mod compressor;
 pub(crate) mod converter;
-pub(crate) mod model_catalog;
 pub(crate) mod handlers;
 pub(crate) mod middleware;
+pub(crate) mod model_catalog;
 mod router;
 mod stream;
 pub mod types;
 mod websearch;
 
-pub use handlers::set_collect_client_fingerprint;
-pub use handlers::set_trust_forwarded_header;
 pub use converter::{set_strip_env_noise, set_tool_description_max_chars};
-pub use handlers::set_extract_thinking;
 pub use handlers::set_cc_auto_buffer;
+pub use handlers::set_collect_client_fingerprint;
+pub use handlers::set_extract_thinking;
 pub use handlers::set_prompt_cache_enabled;
+pub use handlers::set_trust_forwarded_header;
+/// 吸收层分类器：供 `kiro::provider` 的 'absorb 循环判定「这个错误值不值得就地重试」。
+/// 刻意复用 handlers 侧的既有谓词而不在 provider 另写一套字符串匹配 —— 两份拷贝必然漂移。
+/// `pub(crate)`：这是网关内部的重试策略，不属于 anthropic 模块对外的 API 面。
+pub(crate) use handlers::{AbsorbClass, absorb_class_of};
 pub use handlers::{
     set_tool_clean_leaked_tokens, set_tool_expose_error_to_client, set_tool_repair_json,
     set_tool_stream_align_failure, set_tool_truncation_recovery,

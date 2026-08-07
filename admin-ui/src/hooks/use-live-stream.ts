@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { storage } from '@/lib/storage'
 
+// 连接建立超时：网络卡顿时 fetch 可无限挂起（半开 TCP 不自然 done），15s 拿不到响应
+// 就 abort 这次连接走重连退避，避免"绿灯 + stale 数据 + 退避冻结"三件套。
+const CONNECT_TIMEOUT_MS = 15_000
+// 空闲超时：连接建立后 30s 无任何帧数据 = 链路已死但 read() 不返回（半开），abort 触发重连。
+const IDLE_TIMEOUT_MS = 30_000
+
 // SSE /api/admin/stream/live 的一帧（后端 usage_handlers.rs LiveFrame，camelCase）。
 // 每 ~1.5s 一帧，只读内存零上游——比 10s 轮询跟手得多，用于号池实时指示。
 export interface LiveCred {
@@ -73,11 +79,18 @@ export function useLiveStream(enabled = true): LiveStreamState {
       const myGen = ++generation
       const ctrl = new AbortController()
       activeCtrl = ctrl
+      // 空闲检测定时器（半开死连接）：收到帧重置，超时 abort 走重连。声明在 try 外，
+      // 供 catch/收尾访问。
+      let idleTimer: ReturnType<typeof setTimeout> | null = null
+      // 连接建立超时：网络卡顿时 15s 拿不到响应就 abort 这次连接（否则 fetch 无限挂起，
+      // connected 停 true、退避的 attempt 也不自增 → 整体冻结）。
+      const connectTimer = setTimeout(() => ctrl.abort(), CONNECT_TIMEOUT_MS)
       try {
         const resp = await fetch('/api/admin/stream/live', {
           headers: { 'x-api-key': key },
           signal: ctrl.signal,
         })
+        clearTimeout(connectTimer)
         // fetch 对 502/503 是 resolve 而非 reject，而反代（Caddy）的 HTML 错误页让 resp.body
         // 非空 → 不查 ok 会把网关错误当成"已连上"，指示灯先亮绿再立刻闪回重连中。
         if (!resp.ok) throw new Error('http ' + resp.status)
@@ -86,6 +99,11 @@ export function useLiveStream(enabled = true): LiveStreamState {
         const reader = resp.body.getReader()
         const decoder = new TextDecoder()
         let buf = ''
+        const kickIdle = () => {
+          if (idleTimer) clearTimeout(idleTimer)
+          idleTimer = setTimeout(() => ctrl.abort(), IDLE_TIMEOUT_MS)
+        }
+        kickIdle()
         for (;;) {
           const { done, value } = await reader.read()
           if (done) break
@@ -98,19 +116,22 @@ export function useLiveStream(enabled = true): LiveStreamState {
             try {
               setFrame(JSON.parse(dataLine.slice(5).trim()) as LiveFrame)
               attempt = 0 // 真收到一帧 = 链路健康，退避从头计
+              kickIdle() // 收到帧重置空闲计时：链路活着
             } catch {
               /* keep-alive 注释 / 非 JSON 行忽略 */
             }
           }
         }
       } catch {
-        /* abort（卸载/隐藏/被新一轮顶掉）或断连：落到下方重连 */
+        /* abort（超时/卸载/隐藏/被新一轮顶掉）或断连：落到下方重连 */
       }
+      if (idleTimer) clearTimeout(idleTimer)
       // 已被更新的一轮取代：不碰 connected、不排计时器，否则两轮互相踩。
       if (myGen !== generation) return
       if (!cancelled) {
         setConnected(false)
         // 指数退避（2s/4s/8s…上限 30s）：后端长时间不可用时固定 2s 会持续砸重连请求。
+        // 超时路径下 attempt 已在此自增（fetch 已 settle），退避不被冻结。
         const delay = Math.min(2000 * 2 ** attempt, 30000)
         attempt++
         retryTimer = setTimeout(connect, delay)

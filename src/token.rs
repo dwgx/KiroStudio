@@ -192,6 +192,21 @@ pub(crate) fn count_all_tokens_local(
     messages: &[Message],
     tools: Option<&[Tool]>,
 ) -> u64 {
+    count_all_tokens_local_unfloored(system, messages, tools).max(1)
+}
+
+/// [`count_all_tokens_local`] 的无下限版本：真实为 0 时返回 0，不抬到 1。
+///
+/// 拆出来的理由：`.max(1)` 是给「请求输入 token」用的（一次请求不可能是 0 token，
+/// 落库 0 会让面板出现除零/空值）。但前缀估算要把它**相加**，
+/// 而 `.max(1)` 在每次调用上各抬 1 → 空 system + 空历史被算成 2 个「已缓存」token，
+/// 于是 `estimate_cache_breakdown` 的 `prefix_tokens > 0` 闸门被这个幽灵值顶开，
+/// 客户端收到 `cache_read_input_tokens: 2` 而实际什么都没缓存。
+fn count_all_tokens_local_unfloored(
+    system: Option<&[SystemMessage]>,
+    messages: &[Message],
+    tools: Option<&[Tool]>,
+) -> u64 {
     let mut total = 0;
 
     // 系统消息
@@ -224,7 +239,7 @@ pub(crate) fn count_all_tokens_local(
         }
     }
 
-    total.max(1)
+    total
 }
 
 /// 估算稳定前缀（系统提示 + 历史轮次）占用的 token 数。
@@ -233,17 +248,39 @@ pub(crate) fn count_all_tokens_local(
 /// 消息之前的所有内容。当 `agentContinuationId` 固定（同一会话），连续请求会命中该缓存。
 ///
 /// 返回 0 表示第一轮（无历史，缓存尚未建立）；返回正值表示可估算的 cache_read 量。
+///
+/// # 边界必须与 converter 的转发切片对齐
+///
+/// `converter::convert_request` 发给上游的历史不是 `messages[..len-1]`：它先做 prefill
+/// 预处理（末尾非 user 时截断到**最后一条 user**，`converter.rs:861-871`），
+/// 再由 `build_history` 去掉末尾那条 user 作 currentMessage（`converter.rs:1583`）。
+/// 即真实历史 = `messages[..last_user_idx]`。
+///
+/// 本函数原先直接砍末尾一条，对 prefill 载荷（末尾是 assistant）就会把**当前轮**的
+/// user 消息算进「已缓存前缀」——那条消息此刻正第一次发给上游，不可能已被缓存。
+/// 现改为按 role 定位 `last_user_idx`，与 converter 同口径。
 pub(crate) fn count_prefix_tokens(
     system: Option<&[crate::anthropic::types::SystemMessage]>,
     messages: &[crate::anthropic::types::Message],
 ) -> i32 {
-    // 第一轮：没有历史前缀，prefix cache 尚未建立，保守返回 0
-    if messages.len() <= 1 {
+    // 与 converter 的 prefill 预处理同口径：末尾非 user 时，边界是最后一条 user 的下标。
+    // 找不到任何 user 消息时 converter 直接报 EmptyMessages，这里保守返回 0。
+    let Some(last_user_idx) = messages.iter().rposition(|m| m.role == "user") else {
+        return 0;
+    };
+    let history_slice = &messages[..last_user_idx];
+
+    // 第一轮：没有历史前缀，prefix cache 尚未建立，保守返回 0。
+    // 注意这里判的是**历史切片**为空，而不是 `messages.len() <= 1`——
+    // prefill 载荷 `[user, assistant]` 长度为 2 但真实历史仍是空的。
+    if history_slice.is_empty() {
         return 0;
     }
-    let history_slice = &messages[..messages.len() - 1];
-    let sys_tokens = count_all_tokens_local(system, &[], None);
-    let hist_tokens = count_all_tokens_local(None, history_slice, None);
+
+    // 用无下限版本相加：两次 `.max(1)` 会凭空造出 2 个「已缓存」token（见
+    // `count_all_tokens_local_unfloored` 的说明）。
+    let sys_tokens = count_all_tokens_local_unfloored(system, &[], None);
+    let hist_tokens = count_all_tokens_local_unfloored(None, history_slice, None);
     (sys_tokens + hist_tokens) as i32
 }
 
@@ -251,6 +288,139 @@ pub(crate) fn count_prefix_tokens(
 // count_message_content_tokens / estimate_content_block_tokens 原仅供影子缓存记账
 // （cache_tracker）按块累计使用。影子缓存已整体移除，这些辅助函数一并删除。
 // 请求路径的输入 token 估算走 count_all_tokens_local（字符数/4），不受影响。
+
+#[cfg(test)]
+mod prefix_tokens_tests {
+    use super::*;
+    use crate::anthropic::types::{Message, SystemMessage};
+
+    fn msg(role: &str, text: &str) -> Message {
+        Message {
+            role: role.to_string(),
+            content: serde_json::Value::String(text.to_string()),
+        }
+    }
+
+    fn sys(text: &str) -> Vec<SystemMessage> {
+        vec![SystemMessage {
+            text: text.to_string(),
+            block_type: None,
+            cache_control: None,
+        }]
+    }
+
+    /// 单轮请求没有历史前缀 → 0（保持既有契约）。
+    #[test]
+    fn should_return_zero_for_single_turn() {
+        let m = vec![msg("user", "hello")];
+        assert_eq!(count_prefix_tokens(Some(&sys("you are helpful")), &m), 0);
+    }
+
+    /// 🔴 核心回归：prefill 载荷（末尾 assistant）的历史仍是空的。
+    ///
+    /// 旧实现砍末尾一条得到 `[user]`，把**当前轮**的 user 消息算成已缓存前缀，
+    /// 于是长 system + 长 user 的首轮请求会虚报一个很大的 cache_read。
+    #[test]
+    fn should_return_zero_for_prefill_payload_whose_history_is_empty() {
+        let m = vec![msg("user", "hello"), msg("assistant", "partial prefill")];
+        // 长 system，确保旧实现一定返回一个显著的正值（而非恰好为 0 的巧合）
+        let system = sys(&"stable system instructions. ".repeat(200));
+        assert_eq!(
+            count_prefix_tokens(Some(&system), &m),
+            0,
+            "末尾 assistant 时真实历史为空，不应把当前轮 user 计入已缓存前缀"
+        );
+    }
+
+    /// 🔴 分支顺序守卫：prefill 截断必须发生在「历史是否为空」判定**之前**。
+    ///
+    /// `[u, a, u, a]` 的真实转发历史是 `[u, a]`（截断到最后一条 user 再去掉它），
+    /// 而旧实现给出 `[u, a, u]` —— 多算了一整轮。两者都非 0，所以只有比较**数值**
+    /// 才能抓住；只断言 `> 0` 的测试会双双通过而放过缺陷。
+    #[test]
+    fn should_cut_history_at_last_user_not_at_last_message() {
+        let long = "z".repeat(4000);
+        let m = vec![
+            msg("user", "turn1-user"),
+            msg("assistant", "turn1-assistant"),
+            msg("user", &long), // 当前轮 user：绝不该计入前缀
+            msg("assistant", "prefill tail"),
+        ];
+        let got = count_prefix_tokens(None, &m);
+
+        // 期望值 = 只含前两条的历史
+        let expect = count_prefix_tokens(
+            None,
+            &[
+                msg("user", "turn1-user"),
+                msg("assistant", "turn1-assistant"),
+                msg("user", "current"),
+            ],
+        );
+        assert_eq!(got, expect, "边界应落在最后一条 user 之前");
+
+        // 并且必须显著小于「把当前轮 user 也算进去」的旧口径
+        let old_style = count_all_tokens_local_unfloored(None, &m[..m.len() - 1], None) as i32;
+        assert!(
+            got < old_style,
+            "旧口径 {} 含了 4000 字符的当前轮 user，新口径 {} 应显著更小",
+            old_style,
+            got
+        );
+    }
+
+    /// 幽灵 token：空 system + 内容为空的历史不应产出正的 cache_read。
+    ///
+    /// 旧实现两次 `.max(1)` 各抬 1 → 返回 2，而 `estimate_cache_breakdown` 只要
+    /// `prefix_tokens > 0` 就下发 `cache_read_input_tokens`，于是客户端看到
+    /// 「命中 2 tokens」而实际什么都没有。
+    #[test]
+    fn should_not_invent_phantom_tokens_when_prefix_is_empty() {
+        let m = vec![
+            msg("user", ""),
+            msg("assistant", ""),
+            msg("user", "current question"),
+        ];
+        assert_eq!(
+            count_prefix_tokens(None, &m),
+            0,
+            "空前缀不应产出正值（两次 .max(1) 的幽灵值）"
+        );
+    }
+
+    /// 正常多轮：有真实历史时仍返回正值（防止修复过度收敛成恒 0）。
+    #[test]
+    fn should_count_real_history_and_system() {
+        let m = vec![
+            msg("user", &"question one ".repeat(50)),
+            msg("assistant", &"answer one ".repeat(50)),
+            msg("user", "question two"),
+        ];
+        let with_sys = count_prefix_tokens(Some(&sys(&"rules ".repeat(50))), &m);
+        let without_sys = count_prefix_tokens(None, &m);
+        assert!(without_sys > 0, "有历史应返回正值，实际 {}", without_sys);
+        assert!(
+            with_sys > without_sys,
+            "system 应计入前缀：{} 应大于 {}",
+            with_sys,
+            without_sys
+        );
+    }
+
+    /// 无 user 消息（converter 会报 EmptyMessages）时保守返回 0，不 panic。
+    #[test]
+    fn should_return_zero_when_no_user_message_exists() {
+        let m = vec![msg("assistant", "orphan"), msg("assistant", "another")];
+        assert_eq!(count_prefix_tokens(Some(&sys("sys")), &m), 0);
+    }
+
+    /// `count_all_tokens_local` 的对外下限契约不变（拆函数不能改公开行为）。
+    #[test]
+    fn should_keep_floor_of_one_on_public_local_counter() {
+        assert_eq!(count_all_tokens_local(None, &[], None), 1);
+        assert_eq!(count_all_tokens_local_unfloored(None, &[], None), 0);
+    }
+}
 
 /// 估算输出 tokens
 pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {

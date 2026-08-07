@@ -50,6 +50,15 @@ export interface CredentialStatusItem {
   endpoint: string
   /** 该端点是否被用户显式固定。false = 系统自动推断（ksk_ 号自动走 cli，其余回退全局默认）。 */
   endpointPinned?: boolean
+  /**
+   * **实际生效**的上游 region（真正拼进 host 的值，如 "us-east-1"）。
+   *
+   * ksk_ 是按区授权的 token，打错区上游恒 403。此前后端完全不下发 region，
+   * 行视图只能恒显 `—`，探测探错了在面板上看不出来。
+   */
+  effectiveRegion?: string
+  /** 该 region 是否被显式写死。false = 现值只是 config 全局回退，没人为这个号定过区。 */
+  regionPinned?: boolean
   /** 当前在途（in-flight）请求数：实时负载，用于观测负载是否均衡分摊。 */
   inflight?: number
   /** 最近 60 秒滚动窗口内的请求数（RPM 观测）。 */
@@ -59,6 +68,14 @@ export interface CredentialStatusItem {
   overageEnabled?: boolean
   /** 用户自定义别名/备注（卡片展示优先于 email/#id）。 */
   name?: string
+  /** 分身组标识：同一次多开的全部份共享（含主份）。单开凭据无此字段。
+      前端按它分组呈现；后端用随机 UUID 而非父号 id/key 哈希，
+      故 id 复用与 key 轮换都不会让分组错乱。 */
+  cloneGroup?: string
+  /** 组内序号（1-based，1 = 主份），展示为「分身 #2/5」。 */
+  cloneSeq?: number
+  /** 分身标签：这一份的用途标记（与 name 是账号别名不同）。 */
+  tag?: string
   /** 是否正处于冷却中（429/限流/服务错误后短暂跳过调度）。 */
   coolingDown?: boolean
   /** 冷却剩余毫秒（coolingDown 为 true 时有效）。 */
@@ -196,10 +213,72 @@ export interface AddCredentialRequest {
    * >1 时第 1 份仍走去重，只有第 2..N 份绕过。上限 16。
    */
   copies?: number
+  /**
+   * 主份的出口**点名一个节点池 id**（「出口 IP → 从池中选」）。
+   *
+   * 必须传 id 而不是 URL：节点密码从不下发前端（只有 `hasPassword` 布尔），
+   * 服务端按 id 自己取完整 `(url, username, password)` 写进凭据。
+   *
+   * 不与 `copies` 打架：本字段只钉主份，第 2..N 份仍从池里自动补
+   * （若用 `nodeIds: [x]` 表达同一意图，那语义是"本次只用这些节点"，
+   * 第 2/3 份就一个都拿不到）。
+   *
+   * id 不存在 / 已禁用 → 后端 400 且不建任何份（不会静默改成直连或别的节点）。
+   */
+  primaryNodeId?: number
+  /**
+   * 主份要不要也从节点池自动取一个出口。
+   *
+   * **省略 = 后端按份数定**：`copies=1` → true（只有一份，节点没有别的去处）；
+   * `copies>1` → false（主份保持表单里选的出口，池节点全让给第 2..N 份，
+   * 于是 N 份只需 N-1 个节点）。
+   *
+   * 「自动分配」按钮下发 `true`：那正是"让服务端替主份挑一个最合适的节点"。
+   */
+  assignPrimaryNode?: boolean
+  /**
+   * 要求每份都拿到独立节点，凑不齐就整个请求 400（**一份也不建**）。
+   *
+   * 省略 = 后端宽松模式（节点不够时多余的份直连并在文案里说明，行为不变）。
+   * 前端在走池分配时下发 `true`：用户点的是"把这些份分散到不同出口"，
+   * 凑不齐时给他一堆共用同一出口的份是假成功。
+   */
+  requireNodePerCopy?: boolean
   // 自定义 API 代挂透传
   baseUrl?: string
   apiKey?: string
   requestLimit?: number
+}
+
+/**
+ * 给**池中已有**凭据再加分身的请求（`POST /credentials/{id}/clone`）。
+ *
+ * 没有 key 字段是刻意的：key 由服务端按 id 自己读，一步都不经前端
+ * （`CredentialStatusItem` 只有 `apiKeyHash` 与掩码形态，前端拿不到原文）。
+ */
+export interface CloneCredentialRequest {
+  /** 本次再加几份。省略按 1 处理；上限与后端 `MAX_CREDENTIAL_COPIES` 同值（16）。 */
+  copies?: number
+  /**
+   * 新建的分身是否直接启用。**省略 = 后端默认 false（不启用）**。
+   *
+   * 默认不启用是刻意的：新分身还没绑出口、没验活，直接入池参与调度等于
+   * 把未经验证的号推上热路径；而分身共享同一个上游账号配额，多几份立刻
+   * 参与调度只会更快撞 429。
+   */
+  enabled?: boolean
+  /** 本次要用的节点池 id 列表。省略 = 从池里自动分配（按已绑数↑、延迟↑）。 */
+  nodeIds?: number[]
+  /**
+   * 本次新建的**第 1 份**要不要也从池里取节点。
+   *
+   * ⚠️ **省略 = 后端默认 `true`**（与 `AddCredentialRequest.assignPrimaryNode` 的
+   * 默认相反）：这条路父号一字节不动，建出来的 N 份全是新条目、彼此同质，
+   * 让第 1 份独独裸连而池里空着一个节点，正是 2026-08-05 修掉的缺陷。
+   */
+  assignPrimaryNode?: boolean
+  /** 凑不齐「每份一个独立节点」就整个请求 400。省略 = 宽松（不够的份直连）。 */
+  requireNodePerCopy?: boolean
 }
 
 // 添加凭据响应
@@ -347,6 +426,17 @@ export interface ConfigSnapshotResponse {
   endpointNames: string[]
   extractThinking: boolean
   ccAutoBuffer: boolean
+  /** 批量推号入口 POST /api/import/keys 是否启用（默认**开**：端点先于开关存在，
+      外部 kiro-accounting 正在用；关掉后两个挂载点一起返 403）。 */
+  importKeysEnabled: boolean
+  /** 上游 429 吸收层：客户端未收到任何字节时，网关就地退避重试可恢复的 429（默认**开**）。 */
+  upstreamRetryAbsorbEnabled: boolean
+  upstreamRetryAbsorbBudgetSecs: number
+  upstreamRetryAbsorbMaxRounds: number
+  upstreamRetryAbsorbMinDelayMs: number
+  upstreamRetryAbsorbMaxDelaySecs: number
+  /** 是否把 403 临时风控也当可吸收错误（默认关，与自愈退避冲突）。 */
+  upstreamRetryAbsorbSuspended: boolean
   stripEnvNoise: boolean
   toolCleanLeakedTokens: boolean
   toolReclaimTextifiedInvoke: boolean
@@ -359,6 +449,8 @@ export interface ConfigSnapshotResponse {
   /** credentials.json / trash.json at-rest 加密开关（机器绑定密钥，立即生效，默认关）。 */
   encryptCredentialsAtRest: boolean
   cooldownEnabled: boolean
+  /** 账户级 403 风控连续 N 次零成功后自动禁用该号。默认开。 */
+  autoDisableSuspicious: boolean
   allCoolingFastFail: boolean
   rateLimitEnabled: boolean
   rateLimitDailyMax: number
@@ -384,8 +476,30 @@ export interface ConfigSnapshotResponse {
   inboundBurstSecs: number
   inboundQueueMaxWaitSecs: number
   inboundQueueTimeoutPassthrough: boolean
-  /** 当前实时目标 RPM（自动挡动态，只读展示） */
+  /**
+   * 当前实时**目标** RPM（自动挡动态，只读展示）。
+   *
+   * ⚠️ "current" 指「当前生效的目标值」，**不是实测吞吐**。实测在
+   * `inboundObservedRpm`。这两个曾是同一个值（后端把它接成 target），实测面板显示
+   * 500 而客户端真实只有 50~70 —— 差一个数量级。展示时务必标明它是目标而非实测。
+   */
   inboundCurrentRpm: number
+  /**
+   * 最近 60 秒**实测**入站 RPM（客户端请求数，**不含** failover 重试）。
+   *
+   * 旧后端不下发此字段 ⇒ 可能为 undefined，渲染时要降级而不是显示 0
+   * （显示 0 会被读成"没有流量"，而真相是"这个后端还没有这个指标"）。
+   */
+  inboundObservedRpm?: number
+  /**
+   * 逐号 RPM 之和 = 上游实际承受的尝试速率（**含** failover 重试）。
+   *
+   * 与 `inboundObservedRpm` 的比值即重试放大倍数（2026-08-06 实测 4.59×）。
+   * 两者量纲不同，别相减也别当同一条曲线画。
+   */
+  inboundObservedUpstreamRpm?: number
+  /** 累计放行的客户端请求数（滑窗恒 0 而它在涨 ⇒ 滑窗坏了）。 */
+  inboundAdmittedTotal?: number
   balanceWeightEnabled: boolean
   balanceWeightFloor: number
   health429WeightEnabled: boolean
@@ -429,6 +543,14 @@ export interface UpdateConfigRequest {
   defaultEndpoint?: string
   extractThinking?: boolean
   ccAutoBuffer?: boolean
+  importKeysEnabled?: boolean
+  // 上游 429 吸收层
+  upstreamRetryAbsorbEnabled?: boolean
+  upstreamRetryAbsorbBudgetSecs?: number
+  upstreamRetryAbsorbMaxRounds?: number
+  upstreamRetryAbsorbMinDelayMs?: number
+  upstreamRetryAbsorbMaxDelaySecs?: number
+  upstreamRetryAbsorbSuspended?: boolean
   stripEnvNoise?: boolean
   toolCleanLeakedTokens?: boolean
   toolReclaimTextifiedInvoke?: boolean
@@ -440,6 +562,7 @@ export interface UpdateConfigRequest {
   toolDescriptionMaxChars?: number
   encryptCredentialsAtRest?: boolean
   cooldownEnabled?: boolean
+  autoDisableSuspicious?: boolean
   allCoolingFastFail?: boolean
   rateLimitEnabled?: boolean
   rateLimitDailyMax?: number
@@ -516,6 +639,35 @@ export interface WindowSummary {
   cache_creation_tokens: number
   credits_used: number
   avg_latency_ms: number
+  /**
+   * 换号次数累计（后端 `Aggregate.retries_sum` 直出）。
+   *
+   * **后端已下发**（`WindowSummary` DTO 已接通出口）。仍保持 optional 是为了兼容
+   * 旧后端二进制 + 新前端的组合 —— 那种情况下字段真的不在，标成必填就是类型说谎。
+   */
+  retries_sum?: number
+  /**
+   * **发生过**重试的请求数（`retries > 0`）。同为后端已下发字段（optional 理由同上）。
+   *
+   * 两个字段必须成对出现、且**不要只取其一**：绝大多数请求 `retries=0`，
+   * 用 requests 当分母算出的均值会被压到接近 0（1000 条里 10 条各重试 6 次 ⇒
+   * 6000/1000=0.06，看着"几乎不重试"，真相是那 10 条平均重试 6 次）。
+   * 两个分母各有用途：`retries_sum / requests` 是整池放大倍数（可与外置 shield 的
+   * 实测 3.27x 同口径对比），`retries_sum / retried_requests` 是"真重试时重试几次"。
+   */
+  retried_requests?: number
+  /** 每请求平均换号次数（= retries_sum / requests，整池放大倍数口径，后端已算好） */
+  avg_retries_per_request?: number
+  /**
+   * 真发生重试时的平均次数（= retries_sum / retried_requests）。
+   * 无重试样本时后端给 `null`（不是 0 —— 0 会被读成"重试过但只重试 0 次"）。
+   */
+  avg_retries_when_retried?: number | null
+  /**
+   * 平均 TTFB（毫秒）。无有效样本时为 `null` —— 0ms 物理上不可能，
+   * 把"没数据"显示成 0 比显示 '—' 危险得多（看着像"快到测不出"）。
+   */
+  avg_first_token_ms?: number | null
 }
 
 // 概览：24h / 7d / 30d 三窗口
@@ -541,6 +693,14 @@ export interface SeriesPoint {
   cache_creation_tokens: number
   credits_used: number
   avg_latency_ms: number
+  /**
+   * 该桶的换号次数累计（画重试趋势的数据源）。**后端已下发**；
+   * optional 只为兼容旧后端二进制（见 WindowSummary 上同名字段的说明）。
+   * 序列点上后端只给原始计数不给平均值 —— 两个分母都在同一个点里，口径由前端定。
+   */
+  retries_sum?: number
+  /** 该桶内发生过重试的请求数（`retries > 0`）；与 retries_sum 成对使用，勿只取其一 */
+  retried_requests?: number
 }
 
 // 按模型/凭据分组统计（无 total_tokens 字段）
@@ -557,6 +717,15 @@ export interface GroupStat {
   cache_creation_tokens: number
   credits_used: number
   avg_latency_ms: number
+  /**
+   * 换号次数累计（按模型/凭据看哪个维度在烧重试预算）。**后端已下发**；
+   * optional 只为兼容旧后端二进制（见 WindowSummary 上同名字段的说明）。
+   */
+  retries_sum?: number
+  /** 发生过重试的请求数（`retries > 0`）；与 retries_sum 成对使用，勿只取其一 */
+  retried_requests?: number
+  /** 该分组每请求平均换号次数（= retries_sum / requests，后端已算好） */
+  avg_retries_per_request?: number
 }
 
 // 请求结果分类
@@ -831,4 +1000,114 @@ export interface OnboardingDiagnosis {
   raw?: string
   /** 能否重试 */
   retriable: boolean
+}
+
+/** 一次代理测活的结果快照（与 /proxy/test 同语义）。 */
+export interface SocksNodeTest {
+  ok: boolean
+  latencyMs: number
+  exitIp?: string
+  error?: string
+  /** 测试时刻（Unix 秒） */
+  testedAt: number
+}
+
+/** 可复用代理节点（「分身管理」页维护的候选池）。
+ *
+ * ⚠️ `password` **不在此类型里**：后端恒不外传密码，只给 `hasPassword`。
+ * 编辑表单必须在用户未触碰密码框时**不发送** password 键（省略 = 不改），
+ * 发空串才是清空 —— 否则改个节点名就会把密码抹掉，已绑该节点的分身全部掉线。 */
+export interface SocksNode {
+  id: number
+  name: string
+  url: string
+  username?: string
+  hasPassword: boolean
+  enabled: boolean
+  lastTest?: SocksNodeTest
+  createdAt: number
+  /** 展示标签（name 优先，空则回落 url） */
+  label: string
+  /**
+   * 已绑在这个节点上的凭据数。**启发式**：后端按「凭据的 proxyUrl == 节点的 url」
+   * 字符串比对（凭据与节点之间没有 id 级绑定）。手工填过代理的号可能因 scheme
+   * 未归一而漏算，方向偏低 —— 顶多把一个已被占的节点当空闲，而那正是节点不足时
+   * 的既有行为。
+   *
+   * 排序用它做主键（少的优先），与后端自动分配同一口径；口径不一致会让下拉里
+   * 的推荐顺序与实际分到的节点对不上。
+   *
+   * `#[serde(default)]` 在后端侧，故老后端不下发该字段时这里是 `undefined`。
+   */
+  boundCredentials?: number
+}
+
+export interface SocksNodesResponse {
+  total: number
+  nodes: SocksNode[]
+}
+
+/** 新建/更新代理节点请求。`id` 省略 = 新建。
+ *
+ * `url` 可以直接是节点商下发的**分享链接**（`socks://base64(user:pass)@host:port#name`）：
+ * 后端 `parse_proxy_link` 会拆出账密与 `#name` 并只把干净地址写进 url，
+ * 所以前端一个输入框就够，不必让用户自己把 base64 串拆成用户名/密码。 */
+export interface SocksNodeUpsertRequest {
+  id?: number
+  name?: string
+  url: string
+  username?: string
+  /** ⚠️ 省略 = 不改密码；空串 = 清空。绝不要为了「补齐字段」而回填空串。 */
+  password?: string
+  enabled?: boolean
+}
+
+/** 整段粘贴批量导入代理节点（`POST /socks/nodes/bulk-import`）。 */
+export interface SocksNodeBulkImportRequest {
+  /** 整段文本。后端逐行解析，非链接行安静跳过，按 url 去重。 */
+  text: string
+  /** 导入后是否直接启用。**省略 = 后端默认 false**（未测活的出口不该直接参与分配）。 */
+  enabled?: boolean
+}
+
+/** 批量导入的逐行结果（后端 `SocksNodeBulkImportItem`）。
+ *
+ * 🔴 **后端是权威。** 前端粘贴后会先本地预览一遍（`lib/proxy-line-parse.ts`），
+ * 但那只是为了在打后端之前把话说清楚；这里的 `status` / `reason` 才是真实发生的事，
+ * 且带着前端无从得知的两类结论：`address_rejected`（SSRF 策略拦下）与
+ * `over_capacity`（节点数上限）。两者不一致时以本结构为准。 */
+export interface SocksNodeBulkImportItem {
+  /** 原始行号（1 起，与用户粘的文本对齐） */
+  lineno: number
+  /** 该行原文，**密码已由后端脱敏** */
+  raw: string
+  status: 'ok' | 'duplicate' | 'invalid' | 'over_capacity'
+  /** 稳定原因码（前端查 i18n）：`dup_in_paste` / `already_in_pool` /
+   *  `address_rejected` / `over_capacity` / `bad_port` / `bad_host` /
+   *  `no_host_port` / `ambiguous` / `not_proxy` */
+  reason?: string
+  /** 解析出的 `scheme://host:port` */
+  address?: string
+  /** 解析出的用户名（**密码恒不外传**） */
+  username?: string
+}
+
+/** 批量导入结果。四个计数互不重叠，加起来才是「这段文本发生了什么」。 */
+export interface SocksNodeBulkImportResponse {
+  /** 真正新建的节点数 */
+  added: number
+  /** 跳过的行数 = 非链接行 + 地址被策略拒绝的行。
+   *  ⚠️ 含义比字面宽（两类混在一起），精确归因看 `items`。 */
+  skipped: number
+  /** 因重复而未导入（已在池中 **或** 同一次粘贴内重复）。**不覆盖**原有账密 */
+  duplicate: number
+  /** 因超出节点数上限而未导入的条数 */
+  overCapacity: number
+  /** 服务端汇总文案（含「默认未启用」等提示，优先直接展示它） */
+  message: string
+  /** 逐行明细。安静跳过的行（标题/分隔线/说明文字）不在内。
+   *
+   * ⚠️ **可选**：面板与二进制可能不同版本（OTA 只换二进制不换浏览器缓存，反之亦然），
+   * 旧后端不返回它。读之前必须判空，不要假定它存在。 */
+  items?: SocksNodeBulkImportItem[]
 }

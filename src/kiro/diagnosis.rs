@@ -136,9 +136,7 @@ impl OnboardingDiagnosis {
 pub fn diagnose_refresh(status: u16, body: &str) -> OnboardingDiagnosis {
     let raw = Some(format!("{} {}", status, body));
     // ① refresh_token 永久失效：invalid_grant + Invalid refresh token provided。
-    if status == 400
-        && body.contains("\"invalid_grant\"")
-        && body.contains("Invalid refresh token")
+    if status == 400 && body.contains("\"invalid_grant\"") && body.contains("Invalid refresh token")
     {
         return OnboardingDiagnosis::new(
             Stage::Refresh,
@@ -157,7 +155,9 @@ pub fn diagnose_refresh(status: u16, body: &str) -> OnboardingDiagnosis {
     //    SSO-OIDC 的 client 注册有有效期（~90 天）；或 clientId/secret 与发 refresh_token 的 client 不是同一个。
     if status == 400
         && body.contains("\"invalid_request\"")
-        && (body.contains("Invalid token") || body.contains("invalid_client") || body.contains("client"))
+        && (body.contains("Invalid token")
+            || body.contains("invalid_client")
+            || body.contains("client"))
     {
         return OnboardingDiagnosis::new(
             Stage::Refresh,
@@ -224,12 +224,18 @@ pub fn diagnose_refresh(status: u16, body: &str) -> OnboardingDiagnosis {
 }
 
 /// 诊断 IdC device flow 全 region 探测失败（start URL 在所有候选 region 都无对应实例）。
-pub fn diagnose_device_auth_all_failed(tried_regions: usize, last_err: Option<&str>) -> OnboardingDiagnosis {
+pub fn diagnose_device_auth_all_failed(
+    tried_regions: usize,
+    last_err: Option<&str>,
+) -> OnboardingDiagnosis {
     OnboardingDiagnosis::new(
         Stage::DeviceAuth,
         Fault::UserInput,
         "REGION_MISMATCH",
-        format!("start URL 在所试的 {} 个 region 均无对应 IdC 实例。", tried_regions),
+        format!(
+            "start URL 在所试的 {} 个 region 均无对应 IdC 实例。",
+            tried_regions
+        ),
         &[
             "确认 start URL 拼写正确（形如 https://d-xxxxxxxxxx.awsapps.com/start）。",
             "到 AWS IAM Identity Center 控制台 → 设置，查看实例所在 region，在上号时手动填该 region。",
@@ -242,17 +248,26 @@ pub fn diagnose_device_auth_all_failed(tried_regions: usize, last_err: Option<&s
 
 /// 诊断 ListAvailableProfiles 在某 region 返回空 profile 列表（该 region 未开通）。
 /// `probed_region` = 探测的 region；`found_regions` = 已确认有 profile 的 region 列表（可空）。
-pub fn diagnose_no_profile_in_region(probed_region: &str, found_regions: &[String]) -> OnboardingDiagnosis {
+pub fn diagnose_no_profile_in_region(
+    probed_region: &str,
+    found_regions: &[String],
+) -> OnboardingDiagnosis {
     let found_hint = if found_regions.is_empty() {
         "该账号目前在所有已探测 region 都没有可用 profile。".to_string()
     } else {
-        format!("该账号已开通 profile 的 region：{}。", found_regions.join("、"))
+        format!(
+            "该账号已开通 profile 的 region：{}。",
+            found_regions.join("、")
+        )
     };
     OnboardingDiagnosis::new(
         Stage::ProbeRegion,
         Fault::AccountState,
         "NO_PROFILE_IN_REGION",
-        format!("该账号在 {} 未开通 Kiro profile。{}", probed_region, found_hint),
+        format!(
+            "该账号在 {} 未开通 Kiro profile。{}",
+            probed_region, found_hint
+        ),
         &[
             "若刚加入订阅组，profile 传播最多需 24 小时，请稍后再探测。",
             "确认该账号确实在此 region 开通了 Kiro/CodeWhisperer 订阅。",
@@ -269,7 +284,10 @@ pub fn diagnose_feature_not_supported(region: &str) -> OnboardingDiagnosis {
         Stage::Verify,
         Fault::AccountState,
         "FEATURE_NOT_SUPPORTED",
-        format!("{} 的 profile 未开通该功能（FEATURE_NOT_SUPPORTED）。", region),
+        format!(
+            "{} 的 profile 未开通该功能（FEATURE_NOT_SUPPORTED）。",
+            region
+        ),
         &[
             "网关会在刷新时自动重探并纠正到可用 region。",
             "或在凭据设置里手动切换到已开通的 region。",
@@ -294,13 +312,20 @@ mod tests {
         assert_eq!(d.stage, Stage::Refresh);
         assert!(!d.retriable, "client 过期不是重试能解决的");
         assert!(!d.guidance.is_empty(), "必须给用户可操作引导");
-        assert!(d.guidance.iter().any(|g| g.contains("重新上号")), "引导应含重新上号");
-        assert!(d.raw.as_deref().unwrap().contains("Invalid token provided"), "原文折叠保留");
+        assert!(
+            d.guidance.iter().any(|g| g.contains("重新上号")),
+            "引导应含重新上号"
+        );
+        assert!(
+            d.raw.as_deref().unwrap().contains("Invalid token provided"),
+            "原文折叠保留"
+        );
     }
 
     #[test]
     fn test_diagnose_refresh_invalid_grant_permanent() {
-        let body = r#"{"error":"invalid_grant","error_description":"Invalid refresh token provided"}"#;
+        let body =
+            r#"{"error":"invalid_grant","error_description":"Invalid refresh token provided"}"#;
         let d = diagnose_refresh(400, body);
         assert_eq!(d.code, "REFRESH_TOKEN_INVALID");
         assert_eq!(d.fault, Fault::AccountState);
@@ -360,7 +385,10 @@ mod tests {
     #[test]
     fn test_serde_roundtrip() {
         // 前端要拿到结构化诊断，序列化必须完整。
-        let d = diagnose_refresh(400, r#"{"error":"invalid_request","error_description":"Invalid token provided"}"#);
+        let d = diagnose_refresh(
+            400,
+            r#"{"error":"invalid_request","error_description":"Invalid token provided"}"#,
+        );
         let json = serde_json::to_string(&d).unwrap();
         assert!(json.contains("\"code\":\"CLIENT_OR_TOKEN_MISMATCH\""));
         assert!(json.contains("\"fault\":\"account_state\""));

@@ -2,6 +2,9 @@ import { useEffect, useRef } from 'react'
 import { toast } from 'sonner'
 import { useCredentials } from '@/hooks/use-credentials'
 import { useRatelimitInsights } from '@/hooks/use-usage'
+import { disabledReasonLabel } from '@/lib/i18n-labels'
+import { classifyDisabledReason } from '@/lib/pool-event-classify'
+import type { PoolEventCategory } from '@/lib/pool-event-classify'
 import type { CredentialStatusItem, RateLimitInsight } from '@/types/api'
 
 /**
@@ -27,28 +30,26 @@ function credLabel(c: { id: number; name?: string; email?: string }): string {
   return `#${c.id}`
 }
 
-/** disabledReason → 中文短语（与后端 DisabledReason 对齐）。 */
+/**
+ * disabledReason → 展示短语。**转发给 `lib/i18n-labels` 的 `disabledReasonLabel`**，
+ * 不在这里再写一份中文表。
+ *
+ * 为什么改成转发：这里原先是一份硬编码 switch，只覆盖 8 个原因，而后端
+ * `DisabledReason` 有 14 个 ⇒ 缺的全落 `default` 显示裸英文枚举名
+ * （`RegionProbeFailed` / `PassthroughFailed` / `RequestLimitReached` …）。
+ * 更糟的是两份真相源已经分叉：这里写的 `RefreshTokenInvalid` 与
+ * `SubscriptionInvalid` **后端根本不下发**（实际枚举名是 `InvalidRefreshToken`，
+ * 而 `SubscriptionInvalid` 在 `token_manager.rs` 的 `as_str()` 里不存在）
+ * ⇒ 那两个 case 是永不命中的死分支，看起来"覆盖了"其实没有。
+ *
+ * 转发后，后端加新变体只需在 i18n-labels 的表里加一行，通知与卡片/回收站同步生效。
+ */
 function disabledReasonText(reason?: string): string {
-  switch (reason) {
-    case 'QuotaExceeded':
-      return '额度已用尽'
-    case 'AccountSuspended':
-      return '账号被上游暂停/封禁'
-    case 'SuspiciousActivityAuto':
-      return '连续可疑活动风控，已自动禁用'
-    case 'TooManyFailures':
-      return '连续失败过多，已自动禁用'
-    case 'RefreshTokenInvalid':
-      return 'refreshToken 永久失效'
-    case 'SubscriptionInvalid':
-      return '订阅失效/降级（INVALID_MODEL_ID），已移出调度'
-    case 'InvalidConfig':
-      return '凭据配置不完整'
-    case 'Manual':
-      return '手动禁用'
-    default:
-      return reason ? `已禁用（${reason}）` : '已禁用'
-  }
+  if (!reason) return '已禁用'
+  const label = disabledReasonLabel(reason)
+  // `disabledReasonLabel` 对未收录的原因**原样返回**（即裸枚举名）。此处包一层
+  // 「已禁用（X）」，让本版本不认识的新变体至少读起来是句话而不是一个英文标识符。
+  return label === reason ? `已禁用（${reason}）` : label
 }
 
 /**
@@ -105,8 +106,16 @@ export function usePoolNotifications() {
 
     // 批量合并：本轮**新触发**的事件先按类别攒起来，最后统一发；
     // 同类 ≥3 条合并成一条汇总（如"3 个号已禁用"），避免号池批量出事时刷屏。
-    type Cat = 'arn' | 'quota' | 'disabled' | 'suspicious'
-    const batch: Record<Cat, string[]> = { arn: [], quota: [], disabled: [], suspicious: [] }
+    // 类别定义与归类规则在 `lib/pool-event-classify`（纯函数，测试锁住分支顺序）。
+    type Cat = PoolEventCategory
+    const batch: Record<Cat, string[]> = {
+      arn: [],
+      quota: [],
+      disabled: [],
+      suspicious: [],
+      regionProbe: [],
+      regionTokenDead: [],
+    }
 
     // 标记指纹为"已见"，若是本轮新出现且已过首轮 prime，则归入对应类别的批次。
     const track = (key: string, cat: Cat, label: string) => {
@@ -153,13 +162,17 @@ export function usePoolNotifications() {
       if (!c.hasProfileArn && needsArn && !isCustomApi && !c.disabled && !initPending.has(c.id)) {
         track(`arn:${c.id}`, 'arn', label)
       }
-      // 2. 号死/被禁用（额度耗尽单独归 quota 语义）
+      // 2. 号死/被禁用。归类交给 `classifyDisabledReason`：额度耗尽走 quota、
+      //    region 探测两条各走自己的类（处置动作不同，见该函数注释），其余落兜底。
+      //    指纹里带 disabledReason：原因变了（如 TooManyFailures → AccountSuspended）
+      //    应当重新通知一次，因为处置动作跟着变了。
       if (c.disabled) {
-        if (c.disabledReason === 'QuotaExceeded') {
-          track(`quota:${c.id}`, 'quota', label)
-        } else {
-          track(`disabled:${c.id}:${c.disabledReason ?? ''}`, 'disabled', `${label}（${disabledReasonText(c.disabledReason)}）`)
-        }
+        const cat = classifyDisabledReason(c.disabledReason)
+        const key = `${cat}:${c.id}:${c.disabledReason ?? ''}`
+        // quota / region 两类的 desc 已把原因说清楚，标题里不再重复；
+        // 兜底类必须带原因，否则"某个号被禁用了"给不出任何排查方向。
+        const text = cat === 'disabled' ? `${label}（${disabledReasonText(c.disabledReason)}）` : label
+        track(key, cat, text)
       }
     }
 
@@ -222,6 +235,20 @@ export function usePoolNotifications() {
       manyTitle: (k) => `${k} 个凭据触发账户级可疑活动风控`,
       type: 'warning',
       desc: '上游临时限速中，已分钟级退避避免加重风控。频繁触发建议加号分流。',
+    })
+    // region 探测两类：都不在自愈白名单里（人工确认后需手动启用），所以 desc 必须
+    // 直接给出该查哪儿 —— 两条的排查方向完全相反，混成一句就等于没给方向。
+    flushBatch('regionProbe', batch.regionProbe, {
+      one: (n) => `凭据 ${n} 未探到可用区域`,
+      manyTitle: (k) => `${k} 个凭据未探到可用区域`,
+      type: 'error',
+      desc: '候选区域全部被拒 ⇒ 该查这个号的 region 授权范围（ksk_ 是按区授权的，打错区恒 403）。在卡片设置里手动指定区域后再启用。',
+    })
+    flushBatch('regionTokenDead', batch.regionTokenDead, {
+      one: (n) => `凭据 ${n} 区域探测时 token 被拒`,
+      manyTitle: (k) => `${k} 个凭据区域探测时 token 被拒`,
+      type: 'error',
+      desc: '上游返回 401 ⇒ 凭据本身已废，换区无用，该查 token 来源并重新取一份。',
     })
 
     // 回收：本轮不再处于问题态的键从 seen 移除，使问题再次发生时能重新通知。

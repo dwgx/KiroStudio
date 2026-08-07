@@ -38,7 +38,9 @@ fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
                 if attempt >= MAX_ATTEMPTS || !is_retryable_rename_error(&e) {
                     return Err(e);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(BASE_DELAY_MS * attempt as u64));
+                std::thread::sleep(std::time::Duration::from_millis(
+                    BASE_DELAY_MS * attempt as u64,
+                ));
                 attempt += 1;
             }
         }
@@ -126,7 +128,12 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             Ok(())
         }
         Err(e) => {
-            tracing::warn!("原子 rename 重试耗尽,回退直接写: {:?} -> {:?}: {}", tmp, target, e);
+            tracing::warn!(
+                "原子 rename 重试耗尽,回退直接写: {:?} -> {:?}: {}",
+                tmp,
+                target,
+                e
+            );
             let result = std::fs::write(&target, bytes);
             if result.is_ok() {
                 restrict_permissions(&target);

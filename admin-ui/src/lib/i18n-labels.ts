@@ -52,6 +52,11 @@ const DISABLED_REASON_KEYS: Record<string, string> = {
   // 那条查 Kiro 号是否被风控，这两条查中转站的 key/余额/地址，或站点是否持续过载。
   PassthroughFailed: 'labels.disabledReason.passthroughFailed',
   PassthroughOverloaded: 'labels.disabledReason.passthroughOverloaded',
+  // 上号时 region 自动探测的两种失败。与 TooManyFailures 分开是因为排查方向不同：
+  // 这两条查「token 的 region 授权范围」或「token 本身是否已废」，而且都不可自愈
+  // （自愈白名单不含它们），人工确认后需手动启用。
+  RegionProbeFailed: 'labels.disabledReason.regionProbeFailed',
+  RegionProbeTokenDead: 'labels.disabledReason.regionProbeTokenDead',
   // 反序列化兜底：读到本版本不认识的原因（如回滚后读新版写的文件）时后端下发 Unknown。
   Unknown: 'labels.disabledReason.unknown',
 }

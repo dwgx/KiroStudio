@@ -282,6 +282,10 @@ impl SocialLoginManager {
             machine_id: None,
             email: None,
             name: None,
+            // Social 上号是单开路径：分身身份由 service.rs 的多开循环赋予。
+            clone_group: None,
+            clone_seq: None,
+            tag: None,
             subscription_title: None,
             proxy_url,
             proxy_username,
@@ -291,6 +295,8 @@ impl SocialLoginManager {
             disabled_at: None,
             kiro_api_key: None,
             endpoint: None,
+            // Social 上号产出的是 Kiro 号，非 CLI(ksk_)号，该开关对它无意义 → 跟随全局。
+            cli_origin_kiro_cli: None,
         };
 
         let credential_id = match self.token_manager.add_credential(new_cred).await {

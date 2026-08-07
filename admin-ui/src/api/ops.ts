@@ -139,6 +139,14 @@ export interface RecoveryMetrics {
   strayStandaloneRequests?: number
   /** 【观测】见过"句中紧贴 CJK 的 stray 词"的请求数(clean 层够不到的句中黑洞取证)。 */
   strayInlineRequests?: number
+  /** 上游 429 吸收层：就地退避重试的总轮次(可选,旧后端无此字段)。 */
+  absorbRounds?: number
+  /** 吸收后真的成功返回的请求数。 */
+  absorbRecovered?: number
+  /** 吸收预算(墙钟或轮次)耗尽,最终仍把错误吐给客户端的次数。 */
+  absorbBudgetExhausted?: number
+  /** 因 403 临时风控开关关闭而跳过吸收的次数。 */
+  absorbSuspendSkipped?: number
 }
 
 export async function getRecoveryMetrics(): Promise<RecoveryMetrics> {
@@ -180,6 +188,13 @@ export interface TraceRecord {
   latency_ms: number
   first_token_ms: number | null
   outcome: string
+  /**
+   * 该请求的换号次数（**逐条**口径）。
+   *
+   * 聚合口径在 `@/types/api` 的 `WindowSummary` / `SeriesPoint` / `GroupStat`
+   * 三个 DTO 上（`retries_sum` + `retried_requests` 成对）—— 要看趋势/分布走那边，
+   * 别在前端把逐条 retries 自己加一遍（那只覆盖当前页拉到的 N 条，不是全窗口）。
+   */
   retries: number
   error_message: string | null
   session_id: string | null

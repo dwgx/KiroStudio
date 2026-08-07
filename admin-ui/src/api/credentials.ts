@@ -26,6 +26,11 @@ import type {
   UpdateConfigRequest,
   UpdateConfigResponse,
   CredentialRegionsResponse,
+  SocksNodeTest,
+  SocksNodesResponse,
+  SocksNodeUpsertRequest,
+  SocksNodeBulkImportResponse,
+  CloneCredentialRequest,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -161,12 +166,43 @@ export async function setCredentialEndpoint(
   return data
 }
 
+/**
+ * 手动指定该号的上游 region（传 null 清除 → 回退全局默认）。
+ *
+ * ksk_ API Key 是**按 region 授权**的：打错区上游恒 403（实测同一把 key 在
+ * eu-central-1 98.9% 成功、在 us-east-1 100% 403）。自动探测可能探错，所以必须
+ * 有手工兜底入口。
+ *
+ * ⚠️ 此前后端 `POST /credentials/{id}/api-region` 已存在，但前端**零调用** ——
+ * 面板上没有任何能改 ksk_ 号 region 的入口（`switchProfileRegion` 对 api_key 号
+ * 直接报「仅 External IdP / IdC 凭据支持」）。于是探错的号只能改 credentials.json
+ * 手工救。
+ */
+export async function setCredentialApiRegion(
+  id: number,
+  apiRegion: string | null
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/api-region`, {
+    apiRegion: apiRegion && apiRegion.trim() ? apiRegion.trim() : null,
+  })
+  return data
+}
+
 // 设置凭据别名/备注（传空字符串清除）
 export async function setCredentialName(
   id: number,
   name: string | null
 ): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>(`/credentials/${id}/name`, { name })
+  return data
+}
+
+// 设置分身标签（传空字符串清除）。与 name 分开：name 是账号别名，tag 描述这一份的用途。
+export async function setCredentialTag(
+  id: number,
+  tag: string | null
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/tag`, { tag })
   return data
 }
 
@@ -192,9 +228,21 @@ export async function listTrash(): Promise<TrashListResponse> {
   return data
 }
 
-// 从回收站恢复单个凭据
-export async function restoreCredential(id: number): Promise<SuccessResponse> {
-  const { data } = await api.post<SuccessResponse>(`/credentials/trash/${id}/restore`)
+/**
+ * 从回收站恢复单个凭据。
+ *
+ * `force`：跳过 key 重复校验。**多开分身与主凭据必然同 key**，不带这个参数时
+ * 删掉的分身永远恢复不了（后端会回「凭据已存在（kiroApiKey 重复），无法恢复」）。
+ * 默认 false 保留误操作护栏；恢复后仍是禁用态，故 force 不会让它立刻投入调度。
+ */
+export async function restoreCredential(
+  id: number,
+  force = false
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/trash/${id}/restore`,
+    { force }
+  )
   return data
 }
 
@@ -345,6 +393,29 @@ export async function addCredential(
   req: AddCredentialRequest
 ): Promise<AddCredentialResponse> {
   const { data } = await api.post<AddCredentialResponse>('/credentials', req)
+  return data
+}
+
+// 给**已在池中**的凭据再加 N 份分身。
+//
+// 为什么不是前端自己拼 addCredential({ kiroApiKey, copies })：凭据列表里只有
+// apiKeyHash 与掩码形态，**没有 key 原文**（刻意的，明文 key 不下发前端）。
+// 走这个端点让服务端按 id 自己读 key，key 一步都不离开服务端。
+//
+// 份数语义与 addCredential 的 copies 不同：这里 1 也是有效意图（再加 1 份），
+// 服务端会绕过"凭据已存在"去重（那是显式多开意图，不是误双击）。
+//
+// `enabled`：新分身是否直接启用。**不传 = 后端默认 false（不启用）**。
+// 这里刻意用可选参数而不是默认 `false` 常量：省略该键让「默认值」只有服务端一份，
+// 前端写死 false 就会在后端改默认时静默分叉。
+export async function cloneCredential(
+  id: number,
+  copies: number,
+  enabled?: boolean
+): Promise<AddCredentialResponse> {
+  const body: CloneCredentialRequest = { copies }
+  if (enabled !== undefined) body.enabled = enabled
+  const { data } = await api.post<AddCredentialResponse>(`/credentials/${id}/clone`, body)
   return data
 }
 
@@ -500,5 +571,57 @@ export async function updateConfig(
   req: UpdateConfigRequest
 ): Promise<UpdateConfigResponse> {
   const { data } = await api.put<UpdateConfigResponse>('/config', req)
+  return data
+}
+
+// ——— 可复用代理节点（「分身管理」页的候选池）———
+
+export async function listSocksNodes(): Promise<SocksNodesResponse> {
+  const { data } = await api.get<SocksNodesResponse>('/socks/nodes')
+  return data
+}
+
+/** 新建（省略 id）或更新（给 id）一个代理节点。
+ *
+ * ⚠️ **密码语义**：`req.password` 省略 = 不改；空串 = 清空。
+ * 调用方在用户未触碰密码框时必须**不设该键**（不是设 undefined —— 虽然 axios 会
+ * 丢掉 undefined 从而恰好正确，但那是依赖序列化细节；这里明确不放该键）。
+ * 若图省事回填空串，改个节点名就会把密码抹掉，已绑该节点的分身全部掉线。 */
+export async function upsertSocksNode(
+  req: SocksNodeUpsertRequest
+): Promise<{ id: number; message: string }> {
+  const { data } = await api.post<{ id: number; message: string }>('/socks/nodes', req)
+  return data
+}
+
+/** 整段粘贴批量导入节点。
+ *
+ * 后端逐行解析：非链接行（标题/分隔线/`端口: 40002`/curl 示例）安静跳过，
+ * 按 url 去重且**已存在的跳过而不覆盖**（否则重复导入会把已配好的账密抹掉），
+ * `enabled` 省略时默认 false —— 未测活的出口不该直接参与分身分配。
+ *
+ * 超时单独放宽：一段文档可能带几十个节点，且写盘（persist_socks_nodes）在请求内完成。 */
+export async function bulkImportSocksNodes(
+  text: string,
+  enabled?: boolean
+): Promise<SocksNodeBulkImportResponse> {
+  const body: Record<string, unknown> = { text }
+  if (enabled !== undefined) body.enabled = enabled
+  const { data } = await api.post<SocksNodeBulkImportResponse>(
+    '/socks/nodes/bulk-import',
+    body,
+    { timeout: 60000 },
+  )
+  return data
+}
+
+export async function deleteSocksNode(id: number): Promise<{ deleted: boolean }> {
+  const { data } = await api.delete<{ deleted: boolean }>(`/socks/nodes/${id}`)
+  return data
+}
+
+/** 测活并把结果写回节点（复用与 /proxy/test 完全相同的探针路径）。 */
+export async function testSocksNode(id: number): Promise<SocksNodeTest> {
+  const { data } = await api.post<SocksNodeTest>(`/socks/nodes/${id}/test`)
   return data
 }

@@ -74,6 +74,44 @@ pub struct ModelSpec {
     /// **已验证(0713 旁挂黑盒)**:Kiro 上游本就给足远超 200K 的窗口(opus-4.6 不带任何头即吃下
     /// 64万 token),**不依赖那个 beta 头**;故 `[1m]` 的实际价值 = 给只能传纯模型名的客户端一个
     /// 显式 1M 变体名(已验证可接受、正确映射),beta 头保留但无害。
+    ///
+    /// # ⚠️ 已确证的代价：通告 `[1m]` 变体会让 Claude Code 的反应式 auto-compact 失效
+    ///
+    /// （2026-08-06 实测，本机 Claude Code 二进制 build 2.1.220。**符号名会随版本漂移，
+    /// 故此处只记机制与可观测判据**；完整推导见 `docs/auto-compact-fix-2026-08-06.md`。）
+    ///
+    /// Claude Code 解析「本轮该用多大上下文窗口」时按六档优先级取第一个命中的来源，其中
+    /// 「按模型 ID 查内置白名单」那档**有一道前置门：算出来的窗口必须 < 1e6**。而它判 1M
+    /// 的方式是对**模型 ID 字符串**做 `/\[1m\]/i` 正则 —— 命中即直接取 1e6。于是：
+    ///
+    /// ```text
+    /// 客户端选了 `claude-opus-4-8[1m]` → 正则命中 → 窗口 = 1e6
+    ///   → 「window < 1e6」不成立 → 跳过白名单档 → 落最后的兜底档
+    ///   → 反应式 auto-compact 的入口门判定为「无显式窗口来源」→ 直接 return
+    ///   → **该模型永不自动压缩**（撞满上下文后只报错，不会自己压缩重试）
+    /// ```
+    ///
+    /// 归一化**不剥** `[1m]`（只剥 `-\d{8}$` 日期后缀），所以带后缀的 ID 在两张白名单里
+    /// 一律查不到 —— 即「模型本体在白名单里」也救不回来。
+    ///
+    /// **不要为此删掉任何 `[1m]` 变体**：1M 窗口是真功能（给只能传纯模型名的客户端），
+    /// 而失效的只是客户端侧的一个便利特性。两者不对等。
+    ///
+    /// 用户侧绕过（把窗口来源从兜底档抬到第一档 `env`）：
+    /// ```bash
+    /// export CLAUDE_CODE_AUTO_COMPACT_WINDOW=200000
+    /// ```
+    /// 必须是**纯整数**且落在 [1e5, 1e6]；写 `500k` 会被解析成 500 再 clamp 到 1e5。
+    /// 等价手段是用户设置里的 `autoCompactWindow`（第二档）。
+    ///
+    /// 网关侧**无协议通道**可补：能替服务端发声的那一档要求窗口值来自客户端本地的
+    /// bootstrap 缓存，而那份缓存只由 Claude Code 自己向 `<base_url>/api/claude_cli/bootstrap`
+    /// 拉取后写入 —— 本网关不实现该端点，故该档恒空。服务端唯一能做的补救是另一条路：
+    /// 让「装不下」类错误命中 compact-and-retry 判据，见 `handlers.rs` 的
+    /// `OVERFLOW_COMPACT_HINT`。
+    ///
+    /// 可观测判据（版本无关）：`claude --debug` 下若一次都不打
+    /// `autocompact: tokens=... level=...`，就是落了兜底档、入口门提前 return。
     pub supports_1m: bool,
     /// 是否在 `/v1/models` 中广告(thinking 变体通常只做别名不单列)。
     pub advertised: bool,
@@ -173,7 +211,12 @@ pub static CATALOG: &[ModelSpec] = &[
         kiro_id: "claude-sonnet-5",
         family: Family::Sonnet,
         version: Some((5, 0)),
-        aliases: &["claude-sonnet-5", "claude-sonnet-5-0", "sonnet-5", "sonnet-5-0"],
+        aliases: &[
+            "claude-sonnet-5",
+            "claude-sonnet-5-0",
+            "sonnet-5",
+            "sonnet-5-0",
+        ],
         owned_by: "anthropic",
         display_name: "Claude Sonnet 5",
         context_window: 1_000_000,
@@ -187,7 +230,12 @@ pub static CATALOG: &[ModelSpec] = &[
         kiro_id: "claude-sonnet-4.6",
         family: Family::Sonnet,
         version: Some((4, 6)),
-        aliases: &["claude-sonnet-4-6", "claude-sonnet-4.6", "sonnet-4.6", "sonnet-4-6"],
+        aliases: &[
+            "claude-sonnet-4-6",
+            "claude-sonnet-4.6",
+            "sonnet-4.6",
+            "sonnet-4-6",
+        ],
         owned_by: "anthropic",
         display_name: "Claude Sonnet 4.6",
         context_window: 1_000_000,
@@ -514,7 +562,9 @@ fn parse_family_version(model_lower: &str) -> Option<(Family, Option<(u16, u16)>
             let mut j = i;
             let mut major = 0u16;
             while j < bytes.len() && bytes[j].is_ascii_digit() {
-                major = major.saturating_mul(10).saturating_add((bytes[j] as u8 - b'0') as u16);
+                major = major
+                    .saturating_mul(10)
+                    .saturating_add((bytes[j] as u8 - b'0') as u16);
                 j += 1;
             }
             if j < bytes.len() && (bytes[j] == '-' || bytes[j] == '.') {
@@ -524,7 +574,9 @@ fn parse_family_version(model_lower: &str) -> Option<(Family, Option<(u16, u16)>
                     let mut minor = 0u16;
                     let mut minor_digits = 0u8;
                     while k < bytes.len() && bytes[k].is_ascii_digit() {
-                        minor = minor.saturating_mul(10).saturating_add((bytes[k] as u8 - b'0') as u16);
+                        minor = minor
+                            .saturating_mul(10)
+                            .saturating_add((bytes[k] as u8 - b'0') as u16);
                         minor_digits += 1;
                         k += 1;
                     }
@@ -608,14 +660,22 @@ fn resolve_inner(model: &str) -> Option<Resolved> {
 
     // 1) 原名精确匹配(主路径，无告警)。
     if let Some(&i) = idx.get(&raw_lower) {
-        return Some(Resolved { spec: &CATALOG[i], kind: MatchKind::Exact, is_1m: false });
+        return Some(Resolved {
+            spec: &CATALOG[i],
+            kind: MatchKind::Exact,
+            is_1m: false,
+        });
     }
 
     // 2) 剥 thinking 后缀再精确匹配。
     let (base, _had_thinking) = strip_thinking(&raw_lower);
     if base != raw_lower {
         if let Some(&i) = idx.get(&base) {
-            return Some(Resolved { spec: &CATALOG[i], kind: MatchKind::Exact, is_1m: false });
+            return Some(Resolved {
+                spec: &CATALOG[i],
+                kind: MatchKind::Exact,
+                is_1m: false,
+            });
         }
     }
 
@@ -624,7 +684,11 @@ fn resolve_inner(model: &str) -> Option<Resolved> {
         if let Some(ver) = ver_opt {
             // 3a) 确切版本目录里有 → Structured(无损)。
             if let Some(spec) = find_family_version(family, ver) {
-                return Some(Resolved { spec, kind: MatchKind::Structured, is_1m: false });
+                return Some(Resolved {
+                    spec,
+                    kind: MatchKind::Structured,
+                    is_1m: false,
+                });
             }
             // 3b) Claude 3/2 老名:历史被静默升到 4.x 贵档——显式近似+告警。
             if is_legacy_claude(&raw_lower) {
@@ -636,7 +700,11 @@ fn resolve_inner(model: &str) -> Option<Resolved> {
                         match_kind = "claude3-approx",
                         "模型识别:Claude 老名近似到最近档(语义有损、计费按目标档)——请客户端改用明确新模型名"
                     );
-                    return Some(Resolved { spec, kind: MatchKind::Claude3Approx, is_1m: false });
+                    return Some(Resolved {
+                        spec,
+                        kind: MatchKind::Claude3Approx,
+                        is_1m: false,
+                    });
                 }
             }
             // 3c) 更新的未知版本(opus-4.9/opus-5):默认拒绝(strict);开关开则回退最新档+告警。
@@ -649,7 +717,11 @@ fn resolve_inner(model: &str) -> Option<Resolved> {
                         match_kind = "unknown-version-fallback",
                         "模型识别:未知版本回退到同族最新档(KIRO_ALLOW_UNKNOWN_VERSION 已开)——可能非用户预期版本"
                     );
-                    return Some(Resolved { spec, kind: MatchKind::UnknownVersionFallback, is_1m: false });
+                    return Some(Resolved {
+                        spec,
+                        kind: MatchKind::UnknownVersionFallback,
+                        is_1m: false,
+                    });
                 }
             }
             tracing::warn!(
@@ -665,7 +737,11 @@ fn resolve_inner(model: &str) -> Option<Resolved> {
         match family {
             Family::DeepSeek | Family::Glm | Family::Qwen | Family::Auto => {
                 if let Some(spec) = default_in_family(family) {
-                    return Some(Resolved { spec, kind: MatchKind::Structured, is_1m: false });
+                    return Some(Resolved {
+                        spec,
+                        kind: MatchKind::Structured,
+                        is_1m: false,
+                    });
                 }
             }
             _ => {
@@ -680,7 +756,11 @@ fn resolve_inner(model: &str) -> Option<Resolved> {
                             match_kind = "claude3-approx",
                             "模型识别:Claude 老名近似到最近档(语义有损、计费按目标档)——请客户端改用明确新模型名"
                         );
-                        return Some(Resolved { spec, kind: MatchKind::Claude3Approx, is_1m: false });
+                        return Some(Resolved {
+                            spec,
+                            kind: MatchKind::Claude3Approx,
+                            is_1m: false,
+                        });
                     }
                     tracing::warn!(
                         request_model = %model,
@@ -689,7 +769,11 @@ fn resolve_inner(model: &str) -> Option<Resolved> {
                         match_kind = "family-default",
                         "模型识别:无显式版本号，回退到同族最新档——建议客户端带明确版本"
                     );
-                    return Some(Resolved { spec, kind: MatchKind::Structured, is_1m: false });
+                    return Some(Resolved {
+                        spec,
+                        kind: MatchKind::Structured,
+                        is_1m: false,
+                    });
                 }
             }
         }
@@ -712,7 +796,9 @@ pub fn resolve_is_1m(model: &str) -> bool {
 
 /// 便捷:上下文窗口。未识别默认 200k(与旧行为一致)。
 pub fn context_window(model: &str) -> i32 {
-    resolve(model).map(|r| r.spec.context_window).unwrap_or(200_000)
+    resolve(model)
+        .map(|r| r.spec.context_window)
+        .unwrap_or(200_000)
 }
 
 #[cfg(test)]
@@ -834,7 +920,11 @@ mod tests {
         assert_eq!(kid("claude-sonnet-5"), Some("claude-sonnet-5"));
         assert_eq!(kid("sonnet-5"), Some("claude-sonnet-5"));
         assert_eq!(kid("claude-sonnet-4-0"), Some("claude-sonnet-4.0"));
-        assert_eq!(kid("claude-sonnet-4-20250514"), Some("claude-sonnet-4.0"), "旧带日期名归 4.0 不再静默升级");
+        assert_eq!(
+            kid("claude-sonnet-4-20250514"),
+            Some("claude-sonnet-4.0"),
+            "旧带日期名归 4.0 不再静默升级"
+        );
         assert_eq!(kid("auto"), Some("auto"));
         assert_eq!(kid("claude-auto"), Some("auto"));
     }
@@ -850,7 +940,10 @@ mod tests {
         // 1M 变体
         assert!(resolve("claude-opus-5[1m]").unwrap().is_1m);
         // 无版本 opus 回退应指向最新 = Opus 5
-        assert_eq!(resolve("claude-opus").unwrap().spec.kiro_id, "claude-opus-5");
+        assert_eq!(
+            resolve("claude-opus").unwrap().spec.kiro_id,
+            "claude-opus-5"
+        );
         // 参数正确
         let r = resolve("claude-opus-5").unwrap();
         assert_eq!(r.spec.family, Family::Opus);
@@ -863,13 +956,21 @@ mod tests {
     fn test_auto_substring_not_silently_matched() {
         // 回归(对抗 review #1):`auto` 是极常见英文子串,含它的未知名不得被静默映射到 Kiro Auto,
         // 否则既不拒绝也不告警、还产生真实计费,与「未知即拒」矛盾。这类名字必须 strict 拒绝(None)。
-        assert_eq!(kid("gpt-4-auto"), None, "含 auto 子串的未知名应拒绝,不静默映射到 Auto");
+        assert_eq!(
+            kid("gpt-4-auto"),
+            None,
+            "含 auto 子串的未知名应拒绝,不静默映射到 Auto"
+        );
         assert_eq!(kid("autopilot-v2"), None);
         assert_eq!(kid("autocomplete-model"), None);
         assert_eq!(kid("gemini-auto"), None);
         // 精确别名仍必须命中(不能误伤 Auto 本身)。
         assert_eq!(kid("auto"), Some("auto"), "精确 auto 仍应命中");
-        assert_eq!(kid("claude-auto"), Some("auto"), "精确 claude-auto 仍应命中");
+        assert_eq!(
+            kid("claude-auto"),
+            Some("auto"),
+            "精确 claude-auto 仍应命中"
+        );
     }
 
     #[test]
@@ -884,7 +985,10 @@ mod tests {
     #[test]
     fn test_sonnet_newest_is_5() {
         // 无版本 sonnet 回退应指向族内最新=Sonnet 5。
-        assert_eq!(resolve("claude-sonnet").unwrap().spec.kiro_id, "claude-sonnet-5");
+        assert_eq!(
+            resolve("claude-sonnet").unwrap().spec.kiro_id,
+            "claude-sonnet-5"
+        );
     }
 
     #[test]
@@ -918,7 +1022,11 @@ mod tests {
     fn test_gpt_ambiguous_names_rejected() {
         // 无变体后缀的 gpt 名(无「默认 GPT」概念)+ 旧 gpt 名 → strict 拒绝,不静默映射。
         // 与 auto 子串同理:gpt 不做 contains 探测,逼客户端指明 sol/luna/terra。
-        assert_eq!(kid("gpt-5.6"), None, "无变体的 gpt-5.6 应拒绝,逼指明 sol/luna/terra");
+        assert_eq!(
+            kid("gpt-5.6"),
+            None,
+            "无变体的 gpt-5.6 应拒绝,逼指明 sol/luna/terra"
+        );
         assert_eq!(kid("gpt-4"), None);
         assert_eq!(kid("gpt-5-6-mars"), None, "未知变体应拒绝");
         assert_eq!(kid("chatgpt"), None);
@@ -959,7 +1067,11 @@ mod tests {
             keys.dedup(); // 同一 spec 内部重复无害,去掉再查跨 spec
             for k in keys {
                 if let Some(&prev) = owner.get(&k) {
-                    assert_eq!(prev, i, "别名/id `{}` 跨模型撞键(spec#{} 与 #{})", k, prev, i);
+                    assert_eq!(
+                        prev, i,
+                        "别名/id `{}` 跨模型撞键(spec#{} 与 #{})",
+                        k, prev, i
+                    );
                 } else {
                     owner.insert(k, i);
                 }

@@ -48,7 +48,9 @@ impl Drop for InflightGuard {
         // saturating_sub：即便出现异常路径下的重复 drop 也绝不下溢回绕成天文数字
         let _ = self
             .counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some(v.saturating_sub(1)));
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                Some(v.saturating_sub(1))
+            });
     }
 }
 
@@ -123,6 +125,56 @@ impl RpmTracker {
                 None => 0,
             };
             out.insert(id, n);
+        }
+        out
+    }
+
+    /// 一次加锁批量读取「近 `recent` 秒的请求数」与「窗口内总数」。
+    ///
+    /// 用于**爬坡（slew-rate）压力**判定：上游惩罚的是**速率的跃升**，不是绝对吞吐。
+    ///
+    /// # 实测依据（2026-08-04，24h 全量，按「凭据 × 分钟」配对）
+    ///
+    /// 控制「前一分钟完全无 429」以排除 429 放大导致的计数虚高之后：
+    ///
+    /// | 本分钟 / 前一分钟 | 429 率 |
+    /// |---|---|
+    /// | ≥5x 跃升 | **48.3%** |
+    /// | 2–5x | 5.4% |
+    /// | 平稳 | **0.7%** |
+    ///
+    /// 且与绝对速率交叉制表后，**每一档绝对速率内跃升都是主因**：
+    /// 100+ req/min 平缓上量只有 **2.9%** 429，而 <50 req/min 突然跃升有 **36.4%**。
+    ///
+    /// 这解释了此前所有互相矛盾的观测：同一个号同样 ~90 req/min，
+    /// 上一分钟是 5 就 98% 429、上一分钟是 88 就 0% 429。
+    ///
+    /// 返回 `(recent_count, window_count)`。调用方据此算爬坡比例。
+    pub fn ramp_counts_for(
+        &self,
+        ids: &[u64],
+        recent: Duration,
+    ) -> std::collections::HashMap<u64, (u32, u32)> {
+        let now = Instant::now();
+        let window = self.window;
+        let mut map = self.hits.lock();
+        let mut out = std::collections::HashMap::with_capacity(ids.len());
+        for &id in ids {
+            let v = match map.get_mut(&id) {
+                Some(v) => v,
+                None => {
+                    out.insert(id, (0u32, 0u32));
+                    continue;
+                }
+            };
+            Self::prune(v, now, window);
+            // 时间戳单调递增，从队尾往前数即可，无需扫全窗。
+            let recent_n = v
+                .iter()
+                .rev()
+                .take_while(|t| now.saturating_duration_since(**t) <= recent)
+                .count() as u32;
+            out.insert(id, (recent_n, v.len() as u32));
         }
         out
     }

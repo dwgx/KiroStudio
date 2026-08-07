@@ -114,6 +114,189 @@ pub struct Config {
     #[serde(default = "default_cc_auto_buffer")]
     pub cc_auto_buffer: bool,
 
+    /// 是否启用**批量推号入口** `POST /api/import/keys`（及等价的
+    /// `/api/admin/import/keys`）。默认 **true**。
+    ///
+    /// 【为何默认开】该端点在本开关之前就已存在，外部 kiro-accounting 正在用它推号。
+    /// 默认关等于升级即切断对接方，属无声的破坏性变更。开关的用途是**需要时临时封口**
+    /// （如怀疑对接方在灌坏号），而不是重新决定这个功能要不要有。
+    ///
+    /// 关闭时两个挂载点一起失效（同一个 handler），返回 403。
+    /// 鉴权仍在开关之前生效，所以关掉它不会让未鉴权请求看到不同的错误。
+    ///
+    /// ⚠️ 闸门在**解析与入池之前**，但**不在读请求体之前**：handler 签名是
+    /// `Json(payload): Json<Value>`，axum 的提取器先于函数体运行，所以请求体已被
+    /// 读完并反序列化。两个后果：① 关闭时发**非法 JSON** 会拿到提取器的 400 而不是
+    /// 本开关的 403（合法 JSON 才走到 403）；② 大 body 仍会被读进内存（有
+    /// `MAX_BODY_BYTES` 上限兜底）。闸门保证的是「不解析成导入项、不碰号池」，
+    /// 不是「不读字节」。
+    #[serde(default = "default_import_keys_enabled")]
+    pub import_keys_enabled: bool,
+
+    /// 克隆/多开产生的**分身凭据**在请求未显式指定时是否默认启用。**默认 false（不启用）**。
+    ///
+    /// 作用范围只有一条路：`POST /credentials/{id}/clone` 省略 `enabled` 时的取值。
+    /// 请求显式给了 `enabled`（true 或 false）时**恒以请求为准**，本项不参与 ——
+    /// 否则面板上那个开关会在服务端配置为 true 时变成"关不掉"。
+    ///
+    /// # 为什么默认 false
+    ///
+    /// 两件事同时指向 false，所以这里没有"保持现状"与"按需求"的取舍：
+    ///
+    /// - 它就是本项之前那句硬编码 `enabled.unwrap_or(false)` 的值 ⇒ 升级零行为变化。
+    /// - 分身入池的瞬间就会被调度器选中，而此刻出口/region 都还没核对过。实测事故
+    ///   （2026-08-05 02:42）：一次 `copies=5`，4 个分身 `apiRegion=None` → 回退
+    ///   `config.region` → `ksk_` 按区授权 → 恒 403 → **24 秒内三次失败全部被自动禁用、
+    ///   0% 成功**，而那 24 秒的真实用户流量正打在必废的号上。
+    ///
+    /// 本项存在的意义是给"节点池充足、每次都手工再点一遍启用嫌烦"的部署一个开关，
+    /// 而不是重新决定这个默认值该是什么。改成 true 前请先确认节点池份数够用
+    /// （不够时多出来的份直连，与父号共用出口 IP，多开的意义正好被抵消）。
+    ///
+    /// ⚠️ `#[serde(default = ...)]` 是硬约束而非风格：线上 `config.json` 是既有文件、
+    /// 不含本键，缺 default 会让整个配置反序列化失败 → **服务起不来**。
+    #[serde(default = "default_clone_default_enabled")]
+    pub clone_default_enabled: bool,
+
+    /// 网关内置「上游 429 吸收层」总开关。**默认 false**（关闭时逐字节等价旧行为）。
+    ///
+    /// 开启后：`call_api_with_retry` 在**准入闸门之下**、failover 循环之外，对可恢复的
+    /// 429（全池冷却 / 上游账户级速率限流）就地退避重打整条 failover 链，而不是把 429
+    /// 直接吐给客户端。等价于把 VPS 上外置的 `kiro_shield.py` 收进网关，使统计与开关进面板。
+    ///
+    /// ⚠️ 吸收循环**必须**留在 `acquire_admission()` 之后：入站令牌是「每客户端请求一个」，
+    /// 若在闸门之上重试，一条请求会吃 N 个令牌，把令牌桶按 N 倍速率抽干（这是设计评审的
+    /// BLOCKER 1）。详见 `docs/absorb-layer-design.md`。
+    ///
+    /// **默认关。** 2026-08-04 曾短暂改为默认开，当天回退 —— 支撑「默认开」的那个
+    /// 数字是错的，记录在此以免重复：
+    ///
+    /// 当时的依据是「24h 74000 请求里可吸收三类合计 38%」。实际只有**上游 429 那
+    /// 18.2%** 真的可吸收：
+    /// - **池空 16.5% 吸收不了**：唯一的自动复活是全池自愈，而它的退避下限是
+    ///   `SELF_HEAL_BASE_BACKOFF = 60s`（上限 900s），大于吸收层的**总**预算 45s。
+    ///   号池在预算内**结构上**不可能恢复，吸收只是让客户端多等满预算再拿同一个 429。
+    /// - **整池 RPM 饱和 3.3% 只部分可吸收**：`cooldown.rs` 给的恢复秒数常大于
+    ///   `max_delay`（默认 15s），被 clamp 后会**提前**醒来重打一个仍在冷却的池。
+    ///
+    /// 另有两条与「开」直接冲突、尚未修的问题：
+    /// 1. `upstream_retry_absorb_budget_secs` 会经 `round_budget` 反向支配**既有的**
+    ///    45s failover 墙钟（面板允许填 1）—— 开着时把它调小会截断正常换号重试，
+    ///    这是关着时不存在的行为。
+    /// 2. `ABSOLUTE_MAX_TOTAL_RETRIES=12` 的语义从「每请求」变成「每轮」：
+    ///    `max_rounds=3` ⇒ 一条客户端请求最坏 4×12 = **48 次**上游调用，
+    ///    而当初把 64 砍到 12 就是为了压住这个放大。
+    ///
+    /// 结论：这四条修完、且有**真正驱动吸收循环**的运行时测试之后再谈默认开。
+    /// 手动开启仍随时可用（面板开关热更即时生效），本字段只决定新装实例的初值。
+    #[serde(default)]
+    pub upstream_retry_absorb_enabled: bool,
+
+    /// 吸收层**总预算秒数**（默认 45）。绝对 deadline 自进入 `call_api_with_retry` 起算
+    /// （含入站准入排队），与 provider 内部的 45s 墙钟闸门**串联**记账。详见
+    /// `default_absorb_budget_secs`。
+    #[serde(default = "default_absorb_budget_secs")]
+    pub upstream_retry_absorb_budget_secs: u64,
+
+    /// 吸收层**最大额外轮次**（默认 3，0=只打一次即不吸收）。与预算取先到者。
+    /// 名为 rounds 而非 attempts：后者在 provider 里已指 failover 换号跳数，同名两义必混。
+    #[serde(default = "default_absorb_max_rounds")]
+    pub upstream_retry_absorb_max_rounds: u32,
+
+    /// 退避下限毫秒（默认 150）。号池冷却常在几十~几百毫秒即恢复，
+    /// 外置 shield 的 `MIN_DELAY=1.0` 会把 50ms 的恢复睡成 1s，这里放开到亚秒级。
+    #[serde(default = "default_absorb_min_delay_ms")]
+    pub upstream_retry_absorb_min_delay_ms: u64,
+
+    /// 退避上限秒（默认 15）。号池给出的恢复秒数再大也 clamp 到此值，防单请求长挂。
+    #[serde(default = "default_absorb_max_delay_secs")]
+    pub upstream_retry_absorb_max_delay_secs: u64,
+
+    /// 是否也吸收 **403 账户级临时风控**（即外挂 `kiro_shield.py` 的「换号空窗」类，默认 false）。
+    ///
+    /// 默认关的理由：风控窗口约 10 分钟 ≫ 任何合理的单请求预算，窗口内重试成功率接近 0，
+    /// 吸收只是把必然失败推迟再返回；且 `SELF_HEAL_BASE_BACKOFF=60s` 存在的意义就是
+    /// **停止**向刚 403 的账号试探，15s 内重打同账号直接抵消它。
+    ///
+    /// 开启后额外轮次**硬钉为 1** —— 除非同时设了 `upstream_retry_absorb_swap_budget_secs`
+    /// （见那里：那个旋钮换掉的正是「15s 内重打」这个前提，钉 1 的理由随之消失）。
+    #[serde(default)]
+    pub upstream_retry_absorb_suspended: bool,
+
+    /// 是否吸收**上游 5xx**（默认 false）。
+    ///
+    /// 【为什么单独一个开关而不是跟着总开关】5xx 与 429 的失败机理不同：429 是「上游让我们慢
+    /// 一点」，重试大概率换个号就过；5xx 是「上游/网关自己坏了」，可能是瞬时抖动（重试有效），
+    /// 也可能是上游整片故障（重试只是在故障期间乘倍放大请求量）。外挂 `kiro_shield.py` 的
+    /// `RETRYABLE={429,500,502,503,504}` 把两者一视同仁，而它的实测代价是
+    /// **11.6 次重试才救回 1 个请求**（22448 请求 / 19226 次重试 / 1657 次吸收成功）——
+    /// 那个比值就是「不分机理一律重试」的账单。所以这里默认关，要开是显式决定。
+    ///
+    /// 【判据】复用 `handlers::is_upstream_transient_5xx` 且**排除传输层**
+    /// （`is_transport_error`）：连不上上游时 provider 内部的换号已经把每个号各试过一遍，
+    /// 吸收层再套一层只是把同一个网络故障重打 N 遍。
+    #[serde(default)]
+    pub upstream_retry_absorb_server_error: bool,
+
+    /// 是否吸收**带瞬态标记的 400**（模型容量不足，默认 false）。
+    ///
+    /// 【为什么值得单列】上游把一部分**瞬态**故障塞进 400，跟「请求写错了」同一个状态码。
+    /// 外挂实测 6 小时样本里 400 共 165 次，其中容量类 101 次、真格式错 80 次
+    /// （两数之和大于 165，说明它自己的分类也有重叠，取其量级即可）。不区分就会把真正的
+    /// 格式错误重试满预算 —— 那种重试永远不会成功。
+    ///
+    /// 【判据】只认 `endpoint::default_is_model_temporarily_unavailable`
+    /// （`MODEL_TEMPORARILY_UNAVAILABLE` / `INSUFFICIENT_MODEL_CAPACITY`）这一个既有谓词，
+    /// **不认**外挂白名单里的裸 `ThrottlingException`：那个 `__type` 被真限流
+    /// （`USER_REQUEST_RATE_EXCEEDED`）共用，认它等于把真限流也拖进容量路径
+    /// （详见 `endpoint/mod.rs` 该谓词处的说明）。
+    ///
+    /// 【与 provider 内部容量重试的关系】provider 已有 `MAX_MODEL_UNAVAILABLE_RETRIES` 次
+    /// 慢速重试。本开关是它耗尽之后的**第二层**：容量类恢复常在分钟级，而那几次慢速重试
+    /// 加起来只有秒级。
+    #[serde(default)]
+    pub upstream_retry_absorb_capacity_400: bool,
+
+    /// 换号空窗的**独立预算秒数**（默认 0 = 不启用，沿用总预算与短退避曲线）。
+    ///
+    /// 【为什么必须与总预算分开】外挂实测换号空窗（账号被封 → auto_disable → 切下一个号 →
+    /// 推送补号）约 **10 分钟**，而总预算 `upstream_retry_absorb_budget_secs` 线上是 20s
+    /// （代码默认 45s）。同一个预算装不下两种量级：抬总预算会让**所有**类别都能占着客户端
+    /// 连接十分钟，而换号空窗恰恰是唯一等得起的一类（客户端在补号完成后自动恢复，
+    /// 而不是当场断会话）。
+    ///
+    /// 【> 0 时改变三件事】① 该类退避从「min_delay 指数」换成 20/40/60s 长阶梯
+    /// （外挂的 `SWAP_BACKOFF`）；② 该类的 deadline 从 `call_started + budget` 换成
+    /// `call_started + 本值`；③ `upstream_retry_absorb_suspended` 的「额外轮次钉 1」解除
+    /// （钉 1 的理由是「15s 内重打同一个刚被罚的账号会抵消 60s 自愈退避」，长阶梯的最短一档
+    /// 就是 20s，那个前提不再成立）。
+    ///
+    /// 【默认 0 的理由】非零即意味着单条客户端请求最长可占用连接数分钟。这对 Cursor 那类
+    /// 会因错误码掐会话的客户端是净收益，对普通客户端是可见的长挂 —— 属于部署侧决定，
+    /// 不该由升级默默带来。0 时该类的退避与 deadline **逐字节等于**本字段引入前的行为。
+    ///
+    /// ⚠️ 仍受 `upstream_retry_absorb_max_rounds` 与 `ABSOLUTE_MAX_TOTAL_RETRIES=12` 约束：
+    /// 本旋钮给的是**时间**预算，不是无限轮次。要覆盖完整 10 分钟空窗需要
+    /// `max_rounds` 也够大（20+40+60+60… 至少 4 轮），否则只是把一次重试推迟到 20s 后。
+    #[serde(default)]
+    pub upstream_retry_absorb_swap_budget_secs: u64,
+
+    /// 吸收层**预算耗尽时**回给客户端的状态码（默认 429 = 保持透传现状；唯一另一个可选值 503）。
+    ///
+    /// 【为什么这是产品级差异而不是实现细节】外挂原注释：Cursor 见 429 会**掐会话**，
+    /// 而对 503 不会。即同一个「网关已经尽力重试但还是没成」的事实，用 429 表达会让客户端
+    /// 直接放弃，用 503 表达会让它自己再退避重试。两者的差别不在网关侧，在客户端的行为。
+    ///
+    /// 【为什么默认仍是 429】429 + Retry-After 是**语义正确**的那一个（这确实是限流态），
+    /// 且线上客户端以 Claude Code 为主，它对 429 的退避是正常的。改成 503 是为特定客户端
+    /// （Cursor）做的兼容让步，属部署侧决定。
+    ///
+    /// 【只影响「吸收层真的跑过并放弃」的那些请求】判据是 provider 在放弃时打的
+    /// `absorb_budget_exhausted=1` 标记，不是「所有 429」—— 没进过吸收层的 429 照旧。
+    /// 填 429 或任何其它值时 provider 不打该标记 ⇒ 渲染路径逐字节不变。
+    #[serde(default = "default_absorb_exhausted_status")]
+    pub upstream_retry_absorb_exhausted_status: u16,
+
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
@@ -124,6 +307,29 @@ pub struct Config {
     /// 未在此表出现的端点沿用实现内置默认值。
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
+
+    /// CLI 端点（`ksk_` 号）请求体是否按**真实 Kiro CLI 客户端**的形状发送。**默认 false**
+    /// （关闭时逐字节等价旧行为）。
+    ///
+    /// 【为什么存在】`ksk_` 号本身就是 CLI 凭据，而 KiroStudio 至今用的是 IDE 形状的 body
+    /// （`origin: "AI_EDITOR"`）—— 即**拿 CLI 密钥、对上游自报是 IDE**。用户实测同一把 key
+    /// 在 kiro-rs（发 `origin: "KIRO_CLI"`）无 429、在 KiroStudio 429，`origin` 是头号嫌疑：
+    /// 它极可能参与上游的配额/限流分档。
+    ///
+    /// 开启后 `CliEndpoint::transform_api_body` 走 kiro-rs 那套三步（详见
+    /// `kiro::endpoint::cli::set_origin_kiro_cli`）：`origin` 改 `KIRO_CLI`、删
+    /// `conversationState.agentContinuationId`、删 history 里每条 `userInputMessage.modelId`。
+    ///
+    /// 【为什么默认关】线上 17 个可用号正在服务，全池直切一个未验证的上游协议形状不可接受。
+    /// 用法是**单号/小流量开着比 429 率**，而不是升级即换。开关只影响 CLI 端点，IDE 号（social/
+    /// idc/external_idp）完全不受影响。
+    ///
+    /// 【热重载】不需要原子镜像：`transform_api_body` 从 `ctx.config` 读，而该 `Config` 是
+    /// provider 每次调用时 `token_manager.config()`（ArcSwap `load_full`）取的新快照 ⇒ 改配置
+    /// 后下一个请求即生效。加镜像反而多一份要同步的真值（与吸收层同理，见
+    /// `provider.rs` 里 `AbsorbPolicy` 那段说明）。
+    #[serde(default)]
+    pub cli_origin_kiro_cli: bool,
 
     /// 是否启用失败冷却（429/认证失败等后短暂跳过该凭据，默认 true）
     ///
@@ -641,6 +847,57 @@ fn default_extract_thinking() -> bool {
     true
 }
 
+/// 吸收层总预算：默认 **45s**，与 `provider.rs` 的 `MAX_REQUEST_RETRY_BUDGET_SECS` 同值。
+///
+/// 为什么同值而不是更大：每轮的墙钟上限是 `min(45s, 剩余预算)`，两者同源 `min()` 才有意义。
+/// 外置 shield 用 600s 预算 / 60 次重试换来 1.07:1 的吸收比，但 **p50 达 73.2s** ——
+/// 长预算买到的是延迟而非成功率。45s 下最坏客户端可见延迟 ≈ 45s，约为 shield p50 的六成。
+///
+/// 号池 429 是**毫秒级 fast-fail**（`acquire_context` 全池冷却时直接带 `retry_after_secs=N`
+/// 返回，不消耗 45s），所以 45s 内实际能跑满 `max_rounds`；45s 闸门只在真打上游时才吃满。
+fn default_absorb_budget_secs() -> u64 {
+    45
+}
+
+/// 吸收层最大额外轮次：默认 **3**。
+///
+/// 放大上限 = `max_rounds × compute_max_retries` ≤ 3×12 = 36 次上游调用，对比外置 shield 的
+/// 60×12=720。单号池下 `compute_max_retries(1,1)=1`，故实际最坏只有 4 次。
+fn default_absorb_max_rounds() -> u32 {
+    3
+}
+
+/// 退避下限：默认 **150ms**（号池亚秒级恢复不该被睡满 1s，这是 shield p50 偏高的病根之一）。
+fn default_absorb_min_delay_ms() -> u64 {
+    150
+}
+
+/// 退避上限：默认 **15s**（与外置 shield 的 clamp 上界一致）。
+fn default_absorb_max_delay_secs() -> u64 {
+    15
+}
+
+/// 预算耗尽时回给客户端的状态码：默认 **429**（= 保持既有透传行为）。
+///
+/// 写成 `default_*()` 函数而不是裸 `#[serde(default)]`：后者对 `u16` 给的是 **0**，
+/// 那是个非法状态码，会让「缺字段的存量 config.json」拿到一个 provider 侧判不出来的值。
+/// 同款陷阱在 `import_keys_enabled` 上已经吃过一次（bool 裸默认是 false）。
+fn default_absorb_exhausted_status() -> u16 {
+    429
+}
+
+/// 推号入口默认**开**：该端点在本开关之前就存在且有外部对接方在用，
+/// 默认关会让升级变成一次无声的破坏性变更。
+fn default_import_keys_enabled() -> bool {
+    true
+}
+
+/// 分身默认启用：默认 **false**（= 与本项之前的硬编码值一致，升级零行为变化）。
+/// 完整理由见 `Config::clone_default_enabled`。
+fn default_clone_default_enabled() -> bool {
+    false
+}
+
 fn default_cc_auto_buffer() -> bool {
     // 默认 **true** = 识别到 Claude Code 的请求走 buffered 分发。
     //
@@ -871,8 +1128,25 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
             cc_auto_buffer: default_cc_auto_buffer(),
+            import_keys_enabled: default_import_keys_enabled(),
+            clone_default_enabled: default_clone_default_enabled(),
+            // 吸收层六项：**必须调 default_*()，不得另写字面量** —— 默认值散落多处的
+            // 历史不一致正是 `cc_auto_buffer_default_is_on_and_consistent_across_mirrors`
+            // 那条测试要防的形态。suspended 无 default_*() 函数（裸 serde default）。
+            upstream_retry_absorb_enabled: false,
+            upstream_retry_absorb_budget_secs: default_absorb_budget_secs(),
+            upstream_retry_absorb_max_rounds: default_absorb_max_rounds(),
+            upstream_retry_absorb_min_delay_ms: default_absorb_min_delay_ms(),
+            upstream_retry_absorb_max_delay_secs: default_absorb_max_delay_secs(),
+            upstream_retry_absorb_suspended: false,
+            upstream_retry_absorb_server_error: false,
+            upstream_retry_absorb_capacity_400: false,
+            upstream_retry_absorb_swap_budget_secs: 0,
+            upstream_retry_absorb_exhausted_status: default_absorb_exhausted_status(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
+            // CLI body 对齐 kiro-rs 默认关（线上号池正在服务，未验证的协议形状不全池直切）。
+            cli_origin_kiro_cli: false,
             cooldown_enabled: default_cooldown_enabled(),
             cooldown_scale_pct: default_cooldown_scale_pct(),
             rate_limit_jitter_pct: default_rate_limit_jitter_pct(),
@@ -1027,6 +1301,187 @@ mod tests {
         // ② 的一致性断言放在 handlers 自己的测试里
         //（cc_auto_buffer_enabled 是模块私有函数，不为测试放宽生产可见性）：
         //   见 anthropic::handlers::tier3_hotreload_tests::cc_auto_buffer_static_matches_config_default
+    }
+
+    /// `Config::default()` 的吸收层六项必须走 `default_absorb_*()`，不得另写字面量。
+    ///
+    /// 回退即 FAIL：把 `Config::default()` 里任一项改成硬编码数字（例如 `budget_secs: 60`），
+    /// 本测试立刻失败。这是 `cc_auto_buffer` 那条镜像一致性测试的同款守卫 —— 该字段的历史
+    /// 教训正是「默认值散落多处、长期互相矛盾」，而 `Config::default()` 是最容易被随手写
+    /// 字面量的一处。
+    ///
+    /// 注：`ConfigSnapshotResponse` **没有** `Default` impl（它每次都由
+    /// `build_config_snapshot` 从 config 逐字段构造），所以不存在第三处默认值镜像；
+    /// 真正的漂移面在「快照是否真的逐字段读 config」，由 admin/service.rs 的
+    /// `absorb_snapshot_maps_every_field_from_config` 守卫。
+    #[test]
+    fn absorb_config_default_goes_through_default_fns() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.upstream_retry_absorb_budget_secs,
+            default_absorb_budget_secs(),
+            "Config::default() 必须走 default_absorb_budget_secs()，不得另写字面量"
+        );
+        assert_eq!(
+            cfg.upstream_retry_absorb_max_rounds,
+            default_absorb_max_rounds()
+        );
+        assert_eq!(
+            cfg.upstream_retry_absorb_min_delay_ms,
+            default_absorb_min_delay_ms()
+        );
+        assert_eq!(
+            cfg.upstream_retry_absorb_max_delay_secs,
+            default_absorb_max_delay_secs()
+        );
+        // 预算与 provider 的单轮墙钟闸门同值是刻意的（两者同源 min() 才有意义）。
+        assert_eq!(
+            default_absorb_budget_secs(),
+            45,
+            "吸收总预算应与 provider.rs 的 MAX_REQUEST_RETRY_BUDGET_SECS 同值"
+        );
+        assert_eq!(
+            cfg.upstream_retry_absorb_exhausted_status,
+            default_absorb_exhausted_status()
+        );
+    }
+
+    /// ⭐ 硬约束守卫：**合并外挂能力的四个新旋钮全部默认「保持现状」**。
+    ///
+    /// 线上正在服务且号池只剩个位数，任何「顺手改默认值」都是事故。这四项各自的默认值
+    /// 都必须是「行为与本批改动之前逐字节相同」的那一侧：
+    /// - 两个 bool 默认 false ⇒ 新增的两类（5xx / 容量 400）分类出来也不吸收；
+    /// - swap 预算默认 0 ⇒ 换号空窗仍走旧的 min_delay 指数曲线与总预算；
+    /// - 耗尽状态码默认 429 ⇒ provider 不打 `absorb_budget_exhausted=1` 标记，渲染路径不变。
+    ///
+    /// 回退即 FAIL：把任一项默认值改到「新行为」那一侧。
+    #[test]
+    fn newly_merged_absorb_knobs_all_default_to_current_behavior() {
+        let cfg = Config::default();
+        assert!(
+            !cfg.upstream_retry_absorb_server_error,
+            "5xx 吸收默认必须关：外挂实测 11.6 次重试才救回 1 个请求，\
+             那个比值就是「不分失败机理一律重试」的账单"
+        );
+        assert!(
+            !cfg.upstream_retry_absorb_capacity_400,
+            "容量 400 吸收默认必须关"
+        );
+        assert_eq!(
+            cfg.upstream_retry_absorb_swap_budget_secs, 0,
+            "换号空窗独立预算默认必须 0 —— 非零意味着单条请求可占用连接数分钟"
+        );
+        assert_eq!(
+            cfg.upstream_retry_absorb_exhausted_status, 429,
+            "耗尽状态码默认必须 429（保持透传现状）；503 是为 Cursor 做的兼容让步，需显式开"
+        );
+
+        // ⭐ serde 缺字段路径必须与 Config::default() 同源：存量 config.json 没有这四个键。
+        let from_json: Config = serde_json::from_str("{}").expect("缺字段的 config 必须能反序列化");
+        assert!(!from_json.upstream_retry_absorb_server_error);
+        assert!(!from_json.upstream_retry_absorb_capacity_400);
+        assert_eq!(from_json.upstream_retry_absorb_swap_budget_secs, 0);
+        assert_eq!(
+            from_json.upstream_retry_absorb_exhausted_status, 429,
+            "裸 #[serde(default)] 对 u16 给的是 0（非法状态码），必须走 default_* 函数"
+        );
+
+        // 显式开启仍必须被尊重，否则这些开关等于不存在。
+        let on: Config = serde_json::from_str(
+            r#"{"upstreamRetryAbsorbServerError":true,"upstreamRetryAbsorbCapacity400":true,
+                "upstreamRetryAbsorbSwapBudgetSecs":600,"upstreamRetryAbsorbExhaustedStatus":503}"#,
+        )
+        .expect("显式值必须能反序列化");
+        assert!(on.upstream_retry_absorb_server_error);
+        assert!(on.upstream_retry_absorb_capacity_400);
+        assert_eq!(on.upstream_retry_absorb_swap_budget_secs, 600);
+        assert_eq!(on.upstream_retry_absorb_exhausted_status, 503);
+    }
+
+    /// 吸收层与 403 风控吸收**都默认关**。
+    ///
+    /// 「默认开」在 2026-08-04 试过并当天回退：支撑它的「38% 可吸收」是错的
+    /// （池空那 16.5% 的自愈退避下限 60s > 吸收总预算 45s，结构上吸收不了），
+    /// 且开着会让 `budget_secs` 反向支配既有的 45s failover 墙钟、把
+    /// `ABSOLUTE_MAX_TOTAL_RETRIES` 从每请求变成每轮（最坏 48 次上游调用）。
+    /// 完整依据见 `upstream_retry_absorb_enabled` 的字段文档。
+    ///
+    /// 回退即 FAIL：把任一默认改成 true。
+    #[test]
+    fn absorb_and_suspended_absorption_are_both_off_by_default() {
+        assert!(
+            !Config::default().upstream_retry_absorb_enabled,
+            "吸收层默认必须关：可吸收类别实际只有上游 429 的 18.2%，\
+             且预算/放大两条问题未修完前不该默认开"
+        );
+        assert!(
+            !Config::default().upstream_retry_absorb_suspended,
+            "403 临时风控吸收默认必须关闭（与自愈退避冲突）"
+        );
+        // ⭐ 三处默认值必须同源：serde 缺字段路径与 Config::default() 不得分叉。
+        let from_json: Config = serde_json::from_str("{}").expect("缺字段的 config 必须能反序列化");
+        assert_eq!(
+            from_json.upstream_retry_absorb_enabled,
+            Config::default().upstream_retry_absorb_enabled,
+            "serde default 与 Config::default() 必须一致，否则加载路径不同行为不同"
+        );
+    }
+
+    /// ⭐ 推号入口**默认必须开**，且缺字段时也是开。
+    ///
+    /// 回退即 FAIL：把 `default_import_keys_enabled()` 改成 false，或把
+    /// `#[serde(default = ...)]` 换成裸 `#[serde(default)]`（bool 裸默认是 false）。
+    /// 两者任一都会让**升级即切断外部 kiro-accounting 的推号**（那个端点在本开关
+    /// 之前就存在且正在被使用），属无声的破坏性变更。
+    #[test]
+    fn import_keys_enabled_by_default_including_absent_field() {
+        assert!(
+            Config::default().import_keys_enabled,
+            "推号入口默认必须开：端点先于开关存在，默认关等于升级即断对接方"
+        );
+        let from_json: Config = serde_json::from_str("{}").expect("缺字段必须能反序列化");
+        assert!(
+            from_json.import_keys_enabled,
+            "缺字段时必须开（裸 #[serde(default)] 对 bool 是 false，是这里的陷阱）"
+        );
+        // 显式 false 仍必须被尊重，否则这个开关等于不存在。
+        let off: Config = serde_json::from_str(r#"{"importKeysEnabled":false}"#).unwrap();
+        assert!(!off.import_keys_enabled);
+    }
+
+    /// 缺字段的旧 config.json 必须能加载，且各项落在与 `Config::default()` 相同的一侧。
+    ///
+    /// 回退即 FAIL：把任一 `#[serde(default...)]` 摘掉 → 反序列化直接报 missing field，
+    /// 线上既有 config.json 加载失败（`CredentialsConfig::load` 那条路径是 exit(1)）。
+    ///
+    /// ⚠️ 注意这条**不**保证存量部署会开启吸收层：既有 config.json 里显式写了
+    /// `upstreamRetryAbsorbEnabled: false` 时，serde 读到的是那个 false 而非默认值。
+    /// 存量实例必须改配置值（或删键）才生效 —— 见 `upstream_retry_absorb_enabled` 的文档。
+    #[test]
+    fn absorb_fields_absent_from_json_fall_back_to_defaults() {
+        // 只给最小必需字段，其余全靠 serde default 兜。
+        let cfg: Config = serde_json::from_str("{}").expect("缺字段的 config 必须能反序列化");
+        assert!(
+            !cfg.upstream_retry_absorb_enabled,
+            "缺字段时吸收层应按默认关"
+        );
+        assert!(!cfg.upstream_retry_absorb_suspended);
+        assert_eq!(
+            cfg.upstream_retry_absorb_budget_secs,
+            default_absorb_budget_secs()
+        );
+        assert_eq!(
+            cfg.upstream_retry_absorb_max_rounds,
+            default_absorb_max_rounds()
+        );
+
+        // ⭐ 显式 true 必须压过默认值（手动开启的那条路必须仍然管用）。
+        let explicit_on: Config = serde_json::from_str(r#"{"upstreamRetryAbsorbEnabled":true}"#)
+            .expect("显式 true 必须能反序列化");
+        assert!(
+            explicit_on.upstream_retry_absorb_enabled,
+            "面板/配置显式开启必须生效，否则这个功能没有任何启用途径"
+        );
     }
 
     #[test]

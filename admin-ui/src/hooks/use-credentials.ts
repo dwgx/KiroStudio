@@ -7,6 +7,7 @@ import {
   setCredentialAllowedModels,
   setCredentialCustomApi,
   setCredentialEndpoint,
+  setCredentialApiRegion,
   type SetCustomApiConfigInput,
   resetCredentialFailure,
   forceRefreshToken,
@@ -126,6 +127,19 @@ export function useSetCredentialEndpoint() {
   return useMutation({
     mutationFn: ({ id, endpoint }: { id: number; endpoint: string | null }) =>
       setCredentialEndpoint(id, endpoint),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 手动指定该号的上游 region（apiRegion=null → 清除，回退全局默认）
+// ksk_ 号按区授权，打错区恒 403；自动探测可能探错，这是手工兜底入口。
+export function useSetCredentialApiRegion() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, apiRegion }: { id: number; apiRegion: string | null }) =>
+      setCredentialApiRegion(id, apiRegion),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },

@@ -1065,7 +1065,15 @@ export function TrashDetailDialog({
       toast.success(t('opsdetaildialogs.trash.restoreSuccess', { id: item.id }))
       invalidate()
     } catch {
-      toast.error(t('opsdetaildialogs.trash.restoreFailed', { id: item.id }))
+      // 多开分身与主凭据必然同 key → 默认路径被 key 去重挡住。
+      // 自动重试一次强制恢复（恢复后仍是禁用态，不会直接投入调度，故安全）。
+      try {
+        await restoreCredential(item.id, true)
+        toast.success(t('opsdetaildialogs.trash.restoreSuccess', { id: item.id }))
+        invalidate()
+      } catch {
+        toast.error(t('opsdetaildialogs.trash.restoreFailed', { id: item.id }))
+      }
     } finally {
       setBusyId(null)
     }

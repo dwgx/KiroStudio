@@ -1,12 +1,11 @@
 //! Admin UI 路由配置
 
 use axum::{
-    Router,
+    Json, Router,
     body::Body,
     http::{Response, StatusCode, Uri, header},
     response::IntoResponse,
     routing::get,
-    Json,
 };
 use rust_embed::Embed;
 use std::sync::{
@@ -184,7 +183,8 @@ async fn download_bg_bytes(client: &reqwest::Client, img_url: &str) -> Option<Ca
     if sanitize_image_content_type(&content_type, img_url) != content_type {
         tracing::warn!(
             "背景图预取拒绝非图片 MIME {:?}（防止污染内存池后经匿名 bg-cached 造成 XSS）: {}",
-            content_type, img_url
+            content_type,
+            img_url
         );
         return None;
     }
@@ -196,7 +196,11 @@ async fn download_bg_bytes(client: &reqwest::Client, img_url: &str) -> Option<Ca
     const MAX_BG_BYTES: usize = 10 * 1024 * 1024; // 10 MiB，与代理端点同口径
     if let Some(len) = resp.content_length() {
         if len as usize > MAX_BG_BYTES {
-            tracing::warn!("背景图预取过大（Content-Length={}），跳过: {}", len, img_url);
+            tracing::warn!(
+                "背景图预取过大（Content-Length={}），跳过: {}",
+                len,
+                img_url
+            );
             return None;
         }
     }
@@ -208,7 +212,8 @@ async fn download_bg_bytes(client: &reqwest::Client, img_url: &str) -> Option<Ca
                 if buf.len() + chunk.len() > MAX_BG_BYTES {
                     tracing::warn!(
                         "背景图预取流超过 {} 字节上限，丢弃: {}",
-                        MAX_BG_BYTES, img_url
+                        MAX_BG_BYTES,
+                        img_url
                     );
                     return None;
                 }
@@ -255,8 +260,16 @@ const NON_R18_SOURCES: &[BgSource] = &[
         kind: BgKind::Json,
         url: "https://api.lolicon.app/setu/v2?r18=0&size=regular&excludeAI=true&num={num}&aspectRatio=gt1.2",
     },
-    BgSource { name: "alcy", kind: BgKind::Direct, url: "https://t.alcy.cc/pc" },
-    BgSource { name: "loliapi", kind: BgKind::Direct, url: "https://www.loliapi.com/acg/" },
+    BgSource {
+        name: "alcy",
+        kind: BgKind::Direct,
+        url: "https://t.alcy.cc/pc",
+    },
+    BgSource {
+        name: "loliapi",
+        kind: BgKind::Direct,
+        url: "https://www.loliapi.com/acg/",
+    },
 ];
 
 /// R18 图源组:同为二次元/pixiv 题材,仅内容分级不同。lolicon r18=1 可靠,anosu 作冗余备份。
@@ -266,7 +279,11 @@ const R18_SOURCES: &[BgSource] = &[
         kind: BgKind::Json,
         url: "https://api.lolicon.app/setu/v2?r18=1&size=regular&excludeAI=true&num={num}&aspectRatio=gt1.2",
     },
-    BgSource { name: "anosu-r18", kind: BgKind::Direct, url: "https://image.anosu.top/pixiv/direct?r18=1" },
+    BgSource {
+        name: "anosu-r18",
+        kind: BgKind::Direct,
+        url: "https://image.anosu.top/pixiv/direct?r18=1",
+    },
 ];
 
 /// 把一张下载好的图推进内存池,并按上限丢弃最老的(有界)。
@@ -309,7 +326,13 @@ const MAX_JSON_SOURCE_BYTES: u64 = 1024 * 1024;
 async fn fetch_from_json_source(client: &reqwest::Client, url: &str, batch_epoch: u64) -> usize {
     let body: serde_json::Value = match client.get(url).send().await {
         // 带上限读取：第三方响应是外部可控数据，无上限的 r.json() 可被用来 OOM 网关。
-        Ok(r) => match crate::common::http_read::read_json_capped(r, "背景图 JSON 源", MAX_JSON_SOURCE_BYTES).await {
+        Ok(r) => match crate::common::http_read::read_json_capped(
+            r,
+            "背景图 JSON 源",
+            MAX_JSON_SOURCE_BYTES,
+        )
+        .await
+        {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("背景图预取:解析 JSON 源响应失败: {}", e);
@@ -608,7 +631,13 @@ async fn random_bg_handler() -> impl IntoResponse {
     );
     let body: serde_json::Value = match client.get(&api).send().await {
         // 同上：带上限读取（本端点匿名可达，更不能让外部响应决定内存占用）。
-        Ok(r) => match crate::common::http_read::read_json_capped(r, "背景图 JSON 源(直取)", MAX_JSON_SOURCE_BYTES).await {
+        Ok(r) => match crate::common::http_read::read_json_capped(
+            r,
+            "背景图 JSON 源(直取)",
+            MAX_JSON_SOURCE_BYTES,
+        )
+        .await
+        {
             Ok(v) => v,
             Err(_) => return Json(serde_json::json!({"url": null})).into_response(),
         },
@@ -631,10 +660,7 @@ async fn bg_cached_handler(uri: Uri) -> impl IntoResponse {
     // 解析 idx（缺省 0）。
     let idx: usize = uri
         .query()
-        .and_then(|q| {
-            q.split('&')
-                .find_map(|kv| kv.strip_prefix("idx="))
-        })
+        .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("idx=")))
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
@@ -690,7 +716,8 @@ fn sanitize_image_content_type(content_type: &str, img_url: &str) -> String {
     } else {
         tracing::warn!(
             "背景图代理：上游返回非图片 MIME {:?}，已覆盖为 image/jpeg 防止 /admin 同源 XSS（目标 URL: {}）",
-            content_type, img_url
+            content_type,
+            img_url
         );
         "image/jpeg".to_string()
     }
@@ -702,10 +729,12 @@ async fn bg_img_proxy_handler(uri: Uri) -> impl IntoResponse {
     let img_url = query.strip_prefix("url=").unwrap_or("");
     let img_url = match urlencoding::decode(img_url) {
         Ok(u) => u.into_owned(),
-        Err(_) => return Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(Body::from("bad url"))
-            .expect("Failed to build response"),
+        Err(_) => {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from("bad url"))
+                .expect("Failed to build response");
+        }
     };
     if !img_url.starts_with("https://") {
         return Response::builder()
@@ -731,16 +760,22 @@ async fn bg_img_proxy_handler(uri: Uri) -> impl IntoResponse {
                 .expect("Failed to build response");
         }
     };
-    let resp = match client.get(&img_url)
+    let resp = match client
+        .get(&img_url)
         .header("referer", "https://www.pixiv.net/")
-        .send().await {
+        .send()
+        .await
+    {
         Ok(r) => r,
-        Err(_) => return Response::builder()
-            .status(StatusCode::BAD_GATEWAY)
-            .body(Body::from("fetch failed"))
-            .expect("Failed to build response"),
+        Err(_) => {
+            return Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::from("fetch failed"))
+                .expect("Failed to build response");
+        }
     };
-    let content_type = resp.headers()
+    let content_type = resp
+        .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("image/jpeg")
@@ -777,10 +812,12 @@ async fn bg_img_proxy_handler(uri: Uri) -> impl IntoResponse {
                 buf.extend_from_slice(&chunk);
             }
             Ok(None) => break,
-            Err(_) => return Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from("read failed"))
-                .expect("Failed to build response"),
+            Err(_) => {
+                return Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(Body::from("read failed"))
+                    .expect("Failed to build response");
+            }
         }
     }
     Response::builder()
@@ -807,16 +844,16 @@ mod tests {
         for evil in [
             "text/html",
             "text/html; charset=utf-8",
-            "TEXT/HTML",                    // 大小写不敏感
+            "TEXT/HTML", // 大小写不敏感
             "application/xhtml+xml",
-            "image",                        // 缺斜杠,不算 image/*
+            "image", // 缺斜杠,不算 image/*
             "text/javascript",
             "application/javascript",
             "application/pdf",
             "text/plain",
             "application/xml",
-            "image_evil/html",              // 前缀相似但不是 image/
-            "",                             // 缺失 Content-Type
+            "image_evil/html", // 前缀相似但不是 image/
+            "",                // 缺失 Content-Type
         ] {
             assert_eq!(
                 sanitize_image_content_type(evil, "https://example.invalid/x"),
@@ -835,9 +872,9 @@ mod tests {
             "image/webp",
             "image/avif",
             "image/gif",
-            "image/jpeg; charset=binary",   // 带参数:只看主类型
-            "IMAGE/PNG",                     // 大小写不敏感放行,且原样回传
-            "application/octet-stream",      // 部分 CDN 对图片用它
+            "image/jpeg; charset=binary", // 带参数:只看主类型
+            "IMAGE/PNG",                  // 大小写不敏感放行,且原样回传
+            "application/octet-stream",   // 部分 CDN 对图片用它
         ] {
             assert_eq!(
                 sanitize_image_content_type(ok, "https://example.invalid/x"),

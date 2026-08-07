@@ -109,6 +109,25 @@ pub struct Aggregate {
     /// 当成 0ms 摊进去，系统性拉低平均值。
     #[serde(default)]
     pub first_token_count: u64,
+    /// 换号次数累计（`retries`）。
+    ///
+    /// 数据源：`handlers.rs` 四处写入点 + provider 失败路径的
+    /// `fail_record.retries = attempts_used`。
+    /// 「烧掉 12 次换号才失败」与「第一次就失败」的区分，正是判断重试预算够不够、
+    /// 吸收层有没有效的唯一依据。
+    /// 出口已接通：[`WindowSummary`] / [`SeriesPoint`] / [`GroupStat`] 三个 DTO 都下发
+    /// 本字段与 [`Self::retried_requests`]（成对，勿只接一个）。
+    #[serde(default)]
+    pub retries_sum: u64,
+    /// **发生过**重试的请求数（`retries > 0`）。
+    ///
+    /// 与 `retries_sum` 配对是承重的：绝大多数请求 `retries=0`，用 `requests` 当分母
+    /// 算出的平均值会被压到接近 0（例：1000 条里 10 条各重试 6 次 ⇒ 6000/1000=0.06，
+    /// 看着像"几乎不重试"，而真相是**那 10 条平均重试 6 次**）。
+    /// 两个分母各有用途：`retries_sum / requests` 是整池放大倍数，
+    /// `retries_sum / retried_requests` 是"真重试时重试几次"。
+    #[serde(default)]
+    pub retried_requests: u64,
 }
 
 impl Aggregate {
@@ -134,6 +153,11 @@ impl Aggregate {
             self.first_token_sum_ms += ft;
             self.first_token_count += 1;
         }
+        // 换号次数：sum 恒累加（含 0），计数器只在真重试过时 +1（见 retried_requests）。
+        self.retries_sum += r.retries as u64;
+        if r.retries > 0 {
+            self.retried_requests += 1;
+        }
     }
 
     /// 把另一个聚合并入本聚合（用于跨桶汇总）
@@ -149,6 +173,8 @@ impl Aggregate {
         self.latency_sum_ms += other.latency_sum_ms;
         self.first_token_sum_ms += other.first_token_sum_ms;
         self.first_token_count += other.first_token_count;
+        self.retries_sum += other.retries_sum;
+        self.retried_requests += other.retried_requests;
     }
 
     /// 成功率（0.0~1.0），无请求时为 0
@@ -179,6 +205,30 @@ impl Aggregate {
             None
         } else {
             Some(self.first_token_sum_ms as f64 / self.first_token_count as f64)
+        }
+    }
+
+    /// 每请求平均换号次数（**整池放大倍数**口径，分母是全部请求）。
+    ///
+    /// 用途：与外置 shield 的放大倍数（实测 3.27x）同口径对比。
+    pub fn avg_retries_per_request(&self) -> f64 {
+        if self.requests == 0 {
+            0.0
+        } else {
+            self.retries_sum as f64 / self.requests as f64
+        }
+    }
+
+    /// 真发生重试时的平均次数（分母只算 `retries > 0` 的请求）。
+    ///
+    /// 与 [`Self::avg_retries_per_request`] 是**两个不同的问题**，不可互相替代：
+    /// 绝大多数请求 `retries=0`，只看前者会把"少数请求重试很多次"稀释成"几乎不重试"。
+    /// 无重试样本时返 `None`（而非 0.0）—— 0.0 会被误读成"重试过但只重试 0 次"。
+    pub fn avg_retries_when_retried(&self) -> Option<f64> {
+        if self.retried_requests == 0 {
+            None
+        } else {
+            Some(self.retries_sum as f64 / self.retried_requests as f64)
         }
     }
 }
@@ -571,7 +621,8 @@ impl ClientAgg {
             self.by_client.keys().cloned().collect();
         let live_machines: std::collections::HashSet<String> =
             self.by_machine.keys().cloned().collect();
-        self.session_meta.retain(|sid, _| live_sessions.contains(sid));
+        self.session_meta
+            .retain(|sid, _| live_sessions.contains(sid));
         for sids in self.client_sessions.values_mut() {
             sids.retain(|sid| live_sessions.contains(sid));
         }
@@ -579,8 +630,7 @@ impl ClientAgg {
             .retain(|ck, sids| !sids.is_empty() || live_clients.contains(ck));
 
         // 机器维度：画像/归组与存活机器 + 存活 session 对齐
-        self.machine_meta
-            .retain(|mk, _| live_machines.contains(mk));
+        self.machine_meta.retain(|mk, _| live_machines.contains(mk));
         for sids in self.machine_sessions.values_mut() {
             sids.retain(|sid| live_sessions.contains(sid));
         }
@@ -744,6 +794,22 @@ pub struct WindowSummary {
     pub credits_used: f64,
     /// 平均延迟（毫秒）
     pub avg_latency_ms: f64,
+    /// 换号次数累计（[`Aggregate::retries_sum`] 的直出）。
+    ///
+    /// 与 [`Self::retried_requests`] **成对**下发、且两个原始计数都不省略：
+    /// 前端要能自己换分母（整池放大倍数 vs 真重试时几次），只给一个平均值会锁死口径。
+    pub retries_sum: u64,
+    /// **发生过**重试的请求数（`retries > 0`），[`Self::retries_sum`] 的第二个分母。
+    pub retried_requests: u64,
+    /// 每请求平均换号次数（分母 = 全部请求）。可与外置 shield 的放大倍数同口径对比。
+    pub avg_retries_per_request: f64,
+    /// 真发生重试时的平均次数（分母 = `retried_requests`）。
+    ///
+    /// 无重试样本时为 `null` 而非 0 —— 0 会被读成"重试过但只重试 0 次"。
+    pub avg_retries_when_retried: Option<f64>,
+    /// 平均 TTFB（毫秒）。无有效样本时为 `null`（见 [`Aggregate::avg_first_token_ms`]：
+    /// 0ms 物理上不可能，把"没数据"显示成 0 比显示"—"危险得多）。
+    pub avg_first_token_ms: Option<f64>,
 }
 
 impl From<Aggregate> for WindowSummary {
@@ -760,6 +826,11 @@ impl From<Aggregate> for WindowSummary {
             cache_creation_tokens: a.cache_creation_tokens,
             credits_used: a.credits_used,
             avg_latency_ms: a.avg_latency_ms(),
+            retries_sum: a.retries_sum,
+            retried_requests: a.retried_requests,
+            avg_retries_per_request: a.avg_retries_per_request(),
+            avg_retries_when_retried: a.avg_retries_when_retried(),
+            avg_first_token_ms: a.avg_first_token_ms(),
         }
     }
 }
@@ -800,6 +871,13 @@ pub struct SeriesPoint {
     pub credits_used: f64,
     /// 平均延迟（毫秒）
     pub avg_latency_ms: f64,
+    /// 该桶内的换号次数累计（画重试趋势的唯一数据源）。
+    ///
+    /// 序列点上**只给原始计数、不给平均值**：分母（requests / retried_requests）
+    /// 两个都在同一个点里，前端要哪个口径自己除，避免在 DTO 层锁死口径。
+    pub retries_sum: u64,
+    /// 该桶内**发生过**重试的请求数（`retries > 0`）。
+    pub retried_requests: u64,
 }
 
 /// 按 key（模型名 / 凭据 ID 字符串）聚合的一行
@@ -823,6 +901,12 @@ pub struct GroupStat {
     pub credits_used: f64,
     /// 平均延迟（毫秒）
     pub avg_latency_ms: f64,
+    /// 该分组的换号次数累计：看**哪个模型 / 哪个号**在烧重试预算。
+    pub retries_sum: u64,
+    /// 该分组内**发生过**重试的请求数（`retries > 0`），与 [`Self::retries_sum`] 成对。
+    pub retried_requests: u64,
+    /// 该分组每请求平均换号次数（分母 = 该分组请求数）。
+    pub avg_retries_per_request: f64,
 }
 
 impl GroupStat {
@@ -837,6 +921,9 @@ impl GroupStat {
             cache_creation_tokens: a.cache_creation_tokens,
             credits_used: a.credits_used,
             avg_latency_ms: a.avg_latency_ms(),
+            retries_sum: a.retries_sum,
+            retried_requests: a.retried_requests,
+            avg_retries_per_request: a.avg_retries_per_request(),
         }
     }
 }
@@ -1155,6 +1242,8 @@ impl UsageStats {
                 cache_creation_tokens: agg.cache_creation_tokens,
                 credits_used: agg.credits_used,
                 avg_latency_ms: agg.avg_latency_ms(),
+                retries_sum: agg.retries_sum,
+                retried_requests: agg.retried_requests,
             });
         }
         out
@@ -1191,6 +1280,8 @@ impl UsageStats {
                 cache_creation_tokens: agg.cache_creation_tokens,
                 credits_used: agg.credits_used,
                 avg_latency_ms: agg.avg_latency_ms(),
+                retries_sum: agg.retries_sum,
+                retried_requests: agg.retried_requests,
             });
         }
         out
@@ -1507,7 +1598,14 @@ mod tests {
         // 同一小时内 3 条
         s.on_record(&rec(0, Some(1), "m1", RequestOutcome::Success, 10, 5));
         s.on_record(&rec(60_000, Some(1), "m1", RequestOutcome::Success, 20, 10));
-        s.on_record(&rec(120_000, Some(1), "m1", RequestOutcome::RateLimited, 0, 0));
+        s.on_record(&rec(
+            120_000,
+            Some(1),
+            "m1",
+            RequestOutcome::RateLimited,
+            0,
+            0,
+        ));
 
         let ov = s.overview_at(BASE_MS + 120_000);
         assert_eq!(ov.last_24h.requests, 3);
@@ -1527,7 +1625,14 @@ mod tests {
         // 三个不同小时各 1 条（同一天）
         s.on_record(&rec(0, Some(1), "m", RequestOutcome::Success, 1, 1));
         s.on_record(&rec(HOUR_MS, Some(1), "m", RequestOutcome::Success, 1, 1));
-        s.on_record(&rec(2 * HOUR_MS, Some(1), "m", RequestOutcome::Success, 1, 1));
+        s.on_record(&rec(
+            2 * HOUR_MS,
+            Some(1),
+            "m",
+            RequestOutcome::Success,
+            1,
+            1,
+        ));
 
         let series = s.timeseries_hourly_at(BASE_MS + 2 * HOUR_MS, 3);
         assert_eq!(series.len(), 3);
@@ -1566,8 +1671,22 @@ mod tests {
     fn test_by_model_and_by_credential() {
         let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
         s.on_record(&rec(0, Some(1), "sonnet", RequestOutcome::Success, 10, 5));
-        s.on_record(&rec(1000, Some(1), "sonnet", RequestOutcome::Success, 10, 5));
-        s.on_record(&rec(2000, Some(2), "opus", RequestOutcome::ServerError, 3, 0));
+        s.on_record(&rec(
+            1000,
+            Some(1),
+            "sonnet",
+            RequestOutcome::Success,
+            10,
+            5,
+        ));
+        s.on_record(&rec(
+            2000,
+            Some(2),
+            "opus",
+            RequestOutcome::ServerError,
+            3,
+            0,
+        ));
 
         let models = s.by_model();
         // sonnet 请求最多，排第一
@@ -1583,6 +1702,169 @@ mod tests {
         assert_eq!(c1.input_tokens, 20);
         let c2 = creds.iter().find(|c| c.key == "2").unwrap();
         assert_eq!(c2.requests, 1);
+    }
+
+    /// ⭐ 回归（已知问题 #21）：`retries` 必须进聚合层，且两个口径都要对。
+    ///
+    /// 数据一直是齐的（`handlers.rs` 四处写入点 + provider 失败路径），但
+    /// `Aggregate` 既无字段、`add()` 也不读 ⇒ **画不出趋势、算不出分布**，
+    /// 只能在逐条详情里一条条翻。而「烧 12 次换号才失败」与「首次即失败」的区分
+    /// 正是判断重试预算够不够、吸收层有没有效的唯一依据。
+    ///
+    /// 删掉 `add()` 里那两行 → 本测试必 FAILED。
+    #[test]
+    fn aggregate_must_expose_retries_in_both_calibers() {
+        let mut agg = Aggregate::default();
+        // 10 条：8 条零重试，2 条各重试 6 次。
+        for _ in 0..8 {
+            let mut r = RequestRecord::new("t".to_string(), "m".to_string());
+            r.outcome = RequestOutcome::Success;
+            r.retries = 0;
+            agg.add(&r);
+        }
+        for _ in 0..2 {
+            let mut r = RequestRecord::new("t".to_string(), "m".to_string());
+            r.outcome = RequestOutcome::RateLimited;
+            r.retries = 6;
+            agg.add(&r);
+        }
+        assert_eq!(agg.retries_sum, 12, "换号次数必须累计（旧代码恒 0）");
+        assert_eq!(agg.retried_requests, 2, "只有真重试过的请求计入分母");
+
+        // 口径①整池放大倍数：12/10 = 1.2
+        assert!((agg.avg_retries_per_request() - 1.2).abs() < 1e-9);
+        // 口径②真重试时的平均次数：12/2 = 6.0
+        //
+        // 这两个数**必须都能算出来**：只有口径① 时 1.2 会被读成"几乎不重试"，
+        // 而真相是那 2 条各重试了 6 次。这正是加 retried_requests 分母的理由。
+        assert_eq!(agg.avg_retries_when_retried(), Some(6.0));
+
+        // merge 必须同样带上两个字段，否则跨桶汇总（逐小时/逐天）会把它们清零 ——
+        // 而趋势图正是跨桶汇总出来的，漏了 merge 等于字段只在单桶内有效。
+        let mut total = Aggregate::default();
+        total.merge(&agg);
+        total.merge(&agg);
+        assert_eq!(total.retries_sum, 24, "merge 必须累加 retries_sum");
+        assert_eq!(total.retried_requests, 4, "merge 必须累加 retried_requests");
+
+        // 无重试样本时返 None 而非 0.0：后者会被误读成"重试过但只重试 0 次"。
+        let empty = Aggregate::default();
+        assert_eq!(empty.avg_retries_when_retried(), None);
+        assert_eq!(empty.avg_retries_per_request(), 0.0);
+    }
+
+    /// 构造一条带 `retries` 的记录（聚合层已覆盖，这里专测 DTO 出口）。
+    fn rec_retries(offset_ms: i64, cid: Option<u64>, model: &str, retries: u32) -> RequestRecord {
+        let mut r = rec(offset_ms, cid, model, RequestOutcome::RateLimited, 10, 5);
+        r.retries = retries;
+        r
+    }
+
+    /// ⭐ 回归（已知问题 #21 的**出口**部分）：三个 DTO 必须真的把 retries 下发出去。
+    ///
+    /// 聚合层（`Aggregate`）早就在算，但 `WindowSummary` / `SeriesPoint` / `GroupStat`
+    /// 三个输出结构一个字段都没有 ⇒ `/api/admin/usage/*` 全都不下发，前端拿不到。
+    /// 本测试断言的是**序列化后的 JSON 文本**（而不是 Rust 字段），因为字段存在
+    /// 但 serde 改了名（如误加 `rename_all = "camelCase"`）对前端同样等于没有。
+    ///
+    /// 删掉任一 DTO 里的 `retries_sum:` 那行 → 本测试必 FAILED。
+    #[test]
+    fn usage_dtos_must_emit_retries_in_snake_case() {
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        // 3 条同一小时同一模型同一号：2 条各重试 3 次，1 条零重试。
+        s.on_record(&rec_retries(0, Some(9), "sonnet", 3));
+        s.on_record(&rec_retries(1_000, Some(9), "sonnet", 3));
+        s.on_record(&rec_retries(2_000, Some(9), "sonnet", 0));
+
+        // ① WindowSummary：两个原始计数 + 两个口径的平均值都要在
+        let ov = s.overview_at(BASE_MS + 2_000);
+        assert_eq!(ov.last_24h.retries_sum, 6);
+        assert_eq!(ov.last_24h.retried_requests, 2);
+        assert!(
+            (ov.last_24h.avg_retries_per_request - 2.0).abs() < 1e-9,
+            "6/3"
+        );
+        assert_eq!(ov.last_24h.avg_retries_when_retried, Some(3.0), "6/2");
+
+        let ov_json = serde_json::to_string(&s.overview_at(BASE_MS + 2_000)).unwrap();
+        assert!(ov_json.contains("\"retries_sum\":6"), "{ov_json}");
+        assert!(ov_json.contains("\"retried_requests\":2"), "{ov_json}");
+        assert!(
+            ov_json.contains("\"avg_retries_per_request\":2.0"),
+            "{ov_json}"
+        );
+        assert!(
+            ov_json.contains("\"avg_retries_when_retried\":3.0"),
+            "{ov_json}"
+        );
+        // camelCase 变体一个都不许出现：前端类型定义按 snake_case 写的，
+        // 出现 camelCase 说明 DTO 上被误加了 rename_all（字段在但前端读不到）。
+        for camel in [
+            "retriesSum",
+            "retriedRequests",
+            "avgRetriesPerRequest",
+            "avgRetriesWhenRetried",
+        ] {
+            assert!(!ov_json.contains(camel), "出口不得 camelCase：{camel}");
+        }
+
+        // ② SeriesPoint：只给原始计数（分母都在同一个点里，口径交给前端）
+        let series = s.timeseries_hourly_at(BASE_MS + 2_000, 1);
+        assert_eq!(series.last().unwrap().retries_sum, 6);
+        assert_eq!(series.last().unwrap().retried_requests, 2);
+        let series_json = serde_json::to_string(&series).unwrap();
+        assert!(series_json.contains("\"retries_sum\":6"), "{series_json}");
+        assert!(
+            series_json.contains("\"retried_requests\":2"),
+            "{series_json}"
+        );
+        // 天桶同样要接上（漏一个构造点 = 切到「按天」后趋势整条归零）
+        let daily_json = serde_json::to_string(&s.timeseries_daily_at(BASE_MS + 2_000, 1)).unwrap();
+        assert!(daily_json.contains("\"retries_sum\":6"), "{daily_json}");
+
+        // ③ GroupStat：按模型 / 按凭据两条路径都走 GroupStat::from，各断言一次
+        let models = s.by_model();
+        let m = models.iter().find(|g| g.key == "sonnet").unwrap();
+        assert_eq!(m.retries_sum, 6);
+        assert_eq!(m.retried_requests, 2);
+        assert!((m.avg_retries_per_request - 2.0).abs() < 1e-9);
+        let models_json = serde_json::to_string(&models).unwrap();
+        assert!(models_json.contains("\"retries_sum\":6"), "{models_json}");
+        assert!(
+            models_json.contains("\"avg_retries_per_request\":2.0"),
+            "{models_json}"
+        );
+
+        let creds_json = serde_json::to_string(&s.by_credential()).unwrap();
+        assert!(creds_json.contains("\"retries_sum\":6"), "{creds_json}");
+        assert!(
+            creds_json.contains("\"retried_requests\":2"),
+            "{creds_json}"
+        );
+    }
+
+    /// TTFB 平均值同样只有单测在调 —— 出口接上后 `WindowSummary` 必须带它，
+    /// 且**无样本时是 `null` 而不是 0**（0ms 物理不可能，显示 0 比显示 "—" 危险）。
+    #[test]
+    fn window_summary_must_emit_avg_first_token_ms_as_null_when_no_sample() {
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        // rec() 不设 first_token_ms ⇒ 该窗口无 TTFB 样本
+        s.on_record(&rec(0, Some(3), "m", RequestOutcome::Success, 1, 1));
+        let ov = s.overview_at(BASE_MS);
+        assert_eq!(ov.last_24h.avg_first_token_ms, None);
+        let json = serde_json::to_string(&s.overview_at(BASE_MS)).unwrap();
+        assert!(json.contains("\"avg_first_token_ms\":null"), "{json}");
+
+        // 有样本时下发真实平均值
+        let s2 = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        let mut r = rec(0, Some(3), "m", RequestOutcome::Success, 1, 1);
+        r.first_token_ms = Some(300);
+        s2.on_record(&r);
+        let mut r2 = rec(1_000, Some(3), "m", RequestOutcome::Success, 1, 1);
+        r2.first_token_ms = Some(500);
+        s2.on_record(&r2);
+        let ov2 = s2.overview_at(BASE_MS + 1_000);
+        assert_eq!(ov2.last_24h.avg_first_token_ms, Some(400.0));
     }
 
     #[test]
@@ -1629,11 +1911,31 @@ mod tests {
     fn test_clients_rpm_by_ip_and_sessions() {
         let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
         // 客户端 A(1.1.1.1) 开两个窗口：w1 打 2 条，w2 打 1 条（均在近 60 秒内）
-        s.on_record(&rec_client(0, Some("w1"), Some("1.1.1.1"), Some("claude-code")));
-        s.on_record(&rec_client(1_000, Some("w1"), Some("1.1.1.1"), Some("claude-code")));
-        s.on_record(&rec_client(2_000, Some("w2"), Some("1.1.1.1"), Some("claude-code")));
+        s.on_record(&rec_client(
+            0,
+            Some("w1"),
+            Some("1.1.1.1"),
+            Some("claude-code"),
+        ));
+        s.on_record(&rec_client(
+            1_000,
+            Some("w1"),
+            Some("1.1.1.1"),
+            Some("claude-code"),
+        ));
+        s.on_record(&rec_client(
+            2_000,
+            Some("w2"),
+            Some("1.1.1.1"),
+            Some("claude-code"),
+        ));
         // 客户端 B(2.2.2.2) 一个窗口 1 条
-        s.on_record(&rec_client(0, Some("w3"), Some("2.2.2.2"), Some("claude-code")));
+        s.on_record(&rec_client(
+            0,
+            Some("w3"),
+            Some("2.2.2.2"),
+            Some("claude-code"),
+        ));
 
         // now 落在同一 30 秒桶，60 秒 RPM 覆盖以上全部
         let clients = s.clients_at(BASE_MS + 2_000);
@@ -1660,8 +1962,18 @@ mod tests {
     fn test_cleanup_client_stats_reclaims_stale_entries() {
         let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
         // 两个客户端各开一个窗口
-        s.on_record(&rec_client(0, Some("w1"), Some("1.1.1.1"), Some("claude-code")));
-        s.on_record(&rec_client(0, Some("w2"), Some("2.2.2.2"), Some("claude-code")));
+        s.on_record(&rec_client(
+            0,
+            Some("w1"),
+            Some("1.1.1.1"),
+            Some("claude-code"),
+        ));
+        s.on_record(&rec_client(
+            0,
+            Some("w2"),
+            Some("2.2.2.2"),
+            Some("claude-code"),
+        ));
 
         // 窗口内回收：条目仍活跃，四张 map 都应保留
         let (sessions, clients) = s.cleanup_client_stats_at(BASE_MS);
@@ -1677,7 +1989,12 @@ mod tests {
     #[test]
     fn test_clients_prune_stale_window() {
         let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
-        s.on_record(&rec_client(0, Some("old"), Some("9.9.9.9"), Some("claude-code")));
+        s.on_record(&rec_client(
+            0,
+            Some("old"),
+            Some("9.9.9.9"),
+            Some("claude-code"),
+        ));
         // 10 分钟后查询：旧窗口/客户端应被 prune 掉
         let later = s.clients_at(BASE_MS + 11 * 60 * 1000);
         assert!(later.is_empty(), "过期窗口应被回收，结果为空");
@@ -1715,19 +2032,51 @@ mod tests {
         // 修正后语义:IP 为主键。不同 IP 且无 session 关联 = 不同机器(即便 Claude Code 画像相同)。
         // 这正是修复"7 个不同 IP 被合并成 1 台"的核心。
         let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
-        s.on_record(&rec_machine(0, Some("w1"), Some("203.0.113.23"), Some("claude-code"), Some("Windows"), None));
-        s.on_record(&rec_machine(1_000, Some("w2"), Some("10.0.0.9"), Some("claude-code"), Some("Windows"), None));
+        s.on_record(&rec_machine(
+            0,
+            Some("w1"),
+            Some("203.0.113.23"),
+            Some("claude-code"),
+            Some("Windows"),
+            None,
+        ));
+        s.on_record(&rec_machine(
+            1_000,
+            Some("w2"),
+            Some("10.0.0.9"),
+            Some("claude-code"),
+            Some("Windows"),
+            None,
+        ));
 
         let machines = s.machines_at(BASE_MS + 1_000);
-        assert_eq!(machines.len(), 2, "不同 IP 且无 session 关联应是两台机器(画像相同也不合并)");
+        assert_eq!(
+            machines.len(),
+            2,
+            "不同 IP 且无 session 关联应是两台机器(画像相同也不合并)"
+        );
     }
 
     #[test]
     fn test_machines_same_ip_is_one_machine() {
         // 同一 IP = 同一台机器(IP 是主键)。IP 相同即便画像不同也归一台,该 IP 见过的画像取首现。
         let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
-        s.on_record(&rec_machine(0, Some("w1"), Some("1.1.1.1"), Some("claude-code"), Some("Windows"), None));
-        s.on_record(&rec_machine(0, Some("w2"), Some("1.1.1.1"), Some("claude-code"), Some("Windows"), None));
+        s.on_record(&rec_machine(
+            0,
+            Some("w1"),
+            Some("1.1.1.1"),
+            Some("claude-code"),
+            Some("Windows"),
+            None,
+        ));
+        s.on_record(&rec_machine(
+            0,
+            Some("w2"),
+            Some("1.1.1.1"),
+            Some("claude-code"),
+            Some("Windows"),
+            None,
+        ));
 
         let machines = s.machines_at(BASE_MS);
         assert_eq!(machines.len(), 1, "同一 IP 应是一台机器");
@@ -1775,12 +2124,40 @@ mod tests {
         // 被并成一台 unknown)。缺 IP 请求不建立粘滞,后续真实 IP 应各自归位到真实机器。
         let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
         // 两个不同 session,首条都缺 IP → 都落 "unknown",但不粘滞
-        s.on_record(&rec_machine(0, Some("wa"), None, Some("claude-code"), None, None));
-        s.on_record(&rec_machine(0, Some("wb"), None, Some("claude-code"), None, None));
+        s.on_record(&rec_machine(
+            0,
+            Some("wa"),
+            None,
+            Some("claude-code"),
+            None,
+            None,
+        ));
+        s.on_record(&rec_machine(
+            0,
+            Some("wb"),
+            None,
+            Some("claude-code"),
+            None,
+            None,
+        ));
         // 各自后续拿到**不同** IP → 应归位到两台不同真实机器,而非都并进 unknown
         // (用 RFC5737 文档保留段 203.0.113.0/24 / 198.51.100.0/24 作样例)
-        s.on_record(&rec_machine(1_000, Some("wa"), Some("203.0.113.13"), Some("claude-code"), None, None));
-        s.on_record(&rec_machine(1_000, Some("wb"), Some("198.51.100.185"), Some("claude-code"), None, None));
+        s.on_record(&rec_machine(
+            1_000,
+            Some("wa"),
+            Some("203.0.113.13"),
+            Some("claude-code"),
+            None,
+            None,
+        ));
+        s.on_record(&rec_machine(
+            1_000,
+            Some("wb"),
+            Some("198.51.100.185"),
+            Some("claude-code"),
+            None,
+            None,
+        ));
 
         let machines = s.machines_at(BASE_MS + 1_000);
         // 核心断言:两个不相干的真实 IP 各自独立成机器(黑洞根治)。
@@ -1792,7 +2169,10 @@ mod tests {
             ip_machines.len(),
             2,
             "两个不同真实 IP 应各自成一台机器: {:?}",
-            machines.iter().map(|m| (&m.machine_key, &m.ips)).collect::<Vec<_>>()
+            machines
+                .iter()
+                .map(|m| (&m.machine_key, &m.ips))
+                .collect::<Vec<_>>()
         );
         // 关键:没有任何一台机器把两个不相干的公网 IP 混在一起(这正是 dwgx 看到的误并)。
         for m in &machines {
@@ -1811,9 +2191,23 @@ mod tests {
         // 旧组残留没清 → session 同时出现在两台机器下、RPM 双计。这里回归该「单一归属」不变量。
         let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
         // 首条:无 IP → 落 device("claude-code")组
-        s.on_record(&rec_machine(0, Some("s1"), None, Some("claude-code"), None, None));
+        s.on_record(&rec_machine(
+            0,
+            Some("s1"),
+            None,
+            Some("claude-code"),
+            None,
+            None,
+        ));
         // 同 session 后续带真实 IP → 应迁到 IP 组,且从 device 组移除(不再两处都在)
-        s.on_record(&rec_machine(1_000, Some("s1"), Some("203.0.113.23"), Some("claude-code"), None, None));
+        s.on_record(&rec_machine(
+            1_000,
+            Some("s1"),
+            Some("203.0.113.23"),
+            Some("claude-code"),
+            None,
+            None,
+        ));
 
         let machines = s.machines_at(BASE_MS + 1_000);
         // 统计 s1 出现在几台机器下 —— 必须恰好 1 台
@@ -1822,11 +2216,15 @@ mod tests {
             .filter(|m| m.sessions.iter().any(|w| w.session_id == "s1"))
             .count();
         assert_eq!(
-            appearances, 1,
+            appearances,
+            1,
             "session s1 应只归属一台机器,不能在多台重复出现: {:?}",
             machines
                 .iter()
-                .map(|m| (&m.machine_key, m.sessions.iter().map(|w| &w.session_id).collect::<Vec<_>>()))
+                .map(|m| (
+                    &m.machine_key,
+                    m.sessions.iter().map(|w| &w.session_id).collect::<Vec<_>>()
+                ))
                 .collect::<Vec<_>>()
         );
         // 且归属到真实 IP 那台
@@ -2061,7 +2459,8 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         // 一行合法 + 一行垃圾 + 一行空行
-        let good = serde_json::to_string(&rec(0, Some(1), "m", RequestOutcome::Success, 1, 1)).unwrap();
+        let good =
+            serde_json::to_string(&rec(0, Some(1), "m", RequestOutcome::Success, 1, 1)).unwrap();
         let path = dir.join("usage-2026-07-03.jsonl");
         fs::write(&path, format!("{good}\nNOT JSON\n\n")).unwrap();
 
@@ -2134,7 +2533,12 @@ mod tests {
         let later = s.throughput_at(BASE_MS + 120_000);
         assert_eq!(later.current_rpm, 0);
         assert_eq!(later.current_tokens_per_sec, 0.0);
-        assert!(later.recent_buckets.iter().all(|b| b.requests == 0 && b.tokens == 0));
+        assert!(
+            later
+                .recent_buckets
+                .iter()
+                .all(|b| b.requests == 0 && b.tokens == 0)
+        );
 
         // 相隔恰好一整圈（60 秒）落入同一桶但 slot 不同 → 清零覆盖，不叠加旧值
         let ring_span = THROUGHPUT_BUCKETS as i64 * THROUGHPUT_BUCKET_SECS * 1000;
@@ -2157,7 +2561,10 @@ mod tests {
         );
 
         // 确定性：同输入永远同码。
-        assert_eq!(code, machine_code_of(Some("203.0.113.23"), Some("claude-code")));
+        assert_eq!(
+            code,
+            machine_code_of(Some("203.0.113.23"), Some("claude-code"))
+        );
 
         // IP 优先：有 IP 时 device 不影响码（machine_key = IP）。
         assert_eq!(
@@ -2179,9 +2586,19 @@ mod tests {
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
         )));
-        s.on_record(&rec_machine(1_000, Some("w1"), Some("203.0.113.23"), Some("claude-code"), None, None));
+        s.on_record(&rec_machine(
+            1_000,
+            Some("w1"),
+            Some("203.0.113.23"),
+            Some("claude-code"),
+            None,
+            None,
+        ));
         let machines = s.machines_at(BASE_MS + 1_000);
-        let m = machines.iter().find(|m| m.machine_key == "203.0.113.23").unwrap();
+        let m = machines
+            .iter()
+            .find(|m| m.machine_key == "203.0.113.23")
+            .unwrap();
         assert_eq!(m.machine_code, machine_code("203.0.113.23"));
     }
 
@@ -2226,8 +2643,22 @@ mod tests {
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
         )));
         // 同一 session "roam" 先后用两个 IP(DHCP/VPN 漫游)→ 合并为一台机器,ips 收两个。
-        s.on_record(&rec_machine(0, Some("roam"), Some("203.0.113.13"), Some("claude-code"), None, None));
-        s.on_record(&rec_machine(1_000, Some("roam"), Some("203.0.113.99"), Some("claude-code"), None, None));
+        s.on_record(&rec_machine(
+            0,
+            Some("roam"),
+            Some("203.0.113.13"),
+            Some("claude-code"),
+            None,
+            None,
+        ));
+        s.on_record(&rec_machine(
+            1_000,
+            Some("roam"),
+            Some("203.0.113.99"),
+            Some("claude-code"),
+            None,
+            None,
+        ));
 
         let machines = s.machines_at(BASE_MS + 1_000);
         // 该机器(粘滞主键=首个真实 IP 203.0.113.13)应收录两个漫游 IP。
@@ -2236,7 +2667,11 @@ mod tests {
             .find(|m| m.machine_key == "203.0.113.13")
             .expect("漫游应合并到首个真实 IP 机器");
         assert!(m.ips.contains(&"203.0.113.13".to_string()));
-        assert!(m.ips.contains(&"203.0.113.99".to_string()), "第二个漫游 IP 应被收录: {:?}", m.ips);
+        assert!(
+            m.ips.contains(&"203.0.113.99".to_string()),
+            "第二个漫游 IP 应被收录: {:?}",
+            m.ips
+        );
 
         // 关键:ip_codes 覆盖每个见过的 IP,且每个码 == 入口按该 IP 重算的码。
         for ip in &m.ips {
@@ -2253,7 +2688,10 @@ mod tests {
         }
         // 第二个漫游 IP 的码 ≠ 主键码(否则会误以为拉黑主键就够)。
         let second_code = m.ip_codes.iter().find(|c| c.ip == "203.0.113.99").unwrap();
-        assert_ne!(second_code.code, m.machine_code, "漫游第二 IP 的码应独立于主键码");
+        assert_ne!(
+            second_code.code, m.machine_code,
+            "漫游第二 IP 的码应独立于主键码"
+        );
     }
     /// 回归：`by_model` 对**外部可控**的模型名必须有界。
     ///
@@ -2272,7 +2710,14 @@ mod tests {
         let s = UsageStats::new(std::env::temp_dir().join("kiro_bymodel_bounded"));
         // 远超上限的不同模型名
         for i in 0..(Inner::MODEL_KEY_CAP * 2) {
-            s.on_record(&rec(i as i64 * 10, Some(1), &format!("junk-model-{i}"), RequestOutcome::Success, 1, 1));
+            s.on_record(&rec(
+                i as i64 * 10,
+                Some(1),
+                &format!("junk-model-{i}"),
+                RequestOutcome::Success,
+                1,
+                1,
+            ));
         }
         let models = s.by_model();
         assert!(
@@ -2309,11 +2754,4 @@ mod tests {
             models[0].key.chars().count()
         );
     }
-
 }
-
-
-
-
-
-

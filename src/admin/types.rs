@@ -96,6 +96,24 @@ pub struct CredentialStatusItem {
     /// 或回退 `config.defaultEndpoint`）。面板据此区分「已固定」与「自动」两种状态，
     /// 并决定「恢复自动」按钮是否可用。
     pub endpoint_pinned: bool,
+    /// 该号**实际生效**的上游 region（与 `endpoint` 同款「实际值」语义）。
+    ///
+    /// 取 `effective_upstream_region`，即真正拼进 host 的那个值
+    /// （`q.{region}.amazonaws.com` / `runtime.{region}.kiro.dev`），而**不是**
+    /// 裸的 `api_region` 字段 —— 后者可能为空并回退到别处，面板显示裸字段会
+    /// 让运维看不出真实去向。
+    ///
+    /// # 为什么必须下发
+    ///
+    /// `ksk_` 是按区授权的 token，打错区恒 403。此前本结构体**完全不含 region**，
+    /// 面板行视图只能恒显 `—`（见 credential-row.tsx 的注释：「写端点存在、读无出口」），
+    /// 于是「这个号在打哪个区」在面板上不可见 —— 探测探错了也看不出来。
+    pub effective_region: Option<String>,
+    /// 该 region 是否由用户/探测**显式写死**（凭据里有 `api_region`/`region`/`auth_region`）。
+    ///
+    /// `false` = 当前值来自 `config` 全局默认回退，即「没人真的为这个号定过区」。
+    /// 面板据此把这类号标成待确认：它们正是 region 探测缺口的受害者。
+    pub region_pinned: bool,
     /// 当前在途（in-flight）请求数（实时负载，用于观测均衡是否生效）
     pub inflight: u32,
     /// 最近 60 秒滚动窗口内的请求数（RPM 观测）
@@ -103,6 +121,15 @@ pub struct CredentialStatusItem {
     /// 用户自定义别名/备注（卡片展示优先于 email/#id）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// 分身组标识（同一次多开的全部份共享；单开为 None）。前端按它分组呈现。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clone_group: Option<String>,
+    /// 组内序号（1-based，1 = 主份），展示为「分身 #2/5」
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clone_seq: Option<u32>,
+    /// 分身标签（这一份的用途标记）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
     /// 是否正处于冷却中（429/限流/服务错误后短暂跳过）
     pub cooling_down: bool,
     /// 冷却剩余毫秒（cooling_down 为 true 时有效）
@@ -207,6 +234,69 @@ pub struct BatchDeleteResponse {
     pub results: Vec<BatchDeleteItemResult>,
 }
 
+/// 批量清理「已禁用」凭据的请求（`POST /credentials/cleanup-disabled`）。
+///
+/// 与 [`BatchDeleteRequest`] 的区别是**候选由服务端算**：调用方不传 ids，
+/// 因为「哪些号该清」的判据（代挂排除）在后端，让前端各写一份必然漂移。
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupDisabledRequest {
+    /// 只预览不真删。默认 false（真删）。
+    ///
+    /// 存在的理由：这是个**批量破坏性**操作，而候选是服务端算的 ——
+    /// 调用方若不能先看一眼将要删哪些号，就只能盲点。dry-run 与真删走
+    /// **同一段筛选**（见 `AdminService::cleanup_disabled_credentials`），
+    /// 故预览结果与真删结果同源，不存在"预览一套、实删另一套"。
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// 批量清理里被**跳过**的一条（连同原因）。
+///
+/// 只列「已禁用但被刻意排除」的号；未禁用的号根本不是候选，不出现在这里。
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupSkippedItem {
+    /// 凭据 ID
+    pub id: u64,
+    /// 跳过原因的稳定标识（前端按它做 i18n）：
+    /// - `custom_api`：代挂号（有独立 passthrough 路径，不是死号）
+    /// - `passthrough_disabled`：禁用原因是代挂专属（`PassthroughFailed`/`PassthroughOverloaded`）
+    /// - `self_healable`：禁用原因**可自愈**（`TooManyFailures`/`SuspiciousActivityAuto`/
+    ///   `TooManyRefreshFailures`），号会自己回池，删它等于拿走健康号
+    /// - `not_in_pool`：候选算出来之后该号已被别处删掉（竞态）。与 `custom_api` 分开，
+    ///   否则文案会说"这号是代挂所以没删"而真相是"它已经不在池里了"
+    /// - `over_limit`：本次超出单次上限，留给下一次调用
+    pub reason: &'static str,
+}
+
+/// 批量清理「已禁用」凭据的响应。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupDisabledResponse {
+    /// 本次是否为预览（原样回显请求的 `dryRun`，便于前端断言自己没点错）
+    pub dry_run: bool,
+    /// 池中已禁用的凭据总数 —— 取快照那一刻 `disabled == true` 的条数，**筛选与截断之前**。
+    ///
+    /// 恒等式：`disabled_total == candidates.len() + skipped.len()`。每个禁用号必然落进
+    /// 其中一个（超上限的那批是从 candidates **搬**进 skipped 的，不改总数）。
+    ///
+    /// 原注释写的是「= candidates + skipped 里**非** over_limit 的条数」，与实现不符：
+    /// over_limit 那批同样是禁用号，本来就该计入。前端拿它当"池里有多少禁用号"的分母
+    /// （配 `candidates.len()` 显示"本次能清几个"），按旧注释算会在触发上限时少算一批。
+    pub disabled_total: usize,
+    /// 本次判定「该清」的 id（dry-run 时这就是**将要**删的那批）
+    pub candidates: Vec<u64>,
+    /// 被跳过的条目及原因
+    pub skipped: Vec<CleanupSkippedItem>,
+    /// 实际删除成功条数（dry-run 恒 0）
+    pub deleted: usize,
+    /// 实际删除失败条数（dry-run 恒 0）
+    pub failed: usize,
+    /// 逐条删除结果（dry-run 为空数组）。复用批量删除的逐条形状。
+    pub results: Vec<BatchDeleteItemResult>,
+}
+
 // ============ 操作请求 ============
 /// 启用/禁用凭据请求
 #[derive(Debug, Deserialize)]
@@ -243,6 +333,20 @@ pub struct SetEndpointRequest {
     /// 端点名（如 `"ide"` / `"cli"`）。null/空串 = 清除，回到自动路由。
     #[serde(default)]
     pub endpoint: Option<String>,
+}
+
+/// 修改凭据 `apiRegion` 的请求。
+///
+/// 存在的理由：`ksk_` token 按 region 授权，打错区恒 403 且永不自愈，而此前
+/// 全仓没有任何修改它的入口（`/regions` / `/switch-region` 都是 ARN 门控）⇒
+/// api_key 号 region 错了只能删号重建。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetApiRegionRequest {
+    /// 目标 region（须在白名单内，实测只有 `us-east-1` / `eu-central-1` 真实存在）。
+    /// null/空串 = 清除，回退全局 `config.region`。
+    #[serde(default)]
+    pub api_region: Option<String>,
 }
 
 /// 修改自定义 API(代挂透传)凭据配置的请求。字段均可选:None=不改。
@@ -349,6 +453,10 @@ pub struct AddCredentialRequest {
     #[serde(default)]
     pub name: Option<String>,
 
+    /// 分身标签（可选）。多开时会复制到**每一份**上，之后可在分身管理页逐份改。
+    #[serde(default)]
+    pub tag: Option<String>,
+
     /// 入池时是否直接置为禁用态（默认 false = 启用，与旧行为一致）。
     ///
     /// 存在的理由：重新导入一个**已知被上游封禁**的号时，必须能让它以禁用态入池。
@@ -377,6 +485,71 @@ pub struct AddCredentialRequest {
     /// 故导入后应按「账号实测上限 ÷ 份数」逐号调 `rpmLimit`（面板卡片里可设，0 = 继承全局）。
     #[serde(default)]
     pub copies: Option<u32>,
+
+    /// 本次多开要用的**节点池 id 列表**（可选，按顺序分给各份）。
+    ///
+    /// 缺失 / 空数组 = 自动分配（从池里按插入顺序取全部启用节点）。
+    /// 给了就**只用这些**：第 1 个给第 1 份、第 2 个给第 2 份，以此类推；
+    /// 数量少于份数时剩下的份直连（**刻意不复用**已用过的节点——复用等于共用出口 IP）；
+    /// 多于份数时忽略多余的。
+    ///
+    /// 不存在 / 已禁用的 id 被**跳过并在响应文案里点名**，绝不静默替换成别的节点：
+    /// 静默替换会让用户以为分到了他选的那个出口，而实际出口是另一个。
+    ///
+    /// 与 `proxy_url` 的优先级：本份已显式给了 `proxy_url` 时**完全不介入**
+    /// （那是明确意图），此时 `node_ids` 只用于把无效 id 报出来。
+    #[serde(default)]
+    pub node_ids: Option<Vec<u64>>,
+
+    /// **主份**（本次新建的第 1 份）要不要也从节点池取一个出口。
+    ///
+    /// `None`（字段缺失）在本请求体上等价于 `false`：`POST /credentials` 的主份是
+    /// 用户**亲手提交的那一条**，它的出口由同一个表单里的「出口 IP」决定
+    /// （直连 / 从池中选 / 手填），池分配不该越过用户的选择去改它。
+    /// 于是缺省时池节点全部让给第 2..N 份，`copies=N` 只需 **N-1** 个节点。
+    ///
+    /// `Some(true)` = 主份也参与池分配（此时需要 **N** 个节点）。前端在
+    /// 「从池中选」+「自动分配」时下发它。
+    ///
+    /// ⚠️ 与 `proxy_url` 的优先级不变：本份已显式给了 `proxy_url` 时池完全不介入
+    /// （`pool_may_assign` 那道门在前），这个开关只在"没给代理"时才有意义。
+    ///
+    /// ⚠️ `clone_credential`（`POST /credentials/{id}/clone`）走的是**另一个默认**：
+    /// 它显式传 `Some(true)`。那条路上父号一个字节都不动，"主份"指的是本次新建的
+    /// 第 1 个分身 —— 它和第 2..N 份完全同质，没有理由独独让它裸连。
+    #[serde(default)]
+    pub assign_primary_node: Option<bool>,
+
+    /// 主份的出口**点名一个节点池 id**（上号对话框的「出口 IP → 从池中选」）。
+    ///
+    /// 为什么不复用 `node_ids[0]`：`node_ids` 的语义是「本次**只**用这些节点」，
+    /// 于是 `copies=3 + nodeIds=[X]` 会让第 2/3 份一个节点都拿不到（计划只有 1 个）。
+    /// 而对话框里那个下拉的意思只是"主份走 X"，第 2..N 份仍应从池里自动补 ——
+    /// 两种意图挤在一个字段上必然有一方被静默牺牲。
+    ///
+    /// 行为：解析成该节点的 `(url, username, password)` 写进主份（**含密码** ——
+    /// 这正是必须传 id 而不是让前端传 URL 的原因：节点密码从不下发前端），
+    /// 并把该 id 从第 2..N 份的候选里排除（否则两份共用一个出口）。
+    /// id 不存在 / 已禁用 → **400**（这是用户刚在下拉里点的东西，静默直连或静默换一个
+    /// 节点都会让他以为出口是他选的那个）。
+    ///
+    /// 与 `proxy_url` 同时给 → `proxy_url` 优先（显式 URL 是更强的意图），
+    /// 本字段被忽略。与 `assign_primary_node` 无关：给了本字段就是主份要出口。
+    #[serde(default)]
+    pub primary_node_id: Option<u64>,
+
+    /// 要求「每一份都必须拿到一个独立节点」，凑不齐就**整个请求报错**（不建任何份）。
+    ///
+    /// `None` / `false`（缺省）= 既有行为：节点不够时多出来的份直连，
+    /// 并在响应文案里如实说明。老 API 调用方与既有测试都落这一支，行为逐字不变。
+    ///
+    /// `Some(true)` = 严格模式：`需要的份数 > 计划里可用的节点数` 时返回 400，
+    /// 一份也不建。前端在「从池中选 / 自动分配」这条路上下发它 —— 用户点的是
+    /// "把这些份分散到不同出口"，凑不齐时给他一堆共用同一出口的份是**假成功**。
+    ///
+    /// 无论哪一支都**绝不复用节点**：复用等于共用出口，比直连更糟（直连至少看得出来）。
+    #[serde(default)]
+    pub require_node_per_copy: Option<bool>,
 
     /// 凭据级代理 URL（可选，特殊值 "direct" 表示不使用代理）
     pub proxy_url: Option<String>,
@@ -421,6 +594,117 @@ pub struct AddCredentialResponse {
     /// 用户邮箱（如果获取成功）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+}
+
+/// 给**池中已有**凭据再加分身的请求（`POST /credentials/{id}/clone`）。
+///
+/// 只有份数一个字段：key 由服务端按 id 自己读，**绝不经前端**。
+/// 分身管理页拿不到 `kiroApiKey` 原文（`CredentialStatusItem` 只有 `apiKeyHash`
+/// 与掩码），所以「给已有组加分身」在没有本端点时只能让用户回加号对话框重新粘 key。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloneCredentialRequest {
+    /// 本次再加几份。缺失按 1 处理；上限与 `AddCredentialRequest::copies` 同一个
+    /// 常量（`MAX_CREDENTIAL_COPIES`），超限 clamp 而不报错。
+    ///
+    /// 与 `copies` 的语义差别：这里 **1 也是有效的多开意图**（给已有号再加 1 份），
+    /// 不像 `AddCredentialRequest::copies == 1` 表示"普通上号、要走去重"。
+    #[serde(default)]
+    pub copies: Option<u32>,
+    /// 新建出来的分身要不要**立刻启用**。缺失 = `false`（建出来是**禁用**的）。
+    ///
+    /// # 为什么默认禁用（与 `AddCredentialRequest::disabled` 默认启用相反）
+    ///
+    /// 分身入池的瞬间就会被调度器选中，而它此刻**还没配好出口**：节点池不足时
+    /// 多出来的份直连（与父号共用一个出口 IP，多开的意义正好被抵消），region 继承
+    /// 也可能失手。实测事故（2026-08-05 02:42）：一次 `copies=5`，4 个分身
+    /// `apiRegion=None` → 回退 `config.region` → `ksk_` 按区授权 → 恒 403 →
+    /// **24 秒内三次失败全部被自动禁用、0% 成功**，而这 24 秒里真实用户流量正被
+    /// 发往必然失败的号。默认禁用把"检查一遍再放行"变成默认动作。
+    ///
+    /// 这个默认值**只作用于本端点**（按 id 加分身，用户就在分身管理页上盯着），
+    /// 普通上号路径（`POST /credentials`）的默认启用语义完全不动。
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// 本次要用的节点池 id 列表（可选）。语义与 [`AddCredentialRequest::node_ids`]
+    /// 完全一致，本端点只是把它原样透给同一段共享实现。
+    ///
+    /// ⚠️ 必须是 `Option` + `#[serde(default)]`：省略时要能解析成 `None`，
+    /// 否则老前端（只发 `{"copies":3}`）会 400。
+    #[serde(default)]
+    pub node_ids: Option<Vec<u64>>,
+
+    /// 本次新建的**第 1 份**要不要也从池里取节点。语义见
+    /// [`AddCredentialRequest::assign_primary_node`]，但**默认值相反**：
+    /// 本端点缺省 = `true`（第 1 份也拿）。
+    ///
+    /// # ⚠️ 「第 1 份」= 本次**新建**的首份，**不是**已存在的父号
+    ///
+    /// 这个区别是一个真实缺陷的核心。本字段无论怎么设，都**不会**给父号分配节点 ——
+    /// 它只决定「新建的 N 份里，第 1 份要不要也去消费一个池节点」。
+    ///
+    /// 于是会出现这样的形态（线上实测）：`#776` 是原始导入的号（无 `cloneGroup`、无代理），
+    /// `#778–787` 是从它克隆的 10 份、各有独立 SOCKS ⇒ **11 份共用一个上游账号，
+    /// 10 份走独立 IP、1 份走服务器裸 IP**。代理存在的意义（每凭据独立出口）在那一份上是空的，
+    /// 而它在分身管理页上看起来和别的份一样。
+    ///
+    /// 处置是**只告警、不改配置**（用户拍板）：`add_credential_with_intent` 末尾按
+    /// **key** 查同账号成员，发现无独立出口者就把 id 写进响应 `message`，
+    /// 但绝不给它写 `proxy_url` —— 那是用户的显式配置，「直连」也可能是刻意留的对照。
+    /// 判据必须按 key 而非按 `cloneGroup`：父号恰恰是那个没有组标识的。
+    ///
+    /// # 为什么这条路的默认是 true
+    ///
+    /// 本端点**从不碰父号的代理/启用状态**（只 `export_credential` 读它；组标识回填是
+    /// 唯一的例外，理由见 service 层那段注释），建出来的 N 份全是新条目、
+    /// `proxy_*` 全空、彼此完全同质。此时把第 1 份排除在池分配之外没有任何依据，
+    /// 只会让它裸连而池里空着一个节点 —— 那正是 2026-08-05 修掉的缺陷
+    /// （实测：池里 5 个全启用、`copies=4`，只有第 2/3/4 份拿到节点，主份裸连、两个节点闲置）。
+    ///
+    /// 于是「升级后行为不变」在这条路上=保持 true。缺省 `None` 在 service 层被解读成
+    /// `true`，**不是**裸 `#[serde(default)]` 的 false —— 后者会让老前端
+    /// （只发 `{"copies":3}`）静默退回那个已修掉的缺陷。
+    #[serde(default)]
+    pub assign_primary_node: Option<bool>,
+
+    /// 严格模式：凑不齐「每份一个独立节点」就整个请求报错。语义与默认值均同
+    /// [`AddCredentialRequest::require_node_per_copy`]（缺省 = 宽松，行为不变）。
+    #[serde(default)]
+    pub require_node_per_copy: Option<bool>,
+
+    /// 建完分身后，把**被克隆的那个主份**（本请求路径上的 `{id}`）一并删掉。
+    /// 缺省 / `false` = 保留主份，只追加分身（**行为不变**）。
+    ///
+    /// # 两种语义（用户 2026-08-05 拍板的那个勾选框）
+    ///
+    /// - 不勾（缺省）：主份留在池里，本次新建的 N 份是**追加**的分身。组内共 1+N 份，
+    ///   其中主份没有独立出口（本端点从不碰它的 `proxy_*`）。
+    /// - 勾上：先建 N 份（每份各自从节点池取出口），再把主份删掉。组内共 **N 份且彼此
+    ///   完全同质** —— 没有"那一份裸连的主份"，也就没有它把整组账号关联度拉满的问题。
+    ///   `cloneSeq === 1` 的那一份自然顶替主份角色（前端按 seq 升序取首个成员）。
+    ///
+    /// # 顺序是「先建后删」而不是用户原话里的「先删后建」
+    ///
+    /// 用户原话是「先给选择的凭据删掉 然后一下创建」，**实现刻意反过来**，两个理由：
+    ///
+    /// 1. 删了主份就读不到它了。共享实现按 key 从池中同 key 既有号继承
+    ///    `apiRegion` / `authRegion` / `subscriptionTitle` / `cloneGroup`
+    ///    （`find_credential_by_api_key`）—— 主份是**唯一**的继承源。先删 ⇒ 继承全空 ⇒
+    ///    `apiRegion=None` ⇒ 回退 `config.region` ⇒ `ksk_` 按区授权 ⇒ 恒 403。
+    ///    那正是 2026-08-05 02:42 那次「4 个分身 24 秒内全部被自动禁用、0% 成功」的成因。
+    /// 2. 失败方向不同。先建后删：建失败 ⇒ 主份**一字节未动**（用户什么也没丢）；
+    ///    删失败 ⇒ 分身在、主份也在，等价于"没勾"的形态，响应里点名让用户手工删。
+    ///    先删后建则相反 —— 建失败就把用户唯一那份凭据弄没了（虽在回收站，但池里已空）。
+    ///
+    /// 终态与用户要的完全一致（N 份同质、主份不留），只有中间顺序不同。
+    ///
+    /// # 删除是软删
+    ///
+    /// 走 `delete_credential_forced(id, true)` ⇒ 进**回收站**可恢复。`force` 只跳过
+    /// 「必须先禁用」那道误删护栏（主份通常正在服务中，不 force 会被挡住），
+    /// **不**跳过回收站。
+    #[serde(default)]
+    pub replace_primary: Option<bool>,
 }
 
 // ============ 余额查询 ============
@@ -651,6 +935,18 @@ pub struct ConfigSnapshotResponse {
     pub extract_thinking: bool,
     /// Claude Code 自动切缓冲协议（识别到 CC 请求时 /v1 流式自动走 buffered，准确 input_tokens）
     pub cc_auto_buffer: bool,
+    /// 批量推号入口 POST /api/import/keys 是否启用（默认开；关掉即对两个挂载点一起返 403）
+    pub import_keys_enabled: bool,
+    /// 分身凭据在请求未显式指定 `enabled` 时是否默认启用（默认 **关**）。
+    /// 只影响 `POST /credentials/{id}/clone` 的缺省取值，显式请求值恒优先。
+    pub clone_default_enabled: bool,
+    /// 上游 429 吸收层：总开关 / 总预算秒 / 最大额外轮次 / 退避下限毫秒 / 退避上限秒 / 是否吸收 403 风控
+    pub upstream_retry_absorb_enabled: bool,
+    pub upstream_retry_absorb_budget_secs: u64,
+    pub upstream_retry_absorb_max_rounds: u32,
+    pub upstream_retry_absorb_min_delay_ms: u64,
+    pub upstream_retry_absorb_max_delay_secs: u64,
+    pub upstream_retry_absorb_suspended: bool,
     /// 是否把估算的 prompt cache 记账下发给客户端（估算值，上游不提供真值）
     pub prompt_cache_enabled: bool,
     /// 是否剥离转发给上游的 system 环境噪音（省 token / 提缓存命中 / 降关联，立即生效）
@@ -672,6 +968,13 @@ pub struct ConfigSnapshotResponse {
     /// credentials.json / trash.json at-rest 加密开关（机器绑定密钥，立即生效，默认关）
     pub encrypt_credentials_at_rest: bool,
     pub cooldown_enabled: bool,
+    /// 账户级 403 风控连续 N 次零成功后是否自动禁用该号。默认开。
+    ///
+    /// ⚠️ 此前该字段**只存在于 config.json**，既不在本响应里、也不在更新请求里、
+    /// 也没有 TIER1 热更分支 —— 于是面板既看不到也改不了它，只能手改文件 + 重启。
+    /// 线上曾出现「三个自动禁用开关被直连 API 关掉」，而这一项其实改不到，
+    /// 排查时会得出错误结论。
+    pub auto_disable_suspicious: bool,
     /// 全池冷却快速失败:全池都在冷却时立即返回 429+Retry-After 让客户端退避(而非网关内硬扛短等)。默认开。
     pub all_cooling_fast_fail: bool,
     pub rate_limit_enabled: bool,
@@ -703,8 +1006,32 @@ pub struct ConfigSnapshotResponse {
     pub inbound_queue_max_wait_secs: u32,
     /// 入站排队超时后是否放行(默认 true)而非返回 429。单号/高 RPM 不流通根治。
     pub inbound_queue_timeout_passthrough: bool,
-    /// 当前实时目标 RPM(自动挡下动态,只读展示)
+    /// 当前实时**目标** RPM(自动挡下动态,只读展示)
+    ///
+    /// ⚠️ 名字里的 "current" 指「当前生效的目标值」，**不是实测吞吐**。
+    /// 实测吞吐是 [`Self::inbound_observed_rpm`]。这两个字段曾经是同一个值 ——
+    /// `service.rs` 把本字段接成 `inbound_target_rpm()`，于是面板"当前 RPM"恒等于
+    /// "目标 RPM"，2026-08-06 实测面板显示 500 而客户端实际只有 50~70，差一个数量级，
+    /// 运维据此做过两次限流分析。**要改本字段语义前先读 `throttle.rs` 的 `ObservedRate`。**
     pub inbound_current_rpm: u32,
+    /// 最近 60 秒**实测**入站 RPM（客户端请求数，不含 failover 重试）。
+    ///
+    /// 与 [`Self::inbound_observed_upstream_rpm`] 的差值即重试放大倍数
+    /// （2026-08-06 实测 4.59×）。三个数必须并排看才有意义：
+    /// `target`（整形闸门）/ `observed`（客户端真实速率）/ `upstream`（逐号之和）。
+    #[serde(default)]
+    pub inbound_observed_rpm: u32,
+    /// 逐号 RPM 之和 = 上游实际承受的尝试速率（**含 failover 重试**）。
+    ///
+    /// 量纲与 `inbound_observed_rpm` 不同：整形层在 failover 循环**之外**每客户端请求
+    /// 取 1 个令牌，而逐号 `RpmTracker` 在**选号时**记账 ⇒ 每次 failover 尝试各记一次。
+    /// 所以 `inboundTargetRpm=500` 实际允许约 500×放大倍数 的上游 RPM ——
+    /// 这是"设了 500 却压不住 429"的原因，别把两者当同一个量比较。
+    #[serde(default)]
+    pub inbound_observed_upstream_rpm: u32,
+    /// 累计放行的客户端请求数（用于对账滑窗是否在滚动；滑窗恒 0 而它在涨 = 滑窗坏了）。
+    #[serde(default)]
+    pub inbound_admitted_total: u64,
     /// 余额加权分流（默认开）：同档内按剩余额度微调选号，长期拉平号池余额
     pub balance_weight_enabled: bool,
     /// 余额加权 FLOOR（整百分比 0..100，50=因子下限 0.5，越小余额影响越强）
@@ -768,6 +1095,16 @@ pub struct UpdateConfigRequest {
     pub default_endpoint: Option<String>,
     pub extract_thinking: Option<bool>,
     pub cc_auto_buffer: Option<bool>,
+    pub import_keys_enabled: Option<bool>,
+    /// 分身默认启用（立即生效：存盘后 reload_config 换入 ArcSwap，下一次 clone 即读到）。
+    pub clone_default_enabled: Option<bool>,
+    /// 上游 429 吸收层六项（立即生效：存盘后 reload_config 换入 ArcSwap，下一个请求即读到）
+    pub upstream_retry_absorb_enabled: Option<bool>,
+    pub upstream_retry_absorb_budget_secs: Option<u64>,
+    pub upstream_retry_absorb_max_rounds: Option<u32>,
+    pub upstream_retry_absorb_min_delay_ms: Option<u64>,
+    pub upstream_retry_absorb_max_delay_secs: Option<u64>,
+    pub upstream_retry_absorb_suspended: Option<bool>,
     /// 是否把**估算的** cache_read/cache_creation 下发给客户端（详见 config 同名字段）。
     /// 关闭时字段整体缺失而非置 0——两者对客户端语义不同。
     pub prompt_cache_enabled: Option<bool>,
@@ -783,6 +1120,8 @@ pub struct UpdateConfigRequest {
     /// credentials.json / trash.json at-rest 加密开关。开启后下次 persist 把明文重写为密文(透明迁移)。
     pub encrypt_credentials_at_rest: Option<bool>,
     pub cooldown_enabled: Option<bool>,
+    /// 账户级 403 风控自动禁用开关（见响应结构注释）。TIER1 热更。
+    pub auto_disable_suspicious: Option<bool>,
     /// 全池冷却快速失败开关(见响应结构注释)。
     pub all_cooling_fast_fail: Option<bool>,
     pub rate_limit_enabled: Option<bool>,
@@ -956,6 +1295,162 @@ pub struct ImportKeyItem {
     pub endpoint: Option<String>,
     /// 是否导入后立即置禁用态
     pub disabled: bool,
+    /// 推号方声明的授权 region（`apiRegion` / `region` 任一键，可选）。
+    ///
+    /// # 为什么必须收下它
+    ///
+    /// `ksk_` token 是**按 region 授权**的：打错区上游恒 403（实测同一把 key
+    /// 在 `eu-central-1` 98.9% 成功、在 `us-east-1` **100% 403**，见
+    /// `kiro::region_probe` 模块文档的对照表）。
+    ///
+    /// 此前本结构体只有 `key`/`endpoint`/`disabled` 三个字段，推号方**明明带了**
+    /// `apiRegion` 也会被静默丢弃，于是每个号都必须靠上号时的自动探测去猜——
+    /// 那是一次真实上游往返，且探测本身还可能探错。收下已知值 = 直接跳过探测、
+    /// 且比探测更权威（推号方知道这把 key 注册在哪）。
+    ///
+    /// `None` = 推号方没说 → 保持既有行为，交给 `probe_and_persist_api_region` 探。
+    pub api_region: Option<String>,
+}
+
+/// 代理节点的**对外视图**：`password` 恒不外传，只给 `has_password`。
+///
+/// 单列一个类型而不是复用 `SocksNode` + `skip_serializing`：后者一旦有人给
+/// `SocksNode` 加 `Serialize` 的新字段就可能把密码带出去，而这里是白名单式的。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SocksNodeView {
+    pub id: u64,
+    pub name: String,
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// 是否设了密码（**密码本身绝不外传**）
+    pub has_password: bool,
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_test: Option<crate::kiro::model::socks_node::SocksNodeTest>,
+    pub created_at: u64,
+    /// 前端展示标签（name 优先，空则回落 url）
+    pub label: String,
+    /// 已绑在这个节点上的凭据数（**启发式**：按 `proxy_url` 字符串比对，
+    /// 见 `MultiTokenManager::proxy_url_usage`）。
+    ///
+    /// 前端用它做两件事：节点下拉里显示「已挂 N 个」、以及「自动分配」按钮的排序主键
+    /// （少的优先）—— 这两处必须与后端 `resolve_node_plan` 的自动分配同一个排序口径，
+    /// 否则用户在下拉里看到的推荐顺序与实际分到的节点不一致。
+    ///
+    /// 手工填过代理的号可能因 scheme 未归一而漏算（偏低）。漏算方向是安全的：
+    /// 顶多把一个已被占的节点当空闲，而那正是节点不足时的既有行为。
+    #[serde(default)]
+    pub bound_credentials: usize,
+}
+
+impl SocksNodeView {
+    /// `bound` = 该节点 url 上已挂的凭据数（调用方从
+    /// `MultiTokenManager::proxy_url_usage` 里查，那张表一次算好复用给全部节点）。
+    pub fn from_node(n: &crate::kiro::model::socks_node::SocksNode, bound: usize) -> Self {
+        Self {
+            id: n.id,
+            name: n.name.clone(),
+            url: n.url.clone(),
+            username: n.username.clone(),
+            has_password: n.password.as_ref().is_some_and(|p| !p.is_empty()),
+            enabled: n.enabled,
+            last_test: n.last_test.clone(),
+            created_at: n.created_at,
+            label: n.display_label().to_string(),
+            bound_credentials: bound,
+        }
+    }
+}
+
+/// 新建/更新代理节点请求。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SocksNodeUpsertRequest {
+    /// None = 新建；Some = 更新（id 不存在时 404，**不静默新建**）
+    #[serde(default)]
+    pub id: Option<u64>,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// `socks5://host:port` 等。内嵌账密会被拆出，不留在 url 里。
+    pub url: String,
+    #[serde(default)]
+    pub username: Option<String>,
+    /// ⚠️ **省略该键 = 不改密码**；`""` = 清空。
+    /// 绝不能改成必填 —— 那样改个节点名就会把密码抹掉，已绑该节点的分身全部掉线。
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+/// 批量导入代理节点：整段粘贴节点商发的文档。
+///
+/// 存在的理由：节点商下发的是 `socks://base64(user:pass)@host:port#name` 分享链接，
+/// 且通常混在一份含标题/分隔线/`端口: 40002`/curl 示例的文档里，同一节点还会出现两次
+/// （「整段复制」区 + 「逐台明细」区）。逐条手填 5 台机 = 25 个字段，且极易把
+/// base64 串当成用户名填进去（那会让认证失败长得像"节点不通"）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SocksNodeBulkImportRequest {
+    /// 整段文本。逐行解析，非链接行安静跳过，按 url 去重。
+    pub text: String,
+    /// 导入后是否直接启用。**默认 false** —— 与「生成分身时是否全部默认启用」同一原则：
+    /// 新导入的节点还没测活，直接参与分配会把没验证过的出口塞给分身。
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// 批量导入代理节点的结果：四个聚合计数 + 逐行明细。
+///
+/// # 🔴 兼容性
+///
+/// 四个聚合字段是**旧客户端唯一读的东西**（`added` / `skipped` / `duplicate` /
+/// `overCapacity`），必须逐字保留。`items` 是新增的，旧前端会忽略它。
+/// 新前端读 `items` 做逐行展示，但也要容忍它缺失（`#[serde(default)]` 在 TS 侧
+/// 对应 `items?`），因为面板与二进制可能不同版本（OTA 只换二进制不换浏览器缓存）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SocksNodeBulkImportOutcome {
+    /// 真正落库的条数。
+    pub added: usize,
+    /// 被跳过的行数 = 非链接行 + 地址被策略拒绝的行。
+    /// ⚠️ 含义比字面宽（两类混在一起），精确归因看 `items`。
+    pub skipped: usize,
+    /// 因重复而未导入（已在池中 **或** 同一次粘贴内重复）。
+    pub duplicate: usize,
+    /// 因超出节点数上限而未导入。
+    pub over_capacity: usize,
+    /// 逐行明细。安静跳过的行（标题/分隔线/说明文字）**不在内** ——
+    /// 一份节点商文档里那类行有几十条，全列出来会把真正要看的几行埋掉。
+    #[serde(default)]
+    pub items: Vec<SocksNodeBulkImportItem>,
+}
+
+/// 批量导入的逐行结果。
+///
+/// `status` / `reason` 都是**稳定字符串码**，译文由前端查 i18n ——
+/// 后端返回中文会让面板的语言切换对这段文案无效（其余 Admin API 同口径）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SocksNodeBulkImportItem {
+    /// 原始行号（1 起，与用户粘的文本对齐）。
+    pub lineno: usize,
+    /// 原文，**密码已脱敏**（这份响应会进浏览器 devtools 与反代 access log）。
+    pub raw: String,
+    /// `ok` | `duplicate` | `invalid` | `over_capacity`
+    pub status: String,
+    /// 原因码：`dup_in_paste` / `already_in_pool` / `address_rejected` /
+    /// `over_capacity` / 或解析层的 `bad_port` `bad_host` `no_host_port` `ambiguous`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// 解析出的 `scheme://host:port`（解析失败为 None）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    /// 解析出的用户名（**密码恒不外传**）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
 }
 
 /// 批量导入请求（归一化后的内部表示）。
@@ -1107,10 +1602,22 @@ pub fn parse_import_keys_request(body: &serde_json::Value) -> Result<ImportKeysR
                 .get("disabled")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            // `apiRegion` 优先，回落 `region`：两个键在生态里都有人用
+            // （kiro-accounting 导出用 `region`，本仓面板用 `apiRegion`）。
+            // 不做 region 白名单校验：那是 `add_credential` 的职责，在这里报 400
+            // 会让一条坏 region 把整批导入打回。非法值到下游会被忽略并回落探测。
+            let api_region = item
+                .get("apiRegion")
+                .or_else(|| item.get("region"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
             items.push(ImportKeyItem {
                 key: key.to_string(),
                 endpoint,
                 disabled,
+                api_region,
             });
         }
         items
@@ -1130,6 +1637,7 @@ pub fn parse_import_keys_request(body: &serde_json::Value) -> Result<ImportKeysR
                 key: key.to_string(),
                 endpoint: None,
                 disabled: false,
+                api_region: None,
             });
         }
         items
@@ -1140,11 +1648,19 @@ pub fn parse_import_keys_request(body: &serde_json::Value) -> Result<ImportKeysR
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        // 格式 3/4：单个 Key
+        // 格式 3/4：单个 Key。顶层 `apiRegion`/`region` 同样收下（与格式 1 同口径）。
+        let api_region = obj
+            .get("apiRegion")
+            .or_else(|| obj.get("region"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         vec![ImportKeyItem {
             key: key.to_string(),
             endpoint: None,
             disabled: false,
+            api_region,
         }]
     } else {
         return Err(
@@ -1241,12 +1757,57 @@ mod tests {
     /// items[] 的可选字段生效：endpoint 固定 + disabled=true。
     #[test]
     fn import_items_optional_fields_apply() {
-        let req = parse(r#"{"items":[{"key":"ksk_abcdefgh1234","endpoint":"cli","disabled":true}]}"#)
-            .expect("可选字段应解析成功");
+        let req =
+            parse(r#"{"items":[{"key":"ksk_abcdefgh1234","endpoint":"cli","disabled":true}]}"#)
+                .expect("可选字段应解析成功");
         assert_eq!(req.items[0].endpoint.as_deref(), Some("cli"));
         assert!(req.items[0].disabled);
         // 未提交 concurrencyLimit → None（响应回显 null）
         assert_eq!(req.concurrency_limit, None);
+    }
+
+    /// ⭐ 承重：推号方带的 `apiRegion` / `region` 必须被收下，不能静默丢弃。
+    ///
+    /// 回退即 FAIL。`ksk_` 是按区授权的 token（打错区恒 403，实测同一把 key
+    /// eu-central-1 98.9% 成功 / us-east-1 100% 403）。此前 `ImportKeyItem` 只有
+    /// `key`/`endpoint`/`disabled`，推号方**明明给了** region 也会被丢 → 每个号都得
+    /// 靠上号时的自动探测去猜（一次真实上游往返，且可能探错）。
+    #[test]
+    fn import_carries_api_region_from_pusher() {
+        // apiRegion 键
+        let req = parse(r#"{"items":[{"key":"ksk_abcdefgh1234","apiRegion":"us-east-1"}]}"#)
+            .expect("apiRegion 应被解析");
+        assert_eq!(
+            req.items[0].api_region.as_deref(),
+            Some("us-east-1"),
+            "推号方给的 apiRegion 必须收下，否则只能靠探测猜"
+        );
+
+        // region 键（kiro-accounting 导出用这个名字）→ 同样接受
+        let req = parse(r#"{"items":[{"key":"ksk_abcdefgh1234","region":"eu-central-1"}]}"#)
+            .expect("region 应被解析");
+        assert_eq!(req.items[0].api_region.as_deref(), Some("eu-central-1"));
+
+        // apiRegion 优先于 region（两个都给时）
+        let req = parse(
+            r#"{"items":[{"key":"ksk_abcdefgh1234","apiRegion":"us-east-1","region":"eu-central-1"}]}"#,
+        )
+        .expect("两键同时存在应解析");
+        assert_eq!(req.items[0].api_region.as_deref(), Some("us-east-1"));
+
+        // 单 Key 格式（格式 3/4）的顶层 apiRegion 同样收下
+        let req = parse(r#"{"apiKey":"ksk_abcdefgh1234","apiRegion":"us-east-1"}"#)
+            .expect("单 Key 格式应解析 apiRegion");
+        assert_eq!(req.items[0].api_region.as_deref(), Some("us-east-1"));
+
+        // 没给 → None（保持既有行为，交给自动探测）
+        let req = parse(r#"{"items":[{"key":"ksk_abcdefgh1234"}]}"#).expect("无 region 应解析");
+        assert!(req.items[0].api_region.is_none());
+
+        // 空串视为没给（不写进凭据，避免空 region 拼坏 host）
+        let req = parse(r#"{"items":[{"key":"ksk_abcdefgh1234","apiRegion":"  "}]}"#)
+            .expect("空 region 应解析");
+        assert!(req.items[0].api_region.is_none());
     }
 
     /// 格式 2（旧）：keys 字符串数组。
@@ -1256,7 +1817,11 @@ mod tests {
             .expect("keys 格式应解析成功");
         assert_eq!(req.items.len(), 2);
         assert_eq!(req.items[1].key, "ksk_zyxwvuts9876");
-        assert!(req.items.iter().all(|i| i.endpoint.is_none() && !i.disabled));
+        assert!(
+            req.items
+                .iter()
+                .all(|i| i.endpoint.is_none() && !i.disabled)
+        );
     }
 
     /// 格式 3（旧）：单个 apiKey。
@@ -1302,8 +1867,14 @@ mod tests {
     #[test]
     fn import_rejects_malformed_bodies() {
         assert!(parse(r#"{"items":"ksk_x"}"#).is_err(), "items 非数组应拒绝");
-        assert!(parse(r#"{"items":[{"groups":[]}]}"#).is_err(), "缺 key 应拒绝");
-        assert!(parse(r#"{"items":[{"key":"  "}]}"#).is_err(), "空白 key 应拒绝");
+        assert!(
+            parse(r#"{"items":[{"groups":[]}]}"#).is_err(),
+            "缺 key 应拒绝"
+        );
+        assert!(
+            parse(r#"{"items":[{"key":"  "}]}"#).is_err(),
+            "空白 key 应拒绝"
+        );
         assert!(parse(r#"{"items":[]}"#).is_err(), "空 items 应拒绝");
         assert!(parse(r#"{"foo":1}"#).is_err(), "无可识别字段应拒绝");
         assert!(parse(r#"[]"#).is_err(), "非对象体应拒绝");
@@ -1321,7 +1892,10 @@ mod tests {
         assert_eq!(mask_import_key("ksk_12345678"), "***");
         assert_eq!(mask_import_key(""), "***");
         // 非 ASCII 也按 char 切，不会 panic
-        assert_eq!(mask_import_key("密钥密钥密钥密钥密钥密钥密"), "密钥密钥密钥密钥…钥密钥密");
+        assert_eq!(
+            mask_import_key("密钥密钥密钥密钥密钥密钥密"),
+            "密钥密钥密钥密钥…钥密钥密"
+        );
     }
 
     /// 部分失败：total/imported/failed 由逐条结果汇总，失败条目带 error 且 key 脱敏。
@@ -1334,7 +1908,11 @@ mod tests {
     #[test]
     fn import_response_exposes_external_compat_fields() {
         let results = vec![
-            ImportKeyResult { ok: true, key: mask_import_key("ksk_1234567890abcdef"), error: None },
+            ImportKeyResult {
+                ok: true,
+                key: mask_import_key("ksk_1234567890abcdef"),
+                error: None,
+            },
             ImportKeyResult {
                 ok: false,
                 key: mask_import_key("ksk_zyxwvutsrq987654"),
@@ -1343,8 +1921,15 @@ mod tests {
         ];
         let resp = build_import_response(results, Some(100), 42);
 
-        assert!(resp.success, "success 恒 true——真正的失败走 4xx/5xx 不会到这里");
-        assert_eq!(resp.items.len(), resp.results.len(), "items 是 results 的别名");
+        assert!(
+            resp.success,
+            "success 恒 true——真正的失败走 4xx/5xx 不会到这里"
+        );
+        assert_eq!(
+            resp.items.len(),
+            resp.results.len(),
+            "items 是 results 的别名"
+        );
         for (a, b) in resp.items.iter().zip(resp.results.iter()) {
             assert_eq!(a.ok, b.ok);
             assert_eq!(a.key, b.key);
@@ -1354,7 +1939,10 @@ mod tests {
         let s = serde_json::to_string(&resp).expect("序列化应成功");
         assert!(s.contains("\"success\":true"), "缺 success 字段");
         assert!(s.contains("\"items\":["), "缺 items 字段");
-        assert!(s.contains("\"results\":["), "results 必须保留，本仓前端在读它");
+        assert!(
+            s.contains("\"results\":["),
+            "results 必须保留，本仓前端在读它"
+        );
         assert!(s.contains("\"total\":2"));
         assert!(s.contains("\"imported\":1"));
         assert!(s.contains("\"failed\":1"));
@@ -1414,6 +2002,220 @@ mod tests {
         assert!(s.contains("{\"ok\":true,\"key\":\"ksk_1234…cdef\"}"));
     }
 
+    /// 全字段占位夹具：`ConfigSnapshotResponse` 无 `Default` impl（每次都由
+    /// `build_config_snapshot` 从 config 逐字段构造），而线协议契约测试只关心键名，
+    /// 故用本夹具填满其余字段，被测的六项由调用方覆盖。
+    fn absorb_snapshot_fixture() -> ConfigSnapshotResponse {
+        ConfigSnapshotResponse {
+            server_version: "x".into(),
+            host: "x".into(),
+            port: 0,
+            region: "x".into(),
+            kiro_version: "x".into(),
+            system_version: "x".into(),
+            node_version: "x".into(),
+            tls_backend: "x".into(),
+            load_balancing_mode: "x".into(),
+            default_endpoint: "x".into(),
+            endpoint_names: vec![],
+            extract_thinking: false,
+            cc_auto_buffer: false,
+            import_keys_enabled: true,
+            clone_default_enabled: false,
+            upstream_retry_absorb_enabled: false,
+            upstream_retry_absorb_budget_secs: 0,
+            upstream_retry_absorb_max_rounds: 0,
+            upstream_retry_absorb_min_delay_ms: 0,
+            upstream_retry_absorb_max_delay_secs: 0,
+            upstream_retry_absorb_suspended: false,
+            prompt_cache_enabled: false,
+            strip_env_noise: false,
+            tool_clean_leaked_tokens: false,
+            tool_reclaim_textified_invoke: false,
+            tool_stray_repeat_guard: false,
+            tool_stream_align_failure: false,
+            tool_expose_error_to_client: false,
+            tool_repair_json: false,
+            tool_truncation_recovery: false,
+            tool_description_max_chars: 0,
+            encrypt_credentials_at_rest: false,
+            cooldown_enabled: false,
+            auto_disable_suspicious: false,
+            all_cooling_fast_fail: false,
+            rate_limit_enabled: false,
+            rate_limit_daily_max: 0,
+            rate_limit_min_interval_ms: 0,
+            affinity_enabled: false,
+            priority_in_balanced: false,
+            credential_rpm_limit: 0,
+            rpm_headroom_factor: 0,
+            rpm_reserve_slots: 0,
+            rpm_hard_gate_overload_wait: false,
+            cooldown_scale_pct: 0,
+            rate_limit_jitter_pct: 0,
+            inbound_throttle_enabled: false,
+            inbound_rpm_auto: false,
+            inbound_target_rpm: 0,
+            inbound_rpm_min: 0,
+            inbound_rpm_max: 0,
+            inbound_burst_secs: 0,
+            inbound_queue_max_wait_secs: 0,
+            inbound_queue_timeout_passthrough: false,
+            inbound_current_rpm: 0,
+            inbound_observed_rpm: 0,
+            inbound_observed_upstream_rpm: 0,
+            inbound_admitted_total: 0,
+            balance_weight_enabled: false,
+            balance_weight_floor: 0,
+            health_429_weight_enabled: false,
+            has_proxy: false,
+            proxy_url: None,
+            has_admin_key: false,
+            has_api_key: false,
+            callback_mode: "x".into(),
+            callback_base_url: None,
+            cors_allowed_origins: vec![],
+            ip_allowlist: vec![],
+            ip_blocklist: vec![],
+            machine_code_blocklist: vec![],
+            trust_forwarded_header: false,
+            ingress_rate_limit_per_min: 0,
+            max_body_bytes: 0,
+            proactive_token_refresh: false,
+            token_refresh_lead_minutes: 0,
+            token_refresh_interval_secs: 0,
+            login_background_enabled: false,
+            login_background_r18: false,
+            balance_refresh_interval_secs: 0,
+            collect_client_fingerprint: false,
+            config_path: None,
+        }
+    }
+
+    /// ⭐ 线协议契约：吸收层六项必须以**精确的 camelCase 名**上下行。
+    ///
+    /// 回退即 FAIL：改任一字段名（或去掉 `rename_all = "camelCase"`），断言失败。
+    ///
+    /// 为什么值得单列一条：前端按这些字符串读写（`admin-ui/src/types/api.ts` /
+    /// `settings-page.tsx`）。名字对不上时**没有任何编译错误、也没有运行时报错** ——
+    /// 快照里那个键就是 `undefined`，开关渲染成"关"、用户点开保存后后端收到的是 `None`
+    /// 从而什么也不改。表现为"面板上这个开关点了没反应"，是最难排的一类问题。
+    #[test]
+    fn absorb_fields_use_exact_camel_case_on_the_wire() {
+        let snap = ConfigSnapshotResponse {
+            server_version: "0".into(),
+            host: "127.0.0.1".into(),
+            port: 8080,
+            region: "us-east-1".into(),
+            kiro_version: "0".into(),
+            system_version: "s".into(),
+            node_version: "n".into(),
+            tls_backend: "rustls".into(),
+            load_balancing_mode: "priority".into(),
+            default_endpoint: "ide".into(),
+            endpoint_names: vec![],
+            upstream_retry_absorb_enabled: true,
+            upstream_retry_absorb_budget_secs: 45,
+            upstream_retry_absorb_max_rounds: 3,
+            upstream_retry_absorb_min_delay_ms: 150,
+            upstream_retry_absorb_max_delay_secs: 15,
+            upstream_retry_absorb_suspended: false,
+            ..absorb_snapshot_fixture()
+        };
+        let s = serde_json::to_string(&snap).expect("序列化应成功");
+        for (key, val) in [
+            ("upstreamRetryAbsorbEnabled", "true"),
+            ("upstreamRetryAbsorbBudgetSecs", "45"),
+            ("upstreamRetryAbsorbMaxRounds", "3"),
+            ("upstreamRetryAbsorbMinDelayMs", "150"),
+            ("upstreamRetryAbsorbMaxDelaySecs", "15"),
+            ("upstreamRetryAbsorbSuspended", "false"),
+        ] {
+            let expect = format!("\"{key}\":{val}");
+            assert!(
+                s.contains(expect.as_str()),
+                "快照必须含 {expect}；前端按这个字符串读，名字不符时那个键是 undefined、\
+                 开关永远显示关且改不动，且无任何编译/运行时报错。实际: {s}"
+            );
+        }
+
+        // 入向同理：前端提交的 camelCase 必须能反序列化进对应字段。
+        let req: UpdateConfigRequest = serde_json::from_str(
+            r#"{"upstreamRetryAbsorbEnabled":true,"upstreamRetryAbsorbBudgetSecs":30,
+                "upstreamRetryAbsorbMaxRounds":2,"upstreamRetryAbsorbMinDelayMs":200,
+                "upstreamRetryAbsorbMaxDelaySecs":9,"upstreamRetryAbsorbSuspended":true}"#,
+        )
+        .expect("前端 camelCase 请求体必须能反序列化");
+        assert_eq!(req.upstream_retry_absorb_enabled, Some(true));
+        assert_eq!(req.upstream_retry_absorb_budget_secs, Some(30));
+        assert_eq!(req.upstream_retry_absorb_max_rounds, Some(2));
+        assert_eq!(req.upstream_retry_absorb_min_delay_ms, Some(200));
+        assert_eq!(req.upstream_retry_absorb_max_delay_secs, Some(9));
+        assert_eq!(req.upstream_retry_absorb_suspended, Some(true));
+
+        // 缺字段（旧前端 / 只改别的设置）必须全 None，绝不能被当成"要改成 false/0"。
+        let empty: UpdateConfigRequest =
+            serde_json::from_str("{}").expect("空请求体必须能反序列化");
+        assert_eq!(empty.upstream_retry_absorb_enabled, None);
+        assert_eq!(empty.upstream_retry_absorb_budget_secs, None);
+        assert_eq!(empty.upstream_retry_absorb_suspended, None);
+    }
+
+    /// ⭐ 分身三字段的线上契约：`CredentialStatusItem` 的
+    /// `clone_group` / `clone_seq` / `tag` 必须带 `skip_serializing_if`。
+    ///
+    /// 用源码断言而非构造实例：该结构体有 39 个字段且不派生 `Default`，
+    /// 手搓 fixture 会在别的会话加字段时立刻编译失败（与被测契约无关的脆性）。
+    ///
+    /// 回退即 FAIL：删掉任一 `skip_serializing_if` → **每个**单开号的响应里
+    /// 都会多出 `"cloneGroup":null,"cloneSeq":null,"tag":null`。
+    /// 前端 `groupClones` 用 `if (!it.cloneGroup) continue` 过滤，功能上恰好仍对，
+    /// 但凭据列表是面板轮询最频的端点（实测 24h 2747 次），白涨 3 字段 × 凭据数。
+    ///
+    /// camelCase 本身由结构体级 `rename_all` 保证，已被同结构体的其它测试覆盖。
+    #[test]
+    fn clone_identity_fields_are_omitted_when_absent() {
+        let src = include_str!("types.rs");
+        let decl = src
+            .split_once("pub struct CredentialStatusItem {")
+            .expect("CredentialStatusItem 不应被改名")
+            .1;
+        let body = decl.split_once("\n}").expect("结构体应有结尾").0;
+
+        // ⚠️ 必须**逐字段按行**判定，不能取「字段前 N 字节窗口」：三个字段是背靠背
+        // 声明的，200 字节窗口会跨进**上一个**字段的属性行，于是最后一个字段（tag）
+        // 少了属性也照样通过 —— 本测试第一版正是这个形态（对 clone_group/clone_seq
+        // 有效、对 tag 无效的半失效守卫）。
+        let lines: Vec<&str> = body.lines().collect();
+        for field in ["clone_group", "clone_seq", "tag"] {
+            let needle = format!("pub {field}:");
+            let idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with(needle.as_str()))
+                .unwrap_or_else(|| panic!("{field} 应在 CredentialStatusItem 内"));
+            // 只看**紧邻上一行**：serde 属性必须直接挂在字段上。
+            let prev = lines[idx.saturating_sub(1)].trim();
+            assert!(
+                prev.contains("skip_serializing_if"),
+                "{field} 的紧邻上一行必须是 skip_serializing_if 属性，实际是: {prev}。\
+                 否则每个单开号的响应里都白发一个 null 字段，而凭据列表是面板轮询最频的端点"
+            );
+        }
+
+        // 结构体级 camelCase 必须在（前端读 cloneGroup，snake_case 会让分组恒空）。
+        let head = src
+            .split_once("pub struct CredentialStatusItem {")
+            .unwrap()
+            .0;
+        assert!(
+            head.rsplit("/// 单个凭据的状态信息")
+                .next()
+                .unwrap()
+                .contains("rename_all"),
+            "CredentialStatusItem 必须带 rename_all=camelCase"
+        );
+    }
+
     #[test]
     fn config_snapshot_serializes_login_background_r18() {
         // 快照以 camelCase 下发，前端据此渲染开关初值。
@@ -1431,8 +2233,21 @@ mod tests {
             endpoint_names: vec![],
             extract_thinking: true,
             cc_auto_buffer: true,
+            import_keys_enabled: true,
+            clone_default_enabled: false,
+            // 吸收层六项：本处是**测试夹具**（不是 Default impl，本类型没有 Default），
+            // 取值与 config 默认一致只为可读性。真正防漂移的是 service.rs 里
+            // build_config_snapshot 必须逐字段从 config 读，由
+            // `absorb_snapshot_maps_every_field_from_config` 钉死。
+            upstream_retry_absorb_enabled: false,
+            upstream_retry_absorb_budget_secs: 45,
+            upstream_retry_absorb_max_rounds: 3,
+            upstream_retry_absorb_min_delay_ms: 150,
+            upstream_retry_absorb_max_delay_secs: 15,
+            upstream_retry_absorb_suspended: false,
             prompt_cache_enabled: true,
             cooldown_enabled: true,
+            auto_disable_suspicious: true,
             all_cooling_fast_fail: true,
             rate_limit_enabled: false,
             rate_limit_daily_max: 500,
@@ -1454,6 +2269,11 @@ mod tests {
             inbound_queue_max_wait_secs: 30,
             inbound_queue_timeout_passthrough: true,
             inbound_current_rpm: 100,
+            // 实测类字段的"默认值"刻意为 0：它们只能来自真实观测，任何非零默认都是
+            // 凭空造数 —— 那正是本次要修的缺陷（把配置值当实测值展示）。
+            inbound_observed_rpm: 0,
+            inbound_observed_upstream_rpm: 0,
+            inbound_admitted_total: 0,
             balance_weight_enabled: true,
             balance_weight_floor: 50,
             health_429_weight_enabled: true,

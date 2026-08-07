@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Trash2, RotateCcw, CheckCircle2, Database, Zap, Ban, Power, FlaskConical, Download, AlertTriangle } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Trash2, RotateCcw, CheckCircle2, Database, Zap, Ban, Power, FlaskConical, Download, AlertTriangle, LayoutGrid, List, Move } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -8,6 +8,7 @@ import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { CredentialCard } from '@/components/credential-card'
+import { CredentialCanvas } from '@/components/credential-canvas'
 import { StatCard } from '@/components/ui/stat-card'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
@@ -26,6 +27,7 @@ import { getCredentialBalance, getCachedBalances, forceRefreshToken, deepVerifyC
 import { extractErrorMessage, downloadJson, fileStamp } from '@/lib/utils'
 import { PageSkeleton } from '@/components/ui/page-skeleton'
 import { useUiLayoutPrefs } from '@/hooks/use-ui-layout-prefs'
+import { useCredentialSelection } from '@/hooks/use-credential-selection'
 import type { BalanceResponse } from '@/types/api'
 
 interface DashboardProps {
@@ -105,12 +107,50 @@ function ScrollOnOverflow({ text, className }: { text: string; className?: strin
   )
 }
 
+/**
+ * 行视图列头。宽度/断点必须与 `credential-row.tsx` 的行主体**逐列对齐**
+ * （w-10 #id / w-20 端点 md / w-16 区域 xl / w-16 rpm lg / w-12 成功率 lg /
+ *  w-24 余额 xl / w-10 在飞 lg / w-20 错误 xl / w-[76px] 悬浮操作占位）。
+ * 改一边必须改另一边 —— 这是 flex 布局的固有耦合，没有更省的写法。
+ */
+function CredentialRowHeader() {
+  const { t } = useTranslation()
+  return (
+    <div
+      role="row"
+      className="flex items-center gap-2 px-2 pb-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground"
+    >
+      {/* ▸ + 勾选框占位（h-5 w-5 + checkbox 宽度）。纯占位格 aria-hidden，不进读屏。 */}
+      <span aria-hidden className="w-5 shrink-0" />
+      <span aria-hidden className="w-4 shrink-0" />
+      <span role="columnheader" className="w-10 shrink-0">{t('credentialrow.col.id')}</span>
+      <span role="columnheader" className="w-2.5 shrink-0" title={t('credentialrow.col.status')}>
+        <span className="sr-only">{t('credentialrow.col.status')}</span>
+      </span>
+      <span role="columnheader" className="min-w-0 flex-1">{t('credentialrow.col.identity')}</span>
+      <span role="columnheader" className="hidden w-20 shrink-0 md:block">{t('credentialrow.col.endpoint')}</span>
+      <span role="columnheader" className="hidden w-16 shrink-0 xl:block">{t('credentialrow.col.region')}</span>
+      <span role="columnheader" className="hidden w-16 shrink-0 lg:block">{t('credentialrow.col.rpm')}</span>
+      <span role="columnheader" className="hidden w-12 shrink-0 text-right lg:block">{t('credentialrow.col.successRate')}</span>
+      <span role="columnheader" className="hidden w-24 shrink-0 xl:block">{t('credentialrow.col.balance')}</span>
+      <span role="columnheader" className="hidden w-10 shrink-0 text-right lg:block">{t('credentialrow.col.inflight')}</span>
+      <span role="columnheader" className="hidden w-20 shrink-0 text-right xl:block">{t('credentialrow.col.recentError')}</span>
+      <span aria-hidden className="w-[76px] shrink-0" />
+    </div>
+  )
+}
+
 export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const { t } = useTranslation()
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
-  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
+  // 选区改由共享 store 持有(原为本组件局部 state ⇒ 分身/运维视图读不到「当前选中的号」)。
+  // 刻意沿用 selectedIds / toggleSelect / deselectAll 三个原名:下方 6 组批量处理器与 JSX
+  // 逐字不动,迁移的 diff 只有这一处 ⇒ 好审、也不留第二个选区真相源。
+  // ⚠️ store 是模块级的 ⇒ 选区在本组件卸载后仍存活(切到别的 tab 再回来选区还在)。
+  //    这正是共享的目的;唯一的行为变化就这一条,其余语义与迁移前一致。
+  const { ids: selectedIds, toggle: toggleSelect, clear: deselectAll } = useCredentialSelection()
   // 二次确认弹框(替代浏览器原生 confirm,统一走设计系统控件):
   // 存待执行动作 + 文案,确认后调 onConfirm。批量删除/清除已禁用都走它。
   const [confirmState, setConfirmState] = useState<{
@@ -125,8 +165,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [batchWhitelistBusy, setBatchWhitelistBusy] = useState(false)
   // 「允许模型」弹窗开关(勾选后按钮触发,交互对齐「测试可用模型」)。
   const [batchWhitelistOpen, setBatchWhitelistOpen] = useState(false)
-  // UI 排版偏好:凭据卡片尺寸档位 → 自适应每行 N 个(设置页配置)。
-  const { prefs: uiPrefs } = useUiLayoutPrefs()
+  // UI 排版偏好:凭据卡片尺寸档位 → 自适应每行 N 个(设置页配置);视图形态(卡片/紧凑行)。
+  const { prefs: uiPrefs, set: setUiPrefs } = useUiLayoutPrefs()
+  const isRowView = uiPrefs.credentialView === 'row'
+  const isCanvasView = uiPrefs.credentialView === 'canvas'
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
   const [verifying, setVerifying] = useState(false)
   const [verifyProgress, setVerifyProgress] = useState({ current: 0, total: 0 })
@@ -240,21 +282,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   }
 
   // 选择管理：选中只通过卡片左上角勾选框，永远是加/减选（多选语义）。
-  const toggleSelect = (id: number) => {
-    setSelectedIds(prev => {
-      const next = new Set(prev)
-      if (next.has(id)) {
-        next.delete(id)
-      } else {
-        next.add(id)
-      }
-      return next
-    })
-  }
-
-  const deselectAll = () => {
-    setSelectedIds(new Set())
-  }
+  // 实现已上移到 use-credential-selection store(`toggle` / `clear`),此处不再有本地副本。
 
   /**
    * 批量删除。`force=true` 时**连未禁用的号一起删**（后端跳过「必须先禁用」门，仍进回收站）。
@@ -873,6 +901,32 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               </div>
             </div>
             <div className="flex gap-2 flex-wrap">
+              {/* 视图切换分段控件：卡片 / 紧凑行。偏好走 use-ui-layout-prefs（localStorage +
+                  跨组件实时同步），与 cardSize 同一个键，不新开 localStorage 键。 */}
+              <div className="flex items-center rounded-md border bg-card/60 p-0.5">
+                {([
+                  { v: 'card' as const, icon: LayoutGrid, label: t('dashboard.viewMode.card') },
+                  { v: 'row' as const, icon: List, label: t('dashboard.viewMode.row') },
+                  { v: 'canvas' as const, icon: Move, label: t('dashboard.viewMode.canvas') },
+                ]).map(({ v, icon: Icon, label }) => {
+                  const on = uiPrefs.credentialView === v
+                  return (
+                    <button
+                      key={v}
+                      type="button"
+                      aria-pressed={on}
+                      title={label}
+                      onClick={() => setUiPrefs({ credentialView: v })}
+                      className={`inline-flex h-8 items-center gap-1.5 rounded px-2 text-xs font-medium transition-colors ${
+                        on ? 'bg-secondary text-foreground' : 'text-muted-foreground hover:text-foreground'
+                      }`}
+                    >
+                      <Icon className="h-3.5 w-3.5" />
+                      <span className="hidden sm:inline">{label}</span>
+                    </button>
+                  )
+                })}
+              </div>
               {embedded && (
                 <>
                   <Button
@@ -1010,17 +1064,38 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 {t('dashboard.list.empty')}
               </CardContent>
             </Card>
+          ) : isCanvasView ? (
+            /* 画布档：框选 + 拖动位置 + 拖角改大小。
+               刻意**不分页** —— 分页会让「第 1 页框选 5 个 → 翻页 → 批量删除」删掉当前看不见的号，
+               而画布本身可滚动。故这里喂 `data.credentials` 全集而非 `currentCredentials`。
+               卡片/行两档的分页行为一个字节没动。 */
+            // ⚠️ 右键菜单暂未接：卡片视图的右键在 `credential-card.tsx` 内部自处理
+            // （不走 dashboard 的 state），画布要复用需先把那套菜单抽成共享组件。
+            // 本轮只交付框选/拖动/改大小三件，右键留待抽组件后再接。
+            <CredentialCanvas credentials={data?.credentials ?? []} />
           ) : (
             <>
               <div
-                className="grid gap-4"
-                style={{
-                  // 卡片尺寸档位 → 每列最小宽,auto-fill 按容器宽自动决定每行 N 个(紧凑~5、标准~4、大~3)。
-                  gridTemplateColumns: `repeat(auto-fill, minmax(min(100%, ${
-                    uiPrefs.cardSize === 'compact' ? 240 : uiPrefs.cardSize === 'large' ? 380 : 300
-                  }px), 1fr))`,
-                }}
+                // 行视图才是 ARIA 表格：role="row" 必须有 table/grid/rowgroup 祖先，否则读屏
+                // 会忽略行语义（列头与行同为 role="row"，故两者都要在这个容器**内部**）。
+                // 卡片视图恒为 undefined ⇒ 无障碍树与改动前逐字一致。
+                role={isRowView ? 'table' : undefined}
+                aria-label={isRowView ? t('dashboard.viewMode.row') : undefined}
+                className={isRowView ? 'space-y-1' : 'grid gap-4'}
+                style={
+                  isRowView
+                    ? undefined
+                    : {
+                        // 卡片尺寸档位 → 每列最小宽,auto-fill 按容器宽自动决定每行 N 个(紧凑~5、标准~4、大~3)。
+                        gridTemplateColumns: `repeat(auto-fill, minmax(min(100%, ${
+                          uiPrefs.cardSize === 'compact' ? 240 : uiPrefs.cardSize === 'large' ? 380 : 300
+                        }px), 1fr))`,
+                      }
+                }
               >
+                {/* 行视图：一行一个号（列头 + 紧凑行）。卡片视图 isRowView=false ⇒ 不产生任何 DOM 节点，
+                    自适应网格逐字不变。 */}
+                {isRowView && <CredentialRowHeader />}
                 {currentCredentials.map((credential) => (
                   <CredentialCard
                     key={credential.id}
@@ -1030,6 +1105,12 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                     onToggleSelect={() => toggleSelect(credential.id)}
                     balance={balanceMap.get(credential.id) || null}
                     loadingBalance={loadingBalanceIds.has(credential.id)}
+                    view={isRowView ? 'row' : 'card'}
+                    rowBatch={{
+                      count: selectedIds.size,
+                      onBatchDisable: () => handleBatchSetDisabled(true),
+                      onBatchDelete: () => handleBatchDelete(false),
+                    }}
                   />
                 ))}
               </div>
