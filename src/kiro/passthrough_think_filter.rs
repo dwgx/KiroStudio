@@ -44,7 +44,14 @@ pub fn filter_json_bytes(bytes: &[u8]) -> Bytes {
     let Some(content) = v.get_mut("content").and_then(|c| c.as_array_mut()) else {
         return Bytes::copy_from_slice(bytes);
     };
-    content.retain(|block| block.get("type").and_then(|t| t.as_str()) != Some("thinking"));
+    // ⚠️ 与流式路径的 `in_thinking` 判定一致：`redacted_thinking`（超预算的合法类型）
+    // 也必须滤掉，否则非流式请求下客户端同样报 "Tool result missing"。
+    content.retain(|block| {
+        !matches!(
+            block.get("type").and_then(|t| t.as_str()),
+            Some("thinking") | Some("redacted_thinking")
+        )
+    });
     serde_json::to_vec(&v)
         .map(Bytes::from)
         .unwrap_or_else(|_| Bytes::copy_from_slice(bytes))
@@ -470,13 +477,82 @@ mod tests {
         );
     }
 
-    /// 非流式 JSON：滤掉 thinking 块，text/tool_use 保留。
+    /// 🔴 回归：`redacted_thinking`（超预算的合法类型）流式路径也要整块滤掉。
+    #[tokio::test]
+    async fn test_filter_sse_stream_removes_redacted_thinking() {
+        let input = format!(
+            "{}{}{}{}{}",
+            event(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":""}}"#
+            ),
+            event(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"redacted_thinking_delta","data":"x"}}"#
+            ),
+            event("content_block_stop", r#"{"type":"content_block_stop","index":0}"#),
+            event(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#
+            ),
+            event(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hello"}}"#
+            ),
+        );
+        let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(input))]);
+        let filtered = collect_filtered(filter_sse_stream(stream)).await;
+        assert!(
+            !filtered.contains("redacted_thinking"),
+            "redacted_thinking start/delta/stop 必须整块滤掉"
+        );
+        assert!(filtered.contains("Hello"), "text 块必须保留");
+        let indices = extract_indices(&filtered);
+        assert!(
+            indices.iter().all(|&i| i == 0),
+            "滤掉 redacted_thinking 后 text 块应重编号为 0，实际 {indices:?}"
+        );
+    }
+
+    /// 🔴 回归：多行 `data:` 事件（SSE 规范允许）应拼接成完整 JSON 再解析，
+    /// 而不是只取最后一行（旧行为会让 JSON 解析失败 → thinking 泄漏）。
+    #[tokio::test]
+    async fn test_filter_sse_stream_multiline_data_concatenated() {
+        // 一个 data 事件被拆成两行（token 边界拆行），拼接后是合法 JSON。
+        let multiline = format!(
+            "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n"
+        );
+        // 构造：thinking start（正常单行）+ 一个多行 data 的 text start
+        let input = format!(
+            "{}{}",
+            event(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#
+            ),
+            // 把 text start 的 data 拆成两行（`"content_block"` 后断行）
+            multiline
+        );
+        let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(input))]);
+        let filtered = collect_filtered(filter_sse_stream(stream)).await;
+        // 多行 data 拼接后应能解析成 text 块并保留；thinking 块滤掉。
+        assert!(
+            filtered.contains("\"type\":\"text\""),
+            "多行 data 拼接后应解析为 text 块保留，实际: {filtered}"
+        );
+        assert!(
+            !filtered.contains("thinking"),
+            "thinking 块仍应滤掉"
+        );
+    }
+
+    /// 非流式 JSON：滤掉 thinking/redacted_thinking 块，text/tool_use 保留。
     #[test]
     fn test_filter_json_bytes_removes_thinking_blocks() {
         let input = serde_json::json!({
             "id": "msg_1",
             "content": [
                 {"type": "thinking", "thinking": "let me think"},
+                {"type": "redacted_thinking", "data": "secret"},
                 {"type": "text", "text": "Hello"},
                 {"type": "tool_use", "id": "t1", "name": "fs_write", "input": {}}
             ],
@@ -485,8 +561,16 @@ mod tests {
         let out = filter_json_bytes(input.to_string().as_bytes());
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let content = v["content"].as_array().unwrap();
-        assert_eq!(content.len(), 2, "thinking 块被滤掉，text+tool_use 保留");
+        assert_eq!(
+            content.len(),
+            2,
+            "thinking+redacted_thinking 块都被滤掉，text+tool_use 保留"
+        );
         assert!(content.iter().all(|b| b["type"] != "thinking"));
+        assert!(
+            content.iter().all(|b| b["type"] != "redacted_thinking"),
+            "redacted_thinking 非流式也必须滤掉（与流式路径一致）"
+        );
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[1]["type"], "tool_use");
         assert_eq!(v["stop_reason"], "tool_use", "其余字段不受影响");

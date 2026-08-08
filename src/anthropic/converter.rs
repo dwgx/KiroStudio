@@ -1792,7 +1792,9 @@ pub(crate) fn map_tool_input_from_kiro(client_name: &str, input: serde_json::Val
                 &["caseSensitive", "case_sensitive"],
                 "case_sensitive",
             );
-            out.remove("explanation");
+            // ⚠️ Grep 入站只 `maybe_insert`（客户端发才保留）**不注入默认**，
+            // 模型真实生成的 explanation 应保留（Claude Code Grep schema 的 explanation
+            // 是 required），不能像 Read/Glob/LS 那样无条件剥除。
         }
         "LS" => {
             remap_tool_keys(&mut out, &["path"], "path");
