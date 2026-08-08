@@ -7,6 +7,7 @@
 
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -689,6 +690,11 @@ pub struct KiroProvider {
     /// 端点桶 429 封禁状态：key = (credential_id, endpoint_name)，value = 解封时刻。
     /// 同一凭据的多端点（如 ksk_ 的 `cli`/`cli-runtime`）是上游的独立限流桶，某桶被封不波及其它。
     endpoint_buckets: Mutex<HashMap<(u64, String), Instant>>,
+    /// 端点轮换计数器：`select_endpoint` 按请求轮换起始端点（round-robin），
+    /// 让 ksk_ 号的流量从开始就分散到 q.* 与 runtime.* 两个桶，而不是永远先打 q.*。
+    /// 对照 kiro2cc：它是每请求轮换起始端点，因此同一号多桶时流量均匀分散。
+    /// `len == 1`（单端点 OAuth 号）时 start 恒 0，行为与固定优先序完全一致。
+    endpoint_rotation: AtomicUsize,
     /// 全局上游并发闸：限制**同时在飞**的上游 HTTP 调用数（容量来自
     /// `upstream_concurrency_limit`，重启生效）。防「号多 + 429 多 → 疯狂换号重试」
     /// 把内部上游 RPM 放大到外部 RPM 的十几倍。`OwnedSemaphorePermit` 跨 send 存活、
@@ -738,6 +744,7 @@ impl KiroProvider {
             endpoints,
             default_endpoint,
             endpoint_buckets: Mutex::new(HashMap::new()),
+            endpoint_rotation: AtomicUsize::new(0),
             upstream_gate: Arc::new(tokio::sync::Semaphore::new(concurrency_limit)),
             retry_pressure: Mutex::new(RetryPressureWindow::new(PRESSURE_WINDOW_SECS)),
         }
@@ -777,8 +784,12 @@ impl KiroProvider {
 
     /// 按凭据的端点候选顺序选**第一个未封禁**的端点实现（q.* 优先、runtime.* 回退）。
     ///
-    /// - 顺序固定从 [`KiroCredentials::effective_endpoint_order`] 的首个开始，**不按尝试次数
-    ///   轮转偏移**：ksk_ 号默认总是先打 q.*（实测不限速），q.* 桶被 429 封禁才落到 runtime.*。
+    /// - 起始索引按请求轮换（round-robin）：从 [`KiroCredentials::effective_endpoint_order`]
+    ///   的候选里取 `start = 轮换计数器 % len` 作为遍历起点，再按原顺序向后取。
+    ///   这样 ksk_ 号的流量从开始就分散到 q.* 与 runtime.* 两个桶（对照 kiro2cc 的
+    ///   `select_endpoint` 按 attempt 偏移轮询），而不是永远先打 q.*、打爆了才换 runtime.*。
+    /// - 顺序遍历语义保留：仍按候选序跳过冷却桶、取第一个非冷却；`len == 1` 时轮换无效果，
+    ///   行为与固定优先序完全一致。
     /// - 返回 `None` = 该凭据所有端点桶当前都在封禁期 → 调用方应走凭据级冷却/换号。
     fn select_endpoint(
         &self,
@@ -789,9 +800,13 @@ impl KiroProvider {
         if order.is_empty() {
             return None;
         }
+        let len = order.len();
+        // 按请求轮换起始索引：同一凭据的连续请求落在不同端点。len == 1 时恒取 0。
+        let start = self.endpoint_rotation.fetch_add(1, Ordering::Relaxed) % len;
         let mut buckets = self.endpoint_buckets.lock();
         let now = Instant::now();
-        for name in order {
+        for i in 0..len {
+            let name = order[(start + i) % len];
             let key = (id, name.to_string());
             // 惰性清理：已过期即视为可用并从 map 移除，防无界增长。
             if let Some(&until) = buckets.get(&key) {
@@ -3668,6 +3683,115 @@ mod tests {
             body.contains("endpoint_buckets"),
             "select_endpoint 必须查询端点桶封禁状态"
         );
+    }
+
+    // ══════════ select_endpoint 主动轮换（round-robin）══════════
+
+    /// 用真实端点注册表构造 provider（select_endpoint 只查 name，不触达实现细节）。
+    fn provider_with_default(default_endpoint: &str) -> KiroProvider {
+        let cfg = crate::model::config::Config::default();
+        let tm = Arc::new(
+            MultiTokenManager::new(cfg, vec![], None, None, false).expect("测试 token manager"),
+        );
+        KiroProvider::with_proxy(
+            tm,
+            None,
+            crate::kiro::endpoint::registry(),
+            default_endpoint.to_string(),
+        )
+    }
+
+    /// ksk_ API Key 凭据：`effective_endpoint_order` 返回多端点候选链（q.* 优先、其余回退）。
+    fn ksk_credential() -> KiroCredentials {
+        let mut c = KiroCredentials::default();
+        c.auth_method = Some("api_key".to_string());
+        c.kiro_api_key = Some("ksk_test_key".to_string());
+        c.endpoint = None;
+        c
+    }
+
+    /// 连续 N 次 select_endpoint 同一凭据应轮流覆盖所有非冷却端点（断言起点在轮换）。
+    #[test]
+    fn select_endpoint_rotates_through_all_available_endpoints() {
+        let cli = crate::kiro::endpoint::cli::CLI_ENDPOINT_NAME;
+        let provider = provider_with_default(cli);
+        let cred = ksk_credential();
+        let order = cred.effective_endpoint_order(cli);
+        assert!(order.len() >= 2, "ksk_ 号应为多端点候选链");
+        // 计数器起点 0 → 起点依次 0,1,2,...,0,1,2,...，全可用时轮流命中 order 全序。
+        let got: Vec<&str> = (0..order.len() * 2)
+            .map(|_| {
+                provider
+                    .select_endpoint(&cred, 123)
+                    .expect("全可用必有返回")
+                    .name()
+            })
+            .collect();
+        let expected: Vec<&str> = (0..2).flat_map(|_| order.iter().copied()).collect();
+        assert_eq!(
+            got, expected,
+            "同一凭据的连续请求必须轮流覆盖所有非冷却端点"
+        );
+    }
+
+    /// 部分桶冷却时，轮换仍只选非冷却桶（跳过被封桶，恒命中剩余桶）。
+    #[test]
+    fn select_endpoint_rotation_skips_cooled_buckets() {
+        let cli = crate::kiro::endpoint::cli::CLI_ENDPOINT_NAME;
+        let provider = provider_with_default(cli);
+        let cred = ksk_credential();
+        let order = cred.effective_endpoint_order(cli);
+        // 封掉首选桶（q.*），其余候选保持可用。
+        provider.endpoint_buckets.lock().insert(
+            (123, order[0].to_string()),
+            Instant::now() + Duration::from_secs(60),
+        );
+        let mut picked: HashSet<&str> = HashSet::new();
+        for _ in 0..order.len() * 2 {
+            let ep = provider
+                .select_endpoint(&cred, 123)
+                .expect("还有非冷却桶，必有返回");
+            assert_ne!(ep.name(), order[0], "轮换不得选中被封的端点桶");
+            picked.insert(ep.name());
+        }
+        // 足够多的调用里，所有非冷却桶都应被轮换到。
+        assert_eq!(
+            picked.len(),
+            order.len() - 1,
+            "部分冷却时轮换应覆盖所有非冷却桶"
+        );
+    }
+
+    /// 全部冷却返回 None（既有语义，轮换不得破坏）。
+    #[test]
+    fn select_endpoint_rotation_all_cooled_returns_none() {
+        let cli = crate::kiro::endpoint::cli::CLI_ENDPOINT_NAME;
+        let provider = provider_with_default(cli);
+        let cred = ksk_credential();
+        let order = cred.effective_endpoint_order(cli);
+        {
+            let mut buckets = provider.endpoint_buckets.lock();
+            for name in &order {
+                buckets.insert((123, name.to_string()), Instant::now() + Duration::from_secs(60));
+            }
+        }
+        assert!(
+            provider.select_endpoint(&cred, 123).is_none(),
+            "全部冷却必须返回 None"
+        );
+    }
+
+    /// order 长度 1（单端点 OAuth 号）：轮换恒取起点 0，行为与固定优先序完全一致（零回归）。
+    #[test]
+    fn select_endpoint_single_endpoint_does_not_rotate() {
+        let provider = provider_with_default("ide");
+        let cred = KiroCredentials::default(); // 无 api_key、无显式 endpoint → order=[ide]
+        for _ in 0..4 {
+            let ep = provider
+                .select_endpoint(&cred, 9)
+                .expect("单端点不封必有返回");
+            assert_eq!(ep.name(), "ide", "单端点轮换无效果，恒返回唯一端点");
+        }
     }
 
     /// ⭐ 守卫：429 分支必须实现「封当前端点桶 + 判断是否还有未封端点 + 换端点时摘出本号」。

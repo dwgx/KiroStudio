@@ -15,9 +15,11 @@
 //! 全部 head 复用 [`super::cli`]，避免两份协议逻辑漂移。
 
 use reqwest::RequestBuilder;
-use uuid::Uuid;
 
-use super::cli::{inject_cli_agent_fields, set_origin_kiro_cli};
+use super::cli::{
+    cli_user_agent, decorate_cli_mcp, decorate_cli_protocol, inject_cli_agent_fields,
+    set_origin_kiro_cli,
+};
 use super::{KiroEndpoint, RequestContext};
 
 /// Kiro CLI 端点名称（对应 credentials.endpoint / config.defaultEndpoint 的 `"cli-runtime"` 取值）。
@@ -45,10 +47,7 @@ impl CliRuntimeEndpoint {
 
     /// aws-sdk-rust 版 UA，带 `app/AmazonQ-For-CLI` 标识（与 `cli` 端点同形状）。
     fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
-        format!(
-            "aws-sdk-rust/1.0.0 ua/2.1 os/other lang/rust api/codewhispererstreaming#1.28.3 m/E app/AmazonQ-For-CLI md/appVersion-1.28.3-{}",
-            ctx.machine_id
-        )
+        cli_user_agent(ctx.machine_id)
     }
 }
 
@@ -80,30 +79,11 @@ impl KiroEndpoint for CliRuntimeEndpoint {
     }
 
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
-        let ua = self.user_agent(ctx);
-        req.header("X-Amz-Target", CLI_AMZ_TARGET)
-            .header("tokentype", "API_KEY")
-            .header("x-amzn-codewhisperer-optout", "true")
-            .header("x-amzn-kiro-agent-mode", "vibe")
-            .header("x-amz-user-agent", &ua)
-            .header("user-agent", &ua)
-            .header("host", self.host(ctx))
-            .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
-            .header("amz-sdk-request", "attempt=1; max=1")
-            .header("Authorization", format!("Bearer {}", ctx.token))
-        // 刻意不注入 profileArn / anthropic-beta：API_KEY 认证不使用 profileArn；
-        // CLI 端点的 1M 窗口由上游按 modelId 决定，不依赖 anthropic-beta 头。
+        decorate_cli_protocol(req, ctx, self.host(ctx), CLI_AMZ_TARGET, self.user_agent(ctx))
     }
 
     fn decorate_mcp(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
-        let ua = self.user_agent(ctx);
-        req.header("tokentype", "API_KEY")
-            .header("x-amz-user-agent", &ua)
-            .header("user-agent", &ua)
-            .header("host", self.host(ctx))
-            .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
-            .header("amz-sdk-request", "attempt=1; max=1")
-            .header("Authorization", format!("Bearer {}", ctx.token))
+        decorate_cli_mcp(req, ctx, self.host(ctx), self.user_agent(ctx))
     }
 
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {

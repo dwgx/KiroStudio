@@ -14,12 +14,16 @@ use reqwest::RequestBuilder;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
+pub mod amazonq;
 pub mod cli;
 pub mod cli_runtime;
+pub mod codewhisperer;
 pub mod ide;
 
+pub use amazonq::AmazonqEndpoint;
 pub use cli::CliEndpoint;
 pub use cli_runtime::CliRuntimeEndpoint;
+pub use codewhisperer::CodewhispererEndpoint;
 pub use ide::IdeEndpoint;
 
 /// 按端点名构造实现；未知名字返回 `None`。
@@ -31,6 +35,8 @@ pub fn build(name: &str) -> Option<Arc<dyn KiroEndpoint>> {
         ide::IDE_ENDPOINT_NAME => Some(Arc::new(IdeEndpoint::new())),
         cli::CLI_ENDPOINT_NAME => Some(Arc::new(CliEndpoint::new())),
         cli_runtime::CLI_RUNTIME_ENDPOINT_NAME => Some(Arc::new(CliRuntimeEndpoint::new())),
+        codewhisperer::CODEWHISPERER_ENDPOINT_NAME => Some(Arc::new(CodewhispererEndpoint::new())),
+        amazonq::AMAZONQ_ENDPOINT_NAME => Some(Arc::new(AmazonqEndpoint::new())),
         _ => None,
     }
 }
@@ -40,6 +46,8 @@ pub const ENDPOINT_NAMES: &[&str] = &[
     ide::IDE_ENDPOINT_NAME,
     cli::CLI_ENDPOINT_NAME,
     cli_runtime::CLI_RUNTIME_ENDPOINT_NAME,
+    codewhisperer::CODEWHISPERER_ENDPOINT_NAME,
+    amazonq::AMAZONQ_ENDPOINT_NAME,
 ];
 
 /// 全部已知端点的注册表（供 `main.rs` 启动时装配 provider）。

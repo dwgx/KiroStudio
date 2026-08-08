@@ -394,16 +394,19 @@ fn canonicalize_auth_method_value(value: &str) -> &str {
     }
 }
 
-/// ksk_ API Key 号的完整端点候选链（4 个独立限流桶，对齐 kiro2cc `endpoint.rs`）。
+/// ksk_ API Key 号的完整端点候选链。
 ///
-/// 顺序：`cli`(q.* GenerateAssistantResponse) → `cli-runtime`(runtime.*) →
-/// `codewhisperer`(us-east-1 独占 host / 其它区域 q.*) → `amazonq`(q.* + SendMessage)。
-/// `amazonq` 的 SendMessage 操作对 ksk_ **未实测**，放最后兜底，需线上验证。
-const API_KEY_ENDPOINT_ORDER: [&str; 4] = [
+/// 顺序：`cli`(q.* GenerateAssistantResponse) → `cli-runtime`(runtime.*)。
+///
+/// ⚠️ **2026-08-08 部署实测：codewhisperer / amazonq 对 ksk_ 不可用，已从候选链移除。**
+/// 真协议下 `codewhisperer.{region}.amazonaws.com` 对 ksk_ key 返回
+/// `400 ValidationException "The provided credential is invalid"`（此前用畸形 body 探测得到
+/// 200 是被误导——真协议才暴露）。amazonq 的 SendMessage 同理未验证通过。两者**保留为已注册端点**
+/// （显式 `endpoint=codewhisperer` 仍可选），但不进 ksk_ 自动路由，避免请求打到无效 host 变 400。
+/// 现只剩 q.* + runtime.* 两个实测可用的独立限流桶；流量分散靠 `select_endpoint` 的主动轮询。
+const API_KEY_ENDPOINT_ORDER: [&str; 2] = [
     crate::kiro::endpoint::cli::CLI_ENDPOINT_NAME,
     crate::kiro::endpoint::cli_runtime::CLI_RUNTIME_ENDPOINT_NAME,
-    crate::kiro::endpoint::codewhisperer::CODEWHISPERER_ENDPOINT_NAME,
-    crate::kiro::endpoint::amazonq::AMAZONQ_ENDPOINT_NAME,
 ];
 
 /// 凭据配置（支持单对象或数组格式）
@@ -1227,7 +1230,7 @@ mod tests {
         ak.region = Some("eu-central-1".to_string());
         assert_eq!(
             ak.effective_endpoint_order("ide"),
-            vec!["cli", "cli-runtime", "codewhisperer", "amazonq"],
+            vec!["cli", "cli-runtime"],
             "ksk_ 号必须 q.* 优先、runtime.* / codewhisperer / amazonq 回退"
         );
 
@@ -1236,7 +1239,7 @@ mod tests {
         ak.endpoint = Some("cli-runtime".to_string());
         assert_eq!(
             ak.effective_endpoint_order("ide"),
-            vec!["cli-runtime", "cli", "codewhisperer", "amazonq"],
+            vec!["cli-runtime", "cli"],
             "显式 endpoint 放最前，其余候选链去重后跟随后面（不丢换桶能力）"
         );
         ak.endpoint = None;
@@ -1245,7 +1248,7 @@ mod tests {
         ak.endpoint = Some("   ".to_string());
         assert_eq!(
             ak.effective_endpoint_order("ide"),
-            vec!["cli", "cli-runtime", "codewhisperer", "amazonq"]
+            vec!["cli", "cli-runtime"]
         );
     }
 
@@ -1259,7 +1262,7 @@ mod tests {
         ak.endpoint = Some("cli".to_string());
         assert_eq!(
             ak.effective_endpoint_order("ide"),
-            vec!["cli", "cli-runtime", "codewhisperer", "amazonq"],
+            vec!["cli", "cli-runtime"],
             "显式 cli + 完整候选链去重后应与自动顺序一致（cli 本就在链首）"
         );
     }
@@ -1273,7 +1276,7 @@ mod tests {
         ak.endpoint = Some("ide".to_string());
         assert_eq!(
             ak.effective_endpoint_order("ide"),
-            vec!["ide", "cli", "cli-runtime", "codewhisperer", "amazonq"],
+            vec!["ide", "cli", "cli-runtime"],
             "显式 ide 放最前（救急），完整候选链去重后跟随"
         );
     }
