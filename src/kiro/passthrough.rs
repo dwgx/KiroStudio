@@ -39,6 +39,7 @@ pub async fn forward(
     raw_body: Bytes,
     global_proxy: Option<&crate::http_client::ProxyConfig>,
     tls_backend: TlsBackend,
+    global_deepseek_cfg: &crate::kiro::deepseek_normalize::DeepseekNormalizeConfig,
 ) -> (Response, StatusCode) {
     let base = match cred.base_url.as_deref() {
         Some(b) if !b.trim().is_empty() => b.trim_end_matches('/').to_string(),
@@ -83,7 +84,13 @@ pub async fn forward(
     let body_bytes: Bytes = if cred.deepseek_normalize == Some(true) {
         match serde_json::from_slice::<serde_json::Value>(&raw_body) {
             Ok(mut v) => {
-                crate::kiro::deepseek_normalize::normalize_request(&mut v);
+                // per-凭据配置覆盖全局（fallback_model/min_max_tokens），bool 取全局。
+                let cfg = cred
+                    .deepseek_normalize_config
+                    .as_ref()
+                    .map(|c| c.merge_over(global_deepseek_cfg))
+                    .unwrap_or_else(|| global_deepseek_cfg.clone());
+                crate::kiro::deepseek_normalize::normalize_request(&mut v, &cfg);
                 serde_json::to_vec(&v).map(Bytes::from).unwrap_or_else(|_| raw_body.clone())
             }
             Err(_) => raw_body.clone(), // 非 JSON(理论不该出现),回落原样透传

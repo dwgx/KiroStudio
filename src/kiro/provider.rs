@@ -875,11 +875,14 @@ impl KiroProvider {
                 None => return None,
             };
             let started = std::time::Instant::now();
+            // 全局 deepseek 归一化配置（TIER1 热重载，per-凭据在 forward 内覆盖）。
+            let ds_cfg = self.token_manager.config().deepseek_normalize.clone();
             let (resp, status) = crate::kiro::passthrough::forward(
                 &cred,
                 raw_body.clone(),
                 self.global_proxy.as_ref(),
                 self.tls_backend,
+                &ds_cfg,
             )
             .await;
             let latency_ms = started.elapsed().as_millis() as u64;

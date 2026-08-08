@@ -30,9 +30,22 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: std::error::Error + Send + Sync + 'static,
 {
+    filter_sse_stream_with(inner, true)
+}
+
+/// [`filter_sse_stream`] 的可配置版本：`strip_inline_thinking` 控制是否剥 text 里的
+/// 内联 `<thinking>...</thinking>` 标签（deepseek 可能以文本形式吐 thinking）。
+pub fn filter_sse_stream_with<S, E>(
+    inner: S,
+    strip_inline_thinking: bool,
+) -> impl Stream<Item = Result<Bytes, axum::Error>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+{
     SseThinkFilter {
         inner: Box::pin(inner),
-        state: SseFilterState::new(),
+        state: SseFilterState::new(strip_inline_thinking),
     }
 }
 
@@ -52,6 +65,20 @@ pub fn filter_json_bytes(bytes: &[u8]) -> Bytes {
             Some("thinking") | Some("redacted_thinking")
         )
     });
+    // 剥 text 块里的内联 `<thinking>...</thinking>` 标签（deepseek 可能以文本形式吐）。
+    let mut in_inline_thinking = false;
+    for block in content.iter_mut() {
+        if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+            if let Some(text_val) = block.get_mut("text") {
+                if let Some(s) = text_val.as_str() {
+                    *text_val = serde_json::Value::String(strip_inline_thinking(
+                        s,
+                        &mut in_inline_thinking,
+                    ));
+                }
+            }
+        }
+    }
     serde_json::to_vec(&v)
         .map(Bytes::from)
         .unwrap_or_else(|_| Bytes::copy_from_slice(bytes))
@@ -195,16 +222,25 @@ struct SseFilterState {
     index_map: HashMap<usize, usize>,
     /// 下一个新 index。
     next_index: usize,
+    /// 是否剥 text_delta 里的内联 `<thinking>...</thinking>` 标签。
+    strip_inline_thinking: bool,
+    /// 跨 chunk 的"正在内联 thinking 内"状态。
+    in_inline_thinking: bool,
+    /// 滤掉的 thinking 文本累计**字符数**（估算 token = 字符数 / 4）。
+    thinking_chars: u64,
 }
 
 impl SseFilterState {
-    fn new() -> Self {
+    fn new(strip_inline_thinking: bool) -> Self {
         Self {
             buf: Vec::with_capacity(1024),
             pending: Vec::new(),
             in_thinking: HashMap::new(),
             index_map: HashMap::new(),
             next_index: 0,
+            strip_inline_thinking,
+            in_inline_thinking: false,
+            thinking_chars: 0,
         }
     }
 
@@ -306,9 +342,52 @@ impl SseFilterState {
                 // 客户端收到"孤儿 delta"（start 已被丢）甚至与新重编号块同 index 混淆。
                 let in_thinking = self.in_thinking.get(&old_idx).copied().unwrap_or(false);
                 if in_thinking {
+                    // 累计滤掉的 thinking 文本字符（供 message_delta 扣减 usage.output_tokens）。
+                    if let Some(t) = v
+                        .get("delta")
+                        .and_then(|d| d.get("thinking"))
+                        .and_then(|x| x.as_str())
+                    {
+                        self.thinking_chars += t.chars().count() as u64;
+                    }
                     return None;
                 }
+                // 非 thinking 块：剥 text_delta 里的内联 `<thinking>...</thinking>`。
+                if self.strip_inline_thinking {
+                    if let Some(delta) = v.get_mut("delta").and_then(|d| d.as_object_mut()) {
+                        if delta.get("type").and_then(|x| x.as_str()) == Some("text_delta") {
+                            if let Some(text_val) = delta.get_mut("text") {
+                                if let Some(s) = text_val.as_str() {
+                                    let stripped =
+                                        strip_inline_thinking(s, &mut self.in_inline_thinking);
+                                    *text_val = serde_json::Value::String(stripped);
+                                    // 剥光（整段在 thinking 内）→ 丢弃该 delta，避免空 text。
+                                    if text_val.as_str().is_some_and(|t| t.is_empty())
+                                        && self.in_inline_thinking
+                                    {
+                                        return None;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 self.rewrite_index_or_passthrough(&mut v, event_type, block, old_idx)
+            }
+            "message_delta" => {
+                // 滤掉 thinking 后，usage.output_tokens 仍含 thinking token → 扣减估算值
+                //（字符数/4，Claude Code 约 4 字符/token），对齐主路径「剥离的 thinking 不计入
+                // output_tokens」口径。message_start 的 usage 不动（record 口径绑定）。
+                if self.thinking_chars > 0 {
+                    if let Some(usage) = v.get_mut("usage").and_then(|u| u.as_object_mut()) {
+                        if let Some(out) = usage.get("output_tokens").and_then(|x| x.as_u64()) {
+                            let deduct = (self.thinking_chars / 4) as u64;
+                            usage["output_tokens"] =
+                                serde_json::json!(out.saturating_sub(deduct));
+                        }
+                    }
+                }
+                Some(Self::rewrite_event(event_type, &v))
             }
             "content_block_stop" => {
                 let was_thinking = self.in_thinking.remove(&old_idx).unwrap_or(false);
@@ -342,6 +421,39 @@ impl SseFilterState {
     fn rewrite_event(event_type: &str, data: &serde_json::Value) -> Vec<u8> {
         format!("event: {event_type}\ndata: {data}").into_bytes()
     }
+}
+
+/// 剥掉文本里的内联 `<thinking>...</thinking>` 标签（含内容），跨 chunk 状态由 `in_thinking`
+/// 携带。deepseek 可能以**文本**形式吐 thinking（非结构化块），对齐主路径
+/// `strip_inline_thinking_when_disabled` 的口径 —— 客户端没要就不给。
+fn strip_inline_thinking(text: &str, in_thinking: &mut bool) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        if *in_thinking {
+            match rest.find("</thinking>") {
+                Some(i) => {
+                    // 剥到 </thinking> 之后，退出 thinking 态，继续处理剩余（可能又有新标签）。
+                    rest = &rest[i + "</thinking>".len()..];
+                    *in_thinking = false;
+                }
+                None => break, // 整段在 thinking 内，剥光
+            }
+        } else {
+            match rest.find("<thinking>") {
+                Some(i) => {
+                    out.push_str(&rest[..i]);
+                    rest = &rest[i + "<thinking>".len()..];
+                    *in_thinking = true;
+                }
+                None => {
+                    out.push_str(rest);
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// 在 buf 中找事件分隔符（`\n\n` 或 `\r\n\r\n`）的**起始**位置；找不到返 None。
@@ -596,6 +708,79 @@ mod tests {
             "有 content 事件不应补 error，实际: {filtered}"
         );
         assert!(filtered.contains("\"type\":\"text\""), "text 块保留");
+    }
+
+    /// 🔴 回归：滤掉 thinking 后，message_delta 的 usage.output_tokens 应扣减估算的
+    /// thinking token（字符数/4），对齐主路径「剥离的 thinking 不计入 output_tokens」。
+    #[tokio::test]
+    async fn test_filter_sse_stream_deducts_thinking_from_usage() {
+        let input = format!(
+            "{}{}{}{}{}",
+            event(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#
+            ),
+            event(
+                "content_block_delta",
+                // 40 个字符的 thinking → 估算 10 token
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#
+            ),
+            event("content_block_stop", r#"{"type":"content_block_stop","index":0}"#),
+            event(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#
+            ),
+            event(
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":500}}"#
+            ),
+        );
+        let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(input))]);
+        let filtered = collect_filtered(filter_sse_stream(stream)).await;
+        assert!(
+            filtered.contains("\"output_tokens\":490"),
+            "output_tokens 应从 500 扣减 10（40 字符/4），实际: {filtered}"
+        );
+    }
+
+    /// 内联 `<thinking>...</thinking>` 标签剥离（跨 chunk 状态）。
+    #[tokio::test]
+    async fn test_filter_sse_stream_strips_inline_thinking() {
+        let input = format!(
+            "{}{}",
+            event(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#
+            ),
+            event(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"A <thinking>secret reason</thinking> B"}}"#
+            ),
+        );
+        let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(input))]);
+        let filtered = collect_filtered(filter_sse_stream(stream)).await;
+        assert!(
+            !filtered.contains("secret reason"),
+            "内联 thinking 内容必须剥掉，实际: {filtered}"
+        );
+        assert!(filtered.contains("A"), "标签前文本保留");
+        assert!(filtered.contains("B"), "标签后文本保留");
+    }
+
+    /// 非流式 JSON：内联 thinking 标签剥离。
+    #[test]
+    fn test_filter_json_bytes_strips_inline_thinking() {
+        let input = serde_json::json!({
+            "id": "msg_1",
+            "content": [
+                {"type": "text", "text": "A <thinking>secret</thinking> B"}
+            ]
+        });
+        let out = filter_json_bytes(input.to_string().as_bytes());
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let text = v["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("secret"), "内联 thinking 必须剥，实际: {text}");
+        assert!(text.contains("A") && text.contains("B"), "标签外文本保留");
     }
 
     /// 🔴 回归：`redacted_thinking`（超预算的合法类型）流式路径也要整块滤掉。

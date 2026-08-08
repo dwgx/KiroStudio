@@ -21,10 +21,11 @@
 //! - **多轮带工具**：thinking 非 disabled 时，assistant 历史消息含 `tool_use` 而无 `thinking`
 //!   块 → 次轮间歇 400（deepseek 要求回传 reasoning 内容），须注入空 thinking 块。
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// opencodezen 只认的 fallback 模型名（对齐 fuckopencode `DEFAULT_FALLBACK_MODEL`）。
-const DEFAULT_FALLBACK_MODEL: &str = "deepseek-v4-flash";
+pub const DEFAULT_FALLBACK_MODEL: &str = "deepseek-v4-flash";
 
 /// thinking 开启时 `max_tokens` 的下限。
 ///
@@ -36,11 +37,73 @@ const DEFAULT_FALLBACK_MODEL: &str = "deepseek-v4-flash";
 /// 生效；thinking disabled 尊重客户端明确的小预算。
 const DEEPSEEK_MIN_MAX_TOKENS: u64 = 4096;
 
+/// deepseek 归一化配置（全局 `config.deepseek_normalize` 或 per-凭据 `deepseek_normalize_config`）。
+///
+/// per-凭据覆盖全局：`fallback_model` 空串 / `min_max_tokens == 0` 表示"未设，用全局"；
+/// bool 开关一律取全局（per-凭据不覆盖 bool，避免「per-凭据默认 true 覆盖全局 false」的歧义）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct DeepseekNormalizeConfig {
+    /// 模型名 fallback（非 deepseek-* 统一映射到此）。
+    pub fallback_model: String,
+    /// thinking 显式开启时 `max_tokens` 的下限。
+    pub min_max_tokens: u64,
+    /// 剥 `tools[]` 里的 web_search 工具（deepseek 不认 `web_search_20250305` type）。
+    pub strip_web_search_tool: bool,
+    /// 剥 `tool_choice.disable_parallel_tool_use`（可能触发 Extra inputs）。
+    pub strip_tool_choice_parallel: bool,
+    /// 剥 `system` 数组元素的 `cache_control` 块。
+    pub strip_system_cache_control: bool,
+    /// 响应侧剥内联 `<thinking>...</thinking>` 文本。
+    pub strip_inline_thinking: bool,
+    /// `tools[].input_schema` 通用修复（$ref 展开 + 白名单清洗）。
+    pub fix_schema: bool,
+}
+
+impl Default for DeepseekNormalizeConfig {
+    fn default() -> Self {
+        Self {
+            fallback_model: DEFAULT_FALLBACK_MODEL.to_string(),
+            min_max_tokens: DEEPSEEK_MIN_MAX_TOKENS,
+            strip_web_search_tool: true,
+            strip_tool_choice_parallel: true,
+            strip_system_cache_control: true,
+            strip_inline_thinking: true,
+            fix_schema: true,
+        }
+    }
+}
+
+impl DeepseekNormalizeConfig {
+    /// per-凭据覆盖全局：字符串/数字未设（空/0）继承全局，bool 一律全局。
+    pub fn merge_over(&self, global: &DeepseekNormalizeConfig) -> DeepseekNormalizeConfig {
+        DeepseekNormalizeConfig {
+            fallback_model: if self.fallback_model.is_empty() {
+                global.fallback_model.clone()
+            } else {
+                self.fallback_model.clone()
+            },
+            min_max_tokens: if self.min_max_tokens == 0 {
+                global.min_max_tokens
+            } else {
+                self.min_max_tokens
+            },
+            strip_web_search_tool: global.strip_web_search_tool,
+            strip_tool_choice_parallel: global.strip_tool_choice_parallel,
+            strip_system_cache_control: global.strip_system_cache_control,
+            strip_inline_thinking: global.strip_inline_thinking,
+            fix_schema: global.fix_schema,
+        }
+    }
+}
+
 /// 对一次 Anthropic `/v1/messages` 请求体做 deepseek 归一化(就地修改)。
 ///
 /// 幂等:对任意 Anthropic 请求安全,不改消息语义,只调整协议字段。
 /// 非对象 / 非 JSON 结构直接忽略,不会 panic。
-pub fn normalize_request(value: &mut Value) {
+///
+/// `cfg` 为已合并的配置（per-凭据覆盖全局后的最终值），由调用方构造。
+pub fn normalize_request(value: &mut Value, cfg: &DeepseekNormalizeConfig) {
     let obj = match value.as_object_mut() {
         Some(o) => o,
         None => return,
@@ -48,10 +111,13 @@ pub fn normalize_request(value: &mut Value) {
 
     // 0) 模型名重写：opencodezen 只认 deepseek-v4-flash 等精确名，claude-*/gpt-* 会被上游
     //    401（对齐 fuckopencode `resolveModelName`：命中 map 用映射值，否则 fallback）。
-    //    KiroStudio 无 modelMap 配置，简单规则：deepseek-* 保留，其余统一映射到 fallback。
+    //    简单规则：deepseek-* 保留，其余统一映射到 cfg.fallback_model。
     if let Some(model) = obj.get("model").and_then(|m| m.as_str()) {
         if !model.starts_with("deepseek-") {
-            obj.insert("model".into(), serde_json::json!(DEFAULT_FALLBACK_MODEL));
+            obj.insert(
+                "model".into(),
+                serde_json::json!(cfg.fallback_model),
+            );
         }
     }
 
@@ -117,12 +183,64 @@ pub fn normalize_request(value: &mut Value) {
         obj.remove("output_config");
     }
 
-    // 4) 工具上的 strict/defer_loading 也会 400,剥离。
+    // 4) 工具处理：strict/defer_loading 剥离（上游硬拒 "Extra inputs"）；
+    //    WebSearch 工具剥除（deepseek 不认 `web_search_20250305` type，见 cfg）；
+    //    input_schema 通用修复（$ref 展开 + 白名单，见 cfg.fix_schema）。
     if let Some(tools) = obj.get_mut("tools").and_then(|v| v.as_array_mut()) {
+        // 先剥 strict/defer_loading + web_search 工具（原地过滤），再逐工具修 schema。
+        tools.retain(|tool| {
+            let Some(t) = tool.as_object() else { return true };
+            if cfg.strip_web_search_tool {
+                // web_search_20250305 工具：type 字段含 web_search → 剥（deepseek 不认）。
+                let tool_type = t.get("type").and_then(|x| x.as_str());
+                let name = t.get("name").and_then(|x| x.as_str()).unwrap_or("");
+                if tool_type.is_some_and(|ty| ty.contains("web_search"))
+                    || name.contains("web_search")
+                {
+                    return false;
+                }
+            }
+            true
+        });
         for tool in tools {
             if let Some(t) = tool.as_object_mut() {
                 t.remove("strict");
                 t.remove("defer_loading");
+                // 通用 schema 修复：$ref 展开 + 白名单清洗（仅留七键，剥 anyOf/oneOf/allOf）。
+                if cfg.fix_schema {
+                    if let Some(schema) = t.get_mut("input_schema") {
+                        crate::kiro::deepseek_schema::fix_schema(schema);
+                    }
+                }
+            }
+        }
+    }
+    // 4.1) 剥 WebSearch 的 tool_choice（deepseek 不认 web_search 类型的 tool_choice）。
+    if cfg.strip_web_search_tool {
+        if let Some(tc) = obj.get_mut("tool_choice") {
+            let is_web_search = tc
+                .get("type")
+                .and_then(|x| x.as_str())
+                .is_some_and(|ty| ty.contains("web_search"));
+            if is_web_search {
+                obj.remove("tool_choice");
+            }
+        }
+    }
+    // 4.2) 剥 tool_choice.disable_parallel_tool_use（Claude Code 新版发，deepseek 可能 "Extra inputs"）。
+    if cfg.strip_tool_choice_parallel {
+        if let Some(tc) = obj.get_mut("tool_choice").and_then(|v| v.as_object_mut()) {
+            tc.remove("disable_parallel_tool_use");
+            tc.remove("parallel_tool_use");
+        }
+    }
+    // 4.3) 剥 system 数组元素的 cache_control 块（Claude Code 发数组 system 含缓存断点）。
+    if cfg.strip_system_cache_control {
+        if let Some(sys) = obj.get_mut("system").and_then(|v| v.as_array_mut()) {
+            for block in sys.iter_mut() {
+                if let Some(b) = block.as_object_mut() {
+                    b.remove("cache_control");
+                }
             }
         }
     }
@@ -140,12 +258,13 @@ pub fn normalize_request(value: &mut Value) {
     //    ⚠️ 用 `thinking_explicitly_enabled` 而非 `!thinking_disabled`：thinking 字段缺失时
     //    deepseek 默认不开 thinking，小预算不会被吃光，抬升只会白白放大输出成本。
     if thinking_explicitly_enabled {
+        let min = cfg.min_max_tokens;
         match obj.get("max_tokens").and_then(|v| v.as_u64()) {
             None => {
-                obj.insert("max_tokens".into(), serde_json::json!(DEEPSEEK_MIN_MAX_TOKENS));
+                obj.insert("max_tokens".into(), serde_json::json!(min));
             }
-            Some(n) if n < DEEPSEEK_MIN_MAX_TOKENS => {
-                obj.insert("max_tokens".into(), serde_json::json!(DEEPSEEK_MIN_MAX_TOKENS));
+            Some(n) if n < min => {
+                obj.insert("max_tokens".into(), serde_json::json!(min));
             }
             Some(_) => {}
         }
@@ -189,7 +308,7 @@ mod tests {
 
     fn norm(input: serde_json::Value) -> serde_json::Value {
         let mut v = input;
-        normalize_request(&mut v);
+        normalize_request(&mut v, &DeepseekNormalizeConfig::default());
         v
     }
 
@@ -399,9 +518,99 @@ mod tests {
             "tools": [ { "name": "a", "strict": true } ]
         });
         let mut once = input.clone();
-        normalize_request(&mut once);
+        normalize_request(&mut once, &DeepseekNormalizeConfig::default());
         let mut twice = once.clone();
-        normalize_request(&mut twice);
+        normalize_request(&mut twice, &DeepseekNormalizeConfig::default());
         assert_eq!(once, twice, "二次归一化结果不变");
+    }
+
+    /// 请求侧补坑：WebSearch 工具剥除（deepseek 不认 web_search_20250305 type）。
+    #[test]
+    fn strips_web_search_tool() {
+        let out = norm(serde_json::json!({
+            "tools": [
+                { "type": "custom", "name": "fs_write", "input_schema": { "type": "object" } },
+                { "type": "web_search_20250305", "name": "web_search", "max_uses": 5 }
+            ],
+            "tool_choice": { "type": "auto" }
+        }));
+        let tools = out["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1, "web_search 工具必须剥掉");
+        assert_eq!(tools[0]["name"], "fs_write", "普通工具保留");
+    }
+
+    /// 请求侧补坑：web_search 的 tool_choice 剥除 + disable_parallel_tool_use 剥除。
+    #[test]
+    fn strips_web_search_choice_and_parallel() {
+        // web_search 类型的 tool_choice 整体剥
+        let out = norm(serde_json::json!({
+            "tool_choice": { "type": "web_search_20250305" }
+        }));
+        assert!(out.get("tool_choice").is_none(), "web_search tool_choice 必须剥");
+
+        // disable_parallel_tool_use 剥，保留 type
+        let out2 = norm(serde_json::json!({
+            "tool_choice": { "type": "auto", "disable_parallel_tool_use": true }
+        }));
+        assert_eq!(out2["tool_choice"], serde_json::json!({ "type": "auto" }));
+    }
+
+    /// 请求侧补坑：system 数组元素的 cache_control 剥除（内容保留）。
+    #[test]
+    fn strips_system_cache_control() {
+        let out = norm(serde_json::json!({
+            "system": [
+                { "type": "text", "text": "hello", "cache_control": { "type": "ephemeral" } },
+                { "type": "text", "text": "world" }
+            ]
+        }));
+        let sys = out["system"].as_array().unwrap();
+        assert!(
+            sys.iter().all(|b| b.get("cache_control").is_none()),
+            "system 数组的 cache_control 必须剥掉"
+        );
+        assert_eq!(sys[0]["text"], "hello", "文本内容保留");
+    }
+
+    /// 配置化：自定义 cfg（fallback_model / min_max_tokens）生效。
+    #[test]
+    fn uses_custom_config_values() {
+        let cfg = DeepseekNormalizeConfig {
+            fallback_model: "custom-model".to_string(),
+            min_max_tokens: 1234,
+            ..Default::default()
+        };
+        let mut v = serde_json::json!({
+            "model": "claude-sonnet-4",
+            "thinking": { "type": "enabled" },
+            "max_tokens": 100
+        });
+        normalize_request(&mut v, &cfg);
+        assert_eq!(v["model"], "custom-model", "自定义 fallback_model");
+        assert_eq!(v["max_tokens"], 1234, "自定义 min_max_tokens");
+    }
+
+    /// per-凭据 merge：空 fallback/0 min_max 继承全局。
+    #[test]
+    fn merge_over_inherits_global_defaults() {
+        let global = DeepseekNormalizeConfig {
+            fallback_model: "global-model".to_string(),
+            min_max_tokens: 999,
+            ..Default::default()
+        };
+        let per_cred = DeepseekNormalizeConfig {
+            fallback_model: String::new(), // 未设 → 继承全局
+            min_max_tokens: 0,             // 未设 → 继承全局
+            ..Default::default()
+        };
+        let merged = per_cred.merge_over(&global);
+        assert_eq!(merged.fallback_model, "global-model");
+        assert_eq!(merged.min_max_tokens, 999);
+        // bool 一律取全局
+        let global_off = DeepseekNormalizeConfig {
+            strip_web_search_tool: false,
+            ..Default::default()
+        };
+        assert!(!per_cred.merge_over(&global_off).strip_web_search_tool);
     }
 }
