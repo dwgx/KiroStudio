@@ -614,13 +614,6 @@ pub struct ProbeModelsRequest {
     pub api_key: Option<String>,
 }
 
-/// 创建前探测代挂上游模型列表的响应。
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProbeModelsResponse {
-    pub models: Vec<String>,
-}
-
 /// 添加凭据成功响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

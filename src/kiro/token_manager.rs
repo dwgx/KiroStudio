@@ -836,7 +836,7 @@ fn rest_api_region_candidates(sso_region: &str) -> [&'static str; 2] {
 /// （代理软件 fake-IP 池默认段）——否则开着 Clash fake-IP 的机器上**任何**中转站域名
 /// 都会解析到该段而无法添加（实测 api.uu6.top → 198.18.0.46）。私有段、环回、
 /// 云元数据端点仍然全部拦下。理由详见 `ssrf::is_forbidden_ipv4_with` 的文档。
-async fn validate_custom_api_base_url(base_raw: &str) -> anyhow::Result<()> {
+pub(crate) async fn validate_custom_api_base_url(base_raw: &str) -> anyhow::Result<()> {
     let base = base_raw.trim().trim_end_matches('/');
     let url = if base.ends_with("/v1") || base.contains("/v1/") {
         format!("{base}/messages")

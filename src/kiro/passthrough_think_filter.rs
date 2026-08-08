@@ -94,14 +94,23 @@ where
     }
 }
 
-/// SSE 事件切分 + thinking 过滤状态。
+/// SSE 事件切分 + thinking 过滤 + content_block index 重映射状态。
+///
+/// 除了滤掉 thinking 块，还要**重编号**保留块的 content_block index：
+/// 上游在 thinking disabled 时可能发 `index=0 thinking, index=1 text`，直接滤掉 thinking
+/// 会让 text 块从 index=1 开始、客户端 `content[0]` 缺失（Anthropic 协议要求 index 从 0
+/// 连续）。故保留的块按出现顺序重新分配 0..N。
 struct SseFilterState {
     /// 未闭合字节缓冲（等待事件结束空行）。
     buf: Vec<u8>,
     /// 已切出完整事件但尚未吐出的过滤结果。
     pending: Vec<Bytes>,
-    /// 当前是否处于 thinking 块内（按 content_block 的 index）。
+    /// 旧 index → 是否 thinking 块（用于丢弃 thinking 的 delta/stop）。
     in_thinking: HashMap<usize, bool>,
+    /// 旧 index → 新 index（重编号映射）。
+    index_map: HashMap<usize, usize>,
+    /// 下一个新 index。
+    next_index: usize,
 }
 
 impl SseFilterState {
@@ -110,6 +119,8 @@ impl SseFilterState {
             buf: Vec::with_capacity(1024),
             pending: Vec::new(),
             in_thinking: HashMap::new(),
+            index_map: HashMap::new(),
+            next_index: 0,
         }
     }
 
@@ -121,8 +132,8 @@ impl SseFilterState {
             // 事件块 = sep 之前的内容（含 event:/data: 行），sep 本身（空行）作为分隔保留在输出。
             let block: Vec<u8> = self.buf.drain(..sep).collect();
             let sep_bytes = drain_separator(&mut self.buf);
-            if self.should_keep(&block) {
-                let mut event = block;
+            if let Some(mut event) = self.process_block(&block) {
+                // process_block 统一返回**不含**事件分隔符的内容；这里补回原空行。
                 event.extend_from_slice(&sep_bytes);
                 self.pending.push(Bytes::from(event));
             }
@@ -147,17 +158,18 @@ impl SseFilterState {
         Bytes::from(tail)
     }
 
-    /// 判断一个完整 SSE 事件块是否保留。
+    /// 处理一个完整 SSE 事件块，返回 `None` = 丢弃（thinking 块），`Some(bytes)` = 透传
+    /// （**不含**事件分隔符，由调用方统一补回）。
     ///
     /// 丢弃规则：
     /// - `content_block_start` 且 `content_block.type == "thinking"` → 记录该 index 在 thinking 内，丢弃；
-    /// - `content_block_start` 其它 type → 该 index 不在 thinking 内，透传；
+    /// - `content_block_start` 其它 type → 分配连续新 index，**重写** data 里的 index，透传；
     /// - `content_block_delta` 且 `delta.type` ∈ {thinking_delta, signature_delta} 且该 index 在 thinking 内 → 丢弃；
     /// - `content_block_stop` 且该 index 在 thinking 内 → 丢弃（并清除该 index 状态）；
     /// - 其余（message_start/delta/stop、ping、error、未知）→ 透传。
     ///
-    /// 解析失败（非 JSON data、缺 event 行）→ fail-open 透传。
-    fn should_keep(&mut self, block: &[u8]) -> bool {
+    /// 解析失败（非 JSON data、缺 event 行）→ fail-open 原样透传。
+    fn process_block(&mut self, block: &[u8]) -> Option<Vec<u8>> {
         let text = String::from_utf8_lossy(block);
         let mut event_type = "";
         let mut data = "";
@@ -169,11 +181,12 @@ impl SseFilterState {
             }
         }
         if event_type.is_empty() || data.is_empty() {
-            return true; // 不认识的形态，原样透传
+            return Some(block.to_vec());
         }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
-            return true; // data 不是 JSON，fail-open
+        let Ok(mut v) = serde_json::from_str::<serde_json::Value>(data) else {
+            return Some(block.to_vec());
         };
+        let old_idx = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
         match event_type {
             "content_block_start" => {
                 let is_thinking = v
@@ -181,28 +194,61 @@ impl SseFilterState {
                     .and_then(|cb| cb.get("type"))
                     .and_then(|t| t.as_str())
                     == Some("thinking");
-                let idx = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
-                self.in_thinking.insert(idx, is_thinking);
-                !is_thinking
+                self.in_thinking.insert(old_idx, is_thinking);
+                if is_thinking {
+                    return None;
+                }
+                // 保留块：分配连续新 index，重写 data。
+                let new_idx = self.next_index;
+                self.next_index += 1;
+                self.index_map.insert(old_idx, new_idx);
+                v["index"] = serde_json::json!(new_idx);
+                Some(Self::rewrite_event(event_type, &v))
             }
             "content_block_delta" => {
                 let delta_type = v
                     .get("delta")
                     .and_then(|d| d.get("type"))
                     .and_then(|t| t.as_str());
-                let idx = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
-                let in_thinking = self.in_thinking.get(&idx).copied().unwrap_or(false);
+                let in_thinking = self.in_thinking.get(&old_idx).copied().unwrap_or(false);
                 let is_thinking_delta =
                     matches!(delta_type, Some("thinking_delta") | Some("signature_delta"));
-                !(in_thinking && is_thinking_delta)
+                if in_thinking && is_thinking_delta {
+                    return None;
+                }
+                self.rewrite_index_or_passthrough(&mut v, event_type, block, old_idx)
             }
             "content_block_stop" => {
-                let idx = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
-                let was_thinking = self.in_thinking.remove(&idx).unwrap_or(false);
-                !was_thinking
+                let was_thinking = self.in_thinking.remove(&old_idx).unwrap_or(false);
+                if was_thinking {
+                    return None;
+                }
+                self.rewrite_index_or_passthrough(&mut v, event_type, block, old_idx)
             }
-            _ => true,
+            _ => Some(block.to_vec()),
         }
+    }
+
+    /// delta/stop 透传时若该 index 有重映射则重写，否则原样。
+    fn rewrite_index_or_passthrough(
+        &self,
+        v: &mut serde_json::Value,
+        event_type: &str,
+        block: &[u8],
+        old_idx: usize,
+    ) -> Option<Vec<u8>> {
+        match self.index_map.get(&old_idx) {
+            Some(&new_idx) => {
+                v["index"] = serde_json::json!(new_idx);
+                Some(Self::rewrite_event(event_type, v))
+            }
+            None => Some(block.to_vec()), // 未映射（理论不该发生），fail-open 原样
+        }
+    }
+
+    /// 把重写后的 data 重组成 SSE 事件（`event:` + `data:`，**不含**结尾空行）。
+    fn rewrite_event(event_type: &str, data: &serde_json::Value) -> Vec<u8> {
+        format!("event: {event_type}\ndata: {data}").into_bytes()
     }
 }
 
@@ -243,6 +289,16 @@ mod tests {
             .collect()
     }
 
+    /// 从过滤后的 SSE 文本提取每个 `data:` 行的 content_block `index`（按出现顺序）。
+    /// 用于断言 index 重编号，规避 serde_json 重排 key 导致的子串顺序问题。
+    fn extract_indices(s: &str) -> Vec<u64> {
+        s.lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+            .filter_map(|v| v.get("index").and_then(|i| i.as_u64()))
+            .collect()
+    }
+
     /// 端到端：SSE 流里 thinking 块全滤，text 块透传，其它事件透传。
     #[tokio::test]
     async fn test_filter_sse_stream_removes_thinking_block() {
@@ -279,6 +335,13 @@ mod tests {
         assert!(joined.contains("\"type\":\"text\""), "text start 必须透传");
         assert!(joined.contains("message_start"), "message_start 必须透传");
         assert!(joined.contains("message_stop"), "message_stop 必须透传");
+        // ⭐ index 重映射：thinking(0) 被滤后，text 块从 index=1 重编号为 0。
+        let indices = extract_indices(&joined);
+        assert!(!indices.is_empty(), "保留的块应带 index");
+        assert!(
+            indices.iter().all(|&i| i == 0),
+            "滤掉 thinking(0) 后所有保留块 index 应重编号为 0，实际 {indices:?}"
+        );
     }
 
     /// 交错块：thinking 与 text 交替，index 状态不能串。
@@ -325,6 +388,14 @@ mod tests {
         assert!(filtered.contains("text_delta"), "text 块必须保留");
         assert!(filtered.contains("\"text\":\"A\""), "text A 保留");
         assert!(filtered.contains("\"text\":\"B\""), "text B 保留");
+        // index 重映射：thinking(0) 被滤，text(1)→0、text(2)→1，无空洞。
+        // 事件顺序：textA start(0) delta(0) stop(0) textB start(1) delta(1)。
+        let indices = extract_indices(&filtered);
+        assert_eq!(
+            indices,
+            vec![0, 0, 0, 1, 1],
+            "text 块应重编号为连续 0,1（消除 thinking 造成的空洞），实际 {indices:?}"
+        );
     }
 
     /// chunk 跨界：事件被拆到多个 chunk，仍能正确切分过滤。

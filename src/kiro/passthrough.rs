@@ -15,10 +15,15 @@ use bytes::Bytes;
 // TryStreamExt 提供 map_err（错误传播）；StreamExt 的 map 不再需要。
 use futures::TryStreamExt;
 
+use crate::common::http_read::read_body_capped;
 use crate::http_client::build_streaming_client_no_redirect;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::passthrough_think_filter::{filter_json_bytes, filter_sse_stream};
 use crate::model::config::TlsBackend;
+
+/// 非流式响应过滤前允许读取的最大字节数。非流式 JSON 响应通常远小于此；
+/// 纯防御上限，防恶意上游吐超大 body 顶爆内存。
+const PASSTHROUGH_JSON_CAP_BYTES: u64 = 32 * 1024 * 1024;
 
 /// 把一次 Anthropic 请求原样透传到自定义 API 上游,响应流式原样返回。
 ///
@@ -161,7 +166,8 @@ pub async fn forward(
             .unwrap_or_else(|_| err_response(StatusCode::BAD_GATEWAY, "构建透传响应失败"))
     } else if filter_thinking && content_type.contains("application/json") {
         // 非流式:缓冲完整 body 过滤（Content-Length 本就不透传,无需重算）。
-        match upstream.bytes().await {
+        // 用 read_body_capped 给 body 加 32MiB 上限,防恶意上游吐超大 JSON 顶爆内存。
+        match read_body_capped(upstream, "透传非流式响应", PASSTHROUGH_JSON_CAP_BYTES).await {
             Ok(body) => {
                 let filtered = filter_json_bytes(&body);
                 Response::builder()

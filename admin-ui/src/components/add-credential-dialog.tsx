@@ -628,6 +628,11 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         onOpenChange={(o) => {
           if (!o && !importing) {
             resetPaste()
+            // 探测结果是**绑定具体 baseUrl/key** 的缓存：关闭弹框必须清掉，
+            // 否则下次打开（可能换了 baseUrl）旧白名单残留、随提交误写进新凭据。
+            setUpstreamModels(null)
+            setProbeError('')
+            setUpstreamSelected(new Set())
           }
           onOpenChange(o)
         }}
@@ -779,6 +784,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                         {t('addcredentialdialog.probe.label')}
                       </label>
                       <Button
+                        type="button"
                         size="sm"
                         variant="outline"
                         className="h-7 text-xs"
@@ -827,6 +833,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                         {upstreamModels.length > 0 && (
                           <div className="flex items-center justify-between gap-2">
                             <Button
+                              type="button"
                               size="sm"
                               variant="outline"
                               className="h-7 text-xs"
