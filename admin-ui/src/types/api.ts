@@ -310,6 +310,10 @@ export interface ConfigSnapshotResponse {
   defaultEndpoint: string
   endpointNames: string[]
   extractThinking: boolean
+  /** 严格 prompt 缓存观测开关（本地推断，非 Kiro 回执） */
+  promptCacheEnabled: boolean
+  /** 严格缓存成功检查点 TTL（秒） */
+  promptCacheTtlSeconds: number
   ccAutoBuffer: boolean
   stripEnvNoise: boolean
   toolCleanLeakedTokens: boolean
@@ -357,6 +361,10 @@ export interface ConfigSnapshotResponse {
   proxyUrl?: string
   hasAdminKey: boolean
   hasApiKey: boolean
+  /** Relay 频道专用密钥是否已配置；后端绝不回显原值。 */
+  relayApiKeyConfigured: boolean
+  /** 拼车管理二次密码是否已配置；只返回布尔。 */
+  portalAdminPasswordConfigured: boolean
   callbackMode: string
   callbackBaseUrl?: string
   // 反代安全（批次3）
@@ -377,6 +385,15 @@ export interface ConfigSnapshotResponse {
   loginBackgroundR18?: boolean
   // 隐私：是否采集下游客户端指纹（设备/IP/系统/浏览器）。立即生效，无需重启。缺省视为开启。
   collectClientFingerprint?: boolean
+  // ---- 车队频道（Portal）。四项全部立即生效，无需重启 ----
+  // 总开关。关闭时 /portal 全部返回 404（连页面本身也 404，不确认功能存在）。
+  portalEnabled?: boolean
+  // 注册码**是否已配置**。后端只回布尔，绝不回显注册码本身——它是一把凭据。
+  portalInviteCodeConfigured?: boolean
+  // 是否强制 HTTPS 才允许上车/查看明文。
+  portalRequireHttps?: boolean
+  // 积分制开关。关闭时明文对已登录用户直接可见（不需要花积分上车）。
+  portalCreditsEnabled?: boolean
   configPath?: string
 }
 
@@ -432,6 +449,10 @@ export interface UpdateConfigRequest {
   proxyPassword?: string
   /** userKey（对话 api_key）：留空不改，填了更新，需重启生效 */
   apiKey?: string
+  /** 既有批量导入通道密钥；与 Relay 频道隔离。 */
+  importApiKey?: string
+  /** Relay 单条推送频道专用密钥：填入即启用/轮换，空串即停用；立即生效。 */
+  relayApiKey?: string
   callbackBaseUrl?: string
   // 反代安全（批次3，整表替换语义）
   corsAllowedOrigins?: string[]
@@ -451,6 +472,13 @@ export interface UpdateConfigRequest {
   loginBackgroundR18?: boolean
   // 隐私：采集下游客户端指纹开关（立即生效，无需重启）
   collectClientFingerprint?: boolean
+  // ---- 车队频道（Portal）。四项全部立即生效，无需重启 ----
+  portalEnabled?: boolean
+  // 注册码。提交空串 = **清除**（关闭自注册通道，已注册用户仍可登录）；
+  // 不提交此字段 = 不改动。与三把 API key 里的 importApiKey 同语义。
+  portalInviteCode?: string
+  portalRequireHttps?: boolean
+  portalCreditsEnabled?: boolean
 }
 
 // 更新服务端配置响应
@@ -474,6 +502,16 @@ export interface WindowSummary {
   total_tokens: number
   credits_used: number
   avg_latency_ms: number
+  /** 实际执行过严格缓存探针的请求数（命中率分母） */
+  cache_observed_requests: number
+  /** 命中此前完整成功检查点的请求数 */
+  cache_hit_requests: number
+  /** 严格缓存命中率（0~1） */
+  cache_hit_rate: number
+  /** 严格推断复用的输入 tokens */
+  cache_read_tokens: number
+  /** 缓存创建 tokens；Kiro 无回执时通常为 0 */
+  cache_creation_tokens: number
 }
 
 // 概览：24h / 7d / 30d 三窗口
@@ -632,6 +670,8 @@ export interface RequestRecord {
   cache_read_tokens?: number
   /** 写入缓存的输入 token（cache_creation_input_tokens）。后端 BE-A1 补，缺省 0。 */
   cache_creation_tokens?: number
+  /** 是否实际执行过严格缓存探针；false 不能解释为 miss */
+  cache_observed?: boolean
 }
 
 // 单台机器（按设备指纹分组，IP 变化不拆分）的 RPM 视图（对接 GET /usage/machines）。

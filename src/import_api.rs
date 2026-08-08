@@ -1,12 +1,21 @@
-//! External Kiro API-key batch import endpoint (`POST /api/import/keys`).
+//! External Kiro API-key import endpoints.
+//!
+//! - `POST /api/import/keys`: existing batch protocol.
+//! - `POST /api/import/push`: single-key relay protocol with persistent delivery idempotency.
 
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    fs::{self, OpenOptions},
+    io::Write,
+    path::PathBuf,
+    sync::{Arc, Weak},
+};
 
 use axum::{
     Json, Router,
     body::Body,
     extract::{DefaultBodyLimit, Request, State, rejection::JsonRejection},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::post,
@@ -26,6 +35,79 @@ use crate::{
 #[derive(Clone)]
 struct ImportState {
     manager: Arc<MultiTokenManager>,
+    relay_ledger: Arc<tokio::sync::Mutex<RelayLedger>>,
+    relay_delivery_locks: Arc<tokio::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayDeliveryRecord {
+    delivery_id: String,
+    key_sha256: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credential_id: Option<u64>,
+    at_ms: i64,
+}
+
+struct RelayLedger {
+    path: Option<PathBuf>,
+    deliveries: HashMap<String, RelayDeliveryRecord>,
+}
+
+impl RelayLedger {
+    fn load(manager: &MultiTokenManager) -> Self {
+        let path = manager.credentials_path().map(|credentials| {
+            credentials
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("relay-deliveries.ndjson")
+        });
+        Self::from_path(path)
+    }
+
+    fn from_path(path: Option<PathBuf>) -> Self {
+        let mut deliveries = HashMap::new();
+        if let Some(path) = &path {
+            if let Ok(raw) = fs::read_to_string(path) {
+                for record in raw
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<RelayDeliveryRecord>(line).ok())
+                {
+                    deliveries.insert(record.delivery_id.clone(), record);
+                }
+            }
+            #[cfg(unix)]
+            if path.exists() {
+                use std::os::unix::fs::PermissionsExt;
+                if let Err(error) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+                    tracing::warn!(path = %path.display(), "无法收紧 relay 账本权限: {error}");
+                }
+            }
+        }
+        Self { path, deliveries }
+    }
+
+    fn append(&mut self, record: RelayDeliveryRecord) -> Result<(), String> {
+        if let Some(path) = &self.path {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            let mut options = OpenOptions::new();
+            options.create(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(path).map_err(|error| error.to_string())?;
+            let line = serde_json::to_string(&record).map_err(|error| error.to_string())?;
+            writeln!(file, "{line}").map_err(|error| error.to_string())?;
+            file.sync_data().map_err(|error| error.to_string())?;
+        }
+        self.deliveries.insert(record.delivery_id.clone(), record);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,6 +131,19 @@ struct ImportItem {
     groups: Vec<serde_json::Value>,
     #[serde(default)]
     endpoint: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RelayPushRequest {
+    #[serde(default)]
+    secret: Option<String>,
+    key: String,
+    #[serde(default)]
+    region: Option<String>,
+    #[serde(default)]
+    delivery_id: Option<String>,
+    #[serde(default)]
+    key_sha256: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -103,12 +198,27 @@ struct ImportItemResponse {
 /// 这样运维在面板里填上 key 即可启用通道，不必重启。暴露面从 404 变 401，
 /// 两者都不泄露信息（见 auth_keys 模块级说明）。
 pub fn create_router(manager: Arc<MultiTokenManager>) -> Router {
-    let state = ImportState { manager };
-    Router::new()
+    let state = ImportState {
+        relay_ledger: Arc::new(tokio::sync::Mutex::new(RelayLedger::load(&manager))),
+        relay_delivery_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        manager,
+    };
+    // Keep the production batch-import route as its own unchanged router tree. In particular,
+    // its auth middleware, 1 MiB limit, response headers, request/response schema and importApiKey
+    // remain independent from the new Relay route.
+    let batch = Router::new()
         .route("/keys", post(import_keys))
         .layer(middleware::from_fn(import_auth))
-        .layer(DefaultBodyLimit::max(1024 * 1024))
-        .with_state(state)
+        .layer(DefaultBodyLimit::max(1024 * 1024));
+
+    let relay = Router::new()
+        .route("/push", post(import_push))
+        // Relay responses carry credential metadata and must never be cached. This middleware is
+        // intentionally absent from `batch`, preserving the existing /keys response headers.
+        .layer(middleware::from_fn(crate::common::http_cache::no_store))
+        .layer(DefaultBodyLimit::max(64 * 1024));
+
+    batch.merge(relay).with_state(state)
 }
 
 async fn import_auth(request: Request<Body>, next: Next) -> Response {
@@ -157,25 +267,24 @@ async fn import_keys(
     // 可观测摘要（进程级内存、零持久化）：面板据此显示最近几次推送，不必翻容器日志。
     // 面板记**完整 key**（运维需要直接取用/比对），仅受 admin 鉴权保护、不落盘、重启即失；
     // 回给推送方的 `ImportItemResponse.key` 仍是打码值（契约明确「不依赖完整值」）。
-    crate::common::import_stats::record_push(
-        results
-            .iter()
-            .map(|item| crate::common::import_stats::ImportItemRecord {
-                key: item.plain_key.clone(),
-                fingerprint: item.fingerprint.clone(),
-                ok: item.ok,
-                duplicate: item.duplicate.unwrap_or(false),
-                credential_id: item.credential_id,
-                error: item.error.clone(),
-                region: item.region.clone(),
-                endpoint: item.endpoint.clone(),
-                sent_region: item.sent_region.clone(),
-                sent_endpoint: item.sent_endpoint.clone(),
-                sent_groups: item.sent_groups.clone(),
-            })
-            .collect(),
-        started.elapsed().as_millis() as u64,
-    );
+    record_import_stats(&results, started.elapsed().as_millis() as u64, None);
+    // Portal 侧**持久**落盘（只存元数据，不存明文；未启用 portal 时是 no-op）。
+    // 与上面的 import_stats 并存而非替代：那个是进程级、重启归零、只留最近 20 次的运营计数；
+    // 这个是按 key 的持久视图，供 portal 用户查历史。两者口径不同，缺一不可。
+    {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        for item in &results {
+            crate::portal::sink::record_import(
+                &item.plain_key,
+                item.credential_id,
+                item.region.as_deref(),
+                item.endpoint.as_deref(),
+                item.ok,
+                item.error.as_deref(),
+                now_ms,
+            );
+        }
+    }
     Json(ImportResponse {
         success: failed == 0,
         total: results.len(),
@@ -184,6 +293,235 @@ async fn import_keys(
         items: results,
     })
     .into_response()
+}
+
+fn record_import_stats(results: &[ImportItemResponse], elapsed_ms: u64, delivery_id: Option<&str>) {
+    let items = results
+        .iter()
+        .map(|item| crate::common::import_stats::ImportItemRecord {
+            // Preserve the existing batch channel's admin-only plaintext record. The new
+            // Relay channel is stricter and records only the already-masked response key.
+            key: if delivery_id.is_some() {
+                item.key.clone()
+            } else {
+                item.plain_key.clone()
+            },
+            fingerprint: item.fingerprint.clone(),
+            ok: item.ok,
+            duplicate: item.duplicate.unwrap_or(false),
+            credential_id: item.credential_id,
+            error: item.error.clone(),
+            region: item.region.clone(),
+            endpoint: item.endpoint.clone(),
+            sent_region: item.sent_region.clone(),
+            sent_endpoint: item.sent_endpoint.clone(),
+            sent_groups: item.sent_groups.clone(),
+            delivery_id: delivery_id.map(str::to_string),
+        })
+        .collect();
+    if delivery_id.is_some() {
+        crate::common::import_stats::record_relay_push(items, elapsed_ms);
+    } else {
+        crate::common::import_stats::record_push(items, elapsed_ms);
+    }
+}
+
+async fn import_push(
+    State(state): State<ImportState>,
+    headers: HeaderMap,
+    payload: Result<Json<RelayPushRequest>, JsonRejection>,
+) -> Response {
+    let Json(payload) = match payload {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("invalid request body: {}", error.body_text())})),
+            )
+                .into_response();
+        }
+    };
+    let supplied_secret = payload
+        .secret
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .or_else(|| headers.get("x-relay-secret").and_then(|v| v.to_str().ok()))
+        .or_else(|| {
+            headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+        });
+    if !supplied_secret
+        .map(crate::common::auth_keys::relay_key_matches)
+        .unwrap_or(false)
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "invalid secret"})),
+        )
+            .into_response();
+    }
+    // Backward-compatible with the standalone relay: legacy senders may omit delivery_id.
+    // Generated IDs deliberately cannot collide with caller IDs by using a fixed prefix + UUID.
+    let delivery_id = payload
+        .delivery_id
+        .unwrap_or_else(|| format!("legacy-{}", uuid::Uuid::new_v4().simple()));
+    if !valid_delivery_id(&delivery_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "delivery_id is invalid"})),
+        )
+            .into_response();
+    }
+    let key = payload.key.trim().to_string();
+    if key.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "missing key"})),
+        )
+            .into_response();
+    }
+    let key_hash = sha256_hex(&key);
+    if payload
+        .key_sha256
+        .as_deref()
+        .is_some_and(|provided| provided != key_hash)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "key_sha256 does not match key"})),
+        )
+            .into_response();
+    }
+
+    // Same delivery IDs serialize with each other, while unrelated pushes can probe/import in
+    // parallel. Keeping this lock through the import also makes concurrent retries share the
+    // first result instead of issuing duplicate region probes.
+    let delivery_lock = {
+        let mut locks = state.relay_delivery_locks.lock().await;
+        // Weak values preserve same-ID serialization without retaining one map entry forever
+        // for every delivery ever seen. Opportunistic pruning bounds the map to in-flight IDs.
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(&delivery_id).and_then(Weak::upgrade) {
+            lock
+        } else {
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            locks.insert(delivery_id.clone(), Arc::downgrade(&lock));
+            lock
+        }
+    };
+    let _delivery_guard = delivery_lock.lock().await;
+
+    {
+        let mut ledger = state.relay_ledger.lock().await;
+        if let Some(previous) = ledger.deliveries.get(&delivery_id) {
+            if previous.key_sha256 != key_hash {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"ok": false, "error": "delivery_id is bound to a different key"})),
+                )
+                    .into_response();
+            }
+            if previous.status == "delivered" {
+                return Json(serde_json::json!({
+                    "ok": true,
+                    "duplicate": true,
+                    "credentialId": previous.credential_id,
+                }))
+                .into_response();
+            }
+        } else if let Err(error) = ledger.append(RelayDeliveryRecord {
+            delivery_id: delivery_id.clone(),
+            key_sha256: key_hash.clone(),
+            status: "pending".to_string(),
+            credential_id: None,
+            at_ms: chrono::Utc::now().timestamp_millis(),
+        }) {
+            tracing::error!("无法持久化 relay delivery_id: {error}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"ok": false, "error": "delivery ledger unavailable"})),
+            )
+                .into_response();
+        }
+    }
+
+    let started = std::time::Instant::now();
+    let result = process_item(
+        &state,
+        ImportItem {
+            key,
+            region: Some(
+                payload
+                    .region
+                    .filter(|region| !region.is_empty())
+                    .unwrap_or_else(|| "us-east-1".to_string()),
+            ),
+            groups: Vec::new(),
+            endpoint: None,
+        },
+    )
+    .await;
+    record_import_stats(
+        std::slice::from_ref(&result),
+        started.elapsed().as_millis() as u64,
+        Some(&delivery_id),
+    );
+    let status = if result.ok { "delivered" } else { "failed" };
+    {
+        let mut ledger = state.relay_ledger.lock().await;
+        if let Err(error) = ledger.append(RelayDeliveryRecord {
+            delivery_id: delivery_id.clone(),
+            key_sha256: key_hash,
+            status: status.to_string(),
+            credential_id: result.credential_id,
+            at_ms: chrono::Utc::now().timestamp_millis(),
+        }) {
+            tracing::error!("无法更新 relay delivery_id 状态: {error}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"ok": false, "error": "delivery ledger unavailable"})),
+            )
+                .into_response();
+        }
+    }
+    crate::portal::sink::record_import(
+        &result.plain_key,
+        result.credential_id,
+        result.region.as_deref(),
+        result.endpoint.as_deref(),
+        result.ok,
+        result.error.as_deref(),
+        chrono::Utc::now().timestamp_millis(),
+    );
+    if result.ok {
+        Json(serde_json::json!({
+            "ok": true,
+            "duplicate": result.duplicate.unwrap_or(false),
+            "credentialId": result.credential_id,
+        }))
+        .into_response()
+    } else {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"ok": false, "error": result.error.unwrap_or_else(|| "key import failed".to_string())})),
+        )
+            .into_response()
+    }
+}
+
+fn valid_delivery_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 100
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+}
+
+fn sha256_hex(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
 async fn process_item(state: &ImportState, item: ImportItem) -> ImportItemResponse {
@@ -279,8 +617,8 @@ async fn process_item(state: &ImportState, item: ImportItem) -> ImportItemRespon
     //   endpoint=ide → HTTP 200 正常推理。
     // 而对方契约的示例恰好就是 `"endpoint": null`——硬编码 cli 会让推来的号**全部不可用**。
     // 落 None 同时也符合契约第 1 条「不编造默认值」的精神：路由决策交给部署方的配置。
-    let endpoint = requested_endpoint
-        .or_else(|| existing.as_ref().and_then(|old| old.endpoint.clone()));
+    let endpoint =
+        requested_endpoint.or_else(|| existing.as_ref().and_then(|old| old.endpoint.clone()));
 
     // upsert 会消费 key，先留一份给面板明细（明文仅存内存，见 ImportItemRecord.key 说明）。
     let plain_key = key.clone();
@@ -401,6 +739,14 @@ fn mask_key(key: &str) -> String {
 mod tests {
     use super::*;
 
+    fn temp_ledger_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "kirostudio-relay-{tag}-{}-{}.ndjson",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+    }
+
     /// 脱敏格式与凭据管理页同源（`common::key_mask`），两处显示同一个 key 必须一模一样，
     /// 否则运维无法对照确认「面板上这个号就是对方推的那个」。
     #[test]
@@ -429,5 +775,83 @@ mod tests {
             "候选表应含大量无 management 端点的 region（实测 30 个），实际 {}",
             dead.len()
         );
+    }
+
+    #[test]
+    fn delivery_id_validation_matches_relay_contract() {
+        assert!(valid_delivery_id("order-42.retry_1:eu"));
+        assert!(!valid_delivery_id(""));
+        assert!(!valid_delivery_id("contains space"));
+        assert!(!valid_delivery_id(&"x".repeat(101)));
+    }
+
+    #[test]
+    fn relay_request_distinguishes_omitted_and_explicit_empty_delivery_id() {
+        let omitted: RelayPushRequest = serde_json::from_str(r#"{"key":"ksk_x"}"#)
+            .expect("omitted delivery_id should remain backward compatible");
+        assert_eq!(omitted.delivery_id, None);
+
+        let empty: RelayPushRequest = serde_json::from_str(r#"{"key":"ksk_x","delivery_id":""}"#)
+            .expect("empty delivery_id is syntactically valid JSON");
+        assert_eq!(empty.delivery_id.as_deref(), Some(""));
+        assert!(!valid_delivery_id(empty.delivery_id.as_deref().unwrap()));
+    }
+
+    #[test]
+    fn relay_ledger_survives_restart_and_ignores_partial_lines() {
+        let path = temp_ledger_path("restart");
+        let mut ledger = RelayLedger::from_path(Some(path.clone()));
+        ledger
+            .append(RelayDeliveryRecord {
+                delivery_id: "delivery-1".into(),
+                key_sha256: "abc".into(),
+                status: "delivered".into(),
+                credential_id: Some(9),
+                at_ms: 1,
+            })
+            .expect("账本应可写");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("账本应存在")
+            .write_all(b"{partial")
+            .expect("应可模拟崩溃残行");
+
+        let reloaded = RelayLedger::from_path(Some(path.clone()));
+        let record = reloaded.deliveries.get("delivery-1").expect("重启后应恢复");
+        assert_eq!(record.key_sha256, "abc");
+        assert_eq!(record.credential_id, Some(9));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn latest_ledger_record_wins_for_retry_state() {
+        let path = temp_ledger_path("latest");
+        let mut ledger = RelayLedger::from_path(Some(path.clone()));
+        for status in ["pending", "failed", "delivered"] {
+            ledger
+                .append(RelayDeliveryRecord {
+                    delivery_id: "delivery-2".into(),
+                    key_sha256: "def".into(),
+                    status: status.into(),
+                    credential_id: (status == "delivered").then_some(11),
+                    at_ms: 1,
+                })
+                .expect("账本应可追加");
+        }
+        let reloaded = RelayLedger::from_path(Some(path.clone()));
+        let record = reloaded.deliveries.get("delivery-2").unwrap();
+        assert_eq!(record.status, "delivered");
+        assert_eq!(record.credential_id, Some(11));
+        let _ = fs::remove_file(path);
     }
 }

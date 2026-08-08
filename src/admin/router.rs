@@ -12,14 +12,13 @@ use super::{
         external_idp_leg2_select, force_refresh_token, get_all_credentials, get_cached_balances,
         get_config, get_credential_balance, get_load_balancing_mode, get_overage_status,
         import_stats, list_trash, perform_update, poll_idc_login, poll_social_login,
-        probe_available_models,
-        probe_regions, proxy_test, purge_credential, purge_trash_batch, recovery_metrics,
-        reset_failure_count, restart_service, restore_credential, set_credential_allowed_models,
-        set_credential_custom_api, set_credential_disabled, set_credential_name,
-        set_credential_priority, set_credential_proxy, set_credential_rpm_limit,
-        set_load_balancing_mode, social_callback, start_external_idp_login, start_idc_login,
-        start_social_login, storage_cleanup, storage_stats, switch_profile_region, update_config,
-        update_status,
+        probe_available_models, probe_regions, proxy_test, purge_credential, purge_trash_batch,
+        recovery_metrics, reset_failure_count, restart_service, restore_credential,
+        set_credential_allowed_models, set_credential_custom_api, set_credential_disabled,
+        set_credential_name, set_credential_priority, set_credential_proxy,
+        set_credential_rpm_limit, set_load_balancing_mode, social_callback,
+        start_external_idp_login, start_idc_login, start_social_login, storage_cleanup,
+        storage_stats, switch_profile_region, update_config, update_status,
     },
     middleware::{AdminState, admin_auth_middleware},
     usage_handlers::{
@@ -158,5 +157,24 @@ pub fn create_admin_router(state: AdminState) -> Router {
     // 公开路由：远程模式 OAuth 回调（浏览器无 admin key，靠 OAuth state 关联会话）
     let public = Router::new().route("/auth/callback", get(social_callback));
 
-    authed.merge(public).with_state(state)
+    authed
+        .merge(public)
+        // **整棵 admin 树一律 no-store。**
+        //
+        // 这棵树上跑的东西没有一样是可以被中间缓存留存的：`/credentials/{id}/export`
+        // 直接返回**明文凭据**，`/config` 返回含各路密钥的配置，`/logs` 返回运行日志。
+        // 而在此之前这些响应**一个缓存头都没有**——没有指令不等于不缓存，而是由缓存方
+        // 自己拿主意（RFC 9111 §4.2.2 的启发式缓存），一旦前面挂了 nginx/CDN/公司代理
+        // 就允许进共享缓存。
+        //
+        // 用 `layer` 而非 `route_layer`：本树在 main 里是被 `nest("/api/admin", …)` 挂载的，
+        // nest 的作用域已经把它限死在该前缀下，不存在 portal 那边「route_layer 才能避免
+        // 波及全站 fallback」的问题。这里用 layer 反而更严——连本树自己的 404/405
+        // 响应也会带上头。
+        //
+        // 对 SSE 端点（`/stream/live`、`/logs/stream`）的影响：它们原本自设 `no-cache`，
+        // 这里会覆盖成 `no-store`。对 SSE 来说两者都正确（都禁止代理缓冲复用），
+        // 而 no-store 更严，不改变流式语义。
+        .layer(middleware::from_fn(crate::common::http_cache::no_store))
+        .with_state(state)
 }

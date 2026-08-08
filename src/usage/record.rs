@@ -83,6 +83,10 @@ pub struct RequestRecord {
     /// serde default，兼容早于本字段的历史 JSONL（缺字段视为 0）。
     #[serde(default)]
     pub cache_creation_tokens: i32,
+    /// 本次是否实际执行了严格缓存探针。false 表示观测关闭或报文无法稳定解析，
+    /// 不能把它当作 cache miss。serde default 兼容旧 JSONL。
+    #[serde(default)]
+    pub cache_observed: bool,
     /// 上游返回的真实 credit 消耗量（无 meteringEvent 时为 None）
     pub credits_used: Option<f64>,
     /// 端到端延迟（毫秒）
@@ -120,6 +124,7 @@ impl RequestRecord {
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            cache_observed: false,
             credits_used: None,
             latency_ms: 0,
             first_token_ms: None,

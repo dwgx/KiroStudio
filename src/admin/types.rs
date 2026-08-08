@@ -520,6 +520,10 @@ pub struct ConfigSnapshotResponse {
     pub default_endpoint: String,
     pub endpoint_names: Vec<String>,
     pub extract_thinking: bool,
+    /// 是否启用严格 prompt 缓存观测（本地成功账本，非上游回执）。
+    pub prompt_cache_enabled: bool,
+    /// 严格缓存检查点 TTL（秒）。
+    pub prompt_cache_ttl_seconds: u64,
     /// Claude Code 自动切缓冲协议（识别到 CC 请求时 /v1 流式自动走 buffered，准确 input_tokens）
     pub cc_auto_buffer: bool,
     /// 是否剥离转发给上游的 system 环境噪音（省 token / 提缓存命中 / 降关联，立即生效）
@@ -587,6 +591,10 @@ pub struct ConfigSnapshotResponse {
     pub has_admin_key: bool,
     /// 是否配置了 userKey（下游对话 api_key，不回传明文）
     pub has_api_key: bool,
+    /// Relay 频道专用密钥是否已配置；绝不回显原值。
+    pub relay_api_key_configured: bool,
+    /// 拼车管理二次密码是否已配置；只返回布尔，绝不回显 Argon2id PHC。
+    pub portal_admin_password_configured: bool,
     /// 回调模式：local（本地端口）/ remote（公网回调）
     pub callback_mode: String,
     pub callback_base_url: Option<String>,
@@ -612,6 +620,18 @@ pub struct ConfigSnapshotResponse {
     // ---- 隐私 ----
     /// 是否采集下游客户端指纹（device/ip/os/browser，立即生效）
     pub collect_client_fingerprint: bool,
+    // ---- 凭据频道（Portal，立即生效）----
+    /// Portal 总开关。false = `/portal` 全部 404（连页面本身也不确认存在）。
+    pub portal_enabled: bool,
+    /// 是否**已配置**注册码——刻意只给布尔，不回显原值。
+    ///
+    /// 【为何不回显】注册码是一张进入凭据频道的门票，泄露等于任何人都能自助建号。
+    /// 面板只需要知道「配没配」用于显示状态，不需要知道是什么。同三把鉴权 key 的处理。
+    pub portal_invite_code_configured: bool,
+    /// 是否强制要求 HTTPS 才下发明文。
+    pub portal_require_https: bool,
+    /// 积分制是否启用。关闭时明文对已登录用户直接可见（无需上车扣分）。
+    pub portal_credits_enabled: bool,
     /// 配置文件路径（运行时只读元数据）
     pub config_path: Option<String>,
 }
@@ -697,6 +717,9 @@ pub struct UpdateConfigRequest {
     /// （与另两把不同——它未配置是合法状态，见 `auth_keys::clear_import_key`）。
     #[serde(default)]
     pub import_api_key: Option<String>,
+    /// Relay 单条推送频道密钥。空串表示关闭频道；与 importApiKey 完全隔离。
+    #[serde(default)]
+    pub relay_api_key: Option<String>,
     // ---- 反代安全（批次3，均需重启生效）----
     /// CORS 允许来源列表（整表替换）
     pub cors_allowed_origins: Option<Vec<String>>,
@@ -726,6 +749,19 @@ pub struct UpdateConfigRequest {
     // ---- 隐私（立即生效）----
     /// 是否采集下游客户端指纹（device/ip/os/browser）
     pub collect_client_fingerprint: Option<bool>,
+    // ---- 凭据频道（Portal，全部立即生效，无需重启）----
+    //
+    // 之所以能热更：`portal::http` 的运行时镜像（`set_enabled` 等）与路由**总是挂载**
+    // 的设计配套——路由在，行为由镜像决定，所以改开关即时反映。见 main.rs 的装配注释。
+    /// Portal 总开关。
+    pub portal_enabled: Option<bool>,
+    /// 注册码。同 `import_api_key` 的语义：不回显现值、仅提交时更新；
+    /// **空串表示关闭自助注册通道**（已注册用户仍可登录），而非"保持不变"。
+    pub portal_invite_code: Option<String>,
+    /// 是否强制 HTTPS 才下发明文。
+    pub portal_require_https: Option<bool>,
+    /// 积分制开关。
+    pub portal_credits_enabled: Option<bool>,
 }
 
 /// 更新服务端配置响应
@@ -830,10 +866,12 @@ mod tests {
         assert_eq!(req.login_background_r18, None);
     }
 
-    #[test]
-    fn config_snapshot_serializes_login_background_r18() {
-        // 快照以 camelCase 下发，前端据此渲染开关初值。
-        let snap = ConfigSnapshotResponse {
+    /// 一份字段齐全的快照，供多条用例用 `..minimal_snapshot()` 只写自己关心的字段。
+    ///
+    /// 【为何抽出来】这个结构体有 70+ 个字段。若每条用例都手写全量，加一个 config
+    /// 字段就要改所有构造点——那种维护成本的实际后果是「干脆不写新用例」。
+    fn minimal_snapshot() -> ConfigSnapshotResponse {
+        ConfigSnapshotResponse {
             server_version: "0.0.0".into(),
             host: "127.0.0.1".into(),
             port: 8080,
@@ -846,6 +884,8 @@ mod tests {
             default_endpoint: "ide".into(),
             endpoint_names: vec![],
             extract_thinking: true,
+            prompt_cache_enabled: false,
+            prompt_cache_ttl_seconds: 3600,
             cc_auto_buffer: true,
             cooldown_enabled: true,
             all_cooling_fast_fail: true,
@@ -876,6 +916,8 @@ mod tests {
             proxy_url: None,
             has_admin_key: false,
             has_api_key: false,
+            relay_api_key_configured: false,
+            portal_admin_password_configured: false,
             callback_mode: "local".into(),
             callback_base_url: None,
             cors_allowed_origins: vec![],
@@ -902,10 +944,129 @@ mod tests {
             tool_truncation_recovery: false,
             tool_description_max_chars: 10000,
             encrypt_credentials_at_rest: false,
+            portal_enabled: false,
+            portal_invite_code_configured: false,
+            portal_require_https: true,
+            portal_credits_enabled: false,
             config_path: None,
+        }
+    }
+
+    /// 严格缓存观测配置必须以 camelCase 下发，运维卡据此展示开关与 TTL。
+    #[test]
+    fn config_snapshot_serializes_prompt_cache_observation() {
+        let snap = ConfigSnapshotResponse {
+            prompt_cache_enabled: true,
+            prompt_cache_ttl_seconds: 900,
+            ..minimal_snapshot()
+        };
+        let s = serde_json::to_string(&snap).expect("序列化应成功");
+        assert!(s.contains("\"promptCacheEnabled\":true"));
+        assert!(s.contains("\"promptCacheTtlSeconds\":900"));
+    }
+
+    /// 快照以 camelCase 下发，前端据此渲染开关初值。
+    #[test]
+    fn config_snapshot_serializes_login_background_r18() {
+        let snap = ConfigSnapshotResponse {
+            login_background_enabled: true,
+            login_background_r18: false,
+            ..minimal_snapshot()
         };
         let s = serde_json::to_string(&snap).expect("序列化应成功");
         assert!(s.contains("\"loginBackgroundR18\":false"));
         assert!(s.contains("\"loginBackgroundEnabled\":true"));
+    }
+
+    /// **快照必须下发 portal 四项，否则设置页画不出开关。**
+    ///
+    /// 这条测试对应一个真实的生产缺陷：portal 面板上写着「在设置里打开 portalEnabled」，
+    /// 而后端快照的 69 个键里**一个 portal 键都没有**，设置页因此根本没有那个分组——
+    /// 用户按提示去找，永远找不到（生产实证 2026-08-07）。
+    #[test]
+    fn config_snapshot_carries_every_portal_field() {
+        let snap = ConfigSnapshotResponse {
+            portal_enabled: true,
+            portal_invite_code_configured: true,
+            portal_require_https: false,
+            portal_credits_enabled: true,
+            ..minimal_snapshot()
+        };
+        let s = serde_json::to_string(&snap).expect("序列化应成功");
+        for key in [
+            "\"portalEnabled\":true",
+            "\"portalInviteCodeConfigured\":true",
+            "\"portalRequireHttps\":false",
+            "\"portalCreditsEnabled\":true",
+        ] {
+            assert!(s.contains(key), "快照缺少 {key}，设置页画不出这个开关: {s}");
+        }
+    }
+
+    /// **注册码本身绝不出现在快照里。**
+    ///
+    /// 它是一把凭据：回显等于任何拿到面板只读权限的人都能抄走去注册账号。
+    /// 快照只回一个布尔「配没配」，同三把 API key 的口径。
+    #[test]
+    fn config_snapshot_never_echoes_the_invite_code() {
+        // 结构上就没有这个字段，所以任何取值都不可能把它带出去。
+        // 用一个显眼的哨兵串反向确认：它不该出现在任何序列化结果里。
+        let snap = ConfigSnapshotResponse {
+            portal_invite_code_configured: true,
+            ..minimal_snapshot()
+        };
+        let s = serde_json::to_string(&snap).expect("序列化应成功");
+        assert!(
+            !s.contains("portalInviteCode\""),
+            "快照出现了 portalInviteCode 字段（应只有 …Configured 布尔）: {s}"
+        );
+        // 对照组：确认序列化确实产出了 portal 段，否则上面那条在空串上也会过。
+        assert!(s.contains("portalInviteCodeConfigured"), "对照组失败");
+    }
+
+    /// 请求体未提及 portal 字段时全为 None —— 保存别的设置不会顺手改动 portal。
+    ///
+    /// 【为何要这一条】`UpdateConfigRequest` 的字段若不是 `Option`，`{}` 会反序列化成
+    /// `false`，于是「改一下背景图开关」会把 portal 一起关掉。那种错法在 UI 上看不出来。
+    #[test]
+    fn update_config_leaves_portal_untouched_when_absent() {
+        let req: UpdateConfigRequest = serde_json::from_str("{}").expect("空对象应成功");
+        assert_eq!(req.portal_enabled, None);
+        assert_eq!(req.portal_invite_code, None);
+        assert_eq!(req.portal_require_https, None);
+        assert_eq!(req.portal_credits_enabled, None);
+    }
+
+    /// 注册码的空串是**合法输入**，语义是「关闭自注册通道」（同 importApiKey）。
+    ///
+    /// 必须能与「未提及」区分开：`Some("")` = 显式清除，`None` = 不动。
+    /// 若两者混同，管理员就永远无法关掉自注册。
+    #[test]
+    fn empty_invite_code_is_distinguishable_from_absent() {
+        let cleared: UpdateConfigRequest =
+            serde_json::from_str(r#"{"portalInviteCode":""}"#).expect("应成功");
+        assert_eq!(cleared.portal_invite_code.as_deref(), Some(""));
+
+        let absent: UpdateConfigRequest = serde_json::from_str("{}").expect("应成功");
+        assert_eq!(absent.portal_invite_code, None);
+
+        let set: UpdateConfigRequest =
+            serde_json::from_str(r#"{"portalInviteCode":"code-x"}"#).expect("应成功");
+        assert_eq!(set.portal_invite_code.as_deref(), Some("code-x"));
+    }
+
+    /// 前端提交的 camelCase 键名必须能被后端认出来。
+    ///
+    /// 【为何值得一条】`serde(rename_all = "camelCase")` 若哪天被移除，前端发的
+    /// `portalEnabled` 会被静默忽略（serde 默认跳过未知字段），表现是「点了保存、
+    /// 提示成功、刷新后开关又弹回去」——没有任何报错。
+    #[test]
+    fn portal_fields_accept_camel_case_from_the_frontend() {
+        let json =
+            r#"{"portalEnabled":true,"portalRequireHttps":false,"portalCreditsEnabled":true}"#;
+        let req: UpdateConfigRequest = serde_json::from_str(json).expect("反序列化应成功");
+        assert_eq!(req.portal_enabled, Some(true));
+        assert_eq!(req.portal_require_https, Some(false));
+        assert_eq!(req.portal_credits_enabled, Some(true));
     }
 }

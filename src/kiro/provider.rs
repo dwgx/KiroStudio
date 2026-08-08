@@ -15,6 +15,7 @@ use crate::http_client::{ProxyConfig, build_streaming_client};
 use crate::kiro::endpoint::{ENDPOINT_FALLBACK_ORDER, KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::prompt_cache::{PromptCacheProbe, PromptCacheTracker, PromptCacheUsage};
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
@@ -29,6 +30,17 @@ const DEAD_ENDPOINT_TTL: Duration = Duration::from_secs(1800);
 /// 说明这条**路由**当前不可用于对话。与 `dead_endpoints` 同为自动过期的软隔离：
 /// 上游修好、或部署方改了配置后，过期即自动重试，无需人工介入也无需重启。
 const PROTOCOL_BROKEN_TTL: Duration = Duration::from_secs(1800);
+
+/// HTTP Client 缓存容量上限。
+///
+/// 【为何需要上限】key 是**生效后的代理配置**，而代理可以配在每个凭据上。
+/// 正常部署里代理种类是个小常数（直连 + 一两个出口），缓存自然收敛。但只要有
+/// 「每个号一个代理」或「代理 URL 带轮换参数」的用法，这个表就是随时间单调增长的——
+/// 而每个条目是一个 `reqwest::Client`，**自带一个连接池**。泄漏的不只是几百字节
+/// 的 HashMap 条目，是文件描述符和空闲 TCP 连接。
+///
+/// 32 的依据：正常部署远用不到，异常用法下把内存/fd 占用钉在一个可预期的常数上。
+const CLIENT_CACHE_CAP: usize = 32;
 
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
@@ -78,6 +90,42 @@ fn compute_max_retries(total: usize, available: usize) -> usize {
         .min(ABSOLUTE_MAX_TOTAL_RETRIES.max(available))
 }
 
+/// 缓存满时淘汰**最久未用**的一条，为新条目腾位。
+///
+/// # 为什么这个缓存需要上限
+/// key 是「生效的代理配置」。常规部署下代理种类是个小的固定集合，永远碰不到上限，
+/// 所以这是纯兜底、不改变正常路径行为。但若部署方用「每次轮换一个代理 URL」的方式
+/// 出网，这个 map 会随时间单调增长，而每个条目是一个自带连接池的 `reqwest::Client`
+/// ——泄漏的是 fd 和空闲 TCP 连接，不只是内存。
+///
+/// # 为什么淘汰被移除的 Client 是安全的
+/// 从 map 里移除只是「不再复用它」。若仍有在途请求持有克隆，那些请求完全不受影响：
+/// `Client` 内部是 Arc 语义，最后一个持有者走完才真正释放连接池。
+///
+/// # 为什么按 `last_used` 而不是插入时刻
+/// 全局代理对应的 Client 往往是**最早创建**也**最热**的那一个。按创建时刻淘汰会
+/// 优先干掉它，然后立刻又要重建——正好是最坏的选择。
+///
+/// 泛型化到 `K`/`V` 只为可测：真实类型里 `V = Client` 造不出来（要建真实连接池），
+/// 而淘汰策略本身与 value 类型无关。
+fn evict_lru_if_full<K: Clone + Eq + std::hash::Hash, V>(
+    cache: &mut HashMap<K, (V, Instant)>,
+    cap: usize,
+) {
+    // `>=` 而非 `>`：调用方紧接着要插入一条，先腾位才不会瞬时超出容量。
+    if cache.len() < cap {
+        return;
+    }
+    if let Some(victim) = cache
+        .iter()
+        .min_by_key(|(_, (_, last_used))| *last_used)
+        .map(|(k, _)| k.clone())
+    {
+        cache.remove(&victim);
+        tracing::debug!("client_cache 达到上限 {}，淘汰最久未用的条目", cap);
+    }
+}
+
 /// 一次成功调用的元数据（随响应回传给上层，供用量统计埋点关联）
 ///
 /// provider 层掌握凭据/重试/延迟，但看不到最终 usage/credits（流式消费后才知道）；
@@ -113,6 +161,9 @@ pub struct CallMeta {
     /// 自动隔离 + 自动换路，而不是每个请求重踩同一个坑。
     pub endpoint_name: String,
     pub upstream_region: String,
+    /// 基于本次实际发送报文得到的缓存探针。只读命中来自此前完整成功提交的记录；
+    /// 本探针本身要等当前响应完整成功后才允许提交。
+    pub(crate) prompt_cache_probe: Option<PromptCacheProbe>,
 }
 
 /// 一次自定义 API 透传的元数据,供 handler 做 usage 埋点。
@@ -141,9 +192,12 @@ pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
     /// 全局代理配置（用于凭据无自定义代理时的回退）
     global_proxy: Option<ProxyConfig>,
-    /// Client 缓存：key = effective proxy config, value = reqwest::Client
-    /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client
-    client_cache: Mutex<HashMap<Option<ProxyConfig>, Client>>,
+    /// Client 缓存：key = effective proxy config, value = (Client, 最后使用时刻)。
+    /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client。
+    ///
+    /// 带 LRU 淘汰，容量见 [`CLIENT_CACHE_CAP`]——每个条目自带一个连接池，
+    /// 无上限增长泄漏的是 fd 和空闲 TCP 连接，不只是内存。
+    client_cache: Mutex<HashMap<Option<ProxyConfig>, (Client, Instant)>>,
     /// TLS 后端配置
     tls_backend: TlsBackend,
     /// 端点实现注册表（key: endpoint 名称）
@@ -165,6 +219,8 @@ pub struct KiroProvider {
     /// 隔离是**软**的且带 TTL：期内该 (端点, region) 在回退链里被降级到最后，
     /// 期满自动放行重试。上游修好、配置改对都能自愈，无需人工干预或重启。
     protocol_broken: Mutex<HashMap<String, Instant>>,
+    /// Kiro 不回传 cache hit/miss；此账本只维护“最终报文前缀 + 完整成功”的本地可验证状态。
+    prompt_cache: PromptCacheTracker,
 }
 
 impl KiroProvider {
@@ -193,7 +249,7 @@ impl KiroProvider {
         let initial_client =
             build_streaming_client(proxy.as_ref(), 720, tls_backend).expect("创建 HTTP 客户端失败");
         let mut cache = HashMap::new();
-        cache.insert(proxy.clone(), initial_client);
+        cache.insert(proxy.clone(), (initial_client, Instant::now()));
 
         Self {
             token_manager,
@@ -204,6 +260,33 @@ impl KiroProvider {
             default_endpoint,
             dead_endpoints: Mutex::new(HashMap::new()),
             protocol_broken: Mutex::new(HashMap::new()),
+            prompt_cache: PromptCacheTracker::default(),
+        }
+    }
+
+    /// 返回本次调用在发送前查询到的严格本地缓存状态，并钳制到总输入 token 范围。
+    /// 该值是 inferred（Kiro 未提供服务端回执），但不会由历史长度直接猜测。
+    pub(crate) fn prompt_cache_usage(
+        &self,
+        meta: &CallMeta,
+        total_input_tokens: i32,
+    ) -> Option<PromptCacheUsage> {
+        let raw = meta.prompt_cache_probe.as_ref()?.usage;
+        let total = total_input_tokens.max(0);
+        let read = raw.cache_read_input_tokens.clamp(0, total);
+        let creation = raw
+            .cache_creation_input_tokens
+            .clamp(0, total.saturating_sub(read));
+        Some(PromptCacheUsage {
+            cache_read_input_tokens: read,
+            cache_creation_input_tokens: creation,
+        })
+    }
+
+    /// 当前调用完整成功后提交其前缀；失败、截断和下游提前断开均不得调用。
+    pub(crate) fn commit_prompt_cache(&self, meta: &CallMeta) {
+        if let Some(probe) = &meta.prompt_cache_probe {
+            self.prompt_cache.commit(probe);
         }
     }
 
@@ -265,15 +348,25 @@ impl KiroProvider {
             .insert(key, std::time::Instant::now());
     }
 
-    /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
+    /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client。
+    ///
+    /// 命中时顺手刷新 `last_used`，这样 LRU 淘汰的是真正冷掉的条目，
+    /// 而不是「最早被创建」的那个（全局代理往往是第一个建的，也是最热的）。
+    ///
+    /// 缓存有容量上限，见 [`evict_lru_if_full`]。
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
         let effective = credentials.effective_proxy(self.global_proxy.as_ref());
         let mut cache = self.client_cache.lock();
-        if let Some(client) = cache.get(&effective) {
+        if let Some((client, last_used)) = cache.get_mut(&effective) {
+            *last_used = Instant::now();
             return Ok(client.clone());
         }
+
+        // 未命中：先腾位再插入，避免瞬时超出容量。
+        evict_lru_if_full(&mut cache, CLIENT_CACHE_CAP);
+
         let client = build_streaming_client(effective.as_ref(), 720, self.tls_backend)?;
-        cache.insert(effective, client.clone());
+        cache.insert(effective, (client.clone(), Instant::now()));
         Ok(client)
     }
 
@@ -795,6 +888,7 @@ impl KiroProvider {
             // 端点链都失败时才把最后一次响应交给下面的凭据级错误分类逻辑处理。
             let mut endpoint = chain[0].clone();
             let mut response: Option<reqwest::Response> = None;
+            let mut prompt_cache_probe: Option<PromptCacheProbe> = None;
             let last_idx = chain.len() - 1;
 
             for (idx, candidate) in chain.iter().enumerate() {
@@ -835,6 +929,19 @@ impl KiroProvider {
 
                 let url = candidate.api_url(&rctx);
                 let body = candidate.transform_api_body(request_body, &rctx);
+                let candidate_cache_probe = config
+                    .prompt_cache_enabled
+                    .then(|| {
+                        self.prompt_cache.probe(
+                            &body,
+                            ctx.id,
+                            candidate.name(),
+                            &upstream_region,
+                            is_1m,
+                            Duration::from_secs(config.prompt_cache_ttl_seconds),
+                        )
+                    })
+                    .flatten();
 
                 // content-type 由端点声明（单一真相源）。历史缺陷：这里硬编码
                 // application/json，而 cli 端点在 decorate_api 里又 append 了
@@ -862,6 +969,7 @@ impl KiroProvider {
                         if !transient || idx == last_idx {
                             endpoint = candidate.clone();
                             response = Some(resp);
+                            prompt_cache_probe = candidate_cache_probe;
                             break;
                         }
                         tracing::warn!(
@@ -928,6 +1036,7 @@ impl KiroProvider {
                     // 供解码侧回报协议不符时定位「哪条路由坏了」（见 report_protocol_mismatch）。
                     endpoint_name: endpoint.name().to_string(),
                     upstream_region: upstream_region.to_string(),
+                    prompt_cache_probe,
                     // 移交在途守卫：从此随响应流存活，流真正消费完才 -1
                     inflight: ctx.inflight,
                 };
@@ -1272,6 +1381,20 @@ impl KiroProvider {
                     status,
                     body
                 );
+                // 瞬态 429 的确定性标记(附加到 last_error 串尾)。
+                //
+                // 为什么需要它:重试耗尽后 handler 的 map_provider_error 靠错误串分类。瞬态 429 的串
+                // 形如 `流式 API 请求失败: 429 Too Many Requests {...}`,**不含**任何已知关键字,于是
+                // 落入兜底 `502 api_error` —— 客户端(Claude Code)把限流当成网关故障,且 502 不带
+                // Retry-After,退避策略完全走偏(生产实证 2026-08-04:240 次 429 全部回成 502)。
+                //
+                // 标记随**这一条具体错误**走:后续尝试若换成别的错误(如 400),last_error 被覆盖、
+                // 标记自然消失,绝不会把非限流错误误报成限流。
+                //
+                // ⚠️ 命名刻意避开 `retry_after_secs=` 子串:那是「全池冷却」路径的标记,
+                // map_provider_error 用 `contains("retry_after_secs=")` 判定它。若本标记含该子串会
+                // 被那条分支抢先命中,回出「所有凭据都在冷却」的错误文案(实际是上游限流)。
+                let mut rl_marker = String::new();
                 // 429 限流：给该凭据设置短冷却，让调度优先换用其它凭据
                 // （仍不禁用、不计永久失败，冷却到期自动恢复）
                 if status.as_u16() == 429 {
@@ -1281,6 +1404,8 @@ impl KiroProvider {
                     // 优先用上游给出的精确重置时间：响应头 Retry-After 优先，其次错误 body
                     let retry_after =
                         retry_after_header.or_else(|| endpoint.extract_retry_after_secs(&body));
+                    // 0 = 上游未给出精确重置时间(裸 429),由 handler 用默认退避提示。
+                    rl_marker = format!(" upstream_429_retry={}", retry_after.unwrap_or(0));
                     // 本请求链内该号首次 429 才设冷却；再次 429 只换号 failover，不重复累加
                     // trigger_count / 延长冷却（见 rate_limited_this_call 定义处的根因说明）。
                     if rate_limited_this_call.insert(ctx.id) {
@@ -1296,10 +1421,11 @@ impl KiroProvider {
                     last_outcome = crate::usage::RequestOutcome::ServerError;
                 }
                 last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
+                    "{} API 请求失败: {} {}{}",
                     api_type,
                     status,
-                    body
+                    body,
+                    rl_marker
                 ));
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
@@ -1375,6 +1501,19 @@ impl KiroProvider {
                         };
                         let url = endpoint.api_url(&rctx);
                         let body = endpoint.transform_api_body(&fallback_body, &rctx);
+                        let fallback_cache_probe = config
+                            .prompt_cache_enabled
+                            .then(|| {
+                                self.prompt_cache.probe(
+                                    &body,
+                                    ctx.id,
+                                    endpoint.name(),
+                                    ctx.credentials.effective_upstream_region(&config),
+                                    is_1m,
+                                    Duration::from_secs(config.prompt_cache_ttl_seconds),
+                                )
+                            })
+                            .flatten();
                         // 同上：content-type 由端点声明，避免重复头（见主路径注释）。
                         let base = self
                             .client_for(&ctx.credentials)?
@@ -1399,6 +1538,7 @@ impl KiroProvider {
                                         .credentials
                                         .effective_upstream_region(&config)
                                         .to_string(),
+                                    prompt_cache_probe: fallback_cache_probe,
                                     inflight: ctx.inflight,
                                 };
                                 return Ok((resp, meta));
@@ -1845,6 +1985,7 @@ mod tests {
             latency_ms: 1,
             endpoint_name: "cli".to_string(),
             upstream_region: "us-east-1".to_string(),
+            prompt_cache_probe: None,
             inflight: crate::kiro::scheduling::InflightGuard::acquire(Default::default()),
         };
         provider.report_protocol_mismatch(&meta, "上游返回 AWS JSON 1.0 信封");
@@ -1869,5 +2010,118 @@ mod tests {
             "隔离后必须有逃生通道，否则每个请求都必然失败"
         );
         assert_ne!(chain[0].name(), "cli", "坏路由不应仍占链首");
+    }
+
+    // ===== client_cache 容量上限 =====
+    //
+    // 直接测 `evict_lru_if_full` 而不是 `client_for`：后者每次未命中都要真的
+    // 建一个 reqwest::Client（连 TLS 后端一起初始化），造满 32 个只为验证淘汰
+    // 逻辑，既慢又把「策略对不对」和「Client 能不能建起来」两件事绑在一起。
+
+    /// 造一个只有时间戳有意义的假缓存条目。
+    ///
+    /// `Client::new()` 不发起任何连接，构造是纯本地的，所以当占位符用是安全的。
+    fn stub_entry(age: Duration) -> (Client, Instant) {
+        (Client::new(), Instant::now() - age)
+    }
+
+    fn proxy_key(n: usize) -> Option<ProxyConfig> {
+        Some(ProxyConfig {
+            url: format!("http://proxy-{n}.invalid:8080"),
+            username: None,
+            password: None,
+        })
+    }
+
+    /// 未满时一个都不许动。
+    ///
+    /// 【为何单独测这一档】常规部署里代理种类个位数，永远碰不到上限——也就是说
+    /// 这条路径覆盖的是**几乎 100% 的真实流量**。若淘汰逻辑在未满时也误伤，
+    /// 表现是热点 Client 被反复重建、连接池每次从零开始，性能悄悄退化而无人报错。
+    #[test]
+    fn nothing_is_evicted_while_under_capacity() {
+        let mut cache: HashMap<Option<ProxyConfig>, (Client, Instant)> = HashMap::new();
+        for i in 0..5 {
+            cache.insert(proxy_key(i), stub_entry(Duration::from_secs(i as u64)));
+        }
+        evict_lru_if_full(&mut cache, 32);
+        assert_eq!(cache.len(), 5, "未满就不该淘汰任何条目");
+    }
+
+    /// 满了就腾出**恰好一个**位子，且被淘汰的是最久未用的那个。
+    #[test]
+    fn eviction_removes_exactly_the_coldest_entry() {
+        let mut cache: HashMap<Option<ProxyConfig>, (Client, Instant)> = HashMap::new();
+        // 0 号最冷（1 小时未用），其余都是最近几秒用过的。
+        cache.insert(proxy_key(0), stub_entry(Duration::from_secs(3600)));
+        for i in 1..4 {
+            cache.insert(proxy_key(i), stub_entry(Duration::from_secs(i as u64)));
+        }
+
+        evict_lru_if_full(&mut cache, 4);
+
+        assert_eq!(cache.len(), 3, "满了必须且只需腾出一个位子");
+        assert!(
+            !cache.contains_key(&proxy_key(0)),
+            "被淘汰的必须是最久未用的那个（1 小时未用），实际它还在"
+        );
+        for i in 1..4 {
+            assert!(
+                cache.contains_key(&proxy_key(i)),
+                "热条目 {i} 被误伤——LRU 选错了受害者"
+            );
+        }
+    }
+
+    /// **反向断言：淘汰的不是「最早插入」的那个。**
+    ///
+    /// 这条是整组里区分力最强的。全局代理往往是构造函数里第一个插进去的
+    /// （见 `with_proxy` 的预热），同时也是最热的那个。若把 LRU 写成了 FIFO
+    /// （比如按插入顺序、或忘了在命中时刷新 `last_used`），受害者就恰好是
+    /// 那个每个请求都要用的 Client——表现是主链路的连接池被反复丢弃重建。
+    #[test]
+    fn eviction_is_lru_not_fifo() {
+        let mut cache: HashMap<Option<ProxyConfig>, (Client, Instant)> = HashMap::new();
+        // 模拟：全局代理(None)最早插入，但刚刚用过（最热）。
+        cache.insert(None, stub_entry(Duration::from_millis(1)));
+        // 后插入的几个反而更冷。
+        cache.insert(proxy_key(1), stub_entry(Duration::from_secs(600)));
+        cache.insert(proxy_key(2), stub_entry(Duration::from_secs(300)));
+
+        evict_lru_if_full(&mut cache, 3);
+
+        assert!(
+            cache.contains_key(&None),
+            "最早插入但最热的全局代理 Client 被淘汰了——这是 FIFO 而非 LRU。\
+             它是主链路每个请求都要用的那个，反复重建等于连接池永远冷启动。"
+        );
+        assert!(
+            !cache.contains_key(&proxy_key(1)),
+            "真正最冷的（10 分钟未用）应当被淘汰"
+        );
+    }
+
+    /// 容量上限必须给正常部署留足余量。
+    ///
+    /// 这条钉的是取值而非逻辑：若哪天有人把 CAP 调到个位数，常规多代理部署就会
+    /// 开始持续抖动（每个请求淘汰上一个请求刚建的 Client），而所有逻辑用例仍全绿。
+    #[test]
+    fn capacity_is_generous_enough_to_never_bind_in_normal_deployments() {
+        assert!(
+            CLIENT_CACHE_CAP >= 16,
+            "CLIENT_CACHE_CAP={CLIENT_CACHE_CAP} 太小：这是纯兜底上限，\
+             常规部署（代理种类个位数）绝不该碰到它，否则会持续抖动"
+        );
+    }
+
+    /// 空缓存上调用不许 panic。
+    ///
+    /// `min_by_key` 对空迭代器返回 `None`，写成 `.unwrap()` 就会在这里炸——
+    /// 而 cap=0 这种配置错误本该是「不缓存」，不该让整个进程崩掉。
+    #[test]
+    fn eviction_on_empty_cache_is_a_noop() {
+        let mut cache: HashMap<Option<ProxyConfig>, (Client, Instant)> = HashMap::new();
+        evict_lru_if_full(&mut cache, 0);
+        assert!(cache.is_empty());
     }
 }

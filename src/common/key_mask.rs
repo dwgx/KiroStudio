@@ -30,14 +30,24 @@ pub fn mask_api_key(key: &str) -> String {
     }
 }
 
+/// key 的**完整** SHA-256 hex（64 字符）。
+///
+/// 用于需要「稳定且不撞车」的主键场景（如 Portal 的 `import_keys.key_hash`）。
+/// 【为何不能用 [`key_fingerprint`] 当主键】那只有 8 个 hex = 32 bit，几百个 key
+/// 就有可观的生日碰撞概率；一旦撞上，按它做 upsert 会把两个不同的号静默合并成一条，
+/// 丢掉其中一个的记录。全摘要杜绝此事，指纹只用于展示。
+pub fn key_hash_full(key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(key.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 /// key 指纹：SHA-256 前 8 个 hex 字符。
 ///
 /// 不可逆、与完整 key 一一对应。脱敏串撞车或回退 `***` 时，指纹仍能唯一辨别一个号。
 /// 与前端去重用的完整 `api_key_hash` 同源（同一 SHA-256 的前缀），故两者天然一致。
 pub fn key_fingerprint(key: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(key.as_bytes());
-    format!("{:x}", hasher.finalize())[..8].to_string()
+    key_hash_full(key)[..8].to_string()
 }
 
 #[cfg(test)]
