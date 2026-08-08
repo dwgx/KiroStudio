@@ -1848,6 +1848,7 @@ impl AdminService {
             base_url: req.base_url,
             api_key: req.api_key,
             deepseek_normalize: req.deepseek_normalize,
+            deepseek_normalize_config: None,
             request_limit: req.request_limit,
             custom_api_first: req.custom_api_first,
             // ⭐ 三个 region 字段多开时必须继承（见上方 `inherited` 处的长注释）：

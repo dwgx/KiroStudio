@@ -406,6 +406,12 @@ pub struct Config {
     #[serde(default = "default_upstream_concurrency_limit")]
     pub upstream_concurrency_limit: usize,
 
+    /// deepseek 归一化的**全局默认**配置（custom_api 代挂 `deepseekNormalize=true` 时生效）。
+    /// per-凭据 `deepseek_normalize_config` 可覆盖 fallback_model/min_max_tokens；
+    /// bool 开关一律取这里（全局唯一）。TIER1 热重载，改 config.json 立即生效。
+    #[serde(default)]
+    pub deepseek_normalize: crate::kiro::deepseek_normalize::DeepseekNormalizeConfig,
+
     /// 是否启用会话亲和性（同一会话尽量复用同一凭据，默认 true）
     ///
     /// 防关联用：让同一对话粘在同一账号上，避免单次会话散落到多个账号引发关联。
@@ -1171,6 +1177,7 @@ impl Default for Config {
             inbound_queue_max_wait_secs: default_inbound_queue_max_wait_secs(),
             inbound_queue_timeout_passthrough: default_inbound_queue_timeout_passthrough(),
             upstream_concurrency_limit: default_upstream_concurrency_limit(),
+            deepseek_normalize: Default::default(),
             rate_limit_enabled: false,
             rate_limit_daily_max: default_rate_limit_daily(),
             rate_limit_min_interval_ms: default_rate_limit_min_interval_ms(),

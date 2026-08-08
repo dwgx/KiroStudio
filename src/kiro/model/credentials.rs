@@ -141,6 +141,11 @@ pub struct KiroCredentials {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deepseek_normalize: Option<bool>,
+    /// deepseek 归一化**per-凭据覆盖**（fallback_model / min_max_tokens）。
+    /// None = 用全局 `config.deepseek_normalize`；Some = 未设的字符串/数字继承全局、bool 取全局。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deepseek_normalize_config: Option<crate::kiro::deepseek_normalize::DeepseekNormalizeConfig>,
 
     /// 请求上限：累计请求数达到后自动禁用该凭据（None/0=不限）。通用字段,自定义API主用。
     #[serde(default)]
@@ -1465,6 +1470,7 @@ mod tests {
             request_limit: None,
             custom_api_first: None,
             deepseek_normalize: None,
+            deepseek_normalize_config: None,
             region: None,
             auth_region: None,
             api_region: None,
@@ -1601,6 +1607,7 @@ mod tests {
             request_limit: None,
             custom_api_first: None,
             deepseek_normalize: None,
+            deepseek_normalize_config: None,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
             api_region: None,
@@ -1650,6 +1657,7 @@ mod tests {
             request_limit: None,
             custom_api_first: None,
             deepseek_normalize: None,
+            deepseek_normalize_config: None,
             region: None,
             auth_region: None,
             api_region: None,
@@ -1784,6 +1792,7 @@ mod tests {
             request_limit: None,
             custom_api_first: None,
             deepseek_normalize: None,
+            deepseek_normalize_config: None,
             region: Some("us-west-2".to_string()),
             auth_region: None,
             api_region: None,
