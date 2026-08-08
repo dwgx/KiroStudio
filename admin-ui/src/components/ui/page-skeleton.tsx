@@ -8,7 +8,7 @@ import { Skeleton, SkeletonCard } from '@/components/ui/skeleton'
  * 体感更快、不焦虑。shimmer 微光 + prefers-reduced-motion 降级由 Skeleton 兜底。
  */
 
-type PageKind = 'overview' | 'credentials' | 'usage' | 'ops' | 'settings'
+type PageKind = 'overview' | 'credentials' | 'usage' | 'ops' | 'pushChannel' | 'portal' | 'settings'
 
 /** 一排 N 个统计卡骨架（概览/凭据顶部常见三卡布局）。 */
 function StatCardRow({ count = 3 }: { count?: number }) {
@@ -95,6 +95,11 @@ export function PageSkeleton({ kind }: { kind: PageKind }) {
       )
     case 'settings':
       return <StackSkeleton count={4} />
+    // portal：状态卡 + 用户列表 + 审计，三块竖排
+    case 'portal':
+      return <StackSkeleton count={3} />
+    case 'pushChannel':
+      return <StackSkeleton count={3} />
     case 'ops':
       return (
         <div className="space-y-4">

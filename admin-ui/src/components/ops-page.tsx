@@ -8,13 +8,11 @@ import { Button } from '@/components/ui/button'
 import {
   getRecoveryMetrics,
   getLogs,
-  getImportStats,
   type RecoveryMetrics,
   type LogEntry,
-  type ImportRecord,
 } from '@/api/ops'
 import { PROBE_MODEL_CATALOG } from '@/api/credentials'
-import { useRatelimitInsights } from '@/hooks/use-usage'
+import { useRatelimitInsights, useUsageOverview } from '@/hooks/use-usage'
 import { useLiveStream } from '@/hooks/use-live-stream'
 import {
   useSetDisabled,
@@ -25,6 +23,7 @@ import {
   useSetRpmLimit,
   useSetAllowedModels,
   useDeleteCredential,
+  useConfigSnapshot,
 } from '@/hooks/use-credentials'
 import {
   useDeepVerify,
@@ -48,7 +47,7 @@ import type {
   StoragePartition,
   StorageCleanupTarget,
 } from '@/types/api'
-import { cn, copyToClipboard } from '@/lib/utils'
+import { cn } from '@/lib/utils'
 import { storage } from '@/lib/storage'
 import {
   Download,
@@ -184,9 +183,9 @@ export function OpsPage() {
     <TooltipProvider delayDuration={200}>
       <div className="space-y-6">
         <LiveMetricsBar live={live} />
+        <CacheObservationCard />
         <PoolHealthCard live={live} />
         <RecoveryMetricsCard />
-        <ImportPushCard />
         <LogViewer focusToken={logFocus.token} focusTerm={logFocus.term} />
         <OpsAggregationCard onFocusLog={focusLog} />
       </div>
@@ -261,6 +260,136 @@ function LiveMetricsBar({ live }: { live: ReturnType<typeof useLiveStream> }) {
   )
 }
 
+type CacheWindow = 'last_24h' | 'last_7d' | 'last_30d' | 'all_time'
+
+const CACHE_WINDOWS: { key: CacheWindow; labelKey: string }[] = [
+  { key: 'last_24h', labelKey: 'opspage.cache.window24h' },
+  { key: 'last_7d', labelKey: 'opspage.cache.window7d' },
+  { key: 'last_30d', labelKey: 'opspage.cache.window30d' },
+  { key: 'all_time', labelKey: 'opspage.cache.windowAll' },
+]
+
+// 严格缓存观测：只读本地 usage 聚合 + 配置快照，不触发任何 Kiro 上游请求。
+// 命中率分母仅包含 cache_observed=true 的请求，观测关闭/报文不可解析不会被错算成 miss。
+function CacheObservationCard() {
+  const { t } = useTranslation()
+  const overview = useUsageOverview()
+  const config = useConfigSnapshot()
+  const [windowKey, setWindowKey] = useState<CacheWindow>('last_24h')
+  const window = overview.data?.[windowKey]
+  const enabled = config.data?.promptCacheEnabled
+  const observed = window?.cache_observed_requests ?? 0
+  const hits = window?.cache_hit_requests ?? 0
+  const ratePct = observed > 0 ? (window?.cache_hit_rate ?? 0) * 100 : null
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-start justify-between gap-3 pb-2">
+        <div className="space-y-1">
+          <CardTitle className="flex flex-wrap items-center gap-2 text-base">
+            <Database className="h-4 w-4" />
+            {t('opspage.cache.title')}
+            {config.data && (
+              <Badge variant={enabled ? 'success' : 'secondary'} className="text-[10px]">
+                {t(enabled ? 'opspage.cache.enabled' : 'opspage.cache.disabled')}
+              </Badge>
+            )}
+            {config.data && (
+              <span className="text-xs font-normal text-muted-foreground">
+                {t('opspage.cache.ttl', { seconds: config.data.promptCacheTtlSeconds })}
+              </span>
+            )}
+          </CardTitle>
+          <p className="text-xs text-muted-foreground">{t('opspage.cache.subtitle')}</p>
+        </div>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => void Promise.all([overview.refetch(), config.refetch()])}
+          className="h-7 px-2"
+          aria-label={t('opspage.cache.refresh')}
+        >
+          <RefreshCw className={cn('h-3.5 w-3.5', (overview.isFetching || config.isFetching) && 'animate-spin')} />
+        </Button>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="inline-flex rounded-md border border-border bg-secondary/30 p-0.5">
+          {CACHE_WINDOWS.map((item) => (
+            <button
+              key={item.key}
+              type="button"
+              onClick={() => setWindowKey(item.key)}
+              className={cn(
+                'h-7 rounded px-3 text-xs transition-colors',
+                windowKey === item.key
+                  ? 'bg-card text-foreground shadow-sm'
+                  : 'text-muted-foreground hover:text-foreground',
+              )}
+            >
+              {t(item.labelKey)}
+            </button>
+          ))}
+        </div>
+
+        {overview.isLoading || config.isLoading ? (
+          <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+            {Array.from({ length: 4 }).map((_, i) => <Skeleton key={i} className="h-[108px]" />)}
+          </div>
+        ) : overview.error ? (
+          <EmptyState
+            icon={ServerCrash}
+            tone="destructive"
+            title={t('opspage.cache.readFailTitle')}
+            description={t('opspage.cache.readFailDesc')}
+            action={<Button variant="outline" size="sm" onClick={() => overview.refetch()}>{t('opspage.common.retry')}</Button>}
+          />
+        ) : (
+          <>
+            {config.error ? (
+              <Callout variant="warning">{t('opspage.cache.configUnknown')}</Callout>
+            ) : !enabled ? (
+              <Callout variant="warning">{t('opspage.cache.disabledHint')}</Callout>
+            ) : observed === 0 ? (
+              <Callout variant="info">{t('opspage.cache.noObserved')}</Callout>
+            ) : (
+              <Callout variant="info">{t('opspage.cache.disclaimer')}</Callout>
+            )}
+            <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+              <StatCard
+                label={t('opspage.cache.observed')}
+                value={<AnimatedNumber value={observed} />}
+                icon={Eye}
+                hint={t('opspage.cache.observedHint')}
+              />
+              <StatCard
+                label={t('opspage.cache.hits')}
+                value={<AnimatedNumber value={hits} />}
+                icon={CheckCircle2}
+                accent={hits > 0 ? 'success' : 'neutral'}
+                hint={t('opspage.cache.hitsHint', { misses: Math.max(0, observed - hits) })}
+              />
+              <StatCard
+                label={t('opspage.cache.hitRate')}
+                value={ratePct == null ? '—' : `${ratePct.toFixed(1)}%`}
+                icon={Gauge}
+                accent={ratePct == null ? 'neutral' : ratePct >= 50 ? 'success' : 'warning'}
+                hint={t('opspage.cache.hitRateHint')}
+              />
+              <StatCard
+                label={t('opspage.cache.readTokens')}
+                value={<AnimatedNumber value={window?.cache_read_tokens ?? 0} format={(n) => Math.round(n).toLocaleString()} />}
+                icon={Database}
+                accent={(window?.cache_read_tokens ?? 0) > 0 ? 'primary' : 'neutral'}
+                hint={t('opspage.cache.readTokensHint')}
+              />
+            </div>
+          </>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
 function RecoveryMetricsCard() {
   const { t } = useTranslation()
   // 每 5s 刷新计数器（纯内存端点，零上游）。
@@ -328,250 +457,6 @@ function RecoveryMetricsCard() {
       </CardContent>
     </Card>
   )
-}
-
-// 外部凭据推送(POST /api/import/keys)可观测卡。
-//
-// 这个功能相对独立:凭据由外部系统主动推来,不经上号流程,失败原因此前只在容器日志里。
-// 本卡把累计计数 + 最近几批明细摆到面板上,让"对方推了什么、成了几个、为什么失败"可自查。
-// 数据源是进程级内存计数(后端 common/import_stats.rs),零上游、重启归零,故 10s 轮询足够。
-function ImportPushCard() {
-  const { t } = useTranslation()
-  const { data, isLoading, refetch } = useQuery({
-    queryKey: ['import-stats'],
-    queryFn: getImportStats,
-    refetchInterval: 10000,
-  })
-
-  return (
-    <Card>
-      <CardHeader className="flex flex-row items-center justify-between pb-2">
-        <CardTitle className="flex items-center gap-2 text-base">
-          <Inbox className="h-4 w-4" />
-          {t('opspage.import.title')}
-          {data && (
-            <span
-              className={`rounded px-1.5 py-0.5 text-[10px] font-normal ${
-                data.enabled
-                  ? 'bg-emerald-500/10 text-emerald-400'
-                  : 'bg-secondary text-muted-foreground'
-              }`}
-            >
-              {data.enabled ? t('opspage.import.enabled') : t('opspage.import.disabled')}
-            </span>
-          )}
-          {data?.lastAtMs && (
-            <span className="text-xs font-normal text-muted-foreground">
-              {t('opspage.import.lastAt', { time: formatClock(data.lastAtMs) })}
-            </span>
-          )}
-        </CardTitle>
-        <Button variant="ghost" size="sm" onClick={() => refetch()} className="h-7 px-2">
-          <RefreshCw className="h-3.5 w-3.5" />
-        </Button>
-      </CardHeader>
-      <CardContent>
-        {isLoading ? (
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
-            {Array.from({ length: 5 }).map((_, i) => (
-              <Skeleton key={i} className="h-16" />
-            ))}
-          </div>
-        ) : !data ? (
-          <EmptyState
-            icon={ServerCrash}
-            tone="destructive"
-            title={t('opspage.import.readFailTitle')}
-            description={t('opspage.import.readFailDesc')}
-            action={
-              <Button variant="outline" size="sm" onClick={() => refetch()}>
-                {t('opspage.common.retry')}
-              </Button>
-            }
-          />
-        ) : (
-          <>
-            {!data.enabled && (
-              <Callout variant="warning" className="mb-3">
-                {t('opspage.import.disabledHint')}
-              </Callout>
-            )}
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
-              <StatCard
-                label={t('opspage.import.stat.pushes')}
-                value={<AnimatedNumber value={data.pushes} />}
-              />
-              <StatCard
-                label={t('opspage.import.stat.total')}
-                value={<AnimatedNumber value={data.keysTotal} />}
-              />
-              <StatCard
-                label={t('opspage.import.stat.imported')}
-                value={<AnimatedNumber value={data.keysImported} />}
-                accent={data.keysImported > 0 ? 'success' : 'neutral'}
-              />
-              <StatCard
-                label={t('opspage.import.stat.duplicate')}
-                value={<AnimatedNumber value={data.keysDuplicate} />}
-              />
-              <StatCard
-                label={t('opspage.import.stat.failed')}
-                value={<AnimatedNumber value={data.keysFailed} />}
-                accent={data.keysFailed > 0 ? 'warning' : 'neutral'}
-              />
-            </div>
-            {data.records.length > 0 ? (
-              <div className="mt-4 space-y-2">
-                <div className="text-xs text-muted-foreground">{t('opspage.import.recent')}</div>
-                {data.records.map((rec, idx) => (
-                  <ImportRecordRow key={`${rec.atMs}-${idx}`} rec={rec} />
-                ))}
-              </div>
-            ) : (
-              data.enabled && (
-                <div className="mt-4">
-                  <EmptyState
-                    icon={Inbox}
-                    title={t('opspage.import.never')}
-                    description={t('opspage.import.neverHint')}
-                  />
-                </div>
-              )
-            )}
-          </>
-        )}
-      </CardContent>
-    </Card>
-  )
-}
-
-// 单批推送明细行。失败项优先展示(后端已按失败优先裁剪),便于直接看到原因。
-function ImportRecordRow({ rec }: { rec: ImportRecord }) {
-  const { t } = useTranslation()
-  const [open, setOpen] = useState(false)
-  return (
-    <div className="rounded-md border border-[#2e2e2e] bg-[#111]">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center gap-3 px-3 py-2 text-left hover:bg-[#161616]"
-      >
-        <span className="font-mono text-xs text-muted-foreground">{formatClock(rec.atMs)}</span>
-        <span className="flex-1 text-xs text-muted-foreground">
-          {t('opspage.import.batchSummary', {
-            total: rec.total,
-            elapsed: `${(rec.elapsedMs / 1000).toFixed(1)}s`,
-          })}
-        </span>
-        {rec.imported > 0 && (
-          <span className="text-xs text-emerald-400">+{rec.imported}</span>
-        )}
-        {rec.duplicates > 0 && (
-          <span className="text-xs text-muted-foreground">={rec.duplicates}</span>
-        )}
-        {rec.failed > 0 && <span className="text-xs text-amber-400">!{rec.failed}</span>}
-        {open ? (
-          <ChevronUp className="h-3.5 w-3.5 text-muted-foreground" />
-        ) : (
-          <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
-        )}
-      </button>
-      {open && (
-        <div className="space-y-1 border-t border-[#2e2e2e] px-3 py-2">
-          {rec.items.map((it, i) => (
-            <div key={`${it.key}-${i}`} className="space-y-0.5 py-0.5 text-xs">
-              {/* 第一行:处置结果 + 明文 key + 复制 + 落库 id。
-                  明文 key:面板走 admin 鉴权,与既有「导出凭据」同防护级别;运维要直接核对/取用
-                  刚入池的号,打码反而挡住正事(回给推送方的响应仍打码)。 */}
-              <div className="flex items-start gap-2">
-                <span
-                  className={
-                    !it.ok
-                      ? 'shrink-0 text-amber-400'
-                      : it.duplicate
-                        ? 'shrink-0 text-muted-foreground'
-                        : 'shrink-0 text-emerald-400'
-                  }
-                >
-                  {!it.ok
-                    ? t('opspage.import.itemFail')
-                    : it.duplicate
-                      ? t('opspage.import.itemDup')
-                      : t('opspage.import.itemOk')}
-                </span>
-                <span
-                  className="select-all break-all font-mono text-foreground"
-                  title={t('opspage.import.copyKey')}
-                >
-                  {it.key}
-                </span>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  className="h-4 shrink-0 px-1"
-                  title={t('opspage.import.copyKey')}
-                  onClick={async () => {
-                    const ok = await copyToClipboard(it.key)
-                    toast[ok ? 'success' : 'error'](
-                      t(ok ? 'opspage.import.keyCopied' : 'opspage.log.copyFail'),
-                    )
-                  }}
-                >
-                  <Copy className="h-3 w-3" />
-                </Button>
-                {it.credentialId != null && (
-                  <span className="shrink-0 text-muted-foreground">#{it.credentialId}</span>
-                )}
-              </div>
-              {/* 第二行:推送方**发来的**原值 → 我们**落库的**值。
-                  分两栏的理由:只看落库值无法区分「对方指定了 us-east-1」与「对方没发、我们探测出
-                  us-east-1」。而 93 号那次悄悄落到 endpoint=cli 导致整号不可用,面板上却看不出来。 */}
-              <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 pl-[3.2rem] font-mono text-[10px] text-muted-foreground">
-                <span className="not-italic">{t('opspage.import.sentLabel')}</span>
-                <span className="rounded bg-secondary px-1 py-0.5">
-                  region={it.sentRegion ?? '—'}
-                </span>
-                <span className="rounded bg-secondary px-1 py-0.5">
-                  groups=[{(it.sentGroups ?? []).join(',')}]
-                </span>
-                <span className="rounded bg-secondary px-1 py-0.5">
-                  endpoint={it.sentEndpoint ?? 'null'}
-                </span>
-                {it.ok && (
-                  <>
-                    <span className="text-muted-foreground/60">→</span>
-                    <span className="not-italic">{t('opspage.import.landedLabel')}</span>
-                    <span className="rounded bg-primary/10 px-1 py-0.5 text-primary">
-                      {it.region ?? '—'}
-                    </span>
-                    <span
-                      className="rounded bg-primary/10 px-1 py-0.5 text-primary"
-                      title={t('opspage.import.endpointTitle')}
-                    >
-                      {it.endpoint ?? t('opspage.import.endpointDefault')}
-                    </span>
-                  </>
-                )}
-              </div>
-              {it.error && (
-                <div className="break-all pl-[3.2rem] text-amber-400/80">{it.error}</div>
-              )}
-            </div>
-          ))}
-          {rec.omitted > 0 && (
-            <div className="text-xs text-muted-foreground">
-              {t('opspage.import.omitted', { count: rec.omitted })}
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  )
-}
-
-// Unix 毫秒 → 本地时钟(HH:MM:SS)。推送是低频事件,只显示时刻即可定位。
-function formatClock(ms: number): string {
-  return new Date(ms).toLocaleTimeString()
 }
 
 // 图标按钮 + Tooltip 的小包装(替代裸 button title,统一 ghost icon 尺寸)。

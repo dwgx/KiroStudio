@@ -32,6 +32,23 @@ use super::types::{
 };
 use super::websearch;
 
+/// 把 provider 基于“实际凭据 + 实际端点最终报文”查询到的本地可验证缓存状态
+/// 转成 Anthropic usage。Kiro 不返回服务端 cache 回执，所以这里只报告此前完整成功
+/// 请求建立的 inferred read；creation 恒为 0。
+fn strict_cache_breakdown(
+    provider: &crate::kiro::provider::KiroProvider,
+    meta: &crate::kiro::provider::CallMeta,
+    total_input_tokens: i32,
+) -> Option<CacheUsageBreakdown> {
+    let usage = provider.prompt_cache_usage(meta, total_input_tokens)?;
+    Some(CacheUsageBreakdown {
+        cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        cache_read_input_tokens: usage.cache_read_input_tokens,
+        cache_creation_5m_input_tokens: 0,
+        cache_creation_1h_input_tokens: 0,
+    })
+}
+
 /// 从入站请求头提取客户端 IP（仅头部来源，不含连接层回退）。
 ///
 /// **安全(A1 修复)**：取 `x-forwarded-for` 的**最右**段，不是最左。XFF 是各级代理依次
@@ -637,6 +654,46 @@ fn map_provider_error(err: Error) -> Response {
         return (t.status, Json(ErrorResponse::new(t.error_type, t.message))).into_response();
     }
 
+    // 上游瞬态限流（429）重试耗尽：必须回 429 + Retry-After，绝不能落到下面的 502 兜底。
+    //
+    // 为什么单列一支：限流的错误串（`流式 API 请求失败: 429 Too Many Requests {...}`）不含任何
+    // 已知关键字，历史上直落兜底 `502 api_error`。后果有两层：
+    //   ① 客户端（Claude Code）把「上游忙」当成「网关坏了」——语义完全错位；
+    //   ② 502 不带 Retry-After，客户端按故障重试而非按退避重试，反而加剧上游限流。
+    // 生产实证 2026-08-04：240 次 429 全部回成 502，无一次带 Retry-After。
+    //
+    // 放在 translate_upstream_error **之后**：更具体的翻译（如 MONTHLY_REQUEST_COUNT 配额耗尽）
+    // 仍然优先命中，本支只接管原本会掉进 502 兜底的那些，是严格增量、不改任何既有正确行为。
+    if let Some(rest) = err_str.split("upstream_429_retry=").nth(1) {
+        let parsed: u64 = rest
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|d| d.parse().ok())
+            .unwrap_or(0);
+        // 0 = 上游未给精确重置时间（裸 429）。给一个保守的小退避而非不带头：
+        // 不带 Retry-After 时客户端多半立刻重试，等于继续砸正在限流的上游。
+        const DEFAULT_RETRY_AFTER_SECS: u64 = 5;
+        let retry_after = if parsed == 0 {
+            DEFAULT_RETRY_AFTER_SECS
+        } else {
+            parsed.clamp(1, 300)
+        };
+        tracing::warn!(
+            retry_after_secs = retry_after,
+            upstream_specified = parsed > 0,
+            "上游限流（429）重试耗尽，返回 429 + Retry-After 让客户端退避"
+        );
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, retry_after.to_string())],
+            Json(ErrorResponse::new(
+                "rate_limit_error",
+                "上游账号触发速率限制（429）。已按 Retry-After 指示的间隔退避后重试即可；若持续出现，请为号池补充更多凭据以分摊速率。",
+            )),
+        )
+            .into_response();
+    }
+
     // 未知错误:**完整原文只进服务端日志**(便于 dwgx 排障),**不回给客户端**——原始错误链可能
     // 含上游响应体里的 profileArn / AWS 账号号 / region / 内部 URL 等敏感信息(review 泄露发现)。
     // 客户端只得通用提示 + 引导查网关日志,不泄露任何上游内部细节。
@@ -877,28 +934,6 @@ pub async fn post_messages(
         payload.tools.as_deref(),
     ) as i32;
 
-    // 估算影子缓存：系统提示 + 历史轮次已被 Bedrock prefix cache 缓存（通过 agentContinuationId）。
-    // 仅在有历史轮次时（messages.len() > 1）估算；首轮返回 0 保守不注入。
-    //
-    // ⚠️ 必须尊重 promptCacheEnabled：见 /cc/v1 路径同处注释——影子缓存会经
-    // `billed_input_tokens` 把 input_tokens 扣成 0，导致客户端自动压缩永不触发。
-    // 开关打开时由 count_prefix_tokens 内部的 85% 上限兜住（见该函数注释）。
-    let prefix_tokens = if provider.token_manager().config().prompt_cache_enabled {
-        token::count_prefix_tokens(payload.system.as_deref(), &payload.messages, input_tokens)
-    } else {
-        0
-    };
-    let cache_breakdown: Option<CacheUsageBreakdown> = if prefix_tokens > 0 {
-        Some(CacheUsageBreakdown {
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: prefix_tokens.min(input_tokens),
-            cache_creation_5m_input_tokens: 0,
-            cache_creation_1h_input_tokens: 0,
-        })
-    } else {
-        None
-    };
-
     // 检查是否启用了thinking
     let thinking_enabled = payload
         .thinking
@@ -925,7 +960,6 @@ pub async fn post_messages(
                 thinking_enabled,
                 tool_name_map,
                 known_tool_names,
-                cache_breakdown,
                 client,
             )
             .await
@@ -938,7 +972,6 @@ pub async fn post_messages(
                 thinking_enabled,
                 tool_name_map,
                 known_tool_names,
-                cache_breakdown,
                 client,
             )
             .await
@@ -953,7 +986,6 @@ pub async fn post_messages(
             input_tokens,
             extract_thinking,
             tool_name_map,
-            cache_breakdown,
             client,
         )
         .await
@@ -969,7 +1001,6 @@ async fn handle_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
-    cache_breakdown: Option<CacheUsageBreakdown>,
     client: ClientInfo,
 ) -> Response {
     // 1M 变体:据原始模型名判定是否注入 anthropic-beta 头(仅受支持的 [1m] 变体为 true)。
@@ -979,6 +1010,7 @@ async fn handle_stream_request(
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
+    let cache_breakdown = strict_cache_breakdown(&provider, &meta, input_tokens);
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_full(
@@ -1014,6 +1046,9 @@ fn emit_stream_usage(
     meta: &crate::kiro::provider::CallMeta,
     client: &ClientInfo,
 ) {
+    if ctx.completion().is_ok() && ctx.has_context_usage() {
+        provider.commit_prompt_cache(meta);
+    }
     let usage = ctx.resolved_usage();
     let mut record = crate::usage::RequestRecord::new(
         Uuid::new_v4().to_string(),
@@ -1026,6 +1061,7 @@ fn emit_stream_usage(
     record.output_tokens = usage.output_tokens;
     record.cache_read_tokens = usage.cache_read_tokens;
     record.cache_creation_tokens = usage.cache_creation_tokens;
+    record.cache_observed = usage.cache_observed;
     record.credits_used = usage.credits_used;
     record.latency_ms = meta.latency_ms;
     record.retries = meta.retries;
@@ -1246,7 +1282,6 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
-    cache_breakdown: Option<CacheUsageBreakdown>,
     client: ClientInfo,
 ) -> Response {
     // 1M 变体:据原始模型名判定是否注入 anthropic-beta 头(仅受支持的 [1m] 变体为 true)。
@@ -1256,6 +1291,7 @@ async fn handle_non_stream_request(
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
+    let cache_breakdown = strict_cache_breakdown(&provider, &meta, input_tokens);
 
     // 读取响应体
     let body_bytes = match response.bytes().await {
@@ -1522,6 +1558,11 @@ async fn handle_non_stream_request(
             record.session_id = meta.session_id.clone();
             record.is_streaming = meta.is_streaming;
             record.input_tokens = context_input_tokens.unwrap_or(input_tokens);
+            if let Some(cache) = cache_breakdown {
+                record.cache_observed = true;
+                record.cache_read_tokens = cache.cache_read_input_tokens;
+                record.cache_creation_tokens = cache.cache_creation_input_tokens;
+            }
             record.credits_used = credits_used;
             record.latency_ms = meta.latency_ms;
             record.retries = meta.retries;
@@ -1595,6 +1636,12 @@ async fn handle_non_stream_request(
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
     let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
 
+    // 只有响应完整成功且收到上游 contextUsageEvent，当前请求才有资格建立后续缓存检查点。
+    // 缺少收尾 usage 的 2xx/空流保守不提交，避免把协议异常误记成缓存已建立。
+    if context_input_tokens.is_some() {
+        provider.commit_prompt_cache(&meta);
+    }
+
     // 用量埋点：非流式成功记录
     {
         let mut record = crate::usage::RequestRecord::new(
@@ -1606,6 +1653,11 @@ async fn handle_non_stream_request(
         record.is_streaming = meta.is_streaming;
         record.input_tokens = final_input_tokens;
         record.output_tokens = output_tokens;
+        if let Some(cache) = cache_breakdown {
+            record.cache_observed = true;
+            record.cache_read_tokens = cache.cache_read_input_tokens;
+            record.cache_creation_tokens = cache.cache_creation_input_tokens;
+        }
         record.credits_used = credits_used;
         record.latency_ms = meta.latency_ms;
         record.retries = meta.retries;
@@ -1829,28 +1881,6 @@ pub async fn post_messages_cc(
         payload.tools.as_deref(),
     ) as i32;
 
-    // 估算影子缓存（与 /v1 路径逻辑一致）
-    //
-    // 两道防线保证 `input_tokens` 不会被 `billed_input_tokens` 扣成 0（扣成 0 会让
-    // 客户端认为本轮没消耗上下文 → 自动压缩永不触发 → 历史无限累积）：
-    // ①尊重 promptCacheEnabled（关则完全不算）；②开启时由 count_prefix_tokens
-    // 内部的 85% 上限兜底，见该函数注释。
-    let prefix_tokens = if provider.token_manager().config().prompt_cache_enabled {
-        token::count_prefix_tokens(payload.system.as_deref(), &payload.messages, input_tokens)
-    } else {
-        0
-    };
-    let cache_breakdown: Option<CacheUsageBreakdown> = if prefix_tokens > 0 {
-        Some(CacheUsageBreakdown {
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: prefix_tokens.min(input_tokens),
-            cache_creation_5m_input_tokens: 0,
-            cache_creation_1h_input_tokens: 0,
-        })
-    } else {
-        None
-    };
-
     // 检查是否启用了thinking
     let thinking_enabled = payload
         .thinking
@@ -1888,7 +1918,6 @@ pub async fn post_messages_cc(
                 thinking_enabled,
                 tool_name_map,
                 known_tool_names,
-                cache_breakdown,
                 client,
             )
             .await
@@ -1902,7 +1931,6 @@ pub async fn post_messages_cc(
                 thinking_enabled,
                 tool_name_map,
                 known_tool_names,
-                cache_breakdown,
                 client,
             )
             .await
@@ -1917,7 +1945,6 @@ pub async fn post_messages_cc(
             input_tokens,
             extract_thinking,
             tool_name_map,
-            cache_breakdown,
             client,
         )
         .await
@@ -1936,7 +1963,6 @@ async fn handle_stream_request_buffered(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
-    cache_breakdown: Option<CacheUsageBreakdown>,
     client: ClientInfo,
 ) -> Response {
     // 1M 变体:据原始模型名判定是否注入 anthropic-beta 头(仅受支持的 [1m] 变体为 true)。
@@ -1946,6 +1972,7 @@ async fn handle_stream_request_buffered(
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
+    let cache_breakdown = strict_cache_breakdown(&provider, &meta, estimated_input_tokens);
 
     // 创建缓冲流处理上下文
     let mut ctx = BufferedStreamContext::new(
@@ -2133,6 +2160,9 @@ fn emit_buffered_usage(
     meta: &crate::kiro::provider::CallMeta,
     client: &ClientInfo,
 ) {
+    if ctx.completion().is_ok() && ctx.has_context_usage() {
+        provider.commit_prompt_cache(meta);
+    }
     let usage = ctx.resolved_usage();
     let mut record = crate::usage::RequestRecord::new(
         Uuid::new_v4().to_string(),
@@ -2145,6 +2175,7 @@ fn emit_buffered_usage(
     record.output_tokens = usage.output_tokens;
     record.cache_read_tokens = usage.cache_read_tokens;
     record.cache_creation_tokens = usage.cache_creation_tokens;
+    record.cache_observed = usage.cache_observed;
     record.credits_used = usage.credits_used;
     record.latency_ms = meta.latency_ms;
     record.retries = meta.retries;
@@ -2455,6 +2486,92 @@ mod error_translation_tests {
             translate_network(upstream_body).is_none(),
             "上游 body 含 timeout/proxy/tls 字样不应被误判成网络故障"
         );
+    }
+
+    // ===== 瞬态 429 → 429 + Retry-After（生产事故 2026-08-04 回归）=====
+    //
+    // 旧行为：上游限流重试耗尽后，错误串不含任何已知关键字 → 落 502 兜底。
+    // 客户端（Claude Code）把限流当网关故障，且 502 不带 Retry-After，退避完全走偏。
+    // 生产实证：240 次 429 全部回成 502，正确的 429+Retry-After 路径 0 次。
+
+    /// 上游给出精确重置时间时，Retry-After 必须用上游的值。
+    #[test]
+    fn test_transient_429_returns_429_with_upstream_retry_after() {
+        let err = anyhow::anyhow!(
+            "流式 API 请求失败: 429 Too Many Requests {{\"message\":\"Too many requests\"}} upstream_429_retry=30"
+        );
+        let resp = map_provider_error(err);
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "瞬态 429 必须回 429，不能回 502"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("30"),
+            "必须带上游给出的 Retry-After"
+        );
+    }
+
+    /// 裸 429（上游未给重置时间，标记为 0）→ 用保守默认值，但**必须**带头。
+    /// 不带 Retry-After 时客户端多半立刻重试，等于继续砸正在限流的上游。
+    #[test]
+    fn test_bare_429_returns_default_retry_after() {
+        let err = anyhow::anyhow!(
+            "非流式 API 请求失败: 429 Too Many Requests {{\"reason\":null}} upstream_429_retry=0"
+        );
+        let resp = map_provider_error(err);
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let ra = resp
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .expect("裸 429 也必须带 Retry-After");
+        assert!((1..=300).contains(&ra), "默认退避应在合理区间，实际 {ra}");
+    }
+
+    /// ⚠️ 标记互斥性：`upstream_429_retry=` 绝不能含 `retry_after_secs=` 子串。
+    ///
+    /// 后者是「全池冷却」路径的标记，map_provider_error 用 contains 判它且**排在更前**。
+    /// 若两者有子串包含关系，瞬态 429 会被全池冷却分支抢先命中，回出「所有凭据都在冷却」
+    /// 的错误文案（实际是上游限流）——排障方向被彻底带偏。
+    #[test]
+    fn test_429_marker_does_not_collide_with_pool_cooling_marker() {
+        assert!(
+            !"upstream_429_retry=".contains("retry_after_secs="),
+            "两个标记不得有子串包含关系，否则分支互相抢占"
+        );
+
+        // 全池冷却的错误串必须仍走全池冷却分支（文案含「冷却」语义）。
+        let cooling = anyhow::anyhow!("所有凭据均在冷却（0/2）retry_after_secs=12");
+        let resp = map_provider_error(cooling);
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("12"),
+            "全池冷却路径不应被新分支改变行为"
+        );
+    }
+
+    /// 零回归：非限流错误仍走原路径，绝不被新分支误吞。
+    #[test]
+    fn test_non_429_errors_unaffected() {
+        // 普通 400：无任何标记 → 仍是 502 兜底（原行为）。
+        let bad = anyhow::anyhow!("非流式 API 请求失败: 400 {{\"message\":\"bad request\"}}");
+        assert_eq!(map_provider_error(bad).status(), StatusCode::BAD_GATEWAY);
+
+        // 配额耗尽：更具体的翻译**必须**优先于新的瞬态 429 分支
+        // （translate_upstream_error 排在前面，故此串即便带 429 状态码也走配额语义）。
+        let quota = anyhow::anyhow!("API 请求失败: 402 MONTHLY_REQUEST_COUNT exceeded");
+        let t = translate_upstream_error("API 请求失败: 402 MONTHLY_REQUEST_COUNT exceeded")
+            .expect("配额错误必须被翻译");
+        assert_eq!(t.error_type, "rate_limit_error");
+        assert_eq!(map_provider_error(quota).status(), t.status);
     }
 }
 

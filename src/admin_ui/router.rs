@@ -3,7 +3,7 @@
 use axum::{
     Json, Router,
     body::Body,
-    http::{Response, StatusCode, Uri, header},
+    http::{HeaderMap, Response, StatusCode, Uri, header},
     response::IntoResponse,
     routing::get,
 };
@@ -493,12 +493,63 @@ pub fn create_admin_ui_router() -> Router {
 }
 
 /// 处理首页请求
-async fn index_handler() -> impl IntoResponse {
-    serve_index()
+async fn index_handler(headers: HeaderMap) -> impl IntoResponse {
+    serve_index_with(&headers)
+}
+
+/// 由资源内容算出的强 ETag。
+///
+/// 用 rust-embed 编译期就算好的 sha256（`metadata.sha256_hash()`），运行时零成本——
+/// 不需要每次请求重新哈希字节。取前 16 个十六进制字符：64 位碰撞空间对「同一文件的
+/// 不同版本」这个用途绰绰有余，而完整的 64 字符会让每个响应头白占 48 字节。
+///
+/// 是**强** ETag（不带 `W/` 前缀）：字节完全一致才给同一个值，所以可以安全地用于
+/// Range 请求等需要精确匹配的场景。
+fn etag_of(content: &rust_embed::EmbeddedFile) -> String {
+    let h = content.metadata.sha256_hash();
+    let mut s = String::with_capacity(18);
+    s.push('"');
+    for b in h.iter().take(8) {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s.push('"');
+    s
+}
+
+/// 请求带的 `If-None-Match` 是否与当前 ETag 匹配。
+///
+/// 只做「逐个候选精确比对」，不实现 `If-None-Match: *`——那个语义是用于写请求的
+/// 前置条件（"只要资源存在就失败"），对 GET 静态文件没有意义，实现它反而会引入
+/// 一个「客户端发 `*` 就永远拿 304」的错法。
+fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {
+    headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(|inm| {
+            inm.split(',').any(|candidate| {
+                let c = candidate.trim();
+                // 弱比较：`W/"abc"` 与 `"abc"` 视为同一个实体。浏览器一般原样回
+                // 我们发出的强 ETag，但中间代理可能把它弱化，那时仍应命中 304。
+                c == etag || c.strip_prefix("W/").map(str::trim) == Some(etag)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// 304 响应。**必须带上 ETag 与 Cache-Control**：RFC 9110 §15.4.5 要求 304 携带
+/// 那些「若是 200 也会发」的缓存相关头，否则某些缓存会认为条目失效、下次仍整份重下，
+/// 白白抵消掉 304 的收益。
+fn not_modified(etag: &str, cache_control: &str) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::NOT_MODIFIED)
+        .header(header::ETAG, etag)
+        .header(header::CACHE_CONTROL, cache_control)
+        .body(Body::empty())
+        .expect("Failed to build response")
 }
 
 /// 处理静态文件请求
-async fn static_handler(uri: Uri) -> impl IntoResponse {
+async fn static_handler(uri: Uri, headers: HeaderMap) -> impl IntoResponse {
     let path = uri.path().trim_start_matches('/');
 
     // 安全检查：拒绝包含 .. 的路径
@@ -517,18 +568,29 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
 
         // 根据文件类型设置不同的缓存策略
         let cache_control = get_cache_control(path);
+        let etag = etag_of(&content);
+
+        // 命中 If-None-Match → 304，不回传字节。
+        //
+        // 对 `assets/` 下带内容哈希的文件，这条几乎永远走不到（immutable 让浏览器
+        // 连请求都不发）；真正受益的是 index.html 那类 `no-cache` 的资源——它们
+        // 每次导航都必须回源验证，有 ETag 才能用 304 代替整份重下。
+        if etag_matches(&headers, &etag) {
+            return not_modified(&etag, cache_control);
+        }
 
         return Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, mime)
             .header(header::CACHE_CONTROL, cache_control)
+            .header(header::ETAG, etag)
             .body(Body::from(content.data.into_owned()))
             .expect("Failed to build response");
     }
 
     // SPA fallback: 如果文件不存在且不是资源文件，返回 index.html
     if !is_asset_path(path) {
-        return serve_index();
+        return serve_index_with(&headers);
     }
 
     // 404
@@ -538,15 +600,25 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
         .expect("Failed to build response")
 }
 
-/// 提供 index.html
-fn serve_index() -> Response<Body> {
+/// 提供 index.html，支持 `If-None-Match` 条件请求。
+///
+/// index.html 走 `no-cache`（每次导航都必须回源验证），所以它是 ETag 收益最大的
+/// 那个资源：验证通过时用一个空体 304 代替整份 HTML。
+fn serve_index_with(headers: &HeaderMap) -> Response<Body> {
     match Asset::get("index.html") {
-        Some(content) => Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-            .header(header::CACHE_CONTROL, "no-cache")
-            .body(Body::from(content.data.into_owned()))
-            .expect("Failed to build response"),
+        Some(content) => {
+            let etag = etag_of(&content);
+            if etag_matches(headers, &etag) {
+                return not_modified(&etag, "no-cache");
+            }
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                .header(header::CACHE_CONTROL, "no-cache")
+                .header(header::ETAG, etag)
+                .body(Body::from(content.data.into_owned()))
+                .expect("Failed to build response")
+        }
         None => Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Body::from(
@@ -854,6 +926,221 @@ mod tests {
                 ok,
                 "合法图片 MIME {ok:?} 应原样保留"
             );
+        }
+    }
+
+    // ============ 缓存与条件请求 ============
+
+    fn hm(pairs: &[(header::HeaderName, &str)]) -> HeaderMap {
+        let mut m = HeaderMap::new();
+        for (k, v) in pairs {
+            m.insert(k.clone(), v.parse().expect("合法头值"));
+        }
+        m
+    }
+
+    /// index.html 必须真的嵌进了二进制——否则下面所有 ETag 用例都在测一个
+    /// 永远走 `None` 分支的空壳，全绿但毫无意义。
+    #[test]
+    fn index_html_is_actually_embedded() {
+        assert!(
+            Asset::get("index.html").is_some(),
+            "index.html 未嵌入。ETag 相关用例会全部退化成对 404 分支的断言。"
+        );
+    }
+
+    #[test]
+    fn etag_is_stable_quoted_and_content_derived() {
+        let index = Asset::get("index.html").expect("已由上一条用例保证存在");
+        let a = etag_of(&index);
+        let b = etag_of(&Asset::get("index.html").expect("同一文件"));
+
+        assert_eq!(a, b, "同一内容必须给出同一个 ETag，否则 304 永远命中不了");
+        assert!(
+            a.starts_with('"') && a.ends_with('"'),
+            "ETag 必须是带引号的 quoted-string（RFC 9110 §8.8.3），实际是 {a}"
+        );
+        assert!(
+            !a.starts_with("W/"),
+            "这里发的是强 ETag（字节完全一致才同值），不该带弱前缀"
+        );
+        // 16 个十六进制字符 + 两个引号。
+        assert_eq!(a.len(), 18, "ETag 长度变了：{a}");
+    }
+
+    /// 不同文件必须给出不同 ETag。若哪天 `etag_of` 被改成返回常量或版本号，
+    /// 表现就是「改了 JS 但浏览器一直拿 304」——线上最难查的那类问题。
+    #[test]
+    fn different_files_get_different_etags() {
+        let mut seen = std::collections::HashMap::new();
+        for f in Asset::iter() {
+            let name = f.to_string();
+            let content = Asset::get(&name).expect("iter 给出的名字必然存在");
+            let tag = etag_of(&content);
+            if let Some(other) = seen.insert(tag.clone(), name.clone()) {
+                // 两个不同路径同 ETag 只有一种正当情形：字节完全相同。
+                let a = Asset::get(&name).expect("存在").data.into_owned();
+                let b = Asset::get(&other).expect("存在").data.into_owned();
+                assert_eq!(
+                    a, b,
+                    "{name} 与 {other} 内容不同却共用 ETag {tag}——\
+                     浏览器会对其中一个永久返回陈旧内容"
+                );
+            }
+        }
+        assert!(seen.len() > 1, "嵌入资源太少，本用例没有区分力");
+    }
+
+    #[test]
+    fn if_none_match_matches_exactly_and_weakly() {
+        let etag = "\"abc123\"";
+
+        assert!(etag_matches(&hm(&[(header::IF_NONE_MATCH, etag)]), etag));
+        // 中间代理可能把强 ETag 弱化，那时仍应命中 304。
+        assert!(etag_matches(
+            &hm(&[(header::IF_NONE_MATCH, "W/\"abc123\"")]),
+            etag
+        ));
+        // 多候选：命中其中任意一个即可。
+        assert!(etag_matches(
+            &hm(&[(header::IF_NONE_MATCH, "\"zzz\", \"abc123\", \"yyy\"")]),
+            etag
+        ));
+
+        assert!(!etag_matches(
+            &hm(&[(header::IF_NONE_MATCH, "\"nope\"")]),
+            etag
+        ));
+        assert!(!etag_matches(&HeaderMap::new(), etag), "没带头 → 不匹配");
+        // `*` 是写请求的前置条件语义，对 GET 静态文件实现它会变成
+        // 「客户端发 * 就永远拿 304」，那是错的。
+        assert!(
+            !etag_matches(&hm(&[(header::IF_NONE_MATCH, "*")]), etag),
+            "`*` 不该被当成匹配"
+        );
+    }
+
+    /// 304 必须携带 ETag 与 Cache-Control（RFC 9110 §15.4.5）。
+    /// 少了它们，某些缓存会认为条目失效、下次仍整份重下，抵消掉 304 的收益。
+    #[test]
+    fn not_modified_carries_the_caching_headers() {
+        let res = not_modified("\"abc\"", "no-cache");
+        assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            res.headers()
+                .get(header::ETAG)
+                .and_then(|v| v.to_str().ok()),
+            Some("\"abc\"")
+        );
+        assert_eq!(
+            res.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-cache")
+        );
+    }
+
+    #[test]
+    fn serve_index_returns_304_when_etag_matches_and_200_otherwise() {
+        let index = Asset::get("index.html").expect("已嵌入");
+        let etag = etag_of(&index);
+
+        let fresh = serve_index_with(&HeaderMap::new());
+        assert_eq!(fresh.status(), StatusCode::OK);
+        assert_eq!(
+            fresh
+                .headers()
+                .get(header::ETAG)
+                .and_then(|v| v.to_str().ok()),
+            Some(etag.as_str()),
+            "200 必须带 ETag，否则客户端下次无从发起条件请求"
+        );
+
+        let revalidated = serve_index_with(&hm(&[(header::IF_NONE_MATCH, &etag)]));
+        assert_eq!(
+            revalidated.status(),
+            StatusCode::NOT_MODIFIED,
+            "带上刚拿到的 ETag 必须换来 304"
+        );
+
+        // 陈旧 ETag（发过新版）必须拿到完整的 200，不能误命中。
+        let stale = serve_index_with(&hm(&[(header::IF_NONE_MATCH, "\"0000000000000000\"")]));
+        assert_eq!(stale.status(), StatusCode::OK);
+    }
+
+    /// 缓存策略与资源命名方式必须配对：`immutable, max-age=1年` 只有在文件名
+    /// 带内容哈希时才是安全的。若哪天 vite 配置改成不带哈希的固定名，这条会红——
+    /// 否则表现是发新版后用户一年内都拿不到更新。
+    #[test]
+    fn year_long_immutable_is_only_used_for_content_hashed_assets() {
+        let re_hash = |name: &str| {
+            // vite 的形态是 `<base>-<hash>.<ext>`，hash 为 8 位 base64url 字符。
+            //
+            // ⚠️ 不能用 `rsplit_once('-')` 找哈希：base64url 的字符集**包含 `-`**，
+            // 真实产物里就有 `overview-page-C-63v8Th.css` 这种——哈希本身是
+            // `C-63v8Th`，从最后一个 `-` 切会切进哈希内部，得到 6 个字符然后误判
+            // 成「没有哈希」。第一版就是这么写的，被本用例抓住。
+            //
+            // 正确判据是**定宽后缀**：stem 的最后 8 个字符都是 base64url 合法字符，
+            // 且它们前面紧挨着一个 `-`。
+            let stem = match std::path::Path::new(name)
+                .file_stem()
+                .and_then(|s| s.to_str())
+            {
+                Some(s) => s,
+                None => return false,
+            };
+            let chars: Vec<char> = stem.chars().collect();
+            // 至少 `-` + 8 位哈希。
+            if chars.len() < 9 {
+                return false;
+            }
+            let sep = chars[chars.len() - 9];
+            let hash = &chars[chars.len() - 8..];
+            sep == '-'
+                && hash
+                    .iter()
+                    .all(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        };
+
+        // 对照组：确认这个判据既能认出真哈希、也能拒掉无哈希的名字。否则一个
+        // 恒返回 true 的判据会让下面的循环全绿而毫无意义。
+        assert!(
+            re_hash("assets/overview-page-C-63v8Th.css"),
+            "哈希含 `-` 的真实产物必须被认出"
+        );
+        assert!(re_hash("assets/index-C9ZH2VGf.js"));
+        assert!(!re_hash("vite.svg"), "无哈希的名字必须被拒");
+        assert!(!re_hash("assets/style.css"));
+
+        let mut checked = 0;
+        for f in Asset::iter() {
+            let name = f.to_string();
+            let cc = get_cache_control(&name);
+            if cc.contains("immutable") {
+                assert!(
+                    re_hash(&name),
+                    "{name} 被标成 immutable 缓存一年，但文件名里没有内容哈希。\
+                     改这个文件后用户最长一年拿不到新版本。"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "没有任何 immutable 资源，本用例没有区分力");
+    }
+
+    #[test]
+    fn html_is_never_cached_immutably() {
+        for f in Asset::iter() {
+            let name = f.to_string();
+            if name.ends_with(".html") {
+                let cc = get_cache_control(&name);
+                assert!(
+                    !cc.contains("immutable") && !cc.contains("max-age=31536000"),
+                    "{name} 是 HTML 却被长期缓存：发新版后浏览器会拿着旧壳打新 API"
+                );
+                assert!(cc.contains("no-cache"), "{name} 必须每次回源验证");
+            }
         }
     }
 }

@@ -705,6 +705,8 @@ pub struct ResolvedUsage {
     pub cache_read_tokens: i32,
     /// 本次新建缓存写入的 tokens（无缓存记账时为 0）
     pub cache_creation_tokens: i32,
+    /// 本次是否实际执行过严格缓存探针；用于运维命中率的正确分母。
+    pub cache_observed: bool,
 }
 
 pub struct StreamContext {
@@ -1073,6 +1075,7 @@ impl StreamContext {
                 .cache_usage
                 .map(|c| c.cache_creation_input_tokens)
                 .unwrap_or(0),
+            cache_observed: self.cache_usage.is_some(),
         }
     }
 
@@ -1084,6 +1087,14 @@ impl StreamContext {
     /// 用量记账应采用的最终结果分类（去掉硬编码 Success，改读真实完成状态）
     pub fn completion_outcome(&self) -> RequestOutcome {
         self.completion.outcome()
+    }
+
+    /// 是否收到上游的 contextUsageEvent。
+    ///
+    /// 严格缓存账本只在该事件存在时提交：仅有 HTTP 2xx 或空流不足以证明请求已被
+    /// Kiro 完整处理。宁可漏记一次可复用前缀，也不让半截响应建立假缓存。
+    pub fn has_context_usage(&self) -> bool {
+        self.context_input_tokens.is_some()
     }
 
     /// 是否已向客户端内联发过 SSE error 事件（收尾据此避免重复补发）
@@ -2520,6 +2531,11 @@ impl BufferedStreamContext {
     /// 用量记账应采用的最终结果分类（透传，去硬编码 Success）
     pub fn completion_outcome(&self) -> RequestOutcome {
         self.inner.completion_outcome()
+    }
+
+    /// 是否收到上游的 contextUsageEvent（透传内部 StreamContext）。
+    pub fn has_context_usage(&self) -> bool {
+        self.inner.has_context_usage()
     }
 
     /// 是否已内联发过 SSE error 事件（透传）

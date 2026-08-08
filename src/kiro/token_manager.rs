@@ -1210,6 +1210,8 @@ pub struct CredentialEntrySnapshot {
     pub has_profile_arn: bool,
     /// Token 过期时间
     pub expires_at: Option<String>,
+    /// 凭据加入本网关的时间（Unix 毫秒）。老凭据没有此字段，为 `None`。
+    pub added_at_ms: Option<i64>,
     /// refreshToken 的 SHA-256 哈希（仅 OAuth 凭据，用于前端去重）
     pub refresh_token_hash: Option<String>,
     /// kiroApiKey 的 SHA-256 哈希（仅 API Key 凭据，用于前端去重）
@@ -3883,6 +3885,7 @@ impl MultiTokenManager {
                     } else {
                         e.credentials.expires_at.clone()
                     },
+                    added_at_ms: e.credentials.added_at_ms,
                     refresh_token_hash: if e.credentials.is_api_key_credential() {
                         None
                     } else {
@@ -4981,6 +4984,19 @@ impl MultiTokenManager {
 
         // 5. 设置 ID 并保留用户输入的元数据
         validated_cred.id = Some(new_id);
+        // 添加时间在**这一处**统一补写，而不是在每个调用方（社交登录/IdC/推送 API/
+        // 手动添加）各写一遍：那样迟早漏掉一条路径，而漏掉的表现是该号的时间永远为空，
+        // 且只在用户盯着某一列时才会发现。
+        //
+        // 【为何 `or_else` 而非无条件覆盖】调用方若已带着原始添加时间进来（例如日后
+        // 从外部导入既有号、或迁移旧数据），那个值才是真相；无条件覆盖会把它改写成
+        //「导入到本进程的时刻」，让这一列的语义从"何时添加"漂移成"何时入库"。
+        //
+        // 回收站恢复不经过这里：`restore_credential` 直接把结构体移回池子，原值
+        // 天然保留，所以恢复出来的老号不会被标成「刚添加」。
+        validated_cred.added_at_ms = new_cred
+            .added_at_ms
+            .or_else(|| Some(chrono::Utc::now().timestamp_millis()));
         validated_cred.priority = new_cred.priority;
         validated_cred.auth_method = new_cred.auth_method.map(|m| {
             if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
@@ -6532,6 +6548,60 @@ mod tests {
         assert_eq!(manager.available_count(), 1);
     }
 
+    /// 新增凭据必须自动带上添加时间。
+    ///
+    /// 这一列是 portal 用户页直接显示的东西，为空就是空白格。补写点只有
+    /// `add_credential` 一处，所以这条测试同时守着「所有入口都经过那个收口」。
+    #[tokio::test]
+    async fn add_credential_stamps_added_at() {
+        let before = chrono::Utc::now().timestamp_millis();
+        let manager = MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap();
+
+        let mut cred = KiroCredentials::default();
+        cred.kiro_api_key = Some("ksk_stamp_me".to_string());
+        cred.auth_method = Some("api_key".to_string());
+        // 调用方没填时间——正是最常见的情形（社交登录/IdC/手动添加都不填）。
+        assert!(cred.added_at_ms.is_none());
+
+        manager.add_credential(cred).await.unwrap();
+        let after = chrono::Utc::now().timestamp_millis();
+
+        let snap = &manager.snapshot().entries[0];
+        let ts = snap
+            .added_at_ms
+            .expect("新增凭据必须有添加时间，否则用户页那一列是空的");
+        assert!(
+            ts >= before && ts <= after,
+            "添加时间应落在本次调用区间内：{ts} 不在 [{before}, {after}]"
+        );
+    }
+
+    /// 调用方已给出添加时间时不得覆盖。
+    ///
+    /// 【为何要有这条】用 `or_else` 而非无条件赋值，是为了让「带着原始时间重新入池」
+    /// 的路径（导入历史数据、迁移、日后可能改走 add_credential 的回收站恢复）
+    /// 保留真实的首次添加时间。若被覆盖成 now，这一列的语义会从「什么时候加进来的」
+    /// 悄悄变成「最后一次入池时间」——数字一直在，只是含义错了，没有任何报错。
+    #[tokio::test]
+    async fn add_credential_preserves_explicit_added_at() {
+        let manager = MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap();
+
+        let original = 1_600_000_000_000i64; // 2020-09-13，远早于「现在」
+        let mut cred = KiroCredentials::default();
+        cred.kiro_api_key = Some("ksk_keep_my_date".to_string());
+        cred.auth_method = Some("api_key".to_string());
+        cred.added_at_ms = Some(original);
+
+        manager.add_credential(cred).await.unwrap();
+
+        let snap = &manager.snapshot().entries[0];
+        assert_eq!(
+            snap.added_at_ms,
+            Some(original),
+            "已给出的添加时间不得被改写成 now"
+        );
+    }
+
     #[tokio::test]
     async fn test_add_credential_reject_duplicate_api_key() {
         let config = Config::default();
@@ -6620,23 +6690,19 @@ mod tests {
     async fn test_credential_id_never_reused_after_purge() {
         // 回归:删号→从回收站彻底清除(purge)→再加号,新号绝不复用被清除的 id。
         // 旧算法 max(entries∪trash)+1 会在 purge 后回落复用 id,使新号继承死号残留的
-        // cooldown/model_blocklist 内存态。单调 id 计数器根治之。custom_api 号免网络校验。
+        // cooldown/model_blocklist 内存态。单调 id 计数器根治之。这里用 API-key 凭据：
+        // add_credential 不会联网，也不依赖 DNS。过去用 example.invalid 的 custom_api 夹具，
+        // 某些 DNS 会把保留域劫持到 198.18.0.0/15，随后被正确的 SSRF 防护拒绝，造成环境相关失败。
         let config = Config::default();
-        let mk = |url: &str| {
+        let mk = |suffix: &str| {
             let mut c = KiroCredentials::default();
-            c.auth_method = Some("custom_api".to_string());
-            c.base_url = Some(url.to_string());
+            c.auth_method = Some("api_key".to_string());
+            c.kiro_api_key = Some(format!("ksk_id_monotonic_{suffix}"));
             c
         };
         let mgr = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
-        let id1 = mgr
-            .add_credential(mk("https://a.example.invalid"))
-            .await
-            .unwrap();
-        let id2 = mgr
-            .add_credential(mk("https://b.example.invalid"))
-            .await
-            .unwrap();
+        let id1 = mgr.add_credential(mk("a")).await.unwrap();
+        let id2 = mgr.add_credential(mk("b")).await.unwrap();
         assert!(id2 > id1, "id 应单调递增: #{id1} → #{id2}");
 
         // 删除最高 id 的号并从回收站彻底清除。
@@ -6646,10 +6712,7 @@ mod tests {
 
         // 此刻 entries∪trash 的 max 已回落到 id1;旧算法会把 id2 分配给新号(复用),
         // 计数器则继续给 id2 之后的值。
-        let id3 = mgr
-            .add_credential(mk("https://c.example.invalid"))
-            .await
-            .unwrap();
+        let id3 = mgr.add_credential(mk("c")).await.unwrap();
         assert!(
             id3 > id2,
             "purge 后新号 id 必须 > 已清除的 id,不得复用(新号 #{id3},已清除 #{id2})"
@@ -6663,8 +6726,9 @@ mod tests {
         use crate::kiro::cooldown::CooldownReason;
         let config = Config::default();
         let mut c = KiroCredentials::default();
-        c.auth_method = Some("custom_api".to_string());
-        c.base_url = Some("https://relay.example.invalid".to_string());
+        // 该用例只关心 per-id 冷却清理；API-key 凭据足够且不会触发 DNS/SSRF 校验。
+        c.auth_method = Some("api_key".to_string());
+        c.kiro_api_key = Some("ksk_delete_restore_cooldown".to_string());
         let mgr = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
         let id = mgr.add_credential(c).await.unwrap();
 

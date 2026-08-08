@@ -133,7 +133,7 @@ export async function getRecoveryMetrics(): Promise<RecoveryMetrics> {
 // 对方系统按契约往 POST /api/import/keys 推 ksk_ 凭据，这里是该通道的可观测快照。
 // 进程级内存、重启归零；key 已在后端打码，明文密钥绝不出现在响应里。
 export interface ImportItemRecord {
-  /** 完整明文 key（面板走 admin 鉴权，与「导出凭据」同级；给推送方的响应仍打码） */
+  /** 既有批量通道为完整 key；Relay 专属记录为打码 key。 */
   key: string
   /** key 指纹(SHA-256 前 8 位)。与凭据管理页显示的指纹同源,用于确认是同一个 key。 */
   fingerprint: string
@@ -151,6 +151,8 @@ export interface ImportItemRecord {
   sentEndpoint?: string
   /** 推送方**发来的** groups 原值（契约固定空数组，非空即异常，需要能被看见） */
   sentGroups: string[]
+  /** Relay 单条推送协议的 delivery_id；批量协议没有。 */
+  deliveryId?: string
 }
 
 export interface ImportRecord {
@@ -168,6 +170,15 @@ export interface ImportRecord {
 export interface ImportStats {
   /** 是否已配置 importApiKey 启用该通道 */
   enabled: boolean
+  /** Relay 单条推送频道是否已配置专用密钥。 */
+  relayEnabled: boolean
+  relayPushes: number
+  relayKeysTotal: number
+  relayKeysImported: number
+  relayKeysDuplicate: number
+  relayKeysFailed: number
+  relayLastAtMs?: number
+  relayRecords: ImportRecord[]
   pushes: number
   keysTotal: number
   keysImported: number
@@ -210,6 +221,7 @@ export interface TraceRecord {
   output_tokens: number
   cache_read_tokens: number
   cache_creation_tokens: number
+  cache_observed: boolean
   credits_used: number | null
   latency_ms: number
   first_token_ms: number | null
@@ -267,4 +279,3 @@ export async function testProxy(input: {
   const { data } = await api.post<ProxyTestResult>('/proxy/test', input)
   return data
 }
-
