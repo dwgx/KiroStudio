@@ -743,9 +743,45 @@ pub struct Config {
     #[serde(default)]
     pub overload_fallback_model: Option<String>,
 
+    // ============ 上游 trace 埋点（P0-A，排障用）============
+    /// 是否启用上游 trace 埋点（**默认 false**）。
+    ///
+    /// 开启后把「上游原始响应」与「网关内部判断」写进同一条 JSONL 记录，
+    /// 用于回答日志答不了的四个问题（上游给没给 Retry-After / 两个 region 的响应差异 /
+    /// 429 body 里有没有配额字段 / reasoningContentEvent 的原始形状）。
+    ///
+    /// **默认关是刻意的**：它每次失败响应写一行（含最多 2KiB body），是诊断期临时开关，
+    /// 不是常态度量。关闭时热路径只付一次 `Relaxed` 原子读的代价
+    /// （见 `kiro::upstream_trace::is_enabled`）。
+    ///
+    /// 脱敏由 `upstream_trace::sanitize_body` 保证：token / kiroApiKey / refreshToken /
+    /// Authorization **不进 trace**，请求体（含用户 prompt）整体不落盘。
+    #[serde(default)]
+    pub upstream_trace_enabled: bool,
+
+    /// 上游 trace JSONL 落盘路径（默认 `data/upstream_trace.jsonl`）。
+    #[serde(default = "default_upstream_trace_path")]
+    pub upstream_trace_path: String,
+
+    /// 上游 trace 单文件大小上限（字节，默认 64MiB）。
+    ///
+    /// 超上限**轮转**（`.jsonl` → `.1` → `.2` → `.3`，最旧的删）而**不是覆盖** ——
+    /// 覆盖写会让历史趋势永远拿不到（本仓 ops 侧刚踩过）。磁盘占用上界因此是
+    /// `upstreamTraceMaxBytes × 4`，是个可算的有限数（本仓有过日志打满磁盘的事故）。
+    #[serde(default = "default_upstream_trace_max_bytes")]
+    pub upstream_trace_max_bytes: u64,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
+}
+
+fn default_upstream_trace_path() -> String {
+    "data/upstream_trace.jsonl".to_string()
+}
+
+fn default_upstream_trace_max_bytes() -> u64 {
+    64 * 1024 * 1024
 }
 
 /// 输入压缩配置
@@ -1226,6 +1262,9 @@ impl Default for Config {
             balance_refresh_interval_secs: default_balance_refresh_interval_secs(),
             compression: CompressionConfig::default(),
             overload_fallback_model: None,
+            upstream_trace_enabled: false,
+            upstream_trace_path: default_upstream_trace_path(),
+            upstream_trace_max_bytes: default_upstream_trace_max_bytes(),
             config_path: None,
         }
     }

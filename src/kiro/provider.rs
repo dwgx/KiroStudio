@@ -27,29 +27,24 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 /// 小池下重试只会反复砸同几个号，被限流时多打几次纯属加重冷却，不如各摸一次即透传。
 const SMALL_POOL_THRESHOLD: usize = 3;
 
-/// 总重试次数绝对硬上限（避免无限重试）
+/// 总重试次数硬上限 —— 与 kiro.rs 对齐（4 次）。
 ///
-/// 注意：这只是一个安全上限，不再作为固定的重试预算。真正的预算由
-/// [`compute_max_retries`] 依据凭据总数 / 可用数动态计算，保证每个可用
-/// 凭据至少能被摸到一次（历史上写死 9 会让凭据 >3 时后面的号一次没试就报错）。
-///
-/// ⚠️ 由 64 降到 12：64 从未是「合理预算」而只是个防死循环的兜底，但配合
-/// `total * 3` 的算法（且 total 曾把 disabled / custom_api 都算进去）实际生效成了
-/// 生产日志里的 `尝试 8/36`——一条客户端请求连打十几个号、同一出口 IP，正是风控要抓的
-/// 突发特征。叠加 sub2api 侧的 2 次重试 × 10 次账号切换，单请求最坏放大到约 70~108 次
-/// 上游调用。12 仍足以让每个号被摸到（可选号 > 12 时下面会以 available 为准不受此限）。
+/// 依据：17 份分身共享 3 个上游账号，摸 12 个分身 = 对同一账号连打 12 次，
+/// 正是风控要抓的突发特征。高峰期多账号同时触顶时，过多重试会在账号间连环
+/// 撞墙、放大限流；被限时尽早返回而非耗尽配额。配合 429 专用长退避
+/// （见 `retry_delay_throttle`），尽快把错误交还给客户端。
 ///
 /// ⭐ 这个上限是「**每客户端请求**」，开启吸收层后也不变 —— 由 [`round_retry_quota`] 保证。
 ///
 /// 曾经不是：`compute_max_retries` 在 `'absorb: loop` **之外**只算一次，而
-/// `for attempt in 0..max_retries` 每个吸收轮都重跑一遍 ⇒ 每轮各拿一份完整 12 ⇒
-/// `upstreamRetryAbsorbMaxRounds=3` 时一条客户端请求最坏 (1+3)×12 = **48 次**上游调用、
-/// 同一出口 IP，正是上面那段把 64 砍到 12 想压住的突发特征被从另一头放回来。
+/// `for attempt in 0..max_retries` 每个吸收轮都重跑一遍 ⇒ 每轮各拿一份完整 4 ⇒
+/// `upstreamRetryAbsorbMaxRounds=3` 时一条客户端请求最坏 (1+3)×4 = **16 次**上游调用、
+/// 同一出口 IP，正是把上限压到 4 想压住的突发特征被从另一头放回来。
 ///
 /// 现在每轮的实际配额是 `min(基础配额, 本上限 − 跨轮已用)`，所以无论 `max_rounds`
 /// 填多大，单条客户端请求打向上游的总次数恒 ≤ 本值。守卫见
 /// `total_upstream_attempts_are_capped_per_request_not_per_round`。
-const ABSOLUTE_MAX_TOTAL_RETRIES: usize = 12;
+const ABSOLUTE_MAX_TOTAL_RETRIES: usize = 4;
 
 /// 上游压力率（429+5xx）滑动窗口的时长（秒）。
 ///
@@ -374,9 +369,9 @@ fn should_start_another_round(
 /// 本吸收轮还能打几次上游：**跨轮共享**同一个 `ABSOLUTE_MAX_TOTAL_RETRIES` 总额度。
 ///
 /// 未修问题 ②：`compute_max_retries` 在 `'absorb: loop` **之外**只算一次，而
-/// `for attempt in 0..max_retries` 每轮重跑 ⇒ 每轮各拿一份完整 12 ⇒ `max_rounds=3` 时
-/// 一条客户端请求最坏 (1+3)×12 = **48 次**上游调用、同一出口 IP —— 正是当初把
-/// `ABSOLUTE_MAX_TOTAL_RETRIES` 从 64 砍到 12 要压住的突发特征，被吸收层从另一头放回来。
+/// `for attempt in 0..max_retries` 每轮重跑 ⇒ 每轮各拿一份完整 4 ⇒ `max_rounds=3` 时
+/// 一条客户端请求最坏 (1+3)×4 = **16 次**上游调用、同一出口 IP —— 正是当初把
+/// `ABSOLUTE_MAX_TOTAL_RETRIES` 从 64 砍到 4 要压住的突发特征，被吸收层从另一头放回来。
 ///
 /// 修法不是调小 `max_rounds`（那只是把数字挪一挪，语义仍是「每轮各拿一份」），而是让
 /// 上限回到它文档承诺的「**每请求**」语义：本轮配额 = `min(基础配额, 总额度 − 已用)`。
@@ -458,7 +453,7 @@ fn region_retry_target(
 /// 自我抵消，线上 43 号时预算 = 43，一条请求顺着整池撞一遍直到耗尽 45s 墙钟，
 /// 净效果是「号池越大越慢」）。
 ///
-/// 该权衡依赖一个前提：**坏号会被自动禁用从而不进候选集**，故预算 12 足够摸到
+/// 该权衡依赖一个前提：**坏号会被自动禁用从而不进候选集**，故预算 4 足够摸到
 /// 足量健康号。号池规模显著超过 `ABSOLUTE_MAX_TOTAL_RETRIES` 时需重新评估这个前提。
 ///
 /// **小号池降重试**：号池很小（`total <= SMALL_POOL_THRESHOLD`）时，每号重试次数降为 1。
@@ -477,8 +472,9 @@ fn compute_max_retries(total: usize, _available: usize) -> usize {
         // ⚠️ 这里**刻意不再**用 `.max(available)` 抬高上限。
         //
         // 旧代码是 `.min(ABSOLUTE_MAX_TOTAL_RETRIES.max(available))`，那个内层
-        // `.max(available)` 会在 `available > 12` 时把硬上限自己抵消掉 → 预算等于
-        // 可用号数。线上 43 个号时实测预算 = 43，日志里就是「尝试 43/43」：一条
+        // `.max(available)` 会在 `available > ABSOLUTE_MAX_TOTAL_RETRIES` 时把硬上限
+        // 自己抵消掉 → 预算等于可用号数。线上 43 个号时实测预算 = 43，日志里就是
+        // 「尝试 43/43」：一条
         // 客户端请求要顺着整池撞一遍，撞到 45s 墙钟预算才失败。
         //
         // 净效果是**号池越大越慢**，与"扩号池提升吞吐"的目标正好相反。而"保证每个
@@ -555,10 +551,11 @@ impl RetryPressureWindow {
 
 /// 按近期上游压力率（429+5xx）动态降档重试预算。
 ///
-/// 疯狂重试（号多 + 429/5xx 多）时每个请求扫 12 个号纯属放大受害面 —— 重试再多也换不到
-/// 好号（大家都在被限流/过载），不如降档让客户端更快拿到错误自己退避。阶梯（整数除法）：
-/// - 压力率 > 50%：预算 × 33/100（12 → 3）
-/// - 压力率 > 30%：预算 × 1/2（12 → 6）
+/// 疯狂重试（号多 + 429/5xx 多）时每个请求顺着号池一路扫过去纯属放大受害面 ——
+/// 重试再多也换不到好号（大家都在被限流/过载），不如降档让客户端更快拿到错误自己退避。
+/// 阶梯（整数除法，以当前上限 4 为例）：
+/// - 压力率 > 50%：预算 × 33/100（4 → 1）
+/// - 压力率 > 30%：预算 × 1/2（4 → 2）
 /// - 否则：不变
 ///
 /// 只在 `base_retry_quota`（循环外一次计算）处乘系数，`round_retry_quota` 的
@@ -1231,6 +1228,28 @@ impl KiroProvider {
                     }
                 }
 
+                // 订阅不覆盖本应用/模型：**永久**条件 → 立即终止，不重试、不计凭据失败。
+                //
+                // 与对话路径同口径（见 `call_api_with_retry` 的同名分支）。本路径必须**同时**
+                // 有这一条：MCP/WebSearch 打的是同一个上游、用的是同一个凭据，订阅不覆盖时
+                // 拿到的是同一个 403。漏在这里的后果与那条历史缺陷同形 ——
+                // 上面那段注释记着「对话路径已修，本路径此前漏修」，而本仓 issue #2 的
+                // 结论就是「同一逻辑各写一份」正是漏改的成因。
+                if endpoint.is_subscription_unsupported(&body) {
+                    tracing::warn!(
+                        "MCP 请求失败（订阅不覆盖本应用/模型，永久条件；不重试、不计凭据失败）: {} {}",
+                        status,
+                        body
+                    );
+                    last_error = Some(anyhow::anyhow!(
+                        "MCP 请求失败（订阅不支持该应用/模型，重试无效）: {} {} \
+                         subscription_unsupported=1",
+                        status,
+                        body
+                    ));
+                    break;
+                }
+
                 // 账户级**临时**风控限速（suspicious activity / temporary limits）：
                 // 与对话路径同口径（见 `call_api_with_retry` 的 is_temporary_rate_limit 分支），
                 // 必须在落 `report_failure` 之前判定。
@@ -1405,8 +1424,9 @@ impl KiroProvider {
     ///
     /// 重试策略：
     /// - 每个凭据最多重试 MAX_RETRIES_PER_CREDENTIAL 次
-    /// - 总重试预算由 [`compute_max_retries`] 动态计算：以可用凭据数为下限，
-    ///   保证每个可用凭据至少被摸一次；以 ABSOLUTE_MAX_TOTAL_RETRIES 为安全上限
+    /// - 总重试预算由 [`compute_max_retries`] 动态计算：以可用凭据数为下限、以
+    ///   ABSOLUTE_MAX_TOTAL_RETRIES 为硬上限（号池 > 4 时不再保证每个号都被摸到 ——
+    ///   摸穿全池正是风控要抓的突发特征）
     async fn call_api_with_retry(
         &self,
         request_body: &str,
@@ -1423,8 +1443,8 @@ impl KiroProvider {
             {
                 let selectable = self.token_manager.kiro_selectable_count();
                 // 动态降档：近期上游压力率（429+5xx）高（疯狂重试）时按比例收缩预算，
-                // 避免号多 + 压力多时每个请求扫 12 个号、把内部上游 RPM 放大到外部 RPM 的十几倍。
-                // 只在进循环前算一次，跨轮不叠加。
+                // 避免号多 + 压力多时每个请求顺着号池一路扫过去、把内部上游 RPM 放大到
+                // 外部 RPM 的十几倍。只在进循环前算一次，跨轮不叠加。
                 let raw = compute_max_retries(selectable, selectable);
                 let pressure = self.retry_pressure.lock().rate();
                 let scaled = apply_retry_pressure(raw, pressure);
@@ -1526,8 +1546,8 @@ impl KiroProvider {
         // 默认开，wait>2s 即裸 `continue`，不 sleep 也不打上游）；② endpoint 解析失败。
         //
         // 复用它的后果（本轮修复的缺陷）：`compute_max_retries` 在 pool≥4 时恒为
-        // `ABSOLUTE_MAX_TOTAL_RETRIES`=12，于是全池冷却下第 0 轮在**毫秒级**把 12 个额度
-        // 全烧在 fast-fail 上 → 轮末 `attempts_base=12` → 额度闸门命中 → `break 'absorb`
+        // `ABSOLUTE_MAX_TOTAL_RETRIES`=4，于是全池冷却下第 0 轮在**毫秒级**把 4 个额度
+        // 全烧在 fast-fail 上 → 轮末 `attempts_base=4` → 额度闸门命中 → `break 'absorb`
         // ⇒ **`absorb_round` 恒 0，吸收层等于没开**。而 PoolCooldown 正是吸收层要拦的主类别，
         // 排在额度闸门之后的截断闸门因此**永远不被求值**（顺序在这里是承重的）。
         //
@@ -1637,8 +1657,9 @@ impl KiroProvider {
             //
             // ⚠️ 喂的是 `upstream_calls` 而**不是** `attempts_base`：后者含 fast-fail 空转,
             // 会让全池冷却在毫秒内烧空额度、把吸收层整体旁路掉(见其声明处的长注释)。
-            // 「每请求 ≤ 12 次上游调用」这个不变量仍然成立:进轮时 quota ≤ 12 − upstream_calls,
-            // 而本轮内最多再打 quota 次 ⇒ 轮末 upstream_calls ≤ 12。
+            // 「每请求 ≤ ABSOLUTE_MAX_TOTAL_RETRIES 次上游调用」这个不变量仍然成立:进轮时
+            // quota ≤ ABSOLUTE_MAX_TOTAL_RETRIES − upstream_calls, 而本轮内最多再打 quota
+            // 次 ⇒ 轮末 upstream_calls ≤ ABSOLUTE_MAX_TOTAL_RETRIES。
             let max_retries = round_retry_quota(base_retry_quota, upstream_calls);
 
             for attempt in 0..max_retries {
@@ -1771,7 +1792,7 @@ impl KiroProvider {
                 // 把错误透传给客户端让它自己退避。
                 //
                 // ⚠️ 不递增 `upstream_calls`：闸门挡住的是"根本没发出去"的调用，不该占用
-                // 「每请求 ≤12 次上游调用」的额度 —— 该不变量（含吸收层、墙钟闸门、
+                // 「每请求 ≤ ABSOLUTE_MAX_TOTAL_RETRIES 次上游调用」的额度 —— 该不变量（含吸收层、墙钟闸门、
                 // round_retry_quota）全部不受影响。
                 let _gate = match self.upstream_gate.clone().try_acquire_owned() {
                     Ok(permit) => permit,
@@ -1908,6 +1929,36 @@ impl KiroProvider {
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.trim().parse::<u64>().ok());
                 let body = response.text().await.unwrap_or_default();
+
+                // 订阅不覆盖本应用/模型：**永久**条件，换区与重试都无效 → 立即终止。
+                //
+                // 必须排在下方所有 403 分支之前：那些分支分别会换区（L1）、设短冷却后
+                // failover、或计入凭据失败，而本条三者都不该做 ——
+                // 实测同一把 key 在 `q.us-east-1` 回「bearer token invalid」（该区未授权，
+                // 归 L1 换区）、在 `q.eu-central-1` 回本条文案（区是对的、token 是对的，
+                // 订阅不覆盖）。换区拿到的还是同一个错，重试同理，只是白烧上游往返。
+                //
+                // 不计凭据失败（不走 report_failure）：号本身没坏，是订阅档位不含该应用/模型，
+                // 记成凭据失败会在 3 次后把它自动禁用，把「换个模型就能用」误报成「号废了」。
+                // 上游原话**原样带进错误消息**：本条加入前该文案全仓零命中，运维只能看到
+                // 网关自己的推测（「订阅档位或成本白名单」二选一），归因要靠猜。
+                if endpoint.is_subscription_unsupported(&body) {
+                    tracing::warn!(
+                        "API 请求失败（订阅不覆盖本应用/模型，永久条件；不换区、不重试、\
+                         不计凭据失败）: {} {}",
+                        status,
+                        body
+                    );
+                    last_outcome = crate::usage::RequestOutcome::BadRequest;
+                    last_error = Some(anyhow::anyhow!(
+                        "{} API 请求失败（订阅不支持该应用/模型，换区与重试均无效）: {} {} \
+                         subscription_unsupported=1",
+                        api_type,
+                        status,
+                        body
+                    ));
+                    break;
+                }
 
                 // 客户端请求校验错误（如 TOOL_USE_RESULT_MISMATCH / TOOL_SCHEMA_INVALID）：请求构造问题，
                 // 换号/重试都只会重复失败并浪费配额，立即终止（不计凭据失败）。
@@ -2546,7 +2597,13 @@ impl KiroProvider {
                         body
                     ));
                     if attempt + 1 < max_retries {
-                        sleep(Self::retry_delay(attempt)).await;
+                        // 429 用专用长退避（1s→2s→4s→8s）：被限流时短重试只会连打同一上游；
+                        // 5xx/408 仍走通用 200ms 指数（基础设施瞬态，快速重试合理）。
+                        if status.as_u16() == 429 {
+                            sleep(Self::retry_delay_throttle(attempt)).await;
+                        } else {
+                            sleep(Self::retry_delay(attempt)).await;
+                        }
                     }
                     continue;
                 }
@@ -2920,6 +2977,22 @@ impl KiroProvider {
         Duration::from_millis(backoff.saturating_add(jitter))
     }
 
+    /// 429 专用长退避：`1s → 2s → 4s → 8s`（上限 8s）。
+    ///
+    /// 与通用 `retry_delay`（200ms base，基础设施瞬态）区分：429 是**被上游限流**，
+    /// 短退避会在同一账号上连打 —— 重试上限降到 4 之后，每次 429 都是宝贵的出账机会，
+    /// 用长退避把一次客户端请求的 4 次上游调用摊到最坏 ~15s，尽早把错误交还给客户端
+    /// （客户端有自己的退避），而不是在同一窗口内把同一账号砸 4 次。
+    fn retry_delay_throttle(attempt: usize) -> Duration {
+        const BASE_MS: u64 = 1_000;
+        const MAX_MS: u64 = 8_000;
+        let exp = BASE_MS.saturating_mul(2u64.saturating_pow(attempt.min(6) as u32));
+        let backoff = exp.min(MAX_MS);
+        let jitter_max = (backoff / 4).max(1);
+        let jitter = fastrand::u64(0..=jitter_max);
+        Duration::from_millis(backoff.saturating_add(jitter))
+    }
+
     /// 慢速退避：专用于 MODEL_TEMPORARILY_UNAVAILABLE（容量过载）。
     ///
     /// 1s base，2x 指数，30s 上限 + 25% jitter。
@@ -3050,8 +3123,8 @@ mod tests {
     /// ⚠️ 本测试此前名为 `..._covers_every_available_credential`，断言 `r >= total`
     /// 并声称"保证每个可用凭据至少被尝试一次"。那个承诺在移除内层 `.max(available)`
     /// 之后已不成立 —— 它当时**只是碰巧通过**：`total=10` 时预算 `min(30,12)=12`，
-    /// 而 `12 >= 10` 恰好为真。把 `total` 改成 20 就会失败（预算仍 12 < 20），
-    /// 即那是个会在号池扩容时才爆的定时炸弹，且它在维护一条代码已不提供的不变式。
+    /// 而 `12 >= 10` 恰好为真；换成现在的 4 上限后 `min(30,4)=4`，连 `total=10`
+    /// 都过不了。即那是个会在号池扩容时才爆的定时炸弹，且它在维护一条代码已不提供的不变式。
     ///
     /// 现在改为锁住真实行为：封顶生效。若有人把 `.max(available)` 加回来（那正是
     /// 「号池越大越慢」的成因：线上 43 号时预算 = 43，单请求扫全池耗尽 45s 墙钟），
@@ -3126,8 +3199,9 @@ mod tests {
         // 只有 1 个凭据仍至少能试 1 次
         assert_eq!(compute_max_retries(1, 1), 1);
 
-        // 刚过小池阈值（total=4）恢复常规 total*MAX_RETRIES_PER_CREDENTIAL。
-        assert_eq!(compute_max_retries(4, 4), 4 * MAX_RETRIES_PER_CREDENTIAL);
+        // 刚过小池阈值（total=4）恢复常规 total*MAX_RETRIES_PER_CREDENTIAL，
+        // 但随即被 ABSOLUTE_MAX_TOTAL_RETRIES 封顶（min(4×3, 4) = 4）。
+        assert_eq!(compute_max_retries(4, 4), ABSOLUTE_MAX_TOTAL_RETRIES);
 
         // 小池但部分禁用：available 做下限，仍保证可用号被摸到。
         assert!(compute_max_retries(3, 2) >= 2);
@@ -3144,10 +3218,12 @@ mod tests {
         );
     }
 
-    /// 回归（大号池不得放大重试 · 本轮核心）：预算恒 ≤ 12，与池子大小无关。
+    /// 回归（大号池不得放大重试 · 本轮核心）：预算恒 ≤ ABSOLUTE_MAX_TOTAL_RETRIES，
+    /// 与池子大小无关。
     ///
     /// **旧代码为何失败**：`.min(ABSOLUTE_MAX_TOTAL_RETRIES.max(available))` 里的内层
-    /// `.max(available)` 在 `available > 12` 时把硬上限自己抵消掉 → 预算 = available。
+    /// `.max(available)` 在 `available > ABSOLUTE_MAX_TOTAL_RETRIES` 时把硬上限自己抵消掉
+    /// → 预算 = available。
     /// 线上 43 个号实测预算 = 43，日志即「尝试 43/43」：一条请求顺着整池撞一遍、
     /// 耗尽 45s 墙钟才失败 → 用户体感 45 秒卡死，且**号池越大越慢**。
     /// 旧代码下 `compute_max_retries(43, 43)` 返回 43，本断言会失败。
@@ -3165,7 +3241,7 @@ mod tests {
         assert_eq!(
             compute_max_retries(43, 43),
             ABSOLUTE_MAX_TOTAL_RETRIES,
-            "43 号池（线上实测规模）预算必须是 12 而非 43"
+            "43 号池（线上实测规模）预算必须是 {ABSOLUTE_MAX_TOTAL_RETRIES} 而非 43"
         );
     }
 
@@ -3392,6 +3468,95 @@ mod tests {
             "客户端请求校验错误分支内不得 continue：continue 即重试/换号，\
              与『客户端错不重试』的语义冲突"
         );
+    }
+
+    /// ⭐ 源码级守卫：订阅永久错误的分支必须**排在所有 403 处置之前**，且不得计凭据失败。
+    ///
+    /// 为什么用源码守卫而不是行为测试：触发它需要真实上游返回该 403，而本仓铁律禁止
+    /// 测试依赖网络；热路径那段又在 `call_api_with_retry` / `call_mcp_with_retry` 深处，
+    /// 构造不出确定性用例。
+    ///
+    /// 🔴 **先剔注释行再匹配**。`include_str!` 读的是原始源文本（含注释），直接
+    /// `contains` 会匹配到**被注释掉**的实现 ⇒ 把代码注释掉守卫仍然绿。本仓记录
+    /// 该形态已踩过五次（见 `admission_timeout_must_be_observable` 的注释）。
+    #[test]
+    fn subscription_unsupported_branch_must_precede_other_403_handling() {
+        let src = include_str!("provider.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("生产段应存在");
+        let prod: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // needle 运行时拼接，避免把本测试自己的字面量算进匹配。
+        let sub = format!("endpoint.{}(&body)", "is_subscription_unsupported");
+        let validation = format!("endpoint.{}(&body)", "is_client_validation_error");
+        let temp_rl = format!("endpoint.{}(&body)", "is_temporary_rate_limit");
+
+        // ⚠️ **必须按函数切片再比较位置**。`is_temporary_rate_limit` 有**两个**调用点
+        // （`call_mcp_with_retry` 与 `call_api_with_retry`），全局 `find` 拿到的是靠前的
+        // 那个（MCP），于是拿它和对话路径的订阅分支比位置 —— 跨函数比较，结论无意义。
+        // ⇒ 本守卫遍历**两个**函数，缺任何一个都 FAIL（本仓 issue #2 的「同一逻辑各写
+        // 一份 ⇒ 漏改」形态：订阅分支只加在对话路径、MCP 路径漏加正是历史缺陷的原型）。
+        for (fname, marker) in [
+            ("call_api_with_retry", "async fn call_api_with_retry"),
+            ("call_mcp_with_retry", "async fn call_mcp_with_retry"),
+        ] {
+            let start = prod
+                .find(marker)
+                .unwrap_or_else(|| panic!("{fname} 不应被改名"));
+            // 函数体上界：下一个同缩进层方法的起始（三种签名形态取最靠前者）。
+            let after_sig = start + marker.len();
+            let rest = &prod[after_sig..];
+            let end = ["\n    async fn ", "\n    pub fn ", "\n    fn "]
+                .iter()
+                .filter_map(|m| rest.find(m))
+                .min()
+                .map(|i| after_sig + i)
+                .unwrap_or(prod.len());
+            let seg_fn = &prod[start..end];
+
+            let sub_at = seg_fn.find(&sub).unwrap_or_else(|| {
+                panic!(
+                    "{fname} 缺少订阅判据分支 —— 漏了它，该路径上的永久失败会被当成可重试"
+                )
+            });
+
+            // 同函数内若存在其它 403 分支，订阅必须排在它们之前。
+            for (other_name, other) in [
+                ("is_client_validation_error", &validation),
+                ("is_temporary_rate_limit", &temp_rl),
+            ] {
+                if let Some(other_at) = seg_fn.find(other.as_str()) {
+                    assert!(
+                        sub_at < other_at,
+                        "{fname}：订阅永久错误必须排在 {other_name} 之前 —— 排在后面时，\
+                         换区（L1）/短冷却 failover 会先命中，而两者对订阅问题都无效\
+                         （实测同一把 key 在两个区拿到的是**不同**的 403：us 回 bearer \
+                         invalid、eu 回 subscription unsupported），只是白烧上游往返与重试预算"
+                    );
+                }
+            }
+
+            // 承重：该分支**不得**调 report_failure —— 号没坏，是订阅不含该应用/模型。
+            // 片段取到该分支的闭合花括号为止。
+            let branch = &seg_fn[sub_at..];
+            let branch_end = branch
+                .find("\n                }")
+                .map(|i| i + 1)
+                .unwrap_or(branch.len());
+            let branch = &branch[..branch_end];
+            assert!(
+                !branch.contains("report_failure"),
+                "{fname}：订阅永久错误不得计入凭据失败 —— 那会在 3 次后自动禁用一个\
+                 「换个模型就能用」的号，且 persist_disabled_state 落盘后重启也回不来"
+            );
+            assert!(
+                branch.contains("subscription_unsupported=1"),
+                "{fname}：错误串必须带机器可读标记，否则面板/外挂无法与其它 403 区分"
+            );
+        }
     }
 
     // ⚠️ `#[test]` 曾在 2026-08-06 之前的某次改动中丢失，导致本守卫**从未运行过**
@@ -4193,18 +4358,19 @@ mod tests {
     /// ⭐ 未修问题 ②（跨轮次数预算）：`ABSOLUTE_MAX_TOTAL_RETRIES` 必须是「**每请求**」
     /// 而非「每轮」的上限。
     ///
-    /// 缺陷是两处组合出来的：单看 `=12` 没问题，单看「每轮重跑 for 循环」也没问题，
-    /// 但配额在循环外只算一次、循环每轮重跑 ⇒ 每轮各拿一份完整 12 ⇒ `max_rounds=3`
-    /// 时一条客户端请求最坏 (1+3)×12 = **48 次**上游调用、同一出口 IP，正是当初把
-    /// 64 砍到 12 要压住的突发特征。
+    /// 缺陷是两处组合出来的：单看 `=4` 没问题，单看「每轮重跑 for 循环」也没问题，
+    /// 但配额在循环外只算一次、循环每轮重跑 ⇒ 每轮各拿一份完整 4 ⇒ `max_rounds=3`
+    /// 时一条客户端请求最坏 (1+3)×4 = **16 次**上游调用、同一出口 IP，正是当初把
+    /// 64 砍到 4 要压住的突发特征。
     ///
     /// 本测试模拟整条客户端请求：把每轮配额按 `round_retry_quota` 算出来累加，
-    /// 断言总和恒 ≤ 12。回退即 FAIL：让 `round_retry_quota` 忽略 `attempts_before`
-    /// （直接 `base_quota`）→ 总和变 48 → 第二条断言失败。
+    /// 断言总和恒 ≤ `ABSOLUTE_MAX_TOTAL_RETRIES`。回退即 FAIL：让 `round_retry_quota`
+    /// 忽略 `attempts_before`（直接 `base_quota`）→ 总和变 16 → 第二条断言失败。
     #[test]
     fn total_upstream_attempts_are_capped_per_request_not_per_round() {
-        // 大号池 ⇒ 基础配额吃满 12（compute_max_retries(12,12) == 12）。
-        let base = compute_max_retries(12, 12);
+        // 池 ≥ 上限时基础配额必吃满硬上限（compute_max_retries(n,n) 对 n ≥ 上限恒 == 上限）。
+        let base =
+            compute_max_retries(ABSOLUTE_MAX_TOTAL_RETRIES, ABSOLUTE_MAX_TOTAL_RETRIES);
         assert_eq!(base, ABSOLUTE_MAX_TOTAL_RETRIES, "前提：基础配额吃满硬上限");
 
         // 模拟 1 + max_rounds 轮，每轮把配额跑满（最坏情况）。
@@ -4235,13 +4401,14 @@ mod tests {
 
     /// `round_retry_quota` 的边界：额度用尽必须返 0（调用点据此 break，不空跑一轮）。
     ///
-    /// 回退即 FAIL：把 `saturating_sub` 换成 `-` 会在 attempts > 12 时 panic；
+    /// 回退即 FAIL：把 `saturating_sub` 换成 `-` 会在 attempts > ABSOLUTE_MAX_TOTAL_RETRIES
+    /// 时 panic；
     /// 把 `.min(remaining)` 删掉则第三、四条断言失败。
     #[test]
     fn round_retry_quota_shrinks_and_hits_zero() {
         let base = ABSOLUTE_MAX_TOTAL_RETRIES;
         assert_eq!(round_retry_quota(base, 0), base, "第 0 轮拿满基础配额");
-        assert_eq!(round_retry_quota(base, 4), base - 4, "第 1 轮只剩 12-4");
+        assert_eq!(round_retry_quota(base, 4), base - 4, "第 1 轮只剩 4-4");
         assert_eq!(
             round_retry_quota(base, ABSOLUTE_MAX_TOTAL_RETRIES as u32),
             0,
@@ -4299,7 +4466,7 @@ mod tests {
         assert!(
             decl_at > loop_at,
             "本轮配额必须在 'absorb: loop **内**重算：算在循环外等于每轮各拿一份完整配额，\
-             上限退化成「每轮」语义（max_rounds=3 时单请求最坏 48 次上游调用）"
+             上限退化成「每轮」语义（max_rounds=3 时单请求最坏 16 次上游调用）"
         );
         assert!(
             src.contains(quota_call.as_str()),
@@ -4535,8 +4702,8 @@ mod tests {
             "let mut region_override_this_call",
             "let mut model_unavailable_attempts",
             "let mut attempts_used",
-            // 挪进轮内会让每轮各拿一份完整 12 次上游调用额度 —— 那正是 round_retry_quota
-            // 存在的理由（max_rounds=3 时单请求最坏 48 次上游调用、同一出口 IP）。
+            // 挪进轮内会让每轮各拿一份完整 4 次上游调用额度 —— 那正是 round_retry_quota
+            // 存在的理由（max_rounds=3 时单请求最坏 16 次上游调用、同一出口 IP）。
             "let mut upstream_calls",
         ] {
             let at = retry_fn
@@ -4678,10 +4845,10 @@ mod tests {
 
     /// ⭐ P1-b（行为）：全池冷却 fast-fail 一整轮**不得**消耗跨轮重试额度。
     ///
-    /// 缺陷推导（已独立复核）：`compute_max_retries(pool,pool)` 在 pool≥4 时恒为 12；
+    /// 缺陷推导（已独立复核）：`compute_max_retries(pool,pool)` 在 pool≥4 时恒为 4；
     /// 全池冷却时 `all_cooling_fast_fail` 默认开、wait>2s ⇒ `acquire_context_excluding` 裸 bail
-    /// ⇒ 热路径 `continue`（不 sleep、不打上游）⇒ 第 0 轮在毫秒级跑完 12 次迭代。
-    /// 旧代码用迭代计数 `attempts_base`（= 11+1 = 12）喂额度闸门 ⇒ 闸门命中 ⇒ `break 'absorb`
+    /// ⇒ 热路径 `continue`（不 sleep、不打上游）⇒ 第 0 轮在毫秒级跑完 4 次迭代。
+    /// 旧代码用迭代计数 `attempts_base`（= 3+1 = 4）喂额度闸门 ⇒ 闸门命中 ⇒ `break 'absorb`
     /// ⇒ `absorb_round` 恒 0，吸收层对 pool≥4 等于没开。
     ///
     /// 本测试用两种口径各跑一遍同一个「一轮全 fast-fail」剧本，断言只有「计上游调用」这一种
@@ -4705,7 +4872,7 @@ mod tests {
         assert_eq!(
             round_retry_quota(base, attempts_base_after_round0),
             0,
-            "旧口径下一整轮 fast-fail 就把 12 个额度全烧光 ⇒ 额度闸门命中 ⇒ 吸收层被旁路"
+            "旧口径下一整轮 fast-fail 就把 4 个额度全烧光 ⇒ 额度闸门命中 ⇒ 吸收层被旁路"
         );
 
         // 新口径（真实上游调用数）：一轮全 fast-fail ⇒ 一次都没打上游 ⇒ 额度分毫未动。

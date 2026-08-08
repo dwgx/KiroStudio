@@ -1217,6 +1217,12 @@ pub struct StreamContext {
     pub output_tokens: i32,
     /// 从 meteringEvent 解析的真实 credit 消耗量（上游给出，token 估算无法替代）
     pub credits_used: Option<f64>,
+    /// meteringEvent 携带的 cache_read 真值（Layer 1，缺失为 None）。
+    /// 仅用于**入库**（`resolved_usage`）覆盖本地 prefix 估算；client 下发的 message_start
+    /// 在流开始前就已用估算值发出，无法回溯改写。
+    pub metering_cache_read: Option<i32>,
+    /// meteringEvent 携带的 cache_creation 真值（Layer 1，缺失为 None）。
+    pub metering_cache_creation: Option<i32>,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
     /// 出站工具名映射 (tool_use_id -> 还原后的 Claude Code 名)。
@@ -1407,6 +1413,8 @@ impl StreamContext {
             context_input_tokens: None,
             output_tokens: 0,
             credits_used: None,
+            metering_cache_read: None,
+            metering_cache_creation: None,
             tool_block_indices: HashMap::new(),
             tool_use_names: HashMap::new(),
             tool_input_sent: HashMap::new(),
@@ -1652,6 +1660,14 @@ impl StreamContext {
             Event::Metering(metering) => {
                 // 记录上游返回的真实 credit 消耗量（累加，兼容单请求多次计费事件）
                 self.credits_used = Some(self.credits_used.unwrap_or(0.0) + metering.usage);
+                // Layer 1 cache 真值：上游 metering 事件可选携带（缺失保持 None）。
+                // 入库侧 `resolved_usage` 用它覆盖本地 prefix 估算（见 metering_cache_read 注释）。
+                if let Some(r) = metering.cache_read_input_tokens {
+                    self.metering_cache_read = Some(r);
+                }
+                if let Some(c) = metering.cache_creation_input_tokens {
+                    self.metering_cache_creation = Some(c);
+                }
                 tracing::debug!("收到 meteringEvent: {} {}", metering.usage, metering.unit);
                 Vec::new()
             }
@@ -1696,14 +1712,15 @@ impl StreamContext {
             input_tokens: self.context_input_tokens.unwrap_or(self.input_tokens),
             output_tokens: self.output_tokens,
             credits_used: self.credits_used,
+            // Layer 1：上游 metering 真值优先（未缩放，落库真值），缺失才回落到本地估算。
             cache_read_tokens: self
-                .cache_usage
-                .map(|c| c.cache_read_input_tokens)
-                .unwrap_or(0),
-            cache_creation_tokens: self
-                .cache_usage
-                .map(|c| c.cache_creation_input_tokens)
-                .unwrap_or(0),
+                .metering_cache_read
+                .unwrap_or_else(|| self.cache_usage.map(|c| c.cache_read_input_tokens).unwrap_or(0)),
+            cache_creation_tokens: self.metering_cache_creation.unwrap_or_else(|| {
+                self.cache_usage
+                    .map(|c| c.cache_creation_input_tokens)
+                    .unwrap_or(0)
+            }),
         }
     }
 

@@ -517,11 +517,13 @@ where
         return ProbeOutcome::Skipped;
     }
 
-    // 整轮汇总要的两个事实。**不能只看最后一个候选的 verdict**：
+    // 整轮汇总要的三个事实。**不能只看最后一个候选的 verdict**：
     // ① 实际打出去过几次 —— 0 次意味着这一轮没产生任何关于 region 的信息（见循环后）。
     // ② 是否见过账户级风控 —— 它与 region 无关，不该被汇总成「region 不可用」。
+    // ③ 是否见过「没拿到答案」的候选 —— 与「上游明确否定」性质相反，见循环后 P3-c。
     let mut probed = 0usize;
     let mut saw_account_throttled = false;
+    let mut saw_inconclusive = false;
 
     for region in order.iter().take(MAX_PROBE_ATTEMPTS) {
         // 「这个号打哪个 URL」由端点抽象算，探的与将来跑的是同一个 host。
@@ -559,7 +561,17 @@ where
                 saw_account_throttled = true;
                 continue;
             }
-            ProbeVerdict::WrongRegion | ProbeVerdict::Inconclusive => continue,
+            // 上游**明确否定**这个区（403 / bearer token invalid）⇒ 确定的负结论，
+            // 可以据此断言「该区不可用」。这条不置 saw_inconclusive。
+            ProbeVerdict::WrongRegion => continue,
+            // **没拿到答案**（兜底分支：5xx / 网络 / DNS / 400）⇒ 关于该区的可用性
+            // 一无所知。必须与 WrongRegion 分开记：两者在整轮汇总时导致相反的判决
+            // （见循环后 P3-c）。合并成一条 `WrongRegion | Inconclusive => continue`
+            // 正是本轮修复的缺陷 —— 那让「探不了」被汇总成「确定不行」。
+            ProbeVerdict::Inconclusive => {
+                saw_inconclusive = true;
+                continue;
+            }
         }
     }
 
@@ -588,10 +600,48 @@ where
         return ProbeOutcome::AccountThrottled;
     }
 
+    // P3-c：见过「没拿到答案」的候选 ⇒ **不能断言该号无可用区**。
+    //
+    // 必须排在下面的 `NoUsableRegion` 之前 —— 那条现在的前提是「每个打出去的候选都给出了
+    // 确定的否定」，而只要有一个候选是 Inconclusive，这个前提就不成立。
+    //
+    // ## 为什么这条不可省（US 号的真实死法）
+    //
+    // `PROBE_ORDER` 首项是 `eu-central-1` ⇒ US key 的探测序列是
+    // 「第 1 次 eu → 403（确定否定）、第 2 次 us → 200」，**第二次是它唯一的机会**。
+    // 那一次撞上 5xx / 网络抖动 ⇒ Inconclusive ⇒ 循环结束 ⇒ 修复前汇总成 NoUsableRegion。
+    // 而调用方 `service.rs::add_credential` 的
+    // `matches!(probe_outcome, NoUsableRegion | TokenDead)` 命中即
+    // `mark_region_probe_failed` 置 `disabled=true` + `DisabledReason::RegionProbeFailed`，
+    // 且该原因**不在** `is_self_healable_reason` 白名单 ⇒ **一次网络抖动 = 好号永久死，
+    // 必须人工捞**。EU key 第 1 次就 200 直接返回，走不到这条路 ⇒ 受害的只有 US 号。
+    //
+    // ## 为什么判 Skipped 而不是新增一个 outcome
+    //
+    // `Skipped` 的既有语义正是「这一轮没能得出关于 region 的信息」（`probed == 0`
+    // 那条同判它），且调用方对它照常启用 ⇒ 号回退 `config.region` 继续服务，与不带探测
+    // 机制的同类网关同行为。最坏情况是回退的区不对 → `report_failure` →
+    // `TooManyFailures`，**而那个原因在自愈白名单里** ⇒ 最坏态是可自愈的临时禁用，
+    // 严格优于当前的永久禁用。
+    if saw_inconclusive {
+        tracing::warn!(
+            probed,
+            "region 自动探测出现「没拿到答案」的候选（5xx/网络/DNS）—— 本轮不能断言该号\
+             无可用区，判 Skipped 并回退 config.region，绝不禁用：那个没答案的候选恰恰\
+             可能是该号唯一的可用区（US 号即此形态），据此禁用会因一次抖动永久杀掉好号\
+             （RegionProbeFailed 不可自愈）"
+        );
+        return ProbeOutcome::Skipped;
+    }
+
+    // 走到这里的前提是**每个打出去的候选都给出了确定的否定**（全部 WrongRegion）——
+    // 不再是修复前那个宽得多的「没有 Usable」。这个区别是承重的：后者把「探不了」
+    // 也算进来，于是一次网络抖动就足以让一个好号被永久禁用（见上面 P3-c）。
     tracing::warn!(
         tried = MAX_PROBE_ATTEMPTS,
         probed,
-        "region 自动探测未得出可用结论 —— 该号不应被启用（启用即恒 403 被打死）"
+        "region 自动探测：全部候选均**确定**不可用（每个都是上游明确否定，无一是抖动）\
+         —— 该号不应被启用（启用即恒 403 被打死）"
     );
     ProbeOutcome::NoUsableRegion
 }
@@ -1455,6 +1505,155 @@ mod tests {
             ProbeOutcome::Usable("us-east-1".to_string()),
             "第二个候选可用时必须采纳它 —— 先前的 suspend 只说明「那次没探出信息」"
         );
+    }
+
+    /// 探测路径上「没拿到答案」的真实错误串（5xx / 网络 / DNS）。
+    ///
+    /// 全部必须落 [`ProbeVerdict::Inconclusive`]（兜底分支）—— 与
+    /// [`ProbeVerdict::WrongRegion`]（上游明确否定）语义相反。
+    const REAL_INCONCLUSIVE_BODIES: &[&str] = &[
+        "获取使用额度失败: 500 Internal Server Error",
+        "获取使用额度失败: 502 Bad Gateway",
+        "获取使用额度失败: 503 Service Unavailable",
+        "请求失败: error sending request for url (https://management.us-east-1.kiro.dev/...)",
+        "请求失败: dns error: failed to lookup address information",
+    ];
+
+    /// ⭐ 场景 a：**所有候选都「没拿到答案」⇒ 判 Skipped，绝不 NoUsableRegion。**
+    ///
+    /// 修复前此处返 `NoUsableRegion` ⇒ `service.rs` 的
+    /// `matches!(probe_outcome, NoUsableRegion | TokenDead)` 命中 ⇒
+    /// `mark_region_probe_failed` 置 `disabled=true` + `RegionProbeFailed`，
+    /// 而该原因**不在** `is_self_healable_reason` 白名单（实测 grep 4 种模式，
+    /// `is_self_healable_reason` 体内零命中）⇒ **一次网络抖动 = 一个好号永久死，要人工捞。**
+    ///
+    /// 判 `Skipped` 后调用方照常启用，号回退 `config.region` 继续服务（与无探测机制的
+    /// 同类网关同行为）。最坏情况是回退的区不对 → `report_failure` → `TooManyFailures`，
+    /// **而那个原因在自愈白名单里** ⇒ 最坏态是可自愈的临时禁用，严格优于永久禁用。
+    #[tokio::test]
+    async fn all_candidates_inconclusive_yields_skipped_not_region_failure() {
+        let cfg = Arc::new(Config::default());
+        let mut cred = KiroCredentials::default();
+        cred.kiro_api_key = Some("ksk_probe".into());
+
+        let order = ["eu-central-1", "us-east-1"];
+        for body in REAL_INCONCLUSIVE_BODIES {
+            // 前置：这些串必须真的落 Inconclusive（否则本测试测的不是它想测的东西）
+            assert_eq!(
+                classify_probe_result(&Err((*body).to_string())),
+                ProbeVerdict::Inconclusive,
+                "前置断言：该串应落兜底分支 Inconclusive: {body}"
+            );
+            let calls = std::cell::Cell::new(0usize);
+            let outcome = probe_api_region_with(&cred, &cfg, &order, |_t| {
+                calls.set(calls.get() + 1);
+                async move { Err((*body).to_string()) }
+            })
+            .await;
+
+            assert_eq!(
+                outcome,
+                ProbeOutcome::Skipped,
+                "全部候选都没拿到答案时必须判 Skipped（探不了 ≠ 确定不行）: {body}"
+            );
+            assert_ne!(
+                outcome,
+                ProbeOutcome::NoUsableRegion,
+                "承重：判 NoUsableRegion 会让 service.rs 用不可自愈的 RegionProbeFailed \
+                 永久禁用一个好号: {body}"
+            );
+            assert_eq!(calls.get(), order.len(), "应把所有候选都试过");
+        }
+    }
+
+    /// 🔴 场景 b / OVER-REACH CONTROL：**每个候选都给出确定否定 ⇒ 仍必须 NoUsableRegion。**
+    ///
+    /// 这是「改动一」不能改过头的边界。若把汇总写成「任何失败都返 Skipped」，
+    /// 真正无可用区的号会被放进池子反复打 403 —— 那正是本模块存在的理由
+    /// （见模块头注释：启用即恒 403 被打死）。
+    ///
+    /// 与场景 a 构成对照：同样是「两个候选都失败」，但失败的**性质**不同 ⇒ 判决必须不同。
+    #[tokio::test]
+    async fn all_candidates_definitely_wrong_still_yields_no_usable_region() {
+        let cfg = Arc::new(Config::default());
+        let mut cred = KiroCredentials::default();
+        cred.kiro_api_key = Some("ksk_probe".into());
+
+        let order = ["eu-central-1", "us-east-1"];
+        // 实测串：management.us-east-1 对 EU key 回的正是这个（2026-08-07 实打）。
+        const DEFINITE_NO: &str = "权限不足: 403 Forbidden {\"message\":\"Invalid token\",\"reason\":null}";
+        assert_eq!(
+            classify_probe_result(&Err(DEFINITE_NO.to_string())),
+            ProbeVerdict::WrongRegion,
+            "前置断言：403 Invalid token 是**确定的**否定，不是「没答案」"
+        );
+
+        let calls = std::cell::Cell::new(0usize);
+        let outcome = probe_api_region_with(&cred, &cfg, &order, |_t| {
+            calls.set(calls.get() + 1);
+            async move { Err(DEFINITE_NO.to_string()) }
+        })
+        .await;
+
+        assert_eq!(
+            outcome,
+            ProbeOutcome::NoUsableRegion,
+            "全部候选都**确定**不可用时必须判 NoUsableRegion —— 放这种号进池子只会恒 403"
+        );
+        assert_eq!(calls.get(), order.len());
+    }
+
+    /// ⭐ 场景 c（本改动的核心用例）：**US 号的真实受害形态。**
+    ///
+    /// `PROBE_ORDER = ["eu-central-1", "us-east-1"]` ⇒ US key 的探测序列是：
+    ///
+    /// ```text
+    /// 第 1 次 management.eu-central-1 → 403 Invalid token（WrongRegion，确定否定）
+    /// 第 2 次 management.us-east-1    → 5xx/网络抖动（Inconclusive，没答案）
+    ///                                   ↑ 这是它唯一的机会
+    /// ```
+    ///
+    /// 修复前：循环结束、无 Usable ⇒ `NoUsableRegion` ⇒ 永久禁用。
+    /// **EU key 走不到这条路**（第 1 次就 200 直接返回），所以受害的只有 US 号。
+    ///
+    /// 修复后：出现过 Inconclusive ⇒ 不能断言该号无可用区 ⇒ `Skipped` ⇒ 照常启用。
+    #[tokio::test]
+    async fn wrong_region_then_inconclusive_yields_skipped_us_key_victim_shape() {
+        let cfg = Arc::new(Config::default());
+        let mut cred = KiroCredentials::default();
+        cred.kiro_api_key = Some("ksk_probe".into());
+
+        // 顺序与 PROBE_ORDER 一致：US key 的授权区排在末位。
+        let order = ["eu-central-1", "us-east-1"];
+        let calls = std::cell::Cell::new(0usize);
+        let outcome = probe_api_region_with(&cred, &cfg, &order, |_t| {
+            calls.set(calls.get() + 1);
+            let first = calls.get() == 1;
+            async move {
+                if first {
+                    // eu 对 US key 的实测响应
+                    Err("权限不足: 403 Forbidden {\"message\":\"Invalid token\",\"reason\":null}"
+                        .to_string())
+                } else {
+                    // us 本该回 200，但这一次抖了
+                    Err("获取使用额度失败: 500 Internal Server Error".to_string())
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(
+            outcome,
+            ProbeOutcome::Skipped,
+            "「确定否定 + 没答案」混合时必须判 Skipped：那个没答案的候选恰恰可能是\
+             该号唯一的可用区（US 号的真实形态），据此永久禁用等于因一次抖动杀掉好号"
+        );
+        assert_ne!(
+            outcome,
+            ProbeOutcome::NoUsableRegion,
+            "承重：修复前这里正是 NoUsableRegion → RegionProbeFailed（不可自愈）"
+        );
+        assert_eq!(calls.get(), order.len(), "两个候选都应试过");
     }
 
     /// 401 必须压过 suspend：token 废了就是废了，继续探毫无意义。
