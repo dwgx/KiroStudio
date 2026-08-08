@@ -8,8 +8,8 @@
 //! # 设计（与 [`super::recovery_metrics`] 同源）
 //! - **不持久化**：这是「自进程启动以来」的运营信号，重启归零；凭据本身已落 credentials.json。
 //! - **有界内存**：只留最近 [`MAX_RECORDS`] 次推送，`VecDeque` 满则弹最旧，杜绝无界增长。
-//! - **两条通道隔离**：既有批量通道保持 admin 面板可复制明文的历史行为；新 Relay
-//!   通道只记录打码 key。两者使用独立队列与计数器，互不覆盖。
+//! - **两条通道隔离**：批量与 Relay 都在已鉴权 admin 面板显示可复制明文，但使用独立
+//!   有界内存队列与计数器；明文不持久化，进程重启即消失。
 
 use std::collections::VecDeque;
 use std::sync::OnceLock;
@@ -28,7 +28,7 @@ const MAX_ITEMS_PER_RECORD: usize = 20;
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportItemRecord {
-    /// 展示用 key。既有批量通道保持完整值；Relay 通道仅写入打码值。
+    /// 管理后台展示/复制用完整 key。仅存当前进程有界内存，不写日志或持久化账本。
     pub key: String,
     /// key 指纹（SHA-256 前 8 位）。用于和凭据管理页的指纹对照同一个号，
     /// 也便于在不整串比对的情况下快速判同。恒可计算，故非 Option。
@@ -348,7 +348,7 @@ mod tests {
         record_push(vec![batch], 11);
 
         let mut relay = item(false, false);
-        relay.key = "ksk_rela...sker".into();
+        relay.key = "ksk_relay_plaintext_marker".into();
         relay.delivery_id = Some("relay-isolation-marker".into());
         record_relay_push(vec![relay], 12);
 
@@ -368,6 +368,13 @@ mod tests {
                 .iter()
                 .any(|i| i.delivery_id.as_deref() == Some("relay-isolation-marker"))),
             "Relay 记录必须只进入 relayRecords"
+        );
+        assert!(
+            after.relay_records.iter().any(|r| r.items.iter().any(|i| {
+                i.delivery_id.as_deref() == Some("relay-isolation-marker")
+                    && i.key == "ksk_relay_plaintext_marker"
+            })),
+            "Relay 管理记录必须保留可复制明文 key"
         );
         assert!(
             !after.records.iter().any(|r| r

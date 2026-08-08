@@ -4,7 +4,7 @@
 //! - `POST /api/import/push`: single-key relay protocol with persistent delivery idempotency.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
     io::Write,
     path::PathBuf,
@@ -299,13 +299,9 @@ fn record_import_stats(results: &[ImportItemResponse], elapsed_ms: u64, delivery
     let items = results
         .iter()
         .map(|item| crate::common::import_stats::ImportItemRecord {
-            // Preserve the existing batch channel's admin-only plaintext record. The new
-            // Relay channel is stricter and records only the already-masked response key.
-            key: if delivery_id.is_some() {
-                item.key.clone()
-            } else {
-                item.plain_key.clone()
-            },
+            // 两条通道都只在已鉴权管理后台的有界内存快照中保留明文，方便直接复制。
+            // 推送响应仍使用 item.key（打码），Relay delivery 账本也只存 SHA-256，均不泄露明文。
+            key: item.plain_key.clone(),
             fingerprint: item.fingerprint.clone(),
             ok: item.ok,
             duplicate: item.duplicate.unwrap_or(false),
@@ -503,11 +499,27 @@ async fn import_push(
         }))
         .into_response()
     } else {
+        let error = result
+            .error
+            .unwrap_or_else(|| "key import failed".to_string());
         (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({"ok": false, "error": result.error.unwrap_or_else(|| "key import failed".to_string())})),
+            relay_failure_status(&error),
+            Json(serde_json::json!({"ok": false, "error": error})),
         )
             .into_response()
+    }
+}
+
+/// 永久输入/凭据错误用 422，让调用方直接修正且避免 CDN 把普通业务失败包装成 502 页面；
+/// 只有网络探测不确定或持久化故障才返回 502，明确提示推送方稍后重试。
+fn relay_failure_status(error: &str) -> StatusCode {
+    if error.starts_with("region probe was inconclusive")
+        || error.starts_with("failed to build region probe client")
+        || error.starts_with("failed to persist credential")
+    {
+        StatusCode::BAD_GATEWAY
+    } else {
+        StatusCode::UNPROCESSABLE_ENTITY
     }
 }
 
@@ -587,19 +599,15 @@ async fn process_item(state: &ImportState, item: ImportItem) -> ImportItemRespon
         None => None,
     };
 
-    let region = match (&explicit_region, &existing) {
-        // An unchanged explicit region or omitted region on an existing credential needs no
-        // network probe. This keeps duplicate retries cheap and preserves prior routing data.
-        (Some(region), Some(old)) if old.region.as_deref() == Some(region.as_str()) => {
-            region.clone()
-        }
-        (None, Some(old)) if old.region.is_some() => old.region.clone().unwrap(),
-        (Some(region), _) => match probe_regions(state, &key, vec![region.clone()]).await {
-            Ok(region) => region,
-            Err(error) => return fail(error),
-        },
-        (None, _) => {
-            let candidates = KIRO_DIALOG_REGIONS.iter().map(|r| r.to_string()).collect();
+    let existing_region = existing.as_ref().and_then(|old| old.region.as_deref());
+    let region = match (&explicit_region, existing_region) {
+        // 已入池且对方未改 region（或仍发同一个值）时直接复用，重复投递零探测。
+        (None, Some(region)) => region.to_string(),
+        (Some(hint), Some(region)) if hint == region => region.to_string(),
+        // 对方 region 只是优先提示，不是硬限制：错误提示（如 us-east-1）失败后，自动尝试
+        // 已有落库 region 和其余受支持 region，最终写入真实可用值。
+        _ => {
+            let candidates = ordered_region_candidates(explicit_region.as_deref(), existing_region);
             match probe_regions(state, &key, candidates).await {
                 Ok(region) => region,
                 Err(error) => return fail(error),
@@ -649,6 +657,21 @@ async fn process_item(state: &ImportState, item: ImportItem) -> ImportItemRespon
     }
 }
 
+fn ordered_region_candidates(hint: Option<&str>, existing: Option<&str>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut ordered = Vec::with_capacity(KIRO_DIALOG_REGIONS.len());
+    for region in hint
+        .into_iter()
+        .chain(existing)
+        .chain(KIRO_DIALOG_REGIONS.iter().copied())
+    {
+        if seen.insert(region.to_string()) {
+            ordered.push(region.to_string());
+        }
+    }
+    ordered
+}
+
 async fn probe_regions(
     state: &ImportState,
     key: &str,
@@ -667,20 +690,44 @@ async fn probe_regions(
     });
     let client = build_client_no_redirect(proxy.as_ref(), 12, config.tls_backend)
         .map_err(|error| format!("failed to build region probe client: {error}"))?;
+    let ordered = candidates.clone();
 
     let outcomes = stream::iter(candidates.into_iter().map(|region| {
         let client = client.clone();
         let key = key.to_string();
+        let config = config.clone();
         async move {
             let host = format!("management.{region}.kiro.dev");
+            // 与正式 get_usage_limits 完全同口径。旧实现使用 KIRO_CLI 且缺 SDK 指纹头，
+            // 会把真实可用的 API Key 误判为 403 Invalid token。
             let url = format!(
-                "https://{host}/getUsageLimits?isEmailRequired=true&origin=KIRO_CLI&resourceType=AGENTIC_REQUEST"
+                "https://{host}/getUsageLimits?isEmailRequired=true&origin=AI_EDITOR&resourceType=AGENTIC_REQUEST"
+            );
+            let credentials = KiroCredentials {
+                auth_method: Some("api_key".to_string()),
+                region: Some(region.clone()),
+                api_region: Some(region.clone()),
+                kiro_api_key: Some(key.clone()),
+                ..Default::default()
+            };
+            let machine_id = crate::kiro::machine_id::generate_from_credentials(&credentials, &config);
+            let user_agent = format!(
+                "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+                config.system_version, config.node_version, config.kiro_version, machine_id
+            );
+            let amz_user_agent = format!(
+                "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
+                config.kiro_version, machine_id
             );
             let result = client
                 .get(url)
+                .header("x-amz-user-agent", amz_user_agent)
+                .header("user-agent", user_agent)
                 .header("Authorization", format!("Bearer {key}"))
                 .header("tokentype", "API_KEY")
                 .header("host", host)
+                .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+                .header("amz-sdk-request", "attempt=1; max=1")
                 .send()
                 .await;
             (region, result)
@@ -690,42 +737,36 @@ async fn probe_regions(
     .collect::<Vec<_>>()
     .await;
 
-    let mut matches = Vec::new();
+    let mut matches = HashSet::new();
     let mut transient = Vec::new();
     for (region, outcome) in outcomes {
         match outcome {
-            Ok(response) if response.status().is_success() => matches.push(region),
+            Ok(response) if response.status().is_success() => {
+                matches.insert(region);
+            }
             Ok(response)
                 if response.status().is_server_error() || response.status().as_u16() == 429 =>
             {
                 transient.push(format!("{region}: HTTP {}", response.status()));
             }
             Ok(_) => {}
-            // 连接层失败（DNS 无记录 / 拒绝连接）说明该 region **没有 management 端点**，
-            // 与"key 在该 region 无效"等价，绝不能算待重试。实测 KIRO_DIALOG_REGIONS 的 33 个
-            // 候选里只有 3 个真实存在 host（us-east-1 / eu-central-1 / us-gov-east-1），若把这
-            // 30 个 DNS 失败计入 transient，任何无 region 的**永久无效** key 都会返回
-            // "inconclusive; retry later" → 按契约第 3 条推送方会无限重推。
-            // 只有超时才是真瞬态（链路慢/被墙），值得让对方重试。
-            Err(error) if error.is_timeout() => {
-                transient.push(format!("{region}: timeout"));
-            }
+            // 连接层失败（DNS 无记录 / 拒绝连接）说明该 region 没有 management 端点；
+            // 只有超时属于不确定的瞬态故障，值得让推送方稍后重试。
+            Err(error) if error.is_timeout() => transient.push(format!("{region}: timeout")),
             Err(_) => {}
         }
     }
-    match matches.as_slice() {
-        [region] => Ok(region.clone()),
-        [] if transient.is_empty() => {
-            Err("key is invalid or no supported region matched".to_string())
-        }
-        [] => Err(format!(
+    // 并发探测按完成时间返回，必须回到原候选顺序选第一个命中：hint → 已有 → 白名单。
+    if let Some(region) = ordered.into_iter().find(|region| matches.contains(region)) {
+        return Ok(region);
+    }
+    if transient.is_empty() {
+        Err("key is invalid or no supported region matched".to_string())
+    } else {
+        Err(format!(
             "region probe was inconclusive; retry later ({})",
             transient.into_iter().take(3).collect::<Vec<_>>().join("; ")
-        )),
-        _ => Err(format!(
-            "region probe was ambiguous; matched: {}",
-            matches.join(", ")
-        )),
+        ))
     }
 }
 
@@ -774,6 +815,50 @@ mod tests {
             dead.len() > 20,
             "候选表应含大量无 management 端点的 region（实测 30 个），实际 {}",
             dead.len()
+        );
+    }
+
+    #[test]
+    fn hinted_region_is_preferred_but_never_limits_auto_detection() {
+        let regions = ordered_region_candidates(Some("us-east-1"), Some("eu-central-1"));
+        assert_eq!(regions[0], "us-east-1", "推送方提示应优先尝试");
+        assert_eq!(
+            regions[1], "eu-central-1",
+            "已有可用区域应排在其余白名单之前"
+        );
+        assert!(
+            regions.contains(&"us-west-2".to_string()),
+            "提示区域不得限制自动探测"
+        );
+        assert_eq!(
+            regions
+                .iter()
+                .filter(|region| region.as_str() == "us-east-1")
+                .count(),
+            1,
+            "候选区域必须去重"
+        );
+    }
+
+    #[test]
+    fn relay_business_failures_are_422_but_transient_probe_failures_are_502() {
+        assert_eq!(
+            relay_failure_status("key is invalid or no supported region matched"),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            relay_failure_status("unsupported region: nowhere-1"),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            relay_failure_status(
+                "region probe was inconclusive; retry later (eu-central-1: timeout)"
+            ),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            relay_failure_status("failed to persist credential: disk full"),
+            StatusCode::BAD_GATEWAY
         );
     }
 
