@@ -948,19 +948,43 @@ function fillSeats(box, it){
   n.className = 'seat-n';
   n.textContent = num(taken) + '/' + num(max) + ' 位';
   box.appendChild(n);
+}
 
-  // 徽章：满员 / 已上车。颜色不是唯一载体（卡片边框也变绿），色盲用户靠这个字。
+// 状态徽章（已满 / 已上车）画在**车头**，不在座位行。
+//
+// 【为何从座位行搬走】实测：徽章挤在座位行里会把点阵顶到折行——15 个点 + 标签 +
+// 「2/15 位」+ 徽章需要 332px，而 1920 宽下四列布局每张卡内宽只有 301px。
+// 于是点阵折成两行、卡片比邻居高出一截（229 → 326），而且只有**已上车或已满**
+// 的那几张会这样，看上去像随机的排版错乱。把徽章移走后只需 271px，
+// 从 1920 到 360 全都放得下（320 那一档另有堆叠规则兜住）。
+//
+// 【为何不是缩小徽章或让点阵允许折行】徽章要能读，点阵折行则会破坏「一眼估量
+// 还剩几个位子」——两者都是治症状。徽章描述的本来就是整辆车的状态（这车满了 /
+// 我在车上），放在车头与车号同排才是它的正确位置，顺手解决了宽度问题。
+//
+// 【为何整块先删再建】上车成功后徽章要从「无」变成「已上车」，满员时要变「已满」。
+// 只追加不删除的话，同一张卡上会攒出两个徽章（上车一次留一个）。
+function fillBadge(head, it){
+  if (!head) { return; }
+  var old = head.querySelector('.pill');
+  if (old) { head.removeChild(old); }
+
+  var pill = null;
   if (it.full) {
-    var fp = document.createElement('span');
-    fp.className = 'pill warn';
-    fp.textContent = '已满';
-    box.appendChild(fp);
+    pill = document.createElement('span');
+    pill.className = 'pill warn';
+    pill.textContent = '已满';
   } else if (it.aboard) {
-    var mp = document.createElement('span');
-    mp.className = 'pill ok';
-    mp.textContent = '已上车';
-    box.appendChild(mp);
+    pill = document.createElement('span');
+    pill.className = 'pill ok';
+    pill.textContent = '已上车';
   }
+  if (!pill) { return; }
+
+  // 插在发车时间**之前**：.car-when 用 margin-left:auto 把自己顶到最右，
+  // 直接 append 会让徽章排到时间的右边、贴在卡片边缘，与车号离得最远。
+  var when = head.querySelector('.car-when');
+  if (when) { head.insertBefore(pill, when); } else { head.appendChild(pill); }
 }
 
 // 卡片底排：左边车费，右边主操作（已上车 → 复制；未上车 → 上车按钮；满员 → 禁用）。
@@ -1116,14 +1140,16 @@ function board(it, btn, tktBox, seatsBox, foot, cardEl){
       btn.textContent = '已满';
       // 座位区整块重画，而不是改一处文本。
       //
-      // 【为何不能写 seatsBox.textContent = '2/15'】座位区是点阵 + 数字 + 徽章
-      // 三样东西，赋 textContent 会把点阵和徽章一起抹掉，只剩一行裸数字——
+      // 【为何不能写 seatsBox.textContent = '2/15'】座位区是标签 + 点阵 + 数字
+      // 三个节点，赋 textContent 会把点阵一起抹掉、只剩一行裸数字——
       // 而这正是「表格改卡片」时最容易漏的一处：旧代码那样写是对的（那里只有数字）。
-      if (seatsBox) {
-        it.boardCount = f.count;
-        it.full = true;
-        fillSeats(seatsBox, it);
-      }
+      it.boardCount = f.count;
+      it.full = true;
+      if (seatsBox) { fillSeats(seatsBox, it); }
+      // 徽章在车头（不在座位行，见 fillBadge 的说明），从卡片里取那一行来更新。
+      // 漏掉这一步：卡片整张压暗了、按钮写着「已满」，唯独车头没有「已满」徽章，
+      // 而刷新一下它又会出现——这种「只在点击后错、刷新就好」的差异最难查。
+      if (cardEl) { fillBadge(cardEl.querySelector('.car-h'), it); }
       if (cardEl) { cardEl.className = 'car full'; }
       return;
     }
@@ -1146,9 +1172,12 @@ function board(it, btn, tktBox, seatsBox, foot, cardEl){
     // 座位区整块重画：点阵里要多亮一个点，而且那个点是绿的（我的位子）。
     // 同样不能赋 textContent——见上面 409 分支的说明。
     if (seatsBox) { fillSeats(seatsBox, it); }
-    // 卡片边框转绿：这是「这辆车现在是我的」最快能看见的信号，
-    // 比徽章更早进入视野（一屏十几张卡时，逐张找小徽章很费眼）。
-    if (cardEl) { cardEl.className = 'car mine'; }
+    // 卡片边框转绿，并立即把「已上车」徽章画到车头。若只在 render() 调
+    // fillBadge，上车成功后必须等下一次整表刷新才看得到徽章。
+    if (cardEl) {
+      cardEl.className = 'car mine';
+      fillBadge(cardEl.querySelector('.car-h'), it);
+    }
 
     // 重建整个底排。
     //
@@ -1322,9 +1351,12 @@ function render(data){
       when.textContent = '已发车 ' + ago(it.addedAtMs);
       head.appendChild(when);
     }
+    // 状态徽章跟车号同排（见 fillBadge：它从座位行搬上来是为了不挤折点阵）。
+    // 必须在 .car-when 已经挂进 head 之后调用——fillBadge 要靠它决定插入位置。
+    fillBadge(head, it);
     card.appendChild(head);
 
-    // ---- 座位：点阵 + 数字 + 徽章 ----
+    // ---- 座位：点阵 + 数字 ----
     // 与上车成功后的就地更新**共用** fillSeats，避免两处各写一份「什么时候
     // 画几个点」——那样上车后的样子和刷新后的样子会慢慢长歪。
     var seatsBox = document.createElement('div');
@@ -2929,9 +2961,9 @@ mod tests {
     /// **上车成功后就地更新座位区，必须整块重画，不能赋 `textContent`。**
     ///
     /// # 这条挡的是什么
-    /// 座位区是「点阵 + 数字 + 徽章」三样东西。表格时代那一格只有一行数字，
+    /// 座位区是「点阵 + 数字」两样东西。表格时代那一格只有一行数字，
     /// 于是 `board()` 里写的是 `tdSeat.textContent = '2/15'`——完全正确。
-    /// 改成车位卡之后，同一句话会把点阵和徽章一起抹掉，只剩一行裸数字。
+    /// 改成车位卡之后，同一句话会把点阵抹掉，只剩一行裸数字。
     ///
     /// 【为何非测不可】这个 bug 只在**点过上车按钮之后**出现：页面加载时座位是
     /// 对的（走 render），刷新后又变回对的（重新 render）。唯一看得见的时机是
@@ -2962,15 +2994,36 @@ mod tests {
 
         assert!(
             body.contains("fillSeats("),
-            "board() 不再调用 fillSeats：座位点阵和徽章不会跟着人数更新"
+            "board() 不再调用 fillSeats：座位点阵不会跟着人数更新"
         );
         for bad in ["seatsBox.textContent =", "seatsBox.textContent="] {
             assert!(
                 !body.contains(bad),
-                "board() 里给座位区赋 textContent（`{bad}`）会抹掉点阵和徽章，只剩一行裸数字——\
+                "board() 里给座位区赋 textContent（`{bad}`）会抹掉点阵，只剩一行裸数字——\
                  必须走 fillSeats 整块重画"
             );
         }
+    }
+
+    /// 上车成功或服务端告知满员时，车头徽章必须随行内状态立即更新。
+    /// 否则只有整表 `render()` 会调用 `fillBadge`，用户要等下一轮刷新才能看到状态。
+    #[test]
+    fn boarding_repaints_status_badge_without_full_refresh() {
+        let page = strip_js_comments(script_block());
+        let start = page.find("function board(").expect("找不到 board()");
+        let body = &page[start..];
+        let end = body
+            .find("\nfunction ")
+            .map(|e| e + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        assert!(
+            body.matches("fillBadge(cardEl.querySelector('.car-h'), it)")
+                .count()
+                >= 2,
+            "board() 的成功与满员分支都必须立即重画车头徽章"
+        );
     }
 
     /// **车位卡网格的最小轨道宽必须能在窄容器里退让。**
