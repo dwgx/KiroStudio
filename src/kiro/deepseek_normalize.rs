@@ -26,6 +26,16 @@ use serde_json::Value;
 /// opencodezen 只认的 fallback 模型名（对齐 fuckopencode `DEFAULT_FALLBACK_MODEL`）。
 const DEFAULT_FALLBACK_MODEL: &str = "deepseek-v4-flash";
 
+/// thinking 开启时 `max_tokens` 的下限。
+///
+/// 实测根因（2026-08-08 实打 deepseek-v4-flash）：**thinking 计入 max_tokens 预算**。
+/// 客户端（claudecodehaha tier-7 等）常发小 `max_tokens`（约 200），deepseek 先 thinking
+/// 就把预算吃光 → `stop_reason=max_tokens`、只有 thinking、正文空；而 `max_tokens=4096`
+/// 时 `stop_reason=end_turn`、thinking + 正文完整。上游接受大 max_tokens（实测 4096 OK，
+/// model_catalog 的 max_output=64_000），所以抬升是安全的。仅 thinking 非 disabled 时
+/// 生效；thinking disabled 尊重客户端明确的小预算。
+const DEEPSEEK_MIN_MAX_TOKENS: u64 = 4096;
+
 /// 对一次 Anthropic `/v1/messages` 请求体做 deepseek 归一化(就地修改)。
 ///
 /// 幂等:对任意 Anthropic 请求安全,不改消息语义,只调整协议字段。
@@ -117,6 +127,22 @@ pub fn normalize_request(value: &mut Value) {
     //    则前插空 thinking 块(否则 deepseek 次轮 400)。对齐 fuckopencode injectMissingThinkingBlocks。
     if !thinking_disabled {
         inject_missing_thinking_blocks(obj);
+    }
+
+    // 6) max_tokens 下限保护：thinking 非 disabled 时，deepseek 的 thinking 计入
+    //    max_tokens 预算。客户端小预算（如 200）会被 thinking 吃光 → 正文空
+    //    （实测 max_tokens=30 只有 thinking；4096 正常出正文）。这里把 < 下限的
+    //    抬到下限；缺失补下限；≥ 下限保持。thinking disabled 不调（尊重客户端意图）。
+    if !thinking_disabled {
+        match obj.get("max_tokens").and_then(|v| v.as_u64()) {
+            None => {
+                obj.insert("max_tokens".into(), serde_json::json!(DEEPSEEK_MIN_MAX_TOKENS));
+            }
+            Some(n) if n < DEEPSEEK_MIN_MAX_TOKENS => {
+                obj.insert("max_tokens".into(), serde_json::json!(DEEPSEEK_MIN_MAX_TOKENS));
+            }
+            Some(_) => {}
+        }
     }
 }
 
@@ -305,6 +331,47 @@ mod tests {
         }));
         let content3 = out3["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content3[0]["type"], "tool_use", "thinking disabled 不注入");
+    }
+
+    /// max_tokens 下限保护（根因：deepseek thinking 计入 max_tokens，小预算被吃光 → 正文空）。
+    /// thinking 非 disabled 时 < 4096 抬到 4096、缺失补 4096、≥ 保持；disabled 不调。
+    #[test]
+    fn max_tokens_floor_applied_only_when_thinking_enabled() {
+        // thinking enabled + 小 max_tokens → 抬到 4096
+        let out = norm(serde_json::json!({
+            "thinking": { "type": "enabled" },
+            "max_tokens": 200
+        }));
+        assert_eq!(out["max_tokens"], 4096, "小 max_tokens 应抬到下限");
+
+        // thinking adaptive（归一化成 enabled）+ 小 max_tokens → 抬到 4096
+        let out = norm(serde_json::json!({
+            "thinking": { "type": "adaptive" },
+            "max_tokens": 30
+        }));
+        assert_eq!(out["max_tokens"], 4096, "adaptive 归一化为 enabled 后同样抬升");
+
+        // thinking enabled + 缺失 max_tokens → 补 4096
+        let out = norm(serde_json::json!({ "thinking": { "type": "enabled" } }));
+        assert_eq!(out["max_tokens"], 4096, "缺失 max_tokens 应补下限");
+
+        // thinking enabled + ≥ 4096 → 保持
+        let out = norm(serde_json::json!({
+            "thinking": { "type": "enabled" },
+            "max_tokens": 5000
+        }));
+        assert_eq!(out["max_tokens"], 5000, "≥ 下限的 max_tokens 应保持");
+
+        // thinking disabled + 小 max_tokens → 不变（尊重客户端明确的小预算）
+        let out = norm(serde_json::json!({
+            "thinking": { "type": "disabled" },
+            "max_tokens": 100
+        }));
+        assert_eq!(out["max_tokens"], 100, "thinking disabled 不抬升");
+
+        // thinking disabled + 缺失 → 不补
+        let out = norm(serde_json::json!({ "thinking": { "type": "disabled" } }));
+        assert!(out.get("max_tokens").is_none(), "thinking disabled 不补 max_tokens");
     }
 
     /// 幂等：对已归一化的请求再归一化，结果不变。

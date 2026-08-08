@@ -986,6 +986,14 @@ pub(crate) fn absorb_class_of(err_str: &str) -> Option<AbsorbClass> {
     if err_str.contains("pool_permanently_exhausted=1") {
         return None;
     }
+    // 上游并发闸满（网关自己的背压，见 provider.rs 的 `upstream_gate_full=1`）。
+    // 与 `inbound_admission_timeout` 同语义：它**带** `retry_after_secs=2`，若不在此排除，
+    // 会被下面 `parse_retry_after_secs` 抢成 PoolCooldown 吸收 —— sleep 2s 重打整链、
+    // 默认 3 轮 ≈ +6s 延迟，且计数器记成 pool_cooldown 误导面板。必须排在其前。
+    // （吸收层开启即内置 shield 场景，这正是 gate-full 会出现的环境。）
+    if err_str.contains("upstream_gate_full=1") {
+        return None;
+    }
     if let Some(secs) = parse_retry_after_secs(err_str) {
         return Some(AbsorbClass::PoolCooldown(secs));
     }
@@ -4529,6 +4537,30 @@ mod error_translation_tests {
         assert!(
             c_body.contains("cooling down"),
             "全池冷却的文案应保持不变（零回归），实际: {c_body}"
+        );
+    }
+
+    /// 上游并发闸满（`upstream_gate_full=1`）必须：① 对客户端 429 + Retry-After（而非 502，
+    /// 502 让客户端立即重发重新灌满闸门）；② 对吸收层判为**不可吸收**（不能被 `retry_after_secs=`
+    /// 抢成 PoolCooldown 睡 2s 重打整链 +6s 延迟）。
+    #[test]
+    fn upstream_gate_full_is_429_not_absorbable() {
+        // 吸收层分类：带 retry_after_secs=2 但必须返 None（网关自己的背压）。
+        assert!(
+            absorb_class_of("上游并发闸已满，停止本轮重试以免放大 upstream_gate_full=1 retry_after_secs=2")
+                .is_none(),
+            "gate-full 不得被当 PoolCooldown 吸收"
+        );
+
+        // map_provider_error：429 + Retry-After:2。
+        let resp = map_provider_error(anyhow::Error::msg(
+            "上游并发闸已满，停止本轮重试以免放大 upstream_gate_full=1 retry_after_secs=2",
+        ));
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers().get(header::RETRY_AFTER).unwrap().to_str().unwrap(),
+            "2",
+            "gate-full 的 Retry-After 应为网关给的退避秒数"
         );
     }
 
