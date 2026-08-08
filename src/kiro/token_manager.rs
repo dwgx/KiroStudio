@@ -2907,6 +2907,15 @@ impl MultiTokenManager {
     ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
         let cooldown_on = self.cooldown_enabled.load(Ordering::Relaxed);
+        // 模型白名单硬门（与 Kiro 路径同款）：设了 allowed_models 且当前模型不在其中
+        // → 过滤掉；model 为空（无模型语义的调用）放行。
+        //
+        // ⭐ 门序修复（2026-08-08）：白名单判定改用**重写后的模型名**。模型重写
+        // （deepseek 归一化 → `claude-*`/`gpt-*` 映射到 fallback_model）在
+        // `passthrough::forward` 内、选号**之后**才发生，这里若用原始 `claude-sonnet-4-5-*`
+        // 判白名单，按 model_catalog 注释配 `["deepseek-v4-flash"]` 的代挂号会永久被硬门挡下，
+        // 透传永不发生。deepseek 归一化凭据按归一化后的模型名判；普通凭据用原始模型名。
+        let global_ds = self.config().deepseek_normalize.clone();
         entries
             .iter()
             .filter(|e| {
@@ -2914,9 +2923,20 @@ impl MultiTokenManager {
                     && e.credentials.is_custom_api_credential()
                     && !exclude.contains(&e.id)
                     && (!cooldown_on || self.cooldown.is_available(e.id))
-                    // 模型白名单硬门（与 Kiro 路径同款）：设了 allowed_models 且当前模型不在其中
-                    // → 过滤掉；model 为空（无模型语义的调用）放行。
-                    && model.is_none_or(|m| e.credentials.allows_model(m))
+                    && model.is_none_or(|m| {
+                        let effective = if e.credentials.deepseek_normalize == Some(true) {
+                            let merged = e
+                                .credentials
+                                .deepseek_normalize_config
+                                .as_ref()
+                                .map(|c| c.merge_over(&global_ds))
+                                .unwrap_or_else(|| global_ds.clone());
+                            crate::kiro::deepseek_normalize::effective_model(m, &merged)
+                        } else {
+                            m.to_string()
+                        };
+                        e.credentials.allows_model(&effective)
+                    })
             })
             // 均衡分流键(升序):优先级 → 近 60s RPM → 在途。rpm 用独立 mutex,与 Kiro balanced 同款模式。
             .min_by_key(|e| {
@@ -5069,6 +5089,22 @@ impl MultiTokenManager {
                     entry.success_count
                 );
             }
+            // ⭐ 族级清零（承重，与 `report_suspicious_activity` 配对）
+            //
+            // 风控计数是按**族**累加的（同 clone_group 的分身共享一个上游账号，
+            // 见 `report_suspicious_activity` 的实测依据）。若清零只清本号，则同族其它
+            // 分身仍停在高位 ⇒ 下一次 403 会从那个高位 +1 直接把整族推过阈值，
+            // 表现为「刚成功过的账号立刻被判死号并整族禁用」。累加与清零必须同口径。
+            //
+            // 只有共享族键（`clone:` / `m365:` / `aws:`）才需要扫全池；`cred:{id}` 只
+            // 匹配自己，上面那行已经清完，故用前缀判断跳过，保持单号场景零额外开销。
+            if !fam.starts_with("cred:") {
+                for entry in entries.iter_mut() {
+                    if entry.credentials.family_key(entry.id) == fam {
+                        entry.consecutive_suspicious = 0;
+                    }
+                }
+            }
         }
         // 成功：清除冷却并记录速率成功（重置连续失败/退避）
         if self.cooldown_enabled.load(Ordering::Relaxed) {
@@ -5415,49 +5451,99 @@ impl MultiTokenManager {
     /// `endpoint/mod.rs::default_is_account_suspended`）。实测健康号（成功率
     /// 90~100%）也会偶发命中 403，只有真死号才**连续**命中且期间零成功。
     /// 任意一次成功即清零 → 健康号永不误禁。
+    ///
+    /// ## 为什么计数单位是「族」而不是「号」（2026-08-07 线上实测）
+    ///
+    /// 上游 403 的 body 自带账户标识：
+    /// `AccessDeniedException: Your User ID (NNN) temporarily is suspended`。
+    /// 实测该 User ID 与 cred id 是 **N:1**（UID 079998937591 → cred 1294..1299）
+    /// ⇒ 上游按**账号**记账，不按设备指纹。而多开分身（同 `clone_group`）定义上就是
+    /// 同一把 key ⇒ 同一个账号。若按号计数，一次账户级 suspend 要**每份各自数满**
+    /// 阈值才退出调度 ⇒ 白挨 6×N 次上游 403（线上 N=17 ⇒ 102 次/轮），且全池自愈
+    /// 会把整族复活再来一轮（实测当天 `判定为死号并自动禁用` 231 次 / `执行自愈` 14 次），
+    /// 持续撞同一面墙。按族计数后只需 6 次 403 即整族退出调度，上游少挨 6×(N−1) 次。
+    ///
+    /// ⚠️ 收族**只对同 `clone_group` 的 api_key 分身生效**；无 group 的号仍
+    /// `cred:{id}` 各自独立（否则整池连坐）。边界由
+    /// `test_suspicious_counting_stays_per_credential_without_clone_group` 等反向测试钉死。
     pub fn report_suspicious_activity(&self, id: u64) {
         if self.preserve_custom_api_state(id).is_some() {
             return;
         }
         // ── 1. 计数 + 自动禁用（恒执行，不受任何冷却/限速开关影响）
-        let mut disabled_now = false;
+        //
+        // 单位是族：同 clone_group 的分身共享一个上游账号（见 family_key 函数文档的
+        // 实测依据），故整族共用一个计数、同时达阈值、同时禁用。
         let mut hit_count = 0u32;
+        let mut disabled_ids: Vec<u64> = Vec::new();
+        let mut family_size = 0usize;
         {
             let mut entries = self.entries.lock();
-            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                if !entry.disabled {
-                    entry.consecutive_suspicious += 1;
-                    hit_count = entry.consecutive_suspicious;
-                    if self.auto_disable_suspicious.load(Ordering::Relaxed)
-                        && hit_count >= MAX_CONSECUTIVE_SUSPICIOUS_BEFORE_DISABLE
-                    {
+            // 目标号的族键。号已被删除 / 已禁用时不计数（与旧行为一致：只跳过本节，
+            // 后面两节照常执行）。family_key 在锁内就地算，避免 family_key_of 二次取锁。
+            let fam = entries
+                .iter()
+                .find(|e| e.id == id)
+                .filter(|e| !e.disabled)
+                .map(|e| e.credentials.family_key(e.id));
+            if let Some(fam) = fam {
+                // 族内**最高**计数 +1，而不是各自 +1：
+                // 中途被自愈复活（clear_transient_counters 清零）或新导入的分身会从 0 起，
+                // 若各自 +1 则整族计数长期参差 → 阈值被推迟到最慢那份数满，
+                // 等价于退回按号计数。取 max 让整族步调一致。
+                let next = entries
+                    .iter()
+                    .filter(|e| !e.disabled && e.credentials.family_key(e.id) == fam)
+                    .map(|e| e.consecutive_suspicious)
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                hit_count = next;
+                let should_disable = self.auto_disable_suspicious.load(Ordering::Relaxed)
+                    && next >= MAX_CONSECUTIVE_SUSPICIOUS_BEFORE_DISABLE;
+                // 时间戳算一次，整族共用（同一次风控判定应有同一个 disabled_at）。
+                let now_rfc3339 = Utc::now().to_rfc3339();
+                for entry in entries.iter_mut() {
+                    if entry.disabled || entry.credentials.family_key(entry.id) != fam {
+                        continue;
+                    }
+                    entry.consecutive_suspicious = next;
+                    family_size += 1;
+                    if should_disable {
                         entry.disabled = true;
                         entry.disabled_reason = Some(DisabledReason::SuspiciousActivityAuto);
-                        entry.disabled_at = Some(Utc::now().to_rfc3339());
-                        disabled_now = true;
+                        entry.disabled_at = Some(now_rfc3339.clone());
+                        disabled_ids.push(entry.id);
                         crate::common::recovery_metrics::bump_dead_token_disabled();
                     }
                 }
             }
         }
-        if disabled_now {
+        if !disabled_ids.is_empty() {
             tracing::error!(
-                "凭据 #{} 连续 {} 次账户级风控且期间零成功，判定为死号并自动禁用\
-                 （SuspiciousActivityAuto）；移出调度以免每个请求都在它身上白撞",
+                "凭据族（触发号 #{}，同族 {} 份）连续 {} 次账户级风控且期间零成功，\
+                 判定为死号并自动禁用（SuspiciousActivityAuto）：{:?}；\
+                 整族移出调度以免每个请求都在同一个上游账号上白撞",
                 id,
-                hit_count
+                family_size,
+                hit_count,
+                disabled_ids
             );
-            // 清亲和：否则绑定该号的会话会反复重选到已禁用凭据。
-            self.affinity.remove_by_credential(id);
+            // 清亲和：否则绑定这些号的会话会反复重选到已禁用凭据。
+            for cid in &disabled_ids {
+                self.affinity.remove_by_credential(*cid);
+            }
             // 必须落盘：save_stats_debounced 写的 StatsEntry 不含 disabled/disabled_reason，
             // 不落盘则重启后死号以 enabled 回池、重走一遍禁用流程（白耗上游请求）。
+            // persist_credentials 从内存全量重写，故一次调用即覆盖整族。
             self.persist_disabled_state(id);
         } else if hit_count > 0 {
             tracing::debug!(
-                "凭据 #{} 账户级风控连续第 {}/{} 次（一次成功即清零）",
+                "凭据 #{} 账户级风控，族内连续第 {}/{} 次（同族 {} 份共享该计数，一次成功即清零）",
                 id,
                 hit_count,
-                MAX_CONSECUTIVE_SUSPICIOUS_BEFORE_DISABLE
+                MAX_CONSECUTIVE_SUSPICIOUS_BEFORE_DISABLE,
+                family_size
             );
         }
 
@@ -13255,6 +13341,188 @@ mod tests {
             1,
             "健康号（偶发风控但持续有成功）绝不能被自动禁用——这正是 403 不可按\
              『见过即封』处理的原因"
+        );
+    }
+
+    /// 多开分身的族键必须是同一个 `clone:{group}`，而不是各自的 `cred:{id}`。
+    ///
+    /// 上游按账号记账（403 body 的 User ID 与 cred id 实测 N:1），多开只是把同一份
+    /// 配额切成 N 份。若各自独立成族，一次账户级 suspend 要白挨 6×N 次上游 403。
+    #[test]
+    fn test_multi_open_copies_share_one_family() {
+        const KEY: &str = "ksk_family_isolation_probe";
+        const GROUP: &str = "00000000-0000-0000-0000-0000000000cc";
+
+        let mk = |id: u64, mid: &str| {
+            let mut c = KiroCredentials::default();
+            c.id = Some(id);
+            c.auth_method = Some("api_key".to_string());
+            c.kiro_api_key = Some(KEY.to_string());
+            c.clone_group = Some(GROUP.to_string());
+            // 各份指纹不同（多开的真实价值所在），但这**不**让上游把它们当成两个账号。
+            c.machine_id = Some(mid.to_string());
+            c
+        };
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                mk(1306, &"a".repeat(64)),
+                mk(1307, &"b".repeat(64)),
+            ],
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+
+        let f1 = manager.family_key_of(1306);
+        let f2 = manager.family_key_of(1307);
+        assert_eq!(
+            f1, f2,
+            "多开的两份必须同族键：上游按账号记账（403 body 的 User ID 与 cred id 实测 N:1），\
+             各自独立成族只会让一次账户级 suspend 白挨 6×N 次上游 403"
+        );
+        assert_eq!(f1, format!("clone:{GROUP}"), "族键应取 clone:{{clone_group}}");
+        assert!(
+            !f1.starts_with("cred:"),
+            "分身族键不应回退到 cred:{{id}}，否则收族未生效"
+        );
+    }
+
+    /// 构造一个「同一把 key 的 N 份分身」号池（等价于线上 `credentials.json` 的形状）。
+    ///
+    /// 线上实测：17 份共享 keyhash `7d747fc003c9` 与同一个 `cloneGroup`，各自
+    /// machineId / 代理不同。这里复刻该形状，`n` 份、同组、指纹各异。
+    fn clone_family_pool(n: u64) -> Vec<KiroCredentials> {
+        const GROUP: &str = "00000000-0000-0000-0000-0000000000dd";
+        (0..n)
+            .map(|i| {
+                let mut c = KiroCredentials::default();
+                c.id = Some(1306 + i);
+                c.auth_method = Some("api_key".to_string());
+                c.kiro_api_key = Some("ksk_one_account_many_copies".to_string());
+                c.clone_group = Some(GROUP.to_string());
+                // 指纹各异（多开的真实价值），但上游仍按账号记账。
+                c.machine_id = Some(format!("{:064x}", i + 1));
+                c
+            })
+            .collect()
+    }
+
+    /// ⭐ 核心回归（2026-08-07 线上事故）：一个上游账号被 403 suspend 时，
+    /// **整族分身只需数满一次阈值**即全部退出调度 —— 而不是每份各自数满 6 次。
+    ///
+    /// # 事故复现（实测数据）
+    ///
+    /// 线上 17 份分身共享一把 key。按号计数时一次账户级 suspend 要白挨
+    /// `6 × 17 = 102` 次上游 403 才能把池清空；期间客户端全部拿 429，且全池自愈
+    /// 会把整族复活再来一轮（当天 `判定为死号并自动禁用` 231 次 / `执行自愈` 14 次）。
+    /// 该窗口占 4h 内客户端 429 的 95.5%（2080/2177）。
+    ///
+    /// **旧代码在本测试下必红**：按号计数时，对 #1306 报 6 次只会禁用 #1306 一个，
+    /// `available_count()` 仍是 `n-1`。
+    #[test]
+    fn test_suspicious_counting_is_family_scoped_for_clones() {
+        const N: u64 = 5;
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            clone_family_pool(N),
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(manager.available_count(), N as usize, "前置：N 份全部可用");
+
+        // 阈值前一次：整族都还在池内（403 是临时态，不得一见就禁）
+        for _ in 0..(MAX_CONSECUTIVE_SUSPICIOUS_BEFORE_DISABLE - 1) {
+            manager.report_suspicious_activity(1306);
+        }
+        assert_eq!(
+            manager.available_count(),
+            N as usize,
+            "未达阈值前整族都不得被禁用"
+        );
+
+        // 达阈值：**整族**一起退出调度，不需要再对另外 N-1 份各打 6 次。
+        manager.report_suspicious_activity(1306);
+        assert_eq!(
+            manager.available_count(),
+            0,
+            "同 clone_group 的分身共享一个上游账号，一次账户级 suspend 应让整族\
+             （{N} 份）一起退出调度；按号计数时这里会是 {}（旧代码即如此），\
+             等于要白挨 6×{N} 次上游 403",
+            N - 1
+        );
+    }
+
+    /// 🔴 反向（OVER-REACH 控制）：**无** `clone_group` 的号必须仍逐个独立禁用。
+    ///
+    /// 若把收族写成"是 api_key 就并族"，则线上所有未多开的 `ksk_` 号会并成一族 →
+    /// 一号被风控整池连坐，比不收族更糟。本测试与上一个测试构成对照：
+    /// 同样报满阈值，这里只应掉 1 个。
+    #[test]
+    fn test_suspicious_counting_stays_per_credential_without_clone_group() {
+        let mk = |id: u64, key: &str| {
+            let mut c = KiroCredentials::default();
+            c.id = Some(id);
+            c.auth_method = Some("api_key".to_string());
+            c.kiro_api_key = Some(key.to_string());
+            // clone_group 刻意留 None —— 这是本测试的全部要点。
+            c
+        };
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![mk(1, "ksk_solo_a"), mk(2, "ksk_solo_b"), mk(3, "ksk_solo_c")],
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+
+        for _ in 0..MAX_CONSECUTIVE_SUSPICIOUS_BEFORE_DISABLE {
+            manager.report_suspicious_activity(1);
+        }
+        assert_eq!(
+            manager.available_count(),
+            2,
+            "无 clone_group 的号必须各自独立禁用；若整池连坐这里会是 0"
+        );
+    }
+
+    /// 承重配对：族级计数必须配族级清零。
+    ///
+    /// 若累加按族、清零只清本号，则同族其它分身停在高位（如 5/6），下一次 403 会从
+    /// 那个高位 +1 直接把整族推过阈值 —— 表现为「刚成功过的账号立刻被判死号」。
+    /// 把 `report_success` 里的族级清零循环删掉即变红。
+    #[test]
+    fn test_family_success_clears_whole_family_suspicious_counter() {
+        const N: u64 = 4;
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            clone_family_pool(N),
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+
+        // 把整族的计数推到阈值前一格（对 #1306 报，族内共享 → 全员 5/6）
+        for _ in 0..(MAX_CONSECUTIVE_SUSPICIOUS_BEFORE_DISABLE - 1) {
+            manager.report_suspicious_activity(1306);
+        }
+        // 族内**另一份**成功 → 必须把整族计数清零（账号恢复了）
+        manager.report_success(1307);
+
+        // 于是再来 阈值-1 次仍不该禁用：若清零只清了 #1307，
+        // 此刻 #1306 还停在 5，下面第一次上报就会把整族推到 6 → available_count()==0。
+        for _ in 0..(MAX_CONSECUTIVE_SUSPICIOUS_BEFORE_DISABLE - 1) {
+            manager.report_suspicious_activity(1306);
+        }
+        assert_eq!(
+            manager.available_count(),
+            N as usize,
+            "族内任一份成功必须清零**整族**计数；否则刚成功过的账号会被立刻判死号"
         );
     }
 

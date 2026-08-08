@@ -285,6 +285,21 @@ pub fn normalize_request(value: &mut Value, cfg: &DeepseekNormalizeConfig) {
     }
 }
 
+/// 计算某凭据归一化后请求实际使用的「最终模型名」。
+///
+/// 规则与 [`normalize_request`] 第 0 步完全一致（同源，改一处即可）：
+/// `deepseek-*` 保留，其余（`claude-*`/`gpt-*`）统一映射到 `cfg.fallback_model`。
+/// 供选号层的 `allows_model` 白名单在**重写后**判定——否则按 model_catalog 注释配
+/// `["deepseek-v4-flash"]` 时，CC 发的 `claude-sonnet-4-5-*` 会被原始模型名挡在白名单硬门之外，
+/// 透传永不发生。
+pub fn effective_model(raw_model: &str, cfg: &DeepseekNormalizeConfig) -> String {
+    if raw_model.starts_with("deepseek-") {
+        raw_model.to_string()
+    } else {
+        cfg.fallback_model.clone()
+    }
+}
+
 /// 对齐 fuckopencode `injectMissingThinkingBlocks`：thinking 非 disabled 时，assistant
 /// 历史消息含 `tool_use` 但缺 `thinking` 块 → 在 content 头部前插空 thinking 块。
 /// deepseek 在「带工具 + thinking」的多轮里要求 assistant 回传 reasoning 内容，缺失会

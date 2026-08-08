@@ -32,24 +32,81 @@ fn stats_disabled() -> axum::response::Response {
         .into_response()
 }
 
+/// 用量管道背压计数（`/api/admin/usage/overview` 的 `pipeline` 字段）。
+///
+/// # 为什么要挂在 overview 上
+/// 同一个响应里给出「窗口统计」与「这批统计漏了多少」，读数的人才有机会判断可信度。
+/// 若只放在 `/recovery-metrics`（那里也有，见 `usage_pipeline_dropped`），
+/// 看成功率的人不会顺手去查另一个端点 —— 而恰恰是看成功率的人需要这个数。
+///
+/// # 判读
+/// `dropped_records` 非零即意味着 `last_24h`/`last_7d` 等窗口的 requests/success/token
+/// **少算了这么多条**（热路径为了不阻塞请求主动放弃）。单看它无法判断严重程度，
+/// 故配对给出 `written_records` 与派生的 `drop_rate`。
+#[derive(Debug, Clone, Serialize)]
+pub struct PipelineHealth {
+    /// 有界通道满、`try_send` 失败而被丢弃的记录数（自进程启动累计）。
+    pub dropped_records: u64,
+    /// worker 真分发给全部 sink 的记录数（即进了聚合/SQLite 的那批）。
+    pub written_records: u64,
+    /// 丢弃率 = dropped/(dropped+written)。分母为 0 时给 0.0。
+    pub drop_rate: f64,
+}
+
+impl PipelineHealth {
+    /// 从管道的进程级计数器取当前值。
+    fn current() -> Self {
+        let dropped = crate::usage::pipeline::dropped_count();
+        let written = crate::usage::pipeline::written_count();
+        let total = dropped + written;
+        Self {
+            dropped_records: dropped,
+            written_records: written,
+            // 分母 0（进程刚起、一条都没走过）时给 0.0 而不是 NaN：NaN 会被
+            // serde_json 序列化成 `null`，前端做数值比较时静默变成"没问题"。
+            drop_rate: if total == 0 {
+                0.0
+            } else {
+                dropped as f64 / total as f64
+            },
+        }
+    }
+}
+
+/// `GET /api/admin/usage/overview` 的响应体。
+///
+/// `windows` 用 `#[serde(flatten)]` 摊平，使既有的 `last_24h` / `last_7d` / `last_30d` /
+/// `all_time` **仍在顶层** —— 前端契约不变，本次只是**新增**兄弟字段 `pipeline`。
+/// （`Overview` 在 `usage_stats.rs`，不在本次可改文件范围内，故用包装而非给它加字段。）
+///
+/// `dropped` / `parse_errors` 两个键是既有出口（已知问题 #12），必须保留在顶层：
+/// 既有前端类型按这两个键读取（管道满丢弃 + JSONL 重放解析失败），删掉会让面板
+/// 静默丢失丢失率的可观测性。`pipeline` 提供的是配对后的 written/drop_rate 口径，
+/// 二者并存不冲突。
+#[derive(Debug, Clone, Serialize)]
+pub struct OverviewResponse {
+    /// 三窗口 + all_time 统计（摊平到顶层）。
+    #[serde(flatten)]
+    pub windows: crate::usage::usage_stats::Overview,
+    /// 管道满丢弃的原始计数（既有出口，与 `pipeline.dropped_records` 同源）。
+    pub dropped: u64,
+    /// JSONL 重放解析失败数（既有出口）。
+    pub parse_errors: u64,
+    /// 丢弃配对计数（written + 派生 drop_rate）。
+    pub pipeline: PipelineHealth,
+}
+
 /// GET /api/admin/usage/overview
-/// 最近 24h / 7d / 30d 三窗口概览
+/// 最近 24h / 7d / 30d 三窗口概览 + 用量管道丢弃计数
 pub async fn usage_overview(State(state): State<AdminState>) -> impl IntoResponse {
     match &state.usage_stats {
-        Some(stats) => {
-            let ov = stats.overview();
-            // 追加统计丢失可观测性出口（已知问题 #12）：管道满丢弃数 + JSONL 重放解析失败数。
-            // 保持原有四窗口字段不变（前端类型按 last_24h 等键读取，追加键不影响）。
-            Json(serde_json::json!({
-                "last_24h": ov.last_24h,
-                "last_7d": ov.last_7d,
-                "last_30d": ov.last_30d,
-                "all_time": ov.all_time,
-                "dropped": crate::usage::pipeline::dropped_count(),
-                "parse_errors": stats.parse_error_count(),
-            }))
-            .into_response()
-        }
+        Some(stats) => Json(OverviewResponse {
+            windows: stats.overview(),
+            dropped: crate::usage::pipeline::dropped_count(),
+            parse_errors: stats.parse_error_count(),
+            pipeline: PipelineHealth::current(),
+        })
+        .into_response(),
         None => stats_disabled(),
     }
 }
@@ -712,5 +769,89 @@ mod tests {
         assert!(v.get("all_time").is_some(), "{body}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ===== 用量管道丢弃计数的出口 =====
+    //
+    // 缺陷背景：`pipeline::dropped_count()` / `written_count()` 此前**零非定义读者** ——
+    // 通道满时热路径静默丢记录且计数无出口 ⇒ 面板成功率/RPM 系统性偏乐观，而限流调参
+    // 正是以面板数为依据。下面两条钉死出口存在且下发的是**真数**。
+
+    /// ⭐ 核心回归：真制造丢弃 → `GET /usage/overview` 的 `pipeline.dropped_records`
+    /// 必须反映出来。
+    ///
+    /// 用 `pipeline::with_drop_burst` 走**生产的** `Pipeline::submit`（容量 1 的真通道），
+    /// 计数落在生产同一个全局 `DROPPED` 上 —— 所以这里断言的是"出口读到了真数"，
+    /// 不是断言一个测试专用的影子计数器。
+    ///
+    /// 回退验证：把 `usage_overview` 里的 `pipeline: PipelineHealth::current()` 换回
+    /// 原来的 `Json(stats.overview())` → 响应体没有 `pipeline` 键 → 本测试 FAILED。
+    #[tokio::test]
+    async fn overview_endpoint_exposes_pipeline_drop_counters() {
+        // 断言用 `>=`：`DROPPED` 是进程级的，别的测试也在丢；`with_drop_burst` 只保证
+        // burst 期间独占。下界成立即证明出口非硬编码 0（真读了计数器）。
+        let before =
+            crate::usage::pipeline::with_drop_burst(10, |before, dropped| {
+                assert_eq!(dropped, 9, "容量 1 投 10 条应丢 9 条");
+                before
+            });
+
+        let body = body_text(
+            usage_overview(State(state_with_retry_records()))
+                .await
+                .into_response(),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        let p = &v["pipeline"];
+        assert!(
+            !p.is_null(),
+            "overview 必须带 pipeline 字段，否则丢弃计数在面板上仍然不存在：{body}"
+        );
+        let dropped = p["dropped_records"].as_u64().unwrap_or_else(|| {
+            panic!("pipeline.dropped_records 必须是数字：{body}");
+        });
+        assert!(
+            dropped >= before + 9,
+            "出口下发的必须是真计数器（期望 >= {}，实得 {dropped}）：{body}",
+            before + 9
+        );
+        assert!(
+            p["written_records"].is_u64(),
+            "written 必须与 dropped 配对下发，否则丢弃率算不出来（只有分子没有分母）：{body}"
+        );
+        assert!(
+            p["drop_rate"].is_number(),
+            "drop_rate 必须是数字（NaN 会被序列化成 null，前端数值比较会静默当成没问题）：{body}"
+        );
+
+        // 前端类型按 snake_case 写死 —— camelCase 出现即等于前端读不到
+        assert!(!body.contains("droppedRecords"), "出口不得 camelCase：{body}");
+    }
+
+    /// 摊平不得破坏既有契约：加 `pipeline` 的同时 `last_24h` 等必须仍在**顶层**。
+    ///
+    /// `OverviewResponse` 用 `#[serde(flatten)]` 包 `Overview`。若哪天有人去掉 flatten，
+    /// 窗口数据会退到 `windows.last_24h` → 前端图表全空但**没有任何编译错误**。
+    #[tokio::test]
+    async fn overview_keeps_window_fields_at_top_level() {
+        let body = body_text(
+            usage_overview(State(state_with_retry_records()))
+                .await
+                .into_response(),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        for k in ["last_24h", "last_7d", "last_30d", "all_time"] {
+            assert!(
+                !v[k].is_null(),
+                "{k} 必须留在顶层（flatten 被去掉会让前端图表全空且不报错）：{body}"
+            );
+        }
+        assert!(
+            v["windows"].is_null(),
+            "不得出现 windows 包装层（说明 flatten 丢了）：{body}"
+        );
     }
 }

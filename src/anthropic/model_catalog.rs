@@ -822,6 +822,18 @@ pub fn context_window(model: &str) -> i32 {
         .unwrap_or(200_000)
 }
 
+/// 便捷:该模型是否有 Anthropic thinking 语义(`ModelSpec::supports_thinking`)。
+///
+/// **未识别的模型返回 `true`(fail-open)**。这个默认值是刻意选的:唯一消费者
+/// (`openai::convert` 的 thinking 门)用它决定「要不要下发 `thinking` 字段 +
+/// 要不要吞掉 temperature/top_p」。若未识别模型 fail-close 成 false,则任何目录外的
+/// Anthropic 兼容模型名(custom_api 自定义上游常见)都会突然开始透传 temperature,
+/// 而它可能真是 thinking 模型 ⇒ 上游 400。fail-open 保持与本函数引入前**逐字节相同**的行为
+/// (引入前该门根本不查模型,恒等于「所有模型都支持」),故只有目录里显式写 false 的模型行为改变。
+pub fn supports_thinking(model: &str) -> bool {
+    resolve(model).map(|r| r.spec.supports_thinking).unwrap_or(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

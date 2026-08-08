@@ -116,6 +116,39 @@ pub trait KiroEndpoint: Send + Sync {
         body.to_string()
     }
 
+    /// 该端点使用的 `X-Amz-Target` 头值；不走 X-Amz-Target 路由的端点（如 IDE）返回 `None`。
+    ///
+    /// 与 [`Self::bucket_id`] 配套：同 host 同 target 才算同一个上游限流桶。
+    fn amz_target(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// 该端点此请求**实际命中**的上游限流桶标识。
+    ///
+    /// 🔴 deepseek review 修复：provider 的 `endpoint_buckets` 目前以 `(credential_id,
+    /// endpoint_name)` 为 key —— 这对「非 us-east-1 的 codewhisperer 与 cli 同构」不成立：
+    /// 两者 host 都回退 `q.{region}.amazonaws.com`、`X-Amz-Target` 也相同，是**同一个**上游
+    /// 桶，却被按两个桶记。后果：codewhisperer 桶被 429 封后 `select_endpoint` 换到 cli 桶，
+    /// 打回同一个上游 host，又 429 → 两个"桶"都被封但被当成两个独立桶，`has_unthrottled_endpoint`
+    /// 误判"还有可用桶"而持续轰炸。另外 key 缺 region 维度，同一凭据跨区会被错误合并。
+    ///
+    /// 本方法返回的标识由**解析后的 host（含 region）+ X-Amz-Target** 共同界定：
+    /// - codewhisperer 非 us-east-1 回退 q.* → 与 cli 同桶（同构端点去重）；✓
+    /// - codewhisperer us-east-1 走 codewhisperer.* → 与 cli 分桶；✓
+    /// - cli 的 us-east-1 与 eu-central-1 → 不同 host → 分桶（region 维度天然在 host 里）；✓
+    /// - amazonq 同 q.* host 但 target 是 `SendMessage` → 与 cli 分桶（不同操作）。✓
+    ///
+    /// **provider 侧配合**：`endpoint_buckets` 的 key 应改为 `(credential_id, bucket_id)`，
+    /// 即把 `name.to_string()` 换成 `endpoint.bucket_id(ctx)`。`select_endpoint` 处暂无完整
+    /// `RequestContext`（缺 token/machine_id），需在 429 封桶写入点（provider.rs 两处
+    /// `endpoint_buckets.lock().insert`）按当时持有的 ctx 计算，并把 select 侧读取键同步。
+    fn bucket_id(&self, ctx: &RequestContext<'_>) -> String {
+        match self.amz_target() {
+            Some(t) => format!("{}|{}", self.api_url(ctx), t),
+            None => self.api_url(ctx),
+        }
+    }
+
     /// 判断响应体是否表示"月度配额用尽"（禁用凭据并转移）
     fn is_monthly_request_limit(&self, body: &str) -> bool {
         default_is_monthly_request_limit(body)
@@ -124,6 +157,13 @@ pub trait KiroEndpoint: Send + Sync {
     /// 判断响应体是否表示"上游 bearer token 失效"（触发强制刷新）
     fn is_bearer_token_invalid(&self, body: &str) -> bool {
         default_is_bearer_token_invalid(body)
+    }
+
+    /// 判断响应体是否表示「订阅不覆盖本应用/模型」——永久条件，换区与重试都无效。
+    ///
+    /// 判据与理由见 [`default_is_subscription_unsupported`]。
+    fn is_subscription_unsupported(&self, body: &str) -> bool {
+        default_is_subscription_unsupported(body)
     }
 
     /// 判断响应体是否表示"账户被暂停/封禁"（直接禁用，不自动恢复）
@@ -273,6 +313,38 @@ pub fn default_is_monthly_request_limit(body: &str) -> bool {
 /// 默认的 bearer token 失效判断逻辑
 pub fn default_is_bearer_token_invalid(body: &str) -> bool {
     body.contains("The bearer token included in the request is invalid")
+}
+
+/// 订阅不覆盖本应用/模型 —— **永久条件，换区与重试都无效**。
+///
+/// # 为什么需要单独一条判据（2026-08-07 实测定案）
+///
+/// 同一把 `ksk_` key 打两个区的数据面，403 的**文案完全不同**：
+///
+/// ```text
+/// q.us-east-1     403 "The bearer token included in the request is invalid."
+/// q.eu-central-1  403 "Your subscription does not support this application. ..."
+/// ```
+///
+/// 前者是「该区未授权」，已有 [`default_is_bearer_token_invalid`] 认它，并由
+/// `provider.rs` 的 L1 换区自纠正接住 —— 那条路径是对的。
+///
+/// 后者在本判据加入之前**全仓零命中**，于是落进通用 403 处置。两个后果都是实测过的：
+/// ① L1 会尝试**换区重试** —— 而订阅不是按区划分的，换区必然拿到同一个 403，
+///    白烧一次上游往返（同一把 key 在两个区分别验证过：换区不改变这个错误）；
+/// ② 它是**永久**条件，却被当成可重试的失败，于是吃掉重试预算
+///    （`ABSOLUTE_MAX_TOTAL_RETRIES` 与吸收轮次），对一个注定失败的请求反复打上游。
+///
+/// 判据只认 `subscription does not support`（大小写不敏感），刻意不认裸的
+/// `subscription` —— 那个词在额度/计费类文案里也出现，会误伤。
+///
+/// ⚠️ 位置承重：调用方必须把它排在 [`default_is_bearer_token_invalid`] 之后。
+/// 两者是**互斥的两种 403**，但只有本条是「换区也没用」；顺序颠倒不会误判
+/// （文案不重叠），排在后面是为了让「该区未授权」这个更常见的分支先命中、
+/// 保持既有 L1 行为一字不变。
+pub fn default_is_subscription_unsupported(body: &str) -> bool {
+    body.to_ascii_lowercase()
+        .contains("subscription does not support")
 }
 
 /// 默认的账户暂停/封禁判断逻辑
@@ -491,6 +563,77 @@ pub fn default_extract_retry_after_secs(body: &str) -> Option<u64> {
 }
 
 #[cfg(test)]
+mod subscription_unsupported_tests {
+    use super::*;
+
+    /// 2026-08-07 实测原文：同一把 `ksk_` key 打 `q.eu-central-1` 的数据面所得。
+    /// 该区**已授权**（同一把 key 在 `management.eu-central-1` 拿 200，
+    /// 在 `management.us-east-1` 拿 403 `Invalid token`），所以这个 403 不是区的问题。
+    const REAL_SUBSCRIPTION_BODY: &str = r#"{"__type":"com.amazon.aws.codewhisperer#AccessDeniedException","message":"Your subscription does not support this application. Please contact your administrator."}"#;
+
+    /// 同一把 key 打 `q.us-east-1`（**未授权区**）所得 —— 对照组。
+    const REAL_WRONG_REGION_BODY: &str = r#"{"__type":"com.amazon.kiro.runtimeservice#AccessDeniedException","message":"The bearer token included in the request is invalid."}"#;
+
+    /// ⭐ 承重：订阅文案必须被识别。
+    ///
+    /// 回退即 FAIL：删掉 [`default_is_subscription_unsupported`] 或改窄它的判据 ——
+    /// 本条变红。该文案在本判据加入前**全仓零命中**，于是落进通用 403 处置：
+    /// 既被 L1 拿去换区（订阅不按区划分，换了还是同一个错），又吃掉重试预算
+    /// （永久条件被当成可重试）。
+    #[test]
+    fn real_subscription_body_is_recognized() {
+        assert!(
+            default_is_subscription_unsupported(REAL_SUBSCRIPTION_BODY),
+            "上游订阅不支持的实测文案必须被识别，否则永久失败会被当成可重试"
+        );
+    }
+
+    /// ⭐ 承重：两种 403 必须**互斥**，绝不能互相误判。
+    ///
+    /// 这是本改动最容易出错的地方：若订阅判据把「该区未授权」也吃进去，
+    /// L1 换区自纠正就再也不会触发 —— 而那条路径有实测支撑
+    /// （4 个号累计 3393 次成功、42 次瞬态 403），破坏它比不加本判据更糟。
+    #[test]
+    fn two_403_kinds_never_cross_match() {
+        assert!(
+            !default_is_subscription_unsupported(REAL_WRONG_REGION_BODY),
+            "「该区未授权」绝不能被判成订阅问题——否则 L1 换区自纠正被架空"
+        );
+        assert!(
+            !default_is_bearer_token_invalid(REAL_SUBSCRIPTION_BODY),
+            "订阅问题绝不能被判成 token 失效——否则会去换区，而换区对订阅无效"
+        );
+    }
+
+    /// ⭐ OVER-REACH CONTROL：判据不得宽到认裸 `subscription`。
+    ///
+    /// 把实现改成 `lower.contains("subscription")` —— 本条必须 FAIL。
+    /// 若它仍绿，说明判据已经宽到会误伤额度/计费类文案，那类是**可重试**的，
+    /// 被误判成永久终止会让本该成功的请求直接失败。
+    #[test]
+    fn must_not_match_bare_subscription_word() {
+        for benign in [
+            r#"{"message":"Your subscription quota has been exceeded, please try again later."}"#,
+            r#"{"message":"subscription renewal pending"}"#,
+            r#"{"message":"Free tier subscription limit reached"}"#,
+        ] {
+            assert!(
+                !default_is_subscription_unsupported(benign),
+                "判据过宽：裸 subscription 文案被误判成永久不支持: {benign}"
+            );
+        }
+    }
+
+    /// 大小写不敏感（上游文案大小写实测不稳定）。
+    #[test]
+    fn is_case_insensitive() {
+        assert!(default_is_subscription_unsupported(
+            "YOUR SUBSCRIPTION DOES NOT SUPPORT THIS APPLICATION"
+        ));
+    }
+}
+
+#[cfg(test)]
 mod capacity_signature_tests {
     use super::*;
 
@@ -674,6 +817,125 @@ mod registry_tests {
             build(ide::IDE_ENDPOINT_NAME).unwrap().content_type(),
             "application/json"
         );
+    }
+}
+
+/// 端点桶标识（deepseek review 修复）守卫。
+#[cfg(test)]
+mod bucket_identity_tests {
+    use super::*;
+    use crate::kiro::model::credentials::KiroCredentials;
+    use crate::model::config::Config;
+
+    fn ctx_from<'a>(cred: &'a KiroCredentials, config: &'a Config) -> RequestContext<'a> {
+        RequestContext {
+            credentials: cred,
+            token: "ksk_test",
+            machine_id: "mid",
+            config,
+            is_1m: false,
+        }
+    }
+
+    fn ksk_cred(region: &str) -> KiroCredentials {
+        let mut cred = KiroCredentials::default();
+        cred.kiro_api_key = Some("ksk_test".to_string());
+        cred.region = Some(region.to_string());
+        cred
+    }
+
+    fn bucket(name: &str, ctx: &RequestContext<'_>) -> String {
+        build(name).expect("已知端点").bucket_id(ctx)
+    }
+
+    /// ⭐ 承重：非 us-east-1 的 codewhisperer 与 cli **同构**（host 回退 q.*、AMZ_TARGET 相同），
+    /// 必须是**同一个**上游限流桶。若 provider 用 (id, name) 当 key 会把它们记成两个桶 ——
+    /// 这正是 deepseek review 指出的缺陷：codewhisperer 桶被 429 封后换到 cli 桶，打回同一个
+    /// 上游 host 又 429，两个"桶"都被封却被当成独立桶而持续轰炸。
+    #[test]
+    fn non_us_east_1_codewhisperer_is_same_bucket_as_cli() {
+        let cred = ksk_cred("eu-central-1");
+        let config = Config::default();
+        let ctx = ctx_from(&cred, &config);
+        assert_eq!(
+            bucket(cli::CLI_ENDPOINT_NAME, &ctx),
+            bucket(codewhisperer::CODEWHISPERER_ENDPOINT_NAME, &ctx),
+            "非 us-east-1 的 codewhisperer 回退 q.* 且 target 相同，必须与 cli 同桶"
+        );
+    }
+
+    /// 桶标识必须含 region 维度：cli 的 us-east-1 与 eu-central-1 是不同 host = 不同桶。
+    /// 旧 key `(id, endpoint_name)` 缺 region，同一凭据跨区会被错误合并（一区被封全区封）。
+    #[test]
+    fn same_endpoint_different_regions_are_different_buckets() {
+        let cred_eu = ksk_cred("eu-central-1");
+        let cred_use = ksk_cred("us-east-1");
+        let config = Config::default();
+        let ctx_eu = ctx_from(&cred_eu, &config);
+        let ctx_use = ctx_from(&cred_use, &config);
+        assert_ne!(
+            bucket(cli::CLI_ENDPOINT_NAME, &ctx_eu),
+            bucket(cli::CLI_ENDPOINT_NAME, &ctx_use),
+            "不同 region 的 host 不同，必须是不同桶"
+        );
+    }
+
+    /// us-east-1 的 codewhisperer 走独占主机 codewhisperer.*，与 cli 的 q.* 分桶。
+    #[test]
+    fn us_east_1_codewhisperer_is_separate_bucket_from_cli() {
+        let cred = ksk_cred("us-east-1");
+        let config = Config::default();
+        let ctx = ctx_from(&cred, &config);
+        assert_ne!(
+            bucket(cli::CLI_ENDPOINT_NAME, &ctx),
+            bucket(codewhisperer::CODEWHISPERER_ENDPOINT_NAME, &ctx),
+            "us-east-1 codewhisperer 走 codewhisperer.*，必须与 cli 分桶"
+        );
+    }
+
+    /// cli-runtime（runtime.*）与 cli（q.*）不同 host，分桶（既有 429 换桶机制的基础）。
+    #[test]
+    fn cli_runtime_is_separate_bucket_from_cli() {
+        let cred = ksk_cred("us-east-1");
+        let config = Config::default();
+        let ctx = ctx_from(&cred, &config);
+        assert_ne!(
+            bucket(cli::CLI_ENDPOINT_NAME, &ctx),
+            bucket(cli_runtime::CLI_RUNTIME_ENDPOINT_NAME, &ctx),
+            "runtime.* 与 q.* 是不同上游桶"
+        );
+    }
+
+    /// amazonq 与 cli 同 host（q.*）但 target 是 SendMessage —— 不同操作 = 不同桶。
+    /// 桶标识必须含 target，否则 amazonq 会与 cli 被错误合并。
+    #[test]
+    fn amazonq_is_separate_bucket_from_cli_by_target() {
+        let cred = ksk_cred("us-east-1");
+        let config = Config::default();
+        let ctx = ctx_from(&cred, &config);
+        assert_ne!(
+            bucket(cli::CLI_ENDPOINT_NAME, &ctx),
+            bucket(amazonq::AMAZONQ_ENDPOINT_NAME, &ctx),
+            "同 host 但 target 不同（SendMessage vs GenerateAssistantResponse），必须分桶"
+        );
+    }
+
+    /// 四个 CLI 协议端点都必须自报 X-Amz-Target（否则默认 bucket_id 会丢 target 维度，
+    /// 把 amazonq 与 cli 错误合并）；IDE 走 URL 路径寻址，target 为 None。
+    #[test]
+    fn cli_family_endpoints_expose_amz_target() {
+        for name in [
+            cli::CLI_ENDPOINT_NAME,
+            cli_runtime::CLI_RUNTIME_ENDPOINT_NAME,
+            codewhisperer::CODEWHISPERER_ENDPOINT_NAME,
+            amazonq::AMAZONQ_ENDPOINT_NAME,
+        ] {
+            assert!(
+                build(name).unwrap().amz_target().is_some(),
+                "端点 {name} 必须自报 X-Amz-Target（否则桶标识丢失 target 维度）"
+            );
+        }
+        assert_eq!(build(ide::IDE_ENDPOINT_NAME).unwrap().amz_target(), None);
     }
 }
 

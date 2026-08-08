@@ -18,6 +18,11 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+/// 单事件缓冲上限：上游发**无空行**的长流时，`buf` 会在找不到事件分隔符的情况下
+/// 无限增长、且流结束前一个字节都不下发（客户端卡死）。超限即视为不可解析的垃圾流，
+/// fail-open 整块透传并清空（对齐历史 #14 的孤立 `<` 教训 —— 缓冲必须有界）。
+const MAX_EVENT_BUFFER_BYTES: usize = 1 * 1024 * 1024;
+
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 
@@ -237,9 +242,6 @@ struct SseFilterState {
     in_inline_thinking: bool,
     /// 滤掉的 thinking 文本累计**字符数**（估算 token = 字符数 / 4）。
     thinking_chars: u64,
-    /// 已在 message_delta 扣减过的字符数。⚠️ 防重复扣减：上游可能发多个 message_delta
-    ///（增量 usage），同一份 thinking 不能扣 N 次。
-    deducted_chars: u64,
 }
 
 impl SseFilterState {
@@ -253,7 +255,6 @@ impl SseFilterState {
             strip_inline_thinking,
             in_inline_thinking: false,
             thinking_chars: 0,
-            deducted_chars: 0,
         }
     }
 
@@ -270,6 +271,12 @@ impl SseFilterState {
                 event.extend_from_slice(&sep_bytes);
                 self.pending.push(Bytes::from(event));
             }
+        }
+        // ⚠️ 上限防护：while 循环结束后 buf 仍超限 ⇒ 无空行的长流（找不到分隔符）。
+        // 无界增长 + 流结束前零下发 = 客户端卡死。fail-open 整块透传并清空。
+        if self.buf.len() > MAX_EVENT_BUFFER_BYTES {
+            let overflow = std::mem::take(&mut self.buf);
+            self.pending.push(Bytes::from(overflow));
         }
     }
 
@@ -341,10 +348,16 @@ impl SseFilterState {
                     return None;
                 }
                 // 保留块：分配连续新 index，重写 data。
+                // ⚠️ 上游 data 可能是非 object 顶层（`[1,2]`/`"x"`/`5`）——裸 `v["index"] =`
+                // 在 serde_json 里对非 Object 直接 panic（连接任务死、客户端拿到截断 200）。
+                // 用 `as_object_mut` 守卫，非 object 走 fail-open 原样透传。
                 let new_idx = self.next_index;
                 self.next_index += 1;
                 self.index_map.insert(old_idx, new_idx);
-                v["index"] = serde_json::json!(new_idx);
+                let Some(o) = v.as_object_mut() else {
+                    return Some(block.to_vec());
+                };
+                o.insert("index".to_string(), serde_json::json!(new_idx));
                 Some(Self::rewrite_event(event_type, &v))
             }
             "content_block_delta" => {
@@ -389,21 +402,20 @@ impl SseFilterState {
             }
             "message_delta" => {
                 // 滤掉 thinking 后，usage.output_tokens 仍含 thinking token → 扣减估算值
-                //（字符数/4，Claude Code 约 4 字符/token），对齐主路径「剥离的 thinking 不计入
-                // output_tokens」口径。message_start 的 usage 不动（record 口径绑定）。
+                //（字符数/4，Claude Code 约 4 字符/token）。message_start 的 usage 不动
+                //（record 口径绑定）。
                 //
-                // ⚠️ 用 `thinking_chars - deducted_chars` 只扣**尚未扣过的**部分：上游可能发
-                // 多个 message_delta（增量/累计 usage），同一份 thinking 字符不能扣 N 次。
-                // `deducted_chars` 只在**真扣减后**前移：若本 delta 无 usage 或缺 output_tokens
-                //（有些上游 message_delta 只有 stop_reason），跳过但**不**前移，留给后续有
-                // usage 的 delta 扣。
-                if self.thinking_chars > self.deducted_chars {
+                // ⚠️ **累计口径**：Anthropic 的 message_delta.usage.output_tokens 是**累计值**
+                //（每条都是"到该点为止的总输出"，客户端读最后一条）。每条都含被滤掉的
+                // thinking token ⇒ **每个 message_delta 都扣同一份**估算值（不是只扣第一条）。
+                // 旧 `deducted_chars` 防重复逻辑假设"增量 usage"——累计口径下客户端读最后
+                // 一条会丢扣减（最后一条没扣）。
+                if self.thinking_chars > 0 {
                     if let Some(usage) = v.get_mut("usage").and_then(|u| u.as_object_mut()) {
                         if let Some(out) = usage.get("output_tokens").and_then(|x| x.as_u64()) {
-                            let deduct = ((self.thinking_chars - self.deducted_chars) / 4) as u64;
+                            let deduct = (self.thinking_chars / 4) as u64;
                             usage["output_tokens"] =
                                 serde_json::json!(out.saturating_sub(deduct));
-                            self.deducted_chars = self.thinking_chars;
                         }
                     }
                 }
@@ -430,7 +442,11 @@ impl SseFilterState {
     ) -> Option<Vec<u8>> {
         match self.index_map.get(&old_idx) {
             Some(&new_idx) => {
-                v["index"] = serde_json::json!(new_idx);
+                // ⚠️ 同 L347：非 object 顶层 data 不可裸索引赋值（serde_json panic）。
+                let Some(o) = v.as_object_mut() else {
+                    return Some(block.to_vec());
+                };
+                o.insert("index".to_string(), serde_json::json!(new_idx));
                 Some(Self::rewrite_event(event_type, v))
             }
             None => Some(block.to_vec()), // 未映射（理论不该发生），fail-open 原样
@@ -477,10 +493,17 @@ fn strip_inline_thinking(text: &str, in_thinking: &mut bool) -> String {
 }
 
 /// 在 buf 中找事件分隔符（`\n\n` 或 `\r\n\r\n`）的**起始**位置；找不到返 None。
+///
+/// ⚠️ 取两者的 **min**：旧实现 `\n\n` 全 buf 首命中、`or_else` 仅无 `\n\n` 才试 `\r\n\r\n`，
+/// 混合行尾流（先出现 `\r\n\r\n`、后面 data 里含 `\n\n`）会切在后面的 `\n\n` 处把事件
+/// 拦腰截断粘连（两组 event 拼一起 → 解析失败 → fail-open 整块透传 → thinking 泄漏）。
 fn find_event_separator(buf: &[u8]) -> Option<usize> {
-    buf.windows(2)
-        .position(|w| w == b"\n\n")
-        .or_else(|| buf.windows(4).position(|w| w == b"\r\n\r\n"))
+    let lf = buf.windows(2).position(|w| w == b"\n\n");
+    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n");
+    match (lf, crlf) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
 }
 
 /// 把事件分隔符从 buf 里取出来（含完整空行，供输出时保留）。
@@ -565,6 +588,55 @@ mod tests {
         assert!(
             indices.iter().all(|&i| i == 0),
             "滤掉 thinking(0) 后所有保留块 index 应重编号为 0，实际 {indices:?}"
+        );
+    }
+
+    /// 🔴 回归：上游发非 object 顶层 data（数组/字符串/数字）时**不得 panic**，
+    /// fail-open 原样透传（旧代码裸 `v["index"] =` 在 serde_json 对非 Object 直接 panic）。
+    #[tokio::test]
+    async fn test_filter_sse_stream_non_object_top_level_data_no_panic() {
+        let input = format!(
+            "{}{}",
+            event("message_start", r#"{"type":"message_start"}"#),
+            // content_block_start + 数组 data（畸形但合法 JSON）
+            event("content_block_start", "[1, 2, 3]"),
+        );
+        let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(input))]);
+        let filtered = collect_filtered(filter_sse_stream(stream)).await;
+        // 不 panic 且 fail-open 透传（数组块原样出现，而非被静默吞掉）
+        assert!(
+            filtered.contains("[1, 2, 3]"),
+            "非 object data 必须 fail-open 透传而非 panic，实际: {filtered}"
+        );
+    }
+
+    /// 混合行尾：`\r\n\r\n` 在前、`\n\n` 在后时，分隔符取 **min**（切在前者），
+    /// 不粘连事件。旧实现 `\n\n` 首命中会切到后面、把两组 event 拼一起。
+    #[test]
+    fn test_find_event_separator_mixed_line_endings_takes_min() {
+        // E1 用 CRLF 分隔，后面 data 里含 \n\n
+        let buf = b"event: a\r\ndata: {\"x\":1}\r\n\r\nevent: b\ndata: {\"y\":2}\n\n";
+        let sep = find_event_separator(buf).unwrap();
+        // 首个 \r\n\r\n 的位置（=CRLF 事件的结束），应取它而不是后面的 \n\n
+        let crlf_pos = buf
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .unwrap();
+        assert_eq!(sep, crlf_pos, "混合行尾应取先出现的分隔符（min），实际切到 {sep}");
+    }
+
+    /// 🔴 回归：无空行的超长流触发 buf 上限 → fail-open 整块透传，不无界增长/卡死。
+    #[tokio::test]
+    async fn test_filter_sse_stream_buf_cap_fails_open() {
+        // 构造一个超过 MAX_EVENT_BUFFER_BYTES 且不含事件分隔符的大块
+        let big = vec![b'a'; MAX_EVENT_BUFFER_BYTES + 10];
+        let stream =
+            futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(big.clone()))]);
+        let filtered = collect_filtered(filter_sse_stream(stream)).await;
+        assert_eq!(
+            filtered.len(),
+            big.len(),
+            "超限 buf 应 fail-open 整块透传（长度不变），而非静默丢弃"
         );
     }
 
@@ -794,20 +866,20 @@ mod tests {
         );
         let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(input))]);
         let filtered = collect_filtered(filter_sse_stream(stream)).await;
-        // 递增累计（300→500）：第一条扣 10 → 290；第二条已扣过（deducted_chars=40）不再扣 → 500。
-        // 客户端读最后一条 500（未重复扣）。若旧代码重复扣，第二条会成 490 → 断言 500 能区分。
+        // 🔴 累计口径：output_tokens 是累计值、客户端读最后一条，**每条都扣同一份** thinking
+        //（10 token）。第一条 300-10=290；第二条 500-10=490。旧 deducted_chars 逻辑只扣
+        // 第一条 → 客户端读最后一条 500（未扣），扣减丢失。
         assert!(
             filtered.contains("\"output_tokens\":290"),
             "第一条 delta 应扣 10（300-10=290），实际: {filtered}"
         );
         assert!(
-            filtered.contains("\"output_tokens\":500"),
-            "第二条 delta 不应重复扣（500 保持），旧代码会重复扣成 490，实际: {filtered}"
+            filtered.contains("\"output_tokens\":490"),
+            "累计口径下第二条 delta 也要扣 10（500-10=490），旧逻辑会保持 500 丢扣减，实际: {filtered}"
         );
     }
 
-    /// 🔴 回归：无 usage 的 message_delta 不触发扣减，也不前移 deducted_chars——
-    /// 后续有 usage 的 delta 仍能扣。
+    /// 🔴 回归：无 usage 的 message_delta 不触发扣减；后续有 usage 的 delta 仍能扣。
     #[tokio::test]
     async fn test_filter_sse_stream_deducts_on_delta_with_usage_only() {
         let input = format!(

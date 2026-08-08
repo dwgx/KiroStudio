@@ -906,6 +906,19 @@ impl KiroCredentials {
     /// IdC(AWS SSO)/social(Google)/api_key **没有 M365 租户身份、限速模型不同（坚强、独立）**，
     /// 各自 `cred:{id}` 独立成族——M365 的族连坐永不波及它们（键无 `m365:`/`aws:` 前缀），
     /// 雪崩时作坚强兜底号。`id` 传入调用方（entry）的不可变 id。
+    ///
+    /// ## api_key 多开分身的例外：同 `clone_group` 收族（2026-08-07 线上实测）
+    ///
+    /// 上游 403 `Your User ID (NNN) temporarily is suspended` 的 User ID 与 cred id 实测
+    /// **N:1**（UID 079998937591 → cred 1294..1299）⇒ 上游按**账号**记账，不按设备指纹。
+    /// 而多开分身（同 `clone_group`）定义上就是同一把 key ⇒ 同一个上游账号。若 N 份各自
+    /// 独立成族，一次账户级 suspend 要白挨 6×N 次上游 403（线上 N=17 ⇒ 102 次/轮），
+    /// 而 `token_manager.rs` 的全池自愈会把整批复活再来一轮，持续撞同一面墙。
+    /// 故同 `clone_group` 收敛成 `clone:{group}` 一族；`report_suspicious_activity` /
+    /// `report_success` 也按族累加/清零（计数与清零同口径，见 token_manager.rs 函数文档）。
+    ///
+    /// ⚠️ 只在 `clone_group` 非空时收族：无 group 的 `ksk_` 号必须**仍各自独立**，
+    /// 否则整池 api_key 号会并成一族 → 一号被风控全池连坐，比不收族更糟。
     pub fn family_key(&self, id: u64) -> String {
         if self.is_external_idp_credential() {
             // ① issuer_url: https://login.microsoftonline.com/{tenant}/v2.0 → m365:{tenant}
@@ -930,7 +943,16 @@ impl KiroCredentials {
                 }
             }
         }
-        // ③ 非 M365（IdC/social/api_key）或解析失败：各自独立成族
+        // ③ api_key 多开分身：同一个 `clone_group` 定义上就是同一把 key ⇒ 同一个上游账号
+        // （实测依据见函数文档）。同族收敛成 `clone:{group}`，风控计数/禁用按族统一处置，
+        // 不再每份各自数满 6 次。
+        if self.is_api_key_credential()
+            && let Some(group) = self.clone_group.as_deref().map(str::trim)
+            && !group.is_empty()
+        {
+            return format!("clone:{group}");
+        }
+        // ④ 非 M365、非多开分身，或解析失败：各自独立成族
         format!("cred:{id}")
     }
 

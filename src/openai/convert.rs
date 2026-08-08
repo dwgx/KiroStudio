@@ -44,6 +44,85 @@ fn clamp_anthropic_temperature(t: f64) -> f64 {
     t.clamp(0.0, 1.0)
 }
 
+/// 进程内「同一 key 只记一次」闸门:首次见到返回 true(调用方该记日志),之后恒 false。
+///
+/// 为什么需要:本模块几条可观测性日志都在**每请求热路径**上(未识别 tool type、未识别 input
+/// item type、模型不支持 thinking)。线上实测 20 分钟 1214 请求,若逐请求记一行,单个异常形状
+/// 就能把面板读的内存日志 ring 刷爆,反而**盖掉**它本该暴露的信息。而这几条日志的用途是
+/// **拿样本**(「Codex 到底发了什么形状」),样本只需要一份。
+///
+/// key 由调用方自带类别前缀(如 `tool_type:foo`),避免不同类别撞名互相吞掉。
+/// 有界性:key 空间 = 上游可能发出的 type 名集合(有限且极小),不做淘汰。
+fn log_once(key: String) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    // 锁中毒(某测试线程 panic)不该让可观测性连带失效 → 取回内层集合继续用。
+    let mut guard = seen.lock().unwrap_or_else(|e| e.into_inner());
+    guard.insert(key)
+}
+
+/// 一次 reasoning/effort 请求在 Anthropic 侧的落地方案。两条协议入口(chat/completions 与
+/// responses)**共用**本判据,不各自判。
+struct ThinkingPlan {
+    /// 要写进 Anthropic body 的 `thinking` 字段值;None = 不下发该字段。
+    field: Option<Value>,
+    /// 是否吞掉 temperature/top_p。**只在真的下发 `thinking:{type:enabled}` 时为 true。**
+    suppress_sampling: bool,
+}
+
+/// 把客户端的 reasoning effort + 目标模型能力,算成 Anthropic 侧的 thinking 落地方案。
+///
+/// 这是 chat/completions 与 responses 两条入口的**唯一** thinking 判据(源码守卫测试
+/// `both_openai_entries_use_shared_thinking_predicate` 钉死两侧都调它、且不得自己查
+/// `supports_thinking`)。抽共享判据的理由是本仓反复出过的事故形态:同一逻辑各写一份、
+/// 只有一侧有守卫(见 `context_input_tokens_from_pct` 那条的收口方式)。
+///
+/// 判据两维:
+/// 1. **请求侧** —— 客户端发的 effort(`none` → 显式关;非空 → 想开;缺失 → 不表态)。
+/// 2. **模型侧** —— `model_catalog::supports_thinking`(此前是**死字段**,零消费者)。
+///
+/// 为什么模型侧是必要的:`thinking` 字段在 custom_api 透传路径上是发给 Anthropic 兼容上游的
+/// **真参数**,而 Anthropic thinking 模式拒绝非默认 temperature/top_p —— 那道吞掉采样参数的门
+/// 就是为它设的。对 `supports_thinking: false` 的模型(GPT 全系、国产系)根本没有这套语义,
+/// 于是旧代码等于**为一个不存在的约束丢掉客户端真实设置的采样参数**,且无任何日志。
+fn plan_thinking(model: &str, effort: Option<&str>) -> ThinkingPlan {
+    let effort = effort.map(|e| e.trim().to_lowercase());
+    let wants_thinking = match effort.as_deref() {
+        None => return ThinkingPlan { field: None, suppress_sampling: false },
+        // 显式 none = 关。对任何模型都直接下发 disabled(与旧行为一致),不吞采样参数。
+        Some("none") => {
+            return ThinkingPlan {
+                field: Some(json!({"type": "disabled"})),
+                suppress_sampling: false,
+            }
+        }
+        Some("") => return ThinkingPlan { field: None, suppress_sampling: false },
+        Some(_) => true,
+    };
+
+    if wants_thinking && !crate::anthropic::model_catalog::supports_thinking(model) {
+        // 静默降级是原缺陷的一半 —— 客户端设的 temperature 生效了但 reasoning 没生效,
+        // 两件事都得能在日志里看到。去重到「每模型一次」:这条只反映模型能力(静态),
+        // 逐请求重复记零信息量。
+        if log_once(format!("reasoning_unsupported:{}", model)) {
+            tracing::info!(
+                model = model,
+                requested_effort = effort.as_deref().unwrap_or(""),
+                "openai→anthropic: 客户端请求了 reasoning,但该模型目录里 supports_thinking=false \
+                 ⇒ 按无 thinking 处理(不下发 thinking 字段),temperature/top_p 照常透传"
+            );
+        }
+        return ThinkingPlan { field: None, suppress_sampling: false };
+    }
+
+    ThinkingPlan {
+        field: Some(json!({"type": "enabled"})),
+        suppress_sampling: true,
+    }
+}
+
 /// 把 OpenAI `response_format` 翻成一段 system 指令(Anthropic 无原生 JSON mode,只能提示引导)。
 ///
 /// - `{"type":"text"}` 或缺失 → None(默认,无需注入)。
@@ -104,22 +183,18 @@ pub fn openai_chat_to_anthropic(model: &str, raw: &Value, stream: bool) -> Value
     out.insert("stream".into(), json!(stream));
 
     // reasoning_effort → thinking(简化:开 enabled;none→disabled)。上游按 modelId 给窗口,budget 非必需。
-    // 先算出 thinking 是否开启,后面决定 temperature/top_p 是否透传(Anthropic thinking 模式只接受
+    // 判据抽到 `plan_thinking` 与 /v1/responses 共用(含模型能力这一维,见该函数文档)。
+    // 后面据 suppress_sampling 决定 temperature/top_p 是否透传(Anthropic thinking 模式只接受
     // temperature=1 且不接受采样参数改写)。
-    let mut thinking_enabled = false;
-    if let Some(effort) = raw.get("reasoning_effort").and_then(|v| v.as_str()) {
-        let e = effort.trim().to_lowercase();
-        if e == "none" {
-            out.insert("thinking".into(), json!({"type": "disabled"}));
-        } else if !e.is_empty() {
-            out.insert("thinking".into(), json!({"type": "enabled"}));
-            thinking_enabled = true;
-        }
+    let thinking = plan_thinking(model, raw.get("reasoning_effort").and_then(|v| v.as_str()));
+    if let Some(field) = thinking.field {
+        out.insert("thinking".into(), field);
     }
 
-    // temperature/top_p:thinking 开启时**都不透传**(Anthropic thinking 模式只接受 temperature=1、
-    // 且不接受非默认 top_p/top_k,透传客户端的值会让 Anthropic 兼容上游/透传路径 400)。thinking 关时正常透传。
-    if !thinking_enabled {
+    // temperature/top_p:真下发 thinking:enabled 时**都不透传**(Anthropic thinking 模式只接受
+    // temperature=1、且不接受非默认 top_p/top_k,透传客户端的值会让 Anthropic 兼容上游/透传路径 400)。
+    // 其余情况(未请求 thinking / 显式 none / 模型不支持 thinking)正常透传。
+    if !thinking.suppress_sampling {
         if let Some(t) = raw.get("temperature").and_then(|v| v.as_f64()) {
             out.insert("temperature".into(), json!(clamp_anthropic_temperature(t)));
         }
@@ -674,23 +749,19 @@ pub fn openai_responses_to_anthropic(model: &str, raw: &Value, stream: bool) -> 
     out.insert("max_tokens".into(), json!(max_tokens));
     out.insert("stream".into(), json!(stream));
 
-    // reasoning.effort → thinking(none→disabled,其余→enabled)。
-    let mut thinking_enabled = false;
-    if let Some(effort) = raw
-        .get("reasoning")
-        .and_then(|r| r.get("effort"))
-        .and_then(|v| v.as_str())
-    {
-        let e = effort.trim().to_lowercase();
-        if e == "none" {
-            out.insert("thinking".into(), json!({"type": "disabled"}));
-        } else if !e.is_empty() {
-            out.insert("thinking".into(), json!({"type": "enabled"}));
-            thinking_enabled = true;
-        }
+    // reasoning.effort → thinking(none→disabled,其余→enabled)。判据与 chat 路径共用
+    // `plan_thinking`(含模型能力这一维:Codex 对 gpt-5 系必发 effort,而 GPT 全系
+    // supports_thinking=false ⇒ 旧代码在此把客户端的 temperature/top_p 静默丢掉)。
+    let thinking = plan_thinking(
+        model,
+        raw.get("reasoning").and_then(|r| r.get("effort")).and_then(|v| v.as_str()),
+    );
+    if let Some(field) = thinking.field {
+        out.insert("thinking".into(), field);
     }
-    // temperature/top_p:同 chat 路径,thinking 开启时都不透传(Anthropic thinking 模式约束),防透传路径 400。
-    if !thinking_enabled {
+    // temperature/top_p:同 chat 路径,仅在真下发 thinking:enabled 时不透传(Anthropic thinking
+    // 模式约束),防透传路径 400。
+    if !thinking.suppress_sampling {
         if let Some(t) = raw.get("temperature").and_then(|v| v.as_f64()) {
             out.insert("temperature".into(), json!(clamp_anthropic_temperature(t)));
         }
@@ -2970,5 +3041,155 @@ mod tests {
         assert_eq!(msg["content"][0]["text"], "Hello");
         assert_eq!(r["usage"]["input_tokens"], 5);
         assert_eq!(r["usage"]["output_tokens"], 2);
+    }
+
+    // ===== D2:supports_thinking 接上后的行为(两条协议入口共用判据) =====
+
+    /// D2 主断言:GPT 模型(`supports_thinking: false`)+ effort ⇒ **不设 thinking**、
+    /// temperature/top_p **照常透传**。
+    ///
+    /// **旧代码为何 FAIL**:旧判据只看请求侧(有 effort 即 `thinking_enabled = true`),
+    /// 于是 `thinking.type == "enabled"` 且 temperature/top_p 被 `if !thinking_enabled` 双双吞掉。
+    /// 两条断言(thinking 不存在 / temperature 存在)在旧代码上都不成立。
+    #[test]
+    fn gpt_model_with_effort_keeps_sampling_params_and_no_thinking() {
+        for model in ["gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra"] {
+            // /v1/chat/completions
+            let raw = json!({
+                "model": model, "messages": [], "reasoning_effort": "high",
+                "temperature": 0.5, "top_p": 0.9
+            });
+            let a = openai_chat_to_anthropic(model, &raw, false);
+            assert!(
+                a.get("thinking").is_none(),
+                "{model} supports_thinking=false,不应下发 thinking 字段,实际 {:?}",
+                a.get("thinking")
+            );
+            assert_eq!(a["temperature"], 0.5, "{model}: temperature 应透传(无 Anthropic thinking 约束)");
+            assert_eq!(a["top_p"], 0.9, "{model}: top_p 应透传");
+
+            // /v1/responses(Codex 走这条,对 gpt-5 系必发 reasoning.effort)
+            let raw_r = json!({
+                "model": model, "input": "x", "reasoning": {"effort": "high"},
+                "temperature": 0.5, "top_p": 0.9
+            });
+            let r = openai_responses_to_anthropic(model, &raw_r, false);
+            assert!(r.get("thinking").is_none(), "{model} responses 路径同样不应下发 thinking");
+            assert_eq!(r["temperature"], 0.5, "{model} responses: temperature 应透传");
+            assert_eq!(r["top_p"], 0.9, "{model} responses: top_p 应透传");
+        }
+    }
+
+    /// D2 回归保护:Claude 侧(`supports_thinking: true`)行为**不得改变** ——
+    /// 仍 `thinking: enabled`、仍吞掉 temperature/top_p。
+    ///
+    /// 这条同时是 **OVER-REACH CONTROL**:若把修复写成"所有模型都判成不支持 thinking",
+    /// 本测试立刻 FAIL(见报告里的突变输出)。
+    #[test]
+    fn claude_model_with_effort_still_enables_thinking_and_drops_sampling() {
+        for model in ["claude-opus-5", "claude-sonnet-5"] {
+            let raw = json!({
+                "model": model, "messages": [], "reasoning_effort": "high",
+                "temperature": 0.5, "top_p": 0.9
+            });
+            let a = openai_chat_to_anthropic(model, &raw, false);
+            assert_eq!(a["thinking"]["type"], "enabled", "{model} 应开 thinking");
+            assert!(a.get("temperature").is_none(), "{model}: thinking 开时不应透传 temperature");
+            assert!(a.get("top_p").is_none(), "{model}: thinking 开时不应透传 top_p");
+
+            let raw_r = json!({
+                "model": model, "input": "x", "reasoning": {"effort": "high"},
+                "temperature": 0.5, "top_p": 0.9
+            });
+            let r = openai_responses_to_anthropic(model, &raw_r, false);
+            assert_eq!(r["thinking"]["type"], "enabled", "{model} responses 应开 thinking");
+            assert!(r.get("temperature").is_none(), "{model} responses: 不应透传 temperature");
+        }
+    }
+
+    /// D2 反向测试(OVER-REACH CONTROL):**不发** reasoning/effort 的请求,
+    /// thinking 与 temperature 行为完全不变 —— 无 thinking 字段、采样参数照常透传。
+    ///
+    /// 若把修复写成"无条件不下发 thinking"或"无条件吞采样参数",这条 + 上一条组成的对照组
+    /// 至少有一条会 FAIL。
+    #[test]
+    fn no_effort_request_behaviour_unchanged_for_both_families() {
+        for model in ["gpt-5.6-sol", "claude-opus-5"] {
+            let raw = json!({"model": model, "messages": [], "temperature": 0.7, "top_p": 0.3});
+            let a = openai_chat_to_anthropic(model, &raw, false);
+            assert!(a.get("thinking").is_none(), "{model}: 未请求 reasoning 时不应有 thinking");
+            assert_eq!(a["temperature"], 0.7, "{model}: 未请求 reasoning 时 temperature 照常透传");
+            assert_eq!(a["top_p"], 0.3, "{model}: 未请求 reasoning 时 top_p 照常透传");
+        }
+    }
+
+    /// `effort: "none"` = 客户端显式关 thinking。对两族都下发 `disabled` 且不吞采样参数
+    /// (与修复前逐字节相同,这条是保护"none 分支没被顺手改掉")。
+    #[test]
+    fn effort_none_disables_thinking_for_both_families() {
+        for model in ["gpt-5.6-sol", "claude-opus-5"] {
+            let raw = json!({"model": model, "messages": [], "reasoning_effort": "none", "temperature": 0.4});
+            let a = openai_chat_to_anthropic(model, &raw, false);
+            assert_eq!(a["thinking"]["type"], "disabled", "{model}: none 应显式 disabled");
+            assert_eq!(a["temperature"], 0.4, "{model}: none 时 temperature 照常透传");
+        }
+    }
+
+    /// 未识别模型 **fail-open 成"支持 thinking"** —— 保持本改动引入前的行为逐字节不变。
+    /// (目录外的 Anthropic 兼容模型名可能真是 thinking 模型,fail-close 会让它 400。)
+    #[test]
+    fn unknown_model_fails_open_to_thinking_supported() {
+        let raw = json!({"model": "some-unlisted-model", "messages": [], "reasoning_effort": "high", "temperature": 0.5});
+        let a = openai_chat_to_anthropic("some-unlisted-model", &raw, false);
+        assert_eq!(a["thinking"]["type"], "enabled", "未识别模型应 fail-open 开 thinking");
+        assert!(a.get("temperature").is_none(), "fail-open 时维持旧行为:吞掉 temperature");
+    }
+
+    /// D2 源码守卫:两条协议入口**必须**调共享判据 `plan_thinking`,且**不得**自己查
+    /// `supports_thinking` / 自己维护 `thinking_enabled` 布尔。
+    ///
+    /// 为什么要这条:本仓 `context_input_tokens_from_pct` 出过同型事故 —— 流式与非流式各写一份、
+    /// 只有一侧有守卫。这里两条入口逻辑几乎相同,极易被将来某次改动只改一侧。
+    ///
+    /// 抗脆性:按**符号名**匹配,不含空白/换行/行号(本仓有守卫因 rustfmt 换行而误报的先例);
+    /// needle 运行时拼接,避免 `include_str!` 把本测试自己的字面量算进匹配。
+    #[test]
+    fn both_openai_entries_use_shared_thinking_predicate() {
+        let src = include_str!("convert.rs");
+        // 只取两个入口函数体之间的区域,排除本测试模块自身。
+        let body_start = src.find("pub fn openai_chat_to_anthropic").expect("找不到 chat 入口符号");
+        let tests_start = src.find("mod tests").unwrap_or(src.len());
+        let impl_region = &src[body_start..tests_start];
+
+        let call = format!("plan_thinking{}", "(");
+        assert_eq!(
+            impl_region.matches(&call).count(),
+            2,
+            "两条协议入口(openai_chat_to_anthropic / openai_responses_to_anthropic)必须各调一次\
+             共享判据 `plan_thinking`。当前命中 {} 次 —— 若为 1,说明有一侧自己判了 thinking,\
+             那正是 `context_input_tokens_from_pct` 出过事故的形态。",
+            impl_region.matches(&call).count()
+        );
+
+        // 两个入口都不得绕过判据直接查目录能力。
+        let direct = format!("supports_thinking{}", "(");
+        assert!(
+            !impl_region.contains(&direct),
+            "入口函数不得直接调 model_catalog::supports_thinking —— 模型能力判定只能经 `plan_thinking`,\
+             否则两侧判据会再次分叉。"
+        );
+    }
+
+    /// `log_once`:同一 key 只放行首次,之后恒 false(去重语义本身)。
+    ///
+    /// key 带本测试专属前缀,避免与其它测试/其它日志点共享进程内全局集合而产生顺序依赖。
+    #[test]
+    fn log_once_admits_first_occurrence_only() {
+        let k = format!("unit_test_dedup:{}", random_hex(16));
+        assert!(log_once(k.clone()), "首次出现应放行");
+        assert!(!log_once(k.clone()), "同一 key 第二次应被去重");
+        assert!(!log_once(k), "第三次仍应被去重");
+        // 不同 key 互不影响。
+        assert!(log_once(format!("unit_test_dedup:{}", random_hex(16))), "不同 key 应各自放行一次");
     }
 }

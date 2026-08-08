@@ -15,9 +15,19 @@
 //! Design principles:
 //! - Small images pass through directly (no decode, no re-encode, zero overhead)
 //! - Large images are downscaled to the long-side cap and re-encoded as JPEG (PNG/WebP/JPEG all
-//!   emit JPEG; GIF is the exception and keeps its original format because it may be animated)
+//!   emit JPEG; **static** single-frame GIF is also re-encoded as JPEG; only **animated**
+//!   multi-frame GIF keeps its original format to preserve the animation)
 //! - On decode failure **keep the original image** and log a warning; a bad image must never fail the whole request
 //! - Everything is driven by `KIRO_RS_IMAGE_*` env vars, sharing the same contract as the observability env-var family
+//!
+//! ⚠️ **调用约定（deepseek review 修复，2026-08-08）**：
+//! - 本模块是**同步 CPU 密集**路径（解码 + Lanczos3 缩放 + 重编码）。**async 调用方必须用
+//!   `tokio::task::spawn_blocking` 包住** `maybe_shrink_image`，不能直接在 tokio worker 上同步跑。
+//!   当前 `converter.rs` 的调用点尚未包 `spawn_blocking`，属已知待改项。
+//! - **每请求图片数上限由调用方负责**：`converter.rs` 的 `MAX_TOTAL_IMAGES`（20）只约束历史去重
+//!   路径；当前轮（dedup=None）图片**不限量**。单个 40Mpx 像素炸弹 base64 仅约 300KB，
+//!   恶意请求可塞几百张独占 worker 十几分钟。本模块是 per-image API，无法跨图片计数，
+//!   调用方必须在入口按请求截断图片数量。
 //!
 //! 移植自 GreyGunG/Kiro-RS-Tool 的 `image_resize.rs`（多 fork 合并增强版）。与源模块的差异：
 //! 去掉了 `estimate_image_tokens` 与 `RequestImageLimits`（KiroStudio 已有自己的 token 估算与
@@ -42,6 +52,13 @@ const DEFAULT_MAX_BASE64_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_DECODED_BYTES: usize = 6 * 1024 * 1024;
 /// Default decoded pixel hard limit, matching the review recommendation.
 const DEFAULT_MAX_PIXELS: u64 = 40_000_000;
+/// Default **absolute** decoded-pixel ceiling: images above this are rejected (genuine pixel bomb,
+/// decoding would blow memory). Between `max_pixels` (soft warning) and this ceiling we still attempt
+/// a downscale instead of dropping the image.
+///
+/// Memory tradeoff: a decode of `hard_max_pixels` RGB8 is ~300 MB transient. 100 Mpx covers
+/// >40 Mpx DSLR/satellite stills (the drop-regression case) while rejecting multi-hundred-Mpx bombs.
+const DEFAULT_HARD_MAX_PIXELS: u64 = 100_000_000;
 
 /// Inbound image processor configuration
 #[derive(Debug, Clone, Copy)]
@@ -52,7 +69,10 @@ pub struct ResizeConfig {
     pub jpeg_quality: u8,
     pub max_base64_bytes: usize,
     pub max_decoded_bytes: usize,
+    /// 软阈值：超过只告警、仍尝试降采样（>40Mpx 大图不再被丢）。
     pub max_pixels: u64,
+    /// 绝对硬上限：超过即拒绝（真正的像素炸弹，解码会撑爆内存）。
+    pub hard_max_pixels: u64,
 }
 
 impl ResizeConfig {
@@ -89,6 +109,11 @@ impl ResizeConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_MAX_PIXELS);
+        let hard_max_pixels = std::env::var("KIRO_RS_IMAGE_HARD_MAX_PIXELS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_HARD_MAX_PIXELS)
+            .max(max_pixels);
         Self {
             enabled,
             max_long_side,
@@ -97,6 +122,7 @@ impl ResizeConfig {
             max_base64_bytes,
             max_decoded_bytes,
             max_pixels,
+            hard_max_pixels,
         }
     }
 }
@@ -127,6 +153,11 @@ pub struct ProcessedImage {
 ///
 /// Never panics. Hard-limit failures return an error so callers can reject unsafe payloads
 /// instead of passing huge or failed-decode images through unchecked.
+///
+/// ⚠️ **CPU 热路径（deepseek review）**：本函数是同步 CPU 密集操作（解码 + Lanczos3 缩放 +
+/// JPEG 重编码），async 调用方必须用 `tokio::task::spawn_blocking` 包住，不能在 tokio worker
+/// 上同步跑。入口的 `validate_base64_limits` + 解码前的尺寸探测（`read_dimensions_from_raw` 的
+/// `hard_max_pixels`）是防像素炸弹的关键：先探尺寸再全量解码，避免小字节大像素的炸弹直接解满内存。
 pub fn maybe_shrink_image(
     cfg: ResizeConfig,
     format: &str,
@@ -136,9 +167,14 @@ pub fn maybe_shrink_image(
     let original_bytes = data_base64.len();
     validate_base64_limits(cfg, data_base64)?;
 
-    // 1) Disabled: return as-is
+    // 1) Disabled: degrade to passthrough (the kill switch)
+    //
+    // 🔴 deepseek review 修复：旧代码在这里跑 `validate_passthrough_safe`，而它经
+    // `validate_pixel_count` 会把 >40Mpx 大图判 `LimitExceeded` **原样上抛** → 调用方省略该图。
+    // 也就是说 `KIRO_RS_IMAGE_RESIZE=0` 根本救不了大图：开关关了图还是被丢。真正的 kill switch
+    // 语义是"关掉降采样 = 原样透传"，故此处**只**依赖入口 `validate_base64_limits` 的
+    // base64/解码字节硬上限，不做像素/尺寸校验（像素大小与透传安全性无关）。
     if !cfg.enabled {
-        validate_passthrough_safe(cfg, &format_lc, data_base64)?;
         return Ok(passthrough(format_lc, data_base64));
     }
     // 2) Bytes small enough: return as-is (small images need no work, saves CPU)
@@ -160,22 +196,34 @@ pub fn maybe_shrink_image(
             Err(e) => return Err(e),
         }
     }
-    // 3) Animated images (multi-frame GIF) keep their original format unchanged - JPEG would lose the animation
+    // 3) GIF: **static** (single-frame) goes through JPEG downsampling below; only **animated**
+    //    multi-frame GIF keeps its original format (JPEG would lose the animation).
+    //
+    // 🔴 deepseek review 回归修复：旧代码对所有 GIF 一律透传，>400KB base64 的 GIF 直接被
+    // `LimitExceeded` 丢图 —— 而静态 GIF 完全可以用 JPEG 降采样。这里探测帧数：GIF 头
+    // `0x47 0x49 0x46`（"GIF"）+ 帧分隔 `\x2C`（image descriptor）。多帧才取舍（保动画，
+    // 超预算则省略）；单帧落到下方 `shrink_static_image` 重编码 JPEG。
     if format_lc == "gif" {
-        validate_passthrough_safe(cfg, &format_lc, data_base64)?;
-        if data_base64.len() > cfg.max_bytes {
-            return Err(ResizeError::LimitExceeded(format!(
-                "gif image too large for passthrough: {} > {} base64 bytes",
-                data_base64.len(),
-                cfg.max_bytes
-            )));
+        let raw = BASE64
+            .decode(data_base64)
+            .map_err(|e| ResizeError::Base64(e.to_string()))?;
+        if probe_gif_frame_count(&raw) > 1 {
+            validate_passthrough_safe(cfg, &format_lc, data_base64)?;
+            if data_base64.len() > cfg.max_bytes {
+                return Err(ResizeError::LimitExceeded(format!(
+                    "animated gif too large for passthrough: {} > {} base64 bytes",
+                    data_base64.len(),
+                    cfg.max_bytes
+                )));
+            }
+            debug!(
+                target: "kiro_rs::image_resize",
+                original_bytes = original_bytes,
+                "skip animated GIF (preserve animation)"
+            );
+            return Ok(passthrough(format_lc, data_base64));
         }
-        debug!(
-            target: "kiro_rs::image_resize",
-            original_bytes = original_bytes,
-            "skip GIF (potential animation)"
-        );
-        return Ok(passthrough(format_lc, data_base64));
+        // 静态 GIF：不在此截断，走下方 shrink_static_image 转 JPEG 降采样。
     }
 
     // 4) Actually shrink the image
@@ -434,15 +482,106 @@ fn estimated_decoded_len(data_base64: &str) -> usize {
     trimmed.len().saturating_mul(3) / 4
 }
 
+/// 像素数校验：**软阈值 `max_pixels` 之上仍放行**（只告警、尝试降采样），
+/// 只有超过**硬上限 `hard_max_pixels`** 才拒绝 —— 那是真正的像素炸弹（解码即撑爆内存）。
+///
+/// 🔴 deepseek review 修复：旧逻辑把 `max_pixels` 当硬拒绝线，>40Mpx 大图（如 12000x8000
+/// DSLR 照片）在解码前就被丢。软/硬双线让 >40Mpx 图走降采样、仍保住图片。
 fn validate_pixel_count(cfg: ResizeConfig, w: u32, h: u32) -> Result<(), ResizeError> {
     let pixels = (w as u64).saturating_mul(h as u64);
-    if pixels > cfg.max_pixels {
+    if pixels > cfg.hard_max_pixels {
         return Err(ResizeError::LimitExceeded(format!(
             "image pixels too large: {} > {}",
-            pixels, cfg.max_pixels
+            pixels, cfg.hard_max_pixels
         )));
     }
+    if pixels > cfg.max_pixels {
+        warn!(
+            target: "kiro_rs::image_resize",
+            pixels,
+            soft = cfg.max_pixels,
+            hard = cfg.hard_max_pixels,
+            "image exceeds the soft pixel threshold; still attempting downscale"
+        );
+    }
     Ok(())
+}
+
+/// 探测 GIF 帧数（image descriptor `\x2C` 的数量）。
+///
+/// 判据（deepseek review）：GIF 头 `0x47 0x49 0x46`（"GIF"）确认是 GIF，然后按 GIF 块结构
+/// 走位，统计 image descriptor `,`（0x2C）的个数。>=2 帧视为动画，1 帧视为静态。
+///
+/// 必须**按块结构走位**而非裸扫 `0x2C`：图像数据的 LZW 压缩字节里可以合法出现 0x2C，
+/// 裸扫会把单帧 GIF 误判成多帧。块结构：header(6) + Logical Screen Descriptor(7) +
+/// [Global Color Table] + 若干 block，block 只有三种：
+/// - `,` Image Descriptor（+9 字节描述符 +[Local Color Table]+1 字节 LZW 最小码长+图像子块）
+/// - `!` Extension（1 字节 label + 子块）
+/// - `;` Trailer（结束）
+/// 每个子块 = 1 长度字节 + 该字节数数据；0 长度字节终止子块序列。
+///
+/// 解析失败按 1 帧处理（退化到静态 → 走 JPEG 降采样；降采样失败还有 passthrough 兜底），
+/// 绝不因探测失败而丢图。
+fn probe_gif_frame_count(bytes: &[u8]) -> usize {
+    const IMG_DESCRIPTOR: u8 = 0x2C; // ',' image descriptor
+    const EXTENSION: u8 = 0x21; // '!' extension block
+    const TRAILER: u8 = 0x3B; // ';' trailer
+    if bytes.len() < 13 || &bytes[0..3] != b"GIF" || bytes[3] != b'8' {
+        return 1;
+    }
+    let mut pos = 6usize; // skip "GIF87a" / "GIF89a"
+    pos += 7; // Logical Screen Descriptor
+    // Global Color Table (3 bytes/entry, 2^(N+1) entries)
+    if bytes[10] & 0x80 != 0 {
+        pos += 3 * (2usize << (bytes[10] & 0x07));
+    }
+    let mut frames = 0usize;
+    while pos < bytes.len() {
+        match bytes[pos] {
+            TRAILER => break,
+            IMG_DESCRIPTOR => {
+                frames += 1;
+                // 描述符剩余 9 字节（共 10，含 ','），末尾 1 字节 packed flag。
+                if pos + 10 > bytes.len() {
+                    break;
+                }
+                let packed = bytes[pos + 9];
+                pos += 10;
+                // Local Color Table
+                if packed & 0x80 != 0 {
+                    pos += 3 * (2usize << (packed & 0x07));
+                }
+                // LZW 最小码长字节
+                if pos >= bytes.len() {
+                    break;
+                }
+                pos += 1;
+                pos = skip_gif_sub_blocks(bytes, pos);
+            }
+            EXTENSION => {
+                pos += 2; // 0x21 + 1 字节 label
+                pos = skip_gif_sub_blocks(bytes, pos);
+            }
+            _ => pos += 1, // 防御：非法块字节前进，避免死循环
+        }
+    }
+    frames.max(1)
+}
+
+/// 跳过 GIF 子块序列（每个子块 = 1 长度字节 + 数据；0 长度字节终止）。
+fn skip_gif_sub_blocks(bytes: &[u8], mut pos: usize) -> usize {
+    loop {
+        if pos >= bytes.len() {
+            break;
+        }
+        let n = bytes[pos] as usize;
+        pos += 1;
+        if n == 0 {
+            break;
+        }
+        pos = pos.saturating_add(n);
+    }
+    pos
 }
 
 #[derive(Debug)]
@@ -495,7 +634,27 @@ mod tests {
             max_base64_bytes: 8 * 1024 * 1024,
             max_decoded_bytes: 8 * 1024 * 1024,
             max_pixels: 40_000_000,
+            hard_max_pixels: 100_000_000,
         }
+    }
+
+    /// 构造一个 1x1 GIF（可指定帧数）。用 `image` crate 的 GifEncoder 生成，保证本仓解码器
+    /// 一定能解回来；`frames > 1` 即动画。供帧数探测与静态/动画分流测试使用。
+    fn make_gif(frames: usize) -> Vec<u8> {
+        use image::{Frame, Rgba, RgbaImage};
+        let img = RgbaImage::from_pixel(1, 1, Rgba([0, 0, 0, 255]));
+        let mut out = Vec::new();
+        let mut enc = image::codecs::gif::GifEncoder::new(&mut out);
+        for _ in 0..frames {
+            enc.encode_frame(Frame::new(img.clone())).unwrap();
+        }
+        drop(enc); // 释放对 out 的借用，才能 move 返回
+        out
+    }
+
+    /// 把原始字节 base64 编码（GIF 分支探测帧数时输入是 base64）。
+    fn b64(bytes: &[u8]) -> String {
+        BASE64.encode(bytes)
     }
 
     #[test]
@@ -546,13 +705,51 @@ mod tests {
     }
 
     #[test]
-    fn gif_passes_through_to_preserve_animation() {
+    fn animated_gif_passes_through_to_preserve_animation() {
         let cfg = test_cfg();
-        // A 1x1 GIF is enough; what matters here is exercising the branch
-        let tiny_gif = "R0lGODlhAQABAAAAACw=";
-        let out = maybe_shrink_image(cfg, "gif", tiny_gif).unwrap();
+        // 2 帧 GIF：多帧 = 动画，必须保留原格式，绝不能重编码成 JPEG 丢动画。
+        let gif = b64(&make_gif(2));
+        let out = maybe_shrink_image(cfg, "gif", &gif).unwrap();
         assert!(!out.was_resized);
         assert_eq!(out.format, "gif");
+    }
+
+    #[test]
+    fn animated_gif_over_budget_is_dropped_not_passed() {
+        // 动画 + 超字节预算：不能降采样（会丢动画），取舍 = 省略（LimitExceeded），而非透传超大 payload。
+        let cfg = ResizeConfig {
+            max_bytes: 10,
+            ..test_cfg()
+        };
+        let gif = b64(&make_gif(2));
+        let err = maybe_shrink_image(cfg, "gif", &gif).unwrap_err();
+        assert!(matches!(err, ResizeError::LimitExceeded(_)));
+    }
+
+    /// 🔴 回归（deepseek review）：>400KB base64 的**静态** GIF 必须走 JPEG 降采样，而不是被丢图。
+    ///
+    /// 旧代码对所有 GIF 一律透传 + 超 max_bytes 即丢；静态 GIF（单帧）完全可以重编码 JPEG。
+    #[test]
+    fn static_gif_over_budget_is_shrunk_to_jpeg() {
+        let cfg = ResizeConfig {
+            max_bytes: 20,
+            ..test_cfg()
+        };
+        let gif = b64(&make_gif(1));
+        let out = maybe_shrink_image(cfg, "gif", &gif).unwrap();
+        assert!(out.was_resized, "静态 GIF 应被降采样而非丢弃");
+        assert_eq!(out.format, "jpeg", "静态 GIF 应重编码为 JPEG");
+    }
+
+    /// 帧数探测本身：静态 = 1 帧，动画 >= 2 帧；带扩展块的动画也能数对。
+    #[test]
+    fn gif_frame_count_probe() {
+        assert_eq!(probe_gif_frame_count(&make_gif(1)), 1);
+        assert_eq!(probe_gif_frame_count(&make_gif(2)), 2);
+        assert_eq!(probe_gif_frame_count(&make_gif(3)), 3);
+        // 非 GIF 输入退化为 1（不丢图路径）
+        assert_eq!(probe_gif_frame_count(b"not a gif at all"), 1);
+        assert_eq!(probe_gif_frame_count(b""), 1);
     }
 
     #[test]
@@ -561,6 +758,24 @@ mod tests {
             enabled: false,
             ..test_cfg()
         };
+        let big = make_png(1206, 2622);
+        let out = maybe_shrink_image(cfg, "png", &big).unwrap();
+        assert!(!out.was_resized);
+        assert_eq!(out.format, "png");
+    }
+
+    /// 🔴 kill switch 修复（deepseek review）：`KIRO_RS_IMAGE_RESIZE=0` 必须**降级为透传**，
+    /// 即使图片超过**硬像素上限**也不得丢图。旧代码在 disabled 分支跑 `validate_passthrough_safe`，
+    /// >40Mpx 大图被判 LimitExceeded 原样上抛 → 开关关了图还是被丢。
+    #[test]
+    fn disabled_config_passes_through_even_over_hard_pixel_ceiling() {
+        let cfg = ResizeConfig {
+            enabled: false,
+            max_pixels: 1_000,
+            hard_max_pixels: 2_000,
+            ..test_cfg()
+        };
+        // 1206x2622 = 3.16Mpx，远超 hard_max_pixels=2000：但 disabled 时像素与透传安全性无关。
         let big = make_png(1206, 2622);
         let out = maybe_shrink_image(cfg, "png", &big).unwrap();
         assert!(!out.was_resized);
@@ -621,10 +836,42 @@ mod tests {
         assert!(matches!(err, ResizeError::LimitExceeded(_)));
     }
 
+    /// 🔴 语义变更（deepseek review）：`max_pixels` 现在是**软阈值** —— 之上只告警仍降采样；
+    /// 只有超过 `hard_max_pixels` 硬上限才拒绝（真正的像素炸弹）。
     #[test]
-    fn oversized_pixels_are_rejected_before_full_decode() {
+    fn pixels_above_soft_threshold_still_get_downscaled() {
+        let cfg = ResizeConfig {
+            max_pixels: 1_000_000, // 1206x2622 = 3.16Mpx > 软阈值 1Mpx
+            hard_max_pixels: 10_000_000,
+            ..test_cfg()
+        };
+        let img = make_png(1206, 2622);
+        let out = maybe_shrink_image(cfg, "png", &img).unwrap();
+        assert!(out.was_resized, "超过软阈值也必须降采样而非丢图");
+        assert_eq!(out.format, "jpeg");
+    }
+
+    /// 像素校验本身：软阈值之上 Ok（只告警），硬上限之上 Err。
+    #[test]
+    fn pixel_validation_soft_above_max_hard_above_hard_max() {
         let cfg = ResizeConfig {
             max_pixels: 1_000,
+            hard_max_pixels: 10_000,
+            ..test_cfg()
+        };
+        // 5000 px > 软阈值 1000，但 < 硬上限 10000 → Ok（降采样不丢图）
+        assert!(validate_pixel_count(cfg, 50, 100).is_ok());
+        // 恰好等于硬上限 → 仍 Ok（> 才拒）
+        assert!(validate_pixel_count(cfg, 100, 100).is_ok());
+        // 40000 px > 硬上限 → Err（像素炸弹）
+        assert!(validate_pixel_count(cfg, 200, 200).is_err());
+    }
+
+    #[test]
+    fn pixels_above_hard_ceiling_are_rejected_before_full_decode() {
+        let cfg = ResizeConfig {
+            max_pixels: 1_000,
+            hard_max_pixels: 2_000,
             ..test_cfg()
         };
         let img = make_png(64, 64);

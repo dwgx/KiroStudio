@@ -121,6 +121,10 @@ impl KiroEndpoint for CliEndpoint {
         "application/x-amz-json-1.0"
     }
 
+    fn amz_target(&self) -> Option<&'static str> {
+        Some(CLI_AMZ_TARGET)
+    }
+
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
         // 服务根路径（末尾 `/`），操作由 X-Amz-Target 头路由。
         format!("https://q.{}.amazonaws.com/", self.api_region(ctx))

@@ -1980,6 +1980,10 @@ fn cache_estimated_header_value() -> axum::http::HeaderValue {
 /// `metadataEvent` 只有 `stopReason`，从不回传 `tokenUsage` / `cacheReadInputTokens`。
 /// 这里的 `cache_read_input_tokens` 就是 `count_prefix_tokens` 的前缀 token 估算值。
 ///
+/// 本函数是四层降级链（`src/anthropic/cache.rs`）的 **Layer 2**：`resolve_cache_chain`
+/// 在拿到完整响应后先看 Layer 1 上游 `meteringEvent` 的 cache 真值（`MeteringEvent`
+/// 新增的 `cacheReadInputTokens/cacheCreationInputTokens`，见 metering.rs），缺失才回落本估算。
+///
 /// `enabled=false`（`promptCacheEnabled`）时返回 `None`，使**所有**下游注入点自然跳过
 /// ——注入点分散在 stream.rs 的五处，全部从 `cache_usage` 读，所以在源头收口比逐个加
 /// 判断更不容易漏。返回 `None` 而非 `Some(全 0)` 是刻意的：对 Anthropic 客户端来说
@@ -2026,6 +2030,58 @@ fn apply_cache_breakdown(
     record.cache_read_tokens = read;
     record.cache_creation_tokens = creation;
     record.clamp_cache_to_input();
+}
+
+/// 四层降级链的收口：把「prefix 估算 + metering 真值」收敛成最终 cache 记账。
+///
+/// 返回 `(cache 记账, 是否估算)`：
+/// - 估算=true → 数字来自本地估算（Layer 2 prefix / Layer 4 ratio），响应头标注「估算」；
+/// - 估算=false → 数字来自上游 metering 真值（Layer 1），响应头不标注。
+///
+/// 优先级（高→低，见 `src/anthropic/cache.rs`）：
+/// 1. **metering 真值**（Layer 1）——真值不是估算，不受 `promptCacheEnabled` 开关约束；
+/// 2. **prefix 估算**（Layer 2，既有 `estimate_cache_breakdown` 产出）；
+/// 3. **fingerprint**（Layer 3，TODO 未移植，恒 None）；
+/// 4. **ratio 兜底**（Layer 4，50% cache / 30% creation）。
+///
+/// 开关关且无 metering 真值时返回 `(None, false)`：保持既有行为——完全不做 cache 记账，
+/// 不凭空造 cache 命中（配置在说谎的旧缺陷，见 `prompt_cache_enabled`）。
+fn resolve_cache_chain(
+    enabled: bool,
+    final_input_tokens: i32,
+    prefix_estimate: Option<CacheUsageBreakdown>,
+    metering_read: Option<i32>,
+    metering_creation: Option<i32>,
+) -> (Option<CacheUsageBreakdown>, bool) {
+    let metering = match (metering_read, metering_creation) {
+        (Some(r), Some(c)) => Some((r, c)),
+        _ => None,
+    };
+    // Layer 1：上游真值优先，且不受开关约束（真值不是估算）。
+    if let Some(m) = metering {
+        let usage = super::cache::select_final_usage(
+            final_input_tokens,
+            Some(m),
+            None,
+            None,
+            super::cache::PromptCacheUsage::default(),
+        );
+        return (Some(usage), false);
+    }
+    if !enabled {
+        return (None, false);
+    }
+    let prefix_estimated_read = prefix_estimate.map(|c| c.cache_read_input_tokens);
+    let ratio_fallback = super::cache::PromptCacheUsage::from_ratios(final_input_tokens, 0.5, 0.3);
+    // Layer 3 fingerprint：TODO 未移植（k2cc `cache/fingerprint.rs`），恒 None。
+    let usage = super::cache::select_final_usage(
+        final_input_tokens,
+        None,
+        prefix_estimated_read,
+        None,
+        ratio_fallback,
+    );
+    (Some(usage), true)
 }
 
 /// 处理非流式请求
@@ -2083,6 +2139,10 @@ async fn handle_non_stream_request(
     let mut context_input_tokens: Option<i32> = None;
     // 从 meteringEvent 解析的真实 credit 消耗量
     let mut credits_used: Option<f64> = None;
+    // 从 meteringEvent 解析的 cache 真值（Layer 1：上游返回的真实 cache_read/cache_creation）。
+    // 缺失（None）时降级到本地 prefix 估算 / ratio 兜底。
+    let mut metering_cache_read: Option<i32> = None;
+    let mut metering_cache_creation: Option<i32> = None;
     // 本次响应的完成状态：默认 Ok，遇 in-band 错误/异常/解码器停止置失败态。
     // 收尾据此决定 HTTP 码与用量记账 outcome，避免截断输出被当成 200 成功。
     let mut completion = CompletionStatus::Ok;
@@ -2250,6 +2310,13 @@ async fn handle_non_stream_request(
                         }
                         Event::Metering(metering) => {
                             credits_used = Some(credits_used.unwrap_or(0.0) + metering.usage);
+                            // Layer 1 cache 真值：上游 metering 事件可选携带（缺失则保持 None）。
+                            if let Some(r) = metering.cache_read_input_tokens {
+                                metering_cache_read = Some(r);
+                            }
+                            if let Some(c) = metering.cache_creation_input_tokens {
+                                metering_cache_creation = Some(c);
+                            }
                         }
                         // E1：结构化思考增量（纯 delta，直接追加）。此前落 `_ => {}` 被丢弃，
                         // 非流式只能靠下方的 `<thinking>` 标签提取兜底。
@@ -2440,6 +2507,16 @@ async fn handle_non_stream_request(
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
     let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
 
+    // 四层降级链收敛最终 cache 记账（Layer 1 metering 真值 → Layer 2 prefix → Layer 4 ratio；
+    // Layer 3 fingerprint 为 TODO）。入库用**未缩放真值**，对外下发放大由 scale_for_client 负责。
+    let (final_cache_breakdown, cache_estimated) = resolve_cache_chain(
+        prompt_cache_enabled(),
+        final_input_tokens,
+        cache_breakdown,
+        metering_cache_read,
+        metering_cache_creation,
+    );
+
     // 用量埋点：非流式成功记录
     {
         let mut record = crate::usage::RequestRecord::new(
@@ -2454,7 +2531,7 @@ async fn handle_non_stream_request(
         record.output_tokens = output_tokens;
         // 与下方返回客户端的 usage.cache_* 同源，避免"客户端有值、面板恒 0"的矛盾数字。
         // 必须在 input_tokens 赋值之后调用（内部要按 gross 收敛 cache 上限）。
-        apply_cache_breakdown(&mut record, cache_breakdown);
+        apply_cache_breakdown(&mut record, final_cache_breakdown);
         record.credits_used = credits_used;
         record.latency_ms = meta.latency_ms;
         record.retries = meta.retries;
@@ -2468,8 +2545,8 @@ async fn handle_non_stream_request(
         crate::usage::emit_record(record);
     }
 
-    // 构建 usage（注入影子缓存估算字段，让 Claude Code 显示 cache hits）
-    let billed_input = if let Some(c) = cache_breakdown {
+    // 构建 usage（注入影子缓存记账字段，让 Claude Code 显示 cache hits）
+    let billed_input = if let Some(c) = final_cache_breakdown {
         super::stream::billed_input_tokens(
             final_input_tokens,
             c.cache_creation_input_tokens,
@@ -2483,15 +2560,14 @@ async fn handle_non_stream_request(
         "input_tokens": super::stream::scale_for_client(billed_input),
         "output_tokens": output_tokens
     });
-    if let Some(c) = cache_breakdown {
+    if let Some(c) = final_cache_breakdown {
         usage["cache_creation_input_tokens"] =
             json!(super::stream::scale_for_client(c.cache_creation_input_tokens));
         usage["cache_read_input_tokens"] =
             json!(super::stream::scale_for_client(c.cache_read_input_tokens));
     }
-    // 是否需要标注「这些 cache 数字是网关估算」——仅在真的下发了字段时标，
-    // 否则响应头与响应体自相矛盾（见 CACHE_ESTIMATED_HEADER 的说明）。
-    let cache_estimated = cache_breakdown.is_some();
+    // 是否需要标注「这些 cache 数字是网关估算」——仅当胜出层是估算（Layer 2/4）时标；
+    // Layer 1 metering 真值或未下发字段时不标（头与体自相矛盾见 CACHE_ESTIMATED_HEADER）。
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -3160,6 +3236,64 @@ mod non_stream_cache_accounting_tests {
         assert_eq!(record.cache_creation_tokens, 0, "首轮无前缀缓存应记 0");
     }
 
+    /// Layer 1：上游 metering 真值优先于一切本地估算，且不标注「估算」。
+    #[test]
+    fn should_use_metering_truth_over_estimate() {
+        let (bd, estimated) = resolve_cache_chain(true, 1000, None, Some(600), Some(200));
+        let bd = bd.expect("metering 真值应产出记账");
+        assert_eq!(bd.cache_read_input_tokens, 600);
+        assert_eq!(bd.cache_creation_input_tokens, 200);
+        assert_eq!(bd.cache_creation_5m_input_tokens, 200);
+        assert_eq!(bd.cache_creation_1h_input_tokens, 0);
+        assert!(!estimated, "真值不应标「估算」头");
+    }
+
+    /// Layer 1 真值 > total 时按 clamp_to_total 收敛（优先保留 read）。
+    #[test]
+    fn should_clamp_metering_truth_to_total() {
+        let (bd, _) = resolve_cache_chain(true, 100, None, Some(80), Some(50));
+        let bd = bd.expect("应有记账");
+        assert_eq!(bd.cache_read_input_tokens, 80);
+        assert_eq!(bd.cache_creation_input_tokens, 20);
+    }
+
+    /// Layer 1 真值不受 `promptCacheEnabled=false` 约束（真值不是估算）。
+    #[test]
+    fn should_record_metering_truth_even_when_disabled() {
+        let (bd, estimated) = resolve_cache_chain(false, 1000, None, Some(400), Some(100));
+        assert!(bd.is_some(), "真值应照记，即使开关关");
+        assert!(!estimated);
+    }
+
+    /// 开关关且无 metering 真值 → 整体缺失（None），不凭空造 cache 命中。
+    #[test]
+    fn should_omit_entirely_when_disabled_and_no_metering() {
+        let (bd, estimated) = resolve_cache_chain(false, 1000, Some(estimate_cache_breakdown(true, 500, 1000).unwrap()), None, None);
+        assert!(bd.is_none(), "关闭时不得下发 cache 记账");
+        assert!(!estimated);
+    }
+
+    /// Layer 2：无 metering 时回落 prefix 估算（既有行为）。
+    #[test]
+    fn should_fall_back_to_prefix_estimate() {
+        let (bd, estimated) = resolve_cache_chain(true, 1000, Some(estimate_cache_breakdown(true, 400, 1000).unwrap()), None, None);
+        let bd = bd.expect("prefix 估算应产出记账");
+        assert_eq!(bd.cache_read_input_tokens, 400);
+        assert_eq!(bd.cache_creation_input_tokens, 0);
+        assert!(estimated, "估算应标「估算」头");
+    }
+
+    /// Layer 4：无 metering、无 prefix 时 ratio 兜底（50% cache / 30% creation）。
+    #[test]
+    fn should_fall_back_to_ratio_when_no_estimate() {
+        let (bd, estimated) = resolve_cache_chain(true, 1000, None, None, None);
+        let bd = bd.expect("ratio 兜底应产出记账");
+        // 50% × 1000 = 500 cache，creation = 150，read = 350。
+        assert_eq!(bd.cache_read_input_tokens, 350);
+        assert_eq!(bd.cache_creation_input_tokens, 150);
+        assert!(estimated, "ratio 也是估算，应标「估算」头");
+    }
+
     /// 🔴 源码级守卫：`contextUsageEvent` 的判据必须**与流式路径共用同一个函数**，
     /// 不得在本文件里重新算一遍。
     ///
@@ -3225,8 +3359,8 @@ mod non_stream_cache_accounting_tests {
             .next()
             .expect("埋点块应以 emit_record 收尾");
         assert!(
-            block.contains("apply_cache_breakdown(&mut record, cache_breakdown)"),
-            "非流式成功埋点块必须写入 cache 字段,否则落库与客户端 usage 矛盾"
+            block.contains("apply_cache_breakdown(&mut record, final_cache_breakdown)"),
+            "非流式成功埋点块必须写入 cache 字段(四层降级链收敛后的 final_cache_breakdown),否则落库与客户端 usage 矛盾"
         );
     }
 }

@@ -23,6 +23,7 @@
 //! ```
 
 pub mod compressor;
+pub(crate) mod cache;
 pub(crate) mod converter;
 pub(crate) mod handlers;
 pub(crate) mod image_resize;

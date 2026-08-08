@@ -68,6 +68,10 @@ impl KiroEndpoint for CliRuntimeEndpoint {
         "application/x-amz-json-1.0"
     }
 
+    fn amz_target(&self) -> Option<&'static str> {
+        Some(CLI_AMZ_TARGET)
+    }
+
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
         // 服务根路径（末尾 `/`），操作由 X-Amz-Target 头路由。
         format!("https://runtime.{}.kiro.dev/", self.api_region(ctx))
@@ -170,5 +174,40 @@ mod tests {
             "cli-runtime 绝不能注入 profileArn: {out}"
         );
         assert!(out.contains("vibe"), "应注入 agentMode=vibe: {out}");
+    }
+
+    /// ⭐ 顺序守卫（deepseek review 补齐）：本文件复制了 cli.rs 的 `inject → origin` 序列，
+    /// 但此前没有守卫，cli.rs:673 那份管不到这里。`set_origin_kiro_cli` 第一步是字符串字面量
+    /// 替换 `"origin":"AI_EDITOR"`，只对 serde 紧凑序列化成立；inject 必须在它之前，保证它拿到的
+    /// 一定是 serde 刚吐出的紧凑串。删掉/颠倒这里的顺序 → 本测试必须 FAILED。
+    #[test]
+    fn inject_must_run_before_origin_rewrite() {
+        let src = include_str!("cli_runtime.rs");
+        let prod = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("生产段应存在")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("///"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // needle 运行时拼接，避免 include_str! 自匹配；只匹配到左括号、不含实参。
+        let inject_call = ["inject_cli_agent", "_fields("].concat();
+        let origin_call = ["set_origin_kiro", "_cli("].concat();
+        let i = prod
+            .find(inject_call.as_str())
+            .expect("transform_api_body 必须仍调 inject_cli_agent_fields");
+        let o = prod
+            .find(origin_call.as_str())
+            .expect("transform_api_body 必须按开关调 set_origin_kiro_cli");
+        assert!(
+            i < o,
+            "vibe 注入必须在 origin 改写之前求值 —— 否则字面量替换的紧凑序列化前提失去保证"
+        );
+        let gate = ["ctx.config.cli_origin", "_kiro_cli"].concat();
+        let g = prod
+            .find(gate.as_str())
+            .expect("origin 改写必须由 config 开关把门");
+        assert!(g < o, "开关判定必须排在 set_origin_kiro_cli 调用之前");
     }
 }

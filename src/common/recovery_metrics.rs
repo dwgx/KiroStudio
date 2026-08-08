@@ -164,6 +164,20 @@ counters! {
     // 此前 MCP 只有成功分支 emit_record,失败 bail 零埋点 ⇒ 失败在面板上不可见。
     // 与 failover_exhausted 分离:那是 Kiro 对话路径的池耗尽,混在一个桶里无法归因。
     mcp_failures: bump_mcp_failure,
+    // 用量管道(usage::pipeline)的背压可观测:
+    // `usage_pipeline_dropped` = 有界通道满、`try_send` 失败而被丢弃的请求记录数;
+    // `usage_pipeline_written` = worker 真分发给全部 sink 的记录数(即进了聚合/SQLite 的那批)。
+    //
+    // 为什么必须暴露:管道满时热路径**静默**丢记录(设计如此,统计绝不阻塞请求),而丢掉的记录
+    // 不进 usage_stats 的分母也不进分子 ⇒ 面板成功率与 RPM 都是**偏乐观的**。丢弃量此前
+    // 只有一个进程内计数器、零读者 ⇒ 无法回答"面板这个数漏了多少"。而本项目一切限流调参
+    // (inboundTargetRpm / credentialRpmLimit)都以面板数为依据 —— 依据的缺口不可见,
+    // 调参就是在算空气。
+    //
+    // 两个数必须**配对**看:只有 dropped 无法判断严重程度(丢 100 条在 1e6 里是噪声、在 1e3
+    // 里是 10%),丢弃率 = dropped/(dropped+written) 才是可判读的量。
+    usage_pipeline_dropped: bump_usage_pipeline_dropped,
+    usage_pipeline_written: bump_usage_pipeline_written,
 }
 
 #[cfg(test)]
