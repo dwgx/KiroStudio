@@ -57,10 +57,14 @@ pub fn normalize_request(value: &mut Value) {
 
     // 1) thinking 归一化:adaptive→enabled;enabled 去 budget_tokens;disabled 保留;未知形态删除。
     let mut thinking_disabled = false;
+    // ⚠️ 只有**客户端显式**要思考（enabled/adaptive）才置位：thinking 字段缺失时
+    // deepseek 默认不开 thinking，max_tokens 抬升会白白放大 20 倍输出成本。
+    let mut thinking_explicitly_enabled = false;
     match obj.get("thinking") {
         Some(v) if v.is_object() => {
             match v.get("type").and_then(|x| x.as_str()) {
                 Some("adaptive") | Some("enabled") => {
+                    thinking_explicitly_enabled = true;
                     obj.insert("thinking".into(), serde_json::json!({ "type": "enabled" }));
                 }
                 Some("disabled") => {
@@ -129,11 +133,13 @@ pub fn normalize_request(value: &mut Value) {
         inject_missing_thinking_blocks(obj);
     }
 
-    // 6) max_tokens 下限保护：thinking 非 disabled 时，deepseek 的 thinking 计入
-    //    max_tokens 预算。客户端小预算（如 200）会被 thinking 吃光 → 正文空
-    //    （实测 max_tokens=30 只有 thinking；4096 正常出正文）。这里把 < 下限的
-    //    抬到下限；缺失补下限；≥ 下限保持。thinking disabled 不调（尊重客户端意图）。
-    if !thinking_disabled {
+    // 6) max_tokens 下限保护：**仅客户端显式要思考时**（enabled/adaptive），deepseek 的
+    //    thinking 计入 max_tokens 预算。客户端小预算（如 200）会被 thinking 吃光 → 正文空
+    //    （实测 max_tokens=30 只有 thinking；4096 正常出正文）。这里把 < 下限的抬到下限；
+    //    缺失补下限；≥ 下限保持。
+    //    ⚠️ 用 `thinking_explicitly_enabled` 而非 `!thinking_disabled`：thinking 字段缺失时
+    //    deepseek 默认不开 thinking，小预算不会被吃光，抬升只会白白放大输出成本。
+    if thinking_explicitly_enabled {
         match obj.get("max_tokens").and_then(|v| v.as_u64()) {
             None => {
                 obj.insert("max_tokens".into(), serde_json::json!(DEEPSEEK_MIN_MAX_TOKENS));
@@ -372,6 +378,14 @@ mod tests {
         // thinking disabled + 缺失 → 不补
         let out = norm(serde_json::json!({ "thinking": { "type": "disabled" } }));
         assert!(out.get("max_tokens").is_none(), "thinking disabled 不补 max_tokens");
+
+        // 🔴 回归：thinking 字段**缺失**（deepseek 默认不开 thinking）→ 不抬升，
+        //   小预算不会被 thinking 吃光，抬升只会白白放大 20 倍输出成本。
+        let out = norm(serde_json::json!({ "max_tokens": 200 }));
+        assert_eq!(out["max_tokens"], 200, "无 thinking 字段不抬升");
+
+        let out = norm(serde_json::json!({}));
+        assert!(out.get("max_tokens").is_none(), "无 thinking 字段不补 max_tokens");
     }
 
     /// 幂等：对已归一化的请求再归一化，结果不变。

@@ -1465,6 +1465,10 @@ impl StreamContext {
                 )
             })
             .unwrap_or(self.input_tokens);
+        // ⚠️ message_start 保持 billed **未缩放**：`resolved_usage()` 与
+        // `record.billed_input_tokens()` 都绑定此值（`should_keep_gross_input_as_superset_*`
+        // 测试钉死），缩放到会破坏「record 口径 = message_start 口径」的一致性。
+        // message_delta 的 scale_for_client 是另一处既有展示缩放，两者故意不同步。
         let mut usage = json!({
             "input_tokens": billed,
             "output_tokens": 1
@@ -3736,6 +3740,8 @@ impl BufferedStreamContext {
             .unwrap_or(final_input_tokens);
 
         // 更正 message_start 事件中的 input_tokens（并补齐 cache 字段）
+        // ⚠️ 保持 billed **未缩放**，与 create_message_start_event / record 口径一致
+        //（scale_for_client 只作用于 message_delta 的既有展示缩放）。
         for event in &mut self.event_buffer {
             if event.event == "message_start" {
                 if let Some(message) = event.data.get_mut("message") {

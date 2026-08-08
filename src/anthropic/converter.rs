@@ -1628,6 +1628,9 @@ fn map_tool_input_to_kiro(
         ("Write", "fs_write") => {
             maybe_insert(&mut out, "path", take_first(&obj, &["file_path", "path"]));
             maybe_insert(&mut out, "text", take_first(&obj, &["content", "text"]));
+            // ⚠️ 透传 write_mode（"create"|"append"）：不映射会被静默丢弃，
+            // 上游 fs_write 退化成覆盖写，多轮后客户端按默认执行 → 数据丢失风险。
+            maybe_insert(&mut out, "write_mode", take_first(&obj, &["write_mode"]));
         }
         ("Edit", "str_replace") => {
             maybe_insert(&mut out, "path", take_first(&obj, &["file_path", "path"]));
@@ -1760,21 +1763,40 @@ pub(crate) fn map_tool_input_from_kiro(client_name: &str, input: serde_json::Val
                     out.insert("limit".to_string(), serde_json::json!(limit));
                 }
             }
+            // ⚠️ 入站注入的 explanation 是幻影参数（客户端 Read schema 无此键），
+            // 严格校验会报 invalid tool input 并污染多轮上下文，出站必须剥离。
+            out.remove("explanation");
         }
         "Glob" => {
             remap_tool_keys(&mut out, &["query", "pattern"], "pattern");
+            // ⚠️ 入站把 includeIgnoredFiles 的 bool 转成了 "yes"/"no" 字符串（Kiro 接受），
+            // 出站必须还原回 bool，否则客户端收到字符串与其 boolean schema 类型不符。
+            if let Some(v) = out.get("includeIgnoredFiles").cloned() {
+                let mapped = match v.as_str() {
+                    Some("yes") => serde_json::json!(true),
+                    Some("no") => serde_json::json!(false),
+                    _ => v,
+                };
+                out.insert("includeIgnoredFiles".to_string(), mapped);
+            }
+            out.remove("explanation");
         }
         "Grep" => {
             remap_tool_keys(&mut out, &["query", "pattern"], "pattern");
             remap_tool_keys(&mut out, &["includePattern", "glob"], "glob");
+            // ⚠️ 入站把 exclude 映射到 excludePattern，出站必须还原回 exclude，
+            // 否则客户端 Grep 用错参数名、exclude 丢失。
+            remap_tool_keys(&mut out, &["excludePattern", "exclude"], "exclude");
             remap_tool_keys(
                 &mut out,
                 &["caseSensitive", "case_sensitive"],
                 "case_sensitive",
             );
+            out.remove("explanation");
         }
         "LS" => {
             remap_tool_keys(&mut out, &["path"], "path");
+            out.remove("explanation");
         }
         "WebSearch" => {
             remap_tool_keys(&mut out, &["query"], "query");
@@ -3390,6 +3412,51 @@ mod tests {
         assert_eq!(
             map_tool_input_from_kiro("Read", kiro_read),
             serde_json::json!({"file_path": "/a.txt", "offset": 10, "limit": 5})
+        );
+    }
+
+    /// 🔴 回归：Write write_mode 透传、Glob includeIgnoredFiles 出站还原 bool、
+    /// Grep excludePattern→exclude 出站还原、注入的 explanation 出站剥离。
+    #[test]
+    fn test_tool_mapping_write_mode_and_glob_grep_roundtrip() {
+        // Write write_mode 入站透传 + 出站保留（之前被静默丢弃 → 覆盖写数据丢失）
+        let write_in = serde_json::json!({"file_path": "/a.txt", "content": "hi", "write_mode": "append"});
+        let write_out = map_tool_input_to_kiro("Write", write_in).unwrap();
+        assert_eq!(write_out["write_mode"], "append", "write_mode 必须透传（防退化成覆盖写）");
+        let restored = map_tool_input_from_kiro("Write", write_out);
+        assert_eq!(restored["write_mode"], "append", "write_mode 出站保留");
+        assert_eq!(restored["file_path"], "/a.txt");
+
+        // Glob includeIgnoredFiles：入站 bool→"yes"/"no"，出站必须还原回 bool
+        let glob_in = serde_json::json!({"pattern": "*.ts", "includeIgnoredFiles": true});
+        let glob_out = map_tool_input_to_kiro("Glob", glob_in).unwrap();
+        assert_eq!(glob_out["includeIgnoredFiles"], "yes");
+        let glob_restored = map_tool_input_from_kiro("Glob", glob_out);
+        assert_eq!(glob_restored["includeIgnoredFiles"], true, "includeIgnoredFiles 必须还原回 bool");
+        assert!(
+            !glob_restored.as_object().unwrap().contains_key("explanation"),
+            "入站注入的 explanation 出站必须剥离（幻影参数）"
+        );
+
+        // Grep excludePattern→exclude 出站还原
+        let grep_in = serde_json::json!({"pattern": "foo", "exclude": "vendor"});
+        let grep_out = map_tool_input_to_kiro("Grep", grep_in).unwrap();
+        assert_eq!(grep_out["excludePattern"], "vendor");
+        let grep_restored = map_tool_input_from_kiro("Grep", grep_out);
+        assert_eq!(grep_restored["exclude"], "vendor", "excludePattern 必须还原成 exclude");
+        assert!(
+            !grep_restored.as_object().unwrap().contains_key("excludePattern"),
+            "还原后不应残留 excludePattern"
+        );
+
+        // Read 出站剥离注入的 explanation
+        let read_restored = map_tool_input_from_kiro(
+            "Read",
+            serde_json::json!({"path": "/a.txt", "start_line": 1, "end_line": 2}),
+        );
+        assert!(
+            !read_restored.as_object().unwrap().contains_key("explanation"),
+            "Read 出站剥离 explanation"
         );
     }
 
