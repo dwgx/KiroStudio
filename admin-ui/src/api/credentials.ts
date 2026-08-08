@@ -205,6 +205,15 @@ export async function probeUpstreamModels(id: number): Promise<string[]> {
   return data.models ?? []
 }
 
+// 创建前探测代挂上游模型列表（POST /credentials/probe-models，凭据还不存在时的临时探测）。
+export async function probeModelsStandalone(req: {
+  baseUrl: string
+  apiKey?: string
+}): Promise<string[]> {
+  const { data } = await api.post<{ models: string[] }>('/credentials/probe-models', req)
+  return data.models ?? []
+}
+
 // 设置凭据别名/备注（传空字符串清除）
 export async function setCredentialName(
   id: number,

@@ -397,6 +397,15 @@ pub struct Config {
     #[serde(default = "default_inbound_queue_timeout_passthrough")]
     pub inbound_queue_timeout_passthrough: bool,
 
+    /// 全局同时在飞的上游 HTTP 调用数上限（默认 16，重启生效）。
+    ///
+    /// 防「上游重试放大」的硬闸：无论外部请求率多高、每个请求重试几次，网关内部同时
+    /// 进行中的上游调用恒 ≤ 本值 —— 内部 RPM 被钳制在 `容量 / 单次上游延迟` 量级，
+    /// 不再随「号多 + 429 多 → 疯狂换号重试」线性放大。Semaphore 容量不可热更，
+    /// 改配置需重启（并发闸是「上限」而非「目标值」，无需 autotune）。
+    #[serde(default = "default_upstream_concurrency_limit")]
+    pub upstream_concurrency_limit: usize,
+
     /// 是否启用会话亲和性（同一会话尽量复用同一凭据，默认 true）
     ///
     /// 防关联用：让同一对话粘在同一账号上，避免单次会话散落到多个账号引发关联。
@@ -961,6 +970,9 @@ fn default_inbound_queue_max_wait_secs() -> u32 {
 fn default_inbound_queue_timeout_passthrough() -> bool {
     true
 }
+fn default_upstream_concurrency_limit() -> usize {
+    16
+}
 fn default_cooldown_scale_pct() -> u32 {
     100
 }
@@ -1158,6 +1170,7 @@ impl Default for Config {
             inbound_burst_secs: default_inbound_burst_secs(),
             inbound_queue_max_wait_secs: default_inbound_queue_max_wait_secs(),
             inbound_queue_timeout_passthrough: default_inbound_queue_timeout_passthrough(),
+            upstream_concurrency_limit: default_upstream_concurrency_limit(),
             rate_limit_enabled: false,
             rate_limit_daily_max: default_rate_limit_daily(),
             rate_limit_min_interval_ms: default_rate_limit_min_interval_ms(),

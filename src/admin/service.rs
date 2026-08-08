@@ -830,6 +830,37 @@ impl AdminService {
             .map_err(|e| AdminServiceError::UpstreamError(e.to_string()))
     }
 
+    /// 创建前探测代挂上游模型列表（`POST /credentials/probe-models`）。
+    ///
+    /// 凭据**还不存在**时的临时探测：构造一个仅含 base_url/api_key 的临时
+    /// `KiroCredentials` 打 `GET {base}/v1/models`，**不持久化**。与
+    /// [`Self::probe_upstream_models`]（需已有 id）共用同一个 `fetch_upstream_models`。
+    pub async fn probe_models_standalone(
+        &self,
+        base_url: &str,
+        api_key: Option<&str>,
+    ) -> Result<Vec<String>, AdminServiceError> {
+        let base_url = base_url.trim();
+        if base_url.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "自定义 API 凭据缺少 base_url".to_string(),
+            ));
+        }
+        let cred = crate::kiro::model::credentials::KiroCredentials {
+            base_url: Some(base_url.to_string()),
+            api_key: api_key.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+            ..Default::default()
+        };
+        let cfg = self.token_manager.config();
+        let proxy = cfg
+            .proxy_url
+            .as_deref()
+            .map(|u| crate::http_client::ProxyConfig::new(u.to_string()));
+        crate::kiro::passthrough::fetch_upstream_models(&cred, proxy.as_ref(), cfg.tls_backend)
+            .await
+            .map_err(|e| AdminServiceError::UpstreamError(e.to_string()))
+    }
+
     pub fn set_credential_endpoint(
         &self,
         id: u64,
@@ -1757,8 +1788,9 @@ impl AdminService {
             scopes: req.scopes,
             priority: req.priority,
             rpm_limit: req.rpm_limit,
-            // 新增号默认不设白名单（不限制）；上号后经 /credentials/{id}/allowed-models 单独设置。
-            allowed_models: None,
+            // 新增号白名单：创建表单已探测勾选时直接用；未给（None）则不限制，
+            // 上号后仍可经 /credentials/{id}/allowed-models 单独设置。
+            allowed_models: req.allowed_models,
             tested_models: None,
             // 自定义 API 代挂透传字段（auth_method=custom_api 时由前端填入）。
             base_url: req.base_url,

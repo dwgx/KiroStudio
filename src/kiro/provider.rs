@@ -50,6 +50,13 @@ const SMALL_POOL_THRESHOLD: usize = 3;
 /// `total_upstream_attempts_are_capped_per_request_not_per_round`。
 const ABSOLUTE_MAX_TOTAL_RETRIES: usize = 12;
 
+/// 上游 429 率滑动窗口的时长（秒）。
+///
+/// 窗口内每响应喂一次成功/429 布尔，`rate()` 返回近期 429 占比，供
+/// [`apply_retry_pressure`] 动态降档。60s 对齐 throttle 的观察窗口径，既不反应过
+/// 快的瞬时抖动（去抖交给 AIMD 的 3s 窗口），也不至于滞后到跟不上风控节奏。
+const PRESSURE_WINDOW_SECS: u64 = 60;
+
 /// 单个入站请求的重试墙钟预算（秒）。
 ///
 /// ⚠️ 关键防雪崩闸门：小号池下，一个卡住的请求会在每次重试时抢到刚出冷却的号、
@@ -492,6 +499,71 @@ fn compute_max_retries(total: usize, _available: usize) -> usize {
         .max(1)
 }
 
+/// 近期上游 429 率滑动窗口。
+///
+/// 每次上游响应喂一个布尔（成功 false / 429 true），窗口保留近 [`PRESSURE_WINDOW_SECS`]
+/// 秒。`rate()` 返回窗口内 429 占比，供 [`apply_retry_pressure`] 动态降重试预算。
+///
+/// 热路径取舍：短临界区（一次 push + 逐出），锁竞争可接受 —— 即使内部 1000 RPM，
+/// 每秒也才 17 次写，远低于锁的吞吐上限。
+struct RetryPressureWindow {
+    deque: std::collections::VecDeque<(std::time::Instant, bool)>,
+    window: std::time::Duration,
+}
+
+impl RetryPressureWindow {
+    fn new(window_secs: u64) -> Self {
+        Self {
+            deque: std::collections::VecDeque::new(),
+            window: std::time::Duration::from_secs(window_secs),
+        }
+    }
+
+    /// 记录一次上游响应结果。顺带惰性逐出超窗事件（不额外起定时器）。
+    fn record(&mut self, is_429: bool) {
+        let now = std::time::Instant::now();
+        self.deque.push_back((now, is_429));
+        while let Some(&(t, _)) = self.deque.front() {
+            if now.duration_since(t) > self.window {
+                self.deque.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// 窗口内 429 占比（0.0..=1.0）。空窗口返 0（无信号 = 不降档）。
+    fn rate(&self) -> f32 {
+        let total = self.deque.len();
+        if total == 0 {
+            return 0.0;
+        }
+        let n_429 = self.deque.iter().filter(|(_, is_429)| *is_429).count();
+        n_429 as f32 / total as f32
+    }
+}
+
+/// 按近期 429 率动态降档重试预算。
+///
+/// 疯狂重试（号多 + 429 多）时每个请求扫 12 个号纯属放大受害面 —— 重试再多也换不到
+/// 好号（大家都在被限流），不如降档让客户端更快拿到错误自己退避。阶梯：
+/// - 429 率 > 50%：预算 × 33/100（如 12 → 4）
+/// - 429 率 > 30%：预算 × 1/2（如 12 → 6）
+/// - 否则：不变
+///
+/// 只在 `base_retry_quota`（循环外一次计算）处乘系数，`round_retry_quota` 的
+/// `min(剩余总额)` 语义天然把降档收进每请求预算，跨吸收轮不叠加。
+fn apply_retry_pressure(base: usize, rate: f32) -> usize {
+    let scaled = if rate > 0.5 {
+        base * 33 / 100
+    } else if rate > 0.3 {
+        base / 2
+    } else {
+        base
+    };
+    scaled.max(1)
+}
+
 /// 一次成功调用的元数据（随响应回传给上层，供用量统计埋点关联）
 ///
 /// provider 层掌握凭据/重试/延迟，但看不到最终 usage/credits（流式消费后才知道）；
@@ -608,6 +680,13 @@ pub struct KiroProvider {
     /// 端点桶 429 封禁状态：key = (credential_id, endpoint_name)，value = 解封时刻。
     /// 同一凭据的多端点（如 ksk_ 的 `cli`/`cli-runtime`）是上游的独立限流桶，某桶被封不波及其它。
     endpoint_buckets: Mutex<HashMap<(u64, String), Instant>>,
+    /// 全局上游并发闸：限制**同时在飞**的上游 HTTP 调用数（容量来自
+    /// `upstream_concurrency_limit`，重启生效）。防「号多 + 429 多 → 疯狂换号重试」
+    /// 把内部上游 RPM 放大到外部 RPM 的十几倍。`OwnedSemaphorePermit` 跨 send 存活、
+    /// 作用域结束自动 Drop 释放，免费防泄漏。
+    upstream_gate: Arc<tokio::sync::Semaphore>,
+    /// 近 60s 上游结果滑动窗口（成功/429），喂给 [`apply_retry_pressure`] 做动态降档。
+    retry_pressure: Mutex<RetryPressureWindow>,
 }
 
 impl KiroProvider {
@@ -638,6 +717,10 @@ impl KiroProvider {
         let mut cache = HashMap::new();
         cache.insert(proxy.clone(), initial_client);
 
+        let concurrency_limit = token_manager
+            .config()
+            .upstream_concurrency_limit
+            .max(1);
         Self {
             token_manager,
             global_proxy: proxy,
@@ -646,6 +729,8 @@ impl KiroProvider {
             endpoints,
             default_endpoint,
             endpoint_buckets: Mutex::new(HashMap::new()),
+            upstream_gate: Arc::new(tokio::sync::Semaphore::new(concurrency_limit)),
+            retry_pressure: Mutex::new(RetryPressureWindow::new(PRESSURE_WINDOW_SECS)),
         }
     }
 
@@ -1310,7 +1395,21 @@ impl KiroProvider {
             // 抬高 —— 生产日志的 `尝试 8/36` 即由此而来。见 kiro_selectable_count 的说明。
             {
                 let selectable = self.token_manager.kiro_selectable_count();
-                compute_max_retries(selectable, selectable)
+                // 动态降档：近期 429 率高（疯狂重试）时按比例收缩预算，避免号多 + 429 多
+                // 时每个请求扫 12 个号、把内部上游 RPM 放大到外部 RPM 的十几倍。
+                // 只在进循环前算一次，跨轮不叠加。
+                let raw = compute_max_retries(selectable, selectable);
+                let pressure = self.retry_pressure.lock().rate();
+                let scaled = apply_retry_pressure(raw, pressure);
+                if scaled != raw {
+                    tracing::warn!(
+                        "上游 429 率 {:.1}% 过高，重试预算从 {} 动态降档到 {}（防内部放大）",
+                        pressure * 100.0,
+                        raw,
+                        scaled
+                    );
+                }
+                scaled
             };
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
@@ -1636,6 +1735,35 @@ impl KiroProvider {
 
                 last_credential_id = Some(ctx.id);
 
+                // ⭐ 全局上游并发闸：限制**同时在飞**的上游 HTTP 调用数（防放大）。
+                //
+                // 拿 `OwnedSemaphorePermit` 跨 `send().await` 存活、响应头拿到后离开本
+                // 作用域自动 Drop 释放 —— 免费防泄漏。**不用 `acquire().await`**（无限等待
+                // 会把客户端延迟堆到秒级，与 gate 满时"系统已饱和"的语义矛盾）：
+                // `try_acquire_owned` 拿不到就 **break 本轮重试**（而非 continue 无 sleep 空转），
+                // 把错误透传给客户端让它自己退避。
+                //
+                // ⚠️ 不递增 `upstream_calls`：闸门挡住的是"根本没发出去"的调用，不该占用
+                // 「每请求 ≤12 次上游调用」的额度 —— 该不变量（含吸收层、墙钟闸门、
+                // round_retry_quota）全部不受影响。
+                let _gate = match self.upstream_gate.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        tracing::warn!(
+                            "上游并发闸已满（{} 在飞），本轮重试 break 以免放大（尝试 {}/{}）",
+                            self.upstream_gate.available_permits(),
+                            attempt + 1,
+                            max_retries
+                        );
+                        last_error = Some(anyhow::anyhow!(
+                            "上游并发闸已满({} 在飞)，停止本轮重试以免放大",
+                            self.upstream_gate.available_permits()
+                        ));
+                        last_outcome = crate::usage::RequestOutcome::RateLimited;
+                        break;
+                    }
+                };
+
                 let send_result = request.send().await;
                 // ⭐ 额度只在这里累加:此刻请求**已经发出去了**(无论上游怎么回、哪怕连接失败),
                 // 才算真花掉一次「打上游」的机会。放在 send 之后而非循环顶部是本修复的全部内容。
@@ -1664,6 +1792,11 @@ impl KiroProvider {
                 };
 
                 let status = response.status();
+
+                // 喂动态降档信号：**每个**上游响应都记一次（成功 false / 429 true），
+                // 供 base_retry_quota 处的 apply_retry_pressure 收缩重试预算。
+                // 与 AIMD 的 report_upstream_rate_limited 是两套独立机制、两套门控，勿混。
+                self.retry_pressure.lock().record(status.as_u16() == 429);
 
                 // 成功响应
                 if status.is_success() {
@@ -2778,6 +2911,71 @@ impl KiroProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 动态降档阶梯的边界：0/0.3/0.5 为不变档，0.31/0.51 触发降档，地板 1。
+    #[test]
+    fn test_apply_retry_pressure_staircase() {
+        assert_eq!(apply_retry_pressure(12, 0.0), 12);
+        assert_eq!(apply_retry_pressure(12, 0.3), 12, "0.3 恰好是阈值，不降");
+        assert_eq!(apply_retry_pressure(12, 0.5), 6, "0.5 未过 0.5 档但过 0.3 档 → 砍半");
+        assert_eq!(apply_retry_pressure(12, 0.31), 6, ">0.3 砍半");
+        assert_eq!(apply_retry_pressure(12, 0.51), 3, ">0.5 砍到 33%（12*33/100=3）");
+        assert_eq!(apply_retry_pressure(12, 1.0), 3, "满额 429 也只砍到 3，不归零");
+        assert_eq!(apply_retry_pressure(1, 1.0), 1, "地板 1：降档绝不归零");
+        assert_eq!(apply_retry_pressure(3, 0.51), 1, "3 的 33% 向下取整到 1");
+    }
+
+    /// 窗口 rate() 是纯计算：直接注入状态验证 429 占比。
+    #[test]
+    fn test_retry_pressure_window_rate() {
+        let mut w = RetryPressureWindow::new(60);
+        assert_eq!(w.rate(), 0.0, "空窗口无信号，不降档");
+        // 5 成功 + 5 个 429 → 50%
+        for i in 0..10 {
+            w.deque.push_back((std::time::Instant::now(), i % 2 == 1));
+        }
+        assert!((w.rate() - 0.5).abs() < 1e-6);
+        // 全 429 → 100%
+        let mut w2 = RetryPressureWindow::new(60);
+        for _ in 0..4 {
+            w2.deque.push_back((std::time::Instant::now(), true));
+        }
+        assert_eq!(w2.rate(), 1.0);
+    }
+
+    /// record() 顺带逐出超窗事件：极小窗口 + sleep 后，旧事件被清出。
+    #[tokio::test]
+    async fn test_retry_pressure_window_prune_expired() {
+        let mut w = RetryPressureWindow::new(1); // 1s 窗口
+        w.record(true);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(w.deque.len(), 1, "窗口内一条还在");
+        // 换一个 0 秒窗口：第二次 record 必把第一条逐出
+        let mut w0 = RetryPressureWindow::new(0);
+        w0.record(true);
+        w0.record(false);
+        assert_eq!(w0.deque.len(), 1, "0 秒窗口下第一条立即过期");
+        assert_eq!(w0.rate(), 0.0, "剩下的那一条是 false");
+    }
+
+    /// 并发闸 Semaphore：容量 N 时 N 个 permit 全过、第 N+1 拿不到、Drop 后恢复。
+    #[tokio::test]
+    async fn test_upstream_gate_concurrency() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(2));
+        let p1 = gate.clone().try_acquire_owned().unwrap();
+        let p2 = gate.clone().try_acquire_owned().unwrap();
+        assert!(
+            gate.clone().try_acquire_owned().is_err(),
+            "容量 2 时第 3 个拿不到"
+        );
+        drop(p1);
+        let p3 = gate.clone().try_acquire_owned().unwrap();
+        drop(p2);
+        drop(p3);
+        let p4 = gate.clone().try_acquire_owned().unwrap();
+        drop(p4);
+        assert_eq!(gate.available_permits(), 2, "全部 Drop 后 permit 复原");
+    }
 
     /// 预算恒被 `ABSOLUTE_MAX_TOTAL_RETRIES` 封顶，**且刻意不再随可用号数抬高**。
     ///

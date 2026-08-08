@@ -1126,7 +1126,7 @@ export function CredentialCard({
                 </label>
 
                 {/* 上游模型探测：模型只能从上游获取（不硬编码）。探测结果勾选 = allowed_models 白名单。 */}
-                <div className="space-y-1.5 border-t pt-2">
+                <div className="space-y-1.5 border-t pt-3">
                   <div className="flex items-center justify-between gap-2">
                     <label className="text-xs text-muted-foreground">
                       {t('credentialcard.settings.upstreamModelsLabel')}

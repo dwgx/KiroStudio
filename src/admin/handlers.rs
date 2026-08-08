@@ -118,6 +118,25 @@ pub async fn probe_upstream_models(
     }
 }
 
+/// POST /api/admin/credentials/probe-models —— 创建前探测代挂上游模型列表（不依赖凭据 id）。
+///
+/// 与 `GET /credentials/{id}/upstream-models` 的区别：凭据还不存在时用于创建表单的临时探测。
+/// body: `{ "baseUrl": "https://...", "apiKey": "sk-..." }`；不持久化任何东西。
+pub async fn probe_models_standalone(
+    State(state): State<AdminState>,
+    Json(payload): Json<crate::admin::types::ProbeModelsRequest>,
+) -> impl IntoResponse {
+    let base_url = payload.base_url.as_deref().unwrap_or_default();
+    match state
+        .service
+        .probe_models_standalone(base_url, payload.api_key.as_deref())
+        .await
+    {
+        Ok(models) => Json(serde_json::json!({ "models": models })).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/credentials/:id/deepseek-normalize  body: `{ "deepseekNormalize": true }`
 ///
 /// 设置代挂凭据的 deepseek 协议归一化开关（仅 custom_api 有意义；非 custom_api 后端 gate 拒绝）。

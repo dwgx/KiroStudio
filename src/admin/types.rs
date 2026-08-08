@@ -452,6 +452,11 @@ pub struct AddCredentialRequest {
     /// true 时透传前按 fuckopencode 的 deepseek 协议修复改写请求体。
     #[serde(default)]
     pub deepseek_normalize: Option<bool>,
+    /// 代挂模型白名单（创建时从上游探测勾选而来，None/空 = 不限制）。
+    /// 与设置弹框的 `set_allowed_models` 写同一字段；创建时直接带上可省一次
+    /// 「创建后再探测再保存」的往返。
+    #[serde(default)]
+    pub allowed_models: Option<Vec<String>>,
 
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
@@ -593,6 +598,27 @@ pub struct AddCredentialRequest {
 
 fn default_auth_method() -> String {
     "social".to_string()
+}
+
+/// 创建前探测代挂上游模型列表的请求（`POST /credentials/probe-models`）。
+///
+/// 与已存在的 `GET /credentials/{id}/upstream-models` 的差别：那个需要**已存在的
+/// credential id**（探测结果落到设置弹框），本端点用于**创建表单**里凭据还不存在时
+/// 的临时探测 —— 只构造临时凭据打上游，**不持久化任何东西**。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeModelsRequest {
+    /// 自定义 API 上游基址（Anthropic 兼容中转站，必填）
+    pub base_url: Option<String>,
+    /// 自定义 API 密钥（可选，部分中转站无需鉴权也能列模型）
+    pub api_key: Option<String>,
+}
+
+/// 创建前探测代挂上游模型列表的响应。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeModelsResponse {
+    pub models: Vec<String>,
 }
 
 /// 添加凭据成功响应

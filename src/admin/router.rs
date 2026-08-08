@@ -13,8 +13,9 @@ use super::{
         external_idp_leg2, external_idp_leg2_select, force_refresh_token, get_all_credentials,
         get_cached_balances, get_config, get_credential_balance, get_load_balancing_mode,
         get_overage_status, import_keys, list_socks_nodes, list_trash, perform_update,
-        poll_idc_login, poll_social_login, probe_available_models, probe_regions, proxy_test,
-        probe_upstream_models, purge_credential, purge_trash_batch, recovery_metrics,
+        poll_idc_login, poll_social_login, probe_available_models, probe_models_standalone,
+        probe_regions, proxy_test, probe_upstream_models, purge_credential, purge_trash_batch,
+        recovery_metrics,
         reset_failure_count, restart_service, restore_credential, set_credential_allowed_models,
         set_credential_api_region, set_credential_custom_api,
         set_credential_deepseek_normalize, set_credential_disabled,
@@ -107,6 +108,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
         )
         // 代挂凭据探测上游可用模型（custom_api 专属）。
         .route("/credentials/{id}/upstream-models", get(probe_upstream_models))
+        // 创建前临时探测上游模型（凭据还不存在；构造临时凭据打上游，不持久化）。
+        .route("/credentials/probe-models", post(probe_models_standalone))
         .route("/credentials/{id}/name", post(set_credential_name))
         .route("/credentials/{id}/tag", post(set_credential_tag))
         // 给已有号再加 N 份分身。刻意按 id 而不是让前端重发 key：
