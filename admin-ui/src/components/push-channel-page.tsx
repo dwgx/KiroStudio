@@ -252,7 +252,21 @@ function RecordRow({ record }: { record: ImportRecord }) {
                 <Badge variant={!item.ok ? 'warning' : item.duplicate ? 'secondary' : 'success'}>
                   {t(!item.ok ? 'pushchannel.result.failed' : item.duplicate ? 'pushchannel.result.duplicate' : 'pushchannel.result.imported')}
                 </Badge>
-                <code className="text-foreground">{item.key}</code>
+                <code className="select-all break-all text-foreground">{item.key}</code>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-5 shrink-0 px-1"
+                  title={t('opspage.import.copyKey')}
+                  onClick={async () => {
+                    const ok = await copyToClipboard(item.key)
+                    toast[ok ? 'success' : 'error'](
+                      t(ok ? 'opspage.import.keyCopied' : 'pushchannel.toast.copyFailed'),
+                    )
+                  }}
+                >
+                  <Copy className="h-3 w-3" />
+                </Button>
                 <span className="font-mono text-muted-foreground">sha256:{item.fingerprint}</span>
                 {item.deliveryId && <span className="font-mono text-muted-foreground">delivery:{item.deliveryId}</span>}
                 {item.credentialId != null && <span className="text-muted-foreground">#{item.credentialId}</span>}
