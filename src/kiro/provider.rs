@@ -523,6 +523,11 @@ impl RetryPressureWindow {
     fn record(&mut self, is_429: bool) {
         let now = std::time::Instant::now();
         self.deque.push_back((now, is_429));
+        self.prune(now);
+    }
+
+    /// 逐出超过窗口的事件（记录与读取共用，避免 rate() 读到空闲前的陈旧高 429）。
+    fn prune(&mut self, now: std::time::Instant) {
         while let Some(&(t, _)) = self.deque.front() {
             if now.duration_since(t) > self.window {
                 self.deque.pop_front();
@@ -533,7 +538,8 @@ impl RetryPressureWindow {
     }
 
     /// 窗口内 429 占比（0.0..=1.0）。空窗口返 0（无信号 = 不降档）。
-    fn rate(&self) -> f32 {
+    fn rate(&mut self) -> f32 {
+        self.prune(std::time::Instant::now());
         let total = self.deque.len();
         if total == 0 {
             return 0.0;
@@ -546,9 +552,9 @@ impl RetryPressureWindow {
 /// 按近期 429 率动态降档重试预算。
 ///
 /// 疯狂重试（号多 + 429 多）时每个请求扫 12 个号纯属放大受害面 —— 重试再多也换不到
-/// 好号（大家都在被限流），不如降档让客户端更快拿到错误自己退避。阶梯：
-/// - 429 率 > 50%：预算 × 33/100（如 12 → 4）
-/// - 429 率 > 30%：预算 × 1/2（如 12 → 6）
+/// 好号（大家都在被限流），不如降档让客户端更快拿到错误自己退避。阶梯（整数除法）：
+/// - 429 率 > 50%：预算 × 33/100（12 → 3）
+/// - 429 率 > 30%：预算 × 1/2（12 → 6）
 /// - 否则：不变
 ///
 /// 只在 `base_retry_quota`（循环外一次计算）处乘系数，`round_retry_quota` 的
@@ -1750,16 +1756,22 @@ impl KiroProvider {
                     Ok(permit) => permit,
                     Err(_) => {
                         tracing::warn!(
-                            "上游并发闸已满（{} 在飞），本轮重试 break 以免放大（尝试 {}/{}）",
-                            self.upstream_gate.available_permits(),
+                            "上游并发闸已满，本轮重试 break 以免放大（尝试 {}/{}）",
                             attempt + 1,
                             max_retries
                         );
-                        last_error = Some(anyhow::anyhow!(
-                            "上游并发闸已满({} 在飞)，停止本轮重试以免放大",
-                            self.upstream_gate.available_permits()
-                        ));
-                        last_outcome = crate::usage::RequestOutcome::RateLimited;
+                        // ⚠️ 只在还没有更具体错误时设置 gate-full 错误：链内若先有可吸收的
+                        // 429（带 retry_after_secs），覆盖它会把这轮错误判成"不可吸收"而旁路
+                        // 吸收层。`last_error` 已有值时保留原错误，仅 break 本轮。
+                        if last_error.is_none() {
+                            // 带 `upstream_gate_full=1` + `retry_after_secs` 供 handlers 的
+                            // map_provider_error 识别成 429 + Retry-After（让客户端退避，
+                            // 而不是 502 让客户端立即重发、重新灌满闸门）。
+                            last_error = Some(anyhow::anyhow!(
+                                "上游并发闸已满，停止本轮重试以免放大 upstream_gate_full=1 retry_after_secs=2"
+                            ));
+                            last_outcome = crate::usage::RequestOutcome::RateLimited;
+                        }
                         break;
                     }
                 };

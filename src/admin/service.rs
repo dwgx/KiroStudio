@@ -846,6 +846,13 @@ impl AdminService {
                 "自定义 API 凭据缺少 base_url".to_string(),
             ));
         }
+        // 🔴 SSRF 防护必须与 create/set 路径一致：probe 会**直接**拿用户给的 base_url
+        // 打上游，若不加这道 IP 层校验，可被用来打内网/169.254 元数据（响应虽只回模型
+        // 列表，但错误消息可盲扫端口）。写入路径的主防线 `validate_custom_api_base_url`
+        // 在这里同样要走，否则 probe 就成了唯一绕开它的口子。
+        crate::kiro::token_manager::validate_custom_api_base_url(base_url)
+            .await
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
         let cred = crate::kiro::model::credentials::KiroCredentials {
             base_url: Some(base_url.to_string()),
             api_key: api_key.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
@@ -1790,7 +1797,19 @@ impl AdminService {
             rpm_limit: req.rpm_limit,
             // 新增号白名单：创建表单已探测勾选时直接用；未给（None）则不限制，
             // 上号后仍可经 /credentials/{id}/allowed-models 单独设置。
-            allowed_models: req.allowed_models,
+            // 归一化对齐 set 路径（trim + 去空串 + 空表→None），防空白项 fail-closed。
+            allowed_models: req.allowed_models.and_then(|v| {
+                let cleaned: Vec<String> = v
+                    .into_iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if cleaned.is_empty() {
+                    None
+                } else {
+                    Some(cleaned)
+                }
+            }),
             tested_models: None,
             // 自定义 API 代挂透传字段（auth_method=custom_api 时由前端填入）。
             base_url: req.base_url,

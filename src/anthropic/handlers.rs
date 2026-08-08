@@ -1109,6 +1109,28 @@ fn map_provider_error(err: Error) -> Response {
             .into_response();
     }
 
+    // 上游并发闸已满（网关自己的背压，见 provider.rs 的 `upstream_gate_full=1`）。
+    // 与 `inbound_admission_timeout` 同语义：必须 429 + Retry-After 让客户端退避，
+    // 而不是落 502（502 会让客户端立即重发，重新灌满闸门，放大反而更凶）。
+    // message 带 "gateway-side backpressure" 让重试层可区分，不当作上游问题重试。
+    if err_str.contains("upstream_gate_full=1") {
+        let retry_after = parse_retry_after_secs(&err_str).unwrap_or(2).clamp(1, 300);
+        tracing::warn!(
+            retry_after_secs = retry_after,
+            "上游并发闸已满（网关背压），返回 429 + Retry-After；不可吸收"
+        );
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, retry_after.to_string())],
+            Json(ErrorResponse::new(
+                "rate_limit_error",
+                "Gateway upstream concurrency gate is full (too many in-flight upstream calls). \
+                 This is gateway-side backpressure, not an upstream cooldown; retrying immediately will not help.",
+            )),
+        )
+            .into_response();
+    }
+
     // 全池冷却快速失败：token_manager 全池都在冷却时会带 retry_after_secs=N 快速 bail。
     // 这里透传成标准 429 + Retry-After 头，让客户端(Claude Code)按其自身退避策略重试——
     // 比网关内硬扛温和，也减少对被风控号的试探。
