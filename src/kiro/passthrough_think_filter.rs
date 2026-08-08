@@ -51,6 +51,12 @@ where
 
 /// 过滤非流式 JSON 响应里的 thinking content blocks（fail-open：解析失败原样返回）。
 pub fn filter_json_bytes(bytes: &[u8]) -> Bytes {
+    filter_json_bytes_with(bytes, true)
+}
+
+/// [`filter_json_bytes`] 的可配置版本：`strip_inline` 控制是否剥 text 块里的
+/// 内联 `<thinking>...</thinking>` 标签（与流式 [`filter_sse_stream_with`] 对齐）。
+pub fn filter_json_bytes_with(bytes: &[u8], strip_inline: bool) -> Bytes {
     let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(bytes) else {
         return Bytes::copy_from_slice(bytes);
     };
@@ -66,15 +72,18 @@ pub fn filter_json_bytes(bytes: &[u8]) -> Bytes {
         )
     });
     // 剥 text 块里的内联 `<thinking>...</thinking>` 标签（deepseek 可能以文本形式吐）。
-    let mut in_inline_thinking = false;
-    for block in content.iter_mut() {
-        if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-            if let Some(text_val) = block.get_mut("text") {
-                if let Some(s) = text_val.as_str() {
-                    *text_val = serde_json::Value::String(strip_inline_thinking(
-                        s,
-                        &mut in_inline_thinking,
-                    ));
+    // ⚠️ 受 `strip_inline` 控制，与流式路径一致（配置 false 时不剥）。
+    if strip_inline {
+        let mut in_inline_thinking = false;
+        for block in content.iter_mut() {
+            if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                if let Some(text_val) = block.get_mut("text") {
+                    if let Some(s) = text_val.as_str() {
+                        *text_val = serde_json::Value::String(strip_inline_thinking(
+                            s,
+                            &mut in_inline_thinking,
+                        ));
+                    }
                 }
             }
         }
@@ -384,16 +393,19 @@ impl SseFilterState {
                 // output_tokens」口径。message_start 的 usage 不动（record 口径绑定）。
                 //
                 // ⚠️ 用 `thinking_chars - deducted_chars` 只扣**尚未扣过的**部分：上游可能发
-                // 多个 message_delta（增量 usage），同一份 thinking 字符不能扣 N 次。
+                // 多个 message_delta（增量/累计 usage），同一份 thinking 字符不能扣 N 次。
+                // `deducted_chars` 只在**真扣减后**前移：若本 delta 无 usage 或缺 output_tokens
+                //（有些上游 message_delta 只有 stop_reason），跳过但**不**前移，留给后续有
+                // usage 的 delta 扣。
                 if self.thinking_chars > self.deducted_chars {
                     if let Some(usage) = v.get_mut("usage").and_then(|u| u.as_object_mut()) {
                         if let Some(out) = usage.get("output_tokens").and_then(|x| x.as_u64()) {
                             let deduct = ((self.thinking_chars - self.deducted_chars) / 4) as u64;
                             usage["output_tokens"] =
                                 serde_json::json!(out.saturating_sub(deduct));
+                            self.deducted_chars = self.thinking_chars;
                         }
                     }
-                    self.deducted_chars = self.thinking_chars;
                 }
                 Some(Self::rewrite_event(event_type, &v))
             }
@@ -751,7 +763,8 @@ mod tests {
         );
     }
 
-    /// 🔴 回归：多个 message_delta（增量 usage）时，thinking 扣减不能重复——只扣一次。
+    /// 🔴 回归：多个 message_delta（累计 usage，客户端读最后一条）时，thinking 扣减只扣一次，
+    /// 且落在最后一条上。旧代码每条都扣（重复）；错误实现只扣第一条会丢扣减（客户端读最后）。
     #[tokio::test]
     async fn test_filter_sse_stream_deducts_thinking_once_across_multiple_deltas() {
         let input = format!(
@@ -776,15 +789,57 @@ mod tests {
             ),
             event(
                 "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":500}}"#
+            ),
+        );
+        let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(input))]);
+        let filtered = collect_filtered(filter_sse_stream(stream)).await;
+        // 递增累计（300→500）：第一条扣 10 → 290；第二条已扣过（deducted_chars=40）不再扣 → 500。
+        // 客户端读最后一条 500（未重复扣）。若旧代码重复扣，第二条会成 490 → 断言 500 能区分。
+        assert!(
+            filtered.contains("\"output_tokens\":290"),
+            "第一条 delta 应扣 10（300-10=290），实际: {filtered}"
+        );
+        assert!(
+            filtered.contains("\"output_tokens\":500"),
+            "第二条 delta 不应重复扣（500 保持），旧代码会重复扣成 490，实际: {filtered}"
+        );
+    }
+
+    /// 🔴 回归：无 usage 的 message_delta 不触发扣减，也不前移 deducted_chars——
+    /// 后续有 usage 的 delta 仍能扣。
+    #[tokio::test]
+    async fn test_filter_sse_stream_deducts_on_delta_with_usage_only() {
+        let input = format!(
+            "{}{}{}{}{}{}",
+            event(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#
+            ),
+            event(
+                "content_block_delta",
+                // 40 字符 thinking → 10 token
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#
+            ),
+            event("content_block_stop", r#"{"type":"content_block_stop","index":0}"#),
+            event(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#
+            ),
+            event(
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"}}"#
+            ),
+            event(
+                "message_delta",
                 r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":300}}"#
             ),
         );
         let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(input))]);
         let filtered = collect_filtered(filter_sse_stream(stream)).await;
-        // 两次 message_delta 各扣一次会变成 280；正确是只扣一次 → 290。
         assert!(
             filtered.contains("\"output_tokens\":290"),
-            "多 message_delta 只应扣减一次（300-10=290），重复扣会成 280，实际: {filtered}"
+            "无 usage 的首条 delta 不应前移 deducted_chars，第二条有 usage 应扣 10（300-10=290），实际: {filtered}"
         );
     }
 

@@ -19,7 +19,7 @@ use crate::common::http_read::read_body_capped;
 use crate::http_client::build_streaming_client_no_redirect;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::passthrough_think_filter::{
-    filter_json_bytes, filter_sse_stream, filter_sse_stream_with, guard_empty_stream,
+    filter_json_bytes_with, filter_sse_stream_with, guard_empty_stream,
 };
 use crate::model::config::TlsBackend;
 
@@ -169,16 +169,16 @@ pub async fn forward(
     // 其余 custom_api 保持零转换字节流（隔离铁律 3）。流式逐事件滤 thinking 块仍流式回传;
     // 非流式读完整 body 滤 thinking content blocks。解析失败 fail-open 原样透传。
     let filter_thinking = ds_cfg.is_some();
+    // 内联 `<thinking>` 剥离开关取配置（流式 + 非流式共用，cfg 已提到作用域）。
+    let strip_inline = ds_cfg
+        .as_ref()
+        .map_or(true, |c| c.strip_inline_thinking);
 
     let resp = if filter_thinking && content_type.contains("text/event-stream") {
         let byte_stream = upstream.bytes_stream().map_err(|e| {
             tracing::warn!("[透传] 上游流读取中断,以错误终止响应流(客户端可据此重试): {e}");
             axum::Error::new(e)
         });
-        // 内联 `<thinking>` 剥离开关取配置（cfg 已提到作用域）。
-        let strip_inline = ds_cfg
-            .as_ref()
-            .map_or(true, |c| c.strip_inline_thinking);
         Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, content_type)
@@ -194,7 +194,8 @@ pub async fn forward(
         // 用 read_body_capped 给 body 加 32MiB 上限,防恶意上游吐超大 JSON 顶爆内存。
         match read_body_capped(upstream, "透传非流式响应", PASSTHROUGH_JSON_CAP_BYTES).await {
             Ok(body) => {
-                let filtered = filter_json_bytes(&body);
+                // ⚠️ 非流式也要接 strip_inline_thinking 配置（与流式一致，否则配置 false 仍剥）。
+                let filtered = filter_json_bytes_with(&body, strip_inline);
                 Response::builder()
                     .status(status)
                     .header(header::CONTENT_TYPE, content_type)
