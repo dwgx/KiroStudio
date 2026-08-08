@@ -131,9 +131,9 @@ export async function getRecoveryMetrics(): Promise<RecoveryMetrics> {
 
 // ============ 外部凭据推送（import-stats）============
 // 对方系统按契约往 POST /api/import/keys 推 ksk_ 凭据，这里是该通道的可观测快照。
-// 进程级内存、重启归零；key 已在后端打码，明文密钥绝不出现在响应里。
+// 进程级内存、重启归零；此接口受 admin 鉴权保护，记录包含可复制的完整 key。
 export interface ImportItemRecord {
-  /** 既有批量通道为完整 key；Relay 专属记录为打码 key。 */
+  /** 已鉴权管理后台使用的完整 key；不持久化，推送响应仍为打码值。 */
   key: string
   /** key 指纹(SHA-256 前 8 位)。与凭据管理页显示的指纹同源,用于确认是同一个 key。 */
   fingerprint: string
