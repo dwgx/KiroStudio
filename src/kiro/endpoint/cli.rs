@@ -50,11 +50,58 @@ impl CliEndpoint {
 
     /// aws-sdk-rust 版 UA，带 `app/AmazonQ-For-CLI` 标识（区别于 IDE 的 aws-sdk-js/KiroIDE）。
     fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
-        format!(
-            "aws-sdk-rust/1.0.0 ua/2.1 os/other lang/rust api/codewhispererstreaming#1.28.3 m/E app/AmazonQ-For-CLI md/appVersion-1.28.3-{}",
-            ctx.machine_id
-        )
+        cli_user_agent(ctx.machine_id)
     }
+}
+
+/// CLI 协议 UA（`app/AmazonQ-For-CLI` 标识），`cli` / `cli-runtime` / `codewhisperer` /
+/// `amazonq` 四个端点共用同一形状（区别于 IDE 的 aws-sdk-js/KiroIDE）。
+pub(crate) fn cli_user_agent(machine_id: &str) -> String {
+    format!(
+        "aws-sdk-rust/1.0.0 ua/2.1 os/other lang/rust api/codewhispererstreaming#1.28.3 m/E app/AmazonQ-For-CLI md/appVersion-1.28.3-{}",
+        machine_id
+    )
+}
+
+/// CLI 协议 API 请求装饰（`cli` / `cli-runtime` / `codewhisperer` / `amazonq` 共用）。
+///
+/// host 与 `X-Amz-Target` 是端点差异，其余头（tokentype / UA / 遥测退出 / agent-mode / 授权）
+/// 全部同构。抽成公共函数避免每加一个 host 就复制一份 headers 导致漂移。
+pub(crate) fn decorate_cli_protocol(
+    req: RequestBuilder,
+    ctx: &RequestContext<'_>,
+    host: String,
+    amz_target: &'static str,
+    ua: String,
+) -> RequestBuilder {
+    req.header("X-Amz-Target", amz_target)
+        .header("tokentype", "API_KEY")
+        .header("x-amzn-codewhisperer-optout", "true")
+        .header("x-amzn-kiro-agent-mode", "vibe")
+        .header("x-amz-user-agent", &ua)
+        .header("user-agent", &ua)
+        .header("host", host)
+        .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=1")
+        .header("Authorization", format!("Bearer {}", ctx.token))
+    // 刻意不注入 profileArn / anthropic-beta：API_KEY 认证不使用 profileArn；
+    // CLI 端点的 1M 窗口由上游按 modelId 决定，不依赖 anthropic-beta 头。
+}
+
+/// CLI 协议 MCP 请求装饰（与 [`decorate_cli_protocol`] 同款复用；MCP 不走 X-Amz-Target 路由）。
+pub(crate) fn decorate_cli_mcp(
+    req: RequestBuilder,
+    ctx: &RequestContext<'_>,
+    host: String,
+    ua: String,
+) -> RequestBuilder {
+    req.header("tokentype", "API_KEY")
+        .header("x-amz-user-agent", &ua)
+        .header("user-agent", &ua)
+        .header("host", host)
+        .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=1")
+        .header("Authorization", format!("Bearer {}", ctx.token))
 }
 
 impl Default for CliEndpoint {
@@ -85,30 +132,11 @@ impl KiroEndpoint for CliEndpoint {
     }
 
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
-        let ua = self.user_agent(ctx);
-        req.header("X-Amz-Target", CLI_AMZ_TARGET)
-            .header("tokentype", "API_KEY")
-            .header("x-amzn-codewhisperer-optout", "true")
-            .header("x-amzn-kiro-agent-mode", "vibe")
-            .header("x-amz-user-agent", &ua)
-            .header("user-agent", &ua)
-            .header("host", self.host(ctx))
-            .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
-            .header("amz-sdk-request", "attempt=1; max=1")
-            .header("Authorization", format!("Bearer {}", ctx.token))
-        // 刻意不注入 profileArn / anthropic-beta：API_KEY 认证不使用 profileArn；
-        // CLI 端点的 1M 窗口由上游按 modelId 决定，不依赖 anthropic-beta 头。
+        decorate_cli_protocol(req, ctx, self.host(ctx), CLI_AMZ_TARGET, self.user_agent(ctx))
     }
 
     fn decorate_mcp(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
-        let ua = self.user_agent(ctx);
-        req.header("tokentype", "API_KEY")
-            .header("x-amz-user-agent", &ua)
-            .header("user-agent", &ua)
-            .header("host", self.host(ctx))
-            .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
-            .header("amz-sdk-request", "attempt=1; max=1")
-            .header("Authorization", format!("Bearer {}", ctx.token))
+        decorate_cli_mcp(req, ctx, self.host(ctx), self.user_agent(ctx))
     }
 
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {

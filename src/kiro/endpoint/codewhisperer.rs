@@ -1,18 +1,17 @@
-//! Kiro CLI 端点（`runtime.{region}.kiro.dev` 变体 / API Key 认证）
+//! Kiro CLI 端点（`codewhisperer.{region}.amazonaws.com` 变体 / API Key 认证）
 //!
 //! 与 [`super::cli`]（`q.{region}.amazonaws.com`）**协议完全同构**：服务根 `/` +
-//! `X-Amz-Target` + `tokentype: API_KEY` + 绝不注入 profileArn，**仅 host 域不同**。
+//! `X-Amz-Target` + `tokentype: API_KEY` + 绝不注入 profileArn，仅 host 域不同。
 //!
-//! # 为什么需要第二个 CLI 端点
+//! # 为什么需要第三个 CLI 端点
 //!
-//! 上游对 `q.{region}.amazonaws.com` 与 `runtime.{region}.kiro.dev` 按 host 划分**独立限流桶**
-//! （参考 kiro2cc `endpoint.rs`：4 端点 = 4 桶）。实测 `q.*` 300 并发 0 个 429、`runtime.*` 31%
-//! （`docs/batch2-region-endpoint-matrix.md`），故默认 **`q.*` 优先**；当 `q.*` 桶被 429 封禁时，
-//! 同一把 `ksk_` key 自动换到本端点（`runtime.*` 桶）继续，绕过该桶限流。
+//! 上游对不同的 host 划分**独立限流桶**（参考 kiro2cc `endpoint.rs`：4 端点 = 4 桶）。
+//! 本端点在 **us-east-1** 走独占主机 `codewhisperer.{region}.amazonaws.com`（与 `q.*` /
+//! `runtime.*` 都独立的桶）；其它区域回退 `q.{region}.amazonaws.com`（与 cli 同一 host，
+//! 但按 kiro2cc 仍算独立桶）。当 `q.*` / `runtime.*` 桶被 429 封禁时可换到本桶继续，
+//! 绕过该桶限流。
 //!
-//! host 域不同，但请求形状与 `cli` 完全一致（Kiro-RS-Tool 2026.1.8 的 CLI 端点同样走
-//! `runtime.{region}.kiro.dev` 服务根，是参考实现）。本端点的 `transform_api_body` / UA /
-//! 全部 head 复用 [`super::cli`]，避免两份协议逻辑漂移。
+//! `transform_api_body` / UA / 全部 head 复用 [`super::cli`]，避免三份协议逻辑漂移。
 
 use reqwest::RequestBuilder;
 
@@ -22,16 +21,16 @@ use super::cli::{
 };
 use super::{KiroEndpoint, RequestContext};
 
-/// Kiro CLI 端点名称（对应 credentials.endpoint / config.defaultEndpoint 的 `"cli-runtime"` 取值）。
-pub const CLI_RUNTIME_ENDPOINT_NAME: &str = "cli-runtime";
+/// Kiro CLI 端点名称（对应 credentials.endpoint / config.defaultEndpoint 的 `"codewhisperer"` 取值）。
+pub const CODEWHISPERER_ENDPOINT_NAME: &str = "codewhisperer";
 
-/// Amazon Q CLI 的目标操作头值（与 `cli` 端点同一协议）。
-const CLI_AMZ_TARGET: &str = "AmazonCodeWhispererStreamingService.GenerateAssistantResponse";
+/// Amazon CodeWhisperer Streaming 的目标操作头值（与 `cli` 端点同一协议）。
+const AMZ_TARGET: &str = "AmazonCodeWhispererStreamingService.GenerateAssistantResponse";
 
-/// Kiro CLI 端点（runtime.* host）
-pub struct CliRuntimeEndpoint;
+/// Kiro CLI 端点（codewhisperer.* host）
+pub struct CodewhispererEndpoint;
 
-impl CliRuntimeEndpoint {
+impl CodewhispererEndpoint {
     pub fn new() -> Self {
         Self
     }
@@ -41,49 +40,56 @@ impl CliRuntimeEndpoint {
         ctx.credentials.effective_upstream_region(ctx.config)
     }
 
+    /// us-east-1 走独占主机 `codewhisperer.{region}.amazonaws.com`，其它区域回退 `q.*`
+    ///（与 kiro2cc `endpoint.rs` 的 `codewhisperer_host_lowered` 一致）。
     fn host(&self, ctx: &RequestContext<'_>) -> String {
-        format!("runtime.{}.kiro.dev", self.api_region(ctx))
-    }
-
-    /// aws-sdk-rust 版 UA，带 `app/AmazonQ-For-CLI` 标识（与 `cli` 端点同形状）。
-    fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
-        cli_user_agent(ctx.machine_id)
+        let region = self.api_region(ctx);
+        if region == "us-east-1" {
+            format!("codewhisperer.{region}.amazonaws.com")
+        } else {
+            format!("q.{region}.amazonaws.com")
+        }
     }
 }
 
-impl Default for CliRuntimeEndpoint {
+impl Default for CodewhispererEndpoint {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl KiroEndpoint for CliRuntimeEndpoint {
+impl KiroEndpoint for CodewhispererEndpoint {
     fn name(&self) -> &'static str {
-        CLI_RUNTIME_ENDPOINT_NAME
+        CODEWHISPERER_ENDPOINT_NAME
     }
 
     fn content_type(&self) -> &'static str {
-        // CLI 协议走 X-Amz-Target 路由，content-type 必须是 x-amz-json-1.0，否则上游返回
-        // UnknownOperationException 的 JSON（非 event-stream），解码器会读到非法帧长而中断。
+        // CLI 协议走 X-Amz-Target 路由，content-type 必须是 x-amz-json-1.0。
         "application/x-amz-json-1.0"
     }
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
         // 服务根路径（末尾 `/`），操作由 X-Amz-Target 头路由。
-        format!("https://runtime.{}.kiro.dev/", self.api_region(ctx))
+        format!("https://{}/", self.host(ctx))
     }
 
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String {
         // CLI 协议同样走服务根 + X-Amz-Target；CLI 号目前不走 MCP，保留同 host 兜底。
-        format!("https://runtime.{}.kiro.dev/", self.api_region(ctx))
+        format!("https://{}/", self.host(ctx))
     }
 
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
-        decorate_cli_protocol(req, ctx, self.host(ctx), CLI_AMZ_TARGET, self.user_agent(ctx))
+        decorate_cli_protocol(
+            req,
+            ctx,
+            self.host(ctx),
+            AMZ_TARGET,
+            cli_user_agent(ctx.machine_id),
+        )
     }
 
     fn decorate_mcp(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
-        decorate_cli_mcp(req, ctx, self.host(ctx), self.user_agent(ctx))
+        decorate_cli_mcp(req, ctx, self.host(ctx), cli_user_agent(ctx.machine_id))
     }
 
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
@@ -104,11 +110,10 @@ impl KiroEndpoint for CliRuntimeEndpoint {
 mod tests {
     use super::*;
 
-    /// 回归：cli-runtime 的 URL 必须是 `runtime.{region}.kiro.dev` 服务根（末尾 `/`、
-    /// 无 `/generateAssistantResponse` 路径）。若打成 IDE 的路径寻址，CLI 协议会拿到
-    /// UnknownOperationException / 403。
+    /// 回归：codewhisperer 的 URL 在 us-east-1 必须是独占 host `codewhisperer.{region}.amazonaws.com`
+    /// 服务根（末尾 `/`、无 `/generateAssistantResponse` 路径）。
     #[test]
-    fn should_target_runtime_service_root_url() {
+    fn should_target_codewhisperer_host_for_us_east_1() {
         use super::super::{KiroEndpoint, RequestContext};
         use crate::kiro::model::credentials::KiroCredentials;
         use crate::model::config::Config;
@@ -125,19 +130,42 @@ mod tests {
             is_1m: false,
         };
 
-        let url = CliRuntimeEndpoint::new().api_url(&ctx);
-        assert_eq!(url, "https://runtime.us-east-1.kiro.dev/");
+        let url = CodewhispererEndpoint::new().api_url(&ctx);
+        assert_eq!(url, "https://codewhisperer.us-east-1.amazonaws.com/");
         assert!(
             !url.contains("generateAssistantResponse"),
             "CLI 协议不用路径寻址操作: {url}"
         );
     }
 
+    /// 非 us-east-1 区域回退 `q.{region}.amazonaws.com`（与 kiro2cc 一致）。
+    #[test]
+    fn should_fall_back_to_q_host_for_non_us_east_1() {
+        use super::super::{KiroEndpoint, RequestContext};
+        use crate::kiro::model::credentials::KiroCredentials;
+        use crate::model::config::Config;
+
+        let mut cred = KiroCredentials::default();
+        cred.kiro_api_key = Some("ksk_test".to_string());
+        cred.region = Some("eu-central-1".to_string());
+        let config = Config::default();
+        let ctx = RequestContext {
+            credentials: &cred,
+            token: "ksk_test",
+            machine_id: "mid",
+            config: &config,
+            is_1m: false,
+        };
+
+        let url = CodewhispererEndpoint::new().api_url(&ctx);
+        assert_eq!(url, "https://q.eu-central-1.amazonaws.com/");
+    }
+
     /// content-type 必须是 x-amz-json-1.0（X-Amz-Target 路由必需）。
     #[test]
     fn should_use_amz_json_content_type() {
         assert_eq!(
-            CliRuntimeEndpoint::new().content_type(),
+            CodewhispererEndpoint::new().content_type(),
             "application/x-amz-json-1.0"
         );
     }
@@ -161,13 +189,13 @@ mod tests {
             is_1m: false,
         };
 
-        let out = CliRuntimeEndpoint::new().transform_api_body(
+        let out = CodewhispererEndpoint::new().transform_api_body(
             r#"{"conversationState":{"conversationId":"c1"}}"#,
             &ctx,
         );
         assert!(
             !out.contains("profileArn"),
-            "cli-runtime 绝不能注入 profileArn: {out}"
+            "codewhisperer 绝不能注入 profileArn: {out}"
         );
         assert!(out.contains("vibe"), "应注入 agentMode=vibe: {out}");
     }

@@ -1,18 +1,23 @@
-//! Kiro CLI 端点（`runtime.{region}.kiro.dev` 变体 / API Key 认证）
+//! Kiro CLI 端点（`q.{region}.amazonaws.com` + `AmazonQDeveloperStreamingService.SendMessage`
+//! 变体 / API Key 认证）
 //!
-//! 与 [`super::cli`]（`q.{region}.amazonaws.com`）**协议完全同构**：服务根 `/` +
-//! `X-Amz-Target` + `tokentype: API_KEY` + 绝不注入 profileArn，**仅 host 域不同**。
+//! 与 [`super::cli`]（`q.{region}.amazonaws.com` + `GenerateAssistantResponse`）**协议同构**：
+//! 服务根 `/` + `X-Amz-Target` + `tokentype: API_KEY` + 绝不注入 profileArn，仅
+//! `X-Amz-Target` 的**操作**不同（`SendMessage` 而非 `GenerateAssistantResponse`）。
 //!
-//! # 为什么需要第二个 CLI 端点
+//! # 为什么需要第四个 CLI 端点
 //!
-//! 上游对 `q.{region}.amazonaws.com` 与 `runtime.{region}.kiro.dev` 按 host 划分**独立限流桶**
-//! （参考 kiro2cc `endpoint.rs`：4 端点 = 4 桶）。实测 `q.*` 300 并发 0 个 429、`runtime.*` 31%
-//! （`docs/batch2-region-endpoint-matrix.md`），故默认 **`q.*` 优先**；当 `q.*` 桶被 429 封禁时，
-//! 同一把 `ksk_` key 自动换到本端点（`runtime.*` 桶）继续，绕过该桶限流。
+//! 上游对不同操作/host 的组合划分**独立限流桶**（参考 kiro2cc `endpoint.rs`：4 端点 = 4 桶）。
+//! 本端点的 host 与 `cli` 相同（`q.*`），但 `X-Amz-Target` 是 Amazon Q Developer 的
+//! `SendMessage` 操作。当 `q.*` 的 GenerateAssistantResponse 桶被 429 封禁时可换到本桶
+//! 继续。
 //!
-//! host 域不同，但请求形状与 `cli` 完全一致（Kiro-RS-Tool 2026.1.8 的 CLI 端点同样走
-//! `runtime.{region}.kiro.dev` 服务根，是参考实现）。本端点的 `transform_api_body` / UA /
-//! 全部 head 复用 [`super::cli`]，避免两份协议逻辑漂移。
+//! ⚠️ **协议可靠性风险**：`SendMessage` 操作对 `ksk_` API Key 号**未实测**。kiro2cc 把它
+//! 作为第 4 个桶使用，但本仓没有线上证据确认上游接受该 target。故在
+//! [`KiroCredentials::effective_endpoint_order`] 里放**最后**（兜底），需线上验证。若不可用，
+//! 最坏情况是该桶请求 4xx → 换号，不会比现状更差（现有 2 桶本来就会在 q.* 封禁时 429 透传）。
+//!
+//! `transform_api_body` / UA / 全部 head 复用 [`super::cli`]，避免三份协议逻辑漂移。
 
 use reqwest::RequestBuilder;
 
@@ -22,16 +27,17 @@ use super::cli::{
 };
 use super::{KiroEndpoint, RequestContext};
 
-/// Kiro CLI 端点名称（对应 credentials.endpoint / config.defaultEndpoint 的 `"cli-runtime"` 取值）。
-pub const CLI_RUNTIME_ENDPOINT_NAME: &str = "cli-runtime";
+/// Kiro CLI 端点名称（对应 credentials.endpoint / config.defaultEndpoint 的 `"amazonq"` 取值）。
+pub const AMAZONQ_ENDPOINT_NAME: &str = "amazonq";
 
-/// Amazon Q CLI 的目标操作头值（与 `cli` 端点同一协议）。
-const CLI_AMZ_TARGET: &str = "AmazonCodeWhispererStreamingService.GenerateAssistantResponse";
+/// Amazon Q Developer Streaming 的目标操作头值（`SendMessage`，区别于 cli 的
+/// `GenerateAssistantResponse`）。
+const AMZ_TARGET: &str = "AmazonQDeveloperStreamingService.SendMessage";
 
-/// Kiro CLI 端点（runtime.* host）
-pub struct CliRuntimeEndpoint;
+/// Kiro CLI 端点（amazonq 变体，host = q.*）
+pub struct AmazonqEndpoint;
 
-impl CliRuntimeEndpoint {
+impl AmazonqEndpoint {
     pub fn new() -> Self {
         Self
     }
@@ -42,48 +48,48 @@ impl CliRuntimeEndpoint {
     }
 
     fn host(&self, ctx: &RequestContext<'_>) -> String {
-        format!("runtime.{}.kiro.dev", self.api_region(ctx))
-    }
-
-    /// aws-sdk-rust 版 UA，带 `app/AmazonQ-For-CLI` 标识（与 `cli` 端点同形状）。
-    fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
-        cli_user_agent(ctx.machine_id)
+        format!("q.{}.amazonaws.com", self.api_region(ctx))
     }
 }
 
-impl Default for CliRuntimeEndpoint {
+impl Default for AmazonqEndpoint {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl KiroEndpoint for CliRuntimeEndpoint {
+impl KiroEndpoint for AmazonqEndpoint {
     fn name(&self) -> &'static str {
-        CLI_RUNTIME_ENDPOINT_NAME
+        AMAZONQ_ENDPOINT_NAME
     }
 
     fn content_type(&self) -> &'static str {
-        // CLI 协议走 X-Amz-Target 路由，content-type 必须是 x-amz-json-1.0，否则上游返回
-        // UnknownOperationException 的 JSON（非 event-stream），解码器会读到非法帧长而中断。
+        // CLI 协议走 X-Amz-Target 路由，content-type 必须是 x-amz-json-1.0。
         "application/x-amz-json-1.0"
     }
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
         // 服务根路径（末尾 `/`），操作由 X-Amz-Target 头路由。
-        format!("https://runtime.{}.kiro.dev/", self.api_region(ctx))
+        format!("https://{}/", self.host(ctx))
     }
 
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String {
         // CLI 协议同样走服务根 + X-Amz-Target；CLI 号目前不走 MCP，保留同 host 兜底。
-        format!("https://runtime.{}.kiro.dev/", self.api_region(ctx))
+        format!("https://{}/", self.host(ctx))
     }
 
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
-        decorate_cli_protocol(req, ctx, self.host(ctx), CLI_AMZ_TARGET, self.user_agent(ctx))
+        decorate_cli_protocol(
+            req,
+            ctx,
+            self.host(ctx),
+            AMZ_TARGET,
+            cli_user_agent(ctx.machine_id),
+        )
     }
 
     fn decorate_mcp(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
-        decorate_cli_mcp(req, ctx, self.host(ctx), self.user_agent(ctx))
+        decorate_cli_mcp(req, ctx, self.host(ctx), cli_user_agent(ctx.machine_id))
     }
 
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
@@ -104,11 +110,10 @@ impl KiroEndpoint for CliRuntimeEndpoint {
 mod tests {
     use super::*;
 
-    /// 回归：cli-runtime 的 URL 必须是 `runtime.{region}.kiro.dev` 服务根（末尾 `/`、
-    /// 无 `/generateAssistantResponse` 路径）。若打成 IDE 的路径寻址，CLI 协议会拿到
-    /// UnknownOperationException / 403。
+    /// 回归：amazonq 的 URL 必须是 `q.{region}.amazonaws.com` 服务根（末尾 `/`、
+    /// 无 `/generateAssistantResponse` 路径）。
     #[test]
-    fn should_target_runtime_service_root_url() {
+    fn should_target_q_service_root_url() {
         use super::super::{KiroEndpoint, RequestContext};
         use crate::kiro::model::credentials::KiroCredentials;
         use crate::model::config::Config;
@@ -125,8 +130,8 @@ mod tests {
             is_1m: false,
         };
 
-        let url = CliRuntimeEndpoint::new().api_url(&ctx);
-        assert_eq!(url, "https://runtime.us-east-1.kiro.dev/");
+        let url = AmazonqEndpoint::new().api_url(&ctx);
+        assert_eq!(url, "https://q.us-east-1.amazonaws.com/");
         assert!(
             !url.contains("generateAssistantResponse"),
             "CLI 协议不用路径寻址操作: {url}"
@@ -137,7 +142,7 @@ mod tests {
     #[test]
     fn should_use_amz_json_content_type() {
         assert_eq!(
-            CliRuntimeEndpoint::new().content_type(),
+            AmazonqEndpoint::new().content_type(),
             "application/x-amz-json-1.0"
         );
     }
@@ -161,13 +166,13 @@ mod tests {
             is_1m: false,
         };
 
-        let out = CliRuntimeEndpoint::new().transform_api_body(
+        let out = AmazonqEndpoint::new().transform_api_body(
             r#"{"conversationState":{"conversationId":"c1"}}"#,
             &ctx,
         );
         assert!(
             !out.contains("profileArn"),
-            "cli-runtime 绝不能注入 profileArn: {out}"
+            "amazonq 绝不能注入 profileArn: {out}"
         );
         assert!(out.contains("vibe"), "应注入 agentMode=vibe: {out}");
     }
