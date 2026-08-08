@@ -17,6 +17,7 @@ use futures::TryStreamExt;
 
 use crate::http_client::build_streaming_client_no_redirect;
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::passthrough_think_filter::{filter_json_bytes, filter_sse_stream};
 use crate::model::config::TlsBackend;
 
 /// 把一次 Anthropic 请求原样透传到自定义 API 上游,响应流式原样返回。
@@ -72,8 +73,8 @@ pub async fn forward(
     // 的 deepseek 协议修复改写请求体(模型名→deepseek-v4-flash、thinking adaptive→enabled、
     // reasoning_effort→output_config、多轮 tool_use 注入 thinking、剥 context_management 等),
     // 再原样转发;其余 custom_api 凭据保持零转换透传。
-    // ⚠️ 仅请求侧归一化;响应侧未过滤上游 thinking 块(thinking disabled 时 deepseek 仍吐
-    // thinking,客户端可能报 "Tool result missing"),见 deepseek_normalize 模块顶部范围边界。
+    // ⚠️ 响应侧 thinking 过滤(thinking disabled 时 deepseek 仍吐 thinking,客户端会报
+    // "Tool result missing")在下方按 content-type 分流处理,仅 deepseek_normalize=true 启用。
     let body_bytes: Bytes = if cred.deepseek_normalize == Some(true) {
         match serde_json::from_slice::<serde_json::Value>(&raw_body) {
             Ok(mut v) => {
@@ -142,17 +143,50 @@ pub async fn forward(
     //
     // 注:这里**不会**因为返回 Err 而形成自旋——实测 reqwest 的 `bytes_stream` 出错后
     // 下一次 poll 返回 `None`,不重复吐同一个 Err;且 `map`/`map_err` 都不改变终止时机。
-    let byte_stream = upstream.bytes_stream().map_err(|e| {
-        tracing::warn!("[透传] 上游流读取中断,以错误终止响应流(客户端可据此重试): {e}");
-        axum::Error::new(e)
-    });
+    //
+    // ⚠️ deepseek 归一化时的响应侧 thinking 过滤:仅 `deepseek_normalize=true` 启用,
+    // 其余 custom_api 保持零转换字节流（隔离铁律 3）。流式逐事件滤 thinking 块仍流式回传;
+    // 非流式读完整 body 滤 thinking content blocks。解析失败 fail-open 原样透传。
+    let filter_thinking = cred.deepseek_normalize == Some(true);
 
-    let resp = Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, content_type)
-        .body(Body::from_stream(byte_stream))
-        .unwrap_or_else(|_| err_response(StatusCode::BAD_GATEWAY, "构建透传响应失败"));
-    // 返回上游真实 status 供调用侧推断 outcome(成功/限流/失败);body 已原样流式接管。
+    let resp = if filter_thinking && content_type.contains("text/event-stream") {
+        let byte_stream = upstream.bytes_stream().map_err(|e| {
+            tracing::warn!("[透传] 上游流读取中断,以错误终止响应流(客户端可据此重试): {e}");
+            axum::Error::new(e)
+        });
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, content_type)
+            .body(Body::from_stream(filter_sse_stream(byte_stream)))
+            .unwrap_or_else(|_| err_response(StatusCode::BAD_GATEWAY, "构建透传响应失败"))
+    } else if filter_thinking && content_type.contains("application/json") {
+        // 非流式:缓冲完整 body 过滤（Content-Length 本就不透传,无需重算）。
+        match upstream.bytes().await {
+            Ok(body) => {
+                let filtered = filter_json_bytes(&body);
+                Response::builder()
+                    .status(status)
+                    .header(header::CONTENT_TYPE, content_type)
+                    .body(Body::from(filtered))
+                    .unwrap_or_else(|_| err_response(StatusCode::BAD_GATEWAY, "构建透传响应失败"))
+            }
+            Err(e) => {
+                tracing::warn!("[透传] 非流式响应读取失败: {e}");
+                err_response(StatusCode::BAD_GATEWAY, "透传非流式响应读取失败")
+            }
+        }
+    } else {
+        let byte_stream = upstream.bytes_stream().map_err(|e| {
+            tracing::warn!("[透传] 上游流读取中断,以错误终止响应流(客户端可据此重试): {e}");
+            axum::Error::new(e)
+        });
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, content_type)
+            .body(Body::from_stream(byte_stream))
+            .unwrap_or_else(|_| err_response(StatusCode::BAD_GATEWAY, "构建透传响应失败"))
+    };
+    // 返回上游真实 status 供调用侧推断 outcome(成功/限流/失败);body 已流式接管。
     (resp, status)
 }
 

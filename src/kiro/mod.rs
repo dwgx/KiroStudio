@@ -12,6 +12,7 @@ pub mod model;
 pub mod overage;
 pub mod parser;
 pub mod passthrough;
+pub mod passthrough_think_filter;
 pub mod provider;
 pub mod rate_limiter;
 pub mod refresh_loop;

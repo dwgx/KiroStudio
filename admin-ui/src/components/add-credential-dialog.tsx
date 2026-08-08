@@ -1,7 +1,8 @@
 import { useState, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
-import { CheckCircle2, XCircle, AlertCircle, AlertTriangle, Loader2 } from 'lucide-react'
+import { CheckCircle2, XCircle, AlertCircle, AlertTriangle, Loader2, Check, RefreshCw } from 'lucide-react'
+import { Checkbox } from '@/components/ui/checkbox'
 import { useQueryClient, useQuery } from '@tanstack/react-query'
 import {
   Dialog,
@@ -18,7 +19,7 @@ import { ProxyTestButton } from '@/components/proxy-test-button'
 import { useAddCredential, useCredentials } from '@/hooks/use-credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
 import { LoginDialog } from '@/components/login-dialog'
-import { listSocksNodes } from '@/api/credentials'
+import { listSocksNodes, probeModelsStandalone } from '@/api/credentials'
 import { pickBestNode, rankAssignableNodes } from '@/lib/socks-node-rank'
 import type { AddCredentialRequest, SocksNode } from '@/types/api'
 
@@ -290,6 +291,11 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   // 4.1 的主份开关，**默认关**：多开时池节点全给第 2..N 份，N 份只需 N-1 个节点。
   const [assignPrimaryFromPool, setAssignPrimaryFromPool] = useState(false)
   const [endpoint, setEndpoint] = useState('')
+  // 创建前探测上游模型（custom_api 专属）：模型只能从上游获取，不硬编码。
+  const [upstreamModels, setUpstreamModels] = useState<string[] | null>(null)
+  const [probeLoading, setProbeLoading] = useState(false)
+  const [probeError, setProbeError] = useState('')
+  const [upstreamSelected, setUpstreamSelected] = useState<Set<string>>(new Set())
 
   // 导入（粘贴）
   const [pasteInput, setPasteInput] = useState('')
@@ -373,6 +379,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setBaseUrl('')
     setCustomApiKey('')
     setRequestLimit('')
+    setUpstreamModels(null)
+    setProbeError('')
+    setUpstreamSelected(new Set())
   }
 
   const resetPaste = () => {
@@ -381,6 +390,32 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   }
 
   const isApiKey = authMethod === 'api_key'
+
+  // 创建前探测上游模型：凭据还不存在，用表单里临时填的 baseUrl+key 打上游。
+  const handleProbeUpstream = async () => {
+    if (!baseUrl.trim()) {
+      toast.error(t('addcredentialdialog.validate.baseUrlRequired'))
+      return
+    }
+    setProbeLoading(true)
+    setProbeError('')
+    try {
+      const models = await probeModelsStandalone({
+        baseUrl: baseUrl.trim(),
+        apiKey: customApiKey.trim() || undefined,
+      })
+      setUpstreamModels(models)
+      setUpstreamSelected(new Set())
+      if (models.length === 0) {
+        toast.error(t('addcredentialdialog.probe.noModels'))
+      }
+    } catch (err) {
+      setUpstreamModels(null)
+      setProbeError(extractErrorMessage(err))
+    } finally {
+      setProbeLoading(false)
+    }
+  }
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
@@ -437,6 +472,10 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         baseUrl: authMethod === 'custom_api' ? baseUrl.trim() || undefined : undefined,
         apiKey: authMethod === 'custom_api' ? customApiKey.trim() || undefined : undefined,
         requestLimit: authMethod === 'custom_api' ? (parseInt(requestLimit) || undefined) : undefined,
+        allowedModels:
+          authMethod === 'custom_api' && upstreamSelected.size > 0
+            ? Array.from(upstreamSelected)
+            : undefined,
         priority: parseInt(priority) || 0,
         // 只在 >1 时下发：缺省不带该字段，后端走完全不变的普通上号路径（含去重保护）。
         copies: Math.max(1, parseInt(copies) || 1) > 1 ? Math.max(1, parseInt(copies) || 1) : undefined,
@@ -731,6 +770,80 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                       onChange={(e) => setRequestLimit(e.target.value)}
                       disabled={isPending}
                     />
+                  </div>
+                  {/* 创建前探测上游模型：模型只能从上游获取（不硬编码），勾选 = 白名单，
+                      随创建一并保存（allowed_models）。与设置弹框的探测同一后端 fetch。 */}
+                  <div className="space-y-1.5 border-t pt-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <label className="text-sm font-medium">
+                        {t('addcredentialdialog.probe.label')}
+                      </label>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-7 text-xs"
+                        onClick={handleProbeUpstream}
+                        disabled={probeLoading || isPending}
+                      >
+                        {probeLoading ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <RefreshCw className="h-3.5 w-3.5" />
+                        )}
+                        <span className="ml-1">{t('addcredentialdialog.probe.action')}</span>
+                      </Button>
+                    </div>
+                    {probeError && <p className="text-xs text-red-400">{probeError}</p>}
+                    {upstreamModels && (
+                      <>
+                        <div className="max-h-40 overflow-y-auto rounded-md border border-border/60 p-2">
+                          {upstreamModels.length === 0 ? (
+                            <p className="text-xs text-muted-foreground">
+                              {t('addcredentialdialog.probe.noModels')}
+                            </p>
+                          ) : (
+                            upstreamModels.map((m) => (
+                              <label
+                                key={m}
+                                className="flex cursor-pointer items-center gap-2 py-0.5 text-xs"
+                              >
+                                <Checkbox
+                                  checked={upstreamSelected.has(m)}
+                                  onCheckedChange={(v) => {
+                                    setUpstreamSelected((prev) => {
+                                      const next = new Set(prev)
+                                      if (v) next.add(m)
+                                      else next.delete(m)
+                                      return next
+                                    })
+                                  }}
+                                  className="h-3.5 w-3.5"
+                                />
+                                <span className="min-w-0 truncate font-mono">{m}</span>
+                              </label>
+                            ))
+                          )}
+                        </div>
+                        {upstreamModels.length > 0 && (
+                          <div className="flex items-center justify-between gap-2">
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="h-7 text-xs"
+                              onClick={() => setUpstreamSelected(new Set(upstreamModels))}
+                            >
+                              <Check className="mr-1 h-3.5 w-3.5" />
+                              {t('addcredentialdialog.probe.selectAll')}
+                            </Button>
+                            <span className="text-xs text-muted-foreground">
+                              {t('addcredentialdialog.probe.selected', {
+                                count: upstreamSelected.size,
+                              })}
+                            </span>
+                          </div>
+                        )}
+                      </>
+                    )}
                   </div>
                 </div>
               )}

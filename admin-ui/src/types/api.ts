@@ -254,6 +254,8 @@ export interface AddCredentialRequest {
   requestLimit?: number
   /** 自定义 API 代挂:deepseek 协议归一化开关（创建时设；改凭据走 deepseek-normalize 端点） */
   deepseekNormalize?: boolean
+  /** 代挂模型白名单（创建表单探测勾选而来；空/不传 = 不限制） */
+  allowedModels?: string[]
 }
 
 /**
