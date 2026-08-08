@@ -33,13 +33,21 @@ impl AdminState {
     /// 这样 admin 改 adminApiKey 后即时生效，无需重启（重启会掐断在途流式请求）。
     /// 空值由 `set_admin_key` 拒绝写入，判定侧 fail-closed（见 auth_keys 模块级安全说明）。
     pub fn new(admin_api_key: impl Into<String>, service: AdminService) -> Self {
+        Self::from_shared(admin_api_key, Arc::new(service))
+    }
+
+    /// 使用已有的共享服务创建 Admin 状态。
+    ///
+    /// Portal 的上游额度展示也依赖同一份余额缓存，因此主程序会先创建唯一的
+    /// [`AdminService`]，再分别注入 Admin 与 Portal，避免两套缓存和后台刷新任务。
+    pub fn from_shared(admin_api_key: impl Into<String>, service: Arc<AdminService>) -> Self {
         if let Err(e) = crate::common::auth_keys::set_admin_key(&admin_api_key.into()) {
             // 调用方（main.rs）已在挂载前判过非空，走到这里说明校验被绕过。
             // 不 panic：Admin API 会因空存储 fail-closed 全拒（401），比裸奔安全。
             tracing::error!("adminApiKey 播种失败，Admin API 将拒绝所有请求: {}", e);
         }
         Self {
-            service: Arc::new(service),
+            service,
             usage_stats: None,
             trace_db: None,
         }

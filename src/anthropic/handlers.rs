@@ -32,6 +32,23 @@ use super::types::{
 };
 use super::websearch;
 
+/// 把 provider 基于“实际凭据 + 实际端点最终报文”查询到的本地可验证缓存状态
+/// 转成 Anthropic usage。Kiro 不返回服务端 cache 回执，所以这里只报告此前完整成功
+/// 请求建立的 inferred read；creation 恒为 0。
+fn strict_cache_breakdown(
+    provider: &crate::kiro::provider::KiroProvider,
+    meta: &crate::kiro::provider::CallMeta,
+    total_input_tokens: i32,
+) -> Option<CacheUsageBreakdown> {
+    let usage = provider.prompt_cache_usage(meta, total_input_tokens)?;
+    Some(CacheUsageBreakdown {
+        cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        cache_read_input_tokens: usage.cache_read_input_tokens,
+        cache_creation_5m_input_tokens: 0,
+        cache_creation_1h_input_tokens: 0,
+    })
+}
+
 /// 从入站请求头提取客户端 IP（仅头部来源，不含连接层回退）。
 ///
 /// **安全(A1 修复)**：取 `x-forwarded-for` 的**最右**段，不是最左。XFF 是各级代理依次
@@ -917,28 +934,6 @@ pub async fn post_messages(
         payload.tools.as_deref(),
     ) as i32;
 
-    // 估算影子缓存：系统提示 + 历史轮次已被 Bedrock prefix cache 缓存（通过 agentContinuationId）。
-    // 仅在有历史轮次时（messages.len() > 1）估算；首轮返回 0 保守不注入。
-    //
-    // ⚠️ 必须尊重 promptCacheEnabled：见 /cc/v1 路径同处注释——影子缓存会经
-    // `billed_input_tokens` 把 input_tokens 扣成 0，导致客户端自动压缩永不触发。
-    // 开关打开时由 count_prefix_tokens 内部的 85% 上限兜住（见该函数注释）。
-    let prefix_tokens = if provider.token_manager().config().prompt_cache_enabled {
-        token::count_prefix_tokens(payload.system.as_deref(), &payload.messages, input_tokens)
-    } else {
-        0
-    };
-    let cache_breakdown: Option<CacheUsageBreakdown> = if prefix_tokens > 0 {
-        Some(CacheUsageBreakdown {
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: prefix_tokens.min(input_tokens),
-            cache_creation_5m_input_tokens: 0,
-            cache_creation_1h_input_tokens: 0,
-        })
-    } else {
-        None
-    };
-
     // 检查是否启用了thinking
     let thinking_enabled = payload
         .thinking
@@ -965,7 +960,6 @@ pub async fn post_messages(
                 thinking_enabled,
                 tool_name_map,
                 known_tool_names,
-                cache_breakdown,
                 client,
             )
             .await
@@ -978,7 +972,6 @@ pub async fn post_messages(
                 thinking_enabled,
                 tool_name_map,
                 known_tool_names,
-                cache_breakdown,
                 client,
             )
             .await
@@ -993,7 +986,6 @@ pub async fn post_messages(
             input_tokens,
             extract_thinking,
             tool_name_map,
-            cache_breakdown,
             client,
         )
         .await
@@ -1009,7 +1001,6 @@ async fn handle_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
-    cache_breakdown: Option<CacheUsageBreakdown>,
     client: ClientInfo,
 ) -> Response {
     // 1M 变体:据原始模型名判定是否注入 anthropic-beta 头(仅受支持的 [1m] 变体为 true)。
@@ -1019,6 +1010,7 @@ async fn handle_stream_request(
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
+    let cache_breakdown = strict_cache_breakdown(&provider, &meta, input_tokens);
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_full(
@@ -1054,6 +1046,9 @@ fn emit_stream_usage(
     meta: &crate::kiro::provider::CallMeta,
     client: &ClientInfo,
 ) {
+    if ctx.completion().is_ok() && ctx.has_context_usage() {
+        provider.commit_prompt_cache(meta);
+    }
     let usage = ctx.resolved_usage();
     let mut record = crate::usage::RequestRecord::new(
         Uuid::new_v4().to_string(),
@@ -1066,6 +1061,7 @@ fn emit_stream_usage(
     record.output_tokens = usage.output_tokens;
     record.cache_read_tokens = usage.cache_read_tokens;
     record.cache_creation_tokens = usage.cache_creation_tokens;
+    record.cache_observed = usage.cache_observed;
     record.credits_used = usage.credits_used;
     record.latency_ms = meta.latency_ms;
     record.retries = meta.retries;
@@ -1286,7 +1282,6 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
-    cache_breakdown: Option<CacheUsageBreakdown>,
     client: ClientInfo,
 ) -> Response {
     // 1M 变体:据原始模型名判定是否注入 anthropic-beta 头(仅受支持的 [1m] 变体为 true)。
@@ -1296,6 +1291,7 @@ async fn handle_non_stream_request(
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
+    let cache_breakdown = strict_cache_breakdown(&provider, &meta, input_tokens);
 
     // 读取响应体
     let body_bytes = match response.bytes().await {
@@ -1562,6 +1558,11 @@ async fn handle_non_stream_request(
             record.session_id = meta.session_id.clone();
             record.is_streaming = meta.is_streaming;
             record.input_tokens = context_input_tokens.unwrap_or(input_tokens);
+            if let Some(cache) = cache_breakdown {
+                record.cache_observed = true;
+                record.cache_read_tokens = cache.cache_read_input_tokens;
+                record.cache_creation_tokens = cache.cache_creation_input_tokens;
+            }
             record.credits_used = credits_used;
             record.latency_ms = meta.latency_ms;
             record.retries = meta.retries;
@@ -1635,6 +1636,12 @@ async fn handle_non_stream_request(
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
     let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
 
+    // 只有响应完整成功且收到上游 contextUsageEvent，当前请求才有资格建立后续缓存检查点。
+    // 缺少收尾 usage 的 2xx/空流保守不提交，避免把协议异常误记成缓存已建立。
+    if context_input_tokens.is_some() {
+        provider.commit_prompt_cache(&meta);
+    }
+
     // 用量埋点：非流式成功记录
     {
         let mut record = crate::usage::RequestRecord::new(
@@ -1646,6 +1653,11 @@ async fn handle_non_stream_request(
         record.is_streaming = meta.is_streaming;
         record.input_tokens = final_input_tokens;
         record.output_tokens = output_tokens;
+        if let Some(cache) = cache_breakdown {
+            record.cache_observed = true;
+            record.cache_read_tokens = cache.cache_read_input_tokens;
+            record.cache_creation_tokens = cache.cache_creation_input_tokens;
+        }
         record.credits_used = credits_used;
         record.latency_ms = meta.latency_ms;
         record.retries = meta.retries;
@@ -1869,28 +1881,6 @@ pub async fn post_messages_cc(
         payload.tools.as_deref(),
     ) as i32;
 
-    // 估算影子缓存（与 /v1 路径逻辑一致）
-    //
-    // 两道防线保证 `input_tokens` 不会被 `billed_input_tokens` 扣成 0（扣成 0 会让
-    // 客户端认为本轮没消耗上下文 → 自动压缩永不触发 → 历史无限累积）：
-    // ①尊重 promptCacheEnabled（关则完全不算）；②开启时由 count_prefix_tokens
-    // 内部的 85% 上限兜底，见该函数注释。
-    let prefix_tokens = if provider.token_manager().config().prompt_cache_enabled {
-        token::count_prefix_tokens(payload.system.as_deref(), &payload.messages, input_tokens)
-    } else {
-        0
-    };
-    let cache_breakdown: Option<CacheUsageBreakdown> = if prefix_tokens > 0 {
-        Some(CacheUsageBreakdown {
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: prefix_tokens.min(input_tokens),
-            cache_creation_5m_input_tokens: 0,
-            cache_creation_1h_input_tokens: 0,
-        })
-    } else {
-        None
-    };
-
     // 检查是否启用了thinking
     let thinking_enabled = payload
         .thinking
@@ -1928,7 +1918,6 @@ pub async fn post_messages_cc(
                 thinking_enabled,
                 tool_name_map,
                 known_tool_names,
-                cache_breakdown,
                 client,
             )
             .await
@@ -1942,7 +1931,6 @@ pub async fn post_messages_cc(
                 thinking_enabled,
                 tool_name_map,
                 known_tool_names,
-                cache_breakdown,
                 client,
             )
             .await
@@ -1957,7 +1945,6 @@ pub async fn post_messages_cc(
             input_tokens,
             extract_thinking,
             tool_name_map,
-            cache_breakdown,
             client,
         )
         .await
@@ -1976,7 +1963,6 @@ async fn handle_stream_request_buffered(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
-    cache_breakdown: Option<CacheUsageBreakdown>,
     client: ClientInfo,
 ) -> Response {
     // 1M 变体:据原始模型名判定是否注入 anthropic-beta 头(仅受支持的 [1m] 变体为 true)。
@@ -1986,6 +1972,7 @@ async fn handle_stream_request_buffered(
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
+    let cache_breakdown = strict_cache_breakdown(&provider, &meta, estimated_input_tokens);
 
     // 创建缓冲流处理上下文
     let mut ctx = BufferedStreamContext::new(
@@ -2173,6 +2160,9 @@ fn emit_buffered_usage(
     meta: &crate::kiro::provider::CallMeta,
     client: &ClientInfo,
 ) {
+    if ctx.completion().is_ok() && ctx.has_context_usage() {
+        provider.commit_prompt_cache(meta);
+    }
     let usage = ctx.resolved_usage();
     let mut record = crate::usage::RequestRecord::new(
         Uuid::new_v4().to_string(),
@@ -2185,6 +2175,7 @@ fn emit_buffered_usage(
     record.output_tokens = usage.output_tokens;
     record.cache_read_tokens = usage.cache_read_tokens;
     record.cache_creation_tokens = usage.cache_creation_tokens;
+    record.cache_observed = usage.cache_observed;
     record.credits_used = usage.credits_used;
     record.latency_ms = meta.latency_ms;
     record.retries = meta.retries;

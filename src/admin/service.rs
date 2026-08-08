@@ -618,6 +618,33 @@ impl AdminService {
         Ok(balance)
     }
 
+    /// 强制从上游刷新单个凭据的额度，并写回与管理端共用的持久化缓存。
+    ///
+    /// 与 [`Self::get_balance`] 不同，本方法不会命中 5 分钟新鲜缓存。调用方必须先完成
+    /// 身份校验和频率限制；Portal 的“刷新额度”按钮正是显式触发这条真实上游请求。
+    pub async fn refresh_balance(
+        &self,
+        id: u64,
+    ) -> Result<super::types::CachedBalanceItem, AdminServiceError> {
+        let balance = self.fetch_balance(id).await?;
+        let cached_at = Utc::now().timestamp() as f64;
+
+        {
+            let mut cache = self.balance_cache.lock();
+            cache.insert(
+                id,
+                CachedBalance {
+                    cached_at,
+                    data: balance.clone(),
+                },
+            );
+        }
+        self.save_balance_cache();
+        self.push_balance_snapshots_to_scheduler();
+
+        Ok(super::types::CachedBalanceItem { balance, cached_at })
+    }
+
     /// 从上游获取余额（无缓存）
     async fn fetch_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
         let usage = self
@@ -883,6 +910,8 @@ impl AdminService {
         let email = req.email.clone();
         let new_cred = KiroCredentials {
             id: None,
+            // 由 add_credential 统一盖时间戳（那里是唯一收口）。
+            added_at_ms: None,
             access_token: req.access_token,
             refresh_token: req.refresh_token,
             profile_arn: req.profile_arn,
@@ -1056,6 +1085,8 @@ impl AdminService {
             default_endpoint: config.default_endpoint.clone(),
             endpoint_names,
             extract_thinking: config.extract_thinking,
+            prompt_cache_enabled: config.prompt_cache_enabled,
+            prompt_cache_ttl_seconds: config.prompt_cache_ttl_seconds,
             cc_auto_buffer: config.cc_auto_buffer,
             strip_env_noise: config.strip_env_noise,
             tool_clean_leaked_tokens: config.tool_clean_leaked_tokens,
@@ -1104,6 +1135,11 @@ impl AdminService {
                 .as_ref()
                 .map(|k| !k.trim().is_empty())
                 .unwrap_or(false),
+            relay_api_key_configured: crate::common::auth_keys::relay_key_configured(),
+            portal_admin_password_configured: config
+                .portal_admin_password_hash
+                .as_deref()
+                .is_some_and(|v| !v.trim().is_empty()),
             callback_mode,
             callback_base_url: config.callback_base_url.clone(),
             cors_allowed_origins: config.cors_allowed_origins.clone(),
@@ -1120,6 +1156,26 @@ impl AdminService {
             login_background_r18: config.login_background_r18,
             balance_refresh_interval_secs: config.balance_refresh_interval_secs,
             collect_client_fingerprint: config.collect_client_fingerprint,
+            // 读**运行时镜像**而非 config 结构体。两者会真的分叉：portal 库打不开时
+            // main.rs 会 `set_enabled(false)` 强制关停，而 config 里可能仍是 true。
+            // 那时读 config 会让面板显示「已启用」，而 `/portal` 实际全部 404——
+            // 管理员看着一个说自己开着的开关，却怎么也打不开页面（生产实证 2026-08-07
+            // 的权限故障正是这个形态）。镜像是行为的真相源，面板必须跟它一致。
+            portal_enabled: crate::portal::http::enabled(),
+            // 只回布尔「配没配」，不回注册码本身：它是一把凭据，回显等于任何拿到
+            // 面板只读权限的人都能顺手抄走去注册账号。同三把 API key 的处理口径。
+            //
+            // 【为何读 auth_keys 而不读 config】那个热更单元才是**判定注册码是否有效的
+            // 唯一真相源**（`portal_invite_matches` 用它）。若这里读 config 结构体，
+            // 两者一旦漂移，面板就会显示「已配置」而实际注册全被拒（或反之）——
+            // 而这种不一致最难查，因为面板看起来是对的。portal 自己的 `status`
+            // 端点也读同一处（`admin_api.rs::status`），口径必须一致。
+            portal_invite_code_configured: crate::common::auth_keys::portal_invite_configured(),
+            // 同上读镜像：这三项（含 credits）的行为都由镜像决定，且 credits 的镜像值
+            // 是 **sanitized 之后**的——config 里写 base_count=0 的人，实际生效的是 1。
+            // 回显 config 原始字面量会让面板显示一个并未生效的值。
+            portal_require_https: crate::portal::http::require_https_public(),
+            portal_credits_enabled: crate::portal::http::credits_enabled(),
             config_path: config.config_path().map(|p| p.display().to_string()),
         }
     }
@@ -1195,6 +1251,13 @@ impl AdminService {
         // importApiKey 多一种状态：`Some(None)` = 显式清除（关闭导入通道），
         // `Some(Some(k))` = 设为新值，`None` = 本次请求未提及此字段（不动）。
         let mut import_key_changed: Option<Option<String>> = None;
+        let mut relay_key_changed: Option<Option<String>> = None;
+        // —— Portal（车队频道）四项，全部立即生效（运行时镜像），不进 restart_fields ——
+        // 注册码同 importApiKey 的三态语义：`Some(None)` = 清除（关闭自注册通道）。
+        let mut portal_enabled_changed: Option<bool> = None;
+        let mut portal_invite_changed: Option<Option<String>> = None;
+        let mut portal_require_https_changed: Option<bool> = None;
+        let mut portal_credits_changed: Option<bool> = None;
 
         // —— 需重启生效的字段 ——
         if let Some(v) = req.host {
@@ -1609,6 +1672,54 @@ impl AdminService {
                 import_key_changed = Some(new_val);
             }
         }
+        if let Some(v) = req.relay_api_key {
+            let trimmed = v.trim();
+            let new_val = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+            if new_val != config.relay_api_key {
+                config.relay_api_key = new_val.clone();
+                relay_key_changed = Some(new_val);
+            }
+        }
+
+        // —— Portal（车队频道）：四项全部立即生效，不进 restart_fields ——
+        //
+        // 路由是**总是挂载**的，行为由 `portal::http` 的运行时镜像决定（见 main.rs 里
+        // 那段注释）。所以改开关只要更新镜像即可，不必重启——与 importApiKey 的冷启用同理。
+        if let Some(v) = req.portal_enabled {
+            if v != config.portal_enabled {
+                config.portal_enabled = v;
+                portal_enabled_changed = Some(v);
+            }
+        }
+        // 注册码：空串 = 关闭自注册通道（已注册用户仍可登录）。同 importApiKey 的三态。
+        if let Some(v) = req.portal_invite_code {
+            let trimmed = v.trim();
+            let new_val = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+            if new_val != config.portal_invite_code {
+                config.portal_invite_code = new_val.clone();
+                portal_invite_changed = Some(new_val);
+            }
+        }
+        if let Some(v) = req.portal_require_https {
+            if v != config.portal_require_https {
+                config.portal_require_https = v;
+                portal_require_https_changed = Some(v);
+            }
+        }
+        if let Some(v) = req.portal_credits_enabled {
+            if v != config.portal_credits_enabled {
+                config.portal_credits_enabled = v;
+                portal_credits_changed = Some(v);
+            }
+        }
 
         // —— 反代安全（批次3，均需重启生效）——
         if let Some(v) = req.cors_allowed_origins {
@@ -1809,7 +1920,14 @@ impl AdminService {
             || tool_expose_error_to_client_changed.is_some()
             || tool_repair_json_changed.is_some()
             || tool_truncation_recovery_changed.is_some()
-            || tool_description_max_chars_changed.is_some();
+            || tool_description_max_chars_changed.is_some()
+            // Portal 四项：镜像已在下方单独热更，但仍要让 ArcSwap 与磁盘对齐。
+            // 不 reload 的话 `config().portal_*` 会一直是启动值，而 portal 不是
+            // restart-only 字段——留着一份陈旧的 ArcSwap 只等着日后某处读它翻车。
+            || portal_enabled_changed.is_some()
+            || portal_invite_changed.is_some()
+            || portal_require_https_changed.is_some()
+            || portal_credits_changed.is_some();
         if hot_or_display_changed {
             if let Err(e) = self.token_manager.reload_config() {
                 tracing::warn!("配置已存盘但热重载失败,下次重启生效: {}", e);
@@ -1868,6 +1986,42 @@ impl AdminService {
         // 指纹采集开关立即应用到热路径运行时镜像（下一个请求即生效）
         if let Some(v) = fingerprint_changed {
             crate::anthropic::set_collect_client_fingerprint(v);
+        }
+
+        // —— Portal 四项立即应用到运行时镜像 ——
+        //
+        // 【为何必须在这里热更，而不是塞进 restart_fields】portal 的路由是**总是挂载**的，
+        // 行为由 `portal::http::enabled()` 这个运行时镜像决定（见 main.rs 里那段注释）。
+        // 也就是说「即时生效」的能力早就实现好了，只差有人来改这个镜像——本次之前根本
+        // 没有任何 UI 能改它，面板上那句「在设置里打开 portalEnabled」指向的是一个
+        // 不存在的开关（生产实证 2026-08-07）。
+        //
+        // 顺序无关：四个镜像互不依赖，各自 store 一个原子值。
+        if let Some(v) = portal_enabled_changed {
+            crate::portal::http::set_enabled(v);
+            if v {
+                tracing::info!("Portal 已启用（即时生效）: GET /portal");
+            } else {
+                tracing::info!("Portal 已关闭（即时生效）：/portal 全部 404");
+            }
+        }
+        if let Some(v) = portal_require_https_changed {
+            crate::portal::http::set_require_https(v);
+        }
+        if let Some(v) = portal_credits_changed {
+            crate::portal::http::set_credits_enabled(v);
+        }
+        // 注册码：`Some(None)` = 清除（关闭自注册通道，已注册用户仍可登录）。
+        match &portal_invite_changed {
+            Some(Some(v)) => match crate::common::auth_keys::set_portal_invite_code(v) {
+                Ok(()) => tracing::info!("Portal 注册码已更新（即时生效）"),
+                Err(e) => tracing::error!("Portal 注册码播种失败，注册将全拒: {}", e),
+            },
+            Some(None) => {
+                crate::common::auth_keys::clear_portal_invite_code();
+                tracing::info!("Portal 注册码已清除：自注册通道关闭（已注册用户仍可登录）");
+            }
+            None => {}
         }
 
         // TIER3：thinking 提取开关立即应用到热路径进程级镜像（下一个非流式请求即生效）
@@ -1940,6 +2094,21 @@ impl AdminService {
             }
             None => {}
         }
+        match &relay_key_changed {
+            Some(Some(v)) => match crate::common::auth_keys::set_relay_key(v) {
+                Ok(()) => {
+                    crate::common::import_stats::set_relay_enabled(true);
+                    tracing::info!("relayApiKey 已设置并即时生效，POST /api/import/push 可用");
+                }
+                Err(e) => tracing::error!("relayApiKey 已存盘但热更失败，重启后生效: {}", e),
+            },
+            Some(None) => {
+                crate::common::auth_keys::clear_relay_key();
+                crate::common::import_stats::set_relay_enabled(false);
+                tracing::info!("relayApiKey 已清除，Relay 推送频道即时关闭");
+            }
+            None => {}
+        }
 
         let immediate_changed = hot_changed
             || refresh_task_changed
@@ -1960,7 +2129,15 @@ impl AdminService {
             // 不进 hot_or_display_changed：reload_config 会把它们钉回启动值，重载对它们无用。
             || user_key_changed.is_some()
             || admin_key_changed.is_some()
-            || import_key_changed.is_some();
+            || import_key_changed.is_some()
+            || relay_key_changed.is_some()
+            // Portal 四项同样即时生效（运行时镜像）。**漏掉它们的后果不是功能不生效，
+            // 而是提示说谎**：实测开启 portal 后接口返回「无改动。」，而 /portal 明明已经
+            // 从 404 变成 200。管理员会以为保存失败而重复操作，或以为没生效去重启服务。
+            || portal_enabled_changed.is_some()
+            || portal_invite_changed.is_some()
+            || portal_require_https_changed.is_some()
+            || portal_credits_changed.is_some();
         let restart_required = !restart_fields.is_empty();
         let message = if restart_required {
             format!("已保存。{} 个字段需重启服务后生效。", restart_fields.len())
@@ -2323,8 +2500,15 @@ impl AdminService {
     // ============ 存储统计 / 清理（运维）============
 
     /// 用量数据目录（SQLite traces.db 与 usage-*.jsonl 所在目录）。
+    ///
+    /// **必须与 main 的落盘解析同源**：这里原先直接 `PathBuf::from(usage_data_dir)`，
+    /// 用的是配置里的**原始相对值**，而实际落盘位置经过 [`crate::resolve_data_dir_for`]
+    /// 重定向（容器里是 config 同级目录）。两者不一致的后果：`storage/stats` 报出的
+    /// 路径与真实目录不符（生产实证：报 `data/usage`，库实际在别处），而 `storage_cleanup`
+    /// **会按这个路径删文件**——指向错目录的删除功能要么删错东西，要么静默什么都没删。
     fn usage_data_dir(&self) -> PathBuf {
-        PathBuf::from(&self.token_manager.config().usage_data_dir)
+        let config = self.token_manager.config();
+        crate::resolve_data_dir_for(&config.usage_data_dir, config.config_path())
     }
 
     /// 统计一个文件（含 SQLite 的 -wal/-shm 附属文件）的总字节数。
@@ -2896,5 +3080,90 @@ mod balance_cache_tests {
         assert!(!loaded.contains_key(&2), "超过 7 天的缓存应被丢弃");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod portal_hot_field_wiring_tests {
+    /// **结构性断言：每个 portal 热更变量都必须出现在两张聚合清单里。**
+    ///
+    /// `update_config` 里有两张需要手工维护的 `||` 清单，语义不同、缺一都不报错：
+    /// - `hot_or_display_changed` → 决定要不要 `reload_config()`。漏了它，配置落了盘
+    ///   但 ArcSwap 里还是旧值，于是**保存成功、刷新页面开关又弹回去**（代码里那段
+    ///   注释记着 R18 开关就是这么翻的车）。
+    /// - `immediate_changed` → 决定回给前端的那句话。漏了它，明明改了东西却回
+    ///   「无改动。」——本次实测正是如此：portal 四项全部生效了，提示却说没改动。
+    ///
+    /// 两处都是「新增字段时容易忘」的形态，而忘掉之后**编译通过、现有用例全绿**，
+    /// 只能靠人盯着 UI 才发现。所以在源码层面钉死：新增任何 `portal_*_changed`
+    /// 变量，都必须同时接进两张清单，否则这条测试变红。
+    #[test]
+    fn every_portal_changed_flag_feeds_both_aggregation_lists() {
+        let src = include_str!("service.rs");
+        // 只看生产段：测试段里也有这些字面量，会污染计数。
+        let prod = src
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("split 至少给一段");
+
+        // 对照组：切分失效时 prod 会变成整个文件或空串，下面的断言就毫无意义。
+        assert!(
+            prod.contains("pub fn update_config"),
+            "切分失效：没在生产段里找到 update_config"
+        );
+        assert!(
+            !prod.contains("fn every_portal_changed_flag_feeds_both_aggregation_lists"),
+            "切分失效：测试代码漏进了生产段，本用例会被自身的字面量污染"
+        );
+
+        // 从声明处收集所有 portal 热更变量名，而不是写死一份清单——
+        // 写死的话，新增第五个字段时这条测试自己也不会提醒。
+        let flags: Vec<&str> = prod
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                let rest = l.strip_prefix("let mut ")?;
+                let name = rest.split(':').next()?.trim();
+                if name.starts_with("portal_") && name.ends_with("_changed") {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert!(
+            flags.len() >= 4,
+            "只找到 {} 个 portal_*_changed 变量（期望至少 4：enabled/invite/requireHttps/credits）。\
+             若是改名了，本测试的采集规则需要同步更新；若是真删了字段，请确认 UI 也删了。\
+             实际找到: {flags:?}",
+            flags.len()
+        );
+
+        // 定位两张清单各自的文本范围。
+        let cut = |anchor: &str| -> String {
+            let start = prod
+                .find(anchor)
+                .unwrap_or_else(|| panic!("没找到聚合清单锚点 `{anchor}`——它被改名或删了"));
+            // 清单是一串 `||` 直到分号结束。
+            let tail = &prod[start..];
+            let end = tail.find(';').expect("聚合清单没有以分号结束");
+            tail[..end].to_string()
+        };
+        let hot_list = cut("let hot_or_display_changed");
+        let immediate_list = cut("let immediate_changed");
+
+        for f in &flags {
+            assert!(
+                hot_list.contains(f),
+                "`{f}` 不在 hot_or_display_changed 里：配置会落盘但 ArcSwap 不重载，\
+                 表现是「保存成功、刷新后开关弹回原值」"
+            );
+            assert!(
+                immediate_list.contains(f),
+                "`{f}` 不在 immediate_changed 里：改动确实生效了，但接口会回「无改动。」，\
+                 让管理员以为没保存上（生产实证 2026-08-07）"
+            );
+        }
     }
 }

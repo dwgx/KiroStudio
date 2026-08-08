@@ -240,6 +240,8 @@ impl SocialLoginManager {
         // 构建并加入凭据池
         let new_cred = KiroCredentials {
             id: None,
+            // 由 add_credential 统一盖时间戳（那里是唯一收口）。
+            added_at_ms: None,
             access_token: Some(token.access_token),
             refresh_token: Some(refresh_token),
             profile_arn: token.profile_arn,

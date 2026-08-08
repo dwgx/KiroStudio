@@ -24,6 +24,7 @@ import {
   ClipboardCopy,
   Image as ImageIcon,
   LayoutGrid,
+  Users,
   X,
 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -121,7 +122,7 @@ function timeAgo(iso: string | null | undefined, t: TFunction): string {
 /* ============ 分区导航 + 搜索 基础设施 ============ */
 
 // 设置分区（顶部 tab）。id 用于 tab 切换与卡片归属；label 经 i18n 在渲染时解析。
-type SectionId = 'basic' | 'security' | 'scheduling' | 'storage' | 'service' | 'privacy' | 'appearance' | 'export' | 'trash'
+type SectionId = 'basic' | 'security' | 'scheduling' | 'storage' | 'service' | 'privacy' | 'portal' | 'appearance' | 'export' | 'trash'
 
 const SECTION_DEFS: { id: SectionId; labelKey: string; icon: React.ComponentType<{ className?: string }> }[] = [
   { id: 'basic', labelKey: 'settingspage.section.basic', icon: SlidersHorizontal },
@@ -130,6 +131,7 @@ const SECTION_DEFS: { id: SectionId; labelKey: string; icon: React.ComponentType
   { id: 'storage', labelKey: 'settingspage.section.storage', icon: Database },
   { id: 'service', labelKey: 'settingspage.section.service', icon: Server },
   { id: 'privacy', labelKey: 'settingspage.section.privacy', icon: Fingerprint },
+  { id: 'portal', labelKey: 'settingspage.section.portal', icon: Users },
   { id: 'appearance', labelKey: 'settingspage.section.appearance', icon: LayoutGrid },
   { id: 'export', labelKey: 'settingspage.section.export', icon: Download },
   { id: 'trash', labelKey: 'settingspage.section.trash', icon: Trash2 },
@@ -153,6 +155,7 @@ const CARD_INDEX_DEFS: { section: SectionId; titleKey: string; kwKey: string }[]
   { section: 'service', titleKey: 'settingspage.card.service', kwKey: 'settingspage.card.service.kw' },
   { section: 'service', titleKey: 'settingspage.card.clientRpm', kwKey: 'settingspage.card.clientRpm.kw' },
   { section: 'privacy', titleKey: 'settingspage.card.privacy', kwKey: 'settingspage.card.privacy.kw' },
+  { section: 'portal', titleKey: 'settingspage.card.portal', kwKey: 'settingspage.card.portal.kw' },
   { section: 'appearance', titleKey: 'settingspage.card.appearance', kwKey: 'settingspage.card.appearance.kw' },
   { section: 'export', titleKey: 'settingspage.card.export', kwKey: 'settingspage.card.export.kw' },
   { section: 'trash', titleKey: 'settingspage.card.trash', kwKey: 'settingspage.card.trash.kw' },
@@ -282,6 +285,20 @@ interface FormState {
   // Admin UI 登录页背景（立即生效）
   loginBackgroundEnabled: boolean
   loginBackgroundR18: boolean
+  // 车队频道（portal，四项全部立即生效，无需重启）
+  portalEnabled: boolean
+  // 注册码是**只写**字段：后端只回「配没配」的布尔，不回明文。
+  // 故这里的空串语义是「不改动」，不是「当前为空」——与代理账密同一套处理。
+  portalInviteCode: string
+  // 「清除注册码」的显式意图。
+  //
+  // 【为何需要一个单独的布尔，而不是把空输入框当清除】上面那条注释说了空串 = 不改动，
+  // 于是「关闭自注册」就没法表达了。若反过来把空输入框解释成清除，那么每次保存别的
+  // 设置（改个背景图开关）都会顺手把自注册关掉——而且界面上完全看不出发生了什么。
+  // 两种意图各占一个状态位，谁都不会被误触。
+  portalInviteCodeClear: boolean
+  portalRequireHttps: boolean
+  portalCreditsEnabled: boolean
   // UI 排版自定义（纯前端 localStorage，纳入统一保存流程：切换改 form，保存时才落地）
   poolSort: PoolSortMode
   poolShowDisabled: boolean
@@ -372,6 +389,16 @@ function toForm(c: ConfigSnapshotResponse, ui: UiLayoutPrefs): FormState {
     // 缺省视为开启（后端字段可能尚未下发时不误显示为关闭）
     loginBackgroundEnabled: c.loginBackgroundEnabled ?? true,
     loginBackgroundR18: c.loginBackgroundR18 ?? false,
+    // Portal（车队频道）。缺省一律取**关闭**那一侧：后端未下发这些字段时
+    // （比如面板比服务端新），显示成「未启用」比显示成「已启用」安全——
+    // 后者会让人以为频道已对外开放而不去检查。
+    portalEnabled: c.portalEnabled ?? false,
+    // 注册码不回显（后端只给布尔），所以输入框永远从空开始：空 = 不改动。
+    portalInviteCode: '',
+    portalInviteCodeClear: false,
+    // requireHttps 缺省取 true（更安全的那一侧）。
+    portalRequireHttps: c.portalRequireHttps ?? true,
+    portalCreditsEnabled: c.portalCreditsEnabled ?? false,
     // UI 排版偏好（纯前端 localStorage，作为 form 基线纳入统一保存）
     poolSort: ui.poolSort,
     poolShowDisabled: ui.poolShowDisabled,
@@ -1546,6 +1573,21 @@ export function SettingsPage() {
     // Admin UI 登录页背景（缺省视为开启，与 toForm 基线一致）
     if (form.loginBackgroundEnabled !== (config.loginBackgroundEnabled ?? true)) d.loginBackgroundEnabled = form.loginBackgroundEnabled
     if (form.loginBackgroundR18 !== (config.loginBackgroundR18 ?? false)) d.loginBackgroundR18 = form.loginBackgroundR18
+    // Portal（车队频道）：三个开关按值比对，注册码走「密钥」口径。
+    if (form.portalEnabled !== (config.portalEnabled ?? false)) d.portalEnabled = form.portalEnabled
+    if (form.portalRequireHttps !== (config.portalRequireHttps ?? true)) d.portalRequireHttps = form.portalRequireHttps
+    if (form.portalCreditsEnabled !== (config.portalCreditsEnabled ?? false)) d.portalCreditsEnabled = form.portalCreditsEnabled
+    // 注册码：后端不回显现值，所以**不能**按「与 config 比对」来决定发不发。
+    // 三种意图必须能区分开（后端据此走三态语义）：
+    //   1. 填了内容      → 发新值
+    //   2. 勾了「清除」  → 发空串（关闭自注册通道）
+    //   3. 两者都没动    → 字段不出现在 payload 里 = 保持不变
+    // 若把「空输入框」当成「清除」，那么每次保存别的设置都会顺手关掉自注册。
+    if (form.portalInviteCodeClear) {
+      d.portalInviteCode = ''
+    } else if (form.portalInviteCode.trim() !== '') {
+      d.portalInviteCode = form.portalInviteCode.trim()
+    }
     return d
   }, [config, form])
 
@@ -2245,6 +2287,91 @@ export function SettingsPage() {
               checked={form.loginBackgroundR18}
               onCheckedChange={(v) => set('loginBackgroundR18', v)}
               disabled={!form.loginBackgroundEnabled}
+            />
+          </Field>
+        </CardContent>
+      </Card>
+      </SectionGate>
+
+      {/* 频道分区：车队频道四项（全部立即生效，无需重启）。
+          这一整张卡是补一个真实缺口：拼车管理页原本写着「在设置里打开 portalEnabled」，
+          而设置页根本没有这个分组，用户按提示找不到任何开关。 */}
+      <SectionGate section="portal" titleKey="settingspage.card.portal" kwKey="settingspage.card.portal.kw">
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="text-base flex items-center gap-2">
+            <Users className="h-4 w-4 text-muted-foreground" />
+            <Highlight text={t('settingspage.card.portal')} />
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="py-0">
+          <Field
+            label={t('settingspage.portal.enabled.label')}
+            hint={`${t('settingspage.portal.enabled.hint')}${hotParen}`}
+          >
+            <Switch checked={form.portalEnabled} onCheckedChange={(v) => set('portalEnabled', v)} />
+          </Field>
+          <Field
+            label={t('settingspage.portal.inviteCode.label')}
+            hint={t('settingspage.portal.inviteCode.hint')}
+          >
+            <div className="flex items-center gap-2">
+              <Input
+                type="password"
+                className="flex-1 min-w-0 max-w-[260px] font-mono text-xs"
+                value={form.portalInviteCode}
+                onChange={(e) => set('portalInviteCode', e.target.value)}
+                placeholder={
+                  config.portalInviteCodeConfigured
+                    ? t('settingspage.portal.inviteCode.phSet')
+                    : t('settingspage.portal.inviteCode.phUnset')
+                }
+                autoComplete="new-password"
+                disabled={!form.portalEnabled || form.portalInviteCodeClear}
+              />
+              <Badge
+                variant={config.portalInviteCodeConfigured ? 'default' : 'secondary'}
+                className="shrink-0 whitespace-nowrap"
+              >
+                {config.portalInviteCodeConfigured
+                  ? t('settingspage.common.set')
+                  : t('settingspage.common.unset')}
+              </Badge>
+            </div>
+          </Field>
+          {/* 「清除注册码」只在确实配过时才出现：没配过的时候这个勾选框无事可做，
+              显示出来只会让人以为漏了什么。勾选后输入框禁用——同时填新值又要清除是
+              矛盾的意图，让两者互斥比让后端去猜哪个优先更清楚。 */}
+          {config.portalInviteCodeConfigured && (
+            <Field
+              label={t('settingspage.portal.inviteClear.label')}
+              hint={t('settingspage.portal.inviteClear.hint')}
+            >
+              <Checkbox
+                checked={form.portalInviteCodeClear}
+                onCheckedChange={(v) => set('portalInviteCodeClear', v === true)}
+                disabled={!form.portalEnabled}
+              />
+            </Field>
+          )}
+          <Field
+            label={t('settingspage.portal.requireHttps.label')}
+            hint={t('settingspage.portal.requireHttps.hint')}
+          >
+            <Switch
+              checked={form.portalRequireHttps}
+              onCheckedChange={(v) => set('portalRequireHttps', v)}
+              disabled={!form.portalEnabled}
+            />
+          </Field>
+          <Field
+            label={t('settingspage.portal.credits.label')}
+            hint={t('settingspage.portal.credits.hint')}
+          >
+            <Switch
+              checked={form.portalCreditsEnabled}
+              onCheckedChange={(v) => set('portalCreditsEnabled', v)}
+              disabled={!form.portalEnabled}
             />
           </Field>
         </CardContent>
