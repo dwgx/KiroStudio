@@ -206,14 +206,13 @@ impl SseFilterState {
                 Some(Self::rewrite_event(event_type, &v))
             }
             "content_block_delta" => {
-                let delta_type = v
-                    .get("delta")
-                    .and_then(|d| d.get("type"))
-                    .and_then(|t| t.as_str());
+                // ⚠️ 丢弃条件按 `in_thinking` 单独判定，不看 delta_type：
+                // 被滤 thinking 块内的**所有** delta（含 thinking_delta、signature_delta，
+                // 以及偶发的 text_delta）一律不下发 —— 若只滤 thinking_delta，thinking 块内
+                // 混入的 text_delta 会因 index_map 无该旧 index 而带悬空旧 index 透传，
+                // 客户端收到"孤儿 delta"（start 已被丢）甚至与新重编号块同 index 混淆。
                 let in_thinking = self.in_thinking.get(&old_idx).copied().unwrap_or(false);
-                let is_thinking_delta =
-                    matches!(delta_type, Some("thinking_delta") | Some("signature_delta"));
-                if in_thinking && is_thinking_delta {
+                if in_thinking {
                     return None;
                 }
                 self.rewrite_index_or_passthrough(&mut v, event_type, block, old_idx)
@@ -421,6 +420,45 @@ mod tests {
         let filtered = collect_filtered(filter_sse_stream(stream)).await;
         assert!(!filtered.contains("thinking"), "thinking 块必须滤掉（跨 chunk 也应识别）");
         assert!(filtered.contains("text_delta") || filtered.contains("\"type\":\"text\""), "text 块必须保留");
+    }
+
+    /// 🔴 回归：被滤 thinking 块内混入 `text_delta`（非 thinking_delta）也必须丢弃，
+    /// 否则会带悬空旧 index 透传成"孤儿 delta"（start 已被滤，index_map 无该旧 index）。
+    #[tokio::test]
+    async fn test_filter_sse_stream_drops_text_delta_inside_thinking() {
+        let input = format!(
+            "{}{}{}{}{}",
+            event(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#
+            ),
+            event(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"leak"}}"#
+            ),
+            event(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#
+            ),
+            event(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hello"}}"#
+            ),
+            event("message_stop", r#"{"type":"message_stop"}"#),
+        );
+        let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(input))]);
+        let filtered = collect_filtered(filter_sse_stream(stream)).await;
+        assert!(
+            !filtered.contains("leak"),
+            "thinking 块内的 text_delta 必须丢弃，不得泄漏（旧 index 悬空会混淆客户端）"
+        );
+        assert!(filtered.contains("Hello"), "真实 text 块必须保留");
+        // 重编号后唯一 text 块应为 index 0。
+        let indices = extract_indices(&filtered);
+        assert!(
+            indices.iter().all(|&i| i == 0),
+            "泄漏 delta 滤掉后，所有保留块 index 应连续为 0，实际 {indices:?}"
+        );
     }
 
     /// 非流式 JSON：滤掉 thinking 块，text/tool_use 保留。
