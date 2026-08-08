@@ -2,6 +2,65 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.46] - 2026-08-08 - 大规模合并汇聚——上游重试放大治理 + 会炸修复 + vps 移植 + k2cc cache 链
+
+大合并 + 全量修复汇聚批次：治理重试放大、修 3 条会炸的 bug、移植 vps 生产修复、
+落地 k2cc 四层 cache 链、补强 deepseek 归一化与图片降采样，管理面板同步增强。
+
+### 上游重试放大治理
+
+- **全局并发信号量**：新增 `upstream_concurrency_limit`（默认 16），对上游并发请求统一收口，
+  配合整形层从源头抑制重试放大（此前 kiro_shield 外挂每请求重打 KiroStudio、网关内部再 12 次换号）。
+- **动态降重试预算**：60s 压力窗口统计 429+5xx，命中即降档重试预算，压力下自动收敛放大倍数。
+- **重试上限 12→4 + `retry_delay_throttle`**：重试次数封顶下调；429 专用退避 1s→8s 分级退避，
+  避免对仍处于风控中的上游持续猛打。
+- **并发闸满返 429 而非 502**：信号量满时返回 `429 + Retry-After`，让重试层正确识别"背压"，
+  不再误判为服务故障而盲目重试。
+
+### 会炸的 3 条修复
+
+- **passthrough_think_filter 非 object panic**：顶层 JSON 非 object 时 `as_object_mut` 直接 panic，
+  补 fail-open 守卫，异常上游响应不再打崩进程。
+- **SSE 缓冲无界增长**：缓冲上限 1MiB，防超长/异常响应把内存顶爆、整条流卡死。
+- **事件分隔符混合行尾取 min**：`\n` 与 `\r\n` 混合时取最小长度切分，防事件粘连泄漏 thinking。
+
+### vps 修复移植
+
+- **family_key 按 clone_group 收族**：族键改为 `clone:{group}`，克隆同组的凭据共享族级健康。
+- **token_manager 族级累加/清零配对**：整族同值禁用、成功清零整族，两处口径配对一致，
+  杜绝写侧与读侧键不一致的影子条目。
+- **subscription_unsupported 判据接入**：补订阅不支持判据，正确识别并禁用该凭据。
+- **openai plan_thinking + supports_thinking fail-open 门**：能力探测失败时 fail-open，
+  不误伤正常请求。
+- **usage_handlers PipelineHealth**：`written` / `drop_rate` 配对口径合并既有 dropped 出口。
+
+### k2cc 四层 cache 链
+
+- **metering 真值解析**：解析 `MeteringEvent` 的 `cache_read`/`creation` 真值，作为第一层。
+- **prefix 估算 + ratio 兜底 + 5m/1h 拆分 + clamp**：真值缺失时逐层降级，5 分钟/1 小时
+  窗口拆分并 clamp 到合理区间。
+- **入库用未缩放真值、对外乘 0.6657**：持久化保留原始真值，对外上报统一折算（fingerprint
+  Layer3 留 TODO）。
+
+### deepseek 归一化补强
+
+- **请求侧剥 WebSearch**：剥除 WebSearch 工具、`tool_choice=parallel`、system 级 `cache_control`，
+  避免上游不认而报错。
+- **max_tokens 下限仅显式 thinking 抬升**：只有显式开启 thinking 才抬下限，普通请求不受影响。
+- **配置化**：新增 `DeepseekNormalizeOverride`，支持全局 + per-凭据两级覆盖。
+- **响应侧**：thinking 过滤 + 空流兜底（补发 error 事件防客户端卡死）+ usage 扣减（累计口径）
+  + 内联 `<thinking>` 剥离。
+- **通用 JSON Schema 修复**：复用 converter 的 schema 修复逻辑，收敛实现。
+
+### 图片降采样
+
+- **hard_max_pixels / kill switch / GIF 帧数探测**：超过像素上限按比例降采样；kill switch
+  可一键关闭；GIF 按帧数探测——静态图转 JPEG、动画保留原格式。
+
+### 管理面板
+
+- 模型探测、回收站分页、日志持久化、前端运行时 dist 热更（`KIROSTUDIO_UI_DIR`，免重编译换前端）。
+
 ## [0.7.44] - 2026-07-27 - macOS 完整支持 + 全仓精读后的致命缺陷修复批次
 
 对全仓 53k 行 Rust + 23k 行前端做逐文件精读，再对每条发现**逐一读代码复核**（含证伪），
