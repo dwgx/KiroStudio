@@ -1881,9 +1881,14 @@ impl KiroProvider {
                     .and_then(|s| s.trim().parse::<u64>().ok());
                 let body = response.text().await.unwrap_or_default();
 
-                // 客户端请求校验错误（如 TOOL_USE_RESULT_MISMATCH）：请求构造问题，
+                // 客户端请求校验错误（如 TOOL_USE_RESULT_MISMATCH / TOOL_SCHEMA_INVALID）：请求构造问题，
                 // 换号/重试都只会重复失败并浪费配额，立即终止（不计凭据失败）。
-                if endpoint.is_client_validation_error(&body) {
+                // `is_client_validation_error` 覆盖 TOOL_USE_RESULT_MISMATCH；TOOL_SCHEMA_INVALID
+                // 是同一语义（客户端工具 schema 非法，非上游故障）的另一 reason（ZyphrZero/kiro.rs
+                // endpoint/mod.rs 的 CLIENT_VALIDATION_REASONS 两者都收），此处补认。
+                if endpoint.is_client_validation_error(&body)
+                    || body.contains("TOOL_SCHEMA_INVALID")
+                {
                     tracing::warn!(
                         "API 请求失败（客户端请求校验错误，不重试）: {} {}",
                         status,
@@ -3290,6 +3295,52 @@ mod tests {
                 "额度判定必须排在通用 400 分支之前（挪到之后即失效）"
             );
         }
+    }
+
+    /// ⭐ 源码级守卫（客户端格式错误不重试防 503 风暴）：客户端请求校验错误分支必须**同时**
+    /// 认 `TOOL_USE_RESULT_MISMATCH`（endpoint 层 `is_client_validation_error` 覆盖）与
+    /// `TOOL_SCHEMA_INVALID`（本处补认），且命中后直接 break —— 不重试、不换号、不进吸收层。
+    ///
+    /// 参考 ZyphrZero/kiro.rs endpoint/mod.rs 的 `CLIENT_VALIDATION_REASONS`：这两个 reason
+    /// 都是客户端请求构造问题（多轮工具结果不匹配 / 工具 schema 非法），重试/换号只会白烧
+    /// 并发请求，放大成上游 503 风暴。漏认任一都会把它们当可重试瞬态错误处理。
+    ///
+    /// 用源码级守卫而非行为测试：`call_api_with_retry` 需真实上游 + 号池，单测造不出
+    /// （本仓既有惯例）。
+    #[test]
+    fn client_validation_error_recognizes_both_markers_and_breaks() {
+        let full = include_str!("provider.rs");
+        // 切掉测试段：本测试自身的字面量不能成为假命中源。
+        let src = full
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(full);
+        // 定位该分支：条件文本到第一个 `{` 为止。
+        let marker = "if endpoint.is_client_validation_error(&body)";
+        let at = src
+            .find(marker)
+            .expect("客户端请求校验错误分支不应被删除");
+        let cond_end = src[at..]
+            .find('{')
+            .map(|i| at + i)
+            .unwrap_or(src.len());
+        let cond = &src[at..cond_end];
+        assert!(
+            cond.contains("TOOL_SCHEMA_INVALID"),
+            "客户端请求校验错误分支必须同时认 TOOL_USE_RESULT_MISMATCH（endpoint 层\
+             is_client_validation_error）与 TOOL_SCHEMA_INVALID（本处补认）：漏认后者会把\
+             客户端构造错误当可重试瞬态，白烧并发请求并放大成上游 503 风暴"
+        );
+        // 命中后必须 break（直接失败），分支内不得 continue（continue 即重试/换号）。
+        let branch_body = &src[at..src[at..]
+            .find("break")
+            .map(|i| at + i)
+            .expect("命中后必须 break（直接失败、不重试不换号）：改回 continue 即回归")];
+        assert!(
+            !branch_body.contains("continue"),
+            "客户端请求校验错误分支内不得 continue：continue 即重试/换号，\
+             与『客户端错不重试』的语义冲突"
+        );
     }
 
     // ⚠️ `#[test]` 曾在 2026-08-06 之前的某次改动中丢失，导致本守卫**从未运行过**

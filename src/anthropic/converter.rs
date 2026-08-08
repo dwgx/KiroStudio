@@ -15,6 +15,7 @@ use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
 
+use super::image_resize::{ResizeConfig, ResizeError, maybe_shrink_image};
 use super::types::{ContentBlock, ImageSource, MessagesRequest};
 
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
@@ -1299,18 +1300,16 @@ fn resolve_image_format(source: &ImageSource) -> Option<String> {
 /// 顶层通道。
 ///
 /// 返回值：
-/// - `Some(placeholder)`：历史去重命中、或历史图片数超过 [`MAX_TOTAL_IMAGES`] 上限，图片被省略；
+/// - `Some(placeholder)`：历史去重命中、历史图片数超过 [`MAX_TOTAL_IMAGES`] 上限、或图片超过安全上限，图片被省略；
 /// - `None`：图片已上浮到 `images`，或格式不支持（无法转换）。
 fn extract_kiro_image(
     source: &ImageSource,
     dedup: &mut Option<&mut std::collections::HashSet<String>>,
     images: &mut Vec<KiroImage>,
 ) -> Option<String> {
-    // 单图 base64 大小上限（防御）：AWS Q / Kiro 上游有 per-field 大小硬限制，超大图
-    // （如 4K 截图转 base64 常超 1MiB）可能触发 CONTENT_LENGTH_EXCEEDS_THRESHOLD 400。
-    // 8MiB 是远超大图的阈值，正常图片永不触发；超限省略 + 占位符（不 fail 请求，
-    // 与 MAX_TOTAL_IMAGES 同风格）。完整 resize（GreyGunG image_resize）需 image crate +
-    // 热路径 CPU，线上 72h 0 次大图 400，暂不引入，保留本上限作零成本防线。
+    // 单图 base64 大小上限（硬安全网，非降采样目标）：AWS Q / Kiro 上游有 per-field 大小硬限制，
+    // 8MiB 是远超大图的阈值；超限省略 + 占位符（不 fail 请求，与 MAX_TOTAL_IMAGES 同风格）。
+    // 8MiB 内的超大图（如 4K 截图常超 1MiB）不再省略，走下方 maybe_shrink_image 降采样后不丢图。
     const MAX_SINGLE_IMAGE_BASE64_BYTES: usize = 8 * 1024 * 1024;
     if source.data.len() > MAX_SINGLE_IMAGE_BASE64_BYTES {
         tracing::warn!(
@@ -1340,7 +1339,34 @@ fn extract_kiro_image(
         }
     }
 
-    images.push(KiroImage::from_base64(format, source.data.clone()));
+    // 智能降采样（GreyGunG image_resize 移植）：8MiB 内的图先尝试缩小到上游可接受的长边
+    // /字节预算（PNG/WebP/JPEG 一律重编码 JPEG，GIF 保留原格式防丢动画）。小图零开销直通。
+    let cfg = ResizeConfig::from_env();
+    match maybe_shrink_image(cfg, &format, &source.data) {
+        Ok(processed) => {
+            images.push(KiroImage::from_base64(processed.format, processed.data_base64));
+        }
+        Err(ResizeError::LimitExceeded(_)) => {
+            // 安全上限（base64/解码字节/像素/GIF 超预算）触发：维持旧行为"省略 + 占位符"，
+            // 不 fail 请求——把超限 payload 直接透传上游比省略更危险。
+            tracing::warn!(
+                bytes = source.data.len(),
+                format = %format,
+                "单图超过安全上限，省略该图（防上游 per-field 大小限制）"
+            );
+            return Some("[image omitted: exceeds image safety limits]".to_string());
+        }
+        Err(e) => {
+            // 解码/编码失败：保留原图透传（坏图不该让整请求失败），警告留痕。
+            tracing::warn!(
+                error = %e,
+                bytes = source.data.len(),
+                format = %format,
+                "图片降采样失败，保留原图透传"
+            );
+            images.push(KiroImage::from_base64(format, source.data.clone()));
+        }
+    }
     None
 }
 
