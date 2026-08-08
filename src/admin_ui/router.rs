@@ -19,6 +19,26 @@ use std::time::Duration;
 #[folder = "admin-ui/dist"]
 struct Asset;
 
+/// 加载前端资源：优先从运行时 `KIROSTUDIO_UI_DIR` 磁盘读，fallback 到 rust-embed。
+///
+/// 为什么加磁盘优先：前端是编译期 rust-embed 嵌入，改一行前端要重编译整个 Rust 二进制
+/// （release + musl + LTO 约 1.5 分钟）。生产把 dist 目录 bind mount 进容器并设
+/// `KIROSTUDIO_UI_DIR` 后，替换 dist 文件**秒级生效**（每次请求实时读文件，无需重启）。
+/// 未配置该变量时行为与纯 embed 逐字节一致（零回归）。
+///
+/// 安全：`path` 由调用方先剔除前导 `/` 且拒绝含 `..`；`join` 相对路径不会逃逸出 base。
+fn load_asset(path: &str) -> Option<std::borrow::Cow<'static, [u8]>> {
+    if let Some(dir) = std::env::var_os("KIROSTUDIO_UI_DIR") {
+        let full = std::path::PathBuf::from(dir).join(path);
+        if full.is_file() {
+            if let Ok(bytes) = std::fs::read(&full) {
+                return Some(std::borrow::Cow::Owned(bytes));
+            }
+        }
+    }
+    Asset::get(path).map(|c| c.data)
+}
+
 // ============ 登录页背景图预取池 ============
 //
 // 设计目标：登录页打开时秒回一张背景图，不再在请求热路径上实时打 lolicon。
@@ -546,8 +566,8 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
             .expect("Failed to build response");
     }
 
-    // 尝试获取请求的文件
-    if let Some(content) = Asset::get(path) {
+    // 尝试获取请求的文件（磁盘优先，fallback embed）
+    if let Some(content) = load_asset(path) {
         let mime = mime_guess::from_path(path)
             .first_or_octet_stream()
             .to_string();
@@ -559,7 +579,7 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, mime)
             .header(header::CACHE_CONTROL, cache_control)
-            .body(Body::from(content.data.into_owned()))
+            .body(Body::from(content.into_owned()))
             .expect("Failed to build response");
     }
 
@@ -577,12 +597,12 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
 
 /// 提供 index.html
 fn serve_index() -> Response<Body> {
-    match Asset::get("index.html") {
+    match load_asset("index.html") {
         Some(content) => Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
             .header(header::CACHE_CONTROL, "no-cache")
-            .body(Body::from(content.data.into_owned()))
+            .body(Body::from(content.into_owned()))
             .expect("Failed to build response"),
         None => Response::builder()
             .status(StatusCode::NOT_FOUND)
