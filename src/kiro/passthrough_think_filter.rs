@@ -57,6 +57,83 @@ pub fn filter_json_bytes(bytes: &[u8]) -> Bytes {
         .unwrap_or_else(|_| Bytes::copy_from_slice(bytes))
 }
 
+/// 空流兜底：过滤后的流若**没有任何 content 事件**（上游只吐 thinking 被滤光，或上游
+/// 真返回空流），流结束时空则补发一个 Anthropic `error` 事件 —— 否则客户端收到
+/// "API Error: Stream ended without receiving any events" 而 agentic 循环卡死。
+///
+/// 对齐主路径（Kiro）的 `empty_response_error_event`：显式 error 替代静默空流。
+pub fn guard_empty_stream<S, E>(
+    inner: S,
+    err_message: &'static str,
+) -> impl Stream<Item = Result<Bytes, axum::Error>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    EmptyStreamGuard {
+        inner: Box::pin(inner),
+        saw_content: false,
+        guard_emitted: false,
+        err_message,
+    }
+}
+
+/// 空流守卫：跟踪是否见过 `content_block` 事件（thinking 被滤后，透传的 `content_block_*`
+/// 只可能是真实文本/工具调用块；`message_start` 的 `content: []` 不含 `content_block` 子串）。
+struct EmptyStreamGuard<S> {
+    inner: Pin<Box<S>>,
+    saw_content: bool,
+    guard_emitted: bool,
+    err_message: &'static str,
+}
+
+impl<S, E> Stream for EmptyStreamGuard<S>
+where
+    S: Stream<Item = Result<Bytes, E>>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    type Item = Result<Bytes, axum::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            match self.inner.poll_next_unpin(cx) {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    const MARKER: &[u8] = b"content_block";
+                    if !self.saw_content
+                        && chunk
+                            .windows(MARKER.len())
+                            .any(|w| w == MARKER)
+                    {
+                        self.saw_content = true;
+                    }
+                    return Poll::Ready(Some(Ok(chunk)));
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    return Poll::Ready(Some(Err(axum::Error::new(e))));
+                }
+                Poll::Ready(None) => {
+                    if !self.saw_content && !self.guard_emitted {
+                        self.guard_emitted = true;
+                        tracing::warn!(
+                            "[透传] 过滤后流无任何 content 事件，补发 error 事件防客户端空流卡死"
+                        );
+                        let ev = format!(
+                            "event: error\ndata: {}\n\n",
+                            serde_json::json!({
+                                "type": "error",
+                                "error": { "type": "api_error", "message": self.err_message }
+                            })
+                        );
+                        return Poll::Ready(Some(Ok(Bytes::from(ev))));
+                    }
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
 /// 自定义 Stream：持有内层流 + SSE 过滤状态。
 struct SseThinkFilter<S> {
     inner: Pin<Box<S>>,
@@ -475,6 +552,50 @@ mod tests {
             indices.iter().all(|&i| i == 0),
             "泄漏 delta 滤掉后，所有保留块 index 应连续为 0，实际 {indices:?}"
         );
+    }
+
+    /// 🔴 回归：过滤后流**无任何 content 事件**（上游只吐 thinking 被滤光）→ 流结束补发
+    /// error 事件，防客户端 "Stream ended without receiving any events" 卡死。
+    #[tokio::test]
+    async fn test_guard_empty_stream_emits_error_when_no_content() {
+        // 只有 thinking 事件 → filter 滤光 → 空流 → guard 补 error
+        let input = format!(
+            "{}{}",
+            event("message_start", r#"{"type":"message_start"}"#),
+            event(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#
+            ),
+        );
+        let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(input))]);
+        let guarded = guard_empty_stream(filter_sse_stream(stream), "空响应测试");
+        let filtered = collect_filtered(guarded).await;
+        assert!(
+            filtered.contains("\"type\":\"error\""),
+            "空流必须补发 error 事件，实际: {filtered}"
+        );
+        assert!(filtered.contains("空响应测试"), "error 消息应透传");
+    }
+
+    /// 有真实 content 事件 → 不补发 error。
+    #[tokio::test]
+    async fn test_guard_empty_stream_keeps_content_unchanged() {
+        let input = format!(
+            "{}{}",
+            event("message_start", r#"{"type":"message_start"}"#),
+            event(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#
+            ),
+        );
+        let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(input))]);
+        let guarded = guard_empty_stream(filter_sse_stream(stream), "不应出现");
+        let filtered = collect_filtered(guarded).await;
+        assert!(
+            !filtered.contains("\"type\":\"error\""),
+            "有 content 事件不应补 error，实际: {filtered}"
+        );
+        assert!(filtered.contains("\"type\":\"text\""), "text 块保留");
     }
 
     /// 🔴 回归：`redacted_thinking`（超预算的合法类型）流式路径也要整块滤掉。

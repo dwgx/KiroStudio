@@ -18,7 +18,7 @@ use futures::TryStreamExt;
 use crate::common::http_read::read_body_capped;
 use crate::http_client::build_streaming_client_no_redirect;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::passthrough_think_filter::{filter_json_bytes, filter_sse_stream};
+use crate::kiro::passthrough_think_filter::{filter_json_bytes, filter_sse_stream, guard_empty_stream};
 use crate::model::config::TlsBackend;
 
 /// 非流式响应过滤前允许读取的最大字节数。非流式 JSON 响应通常远小于此；
@@ -162,7 +162,12 @@ pub async fn forward(
         Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, content_type)
-            .body(Body::from_stream(filter_sse_stream(byte_stream)))
+            // ⚠️ 空流兜底：thinking 被滤光/上游真空响应时补发 error 事件，
+            // 防客户端 "Stream ended without receiving any events" 卡死 agentic 循环。
+            .body(Body::from_stream(guard_empty_stream(
+                filter_sse_stream(byte_stream),
+                "上游返回空响应（thinking 被过滤后无正文内容），请重试",
+            )))
             .unwrap_or_else(|_| err_response(StatusCode::BAD_GATEWAY, "构建透传响应失败"))
     } else if filter_thinking && content_type.contains("application/json") {
         // 非流式:缓冲完整 body 过滤（Content-Length 本就不透传,无需重算）。
