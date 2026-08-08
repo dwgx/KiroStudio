@@ -36,6 +36,9 @@ hex = "0.4"
 base64 = "0.22"     # PDF document 块 base64 解码（提取文本给上游）
 crc = "3"           # CRC32C 计算
 chacha20poly1305 = "0.10"  # credentials.json at-rest 加密（AEAD，纯 Rust 无 C 依赖）
+# 入站图片智能降采样（移植 GreyGunG/Kiro-RS-Tool image_resize）：超大 base64 图片（如 4K 截图）
+# 在「不丢图」前提下解码→缩到长边≤1568→重编码 JPEG。纯 Rust 无 C 依赖，只启用 png/jpeg/webp/gif。
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 getrandom = "0.2"   # at-rest 加密密钥/nonce 的 CSPRNG（OS 熵源，非 fastrand 弱 PRNG）
 bytes = "1"         # 高效的字节缓冲区
 tower-http = { version = "0.6", features = ["cors"] }

@@ -168,6 +168,25 @@ pub(crate) fn billed_input_tokens(
         .max(0)
 }
 
+/// 返回给客户端的 token 类字段缩放系数。
+///
+/// 仅影响给客户端（如 Claude Code）看到的 usage.input_tokens / cache_* 字段，
+/// 内部计费与 usage_tracker 入库仍写入真实值。`output_tokens` 刻意不缩放，
+/// 避免影响客户端基于它的 max_tokens 计算。
+///
+/// Claude Code 4.6 窗口 200K，85% 触发 compact = 170K（原假设 83%，按实测更新）。
+/// 缩放系数按比例上调以保持原真实触发点不变：0.65 × (85/83) ≈ 0.6657。
+/// 真实 255K+ × 0.6657 ≈ 170K+ → 触发 compact。
+const CLIENT_TOKEN_DISPLAY_SCALE: f64 = 0.6657;
+
+/// 对客户端展示用的 token 值缩放（向上取整保证非零）。
+pub(crate) fn scale_for_client(n: i32) -> i32 {
+    if n <= 0 {
+        return n.max(0);
+    }
+    ((n as f64) * CLIENT_TOKEN_DISPLAY_SCALE).ceil() as i32
+}
+
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
 /// UTF-8字符可能占用1-4个字节，直接按字节位置切片可能会切在多字节字符中间导致panic。
@@ -1104,16 +1123,18 @@ impl SseStateManager {
         if !self.message_delta_sent {
             self.message_delta_sent = true;
             let mut usage_json = json!({
-                "input_tokens": input_tokens,
+                // 客户端展示缩放（output_tokens 不缩放，避免影响 max_tokens 计算）
+                "input_tokens": scale_for_client(input_tokens),
                 "output_tokens": output_tokens
             });
             if let Some(cache_usage) = cache_usage {
                 usage_json["cache_creation_input_tokens"] =
-                    json!(cache_usage.cache_creation_input_tokens);
-                usage_json["cache_read_input_tokens"] = json!(cache_usage.cache_read_input_tokens);
+                    json!(scale_for_client(cache_usage.cache_creation_input_tokens));
+                usage_json["cache_read_input_tokens"] =
+                    json!(scale_for_client(cache_usage.cache_read_input_tokens));
                 usage_json["cache_creation"] = json!({
-                    "ephemeral_5m_input_tokens": cache_usage.cache_creation_5m_input_tokens,
-                    "ephemeral_1h_input_tokens": cache_usage.cache_creation_1h_input_tokens
+                    "ephemeral_5m_input_tokens": scale_for_client(cache_usage.cache_creation_5m_input_tokens),
+                    "ephemeral_1h_input_tokens": scale_for_client(cache_usage.cache_creation_1h_input_tokens)
                 });
             }
             events.push(SseEvent::new(
@@ -1143,6 +1164,20 @@ impl SseStateManager {
 }
 
 use super::converter::get_context_window_size;
+
+/// 空响应判定为「上下文过大」的输入 token 阈值（取窗口的 28%）。
+///
+/// 实测 input≈297K 时上游已频繁返回空/极短响应（4~13 tokens 无工具调用），
+/// 取窗口的 28%（≈280K for 1M 窗口）作为判定阈值。
+fn empty_response_oversized_threshold(model: &str) -> i32 {
+    (get_context_window_size(model) as f64 * 0.28) as i32
+}
+
+/// "近似空响应"的 output token 阈值。
+///
+/// 当上下文压力大时，模型可能返回极短的无意义文本（如 4~13 tokens）而非工具调用，
+/// 导致客户端 agentic 循环卡住。output < 此阈值且无工具调用时，视为近似空响应。
+const NEAR_EMPTY_OUTPUT_THRESHOLD: i32 = 30;
 
 /// 流处理上下文
 /// 一次请求解析出的最终用量快照（供用量统计埋点消费）
@@ -1666,6 +1701,44 @@ impl StreamContext {
                 .map(|c| c.cache_creation_input_tokens)
                 .unwrap_or(0),
         }
+    }
+
+    /// 检测上游是否返回了无效的空/近似空响应。
+    ///
+    /// 在 [`generate_final_events`] 收尾兜底**之后**判定 —— 推理降级下发、空格 thinking 块
+    /// 等既有兜底已把「本可抢救」的响应变成非空，此刻仍为空才是真退化：
+    /// 1. **完全空**：output_tokens == 0 且无工具调用。
+    /// 2. **近似空 + 上下文过大**：output_tokens 极少（< 30）且无工具调用，
+    ///    同时 input_tokens 超过「上下文过大」阈值（窗口的 28%）。此类响应是模型在
+    ///    上下文压力下返回的无意义短文本（如几个空白 token），客户端拿到后会以为
+    ///    end_turn 正常结束并继续对话，导致 agentic 循环反复卡住。
+    pub fn is_empty_response(&self) -> bool {
+        let no_tool_use = !self.state_manager.has_tool_use;
+
+        // 路径 1：完全空
+        if self.output_tokens == 0 && no_tool_use {
+            return true;
+        }
+
+        // 路径 2：近似空 + 上下文过大
+        if self.output_tokens > 0
+            && self.output_tokens < NEAR_EMPTY_OUTPUT_THRESHOLD
+            && no_tool_use
+        {
+            let est = self.context_input_tokens.unwrap_or(self.input_tokens);
+            return est >= empty_response_oversized_threshold(&self.model);
+        }
+
+        false
+    }
+
+    /// 空响应是否由「上下文过大」导致。
+    ///
+    /// 大输入空响应 → 不应重试（重试还是同样的大请求），应提示客户端压缩上下文；
+    /// 小输入空响应 → 视为偶发，可重试。
+    pub fn empty_response_is_oversized_context(&self) -> bool {
+        let est = self.context_input_tokens.unwrap_or(self.input_tokens);
+        est >= empty_response_oversized_threshold(&self.model)
     }
 
     /// 本次响应的完成状态（收尾时读取以决定 outcome / HTTP 码）
@@ -3574,6 +3647,16 @@ impl BufferedStreamContext {
     /// 标记解码器永久停止（透传）
     pub fn mark_decoder_stopped(&mut self, message: impl Into<String>) {
         self.inner.mark_decoder_stopped(message);
+    }
+
+    /// 是否空/近似空响应（透传内部 StreamContext，供收尾补发 error 事件）。
+    pub fn is_empty_response(&self) -> bool {
+        self.inner.is_empty_response()
+    }
+
+    /// 空响应是否由「上下文过大」导致（透传）。
+    pub fn empty_response_is_oversized_context(&self) -> bool {
+        self.inner.empty_response_is_oversized_context()
     }
 
     /// 设置 prompt 缓存记账明细（前缀估算注入；在 process_and_buffer 之前调用）
@@ -9375,5 +9458,73 @@ mod tests {
             "truncated_and_illegal"
         );
         assert_eq!(ToolJsonDefect::Malformed.as_str(), "malformed");
+    }
+}
+
+#[cfg(test)]
+mod ported_k2cc_empty_response_tests {
+    //! 从 k2cc 移植的「token 显示缩放 + 空/近空响应检测」回归测试。
+    //!
+    //! 缩放只改**回给客户端**的 usage 展示，不碰真实记账；空响应判据要求
+    //! 输入占比 + 输出过短 + 无工具调用三者同时，避免误伤正常短回答。
+    use super::*;
+
+    fn ctx(model: &str, input_tokens: i32) -> StreamContext {
+        StreamContext::new_with_thinking(model, input_tokens, false, HashMap::new())
+    }
+
+    #[test]
+    fn test_scale_for_client_basic() {
+        assert_eq!(scale_for_client(100_000), 66_570);
+        assert_eq!(scale_for_client(85_000), 56_585);
+        assert_eq!(scale_for_client(0), 0);
+        assert_eq!(scale_for_client(1), 1);
+        assert_eq!(scale_for_client(-100), 0);
+        assert_eq!(scale_for_client(11), 8); // ceil(11 × 0.6657) = 8
+    }
+
+    #[test]
+    fn test_empty_response_fully_empty() {
+        // output=0 且无工具调用 → 完全空响应。
+        let c = ctx("claude-sonnet-5", 10_000);
+        assert_eq!(c.output_tokens, 0);
+        assert!(c.is_empty_response());
+    }
+
+    #[test]
+    fn test_empty_response_near_empty_oversized_context_flagged() {
+        // output 极少 + 无工具调用 + input 超 28% 窗口 → 上下文压力退化响应。
+        let model = "claude-sonnet-5";
+        let threshold = empty_response_oversized_threshold(model);
+        let mut c = ctx(model, threshold);
+        c.output_tokens = 5;
+        assert!(c.is_empty_response());
+        assert!(c.empty_response_is_oversized_context());
+    }
+
+    #[test]
+    fn test_empty_response_near_empty_small_context_not_flagged() {
+        // 同样短的输出，但输入远未超阈值 → 正常短回答，不误伤。
+        let mut c = ctx("claude-sonnet-5", 10_000);
+        c.output_tokens = 5;
+        assert!(!c.is_empty_response());
+        assert!(!c.empty_response_is_oversized_context());
+    }
+
+    #[test]
+    fn test_empty_response_with_tool_use_not_flagged() {
+        // 有工具调用 → 客户端会去执行工具，不是空响应。
+        let mut c = ctx("claude-sonnet-5", 10_000);
+        c.output_tokens = 5;
+        c.state_manager.set_has_tool_use(true);
+        assert!(!c.is_empty_response());
+    }
+
+    #[test]
+    fn test_empty_response_short_answer_not_flagged() {
+        // output=15（<30）但输入小 → 正常短回答。
+        let mut c = ctx("claude-sonnet-5", 10_000);
+        c.output_tokens = 15;
+        assert!(!c.is_empty_response());
     }
 }

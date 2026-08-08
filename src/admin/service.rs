@@ -416,6 +416,24 @@ pub struct AdminService {
     socks_next_id: std::sync::atomic::AtomicU64,
 }
 
+/// 清洗粘贴进来的 Kiro API Key（`ksk_`）：截取 `ksk_` 起、去首尾空白与包裹引号/逗号。
+///
+/// 移植自 k2cc-proxy（`admin/service.rs:346`）。实测用户会把 `"key: ksk_xxx"` 整段贴进
+/// 表单，不清洗会同时破坏 region 探测（坏 key）与去重（同一 key 不同前缀可重复导入）。
+/// 空串归一为 `None`（与 k2cc 的 `.filter(!is_empty)` 同语义，交给下游「必须提供」报错）。
+fn clean_ksk_api_key(raw: &str) -> Option<String> {
+    let s = raw.trim().trim_matches(|c| c == '"' || c == '\'' || c == ',');
+    let out = match s.find("ksk_") {
+        Some(i) => s[i..].trim().to_string(),
+        None => s.to_string(),
+    };
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 impl AdminService {
     pub fn new(
         token_manager: Arc<MultiTokenManager>,
@@ -1676,6 +1694,13 @@ impl AdminService {
         req: AddCredentialRequest,
         force_multi_open: bool,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
+        // 清洗粘贴噪声（移植自 k2cc-proxy）：截取 `ksk_` 起的部分，去掉首尾空白与包裹的引号/逗号。
+        // 实测有用户把 `"key: ksk_xxx"` 整段贴进来，导致 region 探测失败并静默落到默认区，
+        // 且去重失效（同号可重复导入）。在**最外层入口**规范化，保证去重/探测/落盘拿到同一值。
+        // 批量导入（import_one_key → self.add_credential）也走本函数，故单加 + 批量两条路径都覆盖。
+        let mut req = req;
+        req.kiro_api_key = req.kiro_api_key.as_deref().and_then(clean_ksk_api_key);
+
         // 校验端点名：未指定则默认合法，指定则必须已注册
         if let Some(ref name) = req.endpoint {
             if !self.known_endpoints.contains(name) {
@@ -9178,5 +9203,53 @@ mod cleanup_disabled_tests {
         let preview: CleanupDisabledRequest =
             serde_json::from_str(r#"{"dryRun":true}"#).expect("camelCase 应能解析");
         assert!(preview.dry_run);
+    }
+}
+
+#[cfg(test)]
+mod ksk_clean_tests {
+    use super::*;
+
+    /// 清洗：引号/逗号/首尾空白/`ksk_` 前的噪声都要剥掉，干净的 key 原样保留。
+    #[test]
+    fn clean_ksk_api_key_strips_paste_noise() {
+        // 干净 key 原样
+        assert_eq!(clean_ksk_api_key("ksk_abc123"), Some("ksk_abc123".into()));
+        // 首尾空白
+        assert_eq!(clean_ksk_api_key("  ksk_abc123  "), Some("ksk_abc123".into()));
+        // 整段 `"key: ksk_xxx"` 粘贴（k2cc 实测踩过的形态）
+        assert_eq!(
+            clean_ksk_api_key("\"key: ksk_abc123\""),
+            Some("ksk_abc123".into())
+        );
+        // 单引号 + 逗号包裹
+        assert_eq!(clean_ksk_api_key("'ksk_abc123',"), Some("ksk_abc123".into()));
+        // `ksk_` 前有任意前缀 → 从 ksk_ 起截取（与 k2cc 逐字一致：`s[i..].trim()`，
+        // 只去前缀噪声，`ksk_` 之后的内容原样保留）
+        assert_eq!(
+            clean_ksk_api_key("some noise here ksk_abc123 trailing"),
+            Some("ksk_abc123 trailing".into())
+        );
+        // 非 ksk_ 值：原样（不透写，不改行为）
+        assert_eq!(clean_ksk_api_key("refresh_token_value"), Some("refresh_token_value".into()));
+        // 纯噪声/空白 → None（交给下游「必须提供 kiroApiKey」报错，与 k2cc 同语义）
+        assert_eq!(clean_ksk_api_key("   "), None);
+        assert_eq!(clean_ksk_api_key("\"\","), None);
+    }
+
+    /// ⭐ 源码级守卫：`add_credential_with_intent` 入口必须对 `req.kiro_api_key` 应用清洗。
+    /// 回退即 FAIL：去掉 `.and_then(clean_ksk_api_key)` → 本测试红。
+    /// 批量导入（import_one_key → add_credential）也走本函数，故一条守卫钉住两条路径。
+    #[test]
+    fn add_credential_entry_applies_ksk_cleaning() {
+        let src = include_str!("service.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        let needle = "req.kiro_api_key.as_deref().and_then(clean_ksk_api_key)";
+        assert!(
+            prod.contains(needle),
+            "add_credential_with_intent 入口必须清洗 kiro_api_key（ksk_ 截取 + 去噪声），\
+             否则粘贴 `\"key: ksk_xxx\"` 会破坏去重与 region 探测"
+        );
     }
 }

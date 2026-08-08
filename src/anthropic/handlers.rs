@@ -1721,6 +1721,33 @@ fn create_ping_sse() -> Bytes {
     Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
 }
 
+/// 为上游空响应构造合适的 SSE error 事件。
+///
+/// - 大输入（疑似上下文过大）：返回 invalid_request_error，提示压缩上下文，
+///   不鼓励原样重试（重试还是同样的大请求，仍会空）。
+/// - 小输入（疑似偶发）：返回 overloaded_error，客户端可重试。
+fn empty_response_error_event(oversized_context: bool) -> SseEvent {
+    let (err_type, message) = if oversized_context {
+        (
+            "invalid_request_error",
+            "上游返回了空响应，疑似上下文已接近窗口上限。请精简对话历史（如 /compact）、\
+             缩短 system prompt 或减少工具数量后重试。",
+        )
+    } else {
+        (
+            "overloaded_error",
+            "上游返回了空响应，请重试。",
+        )
+    };
+    SseEvent::new(
+        "error",
+        serde_json::json!({
+            "type": "error",
+            "error": { "type": err_type, "message": message }
+        }),
+    )
+}
+
 /// 创建 SSE 事件流
 fn create_sse_stream(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
@@ -1856,7 +1883,23 @@ fn create_sse_stream(
                                 ));
                                 ctx.mark_error_event_emitted();
                             }
-                            final_events.extend(tail);
+                            // 空响应检测：正常完成但收尾兜底后模型仍什么都没产出（或上下文压力下的
+                            // 退化短响应）时，用显式 error 事件替代空 end_turn，避免客户端 agentic
+                            // 循环卡住。上下文过大 → invalid_request_error 提示 /compact；偶发 → 可重试。
+                            if ctx.completion().is_ok()
+                                && !ctx.error_event_emitted()
+                                && ctx.is_empty_response()
+                            {
+                                let oversized = ctx.empty_response_is_oversized_context();
+                                tracing::warn!(
+                                    oversized_context = oversized,
+                                    "上游返回空响应（收尾兜底后仍无内容），补发 error 事件替代空 end_turn"
+                                );
+                                final_events.push(empty_response_error_event(oversized));
+                                ctx.mark_error_event_emitted();
+                            } else {
+                                final_events.extend(tail);
+                            }
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -2436,12 +2479,15 @@ async fn handle_non_stream_request(
         final_input_tokens
     };
     let mut usage = json!({
-        "input_tokens": billed_input,
+        // 客户端展示缩放（output_tokens 不缩放，避免影响 max_tokens 计算）
+        "input_tokens": super::stream::scale_for_client(billed_input),
         "output_tokens": output_tokens
     });
     if let Some(c) = cache_breakdown {
-        usage["cache_creation_input_tokens"] = json!(c.cache_creation_input_tokens);
-        usage["cache_read_input_tokens"] = json!(c.cache_read_input_tokens);
+        usage["cache_creation_input_tokens"] =
+            json!(super::stream::scale_for_client(c.cache_creation_input_tokens));
+        usage["cache_read_input_tokens"] =
+            json!(super::stream::scale_for_client(c.cache_read_input_tokens));
     }
     // 是否需要标注「这些 cache 数字是网关估算」——仅在真的下发了字段时标，
     // 否则响应头与响应体自相矛盾（见 CACHE_ESTIMATED_HEADER 的说明）。
@@ -2907,7 +2953,22 @@ fn create_buffered_sse_stream(
                                     ));
                                     ctx.mark_error_event_emitted();
                                 }
-                                all_events.extend(tail);
+                                // 空响应检测（buffered 路径同构）：正常完成但收尾兜底后仍无内容时，
+                                // 返回显式 error 事件而非空 end_turn。
+                                if ctx.completion().is_ok()
+                                    && !ctx.error_event_emitted()
+                                    && ctx.is_empty_response()
+                                {
+                                    let oversized = ctx.empty_response_is_oversized_context();
+                                    tracing::warn!(
+                                        oversized_context = oversized,
+                                        "上游返回空响应（buffered 路径，收尾兜底后仍无内容），补发 error 事件"
+                                    );
+                                    all_events.push(empty_response_error_event(oversized));
+                                    ctx.mark_error_event_emitted();
+                                } else {
+                                    all_events.extend(tail);
+                                }
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -5042,5 +5103,29 @@ mod truncation_completion_tests {
         let frame = d.decode_iter().next().unwrap().unwrap();
         assert_eq!(frame.event_type(), Some("toolUseEvent"));
         assert!(Event::from_frame(frame).is_err());
+    }
+}
+
+#[cfg(test)]
+mod ported_k2cc_empty_response_event_tests {
+    //! 从 k2cc 移植的「空响应 SSE error 事件」测试：上下文过大 → invalid_request_error
+    //! 且带 /compact 提示；偶发 → overloaded_error 可重试。
+    use super::*;
+
+    #[test]
+    fn empty_response_error_event_oversized_hints_compact() {
+        let ev = empty_response_error_event(true);
+        assert_eq!(ev.event, "error");
+        assert_eq!(ev.data["error"]["type"], "invalid_request_error");
+        let msg = ev.data["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("/compact"), "提示文案必须含 /compact: {msg}");
+    }
+
+    #[test]
+    fn empty_response_error_event_transient_is_retryable() {
+        let ev = empty_response_error_event(false);
+        assert_eq!(ev.event, "error");
+        assert_eq!(ev.data["error"]["type"], "overloaded_error");
+        assert!(ev.data["error"]["message"].as_str().unwrap().contains("重试"));
     }
 }
