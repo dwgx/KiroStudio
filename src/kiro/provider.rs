@@ -1805,10 +1805,17 @@ impl KiroProvider {
 
                 let status = response.status();
 
-                // 喂动态降档信号：**每个**上游响应都记一次（成功 false / 429 true），
+                // 喂动态降档信号：**每个**上游响应都记一次（成功/4xx false，429/5xx true），
                 // 供 base_retry_quota 处的 apply_retry_pressure 收缩重试预算。
                 // 与 AIMD 的 report_upstream_rate_limited 是两套独立机制、两套门控，勿混。
-                self.retry_pressure.lock().record(status.as_u16() == 429);
+                //
+                // ⚠️ 5xx 必须也算压力（true）：纯 500 风暴同样是「疯狂重试」的来源，
+                // 若只计 429，5xx 落进"成功"桶会把 rate() 稀释到趋近 0 → 降档永不触发。
+                // 4xx（客户端错误）不算压力：它是请求本身的问题，不是上游过载信号。
+                let code = status.as_u16();
+                self.retry_pressure
+                    .lock()
+                    .record(code == 429 || code >= 500);
 
                 // 成功响应
                 if status.is_success() {

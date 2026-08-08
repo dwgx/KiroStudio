@@ -424,7 +424,15 @@ pub struct AdminService {
 fn clean_ksk_api_key(raw: &str) -> Option<String> {
     let s = raw.trim().trim_matches(|c| c == '"' || c == '\'' || c == ',');
     let out = match s.find("ksk_") {
-        Some(i) => s[i..].trim().to_string(),
+        Some(i) => {
+            // ⚠️ `s[i..]` 之后要再剥一次包裹引号/逗号：`"key: 'ksk_abc123'"` 经外层
+            // trim_matches 后 s = `key: 'ksk_abc123'`，直接 `s[i..]` 会留下尾引号
+            // `ksk_abc123'` → key 污染 → region 探测恒 403。
+            s[i..]
+                .trim()
+                .trim_matches(|c| c == '"' || c == '\'' || c == ',')
+                .to_string()
+        }
         None => s.to_string(),
     };
     if out.is_empty() {
@@ -9224,6 +9232,11 @@ mod ksk_clean_tests {
         );
         // 单引号 + 逗号包裹
         assert_eq!(clean_ksk_api_key("'ksk_abc123',"), Some("ksk_abc123".into()));
+        // 🔴 回归：`"key: 'ksk_abc123'"`（前缀 + 内层单引号）→ 之前尾引号残留成 `ksk_abc123'`
+        assert_eq!(
+            clean_ksk_api_key("\"key: 'ksk_abc123'\""),
+            Some("ksk_abc123".into())
+        );
         // `ksk_` 前有任意前缀 → 从 ksk_ 起截取（与 k2cc 逐字一致：`s[i..].trim()`，
         // 只去前缀噪声，`ksk_` 之后的内容原样保留）
         assert_eq!(

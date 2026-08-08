@@ -172,28 +172,37 @@ impl SseFilterState {
     fn process_block(&mut self, block: &[u8]) -> Option<Vec<u8>> {
         let text = String::from_utf8_lossy(block);
         let mut event_type = "";
-        let mut data = "";
+        let mut data = String::new();
         for line in text.lines() {
             if let Some(rest) = line.strip_prefix("event:") {
                 event_type = rest.trim();
             } else if let Some(rest) = line.strip_prefix("data:") {
-                data = rest.trim();
+                // ⚠️ SSE 规范允许多个 `data:` 行拼成一个事件（用换行连接）。
+                // 之前只保留最后一行：多行 data 的 JSON 会解析失败 → fail-open 泄漏
+                // thinking；更坏的情况是末行恰好是合法 JSON 片段 → 用残缺 data 重写事件。
+                if !data.is_empty() {
+                    data.push('\n');
+                }
+                data.push_str(rest.trim());
             }
         }
         if event_type.is_empty() || data.is_empty() {
             return Some(block.to_vec());
         }
-        let Ok(mut v) = serde_json::from_str::<serde_json::Value>(data) else {
+        let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&data) else {
             return Some(block.to_vec());
         };
         let old_idx = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
         match event_type {
             "content_block_start" => {
-                let is_thinking = v
-                    .get("content_block")
-                    .and_then(|cb| cb.get("type"))
-                    .and_then(|t| t.as_str())
-                    == Some("thinking");
+                // ⚠️ `redacted_thinking`（thinking 超预算时上游发的合法类型）同样要滤：
+                // 只认 `thinking` 会把它当保留块重编号透传，客户端同样报 "Tool result missing"。
+                let is_thinking = matches!(
+                    v.get("content_block")
+                        .and_then(|cb| cb.get("type"))
+                        .and_then(|t| t.as_str()),
+                    Some("thinking") | Some("redacted_thinking")
+                );
                 self.in_thinking.insert(old_idx, is_thinking);
                 if is_thinking {
                     return None;
