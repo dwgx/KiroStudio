@@ -50,9 +50,9 @@ const SMALL_POOL_THRESHOLD: usize = 3;
 /// `total_upstream_attempts_are_capped_per_request_not_per_round`。
 const ABSOLUTE_MAX_TOTAL_RETRIES: usize = 12;
 
-/// 上游 429 率滑动窗口的时长（秒）。
+/// 上游压力率（429+5xx）滑动窗口的时长（秒）。
 ///
-/// 窗口内每响应喂一次成功/429 布尔，`rate()` 返回近期 429 占比，供
+/// 窗口内每响应喂一次压力布尔，`rate()` 返回近期压力占比，供
 /// [`apply_retry_pressure`] 动态降档。60s 对齐 throttle 的观察窗口径，既不反应过
 /// 快的瞬时抖动（去抖交给 AIMD 的 3s 窗口），也不至于滞后到跟不上风控节奏。
 const PRESSURE_WINDOW_SECS: u64 = 60;
@@ -499,10 +499,13 @@ fn compute_max_retries(total: usize, _available: usize) -> usize {
         .max(1)
 }
 
-/// 近期上游 429 率滑动窗口。
+/// 近期上游压力滑动窗口。
 ///
-/// 每次上游响应喂一个布尔（成功 false / 429 true），窗口保留近 [`PRESSURE_WINDOW_SECS`]
-/// 秒。`rate()` 返回窗口内 429 占比，供 [`apply_retry_pressure`] 动态降重试预算。
+/// 每次上游响应喂一个布尔（成功/4xx false，429/5xx true），窗口保留近
+/// [`PRESSURE_WINDOW_SECS`] 秒。`rate()` 返回窗口内**压力占比**（429+5xx 占全部），
+/// 供 [`apply_retry_pressure`] 动态降重试预算。
+///
+/// ⚠️ 5xx 也计入压力：纯 500 风暴同样是「疯狂重试」来源，只计 429 会让降档永不触发。
 ///
 /// 热路径取舍：短临界区（一次 push + 逐出），锁竞争可接受 —— 即使内部 1000 RPM，
 /// 每秒也才 17 次写，远低于锁的吞吐上限。
@@ -520,13 +523,13 @@ impl RetryPressureWindow {
     }
 
     /// 记录一次上游响应结果。顺带惰性逐出超窗事件（不额外起定时器）。
-    fn record(&mut self, is_429: bool) {
+    fn record(&mut self, is_pressure: bool) {
         let now = std::time::Instant::now();
-        self.deque.push_back((now, is_429));
+        self.deque.push_back((now, is_pressure));
         self.prune(now);
     }
 
-    /// 逐出超过窗口的事件（记录与读取共用，避免 rate() 读到空闲前的陈旧高 429）。
+    /// 逐出超过窗口的事件（记录与读取共用，避免 rate() 读到空闲前的陈旧高压）。
     fn prune(&mut self, now: std::time::Instant) {
         while let Some(&(t, _)) = self.deque.front() {
             if now.duration_since(t) > self.window {
@@ -537,24 +540,24 @@ impl RetryPressureWindow {
         }
     }
 
-    /// 窗口内 429 占比（0.0..=1.0）。空窗口返 0（无信号 = 不降档）。
+    /// 窗口内压力占比（0.0..=1.0）。空窗口返 0（无信号 = 不降档）。
     fn rate(&mut self) -> f32 {
         self.prune(std::time::Instant::now());
         let total = self.deque.len();
         if total == 0 {
             return 0.0;
         }
-        let n_429 = self.deque.iter().filter(|(_, is_429)| *is_429).count();
-        n_429 as f32 / total as f32
+        let n_pressure = self.deque.iter().filter(|(_, is_pressure)| *is_pressure).count();
+        n_pressure as f32 / total as f32
     }
 }
 
-/// 按近期 429 率动态降档重试预算。
+/// 按近期上游压力率（429+5xx）动态降档重试预算。
 ///
-/// 疯狂重试（号多 + 429 多）时每个请求扫 12 个号纯属放大受害面 —— 重试再多也换不到
-/// 好号（大家都在被限流），不如降档让客户端更快拿到错误自己退避。阶梯（整数除法）：
-/// - 429 率 > 50%：预算 × 33/100（12 → 3）
-/// - 429 率 > 30%：预算 × 1/2（12 → 6）
+/// 疯狂重试（号多 + 429/5xx 多）时每个请求扫 12 个号纯属放大受害面 —— 重试再多也换不到
+/// 好号（大家都在被限流/过载），不如降档让客户端更快拿到错误自己退避。阶梯（整数除法）：
+/// - 压力率 > 50%：预算 × 33/100（12 → 3）
+/// - 压力率 > 30%：预算 × 1/2（12 → 6）
 /// - 否则：不变
 ///
 /// 只在 `base_retry_quota`（循环外一次计算）处乘系数，`round_retry_quota` 的
@@ -1401,15 +1404,15 @@ impl KiroProvider {
             // 抬高 —— 生产日志的 `尝试 8/36` 即由此而来。见 kiro_selectable_count 的说明。
             {
                 let selectable = self.token_manager.kiro_selectable_count();
-                // 动态降档：近期 429 率高（疯狂重试）时按比例收缩预算，避免号多 + 429 多
-                // 时每个请求扫 12 个号、把内部上游 RPM 放大到外部 RPM 的十几倍。
+                // 动态降档：近期上游压力率（429+5xx）高（疯狂重试）时按比例收缩预算，
+                // 避免号多 + 压力多时每个请求扫 12 个号、把内部上游 RPM 放大到外部 RPM 的十几倍。
                 // 只在进循环前算一次，跨轮不叠加。
                 let raw = compute_max_retries(selectable, selectable);
                 let pressure = self.retry_pressure.lock().rate();
                 let scaled = apply_retry_pressure(raw, pressure);
                 if scaled != raw {
                     tracing::warn!(
-                        "上游 429 率 {:.1}% 过高，重试预算从 {} 动态降档到 {}（防内部放大）",
+                        "上游压力率 {:.1}% 过高，重试预算从 {} 动态降档到 {}（防内部放大）",
                         pressure * 100.0,
                         raw,
                         scaled
@@ -2965,6 +2968,29 @@ mod tests {
             w2.deque.push_back((std::time::Instant::now(), true));
         }
         assert_eq!(w2.rate(), 1.0);
+    }
+
+    /// 🔴 回归：5xx 与 429 同样计入压力（纯 500 风暴降档必须触发）；
+    /// 4xx（客户端错误）不算压力。
+    #[test]
+    fn test_retry_pressure_window_counts_5xx_and_not_4xx() {
+        let mut w = RetryPressureWindow::new(60);
+        // 2 个 500 + 1 个 200 → 压力率 2/3
+        w.deque.push_back((std::time::Instant::now(), false)); // 200
+        w.deque.push_back((std::time::Instant::now(), true)); // 500
+        w.deque.push_back((std::time::Instant::now(), true)); // 500
+        assert!(
+            (w.rate() - 2.0 / 3.0).abs() < 1e-6,
+            "5xx 必须计入压力（纯 500 风暴降档才不失效），实际 {}",
+            w.rate()
+        );
+
+        // 4xx 不算压力：2 个 400 + 1 个 200 → 压力率 0
+        let mut w2 = RetryPressureWindow::new(60);
+        w2.deque.push_back((std::time::Instant::now(), false)); // 200
+        w2.deque.push_back((std::time::Instant::now(), false)); // 400
+        w2.deque.push_back((std::time::Instant::now(), false)); // 400
+        assert_eq!(w2.rate(), 0.0, "4xx（客户端错误）不算压力");
     }
 
     /// record() 顺带逐出超窗事件：极小窗口 + sleep 后，旧事件被清出。
