@@ -3026,6 +3026,54 @@ mod tests {
         );
     }
 
+    /// **状态徽章不许回到座位行。**
+    ///
+    /// # 这条挡的是什么
+    /// 徽章原本画在座位行里，实测把点阵顶到了折行：15 个点 + 标签 + 「2/15 位」
+    /// + 徽章需要 332px，而 1920 宽下四列布局每张卡内宽只有 301px。后果不是
+    /// 「有点挤」，而是**只有已上车/已满的那几张卡**会高出一截（229 → 326px），
+    /// 邻居齐平、它们不齐，看上去像随机的排版错乱。
+    ///
+    /// 【为何这个错法会重犯】徽章讲的是座位状态（满了 / 我在车上），语义上跟
+    /// 座位行最亲近，下一个人重构时把它塞回 fillSeats 是很自然的动作——而代价
+    /// 只在宽屏、且只在部分卡片上显形，本地开一个窄窗口根本看不见。
+    ///
+    /// 锁的是「fillSeats 不产出 .pill」这件事本身。
+    #[test]
+    fn status_badge_stays_out_of_the_seat_row() {
+        let page = strip_js_comments(script_block());
+
+        let start = page
+            .find("function fillSeats(")
+            .expect("找不到 fillSeats()——座位行的渲染逻辑在这里");
+        let body = &page[start..];
+        let end = body
+            .find("\nfunction ")
+            .map(|e| e + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        // 对照组：截出来的确实是 fillSeats 的函数体。
+        assert!(
+            body.contains("'seats'") && body.len() < 4000,
+            "函数体切割失效：截到 {} 字节，下面的断言会变成空检查",
+            body.len()
+        );
+
+        assert!(
+            !body.contains("pill"),
+            "fillSeats 又开始画徽章了：座位行会被顶到折行，\
+             而且只有已上车/已满的卡片变高，看起来像随机的排版错乱。\
+             徽章属于车头（见 fillBadge）"
+        );
+
+        // 反向的一半：徽章必须真的还有人画，否则删掉 fillBadge 也能让上面那条变绿。
+        assert!(
+            page.contains("function fillBadge("),
+            "fillBadge 不见了：徽章无人绘制，色盲用户只剩绿边框可依"
+        );
+    }
+
     /// **车位卡网格的最小轨道宽必须能在窄容器里退让。**
     ///
     /// # 这条挡的是什么
