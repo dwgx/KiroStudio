@@ -136,41 +136,38 @@ where
     type Item = Result<Bytes, axum::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        loop {
-            match self.inner.poll_next_unpin(cx) {
-                Poll::Ready(Some(Ok(chunk))) => {
-                    const MARKER: &[u8] = b"content_block";
-                    if !self.saw_content
-                        && chunk
-                            .windows(MARKER.len())
-                            .any(|w| w == MARKER)
-                    {
-                        self.saw_content = true;
-                    }
-                    return Poll::Ready(Some(Ok(chunk)));
+        match self.inner.poll_next_unpin(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                const MARKER: &[u8] = b"content_block";
+                if !self.saw_content
+                    && chunk
+                        .windows(MARKER.len())
+                        .any(|w| w == MARKER)
+                {
+                    self.saw_content = true;
                 }
-                Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Some(Err(axum::Error::new(e))));
-                }
-                Poll::Ready(None) => {
-                    if !self.saw_content && !self.guard_emitted {
-                        self.guard_emitted = true;
-                        tracing::warn!(
-                            "[透传] 过滤后流无任何 content 事件，补发 error 事件防客户端空流卡死"
-                        );
-                        let ev = format!(
-                            "event: error\ndata: {}\n\n",
-                            serde_json::json!({
-                                "type": "error",
-                                "error": { "type": "api_error", "message": self.err_message }
-                            })
-                        );
-                        return Poll::Ready(Some(Ok(Bytes::from(ev))));
-                    }
-                    return Poll::Ready(None);
-                }
-                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Ok(chunk)))
             }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(axum::Error::new(e)))),
+            Poll::Ready(None) => {
+                if !self.saw_content && !self.guard_emitted {
+                    self.guard_emitted = true;
+                    tracing::warn!(
+                        "[透传] 过滤后流无任何 content 事件，补发 error 事件防客户端空流卡死"
+                    );
+                    let ev = format!(
+                        "event: error\ndata: {}\n\n",
+                        serde_json::json!({
+                            "type": "error",
+                            "error": { "type": "api_error", "message": self.err_message }
+                        })
+                    );
+                    Poll::Ready(Some(Ok(Bytes::from(ev))))
+                } else {
+                    Poll::Ready(None)
+                }
+            }
+            Poll::Pending => Poll::Pending,
         }
     }
 }
