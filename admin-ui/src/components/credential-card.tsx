@@ -738,9 +738,35 @@ export function CredentialCard({
               </div>
             )}
             {credential.maskedApiKey && (
-              <div className="col-span-2">
-                <span className="text-muted-foreground">{t('credentialcard.info.apiKey')}</span>
+              <div className="col-span-2 flex min-w-0 items-center gap-1">
+                <span className="shrink-0 text-muted-foreground">{t('credentialcard.info.apiKey')}</span>
                 <span className="font-mono font-medium">{credential.maskedApiKey}</span>
+                {/* 指纹(SHA-256 前 8 位):脱敏串可能撞车、过短 key 还会塌成 ***,
+                    指纹才是唯一可靠的辨别依据,也用于和导入卡片/推送方对账同一个号。 */}
+                {credential.apiKeyHash && (
+                  <>
+                    <span
+                      className="shrink-0 rounded bg-secondary px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground"
+                      title={t('credentialcard.info.fingerprintTitle')}
+                    >
+                      {credential.apiKeyHash.slice(0, 8)}
+                    </span>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-5 shrink-0 px-1"
+                      title={t('credentialcard.info.copyFingerprint')}
+                      onClick={async () => {
+                        const ok = await copyToClipboard(credential.apiKeyHash!.slice(0, 8))
+                        toast[ok ? 'success' : 'error'](
+                          t(ok ? 'credentialcard.toast.fingerprintCopied' : 'credentialcard.toast.copyFailed'),
+                        )
+                      }}
+                    >
+                      <ClipboardCopy className="h-3 w-3" />
+                    </Button>
+                  </>
+                )}
               </div>
             )}
             {/* 超额（Overage）开关已移入「设置」弹框（齿轮），保持卡片主体信息网格干净。 */}

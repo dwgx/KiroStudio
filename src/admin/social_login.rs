@@ -16,9 +16,7 @@ use parking_lot::Mutex;
 use tokio::sync::oneshot;
 
 use crate::http_client::ProxyConfig;
-use crate::kiro::auth::social::{
-    self, OAuthCallbackData, ServerHandle,
-};
+use crate::kiro::auth::social::{self, OAuthCallbackData, ServerHandle};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 
@@ -89,11 +87,7 @@ impl SocialLoginManager {
     ///
     /// - `priority`：新凭据优先级
     /// - `proxy_url`：可选，自定义出站代理（不填继承全局）
-    pub fn start(
-        &self,
-        priority: u32,
-        proxy_url: Option<String>,
-    ) -> anyhow::Result<StartResult> {
+    pub fn start(&self, priority: u32, proxy_url: Option<String>) -> anyhow::Result<StartResult> {
         self.cleanup_expired();
 
         let config = self.token_manager.config();
@@ -139,12 +133,7 @@ impl SocialLoginManager {
                 // 本地：起临时 TCP 端口，浏览器在本机回调
                 let (tx, rx) = oneshot::channel::<OAuthCallbackData>();
                 let (port, handle) = social::start_callback_server(tx, state.clone())?;
-                (
-                    format!("http://127.0.0.1:{}", port),
-                    Some(handle),
-                    None,
-                    rx,
-                )
+                (format!("http://127.0.0.1:{}", port), Some(handle), None, rx)
             }
         };
 
@@ -164,9 +153,7 @@ impl SocialLoginManager {
             remote_tx: Mutex::new(remote_tx),
         });
 
-        self.sessions
-            .lock()
-            .insert(session_id.clone(), session);
+        self.sessions.lock().insert(session_id.clone(), session);
 
         Ok(StartResult {
             session_id,
@@ -246,17 +233,15 @@ impl SocialLoginManager {
         // 表现为“上号输入的代理没有自动加入”）。只持久化 custom_proxy（用户填的），
         // 不持久化 global 回落（避免把全局代理钉死在凭据上）。已是拆好账密的 ProxyConfig。
         let (proxy_url, proxy_username, proxy_password) = match &session.custom_proxy {
-            Some(p) => (
-                Some(p.url.clone()),
-                p.username.clone(),
-                p.password.clone(),
-            ),
+            Some(p) => (Some(p.url.clone()), p.username.clone(), p.password.clone()),
             None => (None, None, None),
         };
 
         // 构建并加入凭据池
         let new_cred = KiroCredentials {
             id: None,
+            // 由 add_credential 统一盖时间戳（那里是唯一收口）。
+            added_at_ms: None,
             access_token: Some(token.access_token),
             refresh_token: Some(refresh_token),
             profile_arn: token.profile_arn,
@@ -274,6 +259,8 @@ impl SocialLoginManager {
             base_url: None,
             api_key: None,
             request_limit: None,
+            // Social 上号产出的是 Kiro 号（非 custom_api 代挂号），该开关对它无意义 → 跟随全局。
+            custom_api_first: None,
             region: None,
             auth_region: None,
             api_region: None,
@@ -298,11 +285,7 @@ impl SocialLoginManager {
         };
 
         // 主动拉订阅等级（失败不阻断）
-        if let Err(e) = self
-            .token_manager
-            .get_usage_limits_for(credential_id)
-            .await
-        {
+        if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
             tracing::warn!("网页上号后获取订阅等级失败（不影响上号）: {}", e);
         }
 

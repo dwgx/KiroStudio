@@ -83,6 +83,10 @@ pub struct RequestRecord {
     /// serde default，兼容早于本字段的历史 JSONL（缺字段视为 0）。
     #[serde(default)]
     pub cache_creation_tokens: i32,
+    /// 本次是否实际执行了严格缓存探针。false 表示观测关闭或报文无法稳定解析，
+    /// 不能把它当作 cache miss。serde default 兼容旧 JSONL。
+    #[serde(default)]
+    pub cache_observed: bool,
     /// 上游返回的真实 credit 消耗量（无 meteringEvent 时为 None）
     pub credits_used: Option<f64>,
     /// 端到端延迟（毫秒）
@@ -120,6 +124,7 @@ impl RequestRecord {
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            cache_observed: false,
             credits_used: None,
             latency_ms: 0,
             first_token_ms: None,
@@ -211,7 +216,9 @@ pub fn parse_client_os(ua: Option<&str>) -> Option<String> {
 
     // 1) 移动端优先：iPad 的 UA 含 "Mac OS X"，Android 的 UA 含 "Linux"，
     //    必须在桌面端判定之前短路，否则会被误分类。
-    if lower.contains("iphone") || lower.contains("ipad") || lower.contains("ipod")
+    if lower.contains("iphone")
+        || lower.contains("ipad")
+        || lower.contains("ipod")
         || lower.contains("ios")
     {
         return Some("iOS".to_string());
@@ -279,11 +286,7 @@ fn extract_version_after(haystack: &str, token: &str) -> Option<String> {
     let rest = &haystack[idx + token.len()..];
     // 主版本号：取到第一个非数字字符为止（"120.0.x" → "120"）
     let major: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if major.is_empty() {
-        None
-    } else {
-        Some(major)
-    }
+    if major.is_empty() { None } else { Some(major) }
 }
 
 #[cfg(test)]
@@ -369,7 +372,10 @@ mod tests {
             Some("claude-code".to_string())
         );
         // CLI 不带平台信息：OS/浏览器解析返回 None 属正常（不硬造）
-        assert_eq!(parse_client_os(Some("claude-cli/2.1.201 (external, cli)")), None);
+        assert_eq!(
+            parse_client_os(Some("claude-cli/2.1.201 (external, cli)")),
+            None
+        );
         assert_eq!(
             parse_client_browser(Some("claude-cli/2.1.201 (external, cli)")),
             None

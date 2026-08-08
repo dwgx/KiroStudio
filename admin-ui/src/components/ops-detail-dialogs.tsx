@@ -663,7 +663,9 @@ function TraceRow({
               <Detail label={t('opsdetaildialogs.trace.detailRetries')} value={String(it.retries)} />
               <Detail
                 label={t('opsdetaildialogs.trace.detailCacheTok')}
-                value={`${fmtNum(it.cache_read_tokens)} / ${fmtNum(it.cache_creation_tokens)}`}
+                value={it.cache_observed
+                  ? `${fmtNum(it.cache_read_tokens)} / ${fmtNum(it.cache_creation_tokens)}`
+                  : t('opsdetaildialogs.trace.cacheNotObserved')}
               />
               <Detail
                 label="credits"

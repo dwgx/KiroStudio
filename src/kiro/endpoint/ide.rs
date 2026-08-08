@@ -1,13 +1,16 @@
 //! Kiro IDE 端点
 //!
-//! 对应 Kiro IDE 客户端目前使用的端点（已随 Kiro 迁移到 kiro.dev；旧的
-//! `q.{region}.amazonaws.com` 已停用）：
-//! - API: `https://runtime.{region}.kiro.dev/generateAssistantResponse`
-//! - MCP: `https://runtime.{region}.kiro.dev/mcp`
+//! 对应 Kiro IDE 客户端目前使用的端点：
+//! - API: `https://q.{region}.amazonaws.com/generateAssistantResponse`
+//! - MCP: `https://q.{region}.amazonaws.com/mcp`
+//!
+//! 注：曾一度迁到 `runtime.{region}.kiro.dev`（commit 1c1cfd0），实测该 host 不可用，
+//! 已回退到 `q.{region}.amazonaws.com`。刷新/余额/Web Portal 仍走 `*.kiro.dev`（见
+//! `token_manager` / `web_portal`），只有对话与 MCP 走 amazonaws.com。
 //!
 //! region 优先从凭据 `profileArn` 的第 4 段提取（与 Kiro IDE 一致），回退到凭据/config region。
 //! 请求头使用 aws-sdk-js User-Agent 标识。请求体按凭据类型条件注入 `profileArn`
-//! （Enterprise/external_idp 不注入，见 `should_send_profile_arn`）。
+//! （Enterprise/external_idp 与 api_key 缺真实 ARN 时不注入，见 `effective_profile_arn`）。
 
 use reqwest::RequestBuilder;
 use uuid::Uuid;
@@ -29,7 +32,7 @@ const BETA_1M: &str = "context-1m-2025-08-07";
 
 /// 纯函数:据 is_1m 决定要不要注入 1M beta 头。抽出便于单测(decorate_api 返回 RequestBuilder
 /// 不便直接断言 header)。is_1m=true → Some(beta 值);否则 None(不注入)。
-fn beta_header_for_1m(is_1m: bool) -> Option<&'static str> {
+pub(super) fn beta_header_for_1m(is_1m: bool) -> Option<&'static str> {
     if is_1m { Some(BETA_1M) } else { None }
 }
 
@@ -48,7 +51,7 @@ impl IdeEndpoint {
     }
 
     fn host(&self, ctx: &RequestContext<'_>) -> String {
-        format!("runtime.{}.kiro.dev", self.api_region(ctx))
+        format!("q.{}.amazonaws.com", self.api_region(ctx))
     }
 
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
@@ -82,13 +85,13 @@ impl KiroEndpoint for IdeEndpoint {
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
         format!(
-            "https://runtime.{}.kiro.dev/generateAssistantResponse",
+            "https://q.{}.amazonaws.com/generateAssistantResponse",
             self.api_region(ctx)
         )
     }
 
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!("https://runtime.{}.kiro.dev/mcp", self.api_region(ctx))
+        format!("https://q.{}.amazonaws.com/mcp", self.api_region(ctx))
     }
 
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
@@ -138,14 +141,15 @@ impl KiroEndpoint for IdeEndpoint {
 
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
         // 用 effective_profile_arn:idc/social 缺 profileArn 时回退默认 BuilderId ARN,
-        // external_idp 用动态解析到的真实租户 ARN(kiro.dev 迁移后 external_idp 也必须带,
+        // external_idp 用动态解析到的真实租户 ARN(external_idp 也必须带,
         // 缺了 400 profileArn is required);仅在 arn 为 None 时不注入。
+        // api_key(ksk_)缺真实 ARN 时同样为 None——套占位 ARN 会 403(伪装成 token 失效)。
         inject_profile_arn(body, &ctx.credentials.effective_profile_arn())
     }
 }
 
 /// 将 profile_arn 注入到请求体 JSON 根对象
-fn inject_profile_arn(request_body: &str, profile_arn: &Option<String>) -> String {
+pub(super) fn inject_profile_arn(request_body: &str, profile_arn: &Option<String>) -> String {
     if let Some(arn) = profile_arn {
         if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(request_body) {
             json["profileArn"] = serde_json::Value::String(arn.clone());
@@ -159,7 +163,7 @@ fn inject_profile_arn(request_body: &str, profile_arn: &Option<String>) -> Strin
 
 #[cfg(test)]
 mod tests {
-    use super::{beta_header_for_1m, inject_profile_arn, BETA_1M};
+    use super::{BETA_1M, beta_header_for_1m, inject_profile_arn};
     use serde_json::Value;
 
     #[test]

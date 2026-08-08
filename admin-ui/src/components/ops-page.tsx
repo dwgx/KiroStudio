@@ -5,9 +5,14 @@ import { useQuery } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
-import { getRecoveryMetrics, getLogs, type RecoveryMetrics, type LogEntry } from '@/api/ops'
+import {
+  getRecoveryMetrics,
+  getLogs,
+  type RecoveryMetrics,
+  type LogEntry,
+} from '@/api/ops'
 import { PROBE_MODEL_CATALOG } from '@/api/credentials'
-import { useRatelimitInsights } from '@/hooks/use-usage'
+import { useRatelimitInsights, useUsageOverview } from '@/hooks/use-usage'
 import { useLiveStream } from '@/hooks/use-live-stream'
 import {
   useSetDisabled,
@@ -18,6 +23,7 @@ import {
   useSetRpmLimit,
   useSetAllowedModels,
   useDeleteCredential,
+  useConfigSnapshot,
 } from '@/hooks/use-credentials'
 import {
   useDeepVerify,
@@ -177,6 +183,7 @@ export function OpsPage() {
     <TooltipProvider delayDuration={200}>
       <div className="space-y-6">
         <LiveMetricsBar live={live} />
+        <CacheObservationCard />
         <PoolHealthCard live={live} />
         <RecoveryMetricsCard />
         <LogViewer focusToken={logFocus.token} focusTerm={logFocus.term} />
@@ -250,6 +257,136 @@ function LiveMetricsBar({ live }: { live: ReturnType<typeof useLiveStream> }) {
         accent="neutral"
       />
     </div>
+  )
+}
+
+type CacheWindow = 'last_24h' | 'last_7d' | 'last_30d' | 'all_time'
+
+const CACHE_WINDOWS: { key: CacheWindow; labelKey: string }[] = [
+  { key: 'last_24h', labelKey: 'opspage.cache.window24h' },
+  { key: 'last_7d', labelKey: 'opspage.cache.window7d' },
+  { key: 'last_30d', labelKey: 'opspage.cache.window30d' },
+  { key: 'all_time', labelKey: 'opspage.cache.windowAll' },
+]
+
+// 严格缓存观测：只读本地 usage 聚合 + 配置快照，不触发任何 Kiro 上游请求。
+// 命中率分母仅包含 cache_observed=true 的请求，观测关闭/报文不可解析不会被错算成 miss。
+function CacheObservationCard() {
+  const { t } = useTranslation()
+  const overview = useUsageOverview()
+  const config = useConfigSnapshot()
+  const [windowKey, setWindowKey] = useState<CacheWindow>('last_24h')
+  const window = overview.data?.[windowKey]
+  const enabled = config.data?.promptCacheEnabled
+  const observed = window?.cache_observed_requests ?? 0
+  const hits = window?.cache_hit_requests ?? 0
+  const ratePct = observed > 0 ? (window?.cache_hit_rate ?? 0) * 100 : null
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-start justify-between gap-3 pb-2">
+        <div className="space-y-1">
+          <CardTitle className="flex flex-wrap items-center gap-2 text-base">
+            <Database className="h-4 w-4" />
+            {t('opspage.cache.title')}
+            {config.data && (
+              <Badge variant={enabled ? 'success' : 'secondary'} className="text-[10px]">
+                {t(enabled ? 'opspage.cache.enabled' : 'opspage.cache.disabled')}
+              </Badge>
+            )}
+            {config.data && (
+              <span className="text-xs font-normal text-muted-foreground">
+                {t('opspage.cache.ttl', { seconds: config.data.promptCacheTtlSeconds })}
+              </span>
+            )}
+          </CardTitle>
+          <p className="text-xs text-muted-foreground">{t('opspage.cache.subtitle')}</p>
+        </div>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => void Promise.all([overview.refetch(), config.refetch()])}
+          className="h-7 px-2"
+          aria-label={t('opspage.cache.refresh')}
+        >
+          <RefreshCw className={cn('h-3.5 w-3.5', (overview.isFetching || config.isFetching) && 'animate-spin')} />
+        </Button>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="inline-flex rounded-md border border-border bg-secondary/30 p-0.5">
+          {CACHE_WINDOWS.map((item) => (
+            <button
+              key={item.key}
+              type="button"
+              onClick={() => setWindowKey(item.key)}
+              className={cn(
+                'h-7 rounded px-3 text-xs transition-colors',
+                windowKey === item.key
+                  ? 'bg-card text-foreground shadow-sm'
+                  : 'text-muted-foreground hover:text-foreground',
+              )}
+            >
+              {t(item.labelKey)}
+            </button>
+          ))}
+        </div>
+
+        {overview.isLoading || config.isLoading ? (
+          <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+            {Array.from({ length: 4 }).map((_, i) => <Skeleton key={i} className="h-[108px]" />)}
+          </div>
+        ) : overview.error ? (
+          <EmptyState
+            icon={ServerCrash}
+            tone="destructive"
+            title={t('opspage.cache.readFailTitle')}
+            description={t('opspage.cache.readFailDesc')}
+            action={<Button variant="outline" size="sm" onClick={() => overview.refetch()}>{t('opspage.common.retry')}</Button>}
+          />
+        ) : (
+          <>
+            {config.error ? (
+              <Callout variant="warning">{t('opspage.cache.configUnknown')}</Callout>
+            ) : !enabled ? (
+              <Callout variant="warning">{t('opspage.cache.disabledHint')}</Callout>
+            ) : observed === 0 ? (
+              <Callout variant="info">{t('opspage.cache.noObserved')}</Callout>
+            ) : (
+              <Callout variant="info">{t('opspage.cache.disclaimer')}</Callout>
+            )}
+            <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+              <StatCard
+                label={t('opspage.cache.observed')}
+                value={<AnimatedNumber value={observed} />}
+                icon={Eye}
+                hint={t('opspage.cache.observedHint')}
+              />
+              <StatCard
+                label={t('opspage.cache.hits')}
+                value={<AnimatedNumber value={hits} />}
+                icon={CheckCircle2}
+                accent={hits > 0 ? 'success' : 'neutral'}
+                hint={t('opspage.cache.hitsHint', { misses: Math.max(0, observed - hits) })}
+              />
+              <StatCard
+                label={t('opspage.cache.hitRate')}
+                value={ratePct == null ? '—' : `${ratePct.toFixed(1)}%`}
+                icon={Gauge}
+                accent={ratePct == null ? 'neutral' : ratePct >= 50 ? 'success' : 'warning'}
+                hint={t('opspage.cache.hitRateHint')}
+              />
+              <StatCard
+                label={t('opspage.cache.readTokens')}
+                value={<AnimatedNumber value={window?.cache_read_tokens ?? 0} format={(n) => Math.round(n).toLocaleString()} />}
+                icon={Database}
+                accent={(window?.cache_read_tokens ?? 0) > 0 ? 'primary' : 'neutral'}
+                hint={t('opspage.cache.readTokensHint')}
+              />
+            </div>
+          </>
+        )}
+      </CardContent>
+    </Card>
   )
 }
 

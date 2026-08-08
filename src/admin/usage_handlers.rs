@@ -7,13 +7,13 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use axum::{
+    Json,
     extract::{Query, State},
     http::StatusCode,
     response::{
-        sse::{Event, KeepAlive, Sse},
         IntoResponse,
+        sse::{Event, KeepAlive, Sse},
     },
-    Json,
 };
 use futures::Stream;
 use serde::{Deserialize, Serialize};
@@ -467,7 +467,7 @@ pub async fn logs_export(Query(q): Query<LogsQuery>) -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_recent_limit, MAX_RECENT_LIMIT};
+    use super::{MAX_RECENT_LIMIT, resolve_recent_limit};
 
     #[test]
     fn test_resolve_recent_limit_default_when_absent() {
@@ -491,7 +491,10 @@ mod tests {
     #[test]
     fn test_resolve_recent_limit_clamped_to_hard_cap() {
         // 超过硬上限（含旧的 5000 之上）一律裁剪到 MAX_RECENT_LIMIT，防拖垮服务
-        assert_eq!(resolve_recent_limit(Some(MAX_RECENT_LIMIT + 1)), MAX_RECENT_LIMIT);
+        assert_eq!(
+            resolve_recent_limit(Some(MAX_RECENT_LIMIT + 1)),
+            MAX_RECENT_LIMIT
+        );
         assert_eq!(resolve_recent_limit(Some(usize::MAX)), MAX_RECENT_LIMIT);
     }
 }

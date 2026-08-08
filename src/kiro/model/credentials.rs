@@ -137,6 +137,19 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_limit: Option<u64>,
 
+    /// **凭据级**「是否抢在 Kiro 号之前无条件先用」（仅对 custom_api 代挂号有意义）。
+    ///
+    /// `None`（默认）= 跟随全局 `config.customApiFirst`（其默认值是 `false`）。
+    /// `Some(true)`  = 该代挂号**无条件优先**于所有 Kiro 号（历史行为：只要它可用就先透传）。
+    /// `Some(false)` = 该代挂号与 Kiro 号在**同一个 priority 维度**上公平比较。
+    ///
+    /// 背景：历史实现把「custom_api 优先」写死在分派顺序里（handlers 一进来就先试透传），
+    /// 于是用户在面板上设的 `priority` 在**跨池维度上完全无效** —— 哪怕 Kiro 号
+    /// priority=0、代挂号 priority=99，也永远先走代挂号。该字段让每个代挂号能各自选择语义。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_api_first: Option<bool>,
+
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -201,6 +214,19 @@ pub struct KiroCredentials {
     /// 端点名必须在启动时注册的端点 registry 中存在。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+
+    /// 这个号是什么时候被加进池子的（Unix 毫秒）。
+    ///
+    /// 【为何是 Option 而不是必填】升级前就在 `credentials.json` 里的号没有这个字段，
+    /// 反序列化后是 `None`。那是**真实情况的如实反映**——我们确实不知道它们是何时加的，
+    /// 与其回填一个「首次被本版本读到的时间」假装知道（那个值会让所有老号显示成同一
+    /// 天、且随升级时间漂移），不如让界面显示「—」。新加的号从此都有真值。
+    ///
+    /// 用毫秒时间戳而非 RFC3339 字符串：这一列要排序和格式化，字符串每次都得先解析；
+    /// 而且时区应由浏览器决定，服务端渲染成字符串会让不同时区的人看到对不上的时间。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub added_at_ms: Option<i64>,
 }
 
 /// 脱敏展示敏感字段：有值 → `"<set:N>"`（标注长度便于排障但不泄露内容），无值 → `None`。
@@ -505,9 +531,7 @@ impl KiroCredentials {
         // OIDC 端点 → clientId 跨 region 失配 → AWS 拒 → 网关 502(0.7.12 收口引入的回归)。故 IdC 号
         // **只同步 region(对话/余额),绝不碰 auth_region**。external_idp 的 auth_region 不参与刷新
         // (用微软 token_endpoint)、social 的走 kiro.dev,故仅 IdC 需此豁免。
-        if !self.is_idc_credential()
-            && self.auth_region.as_deref() != Some(arn_region.as_str())
-        {
+        if !self.is_idc_credential() && self.auth_region.as_deref() != Some(arn_region.as_str()) {
             self.auth_region = Some(arn_region.clone());
             changed = true;
         }
@@ -618,8 +642,9 @@ impl KiroCredentials {
     /// 规则(对齐 Kiro IDE + kiro-account-manager,修复新加 idc 号缺 profileArn 报
     /// `400 profileArn is required`):
     /// - external_idp(M365 企业)→ `None`：这类号带 profileArn 反而 403，绝不发。
+    /// - api_key(ksk_ 凭据)→ `None`：同理，见下方实测记录。
     /// - 自带真实 profile_arn → 用它。
-    /// - idc/social/api_key 缺 profile_arn → 回退默认 BuilderId profileArn（Kiro IDE 公共
+    /// - idc/social 缺 profile_arn → 回退默认 BuilderId profileArn（Kiro IDE 公共
     ///   占位 ARN，上游接受）。**根治**:idc 号入池时常没 profileArn(登录未拉),
     ///   而对话/余额端点要求必带,缺了就 400/403。
     ///
@@ -643,7 +668,19 @@ impl KiroCredentials {
         if self.is_external_idp_credential() {
             return None;
         }
-        // idc/social/api_key 缺 arn → 回退默认 BuilderId 占位 ARN（上游接受）。
+        // api_key(ksk_)号同 external_idp:占位 ARN 属于别的账户(638616132270),ksk_ 凭据
+        // 套上去上游判定 token 与 profile 不匹配,回 `403 The bearer token included in the
+        // request is invalid`——报文形似 token 失效,实为 ARN 越权,极易误诊为「key 不可用」。
+        // 实测(2026-07-29,同一把 ksk_ 密钥,仅 profileArn 一个变量):
+        //   不带 profileArn → 400 INVALID_MODEL_ID(已过认证,仅模型名不合)
+        //   带占位 profileArn → 403 bearer token invalid
+        // 对照:伪造 key 不带 ARN → 403,故 400 证明认证通过。kiro-go 用 `omitempty`
+        // 天然不发(ksk_ 号无 ARN),这正是同一把 key 在 9090 可用、8990 不可用的原因。
+        // 真实 ARN 若已解析到(上面第一分支)仍照发,此处只拦占位值。
+        if self.is_api_key_credential() {
+            return None;
+        }
+        // idc/social 缺 arn → 回退默认 BuilderId 占位 ARN（上游接受）。
         Some(crate::kiro::token_manager::DEFAULT_BUILDER_ID_PROFILE_ARN.to_string())
     }
 
@@ -756,7 +793,10 @@ mod tests {
         .unwrap();
         assert!(c.allows_model("deepseek-3.2"), "白名单内应允许");
         assert!(c.allows_model("glm-5"));
-        assert!(!c.allows_model("claude-opus-4.8"), "白名单外的贵模型绝不允许(防溢出)");
+        assert!(
+            !c.allows_model("claude-opus-4.8"),
+            "白名单外的贵模型绝不允许(防溢出)"
+        );
         // 大小写不敏感
         assert!(c.allows_model("DeepSeek-3.2"));
     }
@@ -808,12 +848,21 @@ mod tests {
         let mut c = KiroCredentials::default();
         c.region = Some("us-east-1".to_string());
         c.auth_region = Some("us-east-1".to_string());
-        c.profile_arn =
-            Some("arn:aws:codewhisperer:eu-central-1:155119901513:profile/ACPYXKUPYE3H".to_string());
+        c.profile_arn = Some(
+            "arn:aws:codewhisperer:eu-central-1:155119901513:profile/ACPYXKUPYE3H".to_string(),
+        );
         let changed = c.sync_region_from_arn();
         assert!(changed, "region 不符时应发生修正");
-        assert_eq!(c.region.as_deref(), Some("eu-central-1"), "region 应被 ARN region 覆盖");
-        assert_eq!(c.auth_region.as_deref(), Some("eu-central-1"), "auth_region 同步");
+        assert_eq!(
+            c.region.as_deref(),
+            Some("eu-central-1"),
+            "region 应被 ARN region 覆盖"
+        );
+        assert_eq!(
+            c.auth_region.as_deref(),
+            Some("eu-central-1"),
+            "auth_region 同步"
+        );
     }
 
     #[test]
@@ -824,11 +873,14 @@ mod tests {
         c.auth_method = Some("idc".to_string());
         c.region = Some("us-east-1".to_string());
         c.auth_region = Some("us-east-1".to_string()); // = R_sso(SSO-OIDC 注册 region)
-        c.profile_arn =
-            Some("arn:aws:codewhisperer:eu-central-1:1:profile/X".to_string()); // R_arn 不同
+        c.profile_arn = Some("arn:aws:codewhisperer:eu-central-1:1:profile/X".to_string()); // R_arn 不同
         let changed = c.sync_region_from_arn();
         assert!(changed, "region 不符仍应同步(返回 true)");
-        assert_eq!(c.region.as_deref(), Some("eu-central-1"), "IdC 对话 region 应同步为 ARN region");
+        assert_eq!(
+            c.region.as_deref(),
+            Some("eu-central-1"),
+            "IdC 对话 region 应同步为 ARN region"
+        );
         assert_eq!(
             c.auth_region.as_deref(),
             Some("us-east-1"),
@@ -840,7 +892,11 @@ mod tests {
         c2.auth_region = Some("us-west-2".to_string());
         c2.profile_arn = Some("arn:aws:codewhisperer:eu-central-1:1:profile/X".to_string());
         c2.sync_region_from_arn();
-        assert_eq!(c2.auth_region.as_deref(), Some("us-west-2"), "builder-id 也豁免 auth_region");
+        assert_eq!(
+            c2.auth_region.as_deref(),
+            Some("us-west-2"),
+            "builder-id 也豁免 auth_region"
+        );
     }
 
     #[test]
@@ -856,13 +912,21 @@ mod tests {
         c2.region = Some("ap-southeast-1".to_string());
         c2.profile_arn = None;
         assert!(!c2.sync_region_from_arn());
-        assert_eq!(c2.region.as_deref(), Some("ap-southeast-1"), "无 ARN 不碰 region");
+        assert_eq!(
+            c2.region.as_deref(),
+            Some("ap-southeast-1"),
+            "无 ARN 不碰 region"
+        );
         // ARN region 非白名单 → 不动（不会把 region 改成垃圾值）
         let mut c3 = KiroCredentials::default();
         c3.region = Some("us-east-1".to_string());
         c3.profile_arn = Some("arn:aws:codewhisperer:not-a-region:1:profile/X".to_string());
         assert!(!c3.sync_region_from_arn());
-        assert_eq!(c3.region.as_deref(), Some("us-east-1"), "非法 ARN region 不覆盖");
+        assert_eq!(
+            c3.region.as_deref(),
+            Some("us-east-1"),
+            "非法 ARN region 不覆盖"
+        );
     }
 
     #[test]
@@ -917,6 +981,45 @@ mod tests {
         );
     }
 
+    /// 回归(2026-07-29):api_key(ksk_)凭据缺真实 profileArn 时必须返回 None。
+    ///
+    /// 套上默认 BuilderId 占位 ARN(属账户 638616132270)会让上游回
+    /// `403 The bearer token included in the request is invalid` —— 报文形似
+    /// key 失效,实为 ARN 与 token 不匹配,曾被误诊为「这把 key 不可用」。
+    /// 实测同一把 ksk_ 密钥:不带 ARN → 400 INVALID_MODEL_ID(认证已通过);
+    /// 带占位 ARN → 403。kiro-go 靠 `omitempty` 天然不发,故同 key 在其上可用。
+    #[test]
+    fn test_effective_profile_arn_api_key_no_placeholder() {
+        // ① auth_method = api_key,缺 arn → None
+        let mut ak = KiroCredentials::default();
+        ak.auth_method = Some("api_key".to_string());
+        assert_eq!(
+            ak.effective_profile_arn(),
+            None,
+            "api_key 缺真实 arn 必须返回 None(套占位 ARN 会 403)"
+        );
+        assert!(!ak.should_send_profile_arn());
+
+        // ② 仅凭 kiro_api_key 字段识别(auth_method 未标注)→ 同样不发
+        let mut ak2 = KiroCredentials::default();
+        ak2.kiro_api_key = Some("ksk_example".to_string());
+        assert_eq!(
+            ak2.effective_profile_arn(),
+            None,
+            "有 kiro_api_key 即视为 API Key 凭据,不套占位 ARN"
+        );
+
+        // ③ 已解析到真实 arn → 照发(此修复只拦占位值,不影响真实 ARN)
+        let mut ak3 = KiroCredentials::default();
+        ak3.auth_method = Some("api_key".to_string());
+        ak3.profile_arn = Some("arn:aws:codewhisperer:us-east-1:333:profile/REAL".to_string());
+        assert_eq!(
+            ak3.effective_profile_arn().as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:333:profile/REAL"),
+            "api_key 有真实 arn 应照发"
+        );
+    }
+
     #[test]
     fn test_effective_upstream_region_fallback() {
         let config = Config::default();
@@ -926,8 +1029,7 @@ mod tests {
         c.region = Some("eu-central-1".to_string());
         assert_eq!(c.effective_upstream_region(&config), "eu-central-1");
         // profileArn 合法 → 优先用 ARN region（压过凭据 region）
-        c.profile_arn =
-            Some("arn:aws:codewhisperer:ap-northeast-1:1:profile/X".to_string());
+        c.profile_arn = Some("arn:aws:codewhisperer:ap-northeast-1:1:profile/X".to_string());
         assert_eq!(c.effective_upstream_region(&config), "ap-northeast-1");
     }
 
@@ -1024,6 +1126,7 @@ mod tests {
     fn test_to_json() {
         let creds = KiroCredentials {
             id: None,
+            added_at_ms: None,
             access_token: Some("token".to_string()),
             refresh_token: None,
             profile_arn: None,
@@ -1041,6 +1144,7 @@ mod tests {
             base_url: None,
             api_key: None,
             request_limit: None,
+            custom_api_first: None,
             region: None,
             auth_region: None,
             api_region: None,
@@ -1152,6 +1256,7 @@ mod tests {
     fn test_region_field_serialization() {
         let creds = KiroCredentials {
             id: None,
+            added_at_ms: None,
             access_token: None,
             refresh_token: Some("test".to_string()),
             profile_arn: None,
@@ -1169,6 +1274,7 @@ mod tests {
             base_url: None,
             api_key: None,
             request_limit: None,
+            custom_api_first: None,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
             api_region: None,
@@ -1193,6 +1299,7 @@ mod tests {
     fn test_region_field_none_not_serialized() {
         let creds = KiroCredentials {
             id: None,
+            added_at_ms: None,
             access_token: None,
             refresh_token: Some("test".to_string()),
             profile_arn: None,
@@ -1210,6 +1317,7 @@ mod tests {
             base_url: None,
             api_key: None,
             request_limit: None,
+            custom_api_first: None,
             region: None,
             auth_region: None,
             api_region: None,
@@ -1317,6 +1425,7 @@ mod tests {
         // 测试序列化和反序列化的往返一致性
         let original = KiroCredentials {
             id: Some(42),
+            added_at_ms: None,
             access_token: Some("token".to_string()),
             refresh_token: Some("refresh".to_string()),
             profile_arn: None,
@@ -1334,6 +1443,7 @@ mod tests {
             base_url: None,
             api_key: None,
             request_limit: None,
+            custom_api_first: None,
             region: Some("us-west-2".to_string()),
             auth_region: None,
             api_region: None,
@@ -1559,11 +1669,20 @@ mod tests {
         // 注：租户 GUID 用占位假值（脱敏，不含真实账户标识）。
         let mut a = KiroCredentials::default();
         a.auth_method = Some("external_idp".to_string());
-        a.issuer_url = Some("https://login.microsoftonline.com/00000000-0000-0000-0000-000000000001/v2.0".to_string());
+        a.issuer_url = Some(
+            "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000001/v2.0"
+                .to_string(),
+        );
         let mut b = KiroCredentials::default();
         b.auth_method = Some("external_idp".to_string());
-        b.issuer_url = Some("https://login.microsoftonline.com/00000000-0000-0000-0000-000000000001/v2.0".to_string());
-        assert_eq!(a.family_key(53), "m365:00000000-0000-0000-0000-000000000001");
+        b.issuer_url = Some(
+            "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000001/v2.0"
+                .to_string(),
+        );
+        assert_eq!(
+            a.family_key(53),
+            "m365:00000000-0000-0000-0000-000000000001"
+        );
         assert_eq!(a.family_key(53), b.family_key(54), "同租户号必须同族键");
     }
 
@@ -1572,7 +1691,8 @@ mod tests {
         // issuer 缺失但有 profileArn → aws:{account}（AWS 账户号用占位假值，脱敏）
         let mut c = KiroCredentials::default();
         c.auth_method = Some("external_idp".to_string());
-        c.profile_arn = Some("arn:aws:codewhisperer:us-east-1:000000000000:profile/EXAMPLE".to_string());
+        c.profile_arn =
+            Some("arn:aws:codewhisperer:us-east-1:000000000000:profile/EXAMPLE".to_string());
         assert_eq!(c.family_key(53), "aws:000000000000");
     }
 

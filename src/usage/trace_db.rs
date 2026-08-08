@@ -15,7 +15,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
-use rusqlite::{params, params_from_iter, Connection, Row, ToSql};
+use rusqlite::{Connection, Row, ToSql, params, params_from_iter};
 
 use super::pipeline::UsageSink;
 use super::record::{RequestOutcome, RequestRecord};
@@ -173,6 +173,7 @@ impl TraceDb {
             // 缓存读写 tokens（历史库补列，默认 0，兼容旧数据）
             "ALTER TABLE traces ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE traces ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE traces ADD COLUMN cache_observed INTEGER NOT NULL DEFAULT 0",
         ];
         for sql in add_columns {
             if let Err(e) = conn.execute(sql, []) {
@@ -220,7 +221,8 @@ impl TraceDb {
                 client_os      TEXT,
                 client_browser TEXT,
                 cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
-                cache_creation_tokens INTEGER NOT NULL DEFAULT 0
+                cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_observed        INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_traces_ts_ms ON traces(ts_ms);
             CREATE INDEX IF NOT EXISTS idx_traces_credential_id ON traces(credential_id);
@@ -241,8 +243,8 @@ impl TraceDb {
                 request_id, ts_ms, credential_id, model, is_streaming,
                 input_tokens, output_tokens, credits_used, latency_ms, first_token_ms,
                 outcome, retries, error_message, session_id, client_device,
-                client_ip, client_os, client_browser, cache_read_tokens, cache_creation_tokens
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                client_ip, client_os, client_browser, cache_read_tokens, cache_creation_tokens, cache_observed
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             params![
                 record.request_id,
                 record.ts_ms,
@@ -264,6 +266,7 @@ impl TraceDb {
                 record.client_browser,
                 record.cache_read_tokens,
                 record.cache_creation_tokens,
+                record.cache_observed,
             ],
         )
         .context("INSERT traces 失败")?;
@@ -277,7 +280,7 @@ impl TraceDb {
             "SELECT request_id, ts_ms, credential_id, model, is_streaming,
                     input_tokens, output_tokens, credits_used, latency_ms, first_token_ms,
                     outcome, retries, error_message, session_id, client_device,
-                    client_ip, client_os, client_browser, cache_read_tokens, cache_creation_tokens
+                    client_ip, client_os, client_browser, cache_read_tokens, cache_creation_tokens, cache_observed
              FROM traces
              ORDER BY ts_ms DESC
              LIMIT ?1",
@@ -308,7 +311,7 @@ impl TraceDb {
             "SELECT request_id, ts_ms, credential_id, model, is_streaming,
                     input_tokens, output_tokens, credits_used, latency_ms, first_token_ms,
                     outcome, retries, error_message, session_id, client_device,
-                    client_ip, client_os, client_browser, cache_read_tokens, cache_creation_tokens
+                    client_ip, client_os, client_browser, cache_read_tokens, cache_creation_tokens, cache_observed
              FROM traces{where_sql}
              ORDER BY ts_ms DESC
              LIMIT ? OFFSET ?"
@@ -320,7 +323,10 @@ impl TraceDb {
 
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(binds.iter().map(|b| b.as_ref())), row_to_record)?;
+        let rows = stmt.query_map(
+            params_from_iter(binds.iter().map(|b| b.as_ref())),
+            row_to_record,
+        )?;
 
         let mut out = Vec::new();
         for r in rows {
@@ -336,10 +342,9 @@ impl TraceDb {
 
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(&sql)?;
-        let n: i64 = stmt.query_row(
-            params_from_iter(binds.iter().map(|b| b.as_ref())),
-            |row| row.get(0),
-        )?;
+        let n: i64 = stmt.query_row(params_from_iter(binds.iter().map(|b| b.as_ref())), |row| {
+            row.get(0)
+        })?;
         Ok(n.max(0))
     }
 
@@ -410,6 +415,7 @@ fn row_to_record(row: &Row<'_>) -> rusqlite::Result<RequestRecord> {
         client_browser: row.get(17)?,
         cache_read_tokens: row.get(18)?,
         cache_creation_tokens: row.get(19)?,
+        cache_observed: row.get(20)?,
     })
 }
 
@@ -489,6 +495,8 @@ mod tests {
         rec.client_ip = Some("203.0.113.7".to_string());
         rec.client_os = Some("Windows".to_string());
         rec.client_browser = Some("Chrome 120".to_string());
+        rec.cache_observed = true;
+        rec.cache_read_tokens = 32;
         rec
     }
 
@@ -521,6 +529,8 @@ mod tests {
         assert_eq!(back.client_ip, Some("203.0.113.7".to_string()));
         assert_eq!(back.client_os, Some("Windows".to_string()));
         assert_eq!(back.client_browser, Some("Chrome 120".to_string()));
+        assert!(back.cache_observed);
+        assert_eq!(back.cache_read_tokens, 32);
     }
 
     #[test]
@@ -940,7 +950,10 @@ mod tests {
         // 3) 迁移后可正常写入带 device 的新记录并读回
         db.on_record(&sample_record("new-with-device", 100));
         let got = db.recent(10).unwrap();
-        let rec = got.iter().find(|r| r.request_id == "new-with-device").unwrap();
+        let rec = got
+            .iter()
+            .find(|r| r.request_id == "new-with-device")
+            .unwrap();
         assert_eq!(rec.client_device, Some("claude-code".to_string()));
 
         // 4) 再次 open 同一库，迁移应幂等（不因列已存在而报错）

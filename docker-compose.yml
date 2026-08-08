@@ -32,6 +32,10 @@ services:
     volumes:
       # 配置与凭据持久化目录（config.json / credentials.json / 用量数据）
       - ./config:/app/config
+    # environment:
+    #   - HTTP_PROXY=http://host.docker.internal:7897
+    #   - HTTPS_PROXY=http://host.docker.internal:7897
+    #   - NO_PROXY=localhost,127.0.0.1
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8990/admin"]

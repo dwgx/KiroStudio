@@ -93,6 +93,85 @@ pub struct Config {
     #[serde(default)]
     pub admin_api_key: Option<String>,
 
+    /// 凭据批量导入接口专用密钥。与管理密钥隔离，避免推送方获得管理权限。
+    #[serde(default)]
+    pub import_api_key: Option<String>,
+
+    /// Relay 单条推送频道专用密钥。与批量 importApiKey 隔离，默认关闭。
+    #[serde(default)]
+    pub relay_api_key: Option<String>,
+
+    /// 拼车管理页的独立二次认证密码哈希（Argon2id PHC）。
+    ///
+    /// 只允许由 `/api/admin/portal/auth/setup` 首次写入，或在已认证会话中改密；
+    /// 通用配置 API 不接受此字段，配置快照也绝不回显。
+    #[serde(default)]
+    pub portal_admin_password_hash: Option<String>,
+
+    /// Portal（多用户凭据查看页）总开关。**默认 false**。
+    ///
+    /// 这个入口的能力是「登录后读出可用的明文 key」，等价于把凭据池的读权限开给一批账号。
+    /// 默认关闭，必须显式打开——不希望有人升级版本后凭空多出一个能拿凭据的公网入口。
+    #[serde(default)]
+    pub portal_enabled: bool,
+
+    /// Portal 注册码。**为空则注册接口一律拒绝**（登录不受影响）。
+    ///
+    /// 【为何必须有】自注册 + 公网可达 + 明文凭据外显三者叠加，等于任何扫到这个 URL 的人
+    /// 都能自助开号、拿走整池凭据。「内部使用」在技术上唯一的落点就是「持有这个码的人才是内部」。
+    /// 一个共享码而非邀请链接/审批流：内部小规模场景下够用，且不引入待办状态。
+    ///
+    /// 换码即刻生效（热更），不影响已注册用户。
+    #[serde(default)]
+    pub portal_invite_code: Option<String>,
+
+    /// Portal 会话 cookie 是否带 `Secure`（仅经 HTTPS 回传）。**默认 true**。
+    ///
+    /// 网关自身是 HTTP，公网暴露必须前置 HTTPS。默认 true 是为了不让会话 cookie 在
+    /// 明文链路上裸奔；纯内网 HTTP 直连调试时才需要关掉，关掉意味着 cookie 可被链路窃听。
+    #[serde(default = "default_portal_require_https")]
+    pub portal_require_https: bool,
+
+    // ============ Portal 车队积分（上车计费）============
+    /// 上车是否计费。**默认 false**——不开就是现在的白给行为，升级不改变任何现状。
+    ///
+    /// ⚠️ 打开的瞬间，已有用户余额都是 0，所有 key 立刻变成看不了。
+    /// 先给用户充值再开，否则等于把所有人挡在门外。
+    #[serde(default)]
+    pub portal_credits_enabled: bool,
+
+    /// 前 `portalKeyBaseCount` 个上车的人，每人固定收 `portalKeyBasePrice` 分。
+    ///
+    /// 与 `portal_key_base_price` 成对使用，「几个人」和「多少分」是**两个独立参数**：
+    /// 配 2/10 就是「2 人 10 分」，配 4/5 就是「前 4 人各 5 分」，不必反推基数。
+    #[serde(default = "default_portal_key_base_count")]
+    pub portal_key_base_count: u32,
+
+    /// 基础档位的单价（分）。同时是**全局价格上限**——任何人数下都不会比它更贵。
+    #[serde(default = "default_portal_key_base_price")]
+    pub portal_key_base_price: i64,
+
+    /// 定价基数。超过基础档位后按 `ceil(total / N)` 均摊。
+    ///
+    /// 【注意】它不等于「系统对这把 key 只收这么多」。向上取整会让实收略超基数
+    /// （N=9 时 9×3=27 > 20，最坏 +7），这是 ceil 的算术必然，不是 bug。
+    #[serde(default = "default_portal_key_total_price")]
+    pub portal_key_total_price: i64,
+
+    /// 每把 key 最多几人上车，满员后拒绝（返回 409）。
+    ///
+    /// 这个上限同时把上面那个取整偏差限制在有界范围内——没有上限时，
+    /// 一旦触到 `portal_key_min_price` 下限，实收就会随人数无限线性增长。
+    #[serde(default = "default_portal_key_max_unlockers")]
+    pub portal_key_max_unlockers: u32,
+
+    /// 单价下限（分）。**默认参数下永不触发**：满员 10 人时 `ceil(20/10)=2` 恒大于 1。
+    ///
+    /// 保留它是为了「把上限调到 20+ 或把基数调小」的场景兜底。
+    /// 不要依赖它控制最低价——默认配置下改它没有任何效果。
+    #[serde(default = "default_portal_key_min_price")]
+    pub portal_key_min_price: i64,
+
     /// 负载均衡模式（"priority" 或 "balanced"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
@@ -105,8 +184,12 @@ pub struct Config {
     pub extract_thinking: bool,
 
     /// Claude Code 自动切缓冲协议：识别到 CC 请求时，`/v1` 流式自动改走 buffered 分发
-    /// （等价 `/cc/v1`，input_tokens 用上游准确值）。默认 true。CC 会校验 input_tokens，
+    /// （等价 `/cc/v1`，input_tokens 用上游准确值）。**默认 true**。CC 会校验 input_tokens，
     /// 开启后 CC 直接打 `/v1` 也能正确工作，无需手动改用 `/cc/v1`。
+    ///
+    /// ⚠️ 代价：buffered 会把整轮回答憋到上游流结束才一次性吐，期间**只发 ping**——
+    /// 模型越慢越像卡死（可能触发客户端 `Stream idle timeout`），且 CC 的 steering 失效。
+    /// 想要内容边到边的真流式请设为 false（热更即时生效）。详见 `default_cc_auto_buffer`。
     #[serde(default = "default_cc_auto_buffer")]
     pub cc_auto_buffer: bool,
 
@@ -126,6 +209,15 @@ pub struct Config {
     /// 纯本地反应式调度：仅在凭据已出错时跳过它一段时间，无副作用，建议常开。
     #[serde(default = "default_cooldown_enabled")]
     pub cooldown_enabled: bool,
+
+    /// 是否在上游瞬态错误（429/5xx）时做**端点级**回退（默认 true）
+    ///
+    /// 上游 429 常是端点容量问题而非凭据额度问题：同一凭据换到 codewhisperer /
+    /// amazonq 端点往往立刻成功（kiro-go 的 `endpointFallback` 即此机制）。
+    /// 单凭据下 `compute_max_retries` 退化为 1、一次 429 就透传给客户端，
+    /// 端点回退在**不额外消耗凭据重试预算**的前提下补上这一层容错。
+    #[serde(default = "default_endpoint_fallback")]
+    pub endpoint_fallback: bool,
 
     /// 冷却时长缩放百分比（10..500，默认 100=原时长）。统一缩放所有冷却基础时长：
     /// <100 更短（激进，快速重试，适合号多）、>100 更长（保守，慎防封号，适合号少）。
@@ -258,18 +350,34 @@ pub struct Config {
     #[serde(default)]
     pub priority_in_balanced: bool,
 
-    /// 是否启用 prompt 缓存记账（默认 false）
+    /// custom_api 代挂号是否**无条件抢在所有 Kiro 号之前**（默认 **false**）。
+    ///
+    /// `false`（默认，推荐）：代挂号与 Kiro 号在**同一个 `priority` 维度**上公平比较 ——
+    ///   谁的 priority 数字小谁先用，用完/失败再落另一池。这符合"priority 越小越优先"的直觉。
+    /// `true`（历史行为）：只要有任一可用的 custom_api 号就先透传，Kiro 号完全不参与竞争，
+    ///   用户设的 priority 在跨池维度上**完全无效**。
+    ///
+    /// 背景：历史实现把「custom_api 优先」写死在分派顺序里（handlers 一进来就先试透传，
+    /// 见 `try_custom_api_passthrough` 的调用点），而 `select_custom_api` 只在代挂号**子集内**
+    /// 比较 priority，于是跨池优先级从来没有被比较过 —— 表现为"我把 Kiro 号 priority 调到 0
+    /// 了，它还是先走中转"。
+    ///
+    /// 单个凭据可用 `credentials.json` 的 `customApiFirst` 字段各自覆盖本全局值。
+    /// TIER1 热重载即时生效。
+    #[serde(default)]
+    pub custom_api_first: bool,
+
+    /// 是否启用严格 prompt 缓存观测（默认 false）
     ///
     /// Kiro 上游不回传 Anthropic 的 cache_read / cache_creation 记账字段。
-    /// 开启后，网关侧维护本地影子缓存表，按凭据推算并注入这些字段，
-    /// 让下游客户端（Claude Code 等）能显示缓存命中情况。
-    /// 这是估算展示，非真实计费（真实计费以 meteringEvent 为准）。
-    /// 当前默认关：热路径的 build_profile（JSON 规范化 + SHA256 指纹）对超大对话有
-    /// 可观 CPU 开销。开启后结果写入 StreamContext.cache_usage 并注入响应 usage 字段。
+    /// 开启后，网关按实际凭据、端点、region、模型、continuationId 和最终 Kiro JSON
+    /// 的完全一致前缀维护有 TTL 的成功账本。只有上一请求完整成功且收到
+    /// contextUsageEvent 才建立检查点；失败、截断、换号、换路或前缀变化均不命中。
+    /// Kiro 不返回服务端 cache hit/miss，因此结果仍是“本地可验证推断”，不是上游回执或计费依据。
     #[serde(default = "default_prompt_cache_enabled")]
     pub prompt_cache_enabled: bool,
 
-    /// prompt 缓存记账的最大 TTL 秒数（默认 3600，支持 5m/1h 断点）
+    /// 严格缓存成功检查点的本地 TTL 秒数（默认 3600）
     #[serde(default = "default_prompt_cache_ttl_seconds")]
     pub prompt_cache_ttl_seconds: u64,
 
@@ -606,19 +714,32 @@ fn default_extract_thinking() -> bool {
 }
 
 fn default_cc_auto_buffer() -> bool {
-    // 默认 false=CC 请求走**真流式**(内容边到边逐块转发)。
+    // 默认 **true** = 识别到 Claude Code 的请求走 buffered 分发。
     //
-    // 【为何改默认】cc_auto_buffer=true 时,CC 请求走 buffered 分发:整轮回答对客户端**全程只发
-    // ping、憋到上游流结束才一次性吐**——目的是让 message_start 的 input_tokens 用上游
-    // contextUsageEvent 的准确值(CC 会读它)。但实测坐实两个代价:①contextUsageEvent **结尾才到**,
-    // 所以 buffered 等于把整条流憋到最后 → 客户端整轮看不到进度(慢/看不到工具调用),模型越慢越像卡死;
-    // ②CC 的 steering(执行途中插入消息引导方向)依赖观察流式增量判断当前 turn 状态,buffered 把整轮
-    // 变成不可打断的黑盒 → 途中发消息要等整轮憋完才被处理。旁挂实测:CC 走真流式能正常干活(工具任务
-    // 成功、无 input_tokens 报错)、流式增量恢复。真流式下 message_start 发估算 input_tokens、结尾
-    // message_delta 携带上游真实 usage 修正——CC 以最终 usage 记账,估算值不影响功能。
+    // 【为何默认开】buffered 让 message_start 的 input_tokens 用上游 contextUsageEvent 的
+    // **准确值**（CC 会校验该字段），这样 CC 直接打 `/v1` 也能拿到正确行为，无需手动改用
+    // `/cc/v1`。同时与两处进程级镜像的初值保持一致（`anthropic/handlers.rs` 的
+    // `CC_AUTO_BUFFER` static、`admin/types.rs` 的 `ConfigSnapshotResponse::default`
+    // 都是 true）——历史上此处返回 false 与那两处相反，是长期的默认值不一致来源。
     //
-    // 想要 message_start 即精确 input_tokens 的场景仍可将 ccAutoBuffer 设回 true(热更即时生效)。
-    false
+    // 【代价，务必知情】buffered = 整轮回答对客户端**全程只发 ping、憋到上游流结束才一次性吐**：
+    //   ① `contextUsageEvent` **结尾才到**，所以 buffered 等于把整条流憋到最后 →
+    //      客户端整轮看不到进度（慢/看不到工具调用），**模型越慢越像卡死**；
+    //      客户端侧可能表现为 `Stream idle timeout - no chunks received`。
+    //   ② CC 的 steering（执行途中插入消息引导方向）依赖观察流式增量判断当前 turn 状态，
+    //      buffered 把整轮变成**不可打断的黑盒** → 途中发消息要等整轮憋完才被处理。
+    //
+    // 【想要真流式怎么做】把 ccAutoBuffer 设为 false（热更即时生效，无需重启）：
+    // 内容边到边逐块转发，`message_start` 发估算 input_tokens、结尾 `message_delta` 携带
+    // 上游真实 usage 修正 —— CC 以最终 usage 记账，估算值不影响功能。旁挂实测真流式下
+    // CC 能正常干活（工具任务成功、无 input_tokens 报错）且流式增量恢复。
+    //
+    // 【作用范围】本开关**同时**决定两个端点的分发方式(2026-07-27 统一):
+    //   - `/v1/messages`     : 识别到 CC 请求且开关为 true 时走 buffered
+    //   - `/cc/v1/messages`  : 开关为 true 时走 buffered
+    // 历史缺陷:`/cc/v1` 曾**无条件** buffered,导致把 CC 指向该端点的用户即便把本开关设成
+    // false 也关不掉。现两端语义统一,一个开关控制到底。
+    true
 }
 
 fn default_all_cooling_fast_fail() -> bool {
@@ -681,6 +802,10 @@ fn default_cooldown_enabled() -> bool {
     true
 }
 
+fn default_endpoint_fallback() -> bool {
+    true
+}
+
 fn default_affinity_enabled() -> bool {
     true
 }
@@ -694,14 +819,9 @@ fn default_rate_limit_min_interval_ms() -> u64 {
 }
 
 fn default_prompt_cache_enabled() -> bool {
-    // 默认关闭影子 prompt 缓存记账。
-    // 该记账在请求热路径同步跑 build_profile（逐块 serde 序列化 + canonicalize_json
-    // 递归排序所有 JSON key + SHA256 前缀指纹），对超大对话（30-40 万 token / 数百块）
-    // 有可观固定 CPU 开销，叠加在发上游之前。它只影响向下游客户端复现 Anthropic 风格的
-    // cache_read / cache_creation 展示，不影响真实上游 prefix 缓存（那由客户端断点 +
-    // Bedrock 决定，网关左右不了）。默认关以砍掉这块热路径开销；需要展示缓存命中统计时
-    // 再显式设 "promptCacheEnabled": true——开启后，记账结果写入 StreamContext.cache_usage
-    // 并在每条响应的 usage 字段注入 cache_read_input_tokens / cache_creation_input_tokens。
+    // 默认关闭：严格观测需要规范化最终 Kiro JSON、计算滚动前缀指纹并维护 TTL 账本，
+    // 会增加请求热路径 CPU。开启后只报告此前完整成功请求建立的 inferred cache_read；
+    // Kiro 没有服务端 cache 回执，不能把该值当作真实计费数据。
     false
 }
 
@@ -768,6 +888,37 @@ fn default_collect_client_fingerprint() -> bool {
     true
 }
 
+fn default_portal_require_https() -> bool {
+    true
+}
+
+// ---- Portal 车队计费默认值 ----
+//
+// 默认配置等价于「2 人 10 分」：前 2 人各 10 分，第 3 人起按 20/N 均摊，10 人满员。
+// 价格序列（N=1..10）：10 10 7 5 4 4 3 3 3 2
+// 与设计文档 docs/superpowers/specs/2026-08-06-portal-credits-design.md 的示例一致，
+// 并由 portal::credits::tests::user_examples_match_exactly 锁死这十个数字。
+
+fn default_portal_key_base_count() -> u32 {
+    2
+}
+
+fn default_portal_key_base_price() -> i64 {
+    10
+}
+
+fn default_portal_key_total_price() -> i64 {
+    20
+}
+
+fn default_portal_key_max_unlockers() -> u32 {
+    10
+}
+
+fn default_portal_key_min_price() -> i64 {
+    1
+}
+
 fn default_max_body_bytes() -> usize {
     // 256MiB 大软上限：远超正常请求（上游 compression 4MiB 触发、~5MiB 就 400），
     // 又挡住恶意超大 body 打死进程。想彻底放开可显式设 0（= 不限制，见 anthropic/router.rs）。
@@ -816,12 +967,25 @@ impl Default for Config {
             proxy_username: None,
             proxy_password: None,
             admin_api_key: None,
+            import_api_key: None,
+            relay_api_key: None,
+            portal_admin_password_hash: None,
+            portal_enabled: false,
+            portal_invite_code: None,
+            portal_require_https: default_portal_require_https(),
+            portal_credits_enabled: false,
+            portal_key_base_count: default_portal_key_base_count(),
+            portal_key_base_price: default_portal_key_base_price(),
+            portal_key_total_price: default_portal_key_total_price(),
+            portal_key_max_unlockers: default_portal_key_max_unlockers(),
+            portal_key_min_price: default_portal_key_min_price(),
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
             cc_auto_buffer: default_cc_auto_buffer(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             cooldown_enabled: default_cooldown_enabled(),
+            endpoint_fallback: default_endpoint_fallback(),
             cooldown_scale_pct: default_cooldown_scale_pct(),
             rate_limit_jitter_pct: default_rate_limit_jitter_pct(),
             inbound_throttle_enabled: default_true(),
@@ -846,6 +1010,8 @@ impl Default for Config {
             all_cooling_fast_fail: default_all_cooling_fast_fail(),
             auto_disable_suspicious: default_auto_disable_suspicious(),
             priority_in_balanced: false,
+            // 默认 false = priority 全局统一比较（修正历史上"代挂号隐含绝对优先"的反直觉行为）。
+            custom_api_first: false,
             prompt_cache_enabled: default_prompt_cache_enabled(),
             prompt_cache_ttl_seconds: default_prompt_cache_ttl_seconds(),
             strip_env_noise: default_strip_env_noise(),
@@ -952,6 +1118,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cc_auto_buffer_default_is_on_and_consistent_across_mirrors() {
+        // ccAutoBuffer 的默认值散落在**三处**，历史上曾长期不一致
+        //（config 默认 false，而 handlers 的 static 初值与 admin 快照 Default 都是 true）：
+        //   ① 本函数 default_cc_auto_buffer()
+        //   ② src/anthropic/handlers.rs 的 CC_AUTO_BUFFER static 初值
+        //   ③ src/admin/types.rs 的 ConfigSnapshotResponse::default
+        // 运行时 ② 会被 main 启动播种覆盖，所以不一致不会立刻出错——但会让单元测试、
+        // 以及任何绕过 create_router_with_provider 的代码路径读到错的默认值，排障时极易误判。
+        // 此处把 ①②的一致性钉死；改任一处默认值都必须同步另一处，否则本测试失败。
+        assert!(
+            default_cc_auto_buffer(),
+            "ccAutoBuffer 默认应为 true（CC 请求走 buffered，message_start 用上游精确 input_tokens）"
+        );
+        assert_eq!(
+            Config::default().cc_auto_buffer,
+            default_cc_auto_buffer(),
+            "Config::default() 必须走 default_cc_auto_buffer()，不得另写字面量"
+        );
+        // ② 的一致性断言放在 handlers 自己的测试里
+        //（cc_auto_buffer_enabled 是模块私有函数，不为测试放宽生产可见性）：
+        //   见 anthropic::handlers::tier3_hotreload_tests::cc_auto_buffer_static_matches_config_default
+    }
+
+    #[test]
     fn login_background_defaults_on() {
         // 登录页背景图开关默认开启（显示背景图）。
         let cfg = Config::default();
@@ -983,5 +1173,105 @@ mod tests {
         assert!(s.contains("\"loginBackgroundR18\":false"));
         let back: Config = serde_json::from_str(&s).expect("反序列化应成功");
         assert!(!back.login_background_r18);
+    }
+
+    // ---- Portal 车队积分 ----
+
+    /// 六个积分配置项的 JSON 名必须与文档/前端一致。
+    ///
+    /// 【为何值得单测】serde 的 `rename_all = "camelCase"` 是按字段名自动推导的，
+    /// 一旦有人把字段改名（比如 `portal_key_max_unlockers` → `portal_key_max_seats`），
+    /// JSON 名会**跟着变**，而老配置文件里的旧键就变成了未知字段——被静默忽略，
+    /// 回落默认值。管理员配了 20 人上限却仍按 10 人收费，没有任何报错。
+    #[test]
+    fn credits_config_json_names_are_stable() {
+        let s = serde_json::to_string(&Config::default()).expect("序列化应成功");
+        for key in [
+            "portalCreditsEnabled",
+            "portalKeyBaseCount",
+            "portalKeyBasePrice",
+            "portalKeyTotalPrice",
+            "portalKeyMaxUnlockers",
+            "portalKeyMinPrice",
+        ] {
+            assert!(
+                s.contains(&format!("\"{key}\"")),
+                "配置 JSON 里缺少 {key}——字段改名会让老配置静默失效"
+            );
+        }
+    }
+
+    /// 积分默认**关闭**，且默认参数就是「2 人 10 分」。
+    ///
+    /// 默认关闭是有意的：升级到带积分的版本后，管理员什么都没配的情况下行为不该改变。
+    /// 若默认打开，所有用户余额都是 0，全部 key 立刻变成看不了——一次升级变成一次故障。
+    #[test]
+    fn credits_default_off_with_two_for_ten() {
+        let cfg = Config::default();
+        assert!(
+            !cfg.portal_credits_enabled,
+            "积分必须默认关闭，否则升级即断服"
+        );
+        assert_eq!(cfg.portal_key_base_count, 2);
+        assert_eq!(cfg.portal_key_base_price, 10);
+        assert_eq!(cfg.portal_key_total_price, 20);
+        assert_eq!(cfg.portal_key_max_unlockers, 10);
+        assert_eq!(cfg.portal_key_min_price, 1);
+    }
+
+    /// 老配置文件（无任何积分字段）解析后应得到与 `Default` 一致的积分参数。
+    #[test]
+    fn old_config_without_credits_fields_falls_back_to_defaults() {
+        let json = r#"{"host":"127.0.0.1","port":8080}"#;
+        let cfg: Config = serde_json::from_str(json).expect("最小配置应能解析");
+        let d = Config::default();
+
+        assert!(!cfg.portal_credits_enabled);
+        assert_eq!(cfg.portal_key_base_count, d.portal_key_base_count);
+        assert_eq!(cfg.portal_key_base_price, d.portal_key_base_price);
+        assert_eq!(cfg.portal_key_total_price, d.portal_key_total_price);
+        assert_eq!(cfg.portal_key_max_unlockers, d.portal_key_max_unlockers);
+        assert_eq!(cfg.portal_key_min_price, d.portal_key_min_price);
+    }
+
+    /// 自定义参数能被真正读进来（不是被 `#[serde(default)]` 悄悄盖掉）。
+    ///
+    /// 用「4 人 5 分」这组——它是用户明确提过的第二种配法，与默认的 2/10 每个字段都不同，
+    /// 所以任何一项读丢了都会被这条抓到。若某项写成了 `#[serde(skip)]` 之类，
+    /// 断言会看到默认值而非 4/5。
+    #[test]
+    fn custom_credits_params_are_honored() {
+        let json = r#"{
+            "host":"127.0.0.1","port":8080,
+            "portalCreditsEnabled":true,
+            "portalKeyBaseCount":4,
+            "portalKeyBasePrice":5,
+            "portalKeyTotalPrice":30,
+            "portalKeyMaxUnlockers":6,
+            "portalKeyMinPrice":2
+        }"#;
+        let cfg: Config = serde_json::from_str(json).expect("解析应成功");
+        assert!(cfg.portal_credits_enabled);
+        assert_eq!(cfg.portal_key_base_count, 4);
+        assert_eq!(cfg.portal_key_base_price, 5);
+        assert_eq!(cfg.portal_key_total_price, 30);
+        assert_eq!(cfg.portal_key_max_unlockers, 6);
+        assert_eq!(cfg.portal_key_min_price, 2);
+    }
+
+    /// 配置默认值与 `credits::Pricing::default()` 必须一致。
+    ///
+    /// 两处各写一份字面量，改一处忘另一处不会有编译错误：`Pricing::default()` 用在
+    /// 尚无快照的 key 上，config 默认值用在启动播种上——不一致会让「没配过任何东西」
+    /// 的部署出现两套价格，而两处都自称是默认。
+    #[test]
+    fn config_defaults_match_pricing_defaults() {
+        let cfg = Config::default();
+        let p = crate::portal::credits::Pricing::default();
+        assert_eq!(cfg.portal_key_base_count, p.base_count);
+        assert_eq!(cfg.portal_key_base_price, p.base_price);
+        assert_eq!(cfg.portal_key_total_price, p.total_price);
+        assert_eq!(cfg.portal_key_max_unlockers, p.max_unlockers);
+        assert_eq!(cfg.portal_key_min_price, p.min_price);
     }
 }

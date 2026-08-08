@@ -3,9 +3,11 @@ mod admin_ui;
 mod anthropic;
 mod common;
 mod http_client;
+mod import_api;
 mod kiro;
 mod model;
 mod openai;
+mod portal;
 pub mod token;
 #[cfg(windows)]
 mod tray;
@@ -15,7 +17,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use clap::Parser;
-use kiro::endpoint::{IdeEndpoint, KiroEndpoint};
+use kiro::endpoint::{
+    AmazonQEndpoint, CliEndpoint, CodeWhispererEndpoint, IdeEndpoint, KiroEndpoint,
+};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
@@ -56,7 +60,11 @@ fn windows_data_root() -> Option<std::path::PathBuf> {
     let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
     let root = exe_dir.join("KiroStudio-data");
     if let Err(e) = std::fs::create_dir_all(&root) {
-        tracing::warn!("创建数据目录 {} 失败: {}，回退到默认路径", root.display(), e);
+        tracing::warn!(
+            "创建数据目录 {} 失败: {}，回退到默认路径",
+            root.display(),
+            e
+        );
         return None;
     }
     Some(root)
@@ -75,7 +83,9 @@ fn resolve_default_data_path(name: &str) -> std::path::PathBuf {
     if cwd_path.exists() {
         return cwd_path; // 源码目录开发：cwd 已有则沿用
     }
-    let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf()));
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.to_path_buf()));
     if let Some(dir) = &exe_dir {
         let legacy = dir.join(name);
         if legacy.exists() {
@@ -104,7 +114,10 @@ fn maybe_open_browser_on_first_run(freshly_generated: bool, host: &str, port: u1
     if !freshly_generated {
         return;
     }
-    if std::env::var("KIRO_NO_BROWSER").map(|v| !v.is_empty()).unwrap_or(false) {
+    if std::env::var("KIRO_NO_BROWSER")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
         return;
     }
     let is_loopback = matches!(host, "127.0.0.1" | "localhost" | "::1" | "0.0.0.0");
@@ -131,21 +144,90 @@ fn maybe_open_browser_on_first_run(freshly_generated: bool, host: &str, port: u1
 #[cfg(not(windows))]
 fn maybe_open_browser_on_first_run(_freshly_generated: bool, _host: &str, _port: u16) {}
 
-/// 解析用量库目录：默认相对值 `"data/usage"` 在 Windows 下前缀到 `KiroStudio-data/`（数据隔离）；
-/// 已被用户改成绝对路径或自定义相对值的，原样尊重（不劫持用户显式配置）。
-/// 非 Windows / 数据根不可用：原样返回（保持相对 cwd 语义）。
-fn resolve_usage_data_dir(configured: &str) -> std::path::PathBuf {
+/// `usageDataDir` 的默认字面量。只有等于它才做下面的重定向；用户改过就原样尊重。
+const DEFAULT_USAGE_DATA_DIR: &str = "data/usage";
+
+/// 解析用量/Portal 数据目录。
+///
+/// # 为什么不能直接用相对 cwd 的 `"data/usage"`
+/// 容器里 cwd 是 `/app`，属主 root，而进程是非 root（Dockerfile 的 `USER app`，或
+/// compose 的 `user: "${KIROSTUDIO_UID}:${KIROSTUDIO_GID}"`）。于是 `/app/data` 建不出来，
+/// 后果是**用量统计静默降级 + Portal 库打不开**（生产实证 2026-08-07：
+/// `Permission denied (os error 13)`，`usage/overview` 长期 503）。
+///
+/// # 为什么修法是「相对 config 文件所在目录」而不是 chown
+/// 在 Dockerfile 里 `mkdir /app/data && chown app:app` **在 Linux 上会失效**：compose
+/// 以宿主 uid 运行（实测 `.env` 里是 501:20），而目录属主是构建期的 `app`(100)，运行期
+/// 照样写不进去。而 `/app/config` 是 bind mount，属主定义上就是运行者——**它是唯一在
+/// macOS 与 Linux 上都必然可写的位置**。数据落在那里还顺带进了用户已在备份的目录。
+///
+/// # 解析优先级
+/// 1. 用户改过 `usageDataDir`（含绝对路径）→ 原样尊重，绝不劫持。
+/// 2. 旧位置 `<cwd>/data/usage` 已存在 → **沿用，不搬迁**。存量库里有用户/积分/审计，
+///    静默换路径等于「数据一夜蒸发」。同 [`resolve_default_data_path`] 对 config.json
+///    的处理（那里的注释：「旧版本落 exe 根目录的存量配置：沿用，不搬（防丢号）」）。
+/// 3. 知道 config 文件在哪 → `<config 所在目录>/data/usage`。容器里即 `/app/config/data/usage`。
+/// 4. Windows 数据隔离 → `KiroStudio-data/data/usage`。
+/// 5. 兜底：原样相对 cwd（保持改动前语义）。
+///
+/// # 为什么是 `pub(crate)`
+/// `admin::service` 的存储统计/清理必须解析出**同一个**目录。它原先直接用
+/// `PathBuf::from(config.usage_data_dir)`（原始相对值），与真实落盘位置不一致——
+/// 生产 `storage/stats` 曾报 `path: "data/usage"` 而库实际在别处。一个**会删文件**的
+/// 功能指向错目录是要出事的，所以两处必须共用这一个函数，而不是各自拼路径。
+pub(crate) fn resolve_data_dir_for(
+    configured: &str,
+    config_path: Option<&std::path::Path>,
+) -> std::path::PathBuf {
+    // 唯一一次文件系统探测在这里，判定逻辑全在下面的纯函数里。
+    //
+    // 【为何要这样切】`is_dir()` 读的是**进程全局**的 cwd。把探测混在判定里，
+    // 测试就只能靠 `set_current_dir` 来构造场景，而那个调用是进程级的：
+    // cargo 并行跑用例时，一个用例改了 cwd，另一个用例的 `is_dir()` 就看到了
+    // 别人的世界。实测正是如此——两条用例单独跑失败、一起跑却"通过"，
+    // 因为它们恰好互相把 cwd 改成了对方需要的样子。这种绿是假的。
+    let legacy_exists = std::path::Path::new(configured).is_dir();
+    decide_data_dir(configured, config_path, legacy_exists)
+}
+
+/// [`resolve_data_dir_for`] 的纯判定部分：不碰文件系统，只按输入算路径。
+///
+/// `legacy_exists` = 「相对 cwd 的旧位置是否已存在」，由调用方探测后传入。
+/// 纯函数意味着测试能直接构造全部分支，不必操纵进程全局的 cwd。
+fn decide_data_dir(
+    configured: &str,
+    config_path: Option<&std::path::Path>,
+    legacy_exists: bool,
+) -> std::path::PathBuf {
     let p = std::path::PathBuf::from(configured);
-    let is_default = configured == "data/usage";
-    if !is_default || p.is_absolute() {
+    if configured != DEFAULT_USAGE_DATA_DIR || p.is_absolute() {
         return p;
     }
+
+    // 旧位置优先：存量数据不搬。只认「目录已存在」，不看里面有没有库——
+    // 空目录也沿用，因为那通常是上一次运行刚建出来、库还没写入的状态。
+    if legacy_exists {
+        return p;
+    }
+
+    // config 同级：容器里这是 bind mount，必然可写。
+    if let Some(dir) = config_path.and_then(|c| c.parent()) {
+        // parent() 对裸文件名 "config.json" 返回 Some("")。此时 join 的结果与
+        // 原样相对路径**完全相同**（`Path::new("").join("data/usage") == "data/usage"`），
+        // 所以在 Unix 上排不排它都一样。显式排掉是为了 Windows：那里应当继续落到
+        // 下面的数据隔离分支，而不是被一个等价于「没重定向」的 join 提前截住。
+        if !dir.as_os_str().is_empty() {
+            return dir.join(configured);
+        }
+    }
+
     #[cfg(windows)]
     {
         if let Some(root) = windows_data_root() {
             return root.join(configured);
         }
     }
+
     p
 }
 
@@ -179,11 +261,15 @@ fn bootstrap_config_if_missing(config_path: &str) -> (String, bool) {
         "tlsBackend": "rustls",
         "region": "us-east-1",
         "defaultEndpoint": "ide",
+        "endpointFallback": true,
     });
     let body = serde_json::to_string_pretty(&cfg).unwrap_or_default();
     if let Err(e) = std::fs::write(&target, body) {
         // 写失败不阻断：继续走原流程（大概率随后因缺 apiKey 退出并报错），但先告知原因。
-        tracing::error!("[引导] 自动生成配置失败({}): {e}；请手动创建 config.json 或用 start.bat", target.display());
+        tracing::error!(
+            "[引导] 自动生成配置失败({}): {e}；请手动创建 config.json 或用 start.bat",
+            target.display()
+        );
         return (resolved_str, false);
     }
     // Unix 收紧权限（含密钥，仅属主可读写）；Windows 依赖 NTFS ACL，此调用 no-op。
@@ -333,6 +419,13 @@ async fn main() {
     {
         let ide = IdeEndpoint::new();
         endpoints.insert(ide.name().to_string(), Arc::new(ide));
+        let cli = CliEndpoint::new();
+        endpoints.insert(cli.name().to_string(), Arc::new(cli));
+        // 备用端点：供 429/5xx 时的端点级回退使用（endpointFallback）。
+        let cw = CodeWhispererEndpoint::new();
+        endpoints.insert(cw.name().to_string(), Arc::new(cw));
+        let aq = AmazonQEndpoint::new();
+        endpoints.insert(aq.name().to_string(), Arc::new(aq));
     }
 
     // 校验默认端点存在
@@ -343,10 +436,7 @@ async fn main() {
 
     // 校验所有凭据声明的端点都已注册
     for cred in &credentials_list {
-        let name = cred
-            .endpoint
-            .as_deref()
-            .unwrap_or(&config.default_endpoint);
+        let name = cred.endpoint.as_deref().unwrap_or(&config.default_endpoint);
         if !endpoints.contains_key(name) {
             tracing::error!(
                 "凭据 id={:?} 指定了未知端点 \"{}\"（已注册: {:?}）",
@@ -445,7 +535,7 @@ async fn main() {
     // 初始化用量统计管道（可选）：装配 trace_db + usage_stats 两个 sink
     // 返回给 admin 侧共享的实例句柄（未启用时为 None）
     let usage_handles = if config.usage_enabled {
-        init_usage_pipeline(&config)
+        init_usage_pipeline(&config, std::path::Path::new(&config_path))
     } else {
         tracing::info!("用量统计未启用（usage_enabled=false）");
         None
@@ -490,27 +580,33 @@ async fn main() {
         .map(|k| !k.trim().is_empty())
         .unwrap_or(false);
 
+    // 上游额度缓存是网关能力，不应依赖 Admin API 是否配置。进程只创建这一份服务，
+    // Portal 与管理端共享它，避免两套缓存与两套后台刷新任务。
+    let balance_service = Arc::new(admin::AdminService::new(
+        token_manager.clone(),
+        endpoint_names.clone(),
+    ));
+
+    // A6：温和的周期性额度刷新（严格受控）。首轮等待完整间隔，逐号串行刷新。
+    // Admin 或 Portal 至少有一个启用时才需要后台刷新；两者都关闭时没有消费者，
+    // 继续周期请求上游只会平白增加风控压力。Portal 显式开启但未配置 adminApiKey
+    // 仍会启动，因此用户页的缓存与单号手动刷新能力不依赖管理 API。
+    if admin_key_valid || config.portal_enabled {
+        balance_service.respawn_balance_task();
+    }
+
     let app = if let Some(admin_key) = &config.admin_api_key {
         if admin_key.trim().is_empty() {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
             anthropic_app
         } else {
-            let admin_service =
-                admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
-            let mut admin_state = admin::AdminState::new(admin_key, admin_service);
+            let mut admin_state =
+                admin::AdminState::from_shared(admin_key, balance_service.clone());
             // 注入用量查询句柄（未启用统计时为 None，端点返回 503）
             if let Some(handles) = &usage_handles {
-                admin_state = admin_state
-                    .with_usage(handles.stats.clone(), handles.trace_db.clone());
+                admin_state =
+                    admin_state.with_usage(handles.stats.clone(), handles.trace_db.clone());
             }
-
-            // A6：温和的周期性余额刷新（严格受控）。
-            // 为避免触发上游风控：绝不在启动/挂载时批量拉——后台任务首轮也要等满一个
-            // 完整间隔才开始，且逐个刷新、每个之间留间隔（分散节奏），只刷未禁用的号，
-            // 仅更新缓存供展示，绝不做主动禁用。0 = 禁用（安全默认之一）。
-            // TIER2 热重载：spawn 交由 AdminService 的受管任务槽（respawn_balance_task），
-            // 启动即受管，admin 改 balanceRefreshIntervalSecs 后 abort+respawn 即时生效不重启。
-            admin_state.service.respawn_balance_task();
 
             let admin_app = admin::create_admin_router(admin_state);
 
@@ -525,6 +621,211 @@ async fn main() {
         }
     } else {
         anthropic_app
+    };
+
+    // 外部凭据推送入口使用独立密钥，不复用网关 key 或高权限 admin key。
+    //
+    // 路由**总是挂载**：鉴权活读 common::auth_keys，未配置时空存储恒 false → 全部 401。
+    // 这样运维在面板填上 importApiKey 即可启用通道（含「从未配置」的冷启用），不必重启。
+    // 旧行为是未配置就不挂载 → 想启用必须重启，而重启会掐断在途流式请求。
+    match config.import_api_key.as_deref().map(str::trim) {
+        Some(import_key) if !import_key.is_empty() => {
+            if let Err(e) = common::auth_keys::set_import_key(import_key) {
+                tracing::error!("importApiKey 播种失败，导入通道将全拒: {}", e);
+            } else {
+                tracing::info!("凭据批量导入 API 已启用: POST /api/import/keys");
+                // 让运维面板的导入卡片能区分「未配置」与「已启用但还没人推过」。
+                common::import_stats::set_enabled(true);
+            }
+        }
+        _ => {
+            tracing::info!("importApiKey 未配置，POST /api/import/keys 已挂载但全拒（401）");
+        }
+    }
+    match config.relay_api_key.as_deref().map(str::trim) {
+        Some(relay_key) if !relay_key.is_empty() => {
+            if let Err(e) = common::auth_keys::set_relay_key(relay_key) {
+                tracing::error!("relayApiKey 播种失败，Relay 频道将全拒: {}", e);
+            } else {
+                common::import_stats::set_relay_enabled(true);
+                tracing::info!("Relay 推送频道已启用: POST /api/import/push");
+            }
+        }
+        _ => tracing::info!("relayApiKey 未配置，POST /api/import/push 已挂载但全拒（401）"),
+    }
+    let app = app.nest(
+        "/api/import",
+        import_api::create_router(token_manager.clone()),
+    );
+
+    // ============ Portal（多用户凭据查看页）============
+    //
+    // 路由**总是挂载**，由运行时镜像 portal::http::enabled() 决定行为：未启用时全部 404
+    // （连页面本身也 404，不确认这个功能存在）。这样 admin 改 portalEnabled 即时生效，
+    // 无需重启——与 importApiKey 的冷启用同一套思路。
+    //
+    // 库放在用量数据目录下（与 traces.db 同处），复用已有的目录创建与 Windows 数据隔离逻辑。
+    let app = {
+        portal::http::set_enabled(config.portal_enabled);
+        portal::http::set_require_https(config.portal_require_https);
+
+        // 车费规则播种。`set_pricing` 内部 sanitized()，写进去的一定是合理值，
+        // 所以下面日志里打印的是**纠正后**的实际生效值，而不是配置文件的原始字面量——
+        // 配了 base_count=0 的人应该看到「实际按 1 生效」，不是看到自己写的 0。
+        portal::http::set_credits_enabled(config.portal_credits_enabled);
+        portal::http::set_pricing(portal::credits::Pricing {
+            base_count: config.portal_key_base_count,
+            base_price: config.portal_key_base_price,
+            total_price: config.portal_key_total_price,
+            min_price: config.portal_key_min_price,
+            max_unlockers: config.portal_key_max_unlockers,
+        });
+
+        if config.portal_credits_enabled && !config.portal_enabled {
+            // 只开积分不开总开关 = 什么都不会发生。这种配置几乎总是误解，
+            // 不提示的话管理员会以为已经生效，直到有人反馈打不开页面。
+            tracing::warn!(
+                "portalCreditsEnabled=true 但 portalEnabled=false：Portal 整体未启用，积分规则不会生效。总开关是 portalEnabled"
+            );
+        }
+
+        // 注册码播种。空/未配置 → 不播种，portal_invite_matches 恒 false = 注册通道关闭。
+        match config.portal_invite_code.as_deref().map(str::trim) {
+            Some(code) if !code.is_empty() => {
+                if let Err(e) = common::auth_keys::set_portal_invite_code(code) {
+                    tracing::error!("portalInviteCode 播种失败，Portal 注册将全拒: {}", e);
+                }
+            }
+            _ => {
+                if config.portal_enabled {
+                    tracing::warn!(
+                        "Portal 已启用但未配置 portalInviteCode：注册通道关闭（已有用户仍可登录）"
+                    );
+                }
+            }
+        }
+
+        let portal_dir = resolve_data_dir_for(
+            &config.usage_data_dir,
+            Some(std::path::Path::new(&config_path)),
+        );
+        // 建目录失败就没必要再试开库了：错误原因在这里最具体（是权限还是路径不对），
+        // 留到 PortalDb::open 只会报出一个更含糊的 "unable to open database file"。
+        let portal_db = match std::fs::create_dir_all(&portal_dir) {
+            Err(e) => Err(format!("创建数据目录 {} 失败: {e}", portal_dir.display())),
+            Ok(()) => {
+                portal::PortalDb::open(&portal_dir.join("portal.db")).map_err(|e| format!("{e:#}"))
+            }
+        };
+
+        let portal_admin_auth = portal::PortalAdminAuth::new(
+            config.portal_admin_password_hash.clone(),
+            std::path::PathBuf::from(&config_path),
+            config.trust_forwarded_header,
+        );
+
+        match portal_db {
+            Ok(db) => {
+                let db = Arc::new(db);
+                let auth = Arc::new(portal::PortalAuth::new(db.clone()));
+
+                // 注册落盘钩子：此后 POST /api/import/keys 每推一个 key 就写一条元数据。
+                // 必须在挂载导入路由之后、服务开始收流量之前完成，否则期间的推送不会留痕。
+                portal::sink::register(db.clone());
+
+                // 过期会话清理：每 6 小时一次。不清会随登录次数无界堆积。
+                // 同时按上限裁剪审计表——它每次登录/每次明文外显都写一条，
+                // 公网暴露下更是撞库者的写放大目标。
+                let cleanup_db = db.clone();
+                tokio::spawn(async move {
+                    let mut ticker =
+                        tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        ticker.tick().await;
+                        let now = chrono::Utc::now().timestamp_millis();
+                        match cleanup_db.purge_expired_sessions(now) {
+                            Ok(n) if n > 0 => tracing::info!("Portal 清理过期会话 {} 条", n),
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!("Portal 清理过期会话失败: {:#}", e),
+                        }
+                        match cleanup_db.trim_audit(portal::MAX_AUDIT_ROWS) {
+                            Ok(n) if n > 0 => tracing::info!("Portal 裁剪审计 {} 条", n),
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!("Portal 裁剪审计失败: {:#}", e),
+                        }
+                    }
+                });
+
+                if config.portal_enabled {
+                    tracing::info!("Portal 已启用: GET /portal");
+                } else {
+                    tracing::info!("Portal 未启用（portalEnabled=false），/portal 全部 404");
+                }
+
+                // 车费规则打印出来，管理员不必自己算那个两段式公式。
+                // 读的是运行时镜像（已 sanitized），所以这行就是实际生效的规则。
+                if config.portal_enabled && portal::http::credits_enabled() {
+                    let p = portal::http::pricing();
+                    let table: Vec<String> = (1..=p.max_unlockers)
+                        .map(|n| p.unit_price(n).to_string())
+                        .collect();
+                    tracing::info!(
+                        "车队积分已启用：前 {} 人各 {} 分，之后 {}/N 均摊，最多 {} 人上车（单价 N=1..{}：{}）",
+                        p.base_count,
+                        p.base_price,
+                        p.total_price,
+                        p.max_unlockers,
+                        p.max_unlockers,
+                        table.join(" ")
+                    );
+                } else if config.portal_enabled {
+                    tracing::info!(
+                        "车队积分未启用（portalCreditsEnabled=false），明文对已登录用户直接可见"
+                    );
+                }
+                // 用量句柄与热路径 sink 共享同一实例，故 portal 读到的是实时聚合，
+                // 不是另拉一份快照。usageEnabled=false 时为 None，用量列显示「未启用」。
+                let mut state = portal::http::PortalState::new(auth, token_manager.clone());
+                if let Some(handles) = &usage_handles {
+                    state = state.with_usage(handles.stats.clone());
+                }
+                state = state.with_balance_service(balance_service.clone());
+                // merge 而非 nest：create_router 用的是绝对路径 `/portal…`，
+                // 这样 `/portal` 与 `/portal/` 能注册成同一个 handler（nest 下 "/" 只匹配前者）。
+                //
+                // admin 侧管理接口挂 /api/admin/portal/*，自带 admin 鉴权中间件。
+                // **不受 portalEnabled 门控**：管理员需要能在开启功能之前先把账号建好，
+                // 否则「开了功能才能建号、建号期间功能已对公网敞开」是个没必要的窗口。
+                app.merge(portal::http::create_router(state)).nest(
+                    "/api/admin/portal",
+                    portal::admin_api::create_router(db, portal_admin_auth.clone()),
+                )
+            }
+            Err(reason) => {
+                // 开库失败不阻断主服务启动——网关的核心职责是转发对话，
+                // portal 是附加功能，它坏了不该让整个服务起不来。
+                tracing::error!("Portal 数据库不可用（Portal 已禁用）: {reason}");
+                tracing::error!(
+                    "  排查提示：数据目录需要对运行用户可写。容器部署把它放在 bind mount 的 \
+                     config 目录下（当前解析为 {}）；也可在配置里把 usageDataDir 显式指向一个可写路径。",
+                    portal_dir.display()
+                );
+                portal::http::set_enabled(false);
+
+                // **用户页 404，管理接口 503。** 两者故意不同：
+                //
+                // 用户页保持 404 是安全属性——不向公网确认「这里有个 portal，只是坏了」，
+                // 与 `feature_gate` 未启用时的行为一致（见 portal::http 模块文档）。
+                //
+                // 管理接口改 503 是可诊断性——它在 admin 鉴权之后，看到的人本就是管理员，
+                // 而 404 会让面板显示成「功能不存在」，把排查引向完全错误的方向。
+                app.nest(
+                    "/api/admin/portal",
+                    portal::admin_api::unavailable_router(reason, portal_admin_auth.clone()),
+                )
+            }
+        }
     };
 
     // 启动服务器
@@ -693,18 +994,18 @@ async fn shutdown_signal() {
 }
 
 /// 是否由托盘「退出」触发的停机（决定 main 的退出码：3=用户主动退出，监督脚本不重拉）。
-static TRAY_QUIT_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TRAY_QUIT_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// 装配用量统计管道：打开 SQLite、构造 JSONL 统计、冷启动重放、启动保留清理任务。
 ///
 /// 任一 sink 初始化失败都不致命——记录告警并退化（返回 None 或跳过该 sink），
 /// 保证统计侧故障绝不阻断主服务启动。
-fn init_usage_pipeline(config: &Config) -> Option<UsageHandles> {
-    use std::path::PathBuf;
-
-    // 用量库目录：默认相对值 "data/usage" 在 Windows 数据隔离下前缀到 KiroStudio-data/，
-    // 避免双击时按 cwd 散落。显式改成绝对/自定义路径的：尊重不动。非 Windows：保持原相对 cwd 语义。
-    let data_dir = resolve_usage_data_dir(&config.usage_data_dir);
+fn init_usage_pipeline(config: &Config, config_path: &std::path::Path) -> Option<UsageHandles> {
+    // 目录解析口径见 [`resolve_data_dir_for`]。必须与 portal 库、以及 admin 侧的
+    // `AdminService::usage_data_dir()` 用同一个函数——三处若各自解析，表现是
+    // 「存储统计/清理对着一个空目录操作，而真实数据在别处」。
+    let data_dir = resolve_data_dir_for(&config.usage_data_dir, Some(config_path));
     if let Err(e) = std::fs::create_dir_all(&data_dir) {
         tracing::error!(
             "创建用量数据目录失败 {}: {}，用量统计已禁用",
@@ -773,8 +1074,194 @@ fn init_usage_pipeline(config: &Config) -> Option<UsageHandles> {
         data_dir.display(),
         retention_days
     );
-    Some(UsageHandles {
-        stats,
-        trace_db,
-    })
+    Some(UsageHandles { stats, trace_db })
+}
+
+#[cfg(test)]
+mod data_dir_tests {
+    use super::{DEFAULT_USAGE_DATA_DIR, decide_data_dir, resolve_data_dir_for};
+    use std::path::{Path, PathBuf};
+
+    /// 独立临时目录。只有 `the_filesystem_probe_is_actually_wired_up` 需要它——
+    /// 其余用例全打纯函数，不碰文件系统。
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("ks_datadir_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("建临时目录");
+        d
+    }
+
+    /// 所有用例都打**纯判定函数** `decide_data_dir`，不碰 cwd。
+    ///
+    /// 【为何刻意避开 `set_current_dir`】那是进程全局状态，而 cargo 并行跑用例。
+    /// 第一版用它构造场景，结果两条用例单独跑失败、一起跑反而"通过"——它们恰好
+    /// 互相把 cwd 改成了对方需要的样子。那种绿完全是巧合，且掩盖了真实失败。
+    /// 把文件系统探测的结果作为参数传进来，每条用例就都是确定的。
+
+    /// **核心修复**：默认值 + 已知 config 位置 + 旧位置不存在 → 落到 config 同级。
+    ///
+    /// 这一条就是生产事故的修复本身：容器里 config 在 `/app/config/`，
+    /// 于是数据目录变成 `/app/config/data/usage`（bind mount，必然可写），
+    /// 而不是不可写的 `/app/data/usage`。
+    #[test]
+    fn default_lands_next_to_the_config_file() {
+        let cfg = PathBuf::from("/app/config/config.json");
+        let got = decide_data_dir(DEFAULT_USAGE_DATA_DIR, Some(&cfg), false);
+        assert_eq!(
+            got,
+            PathBuf::from("/app/config/data/usage"),
+            "默认值必须落到 config 同级；否则容器里就是不可写的 /app/data/usage"
+        );
+    }
+
+    /// **旧位置已存在则沿用，不搬迁。**
+    ///
+    /// 存量 `portal.db` 里有用户、余额、审计。静默换路径的表现是「数据一夜蒸发」——
+    /// 服务照常启动、库自动新建，没有任何报错，等用户反馈登录不上才发现。
+    ///
+    /// 与上一条唯一的差别就是 `legacy_exists`，这样"旧位置优先"是被真正验证的，
+    /// 而不是靠环境凑巧。
+    #[test]
+    fn preexisting_legacy_dir_wins_over_relocation() {
+        let cfg = PathBuf::from("/app/config/config.json");
+        let got = decide_data_dir(DEFAULT_USAGE_DATA_DIR, Some(&cfg), true);
+        assert_eq!(
+            got,
+            Path::new(DEFAULT_USAGE_DATA_DIR),
+            "旧位置已存在时必须沿用；搬迁会让存量用户/积分/审计凭空消失"
+        );
+    }
+
+    /// 用户显式配置过的路径**绝不劫持**——绝对路径。
+    #[test]
+    fn explicit_absolute_path_is_never_hijacked() {
+        let cfg = PathBuf::from("/app/config/config.json");
+        for legacy in [false, true] {
+            let got = decide_data_dir("/var/lib/kiro/usage", Some(&cfg), legacy);
+            assert_eq!(got, PathBuf::from("/var/lib/kiro/usage"));
+        }
+    }
+
+    /// 用户显式配置过的**相对**路径也不劫持。
+    ///
+    /// 【为何单列一条】只测绝对路径的话，一个「凡相对路径都往 config 目录拼」的
+    /// 实现会全绿——而那会把用户写的 `my-data/` 悄悄搬到别处。
+    #[test]
+    fn explicit_relative_path_is_never_hijacked() {
+        let cfg = PathBuf::from("/app/config/config.json");
+        for legacy in [false, true] {
+            let got = decide_data_dir("my-usage-dir", Some(&cfg), legacy);
+            assert_eq!(got, PathBuf::from("my-usage-dir"));
+        }
+    }
+
+    /// config 路径没有目录部分（裸 `config.json`）时不能拼出个怪路径。
+    ///
+    /// `Path::new("config.json").parent()` 返回 `Some("")`。在 Unix 上
+    /// `Path::new("").join("data/usage")` 恰好等于 `"data/usage"`，所以结果与
+    /// 兜底分支相同——这条用例钉的是「结果正确」，不是「走了哪个分支」。
+    #[test]
+    fn bare_config_filename_does_not_produce_a_bogus_join() {
+        let got = decide_data_dir(
+            DEFAULT_USAGE_DATA_DIR,
+            Some(Path::new("config.json")),
+            false,
+        );
+        assert_eq!(got, Path::new(DEFAULT_USAGE_DATA_DIR));
+    }
+
+    /// 不知道 config 在哪时退回原语义（相对 cwd），不 panic、不拼出怪路径。
+    #[test]
+    fn without_config_path_it_falls_back_to_the_old_behavior() {
+        let got = decide_data_dir(DEFAULT_USAGE_DATA_DIR, None, false);
+        #[cfg(not(windows))]
+        assert_eq!(got, Path::new(DEFAULT_USAGE_DATA_DIR));
+        #[cfg(windows)]
+        assert!(got.ends_with("data/usage") || got.ends_with("data\\usage"));
+    }
+
+    /// 判定是**纯**的：同样输入任意多次给同样答案，且绝不建目录。
+    ///
+    /// 建目录是调用方的事。若哪天有人把 `create_dir_all` 挪进解析函数，
+    /// 第一次调用会走「config 同级」、第二次因目录已存在而走「旧位置」——
+    /// 两个调用点（用量管道与 portal）于是解析到不同目录，各写各的库。
+    #[test]
+    fn decision_is_pure_and_creates_nothing() {
+        let cfg = PathBuf::from("/app/config/config.json");
+        let a = decide_data_dir(DEFAULT_USAGE_DATA_DIR, Some(&cfg), false);
+        let b = decide_data_dir(DEFAULT_USAGE_DATA_DIR, Some(&cfg), false);
+        assert_eq!(a, b, "两次判定结果不同：函数不纯");
+        assert!(
+            !a.exists(),
+            "判定函数不该建目录——建目录混进来会让上面那条分支切换悄悄发生"
+        );
+    }
+
+    /// 三个调用点（用量管道 / portal / admin 存储统计）必须解析到**同一个**目录。
+    ///
+    /// 【为何这条最要紧】`admin::service` 原先直接用原始相对值，与真实落盘位置
+    /// 不一致：生产 `storage/stats` 报 `path: "data/usage"` 而库实际在别处。
+    /// 而「存储清理」是个**会删文件**的功能，指向错目录是要出事的。
+    #[test]
+    fn every_call_site_resolves_to_one_place() {
+        let cfg = PathBuf::from("/app/config/config.json");
+        for legacy in [false, true] {
+            let usage = decide_data_dir(DEFAULT_USAGE_DATA_DIR, Some(&cfg), legacy);
+            let portal = decide_data_dir(DEFAULT_USAGE_DATA_DIR, Some(&cfg), legacy);
+            let admin = decide_data_dir(DEFAULT_USAGE_DATA_DIR, Some(&cfg), legacy);
+            assert_eq!(usage, portal, "用量管道与 portal 解析不一致");
+            assert_eq!(portal, admin, "portal 与 admin 存储统计解析不一致");
+        }
+    }
+
+    /// **接线测试**：`resolve_data_dir_for` 必须真的去探测文件系统，并把结果
+    /// 交给 [`decide_data_dir`]。
+    ///
+    /// 【为何单独一条】上面所有用例测的都是纯判定函数，把 `legacy_exists` 当输入喂进去。
+    /// 那些用例**完全无法发现**「探测那一行被写成了恒 `false`」——判定逻辑仍然全对，
+    /// 只是没人告诉它真相。后果正是这次要修的事故的镜像：存量 `data/usage` 明明在，
+    /// 却被判定成不存在，于是数据目录搬到别处、存量库凭空消失。变异测试（D9）证实了
+    /// 这个盲区：把探测改成恒假，8 条用例全绿。
+    ///
+    /// 【为何要动 cwd，以及为何这样是安全的】「旧位置」的语义就是**相对 cwd** 的
+    /// `data/usage`，不动 cwd 就无法构造「它存在」这个场景。本用例是整个测试套件里
+    /// 唯一调用 `resolve_data_dir_for`（唯一读 cwd）的地方，且用一把进程级锁串行化，
+    /// 所以不会重演「两条用例互相改 cwd、假装通过」那一幕。
+    #[test]
+    fn the_filesystem_probe_is_actually_wired_up() {
+        use std::sync::Mutex;
+        static CWD_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir = tmp("wiring");
+        let prev = std::env::current_dir().expect("读 cwd");
+        std::env::set_current_dir(&dir).expect("切 cwd");
+
+        // cwd 下不存在 data/usage → 应落到 config 同级。
+        let cfg = dir.join("cfgdir").join("config.json");
+        let without = resolve_data_dir_for(DEFAULT_USAGE_DATA_DIR, Some(&cfg));
+
+        // 建出旧位置 → 同样的输入必须改变答案，这就证明探测被读到了。
+        std::fs::create_dir_all(DEFAULT_USAGE_DATA_DIR).expect("建旧目录");
+        let with = resolve_data_dir_for(DEFAULT_USAGE_DATA_DIR, Some(&cfg));
+
+        std::env::set_current_dir(prev).expect("恢复 cwd");
+
+        assert_eq!(
+            without,
+            dir.join("cfgdir").join(DEFAULT_USAGE_DATA_DIR),
+            "旧位置不存在时应落到 config 同级"
+        );
+        assert_eq!(
+            with,
+            Path::new(DEFAULT_USAGE_DATA_DIR),
+            "旧位置存在时必须沿用它——探测结果没有被传给判定函数"
+        );
+        assert_ne!(
+            without, with,
+            "两种文件系统状态给出同一答案：探测那一行是死的（恒 true 或恒 false）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

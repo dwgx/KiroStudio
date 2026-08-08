@@ -347,27 +347,21 @@ pub(crate) fn extract_thinking_from_complete_text(text: &str) -> (Option<String>
     let after_open = &text[start_pos + "<thinking>".len()..];
 
     // 查找结束标签：优先匹配带 \n\n 后缀的，退而使用末尾匹配
-    let (thinking_raw, text_after) =
-        if let Some(end_pos) = find_real_thinking_end_tag(after_open) {
-            (
-                &after_open[..end_pos],
-                &after_open[end_pos + "</thinking>\n\n".len()..],
-            )
-        } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
-            let after_tag = end_pos + "</thinking>".len();
-            (
-                &after_open[..end_pos],
-                after_open[after_tag..].trim_start(),
-            )
-        } else {
-            // 找不到有效的结束标签，不做提取
-            return (None, text.to_string());
-        };
+    let (thinking_raw, text_after) = if let Some(end_pos) = find_real_thinking_end_tag(after_open) {
+        (
+            &after_open[..end_pos],
+            &after_open[end_pos + "</thinking>\n\n".len()..],
+        )
+    } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
+        let after_tag = end_pos + "</thinking>".len();
+        (&after_open[..end_pos], after_open[after_tag..].trim_start())
+    } else {
+        // 找不到有效的结束标签，不做提取
+        return (None, text.to_string());
+    };
 
     // 剥离开头的换行符（与流式处理一致：模型输出 <thinking>\n）
-    let thinking_content = thinking_raw
-        .strip_prefix('\n')
-        .unwrap_or(thinking_raw);
+    let thinking_content = thinking_raw.strip_prefix('\n').unwrap_or(thinking_raw);
 
     // 组装剩余文本：跳过纯空白的 before 部分
     let mut remaining = String::new();
@@ -663,8 +657,7 @@ impl SseStateManager {
             if let Some(cache_usage) = cache_usage {
                 usage_json["cache_creation_input_tokens"] =
                     json!(cache_usage.cache_creation_input_tokens);
-                usage_json["cache_read_input_tokens"] =
-                    json!(cache_usage.cache_read_input_tokens);
+                usage_json["cache_read_input_tokens"] = json!(cache_usage.cache_read_input_tokens);
                 usage_json["cache_creation"] = json!({
                     "ephemeral_5m_input_tokens": cache_usage.cache_creation_5m_input_tokens,
                     "ephemeral_1h_input_tokens": cache_usage.cache_creation_1h_input_tokens
@@ -712,6 +705,8 @@ pub struct ResolvedUsage {
     pub cache_read_tokens: i32,
     /// 本次新建缓存写入的 tokens（无缓存记账时为 0）
     pub cache_creation_tokens: i32,
+    /// 本次是否实际执行过严格缓存探针；用于运维命中率的正确分母。
+    pub cache_observed: bool,
 }
 
 pub struct StreamContext {
@@ -750,6 +745,8 @@ pub struct StreamContext {
     pub in_thinking_block: bool,
     /// thinking 块是否已提取完成
     pub thinking_extracted: bool,
+    /// thinking 块累计字符数（用于 debug 日志）
+    thinking_chars_total: usize,
     /// thinking 块索引
     pub thinking_block_index: Option<i32>,
     /// 文本块索引（thinking 启用时动态分配）
@@ -819,7 +816,10 @@ struct StripHit {
 
 impl StripHit {
     fn none() -> Self {
-        StripHit { stripped: false, standalone: false }
+        StripHit {
+            stripped: false,
+            standalone: false,
+        }
     }
 }
 
@@ -835,7 +835,13 @@ impl StreamContext {
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
     ) -> Self {
-        Self::new_full(model, input_tokens, thinking_enabled, tool_name_map, std::collections::HashSet::new())
+        Self::new_full(
+            model,
+            input_tokens,
+            thinking_enabled,
+            tool_name_map,
+            std::collections::HashSet::new(),
+        )
     }
 
     /// 完整构造:额外接 known_tool_names(文本化 invoke 重组的工具名硬护栏)。
@@ -863,6 +869,7 @@ impl StreamContext {
             thinking_buffer: String::new(),
             in_thinking_block: false,
             thinking_extracted: false,
+            thinking_chars_total: 0,
             thinking_block_index: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
@@ -978,9 +985,8 @@ impl StreamContext {
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
                 let window_size = get_context_window_size(&self.model);
-                let actual_input_tokens = (context_usage.context_usage_percentage
-                    * (window_size as f64)
-                    / 100.0) as i32;
+                let actual_input_tokens =
+                    (context_usage.context_usage_percentage * (window_size as f64) / 100.0) as i32;
                 self.context_input_tokens = Some(actual_input_tokens);
                 // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                 if context_usage.context_usage_percentage >= 100.0 {
@@ -1018,13 +1024,8 @@ impl StreamContext {
             }
             Event::Metering(metering) => {
                 // 记录上游返回的真实 credit 消耗量（累加，兼容单请求多次计费事件）
-                self.credits_used =
-                    Some(self.credits_used.unwrap_or(0.0) + metering.usage);
-                tracing::debug!(
-                    "收到 meteringEvent: {} {}",
-                    metering.usage,
-                    metering.unit
-                );
+                self.credits_used = Some(self.credits_used.unwrap_or(0.0) + metering.usage);
+                tracing::debug!("收到 meteringEvent: {} {}", metering.usage, metering.unit);
                 Vec::new()
             }
             Event::Exception {
@@ -1066,11 +1067,15 @@ impl StreamContext {
             input_tokens: self.context_input_tokens.unwrap_or(self.input_tokens),
             output_tokens: self.output_tokens,
             credits_used: self.credits_used,
-            cache_read_tokens: self.cache_usage.map(|c| c.cache_read_input_tokens).unwrap_or(0),
+            cache_read_tokens: self
+                .cache_usage
+                .map(|c| c.cache_read_input_tokens)
+                .unwrap_or(0),
             cache_creation_tokens: self
                 .cache_usage
                 .map(|c| c.cache_creation_input_tokens)
                 .unwrap_or(0),
+            cache_observed: self.cache_usage.is_some(),
         }
     }
 
@@ -1082,6 +1087,14 @@ impl StreamContext {
     /// 用量记账应采用的最终结果分类（去掉硬编码 Success，改读真实完成状态）
     pub fn completion_outcome(&self) -> RequestOutcome {
         self.completion.outcome()
+    }
+
+    /// 是否收到上游的 contextUsageEvent。
+    ///
+    /// 严格缓存账本只在该事件存在时提交：仅有 HTTP 2xx 或空流不足以证明请求已被
+    /// Kiro 完整处理。宁可漏记一次可复用前缀，也不让半截响应建立假缓存。
+    pub fn has_context_usage(&self) -> bool {
+        self.context_input_tokens.is_some()
     }
 
     /// 是否已向客户端内联发过 SSE error 事件（收尾据此避免重复补发）
@@ -1131,7 +1144,8 @@ impl StreamContext {
     fn dsml_filter_applicable(&self) -> bool {
         let m = self.model.to_ascii_lowercase();
         // Claude 系明确排除(最主力路径,零风险优先)。
-        if m.contains("claude") || m.contains("opus") || m.contains("sonnet") || m.contains("haiku") {
+        if m.contains("claude") || m.contains("opus") || m.contains("sonnet") || m.contains("haiku")
+        {
             return false;
         }
         m.contains("deepseek")
@@ -1185,7 +1199,7 @@ impl StreamContext {
                     if let Some(rel_gt) = closed {
                         i += rel_gt + 1; // 完整标记 `<｜…>` 整段丢弃
                         continue;
-    } else {
+                    } else {
                         // 已**确认是 DSML/tool 关键字标记**但无 `>` 闭合:DeepSeek 的 `<｜DSML｜function_calls`
                         // 这类标记本就不以 `>` 收尾、以后续(转成真 toolUseEvent 帧)为界,文本流里到此即断。
                         // 它是标记噪音**不是正文**——丢弃本 chunk 从 `<｜` 起的余下全部,标记 tail 为
@@ -1254,8 +1268,9 @@ impl StreamContext {
     /// 及 course/count/care/card/call 粘 CJK。**注意:此现象发生在 Claude/opus 侧,故清洗必须对
     /// Claude 生效**(不能像 DSML 那样门控排除 Claude,否则正好漏掉主战场)。
     /// 删除死条目 `coursecount`(被 `course` 前缀遮蔽,strip_prefix 顺序遍历永不可达)。
-    const LEAKED_CONTROL_TOKENS: &'static [&'static str] =
-        &["court", "course", "count", "care", "card", "call", "課", "课"];
+    const LEAKED_CONTROL_TOKENS: &'static [&'static str] = &[
+        "court", "course", "count", "care", "card", "call", "課", "课",
+    ];
 
     /// 判断字符是否为「泄漏粘连」信号:CJK 表意文字 或 全角标点/字符(U+3000..U+303F、U+FF00..U+FFEF、
     /// U+4E00..U+9FFF 等)。**收严关键**:此前用「非空格非小写即剥」过宽,把 `count: 42`(冒号)、
@@ -1316,7 +1331,13 @@ impl StreamContext {
         for &tok in Self::LEAK_STANDALONE_TOKENS {
             if trimmed == tok {
                 // 保留行尾换行(维持行结构),只把词本身剥掉。standalone=true(saturation 信号)。
-                return (line[tok.len()..].to_string(), StripHit { stripped: true, standalone: true });
+                return (
+                    line[tok.len()..].to_string(),
+                    StripHit {
+                        stripped: true,
+                        standalone: true,
+                    },
+                );
             }
         }
         for &tok in Self::LEAKED_CONTROL_TOKENS {
@@ -1327,7 +1348,13 @@ impl StreamContext {
                     None => return (line.to_string(), StripHit::none()), // 行尾就是这个词→ 保守不剥。
                     Some(c) => {
                         if Self::is_leak_glue_char(c) {
-                            return (rest.to_string(), StripHit { stripped: true, standalone: false }); // CJK/全角粘连 → 剥。
+                            return (
+                                rest.to_string(),
+                                StripHit {
+                                    stripped: true,
+                                    standalone: false,
+                                },
+                            ); // CJK/全角粘连 → 剥。
                         }
                         return (line.to_string(), StripHit::none()); // 其余→ 正常英文,不剥。
                     }
@@ -1362,7 +1389,11 @@ impl StreamContext {
         // 连计数都没进,导致线上全 0 无法区分"没泄漏"还是"泄漏了没检测到"。这里在**清洗前**扫原始
         // content,按形态分类计数(独占 stray 行 / 句中紧贴 CJK 的 stray 词),供运维页看真机泄漏形态,
         // 再据此决定要不要开保守清洗。开销:仅在 content 含已知 stray 词时才细扫(快路径先 contains)。
-        observe_stray_leak_forms(content, &mut self.stray_standalone_seen, &mut self.stray_inline_seen);
+        observe_stray_leak_forms(
+            content,
+            &mut self.stray_standalone_seen,
+            &mut self.stray_inline_seen,
+        );
         // 先剥离 DeepSeek DSML 工具协议标记(跨 chunk 安全),再走后续文本处理。
         let cleaned = self.strip_dsml_markers(content);
         // 泄漏控制 token 清洗（开关默认 true，见 handlers::tool_clean_leaked_tokens_enabled）：
@@ -1502,7 +1533,12 @@ impl StreamContext {
 
                     // 结束 thinking 块
                     self.in_thinking_block = false;
+                    self.thinking_chars_total += end_pos;
                     self.thinking_extracted = true;
+                    tracing::debug!(
+                        thinking_chars = self.thinking_chars_total,
+                        "流式响应 thinking 块完成"
+                    );
 
                     // 发送空的 thinking_delta 事件，然后发送 content_block_stop 事件
                     if let Some(thinking_index) = self.thinking_block_index {
@@ -1543,6 +1579,7 @@ impl StreamContext {
                             }
                         }
                         self.thinking_buffer = self.thinking_buffer[safe_len..].to_string();
+                        self.thinking_chars_total += safe_len;
                     }
                     break;
                 }
@@ -1646,7 +1683,8 @@ impl StreamContext {
         crate::common::recovery_metrics::bump_reclaimed_invoke();
         let block_index = self.state_manager.next_block_index();
         let tool_use_id = format!("toolu_{}", Uuid::new_v4().to_string().replace('-', ""));
-        self.tool_block_indices.insert(tool_use_id.clone(), block_index);
+        self.tool_block_indices
+            .insert(tool_use_id.clone(), block_index);
         let name = self
             .tool_name_map
             .get(&parsed_name)
@@ -1716,7 +1754,9 @@ impl StreamContext {
         let mut offset = 0usize;
         for segment in text.split_inclusive('\n') {
             let line = segment.trim();
-            if !line.is_empty() && (STRAY_INVOKE_TOKENS.contains(&line) || is_short_flood_token(line)) {
+            if !line.is_empty()
+                && (STRAY_INVOKE_TOKENS.contains(&line) || is_short_flood_token(line))
+            {
                 if line == self.stray_repeat_last {
                     self.stray_repeat_run += 1;
                 } else {
@@ -1757,26 +1797,39 @@ impl StreamContext {
                     Some(end) => {
                         // 完整块:过四道门。
                         let before = strip_trailing_stray_tokens(&buf[..start]).to_string();
-                        let fence_after_before =
-                            fence_open_after(self.code_fence_open, &self.fence_scan_partial, &before);
+                        let fence_after_before = fence_open_after(
+                            self.code_fence_open,
+                            &self.fence_scan_partial,
+                            &before,
+                        );
                         let parsed = parse_invoke_block(&buf[start..end]);
                         let name_known = parsed
                             .as_ref()
                             .map(|(n, _)| self.known_tool_names.contains(n))
                             .unwrap_or(false);
-                        if invoke_looks_like_real_leak(&before) && !fence_after_before && name_known {
+                        if invoke_looks_like_real_leak(&before) && !fence_after_before && name_known
+                        {
                             // 真泄漏:吐块前文本(剥掉尾部独立 stray 行)+ 合成 tool_use。
                             if !before.is_empty() {
                                 // before 的围栏状态要并入(它会作为文本吐,推进围栏奇偶)。
-                                advance_code_fence_state(&mut self.code_fence_open, &mut self.fence_scan_partial, &before);
+                                advance_code_fence_state(
+                                    &mut self.code_fence_open,
+                                    &mut self.fence_scan_partial,
+                                    &before,
+                                );
                                 events.extend(self.emit_text_delta_guarded(&before));
                             }
-                            let (name, input_json) = parsed.expect("parsed is Some when name_known");
+                            let (name, input_json) =
+                                parsed.expect("parsed is Some when name_known");
                             events.extend(self.synthesize_tool_use(name, input_json));
                         } else {
                             // 不捞回(句中/围栏内/工具名未知/解析失败)→ 整段当普通文本吐。
                             let seg = buf[..end].to_string();
-                            advance_code_fence_state(&mut self.code_fence_open, &mut self.fence_scan_partial, &seg);
+                            advance_code_fence_state(
+                                &mut self.code_fence_open,
+                                &mut self.fence_scan_partial,
+                                &seg,
+                            );
                             events.extend(self.emit_text_delta_guarded(&seg));
                         }
                         buf = buf[end..].to_string();
@@ -1785,12 +1838,19 @@ impl StreamContext {
                     None => {
                         // 半块(未闭合)。行首判定:非行首/围栏内当文本直接吐,不 hold。
                         let before = strip_trailing_stray_tokens(&buf[..start]).to_string();
-                        let fence_after_before =
-                            fence_open_after(self.code_fence_open, &self.fence_scan_partial, &before);
+                        let fence_after_before = fence_open_after(
+                            self.code_fence_open,
+                            &self.fence_scan_partial,
+                            &before,
+                        );
                         if !invoke_looks_like_real_leak(&before) || fence_after_before {
                             if !buf.is_empty() {
                                 let seg = buf.clone();
-                                advance_code_fence_state(&mut self.code_fence_open, &mut self.fence_scan_partial, &seg);
+                                advance_code_fence_state(
+                                    &mut self.code_fence_open,
+                                    &mut self.fence_scan_partial,
+                                    &seg,
+                                );
                                 events.extend(self.emit_text_delta_guarded(&seg));
                             }
                             break;
@@ -1798,7 +1858,11 @@ impl StreamContext {
                         // 行首未闭合块:吐 start 前文本,保留 start.. 等闭合。
                         if start > 0 {
                             let seg = buf[..start].to_string();
-                            advance_code_fence_state(&mut self.code_fence_open, &mut self.fence_scan_partial, &seg);
+                            advance_code_fence_state(
+                                &mut self.code_fence_open,
+                                &mut self.fence_scan_partial,
+                                &seg,
+                            );
                             events.extend(self.emit_text_delta_guarded(&seg));
                         }
                         let remainder = buf[start..].to_string();
@@ -1820,7 +1884,11 @@ impl StreamContext {
                     if flush {
                         if !buf.is_empty() {
                             let seg = buf.clone();
-                            advance_code_fence_state(&mut self.code_fence_open, &mut self.fence_scan_partial, &seg);
+                            advance_code_fence_state(
+                                &mut self.code_fence_open,
+                                &mut self.fence_scan_partial,
+                                &seg,
+                            );
                             events.extend(self.emit_text_delta_guarded(&seg));
                         }
                     } else {
@@ -1828,7 +1896,11 @@ impl StreamContext {
                         let emit_len = buf.len() - keep;
                         if emit_len > 0 {
                             let seg = buf[..emit_len].to_string();
-                            advance_code_fence_state(&mut self.code_fence_open, &mut self.fence_scan_partial, &seg);
+                            advance_code_fence_state(
+                                &mut self.code_fence_open,
+                                &mut self.fence_scan_partial,
+                                &seg,
+                            );
                             events.extend(self.emit_text_delta_guarded(&seg));
                         }
                         self.invoke_sniff_buffer = buf[emit_len..].to_string();
@@ -1908,7 +1980,12 @@ impl StreamContext {
 
                 // 结束 thinking 块
                 self.in_thinking_block = false;
+                self.thinking_chars_total += end_pos;
                 self.thinking_extracted = true;
+                tracing::debug!(
+                    thinking_chars = self.thinking_chars_total,
+                    "流式响应 thinking 块完成"
+                );
 
                 if let Some(thinking_index) = self.thinking_block_index {
                     // 先发送空的 thinking_delta
@@ -1992,7 +2069,10 @@ impl StreamContext {
         //   关键：非前缀双完整对象不再被无脑 append 成 `}{` 粘连非法 JSON（Invalid tool parameters 类型 C）。
         if !tool_use.input.is_empty() {
             let model = self.model.clone();
-            let buf = self.tool_input_sent.entry(tool_use.tool_use_id.clone()).or_default();
+            let buf = self
+                .tool_input_sent
+                .entry(tool_use.tool_use_id.clone())
+                .or_default();
             // 帧探针（KIRO_TOOL_TRACE）：抓上游逐帧原文 + 合并轨迹，定性 Invalid tool parameters 真因。
             let buf_before = buf.clone();
             *buf = merge_tool_input(buf, &tool_use.input);
@@ -2046,7 +2126,12 @@ impl StreamContext {
             } else {
                 "-"
             };
+            // model 字段是排查刚需：同一网关同时服务多客户端（Claude Code 打 claude-*、
+            // Codex 打 gpt-*），只有 block_index/defect 时无法判断是哪个模型在截断，
+            // 也就无法回答「是模型侧问题还是某条链路问题」。完整参数全文仍只在
+            // KIRO_TOOL_TRACE 下打（见下方 trace 分支），此处只加低成本的标识字段。
             tracing::warn!(
+                model = %self.model,
                 block_index,
                 defect = defect.as_str(),
                 subkind,
@@ -2075,6 +2160,7 @@ impl StreamContext {
             if super::handlers::tool_repair_json_enabled() {
                 if let Some(repaired) = repair_tool_json(&assembled) {
                     tracing::info!(
+                        model = %self.model,
                         block_index,
                         orig_len = assembled.len(),
                         repaired_len = repaired.len(),
@@ -2091,62 +2177,73 @@ impl StreamContext {
                 // 修不好 → 落入下方缓解②/③/⑤（与不开修复层等价，最坏情况不劣化）。
             }
             // 若 repair 已把 assembled 修成合法,则跳过缓解②/③/⑤(它们只服务"仍非法"的残留)。
-            let repaired_ok =
-                serde_json::from_str::<serde_json::Value>(&assembled).is_ok();
+            let repaired_ok = serde_json::from_str::<serde_json::Value>(&assembled).is_ok();
             if !repaired_ok {
-            // 缓解⑤：截断跨轮恢复（开关默认关）。只在**修复层已启用且也补不回**（修复层开时走到这里
-            // = 上面 repair 已返回 None）且归因为真截断（Truncated / TruncatedAndIllegal）时触发：
-            // 不发不完整的 partial_json
-            // （半截参数会被客户端当完整调用执行，比整轮失败更危险），改置失败态 + 收尾补发 SSE error，
-            // 让客户端退避后重试整个请求。绝不 report_failure 连坐号（工具截断≠号坏，隔离铁律）。
-            // 非截断的畸形（IllegalChars/Malformed）不归本开关管，仍走②/③按原语义处理。
-            if should_recover_truncation(
-                defect,
-                super::handlers::tool_truncation_recovery_enabled(),
-                super::handlers::tool_repair_json_enabled(),
-            ) {
-                tracing::warn!(
-                    block_index,
-                    defect = defect.as_str(),
-                    "tool_use 参数真截断且修复层补不回：置失败态让客户端重试整轮（截断跨轮恢复）"
-                );
-                if self.completion.is_ok() {
-                    self.completion = CompletionStatus::UpstreamError {
+                // 缓解⑤：截断跨轮恢复（开关默认关）。只在**修复层已启用且也补不回**（修复层开时走到这里
+                // = 上面 repair 已返回 None）且归因为真截断（Truncated / TruncatedAndIllegal）时触发：
+                // 不发不完整的 partial_json
+                // （半截参数会被客户端当完整调用执行，比整轮失败更危险），改置失败态 + 收尾补发 SSE error，
+                // 让客户端退避后重试整个请求。绝不 report_failure 连坐号（工具截断≠号坏，隔离铁律）。
+                // 非截断的畸形（IllegalChars/Malformed）不归本开关管，仍走②/③按原语义处理。
+                if should_recover_truncation(
+                    defect,
+                    super::handlers::tool_truncation_recovery_enabled(),
+                    super::handlers::tool_repair_json_enabled(),
+                ) {
+                    tracing::warn!(
+                        model = %self.model,
+                        block_index,
+                        defect = defect.as_str(),
+                        "tool_use 参数真截断且修复层补不回：置失败态让客户端重试整轮（截断跨轮恢复）"
+                    );
+                    if self.completion.is_ok() {
+                        self.completion = CompletionStatus::UpstreamError {
                         code: "INVALID_TOOL_INPUT".to_string(),
                         message: "工具调用参数被上游截断（缺整段值），请重试；如反复触发可拆小该调用。"
                             .to_string(),
                     };
+                    }
+                    // 不发这条截断的坏 partial_json（收尾兜底据失败态补发 SSE error）。
+                    return Vec::new();
                 }
-                // 不发这条截断的坏 partial_json（收尾兜底据失败态补发 SSE error）。
-                return Vec::new();
-            }
-            // 缓解②：流式失败态对齐（开关默认关）。开启时把流式也置 UpstreamError{INVALID_TOOL_INPUT}
-            // 失败态，与非流式对齐（收尾记 ServerError、不污染成功率、收尾兜底会补发 SSE error）。
-            // 幂等：只在首个失败落定。绝不 report_failure 连坐号（工具非法≠号坏，隔离铁律）。
-            if super::handlers::tool_stream_align_failure_enabled() && self.completion.is_ok() {
-                self.completion = CompletionStatus::UpstreamError {
-                    code: "INVALID_TOOL_INPUT".to_string(),
-                    message: "工具调用参数非合法 JSON（模型侧生成异常）".to_string(),
-                };
-            }
-            // 缓解③：如实暴露错误。**不发坏 JSON 的判据绑定"失败态已置"（completion.is_err），
-            // 而非③开关本身**——消除②③拆开的两个矛盾组合（验证报告缺陷2/3）：
-            //   ·②开③关(旧):置了失败态却 fall-through 发坏 JSON → 记账失败却发坏 JSON,自相矛盾;
-            //   ·②关③开(旧):completion 仍 Ok 却 return 吞掉 → 记成功但客户端拿 input:{} 当成功执行(更危险)。
-            // 新语义:只要②或⑤已置失败态(completion.is_err)→ 一律不发坏 partial_json(收尾据失败态补 SSE
-            // error);completion 仍 Ok(②③都关)→ 保持现状原样发出交客户端(绝不静默吞成空参)。
-            // ③开关现语义 = 是否额外"主动置失败态并暴露"(见下),与"不发坏 JSON"由失败态统一裁决解耦。
-            if super::handlers::tool_expose_error_to_client_enabled() && self.completion.is_ok() {
-                // ③开但②没置态(如②关):③自己置失败态,保证"暴露错误"语义成立(不发坏 JSON + 收尾补 error)。
-                self.completion = CompletionStatus::UpstreamError {
-                    code: "INVALID_TOOL_INPUT".to_string(),
-                    message: "工具调用参数非合法 JSON（模型侧生成异常）".to_string(),
-                };
-            }
-            // 统一出口:失败态已置(②/③/⑤任一)→ 不发坏 JSON。这一条兜住所有开关组合的自洽。
-            if !self.completion.is_ok() {
-                return Vec::new();
-            }
+                // 缓解②：流式失败态对齐（开关默认关）。开启时把流式也置 UpstreamError{INVALID_TOOL_INPUT}
+                // 失败态，与非流式对齐（收尾记 ServerError、不污染成功率、收尾兜底会补发 SSE error）。
+                // 幂等：只在首个失败落定。绝不 report_failure 连坐号（工具非法≠号坏，隔离铁律）。
+                if super::handlers::tool_stream_align_failure_enabled() && self.completion.is_ok() {
+                    self.completion = CompletionStatus::UpstreamError {
+                        code: "INVALID_TOOL_INPUT".to_string(),
+                        message: "工具调用参数非合法 JSON（模型侧生成异常）".to_string(),
+                    };
+                }
+                // 缓解③：如实暴露错误。**不发坏 JSON 的判据绑定"失败态已置"（completion.is_err），
+                // 而非③开关本身**——消除②③拆开的两个矛盾组合（验证报告缺陷2/3）：
+                //   ·②开③关(旧):置了失败态却 fall-through 发坏 JSON → 记账失败却发坏 JSON,自相矛盾;
+                //   ·②关③开(旧):completion 仍 Ok 却 return 吞掉 → 记成功但客户端拿 input:{} 当成功执行(更危险)。
+                // 新语义:只要②或⑤已置失败态(completion.is_err)→ 一律不发坏 partial_json(收尾据失败态补 SSE
+                // error);completion 仍 Ok(②③都关)→ 保持现状原样发出交客户端(绝不静默吞成空参)。
+                // ③开关现语义 = 是否额外"主动置失败态并暴露"(见下),与"不发坏 JSON"由失败态统一裁决解耦。
+                if super::handlers::tool_expose_error_to_client_enabled() && self.completion.is_ok()
+                {
+                    // ③开但②没置态(如②关):③自己置失败态,保证"暴露错误"语义成立(不发坏 JSON + 收尾补 error)。
+                    self.completion = CompletionStatus::UpstreamError {
+                        code: "INVALID_TOOL_INPUT".to_string(),
+                        message: "工具调用参数非合法 JSON（模型侧生成异常）".to_string(),
+                    };
+                }
+                // 统一出口:失败态已置(②/③/⑤任一)→ 不发坏 JSON。这一条兜住所有开关组合的自洽。
+                if !self.completion.is_ok() {
+                    // 可观测补齐：此前这里静默 return，日志只有上面那条"参数非合法 JSON"，
+                    // 看不出「所以坏参数没发给客户端、收尾会补 SSE error」——排查时容易误以为
+                    // 半截参数已经发出去了。这条把处置结果显式记下来（含 model 便于区分
+                    // GPT/Claude），与上面的归因告警配成一对。
+                    tracing::warn!(
+                        model = %self.model,
+                        block_index,
+                        defect = defect.as_str(),
+                        "tool_use 坏参数未下发（已置失败态，收尾补发 SSE error 让客户端重试）"
+                    );
+                    return Vec::new();
+                }
             } // end if !repaired_ok(修复成功则跳过②/③/⑤)
         }
         // 洞1:整包双重编码解包。走到这里 assembled 已是合法 JSON(原本合法 / 修复后)。若它其实是
@@ -2156,7 +2253,10 @@ impl StreamContext {
         // 而解包不改语义(只剥误加的一层字符串编码)、对合法 object/array 是安全 no-op(as_str 返回
         // None 即不动),与"修坏 JSON"是正交能力,应独立恒开。故移出开关无条件跑。
         if let Some(unwrapped) = unwrap_double_encoded(&assembled) {
-            tracing::info!(block_index, "tool_use 参数为双重编码,已解一层还原为 object/array");
+            tracing::info!(
+                block_index,
+                "tool_use 参数为双重编码,已解一层还原为 object/array"
+            );
             assembled = unwrapped;
         }
         self.state_manager
@@ -2226,7 +2326,12 @@ impl StreamContext {
                     let remaining = self.thinking_buffer[after_pos..].trim_start().to_string();
                     self.thinking_buffer.clear();
                     self.in_thinking_block = false;
+                    self.thinking_chars_total += end_pos;
                     self.thinking_extracted = true;
+                    tracing::debug!(
+                        thinking_chars = self.thinking_chars_total,
+                        "流式响应 thinking 块完成"
+                    );
                     if !remaining.is_empty() {
                         events.extend(self.create_text_delta_events(&remaining));
                     }
@@ -2383,8 +2488,13 @@ impl BufferedStreamContext {
         tool_name_map: HashMap<String, String>,
         known_tool_names: std::collections::HashSet<String>,
     ) -> Self {
-        let inner =
-            StreamContext::new_full(model, estimated_input_tokens, thinking_enabled, tool_name_map, known_tool_names);
+        let inner = StreamContext::new_full(
+            model,
+            estimated_input_tokens,
+            thinking_enabled,
+            tool_name_map,
+            known_tool_names,
+        );
         Self {
             inner,
             event_buffer: Vec::new(),
@@ -2399,10 +2509,7 @@ impl BufferedStreamContext {
     fn estimate_events_bytes(events: &[SseEvent]) -> usize {
         events
             .iter()
-            .map(|e| {
-                e.event.len()
-                    + serde_json::to_string(&e.data).map(|s| s.len()).unwrap_or(0)
-            })
+            .map(|e| e.event.len() + serde_json::to_string(&e.data).map(|s| s.len()).unwrap_or(0))
             .sum()
     }
 
@@ -2424,6 +2531,11 @@ impl BufferedStreamContext {
     /// 用量记账应采用的最终结果分类（透传，去硬编码 Success）
     pub fn completion_outcome(&self) -> RequestOutcome {
         self.inner.completion_outcome()
+    }
+
+    /// 是否收到上游的 contextUsageEvent（透传内部 StreamContext）。
+    pub fn has_context_usage(&self) -> bool {
+        self.inner.has_context_usage()
     }
 
     /// 是否已内联发过 SSE error 事件（透传）
@@ -3382,7 +3494,9 @@ const MAX_BUFFERED_EVENT_BYTES: usize = 64 * 1024 * 1024;
 const REPEAT_GUARD_TRIP_THRESHOLD: u32 = 32;
 
 /// stray 泄漏观测词表(与 clean 层 LEAKED_CONTROL_TOKENS 对齐,纯观测用)。
-const STRAY_OBSERVE_TOKENS: &[&str] = &["court", "course", "count", "care", "card", "call", "課", "课"];
+const STRAY_OBSERVE_TOKENS: &[&str] = &[
+    "court", "course", "count", "care", "card", "call", "課", "课",
+];
 
 /// 判断字符是否 CJK 表意文字(观测"stray 词紧贴 CJK"的判据,与 clean 层 is_leak_glue_char 同族)。
 fn is_cjk_ideograph(c: char) -> bool {
@@ -3413,7 +3527,10 @@ fn observe_stray_leak_forms(content: &str, standalone: &mut u32, inline: &mut u3
         while let Some(rel) = content[from..].find(*tok) {
             let start = from + rel;
             let end = start + tb.len();
-            let before_cjk = content[..start].chars().next_back().is_some_and(is_cjk_ideograph);
+            let before_cjk = content[..start]
+                .chars()
+                .next_back()
+                .is_some_and(is_cjk_ideograph);
             let after_cjk = content[end..].chars().next().is_some_and(is_cjk_ideograph);
             if before_cjk || after_cjk {
                 *inline = inline.saturating_add(1);
@@ -3489,7 +3606,10 @@ fn detect_structural_flood(text: &str) -> Option<usize> {
             let mut reps = 1usize;
             let mut k = i + tok_len;
             while k + tok_len <= n
-                && chars[k..k + tok_len].iter().map(|(_, c)| *c).eq(tok.iter().copied())
+                && chars[k..k + tok_len]
+                    .iter()
+                    .map(|(_, c)| *c)
+                    .eq(tok.iter().copied())
             {
                 reps += 1;
                 k += tok_len;
@@ -3633,21 +3753,40 @@ fn fence_open_after(open: bool, partial: &str, text: &str) -> bool {
     o
 }
 
-/// 计算缓冲区末尾“可能是部分 `<invoke` 开标签前缀”的字节数，需要保留等待更多内容
+/// 计算缓冲区末尾”可能是部分 `<invoke` 开标签前缀”的字节数，需要保留等待更多内容
 ///
 /// 例如缓冲区以 `<inv` / `<` / `<i` 结尾时，可能是被切碎的 invoke 开标签，
 /// 保留这段尾巴等下一个 chunk 拼齐，避免把半个标签当文本吐出去。
+///
+/// ⚠️ **安全上界**：真正的部分开标签（`<invoke` / `<invoke` 等）最多只有几十字节。
+/// 若从末尾最后一个 `<` 到缓冲区结尾的字节数超过此阈值，说明这个 `<` 只是正文里的普通
+/// `<`（中文散文的”a < b”、代码里的比较运算符等），**不是**未闭合的 invoke 开标签。
+/// 此时应把整段缓冲（含 `<`）当普通文本吐出去，而不是无限持有导致流停摆：
+///   1. `invoke_sniff_buffer` 一旦积压，下一轮 chunk 追加进来，lt=0，emit_len=0，
+///      没有任何输出，请求看起来挂死（客户端无增量输出 + 无界内存增长）；
+///   2. 根本触发路径：reclaim 开（默认）+ 请求带工具 + 模型输出含一个孤立 `<`，
+///      比如”条件 a < b 时触发”这样在中文段落里极为常见的表达式。
+/// 64 字节远超最长合法部分标签（`<parameter name=”` ≈ 18 字节含引号，
+/// 加最长的 antml: 前缀也不超过 32 字节），同时对真正被切碎的标签有充足余量。
 #[allow(dead_code)]
 fn partial_invoke_tag_suffix_len(buf: &str) -> usize {
+    /// 最长合法开标签前缀的安全上界（字节）。
+    /// `<parameter name=”` ≈ 23 字节，`<invoke` = 7 字节；64 字节极为保守。
+    /// 超过这个长度的”尾巴”一定不是被切碎的开标签，不应该再持有。
+    const MAX_PARTIAL_TAG_BYTES: usize = 64;
     // 任何形如 `<...`（最后一个 '<' 之后没有 '>'）的尾巴都可能是部分开标签
     if let Some(lt) = buf.rfind('<') {
         if !buf[lt..].contains('>') {
-            return buf.len() - lt;
+            let tail_len = buf.len() - lt;
+            // 安全上界：真正的部分开标签只有几十字节，超过则是正文中的普通 '<'，
+            // 不应持有（否则导致缓冲区无界增长 + 整条响应停摆）。
+            if tail_len <= MAX_PARTIAL_TAG_BYTES {
+                return tail_len;
+            }
         }
     }
     0
 }
-
 
 /// 检测文本片段里是否出现「文本化的工具调用标记」。
 /// 覆盖:Anthropic 工具调用语法 `<invoke`/`</invoke>`/`<parameter name=`(不论是否带 antml: 前缀),
@@ -3724,7 +3863,7 @@ fn trace_tool_frame(
 ///   2. buf 空             → frame
 ///   3. frame == buf       → buf 不变（重复终帧，不翻倍）
 ///   4. frame 以 buf 为前缀且更长 → frame（累积快照，取最新最全）
-///   5. buf 以 frame 为前缀（frame 更短） → buf 不变（丢弃迟到的旧短快照）
+///   5. buf 以 frame 为前缀（frame 更短）**且 buf 已完整** → buf 不变（丢弃迟到的旧短快照）
 ///   6. buf 与 frame 各自都是完整合法 JSON → frame（非前缀重写，只留最新完整对象，消灭 `}{` 粘连）
 ///   7. 否则               → buf + frame 追加（真增量碎片，还原完整内容）
 ///
@@ -3748,8 +3887,21 @@ pub(crate) fn merge_tool_input(buf: &str, frame: &str) -> String {
     if frame.len() > buf.len() && frame.starts_with(buf) {
         return frame.to_string();
     }
-    // 5. 迟到的旧短快照：缓冲以本帧为前缀（本帧更短）→ 保留更全的缓冲，丢弃本帧
-    if buf.len() > frame.len() && buf.starts_with(frame) {
+    // 5. 迟到的旧短快照：缓冲以本帧为前缀（本帧更短）→ 保留更全的缓冲，丢弃本帧。
+    //
+    // 【关键前提：buf 必须已是完整合法 JSON】——不加这个前提会丢真增量碎片（生产实证）：
+    // gpt-5.6-sol 逐 token 流式发 input，帧序列形如
+    //   `{"plan":[`、`{"`、`step`、`":"`、…
+    // 第 2 帧 `{"` 恰好是 buf `{"plan":[` 的前缀，旧实现据此判为"旧快照"直接丢弃，
+    // 拼装结果 `{"plan":[step":"…` —— 中间少了整段 `{"`，客户端 parse 失败报
+    // Invalid tool parameters；且归因层会把它误标成 `truncated`（看着像上游截断，
+    // 实则是网关自己丢帧），修复层也补不回（缺的是中间的结构字符，不是尾部）。
+    //
+    // 判据：**已完整的 JSON 对象无法再被增量续写**，故 buf 完整时，更短的前缀帧只可能是
+    // 迟到的旧快照（本规则原本要防的就是这个，见 test_merge_full_then_shorter_prefix_kept）；
+    // buf 尚不完整时，前缀匹配的短帧是真增量碎片，必须落到第 7 步追加。
+    // 另注：单一有序字节流上"更旧的快照后到"本就不可能，故收窄本规则不会放过真实乱序。
+    if buf.len() > frame.len() && buf.starts_with(frame) && is_complete_json(buf) {
         return buf.to_string();
     }
     // 6. 非前缀重写：缓冲与本帧各自都是完整合法 JSON → 只留最新完整对象（消灭 `}{` 粘连）
@@ -3807,7 +3959,10 @@ mod tests {
         let (name, input) = parse_invoke_block(&block).expect("应解析出 tool");
         assert_eq!(name, "write_file");
         let parsed: serde_json::Value = serde_json::from_str(&input).expect("input 应为合法 JSON");
-        assert_eq!(parsed["content"], value, "参数值应完整保留（含 < / 多行 / 中文）");
+        assert_eq!(
+            parsed["content"], value,
+            "参数值应完整保留（含 < / 多行 / 中文）"
+        );
     }
 
     #[test]
@@ -3880,7 +4035,10 @@ mod tests {
         assert_eq!(end, full.len());
 
         let unclosed = r#"<invoke name="x"><parameter name="c">ls"#;
-        assert!(find_invoke_block_end(unclosed, 0).is_none(), "未闭合块应返回 None");
+        assert!(
+            find_invoke_block_end(unclosed, 0).is_none(),
+            "未闭合块应返回 None"
+        );
     }
 
     #[test]
@@ -3888,7 +4046,10 @@ mod tests {
         // 🟢 连发 burst：A 紧跟 B，find_next_invoke_open 跳过 A 自身开标签，定位到 B
         let s = r#"<invoke name="a"><parameter name="x">1</parameter></invoke><invoke name="b"><parameter name="y">2</parameter></invoke>"#;
         let b_pos = find_next_invoke_open(s, 0).expect("应找到第二个块开标签");
-        assert_eq!(&s[b_pos..b_pos + "<invoke name=\"b\"".len()], "<invoke name=\"b\"");
+        assert_eq!(
+            &s[b_pos..b_pos + "<invoke name=\"b\"".len()],
+            "<invoke name=\"b\""
+        );
     }
 
     #[test]
@@ -3937,8 +4098,14 @@ mod tests {
 
     #[test]
     fn test_invoke_extract_name_attr() {
-        assert_eq!(extract_name_attr(r#"<invoke name="Bash">"#), Some("Bash".to_string()));
-        assert_eq!(extract_name_attr(r#"<parameter name="cmd">"#), Some("cmd".to_string()));
+        assert_eq!(
+            extract_name_attr(r#"<invoke name="Bash">"#),
+            Some("Bash".to_string())
+        );
+        assert_eq!(
+            extract_name_attr(r#"<parameter name="cmd">"#),
+            Some("cmd".to_string())
+        );
         assert_eq!(extract_name_attr("<invoke>"), None);
     }
 
@@ -3949,7 +4116,10 @@ mod tests {
         // 从第一个参数值区起找下一个参数开标签
         let first_val_start = body.find('>').unwrap() + 1;
         let next = find_next_param_open(body, first_val_start).expect("应找到第二个参数开标签");
-        assert_eq!(&body[next..next + "<parameter name=\"b\"".len()], "<parameter name=\"b\"");
+        assert_eq!(
+            &body[next..next + "<parameter name=\"b\"".len()],
+            "<parameter name=\"b\""
+        );
     }
 
     #[test]
@@ -3974,7 +4144,10 @@ mod tests {
     #[test]
     fn test_invoke_strip_trailing_stray_court_token() {
         // 🟢 KiroStudio 生产语料：court 是主要 stray token，应被剥
-        assert_eq!(strip_trailing_stray_tokens("先看结果。\ncourt"), "先看结果。\n");
+        assert_eq!(
+            strip_trailing_stray_tokens("先看结果。\ncourt"),
+            "先看结果。\n"
+        );
         assert_eq!(strip_trailing_stray_tokens("court"), "");
         // 多个连续 stray 行全部剥掉
         assert_eq!(strip_trailing_stray_tokens("正文\ncall\ncourt"), "正文\n");
@@ -4061,6 +4234,43 @@ mod tests {
     }
 
     #[test]
+    fn test_partial_invoke_tag_suffix_bounded_no_stream_stall() {
+        // ⭐流停摆回归(旧代码必失败):`<` 之后的尾巴一旦超过"最长可能的半个开标签",
+        // 就一定不是被切碎的 invoke 标签,而是正文里的普通 `<`(中文散文的"a < b"、
+        // 数学式、代码里的比较运算符)。旧代码无上限地把它全部 hold 住:
+        //   一旦这个 `<` 落到缓冲区首位,keep=buf.len()、emit_len=0 → 此后**整条响应
+        //   的所有文本都不再下发**,全部囤到流结束才 flush,且缓冲无界增长。
+        // 修复后超过 64 字节即判定"不是标签",返回 0 让正文正常吐出。
+
+        // 短尾巴(可能是真的半个标签)→ 仍然保留,行为不变。
+        assert_eq!(partial_invoke_tag_suffix_len("text<inv"), 4);
+        assert_eq!(partial_invoke_tag_suffix_len("text<parameter na"), 13);
+
+        // 长尾巴(正文里的普通 `<`)→ 必须返回 0(不 hold),否则流停摆。
+        let prose = format!("条件 a < b 时触发{}", "后面还有很多正文".repeat(20));
+        assert_eq!(
+            partial_invoke_tag_suffix_len(&prose),
+            0,
+            "正文中的普通 `<` 后跟大量文本时绝不能 hold(旧代码在此无界持有 → 整条流停摆)"
+        );
+
+        // 关键退化场景:`<` 恰好在缓冲区**首位**且后面全是正文。
+        // 旧代码此时 keep=len、emit_len=0 → 一个字节都不输出。
+        let stuck = format!("<{}", "x".repeat(500));
+        assert_eq!(
+            partial_invoke_tag_suffix_len(&stuck),
+            0,
+            "`<` 在首位且尾巴超长时必须返回 0,否则 emit_len=0 → 流永久停摆"
+        );
+
+        // 边界:恰好 64 字节的尾巴仍视为可能的标签;65 字节则不再 hold。
+        let at_limit = format!("<{}", "a".repeat(63)); // 尾巴 = 64 字节
+        assert_eq!(partial_invoke_tag_suffix_len(&at_limit), 64);
+        let over_limit = format!("<{}", "a".repeat(64)); // 尾巴 = 65 字节
+        assert_eq!(partial_invoke_tag_suffix_len(&over_limit), 0);
+    }
+
+    #[test]
     fn test_sse_event_format() {
         let event = SseEvent::new("message_start", json!({"type": "message_start"}));
         let sse_str = event.to_sse_string();
@@ -4079,7 +4289,10 @@ mod tests {
         // DeepSeek 工具协议标记应被整段剥离,正常文本保留。
         let mut ctx = mk_ctx();
         let out = ctx.strip_dsml_markers("先看目录。\n\n<｜DSML｜function_calls｜>后续");
-        assert_eq!(out, "先看目录。\n\n后续", "DSML 完整标记应被剥离,前后正常文本保留");
+        assert_eq!(
+            out, "先看目录。\n\n后续",
+            "DSML 完整标记应被剥离,前后正常文本保留"
+        );
         assert!(ctx.dsml_tail_buffer.is_empty());
     }
 
@@ -4136,9 +4349,14 @@ mod tests {
     #[test]
     fn test_strip_dsml_claude_model_never_filtered() {
         // 门控:Claude 系模型完全不剥离——哪怕内容里恰好含 <｜…>(如用户让 Claude 解释 DSML)也原样保留。
-        let mut ctx = StreamContext::new_with_thinking("claude-sonnet-4.6", 10, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-4.6", 10, false, HashMap::new());
         let s = "DeepSeek 的标记写作 <｜DSML｜function_calls｜> 你看";
-        assert_eq!(ctx.strip_dsml_markers(s), s, "Claude 模型不应剥离任何 <｜…>");
+        assert_eq!(
+            ctx.strip_dsml_markers(s),
+            s,
+            "Claude 模型不应剥离任何 <｜…>"
+        );
         assert!(ctx.dsml_tail_buffer.is_empty());
     }
 
@@ -4147,7 +4365,11 @@ mod tests {
         // 国产模型下,<｜ 后不是 DSML/tool/function 关键字的正文(CJK 排版)不被误删。
         let mut ctx = mk_ctx(); // deepseek
         let s = "见 <｜注｜关于x｜> 说明";
-        assert_eq!(ctx.strip_dsml_markers(s), s, "非关键字的 <｜…> 属正文,应保留");
+        assert_eq!(
+            ctx.strip_dsml_markers(s),
+            s,
+            "非关键字的 <｜…> 属正文,应保留"
+        );
     }
 
     // ===== 文本化 invoke 重组端到端(旧代码上会失败:旧代码把 <invoke> 当纯文本吐,不重组)=====
@@ -4177,9 +4399,16 @@ mod tests {
         );
         let mut events = ctx.process_assistant_response(&block);
         events.extend(ctx.flush_invoke_sniff_buffer());
-        assert!(has_tool_use_block(&events), "行首完整 invoke 块应重组成 tool_use");
+        assert!(
+            has_tool_use_block(&events),
+            "行首完整 invoke 块应重组成 tool_use"
+        );
         assert_eq!(ctx.reclaimed_invoke_count, 1);
-        assert_eq!(ctx.state_manager.get_stop_reason(), "tool_use", "重组后 stop_reason 应为 tool_use");
+        assert_eq!(
+            ctx.state_manager.get_stop_reason(),
+            "tool_use",
+            "重组后 stop_reason 应为 tool_use"
+        );
     }
 
     #[test]
@@ -4189,7 +4418,9 @@ mod tests {
         known.insert("Read".to_string()); // 只声明 Read,没声明 Bash
         let mut ctx = StreamContext::new_full("claude-opus-4.6", 10, false, HashMap::new(), known);
         let lt = "<";
-        let block = format!("{lt}invoke name=\"Bash\">{lt}parameter name=\"x\">1{lt}/parameter>{lt}/invoke>");
+        let block = format!(
+            "{lt}invoke name=\"Bash\">{lt}parameter name=\"x\">1{lt}/parameter>{lt}/invoke>"
+        );
         let mut events = ctx.process_assistant_response(&block);
         events.extend(ctx.flush_invoke_sniff_buffer());
         assert!(!has_tool_use_block(&events), "未声明的工具名不应被重组执行");
@@ -4203,21 +4434,32 @@ mod tests {
         let lt = "<";
         let mut events = Vec::new();
         events.extend(ctx.process_assistant_response(&format!("{lt}invoke name=\"Ba")));
-        events.extend(ctx.process_assistant_response(&format!("sh\">{lt}parameter name=\"command\">echo hi")));
+        events.extend(
+            ctx.process_assistant_response(&format!("sh\">{lt}parameter name=\"command\">echo hi")),
+        );
         events.extend(ctx.process_assistant_response(&format!("{lt}/parameter>{lt}/invoke>")));
         events.extend(ctx.flush_invoke_sniff_buffer());
-        assert!(has_tool_use_block(&events), "跨 chunk 分片的 invoke 应重组成 tool_use");
+        assert!(
+            has_tool_use_block(&events),
+            "跨 chunk 分片的 invoke 应重组成 tool_use"
+        );
     }
 
     #[test]
     fn test_reclaim_disabled_when_no_tools_declared() {
         // 未声明任何工具(known 空)→ 不进重组路径,<invoke> 原样当文本吐(new_with_thinking 空集=不启用)。
-        let mut ctx = StreamContext::new_with_thinking("claude-opus-4.6", 10, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4.6", 10, false, HashMap::new());
         let lt = "<";
-        let block = format!("{lt}invoke name=\"Bash\">{lt}parameter name=\"c\">x{lt}/parameter>{lt}/invoke>");
+        let block = format!(
+            "{lt}invoke name=\"Bash\">{lt}parameter name=\"c\">x{lt}/parameter>{lt}/invoke>"
+        );
         let events = ctx.process_assistant_response(&block);
         assert!(!has_tool_use_block(&events), "无声明工具时不重组");
-        assert!(ctx.invoke_sniff_buffer.is_empty(), "不启用重组则不进 sniff 缓冲");
+        assert!(
+            ctx.invoke_sniff_buffer.is_empty(),
+            "不启用重组则不进 sniff 缓冲"
+        );
     }
 
     // ===== 结构性 stray 熔断(治 course/课 打地鼠 + 修 thinking/无工具盲区,旧代码上会失败)=====
@@ -4234,15 +4476,23 @@ mod tests {
     fn test_structural_flood_multichar_course() {
         // "coursecourse…" ×40(词表里根本没 course)——多字符 token 连写应被抓。
         let s = "course".repeat(40);
-        assert!(detect_structural_flood(&s).is_some(), "course 连写应被结构性检测命中(不靠词表)");
+        assert!(
+            detect_structural_flood(&s).is_some(),
+            "course 连写应被结构性检测命中(不靠词表)"
+        );
     }
 
     #[test]
     fn test_structural_flood_normal_text_safe() {
         // 正常文本(含少量重复词)不应误判。
-        assert!(detect_structural_flood("这是一段正常的中文回复,讲解代码逻辑和实现细节。").is_none());
+        assert!(
+            detect_structural_flood("这是一段正常的中文回复,讲解代码逻辑和实现细节。").is_none()
+        );
         assert!(detect_structural_flood("the quick brown fox jumps over the lazy dog").is_none());
-        assert!(detect_structural_flood("aaa bbb ccc").is_none(), "短重复但未达阈值不误判");
+        assert!(
+            detect_structural_flood("aaa bbb ccc").is_none(),
+            "短重复但未达阈值不误判"
+        );
     }
 
     #[test]
@@ -4298,12 +4548,17 @@ mod tests {
         // 核心盲区修复:无工具声明请求(known_tool_names 空)的课刷屏也要被处理。
         // 用单行连写(泄漏清洗器只剥行首独占,够不到单行连写)专门验证 guard 生效——
         // 逐行独占的课会被 clean_leaked_tokens 先剥掉(那也是有效清除路径),故此处用连写测 guard。
-        let mut ctx = StreamContext::new_with_thinking("claude-opus-4.6", 10, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4.6", 10, false, HashMap::new());
         let flood = format!("正文{}", "课".repeat(200));
         let events = ctx.process_assistant_response(&flood);
-        assert!(ctx.stray_guard_tripped, "无工具请求的单行课连写刷屏应触发 guard 熔断");
+        assert!(
+            ctx.stray_guard_tripped,
+            "无工具请求的单行课连写刷屏应触发 guard 熔断"
+        );
         // 熔断后吐出的文本里课的数量应远少于 200(截断在游程起点)。
-        let emitted: String = events.iter()
+        let emitted: String = events
+            .iter()
             .filter_map(|e| e.data["delta"]["text"].as_str())
             .collect();
         assert!(emitted.matches('课').count() < 200, "熔断应截断掉大部分课");
@@ -4331,7 +4586,10 @@ mod tests {
         assert_eq!(out, "我来看看目录。\n\n", "正文保留,标记 hold 不输出");
         assert!(ctx.dsml_tail_is_marker, "应标记为确认标记");
         let flushed = ctx.flush_dsml_tail();
-        assert!(flushed.is_empty(), "确认标记的残留 flush 时丢弃,绝不当正文补发(否则泄漏)");
+        assert!(
+            flushed.is_empty(),
+            "确认标记的残留 flush 时丢弃,绝不当正文补发(否则泄漏)"
+        );
         assert!(ctx.dsml_tail_buffer.is_empty());
     }
 
@@ -4356,7 +4614,10 @@ mod tests {
         // 驱动进入 thinking 块并停在块内;末尾孤立 `<` 会被 DSML 逻辑 hold 到 tail。
         let _ = ctx.process_assistant_response("<thinking>我在想 <");
         assert!(ctx.in_thinking_block, "应仍处于 thinking 块内");
-        assert_eq!(ctx.dsml_tail_buffer, "<", "末尾孤立 < 应被 hold 到 DSML tail,而非进 thinking_buffer");
+        assert_eq!(
+            ctx.dsml_tail_buffer, "<",
+            "末尾孤立 < 应被 hold 到 DSML tail,而非进 thinking_buffer"
+        );
 
         let events = ctx.generate_final_events();
 
@@ -4440,7 +4701,10 @@ mod tests {
         use crate::kiro::model::events::ToolUseEvent;
 
         let mut map = HashMap::new();
-        map.insert("short_abc12345".to_string(), "mcp__very_long_original_tool_name".to_string());
+        map.insert(
+            "short_abc12345".to_string(),
+            "mcp__very_long_original_tool_name".to_string(),
+        );
 
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, map);
         let _ = ctx.generate_initial_events();
@@ -4456,10 +4720,12 @@ mod tests {
         let events = ctx.process_kiro_event(&tool_event);
 
         // content_block_start 中的 name 应该是原始长名称
-        let start_event = events.iter().find(|e| e.event == "content_block_start").unwrap();
+        let start_event = events
+            .iter()
+            .find(|e| e.event == "content_block_start")
+            .unwrap();
         assert_eq!(
-            start_event.data["content_block"]["name"],
-            "mcp__very_long_original_tool_name",
+            start_event.data["content_block"]["name"], "mcp__very_long_original_tool_name",
             "应还原为原始工具名称"
         );
     }
@@ -4478,8 +4744,7 @@ mod tests {
                 stop: *stop,
             });
             for e in ctx.process_kiro_event(&ev) {
-                if e.event == "content_block_delta"
-                    && e.data["delta"]["type"] == "input_json_delta"
+                if e.event == "content_block_delta" && e.data["delta"]["type"] == "input_json_delta"
                 {
                     out.push_str(e.data["delta"]["partial_json"].as_str().unwrap_or(""));
                     delta_count += 1;
@@ -4507,7 +4772,10 @@ mod tests {
                 (r#"{"a":1,"b":2}"#, true),
             ],
         );
-        assert_eq!(joined, r#"{"a":1,"b":2}"#, "累积模式:拼接后应为完整 JSON,无重复");
+        assert_eq!(
+            joined, r#"{"a":1,"b":2}"#,
+            "累积模式:拼接后应为完整 JSON,无重复"
+        );
     }
 
     #[test]
@@ -4532,13 +4800,12 @@ mod tests {
         let _ = ctx.generate_initial_events();
         let joined = collect_tool_partial_json(
             &mut ctx,
-            &[
-                (r#"{"a""#, false),
-                (r#":1,"#, false),
-                (r#""b":2}"#, true),
-            ],
+            &[(r#"{"a""#, false), (r#":1,"#, false), (r#""b":2}"#, true)],
         );
-        assert_eq!(joined, r#"{"a":1,"b":2}"#, "增量模式:原样转发,拼接后为完整 JSON");
+        assert_eq!(
+            joined, r#"{"a":1,"b":2}"#,
+            "增量模式:原样转发,拼接后为完整 JSON"
+        );
     }
 
     #[test]
@@ -4557,7 +4824,11 @@ mod tests {
         let _ = ctx.generate_initial_events();
         let (joined, n) = run_tool_frames(
             &mut ctx,
-            &[(r#"{"a""#, false), (r#"{"a":1"#, false), (r#"{"a":1,"b":2}"#, true)],
+            &[
+                (r#"{"a""#, false),
+                (r#"{"a":1"#, false),
+                (r#"{"a":1,"b":2}"#, true),
+            ],
         );
         assert_eq!(joined, r#"{"a":1,"b":2}"#);
         assert_eq!(n, 1, "应只发一个 delta（缓冲到 stop 一次性发）");
@@ -4576,7 +4847,10 @@ mod tests {
         );
         // 只发一个 delta,且结果是合法 JSON(第二帧),不再是 `}{` 粘连串。
         assert_eq!(n, 1, "非前缀帧也只发一个 delta");
-        assert_eq!(joined, r#"{"path":"/b"}"#, "非前缀双完整对象只留最新完整对象");
+        assert_eq!(
+            joined, r#"{"path":"/b"}"#,
+            "非前缀双完整对象只留最新完整对象"
+        );
         assert!(
             serde_json::from_str::<serde_json::Value>(&joined).is_ok(),
             "结果必须是合法 JSON"
@@ -4598,7 +4872,11 @@ mod tests {
         );
         // 值语义：`\x` 非法转义降级为字面反斜杠，值为字面 `\xd7`。
         let v: serde_json::Value = serde_json::from_str(&joined).unwrap();
-        assert_eq!(v["a"].as_str().unwrap(), r"\xd7", "非法 \\x 转义降级为字面反斜杠");
+        assert_eq!(
+            v["a"].as_str().unwrap(),
+            r"\xd7",
+            "非法 \\x 转义降级为字面反斜杠"
+        );
     }
 
     // 注：修复层"关闭时原样透传"的行为不单独用 static 开关测——进程级 static 在并行测试下会互相
@@ -4627,12 +4905,16 @@ mod tests {
                 && e.data["delta"]["type"] == "input_json_delta"));
         }
         let finals = ctx.generate_final_events();
-        let delta = finals.iter().find(|e| e.event == "content_block_delta"
-            && e.data["delta"]["type"] == "input_json_delta");
+        let delta = finals.iter().find(|e| {
+            e.event == "content_block_delta" && e.data["delta"]["type"] == "input_json_delta"
+        });
         assert!(delta.is_some(), "截断收尾应 flush 残留 tool input");
         assert_eq!(delta.unwrap().data["delta"]["partial_json"], r#"{"a":1}"#);
         // 块应被关闭
-        assert!(finals.iter().any(|e| e.event == "content_block_stop"), "截断应关闭 tool 块");
+        assert!(
+            finals.iter().any(|e| e.event == "content_block_stop"),
+            "截断应关闭 tool 块"
+        );
     }
 
     #[test]
@@ -5052,7 +5334,12 @@ mod tests {
 
         let full_thinking: String = thinking_deltas
             .iter()
-            .filter(|e| !e.data["delta"]["thinking"].as_str().unwrap_or("").is_empty())
+            .filter(|e| {
+                !e.data["delta"]["thinking"]
+                    .as_str()
+                    .unwrap_or("")
+                    .is_empty()
+            })
             .map(|e| e.data["delta"]["thinking"].as_str().unwrap_or(""))
             .collect();
 
@@ -5065,14 +5352,11 @@ mod tests {
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
-        let events =
-            ctx.process_assistant_response("<thinking>\nabc</thinking>\n\n你好");
+        let events = ctx.process_assistant_response("<thinking>\nabc</thinking>\n\n你好");
 
         let text_deltas: Vec<_> = events
             .iter()
-            .filter(|e| {
-                e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta"
-            })
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
             .collect();
 
         let full_text: String = text_deltas
@@ -5104,9 +5388,7 @@ mod tests {
     fn collect_text_content(events: &[SseEvent]) -> String {
         events
             .iter()
-            .filter(|e| {
-                e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta"
-            })
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
             .map(|e| e.data["delta"]["text"].as_str().unwrap_or(""))
             .collect()
     }
@@ -5125,7 +5407,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "abc", "thinking should be 'abc', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "abc",
+            "thinking should be 'abc', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "你好", "text should be '你好', got: {:?}", text);
@@ -5143,7 +5429,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "abc", "thinking should be 'abc', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "abc",
+            "thinking should be 'abc', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "你好", "text should be '你好', got: {:?}", text);
@@ -5163,7 +5453,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "abc", "thinking should be 'abc', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "abc",
+            "thinking should be 'abc', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "text", "text should be 'text', got: {:?}", text);
@@ -5192,7 +5486,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "hello", "thinking should be 'hello', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "hello",
+            "thinking should be 'hello', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "world", "text should be 'world', got: {:?}", text);
@@ -5282,12 +5580,14 @@ mod tests {
 
         let mut all_events = Vec::new();
         all_events.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>"));
-        all_events.extend(ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
-            name: "test_tool".to_string(),
-            tool_use_id: "tool_1".to_string(),
-            input: "{}".to_string(),
-            stop: true,
-        }));
+        all_events.extend(
+            ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+                name: "test_tool".to_string(),
+                tool_use_id: "tool_1".to_string(),
+                input: "{}".to_string(),
+                stop: true,
+            }),
+        );
         all_events.extend(ctx.generate_final_events());
 
         let message_delta = all_events
@@ -5396,8 +5696,9 @@ mod tests {
 
         // 内联发出了 error 事件
         assert!(
-            events.iter().any(|e| e.event == "error"
-                && e.data["error"]["type"] == "api_error"),
+            events
+                .iter()
+                .any(|e| e.event == "error" && e.data["error"]["type"] == "api_error"),
             "in-band 错误应内联发出 SSE error 事件"
         );
         assert!(ctx.error_event_emitted(), "应标记已发 error 事件");
@@ -5435,8 +5736,9 @@ mod tests {
         });
 
         assert!(
-            events.iter().any(|e| e.event == "error"
-                && e.data["error"]["type"] == "overloaded_error"),
+            events
+                .iter()
+                .any(|e| e.event == "error" && e.data["error"]["type"] == "overloaded_error"),
             "限流类异常应发 overloaded_error"
         );
         assert_eq!(ctx.completion_outcome(), RequestOutcome::RateLimited);
@@ -5462,7 +5764,13 @@ mod tests {
     #[test]
     fn test_buffered_context_delegates_completion() {
         // BufferedStreamContext 应把完成状态透传给内部 StreamContext。
-        let mut ctx = BufferedStreamContext::new("test-model", 1, false, HashMap::new(), std::collections::HashSet::new());
+        let mut ctx = BufferedStreamContext::new(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
         ctx.process_and_buffer(&Event::Error {
             error_code: "InternalServerException".to_string(),
             error_message: "boom".to_string(),
@@ -5554,7 +5862,10 @@ mod tests {
     #[test]
     fn test_merge_nonprefix_double_object_keeps_latest() {
         let buf = merge_tool_input(r#"{"a":1}"#, r#"{"a":2}"#);
-        assert_eq!(buf, r#"{"a":2}"#, "非前缀双完整对象应只留最新，消灭 object 粘连");
+        assert_eq!(
+            buf, r#"{"a":2}"#,
+            "非前缀双完整对象应只留最新，消灭 object 粘连"
+        );
         assert!(
             serde_json::from_str::<serde_json::Value>(&buf).is_ok(),
             "结果必须是合法 JSON"
@@ -5584,6 +5895,61 @@ mod tests {
         let buf = merge_tool_input(r#"{"x":[1,2"#, r#",3]}"#);
         assert_eq!(buf, r#"{"x":[1,2,3]}"#);
         assert!(serde_json::from_str::<serde_json::Value>(&buf).is_ok());
+    }
+
+    /// 根因回归（生产实证）：规则 5 曾把**真增量碎片**误判成"迟到的旧短快照"而丢弃。
+    ///
+    /// 现场：gpt-5.6-sol 逐 token 流式发 tool input，帧序列 `{"plan":[` → `{"` → `step` → …
+    /// 第 2 帧 `{"` 恰是 buf `{"plan":[` 的前缀，旧实现丢弃它，拼出
+    /// `{"plan":[step":"…`（中间少一段 `{"`）→ 客户端 Invalid tool parameters。
+    /// 该串归因层会误标 `truncated`（像上游截断，实则网关丢帧），且修复层补不回
+    /// （缺的是中间结构字符，非尾部）——这正是生产 23 次截断 0 次修复成功的原因。
+    #[test]
+    fn test_merge_prefix_fragment_not_dropped_when_buf_incomplete() {
+        // buf 尚不完整 + frame 是其前缀 → 必须追加，绝不丢弃。
+        assert_eq!(
+            merge_tool_input(r#"{"plan":["#, r#"{""#),
+            r#"{"plan":[{""#,
+            "buf 未完整时，前缀短帧是真增量碎片，必须追加"
+        );
+
+        // 全序列重放：与生产坏串同形，修复后应拼出合法 JSON。
+        let frames = [
+            r#"{"plan":["#,
+            r#"{""#,
+            "step",
+            r#"":""#,
+            "做事",
+            r#"",""#,
+            "status",
+            r#"":""#,
+            "in_progress",
+            r#""}"#,
+            "]}",
+        ];
+        let mut buf = String::new();
+        for f in frames {
+            buf = merge_tool_input(&buf, f);
+        }
+        assert_eq!(
+            buf, r#"{"plan":[{"step":"做事","status":"in_progress"}]}"#,
+            "逐 token 帧序列应无损还原（此前丢 `{{\"` 拼成 `[step\":\"…`）"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&buf).is_ok(),
+            "还原结果必须是合法 JSON"
+        );
+    }
+
+    /// 收窄规则 5 后，它原本要防的场景仍然成立：buf **已完整**时，更短的前缀帧是旧快照 → 丢弃。
+    #[test]
+    fn test_merge_rule5_still_guards_stale_snapshot_when_buf_complete() {
+        let full = r#"{"path":"a.txt","content":"hi"}"#;
+        assert_eq!(
+            merge_tool_input(full, r#"{"path":"a.txt""#),
+            full,
+            "buf 已完整 → 更短的前缀帧只可能是迟到旧快照，应丢弃"
+        );
     }
 
     // ============ JSON 修复层（缓解④，根治向）离线注入测试 ============
@@ -5682,32 +6048,50 @@ mod tests {
         let fixed = repair_tool_json(bad).expect("应可修复");
         let v: serde_json::Value = serde_json::from_str(&fixed).expect("修复后合法");
         // 合法代理对应解码成 😀,不被降级为字面。
-        assert!(v["emoji"].as_str().unwrap().contains('😀'), "合法代理对必须保留为 emoji");
+        assert!(
+            v["emoji"].as_str().unwrap().contains('😀'),
+            "合法代理对必须保留为 emoji"
+        );
     }
 
     /// 洞4:孤立高代理(无低代理配对)→ 降级字面,修成合法 JSON。
     #[test]
     fn test_repair_isolated_high_surrogate() {
         let bad = r#"{"x":"\uD83Dnext"}"#; // 高代理后跟普通文本,孤立
-        assert!(serde_json::from_str::<serde_json::Value>(bad).is_err(), "前提:孤立高代理非法");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(bad).is_err(),
+            "前提:孤立高代理非法"
+        );
         let fixed = repair_tool_json(bad).expect("孤立高代理应可降级修复");
-        assert!(serde_json::from_str::<serde_json::Value>(&fixed).is_ok(), "修复后必合法");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&fixed).is_ok(),
+            "修复后必合法"
+        );
     }
 
     /// 洞4:孤立低代理 → 降级字面,修成合法 JSON。
     #[test]
     fn test_repair_isolated_low_surrogate() {
         let bad = r#"{"x":"\uDE00abc"}"#;
-        assert!(serde_json::from_str::<serde_json::Value>(bad).is_err(), "前提:孤立低代理非法");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(bad).is_err(),
+            "前提:孤立低代理非法"
+        );
         let fixed = repair_tool_json(bad).expect("孤立低代理应可降级修复");
-        assert!(serde_json::from_str::<serde_json::Value>(&fixed).is_ok(), "修复后必合法");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&fixed).is_ok(),
+            "修复后必合法"
+        );
     }
 
     /// glued 粘连修复：头部多余 `}` 剥除后得到合法 JSON。
     #[test]
     fn test_repair_glued_leading_brace() {
         let bad = r#"}{"path": "src/foo.rs"}"#;
-        assert!(serde_json::from_str::<serde_json::Value>(bad).is_err(), "前提：glued 串非合法 JSON");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(bad).is_err(),
+            "前提：glued 串非合法 JSON"
+        );
         let fixed = repair_tool_json(bad).expect("glued 粘连应可修复");
         let v: serde_json::Value = serde_json::from_str(&fixed).expect("修复后必须是合法 JSON");
         assert_eq!(v["path"].as_str().unwrap(), "src/foo.rs");
@@ -5717,7 +6101,10 @@ mod tests {
     #[test]
     fn test_repair_glued_with_space() {
         let bad = r#"} {"key": "value"}"#;
-        assert!(serde_json::from_str::<serde_json::Value>(bad).is_err(), "前提：非法");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(bad).is_err(),
+            "前提：非法"
+        );
         let fixed = repair_tool_json(bad).expect("glued (带空白) 应可修复");
         let v: serde_json::Value = serde_json::from_str(&fixed).unwrap();
         assert_eq!(v["key"].as_str().unwrap(), "value");
@@ -5727,7 +6114,10 @@ mod tests {
     #[test]
     fn test_repair_glued_no_opening_brace_returns_none() {
         let bad = r#"}not_json_at_all"#;
-        assert!(repair_tool_json(bad).is_none(), "无 `{{` 时修复层应返回 None");
+        assert!(
+            repair_tool_json(bad).is_none(),
+            "无 `{{` 时修复层应返回 None"
+        );
     }
 
     /// 洞1:整包双重编码解包——顶层是被字符串编码的 object → 解一层还原。
@@ -5736,7 +6126,11 @@ mod tests {
         // 双重编码:整个 {"path":"a.txt"} 被再套一层字符串编码。
         let double = r#""{\"path\":\"a.txt\"}""#;
         // 顶层 from_str 成功但得到 String(漏过 repair 层)。
-        assert!(serde_json::from_str::<serde_json::Value>(double).unwrap().is_string());
+        assert!(
+            serde_json::from_str::<serde_json::Value>(double)
+                .unwrap()
+                .is_string()
+        );
         let unwrapped = unwrap_double_encoded(double).expect("应解一层");
         let v: serde_json::Value = serde_json::from_str(&unwrapped).unwrap();
         assert_eq!(v["path"].as_str().unwrap(), "a.txt");
@@ -5749,12 +6143,15 @@ mod tests {
     /// (assembled=repaired 后不再 return,与本路径汇合到同一 unwrap)。
     #[test]
     fn test_flush_unwraps_double_encoded_at_exit() {
-        let mut ctx = StreamContext::new_with_thinking("claude-sonnet-4.6", 1, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-4.6", 1, false, HashMap::new());
         let _ = ctx.generate_initial_events();
         // 合法的双重编码:整个 {"path":"a.txt"} 被再套一层字符串编码(from_str 成功但得 String)。
         let double = r#""{\"path\":\"a.txt\"}""#;
         assert!(
-            serde_json::from_str::<serde_json::Value>(double).unwrap().is_string(),
+            serde_json::from_str::<serde_json::Value>(double)
+                .unwrap()
+                .is_string(),
             "前提:顶层 from_str 成功但是 String(双重编码,会漏过 repair)"
         );
         let evs = ctx.flush_tool_input(0, double.to_string());
@@ -5764,7 +6161,11 @@ mod tests {
             .expect("应发出 input_json_delta");
         let partial = delta.data["delta"]["partial_json"].as_str().unwrap();
         let v: serde_json::Value = serde_json::from_str(partial).expect("发出的必是合法 JSON");
-        assert!(v.is_object(), "双重编码必须在出口被 unwrap 成 object,实际={}", partial);
+        assert!(
+            v.is_object(),
+            "双重编码必须在出口被 unwrap 成 object,实际={}",
+            partial
+        );
         assert_eq!(v["path"].as_str().unwrap(), "a.txt");
     }
 
@@ -5785,7 +6186,8 @@ mod tests {
     /// 这是客户端真正消费的字节，锁死"客户端不再报 Invalid tool parameters"。
     #[test]
     fn test_flush_tool_input_repairs_before_sending() {
-        let mut ctx = StreamContext::new_with_thinking("claude-sonnet-4.6", 1, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-4.6", 1, false, HashMap::new());
         let _ = ctx.generate_initial_events();
         // Windows 路径非法转义（#20015 真实成因）。
         let bad = r#"{"file_path":"C:\Users\x\a.txt"}"#.to_string();
@@ -5827,7 +6229,10 @@ mod tests {
             }
         }
         assert!(!glued_ever, "纯增量拼装全程不应出现 }}{{ 粘连");
-        assert_eq!(buf, r#"{"path": "test.txt", "content": "Hello World! 🌍\n\nend"}"#);
+        assert_eq!(
+            buf,
+            r#"{"path": "test.txt", "content": "Hello World! 🌍\n\nend"}"#
+        );
         assert!(
             serde_json::from_str::<serde_json::Value>(&buf).is_ok(),
             "纯增量碎片最终应拼成合法 JSON（类型 C 主路径）"
@@ -5911,9 +6316,15 @@ mod tests {
     #[test]
     fn test_strip_leaked_prefix_hit_flags() {
         let (_, hit) = StreamContext::strip_leaked_prefix("court\n"); // 独占整行
-        assert!(hit.stripped && hit.standalone, "独占整行 court 应 stripped+standalone");
+        assert!(
+            hit.stripped && hit.standalone,
+            "独占整行 court 应 stripped+standalone"
+        );
         let (_, hit) = StreamContext::strip_leaked_prefix("course重读"); // 粘连非独占
-        assert!(hit.stripped && !hit.standalone, "粘连剥离应 stripped 但非 standalone");
+        assert!(
+            hit.stripped && !hit.standalone,
+            "粘连剥离应 stripped 但非 standalone"
+        );
         let (_, hit) = StreamContext::strip_leaked_prefix("count: 42"); // 正常英文不剥
         assert!(!hit.stripped && !hit.standalone, "正常英文不应命中");
     }
@@ -5921,7 +6332,8 @@ mod tests {
     /// clean_leaked_tokens：只在行首处理，多行时每行行首各判一次；并累加诊断计数。
     #[test]
     fn test_clean_leaked_tokens_multiline() {
-        let mut ctx = StreamContext::new_with_thinking("claude-sonnet-4.6", 1, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-4.6", 1, false, HashMap::new());
         let input = "course重读\nnormal line\ncount你好";
         assert_eq!(ctx.clean_leaked_tokens(input), "重读\nnormal line\n你好");
         assert_eq!(ctx.leaked_stripped, 2, "剥了 course / count 两个");
@@ -5934,7 +6346,10 @@ mod tests {
         let mut ctx = StreamContext::new_with_thinking("claude-opus-4.8", 1, false, HashMap::new());
         let input = "court\ncourt\ncourt\n";
         ctx.clean_leaked_tokens(input);
-        assert_eq!(ctx.leaked_saturation_lines, 3, "3 行纯 court 独占行=saturation 信号");
+        assert_eq!(
+            ctx.leaked_saturation_lines, 3,
+            "3 行纯 court 独占行=saturation 信号"
+        );
         assert_eq!(ctx.leaked_stripped, 3);
     }
 
@@ -5960,8 +6375,7 @@ mod tests {
         let delta = evs
             .iter()
             .find(|e| {
-                e.event == "content_block_delta"
-                    && e.data["delta"]["type"] == "input_json_delta"
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "input_json_delta"
             })
             .expect("应有 input_json_delta");
         let assembled = delta.data["delta"]["partial_json"].as_str().unwrap();
@@ -5990,8 +6404,7 @@ mod tests {
         let delta = evs
             .iter()
             .find(|e| {
-                e.event == "content_block_delta"
-                    && e.data["delta"]["type"] == "input_json_delta"
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "input_json_delta"
             })
             .expect("delta");
         let assembled = delta.data["delta"]["partial_json"].as_str().unwrap();
@@ -6014,8 +6427,7 @@ mod tests {
         let delta = evs
             .iter()
             .find(|e| {
-                e.event == "content_block_delta"
-                    && e.data["delta"]["type"] == "input_json_delta"
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "input_json_delta"
             })
             .expect("delta");
         let assembled = delta.data["delta"]["partial_json"].as_str().unwrap();
@@ -6135,11 +6547,17 @@ mod tests {
         assert!(contains_textified_tool_call(r#"<invoke name="Bash">"#));
         assert!(contains_textified_tool_call(r#"<invoke name="Bash">"#));
         assert!(contains_textified_tool_call("</invoke>"));
-        assert!(contains_textified_tool_call(r#"<parameter name="command">"#));
+        assert!(contains_textified_tool_call(
+            r#"<parameter name="command">"#
+        ));
         assert!(contains_textified_tool_call("</function_calls>"));
         // 正常文本不误命中。
-        assert!(!contains_textified_tool_call("这是一段正常的助手回复,讲 invoke 概念但无标签"));
-        assert!(!contains_textified_tool_call("函数调用 function calls 讨论"));
+        assert!(!contains_textified_tool_call(
+            "这是一段正常的助手回复,讲 invoke 概念但无标签"
+        ));
+        assert!(!contains_textified_tool_call(
+            "函数调用 function calls 讨论"
+        ));
         assert!(!contains_textified_tool_call(""));
     }
 

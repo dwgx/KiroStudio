@@ -137,7 +137,10 @@ fn normalize_json_schema_inner(schema: serde_json::Value, root: bool) -> serde_j
         || (normalized_type.is_none() && obj.contains_key("properties"));
 
     if is_object_schema {
-        obj.insert("type".to_string(), serde_json::Value::String("object".to_string()));
+        obj.insert(
+            "type".to_string(),
+            serde_json::Value::String("object".to_string()),
+        );
     } else if let Some(t) = normalized_type {
         obj.insert("type".to_string(), serde_json::Value::String(t));
     }
@@ -149,10 +152,16 @@ fn normalize_json_schema_inner(schema: serde_json::Value, root: bool) -> serde_j
                 for (name, prop_schema) in props {
                     normalized.insert(name, normalize_json_schema_inner(prop_schema, false));
                 }
-                obj.insert("properties".to_string(), serde_json::Value::Object(normalized));
+                obj.insert(
+                    "properties".to_string(),
+                    serde_json::Value::Object(normalized),
+                );
             }
             _ => {
-                obj.insert("properties".to_string(), serde_json::Value::Object(serde_json::Map::new()));
+                obj.insert(
+                    "properties".to_string(),
+                    serde_json::Value::Object(serde_json::Map::new()),
+                );
             }
         }
         let required = match obj.remove("required") {
@@ -198,10 +207,16 @@ fn normalize_json_schema_inner(schema: serde_json::Value, root: bool) -> serde_j
             );
         }
         Some(serde_json::Value::Bool(value)) => {
-            obj.insert("additionalProperties".to_string(), serde_json::Value::Bool(value));
+            obj.insert(
+                "additionalProperties".to_string(),
+                serde_json::Value::Bool(value),
+            );
         }
         Some(_) => {
-            obj.insert("additionalProperties".to_string(), serde_json::Value::Bool(true));
+            obj.insert(
+                "additionalProperties".to_string(),
+                serde_json::Value::Bool(true),
+            );
         }
         None => {}
     }
@@ -211,7 +226,10 @@ fn normalize_json_schema_inner(schema: serde_json::Value, root: bool) -> serde_j
         && let Some(description) = description.as_str()
     {
         let description = truncate_chars(description, schema_description_max_chars());
-        obj.insert("description".to_string(), serde_json::Value::String(description));
+        obj.insert(
+            "description".to_string(),
+            serde_json::Value::String(description),
+        );
     }
 
     // enum 只保留 string/number/bool 值
@@ -231,7 +249,13 @@ fn normalize_json_schema_inner(schema: serde_json::Value, root: bool) -> serde_j
     obj.retain(|key, _| {
         matches!(
             key.as_str(),
-            "type" | "properties" | "required" | "items" | "additionalProperties" | "description" | "enum"
+            "type"
+                | "properties"
+                | "required"
+                | "items"
+                | "additionalProperties"
+                | "description"
+                | "enum"
         )
     });
 
@@ -255,8 +279,14 @@ fn normalize_schema_type(raw: &str) -> Option<String> {
 /// 文本转成 `<document>` 文本块随消息下发，让模型至少能读到 PDF 内容。
 fn extract_pdf_text_from_base64(data: &str) -> Option<String> {
     use base64::Engine;
-    let data = data.rsplit_once(',').map(|(_, tail)| tail).unwrap_or(data).trim();
-    let bytes = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
+    let data = data
+        .rsplit_once(',')
+        .map(|(_, tail)| tail)
+        .unwrap_or(data)
+        .trim();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .ok()?;
     extract_pdf_text_from_bytes(&bytes)
 }
 
@@ -430,11 +460,7 @@ fn tool_description_max_chars() -> usize {
 /// schema 内嵌 description 上限：顶层的 1/5（保持既有 10000→2000 比例）。0（不截断）时同样不截断。
 fn schema_description_max_chars() -> usize {
     let top = tool_description_max_chars();
-    if top == 0 {
-        0
-    } else {
-        (top / 5).max(1)
-    }
+    if top == 0 { 0 } else { (top / 5).max(1) }
 }
 
 /// 按字符边界安全截断（防多字节切断）。`max==0` 表示不截断，原样返回。
@@ -635,7 +661,22 @@ fn derive_agent_continuation_id(conversation_id: &str) -> String {
     let r = hasher.finalize();
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15]
+        r[0],
+        r[1],
+        r[2],
+        r[3],
+        r[4],
+        r[5],
+        r[6],
+        r[7],
+        r[8],
+        r[9],
+        r[10],
+        r[11],
+        r[12],
+        r[13],
+        r[14],
+        r[15]
     )
 }
 
@@ -801,6 +842,12 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     if !tools.is_empty() {
         context = context.with_tools(tools);
     }
+    // 当前消息携带的 tool_use_id 集合：用于判定历史最后一条 assistant 是否为
+    // 「活跃工具轮次」（上游只接受一个活跃轮次，见 sanitize_history 模块文档）。
+    let current_tool_result_ids: std::collections::HashSet<String> = validated_tool_results
+        .iter()
+        .map(|r| r.tool_use_id.clone())
+        .collect();
     if !validated_tool_results.is_empty() {
         context = context.with_tool_results(validated_tool_results);
     }
@@ -820,18 +867,28 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let current_message = CurrentMessage::new(user_input);
 
     // 13. 构建 ConversationState
-    let conversation_state = ConversationState::new(conversation_id)
+    let mut conversation_state = ConversationState::new(conversation_id)
         .with_agent_continuation_id(agent_continuation_id)
         .with_agent_task_type("vibe")
         .with_chat_trigger_type(chat_trigger_type)
         .with_current_message(current_message)
         .with_history(history);
 
+    // 14. 历史工具扁平化：上游只接受**一个活跃工具轮次**（末条 assistant 的 toolUses
+    // ⟺ 当前 toolResults），历史里残留多组结构化配对会被判 400 REQUEST_BODY_INVALID。
+    // 放在截断之前：扁平化能显著缩小请求体，从根上降低触发截断的频率。
+    super::sanitize_history::sanitize_history(
+        &mut conversation_state.history,
+        &current_tool_result_ids,
+    );
+
+    // 15. 超限保护：上游按**字节**拒绝过大请求（400 CONTENT_LENGTH_EXCEEDS_THRESHOLD），
+    // 而客户端的自动压缩按 token 阈值触发，两者不对齐 → 长会话会撞墙且无法自恢复。
+    // 这里在网关侧主动丢弃最旧历史（对齐 kiro-go 的 truncatePayloadToLimit）。
+    super::truncate::truncate_history_if_needed(&mut conversation_state, &model_id);
+
     if !tool_name_map.is_empty() {
-        tracing::info!(
-            "工具名称映射: {} 个超长名称已缩短",
-            tool_name_map.len()
-        );
+        tracing::info!("工具名称映射: {} 个超长名称已缩短", tool_name_map.len());
     }
 
     Ok(ConversionResult {
@@ -1153,7 +1210,7 @@ fn remove_orphaned_tool_uses(
     }
 }
 
-/// Kiro API 工具名称最大长度限制
+/// Kiro API 工具名称最大长度限制（字节）
 const TOOL_NAME_MAX_LEN: usize = 63;
 /// 生成确定性短名称：截断前缀 + "_" + 8 位 SHA256 hex
 fn shorten_tool_name(name: &str) -> String {
@@ -1161,27 +1218,56 @@ fn shorten_tool_name(name: &str) -> String {
     hasher.update(name.as_bytes());
     let hash_hex = format!("{:x}", hasher.finalize());
     let hash_suffix = &hash_hex[..8];
-    // 54 prefix + 1 underscore + 8 hash = 63
-    let prefix_max = TOOL_NAME_MAX_LEN - 1 - 8;
-    let prefix = match name.char_indices().nth(prefix_max) {
-        Some((idx, _)) => &name[..idx],
-        None => name,
-    };
+    // 预算：54 字节前缀 + 1 字节下划线 + 8 字节 hash = 63 字节 = Kiro 上限。
+    //
+    // ⚠️ 前缀必须按**字节**截断（Kiro 的 63 是字节限制），同时**不能切裂 UTF-8 多字节字符**。
+    // 两个历史错误都要避免：
+    //   - 按字节裸切 `&name[..54]`：会 panic（切在 CJK 字符中间）；
+    //   - 按字符数截断 `chars().take(54)`：54 个汉字 = 162 字节，加后缀 171 字节，照样远超上限。
+    // 正确做法：逐字符累加字节数，在不超过预算的前提下尽可能多取（UTF-8 安全的字节界截断）。
+    const PREFIX_MAX_BYTES: usize = TOOL_NAME_MAX_LEN - 1 - 8; // 54 字节
+    let mut prefix = String::with_capacity(PREFIX_MAX_BYTES);
+    for ch in name.chars() {
+        if prefix.len() + ch.len_utf8() > PREFIX_MAX_BYTES {
+            break;
+        }
+        prefix.push(ch);
+    }
     format!("{}_{}", prefix, hash_suffix)
 }
 
 /// 如果名称超长则缩短，并记录映射（short → original）
+///
+/// ⚠️ 超限判断与前缀截断必须用**同一单位（字节）**，因为 Kiro 上游的 63 是字节限制。
+///
+/// 历史 bug：两者单位不一致 ——
+///   - `map_tool_name` 用 `name.len()`（字节）判是否超过 63 ← 正确
+///   - `shorten_tool_name` 用 `char_indices().nth(54)`（字符）截前缀 ← 对纯 ASCII 恰好等价，
+///     但对 CJK 就错了：30 个汉字 = 90 字节 > 63 触发缩短，而 `nth(54)` 在只有 30 个字符时
+///     返回 `None` → prefix 取**整个名字**（90 字节）→ short = 90+1+8 = 99 字节，
+///     **比原名更长且仍然超限** → 上游回 400 Improperly formed request。
+/// 修复后：前缀按字节预算（54）逐字符累加截断，UTF-8 安全且结果恒 ≤63 字节。
 fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, String>) -> String {
     if name.len() <= TOOL_NAME_MAX_LEN {
         return name.to_string();
     }
     let short = shorten_tool_name(name);
+    debug_assert!(
+        short.len() <= TOOL_NAME_MAX_LEN,
+        "shorten_tool_name 生成的短名 {:?} ({} 字节) 仍超过 Kiro 上限 {} 字节",
+        short,
+        short.len(),
+        TOOL_NAME_MAX_LEN
+    );
     tool_name_map.insert(short.clone(), name.to_string());
     short
 }
 
 /// 转换工具定义
-fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut HashMap<String, String>) -> Vec<Tool> {
+fn convert_tools(
+    tools: &Option<Vec<super::types::Tool>>,
+    tool_name_map: &mut HashMap<String, String>,
+) -> Vec<Tool> {
     let Some(tools) = tools else {
         return Vec::new();
     };
@@ -1222,27 +1308,67 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut Ha
                 tool_specification: ToolSpecification {
                     name: map_tool_name(&t.name, tool_name_map),
                     description,
-                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(t.input_schema))),
+                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(
+                        t.input_schema
+                    ))),
                 },
             }
         })
         .collect()
 }
 
+/// 判断模型是否为 GPT 系列（sol/terra/luna 等 OpenAI 模型）
+fn is_non_claude_model(model: &str) -> bool {
+    let lower = model.to_lowercase();
+    lower.contains("gpt-")
+        || lower.contains("sol")
+        || lower.contains("terra")
+        || lower.contains("luna")
+}
+
 /// 生成thinking标签前缀
+///
+/// - Claude 模型：使用 `<thinking_mode>` 标签（上游通过文本标签触发思考）
+/// - GPT 系列模型（sol/terra/luna）：使用 `<effort>LEVEL</effort>` 标签（上游协议级识别）
 fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
     if let Some(t) = &req.thinking {
+        if t.thinking_type == "disabled" {
+            // GPT 系列模型：low 抑制推理；Claude：不注入任何标签
+            if is_non_claude_model(&req.model) {
+                tracing::debug!(
+                    model = %req.model,
+                    effort = "low",
+                    "GPT 系列模型 thinking disabled，注入 <effort>low</effort> 抑制推理"
+                );
+                return Some("<effort>low</effort>".to_string());
+            }
+            return None;
+        }
+
+        // 获取 effort 级别
+        let effort = req
+            .output_config
+            .as_ref()
+            .map(|c| c.effort.as_str())
+            .unwrap_or("high");
+
+        if is_non_claude_model(&req.model) {
+            // GPT 系列模型：使用 <effort> 标签控制推理强度
+            tracing::debug!(
+                model = %req.model,
+                effort = %effort,
+                "GPT 系列模型注入思考等级标签"
+            );
+            return Some(format!("<effort>{}</effort>", effort));
+        }
+
+        // Claude 模型：保持原有 <thinking_mode> 机制，使用固定 budget_tokens
         if t.thinking_type == "enabled" {
             return Some(format!(
                 "<thinking_mode>enabled</thinking_mode><max_thinking_length>{}</max_thinking_length>",
                 t.budget_tokens
             ));
         } else if t.thinking_type == "adaptive" {
-            let effort = req
-                .output_config
-                .as_ref()
-                .map(|c| c.effort.as_str())
-                .unwrap_or("high");
             return Some(format!(
                 "<thinking_mode>adaptive</thinking_mode><thinking_effort>{}</thinking_effort>",
                 effort
@@ -1254,7 +1380,9 @@ fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
 
 /// 检查内容是否已包含thinking标签
 fn has_thinking_tags(content: &str) -> bool {
-    content.contains("<thinking_mode>") || content.contains("<max_thinking_length>")
+    content.contains("<thinking_mode>")
+        || content.contains("<max_thinking_length>")
+        || content.contains("<effort>")
 }
 
 /// 构建历史消息
@@ -1265,7 +1393,12 @@ fn has_thinking_tags(content: &str) -> bool {
 ///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息），
 ///   调用方应始终使用此参数而非 `req.messages`。
 /// * `model_id` - 已映射的 Kiro 模型 ID
-fn build_history(req: &MessagesRequest, messages: &[super::types::Message], model_id: &str, tool_name_map: &mut HashMap<String, String>) -> Result<Vec<Message>, ConversionError> {
+fn build_history(
+    req: &MessagesRequest,
+    messages: &[super::types::Message],
+    model_id: &str,
+    tool_name_map: &mut HashMap<String, String>,
+) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
@@ -1438,7 +1571,8 @@ fn convert_assistant_message(
                             if let (Some(id), Some(name)) = (block.id, block.name) {
                                 let input = block.input.unwrap_or(serde_json::json!({}));
                                 let mapped_name = map_tool_name(&name, tool_name_map);
-                                tool_uses.push(ToolUseEntry::new(id, mapped_name).with_input(input));
+                                tool_uses
+                                    .push(ToolUseEntry::new(id, mapped_name).with_input(input));
                             }
                         }
                         _ => {}
@@ -1674,7 +1808,10 @@ mod tests {
         assert!(!out.contains("<env>"), "env 起始标签应被剥离");
         assert!(!out.contains("Working directory"), "cwd 行应被剥离");
         assert!(!out.contains("Today's date"), "日期行应被剥离");
-        assert!(out.contains("You are a helpful assistant."), "稳定正文应保留");
+        assert!(
+            out.contains("You are a helpful assistant."),
+            "稳定正文应保留"
+        );
         assert!(out.contains("Follow the task."), "env 后正文应保留");
     }
 
@@ -1694,7 +1831,8 @@ mod tests {
     fn test_strip_env_noise_removes_environment_section() {
         let _g = EnvNoiseGuard::enable();
         // # Environment 段剥到下一个 # 标题为止，后续标题及正文保留
-        let text = "# Task\nDo the work.\n# Environment\nfoo\nbar\ngitStatus: x\n# Rules\nBe concise.";
+        let text =
+            "# Task\nDo the work.\n# Environment\nfoo\nbar\ngitStatus: x\n# Rules\nBe concise.";
         let out = canonicalize_system_text(text);
         assert!(out.contains("# Task"));
         assert!(out.contains("Do the work."));
@@ -1709,10 +1847,14 @@ mod tests {
     fn test_strip_env_noise_stable_content_untouched() {
         let _g = EnvNoiseGuard::enable();
         // 纯稳定正文：无任何噪音标记 → 原样借用不改写
-        let text = "You are an expert engineer.\nWrite clean, tested code.\nExplain your reasoning.";
+        let text =
+            "You are an expert engineer.\nWrite clean, tested code.\nExplain your reasoning.";
         let out = canonicalize_system_text(text);
         assert_eq!(out.as_ref(), text, "稳定正文一字节不改");
-        assert!(matches!(out, std::borrow::Cow::Borrowed(_)), "未改写应零分配借用");
+        assert!(
+            matches!(out, std::borrow::Cow::Borrowed(_)),
+            "未改写应零分配借用"
+        );
     }
 
     #[test]
@@ -1784,7 +1926,10 @@ mod tests {
         let sys_b = extract(&req_b);
 
         assert_eq!(sys_a, sys_b, "env 漂移剥离后转发字节应一致");
-        assert!(!sys_a.contains("Working directory"), "漂移的 cwd 不应泄漏到转发字节");
+        assert!(
+            !sys_a.contains("Working directory"),
+            "漂移的 cwd 不应泄漏到转发字节"
+        );
         assert!(sys_a.contains("Help the user."), "稳定正文应保留");
     }
 
@@ -1832,7 +1977,10 @@ mod tests {
         // 完整原生 id 直透（含子串，映射回自身）
         assert_eq!(map_model("deepseek-3.2"), Some("deepseek-3.2".to_string()));
         assert_eq!(map_model("glm-5"), Some("glm-5".to_string()));
-        assert_eq!(map_model("qwen3-coder-next"), Some("qwen3-coder-next".to_string()));
+        assert_eq!(
+            map_model("qwen3-coder-next"),
+            Some("qwen3-coder-next".to_string())
+        );
         assert_eq!(map_model("minimax-m2.5"), Some("minimax-m2.5".to_string()));
         // minimax 版本细分
         assert_eq!(map_model("minimax-m2.1"), Some("minimax-m2.1".to_string()));
@@ -1945,13 +2093,75 @@ mod tests {
 
     #[test]
     fn test_shorten_tool_name_deterministic() {
-        let long_name = "mcp__some_very_long_server_name__some_very_long_tool_name_that_exceeds_limit";
+        let long_name =
+            "mcp__some_very_long_server_name__some_very_long_tool_name_that_exceeds_limit";
         assert!(long_name.len() > TOOL_NAME_MAX_LEN);
 
         let short1 = shorten_tool_name(long_name);
         let short2 = shorten_tool_name(long_name);
         assert_eq!(short1, short2, "相同输入应产生相同的短名称");
-        assert!(short1.len() <= TOOL_NAME_MAX_LEN, "短名称长度应 <= 63，实际 {}", short1.len());
+        assert!(
+            short1.len() <= TOOL_NAME_MAX_LEN,
+            "短名称长度应 <= 63，实际 {}",
+            short1.len()
+        );
+    }
+
+    #[test]
+    fn test_map_tool_name_cjk_never_exceeds_limit() {
+        // ⭐回归(旧代码必失败):超限判断用字节数、前缀截取用字符数,两者单位不一致。
+        // 30 个汉字 = 90 字节 > 63 → 触发缩短;但 char_indices().nth(54) 在只有 30 字符时
+        // 返回 None → prefix 取整个名字 → 结果 90+1+8 = 99 字节,**比原名更长且仍超上限**,
+        // 上游 Kiro 会回 400 Improperly formed request。
+        // 修复后前缀按 chars().take(54) 截取,短名恒为 ASCII 且 ≤63 字节。
+        let mut map = HashMap::new();
+        for n in [20usize, 22, 30, 40, 60, 100, 200] {
+            let cjk_name: String = "工".repeat(n);
+            let short = map_tool_name(&cjk_name, &mut map);
+            assert!(
+                short.len() <= TOOL_NAME_MAX_LEN,
+                "{n} 个汉字({} 字节)的工具名缩短后为 {} 字节(>{}上限): {:?}",
+                cjk_name.len(),
+                short.len(),
+                TOOL_NAME_MAX_LEN,
+                short
+            );
+            if cjk_name.len() > TOOL_NAME_MAX_LEN {
+                assert!(
+                    short.len() < cjk_name.len(),
+                    "缩短后必须比原名更短,否则毫无意义(原 {} 字节 → 短 {} 字节)",
+                    cjk_name.len(),
+                    short.len()
+                );
+                assert_eq!(
+                    map.get(&short).map(String::as_str),
+                    Some(cjk_name.as_str()),
+                    "必须登记 short→original 映射,否则 stream 层无法还原成客户端原名"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_map_tool_name_mixed_width_boundary() {
+        // 混合宽度(ASCII + CJK)在 63 字节边界附近:凡触发缩短的,结果都必须 ≤63 字节。
+        let mut map = HashMap::new();
+        for ascii_len in 0..8usize {
+            for cjk_len in 18..26usize {
+                let name = format!("{}{}", "a".repeat(ascii_len), "文".repeat(cjk_len));
+                let short = map_tool_name(&name, &mut map);
+                assert!(
+                    short.len() <= TOOL_NAME_MAX_LEN,
+                    "name({} 字节) → short({} 字节) 超限",
+                    name.len(),
+                    short.len()
+                );
+                // 未超限的名字必须原样返回(不该被无谓改写)。
+                if name.len() <= TOOL_NAME_MAX_LEN {
+                    assert_eq!(short, name, "未超限的工具名不应被改写");
+                }
+            }
+        }
     }
 
     #[test]
@@ -1984,7 +2194,8 @@ mod tests {
     fn test_tool_name_mapping_in_convert_request() {
         use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
-        let long_tool_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
+        let long_tool_name =
+            "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
         assert!(long_tool_name.len() > TOOL_NAME_MAX_LEN);
 
         let mut schema = std::collections::HashMap::new();
@@ -1994,12 +2205,10 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
-            messages: vec![
-                AnthropicMessage {
-                    role: "user".to_string(),
-                    content: serde_json::json!("test"),
-                },
-            ],
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
             system: None,
             stream: false,
             tools: Some(vec![AnthropicTool {
@@ -2027,8 +2236,12 @@ mod tests {
         assert!(short.len() <= TOOL_NAME_MAX_LEN);
 
         // Kiro 请求中的工具名应该是短名称
-        let tools = &result.conversation_state.current_message.user_input_message
-            .user_input_message_context.tools;
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
         assert_eq!(tools[0].tool_specification.name, *short);
     }
 
@@ -2086,7 +2299,8 @@ mod tests {
     fn test_tool_name_mapping_in_history() {
         use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
-        let long_tool_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
+        let long_tool_name =
+            "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
 
         let mut schema = std::collections::HashMap::new();
         schema.insert("type".to_string(), serde_json::json!("object"));
@@ -2790,9 +3004,15 @@ mod tests {
 
         let content = &result.assistant_response_message.content;
         assert!(content.contains("<thinking>"), "应包含 thinking 标签");
-        assert!(content.contains("Let me read that file"), "应包含第二条消息的 text 内容");
+        assert!(
+            content.contains("Let me read that file"),
+            "应包含第二条消息的 text 内容"
+        );
 
-        let tool_uses = result.assistant_response_message.tool_uses.expect("应有 tool_uses");
+        let tool_uses = result
+            .assistant_response_message
+            .tool_uses
+            .expect("应有 tool_uses");
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].tool_use_id, "toolu_01ABC");
     }
@@ -2842,7 +3062,11 @@ mod tests {
         };
 
         let result = convert_request(&req);
-        assert!(result.is_ok(), "连续 assistant 消息场景不应报错: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "连续 assistant 消息场景不应报错: {:?}",
+            result.err()
+        );
 
         let state = result.unwrap().conversation_state;
         let mut found_tool_use = false;
@@ -2919,14 +3143,16 @@ mod tests {
                         found_image = true;
                     }
                 }
-                // tool_result 只保留文本，base64 不应出现在 tool_result content 里
-                for tr in &u.user_input_message.user_input_message_context.tool_results {
-                    if tr.tool_use_id == "tool-1" {
-                        let text = tr.content[0].get("text").and_then(|v| v.as_str()).unwrap_or("");
-                        assert_eq!(text, "here is the screen");
-                        assert!(!text.contains(TINY_PNG_B64), "tool_result 不应含 base64");
-                        tool_result_text_ok = true;
-                    }
+                // 历史里的结构化 tool_results 已被 sanitize_history 扁平化成正文文本
+                // （上游只接受一个活跃工具轮次）。故改为在正文里断言：文本保留、
+                // base64 不泄漏进文本。
+                let content = &u.user_input_message.content;
+                if content.contains("here is the screen") {
+                    assert!(
+                        !content.contains(TINY_PNG_B64),
+                        "叙述化后的正文不应含 base64"
+                    );
+                    tool_result_text_ok = true;
                 }
             }
         }
@@ -3004,16 +3230,120 @@ mod tests {
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": TINY_PNG_B64}}
         ]);
 
-        let (_t1, imgs1, _) =
-            process_message_content_dedup(&content, Some(&mut dedup)).unwrap();
+        let (_t1, imgs1, _) = process_message_content_dedup(&content, Some(&mut dedup)).unwrap();
         assert_eq!(imgs1.len(), 1, "首次出现应保留图片");
 
-        let (text2, imgs2, _) =
-            process_message_content_dedup(&content, Some(&mut dedup)).unwrap();
+        let (text2, imgs2, _) = process_message_content_dedup(&content, Some(&mut dedup)).unwrap();
         assert!(imgs2.is_empty(), "重复图片不应再次上浮");
         assert!(
             text2.contains("identical to an earlier screenshot"),
             "重复图片应替换为去重占位符"
         );
+    }
+}
+
+// === 临时测试模块：验证 sol 模型 thinking prefix ===
+#[cfg(test)]
+mod sol_thinking_tests {
+    use super::*;
+    use crate::anthropic::types::*;
+
+    fn make_req(model: &str, thinking_type: &str, effort: Option<&str>) -> MessagesRequest {
+        MessagesRequest {
+            model: model.to_string(),
+            max_tokens: 4096,
+            messages: vec![],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: thinking_type.to_string(),
+                budget_tokens: 1024,
+            }),
+            output_config: effort.map(|e| OutputConfig {
+                effort: e.to_string(),
+            }),
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_is_non_claude_model() {
+        assert!(is_non_claude_model("gpt-5-sol"));
+        assert!(is_non_claude_model("gpt-4o"));
+        assert!(is_non_claude_model("sol"));
+        assert!(is_non_claude_model("my-terra-model"));
+        assert!(is_non_claude_model("luna-v2"));
+        assert!(!is_non_claude_model("claude-sonnet-4"));
+        assert!(!is_non_claude_model("claude-3-opus"));
+    }
+
+    #[test]
+    fn test_sol_enabled_high() {
+        let req = make_req("gpt-5-sol", "enabled", Some("high"));
+        let prefix = generate_thinking_prefix(&req).unwrap();
+        assert_eq!(
+            prefix, "<effort>high</effort>",
+            "sol enabled+high 应生成 <effort>high</effort>"
+        );
+    }
+
+    #[test]
+    fn test_sol_enabled_medium() {
+        let req = make_req("gpt-5-sol", "enabled", Some("medium"));
+        let prefix = generate_thinking_prefix(&req).unwrap();
+        assert_eq!(prefix, "<effort>medium</effort>");
+    }
+
+    #[test]
+    fn test_sol_enabled_low() {
+        let req = make_req("gpt-5-sol", "enabled", Some("low"));
+        let prefix = generate_thinking_prefix(&req).unwrap();
+        assert_eq!(prefix, "<effort>low</effort>");
+    }
+
+    #[test]
+    fn test_sol_disabled_returns_low() {
+        // thinking disabled + 非 Claude → <effort>low</effort> 抑制推理
+        let req = make_req("gpt-5-sol", "disabled", None);
+        let prefix = generate_thinking_prefix(&req).unwrap();
+        assert_eq!(
+            prefix, "<effort>low</effort>",
+            "disabled 非 Claude 应返回 <effort>low</effort>"
+        );
+    }
+
+    #[test]
+    fn test_claude_disabled_returns_none() {
+        // thinking disabled + Claude → None（不注入任何标签）
+        let req = make_req("claude-sonnet-4", "disabled", None);
+        assert!(
+            generate_thinking_prefix(&req).is_none(),
+            "Claude disabled 应返回 None"
+        );
+    }
+
+    #[test]
+    fn test_claude_enabled_uses_thinking_mode() {
+        // Claude enabled → <thinking_mode> 标签，不用 <effort>
+        let req = make_req("claude-sonnet-4", "enabled", Some("high"));
+        let prefix = generate_thinking_prefix(&req).unwrap();
+        assert!(prefix.contains("<thinking_mode>enabled</thinking_mode>"));
+        assert!(prefix.contains("<max_thinking_length>"));
+        assert!(
+            !prefix.contains("<effort>"),
+            "Claude 不应使用 <effort> 标签"
+        );
+    }
+
+    #[test]
+    fn test_has_thinking_tags_detects_effort() {
+        assert!(has_thinking_tags("<effort>high</effort>"));
+        assert!(has_thinking_tags("<thinking_mode>enabled</thinking_mode>"));
+        assert!(has_thinking_tags(
+            "<max_thinking_length>1024</max_thinking_length>"
+        ));
+        assert!(!has_thinking_tags("just normal text"));
     }
 }

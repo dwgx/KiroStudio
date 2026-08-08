@@ -24,18 +24,20 @@
 
 pub mod compressor;
 pub(crate) mod converter;
-pub(crate) mod model_catalog;
 pub(crate) mod handlers;
 pub(crate) mod middleware;
+pub(crate) mod model_catalog;
 mod router;
+pub(crate) mod sanitize_history;
 mod stream;
+pub(crate) mod truncate;
 pub mod types;
 mod websearch;
 
-pub use handlers::set_collect_client_fingerprint;
 pub use converter::{set_strip_env_noise, set_tool_description_max_chars};
-pub use handlers::set_extract_thinking;
 pub use handlers::set_cc_auto_buffer;
+pub use handlers::set_collect_client_fingerprint;
+pub use handlers::set_extract_thinking;
 pub use handlers::{
     set_tool_clean_leaked_tokens, set_tool_expose_error_to_client, set_tool_repair_json,
     set_tool_stream_align_failure, set_tool_truncation_recovery,

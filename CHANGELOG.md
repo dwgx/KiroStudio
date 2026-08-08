@@ -2,6 +2,99 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [0.7.44] - 2026-07-27 - macOS 完整支持 + 全仓精读后的致命缺陷修复批次
+
+对全仓 53k 行 Rust + 23k 行前端做逐文件精读，再对每条发现**逐一读代码复核**（含证伪），
+只修确认成立的缺陷，每条都配能抓住旧 bug 的回归测试。测试 778 → **792 全绿**。
+
+### macOS 完整支持（新平台）
+
+此前 macOS 属于"能编译但链路断裂"状态，本版补齐为与 Linux/Windows 同等的一等公民：
+
+- **OTA 按 `OS × 架构` 选资产（致命修复）**：`ASSET_BIN` 原先只有 `cfg(windows)` /
+  `cfg(not(windows))` 二选一、**不看架构**，于是 macOS（Intel 与 Apple Silicon）和 arm64 Linux
+  全部落到 `kirostudio-linux-x86_64` → 面板点「一键升级」会把 Mach-O 替换成 Linux ELF，
+  sha256 还校验通过（下的和它自己的哈希对得上），重启后**新二进制无法执行、服务当场死亡**
+  （人工恢复 `mv kirostudio.bak kirostudio`）。现穷举 6 个 OS×ARCH 组合；未覆盖组合直接
+  `compile_error!`，绝不静默回退到某个默认资产名。
+- **CI 产出 macOS 资产**：新增 `build-release-macos` job（`macos-14` runner，矩阵产出
+  `kirostudio-macos-aarch64` 与 `kirostudio-macos-x86_64` + 各自 `.sha256`）。
+- **一键重启 / OTA 后自愈**：macOS 无 systemd，原实现把"非 Windows"等同于"Linux+systemd"，
+  `exit(0)` 后无人拉起 → 服务消失。现单独拆出 macOS 分支，spawn detached POSIX shell 助手
+  （用位置参数 `"$0" "$@"` 传参，天然规避引号/注入问题；`trap '' HUP` 防关终端连累助手）。
+- **安装脚本支持 macOS**：`install-binary.sh` 按 `uname` 归一化 OS×ARCH 自动选资产，
+  sha256 工具自适应（`sha256sum` / `shasum -a 256`），并安装 **launchd LaunchAgent**
+  （`KeepAlive=true` 等价于 systemd `Restart=always`，`ThrottleInterval` 防崩溃循环）。
+
+### 致命缺陷修复
+
+- **`acquire_context` CPU 忙等死循环**：`transient_wait_outcome` 的硬门条件与
+  `is_entry_selectable` **不对齐**（漏了 `is_custom_api_credential` 与 `is_model_blocked`），
+  导致 select 返 None 而等待判定返 `Available`，而 `Available => continue` 分支既不 sleep
+  也不递增 `attempt_count` → **请求永不返回且烧满一个 CPU 核**。触发路径真实存在：
+  ① 池中只有 custom_api 代挂号（透传全冷却后回落 Kiro 路径、MCP/WebSearch）；
+  ② 某模型被全池加进 model_blocklist（TTL 1800s）后再来同模型请求。
+  除补齐过滤外另加竞态重选计数上限（64）作纵深防御，使**将来再次不对齐也只是快速失败而非挂死**。
+- **入站令牌桶容量塌陷**：容量 `=(rpm*1000/60).max(1)*burst` 而取一个令牌需 1000 milli，
+  隐含要求 `rpm*burst >= 60`。默认 `burst_secs=2` 时 `rpm<=29` 容量就 <1000，桶**永远攒不满
+  一个令牌**；而 AIMD 从默认 100 连降两档即到 25 → **默认配置下被上游 429 打两次就整体塌陷**：
+  所有请求排满 30s，`passthrough=true` 时限速彻底失效且每请求白等 30s。容量与初始桶均补
+  `.max(ONE_TOKEN_MILLI)` 兜底。
+
+### 高危缺陷修复
+
+- **AIMD 升档饿死（第二条路径）**：`report_upstream_429` 在**已达 rpm_min**（`next == cur`，
+  本次并未真降档）时仍无条件刷新 `last_md_nanos`，而升档要求 `since_md >= 20s` →
+  上游持续零星 429（间隔 >3s 穿过去抖窗、<20s 不到静默期）就让 RPM **永久卡在 floor 回不去**。
+  改为只在真降档时刷新。（去抖分支的同类 bug 此前已修，这条"降不动了"的路径漏了。）
+- **裸 429 的 health 键错用 `cred:{id}`**：读侧（选号 `p_avail` / `report_success` /
+  `report_family_suspicious` / `health_snapshots`）全用 `family_key`，而写侧硬编码
+  `cred:{id}`。external_idp(M365) 的 `family_key` 是 `m365:{tenant}` ≠ `cred:{id}` →
+  裸 429 的 `ewma_429`/`consecutive_429`/跳闸全写进**从不被读**的影子条目，
+  **M365 号被 429 打爆也永不熔断或降权**。（social/idc 因两键恰好相等而正常，故此前测不出来。）
+- **自动禁用不持久化，重启后死号复活**：5 条自动禁用路径（配额耗尽 / 账户封禁 /
+  refreshToken 永久失效 / 连续失败 / 连续刷新失败）禁用后只调 `save_stats_debounced()`，
+  而 `StatsEntry` **不含 `disabled`/`disabled_reason`** → 重启后死号以 enabled 回池、
+  重新走一遍禁用流程（invalid_grant 号白耗一次刷新往返，配额号多打一次 402）。
+  新增 `persist_disabled_state()` 统一收口。
+- **`invoke_sniff_buffer` 无界持有导致整条流停摆**：`partial_invoke_tag_suffix_len` 对
+  "最后一个 `<` 之后没有 `>`"的尾巴**无长度上限**地保留；一旦该 `<` 落到缓冲首位，
+  `emit_len=0` → **此后整条响应的文本都不再下发**，全部囤到流结束，且缓冲无界增长。
+  触发条件很日常：reclaim 开（默认）+ 请求带工具 + 模型输出含孤立 `<`（中文散文的
+  "条件 a < b 时"、数学式、代码里的比较运算符）。现超过 64 字节即判定"不是半个标签"正常吐出。
+- **CJK 工具名"越缩越长"且仍超限**：`map_tool_name` 按**字节**判超限，`shorten_tool_name`
+  按**字符**截前缀。30 个汉字 = 90 字节 > 63 触发缩短，但 `nth(54)` 在只有 30 字符时返回
+  `None` → prefix 取整个名字 → 结果 99 字节，**比原名更长且仍超限** → 上游回 400。
+  改为按字节预算 54 逐字符累加截断（UTF-8 安全），并加 `debug_assert` 兜底。
+- **背景图端点的 MIME / 体积缺口（XSS）**：`/admin/api/bg-img` 与 `/admin/api/bg-cached`
+  都**匿名可达**且原样回响应体，而前者把上游 `Content-Type` 原样透传 → 构造让上游返回
+  `text/html` 即可在 `/admin` **同源执行脚本**（adminKey 明文存于 localStorage、全仓无 CSP）。
+  预取池路径 `download_bg_bytes` 更弱：既不校验 MIME 也**无体积上限**，而图片 URL 来自
+  第三方 JSON 源＝外部可控数据，污染入池后经匿名 `bg-cached` 吐出即同一条 XSS。
+  现两处共用图片 MIME 白名单（入池侧拒绝、代理侧覆盖为 `image/jpeg`）+ 10MiB 流式上限，
+  两个响应端点均补 `X-Content-Type-Options: nosniff`。
+- **发版闸门：tag 与 `Cargo.toml` 版本一致性校验**：OTA 的 `has_update` 比较
+  "远端最大 tag vs 编译期注入的 `LOCAL_VERSION`"。若打了 tag 却忘记 bump `Cargo.toml`，
+  二进制自报旧版 → 升级→重启→**仍认为有新版** → 无限升级循环，且每轮真的重写一次二进制。
+  这是整条发布链上唯一没有自动闸门的地方，现加为 test job 的强制门禁。
+
+### 其它
+
+- **测试不再依赖真实 DNS**：custom_api 相关测试原用 `example.com` 做 base_url，而 SSRF 校验
+  会真实解析域名。开启 fake-IP 模式代理的机器（Clash/Surge 用 `198.18.0.0/16` 作 fake-IP 池，
+  该段正是 `ssrf.rs` 的 RFC2544 禁止段）上 `cargo test` **必然失败**且原因与被测逻辑无关。
+  改用 RFC 6761 保留的 `.invalid` TLD（保证永不解析）。
+- 文档更正：`README.md` 的 Docker 默认宿主端口 8991 → **8990**（与 `docker-compose.yml`
+  和 `install.sh` 一致，照旧文档访问必然连不上）；补全平台/资产对照表。
+- `CLAUDE.md` 更正多处与代码不符之处：构建命令必须带 `--no-default-features`
+  （`Cargo.toml` 的 `default = ["native-tls"]` 与出厂配置相反）；`src/test.rs` 与
+  `src/debug.rs` **不参与编译**（`main.rs` 无对应 `mod` 声明，且已与现有 API 脱节）；
+  已知问题 #2 实为"仅修一半"（chunked 响应可绕过 Content-Length 预检）；
+  已知问题 #6 的描述方向修正为"不遵守 `=true`"。
+- `install-binary.sh` 生成的 systemd unit 补挂 `ExecStartPre=-deploy/rollback-guard.sh`
+  与 `Environment=KIRO_WORKDIR`：此前走公共安装脚本的部署**没有 OTA 崩溃自动回滚**，
+  坏版本只会被 `Restart=always` 反复拉起直到 StartLimit 停住。
+
 ## [0.7.38] - 2026-07-17 - 对抗性审计修复批次(机器码封禁 + IP身份 + 刷新惊群 + 缓冲内存)
 
 外部红队审计(grok)+ 主线逐条核验代码后修复的确认缺陷。质量只升不降。

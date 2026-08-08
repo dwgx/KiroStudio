@@ -152,6 +152,8 @@ impl IdcLoginManager {
             idc::PollTokenResult::Done(token) => {
                 let new_cred = KiroCredentials {
                     id: None,
+                    // 由 add_credential 统一盖时间戳（那里是唯一收口）。
+                    added_at_ms: None,
                     access_token: Some(token.access_token),
                     refresh_token: token.refresh_token,
                     profile_arn: None,
@@ -174,6 +176,8 @@ impl IdcLoginManager {
                     base_url: None,
                     api_key: None,
                     request_limit: None,
+                    // IdC 上号产出的是 Kiro 号（非 custom_api 代挂号），该开关对它无意义 → 跟随全局。
+                    custom_api_first: None,
                     region: Some(session.region.clone()),
                     auth_region: Some(session.region.clone()),
                     api_region: None,
@@ -183,8 +187,14 @@ impl IdcLoginManager {
                     subscription_title: None,
                     // 上号时显式填的代理持久化到该凭据（拆好账密），global 回落不持久化。
                     proxy_url: session.custom_proxy.as_ref().map(|p| p.url.clone()),
-                    proxy_username: session.custom_proxy.as_ref().and_then(|p| p.username.clone()),
-                    proxy_password: session.custom_proxy.as_ref().and_then(|p| p.password.clone()),
+                    proxy_username: session
+                        .custom_proxy
+                        .as_ref()
+                        .and_then(|p| p.username.clone()),
+                    proxy_password: session
+                        .custom_proxy
+                        .as_ref()
+                        .and_then(|p| p.password.clone()),
                     disabled: false,
                     kiro_api_key: None,
                     endpoint: None,
@@ -198,11 +208,7 @@ impl IdcLoginManager {
                     }
                 };
 
-                if let Err(e) = self
-                    .token_manager
-                    .get_usage_limits_for(credential_id)
-                    .await
-                {
+                if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
                     tracing::warn!("IDC 上号后获取订阅等级失败: {}", e);
                 }
 

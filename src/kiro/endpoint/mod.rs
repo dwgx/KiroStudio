@@ -11,8 +11,12 @@ use reqwest::RequestBuilder;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
+pub mod alt;
+pub mod cli;
 pub mod ide;
 
+pub use alt::{AmazonQEndpoint, CodeWhispererEndpoint, ENDPOINT_FALLBACK_ORDER};
+pub use cli::CliEndpoint;
 pub use ide::IdeEndpoint;
 
 /// Kiro 端点
@@ -36,6 +40,30 @@ pub trait KiroEndpoint: Send + Sync {
 
     /// 装饰 MCP 请求的端点特有 header
     fn decorate_mcp(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder;
+
+    /// 本端点请求体的 `content-type`。
+    ///
+    /// 由 Provider **唯一**设置（`decorate_api`/`decorate_mcp` 实现里绝不要再设，
+    /// 见下方"为何是 trait 方法"）。默认 `application/json`，与 ide/alt 既有行为一致；
+    /// 走 AWS JSON 1.0 协议的端点（如 `cli`）覆写为 `application/x-amz-json-1.0`。
+    ///
+    /// # 为何是 trait 方法而不是各实现自己加头
+    ///
+    /// reqwest 的 `RequestBuilder::header()` 内部是 `headers_mut().append()`——**追加**
+    /// 而非覆盖。Provider 统一设一次、端点又在 `decorate` 里设一次，请求就会带**两个**
+    /// content-type。生产事故实证（2026-08-04，真实上游抓包）：`cli` 端点发出
+    /// `["application/json", "application/x-amz-json-1.0"]`，服务端取**第一个**值，
+    /// 于是回 HTTP **200** +
+    /// `{"Output":{"__type":"com.amazon.coral.service#UnknownOperationException"},"Version":"1.0"}`。
+    ///
+    /// 这个组合是最坏的：200 让网关记成功（健康分只升不降、坏号永不退出轮转），
+    /// 而 JSON 文本被喂进 event-stream 解码器又读出 `total_length = 2065846133`
+    /// （ASCII `{"Ou`）——与生产日志里那个"19 亿字节"数字逐位相同。
+    ///
+    /// 把它收成单一真相源，重复头在类型层面就不可能再出现。
+    fn content_type(&self) -> &'static str {
+        "application/json"
+    }
 
     /// 对已序列化的 API 请求体做端点特有加工（如注入 profileArn）
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String;
@@ -249,11 +277,17 @@ pub fn default_is_client_validation_error(body: &str) -> bool {
 
 /// 默认的 MODEL_TEMPORARILY_UNAVAILABLE 判断逻辑。
 ///
-/// 503 且 body 含该信号时表示**模型容量**问题，非凭据问题。
+/// 识别**模型容量**问题的信号（503 或 429 均可能携带），非凭据问题。
 /// 命中时应走慢速退避，且不影响凭据健康分。
+///
+/// 已知信号：
+/// - `MODEL_TEMPORARILY_UNAVAILABLE` (503 经典形式)
+/// - `model is temporarily unavailable` (小写变体)
+/// - `INSUFFICIENT_MODEL_CAPACITY` (429 形式，生产实证 2026-08-01)
 pub fn default_is_model_temporarily_unavailable(body: &str) -> bool {
     body.contains("MODEL_TEMPORARILY_UNAVAILABLE")
         || body.contains("model is temporarily unavailable")
+        || body.contains("INSUFFICIENT_MODEL_CAPACITY")
 }
 
 /// 默认的"从错误 body 提取重置秒数"逻辑
@@ -307,9 +341,13 @@ mod tests {
         assert!(default_is_feature_not_supported(
             r#"{"__type":"AccessDeniedException","message":"FEATURE_NOT_SUPPORTED"}"#
         ));
-        assert!(default_is_feature_not_supported("403 FEATURE_NOT_SUPPORTED for region"));
+        assert!(default_is_feature_not_supported(
+            "403 FEATURE_NOT_SUPPORTED for region"
+        ));
         // 不误命中普通错误。
-        assert!(!default_is_feature_not_supported(r#"{"reason":"MONTHLY_REQUEST_COUNT"}"#));
+        assert!(!default_is_feature_not_supported(
+            r#"{"reason":"MONTHLY_REQUEST_COUNT"}"#
+        ));
         assert!(!default_is_feature_not_supported("INVALID_MODEL_ID"));
     }
 
@@ -375,8 +413,7 @@ mod tests {
         // ⚠️ 防误冻核心边界：一段"临时限速但文案里带 suspended"的 body，
         // is_temporary_rate_limit 必须命中（provider 会先判它，从而只设短冷却）。
         // 同时该 body 也会被 is_account_suspended 命中——正因如此顺序才关键。
-        let body =
-            "Your account has been suspended due to suspicious activity. temporary limits applied, try again later.";
+        let body = "Your account has been suspended due to suspicious activity. temporary limits applied, try again later.";
         assert!(
             default_is_temporary_rate_limit(body),
             "临时风控文案必须先被识别为临时限速"
@@ -427,6 +464,38 @@ mod tests {
         assert_eq!(
             default_extract_retry_after_secs(r#"{"resets_at":1000}"#),
             None
+        );
+    }
+
+    /// 回归：429 + INSUFFICIENT_MODEL_CAPACITY 应走容量路径（不冷却凭据、慢速退避）。
+    /// 生产实证 2026-08-01: claude-opus-5-thinking 返回此信号，被误处置成凭据限流。
+    #[test]
+    fn test_429_insufficient_model_capacity_recognized() {
+        let body = r#"{"message":"I am experiencing high traffic, please try again shortly.","reason":"INSUFFICIENT_MODEL_CAPACITY"}"#;
+        assert!(
+            default_is_model_temporarily_unavailable(body),
+            "429 + INSUFFICIENT_MODEL_CAPACITY 应识别为模型容量问题"
+        );
+    }
+
+    /// 确认经典 503 + MODEL_TEMPORARILY_UNAVAILABLE 仍被识别（回归）。
+    #[test]
+    fn test_503_model_temporarily_unavailable_still_works() {
+        let body =
+            r#"{"error":{"type":"overloaded_error","message":"MODEL_TEMPORARILY_UNAVAILABLE"}}"#;
+        assert!(
+            default_is_model_temporarily_unavailable(body),
+            "503 + MODEL_TEMPORARILY_UNAVAILABLE 经典形式必须仍被识别"
+        );
+    }
+
+    /// 普通 429（无容量信号）应走限流路径，不被误认成容量问题。
+    #[test]
+    fn test_429_rate_limit_without_capacity_signal_not_recognized() {
+        let body = r#"{"error":{"type":"rate_limit_error","message":"Request quota exceeded"}}"#;
+        assert!(
+            !default_is_model_temporarily_unavailable(body),
+            "普通 429 限流错误不应被识别为容量问题（应走冷却路径）"
         );
     }
 }

@@ -98,7 +98,13 @@ fn is_forbidden_ipv6(ip: Ipv6Addr) -> bool {
         return true;
     }
     // 64:ff9b::/96 NAT64 —— 内嵌 v4 目标，按 v4 判定后 32 位
-    if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0 {
+    if seg[0] == 0x0064
+        && seg[1] == 0xff9b
+        && seg[2] == 0
+        && seg[3] == 0
+        && seg[4] == 0
+        && seg[5] == 0
+    {
         let v4 = Ipv4Addr::new(
             (seg[6] >> 8) as u8,
             (seg[6] & 0xff) as u8,
@@ -148,10 +154,7 @@ fn parse_host_port(url: &str) -> Result<(String, u16), String> {
     };
 
     // 去掉 path/query/fragment，只留 authority
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or("");
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     if authority.is_empty() {
         return Err("URL 缺少主机".to_string());
     }
@@ -251,7 +254,10 @@ pub async fn build_guarded_client(
         .split_once("://")
         .map(|(s, _)| s.to_ascii_lowercase())
         .ok_or_else(|| "URL 缺少 scheme".to_string())?;
-    if !allowed_schemes.iter().any(|s| s.eq_ignore_ascii_case(&scheme)) {
+    if !allowed_schemes
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(&scheme))
+    {
         return Err(format!("scheme 不被允许: {scheme}"));
     }
 
@@ -296,38 +302,47 @@ mod tests {
     fn test_forbidden_ipv4() {
         // 内网/环回/链路本地/元数据/多播/保留一律禁止
         for ip in [
-            "127.0.0.1", "10.0.0.1", "172.16.5.5", "172.31.255.255",
-            "192.168.1.1", "169.254.169.254", "100.64.0.1", "0.0.0.0",
-            "224.0.0.1", "240.0.0.1", "255.255.255.255", "192.0.2.5",
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.5.5",
+            "172.31.255.255",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "192.0.2.5",
             "198.18.0.1",
         ] {
-            assert!(
-                is_forbidden_ip(ip.parse().unwrap()),
-                "{ip} 应被禁止"
-            );
+            assert!(is_forbidden_ip(ip.parse().unwrap()), "{ip} 应被禁止");
         }
     }
 
     #[test]
     fn test_allowed_ipv4() {
         for ip in ["8.8.8.8", "1.1.1.1", "210.140.92.183"] {
-            assert!(
-                !is_forbidden_ip(ip.parse().unwrap()),
-                "{ip} 应被放行"
-            );
+            assert!(!is_forbidden_ip(ip.parse().unwrap()), "{ip} 应被放行");
         }
     }
 
     #[test]
     fn test_forbidden_ipv6() {
         for ip in [
-            "::1", "::", "fe80::1", "fc00::1", "fd12:3456::1",
-            "ff02::1", "::ffff:127.0.0.1", "::ffff:169.254.169.254",
+            "::1",
+            "::",
+            "fe80::1",
+            "fc00::1",
+            "fd12:3456::1",
+            "ff02::1",
+            "::ffff:127.0.0.1",
+            "::ffff:169.254.169.254",
             // 6to4 (RFC 3056): 2002::/16 内嵌私有/回环 IPv4
-            "2002:7f00:0001::",   // 内嵌 127.0.0.1
-            "2002:a9fe:a9fe::",   // 内嵌 169.254.169.254
-            "2002:0a00:0001::",   // 内嵌 10.0.0.1
-            "2002:c0a8:0101::",   // 内嵌 192.168.1.1
+            "2002:7f00:0001::", // 内嵌 127.0.0.1
+            "2002:a9fe:a9fe::", // 内嵌 169.254.169.254
+            "2002:0a00:0001::", // 内嵌 10.0.0.1
+            "2002:c0a8:0101::", // 内嵌 192.168.1.1
         ] {
             assert!(
                 is_forbidden_ip(ip.parse().unwrap()),
@@ -342,7 +357,8 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_host_port() {        assert_eq!(
+    fn test_parse_host_port() {
+        assert_eq!(
             parse_host_port("https://example.com/a/b?x=1").unwrap(),
             ("example.com".to_string(), 443)
         );
@@ -370,24 +386,60 @@ mod tests {
     #[tokio::test]
     async fn test_validate_outbound_url_rejects_internal_and_scheme() {
         // 元数据/环回/内网 IP 字面量：拒绝（IP 字面量 lookup_host 直接返回，不走真实 DNS）。
-        assert!(validate_outbound_url("http://169.254.169.254/latest/meta-data", true).await.is_err());
-        assert!(validate_outbound_url("https://127.0.0.1/v1/messages", true).await.is_err());
-        assert!(validate_outbound_url("http://10.0.0.1:6379", true).await.is_err());
+        assert!(
+            validate_outbound_url("http://169.254.169.254/latest/meta-data", true)
+                .await
+                .is_err()
+        );
+        assert!(
+            validate_outbound_url("https://127.0.0.1/v1/messages", true)
+                .await
+                .is_err()
+        );
+        assert!(
+            validate_outbound_url("http://10.0.0.1:6379", true)
+                .await
+                .is_err()
+        );
         assert!(validate_outbound_url("http://[::1]/x", true).await.is_err());
         // userinfo 混淆：@ 后是内网 → 拒绝（parse_host_port 剥 userinfo 取真实 host）。
-        assert!(validate_outbound_url("https://ok.com@169.254.169.254/x", true).await.is_err());
+        assert!(
+            validate_outbound_url("https://ok.com@169.254.169.254/x", true)
+                .await
+                .is_err()
+        );
         // scheme 门：allow_http=false 时 http 被拒。
-        assert!(validate_outbound_url("http://8.8.8.8/x", false).await.is_err());
+        assert!(
+            validate_outbound_url("http://8.8.8.8/x", false)
+                .await
+                .is_err()
+        );
         // 非 http(s) scheme 一律拒。
-        assert!(validate_outbound_url("ftp://8.8.8.8/x", true).await.is_err());
+        assert!(
+            validate_outbound_url("ftp://8.8.8.8/x", true)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
     async fn test_validate_outbound_url_allows_public_ip() {
         // 公网 IP 字面量放行（用 IP 免真实 DNS 依赖）。
-        assert!(validate_outbound_url("https://8.8.8.8/v1/messages", false).await.is_ok());
-        assert!(validate_outbound_url("http://1.1.1.1/x", true).await.is_ok());
+        assert!(
+            validate_outbound_url("https://8.8.8.8/v1/messages", false)
+                .await
+                .is_ok()
+        );
+        assert!(
+            validate_outbound_url("http://1.1.1.1/x", true)
+                .await
+                .is_ok()
+        );
         // allow_http=false 下 https 公网放行。
-        assert!(validate_outbound_url("https://1.1.1.1/x", false).await.is_ok());
+        assert!(
+            validate_outbound_url("https://1.1.1.1/x", false)
+                .await
+                .is_ok()
+        );
     }
 }

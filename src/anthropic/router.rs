@@ -77,22 +77,20 @@ pub fn create_router_with_provider(
         .route("/messages", post(post_messages))
         .route("/messages/count_tokens", post(count_tokens))
         // OpenAI 兼容入站:chat/completions + responses(翻译成 Anthropic 复用同管线)。
-        .route("/chat/completions", post(crate::openai::handlers::post_chat_completions))
+        .route(
+            "/chat/completions",
+            post(crate::openai::handlers::post_chat_completions),
+        )
         .route("/responses", post(crate::openai::handlers::post_responses))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth_middleware,
-        ));
+        // auth_middleware 不再需要 State：userKey 活读 common::auth_keys 热更单元。
+        .layer(middleware::from_fn(auth_middleware));
 
     // 需要认证的 /cc/v1 路由（Claude Code 兼容端点）
     // 与 /v1 的区别：流式响应会等待 contextUsageEvent 后再发送 message_start
     let cc_v1_routes = Router::new()
         .route("/messages", post(post_messages_cc))
         .route("/messages/count_tokens", post(count_tokens))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth_middleware,
-        ));
+        .layer(middleware::from_fn(auth_middleware));
 
     // 请求体上限：0 = 不限制（dwgx：没必要限制，可显式填 0 完全放开）。
     // ⚠️ 注意：/v1 与 /cc/v1 的请求体是 **buffered**（JsonExtractor 一次性读入内存），

@@ -92,6 +92,14 @@ pub struct Aggregate {
     pub credits_used: f64,
     /// 延迟累计（毫秒，用于算平均）
     pub latency_sum_ms: u64,
+    /// 实际执行过严格缓存探针的请求数（命中率分母）。
+    pub cache_observed_requests: u64,
+    /// 严格探针命中至少一个既有成功检查点的请求数。
+    pub cache_hit_requests: u64,
+    /// 严格推断复用的输入 tokens 累计。
+    pub cache_read_tokens: i64,
+    /// 上游未提供创建回执，当前通常为 0；保留字段兼容 usage 契约。
+    pub cache_creation_tokens: i64,
 }
 
 impl Aggregate {
@@ -109,6 +117,14 @@ impl Aggregate {
             self.credits_used += c;
         }
         self.latency_sum_ms += r.latency_ms;
+        if r.cache_observed {
+            self.cache_observed_requests += 1;
+            if r.cache_read_tokens > 0 {
+                self.cache_hit_requests += 1;
+            }
+            self.cache_read_tokens += r.cache_read_tokens.max(0) as i64;
+            self.cache_creation_tokens += r.cache_creation_tokens.max(0) as i64;
+        }
     }
 
     /// 把另一个聚合并入本聚合（用于跨桶汇总）
@@ -120,6 +136,10 @@ impl Aggregate {
         self.output_tokens += other.output_tokens;
         self.credits_used += other.credits_used;
         self.latency_sum_ms += other.latency_sum_ms;
+        self.cache_observed_requests += other.cache_observed_requests;
+        self.cache_hit_requests += other.cache_hit_requests;
+        self.cache_read_tokens += other.cache_read_tokens;
+        self.cache_creation_tokens += other.cache_creation_tokens;
     }
 
     /// 成功率（0.0~1.0），无请求时为 0
@@ -128,6 +148,15 @@ impl Aggregate {
             0.0
         } else {
             self.success as f64 / self.requests as f64
+        }
+    }
+
+    /// 严格缓存命中率（命中请求 / 实际观测请求），无观测时为 0。
+    pub fn cache_hit_rate(&self) -> f64 {
+        if self.cache_observed_requests == 0 {
+            0.0
+        } else {
+            self.cache_hit_requests as f64 / self.cache_observed_requests as f64
         }
     }
 
@@ -529,7 +558,8 @@ impl ClientAgg {
             self.by_client.keys().cloned().collect();
         let live_machines: std::collections::HashSet<String> =
             self.by_machine.keys().cloned().collect();
-        self.session_meta.retain(|sid, _| live_sessions.contains(sid));
+        self.session_meta
+            .retain(|sid, _| live_sessions.contains(sid));
         for sids in self.client_sessions.values_mut() {
             sids.retain(|sid| live_sessions.contains(sid));
         }
@@ -537,8 +567,7 @@ impl ClientAgg {
             .retain(|ck, sids| !sids.is_empty() || live_clients.contains(ck));
 
         // 机器维度：画像/归组与存活机器 + 存活 session 对齐
-        self.machine_meta
-            .retain(|mk, _| live_machines.contains(mk));
+        self.machine_meta.retain(|mk, _| live_machines.contains(mk));
         for sids in self.machine_sessions.values_mut() {
             sids.retain(|sid| live_sessions.contains(sid));
         }
@@ -646,6 +675,16 @@ pub struct WindowSummary {
     pub credits_used: f64,
     /// 平均延迟（毫秒）
     pub avg_latency_ms: f64,
+    /// 实际执行严格缓存探针的请求数（不含观测关闭/无法解析的请求）。
+    pub cache_observed_requests: u64,
+    /// 命中此前成功检查点的请求数。
+    pub cache_hit_requests: u64,
+    /// 命中率（cache_hit_requests / cache_observed_requests）。
+    pub cache_hit_rate: f64,
+    /// 严格推断复用的输入 token。
+    pub cache_read_tokens: i64,
+    /// 缓存创建 token；Kiro 无创建回执，当前严格模式通常为 0。
+    pub cache_creation_tokens: i64,
 }
 
 impl From<Aggregate> for WindowSummary {
@@ -660,6 +699,11 @@ impl From<Aggregate> for WindowSummary {
             total_tokens: a.input_tokens + a.output_tokens,
             credits_used: a.credits_used,
             avg_latency_ms: a.avg_latency_ms(),
+            cache_observed_requests: a.cache_observed_requests,
+            cache_hit_requests: a.cache_hit_requests,
+            cache_hit_rate: a.cache_hit_rate(),
+            cache_read_tokens: a.cache_read_tokens,
+            cache_creation_tokens: a.cache_creation_tokens,
         }
     }
 }
@@ -1370,7 +1414,14 @@ mod tests {
         // 同一小时内 3 条
         s.on_record(&rec(0, Some(1), "m1", RequestOutcome::Success, 10, 5));
         s.on_record(&rec(60_000, Some(1), "m1", RequestOutcome::Success, 20, 10));
-        s.on_record(&rec(120_000, Some(1), "m1", RequestOutcome::RateLimited, 0, 0));
+        s.on_record(&rec(
+            120_000,
+            Some(1),
+            "m1",
+            RequestOutcome::RateLimited,
+            0,
+            0,
+        ));
 
         let ov = s.overview_at(BASE_MS + 120_000);
         assert_eq!(ov.last_24h.requests, 3);
@@ -1385,12 +1436,40 @@ mod tests {
     }
 
     #[test]
+    fn test_cache_observation_aggregate_uses_only_observed_requests_as_denominator() {
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_cache_aggregate"));
+        let mut hit = rec(0, Some(1), "m", RequestOutcome::Success, 10, 5);
+        hit.cache_observed = true;
+        hit.cache_read_tokens = 80;
+        let mut miss = rec(1_000, Some(1), "m", RequestOutcome::Success, 10, 5);
+        miss.cache_observed = true;
+        let unobserved = rec(2_000, Some(1), "m", RequestOutcome::Success, 10, 5);
+        s.on_record(&hit);
+        s.on_record(&miss);
+        s.on_record(&unobserved);
+
+        let w = s.overview_at(BASE_MS + 2_000).last_24h;
+        assert_eq!(w.requests, 3);
+        assert_eq!(w.cache_observed_requests, 2);
+        assert_eq!(w.cache_hit_requests, 1);
+        assert!((w.cache_hit_rate - 0.5).abs() < f64::EPSILON);
+        assert_eq!(w.cache_read_tokens, 80);
+    }
+
+    #[test]
     fn test_cross_hour_and_cross_day() {
         let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
         // 三个不同小时各 1 条（同一天）
         s.on_record(&rec(0, Some(1), "m", RequestOutcome::Success, 1, 1));
         s.on_record(&rec(HOUR_MS, Some(1), "m", RequestOutcome::Success, 1, 1));
-        s.on_record(&rec(2 * HOUR_MS, Some(1), "m", RequestOutcome::Success, 1, 1));
+        s.on_record(&rec(
+            2 * HOUR_MS,
+            Some(1),
+            "m",
+            RequestOutcome::Success,
+            1,
+            1,
+        ));
 
         let series = s.timeseries_hourly_at(BASE_MS + 2 * HOUR_MS, 3);
         assert_eq!(series.len(), 3);
@@ -1429,8 +1508,22 @@ mod tests {
     fn test_by_model_and_by_credential() {
         let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
         s.on_record(&rec(0, Some(1), "sonnet", RequestOutcome::Success, 10, 5));
-        s.on_record(&rec(1000, Some(1), "sonnet", RequestOutcome::Success, 10, 5));
-        s.on_record(&rec(2000, Some(2), "opus", RequestOutcome::ServerError, 3, 0));
+        s.on_record(&rec(
+            1000,
+            Some(1),
+            "sonnet",
+            RequestOutcome::Success,
+            10,
+            5,
+        ));
+        s.on_record(&rec(
+            2000,
+            Some(2),
+            "opus",
+            RequestOutcome::ServerError,
+            3,
+            0,
+        ));
 
         let models = s.by_model();
         // sonnet 请求最多，排第一
@@ -1492,11 +1585,31 @@ mod tests {
     fn test_clients_rpm_by_ip_and_sessions() {
         let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
         // 客户端 A(1.1.1.1) 开两个窗口：w1 打 2 条，w2 打 1 条（均在近 60 秒内）
-        s.on_record(&rec_client(0, Some("w1"), Some("1.1.1.1"), Some("claude-code")));
-        s.on_record(&rec_client(1_000, Some("w1"), Some("1.1.1.1"), Some("claude-code")));
-        s.on_record(&rec_client(2_000, Some("w2"), Some("1.1.1.1"), Some("claude-code")));
+        s.on_record(&rec_client(
+            0,
+            Some("w1"),
+            Some("1.1.1.1"),
+            Some("claude-code"),
+        ));
+        s.on_record(&rec_client(
+            1_000,
+            Some("w1"),
+            Some("1.1.1.1"),
+            Some("claude-code"),
+        ));
+        s.on_record(&rec_client(
+            2_000,
+            Some("w2"),
+            Some("1.1.1.1"),
+            Some("claude-code"),
+        ));
         // 客户端 B(2.2.2.2) 一个窗口 1 条
-        s.on_record(&rec_client(0, Some("w3"), Some("2.2.2.2"), Some("claude-code")));
+        s.on_record(&rec_client(
+            0,
+            Some("w3"),
+            Some("2.2.2.2"),
+            Some("claude-code"),
+        ));
 
         // now 落在同一 30 秒桶，60 秒 RPM 覆盖以上全部
         let clients = s.clients_at(BASE_MS + 2_000);
@@ -1523,8 +1636,18 @@ mod tests {
     fn test_cleanup_client_stats_reclaims_stale_entries() {
         let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
         // 两个客户端各开一个窗口
-        s.on_record(&rec_client(0, Some("w1"), Some("1.1.1.1"), Some("claude-code")));
-        s.on_record(&rec_client(0, Some("w2"), Some("2.2.2.2"), Some("claude-code")));
+        s.on_record(&rec_client(
+            0,
+            Some("w1"),
+            Some("1.1.1.1"),
+            Some("claude-code"),
+        ));
+        s.on_record(&rec_client(
+            0,
+            Some("w2"),
+            Some("2.2.2.2"),
+            Some("claude-code"),
+        ));
 
         // 窗口内回收：条目仍活跃，四张 map 都应保留
         let (sessions, clients) = s.cleanup_client_stats_at(BASE_MS);
@@ -1540,7 +1663,12 @@ mod tests {
     #[test]
     fn test_clients_prune_stale_window() {
         let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
-        s.on_record(&rec_client(0, Some("old"), Some("9.9.9.9"), Some("claude-code")));
+        s.on_record(&rec_client(
+            0,
+            Some("old"),
+            Some("9.9.9.9"),
+            Some("claude-code"),
+        ));
         // 10 分钟后查询：旧窗口/客户端应被 prune 掉
         let later = s.clients_at(BASE_MS + 11 * 60 * 1000);
         assert!(later.is_empty(), "过期窗口应被回收，结果为空");
@@ -1578,19 +1706,51 @@ mod tests {
         // 修正后语义:IP 为主键。不同 IP 且无 session 关联 = 不同机器(即便 Claude Code 画像相同)。
         // 这正是修复"7 个不同 IP 被合并成 1 台"的核心。
         let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
-        s.on_record(&rec_machine(0, Some("w1"), Some("203.0.113.23"), Some("claude-code"), Some("Windows"), None));
-        s.on_record(&rec_machine(1_000, Some("w2"), Some("10.0.0.9"), Some("claude-code"), Some("Windows"), None));
+        s.on_record(&rec_machine(
+            0,
+            Some("w1"),
+            Some("203.0.113.23"),
+            Some("claude-code"),
+            Some("Windows"),
+            None,
+        ));
+        s.on_record(&rec_machine(
+            1_000,
+            Some("w2"),
+            Some("10.0.0.9"),
+            Some("claude-code"),
+            Some("Windows"),
+            None,
+        ));
 
         let machines = s.machines_at(BASE_MS + 1_000);
-        assert_eq!(machines.len(), 2, "不同 IP 且无 session 关联应是两台机器(画像相同也不合并)");
+        assert_eq!(
+            machines.len(),
+            2,
+            "不同 IP 且无 session 关联应是两台机器(画像相同也不合并)"
+        );
     }
 
     #[test]
     fn test_machines_same_ip_is_one_machine() {
         // 同一 IP = 同一台机器(IP 是主键)。IP 相同即便画像不同也归一台,该 IP 见过的画像取首现。
         let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
-        s.on_record(&rec_machine(0, Some("w1"), Some("1.1.1.1"), Some("claude-code"), Some("Windows"), None));
-        s.on_record(&rec_machine(0, Some("w2"), Some("1.1.1.1"), Some("claude-code"), Some("Windows"), None));
+        s.on_record(&rec_machine(
+            0,
+            Some("w1"),
+            Some("1.1.1.1"),
+            Some("claude-code"),
+            Some("Windows"),
+            None,
+        ));
+        s.on_record(&rec_machine(
+            0,
+            Some("w2"),
+            Some("1.1.1.1"),
+            Some("claude-code"),
+            Some("Windows"),
+            None,
+        ));
 
         let machines = s.machines_at(BASE_MS);
         assert_eq!(machines.len(), 1, "同一 IP 应是一台机器");
@@ -1638,12 +1798,40 @@ mod tests {
         // 被并成一台 unknown)。缺 IP 请求不建立粘滞,后续真实 IP 应各自归位到真实机器。
         let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
         // 两个不同 session,首条都缺 IP → 都落 "unknown",但不粘滞
-        s.on_record(&rec_machine(0, Some("wa"), None, Some("claude-code"), None, None));
-        s.on_record(&rec_machine(0, Some("wb"), None, Some("claude-code"), None, None));
+        s.on_record(&rec_machine(
+            0,
+            Some("wa"),
+            None,
+            Some("claude-code"),
+            None,
+            None,
+        ));
+        s.on_record(&rec_machine(
+            0,
+            Some("wb"),
+            None,
+            Some("claude-code"),
+            None,
+            None,
+        ));
         // 各自后续拿到**不同** IP → 应归位到两台不同真实机器,而非都并进 unknown
         // (用 RFC5737 文档保留段 203.0.113.0/24 / 198.51.100.0/24 作样例)
-        s.on_record(&rec_machine(1_000, Some("wa"), Some("203.0.113.13"), Some("claude-code"), None, None));
-        s.on_record(&rec_machine(1_000, Some("wb"), Some("198.51.100.185"), Some("claude-code"), None, None));
+        s.on_record(&rec_machine(
+            1_000,
+            Some("wa"),
+            Some("203.0.113.13"),
+            Some("claude-code"),
+            None,
+            None,
+        ));
+        s.on_record(&rec_machine(
+            1_000,
+            Some("wb"),
+            Some("198.51.100.185"),
+            Some("claude-code"),
+            None,
+            None,
+        ));
 
         let machines = s.machines_at(BASE_MS + 1_000);
         // 核心断言:两个不相干的真实 IP 各自独立成机器(黑洞根治)。
@@ -1655,7 +1843,10 @@ mod tests {
             ip_machines.len(),
             2,
             "两个不同真实 IP 应各自成一台机器: {:?}",
-            machines.iter().map(|m| (&m.machine_key, &m.ips)).collect::<Vec<_>>()
+            machines
+                .iter()
+                .map(|m| (&m.machine_key, &m.ips))
+                .collect::<Vec<_>>()
         );
         // 关键:没有任何一台机器把两个不相干的公网 IP 混在一起(这正是 dwgx 看到的误并)。
         for m in &machines {
@@ -1674,9 +1865,23 @@ mod tests {
         // 旧组残留没清 → session 同时出现在两台机器下、RPM 双计。这里回归该「单一归属」不变量。
         let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
         // 首条:无 IP → 落 device("claude-code")组
-        s.on_record(&rec_machine(0, Some("s1"), None, Some("claude-code"), None, None));
+        s.on_record(&rec_machine(
+            0,
+            Some("s1"),
+            None,
+            Some("claude-code"),
+            None,
+            None,
+        ));
         // 同 session 后续带真实 IP → 应迁到 IP 组,且从 device 组移除(不再两处都在)
-        s.on_record(&rec_machine(1_000, Some("s1"), Some("203.0.113.23"), Some("claude-code"), None, None));
+        s.on_record(&rec_machine(
+            1_000,
+            Some("s1"),
+            Some("203.0.113.23"),
+            Some("claude-code"),
+            None,
+            None,
+        ));
 
         let machines = s.machines_at(BASE_MS + 1_000);
         // 统计 s1 出现在几台机器下 —— 必须恰好 1 台
@@ -1685,11 +1890,15 @@ mod tests {
             .filter(|m| m.sessions.iter().any(|w| w.session_id == "s1"))
             .count();
         assert_eq!(
-            appearances, 1,
+            appearances,
+            1,
             "session s1 应只归属一台机器,不能在多台重复出现: {:?}",
             machines
                 .iter()
-                .map(|m| (&m.machine_key, m.sessions.iter().map(|w| &w.session_id).collect::<Vec<_>>()))
+                .map(|m| (
+                    &m.machine_key,
+                    m.sessions.iter().map(|w| &w.session_id).collect::<Vec<_>>()
+                ))
                 .collect::<Vec<_>>()
         );
         // 且归属到真实 IP 那台
@@ -1722,16 +1931,19 @@ mod tests {
         let mut r = rec(0, Some(1), "m", RequestOutcome::Success, 10, 5);
         r.cache_read_tokens = 128;
         r.cache_creation_tokens = 64;
+        r.cache_observed = true;
         let json = serde_json::to_string(&r).unwrap();
         let back: RequestRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(back.cache_read_tokens, 128);
         assert_eq!(back.cache_creation_tokens, 64);
+        assert!(back.cache_observed);
 
         // 缺字段的历史行：serde default 回退 0，不报错
         let legacy = r#"{"request_id":"x","ts_ms":0,"credential_id":null,"model":"m","is_streaming":false,"input_tokens":1,"output_tokens":1,"credits_used":null,"latency_ms":0,"first_token_ms":null,"outcome":"success","retries":0,"error_message":null,"session_id":null,"client_device":null,"client_ip":null,"client_os":null,"client_browser":null}"#;
         let legacy_rec: RequestRecord = serde_json::from_str(legacy).unwrap();
         assert_eq!(legacy_rec.cache_read_tokens, 0);
         assert_eq!(legacy_rec.cache_creation_tokens, 0);
+        assert!(!legacy_rec.cache_observed);
     }
 
     #[test]
@@ -1783,7 +1995,8 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         // 一行合法 + 一行垃圾 + 一行空行
-        let good = serde_json::to_string(&rec(0, Some(1), "m", RequestOutcome::Success, 1, 1)).unwrap();
+        let good =
+            serde_json::to_string(&rec(0, Some(1), "m", RequestOutcome::Success, 1, 1)).unwrap();
         let path = dir.join("usage-2026-07-03.jsonl");
         fs::write(&path, format!("{good}\nNOT JSON\n\n")).unwrap();
 
@@ -1856,7 +2069,12 @@ mod tests {
         let later = s.throughput_at(BASE_MS + 120_000);
         assert_eq!(later.current_rpm, 0);
         assert_eq!(later.current_tokens_per_sec, 0.0);
-        assert!(later.recent_buckets.iter().all(|b| b.requests == 0 && b.tokens == 0));
+        assert!(
+            later
+                .recent_buckets
+                .iter()
+                .all(|b| b.requests == 0 && b.tokens == 0)
+        );
 
         // 相隔恰好一整圈（60 秒）落入同一桶但 slot 不同 → 清零覆盖，不叠加旧值
         let ring_span = THROUGHPUT_BUCKETS as i64 * THROUGHPUT_BUCKET_SECS * 1000;
@@ -1879,7 +2097,10 @@ mod tests {
         );
 
         // 确定性：同输入永远同码。
-        assert_eq!(code, machine_code_of(Some("203.0.113.23"), Some("claude-code")));
+        assert_eq!(
+            code,
+            machine_code_of(Some("203.0.113.23"), Some("claude-code"))
+        );
 
         // IP 优先：有 IP 时 device 不影响码（machine_key = IP）。
         assert_eq!(
@@ -1901,9 +2122,19 @@ mod tests {
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
         )));
-        s.on_record(&rec_machine(1_000, Some("w1"), Some("203.0.113.23"), Some("claude-code"), None, None));
+        s.on_record(&rec_machine(
+            1_000,
+            Some("w1"),
+            Some("203.0.113.23"),
+            Some("claude-code"),
+            None,
+            None,
+        ));
         let machines = s.machines_at(BASE_MS + 1_000);
-        let m = machines.iter().find(|m| m.machine_key == "203.0.113.23").unwrap();
+        let m = machines
+            .iter()
+            .find(|m| m.machine_key == "203.0.113.23")
+            .unwrap();
         assert_eq!(m.machine_code, machine_code("203.0.113.23"));
     }
 
@@ -1919,8 +2150,22 @@ mod tests {
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
         )));
         // 同一 session "roam" 先后用两个 IP(DHCP/VPN 漫游)→ 合并为一台机器,ips 收两个。
-        s.on_record(&rec_machine(0, Some("roam"), Some("203.0.113.13"), Some("claude-code"), None, None));
-        s.on_record(&rec_machine(1_000, Some("roam"), Some("203.0.113.99"), Some("claude-code"), None, None));
+        s.on_record(&rec_machine(
+            0,
+            Some("roam"),
+            Some("203.0.113.13"),
+            Some("claude-code"),
+            None,
+            None,
+        ));
+        s.on_record(&rec_machine(
+            1_000,
+            Some("roam"),
+            Some("203.0.113.99"),
+            Some("claude-code"),
+            None,
+            None,
+        ));
 
         let machines = s.machines_at(BASE_MS + 1_000);
         // 该机器(粘滞主键=首个真实 IP 203.0.113.13)应收录两个漫游 IP。
@@ -1929,7 +2174,11 @@ mod tests {
             .find(|m| m.machine_key == "203.0.113.13")
             .expect("漫游应合并到首个真实 IP 机器");
         assert!(m.ips.contains(&"203.0.113.13".to_string()));
-        assert!(m.ips.contains(&"203.0.113.99".to_string()), "第二个漫游 IP 应被收录: {:?}", m.ips);
+        assert!(
+            m.ips.contains(&"203.0.113.99".to_string()),
+            "第二个漫游 IP 应被收录: {:?}",
+            m.ips
+        );
 
         // 关键:ip_codes 覆盖每个见过的 IP,且每个码 == 入口按该 IP 重算的码。
         for ip in &m.ips {
@@ -1946,12 +2195,9 @@ mod tests {
         }
         // 第二个漫游 IP 的码 ≠ 主键码(否则会误以为拉黑主键就够)。
         let second_code = m.ip_codes.iter().find(|c| c.ip == "203.0.113.99").unwrap();
-        assert_ne!(second_code.code, m.machine_code, "漫游第二 IP 的码应独立于主键码");
+        assert_ne!(
+            second_code.code, m.machine_code,
+            "漫游第二 IP 的码应独立于主键码"
+        );
     }
 }
-
-
-
-
-
-

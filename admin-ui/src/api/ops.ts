@@ -129,6 +129,71 @@ export async function getRecoveryMetrics(): Promise<RecoveryMetrics> {
   return data
 }
 
+// ============ 外部凭据推送（import-stats）============
+// 对方系统按契约往 POST /api/import/keys 推 ksk_ 凭据，这里是该通道的可观测快照。
+// 进程级内存、重启归零；此接口受 admin 鉴权保护，记录包含可复制的完整 key。
+export interface ImportItemRecord {
+  /** 已鉴权管理后台使用的完整 key；不持久化，推送响应仍为打码值。 */
+  key: string
+  /** key 指纹(SHA-256 前 8 位)。与凭据管理页显示的指纹同源,用于确认是同一个 key。 */
+  fingerprint: string
+  ok: boolean
+  duplicate: boolean
+  credentialId?: number
+  error?: string
+  /** 最终落库的 region（显式指定或探测所得） */
+  region?: string
+  /** 最终落库的 endpoint；缺省表示跟随 config.defaultEndpoint */
+  endpoint?: string
+  /** 推送方**发来的** region 原值；缺省 = 对方未提供（此时 region 为我们探测所得） */
+  sentRegion?: string
+  /** 推送方**发来的** endpoint 原值；缺省 = 对方未提供 */
+  sentEndpoint?: string
+  /** 推送方**发来的** groups 原值（契约固定空数组，非空即异常，需要能被看见） */
+  sentGroups: string[]
+  /** Relay 单条推送协议的 delivery_id；批量协议没有。 */
+  deliveryId?: string
+}
+
+export interface ImportRecord {
+  atMs: number
+  total: number
+  imported: number
+  duplicates: number
+  failed: number
+  elapsedMs: number
+  items: ImportItemRecord[]
+  /** 明细超上限被省略的条数（失败项优先保留） */
+  omitted: number
+}
+
+export interface ImportStats {
+  /** 是否已配置 importApiKey 启用该通道 */
+  enabled: boolean
+  /** Relay 单条推送频道是否已配置专用密钥。 */
+  relayEnabled: boolean
+  relayPushes: number
+  relayKeysTotal: number
+  relayKeysImported: number
+  relayKeysDuplicate: number
+  relayKeysFailed: number
+  relayLastAtMs?: number
+  relayRecords: ImportRecord[]
+  pushes: number
+  keysTotal: number
+  keysImported: number
+  keysDuplicate: number
+  keysFailed: number
+  lastAtMs?: number
+  /** 最近若干次推送，新的在前 */
+  records: ImportRecord[]
+}
+
+export async function getImportStats(): Promise<ImportStats> {
+  const { data } = await api.get<ImportStats>('/import-stats')
+  return data
+}
+
 // ============ 运维日志（内存环形缓冲）============
 export interface LogEntry {
   seq: number
@@ -156,6 +221,7 @@ export interface TraceRecord {
   output_tokens: number
   cache_read_tokens: number
   cache_creation_tokens: number
+  cache_observed: boolean
   credits_used: number | null
   latency_ms: number
   first_token_ms: number | null
@@ -213,4 +279,3 @@ export async function testProxy(input: {
   const { data } = await api.post<ProxyTestResult>('/proxy/test', input)
   return data
 }
-

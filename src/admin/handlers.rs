@@ -11,9 +11,7 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, SetAllowedModelsRequest, SetCustomApiConfigRequest,
-        SetDisabledRequest,
-        SetLoadBalancingModeRequest, SetPriorityRequest,
-        SetRpmLimitRequest,
+        SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest, SetRpmLimitRequest,
         SuccessResponse,
     },
 };
@@ -82,15 +80,22 @@ pub async fn set_credential_custom_api(
     Path(id): Path<u64>,
     Json(payload): Json<SetCustomApiConfigRequest>,
 ) -> impl IntoResponse {
-    match state.service.set_custom_api_config(
-        id,
-        payload.base_url,
-        payload.api_key,
-        payload.request_limit,
-        payload.reset_count,
-    ).await {
-        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 自定义 API 配置已更新", id)))
-            .into_response(),
+    match state
+        .service
+        .set_custom_api_config(
+            id,
+            payload.base_url,
+            payload.api_key,
+            payload.request_limit,
+            payload.reset_count,
+        )
+        .await
+    {
+        Ok(_) => Json(SuccessResponse::new(format!(
+            "凭据 #{} 自定义 API 配置已更新",
+            id
+        )))
+        .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -102,11 +107,18 @@ pub async fn set_credential_allowed_models(
     Path(id): Path<u64>,
     Json(payload): Json<SetAllowedModelsRequest>,
 ) -> impl IntoResponse {
-    match state.service.set_allowed_models(id, payload.allowed_models.clone()) {
+    match state
+        .service
+        .set_allowed_models(id, payload.allowed_models.clone())
+    {
         Ok(_) => Json(SuccessResponse::new(format!(
             "凭据 #{} 允许模型白名单已更新（{} 项，空=不限制）",
             id,
-            payload.allowed_models.as_ref().map(|l| l.len()).unwrap_or(0)
+            payload
+                .allowed_models
+                .as_ref()
+                .map(|l| l.len())
+                .unwrap_or(0)
         )))
         .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
@@ -151,7 +163,10 @@ pub async fn purge_trash_batch(
     Json(payload): Json<PurgeTrashRequest>,
 ) -> impl IntoResponse {
     let n = state.service.purge_trash_batch(payload.ids);
-    Json(SuccessResponse::new(format!("已永久清除 {} 个回收站条目", n)))
+    Json(SuccessResponse::new(format!(
+        "已永久清除 {} 个回收站条目",
+        n
+    )))
 }
 
 #[derive(serde::Deserialize)]
@@ -204,7 +219,7 @@ pub async fn proxy_test(
     State(state): State<AdminState>,
     Json(payload): Json<ProxyTestRequest>,
 ) -> impl IntoResponse {
-    use crate::http_client::{build_client, split_proxy_credentials, ProxyConfig};
+    use crate::http_client::{ProxyConfig, build_client, split_proxy_credentials};
 
     let started = std::time::Instant::now();
 
@@ -261,11 +276,10 @@ pub async fn proxy_test(
                 .into_response();
             }
             // 解析 {"ip":"..."}；解析失败不影响连通性判定，仅 exit_ip 为 None。
-            let exit_ip = resp
-                .json::<serde_json::Value>()
-                .await
-                .ok()
-                .and_then(|v| v.get("ip").and_then(|ip| ip.as_str().map(|s| s.to_string())));
+            let exit_ip = resp.json::<serde_json::Value>().await.ok().and_then(|v| {
+                v.get("ip")
+                    .and_then(|ip| ip.as_str().map(|s| s.to_string()))
+            });
             Json(ProxyTestResponse {
                 ok: true,
                 latency_ms,
@@ -442,7 +456,8 @@ pub async fn purge_credential(
 
 /// POST /api/admin/credentials/:id/refresh
 /// 强制刷新凭据 Token
-pub async fn force_refresh_token(    State(state): State<AdminState>,
+pub async fn force_refresh_token(
+    State(state): State<AdminState>,
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     match state.service.force_refresh_token(id).await {
@@ -462,11 +477,7 @@ pub async fn deep_verify_credential(
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     match state.service.deep_verify_credential(id).await {
-        Ok(_) => Json(SuccessResponse::new(format!(
-            "凭据 #{} 验活通过",
-            id
-        )))
-        .into_response(),
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 验活通过", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -591,12 +602,18 @@ pub async fn recovery_metrics() -> impl IntoResponse {
     Json(crate::common::recovery_metrics::snapshot())
 }
 
+/// GET /api/admin/import-stats
+/// 外部凭据推送（`POST /api/import/keys`）的可观测快照：累计批次/条目计数 + 最近若干批明细。
+/// 与 recovery-metrics 同款设计：进程级内存、不持久化、零上游、零副作用。
+/// 面板据此回答「对方推了什么、成功几个、失败原因是什么」，无需翻容器日志。
+pub async fn import_stats() -> impl IntoResponse {
+    Json(crate::common::import_stats::snapshot())
+}
+
 // ============ 网页上号（Social OAuth）============
 
 use super::service::PollResult;
-use super::types::{
-    PollSocialLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse,
-};
+use super::types::{PollSocialLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse};
 use crate::kiro::auth::social::OAuthCallbackData;
 use axum::extract::Query;
 use std::collections::HashMap;
@@ -662,12 +679,18 @@ pub async fn social_callback(
     use axum::response::Html;
 
     // 有 error 参数 → 失败页
-    if let Some(err) = params.get("error_description").or_else(|| params.get("error")) {
+    if let Some(err) = params
+        .get("error_description")
+        .or_else(|| params.get("error"))
+    {
         let body = format!(
             "<html><head><meta charset='utf-8'><title>登录失败</title></head><body style='font-family:sans-serif;text-align:center;padding:60px'><h2>&#10007; 登录失败</h2><p>{}</p><p style='color:#888;font-size:13px'>请关闭此标签页并重试。</p></body></html>",
             html_escape(err)
         );
-        return ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], Html(body));
+        return (
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            Html(body),
+        );
     }
 
     let code = params.get("code").cloned().unwrap_or_default();
@@ -690,7 +713,10 @@ pub async fn social_callback(
     } else {
         "<html><head><meta charset='utf-8'><title>登录异常</title></head><body style='font-family:sans-serif;text-align:center;padding:60px'><h2>登录会话未匹配</h2><p>可能已超时，请返回 Admin UI 重新发起。</p></body></html>".to_string()
     };
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], Html(body))
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        Html(body),
+    )
 }
 
 /// 极简 HTML 转义，避免回调错误信息注入
@@ -726,7 +752,12 @@ pub async fn start_idc_login(
     }
     match state
         .service
-        .start_idc_login(&payload.start_url, region, payload.priority, payload.proxy_url)
+        .start_idc_login(
+            &payload.start_url,
+            region,
+            payload.priority,
+            payload.proxy_url,
+        )
         .await
     {
         Ok(result) => Json(serde_json::json!({
@@ -782,10 +813,11 @@ pub async fn start_external_idp_login(
     State(state): State<AdminState>,
     Json(payload): Json<StartExternalIdpLoginRequest>,
 ) -> impl IntoResponse {
-    match state
-        .service
-        .start_external_idp_login(payload.priority, payload.proxy_url, payload.region)
-    {
+    match state.service.start_external_idp_login(
+        payload.priority,
+        payload.proxy_url,
+        payload.region,
+    ) {
         Ok(result) => Json(serde_json::json!({
             "sessionId": result.session_id,
             "signinUrl": result.signin_url,
