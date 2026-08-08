@@ -142,10 +142,10 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deepseek_normalize: Option<bool>,
     /// deepseek 归一化**per-凭据覆盖**（fallback_model / min_max_tokens）。
-    /// None = 用全局 `config.deepseek_normalize`；Some = 未设的字符串/数字继承全局、bool 取全局。
+    /// None = 用全局 `config.deepseek_normalize`；Some = `None` 字段继承全局、bool 一律全局。
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub deepseek_normalize_config: Option<crate::kiro::deepseek_normalize::DeepseekNormalizeConfig>,
+    pub deepseek_normalize_config: Option<crate::kiro::deepseek_normalize::DeepseekNormalizeOverride>,
 
     /// 请求上限：累计请求数达到后自动禁用该凭据（None/0=不限）。通用字段,自定义API主用。
     #[serde(default)]
@@ -393,6 +393,18 @@ fn canonicalize_auth_method_value(value: &str) -> &str {
         value
     }
 }
+
+/// ksk_ API Key 号的完整端点候选链（4 个独立限流桶，对齐 kiro2cc `endpoint.rs`）。
+///
+/// 顺序：`cli`(q.* GenerateAssistantResponse) → `cli-runtime`(runtime.*) →
+/// `codewhisperer`(us-east-1 独占 host / 其它区域 q.*) → `amazonq`(q.* + SendMessage)。
+/// `amazonq` 的 SendMessage 操作对 ksk_ **未实测**，放最后兜底，需线上验证。
+const API_KEY_ENDPOINT_ORDER: [&str; 4] = [
+    crate::kiro::endpoint::cli::CLI_ENDPOINT_NAME,
+    crate::kiro::endpoint::cli_runtime::CLI_RUNTIME_ENDPOINT_NAME,
+    crate::kiro::endpoint::codewhisperer::CODEWHISPERER_ENDPOINT_NAME,
+    crate::kiro::endpoint::amazonq::AMAZONQ_ENDPOINT_NAME,
+];
 
 /// 凭据配置（支持单对象或数组格式）
 ///
@@ -792,29 +804,46 @@ impl KiroCredentials {
     /// 端点候选顺序（从首选到回退），供 provider 的"429 换桶"机制使用。
     ///
     /// # 返回值语义
-    /// - 显式 `endpoint` 字段（非空）→ `vec![该值]`：固定 = **仅用这一个**，不自动回退
-    ///   （救急旋钮：上游协议变化时不改代码即可硬切）。
-    /// - ksk_ API Key 号 → `["cli", "cli-runtime"]`：**q.* 优先、runtime.* 回退**。
-    ///   两个 host 是上游的**独立限流桶**（参考 kiro2cc `endpoint.rs`）；实测 `q.*` 300 并发
-    ///   0 个 429、`runtime.*` 31%（`docs/batch2-region-endpoint-matrix.md`），故 q.* 默认优先，
-    ///   其桶被 429 封禁时自动落到 runtime.* 桶。该顺序**不依赖 region** ⇒ us/eu 天然同步。
+    /// - 显式 `endpoint` 字段（非空）→ 非 api_key 号：`vec![该值]`（固定 = **仅用这一个**，
+    ///   救急旋钮：上游协议变化时不改代码即可硬切）。
+    ///   对 **api_key 号**：显式值放最前 + 后面跟完整候选链（去重）——修复「显式
+    ///   `endpoint=cli` 锁死单端点」的坑：手动设值不再丢 cli-runtime/codewhisperer/amazonq
+    ///   回退，q.* 429 时仍能换到其它桶。
+    /// - ksk_ API Key 号 → `["cli", "cli-runtime", "codewhisperer", "amazonq"]`：**q.* 优先、
+    ///   runtime.* / codewhisperer.* / amazonq 回退**。四个 host/操作是上游的**独立限流桶**
+    ///   （对齐 kiro2cc `endpoint.rs` 的 4 端点）。实测 `q.*` 300 并发 0 个 429、`runtime.*`
+    ///   31%（`docs/batch2-region-endpoint-matrix.md`），故 q.* 默认优先；其桶被 429 封禁时
+    ///   依次落到 runtime.* / codewhisperer / amazonq 桶。该顺序**不依赖 region** ⇒ us/eu
+    ///   天然同步。
     /// - 其余（OAuth 号）→ `vec![default_endpoint]`：既有行为逐字节不变。
     pub fn effective_endpoint_order<'a>(&'a self, default_endpoint: &'a str) -> Vec<&'a str> {
+        let is_ksk = !self.is_custom_api_credential() && self.is_api_key_credential();
         // ① 显式配置优先（面板可改、可切回 ide 救急）。
         if let Some(name) = self.endpoint.as_deref() {
             let name = name.trim();
             if !name.is_empty() {
+                // ⚠️ 修复「显式 endpoint 锁死单端点」：手动设 `endpoint=cli` 会丢
+                // cli-runtime/codewhisperer 回退。对 api_key 号改为：显式值放最前 +
+                // 后面跟完整候选链（去重），保证 q.* 429 时仍能换到其它桶。
+                if is_ksk {
+                    let mut order = Vec::with_capacity(API_KEY_ENDPOINT_ORDER.len() + 1);
+                    order.push(name);
+                    for ep in API_KEY_ENDPOINT_ORDER {
+                        if !order.contains(&ep) {
+                            order.push(ep);
+                        }
+                    }
+                    return order;
+                }
+                // 非 api_key 号维持既有行为：显式值固定 = 仅用这一个。
                 return vec![name];
             }
         }
-        // ② 自动路由：ksk_ API Key 号 → q.* 优先、runtime.* 回退。custom_api 透传号不走
-        //    Kiro 端点体系（它有独立的 passthrough 路径），这里显式排除以免误判——
-        //    它也可能带 api_key 字段。
-        if !self.is_custom_api_credential() && self.is_api_key_credential() {
-            return vec![
-                crate::kiro::endpoint::cli::CLI_ENDPOINT_NAME,
-                crate::kiro::endpoint::cli_runtime::CLI_RUNTIME_ENDPOINT_NAME,
-            ];
+        // ② 自动路由：ksk_ API Key 号 → 4 端点（q.* 优先，runtime.* / codewhisperer / amazonq
+        //    回退）。custom_api 透传号不走 Kiro 端点体系（它有独立的 passthrough 路径），
+        //    这里显式排除以免误判——它也可能带 api_key 字段。
+        if is_ksk {
+            return API_KEY_ENDPOINT_ORDER.to_vec();
         }
         // ③ 其余凭据沿用全局默认（既有行为）。
         vec![default_endpoint]
@@ -1187,8 +1216,9 @@ mod tests {
         assert_eq!(idc.effective_endpoint("ide"), "ide");
     }
 
-    /// ⭐ 端点候选顺序（429 换桶的基础）：ksk_ 号 = q.*(cli) 优先、runtime.*(cli-runtime) 回退。
-    /// 两个 host 是上游独立限流桶；顺序**不依赖 region** ⇒ us/eu 天然同步。
+    /// ⭐ 端点候选顺序（429 换桶的基础）：ksk_ 号 = q.*(cli) 优先、runtime.*(cli-runtime) /
+    /// codewhisperer / amazonq 回退（4 个独立限流桶，对齐 kiro2cc）。顺序**不依赖 region**
+    /// ⇒ us/eu 天然同步。
     #[test]
     fn should_order_api_key_endpoints_cli_first_then_cli_runtime() {
         let mut ak = KiroCredentials::default();
@@ -1197,16 +1227,17 @@ mod tests {
         ak.region = Some("eu-central-1".to_string());
         assert_eq!(
             ak.effective_endpoint_order("ide"),
-            vec!["cli", "cli-runtime"],
-            "ksk_ 号必须 q.* 优先、runtime.* 回退"
+            vec!["cli", "cli-runtime", "codewhisperer", "amazonq"],
+            "ksk_ 号必须 q.* 优先、runtime.* / codewhisperer / amazonq 回退"
         );
 
-        // 显式固定 endpoint 时仅用该端点（固定 = 不自动回退）。
+        // ⚠️ 显式固定 endpoint 对 api_key 号**不再锁死单端点**：显式值放最前 + 后面跟完整
+        // 候选链（去重），保证 q.* 429 时仍能换到其它桶。
         ak.endpoint = Some("cli-runtime".to_string());
         assert_eq!(
             ak.effective_endpoint_order("ide"),
-            vec!["cli-runtime"],
-            "显式固定后只保留该端点"
+            vec!["cli-runtime", "cli", "codewhisperer", "amazonq"],
+            "显式 endpoint 放最前，其余候选链去重后跟随后面（不丢换桶能力）"
         );
         ak.endpoint = None;
 
@@ -1214,7 +1245,36 @@ mod tests {
         ak.endpoint = Some("   ".to_string());
         assert_eq!(
             ak.effective_endpoint_order("ide"),
-            vec!["cli", "cli-runtime"]
+            vec!["cli", "cli-runtime", "codewhisperer", "amazonq"]
+        );
+    }
+
+    /// 显式 endpoint=cli 的 ksk_ 号：顺序必须 = [cli, cli-runtime, codewhisperer, amazonq]
+    ///（去重后）。修复「显式 endpoint 锁死单端点」——手动设 `endpoint=cli` 不能再丢
+    /// cli-runtime/codewhisperer/amazonq 回退。
+    #[test]
+    fn explicit_cli_endpoint_keeps_full_bucket_chain_for_api_key() {
+        let mut ak = KiroCredentials::default();
+        ak.kiro_api_key = Some("ksk_test".to_string());
+        ak.endpoint = Some("cli".to_string());
+        assert_eq!(
+            ak.effective_endpoint_order("ide"),
+            vec!["cli", "cli-runtime", "codewhisperer", "amazonq"],
+            "显式 cli + 完整候选链去重后应与自动顺序一致（cli 本就在链首）"
+        );
+    }
+
+    /// 显式非链内端点（如切回 ide 救急）的 ksk_ 号：显式值放最前，完整链去重后跟随，
+    /// 不丢换桶能力（ide 桶被 429 时仍能落到 cli 等桶）。
+    #[test]
+    fn explicit_non_chain_endpoint_prepends_for_api_key() {
+        let mut ak = KiroCredentials::default();
+        ak.kiro_api_key = Some("ksk_test".to_string());
+        ak.endpoint = Some("ide".to_string());
+        assert_eq!(
+            ak.effective_endpoint_order("ide"),
+            vec!["ide", "cli", "cli-runtime", "codewhisperer", "amazonq"],
+            "显式 ide 放最前（救急），完整候选链去重后跟随"
         );
     }
 

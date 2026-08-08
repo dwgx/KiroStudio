@@ -1,66 +1,20 @@
-//! 通用 JSON Schema 修复（移植 kiro2cc-proxy 的 `normalize_json_schema_inner`）。
+//! 通用 JSON Schema 修复 —— 薄包装复用 `anthropic::converter::normalize_json_schema`。
 //!
 //! deepseek 类上游对标准 JSON Schema 之外的非标准形态（`$ref`、`anyOf/oneOf/allOf`、
-//! 多余键）常报 400。本模块把 `tools[].input_schema` 清洗成 deepseek 能接受的白名单形态：
+//! 多余键）常报 400。`converter.rs` 的 `normalize_json_schema` 是成熟实现（$ref 展开 +
+//! 节点预算 + 白名单清洗 + 空 schema 补 type），本模块只把它接到 deepseek 归一化路径。
 //!
-//! - `$ref`：单 schema 上下文无法解析引用 → 降级为 `{"type":"object"}`（防循环引用死循环）。
-//! - 只保留 `type/properties/required/items/additionalProperties/description/enum` 七键。
-//! - `anyOf/oneOf/allOf` 直接丢弃（不在白名单）。
+//! ⚠️ 不要在本模块另写一份 schema 清洗——`converter.rs` 已处理 $ref 展开（本仓唯一一份），
+//! 重复实现会与它漂移（$ref 降级、白名单键、节点预算不一致）。
 
 use serde_json::Value;
 
-/// 允许保留的 JSON Schema 顶层键（白名单）。
-const SCHEMA_KEEP_KEYS: &[&str] = &[
-    "type",
-    "properties",
-    "required",
-    "items",
-    "additionalProperties",
-    "description",
-    "enum",
-];
-
-/// 递归清洗 JSON Schema：$ref 降级 + 白名单剥离（就地修改）。
+/// 清洗 JSON Schema（就地修改）：调用 `converter::normalize_json_schema` 后写回。
 ///
-/// 对任意 JSON 安全（幂等），不会 panic。非对象/数组结构原样保留。
+/// 对任意 JSON 安全（幂等），不会 panic。非对象/数组结构由 converter 原样返回。
 pub fn fix_schema(value: &mut Value) {
-    clean_schema(value, 0);
-}
-
-/// 递归清洗，`depth` 防深层/循环引用撑爆栈。
-fn clean_schema(value: &mut Value, depth: usize) {
-    // 深度上限：超过即降级为宽松 object（宁可少约束，不 panic）。
-    if depth > 8 {
-        *value = serde_json::json!({ "type": "object" });
-        return;
-    }
-    match value {
-        Value::Object(map) => {
-            // $ref 无法在单 schema 上下文解析 → 降级 object，避免把引用原样透传给上游被拒。
-            if map.contains_key("$ref") {
-                *value = serde_json::json!({ "type": "object" });
-                return;
-            }
-            // 白名单剥离：只留七键（anyOf/oneOf/allOf/format/pattern 等全部丢弃）。
-            map.retain(|k, _| SCHEMA_KEEP_KEYS.contains(&k.as_str()));
-            // 递归 properties 的各子 schema。
-            if let Some(props) = map.get_mut("properties").and_then(|v| v.as_object_mut()) {
-                for sub in props.values_mut() {
-                    clean_schema(sub, depth + 1);
-                }
-            }
-            // 递归 items（数组元素 schema）。
-            if let Some(items) = map.get_mut("items") {
-                clean_schema(items, depth + 1);
-            }
-        }
-        Value::Array(arr) => {
-            for item in arr.iter_mut() {
-                clean_schema(item, depth + 1);
-            }
-        }
-        _ => {}
-    }
+    let cleaned = crate::anthropic::converter::normalize_json_schema(value.take());
+    *value = cleaned;
 }
 
 #[cfg(test)]
@@ -111,11 +65,12 @@ mod tests {
         assert!(o.contains_key("type"));
     }
 
-    /// $ref 降级为 object。
+    /// $ref 无定义时由 converter 降级为 object（不 panic、不把 $ref 原样透传）。
     #[test]
     fn ref_downgrades_to_object() {
         let v = serde_json::json!({ "$ref": "#/components/schemas/Foo" });
-        assert_eq!(fix(v), serde_json::json!({ "type": "object" }));
+        let out = fix(v);
+        assert_eq!(out["type"], "object", "无 $defs 可展开时降级 object，实际: {out}");
     }
 
     /// 递归 properties 清洗。
@@ -149,10 +104,10 @@ mod tests {
         // 不 panic 即可；深处降级 object。
     }
 
-    /// 非对象（字符串/数组）安全。
+    /// 非对象（字符串）由 converter 规范化为 object（不 panic）。
     #[test]
-    fn non_object_is_noop() {
-        assert_eq!(fix(serde_json::json!("hello")), serde_json::json!("hello"));
-        assert_eq!(fix(serde_json::json!([1, 2])), serde_json::json!([1, 2]));
+    fn non_object_is_safe() {
+        assert_eq!(fix(serde_json::json!("hello"))["type"], "object");
+        assert_eq!(fix(serde_json::json!([1, 2]))["type"], "object");
     }
 }

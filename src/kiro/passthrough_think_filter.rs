@@ -228,6 +228,9 @@ struct SseFilterState {
     in_inline_thinking: bool,
     /// 滤掉的 thinking 文本累计**字符数**（估算 token = 字符数 / 4）。
     thinking_chars: u64,
+    /// 已在 message_delta 扣减过的字符数。⚠️ 防重复扣减：上游可能发多个 message_delta
+    ///（增量 usage），同一份 thinking 不能扣 N 次。
+    deducted_chars: u64,
 }
 
 impl SseFilterState {
@@ -241,6 +244,7 @@ impl SseFilterState {
             strip_inline_thinking,
             in_inline_thinking: false,
             thinking_chars: 0,
+            deducted_chars: 0,
         }
     }
 
@@ -378,14 +382,18 @@ impl SseFilterState {
                 // 滤掉 thinking 后，usage.output_tokens 仍含 thinking token → 扣减估算值
                 //（字符数/4，Claude Code 约 4 字符/token），对齐主路径「剥离的 thinking 不计入
                 // output_tokens」口径。message_start 的 usage 不动（record 口径绑定）。
-                if self.thinking_chars > 0 {
+                //
+                // ⚠️ 用 `thinking_chars - deducted_chars` 只扣**尚未扣过的**部分：上游可能发
+                // 多个 message_delta（增量 usage），同一份 thinking 字符不能扣 N 次。
+                if self.thinking_chars > self.deducted_chars {
                     if let Some(usage) = v.get_mut("usage").and_then(|u| u.as_object_mut()) {
                         if let Some(out) = usage.get("output_tokens").and_then(|x| x.as_u64()) {
-                            let deduct = (self.thinking_chars / 4) as u64;
+                            let deduct = ((self.thinking_chars - self.deducted_chars) / 4) as u64;
                             usage["output_tokens"] =
                                 serde_json::json!(out.saturating_sub(deduct));
                         }
                     }
+                    self.deducted_chars = self.thinking_chars;
                 }
                 Some(Self::rewrite_event(event_type, &v))
             }
@@ -740,6 +748,43 @@ mod tests {
         assert!(
             filtered.contains("\"output_tokens\":490"),
             "output_tokens 应从 500 扣减 10（40 字符/4），实际: {filtered}"
+        );
+    }
+
+    /// 🔴 回归：多个 message_delta（增量 usage）时，thinking 扣减不能重复——只扣一次。
+    #[tokio::test]
+    async fn test_filter_sse_stream_deducts_thinking_once_across_multiple_deltas() {
+        let input = format!(
+            "{}{}{}{}{}{}",
+            event(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#
+            ),
+            event(
+                "content_block_delta",
+                // 40 字符 thinking → 10 token
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#
+            ),
+            event("content_block_stop", r#"{"type":"content_block_stop","index":0}"#),
+            event(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#
+            ),
+            event(
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":300}}"#
+            ),
+            event(
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":300}}"#
+            ),
+        );
+        let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(input))]);
+        let filtered = collect_filtered(filter_sse_stream(stream)).await;
+        // 两次 message_delta 各扣一次会变成 280；正确是只扣一次 → 290。
+        assert!(
+            filtered.contains("\"output_tokens\":290"),
+            "多 message_delta 只应扣减一次（300-10=290），重复扣会成 280，实际: {filtered}"
         );
     }
 

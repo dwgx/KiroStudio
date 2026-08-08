@@ -29,7 +29,7 @@ use super::types::{ContentBlock, ImageSource, MessagesRequest};
 /// 约束（属性用 `$ref` 指向 `$defs`）静默退化为无约束空对象，模型看不到真实参数
 /// 结构。展开后再逐层规范化 type/properties/required/items/additionalProperties，
 /// 丢弃 Kiro 兼容性差的 anyOf/oneOf/allOf，只保留白名单字段。
-fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
+pub(crate) fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     normalize_json_schema_with_node_budget(schema, MAX_SCHEMA_NODES)
 }
 
