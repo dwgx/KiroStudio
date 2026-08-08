@@ -92,6 +92,14 @@ pub struct Aggregate {
     pub credits_used: f64,
     /// 延迟累计（毫秒，用于算平均）
     pub latency_sum_ms: u64,
+    /// 实际执行过严格缓存探针的请求数（命中率分母）。
+    pub cache_observed_requests: u64,
+    /// 严格探针命中至少一个既有成功检查点的请求数。
+    pub cache_hit_requests: u64,
+    /// 严格推断复用的输入 tokens 累计。
+    pub cache_read_tokens: i64,
+    /// 上游未提供创建回执，当前通常为 0；保留字段兼容 usage 契约。
+    pub cache_creation_tokens: i64,
 }
 
 impl Aggregate {
@@ -109,6 +117,14 @@ impl Aggregate {
             self.credits_used += c;
         }
         self.latency_sum_ms += r.latency_ms;
+        if r.cache_observed {
+            self.cache_observed_requests += 1;
+            if r.cache_read_tokens > 0 {
+                self.cache_hit_requests += 1;
+            }
+            self.cache_read_tokens += r.cache_read_tokens.max(0) as i64;
+            self.cache_creation_tokens += r.cache_creation_tokens.max(0) as i64;
+        }
     }
 
     /// 把另一个聚合并入本聚合（用于跨桶汇总）
@@ -120,6 +136,10 @@ impl Aggregate {
         self.output_tokens += other.output_tokens;
         self.credits_used += other.credits_used;
         self.latency_sum_ms += other.latency_sum_ms;
+        self.cache_observed_requests += other.cache_observed_requests;
+        self.cache_hit_requests += other.cache_hit_requests;
+        self.cache_read_tokens += other.cache_read_tokens;
+        self.cache_creation_tokens += other.cache_creation_tokens;
     }
 
     /// 成功率（0.0~1.0），无请求时为 0
@@ -128,6 +148,15 @@ impl Aggregate {
             0.0
         } else {
             self.success as f64 / self.requests as f64
+        }
+    }
+
+    /// 严格缓存命中率（命中请求 / 实际观测请求），无观测时为 0。
+    pub fn cache_hit_rate(&self) -> f64 {
+        if self.cache_observed_requests == 0 {
+            0.0
+        } else {
+            self.cache_hit_requests as f64 / self.cache_observed_requests as f64
         }
     }
 
@@ -646,6 +675,16 @@ pub struct WindowSummary {
     pub credits_used: f64,
     /// 平均延迟（毫秒）
     pub avg_latency_ms: f64,
+    /// 实际执行严格缓存探针的请求数（不含观测关闭/无法解析的请求）。
+    pub cache_observed_requests: u64,
+    /// 命中此前成功检查点的请求数。
+    pub cache_hit_requests: u64,
+    /// 命中率（cache_hit_requests / cache_observed_requests）。
+    pub cache_hit_rate: f64,
+    /// 严格推断复用的输入 token。
+    pub cache_read_tokens: i64,
+    /// 缓存创建 token；Kiro 无创建回执，当前严格模式通常为 0。
+    pub cache_creation_tokens: i64,
 }
 
 impl From<Aggregate> for WindowSummary {
@@ -660,6 +699,11 @@ impl From<Aggregate> for WindowSummary {
             total_tokens: a.input_tokens + a.output_tokens,
             credits_used: a.credits_used,
             avg_latency_ms: a.avg_latency_ms(),
+            cache_observed_requests: a.cache_observed_requests,
+            cache_hit_requests: a.cache_hit_requests,
+            cache_hit_rate: a.cache_hit_rate(),
+            cache_read_tokens: a.cache_read_tokens,
+            cache_creation_tokens: a.cache_creation_tokens,
         }
     }
 }
@@ -1392,6 +1436,27 @@ mod tests {
     }
 
     #[test]
+    fn test_cache_observation_aggregate_uses_only_observed_requests_as_denominator() {
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_cache_aggregate"));
+        let mut hit = rec(0, Some(1), "m", RequestOutcome::Success, 10, 5);
+        hit.cache_observed = true;
+        hit.cache_read_tokens = 80;
+        let mut miss = rec(1_000, Some(1), "m", RequestOutcome::Success, 10, 5);
+        miss.cache_observed = true;
+        let unobserved = rec(2_000, Some(1), "m", RequestOutcome::Success, 10, 5);
+        s.on_record(&hit);
+        s.on_record(&miss);
+        s.on_record(&unobserved);
+
+        let w = s.overview_at(BASE_MS + 2_000).last_24h;
+        assert_eq!(w.requests, 3);
+        assert_eq!(w.cache_observed_requests, 2);
+        assert_eq!(w.cache_hit_requests, 1);
+        assert!((w.cache_hit_rate - 0.5).abs() < f64::EPSILON);
+        assert_eq!(w.cache_read_tokens, 80);
+    }
+
+    #[test]
     fn test_cross_hour_and_cross_day() {
         let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
         // 三个不同小时各 1 条（同一天）
@@ -1866,16 +1931,19 @@ mod tests {
         let mut r = rec(0, Some(1), "m", RequestOutcome::Success, 10, 5);
         r.cache_read_tokens = 128;
         r.cache_creation_tokens = 64;
+        r.cache_observed = true;
         let json = serde_json::to_string(&r).unwrap();
         let back: RequestRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(back.cache_read_tokens, 128);
         assert_eq!(back.cache_creation_tokens, 64);
+        assert!(back.cache_observed);
 
         // 缺字段的历史行：serde default 回退 0，不报错
         let legacy = r#"{"request_id":"x","ts_ms":0,"credential_id":null,"model":"m","is_streaming":false,"input_tokens":1,"output_tokens":1,"credits_used":null,"latency_ms":0,"first_token_ms":null,"outcome":"success","retries":0,"error_message":null,"session_id":null,"client_device":null,"client_ip":null,"client_os":null,"client_browser":null}"#;
         let legacy_rec: RequestRecord = serde_json::from_str(legacy).unwrap();
         assert_eq!(legacy_rec.cache_read_tokens, 0);
         assert_eq!(legacy_rec.cache_creation_tokens, 0);
+        assert!(!legacy_rec.cache_observed);
     }
 
     #[test]

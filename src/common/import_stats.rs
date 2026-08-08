@@ -8,7 +8,8 @@
 //! # 设计（与 [`super::recovery_metrics`] 同源）
 //! - **不持久化**：这是「自进程启动以来」的运营信号，重启归零；凭据本身已落 credentials.json。
 //! - **有界内存**：只留最近 [`MAX_RECORDS`] 次推送，`VecDeque` 满则弹最旧，杜绝无界增长。
-//! - **绝不存明文 key**：记录里只放调用方已打码的 key（`ksk_abcd...wxyz`），与响应体同源。
+//! - **两条通道隔离**：既有批量通道保持 admin 面板可复制明文的历史行为；新 Relay
+//!   通道只记录打码 key。两者使用独立队列与计数器，互不覆盖。
 
 use std::collections::VecDeque;
 use std::sync::OnceLock;
@@ -27,12 +28,7 @@ const MAX_ITEMS_PER_RECORD: usize = 20;
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportItemRecord {
-    /// **完整明文 key**。
-    ///
-    /// 面板要能直接确认「对方推来的到底是哪个号」并复制去核对，故这里存完整值而非打码串。
-    /// 暴露面与既有 `GET /api/admin/credentials/{id}/export`（返回含明文 key 的整条凭据）
-    /// 同级：都只经 admin 鉴权的管理面出口，且本记录仅在进程内存、重启即失、不落盘。
-    /// 发给**推送方**的 HTTP 响应仍是打码值（契约明确「不依赖完整值」），两个出口口径不同是有意的。
+    /// 展示用 key。既有批量通道保持完整值；Relay 通道仅写入打码值。
     pub key: String,
     /// key 指纹（SHA-256 前 8 位）。用于和凭据管理页的指纹对照同一个号，
     /// 也便于在不整串比对的情况下快速判同。恒可计算，故非 Option。
@@ -58,6 +54,9 @@ pub struct ImportItemRecord {
     pub sent_endpoint: Option<String>,
     /// **推送方发来的 groups 原值**，照实回显（契约称固定空数组，但不替它假设）。
     pub sent_groups: Vec<String>,
+    /// Relay 单条协议的投递 ID；批量导入协议没有此字段。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_id: Option<String>,
     /// 最终落库的 region（探测或重用的结果）。面板显示用——运维要能看出号被路由到哪。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
@@ -95,8 +94,19 @@ static KEYS_IMPORTED: AtomicU64 = AtomicU64::new(0);
 static KEYS_DUPLICATE: AtomicU64 = AtomicU64::new(0);
 static KEYS_FAILED: AtomicU64 = AtomicU64::new(0);
 static LAST_AT_MS: AtomicU64 = AtomicU64::new(0);
+static RELAY_PUSHES: AtomicU64 = AtomicU64::new(0);
+static RELAY_KEYS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static RELAY_KEYS_IMPORTED: AtomicU64 = AtomicU64::new(0);
+static RELAY_KEYS_DUPLICATE: AtomicU64 = AtomicU64::new(0);
+static RELAY_KEYS_FAILED: AtomicU64 = AtomicU64::new(0);
+static RELAY_LAST_AT_MS: AtomicU64 = AtomicU64::new(0);
 
 fn records() -> &'static Mutex<VecDeque<ImportRecord>> {
+    static RECORDS: OnceLock<Mutex<VecDeque<ImportRecord>>> = OnceLock::new();
+    RECORDS.get_or_init(|| Mutex::new(VecDeque::with_capacity(MAX_RECORDS)))
+}
+
+fn relay_records() -> &'static Mutex<VecDeque<ImportRecord>> {
     static RECORDS: OnceLock<Mutex<VecDeque<ImportRecord>>> = OnceLock::new();
     RECORDS.get_or_init(|| Mutex::new(VecDeque::with_capacity(MAX_RECORDS)))
 }
@@ -111,20 +121,59 @@ fn now_ms() -> u64 {
 
 /// 记一次推送。`items` 为全部条目，内部会按「失败优先」裁剪到上限后入队。
 pub fn record_push(items: Vec<ImportItemRecord>, elapsed_ms: u64) {
+    record_into(
+        items,
+        elapsed_ms,
+        &PUSHES,
+        &KEYS_TOTAL,
+        &KEYS_IMPORTED,
+        &KEYS_DUPLICATE,
+        &KEYS_FAILED,
+        &LAST_AT_MS,
+        records(),
+    );
+}
+
+/// Record one Relay `/push` request separately from the legacy batch-import channel.
+pub fn record_relay_push(items: Vec<ImportItemRecord>, elapsed_ms: u64) {
+    record_into(
+        items,
+        elapsed_ms,
+        &RELAY_PUSHES,
+        &RELAY_KEYS_TOTAL,
+        &RELAY_KEYS_IMPORTED,
+        &RELAY_KEYS_DUPLICATE,
+        &RELAY_KEYS_FAILED,
+        &RELAY_LAST_AT_MS,
+        relay_records(),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_into(
+    items: Vec<ImportItemRecord>,
+    elapsed_ms: u64,
+    pushes: &AtomicU64,
+    keys_total: &AtomicU64,
+    keys_imported: &AtomicU64,
+    keys_duplicate: &AtomicU64,
+    keys_failed: &AtomicU64,
+    last_at_ms: &AtomicU64,
+    queue: &Mutex<VecDeque<ImportRecord>>,
+) {
     let total = items.len();
     let imported = items.iter().filter(|i| i.ok && !i.duplicate).count();
     let duplicates = items.iter().filter(|i| i.ok && i.duplicate).count();
     let failed = items.iter().filter(|i| !i.ok).count();
 
-    PUSHES.fetch_add(1, Ordering::Relaxed);
-    KEYS_TOTAL.fetch_add(total as u64, Ordering::Relaxed);
-    KEYS_IMPORTED.fetch_add(imported as u64, Ordering::Relaxed);
-    KEYS_DUPLICATE.fetch_add(duplicates as u64, Ordering::Relaxed);
-    KEYS_FAILED.fetch_add(failed as u64, Ordering::Relaxed);
+    pushes.fetch_add(1, Ordering::Relaxed);
+    keys_total.fetch_add(total as u64, Ordering::Relaxed);
+    keys_imported.fetch_add(imported as u64, Ordering::Relaxed);
+    keys_duplicate.fetch_add(duplicates as u64, Ordering::Relaxed);
+    keys_failed.fetch_add(failed as u64, Ordering::Relaxed);
     let at_ms = now_ms();
-    LAST_AT_MS.store(at_ms, Ordering::Relaxed);
+    last_at_ms.store(at_ms, Ordering::Relaxed);
 
-    // 失败项优先：一次推 1000 个时运维只关心哪些失败、为什么。
     let mut kept: Vec<ImportItemRecord> = items.iter().filter(|i| !i.ok).cloned().collect();
     if kept.len() < MAX_ITEMS_PER_RECORD {
         kept.extend(
@@ -138,7 +187,7 @@ pub fn record_push(items: Vec<ImportItemRecord>, elapsed_ms: u64) {
     kept.truncate(MAX_ITEMS_PER_RECORD);
     let omitted = total.saturating_sub(kept.len());
 
-    let mut queue = records().lock();
+    let mut queue = queue.lock();
     if queue.len() == MAX_RECORDS {
         queue.pop_front();
     }
@@ -160,6 +209,16 @@ pub fn record_push(items: Vec<ImportItemRecord>, elapsed_ms: u64) {
 pub struct ImportStatsSnapshot {
     /// 导入接口是否已配置 `importApiKey` 并启用。
     pub enabled: bool,
+    /// Relay 单条推送频道是否已配置专用密钥。
+    pub relay_enabled: bool,
+    pub relay_pushes: u64,
+    pub relay_keys_total: u64,
+    pub relay_keys_imported: u64,
+    pub relay_keys_duplicate: u64,
+    pub relay_keys_failed: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_last_at_ms: Option<u64>,
+    pub relay_records: Vec<ImportRecord>,
     pub pushes: u64,
     pub keys_total: u64,
     pub keys_imported: u64,
@@ -174,6 +233,7 @@ pub struct ImportStatsSnapshot {
 
 /// 导入接口是否已启用（启动时按 `importApiKey` 是否配置写入一次）。
 static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static RELAY_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 启动接线时调用：把「导入接口是否启用」告知本模块，供面板区分
 /// 「未启用」与「已启用但还没人推过」——两者都表现为零计数，但处置完全不同。
@@ -181,12 +241,27 @@ pub fn set_enabled(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
 }
 
+pub fn set_relay_enabled(enabled: bool) {
+    RELAY_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
 pub fn snapshot() -> ImportStatsSnapshot {
     let last = LAST_AT_MS.load(Ordering::Relaxed);
     let mut list: Vec<ImportRecord> = records().lock().iter().cloned().collect();
     list.reverse(); // 新的在前，前端直接渲染
+    let mut relay_list: Vec<ImportRecord> = relay_records().lock().iter().cloned().collect();
+    relay_list.reverse();
+    let relay_last = RELAY_LAST_AT_MS.load(Ordering::Relaxed);
     ImportStatsSnapshot {
         enabled: ENABLED.load(Ordering::Relaxed),
+        relay_enabled: RELAY_ENABLED.load(Ordering::Relaxed),
+        relay_pushes: RELAY_PUSHES.load(Ordering::Relaxed),
+        relay_keys_total: RELAY_KEYS_TOTAL.load(Ordering::Relaxed),
+        relay_keys_imported: RELAY_KEYS_IMPORTED.load(Ordering::Relaxed),
+        relay_keys_duplicate: RELAY_KEYS_DUPLICATE.load(Ordering::Relaxed),
+        relay_keys_failed: RELAY_KEYS_FAILED.load(Ordering::Relaxed),
+        relay_last_at_ms: (relay_last > 0).then_some(relay_last),
+        relay_records: relay_list,
         pushes: PUSHES.load(Ordering::Relaxed),
         keys_total: KEYS_TOTAL.load(Ordering::Relaxed),
         keys_imported: KEYS_IMPORTED.load(Ordering::Relaxed),
@@ -214,6 +289,7 @@ mod tests {
             sent_region: None,
             sent_endpoint: None,
             sent_groups: Vec::new(),
+            delivery_id: None,
         }
     }
 
@@ -239,7 +315,11 @@ mod tests {
             .find(|r| r.total == 31)
             .expect("应能找到本用例写入的记录");
         assert_eq!(latest.failed, 1);
-        assert_eq!(latest.items.len(), MAX_ITEMS_PER_RECORD, "明细应被裁剪到上限");
+        assert_eq!(
+            latest.items.len(),
+            MAX_ITEMS_PER_RECORD,
+            "明细应被裁剪到上限"
+        );
         assert!(!latest.items[0].ok, "失败项必须排在最前且不被裁掉");
         assert_eq!(latest.omitted, 31 - MAX_ITEMS_PER_RECORD);
     }
@@ -254,6 +334,47 @@ mod tests {
         assert!(
             records().lock().len() <= MAX_RECORDS,
             "记录数不得超过 {MAX_RECORDS}"
+        );
+    }
+
+    /// 新 Relay 的记录和计数不得污染生产批量通道；旧面板仍只读取原字段。
+    #[test]
+    fn relay_and_batch_statistics_are_independent() {
+        let _guard = test_lock();
+        let before = snapshot();
+
+        let mut batch = item(true, false);
+        batch.key = "ksk_batch_plaintext_marker".into();
+        record_push(vec![batch], 11);
+
+        let mut relay = item(false, false);
+        relay.key = "ksk_rela...sker".into();
+        relay.delivery_id = Some("relay-isolation-marker".into());
+        record_relay_push(vec![relay], 12);
+
+        let after = snapshot();
+        assert_eq!(after.pushes, before.pushes + 1, "Relay 不得增加旧 pushes");
+        assert_eq!(after.relay_pushes, before.relay_pushes + 1);
+        assert!(
+            after.records.iter().any(|r| r
+                .items
+                .iter()
+                .any(|i| i.key == "ksk_batch_plaintext_marker")),
+            "旧批量队列必须继续保留管理台明文 key"
+        );
+        assert!(
+            after.relay_records.iter().any(|r| r
+                .items
+                .iter()
+                .any(|i| i.delivery_id.as_deref() == Some("relay-isolation-marker"))),
+            "Relay 记录必须只进入 relayRecords"
+        );
+        assert!(
+            !after.records.iter().any(|r| r
+                .items
+                .iter()
+                .any(|i| i.delivery_id.as_deref() == Some("relay-isolation-marker"))),
+            "Relay 记录污染了生产批量队列"
         );
     }
 }

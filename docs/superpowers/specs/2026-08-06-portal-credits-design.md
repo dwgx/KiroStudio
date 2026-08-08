@@ -15,35 +15,50 @@ Portal 用户查看凭据明文需消耗积分。**每把 key 独立结算**：�
 
 ## 计费规则
 
-### 单价公式
+### 单价公式（两段式）
 
 ```
-unit_price(N) = max(min_price, min(default_price, ceil(total_price / N)))
+N ≤ base_count  →  base_price                                  ← 前段：固定价
+N >  base_count  →  max(min_price, min(base_price, ceil(total_price / N)))   ← 后段：均摊
 ```
 
 - `N` = 该 key 的 distinct 解锁人数，**上限 `max_unlockers` = 10**
-- `default_price` = 10（单人价，同时是价格上限）
-- `total_price` = 20（定价基数，见下方「一个必须知道的后果」）
-- `min_price` = 1（下限，在默认参数下永不触发，见下）
+- `base_count` = 2（前几人享固定价）
+- `base_price` = 10（那个固定价，同时是全局价格上限）
+- `total_price` = 20（后段的均摊基数，见下方「一个必须知道的后果」）
+- `min_price` = 1（下限，默认参数下永不触发，见下）
 
-四个参数各自可配。
+五个参数各自可配。**前段的「几人」和「多少分」是两个独立参数**，因此「2 人 10 分」「4 人 5 分」「6 人 3 分」都能直接配出来，不必反推基数。
 
-代入验证（默认参数，已用脚本逐行跑过）：
+代入验证（两组配置，均已用脚本逐行跑过）：
 
-| N | ceil(20/N) | 单价 | 说明 |
+| N | `base=2, price=10, total=20` | `base=4, price=5, total=20` |
+|---|---|---|
+| 1 | **10** | **5** |
+| 2 | **10** | **5** |
+| 3 | **7** | **5** |
+| 4 | **5** | **5** |
+| 5 | **4** | **4** |
+| 6 | **4** | **4** |
+| 7 | **3** | **3** |
+| 8 | **3** | **3** |
+| 9 | **3** | **3** |
+| 10 | **2** | **2** |
+
+左列与旧公式的结果**完全一致**——旧的单段公式是新公式在 `base_count=2` 时的特例，所以这次改动向后兼容，已有配置的行为不变。
+
+### 后段为什么要取 `min(base_price, …)`
+
+不取 min 会让某些配置组合出现**越多人越贵**。以 `base_count=4, base_price=5, total_price=100` 为例：
+
+| | N=4 | N=5 | N=6 |
 |---|---|---|---|
-| 1 | 20 | **10** | 被 default_price 截断 |
-| 2 | 10 | **10** | 恰好相等，无退款 |
-| 3 | 7 | **7** | 20/3=6.67 上取整 |
-| 4 | 5 | **5** | |
-| 5 | 4 | **4** | |
-| 6 | 4 | **4** | |
-| 7 | 3 | **3** | |
-| 8 | 3 | **3** | |
-| 9 | 3 | **3** | |
-| 10 | 2 | **2** | 满员，最低价 |
+| 不取 min | 5 | **20** | 17 |
+| 取 min | 5 | **5** | 5 |
 
-价格区间锁定 **2~10 分**。
+N=4→5 时价格从 5 跳到 20，因为 `ceil(100/5)=20` 远高于前段的固定价。这会让用户看到「多来一个人，我要多付 15 分」——而整套设计的承诺正好相反。
+
+取 min 把后段钳在前段价格之下，保证**单调不增**（人数增加时单价只会降或平，绝不上涨）。已用脚本验证 8 组配置组合（含上述病态组合）全部满足单调不增。这条性质是用户能理解这套规则的前提，必须在 `credits.rs` 里有对应断言。
 
 ### 人数上限 = 10
 
@@ -138,6 +153,32 @@ CREATE INDEX idx_portal_unlocks_cred ON portal_unlocks(credential_id);
 
 复合主键天然保证幂等。`credential_id` 不设外键——凭据池在 `credentials.json` 而非本库，且凭据被删后解锁记录应保留（历史仍需可查，与 `portal_audit` 同理）。
 
+### `portal_key_pricing`
+
+**价格参数快照。** 一把 key 首次被解锁时，把当时的三个参数冻结在这里，此后这把 key 一直用它们计价。
+
+```sql
+CREATE TABLE portal_key_pricing (
+  credential_id  INTEGER PRIMARY KEY,     -- 一把 key 一行
+  base_count     INTEGER NOT NULL,        -- 冻结时的前段人数
+  base_price     INTEGER NOT NULL,        -- 冻结时的前段固定价 / 上限
+  total_price    INTEGER NOT NULL,        -- 冻结时的均摊基数
+  min_price      INTEGER NOT NULL,        -- 冻结时的下限
+  max_unlockers  INTEGER NOT NULL,        -- 冻结时的人数上限
+  frozen_at_ms   INTEGER NOT NULL
+);
+```
+
+五个参数**全部**冻结，不只是价格。`base_count` 也必须冻——否则管理员把前段从 2 人改成 4 人时，一把已有 3 人解锁的 key 会从「第 3 人按均摊 7 分」变成「第 3 人享固定价 10 分」，价格上涨，正是快照要防的事。
+
+**为什么需要它。** 若不冻结，管理员把基数 20 调到 40 时，已有 4 人解锁的 key 单价会从 5 分跳到 10 分，产生两个都不可接受的选择：追扣老用户 5 分（用户莫名少钱，余额可能被扣成负数），或让老用户维持 5 分而新用户付 8 分（同一把 key 两种价格，「均摊」的说法当场失效，且 `paid` 字段语义分裂成新旧两套、无法用单一公式校验总账）。
+
+冻结之后，语义变得干净：**改价只影响之后才首次被解锁的 key**。已经在用的 key 参数不动，`paid` 字段永远可以用该 key 的快照参数验证。
+
+**推论：改价不产生退款。** 老 key 的单价不变，没有差额可退，因此不存在「改价退款」这类流水。改价只写审计（`admin_change_price`，记录改前改后的值），不触碰任何用户余额。这一点是上面那个决定的直接结果，不是遗漏。
+
+首次解锁时若该行不存在则插入（与解锁在同一事务内，避免并发下两人各插一次）；读取时若缺失则回退到当前配置（兼容积分功能开启前就存在的 key）。
+
 ### `portal_ledger`
 
 ```sql
@@ -174,18 +215,23 @@ src/portal/
 ```
 BEGIN IMMEDIATE
   1. 已解锁？ → 直接返回明文（幂等，不扣分，不写流水）
-  2. N_cur = distinct_unlockers(cred)
-  3. N_cur >= max_unlockers？ → ROLLBACK，409 + 「已满 (10/10)」
-  4. N_new = N_cur + 1
-  5. price = unit_price(N_new)
-  6. 余额 < price？ → ROLLBACK，402 + 差额提示
-  7. 扣 price；写 unlocks(paid=price)；写 ledger(unlock)
-  8. 该 key 的其余 (N_new − 1) 人：
+  2. 读 key_pricing(cred)：
+       有快照 → 用快照里的 (default, total, min, max)
+       无快照 → 用当前配置，并写入快照（本 key 的价格从此固定）
+  3. N_cur = distinct_unlockers(cred)
+  4. N_cur >= max（来自快照）？ → ROLLBACK，409 + 「已满 (N/max)」
+  5. N_new = N_cur + 1
+  6. price = unit_price(N_new, 快照参数)
+  7. 余额 < price？ → ROLLBACK，402 + 差额提示
+  8. 扣 price；写 unlocks(paid=price)；写 ledger(unlock)
+  9. 该 key 的其余 (N_new − 1) 人：
        refund = paid − price
        refund > 0 → 加余额；paid = price；写 ledger(refund)
 COMMIT
 → 返回明文
 ```
+
+**第 2 步的快照写入必须在同一事务内。** 两人同时首次解锁同一把 key 时，若快照写在事务外，二者可能各自读到不同的配置值（管理员正好在此刻改价），于是同一把 key 上出现两套参数、`paid` 语义分裂。放进事务里由 SQLite 写锁串行化：先到者写快照，后到者读到的必然是同一份。
 
 **满员检查必须在事务内、在扣费之前。** 放到事务外就是一个 TOCTOU 竞态：10 人已满时两人同时点解锁，都读到 `N_cur=10` 之前的旧值而通过检查，最终变成 12 人。放在扣费之后则更糟——钱扣了才发现满员，得靠回滚兜住，多一条容易出错的路径。
 
@@ -214,25 +260,56 @@ COMMIT
 ```jsonc
 {
   "portalCreditsEnabled": false,   // 默认关：不开就是现在的白给行为，升级不改变现状
-  "portalKeyDefaultPrice": 10,     // 单人价 / 价格上限
-  "portalKeyTotalPrice": 20,       // 定价基数
+  "portalKeyBaseCount": 2,         // 前段人数：前几个人享固定价
+  "portalKeyBasePrice": 10,        // 前段固定价，同时是全局价格上限
+  "portalKeyTotalPrice": 20,       // 均摊基数：N > baseCount 时按 total/N 分摊
   "portalKeyMaxUnlockers": 10,     // 每把 key 最多几人解锁（满员后拒绝）
   "portalKeyMinPrice": 1           // 下限；默认参数下永不触发，见下
 }
 ```
 
+**你要的两种配置分别这么写：**
+
+「2 人 10 分」（默认）：
+```jsonc
+{ "portalKeyBaseCount": 2, "portalKeyBasePrice": 10, "portalKeyTotalPrice": 20 }
+// → 10 10 7 5 4 4 3 3 3 2
+```
+
+「4 人 5 分」：
+```jsonc
+{ "portalKeyBaseCount": 4, "portalKeyBasePrice": 5, "portalKeyTotalPrice": 20 }
+// → 5 5 5 5 4 4 3 3 3 2
+```
+
 默认关闭的理由与 `portalEnabled` 一致：升级版本不该让已有部署突然开始收费、把现有用户挡在门外。
+
+### 改价的影响范围
+
+**改配置只影响「还没有任何人解锁过」的 key。** 已有解锁者的 key 在首次解锁时就把四个参数写进了 `portal_key_pricing` 快照，此后永久按快照计价，改配置对它没有任何作用。
+
+这条规则带来两个直接结论，都是有意的：
+
+**一、改价不会产生退款。** 老 key 的参数不变 → 应付不变 → 没有差额可退。所以流水里不存在「改价退款」这种记录，也不需要为改价写任何批量重算逻辑。（曾考虑过「涨价不追扣、降价照退」的折中方案，但它会让同一把 key 上出现两种价格，`paid` 字段的含义按用户分裂，总账无法用一个公式校验——不采用。）
+
+**二、改价仍然要写审计。** 记录「谁在何时把 total 从 20 改成 40」。虽然没有用户余额受影响，但价格是计费的基础参数，改动必须可追溯——否则日后对账时无法解释「为什么 key#7 是 20/10 而 key#9 是 40/10」。审计动作名 `admin_change_pricing`，detail 记下改动前后的值。
 
 **`portalKeyMinPrice` 在默认参数下是死参数。** 上限 10 人时最低单价是 `ceil(20/10)=2`，永远碰不到下限 1。保留它只为「把上限调大到 20+ 或把基数调小」这类改配置的场景兜底——那时它才开始起作用。不删除，但也不要指望它在默认配置下有任何效果。
 
 ## 测试
 
 `credits.rs` 纯函数：
-- N=1..max 全覆盖：单调不增、恒 ≥ min_price、恒 ≤ default_price
-- **默认参数下价格区间锁定 2~10 分**（N=10 时 ceil(20/10)=2 为最低）
+- N=1..max 全覆盖：**单调不增**、恒 ≥ min_price、恒 ≤ base_price
+- 前段恒定：N ≤ baseCount 时单价恒等于 basePrice（用 baseCount=1/2/4/10 各验一遍）
+- 你给的两组配置逐项对齐：
+  - `base=2,price=10,total=20` → `10 10 7 5 4 4 3 3 3 2`
+  - `base=4,price=5,total=20` → `5 5 5 5 4 4 3 3 3 2`
+- **病态配置的 min 钳制**（这条最重要）：`base=4, price=5, total=100` 时，
+  若后段不取 `min(basePrice, …)`，N=5 会从 5 分跳到 20 分——价格随人数上涨。
+  断言该组合下序列仍单调不增（全 5 分）。已用脚本验证 8 组配置，全部通过。
 - 差额模型：模拟 1→10 人陆续上车，断言**任何时刻**每人净支出 == `unit_price(N)`（已用脚本预演，10 步零异常）
 - 满员判定：`N == max` 时新用户被拒，已解锁者不受影响
-- 参数边界：`total < default`、`min > total`、`max = 1`、三者为 0
+- 参数边界：`total < basePrice`、`min > total`、`max = 1`、`baseCount > max`、三者为 0
 - 整数运算：ceil 用整数实现而非浮点（避免 20/3 的浮点表示误差）
 
 store 层事务：
@@ -242,6 +319,13 @@ store 层事务：
 - 并发：两线程同抢一把 key → 最终 N=2、各付 10、总扣 20
 - 并发满员：10 人已满时两线程同抢 → 都被拒，**不会出现 N=11**
 - 级联：删用户后 balances/unlocks 清空，ledger 保留
+
+参数快照（`portal_key_pricing`）：
+- 首次解锁写入快照；第 2..N 人读到的是**同一份**快照
+- 改配置后老 key 价格不变：4 人已解锁 → 改 total 20→40 → 第 5 人仍按旧参数 `ceil(20/5)=4` 计价
+- 改配置后新 key 用新参数：另一把从未解锁的 key → 第 1 人按新参数
+- 快照缺失（老数据升级场景）→ 回退当前配置，不 panic
+- 快照与配置无关性：删掉配置项后老 key 仍按快照结算
 
 http 层：
 - 未解锁时响应体内**搜不到明文**（带对照组：已解锁的 key 必须搜得到，否则搜索方法本身无效）

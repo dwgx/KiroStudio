@@ -624,6 +624,56 @@ function OutcomeBadge({ outcome }: { outcome: RequestOutcome }) {
 
 /* ============ 最近请求明细表 ============ */
 
+type RequestCacheState = 'hit' | 'miss' | 'legacyHit' | 'unobserved'
+
+// 单条请求的缓存口径必须同时看 cache_observed 与 token 数：
+// - observed + read>0 是严格 hit；
+// - observed + read=0 是严格 miss（即使本次建立了新缓存）；
+// - 旧库可能已有 read token、但 cache_observed 是后来迁移新增的默认 false，
+//   这类只能标为 legacyHit，保留证据但不冒充严格命中；
+// - 既无严格标记也无读取证据才是 unobserved，绝不能伪装成 miss。
+function requestCacheInfo(record: RequestRecord): {
+  state: RequestCacheState
+  read: number
+  write: number
+} {
+  const read = Math.max(0, record.cache_read_tokens ?? 0)
+  const write = Math.max(0, record.cache_creation_tokens ?? 0)
+  if (record.cache_observed) return { state: read > 0 ? 'hit' : 'miss', read, write }
+  return { state: read > 0 ? 'legacyHit' : 'unobserved', read, write }
+}
+
+function CacheStateBadge({ state }: { state: RequestCacheState }) {
+  const { t } = useTranslation()
+  const variant = state === 'hit' ? 'success' : state === 'miss' ? 'warning' : state === 'legacyHit' ? 'default' : 'outline'
+  return (
+    <Badge
+      variant={variant}
+      className="px-1.5 py-0 text-[10px]"
+      title={t(`usagepage.recent.cacheStateHint.${state}`)}
+    >
+      {t(`usagepage.recent.cacheState.${state}`)}
+    </Badge>
+  )
+}
+
+// 表格中的紧凑缓存单元：主行给结论，副行保留读/写 token 证据。
+function CacheCell({ record }: { record: RequestRecord }) {
+  const { t } = useTranslation()
+  const cache = requestCacheInfo(record)
+  return (
+    <div className="inline-flex min-w-[112px] flex-col items-end gap-1">
+      <CacheStateBadge state={cache.state} />
+      <span
+        className="whitespace-nowrap text-[10px] tabular-nums text-muted-foreground"
+        title={t('usagepage.recent.cacheTokensTooltip', { read: cache.read.toLocaleString(), write: cache.write.toLocaleString() })}
+      >
+        {t('usagepage.recent.cacheTokens', { read: compact(cache.read), write: compact(cache.write) })}
+      </span>
+    </div>
+  )
+}
+
 // 详情弹层里的单行：左灰标签、右等宽值，值可换行不撑破。空值统一显示「—」。
 function DetailRow({
   label,
@@ -652,6 +702,7 @@ function DetailRow({
 function RequestDetail({ record: r }: { record: RequestRecord }) {
   const { t } = useTranslation()
   const dev = deviceMeta(r.client_device, t)
+  const cache = requestCacheInfo(r)
   // 设备三维拼一行：主类 + OS + 浏览器，各自有值才拼。
   const deviceLine = [dev.label, r.client_os, r.client_browser].filter(Boolean).join(' · ')
   return (
@@ -668,6 +719,15 @@ function RequestDetail({ record: r }: { record: RequestRecord }) {
       <DetailRow
         label={t('usagepage.detail.tokenInOut')}
         value={`${r.input_tokens.toLocaleString()} / ${r.output_tokens.toLocaleString()}`}
+      />
+      <DetailRow
+        label={t('usagepage.detail.cacheReadWrite')}
+        value={
+          <span className="inline-flex flex-wrap items-center justify-end gap-1.5">
+            <CacheStateBadge state={cache.state} />
+            <span>{cache.read.toLocaleString()} / {cache.write.toLocaleString()}</span>
+          </span>
+        }
       />
       {r.credits_used != null && (
         <DetailRow label="Credits" value={r.credits_used.toFixed(2)} />
@@ -705,8 +765,7 @@ function RequestDetailSpread({ record: r }: { record: RequestRecord }) {
   const { t } = useTranslation()
   const dev = deviceMeta(r.client_device, t)
   const deviceLine = [dev.label, r.client_os, r.client_browser].filter(Boolean).join(' · ')
-  const cacheR = (r as { cache_read_tokens?: number }).cache_read_tokens
-  const cacheW = (r as { cache_creation_tokens?: number }).cache_creation_tokens
+  const cache = requestCacheInfo(r)
   // 字段项:label + value,自动流式排布(auto-fill 网格,窄屏少列宽屏多列,自然铺成几行)。
   const items: { label: string; value: React.ReactNode; mono?: boolean }[] = [
     { label: t('usagepage.detail.time'), value: new Date(r.ts_ms).toLocaleString() },
@@ -716,7 +775,16 @@ function RequestDetailSpread({ record: r }: { record: RequestRecord }) {
     { label: t('usagepage.detail.device'), value: deviceLine || '—', mono: false },
     { label: t('usagepage.detail.clientIp'), value: r.client_ip || '—' },
     { label: t('usagepage.detail.tokenInOutShort'), value: `${r.input_tokens.toLocaleString()} / ${r.output_tokens.toLocaleString()}` },
-    ...(cacheR != null || cacheW != null ? [{ label: t('usagepage.detail.cacheReadWrite'), value: `${(cacheR ?? 0).toLocaleString()} / ${(cacheW ?? 0).toLocaleString()}` }] : []),
+    {
+      label: t('usagepage.detail.cacheReadWrite'),
+      value: (
+        <span className="inline-flex items-center gap-1.5">
+          <CacheStateBadge state={cache.state} />
+          <span>{cache.read.toLocaleString()} / {cache.write.toLocaleString()}</span>
+        </span>
+      ),
+      mono: false,
+    },
     ...(r.credits_used != null ? [{ label: 'Credits', value: r.credits_used.toFixed(2) }] : []),
     { label: t('usagepage.detail.latency'), value: `${r.latency_ms.toLocaleString()}ms${r.first_token_ms != null ? ` · ${t('usagepage.detail.firstToken')} ${r.first_token_ms.toLocaleString()}ms` : ''}` },
     { label: t('usagepage.detail.retryStream'), value: `${r.retries} ${t('usagepage.detail.timesUnit')} · ${r.is_streaming ? t('usagepage.detail.yes') : t('usagepage.detail.no')}` },
@@ -785,7 +853,7 @@ function RequestPopover({ record, x, y, onClose }: { record: RequestRecord; x: n
   )
 }
 
-// 列：时间 / 模型 / 设备 / 凭据 / 结果 / In-Out / 延迟。
+// 列：时间 / 模型 / 设备 / 凭据 / 结果 / In-Out / 缓存 / 延迟。
 // 交互(dwgx):左键点击行=行下方内联展开详情(手风琴);右键行=跟随鼠标浮窗看全部。
 function RecentTable({ rows }: { rows: RequestRecord[] }) {
   const { t } = useTranslation()
@@ -813,6 +881,7 @@ function RecentTable({ rows }: { rows: RequestRecord[] }) {
             <th className="py-2 pr-3 text-right font-medium">{t('usagepage.detail.credential')}</th>
             <th className="py-2 pr-3 text-center font-medium">{t('usagepage.detail.result')}</th>
             <th className="py-2 pr-3 text-right font-medium">In/Out</th>
+            <th className="py-2 pr-3 text-right font-medium">{t('usagepage.recent.cacheColumn')}</th>
             <th className="py-2 text-right font-medium">{t('usagepage.detail.latency')}</th>
           </tr>
         </thead>
@@ -840,11 +909,12 @@ function RecentTable({ rows }: { rows: RequestRecord[] }) {
                   </td>
                   <td className="py-2 pr-3 text-center"><OutcomeBadge outcome={r.outcome} /></td>
                   <td className="py-2 pr-3 text-right tabular-nums">{r.input_tokens}/{r.output_tokens}</td>
+                  <td className="py-2 pr-3 text-right align-middle"><CacheCell record={r} /></td>
                   <td className="py-2 text-right tabular-nums text-muted-foreground">{r.latency_ms}ms</td>
                 </tr>
                 {open && (
                   <tr className="border-b border-border/40 bg-secondary/20">
-                    <td colSpan={7} className="px-3 py-3">
+                    <td colSpan={8} className="px-3 py-3">
                       <RequestDetailSpread record={r} />
                     </td>
                   </tr>

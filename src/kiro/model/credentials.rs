@@ -214,6 +214,19 @@ pub struct KiroCredentials {
     /// 端点名必须在启动时注册的端点 registry 中存在。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+
+    /// 这个号是什么时候被加进池子的（Unix 毫秒）。
+    ///
+    /// 【为何是 Option 而不是必填】升级前就在 `credentials.json` 里的号没有这个字段，
+    /// 反序列化后是 `None`。那是**真实情况的如实反映**——我们确实不知道它们是何时加的，
+    /// 与其回填一个「首次被本版本读到的时间」假装知道（那个值会让所有老号显示成同一
+    /// 天、且随升级时间漂移），不如让界面显示「—」。新加的号从此都有真值。
+    ///
+    /// 用毫秒时间戳而非 RFC3339 字符串：这一列要排序和格式化，字符串每次都得先解析；
+    /// 而且时区应由浏览器决定，服务端渲染成字符串会让不同时区的人看到对不上的时间。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub added_at_ms: Option<i64>,
 }
 
 /// 脱敏展示敏感字段：有值 → `"<set:N>"`（标注长度便于排障但不泄露内容），无值 → `None`。
@@ -1113,6 +1126,7 @@ mod tests {
     fn test_to_json() {
         let creds = KiroCredentials {
             id: None,
+            added_at_ms: None,
             access_token: Some("token".to_string()),
             refresh_token: None,
             profile_arn: None,
@@ -1242,6 +1256,7 @@ mod tests {
     fn test_region_field_serialization() {
         let creds = KiroCredentials {
             id: None,
+            added_at_ms: None,
             access_token: None,
             refresh_token: Some("test".to_string()),
             profile_arn: None,
@@ -1284,6 +1299,7 @@ mod tests {
     fn test_region_field_none_not_serialized() {
         let creds = KiroCredentials {
             id: None,
+            added_at_ms: None,
             access_token: None,
             refresh_token: Some("test".to_string()),
             profile_arn: None,
@@ -1409,6 +1425,7 @@ mod tests {
         // 测试序列化和反序列化的往返一致性
         let original = KiroCredentials {
             id: Some(42),
+            added_at_ms: None,
             access_token: Some("token".to_string()),
             refresh_token: Some("refresh".to_string()),
             profile_arn: None,
