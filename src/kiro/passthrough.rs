@@ -18,7 +18,9 @@ use futures::TryStreamExt;
 use crate::common::http_read::read_body_capped;
 use crate::http_client::build_streaming_client_no_redirect;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::passthrough_think_filter::{filter_json_bytes, filter_sse_stream, guard_empty_stream};
+use crate::kiro::passthrough_think_filter::{
+    filter_json_bytes, filter_sse_stream, filter_sse_stream_with, guard_empty_stream,
+};
 use crate::model::config::TlsBackend;
 
 /// 非流式响应过滤前允许读取的最大字节数。非流式 JSON 响应通常远小于此；
@@ -81,22 +83,29 @@ pub async fn forward(
     // 再原样转发;其余 custom_api 凭据保持零转换透传。
     // ⚠️ 响应侧 thinking 过滤(thinking disabled 时 deepseek 仍吐 thinking,客户端会报
     // "Tool result missing")在下方按 content-type 分流处理,仅 deepseek_normalize=true 启用。
-    let body_bytes: Bytes = if cred.deepseek_normalize == Some(true) {
-        match serde_json::from_slice::<serde_json::Value>(&raw_body) {
-            Ok(mut v) => {
-                // per-凭据配置覆盖全局（fallback_model/min_max_tokens），bool 取全局。
-                let cfg = cred
+    //
+    // 配置提前到作用域（body 处理 + 响应过滤共用）：per-凭据覆盖全局标量，bool 取全局。
+    let ds_cfg: Option<crate::kiro::deepseek_normalize::DeepseekNormalizeConfig> =
+        if cred.deepseek_normalize == Some(true) {
+            Some(
+                cred
                     .deepseek_normalize_config
                     .as_ref()
                     .map(|c| c.merge_over(global_deepseek_cfg))
-                    .unwrap_or_else(|| global_deepseek_cfg.clone());
-                crate::kiro::deepseek_normalize::normalize_request(&mut v, &cfg);
+                    .unwrap_or_else(|| global_deepseek_cfg.clone()),
+            )
+        } else {
+            None
+        };
+    let body_bytes: Bytes = match &ds_cfg {
+        Some(cfg) => match serde_json::from_slice::<serde_json::Value>(&raw_body) {
+            Ok(mut v) => {
+                crate::kiro::deepseek_normalize::normalize_request(&mut v, cfg);
                 serde_json::to_vec(&v).map(Bytes::from).unwrap_or_else(|_| raw_body.clone())
             }
             Err(_) => raw_body.clone(), // 非 JSON(理论不该出现),回落原样透传
-        }
-    } else {
-        raw_body.clone()
+        },
+        None => raw_body.clone(),
     };
 
     // 组装转发请求:换上该凭据的 api_key(Anthropic 双头兼容:x-api-key + Authorization),
@@ -159,20 +168,24 @@ pub async fn forward(
     // ⚠️ deepseek 归一化时的响应侧 thinking 过滤:仅 `deepseek_normalize=true` 启用,
     // 其余 custom_api 保持零转换字节流（隔离铁律 3）。流式逐事件滤 thinking 块仍流式回传;
     // 非流式读完整 body 滤 thinking content blocks。解析失败 fail-open 原样透传。
-    let filter_thinking = cred.deepseek_normalize == Some(true);
+    let filter_thinking = ds_cfg.is_some();
 
     let resp = if filter_thinking && content_type.contains("text/event-stream") {
         let byte_stream = upstream.bytes_stream().map_err(|e| {
             tracing::warn!("[透传] 上游流读取中断,以错误终止响应流(客户端可据此重试): {e}");
             axum::Error::new(e)
         });
+        // 内联 `<thinking>` 剥离开关取配置（cfg 已提到作用域）。
+        let strip_inline = ds_cfg
+            .as_ref()
+            .map_or(true, |c| c.strip_inline_thinking);
         Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, content_type)
             // ⚠️ 空流兜底：thinking 被滤光/上游真空响应时补发 error 事件，
             // 防客户端 "Stream ended without receiving any events" 卡死 agentic 循环。
             .body(Body::from_stream(guard_empty_stream(
-                filter_sse_stream(byte_stream),
+                filter_sse_stream_with(byte_stream, strip_inline),
                 "上游返回空响应（thinking 被过滤后无正文内容），请重试",
             )))
             .unwrap_or_else(|_| err_response(StatusCode::BAD_GATEWAY, "构建透传响应失败"))

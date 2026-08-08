@@ -37,10 +37,7 @@ pub const DEFAULT_FALLBACK_MODEL: &str = "deepseek-v4-flash";
 /// 生效；thinking disabled 尊重客户端明确的小预算。
 const DEEPSEEK_MIN_MAX_TOKENS: u64 = 4096;
 
-/// deepseek 归一化配置（全局 `config.deepseek_normalize` 或 per-凭据 `deepseek_normalize_config`）。
-///
-/// per-凭据覆盖全局：`fallback_model` 空串 / `min_max_tokens == 0` 表示"未设，用全局"；
-/// bool 开关一律取全局（per-凭据不覆盖 bool，避免「per-凭据默认 true 覆盖全局 false」的歧义）。
+/// deepseek 归一化**全局**配置（`config.deepseek_normalize`）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct DeepseekNormalizeConfig {
@@ -74,25 +71,39 @@ impl Default for DeepseekNormalizeConfig {
     }
 }
 
-impl DeepseekNormalizeConfig {
-    /// per-凭据覆盖全局：字符串/数字未设（空/0）继承全局，bool 一律全局。
+/// deepseek 归一化 **per-凭据覆盖**（`deepseek_normalize_config`）。
+///
+/// 字段全 `Option`：`None` = 继承全局。⚠️ 不能用 `#[serde(default)]` 的具体类型结构
+/// 做 per-凭据配置——那会把缺失字段填成编译默认值（`4096`/`deepseek-v4-flash`），
+/// 在 `merge_over` 里静默覆盖全局（"未设"无法表达）。`Option` 语义明确。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct DeepseekNormalizeOverride {
+    /// 覆盖全局 `fallback_model`（None = 用全局）。
+    pub fallback_model: Option<String>,
+    /// 覆盖全局 `min_max_tokens`（None = 用全局）。
+    pub min_max_tokens: Option<u64>,
+}
+
+impl Default for DeepseekNormalizeOverride {
+    fn default() -> Self {
+        Self {
+            fallback_model: None,
+            min_max_tokens: None,
+        }
+    }
+}
+
+impl DeepseekNormalizeOverride {
+    /// per-凭据覆盖全局：None 字段继承全局，bool 一律取全局。
     pub fn merge_over(&self, global: &DeepseekNormalizeConfig) -> DeepseekNormalizeConfig {
         DeepseekNormalizeConfig {
-            fallback_model: if self.fallback_model.is_empty() {
-                global.fallback_model.clone()
-            } else {
-                self.fallback_model.clone()
-            },
-            min_max_tokens: if self.min_max_tokens == 0 {
-                global.min_max_tokens
-            } else {
-                self.min_max_tokens
-            },
-            strip_web_search_tool: global.strip_web_search_tool,
-            strip_tool_choice_parallel: global.strip_tool_choice_parallel,
-            strip_system_cache_control: global.strip_system_cache_control,
-            strip_inline_thinking: global.strip_inline_thinking,
-            fix_schema: global.fix_schema,
+            fallback_model: self
+                .fallback_model
+                .clone()
+                .unwrap_or_else(|| global.fallback_model.clone()),
+            min_max_tokens: self.min_max_tokens.unwrap_or(global.min_max_tokens),
+            ..global.clone()
         }
     }
 }
@@ -191,12 +202,12 @@ pub fn normalize_request(value: &mut Value, cfg: &DeepseekNormalizeConfig) {
         tools.retain(|tool| {
             let Some(t) = tool.as_object() else { return true };
             if cfg.strip_web_search_tool {
-                // web_search_20250305 工具：type 字段含 web_search → 剥（deepseek 不认）。
+                // ⚠️ 精确匹配（对齐 converter.rs:2028 / websearch.rs:117 的全仓约定）：
+                // 只认 `type` 以 web_search 开头（如 web_search_20250305）或 `name == "web_search"`。
+                // 用 `contains` 会误剥 `{type:"custom", name:"web_search_pro"}` 这类自定义工具。
                 let tool_type = t.get("type").and_then(|x| x.as_str());
                 let name = t.get("name").and_then(|x| x.as_str()).unwrap_or("");
-                if tool_type.is_some_and(|ty| ty.contains("web_search"))
-                    || name.contains("web_search")
-                {
+                if tool_type.is_some_and(|ty| ty.starts_with("web_search")) || name == "web_search" {
                     return false;
                 }
             }
@@ -215,13 +226,16 @@ pub fn normalize_request(value: &mut Value, cfg: &DeepseekNormalizeConfig) {
             }
         }
     }
-    // 4.1) 剥 WebSearch 的 tool_choice（deepseek 不认 web_search 类型的 tool_choice）。
+    // 4.1) 剥 WebSearch 的 tool_choice（deepseek 不认 web_search 类型的 tool_choice；
+    //      tools 里的 web_search 已被步骤 4 剥掉，指向它的 tool_choice 会悬空 400）。
     if cfg.strip_web_search_tool {
         if let Some(tc) = obj.get_mut("tool_choice") {
-            let is_web_search = tc
-                .get("type")
-                .and_then(|x| x.as_str())
-                .is_some_and(|ty| ty.contains("web_search"));
+            let ty = tc.get("type").and_then(|x| x.as_str());
+            let name = tc.get("name").and_then(|x| x.as_str());
+            // ⚠️ 两种形态：服务端工具 `{"type":"web_search_20250305"}` 与显式
+            // `{"type":"tool","name":"web_search"}`（Anthropic 常见形态，websearch.rs:135）。
+            let is_web_search = ty.is_some_and(|t| t.starts_with("web_search"))
+                || name.is_some_and(|n| n == "web_search");
             if is_web_search {
                 obj.remove("tool_choice");
             }
@@ -553,6 +567,27 @@ mod tests {
             "tool_choice": { "type": "auto", "disable_parallel_tool_use": true }
         }));
         assert_eq!(out2["tool_choice"], serde_json::json!({ "type": "auto" }));
+
+        // 🔴 回归：`{"type":"tool","name":"web_search"}` 显式形态的 tool_choice 也要剥
+        //（tools 里的 web_search 已被剥，指向它会悬空 400）。
+        let out3 = norm(serde_json::json!({
+            "tool_choice": { "type": "tool", "name": "web_search" }
+        }));
+        assert!(out3.get("tool_choice").is_none(), "name 指向 web_search 的 tool_choice 必须剥");
+    }
+
+    /// 🔴 回归：自定义工具名碰巧含 web_search（如 `web_search_pro`）**不得**误剥。
+    #[test]
+    fn custom_tool_with_web_search_in_name_not_stripped() {
+        let out = norm(serde_json::json!({
+            "tools": [
+                { "type": "custom", "name": "web_search_pro", "input_schema": { "type": "object" } },
+                { "type": "web_search_20250305", "name": "web_search" }
+            ]
+        }));
+        let tools = out["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1, "自定义 web_search_pro 必须保留，只有内置 web_search 剥掉");
+        assert_eq!(tools[0]["name"], "web_search_pro");
     }
 
     /// 请求侧补坑：system 数组元素的 cache_control 剥除（内容保留）。
@@ -590,7 +625,7 @@ mod tests {
         assert_eq!(v["max_tokens"], 1234, "自定义 min_max_tokens");
     }
 
-    /// per-凭据 merge：空 fallback/0 min_max 继承全局。
+    /// per-凭据 merge：None 字段继承全局，bool 一律全局。
     #[test]
     fn merge_over_inherits_global_defaults() {
         let global = DeepseekNormalizeConfig {
@@ -598,19 +633,41 @@ mod tests {
             min_max_tokens: 999,
             ..Default::default()
         };
-        let per_cred = DeepseekNormalizeConfig {
-            fallback_model: String::new(), // 未设 → 继承全局
-            min_max_tokens: 0,             // 未设 → 继承全局
-            ..Default::default()
-        };
+        // None = 继承全局（Option 语义，无 serde(default) 陷阱）
+        let per_cred = DeepseekNormalizeOverride::default();
         let merged = per_cred.merge_over(&global);
         assert_eq!(merged.fallback_model, "global-model");
         assert_eq!(merged.min_max_tokens, 999);
+
+        // 显式覆盖生效
+        let per_cred2 = DeepseekNormalizeOverride {
+            fallback_model: Some("per-model".to_string()),
+            min_max_tokens: Some(123),
+        };
+        let merged2 = per_cred2.merge_over(&global);
+        assert_eq!(merged2.fallback_model, "per-model");
+        assert_eq!(merged2.min_max_tokens, 123);
+
         // bool 一律取全局
         let global_off = DeepseekNormalizeConfig {
             strip_web_search_tool: false,
             ..Default::default()
         };
         assert!(!per_cred.merge_over(&global_off).strip_web_search_tool);
+    }
+
+    /// 🔴 回归：per-凭据配置反序列化——只写 `fallbackModel` 时 `min_max_tokens` 为 None
+    ///（继承全局），不会被 serde(default) 填成 4096 覆盖全局。
+    #[test]
+    fn override_deserializes_partial_fields_as_none() {
+        let parsed: DeepseekNormalizeOverride =
+            serde_json::from_str(r#"{"fallbackModel":"per-model"}"#).unwrap();
+        assert_eq!(parsed.fallback_model.as_deref(), Some("per-model"));
+        assert!(parsed.min_max_tokens.is_none(), "未写的 min_max_tokens 必须为 None，不能是默认值");
+
+        // 空对象全 None
+        let empty: DeepseekNormalizeOverride = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(empty.fallback_model.is_none());
+        assert!(empty.min_max_tokens.is_none());
     }
 }
