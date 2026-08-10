@@ -72,10 +72,21 @@ docs/PROMPT-*
 PROMPT-*.md
 /research/
 
-# Claude Code agent 配置/记忆（本地私有，不公开）
-.claude/
-# 项目级 AI 助手导航文件：与 .claude/ 同类,仅本地留存不推公开 repo
-CLAUDE.md
+# Claude Code agent 配置/记忆
+#
+# 2026-08-10 起入库，但**只能进私有仓 origin（github dwgx/KiroStudio-skiapi）**。
+# 这些文件含生产机 IP、SSH 端口、密钥文件名、线上配置路径 —— 绝不能进
+# public（github dwgx/KiroStudio）或 gitee。
+#
+# 已做的机械保护：
+#   - master 的上游已从 public/master 切到 origin/master，`git push` 默认走私有仓
+#   - public 的 push URL 已设为 DISABLED_use_origin_instead，推它会直接报错
+# 要给 public 发版就单独 checkout 一个不含这些文件的分支，别解除上面两条。
+#
+# 仍然不入库的：会话级中间产物和运行时文件，换机器没意义
+.claude/state/
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
 kiro_balance_cache.json
 
 # 运行时产物 / 本地临时(绝不提交)
