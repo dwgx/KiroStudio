@@ -41,7 +41,7 @@ jobs:
           pnpm build
 
       - name: 安装 Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.1
       - name: Rust 编译缓存
         uses: Swatinem/rust-cache@v2
         with:
@@ -98,7 +98,7 @@ jobs:
           pnpm build
 
       - name: 安装 Rust (musl 目标)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.1
         with:
           targets: x86_64-unknown-linux-musl
 
@@ -179,7 +179,7 @@ jobs:
           pnpm build
 
       - name: 安装 Rust (${{ matrix.target }})
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.1
         with:
           targets: ${{ matrix.target }}
 
@@ -240,7 +240,7 @@ jobs:
           pnpm build
 
       - name: 安装 Rust (msvc 目标)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.1
         with:
           targets: x86_64-pc-windows-msvc
 
