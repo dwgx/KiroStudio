@@ -596,12 +596,26 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
 }
 
 /// 提供 index.html
+///
+/// CSP:全仓此前无 CSP,一旦 XSS 即可读 localStorage 里的 adminKey 完整接管管理面。
+/// 现在 script 只允许同源(vite 构建产物是外部文件,无内联脚本),阻断内联/外链脚本注入。
+/// style-src 保留 'unsafe-inline'(React 内联 style 属性 + 个别库注入 <style> 的兼容),
+/// 另放行 index.html 模板引入的 Google Fonts 两个域,否则字体样式被拦(视觉回退)。
+/// 背景图走同源 /admin/api/bg-* 代理,img-src 的 https: 兜底直接外链图。
 fn serve_index() -> Response<Body> {
     match load_asset("index.html") {
         Some(content) => Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
             .header(header::CACHE_CONTROL, "no-cache")
+            .header(
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'self'; img-src 'self' data: https:; \
+                 style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
+                 font-src 'self' https://fonts.gstatic.com; \
+                 connect-src 'self'",
+            )
+            .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
             .body(Body::from(content.into_owned()))
             .expect("Failed to build response"),
         None => Response::builder()

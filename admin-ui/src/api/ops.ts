@@ -66,6 +66,8 @@ export interface UpdateCheckResult {
   available_versions: string[]
   commits: CommitSnapshot[]
   error: string | null
+  /** 容器部署标记：容器内为 true，OTA 自更新不可用（需走 deploy 重建镜像）。旧后端不下发该字段。 */
+  container_deployment?: boolean
 }
 
 export interface UpdatePerformResult {

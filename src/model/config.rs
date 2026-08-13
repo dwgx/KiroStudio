@@ -74,6 +74,29 @@ impl Default for ThrottleProfile {
     }
 }
 
+/// 单个模型的单价（元/百万 token），成本估算用。
+///
+/// 四档对齐 Anthropic 计费口径：输入（不含缓存命中部分）/ 输出 / 缓存读取 / 缓存新建。
+/// `cache_read` + `cache_creation` 是 gross input 的**子集**，估算 input 时必须按
+/// billed 口径（gross 减去两项 cache），否则缓存部分被计两次（与
+/// [`crate::usage::record::RequestRecord::billed_input_tokens`] 同口径）。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelPrice {
+    /// 输入单价（元/百万 token；不含缓存命中部分）
+    #[serde(default)]
+    pub input_per_mtok: f64,
+    /// 输出单价（元/百万 token）
+    #[serde(default)]
+    pub output_per_mtok: f64,
+    /// 缓存读取单价（元/百万 token）
+    #[serde(default)]
+    pub cache_read_per_mtok: f64,
+    /// 缓存新建单价（元/百万 token）
+    #[serde(default)]
+    pub cache_creation_per_mtok: f64,
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -99,6 +122,15 @@ pub struct Config {
 
     #[serde(default = "default_kiro_version")]
     pub kiro_version: String,
+
+    /// 是否自动拉取官方稳定版 Kiro IDE 版本号用于 UA 版本伪装（默认 **true**）。
+    ///
+    /// 伪装成官方 IDE 最新版是防上游按版本做风控差异（老版本号可能被降级待遇/拒绝）。
+    /// 开启后后台每 12h 拉一次官方元数据：成功则 UA 用拉到的版本号，失败静默降级回
+    /// `kiro_version`（本地常量），绝不阻塞启动；关闭则缓存恒空，UA 行为与未开此功能
+    /// 时完全一致（零回归）。热更不生效（main.rs 启动期读取后 spawn）。
+    #[serde(default = "default_ua_version_fetch")]
+    pub ua_version_fetch: bool,
 
     #[serde(default)]
     pub machine_id: Option<String>,
@@ -795,6 +827,15 @@ pub struct Config {
     #[serde(default = "default_usage_retention_days")]
     pub usage_retention_days: i64,
 
+    /// 模型单价表（成本估算用，元/百万 token）。
+    ///
+    /// 空表（默认）= **不估算成本**。key 为模型名，与用量统计「按模型」榜单的 key
+    /// （上游实际服务名口径）对齐；命中表的模型其成本按
+    /// [`ModelPrice`] 四档单价推算。只做估算展示，不影响任何真实计费。
+    /// 查询时每次现读配置快照，改 config.json 立即生效（TIER1 热重载）。
+    #[serde(default)]
+    pub model_pricing: HashMap<String, ModelPrice>,
+
     /// 是否采集下游客户端指纹（设备类型 / IP / OS / 浏览器，默认 true）
     ///
     /// 隐私开关：关闭后热路径不再从入站请求头/连接对端解析这些字段，
@@ -962,9 +1003,50 @@ pub struct Config {
     #[serde(default = "default_upstream_trace_max_bytes")]
     pub upstream_trace_max_bytes: u64,
 
+    // ============ Webhook 告警（自愈事件通知）============
+    /// Webhook 告警地址（可选，默认 None = 关闭）。
+    ///
+    /// 配置后，关键自愈事件（吸收预算耗尽 / failover 号全灭 / 重试配额耗尽 /
+    /// 429 风暴吸收轮等）会 POST 一条 JSON（{key, value, window_secs, host}）
+    /// 到该地址；同 key 在冷却窗口内只发一次。热更不生效（provider 构造时注入，
+    /// 改配置需重启）。
+    ///
+    /// ⚠️ 安全：URL 是管理员配置，网关会向它发起请求 —— SSRF 风险自负。
+    /// 建议填内网不可达、只能外联的告警服务；绝不要填内网管理面地址。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alert_webhook_url: Option<String>,
+
+    /// 告警去重冷却秒数（默认 600 = 10 分钟）。同 key 事件在此窗口内只发一次，
+    /// 窗口内的重复事件只累计计数（webhook 的 value 字段携带窗口内增量）。
+    #[serde(default = "default_alert_cooldown_secs")]
+    pub alert_cooldown_secs: u32,
+
+    // ============ OTA 自动检查（仅检查 + 打日志，不自动应用）============
+    /// 是否后台定时检查 OTA 新版本（默认 **false**）。
+    ///
+    /// 开启后每 `ota_auto_check_interval_hours` 小时调一次与面板「检查更新」相同的
+    /// 检查；发现新版本**只打日志**，绝不自动下载替换——OTA 是「下载二进制 + 校验 +
+    /// 原子覆盖运行中的自己」的高危路径，无人值守自动应用等于把镜像投毒升级成无人
+    /// 确认的 RCE；参考仓的「定时自动应用」模式本仓明确不立项（见 update.rs 的
+    /// `spawn_auto_check` 注释）。默认关：检查本身是 GitHub API 出站往返，多数部署
+    /// 走面板手动升级，默认开等于无谓的周期性出站请求。热更不生效（main.rs 启动期
+    /// 读取后 spawn）。
+    #[serde(default = "default_ota_auto_check")]
+    pub ota_auto_check: bool,
+
+    /// OTA 自动检查间隔（小时，默认 24）。0 会被按 1 处理（tokio interval 不接受
+    /// 零时长，且零小时空转只会徒增出站请求）。
+    #[serde(default = "default_ota_auto_check_interval_hours")]
+    pub ota_auto_check_interval_hours: u32,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
+}
+
+fn default_alert_cooldown_secs() -> u32 {
+    600
 }
 
 fn default_upstream_trace_path() -> String {
@@ -1062,6 +1144,20 @@ fn default_region() -> String {
 
 fn default_kiro_version() -> String {
     "0.11.107".to_string()
+}
+
+/// UA 版本伪装默认开：防上游版本风控差异；拉不到官方版本时静默降级回
+/// `kiro_version`，不存在"拉到坏值"的路径（拉取失败即降级）。
+fn default_ua_version_fetch() -> bool {
+    true
+}
+
+fn default_ota_auto_check() -> bool {
+    false
+}
+
+fn default_ota_auto_check_interval_hours() -> u32 {
+    24
 }
 
 fn default_system_version() -> String {
@@ -1383,6 +1479,9 @@ impl Default for Config {
             auth_region: None,
             api_region: None,
             kiro_version: default_kiro_version(),
+            // UA 版本伪装默认开：**必须调 default_ua_version_fetch()，不得另写字面量**
+            // （默认值散落多处正是本仓历史教训，见 default_ua_version_fetch 注释）。
+            ua_version_fetch: default_ua_version_fetch(),
             machine_id: None,
             encrypt_credentials_at_rest: false,
             api_key: None,
@@ -1474,6 +1573,7 @@ impl Default for Config {
             usage_enabled: default_usage_enabled(),
             usage_data_dir: default_usage_data_dir(),
             usage_retention_days: default_usage_retention_days(),
+            model_pricing: HashMap::new(),
             collect_client_fingerprint: default_collect_client_fingerprint(),
             cors_allowed_origins: Vec::new(),
             ip_allowlist: Vec::new(),
@@ -1498,6 +1598,11 @@ impl Default for Config {
             upstream_trace_enabled: false,
             upstream_trace_path: default_upstream_trace_path(),
             upstream_trace_max_bytes: default_upstream_trace_max_bytes(),
+            // 告警默认关（None = bump 零开销 no-op）+ 10 分钟去重冷却。
+            alert_webhook_url: None,
+            alert_cooldown_secs: default_alert_cooldown_secs(),
+            ota_auto_check: default_ota_auto_check(),
+            ota_auto_check_interval_hours: default_ota_auto_check_interval_hours(),
             config_path: None,
         }
     }
@@ -2005,6 +2110,58 @@ mod tests {
         let on: Config = serde_json::from_str(r#"{"nativeThinkingEffortEnabled":true}"#)
             .expect("显式值必须能反序列化");
         assert!(on.native_thinking_effort_enabled);
+    }
+
+    /// UA 版本伪装与 OTA 自动检查的默认值守卫。
+    ///
+    /// - 版本伪装**默认开**（防上游按版本做风控差异），但失败静默降级回
+    ///   `kiro_version`，不存在"拉到坏值"路径 —— 拉不到就用本地常量；
+    /// - OTA 自动检查**默认关**（默认开等于给每个部署加周期性 GitHub 出站往返），
+    ///   间隔默认 24h；
+    /// - 三者 serde 缺字段路径（存量 config.json 没有这些键）必须与
+    ///   `Config::default()` 同源。
+    ///
+    /// 回退即 FAIL：把任一默认值改掉、或 serde 缺字段路径与 Config::default() 分叉。
+    #[test]
+    fn version_mask_and_ota_auto_check_defaults_are_consistent() {
+        assert!(
+            Config::default().ua_version_fetch,
+            "版本伪装默认必须开：它是防上游版本风控差异的常开手段，且失败只会静默降级"
+        );
+        assert!(
+            !Config::default().ota_auto_check,
+            "OTA 自动检查默认必须关：默认开等于给每个部署加周期性 GitHub 出站往返"
+        );
+        assert_eq!(
+            Config::default().ota_auto_check_interval_hours,
+            24,
+            "OTA 自动检查间隔默认 24 小时"
+        );
+        // serde 缺字段路径与 Config::default() 同源：存量 config.json 没有这三个键。
+        let from_json: Config = serde_json::from_str("{}").expect("缺字段的 config 必须能反序列化");
+        assert_eq!(
+            from_json.ua_version_fetch,
+            Config::default().ua_version_fetch,
+            "serde default 与 Config::default() 必须一致"
+        );
+        assert_eq!(
+            from_json.ota_auto_check,
+            Config::default().ota_auto_check,
+            "serde default 与 Config::default() 必须一致"
+        );
+        assert_eq!(
+            from_json.ota_auto_check_interval_hours,
+            Config::default().ota_auto_check_interval_hours,
+            "serde default 与 Config::default() 必须一致"
+        );
+        // 显式配置必须仍被尊重，否则开关等于不存在。
+        let on: Config = serde_json::from_str(
+            r#"{"uaVersionFetch":false,"otaAutoCheck":true,"otaAutoCheckIntervalHours":6}"#,
+        )
+        .expect("显式值必须能反序列化");
+        assert!(!on.ua_version_fetch);
+        assert!(on.ota_auto_check);
+        assert_eq!(on.ota_auto_check_interval_hours, 6);
     }
 
     /// 吸收层与 403 风控吸收**都默认关**。

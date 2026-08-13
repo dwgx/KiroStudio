@@ -892,6 +892,59 @@ pub struct SetLoadBalancingModeRequest {
     pub mode: String,
 }
 
+// ============ KAM 导出 ============
+
+/// Kiro Account Manager 导出文件中的单个账号（KAM 1.8.3+ 平铺格式）
+///
+/// 字段命名与 KAM 导入逻辑对齐（参考仓 kiro-rs-tool 的 `kam-import-dialog.tsx`），
+/// 仅在凭据 `Some(value)` 时输出，避免 `null` 字段。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KamExportAccount {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nickname: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idp: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_arn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+}
+
+/// KAM 导出响应（含版本号 + 账号数组，兼容 KAM 旧版导入器）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KamExportResponse {
+    /// 导出格式版本号
+    pub version: String,
+    /// 导出时间（RFC3339）
+    pub exported_at: String,
+    /// 账号列表（KAM 1.8.3+ 平铺格式）
+    pub accounts: Vec<KamExportAccount>,
+}
+
 // ============ 通用响应 ============
 
 /// 操作成功响应
@@ -1115,6 +1168,14 @@ pub struct ConfigSnapshotResponse {
     /// 线上曾出现「三个自动禁用开关被直连 API 关掉」，而这一项其实改不到，
     /// 排查时会得出错误结论。
     pub auto_disable_suspicious: bool,
+    /// 余额耗尽**自动**禁用开关（AdminService 内存态，默认开；重启回默认值 true）。
+    /// 后台温和余额刷新刷到「新鲜真值 remaining<=0」时自动禁用（对齐 402 语义）。
+    /// ⚠️ 该开关不进 config.json（仅存活于本服务内存），面板改它通过 PUT /config。
+    pub auto_disable_quota_exceeded: bool,
+    /// 代理池**自动**健康调度开关（AdminService 内存态，默认开；重启回默认值 true）。
+    /// 后台每 5 分钟对池内启用节点做一轮健康探测，连续失败达阈值自动禁用。
+    /// ⚠️ 同 `auto_disable_quota_exceeded`：不进 config.json，面板改它通过 PUT /config。
+    pub socks_auto_health: bool,
     /// 全池冷却快速失败:全池都在冷却时立即返回 429+Retry-After 让客户端退避(而非网关内硬扛短等)。默认开。
     pub all_cooling_fast_fail: bool,
     pub rate_limit_enabled: bool,
@@ -1308,6 +1369,16 @@ pub struct UpdateConfigRequest {
     pub cooldown_enabled: Option<bool>,
     /// 账户级 403 风控自动禁用开关（见响应结构注释）。TIER1 热更。
     pub auto_disable_suspicious: Option<bool>,
+    /// 余额耗尽**自动**禁用开关（默认开）。后台温和余额刷新刷到「新鲜真值
+    /// remaining<=0」时自动禁用（对齐 402 语义）。⚠️ AdminService 内存态，
+    /// 不进 config.json，重启回默认值 true。
+    #[serde(default)]
+    pub auto_disable_quota_exceeded: Option<bool>,
+    /// 代理池**自动**健康调度开关（默认开）。后台每 5 分钟对池内启用节点做一轮
+    /// 健康探测，连续失败达阈值自动禁用。⚠️ AdminService 内存态，不进 config.json，
+    /// 重启回默认值 true。
+    #[serde(default)]
+    pub socks_auto_health: Option<bool>,
     /// 全池冷却快速失败开关(见响应结构注释)。
     pub all_cooling_fast_fail: Option<bool>,
     pub rate_limit_enabled: Option<bool>,
@@ -1396,6 +1467,14 @@ pub struct UpdateConfigResponse {
     pub restart_fields: Vec<String>,
 }
 
+/// 导入服务端配置响应（POST /api/admin/config/import）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportConfigResponse {
+    pub success: bool,
+    pub message: String,
+}
+
 // ============ 存储统计 / 清理（运维）============
 
 /// 单个数据分区的占用统计
@@ -1471,6 +1550,101 @@ pub struct StorageCleanupResponse {
     pub message: String,
     /// 各分区清理明细
     pub results: Vec<StorageCleanupItem>,
+}
+
+// ============ 诊断快照（GET /diagnostics/snapshot，纯运维观测）============
+
+/// 诊断快照里单个凭据一行：禁用/冷却/健康分/余额，全部零上游内存数据。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsCredentialEntry {
+    /// 凭据 ID
+    pub id: u64,
+    /// 是否已禁用（禁用的号不参与调度）
+    pub disabled: bool,
+    /// 冷却剩余毫秒；未冷却为 null
+    pub cooldown_remaining_ms: Option<u64>,
+    /// 健康分 [0,1]（EWMA 成功率 × 429 惩罚）；无健康记录为 null（缺省满血）
+    pub health_score: Option<f64>,
+    /// 熔断器是否 Open（真实熔断态，非启发式）
+    pub circuit_open: bool,
+    /// 余额缓存剩余额度；无缓存为 null（**零上游**，见 balance 缓存语义）
+    pub balance_remaining: Option<f64>,
+    /// 余额缓存时刻（Unix 秒）；无缓存为 null
+    pub balance_cached_at: Option<f64>,
+    /// 最近 60 秒滚动窗口选号次数（RPM）
+    pub rpm: u32,
+}
+
+/// 诊断快照里代理池健康摘要（自动健康调度相关）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsPoolHealth {
+    /// 池内节点总数
+    pub total: usize,
+    /// 启用数（`enabled=true`）
+    pub enabled: usize,
+    /// 可参与自动分配数（启用且最近一次测活非失败；与 `resolve_node_plan` 同口径）
+    pub assignable: usize,
+    /// 最近一次测活为失败的节点数（`last_test` 存在且 `ok=false`）
+    pub last_test_failed: usize,
+    /// 最近一次测活成功节点的平均延迟（毫秒）；无任何成功测活数据为 null
+    pub avg_latency_ms: Option<u64>,
+    /// 自动健康调度开关状态（默认开）
+    pub auto_health_enabled: bool,
+}
+
+/// 诊断快照里关键配置摘要。**刻意脱敏**：不含任何 key/密码/代理地址/白名单原文。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsConfigSummary {
+    pub load_balancing_mode: String,
+    pub throttle_profile: crate::model::config::ThrottleProfile,
+    pub inbound_throttle_enabled: bool,
+    /// 整形闸门目标 RPM（实测吞吐见快照的 inbound 三字段，此处只给目标）
+    pub inbound_target_rpm: u32,
+    /// 吸收层开关（上游重试吸收）
+    pub upstream_retry_absorb_enabled: bool,
+    pub upstream_retry_absorb_capacity_400: bool,
+    pub upstream_retry_absorb_budget_secs: u64,
+    pub upstream_retry_absorb_max_rounds: u32,
+    pub cooldown_enabled: bool,
+    pub rate_limit_enabled: bool,
+    pub auto_disable_suspicious: bool,
+    pub auto_disable_quota_exceeded: bool,
+    pub socks_auto_health: bool,
+}
+
+/// 诊断快照里版本信息：本地版本恒有；远端尽力获取（网络失败/超时只给本地）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsVersion {
+    pub local_version: String,
+    /// 远端最新版本；拉取失败为 null
+    pub latest_version: Option<String>,
+    /// 是否有更新；远端信息缺失为 null
+    pub has_update: Option<bool>,
+    /// 远端检查失败原因（成功为 null）
+    pub error: Option<String>,
+}
+
+/// `GET /api/admin/diagnostics/snapshot` 响应体：一键聚合版本/逐号/池/配置/进程。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsSnapshotResponse {
+    pub version: DiagnosticsVersion,
+    /// 逐号状态（每号一行）
+    pub credentials: Vec<DiagnosticsCredentialEntry>,
+    /// 代理池健康摘要
+    pub pool_health: DiagnosticsPoolHealth,
+    /// 关键配置摘要（脱敏）
+    pub config: DiagnosticsConfigSummary,
+    /// 自进程启动以来的毫秒数（与 /recovery-metrics 同源）
+    pub uptime_ms: u64,
+    /// 进程常驻内存字节数；非 Linux 平台为 null
+    pub rss_bytes: Option<u64>,
+    /// 快照生成时刻（Unix 秒）
+    pub generated_at: u64,
 }
 
 // ============ 批量导入 Kiro API Key ============
@@ -2245,6 +2419,8 @@ mod tests {
             encrypt_credentials_at_rest: false,
             cooldown_enabled: false,
             auto_disable_suspicious: false,
+            auto_disable_quota_exceeded: true,
+            socks_auto_health: true,
             all_cooling_fast_fail: false,
             rate_limit_enabled: false,
             rate_limit_daily_max: 0,
@@ -2493,6 +2669,8 @@ mod tests {
             prompt_cache_enabled: true,
             cooldown_enabled: true,
             auto_disable_suspicious: true,
+            auto_disable_quota_exceeded: true,
+            socks_auto_health: true,
             all_cooling_fast_fail: true,
             rate_limit_enabled: false,
             rate_limit_daily_max: 500,

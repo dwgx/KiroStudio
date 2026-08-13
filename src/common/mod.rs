@@ -1,5 +1,6 @@
 //! 公共工具模块
 
+pub mod alerting;
 pub mod auth;
 pub mod fs_atomic;
 pub mod health_marker;

@@ -79,6 +79,15 @@ const MAX_OPEN_SECS: u64 = 1800; // 退避上限 30min（对齐 SuspiciousActivi
 const OPEN_GROWTH: f64 = 1.6; // 退避升级倍率（对齐 cooldown 1.6^n）
 const MIN_ADMIT_SEED: f64 = 0.02; // admit_prob_seed 下限，永留一线试探
 const IDLE_EVICT_SECS: u64 = 900; // cleanup 淘汰 15min 无活动条目
+/// 读路径刷新 `last_touch` 的最小间隔（秒）。
+///
+/// `last_touch` 只被 [`HealthTracker::cleanup`] 的空闲淘汰读取（门限
+/// `IDLE_EVICT_SECS`=900s），按本窗口限频刷新与每次一刷对淘汰语义完全等价
+/// （持续活跃的键距上次刷新永远 < 10s，离 900s 门限还差两个数量级），
+/// 却把选号读路径（`p_avail_with_load_ref`，对每个候选每轮必调）从「每候选一次写」
+/// 降为「每候选最多每 10s 一次写」。衰减时钟是独立的 `last_decay_at`，
+/// 本窗口**不碰**衰减语义（半衰期 60s 的连续增量衰减照旧每次调用都结算）。
+const LAST_TOUCH_REFRESH_SECS: u64 = 10;
 /// 惩罚衰减半衰期：每过这么久，429 惩罚减半、成功率朝 1.0 回归一半、
 /// `consecutive_429`/`open_count` 各减 1、`admit_prob_seed` 翻倍恢复。
 ///
@@ -113,7 +122,7 @@ struct HealthState {
     admit_prob_seed: f64,        // 半开起始放行概率；每次半开失败 *=0.5（收缩）
     recovery_samples: u32,       // 半开内连续成功计数，达 RECOVERY_FULL 全开
     open_count: u32,             // 累计跳闸轮数，退避 1.6^open_count
-    last_touch: Instant,         // cleanup 空闲淘汰用（**任何**读写都会刷新，含选号读 p_avail）
+    last_touch: Instant,         // cleanup 空闲淘汰用（任何读写都会刷新，读路径按 LAST_TOUCH_REFRESH_SECS 限频）
     /// 上次**惩罚衰减**的推进时刻（增量衰减基准）。
     ///
     /// ⚠️ 必须与 `last_touch` 分开，这是一个已实测的生产缺陷的根因：
@@ -431,10 +440,29 @@ impl HealthTracker {
     ) -> f64 {
         let now = Instant::now();
         let mut map = self.states.lock();
-        let s = map.entry(key.to_string()).or_default();
+        // 借用 `key` 查表，仅在**首次**遇到该键时才做一次 String 分配插入。
+        //
+        // 选号读路径对每个候选每轮都调本函数，键早已存在，`entry(key.to_string())`
+        // 的每次堆分配是纯浪费（43 号池一轮选号 43 次分配，100 并发下放大成
+        // 临界区内的分配风暴）。get-then-insert 让热路径零分配、行为逐字节等价
+        // （两种写法在同一把 Mutex 内完成，无并发差异）。
+        let s = match map.get_mut(key) {
+            Some(s) => s,
+            None => {
+                map.insert(key.to_string(), HealthState::default());
+                map.get_mut(key).expect("刚插入必有")
+            }
+        };
         Self::tick_circuit(s, now);
         Self::decay_penalties(s, now);
-        s.last_touch = now;
+        // 限频刷新：`last_touch` 只喂 cleanup 的空闲淘汰（900s 门限），按
+        // LAST_TOUCH_REFRESH_SECS 窗口刷新语义等价，读路径从「每候选一次写」
+        // 降为「最多每 10s 一次写」。衰减照旧每次调用结算（last_decay_at 独立）。
+        if now.saturating_duration_since(s.last_touch)
+            >= Duration::from_secs(LAST_TOUCH_REFRESH_SECS)
+        {
+            s.last_touch = now;
+        }
         let gate = match s.circuit {
             Circuit::Closed => 1.0,
             Circuit::Open { .. } => 0.0,

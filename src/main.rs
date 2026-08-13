@@ -490,6 +490,20 @@ async fn main() {
     admin_ui::set_login_background_r18(config.login_background_r18);
     admin_ui::spawn_bg_prefetch(config.login_background_enabled);
 
+    // Kiro IDE 版本伪装：后台每 12h 拉官方稳定版元数据，成功后 UA 版本段用拉到的
+    // 版本号，失败静默降级回 config.kiro_version（不阻塞启动）。关闭时不 spawn
+    // （缓存恒空，UA 行为零变化）。热更不生效：启动期一次性读取。
+    if config.ua_version_fetch {
+        kiro::version_mask::spawn_refresher(proxy_config.clone(), config.tls_backend);
+    }
+
+    // OTA 自动检查（仅检查 + 打日志，不自动下载替换——见 admin::update::spawn_auto_check）。
+    // 默认关：检查本身是 GitHub API 出站往返，多数部署走面板手动升级按钮。
+    // 热更不生效：启动期一次性读取。
+    if config.ota_auto_check {
+        admin::update::spawn_auto_check(config.ota_auto_check_interval_hours);
+    }
+
     // 指纹采集开关：把配置写入热路径运行时镜像（默认 true）。关闭后不采集
     // 下游客户端 device/ip/os/browser。admin 改开关时会立即改写此镜像。
     anthropic::set_collect_client_fingerprint(config.collect_client_fingerprint);
@@ -628,6 +642,41 @@ async fn main() {
     } else {
         anthropic_app
     };
+
+    // 健康探针 /healthz：**未鉴权**端点（auth 中间件只挂在 /v1、/cc/v1 子路由上，
+    // 根路由不受影响），供 Docker HEALTHCHECK / 反代主动探测使用。
+    //
+    // 刻意不返回任何敏感信息（只报 ok/version/号池数/库可写性）；号池数量是运维
+    // 观测量，不属密钥级敏感数据。判定口径：
+    // - config_loaded：进程能走到 serve 必然 config/凭据加载成功（失败在启动期直接
+    //   exit(1)），此处没有更早的信号可读，恒为 true。
+    // - sqlite_writable：用量统计未启用（usage_enabled=false 或 SQLite 打开失败 →
+    //   usage_handles=None）时 false；启用时以一次 count 探测库可读性。
+    // - recent_success_rate **刻意不返回**：recovery_metrics 是单调计数器、无时间
+    //   窗口；usage_stats 只有 24h/逐小时聚合窗口，均非「近 N 秒」成功率。为避免
+    //   语义欺骗不发明新计数器（需要时应在 recovery_metrics 侧加环形窗口）。
+    let healthz_app = {
+        let tm = token_manager.clone();
+        let handles = usage_handles.clone();
+        axum::Router::new().route(
+            "/healthz",
+            axum::routing::get(move || async move {
+                let snapshot = tm.snapshot();
+                let sqlite_writable = handles
+                    .as_ref()
+                    .map(|h| h.trace_db.count().is_ok())
+                    .unwrap_or(false);
+                axum::Json(serde_json::json!({
+                    "ok": true,
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "config_loaded": true,
+                    "pool_count": snapshot.total,
+                    "sqlite_writable": sqlite_writable,
+                }))
+            }),
+        )
+    };
+    let app = healthz_app.merge(app);
 
     // 启动服务器
     let addr = format!("{}:{}", config.host, config.port);
@@ -883,6 +932,13 @@ async fn shutdown_with_drain_cap(
     // 的唯一判据。debounce 窗口内的成功增量被硬杀丢掉 ⇒ 重启后新号变成"从未成功过"
     // ⇒ 瞬态 403 三次即禁用。实测 20:20:30 启动、20:20:32 就把健康号 #483 打死。
     token_manager.flush_stats_now();
+    // usage 管道（usage::pipeline）的停机 drain：**无 flush/drain 接口可调**。
+    // 它是有界 mpsc（容量 10_000）+ 独立 OS 线程 worker，worker 随进程退出而终止，
+    // 通道内残余记录（至多 CHANNEL_CAPACITY 条）会丢失——这是该管道的既定设计
+    // （统计数据可容忍丢失，热路径绝不阻塞）。丢失量已被 usagePipelineDropped /
+    // usagePipelineWritten 计数覆盖（/api/admin/recovery-metrics），停机那一刻的
+    // 丢失还可从这两个数的差值读出。若要严格不丢，应在 pipeline 侧加
+    // flush 接口（drop(tx) + join worker），此处不加接口、不改语义。
     tracing::info!(
         "收到停机信号，已强制落盘凭据统计，开始 drain（最多 {}s，超时则断开残余连接以尽快让位给新进程）",
         SHUTDOWN_DRAIN_CAP_SECS

@@ -3,10 +3,25 @@
 //!
 //! 分类管理不同原因的冷却状态，支持差异化冷却时长和自动清理。
 //! 参考 CLIProxyAPIPlus 的实现。
+//!
+//! # 可选持久化
+//!
+//! `with_data_dir` 构造的实例会把冷却状态落盘（文件名为 `COOLDOWN_STATE_FILE`，
+//! 与凭据统计文件同目录、同落盘模式）：`trigger_count` 递增退避档位在重启后保持，
+//! 不会因重启回落基线 —— 否则「风控窗口内重启 = 反复以短间隔砸风控中的号」。
+//! 墙钟时间戳用 `SystemTime`（`Instant` 重启即重置，落盘无意义）。
+//! `new()`/`with_config()` 构造的纯内存管理器不落盘（保持旧行为）。
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
+
+/// SystemTime 的饱和差（`saturating_duration_since` 在稳定版不可用，1.97 上是不稳定特性）。
+/// 语义：`a - b` 下溢时返回零（与不稳定 API 一致）。
+fn duration_since_or_zero(a: SystemTime, b: SystemTime) -> Duration {
+    a.duration_since(b).unwrap_or_default()
+}
 
 /// 冷却原因
 ///
@@ -32,7 +47,7 @@ use std::time::{Duration, Instant};
 ///
 ///   尚未被 set_cooldown 实际触发的变体（保留作为 future 分类点）:
 ///     - `QuotaExhausted`      — 月度配额耗尽（目前走 RateLimitExceeded）
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum CooldownReason {
     /// 429 速率限制
     RateLimitExceeded,
@@ -168,20 +183,71 @@ const RATE_LIMIT_FLOOR_SECS: u64 = 8;
 /// 理由与上面一致 —— 小号池全冷却比偶尔多撞一次更糟。
 const SUSPICIOUS_FLOOR_SECS: u64 = 12;
 
+/// 冷却状态持久化文件名（与凭据统计文件同目录）。
+const COOLDOWN_STATE_FILE: &str = "kiro_cooldown.json";
+
+/// 落盘 debounce 窗口（镜像凭据统计的落盘节奏）。
+const SAVE_DEBOUNCE: Duration = Duration::from_secs(30);
+
+/// 冷却事件日志限频窗口：每号每窗口至多一条 info（429 风暴时防日志风暴）。
+const LOG_THROTTLE: Duration = Duration::from_secs(10);
+
 /// 冷却条目
 #[derive(Debug, Clone)]
 struct CooldownEntry {
     /// 冷却原因
     reason: CooldownReason,
 
-    /// 冷却开始时间
-    started_at: Instant,
+    /// 冷却开始时间（墙钟，可落盘；重启后由文件恢复）
+    started_at: SystemTime,
 
-    /// 冷却结束时间
-    expires_at: Instant,
+    /// 冷却结束时间（墙钟，可落盘）
+    expires_at: SystemTime,
 
     /// 连续触发次数（用于递增冷却时长）
     trigger_count: u32,
+}
+
+/// 持久化状态（`None` = 纯内存，不落盘）
+struct PersistState {
+    /// 落盘文件路径
+    path: PathBuf,
+
+    /// 是否有未落盘的变更（debounce 判定用）
+    dirty: std::sync::atomic::AtomicBool,
+
+    /// 上次成功落盘时刻（debounce 判定用；仅内存态，不落盘）
+    last_save_at: Mutex<Option<Instant>>,
+}
+
+/// 落盘格式：credential_id（字符串键，与凭据统计同构）→ 冷却条目
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedEntry {
+    /// 冷却原因
+    reason: CooldownReason,
+
+    /// 冷却开始时间（Unix 毫秒）
+    started_at_unix_ms: u64,
+
+    /// 冷却结束时间（Unix 毫秒）
+    expires_at_unix_ms: u64,
+
+    /// 连续触发次数（用于递增冷却时长）
+    trigger_count: u32,
+}
+
+/// SystemTime → Unix 毫秒（落盘用）
+fn unix_ms(t: SystemTime) -> u64 {
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Unix 毫秒 → SystemTime（加载用；非法值回退到纪元，避免 panic）
+fn from_unix_ms(ms: u64) -> SystemTime {
+    SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_millis(ms))
+        .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
 /// 冷却管理器
@@ -200,6 +266,12 @@ pub struct CooldownManager {
     /// 冷却时长缩放百分比（默认 100=原时长）。热更即时生效。只缩放**可自动恢复**(短/瞬时)冷却基数,
     /// 认证失败/封号/配额耗尽那类长硬窗**不缩放**(防误配把死号提前放行)。
     cooldown_scale_pct: std::sync::atomic::AtomicU32,
+
+    /// 每号冷却事件日志的最后打印时刻（限频降噪）
+    last_log_at: Mutex<HashMap<u64, Instant>>,
+
+    /// 持久化状态（None = 纯内存，不落盘）
+    persist: Option<PersistState>,
 }
 
 impl Default for CooldownManager {
@@ -216,6 +288,8 @@ impl CooldownManager {
             max_short_cooldown_secs: 90, // 上限 90s（原 300s 太黏，小号池下一个卡住请求能把整池压死数分钟）
             long_cooldown_secs: 86400,   // 24 小时
             cooldown_scale_pct: std::sync::atomic::AtomicU32::new(100),
+            last_log_at: Mutex::new(HashMap::new()),
+            persist: None,
         }
     }
 
@@ -281,7 +355,31 @@ impl CooldownManager {
             max_short_cooldown_secs,
             long_cooldown_secs,
             cooldown_scale_pct: std::sync::atomic::AtomicU32::new(100),
+            last_log_at: Mutex::new(HashMap::new()),
+            persist: None,
         }
+    }
+
+    /// 创建带持久化的冷却管理器：状态落盘到 `data_dir` 下的固定文件名，启动即加载。
+    ///
+    /// 与 `new()`/`with_config()`（纯内存）的区别：`trigger_count` 递增退避档位
+    /// 在重启后保持，避免「风控窗口内重启 = 反复以短间隔砸风控中的号」。
+    /// 加载失败（文件不存在/损坏）静默回退空，不阻止启动。
+    pub fn with_data_dir(data_dir: &Path) -> Self {
+        let this = Self {
+            entries: Mutex::new(HashMap::new()),
+            max_short_cooldown_secs: 90,
+            long_cooldown_secs: 86400,
+            cooldown_scale_pct: std::sync::atomic::AtomicU32::new(100),
+            last_log_at: Mutex::new(HashMap::new()),
+            persist: Some(PersistState {
+                path: data_dir.join(COOLDOWN_STATE_FILE),
+                dirty: std::sync::atomic::AtomicBool::new(false),
+                last_save_at: Mutex::new(None),
+            }),
+        };
+        this.load();
+        this
     }
 
     /// 设置凭据冷却
@@ -303,53 +401,61 @@ impl CooldownManager {
     ///
     /// 已在更久冷却中时不缩短（取 max），避免把一个上游明确指定的长冷却覆盖成短的。
     pub fn set_transient_cooldown(&self, credential_id: u64, reason: CooldownReason) -> Duration {
-        let mut entries = self.entries.lock();
-        let now = Instant::now();
-        let baseline = self.scaled_duration(reason, reason.default_duration());
+        let remaining = {
+            let mut entries = self.entries.lock();
+            let now = SystemTime::now();
+            let baseline = self.scaled_duration(reason, reason.default_duration());
 
-        let entry = entries
-            .entry(credential_id)
-            .or_insert_with(|| CooldownEntry {
-                reason,
-                started_at: now,
-                expires_at: now,
-                trigger_count: 0,
-            });
+            let entry = entries
+                .entry(credential_id)
+                .or_insert_with(|| CooldownEntry {
+                    reason,
+                    started_at: now,
+                    expires_at: now,
+                    trigger_count: 0,
+                });
 
-        // 平静期衰减（与 set_cooldown_with_duration 同口径）：长时间没再触发就回退强度。
-        const DECAY_WINDOW_SECS: u64 = 60;
-        if entry.reason == reason && now > entry.expires_at {
-            let calm = now.saturating_duration_since(entry.expires_at).as_secs();
-            let decay = (calm / DECAY_WINDOW_SECS) as u32;
-            if decay > 0 {
-                entry.trigger_count = entry.trigger_count.saturating_sub(decay);
+            // 平静期衰减（与 set_cooldown_with_duration 同口径）：长时间没再触发就回退强度。
+            const DECAY_WINDOW_SECS: u64 = 60;
+            if entry.reason == reason && now > entry.expires_at {
+                let calm = duration_since_or_zero(now, entry.expires_at).as_secs();
+                let decay = (calm / DECAY_WINDOW_SECS) as u32;
+                if decay > 0 {
+                    entry.trigger_count = entry.trigger_count.saturating_sub(decay);
+                }
             }
-        }
 
-        if entry.reason == reason {
-            entry.trigger_count += 1;
-        } else {
-            entry.reason = reason;
-            entry.trigger_count = 1;
-        }
+            if entry.reason == reason {
+                entry.trigger_count += 1;
+            } else {
+                entry.reason = reason;
+                entry.trigger_count = 1;
+            }
 
-        // 关键差异：时长固定取基线，不乘 1.3^n。
-        let new_expires = now + baseline;
-        // 若当前已在更久的冷却中，保留较长的到期时间（不缩短已有长冷却）。
-        if new_expires > entry.expires_at {
-            entry.started_at = now;
-            entry.expires_at = new_expires;
-        }
-        let remaining = entry.expires_at.saturating_duration_since(now);
+            // 关键差异：时长固定取基线，不乘 1.3^n。
+            let new_expires = now + baseline;
+            // 若当前已在更久的冷却中，保留较长的到期时间（不缩短已有长冷却）。
+            if new_expires > entry.expires_at {
+                entry.started_at = now;
+                entry.expires_at = new_expires;
+            }
+            let remaining = duration_since_or_zero(entry.expires_at, now);
 
-        tracing::info!(
-            credential_id = %credential_id,
-            reason = %reason.description(),
-            duration_secs = %remaining.as_secs(),
-            trigger_count = %entry.trigger_count,
-            "凭据进入瞬时冷却（固定基线，不升级）"
-        );
+            // 429 风暴时按号限频打印（事件本身不丢，只限日志频率）。
+            if self.should_log_event(credential_id) {
+                tracing::info!(
+                    credential_id = %credential_id,
+                    reason = %reason.description(),
+                    duration_secs = %remaining.as_secs(),
+                    trigger_count = %entry.trigger_count,
+                    "凭据进入瞬时冷却（固定基线，不升级）"
+                );
+            }
 
+            remaining
+        };
+        // 变更落盘（锁已释放再落盘：save 也要锁 entries，避免同锁重入）。
+        self.mark_dirty();
         remaining
     }
 
@@ -360,60 +466,68 @@ impl CooldownManager {
         reason: CooldownReason,
         custom_duration: Option<Duration>,
     ) -> Duration {
-        let mut entries = self.entries.lock();
-        let now = Instant::now();
+        let duration = {
+            let mut entries = self.entries.lock();
+            let now = SystemTime::now();
 
-        // 获取或创建条目
-        let entry = entries
-            .entry(credential_id)
-            .or_insert_with(|| CooldownEntry {
-                reason,
-                started_at: now,
-                expires_at: now,
-                trigger_count: 0,
-            });
+            // 获取或创建条目
+            let entry = entries
+                .entry(credential_id)
+                .or_insert_with(|| CooldownEntry {
+                    reason,
+                    started_at: now,
+                    expires_at: now,
+                    trigger_count: 0,
+                });
 
-        // 平静期衰减：若距上次冷却「结束」已过去足够久（说明期间该号是健康的，
-        // 只是没走到一次显式成功来清零），按经过的平静时长回退 trigger_count，
-        // 避免小号池长期整池冷却、trigger_count 只增不减一路顶格到上限。
-        // 每经过 DECAY_WINDOW 的平静时间回退一级。
-        const DECAY_WINDOW_SECS: u64 = 60;
-        if entry.reason == reason && now > entry.expires_at {
-            let calm = now.saturating_duration_since(entry.expires_at).as_secs();
-            let decay = (calm / DECAY_WINDOW_SECS) as u32;
-            if decay > 0 {
-                entry.trigger_count = entry.trigger_count.saturating_sub(decay);
+            // 平静期衰减：若距上次冷却「结束」已过去足够久（说明期间该号是健康的，
+            // 只是没走到一次显式成功来清零），按经过的平静时长回退 trigger_count，
+            // 避免小号池长期整池冷却、trigger_count 只增不减一路顶格到上限。
+            // 每经过 DECAY_WINDOW 的平静时间回退一级。
+            const DECAY_WINDOW_SECS: u64 = 60;
+            if entry.reason == reason && now > entry.expires_at {
+                let calm = duration_since_or_zero(now, entry.expires_at).as_secs();
+                let decay = (calm / DECAY_WINDOW_SECS) as u32;
+                if decay > 0 {
+                    entry.trigger_count = entry.trigger_count.saturating_sub(decay);
+                }
             }
-        }
 
-        // 更新触发次数
-        if entry.reason == reason {
-            entry.trigger_count += 1;
-        } else {
-            entry.reason = reason;
-            entry.trigger_count = 1;
-        }
+            // 更新触发次数
+            if entry.reason == reason {
+                entry.trigger_count += 1;
+            } else {
+                entry.reason = reason;
+                entry.trigger_count = 1;
+            }
 
-        // 计算冷却时长
-        let duration = custom_duration
-            .unwrap_or_else(|| self.calculate_cooldown_duration(reason, entry.trigger_count));
+            // 计算冷却时长
+            let duration = custom_duration
+                .unwrap_or_else(|| self.calculate_cooldown_duration(reason, entry.trigger_count));
 
-        let new_expires = now + duration;
-        // 不缩短已有更长的冷却（与 set_transient_cooldown 一致）：若上游 Retry-After 已设定
-        // 更长冷却，自定义时长不应将其覆盖为更短的值。
-        if new_expires > entry.expires_at {
-            entry.started_at = now;
-            entry.expires_at = new_expires;
-        }
+            let new_expires = now + duration;
+            // 不缩短已有更长的冷却（与 set_transient_cooldown 一致）：若上游 Retry-After 已设定
+            // 更长冷却，自定义时长不应将其覆盖为更短的值。
+            if new_expires > entry.expires_at {
+                entry.started_at = now;
+                entry.expires_at = new_expires;
+            }
 
-        tracing::info!(
-            credential_id = %credential_id,
-            reason = %reason.description(),
-            duration_secs = %duration.as_secs(),
-            trigger_count = %entry.trigger_count,
-            "凭据进入冷却"
-        );
+            // 429 风暴时按号限频打印（事件本身不丢，只限日志频率）。
+            if self.should_log_event(credential_id) {
+                tracing::info!(
+                    credential_id = %credential_id,
+                    reason = %reason.description(),
+                    duration_secs = %duration.as_secs(),
+                    trigger_count = %entry.trigger_count,
+                    "凭据进入冷却"
+                );
+            }
 
+            duration
+        };
+        // 变更落盘（锁已释放再落盘：save 也要锁 entries，避免同锁重入）。
+        self.mark_dirty();
         duration
     }
 
@@ -422,13 +536,13 @@ impl CooldownManager {
     /// 返回 `None` 表示不在冷却中，`Some((reason, remaining))` 表示冷却原因和剩余时间
     pub fn check_cooldown(&self, credential_id: u64) -> Option<(CooldownReason, Duration)> {
         let entries = self.entries.lock();
-        let now = Instant::now();
+        let now = SystemTime::now();
 
         entries.get(&credential_id).and_then(|entry| {
             if now < entry.expires_at {
                 Some((
                     entry.reason,
-                    entry.expires_at.saturating_duration_since(now),
+                    duration_since_or_zero(entry.expires_at, now),
                 ))
             } else {
                 None
@@ -453,21 +567,30 @@ impl CooldownManager {
 
     /// 清除凭据冷却
     pub fn clear_cooldown(&self, credential_id: u64) -> bool {
-        let mut entries = self.entries.lock();
-        entries.remove(&credential_id).is_some()
+        let removed = {
+            let mut entries = self.entries.lock();
+            entries.remove(&credential_id).is_some()
+        };
+        if removed {
+            self.mark_dirty();
+        }
+        removed
     }
 
     /// 清除所有已过期的冷却
     pub fn cleanup_expired(&self) -> usize {
-        let mut entries = self.entries.lock();
-        let now = Instant::now();
-        let before_count = entries.len();
+        let removed = {
+            let mut entries = self.entries.lock();
+            let now = SystemTime::now();
+            let before_count = entries.len();
 
-        entries.retain(|_, entry| now < entry.expires_at);
+            entries.retain(|_, entry| now < entry.expires_at);
 
-        let removed = before_count - entries.len();
+            before_count - entries.len()
+        };
         if removed > 0 {
             tracing::debug!("清理了 {} 个过期冷却条目", removed);
+            self.mark_dirty();
         }
         removed
     }
@@ -475,7 +598,7 @@ impl CooldownManager {
     /// 获取所有冷却中的凭据
     pub fn get_all_cooldowns(&self) -> Vec<CooldownInfo> {
         let entries = self.entries.lock();
-        let now = Instant::now();
+        let now = SystemTime::now();
 
         entries
             .iter()
@@ -483,8 +606,8 @@ impl CooldownManager {
             .map(|(&id, entry)| CooldownInfo {
                 credential_id: id,
                 reason: entry.reason,
-                started_at_ms: entry.started_at.elapsed().as_millis() as u64,
-                remaining_ms: entry.expires_at.saturating_duration_since(now).as_millis() as u64,
+                started_at_ms: duration_since_or_zero(now, entry.started_at).as_millis() as u64,
+                remaining_ms: duration_since_or_zero(entry.expires_at, now).as_millis() as u64,
                 trigger_count: entry.trigger_count,
             })
             .collect()
@@ -522,6 +645,151 @@ impl CooldownManager {
             // 不可自动恢复的原因：使用长冷却时长
             Duration::from_secs(self.long_cooldown_secs)
         }
+    }
+
+    // ---- 持久化（可选：`with_data_dir` 构造后启用；落盘模式对齐凭据统计） ----
+
+    /// 冷却事件日志限频：每号每 `LOG_THROTTLE` 窗口至多一条 info
+    /// （429 风暴时防日志风暴；事件本身不丢，只限打印频率）。
+    fn should_log_event(&self, credential_id: u64) -> bool {
+        let mut last = self.last_log_at.lock();
+        let now = Instant::now();
+        let allowed = match last.get(&credential_id) {
+            Some(prev) => now.saturating_duration_since(*prev) >= LOG_THROTTLE,
+            None => true,
+        };
+        if allowed {
+            last.insert(credential_id, now);
+        }
+        allowed
+    }
+
+    /// 状态变更标记：置脏 + 按 debounce 策略决定是否立即落盘（镜像 save_stats_debounced）。
+    ///
+    /// 调用方必须**已释放 entries 锁**（save 要锁 entries，避免同锁重入死锁）。
+    fn mark_dirty(&self) {
+        let Some(state) = &self.persist else {
+            return;
+        };
+        state.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        let should_flush = match *state.last_save_at.lock() {
+            Some(last) => last.elapsed() >= SAVE_DEBOUNCE,
+            None => true,
+        };
+        if should_flush {
+            self.save();
+        }
+    }
+
+    /// **无条件**落盘冷却状态（绕过 debounce）。停机路径调用——重启后 trigger_count
+    /// 退避档位才能保持（debounce 窗口内的变更被硬杀丢掉 = 回到本模块要解决的事故）。
+    pub fn flush_now(&self) {
+        let Some(state) = &self.persist else {
+            return;
+        };
+        if !state.dirty.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        self.save();
+    }
+
+    /// 序列化当前状态并原子写盘（temp→fsync→rename，损坏文件不可能产生）。
+    /// 已过期的条目不写（下个窗口自然从文件消失）。
+    fn save(&self) {
+        let Some(state) = &self.persist else {
+            return;
+        };
+        let snapshot: HashMap<String, PersistedEntry> = {
+            let entries = self.entries.lock();
+            let now = SystemTime::now();
+            entries
+                .iter()
+                .filter(|(_, e)| now < e.expires_at)
+                .map(|(&id, e)| {
+                    (
+                        id.to_string(),
+                        PersistedEntry {
+                            reason: e.reason,
+                            started_at_unix_ms: unix_ms(e.started_at),
+                            expires_at_unix_ms: unix_ms(e.expires_at),
+                            trigger_count: e.trigger_count,
+                        },
+                    )
+                })
+                .collect()
+        };
+        let json = match serde_json::to_string_pretty(&snapshot) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!("序列化冷却状态失败: {}", e);
+                return;
+            }
+        };
+        // 原子写。⚠️ 2026-08-13 对抗审查 M5：不用 block_in_place——`Handle::try_current()`
+        // 在 spawn_blocking 线程/普通 OS 线程也返回 Ok，block_in_place 在那些线程上直接
+        // panic（「can call blocking only when running on the multi-threaded runtime」）。
+        // 冷却状态文件小（几十 KB 级），同步原子写毫秒级，阻塞 worker 可接受。
+        let path = &state.path;
+        let result = crate::common::fs_atomic::write_atomic(path, json.as_bytes());
+        match result {
+            Ok(()) => {
+                *state.last_save_at.lock() = Some(Instant::now());
+                state.dirty.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(e) => tracing::warn!("保存冷却状态失败: {}", e),
+        }
+    }
+
+    /// 从磁盘加载冷却状态。文件不存在/空白/损坏一律静默回退空，不阻止启动
+    /// （与凭据统计/回收站加载同一口径）；已过期的条目丢弃。
+    fn load(&self) {
+        let Some(state) = &self.persist else {
+            return;
+        };
+        let raw = match std::fs::read(&state.path) {
+            Ok(c) => c,
+            Err(_) => return, // 首次运行：文件不存在
+        };
+        if raw.iter().all(|b| b.is_ascii_whitespace()) {
+            return;
+        }
+        let parsed: HashMap<String, PersistedEntry> = match serde_json::from_slice(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("解析冷却状态文件失败，忽略: {}", e);
+                return;
+            }
+        };
+        let now = SystemTime::now();
+        let mut loaded = 0usize;
+        {
+            let mut entries = self.entries.lock();
+            for (id_str, p) in parsed {
+                let Ok(id) = id_str.parse::<u64>() else {
+                    continue;
+                };
+                // 已过期的丢弃：不占内存，下次落盘也从文件消失。
+                if p.expires_at_unix_ms <= unix_ms(now) {
+                    continue;
+                }
+                entries.insert(
+                    id,
+                    CooldownEntry {
+                        reason: p.reason,
+                        started_at: from_unix_ms(p.started_at_unix_ms),
+                        expires_at: from_unix_ms(p.expires_at_unix_ms),
+                        trigger_count: p.trigger_count,
+                    },
+                );
+                loaded += 1;
+            }
+        }
+        if loaded > 0 {
+            tracing::info!("已从缓存加载 {} 条冷却状态", loaded);
+        }
+        // 视为刚写过：首个变更按 debounce 周期落盘，不在启动瞬间立刻写盘。
+        *state.last_save_at.lock() = Some(Instant::now());
+        state.dirty.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -920,5 +1188,57 @@ mod tests {
             "瞬时冷却不应缩短已有长冷却，剩余应仍接近 300s，实际 {}s",
             remaining.as_secs()
         );
+    }
+
+    /// 持久化 round-trip：写入 → 重建 → 加载一致（reason / trigger_count / 冷却中状态）。
+    ///
+    /// 语义要点：`trigger_count` 跨重启保持 = 递增退避档位不回落基线
+    /// （这正是持久化的目的：风控窗口内重启不再退化成短间隔砸号）。
+    #[test]
+    fn test_persistence_round_trip() {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro-cooldown-persist-rt-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let m1 = CooldownManager::with_data_dir(&dir);
+        // 同一原因触发两次 → trigger_count=2（SuspiciousActivity 递增档位 1.6^1=32s）。
+        m1.set_cooldown(1, CooldownReason::SuspiciousActivity);
+        m1.set_cooldown(1, CooldownReason::SuspiciousActivity);
+        m1.set_transient_cooldown(2, CooldownReason::RateLimitExceeded);
+        m1.flush_now();
+        drop(m1);
+
+        let m2 = CooldownManager::with_data_dir(&dir);
+        let (reason, remaining) = m2.check_cooldown(1).expect("#1 应仍在冷却（跨重启）");
+        assert_eq!(reason, CooldownReason::SuspiciousActivity);
+        assert!(remaining.as_secs() > 0, "剩余时长应为正");
+        assert_eq!(
+            m2.trigger_count(1),
+            2,
+            "trigger_count 应跨重启保持（退避档位不回落基线）"
+        );
+        assert!(!m2.is_available(1));
+        let (r2, _) = m2.check_cooldown(2).expect("#2 应仍在冷却（跨重启）");
+        assert_eq!(r2, CooldownReason::RateLimitExceeded);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 损坏容错：状态文件损坏时静默回退空，不 panic、不阻止启动。
+    #[test]
+    fn test_persistence_corrupt_file_falls_back_empty() {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro-cooldown-persist-corrupt-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(COOLDOWN_STATE_FILE), b"{broken json").unwrap();
+
+        let m = CooldownManager::with_data_dir(&dir);
+        assert!(m.is_available(1), "损坏文件应回退为空冷却状态");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

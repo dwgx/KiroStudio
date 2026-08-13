@@ -59,9 +59,17 @@ impl Drop for InflightGuard {
 /// 记录每个凭据在最近 60 秒内被分发请求的时间戳，用于 balanced 选号时判断
 /// 某号是否"接近 RPM 上限"。达到软上限的号在排序中被降权（而非硬跳过），
 /// 避免全部凭据饱和时清空可用池导致请求直接失败。
+///
+/// ## 模型维度（2026-08-14 新增）
+/// `model_hits` 是 `hits` 的同构细分：每 (凭据, 模型) 的近期分发计数，供选号排序
+/// 把「正在被同一爆款模型猛灌的号」与「该模型最近没打过的号」区分开，把热点模型
+/// 摊到整池。键名用**选号时的原始模型名**（模型映射发生在选号之后，选号侧只有
+/// 原始名）——与白名单/模型黑名单同源同口径，同一请求的两种计数落在同一模型名下。
+/// 阈值/上限刻意不新增：模型级只是分流计数，饱和判定仍复用每凭据 rpm_limit。
 pub struct RpmTracker {
     window: Duration,
     hits: Mutex<HashMap<u64, VecDeque<Instant>>>,
+    model_hits: Mutex<HashMap<(u64, String), VecDeque<Instant>>>,
 }
 
 impl Default for RpmTracker {
@@ -76,6 +84,7 @@ impl RpmTracker {
         Self {
             window: Duration::from_secs(60),
             hits: Mutex::new(HashMap::new()),
+            model_hits: Mutex::new(HashMap::new()),
         }
     }
 
@@ -84,6 +93,18 @@ impl RpmTracker {
         let now = Instant::now();
         let mut map = self.hits.lock();
         let v = map.entry(id).or_default();
+        Self::prune(v, now, self.window);
+        v.push_back(now);
+    }
+
+    /// 记录一次「该凭据 × 该模型」的分发（与 [`Self::record`] 同点调用，模型级分流计数）。
+    ///
+    /// `model` 为选号时的原始模型名（映射发生在选号之后，见模块级说明）；
+    /// 调用方对空模型名负责（无模型语义的调用不调本方法，避免空键条目堆积）。
+    pub fn record_model(&self, id: u64, model: &str) {
+        let now = Instant::now();
+        let mut map = self.model_hits.lock();
+        let v = map.entry((id, model.to_string())).or_default();
         Self::prune(v, now, self.window);
         v.push_back(now);
     }
@@ -125,6 +146,28 @@ impl RpmTracker {
                 None => 0,
             };
             out.insert(id, n);
+        }
+        out
+    }
+
+    /// 一次加锁批量读取「近窗内该凭据 × 该模型」的请求数（选号热路径专用，与
+    /// [`Self::counts_for`] 同款理由：排序键对每个候选都要读，逐个加锁会放大竞争）。
+    ///
+    /// 候选们的模型名相同（同一请求同一次选号），故只对 `model` 同名的条目做一次
+    /// 遍历即可覆盖全部候选，避免逐候选构造 (id, model) 键的开销；未出现的
+    /// (凭据, 模型) 组合返回 0（与 `counts_for` 的缺键语义一致）。
+    pub fn model_counts_for(&self, ids: &[u64], model: &str) -> std::collections::HashMap<u64, u32> {
+        let now = Instant::now();
+        let window = self.window;
+        let mut map = self.model_hits.lock();
+        let mut out: std::collections::HashMap<u64, u32> = ids.iter().map(|&id| (id, 0)).collect();
+        for ((cid, m), v) in map.iter_mut() {
+            if m == model {
+                if let Some(n) = out.get_mut(cid) {
+                    Self::prune(v, now, window);
+                    *n = v.len() as u32;
+                }
+            }
         }
         out
     }
@@ -217,9 +260,14 @@ impl RpmTracker {
     }
 
     /// 移除指定凭据的窗口条目（删号时调用，避免其 RPM 记录残留被复用 id 的新号继承）。
+    /// 模型维度同款清理：该凭据的全部 (id, 模型) 条目一并移除。
     /// 返回是否确有条目被移除。
     pub fn remove(&self, id: u64) -> bool {
-        self.hits.lock().remove(&id).is_some()
+        let had_hit = self.hits.lock().remove(&id).is_some();
+        let mut mh = self.model_hits.lock();
+        let had_model = mh.keys().any(|(cid, _)| *cid == id);
+        mh.retain(|(cid, _), _| *cid != id);
+        had_hit || had_model
     }
 
     /// 清理空闲条目（由后台定时任务周期调用，防止不再出现的凭据 id 无界堆积）
@@ -231,6 +279,12 @@ impl RpmTracker {
             Self::prune(v, now, window);
         }
         map.retain(|_, v| !v.is_empty());
+        // 模型维度同款清理：过期条目剔除后空 (id, 模型) 组合一并移除，防无界堆积。
+        let mut mh = self.model_hits.lock();
+        for v in mh.values_mut() {
+            Self::prune(v, now, window);
+        }
+        mh.retain(|_, v| !v.is_empty());
     }
 }
 
@@ -283,6 +337,7 @@ mod tests {
         let tracker = RpmTracker {
             window: Duration::from_millis(30),
             hits: Mutex::new(HashMap::new()),
+            model_hits: Mutex::new(HashMap::new()),
         };
         tracker.record(1);
         assert_eq!(tracker.count(1), 1);
@@ -296,6 +351,7 @@ mod tests {
         let tracker = RpmTracker {
             window: Duration::from_millis(30),
             hits: Mutex::new(HashMap::new()),
+            model_hits: Mutex::new(HashMap::new()),
         };
         tracker.record(1);
         tracker.record(2);
@@ -330,6 +386,7 @@ mod tests {
         let tracker = RpmTracker {
             window: Duration::from_millis(30),
             hits: Mutex::new(HashMap::new()),
+            model_hits: Mutex::new(HashMap::new()),
         };
         tracker.record(1);
         tracker.record(2);
@@ -338,6 +395,72 @@ mod tests {
         let batch = tracker.counts_for(&[1, 2]);
         assert_eq!(batch.get(&1).copied(), Some(0), "过期项应被剔除");
         assert_eq!(batch.get(&2).copied(), Some(0));
+    }
+
+    /// 模型维度：每 (凭据 × 模型) 独立计数，且与每凭据计数互不干扰。
+    #[test]
+    fn test_rpm_tracker_model_dimension_counts_per_cred_model() {
+        let tracker = RpmTracker::new();
+        tracker.record_model(1, "claude-sonnet-4-5");
+        tracker.record_model(1, "claude-sonnet-4-5");
+        tracker.record_model(1, "claude-opus-4-8");
+        tracker.record_model(2, "claude-sonnet-4-5");
+        let batch = tracker.model_counts_for(&[1, 2], "claude-sonnet-4-5");
+        assert_eq!(batch.get(&1).copied(), Some(2), "#1 的 sonnet 计数");
+        assert_eq!(batch.get(&2).copied(), Some(1), "#2 的 sonnet 计数");
+        let other = tracker.model_counts_for(&[1, 2], "claude-opus-4-8");
+        assert_eq!(other.get(&1).copied(), Some(1), "#1 的 opus 计数独立");
+        assert_eq!(
+            other.get(&2).copied(),
+            Some(0),
+            "未出现过的 (凭据, 模型) 组合必须返回 0 而不是缺键"
+        );
+        assert_eq!(tracker.count(1), 0, "模型级计数不污染每凭据计数");
+        assert_eq!(tracker.count(2), 0);
+    }
+
+    /// 模型维度：滑窗过期剔除与 cleanup 清空同样生效（与每凭据维度同款语义）。
+    #[test]
+    fn test_rpm_tracker_model_dimension_prunes_and_cleanup() {
+        let tracker = RpmTracker {
+            window: Duration::from_millis(30),
+            hits: Mutex::new(HashMap::new()),
+            model_hits: Mutex::new(HashMap::new()),
+        };
+        tracker.record_model(1, "m");
+        assert_eq!(tracker.model_counts_for(&[1], "m").get(&1).copied(), Some(1));
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            tracker.model_counts_for(&[1], "m").get(&1).copied(),
+            Some(0),
+            "过期项应被剔除"
+        );
+        tracker.record_model(1, "m");
+        tracker.record_model(2, "m");
+        std::thread::sleep(Duration::from_millis(50));
+        tracker.cleanup();
+        assert_eq!(
+            tracker.model_counts_for(&[1, 2], "m").values().sum::<u32>(),
+            0,
+            "cleanup 后全部过期空条目应被清空"
+        );
+    }
+
+    /// 模型维度：remove 删号时该凭据的模型级条目一并移除（防复用 id 的新号继承计数）。
+    #[test]
+    fn test_rpm_tracker_remove_clears_model_dimension() {
+        let tracker = RpmTracker::new();
+        tracker.record_model(1, "m");
+        tracker.record_model(1, "m");
+        assert!(tracker.remove(1), "remove 应报告确有条目被移除");
+        assert_eq!(
+            tracker.model_counts_for(&[1], "m").get(&1).copied(),
+            Some(0),
+            "删号后该号的模型级计数必须清零"
+        );
+        // 其它号的条目不受影响
+        tracker.record_model(2, "m");
+        assert_eq!(tracker.model_counts_for(&[1, 2], "m").get(&2).copied(), Some(1));
     }
 
     /// 回归（滑窗剔除必须是摊还 O(1) 而非每次全扫）：大量命中下 prune 只处理过期前缀。

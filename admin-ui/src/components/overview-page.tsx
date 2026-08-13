@@ -17,6 +17,7 @@ import { StatusBars } from '@/components/overview/StatusBars'
 import { useUiLayoutPrefs } from '@/hooks/use-ui-layout-prefs'
 import { AreaTrendChart } from '@/components/overview/AreaTrendChart'
 import { authLabel } from '@/lib/i18n-labels'
+import { StaleBadge } from '@/components/settings-page'
 import type { CredentialStatusItem, SeriesPoint, RateLimitInsight } from '@/types/api'
 
 // 紧凑数字：1234 -> 1.2k
@@ -333,6 +334,15 @@ export function OverviewPage() {
   const { data, isLoading: credLoading, error: credError } = useCredentials()
   // 全页共享一份已缓存余额（只读、零上游），传给状态条视图展示剩余额度迷你条。
   const { data: cachedBalances } = useCachedBalances()
+  // 余额快照新鲜度：取全部余额缓存里最新的 cachedAt（Unix 秒，后端 CachedBalanceItem）。
+  // 后台温和刷新间隔 30 分钟，>1h 没更新 = 刷新链路停了，展示旧值必须带过期标记。
+  const { balanceStale, balanceNewestMs } = useMemo(() => {
+    const vals = cachedBalances?.balances ? Object.values(cachedBalances.balances) : []
+    if (vals.length === 0) return { balanceStale: false, balanceNewestMs: 0 }
+    const newestSec = Math.max(...vals.map((b) => b.cachedAt))
+    const stale = Date.now() / 1000 - newestSec > 3600
+    return { balanceStale: stale, balanceNewestMs: newestSec * 1000 }
+  }, [cachedBalances])
   const overview = useUsageOverview()
   // hourly 供 KPI sparkline + 24h 趋势；daily 供 7d/30d 趋势。两者都是本地统计，无上游封号风险。
   const hourly = useUsageTimeseries('hourly')
@@ -529,7 +539,17 @@ export function OverviewPage() {
       ))}
     </div>
   ) : poolView === 'bars' ? (
-    <StatusBars credentials={displayCreds} activity={activity} balances={cachedBalances?.balances} saturatedIds={saturatedIds} />
+    <div className="flex flex-col gap-2">
+      {/* 余额快照过期标记：全部余额缓存里最新的 cachedAt 距今 >1h 即过期。
+          后台温和刷新间隔 30 分钟，>1h 没更新说明刷新链路停了（网关 502 / 上游风控窗口）。
+          旧值仍在展示（有信息量），但必须明示"已过期"，避免运维照着假的新鲜度做判断。 */}
+      {balanceStale && (
+        <div className="flex justify-end">
+          <StaleBadge updatedAt={balanceNewestMs} />
+        </div>
+      )}
+      <StatusBars credentials={displayCreds} activity={activity} balances={cachedBalances?.balances} saturatedIds={saturatedIds} />
+    </div>
   ) : (
     <GlowGrid credentials={displayCreds} activity={activity} />
   )

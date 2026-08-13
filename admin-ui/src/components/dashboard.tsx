@@ -23,7 +23,7 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog'
 import { useCredentials, useDeleteCredentialsBatch, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useSetDisabled } from '@/hooks/use-credentials'
-import { getCredentialBalance, getCachedBalances, forceRefreshToken, deepVerifyCredential, probeAvailableModels, setCredentialAllowedModels, PROBE_MODEL_CATALOG, exportCredential, cleanupDisabled } from '@/api/credentials'
+import { getCredentialBalance, getCachedBalances, forceRefreshToken, deepVerifyCredential, probeAvailableModels, setCredentialAllowedModels, PROBE_MODEL_CATALOG, exportCredential, exportKam, cleanupDisabled } from '@/api/credentials'
 import { extractErrorMessage, downloadJson, fileStamp } from '@/lib/utils'
 import { PageSkeleton } from '@/components/ui/page-skeleton'
 import { useUiLayoutPrefs } from '@/hooks/use-ui-layout-prefs'
@@ -651,6 +651,39 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     })
   }
 
+  // 导出 KAM 号池（Blob 下载为 kam.json）。后端接线中：端点未合入时 404，提示稍后再试。
+  const handleExportKam = async () => {
+    try {
+      const blob = await exportKam()
+      // MINOR-5（2026-08-14 审查修正）：后端错误可能以 200 + JSON 错误页形式回来
+      // （反代/中间层），按 blob.type 判型，避免把错误页下载成垃圾 kam.json。
+      if (blob.type === 'application/json') {
+        const text = await blob.text()
+        let msg = t('dashboard.toolbar.exportKamFailed')
+        try {
+          const parsed = JSON.parse(text)
+          msg = parsed.error?.message || parsed.message || msg
+        } catch {
+          /* 非 JSON 错误体，用默认文案 */
+        }
+        toast.error(msg)
+        return
+      }
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = 'kam.json'
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+      toast.success(t('dashboard.toolbar.exportKamOk'))
+    } catch (err) {
+      // MINOR-6（2026-08-14）：后端已合入（404 是兼容旧后端路径）
+      toast.error(extractErrorMessage(err))
+    }
+  }
+
   // 查询当前页凭据信息（只读已缓存余额快照，一次拉取、绝不触发上游调用）。
   // 封号红线：绝不批量主动拉 per-account balance。后端后台每 30 分钟温和刷新缓存，
   // 这里读的是最近已知值 + cachedAt 新鲜度，零上游、零风控风险。
@@ -1116,6 +1149,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 <Plus className="h-4 w-4 mr-2" />
                 {t('dashboard.toolbar.addCredential')}
               </Button>
+              <Button onClick={handleExportKam} size="sm" variant="outline" title={t('dashboard.toolbar.exportKam')}>
+                <Download className="h-4 w-4 mr-2" />
+                {t('dashboard.toolbar.exportKam')}
+              </Button>
             </div>
           </div>
 
@@ -1130,9 +1167,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                刻意**不分页** —— 分页会让「第 1 页框选 5 个 → 翻页 → 批量删除」删掉当前看不见的号，
                而画布本身可滚动。故这里喂 `data.credentials` 全集而非 `currentCredentials`。
                卡片/行两档的分页行为一个字节没动。 */
-            // ⚠️ 右键菜单暂未接：卡片视图的右键在 `credential-card.tsx` 内部自处理
-            // （不走 dashboard 的 state），画布要复用需先把那套菜单抽成共享组件。
-            // 本轮只交付框选/拖动/改大小三件，右键留待抽组件后再接。
             <CredentialCanvas credentials={data?.credentials ?? []} />
           ) : (
             <>

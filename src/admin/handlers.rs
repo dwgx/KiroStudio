@@ -26,6 +26,63 @@ pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoRe
     Json(response)
 }
 
+/// GET /api/admin/credentials/export-kam
+/// 导出凭据为 KAM 兼容 JSON（含 refreshToken 等**明文敏感字段**）
+///
+/// ⚠️ 敏感操作：响应体含明文 token，前端拿到后应直接触发浏览器下载，
+/// 不要落库/进日志。可选 query 参数 `ids`（逗号分隔）限定导出范围，
+/// 省略则导出全部。鉴权沿用 admin 路由统一鉴权（本路由在 authed 树内）。
+pub async fn export_kam_credentials(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let id_filter: Option<std::collections::HashSet<u64>> = match params
+        .get("ids")
+        .map(|raw| {
+            // ⚠️ 2026-08-14 对抗审查 MAJOR-1：`ids` 出现但解析结果为空（全非法段/空串）
+            // 必须报 400，绝不静默退化为**全量明文导出**——本端点响应含明文 token，
+            // 一个笔误（?ids=abc / ?ids=）让全池 token 出站是最坏的失败模式。
+            // 解析出的集合为空即视为格式错误（合法空串本身无意义：导出全量请省略
+            // 该参数，这是显式契约，与 BatchDelete 的严格解析惯例一致）。
+            let parsed: std::collections::HashSet<u64> = raw
+                .split(',')
+                .filter_map(|s| {
+                    let t = s.trim();
+                    if t.is_empty() {
+                        None
+                    } else {
+                        t.parse::<u64>().ok()
+                    }
+                })
+                .collect();
+            if parsed.is_empty() {
+                return Err(());
+            }
+            Ok(parsed)
+        })
+        .transpose()
+    {
+        Ok(v) => v,
+        Err(()) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(super::types::AdminErrorResponse::invalid_request(
+                    "ids 参数格式错误：需要逗号分隔的数字 ID",
+                )),
+            )
+                .into_response();
+        }
+    };
+
+let response = state.service.export_kam_credentials(id_filter.as_ref());
+    // MINOR-4（2026-08-14）：明文 token 响应禁止缓存（共享代理/浏览器不留副本）。
+    (
+        [("Cache-Control", "no-store")],
+        Json(response),
+    )
+        .into_response()
+}
+
 /// POST /api/admin/credentials/:id/disabled
 /// 设置凭据禁用状态
 pub async fn set_credential_disabled(
@@ -398,7 +455,11 @@ pub struct ProxyTestResponse {
 ///
 /// SSRF 铁律：目标 URL 永远固定在此，绝不接受请求方传入——用户只能控制「用哪个代理」，
 /// 不能控制「访问哪个 URL」，杜绝把本网关当跳板打内网/元数据端点。
-const PROXY_TEST_PROBE_URL: &str = "https://api.ipify.org?format=json";
+///
+/// `pub(super)` 而非私有：后台代理池健康调度（`service.rs::probe_socks_node`）复用
+/// 同一个常量，保证「手动测活」与「自动调度」访问的是同一个目标——各写一份必然漂移，
+/// 而漂移的那一份就是可被指使的出站。
+pub(super) const PROXY_TEST_PROBE_URL: &str = "https://api.ipify.org?format=json";
 
 /// POST /api/admin/proxy/test
 /// 通过指定代理（或直连）访问固定探针 URL，测连通性 + 出口 IP。
@@ -1520,6 +1581,13 @@ pub async fn storage_stats(State(state): State<AdminState>) -> impl IntoResponse
     Json(state.service.storage_stats(state.trace_db.as_ref()))
 }
 
+/// GET /api/admin/diagnostics/snapshot
+/// 运维诊断一键聚合：版本 / 逐号状态（禁用/冷却/健康分/余额）/ 代理池健康 /
+/// 关键配置摘要（脱敏）/ uptime / RSS。纯观测端点，前端不强制接。
+pub async fn diagnostics_snapshot(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.diagnostics_snapshot().await)
+}
+
 /// POST /api/admin/storage/cleanup
 /// 按 target 白名单 + 可选时间窗口清理数据（路径全部从 config 派生，防穿越）
 ///
@@ -1559,6 +1627,27 @@ pub async fn update_config(
     }
 }
 
+/// GET /api/admin/config/export
+/// 导出当前配置（整份 JSON，敏感字段省略——脱敏清单见 AdminService::export_config）。
+pub async fn export_config(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.export_config() {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/config/import
+/// 导入整份配置（先校验后写盘，失败不破坏现有配置；敏感字段省略时继承现值）。
+pub async fn import_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    match state.service.import_config(payload) {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 // ============ OTA 自更新（GitHub 版本检查 + 一键升级）============
 
 /// GET /api/admin/update/check
@@ -1590,8 +1679,11 @@ pub async fn perform_update(
             }
             Json(result).into_response()
         }
+        // 分类错误码（对齐 AdminServiceError::status_code 模式）：400 入参非法 /
+        // 409 环境或版本冲突 / 422 数据无效 / 502 上游不可达 / 500 内部。
+        // body 形状保持既有契约（success=false + message），仅状态码分类。
         Err(e) => (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            e.status_code(),
             Json(serde_json::json!({ "success": false, "message": format!("升级失败: {e}") })),
         )
             .into_response(),

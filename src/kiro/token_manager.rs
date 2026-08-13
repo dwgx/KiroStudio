@@ -245,7 +245,13 @@ async fn refresh_social_token(
     let refresh_url = format!("https://prod.{}.auth.desktop.kiro.dev/refreshToken", region);
     let refresh_domain = format!("prod.{}.auth.desktop.kiro.dev", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = &config.kiro_version;
+    // ⚠️ 2026-08-14 对抗审查 M1：版本段**固定**用 config.kiro_version，不走
+    // version_mask::effective —— 刷新请求不带 profileArn（参考仓实测新版 IDE
+    // 会在用量类接口按版本/UA 强制 profileArn 导致 400；刷新接口属于同一批
+    // 未验证形态，若上游对刷新端点同源判定，换最新版 UA = social 号全池无法
+    // 续期）。号池存亡路径不换未验证指纹：要么先在 staging 实测「最新版 UA +
+    // 无 profileArn」刷新返回 200，再接线。
+    let kiro_version = config.kiro_version.clone();
 
     let client = build_client(proxy, 60, config.tls_backend)?;
     let body = RefreshRequest {
@@ -940,6 +946,10 @@ pub(crate) use crate::kiro::regions::PROFILE_PROBE_REGIONS;
 /// 见 [`CredentialEntry::last_full_reprobe_at`]。6 小时足够稀释「每 token TTL 白跑一轮」的浪费，
 /// 又不至于长到 dwgx 在别 region 开通后要等太久才自动纠正（届时手动刷新/切 region 也能立即生效）。
 const REPROBE_ALL_BAD_COOLDOWN: StdDuration = StdDuration::from_secs(6 * 3600);
+/// per-credential 刷新锁的**等待上限**（秒）。见 `refresh_token_locked` 锁获取处的说明：
+/// 超时按瞬态错误返回（请求换号/重试），不无限排队。取值远小于单次刷新的正常耗时
+/// （网络往返 + 退避最坏 180s+），只在刷新异常卡死时兜底触发。
+const REFRESH_LOCK_TIMEOUT_SECS: u64 = 60;
 
 /// 全池自愈的**基础退避**（值已配置化到 [`Config::self_heal_base_backoff_secs`]，默认 60s）。
 /// 第 n 次连续自愈需等 `BASE × 2^(n-1)`，上限 `self_heal_max_backoff_secs`（默认 900s）。
@@ -1388,9 +1398,38 @@ struct CredentialEntry {
     /// 刷新在全局锁后排队"的队头阻塞问题）。双检守卫（stale-snapshot guard）仍通过
     /// 「拿锁后二次确认 refresh_token 是否已被他人轮换」实现，语义与旧全局锁完全一致。
     refresh_lock: Arc<TokioMutex<()>>,
+    /// **族键缓存**（`family_key(id)` 的预计算结果）。
+    ///
+    /// # 为什么缓存（2026-08-14，选号临界区优化）
+    ///
+    /// `report_success` 的族级清零要对**全池**逐条算 `family_key`（每次成功一次
+    /// 全池扫描，每次都是 String 分配 + issuer_url 解析 + clone_group 判定）——
+    /// 共享族（`clone:` / `m365:` / `aws:`）下这是每成功一次 O(n) 分配扫描。
+    /// 缓存后读侧变纯字段访问，分配归零。
+    ///
+    /// # 失效（惰性重算）
+    ///
+    /// `None` = 需要按当前 `credentials` 重算。族键只依赖 `auth_method` /
+    /// `issuer_url` / `profile_arn` / `clone_group` 四个输入，其中后两个有运行期
+    /// 写入点（`set_clone_identity` / region 纠正 / 刷新写回），那些变更点必须把
+    /// 本字段置 None，否则缓存与凭据漂移（详见各变更点的注释）。
+    family_key: Option<String>,
 }
 
 impl CredentialEntry {
+    /// 读族键缓存；`None`（凭据变更点已置空）时按当前凭据惰性重算并回填。
+    ///
+    /// 需 `&mut self`：重算要写缓存字段。调用点都在 entries 锁内（iter_mut），
+    /// 满足要求；选号排序键等只读点不调用本方法（那里按既有约定现算）。
+    fn family_key_cached(&mut self) -> &str {
+        if self.family_key.is_none() {
+            self.family_key = Some(self.credentials.family_key(self.id));
+        }
+        self.family_key
+            .as_deref()
+            .expect("上面刚回填，必为 Some")
+    }
+
     /// 复活凭据（从禁用态恢复）时必须清零的**全部进程内惩罚计数**，单一收口。
     ///
     /// # 为什么要收口成一个方法
@@ -2215,6 +2254,11 @@ impl MultiTokenManager {
         credentials_path: Option<PathBuf>,
         is_multiple_format: bool,
     ) -> anyhow::Result<Self> {
+        // 冷却状态持久化目录（凭据文件所在目录）——必须先算，credentials_path 稍后
+        // 会被 move 进 Self。⚠️ 无路径时**保持纯内存**（new()）：测试环境全部
+        // credentials_path=None，若统一落 "." 会让并行测试共享同一冷却文件互相污染
+        // （全量跑 17 个选号测试随机红，2026-08-13 实测）。
+        let cooldown_dir = credentials_path.as_deref().and_then(|p| p.parent()).map(|d| d.to_path_buf());
         // 计算当前最大 ID，为没有 ID 的凭据分配新 ID
         let max_existing_id = credentials.iter().filter_map(|c| c.id).max().unwrap_or(0);
         let mut next_id = max_existing_id + 1;
@@ -2267,6 +2311,8 @@ impl MultiTokenManager {
                     last_full_reprobe_at: Mutex::new(None),
                     reprobe_in_flight: AtomicBool::new(false),
                     refresh_lock: Arc::new(TokioMutex::new(())),
+                    // 族键缓存：构造时即按当前凭据预计算（auth_method 已 canonicalize）。
+                    family_key: Some(cred.family_key(id)),
                 }
             })
             .collect();
@@ -2424,7 +2470,12 @@ impl MultiTokenManager {
             self_heal_revived: Mutex::new(std::collections::HashSet::new()),
             self_heal_streak: AtomicU32::new(0),
             stats_dirty: AtomicBool::new(false),
-            cooldown: CooldownManager::new(),
+            // 2026-08-13：冷却状态持久化（风控退避档位重启清零 = 烧号反向放大器）。
+            // 数据目录 = 凭据文件所在目录（cache_dir 同源）；无路径时纯内存（与旧行为一致）。
+            cooldown: match &cooldown_dir {
+                Some(dir) => CooldownManager::with_data_dir(dir),
+                None => CooldownManager::new(),
+            },
             cooldown_enabled: AtomicBool::new(cooldown_enabled),
             throttle,
             rate_limiter: RateLimiter::new(rate_limit_config),
@@ -2960,7 +3011,15 @@ impl MultiTokenManager {
         // 判白名单，按 model_catalog 注释配 `["deepseek-v4-flash"]` 的代挂号会永久被硬门挡下，
         // 透传永不发生。deepseek 归一化凭据按归一化后的模型名判；普通凭据用原始模型名。
         let global_ds = self.config().deepseek_normalize.clone();
-        entries
+        // ⭐ RPM 计数**一次加锁批量取回**（与 Kiro 主路径 `select_next_credential` 同款模式）。
+        //
+        // 此前排序键对每个候选各调一次 `self.rpm.count(e.id)`，每次独立加 RpmTracker
+        // 的锁 —— 43 号池一次选号最多 43 次加锁，而这整段都在 entries 锁临界区内
+        // （100 并发压测最先暴露的选号瓶颈）。先把过滤后的候选收集成 Vec，再一次
+        // `counts_for` 取回全部候选的计数：锁获取 O(n) → O(1)，闭包内退化为纯
+        // HashMap 查表。收集成 Vec 同时让排序键变成「快照后稳定全序」（与 Kiro
+        // 主路径 memoize 约定一致），min_by_key 的比较器不再依赖链式重算。
+        let candidates: Vec<&CredentialEntry> = entries
             .iter()
             .filter(|e| {
                 !e.disabled
@@ -2998,11 +3057,26 @@ impl MultiTokenManager {
                         e.credentials.allows_model(&effective)
                     })
             })
-            // 均衡分流键(升序):优先级 → 近 60s RPM → 在途。rpm 用独立 mutex,与 Kiro balanced 同款模式。
+            .collect();
+        let cand_ids: Vec<u64> = candidates.iter().map(|e| e.id).collect();
+        let rpm_counts = self.rpm.counts_for(&cand_ids);
+        let rpm_of = |id: u64| rpm_counts.get(&id).copied().unwrap_or(0);
+        // 模型级计数同样**一次加锁批量取**（与 counts_for 同理由）；模型为空（无模型
+        // 语义的调用）时跳过，该维度不参与也不记录，与记录侧对称。
+        let model_calls = model
+            .filter(|m| !m.is_empty())
+            .map(|m| self.rpm.model_counts_for(&cand_ids, m))
+            .unwrap_or_default();
+        let model_calls_of = |id: u64| model_calls.get(&id).copied().unwrap_or(0);
+        candidates
+            .into_iter()
+            // 均衡分流键(升序):优先级 → 近 60s RPM → 模型级近期调用 → 在途。
+            // rpm/模型级来自上方批量预取。
             .min_by_key(|e| {
                 (
                     e.credentials.priority,
-                    self.rpm.count(e.id),
+                    rpm_of(e.id),
+                    model_calls_of(e.id),
                     e.inflight.load(Ordering::Acquire),
                 )
             })
@@ -3029,6 +3103,11 @@ impl MultiTokenManager {
                 let guard = commit.map(|(inflight, cid)| {
                     let g = InflightGuard::acquire(inflight);
                     self.rpm.record(cid);
+                    // 模型级分流计数与每凭据计数同点记录（与 Kiro 主路径 commit_selection
+                    // 对称，全仓 record_model 只在这两处）。模型为空（无模型语义）不记。
+                    if let Some(m) = model.filter(|m| !m.is_empty()) {
+                        self.rpm.record_model(cid, m);
+                    }
                     // 成功选到号 ⇒ 清零「连续全池不可用」计数（配对逻辑见该字段的文档）。
                     // ⚠️ 只在**非 peek** 分支清零：peek 只是探测，不代表真有请求被服务。
                     self.consecutive_pool_unavailable
@@ -3100,6 +3179,8 @@ impl MultiTokenManager {
     /// 原注释写「三态都会 `rpm.record`」已是**假断言**，2026-08-10 对抗评审抓出并改正
     /// —— 全仓 `self.rpm.record` 只有两处：`select_custom_api`（透传）与
     /// `commit_selection`（Kiro 主路径）。**别照旧注释去"修"回来，那会变成双记。**
+    /// 模型级 `rpm.record_model` 沿用同一纪律：只在上述同两个选号占位点记录
+    /// （2026-08-14，见两处调用点的注释），此处同样不得补记，否则模型计数双记。
     pub fn record_passthrough_result(&self, id: u64, outcome: crate::usage::RequestOutcome) {
         use crate::usage::RequestOutcome as RO;
         // ⚠️ **这里刻意不再 `rpm.record(id)`**（2026-08-10 移走）。
@@ -3304,7 +3385,7 @@ impl MultiTokenManager {
                             tracing::debug!(user_id = %uid, credential_id = %bound_id, "亲和性复用凭据");
                             // 续期，使持续活跃的会话不因 TTL 到期而解绑
                             self.affinity.touch(uid);
-                            return Some(self.commit_selection(entry));
+                            return Some(self.commit_selection(entry, model_key));
                         }
                         // 注：归一化后两种模式都走下方同一套排序键，所以这条"落到下方分流"
                         // 现在**真的会分流**。此前 priority 模式下下方是裸 min_by_key(priority)，
@@ -3333,7 +3414,7 @@ impl MultiTokenManager {
 
         let selected = {
             {
-                // 自适应分流排序键（升序 min_by_key）——**共 10 位**，完整定义见本闭包末尾的元组，
+                // 自适应分流排序键（升序 min_by_key）——**共 13 位**，完整定义见本闭包末尾的元组，
                 // 那里是唯一权威；本概览只说明各位的作用与次序，改元组时必须同步这里。
                 //
                 // ① unusable                真不可用(p_avail=0 或 RPM 饱和)沉底 —— 优雅溢出
@@ -3343,17 +3424,25 @@ impl MultiTokenManager {
                 //                           熔断 Open 的号/族 p_avail=0 自然沉底、半开期按 admit_prob
                 //                           软降权。族键连坐：M365 同租户共享一个 health(整族一起沉)，
                 //                           IdC/social/api_key 各自 cred:{id} 独立(坚强兜底不受连坐)。
-                // ⑤ inflight_now            ⭐同档内在途最少优先 —— 治惊群核心
-                // ⑥ slot_pressure_permille  ⭐在途/自身容量千分比(大池高基数区分)
-                // ⑦ rpm_usage_permille      RPM 已用率低的先选(按容量比例分流)
-                // ⑧ neg_p_fine              p_avail 精细兜底(含余额加权)
-                // ⑨ success_count           终身成功数
-                // ⑩ priority_tiebreaker     优先级末位兜底(同开关门控，关时恒 0)
+                // ⑤ ramp_tier               ⭐爬坡压力档(治 slew-rate 429，见排序键闭包内的实测依据)
+                // ⑥ whitelist_hit           该模型在该号白名单里显式列出 → 0(首选)；通吃号 → 1。
+                //                           显式路由软因子(newapi「首选凭据组」的软版)：同健康同爬坡
+                //                           档内白名单命中的号优先，白名单号整档饱和时优雅溢出到通吃号。
+                //                           全池无白名单时恒 1(均匀) → 零回归。
+                // ⑦ inflight_now            ⭐同档内在途最少优先 —— 治惊群核心
+                // ⑧ model_calls_now         ⭐该号近窗内被**当前模型**调用的次数(低先)。把爆款模型
+                //                           摊到整池，防单模型把部分号顶到饱和而其它号平局分不到。
+                //                           排在 inflight 之后：总在途仍是抗惊群主键，模型维度只细分。
+                // ⑨ slot_pressure_permille  ⭐在途/自身容量千分比(大池高基数区分)
+                // ⑩ rpm_usage_permille      RPM 已用率低的先选(按容量比例分流)
+                // ⑪ neg_p_fine              p_avail 精细兜底(含余额加权)
+                // ⑫ success_count           终身成功数
+                // ⑫ e.success_count        终身成功数(末位兜底,低负载全平局时生效)
                 //
                 // ⚠️ 健康分档**不是**首要键（历史注释曾如此描述，已不成立）：①② 先于它。
                 // 这是刻意的 —— 真不可用的号必须沉底，饥饿号必须能拿到探测机会，
                 // 二者都优先于"谁更健康"。
-                // p_avail 已内含 rpm 压力/在途，⑤⑥⑦ 作同档兜底仍保留
+                // p_avail 已内含 rpm 压力/在途，⑦⑧⑨⑩ 作同档兜底仍保留
                 // （粒度更细 + rpm_limit=0 时 p_avail 不含压力）。
                 // 是否叠加优先级分发（热更开关）。开启时:先按可用性粗分层(不可用/饱和的沉底),
                 // 再按 priority 分层(越小越优先),层内仍按健康/负载均衡。这样高优先级号被优先用,
@@ -3403,6 +3492,14 @@ impl MultiTokenManager {
                     .rpm
                     .ramp_counts_for(&cand_ids, StdDuration::from_secs(RAMP_RECENT_SECS as u64));
                 let ramp_of = |id: u64| ramp_counts.get(&id).copied().unwrap_or((0, 0));
+                // ⭐ 模型级计数同样**一次加锁批量取**（与 counts_for 同理由）。模型为空串
+                // （无模型语义的调用）时跳过整段：该维度不参与也不记录，与记录侧对称。
+                let model_calls = if model_key.is_empty() {
+                    std::collections::HashMap::new()
+                } else {
+                    self.rpm.model_counts_for(&cand_ids, model_key)
+                };
+                let model_calls_of = |id: u64| model_calls.get(&id).copied().unwrap_or(0);
                 // L4 排序键闭包(供两趟复用):入参 &CredentialEntry,升序 min_by_key。
                 let sort_key = |e: &CredentialEntry| {
                     let key = e.credentials.family_key(e.id);
@@ -3460,13 +3557,6 @@ impl MultiTokenManager {
                         e.credentials.priority
                     } else {
                         0
-                    };
-                    // 末位兜底同样受开关门控:关闭时置 0,确保 priority_in_balanced=false 时
-                    // 优先级在整个排序键中完全不起作用,均衡纯粹由健康/在途/用率决定。
-                    let priority_tiebreaker = if prio_first {
-                        e.credentials.priority
-                    } else {
-                        0u32
                     };
                     // ⭐ 高基数负载维度（企业级分流精度）：在途占**该号自身容量**的千分比。
                     //
@@ -3566,18 +3656,51 @@ impl MultiTokenManager {
                             }
                         }
                     };
+                    // ⑥ 模型→渠道路由偏好（newapi「首选凭据组」的软版）：该模型在该号
+                    // 白名单里**显式列出**时置 0（首选），未设白名单的「通吃号」置 1。
+                    // 排在健康/爬坡之后、负载之前：健康与 429 风险仍是主键，白名单只在
+                    // 同健康同爬坡档内做路由偏好，坏号不因白名单命中而插队；白名单号整档
+                    // RPM 饱和时第一趟硬门自然把它们剔除，流量优雅溢出到通吃号。
+                    // 全池无白名单时恒 1（均匀）→ 零回归；模型为空串时恒 1 不参与。
+                    // ⚠️ 已知边界（2026-08-14 审查 m1 文档化）：白名单号未饱和时通吃号
+                    // 零流量——其健康观测完全冻结（无样本）。N=1 且白名单号容量配置
+                    // 错误时流量会一直压在该号上；通吃号要接流量只能等白名单号饱和。
+                    let whitelist_hit = if model_key.is_empty() {
+                        1u8
+                    } else {
+                        let explicit = e
+                            .credentials
+                            .allowed_models
+                            .as_deref()
+                            .is_some_and(|l| !l.is_empty());
+                        u8::from(!(explicit && e.credentials.allows_model(model_key)))
+                    };
+                    // ⑧ 模型级近期调用数（2026-08-14 新增）：该号近窗内被**当前模型**调用的次数，
+                    // 低者优先。与 inflight 的差别：inflight 是全模型混在一起的总在途，
+                    // 本键回答「这个号最近是不是正在被这个爆款模型猛灌」——同一模型跨多号
+                    // 同时段热时，优先选该模型计数最少的号，把热点模型摊到整池，防单个
+                    // 爆款模型把部分号顶到饱和而其它号因平局分不到。排在 inflight 之后：
+                    // 总在途仍是抗惊群主键，模型维度只做同档细分。模型为空时恒 0（与
+                    // 记录侧对称，无模型语义的调用不参与）。阈值不新增：饱和判定仍复用
+                    // 每凭据 rpm_limit，模型级只是分流计数。
+                    let model_calls_now = if model_key.is_empty() {
+                        0u32
+                    } else {
+                        model_calls_of(e.id)
+                    };
                     (
                         unusable,               // ① 真不可用沉底(优雅溢出)
                         starved,                // ② ⭐饥饿号强制探测(0=饥饿排前)
                         prio_key,               // ③ 开关开:按优先级分层;关:恒 0
                         health_tier,            // ④ 健康 3 档粗门(坏号沉档)
                         ramp_tier,              // ⑤ ⭐爬坡压力档(治 slew-rate 429,见上)
-                        inflight_now,           // ⑥ ⭐同档内在途最少优先(治惠群核心)
-                        slot_pressure_permille, // ⑦ ⭐在途/自身容量千分比(大池高基数区分)
-                        rpm_usage_permille,     // ⑧ RPM 已用率低的先选(按容量比例分流)
-                        neg_p_fine,             // ⑨ p_avail 精细兜底(含余额加权)
-                        e.success_count,        // ⑩ 终身成功数
-                        priority_tiebreaker,    // ⑪ 优先级末位兜底(同开关门控,关:恒 0)
+                        whitelist_hit,          // ⑥ 白名单命中(该模型显式路由的号优先)
+                        inflight_now,           // ⑦ ⭐同档内在途最少优先(治惠群核心)
+                        model_calls_now,        // ⑧ ⭐该模型近期调用数(爆款模型摊整池)
+                        slot_pressure_permille, // ⑨ ⭐在途/自身容量千分比(大池高基数区分)
+                        rpm_usage_permille,     // ⑩ RPM 已用率低的先选(按容量比例分流)
+                        neg_p_fine,             // ⑪ p_avail 精细兜底(含余额加权)
+                        e.success_count,        // ⑫ 终身成功数(末位兜底)
                     )
                 };
                 // L4:两趟选号。第一趟只在**非饱和**候选里选(硬门,RPM 成真天花板);
@@ -3674,7 +3797,7 @@ impl MultiTokenManager {
             }
         }
 
-        Some(self.commit_selection(selected))
+        Some(self.commit_selection(selected, model_key))
     }
 
     /// 提交一次选号：在持有 `entries` 锁的前提下原子占用在途名额并记录 RPM。
@@ -3780,7 +3903,7 @@ impl MultiTokenManager {
             self.fallback_cooldown_tier(best.id),
             cursor
         );
-        Some(self.commit_selection(best))
+        Some(self.commit_selection(best, model_key))
     }
 
     /// 该号当前冷却的**深度档**，供 [`Self::select_ignoring_cooldown`] 的排序键第一维。
@@ -3960,9 +4083,26 @@ impl MultiTokenManager {
         }
     }
 
-    fn commit_selection(&self, entry: &CredentialEntry) -> (u64, KiroCredentials, InflightGuard) {
+    fn commit_selection(
+        &self,
+        entry: &CredentialEntry,
+        model: &str,
+    ) -> (u64, KiroCredentials, InflightGuard) {
         let guard = InflightGuard::acquire(entry.inflight.clone());
         self.rpm.record(entry.id);
+        // 模型级 RPM 分流计数与每凭据计数**同点记录**（同一临界区、同一口径，见
+        // `record_passthrough_result` 处「全仓只有两处 rpm.record」的说明）。
+        // `model` 是选号时的原始模型名（与白名单/模型黑名单同源）；模型为空串
+        // （无模型语义的调用，如 MCP）时不记，避免空键条目堆积。
+        if !model.is_empty() {
+            self.rpm.record_model(entry.id, model);
+        }
+        // 成功选到号 ⇒ 清零「连续全池不可用」计数（与透传路径 select_custom_api 对称，
+        // 见该字段的文档）。任一路径成功都代表池子可用，计数恢复后立刻回到可重试语义。
+        // 2026-08-14 补齐：此前只有透传选号清零，纯 Kiro 池短暂抖动会把计数一路累到
+        // 终态升级阈值，误判「永久故障」。
+        self.consecutive_pool_unavailable
+            .store(0, Ordering::Relaxed);
         // 反饥饿探测的时间基准（见 STARVATION_PROBE_SECS）。用 Cell 而非 &mut：
         // 本函数按既有约定收 &CredentialEntry（选号闭包里持的是不可变引用）。
         entry.last_selected_at.set(Instant::now());
@@ -5285,10 +5425,13 @@ impl MultiTokenManager {
     ///
     /// 即 debounce 是个正确的写放大优化，但它与"进程随时可能被硬杀"叠起来会烧号。
     pub fn flush_stats_now(&self) {
-        if !self.stats_dirty.load(Ordering::Relaxed) {
-            return;
+        if self.stats_dirty.load(Ordering::Relaxed) {
+            self.save_stats();
         }
-        self.save_stats();
+        // 2026-08-13：停机时冷却状态一并强制落盘（即使 stats 不脏，冷却也可能脏——
+        // debounce 30s 窗口内的冷却变更若被硬杀丢掉，重启后风控退避档位回基线，
+        // 正是持久化要消除的烧号放大器）。
+        self.cooldown.flush_now();
     }
 
     /// 标记统计数据已更新，并按 debounce 策略决定是否立即落盘
@@ -5382,7 +5525,10 @@ impl MultiTokenManager {
             // 匹配自己，上面那行已经清完，故用前缀判断跳过，保持单号场景零额外开销。
             if !fam.starts_with("cred:") {
                 for entry in entries.iter_mut() {
-                    if entry.credentials.family_key(entry.id) == fam {
+                    // 读预计算缓存而非逐条现算 `family_key`：否则每次成功都要对全池做
+                    // 一次 String 分配 + issuer_url 解析扫描（共享族下每成功一次的
+                    // O(n) 分配扫描，见 family_key 缓存字段的文档）。
+                    if entry.family_key_cached() == fam {
                         entry.consecutive_suspicious = 0;
                     }
                 }
@@ -5797,6 +5943,7 @@ impl MultiTokenManager {
                         entry.disabled_at = Some(now_rfc3339.clone());
                         disabled_ids.push(entry.id);
                         crate::common::recovery_metrics::bump_dead_token_disabled();
+            crate::common::alerting::bump("credential_disabled");
                     }
                 }
             }
@@ -6008,6 +6155,7 @@ impl MultiTokenManager {
             // 设为阈值，便于在管理面板中直观看到该凭据已不可用
             entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
             crate::common::recovery_metrics::bump_dead_token_disabled();
+            crate::common::alerting::bump("credential_disabled");
 
             tracing::error!("凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用", id);
 
@@ -6066,6 +6214,7 @@ impl MultiTokenManager {
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
             crate::common::recovery_metrics::bump_dead_token_disabled();
+            crate::common::alerting::bump("credential_disabled");
 
             tracing::error!("凭据 #{} 被上游暂停/封禁，已禁用（等待人工处理）", id);
 
@@ -6252,6 +6401,7 @@ impl MultiTokenManager {
             entry.disabled_reason = Some(DisabledReason::InvalidRefreshToken);
             entry.disabled_at = Some(Utc::now().to_rfc3339());
             crate::common::recovery_metrics::bump_dead_token_disabled();
+            crate::common::alerting::bump("credential_disabled");
 
             tracing::error!(
                 "凭据 #{} refreshToken 已失效 (invalid_grant)，已立即禁用",
@@ -6844,6 +6994,8 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             entry.credentials.clone_group = group.filter(|s| !s.trim().is_empty());
             entry.credentials.clone_seq = seq;
+            // 族键依赖 clone_group，变更后必须失效缓存（下次读取时惰性重算）。
+            entry.family_key = None;
         }
         self.persist_credentials()?;
         Ok(())
@@ -7848,6 +8000,8 @@ impl MultiTokenManager {
                 }
             }
 
+            // 族键缓存：构造前先算（validated_cred 随即被 move 进 entry）。
+            let entry_family_key = validated_cred.family_key(new_id);
             entries.push(CredentialEntry {
                 id: new_id,
                 credentials: validated_cred,
@@ -7872,6 +8026,7 @@ impl MultiTokenManager {
                 last_full_reprobe_at: Mutex::new(None),
                 reprobe_in_flight: AtomicBool::new(false),
                 refresh_lock: Arc::new(TokioMutex::new(())),
+                family_key: Some(entry_family_key),
             });
         }
 
@@ -8044,6 +8199,8 @@ impl MultiTokenManager {
                 trash.pop().map(|t| t.credentials)
             };
             if let Some(cred) = restored {
+                // 族键缓存：构造前先算（cred 随即被 move 进 entry）。
+                let entry_family_key = cred.family_key(id);
                 let mut entries = self.entries.lock();
                 entries.push(CredentialEntry {
                     id,
@@ -8067,6 +8224,7 @@ impl MultiTokenManager {
                     last_full_reprobe_at: Mutex::new(None),
                     reprobe_in_flight: AtomicBool::new(false),
                     refresh_lock: Arc::new(TokioMutex::new(())),
+                    family_key: Some(entry_family_key),
                 });
             }
             return Err(e.context("回收站落盘失败，已回滚删除操作"));
@@ -8234,6 +8392,8 @@ impl MultiTokenManager {
                 .or_else(|| Some(Utc::now().to_rfc3339()));
             cred.disabled_reason = restored_reason;
             cred.disabled_at = restored_at.clone();
+            // 族键缓存：构造前先算（cred 随即被 move 进 entry）。
+            let entry_family_key = cred.family_key(id);
             entries.push(CredentialEntry {
                 id,
                 credentials: cred,
@@ -8256,6 +8416,7 @@ impl MultiTokenManager {
                 last_full_reprobe_at: Mutex::new(None),
                 reprobe_in_flight: AtomicBool::new(false),
                 refresh_lock: Arc::new(TokioMutex::new(())),
+                family_key: Some(entry_family_key),
             });
         }
 
@@ -8461,6 +8622,8 @@ impl MultiTokenManager {
                         .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
                     entry.credentials.profile_arn = Some(target_arn.clone());
                     entry.credentials.sync_region_from_arn();
+                    // 族键在 issuer_url 解析失败时退化为 profileArn 兜底，变更后须失效缓存。
+                    entry.family_key = None;
                     if let Some(t) = &subscription_title {
                         entry.credentials.subscription_title = Some(t.clone());
                     }
@@ -8523,6 +8686,8 @@ impl MultiTokenManager {
                 if old.as_deref() != Some(best.arn.as_str()) {
                     entry.credentials.profile_arn = Some(best.arn.clone());
                     entry.credentials.sync_region_from_arn();
+                    // 族键在 issuer_url 解析失败时退化为 profileArn 兜底，变更后须失效缓存。
+                    entry.family_key = None;
                     if let Some(t) = &best.subscription_title {
                         entry.credentials.subscription_title = Some(t.clone());
                     }
@@ -8709,7 +8874,26 @@ impl MultiTokenManager {
         };
 
         // 获取该凭据专属的刷新锁——仅串行化同一凭据的并发刷新，不影响其他凭据。
-        let _guard = cred_refresh_lock.lock().await;
+        // ⚠️ 加**等待超时**（2026-08-14）：该号上一次刷新是跨 .await 的网络往返
+        // （含退避最坏可到 180s+），期间并发请求会在锁后无限排队（实测最坏 15s+）。
+        // 超时后按瞬态错误返回，让请求路径换号重试（`report_refresh_failure_classified`
+        // 对不含 4xx/invalid_grant 的普通错误一律按瞬态处置：只冷却、不计数、不禁用），
+        // 而不是死等一个可能已经卡住的刷新。等待上限远小于一次真实刷新的耗时，
+        // 正常刷新几乎不可能超时，只在「刷新卡死/超长」时兜底。二次确认（下方
+        // conditional_lead 拿锁后重查 token 是否仍将过期）不受影响，防惊群语义保留。
+        let _guard = tokio::time::timeout(
+            StdDuration::from_secs(REFRESH_LOCK_TIMEOUT_SECS),
+            cred_refresh_lock.lock(),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "凭据 #{} 刷新锁等待超时（{}s）：该号上一次刷新耗时异常或卡死，\
+                 本次按瞬态错误处置，请求将换号/重试",
+                id,
+                REFRESH_LOCK_TIMEOUT_SECS
+            )
+        })?;
 
         // 拿锁后读取当前凭据：请求路径或其它预刷新可能在等锁期间已刷新
         let credentials = {
@@ -8837,6 +9021,8 @@ impl MultiTokenManager {
                 // 真正拥有的 4 个 token 字段，其余字段（如 subscription_title）原地保留，
                 // 不被本次刷新发起前的陈旧快照回退。
                 apply_refresh_result_fields(&mut entry.credentials, &new_creds);
+                // 白名单含 profile_arn（族键兜底输入），刷新可能换 arn ⇒ 失效族键缓存。
+                entry.family_key = None;
                 entry.refresh_failure_count = 0;
             }
         }
@@ -8920,6 +9106,8 @@ impl MultiTokenManager {
                     let mut entries = self.entries.lock();
                     if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                         entry.credentials.profile_arn = Some(arn.clone());
+                        // 族键在 issuer_url 解析失败时退化为 profileArn 兜底，变更后须失效缓存。
+                        entry.family_key = None;
                         // 防呆铁律:profile_arn 一变,region/auth_region 立即同步成 ARN 内 region,
                         // 杜绝「解析到 X region 的 ARN 却留着 Y region」错配 → 400 Improperly formed。
                         if entry.credentials.sync_region_from_arn() {
@@ -10827,7 +11015,8 @@ mod tests {
              客户端会无限重试、永远拿不到终态（这正是本测试要防的回归）"
         );
 
-        // 成功选号必须清零：直接调 select_custom_api（它是唯一的清零点）。
+        // 成功选号必须清零：调 select_custom_api（与 Kiro 主路径 commit_selection
+        // 同为清零点，任一路径成功都证明池子可用）。
         // 该号没有冷却，所以能被选中。
         let picked = mgr.select_custom_api(&std::collections::HashSet::new(), None);
         assert!(picked.is_some(), "该代挂号未被禁用也未冷却，应能选中");
@@ -12153,6 +12342,80 @@ mod tests {
             c2.id, 1,
             "最忙的 #1（近窗 3 次）不应被选中，实际 #{}",
             c2.id
+        );
+    }
+
+    /// 回归（newapi「首选凭据组」的软版）：模型在**某号白名单里显式列出**时，该号优先
+    /// 于未设白名单的「通吃号」；白名单外的模型仍能落到通吃号（硬门放行 + 无白名单命中）。
+    ///
+    /// **旧代码为何 FAIL**：白名单此前只是 `is_entry_selectable` 的硬门（设了才过滤），
+    /// 不参与排序 —— 显式路由的号与通吃号在排序键里完全并列，同优先级下平局恒选
+    /// 下标最小的号，白名单配置对分流零影响，无法实现「这个模型优先走这些号」。
+    #[tokio::test]
+    async fn test_whitelisted_model_channel_preferred_over_catch_all() {
+        let manager = make_balanced_manager(2);
+        {
+            let mut entries = manager.entries.lock();
+            for e in entries.iter_mut() {
+                e.credentials.priority = 0;
+                if e.id == 1 {
+                    // #1 显式白名单含该模型（显式路由），#2 未设白名单（通吃）。
+                    e.credentials.allowed_models = Some(vec!["claude-sonnet-4-5".to_string()]);
+                }
+            }
+        }
+        // 其余全并列（同优先级/同健康/在途 0/RPM 0/模型级 0）→ 白名单命中的 #1 应被首选。
+        let g = manager.acquire_context(Some("claude-sonnet-4-5"), None).await.unwrap();
+        assert_eq!(
+            g.id, 1,
+            "白名单显式列出的 #1 应优先于通吃号 #2（显式路由软因子），实际 #{}",
+            g.id
+        );
+        drop(g);
+        // 白名单外的模型：#1 被硬门挡下（白名单不含它），#2 通吃放行 → 仍能选到 #2，
+        // 显式路由不能把白名单外的模型堵死。
+        let g2 = manager.acquire_context(Some("claude-opus-4-8"), None).await.unwrap();
+        assert_eq!(
+            g2.id, 2,
+            "白名单外模型应落到通吃号（硬门放行 + 无白名单命中），实际 #{}",
+            g2.id
+        );
+    }
+
+    /// 回归（模型级 RPM 分流）：同一模型正在猛灌某号时，应优先选**该模型近期调用数少**的号，
+    /// 把爆款模型摊到整池，防单模型把部分号顶到饱和而其它号平局分不到。
+    ///
+    /// **旧代码为何 FAIL**：排序键只有每凭据 RPM / inflight —— 模型级计数为零差异时，
+    /// 两号在途同为 0 即全平局，恒选下标最小的号；爆款模型连续打同一号直到 RPM 饱和，
+    /// 期间其它号即使该模型零调用也不参与分流。
+    #[tokio::test]
+    async fn test_model_rpm_spreads_hot_model_across_pool() {
+        let manager = make_balanced_manager(2);
+        {
+            let mut entries = manager.entries.lock();
+            for e in entries.iter_mut() {
+                e.credentials.priority = 0;
+            }
+        }
+        // 模拟爆款模型正在猛灌 #1（5 次模型级命中），#2 该模型零调用；两者每凭据 RPM 都为 0。
+        manager.rpm.record_model(1, "claude-sonnet-4-5");
+        manager.rpm.record_model(1, "claude-sonnet-4-5");
+        manager.rpm.record_model(1, "claude-sonnet-4-5");
+        manager.rpm.record_model(1, "claude-sonnet-4-5");
+        manager.rpm.record_model(1, "claude-sonnet-4-5");
+        let g = manager.acquire_context(Some("claude-sonnet-4-5"), None).await.unwrap();
+        assert_eq!(
+            g.id, 2,
+            "该模型近期调用少的 #2 应优先（把爆款模型摊到整池），实际 #{}",
+            g.id
+        );
+        drop(g);
+        // 另一模型无近期调用差异 → 回到常规分流：每凭据 RPM 少的 #1（0 次 vs #2 的 1 次）。
+        let g2 = manager.acquire_context(Some("claude-opus-4-8"), None).await.unwrap();
+        assert_eq!(
+            g2.id, 1,
+            "另一模型无近期调用差异时走常规 RPM 分流，实际 #{}",
+            g2.id
         );
     }
 
@@ -13654,9 +13917,12 @@ mod tests {
         let tuple_start = prod
             .find("unusable,")
             .expect("排序键元组第①位必须是 unusable");
+        // ⚠️ 2026-08-14 同步：⑬ priority_tiebreaker 已删除（与③ prio_key 同一表达
+        // 式，数学上不改变排序结果——全面 review MAJOR-2），元组恢复 12 位，
+        // 末位锚点改为唯一出现的 e.success_count。
         let tuple_end = prod
-            .find("priority_tiebreaker,")
-            .expect("排序键元组末位必须是 priority_tiebreaker");
+            .find("e.success_count,")
+            .expect("排序键元组末位必须是 e.success_count");
         assert!(
             tuple_start < tuple_end,
             "锚点顺序异常，说明排序键元组结构已大改，本守卫需重写"
@@ -13681,6 +13947,24 @@ mod tests {
         assert!(
             hi < ri,
             "health_tier 必须仍排在 ramp_tier 之前：坏号沉档优先于爬坡分流"
+        );
+        // 2026-08-14 新增两位的顺序契约（与排序键闭包内的注释同步）：
+        // - whitelist_hit（白名单显式路由软因子）夹在 ramp_tier 与 inflight_now 之间：
+        //   健康/爬坡仍是主键，白名单命中只在同健康同爬坡档内做路由偏好，坏号不因
+        //   白名单命中而插队；同时它又必须先于 inflight，保证显式路由优先于负载平局。
+        // - model_calls_now（模型级近期调用数）排在 inflight_now 之后：
+        //   总在途仍是抗惊群主键，模型维度只做同档细分，不能掀翻总在途分流。
+        let wi = pos("whitelist_hit,");
+        let mi = pos("model_calls_now,");
+        assert!(
+            ri < wi && wi < ii,
+            "whitelist_hit 必须排在 ramp_tier 之后、inflight_now 之前：健康/爬坡优先于\
+             显式路由偏好，且路由偏好优先于负载平局"
+        );
+        assert!(
+            ii < mi,
+            "model_calls_now 必须排在 inflight_now 之后：总在途仍是抗惊群主键，\
+             模型维度只做同档细分"
         );
     }
 

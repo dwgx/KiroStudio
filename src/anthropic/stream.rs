@@ -928,12 +928,29 @@ impl SseEvent {
     }
 
     /// 格式化为 SSE 字符串
+    ///
+    /// 一次分配直接拼好：with_capacity 预分配 + serde_json 直接序列化进缓冲，
+    /// 避免旧实现（`to_string` 产生临时 String，`format!` 再拷贝一次）的二次复制——
+    /// 流式路径逐事件走这里，长流下每帧省两次分配。
     pub fn to_sse_string(&self) -> String {
-        format!(
-            "event: {}\ndata: {}\n\n",
-            self.event,
-            serde_json::to_string(&self.data).unwrap_or_default()
-        )
+        use std::fmt::Write as _;
+        let mut s = String::with_capacity(self.event.len() + 128);
+        let _ = write!(s, "event: {}\n", self.event);
+        s.push_str("data: ");
+        let data_start = s.len();
+        // serde_json::to_writer 需要 io::Write —— String 不实现它，用 Vec<u8> 中转
+        // （一次性分配，写完转 String 零拷贝语义由 String::from_utf8 保证）。
+        let mut buf = Vec::with_capacity(128);
+        if serde_json::to_writer(&mut buf, &self.data).is_err() {
+            // 理论不可达（Value 恒可序列化，Vec 写入不产生 IO 错误）；
+            // 与旧 `unwrap_or_default` 同语义：退化 data 为空。
+            s.truncate(data_start);
+        } else {
+            // Vec<u8> 无非法 UTF-8（serde_json 输出恒 UTF-8），失败仅理论不可达。
+            s.push_str(&String::from_utf8(buf).unwrap_or_default());
+        }
+        s.push_str("\n\n");
+        s
     }
 
     /// 构造 Anthropic 规范的 SSE `error` 事件。
@@ -1418,6 +1435,12 @@ pub struct StreamContext {
     /// 只认 text_delta / thinking_delta / input_json_delta；`message_start` / `ping` /
     /// `content_block_start` / `signature_delta` / 关块用的空 delta 都不算首 token。
     first_token_at: Option<std::time::Instant>,
+    /// 从上游累计收到的传输字节（逐 chunk 经 [`Self::note_received_bytes`] 累加）。
+    ///
+    /// 与「中断字节数」配套：断流（传输错误/解码器停止/in-band 错误）收尾时，
+    /// [`Self::interrupted_bytes`] 用本计数器回报「断流时点已收到多少」。
+    /// 正常结束该字段不被消费（`interrupted_bytes` 返回 None）。
+    received_bytes: u64,
     /// 本轮是否出现过**结构化** reasoning 流（`reasoningContentEvent`）。
     ///
     /// # 为什么需要这个标志（E1 的关键约束）
@@ -1558,6 +1581,7 @@ impl StreamContext {
             stray_inline_seen: 0,
             reclaim_enabled: super::handlers::tool_reclaim_textified_invoke_enabled(),
             first_token_at: None,
+            received_bytes: 0,
             reasoning_stream_seen: false,
             body_content_seen: false,
             discarded_reasoning: String::new(),
@@ -1696,6 +1720,23 @@ impl StreamContext {
     /// 首个真实内容 delta 落定的时刻（供 handler 算 `first_token_ms`）。
     pub fn first_token_at(&self) -> Option<std::time::Instant> {
         self.first_token_at
+    }
+
+    /// 累计一批已从上游收到的传输字节（handler 每拿到一个响应 chunk 调用一次）。
+    pub fn note_received_bytes(&mut self, n: usize) {
+        self.received_bytes += n as u64;
+    }
+
+    /// 断流时已收到的上游字节数；正常结束返回 `None`（未中断）。
+    ///
+    /// `Some(0)` = 断了但一个字节都没收到（首帧前断流）。判定依据是 completion
+    /// 状态：传输错误 / 解码器停止 / in-band 错误均视为中断。
+    pub fn interrupted_bytes(&self) -> Option<u64> {
+        if self.completion.is_ok() {
+            None
+        } else {
+            Some(self.received_bytes)
+        }
     }
 
     fn process_kiro_event_inner(&mut self, event: &Event) -> Vec<SseEvent> {
@@ -4085,6 +4126,12 @@ impl BufferedStreamContext {
         self.inner.mark_decoder_stopped(message);
     }
 
+    /// 中断字节数（非流式路径恒 `None`：没有「SSE 流中途断流」概念，透传占位保持
+    /// 与流式收尾埋点同模式，避免两处埋点代码分叉）。
+    pub fn interrupted_bytes(&self) -> Option<u64> {
+        None
+    }
+
     /// 是否空/近似空响应（透传内部 StreamContext，供收尾补发 error 事件）。
     pub fn is_empty_response(&self) -> bool {
         self.inner.is_empty_response()
@@ -4727,17 +4774,14 @@ fn invoke_trace_enabled() -> bool {
 // `<invoke name="...">...<parameter ...>...</parameter>...</invoke>` 结构捞回。
 // 复用本文件既有的 `QUOTE_CHARS` / `is_quote_char`（与 kiro.rs 完全一致）。
 //
-// 本阶段只落地函数 + 单测（隔离验证），暂不接入任何状态机。
+// 已接入状态机：`StreamContext::drain_invoke_sniff_buffer`（重组路径）逐块调用
+// 本批函数，本批是它的解析层（先落地单测隔离验证，后接线——接线已完成）。
 // ============================================================================
 
 /// 检查 `name_pos`（指向标签名首字母）的前面是否构成合法的开标签起始，
 /// 兼容裸写法 `<tag` 和带命名空间前缀的写法 `<prefix:tag`。
 ///
 /// 返回 `Some(lt_pos)`（指向 `<` 的字节位置）表示合法；`None` 表示不是标签。
-///
-/// 注：本阶段这批 invoke 解析纯函数仅落地 + 单测隔离验证，尚未接入状态机，
-/// 故统一 `#[allow(dead_code)]`；后续接线阶段移除。
-#[allow(dead_code)]
 fn open_tag_lt_pos(buffer: &str, name_pos: usize) -> Option<usize> {
     let bytes = buffer.as_bytes();
     if name_pos == 0 {
@@ -4769,7 +4813,6 @@ fn open_tag_lt_pos(buffer: &str, name_pos: usize) -> Option<usize> {
 ///
 /// 兼容裸 `<invoke ...>` 与带命名空间前缀 `<prefix:invoke ...>` 两种写法。
 /// 复用 `is_quote_char`：若 `<` 前紧贴反引号/引号等包裹字符，视为引用，跳过。
-#[allow(dead_code)]
 fn find_invoke_start(buffer: &str) -> Option<usize> {
     let mut search = 0;
     while let Some(rel) = buffer[search..].find("invoke") {
@@ -4793,7 +4836,6 @@ fn find_invoke_start(buffer: &str) -> Option<usize> {
 /// 从 `start` 之后查找第一个 invoke 闭标签，返回结束位置（exclusive，含闭标签）
 ///
 /// 兼容裸 `</invoke>` 与带前缀 `</prefix:invoke>`。找不到返回 `None`（块还没到齐）。
-#[allow(dead_code)]
 fn find_invoke_block_end(buffer: &str, start: usize) -> Option<usize> {
     // 块 A 的边界 = 下一个 `<invoke` 开标签（即下一个块 B 的起点），没有则到 buffer 结尾。
     // 这样连发 burst（A 紧跟 B）时，A 的搜索区间被 B 的开标签卡住，绝不会吃进 B。
@@ -4809,7 +4851,6 @@ fn find_invoke_block_end(buffer: &str, start: usize) -> Option<usize> {
 
 /// 从 `start` 之后查找下一个真正的 `<invoke`（或 `<prefix:invoke`）开标签的字节位置。
 /// 跳过 `start` 处当前块自身的开标签。
-#[allow(dead_code)]
 fn find_next_invoke_open(buffer: &str, start: usize) -> Option<usize> {
     // 先跳过当前块的开标签：从 start 之后第一个 '>' 之后开始找。
     let after_open = match buffer[start..].find('>') {
@@ -4839,7 +4880,6 @@ fn find_next_invoke_open(buffer: &str, start: usize) -> Option<usize> {
 
 /// 在 `[from, boundary)` 区间内查找最后一个 `</invoke>` / `</prefix:invoke>` 的结束位置
 /// （exclusive，含闭标签）。找不到返回 `None`（块还没到齐）。
-#[allow(dead_code)]
 fn find_last_invoke_close(buffer: &str, from: usize, boundary: usize) -> Option<usize> {
     let region_end = boundary.min(buffer.len());
     if from >= region_end {
@@ -4873,7 +4913,6 @@ fn find_last_invoke_close(buffer: &str, from: usize, boundary: usize) -> Option<
 }
 
 /// 从标签字符串中抠出 `name="..."` 的值（取第一个匹配）
-#[allow(dead_code)]
 fn extract_name_attr(tag: &str) -> Option<String> {
     let needle = "name=\"";
     let rel = tag.find(needle)?;
@@ -4890,7 +4929,6 @@ fn extract_name_attr(tag: &str) -> Option<String> {
 ///   允许多行 / 含 `<` / 中文 / 含字面 `</parameter>`（P0-1 修复）
 /// - 用 serde_json 拼成 object（值都是字符串，自动转义）
 /// - 无合法 name 或拼不出合法 JSON 返回 `None`
-#[allow(dead_code)]
 fn parse_invoke_block(block: &str) -> Option<(String, String)> {
     // invoke 开标签 = 块开头到第一个 '>'
     let open_end = block.find('>')?;
@@ -4947,7 +4985,6 @@ fn parse_invoke_block(block: &str) -> Option<(String, String)> {
 /// 从 `from` 开始查找第一个 parameter 闭标签，返回 (起始位置, 结束位置 exclusive)
 ///
 /// 兼容裸 `</parameter>` 与带前缀 `</prefix:parameter>`。
-#[allow(dead_code)]
 fn find_param_close(body: &str, from: usize) -> Option<(usize, usize)> {
     // P0-1：参数值（尤其 apply_patch 的 patch 正文）可能含字面 `</parameter>`。
     // 朴素「取第一个 </parameter>」会把值截断。改成「贪婪取边界内最后一个 </parameter>」：
@@ -4990,7 +5027,6 @@ fn find_param_close(body: &str, from: usize) -> Option<(usize, usize)> {
 
 /// 从 `from` 开始查找下一个 `<parameter name="`（或 `<prefix:parameter name="`）开标签的字节位置。
 /// 用于 `find_param_close` 的贪婪边界：当前参数值最多吃到下一个参数开标签之前。
-#[allow(dead_code)]
 fn find_next_param_open(body: &str, from: usize) -> Option<usize> {
     let mut search = from;
     while let Some(rel) = body[search..].find("parameter name=\"") {
@@ -5014,7 +5050,6 @@ fn find_next_param_open(body: &str, from: usize) -> Option<usize> {
 /// 生产语料（KiroStudio #70544 变体）里 `court` 是最主要的 stray token，故并入集合。
 /// 中文变体 `課`/`课` 也是我们实测到的高置信泄漏词（见 LEAKED_CONTROL_TOKENS），一并纳入熔断计数，
 /// 否则中文退化刷屏时逐字清洗能剥、但复读熔断（32 次截断止血）抓不到 → 仍会耗尽 max_tokens。
-#[allow(dead_code)]
 const STRAY_INVOKE_TOKENS: &[&str] = &["call", "count", "card", "court", "課", "课"];
 
 /// thinking 缓冲上限(review Finding 5):上游持续吐纯空白时,纯空白分支既不 emit 也不收缩会让
@@ -5034,7 +5069,6 @@ const MAX_BUFFERED_EVENT_BYTES: usize = 64 * 1024 * 1024;
 ///
 /// 取值权衡：正常工具调用前最多出现 1 个引导词行（偶有 2~3），绝不会连续几十次。
 /// 设为 32 远高于正常上限、又远低于退化时的数万次，既不误伤正常引导词，又能尽早止血。
-#[allow(dead_code)]
 const REPEAT_GUARD_TRIP_THRESHOLD: u32 = 32;
 
 /// stray 泄漏观测词表(与 clean 层 LEAKED_CONTROL_TOKENS 对齐,纯观测用)。
@@ -5169,12 +5203,9 @@ fn detect_structural_flood(text: &str) -> Option<usize> {
 
 /// 块级复读折叠：对「已完整的整段文本」做一次性复读熔断。
 ///
-/// 用于非流式 / web_search loop 路径（`extract_invoke_content_blocks` 入口）——
-/// 那条路不经过流式 `emit_text_delta_raw` 的逐 chunk 熔断，所以在这里独立兜一次。
-///
-/// 规则与流式版一致：同一个 `STRAY_INVOKE_TOKENS`（call/count/card/court）连续作为独占一行
-/// 重复超过 `REPEAT_GUARD_TRIP_THRESHOLD` 次，判定为 Opus 退化复读，**从超阈值处截断**，
-/// 丢弃其后的全部复读垃圾（断雪球、不灌历史）。阈值内的少量引导词重复原样保留。
+/// 注释里曾规划用于非流式 / web_search loop 路径（当时的 `extract_invoke_content_blocks`
+/// 入口），该入口至今未落地——流式路径已由 `stray_guard_filter` 逐 chunk 熔断覆盖。
+/// 本函数保留为纯函数 + 单测（供未来非流式路径接线），故标记 `allow(dead_code)`。
 #[allow(dead_code)]
 fn collapse_stray_token_floods(text: &str) -> std::borrow::Cow<'_, str> {
     let mut last_line = "";
@@ -5208,7 +5239,6 @@ fn collapse_stray_token_floods(text: &str) -> std::borrow::Cow<'_, str> {
 }
 
 /// 剥掉块前文本尾部独占一行的 stray token（保留其前一行的换行）
-#[allow(dead_code)]
 fn strip_trailing_stray_tokens(before: &str) -> &str {
     let mut end = before.len();
     loop {
@@ -5252,7 +5282,6 @@ fn strip_trailing_stray_tokens(before: &str) -> &str {
 ///
 /// 注意：这里的“尾部空白”只剥行内空白（空格 / 制表符），不剥换行；
 /// 换行结尾才是“另起一行”的信号。
-#[allow(dead_code)]
 fn invoke_looks_like_real_leak(before: &str) -> bool {
     // 剥掉尾部的行内空白（空格 / 制表符），但保留换行
     let trimmed = before.trim_end_matches([' ', '\t']);
@@ -5267,7 +5296,6 @@ fn invoke_looks_like_real_leak(before: &str) -> bool {
 /// `` `` `` + `` ` `` 两个 chunk，重组成完整行后仍能正确翻转 `open`。
 ///
 /// 返回值仅在内部使用；主要副作用是更新 `open` 与 `partial`。
-#[allow(dead_code)]
 fn advance_code_fence_state(open: &mut bool, partial: &mut String, text: &str) {
     // review Finding 6 修复:围栏判定只需"行首若干字节是否 ```",无换行的超长行会让 partial 无界增长。
     // 一旦当前行已超过判定所需长度(远大于 "```" + 缩进),就不再累积字符(围栏与否已定),防无界 String。
@@ -5287,7 +5315,6 @@ fn advance_code_fence_state(open: &mut bool, partial: &mut String, text: &str) {
 
 /// 纯函数：在不改动真实状态的前提下，试算「把 `text` 走完之后围栏是否打开」。
 /// 用于 drain 决策处判断某个 `<invoke>` 是否落在围栏内。
-#[allow(dead_code)]
 fn fence_open_after(open: bool, partial: &str, text: &str) -> bool {
     let mut o = open;
     let mut p = partial.to_string();
@@ -5312,7 +5339,6 @@ fn fence_open_after(open: bool, partial: &str, text: &str) -> bool {
 ///      比如”条件 a < b 时触发”这样在中文段落里极为常见的表达式。
 /// 64 字节远超最长合法部分标签（`<parameter name=”` ≈ 18 字节含引号，
 /// 加最长的 antml: 前缀也不超过 32 字节），同时对真正被切碎的标签有充足余量。
-#[allow(dead_code)]
 fn partial_invoke_tag_suffix_len(buf: &str) -> usize {
     /// 最长合法开标签前缀的安全上界（字节）。
     /// `<parameter name=”` ≈ 23 字节，`<invoke` = 7 字节；64 字节极为保守。
@@ -9436,6 +9462,33 @@ mod tests {
             RequestOutcome::NetworkError,
             "幂等：应保留首个失败原因"
         );
+    }
+
+    #[test]
+    fn test_interrupted_bytes_only_when_broken() {
+        // 中断字节：正常收尾 None；断流（mark_transport_error / in-band 错误）时
+        // 回报已累计的上游字节；断流前一个字节都没收到 → Some(0)。
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        assert_eq!(ctx.interrupted_bytes(), None, "正常进行中不应有中断字节");
+
+        ctx.note_received_bytes(100);
+        ctx.note_received_bytes(50);
+        ctx.mark_transport_error("connection reset");
+        assert_eq!(
+            ctx.interrupted_bytes(),
+            Some(150),
+            "断流时应返回已收字节之和"
+        );
+
+        // 另一实例：in-band 错误同样算中断，且首帧前断流为 Some(0)
+        let mut ctx2 = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let _ = ctx2.generate_initial_events();
+        ctx2.process_kiro_event(&Event::Error {
+            error_code: "InternalServerException".to_string(),
+            error_message: "boom".to_string(),
+        });
+        assert_eq!(ctx2.interrupted_bytes(), Some(0), "零字节断流应记 0");
     }
 
     #[test]

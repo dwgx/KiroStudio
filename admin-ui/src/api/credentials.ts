@@ -519,6 +519,13 @@ export async function exportCredential(id: number): Promise<Record<string, unkno
   return data
 }
 
+// 导出 KAM 号池 JSON（Blob，下载为 kam.json）。
+// 后端接线中（W16 同步做）；端点未合入时返回 404，调用方提示「稍后再试」。
+export async function exportKam(): Promise<Blob> {
+  const { data } = await api.get<Blob>('/credentials/export-kam', { responseType: 'blob' })
+  return data
+}
+
 // 获取负载均衡模式
 export async function getLoadBalancingMode(): Promise<{ mode: 'priority' | 'balanced' }> {
   const { data } = await api.get<{ mode: 'priority' | 'balanced' }>('/config/load-balancing')

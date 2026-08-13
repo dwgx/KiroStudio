@@ -5,6 +5,7 @@ import { storage } from '@/lib/storage'
 import {
   LayoutDashboard,
   Key,
+  Plug,
   BarChart3,
   Settings,
   Wrench,
@@ -26,6 +27,9 @@ const OverviewPage = lazy(() =>
 const UsagePage = lazy(() =>
   import('@/components/usage-page').then((m) => ({ default: m.UsagePage }))
 )
+const ConnPage = lazy(() =>
+  import('@/components/conn-page').then((m) => ({ default: m.ConnPage }))
+)
 const SettingsPage = lazy(() =>
   import('@/components/settings-page').then((m) => ({ default: m.SettingsPage }))
 )
@@ -33,21 +37,23 @@ const OpsPage = lazy(() =>
   import('@/components/ops-page').then((m) => ({ default: m.OpsPage }))
 )
 
-type Tab = 'overview' | 'credentials' | 'usage' | 'ops' | 'settings'
+type Tab = 'overview' | 'credentials' | 'conn' | 'usage' | 'ops' | 'settings'
 
 const NAV_ICONS: Record<Tab, React.ReactNode> = {
   overview: <LayoutDashboard className="h-4 w-4" />,
   credentials: <Key className="h-4 w-4" />,
+  conn: <Plug className="h-4 w-4" />,
   usage: <BarChart3 className="h-4 w-4" />,
   ops: <Wrench className="h-4 w-4" />,
   settings: <Settings className="h-4 w-4" />,
 }
 
-const NAV_KEYS: Tab[] = ['overview', 'credentials', 'usage', 'ops', 'settings']
+const NAV_KEYS: Tab[] = ['overview', 'credentials', 'conn', 'usage', 'ops', 'settings']
 
 const TAB_TITLE_KEYS: Record<Tab, string> = {
   overview: 'appshell.nav.overview',
   credentials: 'appshell.nav.credentials',
+  conn: 'appshell.nav.conn',
   usage: 'appshell.nav.usage',
   ops: 'appshell.nav.ops',
   settings: 'appshell.nav.settings',
@@ -157,9 +163,10 @@ export function AppShell({ onLogout }: AppShellProps) {
 
         {/* Page Content */}
         <div className="max-w-[1200px] mx-auto px-8 py-8">
-          <Suspense fallback={<PageSkeleton kind={tab} />}>
+          <Suspense fallback={<PageSkeleton kind={tab === 'conn' ? 'settings' : tab} />}>
             {tab === 'overview' && <OverviewPage />}
             {tab === 'usage' && <UsagePage />}
+            {tab === 'conn' && <ConnPage />}
             {tab === 'credentials' && <Dashboard onLogout={onLogout} embedded />}
             {tab === 'ops' && <OpsPage />}
             {tab === 'settings' && <SettingsPage />}

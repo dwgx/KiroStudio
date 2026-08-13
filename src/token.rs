@@ -13,6 +13,7 @@ use crate::anthropic::types::{
 use crate::http_client::{ProxyConfig, build_client};
 use crate::model::config::TlsBackend;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 /// Count Tokens API 配置
 #[derive(Clone, Default)]
@@ -104,7 +105,7 @@ pub fn count_tokens(text: &str) -> u64 {
 
 /// 估算请求的输入 tokens
 ///
-/// 优先调用远程 API，失败时回退到本地计算
+/// 优先调用远程 API（结果带 60s 短 TTL 缓存，命中省掉整段 RTT），失败时回退到本地计算
 pub(crate) fn count_all_tokens(
     model: &str,
     system: Option<&[SystemMessage]>,
@@ -113,17 +114,24 @@ pub(crate) fn count_all_tokens(
 ) -> u64 {
     // 检查是否配置了远程 API
     if let Some(config) = get_config() {
-        if let Some(api_url) = &config.api_url {
+        if config.api_url.is_some() {
+            // 结果缓存：同一会话短时间内的重复请求（客户端重试 / 连续轮次）payload 基本
+            // 不变，命中即跳过整个远程 RTT（含 block_in_place 等待）。key 用轻量哈希。
+            let key = payload_hash(model, system, messages, tools);
+            if let Some(tokens) = cached_remote_count(key) {
+                return tokens;
+            }
             // 尝试调用远程 API
             let result = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(call_remote_count_tokens(
-                    api_url, config, model, system, messages, tools,
+                    config, model, system, messages, tools,
                 ))
             });
 
             match result {
                 Ok(tokens) => {
                     tracing::debug!("远程 count_tokens API 返回: {}", tokens);
+                    store_remote_count(key, tokens);
                     return tokens;
                 }
                 Err(e) => {
@@ -137,16 +145,143 @@ pub(crate) fn count_all_tokens(
     count_all_tokens_local(system, messages, tools)
 }
 
+/// 远程 count_tokens 结果的短 TTL 缓存条目（60s 过期）。
+struct CachedCount {
+    expires_at: Instant,
+    tokens: u64,
+}
+
+/// 结果缓存上限：超过后先清过期条目，仍超则整表清空（缓存只是优化，丢命中不影响正确性）。
+const REMOTE_COUNT_CACHE_CAP: usize = 256;
+/// 结果缓存 TTL：token 估算允许秒级陈旧（同 payload 的 token 数几乎不变）。
+const REMOTE_COUNT_CACHE_TTL_SECS: u64 = 60;
+
+static REMOTE_COUNT_CACHE: OnceLock<
+    parking_lot::Mutex<std::collections::HashMap<u64, CachedCount>>,
+> = OnceLock::new();
+
+/// 命中未过期的远程结果则返回；顺带清理过期条目防止长期堆积。
+fn cached_remote_count(key: u64) -> Option<u64> {
+    let cache = REMOTE_COUNT_CACHE
+        .get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = cache.lock();
+    let now = Instant::now();
+    let hit = guard
+        .get(&key)
+        .filter(|c| c.expires_at > now)
+        .map(|c| c.tokens);
+    if hit.is_none() && guard.len() >= REMOTE_COUNT_CACHE_CAP {
+        guard.retain(|_, c| c.expires_at > now);
+        if guard.len() >= REMOTE_COUNT_CACHE_CAP {
+            guard.clear();
+        }
+    }
+    hit
+}
+
+/// 写入远程成功结果（带过期时间）。失败结果不缓存——下次仍会重试远程。
+fn store_remote_count(key: u64, tokens: u64) {
+    let cache = REMOTE_COUNT_CACHE
+        .get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = cache.lock();
+    let now = Instant::now();
+    if guard.len() >= REMOTE_COUNT_CACHE_CAP {
+        guard.retain(|_, c| c.expires_at > now);
+        if guard.len() >= REMOTE_COUNT_CACHE_CAP {
+            guard.clear();
+        }
+    }
+    guard.insert(
+        key,
+        CachedCount {
+            expires_at: now + Duration::from_secs(REMOTE_COUNT_CACHE_TTL_SECS),
+            tokens,
+        },
+    );
+}
+
+/// 对 (model + system + messages + tools) 算轻量哈希（SipHash-1-3，DefaultHasher）。
+///
+/// 只哈希文本特征（role / 文本 / 工具名 / 描述 / input_schema JSON + 消息块整体序列化），
+/// 遍历成本是 O(payload) 的纯内存操作（与本地估算同量级），远小于一次远程 RTT。
+/// ⚠️ 块整体序列化（2026-08-13 对抗审查 M1）：只 hash text 会丢 image/tool_use 维度，
+/// 同文本不同内容确定性撞 key（不是概率碰撞，是键构造缺维度）。
+fn payload_hash(
+    model: &str,
+    system: Option<&[SystemMessage]>,
+    messages: &[Message],
+    tools: Option<&[Tool]>,
+) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    model.hash(&mut h);
+    if let Some(sys) = system {
+        for m in sys {
+            m.text.hash(&mut h);
+        }
+    }
+    for msg in messages {
+        msg.role.hash(&mut h);
+        match &msg.content {
+            serde_json::Value::String(s) => s.hash(&mut h),
+            serde_json::Value::Array(arr) => {
+                for item in arr {
+                    // ⚠️ 2026-08-13 对抗审查 M1：必须把块**整体**纳入哈希——只 hash
+                    // `text` 会丢 image（无 text 字段）与 tool_use（input 正文）维度，
+                    // 同文本不同图/不同工具输入会撞同一缓存 key，返回错误 token 估算
+                    // （图片每张 ~1000+ tokens，apply_patch 的 patch 可达数千）。
+                    // 用序列化保证全维度（O(payload) 纯内存，远小于远程 RTT）。
+                    let serialized = serde_json::to_string(item).unwrap_or_default();
+                    serialized.hash(&mut h);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(ts) = tools {
+        for t in ts {
+            t.name.hash(&mut h);
+            t.description.hash(&mut h);
+            let schema = serde_json::to_string(&t.input_schema).unwrap_or_default();
+            schema.hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+/// 远程 count_tokens 的 reqwest client：进程级复用一份连接池。
+///
+/// 对齐透传层（`passthrough_client`）的 client 缓存范式——原实现每请求新建 client，
+/// 等于每请求重开 TCP + 重做 TLS 握手（1-2 RTT），并把 RTT 叠进 block_in_place 等待里。
+/// count_tokens 配置是进程级一次性初始化（`init_config`），client 与 (proxy, tls) 绑定
+/// 且永不变化，单例缓存足够。构建失败也缓存（配置级错误，重试无意义），调用方回退本地。
+static REMOTE_COUNT_CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+
+fn cached_remote_count_client() -> Result<&'static reqwest::Client, String> {
+    let cached = REMOTE_COUNT_CLIENT.get_or_init(|| {
+        let config = match get_config() {
+            Some(c) => c,
+            None => return Err("count_tokens 配置未初始化".to_string()),
+        };
+        build_client(config.proxy.as_ref(), 300, config.tls_backend).map_err(|e| e.to_string())
+    });
+    match cached {
+        Ok(c) => Ok(c),
+        Err(e) => Err(e.clone()),
+    }
+}
+
 /// 调用远程 count_tokens API
 async fn call_remote_count_tokens(
-    api_url: &str,
     config: &CountTokensConfig,
     model: &str,
     system: Option<&[SystemMessage]>,
     messages: &[Message],
     tools: Option<&[Tool]>,
 ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-    let client = build_client(config.proxy.as_ref(), 300, config.tls_backend)?;
+    let client = cached_remote_count_client()?;
+    let api_url = config.api_url.as_deref().ok_or("count_tokens API 未配置")?;
 
     // 构建请求体（远程 API 需要 owned 值，clone 仅发生在这条真正走网络的分支）
     let request = CountTokensRequest {

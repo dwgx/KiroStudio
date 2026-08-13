@@ -116,6 +116,34 @@ fn apply_upstream_response_headers(
     builder
 }
 
+/// 被动配额观测（sub2api 借鉴；**纯观测，不参与选号/调度**）。
+///
+/// 现状核查（2026-08-14）：P4 白名单已把配额头**透传给客户端**（让客户端能主动
+/// 限速），但网关自身从不读取它们 —— 上游的配额余量只进客户端、不落日志，运维侧
+/// 看不到「哪个号快被限流了」。这里在成功路径上把配额头摘出来落一条 debug 日志。
+///
+/// 刻意不升级 info：成功路径每请求都走，info 会刷爆日志；失败路径已有上游错误
+/// 原文日志（含 `Retry-After` 语义，见 `upstream_trace`）。
+///
+/// ⚠️ 范围声明：完整目标（写进凭据余额缓存、面板展示）需要 `admin::service` 的
+/// 余额缓存写入口，超出本模块边界；此处只做日志观测，先把数据留下来。
+fn observe_upstream_quota_headers(upstream_headers: &axum::http::HeaderMap, base_url: &str) {
+    let get = |n: &str| upstream_headers.get(n).and_then(|v| v.to_str().ok());
+    let limit = get("x-ratelimit-limit");
+    let remaining = get("x-ratelimit-remaining");
+    let reset = get("x-ratelimit-reset");
+    if limit.is_none() && remaining.is_none() && reset.is_none() {
+        return;
+    }
+    tracing::debug!(
+        base_url = %base_url,
+        limit = limit.unwrap_or("-"),
+        remaining = remaining.unwrap_or("-"),
+        reset = reset.unwrap_or("-"),
+        "[透传] 上游配额头（被动观测，仅记录不参与调度）"
+    );
+}
+
 /// 把一次 Anthropic 请求原样透传到自定义 API 上游,响应流式原样返回。
 ///
 /// - `cred`:命中的自定义 API 凭据(提供 base_url / api_key / 代理)。
@@ -457,6 +485,9 @@ pub async fn forward(
     // 成功路径同样透传 P4 白名单头（x-ratelimit-* 让客户端能主动限速）。
     // 同样必须在消费 upstream 之前克隆。
     let upstream_headers = upstream.headers().clone();
+    // 被动配额观测：成功响应里摘上游配额头落日志（纯观测，见该函数文档）。
+    // 放在消费 `upstream` 之前（与下方 P4 白名单克隆同一时机）。
+    observe_upstream_quota_headers(&upstream_headers, &base);
     // thinking 块过滤（含重编号、usage 扣减）仍只对 deepseek_normalize 凭据开启 ——
     // 它改协议结构，是「零转换透传」的刻意例外，不能推给所有 custom_api 号。
     let filter_thinking = ds_cfg.is_some();
