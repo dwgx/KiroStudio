@@ -5021,15 +5021,12 @@ impl MultiTokenManager {
     fn persist_credentials(&self) -> anyhow::Result<bool> {
         use anyhow::Context;
 
-        // 仅多凭据格式才回写
-        if !self.is_multiple_format {
-            // Single 格式 persist 是 no-op:若此时开着加密,磁盘凭据其实仍是明文——置健康标志 false,
-            // 让 UI 红条如实告警"开了加密但未生效"(review MEDIUM:否则标志停在 true 误报健康)。
-            if self.config().encrypt_credentials_at_rest {
-                crate::common::recovery_metrics::set_at_rest_healthy(false);
-            }
-            return Ok(false);
-        }
+        // ⚠️ 2026-08-13 修复：Single 格式不再 no-op —— 内存里加号后若磁盘仍是单对象
+        // 旧格式，persist 会静默跳过 ⇒ 重启即丢号（nbus 实测连丢两批：17:48/18:08/18:10
+        // 与 22:21 加的 custom_api 号全部随重启消失）。现在**总是写数组格式**：
+        // Single 加载的旧配置文件首次 persist 自动升级为数组（加载路径两种格式都认，
+        // 旧版二进制也认数组，向后兼容）。is_multiple_format 参数保留仅为向后兼容
+        // 调用点，不再参与持久化判定。
 
         let path = match &self.credentials_path {
             Some(p) => p,
@@ -5107,9 +5104,8 @@ impl MultiTokenManager {
     /// 仅多凭据格式才有持久化文件；单凭据格式下回收站为纯内存态。
     /// 文件不存在或解析失败时静默回退为空。
     fn load_trash(&self) {
-        if !self.is_multiple_format {
-            return;
-        }
+        // 2026-08-13：不再按格式跳过（旧版 Single 格式下回收站纯内存、重启即丢——
+        // 与凭据持久化同源修复，统一为总是读写文件）。
         let path = match self.trash_path() {
             Some(p) => p,
             None => return,
@@ -5154,11 +5150,7 @@ impl MultiTokenManager {
     fn persist_trash(&self) -> anyhow::Result<bool> {
         use anyhow::Context;
 
-        // 仅多凭据格式才回写（单凭据格式下回收站仅内存态）
-        if !self.is_multiple_format {
-            return Ok(false);
-        }
-
+        // 2026-08-13：与 load_trash 同口径，总是回写（不再按格式跳过）。
         let path = match self.trash_path() {
             Some(p) => p,
             None => return Ok(false),
