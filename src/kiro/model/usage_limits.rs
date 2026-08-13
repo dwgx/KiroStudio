@@ -38,6 +38,15 @@ pub struct OverageConfiguration {
     /// 是否开启超额。字段缺失时为 None（视为未开启）。
     #[serde(default)]
     pub overage_enabled: Option<bool>,
+
+    /// 超额状态字符串（`"ENABLED"` / `"DISABLED"`）。
+    ///
+    /// 上游用**两种方式**表达同一件事，不同账号/时期返回其中之一：布尔
+    /// `overageEnabled` 或字符串 `overageStatus`。只认布尔会把「只给了
+    /// overageStatus=ENABLED」的号判为未开超额 → cap 不计入 → 额度显示偏低。
+    /// 摘自 ZyphrZero/kiro.rs 的同名字段。
+    #[serde(default)]
+    pub overage_status: Option<String>,
 }
 
 /// 订阅信息
@@ -62,9 +71,14 @@ pub struct UsageBreakdown {
     #[serde(default)]
     pub current_usage_with_precision: f64,
 
-    /// 奖励额度列表
+    /// 奖励额度列表（上游**可能显式返回 null**，不只是缺字段）。
+    ///
+    /// ⚠️ 必须用 `Option<Vec<_>>` 而不是 `Vec<_>`：`#[serde(default)]` 只在**字段缺失**时
+    /// 生效，显式 `"bonuses": null` 会让整个 `UsageLimitsResponse` 反序列化失败 →
+    /// 余额查询整条失败 → 面板显示 0/回退，把「base + bonus」的真实额度吞掉。
+    /// 参照 Foxfishc/kiro.rs 的同名字段（它的注释就写着「可能为 null」）。
     #[serde(default)]
-    pub bonuses: Vec<Bonus>,
+    pub bonuses: Option<Vec<Bonus>>,
 
     /// 免费试用信息
     #[serde(default)]
@@ -106,11 +120,16 @@ pub struct Bonus {
 }
 
 impl Bonus {
-    /// 检查 bonus 是否处于激活状态
+    /// 检查 bonus 是否处于激活状态（**大小写不敏感**）。
+    ///
+    /// 改前用严格 `== "ACTIVE"`：上游若返回 `"Active"`/`"active"` 就判为未激活，
+    /// bonus 额度不计入 `usage_limit()` → 官方面板显示 15000（base+bonus）而我们只显
+    /// 10000。Foxfishc/kiro.rs 与 ZyphrZero/kiro.rs 两家都用 `eq_ignore_ascii_case`，
+    /// 这里对齐它们。
     pub fn is_active(&self) -> bool {
         self.status
             .as_deref()
-            .map(|s| s == "ACTIVE")
+            .map(|s| s.eq_ignore_ascii_case("ACTIVE"))
             .unwrap_or(false)
     }
 }
@@ -187,8 +206,8 @@ impl UsageLimitsResponse {
             }
         }
 
-        // 累加激活的 bonus 额度
-        for bonus in &breakdown.bonuses {
+        // 累加激活的 bonus 额度（bonuses 可能是 null → 视作空列表）
+        for bonus in breakdown.bonuses.iter().flatten() {
             if bonus.is_active() {
                 total += bonus.usage_limit;
             }
@@ -214,8 +233,8 @@ impl UsageLimitsResponse {
             }
         }
 
-        // 累加激活的 bonus 使用量
-        for bonus in &breakdown.bonuses {
+        // 累加激活的 bonus 使用量（bonuses 可能是 null → 视作空列表）
+        for bonus in breakdown.bonuses.iter().flatten() {
             if bonus.is_active() {
                 total += bonus.current_usage;
             }
@@ -226,11 +245,20 @@ impl UsageLimitsResponse {
 
     // ============ Overage（超额）感知 ============
 
-    /// 上游报告的 overage 开启状态（字段缺失时为 None）
+    /// 上游报告的 overage 开启状态（两个字段都缺时为 None）。
+    ///
+    /// 上游对同一事实有**两种表达**：布尔 `overageEnabled` 与字符串
+    /// `overageStatus`（`"ENABLED"`/`"DISABLED"`）。布尔优先，缺失时回落字符串
+    /// （大小写不敏感）——摘自 ZyphrZero/kiro.rs 的 `overage_enabled()`。
+    /// 只认布尔会把「只给 overageStatus」的号判为未开超额，cap 不计入 → 额度偏低。
     pub fn overage_enabled_reported(&self) -> Option<bool> {
-        self.overage_configuration
-            .as_ref()
-            .and_then(|cfg| cfg.overage_enabled)
+        let cfg = self.overage_configuration.as_ref()?;
+        if let Some(enabled) = cfg.overage_enabled {
+            return Some(enabled);
+        }
+        cfg.overage_status
+            .as_deref()
+            .map(|s| s.eq_ignore_ascii_case("ENABLED"))
     }
 
     /// overage 是否开启（字段缺失时按未开启处理）
@@ -282,7 +310,7 @@ mod tests {
             usage_breakdown_list: vec![UsageBreakdown {
                 current_usage: usage as i64,
                 current_usage_with_precision: usage,
-                bonuses: vec![],
+                bonuses: None,
                 free_trial_info: None,
                 next_date_reset: None,
                 usage_limit: limit as i64,
@@ -291,6 +319,7 @@ mod tests {
             }],
             overage_configuration: overage_enabled.map(|e| OverageConfiguration {
                 overage_enabled: Some(e),
+                overage_status: None,
             }),
         }
     }
@@ -314,6 +343,106 @@ mod tests {
         assert_eq!(resp.effective_usage_limit_for(true), 6000.0);
         // base 已耗尽但 overage 还剩 5000
         assert_eq!(resp.effective_remaining_for(true), 5000.0);
+    }
+
+    /// 🔴 `"bonuses": null` 必须能解析（改前 `Vec<Bonus>` 遇显式 null 直接反序列化失败，
+    /// 整条余额查询挂掉 → 面板显示 0/回退）。用真实 JSON 走 serde 而不是手构结构体，
+    /// 否则测不到反序列化这一层。
+    #[test]
+    fn bonuses_explicit_null_deserializes() {
+        let raw = r#"{
+            "usageBreakdownList": [{
+                "currentUsage": 100,
+                "currentUsageWithPrecision": 100.0,
+                "bonuses": null,
+                "usageLimit": 10000,
+                "usageLimitWithPrecision": 10000.0
+            }]
+        }"#;
+        let resp: UsageLimitsResponse =
+            serde_json::from_str(raw).expect("bonuses=null 必须能解析（改前会失败）");
+        assert_eq!(resp.usage_limit(), 10000.0);
+        assert_eq!(resp.current_usage(), 100.0);
+    }
+
+    /// 🔴 官方面板 15000 = base 10000 + 激活 bonus 5000。上游 bonus 状态大小写不定，
+    /// 改前严格 `== "ACTIVE"` 会把 `"Active"` 判为未激活 → 只显 10000。
+    #[test]
+    fn bonus_status_case_insensitive_counts_toward_limit() {
+        for status in ["ACTIVE", "Active", "active"] {
+            let raw = format!(
+                r#"{{
+                    "usageBreakdownList": [{{
+                        "currentUsage": 0,
+                        "currentUsageWithPrecision": 0.0,
+                        "bonuses": [{{"currentUsage": 0.0, "usageLimit": 5000.0, "status": "{status}"}}],
+                        "usageLimit": 10000,
+                        "usageLimitWithPrecision": 10000.0
+                    }}]
+                }}"#
+            );
+            let resp: UsageLimitsResponse = serde_json::from_str(&raw).expect("解析应成功");
+            assert_eq!(
+                resp.usage_limit(),
+                15000.0,
+                "status={status} 时 bonus 应计入总额度（base 10000 + bonus 5000）"
+            );
+        }
+        // 对照组：非 ACTIVE 的 bonus 不计入
+        let raw = r#"{
+            "usageBreakdownList": [{
+                "currentUsage": 0,
+                "currentUsageWithPrecision": 0.0,
+                "bonuses": [{"currentUsage": 0.0, "usageLimit": 5000.0, "status": "EXPIRED"}],
+                "usageLimit": 10000,
+                "usageLimitWithPrecision": 10000.0
+            }]
+        }"#;
+        let resp: UsageLimitsResponse = serde_json::from_str(raw).expect("解析应成功");
+        assert_eq!(resp.usage_limit(), 10000.0, "EXPIRED bonus 不得计入");
+    }
+
+    /// 🔴 上游只给字符串 `overageStatus=ENABLED`（不给布尔 overageEnabled）时也要
+    /// 判定为已开超额。改前只认布尔 → 判为未开 → cap 不计入 → 额度偏低。
+    #[test]
+    fn overage_status_string_recognized() {
+        let raw = r#"{
+            "usageBreakdownList": [{
+                "currentUsage": 10000,
+                "currentUsageWithPrecision": 10000.0,
+                "usageLimit": 10000,
+                "usageLimitWithPrecision": 10000.0,
+                "overageCap": 5000.0
+            }],
+            "overageConfiguration": {"overageStatus": "ENABLED"}
+        }"#;
+        let resp: UsageLimitsResponse = serde_json::from_str(raw).expect("解析应成功");
+        assert_eq!(
+            resp.overage_enabled_reported(),
+            Some(true),
+            "只给 overageStatus=ENABLED 也应判为已开启（改前返回 None）"
+        );
+        assert!(resp.overage_enabled());
+        assert_eq!(resp.effective_usage_limit_for(true), 15000.0);
+        assert_eq!(resp.effective_remaining_for(true), 5000.0);
+    }
+
+    /// 布尔优先于字符串：两者冲突时以 `overageEnabled` 为准。
+    #[test]
+    fn overage_bool_takes_precedence_over_status_string() {
+        let raw = r#"{
+            "usageBreakdownList": [{"usageLimit": 1000, "usageLimitWithPrecision": 1000.0}],
+            "overageConfiguration": {"overageEnabled": false, "overageStatus": "ENABLED"}
+        }"#;
+        let resp: UsageLimitsResponse = serde_json::from_str(raw).expect("解析应成功");
+        assert_eq!(resp.overage_enabled_reported(), Some(false));
+        // DISABLED 字符串同样被识别
+        let raw2 = r#"{
+            "usageBreakdownList": [{"usageLimit": 1000, "usageLimitWithPrecision": 1000.0}],
+            "overageConfiguration": {"overageStatus": "DISABLED"}
+        }"#;
+        let resp2: UsageLimitsResponse = serde_json::from_str(raw2).expect("解析应成功");
+        assert_eq!(resp2.overage_enabled_reported(), Some(false));
     }
 
     #[test]

@@ -11,6 +11,9 @@ use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
     HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
 };
+use crate::kiro::model::requests::kiro::{
+    AdditionalModelRequestFields, KiroOutputConfig,
+};
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
@@ -555,6 +558,27 @@ fn strip_env_noise_enabled() -> bool {
     STRIP_ENV_NOISE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Kiro 原生 effort 开关镜像（`config.native_thinking_effort_enabled`，**默认 false**）。
+///
+/// 开启后，白名单模型 + thinking 启用时，请求改用顶层
+/// `additionalModelRequestFields.output_config.effort` 触发上游原生 reasoning
+/// （实测只有它能触发 `reasoningContentEvent`，XML 标签既不触发还污染历史上下文），
+/// 并抑制 `<thinking_mode>` 标签注入；关闭（默认）时行为逐字节不变。
+///
+/// [`build_history`] / [`convert_request`] 是纯转换拿不到 config，沿用 [`STRIP_ENV_NOISE`]
+/// 同款进程级原子镜像：main 启动按配置写入、admin 改开关立即改写、转换热路径读镜像。
+static NATIVE_THINKING_EFFORT_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 设置 native effort 开关（main 启动接线 / admin 热更调用，立即生效，下个请求即读到新值）。
+pub fn set_native_thinking_effort_enabled(enabled: bool) {
+    NATIVE_THINKING_EFFORT_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn native_thinking_effort_enabled() -> bool {
+    NATIVE_THINKING_EFFORT_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// 工具顶层 description 的字符上限镜像（`config.tool_description_max_chars`，TIER3 热更）。
 ///
 /// [`convert_tools`] 是纯转换、拿不到 config，沿用 [`STRIP_ENV_NOISE`] 同款进程级原子镜像：
@@ -740,6 +764,18 @@ pub struct ConversionResult {
     /// 文本化 invoke 重组的"工具名硬护栏"用它：解析出的工具名必须在此集合里才允许捞回,
     /// 否则当普通文本吐出——宁可漏捞不可把正文里讨论的假命令误执行。
     pub known_tool_names: std::collections::HashSet<String>,
+    /// 每个工具的**必需参数名**（`input_schema.required`），供流式层做 **Bug C** 校验：
+    /// `tool_use` 参数 JSON 合法但缺必需字段（如 `Bash` 缺 `command`）。
+    ///
+    /// key 与 [`Self::known_tool_names`] 同口径（发给模型的名字，含缩短后的短名）。
+    /// 无必需参数的工具不入表；空表 = 不校验。
+    pub tool_required_fields: HashMap<String, Vec<String>>,
+    /// Kiro 原生 effort 请求（`additionalModelRequestFields.output_config.effort`）。
+    ///
+    /// 仅当 `native_thinking_effort_enabled` 开启 **且** 模型在白名单 **且** thinking
+    /// 启用时 Some；否则 None。开关默认关 ⇒ 恒 None，请求字节与旧版完全一致。
+    /// 与 [`build_history`] 的 XML 抑制共用同一判定函数，保证「不发字段就不剥标签」。
+    pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
 }
 
 /// 转换错误
@@ -747,7 +783,20 @@ pub struct ConversionResult {
 pub enum ConversionError {
     UnsupportedModel(String),
     EmptyMessages,
-    /// Claude Code 工具参数无法映射到 Kiro 上游（如 `Read.pages` 无对应 Kiro 参数）。
+    /// Claude Code 工具参数无法映射到 Kiro 上游。
+    ///
+    /// ⚠️ **2026-08-10 起全仓无产出点**（编译器会报 `never constructed`）。
+    /// 曾经唯一的产出点是 `Read.pages`，现已改为**降级处理**
+    /// （整读 + 把页范围意图写进 `explanation`，见 `map_tool_input_to_kiro` 的 `Read` 分支）
+    /// —— 因为用一个可选的范围提示去否决整轮请求，代价（对话中断）远大于收益。
+    ///
+    /// **刻意保留而不删除**，两个理由：
+    /// 1. 它有两处渲染分支（`handlers.rs:1875` 与 `:3119` → 400 `invalid_request_error`），
+    ///    删变体会连带删掉那条对外契约；
+    /// 2. 「客户端工具参数在 Kiro 侧确实无法表达」是**真实存在**的一类情形，
+    ///    未来新增工具映射时很可能需要它。此时该判断的是「能否降级」而非直接沿用本变体
+    ///    —— 只有当丢弃该参数会让工具**执行出错**（而非仅结果不精确）时才该用它。
+    #[allow(dead_code)]
     ///
     /// 由 [`map_tool_input_to_kiro`] 返回，convert_request 侧把它转成客户端可读的 400，
     /// 而不是把无效参数透传给上游（那会得到更含糊的上游 400）。
@@ -1062,6 +1111,34 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         .map(|t| t.tool_specification.name.clone())
         .collect();
 
+    // 每个工具的**必需参数名**（Bug C 校验用）。与 `known_tool_names` 同处提取、
+    // 同口径（key 是**发给模型的名字**，含 `map_tool_name` 缩短后的短名），
+    // 这样流式层校验时不必再做名字还原。
+    //
+    // Bug C = `tool_use` 参数 **JSON 完全合法但缺必需字段**（如 `Bash` 只给了
+    // `description` 没给 `command`）。它既不是 Bug A（JSON 语法坏，`tool_repair_json` 能修）
+    // 也不是 Bug B（连 tool_use 块都没吐，网关碰不到），此前落在两者之间的盲区：
+    // 客户端拿到合法 JSON 后按 schema 校验失败，报 `The required parameter 'X' is missing`。
+    //
+    // 只取 `required` 的**名字列表**，不做完整 JSON Schema 校验 —— 后者是过度设计，
+    // 且类型不匹配的容错空间远大于"字段整个缺失"。
+    // 无 `required` / 非数组 / 空数组的工具不入表（那类工具没有必需参数，无从校验）。
+    let tool_required_fields: HashMap<String, Vec<String>> = tools
+        .iter()
+        .filter_map(|t| {
+            let req = t.tool_specification.input_schema.json.get("required")?;
+            let names: Vec<String> = req
+                .as_array()?
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+            if names.is_empty() {
+                return None;
+            }
+            Some((t.tool_specification.name.clone(), names))
+        })
+        .collect();
+
     // 11. 构建 UserInputMessageContext
     let mut context = UserInputMessageContext::new();
     if !tools.is_empty() {
@@ -1097,10 +1174,18 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         tracing::info!("工具名称映射: {} 个超长名称已缩短", tool_name_map.len());
     }
 
+    // 14. native effort：开关开 + 白名单模型 + thinking 启用时，把 effort 装进请求级
+    // `additionalModelRequestFields.output_config.effort`（Kiro 原生 reasoning 通道）。
+    // 与 build_history 里的 XML 抑制共用同一判定（build_additional_model_request_fields
+    // 见 generate_thinking_prefix 上方的说明），两者不会分叉。
+    let additional_model_request_fields = build_additional_model_request_fields(req, &model_id);
+
     Ok(ConversionResult {
         conversation_state,
         tool_name_map,
         known_tool_names,
+        tool_required_fields,
+        additional_model_request_fields,
     })
 }
 
@@ -1642,12 +1727,44 @@ fn map_tool_input_to_kiro(
             maybe_insert(&mut out, "timeout", take_first(&obj, &["timeout"]));
         }
         ("Read", "read_file") => {
-            // Kiro read_file 没有 Claude Code Read.pages 的等价参数：直接报错而非透传无效参数。
-            if obj.contains_key("pages") && !obj.get("pages").is_some_and(|v| v.is_null()) {
-                return Err(ConversionError::UnsupportedToolMapping {
-                    tool_name: client_name.to_string(),
-                    reason: "Claude Code Read.pages has no Kiro read_file equivalent".to_string(),
-                });
+            // 🔴 `Read.pages`（读 PDF 页范围）在 Kiro `read_file` 侧无等价参数。
+            //
+            // 改前：直接 `return Err(UnsupportedToolMapping)` ⇒ `handlers.rs:1875` 把它渲染成
+            // **400 `工具参数无法映射: Read — ...`** 并终结整个请求（无重试、无降级）
+            // ⇒ 客户端（Claude Code）看到硬错误，**整轮对话失败**。
+            //
+            // 为什么这个处置过重：`pages` 只是「读哪几页」的**范围提示**，丢掉它的后果是
+            // 「读了整个文件」——信息更多而非更少，模型完全能自己在结果里找目标页。
+            // 拿它去否决整轮请求，代价（对话中断）远大于收益（避免一次范围不精确的读取）。
+            // 本仓既有原则也是这个方向：`toolTruncationRecovery` 宁可整轮重试也不下发半截参数，
+            // 但那是因为半截参数会让**工具执行出错**；这里丢掉可选提示不会出错。
+            //
+            // 现在：把 `pages` 的意图折进 explanation，折不了就**忽略并继续**。
+            // ⚠️ 这里只**记下** hint，真正写入放在下面 `maybe_insert(explanation)` **之后**
+            // —— 那个 helper 无条件覆盖，先写会被原始 explanation 冲掉。
+            let mut pages_hint: Option<String> = None;
+            if let Some(pages) = obj.get("pages").filter(|v| !v.is_null()) {
+                // Claude Code 的 pages 形如 "1-5" / "3" / [1,2,3]（视客户端版本）。
+                // Kiro 只有 start_line/end_line（行号语义）。两者量纲不同（页 vs 行），
+                // 无法精确换算 ⇒ 只在**单页**且能解析出数字时给一个保守提示，其余一律忽略。
+                // 不猜「每页多少行」——猜错会截掉用户要的内容，比不截更糟。
+                let hint = match pages {
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    serde_json::Value::Number(n) => Some(n.to_string()),
+                    serde_json::Value::Array(a) => Some(
+                        a.iter()
+                            .filter_map(|v| v.as_i64())
+                            .map(|n| n.to_string())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    ),
+                    _ => None,
+                };
+                pages_hint = hint.filter(|h| !h.is_empty());
+                tracing::debug!(
+                    tool = %client_name,
+                    "Read.pages 无 Kiro 等价参数，已降级为整读 + explanation 提示（不再 400 终结请求）"
+                );
             }
             maybe_insert(&mut out, "path", take_first(&obj, &["file_path", "path"]));
             let offset = obj.get("offset").and_then(optional_number);
@@ -1662,6 +1779,21 @@ fn map_tool_input_to_kiro(
             maybe_insert(&mut out, "explanation", take_first(&obj, &["explanation"]));
             out.entry("explanation".to_string())
                 .or_insert_with(|| default_explanation(client_name));
+            // pages 的意图在最后追加：此刻 explanation 已定稿（原值或默认值），
+            // 追加不会被覆盖。这是「降级但不丢意图」的落点。
+            if let Some(h) = pages_hint {
+                let prev = out
+                    .get("explanation")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                out.insert(
+                    "explanation".to_string(),
+                    serde_json::json!(format!(
+                        "{prev}（用户只关心第 {h} 页；Kiro read_file 无页范围参数，已整读，请自行定位）"
+                    )),
+                );
+            }
         }
         ("Glob", "file_search") => {
             maybe_insert(&mut out, "query", take_first(&obj, &["pattern", "query"]));
@@ -2016,18 +2148,38 @@ fn convert_tools(
 
     tools
         .iter()
-        // 剥离 web_search 类工具：纯 web_search 请求走独立 MCP 分支（见 handlers 前置
-        // 的 has_web_search_tool 判定），不会到这里；但"常规工具 + web_search 混合"
-        // 会走常规转换路径，若把 web_search 原样下发给 Kiro 会触发 400 Improperly
-        // formed request。这里双保险过滤：tool_type 以 "web_search" 开头、或 name 为
-        // "web_search" 的条目一律跳过，其余工具正常转换。
-        .filter(|t| {
-            let is_web_search = t
+        // 🔴 2026-08-09：web_search **不再整条剥离**，改为归一化成 Kiro 可接受的形态。
+        //
+        // 改前的问题：这里把 `type: web_search_*` / `name: web_search` 一律跳过，
+        // 于是"常规工具 + web_search"混合请求（Claude Code 的常态）下发给上游时
+        // **完全没有搜索工具** ⇒ 模型压根不知道自己能搜 ⇒ CC 的 WebSearch 静默失效。
+        //
+        // 为什么现在能不剥：本文件 `kiro_builtin_tool_schema` 早就定义了合法的
+        // `"web_search" => {query: string}` schema（converter.rs:1946），且参考实现
+        // ref-grey 用**同一份 schema**、不做剥离 ⇒ 上游认这个形态。改前是"定义了却
+        // 从不下发"的自相矛盾：原注释担心的 400 来自**原样透传 Anthropic 的
+        // `type: web_search_20250305` 服务端工具形态**（那个上游确实不认），
+        // 而不是来自这个归一化后的函数形态。
+        //
+        // 所以处置是：把 Anthropic 服务端工具形态**改写**成 Kiro 函数工具形态
+        // （下面 map 里 `t.name == "web_search"` 会命中 `kiro_builtin_tool_schema`），
+        // 保留搜索能力。纯 web_search 与显式触发仍走本地 MCP 快路径（handlers 前置判定），
+        // 不受影响。
+        .map(|t| {
+            // Anthropic 服务端工具形态（`type: web_search_*`、可能没有 name）→ 归一化成
+            // 函数工具 `name: web_search`，让下面的通用转换命中内置 schema。
+            let is_server_web_search = t
                 .tool_type
                 .as_deref()
-                .is_some_and(|ty| ty.starts_with("web_search"))
-                || t.name == "web_search";
-            !is_web_search
+                .is_some_and(|ty| ty.starts_with("web_search"));
+            if is_server_web_search && t.name != "web_search" {
+                let mut normalized = t.clone();
+                normalized.name = "web_search".to_string();
+                normalized.tool_type = None;
+                normalized
+            } else {
+                t.clone()
+            }
         })
         .map(|t| {
             let map_enabled = tool_compat_mapping_enabled();
@@ -2105,6 +2257,148 @@ fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
     None
 }
 
+/// —— native effort 路径 ——
+///
+/// 背景：本仓此前 Opus/Sonnet 的 extended thinking 只靠 `<thinking_mode>` XML 标签注入。
+/// 参考仓（GreyGunG/Kiro-RS-Tool @795b9ca，2026-06-07 对 Kiro CLI 2.6.0 + Opus 4.8/xHigh
+/// 的黑盒实测）结论：**只有请求级 `additionalModelRequestFields.output_config.effort`
+/// 能触发上游 `reasoningContentEvent`**；XML 标签既不触发，还会把 `thinking_mode` /
+/// `max_thinking_length` 塞进历史上下文（污染 + 烧 token）。本段把该机制移植过来。
+///
+/// 保守边界：白名单是参考仓**单次实测的硬编码推测值**，按本仓 `model_catalog` 校准——
+/// 只放 catalog 里存在、且参考仓实测过的 4 个 kiro_id；未实测的模型（opus-5 / sonnet-5 /
+/// 4.5 / 4.0 等）一律不进白名单，宁可回退 XML 注入。白名单与 catalog 的一致性由守卫测试
+/// `native_effort_whitelist_models_exist_in_catalog` 钉死。
+///
+/// 开关 `native_thinking_effort_enabled` 默认 false ⇒ 本路径整体不生效，请求字节与旧版
+/// 完全一致；开启后仅命中白名单模型 + thinking 启用时改写。
+const EFFORTS_WITH_XHIGH: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+const EFFORTS_WITHOUT_XHIGH: &[&str] = &["low", "medium", "high", "max"];
+
+/// 模型 → 白名单允许的 effort 档位表（key 是 `map_model` 映射后的 Kiro modelId）。
+///
+/// - `claude-opus-4.8` / `claude-opus-4.7`：实测认 `output_config` + 五档（含 xhigh）；
+/// - `claude-opus-4.6` / `claude-sonnet-4.6`：同一 schema 路径，但**无 xhigh** 档。
+fn native_reasoning_efforts(model_id: &str) -> Option<&'static [&'static str]> {
+    match model_id {
+        "claude-opus-4.8" | "claude-opus-4.7" => Some(EFFORTS_WITH_XHIGH),
+        "claude-opus-4.6" | "claude-sonnet-4.6" => Some(EFFORTS_WITHOUT_XHIGH),
+        _ => None,
+    }
+}
+
+/// 请求是否真的想要 reasoning（thinking 启用，或显式给了非空 effort）。
+fn requested_native_reasoning(req: &MessagesRequest) -> bool {
+    req.thinking.as_ref().is_some_and(|t| t.is_enabled())
+        || req
+            .output_config
+            .as_ref()
+            .is_some_and(|oc| !oc.effort.trim().is_empty())
+}
+
+/// budget_tokens → effort 档位（参考仓同款映射表）。
+fn effort_from_budget_tokens(tokens: i32) -> &'static str {
+    match tokens {
+        i32::MIN..=4_000 => "low",
+        4_001..=16_000 => "medium",
+        16_001..=64_000 => "high",
+        _ => "xhigh",
+    }
+}
+
+/// 归一化 effort：trim + 小写，只认 low/medium/high/xhigh/max，否则回退 "high"。
+fn normalize_thinking_effort(effort: &str) -> &'static str {
+    match effort.trim().to_ascii_lowercase().as_str() {
+        "low" => "low",
+        "medium" => "medium",
+        "high" => "high",
+        "xhigh" => "xhigh",
+        "max" => "max",
+        _ => "high",
+    }
+}
+
+/// 选档：显式 `output_config.effort` 优先（归一化后），否则 thinking 启用时按
+/// budget_tokens 映射，都没给默认 "high"。白名单不允许的档位 → 回退档位表最后一个
+/// （五档表最后是 "max"，四档表最后也是 "max"）。
+///
+/// ⚠️ 空 effort 视同「未给」：与 [`requested_native_reasoning`] 的判空口径一致
+/// （那边 `effort.trim().is_empty()` = 没要求），否则 enabled thinking + 大 budget
+/// 时客户端空 effort 会被归一化成 high，覆盖掉 budget 映射出的更高档。
+fn select_native_reasoning_effort(
+    req: &MessagesRequest,
+    efforts: &'static [&'static str],
+) -> &'static str {
+    let requested = req
+        .output_config
+        .as_ref()
+        .filter(|oc| !oc.effort.trim().is_empty())
+        .map(|oc| normalize_thinking_effort(&oc.effort))
+        .or_else(|| {
+            req.thinking.as_ref().map(|t| {
+                if t.thinking_type == "enabled" {
+                    effort_from_budget_tokens(t.budget_tokens)
+                } else {
+                    normalize_thinking_effort("")
+                }
+            })
+        })
+        .unwrap_or_else(|| normalize_thinking_effort(""));
+    if efforts.contains(&requested) {
+        requested
+    } else {
+        efforts.last().copied().unwrap_or("high")
+    }
+}
+
+/// native effort 总判定：开关 → thinking 未显式禁用 → 白名单 → 选档。
+///
+/// `build_additional_model_request_fields`（产出请求字段）与 build_history 的 XML 抑制
+/// **共用本函数**，同一请求上两处判定恒一致，不会出现「发了字段还塞标签」或
+/// 「剥了标签又没发字段」的分叉。
+fn native_thinking_effort(req: &MessagesRequest, model_id: &str) -> Option<&'static str> {
+    if !native_thinking_effort_enabled() {
+        return None;
+    }
+    if req
+        .thinking
+        .as_ref()
+        .is_some_and(|t| t.thinking_type == "disabled")
+    {
+        return None;
+    }
+    let efforts = native_reasoning_efforts(model_id)?;
+    if !requested_native_reasoning(req) {
+        return None;
+    }
+    Some(select_native_reasoning_effort(req, efforts))
+}
+
+/// 构建请求级 `additionalModelRequestFields`（native effort 通道）。
+fn build_additional_model_request_fields(
+    req: &MessagesRequest,
+    model_id: &str,
+) -> Option<AdditionalModelRequestFields> {
+    let effort = native_thinking_effort(req, model_id)?;
+    Some(AdditionalModelRequestFields {
+        output_config: Some(KiroOutputConfig {
+            effort: effort.to_string(),
+        }),
+    })
+}
+
+/// native 路径下抑制 XML 标签注入；否则原样走 [`generate_thinking_prefix`]。
+///
+/// 为什么必须抑制：实测塞 `<thinking_mode>` 标签既不触发上游 reasoningContentEvent，
+/// 还会把标签文字污染进历史上下文（参考仓 converter.rs 1451-1455 的实测结论）。
+/// 非 native 路径（开关关 / 非白名单）行为逐字节不变。
+fn generate_thinking_prefix_for_model(req: &MessagesRequest, model_id: &str) -> Option<String> {
+    if native_thinking_effort(req, model_id).is_some() {
+        return None;
+    }
+    generate_thinking_prefix(req)
+}
+
 /// 检查内容是否已包含thinking标签
 fn has_thinking_tags(content: &str) -> bool {
     content.contains("<thinking_mode>") || content.contains("<max_thinking_length>")
@@ -2127,7 +2421,11 @@ fn build_history(
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
-    let thinking_prefix = generate_thinking_prefix(req);
+    // native effort 路径（开关开 + 白名单 + thinking 启用，见
+    // build_additional_model_request_fields 上方的说明）下不注入 XML 标签：
+    // 实测只有 `additionalModelRequestFields.output_config.effort` 能触发上游
+    // reasoningContentEvent，塞标签既不触发还污染历史上下文。
+    let thinking_prefix = generate_thinking_prefix_for_model(req, model_id);
 
     // 1. 处理系统消息
     //
@@ -3285,7 +3583,9 @@ mod tests {
             cache_control: None,
         };
 
-        // web_search（带 type）+ 常规工具混合：web_search 应被剥离
+        // 🔴 2026-08-09 行为变更：web_search（带 type）在混合列表里**不再剥离**，
+        // 而是归一化成 Kiro 认的函数工具形态（`name: web_search` + 内置 schema）。
+        // 改前 assert 它被剥离 —— 那是导致 CC WebSearch 静默失效的行为。
         let tools = Some(vec![
             mk("web_search", Some("web_search_20250305")),
             mk("Read", None),
@@ -3298,11 +3598,14 @@ mod tests {
             .iter()
             .map(|t| t.tool_specification.name.as_str())
             .collect();
-        assert_eq!(names.len(), 2);
-        // Read/Write 是 Claude Code 内置工具，已映射为 Kiro 原生名（CC↔Kiro 映射层）。
+        // 现在应是 3 个：web_search（归一化后）+ read_file + fs_write。
+        assert_eq!(names.len(), 3, "web_search 不应被剥离，应归一化保留: {names:?}");
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"fs_write"));
-        assert!(!names.iter().any(|n| *n == "web_search"));
+        assert!(
+            names.contains(&"web_search"),
+            "web_search 必须归一化为 name=web_search 的函数工具（模型需要能看到搜索能力）"
+        );
     }
 
     #[test]
@@ -3362,6 +3665,67 @@ mod tests {
 
     /// 入站参数转换：Claude Code 参数 → Kiro 参数（file_path→path、content→text、
     /// old_string→oldStr、offset/limit→start_line/end_line）。
+    #[test]
+    /// 🔴 `Read.pages` 必须**降级而非报错**（2026-08-10 修，线上实测缺陷）。
+    ///
+    /// 改前：带 `pages` 的 Read 直接 `Err(UnsupportedToolMapping)` ⇒ handlers 渲染成
+    /// **400 `工具参数无法映射: Read — ...`** 并终结整个请求 ⇒ Claude Code 整轮对话失败。
+    ///
+    /// 为什么处置过重：`pages` 只是「读哪几页」的范围提示，丢掉它的后果是「整读」——
+    /// 信息更多而非更少，模型能自己定位。拿它否决整轮请求，代价远大于收益。
+    #[test]
+    fn read_pages_degrades_instead_of_failing() {
+        // ① 字符串页范围：不再 Err，且意图进了 explanation
+        let out = map_tool_input_to_kiro(
+            "Read",
+            serde_json::json!({"file_path": "/a.pdf", "pages": "1-5"}),
+        )
+        .expect("带 pages 的 Read 不该再报错（旧代码在此 panic）");
+        assert_eq!(out["path"], "/a.pdf", "路径必须照常映射");
+        let expl = out["explanation"].as_str().unwrap_or_default();
+        assert!(
+            expl.contains("1-5"),
+            "页范围意图必须落进 explanation，否则降级就是静默丢信息: {expl}"
+        );
+        assert!(
+            !out.as_object().unwrap().contains_key("pages"),
+            "pages 不该原样透传给 Kiro（它不认这个参数）"
+        );
+
+        // ② 数组形式（部分客户端版本）
+        let out = map_tool_input_to_kiro(
+            "Read",
+            serde_json::json!({"file_path": "/b.pdf", "pages": [2, 3]}),
+        )
+        .expect("数组 pages 同样不该报错");
+        assert!(out["explanation"].as_str().unwrap_or_default().contains("2,3"));
+
+        // ③ pages 为 null / 缺失：行为与改前完全一致（不追加任何提示）
+        for v in [
+            serde_json::json!({"file_path": "/c.txt", "pages": null}),
+            serde_json::json!({"file_path": "/c.txt"}),
+        ] {
+            let out = map_tool_input_to_kiro("Read", v).expect("无 pages 必须正常");
+            assert!(
+                !out["explanation"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("只关心第"),
+                "没有 pages 时不该凭空追加页提示"
+            );
+        }
+
+        // ④ 与既有 offset/limit 映射共存（pages 提示不能挤掉行范围）
+        let out = map_tool_input_to_kiro(
+            "Read",
+            serde_json::json!({"file_path": "/d.txt", "pages": "7", "offset": 10, "limit": 5}),
+        )
+        .expect("共存不该报错");
+        assert_eq!(out["start_line"], 10);
+        assert_eq!(out["end_line"], 14);
+        assert!(out["explanation"].as_str().unwrap_or_default().contains("7"));
+    }
+
     #[test]
     fn test_map_tool_input_to_kiro_converts_params() {
         // Write：file_path→path, content→text
@@ -4775,6 +5139,366 @@ mod tests {
             format_via_real_path("image/png", &wrapped).as_deref(),
             Some("jpeg"),
             "base64 带换行时仍应按 magic bytes 纠正"
+        );
+    }
+}
+
+/// native effort 路径测试。
+///
+/// 镜像开关是进程级全局，测试并行会相互污染。用一把静态锁串行所有触碰该开关的
+/// 用例，并在守卫里恢复原值（与 ENV_NOISE_TEST_LOCK 同款）。
+#[cfg(test)]
+mod native_effort_tests {
+    use super::*;
+    use super::super::types::Message as AnthropicMessage;
+
+    static NATIVE_EFFORT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct NativeEffortGuard {
+        prev: bool,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl NativeEffortGuard {
+        fn with(enabled: bool) -> Self {
+            let lock = NATIVE_EFFORT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let prev = native_thinking_effort_enabled();
+            set_native_thinking_effort_enabled(enabled);
+            NativeEffortGuard { prev, _lock: lock }
+        }
+    }
+    impl Drop for NativeEffortGuard {
+        fn drop(&mut self) {
+            set_native_thinking_effort_enabled(self.prev);
+        }
+    }
+
+    /// 构造只有一条 user 消息的最小请求，thinking/output_config 可控。
+    fn mk_req(
+        thinking: Option<super::super::types::Thinking>,
+        output_config: Option<super::super::types::OutputConfig>,
+    ) -> MessagesRequest {
+        MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hi"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking,
+            output_config,
+            metadata: None,
+        }
+    }
+
+    fn enabled_thinking(budget: i32) -> super::super::types::Thinking {
+        super::super::types::Thinking {
+            thinking_type: "enabled".to_string(),
+            budget_tokens: budget,
+        }
+    }
+
+    /// budget_tokens → effort 档位表边界（参考仓同款映射）。
+    #[test]
+    fn budget_tokens_map_to_effort_tiers() {
+        assert_eq!(effort_from_budget_tokens(0), "low");
+        assert_eq!(effort_from_budget_tokens(4_000), "low");
+        assert_eq!(effort_from_budget_tokens(4_001), "medium");
+        assert_eq!(effort_from_budget_tokens(16_000), "medium");
+        assert_eq!(effort_from_budget_tokens(16_001), "high");
+        assert_eq!(effort_from_budget_tokens(64_000), "high");
+        assert_eq!(effort_from_budget_tokens(64_001), "xhigh");
+        assert_eq!(effort_from_budget_tokens(i32::MAX), "xhigh");
+        assert_eq!(effort_from_budget_tokens(i32::MIN), "low");
+    }
+
+    /// 归一化：trim + 小写；未知值回退 "high"。
+    #[test]
+    fn normalize_effort_is_case_insensitive_with_fallback() {
+        assert_eq!(normalize_thinking_effort("low"), "low");
+        assert_eq!(normalize_thinking_effort("  HIGH "), "high");
+        assert_eq!(normalize_thinking_effort("XHigh"), "xhigh");
+        assert_eq!(normalize_thinking_effort("max"), "max");
+        assert_eq!(normalize_thinking_effort(""), "high");
+        assert_eq!(normalize_thinking_effort("ultra"), "high");
+        assert_eq!(normalize_thinking_effort("enabled"), "high");
+    }
+
+    /// 白名单：实测过的 4 个模型命中，其余一律不命中（保守）。
+    #[test]
+    fn whitelist_hits_verified_models_only() {
+        assert_eq!(native_reasoning_efforts("claude-opus-4.8"), Some(EFFORTS_WITH_XHIGH));
+        assert_eq!(native_reasoning_efforts("claude-opus-4.7"), Some(EFFORTS_WITH_XHIGH));
+        assert_eq!(
+            native_reasoning_efforts("claude-opus-4.6"),
+            Some(EFFORTS_WITHOUT_XHIGH)
+        );
+        assert_eq!(
+            native_reasoning_efforts("claude-sonnet-4.6"),
+            Some(EFFORTS_WITHOUT_XHIGH)
+        );
+        for miss in [
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-opus-4.5",
+            "claude-sonnet-4.5",
+            "claude-sonnet-4.0",
+            "claude-haiku-4.5",
+            "deepseek-v4-flash",
+            "claude-3-5-sonnet",
+            "",
+        ] {
+            assert_eq!(
+                native_reasoning_efforts(miss),
+                None,
+                "未实测的模型 {miss} 不得进白名单（保守回退 XML 注入）"
+            );
+        }
+    }
+
+    /// ⭐ 白名单与 model_catalog 校准守卫：白名单每个 kiro_id 必须真实存在于目录，
+    /// 目录里删模型 → 本测试红，提示同步白名单（防止硬编码白名单脱离 catalog 漂移）。
+    #[test]
+    fn native_effort_whitelist_models_exist_in_catalog() {
+        let catalog = super::super::model_catalog::CATALOG;
+        let ids: Vec<&str> = catalog.iter().map(|s| s.kiro_id).collect();
+        for model in ["claude-opus-4.8", "claude-opus-4.7", "claude-opus-4.6", "claude-sonnet-4.6"] {
+            assert!(
+                ids.contains(&model),
+                "白名单模型 {model} 不在 model_catalog.CATALOG 中 —— 白名单与目录已漂移"
+            );
+        }
+    }
+
+    /// ⭐ 镜像初值与 config 默认一致（都 false）：改任一处默认都必须同步另一处，
+    /// 否则绕过 main 播种的测试/旁路会读到与 config 矛盾的默认值。
+    ///
+    /// ⚠️ 必须持锁：同模块 12 个测试会把镜像临时置 true（NativeEffortGuard），
+    /// 本测试不持锁就会在那些窗口内随机读到 true 而误红。
+    #[test]
+    fn native_effort_mirror_matches_config_default() {
+        let _lock = NATIVE_EFFORT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            native_thinking_effort_enabled(),
+            crate::model::config::Config::default().native_thinking_effort_enabled,
+            "NATIVE_THINKING_EFFORT_ENABLED static 初值必须与 config 默认一致（默认关）"
+        );
+    }
+
+    /// 开关关闭（默认）：白名单模型 + thinking 启用也不走 native（行为逐字节不变）。
+    #[test]
+    fn toggle_off_keeps_legacy_behavior() {
+        let _g = NativeEffortGuard::with(false);
+        let req = mk_req(Some(enabled_thinking(32_000)), None);
+        assert_eq!(native_thinking_effort(&req, "claude-opus-4.8"), None);
+        assert_eq!(build_additional_model_request_fields(&req, "claude-opus-4.8"), None);
+        // XML 前缀照旧注入。
+        assert_eq!(
+            generate_thinking_prefix_for_model(&req, "claude-opus-4.8"),
+            generate_thinking_prefix(&req)
+        );
+    }
+
+    /// 开关开启 + 白名单 + thinking 启用：budget_tokens 映射选档。
+    #[test]
+    fn native_effort_selected_from_budget_tokens() {
+        let _g = NativeEffortGuard::with(true);
+        // 32000 → high
+        let req = mk_req(Some(enabled_thinking(32_000)), None);
+        assert_eq!(native_thinking_effort(&req, "claude-opus-4.8"), Some("high"));
+        // 1000 → low
+        let req = mk_req(Some(enabled_thinking(1_000)), None);
+        assert_eq!(native_thinking_effort(&req, "claude-opus-4.8"), Some("low"));
+        // 100000 → xhigh（5 档表允许）
+        let req = mk_req(Some(enabled_thinking(100_000)), None);
+        assert_eq!(native_thinking_effort(&req, "claude-opus-4.8"), Some("xhigh"));
+    }
+
+    /// 显式 output_config.effort 优先于 budget_tokens 映射。
+    #[test]
+    fn explicit_output_config_effort_wins() {
+        let _g = NativeEffortGuard::with(true);
+        // budget 会映射成 high，但显式 effort=low 优先。
+        let req = mk_req(
+            Some(enabled_thinking(32_000)),
+            Some(super::super::types::OutputConfig {
+                effort: "low".to_string(),
+            }),
+        );
+        assert_eq!(native_thinking_effort(&req, "claude-opus-4.8"), Some("low"));
+    }
+
+    /// adaptive 分支：无 output_config 时默认 high；显式 effort 优先；
+    /// 无 xhigh 档模型收到 xhigh 回退 max。
+    #[test]
+    fn adaptive_thinking_defaults_to_high() {
+        let _g = NativeEffortGuard::with(true);
+        let adaptive = super::super::types::Thinking {
+            thinking_type: "adaptive".to_string(),
+            budget_tokens: 0,
+        };
+        // 无显式 effort → high。
+        let req = mk_req(Some(adaptive.clone()), None);
+        assert_eq!(native_thinking_effort(&req, "claude-opus-4.8"), Some("high"));
+        // 显式 xhigh + 5 档表 → xhigh。
+        let req = mk_req(
+            Some(adaptive.clone()),
+            Some(super::super::types::OutputConfig {
+                effort: "xhigh".to_string(),
+            }),
+        );
+        assert_eq!(native_thinking_effort(&req, "claude-opus-4.8"), Some("xhigh"));
+        // 显式 xhigh + 无 xhigh 档的 sonnet-4.6 → 回退 max。
+        let req = mk_req(
+            Some(adaptive.clone()),
+            Some(super::super::types::OutputConfig {
+                effort: "xhigh".to_string(),
+            }),
+        );
+        assert_eq!(
+            native_thinking_effort(&req, "claude-sonnet-4.6"),
+            Some("max"),
+            "adaptive + xhigh 超出白名单档位应回退 max"
+        );
+    }
+
+    /// 空 effort 视同未给：enabled thinking + 大 budget 应按 budget 映射（xhigh），
+    /// 不被空串归一化出的 high 覆盖（与 requested_native_reasoning 判空口径一致）。
+    #[test]
+    fn empty_effort_falls_through_to_budget_mapping() {
+        let _g = NativeEffortGuard::with(true);
+        let req = mk_req(
+            Some(enabled_thinking(100_000)),
+            Some(super::super::types::OutputConfig {
+                effort: "".to_string(),
+            }),
+        );
+        assert_eq!(
+            native_thinking_effort(&req, "claude-opus-4.8"),
+            Some("xhigh"),
+            "空 effort 不应覆盖 budget 映射出的档位"
+        );
+    }
+
+    /// 白名单档位外 → 回退档位表最后一项（max）。
+    #[test]
+    fn effort_outside_whitelist_falls_back() {
+        let _g = NativeEffortGuard::with(true);
+        // sonnet-4.6 无 xhigh 档：budget 映射出 xhigh → 回退 max。
+        let req = mk_req(Some(enabled_thinking(100_000)), None);
+        assert_eq!(
+            native_thinking_effort(&req, "claude-sonnet-4.6"),
+            Some("max"),
+            "无 xhigh 档的模型收到 xhigh 请求应回退到允许表最后档"
+        );
+        // 未知 effort 字符串 → normalize 成 high（在表内，直接用）。
+        let req = mk_req(
+            Some(enabled_thinking(32_000)),
+            Some(super::super::types::OutputConfig {
+                effort: "ultra".to_string(),
+            }),
+        );
+        assert_eq!(native_thinking_effort(&req, "claude-sonnet-4.6"), Some("high"));
+    }
+
+    /// 开关开启但模型不在白名单 → 无 native 字段，XML 照旧（非 native 路径逐字节不变）。
+    #[test]
+    fn non_whitelist_model_keeps_xml_injection() {
+        let _g = NativeEffortGuard::with(true);
+        let req = mk_req(Some(enabled_thinking(32_000)), None);
+        assert_eq!(native_thinking_effort(&req, "claude-opus-5"), None);
+        assert_eq!(native_thinking_effort(&req, "claude-sonnet-4.5"), None);
+        assert_eq!(
+            generate_thinking_prefix_for_model(&req, "claude-opus-5"),
+            generate_thinking_prefix(&req),
+            "非白名单模型的 XML 注入必须保持原样"
+        );
+    }
+
+    /// thinking 显式 disabled → 不出 native 字段（即使给了 output_config.effort）。
+    #[test]
+    fn disabled_thinking_suppresses_native_path() {
+        let _g = NativeEffortGuard::with(true);
+        let req = mk_req(
+            Some(super::super::types::Thinking {
+                thinking_type: "disabled".to_string(),
+                budget_tokens: 0,
+            }),
+            Some(super::super::types::OutputConfig {
+                effort: "high".to_string(),
+            }),
+        );
+        assert_eq!(native_thinking_effort(&req, "claude-opus-4.8"), None);
+    }
+
+    /// 无 thinking 也无 output_config → 无 native 字段（也没有 XML，两端一致 None）。
+    #[test]
+    fn no_reasoning_request_yields_nothing() {
+        let _g = NativeEffortGuard::with(true);
+        let req = mk_req(None, None);
+        assert_eq!(native_thinking_effort(&req, "claude-opus-4.8"), None);
+        assert_eq!(build_additional_model_request_fields(&req, "claude-opus-4.8"), None);
+        assert_eq!(generate_thinking_prefix_for_model(&req, "claude-opus-4.8"), None);
+    }
+
+    /// 只给 output_config.effort（无 thinking 块）也走 native：实测的
+    /// `/effort xhigh` 最小形态就是 `{output_config:{effort:xhigh}}`。
+    #[test]
+    fn bare_output_config_effort_triggers_native() {
+        let _g = NativeEffortGuard::with(true);
+        let req = mk_req(
+            None,
+            Some(super::super::types::OutputConfig {
+                effort: "XHIGH".to_string(),
+            }),
+        );
+        let fields = build_additional_model_request_fields(&req, "claude-opus-4.8")
+            .expect("白名单 + 显式 effort 应产出 native 字段");
+        assert_eq!(
+            fields.output_config.expect("effort 字段应存在").effort,
+            "xhigh",
+            "显式 effort 应归一化后写入"
+        );
+    }
+
+    /// 端到端：convert_request 产出的字段能序列化进 KiroRequest 顶层 JSON（wire 形状）。
+    #[test]
+    fn convert_request_carries_native_fields_into_wire_json() {
+        let _g = NativeEffortGuard::with(true);
+        let req = mk_req(Some(enabled_thinking(100_000)), None);
+        let conversion = convert_request(&req).expect("转换应成功");
+        let fields = conversion
+            .additional_model_request_fields
+            .expect("白名单 + thinking 应产出 native 字段");
+        let kiro_request = crate::kiro::model::requests::kiro::KiroRequest {
+            conversation_state: conversion.conversation_state,
+            profile_arn: None,
+            additional_model_request_fields: Some(fields),
+        };
+        let v = serde_json::to_value(&kiro_request).unwrap();
+        assert_eq!(
+            v["additionalModelRequestFields"]["output_config"]["effort"],
+            "xhigh",
+            "wire 形状必须为顶层 additionalModelRequestFields.output_config.effort"
+        );
+    }
+
+    /// 开关关（默认）：同一请求零 native 字段（与旧版逐字节一致）。
+    #[test]
+    fn toggle_off_produces_no_native_fields_in_wire() {
+        let _g = NativeEffortGuard::with(false);
+        let req = mk_req(Some(enabled_thinking(100_000)), None);
+        let conversion = convert_request(&req).expect("转换应成功");
+        assert!(
+            conversion.additional_model_request_fields.is_none(),
+            "开关关时不得产出 native 字段"
         );
     }
 }

@@ -134,6 +134,107 @@ pub fn find_orphan_tests(file: &str, src: &str) -> Vec<OrphanTest> {
 mod tests {
     use super::*;
 
+    /// 🔴 全仓扫描：**函数内 `macro_rules!` 不得靠捕获外层局部变量**（2026-08-11 新增）。
+    ///
+    /// # 它守的是什么
+    ///
+    /// `macro_rules!` 的卫生性（hygiene）让宏体里的标识符在**定义处**语境解析，
+    /// 而不是展开处。所以「宏体直接引用外层局部变量」这种写法会静默解析不到那个绑定。
+    ///
+    /// 2026-08-11 实测踩到：`Config::apply_throttle_profile` 里的 `fill!` 宏体写
+    /// `if !explicit.contains($key)`，靠捕获外层 `explicit` ——
+    /// 结果**检查形同不存在**，导致它唯一要守的契约（不覆盖用户显式配置的字段）失效。
+    /// 而当时**全套测试是绿的**：守卫在、被守护的逻辑是空的。
+    /// 那个契约一旦失效，升级瞬间就会改写线上生产配置（那 7 个字段全部显式写过）。
+    ///
+    /// # 判据与边界
+    ///
+    /// 只查**函数体内**定义的宏（缩进 > 0）。文件级宏（顶格 `macro_rules!`）不受此限，
+    /// 它本来就没有"外层局部变量"可捕获。
+    ///
+    /// 判据是保守的：宏体内出现「非 `$` 开头的标识符 + `.` 方法调用」即报。
+    /// 误报好过漏报 —— 修法很简单（把变量当参数显式传进去），而漏掉的代价是
+    /// 一个看起来有守卫、实际没有的契约。
+    #[test]
+    fn no_function_local_macro_captures_outer_bindings() {
+        let mut offenders: Vec<String> = Vec::new();
+        let mut stack = vec![std::path::PathBuf::from("src")];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+                    continue;
+                }
+                let Ok(src) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let lines: Vec<&str> = src.lines().collect();
+                for (i, line) in lines.iter().enumerate() {
+                    // 函数体内的宏定义：有缩进 + macro_rules!
+                    let indent = line.len() - line.trim_start().len();
+                    if indent == 0 || !line.trim_start().starts_with("macro_rules!") {
+                        continue;
+                    }
+                    // 取宏体（到缩进回到定义层级的 `}` 为止，最多 60 行）
+                    let end = (i + 60).min(lines.len());
+                    let mut body = String::new();
+                    for l in &lines[i + 1..end] {
+                        let li = l.len() - l.trim_start().len();
+                        if l.trim() == "}" && li <= indent {
+                            break;
+                        }
+                        body.push_str(l);
+                        body.push('\n');
+                    }
+                    // 宏体里「裸标识符 + 方法调用」= 疑似捕获外层绑定。
+                    // `$x.method()` 是参数，安全；`self.x` 是字段，安全。
+                    for seg in body.split_whitespace() {
+                        let Some(dot) = seg.find('.') else { continue };
+                        let head = &seg[..dot];
+                        let head = head.trim_start_matches(['(', '!', '&']);
+                        if head.is_empty()
+                            || head.starts_with('$')
+                            || head == "self"
+                            || head.starts_with('"')
+                            || !head.chars().next().is_some_and(|c| c.is_lowercase())
+                        {
+                            continue;
+                        }
+                        // 后面必须是方法调用才算（排除 `1.0` 之类）
+                        if !seg[dot + 1..]
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_alphabetic())
+                        {
+                            continue;
+                        }
+                        offenders.push(format!(
+                            "{}:{} 宏体引用了疑似外层局部变量 `{head}` \
+                             —— macro_rules! 卫生性会让它在定义处语境解析、可能解析不到，\
+                             把它当参数显式传进宏（`($ex:expr, ...)`）",
+                            path.display(),
+                            i + 1
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "发现 {} 处函数内宏疑似靠捕获外层变量：\n{}",
+            offenders.len(),
+            offenders.join("\n")
+        );
+    }
+
     /// 🔴 全仓扫描：任何疑似孤立测试都让 CI 红。
     ///
     /// 用 `std::fs` 递归读 `src/`（`include_str!` 不支持通配符，而硬编码文件名单

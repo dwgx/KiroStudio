@@ -149,6 +149,42 @@ pub trait KiroEndpoint: Send + Sync {
         }
     }
 
+    /// 与 [`Self::bucket_id`] **等价**，但只需 `credentials` + `config` —— 不需要
+    /// token / machine_id。
+    ///
+    /// # 为什么要这个变体（它解决了 bucket_id 一直没接线的根因）
+    ///
+    /// `bucket_id` 落成死代码的唯一原因是「`select_endpoint` 处拿不到完整
+    /// `RequestContext`（缺 token/machine_id）」。但实测**全部 5 个端点的 `api_url`
+    /// 只依赖 `api_region`**（它由 profileArn 第 4 段 / 凭据 region / config 推出），
+    /// 没有任何一个读 `ctx.token` 或 `ctx.machine_id`：
+    /// - `cli`        → `q.{region}.amazonaws.com/`
+    /// - `cli-runtime`→ `runtime.{region}.kiro.dev/`
+    /// - `ide`        → `runtime.{region}.kiro.dev/generateAssistantResponse`
+    /// - `codewhisperer` / `amazonq` → `{host(ctx)}/`（host 同样只看 region）
+    ///
+    /// ⇒ 那个「拿不到 ctx」的障碍其实是假的：用占位 token/machine_id 构造一个临时
+    /// ctx 就能算出**与真实请求逐字节相同**的 bucket_id。本方法把这件事显式化，
+    /// 避免调用方各自伪造 ctx（那样一旦将来某端点真的在 api_url 里用了 token，
+    /// 伪造点会散落各处而无法收口）。
+    ///
+    /// ⚠️ **不变量**：任何端点实现都**不得**在 `api_url` 里使用 `ctx.token` 或
+    /// `ctx.machine_id`。若将来必须用，则本方法失效，必须改为在请求侧算桶键并
+    /// 把它透传到 select 侧。有守卫测试钉死这条（见本文件 tests 的
+    /// `bucket_key_must_not_depend_on_token_or_machine_id`）。
+    fn bucket_key(&self, credentials: &KiroCredentials, config: &Config) -> String {
+        // 占位值刻意用可识别的字符串而不是空串：一旦哪天真的被写进 URL，
+        // 线上日志里会直接出现 `PLACEHOLDER`，比空串更容易定位。
+        let ctx = RequestContext {
+            credentials,
+            token: "BUCKET_KEY_PLACEHOLDER_TOKEN",
+            machine_id: "BUCKET_KEY_PLACEHOLDER_MACHINE_ID",
+            config,
+            is_1m: false,
+        };
+        self.bucket_id(&ctx)
+    }
+
     /// 判断响应体是否表示"月度配额用尽"（禁用凭据并转移）
     fn is_monthly_request_limit(&self, body: &str) -> bool {
         default_is_monthly_request_limit(body)
@@ -496,6 +532,37 @@ pub fn default_is_image_mime_mismatch(body: &str) -> bool {
     body.contains("IMAGE_MIME_MISMATCH")
 }
 
+/// 请求体校验失败（`reason=REQUEST_BODY_INVALID` 或 message 含 `Invalid tool use format`）。
+///
+/// 2026-08-11 补：此前该错误码**零翻译**，落 `map_provider_error` 的「未识别兜底」
+/// （502 + 通用文案，原文只进日志）。它是**请求构造**问题（工具配对/role/字段合法性），
+/// 重试或换号无意义，应翻成 400 `invalid_request_error` 让客户端不重试、按排障修请求。
+///
+/// # 判据为什么同时认 reason 与 message 散文
+///
+/// 线上实测同一条 400 里两个信号并存（`{"message":"Invalid tool use format.",
+/// "reason":"REQUEST_BODY_INVALID"}`，见 passthrough.rs 注释里的实测样本）——认其一
+/// 漏其二；`Improperly formed request` 是同一校验的**第三种散文形态**（converter.rs /
+/// websearch.rs 实测：工具 schema 属性、工具名超限、web_search 直发都会触发，常带
+/// reason=REQUEST_BODY_INVALID），2026-08-11 对抗审查 M1 发现它此前混在凭据分类里被
+/// 说成「订阅失效」——排障方向全错。与 `default_is_image_mime_mismatch` 同理，
+/// **不认** `ValidationException`（该 `__type` 被多种校验共用，泛匹配会把处置不同的
+/// 错误混成一类）。
+///
+/// # ⚠️ 与 region 探测的边界（不要动探测侧）
+///
+/// `region_probe.rs` 历史上曾用不完整 body 打 `q.*` 服务根探测 region，两个区都回
+/// `400 REQUEST_BODY_INVALID`——那是探测的**预期响应**，不是用户错误。该探测现走
+/// `management.*` 端点 + 独立 client + 独立错误通道（不经过 `map_provider_error`），
+/// 与翻译体系**结构上隔离**，加本判据不会污染探测。但 `classify_probe_result` 的
+/// 400 → Inconclusive 兜底是探测自己的判据，与翻译无关，**不要**因为本判据认了这个码
+/// 就去改它（改坏它会让 region 自愈失效）。
+pub fn default_is_request_body_invalid(body: &str) -> bool {
+    body.contains("REQUEST_BODY_INVALID")
+        || body.contains("Invalid tool use format")
+        || body.contains("Improperly formed")
+}
+
 /// 默认的 MODEL_TEMPORARILY_UNAVAILABLE 判断逻辑。
 ///
 /// 503 且 body 含该信号时表示**模型容量**问题，非凭据问题。
@@ -780,6 +847,105 @@ mod registry_tests {
     fn should_reject_unknown_endpoint_name() {
         assert!(build("nope").is_none());
         assert!(build("").is_none());
+    }
+
+    /// ⭐ 不变量守卫：`api_url` 不得依赖 `token` / `machine_id`。
+    ///
+    /// `bucket_key` 用占位 token/machine_id 构造临时 ctx 来算桶键，前提正是「api_url
+    /// 只看 region」。若哪天某端点在 URL 里用了 token（例如放进 query），select 侧算出的
+    /// 桶键就与请求侧不同 —— **封禁写进去读不到**，`has_unthrottled_endpoint` 恒判"还有
+    /// 可用桶"，于是对着一个已被 429 的上游持续轰炸。那种失效不会有编译错误、也不会有
+    /// 直接的运行时报错，只表现为"换桶不生效"，极难定位。故用测试钉死。
+    #[test]
+    fn bucket_key_must_not_depend_on_token_or_machine_id() {
+        let cfg = Config::default();
+        let mut cred = KiroCredentials::default();
+        cred.kiro_api_key = Some("ksk_guard".to_string());
+        cred.auth_method = Some("api_key".to_string());
+
+        for name in ENDPOINT_NAMES {
+            let ep = build(name).expect("已知端点应可构造");
+            // 同一凭据 + 同一 config，但 token / machine_id 取两组完全不同的值。
+            let a = ep.bucket_id(&RequestContext {
+                credentials: &cred,
+                token: "TOKEN_A",
+                machine_id: "MACHINE_A",
+                config: &cfg,
+                is_1m: false,
+            });
+            let b = ep.bucket_id(&RequestContext {
+                credentials: &cred,
+                token: "TOKEN_B_totally_different",
+                machine_id: "MACHINE_B_totally_different",
+                config: &cfg,
+                is_1m: true,
+            });
+            assert_eq!(
+                a, b,
+                "端点 {name} 的 bucket_id 随 token/machine_id 变化 —— bucket_key 的前提被破坏，\
+                 select 侧与请求侧的桶键会分叉，导致 429 换桶静默失效"
+            );
+            // 且 bucket_key（占位 ctx）必须与真实 ctx 逐字节一致。
+            assert_eq!(
+                ep.bucket_key(&cred, &cfg),
+                a,
+                "端点 {name} 的 bucket_key 与 bucket_id 不一致"
+            );
+        }
+    }
+
+    /// 同构端点必须同桶：非 us-east-1 时 `codewhisperer` 的 host 回退成
+    /// `q.{region}.amazonaws.com`，与 `cli` 的 host + X-Amz-Target 全同 ⇒ 同一个上游桶。
+    ///
+    /// 这正是按端点**名字**分桶的错误所在：两者被记成两个桶，于是 cw 被封后换到 cli
+    /// 打回同一个 host 又 429，而 `has_unthrottled_endpoint` 误判"还有可用桶"。
+    #[test]
+    fn structurally_identical_endpoints_share_one_bucket() {
+        let mut cfg = Config::default();
+        cfg.region = "eu-central-1".to_string();
+        cfg.api_region = Some("eu-central-1".to_string());
+        let mut cred = KiroCredentials::default();
+        cred.kiro_api_key = Some("ksk_same_bucket".to_string());
+        cred.auth_method = Some("api_key".to_string());
+
+        let cli_ep = build(cli::CLI_ENDPOINT_NAME).unwrap();
+        let cw_ep = build(codewhisperer::CODEWHISPERER_ENDPOINT_NAME).unwrap();
+        assert_eq!(
+            cli_ep.bucket_key(&cred, &cfg),
+            cw_ep.bucket_key(&cred, &cfg),
+            "非 us-east-1 时 codewhisperer 回退 q.* ⇒ 必须与 cli 同桶"
+        );
+
+        // 而 us-east-1 时 codewhisperer 走独占 host ⇒ 必须分桶。
+        let mut cfg_use1 = Config::default();
+        cfg_use1.region = "us-east-1".to_string();
+        cfg_use1.api_region = Some("us-east-1".to_string());
+        assert_ne!(
+            cli_ep.bucket_key(&cred, &cfg_use1),
+            cw_ep.bucket_key(&cred, &cfg_use1),
+            "us-east-1 时 codewhisperer 走独占 host ⇒ 应与 cli 分桶"
+        );
+    }
+
+    /// 同名端点、不同 region ⇒ 必须是**不同**桶（region 维度天然在 host 里）。
+    /// 按名字分桶会把两个区合并，一个区被封连带把另一个区判死，白丢可用容量。
+    #[test]
+    fn same_endpoint_different_region_are_distinct_buckets() {
+        let mut cred = KiroCredentials::default();
+        cred.kiro_api_key = Some("ksk_region".to_string());
+        cred.auth_method = Some("api_key".to_string());
+        let ep = build(cli::CLI_ENDPOINT_NAME).unwrap();
+
+        let mut c1 = Config::default();
+        c1.api_region = Some("us-east-1".to_string());
+        let mut c2 = Config::default();
+        c2.api_region = Some("eu-central-1".to_string());
+
+        assert_ne!(
+            ep.bucket_key(&cred, &c1),
+            ep.bucket_key(&cred, &c2),
+            "同端点不同 region 是两个独立上游桶，不得合并"
+        );
     }
 
     /// 旁路（验活/探测）的端点解析必须与 provider 同口径：ksk_ 号拿到 CLI 实现。

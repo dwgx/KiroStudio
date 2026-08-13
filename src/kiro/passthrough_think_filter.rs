@@ -1,9 +1,21 @@
 //! passthrough 响应侧的 thinking 过滤（deepseek 归一化专用）。
 //!
 //! 设计约束：passthrough 的卖点是「字节流原样透传」、零协议转换（隔离铁律 3）。
-//! 本过滤器**只在 `deepseek_normalize == Some(true)` 时启用** —— 因为 deepseek 类中转站
-//! 在 thinking disabled 时仍可能吐 thinking 块，客户端（Claude Code）看到 thinking 会报
-//! "Tool result missing"。其余 custom_api 凭据的响应仍原样回流，一行不解析。
+//! 所以本模块的两层处理**门控不同**（2026-08-10 拆开）：
+//!
+//! - **thinking 块过滤**（`filter_thinking_blocks`）：滤掉 thinking/redacted_thinking 块、
+//!   重编号保留块 index、按滤掉字符扣减 usage。这**改协议结构**，只在
+//!   `deepseek_normalize == Some(true)` 时启用 —— 因为 deepseek 类中转站在 thinking
+//!   disabled 时仍可能吐 thinking 块，客户端（Claude Code）看到 thinking 会报
+//!   "Tool result missing"。其余凭据保持结构原样。
+//! - **DSML 标记剥离**：所有 custom_api 凭据**无条件**启用。DeepSeek 会把
+//!   `<｜DSML｜function_calls>` 这类工具协议标记当普通文本吐进 text_delta，泄漏给客户端
+//!   就是可见的乱码 —— 这与「客户端要不要 thinking」「凭据开没开归一化」都无关，
+//!   custom_api 的上游就是 DeepSeek 系，故不能门控。改前整个 filter 入口被
+//!   `ds_cfg.is_some()` 挡住，未开归一化的号标记原样泄漏（用户走代挂号拉 OpenZ 的实际故障）。
+//!
+//! 代价（明确接受）：SSE/JSON 响应现在对所有 custom_api 号都逐事件解析 + 重序列化，
+//! 不再是纯字节转发。JSON key 顺序可能重排（协议无关），解析失败一律 fail-open。
 //!
 //! 两条路径：
 //! - 流式（`text/event-stream`）：[`filter_sse_stream`] 逐事件解析 Anthropic SSE，
@@ -35,14 +47,20 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: std::error::Error + Send + Sync + 'static,
 {
-    filter_sse_stream_with(inner, true)
+    filter_sse_stream_with(inner, true, true)
 }
 
-/// [`filter_sse_stream`] 的可配置版本：`strip_inline_thinking` 控制是否剥 text 里的
-/// 内联 `<thinking>...</thinking>` 标签（deepseek 可能以文本形式吐 thinking）。
+/// [`filter_sse_stream`] 的可配置版本：
+/// - `strip_inline_thinking`：是否剥 text_delta 里的内联 `<thinking>...</thinking>` 标签
+///   （deepseek 可能以文本形式吐 thinking）；
+/// - `filter_thinking_blocks`：是否滤掉 `content_block_start/delta/stop` 的 thinking 块。
+///   **DSML 标记剥离不在此门控内，永远启用**（上游就是 DeepSeek，标记泄漏与客户端
+///   模型名/归一化配置无关）——`filter_thinking_blocks=false` 时只关 thinking 块过滤，
+///   保留完整字节流语义，仅剥 text 里的 DSML 标记。
 pub fn filter_sse_stream_with<S, E>(
     inner: S,
     strip_inline_thinking: bool,
+    filter_thinking_blocks: bool,
 ) -> impl Stream<Item = Result<Bytes, axum::Error>>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
@@ -50,18 +68,24 @@ where
 {
     SseThinkFilter {
         inner: Box::pin(inner),
-        state: SseFilterState::new(strip_inline_thinking),
+        state: SseFilterState::new(strip_inline_thinking, filter_thinking_blocks),
     }
 }
 
 /// 过滤非流式 JSON 响应里的 thinking content blocks（fail-open：解析失败原样返回）。
 pub fn filter_json_bytes(bytes: &[u8]) -> Bytes {
-    filter_json_bytes_with(bytes, true)
+    filter_json_bytes_with(bytes, true, true)
 }
 
-/// [`filter_json_bytes`] 的可配置版本：`strip_inline` 控制是否剥 text 块里的
-/// 内联 `<thinking>...</thinking>` 标签（与流式 [`filter_sse_stream_with`] 对齐）。
-pub fn filter_json_bytes_with(bytes: &[u8], strip_inline: bool) -> Bytes {
+/// [`filter_json_bytes`] 的可配置版本（与流式 [`filter_sse_stream_with`] 对齐）：
+/// - `strip_inline`：是否剥 text 块里的内联 `<thinking>...</thinking>` 标签；
+/// - `filter_thinking_blocks`：是否滤掉 `type == "thinking"/"redacted_thinking"` 的块。
+///   **DSML 标记剥离不在此门控内，永远启用**（理由同流式版本）。
+pub fn filter_json_bytes_with(
+    bytes: &[u8],
+    strip_inline: bool,
+    filter_thinking_blocks: bool,
+) -> Bytes {
     let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(bytes) else {
         return Bytes::copy_from_slice(bytes);
     };
@@ -70,12 +94,14 @@ pub fn filter_json_bytes_with(bytes: &[u8], strip_inline: bool) -> Bytes {
     };
     // ⚠️ 与流式路径的 `in_thinking` 判定一致：`redacted_thinking`（超预算的合法类型）
     // 也必须滤掉，否则非流式请求下客户端同样报 "Tool result missing"。
-    content.retain(|block| {
-        !matches!(
-            block.get("type").and_then(|t| t.as_str()),
-            Some("thinking") | Some("redacted_thinking")
-        )
-    });
+    if filter_thinking_blocks {
+        content.retain(|block| {
+            !matches!(
+                block.get("type").and_then(|t| t.as_str()),
+                Some("thinking") | Some("redacted_thinking")
+            )
+        });
+    }
     // 剥 text 块里的内联 `<thinking>...</thinking>` 标签（deepseek 可能以文本形式吐）。
     // ⚠️ 受 `strip_inline` 控制，与流式路径一致（配置 false 时不剥）。
     if strip_inline {
@@ -88,6 +114,25 @@ pub fn filter_json_bytes_with(bytes: &[u8], strip_inline: bool) -> Bytes {
                             s,
                             &mut in_inline_thinking,
                         ));
+                    }
+                }
+            }
+        }
+    }
+    // DSML 标记剥离（deepseek 把 `<｜DSML｜function_calls>` 工具协议标记当文本吐）。
+    // 非流式整块读取、无跨 chunk 切分问题，用独立局部变量一次性剥净即可。
+    // 与流式路径同语义：只剥本行内的标记（不吞换行后正文）、识别闭合标签、白名单守正文。
+    {
+        let mut dsml_pending = DsmlPending::default();
+        for block in content.iter_mut() {
+            if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                if let Some(text_val) = block.get_mut("text") {
+                    if let Some(s) = text_val.as_str() {
+                        let stripped = strip_dsml_passthrough(s, &mut dsml_pending);
+                        // 非流式无后续 chunk：残留的半截标记直接丢弃（补发会泄漏标记）。
+                        dsml_pending.buf.clear();
+                        dsml_pending.is_marker = false;
+                        *text_val = serde_json::Value::String(stripped);
                     }
                 }
             }
@@ -235,14 +280,23 @@ struct SseFilterState {
     next_index: usize,
     /// 是否剥 text_delta 里的内联 `<thinking>...</thinking>` 标签。
     strip_inline_thinking: bool,
+    /// 是否滤掉 thinking content block（start/delta/stop）并重编号保留块。
+    ///
+    /// `false` 时（非 deepseek_normalize 凭据）：thinking 块原样透传、**不重编号**
+    /// （index_map 不参与），只做 DSML 标记剥离 —— 保住「零协议转换」的透传语义。
+    filter_thinking_blocks: bool,
     /// 跨 chunk 的"正在内联 thinking 内"状态。
     in_inline_thinking: bool,
+    /// 跨 chunk 的 DSML 半截标记/孤立 `<` 待拼接尾巴（与 `strip_inline_thinking` 的
+    /// `in_inline_thinking` 同构）。DeepSeek 会把 `<｜DSML｜function_calls` 这类标记当文本吐，
+    /// 可能被上游分帧从中间切开 —— 留到下一 chunk 拼上再判定。
+    dsml_pending: DsmlPending,
     /// 滤掉的 thinking 文本累计**字符数**（估算 token = 字符数 / 4）。
     thinking_chars: u64,
 }
 
 impl SseFilterState {
-    fn new(strip_inline_thinking: bool) -> Self {
+    fn new(strip_inline_thinking: bool, filter_thinking_blocks: bool) -> Self {
         Self {
             buf: Vec::with_capacity(1024),
             pending: Vec::new(),
@@ -250,7 +304,9 @@ impl SseFilterState {
             index_map: HashMap::new(),
             next_index: 0,
             strip_inline_thinking,
+            filter_thinking_blocks,
             in_inline_thinking: false,
+            dsml_pending: DsmlPending::default(),
             thinking_chars: 0,
         }
     }
@@ -286,8 +342,34 @@ impl SseFilterState {
         }
     }
 
-    /// 上游结束：flush 未闭合尾部（fail-open 原样透传）。
+    /// 上游结束：flush 未闭合尾部（fail-open 原样透传）+ DSML 待拼接尾巴收尾。
     fn finish(&mut self) -> Bytes {
+        // DSML 尾巴收尾：确认标记残留丢弃；被 hold 的正文按 text_delta 补发（不吞字）。
+        // 挂到最后一个已保留 text 块的 index（`next_index - 1`；无则补发到 index 0）。
+        if !self.dsml_pending.is_empty() {
+            let leftover = self.dsml_pending.flush();
+            if !leftover.is_empty() {
+                let idx = self.next_index.saturating_sub(1);
+                let ev = Self::rewrite_event(
+                    "content_block_delta",
+                    &serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": idx,
+                        "delta": { "type": "text_delta", "text": leftover }
+                    }),
+                );
+                let mut tail = if self.buf.is_empty() {
+                    ev
+                } else {
+                    let mut b = std::mem::take(&mut self.buf);
+                    b.extend_from_slice(&ev);
+                    b
+                };
+                // 补全事件分隔符（rewrite_event 不含结尾空行，SSE 客户端依赖它分帧）。
+                tail.extend_from_slice(b"\n\n");
+                return Bytes::from(tail);
+            }
+        }
         if self.buf.is_empty() {
             return Bytes::new();
         }
@@ -331,6 +413,11 @@ impl SseFilterState {
         };
         let old_idx = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
         match event_type {
+            // thinking 块过滤关闭时（非 deepseek_normalize 凭据）：不滤 thinking、
+            // 不重编号，start/stop 一律原样透传 —— 只有 delta 会走下面的 DSML 剥离。
+            "content_block_start" | "content_block_stop" if !self.filter_thinking_blocks => {
+                Some(block.to_vec())
+            }
             "content_block_start" => {
                 // ⚠️ `redacted_thinking`（thinking 超预算时上游发的合法类型）同样要滤：
                 // 只认 `thinking` 会把它当保留块重编号透传，客户端同样报 "Tool result missing"。
@@ -363,6 +450,9 @@ impl SseFilterState {
                 // 以及偶发的 text_delta）一律不下发 —— 若只滤 thinking_delta，thinking 块内
                 // 混入的 text_delta 会因 index_map 无该旧 index 而带悬空旧 index 透传，
                 // 客户端收到"孤儿 delta"（start 已被丢）甚至与新重编号块同 index 混淆。
+                //
+                // thinking 块过滤关闭时 `in_thinking` 恒空（start 分支根本没记录），
+                // 故这里自然不丢任何 delta —— 只往下走 DSML 剥离。
                 let in_thinking = self.in_thinking.get(&old_idx).copied().unwrap_or(false);
                 if in_thinking {
                     // 累计滤掉的 thinking 文本字符（供 message_delta 扣减 usage.output_tokens）。
@@ -390,6 +480,27 @@ impl SseFilterState {
                                     {
                                         return None;
                                     }
+                                }
+                            }
+                        }
+                    }
+                }
+                // DSML 标记剥离：DeepSeek 把 `<｜DSML｜function_calls>` 等工具协议标记当文本吐。
+                // 透传层此前零处理 → 标记原样泄漏（用户走 custom_api 拉 OpenZ 时看到的裸标记）。
+                // 跨 chunk：半截标记/孤立 `<` 留 `dsml_pending` 等下轮拼接。
+                if let Some(delta) = v.get_mut("delta").and_then(|d| d.as_object_mut()) {
+                    if delta.get("type").and_then(|x| x.as_str()) == Some("text_delta") {
+                        if let Some(text_val) = delta.get_mut("text") {
+                            if let Some(s) = text_val.as_str() {
+                                let stripped = strip_dsml_passthrough(s, &mut self.dsml_pending);
+                                *text_val = serde_json::Value::String(stripped);
+                                // 剥光（整段是 DSML 标记）→ 丢弃该 delta。
+                                // 工具标记行剥离后客户端该看到的是后续真正 text_delta，
+                                // 这条空 delta 不下发是安全的（Anthropic 允许 text 块只有部分 delta）。
+                                if text_val.as_str().is_some_and(|t| t.is_empty())
+                                    && self.dsml_pending.is_empty()
+                                {
+                                    return None;
                                 }
                             }
                         }
@@ -446,7 +557,16 @@ impl SseFilterState {
                 o.insert("index".to_string(), serde_json::json!(new_idx));
                 Some(Self::rewrite_event(event_type, v))
             }
-            None => Some(block.to_vec()), // 未映射（理论不该发生），fail-open 原样
+            // 未映射（该 index 没收到过 content_block_start：上游分帧异常、start 丢失/乱序）。
+            // ⚠️ **不能** `block.to_vec()` 回退原始字节 —— 调用方已在 `v` 上剥掉内联
+            // thinking 与 DSML 标记，回退原始字节等于把这些剥离**静默丢弃**、标记原样泄漏。
+            // 只有 index 重编号需要映射，剥离结果与映射无关：保留改写后的 `v`，index 不动。
+            None => {
+                if v.as_object().is_none() {
+                    return Some(block.to_vec()); // 非 object 顶层：无可保留的改写，原样
+                }
+                Some(Self::rewrite_event(event_type, v))
+            }
         }
     }
 
@@ -454,6 +574,131 @@ impl SseFilterState {
     fn rewrite_event(event_type: &str, data: &serde_json::Value) -> Vec<u8> {
         format!("event: {event_type}\ndata: {data}").into_bytes()
     }
+}
+
+/// 透传层 DSML 标记剥离（跨 chunk 安全）。
+///
+/// 为什么需要：custom_api 透传路径（passthrough.rs）把上游字节流**原样回传**，不进主路径
+/// `StreamContext`。而 DeepSeek 上游会先把 `<｜DSML｜function_calls>` 这类工具协议标记当
+/// 普通文本吐进 text_delta（实测坐实，同主路径 `strip_dsml_markers` 的怪癖）。主路径剥离
+/// 够不到透传层，标记就原样泄漏给客户端 —— 用户经 kirostudio custom_api 拉 OpenZ 订阅时
+/// 看到的裸 `<｜DSML｜function_calls` 正是这条路径。
+///
+/// 语义（对齐主路径 `strip_dsml_markers` 的 2026-08-09 修复 + fuckopencode 12c 教训）：
+/// - 完整标记 `<｜DSML｜function_calls>` / `<｜tool▁calls▁begin｜>` 等（单行内 `>` 闭合）→ 整段丢弃；
+/// - 闭合标签 `</｜DSML｜parameter>` → 整段丢弃（此前 `</｜` 前缀不识别导致闭合标签泄漏）；
+/// - 半截标记（无 `>` 收尾）→ 只剥**本行内**的标记部分，换行及之后正文**绝不吞**
+///   （正文里任意 `>` 如 `a > b` / `=>` 不能触发跨行吞掉整段）；
+/// - 末尾孤立 `<`（可能是 `<｜` 被切开）→ hold 进 `dsml_pending` 等下轮拼接判定；
+/// - 非 DSML 关键字的 `<｜…>`（CJK 排版 / 正文引用）绝不误删 —— 白名单 `dsml/tool/function` 前缀。
+///
+/// 跨 chunk 状态由 `dsml_pending`（待拼接尾巴）携带，与 `strip_inline_thinking` 的
+/// `in_thinking` 同构。返回剥净后的文本（不含尾巴）。
+
+/// 透传层 DSML 跨 chunk 待拼接状态。`buf` 是尾巴文本，`is_marker` 标记 `buf` 是
+/// **已确认的 DSML 标记残留**（流结束 flush 时应丢弃）还是**被 hold 待判定的正文**
+/// （流结束 flush 时应补发）——缺失这个标志是 2026-08-10 对抗评审发现的根因之一
+/// （透传层此前只有文本没有判定，半截标记+同行正文被静默吞掉 / 真标记被超长放行泄漏）。
+#[derive(Default)]
+struct DsmlPending {
+    buf: String,
+    is_marker: bool,
+}
+
+impl DsmlPending {
+    fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    /// 流结束收尾：`is_marker` 尾巴（确认标记残留）丢弃；否则按正文补发。
+    fn flush(&mut self) -> String {
+        let was_marker = self.is_marker;
+        let leftover = std::mem::take(&mut self.buf);
+        self.is_marker = false;
+        if was_marker {
+            return String::new();
+        }
+        leftover
+    }
+}
+
+fn strip_dsml_passthrough(text: &str, dsml_pending: &mut DsmlPending) -> String {
+    // 快路径：无待处理尾巴且不含 `<`，原样返回。
+    if dsml_pending.is_empty() && !text.contains('<') {
+        return text.to_string();
+    }
+    let mut work = std::mem::take(&mut dsml_pending.buf);
+    dsml_pending.is_marker = false;
+    work.push_str(text);
+
+    let mut out = String::with_capacity(work.len());
+    let chars: Vec<char> = work.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        // 探测 DSML 标记起点：`<｜`（开）或 `</｜`（闭）。
+        let is_close_tag =
+            chars[i] == '<' && i + 2 < chars.len() && chars[i + 1] == '/' && chars[i + 2] == '\u{FF5C}';
+        if (chars[i] == '<' && i + 1 < chars.len() && chars[i + 1] == '\u{FF5C}') || is_close_tag {
+            let kw_start = if is_close_tag { i + 3 } else { i + 2 };
+            let rest: String = chars[kw_start..].iter().collect();
+            // 白名单：`<｜` 后必须是 dsml/tool/function 关键字才当标记，否则是正文。
+            let r = rest.trim_start().to_ascii_lowercase();
+            let looks_marker = r.starts_with("dsml") || r.starts_with("tool") || r.starts_with("function");
+            // 闭合查找限行：遇到 `>` 或 `\n` 停。跨行的正文绝不能因为正文里任意 `>` 被当标记吞掉。
+            let closed = chars[i..].iter().position(|&c| c == '>' || c == '\n');
+            if looks_marker {
+                if let Some(rel) = closed {
+                    let closed_by_gt = chars[i + rel] == '>';
+                    if closed_by_gt {
+                        i += rel + 1; // 完整标记（含 `>`）整段丢弃
+                    } else {
+                        // 半截标记 + 换行：剥本行内标记部分，换行本身也跳过（分隔符），正文保留。
+                        i += rel;
+                        if i < chars.len() && chars[i] == '\n' {
+                            i += 1;
+                        }
+                    }
+                    continue;
+                } else {
+                    // 已确认 DSML 关键字标记但无 `>` 闭合：标记噪音，丢弃本 chunk 从 `<｜` 起的
+                    // 余下全部，尾巴标为「确认标记残留」→ 流结束 flush 时丢弃而非补发。
+                    let held: String = chars[i..].iter().collect();
+                    if held.chars().count() > 48 {
+                        // 超长仍无 `>`：关键字命中大概率是误判（正文恰以 <｜tool… 开头且很长），
+                        // 放行为正文避免吞掉大段合法内容（误判从宽）。
+                        out.push_str(&held);
+                    } else {
+                        dsml_pending.buf = held;
+                        dsml_pending.is_marker = true;
+                    }
+                    return out;
+                }
+            }
+            // 非关键字：可能是(a)正文里合法 `<｜…>`→原样输出这个 `<`，继续扫；
+            // (b)关键字还没到齐（rest 短且未闭合）→ hold 等下轮确认。
+            let undecided = closed.is_none() && rest.chars().count() < 8;
+            if undecided {
+                let held: String = chars[i..].iter().collect();
+                if held.chars().count() <= 48 {
+                    dsml_pending.buf = held;
+                    return out;
+                }
+                // 超长：放行为正文
+            }
+            // 确定不是标记：原样输出 `<` 后继续扫（`</` 也原样输出，不误删正文里合法的 `</` 组合）。
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    // 边界：输出末尾孤立 `<`（可能是 `</` 或 `<｜` 被切开）→ hold 等下轮。
+    if out.ends_with('<') {
+        out.pop();
+        dsml_pending.buf.push('<');
+    }
+    out
 }
 
 /// 剥掉文本里的内联 `<thinking>...</thinking>` 标签（含内容），跨 chunk 状态由 `in_thinking`
@@ -1056,5 +1301,213 @@ mod tests {
     fn test_filter_json_bytes_fail_open_on_invalid() {
         let raw = Bytes::from_static(b"not json");
         assert_eq!(filter_json_bytes(&raw), raw);
+    }
+
+    // ===== 透传层 DSML 剥离回归(2026-08-09 实测坐实,此前透传层零处理)=====
+    //
+    // 用户走 custom_api 透传拉 OpenZ 订阅时,DeepSeek 把 `<｜DSML｜function_calls>` 标记当
+    // 普通文本吐进 text_delta。透传层此前只滤 thinking,标记原样泄漏。以下测试覆盖:
+    // 完整/半截/闭合/跨 chunk/跨行正文不吞/白名单守正文。
+
+    /// 流式:完整 DSML 标记从 text_delta 剥离。
+    #[tokio::test]
+    async fn test_filter_sse_stream_strips_dsml_full_marker() {
+        let input = format!(
+            "{}{}{}",
+            event(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#
+            ),
+            event(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"<｜DSML｜function_calls｜>后续"}}"#
+            ),
+            event(
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#
+            ),
+        );
+        let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(input))]);
+        let filtered = collect_filtered(filter_sse_stream(stream)).await;
+        assert!(filtered.contains("后续"), "标记剥掉,正文保留,实际: {filtered}");
+        assert!(!filtered.contains("DSML"), "标记不得泄漏");
+    }
+
+    /// 流式:半截标记 + 换行正文(含 `>`),绝不能跨行吞正文。
+    #[tokio::test]
+    async fn test_filter_sse_stream_strips_dsml_half_marker_no_swallow() {
+        let input = format!(
+            "{}{}",
+            event(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"<｜DSML｜function_calls\n阅读\n如果 a > b 就返回"}}"#
+            ),
+            event(
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#
+            ),
+        );
+        let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(input))]);
+        let filtered = collect_filtered(filter_sse_stream(stream)).await;
+        assert!(
+            filtered.contains("阅读") && filtered.contains("a > b"),
+            "换行后正文含 `>` 不能被吞,实际: {filtered}"
+        );
+        assert!(!filtered.contains("DSML"), "标记不得泄漏");
+    }
+
+    /// 流式:跨 chunk 切开的 DSML 标记(第一块 hold、第二块拼上剥净)。
+    #[tokio::test]
+    async fn test_filter_sse_stream_strips_dsml_cross_chunk() {
+        // 两个事件各自独立成 chunk:第一个 chunk 的 text_delta 只到 `<｜DSML｜func`(半截),
+        // 第二个 chunk 拼上 `tion_calls｜>之后`。dsml_pending 必须跨 chunk hold 尾巴。
+        let chunk1 = event(
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"<｜DSML｜func"}}"#,
+        );
+        let chunk2 = event(
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"tion_calls｜>之后"}}"#,
+        );
+        let stream = futures::stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from(chunk1)),
+            Ok::<Bytes, std::io::Error>(Bytes::from(chunk2)),
+        ]);
+        let filtered = collect_filtered(filter_sse_stream(stream)).await;
+        assert!(
+            filtered.contains("之后"),
+            "跨 chunk 标记剥净,后续文本保留,实际: {filtered}"
+        );
+        assert!(!filtered.contains("DSML") && !filtered.contains("func"), "标记不得泄漏");
+    }
+
+    /// 流式:闭合标签 `</｜DSML｜parameter>` 也被剥(此前只认 `<｜` 导致闭合标签泄漏)。
+    #[tokio::test]
+    async fn test_filter_sse_stream_strips_dsml_close_tag() {
+        let input = format!(
+            "{}{}",
+            event(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"echo hi</｜DSML｜parameter>\n回答"}}"#
+            ),
+            event(
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#
+            ),
+        );
+        let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(input))]);
+        let filtered = collect_filtered(filter_sse_stream(stream)).await;
+        assert!(
+            filtered.contains("echo hi") && filtered.contains("回答"),
+            "命令正文与后续保留,实际: {filtered}"
+        );
+        assert!(!filtered.contains("DSML") && !filtered.contains("parameter"), "闭合标签不得泄漏,实际: {filtered:?}");
+    }
+
+    /// 非流式:JSON text 块里的 DSML 标记被剥,正文保留。
+    #[test]
+    fn test_filter_json_bytes_strips_dsml() {
+        let json = r#"{"content":[{"type":"text","text":"<｜DSML｜function_calls\n已运行 2 命令\n结果 => 成功"}]}"#;
+        let filtered = filter_json_bytes(json.as_bytes());
+        let v: serde_json::Value = serde_json::from_slice(&filtered).unwrap();
+        let text = v["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text, "已运行 2 命令\n结果 => 成功", "标记剥净,正文保留");
+    }
+
+    /// 正常文本(含普通 < >)与全角 CJK 标记不被改写。
+    #[test]
+    fn test_filter_json_bytes_dsml_does_not_touch_normal() {
+        let normal = r#"{"content":[{"type":"text","text":"if a < b && c > d 正常代码"}]}"#;
+        let filtered = filter_json_bytes(normal.as_bytes());
+        let v: serde_json::Value = serde_json::from_slice(&filtered).unwrap();
+        assert_eq!(v["content"][0]["text"].as_str().unwrap(), "if a < b && c > d 正常代码");
+
+        let fullwidth = r#"{"content":[{"type":"text","text":"见 <｜注｜关于x｜> 说明"}]}"#;
+        let filtered = filter_json_bytes(fullwidth.as_bytes());
+        let v: serde_json::Value = serde_json::from_slice(&filtered).unwrap();
+        assert_eq!(v["content"][0]["text"].as_str().unwrap(), "见 <｜注｜关于x｜> 说明");
+    }
+
+    // ===== `filter_thinking_blocks = false`（未开 deepseek_normalize 的 custom_api 号）=====
+    //
+    // 这组坐实门控拆分的语义：DSML 标记剥离**无条件生效**，thinking 块过滤与 index
+    // 重编号**不生效**（保住零协议转换的透传语义）。改前入口整个被 `ds_cfg.is_some()`
+    // 门控，这些号的 DSML 标记原样泄漏给客户端。
+
+    /// 流式:门控关闭时 thinking 块原样透传(不滤、不重编号),但 DSML 标记仍被剥。
+    #[tokio::test]
+    async fn test_filter_sse_dsml_only_keeps_thinking_blocks() {
+        let input = format!(
+            "{}{}{}{}",
+            event(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#
+            ),
+            event(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"推理内容"}}"#
+            ),
+            event(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#
+            ),
+            event(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"<｜DSML｜function_calls｜>正文"}}"#
+            ),
+        );
+        let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(input))]);
+        let filtered = collect_filtered(filter_sse_stream_with(stream, false, false)).await;
+        assert!(
+            filtered.contains("thinking") && filtered.contains("推理内容"),
+            "门控关闭:thinking 块必须原样透传,实际: {filtered}"
+        );
+        assert!(filtered.contains("正文"), "正文保留,实际: {filtered}");
+        assert!(!filtered.contains("DSML"), "DSML 标记仍必须剥掉,实际: {filtered:?}");
+        // index 不重编号：原始 0/1 保持。
+        assert_eq!(extract_indices(&filtered), vec![0, 0, 1, 1], "门控关闭不得重编号");
+    }
+
+    /// 流式:门控开启时 thinking 块被滤 + 重编号(既有行为不回退)。
+    #[tokio::test]
+    async fn test_filter_sse_thinking_gate_on_still_filters_and_renumbers() {
+        let input = format!(
+            "{}{}",
+            event(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#
+            ),
+            event(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#
+            ),
+        );
+        let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(input))]);
+        let filtered = collect_filtered(filter_sse_stream_with(stream, false, true)).await;
+        assert!(!filtered.contains("thinking"), "门控开启:thinking 块被滤,实际: {filtered}");
+        assert_eq!(extract_indices(&filtered), vec![0], "保留块重编号到 0");
+    }
+
+    /// 非流式:门控关闭时 thinking 块保留,DSML 仍被剥。
+    #[test]
+    fn test_filter_json_dsml_only_keeps_thinking_blocks() {
+        let json = r#"{"content":[{"type":"thinking","thinking":"推理"},{"type":"text","text":"<｜DSML｜function_calls｜>正文"}]}"#;
+        let filtered = filter_json_bytes_with(json.as_bytes(), false, false);
+        let v: serde_json::Value = serde_json::from_slice(&filtered).unwrap();
+        let content = v["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2, "门控关闭:thinking 块不得被滤");
+        assert_eq!(content[0]["type"].as_str().unwrap(), "thinking");
+        assert_eq!(content[1]["text"].as_str().unwrap(), "正文", "DSML 标记仍被剥");
+    }
+
+    /// 非流式:门控开启时 thinking 块被滤(既有行为不回退)。
+    #[test]
+    fn test_filter_json_thinking_gate_on_still_filters() {
+        let json = r#"{"content":[{"type":"thinking","thinking":"推理"},{"type":"text","text":"正文"}]}"#;
+        let filtered = filter_json_bytes_with(json.as_bytes(), false, true);
+        let v: serde_json::Value = serde_json::from_slice(&filtered).unwrap();
+        let content = v["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1, "门控开启:thinking 块被滤");
+        assert_eq!(content[0]["type"].as_str().unwrap(), "text");
     }
 }

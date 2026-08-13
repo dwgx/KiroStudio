@@ -35,6 +35,32 @@ pub struct KiroRequest {
     /// Profile ARN（可选）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_arn: Option<String>,
+    /// Kiro 上游附加模型请求字段（AWS Q 的 `additionalModelRequestFields`）。
+    ///
+    /// native extended thinking 走这里：`{"output_config":{"effort":"xhigh"}}` 是
+    /// 实测能触发上游 `reasoningContentEvent` 的最小形态（见 converter.rs 的
+    /// `build_additional_model_request_fields` 说明）。None 时整键不出现在线上。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
+}
+
+/// 顶层附加模型请求字段容器（`additionalModelRequestFields`）。
+///
+/// ⚠️ 线上格式：外层 `additionalModelRequestFields` 是 camelCase（随
+/// [`KiroRequest`] 的 `rename_all`），**内层 `output_config` 保持 snake_case**，
+/// 与真实 Kiro CLI 流量一致（见本文件测试 `test_additional_model_request_fields_wire_format`）。
+/// 所以本结构体**不能**继承 `rename_all = "camelCase"`。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdditionalModelRequestFields {
+    /// 输出配置（含推理 effort）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<KiroOutputConfig>,
+}
+
+/// effort 控制字段（上游认五档：`low / medium / high / xhigh / max`）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KiroOutputConfig {
+    pub effort: String,
 }
 #[cfg(test)]
 mod tests {
@@ -63,6 +89,77 @@ mod tests {
                 .user_input_message
                 .content,
             "Test message"
+        );
+        // 旧客户端 JSON 没有 additionalModelRequestFields 键 → 必须反序列化且为 None
+        // （防未来有人把 Option 字段改成非 Option 或移除 skip 导致旧请求 400）。
+        assert!(request.additional_model_request_fields.is_none());
+    }
+
+    #[test]
+    fn test_kiro_request_deserializes_additional_fields_when_present() {
+        let json = r#"{
+            "conversationState": {
+                "conversationId": "conv-1",
+                "currentMessage": {
+                    "userInputMessage": {
+                        "content": "hi",
+                        "modelId": "claude-opus-4-8",
+                        "userInputMessageContext": {}
+                    }
+                }
+            },
+            "additionalModelRequestFields": {
+                "output_config": {"effort": "xhigh"}
+            }
+        }"#;
+        let request: KiroRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            request
+                .additional_model_request_fields
+                .expect("带 additionalModelRequestFields 时应解析出来")
+                .output_config
+                .expect("output_config 应解析出来")
+                .effort,
+            "xhigh"
+        );
+    }
+
+    #[test]
+    fn test_additional_model_request_fields_wire_format() {
+        // 线上格式：外层键 camelCase（additionalModelRequestFields），内层键保持
+        // snake_case（output_config），与真实 Kiro CLI 流量一致。
+        let fields = AdditionalModelRequestFields {
+            output_config: Some(KiroOutputConfig {
+                effort: "max".to_string(),
+            }),
+        };
+        let v = serde_json::to_value(&fields).unwrap();
+        assert_eq!(v["output_config"]["effort"], "max");
+        assert!(
+            v.get("outputConfig").is_none(),
+            "内层键必须保持 snake_case output_config，实际: {v}"
+        );
+
+        // KiroRequest 顶层：camelCase 键 + None 时整键缺席。
+        let request = KiroRequest {
+            conversation_state: ConversationState::new("conv-789"),
+            profile_arn: None,
+            additional_model_request_fields: Some(fields),
+        };
+        let v = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            v["additionalModelRequestFields"]["output_config"]["effort"],
+            "max"
+        );
+        let without = KiroRequest {
+            conversation_state: ConversationState::new("conv-789"),
+            profile_arn: None,
+            additional_model_request_fields: None,
+        };
+        let v = serde_json::to_value(&without).unwrap();
+        assert!(
+            v.get("additionalModelRequestFields").is_none(),
+            "None 时 additionalModelRequestFields 整键不得出现"
         );
     }
 }

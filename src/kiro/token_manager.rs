@@ -268,7 +268,13 @@ async fn refresh_social_token(
 
     let status = response.status();
     if !status.is_success() {
-        let body_text = response.text().await.unwrap_or_default();
+        let body_text = {
+                // ⚠️ 2026-08-11 横切审查：错误体原文可能含账号/凭据类敏感串（上游
+                // auth 端点无法离线验证回显内容），进日志/错误消息前截断，与对话路径
+                // 「原文只进日志不回客户端」的纪律对齐（此处连日志也截断，双保险）。
+                let raw = response.text().await.unwrap_or_default();
+                raw.chars().take(200).collect::<String>()
+            };
 
         // 400 + invalid_grant → refreshToken 永久失效
         if status.as_u16() == 400 && body_text.contains("invalid_grant") {
@@ -935,7 +941,8 @@ pub(crate) use crate::kiro::regions::PROFILE_PROBE_REGIONS;
 /// 又不至于长到 dwgx 在别 region 开通后要等太久才自动纠正（届时手动刷新/切 region 也能立即生效）。
 const REPROBE_ALL_BAD_COOLDOWN: StdDuration = StdDuration::from_secs(6 * 3600);
 
-/// 全池自愈的**基础退避**。第 n 次连续自愈需等 `BASE × 2^(n-1)`，上限 `SELF_HEAL_MAX_BACKOFF`。
+/// 全池自愈的**基础退避**（值已配置化到 [`Config::self_heal_base_backoff_secs`]，默认 60s）。
+/// 第 n 次连续自愈需等 `BASE × 2^(n-1)`，上限 `self_heal_max_backoff_secs`（默认 900s）。
 ///
 /// 🔴 修复的缺陷（线上实测 + 用户直接反馈「已经 403 封号了，不知道为什么一直被自动开启」）：
 /// 自愈此前**没有任何退避** —— 只要选不出号且存在可自愈的禁用号就立刻复活全池。
@@ -946,14 +953,12 @@ const REPROBE_ALL_BAD_COOLDOWN: StdDuration = StdDuration::from_secs(6 * 3600);
 /// 线上观测到的 403 突发窗口约 10 分钟（当天两次，928 / 516 条），
 /// 而 68 秒一次的复活相当于在一个窗口内重试约 9 遍。
 ///
-/// 取 60s 起、翻倍、上限 900s（15 分钟）：让探测频率与真实窗口同量级 ——
+/// 默认值取 60s 起、翻倍、上限 900s（15 分钟）的依据：让探测频率与真实窗口同量级 ——
 /// 一个窗口内最多探两三次，而不是九次。任一号成功即清零 streak（见 `report_success`），
 /// 所以真的恢复了会立刻回到灵敏状态，不会因为退避过而错过恢复。
-const SELF_HEAL_BASE_BACKOFF: StdDuration = StdDuration::from_secs(60);
-/// 全池自愈退避上限（见 [`SELF_HEAL_BASE_BACKOFF`]）。
-const SELF_HEAL_MAX_BACKOFF: StdDuration = StdDuration::from_secs(900);
-/// 指数退避的指数上限，防 `2^n` 溢出（60 × 2^4 = 960 已超 MAX，故 4 足够）。
-const SELF_HEAL_MAX_SHIFT: u32 = 4;
+///
+/// 消费点每次在进 entries 锁**之前**读 config（热更下一个自愈周期即生效），
+/// 详见 `acquire_context` 的自愈分支。
 
 /// 多 region 探测 profileArn:优先号自己的 region,拿到就用(region 与 ARN 自洽);
 /// 该 region 无 profile 再依次探测候选 region 兜底。任一命中即返回,全部无则 Ok(None)。
@@ -1653,6 +1658,8 @@ pub struct CredentialEntrySnapshot {
     pub request_count: u64,
     /// 自定义 API 代挂:deepseek 协议归一化开关(None=false)
     pub deepseek_normalize: Option<bool>,
+    /// 是否豁免全局模型映射(None=false，即应用映射)
+    pub model_mapping_exempt: Option<bool>,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
     /// Token 过期时间
@@ -1831,9 +1838,9 @@ pub struct MultiTokenManager {
     load_balancing_mode: Mutex<String>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
-    /// 最近一次**全池自愈**的时刻（用于退避，见 `SELF_HEAL_BASE_BACKOFF`）
+    /// 最近一次**全池自愈**的时刻（用于退避，见 `Config::self_heal_base_backoff_secs`）
     last_self_heal_at: Mutex<Option<Instant>>,
-    /// 连续自愈次数（未被成功打断）。驱动指数退避，见 [`SELF_HEAL_BASE_BACKOFF`]。
+    /// 连续自愈次数（未被成功打断）。驱动指数退避，见 [`Config::self_heal_base_backoff_secs`]。
     ///
     /// 清零判据是「**最近一次自愈复活的号**成功了」，不是「任意号成功了」——
     /// 见 `self_heal_revived` 与 `report_success` 的说明。
@@ -1900,6 +1907,21 @@ pub struct MultiTokenManager {
     rpm_hard_gate_overload_wait: AtomicBool,
     /// 全池冷却时是否快速失败（立即返回 429+Retry-After 让客户端退避，而非网关内硬扛）。（原子镜像,reload 热更）
     all_cooling_fast_fail: AtomicBool,
+    /// 🔴 **连续「全池不可用」次数**（进程级，成功即清零）。2026-08-10 对抗评审后新增。
+    ///
+    /// # 它解决的问题
+    /// 纯 custom_api 代挂池下，`available` 恒 0（选号已排除代挂号）而 `any_healable` 恒 true
+    /// （只要有未禁用的代挂号就算"等一会儿会好"）⇒ 那条 `retry_after_secs=` 的 429
+    /// **永远可重试** ⇒ 上游**真·永久坏**时（余额耗尽返 402/403），客户端无限收
+    /// 429+Retry-After:10 却永远拿不到终态。
+    ///
+    /// # 为什么用计数器而不是把号标 `disabled`
+    /// 「透传失败绝不 auto-disable 号」是**有实测依据的刻意设计**
+    /// （见 `record_passthrough_result`：健康号 #216 曾被误禁 119 次）。
+    /// 所以这里只在**进程内**数「连续多少轮全池都不可用」，不碰任何持久化状态：
+    /// 超过阈值就给错误串补上 `pool_permanently_exhausted=1`，让吸收层停止吸收、
+    /// 客户端拿到终态；任何一次成功选号立刻清零，中转站恢复后自动回到可重试语义。
+    consecutive_pool_unavailable: std::sync::atomic::AtomicU32,
     /// 是否在凭据持续可疑活动风控(trigger_count 达阈值)时自动禁用它。（原子镜像,reload 热更）
     auto_disable_suspicious: AtomicBool,
     /// 均衡模式下是否叠加优先级分发（原子镜像,reload 热更）。
@@ -2422,6 +2444,8 @@ impl MultiTokenManager {
             rpm_reserve_slots: AtomicU32::new(rpm_reserve_slots),
             rpm_hard_gate_overload_wait: AtomicBool::new(rpm_hard_gate_overload_wait),
             all_cooling_fast_fail: AtomicBool::new(all_cooling_fast_fail),
+            // 连续全池不可用计数（进程级，不落盘；成功即清零）
+            consecutive_pool_unavailable: std::sync::atomic::AtomicU32::new(0),
             auto_disable_suspicious: AtomicBool::new(auto_disable_suspicious),
             priority_in_balanced: AtomicBool::new(priority_in_balanced),
             balance_weight_enabled: AtomicBool::new(balance_weight_enabled),
@@ -2819,6 +2843,15 @@ impl MultiTokenManager {
     /// 返回 `Some(池中是否仍有启用项)` 表示目标是代挂站，调用方必须立即返回，保持该项
     /// 当前的 `disabled` 状态不变；`None` 表示普通 Kiro 凭据，可继续原有自动禁用逻辑。
     /// 手动开关不走本保险，因此管理员仍可明确禁用/启用代挂站。
+    /// ⚠️ **返回的 bool 是「全池是否仍有启用项」，不是「Kiro 池是否仍有可选号」**
+    /// —— 2026-08-10 审计提出这是同 `:4455` 一类的口径缺陷，复核结论是**当前架构下不可达，
+    /// 故刻意不改**（改一个不可达分支只增加风险）。留此说明避免重复上报：
+    ///
+    /// 该 `Some(..)` 分支只在「调用方把 **custom_api 的 id** 喂进 `report_*` 系列」时命中，
+    /// 而透传路径走的是 `record_passthrough_result`（它有独立逻辑，**不调** `report_*`），
+    /// Kiro 路径又因两池隔离拿不到 custom_api 的 id ⇒ 本分支是**纯防御性**代码（见上方
+    /// 「统一保险」的措辞）。若将来真出现「Kiro 路径持有代挂号 id」的路径，
+    /// 那本身就是隔离铁律被破坏，届时要修的是那条路径，而不是这里的计数口径。
     fn preserve_custom_api_state(&self, id: u64) -> Option<bool> {
         let entries = self.entries.lock();
         let is_custom_api = entries
@@ -2898,13 +2931,24 @@ impl MultiTokenManager {
     /// ② 同优先级 **按近 60s RPM 均衡分流**(RPM 最低的先,让多个同级 API 号轮流用,不再只压第一个);
     /// ③ 再按在途细分兜底。
     /// 跳过:禁用 / 冷却中(failover 时失败号被设了短冷却会被自动跳过)/ `exclude` 内(本请求已试过的号)。
-    /// 命中返回 (id, credentials) 供透传;无可用返回 None → 调用方 failover 完毕落 Kiro 主力路径。
     /// 与 Kiro 的 is_entry_selectable 彻底分离——Kiro 选号已排除 custom_api,此处只管 custom_api。
-    pub fn select_custom_api(
+    ///
+    /// # 返回值（2026-08-10 起多带一个 guard）
+    /// 命中返回 `(id, credentials, InflightGuard)`；无可用返回 `None` → 调用方 failover
+    /// 完毕落 Kiro 主力路径。
+    ///
+    /// 🔴 **第三项 `InflightGuard` 是承重的**：它必须由调用方**持有到本次上游调用结束**
+    /// （Drop 即 inflight-1）。改前本函数只返回 `(id, credentials)`、完全不占位，
+    /// 导致排序键里的 inflight 维度对代挂号恒为 0（结构性失效）+ 选号到记账之间有一整个
+    /// 上游 RTT 的惊群窗口。详见 `.map(...)` 处的完整说明。
+    /// 把 guard 提前 drop（如 `let (id, cred, _) = ...`）等于把这个修复废掉。
+    fn select_custom_api_inner(
         &self,
         exclude: &std::collections::HashSet<u64>,
         model: Option<&str>,
-    ) -> Option<(u64, KiroCredentials)> {
+        // true = 只探测有无候选，不做 inflight/rpm 占位（见下方 `peek_only` 处的理由）
+        peek_only: bool,
+    ) -> Option<(u64, KiroCredentials, Option<InflightGuard>)> {
         let entries = self.entries.lock();
         let cooldown_on = self.cooldown_enabled.load(Ordering::Relaxed);
         // 模型白名单硬门（与 Kiro 路径同款）：设了 allowed_models 且当前模型不在其中
@@ -2924,6 +2968,18 @@ impl MultiTokenManager {
                     && !exclude.contains(&e.id)
                     && (!cooldown_on || self.cooldown.is_available(e.id))
                     && model.is_none_or(|m| {
+                        // 🔴 2026-08-09 修：与改写层共用**白名单感知**的 effective_model。
+                        //
+                        // 改前 bug：`effective_model` 无条件把非 `deepseek-` 前缀映射成
+                        // fallback，于是白名单里含 `deepseek-v4-flash` 的号（1365/1439）会对
+                        // **任意** claude 模型放行 —— `claude-opus-5` 被预判成
+                        // `deepseek-v4-flash` 命中白名单 → 选中 → 改写后打过去上游不认 → 400，
+                        // 且错误体被丢弃（error_message 空），根因完全不可见。
+                        // 1438 因白名单只有 `claude-mythos-5`（不含 deepseek-*）而幸免，
+                        // 这解释了"为什么只有部分号中招"。
+                        //
+                        // 现在原模型在白名单里就按原名判、否则按 fallback 判，两层口径一致：
+                        // 选中即意味着改写后的模型该号真的能服务。
                         let effective = if e.credentials.deepseek_normalize == Some(true) {
                             let merged = e
                                 .credentials
@@ -2931,7 +2987,11 @@ impl MultiTokenManager {
                                 .as_ref()
                                 .map(|c| c.merge_over(&global_ds))
                                 .unwrap_or_else(|| global_ds.clone());
-                            crate::kiro::deepseek_normalize::effective_model(m, &merged)
+                            crate::kiro::deepseek_normalize::effective_model(
+                                m,
+                                &merged,
+                                e.credentials.allowed_models.as_deref(),
+                            )
                         } else {
                             m.to_string()
                         };
@@ -2946,7 +3006,63 @@ impl MultiTokenManager {
                     e.inflight.load(Ordering::Acquire),
                 )
             })
-            .map(|e| (e.id, e.credentials.clone()))
+            // 🔴 `peek_only` = 只探测「有没有候选」，**不做任何占位**。
+            //
+            // 为什么需要它：provider 的透传闸门要判断「排除当前号后还有别的号可换吗」，
+            // 若直接调本函数探测，会白白 `InflightGuard::acquire` + `rpm.record` 一次
+            // ⇒ 污染 inflight 与 RPM 计数（探测比真实请求频繁得多，污染量级不小）。
+            // 而复制一份过滤谓词去别处写探测又必然与这里漂移（这段谓词含 deepseek
+            // 白名单感知，正是 2026-08-09 修过一次的分叉点）⇒ 用同一函数 + 开关最稳。
+            .map(|e| {
+                if peek_only {
+                    // 占位交给真正选号的那次调用；这里只回报"有候选"。
+                    return (e.id, e.credentials.clone(), None);
+                }
+                (
+                    e.id,
+                    e.credentials.clone(),
+                    Some((e.inflight.clone(), e.id)),
+                )
+            })
+            // 真正的占位在锁**仍持有**时完成（与 commit_selection 同一临界区语义）。
+            .map(|(id, cred, commit)| {
+                let guard = commit.map(|(inflight, cid)| {
+                    let g = InflightGuard::acquire(inflight);
+                    self.rpm.record(cid);
+                    // 成功选到号 ⇒ 清零「连续全池不可用」计数（配对逻辑见该字段的文档）。
+                    // ⚠️ 只在**非 peek** 分支清零：peek 只是探测，不代表真有请求被服务。
+                    self.consecutive_pool_unavailable
+                        .store(0, Ordering::Relaxed);
+                    g
+                });
+                (id, cred, guard)
+            })
+    }
+
+    /// 只探测「透传池里还有没有可选号」，**不占位、不记账**。
+    ///
+    /// 供 provider 的并发闸判断「排除当前号后是否还有别的号可换」——
+    /// 有则换号，没有则必须**等许可**而不能排除唯一的号
+    /// （上一版无条件排除，在单号池上直接制造 429 且 trace 的 credential_id 为空）。
+    pub fn has_other_custom_api_candidate(
+        &self,
+        exclude: &std::collections::HashSet<u64>,
+        model: Option<&str>,
+    ) -> bool {
+        self.select_custom_api_inner(exclude, model, true).is_some()
+    }
+
+    /// 选号并占位（对外的正式入口，见下方 `select_custom_api_inner` 的完整说明）。
+    pub fn select_custom_api(
+        &self,
+        exclude: &std::collections::HashSet<u64>,
+        model: Option<&str>,
+    ) -> Option<(u64, KiroCredentials, InflightGuard)> {
+        self.select_custom_api_inner(exclude, model, false)
+            .map(|(id, cred, guard)| {
+                // peek_only=false 时 guard 必定为 Some（见 inner 的 map）。
+                (id, cred, guard.expect("非 peek 模式必有 InflightGuard"))
+            })
     }
 
     /// 给 custom_api 透传号设一段冷却(**仅操作 cooldown,不碰 health/family/report_success/failure**,
@@ -2977,11 +3093,24 @@ impl MultiTokenManager {
     /// - 其余(429 RateLimited / 401·403 AuthFailed / 4xx BadRequest 等):**既不计成功也不计失败**
     ///   ——透传给客户端由其处理,不误判号健康(dwgx:4xx/429 不计号失败)。
     ///
-    /// 三态都会 `rpm.record` + 更新 `last_used_at`,让号池状态条/发光网格能"流动"(反映真实活跃)。
+    /// 三态都会更新 `last_used_at`,让号池状态条/发光网格能"流动"(反映真实活跃)。
+    ///
+    /// ⚠️ **本函数不再 `rpm.record`**（2026-08-10 移到 `select_custom_api` 的选号占位处，
+    /// 理由见函数体内注释：记在上游返回后太晚，会留出一整个 RTT 的惊群窗口）。
+    /// 原注释写「三态都会 `rpm.record`」已是**假断言**，2026-08-10 对抗评审抓出并改正
+    /// —— 全仓 `self.rpm.record` 只有两处：`select_custom_api`（透传）与
+    /// `commit_selection`（Kiro 主路径）。**别照旧注释去"修"回来，那会变成双记。**
     pub fn record_passthrough_result(&self, id: u64, outcome: crate::usage::RequestOutcome) {
         use crate::usage::RequestOutcome as RO;
-        // 速率环:任何结果都记一次活跃,驱动可视化流动(rpm 用独立 mutex,与 entries 无关)。
-        self.rpm.record(id);
+        // ⚠️ **这里刻意不再 `rpm.record(id)`**（2026-08-10 移走）。
+        //
+        // 它已被移到 `select_custom_api` 的选号占位里（与 Kiro 路径的 `commit_selection`
+        // 同款：选中 + inflight+1 + rpm.record 在同一临界区内完成）。原因是记在**上游返回后**
+        // 太晚 —— 从选号到记账之间隔着一整个上游 RTT，期间并发请求读到的 RPM 都是旧值，
+        // 排序键的「按 RPM 均衡分流」在这个窗口内完全失效 ⇒ 惊群全压同一号。
+        //
+        // 🔴 若在此处恢复调用，同一请求会被记**两次** ⇒ 代挂号 RPM 翻倍虚高 ⇒
+        // 排序键与饱和判定同时被污染（面板也会显示假的 2 倍速率）。两处只能有一处。
         // ⚠️ entries 锁必须在内层块内释放，再调 save_stats_debounced ——
         //    后者会二次加 entries 锁（parking_lot 非可重入）。
         {
@@ -4061,6 +4190,15 @@ impl MultiTokenManager {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// AIMD 可观测三元组：`(累计排队次数, 累计降档次数, 累计升档次数)`。
+    ///
+    /// 见 [`crate::kiro::throttle::InboundThrottle::aimd_counters`] 的完整理由：
+    /// 这三个数此前是只写不读的死代码，而它们是判断「整形是否在起作用、是否卡在下限」
+    /// 的唯一依据（先修度量，再谈调参）。
+    pub fn inbound_aimd_counters(&self) -> (u64, u64, u64) {
+        self.throttle.aimd_counters()
+    }
+
     /// 逐号 RPM 之和 = **上游实际承受**的尝试速率（含 failover 重试）。
     ///
     /// 与 [`Self::observed_inbound_rpm`] 的比值就是重试放大倍数。两者必须并排展示：
@@ -4131,8 +4269,18 @@ impl MultiTokenManager {
         // 内层尝试预算需与 provider 层的外层重试预算同量级放开：
         // 以可用凭据数为下限，保证内层不会在外层遍历完所有可用号之前就先耗尽。
         // （历史上仅 total*MAX_FAILURES，当可用数因禁用波动大时可能过紧）
+        //
+        // 🔴 下限必须用 `kiro_selectable_count()` 而非 `available_count()`（2026-08-10 修）：
+        // 本函数是 **Kiro 路径**的选号入口，而 `available_count()` 含 custom_api 代挂号
+        // （它们被 `is_entry_selectable_inner` 一律拒绝，Kiro 路径永远选不到）。
+        // 注释自己写的「以**可用凭据数**为下限」，要的正是「Kiro 可用数」——用错了函数。
+        //
+        // 用错的后果：纯代挂池（线上现状）时 total=N、available=N ⇒ 预算 3N，而一个号都选不到
+        // ⇒ 全部空转在 `NoCandidate` 分支上，**预算越大失败越慢**。
+        // 而 provider 层的外层预算（`provider.rs` 的 `compute_max_retries` 两个调用点）
+        // **早已改用** `kiro_selectable_count()` ⇒ 内层漏改就是**两层口径分叉**。
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize)
-            .max(self.available_count())
+            .max(self.kiro_selectable_count())
             .max(1);
         let mut attempt_count = 0;
         // 纵深防御：`WaitOutcome::Available` 分支的语义是"选号与等待判定之间发生了竞态,
@@ -4185,6 +4333,16 @@ impl MultiTokenManager {
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
+                        // 退避参数来自 config（ArcSwap 热更）。**必须在进 entries 锁之前**
+                        // 读取并存局部变量，绝不在锁内 load —— 保持「锁外读配置」纪律，
+                        // 与 reload 路径的锁序互不纠缠（load 只 +1 引用计数，无锁）。
+                        // reload 换入新值后**下一个自愈周期**即按新参数计算退避。
+                        let cfg = self.config.load();
+                        let heal_base = StdDuration::from_secs(cfg.self_heal_base_backoff_secs);
+                        let heal_max = StdDuration::from_secs(cfg.self_heal_max_backoff_secs);
+                        // shift 上限来自 config（运行期值）：钳到 31 防配置 ≥32 时
+                        // `1u32 << shift` 移位溢出 panic（原常量 4 是编译期定死的）。
+                        let heal_max_shift = cfg.self_heal_max_shift.min(31);
                         let mut entries = self.entries.lock();
                         // ⭐ 可自愈的原因集合（**刻意不含** AccountSuspended / QuotaExceeded /
                         // InvalidRefreshToken / RequestLimitReached / Passthrough* ——
@@ -4209,10 +4367,10 @@ impl MultiTokenManager {
                         // 故真恢复了会立刻回到灵敏状态，不会因退避而错过。
                         let heal_allowed = {
                             let streak = self.self_heal_streak.load(Ordering::Relaxed);
-                            let shift = streak.min(SELF_HEAL_MAX_SHIFT);
-                            let wait = SELF_HEAL_BASE_BACKOFF
+                            let shift = streak.min(heal_max_shift);
+                            let wait = heal_base
                                 .saturating_mul(1u32 << shift)
-                                .min(SELF_HEAL_MAX_BACKOFF);
+                                .min(heal_max);
                             let last = *self.last_self_heal_at.lock();
                             match last {
                                 // 首次自愈不等待：可能真的只是一次抖动。
@@ -4431,12 +4589,71 @@ impl MultiTokenManager {
                             WaitOutcome::NoCandidate => {
                                 // 两个量必须在**同一个**临界区里算完再放锁：available_count()
                                 // 会再锁 entries 致死锁，而分两次锁会读到不一致的池快照。
+                                //
+                                // 🔴 **`available` 必须排除 custom_api**（2026-08-10 修，致命）。
+                                //
+                                // 这里的 `available` 是用来给下面那个二分（① available==0 = 真耗尽
+                                // → 429；② available>0 = 被**模型级硬门**挡掉 → 按有无 TTL 分 429/404）
+                                // 做分诊的，所以它的语义必须是「**Kiro 路径**可选号数」。
+                                // 而 `is_entry_selectable_inner`(:3716) 对 custom_api **一律 return
+                                // false**（注释原文「Kiro 路径永不碰 custom_api」），
+                                // `transient_wait_outcome`(:3783) 同样 continue ⇒ 代挂号从来就不是
+                                // 「Kiro 可用号」，算进来就是喂给二分一个错的口径。
+                                //
+                                // 后果链（线上现状 = 号池全是 custom_api 代挂号、无 ksk_ Kiro 号）：
+                                //   代挂号未 disabled ⇒ available=N>0 ⇒ **跳过** ① 那两条正确的
+                                //   429 出口 ⇒ 落 ②；而透传路径从不调 `report_model_invalid`
+                                //   （它只被 provider 的 Kiro 路径调用）⇒ 代挂号永远不在 blocklist
+                                //   ⇒ `model_block_min_remaining` 返 None ⇒ 必然走「无 TTL = 永久」
+                                //   分支报 `model_unsupported_by_pool=1` ⇒ handlers.rs:1482 映射成
+                                //   **404 且刻意无 Retry-After** ⇒ 客户端（Claude Code/Cursor）
+                                //   **当场断会话**。
+                                // 而那条 404 的文案「N/M 个号均因订阅档位或成本白名单不含该模型而被
+                                // 过滤」对代挂号是**错误归因**——真实原因是「池里一个 Kiro 号都没有」。
+                                //
+                                // ⚠️ 不能改成调 `kiro_selectable_count()`：它自己会再锁 entries，
+                                // 在本临界区内调用即死锁（见本注释开头那条）。故**就地内联**它的
+                                // 谓词，与 `:3078` 逐字一致——两处若再分叉，这个 bug 会以另一种形式回来。
                                 let (available, any_healable) = {
                                     let entries = self.entries.lock();
                                     (
-                                        entries.iter().filter(|e| !e.disabled).count(),
+                                        entries
+                                            .iter()
+                                            .filter(|e| {
+                                                !e.disabled
+                                                    && !e.credentials.is_custom_api_credential()
+                                            })
+                                            .count(),
+                                        // 🔴 `any_healable` = 「这个池等一会儿有希望好吗」。
+                                        // 两种情形都算有希望（2026-08-10 补第二种，实测缺陷）：
                                         entries.iter().any(|e| {
-                                            e.disabled && is_self_healable_reason(e.disabled_reason)
+                                            // ① 有被禁用但**可自愈**的号（TooManyFailures /
+                                            //    SuspiciousActivityAuto / TooManyRefreshFailures）
+                                            //    —— 全池自愈会把它们放回来。
+                                            (e.disabled
+                                                && is_self_healable_reason(e.disabled_reason))
+                                            // ② 有**未禁用的代挂号**（2026-08-10 补）。
+                                            //
+                                            // 为什么必须算：走到这里说明 Kiro 侧选不到号，而池里
+                                            // 全是代挂号时 available 恒为 0 ⇒ 旧判据里
+                                            // any_healable=false（没有"被禁用且可自愈"的号）
+                                            // ⇒ 打 `pool_permanently_exhausted=1` ⇒
+                                            // `absorb_class_of` 显式**拒绝吸收**它（那条注释说
+                                            // "池里全是需人工处置的终态，等多久都不会变"）
+                                            // ⇒ 429 直接透给客户端 ⇒ 会话断。
+                                            //
+                                            // 但那个前提在这里不成立：代挂号**没被禁用**，
+                                            // 走到 Kiro 路径只是因为它们的上游此刻全故障了
+                                            // （实测 2026-08-10：k2cc 30s 无响应 + denzao 502
+                                            // `Upstream service temporarily unavailable`，
+                                            // 30 分钟内 128 次这条 429）。上游故障是**瞬态**，
+                                            // 等一会儿真的会好 ⇒ 该让吸收层去吸收，而不是当永久态。
+                                            //
+                                            // ⚠️ 只看「未禁用」不看「是否冷却中」：冷却本身就是
+                                            // 限时的（透传失败给 5s/180s），冷却期满自然恢复，
+                                            // 同样属于"等一会儿会好"。
+                                                || (!e.disabled
+                                                    && e.credentials.is_custom_api_credential())
                                         }),
                                     )
                                 };
@@ -4466,7 +4683,59 @@ impl MultiTokenManager {
                                     // 标记语义与 `inbound_admission_timeout=1` 同款：**对客户端仍是
                                     // 429 + Retry-After**（人工补号后确实会好，客户端该退避），
                                     // 只是对「单请求内重试」这件事显式说不。
+                                    // 🔴 文案必须区分两种「Kiro 侧 0 可选」（2026-08-10 修）：
+                                    // 旧文案一律写「所有凭据均已禁用（0/N）」，而纯代挂池时
+                                    // N 个号**一个都没被禁用** ⇒ 线上实测出现自相矛盾的
+                                    // 「所有凭据均已禁用（0/2）」，把排障直接带偏
+                                    // （去查为什么号被禁用，而真因是两个代挂上游都挂了）。
+                                    let has_enabled_custom_api = {
+                                        let entries = self.entries.lock();
+                                        entries.iter().any(|e| {
+                                            !e.disabled && e.credentials.is_custom_api_credential()
+                                        })
+                                    };
                                     if any_healable {
+                                        if has_enabled_custom_api {
+                                            // 🔴 **连续全池不可用达阈值 ⇒ 升级为终态**
+                                            // （2026-08-10 对抗评审抓出的缺陷修复）。
+                                            //
+                                            // 不这么做的后果：纯代挂池下 `available` 恒 0 而
+                                            // `any_healable` 恒 true（只要有未禁用代挂号），
+                                            // 而「透传失败绝不 auto-disable 号」是有实测依据的
+                                            // 刻意设计（健康号 #216 曾被误禁 119 次）⇒ 上游
+                                            // **真·永久坏**（余额耗尽返 402/403）时这条 429
+                                            // 永远带 `retry_after_secs=` ⇒ 客户端**无限重试**、
+                                            // 永远拿不到终态。
+                                            //
+                                            // 阈值取 20：按 `POOL_EXHAUSTED_RETRY_AFTER_SECS`=10
+                                            // 的客户端退避节奏，约 200s 持续全败才判永久
+                                            // —— 足以跨过中转站的常见瞬时抖动（实测代挂上游
+                                            // 502 通常几秒自愈），又不会让真故障拖到分钟级以上。
+                                            const POOL_PERMANENT_THRESHOLD: u32 = 20;
+                                            let n = self
+                                                .consecutive_pool_unavailable
+                                                .fetch_add(1, Ordering::Relaxed)
+                                                + 1;
+                                            if n >= POOL_PERMANENT_THRESHOLD {
+                                                anyhow::bail!(
+                                                    "Kiro 路径无可用凭据（池中 {} 个号均为 custom_api 代挂号，\
+                                                     其上游已连续 {} 轮全部失败，判定为持续故障；\
+                                                     代挂号本身未被禁用——请检查中转站余额/可用性）\
+                                                     pool_permanently_exhausted=1 retry_after_secs={}",
+                                                    total,
+                                                    n,
+                                                    POOL_EXHAUSTED_RETRY_AFTER_SECS
+                                                );
+                                            }
+                                            anyhow::bail!(
+                                                "Kiro 路径无可用凭据（池中 {} 个号均为 custom_api 代挂号，\
+                                                 其上游此刻全部失败；代挂号本身未被禁用）\
+                                                 consecutive_pool_unavailable={} retry_after_secs={}",
+                                                total,
+                                                n,
+                                                POOL_EXHAUSTED_RETRY_AFTER_SECS
+                                            );
+                                        }
                                         anyhow::bail!(
                                             "所有凭据均已禁用（0/{}）retry_after_secs={}",
                                             total,
@@ -4550,15 +4819,36 @@ impl MultiTokenManager {
                         // 一次 30s 的 token 端点抖动也会被报成「池永久耗尽」，需要人工
                         // 介入才恢复 —— 那是 `is_self_healable_reason` 覆盖面的问题，
                         // 不是本标记的问题，改它要单独一批（会改变自愈行为本身）。
-                        let any_healable = {
+                        let (any_healable, has_enabled_custom_api) = {
                             let entries = self.entries.lock();
-                            entries
-                                .iter()
-                                .any(|e| e.disabled && is_self_healable_reason(e.disabled_reason))
+                            (
+                                // 与 NoCandidate 那处**同款两情形判据**（2026-08-10 补第二种）：
+                                // ① 有被禁用但可自愈的号；② 有未禁用的代挂号（其上游故障是瞬态）。
+                                // 线上实测漏网点：本站点是第二处产出 `pool_permanently_exhausted=1`
+                                // 的地方，只修 NoCandidate 那处时这里仍会打出旧文案
+                                // （实测 10 分钟内 7 次 `retries=0`，即吸收层拒收后直接透给客户端）。
+                                entries.iter().any(|e| {
+                                    (e.disabled && is_self_healable_reason(e.disabled_reason))
+                                        || (!e.disabled
+                                            && e.credentials.is_custom_api_credential())
+                                }),
+                                entries.iter().any(|e| {
+                                    !e.disabled && e.credentials.is_custom_api_credential()
+                                }),
+                            )
                         };
                         if !any_healable {
                             anyhow::bail!(
                                 "所有凭据均已禁用（0/{}）pool_permanently_exhausted=1 retry_after_secs={}",
+                                total,
+                                POOL_EXHAUSTED_RETRY_AFTER_SECS
+                            );
+                        }
+                        // 纯代挂池：文案要说清"号没坏，是上游挂了"，否则排障方向被带偏。
+                        if has_enabled_custom_api {
+                            anyhow::bail!(
+                                "Kiro 路径无可用凭据（池中 {} 个号均为 custom_api 代挂号，\
+                                 其上游此刻全部失败；代挂号本身未被禁用）retry_after_secs={}",
                                 total,
                                 POOL_EXHAUSTED_RETRY_AFTER_SECS
                             );
@@ -5684,7 +5974,14 @@ impl MultiTokenManager {
         let entries = self.entries.lock();
         entries
             .iter()
-            .filter(|e| !e.disabled)
+            // 🔴 必须排除 custom_api（2026-08-10 修，与 `:4455` / `kiro_selectable_count` 同一类修复）：
+            // 本函数唯一的消费者是 `report_model_invalid`，它的返回值供 provider 判断
+            // 「本模型**在 Kiro 路径上**还有号可试吗」。而 custom_api 号被
+            // `is_entry_selectable_inner` 一律拒绝、Kiro 路径永远选不到，算进来会让纯代挂池
+            // （线上现状）恒返回 `true` ⇒ provider 以为「还有号」而继续 failover 空转，
+            // 直到烧完预算才失败。`INVALID_MODEL_ID` 本身也只在 Kiro 上游出现，
+            // 代挂号的等价错误走透传路径的 400/404 分流，与本函数无关。
+            .filter(|e| !e.disabled && !e.credentials.is_custom_api_credential())
             .filter(|e| model.is_empty() || !self.is_model_blocked(e.id, model))
             .count()
     }
@@ -6059,6 +6356,7 @@ impl MultiTokenManager {
                     request_limit: e.credentials.request_limit,
                     request_count: e.request_count,
                     deepseek_normalize: e.credentials.deepseek_normalize,
+                    model_mapping_exempt: e.credentials.model_mapping_exempt,
                     has_profile_arn: e.credentials.profile_arn.is_some(),
                     expires_at: if e.credentials.is_api_key_credential() {
                         None // API Key 凭据本地不维护过期时间（服务端策略未知）
@@ -6122,6 +6420,32 @@ impl MultiTokenManager {
     }
 
     /// 设置凭据禁用状态（Admin API）
+    /// 手动更新 refreshToken（OAuth 号 token 轮换后的运维入口，2026-08-11）。
+    ///
+    /// 语义：只改 refresh_token 一个字段（field-merge，参照 `refresh_token_locked`
+    /// 的回写模式与 :9574 守卫——整个 struct 替换会把在途的其它字段变更冲掉），
+    /// 并清空 access_token 与 expires_at：下一次调用**必然**走刷新链路用新
+    /// refresh_token 换 token（对抗审查 MAJOR，2026-08-11——只清 access_token
+    /// 不清 expires_at 时，陈旧 expires_at 仍在未来，热路径命中「未过期」分支、
+    /// 报「凭据无 access_token」硬错误，刷新永不触发，最长 1 小时故障窗）。
+    pub fn update_refresh_token(&self, id: u64, refresh_token: String) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.refresh_token = Some(refresh_token);
+            entry.credentials.access_token = None;
+            entry.credentials.expires_at = None;
+            // 刷新失败计数一并清零：新 token 是新起点，旧计数会让下次失败过早触发
+            // TooManyRefreshFailures 禁用。
+            entry.refresh_failure_count = 0;
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
     pub fn set_disabled(&self, id: u64, disabled: bool) -> anyhow::Result<()> {
         {
             let mut entries = self.entries.lock();
@@ -6250,6 +6574,28 @@ impl MultiTokenManager {
                 anyhow::bail!("deepseek 归一化仅对 custom_api 代挂凭据有意义");
             }
             entry.credentials.deepseek_normalize = enabled;
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 设置凭据的**模型映射豁免**开关（`model_mapping_exempt`）。
+    ///
+    /// 对 Kiro 号与 custom_api 代挂号都有效（映射对两条路径都生效，豁免也应都可用）。
+    /// `Some(true)` = 该号发上游时保持客户端原始模型名，跳过全局 `config.model_mapping`。
+    /// 写盘走 `persist_credentials`，立即生效无需重启。
+    pub fn set_credential_model_mapping_exempt(
+        &self,
+        id: u64,
+        exempt: Option<bool>,
+    ) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.model_mapping_exempt = exempt;
         }
         self.persist_credentials()?;
         Ok(())
@@ -7050,6 +7396,7 @@ impl MultiTokenManager {
         let kiro_req = serde_json::to_value(&crate::kiro::model::requests::kiro::KiroRequest {
             conversation_state: conv,
             profile_arn: None,
+            additional_model_request_fields: None,
         })?;
         // profileArn 注入与端点特有 body 加工统一交给端点实现（IDE 注入 arn，CLI 注入
         // agentTaskType/agentMode 且**绝不**注入 arn）。手写 arn 注入会让 CLI 号 403。
@@ -7418,6 +7765,97 @@ impl MultiTokenManager {
             // 调用方契约不变；这里只是不再丢弃它。未提供时 serde default = false，
             // 与旧行为完全一致（新号仍默认启用），故无回归。
             let initial_disabled = validated_cred.disabled;
+
+            // ══════════════════════════════════════════════════════════════════
+            // 🔴 去重复检（TOCTOU 收口）
+            //
+            // 第 2 步的查重是在**另一把已经释放的锁**里做的：那段用
+            // `let ... = { let entries = self.entries.lock(); ... }` 取值后立刻出作用域
+            // 释放（`parking_lot::Mutex` 无 guard 逃逸），而真正的 `push` 在这里、
+            // 隔着一次**重新取锁**。两段临界区之间没有任何互斥 ⇒
+            // 「查重通过」与「插入」不是原子的。
+            //
+            // 为什么这不是理论问题（三个条件同时成立）：
+            // 1. `import_keys` 用 `Semaphore(IMPORT_MAX_IN_FLIGHT)` **并发**派发每条；
+            // 2. `#[tokio::main]` 是多线程运行时，两个 worker 真并行；
+            // 3. **api_key 号在第 3 步走 `new_cred.clone()` 分支、不执行那次
+            //    `refresh_token().await`** ⇒ 从查重到插入是一段**纯同步**代码，
+            //    不需要任何 await 交错就能让两个线程都通过查重。
+            //
+            // 后果不是"多一条记录"：同一账号在池中裂成 N 条、共用一份上游配额，
+            // 而上游按**账号**算风控。CLAUDE.md 记载的线上事故形态正是如此
+            // （克隆 10 份，15 分钟后父号连同分身共 11 个全被 suspiciousActivityAuto
+            // 禁用）—— 那次是用户显式多开，本路径则能在用户**没有多开意图**时复现。
+            //
+            // 【为什么不照抄参考实现】实测参考仓有**同一个**竞态：GreyGunG
+            // `token_manager.rs:2759` 查重（锁随即释放）、`:2841` 重新取锁 push，
+            // 中间同样没有复检（`awk` 扫 2807-2841 无任何 sha256/重复判据）。
+            // 所以这条不是"移植他们的做法"能解决的，必须自己收口。
+            //
+            // 【收口方式】在**已经持有的这把锁**里复检一次同判据：不引入新锁、
+            // 不引入新 await ⇒ 不改变锁顺序、不可能死锁、不增加热路径开销
+            // （只在加号时跑一次，不在请求路径上）。
+            //
+            // 判据与第 2 步保持**同源**：三类凭据各自用自己的键（custom_api =
+            // base_url+api_key、api_key = kiroApiKey、OAuth = refreshToken），
+            // 否则复检会与初检不一致 —— 那比不复检更难排查。
+            // `allow_duplicate`（多开）时整段跳过，与第 2 步的门控完全对称。
+            // ══════════════════════════════════════════════════════════════════
+            if !allow_duplicate {
+                let dup_now = if validated_cred.is_custom_api_credential() {
+                    // 与第 2 步**逐字节同键**：`base_url|api_key`（分隔符 `|`、字段
+                    // 是 `api_key` 而非 kiro_api_key），且同样**跳过非 custom_api 条目**。
+                    // 键的任何差异都会让复检与初检判定不一致，那比不复检更难排查。
+                    let dup_key = format!(
+                        "{}|{}",
+                        validated_cred.base_url.as_deref().unwrap_or(""),
+                        validated_cred.api_key.as_deref().unwrap_or("")
+                    );
+                    let want = sha256_hex(&dup_key);
+                    entries.iter().any(|e| {
+                        if !e.credentials.is_custom_api_credential() {
+                            return false;
+                        }
+                        let k = format!(
+                            "{}|{}",
+                            e.credentials.base_url.as_deref().unwrap_or(""),
+                            e.credentials.api_key.as_deref().unwrap_or("")
+                        );
+                        sha256_hex(&k) == want
+                    })
+                } else if let Some(api_key) = validated_cred.kiro_api_key.as_deref() {
+                    let want = sha256_hex(api_key);
+                    entries.iter().any(|e| {
+                        e.credentials
+                            .kiro_api_key
+                            .as_deref()
+                            .map(sha256_hex)
+                            .as_deref()
+                            == Some(want.as_str())
+                    })
+                } else if let Some(rt) = validated_cred.refresh_token.as_deref() {
+                    // 与第 2 步同判据：比 **sha256 后**的值而非明文。两者结果等价，
+                    // 但保持同源写法 —— 一旦将来有人给初检加盐/换算法，复检不会静默分叉。
+                    let want = sha256_hex(rt);
+                    entries.iter().any(|e| {
+                        e.credentials
+                            .refresh_token
+                            .as_deref()
+                            .map(sha256_hex)
+                            .as_deref()
+                            == Some(want.as_str())
+                    })
+                } else {
+                    false
+                };
+                if dup_now {
+                    // 与第 2 步同文案族：调用方（`import_keys` 的逐条 `results[].error`）
+                    // 不需要区分"初检时已存在"与"并发插入抢先"，两者都是"已存在"。
+                    // 但保留"并发"字样便于事后从日志判断竞态是否真的发生过。
+                    anyhow::bail!("凭据已存在（并发插入被去重复检拦截）");
+                }
+            }
+
             entries.push(CredentialEntry {
                 id: new_id,
                 credentials: validated_cred,
@@ -9521,6 +9959,89 @@ mod tests {
         );
     }
 
+    /// 🔴 并发导入同一个 ksk key 时，**只能有一条入池**（TOCTOU 收口回归）。
+    ///
+    /// # 这条守的是什么
+    ///
+    /// `add_credential_inner` 的查重与插入分处两把**不同**的锁：查重块取锁读完即释放，
+    /// `push` 才重新取锁。api_key 号在第 3 步走 `new_cred.clone()` 分支、**不执行**那次
+    /// `refresh_token().await` ⇒ 从查重到插入是一段纯同步代码，两个 worker 线程可真并行
+    /// 走完，无需任何 await 交错。
+    ///
+    /// 而 `import_keys` 正是用 `Semaphore(IMPORT_MAX_IN_FLIGHT)` **并发**派发每条、跑在
+    /// 多线程运行时上 ⇒ 同一批里含 N 个相同 key 时，N 条会全部通过查重、全部入池。
+    /// 后果是同一账号在池中裂成 N 条共用一份上游配额，而上游按**账号**算风控
+    /// （CLAUDE.md 记载过 11 个号连坐被 suspiciousActivityAuto 禁用的事故形态）。
+    ///
+    /// # 为什么用 `multi_thread` 而不是默认单线程 runtime
+    ///
+    /// 默认 `#[tokio::test]` 是**单线程**运行时：两个 task 之间只在 `.await` 点切换，
+    /// 而这条路径上查重到插入之间没有 await ⇒ **单线程下竞态不可能复现**，测试会假绿。
+    /// 必须显式要求多 worker 才能真正并行。
+    ///
+    /// 注：即便如此，能否稳定命中窗口仍依赖调度时序，所以断言写成「最终只有 1 条」
+    /// （这在修复后**恒成立**），而不是「必须观察到一次并发拦截」（那依赖运气）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_import_of_same_api_key_must_insert_only_one() {
+        let config = Config::default();
+        let manager = std::sync::Arc::new(
+            MultiTokenManager::new(config, vec![], None, None, false).unwrap(),
+        );
+
+        // 8 个任务并发导入**同一把** key。
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let mgr = std::sync::Arc::clone(&manager);
+            tasks.spawn(async move {
+                let mut c = KiroCredentials::default();
+                c.kiro_api_key = Some("ksk_same_key_concurrent".to_string());
+                c.auth_method = Some("api_key".to_string());
+                mgr.add_credential(c).await
+            });
+        }
+        let mut ok = 0usize;
+        while let Some(joined) = tasks.join_next().await {
+            if joined.expect("任务不应 panic").is_ok() {
+                ok += 1;
+            }
+        }
+
+        assert_eq!(ok, 1, "并发导入同一 key 只应有 1 条成功，实际 {ok} 条");
+        assert_eq!(
+            manager.total_count(),
+            1,
+            "池中必须只有 1 条 —— 裂成多条会让同一账号共用配额并触发上游账号级风控"
+        );
+    }
+
+    /// 多开（`add_credential_allowing_duplicate`）不受去重复检影响：
+    /// 它的语义就是**显式允许**同 key 多份，复检必须与初检一样对它整段跳过。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn allow_duplicate_still_permits_multiple_copies_after_recheck() {
+        let config = Config::default();
+        let manager =
+            MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+
+        let mut first = KiroCredentials::default();
+        first.kiro_api_key = Some("ksk_multi_open".to_string());
+        first.auth_method = Some("api_key".to_string());
+        manager
+            .add_credential(first)
+            .await
+            .expect("首条应成功");
+
+        // 第二份走多开入口：即便 key 完全相同也必须成功（否则多开功能被复检打死）。
+        let mut second = KiroCredentials::default();
+        second.kiro_api_key = Some("ksk_multi_open".to_string());
+        second.auth_method = Some("api_key".to_string());
+        manager
+            .add_credential_allowing_duplicate(second)
+            .await
+            .expect("多开入口必须绕过去重复检");
+
+        assert_eq!(manager.total_count(), 2, "多开应得到 2 份");
+    }
+
     #[tokio::test]
     async fn test_add_credential_api_key_empty_rejected() {
         let config = Config::default();
@@ -10257,6 +10778,84 @@ mod tests {
         );
     }
 
+    /// 🔴 纯代挂池 + 上游持续失败 ⇒ **必须最终给出终态**（2026-08-10 对抗评审抓出的缺陷）。
+    ///
+    /// 缺陷成因：纯 custom_api 池下 `available` 恒 0（选号已排除代挂号），而
+    /// `any_healable` 恒 true（只要有未禁用代挂号就算"等一会儿会好"）。又因为
+    /// 「透传失败绝不 auto-disable 号」是有实测依据的刻意设计（健康号 #216 曾被误禁 119 次），
+    /// 号永远不会变成 disabled ⇒ 那条 429 永远带 `retry_after_secs=` 而不带
+    /// `pool_permanently_exhausted=1` ⇒ 吸收层一直吸收、客户端**无限重试**、拿不到终态。
+    ///
+    /// 修复：进程级 `consecutive_pool_unavailable` 计数，达阈值后升级为
+    /// `pool_permanently_exhausted=1`（吸收层据此停止吸收）；成功选号即清零。
+    #[tokio::test]
+    async fn pool_unavailable_escalates_to_permanent_after_repeats() {
+        let config = Config::default();
+        let mut c = KiroCredentials::default();
+        c.id = Some(1);
+        c.auth_method = Some("custom_api".to_string());
+        c.base_url = Some("https://relay.example.invalid".to_string());
+        let mgr = MultiTokenManager::new(config, vec![c], None, None, false).unwrap();
+
+        // 反复走「Kiro 路径无可用凭据」这条 bail。阈值是 20，多跑几次确保跨过。
+        let mut saw_retryable = false;
+        let mut saw_permanent = false;
+        for i in 1..=25 {
+            let e = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                mgr.acquire_context(Some("claude-sonnet-4.5"), None),
+            )
+            .await
+            .expect("不该挂死");
+            // CallContext 未实现 Debug，不能用 expect_err（那要求 Ok 侧可打印）
+            let e = match e {
+                Err(e) => e,
+                Ok(_) => panic!("纯代挂池下 Kiro 主路径必须失败，却成功选到号"),
+            };
+            let msg = e.to_string();
+            if msg.contains("pool_permanently_exhausted=1") {
+                saw_permanent = true;
+                assert!(
+                    i >= 20,
+                    "第 {i} 次就升级为永久态，早于阈值 20 —— 会把中转站的瞬时抖动误判为永久故障"
+                );
+                break;
+            }
+            // 阈值之前必须仍是**可重试**语义（带 Retry-After、不带永久标记）
+            assert!(
+                msg.contains("retry_after_secs="),
+                "第 {i} 次的错误必须带 retry_after_secs= 才能让客户端正确退避: {msg}"
+            );
+            saw_retryable = true;
+        }
+        assert!(saw_retryable, "阈值之前应当先出现可重试的 429");
+        assert!(
+            saw_permanent,
+            "连续 25 轮全池不可用后仍未升级为 pool_permanently_exhausted=1 ⇒ \
+             客户端会无限重试、永远拿不到终态（这正是本测试要防的回归）"
+        );
+
+        // 成功选号必须清零：直接调 select_custom_api（它是唯一的清零点）。
+        // 该号没有冷却，所以能被选中。
+        let picked = mgr.select_custom_api(&std::collections::HashSet::new(), None);
+        assert!(picked.is_some(), "该代挂号未被禁用也未冷却，应能选中");
+        drop(picked);
+        let after = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            mgr.acquire_context(Some("claude-sonnet-4.5"), None),
+        )
+        .await
+        .expect("不该挂死");
+        let after = match after {
+            Err(e) => e,
+            Ok(_) => panic!("仍无 Kiro 号，不该成功"),
+        };
+        assert!(
+            !after.to_string().contains("pool_permanently_exhausted=1"),
+            "成功选到代挂号后计数必须清零，否则中转站恢复了客户端却仍被判永久故障: {after}"
+        );
+    }
+
     #[tokio::test]
     async fn test_acquire_context_no_busy_loop_with_only_custom_api() {
         // ⭐⭐ CPU 死循环回归(旧代码会挂死+烧满一核,本测试靠超时兜底):
@@ -10299,6 +10898,27 @@ mod tests {
                 assert!(
                     !msg.contains("竞态无法收敛"),
                     "不该退化到竞态兜底上限才结束,说明 transient_wait_outcome 仍未正确过滤: {msg}"
+                );
+                // 🔴 **错误分类断言**（2026-08-10 补，旧代码必 FAIL）。
+                //
+                // 本测试走的场景（池里只有 custom_api 号）**正是** `available` 口径 bug 的
+                // 触发条件，但改前它只断言「不是竞态收敛失败」、**完全不检查错误分类** ⇒
+                // 那个致命 bug 从这张网底下溜了过去。
+                //
+                // 旧代码：`available = 1`（把代挂号算进去）≠ 0 ⇒ 跳过真耗尽分支 ⇒ 落
+                // `model_unsupported_by_pool=1` ⇒ handlers 映射 404 无 Retry-After ⇒ 断会话。
+                // 修好后：`available == 0` ⇒ 带 `retry_after_secs=` ⇒ 429 + Retry-After ⇒
+                // 客户端退避重试（人工补号后确实会好）。
+                assert!(
+                    msg.contains("retry_after_secs="),
+                    "纯 custom_api 池必须报**可重试**的池耗尽（带 retry_after_secs= → 429），\
+                     否则客户端拿到 404 会当场断会话。实际: {msg}"
+                );
+                assert!(
+                    !msg.contains("model_unsupported_by_pool=1"),
+                    "纯 custom_api 池**不是**「模型不被号池支持」——那个标记会被映射成 404 且\
+                     刻意无 Retry-After（永久态语义）。真实原因是「池里没有任何 Kiro 号」，\
+                     两回事。若命中此断言，说明 `available` 又把 custom_api 号算进去了。实际: {msg}"
                 );
             }
         }

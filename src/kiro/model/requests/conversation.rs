@@ -72,6 +72,22 @@ impl ConversationState {
         self.history = history;
         self
     }
+
+    /// 移除历史用户消息中的所有图片，返回移除的图片数量。
+    ///
+    /// 自适应二次压缩的第四层降级使用：图片 base64 常占请求体大头，
+    /// 而历史图片是低价值内容（早期轮次的截图），移除后不会破坏 tool 配对。
+    /// 刻意保留 `current_message` 的图片（那是本次请求的输入，删了任务就没法做）。
+    pub fn remove_history_images(&mut self) -> usize {
+        let mut removed = 0usize;
+        for msg in &mut self.history {
+            if let Message::User(user_msg) = msg {
+                removed += user_msg.user_input_message.images.len();
+                user_msg.user_input_message.images.clear();
+            }
+        }
+        removed
+    }
 }
 
 /// 当前消息容器

@@ -24,6 +24,7 @@
 
 pub mod compressor;
 pub(crate) mod cache;
+pub(crate) mod cache_fingerprint;
 pub(crate) mod converter;
 pub(crate) mod handlers;
 pub(crate) mod image_resize;
@@ -34,7 +35,9 @@ mod stream;
 pub mod types;
 mod websearch;
 
-pub use converter::{set_strip_env_noise, set_tool_description_max_chars};
+pub use converter::{
+    set_native_thinking_effort_enabled, set_strip_env_noise, set_tool_description_max_chars,
+};
 pub use handlers::set_cc_auto_buffer;
 pub use handlers::set_collect_client_fingerprint;
 pub use handlers::set_extract_thinking;

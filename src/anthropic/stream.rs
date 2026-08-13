@@ -805,6 +805,69 @@ pub(crate) fn strip_thinking_from_complete_text(text: &str) -> String {
     out
 }
 
+/// 从**完整文本**里剥掉 DeepSeek DSML 工具协议标记（非流式路径用）。
+///
+/// 流式有 [`StreamContext::strip_dsml_markers`]（带跨 chunk 尾巴缓冲），非流式此前
+/// **完全没有** DSML 处理 —— `handle_non_stream_request` 把 `text_content` 原样塞进
+/// content 块，`<｜DSML｜function_calls>` 这类标记逐字泄漏给客户端。fuckopencode 的口径是
+/// 非流式与流式**两处都接**，这里把非流式补齐。
+///
+/// 语义与流式一致（2026-08-09 修复后）：
+/// - 完整标记 `<｜DSML｜…>` / `</｜DSML｜…>`（行内 `>` 闭合）→ 整段丢弃；
+/// - 半截标记（无 `>` 收尾）→ 只剥**本行内**部分，换行及之后正文绝不吞
+///   （正文里任意 `>` 如 `a > b` / `=>` 不能触发跨行吞整段）；
+/// - 非 DSML 关键字的 `<｜…>`（CJK 排版）→ 白名单守住，绝不误删。
+///
+/// 完整文本无跨 chunk 问题，故残留（末尾半截标记/孤立 `<`）直接丢弃：补发会泄漏标记本体。
+pub(crate) fn strip_dsml_from_complete_text(text: &str) -> String {
+    if !text.contains('<') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let is_close_tag = chars[i] == '<'
+            && i + 2 < chars.len()
+            && chars[i + 1] == '/'
+            && chars[i + 2] == '\u{FF5C}';
+        if (chars[i] == '<' && i + 1 < chars.len() && chars[i + 1] == '\u{FF5C}') || is_close_tag {
+            let kw_start = if is_close_tag { i + 3 } else { i + 2 };
+            let rest: String = chars[kw_start..].iter().collect();
+            let r = rest.trim_start().to_ascii_lowercase();
+            let looks_marker =
+                r.starts_with("dsml") || r.starts_with("tool") || r.starts_with("function");
+            // 闭合查找限行，同流式：正文里的 `>` 不能被当标记闭合导致跨行吞正文。
+            let closed = chars[i..].iter().position(|&c| c == '>' || c == '\n');
+            if looks_marker {
+                match closed {
+                    Some(rel) if chars[i + rel] == '>' => {
+                        i += rel + 1; // 完整标记整段丢弃（含 `>`）
+                    }
+                    Some(rel) => {
+                        // 半截标记 + 换行：剥本行内标记，紧邻换行作分隔符一并跳过，正文保留。
+                        i += rel;
+                        if i < chars.len() && chars[i] == '\n' {
+                            i += 1;
+                        }
+                    }
+                    None => {
+                        // 到文本末尾都没闭合：标记残留丢弃（不补发，补发即泄漏）。
+                        break;
+                    }
+                }
+                continue;
+            }
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
 /// SSE 事件
 #[derive(Debug, Clone)]
 pub struct SseEvent {
@@ -1288,10 +1351,49 @@ pub struct StreamContext {
     /// <parameter 标记)。这是决定要不要做 R4 重组层的取证依据——无条件累加(不受 KIRO_INVOKE_TRACE 限),
     /// 收尾经 recovery_metrics 暴露。
     textified_invoke_hits: u32,
+    // ===== tool_use XML 泄漏过滤(参考仓 ref-grey 双层防护的流层)=====
+    /// tool_use XML 泄漏过滤的跨 chunk 缓冲:上游把工具调用当**正文文本**吐进
+    /// `assistantResponseEvent`(非结构化 toolUseEvent)时,`<tool_use …></tool_use>` 会被客户端
+    /// 当普通文本渲染。本缓冲保留"可能是半个 `<tool_use` 开标签"的文本尾巴,
+    /// 等下一 chunk 拼上再判定是完整标签(剥掉)还是普通正文(吐掉),避免标签被上游分帧切
+    /// 成两半时漏剥或误剥。
+    tool_use_xml_buffer: String,
+    /// 当前是否正处在一个已确认的 `<tool_use …` 开标签内(等待 `</tool_use>` 闭合)。
+    /// 为 true 时其后所有文本都被剥掉,直到找到闭合标签。
+    tool_use_xml_stripping: bool,
+    /// 🔴 本轮响应已触发过 256 KiB 上限 ⇒ 永久放弃剥离（latch，不再重入）。
+    /// 没有它会死循环：清空 carry 后下一 chunk 又命中 `<tool_use` 重新进剥离态。
+    tool_use_xml_strip_disabled: bool,
+    /// 本请求真剥掉的 tool_use XML 泄漏字节数(可观测;纯统计,不改剥离判据)。
+    tool_use_xml_stripped: u64,
+    /// 连续剥离态累积剥离字节数(上限兜底:永不闭合的开标签不能无限吞正文)。
+    tool_use_xml_strip_run: usize,
     // ===== 文本化 invoke 重组(R4,移植 ZyphrZero__kiro.rs v0.6.5)=====
     /// 本次请求声明的工具名集合(=模型看到的名字)。重组硬护栏:解析出的工具名必须在此才允许捞回,
     /// 否则当文本吐——宁可漏捞不可把正文讨论的假命令误执行。
     known_tool_names: std::collections::HashSet<String>,
+    /// `block_index` → **发给模型的工具名**（含缩短后的短名）。
+    ///
+    /// Bug C 校验需要在 `flush_tool_input(block_index, ..)` 里知道「这个块是哪个工具」，
+    /// 而那里只有 block_index。既有的 `tool_use_names` 不适用：它的 key 是 tool_use_id、
+    /// 值是**还原后**的客户端名，且只在工具名被缩短时才记录（未缩短的不入表）。
+    /// 本表无条件记录、口径与 [`Self::tool_required_fields`] 一致，故单独一张。
+    tool_block_names: HashMap<i32, String>,
+    /// 每个工具的**必需参数名**（来自客户端请求里 `tools[].input_schema.required`）。
+    ///
+    /// 用于 **Bug C** 校验：`tool_use` 的参数 JSON **完全合法但缺必需字段**
+    /// （典型：`Bash` 只给了 `description` 却没有 `command`）。这一类既不是 Bug A
+    /// （JSON 语法坏，`tool_repair_json` 能修）也不是 Bug B（连 tool_use 块都没吐，
+    /// 网关碰不到），此前一直落在两者之间的盲区 —— 客户端拿到合法 JSON 后按 schema
+    /// 校验失败，报 `The required parameter 'X' is missing`。
+    ///
+    /// 网关**手里就有 schema**（客户端请求里带的 `tools[].input_schema`），此前它只被
+    /// 用来数 token（`token.rs`）与 OpenAI 层归一化，从未用于校验模型吐出的参数。
+    ///
+    /// 空表 = 不校验（未设置 / 无工具 / WebSearch 类工具无 `input_schema`）。
+    /// key 用**模型看到的名字**（即可能被 `map_tool_name` 缩短过的短名），与
+    /// `known_tool_names` 同口径，这样校验时无需再做名字还原。
+    tool_required_fields: HashMap<String, Vec<String>>,
     /// invoke 嗅探缓冲:文本先进这里,决策安全(完整块过四道门 / 确认非泄漏)后才释放。跨 chunk 累积。
     invoke_sniff_buffer: String,
     /// 代码围栏(```)开合状态:围栏内的 <invoke> 是展示代码不捞回。跨 chunk 追踪奇偶。
@@ -1435,7 +1537,16 @@ impl StreamContext {
             leaked_stripped: 0,
             leaked_saturation_lines: 0,
             textified_invoke_hits: 0,
+            tool_use_xml_buffer: String::new(),
+            tool_use_xml_stripping: false,
+            tool_use_xml_strip_disabled: false,
+            tool_use_xml_stripped: 0,
+            tool_use_xml_strip_run: 0,
             known_tool_names,
+            tool_block_names: HashMap::new(),
+            // 默认空 = 不做 Bug C 校验；由 handler 在构造后经 `set_tool_required_fields` 注入
+            // （与 `set_cache_usage` 同款：避免改动 13 个构造点的签名）。
+            tool_required_fields: HashMap::new(),
             invoke_sniff_buffer: String::new(),
             code_fence_open: false,
             fence_scan_partial: String::new(),
@@ -1456,6 +1567,15 @@ impl StreamContext {
     /// 设置 prompt 缓存记账明细（前缀估算注入；在 generate_initial_events 之前调用）
     pub fn set_cache_usage(&mut self, cache_usage: Option<CacheUsageBreakdown>) {
         self.cache_usage = cache_usage;
+    }
+
+    /// 注入每个工具的必需参数名，启用 **Bug C**（参数合法但缺必需字段）校验。
+    ///
+    /// 与 [`Self::set_cache_usage`] 同款「构造后注入」范式：这样不必改动 13 个
+    /// `StreamContext::new*` 调用点的签名（其中 11 个是测试 fixture）。
+    /// 传空表 = 不校验（与不调用本方法等价）。
+    pub fn set_tool_required_fields(&mut self, required: HashMap<String, Vec<String>>) {
+        self.tool_required_fields = required;
     }
 
     /// 生成 message_start 事件
@@ -1814,23 +1934,11 @@ impl StreamContext {
     /// 然后:①遇到 `<｜` 开头且已闭合 `｜>` 或后接 DSML/tool 关键字的完整标记 → 整段丢弃;
     /// ②末尾若是"半个可能的标记"(有 `<｜` 但还没闭合)→ 留到 dsml_tail_buffer 等下轮;
     /// ③其余正常文本原样输出。只对**含全角竖线的 `<｜` 序列**动手,绝不误伤正常 `<` 文本。
-    /// 是否对本请求模型启用 DSML 剥离:**只对会吐 DSML 工具标记的国产模型**(deepseek/qwen/glm/
-    /// minimax/kimi/moonshot 等)启用;Claude 系绝不剥离(它不产生这些标记,剥离只会误伤正文/吞字)。
-    fn dsml_filter_applicable(&self) -> bool {
-        let m = self.model.to_ascii_lowercase();
-        // Claude 系明确排除(最主力路径,零风险优先)。
-        if m.contains("claude") || m.contains("opus") || m.contains("sonnet") || m.contains("haiku")
-        {
-            return false;
-        }
-        m.contains("deepseek")
-            || m.contains("qwen")
-            || m.contains("glm")
-            || m.contains("minimax")
-            || m.contains("kimi")
-            || m.contains("moonshot")
-            || m.contains("deepglm") // 兜底泛化(未来国产名)
-    }
+    /// `strip_dsml_markers` 无条件启用（2026-08-10）：网关后面就是 DeepSeek 等国产模型
+    /// （opencode Zen），客户端声明的模型名（`claude-sonnet-4-6` 之类）不能作为判断依据——
+    /// 上游是 DeepSeek 就可能吐 `<｜DSML｜…>` 标记，与客户端叫它什么无关。剥离逻辑本身有
+    /// 白名单 `is_dsml_keyword_after_pipe` 守正文（只剥 `dsml`/`tool`/`function` 前缀，
+    /// `<｜注｜>` 这类 CJK 排版绝不误删），Claude 官方协议也不产这些标记，零误伤。
 
     /// `<｜` 之后是否确为已知 DSML/工具协议标记关键字(白名单)。只有命中才剥离,
     /// 避免正文里合法的 `<｜…>`(CJK 排版 / 用户引用 token / 代码)被误删。
@@ -1847,10 +1955,7 @@ impl StreamContext {
     const DSML_TAIL_MAX: usize = 48;
 
     fn strip_dsml_markers(&mut self, content: &str) -> String {
-        // 模型门控:非国产模型(尤其 Claude)完全不走剥离,原样返回,零风险零开销。
-        if !self.dsml_filter_applicable() {
-            return content.to_string();
-        }
+        // 无条件剥离（2026-08-10：上游就是 DeepSeek，客户端模型名无关）。
         // 快路径:无待处理尾巴且不含 `<`,直接返回。
         if self.dsml_tail_buffer.is_empty() && !content.contains('<') {
             return content.to_string();
@@ -1863,16 +1968,44 @@ impl StreamContext {
         let chars: Vec<char> = work.chars().collect();
         let mut i = 0;
         while i < chars.len() {
-            // 探测 DSML 标记起点:`<` 紧跟全角竖线 `｜`(U+FF5C)。
-            if chars[i] == '<' && i + 1 < chars.len() && chars[i + 1] == '\u{FF5C}' {
-                let rest: String = chars[i + 2..].iter().collect();
+            // 探测 DSML 标记起点:`<` 紧跟全角竖线 `｜`(U+FF5C),或**闭合**形态 `</｜`。
+            // 闭合形态必须一起认:上游吐完整结构时会带 `</｜DSML｜parameter>` / `</｜DSML｜invoke>`,
+            // 只认 `<｜` 会让这些闭合标签原样泄漏成垃圾文本(实测
+            // `<｜DSML｜parameter …>echo hi</｜DSML｜parameter>` → 客户端看到 `echo hi</｜DSML｜parameter>`)。
+            let is_close_tag = chars[i] == '<'
+                && i + 2 < chars.len()
+                && chars[i + 1] == '/'
+                && chars[i + 2] == '\u{FF5C}';
+            if (chars[i] == '<' && i + 1 < chars.len() && chars[i + 1] == '\u{FF5C}') || is_close_tag
+            {
+                // 关键字起点:开标签跳过 `<｜`(2 字符),闭标签跳过 `</｜`(3 字符)。
+                let kw_start = if is_close_tag { i + 3 } else { i + 2 };
+                let rest: String = chars[kw_start..].iter().collect();
                 // 白名单校验:`<｜` 后必须确为 DSML/tool/function 关键字才当标记;否则是正文,原样输出。
                 // 若关键字尚不完整(rest 太短还看不出)且没闭合,则 hold 到下轮再判。
                 let looks_marker = Self::is_dsml_keyword_after_pipe(&rest);
-                let closed = chars[i..].iter().position(|&c| c == '>');
+                // 🔴 闭合查找**限行**:半截标记(无 `>` 收尾)后如果跨行接正文,正文里任意 `>`
+                // (a > b / => / markdown 引用)都会被误当标记闭合 → 从标记起整段吞掉,只剩 `>` 后残渣
+                // (实测: `<｜DSML｜function_calls\n阅读\n如果 a > b 就返回` → 只回 `" b 就返回…"`)。
+                // 遇到 `\n` 就停:半截标签只到**行尾**,换行后的正文绝不吞(fuckopencode 12c 同款教训)。
+                let closed = chars[i..].iter().position(|&c| c == '>' || c == '\n');
                 if looks_marker {
-                    if let Some(rel_gt) = closed {
-                        i += rel_gt + 1; // 完整标记 `<｜…>` 整段丢弃
+                    // `closed` 命中的是 `>` 还是行尾 `\n`,处置不同:
+                    // - `>`  → 完整标记 `<｜…>`,连 `>` 一起丢弃;
+                    // - `\n` → 标记在本行内没闭合(半截标记 + 换行接正文),只丢**本行内**的标记部分,
+                    //          换行本身与后续正文必须保留(否则就是跨行吞正文那个 bug)。
+                    let closed_by_gt = closed.map(|rel| chars[i + rel] == '>').unwrap_or(false);
+                    if let Some(rel) = closed {
+                        if closed_by_gt {
+                            i += rel + 1; // 完整标记 `<｜…>` 整段丢弃(含 `>`)
+                        } else {
+                            // 停在 `\n` 前:标记行内部分丢弃。紧邻的换行是标记与正文的分隔符,
+                            // 一并跳过,否则剥完会留一个孤立换行(`<｜DSML｜function_calls\n阅读` → `\n阅读`)。
+                            i += rel;
+                            if i < chars.len() && chars[i] == '\n' {
+                                i += 1;
+                            }
+                        }
                         continue;
                     } else {
                         // 已**确认是 DSML/tool 关键字标记**但无 `>` 闭合:DeepSeek 的 `<｜DSML｜function_calls`
@@ -2091,6 +2224,18 @@ impl StreamContext {
             return Vec::new();
         }
         let content = guarded.as_str();
+
+        // tool_use XML 泄漏过滤（跨 chunk 状态机）：上游把工具调用当**正文文本**吐时，
+        // `<tool_use …></tool_use>` 会被客户端当普通文本渲染。这里在 token 估算与后续
+        // 所有处理之前剥掉，保证：① 剥掉的字节不计入 output_tokens（记账=实际下发）；
+        // ② 不喂给 invoke 重组层（那是"执行工具"，泄漏内容绝不能被重组回去凭空执行）；
+        // ③ thinking 与正文路径都拿到同一份剥净后的文本。帧层（assistant.rs from_frame）
+        // 已有一道兜底，这里处理跨 chunk 切开的标签——两层互补（参考仓 ref-grey 双层设计）。
+        let content = self.filter_tool_use_xml_leaks(content);
+        if content.is_empty() {
+            return Vec::new();
+        }
+        let content = content.as_str();
 
         // 估算 tokens
         self.output_tokens += estimate_tokens(content);
@@ -2738,6 +2883,168 @@ impl StreamContext {
         self.drain_invoke_sniff_buffer(true)
     }
 
+    // ===== tool_use XML 泄漏过滤（流层；帧层兜底在 kiro/model/events/assistant.rs）=====
+    //
+    // 参考仓 ref-grey 的两层设计：
+    //   · 流层跨 chunk 状态机（ref-grey stream.rs:33-106 ToolUseXmlLeakFilter，:984 每帧文本过一遍，
+    //     :1512 收尾 finish()）：完整标签立即剥，半标签 hold 等下 chunk；
+    //   · 帧层 from_frame 就地剥（ref-grey assistant.rs:12-90）。
+    // 我们此前只有 invoke/antml: 形态的文本化工具调用处理（invoke_sniff_buffer），
+    // `<tool_use …>` 是另一种标签形态，全仓零命中（rg tool_use_xml 无结果）。
+    //
+    // 实现骨架复用 sniff 缓冲模式（与 drain_invoke_sniff_buffer 同一批函数演化出来的
+    // 跨 chunk 安全策略），但**不做重组**：这里的目的纯粹是把泄漏标签从正文里剥掉，
+    // 不把泄漏内容合成回结构化 tool_use（那会把上游当文本吐的工具调用凭空"执行"）。
+    //
+    // 判据（与帧层 strip_tool_use_xml_leaks 共享同一套常量）：
+    //   开标签必须形如 `<tool_use` 后紧跟 `>` 或空白，`<tool_user>`/`<tool_uses>` 这类
+    //   正文不剥；闭合必须等 `</tool_use>` 原样出现。只剥"字面量 tool_use 标签"，
+    //   绝不触碰结构化 content block（结构化工具调用走 ToolUseEvent，不经过这段文本流）。
+
+    /// tool_use XML 泄漏过滤开标签前缀/闭合标签。与帧层（kiro/model/events/assistant.rs）
+    /// 共用同一组字面量，保证两条防线判定一致。
+    const TOOL_USE_XML_PREFIX: &str = crate::kiro::model::events::TOOL_USE_XML_PREFIX;
+    const TOOL_USE_XML_CLOSE: &str = crate::kiro::model::events::TOOL_USE_XML_CLOSE;
+    /// 连续剥离态的单轮累积上限（256 KiB，与 `MAX_INVOKE_HOLD_BYTES` 同量级）：
+    /// 永不闭合的 `<tool_use …` 不能无限吞正文（吞掉用户可见的整段回答 = 静默吞字），
+    /// 超限即放弃剥离、把后续当普通文本放行。真实泄漏块远小于此。
+    const MAX_TOOL_USE_XML_STRIP_BYTES: usize = 262_144;
+
+    /// 跨 chunk 过滤 `content` 里的字面量 tool_use XML 泄漏，返回应下发的文本。
+    ///
+    /// 语义与 ref-grey `ToolUseXmlLeakFilter::filter` 对齐：保留可能跨 chunk 的
+    /// `<tool_use` 半前缀，已确认的标签体则整段丢弃（含闭合前的内容 —— 那是工具调用的
+    /// JSON 参数，不是该给用户的正文）。
+    fn filter_tool_use_xml_leaks(&mut self, content: &str) -> String {
+        // latch：本轮已放弃剥离 ⇒ 原样放行，不再扫描（防上限触发后重入死循环）。
+        if self.tool_use_xml_strip_disabled {
+            return content.to_string();
+        }
+        self.tool_use_xml_buffer.push_str(content);
+        let mut out = String::with_capacity(self.tool_use_xml_buffer.len());
+        let mut rest = self.tool_use_xml_buffer.as_str();
+
+        loop {
+            if self.tool_use_xml_stripping {
+                // 正在剥一个 `<tool_use …` 块：找闭合标签。
+                if let Some(close_start) = rest.find(Self::TOOL_USE_XML_CLOSE) {
+                    self.tool_use_xml_stripped += close_start as u64;
+                    crate::common::recovery_metrics::bump_tool_use_xml_stripped();
+                    rest = &rest[close_start + Self::TOOL_USE_XML_CLOSE.len()..];
+                    self.tool_use_xml_stripping = false;
+                    self.tool_use_xml_strip_run = 0;
+                    continue;
+                }
+                // 闭合还没到：剥掉本 chunk 除"可能是半个 </tool_use 闭合前缀"的尾巴以外的
+                // 全部。**注意保留尾巴** —— ref-grey 这里清空 buffer（:51），闭合被切成
+                // `<`+`/`+`tool`… 时永远拼不齐，响应余下全部被吞（我们实测复现）。而「剥
+                // 1 字节、留 10 字节尾巴」也是安全的：`</tool_use` 最长前缀 10 字节，被误判
+                // 为闭合前缀的普通正文最多 hold 10 字节、下一 chunk 就判定放行，不吞字。
+                let keep = partial_tool_use_xml_close_suffix(rest);
+                let dropped = rest.len() - keep;
+                let carry = rest[rest.len() - keep..].to_string();
+                self.tool_use_xml_stripped += dropped as u64;
+                self.tool_use_xml_strip_run = self.tool_use_xml_strip_run.saturating_add(dropped);
+                if self.tool_use_xml_strip_run > Self::MAX_TOOL_USE_XML_STRIP_BYTES {
+                    // 🔴 上限兜底：永不闭合的开标签 → 放弃剥离，后续当普通文本放行。
+                    //
+                    // ⚠️ 必须同时**清空 carry 并置 latch**，否则会死循环：carry 里仍留着
+                    // `</tool_use` 的部分前缀，下一 chunk 拼上后又在下面的 `find(PREFIX)`
+                    // 命中 `<tool_use` → 重新进剥离态 → strip_run 归零重新计数 →
+                    // 永远放不出正文（agent 写的
+                    // `tool_use_xml_never_closing_tag_releases_after_cap` 正是抓到这个）。
+                    //
+                    // latch 语义：本轮响应一旦触发过上限，就**不再**对该轮启用剥离
+                    // —— 一条流里出现超 256 KiB 不闭合标签，说明上游行为异常，
+                    // 此时"宁可让客户端看到裸标签，也不能吞掉整段回答"。
+                    self.tool_use_xml_stripping = false;
+                    self.tool_use_xml_strip_run = 0;
+                    self.tool_use_xml_strip_disabled = true;
+                    self.tool_use_xml_buffer.clear();
+                    return out;
+                }
+                self.tool_use_xml_buffer = carry;
+                return out;
+            }
+
+            let Some(start) = rest.find(Self::TOOL_USE_XML_PREFIX) else {
+                // 无开标签：保留可能是半个 `<tool_use` 前缀的尾巴，其余正常吐。
+                let keep = partial_tool_use_xml_prefix_suffix(rest);
+                let emit_len = rest.len().saturating_sub(keep);
+                out.push_str(&rest[..emit_len]);
+                self.tool_use_xml_buffer = rest[emit_len..].to_string();
+                return out;
+            };
+
+            out.push_str(&rest[..start]);
+            let after_start = &rest[start..];
+            let Some(open_end) = after_start.find('>') else {
+                // 开标签没到 `>`：看它像不像 `<tool_use` 前缀。像 → 进入剥离态等闭合
+                //（合并不完整开标签本身也剥掉——它仍是泄漏）；不像 → 当普通文本放行。
+                if is_potential_tool_use_xml_tag_start(after_start) {
+                    self.tool_use_xml_stripping = true;
+                    // 新块开始，累积计数从零起（上限是"单块"上限，不是整请求上限）。
+                    self.tool_use_xml_strip_run = 0;
+                    self.tool_use_xml_stripped += after_start.len() as u64;
+                    self.tool_use_xml_buffer.clear();
+                    return out;
+                }
+                out.push_str(&after_start[..Self::TOOL_USE_XML_PREFIX.len()]);
+                rest = &after_start[Self::TOOL_USE_XML_PREFIX.len()..];
+                continue;
+            };
+
+            let tag_head = &after_start[..open_end];
+            // `<tool_user>` / `<tool_uses>` 不是 tool_use 开标签 → 按普通文本吐这 9 字节前缀。
+            if !tag_head
+                .get(Self::TOOL_USE_XML_PREFIX.len()..)
+                .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(char::is_whitespace))
+            {
+                out.push_str(&after_start[..Self::TOOL_USE_XML_PREFIX.len()]);
+                rest = &after_start[Self::TOOL_USE_XML_PREFIX.len()..];
+                continue;
+            }
+
+            let after_open = &after_start[open_end + 1..];
+            if let Some(close_start) = after_open.find(Self::TOOL_USE_XML_CLOSE) {
+                // 完整 `<tool_use …>…</tool_use>`：整段剥掉，只留块后文本。
+                self.tool_use_xml_stripped += (open_end + 1 + close_start
+                    + Self::TOOL_USE_XML_CLOSE.len()) as u64;
+                crate::common::recovery_metrics::bump_tool_use_xml_stripped();
+                rest = &after_open[close_start + Self::TOOL_USE_XML_CLOSE.len()..];
+            } else {
+                // 有合法开标签但闭合还没到：进入剥离态，等闭合。
+                self.tool_use_xml_stripping = true;
+                // 新块开始，累积计数从零起（上限是"单块"上限，不是整请求上限）。
+                self.tool_use_xml_strip_run = 0;
+                self.tool_use_xml_stripped += after_start.len() as u64;
+                self.tool_use_xml_buffer.clear();
+                return out;
+            }
+        }
+    }
+
+    /// 收尾 flush tool_use XML 泄漏过滤缓冲（流结束）：已确认在标签内的残留整体丢弃
+    ///（泄漏）；被误判为半前缀的正文残留补发，不吞字。
+    fn finish_tool_use_xml_filter(&mut self) -> String {
+        let residue = std::mem::take(&mut self.tool_use_xml_buffer);
+        let was_stripping = self.tool_use_xml_stripping;
+        self.tool_use_xml_stripping = false;
+        self.tool_use_xml_strip_run = 0;
+        if residue.is_empty() {
+            return String::new();
+        }
+        if was_stripping {
+            // 流在 `<tool_use …` 标签内就结束了：残留是泄漏，丢弃（不补发为正文）。
+            self.tool_use_xml_stripped += residue.len() as u64;
+            crate::common::recovery_metrics::bump_tool_use_xml_stripped();
+            return String::new();
+        }
+        // 否则残留只是"可能是半个开标签"的正文尾巴：EOF 时已确定不是标签（没有下一
+        // chunk 了），补发为普通文本，不吞字。
+        crate::kiro::model::events::strip_tool_use_xml_leaks(&residue)
+    }
+
     /// 处理上游 `reasoningContentEvent` 的一帧结构化思考增量（E1）。
     ///
     /// # 与文本嗅探路径的关系
@@ -3021,6 +3328,11 @@ impl StreamContext {
             self.tool_use_names
                 .insert(tool_use.tool_use_id.clone(), original_name.clone());
         }
+        // Bug C 校验用：无条件记 block_index → **发给模型的工具名**（`tool_use.name`，
+        // 即可能被缩短过的短名），与 `tool_required_fields` 的 key 同口径。
+        // 与上面那个 `tool_use_names` 的区别见字段文档（那个只记被缩短的、且存还原名）。
+        self.tool_block_names
+            .insert(block_index, tool_use.name.clone());
 
         // 发送 content_block_start
         let start_events = self.state_manager.handle_content_block_start(
@@ -3103,6 +3415,42 @@ impl StreamContext {
     ///
     /// 校验完整 JSON：合法→原样发；非法→告警并尽力发（不静默吞成空参数——空参数会让客户端把
     /// 一个失败的工具调用当成"无参数成功调用"执行，比报错更危险）。空串→不发（无参工具，客户端得 `{}`）。
+    /// Bug C 判据：该 block 的工具参数是否缺 `input_schema.required` 声明的字段。
+    ///
+    /// 返回 `Some(缺失字段名列表)` 表示确实缺（调用方据此置失败态）；`None` 表示无需干预。
+    ///
+    /// **五种情况一律返回 `None`（不干预）**，每条都是刻意的：
+    /// 1. 这个 block 不是工具块（`tool_block_names` 无记录）—— 文本块无参数可校验；
+    /// 2. 该工具没有必需参数（`tool_required_fields` 无记录）—— 包括 WebSearch 类
+    ///    （它们没有 `input_schema`）与 `required` 为空的工具；
+    /// 3. `assembled` 不是合法 JSON —— 那是 Bug A 的地盘，已由上游 repair 层处理过；
+    /// 4. 顶层不是 object —— `required` 描述顶层属性，数组/标量形态不在本判据范围；
+    /// 5. 所有必需字段都在 —— 正常路径。
+    ///
+    /// ⚠️ 只判「键是否存在」，**不判值的类型/内容**：类型不匹配的容错空间远大于
+    /// 「字段整个缺失」，做全量 schema 校验会把上游的合理变体误判成失败。
+    /// 显式 `null` 视为**存在**（客户端会把 null 当"给了但为空"，与"没给"语义不同）。
+    fn find_missing_required_fields(
+        &self,
+        block_index: i32,
+        assembled: &str,
+    ) -> Option<Vec<String>> {
+        let tool_name = self.tool_block_names.get(&block_index)?;
+        let required = self.tool_required_fields.get(tool_name)?;
+        let value: serde_json::Value = serde_json::from_str(assembled).ok()?;
+        let obj = value.as_object()?;
+        let missing: Vec<String> = required
+            .iter()
+            .filter(|k| !obj.contains_key(k.as_str()))
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            None
+        } else {
+            Some(missing)
+        }
+    }
+
     fn flush_tool_input(&mut self, block_index: i32, mut assembled: String) -> Vec<SseEvent> {
         if assembled.is_empty() {
             return Vec::new();
@@ -3239,6 +3587,53 @@ impl StreamContext {
             );
             assembled = unwrapped;
         }
+
+        // 🔴 **Bug C 校验：参数 JSON 合法但缺 `required` 字段**（2026-08-10 新增）。
+        //
+        // 走到这里 `assembled` 已是**合法 JSON**（原本合法 / 被 repair 修好 / 解过双重编码），
+        // 所以 Bug A 的那套修复层已经无从介入 —— 但它可能仍缺必需参数，典型：
+        // `Bash` 只给了 `{"description":"..."}` 却没有 `command`。客户端拿到后按工具 schema
+        // 校验失败，报 `The required parameter 'command' is missing`，整个工具调用作废。
+        //
+        // 此前这类缺陷落在 Bug A（JSON 语法坏）与 Bug B（连 tool_use 块都没吐）之间的盲区：
+        // `tool_repair_json` 修不到（JSON 没坏）、`tool_truncation_recovery` 修不到（没截断）。
+        // 而网关**手里就有 schema**（客户端请求带的 `tools[].input_schema`），此前只用来数 token。
+        //
+        // 处置：复用既有的 ②③ 失败态链（`tool_stream_align_failure` + `tool_expose_error_to_client`）
+        // —— 置 `UpstreamError{INVALID_TOOL_INPUT}` 并**不下发这条坏参数**，收尾据失败态补发
+        // SSE error 让客户端退避重试整轮。这与「宁可整轮重试也不下发半截参数」的既定原则一致
+        // （半截/缺参的调用会被客户端当完整调用执行，比整轮失败更危险）。
+        // 绝不 `report_failure` 连坐号 —— 工具参数缺失是模型侧生成问题，不是号坏（隔离铁律）。
+        //
+        // 三条边界（都刻意）：
+        // 1. **只校验 required 的存在性**，不做完整 JSON Schema 校验（类型/格式不匹配的容错
+        //    空间远大于"字段整个缺失"，做全量校验会把上游的合理变体也判死）。
+        // 2. 只对**顶层 object** 校验：`required` 描述的就是顶层属性；非 object（数组/标量）
+        //    形态交给上游与客户端自行判断，不在这里加戏。
+        // 3. 受 `tool_stream_align_failure` 开关门控（默认开）：关掉即完全恢复改前行为，
+        //    给"宁可下发坏参数也别整轮失败"的部署留退路。
+        if super::handlers::tool_stream_align_failure_enabled()
+            && self.completion.is_ok()
+            && !self.tool_required_fields.is_empty()
+        {
+            if let Some(missing) = self.find_missing_required_fields(block_index, &assembled) {
+                tracing::warn!(
+                    block_index,
+                    missing = %missing.join(","),
+                    "tool_use 参数合法但缺必需字段（Bug C）：置失败态让客户端重试整轮，不下发坏参数"
+                );
+                self.completion = CompletionStatus::UpstreamError {
+                    code: "INVALID_TOOL_INPUT".to_string(),
+                    message: format!(
+                        "工具调用缺少必需参数：{}（模型侧生成异常），请重试。",
+                        missing.join("、")
+                    ),
+                };
+                // 不下发这条缺参的 partial_json（收尾兜底据失败态补发 SSE error）。
+                return Vec::new();
+            }
+        }
+
         self.state_manager
             .handle_content_block_delta(
                 block_index,
@@ -3421,6 +3816,14 @@ impl StreamContext {
         events.extend(self.flush_dsml_tail());
         // 收尾 flush invoke 嗅探缓冲:流结束时残留的半块(未等到 </invoke>)当普通文本吐,绝不静默吞。
         events.extend(self.flush_invoke_sniff_buffer());
+        // 收尾 flush tool_use XML 泄漏过滤:已确认在标签内的残留丢弃(泄漏);被误判为半前缀的
+        // 正文残留补发(不吞字)。残留要按普通文本走统一出口 `emit_non_thinking_text` —— 直接
+        // create_text_delta_events 会绕开 invoke 重组层(与上面 :2595 记的是同一型缺陷)。
+        let tool_use_xml_residue = self.finish_tool_use_xml_filter();
+        if !tool_use_xml_residue.is_empty() {
+            self.output_tokens += estimate_tokens(&tool_use_xml_residue);
+            events.extend(self.emit_non_thinking_text(&tool_use_xml_residue));
+        }
 
         // ⭐ 空响应兜底（`!thinking_enabled`）：本轮**只有** reasoning、正文为空时，
         // 把攒下的 reasoning 降级成正文下发。
@@ -3547,6 +3950,18 @@ impl StreamContext {
                 inline_seen = self.stray_inline_seen,
                 standalone_seen = self.stray_standalone_seen,
                 "检测到句中/独占 stray 泄漏词(clean 层只清行首、句中未处理,此为观测取证:确认真机泄漏形态)"
+            );
+        }
+        // tool_use XML 泄漏剥离收尾（可观测，不改任何已发内容）：本请求真剥掉过泄漏标签就如实记一条。
+        // 绝不黑箱 —— 剥离是"从用户可见正文里删内容"，必须留下能对账的痕迹（剥了多少字节）。
+        // 与 textified_invoke_hits 是**两种不同标签形态**的取证：那套是 invoke/antml: 形态，
+        // 这套是 `<tool_use …>` 形态（上游把工具调用当正文吐的另一种写法）。
+        if self.tool_use_xml_stripped > 0 {
+            tracing::warn!(
+                model = %self.model,
+                stripped_bytes = self.tool_use_xml_stripped,
+                "上游把工具调用当正文吐出(<tool_use> XML 泄漏),已从文本流剥离 {} 字节——客户端不会看到泄漏标签",
+                self.tool_use_xml_stripped,
             );
         }
 
@@ -3683,6 +4098,11 @@ impl BufferedStreamContext {
     /// 设置 prompt 缓存记账明细（前缀估算注入；在 process_and_buffer 之前调用）
     pub fn set_cache_usage(&mut self, cache_usage: Option<CacheUsageBreakdown>) {
         self.inner.set_cache_usage(cache_usage);
+    }
+
+    /// 转发给内部 `StreamContext`：buffered 只是把产出攒起来，工具校验逻辑与流式共用同一份。
+    pub fn set_tool_required_fields(&mut self, required: HashMap<String, Vec<String>>) {
+        self.inner.set_tool_required_fields(required);
     }
 
     /// 处理 Kiro 事件并缓冲结果
@@ -4912,6 +5332,58 @@ fn partial_invoke_tag_suffix_len(buf: &str) -> usize {
     0
 }
 
+/// 计算缓冲区末尾”可能是半个 `<tool_use` 开标签前缀”的字节数，需要保留等下一 chunk 拼上。
+///
+/// 与 `partial_invoke_tag_suffix_len` 同型：跨 chunk 的标签可能被上游切在任意字节边界，
+/// 直接按整帧吐会把半个标签泄漏给客户端。只保留与 `<tool_use` 前缀匹配的尾巴，
+/// 其余（包括正文里普通 `<`）整段吐出。
+fn partial_tool_use_xml_prefix_suffix(s: &str) -> usize {
+    let max = s.len().min(crate::kiro::model::events::TOOL_USE_XML_PREFIX
+        .len()
+        .saturating_sub(1));
+    for len in (1..=max).rev() {
+        if s.is_char_boundary(s.len() - len)
+            && crate::kiro::model::events::TOOL_USE_XML_PREFIX
+                .starts_with(&s[s.len() - len..])
+        {
+            return len;
+        }
+    }
+    0
+}
+
+/// 计算缓冲区末尾”可能是半个 `</tool_use>` **闭合**标签前缀”的字节数，需要保留等下一 chunk。
+///
+/// 🔴 这个函数是本层与参考仓 ref-grey 的**关键差异**，不是可选优化：
+/// ref-grey 在剥离态下每个 chunk 都 `self.buffer.clear()`（ref-grey stream.rs:51），
+/// 于是闭合标签一旦被上游分帧切开（`</to` + `ol_use>`），拼不齐 ⇒ `stripping` 永远退不出
+/// ⇒ **响应余下的全部正文被静默吞掉**（我们用逐字节切分的 chunk 序列实测复现）。
+/// 保留这段尾巴即修掉它：最多 hold `</tool_use` 的 10 字节，被误判的普通正文
+/// 下一 chunk 立刻判定放行，不吞字。
+fn partial_tool_use_xml_close_suffix(s: &str) -> usize {
+    let close = crate::kiro::model::events::TOOL_USE_XML_CLOSE;
+    let max = s.len().min(close.len().saturating_sub(1));
+    for len in (1..=max).rev() {
+        if s.is_char_boundary(s.len() - len) && close.starts_with(&s[s.len() - len..]) {
+            return len;
+        }
+    }
+    0
+}
+
+/// 半截 `<tool_use …` 是否像 tool_use 开标签的前缀（决定进入剥离态还是当正文放行）。
+///
+/// 覆盖两种形态：`<tool_u` 这类**比前缀短的**半截（后续可能是 `se` 拼成完整前缀），
+/// 以及 `<tool_use` 已齐但属性名还没到 `>`（后接空白即合法开标签）的形态。
+/// `<tool_user>` 拼到一半的 `<tool_use` 恰好也命中"前缀已齐"，但那一段在上层
+/// `filter_tool_use_xml_leaks` 里已被按 `>` 后判定为非开标签吐出；这里只兜底"还没 `>`"。
+fn is_potential_tool_use_xml_tag_start(s: &str) -> bool {
+    let prefix = crate::kiro::model::events::TOOL_USE_XML_PREFIX;
+    prefix.starts_with(s)
+        || s.get(prefix.len()..)
+            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(char::is_whitespace))
+}
+
 /// 检测文本片段里是否出现「文本化的工具调用标记」。
 /// 覆盖:Anthropic 工具调用语法 `<invoke`/`</invoke>`/`<parameter name=`(不论是否带 antml: 前缀),
 /// 及 `<function_calls>` 包裹。仅诊断用(探针),不改控制流。
@@ -5832,6 +6304,149 @@ mod tests {
         all.iter().map(|e| e.to_sse_string()).collect()
     }
 
+    // ===== tool_use XML 泄漏过滤（流层）=====
+
+    /// ① 开标签与闭合分跨两个 chunk：必须能完整剥掉，且用户看不到标签、工具参数或泄漏词。
+    ///
+    /// 旧实现（无本过滤器）会把 `before <tool_use …>…</tool_use> after` 原样发给客户端，
+    /// 泄漏 XML 被当普通文本渲染（甚至被 Claude Code 当结构化指令解析）。
+    #[test]
+    fn tool_use_xml_leak_across_chunks_is_stripped() {
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4.6", 10, false, HashMap::new());
+        let joined = run_turn(
+            &mut ctx,
+            &[
+                text_ev("before "),
+                // 开标签被切在 `>` 之前（第 2 帧还看不出是不是完整标签）
+                text_ev(r##"<tool_use id="toolu_1" name="Read""##),
+                // 第 3 帧才补齐 `>` 与整个块体 + 闭合
+                text_ev(r#">{"path":"/tmp/a"}</tool_use>"#),
+                text_ev(" after"),
+            ],
+        );
+        assert!(joined.contains("before"), "块前文本必须保留: {joined}");
+        assert!(joined.contains("after"), "块后文本必须保留: {joined}");
+        assert!(
+            !joined.contains("tool_use") && !joined.contains("/tmp/a"),
+            "开标签/参数/闭合都不能泄漏给客户端。实际: {joined}"
+        );
+        assert!(
+            ctx.tool_use_xml_stripped > 0,
+            "剥离计数器应记录本次剥离的字节数（可观测，确保剥离真的发生）"
+        );
+    }
+
+    /// ② 合法内容（含小于号的普通文本）不被误剥。
+    #[test]
+    fn tool_use_xml_keeps_normal_text() {
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4.6", 10, false, HashMap::new());
+        let joined = run_turn(
+            &mut ctx,
+            &[text_ev("if a < b then b > c"), text_ev(" and use <tool_user> ok")],
+        );
+        assert!(
+            joined.contains("if a < b then b > c"),
+            "含 < 的普通正文不能被误剥。实际: {joined}"
+        );
+        assert!(
+            joined.contains("<tool_user>"),
+            "<tool_user> 是普通文本不是 tool_use 开标签，不能误剥。实际: {joined}"
+        );
+    }
+
+    /// ③ 流在 `<tool_use …` 标签内结束（未闭合）：残留丢弃，不把泄漏 XML 补发成正文。
+    #[test]
+    fn tool_use_xml_unclosed_at_eof_is_dropped() {
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4.6", 10, false, HashMap::new());
+        let joined = run_turn(
+            &mut ctx,
+            // ⚠️ 用 r##"…"## 双井号：内容以 `"` 结尾，单井号的 `"#` 会被提前当作结束符。
+            &[text_ev("head "), text_ev(r##"<tool_use id="a" name="Write">{"path":"##)],
+        );
+        assert!(joined.contains("head"), "块前文本保留: {joined}");
+        assert!(
+            !joined.contains("tool_use") && !joined.contains("Write"),
+            "未闭合的泄漏标签不能补发。实际: {joined}"
+        );
+    }
+
+    /// ③' 🔴 闭合标签被逐字节切开：必须仍能退出剥离态，其后正文不能被吞。
+    ///
+    /// 这条是我们与参考仓 ref-grey 的**实质差异**的回归钉子：ref-grey 在剥离态下每个
+    /// chunk 都清空缓冲（ref-grey stream.rs:51），闭合被切成 `<` + `/` + `tool`… 时
+    /// 永远拼不齐 ⇒ `stripping` 再也退不出 ⇒ **响应余下全部正文被静默吞掉**。
+    /// 若把 `partial_tool_use_xml_close_suffix` 那段尾巴保留改回 clear()，本测试即 FAIL。
+    #[test]
+    fn tool_use_xml_close_tag_split_byte_by_byte_still_recovers() {
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4.6", 10, false, HashMap::new());
+        let joined = run_turn(
+            &mut ctx,
+            &[
+                text_ev(r#"<tool_use name="A">payload"#),
+                text_ev("<"),
+                text_ev("/"),
+                text_ev("tool"),
+                text_ev("_use"),
+                text_ev(">"),
+                text_ev("VISIBLE"),
+            ],
+        );
+        assert!(
+            joined.contains("VISIBLE"),
+            "闭合标签跨 chunk 切碎后必须退出剥离态，其后正文不能被吞。实际: {joined}"
+        );
+        assert!(
+            !joined.contains("payload") && !joined.contains("tool_use"),
+            "泄漏块本体与标签都不能下发。实际: {joined}"
+        );
+    }
+
+    /// ③'' 上限兜底：永不闭合的 `<tool_use` 不能无限吞正文（否则整段回答静默消失）。
+    #[test]
+    fn tool_use_xml_never_closing_tag_releases_after_cap() {
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4.6", 10, false, HashMap::new());
+        let mut events = vec![text_ev(r#"<tool_use name="A">"#)];
+        // 累积超过 MAX_TOOL_USE_XML_STRIP_BYTES（256 KiB）且始终不闭合。
+        // ⚠️ 内容不能用重复字符（如 `x`×N）—— 那会先被 `stray_guard_filter` 的
+        // 复读熔断拦下（"刷屏"），根本到不了 XML 过滤器，测的是错的守卫。
+        // 用随机化但非重复的文本。
+        let mut filler = String::with_capacity(8 * 1024);
+        let mut seed = 0x5eedu32;
+        for _ in 0..(8 * 1024) {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let c = b'a' + (seed >> 24) as u8 % 26;
+            filler.push(c as char);
+        }
+        for _ in 0..40 {
+            events.push(text_ev(&filler));
+        }
+        events.push(text_ev("LATER"));
+        let joined = run_turn(&mut ctx, &events);
+        assert!(
+            joined.contains("LATER"),
+            "超上限后必须放弃剥离、放行后续文本，否则永不闭合的标签吞掉整段回答"
+        );
+    }
+
+    /// ④ 过滤结果不计入 output_tokens（记账=实际下发）。
+    #[test]
+    fn tool_use_xml_leak_not_counted_in_output_tokens() {
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4.6", 10, false, HashMap::new());
+        let _ = run_turn(
+            &mut ctx,
+            &[
+                text_ev("hi "),
+                text_ev(r#"<tool_use name="Read">{"path":"/a"}</tool_use>"#),
+            ],
+        );
+        // 泄漏的字节数（>20）不应被算进 output_tokens。
+        assert!(
+            ctx.output_tokens < 10,
+            "剥掉的泄漏内容不能计入 output_tokens（记账=实际下发），实际: {}",
+            ctx.output_tokens
+        );
+    }
+
     /// ① thinking 关 + 本轮**只有** reasoning（无正文）→ 必须有非空输出。
     ///
     /// **旧代码为何 FAIL**：`process_reasoning_content` 在 `!thinking_enabled` 时
@@ -6301,16 +6916,22 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_dsml_claude_model_never_filtered() {
-        // 门控:Claude 系模型完全不剥离——哪怕内容里恰好含 <｜…>(如用户让 Claude 解释 DSML)也原样保留。
+    fn test_strip_dsml_claude_model_name_still_filters() {
+        // 2026-08-10 门控删除：上游是 DeepSeek，客户端声明的模型名（claude-sonnet-4.6 之类）
+        // 不决定是否剥离——哪怕是 claude 名，DeepSeek 后端照样可能吐 <｜DSML｜…> 标记。
         let mut ctx =
             StreamContext::new_with_thinking("claude-sonnet-4.6", 10, false, HashMap::new());
         let s = "DeepSeek 的标记写作 <｜DSML｜function_calls｜> 你看";
         assert_eq!(
             ctx.strip_dsml_markers(s),
-            s,
-            "Claude 模型不应剥离任何 <｜…>"
+            "DeepSeek 的标记写作  你看",
+            "Claude 模型名也应剥离真实 DSML 标记（无条件剥离），标记本身剥净、两侧空格保留"
         );
+        // 但白名单仍守正文：非关键字 <｜…> 在 claude 名下同样不误删。
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-4.6", 10, false, HashMap::new());
+        let s = "见 <｜注｜关于x｜> 说明";
+        assert_eq!(ctx.strip_dsml_markers(s), s, "非关键字 <｜…> 属正文，不误删");
         assert!(ctx.dsml_tail_buffer.is_empty());
     }
 
@@ -6323,6 +6944,90 @@ mod tests {
             ctx.strip_dsml_markers(s),
             s,
             "非关键字的 <｜…> 属正文,应保留"
+        );
+    }
+
+    // ===== 半截标记跨行吞正文回归(2026-08-09 实测坐实,旧代码上全部 FAIL)=====
+    //
+    // 旧代码 `closed = position(|c| c == '>')` **不限行**:半截标记后跨行接正文时,正文里
+    // 任意 `>`(`a > b` / `=>` / markdown 引用)被误当标记闭合 ⇒ 从标记起整段吞掉,只剩 `>`
+    // 之后的残渣。实测 `<｜DSML｜function_calls\n阅读\n如果 a > b 就返回` → 只回 `" b 就返回"`。
+    // 修复:闭合查找遇 `\n` 即停,半截标记只吃到**行尾**,换行及之后正文原样保留。
+
+    #[test]
+    fn test_strip_dsml_half_marker_does_not_swallow_next_lines_with_gt() {
+        let mut ctx = mk_ctx();
+        let out = ctx.strip_dsml_markers("<｜DSML｜function_calls\n阅读\n如果 a > b 就返回");
+        assert_eq!(
+            out, "阅读\n如果 a > b 就返回",
+            "半截标记只剥本行,换行后正文(含 `>`)绝不吞"
+        );
+    }
+
+    #[test]
+    fn test_strip_dsml_half_marker_keeps_arrow_text() {
+        let mut ctx = mk_ctx();
+        let out = ctx.strip_dsml_markers("<｜DSML｜function_calls\n结果 => 成功\n后续");
+        assert_eq!(out, "结果 => 成功\n后续", "正文里的 `=>` 不能被当标记闭合");
+    }
+
+    #[test]
+    fn test_strip_dsml_half_marker_keeps_markdown_quote() {
+        let mut ctx = mk_ctx();
+        let out = ctx.strip_dsml_markers("<｜DSML｜function_calls\n分析\n> 引用\n继续");
+        assert_eq!(out, "分析\n> 引用\n继续", "markdown 引用行首 `>` 不能被当标记闭合");
+    }
+
+    #[test]
+    fn test_strip_dsml_double_half_marker() {
+        // 实测形态:连续两个半截 function_calls 标记,后面跟正文。
+        let mut ctx = mk_ctx();
+        let out =
+            ctx.strip_dsml_markers("<｜DSML｜function_calls\n<｜DSML｜function_calls\nFound header");
+        assert_eq!(out, "Found header", "双重半截标记全剥,正文保留");
+    }
+
+    #[test]
+    fn test_strip_dsml_close_tag_is_stripped() {
+        // 闭合标签 `</｜DSML｜parameter>` 以 `</` 开头,旧代码只认 `<｜` ⇒ 闭合标签泄漏成垃圾文本。
+        let mut ctx = mk_ctx();
+        let out = ctx.strip_dsml_markers("echo hi</｜DSML｜parameter>\n回答");
+        assert_eq!(out, "echo hi\n回答", "闭合标签必须被剥,不能泄漏");
+    }
+
+    #[test]
+    fn test_strip_dsml_from_complete_text_non_stream() {
+        // 非流式路径(handle_non_stream_request)此前零 DSML 处理,标记逐字泄漏。
+        assert_eq!(
+            strip_dsml_from_complete_text("<｜DSML｜function_calls｜>后续"),
+            "后续"
+        );
+        assert_eq!(
+            strip_dsml_from_complete_text("<｜DSML｜function_calls\n阅读\n如果 a > b 就返回"),
+            "阅读\n如果 a > b 就返回",
+            "非流式同样不能跨行吞正文"
+        );
+        assert_eq!(
+            strip_dsml_from_complete_text("echo hi</｜DSML｜parameter>\n回答"),
+            "echo hi\n回答",
+            "非流式同样要剥闭合标签"
+        );
+        assert_eq!(
+            strip_dsml_from_complete_text("现在绝对还有<｜DSML｜function_calls"),
+            "现在绝对还有",
+            "流尾半截标记丢弃,前面正文保留"
+        );
+        let normal = "if a < b && c > d 这是正常代码";
+        assert_eq!(
+            strip_dsml_from_complete_text(normal),
+            normal,
+            "正常文本(含普通 < >)绝不改写"
+        );
+        let fullwidth = "见 <｜注｜关于x｜> 说明";
+        assert_eq!(
+            strip_dsml_from_complete_text(fullwidth),
+            fullwidth,
+            "非关键字全角标记属正文,保留"
         );
     }
 
@@ -8582,6 +9287,76 @@ mod tests {
         // Ok → Success
         assert_eq!(CompletionStatus::Ok.outcome(), RequestOutcome::Success);
         assert!(CompletionStatus::Ok.is_ok());
+    }
+
+    /// 🔴 **Bug C**：工具参数 JSON 合法但缺 `required` 字段 → 判定缺失（2026-08-10 新增）。
+    ///
+    /// 现实症状：`Bash failed: The required parameter 'command' is missing` ——
+    /// 模型吐的 input 是 `{"description":"..."}`，**JSON 完全合法**，只是漏了 `command`。
+    /// 既有的 `tool_repair_json`（修 JSON 语法）与 `tool_truncation_recovery`（修截断）
+    /// 都碰不到它，此前落在 Bug A/B 之间的盲区。
+    ///
+    /// 本测试直接测判据函数（`find_missing_required_fields`），覆盖「该判缺」与
+    /// 四类「不该干预」的边界。
+    #[test]
+    fn bug_c_detects_missing_required_tool_fields() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-4-5", 10, false, HashMap::new());
+        // 模拟：Bash 工具的 required = ["command"]，block 3 是它。
+        let mut req = HashMap::new();
+        req.insert("Bash".to_string(), vec!["command".to_string()]);
+        ctx.set_tool_required_fields(req);
+        ctx.tool_block_names.insert(3, "Bash".to_string());
+
+        // ① 缺 command → 判缺（这是真实故障形态）
+        assert_eq!(
+            ctx.find_missing_required_fields(3, r#"{"description":"list files"}"#),
+            Some(vec!["command".to_string()]),
+            "缺必需字段必须被判出来，否则客户端会报 The required parameter is missing"
+        );
+
+        // ② 齐全 → 不干预
+        assert_eq!(
+            ctx.find_missing_required_fields(3, r#"{"command":"ls","description":"x"}"#),
+            None,
+            "必需字段齐全时不得干预"
+        );
+
+        // ③ 显式 null 视为**存在**（客户端把 null 当"给了但为空"，与"没给"语义不同）
+        assert_eq!(
+            ctx.find_missing_required_fields(3, r#"{"command":null}"#),
+            None,
+            "显式 null 是「给了」，不算缺失 —— 只判键存在性，不判值"
+        );
+
+        // ④ 非工具块（无 block→name 记录）→ 不干预
+        assert_eq!(
+            ctx.find_missing_required_fields(99, r#"{"description":"x"}"#),
+            None,
+            "非工具块没有参数可校验"
+        );
+
+        // ⑤ 顶层不是 object（数组/标量）→ 不干预：required 描述的是顶层属性
+        assert_eq!(
+            ctx.find_missing_required_fields(3, r#"["a","b"]"#),
+            None,
+            "顶层非 object 不在本判据范围"
+        );
+
+        // ⑥ 非法 JSON → 不干预（那是 Bug A 的地盘，已由 repair 层处理）
+        assert_eq!(
+            ctx.find_missing_required_fields(3, r#"{"command":"#),
+            None,
+            "非法 JSON 归 Bug A 修复层，本判据不插手"
+        );
+
+        // ⑦ 工具无必需参数（未入表）→ 不干预（含 WebSearch 类无 input_schema 的工具）
+        ctx.tool_block_names.insert(4, "WebSearch".to_string());
+        assert_eq!(
+            ctx.find_missing_required_fields(4, r#"{}"#),
+            None,
+            "没有 required 声明的工具不校验"
+        );
     }
 
     #[test]

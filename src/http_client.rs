@@ -774,6 +774,26 @@ pub fn parse_proxy_links_bulk(text: &str) -> (Vec<ParsedProxyLink>, usize) {
 /// 改用 `read_timeout` 后：只要上游持续吐数据（token/ping），流就永不被超时掐断；只有真正
 /// **卡死**（`idle_secs` 内一个字节都没来）才中断——这才是流式该有的语义。另设一个宽松的
 /// `connect_timeout` 防连不上时无限等。
+/// 连接池参数（对齐 `Calcium-Ion/new-api` 的 `common/init.go` 默认值）。
+///
+/// # 为什么显式设这些
+///
+/// reqwest 默认**不限制**空闲连接数、`pool_idle_timeout` 默认 90s 但 per-host 无上限，
+/// 且不开 TCP keepalive。对「持续打同一个上游」的中继场景，缺 keepalive 会让空闲连接被
+/// 中间设备（NAT/LB）静默丢弃，下次复用时才发现连接已死 → 表现为间歇性
+/// `error sending request`（而上游其实是活的）。
+///
+/// 取值来源：new-api 的 `RELAY_MAX_IDLE_CONNS_PER_HOST=100` / `RELAY_IDLE_CONN_TIMEOUT=90s`
+/// / `KeepAlive=30s`。它是业界用量较大的中继实现，这组值在同类流量下经过验证。
+fn apply_pool_tuning(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    builder
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(100)
+        .tcp_keepalive(Duration::from_secs(30))
+        // Nagle 关掉：中继转发的是小 JSON 头 + 流式 chunk，攒包只会加延迟。
+        .tcp_nodelay(true)
+}
+
 pub fn build_streaming_client(
     proxy: Option<&ProxyConfig>,
     idle_secs: u64,
@@ -782,6 +802,7 @@ pub fn build_streaming_client(
     let mut builder = Client::builder()
         .read_timeout(Duration::from_secs(idle_secs))
         .connect_timeout(Duration::from_secs(30));
+    builder = apply_pool_tuning(builder);
     builder = apply_tls_and_proxy(builder, proxy, tls_backend)?;
     Ok(builder.build()?)
 }
@@ -807,8 +828,13 @@ pub fn build_streaming_client_no_redirect(
 ) -> anyhow::Result<Client> {
     let mut builder = Client::builder()
         .read_timeout(Duration::from_secs(idle_secs))
-        .connect_timeout(Duration::from_secs(30))
+        // 🔴 P1：connect_timeout 30s → 10s。这是 custom_api 透传专用 client，而透传
+        // failover 循环会换号重试 —— 30s 对一个"连接层失败"太长，一个死号就吃掉
+        // 大半个墙钟预算（45s）。10s 仍远超正常连接（实测同机房 <1s），且覆盖 DNS/
+        // TCP/TLS 三类慢连接。
+        .connect_timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none());
+    builder = apply_pool_tuning(builder);
     builder = apply_tls_and_proxy(builder, proxy, tls_backend)?;
     Ok(builder.build()?)
 }

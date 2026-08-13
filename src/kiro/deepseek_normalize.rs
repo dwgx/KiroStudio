@@ -5,11 +5,16 @@
 //! 坑逐一修掉了。本模块把那套修复逻辑用 Rust 复刻,供 custom_api 透传在转发前调用——
 //! 这样 KiroStudio 识别到 opencodezen 凭据(`deepseekNormalize=true`)时,请求先归一化再转发。
 //!
-//! ⚠️ **范围边界（诚实标注，勿当 overclaim）**：本模块只做**请求侧**归一化（模型名/thinking/
-//! reasoning_effort/工具字段）。**响应侧**未实现 `filterThinkingFromStream`（fuckopencode 在
-//! thinking disabled 时仍会剥掉上游吐的 thinking 块，否则 Claude Code 报 "Tool result missing"；
-//! KiroStudio 的 passthrough 是字节流原样回流，未过滤）。因此说"兼容性等价于直接走 fuckopencode"
-//! 只对请求侧成立；响应侧在 thinking disabled 场景可能仍需客户端容忍 thinking 块。
+//! ⚠️ **范围边界**：本模块只做**请求侧**归一化（模型名 / thinking / reasoning_effort /
+//! 工具字段 / content 形态）。
+//!
+//! 🔴 **2026-08-09 更正**：本段此前写着「响应侧未实现 `filterThinkingFromStream`」——
+//! **那已经过期**。响应侧过滤现在由 [`crate::kiro::passthrough_think_filter`] 实现
+//! （流式逐事件状态机 + 非流式 content 数组过滤，fail-open）。留着那句过期声明会让
+//! 后来人重复实现一遍，故就地更正。
+//!
+//! 仍然成立的边界：本模块不碰响应字节流，响应侧的行为要看
+//! `passthrough_think_filter` 那个文件。
 //!
 //! 已知 deepseek 坑(见 fuckopencode/src/deepseek.ts):
 //! - **模型名**：只认 `deepseek-v4-flash` 等精确名，`claude-*` 被上游 401，须重写。
@@ -114,7 +119,13 @@ impl DeepseekNormalizeOverride {
 /// 非对象 / 非 JSON 结构直接忽略,不会 panic。
 ///
 /// `cfg` 为已合并的配置（per-凭据覆盖全局后的最终值），由调用方构造。
-pub fn normalize_request(value: &mut Value, cfg: &DeepseekNormalizeConfig) {
+/// `whitelist` = 该凭据的 `allowed_models`（`None` = 不限，任何模型都会被 fallback 改写）。
+/// 传它是为了让「模型名重写」与选号层的白名单判定用**同一口径**，见步骤 0 的注释。
+pub fn normalize_request(
+    value: &mut Value,
+    cfg: &DeepseekNormalizeConfig,
+    whitelist: Option<&[String]>,
+) {
     let obj = match value.as_object_mut() {
         Some(o) => o,
         None => return,
@@ -123,12 +134,15 @@ pub fn normalize_request(value: &mut Value, cfg: &DeepseekNormalizeConfig) {
     // 0) 模型名重写：opencodezen 只认 deepseek-v4-flash 等精确名，claude-*/gpt-* 会被上游
     //    401（对齐 fuckopencode `resolveModelName`：命中 map 用映射值，否则 fallback）。
     //    简单规则：deepseek-* 保留，其余统一映射到 cfg.fallback_model。
+    //    🔴 2026-08-09 修：**白名单里的原模型名保持不变**。
+    //    改前是"非 deepseek- 前缀一律改写"，导致 1439（白名单含 claude-mythos-5 +
+    //    deepseek-v4-flash）的 claude-mythos-5 被强写成 fallback，上游不认 → 400。
+    //    而选号层用 effective_model 预判时又因白名单含 deepseek-v4-flash 而放行，
+    //    形成「选中了但改写后必失败」的口径分裂。现在两处共用同一个白名单感知判定。
     if let Some(model) = obj.get("model").and_then(|m| m.as_str()) {
-        if !model.starts_with("deepseek-") {
-            obj.insert(
-                "model".into(),
-                serde_json::json!(cfg.fallback_model),
-            );
+        let rewritten = effective_model(model, cfg, whitelist);
+        if rewritten != model {
+            obj.insert("model".into(), serde_json::json!(rewritten));
         }
     }
 
@@ -259,6 +273,20 @@ pub fn normalize_request(value: &mut Value, cfg: &DeepseekNormalizeConfig) {
         }
     }
 
+    // 4.5) 🔴 content 字符串 → 内容块数组（对齐 fuckopencode normalizeMessageContent）。
+    //
+    // opencode Zen 的 /v1/messages **只接受内容块数组**：
+    //   {"role":"user","content":"hi"}                      → 400 `Empty input messages`
+    //   {"role":"user","content":[{"type":"text","text":"hi"}]} → 200
+    // 报错极具误导性：不是 messages 空，是 content 形态不对（参考实现当初排查绕了很久）。
+    // Anthropic 官方 API 两种形态都支持，而 **Claude Code 发的是字符串形态**，必触发。
+    //
+    // 必须排在 `inject_missing_thinking_blocks`（步骤 5）**之前**：那一步要求 content
+    // 是数组，字符串形态会 `continue` 跳过 ⇒ 空 thinking 注入静默失效，次轮命中
+    // 「deepseek 要求回传 reasoning」间歇 400。先转数组，thinking 注入才能覆盖
+    // 字符串形态的多轮历史。
+    normalize_message_content(obj);
+
     // 5) 多轮带工具:thinking 非 disabled 时,assistant 历史含 tool_use 而无 thinking 块
     //    则前插空 thinking 块(否则 deepseek 次轮 400)。对齐 fuckopencode injectMissingThinkingBlocks。
     if !thinking_disabled {
@@ -289,14 +317,64 @@ pub fn normalize_request(value: &mut Value, cfg: &DeepseekNormalizeConfig) {
 ///
 /// 规则与 [`normalize_request`] 第 0 步完全一致（同源，改一处即可）：
 /// `deepseek-*` 保留，其余（`claude-*`/`gpt-*`）统一映射到 `cfg.fallback_model`。
-/// 供选号层的 `allows_model` 白名单在**重写后**判定——否则按 model_catalog 注释配
-/// `["deepseek-v4-flash"]` 时，CC 发的 `claude-sonnet-4-5-*` 会被原始模型名挡在白名单硬门之外，
-/// 透传永不发生。
-pub fn effective_model(raw_model: &str, cfg: &DeepseekNormalizeConfig) -> String {
+///
+/// 🔴 **白名单感知**（2026-08-09 修）：调用方必须传 `whitelist` —— 原模型名若**已在
+/// 该号白名单里**，就保持原名（否则 1439 这种白名单里同时列了 `claude-mythos-5` 和
+/// `deepseek-v4-flash` 的号，会把 `claude-mythos-5` 强写成 fallback，打过去上游不认，
+/// 报误导性的 400）。只有原模型名**不在**白名单时才映射到 fallback。
+///
+/// 这个签名让选号层和改写层用**同一个**判定，不可能再出现「选中了但改写后打不通」
+/// 的口径分裂。
+pub fn effective_model(raw_model: &str, cfg: &DeepseekNormalizeConfig, whitelist: Option<&[String]>) -> String {
     if raw_model.starts_with("deepseek-") {
-        raw_model.to_string()
-    } else {
-        cfg.fallback_model.clone()
+        return raw_model.to_string();
+    }
+    // 原模型名在白名单里 → 保持原名（用户显式授权该模型走这条代挂）。
+    if let Some(list) = whitelist {
+        if list.iter().any(|m| m.eq_ignore_ascii_case(raw_model)) {
+            return raw_model.to_string();
+        }
+    }
+    cfg.fallback_model.clone()
+}
+
+/// 把 `messages[].content` 的**字符串**形态转成单个 text 内容块数组。
+///
+/// 对齐 fuckopencode `normalizeMessageContent`（`src/deepseek.ts:221-231`）。
+///
+/// # 为什么必须做
+///
+/// opencode Zen 的 `/v1/messages` 只接受内容块数组，字符串形态返
+/// `400 {"error":{"message":"Empty input messages"}}` —— 报错文案极具误导性
+/// （看起来像 messages 为空，实际是 content 形态不对）。Anthropic 官方两种形态都收，
+/// 而 **Claude Code 发的就是字符串**，所以这条对代挂 deepseek 上游是**必然触发**，
+/// 不是边缘情况。
+///
+/// # 三个承重细节
+///
+/// 1. **空字符串不转**：转成 `[]` 会再次触发 `Empty input messages`（空数组同样非法）。
+///    留着空串交给上游按原样判断 —— 不要为了"形态统一"制造一个更坏的形态。
+/// 2. **user 与 assistant 都转**：只处理 assistant 会漏掉最常见的用户消息。
+/// 3. 调用点必须在 [`inject_missing_thinking_blocks`] **之前**（见 `normalize_request`
+///    步骤 4.5 的注释）—— 那一步只认数组，顺序反了 thinking 注入就仍然覆盖不到
+///    字符串形态的历史。
+///
+/// 幂等：已是数组的不动，所以重复调用安全。
+fn normalize_message_content(obj: &mut serde_json::Map<String, Value>) {
+    let Some(messages) = obj.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+    for msg in messages {
+        let Some(msg_obj) = msg.as_object_mut() else { continue };
+        // 只在「是字符串且非空」时转换。`as_str()` 对数组/对象返回 None，天然幂等。
+        let Some(text) = msg_obj.get("content").and_then(|c| c.as_str()) else {
+            continue;
+        };
+        if text.is_empty() {
+            continue;
+        }
+        let block = serde_json::json!([{ "type": "text", "text": text }]);
+        msg_obj.insert("content".to_string(), block);
     }
 }
 
@@ -337,7 +415,7 @@ mod tests {
 
     fn norm(input: serde_json::Value) -> serde_json::Value {
         let mut v = input;
-        normalize_request(&mut v, &DeepseekNormalizeConfig::default());
+        normalize_request(&mut v, &DeepseekNormalizeConfig::default(), None);
         v
     }
 
@@ -547,10 +625,144 @@ mod tests {
             "tools": [ { "name": "a", "strict": true } ]
         });
         let mut once = input.clone();
-        normalize_request(&mut once, &DeepseekNormalizeConfig::default());
+        normalize_request(&mut once, &DeepseekNormalizeConfig::default(), None);
         let mut twice = once.clone();
-        normalize_request(&mut twice, &DeepseekNormalizeConfig::default());
+        normalize_request(&mut twice, &DeepseekNormalizeConfig::default(), None);
         assert_eq!(once, twice, "二次归一化结果不变");
+    }
+
+    /// 🔴 content 字符串 → 内容块数组（2026-08-09 补）。
+    /// opencode Zen 只接受内容块数组，字符串形态返 `Empty input messages`（误导性报错，
+    /// 实为 content 形态不对）。Claude Code 发字符串 ⇒ 必触发。
+    #[test]
+    fn string_content_is_converted_to_text_block() {
+        let input = serde_json::json!({
+            "messages": [ { "role": "user", "content": "hi" } ]
+        });
+        let mut v = input.clone();
+        normalize_request(&mut v, &DeepseekNormalizeConfig::default(), None);
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(
+            msgs[0]["content"],
+            serde_json::json!([{ "type": "text", "text": "hi" }]),
+            "字符串 content 必须转成单个 text 块"
+        );
+    }
+
+    /// 已是数组时保持不变（幂等，不得破坏已有结构）。
+    #[test]
+    fn array_content_is_untouched() {
+        let input = serde_json::json!({
+            "messages": [ { "role": "user", "content": [{"type":"text","text":"hi"}] } ]
+        });
+        let mut v = input.clone();
+        normalize_request(&mut v, &DeepseekNormalizeConfig::default(), None);
+        assert_eq!(v["messages"][0]["content"], input["messages"][0]["content"]);
+    }
+
+    /// 空字符串**不**转：转成 `[]` 会再次触发 `Empty input messages`（空数组同样非法）。
+    #[test]
+    fn empty_string_content_is_left_alone() {
+        let input = serde_json::json!({
+            "messages": [ { "role": "user", "content": "" } ]
+        });
+        let mut v = input.clone();
+        normalize_request(&mut v, &DeepseekNormalizeConfig::default(), None);
+        assert_eq!(v["messages"][0]["content"], "", "空串不得被转成 []");
+    }
+
+    /// user 与 assistant **都**要转，不只处理 assistant。
+    #[test]
+    fn both_user_and_assistant_are_converted() {
+        let input = serde_json::json!({
+            "messages": [
+                { "role": "user", "content": "question" },
+                { "role": "assistant", "content": "answer" },
+                { "role": "user", "content": [{"type":"text","text":"already array"}] }
+            ]
+        });
+        let mut v = input.clone();
+        normalize_request(&mut v, &DeepseekNormalizeConfig::default(), None);
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["content"], serde_json::json!([{"type":"text","text":"question"}]));
+        assert_eq!(msgs[1]["content"], serde_json::json!([{"type":"text","text":"answer"}]));
+        assert_eq!(msgs[2]["content"], input["messages"][2]["content"], "已是数组的不动");
+    }
+
+    /// 🔴 顺序守卫：content 转换必须排在 `inject_missing_thinking_blocks` **之前**。
+    ///
+    /// 这守的是本规格最易错的一条。两步的耦合点是「content 必须已经是数组」：
+    /// thinking 注入那步 `get_mut("content").and_then(as_array_mut)` 对字符串返回 None
+    /// 直接 `continue` ⇒ 顺序反了就**静默跳过**，次轮命中「deepseek 要求回传 reasoning」
+    /// 间歇 400，且没有任何报错指向根因。
+    ///
+    /// 断言方式：用**源码顺序**而非行为。因为行为上要触发注入需要 content 里有 `tool_use`
+    /// **块**，而那种消息本来就是数组形态（不经过 content 转换）—— 用行为断言测不到
+    /// 两步的先后。故直接读本文件源码比较两个调用点的位置（本仓既有的源码级守卫范式）。
+    #[test]
+    fn content_normalization_must_run_before_thinking_injection() {
+        let src = include_str!("deepseek_normalize.rs");
+        // 只看生产段，且剔掉注释行（否则本测试的文档注释会自匹配）。
+        let prod: String = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("生产段应存在")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // needle 运行时拼接，避免字面量把自己算进匹配。
+        let content_call = ["normalize_message", "_content(obj)"].concat();
+        let inject_call = ["inject_missing_thinking", "_blocks(obj)"].concat();
+        let i = prod
+            .find(content_call.as_str())
+            .expect("normalize_request 必须调 normalize_message_content");
+        let j = prod
+            .find(inject_call.as_str())
+            .expect("normalize_request 必须调 inject_missing_thinking_blocks");
+        assert!(
+            i < j,
+            "content 转换必须先于 thinking 注入 —— 反了会让字符串形态的多轮历史静默跳过注入"
+        );
+    }
+
+    /// 字符串形态的多轮历史：转换后 content 是数组，为后续 thinking 注入创造了前提。
+    #[test]
+    fn string_history_content_becomes_array() {
+        let input = serde_json::json!({
+            "thinking": { "type": "enabled", "budget_tokens": 4096 },
+            "messages": [
+                { "role": "user", "content": "do it" },
+                { "role": "assistant", "content": "here" },
+                { "role": "user", "content": "done" }
+            ]
+        });
+        let mut v = input.clone();
+        normalize_request(&mut v, &DeepseekNormalizeConfig::default(), None);
+        for i in 0..3 {
+            assert!(
+                v["messages"][i]["content"].is_array(),
+                "第 {i} 条 content 应已转成数组"
+            );
+        }
+    }
+
+    /// content 里本就有 `tool_use` 块（数组形态）时，thinking 注入照常生效 ——
+    /// 证明新增的 content 转换步骤**没有破坏**既有注入行为。
+    #[test]
+    fn array_history_with_tool_use_still_gets_thinking_injected() {
+        let mut v = serde_json::json!({
+            "thinking": { "type": "enabled", "budget_tokens": 4096 },
+            "messages": [
+                { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "t1", "name": "run", "input": {} }
+                ] }
+            ]
+        });
+        normalize_request(&mut v, &DeepseekNormalizeConfig::default(), None);
+        let content = v["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "thinking", "应在头部前插空 thinking 块");
+        assert_eq!(content[0]["thinking"], "", "空 thinking 块内容是空串");
     }
 
     /// 请求侧补坑：WebSearch 工具剥除（deepseek 不认 web_search_20250305 type）。
@@ -635,7 +847,7 @@ mod tests {
             "thinking": { "type": "enabled" },
             "max_tokens": 100
         });
-        normalize_request(&mut v, &cfg);
+        normalize_request(&mut v, &cfg, None);
         assert_eq!(v["model"], "custom-model", "自定义 fallback_model");
         assert_eq!(v["max_tokens"], 1234, "自定义 min_max_tokens");
     }

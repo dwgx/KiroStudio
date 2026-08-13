@@ -307,6 +307,26 @@ impl GlobalThrottle {
         o.buckets.iter().copied().sum()
     }
 
+    /// AIMD 可观测三元组：`(累计排队次数, 累计降档次数, 累计升档次数)`。
+    ///
+    /// # 为什么补这个读取口（2026-08-10）
+    ///
+    /// 这三个计数器此前是**只写不读的死代码** —— 全仓（含前端）除了声明、初始化与
+    /// `fetch_add` 之外**零读取点**。于是「AIMD 降了几档、升回来几次、多少请求真的排过队」
+    /// 运维完全看不到，而这三个数正是判断「整形是否在起作用、是否卡在下限」的唯一依据。
+    ///
+    /// 这与 `CLAUDE.md` 记的那条教训同型：**先修度量，再谈调参**，否则是在算空气
+    /// （历史上 `inboundTargetRpm` 就因为容量口径是假的而"怎么调都没用"）。
+    ///
+    /// `Relaxed` 足够：三个数只用于展示与趋势判断，不参与任何控制决策，不需要跨线程同步语义。
+    pub fn aimd_counters(&self) -> (u64, u64, u64) {
+        (
+            self.queued_total.load(Ordering::Relaxed),
+            self.md_total.load(Ordering::Relaxed),
+            self.ai_total.load(Ordering::Relaxed),
+        )
+    }
+
     /// 入站准入:有令牌立即放行;否则异步排队等待,直到拿到令牌或超时。
     /// 超时返回 Err(建议 Retry-After 秒数),上层据此给客户端带 Retry-After 的 429。
     ///
