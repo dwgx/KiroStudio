@@ -47,7 +47,7 @@ jobs:
         with:
           key: test-no-default
       - name: 运行测试（出厂特性：纯 rustls）
-        run: cargo test --no-default-features --locked
+        run: cargo test --no-default-features
 
       # 发版闸门：tag 必须与 Cargo.toml 的 version 完全一致。
       #
