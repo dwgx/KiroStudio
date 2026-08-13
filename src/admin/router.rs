@@ -2,34 +2,36 @@
 
 use axum::{
     Router, middleware,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 
 use super::{
     handlers::{
         add_credential, bulk_import_socks_nodes, check_update, cleanup_disabled_credentials,
         clone_credential, deep_verify_credential, delete_credential, delete_credentials_batch,
-        delete_socks_node, disable_overage, enable_overage, export_credential, external_idp_leg1,
-        external_idp_leg2, external_idp_leg2_select, force_refresh_token, get_all_credentials,
-        get_cached_balances, get_config, get_credential_balance, get_load_balancing_mode,
-        get_overage_status, import_keys, list_socks_nodes, list_trash, perform_update,
-        poll_idc_login, poll_social_login, probe_available_models, probe_models_standalone,
-        probe_regions, proxy_test, probe_upstream_models, purge_credential, purge_trash_batch,
-        recovery_metrics,
-        reset_failure_count, restart_service, restore_credential, set_credential_allowed_models,
-        set_credential_api_region, set_credential_custom_api,
-        set_credential_deepseek_normalize, set_credential_disabled,
-        set_credential_endpoint, set_credential_name, set_credential_priority,
-        set_credential_proxy, set_credential_rpm_limit, set_credential_tag,
-        set_load_balancing_mode, social_callback, start_external_idp_login, start_idc_login,
-        start_social_login, storage_cleanup, storage_stats, switch_profile_region, test_socks_node,
-        update_config, update_status, upsert_socks_node,
+        delete_socks_node, disable_overage, disable_quota_exceeded, enable_overage,
+        export_credential, external_idp_leg1, external_idp_leg2, external_idp_leg2_select,
+        force_refresh_token, get_all_credentials, get_cached_balances, get_config,
+        get_credential_balance, get_load_balancing_mode, get_overage_status, import_keys,
+        list_socks_nodes, list_trash, perform_update, poll_idc_login, poll_social_login,
+        probe_available_models, probe_models_standalone, probe_regions, proxy_test,
+        probe_upstream_models, purge_credential, purge_trash_batch, endpoint_health,
+        recovery_metrics, relogin_oauth, reprobe_credential_region, reset_failure_count,
+        restart_service, restore_credential, set_credential_allowed_models,
+        set_credential_api_region, set_credential_custom_api, set_credential_deepseek_normalize,
+        set_credential_disabled, set_credential_endpoint, set_credential_model_mapping_exempt,
+        set_credential_name, set_credential_priority, set_credential_proxy,
+        set_credential_rpm_limit, set_credential_tag, set_load_balancing_mode, social_callback,
+        start_external_idp_login, start_idc_login, start_social_login, storage_cleanup,
+        storage_stats, switch_profile_region, test_socks_node, update_config, update_status,
+        update_credential_refresh_token, upsert_socks_node,
     },
     middleware::{AdminState, admin_auth_middleware},
     usage_handlers::{
         logs_export, logs_poll, logs_stream, ratelimit_insights, stream_live, traces_search,
-        usage_by_credential, usage_by_model, usage_clients, usage_machines, usage_overview,
-        usage_rate, usage_recent, usage_throughput, usage_timeseries,
+        usage_by_credential, usage_by_model, usage_by_requested_model, usage_clients,
+        usage_machines, usage_overview, usage_rate, usage_recent, usage_throughput,
+        usage_timeseries,
     },
 };
 
@@ -66,6 +68,12 @@ pub fn create_admin_router(state: AdminState) -> Router {
         // 批量删除（静态段 batch-delete 与 {id} 同层，matchit 静态优先）。
         // 支持 force=true 跳过「必须先禁用」门，把批量删 N 个从 2N 次往返降到 1 次。
         .route("/credentials/batch-delete", post(delete_credentials_batch))
+        // 一键禁用所有「余额已超额」的启用号（remaining<=0，数据源=余额缓存，零上游）。
+        // 同样是静态段，与 {id} 同层由 matchit 静态优先。
+        .route(
+            "/credentials/disable-quota-exceeded",
+            post(disable_quota_exceeded),
+        )
         // 批量清理已禁用号（进回收站，可恢复）。候选由服务端算并**排除代挂号**，
         // 故不收 ids —— 判据只有后端一份，前端各写一份必然漂移成误删代挂。
         // 同样是静态段，与 {id} 同层由 matchit 静态优先。
@@ -101,10 +109,21 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/credentials/{id}/api-region",
             post(set_credential_api_region),
         )
+        // 手动重探该号可用 region 并写死（救「自动探测探错」的最后一招）。
+        // 失败只报错不动禁用态 —— 服役号探失败被禁 = 把好号打掉（启动回填教训）。
+        .route(
+            "/credentials/{id}/reprobe-region",
+            post(reprobe_credential_region),
+        )
         // 代挂凭据的 deepseek 协议归一化开关（仅 custom_api 有意义）。
         .route(
             "/credentials/{id}/deepseek-normalize",
             post(set_credential_deepseek_normalize),
+        )
+        // 凭据级模型映射豁免开关（Kiro 号与 custom_api 号都可用）。
+        .route(
+            "/credentials/{id}/model-mapping-exempt",
+            post(set_credential_model_mapping_exempt),
         )
         // 代挂凭据探测上游可用模型（custom_api 专属）。
         .route("/credentials/{id}/upstream-models", get(probe_upstream_models))
@@ -117,7 +136,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/clone", post(clone_credential))
         .route("/credentials/{id}/proxy", post(set_credential_proxy))
         .route("/credentials/{id}/reset", post(reset_failure_count))
+        // OAuth 类凭据自助复活（清惩罚态重新启用；api_key/代挂拒绝）
+        .route("/credentials/{id}/relogin", post(relogin_oauth))
         .route("/credentials/{id}/refresh", post(force_refresh_token))
+        .route("/credentials/{id}/refresh-token", put(update_credential_refresh_token))
         .route("/credentials/{id}/verify", post(deep_verify_credential))
         // External IdP region 验活选择：列候选 region（GET）+ 切换到目标 region profile（POST，仅验活可用才写）
         .route("/credentials/{id}/regions", get(probe_regions))
@@ -156,6 +178,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/usage/overview", get(usage_overview))
         .route("/usage/timeseries", get(usage_timeseries))
         .route("/usage/by-model", get(usage_by_model))
+        .route("/usage/by-requested-model", get(usage_by_requested_model))
         .route("/usage/by-credential", get(usage_by_credential))
         .route("/usage/recent", get(usage_recent))
         // trace 明细搜索/过滤/分页（多维 AND，参数化防注入，单页≤500）
@@ -170,6 +193,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/ratelimit/insights", get(ratelimit_insights))
         // 自愈机器可观测:刷新/failover/自动禁用/冷却/region重探/泄漏清洗 进程级计数器,零上游
         .route("/recovery-metrics", get(recovery_metrics))
+        // 端点自适应派发可观测：每(凭据,端点)的实测 EWMA 成功率 + 样本数，零上游
+        .route("/endpoint-health", get(endpoint_health))
         // SSE 实时流：每 ~1.5s 推一帧轻量快照（全局 inflight/rpm + 每号状态 + 吞吐），零上游
         .route("/stream/live", get(stream_live))
         // 运维日志：内存环形缓冲拉取(增量+级别) / SSE 实时直播 / 一键导出 JSONL(附 bug 报告)

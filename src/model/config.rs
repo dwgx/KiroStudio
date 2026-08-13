@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum TlsBackend {
     Rustls,
@@ -14,6 +14,63 @@ pub enum TlsBackend {
 impl Default for TlsBackend {
     fn default() -> Self {
         Self::Rustls
+    }
+}
+
+/// 限流/重试的**档位预设**（2026-08-11 新增）。
+///
+/// # 它解决什么
+/// 限流与重试相关的配置字段有 **34 个**，但 2026-08-11 逐个核对线上 `config.json`
+/// 与代码路径后发现：真正决定行为的只有 7 个，其中 2 个还是代码常量而非配置；
+/// 14 个是**死配置**（`absorb ×10` 不覆盖透传路径而线上 100% 流量走透传；
+/// `rate_limit ×4` 有实测依据不能开）；另有 3 个是**语义陷阱** ——
+/// 名字看起来是"关掉某功能"，实际会悄悄改变整条链的行为：
+///
+/// | 字段 | 线上值 | 真实语义 |
+/// |---|---|---|
+/// | `cooldown_enabled` | false | 429 后的号**不被跳过、立刻可重选** ⇒ 坏号不退避 |
+/// | `inbound_queue_timeout_passthrough` | true | 排队超时**放行** ⇒ 整形层是"5 秒延迟器"不是限流器 |
+/// | `inbound_rpm_auto` | false | 关着是对的（AIMD 单向棘轮会锁死在下限） |
+///
+/// 前两个方向相同（都放开），叠加后让外层重试外挂的放大能完整穿透进来。
+///
+/// ⚠️ **幅度用实测、别用配置值推算**：2026-08-11 曾按 `SWAP_MAX_ATTEMPTS=60` 推算
+/// 「最坏 480×」，当天实测 shield 日志（84261 行）推翻 —— 19579 次判定全部落
+/// `[passthrough]` 分支、零 `swap`，那个 60 从未被触及；真实每请求尝试**最大 7 次**
+/// （成功均 4.27、放弃均 5.84）⇒ 总放大**约 5.6×**。
+/// 复核命令见 `CLAUDE.md` 的「配置值上限 ≠ 实际放大」一节。
+///
+/// # 为什么默认是 `Manual`
+/// **向前兼容的硬要求**：这 7 个字段都是「非 Option + serde default」，反序列化后
+/// 分不清「用户显式写了 false」和「字段缺失走默认」。而线上 `config.json` 的 102 个键里
+/// **这 7 个全部显式写了** —— 档位若无条件覆盖，会把现有生产配置全部冲掉。
+/// 所以默认 `Manual`（完全不覆盖），老配置读进来行为**零变化**；
+/// 只有用户主动选档才生效，且**只填空、不覆盖显式值**（见 `apply_to`）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "kebab-case")]
+pub enum ThrottleProfile {
+    /// 网关前面有**外部重试外挂**（线上真实链路：`Caddy → kiro_shield.py → KiroStudio`）。
+    ///
+    /// 目标是**不让外层的放大穿透进来**：
+    /// - 整形层做真限流（排队超时返 429 而非放行）—— 对 shield 而言"放行"等于"重试成功"，
+    ///   会让它立刻发下一个，整形反而成了放大器的润滑剂；返 429 才能让它走 cool 分支
+    ///   听我们的 `Retry-After`。
+    /// - 冷却开 —— 让 429 过的号真正退避，而不是被立刻重选（原地打转）。
+    Shielded,
+    /// 客户端**直连**网关，前面没有重试外挂。
+    ///
+    /// 目标是**单请求体验最好**：整形层超时放行（宁可慢也不要拒），
+    /// 吸收层开（网关内部多承担，少让客户端看见错误）。
+    Direct,
+    /// 不做任何档位覆盖，全部读 `config.json` 原值 / 代码默认值。
+    ///
+    /// **这是默认值**，保证既有配置文件的行为零变化。
+    Manual,
+}
+
+impl Default for ThrottleProfile {
+    fn default() -> Self {
+        Self::Manual
     }
 }
 
@@ -114,6 +171,22 @@ pub struct Config {
     #[serde(default = "default_cc_auto_buffer")]
     pub cc_auto_buffer: bool,
 
+    /// Kiro **原生** extended thinking：是否走请求级
+    /// `additionalModelRequestFields.output_config.effort` 触发上游原生
+    /// `reasoningContentEvent`（**默认 false**）。
+    ///
+    /// 关闭（默认）时行为逐字节不变：Opus/Sonnet 的 extended thinking 仍走既有的
+    /// `<thinking_mode>` XML 标签注入。
+    /// 开启后：命中白名单模型（claude-opus-4.8/4.7/4.6、claude-sonnet-4.6，实测过的
+    /// 才放；opus-5/sonnet-5 等未实测的一律回退 XML 注入）+ thinking 启用时，改用
+    /// `output_config.effort` 原生通道并抑制 XML 标签 —— 参考仓实测：只有原生字段
+    /// 能触发 `reasoningContentEvent`，XML 标签既不触发还污染历史上下文。
+    ///
+    /// 热更即时生效：converter 持有进程级镜像（`set_native_thinking_effort_enabled`），
+    /// 改后下个请求即读到新值，不重启。
+    #[serde(default)]
+    pub native_thinking_effort_enabled: bool,
+
     /// 是否启用**批量推号入口** `POST /api/import/keys`（及等价的
     /// `/api/admin/import/keys`）。默认 **true**。
     ///
@@ -164,9 +237,10 @@ pub struct Config {
     /// 429（全池冷却 / 上游账户级速率限流）就地退避重打整条 failover 链，而不是把 429
     /// 直接吐给客户端。等价于把 VPS 上外置的 `kiro_shield.py` 收进网关，使统计与开关进面板。
     ///
-    /// ⚠️ 吸收循环**必须**留在 `acquire_admission()` 之后：入站令牌是「每客户端请求一个」，
-    /// 若在闸门之上重试，一条请求会吃 N 个令牌，把令牌桶按 N 倍速率抽干（这是设计评审的
-    /// BLOCKER 1）。详见 `docs/absorb-layer-design.md`。
+    /// ⚠️ 吸收循环**必须**留在入站准入闸门之下（2026-08-10 起闸门位于 handler 层
+    /// `post_messages` / `post_messages_cc` 入口，透传与 Kiro 两条路径统一过闸）：
+    /// 入站令牌是「每客户端请求一个」，若在闸门之上重试，一条请求会吃 N 个令牌，
+    /// 把令牌桶按 N 倍速率抽干（这是设计评审的 BLOCKER 1）。详见 `docs/absorb-layer-design.md`。
     ///
     /// **默认关。** 2026-08-04 曾短暂改为默认开，当天回退 —— 支撑「默认开」的那个
     /// 数字是错的，记录在此以免重复：
@@ -174,7 +248,7 @@ pub struct Config {
     /// 当时的依据是「24h 74000 请求里可吸收三类合计 38%」。实际只有**上游 429 那
     /// 18.2%** 真的可吸收：
     /// - **池空 16.5% 吸收不了**：唯一的自动复活是全池自愈，而它的退避下限是
-    ///   `SELF_HEAL_BASE_BACKOFF = 60s`（上限 900s），大于吸收层的**总**预算 45s。
+    ///   `selfHealBaseBackoffSecs` 默认 60s（上限 900s），大于吸收层的**总**预算 45s。
     ///   号池在预算内**结构上**不可能恢复，吸收只是让客户端多等满预算再拿同一个 429。
     /// - **整池 RPM 饱和 3.3% 只部分可吸收**：`cooldown.rs` 给的恢复秒数常大于
     ///   `max_delay`（默认 15s），被 clamp 后会**提前**醒来重打一个仍在冷却的池。
@@ -183,9 +257,9 @@ pub struct Config {
     /// 1. `upstream_retry_absorb_budget_secs` 会经 `round_budget` 反向支配**既有的**
     ///    45s failover 墙钟（面板允许填 1）—— 开着时把它调小会截断正常换号重试，
     ///    这是关着时不存在的行为。
-    /// 2. `ABSOLUTE_MAX_TOTAL_RETRIES=12` 的语义从「每请求」变成「每轮」：
-    ///    `max_rounds=3` ⇒ 一条客户端请求最坏 4×12 = **48 次**上游调用，
-    ///    而当初把 64 砍到 12 就是为了压住这个放大。
+    /// 2. `ABSOLUTE_MAX_TOTAL_RETRIES=4` 的语义从「每请求」变成「每轮」：
+    ///    `max_rounds=3` ⇒ 一条客户端请求最坏 4×4 = **16 次**上游调用，
+    ///    而当初把 64 砍到 4 就是为了压住这个放大。
     ///
     /// 结论：这四条修完、且有**真正驱动吸收循环**的运行时测试之后再谈默认开。
     /// 手动开启仍随时可用（面板开关热更即时生效），本字段只决定新装实例的初值。
@@ -215,7 +289,7 @@ pub struct Config {
     /// 是否也吸收 **403 账户级临时风控**（即外挂 `kiro_shield.py` 的「换号空窗」类，默认 false）。
     ///
     /// 默认关的理由：风控窗口约 10 分钟 ≫ 任何合理的单请求预算，窗口内重试成功率接近 0，
-    /// 吸收只是把必然失败推迟再返回；且 `SELF_HEAL_BASE_BACKOFF=60s` 存在的意义就是
+    /// 吸收只是把必然失败推迟再返回；且 `selfHealBaseBackoffSecs` 默认 60s 存在的意义就是
     /// **停止**向刚 403 的账号试探，15s 内重打同账号直接抵消它。
     ///
     /// 开启后额外轮次**硬钉为 1** —— 除非同时设了 `upstream_retry_absorb_swap_budget_secs`
@@ -275,21 +349,22 @@ pub struct Config {
     /// 会因错误码掐会话的客户端是净收益，对普通客户端是可见的长挂 —— 属于部署侧决定，
     /// 不该由升级默默带来。0 时该类的退避与 deadline **逐字节等于**本字段引入前的行为。
     ///
-    /// ⚠️ 仍受 `upstream_retry_absorb_max_rounds` 与 `ABSOLUTE_MAX_TOTAL_RETRIES=12` 约束：
+    /// ⚠️ 仍受 `upstream_retry_absorb_max_rounds` 与 `ABSOLUTE_MAX_TOTAL_RETRIES=4` 约束：
     /// 本旋钮给的是**时间**预算，不是无限轮次。要覆盖完整 10 分钟空窗需要
     /// `max_rounds` 也够大（20+40+60+60… 至少 4 轮），否则只是把一次重试推迟到 20s 后。
     #[serde(default)]
     pub upstream_retry_absorb_swap_budget_secs: u64,
 
-    /// 吸收层**预算耗尽时**回给客户端的状态码（默认 429 = 保持透传现状；唯一另一个可选值 503）。
+    /// 吸收层**预算耗尽时**回给客户端的状态码（默认 **503**；唯一另一个可选值 429）。
     ///
     /// 【为什么这是产品级差异而不是实现细节】外挂原注释：Cursor 见 429 会**掐会话**，
     /// 而对 503 不会。即同一个「网关已经尽力重试但还是没成」的事实，用 429 表达会让客户端
-    /// 直接放弃，用 503 表达会让它自己再退避重试。两者的差别不在网关侧，在客户端的行为。
+    /// 直接放弃（用户实测：全部暂停），用 503 表达会让它自己再退避重试。两者的差别不在
+    /// 网关侧，在客户端的行为。
     ///
-    /// 【为什么默认仍是 429】429 + Retry-After 是**语义正确**的那一个（这确实是限流态），
-    /// 且线上客户端以 Claude Code 为主，它对 429 的退避是正常的。改成 503 是为特定客户端
-    /// （Cursor）做的兼容让步，属部署侧决定。
+    /// 【为什么默认 503】（2026-08-11 改为 503）：503 + Retry-After 触发客户端自动退避，
+    /// 频率受 Retry-After 控制——「网关已尽力、上游仍不可用」是瞬态终态，退避重试是正确
+    /// 行为。只有确实需要 429 语义（如按状态码计费/监控的对接方）才显式填 429。
     ///
     /// 【只影响「吸收层真的跑过并放弃」的那些请求】判据是 provider 在放弃时打的
     /// `absorb_budget_exhausted=1` 标记，不是「所有 429」—— 没进过吸收层的 429 照旧。
@@ -331,6 +406,51 @@ pub struct Config {
     #[serde(default)]
     pub cli_origin_kiro_cli: bool,
 
+    /// CLI 端点是否发 `x-amzn-codewhisperer-optout: false`（即**允许**上游用会话做训练）。
+    ///
+    /// 【为什么要有这个开关】四个参考实现（ZyphrZero / GreyGunG / Foxfishc / M-JYuan）
+    /// 全部发 `false`，其中 Foxfishc/M-JYuan 带抓包出处（`kiro-cli 2.3.0` +
+    /// `Q_LOG_LEVEL=trace`，2026-05-12 实测），所以 `false` 才是**真实官方客户端**的值。
+    /// 本仓历史上发 `true`（隐私优先：拒绝被用于训练）。
+    ///
+    /// 两者是**语义冲突**，不是谁对谁错：
+    /// - `true`（本字段 = false，默认）＝ 隐私优先。代价：该头与真实客户端不一致，
+    ///   理论上可被上游用作「这不是官方客户端」的指纹信号。
+    /// - `false`（本字段 = true）＝ 指纹对齐真实 CLI。代价：**等于同意上游用你的会话
+    ///   内容做训练**。
+    ///
+    /// 因此不由代码替用户决定，做成开关、**默认保持隐私优先**（不改变既有行为）。
+    /// 想最大化伪装成真实 CLI 时再显式打开。
+    ///
+    /// 【热重载】与 `cli_origin_kiro_cli` 同范式：`decorate_api` 从 `ctx.config` 读，
+    /// 而那份 Config 是 provider 每次调用时从 ArcSwap `load_full()` 取的新快照
+    /// ⇒ 改配置后下一个请求即生效，不需要原子镜像。
+    #[serde(default)]
+    pub cli_codewhisperer_optout_false: bool,
+
+    /// CLI 端点 User-Agent 指纹形状：是否对齐真实 `kiro-cli` 抓包值。
+    ///
+    /// 关（默认）＝ 保持本仓历史形状：`user-agent` 与 `x-amz-user-agent` **同一个串**，
+    /// 内含 `api/codewhispererstreaming#1.28.3`（`#` 分隔）与 `m/E`。
+    ///
+    /// 开 ＝ 对齐四个参考实现一致的真实 CLI 形状，三处同时变：
+    /// 1. 两个头拆成**不同**的串 —— `user-agent` 带 `md/appVersion-{}`、
+    ///    `x-amz-user-agent` 带 `m/F` 且不带 appVersion（四家都这么拆，本仓喂同一串）；
+    /// 2. `api/codewhispererstreaming/{ver}` 用 `/` 分隔（本仓用 `#`）；
+    /// 3. `m/E` → `m/F`。
+    ///
+    /// 【为什么做成开关而不是直接改】UA 是最直接的客户端指纹，但**没有任何一家有对照
+    /// 实验数据**证明它影响 429 率或封号率 —— 四家的依据都只是「真实客户端这么发」。
+    /// 在没有真号做 A/B 的前提下直接全池切换，是拿生产流量赌一个未验证的假设；
+    /// 而做成开关就能单号开、比 429 率。默认关 ＝ 不改变既有线上行为。
+    ///
+    /// ⚠️ 已知局限：`amz-sdk-request` 头本仓与参考仓都写死 `attempt=1`，而真实 SDK 会
+    /// 递增 attempt（kiro2cc 是 `attempt={n+1}; max=3`）。所以即便开了本开关，
+    /// **attempt 恒为 1 本身仍是一个指纹**。要彻底对齐需把重试轮次透传进 decorate，
+    /// 涉及 trait 签名变更，未做（见 `cli.rs` 的 TODO）。
+    #[serde(default)]
+    pub cli_ua_align_real_client: bool,
+
     /// 是否启用失败冷却（429/认证失败等后短暂跳过该凭据，默认 true）
     ///
     /// 纯本地反应式调度：仅在凭据已出错时跳过它一段时间，无副作用，建议常开。
@@ -364,6 +484,12 @@ pub struct Config {
     pub rate_limit_jitter_pct: u32,
 
     // ---- 入站请求整形 + RPM 自动挡(治上游 429 雪崩;冷却是号挂后补救,整形在入口削平突发) ----
+    /// 限流/重试的**档位预设**。默认 `Manual`（不覆盖任何字段，老配置行为零变化）。
+    ///
+    /// 选 `Shielded`/`Direct` 后，档位只会填**配置文件里没显式写**的字段 ——
+    /// 完整语义与向前兼容论证见 [`ThrottleProfile`]。
+    #[serde(default)]
+    pub throttle_profile: ThrottleProfile,
     /// 入站整形总开关（默认 true）。开=请求进上游前先过全局令牌桶,突发被排队削平成受控 RPM。
     #[serde(default = "default_true")]
     pub inbound_throttle_enabled: bool,
@@ -406,11 +532,51 @@ pub struct Config {
     #[serde(default = "default_upstream_concurrency_limit")]
     pub upstream_concurrency_limit: usize,
 
+    /// **单个凭据**同时在飞的上游调用数上限（默认 8，重启生效；0 = 不单独限制，
+    /// 退化成全局闸容量）。
+    ///
+    /// 🔴 为什么全局闸不够：全局闸只保证「总在飞 ≤ N」，**不保证分布**。号池里一旦有号
+    /// 响应慢（上游对它排队而不是立刻 429），慢号的请求会长时间占着全局许可 —— 极端情况
+    /// 下 N 个许可全被同一个慢号吃掉，其余健康号一个都拿不到，**整池吞吐被一个号拖死**，
+    /// 而症状显示为系统级的「并发闸已满」，排障时根本指不到是哪个号。
+    ///
+    /// 加这一级后，单号最多占 N_percred 个许可，剩余容量必然留给别的号；且拿不到许可时
+    /// 走的是**换号**（`continue`）而不是放弃请求，池里其它空闲号会立刻接手。
+    ///
+    /// 与选号层 `inflight` 排序是**互补**关系，不是重复：inflight 影响「优先选谁」（软偏好），
+    /// 本闸是「选中了也不许超」（硬上限）。选号可能因会话亲和、RPM 饱和门回退等原因仍旧
+    /// 选中同一个号 —— 那时只有硬闸挡得住。
+    ///
+    /// 默认 8 = 全局默认 16 的一半，保证至少两个号能同时打满。对照 kiro2cc 的两级闸：
+    /// 全局 50 + 每凭据 20（同为 40% 比例量级）。
+    ///
+    /// ⚠️ 与 RPM 无关：RPM 是**速率**（次/分钟，滚动窗口），本闸是**并发度**（同时在飞数）。
+    /// 一个号可以低并发高 RPM（快速串行），也可以高并发低 RPM（慢响应）。本仓的 RPM 逻辑
+    /// （`credential_rpm_limit` / headroom / 饱和门）完全不受本字段影响。
+    #[serde(default = "default_upstream_per_credential_limit")]
+    pub upstream_per_credential_limit: usize,
+
     /// deepseek 归一化的**全局默认**配置（custom_api 代挂 `deepseekNormalize=true` 时生效）。
     /// per-凭据 `deepseek_normalize_config` 可覆盖 fallback_model/min_max_tokens；
     /// bool 开关一律取这里（全局唯一）。TIER1 热重载，改 config.json 立即生效。
     #[serde(default)]
     pub deepseek_normalize: crate::kiro::deepseek_normalize::DeepseekNormalizeConfig,
+
+    /// **全局模型映射**：`{"客户端请求的模型名": "实际发给上游的模型名"}`（默认空 = 不映射）。
+    ///
+    /// 语义（见 [`crate::kiro::model_mapping`] 的完整设计说明）：
+    /// - 在**选号之后、发上游之前**改写模型名。选号门（`allowed_models` 白名单）只看
+    ///   **原始**模型名，映射后**不再**判白名单。
+    /// - 凭据可设 `model_mapping_exempt=true` **完全跳过**本表（安全阀，覆盖"该号上游
+    ///   不认映射后名"的场景）。
+    /// - key 大小写不敏感；**单跳**映射（不做链式，`A→B` 且 `B→C` 只改写 A→B）。
+    /// - 用量统计双口径：`requested_model`（客户端原始名）与 `upstream_model`（映射后名）
+    ///   分别聚合，面板可按两个维度看。
+    ///
+    /// TIER1 热重载，改 config.json 立即生效。一个请求的 failover 循环内只快照**一次**
+    /// 规则表（见 `provider.rs` 的 `mapping_rules`），避免同一请求跨跳用不同规则。
+    #[serde(default)]
+    pub model_mapping: std::collections::HashMap<String, String>,
 
     /// 是否启用会话亲和性（同一会话尽量复用同一凭据，默认 true）
     ///
@@ -724,6 +890,31 @@ pub struct Config {
     #[serde(default = "default_trash_retention_days")]
     pub trash_retention_days: u32,
 
+    // ============ 全池自愈退避（防自愈加深上游封禁，P0）============
+    /// 全池自愈**基础退避**（秒）。第 n 次连续自愈需等 `base × 2^(n-1)`，
+    /// 上限 `self_heal_max_backoff_secs`。任一号成功即清零 streak（见 token_manager
+    /// 的 report_success），真恢复了立刻回到灵敏状态。
+    ///
+    /// 默认 60 的依据（历史教训）：自愈此前**没有任何退避**——选不出号就立刻复活全池，
+    /// 实测 41 分钟触发 36 次（约每 68 秒一次）；403 `temporarily is suspended` 是上游刚下的
+    /// 惩罚，每次复活都立刻再打一轮 = 持续撞同一面墙、加深封禁（用户直接反馈过
+    /// 「已经 403 封号了，不知道为什么一直被自动开启」）。线上 403 突发窗口约 10 分钟，
+    /// 60s 起、翻倍、上限 900s 让探测频率与真实窗口同量级，一个窗口内最多探两三次。
+    ///
+    /// 热重载即时生效：reload_config 换入 ArcSwap 后，下一个自愈周期即按新值退避，无需重启。
+    #[serde(default = "default_self_heal_base_backoff_secs")]
+    pub self_heal_base_backoff_secs: u64,
+
+    /// 全池自愈退避**上限**（秒，默认 900 = 15 分钟）。见 `self_heal_base_backoff_secs`。
+    #[serde(default = "default_self_heal_max_backoff_secs")]
+    pub self_heal_max_backoff_secs: u64,
+
+    /// 指数退避的**指数上限**（默认 4）。防 `2^n` 溢出：60 × 2^4 = 960 已超上限 900，故 4 足够。
+    /// 注意此值只 clamp 指数增长上限，与 `self_heal_max_backoff_secs` 一起决定退避天花板；
+    /// 消费点另有 31 的硬 clamp 兜底（u32 位移溢出 panic 防护）。
+    #[serde(default = "default_self_heal_max_shift")]
+    pub self_heal_max_shift: u32,
+
     // ============ 输入压缩管道（吸收自 Foxfishc__kiro.rs，MIT，致谢）============
     /// 转换后发上游前的输入压缩配置。
     ///
@@ -928,13 +1119,18 @@ fn default_absorb_max_delay_secs() -> u64 {
     15
 }
 
-/// 预算耗尽时回给客户端的状态码：默认 **429**（= 保持既有透传行为）。
+/// 预算耗尽时回给客户端的状态码：默认 **503**（2026-08-11 改为 503）。
+///
+/// 为什么默认 503 而非 429：`429` 语义正确但 **Cursor 一类客户端见 429 会掐会话
+/// （用户观测：全部暂停）**；`503` 会触发客户端自己退避重试，重试频率受
+/// `Retry-After` 控制。吸收层耗尽是「网关已尽力重试、上游仍不可用」的瞬态终态，
+/// 不该让客户端把会话掐死——503 + Retry-After 是安全侧。
 ///
 /// 写成 `default_*()` 函数而不是裸 `#[serde(default)]`：后者对 `u16` 给的是 **0**，
 /// 那是个非法状态码，会让「缺字段的存量 config.json」拿到一个 provider 侧判不出来的值。
 /// 同款陷阱在 `import_keys_enabled` 上已经吃过一次（bool 裸默认是 false）。
 fn default_absorb_exhausted_status() -> u16 {
-    429
+    503
 }
 
 /// 推号入口默认**开**：该端点在本开关之前就存在且有外部对接方在用，
@@ -986,6 +1182,22 @@ fn default_auto_disable_suspicious() -> bool {
     true
 }
 
+/// 全池自愈基础退避：默认 **60s**（= 原 token_manager.rs 硬编码 `SELF_HEAL_BASE_BACKOFF`，
+/// 升级零行为变化）。语义与依据见 `Config::self_heal_base_backoff_secs`。
+fn default_self_heal_base_backoff_secs() -> u64 {
+    60
+}
+
+/// 全池自愈退避上限：默认 **900s**（15 分钟，= 原硬编码 `SELF_HEAL_MAX_BACKOFF`）。
+fn default_self_heal_max_backoff_secs() -> u64 {
+    900
+}
+
+/// 指数退避指数上限：默认 **4**（= 原硬编码 `SELF_HEAL_MAX_SHIFT`）。
+fn default_self_heal_max_shift() -> u32 {
+    4
+}
+
 fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
@@ -1014,6 +1226,11 @@ fn default_inbound_queue_timeout_passthrough() -> bool {
 }
 fn default_upstream_concurrency_limit() -> usize {
     16
+}
+/// 每凭据并发上限默认 8 = 全局默认 16 的一半，保证至少两个号能同时打满
+/// （对照 kiro2cc：全局 50 + 每凭据 20，同为 40% 量级）。
+fn default_upstream_per_credential_limit() -> usize {
+    8
 }
 fn default_cooldown_scale_pct() -> u32 {
     100
@@ -1182,9 +1399,12 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
             cc_auto_buffer: default_cc_auto_buffer(),
+            // native effort 默认关：开关开=白名单模型走 output_config.effort 原生通道
+            // （未验证的协议形状不全池直切，与 cli_origin_kiro_cli 同款保守理由）。
+            native_thinking_effort_enabled: false,
             import_keys_enabled: default_import_keys_enabled(),
             clone_default_enabled: default_clone_default_enabled(),
-            // 吸收层六项：**必须调 default_*()，不得另写字面量** —— 默认值散落多处的
+            // 吸收层十项：**必须调 default_*()，不得另写字面量** —— 默认值散落多处的
             // 历史不一致正是 `cc_auto_buffer_default_is_on_and_consistent_across_mirrors`
             // 那条测试要防的形态。suspended 无 default_*() 函数（裸 serde default）。
             upstream_retry_absorb_enabled: false,
@@ -1201,9 +1421,16 @@ impl Default for Config {
             endpoints: HashMap::new(),
             // CLI body 对齐 kiro-rs 默认关（线上号池正在服务，未验证的协议形状不全池直切）。
             cli_origin_kiro_cli: false,
+            // 隐私优先：默认仍发 optout: true（拒绝会话被用于训练），需显式开启才对齐真实 CLI。
+            cli_codewhisperer_optout_false: false,
+            // UA 指纹对齐默认关：无对照实验数据前不拿生产流量赌未验证假设。
+            cli_ua_align_real_client: false,
             cooldown_enabled: default_cooldown_enabled(),
             cooldown_scale_pct: default_cooldown_scale_pct(),
             rate_limit_jitter_pct: default_rate_limit_jitter_pct(),
+            // 默认 Manual：不覆盖任何字段，保证既有配置行为零变化
+            // （守卫 `throttle_profile_defaults_to_manual_and_changes_nothing` 钉住这点）。
+            throttle_profile: ThrottleProfile::default(),
             inbound_throttle_enabled: default_true(),
             inbound_rpm_auto: default_true(),
             inbound_target_rpm: default_inbound_target_rpm(),
@@ -1213,7 +1440,9 @@ impl Default for Config {
             inbound_queue_max_wait_secs: default_inbound_queue_max_wait_secs(),
             inbound_queue_timeout_passthrough: default_inbound_queue_timeout_passthrough(),
             upstream_concurrency_limit: default_upstream_concurrency_limit(),
+            upstream_per_credential_limit: default_upstream_per_credential_limit(),
             deepseek_normalize: Default::default(),
+            model_mapping: Default::default(),
             rate_limit_enabled: false,
             rate_limit_daily_max: default_rate_limit_daily(),
             rate_limit_min_interval_ms: default_rate_limit_min_interval_ms(),
@@ -1260,6 +1489,10 @@ impl Default for Config {
             login_background_r18: false,
             trash_retention_days: default_trash_retention_days(),
             balance_refresh_interval_secs: default_balance_refresh_interval_secs(),
+            // 自愈退避三项：**必须调 default_*()，不得另写字面量**（默认值守卫兜底）。
+            self_heal_base_backoff_secs: default_self_heal_base_backoff_secs(),
+            self_heal_max_backoff_secs: default_self_heal_max_backoff_secs(),
+            self_heal_max_shift: default_self_heal_max_shift(),
             compression: CompressionConfig::default(),
             overload_fallback_model: None,
             upstream_trace_enabled: false,
@@ -1301,7 +1534,109 @@ impl Config {
         let content = fs::read_to_string(path)?;
         let mut config: Config = serde_json::from_str(&content)?;
         config.config_path = Some(path.to_path_buf());
+
+        // 🔴 档位只对**文件里没显式写**的字段生效（2026-08-11）。
+        //
+        // 为什么必须先看原始 JSON：那 7 个受档位管的字段都是「非 Option + serde default」，
+        // 反序列化**之后**已经分不清「用户显式写了 false」和「字段缺失走了默认 false」。
+        // 而线上 config.json 的 102 个键里这 7 个全部显式写了 —— 无条件覆盖会把生产配置冲掉。
+        // 所以在这里、用解析前的原始 JSON 判定"哪些键真的存在"，档位只填空。
+        let explicit: std::collections::HashSet<String> =
+            match serde_json::from_str::<serde_json::Value>(&content) {
+                Ok(serde_json::Value::Object(m)) => m.keys().cloned().collect(),
+                // 解析成非对象（理论上不可能，上面 from_str::<Config> 已经成功）：
+                // 保守当作"全部显式"，即档位不改任何东西。
+                _ => std::collections::HashSet::new(),
+            };
+        config.apply_throttle_profile(&explicit);
+
         Ok(config)
+    }
+
+    /// **用户从面板主动切档**时用这个：让档位对所有受管字段生效（不做"只填空"保护）。
+    ///
+    /// 与文件加载路径（[`Self::apply_throttle_profile`]，只填空不覆盖）刻意分开：
+    /// - 文件加载时分不清「显式 false」与「缺失默认 false」，而线上那 7 个字段全部显式写过，
+    ///   无条件覆盖会改写生产配置 ⇒ 必须只填空。
+    /// - 面板切档是明确的意图表达；若还只填空，由于键都已存在，会**一个字段都改不动**
+    ///   （按钮点了没反应，比冲掉配置更糟）⇒ 必须真的写进去。
+    ///
+    /// 切档后的值会随 `save()` 落盘成显式键，下次启动时它们就是"显式"的、
+    /// 不会被加载路径再次覆盖 —— 两条路径自洽。
+    pub fn apply_throttle_profile_for_explicit_switch(&mut self) {
+        self.apply_throttle_profile(&std::collections::HashSet::new());
+    }
+
+    /// 把档位预设应用到**未显式配置**的字段上。
+    ///
+    /// `explicit` 是配置文件里真实出现过的 camelCase 键名集合。
+    /// 契约：**只填空、不覆盖**。任何出现在 `explicit` 里的键，档位一律不碰 ——
+    /// 这是向前兼容的核心保证（详见 [`ThrottleProfile`] 的文档）。
+    ///
+    /// `Manual`（默认）直接返回，一个字段都不动。
+    fn apply_throttle_profile(&mut self, explicit: &std::collections::HashSet<String>) {
+        use ThrottleProfile as P;
+        let profile = self.throttle_profile;
+        if profile == P::Manual {
+            return;
+        }
+
+        // 小工具：键未显式出现时才写入。
+        //
+        // ⚠️ `explicit` 必须**显式传进宏**，不能靠宏体直接引用外层局部变量：
+        // `macro_rules!` 的卫生性（hygiene）会让宏体里的标识符在**定义处**的语境解析，
+        // 而不是展开处的语境。靠捕获写出来的版本在本轮实测中会静默失效
+        // （`explicit` 解析不到同一个绑定 ⇒ 检查形同不存在 ⇒ 显式值被覆盖），
+        // 而这恰好是本函数唯一必须守住的契约。
+        macro_rules! fill {
+            ($ex:expr, $key:literal, $field:ident, $val:expr) => {
+                if !$ex.contains($key) {
+                    self.$field = $val;
+                }
+            };
+        }
+
+        match profile {
+            P::Shielded => {
+                // 整形层做真限流：排队超时返 429，而不是放行。
+                // 对 shield 而言"放行"等于"重试成功"（它会立刻发下一个）；返 429 才能让它
+                // 走 cool 分支听我们的 Retry-After，把 60 次重打压成按真值退避。
+                fill!(explicit, 
+                    "inboundQueueTimeoutPassthrough",
+                    inbound_queue_timeout_passthrough,
+                    false
+                );
+                // 冷却开：让 429 过的号真正退避。关掉时坏号会被立刻重选 = 原地打转，
+                // 这是放大链里最便宜的一刀。
+                fill!(explicit, "cooldownEnabled", cooldown_enabled, true);
+                fill!(explicit, "inboundThrottleEnabled", inbound_throttle_enabled, true);
+                // 吸收层：Shielded 档刻意**不开** —— 外层 shield 已经在吸收，
+                // 网关内再吸收会叠乘（shield 60 次 × 网关吸收轮数）。
+                fill!(explicit, 
+                    "upstreamRetryAbsorbEnabled",
+                    upstream_retry_absorb_enabled,
+                    false
+                );
+            }
+            P::Direct => {
+                // 无外挂：宁可慢也不要拒，排队超时放行。
+                fill!(explicit, 
+                    "inboundQueueTimeoutPassthrough",
+                    inbound_queue_timeout_passthrough,
+                    true
+                );
+                fill!(explicit, "cooldownEnabled", cooldown_enabled, true);
+                fill!(explicit, "inboundThrottleEnabled", inbound_throttle_enabled, true);
+                // 吸收层开：网关内部多承担，少让客户端看见错误。
+                // ⚠️ 已知边界：吸收层**不覆盖透传路径**，纯代挂号池下开了也不生效。
+                fill!(explicit, 
+                    "upstreamRetryAbsorbEnabled",
+                    upstream_retry_absorb_enabled,
+                    true
+                );
+            }
+            P::Manual => unreachable!("上面已提前返回"),
+        }
     }
 
     /// 获取配置文件路径（如果有）
@@ -1338,6 +1673,142 @@ impl Config {
 mod tests {
     use super::*;
 
+    /// 🔴 **语义陷阱备忘守卫**（2026-08-11）：这三个开关的名字与真实后果不对应。
+    ///
+    /// 本测试不校验"值应该是什么"（那由部署环境决定），只钉住**默认值**和
+    /// **它们必须成组理解**这件事。它存在的理由是：2026-08-11 排查
+    /// 「外部 30 RPM 打成上游 1000 RPM」时发现，线上这三个的组合
+    /// （`queueTimeoutPassthrough=true` + `cooldownEnabled=false`）**不属于任何一档**——
+    /// 两个方向都放开，于是外层重试外挂的放大能完整穿透到上游
+    /// （幅度以实测为准，见 `ThrottleProfile` 文档；曾推算的 480× 已被实测推翻）。
+    ///
+    /// | 字段 | 名字看起来 | 真实后果 |
+    /// |---|---|---|
+    /// | `cooldown_enabled=false` | 「不用冷却功能」 | 429 过的号**不被跳过、立刻可重选** ⇒ 换号=原地打转 |
+    /// | `inbound_queue_timeout_passthrough=true` | 「排队超时别拒绝」 | 整形层退化成**延迟器**；前面有重试外挂时"放行"=鼓励它立刻重发 |
+    /// | `inbound_rpm_auto`（默认 **true**，线上刻意 **false**） | 「自动调 RPM 挺好」 | 内置 AIMD 是**单向棘轮**：429 乘性减半、回升要 20s 静默 ×N，而实测每 6.4s 一次 429 ⇒ 锁死在下限（曾卡 30 RPM 而池能跑 216）。线上关掉是对的，代价是目标 RPM 完全交给外部脚本 |
+    ///
+    /// 改这三个默认值前请读 [`ThrottleProfile`] 的档位定义，并想清楚
+    /// 「网关前面有没有会自动重试的组件」——这是决定取值的唯一关键问题。
+    #[test]
+    fn throttle_semantic_traps_defaults_are_documented() {
+        let c: Config = serde_json::from_str("{}").expect("缺字段的 config 必须能反序列化");
+
+        // 代码默认值（**不是**线上值）。断言它们是为了：改动时必须来读上面那张表。
+        assert!(
+            c.cooldown_enabled,
+            "cooldown_enabled 的代码默认必须是 true。\
+             改成 false 意味着 429 过的号不再被跳过、会被立刻重选（换号变成原地打转）—— \
+             那是放大链的一环，不是'关掉一个功能'"
+        );
+        assert!(
+            c.inbound_queue_timeout_passthrough,
+            "inbound_queue_timeout_passthrough 的代码默认必须是 true（直连场景：宁可慢不要拒）。\
+             ⚠️ 但网关前面有重试外挂时这个值应当是 false —— 选 ThrottleProfile::Shielded 档，\
+             而不是改这里的默认值（默认值要服务于最常见的直连场景）"
+        );
+        // ⚠️ `inbound_rpm_auto` 的代码默认是 **true**，而线上刻意设成 **false** ——
+        // 这是已知且有依据的分歧，不是配置漂移：
+        //   内置 AIMD 是**单向棘轮**（429 就乘性减半，回升要 20s 静默 ×N），
+        //   而线上实测每 6.4s 就有一次 429 ⇒ 单调下滑锁死在下限
+        //   （曾卡在 30 RPM 而号池能跑 216）。
+        // 所以这里断言的是"默认仍是 true"，用途是：若有人把默认改成 false，
+        // 必须同时来更新这段说明（否则线上那个 false 就失去了"刻意偏离默认"的语境，
+        // 下一个人会以为它只是没设）。
+        assert!(
+            c.inbound_rpm_auto,
+            "inbound_rpm_auto 的代码默认变了（原为 true）。\
+             若这是有意为之，请更新本测试上方关于「线上刻意设 false」的说明 —— \
+             那条记录依赖'代码默认是 true'这个语境才成立"
+        );
+    }
+
+    /// 🔴 **向前兼容硬保证**：档位默认 `Manual`，且 `Manual` 一个字段都不改。
+    ///
+    /// 线上 `config.json` 有 102 个键，受档位管的 7 个**全部显式写了**。
+    /// 若档位默认值不是 `Manual`、或 `Manual` 会改字段，升级二进制的瞬间就会
+    /// 把生产配置整体改写（`inboundQueueTimeoutPassthrough` / `cooldownEnabled`
+    /// 这类开关一翻，限流行为立刻变）。
+    #[test]
+    fn throttle_profile_defaults_to_manual_and_changes_nothing() {
+        // ① 默认必须是 Manual
+        assert_eq!(
+            ThrottleProfile::default(),
+            ThrottleProfile::Manual,
+            "档位默认值必须是 Manual —— 任何别的默认值都会在升级瞬间改写既有生产配置"
+        );
+        let bare: Config =
+            serde_json::from_str("{}").expect("缺字段的 config 必须能反序列化");
+        assert_eq!(
+            bare.throttle_profile,
+            ThrottleProfile::Manual,
+            "配置文件不含 throttleProfile 时必须落到 Manual"
+        );
+
+        // ② Manual 下 apply 不改任何字段（用空 explicit 集合 = 最激进的填空条件）
+        let mut c = bare.clone();
+        let before = (
+            c.inbound_queue_timeout_passthrough,
+            c.cooldown_enabled,
+            c.inbound_throttle_enabled,
+            c.upstream_retry_absorb_enabled,
+        );
+        c.apply_throttle_profile(&std::collections::HashSet::new());
+        assert_eq!(
+            (
+                c.inbound_queue_timeout_passthrough,
+                c.cooldown_enabled,
+                c.inbound_throttle_enabled,
+                c.upstream_retry_absorb_enabled,
+            ),
+            before,
+            "Manual 档必须一个字段都不改"
+        );
+    }
+
+    /// 档位的**只填空不覆盖**契约：显式写过的键，档位一律不碰。
+    #[test]
+    fn throttle_profile_never_overrides_explicit_keys() {
+        // 构造「用户显式把两个开关设成与 Shielded 档相反」的配置
+        let mut c: Config = serde_json::from_str(
+            r#"{"inboundQueueTimeoutPassthrough": true, "cooldownEnabled": false}"#,
+        )
+        .expect("应能反序列化");
+        c.throttle_profile = ThrottleProfile::Shielded;
+
+        let explicit: std::collections::HashSet<String> =
+            ["inboundQueueTimeoutPassthrough", "cooldownEnabled"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        c.apply_throttle_profile(&explicit);
+
+        assert!(
+            c.inbound_queue_timeout_passthrough,
+            "用户显式写的 true 被 Shielded 档冲成了 false —— 违反「只填空不覆盖」契约。\
+             线上 config.json 这 7 个字段全部显式写过，冲掉就是改写生产配置。"
+        );
+        assert!(
+            !c.cooldown_enabled,
+            "用户显式写的 false 被 Shielded 档冲成了 true —— 同上"
+        );
+
+        // 反面：没显式写的字段，档位应当填上
+        let mut c2: Config = serde_json::from_str("{}").expect("应能反序列化");
+        c2.throttle_profile = ThrottleProfile::Shielded;
+        c2.inbound_queue_timeout_passthrough = true; // 代码默认就是 true
+        c2.cooldown_enabled = false;
+        c2.apply_throttle_profile(&std::collections::HashSet::new());
+        assert!(
+            !c2.inbound_queue_timeout_passthrough,
+            "Shielded 档应把未显式配置的 queueTimeoutPassthrough 填成 false（整形做真限流）"
+        );
+        assert!(
+            c2.cooldown_enabled,
+            "Shielded 档应把未显式配置的 cooldownEnabled 填成 true（让 429 过的号真退避）"
+        );
+    }
+
     #[test]
     fn cc_auto_buffer_default_is_on_and_consistent_across_mirrors() {
         // ccAutoBuffer 的默认值散落在**三处**，历史上曾长期不一致
@@ -1362,7 +1833,10 @@ mod tests {
         //   见 anthropic::handlers::tier3_hotreload_tests::cc_auto_buffer_static_matches_config_default
     }
 
-    /// `Config::default()` 的吸收层六项必须走 `default_absorb_*()`，不得另写字面量。
+    /// `Config::default()` 的**带默认函数**吸收层项必须走 `default_absorb_*()`，不得另写
+    /// 字面量（实测守卫覆盖 5 项：budget/max_rounds/min_delay/max_delay/exhausted_status；
+    /// capacity_400 与 swap_budget_secs 无 default 函数，Default 里写与 `serde(default)`
+    /// 一致的字面量，不在此守卫范围）。
     ///
     /// 回退即 FAIL：把 `Config::default()` 里任一项改成硬编码数字（例如 `budget_secs: 60`），
     /// 本测试立刻失败。这是 `cc_auto_buffer` 那条镜像一致性测试的同款守卫 —— 该字段的历史
@@ -1405,13 +1879,61 @@ mod tests {
         );
     }
 
+    /// ⭐ 默认值守卫：自愈退避三项必须走 default_*()，且等于原 token_manager.rs 硬编码值
+    /// （60s / 900s / 4）。常量已从 token_manager.rs 移除，这里是防默认漂移的唯一锚点
+    /// —— 改默认值 = 升级行为变化，必须有意识为之。
+    ///
+    /// 与 `absorb_config_default_goes_through_default_fns` 同款范式：
+    /// - `Config::default()` 必须走 default_*()，不得另写字面量；
+    /// - serde 缺字段路径（存量 config.json 没有这三个键）必须与 Config::default() 同源；
+    /// - 显式配置必须被尊重，否则配置化等于不存在。
+    #[test]
+    fn self_heal_backoff_defaults_go_through_default_fns() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.self_heal_base_backoff_secs,
+            default_self_heal_base_backoff_secs(),
+            "Config::default() 必须走 default_self_heal_base_backoff_secs()"
+        );
+        assert_eq!(
+            cfg.self_heal_max_backoff_secs,
+            default_self_heal_max_backoff_secs()
+        );
+        assert_eq!(
+            cfg.self_heal_max_shift,
+            default_self_heal_max_shift()
+        );
+
+        // 钉死与原硬编码常量同值（token_manager.rs 的 SELF_HEAL_* 已删除）。
+        assert_eq!(default_self_heal_base_backoff_secs(), 60, "原 SELF_HEAL_BASE_BACKOFF=60s");
+        assert_eq!(default_self_heal_max_backoff_secs(), 900, "原 SELF_HEAL_MAX_BACKOFF=900s");
+        assert_eq!(default_self_heal_max_shift(), 4, "原 SELF_HEAL_MAX_SHIFT=4");
+
+        // serde 缺字段路径必须与 Config::default() 同源：存量 config.json 没有这三个键。
+        let from_json: Config =
+            serde_json::from_str("{}").expect("缺字段的 config 必须能反序列化");
+        assert_eq!(from_json.self_heal_base_backoff_secs, 60);
+        assert_eq!(from_json.self_heal_max_backoff_secs, 900);
+        assert_eq!(from_json.self_heal_max_shift, 4);
+
+        // 显式配置必须被尊重（否则配置化等于不存在）。
+        let on: Config = serde_json::from_str(
+            r#"{"selfHealBaseBackoffSecs":5,"selfHealMaxBackoffSecs":60,"selfHealMaxShift":3}"#,
+        )
+        .expect("合法 JSON 必须能反序列化");
+        assert_eq!(on.self_heal_base_backoff_secs, 5);
+        assert_eq!(on.self_heal_max_backoff_secs, 60);
+        assert_eq!(on.self_heal_max_shift, 3);
+    }
+
     /// ⭐ 硬约束守卫：**合并外挂能力的四个新旋钮全部默认「保持现状」**。
     ///
     /// 线上正在服务且号池只剩个位数，任何「顺手改默认值」都是事故。这四项各自的默认值
     /// 都必须是「行为与本批改动之前逐字节相同」的那一侧：
     /// - 两个 bool 默认 false ⇒ 新增的两类（5xx / 容量 400）分类出来也不吸收；
     /// - swap 预算默认 0 ⇒ 换号空窗仍走旧的 min_delay 指数曲线与总预算；
-    /// - 耗尽状态码默认 429 ⇒ provider 不打 `absorb_budget_exhausted=1` 标记，渲染路径不变。
+    /// - 耗尽状态码默认 503（2026-08-11 改）⇒ provider 打 `absorb_budget_exhausted=1` 标记、
+    ///   map_provider_error 首分支回 503 + Retry-After（见下方断言与 handlers 分支守卫）。
     ///
     /// 回退即 FAIL：把任一项默认值改到「新行为」那一侧。
     #[test]
@@ -1431,8 +1953,9 @@ mod tests {
             "换号空窗独立预算默认必须 0 —— 非零意味着单条请求可占用连接数分钟"
         );
         assert_eq!(
-            cfg.upstream_retry_absorb_exhausted_status, 429,
-            "耗尽状态码默认必须 429（保持透传现状）；503 是为 Cursor 做的兼容让步，需显式开"
+            cfg.upstream_retry_absorb_exhausted_status, 503,
+            "耗尽状态码默认必须 503（2026-08-11 改）：429 会让 Cursor 一类客户端掐会话\
+             （用户实测全部暂停）；503 触发客户端退避重试，频率受 Retry-After 控制"
         );
 
         // ⭐ serde 缺字段路径必须与 Config::default() 同源：存量 config.json 没有这四个键。
@@ -1441,8 +1964,9 @@ mod tests {
         assert!(!from_json.upstream_retry_absorb_capacity_400);
         assert_eq!(from_json.upstream_retry_absorb_swap_budget_secs, 0);
         assert_eq!(
-            from_json.upstream_retry_absorb_exhausted_status, 429,
-            "裸 #[serde(default)] 对 u16 给的是 0（非法状态码），必须走 default_* 函数"
+            from_json.upstream_retry_absorb_exhausted_status, 503,
+            "裸 #[serde(default)] 对 u16 给的是 0（非法状态码），必须走 default_* 函数；\
+             缺字段路径默认 503（2026-08-11 改，与 Config::default() 同源）"
         );
 
         // 显式开启仍必须被尊重，否则这些开关等于不存在。
@@ -1457,12 +1981,38 @@ mod tests {
         assert_eq!(on.upstream_retry_absorb_exhausted_status, 503);
     }
 
+    /// ⭐ 硬约束守卫：`native_thinking_effort_enabled` **默认必须关**（= 行为逐字节不变）。
+    ///
+    /// 开=白名单模型 + thinking 走 `output_config.effort` 原生通道并抑制 XML 标签注入，
+    /// 而那条通道只有参考仓单次实测支撑（2026-06-07，Kiro CLI 2.6.0 + Opus 4.8），
+    /// 未验证的协议形状不全池直切（与 `cli_origin_kiro_cli` 同款保守理由）。
+    ///
+    /// 回退即 FAIL：把默认改成 true，或 serde 缺字段路径与 Config::default() 分叉。
+    #[test]
+    fn native_thinking_effort_defaults_to_off() {
+        assert!(
+            !Config::default().native_thinking_effort_enabled,
+            "native effort 默认必须关：未验证的协议形状不得随升级全池直切"
+        );
+        // serde 缺字段路径与 Config::default() 同源：存量 config.json 没有这个键。
+        let from_json: Config = serde_json::from_str("{}").expect("缺字段的 config 必须能反序列化");
+        assert_eq!(
+            from_json.native_thinking_effort_enabled,
+            Config::default().native_thinking_effort_enabled,
+            "serde default 与 Config::default() 必须一致"
+        );
+        // 显式开启必须仍被尊重，否则开关等于不存在。
+        let on: Config = serde_json::from_str(r#"{"nativeThinkingEffortEnabled":true}"#)
+            .expect("显式值必须能反序列化");
+        assert!(on.native_thinking_effort_enabled);
+    }
+
     /// 吸收层与 403 风控吸收**都默认关**。
     ///
     /// 「默认开」在 2026-08-04 试过并当天回退：支撑它的「38% 可吸收」是错的
     /// （池空那 16.5% 的自愈退避下限 60s > 吸收总预算 45s，结构上吸收不了），
     /// 且开着会让 `budget_secs` 反向支配既有的 45s failover 墙钟、把
-    /// `ABSOLUTE_MAX_TOTAL_RETRIES` 从每请求变成每轮（最坏 48 次上游调用）。
+    /// `ABSOLUTE_MAX_TOTAL_RETRIES` 从每请求变成每轮（最坏 16 次上游调用）。
     /// 完整依据见 `upstream_retry_absorb_enabled` 的字段文档。
     ///
     /// 回退即 FAIL：把任一默认改成 true。

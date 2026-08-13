@@ -648,8 +648,13 @@ struct Inner {
     hours: Vec<TimeBucket>,
     /// 天环形桶
     days: Vec<TimeBucket>,
-    /// 按模型全量累计
+    /// 按「上游实际服务模型」全量累计（key = `r.upstream_model` 映射后名，None 回落
+    /// `r.model`）。与 [`Self::by_requested_model`]（客户端原始名口径）独立有界，
+    /// 见 `Inner::apply` 的注释。
     by_model: HashMap<String, Aggregate>,
+    /// 按「客户端请求的原始模型名」全量累计（key = `r.requested_model`，None 回落
+    /// `r.model`）。与 `by_model` 独立有界，见 `Inner::apply` 的注释。
+    by_requested_model: HashMap<String, Aggregate>,
     /// 按凭据全量累计
     by_credential: HashMap<u64, Aggregate>,
     /// per-credential 速率环
@@ -661,12 +666,13 @@ struct Inner {
 }
 
 impl Inner {
-    /// `by_model` 的模型名最大保留长度（超出即截断）。
+    /// 模型名 key（`by_model` / `by_requested_model` 两表共用）的最大保留长度（超出即截断）。
     ///
     /// 模型名正常都在 40 字符内（目录里最长约 30）。128 留足余量，
     /// 同时阻断"用超长字符串放大单条内存"这一路。
     const MODEL_KEY_MAX_LEN: usize = 128;
-    /// `by_model` 的最大不同模型数。超过后新模型名一律归入 [`Self::MODEL_KEY_OTHER`]。
+    /// 单张模型表（`by_model` / `by_requested_model`）的最大不同模型数。超过后新模型名
+    /// 一律归入 [`Self::MODEL_KEY_OTHER`]。
     ///
     /// 目录里的模型数是十几个量级，256 足以容纳"全部真实模型 + 少量历史遗留名"，
     /// 又把无界增长封死在常数级。
@@ -674,7 +680,7 @@ impl Inner {
     /// 超出 [`Self::MODEL_KEY_CAP`] 后的归并桶名。
     const MODEL_KEY_OTHER: &'static str = "(other)";
 
-    /// 把模型名收敛成**有界**的 by_model key。
+    /// 把模型名收敛成**有界**的模型表 key（两表共用）。
     ///
     /// 两道：① 超长截断（UTF-8 安全，按字符边界）；② 表满则归入 OTHER 桶。
     /// 已存在的 key 永远直接命中（调用方先查 entry），所以真实模型一旦入表不会被挤进 OTHER。
@@ -697,6 +703,7 @@ impl Inner {
             hours: vec![TimeBucket::new(); HOUR_BUCKETS],
             days: vec![TimeBucket::new(); DAY_BUCKETS],
             by_model: HashMap::new(),
+            by_requested_model: HashMap::new(),
             by_credential: HashMap::new(),
             rate: RateRing::default(),
             client_agg: ClientAgg::default(),
@@ -727,7 +734,7 @@ impl Inner {
         }
         db.agg.add(r);
 
-        // 按模型累计。
+        // 按「上游实际服务模型」累计（映射双口径的 upstream 维度）。
         //
         // 🔴 修复的缺陷：`by_model` 的 key 是**外部可控字符串**，而这张表**永不回收** ——
         // `ClientAgg::prune` 只清 by_session / by_client / by_machine，不碰 by_model，
@@ -746,8 +753,35 @@ impl Inner {
         //
         // 修法是在**边界**收敛而非事后清理：超长名截断、表满则归入 OTHER 桶。
         // 归桶而不是丢弃，是为了保住"总量守恒"——面板的模型分布仍能对上总请求数。
+        //
+        // ⭐ 2026-08-11 全量审计修复（双口径复制品）：key 改用 `upstream_model`
+        // （映射后/上游实际服务名，None 回落 `r.model`）。旧实现的 key 是 `r.model`，
+        // 与 `by_requested_model` 的回落值（`requested_model` 要么等于 `r.model`、要么
+        // None 回落）恒等 ⇒ 两表内容恒等，`by_model` 从未表达过注释声称的「上游口径」。
+        // 映射后名虽是受控集，仍走同一套有界策略（MODEL_KEY_CAP/MAX_LEN/OTHER 对两表
+        // 分别生效）——历史 JSONL 重放可能带旧实现的脏 key/预判值，不能假设受控。
+        // 未映射/失败记录（None）回落 `r.model`，保证「上游维度请求总数 = 总请求数」。
         self.by_model
-            .entry(Self::normalize_model_key(&r.model, self.by_model.len()))
+            .entry(Self::normalize_model_key(
+                r.upstream_model.as_deref().unwrap_or(&r.model),
+                self.by_model.len(),
+            ))
+            .or_default()
+            .add(r);
+
+        // 双口径的第二张表：**客户端请求的原始模型名**（`requested_model`；`None` 回落
+        // `r.model`）。与 `by_model` 各自独立有界（MODEL_KEY_CAP/MAX_LEN/OTHER 对两表
+        // 分别生效），避免「一张表两个口径」绕过表满归桶 —— 外部可控字符串无法靠
+        // 映射把同一个 key 塞进两张表挤爆任意一张。
+        //
+        // 两表语义（2026-08-11 审计修复后）：`by_model` 收 `upstream_model`（映射后名），
+        // 本表收 `requested_model`（客户端原始名）——映射命中且改写时两表 key 不同；
+        // 未映射/失败记录（None）各自回落 `r.model`，两维度请求总数恒等。
+        self.by_requested_model
+            .entry(Self::normalize_model_key(
+                r.requested_model.as_deref().unwrap_or(&r.model),
+                self.by_requested_model.len(),
+            ))
             .or_default()
             .add(r);
 
@@ -1176,29 +1210,66 @@ impl UsageStats {
         let now_hour = now_ms.div_euclid(HOUR_MS);
         let now_day = now_ms.div_euclid(DAY_MS);
 
-        // 最近 24 小时：小时 slot ∈ [now_hour-23, now_hour]
+        // ══════════════════════════════════════════════════════════════════════
+        // 🔴 修的缺陷：窗口名与实际覆盖范围不符，导致面板数字每天定时"跳水"。
+        //
+        // 原实现的 `last_7d` 是「最近 7 个**日历天桶**」（`slot >= now_day - 6`），
+        // 不是「最近 7×24 小时」。当天那个桶只累积到"此刻"，所以实际覆盖是
+        // `6 天 + 今天已过的时长`：
+        //   - UTC 刚过零点（00:05）→ 实际只覆盖 **6.00 天**（比名字少 23.9 小时）
+        //   - UTC 12:00          → 6.50 天
+        //   - UTC 23:55          → 7.00 天
+        // 于是每天 UTC 零点一到，`last_7d` 会**断崖式掉掉近一天的量**，看起来像流量
+        // 暴跌，实际只是窗口缩了。`last_30d` 同理，`last_24h` 也少一个小时零头
+        // （`slot >= now_hour - 23` 只有 23 个整小时 + 当前小时的零头）。
+        //
+        // 改法：**统一用小时桶算真正的滚动窗口**。小时环有 744 个桶（31 天），
+        // 足够覆盖 24h / 7d / 30d 三个窗口，所以不需要天桶参与，也就不会被
+        // 日历边界截断。窗口定义变成闭区间 `[now_hour - (N-1), now_hour]`，
+        // 即"最近 N 个小时桶"，N 分别取 24 / 168 / 720。
+        //
+        // 残留的粒度误差只有「当前小时未走完」这一项（最多 59 分钟），且它对三个窗口
+        // 是**同向同量**的，不会再出现零点跳水。要完全消除得按毫秒切分桶内数据，
+        // 而桶是聚合值、内部已无时间信息，做不到 —— 这是刻意接受的精度上限。
+        //
+        // ⚠️ 时区：桶按 UTC 对齐（`HOUR_MS`/`DAY_MS` 整除，无本地偏移）。滚动窗口
+        // 对时区**不敏感**（"最近 24 小时"在任何时区都是同一段时间），所以本修复顺带
+        // 消除了原实现"当天=UTC 当天"带来的时区困扰：+08:00 的用户原先看到的"今天"
+        // 是北京时间早 8 点才开始的一天。日历口径若将来要做（如"本月账单"），
+        // 需要额外引入时区配置，那是另一件事。
+        // ══════════════════════════════════════════════════════════════════════
+        const H_24H: i64 = 24;
+        const H_7D: i64 = 7 * 24;
+        const H_30D: i64 = 30 * 24;
+
         let mut agg24 = Aggregate::default();
+        let mut agg7 = Aggregate::default();
+        let mut agg30 = Aggregate::default();
         for b in &inner.hours {
-            if b.slot >= 0 && b.slot >= now_hour - 23 && b.slot <= now_hour {
+            // slot < 0 是未初始化的空桶；slot > now_hour 是时钟回拨留下的未来桶，都跳过。
+            if b.slot < 0 || b.slot > now_hour {
+                continue;
+            }
+            let age = now_hour - b.slot; // 0 = 当前小时
+            if age < H_24H {
                 agg24.merge(&b.agg);
+            }
+            if age < H_7D {
+                agg7.merge(&b.agg);
+            }
+            if age < H_30D {
+                agg30.merge(&b.agg);
             }
         }
 
-        // 最近 7 天 / 30 天：天 slot 区间
-        let mut agg7 = Aggregate::default();
-        let mut agg30 = Aggregate::default();
+        // 全部：仍用天桶（保留期内所有天，受 stats 保留期限制，非严格历史全量）。
+        // 这里用天桶是对的 —— all_time 不是滚动窗口，不存在边界截断问题，而天桶的
+        // 保留期（31 天）与小时桶一致但内存占用小得多。
         let mut agg_all = Aggregate::default();
         for b in &inner.days {
             if b.slot < 0 || b.slot > now_day {
                 continue;
             }
-            if b.slot >= now_day - 6 {
-                agg7.merge(&b.agg);
-            }
-            if b.slot >= now_day - 29 {
-                agg30.merge(&b.agg);
-            }
-            // 全部:保留期内所有天桶(受 stats 保留期限制)。
             agg_all.merge(&b.agg);
         }
 
@@ -1287,11 +1358,32 @@ impl UsageStats {
         out
     }
 
-    /// 按模型全量聚合（按请求数降序）
+    /// 按「上游实际服务模型」全量聚合（映射双口径的 upstream 维度；按请求数降序）。
+    ///
+    /// key = `r.upstream_model`（映射后/上游实际服务名），`None`（未映射/失败记录）
+    /// 回落 `r.model`。与 [`Self::by_requested_model`]（客户端原始名）是同一批记录的
+    /// 两个口径，请求总数恒等，只是分组键不同。
     pub fn by_model(&self) -> Vec<GroupStat> {
         let inner = self.inner.lock();
         let mut out: Vec<GroupStat> = inner
             .by_model
+            .iter()
+            .map(|(k, a)| GroupStat::from(k.clone(), a))
+            .collect();
+        out.sort_by(|a, b| b.requests.cmp(&a.requests).then(a.key.cmp(&b.key)));
+        out
+    }
+
+    /// 按「客户端请求的原始模型名」全量聚合（映射双口径的 requested 维度）。
+    ///
+    /// 与 [`Self::by_model`] 是同一批记录的两个口径：`by_model` 记**上游实际服务**的
+    /// 模型（`upstream_model`，映射命中时是映射后名；未映射回落 `r.model`），本方法记
+    /// **客户端点名**的模型（`requested_model`，`None` 回落 `r.model`）。两维度的请求
+    /// 总数恒等（同一批 `apply`），只是分组键不同。
+    pub fn by_requested_model(&self) -> Vec<GroupStat> {
+        let inner = self.inner.lock();
+        let mut out: Vec<GroupStat> = inner
+            .by_requested_model
             .iter()
             .map(|(k, a)| GroupStat::from(k.clone(), a))
             .collect();
@@ -1619,6 +1711,70 @@ mod tests {
         assert_eq!(ov.last_30d.requests, 3);
     }
 
+    /// 🔴 窗口是**滚动**的，不是日历天桶 —— 钉死"零点跳水"缺陷。
+    ///
+    /// 构造：在"6 天 23 小时前"放一条。它距今不足 7×24 小时，所以**必须**计入
+    /// `last_7d`。旧实现按日历天桶算（`slot >= now_day - 6`），这条记录落在第 7 天
+    /// 之前的桶里会被排除 —— 于是每天 UTC 零点一过，`last_7d` 就少掉近一天的量。
+    #[test]
+    fn overview_windows_are_rolling_not_calendar_days() {
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        // now 取一个"刚过 UTC 零点"的时刻，这是旧实现偏差最大的相位。
+        let now = BASE_MS + 5 * 60_000; // BASE_MS 是 UTC 日边界，+5 分钟
+        // 6 天 23 小时前：距今 167h < 168h ⇒ 属于最近 7 天。
+        s.on_record(&rec(
+            5 * 60_000 - 167 * HOUR_MS,
+            Some(1),
+            "m",
+            RequestOutcome::Success,
+            1,
+            1,
+        ));
+        // 23 小时前：属于最近 24 小时。
+        s.on_record(&rec(
+            5 * 60_000 - 23 * HOUR_MS,
+            Some(1),
+            "m",
+            RequestOutcome::Success,
+            1,
+            1,
+        ));
+
+        let ov = s.overview_at(now);
+        assert_eq!(
+            ov.last_24h.requests, 1,
+            "23 小时前那条必须计入 last_24h（滚动 24 小时）"
+        );
+        assert_eq!(
+            ov.last_7d.requests, 2,
+            "6 天 23 小时前那条必须计入 last_7d —— 旧的日历天桶口径会漏掉它，\
+             导致每天 UTC 零点后 last_7d 断崖式掉近一天的量"
+        );
+        assert_eq!(ov.last_30d.requests, 2, "两条都在 30 天内");
+    }
+
+    /// 滚动窗口的边界是排他的：正好超出窗口的记录不得计入。
+    #[test]
+    fn overview_windows_exclude_records_just_outside() {
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        let now = BASE_MS + 30 * HOUR_MS;
+        // 距今正好 24 小时（age == 24）⇒ 落在 last_24h 之外，但在 7d 内。
+        s.on_record(&rec(
+            30 * HOUR_MS - 24 * HOUR_MS,
+            Some(1),
+            "m",
+            RequestOutcome::Success,
+            1,
+            1,
+        ));
+        let ov = s.overview_at(now);
+        assert_eq!(
+            ov.last_24h.requests, 0,
+            "age 恰好 24 小时应被排除（窗口是最近 24 个小时桶：age < 24）"
+        );
+        assert_eq!(ov.last_7d.requests, 1, "但仍在 7 天窗口内");
+    }
+
     #[test]
     fn test_cross_hour_and_cross_day() {
         let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
@@ -1702,6 +1858,154 @@ mod tests {
         assert_eq!(c1.input_tokens, 20);
         let c2 = creds.iter().find(|c| c.key == "2").unwrap();
         assert_eq!(c2.requests, 1);
+    }
+
+    /// 映射双口径：`by_model`（上游实际服务名）与 `by_requested_model`（客户端原始名）
+    /// 是同一批记录的两种分组，请求总数恒等，只是 key 不同。
+    ///
+    /// ⭐ 2026-08-11 修复后的语义：`by_model` 聚合 `upstream_model`（映射后名），
+    /// `by_requested_model` 聚合 `requested_model`（客户端原始名）——映射后名与原始名
+    /// 不同的记录**分属两表**。修复前 `by_model` key 用 `r.model`，与回落值恒等 ⇒
+    /// 两表内容恒等（审计登记的双口径复制品缺陷）。
+    #[test]
+    fn test_by_model_and_by_requested_model_two_dimensions() {
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        // 客户端点 claude-haiku-4-5（r.model = 原始名，与真实埋点形态一致），
+        // 映射后上游实际服务 claude-sonnet-4-5。
+        // ⚠️ 构造必须这样：若把 r.model 直接设成映射后名，旧实现（key=r.model）下
+        // 本测试的「by_model 不得出现原始名」断言照样绿 —— 回归保护失效
+        // （2026-08-11 对抗审查 M1）。
+        {
+            let mut r = rec(0, Some(1), "claude-haiku-4-5", RequestOutcome::Success, 10, 5);
+            r.requested_model = Some("claude-haiku-4-5".to_string());
+            r.upstream_model = Some("claude-sonnet-4-5".to_string());
+            s.on_record(&r);
+        }
+        // 未映射的记录：requested_model / upstream_model 缺省（None）→ 都回落 model。
+        s.on_record(&rec(1000, Some(1), "claude-opus-4-8", RequestOutcome::Success, 20, 10));
+
+        let upstream = s.by_model();
+        assert_eq!(upstream.len(), 2, "上游维度应有 sonnet + opus 两条");
+        let sonnet = upstream.iter().find(|m| m.key == "claude-sonnet-4-5").unwrap();
+        assert_eq!(sonnet.requests, 1);
+
+        let requested = s.by_requested_model();
+        assert_eq!(requested.len(), 2, "请求维度应有 haiku + opus 两条");
+        let haiku = requested.iter().find(|m| m.key == "claude-haiku-4-5").unwrap();
+        assert_eq!(haiku.requests, 1);
+        let opus = requested.iter().find(|m| m.key == "claude-opus-4-8").unwrap();
+        assert_eq!(opus.requests, 1);
+
+        // 分属两表：by_model 不得出现客户端原始名，by_requested_model 不得出现映射后名。
+        assert!(
+            upstream.iter().all(|m| m.key != "claude-haiku-4-5"),
+            "by_model 按映射后名分组，不得出现客户端原始名"
+        );
+        assert!(
+            requested.iter().all(|m| m.key != "claude-sonnet-4-5"),
+            "by_requested_model 按客户端原始名分组，不得出现映射后名"
+        );
+
+        // 两维度总数恒等（同一批记录的不同分组）。
+        let upstream_total: u64 = upstream.iter().map(|g| g.requests).sum();
+        let requested_total: u64 = requested.iter().map(|g| g.requests).sum();
+        assert_eq!(upstream_total, requested_total);
+        assert_eq!(upstream_total, 2);
+    }
+
+    /// ⭐ 2026-08-11 全量审计修复（双口径复制品）的回落回归：
+    /// `by_model` 聚合 `upstream_model`（映射后名），`None` 时回落 `r.model`。
+    ///
+    /// 三类样本：① 映射后名 ≠ 原始名 → 分属两表；② 映射后名 = 原始名（等价未映射）；
+    /// ③ `upstream_model = None`（未映射/失败记录）→ `by_model` 回落 `r.model`。
+    #[test]
+    fn by_model_aggregates_upstream_model_with_fallback() {
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        // ① 映射后名 ≠ 原始名（r.model = 原始名，与真实埋点形态一致；旧实现 key=r.model
+        // 时本测试的「by_model 不得出现原始名」断言必红 —— 对抗审查 M1 修正）。
+        {
+            let mut r = rec(0, Some(1), "claude-haiku-4-5", RequestOutcome::Success, 10, 5);
+            r.requested_model = Some("claude-haiku-4-5".to_string());
+            r.upstream_model = Some("claude-sonnet-4-5".to_string());
+            s.on_record(&r);
+        }
+        // ② 映射后名 = 原始名（映射到同名，等价未映射）。
+        {
+            let mut r = rec(1_000, Some(1), "claude-opus-4-8", RequestOutcome::Success, 20, 10);
+            r.requested_model = Some("claude-opus-4-8".to_string());
+            r.upstream_model = Some("claude-opus-4-8".to_string());
+            s.on_record(&r);
+        }
+        // ③ upstream_model = None（未映射/失败记录）→ by_model 回落 r.model。
+        s.on_record(&rec(2_000, Some(1), "claude-opus-4-8", RequestOutcome::Success, 5, 5));
+
+        let upstream = s.by_model();
+        let sonnet = upstream
+            .iter()
+            .find(|m| m.key == "claude-sonnet-4-5")
+            .unwrap_or_else(|| panic!("映射后名应出现在 by_model: {:?}", upstream));
+        assert_eq!(sonnet.requests, 1);
+        let opus = upstream
+            .iter()
+            .find(|m| m.key == "claude-opus-4-8")
+            .unwrap_or_else(|| panic!("None 应回落 r.model: {:?}", upstream));
+        assert_eq!(opus.requests, 2, "② 与 ③ 都归 opus");
+
+        let requested = s.by_requested_model();
+        let haiku = requested
+            .iter()
+            .find(|m| m.key == "claude-haiku-4-5")
+            .unwrap_or_else(|| panic!("原始名应出现在 by_requested_model: {:?}", requested));
+        assert_eq!(haiku.requests, 1);
+        let opus_r = requested
+            .iter()
+            .find(|m| m.key == "claude-opus-4-8")
+            .unwrap();
+        assert_eq!(opus_r.requests, 2, "② 与 ③（None 回落 model）都归 opus");
+
+        // 分属两表：by_model 里没有原始名、by_requested_model 里没有映射后名。
+        assert!(
+            upstream.iter().all(|m| m.key != "claude-haiku-4-5"),
+            "by_model 不得出现客户端原始名"
+        );
+        assert!(
+            requested.iter().all(|m| m.key != "claude-sonnet-4-5"),
+            "by_requested_model 不得出现映射后名"
+        );
+
+        // 总量守恒：两维度请求总数都等于总请求数（3）。
+        let upstream_total: u64 = upstream.iter().map(|g| g.requests).sum();
+        let requested_total: u64 = requested.iter().map(|g| g.requests).sum();
+        assert_eq!(upstream_total, 3, "by_model 总量必须守恒");
+        assert_eq!(requested_total, 3, "by_requested_model 总量必须守恒");
+    }
+
+    /// 双口径下 `by_requested_model` 对**外部可控**字符串同样有界：
+    /// 随机模型名塞满 requested 表也归入 OTHER，不会无界增长（复现 #21 教训的
+    /// `by_model` 无界缺陷在第二张表上不复发）。
+    #[test]
+    fn test_by_requested_model_is_bounded() {
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        // 用 distinct 的原始模型名塞超过 MODEL_KEY_CAP 的记录。
+        for i in 0..(Inner::MODEL_KEY_CAP + 50) {
+            let mut r = rec(
+                i as i64,
+                Some(1),
+                &format!("mapped-{i}"),
+                RequestOutcome::Success,
+                1,
+                0,
+            );
+            r.requested_model = Some(format!("client-model-{i}"));
+            s.on_record(&r);
+        }
+        let requested = s.by_requested_model();
+        // 表满后新名归入 OTHER 桶：条目数 ≤ CAP + 1（含 OTHER）。
+        assert!(
+            requested.len() <= Inner::MODEL_KEY_CAP + 1,
+            "by_requested_model 无界增长：{} 条",
+            requested.len()
+        );
     }
 
     /// ⭐ 回归（已知问题 #21）：`retries` 必须进聚合层，且两个口径都要对。
