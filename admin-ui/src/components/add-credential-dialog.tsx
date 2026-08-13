@@ -15,6 +15,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { NumberStepper } from '@/components/ui/number-stepper'
 import { Select } from '@/components/ui/select'
+import { RegionSelect } from '@/components/ui/region-select'
 import { ProxyTestButton } from '@/components/proxy-test-button'
 import { useAddCredential, useCredentials } from '@/hooks/use-credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
@@ -167,7 +168,7 @@ function toAddRequest(raw: Record<string, unknown>): AddCredentialRequest | null
     return undefined
   }
 
-  const kiroApiKey = pickString(g('kiroApiKey', 'kiro_api_key', 'apiKey', 'api_key'))
+  const kiroApiKey = pickString(g('kiroApiKey', 'kiro_api_key', 'apiKey', 'api_key', 'key'))
   const refreshToken = pickString(g('refreshToken', 'refresh_token'))
   const explicitMethod = normalizeAuthMethod(pickString(g('authMethod', 'auth_method')))
 
@@ -188,6 +189,10 @@ function toAddRequest(raw: Record<string, unknown>): AddCredentialRequest | null
       ),
       machineId: pickString(g('machineId', 'machine_id')),
       endpoint: pickString(g('endpoint')),
+      // items[]（kiro-accounting 导出）里会带 disabled —— 已知被封的号应以禁用态导入，
+      // 否则入池瞬间被投进调度、换回 403 反而加深上游对该批号的风控。字段名与后端
+      // ImportKeyItem 一致，真值才下发。
+      disabled: g('disabled') === true ? true : undefined,
     }
   }
 
@@ -223,7 +228,8 @@ function toAddRequest(raw: Record<string, unknown>): AddCredentialRequest | null
 }
 
 // 从解析出的任意结构里抽取一批凭据请求。
-// 兼容：数组 / {credentials:[...]} / {accounts:[...]}(KAM) / 单对象
+// 兼容：数组 / {credentials:[...]} / {accounts:[...]}(KAM) / {items:[...]} / {keys:[...]}
+// (kiro-accounting 导出) / 单对象
 function extractCredentials(parsed: unknown): AddCredentialRequest[] {
   let items: unknown[]
   if (Array.isArray(parsed)) {
@@ -232,6 +238,11 @@ function extractCredentials(parsed: unknown): AddCredentialRequest[] {
     const obj = parsed as Record<string, unknown>
     if (Array.isArray(obj.accounts)) items = obj.accounts
     else if (Array.isArray(obj.credentials)) items = obj.credentials
+    // 后端 /import/keys 的格式 1/2（parse_import_keys_request）：
+    // items = [{ key, endpoint?, disabled?, apiRegion? }]，keys = 字符串数组。
+    // items 项里的 key 由 toAddRequest 的 'key' 候选兜住。
+    else if (Array.isArray(obj.items)) items = obj.items
+    else if (Array.isArray(obj.keys)) items = obj.keys
     else items = [obj]
   } else {
     return []
@@ -239,7 +250,10 @@ function extractCredentials(parsed: unknown): AddCredentialRequest[] {
 
   const reqs: AddCredentialRequest[] = []
   for (const item of items) {
-    if (item && typeof item === 'object') {
+    if (typeof item === 'string' && item.trim()) {
+      // keys[] 是纯字符串数组（后端格式 2），直接包成 api_key 请求
+      reqs.push({ authMethod: 'api_key', kiroApiKey: item.trim() })
+    } else if (item && typeof item === 'object') {
       const req = toAddRequest(item as Record<string, unknown>)
       if (req) reqs.push(req)
     }
@@ -275,6 +289,10 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [baseUrl, setBaseUrl] = useState('')
   const [customApiKey, setCustomApiKey] = useState('')
   const [requestLimit, setRequestLimit] = useState('')
+  // 自定义 API 代挂：是否无条件抢在所有 Kiro 号之前（省略 = 跟随全局 customApiFirst）
+  const [customApiFirst, setCustomApiFirst] = useState(false)
+  // 导入后是否直接以禁用态入池（重新导入已知被封的号时用）
+  const [importDisabled, setImportDisabled] = useState(false)
   const [priority, setPriority] = useState('0')
   // 多开份数：同一账号导入 N 份，每份自动分配独立 machineId。1 = 普通上号。
   const [copies, setCopies] = useState('1')
@@ -379,6 +397,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setBaseUrl('')
     setCustomApiKey('')
     setRequestLimit('')
+    setCustomApiFirst(false)
+    setImportDisabled(false)
     setUpstreamModels(null)
     setProbeError('')
     setUpstreamSelected(new Set())
@@ -472,6 +492,11 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         baseUrl: authMethod === 'custom_api' ? baseUrl.trim() || undefined : undefined,
         apiKey: authMethod === 'custom_api' ? customApiKey.trim() || undefined : undefined,
         requestLimit: authMethod === 'custom_api' ? (parseInt(requestLimit) || undefined) : undefined,
+        // 只在勾选时下发 true：省略 = 跟随全局 customApiFirst（默认 false = 公平比较），
+        // 与后端 Option<bool> 的三态语义一致。
+        customApiFirst: authMethod === 'custom_api' && customApiFirst ? true : undefined,
+        // 以禁用态入池：默认不勾（与旧行为一致，后端默认 false）。
+        disabled: importDisabled ? true : undefined,
         allowedModels:
           authMethod === 'custom_api' && upstreamSelected.size > 0
             ? Array.from(upstreamSelected)
@@ -776,6 +801,25 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                       disabled={isPending}
                     />
                   </div>
+                  {/* 无条件抢跑开关：三态语义（勾选=true / 不勾=跟随全局 customApiFirst）。
+                      与设置页的全局开关同字段同语义，这里是创建时逐号覆盖。 */}
+                  <label className="flex items-start gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      className="mt-0.5 h-4 w-4 shrink-0 accent-primary"
+                      checked={customApiFirst}
+                      disabled={isPending}
+                      onChange={(e) => setCustomApiFirst(e.target.checked)}
+                    />
+                    <span className="min-w-0">
+                      <span className="font-medium">
+                        {t('addcredentialdialog.field.customApiFirst.label')}
+                      </span>
+                      <span className="mt-0.5 block text-xs text-muted-foreground">
+                        {t('addcredentialdialog.field.customApiFirst.help')}
+                      </span>
+                    </span>
+                  </label>
                   {/* 创建前探测上游模型：模型只能从上游获取（不硬编码），勾选 = 白名单，
                       随创建一并保存（allowed_models）。与设置弹框的探测同一后端 fetch。 */}
                   <div className="space-y-1.5 border-t pt-3">
@@ -870,12 +914,13 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     />
                   </div>
                   <div>
-                    <Input
-                      id="apiRegion"
-                      placeholder="API Region"
+                    {/* API Region 换成带搜索的 RegionSelect（与凭据卡片同一组件、同一数据源）。
+                        可选语义不变：留空 = 自动探测；自由输入非列表值也能用（后端白名单兜底）。 */}
+                    <RegionSelect
                       value={apiRegion}
-                      onChange={(e) => setApiRegion(e.target.value)}
+                      onChange={setApiRegion}
                       disabled={isPending}
+                      placeholder={t('addcredentialdialog.field.region.apiRegionPlaceholder')}
                     />
                   </div>
                 </div>
@@ -1025,6 +1070,27 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   )}
                 </div>
               )}
+
+              {/* 以禁用态导入：重新导入**已知被上游封禁**的号时勾上，先以禁用态入池、
+                  配好出口/确认区域后再启用 —— 否则它会被立刻投入调度、换回一个 403
+                  TEMPORARILY_SUSPENDED，反而加深上游对该批号的风控判定。 */}
+              <label className="flex items-start gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  className="mt-0.5 h-4 w-4 shrink-0 accent-primary"
+                  checked={importDisabled}
+                  disabled={isPending}
+                  onChange={(e) => setImportDisabled(e.target.checked)}
+                />
+                <span className="min-w-0">
+                  <span className="font-medium">
+                    {t('addcredentialdialog.field.importDisabled.label')}
+                  </span>
+                  <span className="mt-0.5 block text-xs text-muted-foreground">
+                    {t('addcredentialdialog.field.importDisabled.help')}
+                  </span>
+                </span>
+              </label>
 
               {/* Machine ID + 端点 均为 Kiro 专属(设备指纹/Kiro API 路由)。
                   自定义 API 代挂透传号无 refreshToken、直接打上游 base_url,不适用,不显示。 */}

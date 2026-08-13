@@ -13,6 +13,7 @@ import {
   MAX_CELL_H,
   GAP,
 } from '@/hooks/use-canvas-layout'
+import { intersects, normRect, DRAG_THRESHOLD } from '@/lib/marquee-geometry'
 import {
   useCredentialSelection,
   selectOnly,
@@ -48,19 +49,6 @@ type Mode =
   | { kind: 'marquee'; x0: number; y0: number; x1: number; y1: number; additive: boolean; subtractive: boolean }
   | { kind: 'drag'; startX: number; startY: number; dx: number; dy: number; base: Map<number, CellLayout> }
   | { kind: 'resize'; id: number; startX: number; startY: number; base: CellLayout }
-
-/** 拖拽阈值（px）：小于此距离视为点击而非拖拽。 */
-const DRAG_THRESHOLD = 4
-
-/** 两个矩形是否相交（框选命中测试）。 */
-function intersects(a: CellLayout, b: { x: number; y: number; w: number; h: number }): boolean {
-  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y
-}
-
-/** 把两点归一化成左上角 + 宽高的矩形（支持任意方向拖拽）。 */
-function normRect(x0: number, y0: number, x1: number, y1: number) {
-  return { x: Math.min(x0, x1), y: Math.min(y0, y1), w: Math.abs(x1 - x0), h: Math.abs(y1 - y0) }
-}
 
 export interface CredentialCanvasProps {
   credentials: CredentialStatusItem[]
@@ -141,10 +129,14 @@ export function CredentialCanvas({ credentials, onContextMenu, className }: Cred
       e.stopPropagation() // 不要触发容器的框选
       // Cmd/Ctrl 点击 = 加减选，不进入拖动。
       if (e.metaKey || e.ctrlKey) {
+        // ⚠️ disabled 号不可选（2026-08-11 审计修复，与行视图同契约）。
+        if (credentials.find((c) => c.id === id)?.disabled) return
         toggle(id)
         return
       }
       // 拖一个**不在选区**里的格子：先把选区替换成它（与 Finder 一致）。
+      // disabled 号不可拖入选区（同契约）。
+      if (credentials.find((c) => c.id === id)?.disabled) return
       const moving = selectedIds.has(id) ? new Set(selectedIds) : new Set([id])
       if (!selectedIds.has(id)) selectOnly(id)
       const base = new Map<number, CellLayout>()
@@ -156,7 +148,7 @@ export function CredentialCanvas({ credentials, onContextMenu, className }: Cred
       const p = toLocal(e)
       setMode({ kind: 'drag', startX: p.x, startY: p.y, dx: 0, dy: 0, base })
     },
-    [geom, selectedIds, toLocal],
+    [credentials, geom, selectedIds, toLocal],
   )
 
   // ── 右下角手柄按下 → 改大小 ──────────────────────────────────────
@@ -196,7 +188,7 @@ export function CredentialCanvas({ credentials, onContextMenu, className }: Cred
         if (mode.kind === 'resize') setResizePreview({ w: p.x - mode.startX, h: p.y - mode.startY })
       })
     },
-    [mode, toLocal],
+    [credentials, mode, toLocal],
   )
 
   const [resizePreview, setResizePreview] = useState<{ w: number; h: number } | null>(null)
@@ -224,8 +216,12 @@ export function CredentialCanvas({ credentials, onContextMenu, className }: Cred
           return
         }
         // 铁律 3：几何求交，不读 DOM。
+        // ⚠️ 剔除 disabled 号（2026-08-11 审计修复，与行视图 marquee 同契约）：
+        // store 契约要求调用方不得把禁用号选进选区（use-credential-selection 注释），
+        // 否则禁用号会进「批量启用/删除」。单格点选/加减选在 onCellPointerDown 处理。
         const hit: number[] = []
-        for (const [id, g] of geom) if (intersects(g, r)) hit.push(id)
+        for (const [id, g] of geom)
+          if (intersects(g, r) && !credentials.find((c) => c.id === id)?.disabled) hit.push(id)
         if (mode.subtractive) removeMany(hit)
         else if (mode.additive) addMany(hit)
         else {

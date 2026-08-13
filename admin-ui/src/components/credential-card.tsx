@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -40,6 +40,7 @@ import {
   setCredentialProxy,
   setCredentialAllowedModels,
   probeUpstreamModels,
+  reprobeRegion,
 } from '@/api/credentials'
 import { authShortLabel, disabledReasonLabel, subscriptionLabel } from '@/lib/i18n-labels'
 import {
@@ -50,6 +51,7 @@ import {
   useSetCredentialEndpoint,
   useSetCredentialApiRegion,
   useSetCredentialDeepseekNormalize,
+  useSetCredentialModelMappingExempt,
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
@@ -64,6 +66,11 @@ interface CredentialCardProps {
   selected: boolean
   /** 勾选框切换选中：additive=true 表示加/减选（保留其它选中项） */
   onToggleSelect: (additive?: boolean) => void
+  /**
+   * 行视图专用：Shift+左键区间选（把 [锚点, 本行] 闭区间并入选区）。卡片视图忽略。
+   * 顺序与「哪些可选」由调用方持有 —— 见 `credential-row.tsx` 的 `onRangeSelect` 注释。
+   */
+  onRangeSelect?: () => void
   /** 按需（hover/“查询信息”）拉取的余额；若存在则优先于自动缓存快照展示。可为 null。 */
   balance: BalanceResponse | null
   loadingBalance: boolean
@@ -117,6 +124,7 @@ export function CredentialCard({
   onViewBalance,
   selected,
   onToggleSelect,
+  onRangeSelect,
   balance,
   loadingBalance,
   view = 'card',
@@ -146,6 +154,7 @@ export function CredentialCard({
   const [customRequestLimit, setCustomRequestLimit] = useState(credential.requestLimit ?? 0)
   const [customResetCount, setCustomResetCount] = useState(false)
   const [customDeepseek, setCustomDeepseek] = useState(credential.deepseekNormalize ?? false)
+  const [customMappingExempt, setCustomMappingExempt] = useState(credential.modelMappingExempt ?? false)
   // 上游模型探测：模型只能从上游获取（不硬编码）。探测结果 + 勾选（写 allowed_models）。
   const [upstreamModels, setUpstreamModels] = useState<string[] | null>(null)
   const [probeLoading, setProbeLoading] = useState(false)
@@ -155,6 +164,8 @@ export function CredentialCard({
 
   // 刷新 Token 失败诊断（结构化，如 client 过期引导重新上号）。
   const [refreshDiagnosis, setRefreshDiagnosis] = useState<OnboardingDiagnosis | null>(null)
+  // 「重新探测 region」在途状态（探测会打真实上游往返，期间按钮转圈 + 禁用其它 region 操作）。
+  const [reprobeBusy, setReprobeBusy] = useState(false)
 
   const queryClient = useQueryClient()
   // 是否按住 Ctrl/Cmd:按住时卡片显示可点击手型 + 左键即多选(松开则普通左键不选中)
@@ -167,10 +178,11 @@ export function CredentialCard({
   const setEndpoint = useSetCredentialEndpoint()
   const setApiRegion = useSetCredentialApiRegion()
   const setDeepseekNormalize = useSetCredentialDeepseekNormalize()
+  const setMappingExempt = useSetCredentialModelMappingExempt()
   // 可选端点由后端注册表给出（config.endpointNames），不在前端硬编码 ide/cli——
   // 后端加了新端点，面板自动多一个按钮。
   const configSnapshot = useConfigSnapshot()
-  const endpointNames = configSnapshot.data?.endpointNames ?? []
+  const allEndpointNames = configSnapshot.data?.endpointNames ?? []
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
@@ -315,6 +327,22 @@ export function CredentialCard({
   const isCustomApi = credential.authMethod === 'custom_api' || !!credential.baseUrl
   // ksk_ API Key 号：自动端点 = q.*(cli) 优先、runtime.*(cli-runtime) 回退（两个独立限流桶）。
   const isApiKeyCred = credential.authMethod === 'api_key'
+  // 🔴 ksk_ 号的端点按钮里**隐藏** `codewhisperer` / `amazonq`：
+  // 两者已被 2026-08-08 部署实测证否 —— 真协议下对 ksk_ key 返
+  // `400 ValidationException "The provided credential is invalid"`（此前用畸形 body
+  // 探测得到的 200 是误导，见 `credentials.rs` 的 `API_KEY_ENDPOINT_ORDER` 注释）。
+  // 它们仍注册在后端（经 API 显式设 `endpoint=codewhisperer` 依然可以），只是不在
+  // 面板上诱人误选 —— 选中即必然 400，且该失败会占用重试预算、把本来能成功的尝试挤掉。
+  //
+  // 只对 ksk 号过滤：OAuth 号（social/idc/M365）不受此限，它们本就走自己的默认端点，
+  // 不该被一起藏掉。
+  const endpointNames = useMemo(
+    () =>
+      isApiKeyCred
+        ? allEndpointNames.filter((n) => n !== 'codewhisperer' && n !== 'amazonq')
+        : allEndpointNames,
+    [allEndpointNames, isApiKeyCred]
+  )
   // 「Profile ARN 区域」探测/切换:External IdP(微软 M365 等,同账号多 region 各有独立 profile 只部分
   // 开通)+ IdC(AWS SSO)。后端 probe_regions_for/switch 已放开到 external_idp||idc(排除 social/api_key
   // /custom_api)。**IdC 实例通常绑单一 region,探测多用于确认/重新解析该号 profileArn,一般只返回一个
@@ -394,6 +422,31 @@ export function CredentialCard({
         onError: (err) => toast.error(t('credentialcard.toast.operationFailed') + extractErrorMessage(err)),
       }
     )
+  }
+
+  /**
+   * 重新探测该号上游实际生效的 region 并写回凭据（救「自动探测探错」的最后一招）。
+   *
+   * 探测是一次真实上游往返、可能耗时，按钮转圈；成功用**返回的 region** 提示
+   * （而非刷新后自己猜），并 invalidate 凭据列表让卡片显示新值。
+   */
+  const handleReprobeRegion = async () => {
+    setReprobeBusy(true)
+    try {
+      const res = await reprobeRegion(credential.id)
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      // region 为 null = 探测未执行（已带 region / 非 api_key 号）——toast 用后端
+      // message 说明原因，避免显示「成功：」空值误导（对抗审查 M1，2026-08-11）。
+      if (res.region) {
+        toast.success(t('credentialcard.toast.reprobeOk', { region: res.region }))
+      } else {
+        toast.info(res.message || t('credentialcard.toast.reprobeSkipped'))
+      }
+    } catch (err) {
+      toast.error(t('credentialcard.toast.reprobeFailed') + extractErrorMessage(err))
+    } finally {
+      setReprobeBusy(false)
+    }
   }
 
   const handleReset = () => {
@@ -610,6 +663,7 @@ export function CredentialCard({
           credential={credential}
           selected={selected}
           onToggleSelect={() => onToggleSelect(true)}
+          onRangeSelect={onRangeSelect}
           onEdit={openSettings}
           onViewBalance={onViewBalance}
           shownBalance={shownBalance}
@@ -1207,6 +1261,33 @@ export function CredentialCard({
               </div>
             )}
 
+            {/* 全局模型映射豁免：开启后该号发上游时保持客户端原始模型名，跳过全局
+                model_mapping。安全阀 —— 覆盖「映射后名该号上游不认」的场景。
+                ⚠️ 刻意放在 isCustomApi 块**外**：后端该字段对 Kiro 号与 custom_api 号都生效
+                （provider.rs 透传/主路径都按 `model_mapping_exempt` 跳过映射，无 custom_api
+                限定），原实现把它塞进 custom_api 块导致 ksk/social 号永远够不到这个开关。
+                即时保存（开关变化即调后端）。 */}
+            <label className="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+              <Checkbox
+                checked={customMappingExempt}
+                onCheckedChange={(v) => {
+                  const next = v === true
+                  setCustomMappingExempt(next)
+                  setMappingExempt.mutate(
+                    { id: credential.id, enabled: next },
+                    {
+                      onSuccess: () => toast.success(t('credentialcard.toast.mappingExemptSaved')),
+                      onError: (err) =>
+                        toast.error(t('credentialcard.toast.operationFailed') + (err as Error).message),
+                    }
+                  )
+                }}
+                className="h-3.5 w-3.5"
+                aria-label={t('credentialcard.settings.mappingExemptAria')}
+              />
+              {t('credentialcard.settings.mappingExemptLabel')}
+            </label>
+
             {/* 调度参数：优先级 + RPM 容量并排两列，各自独立步进器 + 保存。
                 自定义 API 号不参与 RPM 饱和判定(按 优先级+在途 选号),只显优先级单列。 */}
             <div className={cn('grid gap-3 border-t pt-4', isCustomApi ? 'grid-cols-1' : 'grid-cols-2')}>
@@ -1320,10 +1401,27 @@ export function CredentialCard({
                     const c = code.trim()
                     if (c) handleApiRegionChange(c)
                   }}
-                  disabled={setApiRegion.isPending}
+                  disabled={setApiRegion.isPending || reprobeBusy}
                   triggerClassName="h-9"
                   placeholder={t('credentialcard.settings.regionSelectPlaceholder')}
                 />
+                {/* 重新探测：手动指定还是信不过时，让服务端重新探测真实生效 region 并写回。
+                    探测是真实上游往返，期间转圈并禁用上面全部 region 操作，避免并发写。 */}
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-9"
+                  onClick={handleReprobeRegion}
+                  disabled={setApiRegion.isPending || reprobeBusy}
+                  title={t('credentialcard.settings.reprobeRegionTitle')}
+                >
+                  {reprobeBusy ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <RefreshCw className="h-4 w-4" />
+                  )}
+                  <span className="ml-1">{t('credentialcard.settings.reprobeRegion')}</span>
+                </Button>
               </div>
               )}
               {/* 端点切换：默认「自动」——ksk_ 号 q.*(cli) 优先、runtime.*(cli-runtime) 回退

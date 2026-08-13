@@ -7,6 +7,7 @@ import type {
   TrashListResponse,
   SuccessResponse,
   BatchDeleteResponse,
+  CleanupDisabledResponse,
   SetDisabledRequest,
   SetPriorityRequest,
   AddCredentialRequest,
@@ -195,6 +196,17 @@ export async function setCredentialDeepseekNormalize(
 ): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>(`/credentials/${id}/deepseek-normalize`, {
     deepseekNormalize,
+  })
+  return data
+}
+
+// 设置凭据的模型映射豁免开关（跳过全局 model_mapping；Kiro 号与 custom_api 号都可用）。
+export async function setCredentialModelMappingExempt(
+  id: number,
+  modelMappingExempt: boolean
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/model-mapping-exempt`, {
+    modelMappingExempt,
   })
   return data
 }
@@ -434,14 +446,48 @@ export async function addCredential(
 // `enabled`：新分身是否直接启用。**不传 = 后端默认 false（不启用）**。
 // 这里刻意用可选参数而不是默认 `false` 常量：省略该键让「默认值」只有服务端一份，
 // 前端写死 false 就会在后端改默认时静默分叉。
+// `replacePrimary`：建完 N 份后把主份软删进回收站（组内 N 份彼此同质）。省略 = 保留主份。
+// 保持可选参数追加而非对象入参：老调用点（如 credential-row 的行视图扩容）不传即行为不变。
 export async function cloneCredential(
   id: number,
   copies: number,
-  enabled?: boolean
+  enabled?: boolean,
+  replacePrimary?: boolean
 ): Promise<AddCredentialResponse> {
   const body: CloneCredentialRequest = { copies }
   if (enabled !== undefined) body.enabled = enabled
+  if (replacePrimary !== undefined) body.replacePrimary = replacePrimary
   const { data } = await api.post<AddCredentialResponse>(`/credentials/${id}/clone`, body)
+  return data
+}
+
+/**
+ * 重新探测该号上游实际生效的 region 并**写回凭据**（救「自动探测探错」的最后一招）。
+ *
+ * ⚠️ 后端端点与前端在**并行开发**，按约定契约对接：
+ * - 方法/路径：`POST /credentials/{id}/reprobe-region`
+ * - 成功：`{ region: string }`（探测到的 region code）
+ * - 失败：HTTP 错误 + 标准 `AdminErrorResponse` 错误体（`error.message`）
+ *
+ * 响应形状已对齐后端（2026-08-11）：
+ * - `region: string | null`——null 是**合法成功**（Skipped：已带 region / 非 api_key 号 /
+ *   取 token 瞬时失败），不代表失败
+ * - `message`——展示文案（region 为空时 toast 用它，用户才知道「探测根本没发生」）
+ */
+export async function reprobeRegion(id: number): Promise<{ region: string | null; message: string }> {
+  const { data } = await api.post<{ region: string | null; message: string }>(`/credentials/${id}/reprobe-region`)
+  return data
+}
+
+/**
+ * 清除全部「该清」的已禁用号（判据在**服务端唯一收口**：排除代挂 / 透传原因 /
+ * 自愈中的号 / 超上限，见后端 cleanup_disabled_credentials）。
+ *
+ * 前端不要再手写判据（2026-08-11 对抗审查 M2：dashboard 曾绕开本端点逐号 DELETE，
+ * 会把「自愈中」的健康号软删进回收站）。dryRun=true 只预览候选。
+ */
+export async function cleanupDisabled(dryRun = false): Promise<CleanupDisabledResponse> {
+  const { data } = await api.post<CleanupDisabledResponse>('/credentials/cleanup-disabled', { dryRun })
   return data
 }
 

@@ -780,6 +780,12 @@ function CloneGroupsPanel() {
   const [pendingAdd, setPendingAdd] = useState<{ id: number; copies: number } | null>(null)
   const [addBusy, setAddBusy] = useState(false)
   /**
+   * 「建完分身是否把主份软删进回收站」（先建后删，组内 N 份彼此同质）。
+   * **默认关**：主份是默认出口/标签/余额查询的锚点，删掉是不可逆的选择（虽可回收站恢复）。
+   * 每次打开确认弹窗时重置为关，避免上次的勾选悄悄带到下一次扩容。
+   */
+  const [replacePrimary, setReplacePrimary] = useState(false)
+  /**
    * 「生成分身时是否全部默认启用」。**默认关**。
    *
    * 关是刻意的：刚建出来的分身还没绑出口、没验活，直接入池就参与调度等于把未经验证
@@ -869,6 +875,7 @@ function CloneGroupsPanel() {
       toast.error(t('clones.group.addCopiesInvalid', { max: MAX_COPIES }))
       return
     }
+    setReplacePrimary(false)
     setPendingAdd({ id: primaryId, copies: n })
   }
 
@@ -887,6 +894,7 @@ function CloneGroupsPanel() {
       return
     }
     setPickerOpen(false)
+    setReplacePrimary(false)
     setPendingAdd({ id: pickedId, copies: n })
   }
 
@@ -977,7 +985,7 @@ function CloneGroupsPanel() {
     if (!pendingAdd) return
     setAddBusy(true)
     try {
-      const r = await cloneCredential(pendingAdd.id, pendingAdd.copies, cloneEnabled)
+      const r = await cloneCredential(pendingAdd.id, pendingAdd.copies, cloneEnabled, replacePrimary)
       // 直接展示服务端文案：它会如实说明分到了几个节点、还有几份直连
       // （「加了节点却仍然直连」是这条路最容易踩空的地方，不该被前端的通用提示盖掉）。
       toast.success(r.message)
@@ -1209,7 +1217,25 @@ function CloneGroupsPanel() {
         confirmLabel={t('clones.group.addCopies')}
         loading={addBusy}
         onConfirm={confirmAdd}
-      />
+      >
+        {/* 「同时删主份」：后端先建 N 份再软删主份（进回收站可恢复），
+            组内剩下 N 份彼此同质 —— 适合想用分身彻底替换掉主号出口/标签的场景。 */}
+        <label className="mt-1 flex items-start gap-2 border-t border-border/60 pt-3 text-sm">
+          <input
+            type="checkbox"
+            className="mt-0.5 h-4 w-4 shrink-0 accent-primary"
+            checked={replacePrimary}
+            disabled={addBusy}
+            onChange={(e) => setReplacePrimary(e.target.checked)}
+          />
+          <span className="min-w-0">
+            <span className="font-medium">{t('clones.group.replacePrimaryLabel')}</span>
+            <span className="mt-0.5 block text-xs text-muted-foreground">
+              {t('clones.group.replacePrimaryHint')}
+            </span>
+          </span>
+        </label>
+      </ConfirmDialog>
 
       {/* 删除分身二次确认。破坏性样式 + 明说是软删（进回收站可恢复）。 */}
       <ConfirmDialog

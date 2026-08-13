@@ -5,7 +5,14 @@ import { useQuery } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
-import { getRecoveryMetrics, getLogs, type RecoveryMetrics, type LogEntry } from '@/api/ops'
+import {
+  getRecoveryMetrics,
+  getLogs,
+  getEndpointHealth,
+  type RecoveryMetrics,
+  type LogEntry,
+  type EndpointHealthItem,
+} from '@/api/ops'
 import { PROBE_MODEL_CATALOG } from '@/api/credentials'
 import { useRatelimitInsights } from '@/hooks/use-usage'
 import { useLiveStream } from '@/hooks/use-live-stream'
@@ -200,6 +207,7 @@ export function OpsPage() {
         <LiveMetricsBar live={live} />
         <PoolHealthCard live={live} />
         <RecoveryMetricsCard />
+        <EndpointHealthCard />
         <LogViewer focusToken={logFocus.token} focusTerm={logFocus.term} />
         <OpsAggregationCard onFocusLog={focusLog} />
       </div>
@@ -342,6 +350,128 @@ function RecoveryMetricsCard() {
               </Button>
             }
           />
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+/**
+ * 端点自适应派发可观测。
+ *
+ * # 为什么这张卡是必须的
+ *
+ * `select_endpoint` 现在按每凭据的实测 EWMA 成功率派发流量（取代了原来的全局
+ * round-robin）。决策依赖统计量，而统计量不可见就等于**不可调、不可证** ——
+ * 「这个号为什么总走 runtime.* 而不走 q.*」在没有这张卡时无从回答。
+ *
+ * 本仓有直接教训（CLAUDE.md「先修度量，再谈调参」）：一个关键容量数字是配置自乘出来的
+ * 假值，导致所有依赖它的自动调节都在算空气，而三层监控全绿。所以派发与它的观测面
+ * 必须同时存在。
+ */
+function EndpointHealthCard() {
+  const { t } = useTranslation()
+  // 5s 刷新：与 RecoveryMetricsCard 同频（纯内存端点，零上游、零副作用）。
+  const { data, isLoading, refetch } = useQuery({
+    queryKey: ['endpoint-health'],
+    queryFn: getEndpointHealth,
+    refetchInterval: 5000,
+  })
+
+  // 按凭据分组：一个号的多个端点要并排看才能判断「派发是否合理」。
+  const grouped = useMemo(() => {
+    const m = new Map<number, EndpointHealthItem[]>()
+    for (const it of data?.items ?? []) {
+      const arr = m.get(it.credentialId) ?? []
+      arr.push(it)
+      m.set(it.credentialId, arr)
+    }
+    // 端点名排序，保证同一号的列顺序稳定（否则每次刷新列会跳动）。
+    for (const arr of m.values()) arr.sort((a, b) => a.endpoint.localeCompare(b.endpoint))
+    return [...m.entries()].sort((a, b) => a[0] - b[0])
+  }, [data])
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-center justify-between pb-2">
+        <CardTitle className="flex items-center gap-2 text-base">
+          <Gauge className="h-4 w-4" />
+          {t('opspage.endpointHealth.title')}
+          {data && (
+            <span className="text-xs font-normal text-muted-foreground">
+              {t('opspage.endpointHealth.count', { total: data.total })}
+            </span>
+          )}
+        </CardTitle>
+        <IconAction
+          icon={Loader2}
+          label={t('opspage.common.retry')}
+          onClick={() => void refetch()}
+          pending={isLoading}
+        />
+      </CardHeader>
+      <CardContent>
+        <p className="mb-3 text-xs text-muted-foreground">
+          {t('opspage.endpointHealth.desc')}
+        </p>
+        {grouped.length === 0 ? (
+          // 空态不是错误：表不持久化，重启后要等第一批请求才有数据。
+          <div className="py-6 text-center text-xs text-muted-foreground">
+            {isLoading
+              ? t('opspage.endpointHealth.loading')
+              : t('opspage.endpointHealth.emptyDesc')}
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {grouped.map(([cid, items]) => (
+              <div key={cid} className="rounded-md border border-border/60 p-3">
+                <div className="mb-2 text-xs font-medium text-muted-foreground">
+                  {t('opspage.endpointHealth.credential', { id: cid })}
+                </div>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  {items.map((it) => {
+                    const noData = it.successRate === null
+                    const pct = noData ? 0 : Math.round(it.successRate! * 100)
+                    // 配色只在**有样本**时才表达好坏：无样本用中性灰，
+                    // 否则冷启动的新端点会被显示成红色「坏端点」，误导排障。
+                    const tone = noData
+                      ? 'text-muted-foreground'
+                      : pct >= 80
+                        ? 'text-emerald-400'
+                        : pct >= 50
+                          ? 'text-amber-400'
+                          : 'text-red-400'
+                    const bar = noData
+                      ? 'bg-muted'
+                      : pct >= 80
+                        ? 'bg-emerald-500'
+                        : pct >= 50
+                          ? 'bg-amber-500'
+                          : 'bg-red-500'
+                    return (
+                      <div key={it.endpoint} className="space-y-1">
+                        <div className="flex items-baseline justify-between gap-2">
+                          <span className="font-mono text-[11px]">{it.endpoint}</span>
+                          <span className={`text-xs font-medium ${tone}`}>
+                            {noData ? t('opspage.endpointHealth.noData') : `${pct}%`}
+                          </span>
+                        </div>
+                        <div className="h-1.5 overflow-hidden rounded-full bg-secondary">
+                          <div
+                            className={`h-full rounded-full ${bar}`}
+                            style={{ width: noData ? '0%' : `${pct}%` }}
+                          />
+                        </div>
+                        <div className="text-[10px] text-muted-foreground">
+                          {t('opspage.endpointHealth.samples', { n: it.samples })}
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            ))}
+          </div>
         )}
       </CardContent>
     </Card>

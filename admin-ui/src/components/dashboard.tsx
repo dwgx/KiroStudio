@@ -22,12 +22,18 @@ import {
   DialogDescription,
   DialogFooter,
 } from '@/components/ui/dialog'
-import { useCredentials, useDeleteCredential, useDeleteCredentialsBatch, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useSetDisabled } from '@/hooks/use-credentials'
-import { getCredentialBalance, getCachedBalances, forceRefreshToken, deepVerifyCredential, probeAvailableModels, setCredentialAllowedModels, PROBE_MODEL_CATALOG, exportCredential } from '@/api/credentials'
+import { useCredentials, useDeleteCredentialsBatch, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useSetDisabled } from '@/hooks/use-credentials'
+import { getCredentialBalance, getCachedBalances, forceRefreshToken, deepVerifyCredential, probeAvailableModels, setCredentialAllowedModels, PROBE_MODEL_CATALOG, exportCredential, cleanupDisabled } from '@/api/credentials'
 import { extractErrorMessage, downloadJson, fileStamp } from '@/lib/utils'
 import { PageSkeleton } from '@/components/ui/page-skeleton'
 import { useUiLayoutPrefs } from '@/hooks/use-ui-layout-prefs'
-import { useCredentialSelection } from '@/hooks/use-credential-selection'
+import {
+  useCredentialSelection,
+  selectRange,
+  addMany,
+  removeMany,
+} from '@/hooks/use-credential-selection'
+import { intersects, normRect, DRAG_THRESHOLD } from '@/lib/marquee-geometry'
 import type { BalanceResponse } from '@/types/api'
 
 interface DashboardProps {
@@ -150,7 +156,21 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   // 逐字不动,迁移的 diff 只有这一处 ⇒ 好审、也不留第二个选区真相源。
   // ⚠️ store 是模块级的 ⇒ 选区在本组件卸载后仍存活(切到别的 tab 再回来选区还在)。
   //    这正是共享的目的;唯一的行为变化就这一条,其余语义与迁移前一致。
-  const { ids: selectedIds, toggle: toggleSelect, clear: deselectAll } = useCredentialSelection()
+  const { ids: selectedIds, toggle: toggleSelect, clear: deselectAll, lastAnchorId } = useCredentialSelection()
+  // 行视图拖拽框选（marquee）。坐标是**容器局部**（clientX - 容器 padding box 原点），
+  // 因此与页面滚动无关：容器随文档一起滚 ⇒ 起点会牢牢粘在文档位置上，不会因中途滚动而漂。
+  // null = 没在框选（此时不挂 move 计算，也不渲染选框）。
+  const [rowMarquee, setRowMarquee] = useState<{
+    x0: number
+    y0: number
+    x1: number
+    y1: number
+    /** Shift：并入（additive）。 */
+    additive: boolean
+    /** Alt：移出（subtractive）。 */
+    subtractive: boolean
+  } | null>(null)
+  const rowListRef = useRef<HTMLDivElement | null>(null)
   // 二次确认弹框(替代浏览器原生 confirm,统一走设计系统控件):
   // 存待执行动作 + 文案,确认后调 onConfirm。批量删除/清除已禁用都走它。
   const [confirmState, setConfirmState] = useState<{
@@ -197,7 +217,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const queryClient = useQueryClient()
   // dataUpdatedAt = 最近一次**成功**拉取的时刻，用于过期提示条告诉用户手里这份数据有多旧。
   const { data, isLoading, error, refetch, dataUpdatedAt } = useCredentials()
-  const { mutate: deleteCredential } = useDeleteCredential()
   const { mutateAsync: deleteCredentialsBatch } = useDeleteCredentialsBatch()
   const { mutate: resetFailure } = useResetFailure()
   const { mutateAsync: setDisabledAsync } = useSetDisabled()
@@ -327,7 +346,19 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           if (res.failed === 0) {
             toast.success(t('dashboard.batchDelete.successToast', { count: res.deleted, skipped: skippedResultText }))
           } else {
-            toast.warning(t('dashboard.batchDelete.warnToast', { ok: res.deleted, fail: res.failed, skipped: skippedResultText }))
+            // 逐条明细：results 顺序与请求 ids 一致，按结果自己的 id 列（服务端会去重）。
+            // 最多列前 5 条失败项，其余计数省略，避免 toast 被刷满。
+            const failedItems = res.results.filter(r => !r.ok)
+            const failedDetail = [
+              ...failedItems.slice(0, 5).map(r =>
+                t('dashboard.batchDelete.failedItem', { id: r.id, err: r.error ?? t('dashboard.batchDelete.unknownErr') }),
+              ),
+              ...(failedItems.length > 5 ? [t('dashboard.batchDelete.failedOmitted', { count: failedItems.length - 5 })] : []),
+            ].join('\n')
+            toast.warning(
+              t('dashboard.batchDelete.warnToast', { ok: res.deleted, fail: res.failed, skipped: skippedResultText }),
+              { description: failedDetail, duration: 10000 },
+            )
           }
         } catch (err) {
           // 整体失败（网络/鉴权/400）——与"部分条目失败"是不同的情形，文案要分开。
@@ -516,7 +547,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const handleExportSelected = async () => {
     const ids = Array.from(selectedIds)
     if (ids.length === 0) {
-      toast.error('请先勾选要导出的凭据')
+      toast.error(t('dashboard.export.noSelection'))
       return
     }
     setExportingSelected(true)
@@ -528,7 +559,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         setExportProgress({ current: i + 1, total: ids.length })
       }
       downloadJson(`credentials-selected-${fileStamp()}.json`, all)
-      toast.success(`已导出选中的 ${all.length} 个凭据`)
+      toast.success(t('dashboard.export.successToast', { count: all.length }))
     } catch (err) {
       toast.error(extractErrorMessage(err))
     } finally {
@@ -554,36 +585,66 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       return
     }
 
-    const disabledCredentials = data.credentials.filter(credential => credential.disabled)
+    // 🔴 代挂（custom_api）凭据**不进清除范围**，即使它当前是禁用态。
+    //
+    // 为什么要排除：代挂号是用户手工配置的第三方上游（base_url + api_key），
+    // 与 Kiro 号的性质完全不同 ——
+    // 1. **不可再生**：Kiro 号删了可以重新上号/重新导入 ksk；代挂号的 base_url 与 key
+    //    是用户自己填进去的配置，删掉就得回去翻原始凭据重新配。
+    // 2. **禁用常常是暂时的**：代挂站维护、余额用尽、临时限流都会让用户手动禁用它，
+    //    过后再启用。它出现在「已禁用」列表里是**常态**，不是"死号"。
+    // 3. 「清除已禁用」的语义本意是清理**打不通的 Kiro 死号**（额度耗尽/被封/
+    //    refreshToken 失效），把代挂号一起扫掉属于超出预期的破坏，且用户点这个按钮时
+    //    通常没意识到代挂号也在里面。
+    //
+    // 判据用 `baseUrl` 是否存在：该字段是代挂号在 DTO 层的标识（后端
+    // `is_custom_api_credential` 的判据同样是 base_url 存在，api_key 出于安全不下发）。
+    // 不用 `authMethod === 'custom_api'` 是因为历史数据里存在
+    // `authMethod=api_key + baseUrl` 的旧格式代挂号（后端 `is_custom_api_credential`
+    // 的注释明确提到这种形态），只看 authMethod 会漏掉它们。
+    const isPassthrough = (c: { baseUrl?: string }) =>
+      typeof c.baseUrl === 'string' && c.baseUrl.trim() !== ''
+    const allDisabled = data.credentials.filter(credential => credential.disabled)
+    const disabledCredentials = allDisabled.filter(c => !isPassthrough(c))
+    const skippedPassthrough = allDisabled.length - disabledCredentials.length
 
     if (disabledCredentials.length === 0) {
-      toast.error(t('dashboard.clearAll.noDisabled'))
+      // 全部已禁用的都是代挂号时，文案要说清"跳过了什么"，
+      // 否则用户看到"没有可清除的"会以为按钮坏了。
+      toast.error(
+        skippedPassthrough > 0
+          ? t('dashboard.clearAll.onlyPassthrough', { count: skippedPassthrough })
+          : t('dashboard.clearAll.noDisabled')
+      )
       return
     }
 
     setConfirmState({
       title: t('dashboard.clearAll.confirmTitle'),
-      description: t('dashboard.clearAll.confirmDesc', { count: disabledCredentials.length }),
+      description:
+        t('dashboard.clearAll.confirmDesc', { count: disabledCredentials.length }) +
+        (skippedPassthrough > 0
+          ? ' ' + t('dashboard.clearAll.skipPassthrough', { count: skippedPassthrough })
+          : ''),
       confirmText: t('dashboard.clearAll.confirmBtn'),
       onConfirm: async () => {
-        let successCount = 0
-        let failCount = 0
-        for (const credential of disabledCredentials) {
-          try {
-            await new Promise<void>((resolve, reject) => {
-              deleteCredential(credential.id, {
-                onSuccess: () => { successCount++; resolve() },
-                onError: (err) => { failCount++; reject(err) },
-              })
-            })
-          } catch (error) {
-            // 错误已在 onError 中处理
+        // ⭐ 改调后端收口端点（2026-08-11 对抗审查 M2）：前端手写判据会把「自愈中」
+        // 的健康号软删进回收站——后端 cleanup_disabled_credentials 是唯一判据收口
+        // （排除代挂 / 透传原因 / 自愈原因 / 超上限）。
+        try {
+          const res = await cleanupDisabled(false)
+          if (res.failed === 0) {
+            toast.success(t('dashboard.clearAll.successToast', { count: res.deleted }))
+          } else {
+            toast.warning(t('dashboard.clearAll.warnToast', { ok: res.deleted, fail: res.failed }))
           }
-        }
-        if (failCount === 0) {
-          toast.success(t('dashboard.clearAll.successToast', { count: successCount }))
-        } else {
-          toast.warning(t('dashboard.clearAll.warnToast', { ok: successCount, fail: failCount }))
+          if (res.skipped.length > 0) {
+            // 跳过的（含自愈中、代挂、透传）逐条可见——用户才知道为什么没清掉。
+            const reasons = res.skipped.slice(0, 5).map((x) => `#${x.id}: ${x.reason}`).join('\n')
+            toast.info(reasons + (res.skipped.length > 5 ? `\n…共 ${res.skipped.length} 条跳过` : ''))
+          }
+        } catch (err) {
+          toast.error(t('dashboard.clearAll.onlyPassthrough', { count: 0 }) + extractErrorMessage(err))
         }
         deselectAll()
       },
@@ -1079,9 +1140,105 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 // 行视图才是 ARIA 表格：role="row" 必须有 table/grid/rowgroup 祖先，否则读屏
                 // 会忽略行语义（列头与行同为 role="row"，故两者都要在这个容器**内部**）。
                 // 卡片视图恒为 undefined ⇒ 无障碍树与改动前逐字一致。
+                ref={rowListRef}
                 role={isRowView ? 'table' : undefined}
                 aria-label={isRowView ? t('dashboard.viewMode.row') : undefined}
-                className={isRowView ? 'space-y-1' : 'grid gap-4'}
+                // 行视图拖拽框选：起手必须落在**空白**（不在任何 role="row" 内），
+                // 否则与行内按钮/文本选择打架。左右各留内边距造出可起手的空白带。
+                onPointerDown={
+                  !isRowView
+                    ? undefined
+                    : (e) => {
+                        if (e.button !== 0) return
+                        if ((e.target as HTMLElement).closest('[role="row"]')) return
+                        const box = rowListRef.current?.getBoundingClientRect()
+                        if (!box) return
+                        e.currentTarget.setPointerCapture(e.pointerId)
+                        setRowMarquee({
+                          x0: e.clientX - box.left,
+                          y0: e.clientY - box.top,
+                          x1: e.clientX - box.left,
+                          y1: e.clientY - box.top,
+                          additive: e.shiftKey,
+                          subtractive: e.altKey,
+                        })
+                      }
+                }
+                onPointerMove={
+                  !isRowView || !rowMarquee
+                    ? undefined
+                    : (e) => {
+                        const box = rowListRef.current?.getBoundingClientRect()
+                        if (!box) return
+                        setRowMarquee((m) =>
+                          m ? { ...m, x1: e.clientX - box.left, y1: e.clientY - box.top } : m
+                        )
+                      }
+                }
+                onPointerUp={
+                  !isRowView || !rowMarquee
+                    ? undefined
+                    : () => {
+                        const m = rowMarquee
+                        setRowMarquee(null)
+                        if (!m) return
+                        const r = normRect(m.x0, m.y0, m.x1, m.y1)
+                        // 位移小于阈值 ⇒ 当作"点击空白"：清空选区（与画布档同口径）。
+                        if (r.w < DRAG_THRESHOLD && r.h < DRAG_THRESHOLD) {
+                          if (!m.additive && !m.subtractive) deselectAll()
+                          return
+                        }
+                        const box = rowListRef.current?.getBoundingClientRect()
+                        if (!box) return
+                        // 读 DOM 求交（12 行/页量级，无虚拟滚动 ⇒ 全部已挂载）。
+                        const hit: number[] = []
+                        // disabled 行与 shift+点击同判据剔除（`credential.disabled`）：
+                        // store 契约要求调用方传入的 id 序列已剔除 disabled 号
+                        // （见 use-credential-selection.ts:76-78）——否则框选把禁用号拉进
+                        // 选区，批量操作与高亮都会落到「不可选」的行上，与 shift 路径不一致。
+                        const disabledIds = new Set(
+                          (data?.credentials ?? [])
+                            .filter((c) => c.disabled)
+                            .map((c) => c.id)
+                        )
+                        rowListRef.current
+                          ?.querySelectorAll<HTMLElement>('[data-cred-id]')
+                          .forEach((el) => {
+                            const b = el.getBoundingClientRect()
+                            const rowRect = {
+                              x: b.left - box.left,
+                              y: b.top - box.top,
+                              w: b.width,
+                              h: b.height,
+                            }
+                            if (!intersects(r, rowRect)) return
+                            const raw = el.dataset.credId
+                            const idNum = raw ? Number(raw) : NaN
+                            if (Number.isFinite(idNum) && !disabledIds.has(idNum)) hit.push(idNum)
+                          })
+                        if (!hit.length) return
+                        // ⚠️ 框选只作用于**当前页**（分页的固有边界）：跨页选中不可见的号
+                        // 会让批量操作删掉看不见的东西，故刻意不跨页。
+                        if (m.subtractive) removeMany(hit)
+                        else if (m.additive) addMany(hit)
+                        else {
+                          deselectAll()
+                          addMany(hit)
+                        }
+                      }
+                }
+                onPointerCancel={!isRowView ? undefined : () => setRowMarquee(null)}
+                // 行视图整成一个表格：外层一个框 + 行间用水平分割线（divide-y），不再是各自带框的小卡片。
+                // divide-y 只加边框不动 flex 布局 ⇒ 列宽约定（见 CredentialRowHeader）不受影响。
+                className={
+                  isRowView
+                    ? // relative = 选框 overlay 的定位父级；px-3 造出左右两条空白带供起手拖框
+                      // （用户明确要"从左边区域和右边区域去勾选"）；拖拽中 select-none 防刷蓝。
+                      `relative divide-y divide-border rounded-lg border px-3${
+                        rowMarquee ? ' select-none' : ''
+                      }`
+                    : 'grid gap-4'
+                }
                 style={
                   isRowView
                     ? undefined
@@ -1106,6 +1263,17 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                     balance={balanceMap.get(credential.id) || null}
                     loadingBalance={loadingBalanceIds.has(credential.id)}
                     view={isRowView ? 'row' : 'card'}
+                    // Shift+左键区间选：orderedIds 由本组件提供（它才知道当前页顺序与
+                    // 哪些可选）。store 契约要求已剔除 disabled，见 use-credential-selection。
+                    onRangeSelect={() =>
+                      selectRange(
+                        // 锚点：上次单选的行。首次（无锚点）时用本行当锚点 ⇒ 退化成单选，
+                        // 不会因为没有锚点而静默什么都不做。
+                        lastAnchorId ?? credential.id,
+                        credential.id,
+                        currentCredentials.filter((c) => !c.disabled).map((c) => c.id)
+                      )
+                    }
                     rowBatch={{
                       count: selectedIds.size,
                       onBatchDisable: () => handleBatchSetDisabled(true),
@@ -1113,6 +1281,17 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                     }}
                   />
                 ))}
+                {/* 框选可视化：容器局部坐标 ⇒ 随容器一起滚，不会因中途滚动而漂。
+                    pointer-events-none 保证它不吞掉 pointerup。 */}
+                {isRowView && rowMarquee && (() => {
+                  const r = normRect(rowMarquee.x0, rowMarquee.y0, rowMarquee.x1, rowMarquee.y1)
+                  return (
+                    <div
+                      className="pointer-events-none absolute z-20 rounded-sm border border-primary bg-primary/10"
+                      style={{ left: r.x, top: r.y, width: r.w, height: r.h }}
+                    />
+                  )
+                })()}
               </div>
 
               {/* 分页控件 */}

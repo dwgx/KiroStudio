@@ -79,6 +79,7 @@ import type {
   StorageCleanupTarget,
   ClientRpm,
   TrashItem,
+  ThrottleProfile,
 } from '@/types/api'
 import type { TFunction } from 'i18next'
 
@@ -152,6 +153,7 @@ const CARD_INDEX_DEFS: { section: SectionId; titleKey: string; kwKey: string }[]
   { section: 'basic', titleKey: 'settingspage.card.network', kwKey: 'settingspage.card.network.kw' },
   // 高级选项三卡：工具容错（原属 basic，随分组迁来）/ 吸收层（原在协议卡内的小节）/ 缓存记账
   { section: 'advanced', titleKey: 'settingspage.card.toolFault', kwKey: 'settingspage.card.toolFault.kw' },
+  { section: 'advanced', titleKey: 'settingspage.card.cliAlign', kwKey: 'settingspage.card.cliAlign.kw' },
   { section: 'advanced', titleKey: 'settingspage.card.advAbsorb', kwKey: 'settingspage.card.advAbsorb.kw' },
   { section: 'advanced', titleKey: 'settingspage.card.advCache', kwKey: 'settingspage.card.advCache.kw' },
   { section: 'basic', titleKey: 'settingspage.card.loginBg', kwKey: 'settingspage.card.loginBg.kw' },
@@ -247,6 +249,11 @@ interface FormState {
   upstreamRetryAbsorbMinDelayMs: string
   upstreamRetryAbsorbMaxDelaySecs: string
   upstreamRetryAbsorbSuspended: boolean
+  upstreamRetryAbsorbServerError: boolean
+  upstreamRetryAbsorbCapacity400: boolean
+  upstreamRetryAbsorbSwapBudgetSecs: string
+  /** 勾选 = 耗尽时返回 429（默认 503）；变量名保留 exhausted503 历史命名 */
+  upstreamRetryAbsorbExhausted503: boolean
   stripEnvNoise: boolean
   toolCleanLeakedTokens: boolean
   toolReclaimTextifiedInvoke: boolean
@@ -256,8 +263,16 @@ interface FormState {
   toolRepairJson: boolean
   toolTruncationRecovery: boolean
   toolDescriptionMaxChars: string
+  // CLI 端点协议/指纹三开关（详见各自 hint 与后端 config 字段注释）
+  cliOriginKiroCli: boolean
+  cliCodewhispererOptoutFalse: boolean
+  cliUaAlignRealClient: boolean
   // prompt cache 记账下发开关（估算值，非上游真值）
   promptCacheEnabled: boolean
+  selfHealBaseBackoffSecs: string
+  selfHealMaxBackoffSecs: string
+  selfHealMaxShift: string
+  nativeThinkingEffortEnabled: boolean
   encryptCredentialsAtRest: boolean
   cooldownEnabled: boolean
   autoDisableSuspicious: boolean
@@ -274,6 +289,7 @@ interface FormState {
   rpmHardGateOverloadWait: boolean
   cooldownScalePct: string
   rateLimitJitterPct: string
+  throttleProfile: ThrottleProfile
   inboundThrottleEnabled: boolean
   inboundRpmAuto: boolean
   inboundTargetRpm: string
@@ -309,6 +325,8 @@ interface FormState {
   poolSort: PoolSortMode
   poolShowDisabled: boolean
   cardSize: CardSize
+  // 全局模型映射（JSON 文本，双口径用量的 requested→upstream；空对象 = 不映射）
+  modelMapping: string
 }
 
 /* ============ promptCacheEnabled 的本地类型补丁 ============ */
@@ -359,6 +377,10 @@ function toForm(c: ConfigSnapshotResponse, ui: UiLayoutPrefs): FormState {
     upstreamRetryAbsorbMinDelayMs: String(c.upstreamRetryAbsorbMinDelayMs ?? 150),
     upstreamRetryAbsorbMaxDelaySecs: String(c.upstreamRetryAbsorbMaxDelaySecs ?? 15),
     upstreamRetryAbsorbSuspended: c.upstreamRetryAbsorbSuspended ?? false,
+    upstreamRetryAbsorbServerError: c.upstreamRetryAbsorbServerError ?? false,
+    upstreamRetryAbsorbCapacity400: c.upstreamRetryAbsorbCapacity400 ?? false,
+    upstreamRetryAbsorbSwapBudgetSecs: String(c.upstreamRetryAbsorbSwapBudgetSecs ?? 0),
+    upstreamRetryAbsorbExhausted503: c.upstreamRetryAbsorbExhaustedStatus === 429,
     stripEnvNoise: c.stripEnvNoise,
     toolCleanLeakedTokens: c.toolCleanLeakedTokens ?? true,
     toolReclaimTextifiedInvoke: c.toolReclaimTextifiedInvoke ?? true,
@@ -368,7 +390,15 @@ function toForm(c: ConfigSnapshotResponse, ui: UiLayoutPrefs): FormState {
     toolRepairJson: c.toolRepairJson ?? true,
     toolTruncationRecovery: c.toolTruncationRecovery ?? false,
     toolDescriptionMaxChars: String(c.toolDescriptionMaxChars ?? 10000),
+    // 三项默认 false：与后端 serde default 一致，保证「未配置」在前后端读到同一值。
+    cliOriginKiroCli: c.cliOriginKiroCli ?? false,
+    cliCodewhispererOptoutFalse: c.cliCodewhispererOptoutFalse ?? false,
+    cliUaAlignRealClient: c.cliUaAlignRealClient ?? false,
     promptCacheEnabled: (c as ConfigWithCache).promptCacheEnabled ?? PROMPT_CACHE_DEFAULT,
+    selfHealBaseBackoffSecs: String(c.selfHealBaseBackoffSecs ?? 60),
+    selfHealMaxBackoffSecs: String(c.selfHealMaxBackoffSecs ?? 900),
+    selfHealMaxShift: String(c.selfHealMaxShift ?? 4),
+    nativeThinkingEffortEnabled: c.nativeThinkingEffortEnabled ?? false,
     encryptCredentialsAtRest: c.encryptCredentialsAtRest ?? false,
     cooldownEnabled: c.cooldownEnabled,
     autoDisableSuspicious: c.autoDisableSuspicious ?? true,
@@ -384,6 +414,7 @@ function toForm(c: ConfigSnapshotResponse, ui: UiLayoutPrefs): FormState {
     rpmHardGateOverloadWait: c.rpmHardGateOverloadWait ?? false,
     cooldownScalePct: String(c.cooldownScalePct ?? 100),
     rateLimitJitterPct: String(c.rateLimitJitterPct ?? 20),
+    throttleProfile: c.throttleProfile ?? 'manual',
     inboundThrottleEnabled: c.inboundThrottleEnabled ?? true,
     inboundRpmAuto: c.inboundRpmAuto ?? true,
     inboundTargetRpm: String(c.inboundTargetRpm ?? 100),
@@ -419,6 +450,8 @@ function toForm(c: ConfigSnapshotResponse, ui: UiLayoutPrefs): FormState {
     poolSort: ui.poolSort,
     poolShowDisabled: ui.poolShowDisabled,
     cardSize: ui.cardSize,
+    // 全局模型映射：对象序列化成 JSON 文本（空对象 = 不映射）。非法 JSON 后端会拒绝保存。
+    modelMapping: JSON.stringify(c.modelMapping ?? {}, null, 2),
   }
 }
 
@@ -1738,6 +1771,20 @@ export function SettingsPage() {
   const { data: config, isLoading, error, refetch } = useConfigSnapshot()
   const { mutate: save, isPending: isSaving } = useUpdateConfig()
 
+  // 吸收层「本组设置当前不生效」的判据（2026-08-11）。
+  //
+  // 吸收层只挂在 Kiro 主路径（provider 的 `'absorb: loop`）上，**不覆盖透传路径**。
+  // 号池全是 custom_api 代挂号时，100% 流量走透传 ⇒ 那 10 个 absorb 旋钮全程无效，
+  // 但面板上看不出来，用户会反复调一组死配置。这里用已有的凭据列表自行推导，
+  // 不新增后端字段。
+  const { data: credentialsForHints } = useCredentials()
+  const absorbHasNoEffect = useMemo(() => {
+    const list = credentialsForHints?.credentials ?? []
+    const enabled = list.filter((c) => !c.disabled)
+    // 空池不提示（没号时一切都不生效，提示这个反而干扰）。
+    return enabled.length > 0 && enabled.every((c) => c.authMethod === 'custom_api')
+  }, [credentialsForHints])
+
   const [form, setForm] = useState<FormState | null>(null)
 
   // 分区导航当前 tab + 搜索关键词（纯前端）。
@@ -1801,6 +1848,11 @@ export function SettingsPage() {
     const nAbsorbMaxDelay = parseInt(form.upstreamRetryAbsorbMaxDelaySecs, 10)
     if (Number.isFinite(nAbsorbMaxDelay) && nAbsorbMaxDelay !== (config.upstreamRetryAbsorbMaxDelaySecs ?? 15)) d.upstreamRetryAbsorbMaxDelaySecs = nAbsorbMaxDelay
     if (form.upstreamRetryAbsorbSuspended !== (config.upstreamRetryAbsorbSuspended ?? false)) d.upstreamRetryAbsorbSuspended = form.upstreamRetryAbsorbSuspended
+    if (form.upstreamRetryAbsorbServerError !== (config.upstreamRetryAbsorbServerError ?? false)) d.upstreamRetryAbsorbServerError = form.upstreamRetryAbsorbServerError
+    if (form.upstreamRetryAbsorbCapacity400 !== (config.upstreamRetryAbsorbCapacity400 ?? false)) d.upstreamRetryAbsorbCapacity400 = form.upstreamRetryAbsorbCapacity400
+    const nAbsorbSwapBudget = parseInt(form.upstreamRetryAbsorbSwapBudgetSecs, 10)
+    if (Number.isFinite(nAbsorbSwapBudget) && nAbsorbSwapBudget !== (config.upstreamRetryAbsorbSwapBudgetSecs ?? 0)) d.upstreamRetryAbsorbSwapBudgetSecs = nAbsorbSwapBudget
+    if (form.upstreamRetryAbsorbExhausted503 !== (config.upstreamRetryAbsorbExhaustedStatus === 429)) d.upstreamRetryAbsorbExhaustedStatus = form.upstreamRetryAbsorbExhausted503 ? 429 : 503
     if (form.stripEnvNoise !== config.stripEnvNoise) d.stripEnvNoise = form.stripEnvNoise
     if (form.toolCleanLeakedTokens !== (config.toolCleanLeakedTokens ?? true)) d.toolCleanLeakedTokens = form.toolCleanLeakedTokens
     if (form.toolReclaimTextifiedInvoke !== (config.toolReclaimTextifiedInvoke ?? true)) d.toolReclaimTextifiedInvoke = form.toolReclaimTextifiedInvoke
@@ -1811,8 +1863,21 @@ export function SettingsPage() {
     if (form.toolTruncationRecovery !== (config.toolTruncationRecovery ?? false)) d.toolTruncationRecovery = form.toolTruncationRecovery
     const descMax = Number(form.toolDescriptionMaxChars)
     if (Number.isFinite(descMax) && descMax >= 0 && descMax !== (config.toolDescriptionMaxChars ?? 10000)) d.toolDescriptionMaxChars = descMax
+    // CLI 三开关：只在与当前值不同时才进 diff（与本文件既有范式一致，避免无谓写盘）。
+    if (form.cliOriginKiroCli !== (config.cliOriginKiroCli ?? false)) d.cliOriginKiroCli = form.cliOriginKiroCli
+    if (form.cliCodewhispererOptoutFalse !== (config.cliCodewhispererOptoutFalse ?? false))
+      d.cliCodewhispererOptoutFalse = form.cliCodewhispererOptoutFalse
+    if (form.cliUaAlignRealClient !== (config.cliUaAlignRealClient ?? false)) d.cliUaAlignRealClient = form.cliUaAlignRealClient
     if (form.promptCacheEnabled !== ((config as ConfigWithCache).promptCacheEnabled ?? PROMPT_CACHE_DEFAULT))
       d.promptCacheEnabled = form.promptCacheEnabled
+    const nSelfHealBase = parseInt(form.selfHealBaseBackoffSecs, 10)
+    if (Number.isFinite(nSelfHealBase) && nSelfHealBase !== (config.selfHealBaseBackoffSecs ?? 60)) d.selfHealBaseBackoffSecs = nSelfHealBase
+    const nSelfHealMax = parseInt(form.selfHealMaxBackoffSecs, 10)
+    if (Number.isFinite(nSelfHealMax) && nSelfHealMax !== (config.selfHealMaxBackoffSecs ?? 900)) d.selfHealMaxBackoffSecs = nSelfHealMax
+    const nSelfHealShift = parseInt(form.selfHealMaxShift, 10)
+    if (Number.isFinite(nSelfHealShift) && nSelfHealShift !== (config.selfHealMaxShift ?? 4)) d.selfHealMaxShift = nSelfHealShift
+    if (form.nativeThinkingEffortEnabled !== (config.nativeThinkingEffortEnabled ?? false))
+      d.nativeThinkingEffortEnabled = form.nativeThinkingEffortEnabled
     if (form.encryptCredentialsAtRest !== (config.encryptCredentialsAtRest ?? false)) d.encryptCredentialsAtRest = form.encryptCredentialsAtRest
     if (form.cooldownEnabled !== config.cooldownEnabled) d.cooldownEnabled = form.cooldownEnabled
     if (form.autoDisableSuspicious !== config.autoDisableSuspicious)
@@ -1838,6 +1903,7 @@ export function SettingsPage() {
     const nJitter = parseInt(form.rateLimitJitterPct, 10)
     if (Number.isFinite(nJitter) && nJitter !== (config.rateLimitJitterPct ?? 20)) d.rateLimitJitterPct = nJitter
     // 入站整形
+    if (form.throttleProfile !== (config.throttleProfile ?? 'manual')) d.throttleProfile = form.throttleProfile
     if (form.inboundThrottleEnabled !== (config.inboundThrottleEnabled ?? true)) d.inboundThrottleEnabled = form.inboundThrottleEnabled
     if (form.inboundRpmAuto !== (config.inboundRpmAuto ?? true)) d.inboundRpmAuto = form.inboundRpmAuto
     const nTarget = parseInt(form.inboundTargetRpm, 10)
@@ -1884,6 +1950,34 @@ export function SettingsPage() {
     // Admin UI 登录页背景（缺省视为开启，与 toForm 基线一致）
     if (form.loginBackgroundEnabled !== (config.loginBackgroundEnabled ?? true)) d.loginBackgroundEnabled = form.loginBackgroundEnabled
     if (form.loginBackgroundR18 !== (config.loginBackgroundR18 ?? false)) d.loginBackgroundR18 = form.loginBackgroundR18
+    // 全局模型映射：JSON 文本 → 对象；合法且非空时才提交（非法 JSON 不提交，保存时静默忽略，
+    // 前端已在输入区给出即时校验提示）。与基线 deep 比较，避免「空对象 ↔ 未配置」误报差异。
+    // 校验与输入区 `modelMappingParsed` 同口径：**纯对象**（数组/null 不收 —— `typeof []==='object'`
+    // 会放行 `["a"]`）且**值全为 string**（`{"a":123}` 同类问题）。判据不一致会让界面提示
+    // 「非法、不提交」却仍把脏值发后端吃 400（只剩通用错误 toast），提示与行为对不上。
+    const mmTrim = form.modelMapping.trim()
+    if (mmTrim !== '') {
+      try {
+        const mm = JSON.parse(mmTrim) as unknown
+        if (
+          mm !== null &&
+          typeof mm === 'object' &&
+          !Array.isArray(mm) &&
+          Object.values(mm).every((v) => typeof v === 'string')
+        ) {
+          const base = config.modelMapping ?? {}
+          const changed =
+            Object.keys(mm).length !== Object.keys(base).length ||
+            Object.entries(mm).some(([k, v]) => base[k] !== v)
+          if (changed) d.modelMapping = mm as Record<string, string>
+        }
+      } catch {
+        // 非法 JSON：不提交。输入区已有红色校验提示。
+      }
+    } else if ((config.modelMapping ?? {}) && Object.keys(config.modelMapping ?? {}).length > 0) {
+      // 用户清空了整个编辑区 → 视为清空映射（提交空对象删除全部规则）。
+      d.modelMapping = {}
+    }
     return d
   }, [config, form])
 
@@ -1894,6 +1988,25 @@ export function SettingsPage() {
     form.poolShowDisabled !== uiPrefs.poolShowDisabled ||
     form.cardSize !== uiPrefs.cardSize
   )
+
+  // 全局模型映射的即时校验：非法 JSON 标记 invalid；合法则给出规则条数摘要。
+  // 判据与保存路径同口径：纯对象（数组/null 不收）+ 值全为 string。
+  // 若这里放宽而保存路径收紧，`{"a":123}` 会出现「界面不提示非法、保存却静默拒绝」的脱节。
+  const modelMappingParsed = useMemo(() => {
+    if (!form) return undefined
+    const raw = form.modelMapping.trim()
+    if (raw === '') return undefined
+    try {
+      const v = JSON.parse(raw) as unknown
+      return v !== null && typeof v === 'object' && !Array.isArray(v) &&
+        Object.values(v).every((val) => typeof val === 'string')
+        ? (v as Record<string, string>)
+        : undefined
+    } catch {
+      return undefined
+    }
+  }, [form])
+  const modelMappingInvalid = !!(form && form.modelMapping.trim() !== '' && !modelMappingParsed)
 
   const dirty = Object.keys(diff).length > 0 || uiPrefsDirty
 
@@ -2276,6 +2389,28 @@ export function SettingsPage() {
                 description={t('settingspage.smart.gear.inboundDesc')}
               >
                 <SearchContext.Provider value={{ query: '' }}>
+                  {/* 档位放在整形区最上方：它是这一段的总纲，先选档再看细项。
+                      档位只填未手动配过的项，已配置的值不会被覆盖（后端 apply_throttle_profile）。 */}
+                  <Field
+                    label={t('settingspage.throttleProfile.title')}
+                    hint={t('settingspage.throttleProfile.desc')}
+                  >
+                    <select
+                      className="h-9 rounded-md border border-input bg-background px-3 text-sm"
+                      value={form.throttleProfile}
+                      onChange={(e) => set('throttleProfile', e.target.value as ThrottleProfile)}
+                      aria-label={t('settingspage.throttleProfile.title')}
+                    >
+                      <option value="manual">{t('settingspage.throttleProfile.manual')}</option>
+                      <option value="shielded">{t('settingspage.throttleProfile.shielded')}</option>
+                      <option value="direct">{t('settingspage.throttleProfile.direct')}</option>
+                    </select>
+                  </Field>
+                  {form.throttleProfile !== 'manual' && (
+                    <p className="text-xs text-muted-foreground -mt-2 mb-2">
+                      {t(`settingspage.throttleProfile.${form.throttleProfile}Hint`)}
+                    </p>
+                  )}
                   <Field label={t('settingspage.smart.inboundEnabled.label')} hint={t('settingspage.smart.inboundEnabled.hint')}>
                     <Switch checked={form.inboundThrottleEnabled} onCheckedChange={(v) => set('inboundThrottleEnabled', v)} />
                   </Field>
@@ -2473,6 +2608,49 @@ export function SettingsPage() {
       </Card>
       </SectionGate>
 
+      {/*
+        CLI 端点协议/指纹三开关。放 advanced 而非 basic 是刻意的：
+        三项都是「拿生产流量赌一个未验证假设」的性质 —— 四家参考实现虽一致，但**没有任何一家
+        有对照实验数据**证明改了能降 429 率/封号率，依据只是「真实客户端这么发」。
+        默认全关 = 保持既有线上行为逐字节不变；要验证就单号开、比 429 率。
+      */}
+      <SectionGate section="advanced" titleKey="settingspage.card.cliAlign" kwKey="settingspage.card.cliAlign.kw">
+      <Card className="border-amber-500/20">
+        <CardHeader>
+          <CardTitle className="text-sm">{t('settingspage.card.cliAlign')}</CardTitle>
+          <p className="text-xs text-muted-foreground">{t('settingspage.cliAlign.desc')}</p>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <Field label={t('settingspage.cliAlign.body.label')} hint={t('settingspage.cliAlign.body.hint')}>
+            <Switch checked={form.cliOriginKiroCli} onCheckedChange={(v) => set('cliOriginKiroCli', v)} />
+          </Field>
+          <Field label={t('settingspage.cliAlign.ua.label')} hint={t('settingspage.cliAlign.ua.hint')}>
+            <Switch checked={form.cliUaAlignRealClient} onCheckedChange={(v) => set('cliUaAlignRealClient', v)} />
+          </Field>
+          {/* optout 单独用红框：它不是指纹项，而是**隐私语义变更**（打开 = 同意上游用会话训练）。
+              与另两项混在一起会让人以为都是同类的「对齐指纹」开关。 */}
+          <div className="rounded-md border border-red-500/25 bg-red-500/5 p-3">
+            <Field label={t('settingspage.cliAlign.optout.label')} hint={t('settingspage.cliAlign.optout.hint')}>
+              <div className="flex items-center gap-2">
+                {form.cliCodewhispererOptoutFalse && (
+                  <span className="rounded-full bg-red-500/10 px-2 py-0.5 text-[10px] font-medium text-red-400">
+                    {t('settingspage.cliAlign.optout.badge')}
+                  </span>
+                )}
+                <Switch
+                  checked={form.cliCodewhispererOptoutFalse}
+                  onCheckedChange={(v) => set('cliCodewhispererOptoutFalse', v)}
+                />
+              </div>
+            </Field>
+          </div>
+          <p className="text-[11px] leading-relaxed text-muted-foreground">
+            {t('settingspage.cliAlign.footnote')}
+          </p>
+        </CardContent>
+      </Card>
+      </SectionGate>
+
       {/* 高级选项：上游 429 吸收层。带显著警告——与外置 shield 叠乘 + 预算缺口未修完。 */}
       <SectionGate section="advanced" titleKey="settingspage.card.advAbsorb" kwKey="settingspage.card.advAbsorb.kw">
       <Card className="border-amber-500/20">
@@ -2486,10 +2664,17 @@ export function SettingsPage() {
           <Callout variant="warning" className="my-3 text-xs">
             <div className="font-medium">{t('settingspage.advanced.absorb.warnTitle')}</div>
             <ul className="mt-1 list-disc space-y-1 pl-4">
-              <li>{t('settingspage.advanced.absorb.warnGap')}</li>
+              <li>{t('settingspage.advanced.absorb.budgetGapWarn')}</li>
               <li>{t('settingspage.advanced.absorb.warnShield')}</li>
             </ul>
           </Callout>
+          {/* 吸收层只挂在 Kiro 主路径，不覆盖透传。号池全代挂时本组全程无效，
+              显式说出来，避免用户反复调一组死配置。 */}
+          {absorbHasNoEffect && (
+            <Callout variant="warning" className="mb-3">
+              {t('settingspage.advanced.absorb.noEffectAllCustomApi')}
+            </Callout>
+          )}
           <Field label={t('settings.absorb.enabled')} hint={`${t('settings.absorb.enabledHint')}${hotParen}`}>
             <Switch checked={form.upstreamRetryAbsorbEnabled} onCheckedChange={(v) => set('upstreamRetryAbsorbEnabled', v)} />
           </Field>
@@ -2512,6 +2697,18 @@ export function SettingsPage() {
           <Field label={t('settings.absorb.suspended')} hint={t('settingspage.advanced.absorb.suspendedHint')}>
             <Switch checked={form.upstreamRetryAbsorbSuspended} onCheckedChange={(v) => set('upstreamRetryAbsorbSuspended', v)} disabled={!form.upstreamRetryAbsorbEnabled} />
           </Field>
+          <Field label={t('settings.absorb.serverError')} hint={t('settings.absorb.serverErrorHint')}>
+            <Switch checked={form.upstreamRetryAbsorbServerError} onCheckedChange={(v) => set('upstreamRetryAbsorbServerError', v)} disabled={!form.upstreamRetryAbsorbEnabled} />
+          </Field>
+          <Field label={t('settings.absorb.capacity400')} hint={t('settings.absorb.capacity400Hint')}>
+            <Switch checked={form.upstreamRetryAbsorbCapacity400} onCheckedChange={(v) => set('upstreamRetryAbsorbCapacity400', v)} disabled={!form.upstreamRetryAbsorbEnabled} />
+          </Field>
+          <Field label={t('settings.absorb.swapBudgetSecs')} hint={t('settings.absorb.swapBudgetSecsHint')}>
+            <NumberStepper value={Number(form.upstreamRetryAbsorbSwapBudgetSecs) || 0} onChange={(v) => set('upstreamRetryAbsorbSwapBudgetSecs', String(v))} min={0} max={600} step={5} className="w-28" disabled={!form.upstreamRetryAbsorbEnabled} aria-label={t('settings.absorb.swapBudgetSecs')} />
+          </Field>
+          <Field label={t('settings.absorb.exhausted503')} hint={t('settings.absorb.exhausted503Hint')}>
+            <Switch checked={form.upstreamRetryAbsorbExhausted503} onCheckedChange={(v) => set('upstreamRetryAbsorbExhausted503', v)} disabled={!form.upstreamRetryAbsorbEnabled} />
+          </Field>
         </CardContent>
       </Card>
       </SectionGate>
@@ -2530,7 +2727,55 @@ export function SettingsPage() {
           <Field label={t('settingspage.advanced.cache.enabled.label')} hint={`${t('settingspage.advanced.cache.enabled.hint')}${hotParen}`}>
             <Switch checked={form.promptCacheEnabled} onCheckedChange={(v) => set('promptCacheEnabled', v)} />
           </Field>
+          <Field label={t('settingspage.advanced.cache.nativeEffort.label')} hint={t('settingspage.advanced.cache.nativeEffort.hint')}>
+            <Switch checked={form.nativeThinkingEffortEnabled} onCheckedChange={(v) => set('nativeThinkingEffortEnabled', v)} />
+          </Field>
+          <Field label={t('settingspage.advanced.selfHeal.base.label')} hint={t('settingspage.advanced.selfHeal.base.hint')}>
+            <NumberStepper value={Number(form.selfHealBaseBackoffSecs) || 60} onChange={(v) => set('selfHealBaseBackoffSecs', String(v))} min={5} max={3600} step={5} className="w-28" aria-label={t('settingspage.advanced.selfHeal.base.label')} />
+          </Field>
+          <Field label={t('settingspage.advanced.selfHeal.max.label')} hint={t('settingspage.advanced.selfHeal.max.hint')}>
+            <NumberStepper value={Number(form.selfHealMaxBackoffSecs) || 900} onChange={(v) => set('selfHealMaxBackoffSecs', String(v))} min={60} max={7200} step={60} className="w-28" aria-label={t('settingspage.advanced.selfHeal.max.label')} />
+          </Field>
+          <Field label={t('settingspage.advanced.selfHeal.shift.label')} hint={t('settingspage.advanced.selfHeal.shift.hint')}>
+            <NumberStepper value={Number(form.selfHealMaxShift) || 4} onChange={(v) => set('selfHealMaxShift', String(v))} min={0} max={31} step={1} className="w-28" aria-label={t('settingspage.advanced.selfHeal.shift.label')} />
+          </Field>
           <ReadonlyRow label={t('settingspage.advanced.cache.ttl.label')} value={t('settingspage.advanced.cache.ttl.value')} />
+        </CardContent>
+      </Card>
+      </SectionGate>
+
+      {/* 全局模型映射分区：客户端模型名 → 上游模型名（用量双口径）。JSON 编辑 + 即时校验。 */}
+      <SectionGate section="advanced" titleKey="settingspage.card.modelMapping" kwKey="settingspage.card.modelMapping.kw">
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="text-base"><Highlight text={t('settingspage.card.modelMapping')} /></CardTitle>
+        </CardHeader>
+        <CardContent className="py-0">
+          <Callout variant="info" className="my-3 text-xs">
+            <div>{t('settingspage.advanced.modelMapping.intro')}</div>
+            <div className="mt-1">{t('settingspage.advanced.modelMapping.order')}</div>
+            <div className="mt-1">{t('settingspage.advanced.modelMapping.exemptHint')}</div>
+          </Callout>
+          <Field
+            label={t('settingspage.advanced.modelMapping.editorLabel')}
+            hint={t('settingspage.advanced.modelMapping.editorHint')}
+          >
+            <textarea
+              className="flex min-h-[140px] w-full max-w-[360px] rounded-md border border-input bg-background px-3 py-2 font-mono text-xs ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              value={form.modelMapping}
+              onChange={(e) => set('modelMapping', e.target.value)}
+              placeholder={t('settingspage.advanced.modelMapping.ph')}
+              spellCheck={false}
+              aria-invalid={modelMappingInvalid}
+            />
+            <div className={modelMappingInvalid ? 'text-xs text-red-500' : 'text-xs text-muted-foreground'}>
+              {modelMappingInvalid
+                ? t('settingspage.advanced.modelMapping.invalidJson')
+                : t('settingspage.advanced.modelMapping.valid', {
+                    n: Object.keys(modelMappingParsed ?? {}).length,
+                  })}
+            </div>
+          </Field>
         </CardContent>
       </Card>
       </SectionGate>
