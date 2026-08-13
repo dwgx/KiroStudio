@@ -24,4 +24,5 @@ pub mod regions;
 pub mod scheduling;
 pub mod throttle;
 pub mod token_manager;
+pub mod version_mask;
 pub mod web_portal;

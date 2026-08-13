@@ -2330,6 +2330,8 @@ fn emit_stream_usage(
     record.first_token_ms = ctx
         .first_token_at()
         .map(|t| t.saturating_duration_since(meta.started_at).as_millis() as u64);
+    // 中断字节：正常收尾 None，断流时记录已收字节（与 first_token_ms 同模式读 ctx）。
+    record.interrupted_bytes = ctx.interrupted_bytes();
     record.retries = meta.retries;
     // 去硬编码 Success：按本次响应的真实完成状态记账，避免截断/上游错误被记成成功污染熔断信号。
     record.outcome = ctx.completion_outcome();
@@ -2413,6 +2415,8 @@ fn create_sse_stream(
                 chunk_result = body_stream.next() => {
                     match chunk_result {
                         Some(Ok(chunk)) => {
+                            // 累计上游传输字节（断流收尾时经 interrupted_bytes 落库）
+                            ctx.note_received_bytes(chunk.len());
                             // 解码事件
                             if let Err(e) = decoder.feed(&chunk) {
                                 tracing::warn!("缓冲区溢出: {}", e);
@@ -3863,6 +3867,8 @@ fn emit_buffered_usage(
     record.first_token_ms = ctx
         .first_token_at()
         .map(|t| t.saturating_duration_since(meta.started_at).as_millis() as u64);
+    // 中断字节：非流式 buffered 无「流中断」概念，恒 None（与流式埋点同模式对称）。
+    record.interrupted_bytes = ctx.interrupted_bytes();
     record.retries = meta.retries;
     // 去硬编码 Success：按真实完成状态记账（截断/上游错误不再被记成成功）。
     record.outcome = ctx.completion_outcome();

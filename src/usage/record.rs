@@ -123,6 +123,13 @@ pub struct RequestRecord {
     pub latency_ms: u64,
     /// 首字节/首事件延迟（毫秒，流式有意义）
     pub first_token_ms: Option<u64>,
+    /// SSE 流中途断流（传输错误/解码器停止/in-band 错误）时已从上游收到的字节数。
+    ///
+    /// `None` = 本次未中断（正常收尾）；`Some(n)` = 断流时点已收字节（0 表示
+    /// 一个字节都没收到就断了）。埋点见 `StreamContext::note_received_bytes` /
+    /// `interrupted_bytes`。serde default，兼容早于本字段的历史 JSONL（缺字段视为 None）。
+    #[serde(default)]
+    pub interrupted_bytes: Option<u64>,
     /// 结果分类
     pub outcome: RequestOutcome,
     /// 本次经历的重试次数（0 表示首次即成功）
@@ -159,6 +166,7 @@ impl RequestRecord {
             credits_used: None,
             latency_ms: 0,
             first_token_ms: None,
+            interrupted_bytes: None,
             outcome: RequestOutcome::Success,
             retries: 0,
             error_message: None,

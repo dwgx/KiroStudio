@@ -1313,6 +1313,11 @@ async fn run_round(
     })?;
     let tool_name_map = conversion.tool_name_map;
 
+    // 保留压缩前的原始状态克隆：请求体超限重试时从它重建（与两条主路径同款——
+    // 已压缩过的体再压没收益，必须回到压缩前的状态）。
+    let conv_state_for_compress_retry = conversion.conversation_state.clone();
+    let native_fields_for_compress_retry =
+        conversion.additional_model_request_fields.clone();
     let request_body = super::handlers::build_kiro_request_body_for_websearch(
         conversion.conversation_state,
         conversion.additional_model_request_fields,
@@ -1330,10 +1335,69 @@ async fn run_round(
     })?;
 
     let is_1m = crate::anthropic::model_catalog::resolve_is_1m(&payload.model);
-    let (response, meta) = provider
-        .call_api_stream(&request_body, is_1m, budget)
-        .await
-        .map_err(super::handlers::map_provider_error_for_websearch)?;
+
+    // 压缩重试：上游 400 请求体超限（map_provider_error 会给响应挂内部重试标记头）
+    // 时，用既有 compressor 对压缩前克隆压一轮（等比压低 tool_result 截断阈值）再
+    // 重建请求体重发，最多 3 次 —— 与 /cc/v1 的 'compress_retry 循环同语义；多轮
+    // 回灌上下文膨胀正是这条链路的主要触发源。target 公式在 handlers 私有不可复用，
+    // 这里以压缩管道默认阈值按 (3/4)^attempt 递减逼近（下限 2048 字符）。
+    const MAX_COMPRESS_RETRIES: u32 = 3;
+    const RETRY_TOOL_RESULT_BASE_CHARS: u64 = 8000;
+    let mut body = request_body;
+    let mut compress_attempt: u32 = 0;
+    let (response, meta) = loop {
+        match provider.call_api_stream(&body, is_1m, budget).await {
+            Ok(pair) => break pair,
+            Err(e) => {
+                let mapped = super::handlers::map_provider_error_for_websearch(e);
+                let retryable = compress_attempt < MAX_COMPRESS_RETRIES
+                    && mapped
+                        .headers()
+                        .get("x-kirostudio-compress-retry")
+                        .is_some();
+                if !retryable {
+                    // ⚠️ 2026-08-13 对抗审查 m1：耗尽分支必须 strip 内部标记头
+                    // （主路径 handlers.rs 特意 remove，websearch 此前缺同一操作，
+                    // 会把 x-kirostudio-compress-retry 透传给客户端）。
+                    let mut resp = mapped;
+                    resp.headers_mut().remove("x-kirostudio-compress-retry");
+                    return Err(resp);
+                }
+                compress_attempt += 1;
+                let mut conv = conv_state_for_compress_retry.clone();
+                let tool_max = (RETRY_TOOL_RESULT_BASE_CHARS
+                    .saturating_mul(3u64.pow(compress_attempt))
+                    .saturating_div(4u64.pow(compress_attempt)))
+                    .max(2048) as usize;
+                let cfg = crate::model::config::CompressionConfig {
+                    tool_result_max_chars: tool_max,
+                    ..crate::model::config::CompressionConfig::default()
+                };
+                super::compressor::compress(&mut conv, &cfg);
+                body = super::handlers::build_kiro_request_body_for_websearch(
+                    conv,
+                    native_fields_for_compress_retry.clone(),
+                )
+                .map_err(|e| {
+                    tracing::error!("WebSearch 回灌压缩重试序列化请求失败: {}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse::new(
+                            "internal_error",
+                            format!("序列化请求失败: {}", e),
+                        )),
+                    )
+                        .into_response()
+                })?;
+                tracing::info!(
+                    attempt = compress_attempt,
+                    tool_result_max_chars = tool_max,
+                    body_len = body.len(),
+                    "WebSearch 回灌请求体超限：已重新压缩并重试"
+                );
+            }
+        }
+    };
 
     let outcome = decode_round(response, &payload.model, &tool_name_map).await;
 
@@ -1385,7 +1449,7 @@ pub(super) async fn run_web_search_loop(
 
     // 0..=MAX 而不是 0..MAX：上限那一轮仍要**发出去**（拿到最终回答），只是不再回灌。
     for round_idx in 0..=MAX_WEB_SEARCH_ROUNDS {
-        let (round, credential_id) = run_round(&provider, &payload, budget).await?;
+        let (mut round, credential_id) = run_round(&provider, &payload, budget).await?;
         last_credential_id = credential_id;
         last_context_input = round.context_input_tokens.or(last_context_input);
         total_credits += round.credits;
@@ -1393,7 +1457,11 @@ pub(super) async fn run_web_search_loop(
         if should_replay_round(round_idx, &round.web_search, !round.client_tool_use.is_empty()) {
             // 真搜索：任一条失败就整体报错，绝不把失败静默降级成「没搜到」——
             // 客户端会把空结果当"真的没搜到"，掩盖网关/上游故障（与快路径同一条铁律）。
+            // 唯一例外：共享预算耗尽不整包报错 —— 已累积的搜索结果是有价值的部分
+            // 结果，收尾成成功响应返回（见下方 budget_exhausted 分支）。
             let mut searched: Vec<SearchedWebSearch> = Vec::with_capacity(round.web_search.len());
+            // 预算耗尽旁路标记：为真时跳过回灌，落到下方同一份收尾渲染。
+            let mut budget_exhausted = false;
             for ws in &round.web_search {
                 let (srv_id, mcp_request) = create_mcp_request(&ws.query);
                 match call_mcp_api(&provider, &mcp_request, budget).await {
@@ -1405,9 +1473,12 @@ pub(super) async fn run_web_search_loop(
                     }),
                     Err(e) => {
                         tracing::warn!("WebSearch 回灌 MCP 调用失败: {}", e);
-                        // ⭐ 共享预算耗尽（同快路径）：503 + Retry-After，客户端可退避。
+                        // ⭐ 共享预算耗尽（同快路径判据）：部分结果收尾 —— 已搜索
+                        // 轮次的结果 + 已累积文本以成功响应返回（语义「搜索了但预算
+                        // 不够完成全部回灌」），不再整包 503 丢弃已累积的展示内容。
                         if e.to_string().contains("shared_budget_exhausted=1") {
-                            return Err(budget_exhausted_response());
+                            budget_exhausted = true;
+                            break;
                         }
                         return Err((
                             StatusCode::BAD_GATEWAY,
@@ -1420,13 +1491,26 @@ pub(super) async fn run_web_search_loop(
                     }
                 }
             }
-            tracing::info!(
-                round = round_idx + 1,
-                searches = searched.len(),
-                "WebSearch 回灌：搜索完成，结果回灌进下一轮请求"
-            );
-            presentation.extend(append_search_round(&mut payload, &round.text, &searched));
-            continue;
+            if budget_exhausted {
+                // 本轮搜索没拿到结果：清掉悬空的 web_search tool_use（回给客户端会成
+                // 无 tool_result 的孤儿块），只保留已累积内容走下方收尾渲染（stop_reason
+                // 随之按空工具判定为 end_turn，与「搜索了但没搜完」的语义一致）。
+                // ⚠️ 2026-08-13 对抗审查 m3：本轮**已搜到**的 searched 也要保留
+                // （此前只留之前轮次，本轮成果丢失——注释声称「已累积搜索结果是有价值
+                // 的部分结果」却没包含本轮）。
+                round.web_search.clear();
+                if !searched.is_empty() {
+                    presentation.extend(append_search_round(&mut payload, &round.text, &searched));
+                }
+            } else {
+                tracing::info!(
+                    round = round_idx + 1,
+                    searches = searched.len(),
+                    "WebSearch 回灌：搜索完成，结果回灌进下一轮请求"
+                );
+                presentation.extend(append_search_round(&mut payload, &round.text, &searched));
+                continue;
+            }
         }
 
         // 收尾：本轮不是纯 web_search（或已达轮数上限）→ 渲染给客户端。

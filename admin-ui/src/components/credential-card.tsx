@@ -41,6 +41,7 @@ import {
   setCredentialAllowedModels,
   probeUpstreamModels,
   reprobeRegion,
+  exportCredential,
 } from '@/api/credentials'
 import { authShortLabel, disabledReasonLabel, subscriptionLabel } from '@/lib/i18n-labels'
 import {
@@ -141,6 +142,8 @@ export function CredentialCard({
   // 别名/备注编辑：设置弹框内输入框的本地值 + 保存中状态
   const [nameValue, setNameValue] = useState(credential.name ?? '')
   const [savingName, setSavingName] = useState(false)
+  // 点击掩码复制完整 Key：防重复点击（敏感导出端点，与设置页 copyOne 同模式）。
+  const [copyKeyBusy, setCopyKeyBusy] = useState(false)
 
   // 单凭证代理编辑：URL(留空回退全局,"direct"不走代理) + 账密(留空不改)。立即生效无需重启。
   const [proxyValue, setProxyValue] = useState(credential.proxyUrl ?? '')
@@ -208,6 +211,28 @@ export function CredentialCard({
   const cooldownSeconds = Math.ceil(cooldownMs / 1000)
   // 速率限制（429）用琥珀，其它原因（服务错误 / Token 刷新失败等）用红。
   const cooldownIsRateLimit = credential.cooldownReason === '速率限制'
+
+  // 点击掩码复制完整 Key：exportCredential 拿真值（与设置页 copyOne 同模式），
+  // 取 kiroApiKey 字段（后端 export 返回 camelCase KiroCredentials，只有 api_key 号有掩码）。
+  // i18n: credentialcard.toast.apiKeyCopied / apiKeyCopyFailed / apiKeyMissing（主会话补三语）
+  const handleCopyFullKey = async () => {
+    if (copyKeyBusy) return
+    setCopyKeyBusy(true)
+    try {
+      const obj = await exportCredential(credential.id)
+      const key = typeof obj.kiroApiKey === 'string' ? obj.kiroApiKey : ''
+      if (!key) {
+        toast.error('该凭据没有可复制的完整 Key')
+        return
+      }
+      const ok = await copyToClipboard(key)
+      ok ? toast.success('已复制完整 Key') : toast.error('复制失败')
+    } catch (err) {
+      toast.error(extractErrorMessage(err))
+    } finally {
+      setCopyKeyBusy(false)
+    }
+  }
 
   // 保存别名/备注：空字符串视为清除（传 null）。成功后刷新凭据列表 + toast。
   const handleSaveName = async () => {
@@ -922,7 +947,24 @@ export function CredentialCard({
             {credential.maskedApiKey && (
               <div className="col-span-2">
                 <span className="text-muted-foreground">{t('credentialcard.info.apiKey')}</span>
-                <span className="font-mono font-medium">{credential.maskedApiKey}</span>
+                {/* 点击掩码复制完整 Key（exportCredential 拿真值，与设置页 copyOne 同模式）。
+                    i18n: credentialcard.info.copyKeyTitle（主会话补三语） */}
+                <span
+                  className={cn('font-mono font-medium', copyKeyBusy ? 'cursor-wait opacity-60' : 'cursor-pointer')}
+                  title={copyKeyBusy ? '复制中…' : '点击复制完整 Key'}
+                  aria-label={copyKeyBusy ? '复制中…' : '点击复制完整 Key'}
+                  role="button"
+                  tabIndex={0}
+                  onClick={handleCopyFullKey}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault()
+                      handleCopyFullKey()
+                    }
+                  }}
+                >
+                  {credential.maskedApiKey}
+                </span>
               </div>
             )}
             {/* 超额（Overage）开关已移入「设置」弹框（齿轮），保持卡片主体信息网格干净。 */}

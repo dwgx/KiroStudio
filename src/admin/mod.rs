@@ -25,7 +25,8 @@ mod router;
 mod service;
 mod social_login;
 pub mod types;
-mod update;
+// pub(crate)：main.rs 的后台 OTA 自动检查（update::spawn_auto_check）需要跨模块调用。
+pub(crate) mod update;
 mod usage_handlers;
 
 pub use middleware::AdminState;

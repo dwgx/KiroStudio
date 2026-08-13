@@ -27,8 +27,11 @@ pub use super::social_login::{PollResult, StartResult};
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, BatchDeleteItemResult,
     CleanupDisabledResponse, CleanupSkippedItem, ConfigSnapshotResponse, CredentialStatusItem,
-    CredentialsStatusResponse, DisableQuotaExceededResponse, ImportKeyItem, ImportKeyResult,
-    ImportKeysRequest, ImportKeysResponse, LoadBalancingModeResponse, ReprobeRegionResponse,
+    CredentialsStatusResponse, DiagnosticsConfigSummary, DiagnosticsCredentialEntry,
+    DiagnosticsPoolHealth, DiagnosticsSnapshotResponse, DiagnosticsVersion,
+    DisableQuotaExceededResponse, ImportConfigResponse, ImportKeyItem,
+    ImportKeyResult, ImportKeysRequest, ImportKeysResponse, KamExportAccount,
+    KamExportResponse, LoadBalancingModeResponse, ReprobeRegionResponse,
     SetLoadBalancingModeRequest, SocksNodeBulkImportItem, SocksNodeBulkImportOutcome,
     SocksNodeUpsertRequest, SocksNodeView, StorageCleanupItem, StorageCleanupResponse,
     StoragePartition, StorageStatsResponse, TrashItemResponse, TrashListResponse,
@@ -149,6 +152,18 @@ const CLEANUP_SELF_HEALABLE_REASONS: [DisabledReason; 3] = [
     DisabledReason::SuspiciousActivityAuto,
     DisabledReason::TooManyRefreshFailures,
 ];
+
+/// 代理池自动健康探测间隔（秒），固定 5 分钟。
+///
+/// 刻意不提供配置项：`model/config.rs` 不在改动范围，且探测节奏属运维内部策略，
+/// 与 `balance_refresh_interval_secs`（面板可调）定位不同。改这里 + 重启即生效。
+const SOCKS_HEALTH_CHECK_INTERVAL_SECS: u64 = 300;
+
+/// 连续失败多少次后自动禁用该节点（对齐「连续失败 N 次」的调度语义）。
+///
+/// 判定在 `run_socks_health_round` 内按**连续**失败计数（成功即清零），
+/// 达阈值把 `enabled` 置 false 并落盘——面板节点卡片可看到最近失败与原因。
+const SOCKS_HEALTH_FAIL_THRESHOLD: u32 = 3;
 
 /// 一条**已禁用**凭据是否该被清理。返回 `Some(跳过原因)` = 不清；`None` = 清。
 ///
@@ -414,6 +429,38 @@ pub struct AdminService {
     /// 下一个要发放的节点 id。**只增不减**且随表落盘，故 id 永不复用
     /// （`max(现有 id)+1` 会在删掉最大 id 后把它重新发出去）。
     socks_next_id: std::sync::atomic::AtomicU64,
+    /// 配置写锁（2026-08-14 新增）：串行化「load → 逐字段改 → save → reload」整段，
+    /// 根除并发 `update_config` 的 lost update（两请求同时 load、各自 save，后写覆盖先写）。
+    /// 只包 `update_config` / `import_config` 两个写路径，读路径（快照/导出）不走它。
+    /// 函数体全程同步无 await（sync fn），`parking_lot::Mutex` 即可。
+    config_write_lock: parking_lot::Mutex<()>,
+    /// 余额耗尽**自动**禁用开关（2026-08-14 新增，默认开）。
+    ///
+    /// 读取点在后台温和余额刷新循环：刷到「刚取到的上游真值 remaining<=0」时自动
+    /// 调 `report_quota_exhausted` 禁用（对齐 402 路径与手动 `disable_quota_exceeded`
+    /// 语义）。与手动端点唯一的差别：自动只对**本次刚取到的新鲜真值**生效
+    /// （cached_at=now，无需 24h 新鲜度门）。
+    ///
+    /// ⚠️ 仅存活于本服务内存：`model/config.rs` 不在本次改动范围，开关不进 config.json，
+    /// 重启回默认值 true。经 `UpdateConfigRequest` / 配置快照接线到面板。
+    auto_disable_quota_exceeded: std::sync::atomic::AtomicBool,
+    /// 代理池**自动**健康调度任务句柄（独立受管任务槽，对齐 `balance_task` 模式）。
+    /// 后台每 `SOCKS_HEALTH_CHECK_INTERVAL_SECS` 秒对池内启用节点做一轮健康探测，
+    /// 连续失败达 `SOCKS_HEALTH_FAIL_THRESHOLD` 次自动禁用该节点。
+    /// None = 未运行（开关关闭或尚未启动）。
+    socks_health_task: Mutex<Option<JoinHandle<()>>>,
+    /// 自动健康调度开关（服务内存态，默认开；重启回默认值 true）。
+    /// 与 `auto_disable_quota_exceeded` 同款：不进 config.json，经配置快照/更新请求接线。
+    socks_auto_health: std::sync::atomic::AtomicBool,
+    /// 节点 id → 连续失败次数（**仅内存，重启清零**）。
+    ///
+    /// 为什么计数放 service 内存而不是节点表：节点表模型（`kiro/model/socks_node.rs`）
+    /// 不在本次改动范围；且「连续失败」是运行期健康语义，跨重启清零恰好是期望行为
+    /// （重启后重新积累）。探测成功或手动启用时清零。
+    socks_fail_counts: Mutex<HashMap<u64, u32>>,
+    /// 健康探测轮次的 round-robin 起点轮转（每轮 +1，取模落到池内启用节点上，
+    /// 避免每轮都从第一个节点开始——长时间运行后首个节点永远先被探测）。
+    socks_health_round: std::sync::atomic::AtomicU64,
 }
 
 /// 清洗粘贴进来的 Kiro API Key（`ksk_`）：截取 `ksk_` 起、去首尾空白与包裹引号/逗号。
@@ -440,6 +487,126 @@ fn clean_ksk_api_key(raw: &str) -> Option<String> {
     } else {
         Some(out)
     }
+}
+
+/// 写盘前把当前 config.json 轮换为备份（保留 3 份：`config.json.bak`、
+/// `config.json.bak.1`、`config.json.bak.2`）。
+///
+/// 轮换方向（旧→新覆盖）：`.bak.1` → `.bak.2`，`.bak` → `.bak.1`，当前文件复制为 `.bak`。
+/// 复制而非 rename：写盘是原子的（`fs_atomic::write_atomic`），但复制保留 config.json
+/// 原位直到 save 完成，任何时刻磁盘上都有一份完整配置。备份失败只告警不阻断保存
+/// （备份是保险不是依赖）。
+fn rotate_config_backup(config_path: &Path) {
+    let bak = config_path.with_extension("json.bak");
+    let bak1 = config_path.with_extension("json.bak.1");
+    let bak2 = config_path.with_extension("json.bak.2");
+    // 最旧一份先滚出（rename 在 Unix 上覆盖目标；失败仅忽略，下次轮换自然补齐）
+    if bak1.exists() {
+        let _ = std::fs::rename(&bak1, &bak2);
+    }
+    if bak.exists() {
+        let _ = std::fs::rename(&bak, &bak1);
+    }
+    if let Err(e) = std::fs::copy(config_path, &bak) {
+        tracing::warn!("配置备份轮换失败（继续保存，不影响写盘）: {}", e);
+    }
+}
+
+/// 递归对比两份配置 JSON，返回「发生了变更的字段路径」列表。
+///
+/// 只记**字段名**（如 `proxyUrl` / `inboundRpmMin`），绝不记录字段值 ——
+/// 敏感字段（apiKey/adminApiKey/proxyPassword 等）的值因此天然不会进审计日志。
+fn diff_json_fields(old: &serde_json::Value, new: &serde_json::Value) -> Vec<String> {
+    fn walk(path: &str, old: &serde_json::Value, new: &serde_json::Value, out: &mut Vec<String>) {
+        match (old, new) {
+            (serde_json::Value::Object(lo), serde_json::Value::Object(no)) => {
+                let mut keys: Vec<&String> = lo.keys().collect();
+                for k in no.keys() {
+                    if !lo.contains_key(k) {
+                        keys.push(k);
+                    }
+                }
+                keys.sort();
+                for k in keys {
+                    let p = if path.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{path}.{k}")
+                    };
+                    match (lo.get(k), no.get(k)) {
+                        // 双方都有 → 递归到叶子；有一方缺失（新增/删除键）→ 记路径
+                        (Some(a), Some(b)) => walk(&p, a, b, out),
+                        _ => out.push(p),
+                    }
+                }
+            }
+            (a, b) if a == b => {}
+            _ => out.push(path.to_string()),
+        }
+    }
+    let mut out = Vec::new();
+    walk("", old, new, &mut out);
+    out
+}
+
+/// 将单个凭据映射为 KAM 1.8.3+ 平铺格式的账号结构
+///
+/// 移植自参考仓（kiro-rs-tool）`credential_to_kam_account`，按本仓数据结构适配：
+/// - 无 refreshToken 的号（api_key / custom_api）KAM 无对应字段，整条跳过；
+/// - 空字符串字段过滤为 None，保持导出 JSON 整洁；
+/// - 本仓凭据结构没有 provider / start_url 字段 → 恒为 None（KAM 侧可再补）；
+/// - idp 复用本仓 `KiroCredentials::effective_idp` 的既有推断（social → Google）。
+fn credential_to_kam_account(cred: KiroCredentials) -> Option<KamExportAccount> {
+    let refresh_token = cred
+        .refresh_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)?;
+
+    fn non_empty(value: Option<String>) -> Option<String> {
+        value
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    // 派生值先算齐再移动字段（partial move 后不能再整结构借用 effective_idp）。
+    let status = if cred.disabled {
+        Some("disabled".to_string())
+    } else {
+        Some("active".to_string())
+    };
+    let idp = non_empty(Some(cred.effective_idp().to_string()));
+
+    Some(KamExportAccount {
+        email: non_empty(cred.email),
+        nickname: None,
+        idp,
+        provider: None,
+        status,
+        auth_method: non_empty(cred.auth_method.clone()),
+        // MINOR-2（2026-08-14 审查修正）：region 对齐调度真相源的口径 ——
+        // profileArn 推导优先（SSO-OIDC 认证区与对话/余额区物理不同，导错区 =
+        // KAM 导入后错位），再落 region → auth_region → api_region 回退链。
+        region: non_empty(
+            cred
+                .profile_arn
+                .as_deref()
+                .and_then(KiroCredentials::region_from_profile_arn)
+                .map(|s| s.to_string()),
+        )
+        .or_else(|| non_empty(cred.region.clone()))
+        .or_else(|| non_empty(cred.auth_region.clone()))
+        .or_else(|| non_empty(cred.api_region.clone())),
+        start_url: None,
+        client_id: non_empty(cred.client_id),
+        client_secret: non_empty(cred.client_secret),
+        refresh_token: Some(refresh_token),
+        access_token: non_empty(cred.access_token),
+        profile_arn: non_empty(cred.profile_arn),
+        expires_at: non_empty(cred.expires_at),
+        machine_id: non_empty(cred.machine_id),
+    })
 }
 
 impl AdminService {
@@ -475,7 +642,23 @@ impl AdminService {
             socks_nodes_path,
             socks_nodes_writable,
             socks_next_id: std::sync::atomic::AtomicU64::new(socks_next_id),
+            config_write_lock: parking_lot::Mutex::new(()),
+            auto_disable_quota_exceeded: std::sync::atomic::AtomicBool::new(true),
+            socks_health_task: Mutex::new(None),
+            socks_auto_health: std::sync::atomic::AtomicBool::new(true),
+            socks_fail_counts: Mutex::new(HashMap::new()),
+            socks_health_round: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// 模型单价表快照（成本估算用；空表 = 不估算成本）。
+    ///
+    /// 每次现读配置快照（`ArcSwap load_full`），改 config.json 立即生效。
+    /// 供用量端点查询时传给 [`crate::usage::usage_stats::UsageStats::by_model`]。
+    pub fn model_pricing(
+        &self,
+    ) -> std::collections::HashMap<String, crate::model::config::ModelPrice> {
+        self.token_manager.config().model_pricing.clone()
     }
 
     /// 发起网页上号，返回 portal_url + session_id
@@ -656,6 +839,39 @@ impl AdminService {
             available: snapshot.available,
             current_id: snapshot.current_id,
             credentials,
+        }
+    }
+
+    /// 导出凭据为 KAM 兼容 JSON（KAM 1.8.3+ 平铺格式）
+    ///
+    /// ⚠️ **敏感操作**：返回的 JSON 含明文 refreshToken / accessToken / clientSecret，
+    /// 出站后即不可控，调用方（handler）必须保证只落到用户浏览器下载、不进日志/存储。
+    ///
+    /// 解密语义：at-rest 加密在启动加载期由 `CredentialsConfig::load` →
+    /// `maybe_decrypt_to_string` 统一解密，内存中的凭据即明文；这里经
+    /// `token_manager.export_credential` 直接复用解密结果，**不做二次加解密**。
+    ///
+    /// `id_filter` 为 None 时导出全部凭据；为 Some 时仅导出集合内的 ID。
+    /// 结果按 priority 升序排序，与 UI 列表一致。
+    pub fn export_kam_credentials(&self, id_filter: Option<&HashSet<u64>>) -> KamExportResponse {
+        let snapshot = self.token_manager.snapshot();
+        let mut credentials: Vec<KiroCredentials> = snapshot
+            .entries
+            .iter()
+            .filter(|e| id_filter.map_or(true, |f| f.contains(&e.id)))
+            .filter_map(|e| self.token_manager.export_credential(e.id))
+            .collect();
+        credentials.sort_by_key(|c| c.priority);
+
+        let accounts = credentials
+            .into_iter()
+            .filter_map(credential_to_kam_account)
+            .collect();
+
+        KamExportResponse {
+            version: "1.8.3".to_string(),
+            exported_at: Utc::now().to_rfc3339(),
+            accounts,
         }
     }
 
@@ -1005,6 +1221,31 @@ impl AdminService {
             list,
             results,
         }
+    }
+
+    /// 自动禁用「余额已超额」的账号组（后台温和刷新循环用，2026-08-14 新增）。
+    ///
+    /// 入参是**本循环刚 commit 过真值**的账号缓存键 —— 新鲜度由调用点保证
+    /// （cached_at=now），故这里不再查 24h 新鲜度门，与手动端点
+    /// [`Self::disable_quota_exceeded`] 的唯一差别就在这一条。
+    ///
+    /// 禁用机制完全一致：逐 id 走 `report_quota_exhausted` 收口
+    /// （`DisabledReason::QuotaExceeded` + 落盘 + 清亲和 + 若禁的是当前号则切号），
+    /// 同 key 的 N 份分身全部禁用（账号配额是共享的，留一份仍会 402）。
+    /// 幂等：已禁用的号 `report_quota_exhausted` 直接跳过，不产生副作用。
+    fn auto_disable_exhausted_group(&self, key: &str) {
+        let ids = match self.balance_key_to_ids().get(key) {
+            Some(ids) => ids.clone(),
+            None => return,
+        };
+        for id in &ids {
+            self.token_manager.report_quota_exhausted(*id);
+        }
+        tracing::info!(
+            "后台温和余额刷新：账号组 {} 余额已耗尽（remaining<=0），已自动禁用 {} 个凭据（开关 auto_disable_quota_exceeded=true）",
+            key,
+            ids.len()
+        );
     }
 
     /// OAuth 类凭据（idc / social / external_idp）的「自助复活」。
@@ -1597,12 +1838,33 @@ impl AdminService {
 
             match self.fetch_balance(*id).await {
                 Ok(balance) => {
+                    // usage_limit 先读（commit_fresh_balance 会移动 balance——M4 的门条件
+                    // 必须在移动前取值，2026-08-13 编译期修正）。
+                    let balance_usage_limit = balance.usage_limit;
+                    let exhausted = balance.remaining <= 0.0;
+                    let key = self.balance_cache_key(*id);
                     // 落缓存 + 重置该账号基线，走与「查看余额」**同一个**收口
                     // （两条路径各写一份 insert 正是基线漏更新的根源）。
                     // 逐个提交而不是攒到本轮末尾：一轮要走 N×4 秒，早提交的号能早点
                     // 在面板/调度器上生效，且中途进程重启不会白刷。
-                    self.commit_fresh_balance(self.balance_cache_key(*id), balance);
+                    self.commit_fresh_balance(key.clone(), balance);
                     tracing::debug!("后台温和余额刷新：凭据 #{} 已更新缓存", id);
+                    // ⭐ 超额自动禁用（2026-08-14 新增）：刚取到的上游真值必然新鲜
+                    // （cached_at=now），无需 24h 新鲜度门；语义与手动端点
+                    // disable_quota_exceeded 完全一致（report_quota_exhausted 收口）。
+                    // 开关默认开，可在面板服务端配置里关闭。
+                    // ⚠️ 2026-08-13 对抗审查 M4：空 breakdown 时 usage_limit()=0 → remaining=0，
+                    // 会误杀「新号无 usage 记录 / 上游返回空 breakdown」的号（不可逆需人工
+                    // 解禁）。必须加 limit>0 门：真额度用尽的号 limit 是正数（remaining=0
+                    // 是已用尽），空 breakdown 的号 limit=0（拿不到额度信息）→ 跳过自动禁用。
+                    if exhausted
+                        && balance_usage_limit > 0.0
+                        && self
+                            .auto_disable_quota_exceeded
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        self.auto_disable_exhausted_group(&key);
+                    }
                 }
                 Err(e) => {
                     // 单个失败不影响整体节奏；仅更新缓存展示，不做任何禁用动作
@@ -1747,6 +2009,11 @@ impl AdminService {
     /// 幂等：重复调用先 abort 旧句柄再重建，不会累积多个循环。
     /// 保留原有防风控节奏：首轮等满一个完整间隔才开始，逐个刷新每个间隔 4 秒。
     pub fn respawn_balance_task(self: &Arc<Self>) {
+        // 代理池自动健康调度搭车本函数作为**启动/热重挂入口**：main.rs 只调
+        // `respawn_balance_task`（main.rs 不在改动范围），而本服务没有别的
+        // `&Arc<Self>` 启动现场——故在这里顺带重挂 socks 健康任务。
+        // 两个任务各自独立：自己的字段/循环/开关，此处只是共用调用时机。
+        self.respawn_socks_health_task();
         let interval = self.token_manager.config().balance_refresh_interval_secs;
         let mut slot = self.balance_task.lock();
         // 先杀旧任务（若有），无论间隔如何都先停，避免旧间隔残留
@@ -1780,6 +2047,207 @@ impl AdminService {
             "后台温和余额刷新已启用：间隔 {} 秒（逐个刷新，每个间隔 4 秒，不做主动禁用）",
             interval
         );
+    }
+
+    /// 重挂代理池自动健康调度任务（受管任务槽，对齐 [`Self::respawn_balance_task`]）。
+    ///
+    /// - 启动入口：由 `respawn_balance_task` 顺带调用（见其开头注释）；
+    /// - 开关 `socks_auto_health` 在任务循环内自检（改开关走 update_config，
+    ///   不需要重挂——关着就整轮跳过，重开即恢复探测）；
+    /// - 幂等：重复调用先 abort 旧句柄再重建，不会累积多个循环；
+    /// - 任务体持 `Weak<Self>`：AdminService 被 drop 后下一轮 upgrade 失败即自我退出。
+    ///
+    /// 间隔固定 `SOCKS_HEALTH_CHECK_INTERVAL_SECS`（无配置项，见常量注释）。
+    /// 首轮等满一个完整间隔才开始（对齐余额任务，避免启动即打一批探针）。
+    pub fn respawn_socks_health_task(self: &Arc<Self>) {
+        let mut slot = self.socks_health_task.lock();
+        if let Some(old) = slot.take() {
+            old.abort();
+        }
+        let weak = Arc::downgrade(self);
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                SOCKS_HEALTH_CHECK_INTERVAL_SECS,
+            ));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let Some(svc) = weak.upgrade() else {
+                    tracing::debug!("AdminService 已释放，代理池健康调度任务退出");
+                    break;
+                };
+                // 开关在任务内自检：关闭时整轮跳过（任务常驻但不做事，
+                // 重开无需重挂）。池空时 `run_socks_health_round` 内部直接返回。
+                if !svc.socks_auto_health.load(std::sync::atomic::Ordering::Relaxed) {
+                    continue;
+                }
+                svc.run_socks_health_round().await;
+            }
+        });
+        *slot = Some(handle);
+        tracing::info!(
+            "代理池自动健康调度已启用：间隔 {} 秒，连续失败 {} 次自动禁用",
+            SOCKS_HEALTH_CHECK_INTERVAL_SECS,
+            SOCKS_HEALTH_FAIL_THRESHOLD
+        );
+    }
+
+    /// 跑一轮代理池健康探测：对池内**启用**节点逐个探测，按连续失败计数处置。
+    ///
+    /// - 池空直接返回（「只在池非空时跑」）；
+    /// - round-robin：每轮从不同起点开始（`socks_health_round` 取模），
+    ///   保证长时间运行下各节点被探测的时机公平，不固定偏袒队首；
+    /// - 节点间**不**加 sleep：探针目标是固定公共服务（非上游 kiro，无风控节奏约束），
+    ///   且单节点 10s 超时本身就是天然节奏；一轮慢不会丢下一轮
+    ///   （`MissedTickBehavior::Skip`，探测本身串行不并发）。
+    async fn run_socks_health_round(&self) {
+        let enabled: Vec<(u64, String, Option<String>, Option<String>)> = {
+            let nodes = self.socks_nodes.lock();
+            nodes
+                .iter()
+                .filter(|n| n.enabled)
+                .map(|n| (n.id, n.url.clone(), n.username.clone(), n.password.clone()))
+                .collect()
+        };
+        if enabled.is_empty() {
+            return;
+        }
+        let start = self
+            .socks_health_round
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            as usize
+            % enabled.len();
+        for k in 0..enabled.len() {
+            let (id, url, user, pass) = &enabled[(start + k) % enabled.len()];
+            let test = self
+                .probe_socks_node(url, user.clone(), pass.clone())
+                .await;
+            self.apply_socks_health_result(*id, test);
+        }
+    }
+
+    /// 探测单个代理节点（复用 `/proxy/test` 与 `/socks/nodes/{id}/test` 的探针口径）。
+    ///
+    /// 探针 URL 与 `handlers.rs::run_proxy_probe` 共用同一常量（SSRF 防线：
+    /// 目标硬编码固定，绝不接受请求方传入）。返回 `SocksNodeTest` 而非
+    /// `ProxyTestResponse`：后台调度直接消费节点表同款结构，写回零转换。
+    async fn probe_socks_node(
+        &self,
+        proxy_url: &str,
+        username: Option<String>,
+        password: Option<String>,
+    ) -> SocksNodeTest {
+        use crate::http_client::{ProxyConfig, build_client, split_proxy_credentials};
+        use crate::admin::handlers::PROXY_TEST_PROBE_URL;
+
+        let started = std::time::Instant::now();
+        let tested_at = chrono::Utc::now().timestamp().max(0) as u64;
+        let fail = |error: String| SocksNodeTest {
+            ok: false,
+            latency_ms: started.elapsed().as_millis() as u64,
+            exit_ip: None,
+            error: Some(error),
+            tested_at,
+        };
+
+        // 拆出干净 URL 与内嵌账密；显式字段优先覆盖内嵌账密（与 run_proxy_probe 同款）。
+        let (clean_url, embedded_user, embedded_pass) = split_proxy_credentials(proxy_url);
+        // 池内节点按 SSRF 校验入库，直连形态理论不存在；真出现就按失败计（无意义探测）。
+        if clean_url.is_empty() || clean_url.eq_ignore_ascii_case("direct") {
+            return fail("节点地址无效（直连形态，后台调度拒绝探测）".into());
+        }
+        let username = username.filter(|s| !s.trim().is_empty()).or(embedded_user);
+        let password = password.filter(|s| !s.is_empty()).or(embedded_pass);
+        let mut cfg = ProxyConfig::new(clean_url);
+        if let (Some(u), Some(p)) = (username, password) {
+            cfg = cfg.with_auth(u, p);
+        }
+        // 与 run_proxy_probe 同款 10s 超时（连不上/超时都算失败）。
+        let client = match build_client(Some(&cfg), 10, self.tls_backend()) {
+            Ok(c) => c,
+            Err(e) => return fail(format!("构建代理客户端失败: {e}")),
+        };
+
+        // 目标固定为硬编码探针 URL（与 /proxy/test 同一常量，见该常量注释）。
+        match client.get(PROXY_TEST_PROBE_URL).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                let latency_ms = started.elapsed().as_millis() as u64;
+                if !status.is_success() {
+                    return fail(format!("探针返回非 2xx 状态: {status}"));
+                }
+                // 解析 {"ip":"..."}；解析失败不影响连通性判定，仅 exit_ip 为 None。
+                let exit_ip = resp.json::<serde_json::Value>().await.ok().and_then(|v| {
+                    v.get("ip")
+                        .and_then(|ip| ip.as_str().map(|s| s.to_string()))
+                });
+                SocksNodeTest {
+                    ok: true,
+                    latency_ms,
+                    exit_ip,
+                    error: None,
+                    tested_at,
+                }
+            }
+            Err(e) => fail(format!("代理连通失败: {e}")),
+        }
+    }
+
+    /// 处置一次自动探测的结果：成功清零计数并写回；失败累计，达阈值自动禁用。
+    ///
+    /// 锁序注意：本方法**从不**同时持有 `socks_fail_counts` 与 `socks_nodes` 两把锁
+    /// （计数在短临界区内算完即释放，再单独走节点写路径），
+    /// 与 `upsert_socks_node` 的「nodes 锁内查计数」方向一致，无死锁交叉。
+    fn apply_socks_health_result(&self, id: u64, test: SocksNodeTest) {
+        if test.ok {
+            self.socks_fail_counts.lock().remove(&id);
+            if let Err(e) = self.record_socks_node_test(id, test) {
+                tracing::warn!("代理池健康调度：写回节点 #{id} 成功结果失败: {e}");
+            }
+            return;
+        }
+        // 失败：计数在短临界区内 +1 后立即释放 counts 锁（见方法注释的锁序说明）。
+        let fails = {
+            let mut m = self.socks_fail_counts.lock();
+            let c = m.entry(id).or_insert(0);
+            *c += 1;
+            *c
+        };
+        if fails < SOCKS_HEALTH_FAIL_THRESHOLD {
+            // 未达阈值：只写回失败结果（面板可见「最近失败」，还不到动手的时机）。
+            if let Err(e) = self.record_socks_node_test(id, test) {
+                tracing::warn!("代理池健康调度：写回节点 #{id} 失败结果失败: {e}");
+            }
+            return;
+        }
+        // 达阈值：自动禁用（enabled=false + 失败结果 + 计数清零 + 落盘）。
+        // 禁用只改节点表本身——已绑该节点的凭据保持绑定（与手动删除同语义，
+        // 不主动切走既有出口），节点只从「新分配候选」里消失。
+        self.socks_fail_counts.lock().remove(&id);
+        let note = format!("连续 {fails} 次探测失败，已自动禁用");
+        let mut disabled_test = test;
+        disabled_test.error = Some(note);
+        {
+            // 只读降级与 record 路径同款先判后改：拒写时内存也不动（防内存/磁盘不一致）。
+            if let Err(e) = self.ensure_socks_writable() {
+                tracing::warn!("代理池健康调度：节点 #{id} 已连续失败 {fails} 次，但节点表只读降级，自动禁用被跳过: {e}");
+                return;
+            }
+            let mut nodes = self.socks_nodes.lock();
+            let Some(node) = nodes.iter_mut().find(|n| n.id == id) else {
+                tracing::debug!("代理池健康调度：节点 #{id} 已被删除，跳过自动禁用");
+                return;
+            };
+            node.enabled = false;
+            node.last_test = Some(disabled_test);
+        }
+        // ⭐ 落盘必须在节点锁**之外**：persist 内部会重新锁节点表
+        // （与 upsert_socks_node 的「先 drop(nodes) 再 persist」同款，持锁调用必死锁）。
+        match self.persist_socks_nodes() {
+            Ok(()) => tracing::info!("代理池健康调度：节点 #{id} 连续失败 {fails} 次，已自动禁用"),
+            Err(e) => tracing::warn!("代理池健康调度：节点 #{id} 自动禁用后落盘失败: {e}"),
+        }
     }
 
     /// 添加新凭据
@@ -3092,8 +3560,14 @@ impl AdminService {
     /// 与 `import_keys_enabled` 同款：每次直接读 ArcSwap，无 TIER3 镜像 ⇒ 热更即时生效。
     /// ⚠️ 只在 `enabled` **缺省**时才被查询（`clone_credential` 里是 `unwrap_or_else`），
     /// 所以显式请求值永远压过配置项。
+    /// 分身默认启用（`clone_default_enabled()` 每次直接读 config ArcSwap）
     pub fn clone_default_enabled(&self) -> bool {
         self.token_manager.config().clone_default_enabled
+    }
+
+    /// 是否强制信任转发头（供审计中间件取客户端 IP，与入口安全中间件同口径）。
+    pub fn trust_forwarded_header(&self) -> bool {
+        self.token_manager.config().trust_forwarded_header
     }
 
     /// 获取服务端配置快照（敏感字段脱敏）
@@ -3166,6 +3640,14 @@ impl AdminService {
             encrypt_credentials_at_rest: config.encrypt_credentials_at_rest,
             cooldown_enabled: config.cooldown_enabled,
             auto_disable_suspicious: config.auto_disable_suspicious,
+            // 余额耗尽自动禁用开关（AdminService 内存态，见 update_config 对应分支注释）。
+            auto_disable_quota_exceeded: self
+                .auto_disable_quota_exceeded
+                .load(std::sync::atomic::Ordering::Relaxed),
+            // 代理池自动健康调度开关（AdminService 内存态，见 update_config 对应分支注释）。
+            socks_auto_health: self
+                .socks_auto_health
+                .load(std::sync::atomic::Ordering::Relaxed),
             all_cooling_fast_fail: config.all_cooling_fast_fail,
             rate_limit_enabled: config.rate_limit_enabled,
             rate_limit_daily_max: config.rate_limit_daily_max,
@@ -3255,6 +3737,10 @@ impl AdminService {
                 "mode 必须是 'priority' 或 'balanced'".to_string(),
             ));
         }
+        // ⚠️ 2026-08-13 对抗审查 M3：load→改→save 的写路径必须与 update_config 同锁，
+        // 否则并发 update_config × set_load_balancing_mode 仍会 lost update
+        // （两者写同一字段 loadBalancingMode，后写整体覆盖先写）。
+        let _write_guard = self.config_write_lock.lock();
 
         self.token_manager
             .set_load_balancing_mode(req.mode.clone())
@@ -3265,11 +3751,23 @@ impl AdminService {
 
     /// 更新服务端配置并持久化到 config.json
     ///
-    /// 仅提交的字段被修改。TIER1（冷却/限流/亲和/RPM/负载均衡）改后 reload_config 即时生效；
-    /// TIER2（主动预刷新开关/提前量/间隔、余额刷新间隔）改后 abort+respawn 后台任务即时生效；
-    /// 其余固化项（host/port/proxy/tls 等）需重启，通过响应的 `restart_fields` 告知前端。
-    /// 敏感字段不在此开放。
+    /// # 并发写锁（2026-08-14）
+    ///
+    /// 本方法包住「load → 逐字段改 → save → reload_config」整段（见
+    /// `update_config_locked`）。并发两个 PUT /config 时，若各自 load 后交错 save，
+    /// 后完成者会把先完成者的改动整体覆盖（lost update）。持锁串行后互不覆盖。
+    /// 锁内无任何 await（本函数与内部全部是同步调用），`parking_lot::Mutex` 足够。
     pub fn update_config(
+        self: &Arc<Self>,
+        req: UpdateConfigRequest,
+    ) -> Result<UpdateConfigResponse, AdminServiceError> {
+        let _guard = self.config_write_lock.lock();
+        self.update_config_locked(req)
+    }
+
+    /// `update_config` 的锁内实现（原函数体）。**只有** `update_config` 包装函数
+    /// 与 `import_config` 会调用它，调用方必须先持 `config_write_lock`。
+    fn update_config_locked(
         self: &Arc<Self>,
         req: UpdateConfigRequest,
     ) -> Result<UpdateConfigResponse, AdminServiceError> {
@@ -3285,6 +3783,9 @@ impl AdminService {
         // 从磁盘重新加载，避免覆盖进程外的改动
         let mut config = crate::model::config::Config::load(&config_path)
             .map_err(|e| AdminServiceError::InternalError(format!("加载配置失败: {}", e)))?;
+
+        // 审计（2026-08-14）：保存前对比新旧 JSON，记录「变了哪些字段」——只记字段名不记值。
+        let old_json = serde_json::to_value(&config).unwrap_or_default();
 
         let mut restart_fields: Vec<String> = Vec::new();
         // TIER1 运行时字段是否有变更 → save 后统一 reload_config 热应用（不重启即生效）。
@@ -3653,6 +4154,34 @@ impl AdminService {
         if let Some(v) = req.auto_disable_suspicious {
             if v != config.auto_disable_suspicious {
                 config.auto_disable_suspicious = v;
+                hot_changed = true;
+            }
+        }
+        // —— 余额耗尽**自动**禁用开关（2026-08-14 新增，AdminService 内存态）——
+        // 读取点在后台温和余额刷新循环：刷到「新鲜真值 remaining<=0」即自动禁用。
+        // ⚠️ 该开关只存于本服务内存（model/config.rs 不在可改范围，无法落盘），
+        // 重启回默认值 true。置 hot_changed 只为让响应如实回「已保存并立即生效」。
+        if let Some(v) = req.auto_disable_quota_exceeded {
+            let cur = self
+                .auto_disable_quota_exceeded
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if v != cur {
+                self.auto_disable_quota_exceeded
+                    .store(v, std::sync::atomic::Ordering::Relaxed);
+                hot_changed = true;
+            }
+        }
+        // —— 代理池自动健康调度开关（2026-08-14 新增，AdminService 内存态）——
+        // 读取点在后台健康调度任务：每轮自检本开关，关闭时整轮跳过（任务常驻不做事，
+        // 重开无需重挂）。⚠️ 只存于本服务内存（model/config.rs 不在可改范围，无法落盘），
+        // 重启回默认值 true。置 hot_changed 只为让响应如实回「已保存并立即生效」。
+        if let Some(v) = req.socks_auto_health {
+            let cur = self
+                .socks_auto_health
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if v != cur {
+                self.socks_auto_health
+                    .store(v, std::sync::atomic::Ordering::Relaxed);
                 hot_changed = true;
             }
         }
@@ -4090,6 +4619,20 @@ impl AdminService {
         }
 
         // 持久化（一次写盘）
+        //
+        // 2026-08-14 新增两件事：
+        // ① 写盘前轮换 .bak（保留 .bak / .bak.1 / .bak.2 三份，见 rotate_config_backup），
+        //    手滑改错配置可回退；
+        // ② 字段级 diff 审计：对比 load 时的旧值与改完的新值，只记字段名不记值
+        //    （敏感字段的值绝不进日志）。
+        rotate_config_backup(&config_path);
+        {
+            let new_json = serde_json::to_value(&config).unwrap_or_default();
+            let changed = diff_json_fields(&old_json, &new_json);
+            if !changed.is_empty() {
+                tracing::info!(target: "audit", "配置更新，变更字段: {:?}", changed);
+            }
+        }
         config
             .save()
             .map_err(|e| AdminServiceError::InternalError(format!("保存配置失败: {}", e)))?;
@@ -4284,6 +4827,176 @@ impl AdminService {
             message,
             restart_required,
             restart_fields,
+        })
+    }
+
+    /// 导出当前配置（脱敏）：返回整份 config.json 的 JSON。
+    ///
+    /// # 脱敏清单（**省略**而非掩码，保证「导出 → 导入」往返不破坏真实值）
+    ///
+    /// - `apiKey`（下游对话密钥）
+    /// - `adminApiKey`（管理密钥）
+    /// - `proxyPassword`（代理密码）
+    /// - `proxyUsername`（代理登录名）
+    /// - `countTokensApiKey`（count_tokens 密钥）
+    ///
+    /// 省略的键由导入端点「保留现值」逻辑承接：导入时这些键缺失（或写掩码）
+    /// 即继承当前磁盘值。
+    /// 其余字段（host/port/proxyUrl/限流/档位等）原样导出，与面板快照口径一致。
+    pub fn export_config(&self) -> Result<serde_json::Value, AdminServiceError> {
+        let config = self.token_manager.config();
+        let mut value = serde_json::to_value(&*config)
+            .map_err(|e| AdminServiceError::InternalError(format!("配置序列化失败: {}", e)))?;
+        if let Some(obj) = value.as_object_mut() {
+            for key in [
+                "apiKey",
+                "adminApiKey",
+                "proxyPassword",
+                "proxyUsername",
+                "countTokensApiKey",
+            ] {
+                obj.remove(key);
+            }
+        }
+        Ok(value)
+    }
+
+    /// 导入整份配置（**先校验后写盘**，校验或写盘失败均不破坏现有配置）。
+    ///
+    /// # 校验（全部在写盘前完成）
+    ///
+    /// - body 必须是合法 JSON 且能反序列化为 `Config`（缺字段走 serde 默认值）；
+    /// - 必填字段：`host` 非空、`port` 1-65535（与 `update_config` 同口径）；
+    /// - 敏感字段（apiKey / adminApiKey / proxyPassword / proxyUsername /
+    ///   countTokensApiKey）三选一：**显式提供真实值** → 按提供值写入
+    ///   （apiKey 显式提供时必须非空，防 fail-open）；
+    ///   **省略 / `***` 掩码 / null** → 继承当前磁盘值
+    ///   （导出端点省略这五个键，往返不破坏真实值；手改导出文件时
+    ///   用 `***` 占位同样不破坏）。
+    ///
+    /// # 写盘与生效
+    ///
+    /// 校验全部通过后才写盘：先轮换 .bak 再原子写盘（同 `update_config`），随后
+    /// `reload_config` 热应用 + 幂等重挂 TIER2 后台任务。host/port/adminKey 等
+    /// 固化字段不热更，响应统一提示「需重启后生效」。
+    pub fn import_config(
+        self: &Arc<Self>,
+        payload: serde_json::Value,
+    ) -> Result<ImportConfigResponse, AdminServiceError> {
+        // 与 update_config 共用写锁：导入期间的并发更新/导入同样串行化
+        let _guard = self.config_write_lock.lock();
+
+        // ① 反序列化即第一道校验（非法 JSON / 结构不符 → 拒绝，零写盘）
+        let mut imported: crate::model::config::Config = serde_json::from_value(payload.clone())
+            .map_err(|e| {
+                AdminServiceError::InvalidCredential(format!("配置 JSON 解析失败: {}", e))
+            })?;
+
+        // ② 必填字段校验（与 update_config 同口径）
+        if imported.host.trim().is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "host 不能为空".to_string(),
+            ));
+        }
+        if imported.port == 0 {
+            return Err(AdminServiceError::InvalidCredential(
+                "port 必须是 1-65535".to_string(),
+            ));
+        }
+
+        // ③ 敏感字段：省略 / `***` 掩码 / null → 保留现值（读磁盘当前值，与
+        //    update_config 的 load 同源）。只有**显式提供的真实新值**才覆盖。
+        //    （`***` 是导出侧掩码的兜底写法：手改导出文件时不必记得删键。）
+        let config_path = self
+            .token_manager
+            .config()
+            .config_path()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| {
+                AdminServiceError::InternalError("配置文件路径未知，无法保存配置".to_string())
+            })?;
+        let current = crate::model::config::Config::load(&config_path)
+            .map_err(|e| AdminServiceError::InternalError(format!("加载配置失败: {}", e)))?;
+        let obj = payload.as_object();
+        let preserved: Vec<&str> = [
+            "apiKey",
+            "adminApiKey",
+            "proxyPassword",
+            "proxyUsername",
+            "countTokensApiKey",
+        ]
+        .into_iter()
+        .filter(|k| {
+            // filter 闭包入参是 &Item（=&&str），先解引用成 &str 再查键
+            let k: &str = *k;
+            match obj.and_then(|o| o.get(k)) {
+                // 键缺失 = 未提供 → 继承现值
+                None => true,
+                // 键存在但为掩码占位（`***`）或 null = 未提供真实值 → 继承现值
+                Some(v) if v.is_null() || v.as_str() == Some("***") => true,
+                // 显式真实值 → 覆盖
+                _ => false,
+            }
+        })
+        .collect();
+        if preserved.contains(&"apiKey") {
+            imported.api_key = current.api_key;
+        }
+        if preserved.contains(&"adminApiKey") {
+            imported.admin_api_key = current.admin_api_key;
+        }
+        if preserved.contains(&"proxyPassword") {
+            imported.proxy_password = current.proxy_password;
+        }
+        if preserved.contains(&"proxyUsername") {
+            imported.proxy_username = current.proxy_username;
+        }
+        if preserved.contains(&"countTokensApiKey") {
+            imported.count_tokens_api_key = current.count_tokens_api_key;
+        }
+        // apiKey 显式提供**真实值**时必须非空（防 fail-open：null/掩码/空串都不放行，
+        // 与 update_config 的 userKey 分支同口径；想保留现值请省略该键或用 `***`）。
+        if let Some(v) = obj.and_then(|o| o.get("apiKey")) {
+            if !(v.is_null() || v.as_str() == Some("***")) {
+                let provided = imported.api_key.as_deref().map(|k| k.trim()).unwrap_or("");
+                if provided.is_empty() {
+                    return Err(AdminServiceError::InvalidCredential(
+                        "apiKey 不能为空（显式提供 null/空值会被拒绝，防 fail-open；想保留现值请省略该键或用 *** 掩码）"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        if !preserved.is_empty() {
+            tracing::info!(
+                target: "audit",
+                "配置导入，敏感字段省略/掩码已继承现值: {:?}",
+                preserved
+            );
+        }
+
+        // ④ 校验全部通过 → 先轮换备份再原子写盘（此刻起才算生效）
+        rotate_config_backup(&config_path);
+        imported
+            .save()
+            .map_err(|e| AdminServiceError::InternalError(format!("保存配置失败: {}", e)))?;
+
+        // ⑤ 热应用：reload_config 换入 ArcSwap + 幂等重挂 TIER2 后台任务
+        if let Err(e) = self.token_manager.reload_config() {
+            tracing::warn!("配置已导入但热重载失败,下次重启生效: {}", e);
+        }
+        self.token_manager.respawn_refresh_task();
+        self.respawn_balance_task();
+
+        tracing::info!(
+            target: "audit",
+            "配置已导入（整份替换，敏感字段继承 {} 项）",
+            preserved.len()
+        );
+        Ok(ImportConfigResponse {
+            success: true,
+            message: "配置已导入并保存；host/port/adminKey 等固化字段需重启服务后生效。"
+                .to_string(),
         })
     }
 
@@ -4634,6 +5347,11 @@ impl AdminService {
     /// 路径全部从现有 config 派生，绝不接受请求传入路径（防目录穿越）。
     /// `trace_db` 由调用方（handler）从 AdminState 注入；未启用统计时为 None，
     /// 相应分区不出现在结果中。
+    /// 存储统计：各分区占用 + 进程 RSS（观测项）。
+    ///
+    /// 磁盘可用空间（disk_free_bytes）暂缺：statvfs 不在 std 里，需要 libc 依赖
+    /// （本项目刻意不引新依赖）。TODO：引入 libc 后，在响应里加 disk_free_bytes
+    /// （`/` 的 statvfs.f_bavail × f_frsize，Linux/macOS 均可用 std 之外的系统调用）。
     pub fn storage_stats(&self, trace_db: Option<&Arc<TraceDb>>) -> StorageStatsResponse {
         let mut partitions: Vec<StoragePartition> = Vec::new();
         let mut total_disk_bytes: u64 = 0;
@@ -4701,11 +5419,197 @@ impl AdminService {
             in_memory: true,
         });
 
+        // 5) rss：进程常驻内存（Linux 特有，读 /proc/self/status 的 VmRSS，单位 kB）。
+        // 非 Linux（macOS/Windows）无 /proc，返回 None → 不展示该分区（前端按内存分区渲染）。
+        if let Some(rss_kb) = Self::process_rss_kb() {
+            partitions.push(StoragePartition {
+                key: "rss".to_string(),
+                label: "进程常驻内存 (RSS)".to_string(),
+                bytes: rss_kb * 1024,
+                items: 0,
+                path: None,
+                in_memory: true,
+            });
+        }
+
         StorageStatsResponse {
             partitions,
             total_disk_bytes,
             usage_enabled,
         }
+    }
+
+    /// 诊断快照聚合（`GET /api/admin/diagnostics/snapshot`，纯运维观测）。
+    ///
+    /// 一键聚合以下维度，全部**零上游**（版本检查除外——远端信息 5s 超时尽力而为）：
+    /// - 版本：本地版本恒有，远端最新版本尽力获取（复用 `/update/check` 的检查器）；
+    /// - 逐号：复用 `ratelimit_insights` 的 disabled/冷却/健康分/rpm，补余额缓存
+    ///   （按账号键，与批量余额端点同源，见 `balance_cache_key`）；
+    /// - 池健康：节点表内存统计（「可分配」口径与 `resolve_node_plan` 自动分配对齐）；
+    /// - 配置摘要：throttleProfile / 吸收参数等，**刻意脱敏**（不含任何 key/密码/代理地址）；
+    /// - 进程：uptime（与 /recovery-metrics 同源）+ RSS（Linux 特有，非 Linux 为 null）。
+    pub async fn diagnostics_snapshot(&self) -> DiagnosticsSnapshotResponse {
+        let generated_at = chrono::Utc::now().timestamp().max(0) as u64;
+
+        // —— 版本：本地恒有；远端尽力（5s 超时，纯运维端点不阻塞、失败不 500）——
+        let version = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::admin::update::check_for_updates(),
+        )
+        .await
+        {
+            Ok(upd) => DiagnosticsVersion {
+                local_version: upd.local_version,
+                latest_version: upd.latest_version,
+                has_update: Some(upd.has_update),
+                error: upd.error,
+            },
+            Err(_) => DiagnosticsVersion {
+                local_version: env!("CARGO_PKG_VERSION").to_string(),
+                latest_version: None,
+                has_update: None,
+                error: Some("远端版本检查超时（>5s）".into()),
+            },
+        };
+
+        // —— 逐号：复用限流 insights（disabled/冷却/健康分/rpm），补余额缓存 ——
+        let insights = self.ratelimit_insights();
+        let credentials = {
+            // 锁序对齐 disable_quota_exceeded：balance_cache 锁内调 balance_cache_key
+            // （该函数只读 token_manager，与既有调用点同款锁序，见 1032 行先例）。
+            let cache = self.balance_cache.lock();
+            insights
+                .iter()
+                .map(|ins| {
+                    let key = self.balance_cache_key(ins.id);
+                    let (balance_remaining, balance_cached_at) = match cache.get(&key) {
+                        Some(c) => (Some(c.data.remaining), Some(c.cached_at)),
+                        None => (None, None),
+                    };
+                    DiagnosticsCredentialEntry {
+                        id: ins.id,
+                        disabled: ins.disabled,
+                        cooldown_remaining_ms: ins.cooldown.as_ref().map(|c| c.remaining_ms),
+                        health_score: ins.health.as_ref().map(|h| h.health),
+                        circuit_open: ins.health.as_ref().is_some_and(|h| h.circuit_open),
+                        balance_remaining,
+                        balance_cached_at,
+                        rpm: ins.rpm,
+                    }
+                })
+                .collect()
+        };
+
+        // —— 池健康：节点表内存统计 ——
+        let (total, enabled, assignable, last_test_failed, latency_sum, latency_n) = {
+            let nodes = self.socks_nodes.lock();
+            let mut enabled = 0usize;
+            let mut assignable = 0usize;
+            let mut last_test_failed = 0usize;
+            let mut latency_sum = 0u64;
+            let mut latency_n = 0u64;
+            for n in nodes.iter() {
+                if n.enabled {
+                    enabled += 1;
+                    // 「可分配」口径与 resolve_node_plan 自动分配一致：
+                    // enabled 且最近一次测活非失败（从未测过的也算，见该方法文档）。
+                    if n.last_test.as_ref().is_none_or(|t| t.ok) {
+                        assignable += 1;
+                    }
+                }
+                match n.last_test.as_ref() {
+                    // 最近一次测活失败（无论当前是否启用，运维都要看到）。
+                    Some(t) if !t.ok => last_test_failed += 1,
+                    // 最近一次测活成功 → 计入平均延迟样本。
+                    Some(t) => {
+                        latency_sum += t.latency_ms;
+                        latency_n += 1;
+                    }
+                    None => {}
+                }
+            }
+            (
+                nodes.len(),
+                enabled,
+                assignable,
+                last_test_failed,
+                latency_sum,
+                latency_n,
+            )
+        };
+        let pool_health = DiagnosticsPoolHealth {
+            total,
+            enabled,
+            assignable,
+            last_test_failed,
+            avg_latency_ms: if latency_n > 0 {
+                Some(latency_sum / latency_n)
+            } else {
+                None
+            },
+            auto_health_enabled: self
+                .socks_auto_health
+                .load(std::sync::atomic::Ordering::Relaxed),
+        };
+
+        // —— 关键配置摘要（脱敏）：只挑运维排查要看的，不含任何敏感原文 ——
+        let cfg = self.token_manager.config();
+        let config = DiagnosticsConfigSummary {
+            load_balancing_mode: self.token_manager.get_load_balancing_mode(),
+            throttle_profile: cfg.throttle_profile,
+            inbound_throttle_enabled: cfg.inbound_throttle_enabled,
+            inbound_target_rpm: cfg.inbound_target_rpm,
+            upstream_retry_absorb_enabled: cfg.upstream_retry_absorb_enabled,
+            upstream_retry_absorb_capacity_400: cfg.upstream_retry_absorb_capacity_400,
+            upstream_retry_absorb_budget_secs: cfg.upstream_retry_absorb_budget_secs,
+            upstream_retry_absorb_max_rounds: cfg.upstream_retry_absorb_max_rounds,
+            cooldown_enabled: cfg.cooldown_enabled,
+            rate_limit_enabled: cfg.rate_limit_enabled,
+            auto_disable_suspicious: cfg.auto_disable_suspicious,
+            auto_disable_quota_exceeded: self
+                .auto_disable_quota_exceeded
+                .load(std::sync::atomic::Ordering::Relaxed),
+            socks_auto_health: self
+                .socks_auto_health
+                .load(std::sync::atomic::Ordering::Relaxed),
+        };
+
+        // —— 进程：uptime（与 /recovery-metrics 同源）+ RSS（非 Linux 为 null）——
+        let uptime_ms = crate::common::recovery_metrics::snapshot().uptime_ms;
+        let rss_bytes = Self::process_rss_kb().map(|kb| kb * 1024);
+
+        DiagnosticsSnapshotResponse {
+            version,
+            credentials,
+            pool_health,
+            config,
+            uptime_ms,
+            rss_bytes,
+            generated_at,
+        }
+    }
+
+    /// 读取进程常驻内存（RSS，单位 kB）。Linux：`/proc/self/status` 的 `VmRSS` 字段。
+    ///
+    /// 为什么选 VmRSS 而不是 /proc/self/statm：statm 的字段是「页数」，换算字节需要
+    /// 页大小（sysconf 在 libc 里，本项目不引依赖），而 aarch64 可能是 16K/64K 页；
+    /// VmRSS 直接给 kB，零换算、全架构正确。文件读不到/解析失败返回 None（不阻断统计）。
+    #[cfg(target_os = "linux")]
+    fn process_rss_kb() -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                // 形如 "VmRSS:\t  123456 kB"，取第一个空白分隔的数字
+                return rest.split_whitespace().next()?.parse().ok();
+            }
+        }
+        None
+    }
+
+    /// 非 Linux 平台无 /proc，不支持 RSS 观测，返回 None。
+    #[cfg(not(target_os = "linux"))]
+    fn process_rss_kb() -> Option<u64> {
+        None
     }
 
     /// 扫描目录下 `usage-*.jsonl`，返回 (总字节数, 文件数)。
@@ -5406,6 +6310,12 @@ impl AdminService {
                 }
                 if let Some(en) = req.enabled {
                     node.enabled = en;
+                }
+                // 手动启用即视为「已人工确认恢复」：清零自动健康调度的失败计数，
+                // 否则刚手动拉起的节点会背着历史失败数、下轮探测失败一次就被禁。
+                // 计数只存活于内存（见 `socks_fail_counts` 字段注释），此处仅做 remove。
+                if req.enabled == Some(true) {
+                    self.socks_fail_counts.lock().remove(&id);
                 }
                 id
             }
@@ -6436,6 +7346,42 @@ mod absorb_hot_reload_tests {
         assert!(
             !src.contains(&restart),
             "该字段是 TIER1 热更（reload_config 已读它），不得要求重启"
+        );
+    }
+
+    /// 🔴 回归（2026-08-14 新增）：`auto_disable_quota_exceeded` 必须**全套接线**。
+    ///
+    /// 该开关是 AdminService **内存态**（不进 config.json），漂移面有三处：
+    /// ① 快照（面板读得到当前值）；② `req.{field}` 更新分支（面板改得动）；
+    /// ③ 余额刷新循环的读取点（不接线 = 开关形同虚设）。types.rs 响应/请求结构各一处。
+    ///
+    /// 回退即 FAIL：删掉任一处接线 → 对应断言失败。
+    #[test]
+    fn auto_disable_quota_exceeded_is_fully_wired() {
+        let src = include_str!("service.rs");
+        let types = include_str!("types.rs");
+        // 折叠空白再比：长链调用会被 rustfmt 拆成多行（同 router 守卫写法）。
+        let compact: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+        let field = format!("auto_disable{}", "_quota_exceeded");
+
+        let snapshot = format!("{field}:self.{field}");
+        assert!(
+            compact.contains(&snapshot),
+            "配置快照必须输出 `{snapshot}`，否则面板读不到该开关当前值"
+        );
+        let update = format!("req.{field}");
+        assert!(
+            compact.contains(&update),
+            "必须有 `if let Some(v) = {update}` 的更新分支，否则面板改不动它"
+        );
+        assert!(
+            compact.contains(&format!("{field}.load")),
+            "余额刷新循环必须有 `{field}.load(..)` 读取点，否则开关改了也不生效"
+        );
+        assert!(
+            types.matches(&field).count() >= 2,
+            "types.rs 里响应结构与请求结构都必须有该字段（当前 {} 处）",
+            types.matches(&field).count()
         );
     }
 
@@ -10053,5 +10999,355 @@ mod reprobe_quota_relogin_tests {
                 route
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod kam_export_tests {
+    //! GET /credentials/export-kam 的导出行为测试。
+    //!
+    //! 解密语义：at-rest 加密在启动加载期由 `CredentialsConfig::load` →
+    //! `maybe_decrypt_to_string` 统一解密，内存凭据即明文；导出直接复用内存明文，
+    //! 本模块构造明文凭据进内存，断言「导出 = 明文直通」（不经任何加解密）。
+
+    use super::*;
+
+    /// 造一条 OAuth 类凭据（带 refresh_token 才可能进 KAM 导出）。
+    fn mk(id: u64, auth_method: &str, has_rt: bool, disabled: bool) -> KiroCredentials {
+        KiroCredentials {
+            id: Some(id),
+            auth_method: Some(auth_method.to_string()),
+            email: Some(format!("user{id}@example.com")),
+            access_token: Some(format!("at-test-{id}")),
+            refresh_token: if has_rt {
+                Some(format!("rt-test-{id}"))
+            } else {
+                None
+            },
+            region: Some("eu-central-1".to_string()),
+            machine_id: Some(format!("machine-{id}")),
+            client_id: Some(format!("client-{id}")),
+            client_secret: Some(format!("secret-{id}")),
+            profile_arn: Some(format!("arn:aws:iam::1:role/r{id}")),
+            expires_at: Some("2030-01-01T00:00:00Z".to_string()),
+            priority: id as u32,
+            disabled,
+            ..Default::default()
+        }
+    }
+
+    fn mk_service(creds: Vec<KiroCredentials>) -> AdminService {
+        let tm = Arc::new(
+            MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                creds,
+                None,
+                None,
+                // 单凭据格式 ⇒ persist 是 no-op，测试只改内存（同 reprobe 测试先例）。
+                false,
+            )
+            .expect("构造 token manager"),
+        );
+        AdminService::new(tm, Vec::<String>::new())
+    }
+
+    /// 导出即内存明文直通：refreshToken / accessToken 与构造值逐字一致。
+    /// 这是「at-rest 密文 → 明文出站」语义的落点（解密发生在加载期，此处零加解密）。
+    #[test]
+    fn export_includes_plaintext_tokens() {
+        let svc = mk_service(vec![mk(1, "social", true, false)]);
+        let resp = svc.export_kam_credentials(None);
+        assert_eq!(resp.accounts.len(), 1);
+        let acc = &resp.accounts[0];
+        assert_eq!(acc.refresh_token.as_deref(), Some("rt-test-1"));
+        assert_eq!(acc.access_token.as_deref(), Some("at-test-1"));
+        assert_eq!(acc.client_secret.as_deref(), Some("secret-1"));
+    }
+
+    /// 字段映射对齐 KAM 1.8.3+ 平铺格式；idp 复用本仓 social → Google 的既有推断。
+    #[test]
+    fn export_maps_kam_fields() {
+        let mut cred = mk(1, "social", true, true);
+        cred.region = None;
+        cred.auth_region = None;
+        cred.api_region = Some("ap-southeast-1".to_string());
+        let svc = mk_service(vec![cred]);
+        let acc = &svc.export_kam_credentials(None).accounts[0];
+        assert_eq!(acc.email.as_deref(), Some("user1@example.com"));
+        assert_eq!(acc.idp.as_deref(), Some("Google"));
+        assert_eq!(acc.auth_method.as_deref(), Some("social"));
+        assert_eq!(acc.status.as_deref(), Some("disabled"));
+        // region 回退链（MINOR-3 修正）：本用例 region/auth_region 均缺 → 落第三级
+        // api_region（effective_upstream_region 与导出同源，实测覆盖三级链末端）
+        assert_eq!(acc.region.as_deref(), Some("ap-southeast-1"));
+        assert_eq!(acc.machine_id.as_deref(), Some("machine-1"));
+        assert_eq!(acc.client_id.as_deref(), Some("client-1"));
+        assert_eq!(acc.profile_arn.as_deref(), Some("arn:aws:iam::1:role/r1"));
+        assert_eq!(acc.expires_at.as_deref(), Some("2030-01-01T00:00:00Z"));
+    }
+
+    /// region 回退链：region 为空时依次落到 auth_region / api_region。
+    #[test]
+    fn export_region_falls_back_through_chain() {
+        let mut cred = mk(2, "social", true, false);
+        cred.region = None;
+        cred.auth_region = Some("us-west-2".to_string());
+        cred.api_region = Some("ap-northeast-1".to_string());
+        let svc = mk_service(vec![cred]);
+        let acc = &svc.export_kam_credentials(None).accounts[0];
+        assert_eq!(acc.region.as_deref(), Some("us-west-2"));
+    }
+
+    /// 无 refreshToken 的号（api_key / custom_api）KAM 无对应字段 → 整条跳过。
+    #[test]
+    fn export_skips_credentials_without_refresh_token() {
+        let mut api = mk(1, "api_key", false, false);
+        api.kiro_api_key = Some("ksk_test_1".to_string());
+        let mut passthrough = mk(2, "custom_api", false, false);
+        passthrough.api_key = Some("sk-pt-2".to_string());
+        let svc = mk_service(vec![api, passthrough, mk(3, "social", true, false)]);
+        let resp = svc.export_kam_credentials(None);
+        assert_eq!(resp.accounts.len(), 1);
+        assert_eq!(resp.accounts[0].email.as_deref(), Some("user3@example.com"));
+    }
+
+    /// 空池 → accounts 空数组，不报错。
+    #[test]
+    fn export_empty_pool_returns_empty_accounts() {
+        let svc = mk_service(vec![]);
+        let resp = svc.export_kam_credentials(None);
+        assert!(resp.accounts.is_empty());
+    }
+
+    /// ids 过滤：仅导出集合内的 ID。
+    #[test]
+    fn export_respects_id_filter() {
+        let svc = mk_service(vec![
+            mk(1, "social", true, false),
+            mk(2, "social", true, false),
+            mk(3, "social", true, false),
+        ]);
+        let filter: HashSet<u64> = [1u64, 3].into_iter().collect();
+        let resp = svc.export_kam_credentials(Some(&filter));
+        let emails: Vec<&str> = resp
+            .accounts
+            .iter()
+            .filter_map(|a| a.email.as_deref())
+            .collect();
+        assert_eq!(emails, vec!["user1@example.com", "user3@example.com"]);
+    }
+
+    /// 按 priority 升序（与 UI 列表一致）。
+    #[test]
+    fn export_sorted_by_priority() {
+        let mut low = mk(1, "social", true, false);
+        low.priority = 10;
+        let mut high = mk(2, "social", true, false);
+        high.priority = 1;
+        let svc = mk_service(vec![low, high]);
+        let resp = svc.export_kam_credentials(None);
+        let emails: Vec<&str> = resp
+            .accounts
+            .iter()
+            .filter_map(|a| a.email.as_deref())
+            .collect();
+        assert_eq!(emails, vec!["user2@example.com", "user1@example.com"]);
+    }
+
+    /// 序列化契约：camelCase 键名 + 平铺 refreshToken + 无 null 字段（KAM 导入器判型要求）。
+    #[test]
+    fn export_serialization_contract() {
+        let svc = mk_service(vec![mk(1, "social", true, false)]);
+        let json = serde_json::to_value(svc.export_kam_credentials(None)).expect("序列化应成功");
+        let obj = json.as_object().expect("顶层应为对象");
+        assert_eq!(obj["version"], "1.8.3");
+        assert!(obj["exportedAt"].as_str().is_some_and(|s| !s.is_empty()));
+        let acc = obj["accounts"][0].as_object().expect("账号应为对象");
+        assert!(acc.contains_key("refreshToken"), "KAM 平铺契约要求 refreshToken 直接在账号对象上");
+        assert!(!acc.contains_key("refresh_token"), "键名必须是 camelCase");
+        for (k, v) in acc {
+            assert!(!v.is_null(), "字段 {k} 不应为 null（None 字段应省略）");
+        }
+    }
+
+    /// 路由存在性守卫：export-kam 端点必须挂在鉴权路由树内。
+    /// 回退即 FAIL：删掉 `.route(..)` → 前端 404 且编译/测试都不报。
+    #[test]
+    fn export_kam_endpoint_is_wired_in_router() {
+        let router = include_str!("router.rs");
+        // 判据对空白不敏感（rustfmt 会把长 .route(..) 拆多行），折叠空白后再比。
+        let compact: String = router.chars().filter(|c| !c.is_whitespace()).collect();
+        // needle 运行时拼接：写成完整字面量会被 include_str! 读到自己而多算一处。
+        let route = format!(
+            "\"/credentials/export-kam\",get(export_kam_credentials{}",
+            ")"
+        );
+        assert!(
+            compact.contains(&route),
+            "export-kam 端点必须注册进鉴权路由树：{route}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod config_write_tests {
+    //! 配置写路径（update_config / import_config）的健壮性测试：
+    //! 写锁结构守卫、备份轮换行为、字段级 diff 审计行为。
+    use super::*;
+
+    /// 测试用临时目录（Drop 时自动清理；panic 时由 OS 留着，带 pid 不与其他进程撞）。
+    struct TempDir(std::path::PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// 🔴 承重：两个配置写路径必须持同一把写锁，且持锁先于临界区起点。
+    ///
+    /// 根除的是 lost update：并发两个 `update_config` 各自 load 后交错 save，
+    /// 后完成者会把先完成者的改动整体覆盖（都改不同字段时静默吞掉先写字段）。
+    /// 守卫锁死两件事：
+    /// 1. `update_config` 包装函数必须先持锁、再委托 locked 实现（锁保护得住整个临界区）；
+    /// 2. `import_config` 必须先持锁、再写盘（save 是临界区终点）。
+    ///
+    /// 回退即 FAIL：把持锁语句从函数里挪走 / 移到委托调用之后 / 换锁名。
+    #[test]
+    fn config_write_lock_covers_both_write_paths() {
+        let src = include_str!("service.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        // needle 运行时拼接：写成完整字面量会被 include_str! 读到自己而多算一处。
+        let lock = format!("config_write{}", "_lock.lock()");
+        let count = prod.matches(&lock).count();
+        assert!(
+            count >= 2,
+            "两个写路径必须各持一次锁（当前 {count} 处）"
+        );
+
+        // update_config 包装函数：持锁在委托调用之前
+        let update_fn = format!("pub fn update_config{}", "(");
+        let uf = prod
+            .find(&update_fn)
+            .expect("update_config 包装函数不该被改名");
+        let body_end = prod[uf..]
+            .find("\n    pub fn ")
+            .map(|i| i + uf)
+            .unwrap_or(prod.len());
+        let body = &prod[uf..body_end];
+        let li = body
+            .find(&lock)
+            .expect("update_config 必须先持写锁，否则并发 save 互相覆盖");
+        let call = format!("self.update_config{}", "_locked(req)");
+        let ci = body
+            .find(&call)
+            .expect("update_config 必须委托给锁内实现");
+        assert!(li < ci, "持锁必须在委托调用之前，否则保护不到临界区");
+
+        // import_config：持锁在写盘之前
+        let import_fn = format!("pub fn import_config{}", "(");
+        let ii = prod
+            .find(&import_fn)
+            .expect("import_config 不该被改名");
+        let iend = prod[ii..]
+            .find("\n    pub fn ")
+            .map(|i| i + ii)
+            .unwrap_or(prod.len());
+        let ibody = &prod[ii..iend];
+        // 写盘调用是跨行链式（`imported\n .save()`），折叠空白再比（同 router 守卫写法）。
+        let icompact: String = ibody.chars().filter(|c| !c.is_whitespace()).collect();
+        let il = icompact
+            .find(&lock)
+            .expect("import_config 必须先持写锁，否则与并发更新互相覆盖");
+        let save = format!("imported{}", ".save()");
+        let si = icompact
+            .find(&save)
+            .expect("import_config 必须写盘保存");
+        assert!(il < si, "持锁必须在写盘之前，否则并发导入相互覆盖");
+    }
+
+    /// 备份轮换保留 3 代（.bak 最新 → .bak.1 → .bak.2 最旧），当前文件原位不动。
+    #[test]
+    fn rotate_config_backup_keeps_three_generations() {
+        let dir = TempDir(std::env::temp_dir().join(format!(
+            "ks_cfg_bak_{}",
+            std::process::id()
+        )));
+        let _ = std::fs::remove_dir_all(&dir.0);
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let cfg = dir.0.join("config.json");
+
+        std::fs::write(&cfg, b"v0").unwrap();
+        rotate_config_backup(&cfg);
+        assert_eq!(
+            std::fs::read_to_string(cfg.with_extension("json.bak")).unwrap(),
+            "v0"
+        );
+
+        std::fs::write(&cfg, b"v1").unwrap();
+        rotate_config_backup(&cfg);
+        assert_eq!(
+            std::fs::read_to_string(cfg.with_extension("json.bak.1")).unwrap(),
+            "v0"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cfg.with_extension("json.bak")).unwrap(),
+            "v1"
+        );
+
+        std::fs::write(&cfg, b"v2").unwrap();
+        rotate_config_backup(&cfg);
+        assert_eq!(
+            std::fs::read_to_string(cfg.with_extension("json.bak.2")).unwrap(),
+            "v0"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cfg.with_extension("json.bak.1")).unwrap(),
+            "v1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cfg.with_extension("json.bak")).unwrap(),
+            "v2"
+        );
+        // 当前文件保持最新内容未被轮换动过
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), "v2");
+    }
+
+    /// 字段级 diff 审计：只记字段名/路径，绝不记字段值（敏感字段的值因此不会进日志）。
+    #[test]
+    fn diff_json_fields_reports_names_not_values() {
+        // 值变了 → 记字段名；旧值/新值本身绝不出现
+        let old = serde_json::json!({ "apiKey": "secret-old", "port": 8080 });
+        let new = serde_json::json!({ "apiKey": "secret-new", "port": 8080 });
+        let d = diff_json_fields(&old, &new);
+        assert_eq!(d, vec!["apiKey".to_string()]);
+        assert!(
+            d.iter().all(|p| !p.contains("secret")),
+            "diff 结果只能有字段名，不能夹带任何字段值"
+        );
+
+        // 完全相同 → 空
+        let same = serde_json::json!({ "a": 1, "b": { "c": [1, 2] } });
+        assert!(diff_json_fields(&same, &same).is_empty());
+
+        // 新增/删除键 → 记路径
+        let a = serde_json::json!({ "x": 1 });
+        let b = serde_json::json!({ "x": 1, "y": 2 });
+        assert_eq!(diff_json_fields(&a, &b), vec!["y".to_string()]);
+        assert_eq!(diff_json_fields(&b, &a), vec!["y".to_string()]);
+
+        // 嵌套对象 → 递归记完整路径
+        let o1 = serde_json::json!({ "outer": { "inner": 1 } });
+        let o2 = serde_json::json!({ "outer": { "inner": 2 } });
+        assert_eq!(
+            diff_json_fields(&o1, &o2),
+            vec!["outer.inner".to_string()]
+        );
+
+        // 整块结构替换（数组 / 标量类型变）→ 记顶层路径
+        let m1 = serde_json::json!({ "arr": [1, 2] });
+        let m2 = serde_json::json!({ "arr": [3] });
+        assert_eq!(diff_json_fields(&m1, &m2), vec!["arr".to_string()]);
     }
 }

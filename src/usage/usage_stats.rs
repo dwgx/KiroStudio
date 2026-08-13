@@ -19,6 +19,7 @@ use serde::Serialize;
 
 use super::pipeline::UsageSink;
 use super::record::RequestRecord;
+use crate::model::config::ModelPrice;
 
 /// 小时环形桶数量：24×31，覆盖最近 31 天的逐小时数据
 const HOUR_BUCKETS: usize = 24 * 31; // 744
@@ -933,6 +934,13 @@ pub struct GroupStat {
     pub cache_creation_tokens: i64,
     /// credits 累计
     pub credits_used: f64,
+    /// 估算成本（元）：按模型单价表（[`crate::model::config::Config::model_pricing`]）
+    /// 推算，见 [`estimate_cost`]。
+    ///
+    /// 无单价表 / 模型不在表中 = 0.0（不估算）。与 [`Self::credits_used`]（上游真实
+    /// 计费）是**两个独立口径**：credits 是上游 metering 返回的真值，cost 是本机按
+    /// 单价表对 token 用量的推算，仅作「哪个模型最花钱」的排序参考。
+    pub cost: f64,
     /// 平均延迟（毫秒）
     pub avg_latency_ms: f64,
     /// 该分组的换号次数累计：看**哪个模型 / 哪个号**在烧重试预算。
@@ -943,8 +951,34 @@ pub struct GroupStat {
     pub avg_retries_per_request: f64,
 }
 
+/// 按单价表估算成本（元）：`tokens / 1_000_000 × 单价`，四档分别计价后求和。
+///
+/// - `input_tokens` 传 **gross** 口径（[`Aggregate::input_tokens`] 已含 cache 两项）：
+///   input 部分内部按 billed 口径折算（减去 cache 读+建，饱和非负），避免缓存被计两次
+///   （与 [`crate::usage::record::RequestRecord::billed_input_tokens`] 同口径）。
+/// - `price` 为 None（模型无单价）时返回 0.0（不估算）。
+///
+/// 纯函数、无状态，可独立单测。
+fn estimate_cost(
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_creation_tokens: i64,
+    price: Option<&ModelPrice>,
+) -> f64 {
+    let Some(p) = price else {
+        return 0.0;
+    };
+    let billed_input = (input_tokens - cache_read_tokens - cache_creation_tokens).max(0);
+    let per_mtok = |tokens: i64, unit: f64| tokens as f64 / 1_000_000.0 * unit;
+    per_mtok(billed_input, p.input_per_mtok)
+        + per_mtok(output_tokens, p.output_per_mtok)
+        + per_mtok(cache_read_tokens, p.cache_read_per_mtok)
+        + per_mtok(cache_creation_tokens, p.cache_creation_per_mtok)
+}
+
 impl GroupStat {
-    fn from(key: String, a: &Aggregate) -> Self {
+    fn from(key: String, a: &Aggregate, price: Option<&ModelPrice>) -> Self {
         GroupStat {
             key,
             requests: a.requests,
@@ -954,6 +988,13 @@ impl GroupStat {
             cache_read_tokens: a.cache_read_tokens,
             cache_creation_tokens: a.cache_creation_tokens,
             credits_used: a.credits_used,
+            cost: estimate_cost(
+                a.input_tokens,
+                a.output_tokens,
+                a.cache_read_tokens,
+                a.cache_creation_tokens,
+                price,
+            ),
             avg_latency_ms: a.avg_latency_ms(),
             retries_sum: a.retries_sum,
             retried_requests: a.retried_requests,
@@ -1363,12 +1404,15 @@ impl UsageStats {
     /// key = `r.upstream_model`（映射后/上游实际服务名），`None`（未映射/失败记录）
     /// 回落 `r.model`。与 [`Self::by_requested_model`]（客户端原始名）是同一批记录的
     /// 两个口径，请求总数恒等，只是分组键不同。
-    pub fn by_model(&self) -> Vec<GroupStat> {
+    ///
+    /// `pricing` 为模型单价表（空表 = 不估算成本）：key 按本表口径（上游实际服务名）
+    /// 命中，命中行 [`GroupStat::cost`] 按 [`estimate_cost`] 推算，未命中为 0.0。
+    pub fn by_model(&self, pricing: &HashMap<String, ModelPrice>) -> Vec<GroupStat> {
         let inner = self.inner.lock();
         let mut out: Vec<GroupStat> = inner
             .by_model
             .iter()
-            .map(|(k, a)| GroupStat::from(k.clone(), a))
+            .map(|(k, a)| GroupStat::from(k.clone(), a, pricing.get(k)))
             .collect();
         out.sort_by(|a, b| b.requests.cmp(&a.requests).then(a.key.cmp(&b.key)));
         out
@@ -1380,24 +1424,30 @@ impl UsageStats {
     /// 模型（`upstream_model`，映射命中时是映射后名；未映射回落 `r.model`），本方法记
     /// **客户端点名**的模型（`requested_model`，`None` 回落 `r.model`）。两维度的请求
     /// 总数恒等（同一批 `apply`），只是分组键不同。
-    pub fn by_requested_model(&self) -> Vec<GroupStat> {
+    ///
+    /// `pricing` 同 [`Self::by_model`]；注意单价表按**上游实际服务名**配置，
+    /// 客户端原始名通常不在表中（未映射时两表 key 相同才会命中），cost 多为 0.0。
+    pub fn by_requested_model(&self, pricing: &HashMap<String, ModelPrice>) -> Vec<GroupStat> {
         let inner = self.inner.lock();
         let mut out: Vec<GroupStat> = inner
             .by_requested_model
             .iter()
-            .map(|(k, a)| GroupStat::from(k.clone(), a))
+            .map(|(k, a)| GroupStat::from(k.clone(), a, pricing.get(k)))
             .collect();
         out.sort_by(|a, b| b.requests.cmp(&a.requests).then(a.key.cmp(&b.key)));
         out
     }
 
-    /// 按凭据全量聚合（按请求数降序，key 为凭据 ID 字符串）
+    /// 按凭据全量聚合（按请求数降序，key 为凭据 ID 字符串）。
+    ///
+    /// 成本不按凭据估算（单价表按模型配置，聚合层丢掉了模型维度）——
+    /// 但 `cost` 字段随行下发恒为 0.0，前端统一按「有值且 >0 才显示」处理。
     pub fn by_credential(&self) -> Vec<GroupStat> {
         let inner = self.inner.lock();
         let mut out: Vec<GroupStat> = inner
             .by_credential
             .iter()
-            .map(|(k, a)| GroupStat::from(k.to_string(), a))
+            .map(|(k, a)| GroupStat::from(k.to_string(), a, None))
             .collect();
         out.sort_by(|a, b| b.requests.cmp(&a.requests).then(a.key.cmp(&b.key)));
         out
@@ -1632,6 +1682,11 @@ mod tests {
     use super::*;
     use crate::usage::record::RequestOutcome;
 
+    /// 空单价表（= 不估算成本），供既有用例传参
+    fn no_pricing() -> HashMap<String, ModelPrice> {
+        HashMap::new()
+    }
+
     /// UTC 基准时间：2026-07-03T00:00:00Z 的 Unix 毫秒
     const BASE_MS: i64 = 1_783_036_800_000;
 
@@ -1844,7 +1899,7 @@ mod tests {
             0,
         ));
 
-        let models = s.by_model();
+        let models = s.by_model(&no_pricing());
         // sonnet 请求最多，排第一
         assert_eq!(models[0].key, "sonnet");
         assert_eq!(models[0].requests, 2);
@@ -1858,6 +1913,75 @@ mod tests {
         assert_eq!(c1.input_tokens, 20);
         let c2 = creds.iter().find(|c| c.key == "2").unwrap();
         assert_eq!(c2.requests, 1);
+    }
+
+    /// ⭐ 成本估算纯函数：输入 tokens（gross 口径）+ 单价 → 元。
+    ///
+    /// 关键口径：`input_tokens` 是 gross（已含 cache 两项），input 部分必须按 billed
+    /// （gross 减 cache 读+建）计价 —— 否则缓存被计两次，成本系统性偏高。
+    #[test]
+    fn estimate_cost_pure_function() {
+        let price = ModelPrice {
+            input_per_mtok: 2.5,
+            output_per_mtok: 12.5,
+            cache_read_per_mtok: 0.3,
+            cache_creation_per_mtok: 3.125,
+        };
+        // 100 万 input（其中 60 万 cache_read + 20 万 cache_creation）+ 40 万 output：
+        // billed input = 1_000_000 - 600_000 - 200_000 = 200_000
+        // 0.2M × 2.5 + 0.4M × 12.5 + 0.6M × 0.3 + 0.2M × 3.125
+        // = 0.5 + 5.0 + 0.18 + 0.625 = 6.305
+        let cost = estimate_cost(1_000_000, 400_000, 600_000, 200_000, Some(&price));
+        assert!((cost - 6.305).abs() < 1e-9, "cost={cost}");
+
+        // cache 超过 gross 的反常数据：billed input 饱和减为 0，input 部分零计价，
+        // 但 cache 读/建仍按各自单价计（它们是真实发生的用量）。
+        let cost2 = estimate_cost(100, 0, 80, 40, Some(&price));
+        let expected2 = 80.0 / 1e6 * 0.3 + 40.0 / 1e6 * 3.125;
+        assert!((cost2 - expected2).abs() < 1e-12, "cost2={cost2}");
+
+        // 无单价（None）→ 0.0（不估算）
+        assert_eq!(estimate_cost(1_000_000, 1, 0, 0, None), 0.0);
+    }
+
+    /// ⭐ 成本只按「上游实际服务名」命中单价表：命中行有 cost，未命中行与空表恒 0。
+    #[test]
+    fn by_model_estimates_cost_from_pricing_table() {
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        s.on_record(&rec_cache(0, Some(1), "sonnet", 1_000_000, 400_000, 600_000, 200_000));
+        s.on_record(&rec_cache(1_000, Some(1), "opus", 100, 50, 0, 0));
+
+        // 空表（不估算）→ 全部 cost=0
+        let models = s.by_model(&no_pricing());
+        assert!(models.iter().all(|m| m.cost == 0.0), "空表不得估算成本");
+
+        // 命中表：sonnet 有价，opus 不在表中 → 0
+        let mut pricing = HashMap::new();
+        pricing.insert(
+            "sonnet".to_string(),
+            ModelPrice {
+                input_per_mtok: 2.5,
+                output_per_mtok: 12.5,
+                cache_read_per_mtok: 0.3,
+                cache_creation_per_mtok: 3.125,
+            },
+        );
+        let models = s.by_model(&pricing);
+        let sonnet = models.iter().find(|m| m.key == "sonnet").unwrap();
+        assert!(
+            (sonnet.cost - 6.305).abs() < 1e-9,
+            "sonnet 应命中单价表：cost={}",
+            sonnet.cost
+        );
+        let opus = models.iter().find(|m| m.key == "opus").unwrap();
+        assert_eq!(opus.cost, 0.0, "opus 不在单价表，不得估算");
+
+        // 序列化出口：cost 字段真的下发（字段在但没下发 = 前端白改）
+        let json = serde_json::to_string(&models).unwrap();
+        assert!(json.contains("\"cost\":6.305"), "{json}");
+
+        // 按凭据恒 0（单价表按模型配置，聚合层无模型维度）
+        assert!(s.by_credential().iter().all(|c| c.cost == 0.0));
     }
 
     /// 映射双口径：`by_model`（上游实际服务名）与 `by_requested_model`（客户端原始名）
@@ -1884,12 +2008,12 @@ mod tests {
         // 未映射的记录：requested_model / upstream_model 缺省（None）→ 都回落 model。
         s.on_record(&rec(1000, Some(1), "claude-opus-4-8", RequestOutcome::Success, 20, 10));
 
-        let upstream = s.by_model();
+        let upstream = s.by_model(&no_pricing());
         assert_eq!(upstream.len(), 2, "上游维度应有 sonnet + opus 两条");
         let sonnet = upstream.iter().find(|m| m.key == "claude-sonnet-4-5").unwrap();
         assert_eq!(sonnet.requests, 1);
 
-        let requested = s.by_requested_model();
+        let requested = s.by_requested_model(&no_pricing());
         assert_eq!(requested.len(), 2, "请求维度应有 haiku + opus 两条");
         let haiku = requested.iter().find(|m| m.key == "claude-haiku-4-5").unwrap();
         assert_eq!(haiku.requests, 1);
@@ -1939,7 +2063,7 @@ mod tests {
         // ③ upstream_model = None（未映射/失败记录）→ by_model 回落 r.model。
         s.on_record(&rec(2_000, Some(1), "claude-opus-4-8", RequestOutcome::Success, 5, 5));
 
-        let upstream = s.by_model();
+        let upstream = s.by_model(&no_pricing());
         let sonnet = upstream
             .iter()
             .find(|m| m.key == "claude-sonnet-4-5")
@@ -1951,7 +2075,7 @@ mod tests {
             .unwrap_or_else(|| panic!("None 应回落 r.model: {:?}", upstream));
         assert_eq!(opus.requests, 2, "② 与 ③ 都归 opus");
 
-        let requested = s.by_requested_model();
+        let requested = s.by_requested_model(&no_pricing());
         let haiku = requested
             .iter()
             .find(|m| m.key == "claude-haiku-4-5")
@@ -1999,7 +2123,7 @@ mod tests {
             r.requested_model = Some(format!("client-model-{i}"));
             s.on_record(&r);
         }
-        let requested = s.by_requested_model();
+        let requested = s.by_requested_model(&no_pricing());
         // 表满后新名归入 OTHER 桶：条目数 ≤ CAP + 1（含 OTHER）。
         assert!(
             requested.len() <= Inner::MODEL_KEY_CAP + 1,
@@ -2127,7 +2251,7 @@ mod tests {
         assert!(daily_json.contains("\"retries_sum\":6"), "{daily_json}");
 
         // ③ GroupStat：按模型 / 按凭据两条路径都走 GroupStat::from，各断言一次
-        let models = s.by_model();
+        let models = s.by_model(&no_pricing());
         let m = models.iter().find(|g| g.key == "sonnet").unwrap();
         assert_eq!(m.retries_sum, 6);
         assert_eq!(m.retried_requests, 2);
@@ -2627,7 +2751,7 @@ mod tests {
         s.on_record(&rec_cache(1_000, Some(1), "sonnet", 1_000, 10, 600, 0));
         s.on_record(&rec_cache(2_000, Some(2), "opus", 500, 5, 400, 20));
 
-        let models = s.by_model();
+        let models = s.by_model(&no_pricing());
         let sonnet = models.iter().find(|m| m.key == "sonnet").unwrap();
         assert_eq!(sonnet.cache_read_tokens, 1_500);
         assert_eq!(sonnet.cache_creation_tokens, 50);
@@ -2660,7 +2784,7 @@ mod tests {
         let point = s.timeseries_hourly_at(BASE_MS, 1);
         assert_eq!(point[0].cache_read_tokens, 0);
         assert_eq!(point[0].cache_creation_tokens, 0);
-        assert_eq!(s.by_model()[0].cache_read_tokens, 0);
+        assert_eq!(s.by_model(&no_pricing())[0].cache_read_tokens, 0);
         assert_eq!(s.by_credential()[0].cache_creation_tokens, 0);
     }
 
@@ -2708,7 +2832,7 @@ mod tests {
         assert!(ov.contains("\"cache_creation_tokens\":100"), "{ov}");
         let series = serde_json::to_string(&s.timeseries_hourly_at(BASE_MS, 1)).unwrap();
         assert!(series.contains("\"cache_read_tokens\":800"), "{series}");
-        let models = serde_json::to_string(&s.by_model()).unwrap();
+        let models = serde_json::to_string(&s.by_model(&no_pricing())).unwrap();
         assert!(models.contains("\"cache_creation_tokens\":100"), "{models}");
         let creds = serde_json::to_string(&s.by_credential()).unwrap();
         assert!(creds.contains("\"cache_read_tokens\":800"), "{creds}");
@@ -2744,7 +2868,7 @@ mod tests {
         let ov = s2.overview_at(BASE_MS + DAY_MS);
         assert_eq!(ov.last_7d.requests, 3, "重放后应恢复全部 3 条");
         assert_eq!(ov.last_7d.success, 2);
-        let models = s2.by_model();
+        let models = s2.by_model(&no_pricing());
         let m1 = models.iter().find(|m| m.key == "m1").unwrap();
         assert_eq!(m1.requests, 2);
         assert_eq!(m1.input_tokens, 17);
@@ -2795,7 +2919,7 @@ mod tests {
         assert!(serde_json::to_string(&s.overview_at(BASE_MS)).is_ok());
         assert!(serde_json::to_string(&s.timeseries_hourly_at(BASE_MS, 5)).is_ok());
         assert!(serde_json::to_string(&s.timeseries_daily_at(BASE_MS, 5)).is_ok());
-        assert!(serde_json::to_string(&s.by_model()).is_ok());
+        assert!(serde_json::to_string(&s.by_model(&no_pricing())).is_ok());
         assert!(serde_json::to_string(&s.by_credential()).is_ok());
         assert!(serde_json::to_string(&s.throughput_at(BASE_MS)).is_ok());
         assert!(serde_json::to_string(&s.clients_at(BASE_MS)).is_ok());
@@ -3023,7 +3147,7 @@ mod tests {
                 1,
             ));
         }
-        let models = s.by_model();
+        let models = s.by_model(&no_pricing());
         assert!(
             models.len() <= Inner::MODEL_KEY_CAP + 1,
             "by_model 无界增长：{} 个条目（上限 {} + OTHER 桶）",
@@ -3050,7 +3174,7 @@ mod tests {
         let s = UsageStats::new(std::env::temp_dir().join("kiro_bymodel_trunc"));
         let huge = "x".repeat(10_000);
         s.on_record(&rec(0, Some(1), &huge, RequestOutcome::Success, 1, 1));
-        let models = s.by_model();
+        let models = s.by_model(&no_pricing());
         assert_eq!(models.len(), 1);
         assert!(
             models[0].key.chars().count() <= Inner::MODEL_KEY_MAX_LEN,

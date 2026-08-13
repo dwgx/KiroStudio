@@ -1,12 +1,16 @@
 //! SQLite 追踪存储 sink（批次2.3）
 //!
-//! 把每条 [`RequestRecord`] 逐条落账到本地 SQLite 数据库，供 admin 侧做
+//! 把每条 [`RequestRecord`] 落账到本地 SQLite 数据库，供 admin 侧做
 //! 「最近请求」明细展示与历史留存清理。设计要点：
 //! - 开启 WAL 模式 + `synchronous=NORMAL`：写吞吐更高，崩溃安全性对统计数据足够
 //! - rusqlite 的 [`Connection`] 非 `Sync`，用 `parking_lot::Mutex` 包裹（与
 //!   项目其它模块，如 `token_manager` 保持一致）
 //! - 作为 [`UsageSink`]，`on_record` 失败只 `warn` 不 panic：统计侧故障绝不
 //!   回传到请求路径
+//! - **批量写（攒批）**：`on_record` 先把记录攒进内存队列（不锁 DB），
+//!   满 [`BATCH_SIZE`] 条或距上次落库超 [`FLUSH_INTERVAL`] 时，一批一个事务
+//!   批量 INSERT（fsync 从 N 次降到 1 次）。所有**读路径**（查询/清理）先
+//!   flush 待写队列保证读写一致；`Drop` 兜底进程退出时残留的待写记录。
 //!
 //! 表结构 `traces` 的列与 `RequestRecord` 字段一一对应。u64/u32 字段按
 //! SQLite 的整型能力统一以 i64 存取（凭据 ID / 延迟 / 重试数量级均安全）。
@@ -138,7 +142,21 @@ fn escape_like(s: &str) -> String {
 pub struct TraceDb {
     /// rusqlite Connection 非 Sync，用 Mutex 串行化访问
     conn: Mutex<Connection>,
+    /// 待批量落库的积攒队列（与 `conn` 分开锁：攒批不碰 DB，flush 才取锁）
+    pending: Mutex<PendingBatch>,
 }
+
+/// 批量写攒批状态。
+struct PendingBatch {
+    records: Vec<RequestRecord>,
+    /// 上次落库检查时刻（节流：低流量下保证 ≤ [`FLUSH_INTERVAL`] 落一次盘）
+    last_flush: std::time::Instant,
+}
+
+/// 批量攒批上限：满 50 条触发一次落库（一个事务 50 条 INSERT，fsync 一次）。
+const BATCH_SIZE: usize = 50;
+/// 落库节流间隔：低流量请求下最迟这么久落一次盘。
+const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl TraceDb {
     /// 打开/创建数据库，配置 WAL 并建表。
@@ -149,9 +167,12 @@ impl TraceDb {
             .with_context(|| format!("打开 SQLite 数据库失败: {}", path.display()))?;
 
         // WAL 模式提升并发写性能；synchronous=NORMAL 在 WAL 下兼顾安全与吞吐
+        // busy_timeout=5000：多实例（SO_REUSEPORT）并发写同一库时，SQLITE_BUSY 等待
+        // 而非立即失败——否则写锁竞争会静默丢记录（rusqlite 默认 busy 不等待）。
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;\
-             PRAGMA synchronous=NORMAL;",
+             PRAGMA synchronous=NORMAL;\
+             PRAGMA busy_timeout=5000;",
         )
         .context("配置 SQLite PRAGMA 失败")?;
 
@@ -160,6 +181,10 @@ impl TraceDb {
 
         Ok(TraceDb {
             conn: Mutex::new(conn),
+            pending: Mutex::new(PendingBatch {
+                records: Vec::new(),
+                last_flush: std::time::Instant::now(),
+            }),
         })
     }
 
@@ -182,6 +207,8 @@ impl TraceDb {
             // 映射双口径（历史库补列，默认 NULL 兼容旧数据）
             "ALTER TABLE traces ADD COLUMN requested_model TEXT",
             "ALTER TABLE traces ADD COLUMN upstream_model TEXT",
+            // 中断字节（历史库补列，默认 NULL = 未中断，兼容旧数据）
+            "ALTER TABLE traces ADD COLUMN interrupted_bytes INTEGER",
         ];
         for sql in add_columns {
             if let Err(e) = conn.execute(sql, []) {
@@ -231,7 +258,8 @@ impl TraceDb {
                 cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
                 cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
                 requested_model       TEXT,
-                upstream_model        TEXT
+                upstream_model        TEXT,
+                interrupted_bytes     INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_traces_ts_ms ON traces(ts_ms);
             CREATE INDEX IF NOT EXISTS idx_traces_credential_id ON traces(credential_id);
@@ -241,58 +269,92 @@ impl TraceDb {
         Ok(())
     }
 
-    /// 插入一条记录（参数化，防注入）。
+    /// 批量插入一组记录（单事务 + 预编译语句复用；参数化，防注入）。
     ///
     /// 使用 `INSERT OR REPLACE`：request_id 主键冲突时覆盖（同一请求的重复落账
-    /// 以最后一次为准，避免主键冲突报错）。
-    fn insert(&self, record: &RequestRecord) -> Result<()> {
-        let conn = self.conn.lock();
-        conn.execute(
-            "INSERT OR REPLACE INTO traces (
-                request_id, ts_ms, credential_id, model, is_streaming,
-                input_tokens, output_tokens, credits_used, latency_ms, first_token_ms,
-                outcome, retries, error_message, session_id, client_device,
-                client_ip, client_os, client_browser, cache_read_tokens, cache_creation_tokens,
-                requested_model, upstream_model
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
-            params![
-                record.request_id,
-                record.ts_ms,
-                record.credential_id.map(|v| v as i64),
-                record.model,
-                record.is_streaming,
-                record.input_tokens,
-                record.output_tokens,
-                record.credits_used,
-                record.latency_ms as i64,
-                record.first_token_ms.map(|v| v as i64),
-                record.outcome.as_str(),
-                record.retries as i64,
-                record.error_message,
-                record.session_id,
-                record.client_device,
-                record.client_ip,
-                record.client_os,
-                record.client_browser,
-                record.cache_read_tokens,
-                record.cache_creation_tokens,
-                record.requested_model,
-                record.upstream_model,
-            ],
-        )
-        .context("INSERT traces 失败")?;
+    /// 以最后一次为准，避免主键冲突报错）。一个事务批量提交把 fsync 从 N 次降到 1 次。
+    fn insert_batch(&self, records: &[RequestRecord]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().context("开启 traces 写事务失败")?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT OR REPLACE INTO traces (
+                        request_id, ts_ms, credential_id, model, is_streaming,
+                        input_tokens, output_tokens, credits_used, latency_ms, first_token_ms,
+                        outcome, retries, error_message, session_id, client_device,
+                        client_ip, client_os, client_browser, cache_read_tokens, cache_creation_tokens,
+                        requested_model, upstream_model, interrupted_bytes
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+                )
+                .context("预编译 traces 插入语句失败")?;
+            for record in records {
+                stmt.execute(params![
+                    record.request_id,
+                    record.ts_ms,
+                    record.credential_id.map(|v| v as i64),
+                    record.model,
+                    record.is_streaming,
+                    record.input_tokens,
+                    record.output_tokens,
+                    record.credits_used,
+                    record.latency_ms as i64,
+                    record.first_token_ms.map(|v| v as i64),
+                    record.outcome.as_str(),
+                    record.retries as i64,
+                    record.error_message,
+                    record.session_id,
+                    record.client_device,
+                    record.client_ip,
+                    record.client_os,
+                    record.client_browser,
+                    record.cache_read_tokens,
+                    record.cache_creation_tokens,
+                    record.requested_model,
+                    record.upstream_model,
+                    record.interrupted_bytes.map(|v| v as i64),
+                ])
+                .context("INSERT traces 失败")?;
+            }
+        }
+        tx.commit().context("提交 traces 写事务失败")?;
         Ok(())
+    }
+
+    /// 把积攒的待写记录批量落库（幂等；空队列直接返回）。
+    ///
+    /// 失败只告警、丢弃该批（与旧逐条落账同语义：统计侧故障不回传请求路径）。
+    fn flush_pending(&self) {
+        let batch = {
+            let mut pend = self.pending.lock();
+            pend.last_flush = std::time::Instant::now();
+            std::mem::take(&mut pend.records)
+        };
+        if batch.is_empty() {
+            return;
+        }
+        if let Err(e) = self.insert_batch(&batch) {
+            tracing::warn!(
+                "trace_db 批量落账失败（已丢弃该批 {} 条）: {e:#}",
+                batch.len()
+            );
+        }
     }
 
     /// 按 ts_ms 倒序取最近 N 条记录。
     pub fn recent(&self, limit: usize) -> Result<Vec<RequestRecord>> {
+        // 先 flush 待写队列：攒批落库的延迟不得让读路径读到陈旧数据
+        self.flush_pending();
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT request_id, ts_ms, credential_id, model, is_streaming,
                     input_tokens, output_tokens, credits_used, latency_ms, first_token_ms,
                     outcome, retries, error_message, session_id, client_device,
                     client_ip, client_os, client_browser, cache_read_tokens, cache_creation_tokens,
-                    requested_model, upstream_model
+                    requested_model, upstream_model, interrupted_bytes
              FROM traces
              ORDER BY ts_ms DESC
              LIMIT ?1",
@@ -316,6 +378,8 @@ impl TraceDb {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<RequestRecord>> {
+        // 先 flush 待写队列（同 `recent`，读路径必须看到已落账的积攒记录）
+        self.flush_pending();
         let capped = limit.clamp(1, MAX_SEARCH_LIMIT);
         let (where_sql, mut binds) = filter.build_where();
 
@@ -324,7 +388,7 @@ impl TraceDb {
                     input_tokens, output_tokens, credits_used, latency_ms, first_token_ms,
                     outcome, retries, error_message, session_id, client_device,
                     client_ip, client_os, client_browser, cache_read_tokens, cache_creation_tokens,
-                    requested_model, upstream_model
+                    requested_model, upstream_model, interrupted_bytes
              FROM traces{where_sql}
              ORDER BY ts_ms DESC
              LIMIT ? OFFSET ?"
@@ -350,6 +414,7 @@ impl TraceDb {
 
     /// 与 [`search`](Self::search) 同一 WHERE 条件下的匹配总行数（供分页展示总数）。
     pub fn count_filtered(&self, filter: &TraceFilter) -> Result<i64> {
+        self.flush_pending();
         let (where_sql, binds) = filter.build_where();
         let sql = format!("SELECT COUNT(*) FROM traces{where_sql}");
 
@@ -363,6 +428,7 @@ impl TraceDb {
 
     /// 统计 traces 表当前总行数（供 admin 存储统计展示）。
     pub fn count(&self) -> Result<u64> {
+        self.flush_pending();
         let conn = self.conn.lock();
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM traces", [], |row| row.get(0))
@@ -381,6 +447,8 @@ impl TraceDb {
         // 极遥远的过去 → 什么都不删（超大保留期=全保留，语义正确）。
         let cutoff_ms = chrono::Utc::now().timestamp_millis()
             - keep_days.saturating_mul(86_400_000);
+        // 先落库再清理：积攒在队列里的过期记录也应被本次清理覆盖
+        self.flush_pending();
         let conn = self.conn.lock();
         let deleted = conn
             .execute("DELETE FROM traces WHERE ts_ms < ?1", params![cutoff_ms])
@@ -391,14 +459,30 @@ impl TraceDb {
 
 impl UsageSink for TraceDb {
     fn on_record(&self, record: &RequestRecord) {
-        // sink 不应 panic：失败仅告警，丢弃该条统计
-        if let Err(e) = self.insert(record) {
-            tracing::warn!("trace_db 落账失败（已丢弃该条）: {e:#}");
+        // 攒批：先入队（不碰 DB），满 BATCH_SIZE 或距上次落库超 FLUSH_INTERVAL 时批量落库。
+        // sink 不应 panic：落库失败仅告警，丢弃该批统计。
+        let due = {
+            let mut pend = self.pending.lock();
+            pend.records.push(record.clone());
+            let now = std::time::Instant::now();
+            pend.records.len() >= BATCH_SIZE
+                || now.duration_since(pend.last_flush) >= FLUSH_INTERVAL
+        };
+        if due {
+            self.flush_pending();
         }
     }
 
     fn name(&self) -> &'static str {
         "trace_db"
+    }
+}
+
+/// 停机兜底：进程正常退出时把残留的待写记录落库（优雅停机路径 pipeline worker
+/// 退出后会 drop 本 sink）。失败只告警——统计明细可容忍丢失，绝不在析构路径上抛错。
+impl Drop for TraceDb {
+    fn drop(&mut self) {
+        self.flush_pending();
     }
 }
 
@@ -437,6 +521,8 @@ fn row_to_record(row: &Row<'_>) -> rusqlite::Result<RequestRecord> {
         // 用 `get_or` 兜底 None，与 JSONL 的 serde default 同一语义。
         requested_model: row.get(20).unwrap_or(None),
         upstream_model: row.get(21).unwrap_or(None),
+        // 中断字节（历史库缺列时兜底 None = 未中断，同 requested_model 模式）
+        interrupted_bytes: row.get::<_, Option<i64>>(22).unwrap_or(None).map(|v| v as u64),
     })
 }
 
@@ -508,6 +594,8 @@ mod tests {
         rec.credits_used = Some(2.5);
         rec.latency_ms = 1500;
         rec.first_token_ms = Some(300);
+        // 中断字节的往返验证（本样本 outcome 为 Success，仅为纯序列化往返用例）
+        rec.interrupted_bytes = Some(2048);
         rec.outcome = RequestOutcome::Success;
         rec.retries = 1;
         rec.error_message = Some("none".to_string());
@@ -540,6 +628,7 @@ mod tests {
         assert_eq!(back.credits_used, Some(2.5));
         assert_eq!(back.latency_ms, 1500);
         assert_eq!(back.first_token_ms, Some(300));
+        assert_eq!(back.interrupted_bytes, Some(2048));
         assert_eq!(back.outcome, RequestOutcome::Success);
         assert_eq!(back.retries, 1);
         assert_eq!(back.error_message, Some("none".to_string()));
@@ -650,6 +739,7 @@ mod tests {
         rec.credential_id = None;
         rec.credits_used = None;
         rec.first_token_ms = None;
+        rec.interrupted_bytes = None;
         rec.error_message = None;
         rec.session_id = None;
         db.on_record(&rec);
@@ -660,6 +750,7 @@ mod tests {
         assert_eq!(back.credential_id, None);
         assert_eq!(back.credits_used, None);
         assert_eq!(back.first_token_ms, None);
+        assert_eq!(back.interrupted_bytes, None);
         assert_eq!(back.error_message, None);
         assert_eq!(back.session_id, None);
         assert_eq!(back.client_device, None);
@@ -931,6 +1022,54 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(db.count_filtered(&f).unwrap(), 0);
+    }
+
+    /// 批量写：读路径必须先 flush 待写队列，保证读写一致（攒批不引入可见性延迟）。
+    #[test]
+    fn test_batched_inserts_are_visible_to_reads() {
+        let tmp = TempDbPath::new("batch_read");
+        let db = TraceDb::open(tmp.path()).unwrap();
+        for i in 0..5 {
+            db.on_record(&sample_record(&format!("batch-{i}"), 1000 + i));
+        }
+        let got = db.recent(10).unwrap();
+        assert_eq!(got.len(), 5, "读路径应先 flush 待写队列");
+    }
+
+    /// 批量写：超过 BATCH_SIZE 时第一批自动落库（事务批量），余下由读路径 flush 补齐；
+    /// 整批往返不丢不重。
+    #[test]
+    fn test_batch_size_flush_roundtrip() {
+        let tmp = TempDbPath::new("batch_size");
+        let db = TraceDb::open(tmp.path()).unwrap();
+        for i in 0..(BATCH_SIZE + 3) {
+            db.on_record(&sample_record(&format!("req-{i}"), 1000 + i as i64));
+        }
+        let got = db.recent(BATCH_SIZE + 3).unwrap();
+        assert_eq!(
+            got.len(),
+            BATCH_SIZE + 3,
+            "全部记录都应可读（自动批量落库 + 读路径 flush 补齐）"
+        );
+        let mut ids: std::collections::HashSet<_> =
+            got.iter().map(|r| r.request_id.clone()).collect();
+        assert_eq!(ids.len(), BATCH_SIZE + 3, "批量往返不得丢重");
+    }
+
+    /// 停机兜底：Drop 时把残留待写记录落库，重开连接仍可读到。
+    #[test]
+    fn test_drop_flushes_pending() {
+        let tmp = TempDbPath::new("drop_flush");
+        let path = tmp.path().to_path_buf();
+        {
+            let db = TraceDb::open(&path).unwrap();
+            for i in 0..3 {
+                db.on_record(&sample_record(&format!("keep-{i}"), 1000 + i));
+            }
+        } // 作用域结束 drop：残留记录应被落库
+        let db2 = TraceDb::open(&path).unwrap();
+        let got = db2.recent(10).unwrap();
+        assert_eq!(got.len(), 3, "Drop 应 flush 残留待写记录");
     }
 
     /// 模拟旧库（无 client_device 列 + 已有历史数据），验证迁移幂等且不丢数据。

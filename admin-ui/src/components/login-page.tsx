@@ -18,6 +18,8 @@ export function LoginPage({ onLogin }: LoginPageProps) {
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
+    // adminKey 存 sessionStorage(见 lib/storage.ts):关闭浏览器标签即退出,
+    // 新开标签/重启浏览器后这里读不到,需要重新登录——这是刻意的安全取舍。
     const savedKey = storage.getApiKey()
     if (savedKey) {
       setApiKey(savedKey)

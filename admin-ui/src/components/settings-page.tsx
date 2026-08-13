@@ -276,6 +276,10 @@ interface FormState {
   encryptCredentialsAtRest: boolean
   cooldownEnabled: boolean
   autoDisableSuspicious: boolean
+  // 内存态开关：不进 config.json、重启回默认，只能通过 PUT /config 改（详见后端内存开关清单）
+  autoDisableQuotaExceeded: boolean
+  socksAutoHealth: boolean
+  otaAutoCheck: boolean
   allCoolingFastFail: boolean
   rateLimitEnabled: boolean
   rateLimitDailyMax: string
@@ -333,8 +337,18 @@ interface FormState {
 // 后端两侧都已有该字段（`src/admin/types.rs:898` 响应 / `:1031` 请求，serde camelCase），
 // 但 `src/types/api.ts` 的两个接口里还没有它。api.ts 此刻正被其他会话改，
 // 不在本次可改文件内，故在本文件内做最小补丁；等 api.ts 补上字段后删掉这两个别名即可。
-type ConfigWithCache = ConfigSnapshotResponse & { promptCacheEnabled?: boolean }
-type UpdateWithCache = UpdateConfigRequest & { promptCacheEnabled?: boolean }
+type ConfigWithCache = ConfigSnapshotResponse & {
+  promptCacheEnabled?: boolean
+  autoDisableQuotaExceeded?: boolean
+  socksAutoHealth?: boolean
+  otaAutoCheck?: boolean
+}
+type UpdateWithCache = UpdateConfigRequest & {
+  promptCacheEnabled?: boolean
+  autoDisableQuotaExceeded?: boolean
+  socksAutoHealth?: boolean
+  otaAutoCheck?: boolean
+}
 
 // 后端 `default_prompt_cache_enabled()`（`src/model/config.rs:885`）返回 true，
 // 字段缺失时按 true 兜底，避免面板把"未下发"显示成"已关闭"。
@@ -402,6 +416,9 @@ function toForm(c: ConfigSnapshotResponse, ui: UiLayoutPrefs): FormState {
     encryptCredentialsAtRest: c.encryptCredentialsAtRest ?? false,
     cooldownEnabled: c.cooldownEnabled,
     autoDisableSuspicious: c.autoDisableSuspicious ?? true,
+    autoDisableQuotaExceeded: (c as ConfigWithCache).autoDisableQuotaExceeded ?? true,
+    socksAutoHealth: (c as ConfigWithCache).socksAutoHealth ?? true,
+    otaAutoCheck: (c as ConfigWithCache).otaAutoCheck ?? false,
     allCoolingFastFail: c.allCoolingFastFail ?? true,
     rateLimitEnabled: c.rateLimitEnabled,
     rateLimitDailyMax: String(c.rateLimitDailyMax),
@@ -633,7 +650,8 @@ function ReadonlyRow({ label, value, mono }: { label: string; value: React.React
 // 子卡片后台刷新失败但仍有上次成功数据时，挂在标题旁的小角标。
 // 为什么不复用整块"加载失败"文案：那会把仍然有效的旧值整段抹掉；
 // 网关 502 期间数据本身没坏，只是停更了，让用户看到旧值 + 一个明确的"已过期"标记信息量更大。
-function StaleBadge({ updatedAt }: { updatedAt?: number }) {
+// export 供 overview-page 的余额展示复用（余额数据旧 >1h 时同款角标）。
+export function StaleBadge({ updatedAt }: { updatedAt?: number }) {
   const { t } = useTranslation()
   return (
     <span
@@ -1882,6 +1900,13 @@ export function SettingsPage() {
     if (form.cooldownEnabled !== config.cooldownEnabled) d.cooldownEnabled = form.cooldownEnabled
     if (form.autoDisableSuspicious !== config.autoDisableSuspicious)
       d.autoDisableSuspicious = form.autoDisableSuspicious
+    // 内存态开关：与基线（含缺省兜底）不同才进 diff，避免无谓写盘（同既有范式）。
+    if (form.autoDisableQuotaExceeded !== ((config as ConfigWithCache).autoDisableQuotaExceeded ?? true))
+      d.autoDisableQuotaExceeded = form.autoDisableQuotaExceeded
+    if (form.socksAutoHealth !== ((config as ConfigWithCache).socksAutoHealth ?? true))
+      d.socksAutoHealth = form.socksAutoHealth
+    if (form.otaAutoCheck !== ((config as ConfigWithCache).otaAutoCheck ?? false))
+      d.otaAutoCheck = form.otaAutoCheck
     if (form.allCoolingFastFail !== (config.allCoolingFastFail ?? true)) d.allCoolingFastFail = form.allCoolingFastFail
     if (form.rateLimitEnabled !== config.rateLimitEnabled) d.rateLimitEnabled = form.rateLimitEnabled
     const daily = Number(form.rateLimitDailyMax)
@@ -2164,6 +2189,24 @@ export function SettingsPage() {
       {/* 服务管理分区：一键重启 */}
       <SectionGate section="service" titleKey="settingspage.card.service" kwKey="settingspage.card.service.kw">
         <ServiceManagementCard />
+        {/* 内存态开关：OTA 自动检查。config.json 可改，补开关更完整（内存态，重启回默认）。 */}
+        {/* i18n: settingspage.service.otaAutoCheck.label/.hint（主会话补三语） */}
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-base"><Highlight text="OTA 自动检查" /></CardTitle>
+          </CardHeader>
+          <CardContent className="py-0">
+            <Field
+              label="自动检查 GitHub 新版本"
+              hint="定期自动检查新版本，发现后由服务管理卡提示升级（内存态，重启回默认）。"
+            >
+              <Switch
+                checked={form.otaAutoCheck}
+                onCheckedChange={(v) => set('otaAutoCheck', v)}
+              />
+            </Field>
+          </CardContent>
+        </Card>
       </SectionGate>
       {/* 存储分区：占用统计 + 清理 */}
       <SectionGate section="storage" titleKey="settingspage.card.storage" kwKey="settingspage.card.storage.kw">
@@ -2837,6 +2880,29 @@ export function SettingsPage() {
             hint={`${t('settingspage.anti.allCooling.hint')}${hotParen}`}
           >
             <Switch checked={form.allCoolingFastFail} onCheckedChange={(v) => set('allCoolingFastFail', v)} />
+          </Field>
+          {/* 内存态开关：余额超额自动禁用整组。不进 config.json、重启回默认，
+              只能经 PUT /config 改——默认开，温和余额刷新发现超额即自动禁用（误禁无逃生门，故补此开关）。 */}
+          {/* i18n: settingspage.anti.autoDisableQuotaExceeded.label/.hint（主会话补三语） */}
+          <Field
+            label="余额超额自动禁用整组"
+            hint={`温和余额刷新发现超额时自动禁用整组号池（内存态，重启回默认）。${hotParen}`}
+          >
+            <Switch
+              checked={form.autoDisableQuotaExceeded}
+              onCheckedChange={(v) => set('autoDisableQuotaExceeded', v)}
+            />
+          </Field>
+          {/* 内存态开关：socks 代理池自动健康探测。每 5 分钟探测一次，连续 3 次失败自动禁用该代理。 */}
+          {/* i18n: settingspage.anti.socksAutoHealth.label/.hint（主会话补三语） */}
+          <Field
+            label="socks 代理池自动健康探测"
+            hint={`每 5 分钟探测可用性，连续 3 次失败自动禁用该代理（内存态，重启回默认）。${hotParen}`}
+          >
+            <Switch
+              checked={form.socksAutoHealth}
+              onCheckedChange={(v) => set('socksAutoHealth', v)}
+            />
           </Field>
           {/* 速率限制：行尾齿轮点开「速率卡」做细粒度设置 */}
           <Field label={t('settingspage.anti.rateLimit.label')} hint={`${t('settingspage.anti.rateLimit.hint')}${hotParen}`}>

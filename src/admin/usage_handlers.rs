@@ -138,9 +138,11 @@ pub async fn usage_timeseries(
 /// GET /api/admin/usage/by-model
 /// 按「上游实际服务模型」分组的累计统计（映射双口径的 upstream 维度：
 /// key = `upstream_model` 映射后名，None 回落 `model`）。
+///
+/// 成本估算：单价表取自当前配置快照（空表 = 不估算），命中模型的行下发 `cost`。
 pub async fn usage_by_model(State(state): State<AdminState>) -> impl IntoResponse {
     match &state.usage_stats {
-        Some(stats) => Json(stats.by_model()).into_response(),
+        Some(stats) => Json(stats.by_model(&state.service.model_pricing())).into_response(),
         None => stats_disabled(),
     }
 }
@@ -149,7 +151,8 @@ pub async fn usage_by_model(State(state): State<AdminState>) -> impl IntoRespons
 /// 按「客户端请求的原始模型名」分组的累计统计（映射双口径的 requested 维度）。
 pub async fn usage_by_requested_model(State(state): State<AdminState>) -> impl IntoResponse {
     match &state.usage_stats {
-        Some(stats) => Json(stats.by_requested_model()).into_response(),
+        Some(stats) => Json(stats.by_requested_model(&state.service.model_pricing()))
+            .into_response(),
         None => stats_disabled(),
     }
 }

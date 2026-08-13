@@ -64,8 +64,8 @@
 - **D 类阈值**（RAMP_MIN_SAMPLES / MAX_REQUEST_RETRY_BUDGET_SECS / POOL_EXHAUSTED_RETRY_AFTER_SECS 等）：「健康时观测」定性存在，但无真实故障分布数据——**先修度量再调参**（项目铁律）。
 - **upstream_trace 的 DROPPED/WRITTEN 计数器无消费点**：确认 trace 排障功能是否还在用后再决定接出口。
 - **cache Layer3 fingerprint**：已移植（2026-08-11）。
-- **bucket_id 接线需 provider ctx**（08-08 遗留）：`endpoint_buckets` 的 key 仍用 `name.to_string()`，需在 429 封桶写入点按 ctx 计算——未做，与 region 维度修复无关。
-- **前端端点下拉未隐藏 codewhisperer/amazonq**（08-08 遗留，未做）。
+- **bucket_id 已接线**（08-08 遗留已闭环）：429 封桶写入点已按真实 ctx 计算——`provider.rs`（:2366、:3678）用 `(ctx.id, endpoint.bucket_id(&rctx))` 作 `endpoint_buckets` 的 key；`endpoint/mod.rs` 另提供 `bucket_key_for_ctx`（仅需 credentials+config 即可现算，含尾斜杠归一，见 `bucket_identity_tests`）。
+- **前端端点下拉已隐藏 codewhisperer/amazonq**（08-08 遗留已闭环）：`credential-card.tsx`（:336-348）对 ksk_ 号过滤这两个端点（仍注册在后端，经 API 显式设 endpoint 依然可用）。
 - **OTA token 仍为空**（线上 `/etc/kirostudio/update.env`）：`v0.7.46` tag 已打（2026-08-11），
   但 OTA 按钮仍需填 token 才能用（本轮部署走的是 hotswap，不经 OTA）。
 
@@ -98,3 +98,10 @@
 `TRACKING-*` 均保留为证据与推导材料。历史文档中的数字、线上状态、行号和「已上线/待修」
 措辞必须先用本文件和当前代码重新核对。`HANDOFF-2026-08-08-CONSOLIDATED.md` 声称的
 线上状态（已部署新机容器）与真实线上需另行核验后才能采信。
+
+## 2026-08-14 波次 3 闭环
+
+- KAM 导出端点（GET /credentials/export-kam，ids 过滤 + 400 校验 + no-store）
+- 前端：画布右键菜单 / OTA 进度状态机 / KAM 导出按钮
+- docs/CRASHLOOP-ROLLBACK.md 新建；DEPLOYMENT §6 运维观测与告警
+- config.example.json 补 modelPricing/alert/ota/ua 字段示例

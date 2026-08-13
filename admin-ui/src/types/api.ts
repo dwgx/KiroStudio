@@ -538,6 +538,12 @@ export interface ConfigSnapshotResponse {
   cooldownEnabled: boolean
   /** 账户级 403 风控连续 N 次零成功后自动禁用该号。默认开。 */
   autoDisableSuspicious: boolean
+  /** 后台温和余额刷新发现超额时自动禁用整组（内存态，重启回默认 true） */
+  autoDisableQuotaExceeded: boolean
+  /** socks 代理池自动健康探测（内存态，重启回默认 true） */
+  socksAutoHealth: boolean
+  /** OTA 自动检查新版本（内存态，重启回默认 false） */
+  otaAutoCheck: boolean
   /** 分身（clone）新建时默认是否启用（默认 false = 建出来是禁用的）。 */
   cloneDefaultEnabled: boolean
   allCoolingFastFail: boolean
@@ -689,6 +695,9 @@ export interface UpdateConfigRequest {
   encryptCredentialsAtRest?: boolean
   cooldownEnabled?: boolean
   autoDisableSuspicious?: boolean
+  autoDisableQuotaExceeded?: boolean
+  socksAutoHealth?: boolean
+  otaAutoCheck?: boolean
   cloneDefaultEnabled?: boolean
   allCoolingFastFail?: boolean
   rateLimitEnabled?: boolean
@@ -849,6 +858,11 @@ export interface GroupStat {
   /** 写入缓存的输入 token（input_tokens 的子集） */
   cache_creation_tokens: number
   credits_used: number
+  /**
+   * 估算成本（元）：后端按 config 单价表（modelPricing）推算。**后端已下发**；
+   * 0 = 无单价表或模型不在表中（不估算）。optional 只为兼容旧后端二进制。
+   */
+  cost?: number
   avg_latency_ms: number
   /**
    * 换号次数累计（按模型/凭据看哪个维度在烧重试预算）。**后端已下发**；
@@ -969,6 +983,8 @@ export interface ClientRpm {
 // 单条请求明细
 export interface RequestRecord {
   request_id: string
+  /** 中断字节数（断流时已收上游字节；None/0 = 正常收尾） */
+  interrupted_bytes?: number
   ts_ms: number
   credential_id: number | null
   model: string

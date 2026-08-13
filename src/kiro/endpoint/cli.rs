@@ -143,22 +143,18 @@ pub(crate) fn decorate_cli_protocol(
         .header("user-agent", &ua)
         .header("host", host)
         .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
-        // ⚠️ TODO(指纹未完全对齐)：真实 AWS SDK 这个头的 attempt 会**随重试递增**
-        // （kiro2cc 实现为 `attempt={n+1}; max=3`），而这里 attempt 恒为 1。
-        // ⇒ 即便开了 `cli_ua_align_real_client`，「attempt 永远是 1」本身仍是一个
-        // 可被上游识别的指纹（真实客户端重试时该值会变）。
-        //
-        // 没有现在就改的原因：要拿到当前重试轮次，必须把它透传进 `RequestContext`
-        // 或 `decorate_api` 签名 —— 那会动 `KiroEndpoint` trait 的公共签名与全部 5 个
-        // 端点实现，属独立改动。四家参考仓也都写死 attempt=1（只有 kiro2cc 递增），
-        // 所以对齐它们不需要这一步；要对齐**真实 SDK** 才需要。
-        //
-        // max 的取值同理待定：本仓 `max=1`，四家参考仓一致 `max=3`。这个头是**告知
-        // 上游** SDK 层的重试上限声明，不改变网关自身行为（网关实际上限是
-        // `provider.rs::ABSOLUTE_MAX_TOTAL_RETRIES = 4`），所以它纯粹是指纹项。
-        // 未随 `cli_ua_align_real_client` 一起改，是因为该开关的语义限定在 UA 形状；
-        // 把不相关的头塞进同一个开关会让 A/B 结果无法归因。
-        .header("amz-sdk-request", "attempt=1; max=1")
+        // amz-sdk-request 头（2026-08-14 对齐）：
+        // - max 对齐为 3：与 IDE 端点（ide.rs 恒发 3）、四家参考仓、真实 SDK 的
+        //   声明一致 —— 首包值即真实客户端的首包值。此前 max 声明为 1，在任何
+        //   真实实现里都不存在，本身就是一个可识别指纹。该头**纯声明性**，
+        //   不改变网关自身重试行为（实际上限是 `provider.rs::ABSOLUTE_MAX_TOTAL_RETRIES`）。
+        // - attempt 保持 1：真实 SDK 重试时 attempt 递增（kiro2cc 为
+        //   `attempt={n+1}; max=3`），但要把重试轮次透传进来，必须动
+        //   `RequestContext` 结构（全仓 20+ 处构造点，含 provider 热路径 3 处）
+        //   或 `KiroEndpoint::decorate_*` 签名（5 端点实现 + provider 3 处调用点），
+        //   均超出本次改动的文件边界，未做。首包 attempt=1 与真实客户端首包一致，
+        //   只有重试包才会出现差异。守卫测试钉住 max 不回退。
+        .header("amz-sdk-request", "attempt=1; max=3")
         .header("Authorization", format!("Bearer {}", ctx.token))
     // 刻意不注入 profileArn / anthropic-beta：API_KEY 认证不使用 profileArn；
     // CLI 端点的 1M 窗口由上游按 modelId 决定，不依赖 anthropic-beta 头。
@@ -176,7 +172,7 @@ pub(crate) fn decorate_cli_mcp(
         .header("user-agent", &ua)
         .header("host", host)
         .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
-        .header("amz-sdk-request", "attempt=1; max=1")
+        .header("amz-sdk-request", "attempt=1; max=3")
         .header("Authorization", format!("Bearer {}", ctx.token))
 }
 
@@ -336,10 +332,11 @@ pub(crate) fn set_origin_kiro_cli(request_body: &str) -> String {
 // 2. `x-amzn-kiro-agent-mode: vibe`：本仓发，kiro-rs 只在 IDE 端点发。
 //    多发一个上游可能不认的头，最坏是被忽略；它与 body 里的 `agentMode` 重复，
 //    真要清理应连 body 一起，属独立一轮。
-// 3. `amz-sdk-request`：本仓 `attempt=1; max=1`，kiro-rs `attempt=1; max=3`。
-//    这是 AWS SDK 自报的**客户端重试预算**，纯声明性（我们自己不按它重试）。
-//    若上游据此做退避判断，改它会与网关内部的 failover/吸收层记账重叠 —— 要改得先
-//    想清楚两套重试语义谁说了算，不是一行头的事。
+// 3. `amz-sdk-request`：max 已对齐 kiro-rs 的 3（2026-08-14，见 decorate_cli_protocol
+//    的注释与守卫测试）；剩余差异是 attempt 恒为 1 —— 真实 SDK 重试时递增，本仓要
+//    透传重试轮次需动 trait/RequestContext，超出文件边界未做。该头是 AWS SDK 自报的
+//    **客户端重试预算**，纯声明性（网关自身不按它重试，实际上限是
+//    `ABSOLUTE_MAX_TOTAL_RETRIES`）。
 // 4. UA 形状：本仓把 `machine_id` 嵌进 `md/appVersion-...`，kiro-rs 用
 //    `config.system_version` + `config.kiro_version` 且不含 machineId。
 //    machineId 进 UA 是本仓**刻意**的多号隔离手段（同一 UA 跨号会给上游关联线索），
@@ -403,6 +400,38 @@ mod tests {
         assert!(
             aligned.contains("md/appVersion"),
             "user-agent 带 appVersion：{aligned}"
+        );
+    }
+
+    /// ⭐ 守卫：CLI 协议两条路径（API/MCP）的 `amz-sdk-request` 头必须声明 max 为 3，
+    /// 且不得退回声明为 1。
+    ///
+    /// 承重点：max 声明为 1 在任何真实实现里都不存在（IDE 端点恒发 3、四家参考仓
+    /// 一致 3、真实 SDK 默认重试上限 3），是纯指纹项。退回 1 不会报错，只会让
+    /// 网关看起来不像真实客户端。若将来把 attempt 改成动态值（需 provider 透传
+    /// 重试轮次），需同步改写本条守卫。
+    #[test]
+    fn amz_sdk_request_max_is_aligned_to_real_client() {
+        let src = include_str!("cli.rs");
+        let prod = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("生产段应存在")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // needle 运行时拼接，避免 include_str! 自匹配本行。
+        let aligned = ["attempt=1; max=", "3"].concat();
+        let count = prod.matches(&aligned).count();
+        assert!(
+            count >= 2,
+            "API 与 MCP 两条路径的 amz-sdk-request 都必须声明 max=3，当前 {count} 处"
+        );
+        let legacy = ["attempt=1; max=", "1"].concat();
+        assert!(
+            !prod.contains(&legacy),
+            "不得残留 max=1 声明（真实实现不存在的指纹值）"
         );
     }
 

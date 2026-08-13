@@ -18,7 +18,7 @@ use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
 
-use super::image_resize::{ResizeConfig, ResizeError, maybe_shrink_image};
+use super::image_resize::{ResizeConfig, ResizeError, maybe_shrink_image_blocking};
 use super::types::{ContentBlock, ImageSource, MessagesRequest};
 
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
@@ -1427,7 +1427,18 @@ fn extract_kiro_image(
     // 智能降采样（GreyGunG image_resize 移植）：8MiB 内的图先尝试缩小到上游可接受的长边
     // /字节预算（PNG/WebP/JPEG 一律重编码 JPEG，GIF 保留原格式防丢动画）。小图零开销直通。
     let cfg = ResizeConfig::from_env();
-    match maybe_shrink_image(cfg, &format, &source.data) {
+    // 图片解码+缩放+编码是同步 CPU 重活（几十~几百 ms），在 tokio worker 上同步跑会独占
+    // 该 worker 的服务能力。本转换链（convert_request）是同步签名（handlers/websearch 的
+    // 调用点不改动），故在这里用 block_in_place + block_on：worker 线程等待期间让位给
+    // 其他任务，重活实际执行在 spawn_blocking 的 blocking 池（blocking 区可合法 block_on）。
+    let processed = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(maybe_shrink_image_blocking(
+            cfg,
+            format.clone(),
+            source.data.clone(),
+        ))
+    });
+    match processed {
         Ok(processed) => {
             images.push(KiroImage::from_base64(processed.format, processed.data_base64));
         }
@@ -4856,8 +4867,9 @@ mod tests {
     /// 1x1 PNG 的 base64（测试用）
     const TINY_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
 
-    #[test]
-    fn test_tool_result_image_lifts_to_top_level() {
+    // 图片路径会走 block_in_place（见 extract_kiro_image），测试需多线程 runtime
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_tool_result_image_lifts_to_top_level() {
         use super::super::types::Message as AnthropicMessage;
 
         // user 提问 -> assistant tool_use -> user tool_result（含 image + text）
@@ -4979,8 +4991,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_current_message_image_always_kept() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_current_message_image_always_kept() {
         // 当前轮消息（非历史）图片永远保留，不去重
         let content = serde_json::json!([
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": TINY_PNG_B64}},
@@ -4991,8 +5003,8 @@ mod tests {
         assert_eq!(images.len(), 2, "当前轮相同图片应全部保留");
     }
 
-    #[test]
-    fn test_history_image_dedup() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_history_image_dedup() {
         // 历史路径：同一张图跨消息重复出现，只保留首次
         let mut dedup = std::collections::HashSet::new();
         let content = serde_json::json!([
@@ -5033,8 +5045,8 @@ mod tests {
         images.first().map(|img| img.format.clone())
     }
 
-    #[test]
-    fn test_image_format_corrected_to_jpeg_by_magic_bytes() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_image_format_corrected_to_jpeg_by_magic_bytes() {
         let data = fake_image_b64(&[0xFF, 0xD8, 0xFF, 0xE0]);
         assert_eq!(
             format_via_real_path("image/png", &data).as_deref(),
@@ -5043,8 +5055,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_image_format_corrected_to_png_by_magic_bytes() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_image_format_corrected_to_png_by_magic_bytes() {
         let data = fake_image_b64(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
         assert_eq!(
             format_via_real_path("image/jpeg", &data).as_deref(),
@@ -5053,8 +5065,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_image_format_corrected_to_gif_by_magic_bytes() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_image_format_corrected_to_gif_by_magic_bytes() {
         let data = fake_image_b64(b"GIF89a");
         assert_eq!(
             format_via_real_path("image/webp", &data).as_deref(),
@@ -5063,8 +5075,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_image_format_corrected_to_webp_by_magic_bytes() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_image_format_corrected_to_webp_by_magic_bytes() {
         // RIFF + 4 字节长度占位 + WEBP：偏移 8 处的 WEBP 必须一起验，否则 wav/avi 也会命中
         let mut magic = b"RIFF".to_vec();
         magic.extend_from_slice(&[0x10, 0x00, 0x00, 0x00]);
@@ -5077,8 +5089,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_image_format_keeps_declared_when_magic_unknown() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_image_format_keeps_declared_when_magic_unknown() {
         // 不匹配任何 magic：保留声明值，不猜——瞎猜会把上游本来能接受的格式改坏
         let data = fake_image_b64(&[0x00, 0x01, 0x02, 0x03]);
         assert_eq!(
@@ -5097,8 +5109,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_image_format_unchanged_when_declaration_matches_magic() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_image_format_unchanged_when_declaration_matches_magic() {
         // 真 1x1 PNG：声明与 magic 一致，格式不变
         assert_eq!(
             format_via_real_path("image/png", TINY_PNG_B64).as_deref(),
@@ -5107,8 +5119,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_image_format_unsupported_declaration_rescued_by_magic() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_image_format_unsupported_declaration_rescued_by_magic() {
         // 声明是不支持的 media_type 但字节认得出：旧行为整张图无声丢弃，现在按 magic 下发
         let data = fake_image_b64(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
         assert_eq!(
@@ -5123,8 +5135,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_image_format_sniff_tolerates_data_url_prefix_and_newlines() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_image_format_sniff_tolerates_data_url_prefix_and_newlines() {
         // 客户端偶发 data: 前缀 / 带换行的 base64，剥不掉就退化成"认不出"、纠正失效
         let jpeg = fake_image_b64(&[0xFF, 0xD8, 0xFF, 0xDB]);
         let with_prefix = format!("data:image/png;base64,{}", jpeg);

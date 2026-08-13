@@ -411,7 +411,21 @@ pub fn default_is_account_suspended(body: &str) -> bool {
         "permanently banned",
         "has been banned",
     ];
-    SUSPEND_KEYWORDS.iter().any(|kw| lower.contains(kw))
+    // 裸封禁信号（2026-08-14，对齐参考仓 ref-zyphr 的「双短语立即禁用且不参与
+    // 自愈」语义）：不带临时词族的「suspended」裸词视为永久封禁，走 provider 侧
+    // report_account_suspended 收口（立即禁用 + 落盘 + 排除出自愈）。
+    //
+    // ⚠️ 2026-08-14 对抗审查 M2 修正（两处）：
+    //   1. **删掉 `locked` 裸词** —— IdC/AD 的「多次登录失败锁号」标准文案
+    //      （"Account locked due to too many sign-in attempts"）不含 temporarily，
+    //      是自动解锁的临时态，裸词命中 = 真号被永久误禁并落盘（重启不恢复）。
+    //      SUSPEND_KEYWORDS 表里的限定短语才是保守口径，裸词不应比表更宽。
+    //   2. 临时词族排除从 `temporarily` 扩到 `temporar` 前缀族 —— 上游 reason
+    //      字段的词形是 TEMPORARY_SUSPENSION（temporarily 匹配不到），裸词判据
+    //      必须覆盖临时词族才能兜住「temporar* + suspended」的临时态。
+    let has_bare_signal = !lower.contains("temporar")
+        && lower.contains("suspended");
+    SUSPEND_KEYWORDS.iter().any(|kw| lower.contains(kw)) || has_bare_signal
 }
 
 /// 默认的"账户级临时风控限速"判断逻辑（v4-2.1）
@@ -1240,6 +1254,61 @@ mod tests {
             assert!(
                 !default_is_temporary_rate_limit(body),
                 "无临时信号，不应误判为临时: {body}"
+            );
+        }
+    }
+
+    /// 裸封禁信号（2026-08-14 新增，对齐 ref-zyphr 的「双短语立即禁用且不参与
+    /// 自愈」语义）：不带临时词族的「suspended」裸词视为永久封禁。
+    ///
+    /// 回退即 FAIL：删掉新增判据里的临时词族排除 —— 上游临时风控的生产原文
+    /// 会命中新增判据，与下方的临时态回归测试冲突（那是 12h 88 次误禁事故的锁）。
+    /// ⚠️ 2026-08-14 对抗审查 M2：`locked` 裸词**不**判永久 —— IdC/AD 的
+    /// 「多次登录失败锁号」标准文案（"Account locked due to too many sign-in
+    /// attempts"）是自动解锁的临时态，裸词命中 = 真号被永久误禁并落盘。
+    #[test]
+    fn bare_suspend_signals_without_temporary_prefix_count_as_permanent() {
+        for body in [
+            "Your account is suspended. Please contact support.",
+            r#"{"message":"Account has been suspended"}"#,
+            "This account was suspended due to a policy violation",
+            "SUSPENDED: account under review",
+        ] {
+            assert!(
+                default_is_account_suspended(body),
+                "不带临时词族的 suspended 裸词必须判永久封禁: {body}"
+            );
+            assert!(
+                !default_is_temporary_rate_limit(body),
+                "无临时信号，不应判为临时: {body}"
+            );
+        }
+        // M2 修正的回归锚：locked 裸词（无 suspended）不判永久（临时锁号文案）。
+        for body in [
+            r#"{"message":"Account locked"}"#,
+            "Account locked due to too many sign-in attempts. Please try again later.",
+            "This account was locked due to a policy violation",
+        ] {
+            assert!(
+                !default_is_account_suspended(body),
+                "locked 裸词不得判永久封禁（临时锁号/策略锁定）: {body}"
+            );
+        }
+    }
+
+    /// 带临时前缀的变体必须仍被排除在永久封禁之外（与上面那条互锁）：
+    /// 上游临时风控原文同时带「临时悬置」与「安全锁定」两个信号。
+    #[test]
+    fn temporary_prefixed_bodies_never_count_as_permanent() {
+        for body in [
+            "Your User ID is temporarily suspended.",
+            "Your User ID (1) temporarily is suspended.",
+            "The account was locked temporarily for security review",
+            r#"{"reason":"TEMPORARILY_SUSPENDED"}"#,
+        ] {
+            assert!(
+                !default_is_account_suspended(body),
+                "带临时前缀的变体绝不能判永久封禁: {body}"
             );
         }
     }

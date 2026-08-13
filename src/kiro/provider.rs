@@ -172,6 +172,15 @@ const ABSORB_MIN_BACKOFF: Duration = Duration::from_millis(50);
 ///
 /// 不做 TIER3 进程级 static：吸收层在 provider 内，`token_manager.config()` 本身就是 ArcSwap，
 /// admin 存盘后 `reload_config` 原子换入即生效 —— 少一层镜像就少 6 个可写错点。
+///
+/// # 快照粒度：一次函数调用一份，不是一条客户端请求一份（2026-08-14 标注）
+///
+/// 各调用点保证在**函数内只取一份**并贯穿全函数：主路径在吸收循环外取、
+/// 透传在 failover 循环外取。但**请求级一致**（同一条客户端请求的所有调用点共用
+/// 同一份策略）需要上层下传：透传失败后落主路径、以及 WebSearch 每轮重进
+/// `call_api_stream`，都会在各自函数入口各取一份新快照 —— 两处之间若恰好热更，
+/// 同一条请求会混用两代策略。修法属 handler 层（请求入口构造一份下传，或挂到
+/// 每请求共享的 `SharedRetryBudget` 上），不在本文件范围，此处仅记录边界。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AbsorbPolicy {
     enabled: bool,
@@ -947,6 +956,15 @@ impl KiroProvider {
             default_endpoint
         );
         let tls_backend = token_manager.config().tls_backend;
+        // 告警配置随 provider 构造注入（热更不生效，改配置需重启；未配置时告警 bump 零开销）。
+        {
+            let ac = token_manager.config();
+            crate::common::alerting::init(
+                ac.alert_webhook_url.clone(),
+                ac.alert_cooldown_secs,
+                ac.host.clone(),
+            );
+        }
         // 预热：构建全局代理对应的 Client
         // 对话路径用流式 client：read_timeout(空闲间隔) 而非总时长，防长流被中途掐断
         // （根因见 build_streaming_client 注释：修 `Connection closed mid-response`）。
@@ -1495,7 +1513,8 @@ impl KiroProvider {
                 };
             started = std::time::Instant::now();
             // 全局 deepseek 归一化配置（TIER1 热重载，per-凭据在 forward 内覆盖）。
-            let ds_cfg = self.token_manager.config().deepseek_normalize.clone();
+            // 复用循环外快照的 `absorb_cfg`（同一份 Arc<Config>），不再每跳重读。
+            let ds_cfg = absorb_cfg.deepseek_normalize.clone();
             // 透传路径的映射在 forward 内部（先映射 → 再归一化）。改写是否真的发生由
             // forward 判断（JSON 解析失败等情况下不会改写）；这里按凭据豁免与映射规则
             // 预判 mapped_model，仅用于 PassthroughMeta 埋点。
@@ -2584,7 +2603,11 @@ impl KiroProvider {
         // ── 内置「上游 429 吸收层」──────────────────────────────────────────────
         // 吸收层在闸门之下（结构化保证不会被重入）。acquire_admission 已移至 handlers 层，
         // 两条路径统一在 handler 入口过闸，provider 不再重复调。
-        let absorb = AbsorbPolicy::from_config(&self.token_manager.config());
+        // ⭐ 配置快照：一次调用只取一份（与上方 mapping_rules 同约定）。此前 `config`
+        // 在下方每跳 attempt 循环内重读（ArcSwap load + 引用计数增减 × 每跳），
+        // 热更配置会让同一条请求的不同 failover 跳按不同配置走，行为不可复现。
+        let config = self.token_manager.config();
+        let absorb = AbsorbPolicy::from_config(&config);
         // deadline 与 call_started 同源:准入排队(最长 inbound_queue_max_wait_secs)也计入
         // 预算。若改成从此刻起算,客户端可见延迟 = 排队 30s + 吸收 45s = 75s ≈ shield 的
         // p50 73.2s,等于把病根换个地方搬进来。
@@ -2699,7 +2722,7 @@ impl KiroProvider {
                 // 处失败（网络错误 continue）的路径就不会被记入，下一跳又选它。
                 tried_this_call.insert(ctx.id);
 
-                let config = self.token_manager.config();
+                // 配置来自循环外快照（见快照处的说明）：所有 failover 跳共用同一份。
 
                 // ⭐ L1：本请求链内该号已被判定 region 错配 ⇒ 用换过的区建本次请求。
                 //
@@ -3783,6 +3806,8 @@ impl KiroProvider {
                 // 放弃结局的区别是承重的：这是**每请求硬上限**，抬任何 upstreamRetryAbsorb*
                 // 旋钮都不会改变结局 —— 归到 budget_exhausted 会把运维引向抬预算（无效）。
                 crate::common::recovery_metrics::bump_absorb_retry_quota_exhausted();
+                // 告警：跨轮总重试额度耗尽（每请求硬上限，抬任何吸收旋钮都不改变结局的强信号）。
+                crate::common::alerting::bump("absorb_retry_quota_exhausted");
                 tracing::warn!(
                     absorb_stop = "retry_quota_exhausted",
                     rounds = absorb_round,
@@ -3868,6 +3893,8 @@ impl KiroProvider {
                 // 本条的瓶颈是**总预算**,该抬 `upstreamRetryAbsorbBudgetSecs`
                 // (换号空窗类则是 upstreamRetryAbsorbSwapBudgetSecs)。
                 crate::common::recovery_metrics::bump_absorb_budget_exhausted();
+                // 告警：吸收总预算不足一轮（429 风暴下的典型结局）。
+                crate::common::alerting::bump("absorb_budget_exhausted");
                 tracing::warn!(
                     absorb_stop = "budget_too_small_for_round",
                     rounds = absorb_round,
@@ -3890,7 +3917,9 @@ impl KiroProvider {
                 use crate::anthropic::AbsorbClass;
                 match class {
                     AbsorbClass::PoolCooldown(_) => {
-                        crate::common::recovery_metrics::bump_absorb_round_pool_cooldown()
+                        crate::common::recovery_metrics::bump_absorb_round_pool_cooldown();
+                        // 告警：全池冷却吸收轮（429 风暴信号，冷却窗口内去重）。
+                        crate::common::alerting::bump("absorb_pool_cooldown");
                     }
                     AbsorbClass::UpstreamRateLimit => {
                         crate::common::recovery_metrics::bump_absorb_round_rate_limit()
@@ -3918,6 +3947,8 @@ impl KiroProvider {
         // 的不算池耗尽（该区分语义不变，见 `real_failover_happened` 声明处）。
         if real_failover_happened {
             crate::common::recovery_metrics::bump_failover_exhausted();
+            // 告警：全池 failover 号全灭（整条请求失败）。
+            crate::common::alerting::bump("failover_exhausted");
         }
 
         // 所有吸收轮与重试都失败:埋点一条失败记录后返回错误。

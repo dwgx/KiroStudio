@@ -12,6 +12,9 @@
 
 ### 运维 / 部署
 - **DEPLOY-WINDOWS.md** — Windows 部署说明
+- **DEPLOYMENT.md** — Docker/systemd 运维健壮性（数据落卷、日志上限、健康探针、crashloop 回滚）
+- **SECURITY-BACKUP.md** — 备份与密钥安全(密钥独立于凭据备份)
+- CRASHLOOP-ROLLBACK.md：容器崩溃循环回滚流程
 - **UI-COMPONENTS.md** — 运维台 UI 组件规范
 
 ### 进行中的专项
