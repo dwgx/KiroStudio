@@ -9,24 +9,50 @@ Claude Code 在调用工具时经常报 **`Invalid tool parameters`** 或把工�
 
 ---
 
-## 先分清两层（关键）
+## 先分清三层（关键）
 
-| | **Bug A：参数内容坏（网关能修 ✅）** | **Bug B：调用信封坏（网关碰不到 ❌）** |
-| --- | --- | --- |
-| 坏在哪 | `tool_use` 事件里的 `partial_json` **内容**非法 | 工具调用的**信封**（`antml:` 前缀 / 标签）本身被模型吐坏 |
-| 典型成因 | `\U` 等 JSON 非法转义、裸控制符、上游截断、帧丢失 | 高多字节（中文/日文）密度紧邻工具标签，模型丢 `antml:` 前缀 |
-| 现象 | 下游报 `Invalid tool parameters` | 整段工具调用被当**纯文本**显示、根本不执行 |
-| 有没有 tool_use 事件 | **有**——网关能拿到内容去修 | **没有**——模型把 `<invoke>` 当文本吐了，无从修起 |
-| 官方 issue | #20015 / #29715 / #69522 等 | **#70544**（not-planned） |
-| 谁来修 | **KiroStudio 已根治** | 模型 / 客户端侧，网关架构上修不了 |
+| | **Bug A：参数内容坏（网关能修 ✅）** | **Bug B：调用信封坏（网关碰不到 ❌）** | **Bug C：缺必需字段（能修，未做 ⚠️）** |
+| --- | --- | --- | --- |
+| 坏在哪 | `tool_use` 事件里的 `partial_json` **内容**非法 | 工具调用的**信封**（`antml:` 前缀 / 标签）本身被模型吐坏 | 块有、**JSON 完全合法**，但缺 schema `required` 里的字段 |
+| 典型成因 | `\U` 等 JSON 非法转义、裸控制符、上游截断、帧丢失 | 高多字节（中文/日文）密度紧邻工具标签，模型丢 `antml:` 前缀 | 模型生成 tool_use 时漏写必需参数（键名错/漏键） |
+| 现象 | 下游报 `Invalid tool parameters` | 整段工具调用被当**纯文本**显示、根本不执行 | 客户端报 `The required parameter 'X' is missing`（如 Bash 缺 `command`） |
+| 有没有 tool_use 事件 | **有**——网关能拿到内容去修 | **没有**——模型把 `<invoke>` 当文本吐了，无从修起 | **有**，且 JSON 可正常 parse |
+| 官方 issue | #20015 / #29715 / #69522 等 | **#70544**（not-planned） | — |
+| 谁来修 | **KiroStudio 已根治** | 模型 / 客户端侧，网关架构上修不了 | **KiroStudio 可以修，但目前未做**（见下节） |
 
-一句话：**网关只能修「已经产生了 tool_use 块、但块里 JSON 内容坏了」的情况（Bug A）。**
+一句话：**网关只能修「已经产生了 tool_use 块」的情况（Bug A 与 C）。**
 如果模型连 tool_use 块都没吐、把整个工具调用当文本输出（Bug B），网关没有任何工具事件可
 介入——那是模型/客户端的缺陷。
 
 > ⚠️ 常见误判：在**满是中文的对话**里看到「AI 的工具调用变成文本、没执行」，那是 Bug B
 > (#70544)，**不是 KiroStudio 修复失败**。它发生在模型/客户端侧，KiroStudio 在不在链路上
 > 都一样。验证 KiroStudio 的修复要看 Bug A（见下方"如何验证"）。
+
+### Bug C：为什么现有修复层碰不到它（2026-08-10 新识别）
+
+`{"description":"..."}` 缺 `command` —— 这是**完全合法的 JSON**，所以：
+- `tool_repair_json`（修 JSON 语法）**修不到**：JSON 没坏
+- `tool_truncation_recovery`（修截断）**修不到**：没截断
+- 校验发生在**客户端**拿到合法 JSON 之后、按工具 schema 比对时
+
+⇒ **它既不是 A 也不是 B，此前一直落在两者之间的盲区**，这解释了「为什么做了工具修复仍会遇到」。
+
+**网关能修的依据**：客户端在请求里就带了完整工具 schema
+（`src/anthropic/types.rs:248` `Tool.input_schema`，含 `required` 数组），
+可直接 `input_schema.get("required")` 取出必需字段名。
+但该字段目前**只被用来数 token**（`src/token.rs:237-238`）与 OpenAI 层归一化
+（`src/openai/convert.rs:295/345`），**从未用于校验模型吐出的工具参数**。
+
+**修法**：复用现成的 ②③ 组合范式 —— `tool_stream_align_failure` +
+`tool_expose_error_to_client`（见下方开关一览，两者默认开）已经在做
+「工具参数非法 → 置 `UpstreamError{INVALID_TOOL_INPUT}` 失败态 + 补发 SSE error
+让客户端退避重试」，只需给它**加一个触发条件**：缺 `required` 字段时也判非法。
+
+实现注意三点：
+1. 只校验 `required` 的**存在性**，不做完整 JSON Schema 校验（过度设计，类型不匹配的容错空间大）
+2. WebSearch 类工具无 `input_schema`（见 `types.rs:246` 注释），必须跳过
+3. 工具名可能被缩短过（CJK 名超 63 字节会被 `converter.rs` 的 `map_tool_name` 缩），
+   校验时要用 `tool_name_map` 还原后再查 schema
 
 ---
 

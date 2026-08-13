@@ -166,6 +166,73 @@ KiroStudio 数据 `/opt/skiapi/data/kirostudio/`）。
 都在算空气。用户抱怨"配置根本没法调"的根因不是选项多，而是**一个关键数字是假的**。
 改 `credentialRpmLimit` 前必须做控制实验，不要直接按 25~30 改（会把吞吐掐死一个数量级）。
 
+### 🔴 34 个限流旋钮里只有 4 个真在限（2026-08-11 实测线上 config + 逐个核对代码路径）
+
+用户问「外部 30 RPM 怎么被打成上游 1000 RPM」，逐层实读后的分类：
+
+| 类别 | 数量 | 实情 |
+|---|---|---|
+| **死配置** | 14 | `absorb ×10`（线上 `Enabled=false`，且**吸收层不覆盖透传路径** —— 实测透传调用点 absorb 命中 **0**，而线上 100% 流量走透传 ⇒ 这 10 个旋钮全程无效）；`rate_limit ×4`（有实测依据不能开） |
+| **真在限** | 4 | `ABSOLUTE_MAX_TOTAL_RETRIES=4`、`MAX_PASSTHROUGH_FAILOVER_HOPS=6`（**都是代码常量不是配置**）、`upstreamConcurrencyLimit=16`、`upstreamPerCredentialLimit=8` |
+| 容量假数 | 3 | 见上一节 |
+| 其余 | ~13 | 冷却细分、reserve、安全限流等 |
+
+**三个语义陷阱**（名字与真实后果不对应，已加守卫
+`throttle_semantic_traps_defaults_are_documented` 钉住）：
+
+| 字段 | 名字看起来 | 真实后果 |
+|---|---|---|
+| `cooldownEnabled=false` | 「不用冷却功能」 | 429 过的号**不被跳过、立刻可重选** ⇒ 换号 = 原地打转 |
+| `inboundQueueTimeoutPassthrough=true` | 「排队超时别拒绝」 | 整形层退化成**延迟器**（排队 5s 后放行）；前面有重试外挂时"放行"等于鼓励它立刻重发 ⇒ 整形反而是放大器的润滑剂 |
+| `inboundRpmAuto`（代码默认 **true**，线上刻意 **false**） | 「自动调挺好」 | 内置 AIMD 是单向棘轮，锁死在下限（详见上文）。线上关掉是对的 |
+
+**放大链**（用实读参数算，非估算）：
+
+**⚠️ 先看这条：配置值上限 ≠ 实际放大。** 2026-08-11 曾按配置值推算「最坏 480×」
+（`SWAP_MAX_ATTEMPTS=60` × 客户端 2× × 网关 4×），**当天实测 shield 日志（84261 行）推翻**：
+
+| | 按配置推算 | 实测 |
+|---|---|---|
+| shield 每请求尝试 | 最坏 60 次 | **最大 7 次**（成功请求均 4.27、放弃的均 5.84） |
+| 总放大 | 480× | **约 5.6×** |
+
+原因：19579 次判定**全部落 `[passthrough]` 分支，零 `swap`/`cool`/`retry`**
+⇒ `SWAP_MAX_ATTEMPTS=60` 从未被触及。真正生效的是 `MAX_ATTEMPTS=10` 配合
+`MAX_BUDGET_SECS=30`，而最大只到 7 次说明**30s 预算先耗尽、次数上限用不到**。
+
+⇒ **改 `SWAP_MAX_ATTEMPTS` 不会有任何效果**（死配置）。要压 shield 的放大，
+动的应该是 `MAX_BUDGET_SECS`（当前 30s）。
+
+复核命令（每次下结论前跑，别信本表）：
+```bash
+ssh skiapi 'docker logs skiapi-shield-k2cc 2>&1 | sed "s/\x1b\[[0-9;]*m//g" \
+  | grep -oE "after [0-9]+ attempts" | grep -oE "[0-9]+" \
+  | awk "{n++;s+=\$1;if(\$1>m)m=\$1} END{printf \"n=%d avg=%.2f max=%d\\n\",n,s/n,m}"'
+ssh skiapi 'docker logs skiapi-shield-k2cc 2>&1 | grep -oE "\[(cool|swap|retry|auth|perm|passthrough)\]" | sort | uniq -c'
+```
+
+线上那两个陷阱的组合（`passthrough=true` + `cooldown=false`）**方向相同、都放开**，
+所以外层放大能完整穿透（幅度见上表实测值，不是推算的 480×）。⇒ 2026-08-11 新增 `throttleProfile` 三档
+（`shielded` / `direct` / `manual`）把这几个关键开关成组管住，
+**默认 `manual` 不覆盖任何字段**（线上那 7 个受管字段全部显式写过，
+无条件覆盖会改写生产配置；两条应用路径的差异见 `ThrottleProfile` 文档）。
+
+### 🔴 改客户端可见的状态码或文案前，先 grep 仓外消费者（2026-08-11 实测）
+
+`kiro_shield.py` 的 `classify()` **按 body 文案分类，不按状态码**，且只有
+`verdict ∈ {cool, auth}` 才读我们的 `Retry-After`：
+
+```python
+if verdict in ("cool","auth"): delay = cool_delay(attempt, Retry-After)  # 听真值
+else:                          delay = swap_delay(attempt)               # 本地阶梯
+```
+
+⇒ 吸收层/预算耗尽的 503 文案**必须含 `COOLING_MARKERS` 词**（现用「等容量」），
+否则落 `retry` 兜底、我们算的 `Retry-After` 被整个丢弃、改走 20→60s 阶梯。
+已加守卫 `absorb_503_body_must_carry_shield_cooling_marker`（实测删 marker 必红）。
+
+核对命令：`ssh skiapi 'grep -A12 COOLING_MARKERS /opt/skiapi/services/kiro_shield.py'`
+
 ### 线上真实链路里还有一个外挂（不在本仓库）
 
 ```
@@ -433,24 +500,41 @@ Rust 2024 edition。提交遵循 Conventional Commits（中文描述，动词开
 **本机（MacBook Air M2 / 8GB）编不过、也编不了**：
 - `cargo build/test` 缺 `admin-ui/dist` → rust-embed E0599（与代码质量无关）
 - `admin-ui` 无 `node_modules`（网络受限装不上 pnpm 依赖）
-- ⇒ **想确认代码能编译/测试通过，必须在 `skiapi` 服务器上用 Docker**：
+- ⇒ **想确认代码能编译/测试通过，必须在 `skiapi` 服务器上用 Docker**。
+
+**验证循环（2026-08-11 实测，当前唯一可用流程）**：仓库里**已没有
+`Dockerfile.verify`**（旧文档记载已过期）。现用 `Dockerfile` 的 `builder`
+target + 持久化 target-cache 卷：build 只编译、测试用 `docker run` 显式跑，
+退出码来自 cargo 本身，不存在「测试被构建缓存吞掉」的坑。build 层缓存命中时
+秒级出结果（依赖只编一次，增量改动 = 重编改动文件）。
 
 ```bash
-# 本地打快照 → scp → 服务器容器内编译验证（Dockerfile.verify 的 verify target = check+test+build）
+# 1) 本地：快照（临时 index，绝不 git add/commit/checkout）→ scp
+cd /Users/dwgx/Documents/WorkSpace/Project/kirostudio
 export GIT_INDEX_FILE=/tmp/ci.index && rm -f "$GIT_INDEX_FILE"
-git read-tree HEAD && git add -A -- src admin-ui/src admin-ui/tests
+git read-tree HEAD && git add -A -- src          # 后端改动只加 src
 TREE=$(git write-tree)
-C=$(git commit-tree "$TREE" -p HEAD -m "ci")
+C=$(git commit-tree "$TREE" -p HEAD -m ci)
 git branch -f ci/verify-adaptive "$C"
 unset GIT_INDEX_FILE
 git archive --format=tar ci/verify-adaptive -o /tmp/kv.tar
 scp -q /tmp/kv.tar skiapi:/tmp/kv.tar
-ssh skiapi 'mkdir -p /tmp/kiro-verify && cd /tmp/kiro-verify && rm -rf src admin-ui && tar -xf /tmp/kv.tar && docker build --no-cache -f Dockerfile.verify --target verify -t kv:x . > /tmp/b.log 2>&1; echo exit=$?; grep -E "test result|error\[E" /tmp/b.log | head'
+
+# 2) 服务器：解包 → build → 显式跑全量测试
+ssh skiapi 'cd /tmp/kiro-verify && rm -rf src && tar -xf /tmp/kv.tar && \
+  docker build -f Dockerfile --target builder -t kv:x . > /tmp/b.log 2>&1 && echo BUILD=ok && \
+  docker run --rm -w /app -v /tmp/kiro-verify/target-cache:/app/target kv:x sh -c \
+  "cargo test --no-default-features 2>&1 | tail -6"'
+
+# 3) 新增/改过的测试必须按名单独再跑一次，确认真的执行了（而不是被 filter 吞掉）
+ssh skiapi 'docker run --rm -w /app -v /tmp/kiro-verify/target-cache:/app/target kv:x sh -c \
+  "cargo test --no-default-features <测试名> 2>&1 | tail -4"'
 ```
 
-⚠️ **必须 `--no-cache`**：缓存命中时不会真跑测试，`exit=0` 不代表通过
-（Dockerfile 里 `cargo test | tail` 让退出码来自 `tail`）。一定要看到
-`test result: ok. NNNN passed` 才算绿。
+⚠️ **判定标准**：必须看到 `test result: ok. NNNN passed; 0 failed` 才算绿；
+build 失败看 `/tmp/b.log`（`grep -E "error\[E|^error"` 拿行号）。
+⚠️ `/tmp/kiro-verify` 在 VPS 重启后清空；重建依赖层约 5 分钟，之后走缓存。
+⚠️ 改了前端（admin-ui）走的是另一条路，见下「改了前端还要单独同步 dist」。
 
 **部署**（后端）：
 ```bash
@@ -490,6 +574,26 @@ ssh skiapi 'DB=/opt/skiapi/data/kirostudio/usage/traces.db; sqlite3 "$DB" "SELEC
    5 类真实缺陷被 CI 抓出：`r#"..."#` 内容以引号结尾导致 raw string 提前闭合、
    `///` 文档注释用在函数参数（Rust 不允许）、cap 触发后重入死循环、
    截断结果超出契约、测试 helper 喂裸字符串给需要 JSON 对象的函数。
+8. **测试绿 ≠ 守卫有效。写完守卫必须实测"删掉目标它会不会红"**（2026-08-11 实测）。
+   本轮靠这一步抓到全轮最隐蔽的 bug：函数内 `macro_rules!` 靠**捕获**外层局部变量
+   （`if !explicit.contains(...)`），而宏卫生性让标识符在**定义处**语境解析、
+   解析不到那个绑定 ⇒ **检查形同不存在** ⇒ 它唯一要守的契约（不覆盖用户显式配置）
+   静默失效。全套测试当时是**绿的**，守卫在、被守护的逻辑是空的。
+   ⇒ 函数内宏要用的外层变量**显式当参数传进去**，别靠捕获。
+   ⇒ 破坏实验要**类型等价**（改成 `let x = ...; if let Some(_) = x` 这类），
+   直接删字段会引入编译错误，测不到守卫本身。
+9. **守卫用「找某标记第一次出现的位置」切分生产代码区时，注释里不能出现该标记的字面量**
+   （2026-08-11 踩两次：`upstream_hops += 1` 与 `#[cfg(test)]`）。
+   注释命中会让切分点提前、生产区被截断，守卫**静默变绿**。描述某个代码标记时刻意绕开它。
+10. **改客户端可见的状态码/文案前，先 grep 仓外消费者**（见上文 shield `COOLING_MARKERS` 那节）。
+    仓库内做对了不等于链路上做对了。
+11. **配置值上限 ≠ 实际放大：读到一个上限值就推算后果 = 算空气**（2026-08-11 实测）。
+    当天按 `SWAP_MAX_ATTEMPTS=60` 推算 shield「最坏 480×」并据此把它定为"整条链最大的
+    单一放大源"、列成待改项；实测日志后推翻 —— 19579 次判定**全部落 `[passthrough]`
+    分支、零 `swap`**，那个 60 从未被触及，真实放大**约 5.6×**（每请求最大 7 次）。
+    ⇒ 判断一个配置的影响，先确认**它所在的那条分支实际有没有被走到**，再谈它的值。
+    这与「容量口径是假的」是同一类错误的两种形态：一个是自乘出来的假数，
+    一个是根本没生效的上限。两者都会让人对着不存在的瓶颈调参。
 
 ### 关键架构结论（三方对比 + 对抗评审确立，别推翻）
 
@@ -502,6 +606,16 @@ ssh skiapi 'DB=/opt/skiapi/data/kirostudio/usage/traces.db; sqlite3 "$DB" "SELEC
 - **模型映射**（进行中，用户已拍板）：全局扁平 map + 每凭据豁免；用量记
   原始名 + 映射后名两维度；映射后不再判白名单（生态主流，豁免是安全阀）；
   先映射再 deepseek 归一化。
+- **P1 移植甄别结论（2026-08-11，双向对比 Kiro-RS-Tool @795b9ca）**：6 项本仓已是超集
+  （工具适配 / Write-Edit-Read / 半截 JSON / XML 泄漏过滤 / profileArn / 缓存方向），
+  参考仓有吞字 bug 等，**不移植**。2 项已移植：
+  - **native effort 映射**（`native_thinking_effort_enabled`，**默认关**）：往上游注
+    `additionalModelRequestFields.output_config.effort`（参考仓实测只有它能触发
+    reasoningContentEvent）。白名单 4 模型（opus-4.8/4.7 五档含 xhigh；4.6/sonnet-4.6
+    四档），守卫钉住白名单⊆model_catalog。默认关是刻意的（未线上实测）。
+  - **缓存 fingerprint 模拟器**（cache 链 Layer 3）：`anthropic/cache_fingerprint.rs`，
+    纯内存（无持久化/后台线程），最长公共前缀命中 + 会话隔离（种子=完整 user_id）。
+    签名剔除工具块漂移 id + JSON canonicalize（否则工具对话 read 恒 0）。
 
 ## 相关文档
 

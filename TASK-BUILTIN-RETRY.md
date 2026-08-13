@@ -340,3 +340,28 @@ cd admin-ui && npx tsc --noEmit
 3. **fan-out subagent 时注意**：agent 调用走的正是 `k1ro.skiapi.dev`（我们自己的网关），
    号池紧张时 8 路并行必然打穿它 —— 上一轮 fleet 被 502 打死 **5 次**。
    建议 agent 只做只读侦察、并发 ≤3，写代码由主线串行做。
+
+---
+
+## 7. 遗留缺口登记（2026-08-11 全仓审计）
+
+### /cc/v1 无压缩重试循环（P0-2 覆盖缺口）
+
+- **现象**：`post_messages_cc`（/cc/v1）没有 `'compress_retry` 循环（/v1 有，handlers.rs:2084）。
+  上游回 `CONTENT_LENGTH_EXCEEDS_THRESHOLD` 时 /cc/v1 直接以 400 返回——CC 客户端（默认
+  buffered 分发 + 超限高发场景）拿不到压缩自愈。
+- **现状**：`x-kirostudio-compress-retry` 内部头已在 /cc/v1 与 websearch 回灌路径 strip
+  （2026-08-11 修复，防泄漏），但**重试能力本身未补**。
+- **补法（评估）**：把 /v1 的循环结构（~95 行 + state 克隆）复用到 /cc/v1 或提取公共
+  dispatch；规模约 100-150 行 + 守卫测试调整。**待用户拍板后做**。
+- **相关**：websearch 回灌路径同样无压缩重试（多轮回灌上下文膨胀，触发概率不低）。
+
+### 其他登记（详见各审计文件）
+
+- 10 路审计详细发现：/tmp/audit-*.md（handlers/websearch/converter/stream-cache/provider/
+  kiro-model/admin/adminui/usage/crosscut），本机临时目录，重启即失——**关键项已摘要入
+  CURRENT.md 与本节**。
+- 未修项（待决策）：websearch 整轮缓冲行为变更（TTFB 退化）、usage by_model/by_requested_model
+  双口径复制品、token_manager 计数器清零不对称、cli_ua_align_real_client 半接线、
+  前端 4 项（dashboard marquee 未滤 disabled、modelMapping 非法 JSON 仍提交、
+  credential-card 豁免开关位置、contextmenu 未 preventDefault）。
