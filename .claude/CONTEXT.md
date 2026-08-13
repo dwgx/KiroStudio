@@ -37,4 +37,7 @@ Docker 部署，配置在 `config.json`（`config.example.json` 是模板）。
 - 有 `.codegraph/` 索引，先 `codegraph explore` 再 grep
 - 搜内容用 `rg` 不用 `grep`，找文件用 `fd` 不用 `find`
 - 读文件用 Read 工具不用 `cat`/`head`
+- **验证**：本机编不过，必须走服务器 Docker「验证循环」（快照→scp→`docker build
+  --target builder`→`docker run` 显式跑 `cargo test --no-default-features`），
+  完整命令见 `CLAUDE.md`；`Dockerfile.verify` 已不存在，勿引用旧命令。
 - 涉及 key/secret 先读 `~/.claude/SECRETS.md`，值绝不 echo/写文件/进 commit
