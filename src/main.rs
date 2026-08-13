@@ -542,6 +542,10 @@ async fn main() {
     // 同风格：启动即接线，admin 改配置后调同一个 setter 即时生效。
     anthropic::set_prompt_cache_enabled(config.prompt_cache_enabled);
 
+    // Kiro 原生 effort 开关：播种进 converter 的 TIER3 进程镜像（默认关 = 行为逐字节
+    // 不变；开 = 白名单模型 + thinking 走 output_config.effort 原生通道而非 XML 标签）。
+    anthropic::set_native_thinking_effort_enabled(config.native_thinking_effort_enabled);
+
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
         Some(kiro_provider),

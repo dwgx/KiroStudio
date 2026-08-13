@@ -16,7 +16,7 @@ use bytes::Bytes;
 use futures::TryStreamExt;
 
 use crate::common::http_read::read_body_capped;
-use crate::http_client::build_streaming_client_no_redirect;
+use crate::http_client::{ProxyConfig, build_streaming_client_no_redirect};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::passthrough_think_filter::{
     filter_json_bytes_with, filter_sse_stream_with, guard_empty_stream,
@@ -27,6 +27,95 @@ use crate::model::config::TlsBackend;
 /// 纯防御上限，防恶意上游吐超大 body 顶爆内存。
 const PASSTHROUGH_JSON_CAP_BYTES: u64 = 32 * 1024 * 1024;
 
+/// 上游模型列表的读取上限。模型列表是**外部可控**数据（上游被劫持/DNS 投毒时可无上限
+/// 放大内存），而 `resp.json()` 会把整个 body 无上限读进内存 —— 本仓
+/// `common/http_read.rs` 已把这条点名为 OOM 反模式并收口了 `read_json_capped`。
+/// 4 MiB 对模型列表绰绰有余（几百个模型也只有几十 KB）。
+const PASSTHROUGH_MODELS_CAP_BYTES: u64 = 4 * 1024 * 1024;
+
+/// 透传出站 client 缓存：key = `(effective_proxy, tls_backend)`。
+///
+/// # 🔴 这是 `error sending request for url` 的结构性根因修复
+///
+/// 改前 `forward` **每次请求**都调 `build_streaming_client_no_redirect` 新建一个
+/// `reqwest::Client`。每个 Client 自带独立连接池，用完即弃 ⇒ 每请求重开 TCP +
+/// 重做 TLS 握手（1-2 RTT）+ 重新解析系统代理（crate 开了 system-proxy feature）。
+/// 高并发下 ephemeral 端口与 TIME_WAIT 堆积，握手延迟白加在 connect_timeout 里，
+/// 表现为**间歇性** `error sending request`（线上 10:35/10:46/11:00 三次，
+/// 而 `api.skiapi.dev` 实测是活的 —— 不是上游挂了）。
+///
+/// 主路径 `provider.rs::client_for` 早就做对了（`client_cache: Mutex<HashMap>`），
+/// **只有透传路径漏了这层**。这里同构复用那个范式，不新造缓存机制。
+///
+/// 用 `OnceLock` 而非 provider 字段：透传是自由函数（`forward` / `fetch_upstream_models`），
+/// 没有 `&self` 可挂；且 Client 内部本就是 `Arc`，进程级共享一份连接池正是我们要的。
+static PASSTHROUGH_CLIENTS: std::sync::OnceLock<
+    parking_lot::Mutex<std::collections::HashMap<(Option<ProxyConfig>, TlsBackend), reqwest::Client>>,
+> = std::sync::OnceLock::new();
+
+/// 取（或懒建并缓存）透传出站 client。
+///
+/// `idle_secs` 只在**首次**建该 key 的 client 时生效 —— 这是刻意的：同一个
+/// (proxy, tls) 组合复用同一个连接池才有意义，为不同 idle 超时各建一份会把池打散、
+/// 退化回改前的行为。`forward`(720s 长流) 与 `fetch_upstream_models`(30s) 因此共享
+/// 同一个 client，用 720s 的宽松 read_timeout —— 对模型列表这种短请求无害
+/// （它有自己的整体超时由调用方控制），而反过来（用 30s）会把长流式响应掐断。
+fn passthrough_client(
+    proxy: Option<&ProxyConfig>,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<reqwest::Client> {
+    let cache = PASSTHROUGH_CLIENTS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let key = (proxy.cloned(), tls_backend);
+    // 临界区只做 HashMap 查找与 Arc clone（Client 是 Arc 包装），无 IO、无 await。
+    if let Some(c) = cache.lock().get(&key) {
+        return Ok(c.clone());
+    }
+    // 建 client 放在锁**外**：build 会解析代理 URL / 初始化 TLS，不该持锁做。
+    // 竞态下可能有两个线程各建一份，用 entry().or_insert_with 收敛成一份，
+    // 多建的那个直接被丢弃（无副作用，只浪费一次构造）。
+    let built = build_streaming_client_no_redirect(proxy, 720, tls_backend)?;
+    let mut guard = cache.lock();
+    Ok(guard.entry(key).or_insert(built).clone())
+}
+
+/// 🔴 P4：按白名单把上游响应头透传给客户端。
+///
+/// 改前三个响应构造点只设 `content-type`，上游 429 的 `Retry-After`、`x-ratelimit-*`、
+/// `request-id` 全部丢弃。后果：客户端收到 429 却拿不到 `Retry-After`，只能用自己的固定
+/// 退避，与上游的 429 节奏互相放大碰撞（配合 P1 的重试叠乘，是线上 429 风暴的一环）。
+///
+/// 白名单而非全量透传：`content-length` 必须排除（body 被过滤/改写或流式时它会错），
+/// `transfer-encoding` 必须排除（帧结构由 axum 自己写）。这两个透传会让客户端读到
+/// 矛盾的 body 边界 → 解析错乱。
+fn apply_upstream_response_headers(
+    mut builder: axum::http::response::Builder,
+    upstream_headers: &axum::http::HeaderMap,
+) -> axum::http::response::Builder {
+    for (name, value) in upstream_headers.iter() {
+        let n = name.as_str();
+        let allow = n == "retry-after"
+            || n == "request-id"
+            // 🔴 `content-encoding` 必须透传（2026-08-09 `Failed to parse JSON` 的兜底半边）。
+            //
+            // body 是**原样字节流转发**的（`Body::from_stream(byte_stream)` 不解压），
+            // 所以上游若回 gzip，客户端必须看到 `content-encoding: gzip` 才知道要解压。
+            // 改前不透传它 ⇒ 客户端把 gzip 字节当明文 JSON 解析 → `Failed to parse JSON`。
+            //
+            // 与上面「不转发 accept-encoding」配对：那条让上游默认不压缩（治本），
+            // 这条保证万一上游仍压缩（有些上游无视 accept-encoding）客户端也能正确解（兜底）。
+            // ⚠️ 两条必须同时存在。只做一条都有漏：只治本 → 遇到强制压缩的上游仍炸；
+            // 只兜底 → 依赖客户端一定支持该编码。
+            || n == "content-encoding"
+            || n.starts_with("x-ratelimit-")
+            || n.starts_with("anthropic-ratelimit-")
+            || n.starts_with("x-request-id");
+        if allow {
+            builder = builder.header(name.clone(), value.clone());
+        }
+    }
+    builder
+}
+
 /// 把一次 Anthropic 请求原样透传到自定义 API 上游,响应流式原样返回。
 ///
 /// - `cred`:命中的自定义 API 凭据(提供 base_url / api_key / 代理)。
@@ -36,19 +125,66 @@ const PASSTHROUGH_JSON_CAP_BYTES: u64 = 32 * 1024 * 1024;
 /// 返回 `(Response, StatusCode)`:Response 原样透传上游 status/body(失败为 502 错误响应);
 /// StatusCode 供调用侧(provider)据以推断 usage outcome 并做轻量结果计数。**只暴露 header 层
 /// status,body 仍原样流式回传,绝不解析上游 SSE**(隔离铁律 3)。
+// 🔴 **首字节（响应头）超时**（2026-08-10 补，实测缺口）。
+//
+// 为什么不能只靠 client 的 720s `read_timeout`：那个值是**流式空闲间隔**，
+// 刻意放宽到 720s 以防长回复被中途掐断（见 `passthrough_client` 的注释），
+// 但它同时也成了"等响应头"的上限 —— 上游若接受连接却永不回响应头，单跳就能挂 720s。
+//
+// 实测（2026-08-10 真打线上上游）：`claude-nonexistent-zzz` 这类不存在的模型，
+// k2cc 上游 **40s 不返回任何响应头**（TimeoutError），而 denzao 0.2s 就返 404。
+// 后果：透传 failover 的 45s 墙钟只在**每轮进循环时**判，所以第一跳就能把整条
+// 客户端请求拖到 720s，中间既不换号也不返回 —— 客户端与 trace 里都看不到任何记录
+// （实测该请求在日志里只有一条 "Received"，之后彻底静默）。
+//
+// 🔴 **原取 30s 是错的，2026-08-10 同日改为 90s。**
+//
+// 原依据写「健康上游响应头延迟实测 0.2~6s」—— 那个数字来自**健康**上游，
+// 而真实工况下代挂上游（kiro2cc）的响应头延迟 **p50=12.7s / p90=30.0s**。
+// 把阈值设在 p90 上，等于**按设计砍掉一成正常请求**。
+//
+// 铁证（线上 traces，同日实测）：
+// - 44 条请求在 **30.7s** 后才出响应头、且最终 **200 成功** —— 它们被 30s 白白掐死
+// - 82 条卡在 30s 被掐断，两者合计占样本的 **12%**
+// - 成功请求的最大延迟恰好是 **29.8s** —— 分布被阈值截断的典型指纹
+//   （需要 >30s 的请求全被杀掉，所以"成功"样本里永远见不到 >30s）
+// - 因果链数量级 1:1 对应（120min 窗）：30s 超时 64 → 换号 106 → 全池冷却 429 **71**
+//
+// 为什么池里只有 1 个可用号时后果被放大：超时 → 判该号不可用 → 换号 → 无号可换
+// → 全池冷却 → **429 给客户端**。单号池下「换号」这个补救动作必然失败。
+//
+// 取 90s 的理由：
+// - 覆盖 p90(30s) 与观测到的 p95(45s)，留足余量到长尾（实测 >25s 的成功请求仅占 0.7%
+//   ⇒ 放宽阈值的代价极小，收益是救回那 12%）；
+// - 仍**远小于** 720s read_timeout，保住「彻底卡死的连接不会拖满 12 分钟」这个初衷
+//   —— 那才是本超时存在的真正理由（防第一跳静默拖死整条请求）；
+// - ⚠️ 它现在**大于** 45s 墙钟，所以「单跳超时 → 换号」不再保证发生在墙钟内。
+//   这是**刻意的取舍**：单号池下换号本来就救不了（无号可换），
+//   与其在 30s 掐断一个本会成功的请求去换一个不存在的号，不如让它跑完。
+//   多号池下墙钟仍会在下一轮循环顶部生效，不会无限拖。
+pub const FIRST_BYTE_TIMEOUT_SECS: u64 = 90;
+
 pub async fn forward(
     cred: &KiroCredentials,
     raw_body: Bytes,
     global_proxy: Option<&crate::http_client::ProxyConfig>,
     tls_backend: TlsBackend,
     global_deepseek_cfg: &crate::kiro::deepseek_normalize::DeepseekNormalizeConfig,
-) -> (Response, StatusCode) {
+    // 全局模型映射规则（`config.model_mapping`，调用方每次请求快照一次）。
+    // 在 `forward` **内部**应用：与 deepseek 归一化同处，可保证「先映射 → 再归一化」
+    // 的顺序，且 `select_custom_api` 选号（映射前）与改写（映射后）自然分层。
+    model_mapping: &std::collections::HashMap<String, String>,
+    // 客户端原始请求头（P3：按白名单转发 `anthropic-beta` 等；`None` = 不转发任何客户端头）。
+    client_headers: Option<&header::HeaderMap>,
+) -> (Response, StatusCode, String) {
     let base = match cred.base_url.as_deref() {
         Some(b) if !b.trim().is_empty() => b.trim_end_matches('/').to_string(),
         _ => {
             return (
                 err_response(StatusCode::BAD_GATEWAY, "自定义 API 凭据缺少 base_url"),
                 StatusCode::BAD_GATEWAY,
+                // 本地错误（还没打到上游）：无上游错误体，给空串。
+                String::new(),
             );
         }
     };
@@ -64,7 +200,9 @@ pub async fn forward(
     // **禁重定向**(SSRF 纵深):写入 base_url 时已校验目标非内网,但公网中转站若返回
     // 302→内网/元数据仍能绕过,禁重定向堵死这条链。base_url 的 IP 层校验在写入时做。
     let proxy = cred.effective_proxy(global_proxy);
-    let client = match build_streaming_client_no_redirect(proxy.as_ref(), 720, tls_backend) {
+    // 🔴 复用缓存 client（见 `passthrough_client` 的文档）：改前这里每请求新建，
+    // 是线上间歇性 `error sending request` 的结构性根因。
+    let client = match passthrough_client(proxy.as_ref(), tls_backend) {
         Ok(c) => c,
         Err(e) => {
             return (
@@ -73,6 +211,7 @@ pub async fn forward(
                     &format!("构建透传 client 失败: {e}"),
                 ),
                 StatusCode::BAD_GATEWAY,
+                String::new(),
             );
         }
     };
@@ -97,15 +236,42 @@ pub async fn forward(
         } else {
             None
         };
-    let body_bytes: Bytes = match &ds_cfg {
-        Some(cfg) => match serde_json::from_slice::<serde_json::Value>(&raw_body) {
+    // body 处理链：**先映射 → 再 deepseek 归一化**（顺序承重，反序会让 deepseek 先
+    // 把名压成 fallback、映射规则再也匹配不到原始名）。模型映射只对 custom_api 号在
+    // 非豁免时生效；`select_custom_api` 选号用**映射前**名（决定 3：白名单管原始名）。
+    //
+    // ⚠️ 一个**设计明确接受的不对称**（非 bug，见 `model_mapping` 模块文档）：选号侧
+    // 预判的是 deepseek 改写后的名（`token_manager.rs` select_custom_api），映射不进
+    // 预判 ⇒ 「映射后名该号上游不认」时仍可能选中该号 → 上游 400，由凭据豁免覆盖。
+    let exempt = cred.model_mapping_exempt == Some(true);
+    let body_bytes: Bytes = {
+        let parsed = serde_json::from_slice::<serde_json::Value>(&raw_body);
+        match parsed {
             Ok(mut v) => {
-                crate::kiro::deepseek_normalize::normalize_request(&mut v, cfg);
+                // ① 全局模型映射（非豁免时）。透传请求体的模型名在顶层 `model` 字段
+                // （Anthropic 格式），与 Kiro 主路径的
+                // `/conversationState/currentMessage/userInputMessage/modelId` 不同。
+                if !exempt {
+                    if let Some(model) = v.get("model").and_then(|m| m.as_str()) {
+                        if let Some(target) =
+                            crate::kiro::model_mapping::map_target(model, model_mapping)
+                        {
+                            v["model"] = serde_json::json!(target);
+                        }
+                    }
+                }
+                // ② deepseek 归一化（仅该号开启时）。
+                if let Some(cfg) = &ds_cfg {
+                    crate::kiro::deepseek_normalize::normalize_request(
+                        &mut v,
+                        cfg,
+                        cred.allowed_models.as_deref(),
+                    );
+                }
                 serde_json::to_vec(&v).map(Bytes::from).unwrap_or_else(|_| raw_body.clone())
             }
             Err(_) => raw_body.clone(), // 非 JSON(理论不该出现),回落原样透传
-        },
-        None => raw_body.clone(),
+        }
     };
 
     // 组装转发请求:换上该凭据的 api_key(Anthropic 双头兼容:x-api-key + Authorization),
@@ -121,7 +287,77 @@ pub async fn forward(
             .header(header::AUTHORIZATION, format!("Bearer {key}"));
     }
 
-    let upstream = match req.send().await {
+    // 🔴 P3：**客户端请求头按白名单转发**。
+    //
+    // 改前只设上面四个头，客户端的 `anthropic-beta` 被整个丢掉 —— 而 1M 上下文变体
+    // **依赖**这个头（主路径 `endpoint/ide.rs` 对 1M 变体显式注入
+    // `anthropic-beta: context-1m-2025-08-07`，`model_catalog.rs` 说明 `[1m]` 变体依赖它）。
+    // ⇒ 1M 变体走代挂路径时上游拿不到该头、1M 窗口不被放开。这是与主路径的**实际行为
+    // 偏差**（线上 2h 内实测有 32 次 1M 请求），不是规范洁癖。
+    //
+    // 白名单而非黑名单：转发未知头有真实风险（`host`/`content-length` 会让上游收到
+    // 矛盾的元信息，`authorization` 会把客户端 key 泄给中转站）。所以只放行确定安全的。
+    if let Some(src) = client_headers {
+        for (name, value) in src.iter() {
+            let n = name.as_str();
+            // 🔴 `accept-encoding` **刻意不转发**（2026-08-09 排查 `Failed to parse JSON`）。
+            //
+            // 因果链：reqwest 没开 gzip/brotli feature（Cargo.toml 的 reqwest features 无
+            // gzip/deflate/brotli）→ 它不会自动发 `accept-encoding`，也不会自动解压。
+            // 若我们把客户端的 `accept-encoding` 原样转发，上游会真的回 gzip 压缩体，
+            // 而网关拿到的 body 是**压缩字节**、又不透传 `content-encoding` 标记
+            // ⇒ 客户端按明文 JSON 解析 gzip → `Failed to parse JSON`。
+            //
+            // 修法：不透传 `accept-encoding`（让 reqwest 不发压缩请求），同时下面
+            // `apply_upstream_response_headers` 透传 `content-encoding` 兜底（万一上游
+            // 仍回压缩体，客户端能识别）。两条配合，任何上游都不会再触发这个错。
+            let allow = n == "anthropic-beta"
+                || n == "accept"
+                // x-stainless-*：Anthropic SDK 的客户端标识；部分上游按它判断行为。
+                || n.starts_with("x-stainless-");
+            if !allow {
+                continue;
+            }
+            // ⚠️ 刻意**不**转发这些（各有具体理由，别"顺手"加回来）：
+            // - host / content-length / transfer-encoding / connection：本层重写，
+            //   转发会让上游收到与实际 body 矛盾的元信息。
+            // - authorization / x-api-key：已换成本凭据的 key，转发客户端的等于泄露。
+            // - x-forwarded-*：`trustForwardedHeader` 保持 false 是刻意的
+            //   （sub2api 不转发 XFF，开了也拿不到真实 IP，反而会让 IP 黑名单封掉反代自己）。
+            req = req.header(name.clone(), value.clone());
+        }
+    }
+
+    let send_fut = req.send();
+    let sent = match tokio::time::timeout(
+        std::time::Duration::from_secs(FIRST_BYTE_TIMEOUT_SECS),
+        send_fut,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_elapsed) => {
+            tracing::warn!(
+                base_url = %base,
+                timeout_secs = FIRST_BYTE_TIMEOUT_SECS,
+                "[透传] 上游 {}s 未返回响应头，判定该号本次不可用并换号（不动 720s read_timeout，\
+                 长回复传输不受影响）",
+                FIRST_BYTE_TIMEOUT_SECS
+            );
+            // 归 502：与「连接层失败」同类（都没拿到上游语义响应），调用侧的
+            // `should_failover` 对 5xx 会换号，正是我们要的处置。
+            return (
+                err_response(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("透传上游 {FIRST_BYTE_TIMEOUT_SECS}s 未返回响应头"),
+                ),
+                StatusCode::BAD_GATEWAY,
+                // 用 `connect_error:` 前缀与连接层失败保持同一归类前缀，便于 trace 侧统计。
+                format!("connect_error: first byte timeout after {FIRST_BYTE_TIMEOUT_SECS}s"),
+            );
+        }
+    };
+    let upstream = match sent {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("[透传] 上游请求失败({}): {e}", url);
@@ -129,6 +365,9 @@ pub async fn forward(
             return (
                 err_response(StatusCode::BAD_GATEWAY, &format!("透传上游请求失败: {e}")),
                 StatusCode::BAD_GATEWAY,
+                // 连接层失败：把 reqwest 错误文本作为"上游错误体"透出，供调用侧分类
+                // （它能区分超时/DNS/TLS，与上游真返的 4xx/5xx 语义不同）。
+                format!("connect_error: {e}"),
             );
         }
     };
@@ -141,6 +380,50 @@ pub async fn forward(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json")
         .to_string();
+
+    // 🔴 P4 前置：**非 2xx 时把上游错误体读出来**（成功响应绝不碰，仍走原样流式）。
+    //
+    // 为什么必须读：改前上游的真实错误被完全丢弃，日志里只剩一个 `status=502` /
+    // `status=400`。而线上实测这些码背后是**完全不同的故障**，处置方式也不同：
+    //   - `{"type":"GoUsageLimitError","message":"Weekly usage limit reached. Resets in 19hr"}`
+    //     → 额度用尽（该号今天别再选了）
+    //   - `{"message":"Invalid tool use format.","reason":"REQUEST_BODY_INVALID"}`
+    //     → 请求体问题，但**换个上游可能就认**（5 个代挂号指向 5 个不同上游）
+    //   - `{"message":"Invalid model...","reason":"INVALID_MODEL_ID"}`
+    //     → 该上游不认这个模型，换号可能成功
+    // 不读 body 就无法区分，只能一律当"客户端错误"直返 —— 那正是下游吃到错误的原因。
+    //
+    // 上限 64 KiB：错误 JSON 都很小；给足余量又不至于被恶意上游用超大 body 顶爆内存。
+    // 读失败/超限时退化成空串（fail-open：宁可少一条诊断信息，也不改变转发行为）。
+    const UPSTREAM_ERR_PEEK_CAP: u64 = 64 * 1024;
+    if !status.is_success() {
+        // ⚠️ 必须在 read_body_capped **之前**克隆响应头 —— 它会消费 `upstream`。
+        // P4 的关键场景就在这条路径上：429 的 `Retry-After` 只有这里能拿到。
+        let upstream_headers = upstream.headers().clone();
+        let err_body = read_body_capped(upstream, "透传上游错误体", UPSTREAM_ERR_PEEK_CAP)
+            .await
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).trim().to_string())
+            .unwrap_or_default();
+        // 日志按长度截断，避免超长 body 刷爆日志（诊断只需要开头那段 message/reason）。
+        let peek: String = err_body.chars().take(400).collect();
+        tracing::warn!(
+            status = status.as_u16(),
+            base_url = %base,
+            upstream_error = %peek,
+            "[透传] 上游返回非 2xx —— 上游错误原文（供分类：额度/模型/请求体）"
+        );
+        // body 已被消费，只能重新构造响应回给客户端（内容逐字节保持上游原文）。
+        let resp = apply_upstream_response_headers(
+            Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, content_type),
+            &upstream_headers,
+        )
+            .body(Body::from(err_body.clone()))
+            .unwrap_or_else(|_| err_response(status, "构造上游错误响应失败"));
+        return (resp, status, err_body);
+    }
 
     // 原样把上游字节流转回客户端——不解析、不改写。上游怎么发,客户端怎么收。
     //
@@ -165,40 +448,68 @@ pub async fn forward(
     // 注:这里**不会**因为返回 Err 而形成自旋——实测 reqwest 的 `bytes_stream` 出错后
     // 下一次 poll 返回 `None`,不重复吐同一个 Err;且 `map`/`map_err` 都不改变终止时机。
     //
-    // ⚠️ deepseek 归一化时的响应侧 thinking 过滤:仅 `deepseek_normalize=true` 启用,
-    // 其余 custom_api 保持零转换字节流（隔离铁律 3）。流式逐事件滤 thinking 块仍流式回传;
-    // 非流式读完整 body 滤 thinking content blocks。解析失败 fail-open 原样透传。
+    // ⚠️ 响应侧过滤分两层，门控不同（2026-08-10 拆开，理由见下方 `strip_dsml_only_ok`）：
+    // - **thinking 块过滤**（滤 thinking/redacted_thinking 块 + index 重编号 + usage 扣减）：
+    //   改协议结构，仅 `deepseek_normalize=true` 启用，其余号保零转换（隔离铁律 3）。
+    // - **DSML 标记剥离**：所有 custom_api 号无条件启用 —— 上游就是 DeepSeek 系，
+    //   标记泄漏与凭据配置无关。
+    // 流式逐事件处理仍流式回传;非流式读完整 body 处理。解析失败 fail-open 原样透传。
+    // 成功路径同样透传 P4 白名单头（x-ratelimit-* 让客户端能主动限速）。
+    // 同样必须在消费 upstream 之前克隆。
+    let upstream_headers = upstream.headers().clone();
+    // thinking 块过滤（含重编号、usage 扣减）仍只对 deepseek_normalize 凭据开启 ——
+    // 它改协议结构，是「零转换透传」的刻意例外，不能推给所有 custom_api 号。
     let filter_thinking = ds_cfg.is_some();
+    // 🔴 但**响应 filter 入口本身不能再由 `filter_thinking` 门控**。
+    //
+    // 改前入口条件是 `filter_thinking && ...`：没开 deepseek_normalize 的 custom_api 号
+    // 走纯字节透传分支 ⇒ DSML 标记剥离**根本不执行**，`<｜DSML｜function_calls｜>` 原样
+    // 泄漏给客户端（用户走代挂号拉 OpenZ 时看到的裸标记就是这条路径）。
+    //
+    // 而 DSML 泄漏与「客户端要不要 thinking」、「凭据有没有开归一化」都无关：
+    // custom_api 的上游就是 DeepSeek 系中转站，会吐这个标记的是上游模型本身。
+    // 所以 filter 一律接上，只把 thinking 块过滤按 `filter_thinking` 传下去 ——
+    // 关闭时 filter 只剥 text 里的 DSML 标记，thinking 块与 index 一律不动。
+    let strip_dsml_only_ok = content_type.contains("text/event-stream")
+        || content_type.contains("application/json");
     // 内联 `<thinking>` 剥离开关取配置（流式 + 非流式共用，cfg 已提到作用域）。
+    // ⚠️ 未开归一化的号取 `false`：内联 `<thinking>` 剥离属于 thinking 语义处理，
+    // 不该跟着 DSML 一起对所有 custom_api 号生效（DSML 是标记泄漏，两码事）。
     let strip_inline = ds_cfg
         .as_ref()
-        .map_or(true, |c| c.strip_inline_thinking);
+        .map_or(false, |c| c.strip_inline_thinking);
 
-    let resp = if filter_thinking && content_type.contains("text/event-stream") {
+    let resp = if strip_dsml_only_ok && content_type.contains("text/event-stream") {
         let byte_stream = upstream.bytes_stream().map_err(|e| {
             tracing::warn!("[透传] 上游流读取中断,以错误终止响应流(客户端可据此重试): {e}");
             axum::Error::new(e)
         });
-        Response::builder()
-            .status(status)
-            .header(header::CONTENT_TYPE, content_type)
+        apply_upstream_response_headers(
+            Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, content_type),
+            &upstream_headers,
+        )
             // ⚠️ 空流兜底：thinking 被滤光/上游真空响应时补发 error 事件，
             // 防客户端 "Stream ended without receiving any events" 卡死 agentic 循环。
             .body(Body::from_stream(guard_empty_stream(
-                filter_sse_stream_with(byte_stream, strip_inline),
-                "上游返回空响应（thinking 被过滤后无正文内容），请重试",
+                filter_sse_stream_with(byte_stream, strip_inline, filter_thinking),
+                "上游返回空响应（未收到任何正文内容），请重试",
             )))
             .unwrap_or_else(|_| err_response(StatusCode::BAD_GATEWAY, "构建透传响应失败"))
-    } else if filter_thinking && content_type.contains("application/json") {
+    } else if strip_dsml_only_ok && content_type.contains("application/json") {
         // 非流式:缓冲完整 body 过滤（Content-Length 本就不透传,无需重算）。
         // 用 read_body_capped 给 body 加 32MiB 上限,防恶意上游吐超大 JSON 顶爆内存。
         match read_body_capped(upstream, "透传非流式响应", PASSTHROUGH_JSON_CAP_BYTES).await {
             Ok(body) => {
                 // ⚠️ 非流式也要接 strip_inline_thinking 配置（与流式一致，否则配置 false 仍剥）。
-                let filtered = filter_json_bytes_with(&body, strip_inline);
-                Response::builder()
-                    .status(status)
-                    .header(header::CONTENT_TYPE, content_type)
+                let filtered = filter_json_bytes_with(&body, strip_inline, filter_thinking);
+                apply_upstream_response_headers(
+                    Response::builder()
+                        .status(status)
+                        .header(header::CONTENT_TYPE, content_type),
+                    &upstream_headers,
+                )
                     .body(Body::from(filtered))
                     .unwrap_or_else(|_| err_response(StatusCode::BAD_GATEWAY, "构建透传响应失败"))
             }
@@ -208,18 +519,28 @@ pub async fn forward(
             }
         }
     } else {
+        // 其余 content-type（既非 SSE 也非 JSON）：纯字节透传。
+        //
+        // 🔴 P2 的空流守卫在这里**不需要**了：SSE 与 JSON 现在一律走上面两条 filter 分支
+        // （`strip_dsml_only_ok` 覆盖两者），SSE 分支自带 `guard_empty_stream`。
+        // 而非 SSE 的 200 空响应对客户端是合法的（如某些 HEAD 语义），补发 SSE error
+        // 事件反而会破坏 content-type 契约 —— 故这条分支刻意不挂守卫。
         let byte_stream = upstream.bytes_stream().map_err(|e| {
             tracing::warn!("[透传] 上游流读取中断,以错误终止响应流(客户端可据此重试): {e}");
             axum::Error::new(e)
         });
-        Response::builder()
-            .status(status)
-            .header(header::CONTENT_TYPE, content_type)
-            .body(Body::from_stream(byte_stream))
-            .unwrap_or_else(|_| err_response(StatusCode::BAD_GATEWAY, "构建透传响应失败"))
+        apply_upstream_response_headers(
+            Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, content_type),
+            &upstream_headers,
+        )
+        .body(Body::from_stream(byte_stream))
+        .unwrap_or_else(|_| err_response(StatusCode::BAD_GATEWAY, "构建透传响应失败"))
     };
     // 返回上游真实 status 供调用侧推断 outcome(成功/限流/失败);body 已流式接管。
-    (resp, status)
+    // 第三项是上游错误体：**成功路径恒为空串**（2xx 的 body 是流式内容，绝不缓冲读取）。
+    (resp, status, String::new())
 }
 
 /// 探测自定义 API 上游的可用模型列表（`GET {base}/v1/models`，OpenAI 兼容格式）。
@@ -247,7 +568,9 @@ pub async fn fetch_upstream_models(
     };
 
     let proxy = cred.effective_proxy(global_proxy);
-    let client = build_streaming_client_no_redirect(proxy.as_ref(), 30, tls_backend)?;
+    // 同样复用缓存 client（与 `forward` 共享连接池 —— 打的是同一个上游 host，
+    // 分开建会把池打散，等于没修）。
+    let client = passthrough_client(proxy.as_ref(), tls_backend)?;
     let mut req = client.get(&url);
     if let Some(key) = cred.api_key.as_deref().filter(|k| !k.is_empty()) {
         req = req.header("Authorization", format!("Bearer {key}"));
@@ -259,10 +582,14 @@ pub async fn fetch_upstream_models(
     if !resp.status().is_success() {
         anyhow::bail!("上游返回 {} 获取模型列表失败", resp.status());
     }
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("解析上游模型列表失败: {e}"))?;
+    // 🔴 P5：原来是裸 `resp.json()` —— 它把整个 body **无上限**读进内存，而本仓
+    // `common/http_read.rs` 已把这条点名为 OOM 反模式并收口了 `read_json_capped`。
+    // 同一文件里 `forward` 的非流式分支早就用了 capped 版本，这里却裸奔；而模型列表
+    // 是**外部可控**数据（上游被劫持/DNS 投毒可无上限放大）。
+    let body: serde_json::Value =
+        crate::common::http_read::read_json_capped(resp, "上游模型列表", PASSTHROUGH_MODELS_CAP_BYTES)
+            .await
+            .map_err(|e| anyhow::anyhow!("解析上游模型列表失败: {e}"))?;
 
     let mut models: Vec<String> = Vec::new();
     // {data:[{id}]}（OpenAI 标准）

@@ -49,18 +49,63 @@ impl CliEndpoint {
     }
 
     /// aws-sdk-rust 版 UA，带 `app/AmazonQ-For-CLI` 标识（区别于 IDE 的 aws-sdk-js/KiroIDE）。
+    /// 形状受 `config.cli_ua_align_real_client` 控制（默认沿用本仓历史形状，零回归）。
     fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
-        cli_user_agent(ctx.machine_id)
+        cli_user_agent_with(ctx.machine_id, ctx.config.cli_ua_align_real_client)
     }
 }
 
+/// 真实 `kiro-cli` 抓包里的 codewhispererstreaming API 版本号。
+///
+/// 取值来源（五方实读）：GreyGunG `0.1.16551`（最新）、ZyphrZero / Foxfishc / M-JYuan
+/// `0.1.14474`（Foxfishc 标注抓包日期 2026-05-12 / `kiro-cli 2.3.0`）。取最新那个。
+/// 注意真实客户端用 `/` 分隔，而本仓历史形状用 `#1.28.3` —— 见 `cli_user_agent`。
+const REAL_CLI_STREAMING_API_VER: &str = "0.1.16551";
+
 /// CLI 协议 UA（`app/AmazonQ-For-CLI` 标识），`cli` / `cli-runtime` / `codewhisperer` /
 /// `amazonq` 四个端点共用同一形状（区别于 IDE 的 aws-sdk-js/KiroIDE）。
+///
+/// `align_real_client` = `config.cli_ua_align_real_client`：
+/// - `false`（默认）→ 本仓历史形状，逐字节不变（零回归）。
+/// - `true` → 对齐真实客户端抓包形状（`/` 分隔版本号 + `m/F`），且与
+///   [`cli_x_amz_user_agent`] 配对使用（两个头发**不同**的串，见该函数说明）。
+pub(crate) fn cli_user_agent_with(machine_id: &str, align_real_client: bool) -> String {
+    if align_real_client {
+        // 真实客户端形状：`api/codewhispererstreaming/{ver}`（斜杠）+ `m/F` +
+        // `md/appVersion-...`。machine_id 仍嵌在 appVersion 尾部（本仓既有做法，
+        // 四家参考仓在这一段各有出入，且它是我们自己的设备标识载体，保留）。
+        format!(
+            "aws-sdk-rust/1.0.0 ua/2.1 os/other lang/rust api/codewhispererstreaming/{REAL_CLI_STREAMING_API_VER} m/F app/AmazonQ-For-CLI md/appVersion-1.28.3-{machine_id}"
+        )
+    } else {
+        format!(
+            "aws-sdk-rust/1.0.0 ua/2.1 os/other lang/rust api/codewhispererstreaming#1.28.3 m/E app/AmazonQ-For-CLI md/appVersion-1.28.3-{machine_id}"
+        )
+    }
+}
+
+/// 兼容旧调用点：等价于 `cli_user_agent_with(machine_id, false)`（历史形状）。
 pub(crate) fn cli_user_agent(machine_id: &str) -> String {
-    format!(
-        "aws-sdk-rust/1.0.0 ua/2.1 os/other lang/rust api/codewhispererstreaming#1.28.3 m/E app/AmazonQ-For-CLI md/appVersion-1.28.3-{}",
-        machine_id
-    )
+    cli_user_agent_with(machine_id, false)
+}
+
+/// `x-amz-user-agent` 头的值。
+///
+/// 🔴 四家参考实现**都把这个头与 `user-agent` 拆成两个不同的串**：
+/// `x-amz-user-agent` 带 `m/F` 但**不带** `md/appVersion-...`，而 `user-agent` 反之。
+/// 本仓历史上两个头喂的是同一个串 —— 这本身就是一处指纹差异（比版本号更容易被识别，
+/// 因为它是**结构性**的：真实 AWS SDK 生成这两个头的代码路径不同，串必然不同）。
+///
+/// `align_real_client = false` 时返回 `None`，调用方沿用 `user_agent` 那一串（历史行为，
+/// 零回归）；`true` 时返回拆分后的真实形状。
+pub(crate) fn cli_x_amz_user_agent(align_real_client: bool) -> Option<String> {
+    if align_real_client {
+        Some(format!(
+            "aws-sdk-rust/1.0.0 ua/2.1 os/other lang/rust api/codewhispererstreaming/{REAL_CLI_STREAMING_API_VER} m/F app/AmazonQ-For-CLI"
+        ))
+    } else {
+        None
+    }
 }
 
 /// CLI 协议 API 请求装饰（`cli` / `cli-runtime` / `codewhisperer` / `amazonq` 共用）。
@@ -74,14 +119,45 @@ pub(crate) fn decorate_cli_protocol(
     amz_target: &'static str,
     ua: String,
 ) -> RequestBuilder {
+    // 遥测退出头：默认 "true"（隐私优先，本仓历史行为）。开
+    // `cli_codewhisperer_optout_false` 后发 "false" —— 那是四家参考实现一致的真实客户端
+    // 值（Foxfishc/M-JYuan 有抓包出处），但**语义是同意上游用会话做训练**，
+    // 所以只能由用户显式选择，不由代码替他决定。详见该配置字段的文档注释。
+    let optout = if ctx.config.cli_codewhisperer_optout_false {
+        "false"
+    } else {
+        "true"
+    };
+    // `x-amz-user-agent` 是否与 `user-agent` 拆成不同串（见 cli_x_amz_user_agent）。
+    let align_ua = ctx.config.cli_ua_align_real_client;
+    let x_amz_ua = cli_x_amz_user_agent(align_ua);
+
     req.header("X-Amz-Target", amz_target)
         .header("tokentype", "API_KEY")
-        .header("x-amzn-codewhisperer-optout", "true")
+        .header("x-amzn-codewhisperer-optout", optout)
         .header("x-amzn-kiro-agent-mode", "vibe")
-        .header("x-amz-user-agent", &ua)
+        .header(
+            "x-amz-user-agent",
+            x_amz_ua.as_deref().unwrap_or(ua.as_str()),
+        )
         .header("user-agent", &ua)
         .header("host", host)
         .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
+        // ⚠️ TODO(指纹未完全对齐)：真实 AWS SDK 这个头的 attempt 会**随重试递增**
+        // （kiro2cc 实现为 `attempt={n+1}; max=3`），而这里 attempt 恒为 1。
+        // ⇒ 即便开了 `cli_ua_align_real_client`，「attempt 永远是 1」本身仍是一个
+        // 可被上游识别的指纹（真实客户端重试时该值会变）。
+        //
+        // 没有现在就改的原因：要拿到当前重试轮次，必须把它透传进 `RequestContext`
+        // 或 `decorate_api` 签名 —— 那会动 `KiroEndpoint` trait 的公共签名与全部 5 个
+        // 端点实现，属独立改动。四家参考仓也都写死 attempt=1（只有 kiro2cc 递增），
+        // 所以对齐它们不需要这一步；要对齐**真实 SDK** 才需要。
+        //
+        // max 的取值同理待定：本仓 `max=1`，四家参考仓一致 `max=3`。这个头是**告知
+        // 上游** SDK 层的重试上限声明，不改变网关自身行为（网关实际上限是
+        // `provider.rs::ABSOLUTE_MAX_TOTAL_RETRIES = 4`），所以它纯粹是指纹项。
+        // 未随 `cli_ua_align_real_client` 一起改，是因为该开关的语义限定在 UA 形状；
+        // 把不相关的头塞进同一个开关会让 A/B 结果无法归因。
         .header("amz-sdk-request", "attempt=1; max=1")
         .header("Authorization", format!("Bearer {}", ctx.token))
     // 刻意不注入 profileArn / anthropic-beta：API_KEY 认证不使用 profileArn；
@@ -276,8 +352,59 @@ pub(crate) fn set_origin_kiro_cli(request_body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{CliEndpoint, inject_cli_agent_fields, set_origin_kiro_cli};
+    use super::{
+        CliEndpoint, REAL_CLI_STREAMING_API_VER, cli_user_agent, cli_user_agent_with,
+        cli_x_amz_user_agent, inject_cli_agent_fields, set_origin_kiro_cli,
+    };
     use serde_json::Value;
+
+    /// UA 开关关闭时**逐字节**等于历史形状（零回归）。
+    ///
+    /// 这条是承重的：默认关意味着线上行为一个比特都不能变，否则「加开关」本身就成了
+    /// 一次未经 A/B 的全池切换 —— 那正是这个开关要避免的事。
+    #[test]
+    fn ua_switch_off_is_byte_identical_to_legacy() {
+        let mid = "test-machine-id";
+        assert_eq!(cli_user_agent_with(mid, false), cli_user_agent(mid));
+        let legacy = cli_user_agent(mid);
+        assert!(legacy.contains("api/codewhispererstreaming#1.28.3"), "{legacy}");
+        assert!(legacy.contains(" m/E "), "历史形状用 m/E：{legacy}");
+        // 关闭时 x-amz-user-agent 不拆串（返回 None ⇒ 调用方沿用 user-agent 那一串）。
+        assert_eq!(cli_x_amz_user_agent(false), None);
+    }
+
+    /// UA 开关打开时对齐真实客户端抓包形状：`/` 分隔版本号 + `m/F` + 两个头拆开。
+    #[test]
+    fn ua_switch_on_matches_real_client_shape() {
+        let mid = "test-machine-id";
+        let aligned = cli_user_agent_with(mid, true);
+        assert!(
+            aligned.contains(&format!(
+                "api/codewhispererstreaming/{REAL_CLI_STREAMING_API_VER}"
+            )),
+            "真实客户端用 / 分隔版本号：{aligned}"
+        );
+        assert!(!aligned.contains('#'), "不得再出现 # 分隔：{aligned}");
+        assert!(aligned.contains(" m/F "), "真实客户端用 m/F：{aligned}");
+        assert!(
+            aligned.contains(mid),
+            "machineId 仍须嵌在 appVersion 尾部：{aligned}"
+        );
+
+        // 🔴 关键差异：两个头必须是**不同**的串。
+        // `x-amz-user-agent` 带 m/F 但不带 appVersion；`user-agent` 反之带 appVersion。
+        let x = cli_x_amz_user_agent(true).expect("开启时必须给出拆分后的串");
+        assert_ne!(x, aligned, "四家参考实现都把这两个头拆成不同的串");
+        assert!(x.contains(" m/F"), "{x}");
+        assert!(
+            !x.contains("md/appVersion"),
+            "x-amz-user-agent 不带 appVersion：{x}"
+        );
+        assert!(
+            aligned.contains("md/appVersion"),
+            "user-agent 带 appVersion：{aligned}"
+        );
+    }
 
     #[test]
     fn test_inject_cli_agent_fields_adds_vibe() {

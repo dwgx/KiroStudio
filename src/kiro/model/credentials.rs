@@ -147,6 +147,18 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deepseek_normalize_config: Option<crate::kiro::deepseek_normalize::DeepseekNormalizeOverride>,
 
+    /// **是否豁免全局模型映射**（`config.model_mapping`）。
+    ///
+    /// `Some(true)` = 该凭据**完全跳过**全局映射，发上游时保持客户端原始模型名。
+    /// `None`/`Some(false)`（默认）= 应用全局映射。
+    ///
+    /// 语义是安全阀：全局映射把 `A→B` 后，「映射后名 `B` 上游不认」的号（尤其 custom_api
+    /// 代挂号，其上游可能是独立的模型集）应当豁免 —— 否则网关选中它、把名字改写成它
+    /// 上游不认的值，白吃一个上游 400。见 [`crate::kiro::model_mapping`] 的「残留不对称」。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_mapping_exempt: Option<bool>,
+
     /// 请求上限：累计请求数达到后自动禁用该凭据（None/0=不限）。通用字段,自定义API主用。
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1556,6 +1568,7 @@ mod tests {
             custom_api_first: None,
             deepseek_normalize: None,
             deepseek_normalize_config: None,
+            model_mapping_exempt: None,
             region: None,
             auth_region: None,
             api_region: None,
@@ -1693,6 +1706,7 @@ mod tests {
             custom_api_first: None,
             deepseek_normalize: None,
             deepseek_normalize_config: None,
+            model_mapping_exempt: None,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
             api_region: None,
@@ -1743,6 +1757,7 @@ mod tests {
             custom_api_first: None,
             deepseek_normalize: None,
             deepseek_normalize_config: None,
+            model_mapping_exempt: None,
             region: None,
             auth_region: None,
             api_region: None,
@@ -1878,6 +1893,7 @@ mod tests {
             custom_api_first: None,
             deepseek_normalize: None,
             deepseek_normalize_config: None,
+            model_mapping_exempt: None,
             region: Some("us-west-2".to_string()),
             auth_region: None,
             api_region: None,

@@ -8,6 +8,8 @@
 //! 风险最小的两层：
 //! 1. 空白压缩（连续空行折叠、行尾空格移除，近乎无损）
 //! 3. tool_result 智能截断（大工具结果保留头 N 行 + 尾 M 行，中间占位省略）
+//! 4. 超长消息内容截断（`compress_long_messages_pass`，仅自适应二次压缩用，
+//!    属最后手段：单条消息本身大到移除历史也救不回来时必须截断正文）
 //!
 //! TODO(后续批次)：
 //! - ② thinking 块丢弃/截断（compress_thinking_pass）
@@ -258,7 +260,6 @@ fn truncate_tool_result_content(
 }
 
 // ============ 空 content 兜底修复 ============
-
 /// 修复压缩后变空的 content 字段（Kiro API 要求 content 非空）。
 ///
 /// 仅处理确实需要兜底的情况，尽量保留真实结构：
@@ -331,6 +332,66 @@ fn safe_char_truncate(text: &str, max_chars: usize) -> &str {
         Some((idx, _)) => &text[..idx],
         None => text,
     }
+}
+
+// ============ 超长消息内容截断（自适应二次压缩用） ============
+
+/// 截断超长的用户消息正文（history 与 current_message），返回节省的字节数。
+///
+/// 这是**最后手段**的压缩层，仅由自适应二次压缩（`handlers.rs::adaptive_compress_loop`）
+/// 的第三层调用——当单条 user content 本身就超过阈值、移除历史无法把请求落回阈值内时，
+/// 直接截断正文。策略与参考仓一致（ref-mjy/compressor.rs:690）：保留头部、尾部附省略标记。
+///
+/// **只动 content 正文，不动 tool_results / tool_uses / images**，因此不会破坏
+/// tool_use↔tool_result 的 id 配对（那是上游 400 的高频来源）。丢的是用户/助手正文的
+/// 尾部文字——这一层本来就在「宁可丢部分上下文，也别整轮失败」的档位上。
+pub fn compress_long_messages_pass(state: &mut ConversationState, max_chars: usize) -> usize {
+    if max_chars == 0 {
+        return 0;
+    }
+
+    let mut saved = 0usize;
+
+    for msg in &mut state.history {
+        if let Message::User(user_msg) = msg {
+            saved += truncate_long_content(&mut user_msg.user_input_message.content, max_chars);
+        }
+    }
+
+    saved += truncate_long_content(
+        &mut state.current_message.user_input_message.content,
+        max_chars,
+    );
+
+    saved
+}
+
+/// 截断单个 content 字段，返回节省的字节数。
+///
+/// 跳过仅为空格占位符 " " 的字段（与 `compress_string_field` 一致，
+/// converter 用 " " 表示仅 tool_use 消息，不能被压成空串）。
+fn truncate_long_content(field: &mut String, max_chars: usize) -> usize {
+    if field == " " {
+        return 0;
+    }
+    let char_count = field.chars().count();
+    if char_count <= max_chars {
+        return 0;
+    }
+
+    let original_len = field.len();
+    // 🔴 先为省略标记**预留字符预算**，再截正文 —— 否则"截到 max_chars 再拼标记"会让
+    // 最终长度 = max_chars + 标记长度 > max_chars，违反"截断后 ≤ max_chars"的契约
+    // （agent 加的测试 `test_compress_long_messages_truncates_current_and_history` 就抓到了）。
+    let marker = format!("\n...[content truncated, {} chars omitted]", char_count);
+    let marker_chars = marker.chars().count();
+    // 正文最多留 max_chars 里的 (max_chars - marker_chars) 个字符；若 max_chars 本身
+    // 比标记还短（极小阈值场景），就只保留标记、正文全丢（仍是合法的"超长已截断"）。
+    let body_budget = max_chars.saturating_sub(marker_chars);
+    let truncated = safe_char_truncate(field, body_budget);
+    let omitted = char_count.saturating_sub(body_budget);
+    *field = format!("{}\n...[content truncated, {} chars omitted]", truncated, omitted);
+    original_len.saturating_sub(field.len())
 }
 
 #[cfg(test)]
@@ -579,5 +640,51 @@ mod tests {
             .as_str()
             .unwrap();
         assert_eq!(text, original);
+    }
+
+    #[test]
+    fn test_compress_long_messages_truncates_current_and_history() {
+        let mut state = make_simple_state(
+            vec![(&format!("user {}", "x".repeat(9000)), "assistant")],
+            &"y".repeat(9000),
+        );
+        let saved = compress_long_messages_pass(&mut state, 2000);
+        assert!(saved > 0);
+        // 两条超长正文都应被截断到 ≤2000 字符
+        assert!(state.current_message.user_input_message.content.chars().count() <= 2000);
+        if let Message::User(u) = &state.history[0] {
+            assert!(u.user_input_message.content.chars().count() <= 2000);
+        }
+        // 省略标记存在
+        assert!(state.current_message.user_input_message.content.contains("chars omitted"));
+    }
+
+    #[test]
+    fn test_compress_long_messages_short_unchanged() {
+        let mut state = make_simple_state(vec![("hi", "hello")], "cur");
+        let saved = compress_long_messages_pass(&mut state, 1000);
+        assert_eq!(saved, 0);
+        assert_eq!(state.current_message.user_input_message.content, "cur");
+        if let Message::User(u) = &state.history[0] {
+            assert_eq!(u.user_input_message.content, "hi");
+        }
+    }
+
+    #[test]
+    fn test_compress_long_messages_zero_disabled() {
+        let mut state = make_simple_state(vec![("hi", "hello")], &"x".repeat(5000));
+        let saved = compress_long_messages_pass(&mut state, 0);
+        assert_eq!(saved, 0);
+        assert_eq!(state.current_message.user_input_message.content.len(), 5000);
+    }
+
+    #[test]
+    fn test_compress_long_messages_skips_space_placeholder() {
+        let mut state = make_simple_state(vec![(" ", "a")], "cur");
+        let saved = compress_long_messages_pass(&mut state, 1);
+        assert_eq!(saved, 0);
+        if let Message::User(u) = &state.history[0] {
+            assert_eq!(u.user_input_message.content, " ");
+        }
     }
 }

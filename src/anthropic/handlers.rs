@@ -411,6 +411,134 @@ fn current_compression() -> std::sync::Arc<crate::model::config::CompressionConf
     compression_cell().load_full()
 }
 
+/// WebSearch 回灌循环（websearch.rs）用的薄包装：构造 Kiro 请求体并做输入压缩，
+/// 与主路径 `build_kiro_request_body` 完全同源（同一压缩配置），不自己写一份。
+pub(super) fn build_kiro_request_body_for_websearch(
+    conversation_state: crate::kiro::model::requests::conversation::ConversationState,
+    additional_model_request_fields: Option<
+        crate::kiro::model::requests::kiro::AdditionalModelRequestFields,
+    >,
+) -> Result<String, serde_json::Error> {
+    build_kiro_request_body(
+        conversation_state,
+        additional_model_request_fields,
+        &current_compression(),
+        None,
+    )
+}
+
+/// WebSearch 回灌循环用的薄包装：把 provider 错误映射成 HTTP 响应，
+/// 与主路径 `map_provider_error` 同口径（上游错误码/可重试性判定两边一致）。
+pub(super) fn map_provider_error_for_websearch(err: anyhow::Error) -> Response {
+    map_provider_error(err)
+}
+
+/// 混合工具（web_search + 其他工具）场景的 WebSearch agentic 回灌分派。
+///
+/// `/v1/messages` 与 `/cc/v1/messages` 两个端点**共用这一份**：两处此前是逐字复制的
+/// 同一段 web_search 处理，本仓已有多次「同一逻辑各写一份 → 只改了一处 → 行为分叉」
+/// 的事故（见 update.rs:246 抽公共函数的理由）。收口成一个函数，改一次两端同时生效。
+///
+/// 返回 `None` 表示本请求不属于该场景，调用方继续走常规转发路径（行为完全不变）。
+async fn dispatch_web_search_loop(
+    provider: &std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    payload: &MessagesRequest,
+    budget: &crate::kiro::provider::SharedRetryBudget,
+    client: &ClientInfo,
+) -> Option<Response> {
+    if !websearch::has_web_search_tool(payload) {
+        return None;
+    }
+    tracing::info!("混合工具列表含 web_search，走常规转发 + WebSearch 回灌");
+
+    // 估算输入 tokens 作为回灌链路的兜底口径（上游 contextUsageEvent 到达后优先用它）。
+    let fallback_input_tokens = token::count_all_tokens(
+        &payload.model,
+        payload.system.as_deref(),
+        &payload.messages,
+        payload.tools.as_deref(),
+    ) as i32;
+    // `stream` 必须在 payload 被 move 进循环之前取（循环内会追加回灌消息、消费 payload）。
+    let wants_stream = payload.stream;
+
+    let resp = match websearch::run_web_search_loop(
+        provider.clone(),
+        (*payload).clone(),
+        fallback_input_tokens,
+        budget,
+    )
+    .await
+    {
+        Ok(success) => {
+            emit_websearch_loop_usage(provider, &success, client);
+            if wants_stream {
+                let bytes: Vec<Result<Bytes, Infallible>> =
+                    websearch::build_loop_sse_events(&success)
+                        .into_iter()
+                        .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                        .collect();
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header(header::CACHE_CONTROL, "no-cache")
+                    .header(header::CONNECTION, "keep-alive")
+                    .body(Body::from_stream(stream::iter(bytes)))
+                    .unwrap()
+            } else {
+                (
+                    StatusCode::OK,
+                    Json(websearch::build_loop_json_body(&success)),
+                )
+                    .into_response()
+            }
+        }
+        Err(mut resp) => {
+            // 回灌失败响应可能带 x-kirostudio-compress-retry 内部标记（上游 400
+            // CONTENT_LENGTH_EXCEEDS 时 map_provider_error 设置；回灌循环在压缩重试/
+            // strip 点之前，不在这里清就会透传客户端——与 /v1、/cc/v1 的 F1b 同款，
+            // 2026-08-11 对抗审查 M1）。回灌路径**无压缩重试循环**，标记无消费者。
+            resp.headers_mut()
+                .remove("x-kirostudio-compress-retry");
+            resp
+        }
+    };
+    Some(resp)
+}
+
+/// WebSearch 回灌成功收尾时埋一条用量记录。
+///
+/// ⚠️ 诚实边界：回灌链路一次客户端请求对应 **N 次上游往返**，这里只记**一条**记录
+/// （末轮的 credential_id + 各轮累计 credits）。所以面板上这条记录的
+/// `credits_used` 会明显高于同 input_tokens 的普通请求 —— 那不是记账错误，
+/// 而是回灌放大的真实成本。`retries` 借用 rounds-1 表达「多打了几轮」，
+/// 它与 provider 的换号重试**不同源**，但都是"额外上游往返"的同一语义。
+fn emit_websearch_loop_usage(
+    provider: &crate::kiro::provider::KiroProvider,
+    success: &websearch::WebSearchLoopSuccess,
+    client: &ClientInfo,
+) {
+    let mut record =
+        crate::usage::RequestRecord::new(Uuid::new_v4().to_string(), success.model.clone());
+    record.requested_model = Some(success.model.clone());
+    // WebSearch 回灌是 MCP 路径（请求体无 modelId，不经过模型映射），upstream 保持 None。
+    record.credential_id = Some(success.credential_id);
+    record.is_streaming = false;
+    record.input_tokens = success.input_tokens;
+    record.output_tokens = success.output_tokens;
+    record.credits_used = if success.credits > 0.0 {
+        Some(success.credits)
+    } else {
+        None
+    };
+    record.retries = success.rounds.saturating_sub(1);
+    record.outcome = crate::usage::RequestOutcome::Success;
+    if let Some(c) = record.credits_used {
+        provider.report_credits(success.credential_id, c);
+    }
+    client.apply(&mut record);
+    crate::usage::emit_record(record);
+}
+
 /// 请求来源的客户端画像（设备类型 + IP + 细分 OS + 浏览器），
 /// 一并沿用量埋点路径传递，避免多参数散落。
 #[derive(Clone, Default)]
@@ -458,41 +586,265 @@ impl ClientInfo {
     }
 }
 
+/// 自适应二次压缩：最大迭代次数（避免极端输入导致过长 CPU 消耗）。
+/// 参考仓 ref-mjy/src/anthropic/handlers.rs:25（同值 32）。
+const ADAPTIVE_COMPRESSION_MAX_ITERS: usize = 32;
+/// tool_result 二次压缩的最低阈值（字符数），不再往下压（过低会破坏内容可用性）。
+/// 参考仓 ref-mjy/src/anthropic/handlers.rs:27（同值 512）。
+const ADAPTIVE_MIN_TOOL_RESULT_MAX_CHARS: usize = 512;
+/// 历史截断保留的成对消息数（保留前 2 对 user+assistant，避免删光上下文）。
+/// 参考仓 ref-mjy/src/anthropic/handlers.rs:31（同值 2）。
+const ADAPTIVE_HISTORY_PRESERVE_PAIRS: usize = 2;
+/// 消息内容二次压缩的最低阈值（字符数）。
+/// 参考仓 ref-mjy/src/anthropic/handlers.rs:33（同值 8192）。
+const ADAPTIVE_MIN_MESSAGE_CONTENT_MAX_CHARS: usize = 8192;
+
 /// prompt 缓存记账所需的上下文（跟踪器 + 本次请求的缓存画像）
 ///
 /// 构建发往上游的 Kiro 请求体（含输入压缩）。
 ///
 /// 流程：先序列化测量大小；仅当启用压缩且体积超过 `trigger_bytes` 时，对
-/// `ConversationState` 跑压缩管道（空白折叠 + tool_result 智能截断）再重新序列化。
+/// `ConversationState` 跑压缩管道（空白折叠 + tool_result 智能截断）再重新序列化；
+/// 若压一次仍超限，则进入**自适应二次压缩循环**（最多 32 轮），逐层降级——
+/// tool_result_max_chars×3/4 → 截断超长消息正文 → 清历史图片 → 成对删最老历史——
+/// CONTENT_LENGTH_EXCEEDS 压缩重试的目标字节数：`trigger_bytes × (3/4)^attempt`，
+/// 逐轮更紧（attempt=1 → 3/4、attempt=2 → 9/16、attempt=3 → 27/64），下限 64 KiB。
 ///
-/// 保守设计：默认阈值高（4MiB），正常小请求零处理；压缩后仍可能超上游硬限制，
-/// 那种情况不再本地判死，交由上游返回 400，再由 [`map_provider_error`] 透传给客户端。
+/// ⚠️ 2026-08-11 对抗审查修：旧公式 `3^(3-attempt+1)/4^(3-attempt+1)` 的序列是
+/// 0.42 → 0.56 → 0.75（逐轮**放大**），第 2、3 次重试产出更大的 body 必然再败。
+/// 独立成函数并配单元测试（`compress_retry_target_strictly_decreasing_with_floor`），
+/// 防再犯。
+fn compress_retry_target(trigger_bytes: usize, attempt: u32) -> usize {
+    let t = (trigger_bytes as u64)
+        .saturating_mul(3u64.saturating_pow(attempt))
+        .saturating_div(4u64.saturating_pow(attempt));
+    (t as usize).max(65536)
+}
+
+/// 每轮重跑压缩管道并重新序列化测量。
+///
+/// 目标 `max_body` 用 `compression.trigger_bytes`：这是网关发上游前的**出站**软上限，
+/// 压到它以内即不会触发上游 ~5MiB 硬限制。刻意**不用** `config.max_body_bytes`——
+/// 那是 `router.rs:106` 的**入站** axum `DefaultBodyLimit`（默认 256MiB，管客户端发来的
+/// body 多大），语义与「发上游前压缩到多大」无关。
+///
+/// 保守设计：默认阈值高（4MiB），正常小请求零处理；循环中任何一步出错即停止并返回
+/// 当前结果（宁可超限交上游，不 panic）；32 轮后仍超限则照发，由上游判死，
+/// 再经 [`map_provider_error`] 透传给客户端。
+/// `target_bytes`: 压缩目标字节数。None = 使用 `compression.trigger_bytes`。CONTENT_LENGTH_EXCEEDS
+/// 重试时传入更小的目标值，实现渐进式压缩。
 fn build_kiro_request_body(
     conversation_state: crate::kiro::model::requests::conversation::ConversationState,
+    additional_model_request_fields: Option<
+        crate::kiro::model::requests::kiro::AdditionalModelRequestFields,
+    >,
     compression: &crate::model::config::CompressionConfig,
+    target_bytes: Option<usize>,
 ) -> Result<String, serde_json::Error> {
+    let max_body = target_bytes.unwrap_or(compression.trigger_bytes);
     let mut kiro_request = KiroRequest {
         conversation_state,
         profile_arn: None,
+        additional_model_request_fields,
     };
 
     let body = serde_json::to_string(&kiro_request)?;
 
-    if compression.enabled && body.len() > compression.trigger_bytes {
-        let before = body.len();
-        let stats = super::compressor::compress(&mut kiro_request.conversation_state, compression);
-        let compressed = serde_json::to_string(&kiro_request)?;
-        tracing::info!(
-            before_bytes = before,
-            after_bytes = compressed.len(),
-            saved_bytes = stats.total_saved(),
-            trigger_bytes = compression.trigger_bytes,
-            "请求体超过压缩阈值，已执行输入压缩"
-        );
-        return Ok(compressed);
+    if !compression.enabled || body.len() <= max_body {
+        return Ok(body);
     }
 
-    Ok(body)
+    let before = body.len();
+    let stats = super::compressor::compress(&mut kiro_request.conversation_state, compression);
+    let mut request_body = serde_json::to_string(&kiro_request)?;
+
+    if request_body.len() > max_body {
+        adaptive_compress_loop(&mut kiro_request, compression, &mut request_body, target_bytes)?;
+    }
+
+    tracing::info!(
+        before_bytes = before,
+        after_bytes = request_body.len(),
+        saved_bytes = stats.total_saved(),
+        trigger_bytes = max_body,
+        "请求体超过压缩阈值，已执行输入压缩"
+    );
+
+    Ok(request_body)
+}
+
+/// 自适应二次压缩：序列化后仍超 `trigger_bytes` 时，按参考仓降级顺序迭代重压，
+/// 每轮递减阈值 → 重跑压缩管道（复用 [`super::compressor::compress`]）→ 重新序列化。
+///
+/// 降级顺序（参考 ref-mjy/src/anthropic/handlers.rs:265-270，逐条对照）：
+/// 1. tool_result_max_chars ×3/4（仅当存在 tool_result/tools）
+/// 2. tool_use input ×3/4 —— 我方无 `tool_use_input_max_chars` 配置，映射为继续压
+///    tool_result（同一 `compress_tool_results_pass`），语义等价
+/// 3. 截断超长用户消息正文（仅当单条消息本身超过阈值 / 历史已删到只剩保留对）
+/// 4. 清一次历史图片（保留 current_message 图片）
+/// 5. 成对删最老 user+assistant 历史（保留前 2 对）
+///
+/// 与参考仓的差异：3/4/5 层**并列执行**而非 else-if 单选（参考仓 ref-mjy/handlers.rs:397-434
+/// 存在死角：正文短而历史图片大时，L3 `saved=0` 会让循环 `break`，L4/L5 永远轮不到）。
+/// 每轮最多触发一层为 true（正文短时 L3 无 saved），故单轮放大倍数与参考仓一致。
+///
+/// fail-safe：循环内任何一步出错立即返回当前 `request_body`（Er），不 panic。
+fn adaptive_compress_loop(
+    kiro_request: &mut KiroRequest,
+    compression: &crate::model::config::CompressionConfig,
+    request_body: &mut String,
+    target_bytes: Option<usize>,
+) -> Result<(), serde_json::Error> {
+    let max_body = target_bytes.unwrap_or(compression.trigger_bytes);
+
+    // 守卫（对齐参考仓 ref-mjy/handlers.rs:251）：禁用压缩或阈值为 0（不限）时一律不动。
+    // 必须在函数内部再查一次 `enabled`——L3/L4/L5（截正文/清历史图片/删历史）都在
+    // `compressor::compress` **之外**，它们不看 `config.enabled`；只靠调用方守卫的话，
+    // 将来任何新调用点漏查就会在用户显式关掉压缩时静默丢历史。
+    if !compression.enabled || max_body == 0 {
+        return Ok(());
+    }
+
+    // 是否存在任何 tool_result / tools（否则降阈值只会浪费迭代）
+    let has_any_tool_results_or_tools = {
+        let state = &kiro_request.conversation_state;
+        let current = &state.current_message.user_input_message.user_input_message_context;
+        !current.tool_results.is_empty()
+            || !current.tools.is_empty()
+            || state.history.iter().any(|msg| match msg {
+                crate::kiro::model::requests::conversation::Message::User(u) => {
+                    !u.user_input_message
+                        .user_input_message_context
+                        .tool_results
+                        .is_empty()
+                        || !u.user_input_message.user_input_message_context.tools.is_empty()
+                }
+                _ => false,
+            })
+    };
+    // 是否存在历史图片（否则无需尝试图片降级）
+    let has_history_images = kiro_request
+        .conversation_state
+        .history
+        .iter()
+        .any(|msg| match msg {
+            crate::kiro::model::requests::conversation::Message::User(u) => {
+                !u.user_input_message.images.is_empty()
+            }
+            _ => false,
+        });
+    // 是否存在历史（否则删除层无意义）
+    let has_history = !kiro_request.conversation_state.history.is_empty();
+
+    // 初始 message_content_max_chars = 最大消息字符数×3/4，下限 ADAPTIVE_MIN_MESSAGE_CONTENT_MAX_CHARS
+    let max_content_chars = {
+        let mut max_chars = kiro_request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content
+            .chars()
+            .count();
+        for msg in &kiro_request.conversation_state.history {
+            if let crate::kiro::model::requests::conversation::Message::User(u) = msg {
+                max_chars = max_chars.max(u.user_input_message.content.chars().count());
+            }
+        }
+        max_chars
+    };
+    let mut message_content_max_chars =
+        (max_content_chars * 3 / 4).max(ADAPTIVE_MIN_MESSAGE_CONTENT_MAX_CHARS);
+
+    let mut adaptive_config = compression.clone();
+    let mut history_images_removed = false;
+
+    for _ in 0..ADAPTIVE_COMPRESSION_MAX_ITERS {
+        if request_body.len() <= max_body {
+            break;
+        }
+
+        let mut changed = false;
+
+        if has_any_tool_results_or_tools
+            && adaptive_config.tool_result_max_chars > ADAPTIVE_MIN_TOOL_RESULT_MAX_CHARS
+        {
+            // 第 1 层（L2 映射）：降低 tool_result 截断阈值
+            let next = (adaptive_config.tool_result_max_chars * 3 / 4)
+                .max(ADAPTIVE_MIN_TOOL_RESULT_MAX_CHARS);
+            if next < adaptive_config.tool_result_max_chars {
+                adaptive_config.tool_result_max_chars = next;
+                changed = true;
+            }
+        } else {
+            // 若任意单条 user content 已超 max_body，删历史救不回来，必须优先截断正文。
+            let max_single_user_content_bytes = {
+                let state = &kiro_request.conversation_state;
+                let mut max_bytes = state.current_message.user_input_message.content.len();
+                for msg in &state.history {
+                    if let crate::kiro::model::requests::conversation::Message::User(u) = msg {
+                        max_bytes = max_bytes.max(u.user_input_message.content.len());
+                    }
+                }
+                max_bytes
+            };
+
+            // 只取长度（值），不持 `&mut history` 长借用：L3 要传 `&mut conversation_state`，
+            // 而 L5 之后还要用 history ⇒ 长借用会撞 E0499。参考仓能编过只因它是 else-if
+            // 单选（L3 路径上 history 之后不再被用），我方改成并列后必须避开这个借用。
+            let history_len = kiro_request.conversation_state.history.len();
+            if (max_single_user_content_bytes > max_body
+                || history_len <= (ADAPTIVE_HISTORY_PRESERVE_PAIRS * 2) + 2)
+                && message_content_max_chars >= ADAPTIVE_MIN_MESSAGE_CONTENT_MAX_CHARS
+            {
+                // 第 3 层：截断超长消息正文（参考 ref-mjy/compressor.rs:690 同名函数）
+                let saved = super::compressor::compress_long_messages_pass(
+                    &mut kiro_request.conversation_state,
+                    message_content_max_chars,
+                );
+                if saved > 0 {
+                    changed = true;
+                }
+                message_content_max_chars = (message_content_max_chars * 3 / 4)
+                    .max(ADAPTIVE_MIN_MESSAGE_CONTENT_MAX_CHARS);
+            }
+            // 第 4/5 层：清历史图片 → 删历史。与第 3 层**并列**（不是 else-if）：
+            // 参考仓的 else-if 单选存在死角——当正文都很短（`saved=0`）而历史图片很大时，
+            // 上一轮会命中 L3、`changed=false`、整个循环 break，L4/L5 永远轮不到。
+            // 正文短（不触发 L3 的 saved）时降级链必须继续往下走，否则纯图片请求压不动。
+            if !history_images_removed && has_history_images {
+                // 第 4 层：仅清一次历史图片（参考 ref-mjy/conversation.rs:83 remove_history_images）
+                let removed = kiro_request.conversation_state.remove_history_images();
+                if removed > 0 {
+                    history_images_removed = true;
+                    changed = true;
+                }
+            }
+            if has_history && history_len > ADAPTIVE_HISTORY_PRESERVE_PAIRS * 2 + 2 {
+                // 第 5 层：成对删最老 user+assistant（保留前 2 对），单轮最多删 16 条。
+                // 先取历史长度，再单独 `&mut`（避免跨 L3 的 `&mut conversation_state` 长借用）。
+                let removable = history_len.saturating_sub(ADAPTIVE_HISTORY_PRESERVE_PAIRS * 2 + 2);
+                let mut remove_msgs = removable.min(16);
+                remove_msgs -= remove_msgs % 2; // 保持成对
+                if remove_msgs > 0 {
+                    let history = &mut kiro_request.conversation_state.history;
+                    history.drain(ADAPTIVE_HISTORY_PRESERVE_PAIRS * 2..ADAPTIVE_HISTORY_PRESERVE_PAIRS * 2 + remove_msgs);
+                    changed = true;
+                }
+            }
+        }
+
+        if !changed {
+            // 没有可再降的层了，继续循环也不会变小，直接返回当前结果
+            break;
+        }
+
+        // 重跑压缩管道 + 重新序列化（本仓 `compress` 内部含空 content 兜底修复，
+        // 故截断正文 / 删历史后不会因空 content 触发上游 400）
+        super::compressor::compress(&mut kiro_request.conversation_state, &adaptive_config);
+        *request_body = serde_json::to_string(kiro_request)?;
+    }
+
+    Ok(())
 }
 
 /// 已翻译的上游错误：HTTP 状态 + Anthropic 错误类型码 + 面向用户的中文消息（含排障步骤）。
@@ -500,6 +852,9 @@ struct TranslatedError {
     status: StatusCode,
     error_type: &'static str,
     message: String,
+    /// 网关可以在更激进的压缩下重试（CONTENT_LENGTH_EXCEEDS_THRESHOLD 等可自愈错误）。
+    /// 对应的响应带上 `x-kirostudio-compress-retry` 头，handler 据此决定是否重新压缩并重试。
+    retry_compress: bool,
 }
 
 /// 上游账户级限流的客户端退避建议秒数（`Retry-After` 头取值）。
@@ -676,11 +1031,39 @@ fn translate_upstream_error(err_str: &str) -> Option<TranslatedError> {
 
 /// 配额/订阅/region 类（不可重试，需用户处理账号）。
 fn translate_quota_subscription(err_str: &str) -> Option<TranslatedError> {
-    if err_str.contains("MONTHLY_REQUEST_COUNT") || err_str.contains("QUOTA") {
+    // 🔴 **全池配额耗尽**：只认 provider 打的显式标记（2026-08-10 收口）。
+    //
+    // 改前这里是裸串 `contains("MONTHLY_REQUEST_COUNT") || contains("QUOTA")`，而那两个串
+    // 来自**上游 body**：单号耗尽时 provider 走的是「换号 continue」分支，它的 `last_error`
+    // 同样带着上游 body（含这两个串），且 `last_error` 是**刻意不重置**的 ⇒ 池里其余号
+    // 明明健康、最终却因为链上某一跳的残留错误被判成"全部配额耗尽"，归因口径被污染。
+    //
+    // 现在与 `pool_permanently_exhausted=1` / `model_unsupported_by_pool=1` 同款：
+    // 只信 provider 在**确认 `has_available == false`** 后才打的 `quota_exhausted_all=1`。
+    if err_str.contains("quota_exhausted_all=1") {
         return Some(TranslatedError {
+            retry_compress: false,
             status: StatusCode::TOO_MANY_REQUESTS,
             error_type: "rate_limit_error",
-            message: "月度请求配额已耗尽。排障：①面板查看各凭据用量，切到仍有额度的账号；②等待配额周期重置；③为号池补充新凭据。".to_string(),
+            message: "月度请求配额已耗尽（号池内所有凭据）。排障：①面板查看各凭据用量；②等待配额周期重置；③为号池补充新凭据。".to_string(),
+        });
+    }
+    // 兜底：仍保留裸串识别，但**降级为「单号/未知范围」的配额语义**。
+    //
+    // 为什么不能直接删掉（这是本次收口最容易做错的地方）：并非所有配额错误都经过
+    // 上面那个标记 —— MCP 路径（`call_mcp_with_retry`）、透传路径、以及未来新增的
+    // 上游分支都可能把带 `MONTHLY_REQUEST_COUNT` 的 body 冒泡上来。删掉裸串会让它们
+    // 落 `map_provider_error` 末尾兜底 → **502 无 Retry-After** → 客户端当永久故障、
+    // 不退避、原样重发（这正是本仓反复踩过的那类回归）。
+    //
+    // 保留但**改文案**：不再断言"所有凭据"（那是标记分支才能确认的事实），
+    // 避免面板/用户按错误的范围去排障。状态码维持 429（可退避）不变。
+    if err_str.contains("MONTHLY_REQUEST_COUNT") || err_str.contains("QUOTA") {
+        return Some(TranslatedError {
+            retry_compress: false,
+            status: StatusCode::TOO_MANY_REQUESTS,
+            error_type: "rate_limit_error",
+            message: "请求配额已耗尽。排障：①面板查看各凭据用量，切到仍有额度的账号；②等待配额周期重置；③为号池补充新凭据。".to_string(),
         });
     }
     // 上游容量紧张/模型短暂不可用：临时状态，稍后重试即可（常见于新模型发布初期）。
@@ -697,6 +1080,7 @@ fn translate_quota_subscription(err_str: &str) -> Option<TranslatedError> {
         || err_str.contains("INSUFFICIENT_MODEL_CAPACITY")
     {
         return Some(TranslatedError {
+            retry_compress: false,
             status: StatusCode::SERVICE_UNAVAILABLE,
             error_type: "overloaded_error",
             message: "上游模型暂时不可用（负载过高），请稍后重试。若持续出现：①换用同族其他版本（如 claude-opus-4.8）；②新发布模型发布初期容量有限，属正常现象，等待 1~2 小时后通常恢复。".to_string(),
@@ -704,16 +1088,24 @@ fn translate_quota_subscription(err_str: &str) -> Option<TranslatedError> {
     }
     if err_str.contains("FEATURE_NOT_SUPPORTED") {
         return Some(TranslatedError {
+            retry_compress: false,
             status: StatusCode::BAD_GATEWAY,
             error_type: "api_error",
             message: "当前凭据所在 region 未开通该功能（profile 未激活）。排障：①网关会在刷新时自动验活重选可用 region；②如持续，右键该凭据切换 Profile ARN 到已开通 region（如 eu-central-1）；③确认该账号确在某 region 开通了 Kiro。".to_string(),
         });
     }
-    if err_str.contains("Improperly formed")
-        || err_str.contains("Invalid token")
+    // ⚠️ "Improperly formed" **不在**凭据分支里（2026-08-11 对抗审查 M1）：
+    // 上游对**用户请求体**的格式校验失败（工具 schema 属性、工具名超限、web_search 直发
+    // 等，converter.rs/websearch.rs 多处实测记录）也回 `400 Improperly formed request`，
+    // 且常带 `reason=REQUEST_BODY_INVALID`。混在这里会被说成「订阅失效/token 无效」——
+    // 排障方向全错。它由 `translate_context_input` 里的请求体校验分支接管（400
+    // invalid_request_error）。真正的凭据信号是 403 `Invalid token`（map_provider_error
+    // 更前面的 403 分支处理）与 `subscription` 类配额文案。
+    if err_str.contains("Invalid token")
         || err_str.contains("subscription")
     {
         return Some(TranslatedError {
+            retry_compress: false,
             status: StatusCode::BAD_GATEWAY,
             error_type: "api_error",
             message: "上游拒绝凭据（订阅失效或 token 无效）。排障：①面板对该凭据点『刷新 Token』；②若为 Enterprise/IdC 号，确认 profileArn 已正确解析；③测活确认订阅有效，失效则更换凭据。".to_string(),
@@ -768,9 +1160,25 @@ fn translate_context_input(err_str: &str) -> Option<TranslatedError> {
     // 既误导用户、又让客户端不再退避。
     if crate::kiro::endpoint::default_is_image_mime_mismatch(err_str) {
         return Some(TranslatedError {
+            retry_compress: false,
             status: StatusCode::BAD_REQUEST,
             error_type: "invalid_request_error",
             message: "图片声明的 media_type 与实际字节格式不符（上游 IMAGE_MIME_MISMATCH）。这是请求构造问题，重试无效。排障：①按图片真实格式填写 media_type（如 JPEG 字节不要声明 image/png）；②不要在改扩展名后沿用旧的 media_type；③重新读取并重新编码该图片后再发。".to_string(),
+        });
+    }
+    // 请求体校验失败（400 `REQUEST_BODY_INVALID` / `Invalid tool use format`，2026-08-11 补）。
+    //
+    // 改前：该错误码零翻译，落「未识别兜底」502 —— 性质说错（这是请求构造问题不是网关
+    // 故障），且会被外挂 RETRYABLE 集（502 在列）反复重打同一个必败的请求。
+    // 翻成 400 `invalid_request_error` 与 IMAGE_MIME_MISMATCH 同款：请求构造问题，
+    // 重试/换号无意义。判据收口在 `endpoint::default_is_request_body_invalid`
+    // （含 region 探测边界警告，见该谓词 doc —— 探测走独立通道，不会被打到这里）。
+    if crate::kiro::endpoint::default_is_request_body_invalid(err_str) {
+        return Some(TranslatedError {
+            retry_compress: false,
+            status: StatusCode::BAD_REQUEST,
+            error_type: "invalid_request_error",
+            message: "请求体校验失败（上游 REQUEST_BODY_INVALID）。这是请求构造问题，重试无效。排障：①检查工具调用与工具结果的配对（上游对 tool 配对较严，截断/重排序会产生孤儿 tool_use）；②检查消息 role 与内容字段合法性；③重新构造请求后再发。".to_string(),
         });
     }
     // 两条都带 `OVERFLOW_COMPACT_HINT` 前缀：状态码与中文文案一字未改，只在最前面挂哨兵，
@@ -779,6 +1187,7 @@ fn translate_context_input(err_str: &str) -> Option<TranslatedError> {
     // 而它认的正是 message 而非状态码（实测那条判据只看 message 子串）。
     if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
         return Some(TranslatedError {
+            retry_compress: true,
             status: StatusCode::BAD_REQUEST,
             error_type: "invalid_request_error",
             message: format!(
@@ -788,6 +1197,7 @@ fn translate_context_input(err_str: &str) -> Option<TranslatedError> {
     }
     if err_str.contains("Input is too long") {
         return Some(TranslatedError {
+            retry_compress: true,
             status: StatusCode::BAD_REQUEST,
             error_type: "invalid_request_error",
             message: format!(
@@ -857,6 +1267,7 @@ fn translate_network(err_str: &str) -> Option<TranslatedError> {
         || low.contains("failed to lookup")
     {
         return Some(TranslatedError {
+            retry_compress: false,
             status: StatusCode::BAD_GATEWAY,
             error_type: "api_error",
             message: "DNS 解析失败（无法解析上游域名）。排障：①检查本机/容器 DNS 配置；②若走代理，确认代理能解析 kiro.dev；③确认网络出口正常。".to_string(),
@@ -864,6 +1275,7 @@ fn translate_network(err_str: &str) -> Option<TranslatedError> {
     }
     if low.contains("timed out") || low.contains("timeout") {
         return Some(TranslatedError {
+            retry_compress: false,
             status: StatusCode::GATEWAY_TIMEOUT,
             error_type: "api_error",
             message: "连接上游超时。排障：①上游或代理可能拥塞，稍后重试；②检查代理延迟；③大请求可拆小以缩短单次耗时。".to_string(),
@@ -871,6 +1283,7 @@ fn translate_network(err_str: &str) -> Option<TranslatedError> {
     }
     if low.contains("certificate") || low.contains("ssl") || low.contains("tls") {
         return Some(TranslatedError {
+            retry_compress: false,
             status: StatusCode::BAD_GATEWAY,
             error_type: "api_error",
             message: "TLS/证书握手失败。排障：①检查系统时间是否准确；②若走中间人代理，确认其证书受信；③确认未误用被拦截的代理。".to_string(),
@@ -878,6 +1291,7 @@ fn translate_network(err_str: &str) -> Option<TranslatedError> {
     }
     if low.contains("proxy") {
         return Some(TranslatedError {
+            retry_compress: false,
             status: StatusCode::BAD_GATEWAY,
             error_type: "api_error",
             message: "代理连接失败。排障：①检查代理地址/账密是否正确；②确认代理在线可达；③面板核对该凭据绑定的代理配置。".to_string(),
@@ -1060,8 +1474,47 @@ fn map_provider_error(err: Error) -> Response {
     //
     // 依据（外挂 `kiro_shield.py` 原注释）：Cursor 见 429 会**掐会话**，对 503 不会。
     // 即同一个「网关已尽力但没成」的事实，用 429 表达让客户端直接放弃，用 503 表达让它
-    // 自己再退避重试。默认仍是 429（语义正确的那个，且 Claude Code 对 429 退避正常），
+    // 自己再退避重试。默认 503（2026-08-11 改：429 会让 Cursor 掐会话、用户实测全部
+    // 暂停；503 触发退避、频率受 Retry-After 控制），
     // 503 是为特定客户端做的兼容让步 —— 见 `upstream_retry_absorb_exhausted_status`。
+    // ⭐ 每客户端请求共享预算耗尽（2026-08-11 方案 A）：websearch 回灌轮/压缩轮/透传
+    // failover 把整条请求的 ABSOLUTE_MAX_TOTAL_RETRIES 花完。**必须排第一优先**
+    // （在 absorb 分支之前）：它与吸收层耗尽语义同级——「网关已尽力，请退避」，返回
+    // 503 + Retry-After（503 而非 429：Cursor 见 429 掐会话；见 503 自行退避重试，
+    // 重试频率受 Retry-After 控制）。改前这条落 502 兜底：客户端当服务端故障、
+    // 退避逻辑不启动、立刻原样重发（拿一份全新预算再打 4 次，放大在客户端侧复活）。
+    if err_str.contains("shared_budget_exhausted=1") {
+        // 预算耗尽串由 provider 构造，不含 retry_after_secs= 真值——固定用吸收层同款
+        // 兜底值（15s 级退避即可，语义是「请客户端退避」）。
+        let retry_after = ABSORB_EXHAUSTED_RETRY_AFTER_SECS.clamp(1, 300);
+        tracing::warn!(
+            error = %err,
+            retry_after_secs = retry_after,
+            "每客户端请求的上游预算已耗尽（跨层共享），按 503 回：客户端自行退避"
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, retry_after.to_string())],
+            Json(ErrorResponse::new(
+                "api_error",
+                // 🔴 文案里的「等容量」是**承重字符串**，不是修辞（2026-08-11 对抗评审加）。
+                //
+                // 线上真实链路是 `Caddy → kiro_shield.py → KiroStudio`，而 shield 的
+                // `classify()` **按 body 文案分类、不按状态码**，且只有
+                // `verdict ∈ {cool, auth}` 才会读我们的 Retry-After：
+                //     if verdict in ("cool","auth"): delay = cool_delay(..., Retry-After)
+                //     else:                          delay = swap_delay(attempt)  # 本地阶梯
+                // 「等容量」是它 `COOLING_MARKERS` 里的词。删掉它 ⇒ 落 `retry` 兜底
+                // ⇒ **我们精心算的 Retry-After 被整个丢弃**，改走 20→60s 本地阶梯
+                // ⇒ 等真实恢复时间的 2~6 倍（CLAUDE.md 记录：当晚 1753 次失败就是这么来的）。
+                // 改文案前先 `grep COOLING_MARKERS /opt/skiapi/services/kiro_shield.py`。
+                "网关已就该请求打满上游调用预算（每请求上限），上游仍不可用（等容量）。\
+                 这是可重试的瞬态状态，请按 Retry-After 退避后重试。",
+            )),
+        )
+            .into_response();
+    }
+
     if err_str.contains(ABSORB_BUDGET_EXHAUSTED_MARKER) {
         // Retry-After 优先用号池真值（`retry_after_secs=N`），其次按类别兜底。
         let retry_after = parse_retry_after_secs(&err_str)
@@ -1082,7 +1535,9 @@ fn map_provider_error(err: Error) -> Response {
             [(header::RETRY_AFTER, retry_after.to_string())],
             Json(ErrorResponse::new(
                 "api_error",
-                "网关已就该请求重试至预算上限，上游仍不可用。这是可重试的瞬态状态，\
+                // 「等容量」同上，是 shield `COOLING_MARKERS` 的承重词（详见上一处 503 的注释）。
+                // 少了它，shield 丢弃我们的 Retry-After 改走 20→60s 本地阶梯。
+                "网关已就该请求重试至预算上限，上游仍不可用（等容量）。这是可重试的瞬态状态，\
                  请按 Retry-After 退避后重试。若持续出现：①面板『限流健康』查看号池容量与冷却分布；\
                  ②补充凭据分摊上游压力；③必要时调高 upstreamRetryAbsorb* 预算。",
             )),
@@ -1278,7 +1733,14 @@ fn map_provider_error(err: Error) -> Response {
     // 已确证含义的上游错误：翻译成带排障步骤的可读错误。
     if let Some(t) = translate_upstream_error(&err_str) {
         tracing::warn!(error = %err, error_type = t.error_type, "上游错误已翻译为可读排障提示");
-        return (t.status, Json(ErrorResponse::new(t.error_type, t.message))).into_response();
+        let mut resp = (t.status, Json(ErrorResponse::new(t.error_type, t.message))).into_response();
+        if t.retry_compress {
+            resp.headers_mut().insert(
+                axum::http::HeaderName::from_static("x-kirostudio-compress-retry"),
+                axum::http::HeaderValue::from_static("1"),
+            );
+        }
+        return resp;
     }
 
     // 上游 5xx / 传输层错误：**503 + Retry-After**，不落未识别兜底的 502。
@@ -1378,6 +1840,50 @@ pub async fn get_models() -> impl IntoResponse {
     })
 }
 
+/// 入站整形准入闸门：整个客户端请求只过一次（在透传/Kiro/WebSearch 分叉之前）。
+/// 两条 HTTP 入口（post_messages 与 post_messages_cc）都必须调用本函数。
+/// 2026-08-10 前闸门在 provider.call_api_with_retry 内部（仅 Kiro 路径过闸、透传
+/// 100% 绕过）；移到 handler 层后 /cc/v1 入口曾漏闸，2026-08-11 补上。
+///
+/// 超时语义依赖 throttle.rs：queue_timeout_passthrough=true（默认）时排队超时=放行
+/// （返回 None），false 时才返回 429 + Retry-After。
+///
+/// ⚠️ 本函数体里的标记字面量被源码级守卫钉死（admission_timeout_bail_must_carry_
+/// its_own_marker 切片本函数体断言），改文案前先看那个测试的注释。
+async fn try_inbound_admission_gate(
+    provider: &crate::kiro::provider::KiroProvider,
+    model: &str,
+    stream: bool,
+    client: &ClientInfo,
+) -> Option<Response> {
+    if let Err(retry_after) = provider.token_manager().acquire_admission().await {
+        let ra = retry_after.clamp(1, 300);
+        let err_str = format!(
+            "入站限速排队超时(网关目标 {} RPM 保护上游)inbound_admission_timeout=1 retry_after_secs={}",
+            provider.token_manager().inbound_target_rpm(), ra);
+        crate::common::recovery_metrics::bump_inbound_admission_timeout();
+        let mut record = crate::usage::RequestRecord::new(
+            uuid::Uuid::new_v4().to_string(), model.to_string());
+        record.requested_model = Some(model.to_string());
+        record.is_streaming = stream;
+        record.outcome = crate::usage::RequestOutcome::RateLimited;
+        record.error_message = Some(err_str);
+        record.session_id = Some("admission-timeout".to_string());
+        client.apply(&mut record);
+        crate::usage::emit_record(record);
+        tracing::warn!(retry_after_secs = ra, "入站准入排队超时（网关背压），返回 429 + Retry-After");
+        return Some((
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, ra.to_string())],
+            Json(ErrorResponse::new("rate_limit_error",
+                "Gateway inbound rate shaping is at capacity. \
+                 This is gateway-side backpressure, not an upstream cooldown; \
+                 retrying immediately will not help.")),
+        ).into_response());
+    }
+    None
+}
+
 /// POST /v1/messages
 ///
 /// 创建消息（对话）
@@ -1442,9 +1948,30 @@ pub async fn post_messages(
     //    默认按 priority 公平比较，Kiro 更优时**跳过**透传直接走 Kiro；
     //    即便跳过，Kiro 全失败后 provider 的 failover 依然会落回代挂池，兜底能力不减。
     let user_id = payload.metadata.as_ref().and_then(|m| m.user_id.clone());
+
+    // 入站整形准入闸门：透传与 Kiro 两条路径之上统一过一次令牌桶。
+    // 2026-08-10 修：此前闸门只在 provider.rs 的 call_api_with_retry 内部
+    // （仅 Kiro 路径得过），透传路径 100% 绕过 → inboundThrottleEnabled 对
+    // 代挂池完全无效。现移到 handler 层，两条路径进来之前统一过闸。
+    if let Some(resp) = try_inbound_admission_gate(&provider, &payload.model, payload.stream, &client).await {
+        return resp;
+    }
+
+    // 每客户端请求的共享上游预算（2026-08-11 方案 A，RPM 放大治本）：沿整条调用链传递
+    // （透传 failover → websearch 回灌轮 → 压缩重试轮 → Kiro 主路径 failover → MCP），
+    // 无论嵌套多少层，一次客户端请求打上游的总次数恒 ≤ ABSOLUTE_MAX_TOTAL_RETRIES。
+    let retry_budget = crate::kiro::provider::SharedRetryBudget::new();
+
     let passthrough_result = if provider.token_manager().should_try_custom_api_first() {
         provider
-            .try_custom_api_passthrough(raw_body.clone(), Some(&payload.model), user_id.as_deref())
+            .try_custom_api_passthrough(
+                raw_body.clone(),
+                Some(&payload.model),
+                user_id.as_deref(),
+                // P3：把客户端请求头传给透传，让 forward 按白名单转发 anthropic-beta 等。
+                Some(&headers),
+                &retry_budget,
+            )
             .await
     } else {
         None
@@ -1463,6 +1990,9 @@ pub async fn post_messages(
             Uuid::new_v4().to_string(),
             meta.model.clone().unwrap_or_else(|| payload.model.clone()),
         );
+        // 双口径：requested = 客户端原始名，upstream = 映射后名（PassthroughMeta 携带）。
+        record.requested_model = meta.model.clone();
+        record.upstream_model = meta.mapped_model.clone();
         record.credential_id = Some(meta.credential_id);
         record.session_id = meta.session_id.clone();
         record.is_streaming = payload.stream;
@@ -1470,6 +2000,11 @@ pub async fn post_messages(
         record.output_tokens = 0;
         record.latency_ms = meta.latency_ms;
         record.outcome = meta.outcome;
+        // 🔴 上游错误原文进 trace（此前恒空，导致 400 根因不可见）。
+        // 只记截断后的开头，避免超长错误体污染 trace。
+        if let Some(err) = &meta.upstream_error {
+            record.error_message = Some(err.clone());
+        }
         client.apply(&mut record);
         crate::usage::emit_record(record);
         return resp;
@@ -1490,14 +2025,22 @@ pub async fn post_messages(
             payload.tools.as_deref(),
         ) as i32;
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        return websearch::handle_websearch_request(provider, &payload, input_tokens, &retry_budget).await;
     }
 
     // 混合工具场景：请求带 web_search 但未显式触发搜索，剔除 web_search 后走常规转发，
     // 避免把 web_search 原样下发给 Kiro 触发 400 Improperly formed request。
-    if websearch::has_web_search_tool(&payload) {
-        tracing::info!("检测到混合工具列表中的 web_search，剔除后转发上游");
-        websearch::strip_web_search_tools(&mut payload);
+    // 🔴 2026-08-09：混合工具场景**不再剔除** web_search。
+    //
+    // 改前剔除 ⇒ 上游模型完全看不到搜索工具 ⇒ Claude Code 的 WebSearch 在
+    // "web_search + 其他工具"（CC 常态）下**静默失效**。现在交给 converter 把它
+    // 归一化成 Kiro 认的函数工具形态（converter.rs 的 convert_tools + 内置
+    // web_search schema），模型能看到、能调用，回 tool_use 时由**网关内部消化**：
+    // 上游回 web_search tool_use 且本轮无其他工具 → agentic 回灌（内部调 MCP、
+    // 结果回灌重发，最多 5 轮）；一旦混入非 web_search 工具 → 整轮原样回客户端。
+    // 纯 web_search 与显式触发仍走上面的本地 MCP 快路径，不受影响。
+    if let Some(resp) = dispatch_web_search_loop(&provider, &payload, &retry_budget, &client).await {
+        return resp;
     }
 
     // 转换请求
@@ -1525,9 +2068,17 @@ pub async fn post_messages(
     };
 
     // 构建 Kiro 请求体（发上游前，超阈值时执行输入压缩；profile_arn 由 provider 层注入）
-    let request_body =
-        match build_kiro_request_body(conversion_result.conversation_state, &current_compression())
-        {
+    // 保留原始状态的克隆，供 CONTENT_LENGTH_EXCEEDS 重试时重建（渐进式压低 target_bytes）。
+    // native effort 字段随请求体一起走（压缩只作用于 conversation_state，不受影响）。
+    let conv_state_for_compress_retry = conversion_result.conversation_state.clone();
+    let native_fields_for_compress_retry =
+        conversion_result.additional_model_request_fields.clone();
+    let request_body = match build_kiro_request_body(
+        conversion_result.conversation_state,
+        conversion_result.additional_model_request_fields,
+        &current_compression(),
+        None,
+    ) {
             Ok(body) => body,
             Err(e) => {
                 tracing::error!("序列化请求失败: {}", e);
@@ -1552,11 +2103,16 @@ pub async fn post_messages(
         payload.tools.as_deref(),
     ) as i32;
 
-    // 估算影子缓存：系统提示 + 历史轮次已被 Bedrock prefix cache 缓存（通过 agentContinuationId）。
-    // 仅在有历史轮次时（messages.len() > 1）估算；首轮返回 0 保守不注入。
+    // 估算影子缓存
     let prefix_tokens = token::count_prefix_tokens(payload.system.as_deref(), &payload.messages);
-    let cache_breakdown =
-        estimate_cache_breakdown(prompt_cache_enabled(), prefix_tokens, input_tokens);
+    // Layer 3 指纹（2026-08-11 移植，cache_fingerprint.rs）：比 Layer 2 前缀估算严格更完整
+    // （含 creation）。无指纹（无会话种子/无历史前缀）时回退 Layer 2 前缀估算。
+    let fingerprint_usage = prompt_cache_enabled()
+        .then(|| crate::anthropic::cache_fingerprint::compute_fingerprint_usage(&payload))
+        .flatten();
+    let cache_breakdown = fingerprint_usage
+        .map(|u| u.clamp_to_total(input_tokens).to_cache_breakdown())
+        .or_else(|| estimate_cache_breakdown(prompt_cache_enabled(), prefix_tokens, input_tokens));
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -1567,55 +2123,118 @@ pub async fn post_messages(
 
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
+    let tool_required_fields = conversion_result.tool_required_fields;
 
-    if payload.stream {
-        // 流式响应。CC 自动切协议：识别到 Claude Code 且开关开启时，改走 buffered 分发
-        // （等价 /cc/v1），让 message_start 的 input_tokens 用上游准确值——CC 会校验它。
-        // 这样 CC 直接打 /v1 也能拿到正确行为，无需手动改用 /cc/v1 端点。
-        if cc_auto_buffer_enabled() && is_claude_code_request(&headers) {
-            tracing::debug!(
-                "识别到 Claude Code 请求，/v1 流式自动切换为 buffered 分发（准确 input_tokens）"
-            );
-            handle_stream_request_buffered(
-                provider,
-                &request_body,
-                &payload.model,
-                input_tokens,
-                thinking_enabled,
-                tool_name_map,
-                known_tool_names,
-                cache_breakdown,
-                client,
-            )
-            .await
+    // 压缩重试：上游返回 CONTENT_LENGTH_EXCEEDS_THRESHOLD 时，网关用更低的压缩目标重建请求体重发。
+    // 初试用配置阈值，重试时 target_bytes 按 (3/4)^attempt 逐轮压低（最多 3 次，下限 64 KiB），
+    // 且受总墙钟预算约束（单轮内部有自己的 45s failover 预算，多轮叠乘需封顶）。
+    const MAX_COMPRESS_RETRIES: u32 = 3;
+    // 90 = 2×45s：初试一轮完整 failover 预算 + 至少一次完整重试预算（慢上游下压缩重试
+    // 才有意义）。墙钟只在**轮末**检查（见下方循环的 continue 条件），一轮内部可跑满
+    // 45s failover 预算 ⇒ 实际最坏 ≈ 90 + 45 = 135s（最后通过检查的那轮不可抢占）——
+    // 有界即可，不给满 4×45s：压缩重试是「同一请求换个更小的 body」的低成功期望尝试，
+    // 叠乘 180s 正是要压住的最坏形态。
+    const MAX_COMPRESS_RETRY_BUDGET_SECS: u64 = 90;
+    let compress_started = std::time::Instant::now();
+    let mut compress_attempt: u32 = 0;
+    let compression_cfg = current_compression();
+    'compress_retry: loop {
+        let response_body;
+
+        // 仅在重试时重建请求体（初试已在上面构建好，直接复用 request_body）。
+        let body_ref: &str = if compress_attempt == 0 {
+            &request_body
         } else {
-            handle_stream_request(
-                provider,
-                &request_body,
+            let target = compress_retry_target(compression_cfg.trigger_bytes, compress_attempt);
+            response_body = match build_kiro_request_body(
+                conv_state_for_compress_retry.clone(),
+                native_fields_for_compress_retry.clone(),
+                &compression_cfg,
+                Some(target),
+            ) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::error!("压缩重试时序列化请求失败: {}", e);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse::new("internal_error", format!("序列化请求失败: {}", e))),
+                    ).into_response();
+                }
+            };
+            tracing::info!(
+                attempt = compress_attempt,
+                target_bytes = target,
+                body_len = response_body.len(),
+                "CONTENT_LENGTH_EXCEEDS: 重新压缩请求体并重试"
+            );
+            &response_body
+        };
+
+        let response = if payload.stream {
+            if cc_auto_buffer_enabled() && is_claude_code_request(&headers) {
+                tracing::debug!("识别到 Claude Code 请求，/v1 流式自动切换为 buffered 分发");
+                handle_stream_request_buffered(
+                    provider.clone(),
+                    body_ref,
+                    &payload.model,
+                    input_tokens,
+                    thinking_enabled,
+                    tool_name_map.clone(),
+                    known_tool_names.clone(),
+                    tool_required_fields.clone(),
+                    cache_breakdown.clone(),
+                    &retry_budget,
+                    client.clone(),
+                ).await
+            } else {
+                handle_stream_request(
+                    provider.clone(),
+                    body_ref,
+                    &payload.model,
+                    input_tokens,
+                    thinking_enabled,
+                    tool_name_map.clone(),
+                    known_tool_names.clone(),
+                    tool_required_fields.clone(),
+                    cache_breakdown.clone(),
+                    &retry_budget,
+                    client.clone(),
+                ).await
+            }
+        } else {
+            let extract_thinking = extract_thinking_enabled() && thinking_enabled;
+            handle_non_stream_request(
+                provider.clone(),
+                body_ref,
                 &payload.model,
                 input_tokens,
-                thinking_enabled,
-                tool_name_map,
-                known_tool_names,
-                cache_breakdown,
-                client,
-            )
-            .await
+                extract_thinking,
+                tool_name_map.clone(),
+                cache_breakdown.clone(),
+                fingerprint_usage,
+                &retry_budget,
+                client.clone(),
+            ).await
+        };
+
+        // 检查是否为可压缩重试的错误（CONTENT_LENGTH_EXCEEDS / Input too long）
+        let is_compress_retryable = compress_attempt < MAX_COMPRESS_RETRIES
+            && compress_started.elapsed()
+                < std::time::Duration::from_secs(MAX_COMPRESS_RETRY_BUDGET_SECS)
+            && response.headers().get("x-kirostudio-compress-retry").is_some();
+
+        if is_compress_retryable {
+            compress_attempt += 1;
+            continue 'compress_retry;
         }
-    } else {
-        // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = extract_thinking_enabled() && thinking_enabled;
-        handle_non_stream_request(
-            provider,
-            &request_body,
-            &payload.model,
-            input_tokens,
-            extract_thinking,
-            tool_name_map,
-            cache_breakdown,
-            client,
-        )
-        .await
+
+        // 重试已耗尽（或本轮不可重试）：x-kirostudio-compress-retry 是内部标记，
+        // 不得透传给客户端（2026-08-11 对抗审查抓出）。
+        let mut final_response = response;
+        final_response
+            .headers_mut()
+            .remove("x-kirostudio-compress-retry");
+        return final_response;
     }
 }
 
@@ -1628,13 +2247,16 @@ async fn handle_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
+    // Bug C：工具必需参数表（工具名 → required 字段名列表）。空表 = 不校验。
+    tool_required_fields: std::collections::HashMap<String, Vec<String>>,
     cache_breakdown: Option<CacheUsageBreakdown>,
+    budget: &crate::kiro::provider::SharedRetryBudget,
     client: ClientInfo,
 ) -> Response {
     // 1M 变体:据原始模型名判定是否注入 anthropic-beta 头(仅受支持的 [1m] 变体为 true)。
     let is_1m = crate::anthropic::model_catalog::resolve_is_1m(model);
     // 调用 Kiro API（支持多凭据故障转移）
-    let (response, meta) = match provider.call_api_stream(request_body, is_1m).await {
+    let (response, meta) = match provider.call_api_stream(request_body, is_1m, budget).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -1649,6 +2271,9 @@ async fn handle_stream_request(
     );
     // 注入影子缓存估算（必须在 generate_initial_events 之前，message_start 才能携带 cache 字段）
     ctx.set_cache_usage(cache_breakdown);
+    // Bug C：注入工具必需参数表，启用「参数 JSON 合法但缺 required 字段」校验
+    // （如 Bash 只给 description 没给 command）。空表 = 不校验，行为与改前一致。
+    ctx.set_tool_required_fields(tool_required_fields);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -1684,6 +2309,9 @@ fn emit_stream_usage(
         Uuid::new_v4().to_string(),
         meta.model.clone().unwrap_or_else(|| ctx.model.clone()),
     );
+    // 双口径：requested = 客户端原始名（= record.model），upstream = 映射后名。
+    record.requested_model = meta.model.clone();
+    record.upstream_model = meta.mapped_model.clone();
     record.credential_id = Some(meta.credential_id);
     record.session_id = meta.session_id.clone();
     record.is_streaming = meta.is_streaming;
@@ -1705,6 +2333,11 @@ fn emit_stream_usage(
     record.retries = meta.retries;
     // 去硬编码 Success：按本次响应的真实完成状态记账，避免截断/上游错误被记成成功污染熔断信号。
     record.outcome = ctx.completion_outcome();
+    // 2026-08-11 补：失败态此前 error_message 恒 NULL（线上 38 条实测盲区）。
+    // client_message() 对失败态必非空；成功态保持 NULL 不污染（与记录契约一致）。
+    if !ctx.completion().is_ok() {
+        record.error_message = Some(ctx.completion().client_message());
+    }
     // 生命周期累计花费：把本次真实 credit 消耗累加到该凭据（独立于用量保留期，只增不清）。
     if let Some(c) = record.credits_used {
         provider.report_credits(meta.credential_id, c);
@@ -2040,8 +2673,9 @@ fn apply_cache_breakdown(
 ///
 /// 优先级（高→低，见 `src/anthropic/cache.rs`）：
 /// 1. **metering 真值**（Layer 1）——真值不是估算，不受 `promptCacheEnabled` 开关约束；
-/// 2. **prefix 估算**（Layer 2，既有 `estimate_cache_breakdown` 产出）；
-/// 3. **fingerprint**（Layer 3，TODO 未移植，恒 None）；
+/// 2. **fingerprint**（Layer 3，2026-08-11 移植）——**存在时跳过 prefix**（下方
+///    `fingerprint_usage.is_some()` 强制 prefix 槽为 None；指纹含 creation 严格更完整）；
+/// 3. **prefix 估算**（Layer 2，既有 `estimate_cache_breakdown` 产出，无指纹时兜底）；
 /// 4. **ratio 兜底**（Layer 4，50% cache / 30% creation）。
 ///
 /// 开关关且无 metering 真值时返回 `(None, false)`：保持既有行为——完全不做 cache 记账，
@@ -2050,6 +2684,7 @@ fn resolve_cache_chain(
     enabled: bool,
     final_input_tokens: i32,
     prefix_estimate: Option<CacheUsageBreakdown>,
+    fingerprint_usage: Option<super::cache::PromptCacheUsage>,
     metering_read: Option<i32>,
     metering_creation: Option<i32>,
 ) -> (Option<CacheUsageBreakdown>, bool) {
@@ -2071,14 +2706,21 @@ fn resolve_cache_chain(
     if !enabled {
         return (None, false);
     }
-    let prefix_estimated_read = prefix_estimate.map(|c| c.cache_read_input_tokens);
+    // Layer 3 存在时强制 Layer 2 槽为 None：否则 fingerprint 的 creation 会被
+    // select_final_usage 的 Layer 2 分支（只读 read、creation 硬置 0）吞掉 ——
+    // 非流式路径下 fingerprint 就成了生产死代码（对抗审查 MAJOR 1，2026-08-11）。
+    let prefix_estimated_read = if fingerprint_usage.is_some() {
+        None
+    } else {
+        prefix_estimate.map(|c| c.cache_read_input_tokens)
+    };
     let ratio_fallback = super::cache::PromptCacheUsage::from_ratios(final_input_tokens, 0.5, 0.3);
-    // Layer 3 fingerprint：TODO 未移植（k2cc `cache/fingerprint.rs`），恒 None。
+    // Layer 3 fingerprint：2026-08-11 移植（cache_fingerprint.rs），无指纹时为 None → 落 Layer 4。
     let usage = super::cache::select_final_usage(
         final_input_tokens,
         None,
         prefix_estimated_read,
-        None,
+        fingerprint_usage,
         ratio_fallback,
     );
     (Some(usage), true)
@@ -2093,12 +2735,14 @@ async fn handle_non_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     cache_breakdown: Option<CacheUsageBreakdown>,
+    fingerprint_usage: Option<super::cache::PromptCacheUsage>,
+    budget: &crate::kiro::provider::SharedRetryBudget,
     client: ClientInfo,
 ) -> Response {
     // 1M 变体:据原始模型名判定是否注入 anthropic-beta 头(仅受支持的 [1m] 变体为 true)。
     let is_1m = crate::anthropic::model_catalog::resolve_is_1m(model);
     // 调用 Kiro API（支持多凭据故障转移）
-    let (response, meta) = match provider.call_api(request_body, is_1m).await {
+    let (response, meta) = match provider.call_api(request_body, is_1m, budget).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -2416,6 +3060,9 @@ async fn handle_non_stream_request(
                 Uuid::new_v4().to_string(),
                 meta.model.clone().unwrap_or_else(|| model.to_string()),
             );
+            // 双口径：requested = 客户端原始名，upstream = 映射后名。
+            record.requested_model = meta.model.clone();
+            record.upstream_model = meta.mapped_model.clone();
             record.credential_id = Some(meta.credential_id);
             record.session_id = meta.session_id.clone();
             record.is_streaming = meta.is_streaming;
@@ -2424,6 +3071,10 @@ async fn handle_non_stream_request(
             record.latency_ms = meta.latency_ms;
             record.retries = meta.retries;
             record.outcome = completion.outcome();
+            // 2026-08-11 补：此前的失败记录不写 error_message（恒 NULL，线上 38 条实测
+            // 成因查不出 = 盲区）。这里 client_message() 对失败态必非空（见 stream.rs
+            // CompletionStatus::client_message），成功态不进本分支。
+            record.error_message = Some(completion.client_message());
             // 生命周期累计花费：本次真实 credit 消耗累加到该凭据（独立于用量保留期，只增不清）。
             if let Some(c) = record.credits_used {
                 provider.report_credits(meta.credential_id, c);
@@ -2491,6 +3142,9 @@ async fn handle_non_stream_request(
         // 口径与流式的 `strip_inline_thinking_when_disabled`、以及
         // `process_reasoning_content` 在 !thinking_enabled 时直接丢帧一致。
         let stripped = super::stream::strip_thinking_from_complete_text(&text_content);
+        // DSML 工具协议标记剥离：DeepSeek 把 `<｜DSML｜function_calls>` 当文本吐，
+        // 非流式此前零处理 → 标记逐字泄漏。与流式 `strip_dsml_markers` 对齐。
+        let stripped = super::stream::strip_dsml_from_complete_text(&stripped);
         if !stripped.is_empty() {
             content.push(json!({
                 "type": "text",
@@ -2507,12 +3161,14 @@ async fn handle_non_stream_request(
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
     let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
 
-    // 四层降级链收敛最终 cache 记账（Layer 1 metering 真值 → Layer 2 prefix → Layer 4 ratio；
-    // Layer 3 fingerprint 为 TODO）。入库用**未缩放真值**，对外下发放大由 scale_for_client 负责。
+    // 四层降级链收敛最终 cache 记账（Layer 1 metering 真值 → Layer 2 prefix →
+    // Layer 3 fingerprint（2026-08-11 移植）→ Layer 4 ratio）。入库用**未缩放真值**，
+    // 对外下发放大由 scale_for_client 负责。
     let (final_cache_breakdown, cache_estimated) = resolve_cache_chain(
         prompt_cache_enabled(),
         final_input_tokens,
         cache_breakdown,
+        fingerprint_usage,
         metering_cache_read,
         metering_cache_creation,
     );
@@ -2523,6 +3179,9 @@ async fn handle_non_stream_request(
             Uuid::new_v4().to_string(),
             meta.model.clone().unwrap_or_else(|| model.to_string()),
         );
+        // 双口径：requested = 客户端原始名，upstream = 映射后名。
+        record.requested_model = meta.model.clone();
+        record.upstream_model = meta.mapped_model.clone();
         record.credential_id = Some(meta.credential_id);
         record.session_id = meta.session_id.clone();
         record.is_streaming = meta.is_streaming;
@@ -2690,6 +3349,16 @@ pub async fn post_messages_cc(
         }
     };
 
+    // 入站整形准入闸门（与 /v1 同闸）：2026-08-11 补。
+    // 改前闸门在 provider.call_api_with_retry 内部，/cc/v1 的 Kiro 路径也过闸；
+    // 移到 handler 层后曾漏掉这条入口，这里补回（websearch 与 Kiro 路径统一过闸）。
+    if let Some(resp) = try_inbound_admission_gate(&provider, &payload.model, payload.stream, &client).await {
+        return resp;
+    }
+
+    // 每客户端请求的共享上游预算（与 /v1 同款，2026-08-11 方案 A）。
+    let retry_budget = crate::kiro::provider::SharedRetryBudget::new();
+
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
@@ -2705,14 +3374,22 @@ pub async fn post_messages_cc(
             payload.tools.as_deref(),
         ) as i32;
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        return websearch::handle_websearch_request(provider, &payload, input_tokens, &retry_budget).await;
     }
 
     // 混合工具场景：请求带 web_search 但未显式触发搜索，剔除 web_search 后走常规转发，
     // 避免把 web_search 原样下发给 Kiro 触发 400 Improperly formed request。
-    if websearch::has_web_search_tool(&payload) {
-        tracing::info!("检测到混合工具列表中的 web_search，剔除后转发上游");
-        websearch::strip_web_search_tools(&mut payload);
+    // 🔴 2026-08-09：混合工具场景**不再剔除** web_search。
+    //
+    // 改前剔除 ⇒ 上游模型完全看不到搜索工具 ⇒ Claude Code 的 WebSearch 在
+    // "web_search + 其他工具"（CC 常态）下**静默失效**。现在交给 converter 把它
+    // 归一化成 Kiro 认的函数工具形态（converter.rs 的 convert_tools + 内置
+    // web_search schema），模型能看到、能调用，回 tool_use 时由**网关内部消化**：
+    // 上游回 web_search tool_use 且本轮无其他工具 → agentic 回灌（内部调 MCP、
+    // 结果回灌重发，最多 5 轮）；一旦混入非 web_search 工具 → 整轮原样回客户端。
+    // 纯 web_search 与显式触发仍走上面的本地 MCP 快路径，不受影响。
+    if let Some(resp) = dispatch_web_search_loop(&provider, &payload, &retry_budget, &client).await {
+        return resp;
     }
 
     // 转换请求
@@ -2740,9 +3417,18 @@ pub async fn post_messages_cc(
     };
 
     // 构建 Kiro 请求体（发上游前，超阈值时执行输入压缩；profile_arn 由 provider 层注入）
-    let request_body =
-        match build_kiro_request_body(conversion_result.conversation_state, &current_compression())
-        {
+    // 保留原始状态的克隆，供 CONTENT_LENGTH_EXCEEDS 重试时重建（渐进式压低 target_bytes，
+    // 与 /v1 路径同款；2026-08-11 审计缺口补齐）。native effort 字段随请求体一起走，
+    // 压缩只作用于 conversation_state，不受影响。
+    let conv_state_for_compress_retry = conversion_result.conversation_state.clone();
+    let native_fields_for_compress_retry =
+        conversion_result.additional_model_request_fields.clone();
+    let request_body = match build_kiro_request_body(
+        conversion_result.conversation_state,
+        conversion_result.additional_model_request_fields,
+        &current_compression(),
+        None,
+    ) {
             Ok(body) => body,
             Err(e) => {
                 tracing::error!("序列化请求失败: {}", e);
@@ -2769,8 +3455,13 @@ pub async fn post_messages_cc(
 
     // 估算影子缓存（与 /v1 路径逻辑一致）
     let prefix_tokens = token::count_prefix_tokens(payload.system.as_deref(), &payload.messages);
-    let cache_breakdown =
-        estimate_cache_breakdown(prompt_cache_enabled(), prefix_tokens, input_tokens);
+    // Layer 3 指纹（与 /v1 同款，2026-08-11 移植）。
+    let fingerprint_usage = prompt_cache_enabled()
+        .then(|| crate::anthropic::cache_fingerprint::compute_fingerprint_usage(&payload))
+        .flatten();
+    let cache_breakdown = fingerprint_usage
+        .map(|u| u.clamp_to_total(input_tokens).to_cache_breakdown())
+        .or_else(|| estimate_cache_breakdown(prompt_cache_enabled(), prefix_tokens, input_tokens));
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -2781,67 +3472,139 @@ pub async fn post_messages_cc(
 
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
+    // Bug C 校验用：工具必需参数表（转换层与 known_tool_names 同处提取、同口径短名）。
+    let tool_required_fields = conversion_result.tool_required_fields;
 
-    if payload.stream {
-        // ⭐ /cc/v1 也必须尊重 ccAutoBuffer（历史缺陷：此处曾**无条件** buffered）。
-        //
-        // 背景：buffered 分发会把整轮回答憋到上游流结束才一次性吐，期间对客户端**只发 ping**。
-        // 项目已在 `default_cc_auto_buffer()` 里坐实它的两个代价并因此把 /v1 的默认改成真流式：
-        //   ① contextUsageEvent 结尾才到 → 整轮看不到进度，模型越慢**越像卡死**
-        //      （客户端侧表现为 "Stream idle timeout - no chunks received"）；
-        //   ② CC 的 steering（执行途中插消息引导）依赖观察流式增量，buffered 把整轮变成
-        //      不可打断的黑盒 → 途中发消息要等整轮憋完才被处理。
-        // 但那次修正只落在 /v1，本端点仍强制 buffered —— 于是把 CC 指向 /cc/v1 的用户
-        // 拿到的是旧的有害行为，且**把 ccAutoBuffer 设成 false 也关不掉**（开关对本路径无效）。
-        //
-        // 现在两个端点由同一个开关统一语义：
-        //   ccAutoBuffer=false（默认）→ 两端都真流式（内容边到边转发）
-        //   ccAutoBuffer=true          → 两端都 buffered（换取 message_start 即精确 input_tokens）
-        if cc_auto_buffer_enabled() {
-            tracing::debug!(
-                "/cc/v1 流式分发: buffered（ccAutoBuffer=true；整轮只发 ping 直到上游流结束）"
-            );
-            handle_stream_request_buffered(
-                provider,
-                &request_body,
-                &payload.model,
-                input_tokens,
-                thinking_enabled,
-                tool_name_map,
-                known_tool_names,
-                cache_breakdown,
-                client,
-            )
-            .await
+    // 压缩重试循环（2026-08-11 补齐，与 /v1 同款语义）：上游 400 CONTENT_LENGTH_EXCEEDS
+    // 时，网关用更低的压缩目标重建请求体重发。初试用配置阈值，重试时 target_bytes 按
+    // (3/4)^attempt 逐轮压低（最多 3 次，下限 64 KiB），且受总墙钟预算约束（单轮内部
+    // 有自己的 45s failover 预算，多轮叠乘需封顶）。常量语义与 /v1 完全一致：
+    // 90 = 2×45s（初试一轮完整 failover 预算 + 至少一次完整重试预算），墙钟只在轮末
+    // 检查，一轮内部可跑满 45s ⇒ 实际最坏 ≈ 135s，有界即可。
+    const MAX_COMPRESS_RETRIES: u32 = 3;
+    const MAX_COMPRESS_RETRY_BUDGET_SECS: u64 = 90;
+    let compress_started = std::time::Instant::now();
+    let mut compress_attempt: u32 = 0;
+    let compression_cfg = current_compression();
+    'compress_retry: loop {
+        let response_body;
+
+        // 仅在重试时重建请求体（初试已在上面构建好，直接复用 request_body）。
+        let body_ref: &str = if compress_attempt == 0 {
+            &request_body
         } else {
-            tracing::debug!("/cc/v1 流式分发: 真流式（ccAutoBuffer=false，内容边到边转发）");
-            handle_stream_request(
-                provider,
-                &request_body,
+            let target = compress_retry_target(compression_cfg.trigger_bytes, compress_attempt);
+            response_body = match build_kiro_request_body(
+                conv_state_for_compress_retry.clone(),
+                native_fields_for_compress_retry.clone(),
+                &compression_cfg,
+                Some(target),
+            ) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::error!("压缩重试时序列化请求失败: {}", e);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse::new("internal_error", format!("序列化请求失败: {}", e))),
+                    ).into_response();
+                }
+            };
+            tracing::info!(
+                attempt = compress_attempt,
+                target_bytes = target,
+                body_len = response_body.len(),
+                "CONTENT_LENGTH_EXCEEDS: 重新压缩请求体并重试"
+            );
+            &response_body
+        };
+
+        let response = if payload.stream {
+            // ⭐ /cc/v1 也必须尊重 ccAutoBuffer（历史缺陷：此处曾**无条件** buffered）。
+            //
+            // 背景：buffered 分发会把整轮回答憋到上游流结束才一次性吐，期间对客户端**只发 ping**。
+            // 项目已在 `default_cc_auto_buffer()` 里坐实它的两个代价并因此把 /v1 的默认改成真流式：
+            //   ① contextUsageEvent 结尾才到 → 整轮看不到进度，模型越慢**越像卡死**
+            //      （客户端侧表现为 "Stream idle timeout - no chunks received"）；
+            //   ② CC 的 steering（执行途中插消息引导）依赖观察流式增量，buffered 把整轮变成
+            //      不可打断的黑盒 → 途中发消息要等整轮憋完才被处理。
+            // 但那次修正只落在 /v1，本端点仍强制 buffered —— 于是把 CC 指向 /cc/v1 的用户
+            // 拿到的是旧的有害行为，且**把 ccAutoBuffer 设成 false 也关不掉**（开关对本路径无效）。
+            //
+            // 现在两个端点由同一个开关统一语义：
+            //   ccAutoBuffer=false（默认）→ 两端都真流式（内容边到边转发）
+            //   ccAutoBuffer=true          → 两端都 buffered（换取 message_start 即精确 input_tokens）
+            if cc_auto_buffer_enabled() {
+                tracing::debug!(
+                    "/cc/v1 流式分发: buffered（ccAutoBuffer=true；整轮只发 ping 直到上游流结束）"
+                );
+                handle_stream_request_buffered(
+                    provider.clone(),
+                    body_ref,
+                    &payload.model,
+                    input_tokens,
+                    thinking_enabled,
+                    tool_name_map.clone(),
+                    known_tool_names.clone(),
+                    tool_required_fields.clone(),
+                    cache_breakdown.clone(),
+                    &retry_budget,
+                    client.clone(),
+                )
+                .await
+            } else {
+                tracing::debug!("/cc/v1 流式分发: 真流式（ccAutoBuffer=false，内容边到边转发）");
+                handle_stream_request(
+                    provider.clone(),
+                    body_ref,
+                    &payload.model,
+                    input_tokens,
+                    thinking_enabled,
+                    tool_name_map.clone(),
+                    known_tool_names.clone(),
+                    tool_required_fields.clone(),
+                    cache_breakdown.clone(),
+                    &retry_budget,
+                    client.clone(),
+                )
+                .await
+            }
+        } else {
+            // 非流式响应：仅在配置开启时提取 thinking 块
+            let extract_thinking = extract_thinking_enabled() && thinking_enabled;
+            handle_non_stream_request(
+                provider.clone(),
+                body_ref,
                 &payload.model,
                 input_tokens,
-                thinking_enabled,
-                tool_name_map,
-                known_tool_names,
-                cache_breakdown,
-                client,
+                extract_thinking,
+                tool_name_map.clone(),
+                cache_breakdown.clone(),
+                fingerprint_usage,
+                &retry_budget,
+                client.clone(),
             )
             .await
+        };
+
+        // 重试判定与 /v1 同款：次数未耗尽、墙钟预算内、且上游回的内部标记头在场。
+        let is_compress_retryable = compress_attempt < MAX_COMPRESS_RETRIES
+            && compress_started.elapsed()
+                < std::time::Duration::from_secs(MAX_COMPRESS_RETRY_BUDGET_SECS)
+            && response.headers().get("x-kirostudio-compress-retry").is_some();
+
+        if is_compress_retryable {
+            compress_attempt += 1;
+            continue 'compress_retry;
         }
-    } else {
-        // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = extract_thinking_enabled() && thinking_enabled;
-        handle_non_stream_request(
-            provider,
-            &request_body,
-            &payload.model,
-            input_tokens,
-            extract_thinking,
-            tool_name_map,
-            cache_breakdown,
-            client,
-        )
-        .await
+
+        // 重试已耗尽（或本轮不可重试）：内部标记头不得透传客户端（2026-08-11 F1b 同款，
+        // 泄漏会误导客户端判据）。此前 /cc/v1 只 strip 不重试，随本次补齐一并迁移至此，
+        // 超限请求现在有自愈重试，不再是「strip 后直接 400 返回」的已知缺口。
+        let mut final_response = response;
+        final_response
+            .headers_mut()
+            .remove("x-kirostudio-compress-retry");
+        return final_response;
     }
 }
 
@@ -2857,13 +3620,16 @@ async fn handle_stream_request_buffered(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
+    // Bug C：工具必需参数表（工具名 → required 字段名列表）。空表 = 不校验。
+    tool_required_fields: std::collections::HashMap<String, Vec<String>>,
     cache_breakdown: Option<CacheUsageBreakdown>,
+    budget: &crate::kiro::provider::SharedRetryBudget,
     client: ClientInfo,
 ) -> Response {
     // 1M 变体:据原始模型名判定是否注入 anthropic-beta 头(仅受支持的 [1m] 变体为 true)。
     let is_1m = crate::anthropic::model_catalog::resolve_is_1m(model);
     // 调用 Kiro API（支持多凭据故障转移）
-    let (response, meta) = match provider.call_api_stream(request_body, is_1m).await {
+    let (response, meta) = match provider.call_api_stream(request_body, is_1m, budget).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -2878,6 +3644,9 @@ async fn handle_stream_request_buffered(
     );
     // 注入影子缓存估算（finish_and_get_all_events 回补 message_start 时会携带 cache 字段）
     ctx.set_cache_usage(cache_breakdown);
+    // Bug C：注入工具必需参数表，启用「参数 JSON 合法但缺 required 字段」校验
+    // （如 Bash 只给 description 没给 command）。空表 = 不校验，行为与改前一致。
+    ctx.set_tool_required_fields(tool_required_fields);
 
     // 响应头须在首个 chunk 前定稿，故在建流（消费 ctx）之前先取。
     // 这条 buffered 路径是线上默认（ccAutoBuffer=true），标注不能只做在流式路径上。
@@ -3073,6 +3842,9 @@ fn emit_buffered_usage(
         Uuid::new_v4().to_string(),
         meta.model.clone().unwrap_or_default(),
     );
+    // 双口径：requested = 客户端原始名，upstream = 映射后名。
+    record.requested_model = meta.model.clone();
+    record.upstream_model = meta.mapped_model.clone();
     record.credential_id = Some(meta.credential_id);
     record.session_id = meta.session_id.clone();
     record.is_streaming = meta.is_streaming;
@@ -3094,6 +3866,11 @@ fn emit_buffered_usage(
     record.retries = meta.retries;
     // 去硬编码 Success：按真实完成状态记账（截断/上游错误不再被记成成功）。
     record.outcome = ctx.completion_outcome();
+    // 2026-08-11 补：与 emit_stream_usage 同款 —— 失败态补上错误详情，闭合 error_message
+    // 恒 NULL 的盲区（线上 38 条实测）。成功态保持 NULL。
+    if !ctx.completion().is_ok() {
+        record.error_message = Some(ctx.completion().client_message());
+    }
     // 生命周期累计花费：把本次真实 credit 消耗累加到该凭据（独立于用量保留期，只增不清）。
     if let Some(c) = record.credits_used {
         provider.report_credits(meta.credential_id, c);
@@ -3239,7 +4016,7 @@ mod non_stream_cache_accounting_tests {
     /// Layer 1：上游 metering 真值优先于一切本地估算，且不标注「估算」。
     #[test]
     fn should_use_metering_truth_over_estimate() {
-        let (bd, estimated) = resolve_cache_chain(true, 1000, None, Some(600), Some(200));
+        let (bd, estimated) = resolve_cache_chain(true, 1000, None, None, Some(600), Some(200));
         let bd = bd.expect("metering 真值应产出记账");
         assert_eq!(bd.cache_read_input_tokens, 600);
         assert_eq!(bd.cache_creation_input_tokens, 200);
@@ -3251,7 +4028,7 @@ mod non_stream_cache_accounting_tests {
     /// Layer 1 真值 > total 时按 clamp_to_total 收敛（优先保留 read）。
     #[test]
     fn should_clamp_metering_truth_to_total() {
-        let (bd, _) = resolve_cache_chain(true, 100, None, Some(80), Some(50));
+        let (bd, _) = resolve_cache_chain(true, 100, None, None, Some(80), Some(50));
         let bd = bd.expect("应有记账");
         assert_eq!(bd.cache_read_input_tokens, 80);
         assert_eq!(bd.cache_creation_input_tokens, 20);
@@ -3260,7 +4037,7 @@ mod non_stream_cache_accounting_tests {
     /// Layer 1 真值不受 `promptCacheEnabled=false` 约束（真值不是估算）。
     #[test]
     fn should_record_metering_truth_even_when_disabled() {
-        let (bd, estimated) = resolve_cache_chain(false, 1000, None, Some(400), Some(100));
+        let (bd, estimated) = resolve_cache_chain(false, 1000, None, None, Some(400), Some(100));
         assert!(bd.is_some(), "真值应照记，即使开关关");
         assert!(!estimated);
     }
@@ -3268,7 +4045,7 @@ mod non_stream_cache_accounting_tests {
     /// 开关关且无 metering 真值 → 整体缺失（None），不凭空造 cache 命中。
     #[test]
     fn should_omit_entirely_when_disabled_and_no_metering() {
-        let (bd, estimated) = resolve_cache_chain(false, 1000, Some(estimate_cache_breakdown(true, 500, 1000).unwrap()), None, None);
+        let (bd, estimated) = resolve_cache_chain(false, 1000, Some(estimate_cache_breakdown(true, 500, 1000).unwrap()), None, None, None);
         assert!(bd.is_none(), "关闭时不得下发 cache 记账");
         assert!(!estimated);
     }
@@ -3276,17 +4053,48 @@ mod non_stream_cache_accounting_tests {
     /// Layer 2：无 metering 时回落 prefix 估算（既有行为）。
     #[test]
     fn should_fall_back_to_prefix_estimate() {
-        let (bd, estimated) = resolve_cache_chain(true, 1000, Some(estimate_cache_breakdown(true, 400, 1000).unwrap()), None, None);
+        let (bd, estimated) = resolve_cache_chain(true, 1000, Some(estimate_cache_breakdown(true, 400, 1000).unwrap()), None, None, None);
         let bd = bd.expect("prefix 估算应产出记账");
         assert_eq!(bd.cache_read_input_tokens, 400);
         assert_eq!(bd.cache_creation_input_tokens, 0);
         assert!(estimated, "估算应标「估算」头");
     }
 
+    /// ⭐ Layer 3 回归（对抗审查 MAJOR 1，2026-08-11）：fingerprint 与 prefix 估算
+    /// **同时存在**时必须走 Layer 3 —— fingerprint 的 creation 绝不能被 Layer 2 分支
+    /// （只读 read、creation 硬置 0）吞掉。回退即 FAIL：把 resolve_cache_chain 里的
+    /// `if fingerprint_usage.is_some() { None } else { ... }` 改回直接 map。
+    #[test]
+    fn fingerprint_wins_over_prefix_and_keeps_creation() {
+        // 构造：prefix 估算 read=400（Layer 2 若赢：creation=0）；
+        // fingerprint（Layer 3）：read=250、creation=120。
+        let fp = crate::anthropic::cache::PromptCacheUsage {
+            cache_creation_input_tokens: 120,
+            cache_read_input_tokens: 250,
+            cache_creation_5m_input_tokens: 120,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let (bd, estimated) = resolve_cache_chain(
+            true,
+            1000,
+            Some(estimate_cache_breakdown(true, 400, 1000).unwrap()),
+            Some(fp),
+            None,
+            None,
+        );
+        let bd = bd.expect("fingerprint 应产出记账");
+        assert_eq!(
+            bd.cache_creation_input_tokens, 120,
+            "Layer 3 的 creation 不得被 Layer 2 吞成 0（非流式路径曾恒 0）"
+        );
+        assert_eq!(bd.cache_read_input_tokens, 250, "Layer 3 的 read 优先于 Layer 2 的 400");
+        assert!(estimated);
+    }
+
     /// Layer 4：无 metering、无 prefix 时 ratio 兜底（50% cache / 30% creation）。
     #[test]
     fn should_fall_back_to_ratio_when_no_estimate() {
-        let (bd, estimated) = resolve_cache_chain(true, 1000, None, None, None);
+        let (bd, estimated) = resolve_cache_chain(true, 1000, None, None, None, None);
         let bd = bd.expect("ratio 兜底应产出记账");
         // 50% × 1000 = 500 cache，creation = 150，read = 350。
         assert_eq!(bd.cache_read_input_tokens, 350);
@@ -4190,6 +4998,96 @@ mod error_translation_tests {
         );
     }
 
+    /// 线上实测原文（passthrough.rs 注释里的样本，逐字）：同一 body 里 message 与
+    /// reason 两个信号并存 —— 判据必须同时认，认其一漏其二。
+    const REAL_REQUEST_BODY_INVALID: &str = r#"非流式 API 请求失败: 400 Bad Request {"__type":"com.amazon.aws.codewhisperer#ValidationException","message":"Invalid tool use format.","reason":"REQUEST_BODY_INVALID"}"#;
+
+    #[test]
+    fn request_body_invalid_maps_to_400_invalid_request_not_502() {
+        use axum::body::to_bytes;
+        // 判据本身（收口在 endpoint 侧，与 `default_is_*` 系列同处）。
+        assert!(
+            crate::kiro::endpoint::default_is_request_body_invalid(REAL_REQUEST_BODY_INVALID),
+            "线上原文必须命中判据"
+        );
+        let resp = map_provider_error(anyhow::Error::msg(REAL_REQUEST_BODY_INVALID));
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "请求体校验失败是请求构造问题，必须 400（旧路径落兜底 502 → 性质说错，\
+             且 502 在外挂 RETRYABLE 集里会被反复重打同一个必败的请求）"
+        );
+        assert!(
+            resp.headers().get(header::RETRY_AFTER).is_none(),
+            "重试无效的错误绝不带 Retry-After"
+        );
+        let body = futures::executor::block_on(to_bytes(resp.into_body(), usize::MAX)).unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("invalid_request_error"),
+            "错误类型必须是 invalid_request_error（客户端按类型决定是否重试）。实际: {text}"
+        );
+    }
+
+    /// 判据边界：`ValidationException` 是上游多种校验共用（TOOL_USE_RESULT_MISMATCH 等），
+    /// 泛匹配会把处置不同的错误混成一类 —— 判据只认两个专用信号，不得泛认。
+    #[test]
+    fn request_body_invalid_predicate_never_matches_bare_validation_exception() {
+        let bare = r#"非流式 API 请求失败: 400 Bad Request {"__type":"com.amazon.aws.codewhisperer#ValidationException","message":"anything","reason":"SOME_UNMAPPED_REASON"}"#;
+        assert!(
+            !crate::kiro::endpoint::default_is_request_body_invalid(bare),
+            "不带两个专用信号的 body 不得命中（否则把处置不同的校验错误混成一类）"
+        );
+        assert_eq!(
+            map_provider_error(anyhow::Error::msg(bare)).status(),
+            StatusCode::BAD_GATEWAY,
+            "未映射错误仍落 502 兜底 —— 证明本判据没把别的 400 抢走"
+        );
+    }
+
+    /// M1 形态（对抗审查）：`Improperly formed request` + `reason=REQUEST_BODY_INVALID`
+    /// 是**用户请求体**格式校验失败的常见形态（converter.rs/websearch.rs 实测：工具 schema
+    /// 属性、工具名超限、web_search 直发）。改前它被凭据分类分支（`Improperly formed` 子串）
+    /// 截胡成 502「上游拒绝凭据」——排障方向全错。必须 400 invalid_request_error。
+    #[test]
+    fn improperly_formed_body_invalid_maps_to_400_not_502_credential_rejection() {
+        let raw = r#"流式 API 请求失败: 400 Bad Request {"__type":"com.amazon.aws.codewhisperer#ValidationException","message":"Improperly formed request.","reason":"REQUEST_BODY_INVALID"}"#;
+        assert!(
+            crate::kiro::endpoint::default_is_request_body_invalid(raw),
+            "判据必须命中该形态"
+        );
+        let resp = map_provider_error(anyhow::Error::msg(raw));
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "用户请求体的格式校验失败必须 400，不得被说成凭据/订阅问题（502）"
+        );
+    }
+
+    /// 顺序守卫（承重，m2）：请求体校验分支**不得**抢走 `INSUFFICIENT_MODEL_CAPACITY`
+    /// 的 503。与 `image_mime_mismatch_must_not_shadow_capacity_400` 同款——容量 400
+    /// 必须拿 503 `overloaded_error` 客户端才会退避重试；顺序靠 `.or_else` 链保证
+    /// （quota 链先执行），回退即 FAIL。
+    #[test]
+    fn request_body_invalid_must_not_steal_capacity_400_503() {
+        let capacity = r#"400 Bad Request {"__type":"com.amazon.aws.codewhisperer#ThrottlingException","message":"I am experiencing high traffic, please try again shortly.","reason":"INSUFFICIENT_MODEL_CAPACITY"}"#;
+        assert_eq!(
+            map_provider_error(anyhow::Error::msg(capacity)).status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "前提：容量 400 单独出现时确实拿 503"
+        );
+        let both = format!("{capacity} / {REAL_REQUEST_BODY_INVALID}");
+        assert!(
+            crate::kiro::endpoint::default_is_request_body_invalid(&both),
+            "前提：请求体判据确实命中该串（否则顺序断言是空的）"
+        );
+        assert_eq!(
+            map_provider_error(anyhow::Error::msg(both)).status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "容量 400 不得被请求体校验分支抢走：它必须拿 503 才会被客户端退避重试"
+        );
+    }
+
     #[test]
     fn test_insufficient_throughput_also_maps_to_429() {
         // 另一种上游限流文案（实测 8 条）：high traffic / INSUFFICIENT_THROUGHPUT。
@@ -4304,6 +5202,74 @@ mod error_translation_tests {
     /// 吸收层对一个**一个可自愈的号都没有**的池（全 QuotaExhausted /
     /// RefreshTokenInvalid / AccountSuspended）拿满 45s 预算空转，客户端从 <2s
     /// 拿到 429 变成 45s 才拿到，且这 45s 内它一直占着连接。
+    #[test]
+    /// 🔴 **跨系统契约守卫**：两处 503 的文案必须含 shield 的 `COOLING_MARKERS` 词。
+    ///
+    /// 线上真实链路 `Caddy → kiro_shield.py(外挂,不在本仓) → KiroStudio`。
+    /// shield 的 `classify()` **按 body 文案分类而非状态码**，且只有 `verdict ∈ {cool,auth}`
+    /// 才读我们的 `Retry-After`：
+    /// ```text
+    /// if verdict in ("cool","auth"): delay = cool_delay(attempt, Retry-After)   # 听真值
+    /// else:                          delay = swap_delay(attempt)                # 本地阶梯
+    /// ```
+    /// 文案里少了 marker 词 ⇒ 落 `retry` 兜底 ⇒ **精心算出的 Retry-After 被整个丢弃**，
+    /// 改走 20→60s 阶梯 ⇒ 等真实恢复时间的 2~6 倍。
+    /// CLAUDE.md 记录同款事故：当晚 1753 次失败。
+    ///
+    /// 回退即 FAIL：把文案里的「等容量」删掉 → 本测试红。
+    /// ⚠️ 若 shield 的 `COOLING_MARKERS` 变更，需同步本测试
+    /// （核对命令：`ssh skiapi 'grep -A12 COOLING_MARKERS /opt/skiapi/services/kiro_shield.py'`）。
+    #[test]
+    fn absorb_503_body_must_carry_shield_cooling_marker() {
+        let src = include_str!("handlers.rs");
+        let prod = src.split("\n#[cfg(test)]").next().unwrap_or(src);
+
+        // shield COOLING_MARKERS 里我们实际使用的那个词（2026-08-11 线上实读核对）。
+        // 运行时拼接，避免本测试段自身的字面量让 `find` 命中测试代码而非生产代码
+        // —— 本仓已发生过两次这类「守卫静默变绿」事故。
+        let marker: String = ["等", "容量"].concat();
+
+        // ⚠️ **只钉「网关自己把预算用光」这两处**，不是所有 503。
+        //
+        // 生产区共 6 处 503，另外 4 处刻意**不该**带这个 marker：
+        //   · 上游模型过载（`MODEL_TEMPORARILY_UNAVAILABLE` / `INSUFFICIENT_MODEL_CAPACITY`）
+        //     —— shield 对该文案有自己的判据，语义是"上游没容量"而非"网关在等容量"；
+        //   · 兜底 5xx（`is_retryable_upstream_error` 捡剩下的）—— 语义是"上游挂了"；
+        //   · Provider 未初始化 ×2（启动期）—— 与退避无关，客户端重试也没用。
+        // 把它们一起钉进来会强迫无关文案携带误导词，那是过度约束。
+        //
+        // 锚点用「网关已就该请求」——两处 503 文案共有的前缀，语义即"网关自身预算耗尽"。
+        let anchor: String = ["网关已就该请求"].concat();
+        let n = prod.matches(anchor.as_str()).count();
+        assert_eq!(
+            n, 2,
+            "预期恰好 2 处「网关自身预算耗尽」型 503（共享预算耗尽 + 吸收层耗尽），实际 {n} 处。\n\
+             若你新增/删除了这类 503，请同步本守卫；若只是改了文案前缀，请改回或更新 anchor。"
+        );
+
+        // ⚠️ 用 `match_indices` 而不是「find 后 at = i + 1」：源码含大量中文，
+        // `i + 1` 会落进 UTF-8 多字节字符内部，切片直接 panic
+        // （`start byte index ... is not a char boundary`）。本测试初版就是这么挂的。
+        let hits: Vec<usize> = prod.match_indices(anchor.as_str()).map(|(i, _)| i).collect();
+        for (k0, &i) in hits.iter().enumerate() {
+            let k = k0 + 1;
+            // 文案是多行字符串续行拼接，marker 落在 anchor 之后数十字符内。
+            // ⚠️ 不要用「字节窗口 + char_indices 求上界」那种写法：源码是 CJK 密集的，
+            // 字节窗口换算成字符数会缩到 1/3，且 `.last()` 拿到的是字符**起点**，
+            // 可能刚好切在 marker 前面 —— 本测试初版就是这么误红的。
+            // 直接按**字符**取窗口（`chars().take(N)`），既安全又与直觉一致。
+            let window: String = prod[i..].chars().take(240).collect();
+            assert!(
+                window.contains(marker.as_str()),
+                "第 {k} 处「网关自身预算耗尽」503（字节偏移 {i}）的文案里找不到 shield \
+                 COOLING_MARKERS 词「{marker}」。\n\
+                 后果：shield 的 classify() 判它为 `retry` 而非 `cool` ⇒ \
+                 丢弃我们的 Retry-After，改走 20→60s 本地阶梯 ⇒ 客户端等真实恢复时间的 2~6 倍。\n\
+                 修法：在该 503 的 message 文案里加上「{marker}」。"
+            );
+        }
+    }
+
     #[test]
     fn permanently_exhausted_pool_is_never_absorbable() {
         // token_manager 两处 bail 的原文形态（**带** retry_after_secs=，因为对客户端
@@ -4759,23 +5725,245 @@ mod error_translation_tests {
         );
     }
 
+    /// 取 `try_inbound_admission_gate` 的**函数体**源码（供准入闸门守卫用）。
+    ///
+    /// 为什么要切片而不是直接用整个文件：`include_str!` 会把本测试模块自己的
+    /// 字面量也读进来（历史事故：同文件测试夹具里有两份带标记的完整消息副本，
+    /// 全文件 `contains` 会在生产格式串丢掉标记时照样绿——本仓自述的
+    /// 「源码级守卫自匹配」陷阱在迁移中被重新引入过一次）。
+    fn inbound_admission_gate_source() -> &'static str {
+        let full = include_str!("handlers.rs");
+        let start = full
+            .find("fn try_inbound_admission_gate(")
+            .expect("准入闸门函数必须存在");
+        let rest = &full[start..];
+        // 函数体结束于下一个顶层 `\n}\n`（本函数内所有 `}` 都有缩进）。
+        let end = rest.find("\n}\n").expect("准入闸门函数必须有结尾");
+        &rest[..end]
+    }
+
     #[test]
     fn admission_timeout_bail_must_carry_its_own_marker() {
-        // 源码级守卫：provider 侧那条 bail 必须带 `inbound_admission_timeout=1`。
-        // 只靠上面那条行为测试不够 —— 它喂的是手写字符串，而真正的风险是
-        // **provider 改了 bail 文案却没带标记**，那样行为测试照样绿、线上照样不可区分。
-        //
-        // ⚠️ needle 必须**跨越** bail 格式串里紧邻的两段（`保护上游)` + 标记），
-        // 不能只找标记本身：provider.rs 的注释里也解释了这个标记，只找标记会命中注释
-        // → 把 bail 里的标记删掉测试照样绿（我第一版就是这样，删了标记仍 PASS）。
-        // 这是本仓已记录过的「源码级守卫自匹配」陷阱的同一形态。
-        let src = include_str!("../kiro/provider.rs");
+        // 源码级守卫：准入闸门分支必须带标记、必须 bump 计数、必须 emit_record。
+        // 只靠行为测试不够 —— 它喂的是手写字符串，而真正的风险是生产分支
+        // **改了文案却没带标记 / 丢了观测**，那样行为测试照样绿、线上照样不可区分。
+        // 2026-08-11：从全文件 contains 改为切片函数体，杜绝测试夹具自匹配。
+        let body = inbound_admission_gate_source();
         let needle = format!("{}{}{}", "保护上游)", "inbound_admission_timeout", "=1");
         assert!(
-            src.contains(&needle),
-            "provider.rs 的准入超时 bail 格式串必须紧接 `保护上游)` 带上 \
-             inbound_admission_timeout=1 标记，否则分类器无法把它与全池冷却区分开\
-             （两者都带 retry_after_secs=）"
+            body.contains(&needle),
+            "准入闸门格式串必须紧接 `保护上游)` 带上 inbound_admission_timeout=1 标记，\
+             否则分类器无法把它与全池冷却区分开（两者都带 retry_after_secs=）"
+        );
+        assert!(
+            body.contains("bump_inbound_admission_timeout"),
+            "准入超时分支必须 bump 背压计数（面板可观测性，2026-08-11 恢复的断言）"
+        );
+        assert!(
+            body.contains("emit_record"),
+            "准入超时分支必须 emit_record（usage 统计可观测性，2026-08-11 恢复的断言）"
+        );
+    }
+
+    #[test]
+    fn admission_gate_placement_and_cc_coverage() {
+        // 闸门必须位于 post_messages 的透传分叉**之前**，且 /cc/v1 入口也必须过闸。
+        // 回退即 FAIL：把闸门移到透传块之后（透传再次 100% 绕闸，即本轮修复的缺陷
+        // 本体）或删掉 post_messages_cc 的调用，本守卫都会红。
+        let full = include_str!("handlers.rs");
+        let pm = {
+            let start = full
+                .find("pub async fn post_messages(")
+                .expect("post_messages 必须存在");
+            let rest = &full[start..];
+            let end = rest.find("\n}\n").expect("post_messages 必须有结尾");
+            &rest[..end]
+        };
+        let gate_at = pm
+            .find("try_inbound_admission_gate(")
+            .expect("post_messages 必须调用入站闸门");
+        let passthrough_at = pm
+            .find("try_custom_api_passthrough(")
+            .expect("post_messages 必须包含透传分叉");
+        assert!(
+            gate_at < passthrough_at,
+            "准入闸门必须位于透传分叉之前，否则透传 100% 绕闸且现有守卫全部失明"
+        );
+        let cc = {
+            let start = full
+                .find("pub async fn post_messages_cc(")
+                .expect("post_messages_cc 必须存在");
+            let rest = &full[start..];
+            let end = rest.find("\n}\n").expect("post_messages_cc 必须有结尾");
+            &rest[..end]
+        };
+        assert!(
+            cc.contains("try_inbound_admission_gate("),
+            "/cc/v1 入口必须过入站闸门（闸门移到 handler 层后曾漏掉该入口，属回归）"
+        );
+    }
+
+    #[test]
+    fn compress_retry_loop_uses_extracted_target_fn() {
+        // 压缩重试的目标必须走 compress_retry_target（防有人把公式内联回来再次写反向）。
+        // ⚠️ needle 运行时拼接 + 切片锚定到循环结束（4 空格缩进的 `}`）：
+        // 完整字面量若出现在源码里，include_str! 会把测试段/注释也读进来，生产被删后
+        // `.find` 命中它们 → 守卫静默变绿（本仓踩过同型坑）。拼接后源码不存在完整
+        // needle；循环级切片保证「移出循环但仍在函数内」的回退也会红。
+        let full = include_str!("handlers.rs");
+        let needle = format!("{}: loop {}", "'compress_retry", "{");
+        let start = full
+            .find(needle.as_str())
+            .expect("压缩重试循环必须存在");
+        let end = full[start..]
+            .find("\n    }\n")
+            .map(|i| start + i)
+            .unwrap_or(full.len());
+        let body = &full[start..end];
+        assert!(
+            body.contains("compress_retry_target("),
+            "压缩重试必须用 compress_retry_target 计算目标字节数"
+        );
+    }
+
+    #[test]
+    fn compress_retry_loop_cc_coverage() {
+        // /cc/v1 必须与 /v1 同款压缩重试循环（2026-08-11 审计缺口补齐）：
+        // 循环标签、目标公式、轮末 strip 三者都必须落在 cc 函数体内。
+        // ⚠️ needle 运行时拼接（同仓教训：完整字面量出现在测试/注释里会让守卫静默变绿）：
+        // 循环标签拆成三段拼、strip 的头部名拆两段拼；切片锚定 cc 函数体
+        // （"pub async fn post_messages_cc(" 到函数收尾 `}`），保证「循环挪进别的函数」
+        // 的回退也红。
+        let full = include_str!("handlers.rs");
+        let cc = {
+            let start = full
+                .find("pub async fn post_messages_cc(")
+                .expect("post_messages_cc 必须存在");
+            let rest = &full[start..];
+            let end = rest.find("\n}\n").expect("post_messages_cc 必须有结尾");
+            &rest[..end]
+        };
+        let loop_needle = format!("{}: loop {}", "'compress_retry", "{");
+        let start = cc
+            .find(loop_needle.as_str())
+            .expect("/cc/v1 必须与 /v1 同款压缩重试循环");
+        // 循环收尾锚定：轮末 return 之后紧跟循环结束的 4 空格 `}`（本仓惯例循环收尾
+        // 与函数收尾紧贴、无空行；cc 函数切片止于函数收尾 `}` 前，故用 return 行定位）。
+        let return_at = cc[start..]
+            .find("return final_response;")
+            .map(|i| start + i)
+            .expect("/cc/v1 压缩重试循环轮末必须 return");
+        let end = cc[return_at..]
+            .find("\n    }")
+            .map(|i| return_at + i)
+            .unwrap_or(cc.len());
+        let loop_body = &cc[start..end];
+        assert!(
+            loop_body.contains("compress_retry_target("),
+            "/cc/v1 压缩重试必须用 compress_retry_target 计算目标字节数"
+        );
+        let strip_needle = format!("remove(\"x-kirostudio-{}\")", "compress-retry");
+        assert!(
+            loop_body.contains(strip_needle.as_str()),
+            "/cc/v1 循环轮末必须 strip 内部标记头（2026-08-11 F1b 同款防泄漏，不得移出循环）"
+        );
+        // ⚠️ 强化（2026-08-11 对抗审查 m1）：锁「strip 在循环收尾之前」。
+        // 盲区：把轮末改成 `break` 出循环、在循环外 strip 再 return（行为等价但结构
+        // 迁移）时，上面的 loop_body 切片扩张到函数末尾、断言照样绿。两段锁死：
+        // ① 循环收尾（return 之后的 4 空格 `}`）必须存在 —— break 写法下 return 在
+        //    循环外，其后没有 4 空格 `}`（函数收尾是 0 空格），此处 expect 直接红；
+        // ② strip 必须位于循环收尾之前。
+        let loop_end_at = cc[return_at..]
+            .find("\n    }")
+            .expect("循环收尾（4 空格 `}`）必须紧跟轮末 return 之后 —— 若 break 出循环\
+                    再 return，此处必红");
+        let strip_at = cc[start..]
+            .find(strip_needle.as_str())
+            .map(|i| start + i)
+            .unwrap_or(usize::MAX);
+        assert!(
+            strip_at < return_at + loop_end_at,
+            "strip 必须位于循环收尾之前（不得 break 出循环后再 strip）"
+        );
+    }
+
+    #[test]
+    fn compress_retry_target_strictly_decreasing_with_floor() {
+        let trigger = 4 * 1024 * 1024; // 4 MiB（默认 trigger_bytes）
+        let a1 = compress_retry_target(trigger, 1);
+        let a2 = compress_retry_target(trigger, 2);
+        let a3 = compress_retry_target(trigger, 3);
+        // 0.75 → 0.5625 → 0.421875：逐轮更紧，绝不能反弹（历史 bug：序列反向）。
+        assert!(
+            a1 < trigger && a2 < a1 && a3 < a2,
+            "target 必须逐轮递减，a1={a1} a2={a2} a3={a3}"
+        );
+        assert_eq!(a1, trigger * 3 / 4);
+        assert_eq!(a2, trigger * 9 / 16);
+        assert_eq!(a3, trigger * 27 / 64);
+        // 下限 64 KiB；attempt=0 恒等（文档语义：初试用配置值，本函数只用于重试）。
+        assert_eq!(compress_retry_target(1024, 3), 65536);
+        assert_eq!(compress_retry_target(trigger, 0), trigger);
+    }
+
+    /// 压缩重试重建 body 的 native effort 字段携带（deep 审计补测，2026-08-11）：
+    /// `build_kiro_request_body` 带 `additionalModelRequestFields` 时，初试与重试
+    /// （更小 target_bytes）两次序列化都必须含该字段——P1 移植与 P0-2 压缩重试的
+    /// 交叉点，丢字段 = 重试请求的 extended thinking 静默失效。
+    #[test]
+    fn compress_retry_rebuild_keeps_additional_model_request_fields() {
+        use crate::kiro::model::requests::kiro::{AdditionalModelRequestFields, KiroOutputConfig};
+        use crate::model::config::CompressionConfig;
+
+        let state = crate::kiro::model::requests::conversation::ConversationState::new("conv-1");
+        let fields = Some(AdditionalModelRequestFields {
+            output_config: Some(KiroOutputConfig {
+                effort: "xhigh".to_string(),
+            }),
+        });
+        let mut cfg = CompressionConfig::default();
+        cfg.enabled = true;
+        cfg.trigger_bytes = 1024;
+
+        let body_initial = build_kiro_request_body(state.clone(), fields.clone(), &cfg, None)
+            .expect("初试序列化应成功");
+        assert!(
+            body_initial.contains("additionalModelRequestFields")
+                && body_initial.contains("output_config"),
+            "初试 body 必须含 native effort 字段"
+        );
+
+        let body_retry = build_kiro_request_body(state, fields, &cfg, Some(256))
+            .expect("重试序列化应成功");
+        assert!(
+            body_retry.contains("additionalModelRequestFields")
+                && body_retry.contains("output_config"),
+            "压缩重试重建 body 不得丢 native effort 字段（键与 effort 都要在，\
+             只保键不保 effort 同样等于静默失效）"
+        );
+    }
+
+    /// 守卫：压缩重试循环重建 body 时**必须**把捕获的 native fields 传进去。
+    /// 行为测试（上面那条）只证明函数本身不丢字段；这条钉的是循环调用点——
+    /// 若有人把调用改回不传 fields（或注释掉捕获行），行为测试照样绿（函数能力
+    /// 没变），只有这条会红。
+    #[test]
+    fn compress_retry_rebuild_passes_native_fields_through() {
+        let full = include_str!("handlers.rs");
+        let needle = format!("{}: loop {}", "'compress_retry", "{");
+        let start = full
+            .find(needle.as_str())
+            .expect("压缩重试循环必须存在");
+        let end = full[start..]
+            .find("\n    }\n")
+            .map(|i| start + i)
+            .unwrap_or(full.len());
+        let body = &full[start..end];
+        let field = format!("native_fields_for_{}", "compress_retry");
+        assert!(
+            body.contains(field.as_str()),
+            "压缩重试循环重建 body 时必须传入捕获的 native effort 字段 \
+             （丢了 = 重试请求的 extended thinking 静默失效）"
         );
     }
 
@@ -4785,6 +5973,55 @@ mod error_translation_tests {
         assert_eq!(t.status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(t.error_type, "rate_limit_error");
         assert!(t.message.contains("配额") && t.message.contains("排障"));
+    }
+
+    /// 🔴 回归（2026-08-10）：**全池配额耗尽只由显式标记断言，裸串不得冒充**。
+    ///
+    /// 缺陷：`translate_quota_subscription` 原先用裸串 `MONTHLY_REQUEST_COUNT` / `QUOTA`
+    /// 判「月度配额耗尽」，而那两个串来自**上游 body**。单号耗尽时 provider 走「换号
+    /// continue」分支，其 `last_error` 同样带这两个串，且 `last_error` **刻意不重置**
+    /// ⇒ 池里其余号健康时，最终错误仍被判成"全部凭据配额耗尽"，归因口径被污染。
+    ///
+    /// 现在：带 `quota_exhausted_all=1`（provider 确认 `has_available == false` 后才打）
+    /// 的才断言"号池内所有凭据"；裸串降级为不断言范围的通用配额文案。
+    /// 两者状态码都保持 429（可退避），因为删掉裸串会让 MCP/透传等路径的配额错误落
+    /// 502 兜底 → 客户端当永久故障不退避（本仓反复踩过的回归）。
+    #[test]
+    fn quota_exhausted_all_marker_distinguishes_pool_wide_from_single_credential() {
+        // ① 带标记 → 明确断言"所有凭据"
+        let all = translate_upstream_error(
+            "流式 API 请求失败（所有凭据已用尽）quota_exhausted_all=1: 402 {\"reason\":\"MONTHLY_REQUEST_COUNT\"}",
+        )
+        .expect("带标记应命中配额分支");
+        assert_eq!(all.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(all.error_type, "rate_limit_error");
+        assert!(
+            all.message.contains("所有凭据"),
+            "带 quota_exhausted_all=1 时必须断言范围是整个号池，实际: {}",
+            all.message
+        );
+
+        // ② 只有裸串（单号耗尽后换号，链上残留的上游 body）→ **不得**断言"所有凭据"
+        let single = translate_upstream_error(
+            "流式 API 请求失败: 402 {\"reason\":\"MONTHLY_REQUEST_COUNT\"}",
+        )
+        .expect("裸串仍须命中配额分支（不能落 502 兜底）");
+        assert_eq!(
+            single.status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "裸串必须仍返 429（可退避）——落 502 会让客户端当永久故障不退避"
+        );
+        assert!(
+            !single.message.contains("所有凭据"),
+            "只有裸串时**不能**断言\"所有凭据\"（那是标记分支才能确认的事实）。\
+             池里其余号可能仍健康，错误归因不该扩大范围。实际: {}",
+            single.message
+        );
+        assert!(
+            single.message.contains("配额") && single.message.contains("排障"),
+            "裸串分支仍须给出可操作的排障提示，实际: {}",
+            single.message
+        );
     }
 
     #[test]
@@ -5261,5 +6498,229 @@ mod ported_k2cc_empty_response_event_tests {
         assert_eq!(ev.event, "error");
         assert_eq!(ev.data["error"]["type"], "overloaded_error");
         assert!(ev.data["error"]["message"].as_str().unwrap().contains("重试"));
+    }
+}
+
+#[cfg(test)]
+mod adaptive_compress_loop_tests {
+    //! 自适应二次压缩循环：压一次仍超限 → 迭代降级直至进阈值；以及 fail-safe 行为。
+    //!
+    //! ⚠️ 本机无法 `cargo build`（8GB 内存 + 编译不过的历史问题），只能静态自检：
+    //! 断言围绕「最终序列化字节数必须小于阈值」与「不再调用即返回当前结果」，
+    //! 逻辑自洽但未在真实编译器上验证过类型/借用。
+    use super::*;
+    use crate::kiro::model::requests::conversation::*;
+    use crate::kiro::model::requests::tool::ToolResult;
+    use crate::model::config::CompressionConfig;
+
+    fn config(trigger_bytes: usize, tool_result_max_chars: usize) -> CompressionConfig {
+        CompressionConfig {
+            enabled: true,
+            trigger_bytes,
+            whitespace_compression: false,
+            tool_result_max_chars,
+            tool_result_head_lines: 3,
+            tool_result_tail_lines: 3,
+        }
+    }
+
+    fn run(
+        conversation_state: ConversationState,
+        cfg: &CompressionConfig,
+    ) -> (String, ConversationState) {
+        let kiro_request = KiroRequest {
+            conversation_state,
+            profile_arn: None,
+            additional_model_request_fields: None,
+        };
+        let before = serde_json::to_string(&kiro_request).unwrap();
+        assert!(before.len() > cfg.trigger_bytes, "前置：初始已超阈值");
+        // 造一个可变的 KiroRequest 供循环使用
+        let mut kiro_request = kiro_request;
+        let mut body = before;
+        adaptive_compress_loop(&mut kiro_request, cfg, &mut body, None).unwrap();
+        (body, kiro_request.conversation_state)
+    }
+
+    #[test]
+    fn converge_to_below_threshold_via_tool_result() {
+        // 单一超大 tool_result：压一次（8000）仍超限，但压到 4500 就能进阈值
+        let long_text = (0..400).map(|i| format!("row {}", i)).collect::<Vec<_>>().join("\n");
+        let state = ConversationState::new("conv")
+            .with_current_message(CurrentMessage::new(
+                UserInputMessage::new("msg", "claude-sonnet-4.5").with_context(
+                    UserInputMessageContext::new()
+                        .with_tool_results(vec![ToolResult::success("t1", &long_text)]),
+                ),
+            ))
+            .with_history(Vec::new());
+
+        let cfg = config(1800, 8000);
+        let (body, _state) = run(state, &cfg);
+        assert!(body.len() < cfg.trigger_bytes, "最终字节 {} 仍超阈值 {}", body.len(), cfg.trigger_bytes);
+    }
+
+    #[test]
+    fn converge_to_below_threshold_via_history_drop() {
+        // 多轮小历史：没有 tool_result 可压，删掉若干最老轮次后进阈值
+        let mut history = Vec::new();
+        for i in 0..80 {
+            history.push(Message::User(HistoryUserMessage::new(
+                format!("long user message number {}", i),
+                "claude-sonnet-4.5",
+            )));
+            history.push(Message::Assistant(HistoryAssistantMessage::new(
+                format!("assistant answer {}", i),
+            )));
+        }
+        let state = ConversationState::new("conv")
+            .with_current_message(CurrentMessage::new(
+                UserInputMessage::new("hi", "claude-sonnet-4.5"),
+            ))
+            .with_history(history);
+
+        let cfg = config(2000, 0); // 关掉 tool_result 层，逼循环走历史删除
+        let (body, state) = run(state, &cfg);
+        assert!(body.len() < cfg.trigger_bytes, "最终字节 {} 仍超阈值 {}", body.len(), cfg.trigger_bytes);
+        assert!(state.history.len() >= 4, "保留对不能低于 2 对，实际 {}", state.history.len());
+    }
+
+    #[test]
+    fn single_message_huge_triggers_message_truncation() {
+        // 单条 user content 本身就远超阈值：删历史救不回来 → 走正文截断层
+        let huge = "x".repeat(50_000);
+        let state = ConversationState::new("conv")
+            .with_current_message(CurrentMessage::new(
+                UserInputMessage::new(huge, "claude-sonnet-4.5"),
+            ))
+            .with_history(Vec::new());
+
+        // 阈值取 20000：正文截断的下限是 ADAPTIVE_MIN_MESSAGE_CONTENT_MAX_CHARS=8192
+        // （+ 省略标记约 40 字节），阈值若定得比这个地板还小，循环永远压不进去
+        // ——那是「压到底仍超限，照发交上游」的预期路径，不该用它断言收敛。
+        let cfg = config(20_000, 0);
+        let (body, state) = run(state, &cfg);
+        assert!(body.len() < cfg.trigger_bytes, "最终字节 {} 仍超阈值 {}", body.len(), cfg.trigger_bytes);
+        let final_chars = state.current_message.user_input_message.content.chars().count();
+        assert!(final_chars < 50_000, "正文应被截短，实际 {final_chars}");
+    }
+
+    #[test]
+    fn floor_reached_still_oversized_gives_up_without_hanging() {
+        // 压到地板（8192 字符）仍超阈值：必须在 32 轮内退出并照发，不挂死、不 panic
+        let huge = "x".repeat(50_000);
+        let state = ConversationState::new("conv")
+            .with_current_message(CurrentMessage::new(
+                UserInputMessage::new(huge, "claude-sonnet-4.5"),
+            ))
+            .with_history(Vec::new());
+
+        let cfg = config(4000, 0); // 低于 8192 地板，永远压不进
+        let (body, _state) = run(state, &cfg);
+        // 仍超阈值是预期结果（交上游判死），关键是函数返回了
+        assert!(body.len() > cfg.trigger_bytes);
+    }
+
+    #[test]
+    fn history_images_removed_when_no_tool_result() {
+        // 有历史图片、无 tool_result：应触发图片降级而不是删历史
+        let img = KiroImage::from_base64("png", "a".repeat(8000));
+        // HistoryUserMessage 没有 with_images，图片挂在内层 UserMessage 上
+        let mut hu = HistoryUserMessage::new("u", "claude-sonnet-4.5");
+        hu.user_input_message = hu.user_input_message.with_images(vec![img]);
+        let history = vec![
+            Message::User(hu),
+            Message::Assistant(HistoryAssistantMessage::new("a")),
+        ];
+        let state = ConversationState::new("conv")
+            .with_current_message(CurrentMessage::new(
+                UserInputMessage::new("hi", "claude-sonnet-4.5"),
+            ))
+            .with_history(history);
+
+        let cfg = config(3000, 0);
+        let (body, state) = run(state, &cfg);
+        assert!(body.len() < cfg.trigger_bytes, "最终字节 {} 仍超阈值 {}", body.len(), cfg.trigger_bytes);
+        // 历史消息应保留（删的是图片不是轮次）
+        assert_eq!(state.history.len(), 2);
+        if let Message::User(u) = &state.history[0] {
+            assert!(u.user_input_message.images.is_empty(), "历史图片应被清除");
+        }
+    }
+
+    #[test]
+    fn disabled_config_returns_original_body() {
+        // compression.enabled = false 时循环必须原样返回（不触发任何压缩）。
+        // 守卫在 `adaptive_compress_loop` 内部（对齐参考仓 ref-mjy/handlers.rs:251），
+        // 因此即使 state 里存在可压缩的大 tool_result，也不得改动。
+        let long_text = (0..300).map(|i| format!("row {}", i)).collect::<Vec<_>>().join("\n");
+        let state = ConversationState::new("conv")
+            .with_current_message(CurrentMessage::new(
+                UserInputMessage::new("msg", "claude-sonnet-4.5").with_context(
+                    UserInputMessageContext::new()
+                        .with_tool_results(vec![ToolResult::success("t1", &long_text)]),
+                ),
+            ))
+            .with_history(Vec::new());
+
+        let cfg = CompressionConfig {
+            enabled: false,
+            trigger_bytes: 1,
+            ..Default::default()
+        };
+        let kiro_request = KiroRequest {
+            conversation_state: state,
+            profile_arn: None,
+            additional_model_request_fields: None,
+        };
+        let before = serde_json::to_string(&kiro_request).unwrap();
+        let mut kiro_request = kiro_request;
+        let mut body = before.clone();
+        adaptive_compress_loop(&mut kiro_request, &cfg, &mut body, None).unwrap();
+        assert_eq!(body, before, "禁用时不应改动请求体");
+    }
+
+    #[test]
+    fn zero_trigger_returns_original_body() {
+        // trigger_bytes = 0 表示不限制，循环必须原样返回
+        let state = ConversationState::new("conv")
+            .with_current_message(CurrentMessage::new(
+                UserInputMessage::new("hello", "claude-sonnet-4.5"),
+            ))
+            .with_history(Vec::new());
+
+        let cfg = config(0, 0);
+        let kiro_request = KiroRequest {
+            conversation_state: state,
+            profile_arn: None,
+            additional_model_request_fields: None,
+        };
+        let before = serde_json::to_string(&kiro_request).unwrap();
+        let mut kiro_request = kiro_request;
+        let mut body = before.clone();
+        adaptive_compress_loop(&mut kiro_request, &cfg, &mut body, None).unwrap();
+        assert_eq!(body, before);
+    }
+
+    #[test]
+    fn max_iters_are_bounded() {
+        // 即使永远压不进阈值，循环也必须在 32 轮内退出（不挂死）
+        let state = ConversationState::new("conv")
+            .with_current_message(CurrentMessage::new(
+                UserInputMessage::new("hello", "claude-sonnet-4.5"),
+            ))
+            .with_history(Vec::new());
+
+        let cfg = config(1, 0); // 极小阈值，永远达不到
+        let kiro_request = KiroRequest {
+            conversation_state: state,
+            profile_arn: None,
+            additional_model_request_fields: None,
+        };
+        let before = serde_json::to_string(&kiro_request).unwrap();
+        let mut kiro_request = kiro_request;
+        let mut body = before;
+        adaptive_compress_loop(&mut kiro_request, &cfg, &mut body, None).unwrap();
+        assert!(!body.is_empty());
     }
 }

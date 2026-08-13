@@ -3,7 +3,7 @@
 //! 优先级（高→低）：
 //! 1. **metering 真值**：上游 Kiro `MeteringEvent.cacheReadInputTokens/cacheCreationInputTokens`
 //! 2. **prefix 估算**：`token::count_prefix_tokens` 的本地前缀估算（KiroStudio 原有 Layer 2）
-//! 3. **fingerprint 命中**：账号级前缀指纹（TODO：k2cc `cache/fingerprint.rs` 未移植，恒 None）
+//! 3. **fingerprint 命中**：账号级前缀指纹（2026-08-11 移植，`cache_fingerprint.rs`，纯内存）
 //! 4. **ratio 兜底**：50% cache / 30% creation
 //!
 //! 所有分支输出均经 [`PromptCacheUsage::clamp_to_total`] 截断，保证
@@ -92,7 +92,8 @@ fn split_creation_preserving_ratio(original: PromptCacheUsage, creation: i32) ->
 ///
 /// - `metering`：Layer 1 上游真值 `(cache_read, cache_creation)`
 /// - `prefix_estimated_read`：Layer 2 `count_prefix_tokens` 估算
-/// - `fingerprint_usage`：Layer 3 账号级指纹（TODO：未移植，恒传 None）
+/// - `fingerprint_usage`：Layer 3 账号级指纹（2026-08-11 移植，`cache_fingerprint.rs`；
+///   无指纹时调用方传 None）
 /// - `ratio_fallback`：Layer 4 比例兜底（`from_ratios` 产出）
 pub(crate) fn select_final_usage(
     final_input_tokens: i32,
@@ -121,7 +122,7 @@ pub(crate) fn select_final_usage(
         }
         .clamp_to_total(final_input_tokens)
     } else if let Some(fp) = fingerprint_usage {
-        // Layer 3：fingerprint 命中（TODO：账号级前缀指纹未移植，恒 None）。
+        // Layer 3：fingerprint 命中（2026-08-11 移植，`cache_fingerprint.rs`）。
         fp.clamp_to_total(final_input_tokens)
     } else {
         // Layer 4：ratio 兜底。
