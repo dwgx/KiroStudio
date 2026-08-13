@@ -1,6 +1,6 @@
 [package]
 name = "kirostudio"
-version = "0.7.48"
+version = "1.0.0"
 edition = "2024"
 
 [features]
