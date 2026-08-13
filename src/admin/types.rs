@@ -57,6 +57,9 @@ pub struct CredentialStatusItem {
     /// 自定义 API 代挂:deepseek 协议归一化开关（None=false；前端展示/开关用）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deepseek_normalize: Option<bool>,
+    /// 是否豁免全局模型映射（None=false，即应用映射；前端展示/开关用）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_mapping_exempt: Option<bool>,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
     /// refreshToken 的 SHA-256 哈希（仅 OAuth 凭据，用于前端去重）
@@ -300,6 +303,40 @@ pub struct CleanupDisabledResponse {
     pub results: Vec<BatchDeleteItemResult>,
 }
 
+// ============ region 重探 / 一键超额禁用 / OAuth 复活 ============
+
+/// `POST /credentials/{id}/reprobe-region` 的成功响应。
+///
+/// 与前端契约（admin-ui `reprobeRegion`）对齐：成功响应里带 `region` 字段。
+/// `region` 为 `None` 只发生在「无需探测」且号上没有任何 region 字段时，此时
+/// 语义靠 `message` 传达 —— 该情形不算失败，不该走 HTTP 错误路径
+/// （探测没发生，谈不上「探失败」）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReprobeRegionResponse {
+    /// 探测写死（`Usable`）或号上当前已有的 `api_region`（`Skipped`）。
+    pub region: Option<String>,
+    /// 人类可读说明（探测命中 / 无需探测）。
+    pub message: String,
+}
+
+/// `POST /credentials/disable-quota-exceeded` 的响应（一键超额禁用）。
+///
+/// 部分失败仍返 200（HTTP 层成功），由 `results` 逐条标注 —— 与批量删除同款语义：
+/// 禁用是逐号独立的，单号失败不应让整批其它号的禁用回滚。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisableQuotaExceededResponse {
+    /// 实际禁用成功的条数
+    pub disabled: usize,
+    /// 判定「该禁」但执行失败的条数（如竞态下号已被删）
+    pub failed: usize,
+    /// 成功禁用的 id 列表（顺序与 `results` 中 ok=true 的条目一致）
+    pub list: Vec<u64>,
+    /// 逐条结果（仅含「判定该禁」的候选；未超额/已禁用/代挂号不进这里）
+    pub results: Vec<BatchDeleteItemResult>,
+}
+
 // ============ 操作请求 ============
 /// 启用/禁用凭据请求
 #[derive(Debug, Deserialize)]
@@ -345,6 +382,13 @@ pub struct SetEndpointRequest {
 /// api_key 号 region 错了只能删号重建。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RefreshTokenRequest {
+    /// OAuth 号轮换后的新 refreshToken（敏感值：绝不进日志/错误消息/响应）。
+    pub refresh_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SetApiRegionRequest {
     /// 目标 region（须在白名单内，实测只有 `us-east-1` / `eu-central-1` 真实存在）。
     /// null/空串 = 清除，回退全局 `config.region`。
@@ -383,6 +427,16 @@ pub struct SetDeepseekNormalizeRequest {
     /// 这里显式 Option 让前端可传 null 表示关闭）。
     #[serde(default)]
     pub deepseek_normalize: Option<bool>,
+}
+
+/// 设置凭据级「模型映射豁免」开关的请求。
+///
+/// `Some(true)` = 该凭据跳过全局 `config.model_mapping`；`None`/`Some(false)` = 应用映射。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetModelMappingExemptRequest {
+    #[serde(default)]
+    pub model_mapping_exempt: Option<bool>,
 }
 
 /// 设置凭据级「允许模型」白名单的请求（成本安全硬门；空/null = 不限制）
@@ -452,6 +506,9 @@ pub struct AddCredentialRequest {
     /// true 时透传前按 fuckopencode 的 deepseek 协议修复改写请求体。
     #[serde(default)]
     pub deepseek_normalize: Option<bool>,
+    /// 是否豁免全局模型映射（创建时设；true = 该号发上游时保持客户端原始模型名）。
+    #[serde(default)]
+    pub model_mapping_exempt: Option<bool>,
     /// 代挂模型白名单（创建时从上游探测勾选而来，None/空 = 不限制）。
     /// 与设置弹框的 `set_allowed_models` 写同一字段；创建时直接带上可省一次
     /// 「创建后再探测再保存」的往返。
@@ -975,6 +1032,10 @@ pub struct ConfigSnapshotResponse {
     pub extract_thinking: bool,
     /// Claude Code 自动切缓冲协议（识别到 CC 请求时 /v1 流式自动走 buffered，准确 input_tokens）
     pub cc_auto_buffer: bool,
+    /// Kiro 原生 extended thinking（请求级 `output_config.effort` 通道，默认关；
+    /// 开=白名单模型 + thinking 走原生 reasoningContentEvent 并抑制 XML 标签注入）。
+    /// 热更即时生效（converter 进程级镜像）。
+    pub native_thinking_effort_enabled: bool,
     /// 批量推号入口 POST /api/import/keys 是否启用（默认开；关掉即对两个挂载点一起返 403）
     pub import_keys_enabled: bool,
     /// 分身凭据在请求未显式指定 `enabled` 时是否默认启用（默认 **关**）。
@@ -987,7 +1048,38 @@ pub struct ConfigSnapshotResponse {
     pub upstream_retry_absorb_min_delay_ms: u64,
     pub upstream_retry_absorb_max_delay_secs: u64,
     pub upstream_retry_absorb_suspended: bool,
+    /// 是否把上游 **5xx** 也纳入吸收（默认关）。
+    ///
+    /// 🔴 2026-08-10 补：该字段在 `model/config.rs:239` 早已存在，但**从未暴露到
+    /// Admin API**，导致面板与 API 都改不了它，只能改 config.json + 重启。
+    ///
+    /// 为什么现在需要它：线上代挂上游的主要故障形态是 **502**
+    /// （`router.denzao.com` 返 `Upstream service temporarily unavailable`）
+    /// 与 kiro2cc 的 429 交替出现。不吸收 5xx 时那些 502 会直接甩给客户端断会话，
+    /// 而它们恰恰是最典型的瞬态故障（重试几秒后常能成功）。
+    pub upstream_retry_absorb_server_error: bool,
+    /// 是否把上游 **400 容量/配额类**错误也纳入吸收（默认关）。
+    ///
+    /// 🔴 2026-08-11 补：该字段在 `model/config.rs` 早已存在，但从未暴露到
+    /// Admin API，只能改 config.json + 重启。语义：容量类恢复常在分钟级，
+    /// 慢速重试耗尽后的第二层。
+    pub upstream_retry_absorb_capacity_400: bool,
+    /// 换号空窗的**独立预算秒数**（默认 0 = 不启用，沿用总预算与短退避曲线）。
+    ///
+    /// 🔴 2026-08-11 补：此前只能改 config.json + 重启。非零时该类退避换成
+    /// 20/40/60s 长阶梯，deadline 换成 `call_started + 本值`。
+    pub upstream_retry_absorb_swap_budget_secs: u64,
+    /// 吸收层**预算耗尽时**回给客户端的状态码（默认 429；唯一另一个可选值 503）。
+    ///
+    /// 🔴 2026-08-11 补：此前只能改 config.json + 重启。429 语义正确但 Cursor
+    /// 会掐会话，503 会触发客户端自己退避重试。
+    pub upstream_retry_absorb_exhausted_status: u16,
     /// 是否把估算的 prompt cache 记账下发给客户端（估算值，上游不提供真值）
+    pub self_heal_base_backoff_secs: u64,
+    /// 全池自愈退避上限（秒）；与 base 一起决定退避天花板（2026-08-11 配置化）。
+    pub self_heal_max_backoff_secs: u64,
+    /// 全池自愈退避指数上限（2026-08-11 配置化；消费点另有 31 的硬 clamp 兜底）。
+    pub self_heal_max_shift: u32,
     pub prompt_cache_enabled: bool,
     /// 是否剥离转发给上游的 system 环境噪音（省 token / 提缓存命中 / 降关联，立即生效）
     pub strip_env_noise: bool,
@@ -1005,6 +1097,14 @@ pub struct ConfigSnapshotResponse {
     pub tool_truncation_recovery: bool,
     /// 入站工具顶层 description 字符上限（默认 10000，立即生效，0=不截断）
     pub tool_description_max_chars: usize,
+    /// CLI 端点请求体对齐真实 kiro-cli（见 `UpdateConfigRequest` 同名字段）。
+    pub cli_origin_kiro_cli: bool,
+    /// CLI 端点 optout 头是否发 `false`（⚠️ 隐私语义：等于允许上游用会话做训练）。
+    pub cli_codewhisperer_optout_false: bool,
+    /// CLI 端点 UA 指纹是否对齐真实客户端。
+    pub cli_ua_align_real_client: bool,
+    /// 单凭据并发上限（只读展示：Semaphore 容量在构造时固定，改配置需重启）。
+    pub upstream_per_credential_limit: usize,
     /// credentials.json / trash.json at-rest 加密开关（机器绑定密钥，立即生效，默认关）
     pub encrypt_credentials_at_rest: bool,
     pub cooldown_enabled: bool,
@@ -1037,6 +1137,8 @@ pub struct ConfigSnapshotResponse {
     /// 拟人速率：请求间隔抖动百分比（0..50）
     pub rate_limit_jitter_pct: u32,
     // ---- 入站请求整形 + RPM 自动挡 ----
+    /// 限流/重试档位（`shielded` / `direct` / `manual`）。默认 `manual` = 不覆盖任何字段。
+    pub throttle_profile: crate::model::config::ThrottleProfile,
     pub inbound_throttle_enabled: bool,
     pub inbound_rpm_auto: bool,
     pub inbound_target_rpm: u32,
@@ -1072,6 +1174,20 @@ pub struct ConfigSnapshotResponse {
     /// 累计放行的客户端请求数（用于对账滑窗是否在滚动；滑窗恒 0 而它在涨 = 滑窗坏了）。
     #[serde(default)]
     pub inbound_admitted_total: u64,
+    /// AIMD 累计**排队等待**次数（有请求真的等过令牌 = 整形确实在削峰）。
+    ///
+    /// 与下面两个一起构成 AIMD 的可观测三元组。它们此前是**只写不读的死代码**
+    /// （全仓零读取点），于是「整形有没有起作用、是不是卡在下限」无从判断 ——
+    /// 而这正是 `CLAUDE.md` 那条「先修度量再谈调参」教训的同型场景。
+    #[serde(default)]
+    pub inbound_aimd_queued_total: u64,
+    /// AIMD 累计**降档**次数（乘性减：被上游 429 打到就砍速率）。
+    /// 它与升档次数的比值反映 AIMD 是否在健康振荡；只降不升 = 单向棘轮卡死在下限。
+    #[serde(default)]
+    pub inbound_aimd_md_total: u64,
+    /// AIMD 累计**升档**次数（加性增：静默期后缓慢回升）。
+    #[serde(default)]
+    pub inbound_aimd_ai_total: u64,
     /// 余额加权分流（默认开）：同档内按剩余额度微调选号，长期拉平号池余额
     pub balance_weight_enabled: bool,
     /// 余额加权 FLOOR（整百分比 0..100，50=因子下限 0.5，越小余额影响越强）
@@ -1112,6 +1228,9 @@ pub struct ConfigSnapshotResponse {
     pub collect_client_fingerprint: bool,
     /// 配置文件路径（运行时只读元数据）
     pub config_path: Option<String>,
+    // ---- 全局模型映射 ----
+    /// 客户端模型名 → 上游模型名（空表 = 不映射）。双口径用量（requested/upstream）的规则源。
+    pub model_mapping: std::collections::HashMap<String, String>,
 }
 
 /// 更新服务端配置请求
@@ -1135,18 +1254,33 @@ pub struct UpdateConfigRequest {
     pub default_endpoint: Option<String>,
     pub extract_thinking: Option<bool>,
     pub cc_auto_buffer: Option<bool>,
+    /// Kiro 原生 extended thinking 开关（默认关；热更即时生效，converter 镜像）。
+    pub native_thinking_effort_enabled: Option<bool>,
     pub import_keys_enabled: Option<bool>,
     /// 分身默认启用（立即生效：存盘后 reload_config 换入 ArcSwap，下一次 clone 即读到）。
     pub clone_default_enabled: Option<bool>,
-    /// 上游 429 吸收层六项（立即生效：存盘后 reload_config 换入 ArcSwap，下一个请求即读到）
+    /// 上游 429 吸收层**十**项（立即生效：存盘后 reload_config 换入 ArcSwap，下一个请求即读到）
     pub upstream_retry_absorb_enabled: Option<bool>,
     pub upstream_retry_absorb_budget_secs: Option<u64>,
     pub upstream_retry_absorb_max_rounds: Option<u32>,
     pub upstream_retry_absorb_min_delay_ms: Option<u64>,
     pub upstream_retry_absorb_max_delay_secs: Option<u64>,
     pub upstream_retry_absorb_suspended: Option<bool>,
+    /// 是否把上游 **5xx** 也纳入吸收（2026-08-10 补，此前只有 config.json 能改）。
+    /// 线上代挂上游的主要故障是 502，不吸收它等于把最典型的瞬态故障直接甩给客户端。
+    pub upstream_retry_absorb_server_error: Option<bool>,
+    /// 是否把上游 **400 容量/配额类**错误也纳入吸收（2026-08-11 补，此前只能改 config.json）。
+    pub upstream_retry_absorb_capacity_400: Option<bool>,
+    /// 换号空窗的**独立预算秒数**（2026-08-11 补，此前只能改 config.json）。
+    pub upstream_retry_absorb_swap_budget_secs: Option<u64>,
+    /// 吸收层预算耗尽时回给客户端的状态码（2026-08-11 补，此前只能改 config.json）。
+    /// ⚠️ 必须 Option<u16>：裸 u16 配 serde(default) 会把「未传」当成 0（u16 的坑见 config.rs）。
+    pub upstream_retry_absorb_exhausted_status: Option<u16>,
     /// 是否把**估算的** cache_read/cache_creation 下发给客户端（详见 config 同名字段）。
     /// 关闭时字段整体缺失而非置 0——两者对客户端语义不同。
+    pub self_heal_base_backoff_secs: Option<u64>,
+    pub self_heal_max_backoff_secs: Option<u64>,
+    pub self_heal_max_shift: Option<u32>,
     pub prompt_cache_enabled: Option<bool>,
     pub strip_env_noise: Option<bool>,
     pub tool_clean_leaked_tokens: Option<bool>,
@@ -1157,6 +1291,18 @@ pub struct UpdateConfigRequest {
     pub tool_repair_json: Option<bool>,
     pub tool_truncation_recovery: Option<bool>,
     pub tool_description_max_chars: Option<usize>,
+    /// CLI 端点请求体对齐真实 kiro-cli（origin→KIRO_CLI + 删 agentContinuationId/history modelId）。
+    /// 立即生效：`transform_api_body` 从 `ctx.config`（ArcSwap 快照）读。
+    pub cli_origin_kiro_cli: Option<bool>,
+    /// CLI 端点是否发 `x-amzn-codewhisperer-optout: false`（= **允许**上游用会话做训练）。
+    ///
+    /// ⚠️ 这是**隐私语义变更**，不是纯指纹项：四家参考实现一致发 `false`（真实客户端值，
+    /// Foxfishc 有抓包出处），但打开等于同意会话被用于训练。默认关（保持隐私优先）。
+    /// 立即生效：`decorate_api` 读 ArcSwap 快照。
+    pub cli_codewhisperer_optout_false: Option<bool>,
+    /// CLI 端点 UA 指纹是否对齐真实客户端（两个 UA 头拆开 + `m/F` + `/` 分隔版本号）。
+    /// 无对照实验数据前默认关。立即生效：同上读 ArcSwap 快照。
+    pub cli_ua_align_real_client: Option<bool>,
     /// credentials.json / trash.json at-rest 加密开关。开启后下次 persist 把明文重写为密文(透明迁移)。
     pub encrypt_credentials_at_rest: Option<bool>,
     pub cooldown_enabled: Option<bool>,
@@ -1176,6 +1322,9 @@ pub struct UpdateConfigRequest {
     pub rpm_hard_gate_overload_wait: Option<bool>,
     pub cooldown_scale_pct: Option<u32>,
     pub rate_limit_jitter_pct: Option<u32>,
+    /// 切换限流档位。⚠️ 档位只影响**配置文件里没显式写**的字段；
+    /// 已显式配置过的值不会被冲掉（见 `ThrottleProfile` 文档的向前兼容论证）。
+    pub throttle_profile: Option<crate::model::config::ThrottleProfile>,
     pub inbound_throttle_enabled: Option<bool>,
     pub inbound_rpm_auto: Option<bool>,
     pub inbound_target_rpm: Option<u32>,
@@ -1230,6 +1379,9 @@ pub struct UpdateConfigRequest {
     // ---- 隐私（立即生效）----
     /// 是否采集下游客户端指纹（device/ip/os/browser）
     pub collect_client_fingerprint: Option<bool>,
+    // ---- 全局模型映射（立即生效，TIER1 热重载）----
+    /// 客户端模型名 → 上游模型名（整表替换；传 {} = 清空全部规则）
+    pub model_mapping: Option<std::collections::HashMap<String, String>>,
 }
 
 /// 更新服务端配置响应
@@ -2044,7 +2196,7 @@ mod tests {
 
     /// 全字段占位夹具：`ConfigSnapshotResponse` 无 `Default` impl（每次都由
     /// `build_config_snapshot` 从 config 逐字段构造），而线协议契约测试只关心键名，
-    /// 故用本夹具填满其余字段，被测的六项由调用方覆盖。
+    /// 故用本夹具填满其余字段，被测的十项由调用方覆盖。
     fn absorb_snapshot_fixture() -> ConfigSnapshotResponse {
         ConfigSnapshotResponse {
             server_version: "x".into(),
@@ -2060,6 +2212,7 @@ mod tests {
             endpoint_names: vec![],
             extract_thinking: false,
             cc_auto_buffer: false,
+            native_thinking_effort_enabled: false,
             import_keys_enabled: true,
             clone_default_enabled: false,
             upstream_retry_absorb_enabled: false,
@@ -2068,6 +2221,13 @@ mod tests {
             upstream_retry_absorb_min_delay_ms: 0,
             upstream_retry_absorb_max_delay_secs: 0,
             upstream_retry_absorb_suspended: false,
+            upstream_retry_absorb_server_error: false,
+            upstream_retry_absorb_capacity_400: false,
+            upstream_retry_absorb_swap_budget_secs: 0,
+            upstream_retry_absorb_exhausted_status: 503,
+            self_heal_base_backoff_secs: 60,
+            self_heal_max_backoff_secs: 900,
+            self_heal_max_shift: 4,
             prompt_cache_enabled: false,
             strip_env_noise: false,
             tool_clean_leaked_tokens: false,
@@ -2078,6 +2238,10 @@ mod tests {
             tool_repair_json: false,
             tool_truncation_recovery: false,
             tool_description_max_chars: 0,
+            cli_origin_kiro_cli: false,
+            cli_codewhisperer_optout_false: false,
+            cli_ua_align_real_client: false,
+            upstream_per_credential_limit: 8,
             encrypt_credentials_at_rest: false,
             cooldown_enabled: false,
             auto_disable_suspicious: false,
@@ -2093,6 +2257,7 @@ mod tests {
             rpm_hard_gate_overload_wait: false,
             cooldown_scale_pct: 0,
             rate_limit_jitter_pct: 0,
+            throttle_profile: crate::model::config::ThrottleProfile::Manual,
             inbound_throttle_enabled: false,
             inbound_rpm_auto: false,
             inbound_target_rpm: 0,
@@ -2105,6 +2270,9 @@ mod tests {
             inbound_observed_rpm: 0,
             inbound_observed_upstream_rpm: 0,
             inbound_admitted_total: 0,
+            inbound_aimd_queued_total: 0,
+            inbound_aimd_md_total: 0,
+            inbound_aimd_ai_total: 0,
             balance_weight_enabled: false,
             balance_weight_floor: 0,
             health_429_weight_enabled: false,
@@ -2129,10 +2297,11 @@ mod tests {
             balance_refresh_interval_secs: 0,
             collect_client_fingerprint: false,
             config_path: None,
+            model_mapping: std::collections::HashMap::new(),
         }
     }
 
-    /// ⭐ 线协议契约：吸收层六项必须以**精确的 camelCase 名**上下行。
+    /// ⭐ 线协议契约：吸收层十项必须以**精确的 camelCase 名**上下行。
     ///
     /// 回退即 FAIL：改任一字段名（或去掉 `rename_all = "camelCase"`），断言失败。
     ///
@@ -2160,6 +2329,10 @@ mod tests {
             upstream_retry_absorb_min_delay_ms: 150,
             upstream_retry_absorb_max_delay_secs: 15,
             upstream_retry_absorb_suspended: false,
+            upstream_retry_absorb_server_error: false,
+            upstream_retry_absorb_capacity_400: false,
+            upstream_retry_absorb_swap_budget_secs: 0,
+            upstream_retry_absorb_exhausted_status: 503,
             ..absorb_snapshot_fixture()
         };
         let s = serde_json::to_string(&snap).expect("序列化应成功");
@@ -2170,6 +2343,11 @@ mod tests {
             ("upstreamRetryAbsorbMinDelayMs", "150"),
             ("upstreamRetryAbsorbMaxDelaySecs", "15"),
             ("upstreamRetryAbsorbSuspended", "false"),
+            ("upstreamRetryAbsorbServerError", "false"),
+            ("upstreamRetryAbsorbCapacity400", "false"),
+            ("upstreamRetryAbsorbSwapBudgetSecs", "0"),
+            ("upstreamRetryAbsorbExhaustedStatus", "503"),
+            ("nativeThinkingEffortEnabled", "false"),
         ] {
             let expect = format!("\"{key}\":{val}");
             assert!(
@@ -2183,7 +2361,10 @@ mod tests {
         let req: UpdateConfigRequest = serde_json::from_str(
             r#"{"upstreamRetryAbsorbEnabled":true,"upstreamRetryAbsorbBudgetSecs":30,
                 "upstreamRetryAbsorbMaxRounds":2,"upstreamRetryAbsorbMinDelayMs":200,
-                "upstreamRetryAbsorbMaxDelaySecs":9,"upstreamRetryAbsorbSuspended":true}"#,
+                "upstreamRetryAbsorbMaxDelaySecs":9,"upstreamRetryAbsorbSuspended":true,
+                "upstreamRetryAbsorbServerError":true,"upstreamRetryAbsorbCapacity400":true,
+                "upstreamRetryAbsorbSwapBudgetSecs":0,"upstreamRetryAbsorbExhaustedStatus":503,
+                "nativeThinkingEffortEnabled":true}"#,
         )
         .expect("前端 camelCase 请求体必须能反序列化");
         assert_eq!(req.upstream_retry_absorb_enabled, Some(true));
@@ -2192,13 +2373,29 @@ mod tests {
         assert_eq!(req.upstream_retry_absorb_min_delay_ms, Some(200));
         assert_eq!(req.upstream_retry_absorb_max_delay_secs, Some(9));
         assert_eq!(req.upstream_retry_absorb_suspended, Some(true));
+        assert_eq!(req.upstream_retry_absorb_server_error, Some(true));
+        assert_eq!(req.upstream_retry_absorb_capacity_400, Some(true));
+        assert_eq!(req.upstream_retry_absorb_swap_budget_secs, Some(0));
+        assert_eq!(req.upstream_retry_absorb_exhausted_status, Some(503));
+        assert_eq!(req.native_thinking_effort_enabled, Some(true));
 
         // 缺字段（旧前端 / 只改别的设置）必须全 None，绝不能被当成"要改成 false/0"。
+        // ⚠️ 吸收层十项全部点名（deep 审计补测，2026-08-11）：尤其
+        // `upstream_retry_absorb_exhausted_status` —— 若有人把 Option<u16> 回退成裸 u16
+        // （config.rs 记载过该坑：u16 配 serde(default) 会把未传当成 0），只有这条能拦。
         let empty: UpdateConfigRequest =
             serde_json::from_str("{}").expect("空请求体必须能反序列化");
         assert_eq!(empty.upstream_retry_absorb_enabled, None);
         assert_eq!(empty.upstream_retry_absorb_budget_secs, None);
+        assert_eq!(empty.upstream_retry_absorb_max_rounds, None);
+        assert_eq!(empty.upstream_retry_absorb_min_delay_ms, None);
+        assert_eq!(empty.upstream_retry_absorb_max_delay_secs, None);
         assert_eq!(empty.upstream_retry_absorb_suspended, None);
+        assert_eq!(empty.upstream_retry_absorb_server_error, None);
+        assert_eq!(empty.upstream_retry_absorb_capacity_400, None);
+        assert_eq!(empty.upstream_retry_absorb_swap_budget_secs, None);
+        assert_eq!(empty.upstream_retry_absorb_exhausted_status, None);
+        assert_eq!(empty.native_thinking_effort_enabled, None);
     }
 
     /// ⭐ 分身三字段的线上契约：`CredentialStatusItem` 的
@@ -2273,9 +2470,10 @@ mod tests {
             endpoint_names: vec![],
             extract_thinking: true,
             cc_auto_buffer: true,
+            native_thinking_effort_enabled: false,
             import_keys_enabled: true,
             clone_default_enabled: false,
-            // 吸收层六项：本处是**测试夹具**（不是 Default impl，本类型没有 Default），
+            // 吸收层十项：本处是**测试夹具**（不是 Default impl，本类型没有 Default），
             // 取值与 config 默认一致只为可读性。真正防漂移的是 service.rs 里
             // build_config_snapshot 必须逐字段从 config 读，由
             // `absorb_snapshot_maps_every_field_from_config` 钉死。
@@ -2285,6 +2483,13 @@ mod tests {
             upstream_retry_absorb_min_delay_ms: 150,
             upstream_retry_absorb_max_delay_secs: 15,
             upstream_retry_absorb_suspended: false,
+            upstream_retry_absorb_server_error: false,
+            upstream_retry_absorb_capacity_400: false,
+            upstream_retry_absorb_swap_budget_secs: 0,
+            upstream_retry_absorb_exhausted_status: 503,
+            self_heal_base_backoff_secs: 60,
+            self_heal_max_backoff_secs: 900,
+            self_heal_max_shift: 4,
             prompt_cache_enabled: true,
             cooldown_enabled: true,
             auto_disable_suspicious: true,
@@ -2300,6 +2505,7 @@ mod tests {
             rpm_hard_gate_overload_wait: false,
             cooldown_scale_pct: 100,
             rate_limit_jitter_pct: 20,
+            throttle_profile: crate::model::config::ThrottleProfile::Manual,
             inbound_throttle_enabled: true,
             inbound_rpm_auto: true,
             inbound_target_rpm: 100,
@@ -2314,6 +2520,9 @@ mod tests {
             inbound_observed_rpm: 0,
             inbound_observed_upstream_rpm: 0,
             inbound_admitted_total: 0,
+            inbound_aimd_queued_total: 0,
+            inbound_aimd_md_total: 0,
+            inbound_aimd_ai_total: 0,
             balance_weight_enabled: true,
             balance_weight_floor: 50,
             health_429_weight_enabled: true,
@@ -2346,11 +2555,84 @@ mod tests {
             tool_repair_json: true,
             tool_truncation_recovery: false,
             tool_description_max_chars: 10000,
+            cli_origin_kiro_cli: false,
+            cli_codewhisperer_optout_false: false,
+            cli_ua_align_real_client: false,
+            upstream_per_credential_limit: 8,
             encrypt_credentials_at_rest: false,
             config_path: None,
+            model_mapping: std::collections::HashMap::new(),
         };
         let s = serde_json::to_string(&snap).expect("序列化应成功");
         assert!(s.contains("\"loginBackgroundR18\":false"));
         assert!(s.contains("\"loginBackgroundEnabled\":true"));
+
+        // ⭐ CLI 对齐三开关 + 每凭据并发上限必须出现在快照里，且为 camelCase。
+        //
+        // 为什么值得断言：前端 `types/api.ts` 是**手写镜像**（无生成器），字段名对不上
+        // 时 tsc 不会报错 —— 它只会让 `config.cliUaAlignRealClient` 恒为 undefined，
+        // 于是面板开关**看起来能点、存盘也成功，但读回来永远是关**，而且没有任何编译
+        // 或运行时错误指向根因。本仓已有同型教训（usage_handlers 的 `#[serde(flatten)]`
+        // 摊平：字段退到 `windows.last_24h` 后前端图表全空却零编译错误）。
+        for key in [
+            "\"cliOriginKiroCli\":",
+            "\"cliCodewhispererOptoutFalse\":",
+            "\"cliUaAlignRealClient\":",
+            "\"upstreamPerCredentialLimit\":",
+        ] {
+            assert!(s.contains(key), "快照缺少 {key} —— 前端会读到 undefined 且无报错");
+        }
+    }
+
+    // ---- region 重探 / 一键超额禁用 ----
+
+    /// 前端 `reprobeRegion` 契约锁：成功响应必须带 camelCase 的 `region` 字段。
+    ///
+    /// 前端手写镜像（admin-ui `credentials.ts` 的返回类型是 `{ region: string }`），
+    /// 字段名对不上时 tsc 不会报错、只会在运行时拿到 undefined —— 同
+    /// `config_snapshot` 那条守卫的教训。用 serde 序列化断言锁字段名。
+    #[test]
+    fn reprobe_region_response_serializes_camel_case_region() {
+        let resp = ReprobeRegionResponse {
+            region: Some("eu-central-1".to_string()),
+            message: "已探测并写死 region eu-central-1".to_string(),
+        };
+        let s = serde_json::to_string(&resp).expect("序列化应成功");
+        assert!(
+            s.contains("\"region\":\"eu-central-1\""),
+            "前端 reprobeRegion 解构 data.region，字段名必须保持 camelCase"
+        );
+        assert!(s.contains("\"message\":"));
+    }
+
+    /// 一键超额禁用的响应形状：`disabled` + `list` + 逐条 `results`（camelCase）。
+    #[test]
+    fn disable_quota_exceeded_response_shape() {
+        let resp = DisableQuotaExceededResponse {
+            disabled: 1,
+            failed: 1,
+            list: vec![42],
+            results: vec![
+                BatchDeleteItemResult {
+                    id: 42,
+                    ok: true,
+                    error: None,
+                },
+                BatchDeleteItemResult {
+                    id: 7,
+                    ok: false,
+                    error: Some("凭据已被删除".to_string()),
+                },
+            ],
+        };
+        let s = serde_json::to_string(&resp).expect("序列化应成功");
+        assert!(s.contains("\"disabled\":1"));
+        assert!(s.contains("\"failed\":1"));
+        assert!(s.contains("\"list\":[42]"));
+        assert!(s.contains("\"id\":42"));
+        assert!(s.contains("\"ok\":true"));
+        // 失败条的错误消息必带，成功条不泄漏 error 字段。
+        assert!(s.contains("\"error\":\"凭据已被删除\""));
+        assert!(!s.contains("\"error\":null"));
     }
 }

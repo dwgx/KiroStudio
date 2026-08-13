@@ -27,12 +27,12 @@ pub use super::social_login::{PollResult, StartResult};
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, BatchDeleteItemResult,
     CleanupDisabledResponse, CleanupSkippedItem, ConfigSnapshotResponse, CredentialStatusItem,
-    CredentialsStatusResponse, ImportKeyItem, ImportKeyResult, ImportKeysRequest,
-    ImportKeysResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
-    SocksNodeBulkImportItem, SocksNodeBulkImportOutcome, SocksNodeUpsertRequest, SocksNodeView,
-    StorageCleanupItem, StorageCleanupResponse, StoragePartition, StorageStatsResponse,
-    TrashItemResponse, TrashListResponse, UpdateConfigRequest, UpdateConfigResponse,
-    build_import_response, mask_import_key,
+    CredentialsStatusResponse, DisableQuotaExceededResponse, ImportKeyItem, ImportKeyResult,
+    ImportKeysRequest, ImportKeysResponse, LoadBalancingModeResponse, ReprobeRegionResponse,
+    SetLoadBalancingModeRequest, SocksNodeBulkImportItem, SocksNodeBulkImportOutcome,
+    SocksNodeUpsertRequest, SocksNodeView, StorageCleanupItem, StorageCleanupResponse,
+    StoragePartition, StorageStatsResponse, TrashItemResponse, TrashListResponse,
+    UpdateConfigRequest, UpdateConfigResponse, build_import_response, mask_import_key,
 };
 use crate::kiro::auth::social::OAuthCallbackData;
 use crate::usage::TraceDb;
@@ -607,6 +607,7 @@ impl AdminService {
                     request_limit: entry.request_limit,
                     request_count: entry.request_count,
                     deepseek_normalize: entry.deepseek_normalize,
+                    model_mapping_exempt: entry.model_mapping_exempt,
                     has_profile_arn: entry.has_profile_arn,
                     refresh_token_hash: entry.refresh_token_hash,
                     api_key_hash: entry.api_key_hash,
@@ -821,6 +822,222 @@ impl AdminService {
             .map_err(|e| self.classify_error(e, id))
     }
 
+    /// 手动更新 OAuth 号的 refreshToken（token 轮换后的运维入口，2026-08-11）。
+    ///
+    /// ⚠️ 凭证纪律：refreshToken 是敏感值，本函数不记录、不回显、不进错误消息。
+    /// 成功后下一次调用强制走刷新链路（access_token 缓存已清）。
+    pub fn update_refresh_token(&self, id: u64, refresh_token: String) -> Result<(), AdminServiceError> {
+        if refresh_token.trim().is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "refreshToken 不能为空".to_string(),
+            ));
+        }
+        self.token_manager
+            .update_refresh_token(id, refresh_token)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 手动重探指定凭据的可用 region（命中则写死 `api_region` 并落盘）。
+    ///
+    /// 复用上号路径的 `probe_and_persist_api_region`（同一判据、同一落盘收口）。
+    /// 与 `add_credential` 的处置差异在**失败侧**：
+    ///
+    /// - 上号时探不出结论要禁用（新号未接流量，启用即恒 403 被自动打死）；
+    /// - 这里面对的是**已在服役**的存量号 —— 启动回填修过的误禁形态正是「服役号被
+    ///   禁用会把一个靠 `config.region` 恰好对的好号打掉」，故失败一律**只报错、
+    ///   绝不触碰禁用态**（禁用处置只适用于上号那一刻，见 `probe_and_persist_api_region`
+    ///   与 `mark_region_probe_failed` 的文档）。
+    ///
+    /// 前端契约（admin-ui `reprobeRegion`）：成功 `{ region }`；失败标准
+    /// `AdminErrorResponse`（`error.message` 带归因提示）。
+    pub async fn reprobe_api_region(
+        &self,
+        id: u64,
+    ) -> Result<ReprobeRegionResponse, AdminServiceError> {
+        use crate::kiro::region_probe::ProbeOutcome;
+        if self.token_manager.export_credential(id).is_none() {
+            return Err(AdminServiceError::NotFound { id });
+        }
+        match self.token_manager.probe_and_persist_api_region(id).await {
+            ProbeOutcome::Usable(region) => Ok(ReprobeRegionResponse {
+                region: Some(region.clone()),
+                message: format!("凭据 #{} 已探测并写死 region {}", id, region),
+            }),
+            // Skipped：号已带 region 字段 / 不是 api_key 号（OAuth、代挂）/ 取 token 瞬时失败。
+            // 返回当前 api_region；号上没有任何 region 字段就明说「无需探测」——
+            // 这不是失败（探测压根没发生或没有探测资格），不能走错误路径。
+            ProbeOutcome::Skipped => {
+                let region = self
+                    .token_manager
+                    .export_credential(id)
+                    .and_then(|c| c.api_region);
+                Ok(ReprobeRegionResponse {
+                    region: region.clone(),
+                    message: match region {
+                        Some(r) => format!("凭据 #{} 无需探测（已带 region {}）", id, r),
+                        None => format!("凭据 #{} 无需探测（已带 region 或非 api_key 号）", id),
+                    },
+                })
+            }
+            ProbeOutcome::NoUsableRegion => Err(AdminServiceError::InvalidCredential(format!(
+                "凭据 #{} 候选 region 全部不可用（403/无结论），探不出可用区；\
+                 号保持原状态未被禁用，请人工确认 region 授权范围",
+                id
+            ))),
+            ProbeOutcome::TokenDead => Err(AdminServiceError::InvalidCredential(format!(
+                "凭据 #{} token 已失效（401），探不出可用 region；\
+                 号保持原状态未被禁用，需重新获取 token",
+                id
+            ))),
+            ProbeOutcome::AccountThrottled => Err(AdminServiceError::UpstreamError(format!(
+                "凭据 #{} 账户级风控挡住探测，与 region 无关；\
+                 号保持原状态未被禁用，等风控过去后再重探",
+                id
+            ))),
+        }
+    }
+
+    /// 一键禁用所有「余额已超额」的启用号（`remaining <= 0`）。
+    ///
+    /// # 数据源
+    ///
+    /// 余额缓存（`balance_cache`，按账号键共享）—— 与批量缓存余额端点同源，**零上游**。
+    /// 因此前端点此按钮前应先触发余额刷新（或等后台 30 分钟温和刷新），否则候选可能为空。
+    ///
+    /// # 排除项
+    ///
+    /// - 已禁用的号：不是候选（幂等，重复点不重复禁）。
+    /// - 代挂号（`custom_api`）：不适用 Kiro 配额体系，额度是中转站自己的，绝不代禁。
+    /// - 缓存未命中 / 余额大于 0：不是候选。
+    ///
+    /// # 禁用机制（为什么用 `report_quota_exhausted` 而不是 `set_disabled`）
+    ///
+    /// `set_disabled` 在 token_manager 侧把原因写死成 `Manual`，而本端点要求
+    /// `DisabledReason::QuotaExceeded`（面板要能看出「额度用尽」而不是「手动禁用」）。
+    /// 全仓写该原因的既有收口只有 `report_quota_exhausted`（运行期 402 路径），
+    /// 其附带动作对本端点同样成立：failure_count 拉到阈值（面板直观显示不可用）、
+    /// 立即落盘（重启后不回池）、清亲和绑定、若禁的是当前号则切到下一个可用号。
+    ///
+    /// # 部分失败语义
+    ///
+    /// 与批量删除同款：单号失败不炸整批，逐条标 ok/error（`results`）。
+    pub fn disable_quota_exceeded(&self) -> DisableQuotaExceededResponse {
+        let snapshot = self.token_manager.snapshot();
+        let mut candidates: Vec<u64> = Vec::new();
+        let mut stale_results: Vec<BatchDeleteItemResult> = Vec::new();
+        {
+            let cache = self.balance_cache.lock();
+            for entry in snapshot.entries.iter() {
+                if entry.disabled {
+                    continue;
+                }
+                // 代挂判据必须问**真凭据**而不是快照字段：快照的 auth_method 对
+                // 「custom_api 且带 kiroApiKey」的号会显示成 `api_key`（见 snapshot 的
+                // is_api_key_credential 分支）—— 与 cleanup 同款教训。
+                let Some(cred) = self.token_manager.export_credential(entry.id) else {
+                    continue; // 已被删的竞态：本轮跳过，不误判
+                };
+                if cred.is_custom_api_credential() {
+                    continue;
+                }
+                // ⭐ 缓存新鲜度门（2026-08-11 对抗审查 MAJOR）：余额缓存最长可存活 7 天
+                // （BALANCE_CACHE_DISPLAY_MAX_AGE_SECS），且后台温和刷新**跳过已禁用号**——
+                // 「额度耗尽 → 被禁 → 月度重置 → 上游已恢复」的号，remaining=0 的缓存条目
+                // 可能无限期留存。不检查 cached_at 会把**当前额度正常、正在服役**的号
+                // 以 QuotaExceeded 禁掉。24h 窗口：月度重置后正常号至多一天内被旧缓存误判
+                // 为超额——但被禁后会被跳过刷新，永久卡死。故窗口必须足够新（≤24h）
+                // 且跳过时逐条可见（下方 error 标注），而不是静默漏掉。
+                const BALANCE_CACHE_FRESH_SECS: f64 = 24.0 * 3600.0;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as f64)
+                    .unwrap_or(0.0);
+                let key = self.balance_cache_key(entry.id);
+                match cache.get(&key) {
+                    Some(c) if c.data.remaining <= 0.0 && now - c.cached_at <= BALANCE_CACHE_FRESH_SECS => {
+                        candidates.push(entry.id);
+                    }
+                    Some(c) if c.data.remaining <= 0.0 => {
+                        // 缓存过旧：不纳入候选，但记入结果让管理员可见「为什么没禁它」。
+                        stale_results.push(BatchDeleteItemResult {
+                            id: entry.id,
+                            ok: false,
+                            error: Some("余额缓存已过期（>24h），未禁用——请先刷新余额后重试".to_string()),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut results: Vec<BatchDeleteItemResult> = Vec::new();
+        for id in candidates {
+            // 快照之后、执行之前被删：逐条记失败而不是让整批炸掉。
+            if self.token_manager.export_credential(id).is_none() {
+                results.push(BatchDeleteItemResult {
+                    id,
+                    ok: false,
+                    error: Some("凭据已被删除".to_string()),
+                });
+                continue;
+            }
+            self.token_manager.report_quota_exhausted(id);
+            results.push(BatchDeleteItemResult {
+                id,
+                ok: true,
+                error: None,
+            });
+        }
+
+        let list: Vec<u64> = results
+            .iter()
+            .filter(|r| r.ok)
+            .map(|r| r.id)
+            .collect();
+        let disabled = list.len();
+        let failed = results.len() - disabled;
+        // 过期缓存跳过项并入结果（管理员可见「为什么没禁它」），但不算 failed。
+        // （BatchDeleteItemResult 无 Clone derive，直接 extend，先取 len。）
+        results.extend(stale_results);
+        DisableQuotaExceededResponse {
+            disabled,
+            failed,
+            list,
+            results,
+        }
+    }
+
+    /// OAuth 类凭据（idc / social / external_idp）的「自助复活」。
+    ///
+    /// 对齐参考仓 `do_relogin_update` 的节奏（禁用 → 更新 → 重置启用），但本仓
+    /// token_manager **没有写 refresh_token 的 setter**（token 只由内部刷新路径轮换），
+    /// 故这里不做 token 替换，做的是清掉全部进程内惩罚状态并重新启用：
+    /// `reset_and_enable` 内部已收口 `clear_transient_counters` + 冷却 + 限流器。
+    ///
+    /// 用途：号被 `SuspiciousActivityAuto` / 瞬时误禁 / 想强制解除冷却时的人工复活。
+    /// 若 token 真的已废（`InvalidRefreshToken`），复活后首次刷新仍会失败并再次被禁 ——
+    /// 那时需要的是「带新 token 的 relogin」，依赖 token_manager 补 setter（见交接报告）。
+    ///
+    /// 为什么先禁用再启用：与参考实现同形 —— 若中间将来插入 token 写入/验活，窗口内
+    /// 号不会被调度选中；且 `reset_and_enable` 拒绝 `InvalidConfig` 号（bail）时
+    /// 号会留在禁用态（fail-closed）而不是半复活。
+    pub fn relogin_oauth(&self, id: u64) -> Result<(), AdminServiceError> {
+        let cred = self
+            .token_manager
+            .export_credential(id)
+            .ok_or(AdminServiceError::NotFound { id })?;
+        if cred.is_api_key_credential() || cred.is_custom_api_credential() {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "凭据 #{} 不是 OAuth 类凭据（authMethod: {}），不支持自助复活；\
+                 api_key 号应直接换 key，代挂号无此概念",
+                id,
+                cred.auth_method.as_deref().unwrap_or("?")
+            )));
+        }
+        self.set_disabled(id, true)?;
+        self.reset_and_enable(id)
+    }
+
     /// 设置代挂凭据的 deepseek 协议归一化开关（仅 custom_api 有意义，见 token_manager 对应方法）。
     pub fn set_credential_deepseek_normalize(
         &self,
@@ -829,6 +1046,17 @@ impl AdminService {
     ) -> Result<(), AdminServiceError> {
         self.token_manager
             .set_credential_deepseek_normalize(id, enabled)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 设置凭据的模型映射豁免开关（Kiro 号与 custom_api 号都可用）。
+    pub fn set_credential_model_mapping_exempt(
+        &self,
+        id: u64,
+        exempt: Option<bool>,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_credential_model_mapping_exempt(id, exempt)
             .map_err(|e| self.classify_error(e, id))
     }
 
@@ -1316,12 +1544,25 @@ impl AdminService {
     /// 由 main.rs 的后台任务按长间隔调用（默认 30 分钟）。
     pub async fn refresh_all_balances_gently(&self, spacing_secs: u64) {
         // 取未禁用凭据 id 快照（只读，不持锁跨 await）
+        //
+        // 🔴 必须排除 custom_api 代挂号（2026-08-10 修）：它们是用户自购的 Anthropic 兼容
+        // 中转站，**没有 Kiro 账号**，`get_usage_limits` / `web_portal` 对它们必然失败
+        // （`ensure_valid_token` 对代挂号返空 token 后仍会打上游，失败只被 warn 忽略）。
+        // ⇒ 改前每轮后台刷新都对每个代挂号白打一次注定失败的上游请求。
+        // 这与下面那条「绝不为展示类需求反复打 web_portal（加重风控）」的既定原则同向。
         let all_ids: Vec<u64> = self
             .token_manager
             .snapshot()
             .entries
             .into_iter()
-            .filter(|e| !e.disabled)
+            // 判据与 `KiroCredentials::is_custom_api_credential()` **逐条对齐**
+            // （`auth_method == "custom_api"` 或 `base_url` 非空）—— 只判前者会漏掉
+            // 「auth_method 未写全但配了 base_url」的历史号，那些同样没有 Kiro 账号。
+            .filter(|e| {
+                !e.disabled
+                    && e.auth_method.as_deref() != Some("custom_api")
+                    && e.base_url.is_none()
+            })
             .map(|e| e.id)
             .collect();
 
@@ -1849,6 +2090,7 @@ impl AdminService {
             api_key: req.api_key,
             deepseek_normalize: req.deepseek_normalize,
             deepseek_normalize_config: None,
+            model_mapping_exempt: req.model_mapping_exempt,
             request_limit: req.request_limit,
             custom_api_first: req.custom_api_first,
             // ⭐ 三个 region 字段多开时必须继承（见上方 `inherited` 处的长注释）：
@@ -2874,6 +3116,9 @@ impl AdminService {
         }
         .to_string();
 
+        // AIMD 三个累计计数器一次取齐（同源快照 + 少两次原子读）。
+        let aimd_counters = self.token_manager.inbound_aimd_counters();
+
         ConfigSnapshotResponse {
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             host: config.host.clone(),
@@ -2888,6 +3133,7 @@ impl AdminService {
             endpoint_names,
             extract_thinking: config.extract_thinking,
             cc_auto_buffer: config.cc_auto_buffer,
+            native_thinking_effort_enabled: config.native_thinking_effort_enabled,
             import_keys_enabled: config.import_keys_enabled,
             clone_default_enabled: config.clone_default_enabled,
             upstream_retry_absorb_enabled: config.upstream_retry_absorb_enabled,
@@ -2896,6 +3142,13 @@ impl AdminService {
             upstream_retry_absorb_min_delay_ms: config.upstream_retry_absorb_min_delay_ms,
             upstream_retry_absorb_max_delay_secs: config.upstream_retry_absorb_max_delay_secs,
             upstream_retry_absorb_suspended: config.upstream_retry_absorb_suspended,
+            upstream_retry_absorb_server_error: config.upstream_retry_absorb_server_error,
+            upstream_retry_absorb_capacity_400: config.upstream_retry_absorb_capacity_400,
+            upstream_retry_absorb_swap_budget_secs: config.upstream_retry_absorb_swap_budget_secs,
+            upstream_retry_absorb_exhausted_status: config.upstream_retry_absorb_exhausted_status,
+            self_heal_base_backoff_secs: config.self_heal_base_backoff_secs,
+            self_heal_max_backoff_secs: config.self_heal_max_backoff_secs,
+            self_heal_max_shift: config.self_heal_max_shift,
             prompt_cache_enabled: config.prompt_cache_enabled,
             strip_env_noise: config.strip_env_noise,
             tool_clean_leaked_tokens: config.tool_clean_leaked_tokens,
@@ -2906,6 +3159,10 @@ impl AdminService {
             tool_repair_json: config.tool_repair_json,
             tool_truncation_recovery: config.tool_truncation_recovery,
             tool_description_max_chars: config.tool_description_max_chars,
+            cli_origin_kiro_cli: config.cli_origin_kiro_cli,
+            cli_codewhisperer_optout_false: config.cli_codewhisperer_optout_false,
+            cli_ua_align_real_client: config.cli_ua_align_real_client,
+            upstream_per_credential_limit: config.upstream_per_credential_limit,
             encrypt_credentials_at_rest: config.encrypt_credentials_at_rest,
             cooldown_enabled: config.cooldown_enabled,
             auto_disable_suspicious: config.auto_disable_suspicious,
@@ -2921,6 +3178,7 @@ impl AdminService {
             rpm_hard_gate_overload_wait: config.rpm_hard_gate_overload_wait,
             cooldown_scale_pct: config.cooldown_scale_pct,
             rate_limit_jitter_pct: config.rate_limit_jitter_pct,
+            throttle_profile: config.throttle_profile,
             inbound_throttle_enabled: config.inbound_throttle_enabled,
             inbound_rpm_auto: config.inbound_rpm_auto,
             inbound_target_rpm: config.inbound_target_rpm,
@@ -2942,6 +3200,12 @@ impl AdminService {
             inbound_observed_rpm: self.token_manager.observed_inbound_rpm(),
             inbound_observed_upstream_rpm: self.token_manager.observed_upstream_rpm(),
             inbound_admitted_total: self.token_manager.inbound_admitted_total(),
+            // AIMD 三元组：排队 / 降档 / 升档累计次数。此前是只写不读的死代码，
+            // 「整形是否在起作用、是否卡在下限」无从判断（先修度量再谈调参）。
+            // 一次取三个值：三个字段同源，分三次调会读到不一致的快照（也多两次原子读）。
+            inbound_aimd_queued_total: aimd_counters.0,
+            inbound_aimd_md_total: aimd_counters.1,
+            inbound_aimd_ai_total: aimd_counters.2,
             balance_weight_enabled: config.balance_weight_enabled,
             balance_weight_floor: config.balance_weight_floor,
             health_429_weight_enabled: config.health_429_weight_enabled,
@@ -2976,6 +3240,7 @@ impl AdminService {
             config_path: config
                 .config_path()
                 .map(|p| p.display().to_string()),
+            model_mapping: config.model_mapping.clone(),
         }
     }
 
@@ -3037,14 +3302,19 @@ impl AdminService {
         // 所以只要 reload_config 被触发就即时生效。**必须**进 hot_or_display_changed 的
         // OR 链，漏掉就是"存了盘但 ArcSwap 仍是旧值"，面板开关静默无效。
         let mut clone_default_enabled_changed = false;
-        // 上游 429 吸收层六项是否有变更。**无 TIER3 setter**：吸收层在 provider 内直接读
+        // 上游 429 吸收层十项是否有变更。**无 TIER3 setter**：吸收层在 provider 内直接读
         // token_manager 的 config ArcSwap，所以只要下面的 reload_config 被触发就即时生效。
         // ⚠️ 正因如此，这个 flag **必须**进 hot_or_display_changed 的 OR 链 ——
         // 漏掉就会「存了盘但 ArcSwap 仍是旧值」，面板开关静默无效。
         let mut absorb_changed = false;
+        // 全池自愈退避参数（2026-08-11 配置化）：token_manager 每周期从 config 读，
+        // 必须进 hot_or_display_changed 的 OR 链，否则「存了盘但 ArcSwap 仍是旧值」。
+        let mut self_heal_changed = false;
         let mut prompt_cache_enabled_changed: Option<bool> = None;
         // 环境噪音剥离开关：改后调 converter setter 即时生效（进程级镜像，不重启）。
         let mut strip_env_noise_changed: Option<bool> = None;
+        // Kiro 原生 effort 开关：改后调 converter setter 即时生效（进程级镜像，不重启）。
+        let mut native_thinking_effort_enabled_changed: Option<bool> = None;
         // 工具错误缓解三开关：改后调 handlers setter 即时生效（进程级镜像，不重启）。
         let mut tool_clean_leaked_tokens_changed: Option<bool> = None;
         let mut tool_stream_align_failure_changed: Option<bool> = None;
@@ -3171,7 +3441,7 @@ impl AdminService {
                 clone_default_enabled_changed = true;
             }
         }
-        // —— 上游 429 吸收层六项（存盘 + reload_config 即时生效，无 TIER3 setter）——
+        // —— 上游 429 吸收层十项（存盘 + reload_config 即时生效，无 TIER3 setter）——
         if let Some(v) = req.upstream_retry_absorb_enabled {
             if v != config.upstream_retry_absorb_enabled {
                 config.upstream_retry_absorb_enabled = v;
@@ -3208,6 +3478,41 @@ impl AdminService {
                 absorb_changed = true;
             }
         }
+        // 是否吸收上游 5xx（2026-08-10 补：此前该字段只能改 config.json + 重启）。
+        // 线上代挂上游主要故障形态是 502，不吸收等于把最典型的瞬态故障直接甩给客户端。
+        if let Some(v) = req.upstream_retry_absorb_server_error {
+            if v != config.upstream_retry_absorb_server_error {
+                config.upstream_retry_absorb_server_error = v;
+                absorb_changed = true;
+            }
+        }
+        // 吸收 400 容量类 / 换号空窗独立预算 / 耗尽状态码（2026-08-11 补：此前只能改 config.json）。
+        if let Some(v) = req.upstream_retry_absorb_capacity_400 {
+            if v != config.upstream_retry_absorb_capacity_400 {
+                config.upstream_retry_absorb_capacity_400 = v;
+                absorb_changed = true;
+            }
+        }
+        if let Some(v) = req.upstream_retry_absorb_swap_budget_secs {
+            if v != config.upstream_retry_absorb_swap_budget_secs {
+                config.upstream_retry_absorb_swap_budget_secs = v;
+                absorb_changed = true;
+            }
+        }
+        if let Some(v) = req.upstream_retry_absorb_exhausted_status {
+            if v != config.upstream_retry_absorb_exhausted_status {
+                // 值域白名单（2026-08-11 审计）：config 文档明确「唯一另一个可选值 503」。
+                // 消费端（provider.rs）只认精确 503、其余一律按 429 语义处理（有守卫钉死），
+                // 但面板不该允许把 0/999 之类写进 config.json 长期驻留。
+                if v != 429 && v != 503 {
+                    return Err(AdminServiceError::InvalidCredential(format!(
+                        "upstreamRetryAbsorbExhaustedStatus 只允许 429 或 503，收到 {v}"
+                    )));
+                }
+                config.upstream_retry_absorb_exhausted_status = v;
+                absorb_changed = true;
+            }
+        }
 
         // —— prompt cache 记账下发开关（TIER3 热更：改后调 handlers setter 即时生效不重启）——
         // 此前该配置既无读取点也不在 admin 请求里，等于面板改不了、改了也没用。
@@ -3224,10 +3529,37 @@ impl AdminService {
                 strip_env_noise_changed = Some(v);
             }
         }
+        // —— Kiro 原生 effort 开关（改后调 converter setter 即时生效不重启）——
+        if let Some(v) = req.native_thinking_effort_enabled {
+            if v != config.native_thinking_effort_enabled {
+                config.native_thinking_effort_enabled = v;
+                native_thinking_effort_enabled_changed = Some(v);
+            }
+        }
         if let Some(v) = req.tool_clean_leaked_tokens {
             if v != config.tool_clean_leaked_tokens {
                 config.tool_clean_leaked_tokens = v;
                 tool_clean_leaked_tokens_changed = Some(v);
+            }
+        }
+        // 全池自愈退避参数（2026-08-11 配置化）：无 TIER3 setter（token_manager 每周期
+        // 从 config 读），改后下一个自愈周期即生效（热更语义见 config.rs 字段注释）。
+        if let Some(v) = req.self_heal_base_backoff_secs {
+            if v != config.self_heal_base_backoff_secs {
+                config.self_heal_base_backoff_secs = v;
+                self_heal_changed = true;
+            }
+        }
+        if let Some(v) = req.self_heal_max_backoff_secs {
+            if v != config.self_heal_max_backoff_secs {
+                config.self_heal_max_backoff_secs = v;
+                self_heal_changed = true;
+            }
+        }
+        if let Some(v) = req.self_heal_max_shift {
+            if v != config.self_heal_max_shift {
+                config.self_heal_max_shift = v;
+                self_heal_changed = true;
             }
         }
         if let Some(v) = req.tool_reclaim_textified_invoke {
@@ -3272,6 +3604,30 @@ impl AdminService {
             if v != config.tool_description_max_chars {
                 config.tool_description_max_chars = v;
                 tool_description_max_chars_changed = Some(v);
+            }
+        }
+        // ── CLI 端点协议/指纹三开关 ──
+        // 都**不需要** TIER3 原子镜像：`decorate_api` / `transform_api_body` 从
+        // `ctx.config` 读，而那份 Config 是 provider 每次调用时 `token_manager.config()`
+        // （ArcSwap `load_full`）取的新快照 ⇒ 存盘 + reload_config 后下一个请求即生效。
+        // 加镜像反而多一份要同步的真值（与吸收层同理，见 provider.rs 的 AbsorbPolicy 说明）。
+        // 故这里只置 `hot_changed`，不进 restart_fields、不调任何 setter。
+        if let Some(v) = req.cli_origin_kiro_cli {
+            if v != config.cli_origin_kiro_cli {
+                config.cli_origin_kiro_cli = v;
+                hot_changed = true;
+            }
+        }
+        if let Some(v) = req.cli_codewhisperer_optout_false {
+            if v != config.cli_codewhisperer_optout_false {
+                config.cli_codewhisperer_optout_false = v;
+                hot_changed = true;
+            }
+        }
+        if let Some(v) = req.cli_ua_align_real_client {
+            if v != config.cli_ua_align_real_client {
+                config.cli_ua_align_real_client = v;
+                hot_changed = true;
             }
         }
         // at-rest 加密开关:热更(persist 每次读 self.config() 现值)。开→关或关→开都在下次 persist 生效;
@@ -3363,6 +3719,26 @@ impl AdminService {
             let v = v.min(100);
             if v != config.rpm_headroom_factor {
                 config.rpm_headroom_factor = v;
+                hot_changed = true;
+            }
+        }
+        // ---- 限流档位（2026-08-11）----
+        //
+        // 🔴 与**文件加载**时的语义不同，这里必须真的把档位值写进配置。
+        //
+        // 文件加载走 `Config::apply_throttle_profile`，契约是「只填空、不覆盖显式值」——
+        // 因为那时无法区分"用户想要 false"和"字段缺失默认 false"，而线上 config.json
+        // 那 7 个字段全部显式写过，冲掉就是改写生产配置。
+        //
+        // 但从面板切档是**用户主动的意图表达**：他就是要这一档的行为。此时若还"只填空"，
+        // 由于 config.json 里那些键都已存在，档位会**一个字段都改不动** —— 按钮点了没反应，
+        // 这是比"冲掉配置"更糟的体验（静默无效）。
+        // 所以这里用空 explicit 集合调用，让档位对所有受管字段生效，
+        // 且改动会随 `save()` 落盘成显式值（之后重启加载时它们就是"显式"的，不会被再次覆盖 —— 自洽）。
+        if let Some(p) = req.throttle_profile {
+            if p != config.throttle_profile {
+                config.throttle_profile = p;
+                config.apply_throttle_profile_for_explicit_switch();
                 hot_changed = true;
             }
         }
@@ -3703,6 +4079,16 @@ impl AdminService {
             hot_changed = true;
         }
 
+        // —— 立即生效的字段：全局模型映射（整表替换）——
+        // provider 每次调用时 `token_manager.config()`（ArcSwap load_full）取新快照，
+        // 所以只需保存 + reload_config 热应用即可，无需重启（TIER1 范式，同吸收层）。
+        if let Some(mm) = req.model_mapping {
+            if mm != config.model_mapping {
+                config.model_mapping = mm;
+                hot_changed = true;
+            }
+        }
+
         // 持久化（一次写盘）
         config
             .save()
@@ -3736,6 +4122,10 @@ impl AdminService {
             || clone_default_enabled_changed
             || prompt_cache_enabled_changed.is_some()
             || strip_env_noise_changed.is_some()
+            // Kiro 原生 effort 开关有 TIER3 setter（converter 镜像），但要 `hot_changed`
+            // 之外仍进 OR 链才会调它：漏掉这行只改本项时面板会回「无改动」。
+            || native_thinking_effort_enabled_changed.is_some()
+            || self_heal_changed
             || tool_clean_leaked_tokens_changed.is_some()
             || tool_stream_align_failure_changed.is_some()
             || tool_expose_error_to_client_changed.is_some()
@@ -3822,6 +4212,10 @@ impl AdminService {
         if let Some(v) = strip_env_noise_changed {
             crate::anthropic::set_strip_env_noise(v);
         }
+        // Kiro 原生 effort 开关立即应用到 converter 进程级镜像（下一个请求即生效）
+        if let Some(v) = native_thinking_effort_enabled_changed {
+            crate::anthropic::set_native_thinking_effort_enabled(v);
+        }
         // 工具错误缓解三开关立即应用到 handlers 进程级镜像（下一个请求即生效，不重启）。
         if let Some(v) = tool_clean_leaked_tokens_changed {
             crate::anthropic::set_tool_clean_leaked_tokens(v);
@@ -3857,6 +4251,7 @@ impl AdminService {
             || clone_default_enabled_changed
             || prompt_cache_enabled_changed.is_some()
             || strip_env_noise_changed.is_some()
+            || native_thinking_effort_enabled_changed.is_some()
             || tool_clean_leaked_tokens_changed.is_some()
             || tool_stream_align_failure_changed.is_some()
             || tool_expose_error_to_client_changed.is_some()
@@ -5846,6 +6241,57 @@ mod multi_open_copies_tests {
         }
     }
 }
+    /// 🔴 档位切换必须真的落到消费侧（2026-08-11 新增）。
+    ///
+    /// 完整链路：面板切档 → `throttle_profile` 分支设 `hot_changed=true`
+    /// → `hot_or_display_changed` → `reload_config()` → `token_manager` 把
+    /// `inbound_queue_timeout_passthrough` 等值 `store` 进 `GlobalThrottle`。
+    ///
+    /// 断掉任一环的表现都是「面板显示已切档、config.json 里也写对了，但行为没变」——
+    /// 而档位管的恰好是「整形层超时放行还是返 429」这种**只在真实压力下才看得出**的开关，
+    /// 排障时极难定位。所以这里钉住两点：切档分支存在，且它设了 `hot_changed`。
+    #[test]
+    fn throttle_profile_switch_is_wired_to_hot_reload() {
+        let src = include_str!("service.rs");
+        // 显式截断测试段：否则本测试自身的字面量会让 split 命中测试代码
+        // （本文件已因这类原因出过一次「守卫静默变绿」）。
+        let needle_fn = format!("pub fn update{}", "_config");
+        let update_fn = src
+            .split(needle_fn.as_str())
+            .nth(1)
+            .and_then(|s| s.split_once("\n#[cfg(test)]").map(|(head, _)| head))
+            .expect("找不到 update_config 的生产代码段");
+
+        // ① 切档分支必须在 update_config 里
+        let field = format!("req.throttle{}", "_profile");
+        assert!(
+            update_fn.contains(field.as_str()),
+            "update_config 里找不到 {field} 的处理分支 —— 面板切档不会有任何效果"
+        );
+
+        // ② 该分支必须设 hot_changed（否则当次不触发 reload_config，改动要等重启才生效）
+        let seg = update_fn
+            .split(field.as_str())
+            .nth(1)
+            .expect("上面已断言存在");
+        // ⚠️ 窗口必须截到**本分支结束**（下一个 `if let Some` 处），不能用固定字符数。
+        // 初版取 600 字符 ⇒ 越过本分支、命中了下一个字段的 `hot_changed = true`
+        // ⇒ 删掉切档分支自己那一行，守卫**仍然绿**（实测确认过）。
+        // 这正是本守卫要防的失败模式，却先发生在守卫自己身上。
+        let next_branch = format!("if let Some{}", "(");
+        let window = seg
+            .find(next_branch.as_str())
+            .map(|end| &seg[..end])
+            .unwrap_or(seg);
+        let hot = format!("hot{}", "_changed = true");
+        assert!(
+            window.contains(hot.as_str()),
+            "切档分支没有设 {hot} —— 后果：config.json 写对了、面板显示成功，\
+             但当次进程内的整形层/冷却开关**不会更新**，要重启才生效。\
+             这是本文件历史上出现过的同款隐蔽故障。"
+        );
+    }
+
 
 #[cfg(test)]
 mod absorb_hot_reload_tests {
@@ -5863,9 +6309,16 @@ mod absorb_hot_reload_tests {
     #[test]
     fn absorb_changed_is_in_hot_reload_or_chain() {
         let src = include_str!("service.rs");
+        // ⚠️ 显式截断测试段（2026-08-11 审计修复）：`split(...).nth(1)` 只取第二个片段，
+        // 此前 update_fn 恰好在本测试自身的 `.split("pub fn update_config")` 字面量处
+        // 截断 —— 绿是**巧合**（依赖测试段里存在该字面量），删掉那个字面量 update_fn
+        // 会延伸到文件末尾、把本测试断言行的 `absorb_changed = true` 字面量数进去 →
+        // 计数 11 ≠ 10 误红。显式截断 + needle 运行时拼接后语义与位置无关。
+        let needle_fn = format!("pub fn update{}", "_config");
         let update_fn = src
-            .split("pub fn update_config")
+            .split(needle_fn.as_str())
             .nth(1)
+            .and_then(|s| s.split_once("\n#[cfg(test)]").map(|(head, _)| head))
             .expect("update_config 不应被改名");
         // 截到 reload_config 调用处为止，只看它之前的那条 OR 链。
         let or_chain = update_fn
@@ -5878,15 +6331,26 @@ mod absorb_hot_reload_tests {
             "hot_or_display_changed 的 OR 链必须包含 absorb_changed，否则面板改了吸收层配置\
              会存盘但不触发 reload_config → ArcSwap 仍是旧值 → 开关当次静默无效"
         );
-        // 六个字段都必须真的会把 absorb_changed 置位（防加了字段忘了置位）。
-        for field in [
+        // 七个字段都必须真的会把 absorb_changed 置位（防加了字段忘了置位）。
+        // 2026-08-10 从六项扩到七项：补入 `upstream_retry_absorb_server_error`
+        // —— 它在 `model/config.rs` 早已存在，但此前**没暴露到 Admin API**，
+        // 只能改 config.json + 重启。线上代挂上游主要故障形态是 502，
+        // 不吸收 5xx 等于把最典型的瞬态故障直接甩给客户端断会话。
+        // 2026-08-11 扩到十项：capacity_400 / swap_budget_secs / exhausted_status
+        // （同类问题：只存在于 config.json，面板与 API 都改不了）。
+        let absorb_fields = [
             "upstream_retry_absorb_enabled",
             "upstream_retry_absorb_budget_secs",
             "upstream_retry_absorb_max_rounds",
             "upstream_retry_absorb_min_delay_ms",
             "upstream_retry_absorb_max_delay_secs",
             "upstream_retry_absorb_suspended",
-        ] {
+            "upstream_retry_absorb_server_error",
+            "upstream_retry_absorb_capacity_400",
+            "upstream_retry_absorb_swap_budget_secs",
+            "upstream_retry_absorb_exhausted_status",
+        ];
+        for field in absorb_fields {
             assert!(
                 update_fn.contains(&format!("req.{field}")),
                 "update_config 必须读取 req.{field}，否则该字段面板改不了"
@@ -5894,12 +6358,13 @@ mod absorb_hot_reload_tests {
         }
         assert_eq!(
             update_fn.matches("absorb_changed = true").count(),
-            6,
-            "六个吸收层字段各自都必须置位 absorb_changed（漏一个 → 只改那个字段时不热更）"
+            absorb_fields.len(),
+            "每个吸收层字段各自都必须置位 absorb_changed（漏一个 → 只改那个字段时不热更）。\
+             新增字段时这里的计数会自动跟着 absorb_fields 走，不用再手改数字"
         );
     }
 
-    /// ⭐ 源码守卫：配置快照的吸收层六项必须**逐字段从 config 读**，不得写死。
+    /// ⭐ 源码守卫：配置快照的吸收层十项必须**逐字段从 config 读**，不得写死。
     ///
     /// 回退即 FAIL：把任一项改成字面量（如 `upstream_retry_absorb_enabled: false,`），断言失败。
     ///
@@ -5918,6 +6383,12 @@ mod absorb_hot_reload_tests {
             "upstream_retry_absorb_min_delay_ms",
             "upstream_retry_absorb_max_delay_secs",
             "upstream_retry_absorb_suspended",
+            // 2026-08-10 补：该字段此前完全没进 Admin API（面板看不到也改不了）
+            "upstream_retry_absorb_server_error",
+            // 2026-08-11 补：同类问题三个字段（只存在于 config.json）
+            "upstream_retry_absorb_capacity_400",
+            "upstream_retry_absorb_swap_budget_secs",
+            "upstream_retry_absorb_exhausted_status",
         ] {
             let mapping = format!("{field}: config.{field},");
             assert!(
@@ -5966,6 +6437,53 @@ mod absorb_hot_reload_tests {
         assert!(
             !src.contains(&restart),
             "该字段是 TIER1 热更（reload_config 已读它），不得要求重启"
+        );
+    }
+
+    /// 🔴 回归：`native_thinking_effort_enabled` 必须**全套接线**（快照 / 更新分支 /
+    /// TIER3 setter 应用 / 两条 OR 链），否则面板改了不生效且回「无改动」。
+    ///
+    /// 参考仓移植的新开关，必须一次性接通才会被面板看到、改到、热更到：
+    /// - 快照：`build_config_snapshot` 逐字段从 config 读（否则面板永远显示默认值）；
+    /// - 更新分支：`req.{field}` 置位（否则面板改不动）；
+    /// - TIER3：改后调 `set_native_thinking_effort_enabled` 写 converter 进程镜像
+    ///   （否则存了盘但热路径仍读旧值，开关静默无效）；
+    /// - 两条 OR 链各一处（hot_or_display_changed 与 immediate_changed，漏一条 →
+    ///   只改本项时面板回「无改动」）。
+    ///
+    /// 回退即 FAIL：删掉任一处接线 → 对应断言失败。
+    #[test]
+    fn native_thinking_effort_enabled_is_fully_wired() {
+        let src = include_str!("service.rs");
+        let types = include_str!("types.rs");
+        // needle 运行时拼接：include_str! 会把本测试自己的字面量也读进来。
+        let field = format!("native_thinking{}", "_effort_enabled");
+
+        let snapshot = format!("{field}: config.{field},");
+        assert!(
+            src.contains(&snapshot),
+            "配置快照必须逐字段从 config 读 `{snapshot}`，否则面板读不到真实值"
+        );
+        let update = format!("req.{field}");
+        assert!(
+            src.contains(&update),
+            "必须有 `if let Some(v) = {update}` 的 TIER3 更新分支，否则面板改不动它"
+        );
+        let setter = format!("set_native{}", "_thinking_effort_enabled(v)");
+        assert!(
+            src.contains(&setter),
+            "改后必须调 converter 的 `{setter}` 写进程镜像，否则热路径读旧值"
+        );
+        // 响应结构与请求结构各一处（快照 + 请求）。
+        assert!(
+            types.matches(&field).count() >= 2,
+            "types.rs 里响应结构与请求结构都必须有该字段（当前 {} 处）",
+            types.matches(&field).count()
+        );
+        // 两条 OR 链（hot_or_display_changed 与 immediate_changed）各必须含本 flag。
+        assert!(
+            src.matches(&format!("|| {field}_changed.is_some()")).count() >= 2,
+            "本 flag 必须同时进 hot_or_display_changed 与 immediate_changed 两条 OR 链"
         );
     }
 }
@@ -9265,5 +9783,276 @@ mod ksk_clean_tests {
             "add_credential_with_intent 入口必须清洗 kiro_api_key（ksk_ 截取 + 去噪声），\
              否则粘贴 `\"key: ksk_xxx\"` 会破坏去重与 region 探测"
         );
+    }
+}
+
+#[cfg(test)]
+mod reprobe_quota_relogin_tests {
+    //! POST /credentials/{id}/reprobe-region、/credentials/disable-quota-exceeded、
+    //! /credentials/{id}/relogin 三个新端点的行为测试与源码守卫。
+    //!
+    //! 能纯逻辑测的（筛选、Skipped 处置、OAuth 校验、复活）用真 service 行为测；
+    //! 需要真实上游的（NoUsableRegion/TokenDead/AccountThrottled 探测判决）用源码守卫锁
+    //! 「失败分支绝不触碰禁用态」—— 本仓铁律：测试不依赖网络。
+
+    use super::*;
+    use crate::admin::types::ReprobeRegionResponse;
+
+    /// 造一条凭据（对齐 cleanup_disabled_tests::mk 的形状）。
+    fn mk(id: u64, auth_method: &str, disabled: bool, reason: Option<DisabledReason>) -> KiroCredentials {
+        KiroCredentials {
+            id: Some(id),
+            auth_method: Some(auth_method.to_string()),
+            kiro_api_key: match auth_method {
+                "api_key" | "custom_api" => Some(format!("ksk_test_{id}")),
+                _ => None,
+            },
+            // OAuth 类必须带 refresh_token（validate 路径要求；测试里不触发刷新，仅占位）
+            refresh_token: match auth_method {
+                "api_key" | "custom_api" => None,
+                _ => Some(format!("rt-test-{id}")),
+            },
+            disabled,
+            disabled_reason: reason,
+            ..Default::default()
+        }
+    }
+
+    fn mk_service(creds: Vec<KiroCredentials>) -> AdminService {
+        let tm = Arc::new(
+            MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                creds,
+                None,
+                None,
+                // 单凭据格式 ⇒ persist 是 no-op，测试只改内存。
+                false,
+            )
+            .expect("构造 token manager"),
+        );
+        AdminService::new(tm, Vec::<String>::new())
+    }
+
+    fn balance(id: u64, remaining: f64) -> BalanceResponse {
+        BalanceResponse {
+            id,
+            subscription_title: None,
+            current_usage: 0.0,
+            usage_limit: 100.0,
+            remaining,
+            usage_percentage: 0.0,
+            next_reset_at: None,
+            overage_enabled: false,
+            overage_cap: 0.0,
+            effective_limit: 100.0,
+            stale: false,
+            optimistic: false,
+        }
+    }
+
+    fn disabled_of(svc: &AdminService, id: u64) -> (bool, Option<String>) {
+        let snap = svc.token_manager.snapshot();
+        let e = snap
+            .entries
+            .iter()
+            .find(|e| e.id == id)
+            .expect("凭据应在池中");
+        (e.disabled, e.disabled_reason.clone())
+    }
+
+    // ---------------- reprobe-region ----------------
+
+    /// Skipped（已带 region）→ 原样返回当前 api_region，不算失败。
+    /// 探测判据 `needs_api_region_probe` 对带 region 的 api_key 号直接 Skipped，零网络。
+    #[tokio::test]
+    async fn reprobe_skipped_with_region_returns_current_region() {
+        let mut cred = mk(1, "api_key", false, None);
+        cred.api_region = Some("eu-central-1".to_string());
+        let svc = mk_service(vec![cred]);
+        let resp: ReprobeRegionResponse = svc.reprobe_api_region(1).await.expect("Skipped 不是失败");
+        assert_eq!(resp.region.as_deref(), Some("eu-central-1"));
+        assert!(resp.message.contains("无需探测"));
+    }
+
+    /// Skipped（OAuth 号，无 region 概念）→ region=None + 说明文案，仍算成功。
+    #[tokio::test]
+    async fn reprobe_skipped_oauth_returns_no_region() {
+        let svc = mk_service(vec![mk(1, "social", false, None)]);
+        let resp: ReprobeRegionResponse = svc.reprobe_api_region(1).await.expect("Skipped 不是失败");
+        assert_eq!(resp.region, None);
+        assert!(resp.message.contains("无需探测"));
+    }
+
+    /// 号不存在 → NotFound（错误路径，不能假装探测成功）。
+    #[tokio::test]
+    async fn reprobe_missing_credential_is_not_found() {
+        let svc = mk_service(vec![]);
+        let err = svc.reprobe_api_region(1).await.expect_err("不存在必须报错");
+        assert!(matches!(err, AdminServiceError::NotFound { id: 1 }));
+    }
+
+    /// ⭐ 源码级守卫（承重）：探测失败判决（NoUsableRegion / TokenDead / AccountThrottled）
+    /// 只能返错误，**绝不能**调用禁用处置 —— 服役号被禁会把好号打掉
+    /// （启动回填教训，见 `probe_and_persist_api_region` 文档）。
+    /// 行为测试测不到（三个失败判决都要真上游探测），故锁源码。
+    #[test]
+    fn reprobe_failure_arms_must_not_disable_credential() {
+        let src = include_str!("service.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        let marker = format!("pub async fn reprobe_api_region{}", "(");
+        let start = prod.find(&marker).expect("reprobe_api_region 不应被改名");
+        let body_end = prod[start..]
+            .find("\n    pub ")
+            .map(|i| i + start)
+            .unwrap_or(prod.len());
+        let body = &prod[start..body_end];
+        // 三个失败判决必须各自成臂（归因错误消息能区分「探不了」与「探过不行」）。
+        for arm in ["NoUsableRegion =>", "TokenDead =>", "AccountThrottled =>"] {
+            assert!(
+                body.contains(arm),
+                "失败判决 {arm} 必须显式处置（缺失会静默漏分支）"
+            );
+        }
+        // 本函数体里**不允许**出现任何禁用收口调用（拼接 needle 防自匹配）。
+        let disable_call = format!("mark_region_probe_failed{}", "(");
+        assert!(
+            !body.contains(&disable_call),
+            "服役号重探失败不得走禁用处置（mark_region_probe_failed 只属于上号路径）"
+        );
+        let set_disabled_call = format!(".set_disabled{}", "(");
+        assert!(
+            !body.contains(&set_disabled_call),
+            "服役号重探失败不得 set_disabled（会把好号打掉）"
+        );
+    }
+
+    // ---------------- disable-quota-exceeded ----------------
+
+    /// 核心筛选：remaining<=0 且启用 → 禁；healthy（remaining>0）→ 不动。
+    #[test]
+    fn quota_exceeded_disables_only_exhausted_enabled() {
+        let svc = mk_service(vec![
+            mk(1, "api_key", false, None),
+            mk(2, "api_key", false, None),
+            mk(3, "api_key", true, Some(DisabledReason::Manual)),
+        ]);
+        let key1 = svc.balance_cache_key(1);
+        let key2 = svc.balance_cache_key(2);
+        let key3 = svc.balance_cache_key(3);
+        svc.commit_fresh_balance(key1, balance(1, 0.0));
+        svc.commit_fresh_balance(key2, balance(2, 42.5));
+        svc.commit_fresh_balance(key3, balance(3, 0.0));
+
+        let resp = svc.disable_quota_exceeded();
+        assert_eq!(resp.disabled, 1);
+        assert_eq!(resp.failed, 0);
+        assert_eq!(resp.list, vec![1]);
+        // #1 被禁且原因是额度用尽（面板可读，不是 Manual）。
+        assert_eq!(disabled_of(&svc, 1), (true, Some("QuotaExceeded".to_string())));
+        // #2 余额充足：不碰。 #3 已禁用：不是候选（幂等）。
+        assert_eq!(disabled_of(&svc, 2), (false, None));
+        assert_eq!(disabled_of(&svc, 3), (true, Some("Manual".to_string())));
+    }
+
+    /// 代挂号（custom_api）即使缓存显示超额也**绝不**代禁 —— 它的额度是中转站自己的。
+    #[test]
+    fn quota_exceeded_never_disables_custom_api() {
+        let svc = mk_service(vec![mk(10, "custom_api", false, None)]);
+        svc.commit_fresh_balance(svc.balance_cache_key(10), balance(10, -5.0));
+
+        let resp = svc.disable_quota_exceeded();
+        assert_eq!(resp.disabled, 0);
+        assert_eq!(resp.list, Vec::<u64>::new());
+        assert_eq!(disabled_of(&svc, 10), (false, None));
+    }
+
+    /// 无缓存 / 缓存未命中 → 不是候选（零上游，绝不触发余额查询）。
+    #[test]
+    fn quota_exceeded_ignores_uncached() {
+        let svc = mk_service(vec![mk(1, "api_key", false, None)]);
+        let resp = svc.disable_quota_exceeded();
+        assert_eq!(resp.disabled, 0);
+        assert_eq!(resp.list, Vec::<u64>::new());
+        assert_eq!(disabled_of(&svc, 1), (false, None));
+    }
+
+    // ---------------- relogin ----------------
+
+    /// OAuth 号复活：禁用 + 惩罚态清零 + 重新启用（失败计数复位、原因清空）。
+    #[test]
+    fn relogin_revives_oauth_credential() {
+        let svc = mk_service(vec![mk(5, "idc", false, None)]);
+        // 先造一个「惩罚态深」的号：额度耗尽禁用会把 failure_count 拉到阈值。
+        svc.token_manager.report_quota_exhausted(5);
+        assert_eq!(disabled_of(&svc, 5), (true, Some("QuotaExceeded".to_string())));
+
+        svc.relogin_oauth(5).expect("OAuth 号复活应成功");
+        let (disabled, reason) = disabled_of(&svc, 5);
+        assert!(!disabled, "复活后必须重新启用");
+        assert_eq!(reason, None, "复活后禁用原因必须清空");
+        let snap = svc.token_manager.snapshot();
+        let entry = snap.entries.iter().find(|e| e.id == 5).expect("号应在池中");
+        assert_eq!(entry.failure_count, 0, "复活必须重置失败计数");
+    }
+
+    /// api_key 号拒绝复活（它没有 refreshToken 生命周期概念），custom_api 同理。
+    #[test]
+    fn relogin_rejects_api_key_and_custom_api() {
+        let svc = mk_service(vec![
+            mk(1, "api_key", false, None),
+            mk(2, "custom_api", false, None),
+        ]);
+        let err = svc.relogin_oauth(1).expect_err("api_key 号必须拒绝");
+        assert!(matches!(err, AdminServiceError::InvalidCredential(_)));
+        let err = svc.relogin_oauth(2).expect_err("代挂号必须拒绝");
+        assert!(matches!(err, AdminServiceError::InvalidCredential(_)));
+        // 拒绝时不得动状态。
+        assert_eq!(disabled_of(&svc, 1), (false, None));
+        assert_eq!(disabled_of(&svc, 2), (false, None));
+    }
+
+    /// 号不存在 → NotFound。
+    #[test]
+    fn relogin_missing_credential_is_not_found() {
+        let svc = mk_service(vec![]);
+        let err = svc.relogin_oauth(99).expect_err("不存在必须报错");
+        assert!(matches!(err, AdminServiceError::NotFound { id: 99 }));
+    }
+
+    // ---------------- 路由存在性守卫 ----------------
+
+    /// 三个新端点必须挂在鉴权路由树内（路径 → handler 绑定，空白不敏感）。
+    /// 回退即 FAIL：删掉任一 `.route(..)` → 前端 404 且编译/测试都不报。
+    #[test]
+    fn new_endpoints_are_wired_in_router() {
+        let router = include_str!("router.rs");
+        // ⚠️ 判据必须对空白不敏感（rustfmt 会把长 .route(..) 拆成多行），
+        // 折叠空白后再比 —— 与 `api_region_setter_endpoint_is_wired` 同款写法。
+        let compact: String = router.chars().filter(|c| !c.is_whitespace()).collect();
+        // needle 运行时拼接：写成完整字面量会被 include_str! 读到自己而多算一处。
+        let routes = [
+            format!(
+                "\"/credentials/{{id}}/reprobe-region\",post(reprobe_credential_region{}",
+                ")"
+            ),
+            format!(
+                "\"/credentials/disable-quota-exceeded\",post(disable_quota_exceeded{}",
+                ")"
+            ),
+            format!("\"/credentials/{{id}}/relogin\",post(relogin_oauth{}", ")"),
+            // 2026-08-11 对抗审查 m4：refresh-token 路由此前无守卫（漏注册不红）。
+            format!(
+                "\"/credentials/{{id}}/refresh-token\",put(update_credential_refresh_token{}",
+                ")"
+            ),
+        ];
+        for route in routes {
+            assert!(
+                compact.contains(&route),
+                "新端点必须注册进鉴权路由树：{}",
+                route
+            );
+        }
     }
 }

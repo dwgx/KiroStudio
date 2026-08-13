@@ -136,10 +136,20 @@ pub async fn usage_timeseries(
 }
 
 /// GET /api/admin/usage/by-model
-/// 按模型分组的累计统计
+/// 按「上游实际服务模型」分组的累计统计（映射双口径的 upstream 维度：
+/// key = `upstream_model` 映射后名，None 回落 `model`）。
 pub async fn usage_by_model(State(state): State<AdminState>) -> impl IntoResponse {
     match &state.usage_stats {
         Some(stats) => Json(stats.by_model()).into_response(),
+        None => stats_disabled(),
+    }
+}
+
+/// GET /api/admin/usage/by-requested-model
+/// 按「客户端请求的原始模型名」分组的累计统计（映射双口径的 requested 维度）。
+pub async fn usage_by_requested_model(State(state): State<AdminState>) -> impl IntoResponse {
+    match &state.usage_stats {
+        Some(stats) => Json(stats.by_requested_model()).into_response(),
         None => stats_disabled(),
     }
 }
@@ -233,6 +243,9 @@ pub struct TracesSearchQuery {
     /// 模型精确匹配
     #[serde(default)]
     pub model: Option<String>,
+    /// 客户端请求的**原始**模型名精确匹配（映射双口径的 requested 维度）
+    #[serde(default)]
+    pub requested_model: Option<String>,
     /// 凭据 ID 精确匹配
     #[serde(default)]
     pub credential_id: Option<u64>,
@@ -278,6 +291,7 @@ impl TracesSearchQuery {
     fn to_filter(&self) -> crate::usage::TraceFilter {
         crate::usage::TraceFilter {
             model: Self::norm(self.model.clone()),
+            requested_model: Self::norm(self.requested_model.clone()),
             credential_id: self.credential_id,
             client_ip: Self::norm(self.client_ip.clone()),
             session_id: Self::norm(self.session_id.clone()),

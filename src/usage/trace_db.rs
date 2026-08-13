@@ -31,6 +31,8 @@ pub const MAX_SEARCH_LIMIT: usize = 500;
 pub struct TraceFilter {
     /// 模型精确匹配（model = ?）
     pub model: Option<String>,
+    /// 客户端请求的**原始**模型名精确匹配（requested_model = ?；映射双口径的 requested 维度）。
+    pub requested_model: Option<String>,
     /// 凭据 ID 精确匹配（credential_id = ?）
     pub credential_id: Option<u64>,
     /// 客户端 IP 子串匹配（client_ip LIKE %?%）
@@ -61,6 +63,10 @@ impl TraceFilter {
         if let Some(m) = &self.model {
             clauses.push("model = ?".to_string());
             binds.push(Box::new(m.clone()));
+        }
+        if let Some(rm) = &self.requested_model {
+            clauses.push("requested_model = ?".to_string());
+            binds.push(Box::new(rm.clone()));
         }
         if let Some(cid) = self.credential_id {
             clauses.push("credential_id = ?".to_string());
@@ -173,6 +179,9 @@ impl TraceDb {
             // 缓存读写 tokens（历史库补列，默认 0，兼容旧数据）
             "ALTER TABLE traces ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE traces ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0",
+            // 映射双口径（历史库补列，默认 NULL 兼容旧数据）
+            "ALTER TABLE traces ADD COLUMN requested_model TEXT",
+            "ALTER TABLE traces ADD COLUMN upstream_model TEXT",
         ];
         for sql in add_columns {
             if let Err(e) = conn.execute(sql, []) {
@@ -220,7 +229,9 @@ impl TraceDb {
                 client_os      TEXT,
                 client_browser TEXT,
                 cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
-                cache_creation_tokens INTEGER NOT NULL DEFAULT 0
+                cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                requested_model       TEXT,
+                upstream_model        TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_traces_ts_ms ON traces(ts_ms);
             CREATE INDEX IF NOT EXISTS idx_traces_credential_id ON traces(credential_id);
@@ -241,8 +252,9 @@ impl TraceDb {
                 request_id, ts_ms, credential_id, model, is_streaming,
                 input_tokens, output_tokens, credits_used, latency_ms, first_token_ms,
                 outcome, retries, error_message, session_id, client_device,
-                client_ip, client_os, client_browser, cache_read_tokens, cache_creation_tokens
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                client_ip, client_os, client_browser, cache_read_tokens, cache_creation_tokens,
+                requested_model, upstream_model
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             params![
                 record.request_id,
                 record.ts_ms,
@@ -264,6 +276,8 @@ impl TraceDb {
                 record.client_browser,
                 record.cache_read_tokens,
                 record.cache_creation_tokens,
+                record.requested_model,
+                record.upstream_model,
             ],
         )
         .context("INSERT traces 失败")?;
@@ -277,7 +291,8 @@ impl TraceDb {
             "SELECT request_id, ts_ms, credential_id, model, is_streaming,
                     input_tokens, output_tokens, credits_used, latency_ms, first_token_ms,
                     outcome, retries, error_message, session_id, client_device,
-                    client_ip, client_os, client_browser, cache_read_tokens, cache_creation_tokens
+                    client_ip, client_os, client_browser, cache_read_tokens, cache_creation_tokens,
+                    requested_model, upstream_model
              FROM traces
              ORDER BY ts_ms DESC
              LIMIT ?1",
@@ -308,7 +323,8 @@ impl TraceDb {
             "SELECT request_id, ts_ms, credential_id, model, is_streaming,
                     input_tokens, output_tokens, credits_used, latency_ms, first_token_ms,
                     outcome, retries, error_message, session_id, client_device,
-                    client_ip, client_os, client_browser, cache_read_tokens, cache_creation_tokens
+                    client_ip, client_os, client_browser, cache_read_tokens, cache_creation_tokens,
+                    requested_model, upstream_model
              FROM traces{where_sql}
              ORDER BY ts_ms DESC
              LIMIT ? OFFSET ?"
@@ -417,6 +433,10 @@ fn row_to_record(row: &Row<'_>) -> rusqlite::Result<RequestRecord> {
         client_browser: row.get(17)?,
         cache_read_tokens: row.get(18)?,
         cache_creation_tokens: row.get(19)?,
+        // 映射双口径（请求原始名 / 上游实际名）。历史库缺列时 row.get 失败 → 下面
+        // 用 `get_or` 兜底 None，与 JSONL 的 serde default 同一语义。
+        requested_model: row.get(20).unwrap_or(None),
+        upstream_model: row.get(21).unwrap_or(None),
     })
 }
 

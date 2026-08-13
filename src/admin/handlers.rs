@@ -13,7 +13,8 @@ use super::{
         AddCredentialRequest, BatchDeleteRequest, BatchDeleteResponse, CleanupDisabledRequest,
         CloneCredentialRequest, SetAllowedModelsRequest, SetApiRegionRequest,
         SetCustomApiConfigRequest, SetDeepseekNormalizeRequest, SetDisabledRequest,
-        SetEndpointRequest, SetLoadBalancingModeRequest, SetPriorityRequest, SetRpmLimitRequest,
+        SetEndpointRequest, SetLoadBalancingModeRequest, SetModelMappingExemptRequest,
+        SetPriorityRequest, SetRpmLimitRequest, RefreshTokenRequest,
         SuccessResponse, parse_import_keys_request,
     },
 };
@@ -107,6 +108,34 @@ pub async fn set_credential_api_region(
     }
 }
 
+/// POST /api/admin/credentials/:id/reprobe-region
+///
+/// 手动重探该号上游实际生效的 region 并写回凭据（救「自动探测探错」的最后一招）。
+/// 失败只报错、**绝不**动禁用态（服役号探测失败被禁 = 把好号打掉，见 service 文档）。
+pub async fn reprobe_credential_region(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.reprobe_api_region(id).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PUT /api/admin/credentials/:id/refresh-token —— 手动更新 OAuth 号的 refreshToken（2026-08-11）。
+///
+/// ⚠️ 敏感值纪律：请求体里的 refreshToken 绝不进日志/错误消息/响应体。
+pub async fn update_credential_refresh_token(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<RefreshTokenRequest>,
+) -> impl IntoResponse {
+    match state.service.update_refresh_token(id, payload.refresh_token) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} refreshToken 已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// GET /api/admin/credentials/:id/upstream-models —— 探测代挂上游可用模型列表（custom_api 专属）。
 pub async fn probe_upstream_models(
     State(state): State<AdminState>,
@@ -162,6 +191,33 @@ pub async fn set_credential_deepseek_normalize(
     }
 }
 
+/// POST /api/admin/credentials/:id/model-mapping-exempt  body: `{ "modelMappingExempt": true }`
+///
+/// 设置凭据的模型映射豁免开关（跳过全局 `config.model_mapping`）。
+pub async fn set_credential_model_mapping_exempt(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetModelMappingExemptRequest>,
+) -> impl IntoResponse {
+    let exempt = payload.model_mapping_exempt.unwrap_or(false);
+    match state
+        .service
+        .set_credential_model_mapping_exempt(id, payload.model_mapping_exempt)
+    {
+        Ok(_) => {
+            let msg = if exempt {
+                format!("凭据 #{} 已豁免全局模型映射", id)
+            } else {
+                format!("凭据 #{} 已恢复应用全局模型映射", id)
+            };
+            Json(SuccessResponse::new(msg)).into_response()
+        }
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/endpoint
+/// 固定该凭据走的端点（`ide` / `cli`）；传 null 或空串清除，回到自动路由。
 pub async fn set_credential_endpoint(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
@@ -597,6 +653,24 @@ pub async fn reset_failure_count(
     }
 }
 
+/// POST /api/admin/credentials/:id/relogin
+///
+/// OAuth 类凭据（idc / social / external_idp）的「自助复活」：清空全部进程内惩罚
+/// 状态（失败计数/冷却/限流器）并重新启用。api_key 与代挂号拒绝（无此概念）。
+pub async fn relogin_oauth(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.relogin_oauth(id) {
+        Ok(_) => Json(SuccessResponse::new(format!(
+            "凭据 #{} 已复活（惩罚状态已清空并重新启用）",
+            id
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// `GET /api/admin/credentials/:id/balance` 的查询参数。
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -862,6 +936,16 @@ pub async fn cleanup_disabled_credentials(
     Json(state.service.cleanup_disabled_credentials(dry_run))
 }
 
+/// POST /api/admin/credentials/disable-quota-exceeded
+///
+/// 一键禁用所有「余额已超额」的启用号（`remaining <= 0`，数据源 = 余额缓存，零上游）。
+/// 排除代挂号与已禁用号；单号失败不炸整批，逐条看 `results[].ok`（与批量删除同款）。
+pub async fn disable_quota_exceeded(
+    State(state): State<AdminState>,
+) -> impl IntoResponse {
+    Json(state.service.disable_quota_exceeded())
+}
+
 /// GET /api/admin/credentials/trash
 /// 列出回收站中的已删除凭据
 pub async fn list_trash(State(state): State<AdminState>) -> impl IntoResponse {
@@ -1053,6 +1137,49 @@ pub async fn set_load_balancing_mode(
 /// 零上游、零副作用,把刷新/failover/清洗机器从黑箱变成可查。
 pub async fn recovery_metrics() -> impl IntoResponse {
     Json(crate::common::recovery_metrics::snapshot())
+}
+
+/// GET /api/admin/endpoint-health
+/// 端点自适应派发的可观测面：每 `(凭据, 端点)` 的实测 EWMA 成功率与样本数。
+///
+/// # 为什么这个端点是必须的
+///
+/// 派发决策依赖统计量，而统计量不可见就等于**不可调、不可证**。本仓有过直接的教训
+/// （CLAUDE.md 记载「先修度量，再谈调参」：一个关键容量数字是配置自乘出来的假值，
+/// 导致所有依赖它的自动调节都在算空气，而三层监控全绿）。所以派发上线的同时必须
+/// 有这一面 —— 否则「某个号为什么总走 runtime.* 而不走 q.*」无从回答。
+///
+/// 零上游、零副作用，只读进程内内存表。表不持久化（重启从先验重新学习，理由见
+/// `endpoint_health` 模块文档），故重启后本端点会短暂返回空数组，这是预期行为。
+pub async fn endpoint_health() -> impl IntoResponse {
+    let snap = crate::kiro::endpoint_health::shared().snapshot();
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Item {
+        credential_id: u64,
+        endpoint: String,
+        /// EWMA 成功率 [0,1]；`null` = 该组合尚无样本（与「成功率 0」语义不同）。
+        success_rate: Option<f64>,
+        samples: u64,
+    }
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Resp {
+        items: Vec<Item>,
+        /// 组合总数，便于前端判空。
+        total: usize,
+    }
+    let items: Vec<Item> = snap
+        .into_iter()
+        .map(|s| Item {
+            credential_id: s.credential_id,
+            endpoint: s.endpoint,
+            success_rate: s.success_rate,
+            samples: s.samples,
+        })
+        .collect();
+    let total = items.len();
+    Json(Resp { items, total })
 }
 
 // ============ 网页上号（Social OAuth）============
