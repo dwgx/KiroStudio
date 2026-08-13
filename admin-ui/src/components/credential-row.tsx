@@ -76,6 +76,16 @@ export interface CredentialRowBodyProps {
   credential: CredentialStatusItem
   selected: boolean
   onToggleSelect: () => void
+  /**
+   * Shift+左键区间选：把 [锚点, 本行] 闭区间并入选区。
+   *
+   * 刻意传**回调**而不是 `orderedIds: number[]`：区间顺序与「哪些可选」是调用方
+   * （`dashboard.tsx`）的知识 —— 它才知道当前页有哪些行、哪些是 disabled
+   * （store 契约要求 `orderedIds` 已剔除 disabled，见 use-credential-selection.ts:76-78）。
+   * 传数组会让每行都拿到同一份数组、且每次轮询换引用；传回调则 12 行零额外开销。
+   * 未提供时 Shift+左键什么都不做（安全默认）。
+   */
+  onRangeSelect?: () => void
   /** 打开卡片持有的「设置」弹框（复用，不重造表单）。 */
   onEdit: () => void
   /** 打开余额弹框（与卡片「查看余额」同一入口）。 */
@@ -183,6 +193,7 @@ export function CredentialRowBody({
   credential,
   selected,
   onToggleSelect,
+  onRangeSelect,
   onEdit,
   onViewBalance,
   shownBalance,
@@ -302,8 +313,46 @@ export function CredentialRowBody({
 
   const handleContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
     if ((e.target as HTMLElement).closest(INTERACTIVE)) return
+    // 🔴 macOS：Ctrl+左键**同时**派发 `contextmenu`（系统级"辅助点击"）。若不在这里让路，
+    // Ctrl+左键多选会顺带弹出右键菜单，多选一个号就要按一次 Esc ⇒ 该交互实际不可用。
+    // Cmd 一并挡掉：Mac 用户的多选肌肉记忆是 Cmd，让两个修饰键行为一致。
+    // 代价是"Ctrl+右键"开不了菜单——裸右键仍然开，且这条组合本来也不是任何平台的约定。
+    if (e.ctrlKey || e.metaKey) {
+      // 必须 preventDefault：本分支让路后浏览器**仍会派发原生 contextmenu**，
+      // 不拦的话 macOS 的"辅助点击"会照弹原生右键菜单 —— 原来的注释声称
+      // 修掉了「多选要按 Esc」，实际只是把自定义菜单换成了原生菜单。
+      // 与 handleRowClick 的 Ctrl/Cmd 分支配对（那边同样 preventDefault）。
+      e.preventDefault()
+      return
+    }
     e.preventDefault()
     openMenuAt(e.clientX, e.clientY)
+  }
+
+  /**
+   * 行级左键：**Shift 区间选 > Ctrl/Cmd 加减选 > 裸左键什么都不做**。
+   *
+   * 裸左键刻意留空（不展开详情）：与卡片档 `handleCardClick` 同口径（卡片也只在按住
+   * Ctrl/Cmd 时才响应左键）。展开走行首 ▸ 或 Enter/Space，两者都在 `INTERACTIVE`
+   * 判定之外单独接线 —— 若裸左键也展开，则框选起手落在行上时会顺带展开一行。
+   *
+   * Shift 优先于 Ctrl 是各家一致的约定（Finder/资源管理器/Polaris）：两键同按时
+   * 用户意图是"拉区间"，不是"切一个"。
+   */
+  const handleRowClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    if ((e.target as HTMLElement).closest(INTERACTIVE)) return
+    if (e.shiftKey) {
+      // preventDefault 抑制 shift+点击的原生文本区间选择（会把整片行文本刷蓝）。
+      e.preventDefault()
+      onRangeSelect?.()
+      return
+    }
+    if (e.ctrlKey || e.metaKey) {
+      // 与上面 handleContextMenu 的让路配对：这里也 preventDefault，
+      // 避免 macOS 把这一下算成辅助点击后再走浏览器默认行为。
+      e.preventDefault()
+      onToggleSelect()
+    }
   }
 
   // 键盘可达：Enter/Space 展开；Shift+F10 与「菜单键」开右键菜单（锚点取行的右上角）。
@@ -417,7 +466,12 @@ export function CredentialRowBody({
         tabIndex={0}
         aria-selected={selected}
         aria-expanded={expanded}
+        // 拖拽框选的命中测试靠这个属性找行 + 读 `getBoundingClientRect()`（见 dashboard.tsx
+        // 的 marquee 段）。行视图没有画布那种 store 化几何，12 行量级读 DOM 完全够；
+        // 同时它也是「起手点是否落在空白」的判据（`closest('[role="row"]')`）。
+        data-cred-id={credential.id}
         onContextMenu={handleContextMenu}
+        onClick={handleRowClick}
         onKeyDown={handleKeyDown}
         className={cn(
           'group rounded-lg border bg-card transition-[background-color,border-color] duration-200',

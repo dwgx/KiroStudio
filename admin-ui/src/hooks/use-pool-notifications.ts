@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react'
 import { toast } from 'sonner'
+import i18n from '@/i18n'
 import { useCredentials } from '@/hooks/use-credentials'
 import { useRatelimitInsights } from '@/hooks/use-usage'
 import { disabledReasonLabel } from '@/lib/i18n-labels'
@@ -45,11 +46,11 @@ function credLabel(c: { id: number; name?: string; email?: string }): string {
  * 转发后，后端加新变体只需在 i18n-labels 的表里加一行，通知与卡片/回收站同步生效。
  */
 function disabledReasonText(reason?: string): string {
-  if (!reason) return '已禁用'
+  if (!reason) return i18n.t('poolNotify.disabledReasonEmpty')
   const label = disabledReasonLabel(reason)
   // `disabledReasonLabel` 对未收录的原因**原样返回**（即裸枚举名）。此处包一层
   // 「已禁用（X）」，让本版本不认识的新变体至少读起来是句话而不是一个英文标识符。
-  return label === reason ? `已禁用（${reason}）` : label
+  return label === reason ? i18n.t('poolNotify.disabledWithReason', { reason }) : label
 }
 
 /**
@@ -75,10 +76,10 @@ function flushBatch(
     }
     return
   }
-  const head = labels.slice(0, 3).join('、')
-  const rest = labels.length > 3 ? ` 等 ${labels.length} 个` : ''
+  const head = labels.slice(0, 3).join(i18n.t('poolNotify.listSep'))
+  const rest = labels.length > 3 ? i18n.t('poolNotify.etcCount', { count: labels.length }) : ''
   fire(cfg.manyTitle(labels.length), {
-    description: `${head}${rest}。${cfg.desc}`,
+    description: i18n.t('poolNotify.mergedDesc', { head, rest, desc: cfg.desc }),
     duration: 11000,
   })
 }
@@ -146,11 +147,11 @@ export function usePoolNotifications() {
           // 需要解析 profileArn 且尚未就绪 → 弹"初始化中"loading,记 pending 等翻牌。
           // (禁用号排除:如 RefreshTokenInvalid→disabled 且无 arn,不该弹"初始化中"永转 + 与"已禁用"矛盾)
           const key = `init:${c.id}`
-          toast.loading(`凭据 ${label} 初始化中… 正在刷新 Token、解析 Profile ARN`, { id: key })
+          toast.loading(i18n.t('poolNotify.initLoading', { label }), { id: key })
           initPending.set(c.id, { key, startedAt: Date.now() })
         } else if (needsArn && !c.disabled && c.hasProfileArn) {
           // 入池即带 arn(如网页 social 号,无中间态)→ 直接"已就绪"。
-          toast.success(`凭据 ${label} 已就绪，进入调度`)
+          toast.success(i18n.t('poolNotify.initReady', { label }))
         }
         // api_key / custom_api:无 profile 概念,不弹初始化(它们本就即插即用)。
       }
@@ -171,7 +172,7 @@ export function usePoolNotifications() {
         const key = `${cat}:${c.id}:${c.disabledReason ?? ''}`
         // quota / region 两类的 desc 已把原因说清楚，标题里不再重复；
         // 兜底类必须带原因，否则"某个号被禁用了"给不出任何排查方向。
-        const text = cat === 'disabled' ? `${label}（${disabledReasonText(c.disabledReason)}）` : label
+        const text = cat === 'disabled' ? i18n.t('poolNotify.disabledWithLabel', { label, reason: disabledReasonText(c.disabledReason) }) : label
         track(key, cat, text)
       }
     }
@@ -193,10 +194,10 @@ export function usePoolNotifications() {
         continue
       }
       if (c.hasProfileArn) {
-        toast.success(`凭据 ${credLabel(c)} 初始化完成，已进入调度`, { id: info.key })
+        toast.success(i18n.t('poolNotify.initDone', { label: credLabel(c) }), { id: info.key })
         initPending.delete(id)
       } else if (Date.now() - info.startedAt > INIT_TIMEOUT_MS) {
-        toast.warning(`凭据 ${credLabel(c)} 初始化超时，请手动刷新 Token`, { id: info.key })
+        toast.warning(i18n.t('poolNotify.initTimeout', { label: credLabel(c) }), { id: info.key })
         initPending.delete(id)
       }
     }
@@ -213,42 +214,42 @@ export function usePoolNotifications() {
 
     // 统一发射：每类 1-2 条逐条发（含详细描述），≥3 条合并成一条汇总。
     flushBatch('arn', batch.arn, {
-      one: (n) => `凭据 ${n} 缺少 Profile ARN`,
-      manyTitle: (k) => `${k} 个凭据缺少 Profile ARN`,
+      one: (n) => i18n.t('poolNotify.arn.one', { label: n }),
+      manyTitle: (k) => i18n.t('poolNotify.arn.manyTitle', { count: k }),
       type: 'warning',
-      desc: '对话会返回 400 profileArn is required。请刷新 Token 触发动态解析，或检查是否已开通 Kiro。',
+      desc: i18n.t('poolNotify.arn.desc'),
     })
     flushBatch('quota', batch.quota, {
-      one: (n) => `凭据 ${n} 额度已用尽`,
-      manyTitle: (k) => `${k} 个凭据额度已用尽`,
+      one: (n) => i18n.t('poolNotify.quota.one', { label: n }),
+      manyTitle: (k) => i18n.t('poolNotify.quota.manyTitle', { count: k }),
       type: 'error',
-      desc: '已达上游月度请求上限，已移出调度。可加号或等下月重置。',
+      desc: i18n.t('poolNotify.quota.desc'),
     })
     flushBatch('disabled', batch.disabled, {
-      one: (n) => `凭据 ${n}`,
-      manyTitle: (k) => `${k} 个凭据被自动禁用`,
+      one: (n) => i18n.t('poolNotify.disabled.one', { label: n }),
+      manyTitle: (k) => i18n.t('poolNotify.disabled.manyTitle', { count: k }),
       type: 'error',
-      desc: '已移出调度池。可在凭据管理里查看并处理。',
+      desc: i18n.t('poolNotify.disabled.desc'),
     })
     flushBatch('suspicious', batch.suspicious, {
-      one: (n) => `凭据 ${n} 触发账户级可疑活动风控`,
-      manyTitle: (k) => `${k} 个凭据触发账户级可疑活动风控`,
+      one: (n) => i18n.t('poolNotify.suspicious.one', { label: n }),
+      manyTitle: (k) => i18n.t('poolNotify.suspicious.manyTitle', { count: k }),
       type: 'warning',
-      desc: '上游临时限速中，已分钟级退避避免加重风控。频繁触发建议加号分流。',
+      desc: i18n.t('poolNotify.suspicious.desc'),
     })
     // region 探测两类：都不在自愈白名单里（人工确认后需手动启用），所以 desc 必须
     // 直接给出该查哪儿 —— 两条的排查方向完全相反，混成一句就等于没给方向。
     flushBatch('regionProbe', batch.regionProbe, {
-      one: (n) => `凭据 ${n} 未探到可用区域`,
-      manyTitle: (k) => `${k} 个凭据未探到可用区域`,
+      one: (n) => i18n.t('poolNotify.regionProbe.one', { label: n }),
+      manyTitle: (k) => i18n.t('poolNotify.regionProbe.manyTitle', { count: k }),
       type: 'error',
-      desc: '候选区域全部被拒 ⇒ 该查这个号的 region 授权范围（ksk_ 是按区授权的，打错区恒 403）。在卡片设置里手动指定区域后再启用。',
+      desc: i18n.t('poolNotify.regionProbe.desc'),
     })
     flushBatch('regionTokenDead', batch.regionTokenDead, {
-      one: (n) => `凭据 ${n} 区域探测时 token 被拒`,
-      manyTitle: (k) => `${k} 个凭据区域探测时 token 被拒`,
+      one: (n) => i18n.t('poolNotify.regionTokenDead.one', { label: n }),
+      manyTitle: (k) => i18n.t('poolNotify.regionTokenDead.manyTitle', { count: k }),
       type: 'error',
-      desc: '上游返回 401 ⇒ 凭据本身已废，换区无用，该查 token 来源并重新取一份。',
+      desc: i18n.t('poolNotify.regionTokenDead.desc'),
     })
 
     // 回收：本轮不再处于问题态的键从 seen 移除，使问题再次发生时能重新通知。

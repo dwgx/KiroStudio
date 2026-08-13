@@ -24,6 +24,8 @@ export interface CredentialStatusItem {
   requestCount?: number
   /** 自定义 API 代挂:deepseek 协议归一化开关 */
   deepseekNormalize?: boolean
+  /** 是否豁免全局模型映射（true = 该号发上游时保持客户端原始模型名） */
+  modelMappingExempt?: boolean
   /** 「允许模型」白名单（成本安全硬门；空/缺省 = 不限制） */
   allowedModels?: string[]
   /** 「测试可用模型」历史结果（探测打的标签） */
@@ -168,6 +170,20 @@ export interface CachedBalancesResponse {
 }
 
 // 成功响应
+export interface CleanupSkippedItem {
+  id: number
+  reason: string
+}
+export interface CleanupDisabledResponse {
+  dryRun: boolean
+  disabledTotal: number
+  candidates: number[]
+  skipped: CleanupSkippedItem[]
+  deleted: number
+  failed: number
+  results: BatchDeleteItemResult[]
+}
+
 export interface SuccessResponse {
   success: boolean
   message: string
@@ -254,8 +270,24 @@ export interface AddCredentialRequest {
   requestLimit?: number
   /** 自定义 API 代挂:deepseek 协议归一化开关（创建时设；改凭据走 deepseek-normalize 端点） */
   deepseekNormalize?: boolean
+  /** 是否豁免全局模型映射（创建时设；true = 该号发上游时保持客户端原始模型名） */
+  modelMappingExempt?: boolean
   /** 代挂模型白名单（创建表单探测勾选而来；空/不传 = 不限制） */
   allowedModels?: string[]
+  /**
+   * 该代挂号是否**无条件抢在所有 Kiro 号之前**。
+   * 省略 = 跟随全局 `config.customApiFirst`（默认 false = 与 Kiro 号按 priority 公平比较）。
+   * 后端 `AddCredentialRequest::custom_api_first`（Option<bool>）。
+   */
+  customApiFirst?: boolean
+  /**
+   * 是否直接以禁用态入池（默认 false = 启用，与旧行为一致）。
+   *
+   * 存在的理由：重新导入一个**已知被上游封禁**的号时，必须能让它以禁用态入池，
+   * 否则它会被立刻投入调度、换回一个 403 TEMPORARILY_SUSPENDED，反而加深上游
+   * 对该批号的风控判定。对应后端 `AddCredentialRequest::disabled`。
+   */
+  disabled?: boolean
 }
 
 /**
@@ -287,6 +319,14 @@ export interface CloneCredentialRequest {
   assignPrimaryNode?: boolean
   /** 凑不齐「每份一个独立节点」就整个请求 400。省略 = 宽松（不够的份直连）。 */
   requireNodePerCopy?: boolean
+  /**
+   * 建完 N 份后把主份**软删进回收站**，使组内 N 份彼此同质。
+   *
+   * 省略 = false（保留主份，只追加分身）。对应后端 `CloneCredentialRequest::replace_primary`
+   * （Option<bool>）：后端是**先建后删**——先建出全部新分身，再把主份移入回收站，
+   * 不会出现「主份没了但分身还没建出来」的窗口。
+   */
+  replacePrimary?: boolean
 }
 
 // 添加凭据响应
@@ -419,6 +459,16 @@ export interface ExternalIdpSelectResponse {
 // ============ 服务端配置快照 ============
 
 // 服务端配置（敏感字段已脱敏）
+/**
+ * 限流/重试档位。与后端 `ThrottleProfile`（serde kebab-case）一一对应。
+ *
+ * - `shielded`：网关前有外部重试外挂（线上 Caddy → kiro_shield.py → KiroStudio）。
+ *   整形层做真限流（排队超时返 429 而非放行，让外挂听 Retry-After）、冷却开。
+ * - `direct`：客户端直连，无外挂。整形超时放行（宁可慢不要拒）、吸收层开。
+ * - `manual`：不覆盖任何字段，全部读原值。**默认值**，保证既有配置行为零变化。
+ */
+export type ThrottleProfile = 'shielded' | 'direct' | 'manual'
+
 export interface ConfigSnapshotResponse {
   /** 服务端真实版本(编译期注入),侧边栏据此展示,不再硬编码 */
   serverVersion: string
@@ -435,7 +485,15 @@ export interface ConfigSnapshotResponse {
   extractThinking: boolean
   ccAutoBuffer: boolean
   /** 影子缓存记账：是否把估算的 prompt cache 命中下发给客户端（默认 true）。 */
+  /** 全池自愈退避基础秒数（默认 60；2026-08-11 配置化）。 */
+  selfHealBaseBackoffSecs: number
+  /** 全池自愈退避上限秒数（默认 900 = 15 分钟）。 */
+  selfHealMaxBackoffSecs: number
+  /** 全池自愈退避指数上限（默认 4）。 */
+  selfHealMaxShift: number
   promptCacheEnabled: boolean
+  /** 是否注入上游 output_config.effort（native extended thinking，默认关，2026-08-11 移植）。 */
+  nativeThinkingEffortEnabled: boolean
   /** 批量推号入口 POST /api/import/keys 是否启用（默认**开**：端点先于开关存在，
       外部 kiro-accounting 正在用；关掉后两个挂载点一起返 403）。 */
   importKeysEnabled: boolean
@@ -447,6 +505,14 @@ export interface ConfigSnapshotResponse {
   upstreamRetryAbsorbMaxDelaySecs: number
   /** 是否把 403 临时风控也当可吸收错误（默认关，与自愈退避冲突）。 */
   upstreamRetryAbsorbSuspended: boolean
+  /** 是否把上游 5xx 也纳入吸收（默认关）。线上代挂上游主要故障是 502，开了它才不会直接甩给客户端。 */
+  upstreamRetryAbsorbServerError: boolean
+  /** 是否把上游 400 容量/配额类错误也纳入吸收（默认关，2026-08-11 补）。 */
+  upstreamRetryAbsorbCapacity400: boolean
+  /** 换号空窗的独立预算秒数（默认 0 = 不启用，沿用总预算与短退避曲线）。 */
+  upstreamRetryAbsorbSwapBudgetSecs: number
+  /** 吸收层预算耗尽时回给客户端的状态码（默认 429；唯一另一个可选值 503）。 */
+  upstreamRetryAbsorbExhaustedStatus: number
   stripEnvNoise: boolean
   toolCleanLeakedTokens: boolean
   toolReclaimTextifiedInvoke: boolean
@@ -456,6 +522,17 @@ export interface ConfigSnapshotResponse {
   toolRepairJson: boolean
   toolTruncationRecovery: boolean
   toolDescriptionMaxChars: number
+  /** CLI 端点请求体对齐真实 kiro-cli（origin→KIRO_CLI + 删 agentContinuationId/history modelId）。 */
+  cliOriginKiroCli: boolean
+  /**
+   * CLI 端点是否发 `x-amzn-codewhisperer-optout: false`。
+   * ⚠️ 隐私语义：打开 = 允许上游用会话内容做训练（四家参考实现的真实客户端值）。默认关。
+   */
+  cliCodewhispererOptoutFalse: boolean
+  /** CLI 端点 UA 指纹对齐真实客户端（两个 UA 头拆开 + m/F + `/` 分隔版本号）。默认关。 */
+  cliUaAlignRealClient: boolean
+  /** 单凭据并发上限（只读展示：Semaphore 容量构造时固定，改配置需重启）。 */
+  upstreamPerCredentialLimit: number
   /** credentials.json / trash.json at-rest 加密开关（机器绑定密钥，立即生效，默认关）。 */
   encryptCredentialsAtRest: boolean
   cooldownEnabled: boolean
@@ -480,6 +557,8 @@ export interface ConfigSnapshotResponse {
   /** 拟人速率：请求间隔抖动百分比（0..50），让节奏更像人 */
   rateLimitJitterPct: number
   // 入站请求整形 + RPM 自动挡
+  /** 限流/重试档位。manual = 不覆盖任何字段（默认，向前兼容） */
+  throttleProfile: ThrottleProfile
   inboundThrottleEnabled: boolean
   inboundRpmAuto: boolean
   inboundTargetRpm: number
@@ -512,6 +591,20 @@ export interface ConfigSnapshotResponse {
   inboundObservedUpstreamRpm?: number
   /** 累计放行的客户端请求数（滑窗恒 0 而它在涨 ⇒ 滑窗坏了）。 */
   inboundAdmittedTotal?: number
+  /**
+   * AIMD 累计**排队等待**次数（有请求真等过令牌 = 整形确实在削峰）。
+   *
+   * 与下面两个构成 AIMD 可观测三元组。它们此前在后端是只写不读的死代码，
+   * 于是「整形有没有起作用、是否卡在下限」无从判断（先修度量再谈调参）。
+   */
+  inboundAimdQueuedTotal?: number
+  /**
+   * AIMD 累计**降档**次数（乘性减：被上游 429 打到就砍速率）。
+   * 与升档次数的比值反映 AIMD 是否健康振荡；**只降不升 = 单向棘轮卡死在下限**。
+   */
+  inboundAimdMdTotal?: number
+  /** AIMD 累计**升档**次数（加性增：静默期后缓慢回升）。 */
+  inboundAimdAiTotal?: number
   balanceWeightEnabled: boolean
   balanceWeightFloor: number
   health429WeightEnabled: boolean
@@ -541,6 +634,8 @@ export interface ConfigSnapshotResponse {
   loginBackgroundR18?: boolean
   // 隐私：是否采集下游客户端指纹（设备/IP/系统/浏览器）。立即生效，无需重启。缺省视为开启。
   collectClientFingerprint?: boolean
+  // 全局模型映射：客户端模型名 → 上游模型名（缺省 = 不映射）。
+  modelMapping?: Record<string, string>
   configPath?: string
 }
 
@@ -558,7 +653,12 @@ export interface UpdateConfigRequest {
   extractThinking?: boolean
   ccAutoBuffer?: boolean
   importKeysEnabled?: boolean
+  selfHealBaseBackoffSecs?: number
+  selfHealMaxBackoffSecs?: number
+  selfHealMaxShift?: number
   promptCacheEnabled?: boolean
+  /** 是否注入上游 output_config.effort（默认关，2026-08-11 补）。 */
+  nativeThinkingEffortEnabled?: boolean
   // 上游 429 吸收层
   upstreamRetryAbsorbEnabled?: boolean
   upstreamRetryAbsorbBudgetSecs?: number
@@ -566,6 +666,14 @@ export interface UpdateConfigRequest {
   upstreamRetryAbsorbMinDelayMs?: number
   upstreamRetryAbsorbMaxDelaySecs?: number
   upstreamRetryAbsorbSuspended?: boolean
+  /** 是否把上游 5xx 也纳入吸收（2026-08-10 补，此前只能改 config.json + 重启）。 */
+  upstreamRetryAbsorbServerError?: boolean
+  /** 是否把上游 400 容量/配额类错误也纳入吸收（2026-08-11 补）。 */
+  upstreamRetryAbsorbCapacity400?: boolean
+  /** 换号空窗的独立预算秒数（2026-08-11 补）。 */
+  upstreamRetryAbsorbSwapBudgetSecs?: number
+  /** 吸收层预算耗尽时回给客户端的状态码（2026-08-11 补；仅 429/503 有意义）。 */
+  upstreamRetryAbsorbExhaustedStatus?: number
   stripEnvNoise?: boolean
   toolCleanLeakedTokens?: boolean
   toolReclaimTextifiedInvoke?: boolean
@@ -575,6 +683,9 @@ export interface UpdateConfigRequest {
   toolRepairJson?: boolean
   toolTruncationRecovery?: boolean
   toolDescriptionMaxChars?: number
+  cliOriginKiroCli?: boolean
+  cliCodewhispererOptoutFalse?: boolean
+  cliUaAlignRealClient?: boolean
   encryptCredentialsAtRest?: boolean
   cooldownEnabled?: boolean
   autoDisableSuspicious?: boolean
@@ -591,6 +702,8 @@ export interface UpdateConfigRequest {
   rpmHardGateOverloadWait?: boolean
   cooldownScalePct?: number
   rateLimitJitterPct?: number
+  /** 切档。档位只影响配置文件里没显式写的字段，已显式配置的值不会被冲掉 */
+  throttleProfile?: ThrottleProfile
   inboundThrottleEnabled?: boolean
   inboundRpmAuto?: boolean
   inboundTargetRpm?: number
@@ -628,6 +741,8 @@ export interface UpdateConfigRequest {
   loginBackgroundR18?: boolean
   // 隐私：采集下游客户端指纹开关（立即生效，无需重启）
   collectClientFingerprint?: boolean
+  // 全局模型映射（整表替换语义；传 {} = 清空全部规则）
+  modelMapping?: Record<string, string>
 }
 
 // 更新服务端配置响应

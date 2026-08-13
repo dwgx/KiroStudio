@@ -9,6 +9,7 @@ import {
   setCredentialEndpoint,
   setCredentialApiRegion,
   setCredentialDeepseekNormalize,
+  setCredentialModelMappingExempt,
   type SetCustomApiConfigInput,
   resetCredentialFailure,
   forceRefreshToken,
@@ -153,6 +154,18 @@ export function useSetCredentialDeepseekNormalize() {
   return useMutation({
     mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) =>
       setCredentialDeepseekNormalize(id, enabled),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 设置凭据的模型映射豁免开关（跳过全局 model_mapping；Kiro 号与 custom_api 号都可用）。
+export function useSetCredentialModelMappingExempt() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) =>
+      setCredentialModelMappingExempt(id, enabled),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },

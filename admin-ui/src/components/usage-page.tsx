@@ -19,6 +19,18 @@ import {
   Braces,
   Globe,
   HelpCircle,
+  // 新增设备类别图标（与 DEVICE_META 里新增项一一对应）。
+  MousePointer2,
+  Sparkles,
+  Bot,
+  ArrowRightCircle,
+  Wind,
+  Wrench,
+  Boxes,
+  Coffee,
+  Rabbit,
+  Smartphone,
+  Send,
   Search,
   X,
   ChevronLeft,
@@ -43,6 +55,7 @@ import {
   useUsageOverview,
   useUsageTimeseries,
   useUsageByModel,
+  useUsageByRequestedModel,
   useUsageByCredential,
   useUsageRecent,
   useUsageMachines,
@@ -188,6 +201,89 @@ const DEVICE_META: Record<string, DeviceMetaRaw> = {
     label: 'VS Code',
     badge: 'border-blue-500/25 bg-blue-500/10 text-blue-300',
     bar: '#3b82f6',
+  },
+  // ── 以下为后端 classify_device 新识别出的客户端类别 ──
+  // 改前这些 UA 全部落 unknown（或被 OS 关键字吃掉判成 macos/windows），
+  // 面板上看不出真实客户端构成。取值集合与 record.rs::classify_device 契约一致。
+  cursor: {
+    icon: MousePointer2,
+    label: 'Cursor',
+    // Cursor 品牌近黑白，用中性偏亮以区别于 OpenCode 的灰。
+    badge: 'border-zinc-300/25 bg-zinc-300/10 text-zinc-100',
+    bar: '#e4e4e7',
+  },
+  kiro: {
+    icon: Sparkles,
+    label: 'Kiro',
+    badge: 'border-violet-500/25 bg-violet-500/10 text-violet-300',
+    bar: '#8b5cf6',
+  },
+  cline: {
+    icon: Bot,
+    label: 'Cline',
+    badge: 'border-rose-500/25 bg-rose-500/10 text-rose-300',
+    bar: '#f43f5e',
+  },
+  continue: {
+    icon: ArrowRightCircle,
+    label: 'Continue',
+    badge: 'border-lime-500/25 bg-lime-500/10 text-lime-300',
+    bar: '#84cc16',
+  },
+  zed: {
+    icon: Zap,
+    label: 'Zed',
+    badge: 'border-orange-500/25 bg-orange-500/10 text-orange-300',
+    bar: '#f97316',
+  },
+  windsurf: {
+    icon: Wind,
+    label: 'Windsurf',
+    badge: 'border-cyan-400/25 bg-cyan-400/10 text-cyan-200',
+    bar: '#22d3ee',
+  },
+  aider: {
+    icon: Wrench,
+    label: 'Aider',
+    badge: 'border-yellow-500/25 bg-yellow-500/10 text-yellow-300',
+    bar: '#eab308',
+  },
+  jetbrains: {
+    icon: Boxes,
+    label: 'JetBrains',
+    badge: 'border-fuchsia-500/25 bg-fuchsia-500/10 text-fuchsia-300',
+    bar: '#d946ef',
+  },
+  java: {
+    icon: Coffee,
+    label: 'Java',
+    badge: 'border-red-500/25 bg-red-500/10 text-red-300',
+    bar: '#ef4444',
+  },
+  go: {
+    icon: Rabbit,
+    label: 'Go',
+    badge: 'border-sky-400/25 bg-sky-400/10 text-sky-200',
+    bar: '#38bdf8',
+  },
+  dart: {
+    icon: Smartphone,
+    label: 'Dart/Flutter',
+    badge: 'border-teal-400/25 bg-teal-400/10 text-teal-200',
+    bar: '#2dd4bf',
+  },
+  postman: {
+    icon: Send,
+    label: 'Postman',
+    badge: 'border-orange-400/25 bg-orange-400/10 text-orange-200',
+    bar: '#fb923c',
+  },
+  // 移动端：后端不再把 iPhone 误判成 macos / Android 误判成 linux，统一给 mobile。
+  mobile: {
+    icon: Smartphone,
+    labelKey: 'usagepage.device.mobile',
+    badge: 'border-pink-500/25 bg-pink-500/10 text-pink-300',
+    bar: '#ec4899',
   },
   browser: {
     icon: Globe,
@@ -1338,7 +1434,10 @@ export function UsagePage() {
   const overview = useUsageOverview()
   const timeseries = useUsageTimeseries(granularity)
   const byModel = useUsageByModel()
+  const byRequestedModel = useUsageByRequestedModel()
   const byCredential = useUsageByCredential()
+  // 模型维度切换：upstream = 上游实际服务模型（by-model）；requested = 客户端请求模型（by-requested-model）。
+  const [modelDim, setModelDim] = useState<'upstream' | 'requested'>('upstream')
   // 最近请求条数（dwgx：可切换,不止 200）。0="全部"，后端取到硬上限(5万)的真全量；表格分页渲染不炸 DOM。
   const [recentLimit, setRecentLimit] = useState<number>(200)
   const recent = useUsageRecent(recentLimit)
@@ -1560,8 +1659,26 @@ export function UsagePage() {
       {/* 3) 三分组：按模型 / 按凭据 / 按设备 */}
       <div className="grid gap-4 lg:grid-cols-3">
         <Card className="p-5">
-          <SectionTitle hint={t('usagepage.group.byModelHint')}>{t('usagepage.group.byModel')}</SectionTitle>
-          {byModel.isLoading ? <RankListSkeleton /> : <GroupRankList rows={byModel.data ?? []} />}
+          <div className="flex items-center justify-between gap-2">
+            <SectionTitle hint={t('usagepage.group.byModelHint')}>{t('usagepage.group.byModel')}</SectionTitle>
+            <Select
+              value={modelDim}
+              onChange={setModelDim}
+              aria-label={t('usagepage.group.modelDimAria')}
+              options={[
+                { value: 'upstream', label: t('usagepage.group.modelDimUpstream') },
+                { value: 'requested', label: t('usagepage.group.modelDimRequested') },
+              ]}
+              className="w-[110px]"
+            />
+          </div>
+          {modelDim === 'upstream'
+            ? byModel.isLoading
+              ? <RankListSkeleton />
+              : <GroupRankList rows={byModel.data ?? []} />
+            : byRequestedModel.isLoading
+              ? <RankListSkeleton />
+              : <GroupRankList rows={byRequestedModel.data ?? []} />}
         </Card>
         <Card className="p-5">
           <SectionTitle hint={t('usagepage.group.byCredentialHint')}>{t('usagepage.group.byCredential')}</SectionTitle>

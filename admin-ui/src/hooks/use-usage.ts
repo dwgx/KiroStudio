@@ -3,6 +3,7 @@ import {
   getUsageOverview,
   getUsageTimeseries,
   getUsageByModel,
+  getUsageByRequestedModel,
   getUsageByCredential,
   getUsageRecent,
   getUsageClients,
@@ -34,6 +35,14 @@ export function useUsageByModel() {
   return useQuery({
     queryKey: ['usage', 'by-model'],
     queryFn: getUsageByModel,
+    refetchInterval: REFETCH_MS,
+  })
+}
+
+export function useUsageByRequestedModel() {
+  return useQuery({
+    queryKey: ['usage', 'by-requested-model'],
+    queryFn: getUsageByRequestedModel,
     refetchInterval: REFETCH_MS,
   })
 }

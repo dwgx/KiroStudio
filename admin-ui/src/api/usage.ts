@@ -45,9 +45,15 @@ export async function getUsageTimeseries(
   return data
 }
 
-// 按模型分组
+// 按「上游实际服务模型」分组（映射双口径的 upstream 维度：upstream_model 映射后名，None 回落 model）
 export async function getUsageByModel(): Promise<GroupStat[]> {
   const { data } = await api.get<GroupStat[]>('/usage/by-model')
+  return data
+}
+
+// 按「客户端请求的原始模型名」分组（映射双口径的 requested 维度）
+export async function getUsageByRequestedModel(): Promise<GroupStat[]> {
+  const { data } = await api.get<GroupStat[]>('/usage/by-requested-model')
   return data
 }
 

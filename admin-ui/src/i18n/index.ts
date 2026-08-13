@@ -36,6 +36,12 @@ i18n
       // 运行时会显示字面 {var} 而非实际值(几百处会炸)。
       prefix: '{',
       suffix: '}',
+      // 🔴 显式钉死 skipOnVariables:true —— 否则字典里误写的 {{n}} 会被解析成
+      // 变量名 `{n}`(带花括号),与调用点实参 n 不匹配 ⇒ 字面显示 {{n}}。
+      // i18next 自 v19 起默认 true 且 v26 继承,但显式写出就不依赖这个默认值——
+      // 将来升大版本默认值变了,这里不会静默回归(2026-08-09 全仓 66 处就是
+      // 双花括号笔误造成的字面显示,已在三语 json 修成 {n} 并靠此配置兜底)。
+      skipOnVariables: true,
     },
     detection: {
       order: ['localStorage', 'navigator'],

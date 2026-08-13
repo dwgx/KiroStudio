@@ -180,6 +180,31 @@ export async function getRecoveryMetrics(): Promise<RecoveryMetrics> {
   return data
 }
 
+// ============ 端点自适应派发可观测（endpoint-health）============
+
+/** 单个「凭据 × 端点」组合的实测成功率。 */
+export interface EndpointHealthItem {
+  credentialId: number
+  endpoint: string
+  /**
+   * EWMA 成功率 [0,1]。
+   * `null` = 该组合**尚无样本**（与「成功率 0」语义完全不同：前者是没数据、
+   * 后者是试过且全失败）。UI 必须区分展示，否则新号会看起来像坏号。
+   */
+  successRate: number | null
+  samples: number
+}
+
+export interface EndpointHealthResponse {
+  items: EndpointHealthItem[]
+  total: number
+}
+
+export async function getEndpointHealth(): Promise<EndpointHealthResponse> {
+  const { data } = await api.get<EndpointHealthResponse>('/endpoint-health')
+  return data
+}
+
 // ============ 运维日志（内存环形缓冲）============
 export interface LogEntry {
   seq: number
