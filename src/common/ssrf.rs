@@ -32,12 +32,16 @@ use std::time::Duration;
 pub enum SsrfPolicy {
     /// 严格：所有非公网段一律拒绝。
     Strict,
-    /// 管理员显式配置：放宽 RFC 2544 基准测试段（见 [`is_forbidden_ipv4_with`] 的说明）。
+    /// 管理员显式配置：放宽 RFC 2544 基准测试段（fake-IP 代理的默认地址池）
+    /// 与**字面量环回**（127.0.0.0/8、::1 —— 本机服务互转的合法场景：
+    /// 如网关 → 本机 shield → 本机 fuckopencode，2026-08-13 放行）。
+    /// 豁免只对字面量生效；内嵌混淆（Teredo/ISATAP）、私网段、链路本地/元数据仍拒绝。
     AdminConfigured,
 }
 
-/// RFC 2544 基准测试段的标签。它被单独拎出来是因为**只有它**在
-/// [`SsrfPolicy::AdminConfigured`] 下被豁免，理由见 [`is_forbidden_ipv4_with`]。
+/// RFC 2544 基准测试段的标签。它被单独拎出来是因为它在
+/// [`SsrfPolicy::AdminConfigured`] 下被豁免（fake-IP 代理默认地址池），
+/// 理由见 [`is_forbidden_ipv4_with`]。
 const BENCHMARK_SEGMENT: &str = "198.18.0.0/15 基准测试段";
 
 /// 判断某个 IPv4 落在哪个「禁止出站」段，返回该段的可读标签（不禁止则 None）。
@@ -116,6 +120,27 @@ fn forbidden_segment_v4(ip: Ipv4Addr) -> Option<&'static str> {
 fn is_forbidden_ipv4_with(ip: Ipv4Addr, policy: SsrfPolicy) -> bool {
     match forbidden_segment_v4(ip) {
         None => false,
+        // AdminConfigured（管理员过 adminKey 鉴权后亲手填写 base_url）下豁免两类：
+        // 基准测试段（fake-IP 代理的默认地址池）与**字面量环回**（127.0.0.0/8 ——
+        // 本机服务互转的合法场景：如网关 → 本机 shield → 本机 fuckopencode）。
+        // 豁免只对**字面量**生效：Teredo/ISATAP 内嵌环回走 v6 原生判定（不回落 v4），
+        // 仍然拒绝 —— 绕过口未开。私网段/链路本地/元数据在任何策略下都拒绝。
+        Some(seg) => {
+            !(policy == SsrfPolicy::AdminConfigured
+                && (seg == BENCHMARK_SEGMENT || seg == "127.0.0.0/8 环回"))
+        }
+    }
+}
+
+/// 内嵌 v4（NAT64/6to4/Teredo/ISATAP 解混淆）的判定：**环回永不豁免**。
+///
+/// 2026-08-13 字面量环回放行后，必须把内嵌路径与字面量路径分开——解混淆成
+/// 127.x 的地址是攻击者编码出来的（可被用来把出站打回本机/内网），管理员
+/// 亲手填 `127.0.0.1` 是意图明确的本机回环，两者语义不同。只有
+/// `::ffff:127.0.0.1`（无损映射，等价写法）随字面量放行（见 `is_forbidden_ipv6_with`）。
+fn is_forbidden_ipv4_embedded_with(ip: Ipv4Addr, policy: SsrfPolicy) -> bool {
+    match forbidden_segment_v4(ip) {
+        None => false,
         Some(seg) => !(policy == SsrfPolicy::AdminConfigured && seg == BENCHMARK_SEGMENT),
     }
 }
@@ -127,6 +152,12 @@ fn is_forbidden_ipv4(ip: Ipv4Addr) -> bool {
 
 /// 判断某个 IPv6 是否属于「禁止出站」段。IPv4-mapped/兼容地址回落到 v4 校验。
 fn is_forbidden_ipv6_with(ip: Ipv6Addr, policy: SsrfPolicy) -> bool {
+    // ::1 字面量环回必须先于 to_ipv4 回落处理：::1 满足 IPv4-compatible 条件，
+    // to_ipv4() 会把它映射成 ::0.0.0.1 → 落到 0.0.0.0/8 本网络段（永不豁免），
+    // 管理员配置下的本机回环（2026-08-13 放行）会被误杀。
+    if ip == Ipv6Addr::LOCALHOST {
+        return !(policy == SsrfPolicy::AdminConfigured);
+    }
     // IPv4-mapped (::ffff:a.b.c.d) 或 IPv4-compatible：按内嵌 v4 判定（沿用同一策略，
     // 否则 ::ffff:198.18.0.46 会与裸 198.18.0.46 判定不一致）。
     if let Some(v4) = ip.to_ipv4() {
@@ -144,7 +175,11 @@ fn is_forbidden_ipv6(ip: Ipv6Addr) -> bool {
 fn is_forbidden_ipv6_native(ip: Ipv6Addr, policy: SsrfPolicy) -> bool {
     let seg = ip.segments();
     // ::1 环回 / :: 未指定
-    if ip == Ipv6Addr::LOCALHOST || ip == Ipv6Addr::UNSPECIFIED {
+    if ip == Ipv6Addr::LOCALHOST {
+        // 与 v4 环回同口径：AdminConfigured（管理员亲手填写）下放行本机回环。
+        return !(policy == SsrfPolicy::AdminConfigured);
+    }
+    if ip == Ipv6Addr::UNSPECIFIED {
         return true;
     }
     // fc00::/7 唯一本地地址(ULA)
@@ -173,7 +208,7 @@ fn is_forbidden_ipv6_native(ip: Ipv6Addr, policy: SsrfPolicy) -> bool {
             (seg[7] >> 8) as u8,
             (seg[7] & 0xff) as u8,
         );
-        return is_forbidden_ipv4_with(v4, policy);
+        return is_forbidden_ipv4_embedded_with(v4, policy);
     }
     // 6to4 (RFC 3056): 2002::/16 —— 前缀内嵌 IPv4 地址（bits 16–47）。
     // 例：2002:7f00:0001:: 内嵌 127.0.0.1，2002:a9fe:a9fe:: 内嵌 169.254.169.254。
@@ -185,7 +220,7 @@ fn is_forbidden_ipv6_native(ip: Ipv6Addr, policy: SsrfPolicy) -> bool {
             (seg[2] >> 8) as u8,
             (seg[2] & 0xff) as u8,
         );
-        if is_forbidden_ipv4_with(embedded_v4, policy) {
+        if is_forbidden_ipv4_embedded_with(embedded_v4, policy) {
             return true;
         }
     }
@@ -199,7 +234,7 @@ fn is_forbidden_ipv6_native(ip: Ipv6Addr, policy: SsrfPolicy) -> bool {
             (!seg[7] >> 8) as u8,
             (!seg[7] & 0xff) as u8,
         );
-        if is_forbidden_ipv4_with(teredo_v4, policy) {
+        if is_forbidden_ipv4_embedded_with(teredo_v4, policy) {
             return true;
         }
     }
@@ -212,7 +247,7 @@ fn is_forbidden_ipv6_native(ip: Ipv6Addr, policy: SsrfPolicy) -> bool {
             (seg[7] >> 8) as u8,
             (seg[7] & 0xff) as u8,
         );
-        if is_forbidden_ipv4_with(isatap_v4, policy) {
+        if is_forbidden_ipv4_embedded_with(isatap_v4, policy) {
             return true;
         }
     }
@@ -402,11 +437,12 @@ pub async fn validate_outbound_url_with(
 /// 开了 fake-IP 的机器上**任意域名**都解析到 198.18.x.x —— `Strict` 会让管理员
 /// 连一个域名形式的代理节点都加不进来（本仓已知问题 #19 的同源缺陷）。
 ///
-/// ⚠️ **它并没有放开环回与 RFC1918**：`socks5://127.0.0.1:40002`（本机 `ssh -D` 隧道）
-/// 与 `socks5://192.168.x.x:7890`（局域网 Clash/gluetun 旁车）**仍然被拒**，
-/// 而这两个恰是自建分身出口最常见的形态。要支持它们需要一个显式的配置开关
-/// （类似 `trustForwardedHeader` 那种「管理员知情下放开」的旋钮），
-/// 不能靠换策略解决 —— `AdminConfigured` 的豁免范围只有基准段这一条。
+/// ⚠️ **它只放开了基准段与字面量环回**：`socks5://127.0.0.1:40002`（本机 `ssh -D`
+/// 隧道，2026-08-13 起放行——本机回环无横向面，与 custom_api base_url 同口径）；
+/// `socks5://192.168.x.x:7890`（局域网 Clash/gluetun 旁车）**仍然被拒**。
+/// 旁车形态需要一个显式的配置开关（类似 `trustForwardedHeader` 那种「管理员知情下
+/// 放开」的旋钮），不能靠换策略解决 —— `AdminConfigured` 的豁免范围只有
+/// 基准段 + 字面量环回两条（内嵌混淆仍拒）。
 pub async fn validate_proxy_address(url: &str) -> Result<(), String> {
     let scheme = url
         .split_once("://")
@@ -546,15 +582,15 @@ mod tests {
     /// 内网扫描器（用测速接口的成功/失败当探测信号）。
     #[tokio::test]
     async fn proxy_address_rejects_internal_targets() {
+        // 2026-08-13：字面量环回代理（socks5://127.0.0.1、[::1]）放行——本机
+        // v2rayN/ssh -D 隧道是合法代理场景，环回无横向面。其余内网/保留段仍拒绝。
         for bad in [
-            "socks5://127.0.0.1:1080",
             "socks5://10.0.0.5:1080",
             "socks5://192.168.1.1:1080",
             "socks5://172.16.0.1:1080",
             "socks5://100.64.0.1:1080",
             "socks5://169.254.169.254:1080",
             "socks5://198.51.100.7:1080",
-            "http://[::1]:8080",
             "http://[fc00::1]:8080",
             // 6to4 内嵌 169.254.169.254：AdminConfigured 也不豁免内嵌形式。
             "http://[2002:a9fe:a9fe::1]:8080",
@@ -615,6 +651,32 @@ mod tests {
         }
     }
 
+    /// 管理员配置下环回（127.0.0.0/8、::1）放行（本机服务互转合法场景，
+    /// 2026-08-13）：网关 → 本机 shield → 本机 fuckopencode。严格策略下仍拒绝。
+    /// 内嵌混淆（Teredo/ISATAP 解混淆成环回）在两种策略下都必须拒绝（绕过口未开）。
+    #[test]
+    fn admin_configured_allows_literal_loopback_only() {
+        for ip in ["127.0.0.1", "127.0.0.2", "::1"] {
+            let addr: IpAddr = ip.parse().unwrap();
+            assert!(
+                is_forbidden_ip_with(addr, SsrfPolicy::Strict),
+                "{ip} 在严格策略下仍应拒绝（匿名端点不得打环回）"
+            );
+            assert!(
+                !is_forbidden_ip_with(addr, SsrfPolicy::AdminConfigured),
+                "{ip} 管理员亲手填写 base_url 时应放行（本机回环）"
+            );
+        }
+        // 私网段 / 链路本地 / 元数据：管理员配置下仍拒绝（横向/云元数据面不变）。
+        for ip in ["10.0.0.1", "172.16.0.1", "192.168.1.1", "169.254.169.254"] {
+            let addr: IpAddr = ip.parse().unwrap();
+            assert!(
+                is_forbidden_ip_with(addr, SsrfPolicy::AdminConfigured),
+                "{ip} 管理员配置下私网/元数据仍必须拒绝"
+            );
+        }
+    }
+
     /// 豁免范围必须**只有** 198.18.0.0/15 —— 内网与元数据端点在两种策略下都得拦。
     ///
     /// 这条是放宽策略的安全边界守卫：若将来有人把豁免扩大到整个 forbidden 集合，
@@ -623,7 +685,8 @@ mod tests {
     fn should_still_reject_internal_targets_even_when_admin_configured() {
         for ip in [
             "169.254.169.254", // 云元数据端点：最主要的 SSRF 攻击目标
-            "127.0.0.1",
+            // 2026-08-13：127.0.0.1 字面量环回已在 AdminConfigured 下放行（本机服务互转），
+            // 从拒绝列表移除；内嵌混淆环回（Teredo/ISATAP 解混淆）仍拒绝（见内嵌测试）。
             "10.0.0.1",
             "172.16.5.5",
             "192.168.1.1",
