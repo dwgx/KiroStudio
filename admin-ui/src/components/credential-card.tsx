@@ -281,6 +281,12 @@ export function CredentialCard({
       toast.error(t('credentialcard.toast.baseUrlRequired'))
       return
     }
+    // ⚠️ 2026-08-13：上游地址有未保存变更时，后端探测用的是**已保存**的 base_url——
+    // 直接探会拿到旧上游的模型列表，误导勾选白名单。先让用户保存。
+    if (customBaseUrl !== (credential.baseUrl ?? '')) {
+      toast.warning(t('credentialcard.toast.saveBaseUrlFirst'))
+      return
+    }
     setProbeLoading(true)
     setProbeError('')
     try {
@@ -1126,7 +1132,16 @@ export function CredentialCard({
                   <label className="text-xs text-muted-foreground">{t('credentialcard.settings.baseUrlLabel')}</label>
                   <Input
                     value={customBaseUrl}
-                    onChange={(e) => setCustomBaseUrl(e.target.value)}
+                    onChange={(e) => {
+                      setCustomBaseUrl(e.target.value)
+                      // ⚠️ 2026-08-13：上游地址变更即失效旧探测结果 —— 面板的
+                      // 「上游可用模型」是**旧 base_url 的探测产物**，继续展示会让
+                      // 用户对着旧模型列表勾白名单（新上游可能根本没有这些模型）。
+                      // 保存新上游后再点「探测上游模型」重探。
+                      setUpstreamModels(null)
+                      setUpstreamSelected(new Set())
+                      setProbeError('')
+                    }}
                     placeholder="https://your-relay.example.com/v1"
                     className="h-9 font-mono text-xs"
                     aria-label={t('credentialcard.settings.baseUrlAria')}

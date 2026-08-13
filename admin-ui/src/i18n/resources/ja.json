@@ -1353,7 +1353,6 @@
   "settings.absorb.exhausted503Hint": "Cursor は 429 でセッションを切りますが 503 では自動再試行します。503 が安全な既定です（2026-08-11 変更）。吸収を実際に実行して諦めたリクエストのみに影響します。",
   "settings.absorb.suspended": "403 一時制限も吸収（非推奨、自己修復バックオフと競合）",
   "settings.absorb.title": "上流 429 吸収",
-
   "settingspage.advanced.cache.enabled.hint": "オン：レスポンスに cache_read_input_tokens を含め、Claude Code などが「キャッシュヒット N tokens」と表示します。オフ：0 を入れるのではなくフィールド自体を省きます。Anthropic クライアントにとって 0 は「実際に一度もヒットしなかった」、欠落は「このゲートウェイでは計上しない」を意味し、意味が異なります。どちらの場合もパネルと SQLite には推定値が記録され続けます。",
   "settingspage.advanced.cache.nativeEffort.label": "上流 native effort（output_config.effort）を注入",
   "settingspage.advanced.cache.nativeEffort.hint": "既定はオフ。オンにすると Opus 4.8/4.7（5 段階、xhigh 含む）と Opus 4.6/Sonnet 4.6（4 段階）の extended thinking を XML タグではなく上流 output_config.effort で渡します（reasoningContentEvent を発火できるのは後者のみ）。ホワイトリスト外のモデルは影響を受けません。2026-08-11 移植、実機未検証のため既定オフです。",
@@ -1965,5 +1964,6 @@
         "suspendedHint": "上流の「アカウント一時停止」も吸収対象にします。この種のエラーは回復に数分かかるため、単一リクエストの待ち時間が長くなります。クライアントのタイムアウトが十分長い場合のみ有効化を推奨します。"
       }
     }
-  }
+  },
+  "credentialcard.toast.saveBaseUrlFirst": "アップストリーム base URL に未保存の変更があります。先に保存してからモデルをプローブしてください"
 }
