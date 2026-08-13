@@ -4148,8 +4148,7 @@ impl AdminService {
             match self.token_manager.repersist_secrets() {
                 Ok(true) => tracing::info!("at-rest 加密开关已改,已立即重写凭据/回收站文件"),
                 Ok(false) => tracing::warn!(
-                    "at-rest 加密开关已改,但当前为单凭据(Single)格式——persist 是 no-op,加密不生效。\
-                     请先转为多凭据数组格式(如通过 UI 增删任一号触发格式升级)。"
+                    "at-rest 加密开关已改,但立即重写凭据文件被跳过（无凭据路径）"
                 ),
                 Err(e) => tracing::warn!("at-rest 加密开关已改,但立即重写凭据文件失败(下次变更会补上): {}", e),
             }

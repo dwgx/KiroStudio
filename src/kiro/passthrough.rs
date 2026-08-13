@@ -561,67 +561,101 @@ pub async fn fetch_upstream_models(
         .filter(|b| !b.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("自定义 API 凭据缺少 base_url"))?;
     let base = base.trim_end_matches('/');
-    let url = if base.ends_with("/v1") || base.contains("/v1/") {
-        format!("{base}/models")
+    // ⚠️ 2026-08-13 修复（nbus 实测 404）：模型列表端点在**上游之间形态不一**——
+    // OpenAI 兼容上游认 `{base}/models` 或 `{base}/v1/models`；DeepSeek 的 Anthropic
+    // 兼容层（`{base}=.../anthropic`）**不提供** `/anthropic/v1/models`（Claude Code
+    // 从不拉模型列表），但同域 OpenAI 端点（剥掉 `/anthropic` 后缀）有 `/models`。
+    // 故按候选依次尝试，首个 2xx 即返回；全部失败时错误信息带上完整候选清单
+    // （否则 404 只能靠猜是哪个路径拼错了）。
+    let mut candidates: Vec<String> = Vec::new();
+    if base.ends_with("/v1") || base.contains("/v1/") {
+        candidates.push(format!("{base}/models"));
     } else {
-        format!("{base}/v1/models")
-    };
+        candidates.push(format!("{base}/v1/models"));
+        candidates.push(format!("{base}/models"));
+    }
+    // Anthropic 兼容后缀（/anthropic）剥掉后的 OpenAI 端点（DeepSeek 等）。
+    if let Some(stripped) = base.strip_suffix("/anthropic") {
+        candidates.push(format!("{stripped}/models"));
+        candidates.push(format!("{stripped}/v1/models"));
+    }
+    // 去重（剥后缀后可能与上面重复）。
+    candidates.dedup();
 
     let proxy = cred.effective_proxy(global_proxy);
     // 同样复用缓存 client（与 `forward` 共享连接池 —— 打的是同一个上游 host，
     // 分开建会把池打散，等于没修）。
     let client = passthrough_client(proxy.as_ref(), tls_backend)?;
-    let mut req = client.get(&url);
-    if let Some(key) = cred.api_key.as_deref().filter(|k| !k.is_empty()) {
-        req = req.header("Authorization", format!("Bearer {key}"));
-    }
-    let resp = req
-        .send()
+    let mut last_err: Option<anyhow::Error> = None;
+    for url in &candidates {
+        let mut req = client.get(url);
+        if let Some(key) = cred.api_key.as_deref().filter(|k| !k.is_empty()) {
+            req = req.header("Authorization", format!("Bearer {key}"));
+        }
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(anyhow::anyhow!("请求 {url} 失败: {e}"));
+                continue;
+            }
+        };
+        if !resp.status().is_success() {
+            last_err = Some(anyhow::anyhow!(
+                "上游返回 {} 获取模型列表失败（尝试过: {url}）",
+                resp.status()
+            ));
+            continue;
+        }
+        let body: serde_json::Value = match crate::common::http_read::read_json_capped(
+            resp,
+            "上游模型列表",
+            PASSTHROUGH_MODELS_CAP_BYTES,
+        )
         .await
-        .map_err(|e| anyhow::anyhow!("请求上游模型列表失败: {e}"))?;
-    if !resp.status().is_success() {
-        anyhow::bail!("上游返回 {} 获取模型列表失败", resp.status());
-    }
-    // 🔴 P5：原来是裸 `resp.json()` —— 它把整个 body **无上限**读进内存，而本仓
-    // `common/http_read.rs` 已把这条点名为 OOM 反模式并收口了 `read_json_capped`。
-    // 同一文件里 `forward` 的非流式分支早就用了 capped 版本，这里却裸奔；而模型列表
-    // 是**外部可控**数据（上游被劫持/DNS 投毒可无上限放大）。
-    let body: serde_json::Value =
-        crate::common::http_read::read_json_capped(resp, "上游模型列表", PASSTHROUGH_MODELS_CAP_BYTES)
-            .await
-            .map_err(|e| anyhow::anyhow!("解析上游模型列表失败: {e}"))?;
-
-    let mut models: Vec<String> = Vec::new();
-    // {data:[{id}]}（OpenAI 标准）
-    if let Some(data) = body.get("data").and_then(|v| v.as_array()) {
-        for m in data {
-            if let Some(id) = m.get("id").and_then(|x| x.as_str()) {
-                models.push(id.to_string());
+        {
+            Ok(b) => b,
+            Err(e) => {
+                last_err = Some(anyhow::anyhow!("解析 {url} 模型列表失败: {e}"));
+                continue;
+            }
+        };
+        // 解析成功即返回（即使列表为空——上游确实没模型也如实返回）。
+        let mut models: Vec<String> = Vec::new();
+        if let Some(data) = body.get("data").and_then(|v| v.as_array()) {
+            for m in data {
+                if let Some(id) = m.get("id").and_then(|x| x.as_str()) {
+                    models.push(id.to_string());
+                }
             }
         }
-    }
-    // {models:[...]}（字符串数组或对象数组）
-    if let Some(arr) = body.get("models").and_then(|v| v.as_array()) {
-        for m in arr {
-            if let Some(s) = m.as_str() {
-                models.push(s.to_string());
-            } else if let Some(id) = m.get("id").and_then(|x| x.as_str()) {
-                models.push(id.to_string());
+        if let Some(arr) = body.get("models").and_then(|v| v.as_array()) {
+            for m in arr {
+                if let Some(s) = m.as_str() {
+                    models.push(s.to_string());
+                } else if let Some(id) = m.get("id").and_then(|x| x.as_str()) {
+                    models.push(id.to_string());
+                }
             }
         }
-    }
-    // 纯数组 [string]
-    if let Some(arr) = body.as_array() {
-        for m in arr {
-            if let Some(s) = m.as_str() {
-                models.push(s.to_string());
+        // 纯数组 [string]
+        if let Some(arr) = body.as_array() {
+            for m in arr {
+                if let Some(s) = m.as_str() {
+                    models.push(s.to_string());
+                }
             }
         }
+        models.sort();
+        models.dedup();
+        return Ok(models);
     }
-
-    models.sort();
-    models.dedup();
-    Ok(models)
+    // 全部候选失败：附上候选清单让排障不再靠猜。
+    let tried = candidates.join(" | ");
+    match last_err {
+        Some(e) => Err(anyhow::anyhow!("{e}（全部候选: {tried}）")),
+        None => Err(anyhow::anyhow!("无可用模型列表候选（base_url: {base}）")),
+    }
+    // 旧解析尾部已并入上面的候选循环（含纯数组形态）。
 }
 
 /// 构建一个 Anthropic 风格的错误响应(供透传失败时返回)。
