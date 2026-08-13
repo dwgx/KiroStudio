@@ -1353,7 +1353,6 @@
   "settings.absorb.exhausted503Hint": "Cursor kills the session on 429 but retries on 503; 503 is the safe default (changed 2026-08-11), check to return 429 instead. Affects only requests that actually ran through absorption and gave up.",
   "settings.absorb.suspended": "Also absorb 403 temporary suspension (not recommended, conflicts with self-heal backoff)",
   "settings.absorb.title": "Upstream 429 absorption",
-
   "settingspage.advanced.cache.enabled.hint": "On: responses carry cache_read_input_tokens and clients such as Claude Code display \"N tokens read from cache\". Off: the field is omitted entirely rather than set to 0 — for Anthropic clients 0 means \"genuinely no hit\", a missing field means \"this gateway does not account for it\". Either way the dashboard and SQLite keep recording the estimate.",
   "settingspage.advanced.cache.nativeEffort.label": "Inject upstream native effort (output_config.effort)",
   "settingspage.advanced.cache.nativeEffort.hint": "Off by default. When on, extended thinking for Opus 4.8/4.7 (five tiers incl. xhigh) and Opus 4.6/Sonnet 4.6 (four tiers) is delivered via upstream output_config.effort instead of XML tags (only the former triggers upstream reasoningContentEvent). Models outside the whitelist are unaffected. Ported 2026-08-11, not verified on live upstream — off by default is deliberate.",
@@ -1965,5 +1964,6 @@
         "suspendedHint": "Also absorb upstream \"account temporarily suspended\" errors. These usually take minutes to clear, so absorbing them makes a single request wait a long time; enable only when client timeouts are generous."
       }
     }
-  }
+  },
+  "credentialcard.toast.saveBaseUrlFirst": "Upstream base URL has unsaved changes — save it first, then probe models"
 }

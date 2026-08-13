@@ -565,22 +565,38 @@ pub async fn fetch_upstream_models(
     // OpenAI 兼容上游认 `{base}/models` 或 `{base}/v1/models`；DeepSeek 的 Anthropic
     // 兼容层（`{base}=.../anthropic`）**不提供** `/anthropic/v1/models`（Claude Code
     // 从不拉模型列表），但同域 OpenAI 端点（剥掉 `/anthropic` 后缀）有 `/models`。
-    // 故按候选依次尝试，首个 2xx 即返回；全部失败时错误信息带上完整候选清单
-    // （否则 404 只能靠猜是哪个路径拼错了）。
+    // 2026-08-13 二修：候选生成改为**智能剥离**——把 `/v1`、`/anthropic`、
+    // `/anthropic/v1` 等路径片段逐一剥掉后对每个候选根都生成 `/models` 与
+    // `/v1/models` 两种形态，按「最贴近原 base 优先」排序、去重后依次尝试，
+    // 首个 2xx 即返回；全部失败时错误信息带上完整候选清单（不再靠猜路径）。
     let mut candidates: Vec<String> = Vec::new();
-    if base.ends_with("/v1") || base.contains("/v1/") {
-        candidates.push(format!("{base}/models"));
-    } else {
-        candidates.push(format!("{base}/v1/models"));
-        candidates.push(format!("{base}/models"));
+    {
+        let mut roots: Vec<String> = vec![base.to_string()];
+        // 剥 /anthropic（DeepSeek 类：anthropic 兼容层无模型列表，OpenAI 层有）
+        if let Some(stripped) = base.strip_suffix("/anthropic") {
+            roots.push(stripped.to_string());
+        }
+        // 剥 /v1（OpenAI 兼容层常见挂载点：/v1 下只有 chat/completions，models 在根）
+        if base.ends_with("/v1") {
+            roots.push(base.trim_end_matches("/v1").to_string());
+        }
+        if let Some(stripped) = base.strip_suffix("/anthropic/v1") {
+            roots.push(stripped.to_string());
+        }
+        // 每个根生成两种形态；先根路径（多数 OpenAI 上游 /models 就在根），再 /v1/models。
+        for root in roots {
+            candidates.push(format!("{root}/models"));
+            candidates.push(format!("{root}/v1/models"));
+        }
+        // 去重保序（linked-hash 语义：Vec + contains 检查）。
+        let mut deduped: Vec<String> = Vec::with_capacity(candidates.len());
+        for c in candidates {
+            if !deduped.contains(&c) {
+                deduped.push(c);
+            }
+        }
+        candidates = deduped;
     }
-    // Anthropic 兼容后缀（/anthropic）剥掉后的 OpenAI 端点（DeepSeek 等）。
-    if let Some(stripped) = base.strip_suffix("/anthropic") {
-        candidates.push(format!("{stripped}/models"));
-        candidates.push(format!("{stripped}/v1/models"));
-    }
-    // 去重（剥后缀后可能与上面重复）。
-    candidates.dedup();
 
     let proxy = cred.effective_proxy(global_proxy);
     // 同样复用缓存 client（与 `forward` 共享连接池 —— 打的是同一个上游 host，
