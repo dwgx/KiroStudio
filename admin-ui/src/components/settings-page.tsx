@@ -28,6 +28,7 @@ import {
   LayoutGrid,
   Users,
   X,
+  HelpCircle,
 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -2149,6 +2150,18 @@ export function SettingsPage() {
           </div>
           <Button variant="outline" size="sm" onClick={() => refetch()} disabled={isSaving}>
             {t('settingspage.common.refresh')}
+          </Button>
+          {/* 帮助中心跳转：hash 驱动，app-shell 监听 #/help 后全页渲染帮助页 */}
+          {/* i18n: settingspage.help.open（主会话补三语） */}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              window.location.hash = '#/help'
+            }}
+          >
+            <HelpCircle className="mr-1.5 h-4 w-4" />
+            帮助
           </Button>
         </div>
       </div>

@@ -45,7 +45,7 @@ admin-ui/package-lock.json
 *.tar.gz
 *.zip
 dist-windows/
-data/
+/data/
 ui-mockups/
 *.txt.dproj.txt
 tmp-import*/
