@@ -9,15 +9,16 @@
 
 ```text
 branch: master
-HEAD: a066fdf26c88591705d50b97fc2416e5c5434560
-master/origin/master: a066fdf
-deploy/vps: 495b7702e4e5be8e2d7746d889601b185b921297
-porcelain entries: 152 = 96 tracked modifications + 72 untracked paths
+HEAD: 1e100a2（2026-08-15，代挂严格语义修复）
+master/origin/master: 1e100a2（已推，一致）
+deploy/vps: 495b7702e4e5be8e2d7746d889601b185b921297（历史）
+porcelain entries: 少量未提交（并发会话：CHANGELOG/CLAUDE/release.yml/Cargo.lock/.gitignore）
 ```
 
 这意味着：
 
-- `HEAD` 只代表 `a066fdf`；当前源码/测试中的本轮变化不能称为 `master` 已完成。
+- `HEAD` = `1e100a2`（2026-08-15 复核）；当前状态一律以仓根 STATUS.md 为准。
+- 本文件 08-07 审计版的其余内容（部署/验证流程等）若与 STATUS.md 冲突，以 STATUS.md 为准。
 - `deploy/vps` 的 `495b770` 是独立 ref，虽包含一批代码提交，但不等于线上已运行，也不等于当前工作树的完整快照。
 - 当前工作树与 `deploy/vps` 仍有差异；接手者必须按显式路径审阅，不能直接把整个工作树当部署输入。
 - 本次没有使用 `git add`、`commit`、`stash`、`reset`、`checkout`、`switch`，也没有触碰真实 index。后续任何快照都必须复用 `CLAUDE.md` 的临时 index 约束。
