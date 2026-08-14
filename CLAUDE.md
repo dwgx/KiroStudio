@@ -95,11 +95,9 @@ git push -f origin deploy/vps
 
 ### 部署到 VPS
 
-🔴 **2026-08-14 最新线上：nbus（`38.244.34.15:8990`，systemd `kirostudio.service`）已部署
-v1.1.0，`/healthz` 验证过，详情以仓根 `STATUS.md` 为准。** 更早的 2026-08-08 容器化过渡
-（新机 `143.20.230.62`，容器 `skiapi-kirostudio`，镜像 `skiapi/kirostudio:local-0.7.46` 是
-当时的 tag、已过期；数据在 `/opt/skiapi/data/kirostudio/`，sub2api 用 compose 服务名
-`kirostudio:8990` 寻址）是过程记录。
+🔴 **2026-08-08 起 KiroStudio 已容器化，部署方式在过渡中。** 新机（`143.20.230.62`）上
+KiroStudio 跑在 Docker 容器 `skiapi-kirostudio`（镜像 `skiapi/kirostudio:local-0.7.46`，
+数据在 `/opt/skiapi/data/kirostudio/`），sub2api 用 compose 服务名 `kirostudio:8990` 寻址。
 旧的「Actions 出二进制 → scp → `kirostudio-update` 热替换」流程**已不适用**（那套是 systemd
 二进制时代）。新机的 `kirostudio-update` 脚本仍是旧流程、会 `systemctl restart kirostudio`，
 对容器无效——**容器化部署的正确流程（镜像 build+push+rollback）尚未定型**，改镜像前先核对
@@ -338,7 +336,7 @@ CODEGRAPH_DIR=.codegraph-legacy python3 tools/codegraph/cg.py stat
 | `MODULES.md` service.rs | 1990 | **9163** |
 | `MODULES.md` main.rs | 481 | **1139** |
 | 本文件 + `ARCHITECTURE.md` §二 | ide 是「唯一已注册端点」 | **ide + cli 两个都注册**（`endpoint/mod.rs::build()`） |
-| `ARCHITECTURE.md` 抬头 | v0.4.0 | **v1.1.0**（`Cargo.toml`，2026-08-14 复核） |
+| `ARCHITECTURE.md` 抬头 | v0.4.0 | **v0.7.46**（`Cargo.toml`） |
 
 两份 docs 已就地加警示抬头。`MODULES.md` 的**结构性**描述（谁调谁、职责划分）大体仍成立，
 过期的是数字与个别断言。另外两份 docs 都**缺 `src/openai/`** 一节（4 个文件确实存在）。
@@ -353,7 +351,7 @@ KiroStudio 是一个 **Anthropic Messages API 兼容的反向代理网关**，Ru
 - 单端口单二进制（react 前端 rust-embed 内嵌）
 - 上游：`runtime.{region}.kiro.dev/generateAssistantResponse`
 - 管理面板：`/admin`（React SPA），Admin API：`/api/admin/*`
-- 当前版本：v1.1.0（Cargo.toml；前端 admin-ui 独立线 0.7.44）。**v1.1.0 已于 2026-08-14 打 tag 并推送**（origin + public，发版例外，OTA 目标即 public release）；OTA 面板仍未启用（`update.env` token 未填、自动检查默认关）
+- 当前版本：v0.7.46（Cargo.toml）。⚠️ 0.7.46 **还没打 tag** → OTA 升不到这一版
 
 ## 仓库结构
 

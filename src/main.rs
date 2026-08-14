@@ -638,6 +638,9 @@ async fn main() {
                 // 等价于 /api/admin/import/keys。
                 .nest("/api", import_alias_app)
                 .nest("/admin", admin_ui_app)
+                // 帮助中心直达 URL（2026-08-14）：/help 与 /admin 并列挂载，
+                // 同一份 index.html，前端按路径渲染帮助页。
+                .route("/help", axum::routing::get(admin_ui::serve_help_page))
         }
     } else {
         anthropic_app
