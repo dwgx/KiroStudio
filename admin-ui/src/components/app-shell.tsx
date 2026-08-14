@@ -1,11 +1,10 @@
-import { useState, lazy, Suspense } from 'react'
+import { useState, useEffect, lazy, Suspense } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useQueryClient } from '@tanstack/react-query'
 import { storage } from '@/lib/storage'
 import {
   LayoutDashboard,
   Key,
-  Plug,
   BarChart3,
   Settings,
   Wrench,
@@ -27,33 +26,31 @@ const OverviewPage = lazy(() =>
 const UsagePage = lazy(() =>
   import('@/components/usage-page').then((m) => ({ default: m.UsagePage }))
 )
-const ConnPage = lazy(() =>
-  import('@/components/conn-page').then((m) => ({ default: m.ConnPage }))
-)
 const SettingsPage = lazy(() =>
   import('@/components/settings-page').then((m) => ({ default: m.SettingsPage }))
 )
 const OpsPage = lazy(() =>
   import('@/components/ops-page').then((m) => ({ default: m.OpsPage }))
 )
+const HelpPage = lazy(() =>
+  import('@/components/help-page').then((m) => ({ default: m.HelpPage }))
+)
 
-type Tab = 'overview' | 'credentials' | 'conn' | 'usage' | 'ops' | 'settings'
+type Tab = 'overview' | 'credentials' | 'usage' | 'ops' | 'settings'
 
 const NAV_ICONS: Record<Tab, React.ReactNode> = {
   overview: <LayoutDashboard className="h-4 w-4" />,
   credentials: <Key className="h-4 w-4" />,
-  conn: <Plug className="h-4 w-4" />,
   usage: <BarChart3 className="h-4 w-4" />,
   ops: <Wrench className="h-4 w-4" />,
   settings: <Settings className="h-4 w-4" />,
 }
 
-const NAV_KEYS: Tab[] = ['overview', 'credentials', 'conn', 'usage', 'ops', 'settings']
+const NAV_KEYS: Tab[] = ['overview', 'credentials', 'usage', 'ops', 'settings']
 
 const TAB_TITLE_KEYS: Record<Tab, string> = {
   overview: 'appshell.nav.overview',
   credentials: 'appshell.nav.credentials',
-  conn: 'appshell.nav.conn',
   usage: 'appshell.nav.usage',
   ops: 'appshell.nav.ops',
   settings: 'appshell.nav.settings',
@@ -69,6 +66,17 @@ export function AppShell({ onLogout }: AppShellProps) {
   const [loginOpen, setLoginOpen] = useState(false)
   const queryClient = useQueryClient()
 
+  // 帮助页 hash 同步：#/help 时全页覆盖渲染（非 tab）。直接访问 /help 由后端
+  // SPA fallback 服务 index.html，pathname 兜底让该场景同样生效。
+  const [helpActive, setHelpActive] = useState(
+    () => window.location.hash === '#/help' || window.location.pathname.endsWith('/help')
+  )
+  useEffect(() => {
+    const onHash = () => setHelpActive(window.location.hash === '#/help')
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [])
+
   // 号池健康事件通知（右下角 toast，状态跃迁时弹一次；复用已有轮询数据，零额外上游调用）。
   usePoolNotifications()
 
@@ -80,6 +88,17 @@ export function AppShell({ onLogout }: AppShellProps) {
     storage.removeApiKey()
     queryClient.clear()
     onLogout()
+  }
+
+  // 帮助页：整页覆盖（含侧边栏），返回按钮把 hash 清空后自然回到 tab 视图。
+  if (helpActive) {
+    return (
+      <div className="min-h-screen bg-[#0a0a0a] text-[#ededed]" translate="no">
+        <Suspense fallback={<PageSkeleton kind="settings" />}>
+          <HelpPage onBack={() => { window.location.hash = '' }} />
+        </Suspense>
+      </div>
+    )
   }
 
   return (
@@ -163,10 +182,9 @@ export function AppShell({ onLogout }: AppShellProps) {
 
         {/* Page Content */}
         <div className="max-w-[1200px] mx-auto px-8 py-8">
-          <Suspense fallback={<PageSkeleton kind={tab === 'conn' ? 'settings' : tab} />}>
+          <Suspense fallback={<PageSkeleton kind={tab} />}>
             {tab === 'overview' && <OverviewPage />}
             {tab === 'usage' && <UsagePage />}
-            {tab === 'conn' && <ConnPage />}
             {tab === 'credentials' && <Dashboard onLogout={onLogout} embedded />}
             {tab === 'ops' && <OpsPage />}
             {tab === 'settings' && <SettingsPage />}

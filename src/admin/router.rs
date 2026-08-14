@@ -21,7 +21,8 @@ use super::{
         export_config, export_credential, export_kam_credentials, external_idp_leg1, external_idp_leg2,
         external_idp_leg2_select, force_refresh_token, get_all_credentials, get_cached_balances,
         get_config, get_credential_balance, get_load_balancing_mode, get_overage_status,
-        import_config, import_keys, list_socks_nodes, list_trash, perform_update,
+        help_web_search, import_config, import_keys, list_socks_nodes, list_trash,
+        perform_update,
         poll_idc_login, poll_social_login, probe_available_models, probe_models_standalone,
         probe_regions, proxy_test, probe_upstream_models, purge_credential, purge_trash_batch,
         endpoint_health, recovery_metrics, relogin_oauth, reprobe_credential_region,
@@ -235,6 +236,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/update/perform", post(perform_update))
         // OTA 观测：读 .health/.bak/*.failed 标记，显示升级是否稳定确认 / 是否发生过回滚
         .route("/update/status", get(update_status))
+        // 帮助页「联网搜索」代理：DuckDuckGo Instant Answer，空结果兜底 Bing RSS。
+        // 服务器出网（前端绕开 CORS）；无额外频控 —— 面板内使用、量小，
+        // 且本路由在 authed 树内，鉴权层照常拦截。
+        .route("/help/web-search", get(help_web_search))
         // ⚠️ 层序（tower）：**后挂的先执行**。审计必须先挂、鉴权后挂 ⇒ 鉴权最外层先跑，
         // 未鉴权请求在鉴权层就被拦下，**不会**进审计日志（防无 key 攻击者刷审计）。
         // 顺序颠倒 = 审计在鉴权之前跑，未经鉴权的请求也会被记录。

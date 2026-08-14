@@ -2054,6 +2054,24 @@ pub fn build_import_response(
     ImportKeysResponse::new(results, concurrency_limit, elapsed_ms)
 }
 
+// ============ 帮助页联网搜索 ============
+
+/// 帮助页「联网搜索」单条结果（DuckDuckGo 与 Bing 兜底统一形状）。
+///
+/// 前端直接渲染数组：title 展示、url 可点、snippet 摘要。
+/// `url` 为 `None` 的条目（如 DDG 摘要缺 AbstractURL）不下发该字段。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebSearchItem {
+    /// 标题（服务端截断 100 字符）
+    pub title: String,
+    /// 链接；个别条目可能缺失
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// 摘要/描述
+    pub snippet: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

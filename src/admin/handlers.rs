@@ -1696,6 +1696,325 @@ pub struct UpdatePerformRequest {
     pub version: Option<String>,
 }
 
+// ============ 帮助页联网搜索（DuckDuckGo + Bing RSS 兜底）============
+
+/// 单次搜索最多返回的条目数（DDG 与 Bing 兜底共用上限）。
+const MAX_WEB_SEARCH_RESULTS: usize = 10;
+/// Bing RSS 兜底最多取前 8 条（Bing 条目质量参差，够用即止）。
+const BING_FALLBACK_MAX_ITEMS: usize = 8;
+/// 结果标题截断长度（按字符截，`chars()` 避免切坏多字节字符）。
+const WEB_SEARCH_TITLE_MAX_CHARS: usize = 100;
+/// 查询词长度上限（字符数）。
+const WEB_SEARCH_Q_MAX_CHARS: usize = 200;
+
+/// 帮助页搜索的出站 client：进程级单例（复用连接池），8s 总超时。
+///
+/// 跟随 `common/alerting.rs` 的裸 builder 惯例——纯公网目标，无需 SSRF 固定 DNS。
+fn web_search_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(8))
+            .build()
+            .expect("帮助页搜索 client 构建失败")
+    })
+}
+
+/// GET /api/admin/help/web-search?q=<查询>
+/// 帮助页「联网搜索」代理：调 DuckDuckGo Instant Answer（免 key、JSON 稳定），
+/// 空结果时兜底 Bing RSS 搜索（见 `parse_bing_rss`）。前端经它绕开 CORS 并复用
+/// 服务器出网。
+///
+/// 鉴权：本端点注册在 authed 路由树内，走统一 admin 鉴权。
+/// 无额外频控：面板内使用、量小，只有持有 admin key 的请求能到达这里。
+///
+/// 失败语义：参数非法（q 空/超长）→ 400；出站请求失败（超时/非 2xx）→ 502。
+pub async fn help_web_search(
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    // 参数校验：q 必填、trim 后非空、长度 ≤ 200。
+    let q = match params
+        .get("q")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        Some(q) if q.chars().count() <= WEB_SEARCH_Q_MAX_CHARS => q.to_string(),
+        _ => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(super::types::AdminErrorResponse::invalid_request(
+                    "q 参数必填，且长度不超过 200 个字符",
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    let client = web_search_client();
+
+    // 第一源：DDG Instant Answer（skip_disambig=1 跳过消歧义页）。
+    let ddg_url = format!(
+        "https://api.duckduckgo.com/?q={}&format=json&no_html=1&skip_disambig=1",
+        urlencoding::encode(&q)
+    );
+    let resp = match client.get(&ddg_url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return web_search_unavailable(),
+    };
+    let raw = match resp.text().await {
+        Ok(t) => t,
+        Err(_) => return web_search_unavailable(),
+    };
+    let mut items = parse_ddg_response(&raw, &q);
+
+    // 兜底：DDG Instant Answer 覆盖有限、空结果常见——此时**不返回空**，
+    // 改调 Bing RSS（服务器在美国可达，format=rss 返回 XML）。
+    if items.is_empty() {
+        let bing_url = format!(
+            "https://www.bing.com/search?q={}&format=rss",
+            urlencoding::encode(&q)
+        );
+        let resp = match client.get(&bing_url).send().await {
+            Ok(r) if r.status().is_success() => r,
+            _ => return web_search_unavailable(),
+        };
+        let raw = match resp.text().await {
+            Ok(t) => t,
+            Err(_) => return web_search_unavailable(),
+        };
+        items = parse_bing_rss(&raw);
+    }
+
+    Json(items).into_response()
+}
+
+/// 502 响应：搜索服务不可用（上游超时/失败，前端提示稍后再试）。
+fn web_search_unavailable() -> axum::response::Response {
+    (
+        axum::http::StatusCode::BAD_GATEWAY,
+        Json(super::types::AdminErrorResponse::api_error(
+            "搜索服务暂时不可用",
+        )),
+    )
+        .into_response()
+}
+
+/// 纯函数：DDG Instant Answer JSON → 条目。
+///
+/// 展平规则：
+/// - `AbstractText` 非空 → 第一条（title=查询词、url=AbstractURL 或空、snippet=摘要）
+/// - `RelatedTopics[]` 逐项展平：有 `FirstURL` 的取 Text/FirstURL；带嵌套
+///   `Topics[]` 的递归展平；无 `FirstURL` 的条目跳过
+///
+/// 与网络调用解耦（mock 输入串可单测），见 `web_search_tests`。
+fn parse_ddg_response(raw: &str, query: &str) -> Vec<super::types::WebSearchItem> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+
+    if let Some(abstract_text) = v
+        .get("AbstractText")
+        .and_then(|t| t.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        out.push(super::types::WebSearchItem {
+            title: truncate_search_title(query),
+            url: v
+                .get("AbstractURL")
+                .and_then(|u| u.as_str())
+                .filter(|u| !u.is_empty())
+                .map(str::to_string),
+            snippet: abstract_text.to_string(),
+        });
+    }
+
+    if let Some(topics) = v.get("RelatedTopics").and_then(|t| t.as_array()) {
+        for topic in topics {
+            collect_ddg_topic(topic, &mut out);
+        }
+    }
+
+    out.truncate(MAX_WEB_SEARCH_RESULTS);
+    out
+}
+
+/// 递归展平单条 DDG topic（含嵌套 `Topics` 数组）。
+fn collect_ddg_topic(topic: &serde_json::Value, out: &mut Vec<super::types::WebSearchItem>) {
+    if let Some(nested) = topic.get("Topics").and_then(|t| t.as_array()) {
+        for t in nested {
+            collect_ddg_topic(t, out);
+        }
+        return;
+    }
+    let Some(text) = topic
+        .get("Text")
+        .and_then(|t| t.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return;
+    };
+    let Some(url) = topic
+        .get("FirstURL")
+        .and_then(|u| u.as_str())
+        .filter(|u| !u.is_empty())
+    else {
+        return;
+    };
+    out.push(super::types::WebSearchItem {
+        title: truncate_search_title(text),
+        url: Some(url.to_string()),
+        snippet: text.to_string(),
+    });
+}
+
+/// 标题截断：按字符截（`chars()` 而非 bytes，避免切坏多字节字符）。
+fn truncate_search_title(s: &str) -> String {
+    s.chars().take(WEB_SEARCH_TITLE_MAX_CHARS).collect()
+}
+
+/// 纯函数：Bing RSS（`format=rss` 的 XML）→ 条目。
+///
+/// 项目无 XML 解析依赖，选最简可靠的正则式粗解析：手写 find 扫描
+/// `<item>..</item>` 块（Bing 的 title/link/description 均为无属性标签），
+/// 再做基础 HTML 实体解码。条目取前 `BING_FALLBACK_MAX_ITEMS` 条。
+fn parse_bing_rss(xml: &str) -> Vec<super::types::WebSearchItem> {
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while out.len() < BING_FALLBACK_MAX_ITEMS {
+        let Some(open_at) = rest.find("<item>") else {
+            break;
+        };
+        let block_start = open_at + "<item>".len();
+        let Some(rel_end) = rest[block_start..].find("</item>") else {
+            break;
+        };
+        let block = &rest[block_start..block_start + rel_end];
+
+        let title = extract_xml_tag(block, "title").unwrap_or_default();
+        let url = extract_xml_tag(block, "link");
+        // 无标题或链接的条目没有点击价值，跳过。
+        if !title.is_empty() && url.as_deref().is_some_and(|u| !u.is_empty()) {
+            out.push(super::types::WebSearchItem {
+                title: truncate_search_title(&title),
+                url,
+                snippet: extract_xml_tag(block, "description")
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string(),
+            });
+        }
+
+        rest = &rest[block_start + rel_end + "</item>".len()..];
+    }
+    out
+}
+
+/// 取块内 `<tag>..</tag>` 首段内容并做基础 HTML 实体解码。
+fn extract_xml_tag(block: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = block.find(&open)? + open.len();
+    let end = block[start..].find(&close)? + start;
+    Some(html_unescape(&block[start..end]))
+}
+
+/// 基础 HTML 实体解码（Bing RSS 标题/描述含 `&amp;` 一类实体）。
+fn html_unescape(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+}
+
+#[cfg(test)]
+mod web_search_tests {
+    use super::*;
+
+    /// DDG 解析：AbstractText 打头 + RelatedTopics 展平（含嵌套、无链接跳过）。
+    #[test]
+    fn ddg_response_flattens_topics() {
+        let json = r#"{
+            "AbstractText": "Rust 是一门系统编程语言",
+            "AbstractURL": "https://www.rust-lang.org/",
+            "RelatedTopics": [
+                {"Text": "Rust Programming Language", "FirstURL": "https://www.rust-lang.org/"},
+                {"Topics": [
+                    {"Text": "Nested 条目 A", "FirstURL": "https://example.com/a"},
+                    {"Text": "无链接条目被跳过"}
+                ]},
+                {"Text": "只有文本没有链接"}
+            ]
+        }"#;
+        let items = parse_ddg_response(json, "rust");
+        assert_eq!(items.len(), 3);
+        // 第一条 = AbstractText（title 用查询词）
+        assert_eq!(items[0].title, "rust");
+        assert_eq!(items[0].url.as_deref(), Some("https://www.rust-lang.org/"));
+        assert!(items[0].snippet.contains("系统编程"));
+        // 第二条 = 顶层条目
+        assert_eq!(items[1].title, "Rust Programming Language");
+        assert_eq!(items[1].url.as_deref(), Some("https://www.rust-lang.org/"));
+        // 第三条 = 嵌套展开（无链接的条目被跳过）
+        assert_eq!(items[2].title, "Nested 条目 A");
+        assert_eq!(items[2].url.as_deref(), Some("https://example.com/a"));
+    }
+
+    /// DDG 解析：标题截断 100 字符（按字符截，多字节不切坏）。
+    #[test]
+    fn ddg_title_truncated_to_100_chars() {
+        let long = "长".repeat(120);
+        let json = format!(
+            r#"{{"RelatedTopics":[{{"Text":"{text}","FirstURL":"https://example.com/x"}}]}}"#,
+            text = long
+        );
+        let items = parse_ddg_response(&json, "q");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title.chars().count(), WEB_SEARCH_TITLE_MAX_CHARS);
+    }
+
+    /// DDG 解析：空结果 / 非法 JSON → 空数组（空数组触发 Bing 兜底）。
+    #[test]
+    fn ddg_empty_or_invalid_yields_empty() {
+        assert!(parse_ddg_response(r#"{"RelatedTopics":[]}"#, "q").is_empty());
+        assert!(parse_ddg_response("not json", "q").is_empty());
+    }
+
+    /// Bing RSS 解析：条目提取 + 实体解码 + 缺 description 容错 + 无链接跳过。
+    #[test]
+    fn bing_rss_parses_items() {
+        let xml = r#"<?xml version="1.0"?>
+        <rss version="2.0"><channel>
+        <item><title>Rust &amp; Cargo</title><link>https://example.com/rust</link><description>工具链介绍</description></item>
+        <item><title>No Desc</title><link>https://example.com/nodesc</link></item>
+        <item><title>No Link</title><description>只有描述</description></item>
+        </channel></rss>"#;
+        let items = parse_bing_rss(xml);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].title, "Rust & Cargo");
+        assert_eq!(items[0].url.as_deref(), Some("https://example.com/rust"));
+        assert_eq!(items[0].snippet, "工具链介绍");
+        assert_eq!(items[1].title, "No Desc");
+        assert_eq!(items[1].snippet, "");
+    }
+
+    /// Bing RSS 解析：最多取前 8 条。
+    #[test]
+    fn bing_rss_caps_at_8_items() {
+        let mut xml = String::new();
+        for i in 0..12 {
+            xml.push_str(&format!(
+                "<item><title>t{i}</title><link>https://example.com/{i}</link><description>d</description></item>"
+            ));
+        }
+        let items = parse_bing_rss(&xml);
+        assert_eq!(items.len(), BING_FALLBACK_MAX_ITEMS);
+    }
+}
+
 #[cfg(test)]
 mod guard_tests {
     /// ⭐ 源码级守卫：推号开关的闸门必须在 `parse_import_keys_request` **之前**。
