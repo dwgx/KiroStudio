@@ -210,6 +210,13 @@ fn bootstrap_config_if_missing(config_path: &str) -> (String, bool) {
 }
 
 #[tokio::main]
+
+/// /help 帮助中心入口（2026-08-14）：对齐 index_handler 的 async + IntoResponse 包装
+/// （axum 0.8 对返回裸 Response<Body> 的 fn item 不直接实现 Handler）。
+async fn help_page_handler() -> impl axum::response::IntoResponse {
+    admin_ui::serve_help_page()
+}
+
 async fn main() {
     // 解析命令行参数
     let args = Args::parse();
@@ -640,7 +647,7 @@ async fn main() {
                 .nest("/admin", admin_ui_app)
                 // 帮助中心直达 URL（2026-08-14）：/help 与 /admin 并列挂载，
                 // 同一份 index.html，前端按路径渲染帮助页。
-                .route("/help", axum::routing::get(admin_ui::serve_help_page))
+                .route("/help", axum::routing::get(help_page_handler))
         }
     } else {
         anthropic_app
