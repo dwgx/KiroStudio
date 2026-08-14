@@ -595,6 +595,13 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
         .expect("Failed to build response")
 }
 
+/// /help 直达入口（2026-08-14）：帮助中心知识库独立 URL。
+/// SPA fallback 只在 /admin 前缀内生效，主路由 /help 需要显式挂载，
+/// 前端 app-shell 按 pathname.endsWith('/help') 渲染帮助页（与 hash 同源逻辑）。
+pub fn serve_help_page() -> Response<Body> {
+    serve_index()
+}
+
 /// 提供 index.html
 ///
 /// CSP:全仓此前无 CSP,一旦 XSS 即可读 localStorage 里的 adminKey 完整接管管理面。
