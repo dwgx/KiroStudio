@@ -1,5 +1,11 @@
 mod admin;
 mod admin_ui;
+
+/// /help 帮助中心入口（2026-08-14）：对齐 index_handler 的 async + IntoResponse 包装
+/// （axum 0.8 对返回裸 Response<Body> 的 fn item 不直接实现 Handler）。
+async fn help_page_handler() -> impl axum::response::IntoResponse {
+    admin_ui::serve_help_page()
+}
 mod anthropic;
 mod common;
 mod http_client;
@@ -210,13 +216,6 @@ fn bootstrap_config_if_missing(config_path: &str) -> (String, bool) {
 }
 
 #[tokio::main]
-
-/// /help 帮助中心入口（2026-08-14）：对齐 index_handler 的 async + IntoResponse 包装
-/// （axum 0.8 对返回裸 Response<Body> 的 fn item 不直接实现 Handler）。
-async fn help_page_handler() -> impl axum::response::IntoResponse {
-    admin_ui::serve_help_page()
-}
-
 async fn main() {
     // 解析命令行参数
     let args = Args::parse();
