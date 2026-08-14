@@ -950,6 +950,9 @@ const REPROBE_ALL_BAD_COOLDOWN: StdDuration = StdDuration::from_secs(6 * 3600);
 /// 超时按瞬态错误返回（请求换号/重试），不无限排队。取值远小于单次刷新的正常耗时
 /// （网络往返 + 退避最坏 180s+），只在刷新异常卡死时兜底触发。
 const REFRESH_LOCK_TIMEOUT_SECS: u64 = 60;
+/// 模型黑名单 TTL（2026-08-14）：60s 足够覆盖一次 failover 链的多次撞号；
+/// 上游模型分组调整后 60s 内自动解禁，不需要人工干预。
+const MODEL_BLACKLIST_TTL_SECS: u64 = 60;
 
 /// 全池自愈的**基础退避**（值已配置化到 [`Config::self_heal_base_backoff_secs`]，默认 60s）。
 /// 第 n 次连续自愈需等 `BASE × 2^(n-1)`，上限 `self_heal_max_backoff_secs`（默认 900s）。
@@ -2010,6 +2013,11 @@ pub struct MultiTokenManager {
     /// 用 `AtomicU64` 而非放进 `entries` 锁内：它只是个提示值，读到旧值最坏是多轮一次。
     /// 初值 0 = 「还没放行过」，而 id 从 1 起分配（`next_id`），故 0 不与任何号撞。
     fallback_cursor: AtomicU64,
+    /// (credential_id, model) → 上游明确说「不支持该模型」（model_not_found / no
+    /// available channel）的短期黑名单（2026-08-14 根治：请求 opus-5 不再白付一跳
+    /// 打到只有 gpt 的中转站）。60s TTL，内存态。粒度是「号×模型」而非「号」：
+    /// 该号对别的模型可能可用，号级冷却会白丢池容量。
+    model_blacklist: parking_lot::Mutex<std::collections::HashMap<(u64, String), std::time::Instant>>,
 }
 
 /// 单号余额快照(供余额加权分流)。由 AdminService 每 30 分钟刷新后回推。
@@ -2507,6 +2515,11 @@ impl MultiTokenManager {
             clone_seq_hwm: Mutex::new(HashMap::new()),
             // 0 = 还没兜底放行过；id 从 1 起，故 0 不与任何号撞。
             fallback_cursor: AtomicU64::new(0),
+            // (credential_id, model) → 上游明确说「不支持该模型」（model_not_found / no
+            // available channel）的短期黑名单（2026-08-14 根治：请求 opus-5 不再白付一跳
+            // 打到只有 gpt 的中转站）。60s TTL，内存态。粒度是「号×模型」而非「号」：
+            // 该号对别的模型可能可用，号级冷却会白丢池容量。
+            model_blacklist: parking_lot::Mutex::new(std::collections::HashMap::new()),
         };
         // 播种冷却时长缩放(启动即用 config 值)。
         manager.cooldown.set_cooldown_scale_pct(cooldown_scale_pct);
@@ -3026,6 +3039,9 @@ impl MultiTokenManager {
                     && e.credentials.is_custom_api_credential()
                     && !exclude.contains(&e.id)
                     && (!cooldown_on || self.cooldown.is_available(e.id))
+                    // 🔴 模型黑名单（2026-08-14 根治）：上游明确说过「该模型不支持」的
+                    // 号×模型组合直接跳过——请求 opus-5 不再白付一跳撞 pigcode 类中转站。
+                    && !model.is_some_and(|m| self.is_model_blacklisted(e.id, m))
                     && model.is_none_or(|m| {
                         // 🔴 2026-08-09 修：与改写层共用**白名单感知**的 effective_model。
                         //
@@ -3147,6 +3163,31 @@ impl MultiTokenManager {
     /// 给 custom_api 透传号设一段冷却(**仅操作 cooldown,不碰 health/family/report_success/failure**,
     /// 守两池隔离铁律)。供透传 failover:某号 403 额度满 / 401 key 失效 / 429 / 5xx 时暂时跳过它,
     /// 让 select_custom_api 下次(及本请求循环 exclude)避开,换下一个号。
+    /// 上游明确返回「不支持该模型」（model_not_found / no available channel）时调用：
+    /// 记 (id, model) 短期黑名单（60s），后续选号跳过该号×该模型组合——
+    /// 根治「请求 opus-5 白付一跳打到只有 gpt 的中转站」（2026-08-14）。
+    /// 粒度是号×模型：该号对别的模型仍可服务，不做号级冷却（白丢池容量）。
+    pub fn mark_model_unsupported(&self, id: u64, model: &str) {
+        if model.is_empty() {
+            return;
+        }
+        self.model_blacklist.lock().insert(
+            (id, model.to_string()),
+            std::time::Instant::now() + std::time::Duration::from_secs(MODEL_BLACKLIST_TTL_SECS),
+        );
+    }
+
+    /// 选号过滤用：该号×该模型是否在短黑名单内（顺带惰性清理过期项）。
+    pub fn is_model_blacklisted(&self, id: u64, model: &str) -> bool {
+        if model.is_empty() {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        let mut m = self.model_blacklist.lock();
+        m.retain(|_, exp| *exp > now);
+        m.contains_key(&(id, model.to_string()))
+    }
+
     pub fn cooldown_custom_api(&self, id: u64, secs: u64) {
         if self.cooldown_enabled.load(Ordering::Relaxed) {
             self.cooldown.set_cooldown_with_duration(
@@ -10747,6 +10788,44 @@ mod tests {
         let empty = HashSet::new();
         let sel = mgr.select_custom_api(&empty, None).expect("应选到未冷却的 #2");
         assert_eq!(sel.0, 2, "#1 冷却中,应选 #2");
+    }
+
+    /// 模型黑名单（2026-08-14 根治）：上游说「不支持该模型」后，选号跳过该号×该模型；
+    /// 但该号对别的模型仍可服务（粒度是号×模型，不做号级冷却）。
+    #[test]
+    fn test_model_blacklist_skips_unsupported_pair_only() {
+        let mut c1 = KiroCredentials::default();
+        c1.id = Some(1);
+        c1.auth_method = Some("custom_api".to_string());
+        c1.base_url = Some("https://relay1.example.invalid".to_string());
+        c1.priority = 0;
+        let mut c2 = KiroCredentials::default();
+        c2.id = Some(2);
+        c2.auth_method = Some("custom_api".to_string());
+        c2.base_url = Some("https://relay2.example.invalid".to_string());
+        c2.priority = 0;
+        let mgr = MultiTokenManager::new(Config::default(), vec![c1, c2], None, None, false).unwrap();
+
+        // #1 声明不支持 claude-opus-5 → 记黑名单。
+        mgr.mark_model_unsupported(1, "claude-opus-5");
+        assert!(mgr.is_model_blacklisted(1, "claude-opus-5"), "应命中黑名单");
+
+        // 请求 claude-opus-5 → 跳过 #1 选 #2。
+        let empty = HashSet::new();
+        let sel = mgr
+            .select_custom_api(&empty, Some("claude-opus-5"))
+            .expect("应有候选");
+        assert_eq!(sel.0, 2, "黑名单内的号×模型组合不得被选");
+
+        // 请求别的模型 → #1 仍可服务（粒度是号×模型）。
+        let sel2 = mgr
+            .select_custom_api(&empty, Some("gpt-5.6-sol"))
+            .expect("应有候选");
+        assert_eq!(sel2.0, 1, "#1 对未黑名单的模型仍可被选（不得号级连坐）");
+
+        // 空模型不参与黑名单。
+        let sel3 = mgr.select_custom_api(&empty, None).expect("应有候选");
+        assert_eq!(sel3.0, 1, "无模型语义的请求不受黑名单影响");
     }
 
     /// 造一个 custom_api 代挂号（priority 可指定，可选凭据级 custom_api_first 覆盖）。

@@ -1871,6 +1871,26 @@ impl KiroProvider {
             let should_failover = matches!(code, 401 | 402 | 403 | 429)
                 || (500..600).contains(&code)
                 || is_upstream_error_worth_retry;
+            // 🔴 模型黑名单（2026-08-14 根治）：上游明确说「该模型不支持」——
+            // model_not_found / no available channel（如 pigcode 的
+            // "No available channel for model claude-opus-5 under group GPT-PRO"）。
+            // 这是该号对该模型的**稳定属性**（不是抖动）：记 (id, model) 短黑名单，
+            // 同一请求的后续 failover 与后续请求都不再选它，不再白付一跳。
+            // 只认语义特征不认状态码：503/404/400 都可能携带（不同中转站表达不同）。
+            let upstream_says_model_unsupported = !upstream_err.is_empty()
+                && (err_lower.contains("model_not_found")
+                    || err_lower.contains("no available channel")
+                    || err_lower.contains("model not found"));
+            if upstream_says_model_unsupported {
+                if let Some(m) = model {
+                    self.token_manager.mark_model_unsupported(id, m);
+                    tracing::warn!(
+                        credential_id = id,
+                        model = %m,
+                        "上游明确不支持该模型，记模型黑名单 60s（该号该模型不再被选）"
+                    );
+                }
+            }
             if matches!(code, 400 | 404) {
                 tracing::warn!(
                     credential_id = id,
