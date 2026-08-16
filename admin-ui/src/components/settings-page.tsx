@@ -29,6 +29,7 @@ import {
   Users,
   X,
   HelpCircle,
+  MessageSquareWarning,
 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -54,7 +55,7 @@ import {
   purgeCredential,
   purgeTrashBatch,
 } from '@/api/credentials'
-import { extractErrorMessage, copyToClipboard } from '@/lib/utils'
+import { extractErrorMessage, parseError, copyToClipboard } from '@/lib/utils'
 import { RegionSelect } from '@/components/ui/region-select'
 import { NumberStepper } from '@/components/ui/number-stepper'
 import { ComboInput } from '@/components/ui/combo-input'
@@ -66,7 +67,8 @@ import {
   BgCacheDetailDialog,
 } from '@/components/ops-detail-dialogs'
 import { Eye } from 'lucide-react'
-import { disabledReasonLabel } from '@/lib/i18n-labels'
+import { disabledReasonLabel, storagePartitionLabel } from '@/lib/i18n-labels'
+import { ErrorMessagesDialog } from '@/components/error-messages-dialog'
 
 // 版本字段的常见预设（可点选，也可自定义输入）。与 Kiro IDE 实际发行的标识对齐，
 // 便于伪装成主流客户端指纹；不在列表里的值直接手敲即可。
@@ -80,7 +82,7 @@ import type {
   StorageCleanupTarget,
   ClientRpm,
   TrashItem,
-  ThrottleProfile,
+  SchedulingMode,
 } from '@/types/api'
 import type { TFunction } from 'i18next'
 
@@ -157,6 +159,7 @@ const CARD_INDEX_DEFS: { section: SectionId; titleKey: string; kwKey: string }[]
   { section: 'advanced', titleKey: 'settingspage.card.cliAlign', kwKey: 'settingspage.card.cliAlign.kw' },
   { section: 'advanced', titleKey: 'settingspage.card.advAbsorb', kwKey: 'settingspage.card.advAbsorb.kw' },
   { section: 'advanced', titleKey: 'settingspage.card.advCache', kwKey: 'settingspage.card.advCache.kw' },
+  { section: 'advanced', titleKey: 'settingspage.card.errorMessages', kwKey: 'settingspage.card.errorMessages.kw' },
   { section: 'basic', titleKey: 'settingspage.card.loginBg', kwKey: 'settingspage.card.loginBg.kw' },
   { section: 'security', titleKey: 'settingspage.card.security', kwKey: 'settingspage.card.security.kw' },
   { section: 'scheduling', titleKey: 'settingspage.card.loadBalance', kwKey: 'settingspage.card.loadBalance.kw' },
@@ -270,6 +273,9 @@ interface FormState {
   cliUaAlignRealClient: boolean
   // prompt cache 记账下发开关（估算值，非上游真值）
   promptCacheEnabled: boolean
+  // 模拟缓存：透传响应注入模拟 cache_read（比例以整数百分比存储，保存时换算 0..1）
+  mockCacheEnabled: boolean
+  mockCacheReadRatioPct: string
   selfHealBaseBackoffSecs: string
   selfHealMaxBackoffSecs: string
   selfHealMaxShift: string
@@ -294,7 +300,9 @@ interface FormState {
   rpmHardGateOverloadWait: boolean
   cooldownScalePct: string
   rateLimitJitterPct: string
-  throttleProfile: ThrottleProfile
+  // 调度模式（三按钮，2026-08-16）：smart/stable/manual。后端映射到 ThrottleProfile 写矩阵；
+  // throttleProfile 不再是 UI 字段（下拉已由三按钮取代）。
+  schedulingMode: SchedulingMode
   inboundThrottleEnabled: boolean
   inboundRpmAuto: boolean
   inboundTargetRpm: string
@@ -329,6 +337,7 @@ interface FormState {
   // UI 排版自定义（纯前端 localStorage，纳入统一保存流程：切换改 form，保存时才落地）
   poolSort: PoolSortMode
   poolShowDisabled: boolean
+  showPerfDashboard: boolean
   cardSize: CardSize
   // 全局模型映射（JSON 文本，双口径用量的 requested→upstream；空对象 = 不映射）
   modelMapping: string
@@ -354,6 +363,11 @@ type UpdateWithCache = UpdateConfigRequest & {
 // 后端 `default_prompt_cache_enabled()`（`src/model/config.rs:885`）返回 true，
 // 字段缺失时按 true 兜底，避免面板把"未下发"显示成"已关闭"。
 const PROMPT_CACHE_DEFAULT = true
+
+// 模拟缓存默认值（与后端 `default_mock_cache_*()` 对齐）：开关关、比例 0.7。
+// 字段缺失时按此兜底，避免面板把"未下发"显示成"已关闭/0%"。
+const MOCK_CACHE_ENABLED_DEFAULT = false
+const MOCK_CACHE_RATIO_DEFAULT = 0.7
 
 // 多行文本 <-> 字符串列表（去空白、去空行）
 function linesToList(s: string): string[] {
@@ -410,6 +424,9 @@ function toForm(c: ConfigSnapshotResponse, ui: UiLayoutPrefs): FormState {
     cliCodewhispererOptoutFalse: c.cliCodewhispererOptoutFalse ?? false,
     cliUaAlignRealClient: c.cliUaAlignRealClient ?? false,
     promptCacheEnabled: (c as ConfigWithCache).promptCacheEnabled ?? PROMPT_CACHE_DEFAULT,
+    // 模拟缓存：比例 f64(0..1) → 整数百分比（70% 等），保存时反向换算
+    mockCacheEnabled: c.mockCacheEnabled ?? MOCK_CACHE_ENABLED_DEFAULT,
+    mockCacheReadRatioPct: String(Math.round((c.mockCacheReadRatio ?? MOCK_CACHE_RATIO_DEFAULT) * 100)),
     selfHealBaseBackoffSecs: String(c.selfHealBaseBackoffSecs ?? 60),
     selfHealMaxBackoffSecs: String(c.selfHealMaxBackoffSecs ?? 900),
     selfHealMaxShift: String(c.selfHealMaxShift ?? 4),
@@ -432,7 +449,8 @@ function toForm(c: ConfigSnapshotResponse, ui: UiLayoutPrefs): FormState {
     rpmHardGateOverloadWait: c.rpmHardGateOverloadWait ?? false,
     cooldownScalePct: String(c.cooldownScalePct ?? 100),
     rateLimitJitterPct: String(c.rateLimitJitterPct ?? 20),
-    throttleProfile: c.throttleProfile ?? 'manual',
+    // 旧后端不下发 schedulingMode → 按 smart 兜底（与后端 serde 默认一致）
+    schedulingMode: c.schedulingMode ?? 'smart',
     inboundThrottleEnabled: c.inboundThrottleEnabled ?? true,
     inboundRpmAuto: c.inboundRpmAuto ?? true,
     inboundTargetRpm: String(c.inboundTargetRpm ?? 100),
@@ -467,6 +485,7 @@ function toForm(c: ConfigSnapshotResponse, ui: UiLayoutPrefs): FormState {
     // UI 排版偏好（纯前端 localStorage，作为 form 基线纳入统一保存）
     poolSort: ui.poolSort,
     poolShowDisabled: ui.poolShowDisabled,
+    showPerfDashboard: ui.showPerfDashboard,
     cardSize: ui.cardSize,
     // 全局模型映射：对象序列化成 JSON 文本（空对象 = 不映射）。非法 JSON 后端会拒绝保存。
     modelMapping: JSON.stringify(c.modelMapping ?? {}, null, 2),
@@ -480,17 +499,20 @@ function rowMatches(query: string, label: string, hint?: string): boolean {
 }
 
 // 一行可编辑/只读项布局。搜索态下若本项不命中则隐藏，命中则高亮 label。
+// a11y：外层用 <label> 而非 <div>——行内控件（Switch/Input/textarea/select 等）以
+// 隐式关联获得可访问名称（无 htmlFor 时 label 关联其第一个可标注后代），消除
+// 「表单字段缺 label 关联」的 console 告警。布局类名不变，视觉零改动。
 function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
   const { query } = useContext(SearchContext)
   if (!rowMatches(query, label, hint)) return null
   return (
-    <div className="flex items-start justify-between gap-4 py-3 border-b last:border-0">
+    <label className="flex items-start justify-between gap-4 py-3 border-b last:border-0">
       <div className="min-w-0 flex-1">
         <div className="text-sm"><Highlight text={label} /></div>
         {hint && <div className="text-xs text-muted-foreground mt-0.5 leading-relaxed">{hint}</div>}
       </div>
       <div className="shrink-0 flex justify-end pt-0.5">{children}</div>
-    </div>
+    </label>
   )
 }
 
@@ -848,7 +870,7 @@ function StoragePartitionRow({
     <div className="flex items-center justify-between gap-4 border-b border-border/40 py-3 last:border-0">
       <div className="min-w-0">
         <div className="flex items-center gap-2 text-sm">
-          <span className="truncate">{p.label}</span>
+          <span className="truncate">{storagePartitionLabel(p.key, p.label)}</span>
           {p.inMemory && (
             <Badge variant="outline" className="text-[10px]">
               {t('settingspage.storage.inMemory')}
@@ -990,7 +1012,7 @@ function StorageStatsCard() {
       <ConfirmDialog
         open={target !== null}
         onOpenChange={(v) => !v && setTarget(null)}
-        title={t('settingspage.storage.confirmTitle', { label: target?.label ?? '' })}
+        title={t('settingspage.storage.confirmTitle', { label: target ? storagePartitionLabel(target.key, target.label) : '' })}
         description={
           <span>
             {t('settingspage.storage.confirmDescBase')}
@@ -1011,12 +1033,14 @@ function StorageStatsCard() {
             <span className="text-sm">{t('settingspage.storage.keepDays')}</span>
             <div className="flex items-center gap-2">
               <Input
+                id="storage-keep-days"
                 className="w-24 text-right"
                 type="number"
                 min={0}
                 value={keepDays}
                 onChange={(e) => setKeepDays(e.target.value)}
                 placeholder={t('settingspage.common.default')}
+                aria-label={t('settingspage.storage.keepDays')}
               />
               <span className="text-xs text-muted-foreground">{t('settingspage.common.days')}</span>
             </div>
@@ -1540,11 +1564,13 @@ function TrashCard() {
       toast.success(t('settingspage.trash.toast.restored', { id: item.id }))
       invalidate()
     } catch (err) {
-      const msg = extractErrorMessage(err)
+      const parsed = parseError(err)
+      const msg = parsed.title
       // 多开分身与主凭据**必然同 key**，默认路径会被 key 去重挡住。
       // 这里自动重试一次强制恢复：恢复后仍是禁用态，不会跳过运维确认直接投入调度，
       // 故这个自动重试是安全的。仍失败才把错误抛给用户。
-      if (msg.includes('重复')) {
+      // 判据走后端稳定 error.type（duplicate_credential），与「重复」字样的中文文案脱钩。
+      if (parsed.type === 'duplicate_credential') {
         try {
           await restoreCredential(item.id, true)
           toast.success(t('settingspage.trash.toast.restoredForced', { id: item.id }))
@@ -1680,6 +1706,7 @@ function TrashCard() {
               <div className="relative w-full max-w-xs">
                 <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
                 <Input
+                  id="trash-search"
                   value={trashSearch}
                   onChange={(e) => {
                     setTrashSearch(e.target.value)
@@ -1691,8 +1718,9 @@ function TrashCard() {
                 />
               </div>
               <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                <span>{t('settingspage.trash.perPage')}</span>
+                <label htmlFor="trash-page-size">{t('settingspage.trash.perPage')}</label>
                 <select
+                  id="trash-page-size"
                   value={pageSize}
                   onChange={(e) => {
                     const n = Number(e.target.value)
@@ -1785,6 +1813,35 @@ function TrashCard() {
   )
 }
 
+/* ============ 错误提示词：入口卡（点击打开独立配置弹窗） ============ */
+
+// 高级设置区的「错误提示词」入口卡。弹窗本体是独立组件 ErrorMessagesDialog
+// （参照 ops-detail-dialogs 的 TraceDetailDialog 页面化模式），入口卡只管开关。
+function ErrorMessagesEntryCard() {
+  const { t } = useTranslation()
+  const [open, setOpen] = useState(false)
+  return (
+    <>
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="text-base"><Highlight text={t('settingspage.card.errorMessages')} /></CardTitle>
+          <p className="text-xs text-muted-foreground">{t('settingspage.errorMessages.cardSubtitle')}</p>
+        </CardHeader>
+        <CardContent className="py-0">
+          <div className="flex items-center justify-between gap-3 py-3">
+            <span className="text-sm text-muted-foreground">{t('settingspage.errorMessages.entryHint')}</span>
+            <Button variant="outline" size="sm" onClick={() => setOpen(true)}>
+              <MessageSquareWarning className="mr-1.5 h-4 w-4" />
+              {t('settingspage.errorMessages.open')}
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+      <ErrorMessagesDialog open={open} onOpenChange={(v) => !v && setOpen(false)} />
+    </>
+  )
+}
+
 export function SettingsPage() {
   const { t, i18n } = useTranslation()
   const { data: config, isLoading, error, refetch } = useConfigSnapshot()
@@ -1805,6 +1862,10 @@ export function SettingsPage() {
   }, [credentialsForHints])
 
   const [form, setForm] = useState<FormState | null>(null)
+
+  // 调度模式（三按钮）切换确认：切智能/稳定会覆盖高级参数手动值 + 写 cooldownEnabled=true，
+  // 必须让用户知情确认（方案 docs/scheduling-config-simplify.md §3.2）。
+  const [modeConfirm, setModeConfirm] = useState<SchedulingMode | null>(null)
 
   // 分区导航当前 tab + 搜索关键词（纯前端）。
   const [activeSection, setActiveSection] = useState<SectionId>('basic')
@@ -1889,6 +1950,22 @@ export function SettingsPage() {
     if (form.cliUaAlignRealClient !== (config.cliUaAlignRealClient ?? false)) d.cliUaAlignRealClient = form.cliUaAlignRealClient
     if (form.promptCacheEnabled !== ((config as ConfigWithCache).promptCacheEnabled ?? PROMPT_CACHE_DEFAULT))
       d.promptCacheEnabled = form.promptCacheEnabled
+    // 模拟缓存：布尔直比；比例先取整到百分比再与基线比较，避免 f64 精度差误报 diff。
+    // 空串显式跳过：Number('') 为 0，直接提交会把「输入框清空（NumberStepper 中间态）」
+    // 静默写成 0%——空串不进 diff，字段保持原值，只靠 NumberStepper 的 commit 兜底不够。
+    if (form.mockCacheEnabled !== (config.mockCacheEnabled ?? MOCK_CACHE_ENABLED_DEFAULT))
+      d.mockCacheEnabled = form.mockCacheEnabled
+    const mockRatioRaw = form.mockCacheReadRatioPct.trim()
+    if (mockRatioRaw !== '') {
+      const mockPct = Math.round(Number(mockRatioRaw))
+      if (
+        Number.isFinite(mockPct) &&
+        mockPct >= 0 &&
+        mockPct <= 100 &&
+        mockPct !== Math.round((config.mockCacheReadRatio ?? MOCK_CACHE_RATIO_DEFAULT) * 100)
+      )
+        d.mockCacheReadRatio = mockPct / 100
+    }
     const nSelfHealBase = parseInt(form.selfHealBaseBackoffSecs, 10)
     if (Number.isFinite(nSelfHealBase) && nSelfHealBase !== (config.selfHealBaseBackoffSecs ?? 60)) d.selfHealBaseBackoffSecs = nSelfHealBase
     const nSelfHealMax = parseInt(form.selfHealMaxBackoffSecs, 10)
@@ -1929,7 +2006,9 @@ export function SettingsPage() {
     const nJitter = parseInt(form.rateLimitJitterPct, 10)
     if (Number.isFinite(nJitter) && nJitter !== (config.rateLimitJitterPct ?? 20)) d.rateLimitJitterPct = nJitter
     // 入站整形
-    if (form.throttleProfile !== (config.throttleProfile ?? 'manual')) d.throttleProfile = form.throttleProfile
+    // 调度模式：三按钮切档（后端收到后映射 ThrottleProfile + 写矩阵；throttleProfile
+    // 由后端同步，前端不再直接提交它）。
+    if (form.schedulingMode !== (config.schedulingMode ?? 'smart')) d.schedulingMode = form.schedulingMode
     if (form.inboundThrottleEnabled !== (config.inboundThrottleEnabled ?? true)) d.inboundThrottleEnabled = form.inboundThrottleEnabled
     if (form.inboundRpmAuto !== (config.inboundRpmAuto ?? true)) d.inboundRpmAuto = form.inboundRpmAuto
     const nTarget = parseInt(form.inboundTargetRpm, 10)
@@ -2012,6 +2091,7 @@ export function SettingsPage() {
   const uiPrefsDirty = !!form && (
     form.poolSort !== uiPrefs.poolSort ||
     form.poolShowDisabled !== uiPrefs.poolShowDisabled ||
+    form.showPerfDashboard !== uiPrefs.showPerfDashboard ||
     form.cardSize !== uiPrefs.cardSize
   )
 
@@ -2046,6 +2126,7 @@ export function SettingsPage() {
       setUiPrefs({
         poolSort: form.poolSort,
         poolShowDisabled: form.poolShowDisabled,
+        showPerfDashboard: form.showPerfDashboard,
         cardSize: form.cardSize,
       })
     }
@@ -2131,6 +2212,7 @@ export function SettingsPage() {
           <div className="relative">
             <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
             <Input
+              id="settings-search"
               className="w-56 pl-8 pr-8"
               value={searchRaw}
               onChange={(e) => setSearchRaw(e.target.value)}
@@ -2161,7 +2243,7 @@ export function SettingsPage() {
             }}
           >
             <HelpCircle className="mr-1.5 h-4 w-4" />
-            帮助
+            {t('settingspage.help.open')}
           </Button>
         </div>
       </div>
@@ -2206,12 +2288,12 @@ export function SettingsPage() {
         {/* i18n: settingspage.service.otaAutoCheck.label/.hint（主会话补三语） */}
         <Card>
           <CardHeader className="pb-2">
-            <CardTitle className="text-base"><Highlight text="OTA 自动检查" /></CardTitle>
+            <CardTitle className="text-base"><Highlight text={t('settingspage.service.otaAutoCheck.title')} /></CardTitle>
           </CardHeader>
           <CardContent className="py-0">
             <Field
-              label="自动检查 GitHub 新版本"
-              hint="定期自动检查新版本，发现后由服务管理卡提示升级（内存态，重启回默认）。"
+              label={t('settingspage.service.otaAutoCheck.label')}
+              hint={t('settingspage.service.otaAutoCheck.hint')}
             >
               <Switch
                 checked={form.otaAutoCheck}
@@ -2253,6 +2335,12 @@ export function SettingsPage() {
           <Switch
             checked={form.poolShowDisabled}
             onCheckedChange={(v) => set('poolShowDisabled', v)}
+          />
+        </Field>
+        <Field label={t('settingspage.appearance.perfDashboard.label')} hint={t('settingspage.appearance.perfDashboard.hint')}>
+          <Switch
+            checked={form.showPerfDashboard}
+            onCheckedChange={(v) => set('showPerfDashboard', v)}
           />
         </Field>
         <Field label={t('settingspage.appearance.cardSize.label')} hint={t('settingspage.appearance.cardSize.hint')}>
@@ -2333,6 +2421,54 @@ export function SettingsPage() {
           <p className="mb-3 mt-1 text-sm text-muted-foreground">
             {t('settingspage.smart.desc')}
           </p>
+          {/* 调度模式（三按钮，2026-08-16）：智能 / 稳定 / 手动。切档写预设矩阵（后端
+              apply_throttle_profile_for_explicit_switch），会覆盖高级参数里未显式配置的值；
+              切智能/稳定前确认提示（文案含 cooldownEnabled 语义陷阱说明）。 */}
+          <Field
+            label={t('settingspage.schedulingMode.title')}
+            hint={t('settingspage.schedulingMode.desc')}
+          >
+            <div className="flex gap-2">
+              <Button
+                variant={form.schedulingMode === 'smart' ? 'default' : 'outline'}
+                size="sm"
+                onClick={() => {
+                  if (form.schedulingMode === 'smart') return
+                  setModeConfirm('smart')
+                }}
+              >
+                {t('settingspage.schedulingMode.smart')}
+              </Button>
+              <Button
+                variant={form.schedulingMode === 'stable' ? 'default' : 'outline'}
+                size="sm"
+                onClick={() => {
+                  if (form.schedulingMode === 'stable') return
+                  setModeConfirm('stable')
+                }}
+              >
+                {t('settingspage.schedulingMode.stable')}
+              </Button>
+              <Button
+                variant={form.schedulingMode === 'manual' ? 'default' : 'outline'}
+                size="sm"
+                onClick={() => set('schedulingMode', 'manual')}
+              >
+                {t('settingspage.schedulingMode.manual')}
+              </Button>
+            </div>
+          </Field>
+          {form.schedulingMode !== 'manual' && (
+            <p className="text-xs text-muted-foreground -mt-2 mb-2">
+              {t(`settingspage.schedulingMode.${form.schedulingMode}Hint`)}
+            </p>
+          )}
+          {/* 手动档：下方所有高级参数（齿轮卡）全部可调，无任何预设覆盖 */}
+          {form.schedulingMode === 'manual' && (
+            <p className="text-xs text-muted-foreground -mt-2 mb-2">
+              {t('settingspage.schedulingMode.manualHint')}
+            </p>
+          )}
           <Field
             label={t('settingspage.smart.balanceWeight.label')}
             hint={t('settingspage.smart.balanceWeight.hint')}
@@ -2445,28 +2581,8 @@ export function SettingsPage() {
                 description={t('settingspage.smart.gear.inboundDesc')}
               >
                 <SearchContext.Provider value={{ query: '' }}>
-                  {/* 档位放在整形区最上方：它是这一段的总纲，先选档再看细项。
-                      档位只填未手动配过的项，已配置的值不会被覆盖（后端 apply_throttle_profile）。 */}
-                  <Field
-                    label={t('settingspage.throttleProfile.title')}
-                    hint={t('settingspage.throttleProfile.desc')}
-                  >
-                    <select
-                      className="h-9 rounded-md border border-input bg-background px-3 text-sm"
-                      value={form.throttleProfile}
-                      onChange={(e) => set('throttleProfile', e.target.value as ThrottleProfile)}
-                      aria-label={t('settingspage.throttleProfile.title')}
-                    >
-                      <option value="manual">{t('settingspage.throttleProfile.manual')}</option>
-                      <option value="shielded">{t('settingspage.throttleProfile.shielded')}</option>
-                      <option value="direct">{t('settingspage.throttleProfile.direct')}</option>
-                    </select>
-                  </Field>
-                  {form.throttleProfile !== 'manual' && (
-                    <p className="text-xs text-muted-foreground -mt-2 mb-2">
-                      {t(`settingspage.throttleProfile.${form.throttleProfile}Hint`)}
-                    </p>
-                  )}
+                  {/* 档位已收敛为上方「调度模式」三按钮（2026-08-16），细项旋钮全部归
+                      高级参数：在智能/稳定档下切档写预设矩阵，手动档下这些旋钮完全归用户。 */}
                   <Field label={t('settingspage.smart.inboundEnabled.label')} hint={t('settingspage.smart.inboundEnabled.hint')}>
                     <Switch checked={form.inboundThrottleEnabled} onCheckedChange={(v) => set('inboundThrottleEnabled', v)} />
                   </Field>
@@ -2524,6 +2640,23 @@ export function SettingsPage() {
       </Card>
       </SectionGate>
 
+      {/* 调度模式切换确认：切智能/稳定档会写入预设矩阵（覆盖高级参数未显式配置的值），
+          且 cooldownEnabled 会写成 true（线上 false 是语义陷阱，智能档刻意修正）。
+          manual 档不覆盖任何值，无需确认。 */}
+      <ConfirmDialog
+        open={modeConfirm !== null}
+        onOpenChange={(v) => {
+          if (!v) setModeConfirm(null)
+        }}
+        title={t('settingspage.schedulingMode.confirmTitle')}
+        description={t('settingspage.schedulingMode.confirmDesc')}
+        confirmLabel={t('settingspage.schedulingMode.confirmApply')}
+        onConfirm={() => {
+          if (modeConfirm) set('schedulingMode', modeConfirm)
+          setModeConfirm(null)
+        }}
+      />
+
       {/* 基础分区：服务信息（需重启） */}
       <SectionGate section="basic" titleKey="settingspage.card.serviceInfo" kwKey="settingspage.card.serviceInfo.kw">
       <Card>
@@ -2532,7 +2665,7 @@ export function SettingsPage() {
         </CardHeader>
         <CardContent className="py-0">
           <Field label={t('settingspage.basic.host.label')} hint={restart}>
-            <Input className={inputCls} value={form.host} onChange={(e) => set('host', e.target.value)} />
+            <Input id="settings-host" className={inputCls} value={form.host} onChange={(e) => set('host', e.target.value)} />
           </Field>
           <Field label={t('settingspage.basic.port.label')} hint={restart}>
             <NumberStepper value={Number(form.port) || 0} onChange={(v) => set('port', String(v))} min={1} max={65535} className="w-28" aria-label={t('settingspage.basic.port.aria')} />
@@ -2546,7 +2679,7 @@ export function SettingsPage() {
               native-tls 已废弃（曾误导用户切换后废网关）。仅作只读展示，不再可切换。 */}
           <ReadonlyRow label={t('settingspage.basic.tlsBackend')} value={t('settingspage.basic.tlsBackendValue')} />
           <Field label={t('settingspage.basic.defaultEndpoint.label')} hint={t('settingspage.basic.defaultEndpoint.hint', { names: config.endpointNames.join(', ') || emDash })}>
-            <Input className={inputCls} value={form.defaultEndpoint} onChange={(e) => set('defaultEndpoint', e.target.value)} />
+            <Input id="settings-default-endpoint" className={inputCls} value={form.defaultEndpoint} onChange={(e) => set('defaultEndpoint', e.target.value)} />
           </Field>
           {config.configPath && <ReadonlyRow label={t('settingspage.basic.configPath')} value={config.configPath} mono />}
         </CardContent>
@@ -2796,6 +2929,26 @@ export function SettingsPage() {
             <NumberStepper value={Number(form.selfHealMaxShift) || 4} onChange={(v) => set('selfHealMaxShift', String(v))} min={0} max={31} step={1} className="w-28" aria-label={t('settingspage.advanced.selfHeal.shift.label')} />
           </Field>
           <ReadonlyRow label={t('settingspage.advanced.cache.ttl.label')} value={t('settingspage.advanced.cache.ttl.value')} />
+          {/* 模拟缓存：透传池注入伪造 cache_read。仅对透传路径生效，与上方 prompt 缓存记账互不影响。 */}
+          <GroupHeading label={t('settingspage.advanced.cache.mockGroup')} />
+          <Field label={t('settingspage.advanced.cache.mock.enabled.label')} hint={t('settingspage.advanced.cache.mock.enabled.hint')}>
+            <Switch checked={form.mockCacheEnabled} onCheckedChange={(v) => set('mockCacheEnabled', v)} />
+          </Field>
+          <Field label={t('settingspage.advanced.cache.mock.ratio.label')} hint={t('settingspage.advanced.cache.mock.ratio.hint')}>
+            <div className="flex items-center gap-2">
+              <NumberStepper
+                value={Number(form.mockCacheReadRatioPct) || 0}
+                onChange={(v) => set('mockCacheReadRatioPct', String(v))}
+                min={0}
+                max={100}
+                step={5}
+                className="w-24"
+                disabled={!form.mockCacheEnabled}
+                aria-label={t('settingspage.advanced.cache.mock.ratio.label')}
+              />
+              <span className="text-xs text-muted-foreground">%</span>
+            </div>
+          </Field>
         </CardContent>
       </Card>
       </SectionGate>
@@ -2817,6 +2970,7 @@ export function SettingsPage() {
             hint={t('settingspage.advanced.modelMapping.editorHint')}
           >
             <textarea
+              id="model-mapping-editor"
               className="flex min-h-[140px] w-full max-w-[360px] rounded-md border border-input bg-background px-3 py-2 font-mono text-xs ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               value={form.modelMapping}
               onChange={(e) => set('modelMapping', e.target.value)}
@@ -2834,6 +2988,11 @@ export function SettingsPage() {
           </Field>
         </CardContent>
       </Card>
+      </SectionGate>
+
+      {/* 高级选项：错误提示词配置（错误码/提示文案可配置化，点击打开独立弹窗） */}
+      <SectionGate section="advanced" titleKey="settingspage.card.errorMessages" kwKey="settingspage.card.errorMessages.kw">
+        <ErrorMessagesEntryCard />
       </SectionGate>
       </AdvancedDisclosure>
       )}
@@ -2898,8 +3057,8 @@ export function SettingsPage() {
               只能经 PUT /config 改——默认开，温和余额刷新发现超额即自动禁用（误禁无逃生门，故补此开关）。 */}
           {/* i18n: settingspage.anti.autoDisableQuotaExceeded.label/.hint（主会话补三语） */}
           <Field
-            label="余额超额自动禁用整组"
-            hint={`温和余额刷新发现超额时自动禁用整组号池（内存态，重启回默认）。${hotParen}`}
+            label={t('settingspage.anti.autoDisableQuotaExceeded.label')}
+            hint={`${t('settingspage.anti.autoDisableQuotaExceeded.hint')}${hotParen}`}
           >
             <Switch
               checked={form.autoDisableQuotaExceeded}
@@ -2909,8 +3068,8 @@ export function SettingsPage() {
           {/* 内存态开关：socks 代理池自动健康探测。每 5 分钟探测一次，连续 3 次失败自动禁用该代理。 */}
           {/* i18n: settingspage.anti.socksAutoHealth.label/.hint（主会话补三语） */}
           <Field
-            label="socks 代理池自动健康探测"
-            hint={`每 5 分钟探测可用性，连续 3 次失败自动禁用该代理（内存态，重启回默认）。${hotParen}`}
+            label={t('settingspage.anti.socksAutoHealth.label')}
+            hint={`${t('settingspage.anti.socksAutoHealth.hint')}${hotParen}`}
           >
             <Switch
               checked={form.socksAutoHealth}
@@ -2976,21 +3135,21 @@ export function SettingsPage() {
         <CardContent className="py-0">
           <Field label={t('settingspage.network.proxy.label')} hint={t('settingspage.network.proxy.hint')}>
             <div className="flex items-center gap-2">
-              <Input className="max-w-[260px] font-mono text-xs" value={form.proxyUrl} onChange={(e) => set('proxyUrl', e.target.value)} placeholder={t('settingspage.network.proxy.ph')} />
+              <Input id="settings-proxy-url" className="max-w-[260px] font-mono text-xs" value={form.proxyUrl} onChange={(e) => set('proxyUrl', e.target.value)} placeholder={t('settingspage.network.proxy.ph')} />
               <ProxyTestButton proxyUrl={form.proxyUrl} proxyUsername={form.proxyUsername} proxyPassword={form.proxyPassword} />
             </div>
           </Field>
           <Field label={t('settingspage.network.proxyUser.label')} hint={t('settingspage.network.proxyUser.hint')}>
-            <Input className="max-w-[260px] font-mono text-xs" value={form.proxyUsername} onChange={(e) => set('proxyUsername', e.target.value)} placeholder={t('settingspage.network.proxyUser.ph')} autoComplete="off" />
+            <Input id="settings-proxy-username" className="max-w-[260px] font-mono text-xs" value={form.proxyUsername} onChange={(e) => set('proxyUsername', e.target.value)} placeholder={t('settingspage.network.proxyUser.ph')} autoComplete="off" />
           </Field>
           <Field label={t('settingspage.network.proxyPass.label')} hint={t('settingspage.network.proxyPass.hint')}>
-            <Input type="password" className="max-w-[260px] font-mono text-xs" value={form.proxyPassword} onChange={(e) => set('proxyPassword', e.target.value)} placeholder={t('settingspage.network.proxyPass.ph')} autoComplete="new-password" />
+            <Input id="settings-proxy-password" type="password" className="max-w-[260px] font-mono text-xs" value={form.proxyPassword} onChange={(e) => set('proxyPassword', e.target.value)} placeholder={t('settingspage.network.proxyPass.ph')} autoComplete="new-password" />
           </Field>
           <Field
             label={t('settingspage.network.callback.label')}
             hint={t('settingspage.network.callback.hint')}
           >
-            <Input className="max-w-[260px] font-mono text-xs" value={form.callbackBaseUrl} onChange={(e) => set('callbackBaseUrl', e.target.value)} placeholder="http://host:port" />
+            <Input id="settings-callback-base-url" className="max-w-[260px] font-mono text-xs" value={form.callbackBaseUrl} onChange={(e) => set('callbackBaseUrl', e.target.value)} placeholder="http://host:port" />
           </Field>
           <ReadonlyRow
             label={t('settingspage.network.callbackMode')}
@@ -3007,6 +3166,7 @@ export function SettingsPage() {
           >
             <div className="flex items-center gap-2">
               <Input
+                id="settings-api-key"
                 type="password"
                 className="flex-1 min-w-0 max-w-[260px] font-mono text-xs"
                 value={form.apiKey}
@@ -3085,6 +3245,7 @@ export function SettingsPage() {
             hint={t('settingspage.security.cors.hint')}
           >
             <textarea
+              id="cors-allowed-origins"
               className="flex min-h-[72px] w-full max-w-[260px] rounded-md border border-input bg-background px-3 py-2 font-mono text-xs ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               value={form.corsAllowedOrigins}
               onChange={(e) => set('corsAllowedOrigins', e.target.value)}
@@ -3097,6 +3258,7 @@ export function SettingsPage() {
             hint={t('settingspage.security.ip.hint')}
           >
             <textarea
+              id="ip-allowlist"
               className="flex min-h-[72px] w-full max-w-[260px] rounded-md border border-input bg-background px-3 py-2 font-mono text-xs ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               value={form.ipAllowlist}
               onChange={(e) => set('ipAllowlist', e.target.value)}
@@ -3109,6 +3271,7 @@ export function SettingsPage() {
             hint={t('settingspage.security.ipBlock.hint')}
           >
             <textarea
+              id="ip-blocklist"
               className="flex min-h-[72px] w-full max-w-[260px] rounded-md border border-input bg-background px-3 py-2 font-mono text-xs ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               value={form.ipBlocklist}
               onChange={(e) => set('ipBlocklist', e.target.value)}
@@ -3121,6 +3284,7 @@ export function SettingsPage() {
             hint={t('settingspage.security.mcBlock.hint')}
           >
             <textarea
+              id="machine-code-blocklist"
               className="flex min-h-[72px] w-full max-w-[260px] rounded-md border border-input bg-background px-3 py-2 font-mono text-xs ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               value={form.machineCodeBlocklist}
               onChange={(e) => set('machineCodeBlocklist', e.target.value)}

@@ -1,5 +1,6 @@
 import * as React from 'react'
 import { Check, ChevronsUpDown, Search, History, Trash2 } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 import { cn } from '@/lib/utils'
 import { AWS_REGIONS, filterRegions, getRecentRegions, pushRecentRegion, clearRecentRegions, regionLabel, isRegionCodeShape } from '@/lib/regions'
 
@@ -29,16 +30,20 @@ export function RegionSelect({
   onChange,
   className,
   triggerClassName,
-  placeholder = '选择或输入区域',
+  placeholder,
   disabled = false,
   recordRecent = true,
 }: RegionSelectProps) {
+  const { t } = useTranslation()
+  const placeholderText = placeholder ?? t('regionselect.placeholder')
   const [open, setOpen] = React.useState(false)
   const [query, setQuery] = React.useState('')
   const [highlight, setHighlight] = React.useState(0)
   const [recent, setRecent] = React.useState<string[]>([])
   const rootRef = React.useRef<HTMLDivElement>(null)
   const inputRef = React.useRef<HTMLInputElement>(null)
+  // a11y：下拉搜索框需要 id（DevTools「form field 缺 id/name」告警），useId 保证实例间唯一。
+  const searchId = React.useId()
 
   const results = React.useMemo(() => filterRegions(query), [query])
   const selected = React.useMemo(
@@ -131,11 +136,11 @@ export function RegionSelect({
         <span className={cn('truncate text-left', !value && 'text-muted-foreground')}>
           {selected ? (
             <>
-              <span>{selected.label}</span>
+              <span>{regionLabel(selected.code)}</span>
               <span className="ml-1.5 font-mono text-xs text-muted-foreground">{selected.code}</span>
             </>
           ) : (
-            value || placeholder
+            value || placeholderText
           )}
         </span>
         <ChevronsUpDown className="h-4 w-4 shrink-0 text-muted-foreground" />
@@ -152,12 +157,14 @@ export function RegionSelect({
           <div className="flex items-center gap-2 border-b border-border px-3">
             <Search className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
             <input
+              id={searchId}
               ref={inputRef}
               value={query}
               onChange={(e) => {
                 setQuery(e.target.value)
                 setHighlight(0)
               }}
+              aria-label={t('regionselect.searchAria')}
               onKeyDown={(e) => {
                 if (e.key === 'ArrowDown') {
                   e.preventDefault()
@@ -173,7 +180,7 @@ export function RegionSelect({
                   setOpen(false)
                 }
               }}
-              placeholder="搜索：us / tokyo / 东京 / 弗吉尼亚"
+              placeholder={t('regionselect.searchPlaceholder')}
               className="h-9 w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
             />
           </div>
@@ -184,7 +191,7 @@ export function RegionSelect({
               <div className="flex items-center justify-between px-3 py-1">
                 <span className="flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground">
                   <History className="h-3 w-3" />
-                  最近使用
+                  {t('regionselect.recent')}
                 </span>
                 {/* 清理钮：清空全局「最近使用」历史并即时收起分组。阻止冒泡，不触发下拉选中/关闭。 */}
                 <button
@@ -196,8 +203,8 @@ export function RegionSelect({
                     setRecent([])
                   }}
                   className="flex items-center rounded p-0.5 text-muted-foreground transition-colors duration-150 hover:text-foreground"
-                  title="清空最近使用历史"
-                  aria-label="清空最近使用历史"
+                  title={t('regionselect.clearRecentTitle')}
+                  aria-label={t('regionselect.clearRecentAria')}
                 >
                   <Trash2 className="h-3 w-3" />
                 </button>
@@ -220,7 +227,7 @@ export function RegionSelect({
           <div className="max-h-[240px] overflow-y-auto py-1">
             {results.length === 0 ? (
               <div className="px-3 py-2.5 text-xs text-muted-foreground">
-                无匹配区域，回车可直接使用
+                {t('regionselect.noMatch')}
                 <span className="ml-1 font-mono text-foreground">{query.trim()}</span>
               </div>
             ) : (

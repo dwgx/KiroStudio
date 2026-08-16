@@ -227,12 +227,12 @@ pub async fn usage_recent(
     match db.recent(limit) {
         Ok(records) => Json(records).into_response(),
         Err(e) => {
+            // ⚠️ 内部错误细节只进服务端日志，绝不下发客户端（MINOR-5：500 响应体
+            // 暴露 SQLite/内部路径会给攻击者情报，且对前端排障无益）。
             tracing::warn!("查询用量明细失败: {:#}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(AdminErrorResponse::internal_error(format!(
-                    "查询用量明细失败: {e}"
-                ))),
+                Json(AdminErrorResponse::internal_error("查询用量明细失败，请稍后重试")),
             )
                 .into_response()
         }
@@ -325,12 +325,11 @@ pub async fn traces_search(
     let total = match db.count_filtered(&filter) {
         Ok(n) => n,
         Err(e) => {
+            // ⚠️ 内部错误细节只进服务端日志（MINOR-5），见 usage_recent 同款注释。
             tracing::warn!("统计 trace 明细失败: {:#}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(AdminErrorResponse::internal_error(format!(
-                    "统计 trace 明细失败: {e}"
-                ))),
+                Json(AdminErrorResponse::internal_error("统计 trace 明细失败，请稍后重试")),
             )
                 .into_response();
         }
@@ -342,9 +341,7 @@ pub async fn traces_search(
             tracing::warn!("查询 trace 明细失败: {:#}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(AdminErrorResponse::internal_error(format!(
-                    "查询 trace 明细失败: {e}"
-                ))),
+                Json(AdminErrorResponse::internal_error("查询 trace 明细失败，请稍后重试")),
             )
                 .into_response()
         }
@@ -615,6 +612,43 @@ mod tests {
             MAX_RECENT_LIMIT <= 5_000,
             "MAX_RECENT_LIMIT={MAX_RECENT_LIMIT} 过大：单次查询持锁会顶住用量写入管道并丢记录。\
              需要更大范围请走 traces_search 的分页/过滤，不要一次性拉全量"
+        );
+    }
+
+    /// ⭐ 源码守卫（MINOR-5）：500 响应体不得携带内部错误细节。
+    ///
+    /// 三处 500 收口（usage_recent / traces_search 的 count 与 search）都把内部错误
+    /// 细节（SQLite 错误、路径等）写进了响应体 —— 那是给攻击者的情报，且对前端
+    /// 排障无益。修复后 `{e}` 只进 `tracing::warn!`，响应体是通用文案。
+    ///
+    /// 回退即 FAIL：任一处把响应体改回 `internal_error(format!("...: {e}"))` ——
+    /// `internal_error(format!(` 计数从 0 变 1，本条红。
+    #[test]
+    fn internal_error_bodies_must_not_carry_error_details() {
+        let src = include_str!("usage_handlers.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        // 响应体不再用 format! 拼错误详情（{e} 只属于 tracing::warn! 那侧）。
+        let formatted = format!("internal_error(format{}", "!(");
+        assert_eq!(
+            prod.matches(formatted.as_str()).count(),
+            0,
+            "500 响应体不得用 format! 拼内部错误细节（{{e}} 只留在 tracing::warn! 侧）——\
+             泄漏 SQLite/内部路径等于给攻击者情报"
+        );
+        // 通用文案必须存在（三处收口各一条）。
+        for msg in ["查询用量明细失败，请稍后重试", "统计 trace 明细失败，请稍后重试"] {
+            assert!(
+                prod.contains(msg),
+                "500 响应体必须是通用文案（缺: {msg}）"
+            );
+        }
+        // 日志侧仍必须保留完整错误（{:#} 或 {e} 至少一处）—— 修文案不能把排障信息也删了。
+        assert!(
+            prod.contains("tracing::warn!(\"查询用量明细失败: {:#}\", e)")
+                || prod.contains("tracing::warn!(\"统计 trace 明细失败: {:#}\", e)")
+                || prod.contains("tracing::warn!(\"查询 trace 明细失败: {:#}\", e)"),
+            "tracing::warn! 必须保留完整错误（响应体去细节 ≠ 日志去细节）"
         );
     }
 

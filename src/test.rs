@@ -48,7 +48,7 @@ pub(crate) async fn call_stream_api() -> anyhow::Result<()> {
 
     // 调用流式 API（测试工具:不测 1M,传 false）
     let (response, _meta) = provider
-        .call_api_stream(&request_body, false, &Default::default())
+        .call_api_stream(&request_body, false, &Default::default(), None)
         .await?;
 
     // 获取字节流

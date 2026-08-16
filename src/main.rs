@@ -215,22 +215,98 @@ fn bootstrap_config_if_missing(config_path: &str) -> (String, bool) {
     (resolved_str, true)
 }
 
+// ==================== B7 启动播种集中校验 ====================
+// 校验语义：断言「播种执行过」而非「值非空」——error_messages 空表合法、mock_cache
+// 默认关合法，用值无法区分「配置没设」与「setter 没被调」。handlers.rs 侧 17 个
+// 镜像由 setter 内部置位（unwired_mirrors 汇总）；本表覆盖 main 直接播种、setter
+// 在别的模块的 4 个镜像（converter/upstream_trace/token/admin_ui），播种点后显式置位。
+
+/// main 侧播种点位图：第 i 位 = [`MAIN_SEEDED_NAMES`][i] 对应镜像已播种。
+static MAIN_SEEDED_BITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// main 侧播种点名字表：新增 main 直接播种的镜像时必须在此登记（漏登记 mark 时 panic 暴露）。
+const MAIN_SEEDED_NAMES: [&str; 4] = [
+    "login_background_r18",
+    "upstream_trace",
+    "count_tokens",
+    "native_thinking_effort",
+];
+const _: () = assert!(MAIN_SEEDED_NAMES.len() <= 64);
+
+/// main 直播种点调用后登记（setter 在其他模块、无法在 setter 内部置位的镜像）。
+fn mark_main_seeded(name: &str) {
+    let Some(idx) = MAIN_SEEDED_NAMES.iter().position(|n| *n == name) else {
+        panic!("main 播种点 {name} 未登记进 MAIN_SEEDED_NAMES");
+    };
+    MAIN_SEEDED_BITS.fetch_or(1u64 << idx, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 依据播种位图计算缺失的 main 侧镜像名（纯函数，供 B7 告警联动测试）。
+fn main_mirrors_missing(bits: u64) -> Vec<&'static str> {
+    MAIN_SEEDED_NAMES
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| bits & (1u64 << i) == 0)
+        .map(|(_, n)| *n)
+        .collect()
+}
+
+/// B7 启动播种集中校验：必须在**全部播种点之后**、serve 之前调用。
+///
+/// 汇总 handlers 侧（setter 内部置位）+ main 侧（调用方置位）两路标记，缺失即
+/// warn 醒目告警——**只告警不阻塞**：配置静默不生效比启动失败好诊断，但必须一眼看见。
+///
+/// 边界（诚实披露）：token_manager 内部镜像（cooldown/rate_limit/affinity/rpm 等）
+/// 由 `MultiTokenManager::new` 无条件从 config 播种、失败即 exit(1)，天然保证执行过，
+/// 不在本校验范围（setter 在 token_manager.rs，不在本次改动权限内）。
+fn verify_runtime_mirrors_wired() {
+    let mut missing: Vec<&'static str> = crate::anthropic::handlers::unwired_mirrors();
+    let bits = MAIN_SEEDED_BITS.load(std::sync::atomic::Ordering::Relaxed);
+    missing.extend(main_mirrors_missing(bits));
+    if missing.is_empty() {
+        let total = crate::anthropic::handlers::mirror_wired_count() + MAIN_SEEDED_NAMES.len();
+        tracing::info!("启动播种自检通过：{} 个进程镜像全部接线", total);
+        return;
+    }
+    // F6/D3-2（scheduling-audit-research）：接线缺失只 warn 的话 webhook 无感知——
+    // 「面板改了没反应」要等运维翻日志才发现。直报 bump，reason 携带缺失清单摘要
+    // （详细逐条仍在下方日志）；冷却窗口内幂等，未配置 webhook 时零开销 no-op。
+    crate::common::alerting::bump_with_dynamic_reason(
+        "wiring_incomplete",
+        missing.join(", "),
+    );
+    for m in &missing {
+        tracing::warn!(
+            "【启动播种缺失】镜像 [{m}] 未被播种：相关配置将静默不生效（面板改了没反应），\
+             请检查 main.rs / handlers.rs 的启动接线（B7）"
+        );
+    }
+    tracing::warn!(
+        "【启动播种自检】{} 个镜像缺失，服务仍启动；修复前不要依赖这些配置项",
+        missing.len()
+    );
+}
+
 #[tokio::main]
 async fn main() {
     // 解析命令行参数
     let args = Args::parse();
 
-    // 初始化日志:fmt 层(终端/文件)+ 内存环形缓冲层(面板实时日志流/一键导出,见 common::log_buffer)。
-    // 两层共享同一 EnvFilter,故内存 ring 与终端看到的是同一批日志。
+    // 初始化日志。两层 filter 独立:
+    // - fmt 层(终端/文件):由 RUST_LOG 环境变量控制(默认 info)——生产 unit 写 RUST_LOG=warn,
+    //   终端保持精简不刷屏;
+    // - LogBufferLayer(面板实时日志流/一键导出,见 common::log_buffer):固定 INFO——
+    //   面板排障永远可见 info+ 进度(选号/转发/恢复),不随控制台 filter 一起被压掉。
     {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
-        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        use tracing_subscriber::Layer as _;
+        let console_filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        let panel_filter = tracing_subscriber::EnvFilter::new("info");
         tracing_subscriber::registry()
-            .with(filter)
-            .with(tracing_subscriber::fmt::layer())
-            .with(crate::common::log_buffer::LogBufferLayer)
+            .with(tracing_subscriber::fmt::layer().with_filter(console_filter))
+            .with(crate::common::log_buffer::LogBufferLayer.with_filter(panel_filter))
             .init();
     }
 
@@ -494,6 +570,7 @@ async fn main() {
     // 请求命中内存字节秒回，不再在登录页热路径实时打图源。关闭时不 spawn。
     // R18 开关先写入运行时镜像（默认 true），预取轮次按此取 r18 参数。
     admin_ui::set_login_background_r18(config.login_background_r18);
+    mark_main_seeded("login_background_r18");
     admin_ui::spawn_bg_prefetch(config.login_background_enabled);
 
     // Kiro IDE 版本伪装：后台每 12h 拉官方稳定版元数据，成功后 UA 版本段用拉到的
@@ -509,6 +586,19 @@ async fn main() {
     if config.ota_auto_check {
         admin::update::spawn_auto_check(config.ota_auto_check_interval_hours);
     }
+
+    // 上游 trace 埋点（P0-A 排障，kiro::upstream_trace）：默认关，关闭时只付一次
+    // 原子读（零分配零 IO）。开启后把「上游原始响应 + 网关分支判断」写进 JSONL，
+    // 用于回答日志答不了的四个问题（Retry-After 原值 / 两 region 响应差异 / 429 body
+    // 配额字段 / reasoningContentEvent 形状）。热更不生效：配置字段不进
+    // UpdateConfigRequest，改 config.json 后重启生效（与 trust_forwarded_header 同款
+    // 启动期一次性读取的范式，见 515-521 行）。
+    kiro::upstream_trace::sync_from_config(
+        config.upstream_trace_enabled,
+        &config.upstream_trace_path,
+        config.upstream_trace_max_bytes,
+    );
+    mark_main_seeded("upstream_trace");
 
     // 指纹采集开关：把配置写入热路径运行时镜像（默认 true）。关闭后不采集
     // 下游客户端 device/ip/os/browser。admin 改开关时会立即改写此镜像。
@@ -549,6 +639,7 @@ async fn main() {
         proxy: proxy_config,
         tls_backend: config.tls_backend,
     });
+    mark_main_seeded("count_tokens");
 
     // 文本化 invoke 重组 + stray 熔断两开关:启动播种进程级镜像(handlers 热路径读),admin 改后即时生效。
     anthropic::handlers::set_tool_reclaim_textified_invoke(config.tool_reclaim_textified_invoke);
@@ -565,6 +656,35 @@ async fn main() {
     // Kiro 原生 effort 开关：播种进 converter 的 TIER3 进程镜像（默认关 = 行为逐字节
     // 不变；开 = 白名单模型 + thinking 走 output_config.effort 原生通道而非 XML 标签）。
     anthropic::set_native_thinking_effort_enabled(config.native_thinking_effort_enabled);
+    mark_main_seeded("native_thinking_effort");
+
+    // 透传模拟缓存（mockCacheEnabled）：播种进 handlers 的 TIER3 进程镜像（默认关）。
+    // 开启后透传响应 usage 注入 cache_read = round(input × ratio) 的伪造值、creation 置 0，
+    // 仅供下游（sub2api 等）展示缓存分支；admin 改配置时热更即时改写同一镜像。
+    anthropic::handlers::set_mock_cache_config(
+        config.mock_cache_enabled,
+        config.mock_cache_read_ratio,
+    );
+
+    // stats_stale watchdog（2026-08-16 收尾接线，blockers 17e）：usage JSONL 数据
+    // 断更 10 分钟即告警（bump "stats_stale"）。report_if_stale 是幂等的（告警后复位）。
+    {
+        let tm2 = kiro_provider.token_manager().clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                crate::common::alerting::report_if_stale("usage_jsonl", 600);
+            }
+        });
+    }
+
+    // 错误码/提示词覆盖表：播种进 handlers 的进程镜像（默认空表 = 全部走内置默认，
+    // 零行为变化）。⚠️ 播种前校验：管理员手改 config.json 出错时告警 + 降级为空表
+    // （不阻塞启动但配置不生效）；admin 热更（update_config）与 reload_config 会改写
+    // 同一镜像，错误翻译处每请求读镜像快照（见 handlers::resolve_msg）。
+    anthropic::handlers::set_error_messages(sanitize_error_messages_table(
+        config.error_messages.clone(),
+    ));
 
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
@@ -678,6 +798,7 @@ async fn main() {
                 axum::Json(serde_json::json!({
                     "ok": true,
                     "version": env!("CARGO_PKG_VERSION"),
+                    "build_sha": env!("KIRO_BUILD_SHA"),
                     "config_loaded": true,
                     "pool_count": snapshot.total,
                     "sqlite_writable": sqlite_writable,
@@ -687,9 +808,18 @@ async fn main() {
     };
     let app = healthz_app.merge(app);
 
+    // B7 启动播种集中校验：所有播种点（含 create_router_with_provider 间接播种）之后、
+    // serve 之前。缺失只告警不阻塞——日志醒目列出未接线的镜像。
+    verify_runtime_mirrors_wired();
+
     // 启动服务器
     let addr = format!("{}:{}", config.host, config.port);
     tracing::info!("启动 Anthropic API 端点: {}", addr);
+    tracing::info!(
+        "build: {} (sha {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("KIRO_BUILD_SHA")
+    );
     // 只打印固定短前缀 + 长度指纹，不按比例暴露密钥（半个密钥会显著降低爆破熵）
     {
         let masked = if api_key.len() > 8 {
@@ -1060,6 +1190,23 @@ fn bind_listener(addr: &str) -> anyhow::Result<tokio::net::TcpListener> {
 static TRAY_QUIT_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// 启动播种前的错误码表校验（M1）：任一 key 非法 → 告警 + 降级为空表（全部走
+/// 内置默认，配置不生效但不阻塞启动）；合法表原样返回。
+///
+/// 管理员手改 config.json 出错时不阻断服务，但必须告警让用户知道配置没生效
+/// （admin 热更路径用同一校验，失败 400 回显——两条路径语义一致）。
+fn sanitize_error_messages_table(
+    table: std::collections::HashMap<String, model::error_messages::ErrorMessageOverride>,
+) -> std::collections::HashMap<String, model::error_messages::ErrorMessageOverride> {
+    if let Err(e) = admin::validate_error_messages(&table) {
+        tracing::warn!(
+            "errorMessages 配置校验失败，已降级为空表（全部走内置默认，配置未生效）: {e}"
+        );
+        return std::collections::HashMap::new();
+    }
+    table
+}
+
 /// 用量明细保留天数下限钳到 0。
 ///
 /// 负值会让 `trace_db::retention_cleanup` 的 cutoff 落到未来
@@ -1235,5 +1382,185 @@ mod shutdown_tests {
             matches!(out, DrainOutcome::Drained(Ok(()))),
             "无停机信号时宽限期不得起算，否则服务会在启动 {SHUTDOWN_DRAIN_CAP_SECS}s 后自杀"
         );
+    }
+}
+
+#[cfg(test)]
+mod error_messages_boot_tests {
+    use super::*;
+
+    /// M1：启动播种校验——非法表必须降级为空表（不阻塞启动但配置不生效）。
+    /// 用例① status 白名单外（不依赖默认表形态，最稳）；② 渲染值组合违例
+    /// （B1 同款 status-only 绕过，动态取默认表 key，抗并行重写）。
+    #[test]
+    fn boot_sanitize_drops_invalid_table_to_empty() {
+        let mut bad = std::collections::HashMap::new();
+        bad.insert(
+            "quota_exhausted".to_string(),
+            model::error_messages::ErrorMessageOverride {
+                status: Some(418),
+                r#type: None,
+                message: None,
+                retry_after_secs: None,
+            },
+        );
+        let out = sanitize_error_messages_table(bad);
+        assert!(out.is_empty(), "白名单外 status 必须降级为空表");
+
+        let base = model::error_messages::default_error_messages()
+            .iter()
+            .find(|(_, s, t, ..)| *s == 429 && *t == "rate_limit_error")
+            .map(|(k, ..)| k.to_string())
+            .expect("默认表必须保留至少一个 429+rate_limit_error 的 key（启动校验基线）");
+        let mut bad2 = std::collections::HashMap::new();
+        bad2.insert(
+            base,
+            model::error_messages::ErrorMessageOverride {
+                status: Some(401),
+                r#type: None,
+                message: None,
+                retry_after_secs: None,
+            },
+        );
+        let out2 = sanitize_error_messages_table(bad2);
+        assert!(out2.is_empty(), "渲染值组合违例必须降级为空表");
+    }
+
+    /// M1：合法表必须原样保留（只改 message 等合法姿势不误伤）。
+    #[test]
+    fn boot_sanitize_keeps_valid_table() {
+        let mut good = std::collections::HashMap::new();
+        good.insert(
+            "quota_exhausted".to_string(),
+            model::error_messages::ErrorMessageOverride {
+                status: Some(429),
+                r#type: Some("rate_limit_error".to_string()),
+                message: Some("配额已耗尽，请稍后重试。".to_string()),
+                retry_after_secs: None,
+            },
+        );
+        let out = sanitize_error_messages_table(good.clone());
+        assert_eq!(out, good, "合法表必须原样保留");
+    }
+}
+
+// ==================== B7 main 侧播种点：源码守卫 ====================
+#[cfg(test)]
+mod main_seeding_guard {
+    // 守卫纪律（CLAUDE.md 教训 #9）：本模块注释里不得出现带引号括号的完整调用字面量。
+
+    /// 每个 main 直播种点（setter 在别的模块）必须在调用后登记接线标记。
+    /// 删掉任一登记行 / 名字不同步 → 红。
+    #[test]
+    fn main_seeding_source_guard() {
+        let full = include_str!("main.rs");
+        let prod = full.split("\n#[cfg(test)]").next().unwrap_or(full);
+        for name in super::MAIN_SEEDED_NAMES {
+            let needle = format!("mark_main_seeded(\"{}\"{}", name, ")");
+            assert!(
+                prod.contains(&needle),
+                "main 播种点登记缺失: {needle} 不存在于生产代码（MAIN_SEEDED_NAMES 与播种点必须同步）"
+            );
+        }
+        let mut sorted: Vec<&str> = super::MAIN_SEEDED_NAMES.to_vec();
+        sorted.sort_unstable();
+        let deduped = sorted.clone();
+        sorted.dedup();
+        assert_eq!(sorted.len(), deduped.len(), "MAIN_SEEDED_NAMES 含重复名字");
+    }
+
+    /// 校验函数必须真的被 main 调用（删调用即红）。带缩进 + 分号的调用形态，
+    /// 避免与函数定义行（fn 前缀无分号）误匹配。
+    #[test]
+    fn verify_called_in_main() {
+        let full = include_str!("main.rs");
+        let prod = full.split("\n#[cfg(test)]").next().unwrap_or(full);
+        assert!(
+            prod.contains("    verify_runtime_mirrors_wired();"),
+            "main 必须调用启动播种自检"
+        );
+    }
+}
+
+// ==================== F6/D3-2 接线缺失告警联动 ====================
+#[cfg(test)]
+mod mirror_wiring_alert_tests {
+    use super::*;
+
+    /// 纯函数判定：播种位图与缺失清单一一对应。
+    #[test]
+    fn main_mirrors_missing_matches_bits() {
+        assert_eq!(
+            main_mirrors_missing(0),
+            MAIN_SEEDED_NAMES.to_vec(),
+            "位图全 0 时 4 个 main 镜像全部缺失"
+        );
+        assert!(
+            main_mirrors_missing(u64::MAX).is_empty(),
+            "位图全 1 时无缺失"
+        );
+        // 只播第 0 个：其余全部缺失、且已播的不在缺失清单里
+        let got = main_mirrors_missing(1u64 << 0);
+        assert_eq!(got.len(), MAIN_SEEDED_NAMES.len() - 1);
+        assert!(
+            !got.contains(&MAIN_SEEDED_NAMES[0]),
+            "已播种的镜像不得出现在缺失清单"
+        );
+    }
+
+    /// 端到端：启动自检发现接线缺失必须 bump `wiring_incomplete`，且 reason
+    /// 携带缺失清单摘要。本地 HTTP server 收 payload 断言（同 alerting 测试模式）。
+    ///
+    /// 确定性依据：测试进程里 `main()` 不跑 → MAIN_SEEDED_BITS 恒 0 → 4 个 main
+    /// 镜像恒缺失 → 必走缺失分支 → 必 bump（与 handlers 侧镜像的测试间状态无关）。
+    ///
+    /// 防自弱化：删掉 verify 缺失分支的 bump 行 → 本测试收不到投递 → 超时红。
+    #[tokio::test]
+    async fn verify_missing_mirrors_bumps_wiring_incomplete() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let _guard = crate::common::alerting::test_lock();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (body_tx, mut body_rx) = tokio::sync::mpsc::channel::<String>(4);
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 8192];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                if let Some(pos) = text.find("\r\n\r\n") {
+                    let _ = body_tx.send(text[pos + 4..].to_string()).await;
+                }
+                let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        crate::common::alerting::init(
+            Some(format!("http://{addr}/hook")),
+            3600,
+            "test".to_string(),
+        );
+
+        verify_runtime_mirrors_wired();
+
+        let body = tokio::time::timeout(std::time::Duration::from_secs(5), body_rx.recv())
+            .await
+            .expect("应收到告警投递")
+            .expect("channel 不应关闭");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("payload 应为 JSON");
+        assert_eq!(
+            v["key"], "wiring_incomplete",
+            "接线缺失必须 bump wiring_incomplete"
+        );
+        let reason = v["reason"].as_str().expect("reason 必须携带缺失清单摘要");
+        for name in MAIN_SEEDED_NAMES {
+            assert!(
+                reason.contains(name),
+                "reason 摘要必须包含缺失镜像名 {name}"
+            );
+        }
     }
 }

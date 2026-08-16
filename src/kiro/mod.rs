@@ -24,5 +24,7 @@ pub mod regions;
 pub mod scheduling;
 pub mod throttle;
 pub mod token_manager;
+pub mod upstream_trace;
+pub mod user_id;
 pub mod version_mask;
 pub mod web_portal;

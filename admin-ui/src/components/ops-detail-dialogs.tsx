@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, type ReactNode } from 'react'
+import { useState, useEffect, useMemo, useId, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import i18n from '@/i18n'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
@@ -100,6 +100,8 @@ function DateTimeField({
   ariaLabel?: string
 }) {
   const { t } = useTranslation()
+  // 组件可能在同一页出现多次（起止时间两个字段），用 useId 保证 id 唯一。
+  const inputId = useId()
   // 生成本地时区的 datetime-local 字符串(YYYY-MM-DDTHH:mm)。
   const nowLocal = () => {
     const d = new Date()
@@ -111,6 +113,7 @@ function DateTimeField({
       <div className="relative flex-1">
         <CalendarClock className="pointer-events-none absolute left-2 top-1/2 z-10 h-3.5 w-3.5 -translate-y-1/2 text-[#666]" />
         <Input
+          id={inputId}
           type="datetime-local"
           value={value}
           onChange={(e) => onChange(e.target.value)}
@@ -125,6 +128,7 @@ function DateTimeField({
         className="h-8 shrink-0 px-1.5 text-[10px] text-muted-foreground hover:text-[#ededed]"
         onClick={() => onChange(nowLocal())}
         title={t('opsdetaildialogs.datetime.setToNow')}
+        aria-label={t('opsdetaildialogs.datetime.setToNow')}
       >
         {t('opsdetaildialogs.datetime.now')}
       </Button>
@@ -136,6 +140,7 @@ function DateTimeField({
           className="h-8 w-8 shrink-0 p-0 text-muted-foreground hover:text-[#ededed]"
           onClick={() => onChange('')}
           title={t('opsdetaildialogs.trace.clear')}
+          aria-label={t('opsdetaildialogs.trace.clear')}
         >
           <X className="h-3.5 w-3.5" />
         </Button>
@@ -381,16 +386,19 @@ export function TraceDetailDialog({
           <div className="relative min-w-[200px] flex-1">
             <Search className="pointer-events-none absolute left-2 top-1/2 z-10 h-3.5 w-3.5 -translate-y-1/2 text-[#666]" />
             <Input
+              id="trace-search"
               value={textRaw}
               onChange={(e) => setTextRaw(e.target.value)}
               placeholder={t('opsdetaildialogs.trace.searchPlaceholder')}
               className="h-8 pl-7 pr-7 text-xs"
+              aria-label={t('opsdetaildialogs.trace.searchPlaceholder')}
             />
             {textRaw && (
               <button
                 onClick={() => setTextRaw('')}
                 className="absolute right-1.5 top-1/2 z-10 -translate-y-1/2 text-[#666] hover:text-[#ededed]"
                 title={t('opsdetaildialogs.trace.clear')}
+                aria-label={t('opsdetaildialogs.trace.clear')}
               >
                 <X className="h-3.5 w-3.5" />
               </button>
@@ -421,28 +429,34 @@ export function TraceDetailDialog({
               <div className="space-y-1">
                 <span className="block text-[11px] text-muted-foreground">client IP</span>
                 <Input
+                  id="trace-client-ip"
                   value={clientIp}
                   onChange={(e) => setClientIp(e.target.value)}
                   placeholder={t('opsdetaildialogs.trace.clientIpHint')}
                   className="h-8 text-xs"
+                  aria-label={t('opsdetaildialogs.trace.clientIpLabel')}
                 />
               </div>
               <div className="space-y-1">
                 <span className="block text-[11px] text-muted-foreground">session</span>
                 <Input
+                  id="trace-session-id"
                   value={sessionId}
                   onChange={(e) => setSessionId(e.target.value)}
                   placeholder={t('opsdetaildialogs.trace.sessionHint')}
                   className="h-8 text-xs"
+                  aria-label={t('opsdetaildialogs.trace.colSession')}
                 />
               </div>
               <div className="space-y-1">
                 <span className="block text-[11px] text-muted-foreground">{t('opsdetaildialogs.trace.modelLabel')}</span>
                 <Input
+                  id="trace-model"
                   value={model}
                   onChange={(e) => setModel(e.target.value)}
                   placeholder={t('opsdetaildialogs.trace.modelHint')}
                   className="h-8 text-xs"
+                  aria-label={t('opsdetaildialogs.trace.modelLabel')}
                 />
               </div>
               <div className="space-y-1">
@@ -779,9 +793,7 @@ export function UsageDetailDialog({
             <BarChart3 className="h-4 w-4" />
             {t('opsdetaildialogs.usage.title')}
           </DialogTitle>
-          <DialogDescription>
-            汇总 + 占比饼图 + 按模型 / 按号维度聚合(读本地统计,零上游)。KPI 随时间窗切换;饼图为累计维度。
-          </DialogDescription>
+          <DialogDescription>{t('opsdetaildialogs.usage.description')}</DialogDescription>
         </DialogHeader>
 
         <div className="min-h-0 flex-1 space-y-4 overflow-y-auto pr-1">
@@ -1354,6 +1366,7 @@ export function BgCacheDetailDialog({
                       toggleSelect(i)
                     }}
                     title={isSel ? t('opsdetaildialogs.bgcache.deselect') : t('opsdetaildialogs.bgcache.toggleSelect')}
+                    aria-label={isSel ? t('opsdetaildialogs.bgcache.deselect') : t('opsdetaildialogs.bgcache.toggleSelect')}
                     className={cn(
                       'absolute left-1.5 bottom-1.5 flex h-6 w-6 items-center justify-center rounded transition-opacity',
                       isSel
@@ -1369,6 +1382,7 @@ export function BgCacheDetailDialog({
                     download={`bg-${i}.jpg`}
                     onClick={(e) => e.stopPropagation()}
                     title={t('opsdetaildialogs.bgcache.downloadThis')}
+                    aria-label={t('opsdetaildialogs.bgcache.downloadThis')}
                     className="absolute right-1.5 top-1.5 flex h-6 w-6 items-center justify-center rounded bg-black/60 text-white/90 opacity-0 transition-opacity hover:bg-black/80 group-hover:opacity-100"
                   >
                     <Download className="h-3.5 w-3.5" />
@@ -1392,6 +1406,7 @@ export function BgCacheDetailDialog({
           <button
             onClick={() => setLightboxIdx(null)}
             title={t('opsdetaildialogs.bgcache.closeEsc')}
+            aria-label={t('opsdetaildialogs.bgcache.closeEsc')}
             className="absolute right-4 top-4 flex h-9 w-9 items-center justify-center rounded-full bg-white/10 text-white/90 hover:bg-white/20"
           >
             <X className="h-5 w-5" />

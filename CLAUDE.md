@@ -74,7 +74,7 @@ public  https://github.com/dwgx/KiroStudio.git          ← 不要推
 ```bash
 export GIT_INDEX_FILE=/tmp/snap.index && rm -f "$GIT_INDEX_FILE"
 git read-tree HEAD
-git add -A -- src admin-ui/src          # 只加你关心的路径
+git add -A -- src admin-ui build.rs Dockerfile                    # 统一快照命令：后端 + 前端（含未跟踪新文件）
 TREE=$(git write-tree)
 C=$(git commit-tree $TREE -p origin/deploy/vps -m "...")
 git branch -f deploy/vps $C
@@ -95,14 +95,34 @@ git push -f origin deploy/vps
 
 ### 部署到 VPS
 
-🔴 **2026-08-08 起 KiroStudio 已容器化，部署方式在过渡中。** 新机（`143.20.230.62`）上
-KiroStudio 跑在 Docker 容器 `skiapi-kirostudio`（镜像 `skiapi/kirostudio:local-0.7.46`，
-数据在 `/opt/skiapi/data/kirostudio/`），sub2api 用 compose 服务名 `kirostudio:8990` 寻址。
-旧的「Actions 出二进制 → scp → `kirostudio-update` 热替换」流程**已不适用**（那套是 systemd
-二进制时代）。新机的 `kirostudio-update` 脚本仍是旧流程、会 `systemctl restart kirostudio`，
-对容器无效——**容器化部署的正确流程（镜像 build+push+rollback）尚未定型**，改镜像前先核对
-`/opt/skiapi/docker-compose.yml` 与重建规格 `<运维仓>/docs/11-rebuild-new62.md`
-（运维仓有两份，见「线上部署信息」节）。
+🔴 **2026-08-16 最新线上：nbus（`38.244.34.15:8990`，systemd `kirostudio.service`）跑
+W13 最终 build（sha256 88270616，build_sha=final，v1.1.1 + W2-W13 全部修复），`/healthz` pool=4 全绿，
+详情以仓根 `STATUS.md` 为准。** skiapi（`143.20.230.62:673`）现在是**验证机**（Docker 验证循环），
+不再是生产。更早的容器化过渡（skiapi-kirostudio 镜像 0.7.46 时代）与更早的
+`kirostudio-update` 热替换流程**均已过期**，勿引用。
+
+**当前部署流程（nbus，2026-08-15 定型）**：
+🔴 **部署前先跑 `scripts/verify-snapshot.sh`**（快照完整核验：src/、admin-ui/ 下未跟踪新文件
+必须已进快照；git archive 只含快照分支内容，untracked 漏进部署 = 前端组件缺失 BLOCKER，历史 ×2）。
+快照命令统一为 `git read-tree HEAD && git add -A -- src admin-ui build.rs Dockerfile`（含 build.rs；
+三份文档逐字一致，见 WORKFLOW §5）。
+```bash
+# 0) 快照 commit 短 sha：与验证循环的 C 同值（git archive 解包环境无 .git，必须显式传）
+SHA=$(git rev-parse --short ci/verify-adaptive)
+# 1) 验证机构建 release 二进制（含前端，Dockerfile frontend-builder 自动 build dist 内嵌）
+#    --build-arg KIRO_BUILD_SHA=$SHA：healthz 的 build_sha 字段（B11），不传显示 "unknown"
+ssh skiapi "cd /tmp/kiro-verify && docker build -f Dockerfile --target builder --build-arg KIRO_BUILD_SHA=$SHA -t kv:x . && \
+  docker create --name kv-tmp kv:x && docker cp kv-tmp:/app/target/release/kirostudio /tmp/kirostudio-release && \
+  docker rm kv-tmp"
+# 2) 本机中转（skiapi 不能直连 nbus）
+scp skiapi:/tmp/kirostudio-release /tmp/ && scp /tmp/kirostudio-release nbus:/tmp/kirostudio-new
+# 3) nbus 备份 + 替换 + 重启 + 验证
+ssh nbus 'cp /opt/kirostudio/kirostudio /opt/kirostudio/kirostudio.bak-<tag> && \
+  mv /tmp/kirostudio-new /opt/kirostudio/kirostudio && chmod +x /opt/kirostudio/kirostudio && \
+  systemctl restart kirostudio && sleep 5 && systemctl is-active kirostudio && \
+  curl -s http://127.0.0.1:8990/healthz'
+# 判定：sha256sum 一致 + active + /healthz ok:true pool_count=4 且 build_sha == $SHA + 4 通道 smoketest
+```
 
 ```bash
 # 巡检（新机，SSH 端口 673，密钥登录；本机 ssh config 尚无别名，直接 -p 673）
@@ -336,7 +356,7 @@ CODEGRAPH_DIR=.codegraph-legacy python3 tools/codegraph/cg.py stat
 | `MODULES.md` service.rs | 1990 | **9163** |
 | `MODULES.md` main.rs | 481 | **1139** |
 | 本文件 + `ARCHITECTURE.md` §二 | ide 是「唯一已注册端点」 | **ide + cli 两个都注册**（`endpoint/mod.rs::build()`） |
-| `ARCHITECTURE.md` 抬头 | v0.4.0 | **v0.7.46**（`Cargo.toml`） |
+| `ARCHITECTURE.md` 抬头 | v0.4.0 | **v1.1.0**（`Cargo.toml`，2026-08-14 复核） |
 
 两份 docs 已就地加警示抬头。`MODULES.md` 的**结构性**描述（谁调谁、职责划分）大体仍成立，
 过期的是数字与个别断言。另外两份 docs 都**缺 `src/openai/`** 一节（4 个文件确实存在）。
@@ -351,7 +371,18 @@ KiroStudio 是一个 **Anthropic Messages API 兼容的反向代理网关**，Ru
 - 单端口单二进制（react 前端 rust-embed 内嵌）
 - 上游：`runtime.{region}.kiro.dev/generateAssistantResponse`
 - 管理面板：`/admin`（React SPA），Admin API：`/api/admin/*`
-- 当前版本：v0.7.46（Cargo.toml）。⚠️ 0.7.46 **还没打 tag** → OTA 升不到这一版
+- 当前版本：v1.1.1（Cargo.toml；前端 admin-ui 独立线 0.7.44）。**v1.1.1 已于 2026-08-15 发版**
+  （origin + public，发版例外，OTA 目标即 public release）；OTA 面板仍未启用（`update.env`
+  token 未填、自动检查默认关）。**注意**：release 产物落后工作树全部修复（W2-W13），
+  线上 nbus 跑的是修复后 build（sha 88270616，build_sha=final）——发 v1.1.2 让 release 追上需 owner 决策。
+
+## 工作流
+
+**工作流规范在 `.opencode/WORKFLOW.md`**（2026-08-15 定稿，从 W1-W6 实战提炼）：
+任务生命周期 9 步（需求澄清→目标→计划→执行→自 review→落实核验→主线 review→CI→文档同步）、
+派发纪律（文件边界/并行上限/空返回重派）、守卫纪律（needle 拼接/注释不写字面量/删目标必红）、
+落实核验机制（每波三态核对进 DONE.md）、文档六件套职责、参考仓使用纪律（只参考不照搬定义）。
+所有会话（主会话 + subagent）按它执行。
 
 ## 仓库结构
 
@@ -512,19 +543,25 @@ target + 持久化 target-cache 卷：build 只编译、测试用 `docker run` �
 # 1) 本地：快照（临时 index，绝不 git add/commit/checkout）→ scp
 cd /Users/dwgx/Documents/WorkSpace/Project/kirostudio
 export GIT_INDEX_FILE=/tmp/ci.index && rm -f "$GIT_INDEX_FILE"
-git read-tree HEAD && git add -A -- src          # 后端改动只加 src
+git read-tree HEAD && git add -A -- src admin-ui build.rs Dockerfile    # 统一快照命令：后端 + 前端 + 构建文件（B11 起含 build.rs）
 TREE=$(git write-tree)
 C=$(git commit-tree "$TREE" -p HEAD -m ci)
 git branch -f ci/verify-adaptive "$C"
 unset GIT_INDEX_FILE
 git archive --format=tar ci/verify-adaptive -o /tmp/kv.tar
+# 1.5) 部署前新文件核验：src/、admin-ui/ 下未跟踪（??）文件必须已进快照（git archive 只含
+#      快照分支内容，untracked 漏进部署 = 组件缺失 BLOCKER，历史 ×2）。缺失即失败退出。
+scripts/verify-snapshot.sh /tmp/kv.tar
+SHA=${C:0:7}
 scp -q /tmp/kv.tar skiapi:/tmp/kv.tar
 
-# 2) 服务器：解包 → build → 显式跑全量测试
-ssh skiapi 'cd /tmp/kiro-verify && rm -rf src && tar -xf /tmp/kv.tar && \
-  docker build -f Dockerfile --target builder -t kv:x . > /tmp/b.log 2>&1 && echo BUILD=ok && \
-  docker run --rm -w /app -v /tmp/kiro-verify/target-cache:/app/target kv:x sh -c \
-  "cargo test --no-default-features 2>&1 | tail -6"'
+# 2) 服务器：解包 → 确认关键新文件在包内 → build → 显式跑全量测试
+#    --build-arg KIRO_BUILD_SHA=$SHA：git archive 解包环境无 .git，build.rs 拿不到 commit，
+#    必须显式传快照 commit 短 sha（不传则 healthz 显示 "unknown"）
+ssh skiapi "cd /tmp/kiro-verify && rm -rf src && tar -xf /tmp/kv.tar && \
+  ls admin-ui/src/components/error-messages-dialog.tsx >/dev/null && echo KEYFILE=ok && \
+  docker build -f Dockerfile --target builder --build-arg KIRO_BUILD_SHA=$SHA -t kv:x . > /tmp/b.log 2>&1 && echo BUILD=ok && \
+  docker run --rm -w /app -v /tmp/kiro-verify/target-cache:/app/target kv:x sh -c \"cargo test --no-default-features 2>&1 | tail -6\""
 
 # 3) 新增/改过的测试必须按名单独再跑一次，确认真的执行了（而不是被 filter 吞掉）
 ssh skiapi 'docker run --rm -w /app -v /tmp/kiro-verify/target-cache:/app/target kv:x sh -c \
@@ -534,13 +571,14 @@ ssh skiapi 'docker run --rm -w /app -v /tmp/kiro-verify/target-cache:/app/target
 ⚠️ **判定标准**：必须看到 `test result: ok. NNNN passed; 0 failed` 才算绿；
 build 失败看 `/tmp/b.log`（`grep -E "error\[E|^error"` 拿行号）。
 ⚠️ `/tmp/kiro-verify` 在 VPS 重启后清空；重建依赖层约 5 分钟，之后走缓存。
-⚠️ 改了前端（admin-ui）走的是另一条路，见下「改了前端还要单独同步 dist」。
+⚠️ 前端（admin-ui）改动**不需要单独同步 dist**——Dockerfile 的 frontend-builder 阶段自动
+构建并内嵌进二进制（nbus 是纯二进制部署）；验证时快照要 `git add -A -- src admin-ui build.rs Dockerfile`（B11 起含构建文件）。
+⚠️ **面板日志级别独立于控制台**：LogBufferLayer（面板实时日志环形缓冲）固定 INFO，控制台
+由 RUST_LOG 环境变量控制（nbus unit 写 `RUST_LOG=warn` 时终端精简、面板仍可见 info+）。
+⚠️ **部署后验证**：二进制内嵌前端无法直接 ls 检查组件，以快照核验
+（`scripts/verify-snapshot.sh`）+ 面板打开关键页/curl 前端资源为准。
 
-**部署**（后端）：
-```bash
-git push ssh://root@143.20.230.62:673/srv/git/KiroStudio-skiapi.git ci/verify-adaptive:refs/heads/deploy/adaptive -f
-ssh skiapi 'cd /opt/kirostudio-src && git fetch origin && kirostudio-hotswap deploy origin/deploy/adaptive'
-```
+**部署**（nbus 流程见上「部署到 VPS」节，skiapi hotswap 流程已废弃）：
 
 **改了前端还要单独同步 dist**（前端 dist 是 **bind mount**：
 `/opt/kirostudio-src/admin-ui/dist:/app/ui-dist:ro`，二进制从磁盘读、优先于 rust-embed，

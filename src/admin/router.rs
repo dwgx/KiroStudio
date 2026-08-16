@@ -20,7 +20,8 @@ use super::{
         enable_overage,
         export_config, export_credential, export_kam_credentials, external_idp_leg1, external_idp_leg2,
         external_idp_leg2_select, force_refresh_token, get_all_credentials, get_cached_balances,
-        get_config, get_credential_balance, get_load_balancing_mode, get_overage_status,
+        get_config, get_credential_balance, get_error_message_defaults, get_load_balancing_mode,
+        get_overage_status,
         help_web_search, import_config, import_keys, list_socks_nodes, list_trash,
         perform_update,
         poll_idc_login, poll_social_login, probe_available_models, probe_models_standalone,
@@ -174,6 +175,9 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_load_balancing_mode).put(set_load_balancing_mode),
         )
         .route("/config", get(get_config).put(update_config))
+        // 错误码/提示词**内置默认表**（只读，前端默认值预览数据源；key 集随默认表演进
+        // 自动同步，运行期读取不硬编码）。静态段，与 /config 同层互不冲突。
+        .route("/error-messages/defaults", get(get_error_message_defaults))
         // 配置导出/导入（2026-08-14）：导出脱敏（敏感字段省略）、导入先校验后写盘。
         .route("/config/export", get(export_config))
         .route("/config/import", post(import_config))

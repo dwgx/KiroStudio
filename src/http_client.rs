@@ -3,6 +3,9 @@
 //! 提供统一的 HTTP Client 构建功能，支持代理配置
 
 use reqwest::{Client, Proxy};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::model::config::TlsBackend;
@@ -853,6 +856,146 @@ pub fn build_client_no_redirect(
     Ok(builder.build()?)
 }
 
+/// 从 `scheme://[user@]host[:port]/path` 提取 (host, port)，缺省端口按 scheme 推断。
+///
+/// ⚠️ 与 `common/ssrf.rs` 的 `parse_host_port` 同口径（那边是私有函数无法复用，
+/// M8 的 DNS 固化需要在本层独立解析一次；安全语义承重，改动需两侧同步）。
+/// 支持 IPv6 字面量 `[::1]:port` 写法；剥 userinfo 防 `host@内网` 混淆。
+fn split_host_port(url: &str) -> anyhow::Result<(String, u16)> {
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| anyhow::anyhow!("URL 缺少 scheme: {url}"))?;
+    let default_port: u16 = match scheme.to_ascii_lowercase().as_str() {
+        "https" => 443,
+        "http" => 80,
+        s => return Err(anyhow::anyhow!("不支持的 scheme: {s}")),
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return Err(anyhow::anyhow!("URL 缺少主机: {url}"));
+    }
+    let host_port = match authority.rsplit_once('@') {
+        Some((_, hp)) => hp,
+        None => authority,
+    };
+    if let Some(after) = host_port.strip_prefix('[') {
+        let (h, tail) = after
+            .split_once(']')
+            .ok_or_else(|| anyhow::anyhow!("IPv6 字面量缺少右括号: {url}"))?;
+        let port = if let Some(p) = tail.strip_prefix(':') {
+            p.parse::<u16>().map_err(|_| anyhow::anyhow!("非法端口: {url}"))?
+        } else {
+            default_port
+        };
+        return Ok((h.to_ascii_lowercase(), port));
+    }
+    match host_port.rsplit_once(':') {
+        Some((h, p)) => {
+            let port = p
+                .parse::<u16>()
+                .map_err(|_| anyhow::anyhow!("非法端口: {url}"))?;
+            if h.is_empty() {
+                return Err(anyhow::anyhow!("URL 缺少主机: {url}"));
+            }
+            Ok((h.to_ascii_lowercase(), port))
+        }
+        None => Ok((host_port.to_ascii_lowercase(), default_port)),
+    }
+}
+
+/// M8 的连接池缓存：key = (host, port, proxy, tls)，value = (固化时的解析结果, client)。
+///
+/// 解析结果未变化时复用 client（连接池按 host 保留，与透传层旧缓存同款语义），
+/// 变化（DNS 重绑定 / 记录变更）时重建 —— 见 [`pinned_streaming_client`]。
+/// **key 必须含 port**：同 host 不同端口（本机代挂 127.0.0.1:8788 与 127.0.0.1:9999）
+/// 是不同出站目标，SocketAddr 必不等 —— 键缺 port 时 addrs 比较恒不等、每请求重建。
+static PINNED_CLIENT_CACHE: OnceLock<
+    parking_lot::Mutex<
+        HashMap<(String, u16, Option<ProxyConfig>, TlsBackend), (Vec<SocketAddr>, Client)>,
+    >,
+> = OnceLock::new();
+
+/// 🔴 M8：构造「运行时 SSRF 复验 + DNS 固化」的透传出站 client（含连接池缓存）。
+///
+/// # 为什么需要它
+///
+/// custom_api 的 base_url 只在**写入配置时**校验一次（`validate_outbound_url_with` +
+/// `SsrfPolicy::AdminConfigured`，见 `common/ssrf.rs`）。此后每次请求 reqwest 自行
+/// 重新解析域名 —— DNS rebinding（写入时解析公网、之后解析内网/云元数据）可绕过
+/// 写入时校验；连接池空闲超时（90s）后重开连接时就会用上被篡改的解析结果。
+///
+/// # 修复方式
+///
+/// 每次出站前用与写入时**相同策略**复验，并把本次解析结果 `resolve_to_addrs`
+/// 固定到 client 上：
+///
+/// - **校验与连接共用同一份解析结果**：一次 `lookup_host` 得到 addrs，对每个候选
+///   IP 构造 IP 字面量 URL 复验（lookup 对 IP 字面量直接返回、不走 DNS），再整体
+///   pin 到 client —— 校验与连接之间不存在第二次解析；
+/// - **解析结果运行时变化会被复验拦下**：任一候选 IP 命中禁止段即整体拒绝；
+///   DNS 解析失败同样拒绝（fail-closed，绝不回落未固化的普通 client ——
+///   那正是 rebinding 的入口）；
+/// - **显式内网/IP 直连配置不受影响**：策略与写入时完全一致（`AdminConfigured`：
+///   字面量环回 127.0.0.1 / ::1 —— 本机代挂如 fuckopencode —— 与 fake-IP 基准段
+///   198.18.0.0/15 放行；私网/链路本地/云元数据拒绝），写入时放行的运行时照常放行。
+///
+/// 代理（HTTP/SOCKS5）场景：连接目标由代理解析/承接，本地固化不生效但也不劣化
+/// 既有防护（该场景的威胁面与写入时校验同构，由 no-redirect + 代理侧 DNS 承担）。
+pub async fn pinned_streaming_client(
+    url: &str,
+    proxy: Option<&ProxyConfig>,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<Client> {
+    use crate::common::ssrf::{SsrfPolicy, validate_outbound_url_with};
+
+    let (host, port) = split_host_port(url)?;
+    // 一次解析：addrs 同时用于复验与固化，校验与连接之间不存在第二次解析。
+    let mut addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|e| anyhow::anyhow!("解析出站目标失败（{url}）: {e}"))?
+        .collect();
+    addrs.sort();
+    addrs.dedup();
+    if addrs.is_empty() {
+        return Err(anyhow::anyhow!("出站目标未解析到任何地址: {url}"));
+    }
+    // 对**同一份** addrs 复验：IP 字面量 URL 的 lookup 直接返回该 IP（不走 DNS），
+    // 校验的正是将要连接的地址集合。策略与写入时一致（AdminConfigured）。
+    for sa in &addrs {
+        let probe = format!("http://{sa}/");
+        validate_outbound_url_with(&probe, true, SsrfPolicy::AdminConfigured)
+            .await
+            .map_err(|reason| anyhow::anyhow!("出站目标复验被拒（{url}）: {reason}"))?;
+    }
+
+    // 连接池缓存：解析结果未变 → 复用（连接不重建）；变化 → 重建并更新。
+    let key = (host.clone(), port, proxy.cloned(), tls_backend);
+    {
+        let cache = PINNED_CLIENT_CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
+        let guard = cache.lock();
+        if let Some((cached_addrs, client)) = guard.get(&key) {
+            if *cached_addrs == addrs {
+                return Ok(client.clone());
+            }
+        }
+    }
+    // 建 client 放在锁**外**：build 会解析代理 URL / 初始化 TLS，不该持锁做。
+    // 竞态下可能有两个线程各建一份，多建的那份在下方 insert 时被丢弃（无副作用）。
+    let mut builder = Client::builder()
+        .read_timeout(Duration::from_secs(720))
+        // 🔴 P1：connect_timeout 30s → 10s（透传专用 client，与
+        // build_streaming_client_no_redirect 同值 —— failover 换号循环下 30s 太长）。
+        .connect_timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(&host, &addrs);
+    builder = apply_pool_tuning(builder);
+    builder = apply_tls_and_proxy(builder, proxy, tls_backend)?;
+    let client = builder.build()?;
+    let cache = PINNED_CLIENT_CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
+    cache.lock().insert(key, (addrs, client.clone()));
+    Ok(client)
+}
+
 /// 把 TLS 后端选择 + 可选代理（含账密）应用到 builder 上（[`build_client`] /
 /// [`build_streaming_client`] 共用，避免两处逻辑漂移）。
 fn apply_tls_and_proxy(
@@ -1457,5 +1600,115 @@ curl:\n\
         assert_eq!(skipped, 0);
         assert_eq!(nodes[0].url, "socks5://1.2.3.4:1080");
         assert_eq!(nodes[0].password.as_deref(), Some("pw1"));
+    }
+
+    // ===== M8：运行时 SSRF 复验 + DNS 固化（2026-08-15）=====
+
+    /// M8 守卫：**合法显式内网/IP 直连配置必须不受影响** —— 与写入 base_url 时的
+    /// 校验同策略（AdminConfigured）：本机代挂 127.0.0.1:8788（fuckopencode）、
+    /// fake-IP 基准段 198.18.x 放行；公网 IP 放行。
+    ///
+    /// 回退即 FAIL：把复验策略改回 Strict，或对 IP 字面量整体拒绝 —— 本机代挂
+    /// 这类合法配置会被运行时复验误杀，custom_api 全部不可用。
+    #[tokio::test]
+    async fn pinned_client_accepts_loopback_and_public_literals() {
+        for ok in [
+            "http://127.0.0.1:8788/v1", // 本机代挂（fuckopencode 形态）
+            "https://127.0.0.1:8443/v1",
+            "https://8.8.8.8/v1",
+            "http://1.1.1.1:80/v1",
+            "http://198.18.0.46:8080/v1", // fake-IP 池默认段（AdminConfigured 豁免）
+            "http://[::1]:8788/v1",       // IPv6 字面量环回
+        ] {
+            let r = pinned_streaming_client(ok, None, TlsBackend::Rustls).await;
+            assert!(
+                r.is_ok(),
+                "{ok} 是与写入时校验同策略的合法配置，运行时复验必须放行: {r:?}"
+            );
+        }
+    }
+
+    /// M8 守卫：**域名解析结果运行时变化必须被拦** —— 任一候选 IP 命中私网/链路
+    /// 本地/元数据段即整体拒绝（fail-closed）。这正是 DNS rebinding 的落地形态：
+    /// 写入时解析公网、运行时解析内网。回退即 FAIL：把复验删掉/改 fail-open，
+    /// 这些 IP 字面量 URL 会被放行 → rebinding 可直打云元数据。
+    #[tokio::test]
+    async fn pinned_client_rejects_internal_literals() {
+        for bad in [
+            "http://10.0.0.5/v1",
+            "http://192.168.1.1:8080/v1",
+            "http://172.16.0.1/v1",
+            "http://169.254.169.254/latest/meta-data", // 云元数据端点：首要攻击目标
+            "http://[fc00::1]:8080/v1",                // IPv6 ULA
+        ] {
+            let r = pinned_streaming_client(bad, None, TlsBackend::Rustls).await;
+            assert!(
+                r.is_err(),
+                "{bad} 解析到内网/元数据段，运行时复验必须拒绝（rebinding 防线）"
+            );
+        }
+    }
+
+    /// M8 守卫：**DNS 解析失败必须 fail-closed** —— 解析失败绝不回落未固化的
+    /// 普通 client（那正是 rebinding 的入口：一次失败后 reqwest 自行重解析即可
+    /// 用上被篡改的 DNS 记录）。`.invalid` TLD（RFC 6761）保证永不解析，
+    /// 测试不依赖真实 DNS 也不依赖网络。
+    #[tokio::test]
+    async fn pinned_client_fails_closed_on_unresolvable_host() {
+        let r = pinned_streaming_client(
+            "http://never-resolves.invalid/v1",
+            None,
+            TlsBackend::Rustls,
+        )
+        .await;
+        assert!(
+            r.is_err(),
+            "解析失败必须报错（fail-closed），不得回落未固化的普通 client: {r:?}"
+        );
+    }
+
+    /// split_host_port：与 ssrf::parse_host_port 同口径的解析契约（含 userinfo 剥离、
+    /// IPv6 字面量、缺省端口推断）。
+    #[test]
+    fn split_host_port_matches_ssrf_parse_semantics() {        assert_eq!(
+            split_host_port("https://example.com/a/b?x=1").unwrap(),
+            ("example.com".to_string(), 443)
+        );
+        assert_eq!(
+            split_host_port("http://example.com:8080/x").unwrap(),
+            ("example.com".to_string(), 8080)
+        );
+        assert_eq!(
+            split_host_port("https://[::1]:9000/x").unwrap(),
+            ("::1".to_string(), 9000)
+        );
+        assert_eq!(
+            split_host_port("https://user:pass@example.com/x").unwrap(),
+            ("example.com".to_string(), 443),
+            "userinfo 混淆：取 @ 之后的真实 host"
+        );
+        assert!(split_host_port("ftp://example.com").is_err());
+        assert!(split_host_port("not-a-url").is_err());
+    }
+
+    /// M8 守卫：缓存键必须含 port —— 同 host 不同端口（如本机代挂 8788 与 9999）
+    /// 是不同出站目标，固化的 addrs 必不等；键缺 port 时 addrs 比较恒不等、
+    /// 每次请求都重建 client（连接池缓存整体失效）。回退即 FAIL：两个调用后
+    /// 缓存里只剩一个 key（后写覆盖前写）。
+    #[tokio::test]
+    async fn pinned_client_cache_key_distinguishes_ports() {
+        let _ = pinned_streaming_client("http://127.0.0.1:8788/v1", None, TlsBackend::Rustls).await;
+        let _ = pinned_streaming_client("http://127.0.0.1:9999/v1", None, TlsBackend::Rustls).await;
+        let cache = PINNED_CLIENT_CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
+        let guard = cache.lock();
+        let has = |port: u16| {
+            guard
+                .keys()
+                .any(|(h, p, _, _)| h == "127.0.0.1" && *p == port)
+        };
+        assert!(
+            has(8788) && has(9999),
+            "同 host 不同端口必须各自成键（键缺 port 时后写覆盖前写，缓存失效）"
+        );
     }
 }

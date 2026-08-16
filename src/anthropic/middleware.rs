@@ -55,8 +55,19 @@ pub async fn auth_middleware(
     match auth::extract_api_key(&request) {
         Some(key) if auth::constant_time_eq(&key, &state.api_key) => next.run(request).await,
         _ => {
-            let error = ErrorResponse::authentication_error();
-            (StatusCode::UNAUTHORIZED, Json(error)).into_response()
+            // D1 接入（M2 补充）：API key 不匹配走配置 key `api_key_invalid`
+            // （status/type/message 可配，默认 = 现状 401 + "Invalid API key"）。
+            let (status, error_type, message, _) = super::handlers::resolve_msg(
+                &super::handlers::current_error_messages(),
+                "api_key_invalid",
+                (
+                    StatusCode::UNAUTHORIZED,
+                    "authentication_error",
+                    "Invalid API key",
+                    None,
+                ),
+            );
+            (status, Json(ErrorResponse::new(error_type, message))).into_response()
         }
     }
 }

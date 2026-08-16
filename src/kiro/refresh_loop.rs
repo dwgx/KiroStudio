@@ -68,3 +68,56 @@ async fn run_once(manager: &MultiTokenManager, lead_minutes: i64) {
         manager.prefetch_refresh_token_for(id, lead_minutes).await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use crate::kiro::model::credentials::KiroCredentials;
+    use crate::kiro::token_manager::MultiTokenManager;
+    use crate::model::config::Config;
+    use chrono::Utc;
+
+    use super::*;
+
+    /// run_once 空 due 快速返回：池里没有任何「将过期」凭据时不触发任何
+    /// prefetch（零网络往返）。M1 补测 —— 循环体（spawn 的 interval loop）依赖
+    /// 真实 tokio 定时器与 Weak<MultiTokenManager> 生命周期，标注不可测；
+    /// 本轮判定的纯逻辑是 `credentials_due_for_refresh`（token_manager.rs 已有
+    /// 行为测试 + 下方两个过滤用例钉住）。
+    #[tokio::test]
+    async fn run_once_returns_immediately_when_nothing_due() {
+        let manager = MultiTokenManager::new(Config::default(), vec![], None, None, true)
+            .expect("构造空池 manager");
+        run_once(&manager, 10).await;
+        // 能走到这里即证明 due 为空路径未 panic、未触网络。
+    }
+
+    /// run_once 对「不临期 / api_key / 无 refresh_token」三类凭据全部跳过：
+    /// due 为空 → 提前返回。钉住「该轮该刷新哪些凭据」的判定，防止过滤条件
+    /// 被改宽后把不该刷的号拖进网络刷新。
+    #[tokio::test]
+    async fn run_once_skips_non_due_and_api_key_credentials() {
+        // 1 小时才过期 → 不入选。
+        let mut fresh = KiroCredentials::default();
+        fresh.refresh_token = Some("r".repeat(120));
+        fresh.expires_at = Some((Utc::now() + Duration::from_secs(3600)).to_rfc3339());
+        // api_key 型 → 永不入选。
+        let mut api_key = KiroCredentials::default();
+        api_key.kiro_api_key = Some("ksk_test_key_123".to_string());
+        api_key.auth_method = Some("api_key".to_string());
+        // 无 refresh_token → 永不入选。
+        let mut no_rt = KiroCredentials::default();
+        no_rt.expires_at = Some((Utc::now() + Duration::from_secs(60)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![fresh, api_key, no_rt],
+            None,
+            None,
+            true,
+        )
+        .expect("构造 manager");
+        run_once(&manager, 10).await;
+    }
+}

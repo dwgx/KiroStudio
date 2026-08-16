@@ -190,6 +190,9 @@ impl IpBlocklist {
 
 // ============ 入口每-IP 限流（固定窗口）============
 
+/// 入口全表清理的抽样间隔：每 [`CHECK_CLEANUP_INTERVAL`] 次 check 才 retain 一次。
+const CHECK_CLEANUP_INTERVAL: u32 = 256;
+
 /// 每-IP 固定窗口限流器：每 60s 窗口内计数，超 `max_per_min` 拒绝。
 ///
 /// 固定窗口实现简单、内存可控；窗口切换时计数归零。相比滑窗略宽松，
@@ -198,6 +201,9 @@ pub struct IngressRateLimiter {
     max_per_min: u32,
     /// ip -> (窗口起点, 该窗口内已计数)
     windows: Mutex<HashMap<IpAddr, (Instant, u32)>>,
+    /// 距上次全表清理的 check 次数（抽样清理：每 N 次 check 才 retain 一次，
+    /// 避免每请求 O(表长) 扫描 —— 见 `check`）。
+    checks_since_cleanup: Mutex<u32>,
 }
 
 impl IngressRateLimiter {
@@ -205,6 +211,7 @@ impl IngressRateLimiter {
         IngressRateLimiter {
             max_per_min,
             windows: Mutex::new(HashMap::new()),
+            checks_since_cleanup: Mutex::new(0),
         }
     }
 
@@ -222,8 +229,19 @@ impl IngressRateLimiter {
         let now = Instant::now();
         let mut map = self.windows.lock();
 
-        // 惰性清理：窗口整体过期的条目顺手移除，避免 map 无限增长
-        map.retain(|_, (start, _)| now.duration_since(*start) < window);
+        // 🔴 抽样清理（2026-08-15）：改前每请求全表 `retain` 扫描 —— 活跃 IP 数
+        // 多时每次 check 都是 O(表长)，入口限流热路径被清理成本拖慢。改为每
+        // CHECK_CLEANUP_INTERVAL 次 check 清一次：过期条目最多滞留一个清理间隔，
+        // 表长上界 = 每窗口活跃 IP 数 + 一个间隔内的新 IP，限流判定语义不变
+        // （窗口判定是逐条目的，清理只影响内存占用不影响计数）。
+        {
+            let mut checks = self.checks_since_cleanup.lock();
+            *checks += 1;
+            if *checks >= CHECK_CLEANUP_INTERVAL {
+                *checks = 0;
+                map.retain(|_, (start, _)| now.duration_since(*start) < window);
+            }
+        }
 
         let entry = map.entry(ip).or_insert((now, 0));
         if now.duration_since(entry.0) >= window {
@@ -370,6 +388,11 @@ pub async fn security_middleware(
         if let Some(ip) = ip {
             if state.blocklist.blocks(ip) {
                 tracing::debug!("入口 IP 黑名单拒绝: {:?}", ip);
+                // TODO(主线协调)：错误消息可配置化 D2 —— handlers.rs security_block_response
+                // 的同语义构造点已接 resolve_msg("permission_denied")（默认 403 +
+                // 「来源 IP 已被封禁」）；本中间件构造点尚未接入，需与 handlers 侧共用
+                // 同一 key/默认值（防双入口文案漂移）。接线时改走
+                // crate::anthropic::handlers::resolve_msg。
                 return (
                     StatusCode::FORBIDDEN,
                     Json(ErrorResponse::new("permission_error", "来源 IP 已被封禁")),
@@ -553,6 +576,32 @@ mod tests {
         // 另一 IP 独立计数
         let ip2: IpAddr = "5.6.7.8".parse().unwrap();
         assert!(rl.check(ip2));
+    }
+
+    /// MINOR 10 守卫：抽样清理不破坏计数/限流语义 —— 超过清理间隔的高频 check
+    /// 必须与逐次判定行为一致（放行的继续放行、超限的继续拒绝）。
+    #[test]
+    fn test_rate_limiter_sampled_cleanup_preserves_counting() {
+        let rl = IngressRateLimiter::new(10_000);
+        let ip: IpAddr = "9.9.9.9".parse().unwrap();
+        // 超过清理间隔（256）的次数：抽样清理触发多轮，放行语义不变。
+        for _ in 0..(CHECK_CLEANUP_INTERVAL + 10) {
+            assert!(rl.check(ip), "额度内高频 check 必须全部放行");
+        }
+        // 多 IP 交错也走清理路径。
+        let ip2: IpAddr = "8.8.8.8".parse().unwrap();
+        for i in 0..CHECK_CLEANUP_INTERVAL {
+            assert!(rl.check(if i % 2 == 0 { ip } else { ip2 }));
+        }
+        assert!(rl.check(ip2), "抽样清理后判定不受影响");
+
+        // 超限语义在抽样清理下依然成立。
+        let strict = IngressRateLimiter::new(3);
+        let ip3: IpAddr = "7.7.7.7".parse().unwrap();
+        for i in 0..CHECK_CLEANUP_INTERVAL {
+            let expected = i < 3;
+            assert_eq!(strict.check(ip3), expected, "第 {} 次判定应 {}", i + 1, expected);
+        }
     }
 
     #[test]

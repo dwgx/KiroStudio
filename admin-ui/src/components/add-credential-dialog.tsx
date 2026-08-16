@@ -4,6 +4,7 @@ import { toast } from 'sonner'
 import { CheckCircle2, XCircle, AlertCircle, AlertTriangle, Loader2, Check, RefreshCw } from 'lucide-react'
 import { Checkbox } from '@/components/ui/checkbox'
 import { useQueryClient, useQuery } from '@tanstack/react-query'
+import i18n from '@/i18n'
 import {
   Dialog,
   DialogContent,
@@ -149,7 +150,7 @@ function tolerantJsonParse(raw: string): unknown {
       lastErr = e
     }
   }
-  throw lastErr instanceof Error ? lastErr : new Error('无法解析 JSON')
+  throw lastErr instanceof Error ? lastErr : new Error(i18n.t('addcredentialdialog.error.jsonParseFail'))
 }
 
 // 把任意识别到的原始对象拉平成一个统一的凭据请求。兼容 camelCase / snake_case /
@@ -662,7 +663,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
           onOpenChange(o)
         }}
       >
-        <DialogContent className="sm:max-w-lg max-h-[85vh] flex flex-col">
+        <DialogContent className="sm:max-w-lg max-h-[85vh] flex flex-col" aria-describedby={undefined}>
           <DialogHeader>
             <DialogTitle>{t('addcredentialdialog.title')}</DialogTitle>
           </DialogHeader>
@@ -902,7 +903,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               {/* Region 配置(Kiro 专属:Token 刷新/API 请求 region)。自定义 API 代挂透传不适用,不显示 */}
               {authMethod !== 'custom_api' && (
               <div className="space-y-2">
-                <label className="text-sm font-medium">{t('addcredentialdialog.field.region.label')}</label>
+                <label htmlFor="authRegion" className="text-sm font-medium">{t('addcredentialdialog.field.region.label')}</label>
                 <div className="grid grid-cols-2 gap-2">
                   <div>
                     <Input
@@ -1245,7 +1246,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
               {/* 代理配置（手填） */}
               <div className={exitMode === 'manual' ? 'space-y-2' : 'hidden'}>
-                <label className="text-sm font-medium">{t('addcredentialdialog.field.proxy.label')}</label>
+                <label htmlFor="proxyUrl" className="text-sm font-medium">{t('addcredentialdialog.field.proxy.label')}</label>
                 <div className="flex items-center gap-2">
                   <Input
                     id="proxyUrl"
@@ -1261,6 +1262,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   <Input
                     id="proxyUsername"
                     placeholder={t('addcredentialdialog.field.proxyUsername.placeholder')}
+                    aria-label={t('addcredentialdialog.field.proxyUsername.label')}
                     value={proxyUsername}
                     onChange={(e) => setProxyUsername(e.target.value)}
                     disabled={isPending}
@@ -1269,6 +1271,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     id="proxyPassword"
                     type="password"
                     placeholder={t('addcredentialdialog.field.proxyPassword.placeholder')}
+                    aria-label={t('addcredentialdialog.field.proxyPassword.label')}
                     value={proxyPassword}
                     onChange={(e) => setProxyPassword(e.target.value)}
                     disabled={isPending}
@@ -1300,8 +1303,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
             <div className="flex flex-col min-h-0 flex-1">
               <div className="space-y-4 py-4 overflow-y-auto flex-1 pr-1">
                 <div className="space-y-2">
-                  <label className="text-sm font-medium">{t('addcredentialdialog.paste.label')}</label>
+                  <label htmlFor="paste-input" className="text-sm font-medium">{t('addcredentialdialog.paste.label')}</label>
                   <textarea
+                    id="paste-input"
                     value={pasteInput}
                     onChange={(e) => setPasteInput(e.target.value)}
                     disabled={importing}

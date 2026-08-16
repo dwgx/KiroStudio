@@ -6,6 +6,7 @@ import { StatCard } from '@/components/ui/stat-card'
 import { AnimatedNumber } from '@/components/ui/animated-number'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useCredentials, useCachedBalances } from '@/hooks/use-credentials'
+import { isSuspiciousCooldown } from '@/lib/cooldown'
 import { useUsageOverview, useUsageTimeseries, useUsageRecentLive, useRatelimitInsights } from '@/hooks/use-usage'
 import { Sparkline } from '@/components/overview/Sparkline'
 import { RadialGauge } from '@/components/overview/RadialGauge'
@@ -14,6 +15,7 @@ import { type CellActivity } from '@/components/overview/StatusHeatmap'
 import { RankBars } from '@/components/overview/RankBars'
 import { GlowGrid } from '@/components/overview/GlowGrid'
 import { StatusBars } from '@/components/overview/StatusBars'
+import { PerfDashboard } from '@/components/overview/perf-dashboard'
 import { useUiLayoutPrefs } from '@/hooks/use-ui-layout-prefs'
 import { AreaTrendChart } from '@/components/overview/AreaTrendChart'
 import { authLabel } from '@/lib/i18n-labels'
@@ -80,8 +82,9 @@ function assessRisk(it: RateLimitInsight): { level: RiskLevel; labelKey: string;
     return { level: 'disabled', labelKey: 'overviewpage.risk.disabled', pct: 0 }
   }
   // 冷却中（尤其可疑活动风控）= 已经被限流,最高危。
+  // 判据走稳定枚举码 code（与 use-pool-notifications 的 suspicious 判定共用 helper）。
   if (it.cooldown) {
-    const isSuspicious = it.cooldown.reason.includes('可疑')
+    const isSuspicious = isSuspiciousCooldown(it.cooldown.code)
     return {
       level: 'limited',
       labelKey: isSuspicious ? 'overviewpage.risk.suspicious' : 'overviewpage.risk.cooldown',
@@ -146,7 +149,7 @@ function RateLimitDashboard({
         ? t('overviewpage.dashboard.summary.watch')
         : t('overviewpage.dashboard.summary.clear')
     return { level: worst, text, limited }
-  }, [insights])
+  }, [insights, t])
 
   const tone = RISK_TONE[summary.level]
   // 图标语义化(去雪花):畅通=盾牌勾,偏高=量表,即将/被限=警告盾牌/三角。
@@ -450,7 +453,7 @@ export function OverviewPage() {
       }))
 
     return { total, available, disabled, isEmpty, authSegments, healthSegments, topUsed, creds }
-  }, [data])
+  }, [data, t])
 
   // KPI 卡固定展示 24h（sparkline 用 24h 末 24 桶）。
   const w24 = overview.data?.last_24h
@@ -710,6 +713,13 @@ export function OverviewPage() {
           />
         )}
       </div>
+
+      {/* Row 1.5：性能仪表盘 —— 统计区下方；显示/隐藏由设置页「外观」分区开关控制（localStorage，默认显示）。
+          数据全走本页已共享的查询（recent 4s / hourly+overview 30s），自身仅新增 3 个只读小查询，
+          隐藏时整块卸载、轮询随之停止。用量统计未启用时整块隐藏（与趋势卡同策略）。 */}
+      {!usageDisabled && prefs.showPerfDashboard && (
+        <PerfDashboard recent={recent.data} hourly={hourly.data} overview={overview.data} creds={stats.creds} />
+      )}
 
       {/* Row 2：号池状态（主体）—— 三视图切换，默认发光网格 */}
       <Card className="p-5">

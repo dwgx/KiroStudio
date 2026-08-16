@@ -335,7 +335,16 @@ pub fn effective_model(raw_model: &str, cfg: &DeepseekNormalizeConfig, whitelist
             return raw_model.to_string();
         }
     }
-    cfg.fallback_model.clone()
+    // 🔴 2026-08-15 严格语义修复（对齐 sub2api/newapi）：fallback 兜底**只对 claude-*
+    // 生态**生效——客户端请求 claude-* 想跑 deepseek 是这条链的设计语义（归一化改写）。
+    // 其余模型（gpt-* 等 OpenAI 系）**保持原名**：它们有自己专属的渠道（如 gpt 中转站
+    // 的白名单），改写成 deepseek-v4-flash 打进 deepseek 链是**错误归属**——白名单闸
+    // 对原名直接判定（不匹配就过滤），绝不猜改写。用户若真想 gpt → deepseek，在 deepseek
+    // 号的白名单里显式列出即可（白名单优先分支已覆盖）。
+    if raw_model.starts_with("claude-") {
+        return cfg.fallback_model.clone();
+    }
+    raw_model.to_string()
 }
 
 /// 把 `messages[].content` 的**字符串**形态转成单个 text 内容块数组。
@@ -495,7 +504,9 @@ mod tests {
     #[test]
     fn model_is_rewritten_to_fallback_when_not_deepseek() {
         assert_eq!(norm(serde_json::json!({ "model": "claude-sonnet-4" }))["model"], "deepseek-v4-flash");
-        assert_eq!(norm(serde_json::json!({ "model": "gpt-4o" }))["model"], "deepseek-v4-flash");
+        // 🔴 2026-08-15 严格语义：gpt-* 不再被改写进 deepseek 链（保持原名，由
+        // gpt 专属渠道服务；选号白名单对原名判定，不匹配即过滤）。
+        assert_eq!(norm(serde_json::json!({ "model": "gpt-4o" }))["model"], "gpt-4o");
         assert_eq!(norm(serde_json::json!({ "model": "deepseek-v4-flash" }))["model"], "deepseek-v4-flash");
         assert_eq!(norm(serde_json::json!({ "model": "deepseek-reasoner" }))["model"], "deepseek-reasoner");
     }
@@ -896,5 +907,96 @@ mod tests {
         let empty: DeepseekNormalizeOverride = serde_json::from_str(r#"{}"#).unwrap();
         assert!(empty.fallback_model.is_none());
         assert!(empty.min_max_tokens.is_none());
+    }
+
+    /// 🔴 1439 bug 的核心分支（全仓零直接覆盖）：`effective_model` 的白名单感知判定。
+    ///
+    /// 该函数是选号层（token_manager select_custom_api_inner）与改写层（normalize_request
+    /// 第 0 步）的**共用**判定——删掉任何一支都会让「选中了但改写后打不通」的口径分裂复发。
+    ///
+    /// 分支矩阵：① 白名单含原名（大小写变体）→ 保持原名；② 白名单不含 → 仅 claude-*
+    /// 走 fallback；③ deepseek-* 保留；④ gpt-* 保留；⑤ 无白名单 → claude-* fallback。
+    #[test]
+    fn effective_model_whitelist_aware_branch() {
+        let cfg = DeepseekNormalizeConfig::default();
+        assert_eq!(cfg.fallback_model, "deepseek-v4-flash", "测试依赖默认 fallback");
+
+        // ① 白名单含原名（大小写变体）→ 保持原名：1439 白名单含 claude-mythos-5 的号
+        //    请求 claude-mythos-5 时不得改写，否则打过去上游不认、报误导性 400。
+        let wl_has_orig = vec!["Claude-Mythos-5".to_string()];
+        assert_eq!(
+            effective_model("claude-mythos-5", &cfg, Some(wl_has_orig.as_slice())),
+            "claude-mythos-5",
+            "白名单命中（大小写不敏感）必须保持原名"
+        );
+
+        // ② 白名单不含 → claude-* 走 fallback（选号预判与改写层同源）。
+        let wl_ds = vec!["deepseek-v4-flash".to_string()];
+        assert_eq!(
+            effective_model("claude-opus-5", &cfg, Some(wl_ds.as_slice())),
+            "deepseek-v4-flash",
+            "白名单外的 claude-* 必须改写为 fallback"
+        );
+
+        // ③ deepseek-* 保留（即使白名单不含）。
+        assert_eq!(
+            effective_model("deepseek-v4-pro", &cfg, Some(wl_ds.as_slice())),
+            "deepseek-v4-pro"
+        );
+
+        // ④ gpt-* 保留（OpenAI 系有专属渠道，不得改写进 deepseek 链——严格语义修复）。
+        assert_eq!(
+            effective_model("gpt-5.6-sol", &cfg, Some(wl_ds.as_slice())),
+            "gpt-5.6-sol"
+        );
+
+        // ⑤ 无白名单 → claude-* fallback。
+        assert_eq!(
+            effective_model("claude-sonnet-4-5", &cfg, None),
+            "deepseek-v4-flash"
+        );
+    }
+
+    /// 大小写变体钉住：`Claude-Sonnet-4`（大写 C）不命中 `starts_with("claude-")` → 保持原名。
+    ///
+    /// **判定：intended，非 bug。** `effective_model` 与 `normalize_request` 第 0 步同源
+    /// （normalize_request 直接调它）——两处同样大小写敏感：改写层不把大写变体改写为
+    /// fallback，预判层保持原名 = 实际发送给上游的模型名，自洽无分叉。若未来 normalize
+    /// 改为大小写不敏感，本测试断言必须同步改（届时再评估是否该改成对 claude- 大小写不敏感）。
+    #[test]
+    fn effective_model_case_variants() {
+        let cfg = DeepseekNormalizeConfig::default();
+        assert_eq!(
+            effective_model("Claude-Sonnet-4", &cfg, None),
+            "Claude-Sonnet-4",
+            "大写 C 不命中 claude- 前缀，保持原名（与 normalize 第 0 步同源同行为）"
+        );
+    }
+
+    /// 空串与前缀边界：空串原样返回（白名单判定对空串命中保持原名）；
+    /// 无横线的 `deepseek` 不命中 `deepseek-` 前缀，保持原名；
+    /// 白名单含空串条目对非空模型无影响。
+    #[test]
+    fn effective_model_empty_and_prefix_edge() {
+        let cfg = DeepseekNormalizeConfig::default();
+        assert_eq!(effective_model("", &cfg, None), "", "空模型保持原名");
+
+        assert_eq!(
+            effective_model("deepseek", &cfg, None),
+            "deepseek",
+            "无横线不命中 deepseek- 前缀，保持原名"
+        );
+
+        let wl_empty = vec!["".to_string()];
+        assert_eq!(
+            effective_model("claude-opus-5", &cfg, Some(wl_empty.as_slice())),
+            "deepseek-v4-flash",
+            "白名单空串条目不影响非空模型"
+        );
+        assert_eq!(
+            effective_model("", &cfg, Some(wl_empty.as_slice())),
+            "",
+            "空模型命中空串白名单条目 → 保持原名（eq_ignore_ascii_case 匹配）"
+        );
     }
 }

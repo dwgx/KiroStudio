@@ -21,6 +21,13 @@ pub enum AdminServiceError {
     /// 凭据无效（验证失败）
     InvalidCredential(String),
 
+    /// 凭据重复（refreshToken / kiroApiKey 与池中已有凭据冲突）。
+    ///
+    /// 与 `InvalidCredential` 分开是为了给前端一个**稳定可判别的 error.type**
+    /// （`duplicate_credential`）：前端「自动强制恢复」等处置依赖它，且不随
+    /// 中文文案改写/翻译而失配（语言耦合改造，见 docs/cooldown-reason-i18n-design.md §5）。
+    DuplicateCredential(String),
+
     /// 上游查询超时**且无历史缓存可降级**（当前只用于余额查询）。
     ///
     /// 与 `UpstreamError` 分开是为了给前端一个明确可区分的语义：
@@ -41,6 +48,7 @@ impl fmt::Display for AdminServiceError {
             AdminServiceError::UpstreamError(msg) => write!(f, "上游服务错误: {}", msg),
             AdminServiceError::InternalError(msg) => write!(f, "内部错误: {}", msg),
             AdminServiceError::InvalidCredential(msg) => write!(f, "凭据无效: {}", msg),
+            AdminServiceError::DuplicateCredential(msg) => write!(f, "凭据重复: {}", msg),
             AdminServiceError::UpstreamTimeout(id) => {
                 write!(f, "凭据 #{} 余额查询上游超时（无历史值可降级）", id)
             }
@@ -59,6 +67,7 @@ impl AdminServiceError {
             AdminServiceError::UpstreamError(_) => StatusCode::BAD_GATEWAY,
             AdminServiceError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AdminServiceError::InvalidCredential(_) => StatusCode::BAD_REQUEST,
+            AdminServiceError::DuplicateCredential(_) => StatusCode::BAD_REQUEST,
             // 上游超时：504 而非 502 —— 语义上是"等不到"而非"上游报错"，
             // 前端据此显示"稍后重试"而不是把凭据标成异常。
             AdminServiceError::UpstreamTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
@@ -84,6 +93,9 @@ impl AdminServiceError {
             }
             AdminServiceError::InvalidCredential(_) => {
                 AdminErrorResponse::invalid_request(self.to_string())
+            }
+            AdminServiceError::DuplicateCredential(_) => {
+                AdminErrorResponse::new("duplicate_credential", self.to_string())
             }
             AdminServiceError::UpstreamTimeout(_) => {
                 AdminErrorResponse::api_error(self.to_string())

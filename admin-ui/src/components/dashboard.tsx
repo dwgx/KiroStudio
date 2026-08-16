@@ -641,10 +641,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           if (res.skipped.length > 0) {
             // 跳过的（含自愈中、代挂、透传）逐条可见——用户才知道为什么没清掉。
             const reasons = res.skipped.slice(0, 5).map((x) => `#${x.id}: ${x.reason}`).join('\n')
-            toast.info(reasons + (res.skipped.length > 5 ? `\n…共 ${res.skipped.length} 条跳过` : ''))
+            toast.info(reasons + (res.skipped.length > 5 ? '\n' + t('dashboard.clearAll.skippedMore', { count: res.skipped.length }) : ''))
           }
         } catch (err) {
-          toast.error(t('dashboard.clearAll.onlyPassthrough', { count: 0 }) + extractErrorMessage(err))
+          toast.error(t('dashboard.batchDelete.requestFailed') + extractErrorMessage(err))
         }
         deselectAll()
       },
@@ -909,13 +909,13 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
             >
               {isLoadingMode ? t('dashboard.loadBalancing.loading') : (loadBalancingData?.mode === 'priority' ? t('dashboard.loadBalancing.priorityMode') : t('dashboard.loadBalancing.balancedShort'))}
             </Button>
-            <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
+            <Button variant="ghost" size="icon" onClick={toggleDarkMode} aria-label={t('dashboard.toolbar.darkMode')}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
             </Button>
-            <Button variant="ghost" size="icon" onClick={handleRefresh}>
+            <Button variant="ghost" size="icon" onClick={handleRefresh} aria-label={t('dashboard.toolbar.refreshList')}>
               <RefreshCw className="h-5 w-5" />
             </Button>
-            <Button variant="ghost" size="icon" onClick={handleLogout}>
+            <Button variant="ghost" size="icon" onClick={handleLogout} aria-label={t('appshell.action.logout')}>
               <LogOut className="h-5 w-5" />
             </Button>
           </div>
@@ -1009,6 +1009,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                       key={v}
                       type="button"
                       aria-pressed={on}
+                      aria-label={label}
                       title={label}
                       onClick={() => setUiPrefs({ credentialView: v })}
                       className={`inline-flex h-8 items-center gap-1.5 rounded px-2 text-xs font-medium transition-colors ${
@@ -1032,7 +1033,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   >
                     {isLoadingMode ? t('dashboard.loadBalancing.loading') : (loadBalancingData?.mode === 'priority' ? t('dashboard.loadBalancing.priorityMode') : t('dashboard.loadBalancing.balancedShort'))}
                   </Button>
-                  <Button variant="outline" size="sm" onClick={handleRefresh} title={t('dashboard.toolbar.refreshList')}>
+                  <Button variant="outline" size="sm" onClick={handleRefresh} title={t('dashboard.toolbar.refreshList')} aria-label={t('dashboard.toolbar.refreshList')}>
                     <RefreshCw className="h-4 w-4" />
                   </Button>
                 </>
@@ -1045,7 +1046,9 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   </Button>
                   <Button onClick={handleExportSelected} size="sm" variant="outline" disabled={exportingSelected}>
                     <Download className={`h-4 w-4 mr-2 ${exportingSelected ? 'animate-spin' : ''}`} />
-                    {exportingSelected ? `导出中... ${exportProgress.current}/${exportProgress.total}` : '导出选中'}
+                    {exportingSelected
+                      ? t('dashboard.toolbar.exportingSelected', { current: exportProgress.current, total: exportProgress.total })
+                      : t('dashboard.toolbar.exportSelected')}
                   </Button>
                   <Button onClick={handleTestModels} size="sm" variant="outline">
                     <FlaskConical className="h-4 w-4 mr-2" />

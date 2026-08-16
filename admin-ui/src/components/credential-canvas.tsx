@@ -533,17 +533,19 @@ export function CredentialCanvas({ credentials, onContextMenu, className }: Cred
 
       {/* 重命名弹框（与行/卡的 name 编辑同契约：传空 = 清除别名） */}
       <Dialog open={!!renaming} onOpenChange={(v) => !v && setRenaming(null)}>
-        <DialogContent className="max-w-sm">
+        <DialogContent className="max-w-sm" aria-describedby={undefined}>
           <DialogHeader>
             <DialogTitle>{t('dashboard.canvas.rename.title', { id: renaming?.id ?? '' })}</DialogTitle>
           </DialogHeader>
           <Input
+            id="canvas-rename"
             value={renameValue}
             onChange={(e) => setRenameValue(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === 'Enter') submitRename()
             }}
             placeholder={t('dashboard.canvas.rename.label')}
+            aria-label={t('dashboard.canvas.rename.title', { id: renaming?.id ?? '' })}
             autoFocus
           />
           <DialogFooter>

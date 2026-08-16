@@ -25,9 +25,12 @@ export function ComboInput({
   'aria-label'?: string
 }) {
   const listId = useId()
+  // a11y：输入框需要 id（DevTools「form field 缺 id/name」告警），useId 保证实例间唯一。
+  const inputId = useId()
   return (
     <>
       <input
+        id={inputId}
         list={listId}
         value={value}
         placeholder={placeholder}

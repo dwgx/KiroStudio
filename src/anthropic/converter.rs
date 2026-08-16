@@ -2178,14 +2178,19 @@ fn convert_tools(
         // 不受影响。
         .map(|t| {
             // Anthropic 服务端工具形态（`type: web_search_*`、可能没有 name）→ 归一化成
-            // 函数工具 `name: web_search`，让下面的通用转换命中内置 schema。
+            // 函数工具。⚠️ 补名必须用 Claude Code 内置表的 key **"WebSearch"**（大写）：
+            // `claude_code_tool_name_to_kiro` 是大小写敏感映射，补小写 `web_search`
+            // 会错过 `is_builtin` 判定 → 即使 `tool_compat_mapping` 开关开着也取不到
+            // 内置 `{query}` schema（2026-08-15 对抗审查发现，原实现补小写名有缺陷）。
+            // 归一化后经通用转换：`map_client_tool_name_to_kiro("WebSearch")` →
+            // Kiro 原生名 `web_search`（上游 tool_use 回传同名，回灌判定 name-only 命中）。
             let is_server_web_search = t
                 .tool_type
                 .as_deref()
                 .is_some_and(|ty| ty.starts_with("web_search"));
-            if is_server_web_search && t.name != "web_search" {
+            if is_server_web_search && t.name != "WebSearch" {
                 let mut normalized = t.clone();
-                normalized.name = "web_search".to_string();
+                normalized.name = "WebSearch".to_string();
                 normalized.tool_type = None;
                 normalized
             } else {
@@ -3619,6 +3624,51 @@ mod tests {
         );
     }
 
+    /// 🔴 MAJOR-1 守卫（对抗审查，2026-08-15）：type-only 形态（name 缺失、仅
+    /// `type: web_search_*`，非官方 server tool 形态）必须被归一化分支改写为
+    /// `name: web_search` + 清掉 Anthropic 服务端 type —— 搜索能力保留在 converter
+    /// 归一化层（网关入站判定不代答，见 websearch.rs 守卫）。该分支此前零覆盖，
+    /// 删掉不会红，本条补上：删分支（name 落空串）即 FAIL。
+    #[test]
+    fn test_convert_tools_normalizes_type_only_web_search() {
+        use super::super::types::Tool as AnthropicTool;
+
+        // is_builtin 分支依赖 tool_compat_mapping 开关（默认关，无配置入口）；
+        // 测试显式开启以验证「归一化后命中内置 web_search schema」的完整链。
+        set_tool_compat_mapping(true);
+
+        let mk = |name: &str, ty: Option<&str>| AnthropicTool {
+            name: name.to_string(),
+            description: String::new(),
+            input_schema: std::collections::HashMap::new(),
+            tool_type: ty.map(|s| s.to_string()),
+            max_uses: None,
+            cache_control: None,
+        };
+
+        let tools = Some(vec![mk("", Some("web_search_20250305"))]);
+        let mut map = HashMap::new();
+        let converted = convert_tools(&tools, &mut map);
+
+        assert_eq!(converted.len(), 1, "type-only web_search 必须归一化保留，不得剥除");
+        let spec = &converted[0].tool_specification;
+        assert_eq!(
+            spec.name, "web_search",
+            "归一化补 WebSearch（内置表 key）后经映射必须落到 Kiro 原生名 web_search"
+        );
+        // Kiro 工具结构无 tool_type 字段（归一化即丢弃 Anthropic 服务端 type），
+        // 开关开启时 schema 应命中内置 web_search schema（{query}）—— 搜索能力完整保留。
+        let schema: serde_json::Value = spec.input_schema.json.clone();
+        assert!(
+            schema["properties"].get("query").is_some(),
+            "归一化后的 schema 必须是内置 web_search schema（含 query）"
+        );
+        assert!(
+            schema["properties"].get("type").is_none() && schema["properties"].get("name").is_none(),
+            "Anthropic 服务端 type/name 字段不得泄漏进 schema"
+        );
+    }
+
     #[test]
     fn test_convert_tools_regular_tool_unaffected() {
         use super::super::types::Tool as AnthropicTool;
@@ -3676,7 +3726,6 @@ mod tests {
 
     /// 入站参数转换：Claude Code 参数 → Kiro 参数（file_path→path、content→text、
     /// old_string→oldStr、offset/limit→start_line/end_line）。
-    #[test]
     /// 🔴 `Read.pages` 必须**降级而非报错**（2026-08-10 修，线上实测缺陷）。
     ///
     /// 改前：带 `pages` 的 Read 直接 `Err(UnsupportedToolMapping)` ⇒ handlers 渲染成

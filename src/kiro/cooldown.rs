@@ -25,13 +25,11 @@ fn duration_since_or_zero(a: SystemTime, b: SystemTime) -> Duration {
 
 /// 冷却原因
 ///
-/// **当前触发覆盖** (Round 7 静态审查 2026-05-13):
+/// **当前触发覆盖** (Round 7 静态审查 2026-05-13；2026-08-16 复核)：
 ///   生产代码中实际调用 `set_cooldown` 触发的变体:
 ///     - `RateLimitExceeded`  ← 上游 429 + 普通 throttle
 ///     - `TokenRefreshFailed` ← refresh wire 失败
 ///     - `ServerError`        ← 上游 5xx
-///     - `ModelUnavailable`   ← `MODEL_TEMPORARILY_UNAVAILABLE` 全局熔断
-///
 ///     - `SuspiciousActivity`  ← 403 `TEMPORARILY_SUSPENDED` 账户级软风控
 ///     - `AuthenticationFailed` ← `token_manager::report_auth_cooldown`
 ///                               （**只剩「从未成功过的号刷新还失败」这一类**：
@@ -43,9 +41,14 @@ fn duration_since_or_zero(a: SystemTime, b: SystemTime) -> Duration {
 ///                                force-refresh 失败但该号已成功过、一处
 ///                                `bearer_invalid_but_proven`；外加 403
 ///                                FEATURE_NOT_SUPPORTED 且后台重探已启动）
-///     - `AccountSuspended`    ← `token_manager::report_account_suspended`
 ///
-///   尚未被 set_cooldown 实际触发的变体（保留作为 future 分类点）:
+///   **生产从未触发**的变体（2026-08-16 复核。枚举保留：`code()` 是面板/i18n
+///   的稳定 API 面，删除变体会破坏前端判定；`default_duration()` 仅作文档参考）:
+///     - `AccountSuspended`    — 历史由 `token_manager::report_account_suspended`
+///                               设过冷却；该函数已改走**直接禁用凭据**（不设冷却），
+///                               生产零 set_cooldown 调用
+///     - `ModelUnavailable`    — 全仓无 set_cooldown 调用点（MODEL_TEMPORARILY
+///                               _UNAVAILABLE 走其它路径），时长表 300s 为不可达值
 ///     - `QuotaExhausted`      — 月度配额耗尽（目前走 RateLimitExceeded）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum CooldownReason {
@@ -81,7 +84,7 @@ pub enum CooldownReason {
     ///
     /// 共用一个变体的代价是**不对称的**：把瞬态当永久 = 一次抖动冻掉一个健康号 24h
     /// （`is_auto_recoverable=false` ⇒ `calculate_cooldown_duration` 走
-    /// `long_cooldown_secs`=86400s，且不禁用 ⇒ 面板只显示「冷却中」的僵尸，
+    /// `long_cooldown_secs`=`LONG_COOLDOWN_SECS`，且不禁用 ⇒ 面板只显示「冷却中」的僵尸，
     /// 比禁用更难发现）；把永久当瞬态 = 每 20s 多打一次注定失败的上游往返，可逆。
     /// 所以只能拆变体，不能改 `AuthenticationFailed` 的时长。
     ///
@@ -104,29 +107,32 @@ impl CooldownReason {
             // 短冷却：429 瞬时限流是上游 burst 软保护、通常几秒内自愈，基线取小
             // （15s），避免小号池下一个卡住的请求把整池长时间压死（见 calculate_cooldown_duration
             // 的温和递增 + 平静期衰减）。
-            CooldownReason::RateLimitExceeded => Duration::from_secs(15),
+            CooldownReason::RateLimitExceeded => Duration::from_secs(RATE_LIMIT_COOLDOWN_SECS),
             // 可疑活动风控：基线 20s（实测这是账户级"软"风控——甩个 429 后号几秒就又能用，
             // 一上来就冷却 3min 会把还能用的号白白雪藏、可用号变少）。基线短给号喘息，
             // 只有**反复**触发才由 calculate_cooldown_duration 陡增退避（见那里 1.6^n + 30min 上限）。
-            CooldownReason::SuspiciousActivity => Duration::from_secs(20),
-            CooldownReason::TokenRefreshFailed => Duration::from_secs(60),
+            CooldownReason::SuspiciousActivity => Duration::from_secs(SUSPICIOUS_COOLDOWN_SECS),
+            CooldownReason::TokenRefreshFailed => Duration::from_secs(TOKEN_REFRESH_COOLDOWN_SECS),
             // 瞬态认证失败：基线取 20s，与 `SuspiciousActivity` 及 handlers 的
             // `UPSTREAM_SUSPENDED_RETRY_AFTER_SECS` 同档 —— 它们描述的是同一类
             // 「上游几十秒后自愈」的账户级抖动。取这个值而非更短，是因为该号刚被上游
             // 拒过一次，秒级回池等于立刻再撞；也不取分钟级，因为小号池下多冻一个号
             // 比多撞一次上游更糟（同 RATE_LIMIT_FLOOR_SECS 的取值理由）。
             // 反复触发由 calculate_cooldown_duration 的 1.3^n 递增兜住（上限 90s）。
-            CooldownReason::AuthTransient => Duration::from_secs(20),
-            CooldownReason::ServerError => Duration::from_secs(30),
-            CooldownReason::ModelUnavailable => Duration::from_secs(300),
+            CooldownReason::AuthTransient => Duration::from_secs(AUTH_TRANSIENT_COOLDOWN_SECS),
+            CooldownReason::ServerError => Duration::from_secs(SERVER_ERROR_COOLDOWN_SECS),
+            // ⚠️ 不可达死值：ModelUnavailable 生产从未触发（见枚举文档），300s 仅作文档参考。
+            CooldownReason::ModelUnavailable => {
+                Duration::from_secs(MODEL_UNAVAILABLE_COOLDOWN_SECS)
+            }
 
             // 长冷却（24 小时）
             // 注意：default_duration() 仅供文档/展示参考。AuthenticationFailed /
             // AccountSuspended / QuotaExhausted 均属不可自动恢复（is_auto_recoverable=false），
-            // calculate_cooldown_duration 实际走 long_cooldown_secs（= 86400s），而非此处的值。
-            CooldownReason::AuthenticationFailed => Duration::from_secs(86400),
-            CooldownReason::AccountSuspended => Duration::from_secs(86400),
-            CooldownReason::QuotaExhausted => Duration::from_secs(86400),
+            // calculate_cooldown_duration 实际走 long_cooldown_secs（= LONG_COOLDOWN_SECS），而非此处的值。
+            CooldownReason::AuthenticationFailed => Duration::from_secs(LONG_COOLDOWN_SECS),
+            CooldownReason::AccountSuspended => Duration::from_secs(LONG_COOLDOWN_SECS),
+            CooldownReason::QuotaExhausted => Duration::from_secs(LONG_COOLDOWN_SECS),
         }
     }
 
@@ -140,7 +146,7 @@ impl CooldownReason {
             CooldownReason::ServerError => true,
             CooldownReason::ModelUnavailable => true,
             // 承重：必须 true。false 会让 calculate_cooldown_duration 走
-            // long_cooldown_secs(86400s) 那条分支 —— 那正是本变体要修的僵尸行为。
+            // long_cooldown_secs(`LONG_COOLDOWN_SECS`) 那条分支 —— 那正是本变体要修的僵尸行为。
             // 它同时决定 token_manager::fallback_cooldown_tier 把该号判 Shallow 而非
             // Deep（全池冷却兜底时，会自愈的号该优先于铁定失败的号）。
             CooldownReason::AuthTransient => true,
@@ -166,6 +172,25 @@ impl CooldownReason {
             CooldownReason::ModelUnavailable => "模型暂时不可用",
         }
     }
+
+    /// 稳定枚举码（snake_case，admin API 下发 `cooldownCode`）。
+    ///
+    /// 前端判定与 i18n 一律走此码；`description()` 的中文文案**只作展示**，
+    /// 改了不再静默破坏前端判定（语言耦合改造，见 docs/cooldown-reason-i18n-design.md）。
+    /// 稳定 API 面：新增变体必须同步补码，码值不得复用/改写。
+    pub fn code(&self) -> &'static str {
+        match self {
+            CooldownReason::RateLimitExceeded => "rate_limited",
+            CooldownReason::SuspiciousActivity => "suspicious",
+            CooldownReason::AccountSuspended => "account_suspended",
+            CooldownReason::QuotaExhausted => "quota_exhausted",
+            CooldownReason::TokenRefreshFailed => "token_refresh_failed",
+            CooldownReason::AuthenticationFailed => "authentication_failed",
+            CooldownReason::AuthTransient => "auth_transient",
+            CooldownReason::ServerError => "server_error",
+            CooldownReason::ModelUnavailable => "model_unavailable",
+        }
+    }
 }
 
 /// `RateLimitExceeded` 的缩放下限（秒）。
@@ -182,6 +207,49 @@ const RATE_LIMIT_FLOOR_SECS: u64 = 8;
 /// （见 `report_suspicious_activity` 的说明）。但同样不取分钟级，
 /// 理由与上面一致 —— 小号池全冷却比偶尔多撞一次更糟。
 const SUSPICIOUS_FLOOR_SECS: u64 = 12;
+
+// ==================== 基线时长表（`default_duration` 的单一真相源）====================
+//
+// 与**透传池**冷却时长的有意差异（交叉引用，见 provider.rs 透传 failover 的
+// `cooldown_secs` 映射表）：
+//   - 429：Kiro `RATE_LIMIT_COOLDOWN_SECS`=15s vs 透传 5s —— Kiro 号 429 是账号级
+//     惩罚窗口（USER_REQUEST_RATE_EXCEEDED），基线更长；透传号是用户自购的中转站，
+//     「它现在忙」而已，极短跳过即可。
+//   - 401：Kiro `LONG_COOLDOWN_SECS`=86400s vs 透传 180s —— Kiro 401 意味着凭据真废
+//     （refreshToken 失效），24h 长冷却 + 人工换号才恢复；透传 180s 只是调度级跳过
+//     （绝不自动禁用），过期即恢复探测。
+// 两对差异各自有意，勿"统一"（历史教训：把 Kiro 风控模型错套到透传号上，见
+// provider.rs 该映射表的注释）。
+
+/// `RateLimitExceeded` 基线时长（秒）。429 是上游 burst 软保护、通常几秒内自愈。
+const RATE_LIMIT_COOLDOWN_SECS: u64 = 15;
+
+/// `SuspiciousActivity` 基线时长（秒）。账户级软风控（实测甩个 429 后几秒就能用），
+/// 基线短给号喘息，只有**反复**触发才由 `calculate_cooldown_duration` 陡增退避。
+const SUSPICIOUS_COOLDOWN_SECS: u64 = 20;
+
+/// `TokenRefreshFailed` 基线时长（秒）。
+const TOKEN_REFRESH_COOLDOWN_SECS: u64 = 60;
+
+/// `AuthTransient` 基线时长（秒）。与 `SUSPICIOUS_COOLDOWN_SECS` 同档（同一类
+/// 「上游几十秒自愈」的账户级抖动）；反复触发由 `calculate_cooldown_duration`
+/// 的 1.3^n 递增兜住（上限 90s）。
+const AUTH_TRANSIENT_COOLDOWN_SECS: u64 = 20;
+
+/// `ServerError` 基线时长（秒）。
+const SERVER_ERROR_COOLDOWN_SECS: u64 = 30;
+
+/// `ModelUnavailable` 时长（秒）——**不可达死值**：该变体生产从未触发（见
+/// `CooldownReason` 枚举文档「生产从未触发的变体」），300s 仅作文档参考。
+const MODEL_UNAVAILABLE_COOLDOWN_SECS: u64 = 300;
+
+/// 不可自动恢复原因（`AuthenticationFailed`/`AccountSuspended`/`QuotaExhausted`）
+/// 的长冷却（秒）= 24 小时。供 `default_duration()` 与构造器共用。
+const LONG_COOLDOWN_SECS: u64 = 86400;
+
+/// 短冷却上限（秒）：可自动恢复原因经退避递增后的封顶。
+/// 原 300s 太黏，小号池下一个卡住请求能把整池压死数分钟，故取 90s。
+const MAX_SHORT_COOLDOWN_SECS: u64 = 90;
 
 /// 冷却状态持久化文件名（与凭据统计文件同目录）。
 const COOLDOWN_STATE_FILE: &str = "kiro_cooldown.json";
@@ -216,8 +284,16 @@ struct PersistState {
     /// 是否有未落盘的变更（debounce 判定用）
     dirty: std::sync::atomic::AtomicBool,
 
+    /// 状态版本号：每次状态变更（mark_dirty）递增。save() 落盘成功后仅在
+    /// 「版本未再变」时清除 dirty —— 防止落盘期间的新变更被误清（丢更新）。
+    version: std::sync::atomic::AtomicU64,
+
     /// 上次成功落盘时刻（debounce 判定用；仅内存态，不落盘）
     last_save_at: Mutex<Option<Instant>>,
+
+    /// save 串行化锁：快照→序列化→落盘全在锁内，杜绝两个并发 save 交错
+    /// （旧快照最后落盘 + dirty 无条件清除 = 变更丢盘）。
+    save_lock: Mutex<()>,
 }
 
 /// 落盘格式：credential_id（字符串键，与凭据统计同构）→ 冷却条目
@@ -285,8 +361,8 @@ impl CooldownManager {
     pub fn new() -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
-            max_short_cooldown_secs: 90, // 上限 90s（原 300s 太黏，小号池下一个卡住请求能把整池压死数分钟）
-            long_cooldown_secs: 86400,   // 24 小时
+            max_short_cooldown_secs: MAX_SHORT_COOLDOWN_SECS, // 上限 90s（原 300s 太黏，小号池下一个卡住请求能把整池压死数分钟）
+            long_cooldown_secs: LONG_COOLDOWN_SECS,           // 24 小时
             cooldown_scale_pct: std::sync::atomic::AtomicU32::new(100),
             last_log_at: Mutex::new(HashMap::new()),
             persist: None,
@@ -312,8 +388,9 @@ impl CooldownManager {
     /// 我们的号池同样小，所以取下限而不是固定值 —— 让用户仍能用 scalePct 调，
     /// 但调不到「等于没有」。
     ///
-    /// 只对限流/风控两类设下限：`ServerError`(30s)/`ModelUnavailable`(300s)/
-    /// `TokenRefreshFailed`(60s) 是本地可判定的瞬态，缩到很短再试是合理的。
+    /// 只对限流/风控两类设下限：`ServerError`(30s)/`TokenRefreshFailed`(60s)
+    /// 是本地可判定的瞬态，缩到很短再试是合理的（`ModelUnavailable` 的 300s
+    /// 为**不可达死值**——生产从未触发，见枚举文档）。
     fn scaled_duration(&self, reason: CooldownReason, base: Duration) -> Duration {
         if !reason.is_auto_recoverable() {
             return base; // 认证失败/封号/配额:不缩放,防误配放行死号
@@ -368,14 +445,20 @@ impl CooldownManager {
     pub fn with_data_dir(data_dir: &Path) -> Self {
         let this = Self {
             entries: Mutex::new(HashMap::new()),
-            max_short_cooldown_secs: 90,
-            long_cooldown_secs: 86400,
+            max_short_cooldown_secs: MAX_SHORT_COOLDOWN_SECS,
+            long_cooldown_secs: LONG_COOLDOWN_SECS,
             cooldown_scale_pct: std::sync::atomic::AtomicU32::new(100),
             last_log_at: Mutex::new(HashMap::new()),
             persist: Some(PersistState {
                 path: data_dir.join(COOLDOWN_STATE_FILE),
                 dirty: std::sync::atomic::AtomicBool::new(false),
-                last_save_at: Mutex::new(None),
+                version: std::sync::atomic::AtomicU64::new(0),
+                // 启动即视为刚写过：首个变更按 debounce 周期落盘，不在启动瞬间立刻写盘。
+                // 不能初始化为 None——load() 在文件不存在/空白/损坏时提前 return，跳过后
+                // 面的 last_save_at 初始化；None 会让 mark_dirty 判定「从未落盘」→ 首个变更
+                // 立即落盘，破坏 debounce 语义（窗口内多次 set 只置脏不落盘）。
+                last_save_at: Mutex::new(Some(Instant::now())),
+                save_lock: Mutex::new(()),
             }),
         };
         this.load();
@@ -640,7 +723,7 @@ impl CooldownManager {
             let capped_secs = duration_secs.min(self.max_short_cooldown_secs);
             self.scaled_duration(reason, Duration::from_secs(capped_secs))
         } else {
-            // 非自动恢复原因实际走 long_cooldown_secs (86400s = 24h)，
+            // 非自动恢复原因实际走 long_cooldown_secs（`LONG_COOLDOWN_SECS` = 24h），
             // 而非 default_duration() 文档中的值（AuthenticationFailed: 3600s 是参考值不是实际值）。
             // 不可自动恢复的原因：使用长冷却时长
             Duration::from_secs(self.long_cooldown_secs)
@@ -671,6 +754,12 @@ impl CooldownManager {
         let Some(state) = &self.persist else {
             return;
         };
+        // 版本号**先于** dirty 置位递增：save() 靠「版本未变才清 dirty」判断本次快照
+        // 是否已过时。若倒序（先 dirty 后 version），并发 save 可能在两者之间完成
+        // 版本检查并清掉刚置的 dirty —— 变更未落盘却已清脏，shutdown 的 flush_now 会漏写。
+        state
+            .version
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         state.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         let should_flush = match *state.last_save_at.lock() {
             Some(last) => last.elapsed() >= SAVE_DEBOUNCE,
@@ -699,24 +788,33 @@ impl CooldownManager {
         let Some(state) = &self.persist else {
             return;
         };
-        let snapshot: HashMap<String, PersistedEntry> = {
+        // 串行化写入：快照→序列化→落盘全在 save_lock 内，同一时刻至多一个 save 在途。
+        // 后到者排队取到的是**最新**快照，从根上消除「两个并发 save、旧快照最后落盘」。
+        // 不用 CAS 单飞：单飞会跳过排队者的落盘，而在途快照可能早于新变更，变更会滞留
+        // dirty 直到下次事件——排队互斥保证后到者重新取快照。锁序：调用方均在 entries
+        // 锁释放后才进 save（先 save_lock 后 entries，无反向路径，无死锁）。
+        let _guard = state.save_lock.lock();
+        let (snapshot, snap_version): (std::collections::HashMap<String, PersistedEntry>, u64) = {
             let entries = self.entries.lock();
             let now = SystemTime::now();
-            entries
-                .iter()
-                .filter(|(_, e)| now < e.expires_at)
-                .map(|(&id, e)| {
-                    (
-                        id.to_string(),
-                        PersistedEntry {
-                            reason: e.reason,
-                            started_at_unix_ms: unix_ms(e.started_at),
-                            expires_at_unix_ms: unix_ms(e.expires_at),
-                            trigger_count: e.trigger_count,
-                        },
-                    )
-                })
-                .collect()
+            (
+                entries
+                    .iter()
+                    .filter(|(_, e)| now < e.expires_at)
+                    .map(|(&id, e)| {
+                        (
+                            id.to_string(),
+                            PersistedEntry {
+                                reason: e.reason,
+                                started_at_unix_ms: unix_ms(e.started_at),
+                                expires_at_unix_ms: unix_ms(e.expires_at),
+                                trigger_count: e.trigger_count,
+                            },
+                        )
+                    })
+                    .collect(),
+                state.version.load(std::sync::atomic::Ordering::Relaxed),
+            )
         };
         let json = match serde_json::to_string_pretty(&snapshot) {
             Ok(j) => j,
@@ -734,7 +832,12 @@ impl CooldownManager {
         match result {
             Ok(()) => {
                 *state.last_save_at.lock() = Some(Instant::now());
-                state.dirty.store(false, std::sync::atomic::Ordering::Relaxed);
+                // 条件清除 dirty：本次快照之后又有状态变更（version 已变）时**不清**，
+                // 留给下一次 save/flush_now 补写 —— 否则「旧快照最后落盘 + dirty 无条件
+                // 清除」会让落盘期间的新变更（如 429 风暴中的退避档位）永久丢盘。
+                if state.version.load(std::sync::atomic::Ordering::Relaxed) == snap_version {
+                    state.dirty.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             Err(e) => tracing::warn!("保存冷却状态失败: {}", e),
         }
@@ -912,6 +1015,28 @@ mod tests {
     fn test_cooldown_reason_description() {
         assert_eq!(CooldownReason::RateLimitExceeded.description(), "速率限制");
         assert_eq!(CooldownReason::AccountSuspended.description(), "账户暂停");
+    }
+
+    /// 稳定枚举码必须与 description() 的 9 个分支**一一对应**（防新增变体漏码 / 码值漂移）。
+    /// 前端判定与 i18n 走 code()，改 description() 中文文案不得影响本表。
+    #[test]
+    fn test_cooldown_reason_code_covers_all_variants() {
+        let cases = [
+            (CooldownReason::RateLimitExceeded, "rate_limited", "速率限制"),
+            (CooldownReason::SuspiciousActivity, "suspicious", "可疑活动风控"),
+            (CooldownReason::AccountSuspended, "account_suspended", "账户暂停"),
+            (CooldownReason::QuotaExhausted, "quota_exhausted", "配额耗尽"),
+            (CooldownReason::TokenRefreshFailed, "token_refresh_failed", "Token 刷新失败"),
+            (CooldownReason::AuthenticationFailed, "authentication_failed", "认证失败"),
+            (CooldownReason::AuthTransient, "auth_transient", "认证瞬态失败"),
+            (CooldownReason::ServerError, "server_error", "服务器错误"),
+            (CooldownReason::ModelUnavailable, "model_unavailable", "模型暂时不可用"),
+        ];
+        for (variant, code, desc) in cases {
+            assert_eq!(variant.code(), code, "code() 映射与设计表不一致");
+            // description() 是本表基准的另一半：description 改了而 code 没同步，这里红。
+            assert_eq!(variant.description(), desc, "description() 与 code 基准漂移");
+        }
     }
 
     /// 瞬时冷却：反复裸 429 时冷却时长恒为基线，绝不随 trigger_count 指数放大。
@@ -1239,6 +1364,170 @@ mod tests {
         let m = CooldownManager::with_data_dir(&dir);
         assert!(m.is_available(1), "损坏文件应回退为空冷却状态");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 并发 save 竞态回归（blockers-concurrency 三③）：多线程同时 set + flush_now，
+    /// 最终落盘必须包含**全部**已提交的变更。
+    ///
+    /// 修复前（无串行化）：两个并发 save 交错，旧快照可能最后落盘且无条件清 dirty →
+    /// 新变更丢盘。修复后（save_lock 串行化 + 版本守卫）：最后一个完成落盘的 save 必然
+    /// 取到最新快照（队列序），任何落盘期间的新变更都保留 dirty 由后续 flush 补写。
+    /// 本测试对修复后**确定性恒绿**；对修复前为概率性红（需命中竞态窗口，预填大状态
+    /// 放大窗口）。
+    #[test]
+    fn test_concurrent_saves_never_lose_updates() {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro-cooldown-concurrent-save-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::remove_file(dir.join(COOLDOWN_STATE_FILE)).ok();
+
+        let m = std::sync::Arc::new(CooldownManager::with_data_dir(&dir));
+        // 预填大状态：放大快照序列化+写盘窗口，让并发交错更可能命中。
+        for id in 10_000..13_000u64 {
+            m.set_cooldown(id, CooldownReason::RateLimitExceeded);
+        }
+
+        const THREADS: u64 = 8;
+        const ROUNDS: u32 = 30;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS as usize));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let m = std::sync::Arc::clone(&m);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let id = t + 1;
+                    for _ in 0..ROUNDS {
+                        m.set_cooldown(id, CooldownReason::RateLimitExceeded);
+                    }
+                    m.flush_now();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let raw = std::fs::read_to_string(dir.join(COOLDOWN_STATE_FILE)).unwrap();
+        let parsed: HashMap<String, PersistedEntry> = serde_json::from_str(&raw).unwrap();
+        for t in 0..THREADS {
+            let id = (t + 1).to_string();
+            let e = parsed
+                .get(&id)
+                .unwrap_or_else(|| panic!("并发 save 丢失了号 {} 的冷却", id));
+            assert_eq!(
+                e.trigger_count, ROUNDS,
+                "号 {} 的 trigger_count 被旧快照覆盖（丢失更新）",
+                id
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 落盘期间的变更必须保留 dirty（版本守卫）：T1 落盘（快照不含 X）期间 set X，
+    /// X 不随 T1 的落盘丢失；随后 flush_now 必须把 X 补写。
+    ///
+    /// 修复前：T1 落盘成功后**无条件**清 dirty → 后续 flush_now 提前返回 → X 丢盘
+    /// （进程在下一次全量 save 前死亡则重启回退）。修复后：版本未变才清 dirty。
+    /// 对修复后确定性恒绿；对修复前概率性红（X 需恰好落入 T1 的快照后写盘前窗口，
+    /// 预填大状态 + 定时 sleep 放大命中率）。
+    #[test]
+    fn test_change_during_save_is_not_lost() {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro-cooldown-dirty-guard-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::remove_file(dir.join(COOLDOWN_STATE_FILE)).ok();
+
+        let m = std::sync::Arc::new(CooldownManager::with_data_dir(&dir));
+        // 预填大状态：让 save 的序列化+写盘慢到几十毫秒，制造「快照后、写完前」窗口。
+        for id in 10_000..30_000u64 {
+            m.set_cooldown(id, CooldownReason::RateLimitExceeded);
+        }
+
+        // T1 落盘（快照不含 X）。主线程 sleep 让 T1 越过快照点进入写盘窗口。
+        let m2 = m.clone();
+        let t1 = std::thread::spawn(move || m2.flush_now());
+        std::thread::sleep(Duration::from_millis(20));
+        m.set_cooldown(999_999, CooldownReason::SuspiciousActivity);
+        t1.join().unwrap();
+
+        // 修复前：T1 已无条件清 dirty → 此处 flush_now 提前返回 → X 不在盘上。
+        m.flush_now();
+        let raw = std::fs::read_to_string(dir.join(COOLDOWN_STATE_FILE)).unwrap();
+        let parsed: HashMap<String, PersistedEntry> = serde_json::from_str(&raw).unwrap();
+        assert!(
+            parsed.contains_key("999999"),
+            "落盘期间提交的变更不应被并发 save 吞掉"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// save 串行化的确定性证明：主线程先持有 save_lock，再派 T1 落盘 —— T1 必被
+    /// 挡在快照**之前**（快照在锁内）。此时提交新变更 X（必先于 T1 的快照），
+    /// 放行后 T1 取到的必须是最新快照（含 X）。修复前无此锁，T1 立即落盘旧状态。
+    #[test]
+    fn test_save_serializes_through_save_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro-cooldown-save-lock-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::remove_file(dir.join(COOLDOWN_STATE_FILE)).ok();
+
+        let m = std::sync::Arc::new(CooldownManager::with_data_dir(&dir));
+        m.set_cooldown(1, CooldownReason::RateLimitExceeded);
+
+        // 持有 save_lock：任何并发 save 必须排队（debounce 未到，本测试不触发额外 save）。
+        let guard = m.persist.as_ref().unwrap().save_lock.lock();
+        let t1 = {
+            let m = std::sync::Arc::clone(&m);
+            std::thread::spawn(move || m.flush_now())
+        };
+        m.set_cooldown(2, CooldownReason::ServerError);
+        drop(guard);
+        t1.join().unwrap();
+
+        let raw = std::fs::read_to_string(dir.join(COOLDOWN_STATE_FILE)).unwrap();
+        let parsed: HashMap<String, PersistedEntry> = serde_json::from_str(&raw).unwrap();
+        assert!(parsed.contains_key("1"));
+        assert!(
+            parsed.contains_key("2"),
+            "排队中的 save 必须取到最新快照（含等待期间提交的变更）"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// debounce 语义基线：窗口内多次 set 只置脏不落盘（无文件），flush_now 一次性
+    /// 写入最新全量 —— 防将来改动破坏「冷却档位跨重启保留」的持久化契约。
+    #[test]
+    fn test_debounce_window_sets_flush_together() {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro-cooldown-debounce-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::remove_file(dir.join(COOLDOWN_STATE_FILE)).ok();
+
+        let m = CooldownManager::with_data_dir(&dir);
+        m.set_cooldown(1, CooldownReason::RateLimitExceeded);
+        m.set_cooldown(2, CooldownReason::ServerError);
+        m.set_cooldown(3, CooldownReason::SuspiciousActivity);
+        assert!(
+            !dir.join(COOLDOWN_STATE_FILE).exists(),
+            "debounce 窗口内多次 set 不应触发落盘"
+        );
+
+        m.flush_now();
+        let raw = std::fs::read_to_string(dir.join(COOLDOWN_STATE_FILE)).unwrap();
+        let parsed: HashMap<String, PersistedEntry> = serde_json::from_str(&raw).unwrap();
+        for id in ["1", "2", "3"] {
+            assert!(parsed.contains_key(id), "flush_now 应一次性写入全部最新状态");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }

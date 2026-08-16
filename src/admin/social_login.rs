@@ -97,7 +97,10 @@ impl SocialLoginManager {
         self.cleanup_expired();
 
         let config = self.token_manager.config();
-        let auth_endpoint = social::KIRO_AUTH_ENDPOINT.to_string();
+        // 🔴 按有效 auth region 拼端点（2026-08-15 用户调试移植）：硬编码 us-east-1 的
+        // 部署配了非默认 region 时，换 token 打错区域 → 上游 500。auth_region 未配置
+        // 回落 region（effective_auth_region 语义，config.rs:1673）。
+        let auth_endpoint = social::auth_endpoint_for_region(config.effective_auth_region());
         let global_proxy = config.proxy_url.as_ref().map(|url| {
             let mut p = ProxyConfig::new(url);
             if let (Some(u), Some(pw)) = (&config.proxy_username, &config.proxy_password) {
@@ -221,13 +224,17 @@ impl SocialLoginManager {
             return PollResult::Error("OAuth state 校验失败（可能的 CSRF）".to_string());
         }
 
-        // 用 code 换 token
+        // 用 code 换 token。🔴 redirect_uri 必须与授权请求**逐字节一致**（RFC 6749
+        // §4.1.3）：浏览器实际落到 `{base}{callback.path}`（portal 按 login_option
+        // 挂 /oauth/callback 或 /signin/callback），用无路径的 base 换 token 会
+        // Cognito mismatch → 上游 500（2026-08-15 用户调试定位，github 登录必现）。
         let config = self.token_manager.config().clone();
+        let exchange_redirect_uri = social::full_redirect_uri(&session.redirect_uri, &callback.path);
         let token = match social::exchange_code_for_token(
             &session.auth_endpoint,
             &callback.code,
             &session.code_verifier,
-            &session.redirect_uri,
+            &exchange_redirect_uri,
             &config,
             session.proxy.as_ref(),
         )
@@ -236,6 +243,12 @@ impl SocialLoginManager {
             Ok(t) => t,
             Err(e) => {
                 self.sessions.lock().remove(session_id);
+                tracing::warn!(
+                    "网页上号 token 交换失败: session_id={}, auth_endpoint={}: {}",
+                    session_id,
+                    session.auth_endpoint,
+                    e
+                );
                 return PollResult::Error(format!("Token 交换失败: {}", e));
             }
         };
@@ -302,6 +315,7 @@ impl SocialLoginManager {
             disabled: false,
             disabled_reason: None,
             disabled_at: None,
+            quota_exhausted_at: None,
             kiro_api_key: None,
             endpoint: None,
             // Social 上号产出的是 Kiro 号，非 CLI(ksk_)号，该开关对它无意义 → 跟随全局。

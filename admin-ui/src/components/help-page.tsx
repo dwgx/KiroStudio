@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import axios from 'axios'
 import {
   ArrowLeft,
@@ -23,45 +24,6 @@ import { ConnPage } from '@/components/conn-page'
 import type { Category, HelpEntry, HelpModule, HelpChainStep } from '@/data/help-knowledge'
 import { HELP_ENTRIES, HELP_MODULES, HELP_CHAIN } from '@/data/help-knowledge'
 
-// 文案常量：i18n 键名已内联为 Record 键，主会话按键名补 en/zh/ja 三语，此处中文直写。
-const zh = {
-  'helppage.title': '帮助中心',
-  'helppage.back': '返回',
-  'helppage.searchPlaceholder': '搜索知识库（标题 / 标签 / 问题）',
-  'helppage.tab.kb': '知识库',
-  'helppage.tab.map': '架构地图',
-  'helppage.tab.web': '联网搜索',
-  'helppage.tab.conn': '接入信息',
-  'helppage.kb.all': '全部',
-  'helppage.kb.loading': '知识库加载中',
-  'helppage.kb.loadingDesc': '知识库内容正在同步产出，稍后自动出现',
-  'helppage.kb.noMatch': '未找到匹配条目',
-  'helppage.kb.noMatchDesc': '换个关键词，或切换到其它分类查找',
-  'helppage.kb.severityHigh': '高',
-  'helppage.kb.severityMedium': '中',
-  'helppage.kb.severityLow': '低',
-  'helppage.kb.cause': '根因',
-  'helppage.kb.solution': '解决方案',
-  'helppage.kb.source': '来源',
-  'helppage.kb.codePath': '相关代码',
-  'helppage.map.chainTitle': '请求链路',
-  'helppage.map.chainDesc': '一次请求经过的环节（点击环节查看关键代码）',
-  'helppage.map.modulesTitle': '模块地图',
-  'helppage.map.role': '职责',
-  'helppage.map.keyFiles': '关键文件',
-  'helppage.web.placeholder': '输入要搜索的问题',
-  'helppage.web.search': '搜索',
-  'helppage.web.searching': '搜索中…',
-  'helppage.web.empty': '没有搜索结果',
-  'helppage.web.emptyDesc': '换个问法再试，或改用知识库搜索',
-  'helppage.web.notEnabled': '搜索服务未启用',
-  'helppage.web.notEnabledDesc': '后端搜索端点未部署或未配置，请联系管理员',
-  'helppage.web.failed': '搜索失败',
-  'helppage.web.failedDesc': '网络异常或服务暂不可用，请稍后重试',
-  'helppage.web.retry': '重试',
-  'helppage.web.resultCount': '找到 {n} 条结果',
-} as const
-
 // 分类中文名 + 展示顺序（固定 8 类，计数在渲染时按 HELP_ENTRIES 统计）。
 const CATEGORY_ORDER: Category[] = [
   'pitfalls',
@@ -73,17 +35,6 @@ const CATEGORY_ORDER: Category[] = [
   'config',
   'security',
 ]
-const CATEGORY_NAMES: Record<Category, string> = {
-  pitfalls: '踩坑记录',
-  architecture: '架构',
-  protocol: '协议转换',
-  deploy: '部署运维',
-  faq: '常见问题',
-  research: '研究结论',
-  config: '配置指南',
-  security: '安全',
-}
-
 // codePath 统一渲染为 GitHub blob 链接（v1.1.0 分支，新窗口打开）。
 const GITHUB_BLOB = 'https://github.com/dwgx/KiroStudio/blob/v1.1.0/'
 
@@ -123,10 +74,11 @@ function GitHubLink({ path }: { path: string }) {
 }
 
 function SeverityBadge({ severity }: { severity: HelpEntry['severity'] }) {
+  const { t } = useTranslation()
   const map = {
-    high: { label: zh['helppage.kb.severityHigh'], cls: 'border-red-500/30 bg-red-500/10 text-red-400' },
-    medium: { label: zh['helppage.kb.severityMedium'], cls: 'border-amber-500/30 bg-amber-500/10 text-amber-400' },
-    low: { label: zh['helppage.kb.severityLow'], cls: 'border-border/60 bg-secondary text-muted-foreground' },
+    high: { label: t('helppage.kb.severityHigh'), cls: 'border-red-500/30 bg-red-500/10 text-red-400' },
+    medium: { label: t('helppage.kb.severityMedium'), cls: 'border-amber-500/30 bg-amber-500/10 text-amber-400' },
+    low: { label: t('helppage.kb.severityLow'), cls: 'border-border/60 bg-secondary text-muted-foreground' },
   } as const
   const m = map[severity as keyof typeof map]
   return (
@@ -147,6 +99,7 @@ function KnowledgeView({
   query: string
   loading: boolean
 }) {
+  const { t } = useTranslation()
   const [category, setCategory] = useState<Category | null>(null)
   const [expanded, setExpanded] = useState<string | null>(null)
 
@@ -158,7 +111,7 @@ function KnowledgeView({
   const filtered = entries.filter((e) => {
     if (category && e.category !== category) return false
     if (!q) return true
-    const hay = `${e.title} ${e.tags.join(' ')} ${e.problem}`.toLowerCase()
+    const hay = `${t(e.title)} ${e.tags.join(' ')} ${t(e.problem)}`.toLowerCase()
     return hay.includes(q)
   })
 
@@ -175,7 +128,7 @@ function KnowledgeView({
               : 'bg-white/5 text-muted-foreground hover:bg-white/10'
           }`}
         >
-          {zh['helppage.kb.all']} ({entries.length})
+          {t('helppage.kb.all')} ({entries.length})
         </button>
         {CATEGORY_ORDER.filter((c) => (counts.get(c) ?? 0) > 0).map((c) => (
           <button
@@ -188,15 +141,15 @@ function KnowledgeView({
                 : 'bg-white/5 text-muted-foreground hover:bg-white/10'
             }`}
           >
-            {CATEGORY_NAMES[c]} ({counts.get(c)})
+            {t('helppage.category.' + c)} ({counts.get(c)})
           </button>
         ))}
       </div>
 
       {loading ? (
-        <EmptyState icon={BookOpen} title={zh['helppage.kb.loading']} description={zh['helppage.kb.loadingDesc']} />
+        <EmptyState icon={BookOpen} title={t('helppage.kb.loading')} description={t('helppage.kb.loadingDesc')} />
       ) : filtered.length === 0 ? (
-        <EmptyState icon={SearchX} title={zh['helppage.kb.noMatch']} description={zh['helppage.kb.noMatchDesc']} />
+        <EmptyState icon={SearchX} title={t('helppage.kb.noMatch')} description={t('helppage.kb.noMatchDesc')} />
       ) : (
         <div className="space-y-2">
           {filtered.map((e) => {
@@ -209,11 +162,11 @@ function KnowledgeView({
                   className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left transition-colors hover:bg-secondary/30"
                 >
                   <div className="min-w-0">
-                    <div className="text-sm font-medium">{e.title}</div>
-                    <div className="mt-0.5 truncate text-xs text-muted-foreground">{e.problem}</div>
+                    <div className="text-sm font-medium">{t(e.title)}</div>
+                    <div className="mt-0.5 truncate text-xs text-muted-foreground">{t(e.problem)}</div>
                   </div>
                   <div className="flex shrink-0 items-center gap-2">
-                    <span className="text-[10px] text-muted-foreground">{CATEGORY_NAMES[e.category]}</span>
+                    <span className="text-[10px] text-muted-foreground">{t('helppage.category.' + e.category)}</span>
                     <SeverityBadge severity={e.severity} />
                     <ChevronRight
                       className={`h-4 w-4 text-muted-foreground transition-transform ${open ? 'rotate-90' : ''}`}
@@ -223,20 +176,20 @@ function KnowledgeView({
                 {open && (
                   <div className="space-y-3 border-t border-border/40 px-4 py-3">
                     <div>
-                      <div className="text-xs font-medium text-muted-foreground">{zh['helppage.kb.cause']}</div>
-                      <p className="mt-0.5 text-sm leading-relaxed">{e.cause}</p>
+                      <div className="text-xs font-medium text-muted-foreground">{t('helppage.kb.cause')}</div>
+                      <p className="mt-0.5 text-sm leading-relaxed">{t(e.cause)}</p>
                     </div>
                     <div>
-                      <div className="text-xs font-medium text-muted-foreground">{zh['helppage.kb.solution']}</div>
-                      <p className="mt-0.5 whitespace-pre-wrap text-sm leading-relaxed">{e.solution}</p>
+                      <div className="text-xs font-medium text-muted-foreground">{t('helppage.kb.solution')}</div>
+                      <p className="mt-0.5 whitespace-pre-wrap text-sm leading-relaxed">{t(e.solution)}</p>
                     </div>
                     <div className="flex flex-wrap items-center gap-x-6 gap-y-1 text-xs">
                       <span className="text-muted-foreground">
-                        {zh['helppage.kb.source']} <span className="font-mono text-[#ededed]">{e.source}</span>
+                        {t('helppage.kb.source')} <span className="font-mono text-[#ededed]">{e.source}</span>
                       </span>
                       {e.codePath && (
                         <span className="inline-flex items-center gap-1 text-muted-foreground">
-                          {zh['helppage.kb.codePath']} <GitHubLink path={e.codePath} />
+                          {t('helppage.kb.codePath')} <GitHubLink path={e.codePath} />
                         </span>
                       )}
                       <span className="ml-auto text-[10px] text-muted-foreground">{e.updatedAt}</span>
@@ -255,15 +208,16 @@ function KnowledgeView({
 /* ============ 架构地图：请求链路 + 模块网格 ============ */
 
 function MapView({ chain, modules, loading }: { chain: HelpChainStep[]; modules: typeof HELP_MODULES; loading: boolean }) {
+  const { t } = useTranslation()
   if (loading) {
-    return <EmptyState icon={Compass} title={zh['helppage.kb.loading']} description={zh['helppage.kb.loadingDesc']} />
+    return <EmptyState icon={Compass} title={t('helppage.kb.loading')} description={t('helppage.kb.loadingDesc')} />
   }
   return (
     <div className="space-y-8">
       {/* 请求链路：横向步骤卡 + 箭头，点击卡片看关键代码 */}
       <div>
-        <div className="mb-1 text-base font-semibold">{zh['helppage.map.chainTitle']}</div>
-        <p className="mb-3 text-xs text-muted-foreground">{zh['helppage.map.chainDesc']}</p>
+        <div className="mb-1 text-base font-semibold">{t('helppage.map.chainTitle')}</div>
+        <p className="mb-3 text-xs text-muted-foreground">{t('helppage.map.chainDesc')}</p>
         <div className="flex items-stretch gap-2 overflow-x-auto pb-2">
           {chain.map((step, i) => (
             <div key={step.id} className="flex shrink-0 items-stretch gap-2">
@@ -275,9 +229,9 @@ function MapView({ chain, modules, loading }: { chain: HelpChainStep[]; modules:
               >
                 <div className="flex items-center gap-1.5 text-xs font-medium text-primary">
                   <Network className="h-3.5 w-3.5" />
-                  {step.name}
+                  {t(step.name)}
                 </div>
-                <p className="mt-1 flex-1 text-[11px] leading-relaxed text-muted-foreground">{step.desc}</p>
+                <p className="mt-1 flex-1 text-[11px] leading-relaxed text-muted-foreground">{t(step.desc)}</p>
                 <code className="mt-2 truncate font-mono text-[10px] text-[#888]">{step.codePath}</code>
               </a>
               {i < chain.length - 1 && (
@@ -290,7 +244,7 @@ function MapView({ chain, modules, loading }: { chain: HelpChainStep[]; modules:
 
       {/* 模块网格：路径 / 职责 / 关键文件 */}
       <div>
-        <div className="mb-3 text-base font-semibold">{zh['helppage.map.modulesTitle']}</div>
+        <div className="mb-3 text-base font-semibold">{t('helppage.map.modulesTitle')}</div>
         <div className="grid gap-4 md:grid-cols-2">
           {modules.map((m: HelpModule) => (
             <Card key={m.path}>
@@ -302,11 +256,11 @@ function MapView({ chain, modules, loading }: { chain: HelpChainStep[]; modules:
               </CardHeader>
               <CardContent className="space-y-2 py-3">
                 <div>
-                  <div className="text-xs font-medium text-muted-foreground">{m.name}</div>
-                  <p className="mt-0.5 text-xs leading-relaxed text-[#b0b0b0]">{m.role}</p>
+                  <div className="text-xs font-medium text-muted-foreground">{t(m.name)}</div>
+                  <p className="mt-0.5 text-xs leading-relaxed text-[#b0b0b0]">{t(m.role)}</p>
                 </div>
                 <div>
-                  <div className="text-[11px] font-medium text-muted-foreground">{zh['helppage.map.keyFiles']}</div>
+                  <div className="text-[11px] font-medium text-muted-foreground">{t('helppage.map.keyFiles')}</div>
                   <div className="mt-1 flex flex-wrap gap-1">
                     {m.keyFiles.map((f: string) => (
                       <code key={f} className="rounded bg-secondary/60 px-1.5 py-0.5 font-mono text-[10px] text-[#c9d1d9]">
@@ -327,6 +281,7 @@ function MapView({ chain, modules, loading }: { chain: HelpChainStep[]; modules:
 /* ============ 联网搜索：后端端点 GET /api/help/web-search ============ */
 
 function WebSearchView() {
+  const { t } = useTranslation()
   const [raw, setRaw] = useState('')
   const [state, setState] = useState<'idle' | 'loading' | 'ok' | 'error' | 'empty'>('idle')
   const [results, setResults] = useState<WebSearchResult[]>([])
@@ -355,22 +310,24 @@ function WebSearchView() {
     <div className="space-y-4">
       <div className="flex gap-2">
         <Input
+          id="help-search"
           value={raw}
           onChange={(e) => setRaw(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && run(raw)}
-          placeholder={zh['helppage.web.placeholder']}
+          placeholder={t('helppage.web.placeholder')}
+          aria-label={t('helppage.web.placeholder')}
           className="max-w-md"
         />
         <Button size="sm" onClick={() => run(raw)} disabled={state === 'loading' || !raw.trim()}>
           {state === 'loading' ? (
             <>
               <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />
-              {zh['helppage.web.searching']}
+              {t('helppage.web.searching')}
             </>
           ) : (
             <>
               <Globe className="mr-1.5 h-4 w-4" />
-              {zh['helppage.web.search']}
+              {t('helppage.web.search')}
             </>
           )}
         </Button>
@@ -379,7 +336,7 @@ function WebSearchView() {
       {state === 'ok' && (
         <>
           <p className="text-xs text-muted-foreground">
-            {zh['helppage.web.resultCount'].replace('{n}', String(results.length))}
+            {t('helppage.web.resultCount').replace('{n}', String(results.length))}
           </p>
           <div className="space-y-2">
             {results.map((r, i) => (
@@ -402,17 +359,17 @@ function WebSearchView() {
         </>
       )}
       {state === 'empty' && (
-        <EmptyState icon={SearchX} title={zh['helppage.web.empty']} description={zh['helppage.web.emptyDesc']} />
+        <EmptyState icon={SearchX} title={t('helppage.web.empty')} description={t('helppage.web.emptyDesc')} />
       )}
       {state === 'error' && (
         <EmptyState
           icon={SearchX}
           tone="destructive"
-          title={errorKey === 'notEnabled' ? zh['helppage.web.notEnabled'] : zh['helppage.web.failed']}
-          description={errorKey === 'notEnabled' ? zh['helppage.web.notEnabledDesc'] : zh['helppage.web.failedDesc']}
+          title={errorKey === 'notEnabled' ? t('helppage.web.notEnabled') : t('helppage.web.failed')}
+          description={errorKey === 'notEnabled' ? t('helppage.web.notEnabledDesc') : t('helppage.web.failedDesc')}
           action={
             <Button variant="outline" size="sm" onClick={() => run(raw)}>
-              {zh['helppage.web.retry']}
+              {t('helppage.web.retry')}
             </Button>
           }
         />
@@ -424,6 +381,7 @@ function WebSearchView() {
 /* ============ 帮助中心页 ============ */
 
 export function HelpPage({ onBack }: { onBack: () => void }) {
+  const { t } = useTranslation()
   const [view, setView] = useState<View>('kb')
   const [query, setQuery] = useState('')
 
@@ -431,10 +389,10 @@ export function HelpPage({ onBack }: { onBack: () => void }) {
   const loaded = Array.isArray(HELP_ENTRIES) && Array.isArray(HELP_MODULES) && Array.isArray(HELP_CHAIN)
 
   const views: { id: View; label: string; icon: React.ReactNode }[] = [
-    { id: 'kb', label: zh['helppage.tab.kb'], icon: <BookOpen className="mr-1.5 h-4 w-4" /> },
-    { id: 'map', label: zh['helppage.tab.map'], icon: <Compass className="mr-1.5 h-4 w-4" /> },
-    { id: 'web', label: zh['helppage.tab.web'], icon: <Globe className="mr-1.5 h-4 w-4" /> },
-    { id: 'conn', label: zh['helppage.tab.conn'], icon: <Network className="mr-1.5 h-4 w-4" /> },
+    { id: 'kb', label: t('helppage.tab.kb'), icon: <BookOpen className="mr-1.5 h-4 w-4" /> },
+    { id: 'map', label: t('helppage.tab.map'), icon: <Compass className="mr-1.5 h-4 w-4" /> },
+    { id: 'web', label: t('helppage.tab.web'), icon: <Globe className="mr-1.5 h-4 w-4" /> },
+    { id: 'conn', label: t('helppage.tab.conn'), icon: <Network className="mr-1.5 h-4 w-4" /> },
   ]
 
   return (
@@ -443,12 +401,13 @@ export function HelpPage({ onBack }: { onBack: () => void }) {
       <div className="flex flex-wrap items-center gap-3 border-b border-[#2e2e2e] px-8 py-5">
         <Button variant="ghost" size="sm" onClick={onBack}>
           <ArrowLeft className="mr-1 h-4 w-4" />
-          {zh['helppage.back']}
+          {t('helppage.back')}
         </Button>
-        <h2 className="text-lg font-semibold text-gradient-brand">{zh['helppage.title']}</h2>
+        <h2 className="text-lg font-semibold text-gradient-brand">{t('helppage.title')}</h2>
         <div className="relative ml-auto w-72 max-w-full">
           <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
           <Input
+            id="help-query"
             className="pl-8"
             value={query}
             onChange={(e) => {
@@ -456,7 +415,8 @@ export function HelpPage({ onBack }: { onBack: () => void }) {
               // 搜索词天然属于知识库，输入时自动切到知识库视图。
               if (view !== 'kb') setView('kb')
             }}
-            placeholder={zh['helppage.searchPlaceholder']}
+            placeholder={t('helppage.searchPlaceholder')}
+            aria-label={t('helppage.searchPlaceholder')}
           />
         </div>
       </div>

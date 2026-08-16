@@ -26,6 +26,7 @@ import type {
   ConfigSnapshotResponse,
   UpdateConfigRequest,
   UpdateConfigResponse,
+  ErrorMessagesDefaultsResponse,
   CredentialRegionsResponse,
   SocksNodeTest,
   SocksNodesResponse,
@@ -174,10 +175,9 @@ export async function setCredentialEndpoint(
  * eu-central-1 98.9% 成功、在 us-east-1 100% 403）。自动探测可能探错，所以必须
  * 有手工兜底入口。
  *
- * ⚠️ 此前后端 `POST /credentials/{id}/api-region` 已存在，但前端**零调用** ——
- * 面板上没有任何能改 ksk_ 号 region 的入口（`switchProfileRegion` 对 api_key 号
- * 直接报「仅 External IdP / IdC 凭据支持」）。于是探错的号只能改 credentials.json
- * 手工救。
+ * 前端入口：凭证卡片（credential-card.tsx 的 handleApiRegionChange）设置弹框
+ * 「上游 region」区 —— 通过 useSetCredentialApiRegion 调用本端点。历史注释
+ * 声称「前端零调用」已过期，探错号可直接在面板改，无需手工改 credentials.json。
  */
 export async function setCredentialApiRegion(
   id: number,
@@ -309,6 +309,19 @@ export async function forceRefreshToken(
   id: number
 ): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>(`/credentials/${id}/refresh`)
+  return data
+}
+
+// 手动更新 OAuth 号的 refreshToken（号被 InvalidRefreshToken 禁用后自助恢复通道）。
+// 请求体字段 snake_case `refresh_token` 对齐后端 RefreshTokenRequest（types.rs，无 serde rename）。
+export async function updateRefreshToken(
+  id: number,
+  refreshToken: string
+): Promise<SuccessResponse> {
+  const { data } = await api.put<SuccessResponse>(
+    `/credentials/${id}/refresh-token`,
+    { refresh_token: refreshToken }
+  )
   return data
 }
 
@@ -642,6 +655,12 @@ export async function submitExternalIdpLeg2Select(
 // 获取服务端配置快照（敏感字段脱敏）
 export async function getConfigSnapshot(): Promise<ConfigSnapshotResponse> {
   const { data } = await api.get<ConfigSnapshotResponse>('/config')
+  return data
+}
+
+// 获取错误码/提示词**内置默认表**（只读，默认值预览数据源；key 集由后端运行期给出）
+export async function getErrorMessagesDefaults(): Promise<ErrorMessagesDefaultsResponse> {
+  const { data } = await api.get<ErrorMessagesDefaultsResponse>('/error-messages/defaults')
   return data
 }
 

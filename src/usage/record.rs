@@ -67,6 +67,18 @@ pub struct RequestRecord {
     pub ts_ms: i64,
     /// 实际服务该请求的凭据 ID（失败到无凭据可用时为 None）
     pub credential_id: Option<u64>,
+    /// **本条请求链最先尝试的凭据 ID**（failover 首选号；`None` = 无 failover 或首选号不可考）。
+    ///
+    /// 与 [`Self::credential_id`]（最终服务号）成对构成「换号链」：两者不同 = 首选号
+    /// 失败后换号成功。面板据此发现「死号恒选」——`first_attempted_credential_id` 恒为
+    /// 某号而 `credential_id` 恒为另一号时，说明该号每次都排最前却被换掉（上游持续
+    /// 502/429），需要运维处理其上游。透传 failover 链在 `provider.rs` 的
+    /// `try_custom_api_passthrough` 记录首选号，经透传元数据（成功链）与跨层共享预算
+    /// （Kiro 主路径失败记录）分别落到两类 usage 埋点。
+    ///
+    /// serde default，兼容早于本字段的历史 JSONL（缺字段视为 None）。
+    #[serde(default)]
+    pub first_attempted_credential_id: Option<u64>,
     /// 请求模型名
     pub model: String,
     /// **客户端请求的原始模型名**（映射前；`None` = 无映射或不可得时回落 `model`）。
@@ -155,6 +167,7 @@ impl RequestRecord {
             request_id: request_id.into(),
             ts_ms: chrono::Utc::now().timestamp_millis(),
             credential_id: None,
+            first_attempted_credential_id: None,
             model: model.into(),
             requested_model: None,
             upstream_model: None,
@@ -529,6 +542,25 @@ mod tests {
         assert_eq!(back.credential_id, Some(3));
         assert_eq!(back.credits_used, Some(1.5));
         assert_eq!(back.outcome, RequestOutcome::Success);
+    }
+
+    /// failover 首选号：序列化 roundtrip 保留，旧 JSONL（缺字段）反序列化为 None。
+    #[test]
+    fn test_first_attempted_credential_roundtrip_and_legacy() {
+        let mut rec = RequestRecord::new("req-failover", "claude-sonnet-4");
+        rec.credential_id = Some(2);
+        rec.first_attempted_credential_id = Some(3);
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: RequestRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.credential_id, Some(2), "最终服务号必须保留");
+        assert_eq!(back.first_attempted_credential_id, Some(3), "首选号必须保留");
+
+        let legacy = r#"{"request_id":"req-old","ts_ms":1,"credential_id":null,"model":"claude-opus-4-8","is_streaming":false,"input_tokens":1,"output_tokens":1,"credits_used":null,"latency_ms":1,"first_token_ms":null,"outcome":"success","retries":0,"error_message":null,"session_id":null}"#;
+        let old: RequestRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            old.first_attempted_credential_id, None,
+            "历史 JSONL 缺字段必须回落 None，不炸反序列化"
+        );
     }
 
     /// 映射双口径：序列化 roundtrip 保留两个字段，且旧 JSONL（缺字段）反序列化不炸。

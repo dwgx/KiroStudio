@@ -1174,8 +1174,13 @@ impl UsageStats {
         if let Some((_, f)) = guard.as_mut() {
             if let Err(e) = writeln!(f, "{line}") {
                 tracing::warn!("用量统计：写入 JSONL 失败：{e}");
+                return;
             }
         }
+        // B8：数据在产信号——每笔 JSONL 落盘成功都刷新活动时刻，供
+        // alerting::report_if_stale 的「数据断更」watchdog 判定（进程活着 ≠
+        // 数据在产，CLAUDE.md minutely.jsonl 教训）。
+        crate::common::alerting::note_data_activity("usage_jsonl");
     }
 
     /// 冷启动重放：读取目录下所有 `usage-*.jsonl`，逐行反序列化累加进内存聚合。

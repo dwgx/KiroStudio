@@ -47,7 +47,7 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: std::error::Error + Send + Sync + 'static,
 {
-    filter_sse_stream_with(inner, true, true)
+    filter_sse_stream_with(inner, true, true, None)
 }
 
 /// [`filter_sse_stream`] 的可配置版本：
@@ -56,11 +56,17 @@ where
 /// - `filter_thinking_blocks`：是否滤掉 `content_block_start/delta/stop` 的 thinking 块。
 ///   **DSML 标记剥离不在此门控内，永远启用**（上游就是 DeepSeek，标记泄漏与客户端
 ///   模型名/归一化配置无关）——`filter_thinking_blocks=false` 时只关 thinking 块过滤，
-///   保留完整字节流语义，仅剥 text 里的 DSML 标记。
+///   保留完整字节流语义，仅剥 text 里的 DSML 标记；
+/// - `mock_cache`：`Some((true, ratio))` 时对带 usage 的事件（message_start / message_delta）
+///   注入模拟 cache 值（`cache_read_input_tokens = round(input_tokens × ratio)`、
+///   creation 置 0）；`None`/`Some((false, _))` 时**零注入**——但注意事件仍需解析判断，
+///   message_delta 等分支会重序列化事件 JSON（语义等价，非字节级原样）。仅透传路径调用，
+///   Kiro 池四层缓存链不走本函数。
 pub fn filter_sse_stream_with<S, E>(
     inner: S,
     strip_inline_thinking: bool,
     filter_thinking_blocks: bool,
+    mock_cache: Option<(bool, f64)>,
 ) -> impl Stream<Item = Result<Bytes, axum::Error>>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
@@ -68,28 +74,65 @@ where
 {
     SseThinkFilter {
         inner: Box::pin(inner),
-        state: SseFilterState::new(strip_inline_thinking, filter_thinking_blocks),
+        state: SseFilterState::new(
+            strip_inline_thinking,
+            filter_thinking_blocks,
+            mock_cache,
+        ),
     }
 }
 
 /// 过滤非流式 JSON 响应里的 thinking content blocks（fail-open：解析失败原样返回）。
 pub fn filter_json_bytes(bytes: &[u8]) -> Bytes {
-    filter_json_bytes_with(bytes, true, true)
+    filter_json_bytes_with(bytes, true, true, None)
 }
 
 /// [`filter_json_bytes`] 的可配置版本（与流式 [`filter_sse_stream_with`] 对齐）：
 /// - `strip_inline`：是否剥 text 块里的内联 `<thinking>...</thinking>` 标签；
 /// - `filter_thinking_blocks`：是否滤掉 `type == "thinking"/"redacted_thinking"` 的块。
-///   **DSML 标记剥离不在此门控内，永远启用**（理由同流式版本）。
+///   **DSML 标记剥离不在此门控内，永远启用**（理由同流式版本）；
+/// - `mock_cache`：`Some((true, ratio))` 时对顶层 `usage` 注入模拟 cache 值（同流式）。
 pub fn filter_json_bytes_with(
     bytes: &[u8],
     strip_inline: bool,
     filter_thinking_blocks: bool,
+    mock_cache: Option<(bool, f64)>,
 ) -> Bytes {
     let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        if let Some((true, _)) = mock_cache {
+            tracing::debug!("[透传] 非流式响应 JSON 解析失败，模拟缓存注入跳过（fail-open 原样透传）");
+        }
         return Bytes::copy_from_slice(bytes);
     };
+    // 模拟缓存注入（透传路径专用，mockCacheEnabled）：usage.cache_read_input_tokens 上游
+    // 恒 0（DeepSeek 不回传），下游看不到缓存分支——这里注入 round(input × ratio) 的
+    // 伪造值、creation 置 0（模拟全命中不写缓存）。
+    //
+    // ⚠️ 必须先于 content 早退执行：注入只依赖顶层 usage，与 content 无关——上游 2xx
+    // JSON 缺 content 字段时也必须注入，否则 mock 注入静默失效（旧实现注入代码在
+    // content 早退之后，content 缺失时永远执行不到，且无任何日志）。流式路径按事件
+    // 处理不依赖 content，两路径不对称即源于此。仅顶层 usage 有 input_tokens 时注入，
+    // 缺失则整体跳过（零改动）。
+    if let Some((true, ratio)) = mock_cache {
+        if let Some(usage) = v.get_mut("usage").and_then(|u| u.as_object_mut()) {
+            if let Some(input_tokens) = usage.get("input_tokens").and_then(|x| x.as_u64()) {
+                inject_mock_cache_usage(usage, input_tokens, ratio);
+            } else {
+                tracing::debug!("[透传] mock 开启但 usage 缺 input_tokens，模拟缓存注入跳过");
+            }
+        } else {
+            tracing::debug!("[透传] mock 开启但顶层缺 usage，模拟缓存注入跳过");
+        }
+    }
     let Some(content) = v.get_mut("content").and_then(|c| c.as_array_mut()) else {
+        // content 缺失/非数组：mock 关闭时保持字节级原样（零改动）；开启时注入已完成，
+        // 需重序列化以携带注入结果（JSON 语义等价，非字节级原样——键顺序可能重排，
+        // 与流式路径一致）。
+        if mock_cache.is_some_and(|(enabled, _)| enabled) {
+            return serde_json::to_vec(&v)
+                .map(Bytes::from)
+                .unwrap_or_else(|_| Bytes::copy_from_slice(bytes));
+        }
         return Bytes::copy_from_slice(bytes);
     };
     // ⚠️ 与流式路径的 `in_thinking` 判定一致：`redacted_thinking`（超预算的合法类型）
@@ -138,6 +181,7 @@ pub fn filter_json_bytes_with(
             }
         }
     }
+    // 末尾统一重序列化（注入已在函数头部完成）。
     serde_json::to_vec(&v)
         .map(Bytes::from)
         .unwrap_or_else(|_| Bytes::copy_from_slice(bytes))
@@ -293,10 +337,18 @@ struct SseFilterState {
     dsml_pending: DsmlPending,
     /// 滤掉的 thinking 文本累计**字符数**（估算 token = 字符数 / 4）。
     thinking_chars: u64,
+    /// 模拟缓存注入配置：`Some((true, ratio))` = 开启，带 usage 的事件注入
+    /// `cache_read_input_tokens = round(input_tokens × ratio)`、creation 置 0。
+    /// 仅透传路径传入；关闭时零改动（原样透传）。
+    mock_cache: Option<(bool, f64)>,
 }
 
 impl SseFilterState {
-    fn new(strip_inline_thinking: bool, filter_thinking_blocks: bool) -> Self {
+    fn new(
+        strip_inline_thinking: bool,
+        filter_thinking_blocks: bool,
+        mock_cache: Option<(bool, f64)>,
+    ) -> Self {
         Self {
             buf: Vec::with_capacity(1024),
             pending: Vec::new(),
@@ -308,6 +360,7 @@ impl SseFilterState {
             in_inline_thinking: false,
             dsml_pending: DsmlPending::default(),
             thinking_chars: 0,
+            mock_cache,
         }
     }
 
@@ -527,7 +580,51 @@ impl SseFilterState {
                         }
                     }
                 }
+                // 模拟缓存注入（与 message_start 共用同一逻辑，见下）：
+                // Anthropic 的 message_delta.usage 通常只有 output_tokens —— 没有
+                // input_tokens 时不注入（零改动）；个别上游带 input_tokens 时同样注入。
+                if let Some((true, ratio)) = self.mock_cache {
+                    if let Some(usage) = v.get_mut("usage").and_then(|u| u.as_object_mut()) {
+                        if let Some(input_tokens) =
+                            usage.get("input_tokens").and_then(|x| x.as_u64())
+                        {
+                            inject_mock_cache_usage(usage, input_tokens, ratio);
+                        }
+                    }
+                }
                 Some(Self::rewrite_event(event_type, &v))
+            }
+            "message_start" => {
+                // 模拟缓存注入：message_start 的 usage 带 input_tokens，是下游读 cache 分支的
+                // 主入口。开启时注入 round(input × ratio) + creation 置 0；关闭时原样透传
+                //（返回原始字节，零改动）。
+                //
+                // ⚠️ **usage 的定位**（线上实测坐实）：真实 Anthropic message_start 的 usage
+                // **嵌套在 `message` 内**（`{"type":"message_start","message":{"id":...,"usage":{...}}}`
+                // ——顶层无 usage）。旧实现只读顶层 `v["usage"]`，注入条件永不满足 ⇒ 上游
+                // 原样透传、cache_read 恒 0。先探 `message.usage`（真实形态），顶层形态
+                // （个别上游/旧客户端）回退兼容。先只读探测路径再取可变引用，避免两个
+                // `&mut` 分支借用冲突。
+                if let Some((true, ratio)) = self.mock_cache {
+                    let usage = if v
+                        .get("message")
+                        .and_then(|m| m.get("usage"))
+                        .is_some()
+                    {
+                        v.get_mut("message").and_then(|m| m.get_mut("usage"))
+                    } else {
+                        v.get_mut("usage")
+                    };
+                    if let Some(usage) = usage.and_then(|u| u.as_object_mut()) {
+                        if let Some(input_tokens) =
+                            usage.get("input_tokens").and_then(|x| x.as_u64())
+                        {
+                            inject_mock_cache_usage(usage, input_tokens, ratio);
+                            return Some(Self::rewrite_event(event_type, &v));
+                        }
+                    }
+                }
+                Some(block.to_vec())
             }
             "content_block_stop" => {
                 let was_thinking = self.in_thinking.remove(&old_idx).unwrap_or(false);
@@ -573,6 +670,33 @@ impl SseFilterState {
     /// 把重写后的 data 重组成 SSE 事件（`event:` + `data:`，**不含**结尾空行）。
     fn rewrite_event(event_type: &str, data: &serde_json::Value) -> Vec<u8> {
         format!("event: {event_type}\ndata: {data}").into_bytes()
+    }
+}
+
+/// 向 usage 对象注入模拟 cache 值（透传路径 mockCacheEnabled，流式/非流式共用）。
+///
+/// - `cache_read_input_tokens = round(input_tokens × ratio)`（ratio 已由镜像 setter
+///   清洗到 [0.0, 1.0]，read ≤ input 恒成立）；
+/// - `cache_creation_input_tokens = 0`（模拟"全部命中不写缓存"，避免 read + creation
+///   > input 的矛盾）；
+/// - 上游自带的 `cache_creation_5m_input_tokens` / `cache_creation_1h_input_tokens`
+///   若存在也置 0（与 creation 同语义）。
+///
+/// **伪造值，仅供下游展示，不是真实计费依据**（与主路径 prompt_cache 估算下发同性质）。
+/// 调用方必须先确认 usage 含 `input_tokens`（缺 input_tokens 不注入，整体零改动）。
+fn inject_mock_cache_usage(
+    usage: &mut serde_json::Map<String, serde_json::Value>,
+    input_tokens: u64,
+    ratio: f64,
+) {
+    let read = ((input_tokens as f64) * ratio).round() as u64;
+    usage.insert("cache_read_input_tokens".to_string(), serde_json::json!(read));
+    usage.insert("cache_creation_input_tokens".to_string(), serde_json::json!(0));
+    if usage.contains_key("cache_creation_5m_input_tokens") {
+        usage.insert("cache_creation_5m_input_tokens".to_string(), serde_json::json!(0));
+    }
+    if usage.contains_key("cache_creation_1h_input_tokens") {
+        usage.insert("cache_creation_1h_input_tokens".to_string(), serde_json::json!(0));
     }
 }
 
@@ -1457,7 +1581,7 @@ mod tests {
             ),
         );
         let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(input))]);
-        let filtered = collect_filtered(filter_sse_stream_with(stream, false, false)).await;
+        let filtered = collect_filtered(filter_sse_stream_with(stream, false, false, None)).await;
         assert!(
             filtered.contains("thinking") && filtered.contains("推理内容"),
             "门控关闭:thinking 块必须原样透传,实际: {filtered}"
@@ -1483,7 +1607,7 @@ mod tests {
             ),
         );
         let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(input))]);
-        let filtered = collect_filtered(filter_sse_stream_with(stream, false, true)).await;
+        let filtered = collect_filtered(filter_sse_stream_with(stream, false, true, None)).await;
         assert!(!filtered.contains("thinking"), "门控开启:thinking 块被滤,实际: {filtered}");
         assert_eq!(extract_indices(&filtered), vec![0], "保留块重编号到 0");
     }
@@ -1492,7 +1616,7 @@ mod tests {
     #[test]
     fn test_filter_json_dsml_only_keeps_thinking_blocks() {
         let json = r#"{"content":[{"type":"thinking","thinking":"推理"},{"type":"text","text":"<｜DSML｜function_calls｜>正文"}]}"#;
-        let filtered = filter_json_bytes_with(json.as_bytes(), false, false);
+        let filtered = filter_json_bytes_with(json.as_bytes(), false, false, None);
         let v: serde_json::Value = serde_json::from_slice(&filtered).unwrap();
         let content = v["content"].as_array().unwrap();
         assert_eq!(content.len(), 2, "门控关闭:thinking 块不得被滤");
@@ -1504,10 +1628,252 @@ mod tests {
     #[test]
     fn test_filter_json_thinking_gate_on_still_filters() {
         let json = r#"{"content":[{"type":"thinking","thinking":"推理"},{"type":"text","text":"正文"}]}"#;
-        let filtered = filter_json_bytes_with(json.as_bytes(), false, true);
+        let filtered = filter_json_bytes_with(json.as_bytes(), false, true, None);
         let v: serde_json::Value = serde_json::from_slice(&filtered).unwrap();
         let content = v["content"].as_array().unwrap();
         assert_eq!(content.len(), 1, "门控开启:thinking 块被滤");
         assert_eq!(content[0]["type"].as_str().unwrap(), "text");
+    }
+
+    // ==================== 模拟缓存注入（透传路径 mockCacheEnabled）====================
+
+    fn mock_json(input_tokens: u64, extra_usage: &str) -> String {
+        format!(
+            r#"{{"content":[{{"type":"text","text":"hi"}}],"usage":{{"input_tokens":{input_tokens},"output_tokens":9{extra_usage}}}}}"#
+        )
+    }
+
+    /// 非流式：ratio=0.5 → cache_read = round(input×0.5)，creation 置 0。
+    #[test]
+    fn test_mock_cache_json_ratio_half() {
+        let out = filter_json_bytes_with(
+            mock_json(10, "").as_bytes(),
+            true,
+            true,
+            Some((true, 0.5)),
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["usage"]["cache_read_input_tokens"], 5, "10×0.5=5");
+        assert_eq!(v["usage"]["cache_creation_input_tokens"], 0);
+        // 既有 usage 字段必须保留（input/output 不被误改）
+        assert_eq!(v["usage"]["input_tokens"], 10);
+        assert_eq!(v["usage"]["output_tokens"], 9);
+    }
+
+    /// 非流式：ratio=1.0 → cache_read = input（100% 全命中）。
+    #[test]
+    fn test_mock_cache_json_ratio_one_reads_full_input() {
+        let out = filter_json_bytes_with(
+            mock_json(10, "").as_bytes(),
+            true,
+            true,
+            Some((true, 1.0)),
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["usage"]["cache_read_input_tokens"], 10);
+        assert_eq!(v["usage"]["cache_creation_input_tokens"], 0);
+    }
+
+    /// 非流式：关闭（None）→ 原样透传（解析等价，键顺序可能被 serde_json 重排不算改动）。
+    #[test]
+    fn test_mock_cache_json_disabled_unchanged() {
+        let input = mock_json(10, "");
+        let out = filter_json_bytes_with(input.as_bytes(), true, true, None);
+        let v_in: serde_json::Value = serde_json::from_str(&input).unwrap();
+        let v_out: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            v_in, v_out,
+            "关闭时必须零改动（usage 一个字段都不变，cache 字段不出现）"
+        );
+        assert!(
+            v_out["usage"].get("cache_read_input_tokens").is_none(),
+            "关闭时不得注入 cache_read"
+        );
+        // Some((false, _)) 与 None 同语义
+        let out2 = filter_json_bytes_with(input.as_bytes(), true, true, Some((false, 0.7)));
+        let v_out2: serde_json::Value = serde_json::from_slice(&out2).unwrap();
+        assert_eq!(v_in, v_out2);
+    }
+
+    /// 非流式：usage 无 input_tokens → 整体不注入（cache 字段缺失而非置 0）。
+    #[test]
+    fn test_mock_cache_json_no_input_tokens_skips() {
+        let json = r#"{"content":[{"type":"text","text":"hi"}],"usage":{"output_tokens":9}}"#;
+        let out = filter_json_bytes_with(json.as_bytes(), true, true, Some((true, 0.5)));
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(
+            v["usage"].get("cache_read_input_tokens").is_none(),
+            "无 input_tokens 时不得注入 cache_read（字段缺失语义，见 prompt_cache 先例）"
+        );
+        assert!(v["usage"].get("cache_creation_input_tokens").is_none());
+    }
+
+    /// 非流式：上游自带的 creation（含 5m/1h 拆分键）被覆盖为 0，避免 read+creation > input。
+    #[test]
+    fn test_mock_cache_json_creation_overwritten_to_zero() {
+        let json = r#"{"content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":20,"output_tokens":1,"cache_read_input_tokens":3,"cache_creation_input_tokens":9,"cache_creation_5m_input_tokens":7,"cache_creation_1h_input_tokens":2}}"#;
+        let out = filter_json_bytes_with(json.as_bytes(), true, true, Some((true, 1.0)));
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["usage"]["cache_read_input_tokens"], 20, "read 覆盖为 input×1.0");
+        assert_eq!(v["usage"]["cache_creation_input_tokens"], 0, "creation 覆盖为 0");
+        assert_eq!(v["usage"]["cache_creation_5m_input_tokens"], 0);
+        assert_eq!(v["usage"]["cache_creation_1h_input_tokens"], 0);
+        // 不变量：read + creation ≤ input
+        let read = v["usage"]["cache_read_input_tokens"].as_u64().unwrap();
+        let creation = v["usage"]["cache_creation_input_tokens"].as_u64().unwrap();
+        assert!(read + creation <= 20, "read+creation 不得超过 input");
+    }
+
+    /// 非流式：**content 缺失** + mock 开启 → usage 仍被注入（回归 MAJOR-2：旧实现注入
+    /// 代码在 content 早退之后，上游 2xx JSON 缺 content 字段时注入静默失效）。
+    #[test]
+    fn test_mock_cache_json_no_content_still_injects() {
+        let json = r#"{"id":"msg_1","type":"message","role":"assistant","usage":{"input_tokens":100,"output_tokens":50}}"#;
+        let out = filter_json_bytes_with(json.as_bytes(), true, true, Some((true, 0.5)));
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["usage"]["cache_read_input_tokens"], 50, "100×0.5=50 必须注入");
+        assert_eq!(v["usage"]["cache_creation_input_tokens"], 0);
+        assert_eq!(v["usage"]["input_tokens"], 100, "既有字段不得被误改");
+        assert!(v.get("content").is_none(), "content 缺失保持缺失（注入不引入 content）");
+    }
+
+    /// 非流式：content 缺失 + mock 关闭 → 字节级原样（零改动，不做多余重序列化）。
+    #[test]
+    fn test_mock_cache_json_no_content_disabled_keeps_bytes() {
+        let json = br#"{"id":"msg_1","usage":{"input_tokens":100,"output_tokens":50}}"#;
+        let out = filter_json_bytes_with(json, true, true, None);
+        assert_eq!(out.as_ref(), json, "mock 关闭 + content 缺失必须字节级原样");
+        let out2 = filter_json_bytes_with(json, true, true, Some((false, 0.7)));
+        assert_eq!(out2.as_ref(), json, "Some((false, _)) 与 None 同语义");
+    }
+
+    /// 非流式：解析失败 + mock 开启 → fail-open 原样返回（注入不注入、绝不破坏响应）。
+    #[test]
+    fn test_mock_cache_json_parse_failure_fail_open() {
+        let garbage = b"{not valid json";
+        let out = filter_json_bytes_with(garbage, true, true, Some((true, 0.5)));
+        assert_eq!(out.as_ref(), garbage, "解析失败必须 fail-open 原样透传");
+    }
+
+    /// 流式：message_start 的 usage 注入（下游读 cache 分支的主入口）。
+    ///
+    /// ⚠️ 测试夹具用**真实 Anthropic 结构**：usage 嵌套在 `message` 内（顶层无 usage，
+    /// 线上原始字节坐实）。旧夹具把 usage 放顶层，与真实结构不符 ⇒ 旧实现只读顶层
+    /// usage 时测试全绿但线上注入恒 0（回归 MAJOR）。
+    #[tokio::test]
+    async fn test_mock_cache_sse_message_start_injected() {
+        let input = format!(
+            "{}",
+            event(
+                "message_start",
+                r#"{"type":"message_start","message":{"id":"m1","usage":{"input_tokens":10,"output_tokens":0}}}"#
+            )
+        );
+        let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(input))]);
+        let filtered = collect_filtered(filter_sse_stream_with(stream, true, true, Some((true, 0.5))))
+            .await;
+        let data_line = filtered
+            .lines()
+            .find(|l| l.starts_with("data: "))
+            .unwrap_or_else(|| panic!("过滤结果应有 data 行，实际: {filtered}"));
+        let v: serde_json::Value =
+            serde_json::from_str(data_line.strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(
+            v["message"]["usage"]["cache_read_input_tokens"], 5,
+            "message.usage 必须注入 read=round(10×0.5)=5，实际: {filtered}"
+        );
+        assert_eq!(v["message"]["usage"]["cache_creation_input_tokens"], 0);
+        assert_eq!(v["message"]["usage"]["input_tokens"], 10, "既有字段不得被误改");
+    }
+
+    /// 流式：message_start 顶层 usage 的旧形态（无 message.usage）同样注入 —— 兼容回退分支。
+    #[tokio::test]
+    async fn test_mock_cache_sse_message_start_top_level_usage_fallback_injected() {
+        let input = format!(
+            "{}",
+            event(
+                "message_start",
+                r#"{"type":"message_start","usage":{"input_tokens":10,"output_tokens":0}}"#
+            )
+        );
+        let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(input))]);
+        let filtered = collect_filtered(filter_sse_stream_with(stream, true, true, Some((true, 0.5))))
+            .await;
+        let data_line = filtered
+            .lines()
+            .find(|l| l.starts_with("data: "))
+            .unwrap_or_else(|| panic!("过滤结果应有 data 行，实际: {filtered}"));
+        let v: serde_json::Value =
+            serde_json::from_str(data_line.strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(
+            v["usage"]["cache_read_input_tokens"], 5,
+            "顶层 usage 形态（回退分支）必须注入 read=5，实际: {filtered}"
+        );
+        assert_eq!(v["usage"]["cache_creation_input_tokens"], 0);
+    }
+
+    /// 流式：message_delta 的 usage（个别上游带 input_tokens）同样注入。
+    #[tokio::test]
+    async fn test_mock_cache_sse_message_delta_injected() {
+        let input = format!(
+            "{}",
+            event(
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":9}}"#
+            )
+        );
+        let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(input))]);
+        let filtered = collect_filtered(filter_sse_stream_with(stream, true, true, Some((true, 1.0))))
+            .await;
+        assert!(
+            filtered.contains("\"cache_read_input_tokens\":10"),
+            "message_delta usage 带 input_tokens 时必须注入，实际: {filtered}"
+        );
+    }
+
+    /// 流式：无 input_tokens 的事件（真实 message_delta 只有 output_tokens）不注入。
+    #[tokio::test]
+    async fn test_mock_cache_sse_no_input_tokens_not_injected() {
+        let input = format!(
+            "{}{}",
+            event(
+                "message_start",
+                r#"{"type":"message_start","message":{"id":"m1","usage":{"input_tokens":10,"output_tokens":0}}}"#
+            ),
+            event(
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}"#
+            )
+        );
+        let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(input))]);
+        let filtered = collect_filtered(filter_sse_stream_with(stream, true, true, Some((true, 0.7))))
+            .await;
+        assert!(
+            filtered.contains("\"cache_read_input_tokens\":7"),
+            "message_start 注入 7"
+        );
+        // message_delta 只有 output_tokens：注入块跳过，output_tokens 保持原值
+        assert!(filtered.contains("\"output_tokens\":9"));
+        assert_eq!(
+            filtered.matches("cache_read_input_tokens").count(),
+            1,
+            "cache_read_input_tokens 只能出现一次（message_delta 未注入），实际: {filtered}"
+        );
+    }
+
+    /// 流式：关闭（None）→ message_start 原样透传（字节级零改动）。
+    #[tokio::test]
+    async fn test_mock_cache_sse_disabled_unchanged() {
+        let input = format!(
+            "{}",
+            event(
+                "message_start",
+                r#"{"type":"message_start","usage":{"input_tokens":10,"output_tokens":0}}"#
+            )
+        );
+        let stream =
+            futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(input.clone()))]);
+        let filtered = collect_filtered(filter_sse_stream_with(stream, true, true, None)).await;
+        assert_eq!(filtered, input, "关闭时必须原样透传");
     }
 }

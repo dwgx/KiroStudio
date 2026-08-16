@@ -13,7 +13,9 @@ use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::socks_node::{
     MAX_SOCKS_NODES, SocksNode, SocksNodeFileCompat, SocksNodeTest,
 };
-use crate::kiro::token_manager::{DisabledReason, MultiTokenManager};
+use crate::kiro::token_manager::{
+    DisabledReason, MultiTokenManager, sha256_hex, validate_refresh_token,
+};
 
 use super::error::AdminServiceError;
 use super::external_idp_login::{
@@ -105,6 +107,24 @@ const MAX_CREDENTIAL_COPIES: u32 = 16;
 /// 报错会让"想多开但填大了"的请求整个失败，而 clamp 后仍是可用结果。
 fn effective_copies(requested: Option<u32>) -> u32 {
     requested.unwrap_or(1).clamp(1, MAX_CREDENTIAL_COPIES)
+}
+
+/// 该号是否需要在 region 探测期间被临时禁用（探测窗口保护，见
+/// [`AdminService::add_credential_with_intent`] 的 `will_probe` 块）。
+///
+/// ⚠️ **判据镜像 `token_manager::needs_api_region_probe`（逐字一致）**——那个函数是
+/// 私有的，此处是唯一镜像点，**改判据必须两边同步**。分叉的最坏后果是退化为
+/// 「启用态入池」的现状（窗口保护失效，但不会更糟），代价是那个已修过两次的
+/// 死亡竞态复发，故镜像义务由下方守卫测试的字面量断言背书。
+///
+/// 抽成独立函数只为可测：行为测试无法覆盖这条路径（真实探测走上游往返，
+/// 本仓铁律禁止测试依赖网络），窗口保护只能靠「判据矩阵 + 源码守卫」锁。
+fn needs_probe_window_guard(cred: &crate::kiro::model::credentials::KiroCredentials) -> bool {
+    !cred.is_custom_api_credential()
+        && cred.is_api_key_credential()
+        && cred.region.is_none()
+        && cred.auth_region.is_none()
+        && cred.api_region.is_none()
 }
 
 /// 一次「批量清理已禁用凭据」最多删多少条（[`AdminService::cleanup_disabled_credentials`]）。
@@ -281,6 +301,9 @@ struct CachedBalance {
 pub struct CooldownDetail {
     /// 冷却原因（中文描述，如"速率限制"）
     pub reason: String,
+    /// 冷却原因稳定枚举码（rate_limited/suspicious/...，`CooldownReason::code()`）。
+    /// 前端判定与 i18n 走此码，不再依赖中文文案。
+    pub code: String,
     /// 剩余冷却时间（毫秒）
     pub remaining_ms: u64,
     /// 连续触发次数
@@ -510,6 +533,210 @@ fn rotate_config_backup(config_path: &Path) {
     if let Err(e) = std::fs::copy(config_path, &bak) {
         tracing::warn!("配置备份轮换失败（继续保存，不影响写盘）: {}", e);
     }
+}
+
+/// 错误码/提示词表合法 status 白名单（设计 §二 1，对齐 `exhausted_status` 先例）。
+///
+/// 504：`upstream_timeout` 默认 504（api_error）——管理员显式写回默认值时不被拒。
+const ERROR_STATUS_WHITELIST: [u16; 10] = [400, 401, 403, 404, 413, 429, 500, 502, 503, 504];
+
+/// 错误码/提示词表合法 type 白名单（设计 §二 2：Anthropic 官方 9 类减 billing_error）。
+///
+/// ⚠️ `billing_error` 与 `quota_exceeded_error` **不在**白名单（B2 决策，
+/// docs/error-codes-client-behavior.md §1.4/§6.1-H6）：
+/// - `billing_error`：Claude Code CLI 层 D 判定 `type==="billing_error"` → 429/402
+///   都会重试约 7 次（1 分钟）——配出来即触发重试风暴；
+/// - `quota_exceeded_error`：k2cc 姿势需要 402（402 不在 status 白名单），配置即
+///   组合必拒，留在白名单是死选项；
+/// - 待 QUOTA→402 改造（docs/quota-402-design.md，约 45 行）落地时，把 402 加进
+///   status 白名单并同时放行这两个 type（quota_exceeded_error 是 402 姿势的
+///   non_retryable type，见 client-behavior §6.1-H6）。
+///
+/// ⚠️ 现状文案里 `service_unavailable` / `internal_error` / `upstream_error`
+/// 不在白名单（非官方类）：默认表保留现状值，但配置侧只能选白名单内 type。
+const ERROR_TYPE_WHITELIST: [&str; 8] = [
+    "invalid_request_error",
+    "authentication_error",
+    "permission_error",
+    "not_found_error",
+    "request_too_large",
+    "rate_limit_error",
+    "api_error",
+    "overloaded_error",
+];
+
+/// 错误码表条目数上限 / message 长度上限（机制文档 §4.3，防配置膨胀与日志毒化）。
+const ERROR_TABLE_MAX_ENTRIES: usize = 200;
+const ERROR_MESSAGE_MAX_CHARS: usize = 500;
+
+/// status × type 组合约束（设计 §二 3）。调用前 status/type 已各自过白名单。
+///
+/// 504 与 500/502 同族（`upstream_timeout` 默认 504→api_error，H5：全客户端对
+/// 5xx 必重试）；billing_error 已从白名单移除（重试风暴，见白名单注释）。
+fn error_type_compatible_with_status(status: u16, ty: &str) -> bool {
+    match status {
+        401 => ty == "authentication_error",
+        403 => ty == "permission_error",
+        404 => ty == "not_found_error",
+        429 => ty == "rate_limit_error" || ty == "overloaded_error",
+        400 | 413 => ty == "invalid_request_error" || ty == "request_too_large",
+        500 | 502 | 504 => ty == "api_error",
+        503 => ty == "api_error" || ty == "overloaded_error",
+        // 白名单外的 status 已被规则 1 拒绝，走不到这里。
+        _ => true,
+    }
+}
+
+/// message 决策词黑名单（设计 §二 5）：命中即拒——这些词会改变客户端决策
+/// （Claude Code CLI 层重试 / 凭据处置 / type 分派），配置不允许出现。
+///
+/// 大小写不敏感（客户端判据是小写匹配，防绕过）。`quota`+`exhausted` 组合
+/// **无条件拒绝**（B2：billing_error 已从白名单移除，旧豁免条件永远不可达，
+/// 且 Claude Code D 判定/opencode 模式匹配都拿它当重试决策输入）。
+fn error_message_decision_word_hit(message: &str) -> Option<&'static str> {
+    let m = message.to_lowercase();
+    if m.contains("credit balance is too low") {
+        return Some("message 含决策词 `credit balance is too low`（触发 Claude Code CLI 层重试，禁止配置）");
+    }
+    if m.contains("organization has been disabled") {
+        return Some("message 含决策词 `organization has been disabled`（触发客户端凭据处置，禁止配置）");
+    }
+    if m.contains("overloaded_error") {
+        return Some("message 含 `overloaded_error` 字样（客户端按 type 分派行为的哨兵串，禁止混入文案）");
+    }
+    if m.contains("quota") && m.contains("exhausted") {
+        return Some("message 同时含 `quota` 与 `exhausted`（客户端重试决策词，禁止配置）");
+    }
+    if m.contains("billing") {
+        return Some("message 含 `billing` 字样（防 Claude Code CLI 层 7 次重试误触发，禁止配置）");
+    }
+    None
+}
+
+/// key 命名规范：小写字母开头，只允许小写字母/数字/下划线（防日志/前端毒化）。
+fn is_valid_error_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// 错误码/提示词表校验：任一错误 → `Err(第一个错误)`，**整表不生效**（保持旧表）。
+///
+/// 规则（设计 §二 锁死项 + 机制文档 §4.3，逐条落实）：
+/// 1. status 白名单；2. type 白名单；3. status×type 组合约束（取「配置 or 默认表」
+///    的**最终渲染值**判定，防单字段绕过）；4. retryAfterSecs 0-3600；
+/// 5. message 决策词黑名单（拒绝）；6. 承重字符串只告警不硬拒
+///    （`check_load_bearing_message`）；7. 表条目数 ≤200、key 命名 snake_case、
+///    message ≤500 字符。
+///
+/// `pub(crate)`：启动路径（main.rs 播种 set_error_messages 前）与
+/// `update_config`（字段级 merge 前校验，失败 400 回显）、`import_config`
+/// （整份导入校验，失败拒绝导入）共用同一校验。
+pub(crate) fn validate_error_messages(
+    entries: &HashMap<String, crate::model::error_messages::ErrorMessageOverride>,
+) -> Result<(), String> {
+    if entries.len() > ERROR_TABLE_MAX_ENTRIES {
+        return Err(format!(
+            "errorMessages 表条目数超过上限 {}",
+            ERROR_TABLE_MAX_ENTRIES
+        ));
+    }
+    for (key, entry) in entries {
+        if !is_valid_error_key(key) {
+            return Err(format!(
+                "errorMessages[{key}]: key 命名不合法（只允许小写字母/数字/下划线）"
+            ));
+        }
+        if let Some(ty) = entry.r#type.as_deref() {
+            if !ERROR_TYPE_WHITELIST.contains(&ty) {
+                return Err(format!(
+                    "errorMessages[{key}].type 只允许 {:?}，收到 {ty}",
+                    ERROR_TYPE_WHITELIST
+                ));
+            }
+        }
+        if let Some(status) = entry.status {
+            if !ERROR_STATUS_WHITELIST.contains(&status) {
+                return Err(format!(
+                    "errorMessages[{key}].status 只允许 {:?}，收到 {status}",
+                    ERROR_STATUS_WHITELIST
+                ));
+            }
+        }
+        // status×type 组合约束（设计 §二 3）：取「配置 or 默认表」的**最终渲染值**
+        // 再查组合矩阵——只配 status（或只配 type）时另一半落默认，仍必须组合合法，
+        // 堵住单字段绕过（如 {status:401} 单独配置 → 渲染 401+默认 rate_limit_error
+        // → 拒；{type:authentication_error} 单独配置在默认 429 的 key 上 → 拒）。
+        //
+        // 默认表里保留的现状非官方值（service_unavailable / internal_error /
+        // upstream_error、流式 in-band 200）不在白名单：渲染值任一不在白名单时
+        // 跳过组合检查（组合约束只约束官方值域，不拦「只改 message」的合法姿势，
+        // 设计 §一「只改 message 时 status/type 不填」）。
+        // key 不在默认表（管理员自定义，无渲染基线）→ 退化为双方都显式才检查。
+        let default_pair = default_status_type_for(key);
+        let combo_bad = match (entry.status, entry.r#type.as_deref(), default_pair) {
+            (Some(s), Some(t), _) => !error_type_compatible_with_status(s, t),
+            (Some(s), None, Some((_, dt))) => {
+                ERROR_STATUS_WHITELIST.contains(&s)
+                    && ERROR_TYPE_WHITELIST.contains(&dt)
+                    && !error_type_compatible_with_status(s, dt)
+            }
+            (None, Some(t), Some((ds, _))) => {
+                ERROR_STATUS_WHITELIST.contains(&ds)
+                    && ERROR_TYPE_WHITELIST.contains(&t)
+                    && !error_type_compatible_with_status(ds, t)
+            }
+            _ => false,
+        };
+        if combo_bad {
+            return Err(format!(
+                "errorMessages[{key}]: status 与 type 组合不合法（渲染值不满足 \
+                 429→rate_limit_error/overloaded_error；401→authentication_error；403→permission_error；\
+                 404→not_found_error；400/413→invalid_request_error/request_too_large；\
+                 500/502/504→api_error；503→api_error/overloaded_error）"
+            ));
+        }
+        if let Some(ra) = entry.retry_after_secs {
+            if ra > 3600 {
+                return Err(format!(
+                    "errorMessages[{key}].retryAfterSecs 必须在 0-3600 之间，收到 {ra}"
+                ));
+            }
+        }
+        if let Some(msg) = entry.message.as_deref() {
+            if msg.chars().count() > ERROR_MESSAGE_MAX_CHARS {
+                return Err(format!(
+                    "errorMessages[{key}].message 超过 {ERROR_MESSAGE_MAX_CHARS} 字符上限"
+                ));
+            }
+            if let Some(reason) = error_message_decision_word_hit(msg) {
+                return Err(format!("errorMessages[{key}]: {reason}"));
+            }
+            // 承重字符串：提示不硬拒（外挂/客户端判据依赖，改了会静默失效）。
+            if let Some(load_bearing) =
+                crate::model::error_messages::check_load_bearing_message(msg)
+            {
+                tracing::warn!(
+                    "errorMessages[{key}].message 含承重字符串: {load_bearing}（建议保留现状，见 docs/error-codes-inventory.md §3.1）"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 默认表的 (status, type) 渲染基线：key 不在默认表（管理员自定义）→ `None`。
+///
+/// 默认表可能被并行任务重写（key 集变化）——始终以 `default_error_messages()`
+/// 当前实现为准，不硬编码 key。
+fn default_status_type_for(key: &str) -> Option<(u16, &'static str)> {
+    crate::model::error_messages::default_error_messages()
+        .iter()
+        .find(|(k, ..)| *k == key)
+        .map(|(_, s, t, ..)| (*s, *t))
 }
 
 /// 递归对比两份配置 JSON，返回「发生了变更的字段路径」列表。
@@ -827,6 +1054,7 @@ impl AdminService {
                     cooling_down: cd.is_some(),
                     cooldown_remaining_ms: cd.map(|c| c.remaining_ms),
                     cooldown_reason: cd.map(|c| c.reason.description().to_string()),
+                    cooldown_code: cd.map(|c| c.reason.code().to_string()),
                 }
             })
             .collect();
@@ -932,6 +1160,7 @@ impl AdminService {
                     disabled: e.disabled,
                     cooldown: cd.map(|c| CooldownDetail {
                         reason: c.reason.description().to_string(),
+                        code: c.reason.code().to_string(),
                         remaining_ms: c.remaining_ms,
                         trigger_count: c.trigger_count,
                     }),
@@ -1043,9 +1272,49 @@ impl AdminService {
     /// ⚠️ 凭证纪律：refreshToken 是敏感值，本函数不记录、不回显、不进错误消息。
     /// 成功后下一次调用强制走刷新链路（access_token 缓存已清）。
     pub fn update_refresh_token(&self, id: u64, refresh_token: String) -> Result<(), AdminServiceError> {
-        if refresh_token.trim().is_empty() {
+        // 🔴 凭据类型闸（对抗审查 MINOR-6，2026-08-15）：refreshToken 是 OAuth 类
+        // 凭据的专属字段，api_key 凭据没有该概念（直接用 kiro_api_key 作 Bearer），
+        // 更新它是误操作，直接 400。判据问**真凭据**（export_credential）而非快照
+        // 字段 —— 快照的 auth_method 对代挂/历史号不完整（与 cleanup 同款教训，
+        // service.rs:1192）。
+        let cred = self
+            .token_manager
+            .export_credential(id)
+            .ok_or(AdminServiceError::NotFound { id })?;
+        if cred.is_api_key_credential() {
+            return Err(AdminServiceError::InvalidCredential(
+                "仅 OAuth 凭据支持更新 refreshToken".to_string(),
+            ));
+        }
+        // 🔴 服务端 trim（对抗审查 MINOR-7，2026-08-15）：从聊天工具粘贴的 token
+        // 常带首尾换行/空白，不 trim 会把脏值写进 refresh_token_hash 与落库，下次
+        // 刷新必然 invalid_grant。entry 处统一 trim 后再走 validate + 哈希 + 落库。
+        let refresh_token = refresh_token.trim().to_string();
+        if refresh_token.is_empty() {
             return Err(AdminServiceError::InvalidCredential(
                 "refreshToken 不能为空".to_string(),
+            ));
+        }
+        // 截断检测：与 add_credential 同款（长度 <100 或含 "..." 即拒）。从聊天工具
+        // 粘贴时容易被截断，静默接受会让下一次刷新必然失败（invalid_grant）。
+        let mut candidate = KiroCredentials::default();
+        candidate.refresh_token = Some(refresh_token.clone());
+        if let Err(e) = validate_refresh_token(&candidate) {
+            return Err(AdminServiceError::InvalidCredential(e.to_string()));
+        }
+        // 跨凭据重复检测：对齐 add_credential 的 refreshToken 去重（sha256 哈希比较，
+        // 见 snapshot 的 refresh_token_hash）。必须排除自身 —— 用当前值重提交是合法
+        // no-op，不该被当成「与其他凭据重复」。
+        let new_hash = sha256_hex(&refresh_token);
+        let duplicate = self
+            .token_manager
+            .snapshot()
+            .entries
+            .iter()
+            .any(|e| e.id != id && e.refresh_token_hash.as_deref() == Some(new_hash.as_str()));
+        if duplicate {
+            return Err(AdminServiceError::DuplicateCredential(
+                "refreshToken 与其他凭据重复".to_string(),
             ));
         }
         self.token_manager
@@ -2590,6 +2859,7 @@ impl AdminService {
             disabled: req.disabled,
             disabled_reason: None,
             disabled_at: None,
+            quota_exhausted_at: None,
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
             // 新号默认跟随全局 `config.cliOriginKiroCli`（None）；本条为单号 A/B 排查
@@ -2781,6 +3051,29 @@ impl AdminService {
         // 绕过在此处是安全的：份数 >1 本身就是调用方声明了多开意图，误双击上号绕不到
         // 这里（前端只在份数 >1 时才下发该字段，见 add-credential-dialog.tsx）。
         let allow_dup = is_multi_open;
+
+        // ⭐ 探测窗口保护（M9）：要探测的号以**临时禁用态**入池，探测完成前调度器不碰它。
+        //
+        // 对齐同文件 `import_one_key`（disabled 随请求入池）与 `clone_credential`
+        // （「必须在入池时就是 disabled，不能先建后批量禁用」）的**先禁后建**实践。
+        // 下方 `probe_and_persist_api_region` 是 1-2s 的真实上游往返；若号以启用态入池，
+        // 窗口期真实流量会打到错区（`api_region` 还没写死，回退 `config.region`）恒 403，
+        // `MAX_FAILURES_PER_CREDENTIAL=3` 三次即自动禁用 —— 号在自己 region 被探出来
+        // 之前就死了（线上事故 #536-550，见下方 P0 块的完整描述）。
+        //
+        // 判据镜像 `token_manager::needs_api_region_probe`（api_key 号 + region 三字段
+        // 全空 + 非 custom_api）—— 该函数是私有的，此处是唯一镜像点，**改判据必须
+        // 两边同步**（分叉的最坏后果是回到「启用态入池」的现状，不会更糟，但窗口保护
+        // 就失效了）。带 region / OAuth / custom_api 号 will_probe=false，行为零变化。
+        //
+        // ⚠️ 写成布尔表达式而非 `if will_probe` 里的字面量赋值：
+        // `account_throttled_must_not_disable_credential` 守卫用「函数体第一处
+        // `new_cred.disabled = true` 字面量」定位失败处置分支；前置禁用若也用同一
+        // 字面量，守卫的切片锚点会错位（详见那条守卫的文档）。
+        let will_probe = needs_probe_window_guard(&new_cred);
+        let orig_disabled = new_cred.disabled;
+        new_cred.disabled = orig_disabled || will_probe;
+
         let credential_id = if allow_dup {
             self.token_manager
                 .add_credential_allowing_duplicate(new_cred.clone())
@@ -2846,6 +3139,10 @@ impl AdminService {
         // 同一批 key 的 #551–556 探到 `eu-central-1`，其中一个跑到 881/881 全成功。
         // 差别只有几百毫秒的时序。
         //
+        // 窗口期的死亡竞态由上方入池前的临时禁用（`will_probe` 块）消除：探测期间
+        // 号不可被调度，窗口内不存在「真实流量打到错区」。这里只负责**探测之后的
+        // 收尾**：失败（NoUsableRegion/TokenDead）保持禁用，其余结论恢复启用。
+        //
         // ⚠️ **分身必须一并禁用**：分身继承父号的 `api_region`（上方回写块），父号探不到时
         // 它们继承到的是 `None` ⇒ 回退 `config.region` ⇒ 与父号同样恒 403。
         // 历史事故正是这个形态（父号 #525 探到 eu-central-1 而 4 个分身 api_region=None，
@@ -2863,6 +3160,18 @@ impl AdminService {
             self.token_manager
                 .mark_region_probe_failed(credential_id, &probe_outcome);
             new_cred.disabled = true;
+        } else if will_probe && !orig_disabled {
+            // 探测已得出结论（Usable / Skipped / AccountThrottled 三者都不判死）：
+            // 把入池前临时禁用的第 1 份恢复为请求的原启用意图，分身（克隆
+            // `new_cred`）一并恢复。恢复失败只告警不阻断 —— 号停留在临时禁用态
+            // 是安全的一侧（绝不比「错误启用」更糟），但需要人工捞。
+            if let Err(e) = self.token_manager.set_disabled(credential_id, false) {
+                tracing::warn!(
+                    credential_id,
+                    "region 探测后恢复凭据启用失败（号停留在临时禁用态）: {e}"
+                );
+            }
+            new_cred.disabled = false;
         }
 
         // ⭐ 账户级临时风控（403 `TEMPORARILY_SUSPENDED`）挡住了探测：**刻意不禁用**。
@@ -3624,6 +3933,8 @@ impl AdminService {
             self_heal_max_backoff_secs: config.self_heal_max_backoff_secs,
             self_heal_max_shift: config.self_heal_max_shift,
             prompt_cache_enabled: config.prompt_cache_enabled,
+            mock_cache_enabled: config.mock_cache_enabled,
+            mock_cache_read_ratio: config.mock_cache_read_ratio,
             strip_env_noise: config.strip_env_noise,
             tool_clean_leaked_tokens: config.tool_clean_leaked_tokens,
             tool_reclaim_textified_invoke: config.tool_reclaim_textified_invoke,
@@ -3661,6 +3972,7 @@ impl AdminService {
             cooldown_scale_pct: config.cooldown_scale_pct,
             rate_limit_jitter_pct: config.rate_limit_jitter_pct,
             throttle_profile: config.throttle_profile,
+            scheduling_mode: config.scheduling_mode,
             inbound_throttle_enabled: config.inbound_throttle_enabled,
             inbound_rpm_auto: config.inbound_rpm_auto,
             inbound_target_rpm: config.inbound_target_rpm,
@@ -3718,11 +4030,13 @@ impl AdminService {
             login_background_enabled: config.login_background_enabled,
             login_background_r18: config.login_background_r18,
             balance_refresh_interval_secs: config.balance_refresh_interval_secs,
+            ota_auto_check: config.ota_auto_check,
             collect_client_fingerprint: config.collect_client_fingerprint,
             config_path: config
                 .config_path()
                 .map(|p| p.display().to_string()),
             model_mapping: config.model_mapping.clone(),
+            error_messages: config.error_messages.clone(),
         }
     }
 
@@ -3812,6 +4126,12 @@ impl AdminService {
         // 必须进 hot_or_display_changed 的 OR 链，否则「存了盘但 ArcSwap 仍是旧值」。
         let mut self_heal_changed = false;
         let mut prompt_cache_enabled_changed: Option<bool> = None;
+        // 透传模拟缓存（TIER3）：enabled/ratio 任一变更都调 handlers setter 即时生效。
+        let mut mock_cache_changed = false;
+        // 错误码/提示词覆盖表（TIER1）：无 TIER3 setter——消费点每请求读 config
+        // ArcSwap 快照查表（model_mapping 同款范式），**只**靠下面 OR 链触发
+        // reload_config。漏掉这行 → 存了盘但 ArcSwap 仍是旧值，面板改完当次不生效。
+        let mut error_messages_changed = false;
         // 环境噪音剥离开关：改后调 converter setter 即时生效（进程级镜像，不重启）。
         let mut strip_env_noise_changed: Option<bool> = None;
         // Kiro 原生 effort 开关：改后调 converter setter 即时生效（进程级镜像，不重启）。
@@ -3911,6 +4231,15 @@ impl AdminService {
                 }
                 config.default_endpoint = v;
                 restart_fields.push("defaultEndpoint".into());
+            }
+        }
+        // —— OTA 自动检查开关（需重启生效）——
+        // main.rs 启动期按 config.ota_auto_check 门控 spawn 后台检查任务（无 respawn
+        // 机制，TIER2 覆盖范围外），改后必须重启进程才生效 → 只进 restart_fields。
+        if let Some(v) = req.ota_auto_check {
+            if v != config.ota_auto_check {
+                config.ota_auto_check = v;
+                restart_fields.push("otaAutoCheck".into());
             }
         }
         // —— 提取 thinking 开关（TIER3 AppState 热更：改后调 handlers setter 即时生效不重启）——
@@ -4021,6 +4350,24 @@ impl AdminService {
             if v != config.prompt_cache_enabled {
                 config.prompt_cache_enabled = v;
                 prompt_cache_enabled_changed = Some(v);
+            }
+        }
+        // —— 透传模拟缓存（TIER3 热更：改后调 handlers setter 即时生效不重启）——
+        // 两个字段共用一个 changed 标志：任一变更是同一个 setter 调用。
+        if let Some(v) = req.mock_cache_enabled {
+            if v != config.mock_cache_enabled {
+                config.mock_cache_enabled = v;
+                mock_cache_changed = true;
+            }
+        }
+        if let Some(v) = req.mock_cache_read_ratio {
+            // 先清洗再比较/写盘：setter（handlers）侧也会清洗，但 config 结构里存
+            // 原始非法值（NaN/±inf/越界）会让面板快照（读 config 结构）与热路径
+            // 生效值（经 setter clamp）不一致。
+            let v = crate::anthropic::handlers::sanitize_mock_cache_ratio(v);
+            if v != config.mock_cache_read_ratio {
+                config.mock_cache_read_ratio = v;
+                mock_cache_changed = true;
             }
         }
         // —— 环境噪音剥离开关（改后调 converter setter 即时生效不重启）——
@@ -4264,9 +4611,32 @@ impl AdminService {
         // 这是比"冲掉配置"更糟的体验（静默无效）。
         // 所以这里用空 explicit 集合调用，让档位对所有受管字段生效，
         // 且改动会随 `save()` 落盘成显式值（之后重启加载时它们就是"显式"的，不会被再次覆盖 —— 自洽）。
+        if let Some(m) = req.scheduling_mode {
+            if m != config.scheduling_mode {
+                config.scheduling_mode = m;
+                // 调度模式映射到对应 ThrottleProfile 并写入预设矩阵
+                //（smart→Direct / stable→Shielded / manual→Manual，见 `SchedulingMode`）。
+                config.throttle_profile = m.to_throttle_profile();
+                config.apply_throttle_profile_for_explicit_switch();
+                hot_changed = true;
+            }
+        }
         if let Some(p) = req.throttle_profile {
             if p != config.throttle_profile {
                 config.throttle_profile = p;
+                // 反向同步：老客户端只发 throttleProfile 时，调度模式标记保持一致
+                //（direct→smart / shielded→stable / manual→manual）。
+                config.scheduling_mode = match p {
+                    crate::model::config::ThrottleProfile::Direct => {
+                        crate::model::config::SchedulingMode::Smart
+                    }
+                    crate::model::config::ThrottleProfile::Shielded => {
+                        crate::model::config::SchedulingMode::Stable
+                    }
+                    crate::model::config::ThrottleProfile::Manual => {
+                        crate::model::config::SchedulingMode::Manual
+                    }
+                };
                 config.apply_throttle_profile_for_explicit_switch();
                 hot_changed = true;
             }
@@ -4618,6 +4988,33 @@ impl AdminService {
             }
         }
 
+        // —— 立即生效的字段：错误码/提示词覆盖表（per-key merge）——
+        // 消费点（错误翻译处）读 handlers 进程镜像（reload_config 改写同一镜像），
+        // 所以只需保存 + reload_config 热应用。⚠️ 语义：**per-key merge**——提交的
+        // key 更新为提交值（字段 None = 用内置默认），空对象 `{}` = 清掉该 key 回默认，
+        // **未提交的 key 保持不变**（前端按"有改动的 key"提交，整表替换会重置用户
+        // 未改的 key）。⚠️ 先校验再写盘：任一 key 非法 → 整表拒绝（保持旧表），
+        // 400 回显第一个错误（对齐 exhausted_status 白名单先例）。
+        if let Some(em) = req.error_messages {
+            let mut merged = config.error_messages.clone();
+            for (k, v) in em {
+                let is_empty = v.status.is_none()
+                    && v.r#type.is_none()
+                    && v.message.is_none()
+                    && v.retry_after_secs.is_none();
+                if is_empty {
+                    merged.remove(&k);
+                } else {
+                    merged.insert(k, v);
+                }
+            }
+            if merged != config.error_messages {
+                validate_error_messages(&merged).map_err(AdminServiceError::InvalidCredential)?;
+                config.error_messages = merged;
+                error_messages_changed = true;
+            }
+        }
+
         // 持久化（一次写盘）
         //
         // 2026-08-14 新增两件事：
@@ -4664,6 +5061,9 @@ impl AdminService {
             // 删掉它 → 面板改了、存了盘，但 clone_default_enabled() 读到的仍是旧值。
             || clone_default_enabled_changed
             || prompt_cache_enabled_changed.is_some()
+            // 透传模拟缓存有 TIER3 setter（handlers 镜像），但要 `hot_changed` 之外仍进
+            // OR 链才会调它：漏掉这行只改本项时面板会回「无改动」、镜像不刷新。
+            || mock_cache_changed
             || strip_env_noise_changed.is_some()
             // Kiro 原生 effort 开关有 TIER3 setter（converter 镜像），但要 `hot_changed`
             // 之外仍进 OR 链才会调它：漏掉这行只改本项时面板会回「无改动」。
@@ -4678,7 +5078,10 @@ impl AdminService {
             // 🔴 吸收层没有 TIER3 setter，**只**靠这一行触发 reload_config 把新值换进 ArcSwap。
             // 删掉它 → 面板改了、存了盘、但 provider 读到的仍是旧值 → 开关静默无效。
             // 由 absorb_changed_is_in_hot_reload_or_chain 源码守卫钉死。
-            || absorb_changed;
+            || absorb_changed
+            // 错误码/提示词覆盖表同款：消费点每请求读 config ArcSwap（无 TIER3 setter），
+            // 只有这一行能触发 reload_config。漏掉 → 存盘但热路径仍读旧表。
+            || error_messages_changed;
         if hot_or_display_changed {
             if let Err(e) = self.token_manager.reload_config() {
                 tracing::warn!("配置已存盘但热重载失败,下次重启生效: {}", e);
@@ -4750,6 +5153,15 @@ impl AdminService {
             crate::anthropic::set_prompt_cache_enabled(v);
         }
 
+        // TIER3：透传模拟缓存配置立即应用到热路径进程级镜像（下一个透传请求即生效）。
+        // 用 `config`（已更新）而非 req 原值：两个字段可能只改一个，setter 要拿完整组。
+        if mock_cache_changed {
+            crate::anthropic::handlers::set_mock_cache_config(
+                config.mock_cache_enabled,
+                config.mock_cache_read_ratio,
+            );
+        }
+
         // 环境噪音剥离开关立即应用到 converter 进程级镜像（下一个请求即生效）
         if let Some(v) = strip_env_noise_changed {
             crate::anthropic::set_strip_env_noise(v);
@@ -4792,6 +5204,7 @@ impl AdminService {
             // 「无改动」，与实际不符。
             || clone_default_enabled_changed
             || prompt_cache_enabled_changed.is_some()
+            || mock_cache_changed
             || strip_env_noise_changed.is_some()
             || native_thinking_effort_enabled_changed.is_some()
             || tool_clean_leaked_tokens_changed.is_some()
@@ -4802,7 +5215,10 @@ impl AdminService {
             || tool_description_max_chars_changed.is_some()
             // 吸收层是立即生效项（reload_config 换 ArcSwap），漏掉这行只改吸收层时面板会
             // 回「未检测到变更」，与实际不符。
-            || absorb_changed;
+            || absorb_changed
+            // 错误码/提示词覆盖表同款（hot_or_display_changed 触发 reload_config 即生效）：
+            // 漏掉这行只改错误码表时面板会回「未检测到变更」，与实际不符。
+            || error_messages_changed;
         let restart_required = !restart_fields.is_empty();
         let message = if restart_required {
             format!("已保存。{} 个字段需重启服务后生效。", restart_fields.len())
@@ -4903,6 +5319,11 @@ impl AdminService {
                 "port 必须是 1-65535".to_string(),
             ));
         }
+
+        // ②.5 错误码/提示词表校验（与 update_config 同口径，失败整份拒绝零写盘）。
+        // 导入是整份替换，错误码表直接进 Config，这里必须先过 validate_error_messages。
+        validate_error_messages(&imported.error_messages)
+            .map_err(AdminServiceError::InvalidCredential)?;
 
         // ③ 敏感字段：省略 / `***` 掩码 / null → 保留现值（读磁盘当前值，与
         //    update_config 的 load 同源）。只有**显式提供的真实新值**才覆盖。
@@ -5557,6 +5978,7 @@ impl AdminService {
         let config = DiagnosticsConfigSummary {
             load_balancing_mode: self.token_manager.get_load_balancing_mode(),
             throttle_profile: cfg.throttle_profile,
+            scheduling_mode: cfg.scheduling_mode,
             inbound_throttle_enabled: cfg.inbound_throttle_enabled,
             inbound_target_rpm: cfg.inbound_target_rpm,
             upstream_retry_absorb_enabled: cfg.upstream_retry_absorb_enabled,
@@ -6604,13 +7026,17 @@ impl AdminService {
     fn classify_add_error(&self, e: anyhow::Error) -> AdminServiceError {
         let msg = e.to_string();
 
+        // 凭据重复（refreshToken/kiroApiKey 与池中已有冲突）——独立判别，与 restore
+        // 路径（classify_trash_error）同口径，前端可据 error.type 处置。
+        if msg.contains("凭据已存在") || msg.contains("refreshToken 重复") || msg.contains("kiroApiKey 重复")
+        {
+            return AdminServiceError::DuplicateCredential(msg);
+        }
+
         // 凭据验证失败（refreshToken 无效、格式错误等）
         let is_invalid_credential = msg.contains("缺少 refreshToken")
             || msg.contains("refreshToken 为空")
             || msg.contains("refreshToken 已被截断")
-            || msg.contains("凭据已存在")
-            || msg.contains("refreshToken 重复")
-            || msg.contains("kiroApiKey 重复")
             || msg.contains("缺少 kiroApiKey")
             || msg.contains("kiroApiKey 为空")
             || msg.contains("凭证已过期或无效")
@@ -6647,7 +7073,9 @@ impl AdminService {
         if msg.contains("回收站中不存在") {
             AdminServiceError::NotFound { id }
         } else if msg.contains("凭据已存在") || msg.contains("重复") {
-            AdminServiceError::InvalidCredential(msg)
+            // 重复类独立判别：前端「自动强制恢复」按 error.type 触发（settings-page），
+            // 不依赖「重复」字样的中文文案。
+            AdminServiceError::DuplicateCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)
         }
@@ -6804,7 +7232,6 @@ mod multi_open_copies_tests {
     ///
     /// 用源码守卫而非行为测试：`add_credential` 会打真实上游（`get_usage_limits_for`），
     /// 而本仓铁律禁止测试依赖网络。
-    #[test]
     /// `POST /credentials/{id}/api-region` 必须存在且挂在鉴权路由树内。
     ///
     /// 补的是真实运维缺口：`ksk_` 按 region 授权、打错区恒 403 且**永不自愈**，
@@ -7149,6 +7576,102 @@ mod multi_open_copies_tests {
             );
         }
     }
+
+    // ---------------- M9：region 探测窗口保护 ----------------
+
+    /// 探测窗口判据矩阵（纯函数，不碰网络）：只有「真的会被探测」的号才需要
+    /// 临时禁用 —— api_key 号 + region 三字段全空 + 非 custom_api。
+    ///
+    /// 镜像 `token_manager::needs_api_region_probe` 的逐字判据；行为测试跑不到
+    /// 真实探测（上游往返，本仓铁律），故矩阵锁住「哪些号进窗口保护」。
+    #[test]
+    fn probe_window_guard_judgement_matrix() {
+        fn cred(region: Option<&str>, api_region: Option<&str>, auth_region: Option<&str>) -> KiroCredentials {
+            KiroCredentials {
+                auth_method: Some("api_key".into()),
+                kiro_api_key: Some("ksk_m9".into()),
+                region: region.map(String::from),
+                auth_region: auth_region.map(String::from),
+                api_region: api_region.map(String::from),
+                ..Default::default()
+            }
+        }
+
+        // 无任何 region 字段的 api_key 号 → 会探测 → 必须进窗口保护。
+        assert!(needs_probe_window_guard(&cred(None, None, None)));
+        // 任一 region 字段有值 → probe 直接 Skipped → 不进保护（行为零变化）。
+        assert!(!needs_probe_window_guard(&cred(Some("eu-central-1"), None, None)));
+        assert!(!needs_probe_window_guard(&cred(None, Some("us-east-1"), None)));
+        assert!(!needs_probe_window_guard(&cred(None, None, Some("eu-central-1"))));
+        // OAuth 号（无 kiro_api_key）→ probe Skipped → 不进保护。
+        let mut oauth = cred(None, None, None);
+        oauth.kiro_api_key = None;
+        oauth.auth_method = Some("social".into());
+        oauth.refresh_token = Some("rt".into());
+        assert!(!needs_probe_window_guard(&oauth));
+        // custom_api 号（即使旧数据带了 kiro_api_key）→ 不属于 Kiro region 体系 → 不进保护。
+        let mut custom = cred(None, None, None);
+        custom.auth_method = Some("custom_api".into());
+        assert!(!needs_probe_window_guard(&custom));
+        // 旧数据兜底：base_url 有值也算 custom_api（is_custom_api_credential 判据）。
+        let mut legacy_custom = cred(None, None, None);
+        legacy_custom.base_url = Some("https://relay.example.com".into());
+        assert!(!needs_probe_window_guard(&legacy_custom));
+    }
+
+    /// ⭐ 源码级守卫（M9 承重）：探测窗口内凭据**不可被调度**。
+    ///
+    /// 线上事故（2026-08-05 05:41）：#536–550 以启用态入池，探测 1-2s 的窗口里
+    /// 真实流量打到错区恒 403，3 次即自动禁用 —— 号在自己 region 被探出来之前就死了。
+    /// 修复 = 探测前置临时禁用 + 探测后按结论恢复；守卫锁住这个结构：
+    ///   1. `probe_and_persist_api_region(credential_id)` 调用**之前**必须存在
+    ///      临时禁用赋值（`new_cred.disabled = orig_disabled || will_probe`）。
+    ///   2. 探测调用**之后**必须存在恢复调用（`set_disabled(credential_id, false)`）。
+    ///
+    /// 回退即 FAIL：把临时禁用行删掉 / 把恢复调用删掉 / 把临时禁用挪到探测调用之后
+    /// （那等于没保护）。行为测试测不到（真实探测是上游往返），故锁源码。
+    #[test]
+    fn probe_window_keeps_credential_unselectable() {
+        let src = include_str!("service.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        let fname = format!("async fn add_credential_with_intent{}", "(");
+        let start = prod.find(&fname).expect("add_credential_with_intent 不应被改名");
+        let body_end = prod[start..]
+            .find("\n    pub async fn ")
+            .map(|i| i + start)
+            .unwrap_or(prod.len());
+        let body = &prod[start..body_end];
+
+        // 1) 探测调用位置
+        let probe = format!("probe_and_persist_api_region{}", "(credential_id)");
+        let pi = body
+            .find(&probe)
+            .expect("region 探测调用不应被删除或改名");
+
+        // 2) 临时禁用必须出现在探测**之前**（needle 拼接防自匹配）。
+        let guard_assign = format!(
+            "new_cred.disabled = {} || will_probe;",
+            "orig_disabled"
+        );
+        let gi = body.find(&guard_assign).unwrap_or_else(|| {
+            panic!(
+                "入池前必须存在临时禁用赋值（{guard_assign}）——否则探测窗口内\
+                 号以启用态在池中，真实流量打错区 3 次即被自动禁用（事故 #536-550）"
+            )
+        });
+        assert!(gi < pi, "临时禁用必须在探测调用之前（放之后等于没保护）");
+
+        // 3) 恢复调用必须出现在探测**之后**。
+        let restore = format!("set_disabled(credential_id, {})", "false");
+        let ri = body.find(&restore).unwrap_or_else(|| {
+            panic!(
+                "探测后必须存在恢复启用调用（set_disabled(credential_id, false)）——\
+                 否则临时禁用的号永远留在禁用态"
+            )
+        });
+        assert!(pi < ri, "恢复必须在探测完成之后");
+    }
 }
     /// 🔴 档位切换必须真的落到消费侧（2026-08-11 新增）。
     ///
@@ -7204,6 +7727,12 @@ mod multi_open_copies_tests {
 
 #[cfg(test)]
 mod absorb_hot_reload_tests {
+    // ⚠️ 2026-08-15：error_messages 校验矩阵测试也挂在本模块（A1 实现）；
+    // 子模块不自动继承父级项，必须显式引入（validate_error_messages /
+    // ERROR_TABLE_MAX_ENTRIES / HashMap）。
+    use super::*;
+    use std::collections::HashMap;
+
     /// ⭐ 源码守卫：`absorb_changed` 必须出现在 `hot_or_display_changed` 的 OR 链里。
     ///
     /// 回退即 FAIL：删掉 `update_config` 里那行 `|| absorb_changed`，本测试失败。
@@ -7349,6 +7878,92 @@ mod absorb_hot_reload_tests {
         );
     }
 
+    /// 🔴 回归（2026-08-15 补接线）：`ota_auto_check` 必须**全套接线**。
+    ///
+    /// 此前该字段只存在于 `Config` 与 main.rs 启动门控：前端 settings-page.tsx 提交
+    /// `otaAutoCheck`，但 ConfigSnapshotResponse / UpdateConfigRequest 都没有它 →
+    /// serde 静默丢弃 → 用户开了「自动检查」保存成功却不生效，且快照不下发 →
+    /// 刷新后开关恒回弹为关。与已修的 prompt_cache_enabled 事故完全同型。
+    ///
+    /// 语义是 **restart-only**：main.rs 启动期按 config 门控 spawn 后台检查任务
+    /// （无 TIER2 respawn 机制），改后必须重启进程才生效 → 必须进 restart_fields
+    /// （前端据此 toast「需重启」），且绝不能进 hot_or_display_changed（restart-only
+    /// 纪律，见 build_config_snapshot 的 proxy split-brain 注释）。
+    ///
+    /// 回退即 FAIL：删掉任一处接线 → 对应断言失败。
+    #[test]
+    fn ota_auto_check_is_fully_wired() {
+        let src = include_str!("service.rs");
+        let types = include_str!("types.rs");
+        let field = format!("ota_auto{}", "_check");
+
+        let snapshot = format!("{field}: config.{field},");
+        assert!(
+            src.contains(&snapshot),
+            "配置快照必须逐字段从 config 读 `{snapshot}`，否则面板读不到真实值"
+        );
+        let update = format!("req.{field}");
+        assert!(
+            src.contains(&update),
+            "必须有 `if let Some(v) = {update}` 的更新分支，否则面板改不动它"
+        );
+        assert!(
+            types.matches(&field).count() >= 2,
+            "types.rs 里响应结构与请求结构都必须有该字段（当前 {} 处）",
+            types.matches(&field).count()
+        );
+        // restart-only 语义守卫：必须进 restart_fields（前端提示重启），
+        // 且不得进 hot_or_display_changed 的 reload 触发链。
+        let restart = format!("restart_fields.push(\"{}\"", "otaAutoCheck");
+        assert!(
+            src.contains(&restart),
+            "OTA 自动检查是启动期 spawn 的后台任务，必须进 restart_fields 提示重启"
+        );
+        let hot_chain = format!("{field}_changed");
+        assert!(
+            !src.contains(&hot_chain),
+            "restart-only 字段不得进 hot_or_display_changed 的 reload 触发链（proxy split-brain 纪律）"
+        );
+    }
+
+    /// 🔴 回归（2026-08-16 新增）：`scheduling_mode` 必须**全套接线**。
+    ///
+    /// 三按钮方案（docs/scheduling-config-simplify.md §3.2）的前端入口。该字段此前
+    /// 不存在，若只加 `Config` 字段而漏掉任一处接线，面板要么读不到（快照缺失）、
+    /// 要么改不动（请求结构缺失/无更新分支）—— 与 `ota_auto_check` 事故同型。
+    ///
+    /// 语义是 TIER1 热更：切换调度模式即写矩阵 + 落盘（save），无需重启。
+    ///
+    /// 回退即 FAIL：删掉任一处接线 → 对应断言失败。
+    #[test]
+    fn scheduling_mode_is_fully_wired() {
+        let src = include_str!("service.rs");
+        let types = include_str!("types.rs");
+        let field = format!("scheduling{}", "_mode");
+
+        let snapshot = format!("{field}: config.{field},");
+        assert!(
+            src.contains(&snapshot),
+            "配置快照必须逐字段从 config 读 `{snapshot}`，否则面板读不到真实值"
+        );
+        let update = format!("req.{field}");
+        assert!(
+            src.contains(&update),
+            "必须有 `if let Some(m) = {update}` 的更新分支，否则面板改不动它"
+        );
+        assert!(
+            types.matches(&field).count() >= 2,
+            "types.rs 里响应结构与请求结构都必须有该字段（当前 {} 处）",
+            types.matches(&field).count()
+        );
+        // TIER1 语义守卫：它是热更字段，绝不能进 restart_fields。
+        let restart = format!("restart_fields.push(\"{}\"", "schedulingMode");
+        assert!(
+            !src.contains(&restart),
+            "该字段是 TIER1 热更（切换即写矩阵 + save 落盘），不得要求重启"
+        );
+    }
+
     /// 🔴 回归（2026-08-14 新增）：`auto_disable_quota_exceeded` 必须**全套接线**。
     ///
     /// 该开关是 AdminService **内存态**（不进 config.json），漂移面有三处：
@@ -7430,6 +8045,459 @@ mod absorb_hot_reload_tests {
             src.matches(&format!("|| {field}_changed.is_some()")).count() >= 2,
             "本 flag 必须同时进 hot_or_display_changed 与 immediate_changed 两条 OR 链"
         );
+    }
+
+    /// 🔴 回归：透传模拟缓存必须**全套接线**（快照 / 更新分支 / TIER3 setter 应用 /
+    /// 两条 OR 链），否则面板改了不生效且回「无改动」。
+    ///
+    /// 回退即 FAIL：删掉任一处接线 → 对应断言失败。
+    #[test]
+    fn mock_cache_config_is_fully_wired() {
+        let src = include_str!("service.rs");
+        // types.rs 的测试段（#[cfg(test)] 之后）含同名字段的访问/构造，会垫底 count ——
+        // 先截断测试段再数，count 只反映生产结构（响应 + 请求各一处）。
+        let types = include_str!("types.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or("");
+        // needle 运行时拼接：include_str! 会把本测试自己的字面量也读进来。
+        let field = format!("mock_cache{}", "_changed");
+
+        // 快照：面板读到的配置快照必须逐字段来自 config（needle 拼接防自证）。
+        let snapshot_enabled = format!("mock_cache_enabled: config.mock_cache_{}", "enabled,");
+        let snapshot_ratio = format!("mock_cache_read_ratio: config.mock_cache_{}", "read_ratio,");
+        assert!(
+            src.contains(&snapshot_enabled) && src.contains(&snapshot_ratio),
+            "配置快照必须逐字段从 config 读 mock 两字段，否则面板读不到真实值"
+        );
+        let update_enabled = format!("req.mock_cache_{}", "enabled");
+        let update_ratio = format!("req.mock_cache_{}", "read_ratio");
+        assert!(
+            src.contains(&update_enabled) && src.contains(&update_ratio),
+            "必须有更新分支读取 req 两字段，否则面板改不动它"
+        );
+        // setter 调用存在（needle 拼接，防测试段字面量自证；折叠空白防 rustfmt 拆行）。
+        let compact: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+        let setter = format!(
+            "set_mock_cache{}",
+            "_config(config.mock_cache_enabled,config.mock_cache_read_ratio,)"
+        );
+        assert!(
+            compact.contains(&setter),
+            "改后必须调 handlers 的 set_mock_cache_config 写进程镜像，否则热路径读旧值"
+        );
+        // 响应结构与请求结构各一处（快照 + 请求）；测试段已截断，count 只数生产字段。
+        assert!(
+            types.matches("mock_cache_enabled").count() >= 2
+                && types.matches("mock_cache_read_ratio").count() >= 2,
+            "types.rs 里响应结构与请求结构都必须有该字段"
+        );
+        // 两条 OR 链（hot_or_display_changed 与 immediate_changed）各必须含本 flag。
+        // 与 native_thinking 的 `_changed.is_some()` 不同，本 flag 是 bool：needle 为 `|| {field}`。
+        assert!(
+            src.matches(&format!("|| {field}")).count() >= 2,
+            "本 flag 必须同时进 hot_or_display_changed 与 immediate_changed 两条 OR 链"
+        );
+    }
+
+    /// 🔴 回归：错误码/提示词覆盖表必须**全套接线**（快照 / 更新分支 / 先校验再写盘 /
+    /// OR 链 / import_config 同校验），否则面板改了不生效且回「无改动」。
+    ///
+    /// 回退即 FAIL：删掉任一处接线 → 对应断言失败。needle 全部运行时拼接
+    /// （include_str! 会读到本测试自身，防自证绿，守卫纪律见 CURRENT.md）。
+    #[test]
+    fn error_messages_config_is_fully_wired() {
+        let src = include_str!("service.rs");
+        let types = include_str!("types.rs");
+
+        let snapshot = format!("error_messages: config.error_messages{}", ".clone(),");
+        assert!(
+            src.contains(&snapshot),
+            "配置快照必须逐字段从 config 读 error_messages，否则面板读不到真实值"
+        );
+        let update = format!("req.error{}", "_messages");
+        assert!(
+            src.contains(&update),
+            "必须有更新分支读取 req.error_messages，否则面板改不动它"
+        );
+        // 函数定义 + 更新分支 + import_config 三处（needle 拼接，防测试段自证）。
+        let define = format!("fn validate_error{}", "_messages(");
+        assert!(
+            src.contains(&define),
+            "validate_error_messages 函数必须存在"
+        );
+        let update_call = format!("validate_error_messages(&merged{}", ")");
+        assert!(
+            src.contains(&update_call),
+            "更新分支必须先调 validate_error_messages（merged）再写盘"
+        );
+        let import_call = format!("validate_error_messages(&imported.error{}", "_messages)");
+        assert!(
+            src.contains(&import_call),
+            "import_config 必须校验导入的 error_messages（失败整份拒绝零写盘）"
+        );
+        // 整表拒绝语义：校验失败必须 Err 短路（保持旧表）。
+        // ⚠️ 2026-08-15 per-key merge 改造后变量名 em → merged（merge 在赋值前完成），
+        // needle 同步更新；语义不变（校验失败 Err 短路 = 旧表不被替换）。
+        let err_short = format!(
+            "validate_error_messages(&merged).map_err(AdminServiceError::{}",
+            "InvalidCredential)?"
+        );
+        assert!(
+            src.contains(&err_short),
+            "校验失败必须整表拒绝（Err 短路，保持旧表）"
+        );
+        // 两条 OR 链（hot_or_display_changed 与 immediate_changed）各必须含本 flag
+        // （bool flag：needle `|| {field}`，count>=2 防只进一条链）。
+        let or_needle = format!("|| error_messages{}", "_changed");
+        assert!(
+            src.matches(&or_needle).count() >= 2,
+            "error_messages_changed 必须同时进 hot_or_display_changed 与 immediate_changed \
+             两条 OR 链：漏 hot 链 → 存盘但热路径读旧表（无 TIER3 setter，这是唯一生效通道）；\
+             漏 immediate 链 → 面板只改本项时回「未检测到变更」，与实际不符"
+        );
+        // 响应结构与请求结构各一处（快照 + 请求）。
+        assert!(
+            types.matches("error_messages").count() >= 2,
+            "types.rs 里响应结构与请求结构都必须有该字段（当前 {} 处）",
+            types.matches("error_messages").count()
+        );
+    }
+
+    // ---- validate_error_messages 校验矩阵（纯函数，不碰网络/磁盘）----
+
+    fn error_entry(
+        status: Option<u16>,
+        ty: Option<&str>,
+        message: Option<&str>,
+        ra: Option<u64>,
+    ) -> crate::model::error_messages::ErrorMessageOverride {
+        crate::model::error_messages::ErrorMessageOverride {
+            status,
+            r#type: ty.map(str::to_string),
+            message: message.map(str::to_string),
+            retry_after_secs: ra,
+        }
+    }
+
+    fn one_error_entry(
+        entry: crate::model::error_messages::ErrorMessageOverride,
+    ) -> HashMap<String, crate::model::error_messages::ErrorMessageOverride> {
+        let mut m = HashMap::new();
+        m.insert("test_key".to_string(), entry);
+        m
+    }
+
+    #[test]
+    fn validate_accepts_full_valid_entry() {
+        let table = one_error_entry(error_entry(
+            Some(429),
+            Some("rate_limit_error"),
+            Some("请按 Retry-After 退避后重试。"),
+            Some(8),
+        ));
+        assert!(validate_error_messages(&table).is_ok(), "合法条目必须通过");
+    }
+
+    #[test]
+    fn validate_rejects_status_out_of_whitelist() {
+        for bad in [200u16, 418, 451, 529, 600] {
+            let table = one_error_entry(error_entry(Some(bad), Some("api_error"), None, None));
+            let err = validate_error_messages(&table).expect_err("白名单外的 status 必须整表拒绝");
+            assert!(
+                err.contains(".status"),
+                "错误必须点名 status 字段，实际: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_type_out_of_whitelist() {
+        for bad in [
+            "service_unavailable",
+            "internal_error",
+            "upstream_error",
+            "bogus_type",
+        ] {
+            let table = one_error_entry(error_entry(Some(502), Some(bad), None, None));
+            let err = validate_error_messages(&table).expect_err("白名单外的 type 必须整表拒绝");
+            assert!(err.contains(".type"), "错误必须点名 type 字段，实际: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_status_type_combination_violation() {
+        // 429 → 只允许 rate_limit_error / overloaded_error（billing_error 已移除，
+        // 其拒绝在 type 白名单层，见 validate_rejects_billing_error_and_quota_exceeded_error）。
+        for bad in [
+            ("429", "invalid_request_error"),
+            ("429", "api_error"),
+            ("429", "not_found_error"),
+            ("401", "rate_limit_error"),
+            ("403", "authentication_error"),
+            ("404", "permission_error"),
+            ("400", "overloaded_error"),
+            ("413", "rate_limit_error"),
+            ("500", "overloaded_error"),
+            ("502", "rate_limit_error"),
+            ("503", "not_found_error"),
+        ] {
+            let table = one_error_entry(error_entry(
+                Some(bad.0.parse().unwrap()),
+                Some(bad.1),
+                None,
+                None,
+            ));
+            let err = validate_error_messages(&table).expect_err("组合违例必须整表拒绝");
+            assert!(
+                err.contains("组合不合法"),
+                "错误必须说明组合约束，实际: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_decision_words() {
+        // 决策词黑名单：任一命中 → 拒（设计 §二 5）。
+        for bad in [
+            "credit balance is too low",
+            "organization has been disabled",
+            "message says overloaded_error here",
+            "Monthly quota exhausted",
+            "this account has billing issues",
+        ] {
+            let table = one_error_entry(error_entry(
+                Some(429),
+                Some("rate_limit_error"),
+                Some(bad),
+                None,
+            ));
+            assert!(
+                validate_error_messages(&table).is_err(),
+                "决策词必须拒绝: {bad}"
+            );
+        }
+        // quota+exhausted 无豁免（B2）：billing_error 已从白名单移除，旧豁免条件
+        // 永远不可达——配什么 type 都拒（Claude Code CLI 层 D 判定/opencode 模式
+        // 匹配都拿 quota+exhausted 当重试决策输入）。
+        let rejected = one_error_entry(error_entry(
+            Some(429),
+            Some("billing_error"),
+            Some("Monthly quota exhausted"),
+            None,
+        ));
+        assert!(
+            validate_error_messages(&rejected).is_err(),
+            "quota+exhausted 必须无条件拒绝（billing_error 已不可配置，无豁免）"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_retry_after_out_of_range() {
+        let table = one_error_entry(error_entry(
+            Some(429),
+            Some("rate_limit_error"),
+            None,
+            Some(3601),
+        ));
+        let err = validate_error_messages(&table).expect_err("retryAfterSecs 超 3600 必须拒绝");
+        assert!(
+            err.contains("retryAfterSecs"),
+            "错误必须点名 retryAfterSecs，实际: {err}"
+        );
+        let ok = one_error_entry(error_entry(
+            Some(429),
+            Some("rate_limit_error"),
+            None,
+            Some(3600),
+        ));
+        assert!(validate_error_messages(&ok).is_ok(), "3600 是边界合法值");
+    }
+
+    #[test]
+    fn validate_accepts_load_bearing_message_with_warning() {
+        // 承重字符串：提示不硬拒（shield COOLING_MARKERS 三哨兵 / prompt is too long / 背压哨兵）。
+        // ⚠️ 2026-08-15 勘误：「等容量」不是 shield 判据（仅注释出现），已从词表移除——
+        // 含它的普通文案照常放行（见 error_messages.rs 词表测试）。
+        for keep in [
+            "All credentials are temporarily cooling down. Please retry.",
+            "Gateway inbound rate shaping is at capacity; retrying immediately will not help.",
+            "prompt is too long: 上下文窗口已满",
+            "This is gateway-side backpressure; retrying immediately will not help.",
+        ] {
+            let table = one_error_entry(error_entry(
+                Some(400),
+                Some("invalid_request_error"),
+                Some(keep),
+                None,
+            ));
+            assert!(
+                validate_error_messages(&table).is_ok(),
+                "承重字符串必须提示不硬拒: {keep}"
+            );
+        }
+        // 非承重文案（含「等容量」）同样放行——它不承载任何 shield 判据。
+        let plain = one_error_entry(error_entry(
+            Some(400),
+            Some("invalid_request_error"),
+            Some("上游仍不可用（等容量）。请退避重试。"),
+            None,
+        ));
+        assert!(
+            validate_error_messages(&plain).is_ok(),
+            "「等容量」不是承重词，含它的文案必须正常放行"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_bad_key_name_and_oversize() {
+        // key 命名规范。
+        for bad_key in ["QuotaExhausted", "quota exhausted", "1quota", "quota!", ""] {
+            let mut table = HashMap::new();
+            table.insert(
+                bad_key.to_string(),
+                error_entry(Some(429), Some("rate_limit_error"), None, None),
+            );
+            assert!(
+                validate_error_messages(&table).is_err(),
+                "非法 key 名必须拒绝: {bad_key:?}"
+            );
+        }
+        // message 超长。
+        let long_msg = "x".repeat(501);
+        let table = one_error_entry(error_entry(
+            Some(429),
+            Some("rate_limit_error"),
+            Some(&long_msg),
+            None,
+        ));
+        assert!(
+            validate_error_messages(&table).is_err(),
+            "message 超过 500 字符必须拒绝"
+        );
+        // 表条目数上限（200）。
+        let mut big = HashMap::new();
+        for i in 0..=ERROR_TABLE_MAX_ENTRIES {
+            big.insert(format!("key_{i}"), error_entry(None, None, None, None));
+        }
+        assert!(
+            validate_error_messages(&big).is_err(),
+            "超过 {} 条必须拒绝",
+            ERROR_TABLE_MAX_ENTRIES
+        );
+    }
+
+    /// B1：组合校验必须用「配置 or 默认表」的**最终渲染值**——只配 status 或只配
+    /// type 时另一半落默认，仍必须过组合矩阵（防单字段绕过）。
+    ///
+    /// key 不硬编码：默认表可能被并行任务重写（key 集变化），动态从
+    /// `default_error_messages()` 取「默认 429+rate_limit_error」的 key——
+    /// 改表场景测试自适应（表里没有该基线 key 时显式 panic 提示）。
+    #[test]
+    fn validate_rendered_combination_rejects_single_field_bypass() {
+        let table = crate::model::error_messages::default_error_messages();
+        let base = table
+            .iter()
+            .find(|(_, s, t, ..)| *s == 429 && *t == "rate_limit_error")
+            .map(|(k, ..)| k.to_string())
+            .expect("默认表必须保留至少一个 429+rate_limit_error 的 key（B1 渲染值组合校验基线）");
+
+        // status-only 绕过：只配 status=401 → 渲染 401 + 默认 rate_limit_error → 拒。
+        let mut status_only = HashMap::new();
+        status_only.insert(base.clone(), error_entry(Some(401), None, None, None));
+        let err = validate_error_messages(&status_only)
+            .expect_err("只配 status 必须按渲染值过组合矩阵");
+        assert!(err.contains("组合不合法"), "实际: {err}");
+
+        // type-only 绕过：只配 type=authentication_error → 渲染 429 + 该 type → 拒。
+        let mut type_only = HashMap::new();
+        type_only.insert(base, error_entry(None, Some("authentication_error"), None, None));
+        let err = validate_error_messages(&type_only)
+            .expect_err("只配 type 必须按渲染值过组合矩阵");
+        assert!(err.contains("组合不合法"), "实际: {err}");
+
+        // 双显式合法 → 通过；双显式非法 → 拒。
+        let ok = one_error_entry(error_entry(Some(429), Some("rate_limit_error"), None, None));
+        assert!(validate_error_messages(&ok).is_ok(), "双显式合法组合必须通过");
+        let bad = one_error_entry(error_entry(Some(429), Some("api_error"), None, None));
+        assert!(validate_error_messages(&bad).is_err(), "双显式非法组合必须拒绝");
+    }
+
+    /// B1 改默认表场景：默认表所有「默认 status/type 都在官方白名单」的 key，其默认
+    /// 渲染值必须自身组合合法——否则管理员对该 key 的任何配置（含只改 message 的
+    /// 合法姿势）都会被渲染值组合检查误伤。并行任务重写默认表时本测试自动跟随。
+    #[test]
+    fn validate_default_table_combos_are_self_consistent() {
+        let table = crate::model::error_messages::default_error_messages();
+        let mut official = 0;
+        for &(key, s, t, ..) in table {
+            if ERROR_STATUS_WHITELIST.contains(&s) && ERROR_TYPE_WHITELIST.contains(&t) {
+                official += 1;
+                assert!(
+                    error_type_compatible_with_status(s, t),
+                    "默认表 {key}: 默认渲染 {s}+{t} 必须组合合法，\
+                     否则管理员对该 key 的任何配置都会被渲染值检查拒绝"
+                );
+            }
+        }
+        assert!(official > 0, "默认表必须存在官方值域内的 key（否则渲染值检查无靶点）");
+    }
+
+    /// m2：504 必须在 status 白名单（`upstream_timeout` 默认 504——管理员显式写回
+    /// 默认值时不被拒），组合上归 5xx→api_error 族（H5）。
+    #[test]
+    fn validate_accepts_504_upstream_timeout_default() {
+        let ok = one_error_entry(error_entry(Some(504), Some("api_error"), None, None));
+        assert!(validate_error_messages(&ok).is_ok(), "504+api_error 必须合法");
+        let bad = one_error_entry(error_entry(Some(504), Some("rate_limit_error"), None, None));
+        assert!(
+            validate_error_messages(&bad).is_err(),
+            "504 组合必须归 api_error 族"
+        );
+    }
+
+    /// B2：billing_error / quota_exceeded_error 已从 type 白名单移除——任何 status
+    /// 配置都拒绝（Claude Code CLI 层对 429/402+billing_error 重试约 7 次/1 分钟 =
+    /// 重试风暴；quota_exceeded_error 需 402 支持，见白名单注释）；quota+exhausted
+    /// 决策词无豁免（豁免条件随 billing_error 移除永远不可达）。
+    #[test]
+    fn validate_rejects_billing_error_and_quota_exceeded_error() {
+        for status in [400u16, 401, 403, 404, 413, 429, 500, 502, 503, 504] {
+            let table = one_error_entry(error_entry(Some(status), Some("billing_error"), None, None));
+            let err = validate_error_messages(&table)
+                .expect_err("billing_error 配置必须整表拒绝（重试风暴）");
+            assert!(err.contains(".type"), "必须点名 type 字段，实际: {err}");
+        }
+        // 只配 type=billing_error（status 落默认）同样拒。
+        let type_only = one_error_entry(error_entry(None, Some("billing_error"), None, None));
+        assert!(
+            validate_error_messages(&type_only).is_err(),
+            "type-only billing_error 必须拒绝"
+        );
+        // quota_exceeded_error 同移除（非官方 type，402 未进 status 白名单）。
+        let quota_ty = one_error_entry(error_entry(
+            Some(429),
+            Some("quota_exceeded_error"),
+            None,
+            None,
+        ));
+        assert!(
+            validate_error_messages(&quota_ty).is_err(),
+            "quota_exceeded_error 必须拒绝（待 402 改造后放行）"
+        );
+        // quota+exhausted 决策词：配任何 type（含无 type）都无条件拒。
+        for ty in [Some("rate_limit_error"), Some("overloaded_error"), None] {
+            let table = one_error_entry(error_entry(
+                Some(429),
+                ty,
+                Some("Monthly quota exhausted"),
+                None,
+            ));
+            assert!(
+                validate_error_messages(&table).is_err(),
+                "quota+exhausted 必须无条件拒绝 (ty={ty:?})"
+            );
+        }
     }
 }
 
@@ -10168,6 +11236,10 @@ mod cleanup_disabled_tests {
         disabled: bool,
         reason: Option<DisabledReason>,
     ) -> KiroCredentials {
+        // QuotaExceeded 死号带**当月**判定时刻：启动跨月恢复只放过期月份（缺失时间戳
+        // 也视为可恢复），不带时刻会让这些号在构造时被自动复活，测试前提被打破。
+        let quota_exhausted_ts = (reason == Some(DisabledReason::QuotaExceeded))
+            .then(|| Utc::now().to_rfc3339());
         KiroCredentials {
             id: Some(id),
             auth_method: Some(auth_method.to_string()),
@@ -10180,6 +11252,7 @@ mod cleanup_disabled_tests {
             },
             disabled,
             disabled_reason: reason,
+            quota_exhausted_at: quota_exhausted_ts,
             ..Default::default()
         }
     }
@@ -11349,5 +12422,452 @@ mod config_write_tests {
         let m1 = serde_json::json!({ "arr": [1, 2] });
         let m2 = serde_json::json!({ "arr": [3] });
         assert_eq!(diff_json_fields(&m1, &m2), vec!["arr".to_string()]);
+    }
+
+    // ============ update_config_locked 行为测试（2026-08-15 补）============
+    //
+    // 此前只有源码守卫（旧注释自称「单测无法真跑 update_config（需要真实 TokenManager +
+    // 磁盘 config），故用源码断言」——前提其实不成立）：tmp 目录 + 写盘 config.json +
+    // `Config::load` 带回 config_path 即可构造真实可跑的更新链路
+    // （load → 逐字段改 → save → reload_config）。这批测试钉的是守卫钉不住的行为：
+    // 字段 merge 不丢、restart_fields 累积、非法值整单拒绝且零写盘、
+    // TIER1/TIER3 立即生效文案、error_messages per-key merge。
+
+    /// 构造带磁盘 config.json 的 AdminService。
+    ///
+    /// seed 按测试意图写初始配置，整份写盘后经 `Config::load` 读回
+    /// （与 update_config_locked 内部同一条加载路径），config_path 因此有值。
+    fn svc_with_disk_config(
+        dir: &TempDir,
+        seed: impl FnOnce(&mut crate::model::config::Config),
+    ) -> (Arc<AdminService>, std::path::PathBuf) {
+        let path = dir.0.join("config.json");
+        // 目录必须显式创建（TempDir 只登记路径不建目录）：缺了这行
+        // fs::write 直接 NotFound panic，5 个 update_config 测试全红。
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let mut cfg = crate::model::config::Config::default();
+        seed(&mut cfg);
+        std::fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
+        let loaded = crate::model::config::Config::load(&path).expect("初始配置必须可加载");
+        let tm = Arc::new(
+            MultiTokenManager::new(loaded, vec![], None, None, false).expect("构造 token manager"),
+        );
+        (Arc::new(AdminService::new(tm, Vec::<String>::new())), path)
+    }
+
+    fn disk_config_json(path: &std::path::Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap())
+            .expect("磁盘配置必须是合法 JSON")
+    }
+
+    /// 🔴 承重：改一个字段 → **只**改那一个，其余字段保持磁盘原值（merge 不丢）；
+    /// 需重启字段按代码顺序累积进 restart_fields。
+    ///
+    /// 回退即 FAIL：把任一字段的写盘漏掉（「存了盘但读旧值」那类接线缺陷），
+    /// 或 restart_fields 不按提交顺序 push（面板展示顺序错乱）。
+    #[test]
+    fn update_config_restart_fields_accumulate_and_unsubmitted_fields_preserved() {
+        let dir = TempDir(std::env::temp_dir().join(format!(
+            "ks_upd_restart_{}",
+            uuid::Uuid::new_v4()
+        )));
+        let (svc, path) = svc_with_disk_config(&dir, |c| {
+            c.host = "old.example.com".to_string();
+            c.port = 8080;
+            c.region = "us-east-1".to_string();
+        });
+
+        let resp = svc
+            .update_config(UpdateConfigRequest {
+                host: Some("new.example.com".to_string()),
+                port: Some(9090),
+                ..Default::default()
+            })
+            .expect("改 host+port 应成功");
+
+        assert!(resp.restart_required, "host/port 都是重启字段");
+        assert_eq!(
+            resp.restart_fields,
+            vec!["host".to_string(), "port".to_string()],
+            "restart_fields 必须按代码顺序累积"
+        );
+        assert!(
+            resp.message.contains("2 个字段"),
+            "文案必须报 2 个字段需重启，实际: {}",
+            resp.message
+        );
+
+        let disk = disk_config_json(&path);
+        assert_eq!(disk["host"], "new.example.com", "提交的字段必须落盘");
+        assert_eq!(disk["port"], 9090, "提交的字段必须落盘");
+        assert_eq!(
+            disk["region"], "us-east-1",
+            "未提交的字段必须保持磁盘原值（merge 不丢）"
+        );
+    }
+
+    /// 🔴 承重：非法值整单拒绝（Err），且**拒绝发生在写盘之前**——磁盘零改动。
+    ///
+    /// 覆盖四类校验：空串清洗后拒绝（host）、端口 0 拒绝（port）、
+    /// 值域白名单拒绝（absorb_exhausted_status 只认 429/503）、枚举拒绝
+    /// （load_balancing_mode 只认 priority/balanced）。
+    ///
+    /// 回退即 FAIL：把任一校验挪到 save 之后（拒绝但已落盘），或删掉任一校验，
+    /// 对应断言失败。
+    #[test]
+    fn update_config_rejects_invalid_values_without_touching_disk() {
+        let dir = TempDir(std::env::temp_dir().join(format!(
+            "ks_upd_reject_{}",
+            uuid::Uuid::new_v4()
+        )));
+        let (svc, path) = svc_with_disk_config(&dir, |c| {
+            c.host = "h1".to_string();
+            c.port = 8080;
+        });
+        let baseline = std::fs::read(&path).unwrap();
+
+        let cases = [
+            UpdateConfigRequest {
+                host: Some("   ".to_string()),
+                ..Default::default()
+            },
+            UpdateConfigRequest {
+                port: Some(0),
+                ..Default::default()
+            },
+            UpdateConfigRequest {
+                upstream_retry_absorb_exhausted_status: Some(999),
+                ..Default::default()
+            },
+            UpdateConfigRequest {
+                load_balancing_mode: Some("bogus".to_string()),
+                ..Default::default()
+            },
+        ];
+        for req in cases {
+            let err = svc
+                .update_config(req)
+                .expect_err("非法值必须整单拒绝");
+            assert!(
+                matches!(err, AdminServiceError::InvalidCredential(_)),
+                "非法值拒绝必须用 InvalidCredential，实际: {err:?}"
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                baseline,
+                "拒绝时必须零写盘（校验要先于 save）"
+            );
+        }
+    }
+
+    /// TIER1/TIER3 字段：保存后立即生效，不进 restart_fields、回「无需重启」。
+    ///
+    /// 用透传模拟缓存（TIER3 + setter 镜像）与吸收层开关（无 setter、只靠 reload_config
+    /// 的 OR 链）各代表一类：两类都必须回「立即生效」——回「需重启」就是把热更字段
+    /// 误分类的接线缺陷。
+    #[test]
+    fn update_config_hot_fields_report_immediate_effect_without_restart() {
+        let dir = TempDir(std::env::temp_dir().join(format!(
+            "ks_upd_hot_{}",
+            uuid::Uuid::new_v4()
+        )));
+        let (svc, path) = svc_with_disk_config(&dir, |c| {
+            c.mock_cache_enabled = false;
+            c.upstream_retry_absorb_enabled = false;
+        });
+
+        let resp = svc
+            .update_config(UpdateConfigRequest {
+                mock_cache_enabled: Some(true),
+                upstream_retry_absorb_enabled: Some(true),
+                ..Default::default()
+            })
+            .expect("热更字段应成功");
+        assert!(!resp.restart_required, "热更字段不得要求重启");
+        assert!(resp.restart_fields.is_empty());
+        assert!(
+            resp.message.contains("立即生效"),
+            "热更字段必须回「立即生效」，实际: {}",
+            resp.message
+        );
+
+        let disk = disk_config_json(&path);
+        assert_eq!(disk["mockCacheEnabled"], true, "TIER3 字段必须落盘");
+        assert_eq!(disk["upstreamRetryAbsorbEnabled"], true, "吸收层开关必须落盘");
+    }
+
+    /// 提交与磁盘相同的值 → 「无改动。」（不误报立即生效/需重启）。
+    #[test]
+    fn update_config_no_change_reports_no_change() {
+        let dir = TempDir(std::env::temp_dir().join(format!(
+            "ks_upd_none_{}",
+            uuid::Uuid::new_v4()
+        )));
+        let (svc, path) = svc_with_disk_config(&dir, |c| {
+            c.host = "h1".to_string();
+        });
+
+        let resp = svc
+            .update_config(UpdateConfigRequest {
+                host: Some("h1".to_string()),
+                ..Default::default()
+            })
+            .expect("同值提交应成功");
+        assert_eq!(resp.message, "无改动。", "同值提交必须回「无改动。」");
+        assert!(!resp.restart_required);
+        assert_eq!(disk_config_json(&path)["host"], "h1", "同值提交磁盘不变");
+    }
+
+    /// 🔴 承重：error_messages 是 **per-key merge**——提交只更新提交的 key，
+    /// 未提交的 key 保持磁盘原值；整表被校验拒绝时旧表保持（先校验再写盘）。
+    ///
+    /// 回退即 FAIL：把 merge 改成整表替换（`config.error_messages = em`），
+    /// 未提交的 k2 会消失，断言失败。
+    #[test]
+    fn update_config_error_messages_merge_keeps_unsubmitted_keys() {
+        use crate::model::error_messages::ErrorMessageOverride;
+        let dir = TempDir(std::env::temp_dir().join(format!(
+            "ks_upd_errmsg_{}",
+            uuid::Uuid::new_v4()
+        )));
+        let (svc, path) = svc_with_disk_config(&dir, |c| {
+            let mut table = HashMap::new();
+            table.insert(
+                "k1".to_string(),
+                ErrorMessageOverride {
+                    status: Some(429),
+                    r#type: Some("rate_limit_error".to_string()),
+                    message: Some("旧文案".to_string()),
+                    retry_after_secs: Some(8),
+                },
+            );
+            table.insert(
+                "k2".to_string(),
+                ErrorMessageOverride {
+                    status: Some(500),
+                    r#type: Some("api_error".to_string()),
+                    message: Some("k2 保持".to_string()),
+                    retry_after_secs: None,
+                },
+            );
+            c.error_messages = table;
+        });
+
+        let mut submitted = HashMap::new();
+        submitted.insert(
+            "k1".to_string(),
+            ErrorMessageOverride {
+                status: Some(429),
+                r#type: Some("rate_limit_error".to_string()),
+                message: Some("新文案".to_string()),
+                retry_after_secs: Some(8),
+            },
+        );
+        svc.update_config(UpdateConfigRequest {
+            error_messages: Some(submitted),
+            ..Default::default()
+        })
+        .expect("合法 per-key 更新应成功");
+
+        let disk = disk_config_json(&path);
+        assert_eq!(
+            disk["errorMessages"]["k1"]["message"], "新文案",
+            "提交的 key 必须更新"
+        );
+        assert_eq!(
+            disk["errorMessages"]["k2"]["message"], "k2 保持",
+            "未提交的 key 必须保持（per-key merge，不是整表替换）"
+        );
+
+        // 整表被校验拒绝时旧表保持：提交一个非法 key → Err 且 k1 不被写坏。
+        let mut bad = HashMap::new();
+        bad.insert(
+            "k1".to_string(),
+            ErrorMessageOverride {
+                status: Some(418),
+                r#type: Some("api_error".to_string()),
+                message: None,
+                retry_after_secs: None,
+            },
+        );
+        svc.update_config(UpdateConfigRequest {
+            error_messages: Some(bad),
+            ..Default::default()
+        })
+        .expect_err("非法错误码表必须整表拒绝");
+        assert_eq!(
+            disk_config_json(&path)["errorMessages"]["k1"]["message"], "新文案",
+            "拒绝时必须保持旧表（先校验再写盘）"
+        );
+    }
+}
+
+#[cfg(test)]
+mod update_refresh_token_tests {
+    //! `update_refresh_token` 校验矩阵：截断拒 / 跨凭据重复拒 / 正常过（含自身原值重提交）。
+    use super::*;
+
+    fn mk_oauth_cred(id: u64, rt: &str) -> KiroCredentials {
+        let mut c = KiroCredentials::default();
+        c.id = Some(id);
+        c.auth_method = Some("oauth".to_string());
+        c.refresh_token = Some(rt.to_string());
+        c
+    }
+
+    fn mk_service(rt1: &str, rt2: &str) -> AdminService {
+        let tm = Arc::new(
+            MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                vec![mk_oauth_cred(1, rt1), mk_oauth_cred(2, rt2)],
+                None,
+                None,
+                false,
+            )
+            .expect("构造 token manager"),
+        );
+        AdminService::new(tm, Vec::<String>::new())
+    }
+
+    fn token_hash(svc: &AdminService, id: u64) -> Option<String> {
+        svc.token_manager
+            .snapshot()
+            .entries
+            .iter()
+            .find(|e| e.id == id)
+            .and_then(|e| e.refresh_token_hash.clone())
+    }
+
+    /// 截断 token（长度 <100 / 含 "..."）必须被拒：静默接受会让下一次刷新必然失败。
+    #[test]
+    fn truncated_token_is_rejected_with_400() {
+        let svc = mk_service(&"a".repeat(150), &"b".repeat(150));
+        for bad in ["a".repeat(99), "a".repeat(150) + "..."] {
+            let err = svc
+                .update_refresh_token(1, bad)
+                .expect_err("截断 token 必须被拒");
+            assert!(matches!(err, AdminServiceError::InvalidCredential(_)));
+            assert_eq!(
+                err.status_code(),
+                axum::http::StatusCode::BAD_REQUEST,
+                "校验失败必须返回 400"
+            );
+            assert!(err.to_string().contains("截断"), "文案应说明截断，实际 {err}");
+        }
+    }
+
+    /// 与其他凭据的 refresh_token 重复必须被拒（对齐 add_credential 的哈希去重）。
+    /// 跨凭据重复用 `DuplicateCredential`（非 `InvalidCredential`）：#13 语言耦合改造后
+    /// 该变体是前端「duplicate_credential」判别的唯一依据，不能随文案改写而失配。
+    #[test]
+    fn duplicate_token_across_credentials_is_rejected() {
+        let rt1 = "a".repeat(150);
+        let rt2 = "b".repeat(150);
+        let svc = mk_service(&rt1, &rt2);
+        let err = svc
+            .update_refresh_token(2, rt1.clone())
+            .expect_err("与凭据 1 相同的 token 必须被拒");
+        assert!(matches!(
+            err,
+            AdminServiceError::DuplicateCredential(_)
+        ));
+        assert_eq!(
+            err.status_code(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "校验失败必须返回 400"
+        );
+        assert!(err.to_string().contains("重复"), "文案应说明重复，实际 {err}");
+        // 被拒后 2 号原值不得被改动。
+        assert_eq!(
+            token_hash(&svc, 2).as_deref(),
+            Some(sha256_hex(&rt2).as_str())
+        );
+    }
+
+    /// 正常 token 通过；用自身当前值重提交（no-op）也必须通过 —— 去重必须排除自己。
+    #[test]
+    fn valid_token_passes_and_self_resubmit_is_allowed() {
+        let rt1 = "a".repeat(150);
+        let rt2 = "b".repeat(150);
+        let svc = mk_service(&rt1, &rt2);
+        let new_rt = "c".repeat(150);
+        svc.update_refresh_token(1, new_rt.clone())
+            .expect("正常 token 必须通过");
+        assert_eq!(
+            token_hash(&svc, 1).as_deref(),
+            Some(sha256_hex(&new_rt).as_str())
+        );
+        // 自身当前值重提交：不得被跨凭据重复检测误伤。
+        svc.update_refresh_token(1, new_rt.clone())
+            .expect("用自身当前值重提交必须通过（去重排除自身）");
+        assert_eq!(
+            token_hash(&svc, 1).as_deref(),
+            Some(sha256_hex(&new_rt).as_str())
+        );
+    }
+
+    fn mk_api_key_cred(id: u64) -> KiroCredentials {
+        let mut c = KiroCredentials::default();
+        c.id = Some(id);
+        c.auth_method = Some("api_key".to_string());
+        c.kiro_api_key = Some("ksk_test".to_string());
+        c
+    }
+
+    /// 🔴 对抗审查 MINOR-6（2026-08-15）：api_key 凭据没有 refreshToken 概念
+    /// （直接用 kiro_api_key 作 Bearer），更新它是误操作，必须 400 且不动原值。
+    #[test]
+    fn api_key_credential_update_refresh_token_is_rejected() {
+        let tm = Arc::new(
+            MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                vec![mk_api_key_cred(1)],
+                None,
+                None,
+                false,
+            )
+            .expect("构造 token manager"),
+        );
+        let svc = AdminService::new(tm, Vec::<String>::new());
+        let err = svc
+            .update_refresh_token(1, "a".repeat(150))
+            .expect_err("api_key 凭据更新 refreshToken 必须被拒");
+        assert!(matches!(err, AdminServiceError::InvalidCredential(_)));
+        assert_eq!(
+            err.status_code(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "凭据类型闸必须返回 400"
+        );
+        assert!(
+            err.to_string().contains("OAuth"),
+            "文案应说明仅 OAuth 凭据支持，实际 {err}"
+        );
+        // 被拒后原凭据不得被改动（refresh_token 仍为 None，无新哈希）。
+        assert_eq!(token_hash(&svc, 1), None, "api_key 号不得被写入 refresh_token_hash");
+    }
+
+    /// 🔴 对抗审查 MINOR-7（2026-08-15）：从聊天工具粘贴的 token 常带首尾换行/空白/
+    /// 引号，entry 处 trim 后通过校验，落库（refresh_token_hash）必须是 trim 后的
+    /// 规范值 —— 脏空白不得进入哈希，否则刷新链路对不上。
+    #[test]
+    fn whitespace_wrapped_token_is_trimmed_before_validate_and_store() {
+        let rt1 = "a".repeat(150);
+        let rt2 = "b".repeat(150);
+        let svc = mk_service(&rt1, &rt2);
+        let new_rt = "c".repeat(150);
+        let wrapped = format!("\n\t\"{}\" \n", new_rt);
+        let trimmed = wrapped.trim().to_string();
+        svc.update_refresh_token(1, wrapped.clone())
+            .expect("trim 后应通过校验（长度/截断检查作用于 trim 后值）");
+        assert_eq!(
+            token_hash(&svc, 1).as_deref(),
+            Some(sha256_hex(&trimmed).as_str()),
+            "落库哈希必须是 trim 后的值（首尾空白不得进入哈希）"
+        );
+        assert_ne!(
+            token_hash(&svc, 1).as_deref(),
+            Some(sha256_hex(&wrapped).as_str()),
+            "未 trim 的原始串不得作为哈希（否则下次刷新 invalid_grant）"
+        );
     }
 }

@@ -1168,7 +1168,9 @@ pub async fn export_credential(
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     match state.service.export_credential(id) {
-        Ok(cred) => Json(cred).into_response(),
+        // 明文 token 响应禁止缓存（共享代理/浏览器不留副本）——与
+        // export_kam_credentials 的 MINOR-4 同款（2026-08-14）。
+        Ok(cred) => ([("Cache-Control", "no-store")], Json(cred)).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -1521,6 +1523,10 @@ pub async fn external_idp_leg2_select(
     {
         Ok(result) => Json(serde_json::json!({
             "credentialId": result.credential_id,
+            // 回显实际建号用的 arn/region（用户选的 profile 可能被替换为同账号
+            // 可用 profile，前端需要展示最终落点，见 ExternalIdpSelectResult 文档）。
+            "arn": result.arn,
+            "region": result.region,
         }))
         .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
@@ -1608,6 +1614,32 @@ pub async fn storage_cleanup(
 }
 
 // ============ 服务端配置 ============
+
+/// GET /api/admin/error-messages/defaults
+/// 返回错误码/提示词**内置默认表**全量：key → {status, type, message, retryAfterSecs}。
+///
+/// 数据源 = `crate::model::error_messages::default_error_messages()`（**运行期读取**，
+/// key 集随默认表演进自动同步，不硬编码）。只读，供前端「默认值预览」：
+/// 弹窗把默认表与 `GET /config` 的 `errorMessages`（配置覆盖）合并渲染全量 key。
+/// 响应契约 camelCase（retryAfterSecs；无 Retry-After 的条目为 null）。
+pub async fn get_error_message_defaults() -> impl IntoResponse {
+    let table = crate::model::error_messages::default_error_messages();
+    let obj = table
+        .iter()
+        .map(|(key, status, ty, message, retry_after)| {
+            (
+                key.to_string(),
+                serde_json::json!({
+                    "status": status,
+                    "type": ty,
+                    "message": message,
+                    "retryAfterSecs": retry_after,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<String, serde_json::Value>>();
+    Json(serde_json::Value::Object(obj))
+}
 
 /// GET /api/admin/config
 /// 返回服务端配置快照（敏感字段已脱敏）
@@ -2041,6 +2073,35 @@ mod guard_tests {
         assert!(
             gate_at < parse_at,
             "开关闸门必须在解析请求体之前，否则关掉入口后仍会为对接方解析并校验一批 key"
+        );
+    }
+
+    /// ⭐ 源码守卫（MINOR-4）：`export_credential` 必须带 `Cache-Control: no-store`。
+    ///
+    /// 该端点的响应体含**明文 token**；浏览器/共享代理若缓存它，等于把凭据留在
+    /// 本不该留的地方（export_kam_credentials 已带同款头，这条锁的是本端点本身）。
+    ///
+    /// 回退即 FAIL：把响应改回裸 `Json(cred)`（去掉 no-store 头）——断言不命中。
+    #[test]
+    fn export_credential_must_be_no_store() {
+        let src = include_str!("handlers.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        let fname = format!("pub async fn export_credential{}", "(");
+        let start = prod.find(&fname).expect("export_credential 不应被改名");
+        // 切片到下一个函数的文档注释（或测试模块），避免把其它函数的
+        // no-store 也算进本函数的判定。
+        let tail = &prod[start..];
+        let end = tail
+            .find("\n/// ")
+            .or_else(|| tail.find("\n#[cfg(test)]"))
+            .unwrap_or(tail.len());
+        let body = &tail[..end];
+        let header = format!("[({}, {})]", "\"Cache-Control\"", "\"no-store\"");
+        assert!(
+            body.contains(header.as_str()),
+            "export_credential 必须带 Cache-Control: no-store（响应体含明文 token，\
+             缓存会让共享代理/浏览器留下凭据副本）"
         );
     }
 }

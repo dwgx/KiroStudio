@@ -1,5 +1,6 @@
 import * as React from 'react'
 import { Check, ChevronsUpDown } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 import { cn } from '@/lib/utils'
 
 export interface SelectOption<T extends string = string> {
@@ -31,11 +32,13 @@ export function Select<T extends string = string>({
   onChange,
   options,
   className,
-  placeholder = '请选择',
+  placeholder,
   disabled = false,
   id,
   'aria-label': ariaLabel,
 }: SelectProps<T>) {
+  const { t } = useTranslation()
+  const placeholderText = placeholder ?? t('select.placeholder')
   const [open, setOpen] = React.useState(false)
   const [highlight, setHighlight] = React.useState(0)
   const rootRef = React.useRef<HTMLDivElement>(null)
@@ -128,7 +131,7 @@ export function Select<T extends string = string>({
         )}
       >
         <span className={cn('truncate text-left', !selected && 'text-muted-foreground')}>
-          {selected ? selected.label : placeholder}
+          {selected ? selected.label : placeholderText}
         </span>
         <ChevronsUpDown className="h-4 w-4 shrink-0 text-muted-foreground" />
       </button>

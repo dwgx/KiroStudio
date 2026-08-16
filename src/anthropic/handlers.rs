@@ -32,35 +32,61 @@ use super::types::{
 };
 use super::websearch;
 
-/// 从入站请求头提取客户端 IP（仅头部来源，不含连接层回退）。
-///
-/// **安全(A1 修复)**：取 `x-forwarded-for` 的**最右**段，不是最左。XFF 是各级代理依次
-/// 追加的链 `client, proxy1, proxy2, ...`——最左是**客户端可任意伪造**的值，取最左会让
-/// 攻击者发 `X-Forwarded-For: <任意IP>` 来伪造身份、绕过按真实 IP 的封禁/机器码/限流。
-/// 本服务部署在可信反代（openresty，`$proxy_add_x_forwarded_for` 追加式）之后：客户端伪造的
-/// 前缀会被反代把真实 `$remote_addr` **追加到最右**，故最右那段才是不可伪造的真实客户端 IP。
-/// 与安全中间件 [`crate::common::security::client_ip`] 的最右口径一致（消除 A1 的两套语义相反）。
-///
-/// 优先级：`x-forwarded-for` 最右段 → `x-real-ip` → 都没有则 `None`（直连无反代时头缺失，
-/// 由 [`ClientInfo::from_headers_with_peer`] / [`security_block_response`] 回退到 TCP 对端地址）。
-fn extract_client_ip(headers: &axum::http::HeaderMap) -> Option<String> {
-    // x-forwarded-for: "client, proxy1, proxy2" —— 取**最右**段(反代追加的真实 IP,不可伪造)
-    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        if let Some(last) = xff.split(',').next_back() {
-            let ip = last.trim();
-            if !ip.is_empty() {
-                return Some(ip.to_string());
-            }
-        }
-    }
-    // x-real-ip: 单个 IP
-    if let Some(real) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-        let ip = real.trim();
-        if !ip.is_empty() {
-            return Some(ip.to_string());
-        }
-    }
-    None
+// ==================== B7 启动播种自检：镜像接线位图 ====================
+// 校验语义：断言每个进程镜像 setter「被调用过」（而非「值非空」）——
+// error_messages 空表合法（全走内置默认）、mock_cache 默认关也合法，
+// 用值无法区分「配置没设」与「setter 没被调」。main 启动末尾调用
+// [`unwired_mirrors`] 汇总告警；admin 热更 / reload_config 调同一批 setter
+// 只是重复置位，无副作用。
+
+/// 位图：第 i 位 = [`MIRROR_WIRED_NAMES`][i] 对应的 setter 执行过。
+static MIRROR_WIRED_BITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 名字表：新增进程镜像 setter 时必须在此登记（漏登记会在 setter 内 mark 时 panic 暴露）。
+/// 与「删校验必红」守卫同纪律（见本文件测试模块 mirror_wiring_source_guard）。
+const MIRROR_WIRED_NAMES: [&str; 17] = [
+    "collect_client_fingerprint",
+    "trust_forwarded_header",
+    "ip_blocklist",
+    "machine_code_blocklist",
+    "extract_thinking",
+    "cc_auto_buffer",
+    "prompt_cache_enabled",
+    "mock_cache_config",
+    "tool_clean_leaked_tokens",
+    "tool_reclaim_textified_invoke",
+    "tool_stray_repeat_guard",
+    "tool_stream_align_failure",
+    "tool_expose_error_to_client",
+    "tool_repair_json",
+    "tool_truncation_recovery",
+    "compression",
+    "error_messages",
+];
+const _: () = assert!(MIRROR_WIRED_NAMES.len() <= 64);
+
+/// setter 内部调用：登记「本镜像已播种」。名字未登记 → panic（开发期暴露笔误/漏登记）。
+fn mark_mirror_wired(name: &str) {
+    let Some(idx) = MIRROR_WIRED_NAMES.iter().position(|n| *n == name) else {
+        panic!("镜像 {name} 未登记进 MIRROR_WIRED_NAMES");
+    };
+    MIRROR_WIRED_BITS.fetch_or(1u64 << idx, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// B7 启动自检（main 启动末尾调用）：返回尚未播种的镜像名列表，空 = 全部接线完成。
+pub(crate) fn unwired_mirrors() -> Vec<&'static str> {
+    let bits = MIRROR_WIRED_BITS.load(std::sync::atomic::Ordering::Relaxed);
+    MIRROR_WIRED_NAMES
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| bits & (1u64 << i) == 0)
+        .map(|(_, n)| *n)
+        .collect()
+}
+
+/// 登记在案的镜像总数（main 自检日志用）。
+pub(crate) fn mirror_wired_count() -> usize {
+    MIRROR_WIRED_NAMES.len()
 }
 
 /// 指纹采集开关的运行时镜像（`config.collect_client_fingerprint`）。
@@ -73,6 +99,7 @@ static COLLECT_CLIENT_FINGERPRINT: std::sync::atomic::AtomicBool =
 
 /// 设置指纹采集开关（供 main 启动接线 / admin 更新配置时立即生效调用）。
 pub fn set_collect_client_fingerprint(enabled: bool) {
+    mark_mirror_wired("collect_client_fingerprint");
     COLLECT_CLIENT_FINGERPRINT.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -95,12 +122,14 @@ static TRUST_FORWARDED_HEADER: std::sync::atomic::AtomicBool =
 
 /// 设置是否信任转发头（供 main 启动接线 / admin 更新配置时立即生效调用）。
 pub fn set_trust_forwarded_header(enabled: bool) {
+    mark_mirror_wired("trust_forwarded_header");
     TRUST_FORWARDED_HEADER.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// IP 黑名单业务层镜像(ArcSwap 热更)。**与 security 中间件的黑名单互补**:
 /// 中间件用 TCP 对端 IP(反代后=反代内网 IP,拿不到真实客户端),而对话/记账路径的
-/// [`extract_client_ip`] 读 XFF/X-Real-IP 首段=**真实客户端 IP**。故在此业务层再判一次,
+/// [`trusted_client_ip`] 读 XFF/X-Real-IP 最右段=**真实客户端 IP**(委托
+/// [`crate::common::security::client_ip_from_headers`]，与中间件同源同口径)。故在此业务层再判一次,
 /// 命中即拒——这样即便部署在 openresty/nginx 反代后、未开 trust_forwarded,也能按真实 IP 封禁。
 /// 启动时由 main 接线、admin 改 ip_blocklist 时热更(无需重启),存已解析的 Cidr 列表。
 static IP_BLOCKLIST: std::sync::OnceLock<arc_swap::ArcSwap<Vec<crate::common::security::Cidr>>> =
@@ -112,6 +141,7 @@ fn ip_blocklist_cell() -> &'static arc_swap::ArcSwap<Vec<crate::common::security
 
 /// 设置业务层 IP 黑名单(启动接线 / admin 热更调用)。非法条目跳过。
 pub fn set_ip_blocklist(entries: &[String]) {
+    mark_mirror_wired("ip_blocklist");
     let mut cidrs = Vec::new();
     for e in entries {
         match crate::common::security::Cidr::parse(e) {
@@ -147,6 +177,7 @@ fn machine_code_blocklist_cell() -> &'static arc_swap::ArcSwap<Vec<String>> {
 
 /// 设置业务层机器码黑名单(启动接线 / admin 热更调用)。空串跳过,统一小写去空白存储。
 pub fn set_machine_code_blocklist(entries: &[String]) {
+    mark_mirror_wired("machine_code_blocklist");
     let cleaned: Vec<String> = entries
         .iter()
         .map(|s| s.trim().to_ascii_lowercase())
@@ -168,7 +199,7 @@ fn machine_code_is_blocked(code: &str) -> bool {
 /// 安全封禁网关：IP 黑名单 + 机器码黑名单统一判定。命中返回 403 响应，未命中返回 None。
 ///
 /// **F2 修复关键**：封禁判定**独立于 `collect_client_fingerprint` 隐私开关**——直接从请求头
-/// 解析真实客户端 IP（[`extract_client_ip`]，回退 TCP 对端），而非复用 `ClientInfo`（后者在
+/// 解析真实客户端 IP（[`trusted_client_ip`]，回退 TCP 对端），而非复用 `ClientInfo`（后者在
 /// 关闭指纹采集时返回全空 IP，会让黑名单静默失效）。安全过滤不该被可观测性开关关掉。
 ///
 /// 机器码按当前请求真实 IP / device 重算判定（与「按机器」视图逐 IP 展示的码口径一致）。
@@ -200,20 +231,26 @@ fn security_block_response(
     peer: Option<std::net::SocketAddr>,
 ) -> Option<axum::response::Response> {
     // 真实客户端 IP：XFF 最右(A1,不可伪造) → 回退 TCP 对端。不受指纹开关影响。
-    // A1 修复:extract_client_ip 已改取最右段;仅当对端是可信反代(私网/环回)时才采信 XFF,
+    // A1 修复:trusted_client_ip 取 XFF 最右段;仅当对端是可信反代(私网/环回)时才采信 XFF,
     // 公网直连客户端伪造的 XFF 被忽略(用对端 IP),与中间件 client_ip 口径统一。
     let real_ip = trusted_client_ip(headers, peer);
 
     if let Some(ip) = real_ip.as_deref() {
         if ip_is_blocked(ip) {
             tracing::warn!(client_ip = %ip, "IP 黑名单拦截:拒绝该来源请求(403)");
-            return Some(
+            // D2 接入（M2 补充）：IP 黑名单 403 走配置 key `permission_denied`
+            // （A9 region 错配已改用独立 key `region_mismatch`，此 key 专属于本分支）。
+            let (status, error_type, message, _) = resolve_msg(
+                &current_error_messages(),
+                "permission_denied",
                 (
                     StatusCode::FORBIDDEN,
-                    Json(ErrorResponse::new("permission_error", "来源 IP 已被封禁")),
-                )
-                    .into_response(),
+                    "permission_error",
+                    "来源 IP 已被封禁",
+                    None,
+                ),
             );
+            return Some((status, Json(ErrorResponse::new(error_type, message))).into_response());
         }
     }
 
@@ -221,13 +258,18 @@ fn security_block_response(
     let code = crate::usage::machine_code_of(real_ip.as_deref(), None);
     if machine_code_is_blocked(&code) {
         tracing::warn!(machine_code = %code, client_ip = ?real_ip, "机器码黑名单拦截:拒绝该机器请求(403)");
-        return Some(
+        // D3 接入（M2 补充）：机器码黑名单走配置 key `machine_blocked`。
+        let (status, error_type, message, _) = resolve_msg(
+            &current_error_messages(),
+            "machine_blocked",
             (
                 StatusCode::FORBIDDEN,
-                Json(ErrorResponse::new("permission_error", "sbsbsb！")),
-            )
-                .into_response(),
+                "permission_error",
+                "sbsbsb！",
+                None,
+            ),
         );
+        return Some((status, Json(ErrorResponse::new(error_type, message))).into_response());
     }
     None
 }
@@ -246,6 +288,7 @@ static EXTRACT_THINKING: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 
 /// 设置非流式 thinking 提取开关（main 启动接线 / admin 热更调用，立即生效）。
 pub fn set_extract_thinking(enabled: bool) {
+    mark_mirror_wired("extract_thinking");
     EXTRACT_THINKING.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -262,6 +305,7 @@ static CC_AUTO_BUFFER: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 
 /// 设置 CC 自动切缓冲开关（main 启动接线 / admin 热更调用，立即生效）。
 pub fn set_cc_auto_buffer(enabled: bool) {
+    mark_mirror_wired("cc_auto_buffer");
     CC_AUTO_BUFFER.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -279,11 +323,59 @@ static PROMPT_CACHE_ENABLED: std::sync::atomic::AtomicBool =
 
 /// 设置 prompt cache 记账下发开关（main 启动接线 / admin 热更调用，立即生效）。
 pub fn set_prompt_cache_enabled(enabled: bool) {
+    mark_mirror_wired("prompt_cache_enabled");
     PROMPT_CACHE_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn prompt_cache_enabled() -> bool {
     PROMPT_CACHE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 透传路径**模拟缓存**注入开关（`mockCacheEnabled` 的进程镜像）。
+///
+/// custom_api 透传路径（passthrough.rs）的响应是上游原样字节，`cache_read_input_tokens`
+/// 来自上游（DeepSeek 恒 0）→ 下游（sub2api 等）看不到缓存分支。开启后透传 filter
+/// 把 usage 的 `cache_read_input_tokens` 注入为 `round(input_tokens × ratio)`、
+/// creation 置 0（模拟全命中不写缓存）——**伪造值，仅供下游展示，不是真实计费依据**
+/// （与 [`PROMPT_CACHE_ENABLED`] 的估算下发同性质）。
+///
+/// 默认关；main 启动接线、admin 热更即时改写（TIER3 镜像范式，与
+/// [`PROMPT_CACHE_ENABLED`] 相同：进程级 static 原子，无锁近零成本）。
+static MOCK_CACHE_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static MOCK_CACHE_READ_RATIO: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0.7f64.to_bits());
+
+/// 设置模拟缓存配置（main 启动接线 / admin 热更调用，立即生效）。
+/// ratio 在此清洗：非有限值（NaN/±inf）归默认 0.7，其余 clamp 到 [0.0, 1.0]
+/// —— 读取处拿到的恒是合法值，注入逻辑无需再防御。
+pub fn set_mock_cache_config(enabled: bool, ratio: f64) {
+    mark_mirror_wired("mock_cache_config");
+    let ratio = sanitize_mock_cache_ratio(ratio);
+    // ⚠️ 先写 ratio 再写 enabled（关优先语义）：读取处（mock_cache_config）先读
+    // enabled 再读 ratio——关闭瞬间 enabled=false 一旦写入，读侧立即不再注入，
+    // 不残留注入窗口；开启瞬间读侧看到 enabled=true 时 ratio 必已是新清洗值，
+    // 不会用旧比例注入。
+    MOCK_CACHE_READ_RATIO.store(ratio.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    MOCK_CACHE_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+    if enabled {
+        tracing::warn!("模拟缓存已启用：cache_read = input × {ratio}（伪造值，仅供下游展示）");
+    }
+}
+
+/// mock ratio 清洗：非有限值 → 默认 0.7；否则 clamp 到 [0.0, 1.0]。
+pub(crate) fn sanitize_mock_cache_ratio(ratio: f64) -> f64 {
+    if !ratio.is_finite() {
+        return 0.7;
+    }
+    ratio.clamp(0.0, 1.0)
+}
+
+/// 透传路径读取处：模拟缓存开关 + 清洗后的 ratio（`enabled=false` 时 ratio 无意义）。
+pub(crate) fn mock_cache_config() -> (bool, f64) {
+    let enabled = MOCK_CACHE_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+    let ratio = f64::from_bits(MOCK_CACHE_READ_RATIO.load(std::sync::atomic::Ordering::Relaxed));
+    (enabled, ratio)
 }
 
 // ==================== 工具错误缓解开关（TIER3 进程镜像，admin 热更即时生效，默认全关）====================
@@ -296,6 +388,7 @@ static TOOL_CLEAN_LEAKED_TOKENS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 /// 设置泄漏 token 清洗开关（main 启动接线 / admin 热更调用，立即生效）。
 pub fn set_tool_clean_leaked_tokens(enabled: bool) {
+    mark_mirror_wired("tool_clean_leaked_tokens");
     TOOL_CLEAN_LEAKED_TOKENS.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 pub(crate) fn tool_clean_leaked_tokens_enabled() -> bool {
@@ -307,6 +400,7 @@ pub(crate) fn tool_clean_leaked_tokens_enabled() -> bool {
 static TOOL_RECLAIM_TEXTIFIED_INVOKE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 pub fn set_tool_reclaim_textified_invoke(enabled: bool) {
+    mark_mirror_wired("tool_reclaim_textified_invoke");
     TOOL_RECLAIM_TEXTIFIED_INVOKE.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 pub(crate) fn tool_reclaim_textified_invoke_enabled() -> bool {
@@ -317,6 +411,7 @@ pub(crate) fn tool_reclaim_textified_invoke_enabled() -> bool {
 static TOOL_STRAY_REPEAT_GUARD: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 pub fn set_tool_stray_repeat_guard(enabled: bool) {
+    mark_mirror_wired("tool_stray_repeat_guard");
     TOOL_STRAY_REPEAT_GUARD.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 pub(crate) fn tool_stray_repeat_guard_enabled() -> bool {
@@ -328,6 +423,7 @@ static TOOL_STREAM_ALIGN_FAILURE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 /// 设置流式失败态对齐开关（main 启动接线 / admin 热更调用，立即生效）。
 pub fn set_tool_stream_align_failure(enabled: bool) {
+    mark_mirror_wired("tool_stream_align_failure");
     TOOL_STREAM_ALIGN_FAILURE.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 pub(crate) fn tool_stream_align_failure_enabled() -> bool {
@@ -339,6 +435,7 @@ static TOOL_EXPOSE_ERROR_TO_CLIENT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 /// 设置工具错误暴露开关（main 启动接线 / admin 热更调用，立即生效）。
 pub fn set_tool_expose_error_to_client(enabled: bool) {
+    mark_mirror_wired("tool_expose_error_to_client");
     TOOL_EXPOSE_ERROR_TO_CLIENT.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 pub(crate) fn tool_expose_error_to_client_enabled() -> bool {
@@ -349,6 +446,7 @@ pub(crate) fn tool_expose_error_to_client_enabled() -> bool {
 static TOOL_REPAIR_JSON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 /// 设置 JSON 修复层开关（main 启动接线 / admin 热更调用，立即生效）。
 pub fn set_tool_repair_json(enabled: bool) {
+    mark_mirror_wired("tool_repair_json");
     TOOL_REPAIR_JSON.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 pub(crate) fn tool_repair_json_enabled() -> bool {
@@ -365,6 +463,7 @@ static TOOL_TRUNCATION_RECOVERY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 /// 设置截断跨轮恢复开关（main 启动接线 / admin 热更调用，立即生效）。
 pub fn set_tool_truncation_recovery(enabled: bool) {
+    mark_mirror_wired("tool_truncation_recovery");
     TOOL_TRUNCATION_RECOVERY.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 pub(crate) fn tool_truncation_recovery_enabled() -> bool {
@@ -404,11 +503,83 @@ fn compression_cell() -> &'static arc_swap::ArcSwap<crate::model::config::Compre
 
 /// 设置输入压缩配置（main 启动接线 / admin 热更调用，立即生效，下个请求即读到新值）。
 pub fn set_compression(compression: crate::model::config::CompressionConfig) {
+    mark_mirror_wired("compression");
     compression_cell().store(std::sync::Arc::new(compression));
 }
 
-fn current_compression() -> std::sync::Arc<crate::model::config::CompressionConfig> {
+/// 读当前压缩配置快照（热路径 load_full 无锁近零成本）。
+pub(crate) fn current_compression() -> std::sync::Arc<crate::model::config::CompressionConfig> {
     compression_cell().load_full()
+}
+
+/// 错误消息配置表的进程级镜像（热更，范式同 [`COMPRESSION`]）。
+///
+/// `Config.error_messages`（`HashMap<String, ErrorMessageOverride>`）非标量（一张表），
+/// 用 `ArcSwap` 承载：admin 改配置时整份原子换、错误翻译处 `load_full()` 拿 `Arc`
+/// 快照（无锁近零成本）。`OnceLock` 惰性初始化，config 结构层落地后由 reload_config
+/// 接线（main 启动写入真配置 / admin 热更改写）；未初始化时回退空表 ——
+/// [`resolve_msg`] 全部落到调用点内置默认，零行为变化。
+///
+/// ⚠️ 依赖方向纪律（结构绊脚石 #16）：本镜像与 [`COMPRESSION`]、MOCK_CACHE_* 的
+/// setter/getter 是**全仓仅有的 kiro 层反向引用 anthropic 层**（调用环
+/// `kiro/token_manager → anthropic/handlers`）——reload_config 的热更接线跨层依赖
+/// 它们。环的另一半（anthropic → kiro 主方向 + provider 对 AbsorbClass 的类型引用）
+/// 无法归零，故纪律为：**新增 kiro 层对 anthropic 层的引用必须在 review 时显式
+/// 说明理由**；镜像正解是搬去中性模块（如 common/runtime_state.rs）后 re-export。
+pub(crate) type ErrorMessagesTable =
+    std::collections::HashMap<String, crate::model::config::ErrorMessageOverride>;
+
+static ERROR_MESSAGES: std::sync::OnceLock<
+    arc_swap::ArcSwap<ErrorMessagesTable>,
+> = std::sync::OnceLock::new();
+
+fn error_messages_cell() -> &'static arc_swap::ArcSwap<ErrorMessagesTable> {
+    ERROR_MESSAGES.get_or_init(|| arc_swap::ArcSwap::from_pointee(ErrorMessagesTable::new()))
+}
+
+/// 设置错误消息配置表（main 启动接线 / admin 热更调用，立即生效，下个请求即读到新值）。
+pub fn set_error_messages(table: ErrorMessagesTable) {
+    mark_mirror_wired("error_messages");
+    error_messages_cell().store(std::sync::Arc::new(table));
+}
+
+/// 错误翻译处读当前表快照。
+pub(crate) fn current_error_messages() -> std::sync::Arc<ErrorMessagesTable> {
+    error_messages_cell().load_full()
+}
+
+/// 从错误消息配置表解析一个 key 的渲染值。
+///
+/// 未配置该 key（或字段为 None）→ 用调用点内置默认（= 现状文案/码/退避秒数，零行为变化）。
+/// 返回 `(status, error.type, message, retry_after)`；`retry_after` 仅当配置给了值才是
+/// `Some`（调用点自行决定优先级 —— **号池真值 `retry_after_secs=N` 永远优先于配置**）。
+///
+/// 接口约定（与并行 config 结构层对齐）：字段名 `error_messages`、
+/// `ErrorMessageOverride { status, type, message, retry_after_secs }`，全部 Optional，
+/// None = 用内置默认（只改 message 时 status/type 不填）。
+/// default 的 `message` 允许非 'static（调用点可能是动态前缀，如透传池的
+/// `err_response` 传调用点文案）；返回值与默认借用无关（全部 owned）。
+pub(crate) fn resolve_msg<'a>(
+    cfg: &ErrorMessagesTable,
+    key: &str,
+    default: (StatusCode, &'a str, &'a str, Option<u64>),
+) -> (StatusCode, String, String, Option<u64>) {
+    let Some(ov) = cfg.get(key) else {
+        return (
+            default.0,
+            default.1.to_string(),
+            default.2.to_string(),
+            default.3,
+        );
+    };
+    let status = ov
+        .status
+        .and_then(|s| StatusCode::from_u16(s).ok())
+        .unwrap_or(default.0);
+    let error_type = ov.r#type.clone().unwrap_or_else(|| default.1.to_string());
+    let message = ov.message.clone().unwrap_or_else(|| default.2.to_string());
+    let retry_after = ov.retry_after_secs.or(default.3);
+    (status, error_type, message, retry_after)
 }
 
 /// WebSearch 回灌循环（websearch.rs）用的薄包装：构造 Kiro 请求体并做输入压缩，
@@ -470,7 +641,7 @@ async fn dispatch_web_search_loop(
     .await
     {
         Ok(success) => {
-            emit_websearch_loop_usage(provider, &success, client);
+            emit_websearch_loop_usage(provider, &success, client, wants_stream);
             if wants_stream {
                 let bytes: Vec<Result<Bytes, Infallible>> =
                     websearch::build_loop_sse_events(&success)
@@ -505,6 +676,207 @@ async fn dispatch_web_search_loop(
     Some(resp)
 }
 
+/// 双入口共享：KiroProvider 未配置 → 503 服务不可用响应。
+/// 与 /cc/v1 入口同 key（provider_not_configured）：双入口读同一配置。
+fn render_provider_not_configured() -> Response {
+    tracing::error!("KiroProvider 未配置");
+    let (status, error_type, message, _) = resolve_msg(
+        &current_error_messages(),
+        "provider_not_configured",
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service_unavailable",
+            "Kiro API provider not configured",
+            None,
+        ),
+    );
+    (status, Json(ErrorResponse::new(error_type, message))).into_response()
+}
+
+/// 双入口共享：max_tokens 本地上限校验（超上限 = 400，不超 = None）。
+/// 🔴 2026-08-15 线上 smoke test 发现：超出上游上限的 max_tokens 此前被误判为
+/// 瞬态错误吞进 failover+absorb（30s 延迟 + 503 误判，客户端等预算耗尽）。
+/// 上限对齐上游实测（fuckopencode/deepseek 均 393216）。双入口（/v1 与 /cc/v1）同检查。
+fn check_max_tokens_limit(max_tokens: i32) -> Option<Response> {
+    if max_tokens > 393216 {
+        let err_msgs = current_error_messages();
+        let (s, t, m, _) = resolve_msg(
+            &err_msgs,
+            "max_tokens_exceeded",
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "max_tokens 超出上限 393216",
+                None,
+            ),
+        );
+        return Some((s, Json(ErrorResponse::new(t, m))).into_response());
+    }
+    None
+}
+
+/// 双入口共享：转换错误三形态 → (status, error.type, message)。
+/// 三种形态各读各的 key（与另一入口同 key：双入口读同一配置）。
+fn render_conversion_error(e: &ConversionError) -> (StatusCode, String, String) {
+    let err_msgs = current_error_messages();
+    match e {
+        ConversionError::UnsupportedModel(model) => {
+            let (s, t, m, _) = resolve_msg(
+                &err_msgs,
+                "unsupported_model",
+                (StatusCode::BAD_REQUEST, "invalid_request_error", "模型不支持", None),
+            );
+            (s, t, format!("{m}: {model}"))
+        }
+        ConversionError::EmptyMessages => {
+            let (s, t, m, _) = resolve_msg(
+                &err_msgs,
+                "empty_messages",
+                (StatusCode::BAD_REQUEST, "invalid_request_error", "消息列表为空", None),
+            );
+            (s, t, m)
+        }
+        ConversionError::UnsupportedToolMapping { tool_name, reason } => {
+            let (s, t, m, _) = resolve_msg(
+                &err_msgs,
+                "tool_mapping_failed",
+                (
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "工具参数无法映射",
+                    None,
+                ),
+            );
+            (s, t, format!("{m}: {tool_name} — {reason}"))
+        }
+    }
+}
+
+/// 双入口共享：Kiro 请求体序列化失败 → 500（key `request_serialization_failed`，
+/// 双入口同 key、压缩重试轮同配置）。日志由调用点打（区分初试/重试文案）。
+fn render_serialization_failed(e: &impl std::fmt::Display) -> Response {
+    let (status, error_type, message, _) = resolve_msg(
+        &current_error_messages(),
+        "request_serialization_failed",
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "序列化请求失败",
+            None,
+        ),
+    );
+    (status, Json(ErrorResponse::new(error_type, format!("{message}: {e}")))).into_response()
+}
+
+/// 双入口共享：WebSearch 本地处理（快路径 + agentic 回灌循环）。
+/// 返回 `Some` = 已生成最终响应（调用方直接 return）；`None` = 走常规转发。
+/// 收口原因同 [`dispatch_web_search_loop`]：双入口此前逐字复制同一段，只改一处
+/// 即行为分叉。混合工具场景（web_search + 其他工具）请求带 web_search 但未显式
+/// 触发搜索时不再剔除 web_search：交给 converter 归一化成 Kiro 认的函数工具形态，
+/// 上游回 web_search tool_use 且本轮无其他工具 → agentic 回灌；混入非 web_search
+/// 工具 → 整轮原样回客户端。纯 web_search 与显式触发走本地 MCP 快路径。
+async fn dispatch_websearch_paths(
+    provider: &std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    payload: &MessagesRequest,
+    budget: &crate::kiro::provider::SharedRetryBudget,
+    client: &ClientInfo,
+) -> Option<Response> {
+    // 检查是否应本地处理 WebSearch 请求（tool_choice 强制 / 纯 web_search 单工具 / Claude Code 前缀）
+    if websearch::should_handle_websearch_request(payload) {
+        tracing::info!("检测到 WebSearch 请求，路由到本地 WebSearch 处理");
+        // 估算输入 tokens（只读计数，传引用避免深拷贝整个对话历史）
+        let input_tokens = token::count_all_tokens(
+            &payload.model,
+            payload.system.as_deref(),
+            &payload.messages,
+            payload.tools.as_deref(),
+        ) as i32;
+        return Some(
+            websearch::handle_websearch_request(
+                provider.clone(),
+                payload,
+                input_tokens,
+                budget,
+                client,
+            )
+            .await,
+        );
+    }
+    if let Some(resp) = dispatch_web_search_loop(provider, payload, budget, client).await {
+        return Some(resp);
+    }
+    None
+}
+
+/// 双入口共享：压缩重试循环的每一跳上游分发（buffered 流式 / 真流式 / 非流式）。
+/// `use_buffered` 由入口决定并保留入口差异：/v1 = ccAutoBuffer ∧ Claude Code 请求；
+/// /cc/v1 = 仅 ccAutoBuffer。分发后的压缩重试判定（内部标记头）仍在入口循环内。
+async fn dispatch_kiro_attempt(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    body_ref: &str,
+    payload: &MessagesRequest,
+    input_tokens: i32,
+    thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
+    known_tool_names: std::collections::HashSet<String>,
+    tool_required_fields: std::collections::HashMap<String, Vec<String>>,
+    cache_breakdown: Option<CacheUsageBreakdown>,
+    fingerprint_usage: Option<crate::anthropic::cache::PromptCacheUsage>,
+    budget: &crate::kiro::provider::SharedRetryBudget,
+    client: ClientInfo,
+    use_buffered: bool,
+) -> Response {
+    if payload.stream {
+        if use_buffered {
+            handle_stream_request_buffered(
+                provider,
+                body_ref,
+                &payload.model,
+                input_tokens,
+                thinking_enabled,
+                tool_name_map,
+                known_tool_names,
+                tool_required_fields,
+                cache_breakdown,
+                budget,
+                client,
+            )
+            .await
+        } else {
+            handle_stream_request(
+                provider,
+                body_ref,
+                &payload.model,
+                input_tokens,
+                thinking_enabled,
+                tool_name_map,
+                known_tool_names,
+                tool_required_fields,
+                cache_breakdown,
+                budget,
+                client,
+            )
+            .await
+        }
+    } else {
+        // 非流式响应：仅在配置开启时提取 thinking 块
+        let extract_thinking = extract_thinking_enabled() && thinking_enabled;
+        handle_non_stream_request(
+            provider,
+            body_ref,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+            cache_breakdown,
+            fingerprint_usage,
+            budget,
+            client,
+        )
+        .await
+    }
+}
+
 /// WebSearch 回灌成功收尾时埋一条用量记录。
 ///
 /// ⚠️ 诚实边界：回灌链路一次客户端请求对应 **N 次上游往返**，这里只记**一条**记录
@@ -516,13 +888,18 @@ fn emit_websearch_loop_usage(
     provider: &crate::kiro::provider::KiroProvider,
     success: &websearch::WebSearchLoopSuccess,
     client: &ClientInfo,
+    wants_stream: bool,
 ) {
     let mut record =
         crate::usage::RequestRecord::new(Uuid::new_v4().to_string(), success.model.clone());
     record.requested_model = Some(success.model.clone());
-    // WebSearch 回灌是 MCP 路径（请求体无 modelId，不经过模型映射），upstream 保持 None。
+    // 双口径补齐：回灌每轮走 `call_api_stream`（Kiro 主链路，请求体带 modelId、
+    // 经过全局模型映射），末轮的映射结果由 run_round 从 CallMeta.mapped_model 带出，
+    // 与 credential_id 同源（同为末轮）。None = 末轮未命中映射/凭据豁免。
+    record.upstream_model = success.mapped_model.clone();
     record.credential_id = Some(success.credential_id);
-    record.is_streaming = false;
+    // 恒 false 的旧实现：面板上所有回灌记录都显示非流式，无法按客户端形态过滤。
+    record.is_streaming = wants_stream;
     record.input_tokens = success.input_tokens;
     record.output_tokens = success.output_tokens;
     record.credits_used = if success.credits > 0.0 {
@@ -539,10 +916,42 @@ fn emit_websearch_loop_usage(
     crate::usage::emit_record(record);
 }
 
+/// WebSearch **快路径**（`handle_websearch_request` 本地 MCP 单轮搜索）成功时的用量埋点。
+///
+/// 与 [`emit_websearch_loop_usage`]（回灌循环）互补：快路径此前**零埋点**，面板上
+/// 纯 web_search 请求的流量完全不可见。差异（诚实边界）：
+/// - `credential_id` 来自 MCP 调用成功时 provider 返回的实账凭据（拿不到时为 None）；
+/// - MCP 响应无 meteringEvent → `credits_used` 不写（与 build_mcp_record 同口径）；
+/// - `retries` 恒 0（单轮无重试语义）。
+///
+/// `pub(super)`：websearch.rs 在成功收尾处调用（两条路径各埋各的，不混用）。
+pub(super) fn emit_websearch_fast_path_usage(
+    provider: &crate::kiro::provider::KiroProvider,
+    model: &str,
+    credential_id: Option<u64>,
+    input_tokens: i32,
+    output_tokens: i32,
+    wants_stream: bool,
+    client: &ClientInfo,
+) {
+    let mut record = crate::usage::RequestRecord::new(Uuid::new_v4().to_string(), model.to_string());
+    record.requested_model = Some(model.to_string());
+    record.credential_id = credential_id;
+    record.is_streaming = wants_stream;
+    record.input_tokens = input_tokens;
+    record.output_tokens = output_tokens;
+    record.outcome = crate::usage::RequestOutcome::Success;
+    client.apply(&mut record);
+    crate::usage::emit_record(record);
+}
+
 /// 请求来源的客户端画像（设备类型 + IP + 细分 OS + 浏览器），
 /// 一并沿用量埋点路径传递，避免多参数散落。
+///
+/// `pub(super)`：websearch.rs 的快路径埋点（emit_websearch_fast_path_usage）也要
+/// 消费同一份画像，避免在两处各存一份客户端信息结构。
 #[derive(Clone, Default)]
-struct ClientInfo {
+pub(super) struct ClientInfo {
     device: Option<String>,
     ip: Option<String>,
     os: Option<String>,
@@ -848,13 +1257,19 @@ fn adaptive_compress_loop(
 }
 
 /// 已翻译的上游错误：HTTP 状态 + Anthropic 错误类型码 + 面向用户的中文消息（含排障步骤）。
+///
+/// `error_type` 用 `String`（非 `&'static str`）：错误消息可配置化后 type 可能来自
+/// 配置表（运行时字符串），无法静态借用。message 同理本就为 String。
 struct TranslatedError {
     status: StatusCode,
-    error_type: &'static str,
+    error_type: String,
     message: String,
     /// 网关可以在更激进的压缩下重试（CONTENT_LENGTH_EXCEEDS_THRESHOLD 等可自愈错误）。
     /// 对应的响应带上 `x-kirostudio-compress-retry` 头，handler 据此决定是否重新压缩并重试。
     retry_compress: bool,
+    /// 配置表给的 `retryAfterSecs`（默认 None = 不带 Retry-After）。仅适用于**可重试语义**
+    /// 的分支；永久态（404 subscription_unsupported 等）与 400 请求错误分支不产出。
+    retry_after_override: Option<u64>,
 }
 
 /// 上游账户级限流的客户端退避建议秒数（`Retry-After` 头取值）。
@@ -1031,6 +1446,33 @@ fn translate_upstream_error(err_str: &str) -> Option<TranslatedError> {
 
 /// 配额/订阅/region 类（不可重试，需用户处理账号）。
 fn translate_quota_subscription(err_str: &str) -> Option<TranslatedError> {
+    // 🔴 `subscription_unsupported=1`：provider 打在「订阅不覆盖本应用/模型」bail 串上的
+    // 机器可读标记（provider.rs 注释明言：永久条件，不换区、不重试、不计凭据失败）。
+    // **必须排在最前**：旧代码被下方 `contains("subscription")` 宽匹配先命中 → 译成
+    // 502 `api_error`（可重试语义）+「刷新 Token」误导文案 —— 而订阅档位缺失刷新多少次
+    // 都不会变，客户端还会按 5xx 盲退避重打。与 `model_unsupported_by_pool=1` 同范式：
+    // 404 `not_found_error`，绝不带 Retry-After（给了就等于宣称「等一会儿会好」）。
+    if err_str.contains("subscription_unsupported=1") {
+        // ⚠️ 永久态：配置的 retry_afterSecs 刻意**忽略**（带了等于宣称「等一会儿会好」，
+        // 客户端按 5xx 盲退避重打一个重试永远不会变的请求）。
+        let (status, error_type, message, _) = resolve_msg(
+            &current_error_messages(),
+            "subscription_unsupported",
+            (
+                StatusCode::NOT_FOUND,
+                "not_found_error",
+                "当前凭据的订阅档位不支持该应用/模型（永久条件，非临时故障）。换区或重试均无效：请更换为订阅覆盖该应用/模型的凭据，或联系账号管理员开通对应档位。",
+                None,
+            ),
+        );
+        return Some(TranslatedError {
+            retry_compress: false,
+            retry_after_override: None,
+            status,
+            error_type,
+            message,
+        });
+    }
     // 🔴 **全池配额耗尽**：只认 provider 打的显式标记（2026-08-10 收口）。
     //
     // 改前这里是裸串 `contains("MONTHLY_REQUEST_COUNT") || contains("QUOTA")`，而那两个串
@@ -1041,29 +1483,59 @@ fn translate_quota_subscription(err_str: &str) -> Option<TranslatedError> {
     // 现在与 `pool_permanently_exhausted=1` / `model_unsupported_by_pool=1` 同款：
     // 只信 provider 在**确认 `has_available == false`** 后才打的 `quota_exhausted_all=1`。
     if err_str.contains("quota_exhausted_all=1") {
+        let (status, error_type, message, cfg_ra) = resolve_msg(
+            &current_error_messages(),
+            "quota_exhausted",
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                "月度请求配额已耗尽（号池内所有凭据）。排障：①面板查看各凭据用量；②等待配额周期重置；③为号池补充新凭据。",
+                None,
+            ),
+        );
         return Some(TranslatedError {
             retry_compress: false,
-            status: StatusCode::TOO_MANY_REQUESTS,
-            error_type: "rate_limit_error",
-            message: "月度请求配额已耗尽（号池内所有凭据）。排障：①面板查看各凭据用量；②等待配额周期重置；③为号池补充新凭据。".to_string(),
+            status,
+            error_type,
+            message,
+            retry_after_override: cfg_ra,
         });
     }
-    // 兜底：仍保留裸串识别，但**降级为「单号/未知范围」的配额语义**。
+    // 兜底：仍保留配额 reason 码识别（判据收口在
+    // `endpoint::default_is_monthly_request_limit`），但**降级为「单号/未知范围」的配额语义**。
     //
     // 为什么不能直接删掉（这是本次收口最容易做错的地方）：并非所有配额错误都经过
     // 上面那个标记 —— MCP 路径（`call_mcp_with_retry`）、透传路径、以及未来新增的
-    // 上游分支都可能把带 `MONTHLY_REQUEST_COUNT` 的 body 冒泡上来。删掉裸串会让它们
+    // 上游分支都可能把带配额 reason 码的 body 冒泡上来。删掉该兜底会让它们
     // 落 `map_provider_error` 末尾兜底 → **502 无 Retry-After** → 客户端当永久故障、
     // 不退避、原样重发（这正是本仓反复踩过的那类回归）。
     //
+    // 🔴 2026-08-15 收窄：原判据 `contains("QUOTA")` 是**宽判据**——上游 body 任意含
+    // 大写 QUOTA 即判配额耗尽（错误码里恰好带 QUOTA 的无关文案会被 429 误导退避）。
+    // 现收口到 endpoint 侧词表（QUOTA_EXHAUSTED_REASONS = MONTHLY_REQUEST_COUNT /
+    // OVERAGE_REQUEST_LIMIT_EXCEEDED，JSON reason 精确值 + 子串兜底），与
+    // endpoint/主路径侧（endpoint/mod.rs:190 的配额分类）共用一份判据，
+    // 不再在此处新写子串匹配。
+    //
     // 保留但**改文案**：不再断言"所有凭据"（那是标记分支才能确认的事实），
     // 避免面板/用户按错误的范围去排障。状态码维持 429（可退避）不变。
-    if err_str.contains("MONTHLY_REQUEST_COUNT") || err_str.contains("QUOTA") {
+    if crate::kiro::endpoint::default_is_monthly_request_limit(err_str) {
+        let (status, error_type, message, cfg_ra) = resolve_msg(
+            &current_error_messages(),
+            "quota_subscription",
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                "请求配额已耗尽。排障：①面板查看各凭据用量，切到仍有额度的账号；②等待配额周期重置；③为号池补充新凭据。",
+                None,
+            ),
+        );
         return Some(TranslatedError {
             retry_compress: false,
-            status: StatusCode::TOO_MANY_REQUESTS,
-            error_type: "rate_limit_error",
-            message: "请求配额已耗尽。排障：①面板查看各凭据用量，切到仍有额度的账号；②等待配额周期重置；③为号池补充新凭据。".to_string(),
+            status,
+            error_type,
+            message,
+            retry_after_override: cfg_ra,
         });
     }
     // 上游容量紧张/模型短暂不可用：临时状态，稍后重试即可（常见于新模型发布初期）。
@@ -1079,19 +1551,43 @@ fn translate_quota_subscription(err_str: &str) -> Option<TranslatedError> {
     if err_str.contains("MODEL_TEMPORARILY_UNAVAILABLE")
         || err_str.contains("INSUFFICIENT_MODEL_CAPACITY")
     {
+        // B4 矛盾修复（设计 §五 1）：容量 503 现状无 Retry-After（客户端不退避），
+        // 补默认 3s（与 A11 的 5xx 退避同档）；配置的 retryAfterSecs 可覆盖。
+        let (status, error_type, message, cfg_ra) = resolve_msg(
+            &current_error_messages(),
+            "overloaded_capacity",
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "overloaded_error",
+                "上游模型暂时不可用（负载过高），请稍后重试。若持续出现：①换用同族其他版本（如 claude-opus-4.8）；②新发布模型发布初期容量有限，属正常现象，等待 1~2 小时后通常恢复。",
+                Some(3),
+            ),
+        );
         return Some(TranslatedError {
             retry_compress: false,
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            error_type: "overloaded_error",
-            message: "上游模型暂时不可用（负载过高），请稍后重试。若持续出现：①换用同族其他版本（如 claude-opus-4.8）；②新发布模型发布初期容量有限，属正常现象，等待 1~2 小时后通常恢复。".to_string(),
+            status,
+            error_type,
+            message,
+            retry_after_override: cfg_ra,
         });
     }
     if err_str.contains("FEATURE_NOT_SUPPORTED") {
+        let (status, error_type, message, cfg_ra) = resolve_msg(
+            &current_error_messages(),
+            "feature_not_supported",
+            (
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                "当前凭据所在 region 未开通该功能（profile 未激活）。排障：①网关会在刷新时自动验活重选可用 region；②如持续，右键该凭据切换 Profile ARN 到已开通 region（如 eu-central-1）；③确认该账号确在某 region 开通了 Kiro。",
+                None,
+            ),
+        );
         return Some(TranslatedError {
             retry_compress: false,
-            status: StatusCode::BAD_GATEWAY,
-            error_type: "api_error",
-            message: "当前凭据所在 region 未开通该功能（profile 未激活）。排障：①网关会在刷新时自动验活重选可用 region；②如持续，右键该凭据切换 Profile ARN 到已开通 region（如 eu-central-1）；③确认该账号确在某 region 开通了 Kiro。".to_string(),
+            status,
+            error_type,
+            message,
+            retry_after_override: cfg_ra,
         });
     }
     // ⚠️ "Improperly formed" **不在**凭据分支里（2026-08-11 对抗审查 M1）：
@@ -1100,15 +1596,40 @@ fn translate_quota_subscription(err_str: &str) -> Option<TranslatedError> {
     // 且常带 `reason=REQUEST_BODY_INVALID`。混在这里会被说成「订阅失效/token 无效」——
     // 排障方向全错。它由 `translate_context_input` 里的请求体校验分支接管（400
     // invalid_request_error）。真正的凭据信号是 403 `Invalid token`（map_provider_error
-    // 更前面的 403 分支处理）与 `subscription` 类配额文案。
+    // 更前面的 403 分支处理）与 `subscription` 失效类文案。
+    //
+    // 🔴 2026-08-15 收窄：`subscription` 裸词是**宽判据**——「subscription does not
+    // support」（订阅档位，语义应由 `subscription_unsupported=1` 标记处理）、
+    // 「subscription rate limit / quota」（限流/配额）等**非凭据失效**文案也会命中，
+    // 得到 502 +「刷新 Token」误导排障。只认订阅**失效**的连续形态
+    // （expired / invalid / revoked / not found / no longer active 等）。
     if err_str.contains("Invalid token")
-        || err_str.contains("subscription")
+        || err_str.contains("subscription expired")
+        || err_str.contains("subscription has expired")
+        || err_str.contains("subscription is expired")
+        || err_str.contains("subscription is invalid")
+        || err_str.contains("invalid subscription")
+        || err_str.contains("no active subscription")
+        || err_str.contains("subscription not found")
+        || err_str.contains("subscription revoked")
+        || err_str.contains("subscription is no longer active")
     {
+        let (status, error_type, message, cfg_ra) = resolve_msg(
+            &current_error_messages(),
+            "invalid_credential",
+            (
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                "上游拒绝凭据（订阅失效或 token 无效）。排障：①面板对该凭据点『刷新 Token』；②若为 Enterprise/IdC 号，确认 profileArn 已正确解析；③测活确认订阅有效，失效则更换凭据。",
+                None,
+            ),
+        );
         return Some(TranslatedError {
             retry_compress: false,
-            status: StatusCode::BAD_GATEWAY,
-            error_type: "api_error",
-            message: "上游拒绝凭据（订阅失效或 token 无效）。排障：①面板对该凭据点『刷新 Token』；②若为 Enterprise/IdC 号，确认 profileArn 已正确解析；③测活确认订阅有效，失效则更换凭据。".to_string(),
+            status,
+            error_type,
+            message,
+            retry_after_override: cfg_ra,
         });
     }
     None
@@ -1159,11 +1680,23 @@ fn translate_context_input(err_str: &str) -> Option<TranslatedError> {
     // `overloaded_error`（可退避重试）。顺序反了就把「上游没容量」说成「你的图片格式错」，
     // 既误导用户、又让客户端不再退避。
     if crate::kiro::endpoint::default_is_image_mime_mismatch(err_str) {
+        // 400 请求构造问题：配置的 retry_afterSecs 刻意**忽略**（重试原请求无意义）。
+        let (status, error_type, message, _) = resolve_msg(
+            &current_error_messages(),
+            "image_mime_mismatch",
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "图片声明的 media_type 与实际字节格式不符（上游 IMAGE_MIME_MISMATCH）。这是请求构造问题，重试无效。排障：①按图片真实格式填写 media_type（如 JPEG 字节不要声明 image/png）；②不要在改扩展名后沿用旧的 media_type；③重新读取并重新编码该图片后再发。",
+                None,
+            ),
+        );
         return Some(TranslatedError {
             retry_compress: false,
-            status: StatusCode::BAD_REQUEST,
-            error_type: "invalid_request_error",
-            message: "图片声明的 media_type 与实际字节格式不符（上游 IMAGE_MIME_MISMATCH）。这是请求构造问题，重试无效。排障：①按图片真实格式填写 media_type（如 JPEG 字节不要声明 image/png）；②不要在改扩展名后沿用旧的 media_type；③重新读取并重新编码该图片后再发。".to_string(),
+            status,
+            error_type,
+            message,
+            retry_after_override: None,
         });
     }
     // 请求体校验失败（400 `REQUEST_BODY_INVALID` / `Invalid tool use format`，2026-08-11 补）。
@@ -1174,35 +1707,66 @@ fn translate_context_input(err_str: &str) -> Option<TranslatedError> {
     // 重试/换号无意义。判据收口在 `endpoint::default_is_request_body_invalid`
     // （含 region 探测边界警告，见该谓词 doc —— 探测走独立通道，不会被打到这里）。
     if crate::kiro::endpoint::default_is_request_body_invalid(err_str) {
+        let (status, error_type, message, _) = resolve_msg(
+            &current_error_messages(),
+            "request_body_invalid",
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "请求体校验失败（上游 REQUEST_BODY_INVALID）。这是请求构造问题，重试无效。排障：①检查工具调用与工具结果的配对（上游对 tool 配对较严，截断/重排序会产生孤儿 tool_use）；②检查消息 role 与内容字段合法性；③重新构造请求后再发。",
+                None,
+            ),
+        );
         return Some(TranslatedError {
             retry_compress: false,
-            status: StatusCode::BAD_REQUEST,
-            error_type: "invalid_request_error",
-            message: "请求体校验失败（上游 REQUEST_BODY_INVALID）。这是请求构造问题，重试无效。排障：①检查工具调用与工具结果的配对（上游对 tool 配对较严，截断/重排序会产生孤儿 tool_use）；②检查消息 role 与内容字段合法性；③重新构造请求后再发。".to_string(),
+            status,
+            error_type,
+            message,
+            retry_after_override: None,
         });
     }
     // 两条都带 `OVERFLOW_COMPACT_HINT` 前缀：状态码与中文文案一字未改，只在最前面挂哨兵，
     // 让 Claude Code 的 compact-and-retry 认出「这是装不下，压缩后重试还有戏」。
     // 不改 400：这确实是「请求本身太大」，重试原请求无意义 —— 客户端要做的是**先压缩再重试**，
     // 而它认的正是 message 而非状态码（实测那条判据只看 message 子串）。
+    // ⚠️ 配置 message 时由管理员自行保证前缀（「prompt is too long」是承重字符串，
+    // 删了 Claude Code 的自动压缩静默失效——配置校验层对此告警，见设计 §3.1）。
     if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+        let (status, error_type, message, _) = resolve_msg(
+            &current_error_messages(),
+            "context_too_large",
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "prompt is too long: 上下文窗口已满（对话历史累积超出模型上下文上限）。排障：①精简对话历史或开新会话；②缩短 system prompt；③减少同时挂载的工具数量。",
+                None,
+            ),
+        );
         return Some(TranslatedError {
             retry_compress: true,
-            status: StatusCode::BAD_REQUEST,
-            error_type: "invalid_request_error",
-            message: format!(
-                "{OVERFLOW_COMPACT_HINT}: 上下文窗口已满（对话历史累积超出模型上下文上限）。排障：①精简对话历史或开新会话；②缩短 system prompt；③减少同时挂载的工具数量。"
-            ),
+            status,
+            error_type,
+            message,
+            retry_after_override: None,
         });
     }
     if err_str.contains("Input is too long") {
+        let (status, error_type, message, _) = resolve_msg(
+            &current_error_messages(),
+            "input_too_long",
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "prompt is too long: 单次输入过长（请求体本身超出上游限制）。排障：①拆分过大的消息或附件；②减少一次性粘贴的文件内容；③对超大工具结果先做摘要。",
+                None,
+            ),
+        );
         return Some(TranslatedError {
             retry_compress: true,
-            status: StatusCode::BAD_REQUEST,
-            error_type: "invalid_request_error",
-            message: format!(
-                "{OVERFLOW_COMPACT_HINT}: 单次输入过长（请求体本身超出上游限制）。排障：①拆分过大的消息或附件；②减少一次性粘贴的文件内容；③对超大工具结果先做摘要。"
-            ),
+            status,
+            error_type,
+            message,
+            retry_after_override: None,
         });
     }
     None
@@ -1248,6 +1812,17 @@ fn is_upstream_transient_5xx(err_str: &str) -> bool {
         || low.contains("502 bad gateway")
         || low.contains("503 service unavailable")
         || low.contains("504 gateway timeout")
+        // 524 是 Cloudflare 边缘网关超时。http crate 没有 524 的标准 reason phrase，
+        // 状态行只有裸 "524"，故用两条**形态**判据（仍不裸匹配数字）：
+        // 1. 状态行形态 `: 524`：provider 组装的错误串统一是「{api_type} API 请求失败:
+        //    {status} {body}」（provider.rs:3476 等），冒号+空格后紧跟的 524 即状态行；
+        // 2. Cloudflare 错误页正文特征词的连续形态 "524 a timeout occurred"。
+        // 🔴 2026-08-15（对抗审查 MINOR-5）删掉旧宽组合「数字 524 + timeout/gateway
+        // 干扰词」：4xx 错误 body 里 "gateway abuse detected, 524 requests blocked"
+        // 这类句子同时含 524 与 gateway 会被误判成可重试瞬态 5xx → 客户端对永久
+        // 错误无限退避重试（见 `gateway_interference_words_with_524_are_not_5xx`）。
+        || low.contains(": 524")
+        || low.contains("524 a timeout occurred")
         || low.contains("internalserverexception")
 }
 
@@ -1266,38 +1841,108 @@ fn translate_network(err_str: &str) -> Option<TranslatedError> {
         || low.contains("name resolution")
         || low.contains("failed to lookup")
     {
+        let (status, error_type, message, cfg_ra) = resolve_msg(
+            &current_error_messages(),
+            "upstream_dns",
+            (
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                "DNS 解析失败（无法解析上游域名）。排障：①检查本机/容器 DNS 配置；②若走代理，确认代理能解析 kiro.dev；③确认网络出口正常。",
+                None,
+            ),
+        );
         return Some(TranslatedError {
             retry_compress: false,
-            status: StatusCode::BAD_GATEWAY,
-            error_type: "api_error",
-            message: "DNS 解析失败（无法解析上游域名）。排障：①检查本机/容器 DNS 配置；②若走代理，确认代理能解析 kiro.dev；③确认网络出口正常。".to_string(),
+            status,
+            error_type,
+            message,
+            retry_after_override: cfg_ra,
         });
     }
     if low.contains("timed out") || low.contains("timeout") {
+        let (status, error_type, message, cfg_ra) = resolve_msg(
+            &current_error_messages(),
+            "upstream_timeout",
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                "api_error",
+                "连接上游超时。排障：①上游或代理可能拥塞，稍后重试；②检查代理延迟；③大请求可拆小以缩短单次耗时。",
+                None,
+            ),
+        );
         return Some(TranslatedError {
             retry_compress: false,
-            status: StatusCode::GATEWAY_TIMEOUT,
-            error_type: "api_error",
-            message: "连接上游超时。排障：①上游或代理可能拥塞，稍后重试；②检查代理延迟；③大请求可拆小以缩短单次耗时。".to_string(),
+            status,
+            error_type,
+            message,
+            retry_after_override: cfg_ra,
         });
     }
     if low.contains("certificate") || low.contains("ssl") || low.contains("tls") {
+        let (status, error_type, message, cfg_ra) = resolve_msg(
+            &current_error_messages(),
+            "upstream_tls",
+            (
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                "TLS/证书握手失败。排障：①检查系统时间是否准确；②若走中间人代理，确认其证书受信；③确认未误用被拦截的代理。",
+                None,
+            ),
+        );
         return Some(TranslatedError {
             retry_compress: false,
-            status: StatusCode::BAD_GATEWAY,
-            error_type: "api_error",
-            message: "TLS/证书握手失败。排障：①检查系统时间是否准确；②若走中间人代理，确认其证书受信；③确认未误用被拦截的代理。".to_string(),
+            status,
+            error_type,
+            message,
+            retry_after_override: cfg_ra,
         });
     }
     if low.contains("proxy") {
+        let (status, error_type, message, cfg_ra) = resolve_msg(
+            &current_error_messages(),
+            "upstream_proxy",
+            (
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                "代理连接失败。排障：①检查代理地址/账密是否正确；②确认代理在线可达；③面板核对该凭据绑定的代理配置。",
+                None,
+            ),
+        );
         return Some(TranslatedError {
             retry_compress: false,
-            status: StatusCode::BAD_GATEWAY,
-            error_type: "api_error",
-            message: "代理连接失败。排障：①检查代理地址/账密是否正确；②确认代理在线可达；③面板核对该凭据绑定的代理配置。".to_string(),
+            status,
+            error_type,
+            message,
+            retry_after_override: cfg_ra,
         });
     }
     None
+}
+
+/// 上游显式 Retry-After 透传 marker 前缀（S2）。
+///
+/// provider 在 Kiro 主路径 429 分支把解析出的上游 Retry-After（响应头 `Retry-After`
+/// 或 body `resets_*`）打进错误串（`upstream_retry_after=N`），`map_provider_error`
+/// 的 A7 分支据此让客户端拿到上游真值（优先级：上游真值 > 配置 > 默认 8s）。
+///
+/// 与 `retry_after_secs=` 刻意**不同名**：那是**号池**冷却真值（A5 全池语义，
+/// 走「所有凭据冷却」文案）；单凭据上游 429 若复用它会落 A5 的文案，语义错位。
+///
+/// 它是**网关自己打的串**（拼在错误串末尾），不是对上游 body 的子串判定 ——
+/// 与 `retry_after_secs=` 同款误伤面（blockers §2.2.2 记录），本串特征足够独特，
+/// 且解析用 `rsplit` 取**最后一次**出现（网关恒追加在末尾，body 噪声只会出现在前）。
+pub(crate) const UPSTREAM_RETRY_AFTER_MARKER_PREFIX: &str = "upstream_retry_after=";
+
+/// 从错误串里取 `upstream_retry_after=N` 的 N（上游显式 Retry-After 的秒数）。
+///
+/// 与 [`parse_retry_after_secs`] 同构但取**最后一次**出现（见上面 const 的说明）：
+/// 网关恒把 marker 追加在错误串末尾，`rsplit` 天然跳过 body 里可能出现的同名字样。
+pub(crate) fn parse_upstream_retry_after(err_str: &str) -> Option<u64> {
+    err_str
+        .rsplit(UPSTREAM_RETRY_AFTER_MARKER_PREFIX)
+        .next()
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|d| d.parse::<u64>().ok())
 }
 
 /// 从错误串里取 `retry_after_secs=N` 的 N。
@@ -1460,6 +2105,8 @@ const ABSORB_EXHAUSTED_RETRY_AFTER_SECS: u64 = UPSTREAM_RATE_LIMIT_RETRY_AFTER_S
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
+    // 错误消息配置表快照（每请求一次，HashMap get O(1)；未配置 key → 内置默认 = 现状）。
+    let err_msgs = current_error_messages();
 
     // ⭐ 吸收层已尽力重试仍失败，且部署侧显式要求这类终态回 503 —— **必须是第一条分支**。
     //
@@ -1485,39 +2132,60 @@ fn map_provider_error(err: Error) -> Response {
     // 退避逻辑不启动、立刻原样重发（拿一份全新预算再打 4 次，放大在客户端侧复活）。
     if err_str.contains("shared_budget_exhausted=1") {
         // 预算耗尽串由 provider 构造，不含 retry_after_secs= 真值——固定用吸收层同款
-        // 兜底值（15s 级退避即可，语义是「请客户端退避」）。
-        let retry_after = ABSORB_EXHAUSTED_RETRY_AFTER_SECS.clamp(1, 300);
+        // 兜底值（15s 级退避即可，语义是「请客户端退避」）；配置的 retry_afterSecs 可覆盖。
+        let (status, error_type, message, cfg_ra) = resolve_msg(
+            &err_msgs,
+            "shared_budget_exhausted",
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "api_error",
+                "网关已就该请求打满上游调用预算（每请求上限），上游仍不可用（等容量）。\
+                 这是可重试的瞬态状态，请按 Retry-After 退避后重试。",
+                None,
+            ),
+        );
+        let retry_after = cfg_ra
+            .unwrap_or(ABSORB_EXHAUSTED_RETRY_AFTER_SECS)
+            .clamp(1, 300);
         tracing::warn!(
             error = %err,
             retry_after_secs = retry_after,
             "每客户端请求的上游预算已耗尽（跨层共享），按 503 回：客户端自行退避"
         );
         return (
-            StatusCode::SERVICE_UNAVAILABLE,
+            status,
             [(header::RETRY_AFTER, retry_after.to_string())],
             Json(ErrorResponse::new(
-                "api_error",
-                // 🔴 文案里的「等容量」是**承重字符串**，不是修辞（2026-08-11 对抗评审加）。
-                //
-                // 线上真实链路是 `Caddy → kiro_shield.py → KiroStudio`，而 shield 的
-                // `classify()` **按 body 文案分类、不按状态码**，且只有
-                // `verdict ∈ {cool, auth}` 才会读我们的 Retry-After：
-                //     if verdict in ("cool","auth"): delay = cool_delay(..., Retry-After)
-                //     else:                          delay = swap_delay(attempt)  # 本地阶梯
-                // 「等容量」是它 `COOLING_MARKERS` 里的词。删掉它 ⇒ 落 `retry` 兜底
-                // ⇒ **我们精心算的 Retry-After 被整个丢弃**，改走 20→60s 本地阶梯
-                // ⇒ 等真实恢复时间的 2~6 倍（CLAUDE.md 记录：当晚 1753 次失败就是这么来的）。
-                // 改文案前先 `grep COOLING_MARKERS /opt/skiapi/services/kiro_shield.py`。
-                "网关已就该请求打满上游调用预算（每请求上限），上游仍不可用（等容量）。\
-                 这是可重试的瞬态状态，请按 Retry-After 退避后重试。",
+                error_type,
+                // ⚠️ 2026-08-15 认知纠错：本句里的「等容量」**不是** shield 判据 ——
+                // 它只出现在 shield 的**注释**里（kiro_shield.py 337 行），不在
+                // `COOLING_MARKERS` 判据表中（线上实测只有 3 个英文串，清单见
+                // 文件下方守卫测试 `shield_cooling_markers_stay_in_production_text`）。
+                // 因此 A1/A2 这两条 503 文案**不承载任何判据词**，属纯展示文案，
+                // 可自由改（旧的「删掉它 ⇒ 丢弃 Retry-After」说法不成立）。
+                // 改文案前仍建议先 `grep COOLING_MARKERS /opt/skiapi/services/kiro_shield.py`。
+                message,
             )),
         )
             .into_response();
     }
 
     if err_str.contains(ABSORB_BUDGET_EXHAUSTED_MARKER) {
-        // Retry-After 优先用号池真值（`retry_after_secs=N`），其次按类别兜底。
+        let (status, error_type, message, cfg_ra) = resolve_msg(
+            &err_msgs,
+            "absorb_exhausted",
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "api_error",
+                "网关已就该请求重试至预算上限，上游仍不可用（等容量）。这是可重试的瞬态状态，\
+                 请按 Retry-After 退避后重试。若持续出现：①面板『限流健康』查看号池容量与冷却分布；\
+                 ②补充凭据分摊上游压力；③必要时调高 upstreamRetryAbsorb* 预算。",
+                None,
+            ),
+        );
+        // Retry-After 优先用号池真值（`retry_after_secs=N`），其次按配置兜底，最后按类别兜底。
         let retry_after = parse_retry_after_secs(&err_str)
+            .or(cfg_ra)
             .or_else(|| {
                 is_upstream_temporarily_suspended(&err_str)
                     .then_some(UPSTREAM_SUSPENDED_RETRY_AFTER_SECS)
@@ -1531,15 +2199,13 @@ fn map_provider_error(err: Error) -> Response {
              Cursor 一类客户端见 429 会掐会话，见 503 会自行退避重试"
         );
         return (
-            StatusCode::SERVICE_UNAVAILABLE,
+            status,
             [(header::RETRY_AFTER, retry_after.to_string())],
             Json(ErrorResponse::new(
-                "api_error",
-                // 「等容量」同上，是 shield `COOLING_MARKERS` 的承重词（详见上一处 503 的注释）。
-                // 少了它，shield 丢弃我们的 Retry-After 改走 20→60s 本地阶梯。
-                "网关已就该请求重试至预算上限，上游仍不可用（等容量）。这是可重试的瞬态状态，\
-                 请按 Retry-After 退避后重试。若持续出现：①面板『限流健康』查看号池容量与冷却分布；\
-                 ②补充凭据分摊上游压力；③必要时调高 upstreamRetryAbsorb* 预算。",
+                error_type,
+                // 「等容量」同上：不是 shield 判据（2026-08-15 实测仅注释出现），
+                // 本 503 文案不承载判据词，可自由改。
+                message,
             )),
         )
             .into_response();
@@ -1555,19 +2221,27 @@ fn map_provider_error(err: Error) -> Response {
     // 能靠响应体分辨出「这是网关的背压，不该重试」。
     // 两者若共用同一句文案，任何按 body 判定的重试层都会重试网关自己的背压信号。
     if err_str.contains("inbound_admission_timeout=1") {
-        let retry_after = parse_retry_after_secs(&err_str).unwrap_or(1).clamp(1, 300);
+        let (status, error_type, message, cfg_ra) = resolve_msg(
+            &err_msgs,
+            "gate_timeout",
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                "Gateway inbound rate shaping is at capacity (request admission timed out). \
+                 This is gateway-side backpressure, not an upstream cooldown; retrying immediately will not help.",
+                None,
+            ),
+        );
+        // 串内真值优先（准入超时串自带 retry_after_secs=），配置值兜底。
+        let retry_after = parse_retry_after_secs(&err_str).or(cfg_ra).unwrap_or(1).clamp(1, 300);
         tracing::warn!(
             retry_after_secs = retry_after,
             "入站准入排队超时（网关背压），返回 429 + Retry-After；不可吸收"
         );
         return (
-            StatusCode::TOO_MANY_REQUESTS,
+            status,
             [(header::RETRY_AFTER, retry_after.to_string())],
-            Json(ErrorResponse::new(
-                "rate_limit_error",
-                "Gateway inbound rate shaping is at capacity (request admission timed out). \
-                 This is gateway-side backpressure, not an upstream cooldown; retrying immediately will not help.",
-            )),
+            Json(ErrorResponse::new(error_type, message)),
         )
             .into_response();
     }
@@ -1577,19 +2251,26 @@ fn map_provider_error(err: Error) -> Response {
     // 而不是落 502（502 会让客户端立即重发，重新灌满闸门，放大反而更凶）。
     // message 带 "gateway-side backpressure" 让重试层可区分，不当作上游问题重试。
     if err_str.contains("upstream_gate_full=1") {
-        let retry_after = parse_retry_after_secs(&err_str).unwrap_or(2).clamp(1, 300);
+        let (status, error_type, message, cfg_ra) = resolve_msg(
+            &err_msgs,
+            "upstream_gate_full",
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                "Gateway upstream concurrency gate is full (too many in-flight upstream calls). \
+                 This is gateway-side backpressure, not an upstream cooldown; retrying immediately will not help.",
+                None,
+            ),
+        );
+        let retry_after = parse_retry_after_secs(&err_str).or(cfg_ra).unwrap_or(2).clamp(1, 300);
         tracing::warn!(
             retry_after_secs = retry_after,
             "上游并发闸已满（网关背压），返回 429 + Retry-After；不可吸收"
         );
         return (
-            StatusCode::TOO_MANY_REQUESTS,
+            status,
             [(header::RETRY_AFTER, retry_after.to_string())],
-            Json(ErrorResponse::new(
-                "rate_limit_error",
-                "Gateway upstream concurrency gate is full (too many in-flight upstream calls). \
-                 This is gateway-side backpressure, not an upstream cooldown; retrying immediately will not help.",
-            )),
+            Json(ErrorResponse::new(error_type, message)),
         )
             .into_response();
     }
@@ -1598,18 +2279,34 @@ fn map_provider_error(err: Error) -> Response {
     // 这里透传成标准 429 + Retry-After 头，让客户端(Claude Code)按其自身退避策略重试——
     // 比网关内硬扛温和，也减少对被风控号的试探。
     if let Some(secs) = parse_retry_after_secs(&err_str) {
-        let retry_after = secs.clamp(1, 300);
+        // ⭐ 号池真值永远优先：能进此分支必然带真值，配置的 retryAfterSecs 不可覆盖它
+        // （号池算出的剩余秒数比任何常数/配置都准，见 A2 分支注释）。
+        // 决议链与 A2/A3/A4 同构：真值 → 配置兜底 → 类别兜底。此前 `_cfg_ra` 完全
+        // 不读，与 error_messages.rs 的「配置只是兜底」注释矛盾（配置了
+        // rate_limited_pool.retryAfterSecs 的管理员会发现它静默无效）；现改为读
+        // —— 分支守卫保证真值恒存在，配置在链上完整但实际不可达，行为不变。
+        let (status, error_type, message, cfg_ra) = resolve_msg(
+            &err_msgs,
+            "rate_limited_pool",
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                "All credentials are temporarily cooling down. Please retry after the indicated delay.",
+                None,
+            ),
+        );
+        let retry_after = Some(secs)
+            .or(cfg_ra)
+            .unwrap_or(UPSTREAM_RATE_LIMIT_RETRY_AFTER_SECS)
+            .clamp(1, 300);
         tracing::warn!(
             retry_after_secs = retry_after,
             "全池冷却，返回 429 + Retry-After 让客户端退避"
         );
         return (
-            StatusCode::TOO_MANY_REQUESTS,
+            status,
             [(header::RETRY_AFTER, retry_after.to_string())],
-            Json(ErrorResponse::new(
-                "rate_limit_error",
-                "All credentials are temporarily cooling down. Please retry after the indicated delay.",
-            )),
+            Json(ErrorResponse::new(error_type, message)),
         )
             .into_response();
     }
@@ -1622,13 +2319,22 @@ fn map_provider_error(err: Error) -> Response {
     //
     // 用显式标记而非中文文案匹配：文案改动不该让分类失效（这正是"所有凭据均已禁用"落 502 的成因）。
     if err_str.contains("model_unsupported_by_pool=1") {
-        tracing::warn!(error = %err, "请求的模型不被本号池支持（永久，重试无效），返回 404");
-        return (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse::new(
+        // ⚠️ 永久态：配置的 retry_afterSecs 刻意**忽略**（带了等于宣称「等一会儿会好」，
+        // 诱导客户端每 5 分钟重试直到永远 —— 见下方注释的 404 语义）。
+        let (status, error_type, message, _) = resolve_msg(
+            &err_msgs,
+            "model_unsupported",
+            (
+                StatusCode::NOT_FOUND,
                 "not_found_error",
                 "请求的模型不被当前号池支持（所有凭据的订阅档位或成本白名单均不含该模型）。这不是临时故障，重试无效：请换用号池支持的模型，或为凭据开通/放开该模型。",
-            )),
+                None,
+            ),
+        );
+        tracing::warn!(error = %err, "请求的模型不被本号池支持（永久，重试无效），返回 404");
+        return (
+            status,
+            Json(ErrorResponse::new(error_type, message)),
         )
             .into_response();
     }
@@ -1649,22 +2355,44 @@ fn map_provider_error(err: Error) -> Response {
     // 判据只匹配**速率**类，绝不吞配额类：MONTHLY_REQUEST_COUNT / QUOTA 是不可重试的月度
     // 配额耗尽（要等下个计费周期），由下方 translate_quota_subscription 处理成不带
     // Retry-After 的 429 —— 给配额耗尽发退避秒数会让客户端做无意义的短退避反复砸死号。
-    if is_upstream_rate_limited(&err_str) {
+    //
+    // 第二路判据 `upstream_retry_after=`（S2/S3）：provider 把上游显式 Retry-After 打进
+    // 错误串的**网关自己的** marker。它只可能出现在两类串上 —— ① 上游 429（速率类，
+    // 配额类被 provider 的 monthly-limit 分支先接走）；② S3 把最早 429 的 RA 并入的
+    // generic 终态（5xx/传输层，见 provider 的 assemble_final_error，限定集已排除
+    // 永久态/配额/背压）。故本路判据不破坏「只匹配速率类」的既有契约；配额字样的串
+    // 即使出现 marker 也显式排除（双保险，防未来 provider 侧守卫被放宽后静默破坏 H2）。
+    if is_upstream_rate_limited(&err_str)
+        || (err_str.contains(UPSTREAM_RETRY_AFTER_MARKER_PREFIX)
+            && !crate::kiro::endpoint::default_is_monthly_request_limit(&err_str))
+    {
+        let (status, error_type, message, cfg_ra) = resolve_msg(
+            &err_msgs,
+            "rate_limited_credential",
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                "上游账户级速率限流（请求过于密集）。这是可重试的临时状态，请按 Retry-After 退避后重试。若持续出现：①降低客户端并发；②为号池补充更多凭据分摊速率；③面板『限流健康』确认是否单号承载了全部流量。",
+                None,
+            ),
+        );
+        // Retry-After 决议链：上游显式真值（`upstream_retry_after=N`）> 配置 > 固定 8s。
+        // ⭐ S2：上游明说「30s 后恢复」时客户端就该等 30s —— 此前 A7 恒 8s（上游 RA
+        // 只进凭据冷却、不进客户端响应），客户端 8s 就重打，白打一轮又被冷却。
+        // clamp 1-300：防上游给超大值（resets_at 到月底等）让客户端直接放弃重试。
+        let retry_after = parse_upstream_retry_after(&err_str)
+            .or(cfg_ra)
+            .unwrap_or(UPSTREAM_RATE_LIMIT_RETRY_AFTER_SECS)
+            .clamp(1, 300);
         tracing::warn!(
             error = %err,
-            retry_after_secs = UPSTREAM_RATE_LIMIT_RETRY_AFTER_SECS,
+            retry_after_secs = retry_after,
             "上游账户级速率限流，返回 429 + Retry-After 让客户端退避（旧代码此处返 502 致客户端不退避）"
         );
         return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(
-                header::RETRY_AFTER,
-                UPSTREAM_RATE_LIMIT_RETRY_AFTER_SECS.to_string(),
-            )],
-            Json(ErrorResponse::new(
-                "rate_limit_error",
-                "上游账户级速率限流（请求过于密集）。这是可重试的临时状态，请按 Retry-After 退避后重试。若持续出现：①降低客户端并发；②为号池补充更多凭据分摊速率；③面板『限流健康』确认是否单号承载了全部流量。",
-            )),
+            status,
+            [(header::RETRY_AFTER, retry_after.to_string())],
+            Json(ErrorResponse::new(error_type, message)),
         )
             .into_response();
     }
@@ -1679,21 +2407,28 @@ fn map_provider_error(err: Error) -> Response {
     // 会用 `QUOTA` 之类的宽判据先行命中一部分 403 文案，而配额类是**不可重试**的
     // （不带 Retry-After）。临时风控必须拿到 Retry-After，故先判。
     if is_upstream_temporarily_suspended(&err_str) {
+        let (status, error_type, message, cfg_ra) = resolve_msg(
+            &err_msgs,
+            "account_throttled",
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                "上游账户级临时风控（账号被暂时限制，非永久封禁）。这是可恢复的限时状态，请按 Retry-After 退避后重试。若持续出现：①降低并发与请求密度；②为号池补充更多凭据分摊风控压力；③面板『限流健康』查看是否单号承载了全部流量。",
+                None,
+            ),
+        );
+        let retry_after = cfg_ra
+            .unwrap_or(UPSTREAM_SUSPENDED_RETRY_AFTER_SECS)
+            .clamp(1, 300);
         tracing::warn!(
             error = %err,
-            retry_after_secs = UPSTREAM_SUSPENDED_RETRY_AFTER_SECS,
+            retry_after_secs = retry_after,
             "上游账户级临时风控（403 temporarily suspended），返回 429 + Retry-After（旧代码落 502 兜底致客户端不退避）"
         );
         return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(
-                header::RETRY_AFTER,
-                UPSTREAM_SUSPENDED_RETRY_AFTER_SECS.to_string(),
-            )],
-            Json(ErrorResponse::new(
-                "rate_limit_error",
-                "上游账户级临时风控（账号被暂时限制，非永久封禁）。这是可恢复的限时状态，请按 Retry-After 退避后重试。若持续出现：①降低并发与请求密度；②为号池补充更多凭据分摊风控压力；③面板『限流健康』查看是否单号承载了全部流量。",
-            )),
+            status,
+            [(header::RETRY_AFTER, retry_after.to_string())],
+            Json(ErrorResponse::new(error_type, message)),
         )
             .into_response();
     }
@@ -1714,18 +2449,29 @@ fn map_provider_error(err: Error) -> Response {
     // 在 `translate_upstream_error` **之前**（该链的 `Invalid token` / `subscription`
     // 宽判据将来若被放宽，会先行吞掉这条并给出「刷新 Token」的错误排障动作）。
     if is_upstream_region_mismatch_403(&err_str) {
+        // ⚠️ 永久配置错误态：配置的 retry_afterSecs 刻意**忽略**（重试不会改变 region
+        // 错配，给了等于宣称「等一会儿会好」，把需要人工介入的配置错误变成无限退避重试）。
+        // M2 语义错位修复（对抗审查）：region 错配用独立 key `region_mismatch`，
+        // 不再占用 `permission_denied`——后者留给 D2 IP 黑名单（本地安全过滤）。
+        let (status, error_type, message, _) = resolve_msg(
+            &err_msgs,
+            "region_mismatch",
+            (
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                "上游拒绝该凭据的授权（bearer token 对目标 region 无效）。这不是服务端故障，重试无效：\
+                 `ksk_` 类 token 按 region 授权，打错 region 恒被拒。排障：①面板查看该凭据的 region 是否与签发 region 一致；\
+                 ②对该凭据手动改 region（或等网关 region 探测自动重选）；③若整池同区，确认推号来源给的 region 正确。",
+                None,
+            ),
+        );
         tracing::warn!(
             error = %err,
             "上游 403 region 错配（bearer token invalid），返回 403 permission_error（旧代码落 502 兜底致上游/外挂按 5xx 盲退避）"
         );
         return (
-            StatusCode::FORBIDDEN,
-            Json(ErrorResponse::new(
-                "permission_error",
-                "上游拒绝该凭据的授权（bearer token 对目标 region 无效）。这不是服务端故障，重试无效：\
-                 `ksk_` 类 token 按 region 授权，打错 region 恒被拒。排障：①面板查看该凭据的 region 是否与签发 region 一致；\
-                 ②对该凭据手动改 region（或等网关 region 探测自动重选）；③若整池同区，确认推号来源给的 region 正确。",
-            )),
+            status,
+            Json(ErrorResponse::new(error_type, message)),
         )
             .into_response();
     }
@@ -1738,6 +2484,15 @@ fn map_provider_error(err: Error) -> Response {
             resp.headers_mut().insert(
                 axum::http::HeaderName::from_static("x-kirostudio-compress-retry"),
                 axum::http::HeaderValue::from_static("1"),
+            );
+        }
+        // 配置表允许的可重试分支（容量 503 默认 3s、配额类可选）挂 Retry-After 头；
+        // None（永久态/请求错误分支）不挂，与现状一致。
+        if let Some(ra) = t.retry_after_override {
+            let ra = ra.clamp(1, 300);
+            resp.headers_mut().insert(
+                header::RETRY_AFTER,
+                ra.to_string().parse().expect("u64 to_string 恒为合法 HeaderValue"),
             );
         }
         return resp;
@@ -1760,22 +2515,29 @@ fn map_provider_error(err: Error) -> Response {
     // 位置必须在兜底**之前**、在上面所有已识别分支**之后**：它只捡剩下的 5xx。
     if is_upstream_transient_5xx(&err_str) {
         const UPSTREAM_5XX_RETRY_AFTER_SECS: u64 = 3;
-        tracing::warn!(
-            error = %err,
-            retry_after_secs = UPSTREAM_5XX_RETRY_AFTER_SECS,
-            "上游 5xx/传输层瞬态错误，返回 503 + Retry-After（旧代码落 502 无 Retry-After 致客户端不退避）"
-        );
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [(
-                header::RETRY_AFTER,
-                UPSTREAM_5XX_RETRY_AFTER_SECS.to_string(),
-            )],
-            Json(ErrorResponse::new(
+        let (status, error_type, message, cfg_ra) = resolve_msg(
+            &err_msgs,
+            "upstream_5xx",
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
                 "api_error",
                 "上游服务暂时不可用（5xx 或连接失败），这是可重试的瞬态错误。\
                  请按 Retry-After 退避后重试；若持续出现，请查看网关日志。",
-            )),
+                None,
+            ),
+        );
+        let retry_after = cfg_ra
+            .unwrap_or(UPSTREAM_5XX_RETRY_AFTER_SECS)
+            .clamp(1, 300);
+        tracing::warn!(
+            error = %err,
+            retry_after_secs = retry_after,
+            "上游 5xx/传输层瞬态错误，返回 503 + Retry-After（旧代码落 502 无 Retry-After 致客户端不退避）"
+        );
+        return (
+            status,
+            [(header::RETRY_AFTER, retry_after.to_string())],
+            Json(ErrorResponse::new(error_type, message)),
         )
             .into_response();
     }
@@ -1787,12 +2549,19 @@ fn map_provider_error(err: Error) -> Response {
         "Kiro API 调用失败（未识别，原文仅进日志不回客户端）: {}",
         err
     );
-    (
-        StatusCode::BAD_GATEWAY,
-        Json(ErrorResponse::new(
+    let (status, error_type, message, _) = resolve_msg(
+        &err_msgs,
+        "unrecognized_upstream",
+        (
+            StatusCode::BAD_GATEWAY,
             "api_error",
             "上游 API 调用失败（未识别错误）。请查看网关日志获取详情。",
-        )),
+            None,
+        ),
+    );
+    (
+        status,
+        Json(ErrorResponse::new(error_type, message)),
     )
         .into_response()
 }
@@ -1871,14 +2640,27 @@ async fn try_inbound_admission_gate(
         record.session_id = Some("admission-timeout".to_string());
         client.apply(&mut record);
         crate::usage::emit_record(record);
-        tracing::warn!(retry_after_secs = ra, "入站准入排队超时（网关背压），返回 429 + Retry-After");
-        return Some((
-            StatusCode::TOO_MANY_REQUESTS,
-            [(header::RETRY_AFTER, ra.to_string())],
-            Json(ErrorResponse::new("rate_limit_error",
+        // 错误消息配置表（key `gate_timeout`，与 map_provider_error 的
+        // inbound_admission_timeout 分支同 key：同一错误形态的两个渲染点）。
+        // 状态码/type/message 可配；Retry-After 用真值（配置值不适用——本分支的
+        // 退避秒数由闸门队列超时算出，比配置任何常数都准）。
+        let (status, error_type, message, _cfg_ra) = resolve_msg(
+            &current_error_messages(),
+            "gate_timeout",
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
                 "Gateway inbound rate shaping is at capacity. \
                  This is gateway-side backpressure, not an upstream cooldown; \
-                 retrying immediately will not help.")),
+                 retrying immediately will not help.",
+                None,
+            ),
+        );
+        tracing::warn!(retry_after_secs = ra, "入站准入排队超时（网关背压），返回 429 + Retry-After");
+        return Some((
+            status,
+            [(header::RETRY_AFTER, ra.to_string())],
+            Json(ErrorResponse::new(error_type, message)),
         ).into_response());
     }
     None
@@ -1899,12 +2681,20 @@ pub async fn post_messages(
     let mut payload: MessagesRequest = match serde_json::from_slice(&raw_body) {
         Ok(p) => p,
         Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(
+            // 配置 message 只覆盖「前缀」，动态详情（{e}）恒保留（排障必需）。
+            let (status, error_type, message, _) = resolve_msg(
+                &current_error_messages(),
+                "request_parse_failed",
+                (
+                    StatusCode::BAD_REQUEST,
                     "invalid_request_error",
-                    format!("请求体解析失败: {e}"),
-                )),
+                    "请求体解析失败",
+                    None,
+                ),
+            );
+            return (
+                status,
+                Json(ErrorResponse::new(error_type, format!("{message}: {e}"))),
             )
                 .into_response();
         }
@@ -1924,20 +2714,10 @@ pub async fn post_messages(
 
     // 从入站请求头 + TCP 对端地址识别来源画像（设备/IP/OS/浏览器，用于「最近请求」展示）
     let client = ClientInfo::from_headers_with_peer(&headers, Some(peer));
-    // 检查 KiroProvider 是否可用
+    // 检查 KiroProvider 是否可用（未配置渲染双入口共享，key `provider_not_configured`）。
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
-        None => {
-            tracing::error!("KiroProvider 未配置");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse::new(
-                    "service_unavailable",
-                    "Kiro API provider not configured",
-                )),
-            )
-                .into_response();
-        }
+        None => return render_provider_not_configured(),
     };
 
     // 混入池分流:选一次号,若命中自定义 API 凭据 → 原样透传原始请求体到其上游、直接返回。
@@ -1961,6 +2741,14 @@ pub async fn post_messages(
     // （透传 failover → websearch 回灌轮 → 压缩重试轮 → Kiro 主路径 failover → MCP），
     // 无论嵌套多少层，一次客户端请求打上游的总次数恒 ≤ ABSOLUTE_MAX_TOTAL_RETRIES。
     let retry_budget = crate::kiro::provider::SharedRetryBudget::new();
+
+    // 🔴 max_tokens 本地上限校验（2026-08-15 线上 smoke test 发现）：超出上游上限的
+    // max_tokens 此前被误判为瞬态错误吞进 failover+absorb（30s 延迟 + 503 误判，
+    // 客户端等预算耗尽）。校验放在**透传尝试之前**。上限对齐上游实测
+    // （fuckopencode/deepseek 均 393216）。双入口（/v1 与 /cc/v1）同检查。
+    if let Some(resp) = check_max_tokens_limit(payload.max_tokens) {
+        return resp;
+    }
 
     let passthrough_result = if provider.token_manager().should_try_custom_api_first() {
         provider
@@ -1994,6 +2782,10 @@ pub async fn post_messages(
         record.requested_model = meta.model.clone();
         record.upstream_model = meta.mapped_model.clone();
         record.credential_id = Some(meta.credential_id);
+        // 首选号（N4）：透传 failover 链最先尝试的号（None = 首跳即成功/无换号）。
+        // 与 credential_id（最终服务号）成对后，面板能看出「死号恒选」——首选号恒为
+        // 某号而最终号恒为另一号时，说明该号每次都被换掉，需要处理其上游。
+        record.first_attempted_credential_id = meta.first_attempted_credential_id;
         record.session_id = meta.session_id.clone();
         record.is_streaming = payload.stream;
         record.input_tokens = input_tokens;
@@ -2013,33 +2805,8 @@ pub async fn post_messages(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
-    // 检查是否应本地处理 WebSearch 请求（tool_choice 强制 / 纯 web_search 单工具 / Claude Code 前缀）
-    if websearch::should_handle_websearch_request(&payload) {
-        tracing::info!("检测到 WebSearch 请求，路由到本地 WebSearch 处理");
-
-        // 估算输入 tokens（只读计数，传引用避免深拷贝整个对话历史）
-        let input_tokens = token::count_all_tokens(
-            &payload.model,
-            payload.system.as_deref(),
-            &payload.messages,
-            payload.tools.as_deref(),
-        ) as i32;
-
-        return websearch::handle_websearch_request(provider, &payload, input_tokens, &retry_budget).await;
-    }
-
-    // 混合工具场景：请求带 web_search 但未显式触发搜索，剔除 web_search 后走常规转发，
-    // 避免把 web_search 原样下发给 Kiro 触发 400 Improperly formed request。
-    // 🔴 2026-08-09：混合工具场景**不再剔除** web_search。
-    //
-    // 改前剔除 ⇒ 上游模型完全看不到搜索工具 ⇒ Claude Code 的 WebSearch 在
-    // "web_search + 其他工具"（CC 常态）下**静默失效**。现在交给 converter 把它
-    // 归一化成 Kiro 认的函数工具形态（converter.rs 的 convert_tools + 内置
-    // web_search schema），模型能看到、能调用，回 tool_use 时由**网关内部消化**：
-    // 上游回 web_search tool_use 且本轮无其他工具 → agentic 回灌（内部调 MCP、
-    // 结果回灌重发，最多 5 轮）；一旦混入非 web_search 工具 → 整轮原样回客户端。
-    // 纯 web_search 与显式触发仍走上面的本地 MCP 快路径，不受影响。
-    if let Some(resp) = dispatch_web_search_loop(&provider, &payload, &retry_budget, &client).await {
+    // WebSearch 本地处理（快路径 + agentic 回灌循环）双入口共享：返回 Some 即最终响应。
+    if let Some(resp) = dispatch_websearch_paths(&provider, &payload, &retry_budget, &client).await {
         return resp;
     }
 
@@ -2047,20 +2814,11 @@ pub async fn post_messages(
     let conversion_result = match convert_request(&payload) {
         Ok(result) => result,
         Err(e) => {
-            let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
-                }
-                ConversionError::UnsupportedToolMapping { tool_name, reason } => {
-                    ("invalid_request_error", format!("工具参数无法映射: {} — {}", tool_name, reason))
-                }
-            };
+            // 错误渲染双入口共享（三种形态各读各的 key）。
+            let (status, error_type, message) = render_conversion_error(&e);
             tracing::warn!("请求转换失败: {}", e);
             return (
-                StatusCode::BAD_REQUEST,
+                status,
                 Json(ErrorResponse::new(error_type, message)),
             )
                 .into_response();
@@ -2082,14 +2840,8 @@ pub async fn post_messages(
             Ok(body) => body,
             Err(e) => {
                 tracing::error!("序列化请求失败: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse::new(
-                        "internal_error",
-                        format!("序列化请求失败: {}", e),
-                    )),
-                )
-                    .into_response();
+                // 渲染双入口共享（request_serialization_failed：双入口读同一配置）。
+                return render_serialization_failed(&e);
             }
         };
 
@@ -2155,10 +2907,8 @@ pub async fn post_messages(
                 Ok(b) => b,
                 Err(e) => {
                     tracing::error!("压缩重试时序列化请求失败: {}", e);
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ErrorResponse::new("internal_error", format!("序列化请求失败: {}", e))),
-                    ).into_response();
+                    // 渲染双入口共享（request_serialization_failed：压缩重试轮同配置）。
+                    return render_serialization_failed(&e);
                 }
             };
             tracing::info!(
@@ -2173,48 +2923,57 @@ pub async fn post_messages(
         let response = if payload.stream {
             if cc_auto_buffer_enabled() && is_claude_code_request(&headers) {
                 tracing::debug!("识别到 Claude Code 请求，/v1 流式自动切换为 buffered 分发");
-                handle_stream_request_buffered(
+                dispatch_kiro_attempt(
                     provider.clone(),
                     body_ref,
-                    &payload.model,
+                    &payload,
                     input_tokens,
                     thinking_enabled,
                     tool_name_map.clone(),
                     known_tool_names.clone(),
                     tool_required_fields.clone(),
                     cache_breakdown.clone(),
+                    fingerprint_usage,
                     &retry_budget,
                     client.clone(),
-                ).await
+                    true,
+                )
+                .await
             } else {
-                handle_stream_request(
+                dispatch_kiro_attempt(
                     provider.clone(),
                     body_ref,
-                    &payload.model,
+                    &payload,
                     input_tokens,
                     thinking_enabled,
                     tool_name_map.clone(),
                     known_tool_names.clone(),
                     tool_required_fields.clone(),
                     cache_breakdown.clone(),
+                    fingerprint_usage,
                     &retry_budget,
                     client.clone(),
-                ).await
+                    false,
+                )
+                .await
             }
         } else {
-            let extract_thinking = extract_thinking_enabled() && thinking_enabled;
-            handle_non_stream_request(
+            dispatch_kiro_attempt(
                 provider.clone(),
                 body_ref,
-                &payload.model,
+                &payload,
                 input_tokens,
-                extract_thinking,
+                thinking_enabled,
                 tool_name_map.clone(),
+                known_tool_names.clone(),
+                tool_required_fields.clone(),
                 cache_breakdown.clone(),
                 fingerprint_usage,
                 &retry_budget,
                 client.clone(),
-            ).await
+                false,
+            )
+            .await
         };
 
         // 检查是否为可压缩重试的错误（CONTENT_LENGTH_EXCEEDS / Input too long）
@@ -2256,7 +3015,7 @@ async fn handle_stream_request(
     // 1M 变体:据原始模型名判定是否注入 anthropic-beta 头(仅受支持的 [1m] 变体为 true)。
     let is_1m = crate::anthropic::model_catalog::resolve_is_1m(model);
     // 调用 Kiro API（支持多凭据故障转移）
-    let (response, meta) = match provider.call_api_stream(request_body, is_1m, budget).await {
+    let (response, meta) = match provider.call_api_stream(request_body, is_1m, budget, Some(model)).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -2356,24 +3115,65 @@ fn create_ping_sse() -> Bytes {
     Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
 }
 
+/// 空响应的错误形态（类型 + 文案 + 可选 Retry-After），流式 SSE error 与非流式 HTTP 错误共用。
+///
+/// - 大输入（疑似上下文过大）：`invalid_request_error`，提示压缩上下文，
+///   不鼓励原样重试（重试还是同样的大请求，仍会空）。不产出 Retry-After
+///   （400 请求错误带退避秒数会让客户端反复重发同一个必败的大请求）。
+/// - 小输入（疑似偶发）：`overloaded_error`，客户端可重试。**D10 矛盾修复**（设计 §五 2）：
+///   现状 429 不带 Retry-After（客户端只能瞎重试），补默认 3s；配置的
+///   `retryAfterSecs`（key `empty_response`）可覆盖。
+///
+/// M3 共享 key 拆分（对抗审查）：D9 与 D10 是两个**不同语义**的 key——
+/// D9（大输入 400，重试无效）用 `empty_response_large_input`，D10（小输入 429，
+/// 可重试）用 `empty_response`。status 恒按判据 400/429（`oversized_context`
+/// 判据承重，**不读配置**——一个 key 无法同时表达两个形态的 status，
+/// 配置校验层同样约束）；type/message 各自可配。
+/// D10 的 Retry-After 由调用方据第三元决定是否挂头。
+/// D10 空响应 429 的默认退避秒数（设计 §五 2 修复：现状无 Retry-After）。
+/// 取值与 A11 的 5xx 退避（3s）同档：「稍后重试」级瞬态。
+const EMPTY_RESPONSE_RETRY_AFTER_SECS: u64 = 3;
+fn empty_response_error_shape(oversized_context: bool) -> (String, String, Option<u64>) {
+    let (err_type, message, cfg_ra) = if oversized_context {
+        // D9：大输入（疑似上下文过大），重试原请求无意义 → 永不带 Retry-After
+        // （配置的 retryAfterSecs 刻意忽略，与 B9/B10 永久态同策略）。
+        let (_, t, m, _) = resolve_msg(
+            &current_error_messages(),
+            "empty_response_large_input",
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "上游返回了空响应，疑似上下文已接近窗口上限。请精简对话历史（如 /compact）、\
+                 缩短 system prompt 或减少工具数量后重试。",
+                None,
+            ),
+        );
+        (t, m, None)
+    } else {
+        // D10：小输入（疑似偶发），可重试 → 配置 RA 或默认 3s。
+        let (_, t, m, cfg_ra) = resolve_msg(
+            &current_error_messages(),
+            "empty_response",
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "overloaded_error",
+                "上游返回了空响应，请重试。",
+                Some(EMPTY_RESPONSE_RETRY_AFTER_SECS),
+            ),
+        );
+        let ra = cfg_ra.map(|ra| ra.clamp(1, 300));
+        (t, m, ra)
+    };
+    (err_type, message, cfg_ra)
+}
+
 /// 为上游空响应构造合适的 SSE error 事件。
 ///
 /// - 大输入（疑似上下文过大）：返回 invalid_request_error，提示压缩上下文，
 ///   不鼓励原样重试（重试还是同样的大请求，仍会空）。
 /// - 小输入（疑似偶发）：返回 overloaded_error，客户端可重试。
 fn empty_response_error_event(oversized_context: bool) -> SseEvent {
-    let (err_type, message) = if oversized_context {
-        (
-            "invalid_request_error",
-            "上游返回了空响应，疑似上下文已接近窗口上限。请精简对话历史（如 /compact）、\
-             缩短 system prompt 或减少工具数量后重试。",
-        )
-    } else {
-        (
-            "overloaded_error",
-            "上游返回了空响应，请重试。",
-        )
-    };
+    let (err_type, message, _retry_after) = empty_response_error_shape(oversized_context);
     SseEvent::new(
         "error",
         serde_json::json!({
@@ -2730,6 +3530,22 @@ fn resolve_cache_chain(
     (Some(usage), true)
 }
 
+/// 非流式收尾的 content 是否「只有 thinking 块、无 text/tool_use 等正文内容」。
+///
+/// 对应流式 `SseStateManager::has_non_thinking_blocks() == false` 的口径：内容
+/// 数组里除 thinking 外没有任何块。任何其它类型（text / tool_use / server_tool_use /
+/// web_search_tool_result / 未知类型）都视为「有正文内容」。
+fn content_is_thinking_only(content: &[serde_json::Value]) -> bool {
+    let mut has_thinking = false;
+    for block in content {
+        match block.get("type").and_then(|v| v.as_str()) {
+            Some("thinking") => has_thinking = true,
+            _ => return false,
+        }
+    }
+    has_thinking
+}
+
 /// 处理非流式请求
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
@@ -2746,7 +3562,7 @@ async fn handle_non_stream_request(
     // 1M 变体:据原始模型名判定是否注入 anthropic-beta 头(仅受支持的 [1m] 变体为 true)。
     let is_1m = crate::anthropic::model_catalog::resolve_is_1m(model);
     // 调用 Kiro API（支持多凭据故障转移）
-    let (response, meta) = match provider.call_api(request_body, is_1m, budget).await {
+    let (response, meta) = match provider.call_api(request_body, is_1m, budget, Some(model)).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -2756,12 +3572,19 @@ async fn handle_non_stream_request(
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::error!("读取响应体失败: {}", e);
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse::new(
+            let (status, error_type, message, _) = resolve_msg(
+                &current_error_messages(),
+                "response_read_failed",
+                (
+                    StatusCode::BAD_GATEWAY,
                     "api_error",
-                    format!("读取响应失败: {}", e),
-                )),
+                    "读取响应失败",
+                    None,
+                ),
+            );
+            return (
+                status,
+                Json(ErrorResponse::new(error_type, format!("{message}: {e}"))),
             )
                 .into_response();
         }
@@ -3159,6 +3982,15 @@ async fn handle_non_stream_request(
 
     content.extend(tool_uses);
 
+    // 与流式 generate_final_events 的 thinking-only 兜底（stream.rs:3926）对齐：
+    // thinking 开启、content 只有 thinking 块（无 text/tool_use）时，模型把预算
+    // 全花在思考上 —— 补一个空格 text 块并置 stop_reason=max_tokens，否则客户端
+    // 拿到「只有 thinking 无正文」的响应，Claude Code 会视作空回答。
+    if thinking_enabled && content_is_thinking_only(&content) {
+        stop_reason = "max_tokens".to_string();
+        content.push(json!({"type": "text", "text": " "}));
+    }
+
     // 估算输出 tokens
     let output_tokens = token::estimate_output_tokens(&content);
 
@@ -3206,6 +4038,40 @@ async fn handle_non_stream_request(
         }
         client.apply(&mut record);
         crate::usage::emit_record(record);
+    }
+
+    // 非流式空响应兜底（与流式 create_sse_stream / buffered 路径的 is_empty_response
+    // 补发 error 同构）：正常完成但收尾兜底后 content 仍空（thinking/text/tool_use 全无）
+    // 时，返回显式错误而非 200 `content: []` —— 客户端把空 content 当 end_turn 正常
+    // 结束继续对话，agentic 循环会反复卡住。大输入 → 400 invalid_request_error
+    // 提示 /compact（重试还是同样的大请求）；偶发 → 429 overloaded_error 可重试。
+    // 判据与流式共用同一个函数（near_empty_response）：近空（output_tokens < 30 且
+    // 无工具调用）且输入超过「上下文过大」阈值时同样返回 400 —— 大上下文 + 上游只回
+    // 几个 token 的情形此前漏判（只判 content 完全空），200 当成功。阈值常量也共用
+    // empty_response_oversized_threshold，两条路径分界一致。
+    // 埋点已在上面完成（与流式同口径：completion 仍 Ok，记 Success + 空输出）。
+    if super::stream::near_empty_response(output_tokens, has_tool_use, final_input_tokens, model) {
+        let oversized = final_input_tokens
+            >= super::stream::empty_response_oversized_threshold(&model);
+        let (err_type, message, retry_after) = empty_response_error_shape(oversized);
+        let status = if oversized {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::TOO_MANY_REQUESTS
+        };
+        tracing::warn!(
+            oversized_context = oversized,
+            "上游返回空/近空响应（非流式收尾兜底后 content 仍空或仅数 token），返回显式错误替代 200 content:[]"
+        );
+        let mut resp = (status, Json(ErrorResponse::new(err_type, message))).into_response();
+        // D10（偶发小输入 429）补 Retry-After（默认 3s / 配置覆盖）；D9（大输入 400）不带。
+        if let Some(ra) = retry_after {
+            resp.headers_mut().insert(
+                header::RETRY_AFTER,
+                ra.to_string().parse().expect("u64 to_string 恒为合法 HeaderValue"),
+            );
+        }
+        return resp;
     }
 
     // 构建 usage（注入影子缓存记账字段，让 Claude Code 显示 cache hits）
@@ -3337,20 +4203,10 @@ pub async fn post_messages_cc(
     // 从入站请求头 + TCP 对端地址识别来源画像（设备/IP/OS/浏览器，用于「最近请求」展示）
     let client = ClientInfo::from_headers_with_peer(&headers, Some(peer));
 
-    // 检查 KiroProvider 是否可用
+    // 检查 KiroProvider 是否可用（未配置渲染双入口共享，key `provider_not_configured`）。
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
-        None => {
-            tracing::error!("KiroProvider 未配置");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse::new(
-                    "service_unavailable",
-                    "Kiro API provider not configured",
-                )),
-            )
-                .into_response();
-        }
+        None => return render_provider_not_configured(),
     };
 
     // 入站整形准入闸门（与 /v1 同闸）：2026-08-11 补。
@@ -3363,36 +4219,19 @@ pub async fn post_messages_cc(
     // 每客户端请求的共享上游预算（与 /v1 同款，2026-08-11 方案 A）。
     let retry_budget = crate::kiro::provider::SharedRetryBudget::new();
 
+    // 🔴 max_tokens 本地上限校验（2026-08-15 线上 smoke test 发现）：超出上游上限的
+    // max_tokens 此前被误判为瞬态错误吞进 failover+absorb（30s 延迟 + 503 误判，
+    // 客户端等预算耗尽）。校验放在**透传尝试之前**。上限对齐上游实测
+    // （fuckopencode/deepseek 均 393216）。双入口（/v1 与 /cc/v1）同检查。
+    if let Some(resp) = check_max_tokens_limit(payload.max_tokens) {
+        return resp;
+    }
+
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
-    // 检查是否应本地处理 WebSearch 请求（tool_choice 强制 / 纯 web_search 单工具 / Claude Code 前缀）
-    if websearch::should_handle_websearch_request(&payload) {
-        tracing::info!("检测到 WebSearch 请求，路由到本地 WebSearch 处理");
-
-        // 估算输入 tokens（只读计数，传引用避免深拷贝整个对话历史）
-        let input_tokens = token::count_all_tokens(
-            &payload.model,
-            payload.system.as_deref(),
-            &payload.messages,
-            payload.tools.as_deref(),
-        ) as i32;
-
-        return websearch::handle_websearch_request(provider, &payload, input_tokens, &retry_budget).await;
-    }
-
-    // 混合工具场景：请求带 web_search 但未显式触发搜索，剔除 web_search 后走常规转发，
-    // 避免把 web_search 原样下发给 Kiro 触发 400 Improperly formed request。
-    // 🔴 2026-08-09：混合工具场景**不再剔除** web_search。
-    //
-    // 改前剔除 ⇒ 上游模型完全看不到搜索工具 ⇒ Claude Code 的 WebSearch 在
-    // "web_search + 其他工具"（CC 常态）下**静默失效**。现在交给 converter 把它
-    // 归一化成 Kiro 认的函数工具形态（converter.rs 的 convert_tools + 内置
-    // web_search schema），模型能看到、能调用，回 tool_use 时由**网关内部消化**：
-    // 上游回 web_search tool_use 且本轮无其他工具 → agentic 回灌（内部调 MCP、
-    // 结果回灌重发，最多 5 轮）；一旦混入非 web_search 工具 → 整轮原样回客户端。
-    // 纯 web_search 与显式触发仍走上面的本地 MCP 快路径，不受影响。
-    if let Some(resp) = dispatch_web_search_loop(&provider, &payload, &retry_budget, &client).await {
+    // WebSearch 本地处理（快路径 + agentic 回灌循环）双入口共享：返回 Some 即最终响应。
+    if let Some(resp) = dispatch_websearch_paths(&provider, &payload, &retry_budget, &client).await {
         return resp;
     }
 
@@ -3400,20 +4239,11 @@ pub async fn post_messages_cc(
     let conversion_result = match convert_request(&payload) {
         Ok(result) => result,
         Err(e) => {
-            let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
-                }
-                ConversionError::UnsupportedToolMapping { tool_name, reason } => {
-                    ("invalid_request_error", format!("工具参数无法映射: {} — {}", tool_name, reason))
-                }
-            };
+            // 错误渲染双入口共享（三种形态各读各的 key）。
+            let (status, error_type, message) = render_conversion_error(&e);
             tracing::warn!("请求转换失败: {}", e);
             return (
-                StatusCode::BAD_REQUEST,
+                status,
                 Json(ErrorResponse::new(error_type, message)),
             )
                 .into_response();
@@ -3436,14 +4266,8 @@ pub async fn post_messages_cc(
             Ok(body) => body,
             Err(e) => {
                 tracing::error!("序列化请求失败: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse::new(
-                        "internal_error",
-                        format!("序列化请求失败: {}", e),
-                    )),
-                )
-                    .into_response();
+                // 渲染双入口共享（request_serialization_failed：双入口读同一配置）。
+                return render_serialization_failed(&e);
             }
         };
 
@@ -3507,10 +4331,8 @@ pub async fn post_messages_cc(
                 Ok(b) => b,
                 Err(e) => {
                     tracing::error!("压缩重试时序列化请求失败: {}", e);
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ErrorResponse::new("internal_error", format!("序列化请求失败: {}", e))),
-                    ).into_response();
+                    // 渲染双入口共享（request_serialization_failed：压缩重试轮同配置）。
+                    return render_serialization_failed(&e);
                 }
             };
             tracing::info!(
@@ -3541,51 +4363,56 @@ pub async fn post_messages_cc(
                 tracing::debug!(
                     "/cc/v1 流式分发: buffered（ccAutoBuffer=true；整轮只发 ping 直到上游流结束）"
                 );
-                handle_stream_request_buffered(
+                dispatch_kiro_attempt(
                     provider.clone(),
                     body_ref,
-                    &payload.model,
+                    &payload,
                     input_tokens,
                     thinking_enabled,
                     tool_name_map.clone(),
                     known_tool_names.clone(),
                     tool_required_fields.clone(),
                     cache_breakdown.clone(),
+                    fingerprint_usage,
                     &retry_budget,
                     client.clone(),
+                    true,
                 )
                 .await
             } else {
                 tracing::debug!("/cc/v1 流式分发: 真流式（ccAutoBuffer=false，内容边到边转发）");
-                handle_stream_request(
+                dispatch_kiro_attempt(
                     provider.clone(),
                     body_ref,
-                    &payload.model,
+                    &payload,
                     input_tokens,
                     thinking_enabled,
                     tool_name_map.clone(),
                     known_tool_names.clone(),
                     tool_required_fields.clone(),
                     cache_breakdown.clone(),
+                    fingerprint_usage,
                     &retry_budget,
                     client.clone(),
+                    false,
                 )
                 .await
             }
         } else {
-            // 非流式响应：仅在配置开启时提取 thinking 块
-            let extract_thinking = extract_thinking_enabled() && thinking_enabled;
-            handle_non_stream_request(
+            dispatch_kiro_attempt(
                 provider.clone(),
                 body_ref,
-                &payload.model,
+                &payload,
                 input_tokens,
-                extract_thinking,
+                thinking_enabled,
                 tool_name_map.clone(),
+                known_tool_names.clone(),
+                tool_required_fields.clone(),
                 cache_breakdown.clone(),
                 fingerprint_usage,
                 &retry_budget,
                 client.clone(),
+                false,
             )
             .await
         };
@@ -3633,7 +4460,7 @@ async fn handle_stream_request_buffered(
     // 1M 变体:据原始模型名判定是否注入 anthropic-beta 头(仅受支持的 [1m] 变体为 true)。
     let is_1m = crate::anthropic::model_catalog::resolve_is_1m(model);
     // 调用 Kiro API（支持多凭据故障转移）
-    let (response, meta) = match provider.call_api_stream(request_body, is_1m, budget).await {
+    let (response, meta) = match provider.call_api_stream(request_body, is_1m, budget, Some(model)).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -4397,8 +5224,11 @@ mod machine_code_blocklist_tests {
     }
 }
 
+/// `pub(crate)`：websearch.rs 的 f3 测试也改 ERROR_MESSAGES 全局镜像（跨模块共享，
+/// 2026-08-15 并发审计），必须能取到本 mod 的锁——mod 私有会让外部访问
+/// `handlers::error_translation_tests::ERROR_MESSAGES_TEST_LOCK` 报 module is private。
 #[cfg(test)]
-mod error_translation_tests {
+pub(crate) mod error_translation_tests {
     //! 错误翻译层：已确证含义的上游错误 → 带排障步骤的可读错误；未知错误诚实透传（None）。
     use super::*;
 
@@ -4548,6 +5378,99 @@ mod error_translation_tests {
             assert!(
                 !is_upstream_transient_5xx(s),
                 "4xx 不得被当成可重试的 5xx（响应体里含 500 之类的数字很常见）: {s}"
+            );
+        }
+    }
+
+    /// ⭐ 524（Cloudflare 边缘网关超时）必须识别为瞬态 5xx：换号全灭后终态落
+    /// 503 + Retry-After，而不是 502 兜底（客户端不退避、原样重发）。
+    #[test]
+    fn upstream_524_is_recognized_as_transient_5xx() {
+        for err_str in [
+            // Cloudflare 错误页形态：状态行只有裸 "524"，正文 HTML 含 "A timeout occurred"。
+            r#"流式 API 请求失败: 524 <html><title>Error 524</title><body>A timeout occurred</body></html>"#,
+            // 完整 reason phrase 形态（部分网关自定义 reason 为 "Gateway Timeout"）。
+            r#"非流式 API 请求失败: 524 Gateway Timeout {"message":"x"}"#,
+            // 仅连续 reason phrase 形态（无 `: 524` 状态行前缀）：必须命中第二判据。
+            r#"上游返回 524 a timeout occurred"#,
+        ] {
+            assert!(
+                is_upstream_transient_5xx(err_str),
+                "524 必须识别为瞬态 5xx: {err_str}"
+            );
+            let resp = map_provider_error(anyhow::Error::msg(err_str.to_string()));
+            assert_eq!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "524 终态必须映射成 503（旧代码落兜底 502 无 Retry-After）: {err_str}"
+            );
+            assert!(
+                resp.headers().get(header::RETRY_AFTER).is_some(),
+                "524 必须带 Retry-After，否则客户端不退避: {err_str}"
+            );
+        }
+    }
+
+    /// 普通 body 里含数字 "524"（如 token 数 / 请求计数）不得被误判成瞬态 5xx。
+    #[test]
+    fn plain_524_number_in_body_is_not_mistaken_for_5xx() {
+        for s in [
+            r#"400 Bad Request {"message":"context length 524 exceeds the limit"}"#,
+            r#"403 Forbidden {"message":"quota exceeded, 524 requests used"}"#,
+        ] {
+            assert!(
+                !is_upstream_transient_5xx(s),
+                "含 524 数字的 4xx 不得被当成可重试的 5xx: {s}"
+            );
+        }
+    }
+
+    /// 🔴 对抗审查反例（MINOR-5，2026-08-15）：524 数字 + timeout/gateway 干扰词的
+    /// 4xx body 不得被误判成瞬态 5xx —— 旧宽组合判据「contains(524) && (timeout ||
+    /// gateway)」会命中下面两条（如 Cloudflare 限流页 "gateway abuse detected, 524
+    /// requests blocked"），客户端对永久错误无限退避重试。
+    #[test]
+    fn gateway_interference_words_with_524_are_not_5xx() {
+        for s in [
+            r#"403 Forbidden {"message":"gateway abuse detected, 524 requests blocked"}"#,
+            r#"400 Bad Request {"message":"524 tokens too long for this request, timeout after 30s"}"#,
+        ] {
+            assert!(
+                !is_upstream_transient_5xx(s),
+                "524 数字 + gateway/timeout 干扰词的 4xx 不得被当成可重试的 5xx: {s}"
+            );
+            let resp = map_provider_error(anyhow::Error::msg(s.to_string()));
+            assert_ne!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "干扰词 4xx 不得落 503（Retry-After 诱导退避）: {s}"
+            );
+        }
+    }
+
+    /// 🔴 裸 524 状态行形态（MINOR-5 补判据，2026-08-15）：错误串含 `: 524`
+    /// （provider 组装的「{api_type} API 请求失败: {status}」状态行）即命中，
+    /// 不依赖正文里的 timeout/gateway 特征词 —— 换号全灭后终态仍落 503 + Retry-After。
+    #[test]
+    fn bare_524_status_line_is_recognized_as_transient_5xx() {
+        for err_str in [
+            "流式 API 请求失败: 524",
+            r#"流式 API 请求失败: 524 <html><title>Error 524</title></html>"#,
+            r#"非流式 API 请求失败: 524 Gateway Timeout {"message":"x"}"#,
+        ] {
+            assert!(
+                is_upstream_transient_5xx(err_str),
+                "裸 524 状态行必须识别为瞬态 5xx: {err_str}"
+            );
+            let resp = map_provider_error(anyhow::Error::msg(err_str.to_string()));
+            assert_eq!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "524 状态行终态必须映射成 503: {err_str}"
+            );
+            assert!(
+                resp.headers().get(header::RETRY_AFTER).is_some(),
+                "524 状态行必须带 Retry-After: {err_str}"
             );
         }
     }
@@ -5201,6 +6124,73 @@ mod error_translation_tests {
         );
     }
 
+    /// 🔴 **跨系统契约守卫**：shield（kiro_shield.py，仓外）的 `COOLING_MARKERS` 只有
+    /// **3 个英文判据串**（2026-08-15 线上实读核对，`ssh skiapi 'grep -A12
+    /// COOLING_MARKERS /opt/skiapi/services/kiro_shield.py'`）：
+    ///   · `temporarily cooling down`
+    ///   · `All credentials are temporarily`
+    ///   · `inbound rate shaping`
+    /// 它们与我们的响应文案是硬契约 —— shield 的 `classify()` **按 body 文案分类
+    /// 而非状态码**，且只有 `verdict ∈ {cool,auth}` 才读我们的 `Retry-After`：
+    /// ```text
+    /// if verdict in ("cool","auth"): delay = cool_delay(attempt, Retry-After)   # 听真值
+    /// else:                          delay = swap_delay(attempt)                # 本地阶梯
+    /// ```
+    /// 判据词被替换 ⇒ 落 `retry` 兜底 ⇒ **精心算出的 Retry-After 被整个丢弃**，
+    /// 改走 20→60s 阶梯 ⇒ 等真实恢复时间的 2~6 倍（CLAUDE.md 记录：当晚 1753 次失败）。
+    ///
+    /// ⚠️ **2026-08-15 认知纠错**：本守卫此前钉的是「等容量」——它只出现在 shield 的
+    /// **注释**（337 行）里，不是 COOLING_MARKERS 判据；A1/A2 的 503 文案因此
+    /// **不承载**任何判据词，可自由改。旧守卫放行真判据词被替换、却拦住无害的
+    /// 「等容量」，方向反了。真实承载点只有三处生产文案：
+    ///   · A5（全池冷却 429）= `All credentials are temporarily cooling down.`（命中前两个 marker）；
+    ///   · A3（入站准入超时 429）+ 入站闸门 = `Gateway inbound rate shaping is at capacity...`（命中第三个 marker）。
+    ///
+    /// 回退即 FAIL：替换上述任一判据子串 → 本测试红。
+    /// ⚠️ 若 shield 的 `COOLING_MARKERS` 变更，需同步本测试。
+    #[test]
+    fn shield_cooling_markers_stay_in_production_text() {
+        let src = include_str!("handlers.rs");
+        let prod = src.split("\n#[cfg(test)]").next().unwrap_or(src);
+
+        // 判据串运行时拼接，避免本测试段自身的字面量让 `find` 命中测试代码而非生产代码
+        // —— 本仓已发生过两次这类「守卫静默变绿」事故。
+        let a5_head: String = ["All credentials are temporarily"].concat();
+        let cooling: String = ["temporarily cooling", " down"].concat();
+        let shaping: String = ["inbound rate", " shaping"].concat();
+
+        // A5 全池冷却文案必须恰好 1 处（map_provider_error 的 rate_limited_pool 分支），
+        // 且同一文案内两个 COOLING_MARKERS 齐备。
+        let n_a5 = prod.matches(a5_head.as_str()).count();
+        assert_eq!(
+            n_a5, 1,
+            "A5 全池冷却文案必须恰好 1 处（map_provider_error rate_limited_pool 分支），实际 {n_a5} 处。\n\
+             若你新增/删除了全池冷却文案，请同步本守卫。"
+        );
+        let pos = prod
+            .find(a5_head.as_str())
+            .expect("count==1 已保证存在（unwrap 仅用于取偏移）");
+        // ⚠️ 用字符窗口而非字节窗口：源码含大量中文，字节偏移 + 固定长度会切进
+        // UTF-8 多字节字符内部（本仓同类守卫初版就是这么挂的）。`chars().take(N)`
+        // 按字符取，安全且与直觉一致。
+        let window: String = prod[pos..].chars().take(120).collect();
+        assert!(
+            window.contains(cooling.as_str()),
+            "A5 文案必须携带 COOLING_MARKERS 判据词。\n\
+             后果：shield 的 classify() 判它为 `retry` 而非 `cool` ⇒ 丢弃我们的 Retry-After，\
+             改走 20→60s 本地阶梯 ⇒ 1753 次失败事故形态。"
+        );
+
+        // `inbound rate shaping` 的承载点：A3 分支（map_provider_error）+ 入站闸门
+        // （try_inbound_admission_gate），恰好 2 处生产文案。
+        let n_shaping = prod.matches(shaping.as_str()).count();
+        assert_eq!(
+            n_shaping, 2,
+            "「inbound rate shaping」必须恰好 2 处生产文案（A3 分支 + 入站闸门），实际 {n_shaping} 处。\n\
+             若你新增/删除了网关背压文案，请同步本守卫。"
+        );
+    }
+
     /// ⭐ 池**永久**耗尽不可吸收，且判据必须排在 `retry_after_secs=` **之前**。
     ///
     /// 回退即 FAIL：删掉 `absorb_class_of` 里 `pool_permanently_exhausted=1 → None`
@@ -5208,74 +6198,6 @@ mod error_translation_tests {
     /// 吸收层对一个**一个可自愈的号都没有**的池（全 QuotaExhausted /
     /// RefreshTokenInvalid / AccountSuspended）拿满 45s 预算空转，客户端从 <2s
     /// 拿到 429 变成 45s 才拿到，且这 45s 内它一直占着连接。
-    #[test]
-    /// 🔴 **跨系统契约守卫**：两处 503 的文案必须含 shield 的 `COOLING_MARKERS` 词。
-    ///
-    /// 线上真实链路 `Caddy → kiro_shield.py(外挂,不在本仓) → KiroStudio`。
-    /// shield 的 `classify()` **按 body 文案分类而非状态码**，且只有 `verdict ∈ {cool,auth}`
-    /// 才读我们的 `Retry-After`：
-    /// ```text
-    /// if verdict in ("cool","auth"): delay = cool_delay(attempt, Retry-After)   # 听真值
-    /// else:                          delay = swap_delay(attempt)                # 本地阶梯
-    /// ```
-    /// 文案里少了 marker 词 ⇒ 落 `retry` 兜底 ⇒ **精心算出的 Retry-After 被整个丢弃**，
-    /// 改走 20→60s 阶梯 ⇒ 等真实恢复时间的 2~6 倍。
-    /// CLAUDE.md 记录同款事故：当晚 1753 次失败。
-    ///
-    /// 回退即 FAIL：把文案里的「等容量」删掉 → 本测试红。
-    /// ⚠️ 若 shield 的 `COOLING_MARKERS` 变更，需同步本测试
-    /// （核对命令：`ssh skiapi 'grep -A12 COOLING_MARKERS /opt/skiapi/services/kiro_shield.py'`）。
-    #[test]
-    fn absorb_503_body_must_carry_shield_cooling_marker() {
-        let src = include_str!("handlers.rs");
-        let prod = src.split("\n#[cfg(test)]").next().unwrap_or(src);
-
-        // shield COOLING_MARKERS 里我们实际使用的那个词（2026-08-11 线上实读核对）。
-        // 运行时拼接，避免本测试段自身的字面量让 `find` 命中测试代码而非生产代码
-        // —— 本仓已发生过两次这类「守卫静默变绿」事故。
-        let marker: String = ["等", "容量"].concat();
-
-        // ⚠️ **只钉「网关自己把预算用光」这两处**，不是所有 503。
-        //
-        // 生产区共 6 处 503，另外 4 处刻意**不该**带这个 marker：
-        //   · 上游模型过载（`MODEL_TEMPORARILY_UNAVAILABLE` / `INSUFFICIENT_MODEL_CAPACITY`）
-        //     —— shield 对该文案有自己的判据，语义是"上游没容量"而非"网关在等容量"；
-        //   · 兜底 5xx（`is_retryable_upstream_error` 捡剩下的）—— 语义是"上游挂了"；
-        //   · Provider 未初始化 ×2（启动期）—— 与退避无关，客户端重试也没用。
-        // 把它们一起钉进来会强迫无关文案携带误导词，那是过度约束。
-        //
-        // 锚点用「网关已就该请求」——两处 503 文案共有的前缀，语义即"网关自身预算耗尽"。
-        let anchor: String = ["网关已就该请求"].concat();
-        let n = prod.matches(anchor.as_str()).count();
-        assert_eq!(
-            n, 2,
-            "预期恰好 2 处「网关自身预算耗尽」型 503（共享预算耗尽 + 吸收层耗尽），实际 {n} 处。\n\
-             若你新增/删除了这类 503，请同步本守卫；若只是改了文案前缀，请改回或更新 anchor。"
-        );
-
-        // ⚠️ 用 `match_indices` 而不是「find 后 at = i + 1」：源码含大量中文，
-        // `i + 1` 会落进 UTF-8 多字节字符内部，切片直接 panic
-        // （`start byte index ... is not a char boundary`）。本测试初版就是这么挂的。
-        let hits: Vec<usize> = prod.match_indices(anchor.as_str()).map(|(i, _)| i).collect();
-        for (k0, &i) in hits.iter().enumerate() {
-            let k = k0 + 1;
-            // 文案是多行字符串续行拼接，marker 落在 anchor 之后数十字符内。
-            // ⚠️ 不要用「字节窗口 + char_indices 求上界」那种写法：源码是 CJK 密集的，
-            // 字节窗口换算成字符数会缩到 1/3，且 `.last()` 拿到的是字符**起点**，
-            // 可能刚好切在 marker 前面 —— 本测试初版就是这么误红的。
-            // 直接按**字符**取窗口（`chars().take(N)`），既安全又与直觉一致。
-            let window: String = prod[i..].chars().take(240).collect();
-            assert!(
-                window.contains(marker.as_str()),
-                "第 {k} 处「网关自身预算耗尽」503（字节偏移 {i}）的文案里找不到 shield \
-                 COOLING_MARKERS 词「{marker}」。\n\
-                 后果：shield 的 classify() 判它为 `retry` 而非 `cool` ⇒ \
-                 丢弃我们的 Retry-After，改走 20→60s 本地阶梯 ⇒ 客户端等真实恢复时间的 2~6 倍。\n\
-                 修法：在该 503 的 message 文案里加上「{marker}」。"
-            );
-        }
-    }
-
     #[test]
     fn permanently_exhausted_pool_is_never_absorbable() {
         // token_manager 两处 bail 的原文形态（**带** retry_after_secs=，因为对客户端
@@ -5644,6 +6566,135 @@ mod error_translation_tests {
         assert_eq!(parse_retry_after_secs("x retry_after_secs=0"), Some(0));
         assert_eq!(parse_retry_after_secs("没有这个标记"), None);
         assert_eq!(parse_retry_after_secs("retry_after_secs=abc"), None);
+    }
+
+    #[test]
+    fn parse_upstream_retry_after_handles_boundaries() {
+        assert_eq!(
+            parse_upstream_retry_after(&format!("x {}14", UPSTREAM_RETRY_AFTER_MARKER_PREFIX)),
+            Some(14)
+        );
+        assert_eq!(
+            parse_upstream_retry_after(&format!("x {}7 y", UPSTREAM_RETRY_AFTER_MARKER_PREFIX)),
+            Some(7)
+        );
+        assert_eq!(
+            parse_upstream_retry_after(&format!("x {}0", UPSTREAM_RETRY_AFTER_MARKER_PREFIX)),
+            Some(0)
+        );
+        assert_eq!(parse_upstream_retry_after("没有这个标记"), None);
+        assert_eq!(
+            parse_upstream_retry_after(&format!("x {}abc", UPSTREAM_RETRY_AFTER_MARKER_PREFIX)),
+            None
+        );
+        // 网关恒把 marker 追加在错误串**末尾**（body 噪声只可能在前）→ 取最后一次出现。
+        assert_eq!(
+            parse_upstream_retry_after(&format!(
+                "body 里意外出现 {}999 的噪声 {}30",
+                UPSTREAM_RETRY_AFTER_MARKER_PREFIX, UPSTREAM_RETRY_AFTER_MARKER_PREFIX
+            )),
+            Some(30),
+            "必须取最后一次出现（网关追加的才是真值，body 噪声在前）"
+        );
+    }
+
+    /// ⭐ S2：上游显式 Retry-After 透传 —— 上游真值 > 配置 > 默认 8s。
+    ///
+    /// provider 在 429 分支把上游 RA 打进错误串（`upstream_retry_after=N`），
+    /// A7 分支必须优先读它：上游说 30s，客户端就该等 30s，而不是 8s 就重打。
+    #[test]
+    fn upstream_retry_after_value_wins_over_config_and_default() {
+        let _guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let real_429 = r#"流式 API 请求失败: 429 Too Many Requests {"message":"Too many requests, please wait before trying again.","reason":"USER_REQUEST_RATE_EXCEEDED"}"#;
+
+        // ① 无 marker（上游没给 RA）→ 默认 8s。
+        let resp = map_provider_error(anyhow::Error::msg(real_429.to_string()));
+        assert_eq!(
+            resp.headers().get(header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
+            Some("8"),
+            "无上游 RA、无配置时维持默认 8s（既有行为逐字不变）"
+        );
+
+        // ② 上游 RA=30（S2 目标场景）→ 必须 30。
+        let with_marker = format!("{} {}30", real_429, UPSTREAM_RETRY_AFTER_MARKER_PREFIX);
+        let resp = map_provider_error(anyhow::Error::msg(with_marker));
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers().get(header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
+            Some("30"),
+            "上游显式 RA=30 必须透传给客户端（此前 A7 恒 8s，客户端 8s 就重打白打一轮）"
+        );
+
+        // ③ 配置 rate_limited_credential.retryAfterSecs=99 → 上游真值仍优先（99 被覆盖）。
+        let mut table = test_table();
+        table.insert(
+            "rate_limited_credential".to_string(),
+            crate::model::config::ErrorMessageOverride {
+                status: None,
+                r#type: None,
+                message: None,
+                retry_after_secs: Some(99),
+            },
+        );
+        set_error_messages(table);
+        let resp = map_provider_error(anyhow::Error::msg(format!(
+            "{} {}30",
+            real_429, UPSTREAM_RETRY_AFTER_MARKER_PREFIX
+        )));
+        assert_eq!(
+            resp.headers().get(header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
+            Some("30"),
+            "上游真值必须优先于配置（上游真值 > 配置 > 默认）"
+        );
+
+        // ④ 无 marker + 配置 99 → 配置生效。
+        let resp = map_provider_error(anyhow::Error::msg(real_429.to_string()));
+        assert_eq!(
+            resp.headers().get(header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
+            Some("99"),
+            "无上游真值时配置必须生效（上游真值 > 配置 > 默认）"
+        );
+        // 复位（防污染其它测试的全局镜像）。
+        set_error_messages(test_table());
+    }
+
+    /// ⭐ S3 端到端：最早 429 的 RA 被并入 generic 5xx 终态后，A7 的 marker 判据
+    /// 必须把它映射回 429 + 上游 RA（而不是 503+3s 或 502）。
+    #[test]
+    fn upstream_retry_after_marker_maps_5xx_final_to_429() {
+        // provider 的 assemble_final_error 并入 marker 后的 5xx 终态形态。
+        let preserved = format!(
+            "流式 API 请求失败: 502 Bad Gateway {{\"message\":\"upstream\"}} {}30",
+            UPSTREAM_RETRY_AFTER_MARKER_PREFIX
+        );
+        let resp = map_provider_error(anyhow::Error::msg(preserved));
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "最早类型化 429 的 RA 必须把 generic 5xx 终态映射回 429（客户端按上游节奏退避）"
+        );
+        assert_eq!(
+            resp.headers().get(header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
+            Some("30")
+        );
+    }
+
+    /// ⭐ H2 契约：配额字样的串即使带 marker 也绝不能落 A7 带 RA（月度配额要等下个
+    /// 计费周期，给秒数会诱导客户端做无意义的短退避反复砸死号）。
+    #[test]
+    fn upstream_retry_after_marker_never_breaks_quota_semantics() {
+        let quota_with_marker = format!(
+            "流式 API 请求失败: 429 Too Many Requests {{\"reason\":\"MONTHLY_REQUEST_COUNT\"}} {}30",
+            UPSTREAM_RETRY_AFTER_MARKER_PREFIX
+        );
+        let resp = map_provider_error(anyhow::Error::msg(quota_with_marker));
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            resp.headers().get(header::RETRY_AFTER).is_none(),
+            "配额 429 必须维持「无 Retry-After」（H2 契约）：marker 判据不得吞配额类"
+        );
     }
 
     #[test]
@@ -6220,6 +7271,659 @@ mod error_translation_tests {
             "上游 body 含 timeout/proxy/tls 字样不应被误判成网络故障"
         );
     }
+
+    /// ⭐ M3 回归：`subscription_unsupported=1`（provider 打的**永久**条件标记）必须
+    /// 映射成 404 `not_found_error`，绝不能落进下方 `contains("subscription")` 宽匹配
+    /// 被译成 502 `api_error` +「刷新 Token」误导文案。
+    ///
+    /// 旧路径（必失败）：该标记串含 "subscription" 子串 → 宽匹配先行命中 →
+    /// 502 可重试语义 → 客户端按 5xx 盲退避重打一个**重试永远不会变**的请求；
+    /// 排障文案还让管理员去「刷新 Token」——订阅档位缺失刷新多少次都没用。
+    #[test]
+    fn subscription_unsupported_maps_to_404_not_found_not_502() {
+        // provider.rs:3094 那条 bail 的原文形态（上游 body 原样拼接）。
+        let permanent = "Kiro API 请求失败（订阅不支持该应用/模型，换区与重试均无效）: 403 {\"message\":\"profile does not support this model\"} subscription_unsupported=1";
+        let translated = translate_upstream_error(permanent)
+            .expect("subscription_unsupported=1 必须被翻译，不能落 502 兜底");
+        assert_eq!(
+            translated.status,
+            StatusCode::NOT_FOUND,
+            "订阅档位不支持是永久条件：404 不可重试，502 会诱导客户端盲退避重打"
+        );
+        assert_eq!(translated.error_type, "not_found_error");
+        assert!(
+            !translated.message.contains("刷新 Token"),
+            "订阅档位缺失与 token 无关，绝不给「刷新 Token」误导排障动作"
+        );
+        // 走真实出口验证 HTTP 码（防谓词测试纸面化）。
+        let resp = map_provider_error(anyhow::Error::msg(permanent));
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(
+            resp.headers().get(header::RETRY_AFTER).is_none(),
+            "永久条件绝不带 Retry-After（带了等于宣称「等一会儿会好」）"
+        );
+    }
+
+    /// M3 对照组：不带标记的裸 `subscription` 文案**仍**走原 502 兜底分支
+    /// （收口只切掉了带标记的那一类，没有把整条宽匹配关掉）。
+    #[test]
+    fn bare_subscription_without_marker_still_maps_502() {
+        let bare = "上游返回: subscription has expired for this profile";
+        let translated = translate_upstream_error(bare)
+            .expect("裸 subscription 文案仍应被翻译（兜底）");
+        assert_eq!(
+            translated.status,
+            StatusCode::BAD_GATEWAY,
+            "裸 subscription 分支必须保留（MCP/透传路径可能不带标记冒泡上来）"
+        );
+    }
+
+    /// 🔴 配额兜底分支判据收口（2026-08-15）：只认 endpoint 词表里的 reason 码
+    /// （MONTHLY_REQUEST_COUNT / OVERAGE_REQUEST_LIMIT_EXCEEDED），
+    /// 裸 `QUOTA` 字样**不再**命中配额分支（宽判据误伤：无关文案含 QUOTA 会被
+    /// 429 配额文案误导退避）。
+    ///
+    /// 回退即 FAIL：把判据改回 `contains("QUOTA")`，反例组全部误判为配额耗尽。
+    #[test]
+    fn quota_fallback_uses_exact_reason_codes_not_bare_quota() {
+        // 正例：Kiro 实测 reason 码（月度 + overage，endpoint QUOTA_EXHAUSTED_REASONS 同款）。
+        for body in [
+            r#"流式 API 请求失败: 402 {"reason":"MONTHLY_REQUEST_COUNT"}"#,
+            r#"流式 API 请求失败: 402 {"message":"You have reached the limit for overages.","reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}"#,
+        ] {
+            let t = translate_upstream_error(body)
+                .expect("配额 reason 码必须命中配额分支（不能落 502 兜底）: {body}");
+            assert_eq!(
+                t.status,
+                StatusCode::TOO_MANY_REQUESTS,
+                "配额 reason 码必须仍返 429（可退避）: {body}"
+            );
+        }
+        // 反例（误伤场景）：含大写 QUOTA 但与配额耗尽无关 —— 不得被判配额分支。
+        for body in [
+            "上游返回: QUOTA tier not available for this model",
+            r#"{"error":{"code":"QUOTA","message":"configuration error"}}"#,
+        ] {
+            assert!(
+                translate_upstream_error(body).is_none(),
+                "非配额耗尽的 QUOTA 字样不得命中配额分支（宽判据误伤）: {body}"
+            );
+        }
+    }
+
+    /// 🔴 凭据分支 `subscription` 判据收窄（2026-08-15）：只认**失效**连续形态。
+    /// 「subscription does not support」（订阅档位类）与「subscription rate limit」
+    /// （限流类）不得命中 invalid_credential —— 否则给「刷新 Token」误导排障。
+    ///
+    /// 回退即 FAIL：把判据改回裸 `subscription`，反例组全部误判为凭据失效。
+    #[test]
+    fn subscription_judgement_is_credential_invalidity_phrases_only() {
+        // 正例：订阅失效形态仍命中（502 invalid_credential + 刷新 Token 排障）。
+        for body in [
+            "上游返回: subscription has expired for this profile",
+            "Invalid token: subscription expired",
+            "上游返回: no active subscription for this profile",
+            "上游返回: your subscription is invalid",
+            "上游返回: subscription is no longer active",
+        ] {
+            let t = translate_upstream_error(body)
+                .expect("订阅失效文案必须命中 invalid_credential 分支: {body}");
+            assert_eq!(t.status, StatusCode::BAD_GATEWAY, "订阅失效仍应 502: {body}");
+            assert!(
+                t.message.contains("刷新 Token"),
+                "订阅失效的排障应指向刷新 Token: {body}"
+            );
+        }
+        // 反例（误伤场景）：非失效的 subscription 字样不得命中（不再给「刷新 Token」误导）。
+        for body in [
+            "上游返回: your subscription does not support this application",
+            "上游返回: the request exceeds your subscription rate limit",
+            r#"上游返回: {"message":"subscription tier requires a higher plan"}"#,
+        ] {
+            assert!(
+                translate_upstream_error(body).is_none(),
+                "非订阅失效的 subscription 字样不得命中 invalid_credential（宽判据误伤）: {body}"
+            );
+        }
+    }
+
+    /// M4 辅助函数回归：空响应的错误形态（文案/类型）由流式与非流式共用。
+    #[test]
+    fn empty_response_shape_matches_streaming_contract() {
+        let (err_type, message, _ra) = empty_response_error_shape(true);
+        assert_eq!(err_type, "invalid_request_error");
+        assert!(message.contains("/compact"), "大输入必须提示压缩上下文");
+        let (err_type, message, _ra) = empty_response_error_shape(false);
+        assert_eq!(err_type, "overloaded_error");
+        assert!(message.contains("重试"), "偶发空响应必须可重试");
+    }
+
+    /// M4 回归：非流式空响应的 HTTP 码 —— 大输入 400（重试还是同样的大请求）、
+    /// 偶发 429（客户端可重试）。该判据与流式共用同一阈值函数。
+    #[test]
+    fn non_stream_empty_response_status_codes() {
+        // 直接断言收尾用的状态码映射逻辑（handle_non_stream_request 需真实上游，
+        // 这里把「阈值判定 → 状态码」的对应关系钉住）。
+        let model = "claude-sonnet-5";
+        let threshold = crate::anthropic::stream::empty_response_oversized_threshold(model);
+        // 大输入（≥ 阈值）→ 400 invalid_request_error
+        {
+            let oversized = 1_000_000_000 >= threshold;
+            assert!(oversized);
+            let (err_type, _, _) = empty_response_error_shape(oversized);
+            assert_eq!(err_type, "invalid_request_error");
+            let status = if oversized {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::TOO_MANY_REQUESTS
+            };
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+        // 小输入（< 阈值）→ 429 overloaded_error
+        {
+            let oversized = 100 >= threshold;
+            assert!(!oversized);
+            let (err_type, _, _) = empty_response_error_shape(oversized);
+            assert_eq!(err_type, "overloaded_error");
+            let status = if oversized {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::TOO_MANY_REQUESTS
+            };
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        }
+    }
+
+    /// 清单 11：非流式「只有 thinking 块」判定 —— 有非 thinking 内容即 false，
+    /// 全 thinking 才 true（与流式 has_non_thinking_blocks 口径对齐）。
+    #[test]
+    fn content_is_thinking_only_matches_streaming_semantics() {
+        use serde_json::json;
+        // 只有 thinking → true（需要补空格 text 兜底）
+        assert!(content_is_thinking_only(&[json!({"type": "thinking", "thinking": "x"})]));
+        // 空数组 → false（那是 M4 的完全空响应，不归 thinking-only 管）
+        assert!(!content_is_thinking_only(&[]));
+        // thinking + text → false
+        assert!(!content_is_thinking_only(&[
+            json!({"type": "thinking", "thinking": "x"}),
+            json!({"type": "text", "text": "answer"}),
+        ]));
+        // thinking + tool_use → false
+        assert!(!content_is_thinking_only(&[
+            json!({"type": "thinking", "thinking": "x"}),
+            json!({"type": "tool_use", "name": "Bash"}),
+        ]));
+        // 无 type 字段的块按非 thinking 处理（保守）
+        assert!(!content_is_thinking_only(&[json!({"text": "x"})]));
+        // 仅 server_tool_use（websearch 场景）→ false
+        assert!(!content_is_thinking_only(&[json!({"type": "server_tool_use"})]));
+    }
+
+    /// 测试串行锁：错误消息配置表是进程级全局静态（ArcSwap 镜像，与 IP 黑名单同款），
+    /// 多个测试并行读写会互相污染（一个测试 set 配置会让另一个测试的默认文案断言失败）。
+    /// 凡改 ERROR_MESSAGES 镜像的测试都先取此锁，串行执行（范式同 BLOCKLIST_TEST_LOCK）。
+    ///
+    /// `pub(crate)`：websearch.rs 的 f3 测试也改这个全局镜像（跨模块共享），
+    /// 必须持同一把锁，否则与 handlers 锁内测试双向污染（单跑绿全量随机红，2026-08-15 审计）。
+    pub(crate) static ERROR_MESSAGES_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn test_table() -> ErrorMessagesTable {
+        ErrorMessagesTable::new()
+    }
+
+    /// 读响应体为字符串（同步测试里用 current_thread runtime，范式同
+    /// `test_inbound_admission_timeout_is_distinguishable_from_pool_cooling`）。
+    fn block_on_body(resp: axum::response::Response) -> String {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                    .await
+                    .expect("读取响应体");
+                String::from_utf8_lossy(&bytes).to_string()
+            })
+    }
+
+    /// 错误消息可配置化：①配置的 message 生效（map_provider_error 渲染配置值）；
+    /// ②marker 分支判断不受配置影响（分支仍按 marker 命中，marker 在 err_str 里不在
+    /// message 里——message 换配置值后标记逻辑照旧）；③**号池真值永远优先于配置**
+    /// （`retry_after_secs=10` 时配置的 99 被覆盖）；④未配置 → 现状文案逐字不变（回归）。
+    #[test]
+    fn configured_message_renders_marker_stays_pool_truth_wins() {
+        let _guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // ① 未配置 → 现状文案不变（先回归后配置，顺序无所谓，set 恒先于断言）。
+        let resp_default = map_provider_error(anyhow::Error::msg(format!(
+            "所有凭据均在冷却（0/4）retry_after_secs=10 {}",
+            ABSORB_BUDGET_EXHAUSTED_MARKER
+        )));
+        let default_body = block_on_body(resp_default);
+        assert!(
+            default_body.contains("等容量"),
+            "未配置时必须仍是现状文案（含承重词「等容量」）"
+        );
+
+        // ② 配置 message + retryAfterSecs=99。
+        let mut table = test_table();
+        table.insert(
+            "absorb_exhausted".to_string(),
+            crate::model::config::ErrorMessageOverride {
+                status: None,
+                r#type: None,
+                message: Some("配置的吸收层耗尽文案".to_string()),
+                retry_after_secs: Some(99),
+            },
+        );
+        set_error_messages(table);
+        let raw = format!(
+            "所有凭据均在冷却（0/4）retry_after_secs=10 {}",
+            ABSORB_BUDGET_EXHAUSTED_MARKER
+        );
+        let resp = map_provider_error(anyhow::Error::msg(raw));
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "带耗尽标记仍必须命中吸收层分支（marker 判定不受配置影响）"
+        );
+        // 头必须在 move body 之前读（block_on_body 消费 resp）。
+        assert_eq!(
+            resp.headers().get(header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
+            Some("10"),
+            "号池真值 retry_after_secs=10 必须优先于配置的 99（真值比任何配置都准）"
+        );
+        let body = block_on_body(resp);
+        assert!(
+            body.contains("配置的吸收层耗尽文案"),
+            "配置 message 必须生效，实际: {body}"
+        );
+        assert!(
+            !body.contains("等容量"),
+            "配置 message 替换默认文案（含承重词；配置侧自行保证保留）"
+        );
+
+        // ③ 复位（防污染其它测试的全局镜像）。
+        set_error_messages(test_table());
+    }
+
+    /// 配置的 status/type 同样生效（message 之外的渲染字段），且 marker 判据不变。
+    #[test]
+    fn configured_status_and_type_override_render() {
+        let _guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut table = test_table();
+        table.insert(
+            "rate_limited_pool".to_string(),
+            crate::model::config::ErrorMessageOverride {
+                status: Some(503),
+                r#type: Some("overloaded_error".to_string()),
+                message: None,
+                retry_after_secs: None,
+            },
+        );
+        set_error_messages(table);
+        let resp = map_provider_error(anyhow::Error::msg(
+            "所有凭据均在冷却（0/2）retry_after_secs=10",
+        ));
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "配置的 status 必须生效"
+        );
+        // type 在 body 里。
+        let body = block_on_body(resp);
+        assert!(body.contains("\"overloaded_error\""), "配置的 type 必须生效");
+        assert!(
+            body.contains("temporarily cooling down"),
+            "未配置的 message 字段仍用默认文案"
+        );
+        // 复位。
+        set_error_messages(test_table());
+    }
+
+    /// B4 矛盾修复（设计 §五 1）：容量 503 现状无 Retry-After（客户端不退避），
+    /// 补默认 3s（key `overloaded_capacity` 的 retryAfterSecs 默认值）。
+    #[test]
+    fn b4_capacity_503_carries_default_retry_after() {
+        // 400 形态（INSUFFICIENT_MODEL_CAPACITY）与 503 形态（MODEL_TEMPORARILY_UNAVAILABLE）
+        // 都必须带默认 Retry-After: 3。
+        for raw in [
+            r#"流式 API 请求失败: 400 Bad Request {"reason":"INSUFFICIENT_MODEL_CAPACITY"}"#,
+            r#"流式 API 请求失败: 503 Service Unavailable {"reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#,
+        ] {
+            let resp = map_provider_error(anyhow::Error::msg(raw));
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                resp.headers()
+                    .get(header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok()),
+                Some("3"),
+                "容量 503 必须带默认 Retry-After（B4 修复），实际串: {raw}"
+            );
+        }
+    }
+
+    /// D10 矛盾修复（设计 §五 2）：空响应 429（小输入偶发）补默认 Retry-After 3s；
+    /// D9（大输入 400）不带（400 重试无意义，配置给了也不应用）。
+    #[test]
+    fn d10_empty_response_429_carries_retry_after() {
+        let (_t, _m, ra) = empty_response_error_shape(false);
+        assert_eq!(ra, Some(3), "偶发空响应（429）必须带默认 Retry-After（D10 修复）");
+        let (_t, _m, ra) = empty_response_error_shape(true);
+        assert_eq!(ra, None, "大输入空响应（400）不带 Retry-After（重试原请求无意义）");
+    }
+
+    /// 双入口同 key：/v1 与 /cc/v1 的 D5（KiroProvider 未配置）读同一配置
+    /// （provider_not_configured）——两份复制不再漂移。
+    #[tokio::test]
+    async fn both_entries_read_same_provider_not_configured_key() {
+        let _guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        use axum::extract::ConnectInfo;
+        let mut table = test_table();
+        table.insert(
+            "provider_not_configured".to_string(),
+            crate::model::config::ErrorMessageOverride {
+                status: None,
+                r#type: None,
+                message: Some("双入口同配置文案".to_string()),
+                retry_after_secs: None,
+            },
+        );
+        set_error_messages(table);
+        let state = AppState::new("test-key");
+        let peer = ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 12345)));
+        let body_json = br#"{"model":"claude-sonnet-5","max_tokens":1024,"messages":[{"role":"user","content":"hi"}]}"#;
+
+        // /v1 入口：raw_body 字节解析 → provider 未配置分支。
+        let resp = post_messages(
+            State(state.clone()),
+            peer.clone(),
+            axum::http::HeaderMap::new(),
+            bytes::Bytes::from_static(body_json),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let v: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            v["error"]["message"],
+            "双入口同配置文案",
+            "/v1 入口必须读到配置 message"
+        );
+
+        // /cc/v1 入口：JsonExtractor 解析 → provider 未配置分支。
+        let payload: MessagesRequest = serde_json::from_slice(body_json).unwrap();
+        let resp2 = post_messages_cc(
+            State(state),
+            peer,
+            axum::http::HeaderMap::new(),
+            JsonExtractor(payload),
+        )
+        .await;
+        assert_eq!(resp2.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let v2: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp2.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            v2["error"]["message"],
+            "双入口同配置文案",
+            "/cc/v1 入口必须读到同一配置（双入口同 key）"
+        );
+
+        // 复位。
+        set_error_messages(test_table());
+    }
+
+    /// 双入口共享处理（#15 提取）纯函数的行为形态：上限校验边界、转换错误三形态、
+    /// 序列化失败渲染。单一实现 = 两入口天然一致，此处钉住渲染契约本身。
+    #[test]
+    fn shared_render_functions_produce_expected_shapes() {
+        let _guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // 上限边界：393216（上游实测上限）放行、393217 拒绝。
+        assert!(check_max_tokens_limit(393216).is_none(), "上限内必须放行");
+        let resp = check_max_tokens_limit(393217).expect("超限必须拒绝");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = block_on_body(resp);
+        assert!(body.contains("\"invalid_request_error\""));
+        // 转换错误三形态（默认文案契约）。
+        let (s, t, m) =
+            render_conversion_error(&ConversionError::UnsupportedModel("gpt-x".to_string()));
+        assert_eq!((s.as_u16(), t.as_str()), (400, "invalid_request_error"));
+        assert!(m.ends_with("gpt-x"), "模型名必须拼进 message");
+        let (s, t, _) = render_conversion_error(&ConversionError::EmptyMessages);
+        assert_eq!((s.as_u16(), t.as_str()), (400, "invalid_request_error"));
+        let (s, t, m) = render_conversion_error(&ConversionError::UnsupportedToolMapping {
+            tool_name: "Bash".to_string(),
+            reason: "缺 command".to_string(),
+        });
+        assert_eq!((s.as_u16(), t.as_str()), (400, "invalid_request_error"));
+        assert!(
+            m.contains("Bash") && m.contains("缺 command"),
+            "工具名与原因必须拼进 message"
+        );
+        // 序列化失败：500 + internal_error + 动态详情保留（排障必需）。
+        let parse_err = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        let resp = render_serialization_failed(&parse_err);
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = block_on_body(resp);
+        assert!(
+            body.contains("EOF while parsing") || body.contains("unexpected end of JSON input"),
+            "动态详情必须保留在 message 里"
+        );
+        set_error_messages(test_table());
+    }
+
+    /// 双入口同行为（#15 提取后对照）：同一输入（max_tokens 超限）在两入口 →
+    /// 同一 status + 同一 error.type + 同一 message。带真实 provider 走完
+    /// provider 检查/入站闸门/预算段（全不触网），在 max_tokens 校验处汇合。
+    #[tokio::test]
+    async fn both_entries_reject_oversized_max_tokens_identically() {
+        let _guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        use axum::extract::ConnectInfo;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use crate::kiro::endpoint::KiroEndpoint;
+        use crate::kiro::endpoint::ide::{IdeEndpoint, IDE_ENDPOINT_NAME};
+        use crate::kiro::provider::KiroProvider;
+        use crate::kiro::token_manager::MultiTokenManager;
+
+        let mut config = crate::model::config::Config::default();
+        // 关入站闸门：测试不打令牌桶，确定性直通 max_tokens 校验。
+        config.inbound_throttle_enabled = false;
+        let manager =
+            MultiTokenManager::new(config, vec![], None, None, false).expect("构造 manager");
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert(IDE_ENDPOINT_NAME.to_string(), Arc::new(IdeEndpoint::new()));
+        let provider = KiroProvider::with_proxy(
+            Arc::new(manager),
+            None,
+            endpoints,
+            IDE_ENDPOINT_NAME.to_string(),
+        );
+        let state = AppState::new("test-key").with_kiro_provider(provider);
+        let peer = ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 12345)));
+        let body_json =
+            br#"{"model":"claude-sonnet-5","max_tokens":400000,"messages":[{"role":"user","content":"hi"}]}"#;
+
+        let resp = post_messages(
+            State(state.clone()),
+            peer.clone(),
+            axum::http::HeaderMap::new(),
+            bytes::Bytes::from_static(body_json),
+        )
+        .await;
+        let payload: MessagesRequest = serde_json::from_slice(body_json).unwrap();
+        let resp2 = post_messages_cc(
+            State(state),
+            peer,
+            axum::http::HeaderMap::new(),
+            JsonExtractor(payload),
+        )
+        .await;
+
+        assert_eq!(resp.status(), resp2.status(), "两入口 status 必须一致");
+        let v: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let v2: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp2.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            v["error"]["type"], v2["error"]["type"],
+            "两入口 error.type 必须一致"
+        );
+        assert_eq!(
+            v["error"]["message"], v2["error"]["message"],
+            "两入口 message 必须一致"
+        );
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        set_error_messages(test_table());
+    }
+
+    /// 双入口同行为（#15 提取后对照）：同一输入（空 messages 触发转换错误）在
+    /// 两入口 → 同一 status/type/message。与上一条互补：走的是 websearch 判定 +
+    /// convert_request 错误映射段（同样全不触网）。
+    #[tokio::test]
+    async fn both_entries_reject_empty_messages_identically() {
+        let _guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        use axum::extract::ConnectInfo;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use crate::kiro::endpoint::KiroEndpoint;
+        use crate::kiro::endpoint::ide::{IdeEndpoint, IDE_ENDPOINT_NAME};
+        use crate::kiro::provider::KiroProvider;
+        use crate::kiro::token_manager::MultiTokenManager;
+
+        let mut config = crate::model::config::Config::default();
+        config.inbound_throttle_enabled = false;
+        let manager =
+            MultiTokenManager::new(config, vec![], None, None, false).expect("构造 manager");
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert(IDE_ENDPOINT_NAME.to_string(), Arc::new(IdeEndpoint::new()));
+        let provider = KiroProvider::with_proxy(
+            Arc::new(manager),
+            None,
+            endpoints,
+            IDE_ENDPOINT_NAME.to_string(),
+        );
+        let state = AppState::new("test-key").with_kiro_provider(provider);
+        let peer = ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 12345)));
+        let body_json = br#"{"model":"claude-sonnet-5","max_tokens":1024,"messages":[]}"#;
+
+        let resp = post_messages(
+            State(state.clone()),
+            peer.clone(),
+            axum::http::HeaderMap::new(),
+            bytes::Bytes::from_static(body_json),
+        )
+        .await;
+        let payload: MessagesRequest = serde_json::from_slice(body_json).unwrap();
+        let resp2 = post_messages_cc(
+            State(state),
+            peer,
+            axum::http::HeaderMap::new(),
+            JsonExtractor(payload),
+        )
+        .await;
+
+        assert_eq!(resp.status(), resp2.status(), "两入口 status 必须一致");
+        let v: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let v2: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp2.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            v["error"]["type"], v2["error"]["type"],
+            "两入口 error.type 必须一致"
+        );
+        assert_eq!(
+            v["error"]["message"], v2["error"]["message"],
+            "两入口 message 必须一致"
+        );
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        set_error_messages(test_table());
+    }
+}
+
+#[cfg(test)]
+mod websearch_usage_accounting_tests {
+    //! WebSearch 用量埋点的真实形态：is_streaming 必须来自请求的 stream 标志。
+    use super::*;
+
+    /// 清单 8 源码守卫：回灌埋点必须把 `wants_stream` 传入（旧代码恒写死 false，
+    /// 面板按流式/非流式过滤回灌流量时全部显示非流式）。
+    #[test]
+    fn websearch_loop_usage_carries_real_stream_flag() {
+        let src = include_str!("handlers.rs");
+        let prod = src.split("\n#[cfg(test)]").next().unwrap_or(src);
+        let needle = [
+            "emit_websearch_loop_usage(provider, &success, client, ",
+            "wants_stream",
+            ")",
+        ]
+        .concat();
+        assert!(
+            prod.contains(&needle),
+            "dispatch_web_search_loop 必须把 wants_stream 传入埋点（旧代码恒 false）"
+        );
+    }
+
+    /// 缺口 C 埋点守卫：emit_websearch_loop_usage 必须把末轮映射名写入
+    /// `record.upstream_model`（与 credential_id 同源，见 websearch.rs 的
+    /// `loop_success_carries_last_round_mapped_model`）。回退即 FAIL：把该行删掉或
+    /// 改回恒 None，断言失败。
+    #[test]
+    fn websearch_loop_usage_carries_upstream_model() {
+        let src = include_str!("handlers.rs");
+        let prod = src.split("\n#[cfg(test)]").next().unwrap_or(src);
+        let emit_fn = prod
+            .split("fn emit_websearch_loop_usage")
+            .nth(1)
+            .expect("emit_websearch_loop_usage 不应被改名")
+            .split("\npub(super) fn ")
+            .next()
+            .unwrap_or(prod);
+        let needle = [
+            "record.upstream_model = success.mapped_model",
+            ".clone()",
+        ]
+        .concat();
+        assert!(
+            emit_fn.contains(&needle),
+            "回灌埋点必须写入 record.upstream_model（末轮映射名），否则 by_model 聚合失真"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -6273,6 +7977,59 @@ mod tier3_hotreload_tests {
         );
         // 复位默认，避免影响其它测试
         set_compression(CompressionConfig::default());
+    }
+
+    /// mock ratio 清洗：>1 / <0 / NaN / ±inf 全部归位到 [0.0, 1.0]，合法值不动。
+    #[test]
+    fn sanitize_mock_ratio_clamps_and_recovers_non_finite() {
+        assert_eq!(sanitize_mock_cache_ratio(1.5), 1.0, ">1 必须 clamp 到 1.0");
+        assert_eq!(sanitize_mock_cache_ratio(-0.2), 0.0, "<0 必须 clamp 到 0.0");
+        assert_eq!(sanitize_mock_cache_ratio(7.0), 1.0, ">1 必须 clamp 到 1.0");
+        assert_eq!(
+            sanitize_mock_cache_ratio(f64::NAN),
+            0.7,
+            "NaN 必须归默认 0.7（clamp 对 NaN 返回 NaN，会污染下游）"
+        );
+        assert_eq!(
+            sanitize_mock_cache_ratio(f64::INFINITY),
+            0.7,
+            "+inf 必须归默认 0.7"
+        );
+        assert_eq!(
+            sanitize_mock_cache_ratio(f64::NEG_INFINITY),
+            0.7,
+            "-inf 必须归默认 0.7"
+        );
+        assert_eq!(sanitize_mock_cache_ratio(0.7), 0.7, "合法值原样");
+        assert_eq!(sanitize_mock_cache_ratio(0.0), 0.0, "边界 0 原样");
+        assert_eq!(sanitize_mock_cache_ratio(1.0), 1.0, "边界 1 原样");
+    }
+
+    /// mock cache 镜像：与 config 默认的一致性 + setter→getter 往返，**合并在一个测试里
+    /// 顺序执行**——本镜像只有一个（MOCK_CACHE_*），拆成多个测试会在并行执行下互相
+    /// 覆盖状态（违反本模块「各测试操作不同镜像」约定）。任何顺序都绿：set 恒先于断言。
+    #[test]
+    fn mock_cache_mirror_seed_roundtrip_and_clamp() {
+        let cfg_default = crate::model::config::Config::default().mock_cache_read_ratio;
+        // ① 与 config 默认一致（main 启动按 config 播种，改任一处默认值都必须同步另一处）
+        set_mock_cache_config(false, cfg_default);
+        let (enabled, ratio) = mock_cache_config();
+        assert!(!enabled, "镜像关闭态与 config 默认一致");
+        assert_eq!(ratio, cfg_default, "镜像 ratio 必须与 config 默认一致");
+
+        // ② setter→getter 往返
+        set_mock_cache_config(true, 0.5);
+        assert_eq!(
+            mock_cache_config(),
+            (true, 0.5),
+            "set true/0.5 后热路径应读到同一组值"
+        );
+        // ③ 非法值经 setter 清洗后落盘，getter 读到的必须是合法值
+        set_mock_cache_config(true, 2.0);
+        assert_eq!(mock_cache_config().1, 1.0, ">1 必须被 setter clamp");
+        // ④ 复位默认（不影响其它测试）
+        set_mock_cache_config(false, cfg_default);
+        assert_eq!(mock_cache_config(), (false, cfg_default));
     }
 }
 
@@ -6728,5 +8485,50 @@ mod adaptive_compress_loop_tests {
         let mut body = before;
         adaptive_compress_loop(&mut kiro_request, &cfg, &mut body, None).unwrap();
         assert!(!body.is_empty());
+    }
+}
+
+// ==================== B7 启动播种自检：源码守卫 ====================
+#[cfg(test)]
+mod mirror_wiring_guard {
+    // 守卫纪律（CLAUDE.md 教训 #9）：本模块注释里不得出现带引号括号的完整调用字面量
+    // （needle 是拼接出来的，注释命中会静默变绿）。
+
+    /// 每个镜像 setter 内部必须登记接线标记：遍历名字表，断言生产区存在对应调用。
+    /// 删掉任一 setter 的登记行 / 改名不同步 → 红。与 token_manager 的 reload 守卫同范式。
+    #[test]
+    fn mirror_wiring_source_guard() {
+        let full = include_str!("handlers.rs");
+        let prod = full.split("\n#[cfg(test)]").next().unwrap_or(full);
+        for name in super::MIRROR_WIRED_NAMES {
+            let needle = format!("mark_mirror_wired(\"{}\"{}", name, ")");
+            assert!(
+                prod.contains(&needle),
+                "setter 登记缺失: {needle} 不存在于生产代码（MIRROR_WIRED_NAMES 与 setter 必须同步）"
+            );
+        }
+        // 名字表本身不得重复（重复会让位图错位）
+        let mut sorted: Vec<&str> = super::MIRROR_WIRED_NAMES.to_vec();
+        sorted.sort_unstable();
+        let deduped = sorted.clone();
+        sorted.dedup();
+        assert_eq!(sorted.len(), deduped.len(), "MIRROR_WIRED_NAMES 含重复名字");
+    }
+
+    /// 位图框架自检：全部置位后 unwired 为空；mark 未登记名字必须 panic。
+    #[test]
+    fn bitmap_unwired_and_unknown_name() {
+        let total = super::MIRROR_WIRED_NAMES.len();
+        // 全部名字逐一 mark（幂等）
+        for name in super::MIRROR_WIRED_NAMES {
+            super::mark_mirror_wired(name);
+        }
+        assert!(super::unwired_mirrors().is_empty());
+        // 未登记名字 → panic
+        let r = std::panic::catch_unwind(|| super::mark_mirror_wired("no_such_mirror"));
+        assert!(r.is_err(), "未登记名字必须 panic");
+        assert_eq!(super::unwired_mirrors().len(), 0);
+        // 位图没有溢出
+        assert!(total <= 64);
     }
 }

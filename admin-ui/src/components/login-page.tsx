@@ -140,12 +140,14 @@ export function LoginPage({ onLogin }: LoginPageProps) {
           <div className="mb-4">
             <div className="flex items-center gap-2 mb-2">
               <KeyRound style={{ width: '14px', height: '14px', color: '#666' }} />
-              <label style={{ fontSize: '12px', color: '#888', fontWeight: 500 }}>
+              <label htmlFor="admin-api-key" style={{ fontSize: '12px', color: '#888', fontWeight: 500 }}>
                 Admin API Key
               </label>
             </div>
             <input
+              id="admin-api-key"
               type="password"
+              autoComplete="current-password"
               placeholder={t('loginpage.input.apiKeyPlaceholder')}
               value={apiKey}
               onChange={(e) => { setApiKey(e.target.value); if (error) setError(null) }}
@@ -202,7 +204,7 @@ export function LoginPage({ onLogin }: LoginPageProps) {
             }}
           >
             {verifying && <Loader2 style={{ width: '15px', height: '15px' }} className="animate-spin" />}
-            {verifying ? t('loginpage.button.verifying') : '登录'}
+            {verifying ? t('loginpage.button.verifying') : t('loginpage.button.login')}
           </button>
         </form>
 
