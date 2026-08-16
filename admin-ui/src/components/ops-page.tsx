@@ -42,6 +42,7 @@ import {
   usePerformUpdate,
   useUpdateStatus,
 } from '@/hooks/use-ops'
+import { storagePartitionLabel } from '@/lib/i18n-labels'
 import type {
   RateLimitInsight,
   CredentialStatusItem,
@@ -303,7 +304,7 @@ function RecoveryMetricsCard() {
             </span>
           )}
         </CardTitle>
-        <Button variant="ghost" size="sm" onClick={() => refetch()} className="h-7 px-2">
+        <Button variant="ghost" size="sm" onClick={() => refetch()} className="h-7 px-2" title={t('opspage.common.refresh')} aria-label={t('opspage.common.refresh')}>
           <RefreshCw className="h-3.5 w-3.5" />
         </Button>
       </CardHeader>
@@ -961,10 +962,12 @@ function CredOpsDialog({
         <OpsSection title={t('opspage.credops.proxyTitle')} hint={t('opspage.credops.proxyHint')}>
           <div className="flex items-center gap-2">
             <Input
+              id="ops-proxy-url"
               value={proxyUrl}
               onChange={(e) => setProxyUrl(e.target.value)}
               placeholder={t('opspage.credops.proxyPlaceholder')}
               className="h-8 flex-1 text-xs"
+              aria-label={t('opspage.credops.proxyTitle')}
             />
             <ProxyTestButton proxyUrl={proxyUrl} className="h-8" />
             <Button
@@ -987,10 +990,12 @@ function CredOpsDialog({
         <OpsSection title={t('opspage.credops.nameTitle')} hint={t('opspage.credops.nameHint')}>
           <div className="flex items-center gap-2">
             <Input
+              id="ops-cred-name"
               value={name}
               onChange={(e) => setNameVal(e.target.value)}
               placeholder={t('opspage.credops.namePlaceholder')}
               className="h-8 flex-1 text-xs"
+              aria-label={t('opspage.credops.nameTitle')}
             />
             <Button
               size="sm"
@@ -1289,7 +1294,7 @@ const OpsAggregationCard = memo(function OpsAggregationCard({ onFocusLog }: { on
               {t('opspage.storage.title')}
               {storage && <span className="text-xs font-normal text-muted-foreground">{t('opspage.storage.diskTotal', { bytes: formatBytes(storage.totalDiskBytes) })}</span>}
             </div>
-            <Button variant="ghost" size="sm" className="h-7 px-2" onClick={() => refetchStorage()} disabled={storageLoading}>
+            <Button variant="ghost" size="sm" className="h-7 px-2" onClick={() => refetchStorage()} disabled={storageLoading} title={t('opspage.common.refresh')} aria-label={t('opspage.common.refresh')}>
               <RefreshCw className="h-3.5 w-3.5" />
             </Button>
           </div>
@@ -1308,7 +1313,7 @@ const OpsAggregationCard = memo(function OpsAggregationCard({ onFocusLog }: { on
                 return (
                   <div key={p.key} className="flex items-center justify-between gap-3 rounded-md border border-[#2e2e2e] bg-[#111] px-3 py-1.5">
                     <div className="flex min-w-0 items-center gap-2">
-                      <span className="truncate text-xs">{p.label}</span>
+                      <span className="truncate text-xs">{storagePartitionLabel(p.key, p.label)}</span>
                       {p.inMemory && <Badge variant="outline" className="text-[10px]">{t('opspage.storage.inMemory')}</Badge>}
                     </div>
                     <div className="flex shrink-0 items-center gap-3">
@@ -1435,7 +1440,7 @@ const OpsAggregationCard = memo(function OpsAggregationCard({ onFocusLog }: { on
       <ConfirmDialog
         open={!!cleanupTarget}
         onOpenChange={(v) => !v && setConfirm(null)}
-        title={t('opspage.confirm.cleanupTitle', { label: cleanupTarget?.label ?? '' })}
+        title={t('opspage.confirm.cleanupTitle', { label: cleanupTarget ? storagePartitionLabel(cleanupTarget.key, cleanupTarget.label) : '' })}
         description={
           <span>
             {t('opspage.confirm.cleanupIrreversible')}
@@ -1823,6 +1828,7 @@ const LogViewer = memo(function LogViewer({ focusToken = 0, focusTerm = '' }: { 
             className="h-7 w-7 px-0"
             aria-expanded={!collapsed}
             title={collapsed ? t('opspage.log.expand') : t('opspage.log.collapse')}
+            aria-label={collapsed ? t('opspage.log.expand') : t('opspage.log.collapse')}
           >
             {collapsed ? <ChevronDown className="h-4 w-4" /> : <ChevronUp className="h-4 w-4" />}
           </Button>
@@ -1837,17 +1843,20 @@ const LogViewer = memo(function LogViewer({ focusToken = 0, focusTerm = '' }: { 
        <div className="flex flex-row items-center gap-2 px-6 pb-2">
          <div className="relative flex-1">
            <Search className="pointer-events-none absolute left-2 top-1/2 z-10 h-3.5 w-3.5 -translate-y-1/2 text-[#666]" />
-           <Input
-             value={search}
+            <Input
+              id="ops-log-search"
+              value={search}
              onChange={(e) => setSearch(e.target.value)}
              placeholder={t('opspage.log.searchPlaceholder')}
              className="h-7 pl-7 pr-7 text-xs"
+             aria-label={t('opspage.log.searchPlaceholder')}
            />
            {search && (
              <button
                onClick={() => setSearch('')}
                className="absolute right-1.5 top-1/2 z-10 -translate-y-1/2 text-[#666] hover:text-[#ededed]"
                title={t('opspage.log.clearSearch')}
+               aria-label={t('opspage.log.clearSearch')}
              >
                <X className="h-3.5 w-3.5" />
              </button>
@@ -1957,6 +1966,7 @@ function LogRow({
           onClick={handleCopy}
           className="shrink-0 self-start text-[#666] hover:text-[#ededed]"
           title={t('opspage.log.copyWhole')}
+          aria-label={t('opspage.log.copyWhole')}
         >
           <Copy className="h-3.5 w-3.5" />
         </button>

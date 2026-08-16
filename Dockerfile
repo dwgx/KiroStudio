@@ -26,7 +26,14 @@ FROM rust:1.96-alpine AS builder
 RUN apk add --no-cache musl-dev
 
 WORKDIR /app
+# B11：注入快照 commit 短 sha（部署时 docker build --build-arg KIRO_BUILD_SHA=<sha>；
+# git archive 解包环境无 .git，build.rs 的 git 兜底拿不到值，只能靠这里传）。
+# 不传 → 空串 → build.rs 降级 "unknown"（绝不导致构建失败）。
+ARG KIRO_BUILD_SHA
+ENV KIRO_BUILD_SHA=$KIRO_BUILD_SHA
 COPY Cargo.toml Cargo.lock ./
+# build.rs 注入 KIRO_BUILD_SHA（main.rs 编译期 env! 读取，缺了编不过）
+COPY build.rs ./
 COPY src ./src
 # 内嵌前端产物（router.rs 里 #[folder = "admin-ui/dist"]）
 COPY --from=frontend-builder /app/admin-ui/dist /app/admin-ui/dist

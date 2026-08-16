@@ -983,7 +983,7 @@ function RequestDetail({ record: r }: { record: RequestRecord }) {
       {/* 断流字节：仅当有值且 >0 才显示（None=正常收尾，0=一个字节没收到就断了）。
           i18n: usagepage.detail.interrupted（主会话补三语） */}
       {interrupted != null && interrupted > 0 && (
-        <DetailRow label="中断" value={`${Math.round(interrupted / 1024)} KB`} />
+        <DetailRow label={t('usagepage.detail.interrupted')} value={`${Math.round(interrupted / 1024)} KB`} />
       )}
       {r.session_id && <DetailRow label={t('usagepage.detail.sessionWindow')} value={r.session_id} />}
       <DetailRow label={t('usagepage.detail.requestId')} value={r.request_id} />
@@ -1026,7 +1026,7 @@ function RequestDetailSpread({ record: r }: { record: RequestRecord }) {
     { label: t('usagepage.detail.retryStream'), value: `${r.retries} ${t('usagepage.detail.timesUnit')} · ${r.is_streaming ? t('usagepage.detail.yes') : t('usagepage.detail.no')}` },
     // 断流字节：仅当有值且 >0 才显示（None=正常收尾，0=一个字节没收到就断了）。
     // i18n: usagepage.detail.interrupted（主会话补三语）
-    ...(interrupted != null && interrupted > 0 ? [{ label: '中断', value: `${Math.round(interrupted / 1024)} KB`, mono: false }] : []),
+    ...(interrupted != null && interrupted > 0 ? [{ label: t('usagepage.detail.interrupted'), value: `${Math.round(interrupted / 1024)} KB`, mono: false }] : []),
     ...(r.session_id ? [{ label: t('usagepage.detail.sessionWindow'), value: r.session_id }] : []),
     { label: t('usagepage.detail.requestId'), value: r.request_id },
   ]
@@ -1276,9 +1276,11 @@ function RecentRequestsPanel({
         <div className="relative flex-1 min-w-[180px]">
           <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           <input
+            id="usage-search"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder={t('usagepage.recent.searchPlaceholder')}
+            aria-label={t('usagepage.recent.searchAria')}
             className="h-8 w-full rounded-md border border-border bg-secondary/40 pl-8 pr-7 text-xs outline-none focus:border-border-hover"
           />
           {query && (

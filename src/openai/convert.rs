@@ -278,7 +278,8 @@ pub fn openai_chat_to_anthropic(model: &str, raw: &Value, stream: bool) -> Value
     if let Some(Value::Array(tools)) = raw.get("tools") {
         let mut anth_tools: Vec<Value> = Vec::new();
         for t in tools {
-            if t.get("type").and_then(|v| v.as_str()) == Some("function") {
+            let ttype = t.get("type").and_then(|v| v.as_str());
+            if ttype == Some("function") {
                 if let Some(func) = t.get("function") {
                     let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("");
                     let desc = func
@@ -294,6 +295,19 @@ pub fn openai_chat_to_anthropic(model: &str, raw: &Value, stream: bool) -> Value
                         "description": desc,
                         "input_schema": normalize_input_schema(schema),
                     }));
+                }
+            } else if ttype.is_some_and(|ty| ty.starts_with("web_search")) {
+                // 🔴 MAJOR（线上实测）：web_search_20250305 曾被静默丢弃（循环只认
+                // type=="function"）⇒ 模型回 "web browsing isn't available"，搜索能力在
+                // OpenAI 客户端静默失效、无日志。上游是 Anthropic 兼容（custom_api 透传池
+                // / Anthropic API），原生支持 web_search 服务端工具 ⇒ 转成
+                // `{type:"web_search_20250305", name:"web_search"}` 透传，不剥不丢。
+                anth_tools.push(normalize_openai_web_search_tool(t));
+                if log_once(format!("web_search_tool:chat:{}", ttype.unwrap_or("<missing>"))) {
+                    tracing::warn!(
+                        tool_type = ttype.unwrap_or("<missing>"),
+                        "openai_chat_to_anthropic: web_search 工具转为 Anthropic 原生形态透传（不再静默丢弃）"
+                    );
                 }
             }
         }
@@ -357,6 +371,29 @@ fn normalize_input_schema(schema: Option<Value>) -> Value {
         }
         _ => json!({"type": "object", "properties": {}}),
     }
+}
+
+/// OpenAI 的 web_search 工具 → Anthropic 原生 web_search 服务端工具形态。
+///
+/// OpenAI 形态：`{"type":"web_search_20250305","name":"web_search"}`（以及旧变体
+/// `web_search` / `web_search_preview`）——type 以 `web_search` 开头即命中。上游
+/// （custom_api 透传池 / Anthropic 兼容）原生支持 Anthropic 的 web_search 服务端工具
+/// （`{"type":"web_search_20250305","name":"web_search","max_uses":8}`），因此转换 =
+/// 透传保 type/name，仅把 OpenAI 专属的旧变体归一化到 Anthropic 只认的带日期形态；
+/// name 缺失时补 "web_search"（Anthropic 契约）。max_uses 若有则保留。
+fn normalize_openai_web_search_tool(t: &Value) -> Value {
+    let name = t
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("web_search");
+    let mut out = json!({
+        "type": "web_search_20250305",
+        "name": name,
+    });
+    if let Some(mu) = t.get("max_uses").and_then(|v| v.as_u64()) {
+        out["max_uses"] = json!(mu);
+    }
+    out
 }
 
 /// system content(字符串或 parts 数组)→ Anthropic system text 块,追加到 blocks。
@@ -896,6 +933,17 @@ pub fn openai_responses_to_anthropic(model: &str, raw: &Value, stream: bool) -> 
                         "required": ["input"]
                     },
                 }));
+            } else if ttype.is_some_and(|ty| ty.starts_with("web_search")) {
+                // 与 chat 路径同款：web_search 服务端工具不得静默丢弃（旧实现只有
+                // debug 留痕、工具仍被跳过 ⇒ Codex 等 Responses 客户端同样拿不到搜索
+                // 能力）。上游原生支持 ⇒ 转 Anthropic 形态透传。
+                anth_tools.push(normalize_openai_web_search_tool(t));
+                if log_once(format!("web_search_tool:responses:{}", ttype.unwrap_or("<missing>"))) {
+                    tracing::warn!(
+                        tool_type = ttype.unwrap_or("<missing>"),
+                        "openai_responses_to_anthropic: web_search 工具转为 Anthropic 原生形态透传（不再静默丢弃）"
+                    );
+                }
             } else {
                 // 未识别的 tool type:留痕而非静默丢弃整条工具声明。将来 OpenAI 再加新 type 时,
                 // 至少能在日志里看到"这个工具被跳过了",而不是模型莫名其妙不知道该工具存在。
@@ -1185,14 +1233,9 @@ impl ChatStreamConverter {
         match event_type {
             "message_start" => {
                 if let Some(msg) = ev.get("message") {
-                    self.response_id = msg
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if self.response_id.is_empty() {
-                        self.response_id = crate::openai::types::gen_chat_completion_id();
-                    }
+                    // ⚠️ 恒用自生成 id（MINOR-6）：上游 Anthropic 的 msg_xxx 不满足
+                    // OpenAI chatcmpl- 格式契约，且会把上游内部标识泄漏给客户端。
+                    self.response_id = crate::openai::types::gen_chat_completion_id();
                     self.created = now_unix();
                     if let Some(u) = msg.get("usage") {
                         self.usage.merge(u);
@@ -1337,7 +1380,6 @@ impl ChatStreamConverter {
 
 /// 非流式聚合:把内部产出的一串 Anthropic SSE 事件(已解析)聚合成单个 OpenAI chat.completion。
 pub fn aggregate_chat_completion(model: &str, events: &[Value]) -> Value {
-    let mut message_id = String::new();
     let mut created = now_unix();
     let mut usage = UsageTokens::default();
     let mut stop_reason = String::from("end_turn");
@@ -1351,11 +1393,6 @@ pub fn aggregate_chat_completion(model: &str, events: &[Value]) -> Value {
         match ev.get("type").and_then(|v| v.as_str()).unwrap_or("") {
             "message_start" => {
                 if let Some(m) = ev.get("message") {
-                    message_id = m
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
                     created = now_unix();
                     if let Some(u) = m.get("usage") {
                         usage.merge(u);
@@ -1453,11 +1490,9 @@ pub fn aggregate_chat_completion(model: &str, events: &[Value]) -> Value {
     };
 
     let (p, c, t, cached) = usage.openai();
-    let id = if message_id.is_empty() {
-        crate::openai::types::gen_chat_completion_id()
-    } else {
-        message_id
-    };
+    // ⚠️ 恒用自生成 id（MINOR-6）：上游 Anthropic 的 msg_xxx 不满足 OpenAI
+    // chatcmpl- 格式契约，且会把上游内部标识泄漏给客户端。
+    let id = crate::openai::types::gen_chat_completion_id();
     json!({
         "id": id,
         "object": "chat.completion",
@@ -1563,12 +1598,9 @@ impl ResponsesStreamConverter {
                     Some(m) => m,
                     None => return vec![],
                 };
-                self.response_id = msg
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(String::from)
-                    .unwrap_or_else(|| gen_responses_id("resp"));
+                // ⚠️ 恒用自生成 id（MINOR-6）：上游 Anthropic 的 msg_xxx 不满足
+                // OpenAI resp_ 格式契约，且会把上游内部标识泄漏给客户端。
+                self.response_id = gen_responses_id("resp");
                 self.created = now_unix();
                 if let Some(u) = msg.get("usage") {
                     self.usage.merge(u);
@@ -2333,7 +2365,16 @@ mod tests {
         let mut conv = ChatStreamConverter::new("gpt-5.6-sol");
         let start = conv.push_event(&json!({"type": "message_start", "message": {"id": "msg_1", "usage": {"input_tokens": 10}}}));
         assert_eq!(start[0]["choices"][0]["delta"]["role"], "assistant");
-        assert_eq!(start[0]["id"], "msg_1");
+        // MINOR-6：id 恒自生成，不得沿用上游 msg_xxx（格式契约 + 不泄漏上游内部标识）。
+        let id = start[0]["id"].as_str().unwrap_or("");
+        assert!(
+            id.starts_with("chatcmpl-"),
+            "chat 流式 id 必须是自生成的 chatcmpl- 前缀，实际: {id}"
+        );
+        assert!(
+            !id.contains("msg_"),
+            "id 不得携带上游 Anthropic 的 msg_ 内部标识，实际: {id}"
+        );
         let d = conv.push_event(&json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hi"}}));
         assert_eq!(d[0]["choices"][0]["delta"]["content"], "Hi");
         let md = conv.push_event(&json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5}}));
@@ -2349,6 +2390,41 @@ mod tests {
             "usage chunk 的 choices 为空数组"
         );
         assert_eq!(md[1]["usage"]["completion_tokens"], 5);
+    }
+
+    /// ⭐ MINOR-6 守卫：三种输出形态的 id 都必须自生成，不沿用上游 msg_xxx。
+    ///
+    /// 回退即 FAIL：把任一处改回「上游 id 原样用」（空才自生成）——断言红。
+    #[test]
+    fn ids_never_reuse_upstream_msg_id() {
+        // chat 流式（ChatStreamConverter）。
+        let mut conv = ChatStreamConverter::new("m");
+        let start = conv.push_event(&json!({"type": "message_start", "message": {"id": "msg_abc", "usage": {"input_tokens": 1}}}));
+        let id = start[0]["id"].as_str().unwrap_or("").to_string();
+        assert!(id.starts_with("chatcmpl-"), "chat 流式 id 应为 chatcmpl-，实际 {id}");
+        assert!(!id.contains("msg_abc"), "不得复用上游 msg_abc: {id}");
+
+        // chat 非流式（aggregate_chat_completion）。
+        let c = aggregate_chat_completion("m", &[
+            json!({"type": "message_start", "message": {"id": "msg_abc", "usage": {"input_tokens": 1}}}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+        ]);
+        let cid = c["id"].as_str().unwrap_or("").to_string();
+        assert!(cid.starts_with("chatcmpl-"), "chat 非流式 id 应为 chatcmpl-，实际 {cid}");
+        assert!(!cid.contains("msg_abc"), "不得复用上游 msg_abc: {cid}");
+
+        // responses 流式（ResponsesStreamConverter）。
+        let mut rconv = ResponsesStreamConverter::new("m");
+        let evs = rconv.push_event(&json!({"type": "message_start", "message": {"id": "msg_abc", "usage": {"input_tokens": 1}}}));
+        let rid = evs
+            .iter()
+            .find(|(t, _)| t == "response.created")
+            .and_then(|(_, v)| v.get("response").and_then(|r| r.get("id")))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        assert!(rid.starts_with("resp_"), "responses id 应为 resp_，实际 {rid}");
+        assert!(!rid.contains("msg_abc"), "不得复用上游 msg_abc: {rid}");
     }
 
     #[test]
@@ -2668,6 +2744,76 @@ mod tests {
             a3.get("tool_choice").is_none(),
             "responses 无 tools 时不下发 tool_choice"
         );
+    }
+
+    /// 🔴 MAJOR（线上实测）回归：chat/completions 的 `web_search_20250305` 工具不得静默丢弃。
+    /// 旧实现工具循环只认 type=="function"，web_search 被跳过 ⇒ 模型回 "web browsing isn't
+    /// available"。上游是 Anthropic 兼容 ⇒ 保留透传为 Anthropic 原生服务端工具形态。
+    #[test]
+    fn test_request_web_search_tool_not_dropped() {
+        let raw = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"type": "web_search_20250305", "name": "web_search"},
+                {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}
+            ]
+        });
+        let a = openai_chat_to_anthropic("m", &raw, false);
+        let tools = a
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("web_search 工具被丢弃:tools 字段缺失或非数组,a={a}"));
+        let ws = tools
+            .iter()
+            .find(|t| t["name"] == "web_search")
+            .unwrap_or_else(|| panic!("web_search 不在下发的 tools 里,tools={tools:?}"));
+        assert_eq!(ws["type"], "web_search_20250305", "type 原样保留（Anthropic 原生形态）");
+        assert_eq!(ws["name"], "web_search", "name 保留透传");
+        assert!(
+            tools.iter().any(|t| t["name"] == "get_weather"),
+            "同批次的 function 工具不受影响"
+        );
+    }
+
+    /// 旧变体归一化：OpenAI 专属的 `web_search` / `web_search_preview` type 归一化到
+    /// Anthropic 只认的带日期形态 `web_search_20250305`；max_uses 保留；name 缺失补默认。
+    #[test]
+    fn test_request_web_search_legacy_variant_normalized() {
+        let raw = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"type": "web_search", "name": "web_search", "max_uses": 3},
+                {"type": "web_search_preview"}
+            ]
+        });
+        let a = openai_chat_to_anthropic("m", &raw, false);
+        let tools = a["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2, "两个 web_search 变体都必须下发");
+        assert_eq!(tools[0]["type"], "web_search_20250305", "旧变体归一化到带日期形态");
+        assert_eq!(tools[0]["name"], "web_search");
+        assert_eq!(tools[0]["max_uses"], 3, "max_uses 若有则保留");
+        assert_eq!(tools[1]["type"], "web_search_20250305");
+        assert_eq!(tools[1]["name"], "web_search", "name 缺失补 Anthropic 契约默认名");
+    }
+
+    /// Responses 入口（Codex 等）的 web_search 工具同样不得被跳过。
+    #[test]
+    fn test_responses_web_search_tool_not_dropped() {
+        let raw = json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}]
+        });
+        let a = openai_responses_to_anthropic("m", &raw, false);
+        let tools = a
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("responses web_search 工具被丢弃:tools 字段缺失或非数组,a={a}"));
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "web_search_20250305");
+        assert_eq!(tools[0]["name"], "web_search");
     }
 
     #[test]

@@ -44,6 +44,7 @@ import {
 } from '@/components/ui/dialog'
 import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
 import { cn, copyToClipboard, extractErrorMessage } from '@/lib/utils'
+import { cooldownReasonLabel, isRateLimitCooldown } from '@/lib/cooldown'
 import { formatAmount, formatCachedAt, formatCredits, formatLastUsed, maskProxyUrl } from '@/lib/credential-format'
 import { authShortLabel, disabledReasonLabel, subscriptionLabel } from '@/lib/i18n-labels'
 import {
@@ -252,7 +253,8 @@ export function CredentialRowBody({
 
   // 状态合成。判定顺序即优先级：禁用 > 熔断半开 > 冷却 > 健康。
   // 禁用排最前是刻意的：禁用号不参与调度，它的冷却/熔断态对用户没有决策意义。
-  const rateLimited = credential.cooldownReason === '速率限制'
+  // 速率限制判据走稳定枚举码（缺失时返回 false 走红色分支，无害降级）。
+  const rateLimited = isRateLimitCooldown(credential.cooldownCode)
   const status: RowStatus = credential.disabled
     ? 'disabled'
     : insight?.health?.halfOpen
@@ -389,7 +391,6 @@ export function CredentialRowBody({
 
   // 点击掩码复制完整 Key：exportCredential 拿真值（与设置页 copyOne 同模式），
   // 取 kiroApiKey 字段（后端 export 返回 camelCase KiroCredentials，只有 api_key 号有掩码）。
-  // i18n: credentialcard.toast.apiKeyCopied / apiKeyCopyFailed / apiKeyMissing（主会话补三语）
   const handleCopyFullKey = async () => {
     if (copyKeyBusy) return
     setCopyKeyBusy(true)
@@ -397,11 +398,11 @@ export function CredentialRowBody({
       const obj = await exportCredential(credential.id)
       const key = typeof obj.kiroApiKey === 'string' ? obj.kiroApiKey : ''
       if (!key) {
-        toast.error('该凭据没有可复制的完整 Key')
+        toast.error(t('credentialcard.toast.apiKeyMissing'))
         return
       }
       const ok = await copyToClipboard(key)
-      ok ? toast.success('已复制完整 Key') : toast.error('复制失败')
+      ok ? toast.success(t('credentialcard.toast.apiKeyCopied')) : toast.error(t('credentialcard.toast.apiKeyCopyFailed'))
     } catch (err) {
       toast.error(extractErrorMessage(err))
     } finally {
@@ -747,7 +748,7 @@ export function CredentialRowBody({
               {credential.coolingDown && credential.cooldownReason && (
                 <DetailItem
                   label={t('credentialcard.cooldown.label')}
-                  value={`${credential.cooldownReason} · ${Math.ceil((credential.cooldownRemainingMs ?? 0) / 1000)}s`}
+                  value={`${cooldownReasonLabel(credential.cooldownCode, credential.cooldownReason, t)} · ${Math.ceil((credential.cooldownRemainingMs ?? 0) / 1000)}s`}
                   tone={rateLimited ? 'warn' : 'bad'}
                 />
               )}
@@ -780,6 +781,7 @@ export function CredentialRowBody({
                         variant="ghost"
                         className="h-5 w-5 shrink-0 self-center p-0"
                         title={t('credentialcard.info.copyProxyTitle')}
+                        aria-label={t('credentialcard.info.copyProxyTitle')}
                         onClick={async (e) => {
                           e.stopPropagation()
                           const ok = await copyToClipboard(credential.proxyUrl!)
@@ -1124,6 +1126,7 @@ function DetailItem({
   onClick?: () => void
   action?: React.ReactNode
 }) {
+  const { t } = useTranslation()
   return (
     <div className={cn('flex min-w-0 items-baseline gap-1.5', className)}>
       <dt className="shrink-0 text-muted-foreground">{label}</dt>
@@ -1135,7 +1138,7 @@ function DetailItem({
           tone === 'bad' && 'text-red-400',
           tone === 'warn' && 'text-amber-400'
         )}
-        title={onClick ? '点击复制完整 Key' : value}
+        title={onClick ? t('credentialcard.info.copyKeyTitle') : value}
         onClick={onClick}
       >
         {value}

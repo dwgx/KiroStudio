@@ -684,10 +684,6 @@ pub async fn perform_update(target: Option<String>) -> Result<UpdatePerformResul
         return Err(UpdateError::ContainerDeployment);
     }
     // 1) 定目标版本
-    let check = check_for_updates().await;
-    if let Some(err) = &check.error {
-        return Err(UpdateError::DownloadFailed(err.clone()));
-    }
     let explicit = target.is_some();
     let tag = match target {
         Some(t) => {
@@ -696,10 +692,20 @@ pub async fn perform_update(target: Option<String>) -> Result<UpdatePerformResul
             }
             t
         }
-        None => check
-            .latest_version
-            .clone()
-            .ok_or_else(|| UpdateError::DownloadFailed("无最新版本".into()))?,
+        // 显式指定 tag 时**不拉 GitHub tags**（MINOR-8）：直接走下载+校验。
+        // 原来无条件先拉一次 tags —— 显式 tag 场景下那次
+        // 往返纯属浪费（还可能因 GitHub 抖动误报「下载失败」而阻断本来可用的
+        // 指定版本安装）。
+        None => {
+            let check = check_for_updates().await;
+            if let Some(err) = &check.error {
+                return Err(UpdateError::DownloadFailed(err.clone()));
+            }
+            check
+                .latest_version
+                .clone()
+                .ok_or_else(|| UpdateError::DownloadFailed("无最新版本".into()))?
+        }
     };
 
     // 已是目标版本或目标版本更旧 → 免更新（防降级）。
@@ -1110,6 +1116,42 @@ mod tests {
         assert_eq!(
             cached_versions_get(&cache, VERSIONS_CACHE_TTL, t0 + Duration::from_secs(61)),
             Some(vec!["v2.0.0".to_string()])
+        );
+    }
+
+    /// ⭐ 源码守卫（MINOR-8）：显式指定 tag 的升级**不得**拉 GitHub tags。
+    ///
+    /// 原实现无条件先 `check_for_updates()` 拉一次 tags —— 显式 tag 场景下那次
+    /// 往返纯属浪费，且 GitHub 抖动会误报「下载失败」阻断本来可用的指定版本安装。
+    /// 修复后 `check_for_updates` 只存在于自动升级（`None`）分支内。
+    ///
+    /// 回退即 FAIL：把 tags 拉取挪回 match 之外（无条件执行）——`None => {`
+    /// 出现在 `check_for_updates` **之前**，位置断言红。
+    #[test]
+    fn explicit_tag_skips_tags_fetch() {
+        let src = include_str!("update.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        let fname = format!("pub async fn perform_update{}", "(");
+        let start = prod
+            .find(&fname)
+            .expect("perform_update 不应被改名");
+        let body_end = prod[start..]
+            .find("\nfn ")
+            .map(|i| i + start)
+            .unwrap_or(prod.len());
+        let body = &prod[start..body_end];
+
+        let check_at = body
+            .find("check_for_updates")
+            .expect("自动升级分支必须保留 tags 拉取");
+        let none_at = body
+            .find("None => {")
+            .expect("目标版本判定（None 分支）不应被改名");
+        assert!(
+            none_at < check_at,
+            "check_for_updates 必须只在 None（自动升级）分支内调用——\
+             显式 tag 场景不该拉 GitHub tags（浪费一次往返 + 可能误报下载失败）"
         );
     }
 }

@@ -40,7 +40,7 @@ export function BatchVerifyDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent className="sm:max-w-lg" aria-describedby={undefined}>
         <DialogHeader>
           <DialogTitle>{t('batchverifydialog.title')}</DialogTitle>
         </DialogHeader>

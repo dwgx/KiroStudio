@@ -197,6 +197,7 @@ impl IdcLoginManager {
                     disabled: false,
                     disabled_reason: None,
                     disabled_at: None,
+                    quota_exhausted_at: None,
                     kiro_api_key: None,
                     endpoint: None,
                     // IdC 上号产出的是 Kiro 号，非 CLI(ksk_)号，该开关对它无意义 → 跟随全局。

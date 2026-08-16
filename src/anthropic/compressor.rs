@@ -4,10 +4,10 @@
 //! 以规避 Kiro 上游请求体大小限制（实测约 5MiB 左右会触发 400）。
 //!
 //! 本模块吸收自 `reference/Foxfishc__kiro.rs/src/anthropic/compressor.rs`
-//! （MIT 许可，致谢原作者）。我方**分层增量吸收**，当前先实现收益最大、
-//! 风险最小的两层：
+//! （MIT 许可，致谢原作者）。我方**分层增量吸收**，当前实现 4 个 pass：
 //! 1. 空白压缩（连续空行折叠、行尾空格移除，近乎无损）
-//! 3. tool_result 智能截断（大工具结果保留头 N 行 + 尾 M 行，中间占位省略）
+//! 2. tool_result 智能截断（大工具结果保留头 N 行 + 尾 M 行，中间占位省略）
+//! 3. repair_non_empty_content（压缩把 content 压空后补占位符，防空响应）
 //! 4. 超长消息内容截断（`compress_long_messages_pass`，仅自适应二次压缩用，
 //!    属最后手段：单条消息本身大到移除历史也救不回来时必须截断正文）
 //!
@@ -263,9 +263,10 @@ fn truncate_tool_result_content(
 /// 修复压缩后变空的 content 字段（Kiro API 要求 content 非空）。
 ///
 /// 仅处理确实需要兜底的情况，尽量保留真实结构：
-/// - history user_input_message.content（仅当无 images/tool_results 时兜底）
+/// - history user_input_message.content（**无论有无 images/tool_results** 都兜底：
+///   带 payload 的消息 content 被压空同样是 400 源，旧代码的 has_payload 门让这类漏掉）
 /// - history assistant_response_message.content（仅当无 tool_uses 时兜底）
-/// - current_message.user_input_message.content（无 images/tool_results 时兜底）
+/// - current_message.user_input_message.content（同 user 历史，无条件兜底）
 ///
 /// 返回被修复的字段数。
 fn repair_non_empty_content_pass(state: &mut ConversationState) -> usize {
@@ -274,13 +275,10 @@ fn repair_non_empty_content_pass(state: &mut ConversationState) -> usize {
     for msg in &mut state.history {
         match msg {
             Message::User(user_msg) => {
-                let has_payload = !user_msg.user_input_message.images.is_empty()
-                    || !user_msg
-                        .user_input_message
-                        .user_input_message_context
-                        .tool_results
-                        .is_empty();
-                if !has_payload && repair_content_field(&mut user_msg.user_input_message.content) {
+                // 无条件兜底：`repair_content_field` 本身只在 trim 后为空时才写占位符，
+                // 有真实内容的消息天然跳过，门条件删掉不会误伤。带 images/tool_results
+                // 的消息此前被 has_payload 门放过 —— 其 content 压空后仍会 400。
+                if repair_content_field(&mut user_msg.user_input_message.content) {
                     repaired += 1;
                 }
             }
@@ -299,16 +297,8 @@ fn repair_non_empty_content_pass(state: &mut ConversationState) -> usize {
         }
     }
 
-    let current_has_payload = !state.current_message.user_input_message.images.is_empty()
-        || !state
-            .current_message
-            .user_input_message
-            .user_input_message_context
-            .tool_results
-            .is_empty();
-    if !current_has_payload
-        && repair_content_field(&mut state.current_message.user_input_message.content)
-    {
+    // 无条件兜底（同上：带 images/tool_results 的 current 消息压空同样要补占位符）。
+    if repair_content_field(&mut state.current_message.user_input_message.content) {
         repaired += 1;
     }
 
@@ -685,6 +675,83 @@ mod tests {
         assert_eq!(saved, 0);
         if let Message::User(u) = &state.history[0] {
             assert_eq!(u.user_input_message.content, " ");
+        }
+    }
+
+    /// 清单 10 回归：带 images/tool_results 的消息 content 被压空后**也必须**补占位符。
+    ///
+    /// 旧代码的 has_payload 门只看「有无 images/tool_results」就跳过 content 修复 ——
+    /// 但 content 空 + 带 payload 的消息同样违反 Kiro「content 非空」契约，上游照样 400。
+    #[test]
+    fn repair_non_empty_content_fixes_empty_content_even_with_images() {
+        let mut history_user = HistoryUserMessage::new("", "claude-sonnet-4.5");
+        history_user.user_input_message.images =
+            vec![KiroImage::from_base64("png", "iVBORw0KGgo=")];
+        let mut state = ConversationState::new("test")
+            .with_current_message(CurrentMessage::new(
+                UserInputMessage::new("", "claude-sonnet-4.5")
+                    .with_images(vec![KiroImage::from_base64("png", "iVBORw0KGgo=")]),
+            ))
+            .with_history(vec![
+                Message::User(history_user),
+                Message::Assistant(HistoryAssistantMessage::new("assistant text")),
+            ]);
+
+        let repaired = repair_non_empty_content_pass(&mut state);
+        assert_eq!(
+            repaired, 2,
+            "history user + current 两条带 images 的空 content 都必须补占位符（旧代码 has_payload 门放过）"
+        );
+        assert_eq!(state.current_message.user_input_message.content, ".");
+        assert!(!state.current_message.user_input_message.images.is_empty());
+        if let Message::User(u) = &state.history[0] {
+            assert_eq!(u.user_input_message.content, ".");
+            assert!(!u.user_input_message.images.is_empty());
+        }
+    }
+
+    /// 对照：带 images 但 content 非空的消息不得被误补占位符
+    /// （repair_content_field 只动 trim 后为空的字段）。
+    #[test]
+    fn repair_non_empty_content_skips_real_content_even_with_images() {
+        let mut state = ConversationState::new("test")
+            .with_current_message(CurrentMessage::new(
+                UserInputMessage::new("real question", "claude-sonnet-4.5")
+                    .with_images(vec![KiroImage::from_base64("png", "iVBORw0KGgo=")]),
+            ))
+            .with_history(Vec::new());
+
+        let repaired = repair_non_empty_content_pass(&mut state);
+        assert_eq!(repaired, 0);
+        assert_eq!(
+            state.current_message.user_input_message.content,
+            "real question"
+        );
+    }
+
+    /// 对照：带 tool_results 但 content 为空的历史 user 消息同样要补（has_payload 门
+    /// 判据的另一个输入）。
+    #[test]
+    fn repair_non_empty_content_fixes_empty_content_with_tool_results() {
+        let mut history_user = HistoryUserMessage::new("", "claude-sonnet-4.5");
+        history_user.user_input_message.user_input_message_context =
+            UserInputMessageContext::new()
+                .with_tool_results(vec![ToolResult::success("t1", "output")]);
+        let mut state = ConversationState::new("test")
+            .with_current_message(CurrentMessage::new(UserInputMessage::new(
+                "",
+                "claude-sonnet-4.5",
+            )))
+            .with_history(vec![Message::User(history_user)]);
+
+        let repaired = repair_non_empty_content_pass(&mut state);
+        assert_eq!(
+            repaired, 2,
+            "带 tool_results 的空 content 也必须补占位符（旧代码 has_payload 门放过）"
+        );
+        if let Message::User(u) = &state.history[0] {
+            assert_eq!(u.user_input_message.content, ".");
+            assert!(!u.user_input_message.user_input_message_context.tool_results.is_empty());
         }
     }
 }

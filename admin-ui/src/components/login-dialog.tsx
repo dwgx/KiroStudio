@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { useTranslation } from 'react-i18next'
+import { useTranslation, Trans } from 'react-i18next'
 import { toast } from 'sonner'
 import {
   Dialog,
@@ -26,6 +26,7 @@ import { copyToClipboard, extractErrorMessage } from '@/lib/utils'
 import { CheckCircle2, XCircle, Loader2 } from 'lucide-react'
 import { AnimatedHeight } from '@/components/ui/animated-height'
 import { RegionSelect } from '@/components/ui/region-select'
+import { createPollGuard } from '@/lib/poll-guard'
 import { regionLabel } from '@/lib/regions'
 import type { StartSocialLoginResponse, ExternalIdpProfileOption } from '@/types/api'
 
@@ -61,6 +62,8 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
   const [proxyUrl, setProxyUrl] = useState('')
   const [isStarting, setIsStarting] = useState(false)
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // 轮询链守卫：关闭后 in-flight 回调自尽、旧代次不复活（见 lib/poll-guard.ts）。
+  const pollGuard = useRef(createPollGuard()).current
 
   // Web login state
   const [webSession, setWebSession] = useState<StartSocialLoginResponse | null>(null)
@@ -87,8 +90,15 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
   // 多 region profile 选择：leg2 返回多个 profile 时填充，用户选一个后调 select 建号。
   const [eidpProfiles, setEidpProfiles] = useState<ExternalIdpProfileOption[]>([])
   const [eidpCredId, setEidpCredId] = useState<number | null>(null)
+  // select 建号实际生效的 region（后端回显：可能因所选 profile 不可用被自动替换）。
+  const [eidpResultRegion, setEidpResultRegion] = useState('')
 
   const stopPolling = () => {
+    // 终止当前轮询链：递增代次，已捕获旧代次的在途回调（含 await 返回后）在
+    // isCurrent 复查时自尽——不排期、不弹 toast、不 setStep。countdown 超时路径
+    // （到 0 时只调 stopPolling）因此同样杀死在飞 pollIdc 链，不再复活打断新流程。
+    // 对话框保持 open：超时后用户重试发起的新链捕获新代次仍有效。
+    pollGuard.bump()
     if (pollTimerRef.current) {
       clearTimeout(pollTimerRef.current)
       pollTimerRef.current = null
@@ -100,51 +110,59 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
   }
 
   useEffect(() => {
-    if (!open) {
-      stopPolling()
-      const t = setTimeout(() => {
-        setStep('form')
-        setWebSession(null)
-        setIdcSession(null)
-        setResultEmail(null)
-        setCountdown(0)
-        setIsStarting(false)
-        setEidpStep(0)
-        setEidpRegion('')
-        setEidpBusy(false)
-        setEidpSessionId('')
-        setEidpSigninUrl('')
-        setEidpAuthorizeUrl('')
-        setEidpUrl1('')
-        setEidpUrl2('')
-        setEidpCredId(null)
-        setEidpProfiles([])
-      }, 200)
-      return () => clearTimeout(t)
+    if (open) {
+      pollGuard.open()
+      return
     }
+    pollGuard.close()
+    stopPolling()
+    const resetTimer = setTimeout(() => {
+      setStep('form')
+      setWebSession(null)
+      setIdcSession(null)
+      setResultEmail(null)
+      setCountdown(0)
+      setIsStarting(false)
+      setEidpStep(0)
+      setEidpRegion('')
+      setEidpBusy(false)
+      setEidpSessionId('')
+      setEidpSigninUrl('')
+      setEidpAuthorizeUrl('')
+      setEidpUrl1('')
+      setEidpUrl2('')
+      setEidpCredId(null)
+      setEidpResultRegion('')
+      setEidpProfiles([])
+    }, 200)
+    return () => clearTimeout(resetTimer)
   }, [open])
 
-  useEffect(() => () => stopPolling(), [])
+  useEffect(() => () => { stopPolling(); pollGuard.close() }, [])
 
   // --- Web login ---
   const pollWeb = (sessionId: string) => {
+    const epoch = pollGuard.epoch()
     pollTimerRef.current = setTimeout(async () => {
+      if (!pollGuard.isCurrent(epoch)) return
       try {
         const result = await pollSocialLogin(sessionId)
+        if (!pollGuard.isCurrent(epoch)) return
         if (result.status === 'pending') {
           pollWeb(sessionId)
         } else if (result.status === 'done') {
           stopPolling()
           setResultEmail(result.email ?? null)
           setStep('done')
-          toast.success(`上号成功，凭据 #${result.credentialId}`)
+          toast.success(t('logindialog.toast.webLoginSuccess') + result.credentialId)
           onSuccess?.()
         } else {
           stopPolling()
-          toast.error(result.message || '登录失败')
+          toast.error(result.message || t('logindialog.toast.loginFailed'))
           setStep('form')
         }
       } catch {
+        if (!pollGuard.isCurrent(epoch)) return
         pollWeb(sessionId)
       }
     }, SOCIAL_POLL_MS)
@@ -169,9 +187,12 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
 
   // --- IDC login ---
   const pollIdc = (sessionId: string) => {
+    const epoch = pollGuard.epoch()
     pollTimerRef.current = setTimeout(async () => {
+      if (!pollGuard.isCurrent(epoch)) return
       try {
         const result = await pollIdcLogin(sessionId)
+        if (!pollGuard.isCurrent(epoch)) return
         if (result.status === 'pending') {
           pollIdc(sessionId)
         } else if (result.status === 'done') {
@@ -189,6 +210,7 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
           setStep('form')
         }
       } catch {
+        if (!pollGuard.isCurrent(epoch)) return
         pollIdc(sessionId)
       }
     }, IDC_POLL_MS)
@@ -250,7 +272,7 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
 
   const handleEidpLeg1 = async () => {
     if (!eidpUrl1.trim()) {
-      toast.error('请粘贴登录后浏览器地址栏的完整 URL')
+      toast.error(t('logindialog.toast.pasteSigninUrl'))
       return
     }
     setEidpBusy(true)
@@ -267,7 +289,7 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
 
   const handleEidpLeg2 = async () => {
     if (!eidpUrl2.trim()) {
-      toast.error('请粘贴授权后浏览器地址栏的完整 URL')
+      toast.error(t('logindialog.toast.pasteAuthorizeUrl'))
       return
     }
     setEidpBusy(true)
@@ -277,7 +299,7 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
       if (resp.credentialId != null) {
         setEidpCredId(resp.credentialId)
         setEidpStep(3)
-        toast.success(`微软上号成功，凭据 #${resp.credentialId}`)
+        toast.success(t('logindialog.toast.msLoginSuccess') + resp.credentialId)
         onSuccess?.()
         return
       }
@@ -287,7 +309,7 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
         setEidpStep('select')
         return
       }
-      toast.error('该账号未探测到可用 profile（可能未开通 Kiro/CodeWhisperer）')
+      toast.error(t('logindialog.toast.noProfileFound'))
     } catch (err) {
       toast.error(extractErrorMessage(err))
     } finally {
@@ -300,8 +322,14 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
     try {
       const resp = await submitExternalIdpLeg2Select(eidpSessionId, arn)
       setEidpCredId(resp.credentialId)
+      // 回显实际生效 region：用户选的 profile 可能不可用被后端静默替换，toast 与
+      // 成功步 UI 都要让用户知道最终建号用的是什么。
+      setEidpResultRegion(resp.region ?? '')
       setEidpStep(3)
-      toast.success(`微软上号成功，凭据 #${resp.credentialId}`)
+      toast.success(
+        t('logindialog.toast.msLoginSuccess') + resp.credentialId +
+        (resp.region ? ', ' + t('logindialog.eidp.regionResult', { region: resp.region }) : '')
+      )
       onSuccess?.()
     } catch (err) {
       toast.error(extractErrorMessage(err))
@@ -318,8 +346,8 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
 
   const handleCopyUrl = async (url: string) => {
     const ok = await copyToClipboard(url)
-    if (ok) toast.success('链接已复制')
-    else toast.error('复制失败，请手动选中链接复制')
+    if (ok) toast.success(t('logindialog.toast.linkCopied'))
+    else toast.error(t('logindialog.toast.copyFailedSelectManually'))
   }
 
   const formatCountdown = (secs: number) => {
@@ -333,9 +361,9 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-[500px] max-h-[85vh] overflow-y-auto">
+      <DialogContent className="sm:max-w-[500px] max-h-[85vh] overflow-y-auto" aria-describedby={undefined}>
         <DialogHeader>
-          <DialogTitle>上号</DialogTitle>
+          <DialogTitle>{t('logindialog.title')}</DialogTitle>
         </DialogHeader>
 
         {/* Tab switcher - 仅初始表单态可切换。底部一条滑动指示条随选中项平移(丝滑切换)。 */}
@@ -349,7 +377,7 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
                   mode === m ? 'text-[#ededed]' : 'text-[#888] hover:text-[#ededed]'
                 }`}
               >
-                {m === 'web' ? '网页上号' : m === 'idc' ? 'IDC 上号' : '微软SSO'}
+                {m === 'web' ? t('logindialog.tab.web') : m === 'idc' ? t('logindialog.tab.idc') : t('logindialog.tab.externalIdp')}
               </button>
             ))}
             {/* 滑动指示条:宽度=1/3,left 随选中项平移,transform 过渡丝滑 */}
@@ -369,7 +397,7 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
         {step === 'form' && mode === 'web' && (
           <div className="space-y-4 py-2">
             <p className="text-sm text-muted-foreground">
-              在浏览器中登录你的 Kiro 账号，完成后凭据会自动加入池。
+              {t('logindialog.web.intro')}
             </p>
             <div className="space-y-2">
               <label className="text-sm font-medium">{t('idclogindialog.form.priorityLabel')}</label>
@@ -384,9 +412,10 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
               <p className="text-xs text-muted-foreground">{t('idclogindialog.form.priorityHelp')}</p>
             </div>
             <div className="space-y-2">
-              <label className="text-sm font-medium">{t('idclogindialog.form.proxyLabel')}</label>
+              <label className="text-sm font-medium" htmlFor="login-proxy-url">{t('idclogindialog.form.proxyLabel')}</label>
               <div className="flex items-center gap-2">
                 <Input
+                  id="login-proxy-url"
                   className="flex-1"
                   value={proxyUrl}
                   onChange={(e) => setProxyUrl(e.target.value)}
@@ -405,8 +434,9 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
               {t('idclogindialog.form.intro')}
             </p>
             <div className="space-y-2">
-              <label className="text-sm font-medium">{t('idclogindialog.form.startUrlLabel')}</label>
+              <label className="text-sm font-medium" htmlFor="idc-start-url">{t('idclogindialog.form.startUrlLabel')}</label>
               <Input
+                id="idc-start-url"
                 value={startUrl}
                 onChange={(e) => setStartUrl(e.target.value)}
                 placeholder="https://d-xxxxxxxxxx.awsapps.com/start"
@@ -438,9 +468,10 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
               <p className="text-xs text-muted-foreground">{t('idclogindialog.form.priorityHelp')}</p>
             </div>
             <div className="space-y-2">
-              <label className="text-sm font-medium">{t('idclogindialog.form.proxyLabel')}</label>
+              <label className="text-sm font-medium" htmlFor="idc-proxy-url">{t('idclogindialog.form.proxyLabel')}</label>
               <div className="flex items-center gap-2">
                 <Input
+                  id="idc-proxy-url"
                   className="flex-1"
                   value={proxyUrl}
                   onChange={(e) => setProxyUrl(e.target.value)}
@@ -457,9 +488,11 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
         {mode === 'external-idp' && eidpStep === 0 && (
           <div className="space-y-4 py-2">
             <div className="rounded-md border border-[#2e2e2e] bg-[#0070f3]/5 p-3 text-xs text-muted-foreground leading-relaxed">
-              全程<strong className="text-[#ededed]">零本机运行</strong>：你的机器不装、不跑任何程序，
-              只需在浏览器里登录微软账号，再把地址栏里跳转出来的 URL 复制粘贴回来即可。
-              下面会分 3 步引导你完成。
+              <Trans i18nKey="logindialog.eidp.zeroLocalRun">
+                全程<strong className="text-[#ededed]">零本机运行</strong>：你的机器不装、不跑任何程序，
+                只需在浏览器里登录微软账号，再把地址栏里跳转出来的 URL 复制粘贴回来即可。
+                下面会分 3 步引导你完成。
+              </Trans>
             </div>
             <div className="space-y-2">
               <label className="text-sm font-medium">{t('idclogindialog.form.priorityLabel')}</label>
@@ -474,22 +507,22 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
               <p className="text-xs text-muted-foreground">{t('idclogindialog.form.priorityHelp')}</p>
             </div>
             <div className="space-y-2">
-              <label className="text-sm font-medium">优先探测区域（可选）</label>
+              <label className="text-sm font-medium">{t('logindialog.eidp.regionProbeLabel')}</label>
               <RegionSelect
                 value={eidpRegion}
                 onChange={setEidpRegion}
-                placeholder="留空按默认候选探测"
+                placeholder={t('logindialog.eidp.regionProbePlaceholder')}
                 disabled={eidpBusy}
               />
               <p className="text-xs text-muted-foreground">
-                微软号区域会在授权后自动探测。若你的账号只在冷门区域（如 eu-central-1）开通，
-                填这里可优先探测该区域，避免漏掉。不确定就留空。
+                {t('logindialog.eidp.regionProbeHint')}
               </p>
             </div>
             <div className="space-y-2">
-              <label className="text-sm font-medium">{t('idclogindialog.form.proxyLabel')}</label>
+              <label className="text-sm font-medium" htmlFor="eidp-proxy-url">{t('idclogindialog.form.proxyLabel')}</label>
               <div className="flex items-center gap-2">
                 <Input
+                  id="eidp-proxy-url"
                   className="flex-1"
                   value={proxyUrl}
                   onChange={(e) => setProxyUrl(e.target.value)}
@@ -505,22 +538,26 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
         {/* 微软 SSO 第 1 步：打开登录链接，粘回登录后地址栏 URL */}
         {mode === 'external-idp' && eidpStep === 1 && (
           <div className="space-y-4 py-2">
-            <div className="text-sm font-medium text-[#ededed]">步骤 1 / 3 · 登录微软账号</div>
+            <div className="text-sm font-medium text-[#ededed]">{t('logindialog.eidp.step1Title')}</div>
             <p className="text-sm text-muted-foreground leading-relaxed">
-              在浏览器中打开下面的链接，登录你的 Microsoft 账号。
-              登录后浏览器会跳到一个<strong className="text-[#ededed]">打不开的 localhost:3128 页面</strong>
-              （显示空白或“无法访问”都属正常）。把那个页面
-              <strong className="text-[#ededed]">地址栏里的完整 URL</strong> 复制，粘到下面的输入框。
+              <Trans i18nKey="logindialog.eidp.step1Desc">
+                在浏览器中打开下面的链接，登录你的 Microsoft 账号。
+                登录后浏览器会跳到一个<strong className="text-[#ededed]">打不开的 localhost:3128 页面</strong>
+                （显示空白或“无法访问”都属正常）。把那个页面
+                <strong className="text-[#ededed]">地址栏里的完整 URL</strong> 复制，粘到下面的输入框。
+              </Trans>
             </p>
             <div className="flex items-center gap-2">
               <Input
+                id="eidp-signin-url"
                 readOnly
                 value={eidpSigninUrl}
                 className="text-xs"
+                aria-label={t('logindialog.eidp.signinUrlAria')}
                 onFocus={(e) => e.currentTarget.select()}
               />
               <Button type="button" variant="outline" onClick={() => handleCopyUrl(eidpSigninUrl)}>
-                复制
+                {t('logindialog.button.copy')}
               </Button>
             </div>
             <Button
@@ -528,11 +565,12 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
               className="w-full"
               onClick={() => window.open(eidpSigninUrl, '_blank', 'noopener,noreferrer')}
             >
-              打开登录链接
+              {t('logindialog.button.openSigninLink')}
             </Button>
             <div className="space-y-2">
-              <label className="text-sm font-medium">粘贴登录后地址栏的完整 URL</label>
+              <label className="text-sm font-medium" htmlFor="eidp-url-1">{t('logindialog.eidp.pasteSigninUrlLabel')}</label>
               <textarea
+                id="eidp-url-1"
                 value={eidpUrl1}
                 onChange={(e) => setEidpUrl1(e.target.value)}
                 placeholder="http://localhost:3128/oauth/callback?code=...&state=..."
@@ -546,21 +584,25 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
         {/* 微软 SSO 第 2 步：打开授权链接，粘回授权后地址栏 URL */}
         {mode === 'external-idp' && eidpStep === 2 && (
           <div className="space-y-4 py-2">
-            <div className="text-sm font-medium text-[#ededed]">步骤 2 / 3 · 完成微软授权</div>
+            <div className="text-sm font-medium text-[#ededed]">{t('logindialog.eidp.step2Title')}</div>
             <p className="text-sm text-muted-foreground leading-relaxed">
-              打开下面的链接完成 Microsoft 授权。授权后浏览器同样会跳到一个
-              <strong className="text-[#ededed]">打不开的 localhost 页面</strong>（空白或无法访问都正常）。
-              再次把该页面<strong className="text-[#ededed]">地址栏里的完整 URL</strong> 复制，粘到下面。
+              <Trans i18nKey="logindialog.eidp.step2Desc">
+                打开下面的链接完成 Microsoft 授权。授权后浏览器同样会跳到一个
+                <strong className="text-[#ededed]">打不开的 localhost 页面</strong>（空白或无法访问都正常）。
+                再次把该页面<strong className="text-[#ededed]">地址栏里的完整 URL</strong> 复制，粘到下面。
+              </Trans>
             </p>
             <div className="flex items-center gap-2">
               <Input
+                id="eidp-authorize-url"
                 readOnly
                 value={eidpAuthorizeUrl}
                 className="text-xs"
+                aria-label={t('logindialog.eidp.authorizeUrlAria')}
                 onFocus={(e) => e.currentTarget.select()}
               />
               <Button type="button" variant="outline" onClick={() => handleCopyUrl(eidpAuthorizeUrl)}>
-                复制
+                {t('logindialog.button.copy')}
               </Button>
             </div>
             <Button
@@ -568,11 +610,12 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
               className="w-full"
               onClick={() => window.open(eidpAuthorizeUrl, '_blank', 'noopener,noreferrer')}
             >
-              打开授权链接
+              {t('logindialog.button.openAuthorizeLink')}
             </Button>
             <div className="space-y-2">
-              <label className="text-sm font-medium">粘贴授权后地址栏的完整 URL</label>
+              <label className="text-sm font-medium" htmlFor="eidp-url-2">{t('logindialog.eidp.pasteAuthorizeUrlLabel')}</label>
               <textarea
+                id="eidp-url-2"
                 value={eidpUrl2}
                 onChange={(e) => setEidpUrl2(e.target.value)}
                 placeholder="http://localhost:3128/...?code=...&state=..."
@@ -589,7 +632,7 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
         {mode === 'external-idp' && eidpStep === 'select' && (
           <div className="space-y-3 py-2">
             <p className="text-sm text-muted-foreground">
-              该账号在多个区域各有一个 profile，请选择要使用的区域（决定对话走哪个上游端点，务必选账号真实开通的区域）。
+              {t('logindialog.eidp.selectRegionDesc')}
             </p>
             <div className="space-y-2">
               {[...eidpProfiles]
@@ -619,14 +662,14 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
                           <span className="truncate">{regionLabel(p.region)}</span>
                           {!usable && (
                             <span className="shrink-0 rounded bg-white/5 px-1 py-0.5 text-[10px] text-muted-foreground">
-                              该区域未开通
+                              {t('logindialog.eidp.regionNotEnabled')}
                             </span>
                           )}
                         </div>
                         <div className="mt-0.5 truncate text-xs text-muted-foreground">
                           {p.region}
                           {p.subscriptionTitle ? ` · ${p.subscriptionTitle}` : ''}
-                          {p.account ? ` · 账号 ${p.account}` : ''}
+                          {p.account ? ` · ${t('logindialog.eidp.accountPrefix')}${p.account}` : ''}
                         </div>
                       </div>
                       {eidpBusy && <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-primary" />}
@@ -641,9 +684,12 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
         {mode === 'external-idp' && eidpStep === 3 && (
           <div className="space-y-3 py-4 text-center">
             <CheckCircle2 className="mx-auto h-12 w-12 text-green-600 dark:text-green-400" />
-            <p className="text-sm font-medium">微软上号成功</p>
+            <p className="text-sm font-medium">{t('logindialog.eidp.successTitle')}</p>
             {eidpCredId !== null && (
-              <p className="text-xs text-muted-foreground">凭据 #{eidpCredId} 已加入池</p>
+              <p className="text-xs text-muted-foreground">{t('logindialog.eidp.credAddedToPool', { id: eidpCredId })}</p>
+            )}
+            {eidpResultRegion && (
+              <p className="text-xs text-muted-foreground">{t('logindialog.eidp.regionResult', { region: eidpResultRegion })}</p>
             )}
           </div>
         )}
@@ -652,17 +698,19 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
         {step === 'waiting' && mode === 'web' && webSession && (
           <div className="space-y-4 py-2">
             <p className="text-sm text-muted-foreground">
-              点「打开登录页」在新标签页登录 Kiro 账号；登录完成后会自动检测并入池。
+              {t('logindialog.web.waitingIntro')}
             </p>
             <div className="flex items-center gap-2">
               <Input
+                id="web-portal-url"
                 readOnly
                 value={webSession.portalUrl}
                 className="text-xs"
+                aria-label={t('logindialog.web.portalUrlAria')}
                 onFocus={(e) => e.currentTarget.select()}
               />
               <Button type="button" variant="outline" onClick={() => handleCopyUrl(webSession.portalUrl)}>
-                复制
+                {t('logindialog.button.copy')}
               </Button>
             </div>
             <Button
@@ -670,11 +718,11 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
               className="w-full"
               onClick={() => window.open(webSession.portalUrl, '_blank', 'noopener,noreferrer')}
             >
-              打开登录页
+              {t('logindialog.button.openSigninPage')}
             </Button>
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
               <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-primary" />
-              等待浏览器完成登录…
+              {t('logindialog.web.waitingBrowser')}
             </div>
           </div>
         )}
@@ -702,9 +750,11 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
             </div>
             <div className="flex items-center gap-2">
               <Input
+                id="idc-verification-url"
                 readOnly
                 value={idcSession.verificationUriComplete || idcSession.verificationUri}
                 className="text-xs"
+                aria-label={t('idclogindialog.waiting.verificationUrlAria')}
                 onFocus={(e) => e.currentTarget.select()}
               />
               <Button
@@ -712,7 +762,7 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
                 variant="outline"
                 onClick={() => handleCopyUrl(idcSession.verificationUriComplete || idcSession.verificationUri)}
               >
-                复制
+                {t('logindialog.button.copy')}
               </Button>
             </div>
             <Button
@@ -740,7 +790,7 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
           <div className="space-y-3 py-4 text-center">
             <CheckCircle2 className="mx-auto h-12 w-12 text-green-600 dark:text-green-400" />
             <p className="text-sm font-medium">
-              {mode === 'web' ? '网页上号成功' : t('idclogindialog.done.title')}
+              {mode === 'web' ? t('logindialog.done.webSuccess') : t('idclogindialog.done.title')}
             </p>
             {resultEmail && (
               <p className="text-xs text-muted-foreground">{resultEmail}</p>
@@ -794,7 +844,7 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
                 {t('idclogindialog.footer.cancel')}
               </Button>
               <Button type="button" onClick={handleStart} disabled={eidpBusy}>
-                {eidpBusy ? '启动中…' : '开始'}
+                {eidpBusy ? t('logindialog.button.starting') : t('logindialog.button.start')}
               </Button>
             </>
           )}
@@ -809,7 +859,7 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
                 {t('idclogindialog.footer.cancel')}
               </Button>
               <Button type="button" onClick={handleEidpLeg1} disabled={eidpBusy}>
-                {eidpBusy ? '提交中…' : '下一步'}
+                {eidpBusy ? t('logindialog.button.submitting') : t('logindialog.button.next')}
               </Button>
             </>
           )}
@@ -824,7 +874,7 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
                 {t('idclogindialog.footer.cancel')}
               </Button>
               <Button type="button" onClick={handleEidpLeg2} disabled={eidpBusy}>
-                {eidpBusy ? '提交中…' : '完成上号'}
+                {eidpBusy ? t('logindialog.button.submitting') : t('logindialog.button.finishLogin')}
               </Button>
             </>
           )}

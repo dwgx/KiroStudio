@@ -275,6 +275,15 @@ pub struct KiroCredentials {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled_at: Option<String>,
 
+    /// 额度耗尽（MONTHLY_REQUEST_COUNT 402 / 余额刷新剩余<=0）被判定的时刻（RFC3339，持久化）。
+    ///
+    /// 与 `disabled_at` 解耦：`disabled_at` 记「禁用动作」的时刻，本字段记「额度耗尽判定」
+    /// 的时刻——跨自然月自动恢复（`token_manager::recover_expired_quota_disables`）以它为
+    /// 判据：Kiro 的月配额按自然月重置，当前月份 != 判定月份即可恢复。`None` = 旧文件或
+    /// 未记录（跨月恢复时视为可恢复，避免永久钉死）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_exhausted_at: Option<String>,
+
     /// Kiro API Key（headless 模式）
     /// 格式: ksk_xxxxxxxx
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
@@ -702,13 +711,17 @@ impl KiroCredentials {
     /// 该号是否允许服务给定模型（成本安全白名单硬门）。
     ///
     /// `model` 为 map_model 后的规范 kiro modelId。未设白名单（None/空）→ 允许一切（兼容旧号）。
-    /// 设了白名单 → 仅当 model 在其中才允许（大小写不敏感）。用于 is_entry_selectable 过滤，
+    /// 设了白名单 → 仅当 model 在其中才允许（大小写不敏感；支持末尾 `*` 通配，
+    /// 与全局映射 [`crate::kiro::model_mapping::map_target`] 共用 [`wildcard_matches`]，
+    /// 多个规则任一命中即放行，OR 语义）。用于 is_entry_selectable 过滤，
     /// 确保便宜模型的请求绝不溢出到未列该模型的（更贵的）号。
     pub fn allows_model(&self, model: &str) -> bool {
         match &self.allowed_models {
             None => true,
             Some(list) if list.is_empty() => true,
-            Some(list) => list.iter().any(|m| m.eq_ignore_ascii_case(model)),
+            Some(list) => list
+                .iter()
+                .any(|m| crate::kiro::model_mapping::wildcard_matches(m, model)),
         }
     }
 
@@ -1021,6 +1034,50 @@ mod tests {
         );
         // 大小写不敏感
         assert!(c.allows_model("DeepSeek-3.2"));
+    }
+
+    #[test]
+    fn test_allows_model_wildcard() {
+        // 末尾 * 通配：deepseek-* 匹配所有 deepseek- 开头模型。
+        let c = KiroCredentials::from_json(r#"{"refreshToken":"x","allowedModels":["deepseek-*"]}"#)
+            .unwrap();
+        assert!(c.allows_model("deepseek-v4-flash"), "通配前缀应命中");
+        assert!(c.allows_model("deepseek-3.2"));
+        assert!(
+            !c.allows_model("claude-opus-4.8"),
+            "通配范围外的模型仍拒绝(防溢出)"
+        );
+    }
+
+    #[test]
+    fn test_allows_model_exact_plus_wildcard_mix() {
+        // 精确 + 通配混合，任一命中即放行（OR 语义）。
+        let c = KiroCredentials::from_json(
+            r#"{"refreshToken":"x","allowedModels":["deepseek-3.2","claude-*"]}"#,
+        )
+        .unwrap();
+        assert!(c.allows_model("deepseek-3.2"), "精确命中");
+        assert!(c.allows_model("claude-opus-4.8"), "通配命中");
+        assert!(
+            !c.allows_model("glm-5"),
+            "精确与通配都不命中的模型拒绝"
+        );
+    }
+
+    #[test]
+    fn test_allows_model_wildcard_case_insensitive() {
+        // 通配匹配与精确匹配同口径：大小写不敏感。
+        let c = KiroCredentials::from_json(r#"{"refreshToken":"x","allowedModels":["DEEPSEEK-*"]}"#)
+            .unwrap();
+        assert!(c.allows_model("deepseek-v4-flash"));
+    }
+
+    #[test]
+    fn test_allows_model_bare_star_allows_all() {
+        // * 单独 = 匹配全部（用户显式配置的全放行）。
+        let c = KiroCredentials::from_json(r#"{"refreshToken":"x","allowedModels":["*"]}"#).unwrap();
+        assert!(c.allows_model("claude-opus-4.8"));
+        assert!(c.allows_model("glm-5"));
     }
 
     #[test]
@@ -1585,6 +1642,7 @@ mod tests {
             disabled: false,
             disabled_reason: None,
             disabled_at: None,
+            quota_exhausted_at: None,
             kiro_api_key: None,
             endpoint: None,
             cli_origin_kiro_cli: None,
@@ -1723,6 +1781,7 @@ mod tests {
             disabled: false,
             disabled_reason: None,
             disabled_at: None,
+            quota_exhausted_at: None,
             kiro_api_key: None,
             endpoint: None,
             cli_origin_kiro_cli: None,
@@ -1774,6 +1833,7 @@ mod tests {
             disabled: false,
             disabled_reason: None,
             disabled_at: None,
+            quota_exhausted_at: None,
             kiro_api_key: None,
             endpoint: None,
             cli_origin_kiro_cli: None,
@@ -1877,6 +1937,7 @@ mod tests {
             expires_at: None,
             disabled_reason: None,
             disabled_at: None,
+            quota_exhausted_at: None,
             auth_method: Some("social".to_string()),
             client_id: None,
             client_secret: None,

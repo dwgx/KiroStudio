@@ -209,6 +209,8 @@ impl TraceDb {
             "ALTER TABLE traces ADD COLUMN upstream_model TEXT",
             // 中断字节（历史库补列，默认 NULL = 未中断，兼容旧数据）
             "ALTER TABLE traces ADD COLUMN interrupted_bytes INTEGER",
+            // 链内首选号（历史库补列，默认 NULL = 无 failover 信息，兼容旧数据）
+            "ALTER TABLE traces ADD COLUMN first_attempted_credential_id INTEGER",
         ];
         for sql in add_columns {
             if let Err(e) = conn.execute(sql, []) {
@@ -259,7 +261,8 @@ impl TraceDb {
                 cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
                 requested_model       TEXT,
                 upstream_model        TEXT,
-                interrupted_bytes     INTEGER
+                interrupted_bytes     INTEGER,
+                first_attempted_credential_id INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_traces_ts_ms ON traces(ts_ms);
             CREATE INDEX IF NOT EXISTS idx_traces_credential_id ON traces(credential_id);
@@ -287,8 +290,8 @@ impl TraceDb {
                         input_tokens, output_tokens, credits_used, latency_ms, first_token_ms,
                         outcome, retries, error_message, session_id, client_device,
                         client_ip, client_os, client_browser, cache_read_tokens, cache_creation_tokens,
-                        requested_model, upstream_model, interrupted_bytes
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+                        requested_model, upstream_model, interrupted_bytes, first_attempted_credential_id
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
                 )
                 .context("预编译 traces 插入语句失败")?;
             for record in records {
@@ -316,6 +319,7 @@ impl TraceDb {
                     record.requested_model,
                     record.upstream_model,
                     record.interrupted_bytes.map(|v| v as i64),
+                    record.first_attempted_credential_id.map(|v| v as i64),
                 ])
                 .context("INSERT traces 失败")?;
             }
@@ -341,6 +345,10 @@ impl TraceDb {
                 "trace_db 批量落账失败（已丢弃该批 {} 条）: {e:#}",
                 batch.len()
             );
+            // F5/D3-1（scheduling-audit-research）：SQLite 断写只 warn 的话——面板
+            // 「最近请求」的唯一数据源断写无人知（stats_stale 只盯 JSONL）。直报：
+            // webhook 冷却窗口内幂等（同 key 只发一次），未配置时零开销 no-op。
+            crate::common::alerting::bump("trace_db_write_failed");
         }
     }
 
@@ -354,7 +362,7 @@ impl TraceDb {
                     input_tokens, output_tokens, credits_used, latency_ms, first_token_ms,
                     outcome, retries, error_message, session_id, client_device,
                     client_ip, client_os, client_browser, cache_read_tokens, cache_creation_tokens,
-                    requested_model, upstream_model, interrupted_bytes
+                    requested_model, upstream_model, interrupted_bytes, first_attempted_credential_id
              FROM traces
              ORDER BY ts_ms DESC
              LIMIT ?1",
@@ -388,7 +396,7 @@ impl TraceDb {
                     input_tokens, output_tokens, credits_used, latency_ms, first_token_ms,
                     outcome, retries, error_message, session_id, client_device,
                     client_ip, client_os, client_browser, cache_read_tokens, cache_creation_tokens,
-                    requested_model, upstream_model, interrupted_bytes
+                    requested_model, upstream_model, interrupted_bytes, first_attempted_credential_id
              FROM traces{where_sql}
              ORDER BY ts_ms DESC
              LIMIT ? OFFSET ?"
@@ -523,6 +531,11 @@ fn row_to_record(row: &Row<'_>) -> rusqlite::Result<RequestRecord> {
         upstream_model: row.get(21).unwrap_or(None),
         // 中断字节（历史库缺列时兜底 None = 未中断，同 requested_model 模式）
         interrupted_bytes: row.get::<_, Option<i64>>(22).unwrap_or(None).map(|v| v as u64),
+        // 链内首选号（历史库缺列时兜底 None = 无 failover 信息，同 interrupted_bytes 模式）
+        first_attempted_credential_id: row
+            .get::<_, Option<i64>>(23)
+            .unwrap_or(None)
+            .map(|v| v as u64),
     })
 }
 
@@ -596,9 +609,16 @@ mod tests {
         rec.first_token_ms = Some(300);
         // 中断字节的往返验证（本样本 outcome 为 Success，仅为纯序列化往返用例）
         rec.interrupted_bytes = Some(2048);
+        // 链内首选号（N4 往返验证：与 credential_id=7 构成「首选号 → 最终号」换号链形态）
+        rec.first_attempted_credential_id = Some(3);
         rec.outcome = RequestOutcome::Success;
         rec.retries = 1;
         rec.error_message = Some("none".to_string());
+        // 映射双口径两列（与 by_model / by_requested_model 审计口径同构：requested =
+        // 客户端原始名、upstream = 改写后名）——insert→recent 往返在 roundtrip 测试与
+        // trace_db_roundtrip_mapping_dimensions 中显式断言。
+        rec.requested_model = Some("claude-sonnet-4".to_string());
+        rec.upstream_model = Some("deepseek-v4-flash".to_string());
         rec.session_id = Some("conv-1".to_string());
         rec.client_device = Some("claude-code".to_string());
         rec.client_ip = Some("203.0.113.7".to_string());
@@ -623,6 +643,10 @@ mod tests {
         assert_eq!(back.credential_id, Some(7));
         assert_eq!(back.model, "claude-sonnet-4");
         assert!(back.is_streaming);
+        assert_eq!(
+            back.first_attempted_credential_id, Some(3),
+            "链内首选号（SQLite 列）往返必须保留"
+        );
         assert_eq!(back.input_tokens, 120);
         assert_eq!(back.output_tokens, 45);
         assert_eq!(back.credits_used, Some(2.5));
@@ -632,11 +656,49 @@ mod tests {
         assert_eq!(back.outcome, RequestOutcome::Success);
         assert_eq!(back.retries, 1);
         assert_eq!(back.error_message, Some("none".to_string()));
+        assert_eq!(
+            back.requested_model.as_deref(),
+            Some("claude-sonnet-4"),
+            "requested_model（客户端原始名）往返必须保留"
+        );
+        assert_eq!(
+            back.upstream_model.as_deref(),
+            Some("deepseek-v4-flash"),
+            "upstream_model（改写后名）往返必须保留"
+        );
         assert_eq!(back.session_id, Some("conv-1".to_string()));
         assert_eq!(back.client_device, Some("claude-code".to_string()));
         assert_eq!(back.client_ip, Some("203.0.113.7".to_string()));
         assert_eq!(back.client_os, Some("Windows".to_string()));
         assert_eq!(back.client_browser, Some("Chrome 120".to_string()));
+    }
+
+    /// 映射双口径两列（requested_model / upstream_model）的 insert→recent 往返：
+    /// trace 详情页的模型双口径不被 SQLite 列级序列化/读取丢失（与 record.rs 的
+    /// JSONL 序列化测试互补，本测试验证的是 DB 列往返）。
+    #[test]
+    fn trace_db_roundtrip_mapping_dimensions() {
+        let tmp = TempDbPath::new("mapping-dims");
+        let db = TraceDb::open(tmp.path()).unwrap();
+
+        let rec = sample_record("req-map", 1_000);
+        db.on_record(&rec);
+
+        let got = db.recent(10).unwrap();
+        assert_eq!(got.len(), 1);
+        let back = &got[0];
+        assert_eq!(back.request_id, "req-map");
+        assert_eq!(
+            back.requested_model.as_deref(),
+            Some("claude-sonnet-4"),
+            "requested_model（客户端原始名）必须保留"
+        );
+        assert_eq!(
+            back.upstream_model.as_deref(),
+            Some("deepseek-v4-flash"),
+            "upstream_model（改写后名）必须保留"
+        );
+        assert_eq!(back.model, "claude-sonnet-4", "model 与 requested_model 同源");
     }
 
     #[test]
@@ -1132,5 +1194,60 @@ mod tests {
         drop(db);
         let db2 = TraceDb::open(tmp.path()).unwrap();
         assert_eq!(db2.recent(10).unwrap().len(), 2);
+    }
+
+    /// F5/D3-1：flush 落库失败必须 bump `trace_db_write_failed`（SQLite 断写直报，
+    /// 不依赖 stats_stale 的间接覆盖——stats_stale 只盯 JSONL）。
+    ///
+    /// 构造失败方式：drop 掉 traces 表后写记录触发 flush → `insert_batch` 在
+    /// prepare 阶段报 no such table。本地 HTTP server 收 payload 断言（同
+    /// alerting::tests 的 bump_with_reason_payload_carries_reason 模式）。
+    ///
+    /// 防自弱化：删掉 flush 失败分支的 bump 行 → 本测试收不到投递 → 超时红。
+    #[tokio::test]
+    async fn flush_failure_bumps_trace_db_write_failed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let _guard = crate::common::alerting::test_lock();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (body_tx, mut body_rx) = tokio::sync::mpsc::channel::<String>(4);
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 8192];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                if let Some(pos) = text.find("\r\n\r\n") {
+                    let _ = body_tx.send(text[pos + 4..].to_string()).await;
+                }
+                let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        crate::common::alerting::init(
+            Some(format!("http://{addr}/hook")),
+            3600,
+            "test".to_string(),
+        );
+
+        let tmp = TempDbPath::new("flush_fail");
+        let db = TraceDb::open(tmp.path()).unwrap();
+        // 破坏表结构：flush 时 insert_batch 的 prepare 必然失败（no such table）
+        db.conn.lock().execute_batch("DROP TABLE traces").unwrap();
+        db.on_record(&sample_record("req-fail", 1_000));
+        let _ = db.recent(10); // 读路径先 flush → 失败 → warn + bump
+
+        let body = tokio::time::timeout(std::time::Duration::from_secs(5), body_rx.recv())
+            .await
+            .expect("应收到告警投递")
+            .expect("channel 不应关闭");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("payload 应为 JSON");
+        assert_eq!(
+            v["key"], "trace_db_write_failed",
+            "flush 失败必须 bump trace_db_write_failed"
+        );
     }
 }

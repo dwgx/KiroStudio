@@ -144,6 +144,10 @@ pub struct CredentialStatusItem {
     /// 冷却原因（如「速率限制」「服务错误」）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cooldown_reason: Option<String>,
+    /// 冷却原因稳定枚举码（rate_limited/suspicious/...，见 `CooldownReason::code()`）。
+    /// 前端判定与 i18n 走此码；`cooldownReason` 仅作展示 fallback（老后端无此字段）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_code: Option<String>,
 }
 
 // ============ 凭据回收站 ============
@@ -1134,6 +1138,10 @@ pub struct ConfigSnapshotResponse {
     /// 全池自愈退避指数上限（2026-08-11 配置化；消费点另有 31 的硬 clamp 兜底）。
     pub self_heal_max_shift: u32,
     pub prompt_cache_enabled: bool,
+    /// 透传路径模拟缓存注入开关（伪造 cache_read 值仅供下游展示，默认关）
+    pub mock_cache_enabled: bool,
+    /// 模拟缓存命中比例 [0,1]（默认 0.7）
+    pub mock_cache_read_ratio: f64,
     /// 是否剥离转发给上游的 system 环境噪音（省 token / 提缓存命中 / 降关联，立即生效）
     pub strip_env_noise: bool,
     /// 工具错误缓解：泄漏控制 token 清洗 / 流式失败态对齐 / 如实暴露错误（均立即生效，默认关）
@@ -1200,6 +1208,9 @@ pub struct ConfigSnapshotResponse {
     // ---- 入站请求整形 + RPM 自动挡 ----
     /// 限流/重试档位（`shielded` / `direct` / `manual`）。默认 `manual` = 不覆盖任何字段。
     pub throttle_profile: crate::model::config::ThrottleProfile,
+    /// 调度模式（`smart` / `stable` / `manual`，三按钮）。默认 `smart` = 智能档标记，
+    /// 矩阵只在面板显式切换时写入（见 `SchedulingMode` 兼容语义）。
+    pub scheduling_mode: crate::model::config::SchedulingMode,
     pub inbound_throttle_enabled: bool,
     pub inbound_rpm_auto: bool,
     pub inbound_target_rpm: u32,
@@ -1284,6 +1295,10 @@ pub struct ConfigSnapshotResponse {
     // ---- 余额同步（A6）----
     /// 后台温和余额刷新间隔（秒，0=禁用）
     pub balance_refresh_interval_secs: u64,
+    // ---- OTA 自动检查 ----
+    /// 是否后台定时检查 GitHub 新版本（main.rs 启动期按此 spawn，需重启生效；
+    /// 只检查打日志，绝不自动下载替换）
+    pub ota_auto_check: bool,
     // ---- 隐私 ----
     /// 是否采集下游客户端指纹（device/ip/os/browser，立即生效）
     pub collect_client_fingerprint: bool,
@@ -1292,6 +1307,12 @@ pub struct ConfigSnapshotResponse {
     // ---- 全局模型映射 ----
     /// 客户端模型名 → 上游模型名（空表 = 不映射）。双口径用量（requested/upstream）的规则源。
     pub model_mapping: std::collections::HashMap<String, String>,
+    // ---- 错误码/提示词覆盖表 ----
+    /// 错误形态标识 → 覆盖条目（空表 = 全用内置默认）。字段级合并：
+    /// 条目内字段为 None 时用内置默认（只改 message 时 status/type 不必填）。
+    /// 校验失败整表拒绝（update_config 返 400，保持旧表）。
+    pub error_messages:
+        std::collections::HashMap<String, crate::model::error_messages::ErrorMessageOverride>,
 }
 
 /// 更新服务端配置请求
@@ -1343,6 +1364,13 @@ pub struct UpdateConfigRequest {
     pub self_heal_max_backoff_secs: Option<u64>,
     pub self_heal_max_shift: Option<u32>,
     pub prompt_cache_enabled: Option<bool>,
+    /// 透传路径**模拟缓存**注入开关（见 config 同名字段；TIER3 热更，改后调 handlers
+    /// setter 即时生效不重启）。开启后透传响应 usage 注入伪造 cache_read 值，仅供下游展示。
+    pub mock_cache_enabled: Option<bool>,
+    /// 模拟缓存命中比例 [0,1]（默认 0.7；1.0 = 100% 全命中）。非法值由镜像 setter clamp。
+    /// ⚠️ 必须 Option<f64>：裸 f64 配 serde(default) 会把「未传」当成 0.0（f64 的坑见
+    /// config.rs 的 upstream_retry_absorb_exhausted_status 同款 Option 约定）。
+    pub mock_cache_read_ratio: Option<f64>,
     pub strip_env_noise: Option<bool>,
     pub tool_clean_leaked_tokens: Option<bool>,
     pub tool_reclaim_textified_invoke: Option<bool>,
@@ -1396,6 +1424,9 @@ pub struct UpdateConfigRequest {
     /// 切换限流档位。⚠️ 档位只影响**配置文件里没显式写**的字段；
     /// 已显式配置过的值不会被冲掉（见 `ThrottleProfile` 文档的向前兼容论证）。
     pub throttle_profile: Option<crate::model::config::ThrottleProfile>,
+    /// 切换调度模式（三按钮：`smart` / `stable` / `manual`）。切换时后端映射到
+    /// 对应 ThrottleProfile 并写入预设矩阵（覆盖未显式配置的字段，与档位同机制）。
+    pub scheduling_mode: Option<crate::model::config::SchedulingMode>,
     pub inbound_throttle_enabled: Option<bool>,
     pub inbound_rpm_auto: Option<bool>,
     pub inbound_target_rpm: Option<u32>,
@@ -1447,12 +1478,22 @@ pub struct UpdateConfigRequest {
     // ---- 余额同步（A6，需重启生效）----
     /// 后台温和余额刷新间隔（秒，0=禁用）
     pub balance_refresh_interval_secs: Option<u64>,
+    // ---- OTA 自动检查（需重启生效）----
+    /// 是否后台定时检查 GitHub 新版本（main.rs 启动期按此 spawn 后台任务，
+    /// 重启后生效；只检查打日志，绝不自动下载替换）
+    pub ota_auto_check: Option<bool>,
     // ---- 隐私（立即生效）----
     /// 是否采集下游客户端指纹（device/ip/os/browser）
     pub collect_client_fingerprint: Option<bool>,
     // ---- 全局模型映射（立即生效，TIER1 热重载）----
     /// 客户端模型名 → 上游模型名（整表替换；传 {} = 清空全部规则）
     pub model_mapping: Option<std::collections::HashMap<String, String>>,
+    // ---- 错误码/提示词覆盖表（立即生效，TIER1 热重载）----
+    /// 错误形态标识 → 覆盖条目（整表替换；传 {} = 清空全部覆盖回落到内置默认）。
+    /// 条目内字段全可选（None = 内置默认）。校验失败整表拒绝（400 + 具体错误回显）。
+    pub error_messages: Option<
+        std::collections::HashMap<String, crate::model::error_messages::ErrorMessageOverride>,
+    >,
 }
 
 /// 更新服务端配置响应
@@ -1600,6 +1641,8 @@ pub struct DiagnosticsPoolHealth {
 pub struct DiagnosticsConfigSummary {
     pub load_balancing_mode: String,
     pub throttle_profile: crate::model::config::ThrottleProfile,
+    /// 调度模式（smart / stable / manual，三按钮方案的面向用户档位）
+    pub scheduling_mode: crate::model::config::SchedulingMode,
     pub inbound_throttle_enabled: bool,
     /// 整形闸门目标 RPM（实测吞吐见快照的 inbound 三字段，此处只给目标）
     pub inbound_target_rpm: u32,
@@ -2093,6 +2136,35 @@ mod tests {
         assert_eq!(req.login_background_r18, None);
     }
 
+    /// mock cache 两字段的线协议契约：camelCase 提交 → snake_case 落点；缺省 → None。
+    /// 回退即 FAIL：字段名/rename 改动会让前端「点了没反应」（后端收 None 零改动）。
+    #[test]
+    fn update_config_deserializes_mock_cache_fields() {
+        let json = r#"{"mockCacheEnabled": true, "mockCacheReadRatio": 1.0}"#;
+        let req: UpdateConfigRequest = serde_json::from_str(json).expect("反序列化应成功");
+        assert_eq!(req.mock_cache_enabled, Some(true));
+        assert_eq!(req.mock_cache_read_ratio, Some(1.0));
+
+        let empty: UpdateConfigRequest = serde_json::from_str("{}").expect("空对象应成功");
+        assert_eq!(empty.mock_cache_enabled, None);
+        assert_eq!(empty.mock_cache_read_ratio, None);
+    }
+
+    /// OTA 自动检查开关的线协议契约：camelCase 提交 → snake_case 落点；缺省 → None。
+    /// 🔴 回归（2026-08-15 补接线）：此前前端 settings-page.tsx 提交 `otaAutoCheck`，
+    /// 后端请求结构没有该字段 → serde 静默丢弃 → 用户开了自动检查实际不生效，
+    /// 且快照不下发 → 刷新后开关恒回弹为关。
+    /// 回退即 FAIL：字段名/rename 改动会让前端「点了没反应」（后端收 None 零改动）。
+    #[test]
+    fn update_config_deserializes_ota_auto_check() {
+        let json = r#"{"otaAutoCheck": true}"#;
+        let req: UpdateConfigRequest = serde_json::from_str(json).expect("反序列化应成功");
+        assert_eq!(req.ota_auto_check, Some(true));
+
+        let empty: UpdateConfigRequest = serde_json::from_str("{}").expect("空对象应成功");
+        assert_eq!(empty.ota_auto_check, None);
+    }
+
     // ---- 存储清理请求 ----
 
     /// 旧客户端不发 `purgeAll` 时必须默认 false（按天数清），不能变成"静默全清"。
@@ -2283,7 +2355,6 @@ mod tests {
     }
 
     /// 部分失败：total/imported/failed 由逐条结果汇总，失败条目带 error 且 key 脱敏。
-    #[test]
     /// 外部对接方（kiro-accounting 一类）的响应契约：`success` / `items` 必须存在，
     /// 且 `items` 与 `results` 是同一份数据。
     ///
@@ -2421,6 +2492,8 @@ mod tests {
             self_heal_max_backoff_secs: 900,
             self_heal_max_shift: 4,
             prompt_cache_enabled: false,
+            mock_cache_enabled: false,
+            mock_cache_read_ratio: 0.7,
             strip_env_noise: false,
             tool_clean_leaked_tokens: false,
             tool_reclaim_textified_invoke: false,
@@ -2452,6 +2525,7 @@ mod tests {
             cooldown_scale_pct: 0,
             rate_limit_jitter_pct: 0,
             throttle_profile: crate::model::config::ThrottleProfile::Manual,
+            scheduling_mode: crate::model::config::SchedulingMode::Smart,
             inbound_throttle_enabled: false,
             inbound_rpm_auto: false,
             inbound_target_rpm: 0,
@@ -2489,9 +2563,11 @@ mod tests {
             login_background_enabled: false,
             login_background_r18: false,
             balance_refresh_interval_secs: 0,
+            ota_auto_check: false,
             collect_client_fingerprint: false,
             config_path: None,
             model_mapping: std::collections::HashMap::new(),
+            error_messages: std::collections::HashMap::new(),
         }
     }
 
@@ -2542,6 +2618,7 @@ mod tests {
             ("upstreamRetryAbsorbSwapBudgetSecs", "0"),
             ("upstreamRetryAbsorbExhaustedStatus", "503"),
             ("nativeThinkingEffortEnabled", "false"),
+            ("otaAutoCheck", "false"),
         ] {
             let expect = format!("\"{key}\":{val}");
             assert!(
@@ -2685,6 +2762,8 @@ mod tests {
             self_heal_max_backoff_secs: 900,
             self_heal_max_shift: 4,
             prompt_cache_enabled: true,
+            mock_cache_enabled: false,
+            mock_cache_read_ratio: 0.7,
             cooldown_enabled: true,
             auto_disable_suspicious: true,
             auto_disable_quota_exceeded: true,
@@ -2702,6 +2781,7 @@ mod tests {
             cooldown_scale_pct: 100,
             rate_limit_jitter_pct: 20,
             throttle_profile: crate::model::config::ThrottleProfile::Manual,
+            scheduling_mode: crate::model::config::SchedulingMode::Smart,
             inbound_throttle_enabled: true,
             inbound_rpm_auto: true,
             inbound_target_rpm: 100,
@@ -2741,6 +2821,7 @@ mod tests {
             login_background_enabled: true,
             login_background_r18: false,
             balance_refresh_interval_secs: 1800,
+            ota_auto_check: false,
             collect_client_fingerprint: true,
             strip_env_noise: true,
             tool_clean_leaked_tokens: true,
@@ -2758,6 +2839,7 @@ mod tests {
             encrypt_credentials_at_rest: false,
             config_path: None,
             model_mapping: std::collections::HashMap::new(),
+            error_messages: std::collections::HashMap::new(),
         };
         let s = serde_json::to_string(&snap).expect("序列化应成功");
         assert!(s.contains("\"loginBackgroundR18\":false"));
@@ -2775,6 +2857,8 @@ mod tests {
             "\"cliCodewhispererOptoutFalse\":",
             "\"cliUaAlignRealClient\":",
             "\"upstreamPerCredentialLimit\":",
+            "\"mockCacheEnabled\":",
+            "\"mockCacheReadRatio\":",
         ] {
             assert!(s.contains(key), "快照缺少 {key} —— 前端会读到 undefined 且无报错");
         }
@@ -2830,5 +2914,58 @@ mod tests {
         // 失败条的错误消息必带，成功条不泄漏 error 字段。
         assert!(s.contains("\"error\":\"凭据已被删除\""));
         assert!(!s.contains("\"error\":null"));
+    }
+
+    // ---- 错误码/提示词覆盖表 ----
+
+    /// ⭐ 线协议契约：errorMessages 必须以**精确的 camelCase 名**上下行。
+    ///
+    /// 回退即 FAIL：改字段名（或去掉 `rename_all = "camelCase"`）断言失败。
+    /// 前端按这些字符串读写（settings-page 错误提示词编辑页），名字对不上时
+    /// 无任何编译/运行时报错，表现为「保存成功但读回是空表」。
+    #[test]
+    fn error_messages_use_exact_camel_case_on_the_wire() {
+        use crate::model::error_messages::ErrorMessageOverride;
+
+        // 出向：快照带 errorMessages，条目字段全 camelCase（type 是保留字也照发）。
+        let mut table = std::collections::HashMap::new();
+        table.insert(
+            "quota_exhausted".to_string(),
+            ErrorMessageOverride {
+                status: Some(429),
+                r#type: Some("rate_limit_error".to_string()),
+                message: Some("自定义文案".to_string()),
+                retry_after_secs: Some(5),
+            },
+        );
+        let snap = ConfigSnapshotResponse {
+            error_messages: table,
+            ..absorb_snapshot_fixture()
+        };
+        let s = serde_json::to_string(&snap).expect("序列化应成功");
+        assert!(
+            s.contains(
+                "\"errorMessages\":{\"quota_exhausted\":{\"status\":429,\"type\":\"rate_limit_error\",\"message\":\"自定义文案\",\"retryAfterSecs\":5}}"
+            ),
+            "快照必须含完整 camelCase 条目；字段名不符时前端那个键是 undefined。实际: {s}"
+        );
+
+        // 入向：前端提交的 camelCase（含 type/retryAfterSecs）必须反序列化进对应字段。
+        let req: UpdateConfigRequest = serde_json::from_str(
+            r#"{"errorMessages":{"quota_exhausted":{"status":429,"type":"rate_limit_error",
+                "message":"m","retryAfterSecs":3}}}"#,
+        )
+        .expect("前端 camelCase 请求体必须能反序列化");
+        let table = req.error_messages.expect("errorMessages 必须进请求结构");
+        let entry = &table["quota_exhausted"];
+        assert_eq!(entry.status, Some(429));
+        assert_eq!(entry.r#type.as_deref(), Some("rate_limit_error"));
+        assert_eq!(entry.message.as_deref(), Some("m"));
+        assert_eq!(entry.retry_after_secs, Some(3));
+
+        // 缺省：不提交 errorMessages 时必须是 None（整表替换语义，不清空旧表）。
+        let empty: UpdateConfigRequest =
+            serde_json::from_str(r#"{"host":"127.0.0.1"}"#).expect("缺省必须可反序列化");
+        assert!(empty.error_messages.is_none());
     }
 }

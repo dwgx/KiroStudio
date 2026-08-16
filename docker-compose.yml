@@ -30,11 +30,24 @@ services:
       # 宿主端口:容器端口。改宿主端口只需在 .env 里设 KIROSTUDIO_PORT
       - "${KIROSTUDIO_PORT:-8990}:8990"
     volumes:
-      # 配置与凭据持久化目录（config.json / credentials.json / 用量数据）
+      # 配置与凭据持久化目录（config.json / credentials.json）
       - ./config:/app/config
+      # 数据持久化目录（traces.db / usage-*.jsonl）：默认 usageDataDir=data/usage
+      # → 容器内 /app/data/usage。不挂载则重启/重建后用量明细与统计全丢。
+      - ./data:/app/data
+    # 日志上限：单文件 10MB、保留 5 个滚动文件。不设上限时 json-file 驱动会让
+    # 容器日志无界膨胀占满磁盘（用量管道本身也写文件，日志是额外一路）。
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     restart: unless-stopped
+    # 探 /v1/models 而不是 /admin：/admin 是带 adminApiKey 鉴权的完整 UI 页，
+    # 探它既重又不反映「网关可用」。/v1/models 未带有效 apiKey 时返 401——
+    # 401 也说明 HTTP 栈活着（连接建立 + 路由命中 + 鉴权拦截都正常），故 200/401 都算健康。
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8990/admin"]
+      test: ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8990/v1/models | grep -Eq '^(200|401)$'"]
       interval: 30s
       timeout: 5s
       start_period: 20s

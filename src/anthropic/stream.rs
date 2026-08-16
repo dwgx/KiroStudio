@@ -93,6 +93,15 @@ impl CompletionStatus {
     }
 
     /// 面向客户端的错误描述（用于 SSE error 事件 / 非流式错误体）。
+    ///
+    /// ⚠️ **流内形态硬编码，不可配置（M5 决策，2026-08-15 对抗审查）**：
+    /// D11-D14 的 in-band 错误是动态模板（`上游返回错误: {code} - {message}`、
+    /// 按限流信号二选一的 type、429/502 二选一的 status），接配置需把本方法签名
+    /// 从 `&'static str` 系改 `String` 并给流状态机（create_sse_stream 的 unfold
+    /// 闭包 / emit_stream_usage / 非流式收尾）传配置快照，波及 >5 处且与
+    /// `is_rate_limit_signal` 语义纠缠。故错误消息配置表**不设 stream_inband_* key**
+    /// （model/error_messages.rs 模块头注释已记录）；HTTP 层错误（A/B/D/E/F 表）
+    /// 可配，默认文案与流内保持一致（保 H12 契约：非流式完成态 429/502 + 同文案）。
     pub fn client_message(&self) -> String {
         match self {
             CompletionStatus::Ok => String::new(),
@@ -1249,7 +1258,10 @@ use super::converter::get_context_window_size;
 ///
 /// 实测 input≈297K 时上游已频繁返回空/极短响应（4~13 tokens 无工具调用），
 /// 取窗口的 28%（≈280K for 1M 窗口）作为判定阈值。
-fn empty_response_oversized_threshold(model: &str) -> i32 {
+///
+/// `pub(crate)`：非流式收尾（handlers.rs）的空响应兜底复用同一阈值，保证
+/// 两条路径对「大输入 vs 偶发」的分界一致（口径分叉会产出两套空响应文案）。
+pub(crate) fn empty_response_oversized_threshold(model: &str) -> i32 {
     (get_context_window_size(model) as f64 * 0.28) as i32
 }
 
@@ -1258,6 +1270,33 @@ fn empty_response_oversized_threshold(model: &str) -> i32 {
 /// 当上下文压力大时，模型可能返回极短的无意义文本（如 4~13 tokens）而非工具调用，
 /// 导致客户端 agentic 循环卡住。output < 此阈值且无工具调用时，视为近似空响应。
 const NEAR_EMPTY_OUTPUT_THRESHOLD: i32 = 30;
+
+/// 流式与非流式共用的「空/近空响应」判据。
+///
+/// 判定语义与 [`StreamContext::is_empty_response`] 文档一致（完全空 / 近似空 + 上下文过大）。
+/// **两条路径必须调用同一个函数**，不能各自实现一份 —— 本仓已多次踩「同一判据两份实现、
+/// 只修了其中一份」的形态，分界一旦漂移就是「流式判空、非流式放行 → 200 空 body」。
+pub(crate) fn near_empty_response(
+    output_tokens: i32,
+    has_tool_use: bool,
+    input_tokens: i32,
+    model: &str,
+) -> bool {
+    let no_tool_use = !has_tool_use;
+    // 路径 1：完全空。
+    if output_tokens == 0 && no_tool_use {
+        return true;
+    }
+    // 路径 2：近似空 + 上下文过大（input_tokens 超过窗口 28% 阈值）。
+    if output_tokens > 0
+        && output_tokens < NEAR_EMPTY_OUTPUT_THRESHOLD
+        && no_tool_use
+        && input_tokens >= empty_response_oversized_threshold(model)
+    {
+        return true;
+    }
+    false
+}
 
 /// 流处理上下文
 /// 一次请求解析出的最终用量快照（供用量统计埋点消费）
@@ -1895,23 +1934,15 @@ impl StreamContext {
     ///    上下文压力下返回的无意义短文本（如几个空白 token），客户端拿到后会以为
     ///    end_turn 正常结束并继续对话，导致 agentic 循环反复卡住。
     pub fn is_empty_response(&self) -> bool {
-        let no_tool_use = !self.state_manager.has_tool_use;
-
-        // 路径 1：完全空
-        if self.output_tokens == 0 && no_tool_use {
-            return true;
-        }
-
-        // 路径 2：近似空 + 上下文过大
-        if self.output_tokens > 0
-            && self.output_tokens < NEAR_EMPTY_OUTPUT_THRESHOLD
-            && no_tool_use
-        {
-            let est = self.context_input_tokens.unwrap_or(self.input_tokens);
-            return est >= empty_response_oversized_threshold(&self.model);
-        }
-
-        false
+        // 判定实现收敛到文件级共用函数 near_empty_response（非流式收尾同款），
+        // 保证两条路径分界一致 —— 本方法只负责喂本上下文的量。
+        let est = self.context_input_tokens.unwrap_or(self.input_tokens);
+        near_empty_response(
+            self.output_tokens,
+            self.state_manager.has_tool_use,
+            est,
+            &self.model,
+        )
     }
 
     /// 空响应是否由「上下文过大」导致。
@@ -2278,7 +2309,12 @@ impl StreamContext {
         }
         let content = content.as_str();
 
-        // 估算 tokens
+        // 估算 tokens。⚠️ 这是嗅探路径（thinking_enabled）**唯一的** output_tokens 累计点：
+        // 所有进 thinking_buffer 的内容（含内联 `<thinking>` 块）都来自本函数入参，
+        // 在 `process_content_with_thinking` 等提取/下发处**不重复累计** —— 否则 thinking
+        // 文本被计两次（整块 + 提取处），output_tokens 虚高、`is_empty_response` 的近空
+        // 判定随之失效。结构化 reasoning 流（`process_reasoning_content`）不经过本函数，
+        // 在它自己的下发点计一次（互不重复）。
         self.output_tokens += estimate_tokens(content);
 
         // 如果启用了thinking，需要处理thinking块
@@ -2529,6 +2565,8 @@ impl StreamContext {
                     let thinking_content = self.thinking_buffer[..end_m.start].to_string();
                     if !thinking_content.is_empty() {
                         if let Some(thinking_index) = self.thinking_block_index {
+                            // 思考文本已在入口（process_assistant_response 整块估算）计入，
+                            // 此处不重复累加（双计会让 output_tokens 虚高、近空判定失效）。
                             events.push(
                                 self.create_thinking_delta_event(thinking_index, &thinking_content),
                             );
@@ -3147,6 +3185,11 @@ impl StreamContext {
         }
 
         if let Some(idx) = self.thinking_block_index {
+            // thinking 也是真实下发的生成内容，计入 output_tokens（Anthropic 官方
+            // usage 口径 output_tokens 含 thinking tokens）。旧代码只计正文与工具参数，
+            // 客户端看到的 output_tokens 系统性偏低。此处已过 `text.is_empty()` 早退，
+            // 不误计空的 thinking_delta。
+            self.output_tokens += estimate_tokens(text);
             events.push(self.create_thinking_delta_event(idx, text));
         }
         events
@@ -3288,6 +3331,7 @@ impl StreamContext {
                 let thinking_content = self.thinking_buffer[..end_m.start].to_string();
                 if !thinking_content.is_empty() {
                     if let Some(thinking_index) = self.thinking_block_index {
+                        // 同 :2531 口径：思考文本已在入口整块估算时计入，此处不重复累加。
                         events.push(
                             self.create_thinking_delta_event(thinking_index, &thinking_content),
                         );
@@ -3326,6 +3370,7 @@ impl StreamContext {
                 // buffer 可能还有嗅探暂存的内容，关块前先作为 thinking_delta 补发（不吞字）。
                 if !self.thinking_buffer.is_empty() {
                     if let Some(idx) = self.thinking_block_index {
+                        // 同 :2531 口径：缓冲内容已在入口整块估算时计入，此处不重复累加。
                         events.push(self.create_thinking_delta_event(idx, &self.thinking_buffer));
                     }
                     self.thinking_buffer.clear();
@@ -3496,7 +3541,6 @@ impl StreamContext {
         if assembled.is_empty() {
             return Vec::new();
         }
-        self.output_tokens += (assembled.len() as i32 + 3) / 4;
         if serde_json::from_str::<serde_json::Value>(&assembled).is_err() {
             // 拼装后仍非法：多因上游发了非法 JSON（如 JSON 不支持的 \x 转义 / 截断 \uXXXX / 裸控制符）
             // 或中间帧丢失截断。客户端拿坏 JSON 直接 parse 失败 → Invalid tool parameters。
@@ -3675,6 +3719,10 @@ impl StreamContext {
             }
         }
 
+        // 走到这里 `assembled` 已确定要实际下发（合法 / 修复成功 / 无失败态）：
+        // 此时才计入 output_tokens（旧代码在函数入口累计，失败路径——截断恢复/
+        // 失败态对齐/缺参不下发——也凭空记账，面板 output_tokens 偏高）。
+        self.output_tokens += (assembled.len() as i32 + 3) / 4;
         self.state_manager
             .handle_content_block_delta(
                 block_index,
@@ -3739,6 +3787,7 @@ impl StreamContext {
                     let thinking_content = self.thinking_buffer[..end_m.start].to_string();
                     if !thinking_content.is_empty() {
                         if let Some(thinking_index) = self.thinking_block_index {
+                            // 同 :2531 口径：思考文本已在入口整块估算时计入，此处不重复累加。
                             events.push(
                                 self.create_thinking_delta_event(thinking_index, &thinking_content),
                             );
@@ -3769,6 +3818,7 @@ impl StreamContext {
                     // （buffer 可能为空 —— 内容已在流式期间及时下发，此处只负责收尾 stop）
                     if !self.thinking_buffer.is_empty() {
                         if let Some(thinking_index) = self.thinking_block_index {
+                            // 同 :2531 口径：缓冲内容已在入口整块估算时计入，此处不重复累加。
                             events.push(self.create_thinking_delta_event(
                                 thinking_index,
                                 &self.thinking_buffer,
@@ -6755,6 +6805,124 @@ mod tests {
         assert!(
             !joined.contains("截断轮的推理不该下发"),
             "截断（decoder 停止 / 缓冲溢出）的一轮不得被兜底补推理。实际: {joined}"
+        );
+    }
+
+    // ===== B1：buffered 收尾必须用 billed 口径更正 message_start 的 usage =====
+
+    /// buffered 收尾（`finish_and_get_all_events`）必须用**最终 billed 口径**更正
+    /// message_start 的 input_tokens。
+    ///
+    /// 背景：buffered 路径（`/cc/v1` 的 ccAutoBuffer）的存在理由就是「message_start 即精确
+    /// input_tokens」（handlers.rs:4224-4225 注释）。初始事件生成时只有本地估算，上游
+    /// contextUsage 反推的精确值必须在收尾回填。此前该路径零测试：若收尾被误改成读顶层
+    /// `data["usage"]`（message_start 注入事故的同类误改），全部测试依然绿、线上 buffered
+    /// 退回本地估算 —— 本条把「更正发生在 `message.usage` 嵌套路径」钉死。
+    ///
+    /// 夹具结构与真实上游一致：usage **嵌套在 `message` 内**、顶层无 usage
+    /// （docs/PROTOCOL.md:419 + passthrough_think_filter.rs:1760 同款结构）。
+    #[test]
+    fn buffered_finish_corrects_nested_message_start_usage() {
+        let mut ctx = BufferedStreamContext::new(
+            "deepseek",
+            100,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        // 上游 contextUsage 已反推精确 input_tokens（真实入口是 Event::ContextUsage，
+        // 这里直接注入其产物，避免依赖模型窗口常数；测试先例见 should_prefer_context_usage
+        // _over_estimate_for_gross_input）。
+        ctx.inner.context_input_tokens = Some(1_000);
+        ctx.set_cache_usage(Some(CacheUsageBreakdown {
+            cache_creation_input_tokens: 20,
+            cache_read_input_tokens: 30,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        }));
+        // 初始事件生成时只有本地估算口径 billed(100, 20, 30) = 50。
+        ctx.initial_events_generated = true;
+        ctx.event_buffer.push(SseEvent::new(
+            "message_start",
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_mock",
+                    "type": "message",
+                    "usage": {"input_tokens": 50, "output_tokens": 0}
+                }
+            }),
+        ));
+
+        let events = ctx.finish_and_get_all_events();
+        let msg_start = events
+            .iter()
+            .find(|e| e.event == "message_start")
+            .unwrap_or_else(|| panic!("收尾结果必须含 message_start"));
+
+        // billed(1_000, 20, 30) = 950 —— 与初始 50 差异巨大，更正循环被删必然红。
+        assert_eq!(
+            msg_start.data["message"]["usage"]["input_tokens"], 950,
+            "收尾必须用最终 billed 口径更正嵌套 message.usage 的 input_tokens"
+        );
+        assert_eq!(
+            msg_start.data["message"]["usage"]["cache_creation_input_tokens"], 20,
+            "cache 字段必须随更正补齐"
+        );
+        assert_eq!(
+            msg_start.data["message"]["usage"]["cache_read_input_tokens"], 30,
+            "cache 字段必须随更正补齐"
+        );
+        assert!(
+            msg_start.data.get("usage").is_none(),
+            "message_start 保持真实嵌套形态：usage 只存在于 message 内，顶层不得有 usage"
+        );
+    }
+
+    /// 顶层 usage 的旧形态**不是** buffered 收尾的更正对象：原样保留，不被触碰。
+    ///
+    /// 与 passthrough_think_filter 不同（那里对个别上游有顶层回退分支），buffered 收尾
+    /// 只有 `message.usage` 嵌套路径（stream.rs:4279-4293）。若未来误加顶层写入
+    /// （以为能兼容旧形态），本条立即红，提醒重新审视语义。
+    #[test]
+    fn buffered_finish_leaves_top_level_usage_shape_untouched() {
+        let mut ctx = BufferedStreamContext::new(
+            "deepseek",
+            100,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        ctx.inner.context_input_tokens = Some(1_000);
+        ctx.set_cache_usage(Some(CacheUsageBreakdown {
+            cache_creation_input_tokens: 20,
+            cache_read_input_tokens: 30,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        }));
+        ctx.initial_events_generated = true;
+        ctx.event_buffer.push(SseEvent::new(
+            "message_start",
+            json!({
+                "type": "message_start",
+                "id": "msg_old_shape",
+                "usage": {"input_tokens": 111, "output_tokens": 0}
+            }),
+        ));
+
+        let events = ctx.finish_and_get_all_events();
+        let msg_start = events
+            .iter()
+            .find(|e| e.event == "message_start")
+            .unwrap_or_else(|| panic!("收尾结果必须含 message_start"));
+
+        assert_eq!(
+            msg_start.data["usage"]["input_tokens"], 111,
+            "顶层 usage 形态不是更正对象：input_tokens 必须原样保留（收尾只认嵌套路径）"
+        );
+        assert!(
+            msg_start.data["message"]["usage"].is_null(),
+            "该事件没有 message 对象：不得凭空创建嵌套 usage"
         );
     }
 
@@ -10377,5 +10545,175 @@ mod ported_k2cc_empty_response_tests {
         let mut c = ctx("claude-sonnet-5", 10_000);
         c.output_tokens = 15;
         assert!(!c.is_empty_response());
+    }
+
+    #[test]
+    fn near_empty_judgment_shared_by_both_paths() {
+        // 流式（is_empty_response）与非流式（handlers.rs 收尾兜底）必须调用同一个
+        // 共用判据函数，不得各写一份实现 —— 两条路径分界漂移的后果是「流式判空、
+        // 非流式放行 → 200 空 body」。本守卫钉调用点，不钉行为。
+        //
+        // needle 运行时拼接：include_str! 会把本测试模块自己的字面量也算进匹配，
+        // 固定串会让「删掉调用、守卫自己仍含字面量」的纸面测试变绿。
+        let call = format!("{}near_empty_response{}", "stream::", "(");
+        let impl_marker = format!("{}near_empty_response", "fn ");
+        let self_src = include_str!("stream.rs");
+        let handlers_src = include_str!("handlers.rs");
+        let prod = |src: &str| -> String {
+            // 只看生产段（切掉测试模块），且剔掉注释行 —— 否则守卫会匹配到
+            // 注释里的说明文字，变成「把调用注释掉守卫仍绿」的纸面测试。
+            let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+            src[..cut]
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let handlers_prod = prod(handlers_src);
+        assert!(
+            handlers_prod.contains(&call),
+            "非流式收尾兜底必须调用共用判据（handlers.rs 出现独立实现即分界漂移）"
+        );
+        assert!(
+            !handlers_prod.contains(&impl_marker),
+            "handlers.rs 不得出现共用判据的独立实现（只能调用，不能定义）"
+        );
+        let self_prod = prod(self_src);
+        let cut = self_prod
+            .find("pub fn is_empty_response")
+            .expect("is_empty_response 定义不应被删改");
+        let body = &self_prod[cut..];
+        let body = &body[..body
+            .find("pub fn empty_response_is_oversized_context")
+            .expect("is_empty_response 应后随 empty_response_is_oversized_context")];
+        assert!(
+            body.contains("near_empty_response("),
+            "流式 is_empty_response 必须收敛到共用判据（残留自实现即分界漂移）"
+        );
+    }
+}
+
+#[cfg(test)]
+mod output_tokens_accounting_tests {
+    //! output_tokens 记账口径：thinking 内容必须计入（与非流式 estimate 口径对齐），
+    //! 且工具参数只在**实际下发**时累计（失败态不下发的不能凭空记账）。
+    use super::*;
+
+    #[test]
+    fn reasoning_flow_counts_toward_output_tokens() {
+        // thinking 是真实下发的生成内容：Anthropic 官方 usage 口径 output_tokens
+        // 含 thinking tokens。旧实现只计正文与工具参数，此处钉住累加。
+        let mut c = StreamContext::new_with_thinking("claude-sonnet-5", 100, true, HashMap::new());
+        assert_eq!(c.output_tokens, 0);
+        let ev = ReasoningContentEvent {
+            text: "先想一下".to_string(),
+            signature: None,
+            redacted_content: None,
+        };
+        let events = c.process_reasoning_content(&ev);
+        assert!(!events.is_empty(), "thinking 帧必须下发 thinking_delta");
+        assert!(
+            c.output_tokens > 0,
+            "thinking 内容必须计入 output_tokens（修复前恒 0）"
+        );
+        assert_eq!(c.output_tokens, estimate_tokens("先想一下"));
+    }
+
+    #[test]
+    fn reasoning_discarded_when_thinking_disabled_does_not_count() {
+        // thinking 未开启：整帧丢弃（不下发），不得累计 output_tokens。
+        let mut c = StreamContext::new_with_thinking("claude-sonnet-5", 100, false, HashMap::new());
+        let ev = ReasoningContentEvent {
+            text: "secret".to_string(),
+            signature: None,
+            redacted_content: None,
+        };
+        let events = c.process_reasoning_content(&ev);
+        assert!(events.is_empty());
+        assert_eq!(c.output_tokens, 0, "丢弃的 thinking 不得计 output_tokens");
+    }
+
+    fn start_tool_block(c: &mut StreamContext) -> i32 {
+        let idx = c.state_manager.next_block_index();
+        c.state_manager.handle_content_block_start(
+            idx,
+            "tool_use",
+            json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {"type": "tool_use"}
+            }),
+        );
+        idx
+    }
+
+    #[test]
+    fn flush_tool_input_counts_only_when_delivered() {
+        // 合法 JSON：实际下发 → 计入 output_tokens。
+        let mut c = StreamContext::new_with_thinking("claude-sonnet-5", 100, true, HashMap::new());
+        let idx = start_tool_block(&mut c);
+        let good = r#"{"command":"ls"}"#;
+        let events = c.flush_tool_input(idx, good.to_string());
+        assert!(!events.is_empty(), "合法 JSON 必须下发 input_json_delta");
+        assert_eq!(c.output_tokens, (good.len() as i32 + 3) / 4);
+    }
+
+    #[test]
+    fn flush_tool_input_failure_path_does_not_count() {
+        // 非法 JSON 且修复层也补不回：②失败态对齐置态 → 不下发坏参数 →
+        // 不得累计 output_tokens（修复前在函数入口就累计，面板凭空记 output）。
+        let bad = r#"{"a": 1} trailing"#;
+        assert!(
+            repair_tool_json(bad).is_none(),
+            "前置：该串必须修不好（否则走的是修复下发路径）"
+        );
+        let mut c = StreamContext::new_with_thinking("claude-sonnet-5", 100, true, HashMap::new());
+        let idx = start_tool_block(&mut c);
+        let events = c.flush_tool_input(idx, bad.to_string());
+        assert!(events.is_empty(), "失败路径必须不下发坏 JSON");
+        assert!(
+            !c.completion().is_ok(),
+            "失败路径必须已置失败态（②默认开）"
+        );
+        assert_eq!(
+            c.output_tokens, 0,
+            "失败路径不得累计 output_tokens（旧实现函数入口即累计）"
+        );
+    }
+
+    #[test]
+    fn sniffed_inline_thinking_counts_once() {
+        // 内联标签形态的嗅探流（thinking_enabled）：thinking 文本必须只计一次。
+        // 修复前入口对整块计一次、提取处各分支又计一次 → output_tokens 约 1.8 倍
+        // 虚高。整块一次喂入时提取后实际下发恰好等于入口整块估算，严格断言相等
+        // 即钉死「只计一次」（双计必 > 整块估算）。
+        let mut c = StreamContext::new_with_thinking("claude-sonnet-5", 100, true, HashMap::new());
+        let block = "<thinking>让我仔细权衡两种方案的利弊</thinking>\n\n答案是 42";
+        let events = c.process_assistant_response(block);
+        assert!(!events.is_empty(), "thinking 与正文都必须下发");
+        assert_eq!(
+            c.output_tokens,
+            estimate_tokens(block),
+            "嗅探路径必须只计一次：入口整块估算，提取处不得重复累加"
+        );
+    }
+
+    #[test]
+    fn sniffed_thinking_only_keeps_near_empty_detection() {
+        // 大输入 + 只有 thinking 块、无正文：output_tokens 必须仍 < 30（近空判据），
+        // is_empty_response 判 true。构造使「单计 < 30 而双计 ≥ 30」：
+        // 修复前双计把 output 推到 30+，近空判定失效 → 200 当成功（回归表现）。
+        let model = "claude-sonnet-5";
+        let threshold = empty_response_oversized_threshold(model);
+        let mut c = StreamContext::new_with_thinking(model, threshold, true, HashMap::new());
+        let block = "<thinking>甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未</thinking>\n\n";
+        assert!(estimate_tokens(block) < NEAR_EMPTY_OUTPUT_THRESHOLD);
+        let events = c.process_assistant_response(block);
+        assert!(!events.is_empty(), "thinking 块必须下发");
+        assert!(c.output_tokens < NEAR_EMPTY_OUTPUT_THRESHOLD);
+        assert!(
+            c.is_empty_response(),
+            "大输入 + thinking-only 短响应必须判近空（双计后此断言失效）"
+        );
     }
 }

@@ -88,6 +88,9 @@ export interface CredentialStatusItem {
   cooldownRemainingMs?: number
   /** 冷却原因（如「速率限制」「服务错误」）。 */
   cooldownReason?: string
+  /** 冷却原因稳定枚举码（rate_limited/suspicious/...，后端 CooldownReason::code()）。
+      判定与 i18n 走此码；cooldownReason 仅作展示 fallback（老后端无此字段）。 */
+  cooldownCode?: string
 }
 
 // 回收站条目（不含敏感明文）
@@ -451,10 +454,46 @@ export interface ExternalIdpLeg2Response {
   profiles: ExternalIdpProfileOption[]
 }
 
-// 第 3 步选定响应：选定 profile 建号成功
+// 第 3 步选定响应：选定 profile 建号成功。
+// arn/region 是**实际使用**的值而非用户传入值：用户选的 profile 可能不可用
+// （FEATURE_NOT_SUPPORTED）而被后端自动替换为同账号可用的另一个，前端须回显。
 export interface ExternalIdpSelectResponse {
   credentialId: number
+  arn: string
+  region: string
 }
+
+// ============ 错误提示词覆盖（errorMessages 配置表）============
+
+/**
+ * 单条错误提示词覆盖。所有字段 Optional：None = 回落内置默认（= 现状文案）。
+ * 与后端 `ErrorMessageOverride`（serde camelCase + skip_serializing_if）契约一致。
+ *
+ * - `status`：HTTP 状态码（后端白名单 400/401/403/404/413/429/500/502/503/504）
+ * - `type`：Anthropic 协议 error.type 枚举（后端 ERROR_TYPE_WHITELIST 白名单）
+ * - `message`：提示文案
+ * - `retryAfterSecs`：Retry-After 秒数（0-3600；None = 不覆盖）
+ */
+export interface ErrorMessageOverride {
+  status?: number
+  type?: string
+  message?: string
+  retryAfterSecs?: number | null
+}
+
+// ============ 错误提示词内置默认表（GET /api/admin/error-messages/defaults）============
+
+/** 默认表单条：key → 内置默认渲染值（与后端 default_error_messages() 契约一致）。 */
+export interface ErrorMessagesDefaultsEntry {
+  status: number
+  type: string
+  message: string
+  retryAfterSecs: number | null
+}
+
+/** 默认表全量：key → 内置默认（camelCase；retryAfterSecs 无 Retry-After 时为 null）。 */
+export type ErrorMessagesDefaultsResponse = Record<string, ErrorMessagesDefaultsEntry>
+
 
 // ============ 服务端配置快照 ============
 
@@ -468,6 +507,18 @@ export interface ExternalIdpSelectResponse {
  * - `manual`：不覆盖任何字段，全部读原值。**默认值**，保证既有配置行为零变化。
  */
 export type ThrottleProfile = 'shielded' | 'direct' | 'manual'
+
+/**
+ * 调度模式（三按钮，2026-08-16）。与后端 `SchedulingMode`（serde kebab-case）一一对应，
+ * 映射到 ThrottleProfile 矩阵：smart↔direct / stable↔shielded / manual↔manual。
+ *
+ * - `smart`（默认标记）：智能调度。切档时写入 Direct 扩展矩阵（吸收全开合理值 +
+ *   冷却开 + RPM 头寸 + 选号加权）。注意：首启只标记、不重写旋钮，切换才写矩阵。
+ * - `stable`：稳定优先。切档时写入 Shielded 扩展矩阵（真限流返 429、冷却 scale 150、
+ *   吸收层关）。
+ * - `manual`：高级手动。不覆盖任何字段，全部读原值。
+ */
+export type SchedulingMode = 'smart' | 'stable' | 'manual'
 
 export interface ConfigSnapshotResponse {
   /** 服务端真实版本(编译期注入),侧边栏据此展示,不再硬编码 */
@@ -492,6 +543,10 @@ export interface ConfigSnapshotResponse {
   /** 全池自愈退避指数上限（默认 4）。 */
   selfHealMaxShift: number
   promptCacheEnabled: boolean
+  /** 模拟缓存：透传池响应是否注入模拟 cache_read（默认关，配合 mockCacheReadRatio 使用）。 */
+  mockCacheEnabled: boolean
+  /** 模拟缓存注入比例（0..1 f64，默认 0.7）：cache_read = input × 比例。 */
+  mockCacheReadRatio: number
   /** 是否注入上游 output_config.effort（native extended thinking，默认关，2026-08-11 移植）。 */
   nativeThinkingEffortEnabled: boolean
   /** 批量推号入口 POST /api/import/keys 是否启用（默认**开**：端点先于开关存在，
@@ -565,6 +620,8 @@ export interface ConfigSnapshotResponse {
   // 入站请求整形 + RPM 自动挡
   /** 限流/重试档位。manual = 不覆盖任何字段（默认，向前兼容） */
   throttleProfile: ThrottleProfile
+  /** 调度模式（三按钮）。smart = 默认标记；旧后端不下发时前端兜底为 'smart'。 */
+  schedulingMode: SchedulingMode
   inboundThrottleEnabled: boolean
   inboundRpmAuto: boolean
   inboundTargetRpm: number
@@ -642,6 +699,11 @@ export interface ConfigSnapshotResponse {
   collectClientFingerprint?: boolean
   // 全局模型映射：客户端模型名 → 上游模型名（缺省 = 不映射）。
   modelMapping?: Record<string, string>
+  /**
+   * 错误提示词覆盖表：key = 错误形态标识（如 quota_exhausted）；未配置的 key 用内置默认。
+   * 默认值预览待后端默认表接口（如 /api/admin/error-messages/defaults）—— TODO。
+   */
+  errorMessages?: Record<string, ErrorMessageOverride>
   configPath?: string
 }
 
@@ -663,6 +725,10 @@ export interface UpdateConfigRequest {
   selfHealMaxBackoffSecs?: number
   selfHealMaxShift?: number
   promptCacheEnabled?: boolean
+  /** 模拟缓存开关（透传池响应注入模拟 cache_read；默认关）。 */
+  mockCacheEnabled?: boolean
+  /** 模拟缓存注入比例（0..1 f64，默认 0.7）。 */
+  mockCacheReadRatio?: number
   /** 是否注入上游 output_config.effort（默认关，2026-08-11 补）。 */
   nativeThinkingEffortEnabled?: boolean
   // 上游 429 吸收层
@@ -713,6 +779,8 @@ export interface UpdateConfigRequest {
   rateLimitJitterPct?: number
   /** 切档。档位只影响配置文件里没显式写的字段，已显式配置的值不会被冲掉 */
   throttleProfile?: ThrottleProfile
+  /** 切换调度模式（三按钮）。后端映射到对应 ThrottleProfile 并写入预设矩阵 */
+  schedulingMode?: SchedulingMode
   inboundThrottleEnabled?: boolean
   inboundRpmAuto?: boolean
   inboundTargetRpm?: number
@@ -752,6 +820,11 @@ export interface UpdateConfigRequest {
   collectClientFingerprint?: boolean
   // 全局模型映射（整表替换语义；传 {} = 清空全部规则）
   modelMapping?: Record<string, string>
+  /**
+   * 错误提示词覆盖表：只提交有改动的 key；每条只含改动的字段
+   * （空对象 = 清掉该 key 的配置回内置默认）。
+   */
+  errorMessages?: Record<string, ErrorMessageOverride>
 }
 
 // 更新服务端配置响应
@@ -1084,6 +1157,9 @@ export interface ThroughputSnapshot {
 export interface CooldownDetail {
   /** 冷却原因（中文描述，如「速率限制」「服务器错误」） */
   reason: string
+  /** 冷却原因稳定枚举码（rate_limited/suspicious/...，后端 CooldownReason::code()）。
+      判定与 i18n 走此码；reason 仅作展示 fallback。 */
+  code: string
   /** 剩余冷却时间（毫秒） */
   remainingMs: number
   /** 连续触发次数 */

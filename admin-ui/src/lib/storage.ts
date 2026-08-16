@@ -7,7 +7,11 @@ const API_KEY_STORAGE_KEY = 'adminApiKey'
 // 旧版本留在 localStorage 的副本在读取时顺手清掉,消灭历史残留。
 export const storage = {
   getApiKey: () => {
-    localStorage.removeItem(API_KEY_STORAGE_KEY)
+    // 仅当键存在时清一次：历史残留（旧版 localStorage 副本）读取时顺手清掉，
+    // 但每次调用都无条件 removeItem 是纯浪费（axios 拦截器每个请求都走这里）。
+    if (localStorage.getItem(API_KEY_STORAGE_KEY) !== null) {
+      localStorage.removeItem(API_KEY_STORAGE_KEY)
+    }
     return sessionStorage.getItem(API_KEY_STORAGE_KEY)
   },
   setApiKey: (key: string) => sessionStorage.setItem(API_KEY_STORAGE_KEY, key),
