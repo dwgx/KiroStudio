@@ -29,6 +29,11 @@ Run：https://github.com/dwgx/KiroStudio-skiapi/actions/runs/32351942273
 - Chrome：设置 → 调度，智能 / 稳定 / 手动。
 - 空号池流量烟测 66/66。
 
+## 文档包
+
+新窗：`STATUS.md` → `docs/TAKEOVER.md` → `.agent/HANDOFF.md` → `.agent/NEXT-PROMPT.md`。  
+`.opencode/state.md` / `ISSUES.md` 已标档案。未入库设计稿在 `docs/archive/design-drafts/`（gitignore）。
+
 ## 不进远程
 
 凭据、`config.json`、`.agent/`、`.grok/`、`.claude/`、`AGENTS.md`、密钥。禁止 `git push public`。不要 reset 脏树。
