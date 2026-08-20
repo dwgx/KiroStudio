@@ -4,7 +4,7 @@
 
 ## [Unreleased] - 神文件抽取 + 三处 fail-closed
 
-相对 tag v1.1.2 / `5f20596`。本机 `cargo test --no-default-features`：**2171 passed; 0 failed**。
+相对 tag v1.1.2 / `5f20596`。本机 `cargo test --no-default-features`：**2171 passed; 0 failed**。origin 已切到公开仓 `dwgx/KiroStudio`。
 
 - W1–W6：`token_manager` 测试外提；converter/stream 纯函数与测试 `#[path]`；`insight`/`ksk_import`；`retry_budget`/`absorb_policy`；persist/refresh 卫星。选号 12 键与 absorb 循环未改。
 - MCP 直连 401 同请求换号；websearch `decode_round` 消费 `metadataEvent`；SSO 空 refreshToken 拒入池。

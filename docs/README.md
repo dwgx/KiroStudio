@@ -2,6 +2,8 @@
 
 **新窗读序：** 仓根 `STATUS.md` → 本目录 `TAKEOVER.md` → `.agent/HANDOFF.md` → `.agent/NEXT-PROMPT.md`。
 
+发版在公开仓 `dwgx/KiroStudio`（v1.1.2）。旧私有 `KiroStudio-skiapi` 不要再推。
+
 过期过程稿在 `docs/archive/`（gitignore，仅本地）。不要用仓根旧 `HANDOFF-*`、`.opencode/state.md` 当现状。
 
 ## 状态 / 接手
