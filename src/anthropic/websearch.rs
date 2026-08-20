@@ -1157,7 +1157,6 @@ pub async fn handle_websearch_request(
         let summary = generate_search_summary(&query, &search_results);
         let output_tokens = (summary.len() as i32 + 3) / 4;
         super::handlers::emit_websearch_fast_path_usage(
-            &provider,
             &payload.model,
             mcp_credential_id,
             input_tokens,
@@ -1197,7 +1196,7 @@ async fn call_mcp_api(
 
     let (response, credential_id) = provider.call_mcp(&request_body, budget).await?;
 
-    let body = response.text().await?;
+    let body: String = response.text().await?;
     tracing::debug!("MCP response: {}", body);
 
     let mcp_response: McpResponse = serde_json::from_str(&body)?;
@@ -1468,6 +1467,43 @@ pub(super) struct WebSearchLoopSuccess {
     pub rounds: u32,
 }
 
+/// 回灌循环失败：HTTP 响应给客户端；用量字段给埋点（拿不到的保持 None，不编造成功）。
+pub(super) struct WebSearchLoopError {
+    pub response: Response,
+    /// 已完成轮次的末轮凭据；首轮就失败则为 None（不要写成 0）。
+    pub credential_id: Option<u64>,
+    pub mapped_model: Option<String>,
+    /// 已完成轮次累计 credit；没有计量则 None。
+    pub credits: Option<f64>,
+    /// 已发出的上游往返次数（run_round 成功轮；失败当轮未计入）。
+    pub rounds: u32,
+    pub input_tokens: i32,
+}
+
+impl WebSearchLoopError {
+    fn from_parts(
+        response: Response,
+        credential_id: Option<u64>,
+        mapped_model: Option<String>,
+        total_credits: f64,
+        rounds: u32,
+        input_tokens: i32,
+    ) -> Self {
+        Self {
+            response,
+            credential_id,
+            mapped_model,
+            credits: if total_credits > 0.0 {
+                Some(total_credits)
+            } else {
+                None
+            },
+            rounds,
+            input_tokens,
+        }
+    }
+}
+
 /// 单轮请求：转换 payload → 打上游 → 缓冲解码。
 ///
 /// 转换/序列化失败返回 400/500；上游调用失败交 `map_provider_error` 统一映射
@@ -1657,9 +1693,9 @@ pub(super) async fn run_web_search_loop(
     mut payload: MessagesRequest,
     fallback_input_tokens: i32,
     budget: &crate::kiro::provider::SharedRetryBudget,
-) -> Result<WebSearchLoopSuccess, Response> {
+) -> Result<WebSearchLoopSuccess, WebSearchLoopError> {
     let mut presentation: Vec<Value> = Vec::new();
-    let mut last_credential_id: u64 = 0;
+    let mut last_credential_id: Option<u64> = None;
     // 末轮改写名（用量埋点 upstream_model 口径）：与 last_credential_id 同源同更新
     // 时机——每轮覆盖为当轮值，循环结束即末轮值。
     let mut last_mapped_model: Option<String> = None;
@@ -1671,8 +1707,21 @@ pub(super) async fn run_web_search_loop(
 
     // 0..=MAX 而不是 0..MAX：上限那一轮仍要**发出去**（拿到最终回答），只是不再回灌。
     for round_idx in 0..=MAX_WEB_SEARCH_ROUNDS {
-        let (mut round, credential_id, mapped_model) = run_round(&provider, &payload, budget).await?;
-        last_credential_id = credential_id;
+        let (mut round, credential_id, mapped_model) =
+            match run_round(&provider, &payload, budget).await {
+                Ok(v) => v,
+                Err(resp) => {
+                    return Err(WebSearchLoopError::from_parts(
+                        resp,
+                        last_credential_id,
+                        last_mapped_model,
+                        total_credits,
+                        round_idx as u32,
+                        last_context_input.unwrap_or(fallback_input_tokens),
+                    ));
+                }
+            };
+        last_credential_id = Some(credential_id);
         last_mapped_model = mapped_model;
         last_context_input = round.context_input_tokens.or(last_context_input);
         total_credits += round.credits;
@@ -1714,14 +1763,21 @@ pub(super) async fn run_web_search_loop(
                                 None,
                             ),
                         );
-                        return Err((
-                            status,
-                            Json(ErrorResponse::new(
-                                error_type,
-                                format!("{message}: {e}"),
-                            )),
-                        )
-                            .into_response());
+                        return Err(WebSearchLoopError::from_parts(
+                            (
+                                status,
+                                Json(ErrorResponse::new(
+                                    error_type,
+                                    format!("{message}: {e}"),
+                                )),
+                            )
+                                .into_response(),
+                            last_credential_id,
+                            last_mapped_model,
+                            total_credits,
+                            round_idx as u32 + 1,
+                            last_context_input.unwrap_or(fallback_input_tokens),
+                        ));
                     }
                 }
             }
@@ -1798,7 +1854,7 @@ pub(super) async fn run_web_search_loop(
             stop_reason,
             input_tokens: last_context_input.unwrap_or(fallback_input_tokens),
             output_tokens,
-            credential_id: last_credential_id,
+            credential_id: last_credential_id.unwrap_or(0),
             credits: total_credits,
             rounds: round_idx as u32 + 1,
         });
@@ -1818,11 +1874,18 @@ pub(super) async fn run_web_search_loop(
             None,
         ),
     );
-    Err((
-        status,
-        Json(ErrorResponse::new(error_type, message)),
-    )
-        .into_response())
+    Err(WebSearchLoopError::from_parts(
+        (
+            status,
+            Json(ErrorResponse::new(error_type, message)),
+        )
+            .into_response(),
+        last_credential_id,
+        last_mapped_model,
+        total_credits,
+        (MAX_WEB_SEARCH_ROUNDS as u32).saturating_add(1),
+        last_context_input.unwrap_or(fallback_input_tokens),
+    ))
 }
 
 /// 把回灌循环的最终 content 渲染成一串 SSE 事件（客户端要 stream 时用）。
@@ -2940,6 +3003,70 @@ mod tests {
             prod.contains(&["pub mapped_model", ": Option<String>"].concat()),
             "WebSearchLoopSuccess 必须声明 mapped_model 字段"
         );
+    }
+
+    /// 失败出口必须包装成带用量字段的错误结构（裸 Response 无法把 credential/credits/rounds
+    /// 交给 handlers 埋点）。三条出口：run_round / MCP / 循环异常退出。
+    #[test]
+    fn run_web_search_loop_error_surfaces_usage_fields() {
+        let full = include_str!("websearch.rs");
+        let prod = full
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(full);
+        let sig_and_body = prod
+            .split("pub(super) async fn run_web_search_loop")
+            .nth(1)
+            .expect("run_web_search_loop 不应被改名")
+            .split("\npub(super) fn ")
+            .next()
+            .expect("split 至少一段");
+        let ret = [
+            "Result<WebSearchLoopSuccess, ",
+            "WebSearchLoopError>",
+        ]
+        .concat();
+        assert!(
+            sig_and_body.contains(&ret),
+            "失败必须返回带用量字段的错误结构，不能只回裸 Response"
+        );
+        let wrap = ["WebSearchLoopError", "::from_parts"].concat();
+        assert!(
+            sig_and_body.matches(&wrap).count() >= 3,
+            "run_round / MCP / 异常退出 三条失败出口都必须包装错误结构"
+        );
+    }
+
+    fn dummy_fail_response() -> Response {
+        Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[test]
+    fn loop_error_credits_none_when_zero() {
+        let err = WebSearchLoopError::from_parts(dummy_fail_response(), None, None, 0.0, 0, 10);
+        assert!(err.credits.is_none(), "没有计量不得写成 Some(0)");
+        assert!(err.credential_id.is_none());
+        assert_eq!(err.rounds, 0);
+        assert_eq!(err.input_tokens, 10);
+    }
+
+    #[test]
+    fn loop_error_keeps_measured_credits() {
+        let err = WebSearchLoopError::from_parts(
+            dummy_fail_response(),
+            Some(7),
+            Some("mapped".to_string()),
+            0.25,
+            2,
+            100,
+        );
+        assert_eq!(err.credits, Some(0.25));
+        assert_eq!(err.credential_id, Some(7));
+        assert_eq!(err.mapped_model.as_deref(), Some("mapped"));
+        assert_eq!(err.rounds, 2);
     }
 
     /// 源码级守卫：MCP 搜索失败不得静默降级成「没搜到」再继续回灌。

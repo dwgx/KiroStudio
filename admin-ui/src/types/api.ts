@@ -22,8 +22,6 @@ export interface CredentialStatusItem {
   requestLimit?: number
   /** 自定义 API 代挂:累计已发请求数 */
   requestCount?: number
-  /** 自定义 API 代挂:deepseek 协议归一化开关 */
-  deepseekNormalize?: boolean
   /** 是否豁免全局模型映射（true = 该号发上游时保持客户端原始模型名） */
   modelMappingExempt?: boolean
   /** 「允许模型」白名单（成本安全硬门；空/缺省 = 不限制） */
@@ -271,8 +269,6 @@ export interface AddCredentialRequest {
   baseUrl?: string
   apiKey?: string
   requestLimit?: number
-  /** 自定义 API 代挂:deepseek 协议归一化开关（创建时设；改凭据走 deepseek-normalize 端点） */
-  deepseekNormalize?: boolean
   /** 是否豁免全局模型映射（创建时设；true = 该号发上游时保持客户端原始模型名） */
   modelMappingExempt?: boolean
   /** 代挂模型白名单（创建表单探测勾选而来；空/不传 = 不限制） */
@@ -463,6 +459,22 @@ export interface ExternalIdpSelectResponse {
   region: string
 }
 
+// ============ SSO Token 导入（粘贴 AWS portal Bearer Token 静默换号）============
+// 用户已在 AWS portal 登录，粘贴 portal 的 Bearer Token（x-amz-sso_authn），
+// 服务端走完整设备授权流程换取标准 IdC 凭据入池（免浏览器授权人工步骤）。
+
+export interface ImportSsoTokenRequest {
+  token: string
+  region?: string
+  priority?: number
+  proxyUrl?: string
+}
+
+export interface ImportSsoTokenResponse {
+  credentialId: number
+  email?: string | null
+}
+
 // ============ 错误提示词覆盖（errorMessages 配置表）============
 
 /**
@@ -549,6 +561,8 @@ export interface ConfigSnapshotResponse {
   mockCacheReadRatio: number
   /** 是否注入上游 output_config.effort（native extended thinking，默认关，2026-08-11 移植）。 */
   nativeThinkingEffortEnabled: boolean
+  /** CC↔Kiro 工具名/参数映射开关（默认开；热更即时生效）。 */
+  toolCompatMapping: boolean
   /** 批量推号入口 POST /api/import/keys 是否启用（默认**开**：端点先于开关存在，
       外部 kiro-accounting 正在用；关掉后两个挂载点一起返 403）。 */
   importKeysEnabled: boolean
@@ -731,6 +745,8 @@ export interface UpdateConfigRequest {
   mockCacheReadRatio?: number
   /** 是否注入上游 output_config.effort（默认关，2026-08-11 补）。 */
   nativeThinkingEffortEnabled?: boolean
+  /** CC↔Kiro 工具名/参数映射开关（默认开；热更即时生效）。 */
+  toolCompatMapping?: boolean
   // 上游 429 吸收层
   upstreamRetryAbsorbEnabled?: boolean
   upstreamRetryAbsorbBudgetSecs?: number

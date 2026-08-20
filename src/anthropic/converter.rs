@@ -2,7 +2,7 @@
 //!
 //! 负责将 Anthropic API 请求格式转换为 Kiro API 请求格式
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -885,6 +885,46 @@ fn is_valid_uuid(s: &str) -> bool {
     s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4
 }
 
+/// 首条消息参与派生键的文本上限（Unicode 标量个数；截断走 [`truncate_chars`]）。
+const FIRST_MESSAGE_SEED_MAX_CHARS: usize = 4096;
+
+/// 首条消息里用于派生键的可见文本：string，或数组里顶层 `type=text` 块。
+/// 忽略 image / document / 其它块；不 `Display` 整个 Value（base64 可达数 MB）。
+/// 累计到 `max_chars` 个 Unicode 标量即停，截断走 [`truncate_chars`]（UTF-8 边界）。
+fn first_message_text_for_hash(content: &serde_json::Value, max_chars: usize) -> String {
+    match content {
+        serde_json::Value::String(s) => truncate_chars(s, max_chars),
+        serde_json::Value::Array(arr) => {
+            let mut out = String::new();
+            let mut remaining = max_chars;
+            for item in arr {
+                if remaining == 0 {
+                    break;
+                }
+                let Some(obj) = item.as_object() else {
+                    continue;
+                };
+                let is_text_block = match obj.get("type") {
+                    Some(serde_json::Value::String(t)) => t == "text",
+                    None => obj.contains_key("text"),
+                    _ => false,
+                };
+                if !is_text_block {
+                    continue;
+                }
+                let Some(text) = obj.get("text").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let piece = truncate_chars(text, remaining);
+                remaining = remaining.saturating_sub(piece.chars().count());
+                out.push_str(&piece);
+            }
+            out
+        }
+        _ => String::new(),
+    }
+}
+
 /// 无 `metadata.user_id` 时，从「工作上下文」派生稳定 conversationId。
 ///
 /// # 为什么需要
@@ -899,30 +939,38 @@ fn is_valid_uuid(s: &str) -> bool {
 ///
 /// # 派生输入的选择
 ///
-/// 用 `system` 文本 + 排序后的工具名集合，二者都经过与请求路径同一套归一化：
+/// 用 `system` 文本 + 排序后的工具名集合 + **首条消息的可见文本**，system 走与请求
+/// 路径同一套归一化：
 ///
 /// - **system 走 [`canonicalize_system_text`]** —— 它已剥掉每请求漂移的段（`<env>` 块、
 ///   `gitStatus:`、`# Environment` 等）。不复用它就会让工作目录或日期的变化把键打散，
 ///   等于没修。
 /// - **工具名排序** —— 官方自认造过「工具排序非确定」的事故；不排序则同一上下文因工具
 ///   顺序抖动而分裂成多个键。
-/// - **不含 messages** —— 历史每轮都在变，含进去等于每请求一个新键，回到原问题。
+/// - **只吃下标 0 那条的 role + 顶层 text** —— 同一客户端跨会话的 system/tools 往往
+///   恒定，只哈希那两项会把无关会话折叠成一个键（k2cc 08-19：6 会话钉在 3 个号上
+///   轮转）。首条是「同会话跨轮不变、异会话通常不同」的成分：客户端每轮重发完整历史，
+///   下标 0 保持原样。不能纳入全部 messages，否则每轮新键。image / document / base64
+///   不进哈希（禁止把整个 content Display 进 hasher）。累计文本上限见
+///   [`FIRST_MESSAGE_SEED_MAX_CHARS`]。
 ///
 /// 加固定前缀 `derived-conversation:` 避免与 [`derive_agent_continuation_id`] 的哈希
 /// 用途碰撞。返回 UUID 形状是因为下游 `derive_agent_continuation_id` 与上游都按 UUID
-/// 形状消费该字段。
+/// 形状消费该字段。段与段之间用 `\x1f`，避免拼接歧义。
 ///
 /// # 边界
 ///
-/// system 与 tools 双双为空时返回 `None`，让调用方回落到随机 UUID —— 那种请求没有可
-/// 稳定的前缀可言，强行归到同一个键只会让无关请求互相污染上游会话。
+/// system 与 tools 双双为空时返回 `None`（**先判空，再碰首条消息**），让调用方回落到
+/// 随机 UUID —— 裸 curl 不应仅凭第一行文本绑死到同一号。那种请求没有可稳定的前缀
+/// 可言，强行归到同一个键只会让无关请求互相污染上游会话。
 ///
 /// # 多租户：为何跨用户撞键是安全的
 ///
-/// 不同用户若 system + tools 完全相同，会派生出同一个 conversationId。**这不会串话**：
-/// [`ConversationState`] 每次请求都携带完整 `history`（由 [`build_history`] 现场构建），
-/// 上游不靠 `continuationId` 重建历史。撞键的后果仅是两人共用一个上游会话键，而前缀
-/// 字节不同 → 缓存未命中，退化到修复前的状态，不会读到对方的内容。
+/// 不同用户若 system + tools + 首条可见文本完全相同，会派生出同一个 conversationId。
+/// **这不会串话**：[`ConversationState`] 每次请求都携带完整 `history`（由
+/// [`build_history`] 现场构建），上游不靠 `continuationId` 重建历史。撞键的后果仅是
+/// 两人共用一个上游会话键，而前缀字节不同 → 缓存未命中，退化到修复前的状态，不会
+/// 读到对方的内容。
 ///
 /// 因此没有按用户加盐。要加盐就得给 [`convert_request`] 传租户标识，那会改动全部调用点，
 /// 而换来的只是「本来就不会发生的泄漏」不发生 —— 不值得。若将来上游改为按
@@ -957,6 +1005,14 @@ fn derive_conversation_id_from_context(req: &MessagesRequest) -> Option<String> 
 
     if !has_material {
         return None;
+    }
+
+    if let Some(first) = req.messages.first() {
+        hasher.update(first.role.as_bytes());
+        hasher.update(b"\x1f");
+        let seed = first_message_text_for_hash(&first.content, FIRST_MESSAGE_SEED_MAX_CHARS);
+        hasher.update(seed.as_bytes());
+        hasher.update(b"\x1f");
     }
 
     let r = hasher.finalize();
@@ -1045,10 +1101,10 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     // 3. 生成会话 ID 和代理 ID
     // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId
-    // 三级回落：客户端显式 session_id → 工作上下文派生 → 随机。
-    // 中间这级是 2026-08-04 新增（L0-5）：不发 metadata 的客户端（python/curl/opencode）
-    // 此前每请求一个随机键 → 永久零命中，占全站 38.8% 的请求。见
-    // `derive_conversation_id_from_context` 的实测数据。
+    // 三级回落：客户端显式 session_id → 工作上下文派生（system + 排序工具名 +
+    // messages[0] 可见文本）→ 随机。中间这级是 2026-08-04 新增（L0-5）；08-20 把
+    // 首条可见文本纳入 seed，避免同 system/tools 的多会话折叠。见
+    // `derive_conversation_id_from_context`。
     let conversation_id = req
         .metadata
         .as_ref()
@@ -1283,6 +1339,9 @@ fn process_message_content_dedup(
                         "tool_use" => {
                             // tool_use 在 assistant 消息中处理，这里忽略
                         }
+                        // Claude Code ToolSearch 延迟加载占位块（tool_name 字段，无内容）：
+                        // 客户端本地延迟加载用，转发上游无意义 —— 静默跳过，不报错。
+                        "tool_reference" => {}
                         _ => {}
                     }
                 }
@@ -2197,6 +2256,17 @@ fn convert_tools(
                 t.clone()
             }
         })
+        // Claude Code 2.1.215+ 新增的 fs_append 工具，Kiro 上游不支持（400/行为异常），
+        // 兼容模式下隐藏不转发（参考仓 kiro-rs-admin converter.rs 同款处置）。
+        // 开关关闭（raw 透传）时透传，与非 Claude Code 客户端的工具保持原样。
+        .filter(|t| {
+            if tool_compat_mapping_enabled() && t.name == "fs_append" {
+                tracing::debug!("Claude Code 兼容模式隐藏 Kiro 不支持的 fs_append 工具");
+                false
+            } else {
+                true
+            }
+        })
         .map(|t| {
             let map_enabled = tool_compat_mapping_enabled();
             // Claude Code 内置工具名 → Kiro 原生名（Write→fs_write 等），记录反向映射；
@@ -2639,6 +2709,8 @@ fn convert_assistant_message(
                                     .push(ToolUseEntry::new(id, mapped_name).with_input(input));
                             }
                         }
+                        // Claude Code ToolSearch 延迟加载占位块：静默跳过（同 user 消息侧）。
+                        "tool_reference" => {}
                         _ => {}
                     }
                 }
@@ -2713,6 +2785,328 @@ fn merge_assistant_messages(
     Ok(HistoryAssistantMessage {
         assistant_response_message: assistant,
     })
+}
+
+// ============ 请求体超限字节兜底（移植 ref-new-jsjm-KiroStudio truncate.rs + sanitize_history.rs） ============
+//
+// 上游按**字节**拒绝过大请求体（400 CONTENT_LENGTH_EXCEEDS_THRESHOLD），而客户端侧
+// 的自动压缩按 **token** 阈值触发——量纲不对齐：长会话字节先撞线时压缩没机会启动。
+// 本段移植参考仓的两层兜底，供 `handlers.rs` 的 CONTENT_LENGTH_EXCEEDS 压缩重试路径
+// 调用（正常路径仍只走 token 压缩，见 [`apply_byte_overflow_guard`] 的文档）。
+
+/// 序列化后请求体的字节上限。
+///
+/// 上游按字节拒绝过大请求（参考仓实测 2MB 左右开始拒、1.1MB 仍可通过；我方上游
+/// ~5MiB 硬线）。这里取 900KB，与参考仓同值，保守地留出请求头与序列化开销的余量。
+pub(crate) const MAX_PAYLOAD_BYTES: usize = 900 * 1024;
+
+/// 截断时始终保留的最近历史条数。
+pub(crate) const MIN_RECENT_HISTORY_TURNS: usize = 4;
+
+/// 丢弃旧历史处插入的占位说明。
+pub(crate) const TRUNCATION_PLACEHOLDER: &str = "[Earlier conversation history was truncated to fit the model's input limit. Older messages and tool activity have been omitted.]";
+
+/// 估算单条历史的序列化字节数。
+fn entry_size(entry: &Message) -> usize {
+    serde_json::to_string(entry).map(|s| s.len()).unwrap_or(0)
+}
+
+/// 估算整个 `ConversationState` 的序列化字节数。
+fn state_size(state: &ConversationState) -> usize {
+    serde_json::to_string(state).map(|s| s.len()).unwrap_or(0)
+}
+
+/// 丢掉开头连续的 assistant 消息，保证历史以 user 开头。
+fn drop_leading_assistant(mut tail: Vec<Message>) -> Vec<Message> {
+    while matches!(tail.first(), Some(Message::Assistant(_))) {
+        tail.remove(0);
+    }
+    tail
+}
+
+/// 剥掉开头那些「引用了已被丢弃的 toolUse」的孤立 toolResults。
+///
+/// 历史里 assistant 用 `toolUses` 发起调用、随后的 user 用 `toolResults` 回结果，
+/// 两者靠 `tool_use_id` 配对。按字节切历史会把配对切断，留下引用不存在 id 的孤立
+/// toolResults，上游据此判定 `400 REQUEST_BODY_INVALID`（截断重排序产生孤儿 tool_use
+/// 正是 B8 已踩过的 400 形态）。这里从头逐条剥离，直到首条 user 不再含无主的
+/// toolResults。只需处理开头：尾部的配对天然完整（切口只在前端）。
+fn drop_orphan_tool_results(mut tail: Vec<Message>) -> Vec<Message> {
+    loop {
+        // 收集当前 tail 里所有 assistant 发起过的 tool_use_id。
+        let known: std::collections::HashSet<&str> = tail
+            .iter()
+            .filter_map(|m| match m {
+                Message::Assistant(a) => a.assistant_response_message.tool_uses.as_ref(),
+                _ => None,
+            })
+            .flatten()
+            .map(|t| t.tool_use_id.as_str())
+            .collect();
+
+        let orphan = match tail.first() {
+            Some(Message::User(u)) => {
+                let results = &u.user_input_message.user_input_message_context.tool_results;
+                !results.is_empty()
+                    && results.iter().any(|r| !known.contains(r.tool_use_id.as_str()))
+            }
+            _ => false,
+        };
+
+        if !orphan {
+            return tail;
+        }
+        // 丢掉这条孤立 toolResults 的 user，以及紧随其后的 assistant（保持交替）。
+        tail.remove(0);
+        if matches!(tail.first(), Some(Message::Assistant(_))) {
+            tail.remove(0);
+        }
+        if tail.is_empty() {
+            return tail;
+        }
+    }
+}
+
+/// 占位条之后紧跟的 assistant 应答。
+///
+/// 上游要求历史严格 user/assistant 交替，否则 `400 REQUEST_BODY_INVALID`。
+/// 占位本身是一条 user 消息，而 [`drop_leading_assistant`] 又保证 tail 以 user
+/// 开头，二者直接相接会形成 user+user。故在中间补一条极短的 assistant 应答。
+const PLACEHOLDER_ACK: &str = "Understood.";
+
+/// 若请求体超过 [`MAX_PAYLOAD_BYTES`]，丢弃最旧的历史轮次直至满足上限。
+///
+/// 返回被丢弃的条数（0 表示未截断）。当前消息本身超限时无能为力——那是单条用户
+/// 输入过大，截断历史也救不了，此时返回已丢弃的条数并让请求照常发出（由上游给出
+/// 明确错误），而不是静默改写用户的当前输入。
+///
+/// ⚠️ **前置约束：必须先跑 [`sanitize_history`] 再调用本函数**（生产路径
+/// `apply_byte_overflow_guard` 满足）。若不先扁平化，切口落在 toolUse/toolResult
+/// 配对中间时，[`drop_orphan_tool_results`] 的连坐删除（孤立 user + 紧随 assistant）
+/// 会把**保留段内配对本完整**的下一轮也连锁误删（见 `test_drop_orphan_chain_reaction`，
+/// 与参考仓行为一致——参考仓同样靠「sanitize 先行」规避）。sanitize 后历史无残留
+/// 结构化工具轮次，该路径成为死代码。
+///
+/// 保留策略（对齐参考仓 / kiro-go 的 truncatePayloadToLimit）：
+/// - 从最新往旧累加，保留能放下的最长后缀，但不少于 [`MIN_RECENT_HISTORY_TURNS`] 条；
+/// - 被丢弃处插入一条 [`TRUNCATION_PLACEHOLDER`] user 消息 + 极短 assistant 应答
+///   （占位与 tail 之间必须补 assistant，否则 user+user 破坏交替）；
+/// - 历史必须以 user 开头，截断后若首条是 assistant 则一并丢弃；
+/// - 切口可能切断 toolUse/toolResult 配对，剥掉引用了已丢 toolUse 的孤立 toolResults。
+pub(crate) fn truncate_history_if_needed(state: &mut ConversationState, model_id: &str) -> usize {
+    if state_size(state) <= MAX_PAYLOAD_BYTES {
+        return 0;
+    }
+
+    let conversation = std::mem::take(&mut state.history);
+    let total = conversation.len();
+    if total == 0 {
+        return 0;
+    }
+
+    let placeholder = Message::User(HistoryUserMessage::new(TRUNCATION_PLACEHOLDER, model_id));
+
+    // 先量出「不含任何历史」的基线大小（含占位条目），再从最新往旧累加。
+    let base = state_size(state) + entry_size(&placeholder);
+
+    let sizes: Vec<usize> = conversation.iter().map(entry_size).collect();
+
+    // 保留能放下的最长后缀，但不少于 MIN_RECENT_HISTORY_TURNS 条。
+    let mut keep_from = total;
+    let mut running = base;
+    for i in (0..total).rev() {
+        running += sizes[i];
+        let kept = total - i;
+        if running > MAX_PAYLOAD_BYTES && kept > MIN_RECENT_HISTORY_TURNS {
+            break;
+        }
+        keep_from = i;
+    }
+
+    let tail = drop_leading_assistant(conversation[keep_from..].to_vec());
+    // 切口可能落在 toolUse/toolResult 之间，留下无主的 toolResults → 上游 400。
+    let tail = drop_orphan_tool_results(tail);
+    // 上一步可能又暴露出开头的 assistant，再规整一次。
+    let tail = drop_leading_assistant(tail);
+
+    let mut rebuilt = Vec::with_capacity(tail.len() + 2);
+    if keep_from > 0 {
+        // 占位(user) + 应答(assistant)，保持与后续 tail(user 开头) 的严格交替。
+        rebuilt.push(placeholder);
+        rebuilt.push(Message::Assistant(HistoryAssistantMessage::new(
+            PLACEHOLDER_ACK,
+        )));
+    }
+    rebuilt.extend(tail);
+    state.history = rebuilt;
+
+    let dropped = keep_from;
+    if dropped > 0 {
+        tracing::warn!(
+            "请求体超过 {} KB，已丢弃最旧 {} 条历史（保留最近 {} 条）并插入占位说明",
+            MAX_PAYLOAD_BYTES / 1024,
+            dropped,
+            total - dropped
+        );
+    }
+    dropped
+}
+
+/// 把历史里的结构化工具调用扁平化为文本，只保留活跃轮次。
+///
+/// 上游只接受**一个活跃工具轮次**：最后一条 history assistant 的 `toolUses` ⟺
+/// 当前消息的 `toolResults`。历史里残留多组结构化 toolUses/toolResults 会被判
+/// `400 REQUEST_BODY_INVALID`（参考仓 sanitize_history.rs，对齐 kiro-go 的
+/// sanitizeKiroHistory）。本函数把历史里除活跃轮次外的所有结构化工具调用叙述为文本：
+/// - assistant 的 `toolUses` 直接清空，**不**写入任何「调用了工具 X」的文本
+///   （长历史里出现几十个「用文本调用工具」的范例，模型会模仿而不再发结构化调用）；
+/// - user 的 `toolResults` 转成 `[工具名] 输出` 形式并入正文（工具身份靠
+///   `tool_use_id → name` 映射保留）；
+/// - 顺带大幅缩小请求体（结构化 JSON 比纯文本冗余得多），从根上降低截断触发频率。
+///
+/// `current_tool_result_ids` 是**当前**消息携带的 `tool_use_id` 集合。当历史最后一条
+/// 是 assistant 且其 toolUses 被该集合完全覆盖时，这条保持结构化（即活跃轮次）。
+/// 部分覆盖（末条 toolUses=[A,B] 而 current 只应答 A）属**畸形输入**：A 被清空后
+/// current 的 A 变孤立 result，上游本就判 REQUEST_BODY_INVALID（严格 ⟺ 约束），
+/// 本函数不为此防御，错误码从 CONTENT_LENGTH_EXCEEDS 变为 REQUEST_BODY_INVALID 而已。
+pub(crate) fn sanitize_history(history: &mut [Message], current_tool_result_ids: &HashSet<String>) {
+    if history.is_empty() {
+        return;
+    }
+
+    // 快速检查：历史里是否有任何工具调用/结果。无则跳过（避免无谓遍历）。
+    let has_tools = history.iter().any(|m| match m {
+        Message::Assistant(a) => a
+            .assistant_response_message
+            .tool_uses
+            .as_ref()
+            .is_some_and(|uses| !uses.is_empty()),
+        Message::User(u) => !u
+            .user_input_message
+            .user_input_message_context
+            .tool_results
+            .is_empty(),
+    });
+    if !has_tools {
+        return;
+    }
+
+    // 先建 tool_use_id → 工具名 的全量映射：即便某轮的 toolUses 被清空，
+    // 其结果侧仍能标出来源工具。
+    let mut tool_names: HashMap<String, String> = HashMap::new();
+    for m in history.iter() {
+        if let Message::Assistant(a) = m {
+            if let Some(uses) = &a.assistant_response_message.tool_uses {
+                for tu in uses {
+                    if !tu.tool_use_id.is_empty() && !tu.name.is_empty() {
+                        tool_names.insert(tu.tool_use_id.clone(), tu.name.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // 判定活跃轮次：最后一条 assistant 的 toolUses 全部被当前 toolResults 应答。
+    let active_idx: Option<usize> = if current_tool_result_ids.is_empty() {
+        None
+    } else {
+        let last = history.len() - 1;
+        match &history[last] {
+            Message::Assistant(a) => match &a.assistant_response_message.tool_uses {
+                Some(uses) if !uses.is_empty() => uses
+                    .iter()
+                    .all(|tu| current_tool_result_ids.contains(&tu.tool_use_id))
+                    .then_some(last),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+
+    for (i, m) in history.iter_mut().enumerate() {
+        match m {
+            Message::Assistant(a) => {
+                if Some(i) == active_idx {
+                    continue; // 活跃轮次保持结构化
+                }
+                // 清空结构化调用，且不写任何调用叙述（见函数文档反模式）。
+                a.assistant_response_message.tool_uses = None;
+            }
+            Message::User(u) => {
+                let ctx = &mut u.user_input_message.user_input_message_context;
+                if !ctx.tool_results.is_empty() {
+                    let narrated = narrate_tool_results(&ctx.tool_results, &tool_names);
+                    if !narrated.is_empty() {
+                        let content = &mut u.user_input_message.content;
+                        if content.trim().is_empty() {
+                            *content = narrated;
+                        } else {
+                            content.push_str("\n\n");
+                            content.push_str(&narrated);
+                        }
+                    }
+                    ctx.tool_results.clear();
+                }
+                // 历史条目不该携带工具规格（只有当前消息需要）。
+                ctx.tools.clear();
+            }
+        }
+    }
+}
+
+/// 把 toolResults 叙述成 `[工具名] 输出` 形式的文本。
+fn narrate_tool_results(
+    results: &[ToolResult],
+    names: &HashMap<String, String>,
+) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(results.len());
+    for r in results {
+        let mut texts: Vec<&str> = Vec::new();
+        for c in &r.content {
+            if let Some(t) = c.get("text").and_then(|v| v.as_str()) {
+                if !t.trim().is_empty() {
+                    texts.push(t);
+                }
+            }
+        }
+        let body = if texts.is_empty() {
+            "(no output)".to_string()
+        } else {
+            texts.join("\n")
+        };
+        match names.get(&r.tool_use_id) {
+            Some(name) if !name.is_empty() => parts.push(format!("[{name}] {body}")),
+            _ => parts.push(body),
+        }
+    }
+    parts.join("\n")
+}
+
+/// 压缩重试前的字节兜底（只在 400 CONTENT_LENGTH_EXCEEDS 触发压缩重试的路径调用）。
+///
+/// 与 token 压缩的关系（谁先）：正常路径只走 token 压缩（`compressor` +
+/// `adaptive_compress_loop`，保语义）；上游按**字节**拒绝，量纲与 token 不对齐，
+/// 一旦 400 CONTENT_LENGTH_EXCEEDS 触发压缩重试，先做字节兜底再走 token 压缩：
+/// 1. [`sanitize_history`]：扁平化历史里除活跃轮次外的结构化工具轮次（缩小体积，
+///    参考仓顺序 sanitize → truncate，扁平化能降低截断触发频率）；
+/// 2. [`truncate_history_if_needed`]：超过 [`MAX_PAYLOAD_BYTES`] 时丢最旧历史 +
+///    占位说明 + 保 user/assistant 交替 + 剥孤立 toolResult。
+///
+/// 幂等：多次调用安全（截断后 size ≤ 上限则 no-op；sanitize 后无工具则早退）。
+pub(crate) fn apply_byte_overflow_guard(state: &mut ConversationState) {
+    // 当前消息的 toolResults 即活跃轮次的应答集合；先从 state 自身派生，
+    // 不依赖调用方从转换层传值。
+    let current_tool_result_ids: HashSet<String> = state
+        .current_message
+        .user_input_message
+        .user_input_message_context
+        .tool_results
+        .iter()
+        .map(|r| r.tool_use_id.clone())
+        .collect();
+    sanitize_history(&mut state.history, &current_tool_result_ids);
+    let model_id = state.current_message.user_input_message.model_id.clone();
+    truncate_history_if_needed(state, &model_id);
 }
 
 #[cfg(test)]
@@ -3021,6 +3415,7 @@ mod tests {
     }
 
     /// 构造只控制「工作上下文」（system 文本 + 工具名）的最小请求，供 L0-5 派生用例使用。
+    /// 默认带一条 `user`/`"hi"`，调用方可改 `messages` 测首条文本对派生键的影响。
     fn req_with_context(system: Option<&str>, tool_names: &[&str]) -> MessagesRequest {
         use super::super::types::Message as AnthropicMessage;
         use super::super::types::{SystemMessage, Tool};
@@ -3129,7 +3524,7 @@ mod tests {
     /// 正常路径不变：有有效 system + thinking → 前缀在最前，system 正文与分块策略都在。
     #[test]
     fn derived_conversation_id_is_stable_across_requests() {
-        // 同一工作上下文（system + tools 不变）必须派生出同一个键 —— 这正是 L0-5 的目的。
+        // 同一工作上下文（system + tools + 默认首条 "hi"）必须派生出同一个键。
         let a = req_with_context(Some("you are a helpful agent"), &["read", "write"]);
         let b = req_with_context(Some("you are a helpful agent"), &["read", "write"]);
         let ka = derive_conversation_id_from_context(&a).expect("应能派生");
@@ -3176,6 +3571,7 @@ mod tests {
     #[test]
     fn derived_conversation_id_is_none_without_material() {
         // system 与 tools 双空：没有可稳定的前缀，应回落随机而非归到同一个键。
+        // 夹具自带首条 "hi"；双空仍必须 None（不得凭第一行文本绑死裸 curl）。
         let empty = req_with_context(None, &[]);
         assert!(
             derive_conversation_id_from_context(&empty).is_none(),
@@ -3204,6 +3600,149 @@ mod tests {
             derive_conversation_id_from_context(&a),
             derive_conversation_id_from_context(&b),
             "环境噪音漂移必须被归一化吸收"
+        );
+    }
+
+    #[test]
+    fn derive_conversation_id_separates_distinct_first_user_text() {
+        // 同 system/tools、不同首条可见文本 → 必须是两个键（折叠会把流量钉在同一号）。
+        let mut a = req_with_context(Some("sys"), &["read"]);
+        let mut b = req_with_context(Some("sys"), &["read"]);
+        a.messages[0].content = serde_json::json!("session alpha first line");
+        b.messages[0].content = serde_json::json!("session beta first line");
+        assert_ne!(
+            derive_conversation_id_from_context(&a),
+            derive_conversation_id_from_context(&b),
+            "不同首条文本必须隔离"
+        );
+    }
+
+    #[test]
+    fn derive_conversation_id_ignores_later_messages() {
+        // 同会话后续轮只追加历史，下标 0 不变 → 键必须稳定。
+        use super::super::types::Message as AnthropicMessage;
+        let mut a = req_with_context(Some("sys"), &["read"]);
+        a.messages[0].content = serde_json::json!("stable first");
+        let mut b = a.clone();
+        b.messages.push(AnthropicMessage {
+            role: "assistant".to_string(),
+            content: serde_json::json!("ack"),
+        });
+        b.messages.push(AnthropicMessage {
+            role: "user".to_string(),
+            content: serde_json::json!("follow up that must not change the key"),
+        });
+        assert_eq!(
+            derive_conversation_id_from_context(&a),
+            derive_conversation_id_from_context(&b),
+            "后续消息不得改变派生键"
+        );
+    }
+
+    #[test]
+    fn derive_conversation_id_hashes_text_blocks_not_image_payload() {
+        // 数组 content：只吃顶层 text；image/document 的 base64 不得进 hasher。
+        let mut with_image = req_with_context(Some("sys"), &["read"]);
+        with_image.messages[0].content = serde_json::json!([
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+                }
+            },
+            { "type": "text", "text": "same visible prompt" },
+            {
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": "JVBERi0xLjAKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                }
+            }
+        ]);
+        let mut other_image = req_with_context(Some("sys"), &["read"]);
+        other_image.messages[0].content = serde_json::json!([
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE="
+                }
+            },
+            { "type": "text", "text": "same visible prompt" }
+        ]);
+        let mut text_only = req_with_context(Some("sys"), &["read"]);
+        text_only.messages[0].content = serde_json::json!("same visible prompt");
+        assert_eq!(
+            derive_conversation_id_from_context(&with_image),
+            derive_conversation_id_from_context(&other_image),
+            "不同附件不得改变派生键"
+        );
+        assert_eq!(
+            derive_conversation_id_from_context(&with_image),
+            derive_conversation_id_from_context(&text_only),
+            "纯文本与 image+text 在可见文本相同时必须同键"
+        );
+    }
+
+    #[test]
+    fn derive_conversation_id_none_if_empty_context_even_with_first_text() {
+        // 双空时先 return，不得因首条有字就派生（裸 curl 不绑号）。
+        let mut req = req_with_context(None, &[]);
+        req.messages[0].content =
+            serde_json::json!("a unique first line that must not bind a credential");
+        assert!(
+            derive_conversation_id_from_context(&req).is_none(),
+            "system+tools 双空时即使首条有文本也必须 None"
+        );
+    }
+
+    #[test]
+    fn derive_conversation_id_first_message_hashed_only_after_material_gate() {
+        // 源码守卫：生产区必须先因无材料退出，再碰下标 0 的文本。
+        // needle 运行时拼接，避免 include_str 把本测试字面量算进匹配。
+        let full = include_str!("converter.rs");
+        let production = full
+            .split("#[cfg(test)]")
+            .next()
+            .expect("生产区应在测试模块之前");
+        // 切片覆盖取文本 helper + 派生函数（Display 若藏在 helper 里也要红）。
+        let helper_needle = ["fn first_message_text", "_for_hash"].concat();
+        let start = production
+            .find(&helper_needle)
+            .expect("缺少首条文本 helper");
+        let chunk = &production[start..];
+        let next_fn = chunk
+            .find("\nfn collect_history_tool_names")
+            .expect("派生函数后应是 collect_history_tool_names");
+        let body = &chunk[..next_fn];
+
+        let none_needle = ["return ", "None"].concat();
+        let first_needle = ["messages", ".first()"].concat();
+        let none_pos = body.find(&none_needle).expect("必须有无材料早退");
+        let first_pos = body.find(&first_needle).expect("有材料后必须哈希首条");
+        assert!(
+            none_pos < first_pos,
+            "无材料早退必须发生在哈希首条之前，否则裸 curl 会按第一行绑号"
+        );
+
+        let prefix_needle = ["derived", "-conversation:"].concat();
+        assert!(
+            body.contains(&prefix_needle),
+            "前缀不得改成参考仓的 fallback-conversation"
+        );
+        let display_needle = ["first.content", ".to_string()"].concat();
+        assert!(
+            !body.contains(&display_needle),
+            "不得把整段 content Display 进 hasher"
+        );
+        let json_needle = ["to_string(", "&first.content"].concat();
+        assert!(
+            !body.contains(&json_needle),
+            "不得序列化整段 content 进 hasher"
         );
     }
 
@@ -3586,8 +4125,57 @@ mod tests {
         assert_eq!(tools[0].tool_specification.name, *short);
     }
 
+    /// Claude Code 2.1.215+ 的 ToolSearch 延迟加载产生 `type=tool_reference` 块
+    /// （只有 tool_name，没有 text）。system 数组里混入 → 反序列化必须容忍
+    /// （旧代码 text 必填，整请求 400）；content 里混入 → 转换静默跳过，
+    /// 不报错、从转发内容移除。
+    #[test]
+    fn test_tool_reference_blocks_tolerated_and_skipped() {
+        let json = serde_json::json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 1024,
+            "stream": false,
+            "system": [
+                {"type": "text", "text": "you are helpful"},
+                {"type": "tool_reference", "tool_name": "mcp__server__tool"}
+            ],
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "hi"},
+                    {"type": "tool_reference", "tool_name": "mcp__server__tool2"}
+                ]}
+            ]
+        });
+        let req: MessagesRequest = serde_json::from_value(json)
+            .expect("system 数组含 tool_reference 块不得反序列化失败（旧代码在此 400）");
+
+        // tool_reference 块被容忍：text 缺省为空串，text 块原样保留。
+        let system = req.system.as_deref().expect("system 应反序列化成功");
+        assert_eq!(system.len(), 2, "容忍而非丢弃：tool_reference 块仍在数组里");
+        assert_eq!(system[0].text, "you are helpful");
+        assert_eq!(system[1].text, "", "tool_reference 块无 text，容忍为空串");
+
+        let result = convert_request(&req).expect("含 tool_reference 块的请求转换不得报错");
+
+        // 转发内容：文本块保留，tool_reference 静默跳过（无残留）。
+        let content = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content;
+        assert!(
+            content.contains("hi"),
+            "text 块文本必须保留: {content:?}"
+        );
+        assert!(
+            !content.contains("tool_reference") && !content.contains("mcp__server"),
+            "tool_reference 不得泄漏进转发内容: {content:?}"
+        );
+    }
+
     #[test]
     fn test_convert_tools_strips_web_search_in_mixed_list() {
+        let _g = ToolCompatGuard::with(true);
         use super::super::types::Tool as AnthropicTool;
 
         let mk = |name: &str, ty: Option<&str>| AnthropicTool {
@@ -3633,9 +4221,12 @@ mod tests {
     fn test_convert_tools_normalizes_type_only_web_search() {
         use super::super::types::Tool as AnthropicTool;
 
-        // is_builtin 分支依赖 tool_compat_mapping 开关（默认关，无配置入口）；
-        // 测试显式开启以验证「归一化后命中内置 web_search schema」的完整链。
-        set_tool_compat_mapping(true);
+        // is_builtin 分支依赖 tool_compat_mapping 开关（默认开，可经 toolCompatMapping
+        // 配置关闭）；测试显式开启以验证「归一化后命中内置 web_search schema」的完整链。
+        // 串行锁：与 test_convert_tools_passthrough_when_mapping_disabled（翻转同一原子）
+        // 互斥，防止并行执行时读到对方写入的开关值（ENV_NOISE_TEST_LOCK 同款）。
+        // std::sync::Mutex 非重入：本测试只能拿一次 ToolCompatGuard（双 with 会自死锁）。
+        let _g = ToolCompatGuard::with(true);
 
         let mk = |name: &str, ty: Option<&str>| AnthropicTool {
             name: name.to_string(),
@@ -3669,10 +4260,100 @@ mod tests {
         );
     }
 
+    /// 工具映射开关是进程级全局原子，测试并行会相互污染。用一把静态锁串行所有触碰
+    /// 该开关的用例，并在守卫里恢复原值（ENV_NOISE_TEST_LOCK 同款，见上文）。
+    static TOOL_COMPAT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct ToolCompatGuard {
+        prev: bool,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl ToolCompatGuard {
+        fn with(enabled: bool) -> Self {
+            let lock = TOOL_COMPAT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let prev = tool_compat_mapping_enabled();
+            set_tool_compat_mapping(enabled);
+            ToolCompatGuard { prev, _lock: lock }
+        }
+    }
+    impl Drop for ToolCompatGuard {
+        fn drop(&mut self) {
+            set_tool_compat_mapping(self.prev);
+        }
+    }
+
+    /// 开关关闭时映射**不生效**：Write 不映射成 fs_write、schema 不换成 Kiro 原生形态、
+    /// 反向映射表不记录 Kiro 名；type-only web_search 归一化分支仍补名（分支不看开关），
+    /// 但名字保持客户端原形（WebSearch）而不是 Kiro 原生 web_search。
     #[test]
-    fn test_convert_tools_regular_tool_unaffected() {
+    fn test_convert_tools_passthrough_when_mapping_disabled() {
         use super::super::types::Tool as AnthropicTool;
 
+        let _g = ToolCompatGuard::with(false);
+
+        let mk = |name: &str, ty: Option<&str>| AnthropicTool {
+            name: name.to_string(),
+            description: "d".to_string(),
+            input_schema: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("type".to_string(), serde_json::json!("object"));
+                m.insert(
+                    "properties".to_string(),
+                    serde_json::json!({"file_path": {"type": "string"}}),
+                );
+                m
+            },
+            tool_type: ty.map(|s| s.to_string()),
+            max_uses: None,
+            cache_control: None,
+        };
+
+        let tools = Some(vec![mk("Write", None), mk("", Some("web_search_20250305"))]);
+        let mut map = HashMap::new();
+        let converted = convert_tools(&tools, &mut map);
+
+        assert_eq!(converted.len(), 2, "关闭开关只影响映射，不影响工具保留/归一化");
+        let names: Vec<&str> = converted
+            .iter()
+            .map(|t| t.tool_specification.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"Write"),
+            "关闭后 Write 必须原样透传（仅超长缩短），不得映射成 fs_write: {names:?}"
+        );
+        assert!(
+            names.contains(&"WebSearch"),
+            "关闭后 web_search 只补名不换 Kiro 原生名: {names:?}"
+        );
+        // 反向映射表不得记录 Kiro 原生名（fs_write）→ 客户端名。
+        assert!(
+            !map.contains_key("fs_write"),
+            "关闭后反向映射表不得出现 Kiro 原生名 fs_write"
+        );
+        // Write 的 schema 必须是客户端原样（file_path），不是 Kiro 原生合成 schema（path）。
+        // 真实入站 input_schema 是 JSON Schema 对象（type/properties），normalize 白名单
+        // 只留 schema 字段；参数在 properties 下，不在根上。
+        let write = converted
+            .iter()
+            .find(|t| t.tool_specification.name == "Write")
+            .expect("Write 必须在");
+        let schema: serde_json::Value = write.tool_specification.input_schema.json.clone();
+        assert!(
+            schema["properties"].get("file_path").is_some(),
+            "关闭后 schema.properties 必须保留客户端 file_path 参数"
+        );
+        assert!(
+            schema["properties"].get("path").is_none(),
+            "关闭后不得注入 Kiro 原生 path 参数"
+        );
+    }
+
+    #[test]
+    fn test_convert_tools_regular_tool_unaffected() {
+        let _g = ToolCompatGuard::with(true);
+        use super::super::types::Tool as AnthropicTool;
         let tools = Some(vec![AnthropicTool {
             name: "Read".to_string(),
             description: String::new(),
@@ -3693,9 +4374,62 @@ mod tests {
         );
     }
 
+    /// fs_append（Claude Code 2.1.215+ 新增）在兼容模式下被隐藏（Kiro 上游不支持，
+    /// 参考仓 kiro-rs-admin 同款处置）；Write/Read 等既有映射不受影响；
+    /// 开关关闭（raw 透传）时原样保留。
+    #[test]
+    fn test_convert_tools_hides_fs_append_in_compat_mode() {
+        use super::super::types::Tool as AnthropicTool;
+
+        let mk = |name: &str| AnthropicTool {
+            name: name.to_string(),
+            description: String::new(),
+            input_schema: std::collections::HashMap::new(),
+            tool_type: None,
+            max_uses: None,
+            cache_control: None,
+        };
+
+        let tools = Some(vec![mk("fs_append"), mk("Write"), mk("Read")]);
+
+        // 开关开启（Claude Code 兼容模式）：fs_append 隐藏，Write/Read 映射不受影响。
+        let _g = ToolCompatGuard::with(true);
+        let mut map = HashMap::new();
+        let converted = convert_tools(&tools, &mut map);
+        let names: Vec<&str> = converted
+            .iter()
+            .map(|t| t.tool_specification.name.as_str())
+            .collect();
+        assert!(
+            !names.contains(&"fs_append"),
+            "fs_append 应被隐藏，不得转发上游: {names:?}"
+        );
+        assert!(names.contains(&"fs_write"), "Write 映射不受影响: {names:?}");
+        assert!(names.contains(&"read_file"), "Read 映射不受影响: {names:?}");
+        assert!(
+            !map.contains_key("fs_append"),
+            "隐藏的工具不得进入 tool_name_map: {map:?}"
+        );
+
+        // 开关关闭（raw 透传）：fs_append 原样保留。
+        drop(_g);
+        let _g2 = ToolCompatGuard::with(false);
+        let mut map = HashMap::new();
+        let converted = convert_tools(&tools, &mut map);
+        let names: Vec<&str> = converted
+            .iter()
+            .map(|t| t.tool_specification.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"fs_append"),
+            "关闭开关后 fs_append 必须透传（非 Claude Code 客户端不受影响）: {names:?}"
+        );
+    }
+
     /// CC↔Kiro 映射：Write → fs_write，且 schema 换成 Kiro 原生参数形态（path/text）。
     #[test]
     fn test_convert_tools_maps_builtin_to_kiro_schema() {
+        let _g = ToolCompatGuard::with(true);
         use super::super::types::Tool as AnthropicTool;
 
         let tools = Some(vec![AnthropicTool {
@@ -5561,5 +6295,458 @@ mod native_effort_tests {
             conversion.additional_model_request_fields.is_none(),
             "开关关时不得产出 native 字段"
         );
+    }
+}
+
+#[cfg(test)]
+mod byte_overflow_tests {
+    use super::*;
+    use crate::kiro::model::requests::conversation::{
+        HistoryAssistantMessage, HistoryUserMessage, UserInputMessageContext,
+    };
+    use crate::kiro::model::requests::tool::{ToolResult, ToolUseEntry};
+
+    fn user(content: &str) -> Message {
+        Message::User(HistoryUserMessage::new(content, "auto"))
+    }
+
+    fn assistant(content: &str) -> Message {
+        Message::Assistant(HistoryAssistantMessage::new(content))
+    }
+
+    fn state_with(history: Vec<Message>) -> ConversationState {
+        let mut s = ConversationState::new("11111111-1111-4111-8111-111111111111");
+        s.history = history;
+        s
+    }
+
+    fn assistant_with_tool(content: &str, id: &str) -> Message {
+        let m = HistoryAssistantMessage::new(content);
+        let mut m = m;
+        m.assistant_response_message.tool_uses = Some(vec![ToolUseEntry {
+            tool_use_id: id.to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({"path": "a.rs"}),
+        }]);
+        Message::Assistant(m)
+    }
+
+    fn user_with_result(content: &str, id: &str) -> Message {
+        let mut m = HistoryUserMessage::new(content, "auto");
+        let mut ctx = UserInputMessageContext::default();
+        ctx.tool_results = vec![ToolResult {
+            tool_use_id: id.to_string(),
+            content: vec![],
+            status: Some("success".to_string()),
+            is_error: false,
+        }];
+        m.user_input_message.user_input_message_context = ctx;
+        Message::User(m)
+    }
+
+    /// 收集保留历史里出现的所有 toolResult，断言每个都有对应的 toolUse。
+    fn assert_no_orphan_tool_results(state: &ConversationState) {
+        let known: std::collections::HashSet<String> = state
+            .history
+            .iter()
+            .filter_map(|m| match m {
+                Message::Assistant(a) => a.assistant_response_message.tool_uses.as_ref(),
+                _ => None,
+            })
+            .flatten()
+            .map(|t| t.tool_use_id.clone())
+            .collect();
+        for m in &state.history {
+            if let Message::User(u) = m {
+                for r in &u.user_input_message.user_input_message_context.tool_results {
+                    assert!(
+                        known.contains(&r.tool_use_id),
+                        "孤立 toolResult {} 无对应 toolUse，会触发上游 400",
+                        r.tool_use_id
+                    );
+                }
+            }
+        }
+    }
+
+    /// 断言 user/assistant 严格交替（上游要求，否则 400 REQUEST_BODY_INVALID）。
+    fn assert_alternation(history: &[Message]) {
+        for (i, w) in history.windows(2).enumerate() {
+            let same = matches!(
+                (&w[0], &w[1]),
+                (Message::User(_), Message::User(_))
+                    | (Message::Assistant(_), Message::Assistant(_))
+            );
+            assert!(!same, "位置 {i} 出现连续同角色消息，会导致上游 400");
+        }
+    }
+
+    #[test]
+    fn test_no_truncation_when_small() {
+        let mut s = state_with(vec![user("hi"), assistant("hello")]);
+        assert_eq!(truncate_history_if_needed(&mut s, "auto"), 0);
+        assert_eq!(s.history.len(), 2, "小请求不应被改动");
+    }
+
+    #[test]
+    fn test_truncates_oversized_history() {
+        let big = "x".repeat(200 * 1024);
+        // 12 条大历史 ≈ 2.4MB，远超 900KB。
+        let mut hist = Vec::new();
+        for _ in 0..6 {
+            hist.push(user(&big));
+            hist.push(assistant(&big));
+        }
+        let mut s = state_with(hist);
+        let dropped = truncate_history_if_needed(&mut s, "auto");
+
+        assert!(dropped > 0, "超限请求必须被截断");
+        assert!(
+            state_size(&s) <= MAX_PAYLOAD_BYTES,
+            "截断后仍超限: {} > {}",
+            state_size(&s),
+            MAX_PAYLOAD_BYTES
+        );
+        // 首条应是占位说明，让模型知道上下文被省略。
+        match s.history.first() {
+            Some(Message::User(m)) => assert_eq!(
+                m.user_input_message.content, TRUNCATION_PLACEHOLDER,
+                "被丢弃处应插入占位说明"
+            ),
+            other => panic!("首条应为占位 user 消息，实际: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_history_starts_with_user_after_truncation() {
+        // 构造截断后恰好以 assistant 开头的情况，验证它被丢掉
+        // （上游要求 user/assistant 交替且以 user 起始）。
+        //
+        // 尺寸核算（Review m5）：20 条 × 130KB ≈ 2.6MB。keep_from 循环逐条累加，
+        // running 在 i=13（kept=7）时 > 900KB 且 kept > 4 → break，keep_from=14，
+        // 索引 14 是 assistant（偶数位）→ tail 以 assistant 开头 → drop_leading
+        // 必执行。旧值 150KB 时 break 恰落在 user 上（i=15, kept=6，150×6=900 未超
+        // 900KB），drop_leading 从未触发，测试恒绿但测不到目标分支。
+        let big = "y".repeat(130 * 1024);
+        let mut hist = Vec::new();
+        for _ in 0..10 {
+            hist.push(assistant(&big));
+            hist.push(user(&big));
+        }
+        let mut s = state_with(hist);
+        truncate_history_if_needed(&mut s, "auto");
+
+        // 占位(user) 之后紧跟应答(assistant)，再往后才是保留的 tail(user 开头)，
+        // 这样才满足上游的严格交替要求。
+        assert_alternation(&s.history);
+        let rest: Vec<&Message> = s.history.iter().skip(1).collect();
+        if let Some(first) = rest.first() {
+            assert!(
+                matches!(first, Message::Assistant(_)),
+                "占位之后必须紧跟 assistant 应答，否则形成 user+user 触发上游 400"
+            );
+        }
+        // drop_leading 执行证据：tail 首条必须是 user（若未删除开头 assistant，
+        // 交替断言已会红；这里再钉一次首条形状）。
+        match s.history.get(2) {
+            Some(Message::User(m)) => assert!(
+                !m.user_input_message.content.is_empty(),
+                "tail 首条应为真实 user 消息"
+            ),
+            other => panic!("tail 首条应为 user（drop_leading 未执行），实际: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_empty_history_is_noop() {
+        let mut s = state_with(vec![]);
+        assert_eq!(truncate_history_if_needed(&mut s, "auto"), 0);
+    }
+
+    #[test]
+    fn test_alternation_preserved_after_truncation() {
+        let big = "z".repeat(120 * 1024);
+        let mut hist = Vec::new();
+        for _ in 0..10 {
+            hist.push(Message::User(HistoryUserMessage::new(&big, "auto")));
+            hist.push(Message::Assistant(HistoryAssistantMessage::new(&big)));
+        }
+        let mut s = state_with(hist);
+        truncate_history_if_needed(&mut s, "auto");
+
+        assert!(!s.history.is_empty(), "截断后不得清空历史");
+        assert_alternation(&s.history);
+        // 占位必须保留（keep_from > 0 时插入），不能只删不补。
+        match s.history.first() {
+            Some(Message::User(m)) => assert_eq!(
+                m.user_input_message.content, TRUNCATION_PLACEHOLDER,
+                "截断后首条应为占位 user"
+            ),
+            _ => panic!("截断后首条应为占位 user"),
+        }
+    }
+
+    /// 真实 Codex 会话形态：user → assistant(toolUse) → user(toolResult) → ...
+    /// 按字节截断会切断配对，留下无主 toolResults → 上游 400 REQUEST_BODY_INVALID。
+    #[test]
+    fn test_no_orphan_tool_results_after_truncation() {
+        let big = "q".repeat(100 * 1024);
+        let mut hist = Vec::new();
+        for i in 0..12 {
+            let id = format!("tu_{i}");
+            hist.push(Message::User(HistoryUserMessage::new(&big, "auto")));
+            hist.push(assistant_with_tool(&big, &id));
+            hist.push(user_with_result(&big, &id));
+            hist.push(Message::Assistant(HistoryAssistantMessage::new(&big)));
+        }
+        let mut s = state_with(hist);
+        let dropped = truncate_history_if_needed(&mut s, "auto");
+        assert!(dropped > 0, "超限请求必须被截断");
+
+        assert_no_orphan_tool_results(&s);
+        assert_alternation(&s.history);
+    }
+
+    /// 切口落在配对中间：tail 以「引用了已丢弃 toolUse 的 user」开头。
+    #[test]
+    fn test_drops_orphan_leading_result() {
+        let tail = vec![
+            user_with_result("result", "tu_gone"), // 孤立：tu_gone 的 toolUse 已被丢
+            Message::Assistant(HistoryAssistantMessage::new("ok")),
+            Message::User(HistoryUserMessage::new("next", "auto")),
+        ];
+        let out = drop_orphan_tool_results(tail);
+        if let Some(Message::User(u)) = out.first() {
+            let rs = &u.user_input_message.user_input_message_context.tool_results;
+            assert!(
+                rs.is_empty() || rs.iter().all(|r| r.tool_use_id != "tu_gone"),
+                "孤立 toolResult 未被清理"
+            );
+        }
+    }
+
+    /// 配对完整时不得误删。
+    ///
+    /// 注意：orphan 判定只查**首条** user。首条是无 toolResults 的普通 user 时，
+    /// 即使其后有完整配对也整段保留——这正是「配对完整不误删」的正确形态
+    /// （旧构造以 assistant 开头，orphan 判定对 assistant 恒为 false，测试恒绿无意义）。
+    #[test]
+    fn test_keeps_paired_results() {
+        let tail = vec![
+            Message::User(HistoryUserMessage::new("plain", "auto")),
+            assistant_with_tool("calling", "tu_1"),
+            user_with_result("result", "tu_1"),
+        ];
+        let out = drop_orphan_tool_results(tail);
+        assert_eq!(out.len(), 3, "配对完整的历史不应被删");
+    }
+
+    /// 连锁删除行为测试（Review M1）：独立调用 `truncate_history_if_needed`（未先
+    /// sanitize）时，切口处的孤立 user 会被删除，且连坐删除紧随的 assistant，
+    /// 使保留段内配对完整的下一轮变成孤立 → 连锁。这是参考仓同款行为，生产路径
+    /// 由 `apply_byte_overflow_guard` 的「sanitize 先行」规避（截断前无残留结构化
+    /// 工具轮次，本路径成死代码）；本测试钉住的是：**不变量不破**——连锁删除后
+    /// 仍无孤立 toolResult、交替仍保持（只是过度丢弃了保留段的完整配对）。
+    #[test]
+    fn test_drop_orphan_chain_reaction_keeps_invariants() {
+        let tail = vec![
+            user_with_result("result", "tu_gone"), // 孤立：toolUse 已在切口前被丢
+            assistant_with_tool("calling", "tu_kept"),
+            user_with_result("result", "tu_kept"),
+            Message::User(HistoryUserMessage::new("plain", "auto")),
+        ];
+        let out = drop_orphan_tool_results(tail);
+        assert_alternation(&out);
+        // 无孤立 toolResult：保留段出现的每个 result 都必须在保留段内有对应 toolUse。
+        let known: std::collections::HashSet<String> = out
+            .iter()
+            .filter_map(|m| match m {
+                Message::Assistant(a) => a.assistant_response_message.tool_uses.as_ref(),
+                _ => None,
+            })
+            .flatten()
+            .map(|t| t.tool_use_id.clone())
+            .collect();
+        for m in &out {
+            if let Message::User(u) = m {
+                for r in &u.user_input_message.user_input_message_context.tool_results {
+                    assert!(
+                        known.contains(&r.tool_use_id),
+                        "连锁删除后仍不得残留孤立 toolResult {}",
+                        r.tool_use_id
+                    );
+                }
+            }
+        }
+    }
+
+    // ============ sanitize_history（旧工具轮次扁平化） ============
+
+    fn a_with_use(id: &str, name: &str) -> Message {
+        let mut a = HistoryAssistantMessage::new("calling");
+        a.assistant_response_message.tool_uses = Some(vec![ToolUseEntry {
+            tool_use_id: id.into(),
+            name: name.into(),
+            input: serde_json::json!({}),
+        }]);
+        Message::Assistant(a)
+    }
+
+    fn u_with_result_content(id: &str, text: &str) -> Message {
+        let mut m = HistoryUserMessage::new("", "auto");
+        let mut ctx = UserInputMessageContext::default();
+        let mut c = serde_json::Map::new();
+        c.insert("text".into(), serde_json::json!(text));
+        ctx.tool_results = vec![ToolResult {
+            tool_use_id: id.into(),
+            content: vec![c],
+            status: Some("success".into()),
+            is_error: false,
+        }];
+        m.user_input_message.user_input_message_context = ctx;
+        Message::User(m)
+    }
+
+    /// 无活跃轮次时：所有结构化工具调用都被扁平化。
+    #[test]
+    fn test_flattens_all_when_no_active_turn() {
+        let mut h = vec![
+            a_with_use("tu_1", "read_file"),
+            u_with_result_content("tu_1", "file contents"),
+        ];
+        sanitize_history(&mut h, &HashSet::new());
+
+        match &h[0] {
+            Message::Assistant(a) => assert!(
+                a.assistant_response_message.tool_uses.is_none(),
+                "非活跃轮次的 toolUses 必须清空"
+            ),
+            _ => panic!("shape"),
+        }
+        match &h[1] {
+            Message::User(u) => {
+                assert!(
+                    u.user_input_message
+                        .user_input_message_context
+                        .tool_results
+                        .is_empty(),
+                    "toolResults 必须被扁平化"
+                );
+                let c = &u.user_input_message.content;
+                assert!(c.contains("file contents"), "结果文本须并入正文: {c}");
+                assert!(c.contains("read_file"), "须标出来源工具名: {c}");
+            }
+            _ => panic!("shape"),
+        }
+    }
+
+    /// 活跃轮次（末条 assistant 被当前 toolResults 应答）保持结构化。
+    #[test]
+    fn test_keeps_active_tool_turn_structured() {
+        let mut h = vec![
+            u_with_result_content("tu_old", "old result"),
+            a_with_use("tu_now", "grep"),
+        ];
+        let mut ids = HashSet::new();
+        ids.insert("tu_now".to_string());
+        sanitize_history(&mut h, &ids);
+
+        match &h[1] {
+            Message::Assistant(a) => {
+                let uses = a.assistant_response_message.tool_uses.as_ref();
+                assert!(uses.is_some(), "活跃轮次必须保持结构化");
+                assert_eq!(uses.unwrap()[0].tool_use_id, "tu_now");
+            }
+            _ => panic!("shape"),
+        }
+    }
+
+    /// 反模式守卫：扁平化后 assistant 正文不得出现工具调用叙述，
+    /// 否则模型会模仿「用文本调用工具」而不再发结构化调用。
+    #[test]
+    fn test_no_tool_call_narration_in_assistant() {
+        let mut h = vec![a_with_use("tu_1", "read_file"), u_with_result_content("tu_1", "x")];
+        sanitize_history(&mut h, &HashSet::new());
+        if let Message::Assistant(a) = &h[0] {
+            let c = &a.assistant_response_message.content;
+            for bad in ["[Called", "read_file", "tool_use", "invoke"] {
+                assert!(
+                    !c.contains(bad),
+                    "assistant 正文不得叙述工具调用，命中 {bad}: {c}"
+                );
+            }
+        }
+    }
+
+    // ============ 触发点端到端：压缩重试路径的字节兜底 ============
+
+    /// 兜底组合：sanitize（活跃轮次保持结构化、其余扁平化）→ 字节截断
+    /// （≤ MAX_PAYLOAD_BYTES + 占位 + 交替 + 无孤立 toolResult）。
+    #[test]
+    fn test_apply_byte_overflow_guard_end_to_end() {
+        let big = "m".repeat(90 * 1024);
+        let mut hist = Vec::new();
+        // 10 组完整工具轮次（含配对），总大小远超 900KB。
+        for i in 0..10 {
+            let id = format!("tu_{i}");
+            hist.push(Message::User(HistoryUserMessage::new(&big, "auto")));
+            hist.push(assistant_with_tool(&big, &id));
+            hist.push(user_with_result(&big, &id));
+            hist.push(Message::Assistant(HistoryAssistantMessage::new(&big)));
+        }
+        let mut s = state_with(hist);
+        // 当前消息携带活跃轮次的 toolResults（tu_active 的历史 toolUse 不存在 →
+        // 无活跃轮次，全部扁平化；这只影响结构化与否，不影响截断）。
+        s.current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results
+            .push(ToolResult::success("tu_active", "out"));
+
+        apply_byte_overflow_guard(&mut s);
+
+        assert!(
+            state_size(&s) <= MAX_PAYLOAD_BYTES,
+            "字节兜底后仍超限: {} > {}",
+            state_size(&s),
+            MAX_PAYLOAD_BYTES
+        );
+        match s.history.first() {
+            Some(Message::User(m)) => assert_eq!(
+                m.user_input_message.content, TRUNCATION_PLACEHOLDER,
+                "被丢弃处应插入占位说明"
+            ),
+            _ => panic!("首条应为占位 user 消息"),
+        }
+        assert_alternation(&s.history);
+        assert_no_orphan_tool_results(&s);
+    }
+
+    /// 幂等：二次调用不得再改动（截断后 size ≤ 上限 → no-op）。
+    #[test]
+    fn test_apply_byte_overflow_guard_idempotent() {
+        let big = "n".repeat(150 * 1024);
+        let mut hist = Vec::new();
+        for i in 0..6 {
+            hist.push(Message::User(HistoryUserMessage::new(&big, "auto")));
+            hist.push(assistant_with_tool(&big, &format!("tu_{i}")));
+            hist.push(user_with_result(&big, &format!("tu_{i}")));
+        }
+        let mut s = state_with(hist);
+        apply_byte_overflow_guard(&mut s);
+        let first_pass = s.history.clone();
+        let first_size = state_size(&s);
+
+        apply_byte_overflow_guard(&mut s);
+        assert_eq!(s.history.len(), first_pass.len(), "二次兜底不得再删历史");
+        assert_eq!(state_size(&s), first_size, "二次兜底不得再改动体积");
+    }
+
+    /// 小请求（≤ 900KB）：兜底完全不动历史。
+    #[test]
+    fn test_apply_byte_overflow_guard_small_request_unchanged() {
+        let mut s = state_with(vec![user("hi"), assistant("hello")]);
+        apply_byte_overflow_guard(&mut s);
+        assert_eq!(s.history.len(), 2, "小请求不应被改动");
     }
 }

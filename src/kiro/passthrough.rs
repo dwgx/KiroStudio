@@ -180,10 +180,9 @@ pub async fn forward(
     raw_body: Bytes,
     global_proxy: Option<&crate::http_client::ProxyConfig>,
     tls_backend: TlsBackend,
-    global_deepseek_cfg: &crate::kiro::deepseek_normalize::DeepseekNormalizeConfig,
     // 全局模型映射规则（`config.model_mapping`，调用方每次请求快照一次）。
-    // 在 `forward` **内部**应用：与 deepseek 归一化同处，可保证「先映射 → 再归一化」
-    // 的顺序，且 `select_custom_api` 选号（映射前）与改写（映射后）自然分层。
+    // 在 `forward` **内部**应用，`select_custom_api` 选号（映射前）与改写（映射后）
+    // 自然分层。deepseek 归一化已移除（2026-08-16），映射是唯一的模型改写。
     model_mapping: &std::collections::HashMap<String, String>,
     // 客户端原始请求头（P3：按白名单转发 `anthropic-beta` 等；`None` = 不转发任何客户端头）。
     client_headers: Option<&header::HeaderMap>,
@@ -230,33 +229,16 @@ pub async fn forward(
         }
     };
 
-    // deepseek 归一化:opencodezen 代挂凭据(deepseekNormalize=true)时,转发前按 fuckopencode
-    // 的 deepseek 协议修复改写请求体(模型名→deepseek-v4-flash、thinking adaptive→enabled、
-    // reasoning_effort→output_config、多轮 tool_use 注入 thinking、剥 context_management 等),
-    // 再原样转发;其余 custom_api 凭据保持零转换透传。
-    // ⚠️ 响应侧 thinking 过滤(thinking disabled 时 deepseek 仍吐 thinking,客户端会报
-    // "Tool result missing")在下方按 content-type 分流处理,仅 deepseek_normalize=true 启用。
+    // 🔴 2026-08-16：deepseek 归一化已完全移除，请求体模型名**原样透传**
+    // （不再有 claude-* → fallback 改写、thinking/effort/tool 字段归一化）。
+    // 唯一的模型改写是下面的全局 `model_mapping` 表（独立功能，保留）。
     //
-    // 配置提前到作用域（body 处理 + 响应过滤共用）：per-凭据覆盖全局标量，bool 取全局。
-    let ds_cfg: Option<crate::kiro::deepseek_normalize::DeepseekNormalizeConfig> =
-        if cred.deepseek_normalize == Some(true) {
-            Some(
-                cred
-                    .deepseek_normalize_config
-                    .as_ref()
-                    .map(|c| c.merge_over(global_deepseek_cfg))
-                    .unwrap_or_else(|| global_deepseek_cfg.clone()),
-            )
-        } else {
-            None
-        };
-    // body 处理链：**先映射 → 再 deepseek 归一化**（顺序承重，反序会让 deepseek 先
-    // 把名压成 fallback、映射规则再也匹配不到原始名）。模型映射只对 custom_api 号在
-    // 非豁免时生效；`select_custom_api` 选号用**映射前**名（决定 3：白名单管原始名）。
+    // body 处理链：全局映射（非豁免时）。模型映射只对 custom_api 号在非豁免时生效；
+    // `select_custom_api` 选号用**映射前**名（白名单判定原始模型名）。
     //
     // ⚠️ 一个**设计明确接受的不对称**（非 bug，见 `model_mapping` 模块文档）：选号侧
-    // 预判的是 deepseek 改写后的名（`token_manager.rs` select_custom_api），映射不进
-    // 预判 ⇒ 「映射后名该号上游不认」时仍可能选中该号 → 上游 400，由凭据豁免覆盖。
+    // 预判的是映射后的名（`token_manager.rs` select_custom_api 的 support_rank），映射
+    // 不进预判 ⇒ 「映射后名该号上游不认」时仍可能选中该号 → 上游 400，由凭据豁免覆盖。
     let exempt = cred.model_mapping_exempt == Some(true);
     let body_bytes: Bytes = {
         let parsed = serde_json::from_slice::<serde_json::Value>(&raw_body);
@@ -273,14 +255,6 @@ pub async fn forward(
                             v["model"] = serde_json::json!(target);
                         }
                     }
-                }
-                // ② deepseek 归一化（仅该号开启时）。
-                if let Some(cfg) = &ds_cfg {
-                    crate::kiro::deepseek_normalize::normalize_request(
-                        &mut v,
-                        cfg,
-                        cred.allowed_models.as_deref(),
-                    );
                 }
                 serde_json::to_vec(&v).map(Bytes::from).unwrap_or_else(|_| raw_body.clone())
             }
@@ -461,11 +435,12 @@ pub async fn forward(
     // 注:这里**不会**因为返回 Err 而形成自旋——实测 reqwest 的 `bytes_stream` 出错后
     // 下一次 poll 返回 `None`,不重复吐同一个 Err;且 `map`/`map_err` 都不改变终止时机。
     //
-    // ⚠️ 响应侧过滤分两层，门控不同（2026-08-10 拆开，理由见下方 `strip_dsml_only_ok`）：
-    // - **thinking 块过滤**（滤 thinking/redacted_thinking 块 + index 重编号 + usage 扣减）：
-    //   改协议结构，仅 `deepseek_normalize=true` 启用，其余号保零转换（隔离铁律 3）。
+    // ⚠️ 响应侧过滤（2026-08-16 起仅剩一层）：
     // - **DSML 标记剥离**：所有 custom_api 号无条件启用 —— 上游就是 DeepSeek 系，
     //   标记泄漏与凭据配置无关。
+    // - thinking 块过滤（滤 thinking/redacted_thinking 块 + index 重编号 + usage 扣减）与
+    //   内联 `<thinking>` 剥离随 deepseek 归一化一并移除（2026-08-16）：没有凭据能开启，
+    //   恒 false，filter 只剥 text 里的 DSML 标记，thinking 块与 index 一律不动。
     // 流式逐事件处理仍流式回传;非流式读完整 body 处理。解析失败 fail-open 原样透传。
     // 成功路径同样透传 P4 白名单头（x-ratelimit-* 让客户端能主动限速）。
     // 同样必须在消费 upstream 之前克隆。
@@ -473,27 +448,15 @@ pub async fn forward(
     // 被动配额观测：成功响应里摘上游配额头落日志（纯观测，见该函数文档）。
     // 放在消费 `upstream` 之前（与下方 P4 白名单克隆同一时机）。
     observe_upstream_quota_headers(&upstream_headers, &base);
-    // thinking 块过滤（含重编号、usage 扣减）仍只对 deepseek_normalize 凭据开启 ——
-    // 它改协议结构，是「零转换透传」的刻意例外，不能推给所有 custom_api 号。
-    let filter_thinking = ds_cfg.is_some();
-    // 🔴 但**响应 filter 入口本身不能再由 `filter_thinking` 门控**。
-    //
-    // 改前入口条件是 `filter_thinking && ...`：没开 deepseek_normalize 的 custom_api 号
-    // 走纯字节透传分支 ⇒ DSML 标记剥离**根本不执行**，`<｜DSML｜function_calls｜>` 原样
-    // 泄漏给客户端（用户走代挂号拉 OpenZ 时看到的裸标记就是这条路径）。
-    //
-    // 而 DSML 泄漏与「客户端要不要 thinking」、「凭据有没有开归一化」都无关：
-    // custom_api 的上游就是 DeepSeek 系中转站，会吐这个标记的是上游模型本身。
-    // 所以 filter 一律接上，只把 thinking 块过滤按 `filter_thinking` 传下去 ——
-    // 关闭时 filter 只剥 text 里的 DSML 标记，thinking 块与 index 一律不动。
+    // 🔴 响应 filter 入口**不受 thinking 门控**：DSML 泄漏与凭据配置无关，
+    // custom_api 的上游就是 DeepSeek 系中转站，会吐标记的是上游模型本身。
+    // filter 一律接上（thinking 块过滤恒 false，只剥 text 里的 DSML 标记）。
     let strip_dsml_only_ok = content_type.contains("text/event-stream")
         || content_type.contains("application/json");
-    // 内联 `<thinking>` 剥离开关取配置（流式 + 非流式共用，cfg 已提到作用域）。
-    // ⚠️ 未开归一化的号取 `false`：内联 `<thinking>` 剥离属于 thinking 语义处理，
-    // 不该跟着 DSML 一起对所有 custom_api 号生效（DSML 是标记泄漏，两码事）。
-    let strip_inline = ds_cfg
-        .as_ref()
-        .map_or(false, |c| c.strip_inline_thinking);
+    // 内联 `<thinking>` 剥离随 deepseek 归一化移除 → 恒 false（流式 + 非流式共用）。
+    let strip_inline = false;
+    // thinking 块过滤随 deepseek 归一化移除 → 恒 false（零协议转换透传语义）。
+    let filter_thinking = false;
 
     // 模拟缓存注入（mockCacheEnabled，仅透传路径）：上游 DeepSeek 的
     // cache_read_input_tokens 恒 0，下游（sub2api 等）看不到缓存分支 —— 开启后
@@ -530,7 +493,6 @@ pub async fn forward(
         // 用 read_body_capped 给 body 加 32MiB 上限,防恶意上游吐超大 JSON 顶爆内存。
         match read_body_capped(upstream, "透传非流式响应", PASSTHROUGH_JSON_CAP_BYTES).await {
             Ok(body) => {
-                // ⚠️ 非流式也要接 strip_inline_thinking 配置（与流式一致，否则配置 false 仍剥）。
                 let filtered = filter_json_bytes_with(&body, strip_inline, filter_thinking, mock_cache);
                 apply_upstream_response_headers(
                     Response::builder()

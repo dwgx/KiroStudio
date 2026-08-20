@@ -92,4 +92,8 @@ kiro_balance_cache.json
 # 运行时产物 / 本地临时(绝不提交)
 kiro_stats.json
 replay.tmp.json
+.tmp*
+.tmp-cargo-test-*
+.agent/
+.grok/
 scripts/

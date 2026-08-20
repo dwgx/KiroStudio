@@ -5,6 +5,7 @@
 mod assistant;
 mod base;
 mod context_usage;
+mod metadata;
 mod metering;
 mod reasoning;
 mod tool_use;
@@ -19,6 +20,8 @@ pub(crate) use assistant::{
 };
 pub use base::Event;
 pub use context_usage::ContextUsageEvent;
+pub use metadata::MetadataEvent;
+pub(crate) use metadata::map_metadata_stop_reason;
 pub use metering::MeteringEvent;
 pub use reasoning::ReasoningContentEvent;
 pub use tool_use::ToolUseEvent;

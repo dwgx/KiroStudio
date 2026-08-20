@@ -166,6 +166,19 @@ pub async fn usage_by_credential(State(state): State<AdminState>) -> impl IntoRe
     }
 }
 
+/// GET /api/admin/usage/by-outcome
+/// 按结果分类（success/rate_limited/auth_failed/...）分组的累计统计。
+///
+/// 解决 A2/F1：`Aggregate` 只有 success/failure 二值，429/配额/auth 分布画不出，
+/// 只能 `traces/search?outcome=` 逐条过滤。本端点下发全量累计的 outcome 分布
+/// （key = snake_case outcome 名，各 key 的 requests 之和恒等于总请求数）。
+pub async fn usage_by_outcome(State(state): State<AdminState>) -> impl IntoResponse {
+    match &state.usage_stats {
+        Some(stats) => Json(stats.by_outcome()).into_response(),
+        None => stats_disabled(),
+    }
+}
+
 /// recent traces 查询参数
 #[derive(Debug, Deserialize)]
 pub struct RecentQuery {
@@ -666,7 +679,8 @@ mod tests {
     use axum::response::IntoResponse;
 
     use super::{
-        TimeseriesQuery, usage_by_credential, usage_by_model, usage_overview, usage_timeseries,
+        TimeseriesQuery, usage_by_credential, usage_by_model, usage_by_outcome, usage_overview,
+        usage_timeseries,
     };
     use crate::admin::middleware::AdminState;
     use crate::admin::service::AdminService;
@@ -788,6 +802,52 @@ mod tests {
         let c = rows.iter().find(|r| r["key"] == "9").unwrap();
         assert_eq!(c["retries_sum"], 6, "{by_cred}");
         assert_eq!(c["retried_requests"], 2, "{by_cred}");
+    }
+
+    /// ⭐ 回归（F1/A2 的 API 出口）：`GET /usage/by-outcome` 必须真的下发按 outcome
+    /// 分组的行 —— 过 axum `Json(..)` + `IntoResponse` 全链路，响应体即前端所见。
+    ///
+    /// 删掉 handler（或改成 stats_disabled 之外的空返回）→ 本测试 FAILED。
+    #[tokio::test]
+    async fn by_outcome_endpoint_emits_grouped_rows() {
+        // 2 条 rate_limited（各重试 3 次）+ 1 条 success 零重试
+        let stats = Arc::new(UsageStats::new(
+            std::env::temp_dir().join("kiro_usage_handlers_test_ignore"),
+        ));
+        for (outcome, retries) in [
+            (RequestOutcome::RateLimited, 3u32),
+            (RequestOutcome::RateLimited, 3u32),
+            (RequestOutcome::Success, 0u32),
+        ] {
+            let mut r = RequestRecord::new("req", "sonnet");
+            r.credential_id = Some(9);
+            r.outcome = outcome;
+            r.input_tokens = 10;
+            r.output_tokens = 5;
+            r.latency_ms = 100;
+            r.retries = retries;
+            stats.on_record(&r);
+        }
+        let mut st = AdminState::new("k", mk_service());
+        st.usage_stats = Some(stats);
+
+        let body = body_text(usage_by_outcome(State(st)).await.into_response()).await;
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        let rate_limited = rows.iter().find(|r| r["key"] == "rate_limited").unwrap();
+        assert_eq!(rate_limited["requests"], 2, "{body}");
+        // GroupStat 复用：retries 两个口径随行下发（前端可看「每个 outcome 烧了多少重试」）
+        assert_eq!(rate_limited["retries_sum"], 6, "{body}");
+        assert_eq!(rate_limited["retried_requests"], 2, "{body}");
+        let success = rows.iter().find(|r| r["key"] == "success").unwrap();
+        assert_eq!(success["requests"], 1, "{body}");
+        assert_eq!(success["retries_sum"], 0, "{body}");
+        // snake_case key 契约（camelCase 出现 = 前端读不到）
+        assert!(!body.contains("rateLimited"), "出口不得 camelCase：{body}");
+        // 不存在的 outcome 不得出现（只下发命中变体）
+        assert!(
+            rows.iter().all(|r| r["key"] != "auth_failed"),
+            "未命中的 outcome 不应下发：{body}"
+        );
     }
 
     /// ⭐ 回归（已知问题 #12）：统计丢失（管道满丢弃 / JSONL 重放解析失败）必须可观测。

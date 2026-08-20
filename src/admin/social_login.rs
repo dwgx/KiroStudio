@@ -292,8 +292,6 @@ impl SocialLoginManager {
             tested_models: None,
             base_url: None,
             api_key: None,
-            deepseek_normalize: None,
-            deepseek_normalize_config: None,
             model_mapping_exempt: None,
             request_limit: None,
             // Social 上号产出的是 Kiro 号（非 custom_api 代挂号），该开关对它无意义 → 跟随全局。

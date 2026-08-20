@@ -21,6 +21,7 @@ import {
   submitExternalIdpLeg1,
   submitExternalIdpLeg2,
   submitExternalIdpLeg2Select,
+  importSsoToken,
 } from '@/api/credentials'
 import { copyToClipboard, extractErrorMessage } from '@/lib/utils'
 import { CheckCircle2, XCircle, Loader2 } from 'lucide-react'
@@ -36,7 +37,7 @@ interface LoginDialogProps {
   onSuccess?: () => void
 }
 
-type Mode = 'web' | 'idc' | 'external-idp'
+type Mode = 'web' | 'idc' | 'external-idp' | 'sso-token'
 type Step = 'form' | 'waiting' | 'done'
 // 微软 SSO 独立的 3 步引导：0=表单 1=粘回登录 URL 2=粘回授权 URL 3=完成
 type EidpStep = 0 | 1 | 2 | 3 | 'select'
@@ -93,6 +94,12 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
   // select 建号实际生效的 region（后端回显：可能因所选 profile 不可用被自动替换）。
   const [eidpResultRegion, setEidpResultRegion] = useState('')
 
+  // SSO Token 导入 state
+  const [ssoToken, setSsoToken] = useState('')
+  const [ssoRegion, setSsoRegion] = useState('us-east-1')
+  const [ssoResultEmail, setSsoResultEmail] = useState<string | null>(null)
+  const [ssoCredId, setSsoCredId] = useState<number | null>(null)
+
   const stopPolling = () => {
     // 终止当前轮询链：递增代次，已捕获旧代次的在途回调（含 await 返回后）在
     // isCurrent 复查时自尽——不排期、不弹 toast、不 setStep。countdown 超时路径
@@ -134,6 +141,10 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
       setEidpCredId(null)
       setEidpResultRegion('')
       setEidpProfiles([])
+      setSsoToken('')
+      setSsoRegion('us-east-1')
+      setSsoResultEmail(null)
+      setSsoCredId(null)
     }, 200)
     return () => clearTimeout(resetTimer)
   }, [open])
@@ -338,9 +349,37 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
     }
   }
 
+  // --- SSO Token 导入：粘贴 AWS portal Bearer Token，服务端自动走完整授权流程 ---
+  // 单次提交（无轮询），成功即建号完成。
+  const handleStartSsoToken = async () => {
+    if (!ssoToken.trim()) {
+      toast.error(t('logindialog.ssotoken.tokenRequired'))
+      return
+    }
+    setIsStarting(true)
+    try {
+      const resp = await importSsoToken({
+        token: ssoToken.trim(),
+        region: ssoRegion.trim() || 'us-east-1',
+        priority: Number(priority) || 0,
+        proxyUrl: proxyUrl.trim() || undefined,
+      })
+      setSsoCredId(resp.credentialId)
+      setSsoResultEmail(resp.email ?? null)
+      setStep('done')
+      toast.success(`${t('logindialog.ssotoken.toast.importSuccess')}${resp.credentialId}`)
+      onSuccess?.()
+    } catch (err) {
+      toast.error(extractErrorMessage(err))
+    } finally {
+      setIsStarting(false)
+    }
+  }
+
   const handleStart = () => {
     if (mode === 'web') handleStartWeb()
     else if (mode === 'idc') handleStartIdc()
+    else if (mode === 'sso-token') handleStartSsoToken()
     else handleEidpStart()
   }
 
@@ -369,7 +408,7 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
         {/* Tab switcher - 仅初始表单态可切换。底部一条滑动指示条随选中项平移(丝滑切换)。 */}
         {atStart && (
           <div className="relative mb-2 flex border-b border-[#2e2e2e]">
-            {(['web', 'idc', 'external-idp'] as Mode[]).map((m) => (
+            {(['web', 'idc', 'sso-token', 'external-idp'] as Mode[]).map((m) => (
               <button
                 key={m}
                 onClick={() => setMode(m)}
@@ -377,13 +416,23 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
                   mode === m ? 'text-[#ededed]' : 'text-[#888] hover:text-[#ededed]'
                 }`}
               >
-                {m === 'web' ? t('logindialog.tab.web') : m === 'idc' ? t('logindialog.tab.idc') : t('logindialog.tab.externalIdp')}
+                {m === 'web'
+                  ? t('logindialog.tab.web')
+                  : m === 'idc'
+                    ? t('logindialog.tab.idc')
+                    : m === 'sso-token'
+                      ? t('logindialog.tab.ssoToken')
+                      : t('logindialog.tab.externalIdp')}
               </button>
             ))}
-            {/* 滑动指示条:宽度=1/3,left 随选中项平移,transform 过渡丝滑 */}
+            {/* 滑动指示条:宽度=1/4,left 随选中项平移,transform 过渡丝滑 */}
             <span
-              className="pointer-events-none absolute bottom-0 h-0.5 w-1/3 rounded-full bg-[#0070f3] transition-transform duration-300 ease-out-expo motion-reduce:transition-none"
-              style={{ transform: `translateX(${mode === 'web' ? 0 : mode === 'idc' ? 100 : 200}%)` }}
+              className="pointer-events-none absolute bottom-0 h-0.5 w-1/4 rounded-full bg-[#0070f3] transition-transform duration-300 ease-out-expo motion-reduce:transition-none"
+              style={{
+                transform: `translateX(${
+                  mode === 'web' ? 0 : mode === 'idc' ? 100 : mode === 'sso-token' ? 200 : 300
+                }%)`,
+              }}
             />
           </div>
         )}
@@ -472,6 +521,68 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
               <div className="flex items-center gap-2">
                 <Input
                   id="idc-proxy-url"
+                  className="flex-1"
+                  value={proxyUrl}
+                  onChange={(e) => setProxyUrl(e.target.value)}
+                  placeholder={t('idclogindialog.form.proxyPlaceholder')}
+                  disabled={isStarting}
+                />
+                <ProxyTestButton proxyUrl={proxyUrl} />
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* SSO Token 导入表单：粘贴 AWS portal 的 Bearer Token，服务端自动完成
+            设备授权流程（whoAmI 验证 → 模拟授权 → 换正式 IdC 凭据），免浏览器人工步骤。 */}
+        {step === 'form' && mode === 'sso-token' && (
+          <div className="space-y-4 py-2">
+            <p className="text-sm text-muted-foreground leading-relaxed">
+              {t('logindialog.ssotoken.intro')}
+            </p>
+            <div className="space-y-2">
+              <label className="text-sm font-medium" htmlFor="sso-token-input">
+                {t('logindialog.ssotoken.tokenLabel')} <span className="text-red-500">*</span>
+              </label>
+              <textarea
+                id="sso-token-input"
+                value={ssoToken}
+                onChange={(e) => setSsoToken(e.target.value)}
+                placeholder={t('logindialog.ssotoken.tokenPlaceholder')}
+                disabled={isStarting}
+                className="flex min-h-[88px] w-full rounded-md border border-input bg-background px-3 py-2 text-xs font-mono ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+              />
+              <p className="text-xs text-muted-foreground">{t('logindialog.ssotoken.tokenHelp')}</p>
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium">{t('logindialog.ssotoken.regionLabel')}</label>
+              <RegionSelect
+                value={ssoRegion}
+                onChange={setSsoRegion}
+                placeholder="us-east-1"
+                disabled={isStarting}
+              />
+              <p className="text-xs text-muted-foreground">
+                {t('logindialog.ssotoken.regionHelp')}
+              </p>
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium">{t('idclogindialog.form.priorityLabel')}</label>
+              <NumberStepper
+                value={Number(priority) || 0}
+                onChange={(n) => setPriority(String(n))}
+                min={0}
+                disabled={isStarting}
+                className="w-full"
+                aria-label={t('idclogindialog.form.priorityAriaLabel')}
+              />
+              <p className="text-xs text-muted-foreground">{t('idclogindialog.form.priorityHelp')}</p>
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium" htmlFor="sso-token-proxy-url">{t('idclogindialog.form.proxyLabel')}</label>
+              <div className="flex items-center gap-2">
+                <Input
+                  id="sso-token-proxy-url"
                   className="flex-1"
                   value={proxyUrl}
                   onChange={(e) => setProxyUrl(e.target.value)}
@@ -785,15 +896,29 @@ export function LoginDialog({ open, onOpenChange, onSuccess }: LoginDialogProps)
           </div>
         )}
 
-        {/* Done step（网页 / IDC） */}
+        {/* Done step（网页 / IDC / SSO Token） */}
         {step === 'done' && mode !== 'external-idp' && (
           <div className="space-y-3 py-4 text-center">
             <CheckCircle2 className="mx-auto h-12 w-12 text-green-600 dark:text-green-400" />
             <p className="text-sm font-medium">
-              {mode === 'web' ? t('logindialog.done.webSuccess') : t('idclogindialog.done.title')}
+              {mode === 'web'
+                ? t('logindialog.done.webSuccess')
+                : mode === 'sso-token'
+                  ? t('logindialog.ssotoken.successTitle')
+                  : t('idclogindialog.done.title')}
             </p>
             {resultEmail && (
               <p className="text-xs text-muted-foreground">{resultEmail}</p>
+            )}
+            {mode === 'sso-token' && (
+              <>
+                {ssoResultEmail && <p className="text-xs text-muted-foreground">{ssoResultEmail}</p>}
+                {ssoCredId !== null && (
+                  <p className="text-xs text-muted-foreground">
+                    {t('logindialog.ssotoken.credAddedToPool', { id: ssoCredId })}
+                  </p>
+                )}
+              </>
             )}
             {mode === 'idc' && (
               <p className="text-xs text-muted-foreground">{t('idclogindialog.done.desc')}</p>

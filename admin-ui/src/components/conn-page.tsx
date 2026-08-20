@@ -29,12 +29,20 @@ export function ConnPage() {
       : `${loginKey.slice(0, 6)}••••••${loginKey.slice(-4)}`
     : ''
 
+  const anthropicBody = `'{"model":"${EXAMPLE_MODEL}","max_tokens":1024,"messages":[{"role":"user","content":"hi"}]}'`
   const curlAnthropic = [
     `curl ${origin}/v1/messages \\`,
     `  -H "x-api-key: ${apiKey}" \\`,
     `  -H "anthropic-version: 2023-06-01" \\`,
     `  -H "content-type: application/json" \\`,
-    `  -d '{"model":"${EXAMPLE_MODEL}","max_tokens":1024,"messages":[{"role":"user","content":"hi"}]}'`,
+    `  -d ${anthropicBody}`,
+  ].join('\n')
+  const curlAnthropicCc = [
+    `curl ${origin}/cc/v1/messages \\`,
+    `  -H "x-api-key: ${apiKey}" \\`,
+    `  -H "anthropic-version: 2023-06-01" \\`,
+    `  -H "content-type: application/json" \\`,
+    `  -d ${anthropicBody}`,
   ].join('\n')
 
   const curlOpenAi = [
@@ -43,9 +51,18 @@ export function ConnPage() {
     `  -H "content-type: application/json" \\`,
     `  -d '{"model":"${EXAMPLE_MODEL}","messages":[{"role":"user","content":"hi"}]}'`,
   ].join('\n')
+  const curlOpenAiResponses = [
+    `curl ${origin}/v1/responses \\`,
+    `  -H "Authorization: Bearer ${apiKey}" \\`,
+    `  -H "content-type: application/json" \\`,
+    `  -d '{"model":"${EXAMPLE_MODEL}","input":"hi"}'`,
+  ].join('\n')
 
   const envExports = [
+    `# ${t('connpage.env.comment.v1')}`,
     `export ANTHROPIC_BASE_URL=${origin}`,
+    `# ${t('connpage.env.comment.cc')}`,
+    `export ANTHROPIC_BASE_URL=${origin}/cc`,
     `export ANTHROPIC_AUTH_TOKEN=${apiKey}`,
   ].join('\n')
 
@@ -99,10 +116,16 @@ export function ConnPage() {
               onCopy={loginKey ? () => handleCopy('apiKey', loginKey) : undefined}
             />
             <CodeBlock
-              title={t('connpage.curl.title')}
+              title={t('connpage.curl.v1messages')}
               code={curlAnthropic}
               copied={copied === 'curlAnth'}
               onCopy={() => handleCopy('curlAnth', curlAnthropic)}
+            />
+            <CodeBlock
+              title={t('connpage.curl.cc')}
+              code={curlAnthropicCc}
+              copied={copied === 'curlAnthCc'}
+              onCopy={() => handleCopy('curlAnthCc', curlAnthropicCc)}
             />
             <CodeBlock
               title={t('connpage.env.title')}
@@ -135,10 +158,16 @@ export function ConnPage() {
               onCopy={loginKey ? () => handleCopy('apiKeyOa', loginKey) : undefined}
             />
             <CodeBlock
-              title={t('connpage.curl.title')}
+              title={t('connpage.curl.completions')}
               code={curlOpenAi}
               copied={copied === 'curlOa'}
               onCopy={() => handleCopy('curlOa', curlOpenAi)}
+            />
+            <CodeBlock
+              title={t('connpage.curl.responses')}
+              code={curlOpenAiResponses}
+              copied={copied === 'curlOaResp'}
+              onCopy={() => handleCopy('curlOaResp', curlOpenAiResponses)}
             />
             <p className="text-[11px] text-[#666]">{t('connpage.modelsHint')}</p>
           </CardContent>

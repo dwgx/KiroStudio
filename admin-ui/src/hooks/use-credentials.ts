@@ -8,7 +8,6 @@ import {
   setCredentialCustomApi,
   setCredentialEndpoint,
   setCredentialApiRegion,
-  setCredentialDeepseekNormalize,
   setCredentialModelMappingExempt,
   type SetCustomApiConfigInput,
   resetCredentialFailure,
@@ -154,18 +153,6 @@ export function useSetCredentialApiRegion() {
   return useMutation({
     mutationFn: ({ id, apiRegion }: { id: number; apiRegion: string | null }) =>
       setCredentialApiRegion(id, apiRegion),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['credentials'] })
-    },
-  })
-}
-
-// 设置代挂凭据的 deepseek 协议归一化开关（custom_api 专属）。
-export function useSetCredentialDeepseekNormalize() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) =>
-      setCredentialDeepseekNormalize(id, enabled),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },

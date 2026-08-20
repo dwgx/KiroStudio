@@ -468,6 +468,22 @@ pub struct Config {
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
 
+    /// 是否在上游瞬态错误（408/429/500/502/503/504/524）时做**端点级链式回退**（默认 true）
+    ///
+    /// 上游 429 常是端点容量问题而非凭据额度问题：同一凭据换到另一个上游端点往往
+    /// 立刻成功（kiro-go 的 `endpointFallback` 即此机制）。单凭据下
+    /// `compute_max_retries` 退化为 1、一次 429 就直接透传给客户端；链式回退在
+    /// **不额外消耗凭据重试预算**（max_retries）、**不设凭据冷却**、**不扣健康分**的
+    /// 前提下，在同一凭据上立即换下一端点重试，整条链都失败才交给凭据级分类逻辑。
+    ///
+    /// ⚠️ 链内每跳仍是**真实上游调用**：消耗「每请求 ≤ `ABSOLUTE_MAX_TOTAL_RETRIES`
+    /// 次」的**共享预算**（对抗审查 M1，链循环顶部有预算闸）——「不消耗」只对
+    /// max_retries 成立，不适用于共享预算；预算耗尽时链式回退停止，错误透传给客户端。
+    ///
+    /// 关闭时回退链退化为单元素链，行为与改动前逐字节一致（热更即时生效）。
+    #[serde(default = "default_endpoint_fallback")]
+    pub endpoint_fallback: bool,
+
     /// 端点特定的配置
     ///
     /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
@@ -654,12 +670,6 @@ pub struct Config {
     /// （`credential_rpm_limit` / headroom / 饱和门）完全不受本字段影响。
     #[serde(default = "default_upstream_per_credential_limit")]
     pub upstream_per_credential_limit: usize,
-
-    /// deepseek 归一化的**全局默认**配置（custom_api 代挂 `deepseekNormalize=true` 时生效）。
-    /// per-凭据 `deepseek_normalize_config` 可覆盖 fallback_model/min_max_tokens；
-    /// bool 开关一律取这里（全局唯一）。TIER1 热重载，改 config.json 立即生效。
-    #[serde(default)]
-    pub deepseek_normalize: crate::kiro::deepseek_normalize::DeepseekNormalizeConfig,
 
     /// **全局模型映射**：`{"客户端请求的模型名": "实际发给上游的模型名"}`（默认空 = 不映射）。
     ///
@@ -865,6 +875,16 @@ pub struct Config {
     /// 超阈值(32)截断本轮文本,治 Opus 退化刷屏耗尽 max_tokens + 污染历史。
     #[serde(default = "default_tool_stray_repeat_guard")]
     pub tool_stray_repeat_guard: bool,
+
+    /// CC↔Kiro 工具名/参数双向映射开关（默认 **true**，热更即时生效）。
+    ///
+    /// Claude Code 的 8 个内置工具（Write/Edit/Bash/Read/Glob/Grep/LS/WebSearch）在入站
+    /// 时映射成 Kiro 原生名+参数（fs_write/str_replace/execute_bash/read_file/...），
+    /// 出站时还原，根治 `Invalid tool parameters`（Claude Code 发 file_path 而上游只认
+    /// path 那类参数错配）。关闭后内置工具原样透传（仅超长缩短），适配非 Claude Code
+    /// 客户端或恰好使用同名自定义工具的场景。
+    #[serde(rename = "toolCompatMapping", default = "default_tool_compat_mapping")]
+    pub tool_compat_mapping: bool,
 
     /// 工具错误缓解 ②：流式路径工具拼装非法 JSON 时，对齐成失败态。默认开，热更生效。
     ///
@@ -1405,6 +1425,10 @@ fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
 
+fn default_endpoint_fallback() -> bool {
+    true
+}
+
 /// RPM headroom 系数默认 85(预留 15% 缓冲)。
 fn default_rate_limit_jitter_pct() -> u32 {
     20
@@ -1504,6 +1528,11 @@ fn default_strip_env_noise() -> bool {
 /// 模拟缓存命中比例默认 0.7（70% 命中）。仅 mock_cache_enabled 开启时生效。
 fn default_mock_cache_read_ratio() -> f64 {
     0.7
+}
+
+/// CC↔Kiro 工具名/参数映射默认 **true**：目标客户端是 Claude Code，映射生效 = 现状行为。
+fn default_tool_compat_mapping() -> bool {
+    true
 }
 
 /// 泄漏控制 token 清洗默认**开启**：治 #70544 模型泄漏（course/課/count 粘连），保守只剥行首
@@ -1634,6 +1663,7 @@ impl Default for Config {
             upstream_retry_absorb_swap_budget_secs: 0,
             upstream_retry_absorb_exhausted_status: default_absorb_exhausted_status(),
             default_endpoint: default_endpoint(),
+            endpoint_fallback: default_endpoint_fallback(),
             endpoints: HashMap::new(),
             // CLI body 对齐 kiro-rs 默认关（线上号池正在服务，未验证的协议形状不全池直切）。
             cli_origin_kiro_cli: false,
@@ -1658,7 +1688,6 @@ impl Default for Config {
             inbound_queue_timeout_passthrough: default_inbound_queue_timeout_passthrough(),
             upstream_concurrency_limit: default_upstream_concurrency_limit(),
             upstream_per_credential_limit: default_upstream_per_credential_limit(),
-            deepseek_normalize: Default::default(),
             model_mapping: Default::default(),
             // 错误码/提示词覆盖表：默认空表（全用内置默认，零行为变化）。
             error_messages: HashMap::new(),
@@ -1686,6 +1715,7 @@ impl Default for Config {
             tool_clean_leaked_tokens: default_tool_clean_leaked_tokens(),
             tool_reclaim_textified_invoke: default_tool_reclaim_textified_invoke(),
             tool_stray_repeat_guard: default_tool_stray_repeat_guard(),
+            tool_compat_mapping: default_tool_compat_mapping(),
             tool_stream_align_failure: default_tool_stream_align_failure(),
             tool_expose_error_to_client: default_tool_expose_error_to_client(),
             tool_repair_json: default_tool_repair_json(),
@@ -2657,5 +2687,35 @@ mod tests {
         .expect("camelCase 显式值必须能反序列化");
         assert!(explicit.mock_cache_enabled);
         assert_eq!(explicit.mock_cache_read_ratio, 1.0);
+    }
+
+    /// 工具映射开关：缺字段时默认**开**（与既有原子默认 true 一致，保持现状行为零变化）；
+    /// camelCase 显式 false 必须被尊重并 roundtrip 保持。
+    #[test]
+    fn tool_compat_mapping_defaults_on_and_roundtrip() {
+        let cfg = Config::default();
+        assert!(
+            cfg.tool_compat_mapping,
+            "toolCompatMapping 默认必须开（保持现状映射行为）"
+        );
+        assert_eq!(
+            cfg.tool_compat_mapping,
+            default_tool_compat_mapping(),
+            "默认必须走 default_tool_compat_mapping()，不得另写字面量"
+        );
+
+        let bare: Config = serde_json::from_str("{}").expect("缺字段必须能反序列化");
+        assert!(bare.tool_compat_mapping);
+
+        let explicit: Config =
+            serde_json::from_str(r#"{"toolCompatMapping":false}"#).expect("camelCase 必须能反序列化");
+        assert!(
+            !explicit.tool_compat_mapping,
+            "显式关闭必须被尊重，否则用户关不掉"
+        );
+
+        let re: Config = serde_json::from_str(&serde_json::to_string(&explicit).expect("序列化应成功"))
+            .expect("roundtrip 必须能反序列化");
+        assert!(!re.tool_compat_mapping, "roundtrip 后必须保持 false");
     }
 }

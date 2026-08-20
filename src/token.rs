@@ -282,7 +282,7 @@ fn payload_hash(
                     // 同文本不同图/不同工具输入会撞同一缓存 key，返回错误 token 估算
                     // （图片每张 ~1000+ tokens，apply_patch 的 patch 可达数千）。
                     // 用序列化保证全维度（O(payload) 纯内存，远小于远程 RTT）。
-                    let serialized = serde_json::to_string(item).unwrap_or_default();
+                    let serialized = serde_json::to_string(&item).unwrap_or_default();
                     serialized.hash(&mut h);
                 }
             }
@@ -420,7 +420,7 @@ fn count_all_tokens_local_unfloored(
     // 用户消息
     for msg in messages {
         if let serde_json::Value::String(s) = &msg.content {
-            total += count_tokens(s);
+            total += count_tokens(s.as_str());
         } else if let serde_json::Value::Array(arr) = &msg.content {
             for item in arr {
                 if let Some(text) = item.get("text").and_then(|v| v.as_str()) {

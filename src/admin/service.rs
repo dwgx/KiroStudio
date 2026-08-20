@@ -42,6 +42,13 @@ use super::types::{
 use crate::kiro::auth::social::OAuthCallbackData;
 use crate::usage::TraceDb;
 
+/// SSO Token 导入结果（`POST /api/admin/credentials/import-sso`）。
+pub struct ImportSsoTokenResult {
+    pub credential_id: u64,
+    /// 解析到的账号 email（best-effort，可能为 None）。
+    pub email: Option<String>,
+}
+
 /// 余额缓存【新鲜度】阈值（秒），5 分钟。
 /// 仅用于 `get_balance` 的按需（hover）路径：决定是否需要重新向上游拉取。
 /// 注意：这【不是】展示缓存的丢弃阈值——展示用 `BALANCE_CACHE_DISPLAY_MAX_AGE_SECS`。
@@ -491,24 +498,79 @@ pub struct AdminService {
 /// 移植自 k2cc-proxy（`admin/service.rs:346`）。实测用户会把 `"key: ksk_xxx"` 整段贴进
 /// 表单，不清洗会同时破坏 region 探测（坏 key）与去重（同一 key 不同前缀可重复导入）。
 /// 空串归一为 `None`（与 k2cc 的 `.filter(!is_empty)` 同语义，交给下游「必须提供」报错）。
+///
+/// Kiro-Go `ksk_…|region`：恰好一段 `|` 且后缀命中 region 白名单时，返回 key 本体；
+/// 后缀由 [`apply_ksk_region_suffix`] 写入已有的 `api_region`（请求已带则不覆盖）。
 fn clean_ksk_api_key(raw: &str) -> Option<String> {
+    peel_ksk_paste(raw).map(|(key, _region)| key)
+}
+
+/// 从粘贴噪声里取出 `ksk_` 本体，以及可选的 `|region` 后缀。
+fn peel_ksk_paste(raw: &str) -> Option<(String, Option<String>)> {
     let s = raw.trim().trim_matches(|c| c == '"' || c == '\'' || c == ',');
-    let out = match s.find("ksk_") {
+    let (out, had_ksk) = match s.find("ksk_") {
         Some(i) => {
             // ⚠️ `s[i..]` 之后要再剥一次包裹引号/逗号：`"key: 'ksk_abc123'"` 经外层
             // trim_matches 后 s = `key: 'ksk_abc123'`，直接 `s[i..]` 会留下尾引号
             // `ksk_abc123'` → key 污染 → region 探测恒 403。
-            s[i..]
-                .trim()
-                .trim_matches(|c| c == '"' || c == '\'' || c == ',')
-                .to_string()
+            (
+                s[i..]
+                    .trim()
+                    .trim_matches(|c| c == '"' || c == '\'' || c == ',')
+                    .to_string(),
+                true,
+            )
         }
-        None => s.to_string(),
+        None => (s.to_string(), false),
     };
     if out.is_empty() {
-        None
+        return None;
+    }
+    if had_ksk {
+        let (key, region) = split_ksk_region_suffix(&out);
+        Some((key.to_string(), region.map(str::to_string)))
     } else {
-        Some(out)
+        Some((out, None))
+    }
+}
+
+/// 仅当恰好一段 `|` 且后缀是已知 region 时才拆；否则整段当 key。
+fn split_ksk_region_suffix(key: &str) -> (&str, Option<&str>) {
+    let Some((left, right)) = key.split_once('|') else {
+        return (key, None);
+    };
+    if left.contains('|') || right.contains('|') {
+        return (key, None);
+    }
+    let left = left.trim();
+    let right = right.trim();
+    if left.is_empty() || right.is_empty() {
+        return (key, None);
+    }
+    if KiroCredentials::is_supported_region(right) {
+        (left, Some(right))
+    } else {
+        (key, None)
+    }
+}
+
+fn ksk_region_suffix(raw: &str) -> Option<String> {
+    peel_ksk_paste(raw).and_then(|(_, region)| region)
+}
+
+/// `ksk_xxx|eu-central-1` 在请求未带 `api_region` 时写入该字段；已有非空值不覆盖。
+fn apply_ksk_region_suffix(req: &mut AddCredentialRequest) {
+    let already = req
+        .api_region
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some();
+    if already {
+        return;
+    }
+    if let Some(region) = req.kiro_api_key.as_deref().and_then(ksk_region_suffix) {
+        req.api_region = Some(region);
     }
 }
 
@@ -984,6 +1046,106 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))
     }
 
+    /// SSO Token 导入：粘贴 AWS portal 的 Bearer Token，服务端静默走完整设备授权
+    /// 流程换取标准 IdC 凭据入池（免浏览器授权的人工步骤）。
+    ///
+    /// 流程与幂等语义见 [`crate::kiro::auth::sso_token`]。
+    /// - `region` 缺省 us-east-1，且必须过 Kiro region 白名单（它直接拼进
+    ///   `oidc.{region}.amazonaws.com` 出站 host，污染值会把 device session /
+    ///   clientSecret 引到攻击者主机）。
+    /// - 同一邮箱的 idc 号已在池中 → `DuplicateCredential`（SSO 每次导入都换出
+    ///   不同的 refreshToken，哈希判重抓不住重复，email 是账号级稳定指纹）。
+    pub async fn import_sso_token(
+        &self,
+        token: String,
+        region: Option<String>,
+        priority: u32,
+        proxy_url: Option<String>,
+    ) -> Result<ImportSsoTokenResult, AdminServiceError> {
+        use crate::kiro::auth::sso_token::{
+            build_idc_credential_from_sso, exchange_sso_token, find_duplicate_idc_email,
+        };
+
+        let region = region
+            .map(|r| r.trim().to_lowercase())
+            .filter(|r| !r.is_empty())
+            .unwrap_or_else(|| "us-east-1".to_string());
+        // 安全:region 拼进 oidc.{region}.amazonaws.com host(见 sso_token 模块文档)。
+        if !KiroCredentials::is_supported_region(&region) {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "非法 region: {region}（不在支持的 AWS region 白名单内）"
+            )));
+        }
+
+        let config = self.token_manager.config();
+        // 组装代理:显式填的拆账密后仅它持久化到新凭据;global 回落不持久化(与上号同口径)。
+        let (proxy, custom_proxy) = {
+            let global = config.proxy_url.as_ref().map(|url| {
+                let mut p = crate::http_client::ProxyConfig::new(url);
+                if let (Some(u), Some(pw)) = (&config.proxy_username, &config.proxy_password) {
+                    p = p.with_auth(u, pw);
+                }
+                p
+            });
+            let custom = proxy_url.filter(|u| !u.trim().is_empty()).map(|u| {
+                let (clean, user, pass) = crate::http_client::split_proxy_credentials(&u);
+                let mut p = crate::http_client::ProxyConfig::new(clean);
+                if let (Some(user), Some(pass)) = (user, pass) {
+                    p = p.with_auth(user, pass);
+                }
+                p
+            });
+            (custom.clone().or(global), custom)
+        };
+
+        // 7 步纯 HTTP 流程:验证 token → 模拟授权 → 换正式 IdC 凭据。
+        let exchange = exchange_sso_token(&token, &region, &config, proxy.as_ref())
+            .await
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+
+        // 幂等判重:同邮箱 idc 号已在池 → 拒绝重复导入(email 大小写不敏感)。
+        if let Some(email) = exchange.email.as_deref() {
+            let pool: Vec<(Option<String>, Option<String>)> = {
+                let snap = self.token_manager.snapshot();
+                snap.entries
+                    .iter()
+                    .map(|e| (e.auth_method.clone(), e.email.clone()))
+                    .collect()
+            };
+            if find_duplicate_idc_email(&pool, email) {
+                return Err(AdminServiceError::DuplicateCredential(format!(
+                    "该邮箱（{}）的 SSO 账号已在池中——如 Token 已过期请先删除旧号再导入",
+                    email
+                )));
+            }
+        }
+
+        let new_cred = build_idc_credential_from_sso(&exchange, &region, priority, custom_proxy.as_ref());
+        let credential_id = self
+            .token_manager
+            .add_credential(new_cred)
+            .await
+            .map_err(|e| self.classify_add_error(e))?;
+
+        // 顺带拉一次订阅等级（失败不阻断，仅告警——与上号路径同口径）。
+        if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
+            tracing::warn!("SSO Token 导入后获取订阅等级失败: {}", e);
+        }
+
+        // 新号自动初始化(异步):刷 token + 解析 profileArn(idc 号必需,同 IdC 上号)。
+        self.token_manager.spawn_initial_refresh(credential_id);
+
+        tracing::info!(
+            "SSO Token 导入成功,新凭据 #{} (region={})",
+            credential_id,
+            region
+        );
+        Ok(ImportSsoTokenResult {
+            credential_id,
+            email: exchange.email,
+        })
+    }
+
     /// 获取所有凭据状态
     pub fn get_all_credentials(&self) -> CredentialsStatusResponse {
         // 端点的默认回退已在 snapshot 内解析完成（entry.effective_endpoint），此处不再重复。
@@ -1016,7 +1178,6 @@ impl AdminService {
                     base_url: entry.base_url,
                     request_limit: entry.request_limit,
                     request_count: entry.request_count,
-                    deepseek_normalize: entry.deepseek_normalize,
                     model_mapping_exempt: entry.model_mapping_exempt,
                     has_profile_arn: entry.has_profile_arn,
                     refresh_token_hash: entry.refresh_token_hash,
@@ -1546,17 +1707,6 @@ impl AdminService {
         }
         self.set_disabled(id, true)?;
         self.reset_and_enable(id)
-    }
-
-    /// 设置代挂凭据的 deepseek 协议归一化开关（仅 custom_api 有意义，见 token_manager 对应方法）。
-    pub fn set_credential_deepseek_normalize(
-        &self,
-        id: u64,
-        enabled: Option<bool>,
-    ) -> Result<(), AdminServiceError> {
-        self.token_manager
-            .set_credential_deepseek_normalize(id, enabled)
-            .map_err(|e| self.classify_error(e, id))
     }
 
     /// 设置凭据的模型映射豁免开关（Kiro 号与 custom_api 号都可用）。
@@ -2685,6 +2835,7 @@ impl AdminService {
         // 且去重失效（同号可重复导入）。在**最外层入口**规范化，保证去重/探测/落盘拿到同一值。
         // 批量导入（import_one_key → self.add_credential）也走本函数，故单加 + 批量两条路径都覆盖。
         let mut req = req;
+        apply_ksk_region_suffix(&mut req);
         req.kiro_api_key = req.kiro_api_key.as_deref().and_then(clean_ksk_api_key);
 
         // 校验端点名：未指定则默认合法，指定则必须已注册
@@ -2825,8 +2976,6 @@ impl AdminService {
             // 自定义 API 代挂透传字段（auth_method=custom_api 时由前端填入）。
             base_url: req.base_url,
             api_key: req.api_key,
-            deepseek_normalize: req.deepseek_normalize,
-            deepseek_normalize_config: None,
             model_mapping_exempt: req.model_mapping_exempt,
             request_limit: req.request_limit,
             custom_api_first: req.custom_api_first,
@@ -3917,6 +4066,7 @@ impl AdminService {
             extract_thinking: config.extract_thinking,
             cc_auto_buffer: config.cc_auto_buffer,
             native_thinking_effort_enabled: config.native_thinking_effort_enabled,
+            tool_compat_mapping: config.tool_compat_mapping,
             import_keys_enabled: config.import_keys_enabled,
             clone_default_enabled: config.clone_default_enabled,
             upstream_retry_absorb_enabled: config.upstream_retry_absorb_enabled,
@@ -4136,6 +4286,8 @@ impl AdminService {
         let mut strip_env_noise_changed: Option<bool> = None;
         // Kiro 原生 effort 开关：改后调 converter setter 即时生效（进程级镜像，不重启）。
         let mut native_thinking_effort_enabled_changed: Option<bool> = None;
+        // CC↔Kiro 工具名/参数映射开关：改后调 converter setter 即时生效（进程级镜像，不重启）。
+        let mut tool_compat_mapping_changed: Option<bool> = None;
         // 工具错误缓解三开关：改后调 handlers setter 即时生效（进程级镜像，不重启）。
         let mut tool_clean_leaked_tokens_changed: Option<bool> = None;
         let mut tool_stream_align_failure_changed: Option<bool> = None;
@@ -4145,6 +4297,12 @@ impl AdminService {
         let mut tool_description_max_chars_changed: Option<usize> = None;
         // at-rest 加密开关变更:变更后立即重写凭据/回收站文件(明文↔密文),不等下次偶发变更。
         let mut encrypt_at_rest_changed = false;
+        // 两把鉴权 key 的轮换：存盘后调 auth_keys setter 即时生效（不再进 restart_fields）。
+        // 存 trim 后的新值而非 bool——setter 需要实际值，且 reload_config 会把 config 里的
+        // 这两把 key 钉回启动值（restart-only 字段的 split-brain 防护），故热更单元是它们
+        // 唯一的活真相源（详见下方 setter 调用处的顺序注释）。
+        let mut user_key_changed: Option<String> = None;
+        let mut admin_key_changed: Option<String> = None;
 
         // —— 需重启生效的字段 ——
         if let Some(v) = req.host {
@@ -4382,6 +4540,13 @@ impl AdminService {
             if v != config.native_thinking_effort_enabled {
                 config.native_thinking_effort_enabled = v;
                 native_thinking_effort_enabled_changed = Some(v);
+            }
+        }
+        // —— CC↔Kiro 工具名/参数映射开关（改后调 converter setter 即时生效不重启）——
+        if let Some(v) = req.tool_compat_mapping {
+            if v != config.tool_compat_mapping {
+                config.tool_compat_mapping = v;
+                tool_compat_mapping_changed = Some(v);
             }
         }
         if let Some(v) = req.tool_clean_leaked_tokens {
@@ -4809,14 +4974,29 @@ impl AdminService {
             }
         }
         // userKey（下游对话 api_key）：仅在非空白时更新（防 fail-open：空 key 会让 /v1 匿名可达）。
-        // 前端不回显现值，传空串=不改。需重启生效（auth 中间件启动时固化 key）。
+        // 前端不回显现值，传空串=不改。
+        // 【不再需要重启】鉴权已改为活读 `common::auth_keys` 的进程级单元，存盘后调 setter
+        // 即时生效——轮换密钥是常规运维动作，重启整个网关会掐断所有在途流式请求。
         if let Some(v) = req.api_key {
             let trimmed = v.trim();
             if !trimmed.is_empty() {
                 let new_val = Some(trimmed.to_string());
                 if new_val != config.api_key {
                     config.api_key = new_val;
-                    restart_fields.push("apiKey".into());
+                    user_key_changed = Some(trimmed.to_string());
+                }
+            }
+        }
+        // adminApiKey：同 userKey，空串=不改（防把管理面锁死成 fail-closed 全 401）。
+        // 【自锁风险】轮换后当前面板持有的旧 key 立即失效，前端须用新 key 重新鉴权——
+        // 这是热更的正确语义（旧 key 必须马上作废），前端负责换 header 而非后端延迟生效。
+        if let Some(v) = req.admin_api_key {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                let new_val = Some(trimmed.to_string());
+                if new_val != config.admin_api_key {
+                    config.admin_api_key = new_val;
+                    admin_key_changed = Some(trimmed.to_string());
                 }
             }
         }
@@ -5068,6 +5248,9 @@ impl AdminService {
             // Kiro 原生 effort 开关有 TIER3 setter（converter 镜像），但要 `hot_changed`
             // 之外仍进 OR 链才会调它：漏掉这行只改本项时面板会回「无改动」。
             || native_thinking_effort_enabled_changed.is_some()
+            // CC↔Kiro 工具名/参数映射开关同款：TIER3 setter（converter 镜像），漏掉这行
+            // 只改本项时面板会回「无改动」、镜像不刷新。
+            || tool_compat_mapping_changed.is_some()
             || self_heal_changed
             || tool_clean_leaked_tokens_changed.is_some()
             || tool_stream_align_failure_changed.is_some()
@@ -5170,6 +5353,10 @@ impl AdminService {
         if let Some(v) = native_thinking_effort_enabled_changed {
             crate::anthropic::set_native_thinking_effort_enabled(v);
         }
+        // CC↔Kiro 工具名/参数映射开关立即应用到 converter 进程级镜像（下一个请求即生效，不重启）。
+        if let Some(v) = tool_compat_mapping_changed {
+            crate::anthropic::set_tool_compat_mapping(v);
+        }
         // 工具错误缓解三开关立即应用到 handlers 进程级镜像（下一个请求即生效，不重启）。
         if let Some(v) = tool_clean_leaked_tokens_changed {
             crate::anthropic::set_tool_clean_leaked_tokens(v);
@@ -5191,6 +5378,25 @@ impl AdminService {
             crate::anthropic::set_tool_description_max_chars(v);
         }
 
+        // userKey 轮换立即生效：下一个 /v1 请求即按新 key 判定，旧 key 同时失效。
+        // ⚠️必须放在 reload_config 之后——reload 会把 config 里的 userKey 钉回启动值
+        // （restart-only 字段的 split-brain 防护，见 token_manager::reload_config 的
+        // restore 表），但热更单元才是鉴权的活真相源，故此处后写、以新值为准。
+        // setter 拒空，失败仅告警（旧 key 继续有效，不会裸奔）。
+        if let Some(v) = &user_key_changed {
+            match crate::common::auth_keys::set_user_key(v) {
+                Ok(()) => tracing::info!("apiKey 已轮换并即时生效（无需重启）"),
+                Err(e) => tracing::error!("apiKey 已存盘但热更失败，重启后生效: {}", e),
+            }
+        }
+        // adminApiKey 轮换：同上。旧 key 立即失效，面板须用新 key 重新鉴权。
+        if let Some(v) = &admin_key_changed {
+            match crate::common::auth_keys::set_admin_key(v) {
+                Ok(()) => tracing::info!("adminApiKey 已轮换并即时生效（无需重启）"),
+                Err(e) => tracing::error!("adminApiKey 已存盘但热更失败，重启后生效: {}", e),
+            }
+        }
+
         let immediate_changed = hot_changed
             || refresh_task_changed
             || balance_task_changed
@@ -5207,6 +5413,7 @@ impl AdminService {
             || mock_cache_changed
             || strip_env_noise_changed.is_some()
             || native_thinking_effort_enabled_changed.is_some()
+            || tool_compat_mapping_changed.is_some()
             || tool_clean_leaked_tokens_changed.is_some()
             || tool_stream_align_failure_changed.is_some()
             || tool_expose_error_to_client_changed.is_some()
@@ -5218,7 +5425,11 @@ impl AdminService {
             || absorb_changed
             // 错误码/提示词覆盖表同款（hot_or_display_changed 触发 reload_config 即生效）：
             // 漏掉这行只改错误码表时面板会回「未检测到变更」，与实际不符。
-            || error_messages_changed;
+            || error_messages_changed
+            // 两把 key 走 auth_keys setter 即时生效，故算「立即生效」而非「需重启」。
+            // 不进 hot_or_display_changed：reload_config 会把它们钉回启动值，重载对它们无用。
+            || user_key_changed.is_some()
+            || admin_key_changed.is_some();
         let restart_required = !restart_fields.is_empty();
         let message = if restart_required {
             format!("已保存。{} 个字段需重启服务后生效。", restart_fields.len())
@@ -5405,6 +5616,28 @@ impl AdminService {
         // ⑤ 热应用：reload_config 换入 ArcSwap + 幂等重挂 TIER2 后台任务
         if let Err(e) = self.token_manager.reload_config() {
             tracing::warn!("配置已导入但热重载失败,下次重启生效: {}", e);
+        }
+        // ⑥ 鉴权密钥热更：导入显式提供了真实新值 → 播种进 auth_keys 即时生效。
+        // 必须在 reload_config 之后（reload 会把 config 里的 key 钉回启动值，
+        // auth_keys 才是鉴权活真相源）。setter 拒空，空值保持 fail-closed。
+        if let Some(k) = imported.api_key.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if let Err(e) = crate::common::auth_keys::set_user_key(k) {
+                tracing::error!("apiKey 已导入但热更失败，重启后生效: {}", e);
+            } else {
+                tracing::info!("apiKey 已导入并即时生效（无需重启）");
+            }
+        }
+        if let Some(k) = imported
+            .admin_api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if let Err(e) = crate::common::auth_keys::set_admin_key(k) {
+                tracing::error!("adminApiKey 已导入但热更失败，重启后生效: {}", e);
+            } else {
+                tracing::info!("adminApiKey 已导入并即时生效（无需重启）");
+            }
         }
         self.token_manager.respawn_refresh_task();
         self.respawn_balance_task();
@@ -8030,6 +8263,54 @@ mod absorb_hot_reload_tests {
             "必须有 `if let Some(v) = {update}` 的 TIER3 更新分支，否则面板改不动它"
         );
         let setter = format!("set_native{}", "_thinking_effort_enabled(v)");
+        assert!(
+            src.contains(&setter),
+            "改后必须调 converter 的 `{setter}` 写进程镜像，否则热路径读旧值"
+        );
+        // 响应结构与请求结构各一处（快照 + 请求）。
+        assert!(
+            types.matches(&field).count() >= 2,
+            "types.rs 里响应结构与请求结构都必须有该字段（当前 {} 处）",
+            types.matches(&field).count()
+        );
+        // 两条 OR 链（hot_or_display_changed 与 immediate_changed）各必须含本 flag。
+        assert!(
+            src.matches(&format!("|| {field}_changed.is_some()")).count() >= 2,
+            "本 flag 必须同时进 hot_or_display_changed 与 immediate_changed 两条 OR 链"
+        );
+    }
+
+    /// 🔴 回归：`tool_compat_mapping` 必须**全套接线**（快照 / 更新分支 / TIER3 setter
+    /// 应用 / 两条 OR 链），否则面板改了不生效且回「无改动」。
+    ///
+    /// CC↔Kiro 工具名/参数映射开关，此前只有 converter 原子默认 true 无配置入口，
+    /// 必须一次性接通才会被面板看到、改到、热更到：
+    /// - 快照：`build_config_snapshot` 逐字段从 config 读（否则面板永远显示默认值）；
+    /// - 更新分支：`req.{field}` 置位（否则面板改不动）；
+    /// - TIER3：改后调 `set_tool_compat_mapping` 写 converter 进程镜像
+    ///   （否则存了盘但热路径仍读旧值，开关静默无效）；
+    /// - 两条 OR 链各一处（hot_or_display_changed 与 immediate_changed，漏一条 →
+    ///   只改本项时面板回「无改动」）。
+    ///
+    /// 回退即 FAIL：删掉任一处接线 → 对应断言失败。
+    #[test]
+    fn tool_compat_mapping_is_fully_wired() {
+        let src = include_str!("service.rs");
+        let types = include_str!("types.rs");
+        // needle 运行时拼接：include_str! 会把本测试自己的字面量也读进来。
+        let field = format!("tool_compat{}", "_mapping");
+
+        let snapshot = format!("{field}: config.{field},");
+        assert!(
+            src.contains(&snapshot),
+            "配置快照必须逐字段从 config 读 `{snapshot}`，否则面板读不到真实值"
+        );
+        let update = format!("req.{field}");
+        assert!(
+            src.contains(&update),
+            "必须有 `if let Some(v) = {update}` 的 TIER3 更新分支，否则面板改不动它"
+        );
+        let setter = format!("set_tool{}", "_compat_mapping(v)");
         assert!(
             src.contains(&setter),
             "改后必须调 converter 的 `{setter}` 写进程镜像，否则热路径读旧值"
@@ -11787,8 +12068,69 @@ mod ksk_clean_tests {
         assert_eq!(clean_ksk_api_key("\"\","), None);
     }
 
+    /// Kiro-Go `ksk_key|region`：只拆恰好一段 `|` + 白名单 region。
+    #[test]
+    fn clean_ksk_api_key_splits_pipe_region() {
+        assert_eq!(
+            clean_ksk_api_key("ksk_abc123|eu-central-1"),
+            Some("ksk_abc123".into())
+        );
+        assert_eq!(
+            ksk_region_suffix("ksk_abc123|eu-central-1").as_deref(),
+            Some("eu-central-1")
+        );
+        assert_eq!(
+            ksk_region_suffix("\"key: ksk_abc123|eu-central-1\"").as_deref(),
+            Some("eu-central-1")
+        );
+        // 未知 region / 多段 `|` / 非 ksk_：不拆
+        assert_eq!(
+            clean_ksk_api_key("ksk_abc123|not-a-region"),
+            Some("ksk_abc123|not-a-region".into())
+        );
+        assert!(ksk_region_suffix("ksk_abc123|not-a-region").is_none());
+        assert_eq!(
+            clean_ksk_api_key("ksk_ab|c|eu-central-1"),
+            Some("ksk_ab|c|eu-central-1".into())
+        );
+        assert!(ksk_region_suffix("refresh_token_value|eu-central-1").is_none());
+        assert_eq!(
+            clean_ksk_api_key("ksk_abc123| eu-central-1 "),
+            Some("ksk_abc123".into())
+        );
+    }
+
+    /// `|region` 只在 `api_region` 为空时写入；请求已带则保留。
+    #[test]
+    fn clean_ksk_apply_pipe_region_only_when_api_region_empty() {
+        let mut req = AddCredentialRequest {
+            kiro_api_key: Some("ksk_abc123|eu-central-1".into()),
+            ..Default::default()
+        };
+        apply_ksk_region_suffix(&mut req);
+        assert_eq!(req.api_region.as_deref(), Some("eu-central-1"));
+        req.kiro_api_key = req.kiro_api_key.as_deref().and_then(clean_ksk_api_key);
+        assert_eq!(req.kiro_api_key.as_deref(), Some("ksk_abc123"));
+
+        let mut req = AddCredentialRequest {
+            kiro_api_key: Some("ksk_abc123|eu-central-1".into()),
+            api_region: Some("us-east-1".into()),
+            ..Default::default()
+        };
+        apply_ksk_region_suffix(&mut req);
+        assert_eq!(req.api_region.as_deref(), Some("us-east-1"));
+
+        let mut req = AddCredentialRequest {
+            kiro_api_key: Some("ksk_abc123|eu-central-1".into()),
+            api_region: Some("  ".into()),
+            ..Default::default()
+        };
+        apply_ksk_region_suffix(&mut req);
+        assert_eq!(req.api_region.as_deref(), Some("eu-central-1"));
+    }
+
     /// ⭐ 源码级守卫：`add_credential_with_intent` 入口必须对 `req.kiro_api_key` 应用清洗。
-    /// 回退即 FAIL：去掉 `.and_then(clean_ksk_api_key)` → 本测试红。
+    /// 回退即 FAIL：去掉清洗调用 → 本测试红。
     /// 批量导入（import_one_key → add_credential）也走本函数，故一条守卫钉住两条路径。
     #[test]
     fn add_credential_entry_applies_ksk_cleaning() {
@@ -11800,6 +12142,11 @@ mod ksk_clean_tests {
             prod.contains(needle),
             "add_credential_with_intent 入口必须清洗 kiro_api_key（ksk_ 截取 + 去噪声），\
              否则粘贴 `\"key: ksk_xxx\"` 会破坏去重与 region 探测"
+        );
+        let region_needle = format!("{}{}", "apply_ksk_region_suffix(", "&mut req)");
+        assert!(
+            prod.contains(&region_needle),
+            "add_credential_with_intent 必须在清洗前把 ksk_|region 写入 api_region"
         );
     }
 }
@@ -12594,6 +12941,229 @@ mod config_write_tests {
         let disk = disk_config_json(&path);
         assert_eq!(disk["mockCacheEnabled"], true, "TIER3 字段必须落盘");
         assert_eq!(disk["upstreamRetryAbsorbEnabled"], true, "吸收层开关必须落盘");
+    }
+
+    /// 🔴 承重：userKey（apiKey）轮换走 `auth_keys` setter **即时生效、无需重启**。
+    ///
+    /// 旧行为：apiKey 进 restart_fields、面板提示「需重启」——重启会掐断在途流式请求。
+    /// 现在应回「立即生效」且 auth_keys 立刻按新 key 判定（旧 key 立即失效）。
+    ///
+    /// ⚠️ auth_keys 是进程级全局 cell：本用例必须持 `auth_keys::test_serial()` 全程，
+    /// 否则并行的其他用例（构造 AppState/AdminState 或改 key）会覆写同一份全局状态。
+    /// 先播旧 key 模拟 main.rs 启动播种，再经 update_config 轮换 → 断言旧失效/新生效。
+    #[test]
+    fn update_config_user_key_hot_swaps_without_restart() {
+        let _g = crate::common::auth_keys::test_serial();
+        crate::common::auth_keys::set_user_key("sk-old")
+            .expect("启动播种（模拟 main.rs）不应失败");
+        let dir = TempDir(std::env::temp_dir().join(format!(
+            "ks_upd_ukey_{}",
+            uuid::Uuid::new_v4()
+        )));
+        let (svc, path) = svc_with_disk_config(&dir, |c| {
+            c.api_key = Some("sk-old".to_string());
+        });
+        assert!(
+            crate::common::auth_keys::user_key_matches("sk-old"),
+            "前置：播种后旧 key 应生效（模拟真实启动状态）"
+        );
+
+        let resp = svc
+            .update_config(UpdateConfigRequest {
+                api_key: Some("sk-new".to_string()),
+                ..Default::default()
+            })
+            .expect("轮换 apiKey 应成功");
+        assert!(!resp.restart_required, "apiKey 轮换不得要求重启");
+        assert!(resp.restart_fields.is_empty(), "apiKey 不再进 restart_fields");
+        assert!(
+            resp.message.contains("立即生效"),
+            "apiKey 轮换必须回「立即生效」，实际: {}",
+            resp.message
+        );
+
+        // 鉴权活真相源立刻按新 key 判定：旧 key 失效、新 key 通过（热更定义）。
+        assert!(
+            crate::common::auth_keys::user_key_matches("sk-new"),
+            "热更后新 apiKey 必须通过"
+        );
+        assert!(
+            !crate::common::auth_keys::user_key_matches("sk-old"),
+            "热更后旧 apiKey 必须立即失效"
+        );
+
+        let disk = disk_config_json(&path);
+        assert_eq!(disk["apiKey"], "sk-new", "apiKey 必须落盘");
+    }
+
+    /// 承重：adminApiKey 轮换同样即时生效、无需重启。
+    ///
+    /// 语义上 admin key 是**新字段**（此前 UpdateConfigRequest 根本没有它，只能手改
+    /// config.json + 重启）；现在走与 userKey 同款 setter 热更。自锁风险见字段注释。
+    #[test]
+    fn update_config_admin_key_hot_swaps_without_restart() {
+        let _g = crate::common::auth_keys::test_serial();
+        crate::common::auth_keys::set_admin_key("adm-old")
+            .expect("启动播种（模拟 main.rs）不应失败");
+        let dir = TempDir(std::env::temp_dir().join(format!(
+            "ks_upd_akey_{}",
+            uuid::Uuid::new_v4()
+        )));
+        let (svc, path) = svc_with_disk_config(&dir, |c| {
+            c.admin_api_key = Some("adm-old".to_string());
+        });
+        assert!(
+            crate::common::auth_keys::admin_key_matches("adm-old"),
+            "前置：播种后旧 key 应生效"
+        );
+
+        let resp = svc
+            .update_config(UpdateConfigRequest {
+                admin_api_key: Some("adm-new".to_string()),
+                ..Default::default()
+            })
+            .expect("轮换 adminApiKey 应成功");
+        assert!(!resp.restart_required, "adminApiKey 轮换不得要求重启");
+        assert!(resp.restart_fields.is_empty());
+        assert!(
+            resp.message.contains("立即生效"),
+            "adminApiKey 轮换必须回「立即生效」，实际: {}",
+            resp.message
+        );
+        assert!(
+            crate::common::auth_keys::admin_key_matches("adm-new"),
+            "热更后新 adminApiKey 必须通过"
+        );
+        assert!(
+            !crate::common::auth_keys::admin_key_matches("adm-old"),
+            "热更后旧 adminApiKey 必须立即失效"
+        );
+        assert_eq!(disk_config_json(&path)["adminApiKey"], "adm-new", "必须落盘");
+    }
+
+    /// 空/空白 key 传空串 = 不改（防把手动写入 fail-closed 的意图和「手滑存空」混为一谈）。
+    ///
+    /// 只提交空白 apiKey/adminApiKey 时：不报错、不落盘、鉴权仍走旧 key（绝不清成空串，
+    /// 清空 = fail-open 敞口；真正关闭通道的意图在 auth_keys 层由 setter 拒空兜底）。
+    #[test]
+    fn update_config_blank_key_is_ignored_not_wiped() {
+        let _g = crate::common::auth_keys::test_serial();
+        crate::common::auth_keys::set_user_key("sk-keep")
+            .expect("启动播种（模拟 main.rs）不应失败");
+        crate::common::auth_keys::set_admin_key("adm-keep")
+            .expect("启动播种（模拟 main.rs）不应失败");
+        let dir = TempDir(std::env::temp_dir().join(format!(
+            "ks_upd_blank_{}",
+            uuid::Uuid::new_v4()
+        )));
+        let (svc, path) = svc_with_disk_config(&dir, |c| {
+            c.api_key = Some("sk-keep".to_string());
+            c.admin_api_key = Some("adm-keep".to_string());
+        });
+
+        let resp = svc
+            .update_config(UpdateConfigRequest {
+                api_key: Some("   ".to_string()),
+                admin_api_key: Some("".to_string()),
+                ..Default::default()
+            })
+            .expect("空白 key 应被忽略而非报错");
+        assert!(
+            resp.message.contains("无改动"),
+            "空白 key 不算改动，实际: {}",
+            resp.message
+        );
+        assert!(
+            crate::common::auth_keys::user_key_matches("sk-keep"),
+            "空白 key 不得清掉现有 apiKey"
+        );
+        assert!(
+            crate::common::auth_keys::admin_key_matches("adm-keep"),
+            "空白 key 不得清掉现有 adminApiKey"
+        );
+        let disk = disk_config_json(&path);
+        assert_eq!(disk["apiKey"], "sk-keep");
+        assert_eq!(disk["adminApiKey"], "adm-keep");
+    }
+
+    /// 🔴 承重：key 轮换与热字段**同批**提交时，reload_config 不得覆盖新 key。
+    ///
+    /// reload_config（token_manager）会把 apiKey/adminApiKey 这类 restart-only 字段
+    /// 用 ArcSwap 旧值**钉回启动值**（split-brain 防护），鉴权却读 auth_keys 活单元——
+    /// 所以 setter 必须放在 reload_config **之后**、以新值为准。本用例强制走
+    /// mock_cache_enabled（TIER3 热字段 → 触发 reload_config）同批改 apiKey，
+    /// 断言 reload 后 auth_keys 仍是新值：若有人把 setter 挪到 reload 之前或删了接线，
+    /// 这里会当场红。
+    #[test]
+    fn update_config_key_survives_batched_hot_reload() {
+        let _g = crate::common::auth_keys::test_serial();
+        crate::common::auth_keys::set_user_key("sk-old")
+            .expect("启动播种（模拟 main.rs）不应失败");
+        let dir = TempDir(std::env::temp_dir().join(format!(
+            "ks_upd_seq_{}",
+            uuid::Uuid::new_v4()
+        )));
+        let (svc, path) = svc_with_disk_config(&dir, |c| {
+            c.api_key = Some("sk-old".to_string());
+            c.mock_cache_enabled = false;
+        });
+
+        let resp = svc
+            .update_config(UpdateConfigRequest {
+                api_key: Some("sk-new".to_string()),
+                // 热字段：确保本次更新触发 reload_config（正踩「顺序坑」的场景）。
+                mock_cache_enabled: Some(true),
+                ..Default::default()
+            })
+            .expect("key + 热字段同批应成功");
+        assert!(!resp.restart_required);
+        assert!(
+            crate::common::auth_keys::user_key_matches("sk-new"),
+            "reload_config 之后 setter 必须以新值为准，旧 key 不得复活"
+        );
+        assert!(
+            !crate::common::auth_keys::user_key_matches("sk-old"),
+            "reload 不得把钉回的旧启动值当成鉴权真值"
+        );
+        assert_eq!(disk_config_json(&path)["apiKey"], "sk-new");
+    }
+
+    /// 源码守卫：key 热更接线 + 「setter 必须在 reload_config 之后」的顺序不变量。
+    ///
+    /// 回退即 FAIL：
+    /// - 删掉 update_config_locked 里的 set_user_key/set_admin_key 调用（接线断了，
+    ///   key 轮换又退回重启生效）；
+    /// - 把 setter 挪到 reload_config **之前**（reload 会把 key 钉回启动旧值，
+    ///   顺序反了热更静默失效）。
+    #[test]
+    fn guard_update_config_seeds_auth_keys_after_reload() {
+        let src = include_str!("service.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        let compact: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        for needle in [
+            "crate::common::auth_keys::set_user_key",
+            "crate::common::auth_keys::set_admin_key",
+        ] {
+            assert!(
+                compact.contains(needle),
+                "update_config 必须调 {needle} 热更（删接线 = key 轮换退回重启生效）"
+            );
+        }
+        let reload = compact
+            .find("self.token_manager.reload_config()")
+            .expect("update_config 必须保留 reload_config 调用");
+        let set_user = compact
+            .find("crate::common::auth_keys::set_user_key")
+            .expect("userKey setter 接线不该消失");
+        let set_admin = compact
+            .find("crate::common::auth_keys::set_admin_key")
+            .expect("adminKey setter 接线不该消失");
+        assert!(
+            reload < set_user && reload < set_admin,
+            "key setter 必须放在 reload_config 之后（reload 会把 key 钉回启动值，\
+             顺序反了热更被 reload 覆盖而静默失效）"
+        );
     }
 
     /// 提交与磁盘相同的值 → 「无改动。」（不误报立即生效/需重启）。

@@ -22,13 +22,13 @@ use super::{
         external_idp_leg2_select, force_refresh_token, get_all_credentials, get_cached_balances,
         get_config, get_credential_balance, get_error_message_defaults, get_load_balancing_mode,
         get_overage_status,
-        help_web_search, import_config, import_keys, list_socks_nodes, list_trash,
+        help_web_search, import_config, import_keys, import_sso_token, list_socks_nodes, list_trash,
         perform_update,
         poll_idc_login, poll_social_login, probe_available_models, probe_models_standalone,
         probe_regions, proxy_test, probe_upstream_models, purge_credential, purge_trash_batch,
         endpoint_health, recovery_metrics, relogin_oauth, reprobe_credential_region,
         reset_failure_count, restart_service, restore_credential, set_credential_allowed_models,
-        set_credential_api_region, set_credential_custom_api, set_credential_deepseek_normalize,
+        set_credential_api_region, set_credential_custom_api,
         set_credential_disabled, set_credential_endpoint, set_credential_model_mapping_exempt,
         set_credential_name, set_credential_priority, set_credential_proxy,
         set_credential_rpm_limit, set_credential_tag, set_load_balancing_mode, social_callback,
@@ -39,8 +39,8 @@ use super::{
     middleware::{AdminState, admin_auth_middleware},
     usage_handlers::{
         logs_export, logs_poll, logs_stream, ratelimit_insights, stream_live, traces_search,
-        usage_by_credential, usage_by_model, usage_by_requested_model, usage_clients,
-        usage_machines, usage_overview, usage_rate, usage_recent, usage_throughput,
+        usage_by_credential, usage_by_model, usage_by_outcome, usage_by_requested_model,
+        usage_clients, usage_machines, usage_overview, usage_rate, usage_recent, usage_throughput,
         usage_timeseries,
     },
 };
@@ -93,6 +93,9 @@ pub fn create_admin_router(state: AdminState) -> Router {
         )
         // 批量导入 Kiro API Key（ksk_ 号）：兼容 items[] / keys[] / apiKey / kiroApiKey 四种体
         .route("/import/keys", post(import_keys))
+        // SSO Token 导入（粘贴 AWS portal Bearer Token 静默换号，产物为标准 IdC 凭据）。
+        // 静态段 import-sso 与 {id} 同层共存，matchit 静态段优先（同 /credentials/trash 先例）。
+        .route("/credentials/import-sso", post(import_sso_token))
         // 凭据回收站（静态段 trash 与 {id} 同层共存，matchit 静态段优先匹配）
         .route("/credentials/trash", get(list_trash))
         // 批量清空回收站（静态段 purge 优先于 trash/{id}）
@@ -124,11 +127,6 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/credentials/{id}/reprobe-region",
             post(reprobe_credential_region),
-        )
-        // 代挂凭据的 deepseek 协议归一化开关（仅 custom_api 有意义）。
-        .route(
-            "/credentials/{id}/deepseek-normalize",
-            post(set_credential_deepseek_normalize),
         )
         // 凭据级模型映射豁免开关（Kiro 号与 custom_api 号都可用）。
         .route(
@@ -199,6 +197,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/usage/by-model", get(usage_by_model))
         .route("/usage/by-requested-model", get(usage_by_requested_model))
         .route("/usage/by-credential", get(usage_by_credential))
+        .route("/usage/by-outcome", get(usage_by_outcome))
         .route("/usage/recent", get(usage_recent))
         // trace 明细搜索/过滤/分页（多维 AND，参数化防注入，单页≤500）
         .route("/traces/search", get(traces_search))
@@ -371,5 +370,27 @@ mod guard_tests {
                 route
             );
         }
+    }
+
+    /// SSO Token 导入端点必须注册在鉴权路由树内。
+    ///
+    /// 回退即 FAIL：删除 `/credentials/import-sso` 路由。
+    #[test]
+    fn import_sso_endpoint_is_registered() {
+        let src = include_str!("router.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        let compact: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        // needle 运行时拼接：字面量会被 include_str! 读到测试自身而永远为真。
+        let route = format!(
+            "\"/credentials/import-{sso}\",post(import_{sso}_token{close}",
+            sso = "sso",
+            close = ")"
+        );
+        assert!(
+            compact.contains(&route),
+            "SSO Token 导入端点必须注册进鉴权路由树：{}",
+            route
+        );
     }
 }

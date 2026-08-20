@@ -44,6 +44,8 @@ pub enum EventType {
     ContextUsage,
     /// 结构化思考增量事件（上游的 thinking 流，见 `reasoning.rs` 的模块文档）
     ReasoningContent,
+    /// 流末元数据（payload 只有 stopReason，见 `metadata.rs`）
+    Metadata,
     /// 未知事件类型
     Unknown,
 }
@@ -57,6 +59,7 @@ impl EventType {
             "meteringEvent" => Self::Metering,
             "contextUsageEvent" => Self::ContextUsage,
             "reasoningContentEvent" => Self::ReasoningContent,
+            "metadataEvent" => Self::Metadata,
             _ => Self::Unknown,
         }
     }
@@ -69,6 +72,7 @@ impl EventType {
             Self::Metering => "meteringEvent",
             Self::ContextUsage => "contextUsageEvent",
             Self::ReasoningContent => "reasoningContentEvent",
+            Self::Metadata => "metadataEvent",
             Self::Unknown => "unknown",
         }
     }
@@ -103,6 +107,8 @@ pub enum Event {
     ContextUsage(super::ContextUsageEvent),
     /// 结构化思考增量（上游 thinking 流；此前被当 Unknown 丢弃，见 E1）
     ReasoningContent(super::ReasoningContentEvent),
+    /// 流末元数据（stopReason；此前被当 Unknown 丢弃）
+    Metadata(super::MetadataEvent),
     /// 未知事件 (保留原始帧数据)
     Unknown {},
     /// 服务端错误
@@ -160,13 +166,17 @@ impl Event {
                 let payload = super::ReasoningContentEvent::from_frame(&frame)?;
                 Ok(Self::ReasoningContent(payload))
             }
+            EventType::Metadata => {
+                let payload = super::MetadataEvent::from_frame(&frame)?;
+                Ok(Self::Metadata(payload))
+            }
             EventType::Unknown => {
                 // 未知事件类型此前被静默丢弃——连类型名都不留，导致上游新增的事件
                 // 我们永远看不见。已知的具体损失：AWS 官方 amazon-q-developer-cli 的
                 // Smithy 客户端里有 `MetadataEvent.tokenUsage`，含
                 // uncachedInputTokens / cacheReadInputTokens / cacheWriteInputTokens。
-                // （EXP-0 已实测证否：本链路的 metadataEvent 只有 stopReason，
-                //   见 docs/CACHE-EXP0-RESULT.md。）
+                // metadata 帧已单独分类（payload 只有 stopReason，见 metadata.rs /
+                // docs/CACHE-EXP0-RESULT.md）。本分支只剩真正未识别的类型。
                 //
                 // ⚠️ **每种类型只 warn 一次**（进程内按类型去重）。
                 // 原实现对**每一帧**都 warn，而 `reasoningContentEvent` 是上游的结构化
@@ -259,6 +269,11 @@ mod tests {
             EventType::ReasoningContent,
             "reasoningContentEvent 必须被识别为结构化思考流（落 Unknown 会让 payload 被丢弃）"
         );
+        assert_eq!(
+            EventType::from_str("metadataEvent"),
+            EventType::Metadata,
+            "metadataEvent 必须被识别（落 Unknown 会丢掉 stopReason）"
+        );
         assert_eq!(EventType::from_str("unknown_type"), EventType::Unknown);
     }
 
@@ -269,13 +284,13 @@ mod tests {
             "assistantResponseEvent"
         );
         assert_eq!(EventType::ToolUse.as_str(), "toolUseEvent");
+        assert_eq!(EventType::Metadata.as_str(), "metadataEvent");
     }
 
-    /// `metadataEvent` 目前**刻意**落到 Unknown（本轮只加可观测性，不接入解析）。
+    /// 接线守卫：from_str / parse_event 必须把该事件类型接到 Metadata 变体。
     ///
-    /// 这个断言的用途是：等 EXP-0 确认上游确实在发 tokenUsage 后，接入解析时这条
-    /// 测试会失败，从而强制同时更新它——避免"加了 MetadataEvent 变体但忘了从
-    /// Unknown 分支摘出来"这类半成品状态。
+    /// 原测试锁定 Unknown（只加可观测性）。现已接入解析，反向锁定分类，
+    /// 避免再掉回 Unknown 把 stopReason 丢掉。
     /// 未识别事件的告警必须**按类型去重**：同一类型只告警一次。
     ///
     /// 回归背景：原实现逐帧 warn，而 reasoningContentEvent 是结构化 thinking 增量流，
@@ -307,11 +322,35 @@ mod tests {
     }
 
     #[test]
-    fn test_metadata_event_still_unclassified() {
+    fn test_metadata_event_is_classified() {
         assert_eq!(
             EventType::from_str("metadataEvent"),
-            EventType::Unknown,
-            "若已接入 metadataEvent 解析，请同时更新本测试与 parse_event 的分支"
+            EventType::Metadata,
+            "若解析被拆掉，本断言会红；请同时核对 parse_event 的 Metadata 分支"
+        );
+    }
+
+    #[test]
+    fn metadata_event_parse_branch_is_wired() {
+        let src = include_str!("base.rs");
+        let prod = src
+            .split_once("\n#[cfg(test)]")
+            .map(|(p, _)| p)
+            .unwrap_or(src);
+        let prod: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let from_str_arm = format!("\"{}{}\" => Self::{}", "metadata", "Event", "Metadata");
+        let parse_arm = format!("{}::{}", "EventType", "Metadata");
+        assert!(
+            prod.contains(&from_str_arm),
+            "from_str 必须把该事件类型接到 Metadata"
+        );
+        assert!(
+            prod.contains(&parse_arm),
+            "parse_event 必须有 Metadata 分支（变体加了但没接线会把 payload 丢掉）"
         );
     }
 }

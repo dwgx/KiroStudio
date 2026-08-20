@@ -12,7 +12,7 @@ use super::{
     types::{
         AddCredentialRequest, BatchDeleteRequest, BatchDeleteResponse, CleanupDisabledRequest,
         CloneCredentialRequest, SetAllowedModelsRequest, SetApiRegionRequest,
-        SetCustomApiConfigRequest, SetDeepseekNormalizeRequest, SetDisabledRequest,
+        SetCustomApiConfigRequest, SetDisabledRequest,
         SetEndpointRequest, SetLoadBalancingModeRequest, SetModelMappingExemptRequest,
         SetPriorityRequest, SetRpmLimitRequest, RefreshTokenRequest,
         SuccessResponse, parse_import_keys_request,
@@ -219,31 +219,6 @@ pub async fn probe_models_standalone(
         .await
     {
         Ok(models) => Json(serde_json::json!({ "models": models })).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
-    }
-}
-
-/// POST /api/admin/credentials/:id/deepseek-normalize  body: `{ "deepseekNormalize": true }`
-///
-/// 设置代挂凭据的 deepseek 协议归一化开关（仅 custom_api 有意义；非 custom_api 后端 gate 拒绝）。
-pub async fn set_credential_deepseek_normalize(
-    State(state): State<AdminState>,
-    Path(id): Path<u64>,
-    Json(payload): Json<SetDeepseekNormalizeRequest>,
-) -> impl IntoResponse {
-    let enabled = payload.deepseek_normalize.unwrap_or(false);
-    match state
-        .service
-        .set_credential_deepseek_normalize(id, payload.deepseek_normalize)
-    {
-        Ok(_) => {
-            let msg = if enabled {
-                format!("凭据 #{} deepseek 归一化已开启", id)
-            } else {
-                format!("凭据 #{} deepseek 归一化已关闭", id)
-            };
-            Json(SuccessResponse::new(msg)).into_response()
-        }
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -1563,6 +1538,48 @@ fn default_priority() -> u32 {
     // 默认 0:所有号平权(priority 越小越优先,0 即最高且彼此相等)。
     // dwgx:新号默认 100 没必要,都 0 就行,想区分优先级再手动改。
     0
+}
+
+// ============ SSO Token 导入（粘贴 AWS portal Bearer Token 静默换号）============
+
+/// POST /api/admin/credentials/import-sso
+/// 粘贴 AWS portal 的 Bearer Token（x-amz-sso_authn），服务端走完整设备授权流程
+/// 换取标准 IdC 凭据入池（免浏览器授权的人工步骤，移植自 Kiro-Go）。
+///
+/// body: `{ token, region?, priority?, proxyUrl? }`
+/// 返回: `{ credentialId, email }`
+///
+/// ⚠️ 安全：token 全程不落日志、不落盘（单次用途，仅本流程内使用）；region 必须
+/// 在 Kiro region 白名单内（service 层校验，防污染值拼坏出站 host）。
+pub async fn import_sso_token(
+    State(state): State<AdminState>,
+    Json(payload): Json<ImportSsoTokenRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .import_sso_token(payload.token, payload.region, payload.priority, payload.proxy_url)
+        .await
+    {
+        Ok(result) => Json(serde_json::json!({
+            "credentialId": result.credential_id,
+            "email": result.email,
+        }))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSsoTokenRequest {
+    /// AWS portal 的 Bearer Token（x-amz-sso_authn）。
+    pub token: String,
+    /// 导入 region（缺省 us-east-1；必须命中 Kiro region 白名单）。
+    pub region: Option<String>,
+    #[serde(default = "default_priority")]
+    pub priority: u32,
+    /// 上号时显式填的代理（仅此项持久化到新凭据）。
+    pub proxy_url: Option<String>,
 }
 
 // ============ 运维：一键重启 / 存储统计与清理 ============

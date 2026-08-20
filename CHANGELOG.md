@@ -2,6 +2,16 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [1.1.2] - 2026-08-20 - W15–W22 收口 + 吸收/调度
+
+相对 v1.1.1 / `59744cb`。本机 `cargo test --no-default-features`：**2170 passed; 0 failed**。未部署 nbus。
+
+- 端点回退、MCP 无号直连（OAuth 优先、负缓存按凭据）、SSO Token 导入、去掉 deepseek 归一化、auth_keys 热更、SQLite INCREMENTAL、工具兼容。
+- 吸收：conversationId 含首条消息；websearch 失败也记账；OAuth 默认不打 CLI 族；ksk 粘贴/`|region`/CLIProxy 跳过；`metadataEvent.stopReason`；半截流不再假成功。
+- 调度：纯代挂并发满短等；封桶终态 429+Retry-After；设置「个人→智能 / 中转→稳定 / 专家→手动」。
+
+已知未修（不阻断本 tag）：MCP 直连仍单 token 不轮换；websearch `decode_round` 仍丢 metadataEvent；SSO 空 refreshToken 仍可能写入不可刷新号。Client Key 未做。
+
 ## [1.1.0] - 2026-08-14 - 波次1-4：选号临界区优化/告警webhook/成本核算/OTA/代理池调度/KAM导出/接入信息页等 20+ 项
 
 波次 1-4 汇聚：选号临界区与模型级限流优化、告警与安全加固、成本核算、OTA 与版本伪装、
