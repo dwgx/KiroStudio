@@ -974,8 +974,8 @@ mod tests {
         unsafe { std::env::remove_var("KIROSTUDIO_UPDATE_REPO") };
         assert_eq!(github_repo(), DEFAULT_GITHUB_REPO);
 
-        let _g = EnvGuard::set("KIROSTUDIO_UPDATE_REPO", "dwgx/KiroStudio-skiapi");
-        assert_eq!(github_repo(), "dwgx/KiroStudio-skiapi");
+        let _g = EnvGuard::set("KIROSTUDIO_UPDATE_REPO", "example/override-repo");
+        assert_eq!(github_repo(), "example/override-repo");
     }
 
     #[test]

@@ -924,7 +924,7 @@
   "kb.model-unsupported.title": "リクエストしたモデルが非対応 / ブロックされる",
   "kb.ota-check-fails.cause": "OTA 更新確認は GitHub プライベートリポジトリを叩き、環境変数 KIROSTUDIO_UPDATE_REPO / KIROSTUDIO_UPDATE_TOKEN が必要です（トークン検出時は GitHub 直結のみ、第三者のミラーは除外して PAT を中間者に渡さない）。本番 update.env の token は空なので、パネルのボタンは必然的に失敗します。",
   "kb.ota-check-fails.problem": "パネルの更新確認でエラーになる、または新バージョンがあるのに「更新なし」と出る。",
-  "kb.ota-check-fails.solution": "1. サーバーの /etc/kirostudio/update.env に token が入っているか確認（現状空 — 既知の状態）。\n2. 有効化する場合：GitHub で fine-grained PAT を作成（dwgx/KiroStudio-skiapi のみ、権限 Contents:read + Actions:read）、記入して再起動。\n3. 確認結果はメモリ状態で再起動でリセット（起動時に再チェック）。",
+  "kb.ota-check-fails.solution": "1. OTA は公開リポジトリ dwgx/KiroStudio を既定で読む。token は不要。\n2. KIROSTUDIO_UPDATE_REPO が廃止した私有 skiapi リポジトリを指していないか確認。\n3. 自動チェックは設定の otaAutoCheck（メモリ状態、再起動で設定に戻る）。",
   "kb.ota-check-fails.title": "パネルの「更新確認」がずっと失敗する",
   "kb.pit-ai-code-must-pass-ci.cause": "実測で発見された欠陥タイプ：raw string の内容が引用符で終わり早期閉じ、/// ドキュメントコメントを関数引数に使用（Rust 非許可）、cap 発動後の再入デッドループ、契約を超える切り出し結果、JSON オブジェクトを期待する関数に裸文字列を渡すテストヘルパー。",
   "kb.pit-ai-code-must-pass-ci.problem": "agent が納品したコードのレポートは「論理的に整合」と自称するが、実際は 5 種類の実欠陥があり、全て CI で発見された。",
