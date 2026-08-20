@@ -7,7 +7,7 @@ import type { CellActivity } from '@/components/overview/StatusHeatmap'
 import { authLabel, disabledReasonLabel } from '@/lib/i18n-labels'
 
 // ============================================================
-// 号池可视化三视图（GlowGrid / OrbitRing / StatusBars）共用的
+// 号池可视化（GlowGrid / StatusBars）共用的
 // 纯逻辑与展示碎片，集中一处避免各视图重复造轮子。
 // 只读 credentials 免费字段 + activity，绝不在此拉 balance（避免触发上游风控）。
 // ============================================================

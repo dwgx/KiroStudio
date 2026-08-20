@@ -2,7 +2,7 @@
 
 活跃文档在本目录。过期过程稿在 `docs/archive/`（gitignore，仅本地）。
 
-**读序（新窗）：** 仓根 `STATUS.md` → 本目录 `TAKEOVER.md` → `.agent/HANDOFF.md`（本地进度，不进远程）→ 下面「核心技术」。不要用仓根 `HANDOFF-*` / `.opencode/state.md` 当现状。
+**读序（新窗）：** 仓根 `STATUS.md` → 本目录 `TAKEOVER.md` → `.agent/HANDOFF.md` → `.agent/NEXT-PROMPT.md`（给下一 AI 的整段提示词，不进远程）。不要用仓根 `HANDOFF-*` / `.opencode/state.md` 当现状。**nbus 不用管。**
 
 ## 新窗 / 状态
 

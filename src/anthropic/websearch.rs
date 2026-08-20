@@ -1246,12 +1246,27 @@ struct RoundOutcome {
     context_input_tokens: Option<i32>,
     /// meteringEvent 累计 credit
     credits: f64,
-    /// stop_reason 覆盖（max_tokens / model_context_window_exceeded）
+    /// stop_reason 覆盖（metadataEvent / max_tokens / model_context_window_exceeded）
     stop_reason_override: Option<String>,
     /// 上游流中途读失败：本轮内容是**半截**的，不能当成功回灌
     stream_error: bool,
     /// in-band 错误/异常
     upstream_error: Option<String>,
+}
+
+/// 写入 metadataEvent 映射后的 stop_reason。已有更具体覆盖
+///（ContentLengthExceededException → max_tokens，或 context window）时不覆盖；
+/// mapped 为 None（空/缺失 stopReason）时保持原值。
+fn apply_metadata_stop_override(current: &mut Option<String>, mapped: Option<String>) {
+    if matches!(
+        current.as_deref(),
+        Some("max_tokens") | Some("model_context_window_exceeded")
+    ) {
+        return;
+    }
+    if let Some(mapped) = mapped {
+        *current = Some(mapped);
+    }
 }
 
 /// 缓冲解码一轮上游流式响应。
@@ -1436,6 +1451,14 @@ async fn decode_round(
                     if out.upstream_error.is_none() {
                         out.upstream_error = Some(format!("{}: {}", error_code, error_message));
                     }
+                }
+                Event::Metadata(meta) => {
+                    apply_metadata_stop_override(
+                        &mut out.stop_reason_override,
+                        crate::kiro::model::events::map_metadata_stop_reason(
+                            meta.stop_reason.as_deref(),
+                        ),
+                    );
                 }
                 _ => {}
             }
@@ -3286,6 +3309,97 @@ mod tests {
             fn_body.contains("out.stream_error = true"),
             "修复补不回时必须置 stream_error 整轮报错（run_round 据此返 502），\
              不得静默降级成空对象"
+        );
+        let meta_arm = format!("{}::{}", "Event", "Metadata");
+        let mapper = ["map_metadata", "_stop_reason"].concat();
+        assert!(
+            fn_body.contains(&meta_arm),
+            "decode_round 必须消费 Metadata 帧（不能再 _ => 丢掉 stopReason）"
+        );
+        assert!(
+            fn_body.contains(&mapper),
+            "必须复用 map_metadata_stop_reason，禁止第二张映射表"
+        );
+    }
+
+    /// 旧实现把 metadataEvent 丢进 `_ => {}`，stopReason 被丢掉。
+    /// 本条 FAIL 条件：decode_round 函数体不再含 Metadata 臂或不再调用映射函数。
+    #[test]
+    fn decode_round_consumes_metadata_event() {
+        let full = include_str!("websearch.rs");
+        let prod = full
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(full);
+        let fn_body = prod
+            .split("async fn decode_round")
+            .nth(1)
+            .expect("decode_round 不应被改名");
+        let fn_body = fn_body
+            .split("\nasync fn ")
+            .next()
+            .expect("split 至少一段");
+        let meta_arm = format!("{}::{}", "Event", "Metadata");
+        let mapper = ["map_metadata", "_stop_reason"].concat();
+        assert!(
+            fn_body.contains(&meta_arm),
+            "decode_round 必须消费 Metadata 帧（不能再 _ => 丢掉 stopReason）"
+        );
+        assert!(
+            fn_body.contains(&mapper),
+            "必须复用 map_metadata_stop_reason，禁止第二张映射表"
+        );
+    }
+
+    #[test]
+    fn apply_metadata_stop_override_empty_stays_none() {
+        let mut current = None;
+        apply_metadata_stop_override(&mut current, None);
+        assert!(current.is_none());
+        apply_metadata_stop_override(
+            &mut current,
+            crate::kiro::model::events::map_metadata_stop_reason(Some("  ")),
+        );
+        assert!(current.is_none());
+        apply_metadata_stop_override(
+            &mut current,
+            crate::kiro::model::events::map_metadata_stop_reason(None),
+        );
+        assert!(current.is_none());
+    }
+
+    #[test]
+    fn apply_metadata_stop_override_sets_mapped_reason() {
+        let mut current = None;
+        apply_metadata_stop_override(
+            &mut current,
+            crate::kiro::model::events::map_metadata_stop_reason(Some("end_turn")),
+        );
+        assert_eq!(current.as_deref(), Some("end_turn"));
+        apply_metadata_stop_override(
+            &mut current,
+            crate::kiro::model::events::map_metadata_stop_reason(Some("pause_turn")),
+        );
+        assert_eq!(current.as_deref(), Some("pause_turn"));
+    }
+
+    #[test]
+    fn apply_metadata_stop_override_does_not_clobber_specific() {
+        let mut current = Some("max_tokens".to_string());
+        apply_metadata_stop_override(
+            &mut current,
+            crate::kiro::model::events::map_metadata_stop_reason(Some("end_turn")),
+        );
+        assert_eq!(current.as_deref(), Some("max_tokens"));
+
+        let mut current = Some("model_context_window_exceeded".to_string());
+        apply_metadata_stop_override(
+            &mut current,
+            crate::kiro::model::events::map_metadata_stop_reason(Some("end_turn")),
+        );
+        assert_eq!(
+            current.as_deref(),
+            Some("model_context_window_exceeded")
         );
     }
 

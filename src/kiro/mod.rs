@@ -3,7 +3,6 @@
 pub mod affinity;
 pub mod auth;
 pub mod cooldown;
-pub mod deepseek_schema;
 pub mod diagnosis;
 pub mod endpoint;
 pub mod endpoint_health;

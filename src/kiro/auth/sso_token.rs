@@ -62,6 +62,18 @@ pub struct SsoTokenExchangeResult {
     pub email: Option<String>,
 }
 
+/// SSO 导入的 refreshToken 闸：缺字段 / 空串 / 纯空白一律拒绝。
+///
+/// 轮询 HTTP 200 但未给 refreshToken 时，若继续入池会得到 `refresh_token: None`
+/// 的 IdC 号，之后无法刷新。fail-closed：不产出、不落盘。
+pub(crate) fn require_sso_refresh_token(refresh: &str) -> anyhow::Result<&str> {
+    let t = refresh.trim();
+    if t.is_empty() {
+        bail!("SSO 未返回 refreshToken，拒绝导入不可刷新的凭据");
+    }
+    Ok(t)
+}
+
 /// 粘贴的 SSO Token 清洗（纯函数，可单测）。
 ///
 /// 规则（fail-closed）：
@@ -377,7 +389,8 @@ async fn poll_for_token(
                 .as_str()
                 .ok_or_else(|| anyhow!("SSO token 轮询响应缺少 accessToken"))?
                 .to_string();
-            let refresh = data["refreshToken"].as_str().unwrap_or("").to_string();
+            let refresh = require_sso_refresh_token(data["refreshToken"].as_str().unwrap_or(""))?
+                .to_string();
             let expires_in = data["expiresIn"].as_i64().unwrap_or(0);
             return Ok((access, refresh, expires_in));
         }
@@ -485,6 +498,8 @@ pub async fn exchange_sso_token(
         proxy,
     )
     .await?;
+    // 入池闸：缺 refreshToken 的号无法刷新，拒绝产出（poll 已闸一次，这里再守公开入口）。
+    require_sso_refresh_token(&refresh_token)?;
 
     // best-effort 解析 email（展示 + 幂等判重用，失败不阻断）。
     let email = fetch_account_email(&access_token, region, config, proxy).await;
@@ -680,7 +695,8 @@ mod tests {
 
     #[test]
     fn built_credential_without_refresh_token_or_expiry() {
-        // 上游未返回 refreshToken（异常形态）→ 字段为 None 而非空串；expires_in=0 → 无过期时间。
+        // 构造层防御：空 refresh → None（不写空串）；expires_in=0 → 无过期时间。
+        // 入池路径必须先走 require_sso_refresh_token，不会把这种号落盘。
         let exchange = SsoTokenExchangeResult {
             access_token: "at".to_string(),
             refresh_token: String::new(),
@@ -692,5 +708,17 @@ mod tests {
         let cred = build_idc_credential_from_sso(&exchange, "us-east-1", 0, None);
         assert!(cred.refresh_token.is_none());
         assert!(cred.expires_at.is_none());
+    }
+
+    #[test]
+    fn require_sso_refresh_token_rejects_empty_or_blank() {
+        for raw in ["", "   ", "\t", "\n"] {
+            let err = require_sso_refresh_token(raw).unwrap_err().to_string();
+            assert!(
+                err.contains("refreshToken") && err.contains("不可刷新"),
+                "unexpected error for {raw:?}: {err}"
+            );
+        }
+        assert_eq!(require_sso_refresh_token("  rt  ").unwrap(), "rt");
     }
 }

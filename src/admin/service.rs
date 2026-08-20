@@ -42,6 +42,13 @@ use super::types::{
 use crate::kiro::auth::social::OAuthCallbackData;
 use crate::usage::TraceDb;
 
+#[path = "insight.rs"]
+mod insight;
+use insight::build_insight_text;
+#[path = "ksk_import.rs"]
+mod ksk_import;
+use ksk_import::{apply_ksk_region_suffix, clean_ksk_api_key};
+
 /// SSO Token 导入结果（`POST /api/admin/credentials/import-sso`）。
 pub struct ImportSsoTokenResult {
     pub credential_id: u64,
@@ -365,61 +372,6 @@ pub struct LiveCred {
     pub health_score: f64,
 }
 
-/// 根据 rpm / 冷却状态推断中文限流文案（纯本地计算，零上游）。
-///
-/// `gate_active`：RPM 硬门在当前配置下是否真的参与调度（balanced 模式 + 池号数 >1，
-/// 见 `MultiTokenManager::rpm_saturation_gate_active`）。硬门不生效时即便 rpm 已经
-/// 超过 `rpm_limit`，这个阈值对调度也没有拦截力——继续说"建议分流"会让人以为网关在
-/// 限制自己，真实原因通常是上游账户级限流（如 USER_REQUEST_RATE_EXCEEDED），应改口
-/// 引导去加号/降并发，而不是"分流"（priority 模式/单号池根本没有分流对象）。
-fn build_insight_text(
-    id: u64,
-    rpm: u32,
-    rpm_limit: u32,
-    saturated: bool,
-    gate_active: bool,
-    disabled: bool,
-    cooldown: Option<&crate::kiro::cooldown::CooldownInfo>,
-) -> String {
-    use crate::kiro::cooldown::CooldownReason;
-
-    if disabled {
-        return format!("#{id} 已禁用（不参与调度）");
-    }
-
-    if let Some(c) = cooldown {
-        // 向上取整到秒，避免展示"剩 0s"却仍在冷却
-        let secs = c.remaining_ms.div_ceil(1000);
-        if c.reason == CooldownReason::RateLimitExceeded {
-            return format!(
-                "#{id} 冷却中（速率限制）剩{secs}s，已触发{}次",
-                c.trigger_count
-            );
-        }
-        return format!("#{id} 冷却中（{}）剩{secs}s", c.reason.description());
-    }
-
-    if saturated {
-        // 调用方保证 saturated=true 时 gate_active 也为 true（saturated 已在上游
-        // 与 gate_active 做过 &&），这里的 gate_active 分支只是让语义自文档化，
-        // 不依赖调用方的隐式约束。
-        return if gate_active {
-            format!("#{id} 近60s {rpm}/{rpm_limit} 已达软上限，建议分流")
-        } else {
-            format!("#{id} 近60s {rpm}/{rpm_limit} 超过软上限，但当前调度模式下无分流对象，疑似上游账户级限流，建议加号或降低并发")
-        };
-    }
-    // 接近软上限（>=80%）也提示，便于提前分流；硬门不生效时同理改口，不建议"分流"。
-    if rpm_limit > 0 && (rpm as u64) * 5 >= (rpm_limit as u64) * 4 {
-        return if gate_active {
-            format!("#{id} 近60s {rpm}/{rpm_limit} 接近软上限，建议分流")
-        } else {
-            format!("#{id} 近60s {rpm}/{rpm_limit} 接近软上限，但当前调度模式下无分流对象，建议关注上游限流")
-        };
-    }
-    "畅通".to_string()
-}
-
 /// Admin 服务
 ///
 /// 封装所有 Admin API 的业务逻辑
@@ -491,87 +443,6 @@ pub struct AdminService {
     /// 健康探测轮次的 round-robin 起点轮转（每轮 +1，取模落到池内启用节点上，
     /// 避免每轮都从第一个节点开始——长时间运行后首个节点永远先被探测）。
     socks_health_round: std::sync::atomic::AtomicU64,
-}
-
-/// 清洗粘贴进来的 Kiro API Key（`ksk_`）：截取 `ksk_` 起、去首尾空白与包裹引号/逗号。
-///
-/// 移植自 k2cc-proxy（`admin/service.rs:346`）。实测用户会把 `"key: ksk_xxx"` 整段贴进
-/// 表单，不清洗会同时破坏 region 探测（坏 key）与去重（同一 key 不同前缀可重复导入）。
-/// 空串归一为 `None`（与 k2cc 的 `.filter(!is_empty)` 同语义，交给下游「必须提供」报错）。
-///
-/// Kiro-Go `ksk_…|region`：恰好一段 `|` 且后缀命中 region 白名单时，返回 key 本体；
-/// 后缀由 [`apply_ksk_region_suffix`] 写入已有的 `api_region`（请求已带则不覆盖）。
-fn clean_ksk_api_key(raw: &str) -> Option<String> {
-    peel_ksk_paste(raw).map(|(key, _region)| key)
-}
-
-/// 从粘贴噪声里取出 `ksk_` 本体，以及可选的 `|region` 后缀。
-fn peel_ksk_paste(raw: &str) -> Option<(String, Option<String>)> {
-    let s = raw.trim().trim_matches(|c| c == '"' || c == '\'' || c == ',');
-    let (out, had_ksk) = match s.find("ksk_") {
-        Some(i) => {
-            // ⚠️ `s[i..]` 之后要再剥一次包裹引号/逗号：`"key: 'ksk_abc123'"` 经外层
-            // trim_matches 后 s = `key: 'ksk_abc123'`，直接 `s[i..]` 会留下尾引号
-            // `ksk_abc123'` → key 污染 → region 探测恒 403。
-            (
-                s[i..]
-                    .trim()
-                    .trim_matches(|c| c == '"' || c == '\'' || c == ',')
-                    .to_string(),
-                true,
-            )
-        }
-        None => (s.to_string(), false),
-    };
-    if out.is_empty() {
-        return None;
-    }
-    if had_ksk {
-        let (key, region) = split_ksk_region_suffix(&out);
-        Some((key.to_string(), region.map(str::to_string)))
-    } else {
-        Some((out, None))
-    }
-}
-
-/// 仅当恰好一段 `|` 且后缀是已知 region 时才拆；否则整段当 key。
-fn split_ksk_region_suffix(key: &str) -> (&str, Option<&str>) {
-    let Some((left, right)) = key.split_once('|') else {
-        return (key, None);
-    };
-    if left.contains('|') || right.contains('|') {
-        return (key, None);
-    }
-    let left = left.trim();
-    let right = right.trim();
-    if left.is_empty() || right.is_empty() {
-        return (key, None);
-    }
-    if KiroCredentials::is_supported_region(right) {
-        (left, Some(right))
-    } else {
-        (key, None)
-    }
-}
-
-fn ksk_region_suffix(raw: &str) -> Option<String> {
-    peel_ksk_paste(raw).and_then(|(_, region)| region)
-}
-
-/// `ksk_xxx|eu-central-1` 在请求未带 `api_region` 时写入该字段；已有非空值不覆盖。
-fn apply_ksk_region_suffix(req: &mut AddCredentialRequest) {
-    let already = req
-        .api_region
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .is_some();
-    if already {
-        return;
-    }
-    if let Some(region) = req.kiro_api_key.as_deref().and_then(ksk_region_suffix) {
-        req.api_region = Some(region);
-    }
 }
 
 /// 写盘前把当前 config.json 轮换为备份（保留 3 份：`config.json.bak`、
@@ -1055,6 +926,7 @@ impl AdminService {
     ///   clientSecret 引到攻击者主机）。
     /// - 同一邮箱的 idc 号已在池中 → `DuplicateCredential`（SSO 每次导入都换出
     ///   不同的 refreshToken，哈希判重抓不住重复，email 是账号级稳定指纹）。
+    /// - 换号结果缺 refreshToken → `InvalidCredential`（拒绝落盘不可刷新号）。
     pub async fn import_sso_token(
         &self,
         token: String,
@@ -1064,6 +936,7 @@ impl AdminService {
     ) -> Result<ImportSsoTokenResult, AdminServiceError> {
         use crate::kiro::auth::sso_token::{
             build_idc_credential_from_sso, exchange_sso_token, find_duplicate_idc_email,
+            require_sso_refresh_token,
         };
 
         let region = region
@@ -1102,6 +975,10 @@ impl AdminService {
         let exchange = exchange_sso_token(&token, &region, &config, proxy.as_ref())
             .await
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+        // 落盘闸：exchange 成功但 refresh 仍空时不得 add_credential（不可刷新死号）。
+        if let Err(e) = require_sso_refresh_token(&exchange.refresh_token) {
+            return Err(AdminServiceError::InvalidCredential(e.to_string()));
+        }
 
         // 幂等判重:同邮箱 idc 号已在池 → 拒绝重复导入(email 大小写不敏感)。
         if let Some(email) = exchange.email.as_deref() {
@@ -7316,102 +7193,6 @@ impl AdminService {
 }
 
 #[cfg(test)]
-mod insight_text_tests {
-    use super::*;
-    use crate::kiro::cooldown::{CooldownInfo, CooldownReason};
-
-    /// 无冷却 + 未饱和 → "畅通"
-    #[test]
-    fn insight_clear() {
-        assert_eq!(build_insight_text(1, 3, 50, false, true, false, None), "畅通");
-    }
-
-    /// 速率限制冷却中：含"冷却中（速率限制）剩Ns，已触发K次"，剩余毫秒向上取整到秒
-    #[test]
-    fn insight_rate_limit_cooldown() {
-        let cd = CooldownInfo {
-            credential_id: 54,
-            reason: CooldownReason::RateLimitExceeded,
-            started_at_ms: 0,
-            remaining_ms: 21_500, // 向上取整应为 22s
-            trigger_count: 3,
-        };
-        let text = build_insight_text(54, 40, 50, false, true, false, Some(&cd));
-        assert_eq!(text, "#54 冷却中（速率限制）剩22s，已触发3次");
-    }
-
-    /// 非速率限制冷却：走通用分支（不带触发次数）
-    #[test]
-    fn insight_other_cooldown() {
-        let cd = CooldownInfo {
-            credential_id: 7,
-            reason: CooldownReason::ServerError,
-            started_at_ms: 0,
-            remaining_ms: 5_000,
-            trigger_count: 1,
-        };
-        let text = build_insight_text(7, 0, 50, false, true, false, Some(&cd));
-        assert_eq!(text, "#7 冷却中（服务器错误）剩5s");
-    }
-
-    /// 已达软上限 + 硬门生效(balanced+池>1) → "已达软上限，建议分流"
-    #[test]
-    fn insight_saturated_gate_active() {
-        let text = build_insight_text(54, 50, 50, true, true, false, None);
-        assert_eq!(text, "#54 近60s 50/50 已达软上限，建议分流");
-    }
-
-    /// 接近软上限（>=80%）+ 硬门生效 → "接近软上限，建议分流"
-    #[test]
-    fn insight_near_saturation_gate_active() {
-        // 40/50 = 80%
-        let text = build_insight_text(54, 40, 50, false, true, false, None);
-        assert_eq!(text, "#54 近60s 40/50 接近软上限，建议分流");
-    }
-
-    /// rpm_limit=0（不限制）时永不判为接近上限，恒"畅通"（与 gate_active 无关）
-    #[test]
-    fn insight_no_limit_always_clear() {
-        assert_eq!(build_insight_text(9, 999, 0, false, true, false, None), "畅通");
-        assert_eq!(build_insight_text(9, 999, 0, false, false, false, None), "畅通");
-    }
-
-    /// ⭐回归(#虚假饱和告警)：硬门不生效(priority 模式 / 单号池)时，即便 rpm 已达/超过
-    /// 阈值，也不能再说"建议分流"——priority 模式下这个阈值对调度没有任何拦截力,
-    /// "分流"这个词本身就是误导(根本没有第二个号可分)。改口引导去查上游账户级限流。
-    /// 旧代码里 `saturated` 参数一旦为 true 就无条件走"已达软上限，建议分流"分支，
-    /// 与 gate_active 完全无关——本测试对着新签名传 gate_active=false 会触发新分支，
-    /// 证明新逻辑确实按 gate_active 分岔（旧函数体没有这个参数，编译都过不了，
-    /// 这本身就是最强的"旧代码会失败"证据：旧调用点全是 6 个参数）。
-    #[test]
-    fn insight_saturated_but_gate_inactive_does_not_say_spillover() {
-        let text = build_insight_text(54, 51, 25, true, false, false, None);
-        assert_eq!(
-            text,
-            "#54 近60s 51/25 超过软上限，但当前调度模式下无分流对象，疑似上游账户级限流，建议加号或降低并发"
-        );
-        assert!(!text.contains("建议分流"), "硬门未生效时绝不能出现\"建议分流\"字样: {text}");
-    }
-
-    /// 同理:接近软上限但硬门未生效，也不该说"建议分流"。
-    #[test]
-    fn insight_near_saturation_but_gate_inactive_does_not_say_spillover() {
-        let text = build_insight_text(54, 20, 25, false, false, false, None);
-        assert!(!text.contains("建议分流"), "硬门未生效时接近上限也不该建议分流: {text}");
-        assert!(text.contains("接近软上限"), "仍应保留接近上限的事实描述: {text}");
-    }
-
-    /// 已禁用号:显示"已禁用"而非"畅通"(即便有 RPM/未冷却)
-    #[test]
-    fn insight_disabled() {
-        assert_eq!(
-            build_insight_text(54, 0, 50, false, true, true, None),
-            "#54 已禁用（不参与调度）"
-        );
-    }
-}
-
-#[cfg(test)]
 mod multi_open_copies_tests {
     //! 多开份数归一。份数是**外部可控输入**且直接决定本次请求会建多少条凭据，
     //! 故硬上限必须有测试锁住 —— 去掉 clamp 后 `copies_above_cap_is_clamped` 必失败。
@@ -12029,125 +11810,6 @@ mod cleanup_disabled_tests {
         let preview: CleanupDisabledRequest =
             serde_json::from_str(r#"{"dryRun":true}"#).expect("camelCase 应能解析");
         assert!(preview.dry_run);
-    }
-}
-
-#[cfg(test)]
-mod ksk_clean_tests {
-    use super::*;
-
-    /// 清洗：引号/逗号/首尾空白/`ksk_` 前的噪声都要剥掉，干净的 key 原样保留。
-    #[test]
-    fn clean_ksk_api_key_strips_paste_noise() {
-        // 干净 key 原样
-        assert_eq!(clean_ksk_api_key("ksk_abc123"), Some("ksk_abc123".into()));
-        // 首尾空白
-        assert_eq!(clean_ksk_api_key("  ksk_abc123  "), Some("ksk_abc123".into()));
-        // 整段 `"key: ksk_xxx"` 粘贴（k2cc 实测踩过的形态）
-        assert_eq!(
-            clean_ksk_api_key("\"key: ksk_abc123\""),
-            Some("ksk_abc123".into())
-        );
-        // 单引号 + 逗号包裹
-        assert_eq!(clean_ksk_api_key("'ksk_abc123',"), Some("ksk_abc123".into()));
-        // 🔴 回归：`"key: 'ksk_abc123'"`（前缀 + 内层单引号）→ 之前尾引号残留成 `ksk_abc123'`
-        assert_eq!(
-            clean_ksk_api_key("\"key: 'ksk_abc123'\""),
-            Some("ksk_abc123".into())
-        );
-        // `ksk_` 前有任意前缀 → 从 ksk_ 起截取（与 k2cc 逐字一致：`s[i..].trim()`，
-        // 只去前缀噪声，`ksk_` 之后的内容原样保留）
-        assert_eq!(
-            clean_ksk_api_key("some noise here ksk_abc123 trailing"),
-            Some("ksk_abc123 trailing".into())
-        );
-        // 非 ksk_ 值：原样（不透写，不改行为）
-        assert_eq!(clean_ksk_api_key("refresh_token_value"), Some("refresh_token_value".into()));
-        // 纯噪声/空白 → None（交给下游「必须提供 kiroApiKey」报错，与 k2cc 同语义）
-        assert_eq!(clean_ksk_api_key("   "), None);
-        assert_eq!(clean_ksk_api_key("\"\","), None);
-    }
-
-    /// Kiro-Go `ksk_key|region`：只拆恰好一段 `|` + 白名单 region。
-    #[test]
-    fn clean_ksk_api_key_splits_pipe_region() {
-        assert_eq!(
-            clean_ksk_api_key("ksk_abc123|eu-central-1"),
-            Some("ksk_abc123".into())
-        );
-        assert_eq!(
-            ksk_region_suffix("ksk_abc123|eu-central-1").as_deref(),
-            Some("eu-central-1")
-        );
-        assert_eq!(
-            ksk_region_suffix("\"key: ksk_abc123|eu-central-1\"").as_deref(),
-            Some("eu-central-1")
-        );
-        // 未知 region / 多段 `|` / 非 ksk_：不拆
-        assert_eq!(
-            clean_ksk_api_key("ksk_abc123|not-a-region"),
-            Some("ksk_abc123|not-a-region".into())
-        );
-        assert!(ksk_region_suffix("ksk_abc123|not-a-region").is_none());
-        assert_eq!(
-            clean_ksk_api_key("ksk_ab|c|eu-central-1"),
-            Some("ksk_ab|c|eu-central-1".into())
-        );
-        assert!(ksk_region_suffix("refresh_token_value|eu-central-1").is_none());
-        assert_eq!(
-            clean_ksk_api_key("ksk_abc123| eu-central-1 "),
-            Some("ksk_abc123".into())
-        );
-    }
-
-    /// `|region` 只在 `api_region` 为空时写入；请求已带则保留。
-    #[test]
-    fn clean_ksk_apply_pipe_region_only_when_api_region_empty() {
-        let mut req = AddCredentialRequest {
-            kiro_api_key: Some("ksk_abc123|eu-central-1".into()),
-            ..Default::default()
-        };
-        apply_ksk_region_suffix(&mut req);
-        assert_eq!(req.api_region.as_deref(), Some("eu-central-1"));
-        req.kiro_api_key = req.kiro_api_key.as_deref().and_then(clean_ksk_api_key);
-        assert_eq!(req.kiro_api_key.as_deref(), Some("ksk_abc123"));
-
-        let mut req = AddCredentialRequest {
-            kiro_api_key: Some("ksk_abc123|eu-central-1".into()),
-            api_region: Some("us-east-1".into()),
-            ..Default::default()
-        };
-        apply_ksk_region_suffix(&mut req);
-        assert_eq!(req.api_region.as_deref(), Some("us-east-1"));
-
-        let mut req = AddCredentialRequest {
-            kiro_api_key: Some("ksk_abc123|eu-central-1".into()),
-            api_region: Some("  ".into()),
-            ..Default::default()
-        };
-        apply_ksk_region_suffix(&mut req);
-        assert_eq!(req.api_region.as_deref(), Some("eu-central-1"));
-    }
-
-    /// ⭐ 源码级守卫：`add_credential_with_intent` 入口必须对 `req.kiro_api_key` 应用清洗。
-    /// 回退即 FAIL：去掉清洗调用 → 本测试红。
-    /// 批量导入（import_one_key → add_credential）也走本函数，故一条守卫钉住两条路径。
-    #[test]
-    fn add_credential_entry_applies_ksk_cleaning() {
-        let src = include_str!("service.rs");
-        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
-        let prod = &src[..cut];
-        let needle = "req.kiro_api_key.as_deref().and_then(clean_ksk_api_key)";
-        assert!(
-            prod.contains(needle),
-            "add_credential_with_intent 入口必须清洗 kiro_api_key（ksk_ 截取 + 去噪声），\
-             否则粘贴 `\"key: ksk_xxx\"` 会破坏去重与 region 探测"
-        );
-        let region_needle = format!("{}{}", "apply_ksk_region_suffix(", "&mut req)");
-        assert!(
-            prod.contains(&region_needle),
-            "add_credential_with_intent 必须在清洗前把 ksk_|region 写入 api_region"
-        );
     }
 }
 
