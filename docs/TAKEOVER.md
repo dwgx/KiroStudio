@@ -12,7 +12,7 @@ HEAD:     59744cb   master = origin/master
 dirty:    是。禁止 reset / checkout / stash / 全仓 fmt
 tag:      v1.1.2 → 5f20596
 quality:  5a0e174 → origin/quality-up/after-v1.1.2
-origin:   https://github.com/dwgx/KiroStudio-skiapi.git
+origin:   https://github.com/dwgx/KiroStudio.git  （公开仓。旧 skiapi 私有仓弃用）
 ```
 
 快照用临时 `GIT_INDEX_FILE`。不要 stage：凭据、`config.json`、`.agent/`、`.grok/`、`.claude/`、`AGENTS.md`。不要推 `public` / gitee / master，除非 Owner 点名。不要改 tag `v1.1.2`。

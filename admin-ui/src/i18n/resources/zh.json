@@ -924,7 +924,7 @@
   "kb.model-unsupported.title": "请求的模型不被支持 / 被挡下",
   "kb.ota-check-fails.cause": "OTA 检查更新走 GitHub 私有仓库，需要环境变量 KIROSTUDIO_UPDATE_REPO / KIROSTUDIO_UPDATE_TOKEN（检测到令牌时只走 GitHub 直连、剔除第三方镜像，避免 PAT 交给中间人）。线上 update.env 的 token 为空，面板按钮必然失败。",
   "kb.ota-check-fails.problem": "面板点检查更新报错，或提示没有可用更新但明知有新版本。",
-  "kb.ota-check-fails.solution": "1. 确认线上 /etc/kirostudio/update.env 里已填 token（目前为空，是已知状态）。\\n2. 若要启用：在 GitHub 网页建 fine-grained PAT（只勾 dwgx/KiroStudio-skiapi，权限 Contents:read + Actions:read），填入并重启服务。\\n3. 在此之前用运维脚本 kirostudio-update 更新，功能等价。\\n4. 自动检查默认关（otaAutoCheck 开关在设置页，内存态）。",
+  "kb.ota-check-fails.solution": "1. OTA 默认读公开仓 dwgx/KiroStudio，不需要 token。\\n2. 确认没把 KIROSTUDIO_UPDATE_REPO 指到已弃用的私有仓。\\n3. 自动检查开关在设置页（otaAutoCheck，内存态，重启会回到配置）。",
   "kb.ota-check-fails.title": "面板「检查更新」一直失败",
   "kb.pit-ai-code-must-pass-ci.cause": "实测抓出的缺陷类型：raw string 内容以引号结尾导致提前闭合、/// 文档注释用在函数参数（Rust 不允许）、cap 触发后重入死循环、截断结果超出契约、测试 helper 喂裸字符串给需要 JSON 对象的函数。",
   "kb.pit-ai-code-must-pass-ci.problem": "agent 交付的代码报告里自称「逻辑自洽」，实际有 5 类真实缺陷，全靠 CI 抓出。",
