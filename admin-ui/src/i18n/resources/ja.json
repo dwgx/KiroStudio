@@ -1557,7 +1557,6 @@
   "overviewpage.legend.currentActive": "現在アクティブ",
   "overviewpage.legend.groupHue": "同色 = 同一アカウントグループ",
   "overviewpage.legend.processing": "処理中",
-  "overviewpage.orbit.availableTotal": "利用可 / 合計",
   "overviewpage.pool.availableOfTotal": "利用可能 {available} / 合計 {total}",
   "overviewpage.pool.title": "アカウントプールの状態",
   "overviewpage.poolview.bars": "ステータスバー",

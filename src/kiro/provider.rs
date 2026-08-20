@@ -21,112 +21,14 @@ use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
-/// 每个凭据的最大重试次数
-const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
+#[path = "retry_budget.rs"]
+mod retry_budget;
+pub use retry_budget::SharedRetryBudget;
+use retry_budget::{round_retry_quota, compute_max_retries, ABSOLUTE_MAX_TOTAL_RETRIES};
 
-/// 小号池阈值：号池 <= 此值时，每号重试次数降为 1（见 [`compute_max_retries`]）。
-/// 小池下重试只会反复砸同几个号，被限流时多打几次纯属加重冷却，不如各摸一次即透传。
-const SMALL_POOL_THRESHOLD: usize = 3;
-
-/// 总重试次数硬上限 —— 与 kiro.rs 对齐（4 次）。
-///
-/// 依据（最初定 12 时的推算；后 64→12→4 逐步收紧）：17 份分身共享 3 个上游账号，
-/// 摸 12 个并发分身 = 对同一账号连打 12 次，正是风控要抓的突发特征。高峰期多账号
-/// 同时触顶时，过多重试会在账号间连环撞墙、放大限流；被限时尽早返回而非耗尽配额。
-/// 配合 429 专用长退避（见 `retry_delay_throttle`），尽快把错误交还给客户端。
-///
-/// ⭐ 这个上限是「**每客户端请求**」，开启吸收层后也不变 —— 由 [`round_retry_quota`] 保证。
-///
-/// 曾经不是：`compute_max_retries` 在 `'absorb: loop` **之外**只算一次，而
-/// `'attempt: for attempt in 0..max_retries` 每个吸收轮都重跑一遍 ⇒ 每轮各拿一份完整 4 ⇒
-/// `upstreamRetryAbsorbMaxRounds=3` 时一条客户端请求最坏 (1+3)×4 = **16 次**上游调用、
-/// 同一出口 IP，正是把上限压到 4 想压住的突发特征被从另一头放回来。
-///
-/// 现在每轮的实际配额是 `min(基础配额, 本上限 − 跨轮已用)`，所以无论 `max_rounds`
-/// 填多大，单条客户端请求打向上游的总次数恒 ≤ 本值。守卫见
-/// `total_upstream_attempts_are_capped_per_request_not_per_round`。
-const ABSOLUTE_MAX_TOTAL_RETRIES: usize = 4;
-
-/// 每客户端请求的上游调用**共享预算**（2026-08-11 方案 A，RPM 放大治本）。
-///
-/// # 为什么必须有
-///
-/// `ABSOLUTE_MAX_TOTAL_RETRIES` 的「每请求」语义此前只约束**单次** `call_api_with_retry`
-/// 调用内：websearch 回灌**每一轮**（上限 5 轮）都重新走一遍完整 failover、压缩重试
-/// 每一轮同理、MCP 调用（`call_mcp_with_retry`，WebSearch 的搜索）与透传 failover
-/// 各自独立拿配额——一次客户端请求最坏可打 20+ 次上游。外部 30-50 RPM 因此放大成
-/// 500-1000+ 上游 RPM（用户实测观测），端点选错时每轮都失败、每轮都换号重试，放大
-/// 成倍。
-///
-/// # 语义
-///
-/// handler 层**每客户端请求创建一个**，沿整条调用链传递（主路径 failover / 压缩重试轮 /
-/// websearch 回灌轮含 MCP / 透传 failover 全部从同一预算扣）。预算耗尽后各层
-/// `round_retry_quota` 返回 0、failover 直接停止，错误上抛给客户端自己退避。
-/// 无论嵌套多少层，每请求上游调用恒 ≤ `ABSOLUTE_MAX_TOTAL_RETRIES`。
-///
-/// `remaining` 用 Mutex：同一请求内各层可能在并发任务中执行（如 websearch 轮次），
-/// 但任一时刻只有一层在扣（各层是串行 await 链），锁无竞争。
-///
-/// ⭐ **链内首选号**（N4 可观测）：`first_attempted_credential_id` 是整条客户端请求链
-/// **最先尝试**的凭据 ID，供失败/成功记录的 usage 埋点暴露「死号恒选」。
-/// 为什么挂在预算上：透传 failover（`try_custom_api_passthrough`）与 Kiro 主路径
-/// （`call_api_with_retry`）是 handlers 层的**两次独立调用**，各自只拿得到自己那一段的
-/// 选号信息 —— 而「透传先试了哪几个号」在透传全败返回 `None` 时随返回值一起丢失。
-/// 预算沿整条链传递（handler 每请求创建一份），是最小的跨层携带通道：
-/// 透传首跳先写（首写生效），Kiro 主路径首个选中的号兜底，`fail_record` 读同一份。
-#[derive(Debug)]
-pub struct SharedRetryBudget {
-    remaining: std::sync::Mutex<u32>,
-    /// 整条请求链最先尝试的凭据 ID（首写生效；None = 链内尚未选中任何凭据）。
-    first_attempted_credential_id: std::sync::Mutex<Option<u64>>,
-}
-
-impl SharedRetryBudget {
-    pub fn new() -> Self {
-        Self {
-            remaining: std::sync::Mutex::new(ABSOLUTE_MAX_TOTAL_RETRIES as u32),
-            first_attempted_credential_id: std::sync::Mutex::new(None),
-        }
-    }
-
-    /// 当前剩余额度（配额计算输入：每轮 `min(base, remaining)`）。
-    pub fn remaining(&self) -> u32 {
-        *self.remaining.lock().unwrap()
-    }
-
-    /// 已用量（`round_retry_quota(base, attempts_before)` 的实参语义是「已完成的尝试次数」，
-    /// 不是剩余量——传剩余会把语义反转：耗尽时 remaining=0 被当成「还没用」而拿满配额）。
-    pub fn used(&self) -> u32 {
-        (ABSOLUTE_MAX_TOTAL_RETRIES as u32).saturating_sub(self.remaining())
-    }
-
-    /// 一次真实上游调用后扣减（无论成败——打了就是打了）。
-    pub fn consume(&self, n: u32) {
-        let mut r = self.remaining.lock().unwrap();
-        *r = r.saturating_sub(n);
-    }
-
-    /// 记录链内最先尝试的凭据 ID（**首写生效**：已有值不再覆盖，保证
-    /// 「透传首跳 → Kiro 首跳」的先后顺序语义 —— 先跑的那层拥有槽位）。
-    pub fn note_first_attempt(&self, id: u64) {
-        let mut f = self.first_attempted_credential_id.lock().unwrap();
-        if f.is_none() {
-            *f = Some(id);
-        }
-    }
-
-    /// 链内最先尝试的凭据 ID（`None` = 链内尚未选中任何凭据）。
-    pub fn first_attempted(&self) -> Option<u64> {
-        *self.first_attempted_credential_id.lock().unwrap()
-    }
-}
-
-impl Default for SharedRetryBudget {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+#[path = "absorb_policy.rs"]
+mod absorb_policy;
+use absorb_policy::{AbsorbPolicy, should_start_another_round};
 
 /// 🔴 **透传（custom_api）路径单请求的最大换号次数**。
 ///
@@ -237,329 +139,6 @@ const MCP_DIRECT_NEG_CACHE_TTL: Duration = Duration::from_secs(60);
 /// 上游修好、或部署方改了配置后，过期即自动重试，无需人工介入也无需重启。
 const PROTOCOL_BROKEN_TTL: Duration = Duration::from_secs(1800);
 
-/// 吸收层一轮最坏「能跑出结果」的时长下限。
-///
-/// 取值等于 token_manager 的 `MAX_TRANSIENT_WAIT_SECS`（20s）而非另造一个数字：全池只是临时
-/// 冷却时 `acquire_context` 最多在网关内等 20s 才 bail，因此**剩余预算不足 20s 的一轮，结构上
-/// 只可能在 transient wait 里烧完再返回同一个 429** —— 白打一轮上游、客户端白等。
-///
-/// 这是设计评审 BLOCKER 9 的修法：判据必须是「剩余 ≥ 退避 + 一轮最坏耗时」，而不是
-/// 「剩余 ≥ 退避下限」。后者会让第 2 轮必然在半路被 deadline 砍断。
-const ABSORB_MIN_USEFUL_ROUND_SECS: u64 = 20;
-
-/// 退避的**绝对下限**。`maxDelaySecs=0` 经 API 可写（配置层对它无 clamp），而 0 退避会
-/// 让吸收循环退化成无 sleep 的 `continue` —— 忙等死循环，打满一核且请求永不返回。
-/// 50ms 取自号池冷却的实测最快恢复量级（远小于外置 shield 硬编码的 1s）。
-const ABSORB_MIN_BACKOFF: Duration = Duration::from_millis(50);
-
-/// 内置「上游 429 吸收层」的运行时策略快照（每次调用从 config 的 ArcSwap 取一份）。
-///
-/// 不做 TIER3 进程级 static：吸收层在 provider 内，`token_manager.config()` 本身就是 ArcSwap，
-/// admin 存盘后 `reload_config` 原子换入即生效 —— 少一层镜像就少 6 个可写错点。
-///
-/// # 快照粒度：一次函数调用一份，不是一条客户端请求一份（2026-08-14 标注）
-///
-/// 各调用点保证在**函数内只取一份**并贯穿全函数：主路径在吸收循环外取、
-/// 透传在 failover 循环外取。但**请求级一致**（同一条客户端请求的所有调用点共用
-/// 同一份策略）需要上层下传：透传失败后落主路径、以及 WebSearch 每轮重进
-/// `call_api_stream`，都会在各自函数入口各取一份新快照 —— 两处之间若恰好热更，
-/// 同一条请求会混用两代策略。修法属 handler 层（请求入口构造一份下传，或挂到
-/// 每请求共享的 `SharedRetryBudget` 上），不在本文件范围，此处仅记录边界。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct AbsorbPolicy {
-    enabled: bool,
-    budget: Duration,
-    max_rounds: u32,
-    min_delay: Duration,
-    max_delay: Duration,
-    /// 是否吸收 403 账户级临时风控（= 外挂所称的「换号空窗」）。**必须存进快照**而不是在
-    /// 循环里重新 `config()`：一次调用内只取一份策略，否则 admin 在两轮之间热更会让同一条
-    /// 请求前后按不同策略走（前半轮用旧 max_rounds、后半轮用新 suspended 判据），
-    /// 行为不可复现也不可测试。
-    absorb_suspended: bool,
-    /// 是否吸收上游 5xx。默认 false（见 `upstream_retry_absorb_server_error`）。
-    absorb_server_error: bool,
-    /// 是否吸收带瞬态标记的 400（模型容量）。默认 false。
-    absorb_capacity_400: bool,
-    /// 换号空窗的**独立预算**。`ZERO` = 未启用 ⇒ 该类沿用总预算与 min_delay 指数曲线
-    /// （逐字节等于本字段引入前的行为）。非零时该类换成 20/40/60s 长阶梯 + 独立 deadline。
-    swap_budget: Duration,
-    /// 预算耗尽时是否给错误串打 `absorb_budget_exhausted=1`（让 handlers 渲染成 503）。
-    /// 默认 false（状态码保持透传 429）。
-    exhausted_as_503: bool,
-}
-
-/// 换号空窗的退避阶梯（秒），逐字取自外挂 `kiro_shield.py` 的 `SWAP_BACKOFF`。
-///
-/// 为什么是这三档而不是继续用指数：外挂注释里那句「**绝不能用限速那套 1 秒退避** ——
-/// 那是拿一个已被封的账号去猛打上游，只会加重风控」是本阶梯存在的全部理由。空窗实测约
-/// 10 分钟，20s 起步、封顶 60s 意味着一条请求最多问上游十几次，而 1s 起的指数在同样时长内
-/// 会问上百次。超出表长的轮次取最后一档（60s）。
-const SWAP_WINDOW_BACKOFF_SECS: [u64; 3] = [20, 40, 60];
-
-impl AbsorbPolicy {
-    fn from_config(cfg: &crate::model::config::Config) -> Self {
-        // 403 临时风控的额外轮次**硬钉为 1**（不是沿用 max_rounds）：`config.self_heal_base_backoff_secs（默认 60s）`
-        // 存在的意义就是停止向刚 403 的账号试探，而 403 是**账号级**的 —— 换号只是把同一个
-        // 被惩罚账号走多遍，扩大受害面而非提高成功率。UI 文案也标注了「与自愈退避冲突」。
-        let swap_budget = Duration::from_secs(cfg.upstream_retry_absorb_swap_budget_secs);
-        // ⭐ 「钉 1」的**前提**是短退避：15s 内重打同一个刚被风控的账号会抵消
-        // `config.self_heal_base_backoff_secs（默认 60s）=60s`（那条退避存在的意义就是停止试探）。
-        // 设了 swap 预算后该类走 20/40/60s 长阶梯 —— 最短一档就是 20s，前提不再成立，
-        // 于是解除钉 1，交回 `max_rounds` + 独立 deadline + `ABSOLUTE_MAX_TOTAL_RETRIES` 三道闸。
-        //
-        // 不解除的话这个旋钮基本没用：钉 1 时它只能把**一次**重试推迟到 20s 后，
-        // 而空窗实测 10 分钟 ⇒ 那一次几乎必然还在窗口内 ⇒ 白等 20s 拿同一个 403。
-        let max_rounds = if cfg.upstream_retry_absorb_suspended && swap_budget.is_zero() {
-            cfg.upstream_retry_absorb_max_rounds.min(1)
-        } else {
-            cfg.upstream_retry_absorb_max_rounds
-        };
-        // ⭐ 两道归一化，顺序不能换。两者都是**下限**方向，因为 `backoff()` 末尾是
-        // `d.clamp(min_delay, max_delay)` —— 决定「会不会返 0」的是 `min_delay`（下界），
-        // 不是 `max_delay`。
-        //
-        // ① `min_delay` 抬到 `ABSORB_MIN_BACKOFF`。`minDelayMs=0` 经 Admin API 可写
-        //    （`service.rs` 对这两个字段无任何 clamp），而下界为 0 时 `clamp` 不会抬起
-        //    任何东西 → `PoolCooldown(0)` 直接返 `Duration::ZERO` → 吸收循环变成无 sleep
-        //    的 `continue` = 忙等死循环（`acquire_context` 那次 CPU 打满一核、请求永不
-        //    返回正是这个形态）。⚠️ 这条缺陷**在本批之前就存在**（deploy tip 的
-        //    `from_config` 同样不给 `min_delay` 下限），不是新引入的。
-        //
-        // ② `max_delay` 再抬到不低于 `min_delay`。`d.clamp(min, max)` 在 `min > max` 时是
-        //    **panic**（std 契约），而两个字段来自面板上两个独立数字框（毫秒 vs 秒），
-        //    `minDelayMs=60000` 配 `maxDelaySecs=1` 一次手滑即可配出 —— 那会让此后每个
-        //    429 都在请求热路径上 panic。
-        //
-        //    方向取「抬 max 到 min」而不是「压 min 到 max」：矛盾配置下宁可**退避更久**。
-        //    退避久的后果是 `should_start_another_round`（要求剩余 > 退避 + 20s）判不通过
-        //    ⇒ 吸收层不干活、回落旧行为；而退避短的后果是对一个还在冷却的号池连打，
-        //    正是吸收层要避免的事。前者安全，后者有害。
-        //
-        // 都用归一化而非拒绝保存：退避窗退化成一个点仍是可用行为，而拒绝保存会把一个
-        // 能自愈的配置错误变成运维事故。不变式由构造保证 ⇒ 可用纯函数单测钉死。
-        let min_delay =
-            Duration::from_millis(cfg.upstream_retry_absorb_min_delay_ms).max(ABSORB_MIN_BACKOFF);
-        let max_delay =
-            Duration::from_secs(cfg.upstream_retry_absorb_max_delay_secs).max(min_delay);
-        Self {
-            enabled: cfg.upstream_retry_absorb_enabled,
-            // ⭐ 总预算**下限是 45s**（`MAX_REQUEST_RETRY_BUDGET_SECS`），不是面板允许的 1s。
-            //
-            // 因为 `round_budget()` 用 `min(45s, 剩余预算)` 夹每一轮的 failover 墙钟，
-            // 所以这个「吸收层的」旋钮会反向支配**既有的** failover 重试预算：
-            // 填 5s ⇒ 第 0 轮（也就是关掉吸收层时唯一的那一轮）的换号墙钟从 45s 变成 5s
-            // ⇒ 正常换号重试被截断。运维填小值的动机恰恰是「想压住客户端延迟」，
-            // 而实际后果是把与吸收层无关的重试也砍了 —— 面板上完全看不出这层耦合。
-            //
-            // 抬到 45s 后语义变干净：这个旋钮只能决定**多给几轮**，
-            // 永远不会让单轮比关掉吸收层时更短。
-            budget: Duration::from_secs(cfg.upstream_retry_absorb_budget_secs)
-                .max(Duration::from_secs(MAX_REQUEST_RETRY_BUDGET_SECS)),
-            max_rounds,
-            min_delay,
-            max_delay,
-            absorb_suspended: cfg.upstream_retry_absorb_suspended,
-            absorb_server_error: cfg.upstream_retry_absorb_server_error,
-            absorb_capacity_400: cfg.upstream_retry_absorb_capacity_400,
-            swap_budget,
-            // 只认精确的 503。其它值（含裸 `#[serde(default)]` 会给的 0）一律按 429 处理：
-            // 这个开关的语义是「要不要为 Cursor 让步」，不是「随便填个状态码」——
-            // 让 provider 打一个 handlers 认不出的标记只会造成静默的行为分叉。
-            exhausted_as_503: cfg.upstream_retry_absorb_exhausted_status == 503,
-        }
-    }
-
-    /// 该类别当前是否被允许吸收（各类别的独立开关）。
-    ///
-    /// 抽成纯函数而不是在循环里散写 `if`：三个新类别各有一个开关，散写必然漏一处，
-    /// 而漏掉的那一处的表现是「默认关的类别其实在吸收」—— 正是硬约束里最不能出的错。
-    /// 纯函数可用单测把「默认配置下三个新类别一律不吸收」钉死。
-    fn class_allowed(&self, class: crate::anthropic::AbsorbClass) -> bool {
-        use crate::anthropic::AbsorbClass;
-        match class {
-            // 这两类是吸收层原本就在做的事，跟着总开关走。
-            AbsorbClass::PoolCooldown(_) | AbsorbClass::UpstreamRateLimit => true,
-            AbsorbClass::SwapWindow => self.absorb_suspended,
-            AbsorbClass::TransientServerError => self.absorb_server_error,
-            AbsorbClass::TransientCapacity400 => self.absorb_capacity_400,
-        }
-    }
-
-    /// 该类别的绝对 deadline。换号空窗在设了独立预算时用它自己那份，其余一律用总预算。
-    ///
-    /// 为什么不能共用一个预算（外挂实测）：换号空窗约 **10 分钟**，而总预算线上是 20s。
-    /// 抬总预算会让**所有**类别都能占着客户端连接十分钟，而换号空窗恰恰是唯一等得起的一类
-    /// （客户端在补号完成后自动恢复，而不是当场断会话）。
-    fn class_deadline(
-        &self,
-        call_started: std::time::Instant,
-        class: crate::anthropic::AbsorbClass,
-    ) -> std::time::Instant {
-        if matches!(class, crate::anthropic::AbsorbClass::SwapWindow) && !self.swap_budget.is_zero()
-        {
-            // 与总预算同源地从 `call_started` 起算（含准入排队），理由见调用点：
-            // 改成「从此刻起算」会让客户端可见延迟变成排队 + 吸收之和。
-            call_started + self.swap_budget
-        } else {
-            call_started + self.budget
-        }
-    }
-
-    /// 该类别愿意睡的上限。换号空窗启用长阶梯时可以超过全局 `max_delay`。
-    ///
-    /// 为什么必须放宽：`max_delay` 默认 15s < 阶梯最短一档 20s ⇒ 不放宽的话长阶梯会被
-    /// 全局 clamp 削回 15s，这个旋钮等于没接上（而 `backoff_is_truncated` 只对
-    /// `PoolCooldown` 成立，不会拦住这种「睡不够」）。显式设了 swap 预算本身就是
-    /// 「这一类可以睡更久」的表态。
-    fn class_max_delay(&self, class: crate::anthropic::AbsorbClass) -> Duration {
-        if matches!(class, crate::anthropic::AbsorbClass::SwapWindow) && !self.swap_budget.is_zero()
-        {
-            let ladder_top =
-                Duration::from_secs(SWAP_WINDOW_BACKOFF_SECS[SWAP_WINDOW_BACKOFF_SECS.len() - 1]);
-            self.max_delay.max(ladder_top)
-        } else {
-            self.max_delay
-        }
-    }
-
-    /// 本次调用允许的额外吸收轮次。关闭时恒为 0 —— 把「关 ⇒ 零额外轮次」做成可断言的纯函数，
-    /// 而不是散落在调用点的 `if !enabled` 判断（后者无法用单测钉死）。
-    fn effective_max_rounds(&self) -> u32 {
-        if self.enabled { self.max_rounds } else { 0 }
-    }
-
-    /// 本轮 failover 循环的墙钟预算：`min(45s, 剩余吸收预算)`。
-    ///
-    /// 这就是「吸收轮次不会超总预算」的**机制**（而非靠调用点自觉）：一轮的墙钟上限本身
-    /// 被剩余预算夹住，所以吸收轮次与 failover 轮次不是各算一套预算，而是后者被前者显式配额。
-    /// 关闭时恒返完整 45s ⇒ 与旧行为逐字节等价。
-    fn round_budget(
-        &self,
-        deadline: std::time::Instant,
-        round_started: std::time::Instant,
-    ) -> Duration {
-        let full = Duration::from_secs(MAX_REQUEST_RETRY_BUDGET_SECS);
-        if self.enabled {
-            full.min(deadline.saturating_duration_since(round_started))
-        } else {
-            full
-        }
-    }
-
-    /// 本轮**真正需要**等多久才有意义 —— 未经 `max_delay` 截断的原始值。
-    ///
-    /// 与 [`Self::backoff`] 分开是承重的（未修问题 ③）：`PoolCooldown(secs)` 是 cooldown.rs
-    /// 的**进程内真值**，而 `max_delay`（默认 15s）是一个与它毫无关系的旋钮。号池给出
-    /// 60s（`config.self_heal_base_backoff_secs（默认 60s） = from_secs(60)`，token_manager.rs:890 一带）时，
-    /// 只 clamp 不判断的写法会
-    /// 睡满 15s 就醒来再打一轮 —— 池子还在冷却 45s，这一轮**结构上必然**拿回同一个 429，
-    /// 等于白打一轮上游 + 客户端白等 15s。判「够不够」必须用真值，睡多久才用截断值。
-    fn required_wait(&self, class: crate::anthropic::AbsorbClass, round: u32) -> Duration {
-        use crate::anthropic::AbsorbClass;
-        match class {
-            // 号池真值。secs=0 由 backoff() 的 clamp 抬到 min_delay:无 sleep 的 continue 就是
-            // 忙等死循环(acquire_context 那次 CPU 打满一核、请求永不返回正是这个形态)。
-            AbsorbClass::PoolCooldown(secs) => Duration::from_secs(secs),
-            // 无真值可用:指数(非 shield 的 1.7 倍)。已有 max_rounds 与绝对 deadline 双闸,
-            // 收敛更快比更平滑重要。
-            AbsorbClass::UpstreamRateLimit => self.min_delay.saturating_mul(1u32 << round.min(6)),
-            // 换号空窗:设了独立预算 ⇒ 长阶梯 20/40/60s;未设 ⇒ 与限速同曲线(旧行为)。
-            //
-            // 长阶梯的理由是外挂那句实测结论:「**绝不能用限速那套 1 秒退避** —— 那是拿一个
-            // 已被封的账号去猛打上游,只会加重风控」。空窗约 10 分钟,20s 起步意味着一条请求
-            // 最多问上游十几次;1s 起的指数在同样时长内会问上百次,那不是重试而是施压。
-            AbsorbClass::SwapWindow => {
-                if self.swap_budget.is_zero() {
-                    self.min_delay.saturating_mul(1u32 << round.min(6))
-                } else {
-                    let idx = (round as usize).min(SWAP_WINDOW_BACKOFF_SECS.len() - 1);
-                    Duration::from_secs(SWAP_WINDOW_BACKOFF_SECS[idx])
-                }
-            }
-            // 5xx:1s 起(逐字取自 shield 的 `MIN_DELAY=1.0`)×2 指数。
-            // 为什么比限速类起步更长而封顶更早:5xx 多为上游/网关瞬时抖动,一两秒后重打大概率
-            // 就过;但若是整片故障,短退避会在故障期乘倍放大请求量。1s 是「抖动等得起、
-            // 故障不放大」的折中,且与本仓既有的 `retry_delay_model_unavailable` 同基数。
-            AbsorbClass::TransientServerError => {
-                const BASE: Duration = Duration::from_secs(1);
-                BASE.saturating_mul(1u32 << round.min(4))
-            }
-            // 容量类:2s 起 ×2。比 5xx 更长是因为「模型没容量」是**全局**状态
-            // (所有凭据对同一模型等价受影响,见 endpoint 侧那条判据的说明),换号不解决问题,
-            // 只能等上游腾出容量。与 provider 内部那几次慢速重试(1s base)串联后总时长才够到
-            // 容量恢复的量级 —— 内部那几次加起来只有秒级,而容量恢复常在分钟级。
-            AbsorbClass::TransientCapacity400 => {
-                const BASE: Duration = Duration::from_secs(2);
-                BASE.saturating_mul(1u32 << round.min(4))
-            }
-        }
-    }
-
-    /// 本轮实际睡多久：真实需求经 `[min_delay, max_delay]` 夹取。
-    ///
-    /// 与外置 shield 的逐条差异：① shield 的 `MIN_DELAY` 硬 1s，号池 50ms 就能恢复时白睡
-    /// 950ms×每轮（这是它 p50 73.2s 的病根之一），这里下限可配到亚秒级；② shield 只看 HTTP
-    /// `Retry-After` 头，这里直接吃 `PoolCooldown(secs)` 的**进程内真值**（就是 cooldown.rs
-    /// 算出的剩余秒数，无需 HTTP 头往返）。
-    fn backoff(&self, class: crate::anthropic::AbsorbClass, round: u32) -> Duration {
-        // 上界按类别取（见 `class_max_delay`）：换号空窗的长阶梯不能被默认 15s 的全局上限削回，
-        // 否则那个旋钮等于没接上。其余类别的上界与本改动之前逐字节相同。
-        //
-        // ⚠️ `clamp` 在 `min > max` 时 panic，而 `class_max_delay` 只会**放大**上界
-        // （`self.max_delay.max(ladder_top)`），`from_config` 已保证 `max_delay >= min_delay`
-        // ⇒ 不变式仍然成立。
-        self.required_wait(class, round)
-            .clamp(self.min_delay, self.class_max_delay(class))
-    }
-
-    /// 号池给出的**真实恢复时刻**是否超过我们愿意睡的上限 ⇒ 睡醒了池子还没好 ⇒ 这一轮白打。
-    ///
-    /// **只对 `PoolCooldown` 成立**，这个限定是承重的：只有它携带真值（cooldown.rs 算出的
-    /// 剩余秒数）。`UpstreamRateLimit`/`Suspended` 走的是我们自己编的指数兜底 —— 它撞上
-    /// `max_delay` 只说明「我们不想睡更久」，**不代表上游没好**（`max_delay` 本来就是为了
-    /// 夹住它而存在的）。若把它们也算进来，指数涨过上限后吸收层会对**最主要**的那类
-    /// （上游裸 429）提前停止工作，白丢一层保护。
-    ///
-    /// 这条比 `should_start_another_round` 更早生效：后者只管**预算**够不够睡，管不了
-    /// 「睡够了但上游没好」——两者是独立的失败模式，都必须拦。
-    fn backoff_is_truncated(&self, class: crate::anthropic::AbsorbClass, round: u32) -> bool {
-        matches!(class, crate::anthropic::AbsorbClass::PoolCooldown(_))
-            && self.required_wait(class, round) > self.max_delay
-    }
-}
-
-/// 是否还够再跑一轮吸收：**剩余预算 > 退避 + 一轮最坏耗时**。
-///
-/// 判据刻意不是「剩余 ≥ 退避下限」（BLOCKER 9）：那样第 2 轮会在半路被 deadline 砍断，
-/// 等于白打一轮上游还让客户端多等。纯函数便于单测钉死，无需真实上游。
-fn should_start_another_round(
-    deadline: std::time::Instant,
-    now: std::time::Instant,
-    delay: Duration,
-) -> bool {
-    deadline.saturating_duration_since(now)
-        > delay + Duration::from_secs(ABSORB_MIN_USEFUL_ROUND_SECS)
-}
-
-/// 本吸收轮还能打几次上游：**跨轮共享**同一个 `ABSOLUTE_MAX_TOTAL_RETRIES` 总额度。
-///
-/// 未修问题 ②：`compute_max_retries` 在 `'absorb: loop` **之外**只算一次，而
-/// `for attempt in 0..max_retries` 每轮重跑 ⇒ 每轮各拿一份完整 4 ⇒ `max_rounds=3` 时
-/// 一条客户端请求最坏 (1+3)×4 = **16 次**上游调用、同一出口 IP —— 正是当初把
-/// `ABSOLUTE_MAX_TOTAL_RETRIES` 从 64 砍到 4 要压住的突发特征，被吸收层从另一头放回来。
-///
-/// 修法不是调小 `max_rounds`（那只是把数字挪一挪，语义仍是「每轮各拿一份」），而是让
-/// 上限回到它文档承诺的「**每请求**」语义：本轮配额 = `min(基础配额, 总额度 − 已用)`。
-/// 于是无论 `max_rounds` 填多少，一条客户端请求打向上游的次数恒 ≤ `ABSOLUTE_MAX_TOTAL_RETRIES`。
-///
-/// `attempts_before` 传**已完成的尝试次数**（= 循环外的 `attempts_base`）。返回 0 表示
-/// 额度已用尽，调用点必须 `break 'absorb` 而不是空跑一轮（空跑会白睡一次退避）。
-fn round_retry_quota(base_quota: usize, attempts_before: u32) -> usize {
-    let remaining = ABSOLUTE_MAX_TOTAL_RETRIES.saturating_sub(attempts_before as usize);
-    base_quota.min(remaining)
-}
-
 /// 对话路径 403 → **换区重试**的目标 region（L1）。`None` = 不该换区。
 ///
 /// # 为什么对话路径需要这一层
@@ -613,63 +192,6 @@ fn region_retry_target(
         return None;
     }
     Some(next)
-}
-
-/// 计算本次调用允许的总重试次数（动态预算）
-///
-/// - `total`：凭据总数
-/// - `available`：当前未禁用（可用）凭据数
-///
-/// 预算 = `(total * per_cred).min(ABSOLUTE_MAX_TOTAL_RETRIES)`，再以 1 兜底。
-///
-/// ⚠️ **`available` 已不参与计算**（参数保留只为不动调用点与既有测试）。
-/// 因此本函数**不再保证「每个可用凭据至少被尝试一次」** —— 号池大于
-/// `ABSOLUTE_MAX_TOTAL_RETRIES` 时，单个请求扫不完全池。这是**刻意的权衡**，
-/// 理由见函数体内 `.min()` 处的长注释（旧代码的内层 `.max(available)` 会让硬上限
-/// 自我抵消，线上 43 号时预算 = 43，一条请求顺着整池撞一遍直到耗尽 45s 墙钟，
-/// 净效果是「号池越大越慢」）。
-///
-/// 该权衡依赖一个前提：**坏号会被自动禁用从而不进候选集**，故预算 4 足够摸到
-/// 足量健康号。号池规模显著超过 `ABSOLUTE_MAX_TOTAL_RETRIES` 时需重新评估这个前提。
-///
-/// **小号池降重试**：号池很小（`total <= SMALL_POOL_THRESHOLD`）时，每号重试次数降为 1。
-/// 因为小池下重试循环只会反复选到同几个号——被限流时多打几次纯属反复砸、加重冷却，
-/// 不如让每个号各摸一次就把上游错误透传给客户端（客户端自身有退避重试，比网关内反复砸温和）。
-/// 号多时行为完全不变（仍 `MAX_RETRIES_PER_CREDENTIAL`）。
-fn compute_max_retries(total: usize, _available: usize) -> usize {
-    // `_available` 保留在签名里但**不再参与计算**：见下方 `.min()` 处的说明。
-    // 保留参数是为了不改动调用点与既有测试；将来若确认永不需要，再一并删除。
-    let per_cred = if total <= SMALL_POOL_THRESHOLD {
-        1
-    } else {
-        MAX_RETRIES_PER_CREDENTIAL
-    };
-    (total * per_cred)
-        // ⚠️ 这里**刻意不再**用 `.max(available)` 抬高上限。
-        //
-        // 旧代码是 `.min(ABSOLUTE_MAX_TOTAL_RETRIES.max(available))`，那个内层
-        // `.max(available)` 会在 `available > ABSOLUTE_MAX_TOTAL_RETRIES` 时把硬上限
-        // 自己抵消掉 → 预算等于可用号数。线上 43 个号时实测预算 = 43，日志里就是
-        // 「尝试 43/43」：一条
-        // 客户端请求要顺着整池撞一遍，撞到 45s 墙钟预算才失败。
-        //
-        // 净效果是**号池越大越慢**，与"扩号池提升吞吐"的目标正好相反。而"保证每个
-        // 可用号至少被摸一次"这个原始意图本身就站不住：池子有 200 个号时，为一条
-        // 请求打 200 次上游只会加重风控，而不会提高这条请求的成功率——真正该做的是
-        // 让坏号被自动禁用而**不进入**候选集（见 token_manager 的
-        // `report_suspicious_activity`），而不是靠遍历去撞。
-        .min(ABSOLUTE_MAX_TOTAL_RETRIES)
-        // ⚠️ 地板 1：预算为 0 等于**一次都不尝试**，请求直接以「已达到最大重试次数（0次）」
-        // 失败，而 acquire_context 的等待循环根本没机会跑。
-        //
-        // 旧实现喂 `total_count()`（含 disabled 条目，恒 ≥ 池内号数）所以永远算不出 0，
-        // 掩盖了这里缺下限。改喂 `kiro_selectable_count()` 后，**瞬时**全池不可选
-        //（全部在冷却中 / inflight 打满）会让它返回 0 → 预算 0 → 请求零重试即失败。
-        // 这是真实回归：线上 20 分钟内出现 10 次该错误。
-        //
-        // 取 1 而非 0 的语义：至少走一遍 acquire_context，让它的等待逻辑有机会等到号
-        // 出冷却；等不到再由墙钟预算（MAX_REQUEST_RETRY_BUDGET_SECS）兜底透传错误。
-        .max(1)
 }
 
 /// 近期上游压力滑动窗口。
@@ -1766,10 +1288,11 @@ impl KiroProvider {
     /// # 边界
     ///
     /// - 纯 custom_api 池无 Kiro token → 返回 Err（调用方降级回池子错误）。
-    /// - OAuth token 可能已过期（不做刷新，保持最小）→ 上游 401 → 调用方降级。
+    /// - OAuth token 可能已过期（不做刷新，保持最小）→ 上游 401 → **同请求换下一个
+    ///   带 Kiro token 的号**；全部试完或共享预算耗尽才降级回池子错误。
     /// - **失败短负缓存（M3）**：非 2xx（401/403/429）落 60s 负缓存，键按凭据 id
     ///   分段（复用 [`Self::dead_endpoints`]，TTL 更短），期内跳过**该号**直连
-    ///   直接降级——同 region 其它号仍可直连。
+    ///   （同请求仍可换其它号；无候选才降级）。同 region 其它号不连坐。
     /// - 直连不占 inflight / 不改健康分 / 不进 endpoint 429 桶 —— 刻意：这是
     ///   「拿 token 直接打」的轻量路径（gateway 模型），不是调度路径。
     /// - URL 恒为 IDE 协议的 `runtime.{region}.kiro.dev/mcp`：MCP 端点是 IDE 协议
@@ -1780,69 +1303,87 @@ impl KiroProvider {
         request_body: &str,
         budget: &SharedRetryBudget,
     ) -> anyhow::Result<(reqwest::Response, u64)> {
-        let (id, cred, token) = self
-            .token_manager
-            .acquire_mcp_direct_token()
-            .ok_or_else(|| {
-                anyhow::anyhow!("MCP 无号直连：凭据池无可用 Kiro token（纯 custom_api 池）")
-            })?;
+        let mut exclude: HashSet<u64> = HashSet::new();
+        let mut last_err: Option<anyhow::Error> = None;
+        loop {
+            let (id, cred, token) = match self
+                .token_manager
+                .acquire_mcp_direct_token_excluding(&exclude)
+            {
+                Some(v) => v,
+                None => {
+                    return Err(last_err.unwrap_or_else(|| {
+                        anyhow::anyhow!("MCP 无号直连：凭据池无可用 Kiro token（纯 custom_api 池）")
+                    }));
+                }
+            };
+            exclude.insert(id);
 
-        let config = self.token_manager.config();
-        // M3 失败短负缓存：直连失败（401/403/429）落 60s 负缓存，键含凭据 id。
-        // 先 acquire 再查，保证键对上即将发送的 token。同 region 其它号不连坐。
-        let region = cred.effective_upstream_region(&config);
-        if self.is_mcp_direct_blocked(id, region) {
-            return Err(anyhow::anyhow!(
-                "MCP 无号直连负缓存生效（{}s），跳过直连降级回池子错误",
-                MCP_DIRECT_NEG_CACHE_TTL.as_secs()
-            ));
-        }
-        let machine_id = machine_id::generate_from_credentials(&cred, &config);
-        let rctx = RequestContext {
-            credentials: &cred,
-            token: &token,
-            machine_id: &machine_id,
-            config: &config,
-            is_1m: false,
-        };
-        // MCP 端点是 IDE 协议的（runtime.*.kiro.dev/mcp），直连固定走它；CLI 端点的
-        // mcp_url 是 q.* 兜底（cli.rs:205），不适合。region 解析与 ide 端点同源。
-        let endpoint = crate::kiro::endpoint::ide::IdeEndpoint::new();
-        let url = endpoint.mcp_url(&rctx);
-        let body = endpoint.transform_mcp_body(request_body, &rctx);
-
-        let client = self.client_for(&cred)?;
-        let mut req = client
-            .post(&url)
-            .body(body)
-            .header("content-type", "application/json");
-        for (name, value) in Self::mcp_direct_headers(&cred, &token) {
-            req = req.header(name, value);
-        }
-
-        let response = match req.send().await {
-            Ok(resp) => {
-                // 共享预算：请求已真实发出，无论成败都算一次上游调用（与主循环同口径）。
-                budget.consume(1);
-                resp
+            let config = self.token_manager.config();
+            // M3 失败短负缓存：直连失败（401/403/429）落 60s 负缓存，键含凭据 id。
+            // 先 acquire 再查，保证键对上即将发送的 token。同 region 其它号不连坐。
+            let region = cred.effective_upstream_region(&config);
+            if self.is_mcp_direct_blocked(id, region) {
+                last_err = Some(anyhow::anyhow!(
+                    "MCP 无号直连负缓存生效（{}s），跳过直连降级回池子错误",
+                    MCP_DIRECT_NEG_CACHE_TTL.as_secs()
+                ));
+                continue;
             }
-            Err(e) => {
-                budget.consume(1);
-                return Err(e.into());
+            let machine_id = machine_id::generate_from_credentials(&cred, &config);
+            let rctx = RequestContext {
+                credentials: &cred,
+                token: &token,
+                machine_id: &machine_id,
+                config: &config,
+                is_1m: false,
+            };
+            // MCP 端点是 IDE 协议的（runtime.*.kiro.dev/mcp），直连固定走它；CLI 端点的
+            // mcp_url 是 q.* 兜底（cli.rs:205），不适合。region 解析与 ide 端点同源。
+            let endpoint = crate::kiro::endpoint::ide::IdeEndpoint::new();
+            let url = endpoint.mcp_url(&rctx);
+            let body = endpoint.transform_mcp_body(request_body, &rctx);
+
+            let client = self.client_for(&cred)?;
+            let mut req = client
+                .post(&url)
+                .body(body)
+                .header("content-type", "application/json");
+            for (name, value) in Self::mcp_direct_headers(&cred, &token) {
+                req = req.header(name, value);
             }
-        };
-        // ⭐ 非 2xx = 直连失败（无 ARN 形态被上游拒的 403/400、token 过期的 401、
-        // 429 限流等）：落 60s 负缓存（M3，期内跳过直连不再白打）后交由调用方
-        // 降级返回池子错误，绝不让错误响应体当成功解析（MCP JSON-RPC 解析会对
-        // 错误体反序列化失败，反而掩盖真实原因）。
-        if !response.status().is_success() {
-            self.mark_endpoint_dead(&format!("mcp-direct@{}", id), region);
-            return Err(anyhow::anyhow!(
-                "MCP 无号直连上游响应: {}",
-                response.status()
-            ));
+
+            let response = match req.send().await {
+                Ok(resp) => {
+                    // 共享预算：请求已真实发出，无论成败都算一次上游调用（与主循环同口径）。
+                    budget.consume(1);
+                    resp
+                }
+                Err(e) => {
+                    budget.consume(1);
+                    last_err = Some(e.into());
+                    if budget.remaining() == 0 {
+                        return Err(last_err.take().expect("just set"));
+                    }
+                    continue;
+                }
+            };
+            // ⭐ 非 2xx = 直连失败（无 ARN 形态被上游拒的 403/400、token 过期的 401、
+            // 429 限流等）：落 60s 负缓存（M3，期内跳过直连不再白打该号）后**同请求换下一个
+            // token**，绝不把错误响应体当成功解析。
+            if !response.status().is_success() {
+                self.mark_endpoint_dead(&format!("mcp-direct@{}", id), region);
+                last_err = Some(anyhow::anyhow!(
+                    "MCP 无号直连上游响应: {}",
+                    response.status()
+                ));
+                if budget.remaining() == 0 {
+                    return Err(last_err.take().expect("just set"));
+                }
+                continue;
+            }
+            return Ok((response, id));
         }
-        Ok((response, id))
     }
 
     /// MCP 无号直连的请求头（纯函数，便于单测钉死「无 profileArn」契约）。
@@ -5572,6 +5113,8 @@ fn assemble_final_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::absorb_policy::ABSORB_MIN_BACKOFF;
+    use super::retry_budget::MAX_RETRIES_PER_CREDENTIAL;
 
     // ===== S4：透传池冷却标签独立（状态码 → 秒数 + 原因）=====
 
@@ -5893,6 +5436,33 @@ mod tests {
         assert!(
             direct.contains("is_mcp_direct_blocked("),
             "直连发送前必须查负缓存（失败 60s 内跳过直连降级回池子错误）"
+        );
+    }
+
+    /// 同请求 401 必须换号：删掉 excluding / exclude.insert 会退回单 token。
+    #[test]
+    fn call_mcp_direct_rotates_on_same_request_after_failure() {
+        let full = include_str!("provider.rs");
+        let prod = full
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(full);
+        let direct = prod
+            .split("async fn call_mcp_direct(")
+            .nth(1)
+            .expect("call_mcp_direct 不应被改名");
+        let direct = direct
+            .split("\n    }\n")
+            .next()
+            .expect("call_mcp_direct 应有函数体收尾");
+        let acquire = ["acquire_mcp_direct_token", "_excluding"].concat();
+        assert!(
+            direct.contains(&acquire),
+            "直连必须按排除集选下一个 token（同请求换号）"
+        );
+        assert!(
+            direct.contains("exclude.insert"),
+            "试过的 id 必须进排除集，否则会钉死同一号"
         );
     }
 
@@ -9312,7 +8882,7 @@ mod tests {
         );
         // 策略里确实带上了这个字段（防有人删字段又改回重读）。
         assert!(
-            src.contains("absorb_suspended: bool"),
+            include_str!("absorb_policy.rs").contains("absorb_suspended: bool"),
             "AbsorbPolicy 必须持有 absorb_suspended 字段"
         );
     }
@@ -10751,7 +10321,8 @@ mod tests {
 
         // ① 只认精确的 503：其它值（含裸 serde default 会给的 0）一律按 429 处理。
         assert!(
-            prod.contains("cfg.upstream_retry_absorb_exhausted_status == 503"),
+            include_str!("absorb_policy.rs")
+                .contains("cfg.upstream_retry_absorb_exhausted_status == 503"),
             "必须只认精确 503 —— 打一个 handlers 认不出的标记只会造成静默的行为分叉"
         );
         // ② 标记必须同时受「真跑过轮次」约束：一次都没重试就改状态码是说谎。

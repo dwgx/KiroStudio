@@ -1557,7 +1557,6 @@
   "overviewpage.legend.currentActive": "Current active",
   "overviewpage.legend.groupHue": "Same hue = same account group",
   "overviewpage.legend.processing": "Processing",
-  "overviewpage.orbit.availableTotal": "Available / Total",
   "overviewpage.pool.availableOfTotal": "Available {available} / Total {total}",
   "overviewpage.pool.title": "Account pool status",
   "overviewpage.poolview.bars": "Status bars",

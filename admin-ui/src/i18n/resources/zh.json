@@ -1557,7 +1557,6 @@
   "overviewpage.legend.currentActive": "当前活跃",
   "overviewpage.legend.groupHue": "同色 = 同账号组",
   "overviewpage.legend.processing": "处理中",
-  "overviewpage.orbit.availableTotal": "可用 / 总数",
   "overviewpage.pool.availableOfTotal": "可用 {available} / 共 {total}",
   "overviewpage.pool.title": "号池状态",
   "overviewpage.poolview.bars": "状态条",
