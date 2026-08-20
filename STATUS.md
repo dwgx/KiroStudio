@@ -15,7 +15,7 @@
 | 发版 | **v1.1.2** = `5f20596`。公开 Release **Latest**，四端资产齐 |
 | Cargo | **1.1.2** |
 | 本机测试 | `cargo test --no-default-features` → **2171 passed; 0 failed** |
-| 质量提升 | `origin/quality-up/after-v1.1.2`（相对 tag 的抽取快照）。**没并进 master、没改 tag** |
+| 质量提升 | 分支 `quality-up/after-v1.1.2`（相对 tag 的抽取快照）。**没并进 master、没改 tag** |
 | Homecloud | 二进制已是 1.1.2；无 `.git`；OTA 默认公开仓 |
 
 ## 发版产物
