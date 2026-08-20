@@ -357,11 +357,16 @@ mod tests {
     #[tokio::test]
     async fn bump_dedupes_and_retries_after_failure() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        // 未 init：所有 bump 零开销 no-op。
-        assert_eq!(SENT_TOTAL.load(Ordering::Relaxed), 0);
+        // 未 init：所有 bump 零开销 no-op（差值断言——别的告警测试可能已 bump
+        // 过进程级 SENT_TOTAL，绝对 0 会被并发测试污染，2026-08-16 实测）。
+        let before = SENT_TOTAL.load(Ordering::Relaxed);
         bump("a");
         bump("a");
-        assert_eq!(SENT_TOTAL.load(Ordering::Relaxed), 0, "未配置时必须 no-op");
+        assert_eq!(
+            SENT_TOTAL.load(Ordering::Relaxed),
+            before,
+            "未配置时必须 no-op"
+        );
 
         // init 长冷却 + 不可达地址。
         init(

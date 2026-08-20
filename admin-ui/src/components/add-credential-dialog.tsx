@@ -255,11 +255,30 @@ function extractCredentials(parsed: unknown): AddCredentialRequest[] {
       // keys[] 是纯字符串数组（后端格式 2），直接包成 api_key 请求
       reqs.push({ authMethod: 'api_key', kiroApiKey: item.trim() })
     } else if (item && typeof item === 'object') {
-      const req = toAddRequest(item as Record<string, unknown>)
+      const rec = item as Record<string, unknown>
+      // CLIProxy 混合导出：type 非空且不是 kiro → OpenAI/Gemini 等，不当 Kiro 号导入。
+      const vendor = pickString(rec.type)
+      if (vendor && vendor.toLowerCase() !== 'kiro') continue
+      const req = toAddRequest(rec)
       if (req) reqs.push(req)
     }
   }
   return reqs
+}
+
+/** 非 JSON 纯行：每行一把 `ksk_`（空行 / `#` 注释忽略）。对齐 Foxfishc / Kiro-Go apikeys-batch。 */
+function extractPlainKskLines(raw: string): AddCredentialRequest[] {
+  const keys: string[] = []
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.startsWith('#')) continue
+    const at = trimmed.indexOf('ksk_')
+    if (at < 0) return []
+    const key = trimmed.slice(at).trim()
+    if (!key.startsWith('ksk_')) return []
+    keys.push(key)
+  }
+  return keys.map((kiroApiKey) => ({ authMethod: 'api_key', kiroApiKey }))
 }
 
 interface PasteResult {
@@ -548,8 +567,11 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       const parsed = tolerantJsonParse(pasteInput)
       reqs = extractCredentials(parsed)
     } catch (error) {
-      toast.error(t('addcredentialdialog.toast.jsonUnrecognized') + extractErrorMessage(error))
-      return
+      reqs = extractPlainKskLines(pasteInput)
+      if (reqs.length === 0) {
+        toast.error(t('addcredentialdialog.toast.jsonUnrecognized') + extractErrorMessage(error))
+        return
+      }
     }
 
     if (reqs.length === 0) {

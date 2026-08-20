@@ -132,21 +132,6 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
 
-    /// 是否对该 custom_api 透传做 **deepseek 归一化**（opencodezen 代挂专用）。
-    ///
-    /// `Some(true)` 时，透传前把请求体按 fuckopencode 的 deepseek 协议修复逻辑改写：
-    /// `thinking: adaptive→enabled`、删 `budget_tokens`、`reasoning_effort→output_config.effort`、
-    /// 剥 `context_management` 等 deepseek 不认的字段。`None`/`Some(false)`（默认）原样透传。
-    /// 只在 auth_method=custom_api 且上游是 opencodezen 类 deepseek 网关时置 true。
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub deepseek_normalize: Option<bool>,
-    /// deepseek 归一化**per-凭据覆盖**（fallback_model / min_max_tokens）。
-    /// None = 用全局 `config.deepseek_normalize`；Some = `None` 字段继承全局、bool 一律全局。
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub deepseek_normalize_config: Option<crate::kiro::deepseek_normalize::DeepseekNormalizeOverride>,
-
     /// **是否豁免全局模型映射**（`config.model_mapping`）。
     ///
     /// `Some(true)` = 该凭据**完全跳过**全局映射，发上游时保持客户端原始模型名。
@@ -1623,8 +1608,6 @@ mod tests {
             api_key: None,
             request_limit: None,
             custom_api_first: None,
-            deepseek_normalize: None,
-            deepseek_normalize_config: None,
             model_mapping_exempt: None,
             region: None,
             auth_region: None,
@@ -1762,8 +1745,6 @@ mod tests {
             api_key: None,
             request_limit: None,
             custom_api_first: None,
-            deepseek_normalize: None,
-            deepseek_normalize_config: None,
             model_mapping_exempt: None,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
@@ -1814,8 +1795,6 @@ mod tests {
             api_key: None,
             request_limit: None,
             custom_api_first: None,
-            deepseek_normalize: None,
-            deepseek_normalize_config: None,
             model_mapping_exempt: None,
             region: None,
             auth_region: None,
@@ -1952,8 +1931,6 @@ mod tests {
             api_key: None,
             request_limit: None,
             custom_api_first: None,
-            deepseek_normalize: None,
-            deepseek_normalize_config: None,
             model_mapping_exempt: None,
             region: Some("us-west-2".to_string()),
             auth_region: None,

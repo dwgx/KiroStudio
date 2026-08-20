@@ -663,14 +663,16 @@ async fn dispatch_web_search_loop(
                     .into_response()
             }
         }
-        Err(mut resp) => {
+        Err(mut fail) => {
             // 回灌失败响应可能带 x-kirostudio-compress-retry 内部标记（上游 400
             // CONTENT_LENGTH_EXCEEDS 时 map_provider_error 设置；回灌循环在压缩重试/
             // strip 点之前，不在这里清就会透传客户端——与 /v1、/cc/v1 的 F1b 同款，
             // 2026-08-11 对抗审查 M1）。回灌路径**无压缩重试循环**，标记无消费者。
-            resp.headers_mut()
+            fail.response
+                .headers_mut()
                 .remove("x-kirostudio-compress-retry");
-            resp
+            emit_websearch_loop_error_usage(provider, payload, &fail, client, wants_stream);
+            fail.response
         }
     };
     Some(resp)
@@ -916,6 +918,52 @@ fn emit_websearch_loop_usage(
     crate::usage::emit_record(record);
 }
 
+/// 回灌循环失败时的客户端请求埋点（与成功路径成对：一次客户端请求一条记录）。
+///
+/// 失败时没有客户端可见的输出，`output_tokens` 记 0；credits 只写循环已计量到的值
+/// （没有就 None，不编 0 成功）。outcome 按响应状态归到既有 [`RequestOutcome`] 变体。
+fn emit_websearch_loop_error_usage(
+    provider: &crate::kiro::provider::KiroProvider,
+    payload: &MessagesRequest,
+    fail: &websearch::WebSearchLoopError,
+    client: &ClientInfo,
+    wants_stream: bool,
+) {
+    let status = fail.response.status();
+    let mut record =
+        crate::usage::RequestRecord::new(Uuid::new_v4().to_string(), payload.model.clone());
+    record.requested_model = Some(payload.model.clone());
+    record.upstream_model = fail.mapped_model.clone();
+    record.credential_id = fail.credential_id;
+    record.is_streaming = wants_stream;
+    record.input_tokens = fail.input_tokens;
+    record.output_tokens = 0;
+    record.credits_used = fail.credits;
+    record.retries = fail.rounds.saturating_sub(1);
+    record.outcome = websearch_loop_error_outcome(status);
+    record.error_message = Some(format!(
+        "web_search loop failed (status {})",
+        status.as_u16()
+    ));
+    if let (Some(c), Some(id)) = (record.credits_used, record.credential_id) {
+        provider.report_credits(id, c);
+    }
+    client.apply(&mut record);
+    crate::usage::emit_record(record);
+}
+
+/// 回灌失败 HTTP 状态 → 用量 outcome。对齐 `map_provider_error` 落给客户端的码，
+/// 不是 Success。503 预算/吸收耗尽按 ServerError（ModelUnavailable 只用于上游容量标记）。
+fn websearch_loop_error_outcome(status: StatusCode) -> crate::usage::RequestOutcome {
+    match status.as_u16() {
+        429 => crate::usage::RequestOutcome::RateLimited,
+        401 | 403 => crate::usage::RequestOutcome::AuthFailed,
+        400 | 413 => crate::usage::RequestOutcome::BadRequest,
+        500 | 502 | 503 | 504 => crate::usage::RequestOutcome::ServerError,
+        _ => crate::usage::RequestOutcome::OtherError,
+    }
+}
+
 /// WebSearch **快路径**（`handle_websearch_request` 本地 MCP 单轮搜索）成功时的用量埋点。
 ///
 /// 与 [`emit_websearch_loop_usage`]（回灌循环）互补：快路径此前**零埋点**，面板上
@@ -926,7 +974,6 @@ fn emit_websearch_loop_usage(
 ///
 /// `pub(super)`：websearch.rs 在成功收尾处调用（两条路径各埋各的，不混用）。
 pub(super) fn emit_websearch_fast_path_usage(
-    provider: &crate::kiro::provider::KiroProvider,
     model: &str,
     credential_id: Option<u64>,
     input_tokens: i32,
@@ -1254,6 +1301,47 @@ fn adaptive_compress_loop(
     }
 
     Ok(())
+}
+
+/// 压缩重试轮重建请求体：字节兜底先行，再以更紧的 target 走 token 压缩管道。
+///
+/// 量纲对齐：上游按**字节**拒绝（400 CONTENT_LENGTH_EXCEEDS_THRESHOLD），而 token
+/// 压缩压不到目标时（长会话字节先撞线），先执行
+/// [`crate::anthropic::converter::apply_byte_overflow_guard`]——扁平化历史里除活跃
+/// 轮次外的结构化工具轮次 + 按字节截断丢最旧历史（占位说明 + 保 user/assistant
+/// 交替 + 剥孤立 toolResult），再走 `build_kiro_request_body` 的 token 压缩。
+/// 比 token 压缩更激进，但**只在 400 触发压缩重试的路径执行**，正常路径（初试）
+/// 不受影响，与 `adaptive_compress_loop` 不重复打架。
+fn rebuild_body_for_compress_retry(
+    conv_state: &mut crate::kiro::model::requests::conversation::ConversationState,
+    native_fields: &Option<crate::kiro::model::requests::kiro::AdditionalModelRequestFields>,
+    compression_cfg: &crate::model::config::CompressionConfig,
+    attempt: u32,
+) -> Result<String, serde_json::Error> {
+    // ⭐ 显式压缩关闭时跳过字节兜底（与 adaptive_compress_loop 的 enabled 守卫同款）：
+    // 用户关闭压缩 = 明确要求不干预请求，400 超限应透传而非静默丢历史。
+    if compression_cfg.enabled {
+        crate::anthropic::converter::apply_byte_overflow_guard(conv_state);
+    } else {
+        tracing::warn!(
+            attempt = attempt,
+            "CONTENT_LENGTH_EXCEEDS 重试但压缩已显式关闭：跳过字节兜底，不丢历史"
+        );
+    }
+    let target = compress_retry_target(compression_cfg.trigger_bytes, attempt);
+    let body = build_kiro_request_body(
+        conv_state.clone(),
+        native_fields.clone(),
+        compression_cfg,
+        Some(target),
+    )?;
+    tracing::info!(
+        attempt = attempt,
+        target_bytes = target,
+        body_len = body.len(),
+        "CONTENT_LENGTH_EXCEEDS: 重新压缩请求体并重试"
+    );
+    Ok(body)
 }
 
 /// 已翻译的上游错误：HTTP 状态 + Anthropic 错误类型码 + 面向用户的中文消息（含排障步骤）。
@@ -1945,6 +2033,20 @@ pub(crate) fn parse_upstream_retry_after(err_str: &str) -> Option<u64> {
         .and_then(|d| d.parse::<u64>().ok())
 }
 
+/// A7 判据的锚定版：`upstream_retry_after=N` 必须落在错误串**末尾**（trim 后）
+/// 才算网关自己打的串。
+///
+/// 网关恒把 marker 追加在错误串末尾（429 分支与 `assemble_final_error` 都是
+/// 追加），body 噪声里的同名字样只会出现在前。裸 `contains` 会把噪声误判成
+/// 网关真值（Review3 m1）——锚定后只有「marker 之后直到串尾全是数字」才进
+/// A7 分支（`parse_upstream_retry_after` 的解析结果与锚定判据天然一致）。
+fn upstream_retry_after_anchored(err_str: &str) -> bool {
+    match err_str.trim_end().rsplit_once(UPSTREAM_RETRY_AFTER_MARKER_PREFIX) {
+        Some((_, tail)) => !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()),
+        None => false,
+    }
+}
+
 /// 从错误串里取 `retry_after_secs=N` 的 N。
 ///
 /// 抽出成公共函数的理由：这段解析此前在 `map_provider_error` 内**复制了两份**（准入超时分支
@@ -2278,6 +2380,10 @@ fn map_provider_error(err: Error) -> Response {
     // 全池冷却快速失败：token_manager 全池都在冷却时会带 retry_after_secs=N 快速 bail。
     // 这里透传成标准 429 + Retry-After 头，让客户端(Claude Code)按其自身退避策略重试——
     // 比网关内硬扛温和，也减少对被风控号的试探。
+    //
+    // 顺序承重：必须排在 translate_upstream_error / 通用 5xx 503 之前。
+    // 本串只有 `retry_after_secs=`、没有 absorb/budget 标记；落到后面的 503
+    // 会让 shield/客户端丢掉 429+号池真值（T5 夹具 `retry_after_secs=14`）。
     if let Some(secs) = parse_retry_after_secs(&err_str) {
         // ⭐ 号池真值永远优先：能进此分支必然带真值，配置的 retryAfterSecs 不可覆盖它
         // （号池算出的剩余秒数比任何常数/配置都准，见 A2 分支注释）。
@@ -2362,8 +2468,10 @@ fn map_provider_error(err: Error) -> Response {
     // generic 终态（5xx/传输层，见 provider 的 assemble_final_error，限定集已排除
     // 永久态/配额/背压）。故本路判据不破坏「只匹配速率类」的既有契约；配额字样的串
     // 即使出现 marker 也显式排除（双保险，防未来 provider 侧守卫被放宽后静默破坏 H2）。
+    // ⭐ 锚定判定（Review3 m1）：裸 contains 会把 body 噪声误判成网关真值，判据改为
+    // trim_end 后「marker 落在串尾且后跟纯数字」才命中（网关恒追加在末尾）。
     if is_upstream_rate_limited(&err_str)
-        || (err_str.contains(UPSTREAM_RETRY_AFTER_MARKER_PREFIX)
+        || (upstream_retry_after_anchored(&err_str)
             && !crate::kiro::endpoint::default_is_monthly_request_limit(&err_str))
     {
         let (status, error_type, message, cfg_ra) = resolve_msg(
@@ -2828,7 +2936,7 @@ pub async fn post_messages(
     // 构建 Kiro 请求体（发上游前，超阈值时执行输入压缩；profile_arn 由 provider 层注入）
     // 保留原始状态的克隆，供 CONTENT_LENGTH_EXCEEDS 重试时重建（渐进式压低 target_bytes）。
     // native effort 字段随请求体一起走（压缩只作用于 conversation_state，不受影响）。
-    let conv_state_for_compress_retry = conversion_result.conversation_state.clone();
+    let mut conv_state_for_compress_retry = conversion_result.conversation_state.clone();
     let native_fields_for_compress_retry =
         conversion_result.additional_model_request_fields.clone();
     let request_body = match build_kiro_request_body(
@@ -2897,12 +3005,11 @@ pub async fn post_messages(
         let body_ref: &str = if compress_attempt == 0 {
             &request_body
         } else {
-            let target = compress_retry_target(compression_cfg.trigger_bytes, compress_attempt);
-            response_body = match build_kiro_request_body(
-                conv_state_for_compress_retry.clone(),
-                native_fields_for_compress_retry.clone(),
+            response_body = match rebuild_body_for_compress_retry(
+                &mut conv_state_for_compress_retry,
+                &native_fields_for_compress_retry,
                 &compression_cfg,
-                Some(target),
+                compress_attempt,
             ) {
                 Ok(b) => b,
                 Err(e) => {
@@ -2911,12 +3018,6 @@ pub async fn post_messages(
                     return render_serialization_failed(&e);
                 }
             };
-            tracing::info!(
-                attempt = compress_attempt,
-                target_bytes = target,
-                body_len = response_body.len(),
-                "CONTENT_LENGTH_EXCEEDS: 重新压缩请求体并重试"
-            );
             &response_body
         };
 
@@ -3546,6 +3647,89 @@ fn content_is_thinking_only(content: &[serde_json::Value]) -> bool {
     has_thinking
 }
 
+/// 非流式 content 是否含用户可见正文（非空 text / tool_use）。
+/// thinking-only 补的空格 text 经 trim 后为空，不算可见（该路径已显式 max_tokens）。
+fn nonstream_content_has_visible_body(content: &[serde_json::Value]) -> bool {
+    content.iter().any(|block| match block.get("type").and_then(|v| v.as_str()) {
+        Some("text") => block
+            .get("text")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty()),
+        Some("tool_use") => true,
+        _ => false,
+    })
+}
+
+/// 与流式 `is_clean_eof_without_terminal` 同口径：传输干净、有部分产出、无任何终止信号。
+fn nonstream_clean_eof_without_terminal(
+    completion_ok: bool,
+    explicit_stop: Option<&str>,
+    saw_upstream_stop: bool,
+    saw_tool_stop: bool,
+    has_visible_body: bool,
+    has_tool_use: bool,
+) -> bool {
+    if !completion_ok {
+        return false;
+    }
+    if explicit_stop.is_some() || saw_upstream_stop || saw_tool_stop {
+        return false;
+    }
+    has_visible_body || has_tool_use
+}
+
+/// 与流式 `SseStateManager::get_stop_reason` 同口径。
+fn resolve_nonstream_stop_reason(explicit: Option<String>, has_tool_use: bool) -> String {
+    match explicit {
+        Some(reason) => reason,
+        None if has_tool_use => "tool_use".to_string(),
+        None => "end_turn".to_string(),
+    }
+}
+
+/// 非流式失败收尾：埋点真实 outcome + 非 200。in-band / 解码停止 / 不完整 EOF 共用。
+fn emit_nonstream_completion_failure(
+    completion: &CompletionStatus,
+    meta: &crate::kiro::provider::CallMeta,
+    model: &str,
+    context_input_tokens: Option<i32>,
+    input_tokens: i32,
+    credits_used: Option<f64>,
+    provider: &crate::kiro::provider::KiroProvider,
+    client: &ClientInfo,
+) -> Response {
+    let mut record = crate::usage::RequestRecord::new(
+        Uuid::new_v4().to_string(),
+        meta.model.clone().unwrap_or_else(|| model.to_string()),
+    );
+    record.requested_model = meta.model.clone();
+    record.upstream_model = meta.mapped_model.clone();
+    record.credential_id = Some(meta.credential_id);
+    record.session_id = meta.session_id.clone();
+    record.is_streaming = meta.is_streaming;
+    record.input_tokens = context_input_tokens.unwrap_or(input_tokens);
+    record.credits_used = credits_used;
+    record.latency_ms = meta.latency_ms;
+    record.retries = meta.retries;
+    record.outcome = completion.outcome();
+    record.error_message = Some(completion.client_message());
+    if let Some(c) = record.credits_used {
+        provider.report_credits(meta.credential_id, c);
+    }
+    client.apply(&mut record);
+    crate::usage::emit_record(record);
+    let status =
+        StatusCode::from_u16(completion.http_status_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    (
+        status,
+        Json(ErrorResponse::new(
+            completion.sse_error_type(),
+            completion.client_message(),
+        )),
+    )
+        .into_response()
+}
+
 /// 处理非流式请求
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
@@ -3568,7 +3752,7 @@ async fn handle_non_stream_request(
     };
 
     // 读取响应体
-    let body_bytes = match response.bytes().await {
+    let body_bytes: bytes::Bytes = match response.bytes().await {
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::error!("读取响应体失败: {}", e);
@@ -3605,7 +3789,10 @@ async fn handle_non_stream_request(
     let mut reasoning_signature: Option<String> = None;
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
-    let mut stop_reason = "end_turn".to_string();
+    // 不再默认 end_turn：缺终止信号时由 resolve / 不完整 EOF 判定，避免把截断当成功。
+    let mut stop_reason: Option<String> = None;
+    let mut saw_upstream_stop = false;
+    let mut saw_tool_stop = false;
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
     // 从 meteringEvent 解析的真实 credit 消耗量
@@ -3635,6 +3822,9 @@ async fn handle_non_stream_request(
                         }
                         Event::ToolUse(tool_use) => {
                             has_tool_use = true;
+                            if tool_use.stop {
+                                saw_tool_stop = true;
+                            }
 
                             // 累积工具的 JSON 输入（自适应累积快照 vs 纯增量，与流式路径同源修复）：
                             // Kiro 同一 tool_use_id 的 input 可能是"到目前为止的完整 JSON"（累积）
@@ -3776,7 +3966,7 @@ async fn handle_non_stream_request(
                             }
                             // 上界判定与下界守卫**互不依赖**：即便将来下界改动，这条照旧生效。
                             if pct >= 100.0 {
-                                stop_reason = "model_context_window_exceeded".to_string();
+                                stop_reason = Some("model_context_window_exceeded".to_string());
                             }
                         }
                         Event::Metering(metering) => {
@@ -3806,7 +3996,7 @@ async fn handle_non_stream_request(
                         } => {
                             // 铁律：ContentLengthExceededException = max_tokens 干净收尾，绝不算失败。
                             if exception_type == "ContentLengthExceededException" {
-                                stop_reason = "max_tokens".to_string();
+                                stop_reason = Some("max_tokens".to_string());
                             } else if completion.is_ok() {
                                 // 其它异常是上游真实失败，置失败态（保留首因）。
                                 tracing::error!(
@@ -3836,6 +4026,20 @@ async fn handle_non_stream_request(
                                     code: error_code,
                                     message: error_message,
                                 };
+                            }
+                        }
+                        Event::Metadata(meta) => {
+                            // 与流式 process 路径同源：复用 map_metadata_stop_reason，禁止第二张表。
+                            if let Some(mapped) =
+                                crate::kiro::model::events::map_metadata_stop_reason(
+                                    meta.stop_reason.as_deref(),
+                                )
+                            {
+                                saw_upstream_stop = true;
+                                // 已有 tool_use 时客户端 stop_reason 仍走 tool_use；本帧只标记流完整。
+                                if !has_tool_use {
+                                    stop_reason = Some(mapped);
+                                }
                             }
                         }
                         _ => {}
@@ -3882,49 +4086,16 @@ async fn handle_non_stream_request(
     // 完成状态为失败：直接返回非 200 错误响应 + 埋点真实 outcome，绝不把截断输出当 200 成功。
     // （ContentLengthExceededException 走的是 max_tokens，completion 仍为 Ok，不进此分支。）
     if !completion.is_ok() {
-        {
-            let mut record = crate::usage::RequestRecord::new(
-                Uuid::new_v4().to_string(),
-                meta.model.clone().unwrap_or_else(|| model.to_string()),
-            );
-            // 双口径：requested = 客户端原始名，upstream = 映射后名。
-            record.requested_model = meta.model.clone();
-            record.upstream_model = meta.mapped_model.clone();
-            record.credential_id = Some(meta.credential_id);
-            record.session_id = meta.session_id.clone();
-            record.is_streaming = meta.is_streaming;
-            record.input_tokens = context_input_tokens.unwrap_or(input_tokens);
-            record.credits_used = credits_used;
-            record.latency_ms = meta.latency_ms;
-            record.retries = meta.retries;
-            record.outcome = completion.outcome();
-            // 2026-08-11 补：此前的失败记录不写 error_message（恒 NULL，线上 38 条实测
-            // 成因查不出 = 盲区）。这里 client_message() 对失败态必非空（见 stream.rs
-            // CompletionStatus::client_message），成功态不进本分支。
-            record.error_message = Some(completion.client_message());
-            // 生命周期累计花费：本次真实 credit 消耗累加到该凭据（独立于用量保留期，只增不清）。
-            if let Some(c) = record.credits_used {
-                provider.report_credits(meta.credential_id, c);
-            }
-            client.apply(&mut record);
-            crate::usage::emit_record(record);
-        }
-        let status =
-            StatusCode::from_u16(completion.http_status_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-        let sse_error_type = completion.sse_error_type();
-        return (
-            status,
-            Json(ErrorResponse::new(
-                sse_error_type,
-                completion.client_message(),
-            )),
-        )
-            .into_response();
-    }
-
-    // 确定 stop_reason
-    if has_tool_use && stop_reason == "end_turn" {
-        stop_reason = "tool_use".to_string();
+        return emit_nonstream_completion_failure(
+            &completion,
+            &meta,
+            model,
+            context_input_tokens,
+            input_tokens,
+            credits_used,
+            &provider,
+            &client,
+        );
     }
 
     // 构建响应内容
@@ -3987,8 +4158,34 @@ async fn handle_non_stream_request(
     // 全花在思考上 —— 补一个空格 text 块并置 stop_reason=max_tokens，否则客户端
     // 拿到「只有 thinking 无正文」的响应，Claude Code 会视作空回答。
     if thinking_enabled && content_is_thinking_only(&content) {
-        stop_reason = "max_tokens".to_string();
+        stop_reason = Some("max_tokens".to_string());
         content.push(json!({"type": "text", "text": " "}));
+    }
+
+    // 干净 EOF：有部分正文/未 stop 的 tool，却没有任何终止信号。不得 200 + end_turn。
+    // 空响应当下方 near_empty_response 处理（completion 保持 Ok）。
+    // thinking-only 已在上面显式置 max_tokens，不会进本分支。
+    if nonstream_clean_eof_without_terminal(
+        completion.is_ok(),
+        stop_reason.as_deref(),
+        saw_upstream_stop,
+        saw_tool_stop,
+        nonstream_content_has_visible_body(&content),
+        has_tool_use,
+    ) {
+        completion = CompletionStatus::Incomplete {
+            message: "传输层干净结束，但缺少 stopReason 或 tool_use 终止信号".to_string(),
+        };
+        return emit_nonstream_completion_failure(
+            &completion,
+            &meta,
+            model,
+            context_input_tokens,
+            input_tokens,
+            credits_used,
+            &provider,
+            &client,
+        );
     }
 
     // 估算输出 tokens
@@ -4105,7 +4302,7 @@ async fn handle_non_stream_request(
         "role": "assistant",
         "content": content,
         "model": model,
-        "stop_reason": stop_reason,
+        "stop_reason": resolve_nonstream_stop_reason(stop_reason, has_tool_use),
         "stop_sequence": null,
         "usage": usage
     });
@@ -4254,7 +4451,7 @@ pub async fn post_messages_cc(
     // 保留原始状态的克隆，供 CONTENT_LENGTH_EXCEEDS 重试时重建（渐进式压低 target_bytes，
     // 与 /v1 路径同款；2026-08-11 审计缺口补齐）。native effort 字段随请求体一起走，
     // 压缩只作用于 conversation_state，不受影响。
-    let conv_state_for_compress_retry = conversion_result.conversation_state.clone();
+    let mut conv_state_for_compress_retry = conversion_result.conversation_state.clone();
     let native_fields_for_compress_retry =
         conversion_result.additional_model_request_fields.clone();
     let request_body = match build_kiro_request_body(
@@ -4321,12 +4518,11 @@ pub async fn post_messages_cc(
         let body_ref: &str = if compress_attempt == 0 {
             &request_body
         } else {
-            let target = compress_retry_target(compression_cfg.trigger_bytes, compress_attempt);
-            response_body = match build_kiro_request_body(
-                conv_state_for_compress_retry.clone(),
-                native_fields_for_compress_retry.clone(),
+            response_body = match rebuild_body_for_compress_retry(
+                &mut conv_state_for_compress_retry,
+                &native_fields_for_compress_retry,
                 &compression_cfg,
-                Some(target),
+                compress_attempt,
             ) {
                 Ok(b) => b,
                 Err(e) => {
@@ -4335,12 +4531,6 @@ pub async fn post_messages_cc(
                     return render_serialization_failed(&e);
                 }
             };
-            tracing::info!(
-                attempt = compress_attempt,
-                target_bytes = target,
-                body_len = response_body.len(),
-                "CONTENT_LENGTH_EXCEEDS: 重新压缩请求体并重试"
-            );
             &response_body
         };
 
@@ -6062,8 +6252,16 @@ pub(crate) mod error_translation_tests {
 
     #[test]
     fn test_pool_cooling_retry_after_still_takes_precedence() {
-        // 零回归：全池冷却分支（带 retry_after_secs=N 标记）在限流判据之前，
-        // 其上游给定的精确秒数不该被本次新增的固定 8s 覆盖。
+        // 错误消息表是进程级 ArcSwap：`configured_status_and_type_override_render`
+        // 会把 `rate_limited_pool` 配成 503。本夹具不持锁就会在全量并行里读到那张表，
+        // 冷却分支仍命中但 status 变成 503（T5 left 503 / right 429），与分支顺序无关。
+        let _guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_error_messages(ErrorMessagesTable::new());
+
+        // 零回归：全池冷却分支（带 retry_after_secs=N 标记）在限流判据 / 通用 503 之前，
+        // 其上游给定的精确秒数不该被固定 8s 或 5xx 503 覆盖。
         let err = anyhow::Error::msg("所有凭据均在冷却（1/5）retry_after_secs=14");
         let resp = map_provider_error(err);
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -6075,6 +6273,23 @@ pub(crate) mod error_translation_tests {
                 .unwrap(),
             "14",
             "全池冷却的精确 retry_after 不该被固定 8s 覆盖"
+        );
+
+        // 源码顺序：冷却 if-let 必须在通用 5xx 503 之前（针拼接，测试段不写完整生产字面量）。
+        let full = include_str!("handlers.rs");
+        let start = full
+            .find("fn map_provider_error(err: Error) -> Response {")
+            .expect("函数签名必须存在");
+        let body = &full[start..];
+        let cooling = ["if let Some(secs) = ", "parse_retry_after_secs(&err_str)"].concat();
+        let five_xx = ["is_upstream_transient_5xx", "(&err_str)"].concat();
+        let cooling_at = body
+            .find(&cooling)
+            .expect("全池冷却 if-let 分支必须存在");
+        let five_xx_at = body.find(&five_xx).expect("通用 5xx 分支必须存在");
+        assert!(
+            cooling_at < five_xx_at,
+            "全池冷却必须排在通用 5xx 503 之前，否则本夹具会被抢走返 503"
         );
     }
 
@@ -6598,6 +6813,53 @@ pub(crate) mod error_translation_tests {
         );
     }
 
+    /// Review3 m1：A7 判据必须锚定串尾（trim 后），裸 contains 会把 body 噪声
+    /// 误判成网关真值。锚定判据与 `parse_upstream_retry_after` 的解析天然一致
+    /// （marker 之后直到串尾全是数字才算）。
+    #[test]
+    fn upstream_retry_after_anchored_requires_marker_at_tail() {
+        let marker = UPSTREAM_RETRY_AFTER_MARKER_PREFIX;
+        assert!(
+            upstream_retry_after_anchored(&format!("x {}30", marker)),
+            "网关追加在末尾（后跟数字）必须锚定"
+        );
+        assert!(
+            upstream_retry_after_anchored(&format!("x {}30  ", marker)),
+            "尾随空白可容忍（trim_end 后锚定）"
+        );
+        assert!(
+            !upstream_retry_after_anchored(&format!("x {}7 y", marker)),
+            "marker 后还有字符 = body 噪声，不得锚定"
+        );
+        assert!(
+            !upstream_retry_after_anchored(&format!("body 噪声 {}999 后还有字", marker)),
+            "marker 不在串尾的噪声不得锚定"
+        );
+        assert!(!upstream_retry_after_anchored("没有这个标记"));
+        assert!(
+            !upstream_retry_after_anchored(&format!("x {}abc", marker)),
+            "marker 后非数字不得锚定"
+        );
+    }
+
+    /// Review3 m1 行为级：marker 不在串尾的噪声串绝不落 A7（5xx 终态不被错误
+    /// 映射回 429+RA——否则客户端拿上游真值做短退避白打）。
+    #[test]
+    fn upstream_retry_after_noise_not_at_tail_never_maps_to_429() {
+        let marker = UPSTREAM_RETRY_AFTER_MARKER_PREFIX;
+        // 网关真实形态是追加在末尾；这里 marker 在串中间（body 噪声形态）。
+        let noise = format!(
+            "流式 API 请求失败: 502 Bad Gateway {{\"message\":\"upstream\"}} {}30 然后结束",
+            marker
+        );
+        let resp = map_provider_error(anyhow::Error::msg(noise));
+        assert_ne!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "marker 不在串尾的噪声不得触发 A7（裸 contains 会误判）"
+        );
+    }
+
     /// ⭐ S2：上游显式 Retry-After 透传 —— 上游真值 > 配置 > 默认 8s。
     ///
     /// provider 在 429 分支把上游 RA 打进错误串（`upstream_retry_after=N`），
@@ -6867,6 +7129,9 @@ pub(crate) mod error_translation_tests {
         // 完整字面量若出现在源码里，include_str! 会把测试段/注释也读进来，生产被删后
         // `.find` 命中它们 → 守卫静默变绿（本仓踩过同型坑）。拼接后源码不存在完整
         // needle；循环级切片保证「移出循环但仍在函数内」的回退也会红。
+        // 2026-08-16 W20：target 计算随 rebuild_body_for_compress_retry 提取进 helper
+        // （F3 字节兜底），循环内调用 helper——断言改为「循环调用 helper + 全段
+        // compress_retry_target 存在」，防 helper 内联回循环（目标公式反向回归）。
         let full = include_str!("handlers.rs");
         let needle = format!("{}: loop {}", "'compress_retry", "{");
         let start = full
@@ -6878,8 +7143,14 @@ pub(crate) mod error_translation_tests {
             .unwrap_or(full.len());
         let body = &full[start..end];
         assert!(
-            body.contains("compress_retry_target("),
-            "压缩重试必须用 compress_retry_target 计算目标字节数"
+            body.contains("rebuild_body_for_compress_retry("),
+            "压缩重试循环必须调用 rebuild_body_for_compress_retry（字节兜底 + target 计算）"
+        );
+        let cut = full.find("#[cfg(test)]").unwrap_or(full.len());
+        let prod = &full[..cut];
+        assert!(
+            prod.contains("compress_retry_target("),
+            "compress_retry_target 必须存在（helper 内计算目标字节数）"
         );
     }
 
@@ -6915,9 +7186,17 @@ pub(crate) mod error_translation_tests {
             .map(|i| return_at + i)
             .unwrap_or(cc.len());
         let loop_body = &cc[start..end];
+        // W20：target 公式在 rebuild_body_for_compress_retry 内；循环必须调 helper，
+        // 不得把 compress_retry_target 再内联回 /cc/v1 循环（与 /v1 守卫同口径）。
         assert!(
-            loop_body.contains("compress_retry_target("),
-            "/cc/v1 压缩重试必须用 compress_retry_target 计算目标字节数"
+            loop_body.contains("rebuild_body_for_compress_retry("),
+            "/cc/v1 压缩重试循环必须调用 rebuild_body_for_compress_retry"
+        );
+        let cut = full.find("#[cfg(test)]").unwrap_or(full.len());
+        let prod = &full[..cut];
+        assert!(
+            prod.contains("compress_retry_target("),
+            "compress_retry_target 必须存在（helper 内计算目标字节数）"
         );
         let strip_needle = format!("remove(\"x-kirostudio-{}\")", "compress-retry");
         assert!(
@@ -7021,6 +7300,90 @@ pub(crate) mod error_translation_tests {
             body.contains(field.as_str()),
             "压缩重试循环重建 body 时必须传入捕获的 native effort 字段 \
              （丢了 = 重试请求的 extended thinking 静默失效）"
+        );
+    }
+
+    /// 行为测试：CONTENT_LENGTH_EXCEEDS 重试路径重建 body 时**先走字节兜底**。
+    ///
+    /// 上游按字节拒绝（400 CONTENT_LENGTH_EXCEEDS_THRESHOLD），token 压缩压不到目标
+    /// 时（长会话字节先撞线），重试重建必须先截断历史（量纲对齐）再走 token 压缩。
+    /// 断言的是传入的 state 被就地字节兜底（历史变短 + 首条占位）：token 压缩的
+    /// L1-L5 层做不到"插入占位说明"，占位出现即证明截断路径真正执行了。
+    #[test]
+    fn compress_retry_rebuild_applies_byte_overflow_guard() {
+        use crate::model::config::CompressionConfig;
+
+        let big = "p".repeat(200 * 1024);
+        let mut hist = Vec::new();
+        for _ in 0..6 {
+            hist.push(crate::kiro::model::requests::conversation::Message::User(
+                crate::kiro::model::requests::conversation::HistoryUserMessage::new(
+                    &big,
+                    "claude-sonnet-4.5",
+                ),
+            ));
+            hist.push(crate::kiro::model::requests::conversation::Message::Assistant(
+                crate::kiro::model::requests::conversation::HistoryAssistantMessage::new(&big),
+            ));
+        }
+        let mut state = crate::kiro::model::requests::conversation::ConversationState::new("conv-1")
+            .with_history(hist);
+
+        let mut cfg = CompressionConfig::default();
+        cfg.enabled = true;
+        cfg.trigger_bytes = 4 * 1024 * 1024;
+
+        let body = rebuild_body_for_compress_retry(&mut state, &None, &cfg, 1)
+            .expect("重试重建应成功");
+
+        // 字节兜底执行证据：历史被截断 + 首条为占位说明（token 压缩不做这两件事）。
+        assert!(
+            state.history.len() < 12,
+            "重试路径必须先按字节截断历史，实际保留 {} 条",
+            state.history.len()
+        );
+        match state.history.first() {
+            Some(crate::kiro::model::requests::conversation::Message::User(m)) => assert_eq!(
+                m.user_input_message.content,
+                crate::anthropic::converter::TRUNCATION_PLACEHOLDER,
+                "截断处必须插入占位说明"
+            ),
+            other => panic!("首条应为占位 user 消息，实际: {other:?}"),
+        }
+        // 截断后 ≤ 900KB，必低于 attempt=1 的 target（4MiB × 3/4 = 3MiB）。
+        assert!(
+            body.len() <= 3 * 1024 * 1024,
+            "重试 body 应被压到 target 以内，实际 {}",
+            body.len()
+        );
+    }
+
+    /// 守卫：双入口压缩重试循环都走 `rebuild_body_for_compress_retry`，且该函数
+    /// 内部必须调用字节兜底（`apply_byte_overflow_guard`）。行为测试只能证明函数
+    /// 能力本身，钉的是接线——若有人把某入口的调用改回旧的 `build_kiro_request_body`
+    /// 直连（跳过字节兜底），行为测试照样绿，只有这条会红。
+    #[test]
+    fn compress_retry_loops_wired_to_byte_overflow_guard() {
+        let full = include_str!("handlers.rs");
+        let prod = full.split("\n#[cfg(test)]").next().unwrap_or(full);
+        // 函数定义 1 处 + 双入口循环（/v1、/cc/v1）各 1 处调用 = 3。
+        let calls = prod.matches("rebuild_body_for_compress_retry(").count();
+        assert!(
+            calls >= 3,
+            "重试重建必须由双入口共用 helper 且 helper 被调用，实际 {calls} 处"
+        );
+        let helper_start = prod
+            .find("fn rebuild_body_for_compress_retry(")
+            .expect("rebuild_body_for_compress_retry 必须存在");
+        let helper_end = prod[helper_start..]
+            .find("\n}\n")
+            .map(|i| helper_start + i)
+            .unwrap_or(prod.len());
+        let helper = &prod[helper_start..helper_end];
+        assert!(
+            helper.contains("apply_byte_overflow_guard(conv_state)"),
+            "重试重建必须调用字节兜底（sanitize + 字节截断）；带实参形态匹配，\
+             防 doc 注释里的裸词冒充真实调用"
         );
     }
 
@@ -7924,6 +8287,88 @@ mod websearch_usage_accounting_tests {
             "回灌埋点必须写入 record.upstream_model（末轮映射名），否则 by_model 聚合失真"
         );
     }
+
+    /// 失败路径必须埋一条非 Success 记录。历史：Err 臂只回 Response、零 emit，
+    /// 面板上看不到失败的混合搜索。源码守卫 + 分类函数行为测试。
+    #[test]
+    fn emit_websearch_loop_error_path_records_failure() {
+        let src = include_str!("handlers.rs");
+        let prod = src.split("\n#[cfg(test)]").next().unwrap_or(src);
+        let dispatch = prod
+            .split("async fn dispatch_web_search_loop")
+            .nth(1)
+            .expect("dispatch_web_search_loop 不应被改名")
+            .split("\nfn render_provider_not_configured")
+            .next()
+            .expect("dispatch 体应在 render_provider_not_configured 之前结束");
+        let call = [
+            "emit_websearch_loop_error_usage(",
+            "provider, payload, &fail, client, ",
+            "wants_stream)",
+        ]
+        .concat();
+        assert!(
+            dispatch.contains(&call),
+            "回灌 Err 臂必须调用失败埋点（旧代码只回 Response，面板上看不到失败混合搜索）"
+        );
+        let emit_fn = prod
+            .split("fn emit_websearch_loop_error_usage")
+            .nth(1)
+            .expect("emit_websearch_loop_error_usage 不应被改名")
+            .split("\nfn websearch_loop_error_outcome")
+            .next()
+            .expect("失败埋点之后应是 outcome 分类函数");
+        let rec = ["crate::usage::emit", "_record(record)"].concat();
+        assert!(
+            emit_fn.contains(&rec),
+            "失败埋点必须 emit_record，否则用量管道收不到失败混合搜索"
+        );
+        assert!(
+            !emit_fn.contains("RequestOutcome::Success"),
+            "失败埋点不得写成 Success"
+        );
+    }
+
+    #[test]
+    fn websearch_loop_error_outcome_matches_provider_failures() {
+        use crate::usage::RequestOutcome;
+        assert_eq!(
+            websearch_loop_error_outcome(StatusCode::TOO_MANY_REQUESTS),
+            RequestOutcome::RateLimited
+        );
+        assert_eq!(
+            websearch_loop_error_outcome(StatusCode::BAD_GATEWAY),
+            RequestOutcome::ServerError
+        );
+        assert_eq!(
+            websearch_loop_error_outcome(StatusCode::INTERNAL_SERVER_ERROR),
+            RequestOutcome::ServerError
+        );
+        assert_eq!(
+            websearch_loop_error_outcome(StatusCode::SERVICE_UNAVAILABLE),
+            RequestOutcome::ServerError
+        );
+        assert_eq!(
+            websearch_loop_error_outcome(StatusCode::BAD_REQUEST),
+            RequestOutcome::BadRequest
+        );
+        assert_eq!(
+            websearch_loop_error_outcome(StatusCode::FORBIDDEN),
+            RequestOutcome::AuthFailed
+        );
+        assert_eq!(
+            websearch_loop_error_outcome(StatusCode::UNAUTHORIZED),
+            RequestOutcome::AuthFailed
+        );
+        assert_eq!(
+            websearch_loop_error_outcome(StatusCode::NOT_FOUND),
+            RequestOutcome::OtherError
+        );
+        assert_ne!(
+            websearch_loop_error_outcome(StatusCode::BAD_GATEWAY),
+            RequestOutcome::Success
+        );
+    }
 }
 
 #[cfg(test)]
@@ -8074,13 +8519,23 @@ mod truncation_completion_tests {
     // 引入 PRELUDE_SIZE
     use crate::kiro::parser::frame::PRELUDE_SIZE;
 
-    /// 复刻非流式 handler 的解码收尾判定：drain 全部帧，遇 in-band error/非 CL 异常/
-    /// 解码器停止置失败态，返回最终 CompletionStatus。
-    fn decode_to_completion(data: &[u8]) -> CompletionStatus {
+    /// 复刻非流式 handler 的解码收尾：drain 全部帧，映射 metadata.stopReason，
+    /// 遇 in-band error/非 CL 异常/解码器停止/不完整 EOF 置失败态。
+    struct NonStreamTerminal {
+        completion: CompletionStatus,
+        stop_reason: String,
+    }
+
+    fn collect_nonstream_terminal(data: &[u8]) -> NonStreamTerminal {
         let mut decoder = EventStreamDecoder::new();
         decoder.feed(data).unwrap();
 
         let mut completion = CompletionStatus::Ok;
+        let mut stop_reason: Option<String> = None;
+        let mut saw_upstream_stop = false;
+        let mut saw_tool_stop = false;
+        let mut has_tool_use = false;
+        let mut text_content = String::new();
         let mut last_err: Option<String> = None;
         for result in decoder.decode_iter() {
             match result {
@@ -8089,6 +8544,15 @@ mod truncation_completion_tests {
                     let et = frame.event_type().map(|s| s.to_string());
                     match Event::from_frame(frame) {
                         Ok(event) => match event {
+                            Event::AssistantResponse(resp) => {
+                                text_content.push_str(&resp.content);
+                            }
+                            Event::ToolUse(tool_use) => {
+                                has_tool_use = true;
+                                if tool_use.stop {
+                                    saw_tool_stop = true;
+                                }
+                            }
                             Event::Error {
                                 error_code,
                                 error_message,
@@ -8104,13 +8568,25 @@ mod truncation_completion_tests {
                                 exception_type,
                                 message,
                             } => {
-                                if exception_type != "ContentLengthExceededException"
-                                    && completion.is_ok()
-                                {
+                                if exception_type == "ContentLengthExceededException" {
+                                    stop_reason = Some("max_tokens".to_string());
+                                } else if completion.is_ok() {
                                     completion = CompletionStatus::UpstreamError {
                                         code: exception_type,
                                         message,
                                     };
+                                }
+                            }
+                            Event::Metadata(meta) => {
+                                if let Some(mapped) =
+                                    crate::kiro::model::events::map_metadata_stop_reason(
+                                        meta.stop_reason.as_deref(),
+                                    )
+                                {
+                                    saw_upstream_stop = true;
+                                    if !has_tool_use {
+                                        stop_reason = Some(mapped);
+                                    }
                                 }
                             }
                             _ => {}
@@ -8133,7 +8609,27 @@ mod truncation_completion_tests {
                 message: last_err.unwrap_or_default(),
             };
         }
-        completion
+        let has_visible_body = !text_content.trim().is_empty();
+        if nonstream_clean_eof_without_terminal(
+            completion.is_ok(),
+            stop_reason.as_deref(),
+            saw_upstream_stop,
+            saw_tool_stop,
+            has_visible_body,
+            has_tool_use,
+        ) {
+            completion = CompletionStatus::Incomplete {
+                message: "传输层干净结束，但缺少 stopReason 或 tool_use 终止信号".to_string(),
+            };
+        }
+        NonStreamTerminal {
+            completion,
+            stop_reason: resolve_nonstream_stop_reason(stop_reason, has_tool_use),
+        }
+    }
+
+    fn decode_to_completion(data: &[u8]) -> CompletionStatus {
+        collect_nonstream_terminal(data).completion
     }
 
     #[test]
@@ -8237,6 +8733,157 @@ mod truncation_completion_tests {
         let frame = d.decode_iter().next().unwrap().unwrap();
         assert_eq!(frame.event_type(), Some("toolUseEvent"));
         assert!(Event::from_frame(frame).is_err());
+    }
+
+    #[test]
+    fn nonstream_metadata_event_stop_reason_max_tokens_surfaces() {
+        let mut data = build_frame(
+            &[
+                (":message-type", "event"),
+                (":event-type", "assistantResponseEvent"),
+            ],
+            br#"{"content":"partial answer that hit the cap"}"#,
+        );
+        data.extend(build_frame(
+            &[
+                (":message-type", "event"),
+                (":event-type", "metadataEvent"),
+            ],
+            br#"{"stopReason":"max_tokens"}"#,
+        ));
+        let terminal = collect_nonstream_terminal(&data);
+        assert!(
+            terminal.completion.is_ok(),
+            "metadata 给出 max_tokens 是干净收尾，不是失败"
+        );
+        assert_eq!(
+            terminal.stop_reason, "max_tokens",
+            "上游 metadata.stopReason=max_tokens 必须露出，不得推断成 end_turn"
+        );
+    }
+
+    #[test]
+    fn nonstream_clean_eof_partial_text_without_stop_is_not_success_end_turn() {
+        let data = build_frame(
+            &[
+                (":message-type", "event"),
+                (":event-type", "assistantResponseEvent"),
+            ],
+            br#"{"content":"this answer was cut off mid-"}"#,
+        );
+        let terminal = collect_nonstream_terminal(&data);
+        assert!(
+            !terminal.completion.is_ok(),
+            "干净 EOF + 部分正文 + 无终止信号不得记成功"
+        );
+        assert_ne!(
+            terminal.completion.http_status_u16(),
+            200,
+            "不完整必须非 200"
+        );
+        match terminal.completion {
+            CompletionStatus::Incomplete { .. } => {}
+            other => panic!("期望 Incomplete，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nonstream_tool_stop_true_without_metadata_is_complete_tool_use() {
+        let data = build_frame(
+            &[(":message-type", "event"), (":event-type", "toolUseEvent")],
+            br#"{"name":"Read","toolUseId":"toolu_1","input":"{\"path\":\"/a\"}","stop":true}"#,
+        );
+        let terminal = collect_nonstream_terminal(&data);
+        assert!(
+            terminal.completion.is_ok(),
+            "tool_use stop=true 即终止，无需 metadata"
+        );
+        assert_eq!(
+            terminal.stop_reason, "tool_use",
+            "有 stop:true 的 tool 帧即使没有 metadata 也是完整 tool_use"
+        );
+    }
+
+    #[test]
+    fn nonstream_empty_body_without_metadata_is_not_incomplete() {
+        // 完全空留给 near_empty_response（completion 保持 Ok），不是 Incomplete。
+        let terminal = collect_nonstream_terminal(&[]);
+        assert!(terminal.completion.is_ok());
+        assert_eq!(terminal.stop_reason, "end_turn");
+    }
+
+    #[test]
+    fn resolve_nonstream_stop_reason_matches_stream_get_stop_reason() {
+        assert_eq!(
+            resolve_nonstream_stop_reason(Some("max_tokens".into()), false),
+            "max_tokens"
+        );
+        assert_eq!(
+            resolve_nonstream_stop_reason(None, true),
+            "tool_use"
+        );
+        assert_eq!(
+            resolve_nonstream_stop_reason(None, false),
+            "end_turn"
+        );
+        assert_eq!(
+            resolve_nonstream_stop_reason(Some("end_turn".into()), true),
+            "end_turn",
+            "显式 end_turn 优先于 has_tool_use（与流式 get_stop_reason 一致）"
+        );
+    }
+
+    #[test]
+    fn nonstream_content_has_visible_body_ignores_thinking_only_space() {
+        use serde_json::json;
+        assert!(nonstream_content_has_visible_body(&[json!({
+            "type": "text",
+            "text": "hello"
+        })]));
+        assert!(!nonstream_content_has_visible_body(&[json!({
+            "type": "thinking",
+            "thinking": "x"
+        })]));
+        assert!(
+            !nonstream_content_has_visible_body(&[json!({"type": "text", "text": " "})]),
+            "thinking-only 补的空格不算可见正文"
+        );
+        assert!(nonstream_content_has_visible_body(&[json!({
+            "type": "tool_use",
+            "name": "Read"
+        })]));
+    }
+
+    #[test]
+    fn nonstream_must_consume_metadata_event_and_reject_clean_eof() {
+        let src = include_str!("handlers.rs");
+        let start = src
+            .find("async fn handle_non_stream_request(")
+            .expect("handle_non_stream_request 必须存在");
+        let rest = &src[start..];
+        let end = rest
+            .find("\nfn override_thinking_from_model_name")
+            .expect("下一函数定位不应被改名");
+        let prod: String = rest[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let meta_arm = format!("{}::{}", "Event", "Metadata");
+        let mapper = ["map_metadata", "_stop_reason"].concat();
+        let incomplete = format!("{}::{}", "CompletionStatus", "Incomplete");
+        assert!(
+            prod.contains(&meta_arm),
+            "非流式 match 必须消费 Metadata 帧（不能再 _ => 丢掉 stopReason）"
+        );
+        assert!(
+            prod.contains(&mapper),
+            "必须复用 map_metadata_stop_reason，禁止第二张映射表"
+        );
+        assert!(
+            prod.contains(&incomplete),
+            "干净 EOF 无终止必须落非 Ok 完成态"
+        );
     }
 }
 

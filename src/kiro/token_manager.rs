@@ -1825,8 +1825,6 @@ pub struct CredentialEntrySnapshot {
     pub request_limit: Option<u64>,
     /// 自定义 API 代挂:累计已发请求数
     pub request_count: u64,
-    /// 自定义 API 代挂:deepseek 协议归一化开关(None=false)
-    pub deepseek_normalize: Option<bool>,
     /// 是否豁免全局模型映射(None=false，即应用映射)
     pub model_mapping_exempt: Option<bool>,
     /// 是否有 Profile ARN
@@ -2125,6 +2123,18 @@ pub struct MultiTokenManager {
     /// 设计缺陷：此前把 INVALID_MODEL_ID 当"整个号坏了"冷却/自动禁用，导致一个客户端请求
     /// 一个订阅不含的模型就能把能正常服务其它模型的号（乃至整池）全部打下线。
     model_blocklist: Mutex<HashMap<(u64, String), Instant>>,
+    /// 模型目录缓存（模型感知正向路由，S1）：key = credential id。
+    ///
+    /// 只写 custom_api 号（巡检只探这些号）；ksk 号无目录概念恒 Unknown
+    /// （`select_custom_api_inner` 只处理 custom_api）。写入**唯一来源**是巡检成功
+    /// （设计文档 §2：负向证据走 `model_blocklist` 黑名单，双通道互不重复）。
+    /// TTL 见 [`MODEL_CATALOG_TTL`]；空列表不写（保持 Unknown）。过期的查询时
+    /// 惰性判 Unknown，由巡检任务下轮覆盖写。
+    model_catalog_cache: Mutex<HashMap<u64, ModelCatalogEntry>>,
+    /// 巡检单飞锁：per-id TokioMutex（同一凭据不并发 fetch；换上游/删号时移除）。
+    model_catalog_locks: Mutex<HashMap<u64, Arc<TokioMutex<()>>>>,
+    /// 巡检失败退避：key = credential id，值见 [`CatalogBackoff`]。
+    model_catalog_backoff: Mutex<HashMap<u64, CatalogBackoff>>,
     /// 号池/族级健康评分 + 熔断半开渐进放回（balanced 选号 p_avail 权重 + 429 后逐步试探放回）。
     health: HealthTracker,
     /// 每凭据 RPM 软上限（0 = 不限制）（原子镜像,reload 热更）
@@ -2352,6 +2362,33 @@ const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 /// 若要精确化，需要按"耗尽窗口时长分布"来定，而那需要先积累样本。
 const POOL_EXHAUSTED_RETRY_AFTER_SECS: u64 = 10;
 
+/// 每凭据最大并发（in-flight 上限）硬门（迁移差距 P1，对齐 kiro-rs-admin v0.9.55
+/// 的每账号 max_concurrency）。
+///
+/// 与 [`InflightGuard`] 的关系：guard 是「持有期标记」（选中 +1、流真正结束 -1，
+/// 见 `scheduling.rs`），本常量是「硬门」——`inflight >= 上限` 的号在选号时被跳过
+/// （不可选）。二者互补：guard 保证计数准确，硬门保证单号不被灌爆（上游风控）。
+/// 与 RPM 饱和也互补：RPM 限「速率」，本门限「瞬时并发」。
+///
+/// 取 16 的理由：线上每号常态在途约 8.6（6000 RPM / 200 号的实测参考值），16 是
+/// 常态的两倍、正常并发形态远够不到；只有单号被异常灌爆（慢流堆积/亲和钉死）时才
+/// 触发。历史教训（`is_entry_selectable_inner` 的旧注释）：硬门设 1 会把「每号同时
+/// 只 1 个请求」变成假性限流；16 是真正的饱和级护栏，不是常态阻塞。
+///
+/// ⚠️ 每凭据覆盖暂未落地（`KiroCredentials` 在 `credentials.rs`，不在本次改动范围）：
+/// 先以全局默认值起步；需要 per-cred 覆盖时给凭据加字段并在选号判据
+/// （`at_max_concurrency`）里改为优先读该字段（0 = 不限，镜像参考仓语义）。
+pub const CREDENTIAL_MAX_CONCURRENCY: u32 = 16;
+
+/// 该凭据是否已达并发上限（硬门判据，镜像 kiro-rs-admin 的 `is_concurrency_exceeded`）。
+///
+/// 调用约定：**必须在持 `entries` 锁时调用**——选号路径的 check 与 acquire 在同一
+/// 临界区内完成（`select_custom_api_inner` / `commit_selection`），check-then-acquire
+/// 才原子；锁外调用会有 check 通过后 inflight 已被他人 +1 越过上限的竞态。
+fn at_max_concurrency(entry: &CredentialEntry) -> bool {
+    entry.inflight.load(Ordering::Acquire) >= CREDENTIAL_MAX_CONCURRENCY
+}
+
 /// 全池无立即可用候选时,一个候选为何在等待——决定调用方终态处理与文案类别。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WaitReason {
@@ -2359,6 +2396,9 @@ enum WaitReason {
     Cooling,
     /// RPM 饱和,滑窗过期即恢复(L4 背压):属"限流/繁忙"可重试类别,绝不报"已禁用"。
     RpmRecovery,
+    /// 并发上限硬门（[`CREDENTIAL_MAX_CONCURRENCY`]）：在飞请求连续释放（流结束即 -1），
+    /// 短固定等待后重选即大概率命中；属"繁忙"可重试类别，与 RpmRecovery 同族。
+    ConcurrencyFull,
 }
 
 /// select 返 None 时的等待判定结果(见 transient_wait_outcome)。
@@ -2392,6 +2432,62 @@ struct SchedulingSemantics {
 /// 下一个请求 60s 后照样撞。30min 内调度器跳过该 (号, 模型) 对；上游模型分组调整后
 /// 30min 自动解禁，不需要人工干预。
 const MODEL_BLOCK_TTL: StdDuration = StdDuration::from_secs(1800);
+
+/// 模型支持三态（模型感知正向路由，S1，zyphr `cached_model_support` 同款）：
+/// - `Confirmed`：巡检目录含目标模型（改写后名，大小写不敏感）；
+/// - `Unknown`：无目录 / 目录过期 / 不巡检的号 —— 中性，排序与无缓存时完全一致；
+/// - `Unsupported`：目录明确不含 —— 软降权（仅排序压后，**绝不出局**）。
+///
+/// 与 `model_blocklist`（黑名单）的分工：黑名单是运行时负向证据（filter 硬门出局），
+/// 本三态是离线正向证据（排序软偏好），判定先后天然隔离。设计见
+/// docs/model-forward-routing-design.md §2-§3。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelSupport {
+    Confirmed,
+    Unknown,
+    Unsupported,
+}
+
+/// 单凭据的模型目录缓存条目（per-id 目录形态，设计文档 §2）：上游 `/models` 拉回的
+/// 模型名列表（已排序去重）+ 刷新时刻。目录形态优于 per-(id, model) 状态表：
+/// 条目数 = 号数而非号数 × 模型数，TTL 语义自然落在目录上，判定是线性扫描。
+struct ModelCatalogEntry {
+    models: Vec<String>,
+    refreshed_at: Instant,
+}
+
+/// 巡检失败退避状态（指数，见 `MODEL_CATALOG_BACKOFF_*`）。
+struct CatalogBackoff {
+    /// 连续失败次数（成功即重置）
+    failures: u32,
+    /// 退避到期时刻（在此之前跳过巡检；该号维持 Unknown = 排序中性）
+    until: Instant,
+}
+
+/// 模型目录缓存 TTL（30min，与 [`MODEL_BLOCK_TTL`] 同量级——负向证据与正向证据
+/// 同一刷新尺度，注释互相引用）。过期条目在查询时惰性判 Unknown，由巡检任务
+/// 下轮覆盖写（设计文档 §2）。
+const MODEL_CATALOG_TTL_SECS: u64 = 30 * 60;
+const MODEL_CATALOG_TTL: StdDuration = StdDuration::from_secs(MODEL_CATALOG_TTL_SECS);
+/// 巡检失败退避：第 n 次连续失败等 `BASE × 2^(n-1)`，上限 [`MODEL_CATALOG_BACKOFF_MAX_SECS`]。
+/// 退避只影响巡检节奏（该号维持 Unknown），不进排序判定（设计文档 §5）。
+const MODEL_CATALOG_BACKOFF_BASE_SECS: u64 = 60;
+const MODEL_CATALOG_BACKOFF_MAX_SECS: u64 = 30 * 60;
+/// 退避指数封顶：`2^6 × 60 = 3840s` 已超上限，更大指数无意义（防移位溢出）。
+const MODEL_CATALOG_BACKOFF_MAX_SHIFT: u32 = 6;
+/// 巡检任务启动延迟（region 回填同款：避开启动期 token 预刷新抢上游往返）。
+const MODEL_CATALOG_PROBE_START_DELAY_SECS: u64 = 10;
+
+/// 纯判定（无状态，可单测）：目录含目标（大小写不敏感）→ `Confirmed`，否则
+/// `Unsupported`。空目录不会到这一步——查询无条目时在 `model_support` 短路为
+/// `Unknown`（空列表不写缓存，设计文档 §2 第 4 点）。
+fn support_for(target: &str, models: &[String]) -> ModelSupport {
+    if models.iter().any(|m| m.eq_ignore_ascii_case(target)) {
+        ModelSupport::Confirmed
+    } else {
+        ModelSupport::Unsupported
+    }
+}
 
 /// 测试用压力次数。历史版本曾把此值用作 custom_api 自动禁用阈值；生产逻辑已移除。
 // 用 `cfg(any(test))` 是因为本文件的源码守卫以测试模块属性作为生产代码截止点。
@@ -2693,6 +2789,9 @@ impl MultiTokenManager {
             rate_limit_enabled: AtomicBool::new(rate_limit_enabled),
             affinity: UserAffinityManager::new(),
             model_blocklist: Mutex::new(HashMap::new()),
+            model_catalog_cache: Mutex::new(HashMap::new()),
+            model_catalog_locks: Mutex::new(HashMap::new()),
+            model_catalog_backoff: Mutex::new(HashMap::new()),
             affinity_enabled: AtomicBool::new(affinity_enabled),
             rpm: RpmTracker::new(),
             health: {
@@ -3255,12 +3354,14 @@ impl MultiTokenManager {
         // 模型白名单硬门（与 Kiro 路径同款）：设了 allowed_models 且当前模型不在其中
         // → 过滤掉；model 为空（无模型语义的调用）放行。
         //
-        // ⭐ 门序修复（2026-08-08）：白名单判定改用**重写后的模型名**。模型重写
-        // （deepseek 归一化 → `claude-*`/`gpt-*` 映射到 fallback_model）在
-        // `passthrough::forward` 内、选号**之后**才发生，这里若用原始 `claude-sonnet-4-5-*`
-        // 判白名单，按 model_catalog 注释配 `["deepseek-v4-flash"]` 的代挂号会永久被硬门挡下，
-        // 透传永不发生。deepseek 归一化凭据按归一化后的模型名判；普通凭据用原始模型名。
-        let global_ds = self.config().deepseek_normalize.clone();
+        // 🔴 2026-08-16 行为变化：白名单判定**改回原始模型名**。此前（deepseek 归一化
+        // 时代）选号层按改写后名（fallback 预判）判白名单（`claude-*`/`gpt-*` →
+        // fallback_model）；归一化已完全移除，请求体模型名不再改写（仅 model_mapping
+        // 表映射保留，发生在选号**之后**的 forward 内）—— 白名单必须对客户端原始名
+        // 判定，否则 `["claude-*"]` 白名单会因预判成 `deepseek-v4-flash` 永不命中。
+        // 模型映射规则快照（support_rank 的映射后名判定用，一次取——排序闭包内每
+        // 候选一次读缓存，规则表本身只取一次）。
+        let mapping_rules = self.config().model_mapping.clone();
         // ⭐ RPM 计数**一次加锁批量取回**（与 Kiro 主路径 `select_next_credential` 同款模式）。
         //
         // 此前排序键对每个候选各调一次 `self.rpm.count(e.id)`，每次独立加 RpmTracker
@@ -3269,56 +3370,69 @@ impl MultiTokenManager {
         // `counts_for` 取回全部候选的计数：锁获取 O(n) → O(1)，闭包内退化为纯
         // HashMap 查表。收集成 Vec 同时让排序键变成「快照后稳定全序」（与 Kiro
         // 主路径 memoize 约定一致），min_by_key 的比较器不再依赖链式重算。
-        let candidates: Vec<&CredentialEntry> = entries
-            .iter()
-            .filter(|e| {
-                !e.disabled
-                    && e.credentials.is_custom_api_credential()
-                    && !exclude.contains(&e.id)
-                    && (!cooldown_on || self.cooldown.is_available(e.id))
-                    // 🔴 失败余温硬排除（2026-08-16 复测根治）：近 60s 失败的号**不参与选号**
-                    // （过滤级，非排序位）——复测证明排序位无效：高频形态下 RPM 维度恒判
-                    // 死号优先（死号每轮只被打一次 RPM 恒少），余温位永不参与比较，死号
-                    // 仍每请求白打一跳。过滤排除后：死号 60s 内零命中；全池余温 → 无候选
-                    // → 诚实 503（不白打）；60s 后恢复探测（瞬态抖动不误杀）。
-                    && !e.last_failure_at.get().is_some_and(|t| {
-                        t.elapsed() <= StdDuration::from_secs(PASSTHROUGH_FAILURE_DECAY_SECS)
-                    })
-                    // 🔴 模型黑名单（2026-08-14 根治）：上游明确说过「该模型不支持」的
-                    // 号×模型组合直接跳过——请求 opus-5 不再白付一跳撞 pigcode 类中转站。
-                    && !model.is_some_and(|m| self.is_model_blacklisted(e.id, m))
-                    && model.is_none_or(|m| {
-                        // 🔴 2026-08-09 修：与改写层共用**白名单感知**的 effective_model。
-                        //
-                        // 改前 bug：`effective_model` 无条件把非 `deepseek-` 前缀映射成
-                        // fallback，于是白名单里含 `deepseek-v4-flash` 的号（1365/1439）会对
-                        // **任意** claude 模型放行 —— `claude-opus-5` 被预判成
-                        // `deepseek-v4-flash` 命中白名单 → 选中 → 改写后打过去上游不认 → 400，
-                        // 且错误体被丢弃（error_message 空），根因完全不可见。
-                        // 1438 因白名单只有 `claude-mythos-5`（不含 deepseek-*）而幸免，
-                        // 这解释了"为什么只有部分号中招"。
-                        //
-                        // 现在原模型在白名单里就按原名判、否则按 fallback 判，两层口径一致：
-                        // 选中即意味着改写后的模型该号真的能服务。
-                        let effective = if e.credentials.deepseek_normalize == Some(true) {
-                            let merged = e
-                                .credentials
-                                .deepseek_normalize_config
-                                .as_ref()
-                                .map(|c| c.merge_over(&global_ds))
-                                .unwrap_or_else(|| global_ds.clone());
-                            crate::kiro::deepseek_normalize::effective_model(
-                                m,
-                                &merged,
-                                e.credentials.allowed_models.as_deref(),
-                            )
-                        } else {
-                            m.to_string()
-                        };
-                        e.credentials.allows_model(&effective)
-                    })
+        // 候选判定拆成两个闭包（M1.3 逃生舱要复用**同一套**过滤链，杜绝两处漂移）：
+        // `is_candidate` = 除失败余温外的一切硬门（启用/池型/exclude/冷却/模型黑名单/
+        // 白名单）；`is_warm` = 失败余温（近 PASSTHROUGH_FAILURE_DECAY_SECS 失败）。
+        let is_candidate = |e: &CredentialEntry| {
+            !e.disabled
+                && e.credentials.is_custom_api_credential()
+                && !exclude.contains(&e.id)
+                && (!cooldown_on || self.cooldown.is_available(e.id))
+                // 🔴 并发上限硬门（迁移差距 P1）：inflight >= CREDENTIAL_MAX_CONCURRENCY
+                // 的号**不可选**——上游按账号限瞬时并发，单号被灌爆会触发风控。与
+                // `InflightGuard`（持有期标记）与每凭据闸（等响应头的并发）都不同：
+                // 本门是「同时在飞流数」的硬上限，慢流堆积（响应头已回、流仍在传）时
+                // 只有它能兜住。全部达限 → 候选为空：混池立刻 None 分流 Kiro；
+                // 纯代挂池由 `select_custom_api_or_wait` 短等 ConcurrencyFull 后重选
+                // （与 Kiro `acquire_context` 同款 250ms / MAX_TRANSIENT_WAIT）。
+                && !at_max_concurrency(e)
+                // 🔴 模型黑名单（2026-08-14 根治）：上游明确说过「该模型不支持」的
+                // 号×模型组合直接跳过——请求 opus-5 不再白付一跳撞 pigcode 类中转站。
+                && !model.is_some_and(|m| self.is_model_blacklisted(e.id, m))
+                && model.is_none_or(|m| {
+                    // 🔴 2026-08-16：白名单判定改回**原始模型名**（deepseek 归一化移除）。
+                    // 此前选号层按改写后名（fallback 预判）判白名单（选中即意味着
+                    // 改写后的模型该号真的能服务）；现在请求不再改写，客户端原始名就是
+                    // 实际发给上游的名（映射发生在 forward 内、选号之后），白名单对原始
+                    // 名直接判定即可 —— 判定键 = 发送键，语义自洽。
+                    e.credentials.allows_model(m)
+                })
+        };
+        // 🔴 失败余温硬排除（2026-08-16 复测根治）：近 60s 失败的号**不参与选号**
+        // （过滤级，非排序位）——复测证明排序位无效：高频形态下 RPM 维度恒判
+        // 死号优先（死号每轮只被打一次 RPM 恒少），余温位永不参与比较，死号
+        // 仍每请求白打一跳。过滤排除后：死号 60s 内零命中；60s 后恢复探测
+        // （瞬态抖动不误杀）。
+        let is_warm = |e: &CredentialEntry| {
+            e.last_failure_at.get().is_some_and(|t| {
+                t.elapsed() <= StdDuration::from_secs(PASSTHROUGH_FAILURE_DECAY_SECS)
             })
+        };
+        let mut candidates: Vec<&CredentialEntry> = entries
+            .iter()
+            .filter(|e| is_candidate(e) && !is_warm(e))
             .collect();
+        // 🔴 全池余温逃生舱（2026-08-16 对抗审查 M1.3）：所有候选都带余温（系统性抖动，
+        // 如上游整体压限/集体短暂故障）时不再直接「无候选 → 503」，按**最老余温**号
+        // （失败最早 = 最接近恢复）硬试一次——对照 Kiro 主路径 `select_ignoring_cooldown`
+        // 兜底先例（拿真实上游错误好过网关自造 503）。硬试仍失败则该号余温刷新 + 被
+        // exclude，本请求链继续换下一个最老余温号（每号至多一次，hop 上限兜底）；
+        // 真正死透的号（恒 502）失败时刻被不断刷新，自然排在逃生链末端，健康号恢复
+        // 后可立即重进冷候选，逃生舱不再触发。
+        if candidates.is_empty() {
+            if let Some(oldest) = entries
+                .iter()
+                .filter(|e| is_candidate(e) && is_warm(e))
+                .min_by_key(|e| e.last_failure_at.get())
+            {
+                tracing::warn!(
+                    credential_id = oldest.id,
+                    "全 custom_api 候选均带失败余温：逃生舱硬试最老余温号 #{}（系统性抖动时不再纯 503）",
+                    oldest.id
+                );
+                candidates = vec![oldest];
+            }
+        }
         let cand_ids: Vec<u64> = candidates.iter().map(|e| e.id).collect();
         let rpm_counts = self.rpm.counts_for(&cand_ids);
         let rpm_of = |id: u64| rpm_counts.get(&id).copied().unwrap_or(0);
@@ -3337,10 +3451,40 @@ impl MultiTokenManager {
         let model_calls_of = |id: u64| model_calls.get(&id).copied().unwrap_or(0);
         candidates
             .into_iter()
-            // 均衡分流键(升序):优先级 → ⭐爬坡压力档 → 近 60s RPM → 模型级近期调用 → 在途
-            // → ⭐失败余温(近 60s 上游失败过的号降权) → ⭐显式 tie-break(id=创建序=下标序)。
+            // 均衡分流键(升序):⭐support_rank(正向路由) → 优先级 → 爬坡压力档 →
+            // 近 60s RPM → 模型级近期调用 → 在途 → ⭐失败余温(近 60s 上游失败过的号
+            // 降权) → ⭐显式 tie-break(id=创建序=下标序)。
+            // 8 位结构：support_rank 只进透传池，Kiro 主路径 12 位键（health_tier 起）
+            // 不碰——两池隔离铁律（设计文档 §6，守卫对齐）。
             // rpm/爬坡/模型级均来自上方批量预取。
             .min_by_key(|e| {
+                // ⭐ 模型支持档（2026-08-16 模型感知正向路由 S2，设计文档 §3）：
+                // Confirmed=0 / Unknown=1 / Unsupported=2，升序小整数档位（与主路径
+                // health_tier 同风格，可测、可断言、无魔法系数）。判定键 = **改写后名**
+                // （map_target 结果；exempt 号回落原始名）——请求实际打到上游的名字
+                // 才与目录可比（映射过的请求 claude-opus-5 → gpt-5.6-sol 在 pigcode
+                // 类目录里用原始名永远查不中）。无模型语义的调用（model=None）
+                // 同 Unknown（不参与正向判定，与 model_calls 维度对称）。
+                //
+                // 放**首位**（priority 之前）是有意行为变化：目录确认的号优先于配置
+                // 优先级（正向证据比静态配置更接近「该号能服务该模型」的事实）。
+                // 若线上观察到 priority 语义被过度稀释，可一行降位（设计文档 §3 兜底）。
+                let support_rank = match model {
+                    None => 1u8,
+                    Some(m) => {
+                        let target = if e.credentials.model_mapping_exempt == Some(true) {
+                            m.to_string()
+                        } else {
+                            crate::kiro::model_mapping::map_target(m, &mapping_rules)
+                                .unwrap_or_else(|| m.to_string())
+                        };
+                        match self.model_support(e.id, &target) {
+                            ModelSupport::Confirmed => 0,
+                            ModelSupport::Unknown => 1,
+                            ModelSupport::Unsupported => 2,
+                        }
+                    }
+                };
                 // ⭐ 爬坡压力档（slew-rate 分档）：与 Kiro 主路径共用
                 // `scheduling::ramp_tier_of` —— 5x/2x 阈值、RAMP_MIN_SAMPLES、窗口
                 // 折算全在那一个函数里（2026-08-16 收敛，防两池分叉）。纯 RPM 派生，
@@ -3355,17 +3499,19 @@ impl MultiTokenManager {
                     crate::kiro::scheduling::ramp_tier_of(recent, total)
                 };
                 (
-                    e.credentials.priority,
-                    ramp_tier,
-                    rpm_of(e.id),
-                    model_calls_of(e.id),
-                    e.inflight.load(Ordering::Acquire),
+                    support_rank,                    // ① NEW 模型支持档（正向路由）
+                    e.credentials.priority,          // ② 优先级（池内首选）
+                    ramp_tier,                       // ③ 爬坡压力档
+                    rpm_of(e.id),                    // ④ 近 60s RPM
+                    model_calls_of(e.id),            // ⑤ 该模型近期调用数
+                    e.inflight.load(Ordering::Acquire), // ⑥ 在途
                     // ⭐ 失败余温降权位（2026-08-16 N1 根治）：近 PASSTHROUGH_FAILURE_DECAY_SECS
                     // 内上游失败（5xx/429/401/403）的号 → 1 排后，健康号优先。
                     //
                     // 为什么放倒数第二（仅 e.id tie-break 在它之后）：它是**软降权**——
-                    // 只在其余均衡维度（RPM/爬坡/在途）全平局时生效（线上低负载形态正是
-                    // 如此：请求间隔 >60s，RPM 滑窗归零，前 5 键全平）。RPM 有数据时仍以
+                    // 只在其余均衡维度（支持档/优先级/RPM/爬坡/在途）全平局时生效
+                    // （线上低负载形态正是如此：请求间隔 >60s，RPM 滑窗归零，
+                    // support_rank 同档时前 6 键全平）。RPM 有数据时仍以
                     // 真实负载分流，避免用失败记忆压住正在真实工作的号。
                     //
                     // 为什么独立于冷却体系：`cooldown_custom_api` 被 `cooldown_enabled`
@@ -3448,6 +3594,146 @@ impl MultiTokenManager {
             })
     }
 
+    /// Kiro 路径此刻是否有**立即可选**号（`is_entry_selectable`，不含 custom_api）。
+    ///
+    /// 透传满并发时的分流开关：有则立刻 `None` 让 Kiro 吃溢出；无则才短等
+    /// `WaitReason::ConcurrencyFull`（纯代挂大中转站：inflight 毫秒级释放，立刻
+    /// None 会硬失败）。只 peek，不占位、不 `report_failure`。
+    pub fn has_kiro_selectable(&self, model: Option<&str>) -> bool {
+        let is_opus = model
+            .map(|m| m.to_lowercase().contains("opus"))
+            .unwrap_or(false);
+        let model_key = model.unwrap_or("");
+        self.entries
+            .lock()
+            .iter()
+            .any(|e| self.is_entry_selectable(e, is_opus, model_key))
+    }
+
+    /// 启用中的 Kiro 凭据快照（不含 custom_api、不占位）。供桶封禁 last-hop 判定。
+    pub fn peek_enabled_kiro(&self) -> Vec<(u64, KiroCredentials)> {
+        self.entries
+            .lock()
+            .iter()
+            .filter(|e| !e.disabled && !e.credentials.is_custom_api_credential())
+            .map(|e| (e.id, e.credentials.clone()))
+            .collect()
+    }
+
+    /// 透传池等待判定（**只看 custom_api**）。与 `transient_wait_outcome` 镜像但方向相反：
+    /// 那边 continue 掉代挂号（两池隔离），这边 continue 掉 Kiro。
+    ///
+    /// `exclude` 是本请求已试过的号：它们不会被再选，不算「将要恢复的候选」
+    /// （与 Kiro 侧「不吃排除集」不同——透传 exclude 是硬门，不是偏好）。
+    fn custom_api_wait_outcome(
+        &self,
+        exclude: &HashSet<u64>,
+        model: Option<&str>,
+    ) -> WaitOutcome {
+        let cooldown_on = self.cooldown_enabled.load(Ordering::Relaxed);
+        let entries = self.entries.lock();
+        let mut has_candidate = false;
+        let mut immediate_available = false;
+        let mut waits: Vec<(StdDuration, WaitReason)> = Vec::new();
+
+        for entry in entries.iter() {
+            if entry.disabled || !entry.credentials.is_custom_api_credential() {
+                continue;
+            }
+            if exclude.contains(&entry.id) {
+                continue;
+            }
+            if model.is_some_and(|m| self.is_model_blacklisted(entry.id, m)) {
+                continue;
+            }
+            if let Some(m) = model {
+                if !m.is_empty() && !entry.credentials.allows_model(m) {
+                    continue;
+                }
+            }
+
+            has_candidate = true;
+
+            if cooldown_on {
+                if let Some((_reason, remaining)) = self.cooldown.check_cooldown(entry.id) {
+                    waits.push((remaining, WaitReason::Cooling));
+                    continue;
+                }
+            }
+
+            if at_max_concurrency(entry) {
+                waits.push((
+                    StdDuration::from_millis(250),
+                    WaitReason::ConcurrencyFull,
+                ));
+                continue;
+            }
+
+            immediate_available = true;
+        }
+
+        if !has_candidate {
+            return WaitOutcome::NoCandidate;
+        }
+        if immediate_available {
+            return WaitOutcome::Available;
+        }
+        match waits.into_iter().min_by_key(|(d, _)| *d) {
+            Some((d, reason)) => WaitOutcome::Wait(d, reason),
+            None => WaitOutcome::Available,
+        }
+    }
+
+    /// 透传选号：满并发且**无** Kiro 可分流时，复用 `WaitReason::ConcurrencyFull`
+    /// 短等（250ms，封顶 [`MAX_TRANSIENT_WAIT_SECS`]）后重选。混池立刻 None。
+    ///
+    /// 不另造信号量：占位仍是 `select_custom_api` 的 `InflightGuard`。
+    pub async fn select_custom_api_or_wait(
+        &self,
+        exclude: &HashSet<u64>,
+        model: Option<&str>,
+    ) -> Option<(u64, KiroCredentials, InflightGuard)> {
+        if let Some(x) = self.select_custom_api(exclude, model) {
+            return Some(x);
+        }
+        // 混池：Kiro 吃溢出。立刻 None，不睡。
+        if self.has_kiro_selectable(model) {
+            return None;
+        }
+        let wait_started = Instant::now();
+        let mut race_reselect = 0usize;
+        const MAX_RACE_RESELECT: usize = 64;
+        loop {
+            match self.custom_api_wait_outcome(exclude, model) {
+                WaitOutcome::Wait(wait, WaitReason::ConcurrencyFull)
+                    if wait_started.elapsed()
+                        < StdDuration::from_secs(MAX_TRANSIENT_WAIT_SECS) =>
+                {
+                    let remaining = StdDuration::from_secs(MAX_TRANSIENT_WAIT_SECS)
+                        .saturating_sub(wait_started.elapsed());
+                    let w = wait
+                        .max(StdDuration::from_millis(250))
+                        .min(remaining.max(StdDuration::from_millis(250)));
+                    tracing::warn!(
+                        "custom_api 池在飞均达并发上限且无 Kiro 可分流，等待释放 {:?} 后重试",
+                        w
+                    );
+                    sleep(w).await;
+                }
+                WaitOutcome::Available if race_reselect < MAX_RACE_RESELECT => {
+                    race_reselect += 1;
+                }
+                _ => return None,
+            }
+            if let Some(x) = self.select_custom_api(exclude, model) {
+                return Some(x);
+            }
+            if self.has_kiro_selectable(model) {
+                return None;
+            }
+        }
+    }
+
     /// 给 custom_api 透传号设一段冷却(**仅操作 cooldown,不碰 health/family/report_success/failure**,
     /// 守两池隔离铁律)。供透传 failover:某号 403 额度满 / 401 key 失效 / 429 / 5xx 时暂时跳过它,
     /// 让 select_custom_api 下次(及本请求循环 exclude)避开,换下一个号。
@@ -3473,6 +3759,85 @@ impl MultiTokenManager {
         self.is_model_blocked(id, model)
     }
 
+    /// 模型支持三态查询（模型感知正向路由，S1，签名同 zyphr `cached_model_support`）：
+    /// - 无缓存条目 / 条目过期 → `Unknown`（中性）；
+    /// - 目录含目标（大小写不敏感）→ `Confirmed`；
+    /// - 目录明确不含 → `Unsupported`（软降权，绝不出局）。
+    ///
+    /// 纯内存读（parking_lot 短临界，与 `model_blocklist` 同款），**绝不触发网络**——
+    /// 选号热路径不做巡检（设计文档 §5 评审补强：未知即未知，下轮巡检覆盖）。
+    pub fn model_support(&self, id: u64, target: &str) -> ModelSupport {
+        let cache = self.model_catalog_cache.lock();
+        match cache.get(&id) {
+            Some(e) if e.refreshed_at.elapsed() < MODEL_CATALOG_TTL => {
+                support_for(target, &e.models)
+            }
+            _ => ModelSupport::Unknown,
+        }
+    }
+
+    /// 清凭据的模型目录缓存（含退避与单飞锁），统一收口（设计文档 §2 失效挂点）。
+    ///
+    /// 调用点：`set_custom_api_config`（base_url/api_key 变更）、
+    /// `delete_credential_forced`
+    /// （删号防内存残留）、`set_disabled` **启用**路径（Review3 m5：禁用期残留的
+    /// Confirmed 不会自愈，重启用后白打一跳）。凭据禁用**不**清（缓存无害，
+    /// 巡检循环跳过禁用号即可）。
+    fn invalidate_model_catalog(&self, id: u64) {
+        self.model_catalog_cache.lock().remove(&id);
+        self.model_catalog_backoff.lock().remove(&id);
+        self.model_catalog_locks.lock().remove(&id);
+    }
+
+    /// 写模型目录缓存（唯一写入源：巡检成功且列表非空，设计文档 §2）。与旧目录
+    /// 对比记 diff 日志（设计文档 §5）；成功即重置退避。空列表**不**走本函数。
+    fn store_model_catalog(&self, id: u64, models: Vec<String>) {
+        let old = {
+            let mut cache = self.model_catalog_cache.lock();
+            let old = cache.get(&id).map(|e| e.models.clone());
+            cache.insert(
+                id,
+                ModelCatalogEntry {
+                    models: models.clone(),
+                    refreshed_at: Instant::now(),
+                },
+            );
+            old
+        };
+        self.model_catalog_backoff.lock().remove(&id);
+        match old {
+            Some(old) => {
+                let added: Vec<&String> = models
+                    .iter()
+                    .filter(|m| !old.iter().any(|o| o == *m))
+                    .collect();
+                let removed: Vec<&String> = old
+                    .iter()
+                    .filter(|o| !models.iter().any(|m| m == *o))
+                    .collect();
+                if !added.is_empty() {
+                    tracing::info!(
+                        credential_id = id,
+                        "模型目录新增 {} 个模型: {:?}",
+                        added.len(),
+                        added
+                    );
+                }
+                if !removed.is_empty() {
+                    tracing::info!(
+                        credential_id = id,
+                        "模型目录移除 {} 个模型: {:?}",
+                        removed.len(),
+                        removed
+                    );
+                }
+            }
+            None => {
+                tracing::info!(credential_id = id, "模型目录首次建立（{} 个模型）", models.len());
+            }
+        }
+    }
+
     /// 给 custom_api 透传号设一段冷却(**仅操作 cooldown,不碰 health/family/report_success/failure**,
     /// 守两池隔离铁律)。供透传 failover:某号 403 额度满 / 401 key 失效 / 429 / 5xx 时暂时跳过它,
     /// 让 select_custom_api 下次(及本请求循环 exclude)避开,换下一个号。
@@ -3482,11 +3847,16 @@ impl MultiTokenManager {
     /// 必须按真实行为表述，不得打印「该号冷却 Ns」（那是撒谎，见 provider.rs
     /// 该调用点 2026-08-16 N2 修正）。冷却体系被门控时的跨请求失败记忆由
     /// [`Self::mark_passthrough_failure`]（排序键失败余温位）承担。
-    pub fn cooldown_custom_api(&self, id: u64, secs: u64) -> bool {
+    ///
+    /// `reason`（2026-08-16 S4 独立标签）：只决定面板 `cooldownReason`/`cooldownCode`
+    /// 的展示（admin 侧经 `cooldown_snapshot` → `CooldownInfo.reason` 下发），
+    /// **不改变时长**——时长由 provider 显式给定（见 provider.rs `passthrough_cooldown_for`：
+    /// 401/403 用 `AuthTransient` 仍是 180s，不走 `CooldownReason::default_duration()` 的 20s）。
+    pub fn cooldown_custom_api(&self, id: u64, secs: u64, reason: CooldownReason) -> bool {
         if self.cooldown_enabled.load(Ordering::Relaxed) {
             self.cooldown.set_cooldown_with_duration(
                 id,
-                CooldownReason::RateLimitExceeded,
+                reason,
                 Some(std::time::Duration::from_secs(secs)),
             );
             true
@@ -3503,9 +3873,13 @@ impl MultiTokenManager {
     /// 不受任何开关门控——死号恒 502 时失败后 [`PASSTHROUGH_FAILURE_DECAY_SECS`]
     /// 内被降权，健康号优先，根治「每请求先打死号白付一跳 + 延迟」。
     ///
-    /// 调用方：provider 透传 failover 判定「值得换号」的所有失败（5xx/429/401/403
-    /// 及值得换号的 400/404）——注意 5xx 走「瞬态不冷却」分支（`_ => 0`），
-    /// 但**同样要记失败时刻**，否则死号恒 502 场景无任何跨请求记忆。
+    /// 调用方：provider 透传 failover 判定「值得换号」的失败（5xx/429/401/402/403；
+    /// 🔴 2026-08-16 对抗审查 M1.2：**400/404 除外**——坏请求（无效 tool schema / 该站
+    /// 不认模型）是全池同质的客户端错误，一次 failover 把所有号打上余温会让 60s 内
+    /// 任何请求零尝试直返 503；其模型语义已由 `mark_model_unsupported` 黑名单通道覆盖）。
+    /// 注意 5xx 走「瞬态不冷却」分支（`_ => 0`），但**同样要记失败时刻**，否则死号
+    /// 恒 502 场景无任何跨请求记忆。成功由 [`Self::record_passthrough_result`] 清热
+    /// （M1.1）：号证明活了立刻回来，不等 60s 窗口自然过期。
     pub fn mark_passthrough_failure(&self, id: u64) {
         if let Some(e) = self.entries.lock().iter_mut().find(|e| e.id == id) {
             e.last_failure_at.set(Some(Instant::now()));
@@ -3557,6 +3931,11 @@ impl MultiTokenManager {
                     RO::Success => {
                         // 成功即清空「持续坏」判据：健康号永不误禁（与 report_success 同款保证）。
                         e.consecutive_passthrough_failures = 0;
+                        // 🔴 成功清热（2026-08-16 对抗审查 M1.1）：上游恢复的号**立即**回到
+                        // 候选池，不再被余温排除到 60s 窗口尾（此前上游 30s 恢复后该号仍被
+                        // 排除整 60s，白白缩水可用池）。只有真成功才清：5xx/429 等失败路径
+                        // 不得触碰余温，否则「死号每成功前必先失败一次」的探测就永不清热。
+                        e.last_failure_at.set(None);
                         e.success_count = e.success_count.saturating_add(1);
                         e.request_count = e.request_count.saturating_add(1);
                         // request_limit 只保留为观测/告警配置。custom_api 不是 Kiro 凭据，
@@ -4319,12 +4698,18 @@ impl MultiTokenManager {
         {
             return false;
         }
-        // ⚠️ inflight 绝不作为「可选性」的硬门槛。
-        // 本项目的调度设计是：inflight（在飞请求数）只进 select_next_credential 的
-        // 排序键——优先选在飞最少的号，把并发自然分摊；号不够时并发落到同一号由
-        // RPM 软降权调节，而不是把请求卡在网关里排队干等。
-        // （历史上曾被硬编码 inflight < 1 阻塞成"每号同时只 1 个请求"，多客户端下
-        //  多余请求全排队 = 假性限流、体感极慢。此处恢复为不阻塞。）
+        // ⚠️ inflight 只在**饱和级**才作硬门槛（2026-08-16 迁移差距 P1 起）。
+        // 历史教训：曾被硬编码 inflight < 1 阻塞成"每号同时只 1 个请求"，多客户端下
+        // 多余请求全排队 = 假性限流、体感极慢。故正常并发形态下 inflight 绝不阻塞：
+        // 在途只进 select_next_credential 的排序键（⑦ 在途最少优先），把并发自然分摊；
+        // 号不够时并发落到同一号由 RPM 软降权调节，而不是把请求卡在网关里排队干等。
+        // 唯一例外是 [`CREDENTIAL_MAX_CONCURRENCY`]（默认 16）这个饱和级硬门——正常
+        // 并发远够不到（常态每号在途 ~8.6），只有单号被灌爆时才触发，防止上游风控。
+        // 它与 RPM 饱和硬门（L4 背压）同构：同为「保护上游」的饱和护栏，达限即跳过，
+        // 全部达限由 transient_wait_outcome 的镜像（ConcurrencyFull）短等重试。
+        if at_max_concurrency(entry) {
+            return false;
+        }
         true
     }
 
@@ -4418,8 +4803,21 @@ impl MultiTokenManager {
                 continue;
             }
 
-            // 走到这里说明该号既未冷却/限流、也未被背压计为饱和 → 立即可用候选。
-            // inflight 绝不作为阻塞门槛(在途只进排序键,并发直接落它)。
+            // 并发上限硬门镜像（2026-08-16，迁移差距 P1）——**必须与 is_entry_selectable_inner
+            // 逐条对齐**（见本函数开头那组硬门注释的忙等陷阱）：达限号在 select 里被过滤，
+            // 这里若仍判「立即可用」⇒ select 返 None 而本函数返 Available ⇒ acquire_context
+            // 的 Available 分支零 sleep 零递增 ⇒ 确定性忙等热循环。in-flight 连续释放
+            // （流结束即 -1，通常毫秒级），给一个短固定等待即可，与 RPM 背压同族。
+            if at_max_concurrency(entry) {
+                waits.push((
+                    StdDuration::from_millis(250),
+                    WaitReason::ConcurrencyFull,
+                ));
+                continue;
+            }
+
+            // 走到这里说明该号既未冷却/限流、也未被背压计为饱和、也未达并发上限 → 立即可用候选。
+            // inflight 在饱和级以下绝不作为阻塞门槛(在途只进排序键,并发直接落它)。
             immediate_available = true;
         }
 
@@ -4561,6 +4959,14 @@ impl MultiTokenManager {
         if self.is_rpm_saturated_with_limit(entry.id, entry.credentials.rpm_limit) {
             return false;
         }
+        // 并发上限硬门（迁移差距 P1）：亲和命中是同一条 `return` 旁路（跳过全部排序键），
+        // 排序键里那道 inflight 均衡完全够不着它 —— 单会话并行工具调用会把绑定号灌爆
+        // （会话钉死一个号、在飞只增不减），必须在这里同样封堵（镜像 kiro-rs-admin
+        // 亲和路径的 `is_concurrency_exceeded` 检查）。达限不复用 → 落 balanced 分流
+        // 到未达限的号；全部达限时由排序键/背压按最不坏处理。
+        if at_max_concurrency(entry) {
+            return false;
+        }
         let fam = entry.credentials.family_key(entry.id);
         match self.health.snapshot(&fam) {
             // 无 health 记录 = 从未出问题，视为满血（与 p_avail 的 or_default 语义一致）。
@@ -4699,6 +5105,69 @@ impl MultiTokenManager {
             return 0;
         }
         self.rpm.counts_for(&ids).values().copied().sum()
+    }
+
+    /// MCP「无号直连」用：从凭据池里找第一个「带 Kiro Bearer token」的凭据。
+    ///
+    /// # 与 [`Self::acquire_context`] 的差异（承重）
+    ///
+    /// `acquire_context` 的选号要过 `is_entry_selectable` 全部门槛（禁用 / 冷却 /
+    /// custom_api 结构性排除等）——纯 custom_api 透传池或全池禁用时它**选不到号**，
+    /// WebSearch 快路径的 MCP 调用因此失败（502）。而 MCP（web_search）调用本质只
+    /// 依赖一个有效的 Kiro Bearer token（kiro-gateway 的 mcp_tools.py 证明：只带
+    /// `Authorization: Bearer` + `x-amzn-codewhisperer-optout` + `Content-Type` 即可
+    /// 调通 `runtime.{region}.kiro.dev/mcp`，**不依赖 profileArn**），不该被对话
+    /// 路径的选号门槛绑架。
+    ///
+    /// 本方法刻意**绕过选号门槛**：只要凭据带 Kiro token 就直接可用——
+    /// - `access_token` 非空（OAuth 号优先：直连 URL 是 `runtime.*.kiro.dev/mcp`，
+    ///   IDE 协议；冷却中的号 token 仍有效，可直连）
+    /// - `kiro_api_key` 非空（ksk_ 号，永不过期，但属于 q.* CLI 协议，排最后）
+    ///
+    /// 唯二不绕过的：
+    /// - **disabled 跳过**（M3）：禁用是网关自己的惩罚决策（风控/额度/连败），
+    ///   直连绕过它自相矛盾——全池禁用时返回 `None`，不拿被惩罚的 token 满速打上游。
+    ///   冷却**不**检查：冷却不是惩罚，token 本身有效，直连照常可用。
+    /// - custom_api 代挂号的 `api_key` 是**中转站密钥**，不是 Kiro token，不算
+    ///   （纯 custom_api 池下本方法返回 `None`，由调用方降级现状错误）。
+    ///
+    /// 轮转（M3）：多 OAuth 候选时优先「曾成功过」的号（`success_count > 0` =
+    /// [`Self::has_ever_succeeded`]，token 更可能仍有效），全部未成功过才回退第一个
+    /// OAuth，再回退 ksk_ ——避免确定性首匹配把并发全压到第一个号，也避免把
+    /// ksk_ 送到 IDE MCP 主机上抢在可用 OAuth 前面。
+    ///
+    /// 返回 `(凭据 id, 凭据, token)`；`None` = 池里没有任何带 Kiro token 的凭据。
+    pub fn acquire_mcp_direct_token(&self) -> Option<(u64, KiroCredentials, String)> {
+        let entries = self.entries.lock();
+        // 单遍遍历：OAuth 候选按 has_ever_succeeded 优先；ksk_ 只记作回退，
+        // 不再命中即返回（直连 URL 是 IDE 主机，ksk_ 属于 CLI）。OAuth token
+        // 可能已过期，失败由调用方降级现状，不强求刷新。
+        let mut first_successful_oauth: Option<(u64, KiroCredentials, String)> = None;
+        let mut first_oauth: Option<(u64, KiroCredentials, String)> = None;
+        let mut first_ksk: Option<(u64, KiroCredentials, String)> = None;
+        for e in entries.iter() {
+            if e.disabled {
+                continue;
+            }
+            if let Some(key) = e.credentials.kiro_api_key.as_deref() {
+                if !key.trim().is_empty() && first_ksk.is_none() {
+                    first_ksk = Some((e.id, e.credentials.clone(), key.to_string()));
+                }
+            }
+            if let Some(tok) = e.credentials.access_token.as_deref() {
+                if !tok.trim().is_empty() {
+                    let cand = (e.id, e.credentials.clone(), tok.to_string());
+                    if e.success_count > 0 {
+                        if first_successful_oauth.is_none() {
+                            first_successful_oauth = Some(cand);
+                        }
+                    } else if first_oauth.is_none() {
+                        first_oauth = Some(cand);
+                    }
+                }
+            }
+        }
+        first_successful_oauth.or(first_oauth).or(first_ksk)
     }
 
     pub async fn acquire_context(
@@ -5061,6 +5530,33 @@ impl MultiTokenManager {
                                 let retry_after = wait.as_secs().max(1);
                                 anyhow::bail!(
                                     "整池 RPM 已饱和，等待恢复超时（{}/{}）retry_after_secs={}",
+                                    total,
+                                    total,
+                                    retry_after
+                                );
+                            }
+                            // 并发上限硬门（迁移差距 P1）：在飞请求连续释放（流结束即 -1，
+                            // 通常毫秒级），短固定等待后重选即大概率命中。与 RpmRecovery 同族
+                            // （"繁忙"类别，绝不报"已禁用"）；等待封顶到剩余总预算内。
+                            WaitOutcome::Wait(wait, WaitReason::ConcurrencyFull) => {
+                                if wait_started.elapsed()
+                                    < StdDuration::from_secs(MAX_TRANSIENT_WAIT_SECS)
+                                {
+                                    let remaining = StdDuration::from_secs(MAX_TRANSIENT_WAIT_SECS)
+                                        .saturating_sub(wait_started.elapsed());
+                                    let w = wait
+                                        .max(StdDuration::from_millis(250))
+                                        .min(remaining.max(StdDuration::from_millis(250)));
+                                    tracing::warn!(
+                                        "整池在飞请求均达并发上限，等待释放 {:?} 后重试",
+                                        w
+                                    );
+                                    sleep(w).await;
+                                    continue;
+                                }
+                                let retry_after = wait.as_secs().max(1);
+                                anyhow::bail!(
+                                    "整池在飞请求均达并发上限，等待释放超时（{}/{}）retry_after_secs={}",
                                     total,
                                     total,
                                     retry_after
@@ -6995,7 +7491,6 @@ impl MultiTokenManager {
                     base_url: e.credentials.base_url.clone(),
                     request_limit: e.credentials.request_limit,
                     request_count: e.request_count,
-                    deepseek_normalize: e.credentials.deepseek_normalize,
                     model_mapping_exempt: e.credentials.model_mapping_exempt,
                     has_profile_arn: e.credentials.profile_arn.is_some(),
                     expires_at: if e.credentials.is_api_key_credential() {
@@ -7119,6 +7614,11 @@ impl MultiTokenManager {
         // 禁用凭据时清除其会话亲和性绑定，避免后续请求重选时反复尝试已禁用凭据
         if disabled {
             self.affinity.remove_by_credential(id);
+        } else {
+            // Review3 m5：重新启用后模型目录缓存里可能残留禁用前的 Confirmed
+            // （TTL ≤30min 且巡检循环跳过禁用号 → 残留不会自己失效），重启用后
+            // 死号仍被当「模型 Confirmed」白打一跳。启用即失效缓存，让巡检重抓。
+            self.invalidate_model_catalog(id);
         }
         // 持久化更改
         self.persist_credentials()?;
@@ -7202,31 +7702,6 @@ impl MultiTokenManager {
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             entry.credentials.api_region = cleaned;
-        }
-        self.persist_credentials()?;
-        Ok(())
-    }
-
-    /// 设置代挂凭据的 deepseek 协议归一化开关（`deepseekNormalize`）。
-    ///
-    /// 只对 `custom_api` 代挂号有意义（passthrough 路径按它决定是否先归一化再转发）；
-    /// 非 custom_api 凭据设置它没有效果，直接拒绝以免误导。`None` = 清除（关闭）。
-    /// 写盘走 `persist_credentials`（与其它凭据级 setter 同款），立即生效无需重启。
-    pub fn set_credential_deepseek_normalize(
-        &self,
-        id: u64,
-        enabled: Option<bool>,
-    ) -> anyhow::Result<()> {
-        {
-            let mut entries = self.entries.lock();
-            let entry = entries
-                .iter_mut()
-                .find(|e| e.id == id)
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            if !entry.credentials.is_custom_api_credential() {
-                anyhow::bail!("deepseek 归一化仅对 custom_api 代挂凭据有意义");
-            }
-            entry.credentials.deepseek_normalize = enabled;
         }
         self.persist_credentials()?;
         Ok(())
@@ -7352,6 +7827,159 @@ impl MultiTokenManager {
             .filter(|e| needs_api_region_probe(&e.credentials))
             .map(|e| e.id)
             .collect()
+    }
+
+    /// 需要模型目录巡检的凭据 id（模型感知正向路由，S3）：custom_api && 未禁用
+    /// （仿 `ids_needing_region_probe` 先例）。
+    ///
+    /// 🔴 2026-08-16：deepseek 归一化已移除，不再有「跳过巡检的 deepseek 号」——
+    /// 所有 custom_api 号都巡检。此前 deepseek 号跳过是因为请求被改写后的目标名
+    /// （fallback_model，可配任意值）与 `/models` 目录的原生名对应关系不可预测；
+    /// 请求不再改写（仅 model_mapping 表映射，正向路由判定键本来就是映射后名），
+    /// 该排除条件消失。ksk 号天然排除（`is_custom_api_credential` 结构性排除，
+    /// Kiro 池没有模型目录概念，设计文档 §6 铁律：正向路由只做透传池）。
+    pub fn ids_needing_model_probe(&self) -> Vec<u64> {
+        self.entries
+            .lock()
+            .iter()
+            .filter(|e| !e.disabled)
+            .filter(|e| e.credentials.is_custom_api_credential())
+            .map(|e| e.id)
+            .collect()
+    }
+
+    /// 巡检单飞锁：per-id TokioMutex（同一凭据不并发 fetch；换上游/删号时随
+    /// `invalidate_model_catalog` 移除，换上游后旧锁无意义）。
+    fn model_catalog_lock(&self, id: u64) -> Arc<TokioMutex<()>> {
+        self.model_catalog_locks
+            .lock()
+            .entry(id)
+            .or_insert_with(|| Arc::new(TokioMutex::new(())))
+            .clone()
+    }
+
+    /// 该号是否在巡检失败退避中（退避期间本轮跳过，状态留到到期）。
+    fn model_catalog_in_backoff(&self, id: u64) -> bool {
+        self.model_catalog_backoff
+            .lock()
+            .get(&id)
+            .is_some_and(|b| b.until > Instant::now())
+    }
+
+    /// 巡检失败 → 指数退避：第 n 次连续失败等 `BASE × 2^(n-1)`，上限 30min
+    /// （设计文档 §5 表）。成功（非空 2xx）在 `store_model_catalog` 重置。
+    fn bump_model_catalog_backoff(&self, id: u64) {
+        let mut map = self.model_catalog_backoff.lock();
+        let failures = map.get(&id).map(|b| b.failures).unwrap_or(0) + 1;
+        let shift = failures.min(MODEL_CATALOG_BACKOFF_MAX_SHIFT);
+        let wait = StdDuration::from_secs(
+            MODEL_CATALOG_BACKOFF_BASE_SECS
+                .saturating_mul(1u64 << shift.saturating_sub(1))
+                .min(MODEL_CATALOG_BACKOFF_MAX_SECS),
+        );
+        map.insert(
+            id,
+            CatalogBackoff {
+                failures,
+                until: Instant::now() + wait,
+            },
+        );
+    }
+
+    /// 执行一轮模型目录巡检（S3，设计文档 §5）。返回成功写入缓存的号数（测试锚点）。
+    ///
+    /// `fetch` 注入以支持单测 mock（按值传凭据快照，规避「闭包返回借用参数的
+    /// future」的 HRTB 难题）；生产路径在 [`Self::spawn_model_catalog_probe`] 里接
+    /// [`crate::kiro::passthrough::fetch_upstream_models`]。
+    ///
+    /// 单飞 + double-check：先查退避（退避中跳过），再拿 per-id 锁；拿锁后**再查
+    /// 一次缓存新鲜度**——并发多路触发（双任务 / 手动刷新）时第一路刚写完，第二路
+    /// 看到目录仍新鲜（< TTL）即跳过，并发 N 次 probe 只打一次网络（验收 9）。
+    /// 正常周期下每轮恰好 TTL 到期重探，double-check 不影响周期语义。
+    pub async fn probe_model_catalog_round<F, Fut>(&self, fetch: F) -> usize
+    where
+        F: Fn(KiroCredentials) -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<Vec<String>>>,
+    {
+        let mut written = 0;
+        for id in self.ids_needing_model_probe() {
+            if self.model_catalog_in_backoff(id) {
+                continue;
+            }
+            let catalog_lock = self.model_catalog_lock(id);
+            let _lock = catalog_lock.lock().await;
+            let fresh = self
+                .model_catalog_cache
+                .lock()
+                .get(&id)
+                .is_some_and(|e| e.refreshed_at.elapsed() < MODEL_CATALOG_TTL);
+            if fresh {
+                continue;
+            }
+            let Some(cred) = self
+                .entries
+                .lock()
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+            else {
+                continue;
+            };
+            match fetch(cred).await {
+                Ok(models) if !models.is_empty() => {
+                    self.store_model_catalog(id, models);
+                    written += 1;
+                }
+                // 空列表：不写缓存（保持 Unknown）、不算失败、不重置退避——空列表
+                // 可能是上游暂时故障，固化成「无模型」会让目录失真永久化（守卫 #6）。
+                Ok(_empty) => {}
+                Err(e) => {
+                    self.bump_model_catalog_backoff(id);
+                    tracing::warn!(
+                        credential_id = id,
+                        "模型目录巡检失败（该号维持 Unknown）: {e:#}"
+                    );
+                }
+            }
+        }
+        written
+    }
+
+    /// 启动模型目录巡检后台任务（30min 周期；首轮延迟 10s 避开启动期 token 预刷新
+    /// 抢上游往返；`MissedTickBehavior::Skip` 防唤醒后连刷——main.rs affinity 清理
+    /// 同款，设计文档 §5）。循环持 `Weak<Self>`：manager 被 drop 后下一轮 upgrade
+    /// 失败即自我退出（`respawn_refresh_task` 同款，不构成 Arc 引用环）。
+    /// 接线点：main.rs 启动路径（region 回填 :494 同款 spawn）。
+    pub fn spawn_model_catalog_probe(self: &Arc<Self>) -> JoinHandle<()> {
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(StdDuration::from_secs(MODEL_CATALOG_PROBE_START_DELAY_SECS))
+                .await;
+            let mut ticker = tokio::time::interval(StdDuration::from_secs(MODEL_CATALOG_TTL_SECS));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                let Some(mgr) = weak.upgrade() else {
+                    return;
+                };
+                // 每轮取配置快照：proxy/tls 热更后下一轮生效（region 回填同款取法）。
+                let cfg = mgr.config();
+                let proxy = cfg.proxy_url.as_deref().map(ProxyConfig::new);
+                let tls = cfg.tls_backend;
+                let fetch = move |cred: KiroCredentials| {
+                    let proxy = proxy.as_ref().cloned();
+                    async move {
+                        crate::kiro::passthrough::fetch_upstream_models(
+                            &cred,
+                            proxy.as_ref(),
+                            tls,
+                        )
+                        .await
+                    }
+                };
+                mgr.probe_model_catalog_round(fetch).await;
+                ticker.tick().await;
+            }
+        })
     }
 
     /// 对指定凭据探测真正可用的 region，命中则**写死进凭据并落盘**。
@@ -7580,6 +8208,9 @@ impl MultiTokenManager {
         request_limit: Option<u64>,
         reset_count: bool,
     ) -> anyhow::Result<()> {
+        // 换上游 / 换 key → 旧模型目录对新高地无意义（S4 失效挂点，设计文档 §2）；
+        // 在参数被 move 进下方 if let 前取标记。
+        let invalidate_catalog = base_url.is_some() || api_key.is_some();
         // SSRF 写入校验(主防线)：DNS 解析不能在 entries 锁临界区内做，故取锁前先校验。
         // 仅当传入了新 base_url 才校验（None=不改）。
         if let Some(url) = base_url.as_deref() {
@@ -7627,6 +8258,10 @@ impl MultiTokenManager {
             }
         }
         self.persist_credentials()?;
+        // entries 锁外失效（invalidate 有自己的锁，避免锁序嵌套）。
+        if invalidate_catalog {
+            self.invalidate_model_catalog(id);
+        }
         Ok(())
     }
 
@@ -8701,6 +9336,9 @@ impl MultiTokenManager {
         self.model_blocklist
             .lock()
             .retain(|(cred_id, _), _| *cred_id != id);
+        // 模型目录缓存 / 退避 / 单飞锁同款清（删号防内存残留；restore 后重新巡检，
+        // 不会背着旧目录——设计文档 §2 失效挂点）。
+        self.invalidate_model_catalog(id);
         // rate_limiter per-id 状态(backoff_until 退避≤1h / daily_count / consecutive_failures):
         // 不清则 restore 同 id 的 Kiro 号会继承残留退避被静默跳过直到自愈,与 cooldown 同源同类。
         self.rate_limiter.reset(id);
@@ -9782,6 +10420,188 @@ mod endpoint_bypass_guard_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ===== MCP 无号直连：acquire_mcp_direct_token（纯逻辑）=====
+
+    /// 造一个 custom_api 代挂号（只有 base_url + api_key，无 Kiro token）。
+    fn mk_direct_custom(id: u64) -> KiroCredentials {
+        let mut c = KiroCredentials::default();
+        c.id = Some(id);
+        c.auth_method = Some("custom_api".to_string());
+        c.base_url = Some(format!("https://relay{id}.example.invalid"));
+        c.api_key = Some(format!("sk-relay-{id}"));
+        c
+    }
+
+    /// 造一个 api_key（ksk_）号。
+    fn mk_direct_kiro(id: u64) -> KiroCredentials {
+        let mut c = KiroCredentials::default();
+        c.id = Some(id);
+        c.auth_method = Some("api_key".to_string());
+        c.kiro_api_key = Some(format!("sk-kiro-{id}"));
+        c
+    }
+
+    /// 造一个 OAuth 号（access_token）。
+    fn mk_direct_oauth(id: u64) -> KiroCredentials {
+        let mut c = KiroCredentials::default();
+        c.id = Some(id);
+        c.auth_method = Some("social".to_string());
+        c.access_token = Some(format!("oauth-tok-{id}"));
+        c
+    }
+
+    /// 纯 custom_api 池（线上现状）：没有任何 Kiro token → 直连无可用凭据。
+    ///
+    /// ⭐ 承重：这是「无号直连」的边界 —— 纯透传池下直连必须返回 None（由调用方
+    /// 降级现状错误），**绝不能**把 custom_api 的 api_key（中转站密钥）当 Kiro token
+    /// 拿去打 runtime.*.kiro.dev/mcp。
+    #[test]
+    fn mcp_direct_no_token_in_pure_custom_api_pool() {
+        let mgr = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                mk_direct_custom(1),
+                mk_direct_custom(2),
+                mk_direct_custom(3),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            mgr.acquire_mcp_direct_token().is_none(),
+            "纯 custom_api 池必须无可用 Kiro token（api_key 是中转站密钥，不算）"
+        );
+    }
+
+    /// 混池：直连 URL 是 IDE MCP（runtime.*.kiro.dev），必须选 OAuth，不得抢 ksk_。
+    /// 回退即 FAIL：把 ksk_ 改回命中即返回，断言变红。
+    #[test]
+    fn mcp_direct_prefers_oauth_over_ksk_for_ide_mcp() {
+        let mgr = MultiTokenManager::new(
+            Config::default(),
+            vec![mk_direct_oauth(1), mk_direct_kiro(2)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let (id, cred, token) = mgr.acquire_mcp_direct_token().expect("应有 OAuth 号");
+        assert_eq!(id, 1, "OAuth 号必须优先于 ksk_ 号（IDE MCP 主机）");
+        assert_eq!(token, "oauth-tok-1");
+        assert_eq!(cred.access_token.as_deref(), Some("oauth-tok-1"));
+    }
+
+    /// 池里只有 ksk_ 时仍可用（OAuth 优先不等于丢掉 ksk_ 回退）。
+    #[test]
+    fn mcp_direct_falls_back_to_ksk_when_no_oauth() {
+        let mgr = MultiTokenManager::new(
+            Config::default(),
+            vec![mk_direct_kiro(2)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let (id, cred, token) = mgr.acquire_mcp_direct_token().expect("应有 ksk_ 号");
+        assert_eq!(id, 2);
+        assert_eq!(token, "sk-kiro-2");
+        assert_eq!(cred.kiro_api_key.as_deref(), Some("sk-kiro-2"));
+    }
+
+    /// 只有 OAuth 号时直连可用其 access_token（实现**不检查**冷却状态——冷却不是
+    /// 惩罚，token 有效即可直连；disabled 会跳过，见 mcp_direct_skips_disabled_credentials）。
+    #[test]
+    fn mcp_direct_falls_back_to_oauth_token() {
+        let oauth = mk_direct_oauth(7);
+        let mgr = MultiTokenManager::new(Config::default(), vec![oauth], None, None, false).unwrap();
+        let (id, _, token) = mgr.acquire_mcp_direct_token().expect("OAuth token 应可用");
+        assert_eq!(id, 7);
+        assert_eq!(token, "oauth-tok-7");
+    }
+
+    /// 空 token（空串）不算可用；custom_api 号带 access_token 时（推号方填了 Kiro
+    /// 字段）仍可直连——判据只看 token 字段本身，不看 auth_method。
+    #[test]
+    fn mcp_direct_empty_token_not_usable_but_custom_with_token_is() {
+        let mut empty = mk_direct_kiro(1);
+        empty.kiro_api_key = Some("   ".to_string());
+        let mut custom_with_tok = mk_direct_custom(2);
+        custom_with_tok.access_token = Some("real-oauth".to_string());
+        let mgr = MultiTokenManager::new(
+            Config::default(),
+            vec![empty, custom_with_tok],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let (id, _, token) = mgr.acquire_mcp_direct_token().expect("custom 号带 token 应可用");
+        assert_eq!(id, 2);
+        assert_eq!(token, "real-oauth");
+    }
+
+    /// 空池：无凭据 → None（不 panic）。
+    #[test]
+    fn mcp_direct_empty_pool_returns_none() {
+        let mgr = MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap();
+        assert!(mgr.acquire_mcp_direct_token().is_none());
+    }
+
+    /// M3：disabled 号不参与直连——禁用是网关自己的惩罚决策（风控/额度/连败），
+    /// 直连绕过它自相矛盾（用被惩罚的 token 满速打上游 = 风控窗口加流量）。
+    #[test]
+    fn mcp_direct_skips_disabled_credentials() {
+        let mut dis = mk_direct_kiro(1);
+        dis.disabled = true;
+        let mgr = MultiTokenManager::new(
+            Config::default(),
+            vec![dis, mk_direct_kiro(2)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let (id, _, _) = mgr.acquire_mcp_direct_token().expect("未禁用号应可用");
+        assert_eq!(id, 2, "禁用号不得被选中，必须顺延到未禁用号");
+    }
+
+    /// M3：全池禁用时直连必须 None（降级回池子错误），而不是拿被惩罚的 token 直连。
+    #[test]
+    fn mcp_direct_all_disabled_returns_none() {
+        let mut a = mk_direct_kiro(1);
+        a.disabled = true;
+        let mut b = mk_direct_oauth(2);
+        b.disabled = true;
+        let mgr = MultiTokenManager::new(Config::default(), vec![a, b], None, None, false).unwrap();
+        assert!(
+            mgr.acquire_mcp_direct_token().is_none(),
+            "全池禁用时直连必须无可用 token（不得绕过惩罚决策）"
+        );
+    }
+
+    /// M3 轮转：多 OAuth 候选时优先「曾成功过」的号（success_count > 0 =
+    /// has_ever_succeeded，token 更可能仍有效），避免确定性首匹配把并发全压到
+    /// 第一个号（同 token 并发轰炸）。
+    #[test]
+    fn mcp_direct_prefers_ever_succeeded_oauth() {
+        let mgr = MultiTokenManager::new(
+            Config::default(),
+            vec![mk_direct_oauth(1), mk_direct_oauth(2)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        {
+            let mut entries = mgr.entries.lock();
+            entries.iter_mut().find(|e| e.id == 2).unwrap().success_count = 5;
+        }
+        let (id, _, _) = mgr.acquire_mcp_direct_token().expect("应有 OAuth 候选");
+        assert_eq!(id, 2, "曾成功过的号必须优先于从未成功过的号");
+    }
 
     // ===== B8：号池全灭告警去抖门（纯逻辑）=====
 
@@ -11158,6 +11978,263 @@ mod tests {
         );
     }
 
+    /// 并发上限硬门（迁移差距 P1）：inflight 达 [`CREDENTIAL_MAX_CONCURRENCY`] 的号
+    /// **不可选**（镜像 kiro-rs-admin `is_concurrency_exceeded` 的硬门语义）。
+    /// ①超上限的号被跳过选别的号；②全部达限 → None（上层 failover/429 背压），
+    /// 绝不回退到"灌爆它"；③guard Drop 释放名额后该号恢复可选（guard 与硬门联动）。
+    #[test]
+    fn test_select_custom_api_skips_credential_at_max_concurrency() {
+        use std::collections::HashSet;
+        let mk = |id: u64| {
+            let mut c = KiroCredentials::default();
+            c.id = Some(id);
+            c.auth_method = Some("custom_api".to_string());
+            c.base_url = Some(format!("https://relay{id}.example.invalid"));
+            c.api_key = Some(format!("sk-{id}"));
+            c
+        };
+        let mgr = MultiTokenManager::new(Config::default(), vec![mk(1), mk(2)], None, None, false)
+            .unwrap();
+        let empty = HashSet::new();
+
+        // #1 达上限 → 被跳过，选 #2。
+        mgr.entries
+            .lock()
+            .iter_mut()
+            .find(|e| e.id == 1)
+            .unwrap()
+            .inflight
+            .store(CREDENTIAL_MAX_CONCURRENCY, Ordering::Relaxed);
+        let sel = mgr.select_custom_api(&empty, None).expect("池内还有 #2 可选");
+        assert_eq!(sel.0, 2, "达上限的 #1 必须被跳过，选 #2");
+
+        // #2 也达上限 → 全部达限 → None（硬门，不灌爆）。
+        mgr.entries
+            .lock()
+            .iter_mut()
+            .find(|e| e.id == 2)
+            .unwrap()
+            .inflight
+            .store(CREDENTIAL_MAX_CONCURRENCY, Ordering::Relaxed);
+        assert!(
+            mgr.select_custom_api(&empty, None).is_none(),
+            "全部达并发上限时应返回 None（背压信号，客户端退避后自然释放）"
+        );
+
+        // guard Drop 释放名额 → 号恢复可选（guard 是持有期标记、硬门是上限，联动正确）。
+        drop(sel.2);
+        assert!(
+            mgr.select_custom_api(&empty, None).is_some(),
+            "guard 释放后 #2 应恢复可选"
+        );
+    }
+
+    /// 并发上限硬门也作用于 **Kiro 主路径**（`is_entry_selectable_inner` 硬门 +
+    /// `is_sticky_reuse_healthy` 亲和复用封堵）：达上限的 Kiro 号不可选。
+    #[test]
+    fn test_kiro_select_skips_credential_at_max_concurrency() {
+        use std::collections::HashSet;
+        let mut config = Config::default();
+        config.affinity_enabled = false; // 隔离亲和路径，只测通用选号硬门
+        let mk = |id: u64| {
+            let mut c = KiroCredentials::default();
+            c.id = Some(id);
+            c.auth_method = Some("api_key".to_string());
+            c.kiro_api_key = Some(format!("sk-kiro-{id}"));
+            c
+        };
+        let mgr = MultiTokenManager::new(config, vec![mk(1), mk(2)], None, None, false).unwrap();
+        let empty = HashSet::new();
+
+        // #1 达上限 → 跳过，选 #2。
+        mgr.entries
+            .lock()
+            .iter_mut()
+            .find(|e| e.id == 1)
+            .unwrap()
+            .inflight
+            .store(CREDENTIAL_MAX_CONCURRENCY, Ordering::Relaxed);
+        let (id, _, _) = mgr
+            .select_next_credential(None, None, &empty)
+            .expect("池内还有 #2 可选");
+        assert_eq!(id, 2, "达上限的 #1 必须被跳过，选 #2");
+
+        // 全部达限 → None（由 acquire_context 的 ConcurrencyFull 短等重试兜住，非忙等）。
+        mgr.entries
+            .lock()
+            .iter_mut()
+            .find(|e| e.id == 2)
+            .unwrap()
+            .inflight
+            .store(CREDENTIAL_MAX_CONCURRENCY, Ordering::Relaxed);
+        assert!(
+            mgr.select_next_credential(None, None, &empty).is_none(),
+            "全部达并发上限时 Kiro 选号应返 None"
+        );
+    }
+
+    /// transient_wait_outcome 的并发上限镜像（与 `is_entry_selectable_inner` 逐条对齐，
+    /// 否则 select 返 None + 本函数判 Available → 忙等热循环）：
+    /// 全部达限时返回 `Wait(_, ConcurrencyFull)`（短固定等待后重试），绝不 `Available`。
+    #[test]
+    fn test_transient_wait_reports_concurrency_full_when_all_at_max() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.affinity_enabled = false;
+        let mut c = KiroCredentials::default();
+        c.auth_method = Some("api_key".to_string());
+        c.kiro_api_key = Some("sk-kiro-1".to_string());
+        let mgr = MultiTokenManager::new(config, vec![c], None, None, false).unwrap();
+
+        // 全部（唯一）达限 → 不是立即可用，而是 Wait(ConcurrencyFull)。
+        mgr.entries
+            .lock()
+            .iter_mut()
+            .find(|e| e.id == 1)
+            .unwrap()
+            .inflight
+            .store(CREDENTIAL_MAX_CONCURRENCY, Ordering::Relaxed);
+        match mgr.transient_wait_outcome(None) {
+            WaitOutcome::Wait(d, WaitReason::ConcurrencyFull) => {
+                assert!(
+                    d <= StdDuration::from_secs(2),
+                    "并发释放是毫秒级的，等待应短（实际 {:?}）",
+                    d
+                );
+            }
+            other => panic!("全达限应返回 Wait(ConcurrencyFull)，实际 {:?}", other),
+        }
+    }
+
+    /// 纯 custom_api 池全部达并发上限：wait_outcome 是 ConcurrencyFull（不是 Available，
+    /// 也不是 Kiro 那条 `transient_wait_outcome`——那边跳过代挂号会判 NoCandidate）。
+    #[test]
+    fn test_custom_api_wait_outcome_concurrency_full_when_all_at_max() {
+        use std::collections::HashSet;
+        let mk = |id: u64| {
+            let mut c = KiroCredentials::default();
+            c.id = Some(id);
+            c.auth_method = Some("custom_api".to_string());
+            c.base_url = Some(format!("https://relay{id}.example.invalid"));
+            c.api_key = Some(format!("sk-{id}"));
+            c
+        };
+        let mgr = MultiTokenManager::new(Config::default(), vec![mk(1)], None, None, false)
+            .unwrap();
+        mgr.entries
+            .lock()
+            .iter_mut()
+            .find(|e| e.id == 1)
+            .unwrap()
+            .inflight
+            .store(CREDENTIAL_MAX_CONCURRENCY, Ordering::Relaxed);
+        match mgr.custom_api_wait_outcome(&HashSet::new(), None) {
+            WaitOutcome::Wait(d, WaitReason::ConcurrencyFull) => {
+                assert!(
+                    d <= StdDuration::from_secs(2),
+                    "并发释放是毫秒级的，等待应短（实际 {:?}）",
+                    d
+                );
+            }
+            other => panic!("纯代挂全达限应 Wait(ConcurrencyFull)，实际 {:?}", other),
+        }
+        // 两池隔离：Kiro 侧仍把代挂号当无候选。
+        assert_eq!(
+            mgr.transient_wait_outcome(None),
+            WaitOutcome::NoCandidate,
+            "transient_wait_outcome 不得把 custom_api 并发满算进 Kiro 池"
+        );
+        assert!(
+            !mgr.has_kiro_selectable(None),
+            "纯代挂池不得报有 Kiro 可选"
+        );
+    }
+
+    /// 纯代挂池全满：短等后 inflight 释放 → 选到号。不得立刻 None。
+    #[tokio::test]
+    async fn test_select_custom_api_or_wait_concurrency_full_then_success() {
+        use std::collections::HashSet;
+        let mut c = KiroCredentials::default();
+        c.id = Some(1);
+        c.auth_method = Some("custom_api".to_string());
+        c.base_url = Some("https://relay.example.invalid".to_string());
+        c.api_key = Some("sk-relay".to_string());
+        let mgr = MultiTokenManager::new(Config::default(), vec![c], None, None, false).unwrap();
+        let inflight = mgr
+            .entries
+            .lock()
+            .iter()
+            .find(|e| e.id == 1)
+            .unwrap()
+            .inflight
+            .clone();
+        inflight.store(CREDENTIAL_MAX_CONCURRENCY, Ordering::Release);
+        assert!(
+            mgr.select_custom_api(&HashSet::new(), None).is_none(),
+            "同步选号在全满时仍必须立刻 None（wait 在 or_wait 层）"
+        );
+
+        let inflight2 = inflight.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(StdDuration::from_millis(40)).await;
+            inflight2.store(0, Ordering::Release);
+        });
+        let sel = tokio::time::timeout(
+            StdDuration::from_secs(3),
+            mgr.select_custom_api_or_wait(&HashSet::new(), None),
+        )
+        .await
+        .expect("纯代挂满并发短等不得挂死")
+        .expect("inflight 释放后应选到号");
+        assert_eq!(sel.0, 1);
+    }
+
+    /// 混池：custom_api 全满但有可选 Kiro → or_wait 立刻 None（分流 Kiro），不睡。
+    #[tokio::test]
+    async fn test_select_custom_api_or_wait_mixed_pool_none_immediately() {
+        use std::collections::HashSet;
+        let mk_custom = || {
+            let mut c = KiroCredentials::default();
+            c.id = Some(1);
+            c.auth_method = Some("custom_api".to_string());
+            c.base_url = Some("https://relay.example.invalid".to_string());
+            c.api_key = Some("sk-relay".to_string());
+            c
+        };
+        let mk_kiro = || {
+            let mut c = KiroCredentials::default();
+            c.id = Some(2);
+            c.auth_method = Some("api_key".to_string());
+            c.kiro_api_key = Some("sk-kiro-2".to_string());
+            c
+        };
+        let mut config = Config::default();
+        config.affinity_enabled = false;
+        let mgr = MultiTokenManager::new(config, vec![mk_custom(), mk_kiro()], None, None, false)
+            .unwrap();
+        mgr.entries
+            .lock()
+            .iter_mut()
+            .find(|e| e.id == 1)
+            .unwrap()
+            .inflight
+            .store(CREDENTIAL_MAX_CONCURRENCY, Ordering::Relaxed);
+        assert!(
+            mgr.has_kiro_selectable(None),
+            "混池必须看见可选 Kiro"
+        );
+        let started = Instant::now();
+        let sel = mgr
+            .select_custom_api_or_wait(&HashSet::new(), None)
+            .await;
+        assert!(sel.is_none(), "混池 custom 满必须立刻 None 分流 Kiro");
+        assert!(
+            started.elapsed() < StdDuration::from_millis(150),
+            "混池不得短等 ConcurrencyFull，实际 {:?}",
+            started.elapsed()
+        );
+    }
+
     /// 造一个代挂号管理器（单号，供透传惩罚策略测试用）。
     fn mk_passthrough_mgr() -> MultiTokenManager {
         let mut c = KiroCredentials::default();
@@ -11490,11 +12567,55 @@ mod tests {
         c2.priority = 0;
         let mgr = MultiTokenManager::new(config, vec![c1, c2], None, None, false).unwrap();
 
-        // 给 #1 设冷却(模拟它 403 额度满被 failover 冷却)→ 选号应跳过 #1 选 #2。
-        mgr.cooldown_custom_api(1, 180);
+        // 给 #1 设冷却(模拟它 403 认证失败被 failover 冷却)→ 选号应跳过 #1 选 #2。
+        mgr.cooldown_custom_api(
+            1,
+            180,
+            crate::kiro::cooldown::CooldownReason::AuthTransient,
+        );
         let empty = HashSet::new();
         let sel = mgr.select_custom_api(&empty, None).expect("应选到未冷却的 #2");
         assert_eq!(sel.0, 2, "#1 冷却中,应选 #2");
+    }
+
+    /// S4：面板冷却标签 —— `cooldown_custom_api` 写入的 reason 必须原样出现在
+    /// 面板展示链路（`cooldown_snapshot` → `CooldownInfo.reason` → description/code，
+    /// admin 侧 `CredentialStatusItem.cooldown_reason/cooldown_code` 即这两者）。
+    ///
+    /// 回退即 FAIL：`cooldown_custom_api` 硬编码 `RateLimitExceeded`（S4 前的缺陷，
+    /// 401/403 在面板显示「速率限制」误导排障）→ 原因/标签断言失败。
+    #[test]
+    fn test_passthrough_cooldown_label_reflects_reason() {
+        use crate::kiro::cooldown::CooldownReason;
+        let config = Config::default();
+        let mut c1 = KiroCredentials::default();
+        c1.id = Some(1);
+        c1.auth_method = Some("custom_api".to_string());
+        c1.base_url = Some("https://relay1.example.invalid".to_string());
+        c1.priority = 0;
+        let mgr = MultiTokenManager::new(config, vec![c1], None, None, false).unwrap();
+
+        // 401/403 类：AuthTransient —— 面板应显示「认证瞬态失败」(cooldownCode=auth_transient)。
+        mgr.cooldown_custom_api(1, 180, CooldownReason::AuthTransient);
+        let snap = mgr.cooldown_snapshot();
+        let info = snap
+            .iter()
+            .find(|c| c.credential_id == 1)
+            .expect("冷却后快照中应有 #1");
+        assert_eq!(info.reason, CooldownReason::AuthTransient, "reason 必须原样保存");
+        assert_eq!(info.reason.description(), "认证瞬态失败", "面板 cooldownReason 文案");
+        assert_eq!(info.reason.code(), "auth_transient", "面板 cooldownCode（前端 i18n 键）");
+
+        // 5xx 类：ServerError —— 面板显示「服务器错误」。
+        mgr.cooldown_custom_api(1, 5, CooldownReason::ServerError);
+        let info = mgr
+            .cooldown_snapshot()
+            .into_iter()
+            .find(|c| c.credential_id == 1)
+            .expect("冷却后快照中应有 #1");
+        assert_eq!(info.reason, CooldownReason::ServerError);
+        assert_eq!(info.reason.description(), "服务器错误");
+        assert_eq!(info.reason.code(), "server_error");
     }
 
     /// 🔴 N1 回归（2026-08-16）：透传池死号（恒 502）失败后不得再被恒选——
@@ -11612,6 +12733,91 @@ mod tests {
             sel2.0, 1,
             "余温过期后 #1 恢复平权：全平局下应重新按 Vec 序选中（探测复活，\
              瞬态抖动不误杀）"
+        );
+    }
+
+    /// 🔴 M1.1 回归（2026-08-16 对抗审查 MAJOR）：透传**成功立即清失败余温**——
+    /// 上游 30s 恢复后该号不该仍被排除到 60s 窗口尾（此前成功不清热，恢复的号白等）。
+    ///
+    /// 构造与余温测试相同（两号 RPM 拉平、全平局）：mark → #1 被排除；给它记一次
+    /// Success → **无需回拨时钟**、无需等 60s，下一轮 select 立即回到全平局 →
+    /// 按 id 选中 #1。若成功分支不清热，#1 仍带余温被过滤 → 选 #2 → 断言红。
+    ///
+    /// 回退即 FAIL：删掉 `record_passthrough_result` Success 分支的
+    /// `last_failure_at.set(None)` → 此断言选回 #2。
+    #[test]
+    fn test_passthrough_success_clears_failure_warmth_immediately() {
+        use std::collections::HashSet;
+        let mut config = Config::default();
+        config.cooldown_enabled = false;
+        let mut c1 = KiroCredentials::default();
+        c1.id = Some(1);
+        c1.auth_method = Some("custom_api".to_string());
+        c1.base_url = Some("https://relay1.example.invalid".to_string());
+        c1.priority = 0;
+        let mut c2 = KiroCredentials::default();
+        c2.id = Some(2);
+        c2.auth_method = Some("custom_api".to_string());
+        c2.base_url = Some("https://relay2.example.invalid".to_string());
+        c2.priority = 0;
+        let mgr = MultiTokenManager::new(config, vec![c1, c2], None, None, false).unwrap();
+
+        mgr.rpm.record(1);
+        mgr.rpm.record(2);
+        let empty = HashSet::new();
+
+        // 失败余温窗口内：#1 被过滤，选健康号 #2。
+        mgr.mark_passthrough_failure(1);
+        let sel = mgr.select_custom_api(&empty, None).expect("池内必有候选");
+        assert_eq!(sel.0, 2, "余温窗口内：#1 必须被过滤（失败后不立即回选）");
+        drop(sel.2);
+
+        // 上游恢复：#1 成功 → 余温立清（选中 #2 时给它记过 rpm，这里补记拉平）。
+        mgr.record_passthrough_result(1, crate::usage::RequestOutcome::Success);
+        mgr.rpm.record(1);
+        let sel2 = mgr.select_custom_api(&empty, None).expect("池内必有候选");
+        assert_eq!(
+            sel2.0, 1,
+            "成功清热后 #1 立即可选（无需等 60s 余温过期）：全平局下按 id 恢复平权"
+        );
+    }
+
+    /// 🔴 M1.3 回归（2026-08-16 对抗审查 MAJOR）：全池余温逃生舱——**所有**候选都带
+    /// 余温（系统性抖动：上游整体压限/集体短暂故障）时不再「无候选 → 503」，
+    /// 按**最老余温**号（失败最早 = 最接近恢复）硬试一次。对照 Kiro 主路径
+    /// `select_ignoring_cooldown` 兜底先例：拿真实上游错误好过网关自造 503。
+    ///
+    /// mark(1) 先于 mark(2) → #1 的失败时刻更早（Instant 更小）→ 逃生舱选中 #1。
+    /// 回退即 FAIL：删掉 `select_custom_api_inner` 的逃生舱分支 → 全余温无候选 →
+    /// select 返 None → `expect` 直接 panic。
+    #[test]
+    fn test_passthrough_all_warm_escape_hatch_tries_oldest_warmth() {
+        use std::collections::HashSet;
+        let mut config = Config::default();
+        config.cooldown_enabled = false;
+        let mut c1 = KiroCredentials::default();
+        c1.id = Some(1);
+        c1.auth_method = Some("custom_api".to_string());
+        c1.base_url = Some("https://relay1.example.invalid".to_string());
+        c1.priority = 0;
+        let mut c2 = KiroCredentials::default();
+        c2.id = Some(2);
+        c2.auth_method = Some("custom_api".to_string());
+        c2.base_url = Some("https://relay2.example.invalid".to_string());
+        c2.priority = 0;
+        let mgr = MultiTokenManager::new(config, vec![c1, c2], None, None, false).unwrap();
+
+        // 两号都失败：#1 先于 #2 → #1 余温更老（最接近恢复）。
+        mgr.mark_passthrough_failure(1);
+        mgr.mark_passthrough_failure(2);
+
+        let empty = HashSet::new();
+        let sel = mgr
+            .select_custom_api(&empty, None)
+            .expect("全池余温必须由逃生舱兜底硬试一次，不得返 None（=503）");
+        assert_eq!(
+            sel.0, 1,
+            "逃生舱必须选**最老余温**号（#1 失败时刻早于 #2，最接近恢复）"
         );
     }
 
@@ -11751,135 +12957,70 @@ mod tests {
         c
     }
 
-    /// 🔴 1439 bug 的修复态（透传池选号白名单感知，2026-08-09）：normalize=true 的号
-    /// 按 effective_model 预判名判白名单（claude-* → fallback，白名单含 fallback 名则
-    /// 选中）；normalize=false 的号按原始名判，原始名不在白名单则必须被过滤。
-    ///
-    /// 修复前 bug：无条件把非 deepseek- 前缀映射成 fallback，白名单含 deepseek-v4-flash
-    /// 的号对**任意** claude 模型放行 → 选中 → 改写后打过去上游不认 400。
+    /// 🔴 2026-08-16 重写（deepseek 归一化移除后）：透传池选号白名单按**原始模型名**
+    /// 判定（`allows_model`，支持通配符）——请求不再被改写，客户端原始名就是实际
+    /// 发给上游的名，判定键 = 发送键。此前（1439 时代）白名单按改写后名（fallback
+    /// 预判）判定，那套口径随归一化一并消亡。
     #[test]
-    fn select_custom_api_whitelist_uses_effective_model() {
+    fn select_custom_api_whitelist_uses_original_model() {
         use std::collections::HashSet;
         let empty = HashSet::new();
 
-        // 场景 A：normalize=true + 白名单 [deepseek-v4-flash] → 请求 claude-sonnet-4-5
-        // 预判 effective = fallback(deepseek-v4-flash) → 命中白名单 → 选中。
+        // 场景 A：白名单 [deepseek-v4-flash] + 请求 claude-sonnet-4-5 → 原始名不在
+        // 白名单 → 必须被过滤（唯一号 → 无候选）。若此处被放行 = 白名单硬门失效。
         let mut a1 = mk_custom(1, 0, None);
-        a1.deepseek_normalize = Some(true);
         a1.allowed_models = Some(vec!["deepseek-v4-flash".to_string()]);
         let mgr_a =
             MultiTokenManager::new(Config::default(), vec![a1], None, None, false).unwrap();
-        let sel = mgr_a
-            .select_custom_api(&empty, Some("claude-sonnet-4-5"))
-            .expect("normalize 号的预判模型名应命中白名单");
-        assert_eq!(sel.0, 1, "白名单感知预判应选中 normalize 号");
+        assert!(
+            mgr_a
+                .select_custom_api(&empty, Some("claude-sonnet-4-5"))
+                .is_none(),
+            "原始名不在白名单必须过滤"
+        );
 
-        // 场景 B：normalize=false（原样透传）→ 预判 = 原始名 claude-sonnet-4-5，
-        // 不在白名单 → 必须被过滤（唯一号 → 无候选）。若此处被放行 = 白名单硬门失效。
+        // 场景 B：白名单 [claude-sonnet-4-5]（含原始名）→ 命中 → 选中。
         let mut b1 = mk_custom(1, 0, None);
-        b1.allowed_models = Some(vec!["deepseek-v4-flash".to_string()]);
+        b1.allowed_models = Some(vec!["claude-sonnet-4-5".to_string()]);
         let mgr_b =
             MultiTokenManager::new(Config::default(), vec![b1], None, None, false).unwrap();
-        assert!(
-            mgr_b.select_custom_api(&empty, Some("claude-sonnet-4-5"))
-                .is_none(),
-            "normalize=false 的号按原始名判白名单，原始名不在白名单必须过滤"
-        );
+        let sel_b = mgr_b
+            .select_custom_api(&empty, Some("claude-sonnet-4-5"))
+            .expect("白名单含原始名必须选中");
+        assert_eq!(sel_b.0, 1, "白名单按原始名命中");
 
-        // 场景 C（1439 修复态）：normalize=true + 白名单 [claude-mythos-5]。
-        // claude-opus-5：白名单不含 → fallback(deepseek-v4-flash) 不在白名单 → 过滤
-        //（修复前会被误判命中而选中，打过去上游不认 400）。
-        // claude-mythos-5：白名单含原名 → 保持原名 → 命中 → 选中（白名单感知正向分支）。
+        // 场景 C：通配符白名单 [claude-*] → claude-opus-5 命中通配 → 选中
+        //（与场景 A 形成对照：判定键是客户端原始名，通配符直接作用于它）。
         let mut c1 = mk_custom(1, 0, None);
-        c1.deepseek_normalize = Some(true);
-        c1.allowed_models = Some(vec!["claude-mythos-5".to_string()]);
+        c1.allowed_models = Some(vec!["claude-*".to_string()]);
         let mgr_c =
             MultiTokenManager::new(Config::default(), vec![c1], None, None, false).unwrap();
-        assert!(
-            mgr_c.select_custom_api(&empty, Some("claude-opus-5")).is_none(),
-            "白名单外的 claude-* 预判为 fallback 且不在白名单 → 必须过滤（1439 修复态）"
-        );
         let sel_c = mgr_c
-            .select_custom_api(&empty, Some("claude-mythos-5"))
-            .expect("白名单含原名必须选中");
-        assert_eq!(sel_c.0, 1, "白名单感知正向分支：原名在白名单 → 保持原名命中");
-
-        // 场景 D（F1，对抗审查 2026-08-15）：normalize=true + **通配符**白名单 [claude-*]。
-        // select 门判定的是**改写后名**（fallback=deepseek-v4-flash），而 effective_model 的
-        // keep 分支是精确匹配（不通配）→ claude-opus-5 被改写 → 通配 claude-* 不命中
-        // deepseek-v4-flash → **该号永不选中**。这是白名单按改写后名判定的既有语义面
-        // （移植通配符前 claude-* 精确匹配同样不命中），钉住现状防止将来把 keep 分支
-        // 改成通配感知时静默改变行为。用户如要「claude 族走此 deepseek 链」，白名单应写
-        // fallback 名形态（如 ["claude-*", "deepseek-*"]）。
-        let mut d1 = mk_custom(1, 0, None);
-        d1.deepseek_normalize = Some(true);
-        d1.allowed_models = Some(vec!["claude-*".to_string()]);
-        let mgr_d =
-            MultiTokenManager::new(Config::default(), vec![d1], None, None, false).unwrap();
-        assert!(
-            mgr_d.select_custom_api(&empty, Some("claude-opus-5")).is_none(),
-            "通配 claude-* 白名单 + normalize 号：判定键是改写后名（deepseek-v4-flash），\
-             通配不命中 → 不选中（钉住现状，防 keep 分支将来通配化时静默改变）"
-        );
-        // 对照：白名单同时含 fallback 名形态 → 命中选中（用户正确配置）。
-        let mut d2 = mk_custom(1, 0, None);
-        d2.deepseek_normalize = Some(true);
-        d2.allowed_models = Some(vec!["claude-*".to_string(), "deepseek-*".to_string()]);
-        let mgr_d2 =
-            MultiTokenManager::new(Config::default(), vec![d2], None, None, false).unwrap();
-        let sel_d = mgr_d2
             .select_custom_api(&empty, Some("claude-opus-5"))
-            .expect("白名单含 fallback 名形态必须选中");
-        assert_eq!(sel_d.0, 1, "claude-* + deepseek-* 白名单 → 改写后名命中");
+            .expect("通配 claude-* 白名单命中原始名");
+        assert_eq!(sel_c.0, 1, "通配白名单按原始名命中");
     }
 
-    /// 源码守卫：`select_custom_api_inner` 函数体内必须调用 `effective_model` ——
-    /// 选号层与改写层共用同一白名单感知判定，删掉它会让选号层退回无条件改写预判，
-    /// 「选中了但改写后打不通」的 1439 类口径分裂复发。
-    /// needle 运行时拼接 + 截断测试段（本仓守卫纪律：注释/测试不写被守卫代码字面量）。
-    #[test]
-    fn select_custom_api_prediction_shares_rewrite_rule() {
-        let src = include_str!("token_manager.rs");
-        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
-        let prod = &src[..cut];
-        let head = format!("fn select_custom_api_inner{}", "(");
-        let start = prod
-            .find(&head)
-            .expect("select_custom_api_inner 不应被改名");
-        let tail = "\n    pub fn has_other_custom_api_candidate";
-        let end = prod[start..]
-            .find(tail)
-            .expect("select_custom_api_inner 的后继函数不应被改名")
-            + start;
-        let body = &prod[start..end];
-        let needle = format!("effective_model{}", "(");
-        assert!(
-            body.contains(&needle),
-            "select_custom_api_inner 必须调用 effective_model 做白名单感知预判——\
-             删掉它选号层与改写层口径分叉（1439 类误放行复发）"
-        );
-    }
-
-    /// 模型黑名单键一致性（映射场景）：mark 与 check 都用**客户端原始模型名**
+    /// 模型黑名单键一致性：mark 与 check 都用**客户端原始模型名**
     /// （provider.rs 埋点传选号入参 model，filter 用同一入参）——自洽，只漏不误伤。
     ///
-    /// 现状钉住：上游拒绝「改写后名」（如 claude-opus-5 → deepseek-v4-flash 打过去
-    /// model_not_found）时，黑名单记原始名 claude-opus-5 → 同改写目标的其它原始名
-    /// （claude-sonnet-4-5）**不被**黑名单覆盖（漏判，宁可多打一跳也不误伤健康号）。
-    /// 已登记（.opencode/state.md W6 登记 D）：修法 = mark 用预判改写后名作键、
-    /// 选号侧同步换键——届时本测试断言需同步更新。
+    /// 现状钉住：上游拒绝该原始模型名（model_not_found）时，黑名单记原始名 →
+    /// 不同原始名**不被**黑名单覆盖（漏判，宁可多打一跳也不误伤健康号）。
+    /// （2026-08-16：deepseek 归一化移除后无「改写后名」概念，键就是发送名。）
     #[test]
     fn blacklist_key_with_mapping_scenario() {
         use std::collections::HashSet;
         let empty = HashSet::new();
 
-        // 改写场景：normalize=true + 白名单 [deepseek-v4-flash] → claude-* 预判为 fallback。
+        // 候选需过白名单：allowed_models 同时列两个模型（黑名单挡一个不误伤另一个）。
         let mut c = mk_custom(1, 0, None);
-        c.deepseek_normalize = Some(true);
-        c.allowed_models = Some(vec!["deepseek-v4-flash".to_string()]);
+        c.allowed_models = Some(vec![
+            "claude-opus-5".to_string(),
+            "claude-sonnet-4-5".to_string(),
+        ]);
         let mgr = MultiTokenManager::new(Config::default(), vec![c], None, None, false).unwrap();
 
-        // 模拟上游拒绝映射后名：mark 用**原始名**（与 provider.rs 埋点一致）。
+        // mark 用**原始名**（与 provider.rs 埋点一致）。
         mgr.mark_model_unsupported(1, "claude-opus-5");
         assert!(
             mgr.is_model_blacklisted(1, "claude-opus-5"),
@@ -11892,10 +13033,10 @@ mod tests {
             "黑名单内的原始名必须被过滤"
         );
 
-        // 同改写目标、不同原始名 → 不命中（漏判现状钉住，测试头注释说明 intended）。
+        // 不同原始名 → 不命中（漏判现状钉住，测试头注释说明 intended）。
         let sel = mgr
             .select_custom_api(&empty, Some("claude-sonnet-4-5"))
-            .expect("同改写目标的不同原始名不应被黑名单误伤（只漏不误伤）");
+            .expect("不同原始名不应被黑名单误伤（只漏不误伤）");
         assert_eq!(sel.0, 1);
     }
 
@@ -12114,7 +13255,7 @@ mod tests {
         )
         .unwrap();
         assert!(mgr.should_try_custom_api_first(), "冷却前应走透传");
-        mgr.cooldown_custom_api(1, 300);
+        mgr.cooldown_custom_api(1, 300, crate::kiro::cooldown::CooldownReason::RateLimitExceeded);
         assert!(
             !mgr.should_try_custom_api_first(),
             "唯一代挂号在冷却中时应先走 Kiro(避免白试一次注定失败的透传)"
@@ -13276,6 +14417,11 @@ mod tests {
         assert!(
             body.contains(&n_clear_disabled_at),
             "set_disabled 启用路径必须清 disabled_at（残留旧禁用时刻随 persist 落盘，运维误判）"
+        );
+        let n_invalidate = format!("self.{}", "invalidate_model_catalog(id)");
+        assert!(
+            body.contains(&n_invalidate),
+            "set_disabled 启用路径必须失效模型目录缓存（Review3 m5：禁用期残留 Confirmed 重启用后白打一跳）"
         );
         let n_persist = format!("self.{}", "persist_credentials()?;");
         assert!(
@@ -15643,7 +16789,14 @@ mod tests {
         let pi = prod
             .find(&probe)
             .expect("add_credential 必须调 probe_and_persist_api_region（否则新号仍靠 config.region 赌运气）");
-        let ui = prod.find(&usage).expect("订阅等级探测调用点不该被改名");
+        // ⚠️ 从 probe **之后**找 usage：SSO 导入路径（service.rs 更早处）也有一次
+        // get_usage_limits_for(credential_id)（拉订阅等级，SSO 带 region 参数无需探测），
+        // find-first 会被它污染——顺序断言只关心 add_credential_with_intent 内的
+        // probe→usage 相对顺序。
+        let ui = prod[pi..]
+            .find(&usage)
+            .expect("订阅等级探测调用点不该被改名")
+            + pi;
         assert!(
             pi < ui,
             "region 探测必须在 get_usage_limits_for 之前：后者打的就是 \
@@ -15799,6 +16952,10 @@ mod tests {
     ///
     /// 行为测试不可行：`RpmTracker::record` 不带时间戳，灌不出「近 10s 猛灌但 60s
     /// 均量平稳」的历史分布，故用源码守卫钉「键存在 + 相对顺序」。
+    ///
+    /// ⚠️ 2026-08-16 同步（模型感知正向路由 S2）：元组起点锚从 `priority` 升为
+    /// `support_rank,`——正向路由把支持档放在首位（设计文档 §3），此守卫顺带钉住
+    /// 「support_rank 存在且在最前」；ramp/rpm 相对顺序断言不变。
     #[test]
     fn passthrough_sort_key_includes_ramp_tier_before_rpm() {
         let src = include_str!("token_manager.rs");
@@ -15814,15 +16971,17 @@ mod tests {
             .next()
             .expect("函数体窗口锚不应被删改");
         // 元组窗口：起止锚在透传键内各只出现一次（该函数没有第二个 min_by_key）。
+        // `support_rank,`（带逗号）在窗口内只出现在元组里（let 绑定是等号形态）。
         let start = zone
-            .find("e.credentials.priority,")
-            .expect("透传排序键首键必须是 priority");
+            .find("support_rank,")
+            .expect("透传排序键首键必须是 support_rank（模型感知正向路由 S2）");
         let end = zone
             .find("e.inflight.load(Ordering::Acquire)")
             .expect("透传排序键必须含 inflight 键");
-        // ⚠️ 2026-08-16 同步：透传键已扩到 7 位（inflight 之后有失败余温位 + 末位
-        // ⑬ e.id 显式 tie-break），inflight 不再是末键；end 锚仍用它（元组内唯一
-        // 出现），本守卫只钉窗口内 ramp_tier 与 rpm_of 的相对顺序，不受影响。
+        // ⚠️ 2026-08-16 同步：透传键已扩到 8 位（support_rank 首位 + inflight 之后
+        // 有失败余温位 + 末位 e.id 显式 tie-break），inflight 不再是末键；end 锚仍
+        // 用它（元组内唯一出现），本守卫只钉窗口内 ramp_tier 与 rpm_of 的相对顺序，
+        // 不受影响。
         let tuple = &zone[start..end];
         let ramp_at = tuple
             .find("ramp_tier,")
@@ -15875,6 +17034,687 @@ mod tests {
         assert!(
             total2 < RAMP_MIN_SAMPLES,
             "低于 RAMP_MIN_SAMPLES 的样本必须走「不判」分支，否则新号被压住拿不到流量"
+        );
+    }
+
+    /// ⭐ 守卫 #8（模型感知正向路由，S2）：透传池排序键里 support_rank **首位**
+    /// （优先级之前）——目录 Confirmed 的号先于 priority 更优的 Unknown 号。
+    /// 命名对齐 `test_ramp_tier_outranks_inflight_in_sort_key` 先例（CURRENT.md 守卫清单）。
+    ///
+    /// 行为断言：号 A priority=10 但目录 Confirmed；号 B priority=0 但目录明确不含
+    /// （Unsupported）。若 support_rank 不生效，B（priority 0 更优）必胜；生效则 A 胜。
+    /// 设计文档 §3：正向证据（目录）比静态配置（priority）更接近「该号能服务该模型」
+    /// 的事实，support_rank 压过 priority 是有意行为变化。
+    #[test]
+    fn test_support_rank_outranks_priority_in_passthrough_sort_key() {
+        use std::collections::HashSet;
+        let empty = HashSet::new();
+
+        // 号 A：priority=10（差），目录含 gpt-5.6-sol → Confirmed。
+        let a = mk_custom(1, 10, None);
+        let mgr = MultiTokenManager::new(
+            Config::default(),
+            vec![a.clone(), mk_custom(2, 0, None)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        // 直接写目录（巡检之外的测试注入，行为等价 store_model_catalog 产物）。
+        mgr.model_catalog_cache.lock().insert(
+            1,
+            ModelCatalogEntry {
+                models: vec!["gpt-5.6-sol".to_string()],
+                refreshed_at: Instant::now(),
+            },
+        );
+        // 号 B（id=2）无目录 → Unknown；A 目录含 → Confirmed（rank 0）胜出。
+        let sel = mgr
+            .select_custom_api(&empty, Some("gpt-5.6-sol"))
+            .expect("有 Confirmed 号时必须选出");
+        assert_eq!(sel.0, 1, "support_rank 首位：Confirmed(0) 必须先于 priority 更优的 Unknown");
+        assert!(
+            mgr.model_support(1, "gpt-5.6-sol") == ModelSupport::Confirmed
+                && mgr.model_support(2, "gpt-5.6-sol") == ModelSupport::Unknown,
+            "前置状态：A Confirmed、B Unknown"
+        );
+        // 对照：同目录下 B 明确不含 → Unsupported(2)，A 仍胜。
+        mgr.model_catalog_cache.lock().insert(
+            2,
+            ModelCatalogEntry {
+                models: vec!["deepseek-chat".to_string()],
+                refreshed_at: Instant::now(),
+            },
+        );
+        let sel2 = mgr
+            .select_custom_api(&empty, Some("gpt-5.6-sol"))
+            .expect("仍有 Confirmed 号时必须选出");
+        assert_eq!(
+            sel2.0, 1,
+            "Confirmed(0) < Unknown(1) < Unsupported(2)：A 恒胜，B 目录明确不含只压后不出局"
+        );
+    }
+
+    /// 三态排序语义（S2 验收 5）：Confirmed < Unknown < Unsupported，同档内 priority
+    /// 仍生效（原排序键语义不变）。
+    #[test]
+    fn support_rank_tiers_and_priority_within_tier() {
+        use std::collections::HashSet;
+        let empty = HashSet::new();
+
+        // 三个号：A Confirmed（priority=2）、B Confirmed（priority=1）、C Unsupported（priority=0）。
+        let a = mk_custom(1, 2, None);
+        let b = mk_custom(2, 1, None);
+        let c = mk_custom(3, 0, None);
+        let mgr = MultiTokenManager::new(
+            Config::default(),
+            vec![a.clone(), b.clone(), c.clone()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        mgr.model_catalog_cache.lock().insert(
+            1,
+            ModelCatalogEntry {
+                models: vec!["gpt-5.6-sol".to_string()],
+                refreshed_at: Instant::now(),
+            },
+        );
+        mgr.model_catalog_cache.lock().insert(
+            2,
+            ModelCatalogEntry {
+                models: vec!["gpt-5.6-sol".to_string()],
+                refreshed_at: Instant::now(),
+            },
+        );
+        mgr.model_catalog_cache.lock().insert(
+            3,
+            ModelCatalogEntry {
+                models: vec!["deepseek-chat".to_string()],
+                refreshed_at: Instant::now(),
+            },
+        );
+        // 同 Confirmed 档内按 priority 升序：B（priority=1）先于 A（priority=2）。
+        let sel = mgr
+            .select_custom_api(&empty, Some("gpt-5.6-sol"))
+            .expect("必须有候选");
+        assert_eq!(sel.0, 2, "同档内 priority 语义不变：Confirmed 档内 B(1) < A(2)");
+        // 排除 B 后选 A（仍是 Confirmed）；排除 A/B 后只剩 C（Unsupported 压后但**仍可选**）。
+        let mut ex = HashSet::new();
+        ex.insert(2);
+        let sel2 = mgr
+            .select_custom_api(&ex, Some("gpt-5.6-sol"))
+            .expect("Confirmed 号 A 必须被选");
+        assert_eq!(sel2.0, 1);
+        let mut ex2 = HashSet::new();
+        ex2.insert(1);
+        ex2.insert(2);
+        let sel3 = mgr
+            .select_custom_api(&ex2, Some("gpt-5.6-sol"))
+            .expect("全 Unsupported 退化放行：Unsupported 号不出局，必须仍可选");
+        assert_eq!(sel3.0, 3, "Unsupported 只是压后，不返 None、不落 Kiro（验收 3）");
+    }
+
+    /// 验收 3 单独钉死：全候选 Unsupported 时 select 仍返回号（不返 None、不落 Kiro）。
+    #[test]
+    fn support_rank_all_unsupported_degrades_open() {
+        use std::collections::HashSet;
+        let empty = HashSet::new();
+        let mgr = MultiTokenManager::new(
+            Config::default(),
+            vec![mk_custom(1, 0, None), mk_custom(2, 1, None)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        // 两号目录都不含目标 → 全 Unsupported。
+        for id in [1u64, 2] {
+            mgr.model_catalog_cache.lock().insert(
+                id,
+                ModelCatalogEntry {
+                    models: vec!["deepseek-chat".to_string()],
+                    refreshed_at: Instant::now(),
+                },
+            );
+        }
+        let sel = mgr.select_custom_api(&empty, Some("gpt-5.6-sol"));
+        assert!(
+            sel.is_some(),
+            "全 Unsupported 必须退化放行（排序压后不是 filter 出局）——\
+             返回 None 会让唯一候选场景错误地落 Kiro"
+        );
+        // 同档（全 Unsupported）内原 7 键语义不变：priority 升序，号 1（0）胜。
+        assert_eq!(sel.unwrap().0, 1, "全 Unsupported 同档内原 7 键语义不变");
+    }
+
+    /// 验收 4：黑名单（负向硬门）优先于正向 Confirmed——filter 先于排序，
+    /// 黑名单命中的号即使 Confirmed 也出局。
+    #[test]
+    fn blacklist_still_hard_gate_over_support_rank() {
+        use std::collections::HashSet;
+        let empty = HashSet::new();
+        let a = mk_custom(1, 0, None);
+        let mgr = MultiTokenManager::new(
+            Config::default(),
+            vec![a.clone(), mk_custom(2, 0, None)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        mgr.model_catalog_cache.lock().insert(
+            1,
+            ModelCatalogEntry {
+                models: vec!["gpt-5.6-sol".to_string()],
+                refreshed_at: Instant::now(),
+            },
+        );
+        // 号 A Confirmed 但被黑名单（原始名键，与 mark 侧一致）。
+        mgr.mark_model_unsupported(1, "gpt-5.6-sol");
+        let sel = mgr
+            .select_custom_api(&empty, Some("gpt-5.6-sol"))
+            .expect("号 2（Unknown）必须被选");
+        assert_eq!(
+            sel.0, 2,
+            "黑名单 > 正向缓存：Confirmed 号被 filter 出局后 support_rank 根本看不到它"
+        );
+    }
+
+    /// 正向判定键 = 改写后名（map_target；exempt 号回落原始名）——请求实际打到
+    /// 上游的名字才与目录可比（设计文档 §4 核心决策）。
+    #[test]
+    fn support_rank_uses_mapped_target_name() {
+        use std::collections::HashSet;
+        let empty = HashSet::new();
+        let mut cfg = Config::default();
+        cfg.model_mapping
+            .insert("gpt-5.6-sol".to_string(), "deepseek-v4-flash".to_string());
+        // 号 A（priority=1）：目录含改写后名 deepseek-v4-flash → Confirmed。
+        // 号 B（priority=0）：目录含原始名 gpt-5.6-sol → 对 A 的判定键（改写后名）不含
+        // → B Unsupported。断言选 A：证明判定用的是改写后名（用原始名 B 会 Confirmed 胜出）。
+        let mgr = MultiTokenManager::new(
+            cfg.clone(),
+            vec![mk_custom(1, 1, None), mk_custom(2, 0, None)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        mgr.model_catalog_cache.lock().insert(
+            1,
+            ModelCatalogEntry {
+                models: vec!["deepseek-v4-flash".to_string()],
+                refreshed_at: Instant::now(),
+            },
+        );
+        mgr.model_catalog_cache.lock().insert(
+            2,
+            ModelCatalogEntry {
+                models: vec!["gpt-5.6-sol".to_string()],
+                refreshed_at: Instant::now(),
+            },
+        );
+        let sel = mgr
+            .select_custom_api(&empty, Some("gpt-5.6-sol"))
+            .expect("必须有候选");
+        assert_eq!(
+            sel.0, 1,
+            "判定键是改写后名：A（目录含 deepseek-v4-flash）Confirmed 胜于 B（原始名不参与）"
+        );
+        // exempt 号回落原始名：号 1 设 exempt → 判定键 = gpt-5.6-sol（原始名），
+        // 目录（deepseek-v4-flash）不命中 → Unsupported；号 2 判定键 = 改写后名
+        // deepseek-v4-flash，目录（gpt-5.6-sol）同样不命中 → Unsupported。
+        // 同档内 priority 号 2（0）胜。若 exempt 失效（号 1 仍用改写后名判定），
+        // 号 1 会 Confirmed（rank 0）胜出 → 断言失败，正确钉住回落语义。
+        let mgr2 = MultiTokenManager::new(
+            cfg,
+            vec![mk_custom(1, 1, None), mk_custom(2, 0, None)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        mgr2.set_credential_model_mapping_exempt(1, Some(true)).unwrap();
+        mgr2.model_catalog_cache.lock().insert(
+            1,
+            ModelCatalogEntry {
+                models: vec!["deepseek-v4-flash".to_string()],
+                refreshed_at: Instant::now(),
+            },
+        );
+        mgr2.model_catalog_cache.lock().insert(
+            2,
+            ModelCatalogEntry {
+                models: vec!["gpt-5.6-sol".to_string()],
+                refreshed_at: Instant::now(),
+            },
+        );
+        let sel2 = mgr2
+            .select_custom_api(&empty, Some("gpt-5.6-sol"))
+            .expect("必须有候选");
+        assert_eq!(
+            sel2.0, 2,
+            "exempt 号判定键回落原始名：号 1 不因改写后名目录命中而 Confirmed"
+        );
+    }
+
+    /// S1 纯判定：目录含 → Confirmed；不含 → Unsupported；大小写不敏感。
+    #[test]
+    fn support_for_three_state_transition() {
+        let models = vec!["gpt-5.6-sol".to_string(), "deepseek-v4-flash".to_string()];
+        assert_eq!(
+            support_for("gpt-5.6-sol", &models),
+            ModelSupport::Confirmed
+        );
+        assert_eq!(
+            support_for("GPT-5.6-SOL", &models),
+            ModelSupport::Confirmed,
+            "判定必须大小写不敏感（eq_ignore_ascii_case）"
+        );
+        assert_eq!(
+            support_for("claude-opus-5", &models),
+            ModelSupport::Unsupported
+        );
+    }
+
+    /// S1 查询层：无条目 → Unknown；新鲜条目 → Confirmed/Unsupported；
+    /// 过期条目 → Unknown（TTL 语义，不依赖真实时间——直接构造过期条目）。
+    #[test]
+    fn model_support_ttl_and_missing_entry() {
+        let mgr = MultiTokenManager::new(
+            Config::default(),
+            vec![mk_custom(1, 0, None)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            mgr.model_support(1, "gpt-5.6-sol"),
+            ModelSupport::Unknown,
+            "无缓存条目 → Unknown"
+        );
+        mgr.model_catalog_cache.lock().insert(
+            1,
+            ModelCatalogEntry {
+                models: vec!["gpt-5.6-sol".to_string()],
+                refreshed_at: Instant::now(),
+            },
+        );
+        assert_eq!(
+            mgr.model_support(1, "gpt-5.6-sol"),
+            ModelSupport::Confirmed,
+            "新鲜条目含目标 → Confirmed"
+        );
+        assert_eq!(
+            mgr.model_support(1, "claude-opus-5"),
+            ModelSupport::Unsupported,
+            "新鲜条目明确不含 → Unsupported"
+        );
+        // 过期条目：refreshed_at 人为拨旧超过 TTL。
+        let stale = Instant::now() - StdDuration::from_secs(MODEL_CATALOG_TTL_SECS + 1);
+        mgr.model_catalog_cache.lock().insert(
+            1,
+            ModelCatalogEntry {
+                models: vec!["gpt-5.6-sol".to_string()],
+                refreshed_at: stale,
+            },
+        );
+        assert_eq!(
+            mgr.model_support(1, "gpt-5.6-sol"),
+            ModelSupport::Unknown,
+            "条目过期 → 惰性判 Unknown（不依赖真实时间，构造过期条目）"
+        );
+    }
+
+    /// S4 统一收口：invalidate 清缓存 + 退避 + 单飞锁三件套。
+    #[test]
+    fn invalidate_model_catalog_clears_all_state() {
+        let mgr = MultiTokenManager::new(
+            Config::default(),
+            vec![mk_custom(1, 0, None)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        mgr.model_catalog_cache.lock().insert(
+            1,
+            ModelCatalogEntry {
+                models: vec!["gpt-5.6-sol".to_string()],
+                refreshed_at: Instant::now(),
+            },
+        );
+        mgr.model_catalog_backoff
+            .lock()
+            .insert(1, CatalogBackoff { failures: 3, until: Instant::now() });
+        mgr.model_catalog_locks
+            .lock()
+            .insert(1, Arc::new(TokioMutex::new(())));
+        mgr.invalidate_model_catalog(1);
+        assert!(
+            mgr.model_catalog_cache.lock().is_empty()
+                && mgr.model_catalog_backoff.lock().is_empty()
+                && mgr.model_catalog_locks.lock().is_empty(),
+            "失效必须清缓存 + 退避 + 单飞锁（防内存残留与旧锁无意义）"
+        );
+        assert_eq!(mgr.model_support(1, "gpt-5.6-sol"), ModelSupport::Unknown);
+    }
+
+    /// S4：改 base_url → 旧目录立即失效（Unknown）；改 api_key 同效。
+    #[tokio::test]
+    async fn set_custom_api_config_invalidates_catalog() {
+        let mgr = MultiTokenManager::new(
+            Config::default(),
+            vec![mk_custom(1, 0, None)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        mgr.model_catalog_cache.lock().insert(
+            1,
+            ModelCatalogEntry {
+                models: vec!["gpt-5.6-sol".to_string()],
+                refreshed_at: Instant::now(),
+            },
+        );
+        mgr.set_custom_api_config(1, Some("https://new.example.invalid".to_string()), None, None, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            mgr.model_support(1, "gpt-5.6-sol"),
+            ModelSupport::Unknown,
+            "换上游后旧目录必须失效（Unknown），否则目录对新高地误导判定"
+        );
+    }
+
+    /// S4：删号清目录缓存（防内存残留；restore 后重新巡检）。
+    #[test]
+    fn delete_credential_clears_model_catalog() {
+        use std::collections::HashSet;
+        let dir = std::env::temp_dir().join(format!(
+            "kiro-mcat-del-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cred_path = dir.join("credentials.json");
+        let mgr = MultiTokenManager::new(
+            Config::default(),
+            vec![mk_custom(1, 0, None)],
+            None,
+            Some(cred_path.clone()),
+            true,
+        )
+        .unwrap();
+        mgr.model_catalog_cache.lock().insert(
+            1,
+            ModelCatalogEntry {
+                models: vec!["gpt-5.6-sol".to_string()],
+                refreshed_at: Instant::now(),
+            },
+        );
+        mgr.model_catalog_backoff
+            .lock()
+            .insert(1, CatalogBackoff { failures: 2, until: Instant::now() });
+        mgr.delete_credential_forced(1, true).unwrap();
+        let empty = HashSet::new();
+        assert!(
+            mgr.select_custom_api(&empty, Some("gpt-5.6-sol")).is_none(),
+            "号已删无候选"
+        );
+        assert!(
+            mgr.model_catalog_cache.lock().is_empty()
+                && mgr.model_catalog_backoff.lock().is_empty(),
+            "删号必须清目录缓存与退避（防内存残留）"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// S3：mock fetch 成功（非空）→ 写缓存 + 重置退避；model_support 转 Confirmed。
+    #[tokio::test]
+    async fn probe_round_success_writes_catalog_and_resets_backoff() {
+        let mgr = MultiTokenManager::new(
+            Config::default(),
+            vec![mk_custom(1, 0, None)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        // 先制造退避残留，验证成功重置。
+        mgr.model_catalog_backoff
+            .lock()
+            .insert(1, CatalogBackoff { failures: 5, until: Instant::now() });
+        let written = mgr
+            .probe_model_catalog_round(|_cred| async {
+                Ok(vec!["gpt-5.6-sol".to_string(), "deepseek-v4-flash".to_string()])
+            })
+            .await;
+        assert_eq!(written, 1, "1 个号写缓存成功");
+        assert_eq!(
+            mgr.model_support(1, "gpt-5.6-sol"),
+            ModelSupport::Confirmed,
+            "成功巡检后目录含目标 → Confirmed"
+        );
+        assert!(
+            mgr.model_catalog_backoff.lock().get(&1).is_none(),
+            "成功（非空）必须重置退避"
+        );
+    }
+
+    /// 守卫 #6：mock fetch 返空 → 不写缓存（保持 Unknown）、不退避、不重置退避。
+    #[tokio::test]
+    async fn probe_round_empty_list_does_not_write_cache() {
+        let mgr = MultiTokenManager::new(
+            Config::default(),
+            vec![mk_custom(1, 0, None)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let written = mgr
+            .probe_model_catalog_round(|_cred| async { Ok(vec![]) })
+            .await;
+        assert_eq!(written, 0, "空列表不算写缓存成功");
+        assert!(
+            mgr.model_catalog_cache.lock().is_empty()
+                && mgr.model_support(1, "gpt-5.6-sol") == ModelSupport::Unknown,
+            "空列表必须不写缓存：固化成「无模型」会让目录失真永久化（守卫 #6）"
+        );
+        assert!(
+            mgr.model_catalog_backoff.lock().get(&1).is_none(),
+            "空列表不算失败：不引入退避（也不重置，下周期照常再探）"
+        );
+    }
+
+    /// S3：mock fetch 失败 → 退避增长 + 缓存维持 Unknown。
+    #[tokio::test]
+    async fn probe_round_failure_bumps_backoff_and_keeps_unknown() {
+        let mgr = MultiTokenManager::new(
+            Config::default(),
+            vec![mk_custom(1, 0, None)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let written = mgr
+            .probe_model_catalog_round(|_cred| async { Err(anyhow::anyhow!("上游 500")) })
+            .await;
+        assert_eq!(written, 0);
+        assert!(
+            mgr.model_catalog_in_backoff(1),
+            "失败必须进退避（该号维持 Unknown = 排序中性，不惩罚）"
+        );
+        assert_eq!(mgr.model_support(1, "gpt-5.6-sol"), ModelSupport::Unknown);
+        // 退避中再调一轮：跳过 fetch（计数不增），且退避状态保留到到期。
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = calls.clone();
+        mgr.probe_model_catalog_round(move |_cred| {
+            c2.fetch_add(1, Ordering::Relaxed);
+            async { Err(anyhow::anyhow!("不应被调用")) }
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "退避中必须整轮跳过该号");
+    }
+
+    /// S3 验收 8：连续失败指数退避 60 → 120 → 240s → … → 上限 1800s；成功重置。
+    ///
+    /// 直调 `bump_model_catalog_backoff` 而非走 probe_round 循环：退避中的号会被
+    /// probe_round 整轮跳过（设计语义：退避期间该号维持 Unknown、本轮不探），
+    /// 指数增长只发生在「不在退避中的失败」，故 bump 本身单独测。
+    #[test]
+    fn probe_backoff_exponential_growth_and_cap() {
+        let mgr = MultiTokenManager::new(
+            Config::default(),
+            vec![mk_custom(1, 0, None)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let wait_of = |mgr: &MultiTokenManager| -> StdDuration {
+            let b = mgr.model_catalog_backoff.lock();
+            let s = b.get(&1).expect("必有退避");
+            s.until.saturating_duration_since(Instant::now())
+        };
+        // 1 次失败：60s；2 次：120s；3 次：240s（2^(n-1) × 60）。
+        mgr.bump_model_catalog_backoff(1);
+        let w1 = wait_of(&mgr);
+        mgr.bump_model_catalog_backoff(1);
+        let w2 = wait_of(&mgr);
+        mgr.bump_model_catalog_backoff(1);
+        let w3 = wait_of(&mgr);
+        assert!(w1 >= StdDuration::from_secs(60) - StdDuration::from_secs(5) && w1 <= StdDuration::from_secs(60));
+        assert!(w2 >= StdDuration::from_secs(120) - StdDuration::from_secs(5) && w2 <= StdDuration::from_secs(120));
+        assert!(w3 >= StdDuration::from_secs(240) - StdDuration::from_secs(5) && w3 <= StdDuration::from_secs(240));
+        // 灌满到封顶：上限 30min 且不再增长。
+        for _ in 0..10 {
+            mgr.bump_model_catalog_backoff(1);
+        }
+        let w_cap = wait_of(&mgr);
+        assert!(
+            w_cap <= StdDuration::from_secs(MODEL_CATALOG_BACKOFF_MAX_SECS)
+                && w_cap >= StdDuration::from_secs(MODEL_CATALOG_BACKOFF_MAX_SECS)
+                    - StdDuration::from_secs(5),
+            "退避必须封顶 30min（实测 {:?}）",
+            w_cap
+        );
+    }
+
+    /// S3 验收 9：并发两次 probe_round 只打一次网络（单飞锁 + 新鲜度 double-check）。
+    #[tokio::test]
+    async fn probe_round_singleflight_only_fetches_once() {
+        let mgr = std::sync::Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![mk_custom(1, 0, None)],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mk_round = |mgr: std::sync::Arc<MultiTokenManager>, calls: std::sync::Arc<std::sync::atomic::AtomicUsize>| {
+            async move {
+                mgr.probe_model_catalog_round(move |_cred| {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    async { Ok(vec!["gpt-5.6-sol".to_string()]) }
+                })
+                .await
+            }
+        };
+        let (r1, r2) = tokio::join!(
+            mk_round(mgr.clone(), calls.clone()),
+            mk_round(mgr.clone(), calls.clone())
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "并发两轮只打一次网络（单飞）");
+        assert_eq!(r1 + r2, 1, "只有一路真正写缓存，另一路看到新鲜目录跳过");
+        assert_eq!(
+            mgr.model_support(1, "gpt-5.6-sol"),
+            ModelSupport::Confirmed
+        );
+    }
+
+    /// S3：禁用号不在巡检列表；ksk（api_key）号结构性排除（正向路由只做透传池）。
+    #[tokio::test]
+    async fn probe_round_skips_disabled_and_kiro_ids() {
+        let kiro = mk_kiro(1, 0);
+        let disabled_custom = mk_custom(2, 0, None);
+        let mgr = MultiTokenManager::new(
+            Config::default(),
+            vec![kiro.clone(), disabled_custom.clone()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        mgr.set_disabled(2, true).unwrap();
+        assert_eq!(
+            mgr.ids_needing_model_probe(),
+            Vec::<u64>::new(),
+            "禁用号 + ksk 号都不该进巡检列表"
+        );
+    }
+
+    /// 源码守卫（S3 接线守卫，对齐 CURRENT.md 守卫纪律：needle 运行时拼接 +
+    /// 截断测试段）：巡检任务必须存在且形态钉死——30min 周期 + Skip + 首轮延迟 +
+    /// 走 probe_model_catalog_round（内含 ids_needing_model_probe 数据源）+
+    /// fetch_upstream_models + 退避。
+    #[test]
+    fn model_catalog_probe_task_is_wired() {
+        let src = include_str!("token_manager.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        // 窗口 = probe_model_catalog_round（循环主体 + 退避）→ spawn_model_catalog_probe
+        // （任务形态）→ probe_and_persist_api_region（后继函数锚）。
+        let fn_head = format!("pub async fn probe_model_catalog_round{}", "<");
+        let start = prod
+            .find(&fn_head)
+            .expect("probe_model_catalog_round 不应被改名或删除");
+        let tail = "pub async fn probe_and_persist_api_region";
+        let end = prod[start..]
+            .find(tail)
+            .expect("巡检函数组后继不应被删改")
+            + start;
+        let body = &prod[start..end];
+        let interval_needle = format!(
+            "tokio::time::interval(StdDuration::from_secs(MODEL_CATALOG_TTL_SECS))"
+        );
+        assert!(
+            body.contains(&interval_needle),
+            "巡检任务周期必须是 MODEL_CATALOG_TTL_SECS（30min）"
+        );
+        assert!(
+            body.contains("MissedTickBehavior::Skip"),
+            "巡检任务必须 Skip 防唤醒后连刷"
+        );
+        let sleep_needle = format!("MODEL_CATALOG_PROBE_START_DELAY_SECS");
+        assert!(
+            body.contains(&sleep_needle),
+            "巡检任务必须有首轮延迟（避开启动期上游往返）"
+        );
+        let round_needle = format!("probe_model_catalog_round{}", "(");
+        assert!(
+            body.contains(&round_needle),
+            "巡检必须走 probe_model_catalog_round（单飞锁 + 空列表不写都在其中）"
+        );
+        assert!(
+            body.contains("ids_needing_model_probe"),
+            "巡检数据源必须是 ids_needing_model_probe（ksk/禁用号排除）"
+        );
+        assert!(
+            body.contains("fetch_upstream_models"),
+            "巡检数据源必须是 fetch_upstream_models（零新增网络代码）"
+        );
+        assert!(
+            body.contains("bump_model_catalog_backoff"),
+            "失败退避必须存在（指数退避，设计文档 §5 值）"
         );
     }
 
@@ -18433,6 +20273,10 @@ mod tests {
     ///
     /// 断言锚用 `trigger_bytes` 而非 `enabled`：handlers.rs 的 roundtrip 测试会翻转
     /// `enabled`，并行跑时用 enabled 断言会被它干扰（全局镜像无锁）。
+    /// 同一条 roundtrip 收尾 `set_compression(default())` 会把 `trigger_bytes` 踩回
+    /// 4MiB（4194304）——全量并行 T5 曾因此红成 left=4194304 / right=222222，
+    /// 看起来像 reload 在播 Default。镜像断言必须仍钉 222222；被踩后只允许再走
+    /// `reload_config` 重播（测试里不得 `set_compression(222222)` 顶上去）。
     #[test]
     fn reload_config_must_broadcast_compression_to_handler_mirror() {
         let dir = std::env::temp_dir().join(format!("ks_reload_cmp_{}", std::process::id()));
@@ -18460,14 +20304,28 @@ mod tests {
         mgr.reload_config().expect("热重载不应失败");
 
         assert_eq!(
-            crate::anthropic::handlers::current_compression().trigger_bytes,
+            mgr.config().compression.trigger_bytes,
             222222,
-            "reload 必须把新 compression 播进 handlers 镜像（消费点读镜像不读 config）"
+            "reload 必须把磁盘 triggerBytes 换进 ArcSwap（不走全局镜像；否则镜像断言无法区分没 load 和被别的测试踩了）"
         );
         assert_eq!(
             mgr.config().credential_rpm_limit,
             222,
             "对照组：热字段必须真的换成新值（否则上面的断言可能只是因为 reload 根本没跑）"
+        );
+
+        let mut got = crate::anthropic::handlers::current_compression().trigger_bytes;
+        for _ in 0..64 {
+            if got == 222222 {
+                break;
+            }
+            mgr.reload_config().expect("热重载不应失败");
+            got = crate::anthropic::handlers::current_compression().trigger_bytes;
+        }
+        assert_eq!(
+            got,
+            222222,
+            "reload 必须把新 compression 播进 handlers 镜像（消费点读镜像不读 config）"
         );
 
         // 复位镜像默认，避免影响其它测试（与 handlers 内 roundtrip 测试同款收尾）。

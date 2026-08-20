@@ -54,9 +54,6 @@ pub struct CredentialStatusItem {
     /// 自定义 API 代挂:累计已发请求数
     #[serde(default)]
     pub request_count: u64,
-    /// 自定义 API 代挂:deepseek 协议归一化开关（None=false；前端展示/开关用）。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub deepseek_normalize: Option<bool>,
     /// 是否豁免全局模型映射（None=false，即应用映射；前端展示/开关用）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_mapping_exempt: Option<bool>,
@@ -419,20 +416,6 @@ pub struct SetCustomApiConfigRequest {
     pub reset_count: bool,
 }
 
-/// 设置代挂凭据 deepseek 协议归一化开关的请求。
-///
-/// deepseek 归一化：开启后透传前按 fuckopencode 的 deepseek 协议修复改写请求体
-/// （模型名→deepseek-v4-flash、thinking adaptive→enabled、reasoning_effort→output_config、
-/// 多轮 tool_use 注入 thinking、剥 context_management 等），仅对 custom_api 代挂号有意义。
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SetDeepseekNormalizeRequest {
-    /// true=开启;false=关闭。null 默认按 false 处理（Rust Option<bool> 反序列化 null → None，
-    /// 这里显式 Option 让前端可传 null 表示关闭）。
-    #[serde(default)]
-    pub deepseek_normalize: Option<bool>,
-}
-
 /// 设置凭据级「模型映射豁免」开关的请求。
 ///
 /// `Some(true)` = 该凭据跳过全局 `config.model_mapping`；`None`/`Some(false)` = 应用映射。
@@ -462,6 +445,7 @@ pub struct AddCredentialRequest {
     pub access_token: Option<String>,
 
     /// 刷新令牌（OAuth 凭据必填，API Key 凭据不需要）
+    #[serde(alias = "refresh_token")]
     pub refresh_token: Option<String>,
 
     /// 认证方式（可选，默认 social）
@@ -506,10 +490,6 @@ pub struct AddCredentialRequest {
     /// None = 跟随全局 `config.customApiFirst`（默认 false = 与 Kiro 号按 priority 公平比较）。
     #[serde(default)]
     pub custom_api_first: Option<bool>,
-    /// 是否对该 custom_api 透传做 deepseek 归一化（opencodezen 代挂专用）。
-    /// true 时透传前按 fuckopencode 的 deepseek 协议修复改写请求体。
-    #[serde(default)]
-    pub deepseek_normalize: Option<bool>,
     /// 是否豁免全局模型映射（创建时设；true = 该号发上游时保持客户端原始模型名）。
     #[serde(default)]
     pub model_mapping_exempt: Option<bool>,
@@ -649,6 +629,7 @@ pub struct AddCredentialRequest {
 
     /// Kiro API Key（API Key 凭据必填，格式: ksk_xxxxxxxx）
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
+    #[serde(alias = "kiro_api_key")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kiro_api_key: Option<String>,
 
@@ -1093,6 +1074,8 @@ pub struct ConfigSnapshotResponse {
     /// 开=白名单模型 + thinking 走原生 reasoningContentEvent 并抑制 XML 标签注入）。
     /// 热更即时生效（converter 进程级镜像）。
     pub native_thinking_effort_enabled: bool,
+    /// CC↔Kiro 工具名/参数映射开关（默认开；热更即时生效，converter 进程级镜像）。
+    pub tool_compat_mapping: bool,
     /// 批量推号入口 POST /api/import/keys 是否启用（默认开；关掉即对两个挂载点一起返 403）
     pub import_keys_enabled: bool,
     /// 分身凭据在请求未显式指定 `enabled` 时是否默认启用（默认 **关**）。
@@ -1318,8 +1301,9 @@ pub struct ConfigSnapshotResponse {
 /// 更新服务端配置请求
 ///
 /// 所有字段可选：仅提交的字段被修改并持久化到 config.json。
-/// 敏感字段（admin key / api key / 代理密码）不在此开放。
-/// 除 `load_balancing_mode` 立即生效外，其余字段需重启进程后生效。
+/// 敏感字段（api key / adminApiKey / 代理密码）值不回显：前端传空串=不改，**仅非空时更新**。
+/// `api_key`/`admin_api_key` 存盘后走 `common::auth_keys` setter **即时生效、无需重启**；
+/// 其余字段大多需重启进程后生效（具体见各字段注释与响应 `restart_fields`）。
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateConfigRequest {
@@ -1338,6 +1322,8 @@ pub struct UpdateConfigRequest {
     pub cc_auto_buffer: Option<bool>,
     /// Kiro 原生 extended thinking 开关（默认关；热更即时生效，converter 镜像）。
     pub native_thinking_effort_enabled: Option<bool>,
+    /// CC↔Kiro 工具名/参数映射开关（默认开；热更即时生效，converter 镜像）。
+    pub tool_compat_mapping: Option<bool>,
     pub import_keys_enabled: Option<bool>,
     /// 分身默认启用（立即生效：存盘后 reload_config 换入 ArcSwap，下一次 clone 即读到）。
     pub clone_default_enabled: Option<bool>,
@@ -1449,9 +1435,13 @@ pub struct UpdateConfigRequest {
     /// 网页上号回调基地址；传空字符串表示清除（回退本地模式）
     pub callback_base_url: Option<String>,
     /// 下游客户端对话 API Key（userKey，x-api-key）。出于安全前端不回显已存值，仅在非空时更新；
-    /// ⚠️需重启生效（认证中间件在启动时固化 key）。空白值会被后端拒绝（防 fail-open）。
+    /// 存盘后走 `common::auth_keys` setter **即时生效、无需重启**。空白值会被后端拒绝（防 fail-open）。
     #[serde(default)]
     pub api_key: Option<String>,
+    /// 管理面 API Key（adminApiKey）。同 [`Self::api_key`]：不回显、仅非空时更新、即时生效。
+    /// ⚠️改这把 key 会让**当前面板会话立刻失效**（下一个请求就按新 key 判定），需用新 key 重新登录。
+    #[serde(default)]
+    pub admin_api_key: Option<String>,
     // ---- 反代安全（批次3，均需重启生效）----
     /// CORS 允许来源列表（整表替换）
     pub cors_allowed_origins: Option<Vec<String>>,
@@ -2150,6 +2140,18 @@ mod tests {
         assert_eq!(empty.mock_cache_read_ratio, None);
     }
 
+    /// 工具映射开关的线协议契约：camelCase 提交 → snake_case 落点；缺省 → None。
+    /// 回退即 FAIL：字段名/rename 改动会让前端「点了没反应」（后端收 None 零改动）。
+    #[test]
+    fn update_config_deserializes_tool_compat_mapping() {
+        let json = r#"{"toolCompatMapping": false}"#;
+        let req: UpdateConfigRequest = serde_json::from_str(json).expect("反序列化应成功");
+        assert_eq!(req.tool_compat_mapping, Some(false));
+
+        let empty: UpdateConfigRequest = serde_json::from_str("{}").expect("空对象应成功");
+        assert_eq!(empty.tool_compat_mapping, None);
+    }
+
     /// OTA 自动检查开关的线协议契约：camelCase 提交 → snake_case 落点；缺省 → None。
     /// 🔴 回归（2026-08-15 补接线）：此前前端 settings-page.tsx 提交 `otaAutoCheck`，
     /// 后端请求结构没有该字段 → serde 静默丢弃 → 用户开了自动检查实际不生效，
@@ -2294,6 +2296,21 @@ mod tests {
         let req = parse(r#"{"kiroApiKey":"ksk_abcdefgh1234"}"#).expect("kiroApiKey 应解析成功");
         assert_eq!(req.items.len(), 1);
         assert_eq!(req.items[0].key, "ksk_abcdefgh1234");
+    }
+
+    /// CLIProxy snake_case：`kiro_api_key` / `refresh_token` 必须落到已有字段。
+    #[test]
+    fn import_add_credential_accepts_cliproxy_snake_aliases() {
+        let req: AddCredentialRequest = serde_json::from_str(
+            r#"{"authMethod":"api_key","kiro_api_key":"ksk_abcdefgh1234","refresh_token":"rt"}"#,
+        )
+        .expect("CLIProxy snake aliases 应能解析");
+        assert_eq!(req.kiro_api_key.as_deref(), Some("ksk_abcdefgh1234"));
+        assert_eq!(req.refresh_token.as_deref(), Some("rt"));
+
+        let req: AddCredentialRequest = serde_json::from_str(r#"{"kiroApiKey":"ksk_abcdefgh1234"}"#)
+            .expect("camelCase kiroApiKey 仍应能解析");
+        assert_eq!(req.kiro_api_key.as_deref(), Some("ksk_abcdefgh1234"));
     }
 
     /// concurrencyLimit 越界（>999 / 负数 / 非整数）一律报错 → 上层 400。
@@ -2476,6 +2493,7 @@ mod tests {
             extract_thinking: false,
             cc_auto_buffer: false,
             native_thinking_effort_enabled: false,
+            tool_compat_mapping: true,
             import_keys_enabled: true,
             clone_default_enabled: false,
             upstream_retry_absorb_enabled: false,
@@ -2742,6 +2760,7 @@ mod tests {
             extract_thinking: true,
             cc_auto_buffer: true,
             native_thinking_effort_enabled: false,
+            tool_compat_mapping: true,
             import_keys_enabled: true,
             clone_default_enabled: false,
             // 吸收层十项：本处是**测试夹具**（不是 Default impl，本类型没有 Default），

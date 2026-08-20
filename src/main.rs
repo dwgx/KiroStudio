@@ -225,11 +225,12 @@ fn bootstrap_config_if_missing(config_path: &str) -> (String, bool) {
 static MAIN_SEEDED_BITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// main 侧播种点名字表：新增 main 直接播种的镜像时必须在此登记（漏登记 mark 时 panic 暴露）。
-const MAIN_SEEDED_NAMES: [&str; 4] = [
+const MAIN_SEEDED_NAMES: [&str; 5] = [
     "login_background_r18",
     "upstream_trace",
     "count_tokens",
     "native_thinking_effort",
+    "tool_compat_mapping",
 ];
 const _: () = assert!(MAIN_SEEDED_NAMES.len() <= 64);
 
@@ -396,6 +397,12 @@ async fn main() {
         tracing::error!("配置文件中 apiKey 为空，拒绝以无鉴权方式启动");
         std::process::exit(1);
     }
+
+    // 播种进鉴权热更单元（common::auth_keys）：后续 admin 改 apiKey 走 setter 即时生效，
+    // 无需重启（重启会掐断在途流式请求）。此处已判非空，播种不会失败；若真失败，
+    // expect panic（fail-closed）——继续跑会让 /v1 匿名可达。
+    crate::common::auth_keys::set_user_key(&api_key)
+        .expect("apiKey 为空——拒绝以无鉴权方式提供 /v1（空值会导致鉴权 fail-open）");
 
     // 构建代理配置
     let proxy_config = config.proxy_url.as_ref().map(|url| {
@@ -666,10 +673,26 @@ async fn main() {
         config.mock_cache_read_ratio,
     );
 
+    // CC↔Kiro 工具名/参数映射开关（默认 true）：播种进 converter 的进程级原子镜像
+    // （默认 true = 现状行为零变化）。关闭后 8 个内置工具（Write→fs_write 等）原样
+    // 透传（仅超长缩短），适配非 Claude Code 客户端/同名自定义工具；admin 改配置时
+    // 热更改写同一镜像（service.rs update_config 调同一个 setter）。
+    anthropic::set_tool_compat_mapping(config.tool_compat_mapping);
+    mark_main_seeded("tool_compat_mapping");
+
+    // 模型感知正向路由巡检（2026-08-16 W16 接线）：30min 周期拉取透传池各号模型目录，
+    // 三态缓存（Confirmed/Unknown/Unsupported）+ support_rank 排序——混池请求不再
+    // 首次打错号（黑名单负向兜底不变）。
+    {
+        let tm3 = kiro_provider.token_manager_arc();
+        tokio::spawn(async move {
+            tm3.spawn_model_catalog_probe();
+        });
+    }
+
     // stats_stale watchdog（2026-08-16 收尾接线，blockers 17e）：usage JSONL 数据
     // 断更 10 分钟即告警（bump "stats_stale"）。report_if_stale 是幂等的（告警后复位）。
     {
-        let tm2 = kiro_provider.token_manager().clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -716,6 +739,10 @@ async fn main() {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
             anthropic_app
         } else {
+            // 播种进鉴权热更单元：admin 改 adminApiKey 走 setter 即时生效，无需重启。
+            // 挂载前已判非空；播种失败属「校验被绕过」，expect panic（fail-closed）。
+            crate::common::auth_keys::set_admin_key(admin_key)
+                .expect("adminApiKey 为空——拒绝挂载无鉴权 Admin API");
             let admin_service =
                 admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
             let mut admin_state = admin::AdminState::new(admin_key, admin_service);

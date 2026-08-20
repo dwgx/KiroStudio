@@ -50,6 +50,34 @@ pub const ENDPOINT_NAMES: &[&str] = &[
     amazonq::AMAZONQ_ENDPOINT_NAME,
 ];
 
+/// 端点回退链的**通用补齐顺序**（`ide` 优先，其后为备用端点）。
+///
+/// 上游 429 / 5xx 往往是**端点级**容量问题，而非凭据额度问题：同一个凭据换到另一个
+/// 上游端点常常立刻成功（kiro-go 的 `endpointFallback` 正靠这三个端点轮转吃掉 429）。
+///
+/// 与 [`KiroCredentials::effective_endpoint_order`] 是**两个不同层面**，不冲突：
+/// 那个按凭据类型给**候选链**（ksk_ 号 = CLI 族 4 端点，供 `select_endpoint` 桶机制用），
+/// 本表是全类型通用的**补齐顺序**（OAuth 号只有 `[ide]` 单候选，回退链靠本表补出
+/// `codewhisperer` / `amazonq`）。`endpoint_chain_for` 以「select 选中的端点」为链首，
+/// 先用凭据候选顺序补齐（ksk_ 号 → CLI 族内部轮内回退），再用本表补齐（跨族兜底）。
+///
+/// ⚠️ **跨族兼容性边界**（与参考仓 jsjm 的结构差异）：参考仓的 codewhisperer / amazonq
+/// 是 IDE 协议变体（`/generateAssistantResponse` 路径 + 条件 tokentype，实测 200 可迁移）；
+/// 本仓的 codewhisperer / amazonq 是 **CLI 协议族**（服务根 `/` + `X-Amz-Target` +
+/// `tokentype: API_KEY` 硬编码 + 绝不注入 profileArn），`tokentype=API_KEY` 的请求只对
+/// `ksk_` 号实测过 200。OAuth 号回退到它们属于**未实测路径**（🔴 待上线实测——
+/// 失败无害（非瞬态错误会立即断链、交既有分类逻辑）但可能**多烧一跳**：OAuth
+/// 请求打 CLI 协议端点大概率得到确定性错误，链内白试一跳后才断链）。
+///
+/// 另注：ksk_（API_KEY）号的链在 `endpoint_chain_for` 里**整体剔除 ide**（对抗审查
+/// M2）——ksk_ 打 ide 必 403 是确定性错误，链尾兜底铁律会让「挪到链尾」的 ide 在
+/// 容量风暴时被真打、从从未成功号累计 report_failure 误禁用（历史事故 #481 同型）。
+pub const ENDPOINT_FALLBACK_ORDER: &[&str] = &[
+    ide::IDE_ENDPOINT_NAME,
+    codewhisperer::CODEWHISPERER_ENDPOINT_NAME,
+    amazonq::AMAZONQ_ENDPOINT_NAME,
+];
+
 /// 全部已知端点的注册表（供 `main.rs` 启动时装配 provider）。
 ///
 /// 键取实现自报的 [`KiroEndpoint::name`]，而非 [`ENDPOINT_NAMES`] 里的字符串：两者若
@@ -997,6 +1025,23 @@ mod registry_tests {
             build(ide::IDE_ENDPOINT_NAME).unwrap().content_type(),
             "application/json"
         );
+    }
+
+    /// ⭐ 回退链顺序守卫：`ide` 必须占链首，且顺序内无重复名字（重复会让链式回退
+    /// 在同一端点上白转一圈）。
+    #[test]
+    fn fallback_order_starts_with_ide_and_has_no_dupes() {
+        assert_eq!(ENDPOINT_FALLBACK_ORDER[0], ide::IDE_ENDPOINT_NAME);
+        assert!(
+            ENDPOINT_FALLBACK_ORDER
+                .iter()
+                .all(|name| ENDPOINT_NAMES.contains(name)),
+            "回退链只能引用已注册的端点名"
+        );
+        let mut seen = ENDPOINT_FALLBACK_ORDER.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), ENDPOINT_FALLBACK_ORDER.len(), "回退链不得有重复");
     }
 }
 

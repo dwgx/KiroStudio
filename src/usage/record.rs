@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// 对齐 provider 的失败处置分类（见 [`crate::kiro::cooldown::CooldownReason`]），
 /// 便于统计侧按结果聚合健康度。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestOutcome {
     /// 成功

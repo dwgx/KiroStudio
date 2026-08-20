@@ -23,6 +23,8 @@ import type {
   ExternalIdpLeg1Response,
   ExternalIdpLeg2Response,
   ExternalIdpSelectResponse,
+  ImportSsoTokenRequest,
+  ImportSsoTokenResponse,
   ConfigSnapshotResponse,
   UpdateConfigRequest,
   UpdateConfigResponse,
@@ -185,17 +187,6 @@ export async function setCredentialApiRegion(
 ): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>(`/credentials/${id}/api-region`, {
     apiRegion: apiRegion && apiRegion.trim() ? apiRegion.trim() : null,
-  })
-  return data
-}
-
-// 设置代挂凭据的 deepseek 协议归一化开关（仅 custom_api 有意义，后端 gate 拒绝其它类型）。
-export async function setCredentialDeepseekNormalize(
-  id: number,
-  deepseekNormalize: boolean
-): Promise<SuccessResponse> {
-  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/deepseek-normalize`, {
-    deepseekNormalize,
   })
   return data
 }
@@ -649,6 +640,28 @@ export async function submitExternalIdpLeg2Select(
     sessionId,
     arn,
   })
+  return data
+}
+
+// ============ SSO Token 导入（粘贴 AWS portal Bearer Token 静默换号）============
+// 用户已在 AWS portal 登录，粘贴 portal 的 Bearer Token，服务端自动走完整
+// 设备授权流程换取标准 IdC 凭据入池（免浏览器授权的人工步骤）。
+
+export async function importSsoToken(
+  req: ImportSsoTokenRequest
+): Promise<ImportSsoTokenResponse> {
+  // 服务端 CreateToken 轮询最长 120s（sso_token.rs POLL_TIMEOUT_SECS）。
+  // 默认 axios 15s 会先于服务端超时，略加余量覆盖响应落盘。
+  const { data } = await api.post<ImportSsoTokenResponse>(
+    '/credentials/import-sso',
+    {
+      token: req.token,
+      region: req.region,
+      priority: req.priority,
+      proxyUrl: req.proxyUrl,
+    },
+    { timeout: 130000 },
+  )
   return data
 }
 

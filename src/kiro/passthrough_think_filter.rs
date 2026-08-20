@@ -1,13 +1,12 @@
-//! passthrough 响应侧的 thinking 过滤（deepseek 归一化专用）。
+//! passthrough 响应侧的 thinking 过滤（custom_api 透传专用）。
 //!
 //! 设计约束：passthrough 的卖点是「字节流原样透传」、零协议转换（隔离铁律 3）。
 //! 所以本模块的两层处理**门控不同**（2026-08-10 拆开）：
 //!
 //! - **thinking 块过滤**（`filter_thinking_blocks`）：滤掉 thinking/redacted_thinking 块、
-//!   重编号保留块 index、按滤掉字符扣减 usage。这**改协议结构**，只在
-//!   `deepseek_normalize == Some(true)` 时启用 —— 因为 deepseek 类中转站在 thinking
-//!   disabled 时仍可能吐 thinking 块，客户端（Claude Code）看到 thinking 会报
-//!   "Tool result missing"。其余凭据保持结构原样。
+//!   重编号保留块 index、按滤掉字符扣减 usage。这**改协议结构**，按门控启用 ——
+//!   因为 deepseek 类中转站在 thinking disabled 时仍可能吐 thinking 块，客户端
+//!   （Claude Code）看到 thinking 会报 "Tool result missing"。其余凭据保持结构原样。
 //! - **DSML 标记剥离**：所有 custom_api 凭据**无条件**启用。DeepSeek 会把
 //!   `<｜DSML｜function_calls>` 这类工具协议标记当普通文本吐进 text_delta，泄漏给客户端
 //!   就是可见的乱码 —— 这与「客户端要不要 thinking」「凭据开没开归一化」都无关，
@@ -326,7 +325,7 @@ struct SseFilterState {
     strip_inline_thinking: bool,
     /// 是否滤掉 thinking content block（start/delta/stop）并重编号保留块。
     ///
-    /// `false` 时（非 deepseek_normalize 凭据）：thinking 块原样透传、**不重编号**
+    /// `false` 时：thinking 块原样透传、**不重编号**
     /// （index_map 不参与），只做 DSML 标记剥离 —— 保住「零协议转换」的透传语义。
     filter_thinking_blocks: bool,
     /// 跨 chunk 的"正在内联 thinking 内"状态。
@@ -466,7 +465,7 @@ impl SseFilterState {
         };
         let old_idx = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
         match event_type {
-            // thinking 块过滤关闭时（非 deepseek_normalize 凭据）：不滤 thinking、
+            // thinking 块过滤关闭时：不滤 thinking、
             // 不重编号，start/stop 一律原样透传 —— 只有 delta 会走下面的 DSML 剥离。
             "content_block_start" | "content_block_stop" if !self.filter_thinking_blocks => {
                 Some(block.to_vec())
@@ -1552,7 +1551,7 @@ mod tests {
         assert_eq!(v["content"][0]["text"].as_str().unwrap(), "见 <｜注｜关于x｜> 说明");
     }
 
-    // ===== `filter_thinking_blocks = false`（未开 deepseek_normalize 的 custom_api 号）=====
+    // ===== `filter_thinking_blocks = false`（未开启 thinking 过滤的 custom_api 号）=====
     //
     // 这组坐实门控拆分的语义：DSML 标记剥离**无条件生效**，thinking 块过滤与 index
     // 重编号**不生效**（保住零协议转换的透传语义）。改前入口整个被 `ds_cfg.is_some()`

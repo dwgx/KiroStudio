@@ -18,7 +18,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 
 use super::pipeline::UsageSink;
-use super::record::RequestRecord;
+use super::record::{RequestOutcome, RequestRecord};
 use crate::model::config::ModelPrice;
 
 /// 小时环形桶数量：24×31，覆盖最近 31 天的逐小时数据
@@ -658,6 +658,12 @@ struct Inner {
     by_requested_model: HashMap<String, Aggregate>,
     /// 按凭据全量累计
     by_credential: HashMap<u64, Aggregate>,
+    /// 按结果分类（outcome）全量累计（key = [`RequestOutcome`]，**封闭枚举** 10 变体，
+    /// 非外部可控字符串 → 天然有界，无需 by_model 的截断/OTHER 归并，见 `Inner::apply`）。
+    ///
+    /// 解决 F1/A2：`Aggregate` 只存 success/failure 二值，429/配额/auth 分布画不出，
+    /// 只能 `traces/search?outcome=` 逐条过滤。
+    by_outcome: HashMap<RequestOutcome, Aggregate>,
     /// per-credential 速率环
     rate: RateRing,
     /// 下游客户端 / 窗口维度的滚动速率聚合（Task5）
@@ -706,6 +712,7 @@ impl Inner {
             by_model: HashMap::new(),
             by_requested_model: HashMap::new(),
             by_credential: HashMap::new(),
+            by_outcome: HashMap::new(),
             rate: RateRing::default(),
             client_agg: ClientAgg::default(),
             throughput: GlobalThroughputRing::default(),
@@ -792,6 +799,13 @@ impl Inner {
             self.by_credential.entry(cid).or_default().add(r);
             self.rate.bump(cid, rate_slot);
         }
+
+        // 按结果分类累计（F1/A2：outcome 细分 —— 429/配额/auth 分布不再靠逐条过滤）。
+        // key 是**封闭枚举**（`RequestOutcome` 10 变体，非外部可控字符串）：无需
+        // by_model 那套截断/OTHER 归并（`MODEL_KEY_CAP` 是为外部可控 key 封无界增长），
+        // 本表条目数恒 ≤ 10，有测试钉死守恒与有界。历史 JSONL 重放走同一 apply，
+        // 未知 outcome 反序列化即失败（serde 枚举），不会产生表外 key。
+        self.by_outcome.entry(r.outcome).or_default().add(r);
 
         // 下游客户端 / 窗口维度速率（与 credential 速率共用同一 30 秒桶编号）
         self.client_agg.bump(r, rate_slot);
@@ -1458,6 +1472,26 @@ impl UsageStats {
         out
     }
 
+    /// 按结果分类（outcome）全量聚合（按请求数降序，key = `RequestOutcome::as_str()`
+    /// 的 snake_case 名：`success` / `rate_limited` / `auth_failed` / ...）。
+    ///
+    /// 解决 F1/A2：`Aggregate` 只存 success/failure 二值，429/配额/auth 分布画不出，
+    /// 面板只能 `traces/search?outcome=` 逐条过滤。本表给出**全量累计**的分布，
+    /// 各 key 的 `requests` 之和恒等于总请求数（守恒）。
+    ///
+    /// 成本不按 outcome 估算（单价表按模型配置）——与 [`Self::by_credential`] 同先例，
+    /// `cost` 随行下发恒 0.0。
+    pub fn by_outcome(&self) -> Vec<GroupStat> {
+        let inner = self.inner.lock();
+        let mut out: Vec<GroupStat> = inner
+            .by_outcome
+            .iter()
+            .map(|(k, a)| GroupStat::from(k.as_str().to_string(), a, None))
+            .collect();
+        out.sort_by(|a, b| b.requests.cmp(&a.requests).then(a.key.cmp(&b.key)));
+        out
+    }
+
     /// 某凭据最近 10 分钟每 30 秒的请求数（20 个点，从旧到新），供前端画 sparkline。
     pub fn recent_rate(&self, credential_id: u64) -> Vec<u32> {
         self.recent_rate_at(credential_id, chrono::Utc::now().timestamp_millis())
@@ -1918,6 +1952,103 @@ mod tests {
         assert_eq!(c1.input_tokens, 20);
         let c2 = creds.iter().find(|c| c.key == "2").unwrap();
         assert_eq!(c2.requests, 1);
+    }
+
+    /// ⭐ 回归（F1/A2）：outcome 细分聚合 —— 不同 outcome 的记录按变体计数。
+    ///
+    /// `Aggregate` 只有 success/failure 二值，429/配额/auth 分布画不出，只能
+    /// `traces/search?outcome=` 逐条过滤。本表把每个变体累计成一行。
+    #[test]
+    fn by_outcome_counts_each_variant() {
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        // 同一小时：success ×2、rate_limited ×1、auth_failed ×1、server_error ×1
+        s.on_record(&rec(0, Some(1), "m", RequestOutcome::Success, 10, 5));
+        s.on_record(&rec(1_000, Some(1), "m", RequestOutcome::Success, 20, 10));
+        s.on_record(&rec(
+            2_000,
+            Some(2),
+            "m",
+            RequestOutcome::RateLimited,
+            0,
+            0,
+        ));
+        s.on_record(&rec(
+            3_000,
+            Some(2),
+            "m",
+            RequestOutcome::AuthFailed,
+            0,
+            0,
+        ));
+        s.on_record(&rec(
+            4_000,
+            Some(2),
+            "m",
+            RequestOutcome::ServerError,
+            0,
+            0,
+        ));
+
+        let rows = s.by_outcome();
+        let row = |k: &str| rows.iter().find(|r| r.key == k).unwrap();
+        // 未出现的变体不得凭空出现一行（表按命中变体累计）
+        assert_eq!(rows.len(), 4, "只应有命中的 4 个变体: {:?}", rows);
+        assert_eq!(row("success").requests, 2);
+        assert_eq!(row("success").input_tokens, 30);
+        assert_eq!(row("rate_limited").requests, 1);
+        assert_eq!(row("auth_failed").requests, 1);
+        assert_eq!(row("server_error").requests, 1);
+
+        // 总量守恒：各变体请求数之和 = 总请求数（与 by_model 的守恒口径一致）
+        let total: u64 = rows.iter().map(|r| r.requests).sum();
+        assert_eq!(total, 5, "outcome 分布必须守恒");
+
+        // 序列化出口：key 是 snake_case（前端按 outcome 字符串对接）
+        let json = serde_json::to_string(&rows).unwrap();
+        assert!(json.contains("\"key\":\"rate_limited\""), "{json}");
+        assert!(json.contains("\"key\":\"auth_failed\""), "{json}");
+        // 成本不按 outcome 估算（与 by_credential 同先例，恒 0）
+        assert!(rows.iter().all(|r| r.cost == 0.0));
+    }
+
+    /// by_outcome 的 key 是**封闭枚举**（10 变体），天然有界：
+    /// 条目数恒 ≤ 变体数，任意灌入不会增长（对比 by_model 需 MODEL_KEY_CAP/OTHER）。
+    #[test]
+    fn by_outcome_is_bounded_by_enum_variants() {
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        // 所有 10 个变体都来一条
+        for (i, o) in [
+            RequestOutcome::Success,
+            RequestOutcome::RateLimited,
+            RequestOutcome::AuthFailed,
+            RequestOutcome::QuotaExhausted,
+            RequestOutcome::AccountSuspended,
+            RequestOutcome::ServerError,
+            RequestOutcome::BadRequest,
+            RequestOutcome::NetworkError,
+            RequestOutcome::OtherError,
+            RequestOutcome::ModelUnavailable,
+        ]
+        .iter()
+        .enumerate()
+        {
+            s.on_record(&rec(i as i64 * 1_000, Some(1), "m", *o, 1, 0));
+        }
+        let rows = s.by_outcome();
+        // 有界：不超过变体数（10）
+        assert!(
+            rows.len() <= 10,
+            "by_outcome 应有界（10 变体）：{} 条",
+            rows.len()
+        );
+        // 守恒：全部 10 条都归到各自的桶
+        let total: u64 = rows.iter().map(|r| r.requests).sum();
+        assert_eq!(total, 10, "outcome 分布必须守恒");
+        // 每个变体恰好一行
+        assert_eq!(rows.len(), 10);
+        // 与 by_model 总量一致（同一批记录的两个维度）
+        let model_total: u64 = s.by_model(&no_pricing()).iter().map(|m| m.requests).sum();
+        assert_eq!(model_total, 10);
     }
 
     /// ⭐ 成本估算纯函数：输入 tokens（gross 口径）+ 单价 → 元。
@@ -2926,6 +3057,7 @@ mod tests {
         assert!(serde_json::to_string(&s.timeseries_daily_at(BASE_MS, 5)).is_ok());
         assert!(serde_json::to_string(&s.by_model(&no_pricing())).is_ok());
         assert!(serde_json::to_string(&s.by_credential()).is_ok());
+        assert!(serde_json::to_string(&s.by_outcome()).is_ok());
         assert!(serde_json::to_string(&s.throughput_at(BASE_MS)).is_ok());
         assert!(serde_json::to_string(&s.clients_at(BASE_MS)).is_ok());
         assert!(serde_json::to_string(&s.machines_at(BASE_MS)).is_ok());
@@ -3185,6 +3317,31 @@ mod tests {
             models[0].key.chars().count() <= Inner::MODEL_KEY_MAX_LEN,
             "模型名未截断：{} 字符",
             models[0].key.chars().count()
+        );
+    }
+
+    /// 源码守卫（F1/A2）：by_outcome 聚合必须接线在 `Inner::apply` 里。
+    ///
+    /// 删掉 apply() 里的累计行 → **编译不报错**（by_outcome 只是少累计），
+    /// `/usage/by-outcome` 静默返回空表 —— 本守卫靠 needle 钉死接线存在。
+    ///
+    /// 回退即 FAIL：apply() 里对 by_outcome 的累计入口消失。
+    #[test]
+    fn apply_must_wire_by_outcome_aggregation() {
+        let src = include_str!("usage_stats.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        // needle 运行时拼接（守卫纪律）：字面量只出现在被守卫的代码里
+        let needle = format!("self.by_outcome.entry(r.outcome){}", "");
+        assert!(
+            prod.contains(&needle),
+            "apply() 必须按 outcome 累计进 by_outcome（删掉接线 = 细分视图静默归零）"
+        );
+        // 查询出口同样不能丢：by_outcome() 方法必须存在
+        let needle2 = format!("pub fn by_outcome({})", "&self");
+        assert!(
+            prod.contains(&needle2),
+            "by_outcome() 查询方法必须存在（删掉 = /usage/by-outcome 无法返回）"
         );
     }
 }

@@ -1,82 +1,82 @@
-# 当前接手说明（2026-08-16 W13 复核版）
+# 当前接手说明（2026-08-20 Windows）
 
-本文件是执行层交接；当前状态入口是仓根 [`STATUS.md`](../STATUS.md)。
-任务状态三件套：`.opencode/state.md`（波次）、`.opencode/ISSUES.md`（a-e 问题清单）、
-`.opencode/DONE.md`（已完成+证据）；subagent 背景见 `.claude/CONTEXT.md`；
-会话全景报告见 `docs/session-report-2026-08-15-16.md`。
-根目录的 `HANDOFF-*`、`PLAN-*`、`TRACKING-*`、`OPEN-ISSUES-*` 和旧 `STATUS-*` 全部按历史档案处理：保留证据，不承载当前结论。
+执行层。状态入口是仓根 [`STATUS.md`](../STATUS.md)。进度 `.agent/HANDOFF.md`。收口板 `.agent/CLOSEOUT.md`。
+过程记录 `.opencode/state.md` / `ISSUES.md` / `DONE.md` 是历史+脏叙事，结论以 STATUS 为准。
+`.claude/state/CURRENT.md` 的 W13 / nbus `88270616` 段是 **2026-08-16 历史**；后半守卫名单仍要用。
 
-## 1. Git 边界（2026-08-16 复核）
+## 1. Git 边界
 
 ```text
-branch: master
-HEAD: 513e7f0（2026-08-15 docs 交接快照；代码侧最后提交 1e100a2 严格语义修复）
-master/origin/master: 513e7f0（已推，一致）
-porcelain entries: 203 个未提交（多会话并发：W2-W13 全部工作）
+live:   D:\Project\kirostudio
+branch: master = origin/master   (0/0)
+HEAD:   59744cb  W2-W14 milestone
+freeze: backup/w15-w22-windows = 911b914   (local only; not master; not pushed)
+dirty:  W15-W22 product stack + closeout T0-T4 hunks
+        src + admin-ui + untracked auth_keys.rs, sso_token.rs
+        + untracked docs/client-key-design.md, docs/compat-upgrade-plan.md
+remote: origin = https://github.com/dwgx/KiroStudio-skiapi.git
 ```
 
-- `HEAD` = `513e7f0`；当前状态一律以仓根 STATUS.md 为准。
-- 工作树有 W2-W13 大量已 CI 验证的未提交改动；禁止裸 git 操作，快照走临时 index（CLAUDE.md）。
-- 部署目标：**线上是 nbus（38.244.34.15:8990，systemd 二进制）**，skiapi（143.20.230.62:673）是验证机。
+- 禁止 `git checkout` / `stash` / `reset` / 全仓 `fmt`（会冲掉别人的脏树）。
+- 提交必须 Owner 点名。默认用临时 `GIT_INDEX_FILE` 快照，不碰真实 index。
+- 不要 stage：`credentials.json`、`config.json`、`.agent/`、`.grok/`、`.claude/`、凭据备份、本地 db。
+- `.opencode/*` 已跟踪属迁移债；新提交尽量不要再扩。
+- 本仓 `.git/config` 已设 `core.filemode=false`。
+- 本切片 **无 push、无部署**。冻包 `911b914` 不要当成已上线。
 
-## 2. 线上边界（2026-08-16 实测）
+## 2. 线上边界
+
+2026-08-20 **未 ssh** nbus / skiapi。nbus sha / `build_sha` / pool = **unknown**。
+旧数字（nbus `88270616`、`build_sha=final`，脏 state 的 CI 2109/0 与 w18/w19/w22 部署）**不是现状**。
+部署目标仍是：**nbus = 生产 systemd 二进制**，**skiapi = 验证机**。未授权不 ssh。
+
+## 3. 本地验证边界（Windows）
+
+- rustc **1.96.0**（CI release 用 1.97.1）。`admin-ui/dist` 在。`cargo` 一律 `--no-default-features`。
+- 全量：`cargo test --no-default-features` → **ok. 2170 passed; 0 failed**（收尾波会再跑，以 closeout `test-t5-full.md` 为准）。
+- 前端：本机无 `pnpm`。tsc 未复跑；发版 CI 会 `pnpm build`。
+- skiapi Docker / nbus 部署必须 Owner 点名。
+- Mac 8GB /「只走 skiapi」**不是这台 Windows**。
+
+## 4. 平台对照
+
+| 项 | Mac（已结束） | Windows（当前） |
+|---|---|---|
+| 路径 | `/Users/dwgx/Documents/WorkSpace/Project/kirostudio` | `D:\Project\kirostudio` |
+| 主写 | OpenCode + Claude | Grok 编排；大改可交 Cursor |
+| 后端编 | 8GB 编不过，只走 skiapi | 本机 check/test 二进制已能编；T5 待跑 |
+| Mac 镜像 | — | `D:\Macos\workspace\Project\kirostudio` 不存在，不要新建从 `D:\Project` 打出的 junction |
+
+## 5. 完成 / 未完成
+
+- **已进 git**：W2–W14（`59744cb`）。
+- **冻包过时**：`911b914` 早于吸收/调度收口，不要当当前树。
+- **在脏树**：W15–W22 + 吸收（conversationId / websearch 失败埋点 / OAuth 不走 CLI / MCP 按号负缓存 / 上号解析 / stopReason）+ 调度（ConcurrencyFull 纯代挂短等、封桶 429+RA、非流式 metadata、设置三档）。
+- **未验证**：线上 sha、SSO 实登、MCP 无号活流量、`tool_reference`、前端 tsc。
+- **有意未做**：Client Key、加大全局 16、部署 nbus。已知 3 条 review bug 未修（MCP 不轮换 / websearch decode_round / SSO 空 refresh）。
+
+## 6. 打包 / tag（准备，未执行）
+
+禁止真实 `git add`。快照用临时 index。**不要** `git push public`。**不要** 在 Cargo.toml 仍是 1.1.1 时打 `v1.1.2`（OTA 死循环，CI 也会拒）。
+
+**进快照：** `src/`（含未跟踪 `auth_keys.rs` `sso_token.rs` `metadata.rs`）、`admin-ui/`、`build.rs`、`Dockerfile`、`Cargo.toml`、`CHANGELOG.md`、`STATUS.md`、`docs/README.md`、`docs/TAKEOVER.md`、设计稿 `docs/client-key-design.md` `docs/compat-upgrade-plan.md`。
+
+**不准进：** `credentials.json` `config.json` `.agent/` `.grok/` `.tmp*` `docs/archive/` `.opencode/` 扩写、密钥、本地 db、`*.log`。
 
 ```text
-systemd: ActiveState=active, SubState=running
-binary: /opt/kirostudio/kirostudio
-sha256 前缀: 88270616（W13 最终 build）
-healthz: {"build_sha":"final","config_loaded":true,"ok":true,"pool_count":4,
-          "sqlite_writable":true,"version":"1.1.1"}
-备份: /opt/kirostudio/kirostudio.bak-pre-final（前序 edf27204）
+# PowerShell 示意（Owner 点名后再跑；GIT_INDEX_FILE 用临时路径）
+$env:GIT_INDEX_FILE = "$env:TEMP\ks-snap.index"
+Remove-Item $env:GIT_INDEX_FILE -ErrorAction SilentlyContinue
+git read-tree HEAD
+git add -A -- src admin-ui build.rs Dockerfile Cargo.toml CHANGELOG.md STATUS.md docs/README.md docs/TAKEOVER.md docs/client-key-design.md docs/compat-upgrade-plan.md
+# 核：git ls-files --others --exclude-standard -- src admin-ui 必须空
+# TREE=$(git write-tree); 再 commit-tree + 分支，不碰真实 index
+# tag v1.1.2 且 Cargo.toml version=1.1.2 后 push origin tag → 触发 release.yml
+Remove-Item Env:GIT_INDEX_FILE
 ```
 
-线上跑的是 W13 收尾 build（build_sha=final，2026-08-16 05:24 部署）。部署细节与判定标准见
-`.claude/state/CURRENT.md`「如何验证与部署」节；4 通道状态见 STATUS.md「先看结论」。
+发 tag 后 CI：Ubuntu 测试门禁 → Linux musl + macOS 双架构 + Windows exe。本机 smoketest 不能替代 CI 三端。
 
-## 3. 本地验证边界
+## 7. 安全下一步
 
-**本机 8GB 编不过 Rust**，所有后端验证必须走 skiapi Docker 验证循环（CLAUDE.md 完整命令）：
-快照（临时 index）→ `verify-snapshot.sh` → scp → docker build → 显式跑
-`cargo test --no-default-features`。判定 `2020 passed; 0 failed`（当前基线）。
-前端：`cd admin-ui && pnpm install && pnpm exec tsc --noEmit && node --test 'tests/*.test.ts'`
-（53 测试）+ `pnpm build`。
-
-## 4. 当前代码可确认的“完成”
-
-- W1-W13 全部工作在工作树中（已 CI 验证，未提交）：51 项审计修复、模拟缓存、错误码可配置（42 key）、
-  模型兼容层（通配符/路径段/统计对齐）、绊脚石 16 项 + 并发工程类、性能仪表盘、i18n 三语 2344 键。
-- 线上 88270616 实测 sha256sum 一致 + healthz 全绿 + 4 通道 smoketest 通过（详见 DONE.md 十一/十二节）。
-- 若需要精确范围，先看 `git status --porcelain` + `.opencode/state.md` 波次记录；不要引用旧 handoff
-  的测试数、行号或线上数字。
-
-## 5. 当前“未完成/未验证”清单
-
-- **未提交**：W2-W13 全部改动仍未进 master（并发纪律，提交需 owner 批准走正式流程）。
-- **待 owner 决策**：websearch 结构性缺陷（D/A/B/C 选型）、v1.1.2 发版、opencode 配置切换、
-  gpt-5.6-sol 来源排查、native_thinking_effort_enabled（详见 STATUS.md「需要 owner 决策」）。
-- **未验证**：微软 SSO 完整登录流程（回调已修，待用户实测）、流式路径性能基准（PERFORMANCE.md §10）、
-  生图三层不通（路由 404 + catalog 400 + key 无 image 权限）。
-- **未做（有意）**：OTA 未启用、upstream_trace 默认关、性能 P1/P2 建议（PERFORMANCE.md §9）。
-
-## 6. 外部阻塞与 owner 决策
-
-- websearch 结构性缺陷修复选项需 owner 拍板（D 补 Kiro 号零代码推荐 / A 判定前移 / B 降级转发 / C 大工程）。
-- v1.1.2 发版需 owner 批准（release 产物落后线上全部 W2-W13 修复）。
-- 部署需 owner 批准；部署后必须校验 sha256 + 产物 static-pie 形态 + healthz build_sha == 快照 commit
-  （W12 踩过缓存坏产物坑）。
-
-## 7. 安全下一步命令（只列，不代表本次执行）
-
-```bash
-git status --short --branch
-git diff --check
-
-cd admin-ui
-pnpm install --frozen-lockfile
-pnpm build
-node --import ./tests/tsx-loader-register.mjs --test 'tests/*.test.ts'
-```
-
-后端验证/部署流程（临时 GIT_INDEX_FILE 快照、verify-snapshot.sh、skiapi Docker、nbus 替换 + restart、
-build_sha 校验）见 `.claude/state/CURRENT.md`；禁止真实 index 写操作、全仓 `cargo fmt`、VPS 本地编译和
-未经批准的线上配置变更。
+不要 `reset` 脏树。下一动作只有 Owner 点名的那件：bump+tag、或 ssh、或实号烟测。

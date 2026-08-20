@@ -280,6 +280,8 @@ interface FormState {
   selfHealMaxBackoffSecs: string
   selfHealMaxShift: string
   nativeThinkingEffortEnabled: boolean
+  // CC↔Kiro 工具名/参数映射开关（默认开；热更即时生效）
+  toolCompatMapping: boolean
   encryptCredentialsAtRest: boolean
   cooldownEnabled: boolean
   autoDisableSuspicious: boolean
@@ -369,6 +371,10 @@ const PROMPT_CACHE_DEFAULT = true
 const MOCK_CACHE_ENABLED_DEFAULT = false
 const MOCK_CACHE_RATIO_DEFAULT = 0.7
 
+// 工具映射开关默认值（与后端 `default_tool_compat_mapping()` 对齐）：开。
+// 字段缺失时按此兜底，避免面板把"未下发"显示成"已关闭"。
+const TOOL_COMPAT_MAPPING_DEFAULT = true
+
 // 多行文本 <-> 字符串列表（去空白、去空行）
 function linesToList(s: string): string[] {
   return s
@@ -431,6 +437,7 @@ function toForm(c: ConfigSnapshotResponse, ui: UiLayoutPrefs): FormState {
     selfHealMaxBackoffSecs: String(c.selfHealMaxBackoffSecs ?? 900),
     selfHealMaxShift: String(c.selfHealMaxShift ?? 4),
     nativeThinkingEffortEnabled: c.nativeThinkingEffortEnabled ?? false,
+    toolCompatMapping: c.toolCompatMapping ?? TOOL_COMPAT_MAPPING_DEFAULT,
     encryptCredentialsAtRest: c.encryptCredentialsAtRest ?? false,
     cooldownEnabled: c.cooldownEnabled,
     autoDisableSuspicious: c.autoDisableSuspicious ?? true,
@@ -1974,6 +1981,8 @@ export function SettingsPage() {
     if (Number.isFinite(nSelfHealShift) && nSelfHealShift !== (config.selfHealMaxShift ?? 4)) d.selfHealMaxShift = nSelfHealShift
     if (form.nativeThinkingEffortEnabled !== (config.nativeThinkingEffortEnabled ?? false))
       d.nativeThinkingEffortEnabled = form.nativeThinkingEffortEnabled
+    if (form.toolCompatMapping !== (config.toolCompatMapping ?? TOOL_COMPAT_MAPPING_DEFAULT))
+      d.toolCompatMapping = form.toolCompatMapping
     if (form.encryptCredentialsAtRest !== (config.encryptCredentialsAtRest ?? false)) d.encryptCredentialsAtRest = form.encryptCredentialsAtRest
     if (form.cooldownEnabled !== config.cooldownEnabled) d.cooldownEnabled = form.cooldownEnabled
     if (form.autoDisableSuspicious !== config.autoDisableSuspicious)
@@ -2200,6 +2209,8 @@ export function SettingsPage() {
   const restart = t('settingspage.hint.restartRequired')
   const presetRestart = t('settingspage.hint.presetOrCustomRestart')
   const emDash = t('settingspage.common.emDash')
+  // 号池全代挂时吸收层无效：主开关与调参旋钮一起禁用（警告文案仍显示）。
+  const absorbTuningDisabled = absorbHasNoEffect || !form.upstreamRetryAbsorbEnabled
 
   return (
     <SearchContext.Provider value={{ query }}>
@@ -2421,9 +2432,9 @@ export function SettingsPage() {
           <p className="mb-3 mt-1 text-sm text-muted-foreground">
             {t('settingspage.smart.desc')}
           </p>
-          {/* 调度模式（三按钮，2026-08-16）：智能 / 稳定 / 手动。切档写预设矩阵（后端
-              apply_throttle_profile_for_explicit_switch），会覆盖高级参数里未显式配置的值；
-              切智能/稳定前确认提示（文案含 cooldownEnabled 语义陷阱说明）。 */}
+          {/* 调度档三按钮：智能=个人/直连，稳定=中转/shield，手动=专家。
+              切智能/稳定写预设矩阵；确认文案含 cooldownEnabled 语义陷阱。
+              非手动档不藏已有专家旋钮。 */}
           <Field
             label={t('settingspage.schedulingMode.title')}
             hint={t('settingspage.schedulingMode.desc')}
@@ -2458,17 +2469,12 @@ export function SettingsPage() {
               </Button>
             </div>
           </Field>
-          {form.schedulingMode !== 'manual' && (
-            <p className="text-xs text-muted-foreground -mt-2 mb-2">
-              {t(`settingspage.schedulingMode.${form.schedulingMode}Hint`)}
-            </p>
-          )}
-          {/* 手动档：下方所有高级参数（齿轮卡）全部可调，无任何预设覆盖 */}
-          {form.schedulingMode === 'manual' && (
-            <p className="text-xs text-muted-foreground -mt-2 mb-2">
-              {t('settingspage.schedulingMode.manualHint')}
-            </p>
-          )}
+          <p className="text-xs text-muted-foreground -mt-2 mb-1">
+            {t('settingspage.schedulingMode.dailyOnly')}
+          </p>
+          <p className="text-xs text-muted-foreground mb-2">
+            {t(`settingspage.schedulingMode.${form.schedulingMode}Hint`)}
+          </p>
           <Field
             label={t('settingspage.smart.balanceWeight.label')}
             hint={t('settingspage.smart.balanceWeight.hint')}
@@ -2793,6 +2799,10 @@ export function SettingsPage() {
           <Field label={t('settingspage.tool.descMax.label')} hint={t('settingspage.tool.descMax.hint')}>
             <NumberStepper value={Number(form.toolDescriptionMaxChars) || 0} onChange={(v) => set('toolDescriptionMaxChars', String(v))} min={0} step={1000} className="w-32" aria-label={t('settingspage.tool.descMax.aria')} />
           </Field>
+          {/* CC↔Kiro 工具名/参数映射：不入容错七项计数（不同性质：协议映射层而非错误缓解）。 */}
+          <Field label={t('settingspage.advanced.toolCompat.label')} hint={t('settingspage.advanced.toolCompat.hint')}>
+            <Switch checked={form.toolCompatMapping} onCheckedChange={(v) => set('toolCompatMapping', v)} />
+          </Field>
         </CardContent>
       </Card>
       </SectionGate>
@@ -2865,38 +2875,42 @@ export function SettingsPage() {
             </Callout>
           )}
           <Field label={t('settings.absorb.enabled')} hint={`${t('settings.absorb.enabledHint')}${hotParen}`}>
-            <Switch checked={form.upstreamRetryAbsorbEnabled} onCheckedChange={(v) => set('upstreamRetryAbsorbEnabled', v)} />
+            <Switch
+              checked={form.upstreamRetryAbsorbEnabled}
+              onCheckedChange={(v) => set('upstreamRetryAbsorbEnabled', v)}
+              disabled={absorbHasNoEffect}
+            />
           </Field>
           <GroupHeading label={t('settingspage.advanced.absorb.tuningGroup')} />
           {/* min=45 与后端 from_config 的 budget 下限一致：低于 45 会反向砍掉既有的
               failover 墙钟（round_budget 是 min(45s, 剩余预算)），后端已强制抬回，
               这里同步 min 是为了让面板不给出一个「填了不生效」的值。 */}
           <Field label={t('settings.absorb.budgetSecs')} hint={t('settings.absorb.budgetSecsHint')}>
-            <NumberStepper value={Number(form.upstreamRetryAbsorbBudgetSecs) || 0} onChange={(v) => set('upstreamRetryAbsorbBudgetSecs', String(v))} min={45} max={600} step={5} className="w-28" disabled={!form.upstreamRetryAbsorbEnabled} aria-label={t('settings.absorb.budgetSecs')} />
+            <NumberStepper value={Number(form.upstreamRetryAbsorbBudgetSecs) || 0} onChange={(v) => set('upstreamRetryAbsorbBudgetSecs', String(v))} min={45} max={600} step={5} className="w-28" disabled={absorbTuningDisabled} aria-label={t('settings.absorb.budgetSecs')} />
           </Field>
           <Field label={t('settings.absorb.maxRounds')} hint={t('settings.absorb.maxRoundsHint')}>
-            <NumberStepper value={Number(form.upstreamRetryAbsorbMaxRounds) || 0} onChange={(v) => set('upstreamRetryAbsorbMaxRounds', String(v))} min={1} max={64} className="w-28" disabled={!form.upstreamRetryAbsorbEnabled} aria-label={t('settings.absorb.maxRounds')} />
+            <NumberStepper value={Number(form.upstreamRetryAbsorbMaxRounds) || 0} onChange={(v) => set('upstreamRetryAbsorbMaxRounds', String(v))} min={1} max={64} className="w-28" disabled={absorbTuningDisabled} aria-label={t('settings.absorb.maxRounds')} />
           </Field>
           <Field label={t('settings.absorb.minDelayMs')} hint={t('settingspage.advanced.absorb.minDelayHint')}>
-            <NumberStepper value={Number(form.upstreamRetryAbsorbMinDelayMs) || 0} onChange={(v) => set('upstreamRetryAbsorbMinDelayMs', String(v))} min={0} max={60000} step={50} className="w-28" disabled={!form.upstreamRetryAbsorbEnabled} aria-label={t('settings.absorb.minDelayMs')} />
+            <NumberStepper value={Number(form.upstreamRetryAbsorbMinDelayMs) || 0} onChange={(v) => set('upstreamRetryAbsorbMinDelayMs', String(v))} min={0} max={60000} step={50} className="w-28" disabled={absorbTuningDisabled} aria-label={t('settings.absorb.minDelayMs')} />
           </Field>
           <Field label={t('settings.absorb.maxDelaySecs')} hint={t('settingspage.advanced.absorb.maxDelayHint')}>
-            <NumberStepper value={Number(form.upstreamRetryAbsorbMaxDelaySecs) || 0} onChange={(v) => set('upstreamRetryAbsorbMaxDelaySecs', String(v))} min={1} max={600} className="w-28" disabled={!form.upstreamRetryAbsorbEnabled} aria-label={t('settings.absorb.maxDelaySecs')} />
+            <NumberStepper value={Number(form.upstreamRetryAbsorbMaxDelaySecs) || 0} onChange={(v) => set('upstreamRetryAbsorbMaxDelaySecs', String(v))} min={1} max={600} className="w-28" disabled={absorbTuningDisabled} aria-label={t('settings.absorb.maxDelaySecs')} />
           </Field>
           <Field label={t('settings.absorb.suspended')} hint={t('settingspage.advanced.absorb.suspendedHint')}>
-            <Switch checked={form.upstreamRetryAbsorbSuspended} onCheckedChange={(v) => set('upstreamRetryAbsorbSuspended', v)} disabled={!form.upstreamRetryAbsorbEnabled} />
+            <Switch checked={form.upstreamRetryAbsorbSuspended} onCheckedChange={(v) => set('upstreamRetryAbsorbSuspended', v)} disabled={absorbTuningDisabled} />
           </Field>
           <Field label={t('settings.absorb.serverError')} hint={t('settings.absorb.serverErrorHint')}>
-            <Switch checked={form.upstreamRetryAbsorbServerError} onCheckedChange={(v) => set('upstreamRetryAbsorbServerError', v)} disabled={!form.upstreamRetryAbsorbEnabled} />
+            <Switch checked={form.upstreamRetryAbsorbServerError} onCheckedChange={(v) => set('upstreamRetryAbsorbServerError', v)} disabled={absorbTuningDisabled} />
           </Field>
           <Field label={t('settings.absorb.capacity400')} hint={t('settings.absorb.capacity400Hint')}>
-            <Switch checked={form.upstreamRetryAbsorbCapacity400} onCheckedChange={(v) => set('upstreamRetryAbsorbCapacity400', v)} disabled={!form.upstreamRetryAbsorbEnabled} />
+            <Switch checked={form.upstreamRetryAbsorbCapacity400} onCheckedChange={(v) => set('upstreamRetryAbsorbCapacity400', v)} disabled={absorbTuningDisabled} />
           </Field>
           <Field label={t('settings.absorb.swapBudgetSecs')} hint={t('settings.absorb.swapBudgetSecsHint')}>
-            <NumberStepper value={Number(form.upstreamRetryAbsorbSwapBudgetSecs) || 0} onChange={(v) => set('upstreamRetryAbsorbSwapBudgetSecs', String(v))} min={0} max={600} step={5} className="w-28" disabled={!form.upstreamRetryAbsorbEnabled} aria-label={t('settings.absorb.swapBudgetSecs')} />
+            <NumberStepper value={Number(form.upstreamRetryAbsorbSwapBudgetSecs) || 0} onChange={(v) => set('upstreamRetryAbsorbSwapBudgetSecs', String(v))} min={0} max={600} step={5} className="w-28" disabled={absorbTuningDisabled} aria-label={t('settings.absorb.swapBudgetSecs')} />
           </Field>
           <Field label={t('settings.absorb.exhausted503')} hint={t('settings.absorb.exhausted503Hint')}>
-            <Switch checked={form.upstreamRetryAbsorbExhausted503} onCheckedChange={(v) => set('upstreamRetryAbsorbExhausted503', v)} disabled={!form.upstreamRetryAbsorbEnabled} />
+            <Switch checked={form.upstreamRetryAbsorbExhausted503} onCheckedChange={(v) => set('upstreamRetryAbsorbExhausted503', v)} disabled={absorbTuningDisabled} />
           </Field>
         </CardContent>
       </Card>

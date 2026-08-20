@@ -324,12 +324,11 @@ pub static CATALOG: &[ModelSpec] = &[
         advertised: true,
     },
     // deepseek-v4-flash —— opencodezen 代挂（custom_api 透传）。
-    // 链路: KiroStudio 识别到 opencodezen 凭据(deepseekNormalize=true)后,透传前先按
-    // `kiro::deepseek_normalize`(fuckopencode 的 deepseek 协议修复逻辑)改写请求体,再转发
-    // opencodezen(真实上游 https://opencode.ai/zen/go,只认 deepseek-v4-flash,1M ctx,免费)。
+    // 链路: custom_api 透传池将请求原样转发到 opencodezen(真实上游
+    // https://opencode.ai/zen/go,只认 deepseek-v4-flash,1M ctx,免费)。
     // custom_api 透传不经过 Kiro 号池计费,credit_mult 置 0。
     // 使用: admin 新增 custom_api 凭据,base_url 填 opencodezen 端点,api_key 填网关 key,
-    //       勾选 deepseekNormalize,模型选 deepseek-v4-flash。
+    //       模型选 deepseek-v4-flash。
     ModelSpec {
         kiro_id: "deepseek-v4-flash",
         family: Family::DeepSeek,

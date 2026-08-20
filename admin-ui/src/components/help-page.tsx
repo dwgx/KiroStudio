@@ -35,8 +35,8 @@ const CATEGORY_ORDER: Category[] = [
   'config',
   'security',
 ]
-// codePath 统一渲染为 GitHub blob 链接（v1.1.0 分支，新窗口打开）。
-const GITHUB_BLOB = 'https://github.com/dwgx/KiroStudio/blob/v1.1.0/'
+// public dwgx/KiroStudio @ v1.1.0 已冻结，不含现树 /v1/responses、auth_keys、SSO。
+// 只展示本地路径，不链到过期 tag。
 
 // 联网搜索端点契约：GET /api/help/web-search?q=...，返回 [{title,url,snippet}]。
 // 与其余 api 模块同款 axios 配置（baseURL + x-api-key + 15s 超时），就地声明避免扩权改 api/ 目录。
@@ -59,18 +59,50 @@ interface WebSearchResult {
 
 type View = 'kb' | 'map' | 'web' | 'conn'
 
-function GitHubLink({ path }: { path: string }) {
-  return (
-    <a
-      href={`${GITHUB_BLOB}${path}`}
-      target="_blank"
-      rel="noreferrer"
-      className="inline-flex max-w-full items-center gap-1 text-primary hover:underline"
-    >
-      <code className="min-w-0 flex-1 truncate font-mono text-xs">{path}</code>
-      <ExternalLink className="h-3 w-3 shrink-0" />
-    </a>
+function LocalCodePath({ path }: { path: string }) {
+  return <code className="min-w-0 flex-1 truncate font-mono text-xs">{path}</code>
+}
+
+const MODEL_UNSUPPORTED_SOURCE =
+  'src/kiro/model_mapping.rs + allowed_models / model_blocklist（deepseek 归一化已移除）'
+
+const EXTRA_HELP_ENTRIES: HelpEntry[] = [
+  {
+    id: 'sso-token-paste',
+    title: 'kb.sso-token-paste.title',
+    category: 'faq',
+    tags: ['SSO', 'sso', '粘贴', 'paste', 'import-sso', 'x-amz-sso_authn', 'IdC', 'token'],
+    problem: 'kb.sso-token-paste.problem',
+    cause: 'kb.sso-token-paste.cause',
+    solution: 'kb.sso-token-paste.solution',
+    severity: 'medium',
+    source: 'src/kiro/auth/sso_token.rs + POST /api/admin/credentials/import-sso',
+    codePath: 'src/kiro/auth/sso_token.rs',
+    updatedAt: '2026-08-20',
+  },
+  {
+    id: 'auth-keys-hot-rotate',
+    title: 'kb.auth-keys-hot-rotate.title',
+    category: 'config',
+    tags: ['apiKey', 'adminApiKey', 'auth_keys', '热重载', 'hot reload', '密钥', 'rotate'],
+    problem: 'kb.auth-keys-hot-rotate.problem',
+    cause: 'kb.auth-keys-hot-rotate.cause',
+    solution: 'kb.auth-keys-hot-rotate.solution',
+    severity: 'high',
+    source: 'src/common/auth_keys.rs',
+    codePath: 'src/common/auth_keys.rs',
+    updatedAt: '2026-08-20',
+  },
+]
+
+function liveHelpEntries(base: HelpEntry[]): HelpEntry[] {
+  const overlaid = base.map((e) =>
+    e.id === 'model-unsupported'
+      ? { ...e, source: MODEL_UNSUPPORTED_SOURCE, updatedAt: '2026-08-20' }
+      : e,
   )
+  const have = new Set(overlaid.map((e) => e.id))
+  return [...overlaid, ...EXTRA_HELP_ENTRIES.filter((e) => !have.has(e.id))]
 }
 
 function SeverityBadge({ severity }: { severity: HelpEntry['severity'] }) {
@@ -189,7 +221,7 @@ function KnowledgeView({
                       </span>
                       {e.codePath && (
                         <span className="inline-flex items-center gap-1 text-muted-foreground">
-                          {t('helppage.kb.codePath')} <GitHubLink path={e.codePath} />
+                          {t('helppage.kb.codePath')} <LocalCodePath path={e.codePath} />
                         </span>
                       )}
                       <span className="ml-auto text-[10px] text-muted-foreground">{e.updatedAt}</span>
@@ -221,19 +253,14 @@ function MapView({ chain, modules, loading }: { chain: HelpChainStep[]; modules:
         <div className="flex items-stretch gap-2 overflow-x-auto pb-2">
           {chain.map((step, i) => (
             <div key={step.id} className="flex shrink-0 items-stretch gap-2">
-              <a
-                href={`${GITHUB_BLOB}${step.codePath}`}
-                target="_blank"
-                rel="noreferrer"
-                className="flex w-48 flex-col rounded-lg border border-border/60 bg-white/5 p-3 transition-colors hover:border-primary/40 hover:bg-primary/5"
-              >
+              <div className="flex w-48 flex-col rounded-lg border border-border/60 bg-white/5 p-3">
                 <div className="flex items-center gap-1.5 text-xs font-medium text-primary">
                   <Network className="h-3.5 w-3.5" />
                   {t(step.name)}
                 </div>
                 <p className="mt-1 flex-1 text-[11px] leading-relaxed text-muted-foreground">{t(step.desc)}</p>
                 <code className="mt-2 truncate font-mono text-[10px] text-[#888]">{step.codePath}</code>
-              </a>
+              </div>
               {i < chain.length - 1 && (
                 <ChevronRight className="h-4 w-4 shrink-0 self-center text-muted-foreground" />
               )}
@@ -438,7 +465,9 @@ export function HelpPage({ onBack }: { onBack: () => void }) {
           ))}
         </div>
 
-        {view === 'kb' && <KnowledgeView entries={loaded ? HELP_ENTRIES : []} query={query} loading={!loaded} />}
+        {view === 'kb' && (
+          <KnowledgeView entries={loaded ? liveHelpEntries(HELP_ENTRIES) : []} query={query} loading={!loaded} />
+        )}
         {view === 'map' && <MapView chain={loaded ? HELP_CHAIN : []} modules={loaded ? HELP_MODULES : []} loading={!loaded} />}
         {view === 'web' && <WebSearchView />}
         {view === 'conn' && <ConnPage />}

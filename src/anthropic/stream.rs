@@ -39,6 +39,9 @@ pub enum CompletionStatus {
     TransportError { message: String },
     /// 解码器连续错误超限、永久停止（响应必然截断）
     DecoderStopped { message: String },
+    /// 传输层干净结束，但缺少终止信号（无 metadata stopReason、无 tool_use stop）。
+    /// 部分正文已下发时不得再标成功 `end_turn`。
+    Incomplete { message: String },
 }
 
 impl CompletionStatus {
@@ -63,6 +66,7 @@ impl CompletionStatus {
             }
             CompletionStatus::TransportError { .. } => RequestOutcome::NetworkError,
             CompletionStatus::DecoderStopped { .. } => RequestOutcome::ServerError,
+            CompletionStatus::Incomplete { .. } => RequestOutcome::ServerError,
         }
     }
 
@@ -81,6 +85,7 @@ impl CompletionStatus {
             }
             CompletionStatus::TransportError { .. } => "api_error",
             CompletionStatus::DecoderStopped { .. } => "api_error",
+            CompletionStatus::Incomplete { .. } => "api_error",
         }
     }
 
@@ -117,6 +122,9 @@ impl CompletionStatus {
             }
             CompletionStatus::DecoderStopped { message } => {
                 format!("上游响应解析中断: {}", message)
+            }
+            CompletionStatus::Incomplete { message } => {
+                format!("上游响应不完整: {}", message)
             }
         }
     }
@@ -1194,19 +1202,7 @@ impl SseStateManager {
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
-        // 关闭所有未关闭的块
-        for (index, block) in self.active_blocks.iter_mut() {
-            if block.started && !block.stopped {
-                events.push(SseEvent::new(
-                    "content_block_stop",
-                    json!({
-                        "type": "content_block_stop",
-                        "index": index
-                    }),
-                ));
-                block.stopped = true;
-            }
-        }
+        events.extend(self.close_open_blocks());
 
         // 发送 message_delta
         if !self.message_delta_sent {
@@ -1248,6 +1244,24 @@ impl SseStateManager {
             ));
         }
 
+        events
+    }
+
+    /// 关闭仍打开的内容块。干净 EOF 不完整时只关块、不发成功 `message_delta`。
+    fn close_open_blocks(&mut self) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        for (index, block) in self.active_blocks.iter_mut() {
+            if block.started && !block.stopped {
+                events.push(SseEvent::new(
+                    "content_block_stop",
+                    json!({
+                        "type": "content_block_stop",
+                        "index": index
+                    }),
+                ));
+                block.stopped = true;
+            }
+        }
         events
     }
 }
@@ -1502,6 +1516,10 @@ pub struct StreamContext {
     /// 判定点在 `process_kiro_event`（流式常态）与 `generate_final_events`（整轮被 hold 到
     /// 收尾才 flush 的形态）两处，缺任一处都会漏判。
     body_content_seen: bool,
+    /// 收到过带非空 stopReason 的 metadata 帧（终止信号；client 侧 reason 仍可能是 tool_use）。
+    saw_upstream_stop: bool,
+    /// 收到过 `toolUseEvent.stop=true`（或 XML 重组出的完整 tool_use）。未 stop 的残留不算。
+    saw_tool_stop: bool,
     /// `!thinking_enabled` 时被丢弃的结构化 reasoning 原文（截断累积，上限
     /// [`Self::MAX_DISCARDED_REASONING_BYTES`]）。
     ///
@@ -1623,6 +1641,8 @@ impl StreamContext {
             received_bytes: 0,
             reasoning_stream_seen: false,
             body_content_seen: false,
+            saw_upstream_stop: false,
+            saw_tool_stop: false,
             discarded_reasoning: String::new(),
         }
     }
@@ -1896,7 +1916,19 @@ impl StreamContext {
                     self.completion.client_message(),
                 )]
             }
-            _ => Vec::new(),
+            Event::Metadata(meta) => {
+                if let Some(mapped) =
+                    crate::kiro::model::events::map_metadata_stop_reason(meta.stop_reason.as_deref())
+                {
+                    self.saw_upstream_stop = true;
+                    // 已有 tool_use 时客户端 stop_reason 仍走 tool_use；metadata 只标记流完整。
+                    if !self.state_manager.has_tool_use {
+                        self.state_manager.set_stop_reason(mapped);
+                    }
+                }
+                Vec::new()
+            }
+            Event::Unknown {} => Vec::new(),
         }
     }
 
@@ -1943,6 +1975,20 @@ impl StreamContext {
             est,
             &self.model,
         )
+    }
+
+    /// 传输层干净结束、有部分可见产出，却没有任何终止信号。
+    fn is_clean_eof_without_terminal(&self) -> bool {
+        if !self.completion.is_ok() {
+            return false;
+        }
+        if self.state_manager.stop_reason.is_some()
+            || self.saw_upstream_stop
+            || self.saw_tool_stop
+        {
+            return false;
+        }
+        self.body_content_seen || self.state_manager.has_tool_use
     }
 
     /// 空响应是否由「上下文过大」导致。
@@ -2721,6 +2767,7 @@ impl StreamContext {
     fn synthesize_tool_use(&mut self, parsed_name: String, input_json: String) -> Vec<SseEvent> {
         let mut events = Vec::new();
         self.state_manager.set_has_tool_use(true);
+        self.saw_tool_stop = true;
         self.reclaimed_invoke_count += 1;
         crate::common::recovery_metrics::bump_reclaimed_invoke();
         let block_index = self.state_manager.next_block_index();
@@ -3470,6 +3517,7 @@ impl StreamContext {
 
         // 仅在 stop 时把完整缓冲一次性发出 + 关闭块（此前只累积、不发 partial_json）。
         if tool_use.stop {
+            self.saw_tool_stop = true;
             let mut assembled = self
                 .tool_input_sent
                 .remove(&tool_use.tool_use_id)
@@ -3966,6 +4014,10 @@ impl StreamContext {
                     //    捞成真 tool_use —— 那是凭空执行工具（同一理由见
                     //    `process_assistant_response` 里剥离器排在 reclaim 之前那段注释）。
                     events.extend(self.create_text_delta_events(&cleaned));
+                    // 本地产品选择：reasoning 降级成正文是完整一轮，不是截断。
+                    if self.state_manager.stop_reason.is_none() {
+                        self.state_manager.set_stop_reason("end_turn");
+                    }
                 }
             }
         }
@@ -3981,26 +4033,45 @@ impl StreamContext {
             events.extend(self.create_text_delta_events(" "));
         }
 
-        // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-        let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
-        // 剔除 cache 读写，得到 Anthropic usage 的 input_tokens 口径
-        let billed = self
-            .cache_usage
-            .map(|c| {
-                billed_input_tokens(
-                    final_input_tokens,
-                    c.cache_creation_input_tokens,
-                    c.cache_read_input_tokens,
-                )
-            })
-            .unwrap_or(final_input_tokens);
+        // 干净 EOF 有部分正文/未 stop 的 tool，却没有任何终止信号：不得发成功 end_turn。
+        // 空响应当 `is_empty_response` 处理（completion 保持 Ok，由 handler 补 error）。
+        // thinking-only / reasoning 降级已在上面显式 set_stop_reason，不会进本分支。
+        if self.is_clean_eof_without_terminal() {
+            events.extend(self.state_manager.close_open_blocks());
+            if self.completion.is_ok() {
+                self.completion = CompletionStatus::Incomplete {
+                    message: "传输层干净结束，但缺少 stopReason 或 tool_use 终止信号".to_string(),
+                };
+            }
+            if !self.error_event_emitted {
+                events.push(SseEvent::error_event(
+                    self.completion.sse_error_type(),
+                    self.completion.client_message(),
+                ));
+                self.error_event_emitted = true;
+            }
+        } else {
+            // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
+            let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
+            // 剔除 cache 读写，得到 Anthropic usage 的 input_tokens 口径
+            let billed = self
+                .cache_usage
+                .map(|c| {
+                    billed_input_tokens(
+                        final_input_tokens,
+                        c.cache_creation_input_tokens,
+                        c.cache_read_input_tokens,
+                    )
+                })
+                .unwrap_or(final_input_tokens);
 
-        // 生成最终事件
-        events.extend(self.state_manager.generate_final_events(
-            billed,
-            self.output_tokens,
-            self.cache_usage,
-        ));
+            // 生成最终事件
+            events.extend(self.state_manager.generate_final_events(
+                billed,
+                self.output_tokens,
+                self.cache_usage,
+            ));
+        }
 
         // 泄漏 token 诊断收尾（可观测，不改任何已发内容）：本请求若清洗过泄漏 token / 命中 saturation,
         // 如实记一条——绝不黑箱。saturation（整段纯泄漏词行）= #70544 模型侧整段退化的信号,网关只能
@@ -6370,6 +6441,13 @@ mod tests {
         })
     }
 
+    /// 完整一轮的上游终止信号。XML 泄漏测试测的是剥离，不是截断；夹具必须带它。
+    fn meta_end_turn() -> Event {
+        Event::Metadata(crate::kiro::model::events::MetadataEvent {
+            stop_reason: Some("end_turn".into()),
+        })
+    }
+
     /// 把一轮事件跑完（含真实收尾），返回全部 SSE 报文拼串。
     fn run_turn(ctx: &mut StreamContext, events: &[Event]) -> String {
         let mut all = ctx.generate_initial_events();
@@ -6398,6 +6476,7 @@ mod tests {
                 // 第 3 帧才补齐 `>` 与整个块体 + 闭合
                 text_ev(r#">{"path":"/tmp/a"}</tool_use>"#),
                 text_ev(" after"),
+                meta_end_turn(),
             ],
         );
         assert!(joined.contains("before"), "块前文本必须保留: {joined}");
@@ -6437,7 +6516,12 @@ mod tests {
         let joined = run_turn(
             &mut ctx,
             // ⚠️ 用 r##"…"## 双井号：内容以 `"` 结尾，单井号的 `"#` 会被提前当作结束符。
-            &[text_ev("head "), text_ev(r##"<tool_use id="a" name="Write">{"path":"##)],
+            // 上游已发 metadata 收尾：未闭合泄漏仍丢弃，整轮是成功 turn（不是截断）。
+            &[
+                text_ev("head "),
+                text_ev(r##"<tool_use id="a" name="Write">{"path":"##),
+                meta_end_turn(),
+            ],
         );
         assert!(joined.contains("head"), "块前文本保留: {joined}");
         assert!(
@@ -6465,6 +6549,7 @@ mod tests {
                 text_ev("_use"),
                 text_ev(">"),
                 text_ev("VISIBLE"),
+                meta_end_turn(),
             ],
         );
         assert!(
@@ -9259,14 +9344,20 @@ mod tests {
 
     #[test]
     fn test_thinking_with_text_keeps_end_turn_stop_reason() {
-        // thinking + text 的情况，stop_reason 应为 end_turn
+        // thinking + text + 上游 metadata 明确 end_turn → 成功收尾
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
         all_events.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>\n\nHello"));
+        all_events.extend(ctx.process_kiro_event(&Event::Metadata(
+            crate::kiro::model::events::MetadataEvent {
+                stop_reason: Some("end_turn".into()),
+            },
+        )));
         all_events.extend(ctx.generate_final_events());
 
+        assert!(ctx.completion().is_ok(), "有终止信号的一轮必须是成功态");
         let message_delta = all_events
             .iter()
             .find(|e| e.event == "message_delta")
@@ -9275,6 +9366,123 @@ mod tests {
         assert_eq!(
             message_delta.data["delta"]["stop_reason"], "end_turn",
             "stop_reason should be end_turn when text is also produced"
+        );
+    }
+
+    #[test]
+    fn metadata_event_stop_reason_max_tokens_surfaces() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        ctx.process_kiro_event(&Event::AssistantResponse(
+            crate::kiro::model::events::AssistantResponseEvent {
+                content: "partial answer that hit the cap".into(),
+            },
+        ));
+        ctx.process_kiro_event(&Event::Metadata(
+            crate::kiro::model::events::MetadataEvent {
+                stop_reason: Some("max_tokens".into()),
+            },
+        ));
+        let finals = ctx.generate_final_events();
+        assert!(
+            ctx.completion().is_ok(),
+            "metadata 给出 max_tokens 是干净收尾，不是失败"
+        );
+        let message_delta = finals
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("应有 message_delta");
+        assert_eq!(
+            message_delta.data["delta"]["stop_reason"], "max_tokens",
+            "上游 metadata.stopReason=max_tokens 必须露出，不得推断成 end_turn"
+        );
+        assert!(
+            !finals.iter().any(|e| e.event == "error"),
+            "干净 max_tokens 不得发 SSE error"
+        );
+    }
+
+    #[test]
+    fn clean_eof_partial_text_without_stop_is_not_success_end_turn() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        ctx.process_kiro_event(&Event::AssistantResponse(
+            crate::kiro::model::events::AssistantResponseEvent {
+                content: "this answer was cut off mid-".into(),
+            },
+        ));
+        let finals = ctx.generate_final_events();
+        assert!(
+            !ctx.completion().is_ok(),
+            "干净 EOF + 部分正文 + 无终止信号不得记成功"
+        );
+        assert!(
+            !finals.iter().any(|e| {
+                e.event == "message_delta" && e.data["delta"]["stop_reason"] == "end_turn"
+            }),
+            "不得下发成功 end_turn。实际: {:?}",
+            finals.iter().map(|e| &e.event).collect::<Vec<_>>()
+        );
+        assert!(
+            finals.iter().any(|e| e.event == "error"),
+            "应发 SSE error 让客户端重试，而不是当成功 turn"
+        );
+        match ctx.completion() {
+            CompletionStatus::Incomplete { .. } => {}
+            other => panic!("期望 Incomplete，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_stop_true_without_metadata_is_complete_tool_use() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        ctx.process_kiro_event(&Event::ToolUse(
+            crate::kiro::model::events::ToolUseEvent {
+                name: "Read".into(),
+                tool_use_id: "toolu_1".into(),
+                input: r#"{"path":"/a"}"#.into(),
+                stop: true,
+            },
+        ));
+        let finals = ctx.generate_final_events();
+        assert!(ctx.completion().is_ok(), "tool_use stop=true 即终止，无需 metadata");
+        let message_delta = finals
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("应有 message_delta");
+        assert_eq!(
+            message_delta.data["delta"]["stop_reason"], "tool_use",
+            "有 stop:true 的 tool 帧即使没有 metadata 也是完整 tool_use"
+        );
+    }
+
+    #[test]
+    fn stream_must_consume_metadata_and_reject_clean_eof_without_stop() {
+        let src = include_str!("stream.rs");
+        let prod = src
+            .split_once("\n#[cfg(test)]")
+            .map(|(p, _)| p)
+            .unwrap_or(src);
+        let prod: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let meta_arm = format!("{}::{}", "Event", "Metadata");
+        let incomplete = format!("{}::{}", "CompletionStatus", "Incomplete");
+        let eof_fn = format!("{}{}", "is_clean_eof_without", "_terminal");
+        assert!(
+            prod.contains(&meta_arm),
+            "process 路径必须消费 Metadata 帧（不能再 _ => 丢掉 stopReason）"
+        );
+        assert!(
+            prod.contains(&incomplete),
+            "干净 EOF 无终止必须落非 Ok 完成态"
+        );
+        assert!(
+            prod.contains(&eof_fn),
+            "必须有干净 EOF 终止信号检查"
         );
     }
 
@@ -9477,6 +9685,14 @@ mod tests {
         };
         assert_eq!(ds.outcome(), RequestOutcome::ServerError);
         assert_eq!(ds.http_status_u16(), 502);
+
+        let inc = CompletionStatus::Incomplete {
+            message: "no terminal".to_string(),
+        };
+        assert_eq!(inc.outcome(), RequestOutcome::ServerError);
+        assert_eq!(inc.sse_error_type(), "api_error");
+        assert_eq!(inc.http_status_u16(), 502);
+        assert!(!inc.is_ok());
 
         // Ok → Success
         assert_eq!(CompletionStatus::Ok.outcome(), RequestOutcome::Success);
