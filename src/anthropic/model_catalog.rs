@@ -324,12 +324,11 @@ pub static CATALOG: &[ModelSpec] = &[
         advertised: true,
     },
     // deepseek-v4-flash —— opencodezen 代挂（custom_api 透传）。
-    // 链路: KiroStudio 识别到 opencodezen 凭据(deepseekNormalize=true)后,透传前先按
-    // `kiro::deepseek_normalize`(fuckopencode 的 deepseek 协议修复逻辑)改写请求体,再转发
-    // opencodezen(真实上游 https://opencode.ai/zen/go,只认 deepseek-v4-flash,1M ctx,免费)。
+    // 链路: custom_api 透传池将请求原样转发到 opencodezen(真实上游
+    // https://opencode.ai/zen/go,只认 deepseek-v4-flash,1M ctx,免费)。
     // custom_api 透传不经过 Kiro 号池计费,credit_mult 置 0。
     // 使用: admin 新增 custom_api 凭据,base_url 填 opencodezen 端点,api_key 填网关 key,
-    //       勾选 deepseekNormalize,模型选 deepseek-v4-flash。
+    //       模型选 deepseek-v4-flash。
     ModelSpec {
         kiro_id: "deepseek-v4-flash",
         family: Family::DeepSeek,
@@ -655,6 +654,11 @@ fn allow_unknown_version() -> bool {
 /// 先剥 `[1m]` 后缀(若有),用剥后名走完整解析,再据 spec.supports_1m 决定最终 is_1m:
 /// spec 支持 → is_1m=true(触发 beta 头);spec 不支持 → 忽略后缀 + 告警(不拒绝,更宽容)。
 pub fn resolve(model: &str) -> Option<Resolved> {
+    // 路径段归一（sub2api 移植，2026-08-15）：OpenRouter/Claude Code 类客户端会发
+    // `models/claude-opus-5`、`anthropic/claude-opus-5`、`org/model` 形态。
+    // 剥 `models/` 前缀 + 取 `/` 后末段，一次剥除覆盖所有下游环节（resolve 是唯一入口）。
+    // ⚠️ 放在 `[1m]` 剥除之前（路径段可能带 `[1m]`：`models/claude-opus-5[1m]`）。
+    let model = strip_path_segments(model);
     let lower = model.to_ascii_lowercase();
     let (base_name, requested_1m) = strip_1m_suffix(&lower);
     // 用剥掉 [1m] 的名字走既有全流程(精确/thinking/结构化)。
@@ -671,6 +675,20 @@ pub fn resolve(model: &str) -> Option<Resolved> {
         }
     }
     Some(resolved)
+}
+
+/// 路径段归一：剥 `models/` 前缀（若存在）+ 取 `/` 后末段（若存在）。
+/// 空结果 / 无路径段时原样返回（不误伤普通模型名）。
+///
+/// ⚠️ F4a（对抗审查 2026-08-15）：**CATALOG 禁止含 `/` 的别名**——若未来加入
+/// `org/a` 这类带斜杠别名，`resolve("org/a")` 会先被本函数剥成 `a` 而张冠李戴。
+/// 新增别名时保持无 `/` 约定；若必须加，需先让本函数查精确命中再剥段。
+fn strip_path_segments(model: &str) -> &str {
+    let stripped = model.strip_prefix("models/").unwrap_or(model);
+    match stripped.rsplit_once('/') {
+        Some((_, last)) if !last.is_empty() => last,
+        _ => stripped,
+    }
 }
 
 /// 内部解析(不含 `[1m]` 处理):入参已是剥掉 `[1m]` 的名字。所有 `Resolved` 的 `is_1m` 恒 false,
@@ -852,6 +870,23 @@ mod tests {
         assert_eq!(kid("claude-haiku-4-5-20251001"), Some("claude-haiku-4.5"));
         // thinking 后缀剥离
         assert_eq!(kid("claude-opus-4-8-thinking"), Some("claude-opus-4.8"));
+    }
+
+    /// 路径段归一（sub2api 移植，2026-08-15）：`models/` 前缀 / `org/model` 形态
+    /// 与普通模型名等价解析，一次剥除覆盖所有下游环节。
+    #[test]
+    fn test_resolve_strips_path_segments() {
+        assert_eq!(kid("models/claude-opus-4.6"), Some("claude-opus-4.6"));
+        assert_eq!(kid("anthropic/claude-opus-4.6"), Some("claude-opus-4.6"));
+        assert_eq!(kid("org/model/claude-sonnet-4.5"), Some("claude-sonnet-4.5"));
+        // 路径段带 [1m] 后缀：先剥路径再剥 [1m]。
+        assert_eq!(kid("models/claude-opus-4.6[1m]"), Some("claude-opus-4.6"));
+        // 无路径段 / 路径段空 / 空模型名均原样（不误伤）。
+        assert_eq!(kid("claude-opus-4.6"), Some("claude-opus-4.6"));
+        assert_eq!(kid("models/"), None);
+        assert_eq!(kid(""), None);
+        // models/ 前缀但不是路径（模型名恰以 models/ 开头）——按路径剥除处理是宽容而非拒绝。
+        assert_eq!(kid("models/"), None, "空段不 panic 且不命中");
     }
 
     #[test]

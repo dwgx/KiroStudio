@@ -23,7 +23,8 @@
 //! ⚠️ **调用约定（deepseek review 修复，2026-08-08）**：
 //! - 本模块是**同步 CPU 密集**路径（解码 + Lanczos3 缩放 + 重编码）。**async 调用方必须用
 //!   `tokio::task::spawn_blocking` 包住** `maybe_shrink_image`，不能直接在 tokio worker 上同步跑。
-//!   当前 `converter.rs` 的调用点尚未包 `spawn_blocking`，属已知待改项。
+//!   已落实：`maybe_shrink_image_blocking` 是 async 包装（内部 spawn_blocking 跑同步核心），
+//!   `converter.rs` 的调用点在其上通过 `block_in_place` 等待（转换链保持同步签名）。
 //! - **每请求图片数上限由调用方负责**：`converter.rs` 的 `MAX_TOTAL_IMAGES`（20）只约束历史去重
 //!   路径；当前轮（dedup=None）图片**不限量**。单个 40Mpx 像素炸弹 base64 仅约 300KB，
 //!   恶意请求可塞几百张独占 worker 十几分钟。本模块是 per-image API，无法跨图片计数，
@@ -240,6 +241,23 @@ pub fn maybe_shrink_image(
             Err(e)
         }
     }
+}
+
+/// async 包装：把同步 CPU 重活（解码 + Lanczos3 缩放 + JPEG 重编码）移到
+/// tokio blocking 线程池执行，不占 tokio worker。
+///
+/// 同步核心 `maybe_shrink_image` 保持不动（测试直接调它）；async 调用方走本包装。
+/// `spawn_blocking` 要求闭包 `'static` + owned，故 `format` / `data_base64` 传 String
+/// 而非引用（base64 拷贝相对解码缩放成本可忽略）。任务 panic 时归为 `Decode` 错误，
+/// 由调用方按既有「降采样失败保留原图」分支兜底，绝不 fail 请求。
+pub async fn maybe_shrink_image_blocking(
+    cfg: ResizeConfig,
+    format: String,
+    data_base64: String,
+) -> Result<ProcessedImage, ResizeError> {
+    tokio::task::spawn_blocking(move || maybe_shrink_image(cfg, &format, &data_base64))
+        .await
+        .map_err(|e| ResizeError::Decode(format!("图片降采样任务异常: {e}")))?
 }
 
 fn passthrough(format: String, data_base64: &str) -> ProcessedImage {

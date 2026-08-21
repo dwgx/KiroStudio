@@ -6,6 +6,8 @@ import { StatCard } from '@/components/ui/stat-card'
 import { AnimatedNumber } from '@/components/ui/animated-number'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useCredentials, useCachedBalances } from '@/hooks/use-credentials'
+import { isSuspiciousCooldown } from '@/lib/cooldown'
+import { insightLabel } from '@/lib/insight'
 import { useUsageOverview, useUsageTimeseries, useUsageRecentLive, useRatelimitInsights } from '@/hooks/use-usage'
 import { Sparkline } from '@/components/overview/Sparkline'
 import { RadialGauge } from '@/components/overview/RadialGauge'
@@ -14,9 +16,11 @@ import { type CellActivity } from '@/components/overview/StatusHeatmap'
 import { RankBars } from '@/components/overview/RankBars'
 import { GlowGrid } from '@/components/overview/GlowGrid'
 import { StatusBars } from '@/components/overview/StatusBars'
+import { PerfDashboard } from '@/components/overview/perf-dashboard'
 import { useUiLayoutPrefs } from '@/hooks/use-ui-layout-prefs'
 import { AreaTrendChart } from '@/components/overview/AreaTrendChart'
 import { authLabel } from '@/lib/i18n-labels'
+import { StaleBadge } from '@/components/settings-page'
 import type { CredentialStatusItem, SeriesPoint, RateLimitInsight } from '@/types/api'
 
 // 紧凑数字：1234 -> 1.2k
@@ -79,8 +83,9 @@ function assessRisk(it: RateLimitInsight): { level: RiskLevel; labelKey: string;
     return { level: 'disabled', labelKey: 'overviewpage.risk.disabled', pct: 0 }
   }
   // 冷却中（尤其可疑活动风控）= 已经被限流,最高危。
+  // 判据走稳定枚举码 code（与 use-pool-notifications 的 suspicious 判定共用 helper）。
   if (it.cooldown) {
-    const isSuspicious = it.cooldown.reason.includes('可疑')
+    const isSuspicious = isSuspiciousCooldown(it.cooldown.code)
     return {
       level: 'limited',
       labelKey: isSuspicious ? 'overviewpage.risk.suspicious' : 'overviewpage.risk.cooldown',
@@ -145,7 +150,7 @@ function RateLimitDashboard({
         ? t('overviewpage.dashboard.summary.watch')
         : t('overviewpage.dashboard.summary.clear')
     return { level: worst, text, limited }
-  }, [insights])
+  }, [insights, t])
 
   const tone = RISK_TONE[summary.level]
   // 图标语义化(去雪花):畅通=盾牌勾,偏高=量表,即将/被限=警告盾牌/三角。
@@ -204,7 +209,7 @@ function RateLimitRow({ it, label }: { it: RateLimitInsight; label: string }) {
   return (
     <div
       className="group relative flex items-center gap-3 rounded-lg border border-border bg-secondary/40 px-3 py-2"
-      title={it.insightText}
+      title={insightLabel(it, t)}
     >
       <span className={`h-2 w-2 shrink-0 rounded-full ${tone.bar}`} />
       <span className="shrink-0 font-mono text-xs tabular-nums text-foreground">#{it.id}</span>
@@ -333,6 +338,15 @@ export function OverviewPage() {
   const { data, isLoading: credLoading, error: credError } = useCredentials()
   // 全页共享一份已缓存余额（只读、零上游），传给状态条视图展示剩余额度迷你条。
   const { data: cachedBalances } = useCachedBalances()
+  // 余额快照新鲜度：取全部余额缓存里最新的 cachedAt（Unix 秒，后端 CachedBalanceItem）。
+  // 后台温和刷新间隔 30 分钟，>1h 没更新 = 刷新链路停了，展示旧值必须带过期标记。
+  const { balanceStale, balanceNewestMs } = useMemo(() => {
+    const vals = cachedBalances?.balances ? Object.values(cachedBalances.balances) : []
+    if (vals.length === 0) return { balanceStale: false, balanceNewestMs: 0 }
+    const newestSec = Math.max(...vals.map((b) => b.cachedAt))
+    const stale = Date.now() / 1000 - newestSec > 3600
+    return { balanceStale: stale, balanceNewestMs: newestSec * 1000 }
+  }, [cachedBalances])
   const overview = useUsageOverview()
   // hourly 供 KPI sparkline + 24h 趋势；daily 供 7d/30d 趋势。两者都是本地统计，无上游封号风险。
   const hourly = useUsageTimeseries('hourly')
@@ -440,7 +454,7 @@ export function OverviewPage() {
       }))
 
     return { total, available, disabled, isEmpty, authSegments, healthSegments, topUsed, creds }
-  }, [data])
+  }, [data, t])
 
   // KPI 卡固定展示 24h（sparkline 用 24h 末 24 桶）。
   const w24 = overview.data?.last_24h
@@ -529,7 +543,17 @@ export function OverviewPage() {
       ))}
     </div>
   ) : poolView === 'bars' ? (
-    <StatusBars credentials={displayCreds} activity={activity} balances={cachedBalances?.balances} saturatedIds={saturatedIds} />
+    <div className="flex flex-col gap-2">
+      {/* 余额快照过期标记：全部余额缓存里最新的 cachedAt 距今 >1h 即过期。
+          后台温和刷新间隔 30 分钟，>1h 没更新说明刷新链路停了（网关 502 / 上游风控窗口）。
+          旧值仍在展示（有信息量），但必须明示"已过期"，避免运维照着假的新鲜度做判断。 */}
+      {balanceStale && (
+        <div className="flex justify-end">
+          <StaleBadge updatedAt={balanceNewestMs} />
+        </div>
+      )}
+      <StatusBars credentials={displayCreds} activity={activity} balances={cachedBalances?.balances} saturatedIds={saturatedIds} />
+    </div>
   ) : (
     <GlowGrid credentials={displayCreds} activity={activity} />
   )
@@ -690,6 +714,13 @@ export function OverviewPage() {
           />
         )}
       </div>
+
+      {/* Row 1.5：性能仪表盘 —— 统计区下方；显示/隐藏由设置页「外观」分区开关控制（localStorage，默认显示）。
+          数据全走本页已共享的查询（recent 4s / hourly+overview 30s），自身仅新增 3 个只读小查询，
+          隐藏时整块卸载、轮询随之停止。用量统计未启用时整块隐藏（与趋势卡同策略）。 */}
+      {!usageDisabled && prefs.showPerfDashboard && (
+        <PerfDashboard recent={recent.data} hourly={hourly.data} overview={overview.data} creds={stats.creds} />
+      )}
 
       {/* Row 2：号池状态（主体）—— 三视图切换，默认发光网格 */}
       <Card className="p-5">

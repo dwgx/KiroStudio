@@ -12,6 +12,7 @@
 
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { CheckCircle2, XCircle, AlertTriangle, Info, Loader2 } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 
 export type ToastType = 'success' | 'error' | 'warning' | 'info' | 'loading' | 'default'
 
@@ -235,6 +236,7 @@ const CSS = `
 `
 
 function ToastItem({ rec }: { rec: ToastRecord }) {
+  const { t } = useTranslation()
   const [removing, setRemoving] = useState(false)
   // hover 暂停：记录剩余时长，离开时按剩余续跑
   const remainingRef = useRef(rec.duration)
@@ -293,7 +295,7 @@ function ToastItem({ rec }: { rec: ToastRecord }) {
           <div className="ks-toast-desc">{rec.description}</div>
         )}
       </div>
-      <button className="ks-toast-close" aria-label="关闭" onClick={beginClose}>
+      <button className="ks-toast-close" aria-label={t('toaster.close')} onClick={beginClose}>
         <XCircle size={14} strokeWidth={2.4} style={{ display: 'none' }} />
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
       </button>

@@ -1,0 +1,3 @@
+# Pin matches .github/workflows/release.yml (`dtolnay/rust-toolchain@1.97.1`).
+[toolchain]
+channel = "1.97.1"

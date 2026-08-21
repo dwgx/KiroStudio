@@ -76,3 +76,18 @@ export function subscriptionLabel(title: string | null | undefined): string {
   if (!title) return i18n.t('labels.common.unknown')
   return title
 }
+
+// 存储分区：后端下发中文 label，按稳定 key 映射本地化名；未知 key 回退后端值。
+const STORAGE_PART_KEYS: Record<string, string> = {
+  traces: 'opspage.storage.part.traces',
+  usage_jsonl: 'opspage.storage.part.usage_jsonl',
+  trash: 'opspage.storage.part.trash',
+  bg_cache: 'opspage.storage.part.bg_cache',
+  rss: 'opspage.storage.part.rss',
+}
+
+/** 存储分区名：优先本地化 key，未知 key 原样返回后端 label。 */
+export function storagePartitionLabel(key: string | null | undefined, fallback: string): string {
+  const i18nKey = key ? STORAGE_PART_KEYS[key] : undefined
+  return i18nKey ? i18n.t(i18nKey) : fallback
+}

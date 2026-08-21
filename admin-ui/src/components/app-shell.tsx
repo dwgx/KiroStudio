@@ -1,4 +1,4 @@
-import { useState, lazy, Suspense } from 'react'
+import { useState, useEffect, lazy, Suspense } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useQueryClient } from '@tanstack/react-query'
 import { storage } from '@/lib/storage'
@@ -32,6 +32,9 @@ const SettingsPage = lazy(() =>
 const OpsPage = lazy(() =>
   import('@/components/ops-page').then((m) => ({ default: m.OpsPage }))
 )
+const HelpPage = lazy(() =>
+  import('@/components/help-page').then((m) => ({ default: m.HelpPage }))
+)
 
 type Tab = 'overview' | 'credentials' | 'usage' | 'ops' | 'settings'
 
@@ -63,6 +66,17 @@ export function AppShell({ onLogout }: AppShellProps) {
   const [loginOpen, setLoginOpen] = useState(false)
   const queryClient = useQueryClient()
 
+  // 帮助页 hash 同步：#/help 时全页覆盖渲染（非 tab）。直接访问 /help 由后端
+  // SPA fallback 服务 index.html，pathname 兜底让该场景同样生效。
+  const [helpActive, setHelpActive] = useState(
+    () => window.location.hash === '#/help' || window.location.pathname.endsWith('/help')
+  )
+  useEffect(() => {
+    const onHash = () => setHelpActive(window.location.hash === '#/help')
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [])
+
   // 号池健康事件通知（右下角 toast，状态跃迁时弹一次；复用已有轮询数据，零额外上游调用）。
   usePoolNotifications()
 
@@ -74,6 +88,17 @@ export function AppShell({ onLogout }: AppShellProps) {
     storage.removeApiKey()
     queryClient.clear()
     onLogout()
+  }
+
+  // 帮助页：整页覆盖（含侧边栏），返回按钮把 hash 清空后自然回到 tab 视图。
+  if (helpActive) {
+    return (
+      <div className="min-h-screen bg-[#0a0a0a] text-[#ededed]" translate="no">
+        <Suspense fallback={<PageSkeleton kind="settings" />}>
+          <HelpPage onBack={() => { window.location.hash = '' }} />
+        </Suspense>
+      </div>
+    )
   }
 
   return (

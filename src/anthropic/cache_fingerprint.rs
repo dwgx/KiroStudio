@@ -50,6 +50,10 @@ const DEFAULT_TTL_SECS: i64 = 5 * 60;
 const MAX_TTL_SECS: i64 = 3600;
 /// 图片块 token 近似（Anthropic 默认 ~1105 token/图，此处取整估算，见模块注释）。
 const IMAGE_BLOCK_TOKENS: u32 = 1000;
+/// LRU 淘汰的抽样间隔（2026-08-15）：每累计 [`EVICT_INTERVAL`] 条「超限插入」才
+/// 全表排序一次。排序是 O(n log n)，改前每次超限插入都排序会拖慢热路径；抽样后
+/// 表长上界 = cap + EVICT_INTERVAL − 1 + 单次 record 插入段数，内存可控。
+const EVICT_INTERVAL: usize = 128;
 
 /// 单个缓存条目。
 #[derive(Debug, Clone, Copy)]
@@ -62,6 +66,8 @@ struct CacheEntry {
 #[derive(Default)]
 struct Inner {
     entries: HashMap<u64, CacheEntry>,
+    /// 距上次 LRU 淘汰的「超限插入」条数（抽样淘汰计数，见 [`EVICT_INTERVAL`]）。
+    inserts_since_evict: usize,
 }
 
 /// 进程内提示词前缀指纹缓存（纯内存、惰性淘汰）。
@@ -100,7 +106,7 @@ impl CacheFingerprintMeter {
     }
 
     /// 把一组前缀段写入缓存。`ttl_secs` clip 到 [60, MAX_TTL_SECS]；容量超限按
-    /// last_hit_at（LRU）淘汰最旧条目。
+    /// last_hit_at（LRU）淘汰最旧条目（抽样淘汰，见 [`EVICT_INTERVAL`]）。
     fn record_at(&self, hashes: &[u64], tokens: &[u32], ttl_secs: i64, now: i64) {
         debug_assert_eq!(hashes.len(), tokens.len());
         let ttl = ttl_secs.clamp(60, MAX_TTL_SECS);
@@ -115,16 +121,24 @@ impl CacheFingerprintMeter {
                 },
             );
         }
+        // 🔴 抽样淘汰（2026-08-15）：改前每次超限插入都全表排序（O(n log n)）——
+        // 容量打满后每次 record 都付一次全表排序成本，纯估算层不值得。改为每
+        // EVICT_INTERVAL 条「超限插入」才淘汰一次：表长上界 = cap + EVICT_INTERVAL − 1
+        // + 单次 record 段数（有界不泄漏），LRU 语义（最旧 last_hit_at 先淘汰）不变。
         if inner.entries.len() > DEFAULT_CAPACITY {
-            let drop_n = inner.entries.len() - DEFAULT_CAPACITY;
-            let mut victims: Vec<(u64, i64)> = inner
-                .entries
-                .iter()
-                .map(|(k, v)| (*k, v.last_hit_at))
-                .collect();
-            victims.sort_by_key(|x| x.1);
-            for (k, _) in victims.into_iter().take(drop_n) {
-                inner.entries.remove(&k);
+            inner.inserts_since_evict += 1;
+            if inner.inserts_since_evict >= EVICT_INTERVAL {
+                inner.inserts_since_evict = 0;
+                let drop_n = inner.entries.len() - DEFAULT_CAPACITY;
+                let mut victims: Vec<(u64, i64)> = inner
+                    .entries
+                    .iter()
+                    .map(|(k, v)| (*k, v.last_hit_at))
+                    .collect();
+                victims.sort_by_key(|x| x.1);
+                for (k, _) in victims.into_iter().take(drop_n) {
+                    inner.entries.remove(&k);
+                }
             }
         }
     }
@@ -398,12 +412,42 @@ fn system_signature(s: &SystemMessage) -> String {
     format!("sys:{}|{}", s.block_type.as_deref().unwrap_or("text"), s.text)
 }
 
+/// 从文本中剥除 `<system-reminder>...</system-reminder>` 标签对（语义移植自
+/// k2cc `strip_system_reminders`）：Kiro 上游每轮在历史 user 消息里注入
+/// system-reminder（内容含时间戳等逐轮漂移字段），把它编进指纹会让前缀链
+/// 每轮全 miss、cache_read 恒 0。剥除只影响指纹签名与 token 估算，**转发字节不动**
+/// （遵守 RFC「不做消息搬移」禁令）。未闭合的开始标签剥到文本末尾（k2cc 同语义）。
+fn strip_system_reminders(text: &str) -> String {
+    const OPEN_TAG: &str = "<system-reminder>";
+    const CLOSE_TAG: &str = "</system-reminder>";
+
+    let mut result = String::with_capacity(text.len());
+    let mut search_from = 0;
+
+    while let Some(start) = text[search_from..].find(OPEN_TAG) {
+        let abs_start = search_from + start;
+        result.push_str(&text[search_from..abs_start]);
+
+        let after_open = abs_start + OPEN_TAG.len();
+        if let Some(end) = text[after_open..].find(CLOSE_TAG) {
+            search_from = after_open + end + CLOSE_TAG.len();
+        } else {
+            search_from = text.len();
+        }
+    }
+    result.push_str(&text[search_from..]);
+
+    result
+}
+
 /// 消息 content block 的结构化签名（进哈希）。
 ///
 /// ⚠️ **刻意剔除每轮漂移的字段**（对抗审查 MAJOR 2，2026-08-11）：Claude Code 的工具
 /// 对话里 `tool_use.id` / `tool_result.tool_use_id` 每轮回传时重新生成 —— 把它们编进
 /// 哈希会让工具类多轮对话的前缀链每轮全 miss、read 恒 0。JSON 内容先 canonicalize
 /// （递归排序键），防客户端键序抖动连锁 miss。语义对齐参考仓 cache_metering.rs。
+/// text 块另剥 `<system-reminder>` 标签对（Kiro 注入、内容逐轮漂移，见
+/// [`strip_system_reminders`]）。
 fn block_signature_value(v: &serde_json::Value) -> String {
     let block_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("text");
     match block_type {
@@ -425,7 +469,10 @@ fn block_signature_value(v: &serde_json::Value) -> String {
             "block:redacted_thinking|{}",
             v.get("data").and_then(|x| x.as_str()).unwrap_or("")
         ),
-        _ => format!("block:{block_type}|{}", v.get("text").and_then(|x| x.as_str()).unwrap_or("")),
+        _ => {
+            let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("");
+            format!("block:{block_type}|{}", strip_system_reminders(text))
+        }
     }
 }
 
@@ -447,7 +494,7 @@ fn canonical_json(v: Option<&serde_json::Value>) -> String {
     }
 }
 
-/// 消息 content block 的 token 文本。
+/// 消息 content block 的 token 文本（text 块同样剥 `<system-reminder>`，与签名一致）。
 fn block_token_text(v: &serde_json::Value) -> String {
     match v.get("type").and_then(|t| t.as_str()) {
         Some("tool_use") => v
@@ -471,7 +518,9 @@ fn block_token_text(v: &serde_json::Value) -> String {
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .to_string(),
-        _ => v.get("text").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        _ => strip_system_reminders(
+            v.get("text").and_then(|x| x.as_str()).unwrap_or(""),
+        ),
     }
 }
 
@@ -695,21 +744,31 @@ mod tests {
         assert_eq!(m.lookup_at(&[0xAAAA], now + 10), vec![true], "未过期命中");
     }
 
-    /// 容量超限按 LRU（last_hit_at）淘汰最旧条目。
+    /// 容量上限语义（抽样淘汰）：表长必须有界（cap + 淘汰间隔余量），且 LRU
+    /// （last_hit_at）语义不变 —— 最旧条目最终被淘汰、最新条目保留。
+    ///
+    /// ⚠️ 2026-08-15 语义微调：改前每次超限都淘汰、表长严格回到 cap；抽样后
+    /// 每 EVICT_INTERVAL 条超限插入才淘汰一次，表长上界 = cap + EVICT_INTERVAL − 1。
+    /// 断言改测上界 + LRU 方向，而非「严格等于 cap」。
     #[test]
     fn capacity_evicts_least_recently_hit() {
         let m = CacheFingerprintMeter::default();
         let now = 1_000_000;
-        // 直接塞 DEFAULT_CAPACITY + 2 条（ttl 用上限，查询时刻所有条目都未过期）：
-        // 最早写入的两条（last_hit_at 最小）应被淘汰。
-        let total = DEFAULT_CAPACITY + 2;
+        // 塞 DEFAULT_CAPACITY + EVICT_INTERVAL + 10 条（ttl 用上限，查询时刻所有
+        // 条目都未过期）：至少触发一轮淘汰，最早写入的条目（last_hit_at 最小）
+        // 应被淘汰。
+        let total = DEFAULT_CAPACITY + EVICT_INTERVAL + 10;
         for i in 0..total {
             m.record_at(&[i as u64 + 1], &[10], MAX_TTL_SECS, now + i as i64);
         }
-        assert_eq!(m.len(), DEFAULT_CAPACITY, "超限后回到容量上限");
-        // 查询时刻取 now + total：所有剩余条目（写入晚于 1、2）仍在 TTL 内。
+        assert!(
+            m.len() <= DEFAULT_CAPACITY + EVICT_INTERVAL - 1,
+            "抽样淘汰后表长必须保持有界（cap + 淘汰间隔余量），实际 {}",
+            m.len()
+        );
+        // 查询时刻取 now + total：最早写入的 1、2 已被淘汰，最新的 total 仍在。
         let hits = m.lookup_at(&[1, 2, total as u64], now + total as i64);
-        assert_eq!(hits, vec![false, false, true], "最早写入的 1、2 被淘汰，最新的在");
+        assert_eq!(hits, vec![false, false, true], "LRU 语义：最旧被淘汰，最新保留");
     }
 
     /// 工具对话的 id 漂移（对抗审查 MAJOR 2）：Claude Code 每轮回传工具块时重新生成
@@ -854,6 +913,61 @@ mod tests {
         assert_eq!(
             c.cache_creation_5m_input_tokens + c.cache_creation_1h_input_tokens,
             c.cache_creation_input_tokens
+        );
+    }
+
+    /// 剥除函数的本地语义（移植自 k2cc）：完整标签对被剥除、前后文保留、
+    /// 多个标签逐对剥除、未闭合的开始标签剥到文本末尾。
+    #[test]
+    fn strip_system_reminders_removes_full_tag_pairs() {
+        assert_eq!(strip_system_reminders("plain text"), "plain text");
+        assert_eq!(
+            strip_system_reminders(
+                "<system-reminder>context walkthrough</system-reminder>real question"
+            ),
+            "real question"
+        );
+        assert_eq!(
+            strip_system_reminders(
+                "a<system-reminder>one</system-reminder>b<system-reminder>two</system-reminder>c"
+            ),
+            "abc"
+        );
+        assert_eq!(strip_system_reminders("<system-reminder>no close"), "");
+    }
+
+    /// Kiro 每轮在历史 user 消息注入 `<system-reminder>`（内容含时间戳等逐轮漂移
+    /// 字段）：指纹签名/计数必须剥除该标签对，否则前缀链每轮全 miss、read 恒 0。
+    /// 剥除后签名与漂移无关 → 命中不被破坏（转发字节不受影响，仅影响指纹估算）。
+    #[test]
+    fn system_reminder_drift_in_history_does_not_break_hits() {
+        let mk = |reminder: &str| {
+            req_with(
+                Some("user_a__session-system-reminder"),
+                None,
+                None,
+                vec![
+                    Message {
+                        role: "user".into(),
+                        content: serde_json::json!([
+                            {"type": "text", "text": format!(
+                                "<system-reminder>{}</system-reminder>history question",
+                                reminder
+                            )}
+                        ]),
+                    },
+                    msg("assistant", "history answer"),
+                    msg("user", "current turn"),
+                ],
+            )
+        };
+        let u1 = compute_fingerprint_usage(&mk("2026-08-15 10:00:00 walkthrough")).unwrap();
+        assert_eq!(u1.cache_read_input_tokens, 0, "首轮无历史命中");
+        let u2 = compute_fingerprint_usage(&mk("2026-08-15 10:00:05 other walkthrough")).unwrap();
+        assert!(
+            u2.cache_read_input_tokens > 0,
+            "system-reminder 内容漂移不得破坏命中（剥除后前缀一致）。read={}",
+            u2.cache_read_input_tokens
         );
     }
 }

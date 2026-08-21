@@ -293,27 +293,6 @@
   animation: glow-burst 0.75s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
-/* OrbitRing —— 活跃节点 → 中心的脉冲连线：快速亮起后淡出 */
-@keyframes orbit-link {
-  0%   { opacity: 0; }
-  25%  { opacity: 0.8; }
-  100% { opacity: 0; }
-}
-.animate-orbit-link {
-  animation: orbit-link 0.85s cubic-bezier(0.16, 1, 0.3, 1) both;
-}
-
-/* OrbitRing —— 命中涟漪：节点外一圈向外扩散并淡出（以节点自身为中心缩放） */
-@keyframes orbit-ripple {
-  0%   { opacity: 0.9; transform: scale(1); }
-  100% { opacity: 0; transform: scale(3.2); }
-}
-.animate-orbit-ripple {
-  transform-box: fill-box;
-  transform-origin: center;
-  animation: orbit-ripple 0.9s cubic-bezier(0.16, 1, 0.3, 1) both;
-}
-
 /* StatusBars —— 命中横向扫光：高光带从左掠到右一次 */
 @keyframes bar-sweep {
   0%   { opacity: 0; transform: translateX(-120%); }
@@ -328,8 +307,6 @@
   .animate-idle-glow-soft,
   .animate-glow-sweep,
   .animate-glow-burst,
-  .animate-orbit-link,
-  .animate-orbit-ripple,
   .animate-bar-sweep {
     animation: none;
   }

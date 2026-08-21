@@ -3,16 +3,20 @@
 use axum::{
     Json, Router,
     body::Body,
-    http::{Response, StatusCode, Uri, header},
+    extract::ConnectInfo,
+    http::{HeaderMap, Response, StatusCode, Uri, header},
     response::IntoResponse,
     routing::get,
 };
 use rust_embed::Embed;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{
     Mutex, OnceLock,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::Duration;
+
+use crate::common::security::IngressRateLimiter;
 
 /// 嵌入前端构建产物
 #[derive(Embed)]
@@ -197,7 +201,7 @@ async fn download_bg_bytes(client: &reqwest::Client, img_url: &str) -> Option<Ca
     // `/admin/api/bg-cached?idx=N` 原样吐给浏览器。图片 URL 来自第三方 JSON 源
     // （api.lolicon.app）的响应，属于外部可控数据；若该源被劫持返回一个 text/html 的
     // URL，就能把 HTML 灌进池子，再由 bg-cached 在 /admin 同源下吐出 → XSS →
-    // localStorage 里的 adminKey 泄露。故非图片 MIME 一律拒绝入池。
+    // sessionStorage 里的 adminKey 泄露。故非图片 MIME 一律拒绝入池。
     // 与代理端点共用同一判定（single source of truth，防两处漂移）；
     // 但入池侧更严格：直接**拒绝**而非覆盖，绝不让非图片字节进常驻内存池。
     if sanitize_image_content_type(&content_type, img_url) != content_type {
@@ -343,8 +347,23 @@ const MAX_JSON_SOURCE_BYTES: u64 = 1024 * 1024;
 
 /// 从一个 Json 源(lolicon 格式)拿图片 URL 列表并逐张下载,返回成功存池的张数。
 /// `batch_epoch` 透传给 push_bg_to_pool 做代次校验;某张 push 被拒(代次变)即停止本源下载。
-async fn fetch_from_json_source(client: &reqwest::Client, url: &str, batch_epoch: u64) -> usize {
-    let body: serde_json::Value = match client.get(url).send().await {
+async fn fetch_from_json_source(_client: &reqwest::Client, url: &str, batch_epoch: u64) -> usize {
+    // JSON 源 URL 虽是我们写死的域名，仍走 SSRF 守卫：禁重定向 + DNS 固定，
+    // 防 lolicon 被劫持 302 到内网（图片 URL 已守卫，源请求本身此前是旁路）。
+    let src_client = match crate::common::ssrf::build_guarded_client(
+        url,
+        Duration::from_secs(15),
+        &["https"],
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("背景图预取拒绝 JSON 源（SSRF 防护）: {} - {}", url, e);
+            return 0;
+        }
+    };
+    let body: serde_json::Value = match src_client.get(url).send().await {
         // 带上限读取：第三方响应是外部可控数据，无上限的 r.json() 可被用来 OOM 网关。
         Ok(r) => match crate::common::http_read::read_json_capped(
             r,
@@ -595,13 +614,36 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
         .expect("Failed to build response")
 }
 
+/// /help 直达入口（2026-08-14）：帮助中心知识库独立 URL。
+/// SPA fallback 只在 /admin 前缀内生效，主路由 /help 需要显式挂载，
+/// 前端 app-shell 按 pathname.endsWith('/help') 渲染帮助页（与 hash 同源逻辑）。
+pub fn serve_help_page() -> Response<Body> {
+    serve_index()
+}
+
+/// Admin UI HTML CSP. `frame-ancestors 'none'` blocks login-page clickjacking.
+const ADMIN_UI_CSP: &str = "default-src 'self'; img-src 'self' data: https:; \
+     style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
+     font-src 'self' https://fonts.gstatic.com; \
+     connect-src 'self'; \
+     frame-ancestors 'none'";
+
 /// 提供 index.html
+///
+/// CSP: script 只允许同源(vite 构建产物是外部文件,无内联脚本),阻断内联/外链脚本注入。
+/// style-src 保留 'unsafe-inline'(React 内联 style 属性 + 个别库注入 <style> 的兼容),
+/// 另放行 index.html 模板引入的 Google Fonts 两个域,否则字体样式被拦(视觉回退)。
+/// 背景图走同源 /admin/api/bg-* 代理,img-src 的 https: 兜底直接外链图。
+/// frame-ancestors 'none' 禁止任意站点 iframe 嵌登录页做 UI 覆盖钓鱼。
+/// adminKey 在 sessionStorage（非 localStorage）；CSP 降低 XSS 读到它的面。
 fn serve_index() -> Response<Body> {
     match load_asset("index.html") {
         Some(content) => Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
             .header(header::CACHE_CONTROL, "no-cache")
+            .header(header::CONTENT_SECURITY_POLICY, ADMIN_UI_CSP)
+            .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
             .body(Body::from(content.into_owned()))
             .expect("Failed to build response"),
         None => Response::builder()
@@ -658,14 +700,20 @@ async fn random_bg_handler() -> impl IntoResponse {
 
     // 池空兜底：实时拉一张（旧逻辑），下载交给现有 bg-img 代理。
     // 这条路径只在服务刚启动、后台首批还没到位时短暂出现。
-    let client = match bg_http_client(10) {
-        Some(c) => c,
-        None => return Json(serde_json::json!({"url": null})).into_response(),
-    };
     let api = format!(
         "https://api.lolicon.app/setu/v2?r18={}&size=regular&excludeAI=true&num=1&aspectRatio=gt1.2",
         r18_param()
     );
+    let client = match crate::common::ssrf::build_guarded_client(
+        &api,
+        Duration::from_secs(10),
+        &["https"],
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(_) => return Json(serde_json::json!({"url": null})).into_response(),
+    };
     let body: serde_json::Value = match client.get(&api).send().await {
         // 同上：带上限读取（本端点匿名可达，更不能让外部响应决定内存占用）。
         Ok(r) => match crate::common::http_read::read_json_capped(
@@ -733,7 +781,7 @@ async fn bg_cached_handler(uri: Uri) -> impl IntoResponse {
 /// 若把上游 Content-Type 原样透传：
 ///   1. 攻击者构造一个返回 `text/html` 的 URL 作为 `url=` 参数；
 ///   2. 浏览器在 **`/admin` 同源**下把它当 HTML 执行 → XSS；
-///   3. 面板的 adminKey 明文存在 localStorage（全仓无 CSP）→ 完整接管管理面。
+///   3. 面板的 adminKey 在 sessionStorage；文档 CSP 是纵深防御，MIME 漏了仍可能同源 XSS。
 /// SSRF 与 10MiB 上限都已经防了，唯独不限制 MIME 等于没闭合这条链。
 ///
 /// 策略：只放行 `image/*`（以及某些 CDN 对图片用的 `application/octet-stream`），
@@ -760,8 +808,132 @@ fn sanitize_image_content_type(content_type: &str, img_url: &str) -> String {
     }
 }
 
+/// `/api/bg-img` 专用每-IP 限流：固定 30/min。不读 `ingressRateLimitPerMin`（API 门，默认关）。
+const BG_IMG_RATE_LIMIT_PER_MIN: u32 = 30;
+
+static BG_IMG_RATE_LIMITER: OnceLock<IngressRateLimiter> = OnceLock::new();
+
+fn bg_img_rate_limiter() -> &'static IngressRateLimiter {
+    BG_IMG_RATE_LIMITER.get_or_init(|| IngressRateLimiter::new(BG_IMG_RATE_LIMIT_PER_MIN))
+}
+
+/// Host / Origin 权威主机名：剥端口。`[::1]:8990` → `[::1]`；`127.0.0.1:8990` → `127.0.0.1`。
+fn hostname_only(authority: &str) -> &str {
+    let s = authority.trim();
+    if s.starts_with('[') {
+        if let Some(end) = s.find(']') {
+            return &s[..=end];
+        }
+    }
+    if let Some((host, port)) = s.rsplit_once(':')
+        && !port.is_empty()
+        && port.bytes().all(|b| b.is_ascii_digit())
+    {
+        return host;
+    }
+    s
+}
+
+/// 从绝对 URL 取主机名（剥端口、忽略 scheme / path）。解析失败 → `None`。
+fn hostname_from_absolute_url(raw: &str) -> Option<String> {
+    let after = raw.trim().split_once("://")?.1;
+    let after = match after.split_once('@') {
+        Some((_, rest)) => rest,
+        None => after,
+    };
+    let authority = after.split(['/', '?', '#']).next().unwrap_or(after);
+    if authority.is_empty() {
+        return None;
+    }
+    let host = hostname_only(authority);
+    if host.is_empty() {
+        return None;
+    }
+    Some(host.to_ascii_lowercase())
+}
+
+fn header_text<'a>(headers: &'a HeaderMap, name: header::HeaderName) -> Option<&'a str> {
+    headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+/// 同源：Origin 优先；否则 Referer。两者都缺则放行（登录 `<img>` + 严 Referrer-Policy / curl）。
+/// 头在但无法解析为 URL → 403。
+fn bg_img_same_origin(headers: &HeaderMap, request_host: &str) -> Result<(), StatusCode> {
+    let expected = hostname_only(request_host).to_ascii_lowercase();
+    let candidate = if headers.contains_key(header::ORIGIN) {
+        let raw = header_text(headers, header::ORIGIN).ok_or(StatusCode::FORBIDDEN)?;
+        hostname_from_absolute_url(raw).ok_or(StatusCode::FORBIDDEN)?
+    } else if headers.contains_key(header::REFERER) {
+        let raw = header_text(headers, header::REFERER).ok_or(StatusCode::FORBIDDEN)?;
+        hostname_from_absolute_url(raw).ok_or(StatusCode::FORBIDDEN)?
+    } else {
+        return Ok(());
+    };
+    if !expected.is_empty() && candidate == expected {
+        Ok(())
+    } else {
+        Err(StatusCode::FORBIDDEN)
+    }
+}
+
+fn bg_img_rate_limit(
+    limiter: &IngressRateLimiter,
+    ip: Option<IpAddr>,
+) -> Result<(), StatusCode> {
+    match ip {
+        Some(ip) if !limiter.check(ip) => Err(StatusCode::TOO_MANY_REQUESTS),
+        _ => Ok(()),
+    }
+}
+
+fn bg_img_preflight_limited(
+    headers: &HeaderMap,
+    host: &str,
+    ip: Option<IpAddr>,
+    limiter: &IngressRateLimiter,
+) -> Result<(), StatusCode> {
+    bg_img_same_origin(headers, host)?;
+    bg_img_rate_limit(limiter, ip)
+}
+
+fn bg_img_preflight(
+    headers: &HeaderMap,
+    host: &str,
+    ip: Option<IpAddr>,
+) -> Result<(), StatusCode> {
+    bg_img_preflight_limited(headers, host, ip, bg_img_rate_limiter())
+}
+
+fn bg_img_deny_response(status: StatusCode) -> Response<Body> {
+    let mut builder = Response::builder().status(status);
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        builder = builder.header(header::RETRY_AFTER, "60");
+    }
+    let body = if status == StatusCode::TOO_MANY_REQUESTS {
+        "rate limited"
+    } else {
+        "forbidden"
+    };
+    builder
+        .body(Body::from(body))
+        .expect("Failed to build response")
+}
+
 /// 图片代理（绕过 i.pixiv.re 防盗链，直接把图片 stream 给浏览器）
-async fn bg_img_proxy_handler(uri: Uri) -> impl IntoResponse {
+async fn bg_img_proxy_handler(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> impl IntoResponse {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    // 与进程默认口径一致：`trust_forwarded_header` 默认 false；对端私网时仍采信 XFF 最右。
+    let ip = crate::common::security::client_ip_from_headers(&headers, Some(peer), false);
+    if let Err(status) = bg_img_preflight(&headers, host, ip) {
+        return bg_img_deny_response(status);
+    }
     let query = uri.query().unwrap_or("");
     let img_url = query.strip_prefix("url=").unwrap_or("");
     let img_url = match urlencoding::decode(img_url) {
@@ -873,10 +1045,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn admin_ui_csp_includes_frame_ancestors_none() {
+        assert!(
+            ADMIN_UI_CSP.contains("frame-ancestors 'none'"),
+            "login HTML CSP must include frame-ancestors 'none' to block iframe phishing"
+        );
+        let src = include_str!("router.rs");
+        let compact: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+        // needle 运行时拼接：写成完整字面量会被 include_str! 读到自己而假绿。
+        let needle = format!(
+            "{}{}",
+            "CONTENT_SECURITY_POLICY,",
+            "ADMIN_UI_CSP"
+        );
+        assert!(
+            compact.contains(&needle),
+            "serve_index must attach ADMIN_UI_CSP so frame-ancestors cannot drift from this test"
+        );
+    }
+
+    #[test]
     fn test_sanitize_image_content_type_rejects_executable_mimes() {
         // ⭐XSS 回归(旧代码原样透传上游 Content-Type):/admin/api/bg-img 与 /admin/api/bg-cached
         // 都是**匿名可达**且原样回响应体。若把 text/html 透传出去,浏览器会在 /admin **同源**下
-        // 执行它 → adminKey 存在 localStorage(全仓无 CSP) → 管理面完整接管。
+        // 执行它 → sessionStorage 里的 adminKey 可被读走（文档 CSP 是纵深防御）→ 管理面完整接管。
         // 这里断言:一切可被浏览器当文档/脚本执行的 MIME 都必须被覆盖成 image/jpeg。
         for evil in [
             "text/html",
@@ -948,6 +1140,136 @@ mod tests {
             body.contains(&needle),
             "第三方 JSON 源下发的图片 URL 必须过 build_guarded_client 的 SSRF 校验，\
              否则可被指使去打内网/元数据端点"
+        );
+    }
+
+    fn bg_img_test_headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).expect("header name"),
+                value.parse().expect("header value"),
+            );
+        }
+        headers
+    }
+
+    #[test]
+    fn bg_img_origin_host_match_allows() {
+        let headers = bg_img_test_headers(&[("origin", "http://example.test")]);
+        assert_eq!(
+            bg_img_preflight(&headers, "example.test", None),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn bg_img_origin_host_mismatch_denies() {
+        let headers = bg_img_test_headers(&[("origin", "http://evil.test")]);
+        assert_eq!(
+            bg_img_preflight(&headers, "example.test", None),
+            Err(StatusCode::FORBIDDEN)
+        );
+    }
+
+    #[test]
+    fn bg_img_referer_only_match_allows() {
+        let headers = bg_img_test_headers(&[("referer", "http://example.test/admin")]);
+        assert_eq!(
+            bg_img_preflight(&headers, "example.test", None),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn bg_img_referer_only_mismatch_denies() {
+        let headers = bg_img_test_headers(&[("referer", "https://evil.test/admin")]);
+        assert_eq!(
+            bg_img_preflight(&headers, "example.test", None),
+            Err(StatusCode::FORBIDDEN)
+        );
+    }
+
+    #[test]
+    fn bg_img_missing_origin_and_referer_allows() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            bg_img_preflight(&headers, "127.0.0.1:8990", None),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn bg_img_host_port_matches_origin_url_port() {
+        let headers = bg_img_test_headers(&[("origin", "http://127.0.0.1:8990")]);
+        assert_eq!(
+            bg_img_preflight(&headers, "127.0.0.1:8990", None),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn bg_img_malformed_origin_denies() {
+        let headers = bg_img_test_headers(&[("origin", "null")]);
+        assert_eq!(
+            bg_img_preflight(&headers, "127.0.0.1:8990", None),
+            Err(StatusCode::FORBIDDEN)
+        );
+    }
+
+    #[test]
+    fn bg_img_rate_limiter_two_pass_third_fails() {
+        let limiter = IngressRateLimiter::new(2);
+        let ip: IpAddr = "203.0.113.10".parse().unwrap();
+        let headers = HeaderMap::new();
+        let host = "127.0.0.1:8990";
+        assert_eq!(
+            bg_img_preflight_limited(&headers, host, Some(ip), &limiter),
+            Ok(())
+        );
+        assert_eq!(
+            bg_img_preflight_limited(&headers, host, Some(ip), &limiter),
+            Ok(())
+        );
+        assert_eq!(
+            bg_img_preflight_limited(&headers, host, Some(ip), &limiter),
+            Err(StatusCode::TOO_MANY_REQUESTS)
+        );
+    }
+
+    #[test]
+    fn bg_img_rate_limit_response_sets_retry_after_60() {
+        let resp = bg_img_deny_response(StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers().get(header::RETRY_AFTER).map(|v| v.as_bytes()),
+            Some(b"60".as_slice())
+        );
+    }
+
+    /// 同源 / 限流必须在出站 GET 之前（fail closed）。作用域限定 handler 体，
+    /// 避免测试段自己的拼接字面量假绿。
+    #[test]
+    fn bg_img_preflight_runs_before_outbound_fetch() {
+        let src = include_str!("router.rs");
+        let compact: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+        let start = compact
+            .find("asyncfnbg_img_proxy_handler")
+            .expect("bg_img_proxy_handler 应存在");
+        let end = compact[start..]
+            .find("modtests")
+            .expect("mod tests 应在 handler 之后")
+            + start;
+        let body = &compact[start..end];
+        let pre = format!("{}{}", "bg_img_preflight", "(");
+        let fetch = format!("{}{}", "build_guarded_client", "(");
+        let pre_at = body.find(&pre).expect("handler 必须先跑 bg_img_preflight");
+        let fetch_at = body
+            .find(&fetch)
+            .expect("handler 仍须走 build_guarded_client 的 SSRF 校验");
+        assert!(
+            pre_at < fetch_at,
+            "同源/限流必须在出站 fetch 之前，否则匿名端点可先打外网再被拒"
         );
     }
 }

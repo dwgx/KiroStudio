@@ -128,10 +128,47 @@ pub fn init(sinks: Vec<Arc<dyn UsageSink>>) {
 /// `/api/admin/recovery-metrics` 的 `usagePipelineDropped`、
 /// `/api/admin/usage/overview` 的 `pipeline.dropped_records`，以及按 2 的幂次的 `warn!`。
 pub fn record(record: RequestRecord) {
+    #[cfg(test)]
+    test_capture::push(&record);
     let Some(pipeline) = PIPELINE.get() else {
         return;
     };
     pipeline.submit(record);
+}
+
+/// 仅测试：把本线程随后 `record()` 的投递同步抄一份。
+///
+/// 未 `init` 时生产路径静默丢弃，单测仍能拿到记录。thread-local，不与并行测试串扰。
+#[cfg(test)]
+pub(crate) fn with_captured_records<T>(f: impl FnOnce() -> T) -> (T, Vec<RequestRecord>) {
+    test_capture::with_captured_records(f)
+}
+
+#[cfg(test)]
+mod test_capture {
+    use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static BUF: RefCell<Option<Vec<RequestRecord>>> = const { RefCell::new(None) };
+    }
+
+    pub fn with_captured_records<T>(f: impl FnOnce() -> T) -> (T, Vec<RequestRecord>) {
+        BUF.with(|slot| {
+            *slot.borrow_mut() = Some(Vec::new());
+        });
+        let out = f();
+        let recs = BUF.with(|slot| slot.borrow_mut().take().unwrap_or_default());
+        (out, recs)
+    }
+
+    pub fn push(record: &RequestRecord) {
+        BUF.with(|slot| {
+            if let Some(buf) = slot.borrow_mut().as_mut() {
+                buf.push(record.clone());
+            }
+        });
+    }
 }
 
 /// 已丢弃的记录数（管道满导致）。

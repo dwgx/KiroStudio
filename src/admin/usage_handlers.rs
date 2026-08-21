@@ -138,9 +138,11 @@ pub async fn usage_timeseries(
 /// GET /api/admin/usage/by-model
 /// 按「上游实际服务模型」分组的累计统计（映射双口径的 upstream 维度：
 /// key = `upstream_model` 映射后名，None 回落 `model`）。
+///
+/// 成本估算：单价表取自当前配置快照（空表 = 不估算），命中模型的行下发 `cost`。
 pub async fn usage_by_model(State(state): State<AdminState>) -> impl IntoResponse {
     match &state.usage_stats {
-        Some(stats) => Json(stats.by_model()).into_response(),
+        Some(stats) => Json(stats.by_model(&state.service.model_pricing())).into_response(),
         None => stats_disabled(),
     }
 }
@@ -149,7 +151,8 @@ pub async fn usage_by_model(State(state): State<AdminState>) -> impl IntoRespons
 /// 按「客户端请求的原始模型名」分组的累计统计（映射双口径的 requested 维度）。
 pub async fn usage_by_requested_model(State(state): State<AdminState>) -> impl IntoResponse {
     match &state.usage_stats {
-        Some(stats) => Json(stats.by_requested_model()).into_response(),
+        Some(stats) => Json(stats.by_requested_model(&state.service.model_pricing()))
+            .into_response(),
         None => stats_disabled(),
     }
 }
@@ -159,6 +162,19 @@ pub async fn usage_by_requested_model(State(state): State<AdminState>) -> impl I
 pub async fn usage_by_credential(State(state): State<AdminState>) -> impl IntoResponse {
     match &state.usage_stats {
         Some(stats) => Json(stats.by_credential()).into_response(),
+        None => stats_disabled(),
+    }
+}
+
+/// GET /api/admin/usage/by-outcome
+/// 按结果分类（success/rate_limited/auth_failed/...）分组的累计统计。
+///
+/// 解决 A2/F1：`Aggregate` 只有 success/failure 二值，429/配额/auth 分布画不出，
+/// 只能 `traces/search?outcome=` 逐条过滤。本端点下发全量累计的 outcome 分布
+/// （key = snake_case outcome 名，各 key 的 requests 之和恒等于总请求数）。
+pub async fn usage_by_outcome(State(state): State<AdminState>) -> impl IntoResponse {
+    match &state.usage_stats {
+        Some(stats) => Json(stats.by_outcome()).into_response(),
         None => stats_disabled(),
     }
 }
@@ -224,12 +240,12 @@ pub async fn usage_recent(
     match db.recent(limit) {
         Ok(records) => Json(records).into_response(),
         Err(e) => {
+            // ⚠️ 内部错误细节只进服务端日志，绝不下发客户端（MINOR-5：500 响应体
+            // 暴露 SQLite/内部路径会给攻击者情报，且对前端排障无益）。
             tracing::warn!("查询用量明细失败: {:#}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(AdminErrorResponse::internal_error(format!(
-                    "查询用量明细失败: {e}"
-                ))),
+                Json(AdminErrorResponse::internal_error("查询用量明细失败，请稍后重试")),
             )
                 .into_response()
         }
@@ -322,12 +338,11 @@ pub async fn traces_search(
     let total = match db.count_filtered(&filter) {
         Ok(n) => n,
         Err(e) => {
+            // ⚠️ 内部错误细节只进服务端日志（MINOR-5），见 usage_recent 同款注释。
             tracing::warn!("统计 trace 明细失败: {:#}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(AdminErrorResponse::internal_error(format!(
-                    "统计 trace 明细失败: {e}"
-                ))),
+                Json(AdminErrorResponse::internal_error("统计 trace 明细失败，请稍后重试")),
             )
                 .into_response();
         }
@@ -339,9 +354,7 @@ pub async fn traces_search(
             tracing::warn!("查询 trace 明细失败: {:#}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(AdminErrorResponse::internal_error(format!(
-                    "查询 trace 明细失败: {e}"
-                ))),
+                Json(AdminErrorResponse::internal_error("查询 trace 明细失败，请稍后重试")),
             )
                 .into_response()
         }
@@ -615,6 +628,43 @@ mod tests {
         );
     }
 
+    /// ⭐ 源码守卫（MINOR-5）：500 响应体不得携带内部错误细节。
+    ///
+    /// 三处 500 收口（usage_recent / traces_search 的 count 与 search）都把内部错误
+    /// 细节（SQLite 错误、路径等）写进了响应体 —— 那是给攻击者的情报，且对前端
+    /// 排障无益。修复后 `{e}` 只进 `tracing::warn!`，响应体是通用文案。
+    ///
+    /// 回退即 FAIL：任一处把响应体改回 `internal_error(format!("...: {e}"))` ——
+    /// `internal_error(format!(` 计数从 0 变 1，本条红。
+    #[test]
+    fn internal_error_bodies_must_not_carry_error_details() {
+        let src = include_str!("usage_handlers.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        // 响应体不再用 format! 拼错误详情（{e} 只属于 tracing::warn! 那侧）。
+        let formatted = format!("internal_error(format{}", "!(");
+        assert_eq!(
+            prod.matches(formatted.as_str()).count(),
+            0,
+            "500 响应体不得用 format! 拼内部错误细节（{{e}} 只留在 tracing::warn! 侧）——\
+             泄漏 SQLite/内部路径等于给攻击者情报"
+        );
+        // 通用文案必须存在（三处收口各一条）。
+        for msg in ["查询用量明细失败，请稍后重试", "统计 trace 明细失败，请稍后重试"] {
+            assert!(
+                prod.contains(msg),
+                "500 响应体必须是通用文案（缺: {msg}）"
+            );
+        }
+        // 日志侧仍必须保留完整错误（{:#} 或 {e} 至少一处）—— 修文案不能把排障信息也删了。
+        assert!(
+            prod.contains("tracing::warn!(\"查询用量明细失败: {:#}\", e)")
+                || prod.contains("tracing::warn!(\"统计 trace 明细失败: {:#}\", e)")
+                || prod.contains("tracing::warn!(\"查询 trace 明细失败: {:#}\", e)"),
+            "tracing::warn! 必须保留完整错误（响应体去细节 ≠ 日志去细节）"
+        );
+    }
+
     // ===== 端点级：retries 指标必须真的出现在 HTTP 响应体里 =====
     //
     // 为什么要在**端点**层再测一遍（`usage_stats.rs` 已测过 DTO 序列化）：
@@ -629,7 +679,8 @@ mod tests {
     use axum::response::IntoResponse;
 
     use super::{
-        TimeseriesQuery, usage_by_credential, usage_by_model, usage_overview, usage_timeseries,
+        TimeseriesQuery, usage_by_credential, usage_by_model, usage_by_outcome, usage_overview,
+        usage_timeseries,
     };
     use crate::admin::middleware::AdminState;
     use crate::admin::service::AdminService;
@@ -753,6 +804,52 @@ mod tests {
         assert_eq!(c["retried_requests"], 2, "{by_cred}");
     }
 
+    /// ⭐ 回归（F1/A2 的 API 出口）：`GET /usage/by-outcome` 必须真的下发按 outcome
+    /// 分组的行 —— 过 axum `Json(..)` + `IntoResponse` 全链路，响应体即前端所见。
+    ///
+    /// 删掉 handler（或改成 stats_disabled 之外的空返回）→ 本测试 FAILED。
+    #[tokio::test]
+    async fn by_outcome_endpoint_emits_grouped_rows() {
+        // 2 条 rate_limited（各重试 3 次）+ 1 条 success 零重试
+        let stats = Arc::new(UsageStats::new(
+            std::env::temp_dir().join("kiro_usage_handlers_test_ignore"),
+        ));
+        for (outcome, retries) in [
+            (RequestOutcome::RateLimited, 3u32),
+            (RequestOutcome::RateLimited, 3u32),
+            (RequestOutcome::Success, 0u32),
+        ] {
+            let mut r = RequestRecord::new("req", "sonnet");
+            r.credential_id = Some(9);
+            r.outcome = outcome;
+            r.input_tokens = 10;
+            r.output_tokens = 5;
+            r.latency_ms = 100;
+            r.retries = retries;
+            stats.on_record(&r);
+        }
+        let mut st = AdminState::new("k", mk_service());
+        st.usage_stats = Some(stats);
+
+        let body = body_text(usage_by_outcome(State(st)).await.into_response()).await;
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        let rate_limited = rows.iter().find(|r| r["key"] == "rate_limited").unwrap();
+        assert_eq!(rate_limited["requests"], 2, "{body}");
+        // GroupStat 复用：retries 两个口径随行下发（前端可看「每个 outcome 烧了多少重试」）
+        assert_eq!(rate_limited["retries_sum"], 6, "{body}");
+        assert_eq!(rate_limited["retried_requests"], 2, "{body}");
+        let success = rows.iter().find(|r| r["key"] == "success").unwrap();
+        assert_eq!(success["requests"], 1, "{body}");
+        assert_eq!(success["retries_sum"], 0, "{body}");
+        // snake_case key 契约（camelCase 出现 = 前端读不到）
+        assert!(!body.contains("rateLimited"), "出口不得 camelCase：{body}");
+        // 不存在的 outcome 不得出现（只下发命中变体）
+        assert!(
+            rows.iter().all(|r| r["key"] != "auth_failed"),
+            "未命中的 outcome 不应下发：{body}"
+        );
+    }
+
     /// ⭐ 回归（已知问题 #12）：统计丢失（管道满丢弃 / JSONL 重放解析失败）必须可观测。
     ///
     /// 删除 `usage_overview` 里的 `dropped` / `parse_errors` 两个键 → 本测试 FAILED。
@@ -766,7 +863,10 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("usage-2026-07-03.jsonl"), "NOT JSON\n").unwrap();
+        // 文件名日期必须落在 rebuild 的 31 天环形窗内（P1-3）；写死 2026-07-03
+        // 在 2026-08-21 会被跳过，parse_errors 假 0。
+        let today = chrono::Utc::now().format("%Y-%m-%d");
+        std::fs::write(dir.join(format!("usage-{today}.jsonl")), "NOT JSON\n").unwrap();
 
         let stats = Arc::new(UsageStats::new(dir.clone()));
         stats.rebuild_from_logs();

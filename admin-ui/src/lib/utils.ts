@@ -1,5 +1,6 @@
 import { clsx, type ClassValue } from 'clsx'
 import { twMerge } from 'tailwind-merge'
+import i18n from '@/i18n'
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
@@ -92,7 +93,7 @@ export function extractDiagnosis(error: unknown): import('@/types/api').Onboardi
  */
 export function parseError(error: unknown): ParsedError {
   if (!error || typeof error !== 'object') {
-    return { title: '未知错误' }
+    return { title: i18n.t('error.unknown') }
   }
 
   const axiosError = error as Record<string, unknown>
@@ -120,7 +121,7 @@ export function parseError(error: unknown): ParsedError {
     return { title: axiosError.message }
   }
 
-  return { title: '未知错误' }
+  return { title: i18n.t('error.unknown') }
 }
 
 /**
@@ -142,8 +143,8 @@ function parseNestedErrorMessage(message: string): { title: string; detail?: str
 
     // 在 title 中包含状态码
     const title = statusCode
-      ? `${mainReason || '服务错误'} (${statusCode})`
-      : (mainReason || '服务错误')
+      ? `${mainReason || i18n.t('error.service')} (${statusCode})`
+      : (mainReason || i18n.t('error.service'))
 
     return {
       title,

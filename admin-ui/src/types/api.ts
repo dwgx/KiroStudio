@@ -22,8 +22,6 @@ export interface CredentialStatusItem {
   requestLimit?: number
   /** 自定义 API 代挂:累计已发请求数 */
   requestCount?: number
-  /** 自定义 API 代挂:deepseek 协议归一化开关 */
-  deepseekNormalize?: boolean
   /** 是否豁免全局模型映射（true = 该号发上游时保持客户端原始模型名） */
   modelMappingExempt?: boolean
   /** 「允许模型」白名单（成本安全硬门；空/缺省 = 不限制） */
@@ -88,6 +86,9 @@ export interface CredentialStatusItem {
   cooldownRemainingMs?: number
   /** 冷却原因（如「速率限制」「服务错误」）。 */
   cooldownReason?: string
+  /** 冷却原因稳定枚举码（rate_limited/suspicious/...，后端 CooldownReason::code()）。
+      判定与 i18n 走此码；cooldownReason 仅作展示 fallback（老后端无此字段）。 */
+  cooldownCode?: string
 }
 
 // 回收站条目（不含敏感明文）
@@ -124,6 +125,13 @@ export interface BatchDeleteItemResult {
 
 export interface BatchDeleteResponse {
   deleted: number
+  failed: number
+  results: BatchDeleteItemResult[]
+}
+
+/** 批量 reset/disable/whitelist/refresh（部分失败仍返 200，须逐条检查 ok）。 */
+export interface BatchOpResponse {
+  succeeded: number
   failed: number
   results: BatchDeleteItemResult[]
 }
@@ -268,8 +276,6 @@ export interface AddCredentialRequest {
   baseUrl?: string
   apiKey?: string
   requestLimit?: number
-  /** 自定义 API 代挂:deepseek 协议归一化开关（创建时设；改凭据走 deepseek-normalize 端点） */
-  deepseekNormalize?: boolean
   /** 是否豁免全局模型映射（创建时设；true = 该号发上游时保持客户端原始模型名） */
   modelMappingExempt?: boolean
   /** 代挂模型白名单（创建表单探测勾选而来；空/不传 = 不限制） */
@@ -451,10 +457,62 @@ export interface ExternalIdpLeg2Response {
   profiles: ExternalIdpProfileOption[]
 }
 
-// 第 3 步选定响应：选定 profile 建号成功
+// 第 3 步选定响应：选定 profile 建号成功。
+// arn/region 是**实际使用**的值而非用户传入值：用户选的 profile 可能不可用
+// （FEATURE_NOT_SUPPORTED）而被后端自动替换为同账号可用的另一个，前端须回显。
 export interface ExternalIdpSelectResponse {
   credentialId: number
+  arn: string
+  region: string
 }
+
+// ============ SSO Token 导入（粘贴 AWS portal Bearer Token 静默换号）============
+// 用户已在 AWS portal 登录，粘贴 portal 的 Bearer Token（x-amz-sso_authn），
+// 服务端走完整设备授权流程换取标准 IdC 凭据入池（免浏览器授权人工步骤）。
+
+export interface ImportSsoTokenRequest {
+  token: string
+  region?: string
+  priority?: number
+  proxyUrl?: string
+}
+
+export interface ImportSsoTokenResponse {
+  credentialId: number
+  email?: string | null
+}
+
+// ============ 错误提示词覆盖（errorMessages 配置表）============
+
+/**
+ * 单条错误提示词覆盖。所有字段 Optional：None = 回落内置默认（= 现状文案）。
+ * 与后端 `ErrorMessageOverride`（serde camelCase + skip_serializing_if）契约一致。
+ *
+ * - `status`：HTTP 状态码（后端白名单 400/401/403/404/413/429/500/502/503/504）
+ * - `type`：Anthropic 协议 error.type 枚举（后端 ERROR_TYPE_WHITELIST 白名单）
+ * - `message`：提示文案
+ * - `retryAfterSecs`：Retry-After 秒数（0-3600；None = 不覆盖）
+ */
+export interface ErrorMessageOverride {
+  status?: number
+  type?: string
+  message?: string
+  retryAfterSecs?: number | null
+}
+
+// ============ 错误提示词内置默认表（GET /api/admin/error-messages/defaults）============
+
+/** 默认表单条：key → 内置默认渲染值（与后端 default_error_messages() 契约一致）。 */
+export interface ErrorMessagesDefaultsEntry {
+  status: number
+  type: string
+  message: string
+  retryAfterSecs: number | null
+}
+
+/** 默认表全量：key → 内置默认（camelCase；retryAfterSecs 无 Retry-After 时为 null）。 */
+export type ErrorMessagesDefaultsResponse = Record<string, ErrorMessagesDefaultsEntry>
+
 
 // ============ 服务端配置快照 ============
 
@@ -468,6 +526,18 @@ export interface ExternalIdpSelectResponse {
  * - `manual`：不覆盖任何字段，全部读原值。**默认值**，保证既有配置行为零变化。
  */
 export type ThrottleProfile = 'shielded' | 'direct' | 'manual'
+
+/**
+ * 调度模式（三按钮，2026-08-16）。与后端 `SchedulingMode`（serde kebab-case）一一对应，
+ * 映射到 ThrottleProfile 矩阵：smart↔direct / stable↔shielded / manual↔manual。
+ *
+ * - `smart`（默认标记）：智能调度。切档时写入 Direct 扩展矩阵（吸收全开合理值 +
+ *   冷却开 + RPM 头寸 + 选号加权）。注意：首启只标记、不重写旋钮，切换才写矩阵。
+ * - `stable`：稳定优先。切档时写入 Shielded 扩展矩阵（真限流返 429、冷却 scale 150、
+ *   吸收层关）。
+ * - `manual`：高级手动。不覆盖任何字段，全部读原值。
+ */
+export type SchedulingMode = 'smart' | 'stable' | 'manual'
 
 export interface ConfigSnapshotResponse {
   /** 服务端真实版本(编译期注入),侧边栏据此展示,不再硬编码 */
@@ -492,8 +562,14 @@ export interface ConfigSnapshotResponse {
   /** 全池自愈退避指数上限（默认 4）。 */
   selfHealMaxShift: number
   promptCacheEnabled: boolean
+  /** 模拟缓存：透传池响应是否注入模拟 cache_read（默认关，配合 mockCacheReadRatio 使用）。 */
+  mockCacheEnabled: boolean
+  /** 模拟缓存注入比例（0..1 f64，默认 0.7）：cache_read = input × 比例。 */
+  mockCacheReadRatio: number
   /** 是否注入上游 output_config.effort（native extended thinking，默认关，2026-08-11 移植）。 */
   nativeThinkingEffortEnabled: boolean
+  /** CC↔Kiro 工具名/参数映射开关（默认开；热更即时生效）。 */
+  toolCompatMapping: boolean
   /** 批量推号入口 POST /api/import/keys 是否启用（默认**开**：端点先于开关存在，
       外部 kiro-accounting 正在用；关掉后两个挂载点一起返 403）。 */
   importKeysEnabled: boolean
@@ -538,6 +614,12 @@ export interface ConfigSnapshotResponse {
   cooldownEnabled: boolean
   /** 账户级 403 风控连续 N 次零成功后自动禁用该号。默认开。 */
   autoDisableSuspicious: boolean
+  /** 后台温和余额刷新发现超额时自动禁用整组（内存态，重启回默认 true） */
+  autoDisableQuotaExceeded: boolean
+  /** socks 代理池自动健康探测（内存态，重启回默认 true） */
+  socksAutoHealth: boolean
+  /** OTA 自动检查新版本（内存态，重启回默认 false） */
+  otaAutoCheck: boolean
   /** 分身（clone）新建时默认是否启用（默认 false = 建出来是禁用的）。 */
   cloneDefaultEnabled: boolean
   allCoolingFastFail: boolean
@@ -559,6 +641,8 @@ export interface ConfigSnapshotResponse {
   // 入站请求整形 + RPM 自动挡
   /** 限流/重试档位。manual = 不覆盖任何字段（默认，向前兼容） */
   throttleProfile: ThrottleProfile
+  /** 调度模式（三按钮）。smart = 默认标记；旧后端不下发时前端兜底为 'smart'。 */
+  schedulingMode: SchedulingMode
   inboundThrottleEnabled: boolean
   inboundRpmAuto: boolean
   inboundTargetRpm: number
@@ -636,6 +720,11 @@ export interface ConfigSnapshotResponse {
   collectClientFingerprint?: boolean
   // 全局模型映射：客户端模型名 → 上游模型名（缺省 = 不映射）。
   modelMapping?: Record<string, string>
+  /**
+   * 错误提示词覆盖表：key = 错误形态标识（如 quota_exhausted）；未配置的 key 用内置默认。
+   * 默认值预览待后端默认表接口（如 /api/admin/error-messages/defaults）—— TODO。
+   */
+  errorMessages?: Record<string, ErrorMessageOverride>
   configPath?: string
 }
 
@@ -657,8 +746,14 @@ export interface UpdateConfigRequest {
   selfHealMaxBackoffSecs?: number
   selfHealMaxShift?: number
   promptCacheEnabled?: boolean
+  /** 模拟缓存开关（透传池响应注入模拟 cache_read；默认关）。 */
+  mockCacheEnabled?: boolean
+  /** 模拟缓存注入比例（0..1 f64，默认 0.7）。 */
+  mockCacheReadRatio?: number
   /** 是否注入上游 output_config.effort（默认关，2026-08-11 补）。 */
   nativeThinkingEffortEnabled?: boolean
+  /** CC↔Kiro 工具名/参数映射开关（默认开；热更即时生效）。 */
+  toolCompatMapping?: boolean
   // 上游 429 吸收层
   upstreamRetryAbsorbEnabled?: boolean
   upstreamRetryAbsorbBudgetSecs?: number
@@ -689,6 +784,9 @@ export interface UpdateConfigRequest {
   encryptCredentialsAtRest?: boolean
   cooldownEnabled?: boolean
   autoDisableSuspicious?: boolean
+  autoDisableQuotaExceeded?: boolean
+  socksAutoHealth?: boolean
+  otaAutoCheck?: boolean
   cloneDefaultEnabled?: boolean
   allCoolingFastFail?: boolean
   rateLimitEnabled?: boolean
@@ -704,6 +802,8 @@ export interface UpdateConfigRequest {
   rateLimitJitterPct?: number
   /** 切档。档位只影响配置文件里没显式写的字段，已显式配置的值不会被冲掉 */
   throttleProfile?: ThrottleProfile
+  /** 切换调度模式（三按钮）。后端映射到对应 ThrottleProfile 并写入预设矩阵 */
+  schedulingMode?: SchedulingMode
   inboundThrottleEnabled?: boolean
   inboundRpmAuto?: boolean
   inboundTargetRpm?: number
@@ -743,6 +843,11 @@ export interface UpdateConfigRequest {
   collectClientFingerprint?: boolean
   // 全局模型映射（整表替换语义；传 {} = 清空全部规则）
   modelMapping?: Record<string, string>
+  /**
+   * 错误提示词覆盖表：只提交有改动的 key；每条只含改动的字段
+   * （空对象 = 清掉该 key 的配置回内置默认）。
+   */
+  errorMessages?: Record<string, ErrorMessageOverride>
 }
 
 // 更新服务端配置响应
@@ -849,6 +954,11 @@ export interface GroupStat {
   /** 写入缓存的输入 token（input_tokens 的子集） */
   cache_creation_tokens: number
   credits_used: number
+  /**
+   * 估算成本（元）：后端按 config 单价表（modelPricing）推算。**后端已下发**；
+   * 0 = 无单价表或模型不在表中（不估算）。optional 只为兼容旧后端二进制。
+   */
+  cost?: number
   avg_latency_ms: number
   /**
    * 换号次数累计（按模型/凭据看哪个维度在烧重试预算）。**后端已下发**；
@@ -872,6 +982,8 @@ export type RequestOutcome =
   | 'bad_request'
   | 'network_error'
   | 'model_unavailable'
+  | 'empty_response'
+  | 'interrupted'
   | 'other_error'
 
 // ============ 运维：存储统计 / 清理（对接 GET /storage/stats, POST /storage/cleanup） ============
@@ -969,6 +1081,8 @@ export interface ClientRpm {
 // 单条请求明细
 export interface RequestRecord {
   request_id: string
+  /** 中断字节数（断流时已收上游字节；None/0 = 正常收尾） */
+  interrupted_bytes?: number
   ts_ms: number
   credential_id: number | null
   model: string
@@ -1068,6 +1182,9 @@ export interface ThroughputSnapshot {
 export interface CooldownDetail {
   /** 冷却原因（中文描述，如「速率限制」「服务器错误」） */
   reason: string
+  /** 冷却原因稳定枚举码（rate_limited/suspicious/...，后端 CooldownReason::code()）。
+      判定与 i18n 走此码；reason 仅作展示 fallback。 */
+  code: string
   /** 剩余冷却时间（毫秒） */
   remainingMs: number
   /** 连续触发次数 */
@@ -1092,10 +1209,24 @@ export interface RateLimitInsight {
   cooldown: CooldownDetail | null
   /** 近期 429 次数（取自速率限制冷却的连续触发计数，零上游） */
   recent429: number
-  /** 中文推断文案（如「#54 冷却中（速率限制）剩22s，已触发3次」「畅通」） */
+  /** 中文推断文案（旧 UI fallback；新 UI 优先 insightCode + insightParams） */
   insightText: string
+  /** 稳定 insight 码（clear / disabled / cooldown_rate / cooldown / saturated / ...） */
+  insightCode?: string
+  /** 与 insightCode 配套的 i18n 插值参数（camelCase） */
+  insightParams?: InsightParams
   /** 真实熔断/健康快照（后端 HealthTracker）。无健康记录（从未被选过）时为 null，前端按缺省=满血处理。 */
   health?: HealthSnapshot | null
+}
+
+/** `RateLimitInsight.insightParams`：缺省字段由后端省略。 */
+export interface InsightParams {
+  id?: number
+  rpm?: number
+  rpmLimit?: number
+  secs?: number
+  triggerCount?: number
+  reasonCode?: string
 }
 
 /** 熔断器/健康只读快照（后端 HealthTracker，族级 family_key 共享）。 */

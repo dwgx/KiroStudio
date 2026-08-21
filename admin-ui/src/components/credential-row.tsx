@@ -18,6 +18,7 @@ import {
   Globe,
   Network,
   CopyPlus,
+  ClipboardCopy,
 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -43,6 +44,8 @@ import {
 } from '@/components/ui/dialog'
 import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
 import { cn, copyToClipboard, extractErrorMessage } from '@/lib/utils'
+import { cooldownReasonLabel, isRateLimitCooldown } from '@/lib/cooldown'
+import { insightLabel } from '@/lib/insight'
 import { formatAmount, formatCachedAt, formatCredits, formatLastUsed, maskProxyUrl } from '@/lib/credential-format'
 import { authShortLabel, disabledReasonLabel, subscriptionLabel } from '@/lib/i18n-labels'
 import {
@@ -50,6 +53,7 @@ import {
   listSocksNodes,
   setCredentialAllowedModels,
   PROBE_MODEL_CATALOG,
+  exportCredential,
 } from '@/api/credentials'
 import {
   useDeleteCredential,
@@ -216,6 +220,8 @@ export function CredentialRowBody({
   const [showClone, setShowClone] = useState(false)
   const [cloneCopies, setCloneCopies] = useState(1)
   const [cloneBusy, setCloneBusy] = useState(false)
+  // 点击掩码复制完整 Key：防重复点击（敏感导出端点，与设置页 copyOne 同模式）。
+  const [copyKeyBusy, setCopyKeyBusy] = useState(false)
 
   const setDisabled = useSetDisabled()
   const setEndpoint = useSetCredentialEndpoint()
@@ -248,7 +254,8 @@ export function CredentialRowBody({
 
   // 状态合成。判定顺序即优先级：禁用 > 熔断半开 > 冷却 > 健康。
   // 禁用排最前是刻意的：禁用号不参与调度，它的冷却/熔断态对用户没有决策意义。
-  const rateLimited = credential.cooldownReason === '速率限制'
+  // 速率限制判据走稳定枚举码（缺失时返回 false 走红色分支，无害降级）。
+  const rateLimited = isRateLimitCooldown(credential.cooldownCode)
   const status: RowStatus = credential.disabled
     ? 'disabled'
     : insight?.health?.halfOpen
@@ -381,6 +388,27 @@ export function CredentialRowBody({
   const refreshBalance = () => {
     queryClient.invalidateQueries({ queryKey: ['cached-balances'] })
     toast.success(t('credentialrow.toast.balanceRefreshing'))
+  }
+
+  // 点击掩码复制完整 Key：exportCredential 拿真值（与设置页 copyOne 同模式），
+  // 取 kiroApiKey 字段（后端 export 返回 camelCase KiroCredentials，只有 api_key 号有掩码）。
+  const handleCopyFullKey = async () => {
+    if (copyKeyBusy) return
+    setCopyKeyBusy(true)
+    try {
+      const obj = await exportCredential(credential.id)
+      const key = typeof obj.kiroApiKey === 'string' ? obj.kiroApiKey : ''
+      if (!key) {
+        toast.error(t('credentialcard.toast.apiKeyMissing'))
+        return
+      }
+      const ok = await copyToClipboard(key)
+      ok ? toast.success(t('credentialcard.toast.apiKeyCopied')) : toast.error(t('credentialcard.toast.apiKeyCopyFailed'))
+    } catch (err) {
+      toast.error(extractErrorMessage(err))
+    } finally {
+      setCopyKeyBusy(false)
+    }
   }
 
   const toggleDisabled = () =>
@@ -711,17 +739,17 @@ export function CredentialRowBody({
                   tone={insight.health.health < 0.6 ? 'bad' : undefined}
                 />
               )}
-              {insight?.insightText && (
+              {insight && (insight.insightCode || insight.insightText) && (
                 <DetailItem
                   label={t('credentialrow.detail.insight')}
-                  value={insight.insightText}
+                  value={insightLabel(insight, t)}
                   className="col-span-2 lg:col-span-2"
                 />
               )}
               {credential.coolingDown && credential.cooldownReason && (
                 <DetailItem
                   label={t('credentialcard.cooldown.label')}
-                  value={`${credential.cooldownReason} · ${Math.ceil((credential.cooldownRemainingMs ?? 0) / 1000)}s`}
+                  value={`${cooldownReasonLabel(credential.cooldownCode, credential.cooldownReason, t)} · ${Math.ceil((credential.cooldownRemainingMs ?? 0) / 1000)}s`}
                   tone={rateLimited ? 'warn' : 'bad'}
                 />
               )}
@@ -733,13 +761,38 @@ export function CredentialRowBody({
                 />
               )}
               {credential.maskedApiKey && (
-                <DetailItem label={t('credentialcard.info.apiKey')} value={credential.maskedApiKey} mono />
+                /* 点击掩码复制完整 Key（exportCredential 拿真值，与设置页 copyOne 同模式）。
+                   i18n: credentialcard.info.copyKeyTitle（主会话补三语） */
+                <DetailItem
+                  label={t('credentialcard.info.apiKey')}
+                  value={credential.maskedApiKey}
+                  mono
+                  onClick={handleCopyFullKey}
+                />
               )}
               {credential.hasProxy && (
                 <DetailItem
                   label={t('credentialcard.info.proxy')}
                   value={credential.proxyUrl ? maskProxyUrl(credential.proxyUrl) : t('credentialcard.info.proxyConfigured')}
                   mono
+                  action={
+                    credential.proxyUrl ? (
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="h-5 w-5 shrink-0 self-center p-0"
+                        title={t('credentialcard.info.copyProxyTitle')}
+                        aria-label={t('credentialcard.info.copyProxyTitle')}
+                        onClick={async (e) => {
+                          e.stopPropagation()
+                          const ok = await copyToClipboard(credential.proxyUrl!)
+                          ok ? toast.success(t('credentialcard.toast.proxyCopied')) : toast.error(t('credentialcard.toast.copyFailed'))
+                        }}
+                      >
+                        <ClipboardCopy className="h-3 w-3" />
+                      </Button>
+                    ) : undefined
+                  }
                 />
               )}
               {isCustomApi && credential.baseUrl && (
@@ -1054,20 +1107,27 @@ export function CredentialRowBody({
   )
 }
 
-/** 展开区的一个 label/value 对。`tone` 只用于失败类数字染色（与卡片同色）。 */
+/** 展开区的一个 label/value 对。`tone` 只用于失败类数字染色（与卡片同色）。
+ *  `onClick`：value 可点击（掩码复制入口，cursor-pointer + title 提示）。
+ *  `action`：value 后追加的操作元素（如复制按钮），需自带 self-center 对齐。 */
 function DetailItem({
   label,
   value,
   tone,
   mono,
   className,
+  onClick,
+  action,
 }: {
   label: string
   value: string
   tone?: 'bad' | 'warn'
   mono?: boolean
   className?: string
+  onClick?: () => void
+  action?: React.ReactNode
 }) {
+  const { t } = useTranslation()
   return (
     <div className={cn('flex min-w-0 items-baseline gap-1.5', className)}>
       <dt className="shrink-0 text-muted-foreground">{label}</dt>
@@ -1075,13 +1135,16 @@ function DetailItem({
         className={cn(
           'min-w-0 truncate font-medium',
           mono && 'font-mono',
+          onClick && 'cursor-pointer',
           tone === 'bad' && 'text-red-400',
           tone === 'warn' && 'text-amber-400'
         )}
-        title={value}
+        title={onClick ? t('credentialcard.info.copyKeyTitle') : value}
+        onClick={onClick}
       >
         {value}
       </dd>
+      {action}
     </div>
   )
 }

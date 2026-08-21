@@ -79,6 +79,15 @@ const MAX_OPEN_SECS: u64 = 1800; // 退避上限 30min（对齐 SuspiciousActivi
 const OPEN_GROWTH: f64 = 1.6; // 退避升级倍率（对齐 cooldown 1.6^n）
 const MIN_ADMIT_SEED: f64 = 0.02; // admit_prob_seed 下限，永留一线试探
 const IDLE_EVICT_SECS: u64 = 900; // cleanup 淘汰 15min 无活动条目
+/// 读路径刷新 `last_touch` 的最小间隔（秒）。
+///
+/// `last_touch` 只被 [`HealthTracker::cleanup`] 的空闲淘汰读取（门限
+/// `IDLE_EVICT_SECS`=900s），按本窗口限频刷新与每次一刷对淘汰语义完全等价
+/// （持续活跃的键距上次刷新永远 < 10s，离 900s 门限还差两个数量级），
+/// 却把选号读路径（`p_avail_with_load_ref`，对每个候选每轮必调）从「每候选一次写」
+/// 降为「每候选最多每 10s 一次写」。衰减时钟是独立的 `last_decay_at`，
+/// 本窗口**不碰**衰减语义（半衰期 60s 的连续增量衰减照旧每次调用都结算）。
+const LAST_TOUCH_REFRESH_SECS: u64 = 10;
 /// 惩罚衰减半衰期：每过这么久，429 惩罚减半、成功率朝 1.0 回归一半、
 /// `consecutive_429`/`open_count` 各减 1、`admit_prob_seed` 翻倍恢复。
 ///
@@ -113,7 +122,7 @@ struct HealthState {
     admit_prob_seed: f64,        // 半开起始放行概率；每次半开失败 *=0.5（收缩）
     recovery_samples: u32,       // 半开内连续成功计数，达 RECOVERY_FULL 全开
     open_count: u32,             // 累计跳闸轮数，退避 1.6^open_count
-    last_touch: Instant,         // cleanup 空闲淘汰用（**任何**读写都会刷新，含选号读 p_avail）
+    last_touch: Instant,         // cleanup 空闲淘汰用（任何读写都会刷新，读路径按 LAST_TOUCH_REFRESH_SECS 限频）
     /// 上次**惩罚衰减**的推进时刻（增量衰减基准）。
     ///
     /// ⚠️ 必须与 `last_touch` 分开，这是一个已实测的生产缺陷的根因：
@@ -236,7 +245,7 @@ impl HealthTracker {
     ///
     /// **① 饥饿自锁。** `ewma_429` 原先只在 `on_success` 里衰减、`ewma_success` 只在成功时抬升。
     /// 于是形成死锁：号吃几次 429 → `health` 跌破分档边界 → 进 T1/T2 → `health_tier` 是
-    /// 排序键第③位，低档只在高档全部饱和时才被选到 → **拿不到请求 → 没有成功 →
+    /// 排序键第④位（第③位是 prio_key），低档只在高档全部饱和时才被选到 → **拿不到请求 → 没有成功 →
     /// EWMA 永不回升 → 永久留在低档**。实测 6 号池里 4 个号进 T2 且 `rpm=0 inflight=0`
     /// 完全空转，有效容量 6→3，**全程零 429**。这是"越跑越慢"的确切机制。
     ///
@@ -408,6 +417,63 @@ impl HealthTracker {
         s.open_start = Some(now);
     }
 
+    /// 借用 `key` 查表，仅在**首次**遇到该键时才做一次 String 分配插入。
+    ///
+    /// 选号读路径对每个候选每轮都要碰健康表，键早已存在，`entry(key.to_string())`
+    /// 的每次堆分配是纯浪费（43 号池一轮选号 43 次分配）。get-then-insert 让热路径
+    /// 命中零分配、与 `entry` 行为等价（同一把 Mutex 内完成，无并发差异）。
+    fn state_mut<'a>(map: &'a mut HashMap<String, HealthState>, key: &str) -> &'a mut HealthState {
+        if map.contains_key(key) {
+            return map.get_mut(key).expect("contains_key 刚为 true");
+        }
+        map.insert(key.to_string(), HealthState::default());
+        map.get_mut(key).expect("刚插入必有")
+    }
+
+    /// 在已持有 `states` 锁、已取到 `&mut HealthState` 的前提下结算 p_avail。
+    ///
+    /// [`Self::p_avail_with_load_ref`] 与 [`Self::p_avail_batch`] 共用，保证逐个读与
+    /// 批量读对同一行的 tick / 衰减 / last_touch / 公式逐字节同构。
+    fn p_avail_from_state(
+        s: &mut HealthState,
+        now: Instant,
+        rpm: u32,
+        inflight: u32,
+        rpm_limit: u32,
+        load_ref: f64,
+        disable_429_weight: bool,
+    ) -> f64 {
+        Self::tick_circuit(s, now);
+        Self::decay_penalties(s, now);
+        // 限频刷新：`last_touch` 只喂 cleanup 的空闲淘汰（900s 门限），按
+        // LAST_TOUCH_REFRESH_SECS 窗口刷新语义等价，读路径从「每候选一次写」
+        // 降为「最多每 10s 一次写」。衰减照旧每次调用结算（last_decay_at 独立）。
+        if now.saturating_duration_since(s.last_touch)
+            >= Duration::from_secs(LAST_TOUCH_REFRESH_SECS)
+        {
+            s.last_touch = now;
+        }
+        let gate = match s.circuit {
+            Circuit::Closed => 1.0,
+            Circuit::Open { .. } => 0.0,
+            Circuit::HalfOpen { admit_prob } => admit_prob,
+        };
+        // 429 降权:默认生效(health 含 EWMA-429 惩罚);运维关闭开关后跳过惩罚(只用 ewma_success)。
+        let health = if disable_429_weight {
+            s.ewma_success.clamp(0.0, 1.0)
+        } else {
+            (s.ewma_success * (1.0 - HEALTH_429_WEIGHT * s.ewma_429)).clamp(0.0, 1.0)
+        };
+        let rpm_pressure = if rpm_limit > 0 {
+            (rpm as f64 / rpm_limit as f64).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        // 归一分母由调用方给出（自适应，见 adaptive_load_ref）。防御性下限避免除零/负数误配。
+        let load = (inflight as f64 / load_ref.max(1.0)).clamp(0.0, 1.0);
+        (gate * health * (1.0 - rpm_pressure) * (1.0 - LOAD_PENALTY * load)).clamp(0.0, 1.0)
+    }
+
     /// 可用概率 p_avail ∈ [0,1]：选号权重。读路径也惰性推进。
     ///
     /// 用固定的 [`LOAD_REF`] 作 inflight 归一分母——**仅适用于小池/测试**。
@@ -431,29 +497,50 @@ impl HealthTracker {
     ) -> f64 {
         let now = Instant::now();
         let mut map = self.states.lock();
-        let s = map.entry(key.to_string()).or_default();
-        Self::tick_circuit(s, now);
-        Self::decay_penalties(s, now);
-        s.last_touch = now;
-        let gate = match s.circuit {
-            Circuit::Closed => 1.0,
-            Circuit::Open { .. } => 0.0,
-            Circuit::HalfOpen { admit_prob } => admit_prob,
-        };
-        // 429 降权:默认生效(health 含 EWMA-429 惩罚);运维关闭开关后跳过惩罚(只用 ewma_success)。
-        let health = if self.disable_429_weight.load(Ordering::Relaxed) {
-            s.ewma_success.clamp(0.0, 1.0)
-        } else {
-            (s.ewma_success * (1.0 - HEALTH_429_WEIGHT * s.ewma_429)).clamp(0.0, 1.0)
-        };
-        let rpm_pressure = if rpm_limit > 0 {
-            (rpm as f64 / rpm_limit as f64).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        // 归一分母由调用方给出（自适应，见 adaptive_load_ref）。防御性下限避免除零/负数误配。
-        let load = (inflight as f64 / load_ref.max(1.0)).clamp(0.0, 1.0);
-        (gate * health * (1.0 - rpm_pressure) * (1.0 - LOAD_PENALTY * load)).clamp(0.0, 1.0)
+        let disable_429_weight = self.disable_429_weight.load(Ordering::Relaxed);
+        let s = Self::state_mut(&mut map, key);
+        Self::p_avail_from_state(
+            s,
+            now,
+            rpm,
+            inflight,
+            rpm_limit,
+            load_ref,
+            disable_429_weight,
+        )
+    }
+
+    /// 一次加锁批量读取多个候选的 p_avail（选号热路径专用，与 `RpmTracker::counts_for` 同款）。
+    ///
+    /// `items` 每行 `(credential_id, family_key, rpm, inflight, rpm_limit)`。rpm / inflight /
+    /// rpm_limit 是**凭据级**（同族多号可不同），family_key 才是健康表键。
+    ///
+    /// 对每一行的 tick / 衰减 / last_touch / 公式与 [`Self::p_avail_with_load_ref`] 同构；
+    /// 同 `family_key` 出现两次时按输入顺序各结算一次（与逐个调相同，同轮 dt≈0 幂等）。
+    /// 一轮选号共用一个 `now` 与一个 `load_ref`，锁获取 O(n) → O(1)。
+    pub fn p_avail_batch(
+        &self,
+        items: &[(u64, &str, u32, u32, u32)],
+        load_ref: f64,
+    ) -> HashMap<u64, f64> {
+        let now = Instant::now();
+        let mut map = self.states.lock();
+        let disable_429_weight = self.disable_429_weight.load(Ordering::Relaxed);
+        let mut out = HashMap::with_capacity(items.len());
+        for &(id, key, rpm, inflight, rpm_limit) in items {
+            let s = Self::state_mut(&mut map, key);
+            let p = Self::p_avail_from_state(
+                s,
+                now,
+                rpm,
+                inflight,
+                rpm_limit,
+                load_ref,
+                disable_429_weight,
+            );
+            out.insert(id, p);
+        }
+        out
     }
 
     /// 只读快照（概览页/hover）。先推进到期的 Open→HalfOpen，保证展示状态与热路径一致。
@@ -515,6 +602,65 @@ mod tests {
     fn test_default_state_is_fully_available() {
         let h = ht();
         assert!((h.p_avail("k", 0, 0, 0) - 1.0).abs() < 1e-9);
+    }
+
+    /// 批量 p_avail 必须与逐个 `p_avail_with_load_ref` 同构（含同族不同 rpm 的两号）。
+    ///
+    /// 两份独立 tracker 做相同播种：批量读不得把同 `family_key` 收成一行
+    /// （rpm/inflight 是凭据级；收成一行会让两号拿到同一 p，选号 12 键翻盘）。
+    #[test]
+    fn test_p_avail_batch_matches_one_by_one() {
+        let load_ref = 8.0;
+        let items: [(u64, &str, u32, u32, u32); 3] = [
+            (1, "hot", 15, 2, 30),
+            (2, "ok", 0, 0, 30),
+            (3, "hot", 0, 0, 30),
+        ];
+
+        let batch_tracker = ht();
+        for _ in 0..2 {
+            batch_tracker.on_429("hot");
+        }
+        batch_tracker.on_success("ok");
+        let batch = batch_tracker.p_avail_batch(&items, load_ref);
+
+        let one = ht();
+        for _ in 0..2 {
+            one.on_429("hot");
+        }
+        one.on_success("ok");
+        let o1 = one.p_avail_with_load_ref("hot", 15, 2, 30, load_ref);
+        let o2 = one.p_avail_with_load_ref("ok", 0, 0, 30, load_ref);
+        let o3 = one.p_avail_with_load_ref("hot", 0, 0, 30, load_ref);
+
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
+        assert!(
+            close(batch[&1], o1) && close(batch[&2], o2) && close(batch[&3], o3),
+            "batch={:?} one=[{o1}, {o2}, {o3}]",
+            (batch[&1], batch[&2], batch[&3])
+        );
+        assert!(
+            batch[&1] < batch[&3],
+            "同族不同 rpm：#1 rpm_pressure 更大，p 必须更小（不得按族键去重）"
+        );
+        assert_eq!(batch.len(), 3);
+        assert!(ht().p_avail_batch(&[], load_ref).is_empty());
+    }
+
+    /// 空表默认态：批量读必须命中闭式 p_avail（gate=health=1）。
+    #[test]
+    fn test_p_avail_batch_default_closed_form() {
+        let h = ht();
+        let load_ref = 8.0;
+        let batch = h.p_avail_batch(&[(7, "fresh", 15, 4, 30)], load_ref);
+        let rpm_p = 15.0 / 30.0;
+        let load = (4.0 / load_ref).clamp(0.0, 1.0);
+        let expect = (1.0 - rpm_p) * (1.0 - 0.5 * load);
+        assert!(
+            (batch[&7] - expect).abs() < 1e-9,
+            "p={} expect={expect}",
+            batch[&7]
+        );
     }
 
     #[test]

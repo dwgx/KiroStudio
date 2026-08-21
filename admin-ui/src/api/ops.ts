@@ -66,6 +66,8 @@ export interface UpdateCheckResult {
   available_versions: string[]
   commits: CommitSnapshot[]
   error: string | null
+  /** 容器部署标记：容器内为 true，OTA 自更新不可用（需走 deploy 重建镜像）。旧后端不下发该字段。 */
+  container_deployment?: boolean
 }
 
 export interface UpdatePerformResult {
@@ -202,6 +204,23 @@ export interface EndpointHealthResponse {
 
 export async function getEndpointHealth(): Promise<EndpointHealthResponse> {
   const { data } = await api.get<EndpointHealthResponse>('/endpoint-health')
+  return data
+}
+
+// ============ 诊断快照（GET /diagnostics/snapshot，纯运维观测）============
+// 后端 DiagnosticsSnapshotResponse 还含 version/credentials/poolHealth/config 大块，
+// 前端只消费进程级字段（uptime/rss），故这里只声明用到的三个。
+export interface DiagnosticsSnapshotResponse {
+  /** 自进程启动以来的毫秒数（与 /recovery-metrics 同源） */
+  uptimeMs: number
+  /** 进程常驻内存字节数；非 Linux 平台为 null */
+  rssBytes: number | null
+  /** 快照生成时刻（Unix 秒） */
+  generatedAt: number
+}
+
+export async function getDiagnosticsSnapshot(): Promise<DiagnosticsSnapshotResponse> {
+  const { data } = await api.get<DiagnosticsSnapshotResponse>('/diagnostics/snapshot')
   return data
 }
 

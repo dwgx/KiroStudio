@@ -1,6 +1,11 @@
 //! 公共工具模块
 
+pub mod alerting;
 pub mod auth;
+/// 鉴权密钥热更单元（apiKey/adminApiKey 的进程级 ArcSwap，单一真相源）
+pub mod auth_keys;
+/// Anthropic 形态错误信封（security 与协议层共用，避免 common → anthropic）。
+pub(crate) mod error_response;
 pub mod fs_atomic;
 pub mod health_marker;
 pub mod http_read;

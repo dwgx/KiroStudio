@@ -10,6 +10,7 @@
 //! 客户端 IP 判定见 [`client_ip`]，支持在可信反代后读取 `X-Forwarded-For`。
 
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::{
@@ -24,7 +25,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use crate::anthropic::types::ErrorResponse;
+use crate::common::error_response::ErrorResponse;
 
 // ============ CIDR 白名单 ============
 
@@ -190,6 +191,9 @@ impl IpBlocklist {
 
 // ============ 入口每-IP 限流（固定窗口）============
 
+/// 入口全表清理的抽样间隔：每 [`CHECK_CLEANUP_INTERVAL`] 次 check 才 retain 一次。
+const CHECK_CLEANUP_INTERVAL: u32 = 256;
+
 /// 每-IP 固定窗口限流器：每 60s 窗口内计数，超 `max_per_min` 拒绝。
 ///
 /// 固定窗口实现简单、内存可控；窗口切换时计数归零。相比滑窗略宽松，
@@ -198,6 +202,9 @@ pub struct IngressRateLimiter {
     max_per_min: u32,
     /// ip -> (窗口起点, 该窗口内已计数)
     windows: Mutex<HashMap<IpAddr, (Instant, u32)>>,
+    /// 距上次全表清理的 check 次数（抽样清理：每 N 次 check 才 retain 一次，
+    /// 避免每请求 O(表长) 扫描 —— 见 `check`）。
+    checks_since_cleanup: Mutex<u32>,
 }
 
 impl IngressRateLimiter {
@@ -205,6 +212,7 @@ impl IngressRateLimiter {
         IngressRateLimiter {
             max_per_min,
             windows: Mutex::new(HashMap::new()),
+            checks_since_cleanup: Mutex::new(0),
         }
     }
 
@@ -222,8 +230,19 @@ impl IngressRateLimiter {
         let now = Instant::now();
         let mut map = self.windows.lock();
 
-        // 惰性清理：窗口整体过期的条目顺手移除，避免 map 无限增长
-        map.retain(|_, (start, _)| now.duration_since(*start) < window);
+        // 🔴 抽样清理（2026-08-15）：改前每请求全表 `retain` 扫描 —— 活跃 IP 数
+        // 多时每次 check 都是 O(表长)，入口限流热路径被清理成本拖慢。改为每
+        // CHECK_CLEANUP_INTERVAL 次 check 清一次：过期条目最多滞留一个清理间隔，
+        // 表长上界 = 每窗口活跃 IP 数 + 一个间隔内的新 IP，限流判定语义不变
+        // （窗口判定是逐条目的，清理只影响内存占用不影响计数）。
+        {
+            let mut checks = self.checks_since_cleanup.lock();
+            *checks += 1;
+            if *checks >= CHECK_CLEANUP_INTERVAL {
+                *checks = 0;
+                map.retain(|_, (start, _)| now.duration_since(*start) < window);
+            }
+        }
 
         let entry = map.entry(ip).or_insert((now, 0));
         if now.duration_since(entry.0) >= window {
@@ -248,6 +267,8 @@ impl IngressRateLimiter {
 /// - 否则（默认）**自动判定**：TCP 对端是私网/环回地址（=本机 openresty/nginx 反代）时，
 ///   同样信任 XFF 最右段（A2 修复：反代后中间件白名单/限流不再只看到反代内网 IP）；
 ///   对端是公网地址（=客户端直连本服务）时，直接用对端 IP、忽略可被伪造的 XFF。
+/// - 自动判定受 `trustPrivatePeerAsProxy`（进程级镜像，默认 true）门控：LAN 直连部署
+///   置 false 后私网对端不再当反代，XFF 被忽略（防内网客户端伪造 IP 绕限流/黑名单）。
 pub fn client_ip(
     req: &Request<Body>,
     peer: Option<SocketAddr>,
@@ -276,10 +297,29 @@ pub fn client_ip_from_headers(
     peer: Option<SocketAddr>,
     trust_forwarded: bool,
 ) -> Option<IpAddr> {
+    client_ip_from_headers_with(
+        headers,
+        peer,
+        trust_forwarded,
+        trust_private_peer_as_proxy(),
+    )
+}
+
+/// [`client_ip_from_headers`] 的可测版本：`trust_private` 覆盖进程级镜像，避免并行测试改全局。
+fn client_ip_from_headers_with(
+    headers: &axum::http::HeaderMap,
+    peer: Option<SocketAddr>,
+    trust_forwarded: bool,
+    trust_private: bool,
+) -> Option<IpAddr> {
     // 是否应信任转发头:显式开启,或对端是私网/环回(说明位于本机可信反代之后)。
     // 后者是 A2 修复:线上 openresty 反代到 8990,对端恒为 127.0.0.1/内网,默认 trust=false
     // 会让中间件白名单/入口限流全部按同一个反代 IP 工作(失效或误伤)。对端私网即视为可信反代。
-    let trust = trust_forwarded || peer.map(|p| is_trusted_proxy_peer(p.ip())).unwrap_or(false);
+    // `trust_private=false`（LAN 直连）关掉自动判定，只认 `trust_forwarded`。
+    let trust = trust_forwarded
+        || peer
+            .map(|p| is_trusted_proxy_peer_with(p.ip(), trust_private))
+            .unwrap_or(false);
     if trust {
         if let Some(xff) = headers.get("x-forwarded-for") {
             if let Ok(s) = xff.to_str() {
@@ -305,9 +345,31 @@ pub fn client_ip_from_headers(
     peer.map(|p| p.ip())
 }
 
+/// 进程级镜像：是否把私网/环回对端自动当成可信反代（默认 true = A2 现状，零回归）。
+/// main 启动期写入；改 `trustPrivatePeerAsProxy` 需重启（与 `trust_forwarded_header` 同款）。
+static TRUST_PRIVATE_PEER_AS_PROXY: AtomicBool = AtomicBool::new(true);
+
+/// 启动期写入进程级镜像。热路径只读。
+pub fn set_trust_private_peer_as_proxy(enabled: bool) {
+    TRUST_PRIVATE_PEER_AS_PROXY.store(enabled, Ordering::Relaxed);
+}
+
+fn trust_private_peer_as_proxy() -> bool {
+    TRUST_PRIVATE_PEER_AS_PROXY.load(Ordering::Relaxed)
+}
+
 /// 对端地址是否为「可信本机反代」:环回(127.0.0.1/::1)或私网(RFC1918 / fc00::/7 / 链路本地)。
 /// 用于 A2 自动判定——只有当请求来自本机/内网反代时才信任其追加的 XFF 最右段。
+/// 受 `trustPrivatePeerAsProxy` 门控（默认 true）；LAN 直连部署应关闭。
 pub fn is_trusted_proxy_peer(ip: IpAddr) -> bool {
+    is_trusted_proxy_peer_with(ip, trust_private_peer_as_proxy())
+}
+
+/// [`is_trusted_proxy_peer`] 的可测版本。`trust_private=false` 时任何对端都不自动当反代。
+fn is_trusted_proxy_peer_with(ip: IpAddr, trust_private: bool) -> bool {
+    if !trust_private {
+        return false;
+    }
     match ip {
         IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
         IpAddr::V6(v6) => {
@@ -370,6 +432,11 @@ pub async fn security_middleware(
         if let Some(ip) = ip {
             if state.blocklist.blocks(ip) {
                 tracing::debug!("入口 IP 黑名单拒绝: {:?}", ip);
+                // TODO(主线协调)：错误消息可配置化 D2 —— handlers.rs security_block_response
+                // 的同语义构造点已接 resolve_msg("permission_denied")（默认 403 +
+                // 「来源 IP 已被封禁」）；本中间件构造点尚未接入，需与 handlers 侧共用
+                // 同一 key/默认值（防双入口文案漂移）。接线时改走
+                // crate::anthropic::handlers::resolve_msg。
                 return (
                     StatusCode::FORBIDDEN,
                     Json(ErrorResponse::new("permission_error", "来源 IP 已被封禁")),
@@ -555,6 +622,32 @@ mod tests {
         assert!(rl.check(ip2));
     }
 
+    /// MINOR 10 守卫：抽样清理不破坏计数/限流语义 —— 超过清理间隔的高频 check
+    /// 必须与逐次判定行为一致（放行的继续放行、超限的继续拒绝）。
+    #[test]
+    fn test_rate_limiter_sampled_cleanup_preserves_counting() {
+        let rl = IngressRateLimiter::new(10_000);
+        let ip: IpAddr = "9.9.9.9".parse().unwrap();
+        // 超过清理间隔（256）的次数：抽样清理触发多轮，放行语义不变。
+        for _ in 0..(CHECK_CLEANUP_INTERVAL + 10) {
+            assert!(rl.check(ip), "额度内高频 check 必须全部放行");
+        }
+        // 多 IP 交错也走清理路径。
+        let ip2: IpAddr = "8.8.8.8".parse().unwrap();
+        for i in 0..CHECK_CLEANUP_INTERVAL {
+            assert!(rl.check(if i % 2 == 0 { ip } else { ip2 }));
+        }
+        assert!(rl.check(ip2), "抽样清理后判定不受影响");
+
+        // 超限语义在抽样清理下依然成立。
+        let strict = IngressRateLimiter::new(3);
+        let ip3: IpAddr = "7.7.7.7".parse().unwrap();
+        for i in 0..CHECK_CLEANUP_INTERVAL {
+            let expected = i < 3;
+            assert_eq!(strict.check(ip3), expected, "第 {} 次判定应 {}", i + 1, expected);
+        }
+    }
+
     #[test]
     fn test_security_state_none_when_all_disabled() {
         assert!(SecurityState::from_config(&[], &[], 0, false).is_none());
@@ -638,6 +731,60 @@ mod tests {
             client_ip(&req3, Some(public_peer), false),
             Some("198.51.100.22".parse().unwrap()),
             "公网直连应忽略 XFF 用对端 IP(防直连伪造)"
+        );
+    }
+
+    /// P1-5：`trustPrivatePeerAsProxy` 两态。
+    ///
+    /// true（默认/A2）：LAN/环回对端当反代，采信 XFF 最右。
+    /// false（LAN 直连）：私网对端不信任，忽略可伪造 XFF，用对端 IP。
+    /// 显式 `trust_forwarded=true` 仍采信 XFF（不受本开关影响）。
+    #[test]
+    fn test_trust_private_peer_as_proxy_switch_both_states() {
+        use axum::body::Body;
+        use axum::http::Request;
+
+        let req = Request::builder()
+            .header("x-forwarded-for", "8.8.8.8")
+            .body(Body::empty())
+            .unwrap();
+        let lan_peer: SocketAddr = "192.168.1.50:5000".parse().unwrap();
+        let loop_peer: SocketAddr = "127.0.0.1:8990".parse().unwrap();
+        let spoofed: IpAddr = "8.8.8.8".parse().unwrap();
+        let lan_ip: IpAddr = "192.168.1.50".parse().unwrap();
+
+        assert!(
+            is_trusted_proxy_peer_with(lan_ip, true),
+            "默认态：RFC1918 对端是可信反代"
+        );
+        assert!(
+            !is_trusted_proxy_peer_with(lan_ip, false),
+            "关闭态：私网对端不得当反代"
+        );
+        assert!(
+            !is_trusted_proxy_peer_with("127.0.0.1".parse().unwrap(), false),
+            "关闭态：环回也不自动当反代"
+        );
+
+        assert_eq!(
+            client_ip_from_headers_with(req.headers(), Some(lan_peer), false, true),
+            Some(spoofed),
+            "true：LAN 对端采信 XFF 最右"
+        );
+        assert_eq!(
+            client_ip_from_headers_with(req.headers(), Some(loop_peer), false, true),
+            Some(spoofed),
+            "true：环回对端采信 XFF 最右（A2）"
+        );
+        assert_eq!(
+            client_ip_from_headers_with(req.headers(), Some(lan_peer), false, false),
+            Some(lan_ip),
+            "false：LAN 直连忽略 XFF，用对端（防伪造绕限流）"
+        );
+        assert_eq!(
+            client_ip_from_headers_with(req.headers(), Some(lan_peer), true, false),
+            Some(spoofed),
+            "false + 显式 trust_forwarded：仍采信 XFF"
         );
     }
 }

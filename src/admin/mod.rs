@@ -25,12 +25,16 @@ mod router;
 mod service;
 mod social_login;
 pub mod types;
-mod update;
+// pub(crate)：main.rs 的后台 OTA 自动检查（update::spawn_auto_check）需要跨模块调用。
+pub(crate) mod update;
 mod usage_handlers;
 
 pub use middleware::AdminState;
 pub use router::{create_admin_router, create_import_alias_router};
 pub use service::AdminService;
+// pub(crate)：main.rs 启动播种 set_error_messages 前校验 error_messages 表
+// （M1 启动加载校验：非法表告警 + 降级为空表，不阻塞启动）。
+pub(crate) use service::validate_error_messages;
 // Windows 系统托盘「重启服务」复用面板一键重启的自重启逻辑（同源）。
 #[cfg(windows)]
 pub(crate) use service::spawn_windows_relaunch_process;

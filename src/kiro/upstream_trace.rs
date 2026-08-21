@@ -420,16 +420,23 @@ pub fn init(path: impl AsRef<Path>, max_bytes: u64, enabled: bool) {
     }
 }
 
-/// 按当前配置同步开关与管道（幂等，热路径可调）。
+/// 按当前配置同步开关与管道（幂等，**当前只在启动期调用一次**）。
 ///
-/// ## 为什么是这个形态，而不是在 `main.rs` 装配
+/// ## 接线现状（2026-08-15 对齐）
 ///
-/// 本轮的文件独占约束把 `main.rs` 划给了别人（本仓的并发改同一文件是历史事故的**全部**
-/// 来源）。而它同时也是更好的设计：开关随 `Config` 热重载生效，无需重启 ——
-/// `main.rs` 里一次性的 `init` 做不到这个（TIER1 换的是 ArcSwap 里的 Config，
-/// 不会回头去调 `init`）。
+/// `main.rs` 启动装配时调用一次，之后**没有**热更入口：三个配置字段
+/// （`upstream_trace_enabled` / `upstream_trace_path` / `upstream_trace_max_bytes`）
+/// 不进 `UpdateConfigRequest`，改 `config.json` 后须重启生效（与
+/// `trust_forwarded_header` 同款「启动期一次性读取」范式）。函数形态刻意保持
+/// 幂等 + 可重复调：将来若把字段接进配置热重载（TIER1 ArcSwap 镜像），
+/// 热路径上每轮调用即可就地生效，无需改本函数。
 ///
-/// 代价是它在热路径上被调用。开销做了两道限：
+/// ## 为什么做成可热调形态而不是只有 init
+///
+/// 幂等快路径让「无热更入口」时也零额外成本，且把「将来接热更」的路留好：
+/// 本函数自带 `enabled` 快照比对，状态没变直接返回 —— 不需要调用方去查重。
+///
+/// 代价是它在（假想的）热路径上被调用。开销做了两道限：
 ///   1. `enabled=false`（生产常态）时只做一次 `Relaxed` load + 一次 store 判等，
 ///      **不碰 `OnceLock`、不建线程、不 clone 字符串**。
 ///   2. `enabled=true` 时管道只在首次真正建起来（`ONCE_STARTED` 的 CAS 保证），

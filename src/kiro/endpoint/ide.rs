@@ -84,9 +84,13 @@ impl IdeEndpoint {
     }
 
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
+        // 版本段走 version_mask::effective：后台拉到官方稳定版就用官方最新，
+        // 拉不到（或 ua_version_fetch 关）静默降级回 config.kiro_version ——
+        // 与 kiro-rs 参考仓的接线点一一对应。
         format!(
             "aws-sdk-js/1.0.34 KiroIDE-{}-{}",
-            ctx.config.kiro_version, ctx.machine_id
+            crate::kiro::version_mask::effective(&ctx.config.kiro_version),
+            ctx.machine_id
         )
     }
 
@@ -95,7 +99,7 @@ impl IdeEndpoint {
             "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
             ctx.config.system_version,
             ctx.config.node_version,
-            ctx.config.kiro_version,
+            crate::kiro::version_mask::effective(&ctx.config.kiro_version),
             ctx.machine_id
         )
     }

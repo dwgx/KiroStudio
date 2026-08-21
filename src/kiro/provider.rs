@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 use crate::http_client::{ProxyConfig, build_streaming_client};
-use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
+use crate::kiro::cooldown::CooldownReason;
+use crate::kiro::endpoint::{ENDPOINT_FALLBACK_ORDER, KiroEndpoint, RequestContext};
 use crate::kiro::endpoint_health::EndpointHealth;
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
@@ -20,87 +21,14 @@ use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
-/// 每个凭据的最大重试次数
-const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
+#[path = "retry_budget.rs"]
+mod retry_budget;
+pub use retry_budget::SharedRetryBudget;
+use retry_budget::{round_retry_quota, compute_max_retries, ABSOLUTE_MAX_TOTAL_RETRIES};
 
-/// 小号池阈值：号池 <= 此值时，每号重试次数降为 1（见 [`compute_max_retries`]）。
-/// 小池下重试只会反复砸同几个号，被限流时多打几次纯属加重冷却，不如各摸一次即透传。
-const SMALL_POOL_THRESHOLD: usize = 3;
-
-/// 总重试次数硬上限 —— 与 kiro.rs 对齐（4 次）。
-///
-/// 依据（最初定 12 时的推算；后 64→12→4 逐步收紧）：17 份分身共享 3 个上游账号，
-/// 摸 12 个并发分身 = 对同一账号连打 12 次，正是风控要抓的突发特征。高峰期多账号
-/// 同时触顶时，过多重试会在账号间连环撞墙、放大限流；被限时尽早返回而非耗尽配额。
-/// 配合 429 专用长退避（见 `retry_delay_throttle`），尽快把错误交还给客户端。
-///
-/// ⭐ 这个上限是「**每客户端请求**」，开启吸收层后也不变 —— 由 [`round_retry_quota`] 保证。
-///
-/// 曾经不是：`compute_max_retries` 在 `'absorb: loop` **之外**只算一次，而
-/// `for attempt in 0..max_retries` 每个吸收轮都重跑一遍 ⇒ 每轮各拿一份完整 4 ⇒
-/// `upstreamRetryAbsorbMaxRounds=3` 时一条客户端请求最坏 (1+3)×4 = **16 次**上游调用、
-/// 同一出口 IP，正是把上限压到 4 想压住的突发特征被从另一头放回来。
-///
-/// 现在每轮的实际配额是 `min(基础配额, 本上限 − 跨轮已用)`，所以无论 `max_rounds`
-/// 填多大，单条客户端请求打向上游的总次数恒 ≤ 本值。守卫见
-/// `total_upstream_attempts_are_capped_per_request_not_per_round`。
-const ABSOLUTE_MAX_TOTAL_RETRIES: usize = 4;
-
-/// 每客户端请求的上游调用**共享预算**（2026-08-11 方案 A，RPM 放大治本）。
-///
-/// # 为什么必须有
-///
-/// `ABSOLUTE_MAX_TOTAL_RETRIES` 的「每请求」语义此前只约束**单次** `call_api_with_retry`
-/// 调用内：websearch 回灌**每一轮**（上限 5 轮）都重新走一遍完整 failover、压缩重试
-/// 每一轮同理、MCP 调用（`call_mcp_with_retry`，WebSearch 的搜索）与透传 failover
-/// 各自独立拿配额——一次客户端请求最坏可打 20+ 次上游。外部 30-50 RPM 因此放大成
-/// 500-1000+ 上游 RPM（用户实测观测），端点选错时每轮都失败、每轮都换号重试，放大
-/// 成倍。
-///
-/// # 语义
-///
-/// handler 层**每客户端请求创建一个**，沿整条调用链传递（主路径 failover / 压缩重试轮 /
-/// websearch 回灌轮含 MCP / 透传 failover 全部从同一预算扣）。预算耗尽后各层
-/// `round_retry_quota` 返回 0、failover 直接停止，错误上抛给客户端自己退避。
-/// 无论嵌套多少层，每请求上游调用恒 ≤ `ABSOLUTE_MAX_TOTAL_RETRIES`。
-///
-/// `remaining` 用 Mutex：同一请求内各层可能在并发任务中执行（如 websearch 轮次），
-/// 但任一时刻只有一层在扣（各层是串行 await 链），锁无竞争。
-#[derive(Debug)]
-pub struct SharedRetryBudget {
-    remaining: std::sync::Mutex<u32>,
-}
-
-impl SharedRetryBudget {
-    pub fn new() -> Self {
-        Self {
-            remaining: std::sync::Mutex::new(ABSOLUTE_MAX_TOTAL_RETRIES as u32),
-        }
-    }
-
-    /// 当前剩余额度（配额计算输入：每轮 `min(base, remaining)`）。
-    pub fn remaining(&self) -> u32 {
-        *self.remaining.lock().unwrap()
-    }
-
-    /// 已用量（`round_retry_quota(base, attempts_before)` 的实参语义是「已完成的尝试次数」，
-    /// 不是剩余量——传剩余会把语义反转：耗尽时 remaining=0 被当成「还没用」而拿满配额）。
-    pub fn used(&self) -> u32 {
-        (ABSOLUTE_MAX_TOTAL_RETRIES as u32).saturating_sub(self.remaining())
-    }
-
-    /// 一次真实上游调用后扣减（无论成败——打了就是打了）。
-    pub fn consume(&self, n: u32) {
-        let mut r = self.remaining.lock().unwrap();
-        *r = r.saturating_sub(n);
-    }
-}
-
-impl Default for SharedRetryBudget {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+#[path = "absorb_policy.rs"]
+mod absorb_policy;
+use absorb_policy::{AbsorbPolicy, should_start_another_round};
 
 /// 🔴 **透传（custom_api）路径单请求的最大换号次数**。
 ///
@@ -146,6 +74,57 @@ const PRESSURE_WINDOW_SECS: u64 = 60;
 /// 大请求的排队+响应，又不至于长到能扫冷全池。
 const MAX_REQUEST_RETRY_BUDGET_SECS: u64 = 45;
 
+/// 解析上游 `Retry-After` 头：整数秒，或 RFC 7231 HTTP-date（IMF-fixdate）。
+/// HTTP-date 相对现在的剩余秒数；已过期 → 0。解析失败 → None。
+pub(crate) fn parse_retry_after_header_value(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Ok(n) = s.parse::<u64>() {
+        return Some(n);
+    }
+    let dt = chrono::DateTime::parse_from_rfc2822(s).ok()?;
+    let secs = dt
+        .with_timezone(&chrono::Utc)
+        .signed_duration_since(chrono::Utc::now())
+        .num_seconds();
+    Some(secs.max(0) as u64)
+}
+
+/// MCP 路径（WebSearch 等工具调用）流式 client 的 read_timeout（空闲间隔秒）。
+///
+/// 单一源头：`client_for` 构造 MCP client 与 MCP 墙钟推导都从这里取，
+/// 改任一个另一个自动跟随（透传墙钟同款范式，见 `try_custom_api_passthrough`
+/// 里 `FIRST_BYTE_TIMEOUT_SECS` 的取舍注释 —— 「改了一个忘了另一个」已踩过）。
+const MCP_CLIENT_READ_TIMEOUT_SECS: u64 = 720;
+
+/// MCP 单请求重试的墙钟预算（秒），**不能复用主路径 45s**。
+///
+/// 与透传墙钟（`PASSTHROUGH_WALL_SECS`）同形教训：MCP 用 720s read_timeout 的
+/// 流式 client，单次 send() 可**合法**超过 45s（connect 10s + 慢响应）。45s 墙钟下
+/// 「首跳 60s 失败 ⇒ elapsed 已过预算 ⇒ 第二个号一次都不会试」—— 换号能力被静默
+/// 废掉，而"多号互为备份"正是 failover 循环存在的理由。所以墙钟必须容纳
+/// 「至少一次完整的单次尝试 + 一次换号后的再次尝试」：取 read_timeout × 2 + 30s
+/// 余量（与透传 `FIRST_BYTE_TIMEOUT_SECS * 2 + 30` 同构）。
+///
+/// ⚠️ 墙钟这么宽不会失控：本循环的实际约束是次数闸 —— max_retries 被共享预算
+/// 剩余（`budget.remaining()`）夹住，墙钟只是「次数闸失效时」的兜底。
+const MCP_WALL_SECS: u64 = MCP_CLIENT_READ_TIMEOUT_SECS * 2 + 30;
+
+/// `call_mcp_with_retry` 因「选不到号」失败时给错误打的标记（`context` 前缀）。
+///
+/// `call_mcp` 入口据此识别「无号池」错误并触发 [`Self::call_mcp_direct`] 直连兜底，
+/// 返回给上层前剥掉标记 —— 客户端只见原错误，不见内部标记。与
+/// `shared_budget_exhausted=1`（handlers 层据此渲染 503）同款「错误串带内部标记」
+/// 模式。
+const MCP_POOL_UNAVAILABLE_MARKER: &str = "mcp_pool_unavailable=1";
+
+/// MCP「无号直连」总开关（默认开，见 [`Self::call_mcp_direct`] 的文档）。
+///
+/// 进程级 AtomicBool 而非配置项：这是「上游是否接受无 ARN MCP 调用」的**实测前
+/// 开关**——上线后若发现上游对直连形态拒绝（403/400），关掉即整体退回旧行为，
+/// 不用重新发布。测试可关闭验证降级路径。
+pub(crate) static MCP_DIRECT_BYPASS_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
 /// 端点桶（同一 host 的限流桶）被 429 封禁的时长。对齐 kiro2cc `BUCKET_THROTTLE_DURATION`。
 ///
 /// 桶 = (credential_id, endpoint_name)。同凭据另一端点（另一 host = 上游另一限流桶）不受影响，
@@ -153,319 +132,27 @@ const MAX_REQUEST_RETRY_BUDGET_SECS: u64 = 45;
 /// 只读不清理，键数 = 号数 × 端点数，无无界增长风险）。
 const ENDPOINT_BUCKET_THROTTLE: Duration = Duration::from_secs(30);
 
-/// 吸收层一轮最坏「能跑出结果」的时长下限。
+/// 死端点负缓存 TTL（5 分钟）。连接层失败通常表示 DNS 不存在（如 codewhisperer.eu-central-1）
+/// 或 host 路由黑洞，但配置/网络可能临时修复，过期后自动重试。
 ///
-/// 取值等于 token_manager 的 `MAX_TRANSIENT_WAIT_SECS`（20s）而非另造一个数字：全池只是临时
-/// 冷却时 `acquire_context` 最多在网关内等 20s 才 bail，因此**剩余预算不足 20s 的一轮，结构上
-/// 只可能在 transient wait 里烧完再返回同一个 429** —— 白打一轮上游、客户端白等。
+/// 2026-08-16 从 1800s 收紧到 300s（m1）：一次瞬时抖动让健康端点 30 分钟零流量
+/// 的代价太大（恢复探测太慢），5 分钟足够挡 DNS/路由黑洞，抖动自愈更快。
+const DEAD_ENDPOINT_TTL: Duration = Duration::from_secs(300);
+
+/// MCP 直连失败短负缓存 TTL（60s，M3）。
 ///
-/// 这是设计评审 BLOCKER 9 的修法：判据必须是「剩余 ≥ 退避 + 一轮最坏耗时」，而不是
-/// 「剩余 ≥ 退避下限」。后者会让第 2 轮必然在半路被 deadline 砍断。
-const ABSORB_MIN_USEFUL_ROUND_SECS: u64 = 20;
+/// 远短于 [`DEAD_ENDPOINT_TTL`]（300s）：连接层失败是 DNS/路由黑洞（代价是每个
+/// 请求的 connect timeout），而直连失败是 token 级问题（401/403/429），失败后
+/// 短暂跳过即可，避免每个请求都再白打一跳死 token——60s 足够挡惩罚窗口，恢复
+/// 探测更快。
+const MCP_DIRECT_NEG_CACHE_TTL: Duration = Duration::from_secs(60);
 
-/// 退避的**绝对下限**。`maxDelaySecs=0` 经 API 可写（配置层对它无 clamp），而 0 退避会
-/// 让吸收循环退化成无 sleep 的 `continue` —— 忙等死循环，打满一核且请求永不返回。
-/// 50ms 取自号池冷却的实测最快恢复量级（远小于外置 shield 硬编码的 1s）。
-const ABSORB_MIN_BACKOFF: Duration = Duration::from_millis(50);
-
-/// 内置「上游 429 吸收层」的运行时策略快照（每次调用从 config 的 ArcSwap 取一份）。
+/// 协议不符隔离 TTL（30 分钟）。
 ///
-/// 不做 TIER3 进程级 static：吸收层在 provider 内，`token_manager.config()` 本身就是 ArcSwap，
-/// admin 存盘后 `reload_config` 原子换入即生效 —— 少一层镜像就少 6 个可写错点。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct AbsorbPolicy {
-    enabled: bool,
-    budget: Duration,
-    max_rounds: u32,
-    min_delay: Duration,
-    max_delay: Duration,
-    /// 是否吸收 403 账户级临时风控（= 外挂所称的「换号空窗」）。**必须存进快照**而不是在
-    /// 循环里重新 `config()`：一次调用内只取一份策略，否则 admin 在两轮之间热更会让同一条
-    /// 请求前后按不同策略走（前半轮用旧 max_rounds、后半轮用新 suspended 判据），
-    /// 行为不可复现也不可测试。
-    absorb_suspended: bool,
-    /// 是否吸收上游 5xx。默认 false（见 `upstream_retry_absorb_server_error`）。
-    absorb_server_error: bool,
-    /// 是否吸收带瞬态标记的 400（模型容量）。默认 false。
-    absorb_capacity_400: bool,
-    /// 换号空窗的**独立预算**。`ZERO` = 未启用 ⇒ 该类沿用总预算与 min_delay 指数曲线
-    /// （逐字节等于本字段引入前的行为）。非零时该类换成 20/40/60s 长阶梯 + 独立 deadline。
-    swap_budget: Duration,
-    /// 预算耗尽时是否给错误串打 `absorb_budget_exhausted=1`（让 handlers 渲染成 503）。
-    /// 默认 false（状态码保持透传 429）。
-    exhausted_as_503: bool,
-}
-
-/// 换号空窗的退避阶梯（秒），逐字取自外挂 `kiro_shield.py` 的 `SWAP_BACKOFF`。
-///
-/// 为什么是这三档而不是继续用指数：外挂注释里那句「**绝不能用限速那套 1 秒退避** ——
-/// 那是拿一个已被封的账号去猛打上游，只会加重风控」是本阶梯存在的全部理由。空窗实测约
-/// 10 分钟，20s 起步、封顶 60s 意味着一条请求最多问上游十几次，而 1s 起的指数在同样时长内
-/// 会问上百次。超出表长的轮次取最后一档（60s）。
-const SWAP_WINDOW_BACKOFF_SECS: [u64; 3] = [20, 40, 60];
-
-impl AbsorbPolicy {
-    fn from_config(cfg: &crate::model::config::Config) -> Self {
-        // 403 临时风控的额外轮次**硬钉为 1**（不是沿用 max_rounds）：`config.self_heal_base_backoff_secs（默认 60s）`
-        // 存在的意义就是停止向刚 403 的账号试探，而 403 是**账号级**的 —— 换号只是把同一个
-        // 被惩罚账号走多遍，扩大受害面而非提高成功率。UI 文案也标注了「与自愈退避冲突」。
-        let swap_budget = Duration::from_secs(cfg.upstream_retry_absorb_swap_budget_secs);
-        // ⭐ 「钉 1」的**前提**是短退避：15s 内重打同一个刚被风控的账号会抵消
-        // `config.self_heal_base_backoff_secs（默认 60s）=60s`（那条退避存在的意义就是停止试探）。
-        // 设了 swap 预算后该类走 20/40/60s 长阶梯 —— 最短一档就是 20s，前提不再成立，
-        // 于是解除钉 1，交回 `max_rounds` + 独立 deadline + `ABSOLUTE_MAX_TOTAL_RETRIES` 三道闸。
-        //
-        // 不解除的话这个旋钮基本没用：钉 1 时它只能把**一次**重试推迟到 20s 后，
-        // 而空窗实测 10 分钟 ⇒ 那一次几乎必然还在窗口内 ⇒ 白等 20s 拿同一个 403。
-        let max_rounds = if cfg.upstream_retry_absorb_suspended && swap_budget.is_zero() {
-            cfg.upstream_retry_absorb_max_rounds.min(1)
-        } else {
-            cfg.upstream_retry_absorb_max_rounds
-        };
-        // ⭐ 两道归一化，顺序不能换。两者都是**下限**方向，因为 `backoff()` 末尾是
-        // `d.clamp(min_delay, max_delay)` —— 决定「会不会返 0」的是 `min_delay`（下界），
-        // 不是 `max_delay`。
-        //
-        // ① `min_delay` 抬到 `ABSORB_MIN_BACKOFF`。`minDelayMs=0` 经 Admin API 可写
-        //    （`service.rs` 对这两个字段无任何 clamp），而下界为 0 时 `clamp` 不会抬起
-        //    任何东西 → `PoolCooldown(0)` 直接返 `Duration::ZERO` → 吸收循环变成无 sleep
-        //    的 `continue` = 忙等死循环（`acquire_context` 那次 CPU 打满一核、请求永不
-        //    返回正是这个形态）。⚠️ 这条缺陷**在本批之前就存在**（deploy tip 的
-        //    `from_config` 同样不给 `min_delay` 下限），不是新引入的。
-        //
-        // ② `max_delay` 再抬到不低于 `min_delay`。`d.clamp(min, max)` 在 `min > max` 时是
-        //    **panic**（std 契约），而两个字段来自面板上两个独立数字框（毫秒 vs 秒），
-        //    `minDelayMs=60000` 配 `maxDelaySecs=1` 一次手滑即可配出 —— 那会让此后每个
-        //    429 都在请求热路径上 panic。
-        //
-        //    方向取「抬 max 到 min」而不是「压 min 到 max」：矛盾配置下宁可**退避更久**。
-        //    退避久的后果是 `should_start_another_round`（要求剩余 > 退避 + 20s）判不通过
-        //    ⇒ 吸收层不干活、回落旧行为；而退避短的后果是对一个还在冷却的号池连打，
-        //    正是吸收层要避免的事。前者安全，后者有害。
-        //
-        // 都用归一化而非拒绝保存：退避窗退化成一个点仍是可用行为，而拒绝保存会把一个
-        // 能自愈的配置错误变成运维事故。不变式由构造保证 ⇒ 可用纯函数单测钉死。
-        let min_delay =
-            Duration::from_millis(cfg.upstream_retry_absorb_min_delay_ms).max(ABSORB_MIN_BACKOFF);
-        let max_delay =
-            Duration::from_secs(cfg.upstream_retry_absorb_max_delay_secs).max(min_delay);
-        Self {
-            enabled: cfg.upstream_retry_absorb_enabled,
-            // ⭐ 总预算**下限是 45s**（`MAX_REQUEST_RETRY_BUDGET_SECS`），不是面板允许的 1s。
-            //
-            // 因为 `round_budget()` 用 `min(45s, 剩余预算)` 夹每一轮的 failover 墙钟，
-            // 所以这个「吸收层的」旋钮会反向支配**既有的** failover 重试预算：
-            // 填 5s ⇒ 第 0 轮（也就是关掉吸收层时唯一的那一轮）的换号墙钟从 45s 变成 5s
-            // ⇒ 正常换号重试被截断。运维填小值的动机恰恰是「想压住客户端延迟」，
-            // 而实际后果是把与吸收层无关的重试也砍了 —— 面板上完全看不出这层耦合。
-            //
-            // 抬到 45s 后语义变干净：这个旋钮只能决定**多给几轮**，
-            // 永远不会让单轮比关掉吸收层时更短。
-            budget: Duration::from_secs(cfg.upstream_retry_absorb_budget_secs)
-                .max(Duration::from_secs(MAX_REQUEST_RETRY_BUDGET_SECS)),
-            max_rounds,
-            min_delay,
-            max_delay,
-            absorb_suspended: cfg.upstream_retry_absorb_suspended,
-            absorb_server_error: cfg.upstream_retry_absorb_server_error,
-            absorb_capacity_400: cfg.upstream_retry_absorb_capacity_400,
-            swap_budget,
-            // 只认精确的 503。其它值（含裸 `#[serde(default)]` 会给的 0）一律按 429 处理：
-            // 这个开关的语义是「要不要为 Cursor 让步」，不是「随便填个状态码」——
-            // 让 provider 打一个 handlers 认不出的标记只会造成静默的行为分叉。
-            exhausted_as_503: cfg.upstream_retry_absorb_exhausted_status == 503,
-        }
-    }
-
-    /// 该类别当前是否被允许吸收（各类别的独立开关）。
-    ///
-    /// 抽成纯函数而不是在循环里散写 `if`：三个新类别各有一个开关，散写必然漏一处，
-    /// 而漏掉的那一处的表现是「默认关的类别其实在吸收」—— 正是硬约束里最不能出的错。
-    /// 纯函数可用单测把「默认配置下三个新类别一律不吸收」钉死。
-    fn class_allowed(&self, class: crate::anthropic::AbsorbClass) -> bool {
-        use crate::anthropic::AbsorbClass;
-        match class {
-            // 这两类是吸收层原本就在做的事，跟着总开关走。
-            AbsorbClass::PoolCooldown(_) | AbsorbClass::UpstreamRateLimit => true,
-            AbsorbClass::SwapWindow => self.absorb_suspended,
-            AbsorbClass::TransientServerError => self.absorb_server_error,
-            AbsorbClass::TransientCapacity400 => self.absorb_capacity_400,
-        }
-    }
-
-    /// 该类别的绝对 deadline。换号空窗在设了独立预算时用它自己那份，其余一律用总预算。
-    ///
-    /// 为什么不能共用一个预算（外挂实测）：换号空窗约 **10 分钟**，而总预算线上是 20s。
-    /// 抬总预算会让**所有**类别都能占着客户端连接十分钟，而换号空窗恰恰是唯一等得起的一类
-    /// （客户端在补号完成后自动恢复，而不是当场断会话）。
-    fn class_deadline(
-        &self,
-        call_started: std::time::Instant,
-        class: crate::anthropic::AbsorbClass,
-    ) -> std::time::Instant {
-        if matches!(class, crate::anthropic::AbsorbClass::SwapWindow) && !self.swap_budget.is_zero()
-        {
-            // 与总预算同源地从 `call_started` 起算（含准入排队），理由见调用点：
-            // 改成「从此刻起算」会让客户端可见延迟变成排队 + 吸收之和。
-            call_started + self.swap_budget
-        } else {
-            call_started + self.budget
-        }
-    }
-
-    /// 该类别愿意睡的上限。换号空窗启用长阶梯时可以超过全局 `max_delay`。
-    ///
-    /// 为什么必须放宽：`max_delay` 默认 15s < 阶梯最短一档 20s ⇒ 不放宽的话长阶梯会被
-    /// 全局 clamp 削回 15s，这个旋钮等于没接上（而 `backoff_is_truncated` 只对
-    /// `PoolCooldown` 成立，不会拦住这种「睡不够」）。显式设了 swap 预算本身就是
-    /// 「这一类可以睡更久」的表态。
-    fn class_max_delay(&self, class: crate::anthropic::AbsorbClass) -> Duration {
-        if matches!(class, crate::anthropic::AbsorbClass::SwapWindow) && !self.swap_budget.is_zero()
-        {
-            let ladder_top =
-                Duration::from_secs(SWAP_WINDOW_BACKOFF_SECS[SWAP_WINDOW_BACKOFF_SECS.len() - 1]);
-            self.max_delay.max(ladder_top)
-        } else {
-            self.max_delay
-        }
-    }
-
-    /// 本次调用允许的额外吸收轮次。关闭时恒为 0 —— 把「关 ⇒ 零额外轮次」做成可断言的纯函数，
-    /// 而不是散落在调用点的 `if !enabled` 判断（后者无法用单测钉死）。
-    fn effective_max_rounds(&self) -> u32 {
-        if self.enabled { self.max_rounds } else { 0 }
-    }
-
-    /// 本轮 failover 循环的墙钟预算：`min(45s, 剩余吸收预算)`。
-    ///
-    /// 这就是「吸收轮次不会超总预算」的**机制**（而非靠调用点自觉）：一轮的墙钟上限本身
-    /// 被剩余预算夹住，所以吸收轮次与 failover 轮次不是各算一套预算，而是后者被前者显式配额。
-    /// 关闭时恒返完整 45s ⇒ 与旧行为逐字节等价。
-    fn round_budget(
-        &self,
-        deadline: std::time::Instant,
-        round_started: std::time::Instant,
-    ) -> Duration {
-        let full = Duration::from_secs(MAX_REQUEST_RETRY_BUDGET_SECS);
-        if self.enabled {
-            full.min(deadline.saturating_duration_since(round_started))
-        } else {
-            full
-        }
-    }
-
-    /// 本轮**真正需要**等多久才有意义 —— 未经 `max_delay` 截断的原始值。
-    ///
-    /// 与 [`Self::backoff`] 分开是承重的（未修问题 ③）：`PoolCooldown(secs)` 是 cooldown.rs
-    /// 的**进程内真值**，而 `max_delay`（默认 15s）是一个与它毫无关系的旋钮。号池给出
-    /// 60s（`config.self_heal_base_backoff_secs（默认 60s） = from_secs(60)`，token_manager.rs:890 一带）时，
-    /// 只 clamp 不判断的写法会
-    /// 睡满 15s 就醒来再打一轮 —— 池子还在冷却 45s，这一轮**结构上必然**拿回同一个 429，
-    /// 等于白打一轮上游 + 客户端白等 15s。判「够不够」必须用真值，睡多久才用截断值。
-    fn required_wait(&self, class: crate::anthropic::AbsorbClass, round: u32) -> Duration {
-        use crate::anthropic::AbsorbClass;
-        match class {
-            // 号池真值。secs=0 由 backoff() 的 clamp 抬到 min_delay:无 sleep 的 continue 就是
-            // 忙等死循环(acquire_context 那次 CPU 打满一核、请求永不返回正是这个形态)。
-            AbsorbClass::PoolCooldown(secs) => Duration::from_secs(secs),
-            // 无真值可用:指数(非 shield 的 1.7 倍)。已有 max_rounds 与绝对 deadline 双闸,
-            // 收敛更快比更平滑重要。
-            AbsorbClass::UpstreamRateLimit => self.min_delay.saturating_mul(1u32 << round.min(6)),
-            // 换号空窗:设了独立预算 ⇒ 长阶梯 20/40/60s;未设 ⇒ 与限速同曲线(旧行为)。
-            //
-            // 长阶梯的理由是外挂那句实测结论:「**绝不能用限速那套 1 秒退避** —— 那是拿一个
-            // 已被封的账号去猛打上游,只会加重风控」。空窗约 10 分钟,20s 起步意味着一条请求
-            // 最多问上游十几次;1s 起的指数在同样时长内会问上百次,那不是重试而是施压。
-            AbsorbClass::SwapWindow => {
-                if self.swap_budget.is_zero() {
-                    self.min_delay.saturating_mul(1u32 << round.min(6))
-                } else {
-                    let idx = (round as usize).min(SWAP_WINDOW_BACKOFF_SECS.len() - 1);
-                    Duration::from_secs(SWAP_WINDOW_BACKOFF_SECS[idx])
-                }
-            }
-            // 5xx:1s 起(逐字取自 shield 的 `MIN_DELAY=1.0`)×2 指数。
-            // 为什么比限速类起步更长而封顶更早:5xx 多为上游/网关瞬时抖动,一两秒后重打大概率
-            // 就过;但若是整片故障,短退避会在故障期乘倍放大请求量。1s 是「抖动等得起、
-            // 故障不放大」的折中,且与本仓既有的 `retry_delay_model_unavailable` 同基数。
-            AbsorbClass::TransientServerError => {
-                const BASE: Duration = Duration::from_secs(1);
-                BASE.saturating_mul(1u32 << round.min(4))
-            }
-            // 容量类:2s 起 ×2。比 5xx 更长是因为「模型没容量」是**全局**状态
-            // (所有凭据对同一模型等价受影响,见 endpoint 侧那条判据的说明),换号不解决问题,
-            // 只能等上游腾出容量。与 provider 内部那几次慢速重试(1s base)串联后总时长才够到
-            // 容量恢复的量级 —— 内部那几次加起来只有秒级,而容量恢复常在分钟级。
-            AbsorbClass::TransientCapacity400 => {
-                const BASE: Duration = Duration::from_secs(2);
-                BASE.saturating_mul(1u32 << round.min(4))
-            }
-        }
-    }
-
-    /// 本轮实际睡多久：真实需求经 `[min_delay, max_delay]` 夹取。
-    ///
-    /// 与外置 shield 的逐条差异：① shield 的 `MIN_DELAY` 硬 1s，号池 50ms 就能恢复时白睡
-    /// 950ms×每轮（这是它 p50 73.2s 的病根之一），这里下限可配到亚秒级；② shield 只看 HTTP
-    /// `Retry-After` 头，这里直接吃 `PoolCooldown(secs)` 的**进程内真值**（就是 cooldown.rs
-    /// 算出的剩余秒数，无需 HTTP 头往返）。
-    fn backoff(&self, class: crate::anthropic::AbsorbClass, round: u32) -> Duration {
-        // 上界按类别取（见 `class_max_delay`）：换号空窗的长阶梯不能被默认 15s 的全局上限削回，
-        // 否则那个旋钮等于没接上。其余类别的上界与本改动之前逐字节相同。
-        //
-        // ⚠️ `clamp` 在 `min > max` 时 panic，而 `class_max_delay` 只会**放大**上界
-        // （`self.max_delay.max(ladder_top)`），`from_config` 已保证 `max_delay >= min_delay`
-        // ⇒ 不变式仍然成立。
-        self.required_wait(class, round)
-            .clamp(self.min_delay, self.class_max_delay(class))
-    }
-
-    /// 号池给出的**真实恢复时刻**是否超过我们愿意睡的上限 ⇒ 睡醒了池子还没好 ⇒ 这一轮白打。
-    ///
-    /// **只对 `PoolCooldown` 成立**，这个限定是承重的：只有它携带真值（cooldown.rs 算出的
-    /// 剩余秒数）。`UpstreamRateLimit`/`Suspended` 走的是我们自己编的指数兜底 —— 它撞上
-    /// `max_delay` 只说明「我们不想睡更久」，**不代表上游没好**（`max_delay` 本来就是为了
-    /// 夹住它而存在的）。若把它们也算进来，指数涨过上限后吸收层会对**最主要**的那类
-    /// （上游裸 429）提前停止工作，白丢一层保护。
-    ///
-    /// 这条比 `should_start_another_round` 更早生效：后者只管**预算**够不够睡，管不了
-    /// 「睡够了但上游没好」——两者是独立的失败模式，都必须拦。
-    fn backoff_is_truncated(&self, class: crate::anthropic::AbsorbClass, round: u32) -> bool {
-        matches!(class, crate::anthropic::AbsorbClass::PoolCooldown(_))
-            && self.required_wait(class, round) > self.max_delay
-    }
-}
-
-/// 是否还够再跑一轮吸收：**剩余预算 > 退避 + 一轮最坏耗时**。
-///
-/// 判据刻意不是「剩余 ≥ 退避下限」（BLOCKER 9）：那样第 2 轮会在半路被 deadline 砍断，
-/// 等于白打一轮上游还让客户端多等。纯函数便于单测钉死，无需真实上游。
-fn should_start_another_round(
-    deadline: std::time::Instant,
-    now: std::time::Instant,
-    delay: Duration,
-) -> bool {
-    deadline.saturating_duration_since(now)
-        > delay + Duration::from_secs(ABSORB_MIN_USEFUL_ROUND_SECS)
-}
-
-/// 本吸收轮还能打几次上游：**跨轮共享**同一个 `ABSOLUTE_MAX_TOTAL_RETRIES` 总额度。
-///
-/// 未修问题 ②：`compute_max_retries` 在 `'absorb: loop` **之外**只算一次，而
-/// `for attempt in 0..max_retries` 每轮重跑 ⇒ 每轮各拿一份完整 4 ⇒ `max_rounds=3` 时
-/// 一条客户端请求最坏 (1+3)×4 = **16 次**上游调用、同一出口 IP —— 正是当初把
-/// `ABSOLUTE_MAX_TOTAL_RETRIES` 从 64 砍到 4 要压住的突发特征，被吸收层从另一头放回来。
-///
-/// 修法不是调小 `max_rounds`（那只是把数字挪一挪，语义仍是「每轮各拿一份」），而是让
-/// 上限回到它文档承诺的「**每请求**」语义：本轮配额 = `min(基础配额, 总额度 − 已用)`。
-/// 于是无论 `max_rounds` 填多少，一条客户端请求打向上游的次数恒 ≤ `ABSOLUTE_MAX_TOTAL_RETRIES`。
-///
-/// `attempts_before` 传**已完成的尝试次数**（= 循环外的 `attempts_base`）。返回 0 表示
-/// 额度已用尽，调用点必须 `break 'absorb` 而不是空跑一轮（空跑会白睡一次退避）。
-fn round_retry_quota(base_quota: usize, attempts_before: u32) -> usize {
-    let remaining = ABSOLUTE_MAX_TOTAL_RETRIES.saturating_sub(attempts_before as usize);
-    base_quota.min(remaining)
-}
+/// 上游对某 (端点, region) 返回的不是 event-stream 而是 JSON/文本（协议降级），
+/// 说明这条**路由**当前不可用于对话。与 `dead_endpoints` 同为自动过期的软隔离：
+/// 上游修好、或部署方改了配置后，过期即自动重试，无需人工介入也无需重启。
+const PROTOCOL_BROKEN_TTL: Duration = Duration::from_secs(1800);
 
 /// 对话路径 403 → **换区重试**的目标 region（L1）。`None` = 不该换区。
 ///
@@ -520,63 +207,6 @@ fn region_retry_target(
         return None;
     }
     Some(next)
-}
-
-/// 计算本次调用允许的总重试次数（动态预算）
-///
-/// - `total`：凭据总数
-/// - `available`：当前未禁用（可用）凭据数
-///
-/// 预算 = `(total * per_cred).min(ABSOLUTE_MAX_TOTAL_RETRIES)`，再以 1 兜底。
-///
-/// ⚠️ **`available` 已不参与计算**（参数保留只为不动调用点与既有测试）。
-/// 因此本函数**不再保证「每个可用凭据至少被尝试一次」** —— 号池大于
-/// `ABSOLUTE_MAX_TOTAL_RETRIES` 时，单个请求扫不完全池。这是**刻意的权衡**，
-/// 理由见函数体内 `.min()` 处的长注释（旧代码的内层 `.max(available)` 会让硬上限
-/// 自我抵消，线上 43 号时预算 = 43，一条请求顺着整池撞一遍直到耗尽 45s 墙钟，
-/// 净效果是「号池越大越慢」）。
-///
-/// 该权衡依赖一个前提：**坏号会被自动禁用从而不进候选集**，故预算 4 足够摸到
-/// 足量健康号。号池规模显著超过 `ABSOLUTE_MAX_TOTAL_RETRIES` 时需重新评估这个前提。
-///
-/// **小号池降重试**：号池很小（`total <= SMALL_POOL_THRESHOLD`）时，每号重试次数降为 1。
-/// 因为小池下重试循环只会反复选到同几个号——被限流时多打几次纯属反复砸、加重冷却，
-/// 不如让每个号各摸一次就把上游错误透传给客户端（客户端自身有退避重试，比网关内反复砸温和）。
-/// 号多时行为完全不变（仍 `MAX_RETRIES_PER_CREDENTIAL`）。
-fn compute_max_retries(total: usize, _available: usize) -> usize {
-    // `_available` 保留在签名里但**不再参与计算**：见下方 `.min()` 处的说明。
-    // 保留参数是为了不改动调用点与既有测试；将来若确认永不需要，再一并删除。
-    let per_cred = if total <= SMALL_POOL_THRESHOLD {
-        1
-    } else {
-        MAX_RETRIES_PER_CREDENTIAL
-    };
-    (total * per_cred)
-        // ⚠️ 这里**刻意不再**用 `.max(available)` 抬高上限。
-        //
-        // 旧代码是 `.min(ABSOLUTE_MAX_TOTAL_RETRIES.max(available))`，那个内层
-        // `.max(available)` 会在 `available > ABSOLUTE_MAX_TOTAL_RETRIES` 时把硬上限
-        // 自己抵消掉 → 预算等于可用号数。线上 43 个号时实测预算 = 43，日志里就是
-        // 「尝试 43/43」：一条
-        // 客户端请求要顺着整池撞一遍，撞到 45s 墙钟预算才失败。
-        //
-        // 净效果是**号池越大越慢**，与"扩号池提升吞吐"的目标正好相反。而"保证每个
-        // 可用号至少被摸一次"这个原始意图本身就站不住：池子有 200 个号时，为一条
-        // 请求打 200 次上游只会加重风控，而不会提高这条请求的成功率——真正该做的是
-        // 让坏号被自动禁用而**不进入**候选集（见 token_manager 的
-        // `report_suspicious_activity`），而不是靠遍历去撞。
-        .min(ABSOLUTE_MAX_TOTAL_RETRIES)
-        // ⚠️ 地板 1：预算为 0 等于**一次都不尝试**，请求直接以「已达到最大重试次数（0次）」
-        // 失败，而 acquire_context 的等待循环根本没机会跑。
-        //
-        // 旧实现喂 `total_count()`（含 disabled 条目，恒 ≥ 池内号数）所以永远算不出 0，
-        // 掩盖了这里缺下限。改喂 `kiro_selectable_count()` 后，**瞬时**全池不可选
-        //（全部在冷却中 / inflight 打满）会让它返回 0 → 预算 0 → 请求零重试即失败。
-        // 这是真实回归：线上 20 分钟内出现 10 次该错误。
-        //
-        // 取 1 而非 0 的语义：至少走一遍 acquire_context，让它的等待逻辑有机会等到号
-        // 出冷却；等不到再由墙钟预算（MAX_REQUEST_RETRY_BUDGET_SECS）兜底透传错误。
-        .max(1)
 }
 
 /// 近期上游压力滑动窗口。
@@ -661,14 +291,14 @@ fn apply_retry_pressure(base: usize, rate: f32) -> usize {
 pub struct CallMeta {
     /// 实际服务该请求的凭据 ID
     pub credential_id: u64,
-    /// 请求模型名（从请求体解析，可能为 None）
+    /// 请求模型名 = 客户端**原始**名（调用方传入；未提供时回落请求体解析名，可能为 None）
     pub model: Option<String>,
     /// **映射后的模型名**（全局模型映射 `config.model_mapping` 命中且改写时非 None）。
     ///
     /// `model` 恒为客户端**原始**名（供 `requested_model` 口径），本字段携带改写结果
     /// （供 `upstream_model` 口径）；两者在 handler 埋点时分头写入 `RequestRecord`。
-    /// 未命中映射 / 凭据豁免 / overload_fallback_model 路径均为 None（fallback 名
-    /// 显式跳过映射，见 `call_api_with_retry` 末尾）。
+    /// 未命中映射 / 凭据豁免为 None；overload_fallback_model 路径记 fallback 名
+    /// （显式跳过全局映射表，见 `call_api_with_retry` 末尾）。
     pub mapped_model: Option<String>,
     /// 会话标识（conversationId）
     pub session_id: Option<String>,
@@ -709,6 +339,13 @@ pub struct CallMeta {
 pub struct PassthroughMeta {
     /// 服务该请求的自定义 API 凭据 ID
     pub credential_id: u64,
+    /// **本次透传 failover 链最先尝试的凭据 ID**（`None` = 首跳即成功/未发生换号）。
+    ///
+    /// 与 [`Self::credential_id`]（最终服务号）成对后，handlers 层的 usage record 能暴露
+    /// 「死号恒选」：`first_attempted_credential_id` 恒为某号而 `credential_id` 恒为另一号
+    /// 时，说明该号每次都被选中最前却被换掉（上游持续失败），需要运维处理。
+    /// 记录点见 `try_custom_api_passthrough` 循环内 `note_first_attempt`。
+    pub first_attempted_credential_id: Option<u64>,
     /// 请求模型名(原样,透传不映射)
     pub model: Option<String>,
     /// **映射后的模型名**（全局模型映射 `config.model_mapping` 命中且改写时非 None）。
@@ -817,6 +454,23 @@ pub struct KiroProvider {
     ///
     /// 用 `bucket_key` 后两者都对：region 天然在 host 里、同构端点自动去重。
     endpoint_buckets: Mutex<HashMap<(u64, String), Instant>>,
+    /// DNS/连接层失败的端点负缓存（key: "endpoint_name@region", value: 首次失败时刻）。
+    ///
+    /// 连接层失败通常表示 DNS 不存在（如 eu-central-1 的 codewhisperer）或 host 路由黑洞，
+    /// 端点回退逐一尝试会在每个请求上重复白跑 connect timeout。记住首次失败的端点，
+    /// 30 分钟内跳过（避免瞬时网络抖动永久拉黑，过期自动重试）。与 `endpoint_buckets`
+    /// 正交：后者是上游**明确告知**的限流（429 封桶 30s），本表是我们**观测到**的
+    /// 连接层故障（300s），两者互不覆盖。MCP 直连失败负缓存复用本表但 TTL 更短
+    /// （60s，见 [`MCP_DIRECT_NEG_CACHE_TTL`]）：键按凭据 id 分段，避免同 region
+    /// 一个坏 ksk 连坐健康 OAuth。与 `{endpoint}@{region}` 连接层键不冲突。
+    dead_endpoints: Mutex<HashMap<String, Instant>>,
+    /// 协议不符的端点隔离缓存（key: "endpoint_name@region", value: 首次判定时刻）。
+    ///
+    /// 与 [`Self::dead_endpoints`] 互补：那个管「连不上」（DNS/TCP/TLS），这个管
+    /// 「连上了但说的不是同一种协议」——上游返回 HTTP 2xx 却给出 JSON/文本而非
+    /// AWS event-stream。隔离是**软**的且带 TTL：期内该 (端点, region) 在回退链里被跳过，
+    /// 期满自动放行重试（上游修好、配置改对都能自愈，无需人工干预或重启）。
+    protocol_broken: Mutex<HashMap<String, Instant>>,
     /// 端点自适应派发：每 `(凭据, 端点)` 记一份 EWMA 成功率，选端点时优先送到更可能
     /// 成功的那个，并保留探索通道防误判自我实现。
     ///
@@ -927,6 +581,36 @@ fn passthrough_absorb_delay_ms(attempt: u32, min_delay_ms: u64, max_delay_secs: 
     base.clamp(min, max)
 }
 
+/// 透传 400/404 是否「换号无益」（额度耗尽 / 请求超长）——命中则不 failover 直返。
+///
+/// 判据用**连续形态**词表（对齐实测/常见上游：OpenAI 系 `insufficient_quota` 与
+/// `exceeded your current quota`、one-api 系 `quota exhausted`、DeepSeek 系
+/// `Insufficient Balance`、超长类 `too long` / `CONTENT_LENGTH_EXCEEDS_THRESHOLD`），
+/// 刻意不认裸 `quota`（2026-08-15 收窄）：body 任意含 `quota` 即判无益，会把
+/// 「quota tier / quota 配置」这类**上游能力差异**文案（换一个号可能成功）也吞成
+/// 直返，让客户端白吃一个本来能靠换号解决的 400/404。
+fn is_hopeless_upstream_400(body_lower: &str) -> bool {
+    [
+        "too long",
+        "content_length_exceeds",
+        "usage limit",
+        "insufficient balance",
+        "insufficient_quota",
+        "insufficient quota",
+        "quota exceeded",
+        "quota_exceeded",
+        "quota exhausted",
+        "quota_exhausted",
+        "quota limit",
+        "quota_limit",
+        "quota_reached",
+        "exceeded your current quota",
+        "no quota",
+    ]
+    .iter()
+    .any(|k| body_lower.contains(k))
+}
+
 impl KiroProvider {
     /// 创建带代理配置和端点注册表的 KiroProvider 实例
     ///
@@ -947,6 +631,15 @@ impl KiroProvider {
             default_endpoint
         );
         let tls_backend = token_manager.config().tls_backend;
+        // 告警配置随 provider 构造注入（热更不生效，改配置需重启；未配置时告警 bump 零开销）。
+        {
+            let ac = token_manager.config();
+            crate::common::alerting::init(
+                ac.alert_webhook_url.clone(),
+                ac.alert_cooldown_secs,
+                ac.host.clone(),
+            );
+        }
         // 预热：构建全局代理对应的 Client
         // 对话路径用流式 client：read_timeout(空闲间隔) 而非总时长，防长流被中途掐断
         // （根因见 build_streaming_client 注释：修 `Connection closed mid-response`）。
@@ -978,12 +671,19 @@ impl KiroProvider {
             endpoints,
             default_endpoint,
             endpoint_buckets: Mutex::new(HashMap::new()),
+            dead_endpoints: Mutex::new(HashMap::new()),
+            protocol_broken: Mutex::new(HashMap::new()),
             endpoint_health: crate::kiro::endpoint_health::shared(),
             upstream_gate: Arc::new(tokio::sync::Semaphore::new(concurrency_limit)),
             upstream_per_credential_gates: Mutex::new(HashMap::new()),
             upstream_per_credential_limit: per_credential_limit,
             retry_pressure: Mutex::new(RetryPressureWindow::new(PRESSURE_WINDOW_SECS)),
         }
+    }
+
+    /// 未禁用的 Kiro 号（非 custom_api）是否存在。WebSearch MCP 快路径依赖它。
+    pub fn has_enabled_kiro_credential(&self) -> bool {
+        self.token_manager.has_enabled_kiro_credential()
     }
 
     /// 取（或懒建）某凭据的并发闸。
@@ -1028,7 +728,11 @@ impl KiroProvider {
         if let Some(client) = cache.get(&effective) {
             return Ok(client.clone());
         }
-        let client = build_streaming_client(effective.as_ref(), 720, self.tls_backend)?;
+        let client = build_streaming_client(
+            effective.as_ref(),
+            MCP_CLIENT_READ_TIMEOUT_SECS,
+            self.tls_backend,
+        )?;
         cache.insert(effective, client.clone());
         Ok(client)
     }
@@ -1051,6 +755,176 @@ impl KiroProvider {
             .get(name)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
+    }
+
+    /// 该 (端点, region) 是否处于死亡负缓存窗口内（跳过本跳，别再白跑一次 DNS/连接超时）。
+    fn is_endpoint_dead(&self, endpoint_name: &str, region: &str) -> bool {
+        let key = format!("{}@{}", endpoint_name, region);
+        let mut dead = self.dead_endpoints.lock();
+        match dead.get(&key) {
+            Some(at) if at.elapsed() < DEAD_ENDPOINT_TTL => true,
+            // TTL 已过 → 清掉条目，让它重新试一次（region 可能恢复/配置已改）。
+            Some(_) => {
+                dead.remove(&key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// MCP 直连失败短负缓存（M3）：直连失败（401/403/429）后 60s 内跳过**该凭据**
+    /// 在该 region 的直连。
+    ///
+    /// 复用 [`Self::dead_endpoints`] 键空间：端点名写成 `mcp-direct@{id}`，
+    /// [`Self::mark_endpoint_dead`] 再拼 `@{region}` → 按凭据划界。同 region
+    /// 另一个号不受连坐（坏 ksk 不得蒙住健康 OAuth）。TTL 远短于连接层失败
+    /// （60s vs 300s）：直连是「无号」场景的轻量探测，失败后短暂跳过即可。
+    fn is_mcp_direct_blocked(&self, credential_id: u64, region: &str) -> bool {
+        let key = format!("mcp-direct@{}@{}", credential_id, region);
+        let mut dead = self.dead_endpoints.lock();
+        match dead.get(&key) {
+            Some(at) if at.elapsed() < MCP_DIRECT_NEG_CACHE_TTL => true,
+            // TTL 已过 → 清掉条目，让它重新试一次（token/region 可能已恢复）。
+            Some(_) => {
+                dead.remove(&key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// 记一次 (端点, region) 连接层失败。仅用于**连接层**失败（DNS/TCP/TLS），
+    /// HTTP 状态码错误（429/5xx）绝不进这里——那是容量问题，host 本身是好的。
+    /// （M3 例外：MCP 直连的 HTTP 级失败以 `mcp-direct@{id}` 作端点名走本函数，
+    /// 由 [`Self::is_mcp_direct_blocked`] 按凭据 id + region 读，TTL 更短。）
+    fn mark_endpoint_dead(&self, endpoint_name: &str, region: &str) {
+        let key = format!("{}@{}", endpoint_name, region);
+        self.dead_endpoints
+            .lock()
+            .insert(key, std::time::Instant::now());
+    }
+
+    /// 清除 (端点, region) 的负缓存。拿到 HTTP 响应 = 连接层通了（哪怕业务层 429/5xx）。
+    fn mark_endpoint_alive(&self, endpoint_name: &str, region: &str) {
+        let key = format!("{}@{}", endpoint_name, region);
+        self.dead_endpoints.lock().remove(&key);
+    }
+
+    /// 该 (端点, region) 是否处于「协议不符」隔离窗口内。
+    ///
+    /// 与 [`Self::is_endpoint_dead`] 同款自愈语义：TTL 一到自动清条目并放行重试，
+    /// 因此上游恢复或配置改对之后无需人工干预、无需重启即自动回到轮转。
+    fn is_route_protocol_broken(&self, endpoint_name: &str, region: &str) -> bool {
+        let key = format!("{}@{}", endpoint_name, region);
+        let mut broken = self.protocol_broken.lock();
+        match broken.get(&key) {
+            Some(at) if at.elapsed() < PROTOCOL_BROKEN_TTL => true,
+            // TTL 已过 → 清掉条目，让它重新试一次（上游可能已修好）。
+            Some(_) => {
+                broken.remove(&key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// 记一次 (端点, region) 协议不符（上游返回非 event-stream 响应）。
+    ///
+    /// 仅应在**确定性判据**命中时回报（例如解码层首字节不可能属于合法 event-stream
+    /// 帧长），绝不因业务错误码或偶发截断进入这里。当前本仓的解码层回报链路尚未
+    /// 接线到此处（provider 允许改动范围内无解码层入口），方法先就绪供测试与后续接线；
+    /// 未接线时 `protocol_broken` 表恒空，链行为等价「仅 dead_endpoint 负缓存生效」。
+    fn mark_route_protocol_broken(&self, endpoint_name: &str, region: &str) {
+        let key = format!("{}@{}", endpoint_name, region);
+        self.protocol_broken
+            .lock()
+            .insert(key, std::time::Instant::now());
+    }
+
+    /// 构造本次调用的端点回退链（链式回退，P0 移植）。
+    ///
+    /// 以 `head`（= [`Self::select_endpoint`] 选中的端点：桶机制 + EWMA 健康分已应用）
+    /// 为链首，先按凭据的 [`KiroCredentials::effective_endpoint_order`] 补齐
+    /// （ksk_ 号 = CLI 族端点：q.* 优先、runtime.* 回退，与 select_endpoint 同源 →
+    /// 轮内链与跨轮桶机制天然对齐），再用 [`ENDPOINT_FALLBACK_ORDER`] 按**协议族**
+    /// 补齐：ksk_ 剔除 ide；OAuth/Social/IdC **不**补 codewhisperer / amazonq
+    /// （CLI 族 + 硬编码 `tokentype: API_KEY`，OAuth Bearer 打过去是确定性 403）。
+    /// 显式 `endpoint` 仍走 ① 的凭据候选，不经本补齐。`endpoint_fallback = false`
+    /// 或注册表只有一个端点时退化为单元素链。
+    ///
+    /// 规则（对齐参考仓 jsjm）：
+    /// - 主端点被证实协议不符 → 不占链首（降级出链，兜底位除外）；
+    /// - 其余协议不符的端点同样跳过；
+    /// - **兜底铁律**：链绝不为空（否则 response 恒 None，请求无人发送）。
+    fn endpoint_chain_for(
+        &self,
+        head: &Arc<dyn KiroEndpoint>,
+        credentials: &KiroCredentials,
+        fallback_enabled: bool,
+        upstream_region: &str,
+    ) -> Vec<Arc<dyn KiroEndpoint>> {
+        if !fallback_enabled {
+            return vec![head.clone()];
+        }
+        let head_name = head.name();
+        let head_broken = self.is_route_protocol_broken(head_name, upstream_region);
+        // 主端点协议不符 → 它不占链首（仍保留兜底位，避免整条链为空无人发送）。
+        let mut chain = if head_broken {
+            tracing::warn!(
+                "端点 {} 在 region {} 处于协议不符隔离期，本次请求优先改走回退端点",
+                head_name,
+                upstream_region
+            );
+            Vec::new()
+        } else {
+            vec![head.clone()]
+        };
+        // ① 凭据候选顺序补齐（与 select_endpoint 同源，ksk_ 号 = CLI 族端点）。
+        for name in credentials.effective_endpoint_order(&self.default_endpoint) {
+            if name == head_name || self.is_route_protocol_broken(name, upstream_region) {
+                continue;
+            }
+            if let Some(ep) = self.endpoints.get(name) {
+                chain.push(ep.clone());
+            }
+        }
+        // ② 通用补齐顺序。按协议族裁剪 ENDPOINT_FALLBACK_ORDER，禁止跨族兜底：
+        //
+        // ksk_（API_KEY）号是 CLI 协议族：codewhisperer / amazonq 同为 CLI
+        // （服务根 `/` + X-Amz-Target + `tokentype: API_KEY`），ide 是 OAuth/IDE
+        // 协议端点 —— ksk_ 打 ide 必 403。对抗审查 M2：ksk_ **整体剔除 ide**
+        // （不是挪到链尾：链尾兜底铁律永不跳过，容量风暴时必被真打 → 403
+        // 从从未成功号 report_failure 累计 → TooManyFailures 误禁用，#481 同型）。
+        //
+        // OAuth/Social/IdC 对称：不得从本表补 CLI 族。CLI decorate 对所有 CLI 族
+        // 端点硬编码 tokentype=API_KEY，OAuth Bearer 打过去同样是确定性 403，
+        // 且 403 不在链内瞬时跳转集合里，会离开链进入凭据级认证冷却。
+        // 显式 `endpoint` 已在 ① 入链；本表只保留 ide。不把 endpoint_fallback
+        // 默认改 false（那会拆掉 ksk_ 的 cli→cw→amazonq 同族回退）。
+        let mut fallback_order: Vec<&str> = ENDPOINT_FALLBACK_ORDER.to_vec();
+        let ide_name = crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME;
+        if !credentials.is_custom_api_credential() && credentials.is_api_key_credential() {
+            fallback_order.retain(|n| *n != ide_name);
+        } else if !credentials.is_custom_api_credential() {
+            fallback_order.retain(|n| *n == ide_name);
+        }
+        for name in fallback_order {
+            if chain.iter().any(|ep| ep.name() == name) {
+                continue;
+            }
+            // 同样跳过其它已知协议不符的端点（链尾兜底除外，见下）。
+            if self.is_route_protocol_broken(name, upstream_region) {
+                continue;
+            }
+            if let Some(ep) = self.endpoints.get(name) {
+                chain.push(ep.clone());
+            }
+        }
+        // 兜底铁律：链绝不为空（否则 response 恒 None，请求无人发送）。
+        if chain.is_empty() {
+            chain.push(head.clone());
+        }
+        chain
     }
 
     /// 在凭据的端点候选里选一个：**硬门筛完 → 按实测成功率派发**。
@@ -1287,6 +1161,63 @@ impl KiroProvider {
         false
     }
 
+    /// 端点桶最短剩余封禁秒数。`credential_id=Some` 时先看该号，没有再用全表。
+    /// 无有效剩余（已过期 / 亚秒）→ 2（handlers A5 要 `retry_after_secs=` 才能 429 而非 502）。
+    fn shortest_endpoint_bucket_retry_after_secs(&self, credential_id: Option<u64>) -> u64 {
+        let now = Instant::now();
+        let buckets = self.endpoint_buckets.lock();
+        let min_of = |want: Option<u64>| -> Option<u64> {
+            buckets
+                .iter()
+                .filter(|((id, _), until)| **until > now && want.map(|w| *id == w).unwrap_or(true))
+                .map(|(_, until)| until.saturating_duration_since(now).as_secs())
+                .filter(|&s| s > 0)
+                .min()
+        };
+        min_of(credential_id)
+            .or_else(|| min_of(None))
+            .unwrap_or(2)
+    }
+
+    /// 每个启用中的 Kiro 号都没有未封禁端点桶（含 ksk 备区）。空 Kiro 池不算。
+    fn all_enabled_kiro_endpoint_buckets_sealed(&self) -> bool {
+        let snap = self.token_manager.peek_enabled_kiro();
+        if snap.is_empty() {
+            return false;
+        }
+        snap.iter()
+            .all(|(id, cred)| !self.has_unthrottled_endpoint(cred, *id))
+    }
+
+    /// last hop：全池端点桶 429 封禁且终态还是无 `retry_after_secs=` 的 generic 串
+    /// → 打上最短桶 TTL（或 2s），让 `map_provider_error` A5 走 429 + Retry-After 而非 502。
+    /// 不增加 hop。已有标记 / 非 RateLimited 类终态不改。
+    fn with_sealed_bucket_retry_after(
+        &self,
+        err: anyhow::Error,
+        last_outcome: crate::usage::RequestOutcome,
+    ) -> anyhow::Error {
+        let s = err.to_string();
+        if s.contains("retry_after_secs=") {
+            return err;
+        }
+        if !self.all_enabled_kiro_endpoint_buckets_sealed() {
+            return err;
+        }
+        let generic = matches!(
+            last_outcome,
+            crate::usage::RequestOutcome::RateLimited
+                | crate::usage::RequestOutcome::OtherError
+                | crate::usage::RequestOutcome::ServerError
+        ) || s.contains("所有端点桶均处于")
+            || s.contains("已达到最大重试次数");
+        if !generic {
+            return err;
+        }
+        let secs = self.shortest_endpoint_bucket_retry_after_secs(None);
+        anyhow::anyhow!("{s} retry_after_secs={secs}")
+    }
+
     /// 发送非流式 API 请求
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）；
@@ -1296,8 +1227,10 @@ impl KiroProvider {
         request_body: &str,
         is_1m: bool,
         budget: &SharedRetryBudget,
+        client_model: Option<&str>,
     ) -> anyhow::Result<(reqwest::Response, CallMeta)> {
-        self.call_api_with_retry(request_body, false, is_1m, budget).await
+        self.call_api_with_retry(request_body, false, is_1m, budget, client_model)
+            .await
     }
 
     /// 发送流式 API 请求
@@ -1306,17 +1239,289 @@ impl KiroProvider {
         request_body: &str,
         is_1m: bool,
         budget: &SharedRetryBudget,
+        client_model: Option<&str>,
     ) -> anyhow::Result<(reqwest::Response, CallMeta)> {
-        self.call_api_with_retry(request_body, true, is_1m, budget).await
+        self.call_api_with_retry(request_body, true, is_1m, budget, client_model)
+            .await
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
+    ///
+    /// 成功时返回 (响应, 实际使用的凭据 id) —— 调用方（websearch.rs 快路径埋点）
+    /// 需要 credential_id 落用量记录；此前只返回 Response，埋点只能写 None。
+    ///
+    /// # 无号直连兜底（P0，2026-08-16）
+    ///
+    /// `call_mcp_with_retry` 因「池子选不到号」失败时（错误带
+    /// [`MCP_POOL_UNAVAILABLE_MARKER`] 标记 —— 纯 custom_api 透传池 / 全池禁用的
+    /// 结构信号），改走 [`Self::call_mcp_direct`]：用池里**任意**带 Kiro Bearer
+    /// token 的凭据直连 MCP 端点（不注入 profileArn，kiro-gateway 证明的形态）。
+    /// 直连失败 → 降级返回原错误（客户端行为与现状逐字节一致）。
+    ///
+    /// **有号路径零变化**：直连只在 `acquire_context` 彻底失败后触发，成功路径
+    /// 与开关关闭时的错误路径都逐字节等于旧实现。
     pub async fn call_mcp(
         &self,
         request_body: &str,
         budget: &SharedRetryBudget,
-    ) -> anyhow::Result<reqwest::Response> {
-        self.call_mcp_with_retry(request_body, budget).await
+    ) -> anyhow::Result<(reqwest::Response, u64)> {
+        match self.call_mcp_with_retry(request_body, budget).await {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                let es = e.to_string();
+                let Some(pool_err) = es.strip_prefix(MCP_POOL_UNAVAILABLE_MARKER) else {
+                    return Err(e);
+                };
+                if MCP_DIRECT_BYPASS_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+                    match self.call_mcp_direct(request_body, budget).await {
+                        Ok(v) => return Ok(v),
+                        Err(direct_err) => {
+                            tracing::warn!(
+                                direct_err = %direct_err,
+                                pool_err = %pool_err.trim_start_matches(": "),
+                                "MCP 无号直连失败，降级返回池子错误"
+                            );
+                        }
+                    }
+                }
+                // 剥掉内部标记再上抛（客户端只见原错误）。
+                Err(anyhow::anyhow!("{}", pool_err.trim_start_matches(": ")))
+            }
+        }
+    }
+
+    /// MCP「无号直连」：不经过 `acquire_context` 的选号门槛，用池里任意带 Kiro
+    /// token 的凭据直接打 MCP 端点。
+    ///
+    /// # 为什么必须有（P0，W8 诊断的 websearch 结构性缺陷）
+    ///
+    /// 快路径 MCP 调用此前**硬依赖 Kiro 池号**：`acquire_context` 的选号要求凭据
+    /// 过 `is_entry_selectable`（禁用 / 冷却 / custom_api 结构性排除），纯 custom_api
+    /// 透传池（线上现状：4 个代挂号）**一个号都选不到** → WebSearch 快路径恒 502。
+    /// 而 MCP（web_search）调用本质只依赖一个有效的 Kiro Bearer token ——
+    /// kiro-gateway 的 mcp_tools.py 证明 `Authorization: Bearer` +
+    /// `x-amzn-codewhisperer-optout` + `Content-Type` 即可调通
+    /// `runtime.{region}.kiro.dev/mcp`，**不依赖 profileArn**。本方法实现同一形态：
+    /// token 从凭据池现取（`token_manager.acquire_mcp_direct_token`，绕过选号门槛），
+    /// 请求头按 gateway 同款构造，**不注入 `x-amzn-kiro-profile-arn`**。
+    ///
+    /// # 边界
+    ///
+    /// - 纯 custom_api 池无 Kiro token → 返回 Err（调用方降级回池子错误）。
+    /// - OAuth token 可能已过期（不做刷新，保持最小）→ 上游 401 → **同请求换下一个
+    ///   带 Kiro token 的号**；全部试完或共享预算耗尽才降级回池子错误。
+    /// - **失败短负缓存（M3）**：非 2xx（401/403/429）落 60s 负缓存，键按凭据 id
+    ///   分段（复用 [`Self::dead_endpoints`]，TTL 更短），期内跳过**该号**直连
+    ///   （同请求仍可换其它号；无候选才降级）。同 region 其它号不连坐。
+    /// - 直连不占 inflight / 不改健康分 / 不进 endpoint 429 桶 —— 刻意：这是
+    ///   「拿 token 直接打」的轻量路径（gateway 模型），不是调度路径。
+    /// - URL 恒为 IDE 协议的 `runtime.{region}.kiro.dev/mcp`：MCP 端点是 IDE 协议
+    ///   的（`endpoint/ide.rs`），CLI 端点的 `mcp_url` 是 `q.*` 兜底（cli.rs），
+    ///   不适合直连。region 仍走 `effective_upstream_region`（白名单校验内建）。
+    async fn call_mcp_direct(
+        &self,
+        request_body: &str,
+        budget: &SharedRetryBudget,
+    ) -> anyhow::Result<(reqwest::Response, u64)> {
+        let mut exclude: HashSet<u64> = HashSet::new();
+        let mut last_err: Option<anyhow::Error> = None;
+        loop {
+            let (id, cred, token) = match self
+                .token_manager
+                .acquire_mcp_direct_token_excluding(&exclude)
+            {
+                Some(v) => v,
+                None => {
+                    return Err(last_err.unwrap_or_else(|| {
+                        anyhow::anyhow!("MCP 无号直连：凭据池无可用 Kiro token（纯 custom_api 池）")
+                    }));
+                }
+            };
+            exclude.insert(id);
+
+            let config = self.token_manager.config();
+            // M3 失败短负缓存：直连失败（401/403/429）落 60s 负缓存，键含凭据 id。
+            // 先 acquire 再查，保证键对上即将发送的 token。同 region 其它号不连坐。
+            let region = cred.effective_upstream_region(&config);
+            if self.is_mcp_direct_blocked(id, region) {
+                last_err = Some(anyhow::anyhow!(
+                    "MCP 无号直连负缓存生效（{}s），跳过直连降级回池子错误",
+                    MCP_DIRECT_NEG_CACHE_TTL.as_secs()
+                ));
+                continue;
+            }
+            let machine_id = machine_id::generate_from_credentials(&cred, &config);
+            let rctx = RequestContext {
+                credentials: &cred,
+                token: &token,
+                machine_id: &machine_id,
+                config: &config,
+                is_1m: false,
+            };
+            // MCP 端点是 IDE 协议的（runtime.*.kiro.dev/mcp），直连固定走它；CLI 端点的
+            // mcp_url 是 q.* 兜底（cli.rs:205），不适合。region 解析与 ide 端点同源。
+            let endpoint = crate::kiro::endpoint::ide::IdeEndpoint::new();
+            let url = endpoint.mcp_url(&rctx);
+            let body = endpoint.transform_mcp_body(request_body, &rctx);
+
+            let client = self.client_for(&cred)?;
+            let mut req = client
+                .post(&url)
+                .body(body)
+                .header("content-type", "application/json");
+            for (name, value) in Self::mcp_direct_headers(&cred, &token) {
+                req = req.header(name, value);
+            }
+
+            let response = match req.send().await {
+                Ok(resp) => {
+                    // 共享预算：请求已真实发出，无论成败都算一次上游调用（与主循环同口径）。
+                    budget.consume(1);
+                    resp
+                }
+                Err(e) => {
+                    budget.consume(1);
+                    last_err = Some(e.into());
+                    if budget.remaining() == 0 {
+                        return Err(last_err.take().expect("just set"));
+                    }
+                    continue;
+                }
+            };
+            // ⭐ 非 2xx = 直连失败（无 ARN 形态被上游拒的 403/400、token 过期的 401、
+            // 429 限流等）：落 60s 负缓存（M3，期内跳过直连不再白打该号）后**同请求换下一个
+            // token**，绝不把错误响应体当成功解析。
+            if !response.status().is_success() {
+                self.mark_endpoint_dead(&format!("mcp-direct@{}", id), region);
+                last_err = Some(anyhow::anyhow!(
+                    "MCP 无号直连上游响应: {}",
+                    response.status()
+                ));
+                if budget.remaining() == 0 {
+                    return Err(last_err.take().expect("just set"));
+                }
+                continue;
+            }
+            return Ok((response, id));
+        }
+    }
+
+    /// MCP 无号直连的请求头（纯函数，便于单测钉死「无 profileArn」契约）。
+    ///
+    /// 对齐 kiro-gateway mcp_tools.py 的已证可实现形态：`Authorization` +
+    /// `x-amzn-codewhisperer-optout`，**刻意不注入 `x-amzn-kiro-profile-arn`**
+    /// （gateway 证明上游 MCP 端点不依赖 profileArn）。另按凭据类型补 tokentype
+    /// （与 decorate_mcp 同口径：api_key → API_KEY / external_idp → EXTERNAL_IDP），
+    /// 保住 ksk_ 号的既有认证语义。
+    fn mcp_direct_headers(cred: &KiroCredentials, token: &str) -> Vec<(&'static str, String)> {
+        let mut headers = vec![
+            ("x-amzn-codewhisperer-optout", "false".to_string()),
+            ("Authorization", format!("Bearer {}", token)),
+        ];
+        if cred.is_api_key_credential() {
+            headers.push(("tokentype", "API_KEY".to_string()));
+        } else if cred.is_external_idp_credential() {
+            headers.push(("tokentype", "EXTERNAL_IDP".to_string()));
+        }
+        headers
+    }
+
+    /// 预判 custom_api 透传**本跳**改写后发给上游的模型名（`PassthroughMeta.mapped_model` 口径）。
+    ///
+    /// 必须与 `passthrough::forward` 内部的改写链逐位一致。deepseek 归一化已移除
+    /// （2026-08-16），全局模型映射是**唯一**改写源（`config.model_mapping`，豁免号跳过）：
+    /// forward 的顺序（passthrough.rs body 处理链）为「非豁免 → `map_target`（原始名）」，
+    /// 此处复用同一判定本体与同一豁免判据，与改写层不可能出现口径分裂。
+    ///
+    /// 返回值：改写发生（映射命中）→ `Some(最终上游名)`；未改写 → `None`（消费端回落
+    /// 原始名，对齐 `usage::record::RequestRecord::upstream_model` 语义）。forward 在 JSON
+    /// 解析失败时零改写；该场景到不了这里（调用方拿到的 `model` 必来自已解析成功的 payload，
+    /// forward 二次解析同一字节流必然成功），由「未改写 → None」分支保守覆盖。
+    fn predict_passthrough_upstream_model(
+        model: Option<&str>,
+        cred: &KiroCredentials,
+        mapping_rules: &std::collections::HashMap<String, String>,
+    ) -> Option<String> {
+        let m = model?;
+        // 全局映射（豁免时跳过，与 forward 的 exempt 分支一致）。
+        let final_model = if cred.model_mapping_exempt == Some(true) {
+            m.to_string()
+        } else {
+            crate::kiro::model_mapping::map_target(m, mapping_rules)
+                .unwrap_or_else(|| m.to_string())
+        };
+        // 未改写（最终名 == 原始名）→ None，消费端回落原始名。
+        if final_model != m {
+            Some(final_model)
+        } else {
+            None
+        }
+    }
+
+    /// 透传池失败冷却决策：按上游状态码返回 `(冷却秒数, 冷却原因)`。
+    ///
+    /// # 秒数（既有调参，2026-08-10 定，dwgx 语义）
+    ///
+    /// 代挂号是用户自购的付费中转站,不是 Kiro 号,它没有"被风控"这个状态,429 只代表
+    /// "它现在忙"。429 原先给 30s 冷却——那是把 Kiro 号的风控模型错套到代挂号上:
+    /// 用户已经为这个上游付过钱,把它按下 30 秒既不能让它变快,又白白缩小了可用池
+    /// (极端情况:两个代挂号轮流 429 → 两个都被冷却 → 整池不可用 → 回落 Kiro,
+    ///  而 Kiro 侧此刻可能正被风控烧号)。偶尔 429 只该 failover,不该留痕。
+    ///
+    /// - `401|402|403` = 180s：**非瞬态**,短期内重试必然还是失败。给冷却是为了别让
+    ///   同一请求链外的后续请求继续撞它。代挂号**绝不自动禁用**:record_passthrough_result
+    ///   只记观测计数,180s 冷却只是调度级跳过,管理员设置的 enabled 状态永不被改写。
+    /// - `429` / `400|404` = 5s：瞬态/站点属性,给一个**极短**的调度级跳过,而不是零。
+    ///
+    ///   为什么不是 0（审查发现的延迟回归）：`excluded` 只在**本请求链内**生效,
+    ///   跨请求不起作用。若完全不冷却,一个 100% 拒绝的中转站会被**每一个**新请求
+    ///   重新选中(select_custom_api 按 priority/RPM 排序,它排在前面),每次都白付一次
+    ///   上游往返才 failover——若不跳过,每个新请求都会多等一个失败 RTT(代挂号**没有**
+    ///   自动禁用兜底,只能靠这 5s 调度级跳过稀释同一秒内撞向同一个忙站的频率)。
+    ///   5s 是刻意取的平衡点:它**不是**惩罚(不进 health、不计失败、不影响自动禁用判据),
+    ///   只是调度上避免同一秒内把所有请求都撞向同一个忙站;而 5s 远低于人可感知的
+    ///   池容量缩水(旧值 30s 才是真正的惩罚性退避)。
+    ///
+    ///   400/404 与 429 同列：该上游对**这类请求**不认(模型不支持 / tool 配对更严 /
+    ///   role 白名单更严),是它的稳定属性而非抖动,短期内同类请求还会失败。但绝不给
+    ///   长冷却:换个模型的请求它可能就认,长冷却会白丢池容量。404 与 400 同性质
+    ///   (k2cc 用 400 INVALID_MODEL_ID、denzao 用 404 model_not_found,只是不同站点
+    ///   表达「本站不认这个请求」的不同状态码)。
+    /// - `5xx` = 5s（2026-08-16 S4 起）：与 429 同档调度级跳过 + 原因标签 `ServerError`。
+    ///   行为变化:5xx 此前完全不冷却(仅排序键余温软降权);5s 硬跳过与其互补——余温
+    ///   只在排序键平局时生效,5s 硬跳过保证该号 5s 内绝不重选,死号恒 502 时仍由
+    ///   余温承担 60s 降权。
+    /// - `_`（网络错误/其它）= 0：真瞬态,不跳过,仅记失败余温。
+    ///
+    /// # 原因（2026-08-16 S4「透传池冷却标签独立」）
+    ///
+    /// 此前所有冷却统一打 `RateLimitExceeded` 标签 ⇒ 401/402/403 在面板显示「速率限制」,
+    /// 误导排障(W14 实测确认)。现按语义映射,原因只决定面板 `cooldownReason`/
+    /// `cooldownCode`(admin service 读 `CooldownInfo.reason` 下发,前端 i18n 走 code):
+    ///
+    /// | 状态码 | 秒数 | CooldownReason | 面板标签 |
+    /// |---|---|---|---|
+    /// | 401 / 403 | 180 | `AuthTransient` | 认证瞬态失败 |
+    /// | 402 | 180 | `QuotaExhausted` | 配额耗尽 |
+    /// | 429 | 5 | `RateLimitExceeded` | 速率限制(保留) |
+    /// | 400 / 404 | 5 | `RateLimitExceeded` | 速率限制(现状保留) |
+    /// | 500-599 | 5 | `ServerError` | 服务器错误 |
+    /// | 其它 | 0 | 无(不冷却) | — |
+    ///
+    /// ⚠️ **秒数不走 `CooldownReason::default_duration()`**：时长是这里显式给出的既有
+    /// 调参,原因只决定标签——401 用 `AuthTransient` 后仍冷却 180s(不是该变体的 20s
+    /// 默认值),不会因换标签而改变时长。
+    ///
+    /// 不变式:返回的秒数 > 0 ⟺ 原因 = Some(调用点据此 expect)。
+    fn passthrough_cooldown_for(code: u16) -> (u64, Option<CooldownReason>) {
+        match code {
+            401 | 403 => (180, Some(CooldownReason::AuthTransient)),
+            402 => (180, Some(CooldownReason::QuotaExhausted)),
+            429 => (5, Some(CooldownReason::RateLimitExceeded)),
+            400 | 404 => (5, Some(CooldownReason::RateLimitExceeded)),
+            (500..600) => (5, Some(CooldownReason::ServerError)),
+            _ => (0, None),
+        }
     }
 
     /// 混入池分流:选一次号,若命中「自定义 API」凭据则原样透传原始 Anthropic 请求体到其上游、
@@ -1388,6 +1593,10 @@ impl KiroProvider {
         // 720s。⇒ 单请求的真实上界不是 210s，而是「210s + 最后一跳的 720s」，且中间能打的
         // 上游次数无上限。次数闸把这个上界压到常数级。
         let mut upstream_hops: usize = 0;
+        // ⭐ 本链最先尝试的凭据 ID（N4 首选号）：首次 `select_custom_api` 成功后置位，
+        // 随 PassthroughMeta 供成功链的 usage record；共享预算携带同一份（见
+        // `SharedRetryBudget::note_first_attempt` 注释）。
+        let mut first_attempted_id: Option<u64> = None;
         // 🔴 **闸门空转次数，与 `upstream_hops` 分开计**（2026-08-10）。
         //
         // 为什么必须分开：两个约束彼此冲突，合用一个计数器无法同时满足 ——
@@ -1487,29 +1696,38 @@ impl KiroProvider {
             // 成功路径把它移交给 `PassthroughMeta`（随响应流存活），失败路径由循环下一轮
             // 覆盖变量时自然 Drop。
             let (id, cred, inflight_guard) =
-                match self.token_manager.select_custom_api(&excluded, model) {
+                match self
+                    .token_manager
+                    .select_custom_api_or_wait(&excluded, model)
+                    .await
+                {
                     Some(x) => x,
-                    // 无更多可用 custom_api 号:①一开始就没(excluded 空)→ 池里无透传号,零开销落 Kiro;
-                    // ②都试过失败(excluded 非空)→ custom_api 全额度满/失败,failover 落 Kiro 主力。
+                    // 无更多可用 custom_api 号:
+                    // ①一开始就没(excluded 空)→ 池里无透传号,零开销落 Kiro;
+                    // ②都试过失败(excluded 非空)→ custom_api 全额度满/失败,failover 落 Kiro;
+                    // ③纯代挂池全部 CREDENTIAL_MAX_CONCURRENCY → or_wait 已短等重试,仍 None。
+                    // 混池 custom 满且有可选 Kiro：or_wait 立刻 None（分流），不睡。
                     None => return None,
                 };
+            // ⭐ 首选号（N4 可观测）：本链最先选中的号即「首选」。写两份 —— 本链的
+            // `first_attempted_id` 随 PassthroughMeta 供成功链的 usage record；跨层共享
+            // 预算携带同一份（首写生效），供「透传全败 → 落 Kiro 主路径」的 fail_record
+            // —— handlers 先试透传再落 Kiro，预算里就是整条链真正最先尝试的号。
+            if first_attempted_id.is_none() {
+                first_attempted_id = Some(id);
+                retry_budget.note_first_attempt(id);
+            }
             started = std::time::Instant::now();
-            // 全局 deepseek 归一化配置（TIER1 热重载，per-凭据在 forward 内覆盖）。
-            let ds_cfg = self.token_manager.config().deepseek_normalize.clone();
-            // 透传路径的映射在 forward 内部（先映射 → 再归一化）。改写是否真的发生由
-            // forward 判断（JSON 解析失败等情况下不会改写）；这里按凭据豁免与映射规则
-            // 预判 mapped_model，仅用于 PassthroughMeta 埋点。
+            // 透传路径的改写链在 forward 内部（仅全局模型映射；deepseek 归一化已移除）。
+            // 改写是否真的发生由 forward 判断（JSON 解析失败等情况下不会改写）；这里按
+            // 凭据豁免与映射规则预判 mapped_model，仅用于 PassthroughMeta 埋点。
             // 🔴 修复（2026-08-11 全量审计）：每跳**重算并重置** —— 旧代码只在命中时覆盖、
             // 未命中/豁免时保留上一跳的值。混合豁免/非豁免 custom_api 号池 failover 后
             // （第 1 跳非豁免命中映射、第 2 跳豁免原样转发），最后一跳的 PassthroughMeta
             // 仍带旧跳的映射名，与实际服务模型不符。现改为每跳先归 None 再按本跳凭据重算。
-            mapped_model = if cred.model_mapping_exempt != Some(true) {
-                model.and_then(|m| {
-                    crate::kiro::model_mapping::map_target(m, &mapping_rules)
-                })
-            } else {
-                None
-            };
+            mapped_model = Self::predict_passthrough_upstream_model(
+                model, &cred, &mapping_rules,
+            );
             // 🔴 **全局上游并发闸**（2026-08-10 补：透传路径此前完全绕过它）。
             //
             // 与主路径同一个 `upstream_gate` 语义：限制**同时在飞**的上游 HTTP 调用总数。
@@ -1704,7 +1922,6 @@ impl KiroProvider {
                     raw_body.clone(),
                     self.global_proxy.as_ref(),
                     self.tls_backend,
-                    &ds_cfg,
                     &mapping_rules,
                     client_headers,
                 ).await;
@@ -1778,9 +1995,13 @@ impl KiroProvider {
                 }
                 let meta = PassthroughMeta {
                     credential_id: id,
+                    first_attempted_credential_id: first_attempted_id,
                     model: model.map(|s| s.to_string()),
                     mapped_model: mapped_model.clone(),
-                    session_id: user_id.map(|s| s.to_string()),
+                    // S6 P1-1：session 与 Kiro 路径同源（同一函数从 user_id 提取 UUID）。
+                    // 此前直接把原始 user_id 串当 session —— 同一会话跨 Kiro/透传拆成
+                    // 两个 by_session key，且 account_uuid 明文进 trace。现提取不到即 None。
+                    session_id: user_id.and_then(Self::extract_session_uuid),
                     outcome,
                     latency_ms,
                     upstream_error: None, // 成功路径无错误体
@@ -1841,9 +2062,9 @@ impl KiroProvider {
             // 且 404 的语义空间比 400 窄；无样本支持的猜测性匹配只会制造误判。
             let is_upstream_error_worth_retry = matches!(code, 400 | 404) && {
                 // 先排除"换号无益"的：额度 / 超长。命中即不 failover。
-                let hopeless = ["too long", "content_length_exceeds", "usage limit", "quota", "insufficient balance", "insufficient_quota"]
-                    .iter()
-                    .any(|k| err_lower.contains(k));
+                // 判据是连续形态词表（is_hopeless_upstream_400），不认裸 `quota`
+                // （上游能力差异类文案含 quota 字样时仍给换号机会）。
+                let hopeless = is_hopeless_upstream_400(&err_lower);
                 // 其余一律给换号机会：上游差异导致的 400/404 占实测绝大多数
                 // （INVALID_MODEL_ID 52 次 / Invalid tool use 19 次 / role 白名单 / model_not_found）。
                 // 空错误体（读取失败）也给机会 —— 宁可多试一个号，也不让客户端白吃错误。
@@ -1852,6 +2073,29 @@ impl KiroProvider {
             let should_failover = matches!(code, 401 | 402 | 403 | 429)
                 || (500..600).contains(&code)
                 || is_upstream_error_worth_retry;
+            // 🔴 模型黑名单（2026-08-14 根治）：上游明确说「该模型不支持」——
+            // model_not_found / no available channel（如 pigcode 的
+            // "No available channel for model claude-opus-5 under group GPT-PRO"）。
+            // 这是该号对该模型的**稳定属性**（不是抖动）：记 (id, model) 短黑名单，
+            // 同一请求的后续 failover 与后续请求都不再选它，不再白付一跳。
+            // 只认语义特征不认状态码：503/404/400 都可能携带（不同中转站表达不同）。
+            let upstream_says_model_unsupported = !upstream_err.is_empty()
+                && (err_lower.contains("model_not_found")
+                    || err_lower.contains("no available channel")
+                    || err_lower.contains("model not found")
+                    // 对齐 sub2api 关键词表（"unknown model" 是 newapi/one-api 系上游
+                    // 的标准拒绝文案）。
+                    || err_lower.contains("unknown model"));
+            if upstream_says_model_unsupported {
+                if let Some(m) = model {
+                    self.token_manager.mark_model_unsupported(id, m);
+                    tracing::warn!(
+                        credential_id = id,
+                        model = %m,
+                        "上游明确不支持该模型，记模型黑名单 30min（该号该模型不再被选）"
+                    );
+                }
+            }
             if matches!(code, 400 | 404) {
                 tracing::warn!(
                     credential_id = id,
@@ -1864,9 +2108,11 @@ impl KiroProvider {
             if !should_failover {
                 let meta = PassthroughMeta {
                     credential_id: id,
+                    first_attempted_credential_id: first_attempted_id,
                     model: model.map(|s| s.to_string()),
                     mapped_model: mapped_model.clone(),
-                    session_id: user_id.map(|s| s.to_string()),
+                    // S6 P1-1：同成功路径，session 与 Kiro 同源提取（见 :2373 处注释）。
+                    session_id: user_id.and_then(Self::extract_session_uuid),
                     outcome,
                     latency_ms,
                     // 🔴 上游错误体：非 2xx 时带上，让面板/trace 能看到上游原文
@@ -1882,57 +2128,67 @@ impl KiroProvider {
                 return Some((resp, meta));
             }
 
-            // 冷却时长按性质。⭐ dwgx 定的语义:**代挂号是用户自购的付费中转站,不是 Kiro 号**,
-            // 它没有"被风控"这个状态,429 只代表"它现在忙"。
-            //
-            // 🔴 修复:429 原先给 30s 冷却。那是把 Kiro 号的风控模型错套到代挂号上——
-            // 用户已经为这个上游付过钱,把它按下 30 秒既不能让它变快,又白白缩小了可用池
-            // (极端情况:两个代挂号轮流 429 → 两个都被冷却 → 整池不可用 → 回落 Kiro,
-            //  而 Kiro 侧此刻可能正被风控烧号)。偶尔 429 只该 failover,不该留痕。
-            //
-            // 现在:429 与 5xx 同列为**瞬态**,本请求链内 exclude 换下一个号即可,零冷却。
-            // 无论 429 持续多久都不写 disabled；这里只做本请求内 failover 与短调度跳过。
-            let cooldown_secs = match code {
-                // 401 key 失效 / 402·403 额度耗尽:**非瞬态**,短期内重试必然还是失败。
-                // 给冷却是为了别让同一请求链外的后续请求继续撞它;真正的处置(自动禁用)
-                // 由 record_passthrough_result 的连续失败计数负责。
-                401 | 402 | 403 => 180,
-                // 429 / 5xx / 网络:瞬态。给一个**极短**的调度级跳过,而不是零。
-                //
-                // 为什么不是 0（审查发现的延迟回归）：`excluded` 只在**本请求链内**生效，
-                // 跨请求不起作用。若完全不冷却，一个 100% 429 的中转站会被**每一个**新请求
-                // 重新选中（select_custom_api 按 priority/RPM 排序，它排在前面），
-                // 每次都白付一次上游往返才 failover —— 而持续过载的自动禁用要 300s 才生效，
-                // 若完全不跳过，每个新请求都会多等一个失败 RTT。
-                //
-                // 5s 是刻意取的平衡点：它**不是**惩罚（不进 health、不计失败、不影响自动禁用判据，
-                // 满足"偶尔 429 绝不惩罚"），只是调度上避免同一秒内把所有请求都撞向同一个忙站；
-                // 而 5s 远低于人可感知的池容量缩水（旧值 30s 才是真正的惩罚性退避）。
-                429 => 5,
-                // 🔴 400/404（走到这里的都是 `is_upstream_error_worth_retry` 判定"换号可能有救"的）：
-                // 给 5s 调度级跳过，与 429 同理由 —— 该上游对**这类请求**不认（模型不支持 /
-                // tool 配对更严 / role 白名单更严），是它的稳定属性而非抖动，短期内同类请求
-                // 还会失败。但绝不给长冷却：换个模型的请求它可能就认，长冷却会白丢池容量。
-                // 404 与 400 同列：实测两者只是不同站点表达「本站不认这个请求」的不同状态码
-                // （k2cc 用 400 INVALID_MODEL_ID、denzao 用 404 model_not_found），性质相同。
-                400 | 404 => 5,
-                // 5xx / 网络：真瞬态，可能只是抖一下，不跳过。
-                _ => 0,
-            };
+            // 冷却决策(秒数 + 原因)收敛到 [`Self::passthrough_cooldown_for`] 一处:
+            // 秒数是 2026-08-10 定下的既有调参(dwgx 语义:代挂号 429 只是"它现在忙"),
+            // 原因(S4)只决定面板标签/cooldownCode,不改变时长(显式传秒数,不走
+            // CooldownReason 默认时长表——401 用 AuthTransient 仍是 180s)。
+            let (cooldown_secs, cooldown_reason) = Self::passthrough_cooldown_for(code);
+            // 🔴 M1.2（2026-08-16 对抗审查 MAJOR）：400/404 **不记失败余温**——
+            // 坏请求（无效 tool schema / 该站不认模型）是全池同质的客户端错误，一次
+            // failover 把所有号打上余温会让 60s 内任何请求零尝试直返 503（毒化整池）。
+            // 其模型语义已由 `mark_model_unsupported` 黑名单通道覆盖（稳定属性）。
+            // 仍记热的：5xx/429/401/402/403（账户级/限流/上游故障，跨请求记忆继续生效）。
+            let records_warmth = !matches!(code, 400 | 404);
             if cooldown_secs > 0 {
-                self.token_manager.cooldown_custom_api(id, cooldown_secs);
-                tracing::warn!(
-                    credential_id = id,
-                    status = code,
-                    "自定义 API 透传失败(非瞬态),该号冷却 {}s 并 failover 下一个 custom_api",
-                    cooldown_secs
+                // 🔴 N2 日志诚实化（2026-08-16）：`cooldown_custom_api` 被
+                // `cooldown_enabled` 门控——线上 cooldownEnabled=false 时它什么都不做，
+                // 旧文案一律打印「该号冷却 Ns 并 failover」是撒谎（实际没冷却，
+                // 跨请求的死号仍被每个新请求重新选中）。现在按返回值分两档，
+                // 没真冷却就明说，并指出现实中承担跨请求降权的是排序键失败余温位。
+                let reason = cooldown_reason.expect(
+                    "cooldown_secs > 0 时必有原因(passthrough_cooldown_for 不变式)",
                 );
+                let cooled = self.token_manager.cooldown_custom_api(id, cooldown_secs, reason);
+                if cooled {
+                    tracing::warn!(
+                        credential_id = id,
+                        status = code,
+                        reason = %reason.description(),
+                        "自定义 API 透传失败,该号冷却 {}s({})并 failover 下一个 custom_api",
+                        cooldown_secs, reason.description()
+                    );
+                } else {
+                    tracing::warn!(
+                        credential_id = id,
+                        status = code,
+                        cooldown_secs = cooldown_secs,
+                        "自定义 API 透传失败,但冷却未启用(cooldownEnabled=false):\
+                         不设冷却,仅本请求链内 failover——{}",
+                        if records_warmth {
+                            "跨请求靠排序键失败余温(60s 降权)避开该号"
+                        } else {
+                            "400/404 是客户端错误不记余温,换号不降权"
+                        }
+                    );
+                }
             } else {
+                // 网络错误/其它：真瞬态，不冷却，但记失败余温——死号恒 502 时
+                // 排序键据余温把它降权，不再每请求白打一跳（见 mark_passthrough_failure）。
                 tracing::warn!(
                     credential_id = id,
                     status = code,
-                    "自定义 API 透传失败(瞬态,如 429/5xx),**不冷却**,仅本请求内 failover 下一个 custom_api"
+                    "自定义 API 透传失败(网络/其它),**不冷却**,记失败余温(60s 降权),\
+                     仅本请求内 failover 下一个 custom_api"
                 );
+            }
+            // 🔴 N1 根治（2026-08-16）：任何判定「值得 failover」的透传失败都记失败时刻
+            // ——排序键「失败余温」位据此降权。5xx 走上方 5s 短冷却（S4 起，非 0）、
+            // 网络错误走 cooldown_secs=0 分支不冷却，但**同样要记余温**：死号恒 502
+            // （如线上 #3 cursorapi）时不再每请求白打一跳才 failover。该位独立于
+            // cooldownEnabled 开关（线上 false 时冷却体系整体失效），是本修复在线上
+            // 生效的根基。
+            if records_warmth {
+                self.token_manager.mark_passthrough_failure(id);
             }
             excluded.insert(id);
             // 丢弃本次错误响应,继续循环试下一个 custom_api;全部试完 select 返 None → 落 Kiro。
@@ -1952,16 +2208,24 @@ impl KiroProvider {
     /// handler 只持有 provider，但需要在**分派之前**做跨池优先级仲裁
     /// （`should_try_custom_api_first`：决定这次请求先走 custom_api 透传还是先走 Kiro）。
     /// 与 `report_credits` 同款薄 passthrough 思路，避免把仲裁逻辑复制到 handler 层。
+    /// 返回内部 Arc<MultiTokenManager>（供 spawn 长生命周期任务持有）。
+    pub fn token_manager_arc(&self) -> Arc<MultiTokenManager> {
+        self.token_manager.clone()
+    }
+
     pub fn token_manager(&self) -> &MultiTokenManager {
         &self.token_manager
     }
 
     /// 内部方法：带重试逻辑的 MCP API 调用
+    ///
+    /// 成功时返回 (响应, 实际使用的凭据 id)：调用方（websearch 快路径）的用量埋点
+    /// 需要它写 credential_id（此前返回裸 Response，快路径埋点只能写 None）。
     async fn call_mcp_with_retry(
         &self,
         request_body: &str,
         budget: &SharedRetryBudget,
-    ) -> anyhow::Result<reqwest::Response> {
+    ) -> anyhow::Result<(reqwest::Response, u64)> {
         let call_started = std::time::Instant::now();
         let max_retries =
             // 预算按「Kiro 路径**实际可选**的号数」算，而非 entries.len()：后者含 disabled
@@ -1992,6 +2256,22 @@ impl KiroProvider {
         for attempt in 0..max_retries {
             // 失败记录的 retries 用「已尝试次数 - 1」＝重试次数（与对话路径同口径）。
             attempts_used = attempt as u32;
+            // ⭐ 墙钟闸门：单请求 MCP 重试总时长超预算就停止（把最后错误透传给客户端，
+            // 让它自己退避）。本循环此前只有次数闸无墙钟 —— retry_delay 指数退避叠加
+            // 后，一条慢请求可以在小号池里拖过分钟级、反复扫同一个坏号，把偶发 429
+            // 拖成持续雪崩。与对话路径的 round_clock 闸门（见 call_api_with_retry）
+            // 同款语义：首次尝试(attempt==0)不受此限，保证至少打一次。
+            // 预算取 [`MCP_WALL_SECS`]（≈read_timeout×2+30）而非主路径 45s —— 推导
+            // 见该常量注释：45s < 单次合法耗时会掐死换号（同透传墙钟教训）。
+            if attempt > 0 && call_started.elapsed() >= Duration::from_secs(MCP_WALL_SECS) {
+                tracing::warn!(
+                    "单请求 MCP 重试已达墙钟预算 {}s（尝试 {}/{}），停止重试并透传上游错误，避免拖垮整池",
+                    MCP_WALL_SECS,
+                    attempt,
+                    max_retries
+                );
+                break;
+            }
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
             let ctx = match self.token_manager.acquire_context(None, None).await {
                 Ok(c) => {
@@ -2003,7 +2283,10 @@ impl KiroProvider {
                     if es.contains("retry_after_secs=") || es.contains("冷却") {
                         last_outcome = crate::usage::RequestOutcome::RateLimited;
                     }
-                    last_error = Some(e);
+                    // ⭐ 无号标记（P0）：选不到号 = 池子没有可用 Kiro 凭据（纯
+                    // custom_api 池 / 全池禁用）。打上标记供 `call_mcp` 入口识别并
+                    // 触发「无号直连」兜底；错误原文保留在链里，返回客户端前剥掉。
+                    last_error = Some(e.context(MCP_POOL_UNAVAILABLE_MARKER));
                     continue;
                 }
             };
@@ -2016,8 +2299,9 @@ impl KiroProvider {
                 None => {
                     last_outcome = crate::usage::RequestOutcome::RateLimited;
                     last_error = Some(anyhow::anyhow!(
-                        "凭据 #{} 所有端点桶均处于 429 封禁期",
-                        ctx.id
+                        "凭据 #{} 所有端点桶均处于 429 封禁期 retry_after_secs={}",
+                        ctx.id,
+                        self.shortest_endpoint_bucket_retry_after_secs(Some(ctx.id))
                     ));
                     // ⚠️ 不得 report_failure：None 代表**端点桶 30s 封禁**（瞬态），不是未知端点
                     // 配置错误。report_failure 会累计 failure_count → TooManyFailures 永久禁用
@@ -2093,6 +2377,33 @@ impl KiroProvider {
                         max_retries,
                         e
                     );
+                    // 上游 trace（P0-A）：网络错误无响应体，独立组装一条（status=None）。
+                    // 守卫只覆盖「读到失败 body 之后」的分支，这里在守卫组装点之前。
+                    if crate::kiro::upstream_trace::is_enabled() {
+                        crate::kiro::upstream_trace::emit(
+                            crate::kiro::upstream_trace::UpstreamTrace {
+                                ts: chrono::Utc::now().to_rfc3339(),
+                                credential_id: ctx.id,
+                                endpoint: endpoint.name().to_string(),
+                                url: url.clone(),
+                                region: req_cred.effective_upstream_region(&config).to_string(),
+                                model: None,
+                                attempt: attempt as u32,
+                                absorb_round: 0,
+                                upstream_calls: attempt as u32 + 1,
+                                status: None,
+                                retry_after_raw: None,
+                                retry_after_secs: None,
+                                body: None,
+                                network_error: Some(crate::kiro::upstream_trace::sanitize_body(
+                                    &e.to_string(),
+                                )),
+                                latency_ms: call_started.elapsed().as_millis() as u64,
+                                verdict: "network_error".to_string(),
+                                cred_ever_succeeded: self.token_manager.has_ever_succeeded(ctx.id),
+                            },
+                        );
+                    }
                     last_error = Some(e.into());
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
@@ -2106,6 +2417,31 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
+                // 上游 trace（P0-A）：守卫不覆盖成功路径（成功时 body 还没读，也不该读），
+                // 成功侧用独立 emit 直接发一条 verdict="success"（body 恒 None，对话内容绝不落盘）。
+                if crate::kiro::upstream_trace::is_enabled() {
+                    crate::kiro::upstream_trace::emit(
+                        crate::kiro::upstream_trace::UpstreamTrace {
+                            ts: chrono::Utc::now().to_rfc3339(),
+                            credential_id: ctx.id,
+                            endpoint: endpoint.name().to_string(),
+                            url: url.clone(),
+                            region: req_cred.effective_upstream_region(&config).to_string(),
+                            model: None,
+                            attempt: attempt as u32,
+                            absorb_round: 0,
+                            upstream_calls: attempt as u32 + 1,
+                            status: Some(status.as_u16()),
+                            retry_after_raw: None,
+                            retry_after_secs: None,
+                            body: None,
+                            network_error: None,
+                            latency_ms: call_started.elapsed().as_millis() as u64,
+                            verdict: "success".to_string(),
+                            cred_ever_succeeded: true,
+                        },
+                    );
+                }
                 // 用量埋点：MCP 成功路径也落一条记录。
                 // 历史缺陷：这里只调 report_success 让凭据 success_count +1，却没有任何
                 // emit_record，于是「凭据统计的成功次数」恒大于「用量库的记录数」
@@ -2117,15 +2453,52 @@ impl KiroProvider {
                     call_started.elapsed().as_millis() as u64,
                     attempt as u32,
                 ));
-                return Ok(response);
+                return Ok((response, ctx.id));
             }
 
             // 失败响应
+            // 先取 Retry-After（body 消费后 response 不再可用），原始串与解析值都要：
+            // trace 存原值；秒数认整数或 HTTP-date。
+            let retry_after_raw = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim().to_string());
+            let retry_after_secs = retry_after_raw
+                .as_deref()
+                .and_then(parse_retry_after_header_value);
             let body = response.text().await.unwrap_or_default();
+
+            // ── 上游 trace 失败守卫（P0-A）────────────────────────────────────
+            // 成功路径在 body 读取前已 return，守卫只覆盖失败分支；`verdict` 由下方各
+            // 失败分支打标签，漏标的分支自然落 unclassified（验收脚本据此统计）。
+            let mut mcp_trace_guard = crate::kiro::upstream_trace::FailureTraceGuard::new(
+                crate::kiro::upstream_trace::is_enabled(),
+                || crate::kiro::upstream_trace::UpstreamTrace {
+                    ts: chrono::Utc::now().to_rfc3339(),
+                    credential_id: ctx.id,
+                    endpoint: endpoint.name().to_string(),
+                    url: url.clone(),
+                    region: req_cred.effective_upstream_region(&config).to_string(),
+                    model: None,
+                    attempt: attempt as u32,
+                    absorb_round: 0,
+                    upstream_calls: attempt as u32 + 1,
+                    status: Some(status.as_u16()),
+                    retry_after_raw: retry_after_raw.clone(),
+                    retry_after_secs,
+                    body: Some(crate::kiro::upstream_trace::sanitize_body(&body)),
+                    network_error: None,
+                    latency_ms: call_started.elapsed().as_millis() as u64,
+                    verdict: crate::kiro::upstream_trace::VERDICT_UNCLASSIFIED.to_string(),
+                    cred_ever_succeeded: self.token_manager.has_ever_succeeded(ctx.id),
+                },
+            );
 
             // 额度用尽（**不门控状态码**，理由同对话路径那处的长注释：
             // 上游已从 402 改用 400，402 实测 6 小时 0 次而 400+OVERAGE 564 次）
             if endpoint.is_monthly_request_limit(&body) {
+                mcp_trace_guard.verdict("monthly_limit");
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if !has_available {
                     // 失败埋点（#11）：此前裸 bail，失败在面板上不存在。
@@ -2145,6 +2518,7 @@ impl KiroProvider {
 
             // 400 Bad Request
             if status.as_u16() == 400 {
+                mcp_trace_guard.verdict("generic_400");
                 crate::common::recovery_metrics::bump_mcp_failure();
                 crate::usage::emit_record(build_mcp_record(
                     ctx.id,
@@ -2157,6 +2531,8 @@ impl KiroProvider {
 
             // 401/403 凭据问题
             if matches!(status.as_u16(), 401 | 403) {
+                // 外层先标粗标签，子出口再覆盖成更精确的名字（verdict 最后一次写入生效）。
+                mcp_trace_guard.verdict("auth_4xx");
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会。
                 //
                 // ⚠️ **api_key 号必须跳过**：它没有 refreshToken，`refresh_token()` 对它是
@@ -2210,6 +2586,7 @@ impl KiroProvider {
                 // 上面那段注释记着「对话路径已修，本路径此前漏修」，而本仓 issue #2 的
                 // 结论就是「同一逻辑各写一份」正是漏改的成因。
                 if endpoint.is_subscription_unsupported(&body) {
+                    mcp_trace_guard.verdict("subscription_unsupported");
                     tracing::warn!(
                         "MCP 请求失败（订阅不覆盖本应用/模型，永久条件；不重试、不计凭据失败）: {} {}",
                         status,
@@ -2235,6 +2612,7 @@ impl KiroProvider {
                 // （403 曾被当永久封禁 → 12h 内 88 次误禁 + 36 次全池自愈活锁）。对话路径已修，
                 // 本路径此前漏修；且自动禁用落盘后（persist_disabled_state）该误禁**重启也回不来**。
                 if endpoint.is_temporary_rate_limit(&body) {
+                    mcp_trace_guard.verdict("temporary_rate_limit");
                     last_outcome = crate::usage::RequestOutcome::RateLimited;
                     tracing::warn!(
                         "MCP 请求失败（账户临时风控限速，非永久封禁；分钟级退避后 failover，尝试 {}/{}）: {} {}",
@@ -2276,6 +2654,7 @@ impl KiroProvider {
                 // 账户被永久暂停/封禁：禁用该号并换号（同样先于通用失败判定，
                 // 使 disabled_reason 落 AccountSuspended 而非 TooManyFailures）。
                 if endpoint.is_account_suspended(&body) {
+                    mcp_trace_guard.verdict("account_suspended");
                     tracing::error!(
                         "MCP 请求失败（账户被暂停/封禁，禁用凭据并切换，尝试 {}/{}）: {} {}",
                         attempt + 1,
@@ -2324,6 +2703,11 @@ impl KiroProvider {
 
             // 瞬态错误
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+                if status.as_u16() == 429 {
+                    mcp_trace_guard.verdict("rate_limited");
+                } else {
+                    mcp_trace_guard.verdict("server_error");
+                }
                 last_outcome = if status.as_u16() == 429 {
                     crate::usage::RequestOutcome::RateLimited
                 } else {
@@ -2369,6 +2753,7 @@ impl KiroProvider {
 
             // 其他 4xx
             if status.is_client_error() {
+                mcp_trace_guard.verdict("other_4xx");
                 // 失败埋点（#11）。
                 crate::common::recovery_metrics::bump_mcp_failure();
                 crate::usage::emit_record(build_mcp_record(
@@ -2408,9 +2793,12 @@ impl KiroProvider {
                 "MCP 请求失败：每客户端请求的上游调用预算已耗尽（shared_budget_exhausted=1）"
             ))
         } else {
-            Err(last_error.unwrap_or_else(|| {
-                anyhow::anyhow!("MCP 请求失败：已达到最大重试次数（{}次）", max_retries)
-            }))
+            Err(self.with_sealed_bucket_retry_after(
+                last_error.unwrap_or_else(|| {
+                    anyhow::anyhow!("MCP 请求失败：已达到最大重试次数（{}次）", max_retries)
+                }),
+                last_outcome,
+            ))
         }
     }
 
@@ -2427,6 +2815,7 @@ impl KiroProvider {
         is_stream: bool,
         is_1m: bool,
         budget: &SharedRetryBudget,
+        client_model: Option<&str>,
     ) -> anyhow::Result<(reqwest::Response, CallMeta)> {
         // 「基础」配额:一轮 failover 链最多摸几个号。吸收层开启时它**不是**本轮的实际配额
         // —— 实际配额还要被跨轮总额度夹一次(见 round_retry_quota)。刻意不叫 `max_retries`:
@@ -2454,6 +2843,19 @@ impl KiroProvider {
                 scaled
             };
         let mut last_error: Option<anyhow::Error> = None;
+        // ⭐ S3：重试链内**首个**上游 429 的显式 Retry-After（最早类型化 429 保留）。
+        //
+        // 重试链里第一个 429 的退避指令不该被后续 generic 错误（5xx 等）覆盖：
+        // 终态非 429 时用它把「429 语义 + 上游精确 RA」带回客户端（见下方
+        // `assemble_final_error`）。参考 zyphr 的 `take_rate_limit_error`（最早类型化
+        // 429 优先，ref-ZyphrZero-kiro.rs.md 机制 #8）。
+        //
+        // 🔴 m7（2026-08-16 对抗审查 RA MINOR）：RA 合并语义 `.or()` → `.max()`。
+        // `.or()` = 首个**带值**者胜出——第二个号 429 RA=120 时客户端拿首个 10s 就重试，
+        // 提前撞回上游仍在限流的窗口。`.max()` = 保留最大 RA（「上游说多久等多久」，
+        // 保守退避；首个 429 无 RA、后续 429 有 RA 时取后者；先 429 后 5xx（无 RA）
+        // 时首个 RA 仍保留——`None < Some`）。见 [`merge_upstream_429_retry_after`]。
+        let mut first_upstream_429_retry_after: Option<u64> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         // 本次请求重试链内「已因 429 冷却过」的凭据集合。防止同一个请求的一条重试链
         // 反复砸同一个号、把同一次限流事件当成多次独立事件累加 trigger_count / 指数延长冷却
@@ -2490,6 +2892,13 @@ impl KiroProvider {
         // 不加上限就是两个区来回打：A 区 403 → 换 B → B 区 403 → 换回 A → …… 一条客户端
         // 请求把额度全烧在同一个号的两个区之间，同一出口 IP 连打 = 正是风控要抓的突发特征。
         // 本仓刚因「吸收层放大」修过一轮，这里不重犯。
+        //
+        // ⭐ A-5 起本集合是**两条换区路径共享的「本请求已换区」标记**：L1 403 换区
+        // （下方 region_retry_target 分支）与 429 备区换桶（select_endpoint 返回
+        // `alt_region` 后的 Cow 重绑处）都往这里 insert，403 分支的门
+        // `!contains(&ctx.id)` 因此对**任何一条路径**先换过区的号都生效 ——
+        // 否则 429 换到备区后吃 403，L1 会按当前区算回原区，而原区桶还在封禁期，
+        // select_endpoint 又弹回备区 ⇒ 同一请求内 A→B→A→B 振荡。
         let mut region_switched_this_call: HashSet<u64> = HashSet::new();
         // ⭐ L1 换区后**本次请求内生效**的 region（id → region），在建请求时覆盖凭据的
         // `api_region`。
@@ -2514,13 +2923,17 @@ impl KiroProvider {
         // 一次解析同时取出模型信息与会话标识（conversationId），避免热路径上对
         // 整个请求体做两次全量 serde_json::from_str（大请求体尤其昂贵）。
         let (model, session_id) = Self::extract_model_and_session(request_body);
+        // 客户端**原始**模型名（调用方从入站 payload 传入；Kiro 请求体里的 modelId 已被
+        // converter 归一化成 Kiro id，不再是客户端原始名）。供成功/失败埋点的
+        // `requested_model` 口径；None = 调用方未提供（如 test 工具），回落请求体解析名。
+        let client_model_owned = client_model.map(str::to_string);
 
         // ⭐ 全局模型映射规则：**循环外只快照一次**（TIER1 热重载下同一请求的多次
         // failover 跳必须用同一份规则，否则第 1 跳 A→B、第 2 跳 A→C，`mapped_model`
         // 单值无从归属）。克隆的是规则表，映射在循环内按每凭据豁免决定是否应用。
         let mapping_rules = self.token_manager.config().model_mapping.clone();
         // 本次调用实际改写后的模型名（循环外声明，成功/失败路径共享；见 CallMeta.mapped_model）。
-        // None = 未命中映射 / 凭据豁免 / overload_fallback 路径。失败记录同样用它，
+        // None = 未命中映射 / 凭据豁免；overload_fallback 路径记 fallback 名。失败记录同样用它，
         // 保证「按 upstream_model 聚合」时失败样本不凭空消失（复现 #21 教训）。
         // ⚠️ 2026-08-11 起为「最后一跳」语义：每跳同步本跳真实映射结果（未映射也置 None），
         // 不再跨跳残留旧值，见循环内 mapped_this_attempt 之后的同步点。
@@ -2584,7 +2997,11 @@ impl KiroProvider {
         // ── 内置「上游 429 吸收层」──────────────────────────────────────────────
         // 吸收层在闸门之下（结构化保证不会被重入）。acquire_admission 已移至 handlers 层，
         // 两条路径统一在 handler 入口过闸，provider 不再重复调。
-        let absorb = AbsorbPolicy::from_config(&self.token_manager.config());
+        // ⭐ 配置快照：一次调用只取一份（与上方 mapping_rules 同约定）。此前 `config`
+        // 在下方每跳 attempt 循环内重读（ArcSwap load + 引用计数增减 × 每跳），
+        // 热更配置会让同一条请求的不同 failover 跳按不同配置走，行为不可复现。
+        let config = self.token_manager.config();
+        let absorb = AbsorbPolicy::from_config(&config);
         // deadline 与 call_started 同源:准入排队(最长 inbound_queue_max_wait_secs)也计入
         // 预算。若改成从此刻起算,客户端可见延迟 = 排队 30s + 吸收 45s = 75s ≈ shield 的
         // p50 73.2s,等于把病根换个地方搬进来。
@@ -2637,7 +3054,11 @@ impl KiroProvider {
             // 次 ⇒ 轮末 budget.used() ≤ ABSOLUTE_MAX_TOTAL_RETRIES（跨层总额度共享）。
             let max_retries = round_retry_quota(base_retry_quota, budget.used());
 
-            for attempt in 0..max_retries {
+            // 同号续跳：429 换桶 / L1 换区必须打回**刚失败的那个号**。
+            // 只靠把该号从排除集摘掉不够——选号按 RPM/在途排序，会优先捡还没打过的陪跑号，
+            // 备区 hop 被偷走（A-5 实测：受害者只打到当前区、备区 0 次，队列耗尽变 500）。
+            let mut reuse_ctx: Option<crate::kiro::token_manager::CallContext> = None;
+            'attempt: for attempt in 0..max_retries {
                 // 与成功分支的 `retries: attempt as u32` 同口径：记「已尝试次数 - 1」＝重试次数。
                 // 放在墙钟闸门**之前**递增：闸门 break 时也要反映"这一轮进来过"，
                 // 否则墙钟耗尽的失败会少记一次，而那正是要观测的形态。
@@ -2656,7 +3077,7 @@ impl KiroProvider {
                         max_retries,
                         absorb_round
                     );
-                    break;
+                    break 'attempt;
                 }
                 // 获取调用上下文（绑定 index、credentials、token）
                 //
@@ -2665,31 +3086,40 @@ impl KiroProvider {
                 // （`is_entry_selectable` 里的冷却硬门是唯一排除机制），线上它是 false ⇒
                 // 一个真实 429 被放大成连环 429。全池都试过时排除集自动退化（允许重选），
                 // 见 `acquire_context_excluding` 的不变量 1。
-                let ctx = match self
-                    .token_manager
-                    .acquire_context_excluding(
-                        model.as_deref(),
-                        session_id.as_deref(),
-                        &tried_this_call,
-                    )
-                    .await
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        // 全池冷却快速失败(带 retry_after_secs / "冷却")归类为 RateLimited,
-                        // 用量明细显示"限流"而非扎眼的"其它错误"(dwgx:那些其它错误 0/0 很恶心)。
-                        let es = e.to_string();
-                        if es.contains("retry_after_secs=") || es.contains("冷却") {
-                            last_outcome = crate::usage::RequestOutcome::RateLimited;
+                //
+                // 同号续跳（429 换桶 / L1 换区）跳过选号，沿用上一跳的 CallContext：
+                // 摘排除集只让该号**可被**选中，并不能让它胜过更空闲的陪跑号。
+                let same_cred_retry = reuse_ctx.is_some();
+                let ctx = if let Some(c) = reuse_ctx.take() {
+                    c
+                } else {
+                    match self
+                        .token_manager
+                        .acquire_context_excluding(
+                            model.as_deref(),
+                            session_id.as_deref(),
+                            &tried_this_call,
+                        )
+                        .await
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            // 全池冷却快速失败(带 retry_after_secs / "冷却")归类为 RateLimited,
+                            // 用量明细显示"限流"而非扎眼的"其它错误"(dwgx:那些其它错误 0/0 很恶心)。
+                            let es = e.to_string();
+                            if es.contains("retry_after_secs=") || es.contains("冷却") {
+                                last_outcome = crate::usage::RequestOutcome::RateLimited;
+                            }
+                            last_error = Some(e);
+                            continue 'attempt;
                         }
-                        last_error = Some(e);
-                        continue;
                     }
                 };
 
                 // 可观测:attempt>0 且真拿到了一个号 = 一次 failover 换号(真打了下一个号)。
                 // 放在 acquire_context 成功之后,避免全池冷却 continue(没拿到号)误计一跳。
-                if attempt > 0 {
+                // 同号续跳不是换号，不计 failover hop。
+                if attempt > 0 && !same_cred_retry {
                     crate::common::recovery_metrics::bump_failover_hop();
                     real_failover_happened = true;
                 }
@@ -2698,8 +3128,17 @@ impl KiroProvider {
                 // 必须在真正拿到号之后、发请求之前记 —— 记在发请求之后的话，一条在 send()
                 // 处失败（网络错误 continue）的路径就不会被记入，下一跳又选它。
                 tried_this_call.insert(ctx.id);
+                // ⭐ 链内首选号（Kiro 侧兜底）：透传未试过（预算尚未置位）时，本路径首个
+                // 拿到的号即整链首选；预算首写生效，不会覆盖透传已记的值（handlers 层
+                // 先试透传再落本路径）。供失败记录的 `first_attempted_credential_id`。
+                budget.note_first_attempt(ctx.id);
 
-                let config = self.token_manager.config();
+                // 配置来自循环外快照（见快照处的说明）：所有 failover 跳共用同一份。
+                // `'classify` 是 labeled **block**（不是 loop）：无标签 continue/break 仍
+                // 作用在外层 `for attempt`；`break 'classify` 只退出本块，好把 ctx 移进
+                // reuse_ctx（块内 rctx 借用结束后才能 move）。
+                let mut retry_same = false;
+                'classify: {
 
                 // ⭐ L1：本请求链内该号已被判定 region 错配 ⇒ 用换过的区建本次请求。
                 //
@@ -2718,12 +3157,14 @@ impl KiroProvider {
 
                 let machine_id = machine_id::generate_from_credentials(&call_creds, &config);
 
-                let (endpoint, alt_region) = match self.select_endpoint(&call_creds, ctx.id) {
+                let (selected_endpoint, alt_region) = match self.select_endpoint(&call_creds, ctx.id) {
                     Some(e) => e,
                     None => {
+                        last_outcome = crate::usage::RequestOutcome::RateLimited;
                         last_error = Some(anyhow::anyhow!(
-                            "凭据 #{} 所有端点桶均处于 429 封禁期（当前区与备用区的桶都在封禁中）",
-                            ctx.id
+                            "凭据 #{} 所有端点桶均处于 429 封禁期（当前区与备用区的桶都在封禁中）retry_after_secs={}",
+                            ctx.id,
+                            self.shortest_endpoint_bucket_retry_after_secs(Some(ctx.id))
                         ));
                         // ⚠️ 不得 report_failure：None 代表**端点桶 30s 封禁**（瞬态），不是未知
                         // 端点配置错误。report_failure 会累计 failure_count → TooManyFailures
@@ -2734,7 +3175,7 @@ impl KiroProvider {
                                 Some(ENDPOINT_BUCKET_THROTTLE.as_secs()),
                             );
                         }
-                        continue;
+                        continue 'attempt;
                     }
                 };
 
@@ -2747,6 +3188,22 @@ impl KiroProvider {
                 // 就会以最难查的形式破掉。
                 let call_creds: std::borrow::Cow<'_, KiroCredentials> = match alt_region {
                     Some(r) => {
+                        // ⭐ A-5 共享感知：429 备区换桶也置位「本请求已换区」标记
+                        // （与 L1 403 换区同一份 `region_switched_this_call`，见其声明处）。
+                        //
+                        // 不置位的振荡路径（实测形态）：本号当前区全封 → 换到备区 A →
+                        // A 区回 bearer-invalid 403 → L1 按「已换到的区」算
+                        // `region_retry_target` 换回原区 → 原区桶还在 30s 封禁期 →
+                        // select_endpoint 又把请求弹回备区 → 同一请求内 A→B→A→B，
+                        // L1 的换区意图被彻底打空、白烧上游往返，最后仍落 report_failure。
+                        // 置位后 L1 的门 `!contains(&ctx.id)` 直接挡住：本号本请求只换
+                        // 一次区，惩罚换号交给下方通用分支。
+                        //
+                        // 只置位标记、**不**写 `region_override_this_call`：那是 L1/L2 的
+                        // 「换区自纠正」通道（成功后把 api_region 持久化回写凭据），
+                        // 备区换桶只是躲避**瞬态**封禁，写进去会让一次 30s 封禁把号的
+                        // region 永久改掉，两条路径的语义就被污染了。
+                        region_switched_this_call.insert(ctx.id);
                         let mut c = call_creds.into_owned();
                         c.api_region = Some(r.to_string());
                         std::borrow::Cow::Owned(c)
@@ -2762,7 +3219,101 @@ impl KiroProvider {
                     is_1m,
                 };
 
-                let url = endpoint.api_url(&rctx);
+                last_credential_id = Some(ctx.id);
+
+                // ⭐ 端点级链式回退（P0 移植，A-5 痛点修复）：
+                // 上游 429/5xx 多为**端点级**容量问题而非凭据额度问题：同一凭据换到另一个
+                // 上游端点常常立刻成功（kiro-go 的 `endpointFallback` 即此机制；参考仓 jsjm
+                // 同款实现已实测 200）。链首 = `select_endpoint` 选中的端点（**桶机制 + EWMA
+                // 健康分已应用**，即「先走桶内选端点」）；链内顺延在**同一凭据、同一轮 attempt**
+                // 内立即重试：不消耗 max_retries 预算、不设凭据冷却、不扣健康分（这些只在整条
+                // 链都失败、落到下方凭据级分类逻辑时发生）—— 这是与既有「跨轮换端点」
+                // （429 封桶 → 下一轮 select_endpoint 换桶）正交的增量层。
+                //
+                // ⚠️ 但**每跳消耗共享预算**（`ABSOLUTE_MAX_TOTAL_RETRIES`，对抗审查 M1）：
+                // 链内跳不触碰 attempt 计数、不设冷却、不扣健康分，却是真实上游调用——
+                // 链循环顶部的预算闸保证整条客户端请求（含链式回退）总上游调用 ≤
+                // ABSOLUTE_MAX_TOTAL_RETRIES，吸收层 `round_retry_quota(base, used())`
+                // 的「进轮算一次」拦不住轮内追加的跳数，必须由闸补齐。
+                //
+                // 与参考仓的结构差异：参考仓在 acquire 后构造链并以配置端点为链首；本仓
+                // select_endpoint 已按桶/健康分选过端点，故以**选中端点**为链首，再按凭据
+                // 候选顺序（ksk_ 号 = CLI 族 4 端点）与 ENDPOINT_FALLBACK_ORDER 补齐。
+                let upstream_region = call_creds.effective_upstream_region(&config).to_string();
+                let chain = self.endpoint_chain_for(
+                    &selected_endpoint,
+                    &call_creds,
+                    config.endpoint_fallback,
+                    &upstream_region,
+                );
+                let mut chain_idx = 0usize;
+                // 第四元组 = 是否「bail 整个 attempt 循环」（全局并发闸满：系统饱和，
+                // 换号无意义，透传错误 —— 原 break 语义）；false = 链尾网络错误/凭据级
+                // 闸满（原 continue 语义：退避后换号重试）。
+                let (endpoint, response, last_url, bail_attempt_loop) = 'endpoint_chain: loop {
+                    let candidate = &chain[chain_idx];
+
+                    // ⭐ 链内共享预算闸（对抗审查 M1）：链式回退的每一跳都是**真实上游
+                    // 调用**，必须受「每请求 ≤ ABSOLUTE_MAX_TOTAL_RETRIES 次上游调用」的
+                    // 共享预算约束。此前的缺口：`round_retry_quota` 只在进轮时算一次，
+                    // 拦得住「跨轮」却拦不住「轮内链式回退追加的跳数」——4 attempts ×
+                    // 5 跳 = 20 次真实调用，共享预算账本 saturated 但实际超发，吸收层
+                    // 一轮即死。预算耗尽 = 系统饱和（可能是 MCP/压缩/透传等其它层先
+                    // 吃完的），换号无意义 → 与全局并发闸同语义，bail 整个 attempt
+                    // 循环，透传已有错误让客户端自己退避。
+                    if budget.remaining() == 0 {
+                        tracing::warn!(
+                            "每请求上游调用共享预算已用尽（{} 次），停止链式回退（尝试 {}/{}）",
+                            ABSOLUTE_MAX_TOTAL_RETRIES,
+                            attempt + 1,
+                            max_retries
+                        );
+                        if last_error.is_none() {
+                            last_error = Some(anyhow::anyhow!(
+                                "每请求上游调用共享预算已用尽（ABSOLUTE_MAX_TOTAL_RETRIES={}），\
+                                 停止链式回退并透传上游错误",
+                                ABSOLUTE_MAX_TOTAL_RETRIES
+                            ));
+                        }
+                        break 'endpoint_chain (candidate.clone(), None, candidate.api_url(&rctx), true);
+                    }
+
+                    // 死端点负缓存 / 协议隔离 / 桶封禁：跳过本跳（**链尾绝不跳过**：兜底铁律，
+                    // 否则整条链无人发送、response 恒 None）。桶封禁用与 select 侧同款判据
+                    // —— 链式回退加在桶机制**之上**，顺延同样避开已封禁桶，不破坏既有封禁语义。
+                    if chain_idx + 1 < chain.len() {
+                        if self.is_endpoint_dead(candidate.name(), &upstream_region) {
+                            tracing::debug!(
+                                "端点 {} 在 region {} 近期连接失败（负缓存 {}s 内），跳过本跳",
+                                candidate.name(),
+                                upstream_region,
+                                DEAD_ENDPOINT_TTL.as_secs()
+                            );
+                            chain_idx += 1;
+                            continue 'endpoint_chain;
+                        }
+                        if self.is_route_protocol_broken(candidate.name(), &upstream_region) {
+                            tracing::debug!(
+                                "端点 {} 在 region {} 近期返回非 event-stream 响应（协议隔离 {}s 内），跳过本跳",
+                                candidate.name(),
+                                upstream_region,
+                                PROTOCOL_BROKEN_TTL.as_secs()
+                            );
+                            chain_idx += 1;
+                            continue 'endpoint_chain;
+                        }
+                        if self
+                            .endpoint_buckets
+                            .lock()
+                            .get(&(ctx.id, candidate.bucket_key(&call_creds, &config)))
+                            .is_some_and(|&until| Instant::now() < until)
+                        {
+                            chain_idx += 1;
+                            continue 'endpoint_chain;
+                        }
+                    }
+
+                    let url = candidate.api_url(&rctx);
 
                 // ⭐ 全局模型映射：**选号之后、发上游之前**改写模型名。
                 // 白名单门（选号）只看**原始**模型名；改写后不再判白名单（用户拍板决定 3）。
@@ -2811,18 +3362,16 @@ impl KiroProvider {
                 mapped_model = mapped_this_attempt.as_ref().map(|(_, t)| t.clone());
                 // 本跳实际发给上游的 body：映射命中用改写后的，否则原样。
                 let body = match &mapped_this_attempt {
-                    Some((mapped_body, _)) => endpoint.transform_api_body(mapped_body, &rctx),
-                    None => endpoint.transform_api_body(request_body, &rctx),
+                    Some((mapped_body, _)) => candidate.transform_api_body(mapped_body, &rctx),
+                    None => candidate.transform_api_body(request_body, &rctx),
                 };
 
                 let base = self
                     .client_for(&ctx.credentials)?
                     .post(&url)
                     .body(body)
-                    .header("content-type", endpoint.content_type());
-                let request = endpoint.decorate_api(base, &rctx);
-
-                last_credential_id = Some(ctx.id);
+                    .header("content-type", candidate.content_type());
+                let request = candidate.decorate_api(base, &rctx);
 
                 // ⭐ 全局上游并发闸：限制**同时在飞**的上游 HTTP 调用数（防放大）。
                 //
@@ -2855,7 +3404,7 @@ impl KiroProvider {
                             ));
                             last_outcome = crate::usage::RequestOutcome::RateLimited;
                         }
-                        break;
+                        break 'endpoint_chain (candidate.clone(), None, url, true);
                     }
                 };
 
@@ -2895,7 +3444,14 @@ impl KiroProvider {
                                 self.upstream_per_credential_limit
                             ));
                         }
-                        continue;
+                        // 凭据级闸按号（ctx.id）计，链内换端点打的是同一个号 ⇒ 整链都会满。
+                        // 非链尾继续顺延（无网络 I/O，纯空转开销），链尾交循环外「退避换号」
+                        // （原 continue 语义，见循环外的 None 分支）。
+                        if chain_idx + 1 < chain.len() {
+                            chain_idx += 1;
+                            continue 'endpoint_chain;
+                        }
+                        break 'endpoint_chain (candidate.clone(), None, url, false);
                     }
                 };
 
@@ -2909,43 +3465,195 @@ impl KiroProvider {
                 // 共享预算同步扣减（2026-08-11 方案 A）：跨层（websearch 轮/压缩轮/透传）
                 // 共用同一「每请求」总额度，upstream_calls 只是本调用内的展示计数。
                 budget.consume(1);
-                let response = match send_result {
-                    Ok(resp) => resp,
+                match send_result {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        // 喂动态降档信号：**每个**上游响应都记一次（成功/4xx false，429/5xx true），
+                        // 供 base_retry_quota 处的 apply_retry_pressure 收缩重试预算。
+                        // 与 AIMD 的 report_upstream_rate_limited 是两套独立机制、两套门控，勿混。
+                        //
+                        // ⚠️ 5xx 必须也算压力（true）：纯 500 风暴同样是「疯狂重试」的来源，
+                        // 若只计 429，5xx 落进"成功"桶会把 rate() 稀释到趋近 0 → 降档永不触发。
+                        // 4xx（客户端错误）不算压力：它是请求本身的问题，不是上游过载信号。
+                        let code = status.as_u16();
+                        self.retry_pressure
+                            .lock()
+                            .record(code == 429 || code >= 500);
+                        // 拿到 HTTP 响应 = 连接层通了（哪怕是 429/5xx）→ 清负缓存。
+                        // 负缓存只针对"连不上"（DNS/TCP/TLS），绝不针对上游返回的业务错误。
+                        self.mark_endpoint_alive(candidate.name(), &upstream_region);
+                        // ⭐ 链式回退核心：瞬态错误（显式列表，见下）且还有备用端点 →
+                        // 立即换下一端点重试。**不消耗 max_retries 预算、不设凭据冷却、
+                        // 不扣健康分**（但每跳消耗共享预算，见链循环顶部的预算闸）
+                        // —— 与下方「整链失败后交凭据级分类」的既有路径正交。列表里
+                        // 的 5xx 是 MODEL_TEMPORARILY_UNAVAILABLE 一类的容量错误，换
+                        // host 可能恰有容量，链内换端点无害；400 形态
+                        // （INSUFFICIENT_MODEL_CAPACITY）不属于瞬态，仍走下方既有容量
+                        // 分支（不惩罚凭据的语义保留）。
+                        //
+                        // 🔴 对抗审查 m4：瞬态判定**收窄为显式列表**，不再用
+                        // `is_server_error()`（501/505 也被它顺延，白烧一跳）——
+                        // 501 Not Implemented / 505 HTTP Version Not Supported 是网关
+                        // 对请求的**确定性**答复，换 host 不会变；只认实测可恢复的
+                        // 408（请求超时）/ 429（限流）/ 500 / 502 / 503 / 504
+                        // （容量/网关抖动）/ 524（Cloudflare 上游超时）。
+                        let transient =
+                            matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504 | 524);
+                        if transient && chain_idx + 1 < chain.len() {
+                            // ⭐ 链首（select 选中的端点）被 429 证实容量满 → 封桶，让下一轮
+                            // `select_endpoint` 避开它（与下方既有 429 分支**同守卫**：
+                            // 凭据候选 >1 才封，否则 select 会因单候选全封而返回 None，把
+                            // 瞬态封禁累成凭据级冷却）。顺延跳**不**封桶：它们是纯立即重试，
+                            // 不产生调度状态（用户约束：链内跳不设冷却、不扣健康分）。
+                            //
+                            // 不封链首的后果（为什么必须有这行）：`select_endpoint` 的硬门
+                            // 只认桶封禁、EWMA 只看健康分，而链内跳两样都不写 ⇒ 容量满的链首
+                            // 健康分不降、桶不封 → 每轮都被选中 → 每请求白打一跳，且
+                            // `has_unthrottled_endpoint` 恒判"还有可用桶"、凭据冷却永不触发。
+                            if chain_idx == 0
+                                && status.as_u16() == 429
+                                && call_creds
+                                    .effective_endpoint_order(&self.default_endpoint)
+                                    .len()
+                                    > 1
+                            {
+                                self.endpoint_buckets.lock().insert(
+                                    (ctx.id, candidate.bucket_key(&call_creds, &config)),
+                                    Instant::now() + ENDPOINT_BUCKET_THROTTLE,
+                                );
+                            }
+                            tracing::warn!(
+                                "端点 {} 返回瞬态错误 {}，链式回退到下一端点（凭据 #{} 不计失败、不耗重试预算，尝试 {}/{}）",
+                                candidate.name(),
+                                status,
+                                ctx.id,
+                                attempt + 1,
+                                max_retries
+                            );
+                            chain_idx += 1;
+                            continue 'endpoint_chain;
+                        }
+                        break 'endpoint_chain (candidate.clone(), Some(resp), url, false);
+                    }
                     Err(e) => {
+                        // 连接层失败：记负缓存（下次自动跳过此 (端点, region)）。
+                        // reqwest::Error 的 `.is_connect()` 仅含 TCP connect 失败，DNS 归
+                        // `.is_request()`，故综合判断 request/connect/timeout（避免漏掉
+                        // DNS 不存在的场景）。
+                        if e.is_connect() || e.is_timeout() || e.is_request() {
+                            self.mark_endpoint_dead(candidate.name(), &upstream_region);
+                            tracing::debug!(
+                                "端点 {} 在 region {} 连接层失败，记入负缓存 (TTL {}s): {}",
+                                candidate.name(),
+                                upstream_region,
+                                DEAD_ENDPOINT_TTL.as_secs(),
+                                e
+                            );
+                        }
+                        if chain_idx + 1 < chain.len() {
+                            tracing::warn!(
+                                "端点 {} 发送失败，链式回退到下一端点: {}",
+                                candidate.name(),
+                                e
+                            );
+                            chain_idx += 1;
+                            continue 'endpoint_chain;
+                        }
+                        // 链尾：网络错误（上游 trace + 错误记录）。
                         tracing::warn!(
                             "API 请求发送失败（尝试 {}/{}）: {}",
                             attempt + 1,
                             max_retries,
                             e
                         );
+                        // 上游 trace（P0-A）：网络错误无响应体，独立组装一条（status=None）。
+                        // 守卫只覆盖「读到失败 body 之后」的分支，这里在守卫组装点之前。
+                        if crate::kiro::upstream_trace::is_enabled() {
+                            crate::kiro::upstream_trace::emit(
+                                crate::kiro::upstream_trace::UpstreamTrace {
+                                    ts: chrono::Utc::now().to_rfc3339(),
+                                    credential_id: ctx.id,
+                                    endpoint: candidate.name().to_string(),
+                                    url: url.clone(),
+                                    region: call_creds
+                                        .effective_upstream_region(&config)
+                                        .to_string(),
+                                    model: model.clone(),
+                                    attempt: attempt as u32,
+                                    absorb_round,
+                                    upstream_calls,
+                                    status: None,
+                                    retry_after_raw: None,
+                                    retry_after_secs: None,
+                                    body: None,
+                                    network_error: Some(crate::kiro::upstream_trace::sanitize_body(
+                                        &e.to_string(),
+                                    )),
+                                    latency_ms: call_started.elapsed().as_millis() as u64,
+                                    verdict: "network_error".to_string(),
+                                    cred_ever_succeeded: self
+                                        .token_manager
+                                        .has_ever_succeeded(ctx.id),
+                                },
+                            );
+                        }
                         // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
                         // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
                         last_error = Some(e.into());
                         last_outcome = crate::usage::RequestOutcome::NetworkError;
+                        break 'endpoint_chain (candidate.clone(), None, url, false);
+                    }
+                }
+                };
+
+                let response = match response {
+                    Some(resp) => resp,
+                    None => {
+                        if bail_attempt_loop {
+                            // 全局并发闸已满：停止本轮重试并透传错误（原 break 语义）。
+                            break 'attempt;
+                        }
+                        // 整条端点链都发送失败（网络层）或凭据级闸满：错误已在链内记录。
+                        // 与改动前逐字节一致的收尾（sleep + 换号重试）。
                         if attempt + 1 < max_retries {
                             sleep(Self::retry_delay(attempt)).await;
                         }
-                        continue;
+                        continue 'attempt;
                     }
                 };
 
                 let status = response.status();
 
-                // 喂动态降档信号：**每个**上游响应都记一次（成功/4xx false，429/5xx true），
-                // 供 base_retry_quota 处的 apply_retry_pressure 收缩重试预算。
-                // 与 AIMD 的 report_upstream_rate_limited 是两套独立机制、两套门控，勿混。
-                //
-                // ⚠️ 5xx 必须也算压力（true）：纯 500 风暴同样是「疯狂重试」的来源，
-                // 若只计 429，5xx 落进"成功"桶会把 rate() 稀释到趋近 0 → 降档永不触发。
-                // 4xx（客户端错误）不算压力：它是请求本身的问题，不是上游过载信号。
-                let code = status.as_u16();
-                self.retry_pressure
-                    .lock()
-                    .record(code == 429 || code >= 500);
-
                 // 成功响应
                 if status.is_success() {
                     self.token_manager.report_success(ctx.id);
+                    // 上游 trace（P0-A）：守卫不覆盖成功路径（成功时 body 还没读，也不该读），
+                    // 成功侧用独立 emit 直接发一条 verdict="success"（body 恒 None，对话内容绝不落盘）。
+                    if crate::kiro::upstream_trace::is_enabled() {
+                        crate::kiro::upstream_trace::emit(
+                            crate::kiro::upstream_trace::UpstreamTrace {
+                                ts: chrono::Utc::now().to_rfc3339(),
+                                credential_id: ctx.id,
+                                endpoint: endpoint.name().to_string(),
+                                url: last_url.clone(),
+                                region: call_creds
+                                    .effective_upstream_region(&config)
+                                    .to_string(),
+                                model: model.clone(),
+                                attempt: attempt as u32,
+                                absorb_round,
+                                upstream_calls,
+                                status: Some(status.as_u16()),
+                                retry_after_raw: None,
+                                retry_after_secs: None,
+                                body: None,
+                                network_error: None,
+                                latency_ms: call_started.elapsed().as_millis() as u64,
+                                verdict: "success".to_string(),
+                                cred_ever_succeeded: true,
+                            },
+                        );
+                    }
                     // 端点自适应派发：这个端点**受理了**这个凭据 → 记一次成功。
                     // 与 `report_success`（凭据健康）分开记：两者维度不同，一个号可能在
                     // 端点 A 上恒 200、在端点 B 上恒 400，凭据级健康分看不出这种差异。
@@ -2997,7 +3705,7 @@ impl KiroProvider {
                     }
                     let meta = CallMeta {
                         credential_id: ctx.id,
-                        model: model.clone(),
+                        model: client_model_owned.clone().or_else(|| model.clone()),
                         // 映射后名（仅映射命中并改写时 Some，否则 None=未映射）。注意：
                         // failover 跨多跳时取**最后一跳**的映射结果（2026-08-11 修复：
                         // 每跳同步，最后一跳未映射/豁免时同样置 None，不再残留旧跳值），
@@ -3015,13 +3723,44 @@ impl KiroProvider {
                     return Ok((response, meta));
                 }
 
-                // 失败响应：先从响应头提取 Retry-After（body 消费后头就没了），再读取 body
-                let retry_after_header = response
+                // 失败响应：先从响应头提取 Retry-After（body 消费后头就没了），再读取 body。
+                // 原始串与解析值都要：trace 存原值；秒数认整数或 HTTP-date。
+                let retry_after_raw = response
                     .headers()
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.trim().parse::<u64>().ok());
+                    .map(|s| s.trim().to_string());
+                let retry_after_header = retry_after_raw
+                    .as_deref()
+                    .and_then(parse_retry_after_header_value);
                 let body = response.text().await.unwrap_or_default();
+
+                // ── 上游 trace 失败守卫（P0-A）────────────────────────────────
+                // 成功路径在 body 读取前已 return，守卫只覆盖失败分支；`verdict` 由下方
+                // 各失败分支打标签（401/403 大分支先标粗标签、子出口再覆盖），漏标的分支
+                // 自然落 unclassified（验收脚本据此统计）。
+                let mut trace_guard = crate::kiro::upstream_trace::FailureTraceGuard::new(
+                    crate::kiro::upstream_trace::is_enabled(),
+                    || crate::kiro::upstream_trace::UpstreamTrace {
+                        ts: chrono::Utc::now().to_rfc3339(),
+                        credential_id: ctx.id,
+                        endpoint: endpoint.name().to_string(),
+                        url: last_url.clone(),
+                        region: call_creds.effective_upstream_region(&config).to_string(),
+                        model: model.clone(),
+                        attempt: attempt as u32,
+                        absorb_round,
+                        upstream_calls,
+                        status: Some(status.as_u16()),
+                        retry_after_raw: retry_after_raw.clone(),
+                        retry_after_secs: retry_after_header,
+                        body: Some(crate::kiro::upstream_trace::sanitize_body(&body)),
+                        network_error: None,
+                        latency_ms: call_started.elapsed().as_millis() as u64,
+                        verdict: crate::kiro::upstream_trace::VERDICT_UNCLASSIFIED.to_string(),
+                        cred_ever_succeeded: self.token_manager.has_ever_succeeded(ctx.id),
+                    },
+                );
 
                 // 订阅不覆盖本应用/模型：**永久**条件，换区与重试都无效 → 立即终止。
                 //
@@ -3036,6 +3775,7 @@ impl KiroProvider {
                 // 上游原话**原样带进错误消息**：本条加入前该文案全仓零命中，运维只能看到
                 // 网关自己的推测（「订阅档位或成本白名单」二选一），归因要靠猜。
                 if endpoint.is_subscription_unsupported(&body) {
+                    trace_guard.verdict("subscription_unsupported");
                     tracing::warn!(
                         "API 请求失败（订阅不覆盖本应用/模型，永久条件；不换区、不重试、\
                          不计凭据失败）: {} {}",
@@ -3050,7 +3790,7 @@ impl KiroProvider {
                         status,
                         body
                     ));
-                    break;
+                    break 'attempt;
                 }
 
                 // 客户端请求校验错误（如 TOOL_USE_RESULT_MISMATCH / TOOL_SCHEMA_INVALID）：请求构造问题，
@@ -3061,6 +3801,7 @@ impl KiroProvider {
                 if endpoint.is_client_validation_error(&body)
                     || body.contains("TOOL_SCHEMA_INVALID")
                 {
+                    trace_guard.verdict("client_validation");
                     tracing::warn!(
                         "API 请求失败（客户端请求校验错误，不重试）: {} {}",
                         status,
@@ -3073,7 +3814,7 @@ impl KiroProvider {
                         status,
                         body
                     ));
-                    break;
+                    break 'attempt;
                 }
 
                 // 账户级临时风控限速（suspicious activity + temporary limits）：
@@ -3081,6 +3822,7 @@ impl KiroProvider {
                 // activity" 的临时限速文案会被误判成永久封禁，白冻一个还能用的号 24h。
                 // 处置：只设短冷却 + 立即 failover，不禁用、不计永久失败。
                 if endpoint.is_temporary_rate_limit(&body) {
+                    trace_guard.verdict("temporary_rate_limit");
                     tracing::warn!(
                         "API 请求失败（账户临时风控限速，非永久封禁；短冷却后 failover，尝试 {}/{}）: {} {}",
                         attempt + 1,
@@ -3121,12 +3863,12 @@ impl KiroProvider {
                          （避免扫冷全池 + 同出口 IP 连续触发风控）",
                             suspicious_failovers_this_call
                         );
-                        break;
+                        break 'attempt;
                     }
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
-                    continue;
+                    continue 'attempt;
                 }
 
                 // 注：524 网关超时（Cloudflare 等）落入下方通用 5xx 分支即按可重试瞬态
@@ -3151,6 +3893,7 @@ impl KiroProvider {
                 //
                 // ⚠️ 位置必须在通用 400 分支**之前**（本分支现在就在那之前）；挪到之后即失效。
                 if endpoint.is_monthly_request_limit(&body) {
+                    trace_guard.verdict("monthly_limit");
                     tracing::warn!(
                         "API 请求失败（额度已用尽，禁用凭据并切换，尝试 {}/{}）: {} {}",
                         attempt + 1,
@@ -3181,7 +3924,7 @@ impl KiroProvider {
                             status,
                             body
                         ));
-                        break;
+                        break 'attempt;
                     }
                     last_error = Some(anyhow::anyhow!(
                         "{} API 请求失败: {} {}",
@@ -3189,12 +3932,13 @@ impl KiroProvider {
                         status,
                         body
                     ));
-                    continue;
+                    continue 'attempt;
                 }
 
                 // 账户被暂停/封禁：不论状态码，body 命中 suspend 信号即直接禁用并转移
                 // （不可自动恢复，等待人工处理，避免反复打已封的号）
                 if endpoint.is_account_suspended(&body) {
+                    trace_guard.verdict("account_suspended");
                     tracing::error!(
                         "API 请求失败（账户被暂停/封禁，禁用凭据并切换，尝试 {}/{}）: {} {}",
                         attempt + 1,
@@ -3217,7 +3961,7 @@ impl KiroProvider {
                             status,
                             body
                         ));
-                        break;
+                        break 'attempt;
                     }
                     last_error = Some(anyhow::anyhow!(
                         "{} API 请求失败（账户被暂停）: {} {}",
@@ -3240,11 +3984,11 @@ impl KiroProvider {
                         tracing::error!(
                             "本次请求已因账户暂停转移过一次，不再遍历号池（避免同 IP 连续触发风控）"
                         );
-                        break;
+                        break 'attempt;
                     }
                     suspended_this_call = true;
                     tokio::time::sleep(Self::retry_delay(attempt)).await;
-                    continue;
+                    continue 'attempt;
                 }
 
                 // 400 INVALID_MODEL_ID：该号已不能服务请求的模型（多为订阅取消/降级）。
@@ -3252,6 +3996,7 @@ impl KiroProvider {
                 // 而非直接把 400 透传（那样坏号还留在轮转里，下个请求又命中它）。
                 // 只有当所有号都返回它（report 返回 has_available=false）时，才是模型本身无效、透传。
                 if status.as_u16() == 400 && endpoint.is_invalid_model_id(&body) {
+                    trace_guard.verdict("invalid_model_id");
                     last_outcome = crate::usage::RequestOutcome::BadRequest;
                     // 模型级处置：只把"该号+该模型"记进短期黑名单并 failover 到对此模型仍可用的号；
                     // 绝不冷却/禁用整个号（该号对其它模型照常可用）。返回 false = 所有未禁用号都已对
@@ -3268,7 +4013,7 @@ impl KiroProvider {
                             body
                         ));
                         // 透传真实 400：这是客户端请求了一个所有号都不支持的模型，重试无意义。
-                        break;
+                        break 'attempt;
                     }
                     last_error = Some(anyhow::anyhow!(
                         "{} API 请求失败（凭据 #{} 对模型 {:?} INVALID_MODEL_ID，切换到仍支持的号）: {} {}",
@@ -3278,7 +4023,7 @@ impl KiroProvider {
                         status,
                         body
                     ));
-                    continue;
+                    continue 'attempt;
                 }
 
                 // ⭐ 400 + 模型容量不足 —— **必须排在下面那条通用 400 之前**。
@@ -3302,6 +4047,7 @@ impl KiroProvider {
 
                 // 400 Bad Request - 其它请求问题（客户端构造错误），重试/切换凭据无意义
                 if status.as_u16() == 400 && !is_capacity_400 {
+                    trace_guard.verdict("generic_400");
                     last_outcome = crate::usage::RequestOutcome::BadRequest;
                     last_error = Some(anyhow::anyhow!(
                         "{} API 请求失败: {} {}",
@@ -3309,11 +4055,13 @@ impl KiroProvider {
                         status,
                         body
                     ));
-                    break;
+                    break 'attempt;
                 }
 
                 // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
                 if matches!(status.as_u16(), 401 | 403) {
+                    // 外层先标粗标签，子出口再覆盖成更精确的名字（verdict 最后一次写入生效）。
+                    trace_guard.verdict("auth_4xx");
                     tracing::warn!(
                         "API 请求失败（可能为凭据错误，尝试 {}/{}）: {} {}",
                         attempt + 1,
@@ -3334,6 +4082,7 @@ impl KiroProvider {
                         && endpoint.is_feature_not_supported(&body)
                         && ctx.credentials.is_external_idp_credential()
                     {
+                        trace_guard.verdict("region_feature_403");
                         let corrected = self.token_manager.sync_region_from_arn_for(ctx.id);
                         self.token_manager
                             .mark_usage_403_feature_not_supported(ctx.id);
@@ -3355,7 +4104,7 @@ impl KiroProvider {
                                 body
                             ));
                             // continue → 下一轮 acquire_context 重克隆已改好 region 的 creds(不复用旧 ctx/url)。
-                            continue;
+                            continue 'attempt;
                         }
                         // 本地纠不动(ARN region 本身就是未开通那个,常见)→ failover 换号服务本请求,
                         // 后台异步重探已启动为该号后续请求恢复。给该号一段**认证冷却**(临时跳过、非禁用、
@@ -3382,7 +4131,7 @@ impl KiroProvider {
                             body
                         ));
                         // continue:下一轮 acquire_context 选别的号;全池不可用时由 max_retries/墙钟兜底透传。
-                        continue;
+                        continue 'attempt;
                     }
 
                     // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会。
@@ -3401,7 +4150,7 @@ impl KiroProvider {
                             .is_ok()
                         {
                             tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
-                            continue;
+                            continue 'attempt;
                         }
                         tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
                         // 刷新失败 = 认证态有问题，加一段冷却让调度避开它。
@@ -3437,6 +4186,7 @@ impl KiroProvider {
                     let bearer_invalid_but_proven = endpoint.is_bearer_token_invalid(&body)
                         && self.token_manager.has_ever_succeeded(ctx.id);
                     if bearer_invalid_but_proven {
+                        trace_guard.verdict("bearer_invalid_transient");
                         tracing::warn!(
                             "凭据 #{} 收到 bearer-invalid 403，但它已成功过 ⇒ 判为瞬态：\
                          只设短冷却 + failover，不计失败（防高并发下 3 次抖动把健康号打死）",
@@ -3474,7 +4224,7 @@ impl KiroProvider {
                             status,
                             body
                         ));
-                        continue;
+                        continue 'attempt;
                     }
 
                     // ⭐ L1：**从未成功过**的号吃 bearer-invalid 403 ⇒ 判 region 错配，换区重试。
@@ -3497,6 +4247,7 @@ impl KiroProvider {
                         && call_started.elapsed()
                             < Duration::from_secs(MAX_REQUEST_RETRY_BUDGET_SECS)
                     {
+                        trace_guard.verdict("region_mismatch_403");
                         // 用 `call_creds` 而非 `ctx.credentials`：前者才是**本次请求真正打出去**
                         // 的那个区（含本链内已生效的覆盖），据它算「另一个区」才不会算错。
                         let current = call_creds.effective_upstream_region(&config).to_string();
@@ -3530,7 +4281,8 @@ impl KiroProvider {
                                 status,
                                 body
                             ));
-                            continue;
+                            retry_same = true;
+                            break 'classify;
                         }
                     }
 
@@ -3553,7 +4305,7 @@ impl KiroProvider {
                             status,
                             body
                         ));
-                        break;
+                        break 'attempt;
                     }
 
                     last_error = Some(anyhow::anyhow!(
@@ -3565,7 +4317,7 @@ impl KiroProvider {
                     // 换号前退避：此前是裸 continue，401/403 风暴下会以零间隔连打多个号，
                     // 与 suspend 分支同一类自我放大。
                     tokio::time::sleep(Self::retry_delay(attempt)).await;
-                    continue;
+                    continue 'attempt;
                 }
 
                 // 503 MODEL_TEMPORARILY_UNAVAILABLE — 模型容量问题，非凭据问题。
@@ -3587,6 +4339,13 @@ impl KiroProvider {
                 if (status.as_u16() == 503 || status.as_u16() == 400)
                     && endpoint.is_model_temporarily_unavailable(&body)
                 {
+                    // 400 形态（INSUFFICIENT_MODEL_CAPACITY）与 503 形态（容量不足）分开标：
+                    // 两者处置相同但成因不同，trace 需要区分。
+                    if status.as_u16() == 400 {
+                        trace_guard.verdict("capacity_400");
+                    } else {
+                        trace_guard.verdict("model_unavailable");
+                    }
                     model_unavailable_attempts += 1;
                     tracing::warn!(
                         "模型暂时不可用（MODEL_TEMPORARILY_UNAVAILABLE，第 {}/{} 次）: {} {}",
@@ -3604,19 +4363,24 @@ impl KiroProvider {
                     ));
                     if model_unavailable_attempts > MAX_MODEL_UNAVAILABLE_RETRIES {
                         // 已用完慢速重试预算，透传过载错误给客户端，让其自行退避。
-                        break;
+                        break 'attempt;
                     }
                     // 慢速退避：1s base，比通用 200ms 更长，避免反复冲击过载路径。
                     sleep(Self::retry_delay_model_unavailable(
                         model_unavailable_attempts - 1,
                     ))
                     .await;
-                    continue;
+                    continue 'attempt;
                 }
 
                 // 429/408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
                 // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
                 if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+                    if status.as_u16() == 429 {
+                        trace_guard.verdict("rate_limited");
+                    } else {
+                        trace_guard.verdict("server_error");
+                    }
                     tracing::warn!(
                         "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
                         attempt + 1,
@@ -3626,6 +4390,10 @@ impl KiroProvider {
                     );
                     // 429 限流：优先换端点桶（另一 host = 上游另一限流桶），同号换完所有端点
                     // 才走凭据级冷却换号。（仍不禁用、不计永久失败，冷却到期自动恢复）
+                    // ⭐ S2：本次 429 的显式上游 RA，供错误串 marker 透传给客户端
+                    // （凭据冷却在下方共用同一值；配额类 429 被上方 monthly-limit 分支
+                    // 先接走，不会到这里 —— marker 恒为速率类）。
+                    let mut upstream_retry_after: Option<u64> = None;
                     if status.as_u16() == 429 {
                         last_outcome = crate::usage::RequestOutcome::RateLimited;
                         // 上游 429 → 入站整形 RPM 自动挡乘性降档(削平后续入站速率,别继续挤爆上游)。
@@ -3636,6 +4404,12 @@ impl KiroProvider {
                         // 优先用上游给出的精确重置时间：响应头 Retry-After 优先，其次错误 body
                         let retry_after =
                             retry_after_header.or_else(|| endpoint.extract_retry_after_secs(&body));
+                        // S2/S3：记下本次 429 的显式 RA（客户端透传 marker）+ 重试链内
+                        // 429 RA 的合并（m7：`.max()` 保留最大 RA，见声明处说明与
+                        // [`merge_upstream_429_retry_after`]）。
+                        upstream_retry_after = retry_after;
+                        first_upstream_429_retry_after =
+                            merge_upstream_429_retry_after(first_upstream_429_retry_after, retry_after);
 
                         // 🔀 端点桶换桶：**仅当该凭据有回退端点**（端点顺序 > 1，如 ksk_ 的
                         // `cli`/`cli-runtime` 两个独立限流桶）才封禁当前 host 桶 30s 并尝试换下一
@@ -3656,12 +4430,14 @@ impl KiroProvider {
                                 Instant::now() + ENDPOINT_BUCKET_THROTTLE,
                             );
                             if self.has_unthrottled_endpoint(&call_creds, ctx.id) {
-                                // ⭐ 照抄 bearer-invalid 403 换区先例（见上文 `tried_this_call.remove`
+                                // ⭐ 照抄 bearer-invalid 403 换区先例（见上文排除集摘除
                                 // 的注释）：摘掉"本请求已试过"标记，让 acquire_context_excluding 下轮
                                 // 可重新选中本号；同时**不设凭据级冷却**（也不占 rate_limited_this_call，
-                                // 否则"全部端点都封"时去重逻辑误判已冷却过、永远不设冷却），避免调度
-                                // 改换别的号——那样换端点就落空了。
+                                // 否则"全部端点都封"时去重逻辑误判已冷却过、永远不设冷却）。
+                                // 仅摘排除集不够：选号会优先更空闲的陪跑号，换桶/换区 hop 被偷走。
+                                // 下一跳必须沿用本 CallContext（reuse_ctx），不重新选号。
                                 tried_this_call.remove(&ctx.id);
+                                retry_same = true;
                                 tracing::warn!(
                                     "凭据 #{} 端点 {} 429 ⇒ 封桶 {}s，换下一端点继续（本请求链内）",
                                     ctx.id,
@@ -3703,12 +4479,25 @@ impl KiroProvider {
                             }
                         }
                     }
-                    last_error = Some(anyhow::anyhow!(
-                        "{} API 请求失败: {} {}",
-                        api_type,
-                        status,
-                        body
-                    ));
+                    // ⭐ S2：429 且上游给了显式 Retry-After → 把网关自己的 marker
+                    // （`upstream_retry_after=N`）打进错误串，由 map_provider_error 的
+                    // A7 分支决议成客户端 Retry-After 头（优先级：上游真值 > 配置 > 8s）。
+                    // 与 `retry_after_secs=`（号池冷却真值，A5 全池语义）刻意不同名——
+                    // 单凭据上游 429 复用它会落 A5 的「所有凭据冷却」文案，语义错位。
+                    // 配额类 429 不会到这里（上方 monthly-limit 分支不门控状态码先接走）。
+                    last_error = Some(match upstream_retry_after {
+                        Some(secs) => anyhow::anyhow!(
+                            "{} API 请求失败: {} {} {}{}",
+                            api_type,
+                            status,
+                            body,
+                            crate::anthropic::handlers::UPSTREAM_RETRY_AFTER_MARKER_PREFIX,
+                            secs
+                        ),
+                        None => {
+                            anyhow::anyhow!("{} API 请求失败: {} {}", api_type, status, body)
+                        }
+                    });
                     if attempt + 1 < max_retries {
                         // 429 用专用长退避（1s→2s→4s→8s）：被限流时短重试只会连打同一上游；
                         // 5xx/408 仍走通用 200ms 指数（基础设施瞬态，快速重试合理）。
@@ -3718,11 +4507,15 @@ impl KiroProvider {
                             sleep(Self::retry_delay(attempt)).await;
                         }
                     }
-                    continue;
+                    if retry_same {
+                        break 'classify;
+                    }
+                    continue 'attempt;
                 }
 
                 // 其他 4xx - 通常为请求/配置问题：直接返回，不计入凭据失败
                 if status.is_client_error() {
+                    trace_guard.verdict("other_4xx");
                     last_outcome = crate::usage::RequestOutcome::BadRequest;
                     last_error = Some(anyhow::anyhow!(
                         "{} API 请求失败: {} {}",
@@ -3730,7 +4523,7 @@ impl KiroProvider {
                         status,
                         body
                     ));
-                    break;
+                    break 'attempt;
                 }
 
                 // 兜底：当作可重试的瞬态错误处理（不切换凭据）
@@ -3750,6 +4543,10 @@ impl KiroProvider {
                 ));
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
+                }
+                } // 'classify
+                if retry_same {
+                    reuse_ctx = Some(ctx);
                 }
             }
 
@@ -3783,6 +4580,8 @@ impl KiroProvider {
                 // 放弃结局的区别是承重的：这是**每请求硬上限**，抬任何 upstreamRetryAbsorb*
                 // 旋钮都不会改变结局 —— 归到 budget_exhausted 会把运维引向抬预算（无效）。
                 crate::common::recovery_metrics::bump_absorb_retry_quota_exhausted();
+                // 告警：跨轮总重试额度耗尽（每请求硬上限，抬任何吸收旋钮都不改变结局的强信号）。
+                crate::common::alerting::bump("absorb_retry_quota_exhausted");
                 tracing::warn!(
                     absorb_stop = "retry_quota_exhausted",
                     rounds = absorb_round,
@@ -3809,7 +4608,7 @@ impl KiroProvider {
             // 只能靠这组数回答。共用一个桶的话，开三个开关后面板上仍是一个数 ⇒ 无法归因，
             // 也就无法决定该关掉哪个（外挂那 11.6:1 的重试比正是不分类别一律重试的账单）。
             if !absorb.class_allowed(class) {
-                use crate::anthropic::AbsorbClass;
+                use crate::model::AbsorbClass;
                 match class {
                     AbsorbClass::SwapWindow => {
                         crate::common::recovery_metrics::bump_absorb_suspend_skipped()
@@ -3868,6 +4667,8 @@ impl KiroProvider {
                 // 本条的瓶颈是**总预算**,该抬 `upstreamRetryAbsorbBudgetSecs`
                 // (换号空窗类则是 upstreamRetryAbsorbSwapBudgetSecs)。
                 crate::common::recovery_metrics::bump_absorb_budget_exhausted();
+                // 告警：吸收总预算不足一轮（429 风暴下的典型结局）。
+                crate::common::alerting::bump("absorb_budget_exhausted");
                 tracing::warn!(
                     absorb_stop = "budget_too_small_for_round",
                     rounds = absorb_round,
@@ -3887,10 +4688,12 @@ impl KiroProvider {
             crate::common::recovery_metrics::bump_absorb_round();
             // 每类各一个 round 计数器:哪一类在真起作用只能靠这组数回答(见 recovery_metrics 说明)。
             {
-                use crate::anthropic::AbsorbClass;
+                use crate::model::AbsorbClass;
                 match class {
                     AbsorbClass::PoolCooldown(_) => {
-                        crate::common::recovery_metrics::bump_absorb_round_pool_cooldown()
+                        crate::common::recovery_metrics::bump_absorb_round_pool_cooldown();
+                        // 告警：全池冷却吸收轮（429 风暴信号，冷却窗口内去重）。
+                        crate::common::alerting::bump("absorb_pool_cooldown");
                     }
                     AbsorbClass::UpstreamRateLimit => {
                         crate::common::recovery_metrics::bump_absorb_round_rate_limit()
@@ -3918,6 +4721,8 @@ impl KiroProvider {
         // 的不算池耗尽（该区分语义不变，见 `real_failover_happened` 声明处）。
         if real_failover_happened {
             crate::common::recovery_metrics::bump_failover_exhausted();
+            // 告警：全池 failover 号全灭（整条请求失败）。
+            crate::common::alerting::bump("failover_exhausted");
         }
 
         // 所有吸收轮与重试都失败:埋点一条失败记录后返回错误。
@@ -3978,12 +4783,14 @@ impl KiroProvider {
                                 self.token_manager.report_success(ctx.id);
                                 let meta = CallMeta {
                                     credential_id: ctx.id,
-                                    model: Some(fallback_model_id.clone()),
-                                    // overload_fallback 显式跳过映射：fallback 名是运维拍板的
-                                    // 目标，再套全局映射会依赖 HashMap 迭代顺序产生不确定行为
-                                    // （A→B 且 B→C 时 fallback=B 是否再被改写无从判定）。
-                                    // 记原始 fallback 名即可（upstream 口径回落 model）。
-                                    mapped_model: None,
+                                    // 契约：model 恒为客户端原始名（requested_model 口径）。
+                                    model: client_model_owned.clone().or_else(|| model.clone()),
+                                    // overload_fallback 显式跳过**全局映射表**：fallback 名是
+                                    // 运维拍板的目标，再套全局映射会依赖 HashMap 迭代顺序产生
+                                    // 不确定行为（A→B 且 B→C 时 fallback=B 是否再被改写无从判定）。
+                                    // 它就是"实际发给上游的名"，直接进 mapped_model
+                                    // （upstream_model 口径；不再回落 model 造成失真）。
+                                    mapped_model: Some(fallback_model_id.clone()),
                                     session_id: session_id.clone(),
                                     is_streaming: is_stream,
                                     retries: (model_unavailable_attempts + 1) as u32,
@@ -3994,6 +4801,11 @@ impl KiroProvider {
                                 return Ok((resp, meta));
                             }
                             Ok(resp) => {
+                                // 🔴 F2（对抗审查 2026-08-15）：fallback 尝试**发出后无论成败**，
+                                // mapped_model 都要更新为 fallback 名（与成功路径 :4366 同键空间）——
+                                // 否则失败样本 fail_record.upstream_model 归到主循环名/原始名，
+                                // by_model 聚合失真。fallback 场景恰是上游过载时最可能失败的时候。
+                                mapped_model = Some(fallback_model_id.clone());
                                 tracing::warn!(
                                     "overload_fallback_model {} 也失败: {}",
                                     fallback_model_id,
@@ -4001,6 +4813,7 @@ impl KiroProvider {
                                 );
                             }
                             Err(e) => {
+                                mapped_model = Some(fallback_model_id.clone());
                                 tracing::warn!(
                                     "overload_fallback_model {} 请求错误: {}",
                                     fallback_model_id,
@@ -4014,23 +4827,26 @@ impl KiroProvider {
         }
         }
 
-        let final_error = last_error.unwrap_or_else(|| {
-            if budget.remaining() == 0 {
-                // 每客户端请求的共享上游预算已耗尽（2026-08-11 方案 A）：可能发生在
-                // websearch 回灌靠后轮次或压缩重试轮——「每请求 ≤4 次上游」的承诺达成后
-                // 不再空打，错误上抛给客户端自己退避。
-                anyhow::anyhow!(
-                    "{} API 请求失败：每客户端请求的上游调用预算已耗尽（shared_budget_exhausted=1）",
-                    api_type
-                )
-            } else {
-                anyhow::anyhow!(
-                    "{} API 请求失败：已达到最大重试次数（{}次）",
-                    api_type,
-                    base_retry_quota
-                )
-            }
-        });
+        let final_error = self.with_sealed_bucket_retry_after(
+            last_error.unwrap_or_else(|| {
+                if budget.remaining() == 0 {
+                    // 每客户端请求的共享上游预算已耗尽（2026-08-11 方案 A）：可能发生在
+                    // websearch 回灌靠后轮次或压缩重试轮——「每请求 ≤4 次上游」的承诺达成后
+                    // 不再空打，错误上抛给客户端自己退避。
+                    anyhow::anyhow!(
+                        "{} API 请求失败：每客户端请求的上游调用预算已耗尽（shared_budget_exhausted=1）",
+                        api_type
+                    )
+                } else {
+                    anyhow::anyhow!(
+                        "{} API 请求失败：已达到最大重试次数（{}次）",
+                        api_type,
+                        base_retry_quota
+                    )
+                }
+            }),
+            last_outcome,
+        );
         // ⭐ 吸收层真的重试过却仍失败,且部署侧要求这类终态回 503:给错误串打机器可读标记,
         // 由 `map_provider_error` 的第一条分支换状态码。
         //
@@ -4052,20 +4868,31 @@ impl KiroProvider {
         } else {
             final_error
         };
+        // ⭐ S3：最早类型化 429 保留 —— 把重试链内首个上游 429 的显式 RA 并入终态
+        // （若终态是 generic 瞬态失败且未被既有标记分支覆盖）。限定集见
+        // `assemble_final_error`：吸收耗尽 503 不转换、永久态/配额/背压分支不转换。
+        let final_error =
+            assemble_final_error(final_error, first_upstream_429_retry_after, last_outcome);
         let mut fail_record = crate::usage::RequestRecord::new(
             uuid::Uuid::new_v4().to_string(),
-            model.clone().unwrap_or_default(),
+            client_model_owned.clone().or(model.clone()).unwrap_or_default(),
         );
         fail_record.credential_id = last_credential_id;
+        // ⭐ 失败记录必须带「链内首选号」（N4）：透传 failover 首跳已由共享预算记录
+        // （handlers 先试透传再落本路径，预算里是整条链真正最先尝试的号；本路径首个
+        // 选中的号兜底）。此前失败样本 credential_id=None 且无首选号信息，面板看不到
+        // 「死号恒选」—— 首选号恒为某号却全链失败时，说明该号每次都被选中最前却被换掉。
+        fail_record.first_attempted_credential_id = budget.first_attempted();
         fail_record.session_id = session_id.clone();
         fail_record.is_streaming = is_stream;
         fail_record.latency_ms = call_started.elapsed().as_millis() as u64;
         fail_record.outcome = last_outcome;
-        // ⭐ 失败记录同样带双口径：`requested_model` = 客户端原始名（= model），
-        // `upstream_model` = 循环内最后成功映射的名（选号后、改写成功才可能非 None；
-        // 全池冷却/准入超时等根本没进循环的失败路径为 None，聚合层回落 model）。
+        // ⭐ 失败记录同样带双口径：`requested_model` = 客户端原始名（= client_model，
+        // 未提供时回落请求体解析名），`upstream_model` = 循环内最后成功映射的名
+        // （选号后、改写成功才可能非 None；全池冷却/准入超时等根本没进循环的失败
+        // 路径为 None，聚合层回落 model）。
         // 缺失会让「按 upstream_model 聚合」时失败样本凭空消失 → 成功率偏乐观（#21 教训）。
-        fail_record.requested_model = model.clone();
+        fail_record.requested_model = client_model_owned.clone().or(model.clone());
         fail_record.upstream_model = mapped_model.clone();
         // ⭐ 失败记录必须带真实换号次数。此前这里没有设 `retries` → 恒为默认 0，
         // 使「烧掉 12 次换号才失败」与「第一次就失败」在面板上不可区分。
@@ -4075,6 +4902,48 @@ impl KiroProvider {
         crate::usage::emit_record(fail_record);
 
         Err(final_error)
+    }
+
+    /// 从原始 `metadata.user_id` 提取会话 UUID（S6 P1-1 透传 session 归一）。
+    ///
+    /// 语义镜像 `anthropic::converter::extract_session_id`（converter.rs:857）——
+    /// 透传路径的埋点 session 必须与 Kiro 路径**同源**：Kiro 的 conversationId（L1）
+    /// 由同一函数从 user_id 提取，两条路径共用同一个 key，同一会话跨 Kiro/透传
+    /// 不再拆成两个 by_session key；同时只把 UUID 落 trace，`account_uuid` /
+    /// `user_xxx_account__` 前缀等明文不再进 trace（脱敏，S6 P1-4）。
+    ///
+    /// 提取不到（无 session / 非法形状）→ `None`（不再回落原始 user_id 串）。
+    ///
+    /// ⚠️ converter 的版本是私有函数（本次改动范围不含 converter.rs），这里按同一
+    /// 语义复制一份。若将来 converter 侧改动提取逻辑，必须同步本函数（或把 converter
+    /// 的函数提升为 `pub` 后删掉本副本——两份拷贝必然漂移是本仓已记的教训）。
+    fn extract_session_uuid(user_id: &str) -> Option<String> {
+        // JSON 格式: {"device_id":"...","account_uuid":"...","session_id":"UUID"}
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id) {
+            if let Some(session_id) = json.get("session_id").and_then(|v| v.as_str()) {
+                if Self::is_valid_uuid_shape(session_id) {
+                    return Some(session_id.to_string());
+                }
+            }
+        }
+        // 字符串格式: user_xxx_account__session_0b4445e1-...
+        if let Some(pos) = user_id.find("session_") {
+            // 安全：用 get(..36) 而非定长字节切片。客户端可控串可能在第 36 字节落在
+            // 多字节 UTF-8 字符中间，定长切片会 panic（converter 同款防御）。
+            if let Some(uuid_str) = user_id[pos + 8..].get(..36) {
+                if Self::is_valid_uuid_shape(uuid_str) {
+                    return Some(uuid_str.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// 简单校验 UUID 形状（36 字符 + 4 个连字符；镜像 converter::is_valid_uuid）。
+    /// 只做形状校验（与 converter 一致），不做 hex 校验——客户端真实 UUID 全 hex、
+    /// L2 派生键是合法 UUID 形状，均不受影响。
+    fn is_valid_uuid_shape(s: &str) -> bool {
+        s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4
     }
 
     /// 从请求体中一次性提取模型信息与会话标识（conversationId）。
@@ -4110,6 +4979,13 @@ impl KiroProvider {
         let session_id = conversation_state
             .and_then(|cs| cs.get("conversationId"))
             .and_then(|v| v.as_str())
+            // S6 P1-2 会话键形状门：会话键只认 UUID 形状。converter 产的 conversationId
+            // 恒为 UUID 形状（L1 提取校验 / L2 派生格式化 / L3 random），非 UUID 形状只
+            // 可能是异常值，不再进 by_session / traces。
+            // ⚠️ 局限（诚实标注）：L3 随机兜底（converter.rs:1058）产的是**合法形状**的
+            // 随机 UUID，provider 无法与 L1 真会话区分——根治需 converter 侧打 is_derived
+            // 标记（研究 P1-2），本次改动范围不含 converter.rs，该残余留待同系改动。
+            .filter(|s| Self::is_valid_uuid_shape(s))
             .map(|s| s.to_string());
 
         (model, session_id)
@@ -4176,9 +5052,677 @@ impl KiroProvider {
     }
 }
 
+/// 重试链内 429 显式 Retry-After 的合并（2026-08-16 对抗审查 m7：RA MINOR）。
+///
+/// `.max()` 而非 `.or()`：`.or()` 是**首个带值者**胜出——attempt1 的号 429 RA=10、
+/// attempt2 的号 429 RA=120 时，客户端拿首个 10s 就重试，提前撞回上游仍在限流的
+/// 窗口（被第二个号明确告知要等 120s）。`.max()` 保留**最大 RA**（「上游说多久等
+/// 多久」的保守口径）：`max(None, Some(10)) = Some(10)`（首个 429 无 RA、后续有 RA
+/// 时取后续）；`max(Some(120), None) = Some(120)`（先 429 后 5xx 无 RA 时首个 RA
+/// 仍保留——`None < Some`，5xx 不能稀释 429 的退避指令）。
+///
+/// 抽成纯函数便于测试（与 `assemble_final_error` 同范式）——若回退成 `.or()`，
+/// `merge_upstream_429_retry_after_keeps_max` 断言红。
+fn merge_upstream_429_retry_after(
+    current: Option<u64>,
+    retry_after: Option<u64>,
+) -> Option<u64> {
+    current.max(retry_after)
+}
+
+/// S3：最早类型化 429 保留 —— 决定是否把重试链内首个上游 429 的显式 RA 并入终态错误串。
+///
+/// 场景（scheduling-429-research.md §2.3）：多号池 attempt1 = A 号 429（上游 RA 30s）、
+/// attempt2 = C 号 5xx → 终态按**最后一个**错误分类 → 客户端拿 503+3s 而不是 429+30s，
+/// 丢失「429 语义 + 上游精确 RA」（CC 对 429 走 `max(Retry-After, 退避)` 精确等待，
+/// 对 503 只能指数退避，更早重打）。这里把 marker 并入终态串，map_provider_error 的
+/// A7 分支（含 marker 判据）返回 429 + 上游 RA。
+///
+/// RA 值由 [`merge_upstream_429_retry_after`] 以 `.max()` 语义产生（m7：保留最大 RA，
+/// 而非首见值）；本函数只负责「是否并入」，不重算。
+///
+/// # 限定（scheduling-429-research.md 方案 S2 的限定集）
+///
+/// ① **吸收层耗尽路径不转换**：`absorb_budget_exhausted=1` 的 503 是「网关已尽力」的
+///    兼容语义（Cursor 见 429 掐会话），A2 分支本来就是 map_provider_error 第一条 ——
+///    该 marker 存在即跳过；
+/// ② **永久态/配额/背压分支不转换**：subscription_unsupported / model_unsupported /
+///    inbound_admission_timeout / upstream_gate_full / shared_budget / 配额类
+///    （各带自己的结构化 marker 或 reason 词表），转换会让对应分支的语义被 429 吞掉；
+/// ③ **终态已是 429+RA 或带号池真值不重复打**（已有 marker / `retry_after_secs=`）；
+/// ④ **仅 generic 瞬态终态转换**（last_outcome ∈ ServerError/OtherError/RateLimited，
+///    覆盖 5xx/408/传输层/裸 429 终态）—— 认证失败/400/配额/风控/模型容量等已识别
+///    终态保持原映射（与 zyphr 只在「终态 generic」时保留类型化 429 的语义一致）。
+///
+/// 抽成纯函数便于测试（与 `retry_delay` 等纯函数同范式）。
+fn assemble_final_error(
+    final_error: anyhow::Error,
+    first_upstream_429_retry_after: Option<u64>,
+    last_outcome: crate::usage::RequestOutcome,
+) -> anyhow::Error {
+    let Some(earliest_ra) = first_upstream_429_retry_after else {
+        return final_error;
+    };
+    let s = final_error.to_string();
+    let marker = crate::anthropic::handlers::UPSTREAM_RETRY_AFTER_MARKER_PREFIX;
+    let eligible = !s.contains(marker)
+        && !s.contains("retry_after_secs=")
+        && !s.contains(crate::anthropic::handlers::ABSORB_BUDGET_EXHAUSTED_MARKER)
+        && !s.contains("shared_budget_exhausted=1")
+        && !s.contains("subscription_unsupported=1")
+        && !s.contains("model_unsupported_by_pool=1")
+        && !s.contains("inbound_admission_timeout=1")
+        && !s.contains("upstream_gate_full=1")
+        && !s.contains("quota_exhausted_all=1")
+        && !crate::kiro::endpoint::default_is_monthly_request_limit(&s)
+        && matches!(
+            last_outcome,
+            crate::usage::RequestOutcome::ServerError
+                | crate::usage::RequestOutcome::OtherError
+                | crate::usage::RequestOutcome::RateLimited
+        );
+    if eligible {
+        // 与吸收 marker 同款：用 `context` 拼接保留原始错误链（面板/日志排障线索），
+        // marker 必须与原文在同一层（anyhow 的 Display 只打最外层）。
+        anyhow::anyhow!("{} {}{}", final_error, marker, earliest_ra)
+    } else {
+        final_error
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::absorb_policy::ABSORB_MIN_BACKOFF;
+    use super::retry_budget::MAX_RETRIES_PER_CREDENTIAL;
+
+    #[test]
+    fn parse_retry_after_header_accepts_delta_seconds_and_http_date() {
+        assert_eq!(parse_retry_after_header_value("12"), Some(12));
+        assert_eq!(parse_retry_after_header_value(" 7 "), Some(7));
+        assert_eq!(parse_retry_after_header_value("not-a-date"), None);
+        let future = (chrono::Utc::now() + chrono::Duration::seconds(90))
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+        let secs = parse_retry_after_header_value(&future).expect("HTTP-date 应解析");
+        assert!(
+            (60..=120).contains(&secs),
+            "未来 90s 的 HTTP-date 应落在 60..=120，实际 {secs} ({future})"
+        );
+        let past = "Wed, 21 Oct 2015 07:28:00 GMT";
+        assert_eq!(parse_retry_after_header_value(past), Some(0));
+    }
+
+    // ===== S4：透传池冷却标签独立（状态码 → 秒数 + 原因）=====
+
+    /// 映射表契约（2026-08-16 S4）：每个状态码的 `(秒数, 原因)` 必须精确匹配。
+    /// 原因只决定面板 `cooldownReason`/`cooldownCode` 展示；秒数是既有调参
+    /// （401/403 用 `AuthTransient` 仍是 180s，不走该变体 20s 默认时长）。
+    /// 回退即 FAIL：S4 前全部冷却硬编码 `RateLimitExceeded`（401 在面板显示
+    /// 「速率限制」误导排障）→ 原因断言失败。
+    #[test]
+    fn passthrough_cooldown_reason_mapping_table() {
+        use crate::kiro::cooldown::CooldownReason as R;
+        // 认证类（key 失效/403）→ AuthTransient，180s 非瞬态冷却。
+        assert_eq!(
+            KiroProvider::passthrough_cooldown_for(401),
+            (180, Some(R::AuthTransient))
+        );
+        assert_eq!(
+            KiroProvider::passthrough_cooldown_for(403),
+            (180, Some(R::AuthTransient))
+        );
+        // 配额耗尽（中转站常用 402 表额度）→ QuotaExhausted。
+        assert_eq!(
+            KiroProvider::passthrough_cooldown_for(402),
+            (180, Some(R::QuotaExhausted))
+        );
+        // 限流 → RateLimitExceeded（保留原标签）。
+        assert_eq!(
+            KiroProvider::passthrough_cooldown_for(429),
+            (5, Some(R::RateLimitExceeded))
+        );
+        // 站点不认请求（模型/tool/role）→ 5s 调度跳过（现状保留）。
+        assert_eq!(
+            KiroProvider::passthrough_cooldown_for(400),
+            (5, Some(R::RateLimitExceeded))
+        );
+        assert_eq!(
+            KiroProvider::passthrough_cooldown_for(404),
+            (5, Some(R::RateLimitExceeded))
+        );
+        // 服务器错误 → ServerError（5s 调度跳过 + 标签）。
+        assert_eq!(
+            KiroProvider::passthrough_cooldown_for(500),
+            (5, Some(R::ServerError))
+        );
+        assert_eq!(
+            KiroProvider::passthrough_cooldown_for(502),
+            (5, Some(R::ServerError))
+        );
+        assert_eq!(
+            KiroProvider::passthrough_cooldown_for(599),
+            (5, Some(R::ServerError))
+        );
+        // 网络错误（无状态码，code=0）与其它码：不冷却。
+        assert_eq!(KiroProvider::passthrough_cooldown_for(0), (0, None));
+        assert_eq!(KiroProvider::passthrough_cooldown_for(422), (0, None));
+        assert_eq!(KiroProvider::passthrough_cooldown_for(600), (0, None));
+    }
+
+    // ===== MCP 无号直连（P0：web_search 快路径去 profileArn 依赖）=====
+
+    /// 直连头契约：**绝不注入 profileArn**（kiro-gateway 证明上游不依赖它），
+    /// 只带 gateway 同款的最小三件套 + 按凭据类型的 tokentype。
+    #[test]
+    fn mcp_direct_headers_never_inject_profile_arn() {
+        let mut social = KiroCredentials::default();
+        social.auth_method = Some("social".to_string());
+        social.profile_arn = Some("arn:aws:codewhisperer:us-east-1:1:profile/OWN".to_string());
+        let headers = KiroProvider::mcp_direct_headers(&social, "tok");
+        assert!(
+            !headers.iter().any(|(k, _)| *k == "x-amzn-kiro-profile-arn"),
+            "直连头绝不允许出现 profileArn（social 号自带 ARN 也一样不带）"
+        );
+        assert!(
+            headers.iter().any(|(k, v)| *k == "Authorization" && v == "Bearer tok"),
+            "必须带 Bearer Authorization"
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| *k == "x-amzn-codewhisperer-optout" && v == "false"),
+            "必须带 x-amzn-codewhisperer-optout（gateway 同款）"
+        );
+        assert!(
+            !headers.iter().any(|(k, _)| *k == "tokentype"),
+            "social 号不带 tokentype"
+        );
+    }
+
+    /// api_key（ksk_）号直连带 `tokentype: API_KEY`（与 decorate_mcp 同口径）。
+    #[test]
+    fn mcp_direct_headers_api_key_gets_tokentype() {
+        let mut api_key = KiroCredentials::default();
+        api_key.auth_method = Some("api_key".to_string());
+        api_key.kiro_api_key = Some("ksk_x".to_string());
+        let headers = KiroProvider::mcp_direct_headers(&api_key, "ksk_x");
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| *k == "tokentype" && v == "API_KEY"),
+            "ksk_ 号直连必须带 tokentype: API_KEY"
+        );
+    }
+
+    /// external_idp 号直连带 `tokentype: EXTERNAL_IDP`。
+    #[test]
+    fn mcp_direct_headers_external_idp_gets_tokentype() {
+        let mut ext = KiroCredentials::default();
+        ext.auth_method = Some("external_idp".to_string());
+        let headers = KiroProvider::mcp_direct_headers(&ext, "t");
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| *k == "tokentype" && v == "EXTERNAL_IDP"),
+            "external_idp 号直连必须带 tokentype: EXTERNAL_IDP"
+        );
+    }
+
+    /// 开关默认开（「默认开无号直连尝试，失败降级现状」——实测前置要求）。
+    #[test]
+    fn mcp_direct_bypass_defaults_to_enabled() {
+        assert!(
+            MCP_DIRECT_BYPASS_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
+            "无号直连开关默认必须开启（失败由降级兜底）"
+        );
+    }
+
+    /// 接线守卫①：`call_mcp` 入口必须含「标记识别 → 直连兜底 → 剥标记返回」三段。
+    ///
+    /// 回退即 FAIL：把 call_mcp 改回裸转发（直连不接线 = 结构性缺陷修不了）。
+    #[test]
+    fn call_mcp_is_wired_for_direct_bypass() {
+        let full = include_str!("provider.rs");
+        let prod = full
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(full);
+        let call_mcp = prod
+            .split("pub async fn call_mcp(")
+            .nth(1)
+            .expect("call_mcp 不应被改名");
+        let call_mcp = call_mcp
+            .split("\n    }\n")
+            .next()
+            .expect("call_mcp 应有函数体收尾");
+        assert!(
+            call_mcp.contains("call_mcp_with_retry(request_body, budget)"),
+            "call_mcp 必须先走原路径"
+        );
+        assert!(
+            call_mcp.contains("strip_prefix(MCP_POOL_UNAVAILABLE_MARKER)"),
+            "必须识别无号标记（否则直连永不触发）"
+        );
+        assert!(
+            call_mcp.contains("call_mcp_direct(request_body, budget)"),
+            "无号时必须调用直连兜底"
+        );
+        assert!(
+            call_mcp.contains("MCP_DIRECT_BYPASS_ENABLED.load"),
+            "直连必须受开关门控"
+        );
+    }
+
+    /// 接线守卫②：`call_mcp_with_retry` 的 acquire_context 失败分支必须打无号标记。
+    ///
+    /// 回退即 FAIL：把 `.context(MCP_POOL_UNAVAILABLE_MARKER)` 删掉或改回
+    /// `last_error = Some(e)` → 直连永不触发。
+    #[test]
+    fn acquire_context_failure_marks_pool_unavailable() {
+        let full = include_str!("provider.rs");
+        let prod = full
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(full);
+        let mcp_fn = prod
+            .split("async fn call_mcp_with_retry")
+            .nth(1)
+            .expect("call_mcp_with_retry 不应被改名");
+        let acquire_err = mcp_fn
+            .split("last_error = Some(e.context(MCP_POOL_UNAVAILABLE_MARKER));")
+            .count();
+        assert_eq!(
+            acquire_err,
+            2,
+            "acquire_context 失败分支必须打 mcp_pool_unavailable=1 标记（仅此一处）"
+        );
+    }
+
+    /// 接线守卫③：直连 URL 必须恒为 IDE 协议的 `runtime.{region}.kiro.dev/mcp`，
+    /// 不得随凭据端点类型变成 `q.*`（CLI 端点的 mcp_url 是 q.* 兜底，不适合直连）。
+    #[test]
+    fn call_mcp_direct_uses_ide_mcp_url_only() {
+        let full = include_str!("provider.rs");
+        let prod = full
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(full);
+        let direct = prod
+            .split("async fn call_mcp_direct(")
+            .nth(1)
+            .expect("call_mcp_direct 不应被改名");
+        let direct = direct
+            .split("\n    }\n")
+            .next()
+            .expect("call_mcp_direct 应有函数体收尾");
+        assert!(
+            direct.contains("IdeEndpoint::new()"),
+            "直连必须显式构造 IDE 端点（MCP 端点是 IDE 协议的）"
+        );
+        assert!(
+            !direct.contains("for_credentials("),
+            "直连不得按凭据类型路由端点（ksk_ 号会拿到 cli 端点的 q.* 兜底 URL）"
+        );
+        assert!(
+            !direct.contains("amazonaws.com"),
+            "直连 URL 不得出现 q.* 兜底"
+        );
+    }
+
+    /// 接线守卫④：直连必须消费共享预算（真实发了上游请求 = 打了就是打了）。
+    #[test]
+    fn call_mcp_direct_consumes_budget() {
+        let full = include_str!("provider.rs");
+        let prod = full
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(full);
+        let direct = prod
+            .split("async fn call_mcp_direct(")
+            .nth(1)
+            .expect("call_mcp_direct 不应被改名");
+        let direct = direct
+            .split("\n    }\n")
+            .next()
+            .expect("call_mcp_direct 应有函数体收尾");
+        assert_eq!(
+            direct.matches("budget.consume(1)").count(),
+            2,
+            "直连成功与发送失败两条出口都必须扣共享预算"
+        );
+    }
+
+    /// 接线守卫⑤：直连必须拒绝非 2xx 响应（不得当成功解析）。
+    ///
+    /// 回退即 FAIL：删掉 status 检查 → 无 ARN 形态被上游拒（403/400）时错误体
+    /// 会被当 MCP JSON-RPC 解析，反序列化失败掩盖真实原因，且可能把「上游不认
+    /// 无 ARN」伪装成「解析错误」误导排障。
+    #[test]
+    fn call_mcp_direct_rejects_non_success_status() {
+        let full = include_str!("provider.rs");
+        let prod = full
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(full);
+        let direct = prod
+            .split("async fn call_mcp_direct(")
+            .nth(1)
+            .expect("call_mcp_direct 不应被改名");
+        let direct = direct
+            .split("\n    }\n")
+            .next()
+            .expect("call_mcp_direct 应有函数体收尾");
+        assert!(
+            direct.contains("is_success()"),
+            "直连必须检查上游 status（非 2xx 不得当成功返回）"
+        );
+    }
+
+    /// M3 接线守卫⑥：直连非 2xx 失败必须落短负缓存，且键含凭据 id。
+    ///
+    /// 回退即 FAIL：删掉 mark → 直连失败零记忆，每请求再打死 token 一跳
+    /// （风控窗口加流量，与网关纪律矛盾）。把键改回 region-only → 同区坏 ksk
+    /// 连坐健康 OAuth。
+    #[test]
+    fn call_mcp_direct_marks_negative_cache_on_failure() {
+        let full = include_str!("provider.rs");
+        let prod = full
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(full);
+        let direct = prod
+            .split("async fn call_mcp_direct(")
+            .nth(1)
+            .expect("call_mcp_direct 不应被改名");
+        let direct = direct
+            .split("\n    }\n")
+            .next()
+            .expect("call_mcp_direct 应有函数体收尾");
+        let mark = ["mark_endpoint_dead", "("].concat();
+        let id_slot = ["mcp-direct@", "{}"].concat();
+        assert!(
+            direct.contains(&mark) && direct.contains("is_success()"),
+            "直连非 2xx 必须落负缓存（60s 内不重试该号直连）"
+        );
+        assert!(
+            direct.contains(&id_slot),
+            "负缓存端点名必须嵌入凭据 id，避免同 region 一号毒全池"
+        );
+    }
+
+    /// M3 接线守卫⑦：直连发送前必须检查短负缓存（否则负缓存是死代码）。
+    ///
+    /// 回退即 FAIL：删掉 `is_mcp_direct_blocked` 检查 → 负缓存永远读不到，
+    /// 401 后 60s 内仍每请求白打一跳。
+    #[test]
+    fn call_mcp_direct_checks_negative_cache_before_send() {
+        let full = include_str!("provider.rs");
+        let prod = full
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(full);
+        let direct = prod
+            .split("async fn call_mcp_direct(")
+            .nth(1)
+            .expect("call_mcp_direct 不应被改名");
+        let direct = direct
+            .split("\n    }\n")
+            .next()
+            .expect("call_mcp_direct 应有函数体收尾");
+        assert!(
+            direct.contains("is_mcp_direct_blocked("),
+            "直连发送前必须查负缓存（失败 60s 内跳过直连降级回池子错误）"
+        );
+    }
+
+    /// 同请求 401 必须换号：删掉 excluding / exclude.insert 会退回单 token。
+    #[test]
+    fn call_mcp_direct_rotates_on_same_request_after_failure() {
+        let full = include_str!("provider.rs");
+        let prod = full
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(full);
+        let direct = prod
+            .split("async fn call_mcp_direct(")
+            .nth(1)
+            .expect("call_mcp_direct 不应被改名");
+        let direct = direct
+            .split("\n    }\n")
+            .next()
+            .expect("call_mcp_direct 应有函数体收尾");
+        let acquire = ["acquire_mcp_direct_token", "_excluding"].concat();
+        assert!(
+            direct.contains(&acquire),
+            "直连必须按排除集选下一个 token（同请求换号）"
+        );
+        assert!(
+            direct.contains("exclude.insert"),
+            "试过的 id 必须进排除集，否则会钉死同一号"
+        );
+    }
+
+    /// 缺口 B 守卫：overload fallback **成功**路径的 CallMeta 双口径必须与主循环一致
+    /// —— `model` 恒为客户端原始名（client_model 回落），`mapped_model` 记 fallback 名
+    /// （它就是实际发给上游的名，直接进 upstream_model 口径）。
+    ///
+    /// 历史缺陷：`model` 被覆盖成 fallback 名、`mapped_model` 恒 None ⇒ requested_model
+    /// 失真（面板以为客户端点了 fallback 模型）+ upstream_model 回落 model 双重错误。
+    /// 回退即 FAIL：把 `model:` 改回 `Some(fallback_model_id` 或把 `mapped_model:` 改回
+    /// `None`，断言失败。
+    #[test]
+    fn overload_fallback_success_keeps_client_model_in_meta() {
+        let full = include_str!("provider.rs");
+        let prod = full
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(full);
+        let retry_fn = prod
+            .split("async fn call_api_with_retry")
+            .nth(1)
+            .expect("call_api_with_retry 不应被改名");
+        // 切到 fallback 分支：从「尝试 overload_fallback_model」日志到失败记录组装之前。
+        let fb = retry_fn
+            .split("overload_fallback_model: {}")
+            .nth(1)
+            .expect("fallback 分支锚点不应被改名");
+        let fb_ok = fb
+            .split("let final_error = last_error")
+            .next()
+            .unwrap_or(fb);
+        let mapped = ["mapped_model: ", "Some(fallback_model_id"].concat();
+        assert!(
+            fb_ok.contains(&mapped),
+            "fallback 成功路径必须把 fallback 名记入 mapped_model（upstream_model 口径），\
+             否则按 upstream_model 聚合时该样本按原始名统计"
+        );
+        assert!(
+            fb_ok.contains("model: client_model_owned.clone().or_else(|| model.clone())"),
+            "fallback 成功路径的 CallMeta.model 必须用客户端原始名（client_model 回落），\
+             不得覆盖成 fallback 名（requested_model 契约）"
+        );
+    }
+
+    /// ⭐ S3：最早类型化 429 保留 —— 终态错误组装（`assemble_final_error`）的行为集。
+    ///
+    /// 场景（research §2.3）：attempt1 = A 号 429（上游 RA 30s）、attempt2 = C 号 5xx
+    /// → 终态按最后一个错误分类 → 客户端拿 503+3s 而不是 429+30s。修复后终态串
+    /// 必须带上最早 429 的 RA marker，由 map_provider_error 的 A7 分支映射回 429。
+    #[test]
+    fn assemble_final_error_keeps_earliest_429_ra_over_later_5xx() {
+        let final_err = anyhow::anyhow!(
+            "流式 API 请求失败: 502 Bad Gateway {{\"message\":\"upstream\"}}"
+        );
+        // 先 429(RA=30) 后 502 → 终态仍带 RA=30。
+        let merged = assemble_final_error(
+            final_err,
+            Some(30),
+            crate::usage::RequestOutcome::ServerError,
+        );
+        let s = merged.to_string();
+        assert!(
+            s.contains(&format!("{}30", crate::anthropic::handlers::UPSTREAM_RETRY_AFTER_MARKER_PREFIX)),
+            "最早类型化 429 的 RA=30 必须被并入 5xx 终态（否则客户端拿 503+3s 而非 429+30s）: {s}"
+        );
+    }
+
+    /// 🔴 m7 回归（2026-08-16 对抗审查 RA MINOR）：重试链内 429 RA 合并必须是
+    /// `.max()` 语义——**保留最大 RA**（「上游说多久等多久」）。
+    ///
+    /// `.or()`（首见值胜出）的 bug：attempt1 号 429 RA=10、attempt2 号 429 RA=120 时
+    /// 客户端拿首个 10s 就重试，提前撞回上游仍在限流的窗口（120s 是更晚、更保守的
+    /// 退避指令，却被首个值吞掉）。
+    ///
+    /// 回退即 FAIL：把 `merge_upstream_429_retry_after` 改回 `.or()` → 本条
+    /// 「先 10 后 120 → 终态 120」断言红。
+    #[test]
+    fn merge_upstream_429_retry_after_keeps_max() {
+        // 先 10 后 120 → 终态 120（m7 核心场景）。
+        assert_eq!(
+            merge_upstream_429_retry_after(Some(10), Some(120)),
+            Some(120),
+            "第二个号 429 RA=120 时客户端不得拿首个 10s 就重试"
+        );
+        // 逆序（120 先、10 后）→ 仍是 120。
+        assert_eq!(merge_upstream_429_retry_after(Some(120), Some(10)), Some(120));
+        // 首个 429 无 RA、后续 429 有 RA → 取后续（max(None, Some) = Some）。
+        assert_eq!(merge_upstream_429_retry_after(None, Some(10)), Some(10));
+        // 先 429 后 5xx（无 RA）→ 首个 RA 仍保留（max(Some, None) = Some，
+        // 5xx 不能稀释 429 的退避指令）——与既有
+        // `assemble_final_error_keeps_earliest_429_ra_over_later_5xx` 场景兼容。
+        assert_eq!(merge_upstream_429_retry_after(Some(10), None), Some(10));
+        // 全程无 RA → None。
+        assert_eq!(merge_upstream_429_retry_after(None, None), None);
+    }
+
+    /// S3 限定：没有前置 429 时终态逐字不变（默认配置路径零影响）。
+    #[test]
+    fn assemble_final_error_untouched_without_earlier_429() {
+        let err = anyhow::anyhow!("流式 API 请求失败: 502 Bad Gateway");
+        let out = assemble_final_error(err, None, crate::usage::RequestOutcome::ServerError);
+        assert_eq!(out.to_string(), "流式 API 请求失败: 502 Bad Gateway");
+    }
+
+    /// S3 限定①：吸收层耗尽路径（absorb_budget_exhausted=1，503 语义）不转换。
+    #[test]
+    fn assemble_final_error_never_converts_absorb_exhausted() {
+        let marker = crate::anthropic::handlers::ABSORB_BUDGET_EXHAUSTED_MARKER;
+        let err = anyhow::anyhow!("流式 API 请求失败: 429 Too Many Requests {}", marker);
+        let out = assemble_final_error(
+            err,
+            Some(30),
+            crate::usage::RequestOutcome::RateLimited,
+        );
+        assert!(
+            !out.to_string()
+                .contains(crate::anthropic::handlers::UPSTREAM_RETRY_AFTER_MARKER_PREFIX),
+            "吸收耗尽 503 不得被 429 marker 转换（Cursor 掐会话兼容）"
+        );
+    }
+
+    /// S3 限定②：永久态/配额/背压/已带真值的终态一律不转换。
+    #[test]
+    fn assemble_final_error_never_converts_recognized_branches() {
+        let cases: Vec<(&str, crate::usage::RequestOutcome)> = vec![
+            ("流式 API 请求失败: 403 Forbidden subscription_unsupported=1", crate::usage::RequestOutcome::BadRequest),
+            ("模型不被本号池支持 model_unsupported_by_pool=1", crate::usage::RequestOutcome::OtherError),
+            ("所有凭据均在冷却（0/2）retry_after_secs=10", crate::usage::RequestOutcome::RateLimited),
+            ("入站限速排队超时 inbound_admission_timeout=1 retry_after_secs=3", crate::usage::RequestOutcome::OtherError),
+            ("上游并发闸已满 upstream_gate_full=1 retry_after_secs=2", crate::usage::RequestOutcome::OtherError),
+            ("流式 API 请求失败: 429 {\"reason\":\"MONTHLY_REQUEST_COUNT\"}", crate::usage::RequestOutcome::RateLimited),
+            ("流式 API 请求失败（所有凭据已用尽）quota_exhausted_all=1: 429 x", crate::usage::RequestOutcome::QuotaExhausted),
+            ("每客户端请求的上游调用预算已耗尽 shared_budget_exhausted=1", crate::usage::RequestOutcome::OtherError),
+        ];
+        for (raw, outcome) in cases {
+            let out = assemble_final_error(anyhow::anyhow!("{}", raw), Some(30), outcome);
+            assert_eq!(
+                out.to_string(),
+                raw,
+                "已识别分支不得被最早 429 的 RA 转换: {raw}"
+            );
+        }
+    }
+
+    /// S3 限定③④：终态已是 429+RA（自带 marker）不重复打；非 generic 终态
+    /// （认证失败/400/模型容量）不转换（与 zyphr 只在终态 generic 时保留一致）。
+    #[test]
+    fn assemble_final_error_skips_already_marked_and_recognized_outcomes() {
+        let marker = crate::anthropic::handlers::UPSTREAM_RETRY_AFTER_MARKER_PREFIX;
+        // 终态本身就是 429 + RA=60：保留最早 30 还是覆盖成 60？—— 保留终态自身（已带 marker）。
+        let already = format!("流式 API 请求失败: 429 Too Many Requests {}60", marker);
+        let out = assemble_final_error(
+            anyhow::anyhow!("{}", already),
+            Some(30),
+            crate::usage::RequestOutcome::RateLimited,
+        );
+        assert_eq!(
+            out.to_string(),
+            already,
+            "终态已带自己的 marker 时不重复并入（终态自身是最后一条 429 的信息）"
+        );
+
+        // 认证失败终态（AuthFailed）：不转换（401/403 语义保持）。
+        let auth = anyhow::anyhow!("流式 API 请求失败: 401 Unauthorized {{\"message\":\"x\"}}");
+        let out = assemble_final_error(
+            auth,
+            Some(30),
+            crate::usage::RequestOutcome::AuthFailed,
+        );
+        assert!(
+            !out.to_string().contains(marker),
+            "认证失败终态不得被 429 转换（与 zyphr take_rate_limit_error 语义一致）"
+        );
+
+        // 400 终态（BadRequest）：不转换。
+        let bad = anyhow::anyhow!("流式 API 请求失败: 400 Bad Request {{\"message\":\"x\"}}");
+        let out = assemble_final_error(bad, Some(30), crate::usage::RequestOutcome::BadRequest);
+        assert!(!out.to_string().contains(marker));
+
+        // 模型容量终态（ModelUnavailable）：不转换（有独立的 503 overload 语义）。
+        let cap = anyhow::anyhow!("流式 API 请求失败: 503 MODEL_TEMPORARILY_UNAVAILABLE");
+        let out = assemble_final_error(
+            cap,
+            Some(30),
+            crate::usage::RequestOutcome::ModelUnavailable,
+        );
+        assert!(!out.to_string().contains(marker));
+    }
+
+    /// 缺口 A 守卫：Kiro 主路径成功/失败埋点的 `requested_model` 必须同源（都是
+    /// `client_model` = 客户端原始名），不得一边原始名一边归一化 Kiro id 的混合口径。
+    ///
+    /// 历史缺陷：成功路径埋点记 `extract_model_and_session` 从请求体解析的 modelId
+    /// （已被 converter 归一化成 Kiro id），失败记录同源同错——与透传路径（原始名）
+    /// 口径分叉。回退即 FAIL：把成功路径的 `model:` 改回 `model.clone()` 或把
+    /// `fail_record.requested_model` 改回 `model.clone()`，断言失败。
+    #[test]
+    fn kiro_success_and_failure_records_share_client_model() {
+        let full = include_str!("provider.rs");
+        let prod = full
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(full);
+        let retry_fn = prod
+            .split("async fn call_api_with_retry")
+            .nth(1)
+            .expect("call_api_with_retry 不应被改名");
+        let success_meta = "model: client_model_owned.clone().or_else(|| model.clone())";
+        assert_eq!(
+            retry_fn.matches(success_meta).count(),
+            2,
+            "主循环与 overload fallback 两条成功路径的 CallMeta.model 都必须用客户端原始名"
+        );
+        assert!(
+            retry_fn.contains("fail_record.requested_model = client_model_owned.clone().or(model.clone())"),
+            "失败记录 requested_model 必须与成功路径同源（client_model），\
+             否则按 requested_model 聚合时成功/失败口径分叉"
+        );
+        assert!(
+            retry_fn.contains("client_model_owned.clone().or(model.clone()).unwrap_or_default()"),
+            "失败记录的 record.model 必须同样回落 client_model（与成功记录 record.model 口径一致）"
+        );
+    }
 
     /// 模型映射改写 body：命中 `/conversationState/currentMessage/userInputMessage/modelId`。
     #[test]
@@ -4419,7 +5963,7 @@ mod tests {
         // 一次解析应同时取出 modelId 与 conversationId（与旧双解析等价）
         let body = r#"{
             "conversationState": {
-                "conversationId": "sess-123",
+                "conversationId": "0b4445e1-f5be-49e1-87ce-62bbc28ad705",
                 "currentMessage": {
                     "userInputMessage": { "modelId": "claude-sonnet-4" }
                 }
@@ -4427,16 +5971,16 @@ mod tests {
         }"#;
         let (model, session) = KiroProvider::extract_model_and_session(body);
         assert_eq!(model.as_deref(), Some("claude-sonnet-4"));
-        assert_eq!(session.as_deref(), Some("sess-123"));
+        assert_eq!(session.as_deref(), Some("0b4445e1-f5be-49e1-87ce-62bbc28ad705"));
     }
 
     #[test]
     fn test_extract_model_and_session_partial() {
         // 只有 conversationId、无 modelId：model=None、session=Some
-        let only_session = r#"{"conversationState":{"conversationId":"s1"}}"#;
+        let only_session = r#"{"conversationState":{"conversationId":"8bb5523b-ec7c-4540-a9ca-beb6d79f1552"}}"#;
         let (model, session) = KiroProvider::extract_model_and_session(only_session);
         assert_eq!(model, None);
-        assert_eq!(session.as_deref(), Some("s1"));
+        assert_eq!(session.as_deref(), Some("8bb5523b-ec7c-4540-a9ca-beb6d79f1552"));
 
         // 只有 modelId、无 conversationId：model=Some、session=None
         let only_model =
@@ -4445,6 +5989,97 @@ mod tests {
         assert_eq!(model.as_deref(), Some("m"));
         assert_eq!(session, None);
     }
+
+    // ===== S6 透传会话归一（会话研究 P1-1/P1-2/P1-4）=====
+
+    /// S6 P1-1 归一化 + P1-4 脱敏：透传埋点的 session 键与 Kiro 路径同源——
+    /// 同一 `metadata.user_id` 里提取出的 UUID，两条路径必须同一个 key；
+    /// 且只落 UUID，`user_xxx_account__` 前缀 / account_uuid 明文不得进 trace。
+    #[test]
+    fn test_passthrough_session_id_kiro_consistent_and_redacted() {
+        // 字符串格式（Claude Code 典型）：含 account 前缀 + account_uuid 片段
+        let user_id = "user_ffffffff-aaaa-4bbb-8ccc-dddddddddddd_account__session_0b4445e1-f5be-49e1-87ce-62bbc28ad705";
+        let extracted =
+            KiroProvider::extract_session_uuid(user_id).expect("应从 user_id 提取出 session UUID");
+        assert_eq!(
+            extracted,
+            "0b4445e1-f5be-49e1-87ce-62bbc28ad705",
+            "透传 session 必须是提取后的纯 UUID（Kiro 路径 conversationId 同源）"
+        );
+        // 脱敏：trace 里的 session 键不含 account 前缀 / account_uuid 片段
+        assert!(
+            !extracted.contains("account_") && !extracted.contains("ffffffff-aaaa"),
+            "session 键不得携带 account_uuid 明文，实际 {extracted}"
+        );
+
+        // 归一化：Kiro 路径把同一 UUID 写进 conversationState.conversationId，
+        // 提取结果 = 透传提取结果 = 同一个 key（同会话跨路径不再拆双 key）。
+        let kiro_body = format!(
+            r#"{{"conversationState":{{"conversationId":"{extracted}"}}}}"#
+        );
+        let (_, kiro_session) = KiroProvider::extract_model_and_session(&kiro_body);
+        assert_eq!(
+            kiro_session.as_deref(),
+            Some(extracted.as_str()),
+            "Kiro 路径与透传路径必须得到同一个 session key"
+        );
+    }
+
+    /// S6 P1-1 兜底 None：JSON 格式的 user_id 提取 session_id（形状合法才收）。
+    #[test]
+    fn test_passthrough_session_id_json_format() {
+        let user_id = r#"{"device_id":"0dede55c6dcc4a11a30bbb5e7f22e6fdf86cdeba3820019cc27612af4e1243cd","account_uuid":"acc-123","session_id":"8bb5523b-ec7c-4540-a9ca-beb6d79f1552"}"#;
+        assert_eq!(
+            KiroProvider::extract_session_uuid(user_id).as_deref(),
+            Some("8bb5523b-ec7c-4540-a9ca-beb6d79f1552")
+        );
+    }
+
+    /// S6 P1-1 兜底 None：提取不到（无 session / 非法形状 / 空）→ None，
+    /// 不再回落原始 user_id 串（旧行为把整串当 session 进 trace）。
+    #[test]
+    fn test_passthrough_session_id_none_when_not_extractable() {
+        assert_eq!(KiroProvider::extract_session_uuid(""), None, "空串无会话");
+        assert_eq!(
+            KiroProvider::extract_session_uuid("plain-string-no-session"),
+            None,
+            "无 session_ 标记的普通串无会话"
+        );
+        assert_eq!(
+            KiroProvider::extract_session_uuid("user_x_account__session_not-a-uuid"),
+            None,
+            "session_ 后非 UUID 形状 → None（形状门）"
+        );
+        assert_eq!(
+            KiroProvider::extract_session_uuid(r#"{"session_id":"not-a-uuid"}"#),
+            None,
+            "JSON 里 session_id 非 UUID 形状 → None"
+        );
+    }
+
+    /// S6 P1-2 兜底 None（Kiro 侧形状门）：conversationId 非 UUID 形状 → session None。
+    /// converter 产的 conversationId 恒为 UUID 形状，此门只拦截异常/伪造键，不再进
+    /// by_session / traces。
+    #[test]
+    fn test_kiro_session_id_requires_uuid_shape() {
+        // 合法 UUID 形状 → 收
+        let good = r#"{"conversationState":{"conversationId":"8bb5523b-ec7c-4540-a9ca-beb6d79f1552"}}"#;
+        let (_, session) = KiroProvider::extract_model_and_session(good);
+        assert_eq!(session.as_deref(), Some("8bb5523b-ec7c-4540-a9ca-beb6d79f1552"));
+
+        // 非 UUID 形状（畸形/伪造）→ None（兜底 None，by_session 不落键）
+        for bad in [
+            "sess-123",
+            "not-a-uuid",
+            "0b4445e1-f5be-49e1-87ce",       // 短
+            "0b4445e1-f5be-49e1-87ce-62bbc28ad705XX", // 长
+        ] {
+            let body = format!(r#"{{"conversationState":{{"conversationId":"{bad}"}}}}"#);
+            let (_, session) = KiroProvider::extract_model_and_session(&body);
+            assert_eq!(session, None, "非 UUID 形状 conversationId 必须归 None（实际 {bad}）");
+        }
+    }
+
 
     #[test]
     fn should_build_mcp_record_with_honest_zeros_and_no_credits() {
@@ -4533,6 +6168,70 @@ mod tests {
         );
     }
 
+    /// ⭐ 源码级守卫：MCP 重试循环必须有墙钟预算闸门（2026-08-15，M5）。
+    ///
+    /// 历史缺陷：`call_mcp_with_retry` 只有次数闸（`max_retries`）无墙钟。retry_delay
+    /// 指数退避叠加后，一条慢请求可以在小号池里拖过分钟级、反复扫同一个坏号，把偶发
+    /// 429 拖成持续雪崩 —— 与对话路径 2026-08-11 修掉的吸收层放大是同一形态
+    /// （对话路径靠 round_clock 闸门兜住，MCP 路径当时漏了）。
+    ///
+    /// 单测覆盖不到（需真实上游 + 号池），用源码断言钉死三点：
+    /// 1. 闸门确实在 MCP 函数内；
+    /// 2. 闸门在 MCP 的 for 循环**内**、且在 `acquire_context`（发请求前）之前 ——
+    ///    挪到循环外或发请求之后都会让墙钟失效；
+    /// 3. 整个生产段只有这一处该闸门（防在别的函数里加个假的充数）。
+    #[test]
+    fn mcp_retry_loop_must_have_wall_clock_gate() {
+        let full = include_str!("provider.rs");
+        let src = full
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(full);
+        let mcp_fn = src
+            .split("async fn call_mcp_with_retry")
+            .nth(1)
+            .expect("call_mcp_with_retry 不应被改名");
+        // needle 运行时拼接（include_str! 会把测试自身字面量也读进来，本仓踩过多次）。
+        // 判据不带对齐空格（本仓守卫约定，见 token_manager 排序键守卫的教训）：
+        // 只匹配「预算比较」这一行本身，缩进/换行随 rustfmt 怎么排都不影响。
+        // 常量取 MCP_WALL_SECS（≈read_timeout×2+30，推导见该常量注释）—— 复用主路径
+        // 45s 会掐死换号（同透传墙钟教训），此守卫顺带钉住不用错常量。
+        let gate_body = format!(
+            "{}{}",
+            "&& call_started.elapsed() >= Duration::from_secs", "(MCP_WALL_SECS)"
+        );
+        let for_at = mcp_fn
+            .find("for attempt in 0..max_retries")
+            .expect("MCP 重试循环不应被改名");
+        let body_at = mcp_fn.find(&gate_body).unwrap_or_else(|| {
+            panic!("MCP 循环内必须存在墙钟预算比较（`{gate_body}`），否则单请求可在小号池里拖过分钟级")
+        });
+        // 同一语句窗口内必须有「attempt > 0」首试豁免（保证至少打一次）。
+        // ⚠️ 不能用字节切片（`&mcp_fn[a..b]`）：body_at 偏移可能落在多字节字符
+        // 中间（2026-08-15 实测 panic: not a char boundary），用 rfind 比较位置。
+        let before_at = mcp_fn[..body_at].rfind("if attempt > 0");
+        assert!(
+            before_at.is_some_and(|p| body_at - p < 300),
+            "墙钟闸门必须带 attempt>0 首试豁免：首次尝试不受此限，保证至少打一次"
+        );
+        assert!(
+            for_at < body_at,
+            "墙钟闸门必须在 for 循环**内**（挪到循环外即失效）"
+        );
+        let acquire_at = mcp_fn
+            .find("acquire_context(None, None)")
+            .expect("MCP 的上下文获取调用不应被改名");
+        assert!(
+            body_at < acquire_at,
+            "墙钟闸门必须排在 acquire_context（发请求）之前，否则超预算的请求仍会真打上游"
+        );
+        assert_eq!(
+            src.matches(&gate_body).count(),
+            1,
+            "该墙钟闸门在整个生产段应只出现一次（MCP 路径）；对话路径用的是 round_clock 形态"
+        );
+    }
+
     /// ⭐ 源码级守卫：两处 force-refresh 调用点都必须跳过 api_key 号。
     ///
     /// 单测覆盖不到（需真实上游返回 401/403 才会走到该分支），而这是**会加速烧号**的路径：
@@ -4545,7 +6244,6 @@ mod tests {
     ///
     /// 断言两处而非一处：对话路径与 MCP 路径各有一份 force-refresh 逻辑，
     /// 这种「同款逻辑复制两份」正是本仓 #4 类漏改事故的成因（对话路径修了、MCP 漏了）。
-    #[test]
     /// 🔴 额度耗尽判定**不得门控状态码** —— 只认 body 里的 reason 字面量。
     ///
     /// # 实测（2026-08-05，6 小时窗口）
@@ -4789,6 +6487,33 @@ mod tests {
         );
     }
 
+    /// ⭐ 源码级守卫（N4）：失败记录必须携带「链内首选号」。
+    ///
+    /// 线上实测：透传全败的失败样本 `credential_id=None retries=3`，面板看不出
+    /// 「首选了哪个号」—— 若死号每次都排最前（`select_custom_api` 排序首写），
+    /// 这种「死号恒选」在面板上完全不可见。`first_attempted_credential_id` 由
+    /// 共享预算携带（透传首跳写、Kiro 主路径兜底），fail_record 必须读它。
+    ///
+    /// 用源码级守卫而非行为测试：触发需要整条透传全败 → 落 Kiro 主路径的端到端
+    /// mock 链，且记录经管道异步落库无法在单测内同步断言（与 retries 守卫同理）。
+    #[test]
+    fn fail_record_must_carry_first_attempted_credential() {
+        let src = include_str!("provider.rs");
+        let block = src
+            .split("let mut fail_record")
+            .nth(1)
+            .expect("fail_record 组装块不应被改名/删除");
+        let block = block
+            .split("emit_record")
+            .next()
+            .expect("fail_record 之后应紧跟 emit_record");
+        assert!(
+            block.contains("fail_record.first_attempted_credential_id"),
+            "失败记录必须设 first_attempted_credential_id，否则透传全败的样本\
+             看不到『首选了哪个号』，面板无法发现死号恒选（N4）"
+        );
+    }
+
     /// ⭐ 源码级守卫（已知问题 #20）：准入闸门超时必须**既 emit_record 又 bump 计数器**。
     ///
     /// 旧代码是裸 `anyhow::bail!` —— 被网关自己背压掐掉的请求在面板上**完全不存在**，
@@ -5003,6 +6728,1403 @@ mod tests {
         )
     }
 
+    // ============ call_api_with_retry 行为测试（端到端 mock 上游，2026-08-15 补）============
+    //
+    // call_api_with_retry 是全仓最重的单函数（约 1800 行），此前只有纯函数测试与
+    // include_str 源码守卫——「分支之间怎么咬合」从未被真跑过（blockers-structure.md §1）。
+    // 本组测试用本地 TCP 假上游 + 注入 mock endpoint（KiroEndpoint trait 的实现者，
+    // 经 `with_proxy` 的 endpoints 注册表传入——这是现有构造路径，非测试专用 seam），
+    // 把「选号 → 建请求 → 打上游 → 错误分类 → 换号/重试/耗尽」整条链真实跑起来。
+    //
+    // 网络与 AWS 签名完全在 mock 侧消除：api_url 指向 127.0.0.1、decorate_api 不加头。
+
+    /// 本地 mock 上游：每个连接消费一个预配置响应（`connection: close` 强制新连接，
+    /// 响应队列按请求次序出队），超出队列的请求一律 500（让测试以 Err 收尾而非挂死）。
+    struct MockUpstream {
+        port: u16,
+        hits: Arc<std::sync::atomic::AtomicUsize>,
+        /// 每个请求的原始请求头（按请求次序；含 Authorization，可据此区分请求是哪个号发的）。
+        heads: Arc<Mutex<Vec<String>>>,
+        _responses: Arc<Mutex<std::collections::VecDeque<MockResponse>>>,
+    }
+
+    #[derive(Clone)]
+    struct MockResponse {
+        status: u16,
+        reason: &'static str,
+        body: &'static str,
+        retry_after_secs: Option<u64>,
+    }
+
+    impl MockResponse {
+        fn ok(body: &'static str) -> Self {
+            Self {
+                status: 200,
+                reason: "OK",
+                body,
+                retry_after_secs: None,
+            }
+        }
+    }
+
+    impl MockUpstream {
+        fn start(responses: Vec<MockResponse>) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定 mock 上游端口");
+            let port = listener.local_addr().expect("mock 端口").port();
+            let responses = Arc::new(Mutex::new(std::collections::VecDeque::from(responses)));
+            let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let heads = Arc::new(Mutex::new(Vec::new()));
+            let (hits_t, responses_t, heads_t) = (hits.clone(), responses.clone(), heads.clone());
+            std::thread::spawn(move || {
+                for conn in listener.incoming() {
+                    let Ok(mut stream) = conn else { continue };
+                    let (hits_c, responses_c, heads_c) = (hits_t.clone(), responses_t.clone(), heads_t.clone());
+                    std::thread::spawn(move || {
+                        // 先落请求头再写响应：调用方拿到响应时，本连接的请求头必然已可读。
+                        heads_c.lock().push(mock_read_request_head(&mut stream));
+                        let n = hits_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let resp = responses_c
+                            .lock()
+                            .get(n)
+                            .cloned()
+                            .unwrap_or(MockResponse {
+                                status: 500,
+                                reason: "Internal Server Error",
+                                body: "{}",
+                                retry_after_secs: None,
+                            });
+                        mock_write_response(&mut stream, &resp);
+                    });
+                }
+            });
+            Self {
+                port,
+                hits,
+                heads,
+                _responses: responses,
+            }
+        }
+
+        /// 按请求次序返回每个请求的原始请求头（含 Authorization，可据此区分是哪个号打的）。
+        fn captured_heads(&self) -> Vec<String> {
+            self.heads.lock().clone()
+        }
+    }
+
+    fn mock_read_request_head(stream: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+        let mut buf = [0u8; 4096];
+        let mut received = Vec::new();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    received.extend_from_slice(&buf[..n]);
+                    if received.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&received).into_owned()
+    }
+
+    fn mock_write_response(stream: &mut std::net::TcpStream, r: &MockResponse) {
+        use std::io::Write;
+        let mut head = format!(
+            "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n",
+            r.status,
+            r.reason,
+            r.body.len()
+        );
+        if let Some(ra) = r.retry_after_secs {
+            head.push_str(&format!("retry-after: {}\r\n", ra));
+        }
+        head.push_str("\r\n");
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(r.body.as_bytes());
+        let _ = stream.flush();
+    }
+
+    /// 只认 mock 上游的端点实现：不加任何头、不改任何 body，URL 固定指向本地假上游。
+    ///
+    /// `name` 可自定义（真实端点名如 "ide" / "codewhisperer"）：端点回退链按名字在
+    /// 注册表里补齐，固定叫 "mock" 的端点进不了 `ENDPOINT_FALLBACK_ORDER` 的链。
+    struct MockEndpoint {
+        url: String,
+        name: &'static str,
+    }
+
+    impl KiroEndpoint for MockEndpoint {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn api_url(&self, _ctx: &RequestContext<'_>) -> String {
+            self.url.clone()
+        }
+        fn mcp_url(&self, _ctx: &RequestContext<'_>) -> String {
+            self.url.clone()
+        }
+        fn decorate_api(
+            &self,
+            req: reqwest::RequestBuilder,
+            _ctx: &RequestContext<'_>,
+        ) -> reqwest::RequestBuilder {
+            req
+        }
+        fn decorate_mcp(
+            &self,
+            req: reqwest::RequestBuilder,
+            _ctx: &RequestContext<'_>,
+        ) -> reqwest::RequestBuilder {
+            req
+        }
+        fn transform_api_body(&self, body: &str, _ctx: &RequestContext<'_>) -> String {
+            body.to_string()
+        }
+    }
+
+    /// 构造「2 个可用 Kiro 号 + 唯一 mock 端点」的 provider。
+    ///
+    /// ⚠️ 凭据 id 用本组专属段（91_xxx）：endpoint_health 是**进程级共享**表
+    /// （endpoint_health::SHARED），与既有 select_endpoint 测试共用 id 会被对方写入的
+    /// 样本破坏「冷启动」类断言（provider 内部 `report_endpoint_outcome` 会写这张表）。
+    fn provider_with_mock_upstream(upstream: &MockUpstream) -> KiroProvider {
+        let mut creds = Vec::new();
+        for id in [91_001u64, 91_002] {
+            let mut c = KiroCredentials::default();
+            c.id = Some(id);
+            c.auth_method = Some("api_key".to_string());
+            c.kiro_api_key = Some(format!("sk-mock-{id}"));
+            // ⚠️ 必须显式钉死 endpoint：api_key 号被 `effective_endpoint_order` 自动路由到
+            // 内置的 ["cli", "cli-runtime"] 候选链（endpoint=None 时），而测试注册表只有
+            // "mock"——不钉死则 select_endpoint 硬门滤掉全部候选 → 请求永不打 mock 上游。
+            c.endpoint = Some("mock".to_string());
+            creds.push(c);
+        }
+        let tm = Arc::new(
+            MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                creds,
+                None,
+                None,
+                false,
+            )
+            .expect("构造测试 token manager"),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert(
+            "mock".to_string(),
+            Arc::new(MockEndpoint {
+                url: format!("http://127.0.0.1:{}", upstream.port),
+                name: "mock",
+            }),
+        );
+        KiroProvider::with_proxy(tm, None, endpoints, "mock".to_string())
+    }
+
+    /// 构造「2 个 custom_api 代挂号（baseUrl 指向同一 mock 上游）+ mock 端点」的 provider，
+    /// 供 `try_custom_api_passthrough` 的 failover 链测试（N4 首选号）。
+    ///
+    /// 与 `provider_with_mock_upstream` 的差异只有凭据形态（custom_api vs api_key）：
+    /// 透传选号池（`select_custom_api`）只认 custom_api 号；透传路径不经 KiroEndpoint，
+    /// URL 直接由 base_url 拼出（`passthrough::forward`），mock 端点在注册表里只是
+    /// `with_proxy` 构造所需。
+    fn provider_with_passthrough_upstream(upstream: &MockUpstream) -> KiroProvider {
+        let mut creds = Vec::new();
+        for id in [91_001u64, 91_002] {
+            let mut c = KiroCredentials::default();
+            c.id = Some(id);
+            c.auth_method = Some("custom_api".to_string());
+            c.base_url = Some(format!("http://127.0.0.1:{}", upstream.port));
+            c.kiro_api_key = Some(format!("sk-mock-{id}"));
+            creds.push(c);
+        }
+        let tm = Arc::new(
+            MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                creds,
+                None,
+                None,
+                false,
+            )
+            .expect("构造测试 token manager"),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert(
+            "mock".to_string(),
+            Arc::new(MockEndpoint {
+                url: format!("http://127.0.0.1:{}", upstream.port),
+                name: "mock",
+            }),
+        );
+        KiroProvider::with_proxy(tm, None, endpoints, "mock".to_string())
+    }
+
+        const MOCK_PASSTHROUGH_BODY: &str =
+        r#"{"model":"claude-sonnet-4","messages":[{"role":"user","content":"hi"}]}"#;
+
+    /// 构造「2 个可用 Kiro 号 + 双 mock 端点（ide → port_a、codewhisperer → port_b）」的
+    /// provider，供端点级链式回退测试。
+    ///
+    /// ⚠️ 凭据 id 用本组专属段（93_xxx），理由同 `provider_with_mock_upstream`（91_xxx 段
+    /// 的 endpoint_health 共享表会被本组写入的样本污染「冷启动」断言）。
+    ///
+    /// 凭据形态：api_key 号 + 显式 `endpoint="ide"`。api_key 号无显式值时被
+    /// `effective_endpoint_order` 自动路由到 CLI 族（注册表里没有，select 拿不到候选），
+    /// 显式指定 ide 后候选链 = ["ide", cli, cli-runtime, codewhisperer, amazonq]（显式值
+    /// 放最前 + 完整候选链去重），注册表只含 ide/codewhisperer ⇒ select 候选 [ide, cw]，
+    /// 冷启动选中 ide ⇒ 端点链 = [ide, codewhisperer]（order 补齐 cw，FALLBACK_ORDER 无新增）。
+    fn provider_with_mock_chain_ports(port_a: u16, port_b: u16) -> KiroProvider {
+        let mut creds = Vec::new();
+        for id in [93_001u64, 93_002] {
+            let mut c = KiroCredentials::default();
+            c.id = Some(id);
+            c.auth_method = Some("api_key".to_string());
+            c.kiro_api_key = Some(format!("sk-mock-{id}"));
+            c.endpoint = Some("ide".to_string());
+            creds.push(c);
+        }
+        let tm = Arc::new(
+            MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                creds,
+                None,
+                None,
+                false,
+            )
+            .expect("构造测试 token manager"),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert(
+            "ide".to_string(),
+            Arc::new(MockEndpoint {
+                url: format!("http://127.0.0.1:{port_a}"),
+                name: "ide",
+            }),
+        );
+        endpoints.insert(
+            "codewhisperer".to_string(),
+            Arc::new(MockEndpoint {
+                url: format!("http://127.0.0.1:{port_b}"),
+                name: "codewhisperer",
+            }),
+        );
+        KiroProvider::with_proxy(tm, None, endpoints, "ide".to_string())
+    }
+
+    fn provider_with_mock_chain(up_a: &MockUpstream, up_b: &MockUpstream) -> KiroProvider {
+        provider_with_mock_chain_ports(up_a.port, up_b.port)
+    }
+
+    /// 构造「2 个可用 Kiro 号 + 4 个 mock 端点（ide/cli/codewhisperer/amazonq 各指
+    /// 一个 mock 上游）」的 provider，供 M1 预算闸的「4 元素链全 429」集成测试。
+    ///
+    /// api_key 号 + 显式 `endpoint="ide"` ⇒ 候选链 = [ide, cli, cli-runtime(未注册),
+    /// codewhisperer, amazonq]，注册表含全部 4 端点 ⇒ 链 = [ide, cli, codewhisperer,
+    /// amazonq]（4 元素；FALLBACK_ORDER 里的端点已在链内，无新增）。
+    fn provider_with_mock_chain_4ports(ports: [u16; 4]) -> KiroProvider {
+        let mut creds = Vec::new();
+        for id in [93_011u64, 93_012] {
+            let mut c = KiroCredentials::default();
+            c.id = Some(id);
+            c.auth_method = Some("api_key".to_string());
+            c.kiro_api_key = Some(format!("sk-mock-{id}"));
+            c.endpoint = Some("ide".to_string());
+            creds.push(c);
+        }
+        let tm = Arc::new(
+            MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                creds,
+                None,
+                None,
+                false,
+            )
+            .expect("构造测试 token manager"),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        for (name, port) in [
+            ("ide", ports[0]),
+            ("cli", ports[1]),
+            ("codewhisperer", ports[2]),
+            ("amazonq", ports[3]),
+        ] {
+            endpoints.insert(
+                name.to_string(),
+                Arc::new(MockEndpoint {
+                    url: format!("http://127.0.0.1:{port}"),
+                    name,
+                }),
+            );
+        }
+        KiroProvider::with_proxy(tm, None, endpoints, "ide".to_string())
+    }
+
+    /// 拿一个「立刻被释放、无人监听」的本地端口（连接层失败 = ECONNREFUSED 的模拟）。
+    fn dead_local_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定临时端口");
+        l.local_addr().expect("临时端口地址").port()
+    }
+
+    /// N4：透传 failover 链（首选号 502 → 换号 200）的 usage record 必须带
+    /// `first_attempted_credential_id` = 首选号，与 `credential_id` = 最终号成对——
+    /// 面板据此发现「死号恒选」（某号每次都被选中最前却被换掉）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn passthrough_failover_record_carries_first_attempted_credential() {
+        let up = MockUpstream::start(vec![
+            MockResponse {
+                status: 502,
+                reason: "Bad Gateway",
+                body: "{}",
+                retry_after_secs: None,
+            },
+            MockResponse::ok(r#"{"ok":true}"#),
+        ]);
+        let provider = provider_with_passthrough_upstream(&up);
+        let budget = SharedRetryBudget::new();
+
+        let (resp, meta) = provider
+            .try_custom_api_passthrough(
+                MOCK_PASSTHROUGH_BODY.into(),
+                Some("claude-sonnet-4"),
+                None,
+                None,
+                &budget,
+            )
+            .await
+            .expect("502 → failover → 200 应成功");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            meta.first_attempted_credential_id,
+            Some(91_001),
+            "首选号必须是首个被选中的号（502 那个）"
+        );
+        assert_eq!(
+            meta.credential_id, 91_002,
+            "最终服务号必须是 failover 后的号（200 那个）"
+        );
+        assert_eq!(
+            budget.first_attempted(),
+            Some(91_001),
+            "共享预算必须同步携带首选号——Kiro 主路径的失败记录要读它"
+        );
+
+        // 与 handlers.rs 同款 record 构造（透传成功链埋点）：record 带首选号 + 最终号。
+        let mut record = crate::usage::RequestRecord::new(
+            "req-pt",
+            meta.model.clone().unwrap_or_default(),
+        );
+        record.credential_id = Some(meta.credential_id);
+        record.first_attempted_credential_id = meta.first_attempted_credential_id;
+        assert_eq!(
+            record.first_attempted_credential_id,
+            Some(91_001),
+            "record 首选号 == 链首选号"
+        );
+        assert_eq!(record.credential_id, Some(91_002), "record 最终号 == 链最终号");
+    }
+
+    /// 🔴 M1.2 回归（2026-08-16 对抗审查 MAJOR）：400/404 **不记失败余温**——
+    /// 坏请求（无效 tool schema / 该站不认模型）是全池同质的客户端错误，一次
+    /// failover 把所有号打上余温会让 60s 内任何请求零尝试直返 503（毒化整池）。
+    ///
+    /// 断言方式（外部可观察行为）：第一请求 A 号 400（值得换号）→ failover 到 B 号
+    /// 成功；第二请求（全新上游+全新 manager）若 400 被记热，A 号会被余温过滤 →
+    /// 直接选 B 号；不记热则 A 号仍在候选（全平局按 id）→ 首试 A 号。
+    /// `meta.credential_id` 公开可见，无需侵入式访问内部状态。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn passthrough_400_404_do_not_record_failure_warmth() {
+        for (code, reason) in [
+            (400u16, "Bad Request"),
+            (404u16, "Not Found"),
+        ] {
+            // 第一请求：#91_001 返 code（值得换号）→ failover → #91_002 200。
+            let up = MockUpstream::start(vec![
+                MockResponse {
+                    status: code,
+                    reason,
+                    body: "{}",
+                    retry_after_secs: None,
+                },
+                MockResponse::ok(r#"{"ok":true}"#),
+            ]);
+            let provider = provider_with_passthrough_upstream(&up);
+            let budget = SharedRetryBudget::new();
+            let (resp, meta) = provider
+                .try_custom_api_passthrough(
+                    MOCK_PASSTHROUGH_BODY.into(),
+                    Some("claude-sonnet-4"),
+                    None,
+                    None,
+                    &budget,
+                )
+                .await
+                .expect("400/404(值得换号) → failover → 200 应成功");
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+            assert_eq!(
+                meta.credential_id, 91_002,
+                "{code} 换号后应由 #91_002 服务（failover 语义不变）"
+            );
+
+            // 第二请求（全新上游 + 全新 manager，无任何跨请求状态残留）：
+            // 不记热 → #91_001 仍首选；记热 → 它被余温过滤 → 直接选 #91_002。
+            let up2 = MockUpstream::start(vec![MockResponse::ok(r#"{"ok":true}"#)]);
+            let provider2 = provider_with_passthrough_upstream(&up2);
+            let budget2 = SharedRetryBudget::new();
+            let (_resp2, meta2) = provider2
+                .try_custom_api_passthrough(
+                    MOCK_PASSTHROUGH_BODY.into(),
+                    Some("claude-sonnet-4"),
+                    None,
+                    None,
+                    &budget2,
+                )
+                .await
+                .expect("第二请求应成功");
+            assert_eq!(
+                meta2.credential_id, 91_001,
+                "{code} 不得记失败余温：第二请求必须先试原号（记热时这里会是 #91_002，\
+                 整池被坏请求毒化 60s）"
+            );
+        }
+    }
+
+    /// N4：透传全败（落 Kiro 主路径）时，首选号不随 `None` 返回丢失——由共享预算携带，
+    /// Kiro 主路径的 `fail_record` 读取它（线上证据形态：`cred_id=None retries=3` 的失败链）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn passthrough_all_fail_budget_keeps_first_attempted() {
+        let up = MockUpstream::start(vec![
+            MockResponse {
+                status: 502,
+                reason: "Bad Gateway",
+                body: "{}",
+                retry_after_secs: None,
+            },
+            MockResponse {
+                status: 502,
+                reason: "Bad Gateway",
+                body: "{}",
+                retry_after_secs: None,
+            },
+        ]);
+        let provider = provider_with_passthrough_upstream(&up);
+        let budget = SharedRetryBudget::new();
+
+        let r = provider
+            .try_custom_api_passthrough(
+                MOCK_PASSTHROUGH_BODY.into(),
+                Some("claude-sonnet-4"),
+                None,
+                None,
+                &budget,
+            )
+            .await;
+        assert!(r.is_none(), "全 502 → 透传整体不可用，落 Kiro 主路径");
+        assert_eq!(
+            budget.first_attempted(),
+            Some(91_001),
+            "首选号不因全败而丢失——Kiro 主路径 fail_record 依赖它"
+        );
+    }
+
+    /// 共享预算「链内首选号」的语义：首写生效（透传首跳的号优先于后续任何跳）。
+    #[test]
+    fn shared_retry_budget_first_attempt_is_first_wins() {
+        let b = SharedRetryBudget::new();
+        assert_eq!(b.first_attempted(), None, "未记录时恒为 None");
+        b.note_first_attempt(3);
+        b.note_first_attempt(2);
+        assert_eq!(b.first_attempted(), Some(3), "首写生效：先试的号拥有槽位");
+    }
+
+    const MOCK_BODY: &str = r#"{"conversationState":{"conversationId":"sess-1","currentMessage":{"userInputMessage":{"modelId":"claude-sonnet-4"}}}}"#;
+
+    /// 成功路径：上游直接 200 → `Ok((resp, meta))`，retries=0，只打 1 次上游。
+    ///
+    /// 回退即 FAIL：把成功分支的 `report_success`/`return Ok` 弄丢（例如重试循环
+    /// 对 200 也继续换号），断言失败。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn call_api_first_try_success_returns_zero_retries() {
+        let up = MockUpstream::start(vec![MockResponse::ok(r#"{"ok":true}"#)]);
+        let provider = provider_with_mock_upstream(&up);
+
+        let (resp, meta) = match provider
+            .call_api(MOCK_BODY, false, &SharedRetryBudget::new(), Some("claude-sonnet-4"))
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => panic!("首次 200 应直接成功: {e}"),
+        };
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(resp.text().await.unwrap(), r#"{"ok":true}"#, "上游 body 必须原样透传");
+        assert_eq!(meta.retries, 0, "首次即成功不得计重试");
+        assert!(
+            meta.credential_id == 91_001 || meta.credential_id == 91_002,
+            "meta 必须带实际使用的那条凭据"
+        );
+        assert_eq!(
+            up.hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "成功路径只允许打 1 次上游"
+        );
+    }
+
+    /// ⭐ 链式回退核心回归（P0 移植）：第一端点 429 → 轮内立即换第二端点 → 200。
+    ///
+    /// 钉住三件事：
+    /// 1. **不消耗重试预算**：`meta.retries` 必须仍是 0（链内跳不触碰 attempt 计数）；
+    /// 2. 第二端点真被打到（hits 两个上游各 1）；
+    /// 3. 链首 429 封桶（`order.len() > 1` 时）→ 但成功不受影响。
+    ///
+    /// 回退即 FAIL：把链式回退的 `continue 'endpoint_chain` 删掉（回到跨轮换号），
+    /// `meta.retries` 变成 1 或请求失败——本测试断言 retries==0 必红。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn endpoint_chain_fallback_uses_next_endpoint_without_retry_budget() {
+        let up_a = MockUpstream::start(vec![MockResponse {
+            status: 429,
+            reason: "Too Many Requests",
+            body: "{}",
+            retry_after_secs: None,
+        }]);
+        let up_b = MockUpstream::start(vec![MockResponse::ok(r#"{"ok":true}"#)]);
+        let provider = provider_with_mock_chain(&up_a, &up_b);
+
+        let (resp, meta) = match provider
+            .call_api(MOCK_BODY, false, &SharedRetryBudget::new(), Some("claude-sonnet-4"))
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => panic!("第一端点 429 → 链式回退第二端点应成功: {e}"),
+        };
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(resp.text().await.unwrap(), r#"{"ok":true}"#);
+        assert_eq!(meta.retries, 0, "链式回退不得消耗凭据重试预算（attempt 计数不变）");
+        assert_eq!(
+            up_a.hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "第一端点只打 1 次（429 后即顺延）"
+        );
+        assert_eq!(
+            up_b.hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "第二端点必须被链式回退打到"
+        );
+    }
+
+    /// ⭐ 死端点负缓存：A 端口无人监听（连接层失败）→ 记入负缓存 + 顺延 B 成功；
+    /// 第二次调用跳过 A（负缓存 TTL 内），只打 B。
+    ///
+    /// 回退即 FAIL：把链循环顶部的 `is_endpoint_dead` 跳过分支删掉，第二次调用会
+    /// 先白打一次 A（connect refused）——断言 `up_b.hits == 2` 变红（B 只被打 1 次
+    /// 的话说明第二次没到 B？不——A 连接失败很快，B 仍会打到。真正的判据是
+    /// `is_endpoint_dead` 被置位 + A 跳过。用 hits 数 A 无法直接数（连接失败不落
+    /// mock），故用负缓存状态断言）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dead_endpoint_negative_cache_skips_failed_route() {
+        let dead_port = dead_local_port();
+        let up_b = MockUpstream::start(vec![
+            MockResponse::ok(r#"{"ok":true}"#),
+            MockResponse::ok(r#"{"ok":true}"#),
+        ]);
+        let provider = provider_with_mock_chain_ports(dead_port, up_b.port);
+
+        // 第一次：A 连接失败（记负缓存）→ 顺延 B → 成功。
+        let (resp, meta) = match provider
+            .call_api(MOCK_BODY, false, &SharedRetryBudget::new(), Some("claude-sonnet-4"))
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => panic!("A 连接失败应链式顺延到 B 并成功: {e}"),
+        };
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(meta.retries, 0, "连接层顺延同样不耗重试预算");
+        assert!(
+            provider.is_endpoint_dead("ide", "us-east-1"),
+            "连接层失败必须记入负缓存"
+        );
+        assert_eq!(
+            up_b.hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "第一次调用 B 被顺延打到 1 次"
+        );
+
+        // 第二次：A 在负缓存 TTL 内 → 跳过，直接打 B。
+        let (resp, _) = match provider
+            .call_api(MOCK_BODY, false, &SharedRetryBudget::new(), Some("claude-sonnet-4"))
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => panic!("第二次调用应跳过 A 直接打 B: {e}"),
+        };
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            up_b.hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "A 被负缓存跳过 → B 累计打 2 次"
+        );
+        assert!(
+            provider.is_endpoint_dead("ide", "us-east-1"),
+            "负缓存 TTL 未到不得清除"
+        );
+    }
+
+    /// ⭐ 链尾兜底铁律：A、B 全部连接失败过（都在负缓存内）→ A（非链尾）跳过、
+    /// B（链尾）**绝不跳过**，仍真打 → 成功。
+    ///
+    /// 回退即 FAIL：把链循环的「链尾不跳过」条件删掉（`idx != last_idx` 放宽成
+    /// 无条件跳过），第二次调用整链无人发送 → response 恒 None → 请求 Err。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn endpoint_chain_tail_is_never_skipped() {
+        let dead_port = dead_local_port();
+        let up_b = MockUpstream::start(vec![
+            MockResponse::ok(r#"{"ok":true}"#),
+            MockResponse::ok(r#"{"ok":true}"#),
+        ]);
+        let provider = provider_with_mock_chain_ports(dead_port, up_b.port);
+
+        // 第一次：A 连接失败 → 记 dead；B 200。
+        provider
+            .call_api(MOCK_BODY, false, &SharedRetryBudget::new(), Some("claude-sonnet-4"))
+            .await
+            .expect("第一次应经 A 失败顺延 B 成功");
+        assert!(provider.is_endpoint_dead("ide", "us-east-1"));
+
+        // 把 B 也标记连接失败（模拟 B 近期也连不上）——现在链内两个端点全在负缓存里。
+        provider.mark_endpoint_dead("codewhisperer", "us-east-1");
+
+        // 第二次：A 跳过（非链尾）、B dead 但链尾不跳过 → 仍真打 B → 200。
+        let (resp, _) = match provider
+            .call_api(MOCK_BODY, false, &SharedRetryBudget::new(), Some("claude-sonnet-4"))
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => panic!("链尾绝不跳过：全死仍尝试 B 并成功: {e}"),
+        };
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            up_b.hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "链尾被跳过则 B 不会被打到第 2 次"
+        );
+    }
+
+    /// 整链失败交凭据级分类：两个端点都 429 → 链式回退耗尽 → 链尾响应走既有
+    /// 429 分类（封桶 + has_unthrottled 判定 + 冷却换号），最终 `Err` 透传。
+    ///
+    /// hits：号 1 打 A、B（链内 2 跳），封双桶 → has_unthrottled false（cli/cli-runtime/
+    /// amazonq 未注册不算可用）→ 凭据冷却 → 号 2 同样 2 跳 → 预算耗尽（2 号池
+    /// max_retries=2）→ Err。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn endpoint_chain_full_failure_falls_through_to_credential_classification() {
+        let up_a = MockUpstream::start(vec![
+            MockResponse {
+                status: 429,
+                reason: "Too Many Requests",
+                body: "{}",
+                retry_after_secs: None,
+            },
+            MockResponse {
+                status: 429,
+                reason: "Too Many Requests",
+                body: "{}",
+                retry_after_secs: None,
+            },
+        ]);
+        let up_b = MockUpstream::start(vec![
+            MockResponse {
+                status: 429,
+                reason: "Too Many Requests",
+                body: "{}",
+                retry_after_secs: None,
+            },
+            MockResponse {
+                status: 429,
+                reason: "Too Many Requests",
+                body: "{}",
+                retry_after_secs: None,
+            },
+        ]);
+        let provider = provider_with_mock_chain(&up_a, &up_b);
+
+        let err = provider
+            .call_api(MOCK_BODY, false, &SharedRetryBudget::new(), Some("claude-sonnet-4"))
+            .await
+            .err().expect("两个端点都 429 → 整链失败应 Err（透传 429）");
+        assert!(
+            err.to_string().contains("429"),
+            "整链失败必须交凭据级分类（透传上游 429 语义）: {err}"
+        );
+        assert_eq!(
+            up_a.hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "两个号各打一次 A（链首）"
+        );
+        assert_eq!(
+            up_b.hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "两个号各打一次 B（链尾）"
+        );
+    }
+
+    /// ⭐ 链内共享预算闸（对抗审查 M1）：4 元素链全 429 → 总上游调用必须 ≤
+    /// `ABSOLUTE_MAX_TOTAL_RETRIES`(=4)，不得出现「attempts × 链跳数」的超发。
+    ///
+    /// 现有 2 元素链测试（`endpoint_chain_full_failure_falls_through_...`）对 M1
+    /// **失明**：2 元素链在第 1 个 attempt 内就打满 4 次预算（2 跳 × 2 号），hits 恒 4，
+    /// 看不出「链内跳不扣共享预算」的洞。4 元素链下第 1 个 attempt 的 4 跳就耗尽预算，
+    /// 换号后的第 2 个 attempt 必须在链首跳前被预算闸拦下——这是对「每请求 ≤
+    /// ABSOLUTE_MAX_TOTAL_RETRIES 次上游调用」不变量的端到端回归。
+    ///
+    /// 回退即 FAIL：把链循环顶部的预算闸删掉，第 2 个 attempt 会再打 4 跳
+    /// → total hits == 8 > 4，断言变红。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn endpoint_chain_respects_shared_retry_budget_when_all_429() {
+        let ups: Vec<MockUpstream> = (0..4)
+            .map(|_| {
+                MockUpstream::start(vec![MockResponse {
+                    status: 429,
+                    reason: "Too Many Requests",
+                    body: "{}",
+                    retry_after_secs: None,
+                }])
+            })
+            .collect();
+        let ports: [u16; 4] = ups
+            .iter()
+            .map(|u| u.port)
+            .collect::<Vec<_>>()
+            .try_into()
+            .expect("4 个端口");
+        let provider = provider_with_mock_chain_4ports(ports);
+
+        let err = provider
+            .call_api(MOCK_BODY, false, &SharedRetryBudget::new(), Some("claude-sonnet-4"))
+            .await
+            .err()
+            .expect("4 端点全 429 → 整链失败应 Err（透传 429）");
+        assert!(
+            err.to_string().contains("429"),
+            "整链失败必须透传上游 429 语义: {err}"
+        );
+
+        let total: usize = ups
+            .iter()
+            .map(|u| u.hits.load(std::sync::atomic::Ordering::SeqCst))
+            .sum();
+        assert!(
+            total <= ABSOLUTE_MAX_TOTAL_RETRIES,
+            "链式回退 + 换号重试的总上游调用必须 ≤ ABSOLUTE_MAX_TOTAL_RETRIES（实际 {total} 次）\
+             —— 链内每跳消耗共享预算，预算耗尽必须停在链首前"
+        );
+        assert_eq!(
+            total, ABSOLUTE_MAX_TOTAL_RETRIES,
+            "4 元素链全 429 恰好打满 4 次（第 1 个 attempt 的 4 跳），换号后的 attempt 被预算闸拦下"
+        );
+    }
+
+    /// 🔴 对抗审查 m4：501（Not Implemented）是**确定性**错误，不得触发链式回退
+    /// （`status.is_server_error()` 会把 501/505 也顺延，白烧一跳——换 host 不会让
+    /// 501 变 200，它是对请求的确定性答复）。
+    ///
+    /// 回退即 FAIL：把链内瞬态判定改回 `|| status.is_server_error()`，501 触发
+    /// 链式回退 → B 被真打（up_b.hits == 1），断言变红。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn endpoint_chain_does_not_fallback_on_501() {
+        let up_a = MockUpstream::start(vec![MockResponse {
+            status: 501,
+            reason: "Not Implemented",
+            body: "{}",
+            retry_after_secs: None,
+        }]);
+        let up_b = MockUpstream::start(vec![MockResponse {
+            status: 501,
+            reason: "Not Implemented",
+            body: "{}",
+            retry_after_secs: None,
+        }]);
+        let provider = provider_with_mock_chain(&up_a, &up_b);
+
+        let err = provider
+            .call_api(MOCK_BODY, false, &SharedRetryBudget::new(), Some("claude-sonnet-4"))
+            .await
+            .err()
+            .expect("501 不顺延 → 交凭据级分类（两号都 501）→ Err");
+        assert!(
+            err.to_string().contains("501"),
+            "错误必须保留上游 501 语义: {err}"
+        );
+        // 501 不触发**链式**回退（同凭据换 host 不会让 501 变 200）；A 被命中 2 次 =
+        // 首端点 1 次 + 凭据级/吸收层对 501 的既有重试 1 次（501 不在链内瞬态集，
+        // 但吸收层分类仍视 5xx 为可吸收——那是既有行为，m4 只修链内顺延）。
+        assert_eq!(
+            up_a.hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "同凭据链内不得因 501 顺延（501 是确定性错误），A 命中 = 首打 + 吸收层重试"
+        );
+    }
+
+    /// 注册表含 ide/cli/codewhisperer/amazonq 四端点的 provider（URL 指向无人监听端口，
+    /// 链构造不联网），供 `endpoint_chain_for` 与负缓存的纯函数测试。
+    fn provider_with_full_endpoint_registry() -> KiroProvider {
+        let mut creds = Vec::new();
+        let mut c = KiroCredentials::default();
+        c.id = Some(94_001);
+        creds.push(c);
+        let tm = Arc::new(
+            MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                creds,
+                None,
+                None,
+                false,
+            )
+            .expect("构造测试 token manager"),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        for name in ["ide", "cli", "codewhisperer", "amazonq"] {
+            endpoints.insert(
+                name.to_string(),
+                Arc::new(MockEndpoint {
+                    url: format!("http://127.0.0.1:1/{name}"),
+                    name,
+                }),
+            );
+        }
+        KiroProvider::with_proxy(tm, None, endpoints, "ide".to_string())
+    }
+
+    /// 链构造：OAuth 号（默认 ide）+ fallback 仍开 → 链只有 ide。
+    /// 不得从 FALLBACK_ORDER 补 CLI 族（cw/amazonq 会硬编码 tokentype=API_KEY）。
+    /// 回退即 FAIL：把 retain 改回给 OAuth 整表补齐，断言变红。
+    #[test]
+    fn endpoint_chain_oauth_head_gets_fallback_order_endpoints() {
+        let p = provider_with_full_endpoint_registry();
+        let head = p.endpoints["ide"].clone();
+        let chain = p.endpoint_chain_for(&head, &KiroCredentials::default(), true, "us-east-1");
+        let names: Vec<&str> = chain.iter().map(|ep| ep.name()).collect();
+        assert_eq!(names, vec!["ide"]);
+        assert!(
+            !names.contains(&"codewhisperer") && !names.contains(&"amazonq"),
+            "OAuth 号不得从 FALLBACK_ORDER 落入 CLI 族端点"
+        );
+    }
+
+    /// 链构造：ksk_ 号（自动路由 cli）→ 链首 + 凭据候选顺序（CLI 族端点，cli-runtime
+    /// 未注册跳过）+ 跨族兜底：codewhisperer/amazonq（同为 CLI 协议族）。
+    ///
+    /// 🔴 对抗审查 M2：ide 必须**整体不在链里**（不是排链尾）——ksk_ 打 ide 必 403
+    /// 是确定性错误，而链尾有「兜底铁律」永不跳过，容量风暴时链尾 ide 必被真打 →
+    /// 403 从从未成功号 report_failure 累计 → TooManyFailures 误禁用（历史事故
+    /// #481 同型）。回退即 FAIL：把 `retain` 改回「挪到链尾」，断言变红。
+    #[test]
+    fn endpoint_chain_ksk_head_uses_credential_order_first() {
+        let p = provider_with_full_endpoint_registry();
+        let mut cred = KiroCredentials::default();
+        cred.auth_method = Some("api_key".to_string());
+        cred.kiro_api_key = Some("ksk_test".to_string());
+        let head = p.endpoints["cli"].clone();
+        let chain = p.endpoint_chain_for(&head, &cred, true, "us-east-1");
+        let names: Vec<&str> = chain.iter().map(|ep| ep.name()).collect();
+        assert_eq!(names, vec!["cli", "codewhisperer", "amazonq"]);
+        assert!(
+            !names.contains(&"ide"),
+            "ksk_ 号链不得含 ide（协议族安全：ksk_ 打 ide 必 403，链尾兜底铁律会把它打成确定性失败）"
+        );
+    }
+
+    /// 开关关闭：链退化为单元素（部署方显式关掉回退的意图必须被尊重）。
+    #[test]
+    fn endpoint_chain_fallback_disabled_is_single_element() {
+        let p = provider_with_full_endpoint_registry();
+        let head = p.endpoints["ide"].clone();
+        let chain = p.endpoint_chain_for(&head, &KiroCredentials::default(), false, "us-east-1");
+        assert_eq!(chain.len(), 1, "显式关闭回退时绝不擅自加端点");
+        assert_eq!(chain[0].name(), "ide");
+    }
+
+    /// 主端点协议不符 → 不占链首（降级出链），其余健康**同族**端点按序上位。
+    /// OAuth 无 CLI 族可上位：兜底铁律把 ide 放回，且不得跨族落到 cw/amazonq。
+    #[test]
+    fn endpoint_chain_broken_head_is_demoted_not_removed() {
+        let p = provider_with_full_endpoint_registry();
+        p.mark_route_protocol_broken("ide", "us-east-1");
+        let head = p.endpoints["ide"].clone();
+        let chain = p.endpoint_chain_for(&head, &KiroCredentials::default(), true, "us-east-1");
+        assert!(!chain.is_empty());
+        let names: Vec<&str> = chain.iter().map(|ep| ep.name()).collect();
+        assert!(
+            !names.contains(&"codewhisperer") && !names.contains(&"amazonq") && !names.contains(&"cli"),
+            "OAuth 号 ide 被隔离也不得跨族落到 CLI 端点"
+        );
+        assert_eq!(names, vec!["ide"], "无同族可上位时兜底铁律放回 head");
+    }
+
+    /// 兜底铁律：所有端点都被隔离 → 链仍不得为空（否则 response 恒 None，请求无人发送）。
+    #[test]
+    fn endpoint_chain_never_empty_even_when_all_routes_quarantined() {
+        let p = provider_with_full_endpoint_registry();
+        for name in ["ide", "cli", "codewhisperer", "amazonq"] {
+            p.mark_route_protocol_broken(name, "us-east-1");
+        }
+        let head = p.endpoints["ide"].clone();
+        let chain = p.endpoint_chain_for(&head, &KiroCredentials::default(), true, "us-east-1");
+        assert!(!chain.is_empty(), "全隔离时链仍不得为空");
+    }
+
+    /// 协议隔离是软的且按 (端点, region) 精确划界：不连坐别的 region / 端点。
+    #[test]
+    fn protocol_broken_quarantine_is_recorded_and_scoped() {
+        let p = provider_with_full_endpoint_registry();
+        assert!(!p.is_route_protocol_broken("cli", "us-east-1"), "初始不应有任何隔离");
+        p.mark_route_protocol_broken("cli", "us-east-1");
+        assert!(p.is_route_protocol_broken("cli", "us-east-1"));
+        assert!(
+            !p.is_route_protocol_broken("cli", "eu-central-1"),
+            "隔离不得跨 region 连坐"
+        );
+        assert!(
+            !p.is_route_protocol_broken("ide", "us-east-1"),
+            "隔离不得跨端点连坐"
+        );
+    }
+
+    /// M3：MCP 直连失败短负缓存 —— 记入 → 判定 → 按 (凭据 id, region) 划界。
+    /// 同 region 其它 id 不连坐；与端点连接层键空间互不干扰。
+    #[test]
+    fn mcp_direct_negative_cache_blocks_same_region_only() {
+        let p = provider_with_full_endpoint_registry();
+        let id_a = 1u64;
+        let id_b = 2u64;
+        assert!(
+            !p.is_mcp_direct_blocked(id_a, "us-east-1"),
+            "初始不应有负缓存"
+        );
+        p.mark_endpoint_dead(&format!("mcp-direct@{}", id_a), "us-east-1");
+        assert!(
+            p.is_mcp_direct_blocked(id_a, "us-east-1"),
+            "直连失败后 60s 内必须跳过该号直连"
+        );
+        assert!(
+            !p.is_mcp_direct_blocked(id_b, "us-east-1"),
+            "负缓存不得连坐同 region 其它凭据"
+        );
+        assert!(
+            !p.is_mcp_direct_blocked(id_a, "eu-central-1"),
+            "负缓存不得跨 region 连坐"
+        );
+        assert!(
+            !p.is_endpoint_dead("ide", "us-east-1"),
+            "mcp-direct 键不得影响端点连接层负缓存（键空间正交）"
+        );
+    }
+
+    /// M3：直连负缓存 TTL 过期必须放行（自愈语义，同 is_endpoint_dead 同款惰性清理）。
+    #[test]
+    fn mcp_direct_negative_cache_expires_after_ttl() {
+        let p = provider_with_full_endpoint_registry();
+        let id = 1u64;
+        p.dead_endpoints.lock().insert(
+            format!("mcp-direct@{}@us-east-1", id),
+            std::time::Instant::now() - std::time::Duration::from_secs(61),
+        );
+        assert!(
+            !p.is_mcp_direct_blocked(id, "us-east-1"),
+            "TTL 过期必须放行重试（上游/token 可能已恢复）"
+        );
+    }
+
+    /// 死端点负缓存：记入 → 判定 → 划界 → alive 清除。
+    #[test]
+    fn dead_endpoint_negative_cache_is_recorded_cleared_and_scoped() {
+        let p = provider_with_full_endpoint_registry();
+        assert!(!p.is_endpoint_dead("ide", "us-east-1"), "初始不应有负缓存");
+        p.mark_endpoint_dead("ide", "us-east-1");
+        assert!(p.is_endpoint_dead("ide", "us-east-1"));
+        assert!(
+            !p.is_endpoint_dead("ide", "eu-central-1"),
+            "负缓存不得跨 region 连坐"
+        );
+        p.mark_endpoint_alive("ide", "us-east-1");
+        assert!(
+            !p.is_endpoint_dead("ide", "us-east-1"),
+            "mark_endpoint_alive 必须清除负缓存（拿到 HTTP 响应 = 连接层通了）"
+        );
+    }
+
+    /// ⭐ 接线守卫：endpoint_chain_for 必须在 call_api_with_retry 内被调用（链式回退接线）。
+    ///
+    /// 回退即 FAIL：把链构造挪到别的函数 / 改成 `endpoint_for` 单端点直发 → 本条变红。
+    #[test]
+    fn endpoint_chain_for_is_wired_in_call_api_with_retry() {
+        let full = include_str!("provider.rs");
+        let cut = full.find("#[cfg(test)]").unwrap_or(full.len());
+        let prod = &full[..cut];
+        // needle 运行时拼接，避免 include_str! 自匹配。
+        let call = ["self.endpoint_chain_for", "("].concat();
+        assert_eq!(
+            prod.matches(&call).count(),
+            1,
+            "endpoint_chain_for 应在生产段恰好调用 1 次（MCP 路径不参与端点回退）"
+        );
+        let fn_body = prod
+            .split("async fn call_api_with_retry")
+            .nth(1)
+            .expect("call_api_with_retry 不应被改名");
+        assert!(
+            fn_body.contains(&call),
+            "endpoint_chain_for 调用必须在 call_api_with_retry 函数体内"
+        );
+    }
+
+    /// ⭐ 接线守卫：endpoint_fallback 配置开关必须作为 endpoint_chain_for 的实参接线，
+    /// 否则开关是死配置（关了也没用）。
+    #[test]
+    fn endpoint_fallback_config_is_wired_into_chain() {
+        let full = include_str!("provider.rs");
+        let cut = full.find("#[cfg(test)]").unwrap_or(full.len());
+        let prod = &full[..cut];
+        let call = ["self.endpoint_chain_for", "("].concat();
+        let at = prod
+            .find(&call)
+            .expect("endpoint_chain_for 调用不应被改名");
+        // 开关实参在调用点**之后**（同一调用语句内）。`after` 从 at 起切：at 是
+        // ASCII needle 的起点（合法字符边界），find 返回的偏移同理，无多字节坑。
+        let after = &prod[at..];
+        let gate = after.find("config.endpoint_fallback").unwrap_or_else(|| {
+            panic!(
+                "endpoint_chain_for 的 fallback_enabled 实参必须来自 config 开关 \
+                 （否则该配置是死配置，部署方显式关闭会被无视）"
+            )
+        });
+        assert!(gate < 300, "开关实参必须在调用点近旁（同一语句窗口）");
+    }
+
+    /// 失败重试路径：上游先 429（带 Retry-After）→ 冷却 + 换号 → 第二个号 200。
+    ///
+    /// 钉住「429 分类 → 凭据冷却 → tried_this_call 结构性排除 → failover 换号 → 成功」
+    /// 整条链（此前只有 absorb 层纯函数测试，链咬合从未真跑）。meta.retries 必须为 1。
+    ///
+    /// 回退即 FAIL：把 429 分支的 `report_rate_limited_with_retry_after` 或
+    /// `tried_this_call.insert` 删掉——换号会落空、整条链回到同一个号，请求变 Err。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn call_api_failover_after_upstream_429_succeeds_on_another_credential() {
+        let up = MockUpstream::start(vec![
+            MockResponse {
+                status: 429,
+                reason: "Too Many Requests",
+                body: "{}",
+                retry_after_secs: Some(1),
+            },
+            MockResponse::ok(r#"{"ok":true}"#),
+        ]);
+        let provider = provider_with_mock_upstream(&up);
+
+        let (resp, meta) = match provider
+            .call_api(MOCK_BODY, false, &SharedRetryBudget::new(), Some("claude-sonnet-4"))
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => panic!("429 换号后应成功: {e}"),
+        };
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(meta.retries, 1, "429 一次 + 换号成功 = 恰好 1 次重试");
+        assert_eq!(
+            up.hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "必须打 2 次上游（1 次 429 + 1 次成功）"
+        );
+    }
+
+    /// 重试耗尽：1 号池（小池预算 1 次）+ 上游恒 500 → `Err`，且只打 1 次就停
+    /// （预算 1 = 各号摸一次即透传，不风暴）。
+    ///
+    /// 回退即 FAIL：把墙钟闸门/预算判据改松（例如预算恢复成号池倍数），
+    /// hits 会变成 3+，断言失败。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn call_api_budget_exhausted_returns_err_without_storming_upstream() {
+        let up = MockUpstream::start(vec![
+            MockResponse {
+                status: 500,
+                reason: "Internal Server Error",
+                body: "{}",
+                retry_after_secs: None,
+            },
+            MockResponse {
+                status: 500,
+                reason: "Internal Server Error",
+                body: "{}",
+                retry_after_secs: None,
+            },
+            MockResponse {
+                status: 500,
+                reason: "Internal Server Error",
+                body: "{}",
+                retry_after_secs: None,
+            },
+        ]);
+        // 单号池：小池预算 = 每号 1 次 = 总共 1 次尝试。
+        let mut cred = KiroCredentials::default();
+        cred.id = Some(91_003);
+        cred.auth_method = Some("api_key".to_string());
+        cred.kiro_api_key = Some("sk-mock-91003".to_string());
+        // 同 provider_with_mock_upstream：显式钉死 endpoint，否则被自动路由到
+        // 内置 cli/cli-runtime 候选链、mock 上游零命中。
+        cred.endpoint = Some("mock".to_string());
+        let tm = Arc::new(
+            MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                vec![cred],
+                None,
+                None,
+                false,
+            )
+            .expect("构造测试 token manager"),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert(
+            "mock".to_string(),
+            Arc::new(MockEndpoint {
+                url: format!("http://127.0.0.1:{}", up.port),
+                name: "mock",
+            }),
+        );
+        let provider = KiroProvider::with_proxy(tm, None, endpoints, "mock".to_string());
+
+        let err = match provider
+            .call_api(MOCK_BODY, false, &SharedRetryBudget::new(), Some("claude-sonnet-4"))
+            .await
+        {
+            Ok(_) => panic!("预算耗尽必须 Err"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("500"),
+            "终态错误必须透传上游 500 文案，实际: {}",
+            err
+        );
+        assert_eq!(
+            up.hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "小池预算 1：恒 500 也只许打 1 次，不得风暴"
+        );
+    }
+
+    // ══════════ A-5：429 备区换桶 与 L1 403 换区 的共享感知（防同请求内 A→B→A→B 振荡）══════════
+
+    /// A-5 专用端点：**URL 与桶键都随 region 走** —— 让「当前区全封 ⇒ 用备区桶」的
+    /// 换桶真实可触发（MockEndpoint 的 URL/桶键与 region 无关，两区永远同桶，换桶
+    /// 路径根本走不到）。`decorate_api` 仿真实 cli 端点带上 Bearer 头，让 mock 上游
+    /// 能按 token 区分请求是哪个号发的。
+    ///
+    /// 依赖前提：`bucket_key`/`bucket_id` 走 trait 默认实现（= `api_url`，`amz_target`
+    /// 为 None），故 URL 随区变化 ⇒ 桶键随区独立；与生产端点的「region 在 host 里」
+    /// 是同一种不变量。
+    struct RegionAwareMockEndpoint {
+        eu_url: String,
+        us_url: String,
+    }
+
+    impl KiroEndpoint for RegionAwareMockEndpoint {
+        fn name(&self) -> &'static str {
+            "mock-region"
+        }
+        fn api_url(&self, ctx: &RequestContext<'_>) -> String {
+            self.url_for_region(ctx.credentials.effective_upstream_region(&ctx.config))
+        }
+        fn mcp_url(&self, ctx: &RequestContext<'_>) -> String {
+            self.url_for_region(ctx.credentials.effective_upstream_region(&ctx.config))
+        }
+        fn decorate_api(
+            &self,
+            req: reqwest::RequestBuilder,
+            ctx: &RequestContext<'_>,
+        ) -> reqwest::RequestBuilder {
+            req.header("Authorization", format!("Bearer {}", ctx.token))
+        }
+        fn decorate_mcp(
+            &self,
+            req: reqwest::RequestBuilder,
+            _ctx: &RequestContext<'_>,
+        ) -> reqwest::RequestBuilder {
+            req
+        }
+        fn transform_api_body(&self, body: &str, _ctx: &RequestContext<'_>) -> String {
+            body.to_string()
+        }
+    }
+
+    impl RegionAwareMockEndpoint {
+        fn url_for_region(&self, region: &str) -> String {
+            match region {
+                "eu-central-1" => self.eu_url.clone(),
+                _ => self.us_url.clone(),
+            }
+        }
+    }
+
+    /// A-5 复现测试（钉顺序）：当前区 429 全封 → 429 路径换备区 → 备区 403 →
+    /// **不得**再由 L1 换回原区（原区桶仍在 30s 封禁期，select_endpoint 会把请求
+    /// 弹回备区 ⇒ 同一请求内 A→B→A→B 振荡）。
+    ///
+    /// 序列（#910101 = 受害者，初始区 eu，备区 us）：
+    ///   ① #910101 → eu → 429（eu 桶被封）
+    ///   ② #910101 → us（429 备区换桶）→ 403 bearer-invalid
+    ///   ③ 修复前：L1 按当前区(us)算 `region_retry_target` 换回 eu → eu 桶还封着
+    ///      → 备区路径又弹回 us → #910101 **第二次**打 us；修复后：共享标记
+    ///      `region_switched_this_call` 挡住 L1 ⇒ #910101 不再换区，惩罚换号走
+    ///      failover（再打 eu 的是 #910102）。
+    ///
+    /// 断言（按请求头里的 token 数每个号在每区的命中）：
+    ///   - us 上 #910101 恰好 1 次（换区次数 ≤ 1；修复前是 2 次 = 振荡）；
+    ///   - eu 上 #910101 恰好 1 次（从未被换回去）；
+    ///   - 单路径行为不变：#910102 从未换过区，eu 403 后仍走 L1 换区（us 恰好 1 次）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a5_no_region_pingpong_after_429_swap_then_403() {
+        // eu = 当前区（429 封桶），us = 备区（403 bearer-invalid）。
+        // 每区各配 2 个响应就够（预算封顶 4 次上游调用）；队列耗尽后一律 500，
+        // 若真的多打了，500 也会被计入命中 → 断言照样红，不会假绿。
+        let eu = MockUpstream::start(vec![
+            MockResponse {
+                status: 429,
+                reason: "Too Many Requests",
+                body: "{}",
+                retry_after_secs: None,
+            },
+            MockResponse {
+                status: 403,
+                reason: "Forbidden",
+                body: REAL_BEARER_INVALID_BODY,
+                retry_after_secs: None,
+            },
+            MockResponse {
+                status: 403,
+                reason: "Forbidden",
+                body: REAL_BEARER_INVALID_BODY,
+                retry_after_secs: None,
+            },
+        ]);
+        let us = MockUpstream::start(vec![
+            MockResponse {
+                status: 403,
+                reason: "Forbidden",
+                body: REAL_BEARER_INVALID_BODY,
+                retry_after_secs: None,
+            },
+            MockResponse {
+                status: 403,
+                reason: "Forbidden",
+                body: REAL_BEARER_INVALID_BODY,
+                retry_after_secs: None,
+            },
+        ]);
+
+        // 4 个 ksk_ 号，初始区钉死 eu（PROBE_ORDER 首项 ⇒ 备区恒为 us），
+        // endpoint 钉死 mock-region（order = [mock-region, cli, cli-runtime]，len>1
+        // ⇒ 429 分支会封桶并尝试换桶，这正是 A-5 的前提）。id 用本组专属段 91_1xx
+        // （endpoint_health 是进程级共享表，避开既有测试的 91_0xx）。
+        //
+        // ⚠️ 号池必须 ≥4：本轮重试配额 = compute_max_retries(号数, …)，号数 ≤
+        // SMALL_POOL_THRESHOLD(3) 时每号只重试 1 次 ⇒ 2 号池配额 = 2，第 2 跳（#910101
+        // 打 us）403 后本轮即耗尽（region 错配类错误按设计不可吸收，吸收层不会续轮），
+        // failover 根本走不到 #910102。4 号池配额 = min(4×3, 4) = 4，正好装下 A-5 全
+        // 序列（eu→us→eu→us，共 4 次上游调用）。91_103/91_104 是陪跑号：选号排序键
+        // 按 id 升序平局决胜（⑬ e.id），本序列只会用到 91_101/91_102，它们不被选中。
+        let mut creds = Vec::new();
+        for (id, token) in [
+            (91_101u64, "sk-mock-a5-910101"),
+            (91_102, "sk-mock-a5-910102"),
+            (91_103, "sk-mock-a5-910103"),
+            (91_104, "sk-mock-a5-910104"),
+        ] {
+            let mut c = KiroCredentials::default();
+            c.id = Some(id);
+            c.auth_method = Some("api_key".to_string());
+            c.kiro_api_key = Some(token.to_string());
+            c.api_region = Some("eu-central-1".to_string());
+            c.endpoint = Some("mock-region".to_string());
+            creds.push(c);
+        }
+        let tm = Arc::new(
+            MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                creds,
+                None,
+                None,
+                false,
+            )
+            .expect("构造测试 token manager"),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert(
+            "mock-region".to_string(),
+            Arc::new(RegionAwareMockEndpoint {
+                eu_url: format!("http://127.0.0.1:{}", eu.port),
+                us_url: format!("http://127.0.0.1:{}", us.port),
+            }),
+        );
+        let provider = KiroProvider::with_proxy(tm, None, endpoints, "mock-region".to_string());
+
+        let err = match provider
+            .call_api(MOCK_BODY, false, &SharedRetryBudget::new(), Some("claude-sonnet-4"))
+            .await
+        {
+            Ok(_) => panic!("备区 403 是永久性（未授权区），序列必须以 Err 收尾"),
+            Err(e) => e,
+        };
+
+        let eu_heads = eu.captured_heads();
+        let us_heads = us.captured_heads();
+        let hits_by = |heads: &[String], token: &str| heads.iter().filter(|h| h.contains(token)).count();
+        let victim_eu = hits_by(&eu_heads, "sk-mock-a5-910101");
+        let victim_us = hits_by(&us_heads, "sk-mock-a5-910101");
+        let fresh_eu = hits_by(&eu_heads, "sk-mock-a5-910102");
+        let fresh_us = hits_by(&us_heads, "sk-mock-a5-910102");
+        let extra_eu = hits_by(&eu_heads, "sk-mock-a5-910103") + hits_by(&eu_heads, "sk-mock-a5-910104");
+        let extra_us = hits_by(&us_heads, "sk-mock-a5-910103") + hits_by(&us_heads, "sk-mock-a5-910104");
+        eprintln!(
+            "a5 hits eu={} us={} | 910101 eu/us={}/{} 910102 eu/us={}/{} extra 103+104 eu/us={}/{} | err={}",
+            eu_heads.len(),
+            us_heads.len(),
+            victim_eu,
+            victim_us,
+            fresh_eu,
+            fresh_us,
+            extra_eu,
+            extra_us,
+            err
+        );
+        assert!(
+            err.to_string().contains("403"),
+            "终态错误必须透传上游 403 文案，实际: {err}; hits 910101 eu/us={victim_eu}/{victim_us} \
+             910102 eu/us={fresh_eu}/{fresh_us} extra103+104 eu/us={extra_eu}/{extra_us} \
+             eu_total={} us_total={}",
+            eu_heads.len(),
+            us_heads.len()
+        );
+
+        assert_eq!(
+            victim_eu, 1,
+            "受害者 #910101 必须恰好打 1 次当前区 eu（初始 429）；换回原区=振荡，实际 {victim_eu}"
+        );
+        assert_eq!(
+            victim_us, 1,
+            "受害者 #910101 在备区 us 必须恰好 1 次（429 换桶那一次）；\
+             修复前 L1 换回 eu 被备区路径弹回 ⇒ us 会是 2 次（A→B→A→B 振荡），实际 {victim_us}"
+        );
+        assert_eq!(
+            fresh_eu, 1,
+            "从未换过区的 #910102 应接住 failover 打 eu，实际 {fresh_eu}"
+        );
+        assert_eq!(
+            fresh_us, 1,
+            "单路径行为不变：从未换过区的 #910102 吃 eu 403 后仍走 L1 换区（us 恰好 1 次），\
+             实际 {fresh_us}"
+        );
+    }
+
     /// ksk_ API Key 凭据：`effective_endpoint_order` 返回多端点候选链（q.* 优先、其余回退）。
     fn ksk_credential() -> KiroCredentials {
         let mut c = KiroCredentials::default();
@@ -5175,6 +8297,173 @@ mod tests {
         assert!(
             provider.pick_endpoint_for_test(&cred, 123).is_none(),
             "全部冷却必须返回 None"
+        );
+    }
+
+    /// last hop 全桶 429 封禁：generic 错误必须带 `retry_after_secs=`（handlers A5 → 429+RA，
+    /// 而不是无标记兜底 502）。TTL 取最短桶剩余，没有则 2s。不增加 hop。
+    #[test]
+    fn last_hop_all_buckets_sealed_stamps_retry_after_secs() {
+        let cli = crate::kiro::endpoint::cli::CLI_ENDPOINT_NAME;
+        const ID: u64 = 92_201;
+        let mut cred = ksk_credential();
+        cred.id = Some(ID);
+        let tm = std::sync::Arc::new(
+            crate::kiro::token_manager::MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                vec![cred.clone()],
+                None,
+                None,
+                false,
+            )
+            .expect("测试 token manager"),
+        );
+        let provider = KiroProvider::with_proxy(
+            tm,
+            None,
+            crate::kiro::endpoint::registry(),
+            cli.to_string(),
+        );
+        let order = cred.effective_endpoint_order(cli);
+        let cfg = provider.token_manager.config();
+        {
+            let mut buckets = provider.endpoint_buckets.lock();
+            for region in crate::kiro::region_probe::PROBE_ORDER {
+                let mut c = cred.clone();
+                c.api_region = Some(region.to_string());
+                for name in &order {
+                    let key = provider
+                        .endpoints
+                        .get(*name)
+                        .expect("候选端点应已注册")
+                        .bucket_key(&c, &cfg);
+                    buckets.insert((ID, key), Instant::now() + Duration::from_secs(14));
+                }
+            }
+        }
+        assert!(
+            provider.select_endpoint(&cred, ID).is_none(),
+            "全 region 封桶必须返 None"
+        );
+        assert!(
+            provider.all_enabled_kiro_endpoint_buckets_sealed(),
+            "号池里唯一 Kiro 的桶全封"
+        );
+        let ra = provider.shortest_endpoint_bucket_retry_after_secs(Some(ID));
+        assert!(
+            (1..=14).contains(&ra),
+            "最短桶 TTL 应落在 1..=14，实际 {ra}"
+        );
+
+        let marker = ["retry_after_secs", "="].concat();
+        let sealed = anyhow::anyhow!(
+            "凭据 #{ID} 所有端点桶均处于 429 封禁期（当前区与备用区的桶都在封禁中）"
+        );
+        let stamped = provider.with_sealed_bucket_retry_after(
+            sealed,
+            crate::usage::RequestOutcome::RateLimited,
+        );
+        let s = stamped.to_string();
+        assert!(
+            s.contains(marker.as_str()),
+            "A5 冷却分支需要 {marker} 才能 429+Retry-After 而非 502: {s}"
+        );
+        let secs = crate::anthropic::handlers::parse_retry_after_secs(&s)
+            .expect("必须能解析 retry_after 真值");
+        assert!((1..=14).contains(&secs), "解析出 {secs}");
+        let again = provider.with_sealed_bucket_retry_after(
+            stamped,
+            crate::usage::RequestOutcome::RateLimited,
+        );
+        assert_eq!(
+            again.to_string().matches(marker.as_str()).count(),
+            1,
+            "已有标记不得再打一份"
+        );
+
+        let generic = anyhow::anyhow!("流式 API 请求失败: 429 Too Many Requests {{}}");
+        let s2 = provider
+            .with_sealed_bucket_retry_after(generic, crate::usage::RequestOutcome::RateLimited)
+            .to_string();
+        assert!(
+            s2.contains(marker.as_str()),
+            "last hop generic 429 必须 stamp: {s2}"
+        );
+
+        let auth = anyhow::anyhow!("流式 API 请求失败: 403 Forbidden bearer invalid");
+        let s3 = provider
+            .with_sealed_bucket_retry_after(auth, crate::usage::RequestOutcome::AuthFailed)
+            .to_string();
+        assert!(
+            !s3.contains(marker.as_str()),
+            "403 不得被打成 A5 冷却: {s3}"
+        );
+
+        let empty = provider_with_default(cli);
+        assert_eq!(
+            empty.shortest_endpoint_bucket_retry_after_secs(None),
+            2,
+            "无封禁桶时兜底 2s"
+        );
+    }
+
+    /// 混池：只有部分号的桶封了 → 不是「every credential sealed」，不 stamp。
+    #[test]
+    fn mixed_pool_partial_seal_does_not_stamp_retry_after_secs() {
+        let cli = crate::kiro::endpoint::cli::CLI_ENDPOINT_NAME;
+        const A: u64 = 92_211;
+        const B: u64 = 92_212;
+        let mk = |id: u64| {
+            let mut c = ksk_credential();
+            c.id = Some(id);
+            c
+        };
+        let tm = std::sync::Arc::new(
+            crate::kiro::token_manager::MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                vec![mk(A), mk(B)],
+                None,
+                None,
+                false,
+            )
+            .expect("测试 token manager"),
+        );
+        let provider = KiroProvider::with_proxy(
+            tm,
+            None,
+            crate::kiro::endpoint::registry(),
+            cli.to_string(),
+        );
+        let cred_a = mk(A);
+        let order = cred_a.effective_endpoint_order(cli);
+        let cfg = provider.token_manager.config();
+        {
+            let mut buckets = provider.endpoint_buckets.lock();
+            for region in crate::kiro::region_probe::PROBE_ORDER {
+                let mut c = cred_a.clone();
+                c.api_region = Some(region.to_string());
+                for name in &order {
+                    let key = provider
+                        .endpoints
+                        .get(*name)
+                        .expect("候选端点应已注册")
+                        .bucket_key(&c, &cfg);
+                    buckets.insert((A, key), Instant::now() + Duration::from_secs(30));
+                }
+            }
+        }
+        assert!(
+            !provider.all_enabled_kiro_endpoint_buckets_sealed(),
+            "B 未封，不得判全池封禁"
+        );
+        let marker = ["retry_after_secs", "="].concat();
+        let generic = anyhow::anyhow!("流式 API 请求失败: 429 Too Many Requests {{}}");
+        let s = provider
+            .with_sealed_bucket_retry_after(generic, crate::usage::RequestOutcome::RateLimited)
+            .to_string();
+        assert!(
+            !s.contains(marker.as_str()),
+            "还有未封号时 generic 429 不 stamp（换号仍可能成功）: {s}"
         );
     }
 
@@ -5630,7 +8919,7 @@ mod tests {
         );
         // 策略里确实带上了这个字段（防有人删字段又改回重读）。
         assert!(
-            src.contains("absorb_suspended: bool"),
+            include_str!("absorb_policy.rs").contains("absorb_suspended: bool"),
             "AbsorbPolicy 必须持有 absorb_suspended 字段"
         );
     }
@@ -5641,7 +8930,7 @@ mod tests {
     /// 忙等（正是 acquire_context 那次 CPU 打满一核、请求永不返回的事故形态），第二条断言失败。
     #[test]
     fn absorb_backoff_prefers_pool_truth_and_clamps() {
-        use crate::anthropic::AbsorbClass;
+        use crate::model::AbsorbClass;
         let p = AbsorbPolicy::from_config(&absorb_cfg(true));
 
         // 号池给的真值在区间内 → 原样采用（无需等 HTTP Retry-After 头往返）。
@@ -5675,7 +8964,7 @@ mod tests {
     /// 而 panic 发生在**请求热路径**上 —— 开启吸收层后每个 429 都会打到。
     #[test]
     fn absorb_min_delay_above_max_is_normalized_not_panicking() {
-        use crate::anthropic::AbsorbClass;
+        use crate::model::AbsorbClass;
         let mut c = absorb_cfg(true);
         c.upstream_retry_absorb_min_delay_ms = 60_000; // 面板毫秒框上限
         c.upstream_retry_absorb_max_delay_secs = 1; // 面板秒框下限
@@ -5750,7 +9039,7 @@ mod tests {
     /// 该值经 Admin API 可写（`service.rs` 对这两个字段无 clamp），所以这是可达状态。
     #[test]
     fn absorb_zero_max_delay_cannot_produce_busy_loop() {
-        use crate::anthropic::AbsorbClass;
+        use crate::model::AbsorbClass;
         let mut c = absorb_cfg(true);
         c.upstream_retry_absorb_max_delay_secs = 0;
         c.upstream_retry_absorb_min_delay_ms = 0;
@@ -6029,7 +9318,7 @@ mod tests {
     /// 恒假式（如 `false`），第二、三条断言失败。
     #[test]
     fn truncated_backoff_means_round_is_futile() {
-        use crate::anthropic::AbsorbClass;
+        use crate::model::AbsorbClass;
         let p = AbsorbPolicy::from_config(&absorb_cfg(true));
 
         // 号池真值在退避上限之内 → 睡够就真到恢复时刻 → 这一轮有意义。
@@ -6162,12 +9451,68 @@ mod tests {
              误判成「模型不存在」而断会话，而池里其它号可能能成功（实测 deepseek-v4-flash \
              在 denzao 返 404、在 k2cc 返 200）"
         );
-        // 冷却时长也要覆盖 404（与 400 同性质：站点稳定属性，给 5s 调度级跳过而非惩罚）。
-        let cooldown = format!("{}{}", "400 ", "| 404 => 5");
+        // 冷却时长在 passthrough_cooldown_for（抽到 try_custom_api_passthrough 之前）。
+        // 切片必须扫 helper，不能扫透传函数体——否则抽函数后守卫假红。
+        let cool_marker = format!("{}{}", "fn passthrough_cooldown_for", "(");
+        let cool_start = src
+            .find(cool_marker.as_str())
+            .expect("passthrough_cooldown_for 不应被改名");
+        let cool_end = src[cool_start..]
+            .find("\n    /// 混入池分流")
+            .map(|off| cool_start + off)
+            .unwrap_or(src.len());
+        let cool_src: String = src[cool_start..cool_end]
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cooldown = format!("{}{}", "400 ", "| 404 => (5,");
         assert!(
-            code.contains(cooldown.as_str()),
+            cool_src.contains(cooldown.as_str()),
             "404 的冷却时长必须与 400 同档（5s 调度级跳过）：它们是同一性质"
         );
+    }
+
+    /// 透传 400/404 的「换号无益」判据（`is_hopeless_upstream_400`）：
+    /// 真实配额耗尽/超长形态必须判无益（不 failover），
+    /// 但 body 恰好含 `quota` 字样的**上游能力差异**文案必须仍给换号机会。
+    ///
+    /// 回退即 FAIL：把判据改回裸 `quota` 宽匹配，反例组全部误判为无益 →
+    /// 客户端白吃一个本来能靠换号解决的 400/404。
+    #[test]
+    fn hopeless_400_judgement_is_phrase_based_not_bare_quota() {
+        // 正例：实测/常见配额耗尽与超长形态（OpenAI 系 / one-api 系 / DeepSeek 系）。
+        for body in [
+            r#"{"error":{"message":"You exceeded your current quota, please check your plan and billing details.","code":"insufficient_quota"}}"#,
+            r#"{"error":{"message":"quota exhausted"}}"#,
+            r#"{"error":{"message":"quota exceeded, 500 requests used"}}"#,
+            "Insufficient Balance",
+            "usage limit exceeded",
+            "the request is too long",
+            r#"{"reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#,
+        ] {
+            let low = body.to_ascii_lowercase();
+            assert!(
+                is_hopeless_upstream_400(&low),
+                "真实配额耗尽/超长形态必须判「换号无益」: {body}"
+            );
+        }
+        // 反例（误伤场景）：含 `quota` 字样但**不是**配额耗尽 —— 上游能力差异
+        // （换一个号可能成功），必须仍给 failover 机会。
+        for body in [
+            "the model deepseek-quota-v2 requires a higher quota tier on this relay",
+            r#"{"error":{"message":"quota tier not enabled for this model"}}"#,
+            r#"{"error":{"code":"quota","message":"unknown error"}}"#,
+        ] {
+            let low = body.to_ascii_lowercase();
+            assert!(
+                !is_hopeless_upstream_400(&low),
+                "非配额耗尽的 quota 字样不得判「换号无益」（会把上游能力差异吞成直返）: {body}"
+            );
+        }
     }
 
     #[test]
@@ -6805,7 +10150,7 @@ mod tests {
     /// 改成 `=> true` → 本测试 FAILED。
     #[test]
     fn new_absorb_classes_are_all_gated_off_by_default() {
-        use crate::anthropic::AbsorbClass;
+        use crate::model::AbsorbClass;
         // 总开关开着（否则 effective_max_rounds()=0，测不到类别闸门本身）。
         let p = AbsorbPolicy::from_config(&absorb_cfg(true));
 
@@ -6845,7 +10190,7 @@ mod tests {
     /// （只留指数曲线）→ 本测试 FAILED。
     #[test]
     fn swap_window_uses_long_ladder_only_when_budget_configured() {
-        use crate::anthropic::AbsorbClass;
+        use crate::model::AbsorbClass;
 
         // ① 默认（swap 预算 0）：与限速同曲线 ⇒ 逐字节等于本字段引入前的行为。
         let mut c = absorb_cfg(true);
@@ -6899,7 +10244,7 @@ mod tests {
     /// 两条曲线必须**可区分**：5xx 多为瞬时抖动，容量类是全局状态、换号不解决问题。
     #[test]
     fn transient_5xx_backs_off_shorter_than_capacity_class() {
-        use crate::anthropic::AbsorbClass;
+        use crate::model::AbsorbClass;
         let mut c = absorb_cfg(true);
         // 抬高上界，让曲线本身可见（默认 15s 会把两条都 clamp 到同一个值）。
         c.upstream_retry_absorb_max_delay_secs = 300;
@@ -6931,7 +10276,7 @@ mod tests {
     /// 而换号空窗恰恰是唯一等得起的一类。
     #[test]
     fn swap_budget_deadline_does_not_leak_to_other_classes() {
-        use crate::anthropic::AbsorbClass;
+        use crate::model::AbsorbClass;
         let now = std::time::Instant::now();
         let mut c = absorb_cfg(true);
         c.upstream_retry_absorb_suspended = true;
@@ -7013,7 +10358,8 @@ mod tests {
 
         // ① 只认精确的 503：其它值（含裸 serde default 会给的 0）一律按 429 处理。
         assert!(
-            prod.contains("cfg.upstream_retry_absorb_exhausted_status == 503"),
+            include_str!("absorb_policy.rs")
+                .contains("cfg.upstream_retry_absorb_exhausted_status == 503"),
             "必须只认精确 503 —— 打一个 handlers 认不出的标记只会造成静默的行为分叉"
         );
         // ② 标记必须同时受「真跑过轮次」约束：一次都没重试就改状态码是说谎。
@@ -7312,6 +10658,221 @@ mod tests {
             retry_fn.contains(unexclude.as_str()),
             "换区后必须把该号从 tried_this_call 摘掉，否则 acquire_context_excluding 会避开它，\
              换区重试打的是别人的号 —— 覆盖值没人用，等于没换区"
+        );
+    }
+
+    /// ⭐ A-5 源码级守卫：429 备区换桶 与 L1 403 换区必须**共享同一个**「本请求已换区」
+    /// 标记（`region_switched_this_call`）。
+    ///
+    /// 回退即 FAIL：
+    /// - 把 429 备区换桶处的标记置位删掉 → 第一条断言 FAILED（403 分支的门看不见
+    ///   这次换桶 ⇒ 按已换到的区算回原区 ⇒ 原区桶还在封禁 ⇒ 备区路径又弹回 ⇒
+    ///   同一请求内 A→B→A→B 振荡）；
+    /// - 把标记置位挪出 `alt_region` 的 `Some(r)` 分支（如无条件置位）→ 第二条 FAILED
+    ///   （未换桶的普通请求也置位 ⇒ 该号本请求内合法的一次 L1 换区被误杀）；
+    /// - 403 分支那道门被删 → 第三条 FAILED（两路径的共享感知失效，回到「各自为政」）。
+    #[test]
+    fn alt_region_swap_marks_region_switched_shared_with_l1_403() {
+        let src = include_str!("provider.rs");
+        let prod = src
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(src);
+        let retry_fn = prod
+            .split("async fn call_api_with_retry")
+            .nth(1)
+            .expect("call_api_with_retry 不应被改名");
+
+        // ① 429 备区换桶处必须置位共享标记（与 L1 403 的置位同字面量、同集合）。
+        let mark = format!("{}{}", "region_switched_this_call", ".insert(ctx.id)");
+        // ② 该置位必须落在 `alt_region` 的 `Some(r)` 分支内：锚定备区生效处的
+        //    Cow 重绑到 `None` 分支之间的切片，断言标记插入在其中。
+        let anchor = "let call_creds: std::borrow::Cow<'_, KiroCredentials> = match alt_region";
+        let branch_start = retry_fn
+            .find(anchor)
+            .expect("备区生效处的 Cow 重绑不应被改名");
+        let branch_end = retry_fn[branch_start..]
+            .find("None => call_creds")
+            .map(|i| branch_start + i)
+            .expect("alt_region 的 None 分支不应消失");
+        let alt_branch = &retry_fn[branch_start..branch_end];
+        assert!(
+            alt_branch.contains(mark.as_str()),
+            "429 备区换桶必须置位「本请求已换区」标记（与 L1 403 同一份）：\
+             否则 403 分支的门看不见这次换桶，会按已换到的区算回原区，而原区桶还在封禁期，\
+             select_endpoint 又弹回备区 ⇒ 同一请求内 A→B→A→B 振荡"
+        );
+
+        // ③ 403 分支的门仍在（两路径读同一个标记，共享感知才有落点）。
+        let gate = format!("!{}{}", "region_switched_this_call", ".contains(&ctx.id)");
+        assert!(
+            retry_fn.contains(gate.as_str()),
+            "403 换区分支的门被删：429 备区换桶置的标记没人读，共享感知失效"
+        );
+    }
+
+    /// ⭐ 源码级守卫（P0-A）：对话路径与 MCP 路径的失败守卫组装点都必须存在，
+    /// 且初值必须是 [`crate::kiro::upstream_trace::VERDICT_UNCLASSIFIED`]。
+    ///
+    /// 与 `upstream_trace.rs` 的 `provider_guards_must_default_verdict_to_unclassified`
+    /// 同源（那边数全局计数=2，这里数两处组装点各自就位）：漏标的失败分支在 trace
+    /// 里落 unclassified，验收脚本据此统计。组装点被删/挪出失败路径/初值被改，本断言红。
+    #[test]
+    fn trace_guards_wired_in_both_call_paths_with_unclassified_default() {
+        let full = include_str!("provider.rs");
+        let src = full
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(full);
+        // needle 运行时拼接（include_str! 自匹配坑，本仓踩过多次）。
+        let needle = format!(
+            "{}{}",
+            "verdict: crate::kiro::upstream_trace::VERDICT_UNCLASSIFIED", ".to_string(),"
+        );
+        assert_eq!(
+            src.matches(needle.as_str()).count(),
+            2,
+            "对话路径与 MCP 路径的失败守卫组装点都必须以 VERDICT_UNCLASSIFIED 为初值\
+             （当前 {} 处），否则漏标的失败分支在 trace 里查不出来",
+            src.matches(needle.as_str()).count()
+        );
+        // 两处必须分别落在两个重试函数里，且都位于「失败响应」之后（守卫真的挂在
+        // 失败路径上，而不是在函数里充数）。函数切片照本仓先例截到下一个顶层函数。
+        for (fname, marker) in [
+            ("call_api_with_retry", "async fn call_api_with_retry"),
+            ("call_mcp_with_retry", "async fn call_mcp_with_retry"),
+        ] {
+            let start = src
+                .find(marker)
+                .unwrap_or_else(|| panic!("{fname} 不应被改名"));
+            let after_sig = start + marker.len();
+            let rest = &src[after_sig..];
+            let end = ["\n    async fn ", "\n    pub fn ", "\n    fn "]
+                .iter()
+                .filter_map(|m| rest.find(m))
+                .min()
+                .map(|i| after_sig + i)
+                .unwrap_or(src.len());
+            let seg_fn = &src[start..end];
+            let fail_at = seg_fn
+                .find("// 失败响应")
+                .unwrap_or_else(|| panic!("{fname} 的失败响应注释锚点不应被删改"));
+            let guard_at = seg_fn
+                .find(needle.as_str())
+                .unwrap_or_else(|| panic!("{fname} 缺少失败守卫组装点"));
+            assert!(
+                fail_at < guard_at,
+                "{fname}：守卫必须组装在读到失败 body 之后（挂在失败路径上）"
+            );
+            assert_eq!(
+                seg_fn.matches(needle.as_str()).count(),
+                1,
+                "{fname} 应恰好一处守卫组装点"
+            );
+        }
+    }
+
+    /// ⭐ 源码级守卫（P0-A）：成功侧与网络错误侧必须各自用独立 emit 发 trace。
+    ///
+    /// 守卫不覆盖成功路径（成功时 body 是对话内容，不该读也不该落盘），成功侧用
+    /// verdict="success" 的独立 emit；网络错误无响应体，同样独立 emit（status=None）。
+    /// 两条路径缺任一处，trace 里该形态的请求就整条不可见。
+    #[test]
+    fn trace_success_and_network_error_emits_exist_in_both_paths() {
+        let full = include_str!("provider.rs");
+        let src = full
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(full);
+        for (fname, marker) in [
+            ("call_api_with_retry", "async fn call_api_with_retry"),
+            ("call_mcp_with_retry", "async fn call_mcp_with_retry"),
+        ] {
+            let start = src
+                .find(marker)
+                .unwrap_or_else(|| panic!("{fname} 不应被改名"));
+            let after_sig = start + marker.len();
+            let rest = &src[after_sig..];
+            let end = ["\n    async fn ", "\n    pub fn ", "\n    fn "]
+                .iter()
+                .filter_map(|m| rest.find(m))
+                .min()
+                .map(|i| after_sig + i)
+                .unwrap_or(src.len());
+            let seg_fn = &src[start..end];
+            assert_eq!(
+                seg_fn.matches("verdict: \"success\"").count(),
+                1,
+                "{fname} 成功侧必须有独立的 verdict=\"success\" trace emit（守卫不覆盖成功路径）"
+            );
+            assert_eq!(
+                seg_fn.matches("verdict: \"network_error\"").count(),
+                1,
+                "{fname} 网络错误分支必须有独立的 verdict=\"network_error\" trace emit"
+            );
+        }
+    }
+
+    // ══════════ mapped_model 透传预判（predict_passthrough_upstream_model）══════════
+
+    fn predict_cred() -> KiroCredentials {
+        KiroCredentials::default()
+    }
+
+    fn predict_rules(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// 未命中映射 → None（消费端回落原始名）；命中映射 → Some(映射后名)。
+    #[test]
+    fn predict_mapped_model_without_normalize_only_maps() {
+        let cred = predict_cred();
+        let rules = predict_rules(&[("claude-haiku-4-5", "claude-sonnet-4-5")]);
+        assert_eq!(
+            KiroProvider::predict_passthrough_upstream_model(Some("claude-haiku-4-5"), &cred, &rules),
+            Some("claude-sonnet-4-5".to_string())
+        );
+        assert_eq!(
+            KiroProvider::predict_passthrough_upstream_model(Some("claude-opus-5"), &cred, &rules),
+            None,
+            "未命中映射 → None"
+        );
+        // 空模型名不 panic 且不改写。
+        assert_eq!(
+            KiroProvider::predict_passthrough_upstream_model(Some(""), &cred, &rules),
+            None
+        );
+        assert_eq!(
+            KiroProvider::predict_passthrough_upstream_model(None, &cred, &rules),
+            None,
+            "无模型语义调用 → None"
+        );
+    }
+
+    /// 映射命中 → 预判记映射名（与 forward 链一致）。
+    #[test]
+    fn predict_mapped_model_map_to_deepseek_kept() {
+        let cred = predict_cred();
+        let rules = predict_rules(&[("claude-haiku-4-5", "deepseek-v4-flash")]);
+        assert_eq!(
+            KiroProvider::predict_passthrough_upstream_model(Some("claude-haiku-4-5"), &cred, &rules),
+            Some("deepseek-v4-flash".to_string())
+        );
+    }
+
+    /// 豁免凭据：映射跳过 → 不改写（对齐 forward 的 exempt 分支）。
+    #[test]
+    fn predict_mapped_model_exempt_skips_mapping() {
+        let mut cred = predict_cred();
+        cred.model_mapping_exempt = Some(true);
+        let rules = predict_rules(&[("claude-opus-5", "claude-haiku-4-5")]);
+        assert_eq!(
+            KiroProvider::predict_passthrough_upstream_model(Some("claude-opus-5"), &cred, &rules),
+            None,
+            "豁免只跳过映射，无其它改写 → None"
         );
     }
 }

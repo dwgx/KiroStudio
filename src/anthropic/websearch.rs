@@ -269,30 +269,33 @@ pub struct WebSearchResult {
     pub public_domain: Option<bool>,
 }
 
-/// 判断单个工具是否为 web_search 工具。
+/// 判断单个工具是否为 Anthropic 原生 web_search 工具。
 ///
-/// 兼容两种客户端形态：
-/// - name 为 "web_search"
-/// - name 缺失、仅通过 type（如 "web_search_20250305"）声明
+/// 双判据（AND）：name 为 "web_search" **且** type 以 "web_search" 开头
+/// （如 "web_search_20250305"）。客户端自定义的普通工具恰好叫 web_search
+/// （无 web_search type）不得被误吞进搜索快路径/回灌循环；type-only 形态
+/// （name 缺失、仅靠 type 声明）同样不再命中 —— 该形态由 converter 归一化成
+/// `name: web_search` 后走常规转发（与参考仓 zyphr 一致）。
 fn tool_is_web_search(t: &Tool) -> bool {
     t.name == "web_search"
-        || t.tool_type
+        && t.tool_type
             .as_deref()
             .is_some_and(|ty| ty.starts_with("web_search"))
 }
 
 /// 判断上游返回的 tool_use 是否 web_search。
 ///
-/// 与入站 `tool_is_web_search` 同判据（name == "web_search"）：上游只认识 name，
-/// 不会带 type；但历史消息里可能有客户端回灌的带 type 形态，两处都用同一谓词避免漂移。
+/// 与入站 `tool_is_web_search` 不同：上游 tool_use 只携带 name（无 type），历史
+/// 回灌消息同样只有 name 形态，故此处只能按 name 判定（与参考仓 zyphr 一致）。
 fn tool_use_name_is_web_search(name: &str) -> bool {
     name == "web_search"
 }
 
-/// 检查请求的 tools 是否包含 WebSearch 工具。
+/// 检查请求的 tools 是否包含原生 WebSearch 工具。
 ///
-/// 只要 tools 中出现 web_search（按 name 或 type 判断）即返回 true，
-/// **不要求 web_search 是唯一工具**，因此可覆盖“web_search + 其他工具”的混合场景。
+/// 只要 tools 中出现原生 web_search（name + type 双判据，见 `tool_is_web_search`）
+/// 即返回 true，**不要求 web_search 是唯一工具**，因此可覆盖“web_search + 其他工具”
+/// 的混合场景。
 pub fn has_web_search_tool(req: &MessagesRequest) -> bool {
     req.tools
         .as_ref()
@@ -302,7 +305,23 @@ pub fn has_web_search_tool(req: &MessagesRequest) -> bool {
 /// tool_choice 是否强制选择 web_search。
 ///
 /// Anthropic 常见形态：{"type":"tool","name":"web_search"}
+///
+/// 判据与工具定义保持单一口径（AND）：tools 里没有原生 web_search 定义时，
+/// tool_choice 指名 "web_search" 只可能是自定义普通工具，不得触发搜索快路径
+/// （独立判定同样被 `has_web_search_tool` 闸住）。
+///
+/// 🔴 有意降级（2026-08-15，对抗审查 MAJOR-1，决策已定不恢复 OR）：type-only
+/// 形态（name 缺失、仅 `type: web_search_*`）即使 tool_choice 强制指名
+/// "web_search" 也不再触发快路径 —— 网关不代答，请求走常规转发，搜索能力经
+/// converter 归一化分支（`convert_tools` 改写为 `name: web_search` + 内置 schema）
+/// 保留给上游。该形态非 Anthropic 官方 server tool 形态（server tool 必带
+/// name+type），线上零流量；恢复 OR 会重新引入「自定义同名工具被误吞进搜索
+/// 快路径」漏洞（`test_has_web_search_tool_type_only_not_matched` /
+/// `test_type_only_web_search_with_forced_tool_choice_not_handled_locally` 守卫）。
 fn tool_choice_requests_web_search(req: &MessagesRequest) -> bool {
+    if !has_web_search_tool(req) {
+        return false;
+    }
     let Some(choice) = req.tool_choice.as_ref() else {
         return false;
     };
@@ -377,14 +396,27 @@ fn request_explicit_web_search_prefix(req: &MessagesRequest) -> bool {
 /// 不再剔除 web_search 工具（见 handlers 分派）。
 /// 共享预算耗尽的 503 响应（2026-08-11 方案 A）：MCP 子调用路径不经过
 /// `map_provider_error`，预算耗尽串在这里特判——落 502 会让客户端当故障立即重发。
+///
+/// F3 矛盾修复（设计 §五 3）：Retry-After 原来硬编码 `"8"`（与 A1 的 8s 同值但字面量
+/// 写死，改 A1 不会同步 F3 —— 已知漂移形态），统一走配置 key `mcp_failed` 的
+/// `retryAfterSecs`（默认 8，与 `UPSTREAM_RATE_LIMIT_RETRY_AFTER_SECS` 同源）。
 fn budget_exhausted_response() -> axum::response::Response {
+    let (status, error_type, message, cfg_ra) =
+        super::handlers::resolve_msg(
+            &super::handlers::current_error_messages(),
+            "mcp_failed",
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "api_error",
+                "网关已就该请求打满上游调用预算（每请求上限），上游仍不可用。这是可重试的瞬态状态，请按 Retry-After 退避后重试。",
+                Some(8),
+            ),
+        );
+    let retry_after = cfg_ra.unwrap_or(8).clamp(1, 300);
     (
-        StatusCode::SERVICE_UNAVAILABLE,
-        [(header::RETRY_AFTER, "8")],
-        Json(ErrorResponse::new(
-            "api_error",
-            "网关已就该请求打满上游调用预算（每请求上限），上游仍不可用。这是可重试的瞬态状态，请按 Retry-After 退避后重试。",
-        )),
+        status,
+        [(header::RETRY_AFTER, retry_after.to_string())],
+        Json(ErrorResponse::new(error_type, message)),
     )
         .into_response()
 }
@@ -834,7 +866,7 @@ fn generate_websearch_events(
                 });
                 json!({
                     "type": "web_search_result",
-                    "title": r.title,
+                    "title": normalize_html_text(&r.title),
                     "url": r.url,
                     "encrypted_content": r.snippet.as_deref().map(normalize_html_text).unwrap_or_default(),
                     "page_age": page_age
@@ -970,23 +1002,97 @@ fn generate_search_summary(query: &str, results: &Option<WebSearchResults>) -> S
     summary
 }
 
+/// 把快路径搜索结果渲染成非流式 JSON 响应体（`stream=false` 时用）。
+///
+/// 与回灌路径 [`build_loop_json_body`] 同构；content 与流式
+/// [`generate_websearch_events`] 逐块对应：决策文本 → server_tool_use →
+/// web_search_tool_result → 摘要文本。output_tokens 与流式同源
+/// （`(summary.len()+3)/4`），避免两条路径对同一请求报出两套 token 数。
+fn build_fast_path_json_body(
+    model: &str,
+    query: &str,
+    tool_use_id: &str,
+    search_results: &Option<WebSearchResults>,
+    input_tokens: i32,
+) -> Value {
+    let summary = generate_search_summary(query, search_results);
+    let output_tokens = (summary.len() as i32 + 3) / 4;
+    let search_content = match search_results {
+        Some(results) => results
+            .results
+            .iter()
+            .map(|r| {
+                let page_age = r.published_date.and_then(|ms| {
+                    chrono::DateTime::from_timestamp_millis(ms)
+                        .map(|dt| dt.format("%B %-d, %Y").to_string())
+                });
+                json!({
+                    "type": "web_search_result",
+                    "title": normalize_html_text(&r.title),
+                    "url": r.url,
+                    "encrypted_content": r.snippet.as_deref().map(normalize_html_text).unwrap_or_default(),
+                    "page_age": page_age
+                })
+            })
+            .collect::<Vec<_>>(),
+        None => vec![],
+    };
+    json!({
+        "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
+        "type": "message",
+        "role": "assistant",
+        "content": [
+            {"type": "text", "text": format!("I'll search for \"{}\".", query)},
+            {
+                "type": "server_tool_use",
+                "id": tool_use_id,
+                "name": "web_search",
+                "input": {"query": query}
+            },
+            {
+                "type": "web_search_tool_result",
+                "tool_use_id": tool_use_id,
+                "content": search_content
+            },
+            {"type": "text", "text": summary}
+        ],
+        "model": model,
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+        }
+    })
+}
+
 /// 处理 WebSearch 请求
 pub async fn handle_websearch_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
     input_tokens: i32,
     budget: &crate::kiro::provider::SharedRetryBudget,
+    client: &super::handlers::ClientInfo,
 ) -> Response {
     // 1. 提取搜索查询
     let query = match extract_search_query(payload) {
         Some(q) => q,
         None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(
+            let (status, error_type, message, _) = super::handlers::resolve_msg(
+                &super::handlers::current_error_messages(),
+                "websearch_query_missing",
+                (
+                    StatusCode::BAD_REQUEST,
                     "invalid_request_error",
                     "无法从消息中提取搜索查询",
-                )),
+                    None,
+                ),
+            );
+            return (
+                status,
+                Json(ErrorResponse::new(error_type, message)),
             )
                 .into_response();
         }
@@ -1002,8 +1108,12 @@ pub async fn handle_websearch_request(
     // 「真的没搜到」，掩盖网关/上游故障（已确认缺陷）。失败时返回 502 让客户端
     // 能区分「搜索无结果」与「搜索服务故障」；正常「无结果」仍是合法 200 空结果
     // （parse_search_results 返回 None，或 results 为空数组）。
+    let mut mcp_credential_id: Option<u64> = None;
     let search_results = match call_mcp_api(&provider, &mcp_request, budget).await {
-        Ok(response) => parse_search_results(&response),
+        Ok((response, credential_id)) => {
+            mcp_credential_id = Some(credential_id);
+            parse_search_results(&response)
+        }
         Err(e) => {
             tracing::warn!("MCP API 调用失败: {}", e);
             // ⭐ 共享预算耗尽（2026-08-11 方案 A）：不能落 502 无退避信号（客户端当
@@ -1011,44 +1121,82 @@ pub async fn handle_websearch_request(
             if e.to_string().contains("shared_budget_exhausted=1") {
                 return budget_exhausted_response();
             }
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse::new(
+            // 非预算类 MCP 失败（F2）：key `mcp_failed`（与 F3 同源），message 只覆盖
+            // 前缀，动态详情（{e}）恒保留。
+            let (status, error_type, message, _) = super::handlers::resolve_msg(
+                &super::handlers::current_error_messages(),
+                "mcp_failed",
+                (
+                    StatusCode::BAD_GATEWAY,
                     "upstream_error",
-                    format!("WebSearch 上游调用失败: {}", e),
+                    "WebSearch 上游调用失败",
+                    None,
+                ),
+            );
+            return (
+                status,
+                Json(ErrorResponse::new(
+                    error_type,
+                    format!("{message}: {e}"),
                 )),
             )
                 .into_response();
         }
     };
 
-    // 4. 生成 SSE 响应
+    // 4. 生成响应：按请求的 stream 标志分支。旧实现忽略该标志恒返回 SSE ——
+    //    非流式客户端把 text/event-stream 当 JSON 解析必然失败（协议违规）。
+    //    标志在 payload 被 move 进流之前取（与 dispatch_web_search_loop 同款）。
+    let wants_stream = payload.stream;
+    // 快路径此前零用量埋点（M2）：面板上纯 web_search 请求完全不可见。
+    // 成功路径（MCP 调用成功）SSE 与非流式两个分支都埋；失败路径在本函数内
+    // **直接 return**（budget_exhausted_response / 502），不留到调用方 ——
+    // 那些失败出口由 provider 层 MCP 自身的失败埋点记账，此处不再重复埋。
+    // output_tokens 与两个分支下发口径同源（(summary.len()+3)/4）。
+    {
+        let summary = generate_search_summary(&query, &search_results);
+        let output_tokens = (summary.len() as i32 + 3) / 4;
+        super::handlers::emit_websearch_fast_path_usage(
+            &payload.model,
+            mcp_credential_id,
+            input_tokens,
+            output_tokens,
+            wants_stream,
+            client,
+        );
+    }
     let model = payload.model.clone();
-    let stream =
-        create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
-        .unwrap()
+    if wants_stream {
+        let stream =
+            create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header(header::CONNECTION, "keep-alive")
+            .body(Body::from_stream(stream))
+            .unwrap()
+    } else {
+        let body = build_fast_path_json_body(&model, &query, &tool_use_id, &search_results, input_tokens);
+        (StatusCode::OK, Json(body)).into_response()
+    }
 }
 
 /// 调用 Kiro MCP API
+///
+/// 成功时返回 (响应, 实际使用的凭据 id)：快路径用量埋点需要 credential_id。
 async fn call_mcp_api(
     provider: &crate::kiro::provider::KiroProvider,
     request: &McpRequest,
     budget: &crate::kiro::provider::SharedRetryBudget,
-) -> anyhow::Result<McpResponse> {
+) -> anyhow::Result<(McpResponse, u64)> {
     let request_body = serde_json::to_string(request)?;
 
     tracing::debug!("MCP request: {}", request_body);
 
-    let response = provider.call_mcp(&request_body, budget).await?;
+    let (response, credential_id) = provider.call_mcp(&request_body, budget).await?;
 
-    let body = response.text().await?;
+    let body: String = response.text().await?;
     tracing::debug!("MCP response: {}", body);
 
     let mcp_response: McpResponse = serde_json::from_str(&body)?;
@@ -1061,7 +1209,7 @@ async fn call_mcp_api(
         );
     }
 
-    Ok(mcp_response)
+    Ok((mcp_response, credential_id))
 }
 
 // ==================== WebSearch agentic 多轮回灌 ====================
@@ -1098,12 +1246,27 @@ struct RoundOutcome {
     context_input_tokens: Option<i32>,
     /// meteringEvent 累计 credit
     credits: f64,
-    /// stop_reason 覆盖（max_tokens / model_context_window_exceeded）
+    /// stop_reason 覆盖（metadataEvent / max_tokens / model_context_window_exceeded）
     stop_reason_override: Option<String>,
     /// 上游流中途读失败：本轮内容是**半截**的，不能当成功回灌
     stream_error: bool,
     /// in-band 错误/异常
     upstream_error: Option<String>,
+}
+
+/// 写入 metadataEvent 映射后的 stop_reason。已有更具体覆盖
+///（ContentLengthExceededException → max_tokens，或 context window）时不覆盖；
+/// mapped 为 None（空/缺失 stopReason）时保持原值。
+fn apply_metadata_stop_override(current: &mut Option<String>, mapped: Option<String>) {
+    if matches!(
+        current.as_deref(),
+        Some("max_tokens") | Some("model_context_window_exceeded")
+    ) {
+        return;
+    }
+    if let Some(mapped) = mapped {
+        *current = Some(mapped);
+    }
 }
 
 /// 缓冲解码一轮上游流式响应。
@@ -1193,14 +1356,39 @@ async fn decode_round(
                         let input: Value = if assembled.is_empty() {
                             json!({})
                         } else {
-                            serde_json::from_str(&assembled).unwrap_or_else(|e| {
-                                tracing::warn!(
-                                    "WebSearch 回灌工具参数非法 JSON(tool_use_id={}): {}",
-                                    tu.tool_use_id,
-                                    e
-                                );
-                                json!({})
-                            })
+                            match serde_json::from_str::<Value>(&assembled) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    // 复用主路径修复层（stream::repair_tool_json，与
+                                    // flush_tool_input 同源）：能修好就用修好的，避免
+                                    // query 静默丢失；修不好则置 stream_error 整轮报错
+                                    // （run_round 对 stream_error 返回 502，绝不把半截
+                                    // 参数当「没参数」回灌 —— 那会让搜索 query 凭空消失）。
+                                    if let Some(repaired) =
+                                        super::stream::repair_tool_json(&assembled)
+                                    {
+                                        tracing::warn!(
+                                            "WebSearch 回灌工具参数非法 JSON 已修复(tool_use_id={}): {}",
+                                            tu.tool_use_id,
+                                            e
+                                        );
+                                        serde_json::from_str::<Value>(&repaired).unwrap_or_else(
+                                            |_| {
+                                                out.stream_error = true;
+                                                json!({})
+                                            },
+                                        )
+                                    } else {
+                                        tracing::error!(
+                                            "WebSearch 回灌工具参数非法 JSON 且修复层补不回(tool_use_id={}): {}",
+                                            tu.tool_use_id,
+                                            e
+                                        );
+                                        out.stream_error = true;
+                                        json!({})
+                                    }
+                                }
+                            }
                         };
                         if tool_use_name_is_web_search(&name) {
                             let query = input
@@ -1264,6 +1452,14 @@ async fn decode_round(
                         out.upstream_error = Some(format!("{}: {}", error_code, error_message));
                     }
                 }
+                Event::Metadata(meta) => {
+                    apply_metadata_stop_override(
+                        &mut out.stop_reason_override,
+                        crate::kiro::model::events::map_metadata_stop_reason(
+                            meta.stop_reason.as_deref(),
+                        ),
+                    );
+                }
                 _ => {}
             }
         }
@@ -1278,6 +1474,9 @@ async fn decode_round(
 /// 回灌循环成功收尾时的结果（渲染成 SSE 或 JSON 由调用方决定）。
 pub(super) struct WebSearchLoopSuccess {
     pub model: String,
+    /// 末轮实际改写后的模型名（CallMeta.mapped_model 带出；None = 末轮未命中映射/凭据豁免）。
+    /// 与 [`Self::credential_id`] 同源（都是末轮 meta），供埋点的 upstream_model 口径。
+    pub mapped_model: Option<String>,
     /// 最终 content 数组：各轮 server_tool_use/web_search_tool_result + 末轮文本 + 末轮 tool_use
     pub content: Vec<Value>,
     pub stop_reason: String,
@@ -1291,6 +1490,43 @@ pub(super) struct WebSearchLoopSuccess {
     pub rounds: u32,
 }
 
+/// 回灌循环失败：HTTP 响应给客户端；用量字段给埋点（拿不到的保持 None，不编造成功）。
+pub(super) struct WebSearchLoopError {
+    pub response: Response,
+    /// 已完成轮次的末轮凭据；首轮就失败则为 None（不要写成 0）。
+    pub credential_id: Option<u64>,
+    pub mapped_model: Option<String>,
+    /// 已完成轮次累计 credit；没有计量则 None。
+    pub credits: Option<f64>,
+    /// 已发出的上游往返次数（run_round 成功轮；失败当轮未计入）。
+    pub rounds: u32,
+    pub input_tokens: i32,
+}
+
+impl WebSearchLoopError {
+    fn from_parts(
+        response: Response,
+        credential_id: Option<u64>,
+        mapped_model: Option<String>,
+        total_credits: f64,
+        rounds: u32,
+        input_tokens: i32,
+    ) -> Self {
+        Self {
+            response,
+            credential_id,
+            mapped_model,
+            credits: if total_credits > 0.0 {
+                Some(total_credits)
+            } else {
+                None
+            },
+            rounds,
+            input_tokens,
+        }
+    }
+}
+
 /// 单轮请求：转换 payload → 打上游 → 缓冲解码。
 ///
 /// 转换/序列化失败返回 400/500；上游调用失败交 `map_provider_error` 统一映射
@@ -1299,68 +1535,174 @@ async fn run_round(
     provider: &std::sync::Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
     budget: &crate::kiro::provider::SharedRetryBudget,
-) -> Result<(RoundOutcome, u64), Response> {
+) -> Result<(RoundOutcome, u64, Option<String>), Response> {
     let conversion = super::converter::convert_request(payload).map_err(|e| {
         tracing::warn!("WebSearch 回灌请求转换失败: {}", e);
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
+        // 回灌类本地错误统一 key `websearch_failed`（配置只覆盖前缀，详情恒保留）。
+        let (status, error_type, message, _) = super::handlers::resolve_msg(
+            &super::handlers::current_error_messages(),
+            "websearch_failed",
+            (
+                StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                format!("WebSearch 回灌请求转换失败: {}", e),
-            )),
+                "WebSearch 回灌请求转换失败",
+                None,
+            ),
+        );
+        (
+            status,
+            Json(ErrorResponse::new(error_type, format!("{message}: {e}"))),
         )
             .into_response()
     })?;
     let tool_name_map = conversion.tool_name_map;
 
+    // 保留压缩前的原始状态克隆：请求体超限重试时从它重建（与两条主路径同款——
+    // 已压缩过的体再压没收益，必须回到压缩前的状态）。
+    let conv_state_for_compress_retry = conversion.conversation_state.clone();
+    let native_fields_for_compress_retry =
+        conversion.additional_model_request_fields.clone();
     let request_body = super::handlers::build_kiro_request_body_for_websearch(
         conversion.conversation_state,
         conversion.additional_model_request_fields,
     )
     .map_err(|e| {
         tracing::error!("WebSearch 回灌序列化请求失败: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse::new(
+        let (status, error_type, message, _) = super::handlers::resolve_msg(
+            &super::handlers::current_error_messages(),
+            "websearch_failed",
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
-                format!("序列化请求失败: {}", e),
-            )),
+                "序列化请求失败",
+                None,
+            ),
+        );
+        (
+            status,
+            Json(ErrorResponse::new(error_type, format!("{message}: {e}"))),
         )
             .into_response()
     })?;
 
     let is_1m = crate::anthropic::model_catalog::resolve_is_1m(&payload.model);
-    let (response, meta) = provider
-        .call_api_stream(&request_body, is_1m, budget)
-        .await
-        .map_err(super::handlers::map_provider_error_for_websearch)?;
+
+    // 压缩重试：上游 400 请求体超限（map_provider_error 会给响应挂内部重试标记头）
+    // 时，用既有 compressor 对压缩前克隆压一轮（等比压低 tool_result 截断阈值）再
+    // 重建请求体重发，最多 3 次 —— 与 /cc/v1 的 'compress_retry 循环同语义；多轮
+    // 回灌上下文膨胀正是这条链路的主要触发源。target 公式在 handlers 私有不可复用，
+    // 这里以压缩管道默认阈值按 (3/4)^attempt 递减逼近（下限 2048 字符）。
+    const MAX_COMPRESS_RETRIES: u32 = 3;
+    const RETRY_TOOL_RESULT_BASE_CHARS: u64 = 8000;
+    let mut body = request_body;
+    let mut compress_attempt: u32 = 0;
+    let (response, meta) = loop {
+        match provider
+            .call_api_stream(&body, is_1m, budget, Some(payload.model.as_str()))
+            .await
+        {
+            Ok(pair) => break pair,
+            Err(e) => {
+                let mapped = super::handlers::map_provider_error_for_websearch(e);
+                let retryable = compress_attempt < MAX_COMPRESS_RETRIES
+                    && mapped
+                        .headers()
+                        .get("x-kirostudio-compress-retry")
+                        .is_some();
+                if !retryable {
+                    // ⚠️ 2026-08-13 对抗审查 m1：耗尽分支必须 strip 内部标记头
+                    // （主路径 handlers.rs 特意 remove，websearch 此前缺同一操作，
+                    // 会把 x-kirostudio-compress-retry 透传给客户端）。
+                    let mut resp = mapped;
+                    resp.headers_mut().remove("x-kirostudio-compress-retry");
+                    return Err(resp);
+                }
+                compress_attempt += 1;
+                let mut conv = conv_state_for_compress_retry.clone();
+                let tool_max = (RETRY_TOOL_RESULT_BASE_CHARS
+                    .saturating_mul(3u64.pow(compress_attempt))
+                    .saturating_div(4u64.pow(compress_attempt)))
+                    .max(2048) as usize;
+                let cfg = crate::model::config::CompressionConfig {
+                    tool_result_max_chars: tool_max,
+                    ..crate::model::config::CompressionConfig::default()
+                };
+                super::compressor::compress(&mut conv, &cfg);
+                body = super::handlers::build_kiro_request_body_for_websearch(
+                    conv,
+                    native_fields_for_compress_retry.clone(),
+                )
+                .map_err(|e| {
+                    tracing::error!("WebSearch 回灌压缩重试序列化请求失败: {}", e);
+                    let (status, error_type, message, _) = super::handlers::resolve_msg(
+                        &super::handlers::current_error_messages(),
+                        "websearch_failed",
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "internal_error",
+                            "序列化请求失败",
+                            None,
+                        ),
+                    );
+                    (
+                        status,
+                        Json(ErrorResponse::new(error_type, format!("{message}: {e}"))),
+                    )
+                        .into_response()
+                })?;
+                tracing::info!(
+                    attempt = compress_attempt,
+                    tool_result_max_chars = tool_max,
+                    body_len = body.len(),
+                    "WebSearch 回灌请求体超限：已重新压缩并重试"
+                );
+            }
+        }
+    };
 
     let outcome = decode_round(response, &payload.model, &tool_name_map).await;
 
     // 上游 in-band 错误 / 流截断：不能把半截内容当成功回灌下一轮（回灌了等于把
     // 截断的假事实写进历史，模型后续全部基于错误前提推理）。
     if let Some(err) = &outcome.upstream_error {
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            Json(ErrorResponse::new(
+        let (status, error_type, message, _) = super::handlers::resolve_msg(
+            &super::handlers::current_error_messages(),
+            "websearch_failed",
+            (
+                StatusCode::BAD_GATEWAY,
                 "upstream_error",
-                format!("WebSearch 回灌上游返回错误: {}", err),
+                "WebSearch 回灌上游返回错误",
+                None,
+            ),
+        );
+        return Err((
+            status,
+            Json(ErrorResponse::new(
+                error_type,
+                format!("{message}: {err}"),
             )),
         )
             .into_response());
     }
     if outcome.stream_error {
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            Json(ErrorResponse::new(
+        let (status, error_type, message, _) = super::handlers::resolve_msg(
+            &super::handlers::current_error_messages(),
+            "websearch_failed",
+            (
+                StatusCode::BAD_GATEWAY,
                 "upstream_error",
                 "WebSearch 回灌期间上游响应流意外中断（内容不完整，未回灌）",
-            )),
+                None,
+            ),
+        );
+        return Err((
+            status,
+            Json(ErrorResponse::new(error_type, message)),
         )
             .into_response());
     }
 
-    Ok((outcome, meta.credential_id))
+    Ok((outcome, meta.credential_id, meta.mapped_model))
 }
 
 /// WebSearch agentic 回灌循环（机制主体）。
@@ -1374,9 +1716,12 @@ pub(super) async fn run_web_search_loop(
     mut payload: MessagesRequest,
     fallback_input_tokens: i32,
     budget: &crate::kiro::provider::SharedRetryBudget,
-) -> Result<WebSearchLoopSuccess, Response> {
+) -> Result<WebSearchLoopSuccess, WebSearchLoopError> {
     let mut presentation: Vec<Value> = Vec::new();
-    let mut last_credential_id: u64 = 0;
+    let mut last_credential_id: Option<u64> = None;
+    // 末轮改写名（用量埋点 upstream_model 口径）：与 last_credential_id 同源同更新
+    // 时机——每轮覆盖为当轮值，循环结束即末轮值。
+    let mut last_mapped_model: Option<String> = None;
     let mut last_context_input: Option<i32> = None;
     let mut total_credits = 0.0;
     // 客户端是否声明 thinking（决定收尾是否下发 thinking 块）。必须在循环外取：
@@ -1385,19 +1730,37 @@ pub(super) async fn run_web_search_loop(
 
     // 0..=MAX 而不是 0..MAX：上限那一轮仍要**发出去**（拿到最终回答），只是不再回灌。
     for round_idx in 0..=MAX_WEB_SEARCH_ROUNDS {
-        let (round, credential_id) = run_round(&provider, &payload, budget).await?;
-        last_credential_id = credential_id;
+        let (mut round, credential_id, mapped_model) =
+            match run_round(&provider, &payload, budget).await {
+                Ok(v) => v,
+                Err(resp) => {
+                    return Err(WebSearchLoopError::from_parts(
+                        resp,
+                        last_credential_id,
+                        last_mapped_model,
+                        total_credits,
+                        round_idx as u32,
+                        last_context_input.unwrap_or(fallback_input_tokens),
+                    ));
+                }
+            };
+        last_credential_id = Some(credential_id);
+        last_mapped_model = mapped_model;
         last_context_input = round.context_input_tokens.or(last_context_input);
         total_credits += round.credits;
 
         if should_replay_round(round_idx, &round.web_search, !round.client_tool_use.is_empty()) {
             // 真搜索：任一条失败就整体报错，绝不把失败静默降级成「没搜到」——
             // 客户端会把空结果当"真的没搜到"，掩盖网关/上游故障（与快路径同一条铁律）。
+            // 唯一例外：共享预算耗尽不整包报错 —— 已累积的搜索结果是有价值的部分
+            // 结果，收尾成成功响应返回（见下方 budget_exhausted 分支）。
             let mut searched: Vec<SearchedWebSearch> = Vec::with_capacity(round.web_search.len());
+            // 预算耗尽旁路标记：为真时跳过回灌，落到下方同一份收尾渲染。
+            let mut budget_exhausted = false;
             for ws in &round.web_search {
                 let (srv_id, mcp_request) = create_mcp_request(&ws.query);
                 match call_mcp_api(&provider, &mcp_request, budget).await {
-                    Ok(resp) => searched.push(SearchedWebSearch {
+                    Ok((resp, _credential_id)) => searched.push(SearchedWebSearch {
                         upstream_id: ws.id.clone(),
                         query: ws.query.clone(),
                         srv_id,
@@ -1405,28 +1768,62 @@ pub(super) async fn run_web_search_loop(
                     }),
                     Err(e) => {
                         tracing::warn!("WebSearch 回灌 MCP 调用失败: {}", e);
-                        // ⭐ 共享预算耗尽（同快路径）：503 + Retry-After，客户端可退避。
+                        // ⭐ 共享预算耗尽（同快路径判据）：部分结果收尾 —— 已搜索
+                        // 轮次的结果 + 已累积文本以成功响应返回（语义「搜索了但预算
+                        // 不够完成全部回灌」），不再整包 503 丢弃已累积的展示内容。
                         if e.to_string().contains("shared_budget_exhausted=1") {
-                            return Err(budget_exhausted_response());
+                            budget_exhausted = true;
+                            break;
                         }
-                        return Err((
-                            StatusCode::BAD_GATEWAY,
-                            Json(ErrorResponse::new(
+                        // 非预算类回灌 MCP 失败（F8）：key `mcp_failed`（与快路径同源）。
+                        let (status, error_type, message, _) = super::handlers::resolve_msg(
+                            &super::handlers::current_error_messages(),
+                            "mcp_failed",
+                            (
+                                StatusCode::BAD_GATEWAY,
                                 "upstream_error",
-                                format!("WebSearch 上游调用失败: {}", e),
-                            )),
-                        )
-                            .into_response());
+                                "WebSearch 上游调用失败",
+                                None,
+                            ),
+                        );
+                        return Err(WebSearchLoopError::from_parts(
+                            (
+                                status,
+                                Json(ErrorResponse::new(
+                                    error_type,
+                                    format!("{message}: {e}"),
+                                )),
+                            )
+                                .into_response(),
+                            last_credential_id,
+                            last_mapped_model,
+                            total_credits,
+                            round_idx as u32 + 1,
+                            last_context_input.unwrap_or(fallback_input_tokens),
+                        ));
                     }
                 }
             }
-            tracing::info!(
-                round = round_idx + 1,
-                searches = searched.len(),
-                "WebSearch 回灌：搜索完成，结果回灌进下一轮请求"
-            );
-            presentation.extend(append_search_round(&mut payload, &round.text, &searched));
-            continue;
+            if budget_exhausted {
+                // 本轮搜索没拿到结果：清掉悬空的 web_search tool_use（回给客户端会成
+                // 无 tool_result 的孤儿块），只保留已累积内容走下方收尾渲染（stop_reason
+                // 随之按空工具判定为 end_turn，与「搜索了但没搜完」的语义一致）。
+                // ⚠️ 2026-08-13 对抗审查 m3：本轮**已搜到**的 searched 也要保留
+                // （此前只留之前轮次，本轮成果丢失——注释声称「已累积搜索结果是有价值
+                // 的部分结果」却没包含本轮）。
+                round.web_search.clear();
+                if !searched.is_empty() {
+                    presentation.extend(append_search_round(&mut payload, &round.text, &searched));
+                }
+            } else {
+                tracing::info!(
+                    round = round_idx + 1,
+                    searches = searched.len(),
+                    "WebSearch 回灌：搜索完成，结果回灌进下一轮请求"
+                );
+                presentation.extend(append_search_round(&mut payload, &round.text, &searched));
+                continue;
+            }
         }
 
         // 收尾：本轮不是纯 web_search（或已达轮数上限）→ 渲染给客户端。
@@ -1475,11 +1872,12 @@ pub(super) async fn run_web_search_loop(
         let model = payload.model.clone();
         return Ok(WebSearchLoopSuccess {
             model,
+            mapped_model: last_mapped_model,
             content,
             stop_reason,
             input_tokens: last_context_input.unwrap_or(fallback_input_tokens),
             output_tokens,
-            credential_id: last_credential_id,
+            credential_id: last_credential_id.unwrap_or(0),
             credits: total_credits,
             rounds: round_idx as u32 + 1,
         });
@@ -1489,14 +1887,28 @@ pub(super) async fn run_web_search_loop(
     // （回灌判定的 round_idx < MAX 已假）。留显式错误而非 unreachable!()，
     // 万一将来改了上限比较符也只是 500 而非 panic 掉整个 worker。
     tracing::error!("WebSearch 回灌循环异常退出（不应发生）");
-    Err((
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorResponse::new(
+    let (status, error_type, message, _) = super::handlers::resolve_msg(
+        &super::handlers::current_error_messages(),
+        "websearch_failed",
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
             "WebSearch 回灌循环异常退出",
-        )),
-    )
-        .into_response())
+            None,
+        ),
+    );
+    Err(WebSearchLoopError::from_parts(
+        (
+            status,
+            Json(ErrorResponse::new(error_type, message)),
+        )
+            .into_response(),
+        last_credential_id,
+        last_mapped_model,
+        total_credits,
+        (MAX_WEB_SEARCH_ROUNDS as u32).saturating_add(1),
+        last_context_input.unwrap_or(fallback_input_tokens),
+    ))
 }
 
 /// 把回灌循环的最终 content 渲染成一串 SSE 事件（客户端要 stream 时用）。
@@ -1675,8 +2087,7 @@ pub(super) fn build_loop_json_body(success: &WebSearchLoopSuccess) -> Value {
 mod tests {
     use super::*;
 
-    /// WebSearch 回灌轮次的 native effort 字段携带（deep 审计补测，2026-08-11）：
-    /// 回灌重建 body 时 `additionalModelRequestFields` 不得丢（P1 移植 × WebSearch
+    /// WebSearch 回灌轮次的 native effort 字段携带（deep 审计补测，2026-08-11）：    /// 回灌重建 body 时 `additionalModelRequestFields` 不得丢（P1 移植 × WebSearch
     /// 交叉点）。无字段时输出不含该键（默认行为不回归）。
     #[test]
     fn test_websearch_rebuild_keeps_additional_model_request_fields() {
@@ -1688,6 +2099,7 @@ mod tests {
             output_config: Some(KiroOutputConfig {
                 effort: "high".to_string(),
             }),
+            reasoning: None,
         });
         let body = build_kiro_request_body_for_websearch(state.clone(), fields)
             .expect("回灌序列化应成功");
@@ -1794,12 +2206,54 @@ mod tests {
     }
 
     #[test]
-    fn test_has_web_search_tool_matches_type_only() {
-        // name 缺失、仅靠 type 声明的 web_search 也应识别
+    fn test_has_web_search_tool_type_only_not_matched() {
+        // 🔴 2026-08-15 收紧（OR → AND）：name 缺失、仅靠 type 声明的形态不再命中
+        // 入站判据 —— 该形态由 converter 归一化成 `name: web_search` 后走常规转发
+        // （converter 测试已覆盖），这里不得再误判为原生 web_search。
         let mut tool = mk_web_search_tool();
         tool.name = String::new();
         let req = mk_req("test", Some(vec![tool, mk_plain_tool("other_tool")]));
-        assert!(has_web_search_tool(&req));
+        assert!(!has_web_search_tool(&req));
+        assert!(!should_handle_websearch_request(&req));
+    }
+
+    /// 🔴 MAJOR-1 守卫（对抗审查，决策已定）：type-only 形态（name 缺失）+ tool_choice
+    /// 强制指名 "web_search" 也不得进入搜索快路径 —— 网关不代答，搜索能力经
+    /// converter 归一化层（`convert_tools` 改写 `name: web_search`）保留给上游
+    /// 常规转发。恢复 OR / 撤掉 `has_web_search_tool` 闸会让本条 FAIL。
+    #[test]
+    fn test_type_only_web_search_with_forced_tool_choice_not_handled_locally() {
+        let mut tool = mk_web_search_tool();
+        tool.name = String::new();
+        let mut req = mk_req(
+            "search something",
+            Some(vec![tool, mk_plain_tool("Edit")]),
+        );
+        req.tool_choice = Some(serde_json::json!({"type": "tool", "name": "web_search"}));
+        assert!(!has_web_search_tool(&req));
+        assert!(!should_handle_websearch_request(&req));
+    }
+
+    #[test]
+    fn test_custom_tool_named_web_search_not_treated_as_native() {
+        // 移植 zyphr 钉死测试：客户端自定义普通工具恰好叫 web_search（tool_type=None）
+        // 不得被误吞进搜索快路径/回灌循环。
+        let req = mk_req(
+            "test",
+            Some(vec![mk_plain_tool("web_search"), mk_plain_tool("other_tool")]),
+        );
+        assert!(!has_web_search_tool(&req));
+        assert!(!should_handle_websearch_request(&req));
+    }
+
+    #[test]
+    fn test_tool_choice_web_search_with_custom_named_tool_not_handled() {
+        // tool_choice 指名 "web_search" 但工具定义是自定义普通工具（无 web_search type）：
+        // 判据与工具定义同口径（AND），不得因 tool_choice 触发搜索快路径。
+        let mut req = mk_req("task", Some(vec![mk_plain_tool("web_search")]));
+        req.tool_choice = Some(serde_json::json!({"type": "tool", "name": "web_search"}));
+        assert!(!has_web_search_tool(&req));
+        assert!(!should_handle_websearch_request(&req));
     }
 
     #[test]
@@ -2179,8 +2633,14 @@ mod tests {
             fn_body.contains("BAD_GATEWAY"),
             "MCP 上游调用失败必须返回非 200（502），不能落回 200 空结果伪装成「无结果」"
         );
+        // 2026-08-15 改：call_mcp_api 返回 `(response, credential_id)`（用量埋点
+        // 需要凭据归因），Ok 分支解构后仍必须继续 parse_search_results。
         assert!(
-            fn_body.contains("Ok(response) => parse_search_results(&response)"),
+            fn_body.contains("Ok((response, credential_id))"),
+            "MCP Ok 分支必须解构 (response, credential_id)"
+        );
+        assert!(
+            fn_body.contains("parse_search_results(&response)"),
             "Ok 分支必须继续 parse_search_results，正常「无结果」仍走 200 空结果路径"
         );
     }
@@ -2378,6 +2838,7 @@ mod tests {
         // 且每块都要 start/stop 成对（缺 stop 客户端会一直等那个块结束）。
         let success = WebSearchLoopSuccess {
             model: "claude-sonnet-5".to_string(),
+            mapped_model: None,
             content: vec![
                 json!({"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search",
                        "input": {"query": "q"}}),
@@ -2453,6 +2914,7 @@ mod tests {
         // 缺 signature_delta 客户端 thinking 模式本地校验会失败；缺 stop 客户端一直等块结束。
         let success = WebSearchLoopSuccess {
             model: "claude-sonnet-5".to_string(),
+            mapped_model: None,
             content: vec![json!({
                 "type": "thinking",
                 "thinking": "搜之前先想一下",
@@ -2495,6 +2957,7 @@ mod tests {
     fn loop_json_body_carries_content_and_usage() {
         let success = WebSearchLoopSuccess {
             model: "claude-sonnet-5".to_string(),
+            mapped_model: None,
             content: vec![json!({"type": "text", "text": "done"})],
             stop_reason: "end_turn".to_string(),
             input_tokens: 100,
@@ -2511,6 +2974,123 @@ mod tests {
         assert_eq!(body["content"][0]["text"], "done");
         assert_eq!(body["usage"]["input_tokens"], json!(100));
         assert_eq!(body["usage"]["output_tokens"], json!(20));
+    }
+
+    /// 缺口 C 守卫：回灌路径的 `upstream_model` 口径必须全程接线——
+    /// run_round 从 CallMeta 带出 mapped_model（与 credential_id 同源），循环每轮覆盖，
+    /// 收尾写入 WebSearchLoopSuccess，埋点（handlers.rs）写 record.upstream_model。
+    ///
+    /// 历史缺陷：run_round 丢弃 CallMeta.mapped_model ⇒ WebSearchLoopSuccess 无此字段 ⇒
+    /// 回灌记录 upstream_model 恒 None，主路径映射命中时 by_model 聚合失真。
+    /// 回退即 FAIL：把 run_round 返回三元组改回二元组 / 删掉 last_mapped_model /
+    /// 删掉结构体字段，断言失败。
+    #[test]
+    fn loop_success_carries_last_round_mapped_model() {
+        let full = include_str!("websearch.rs");
+        let prod = full
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(full);
+        // run_round：返回三元组且第三元来自 CallMeta（与 credential_id 同一 meta 源）。
+        let round_fn = prod
+            .split("async fn run_round")
+            .nth(1)
+            .expect("run_round 不应被改名")
+            .split("\npub(super) async fn ")
+            .next()
+            .expect("split 至少一段");
+        assert!(
+            round_fn.contains("meta.credential_id, meta.mapped_model"),
+            "run_round 必须把末轮 CallMeta.mapped_model 带出（与 credential_id 同源），\
+             否则回灌 upstream_model 恒 None"
+        );
+        // run_web_search_loop：每轮覆盖 last_mapped_model，收尾写入 success。
+        let loop_fn = prod
+            .split("pub(super) async fn run_web_search_loop")
+            .nth(1)
+            .expect("run_web_search_loop 不应被改名")
+            .split("\npub(super) fn ")
+            .next()
+            .expect("split 至少一段");
+        let last_round = ["last_mapped_model", " = mapped_model"].concat();
+        assert!(
+            loop_fn.contains(&last_round),
+            "循环每轮必须把当轮 mapped_model 覆盖进 last_mapped_model（末轮值）"
+        );
+        let carry = ["mapped_model", ": last_mapped_model"].concat();
+        assert!(
+            loop_fn.contains(&carry),
+            "收尾必须把末轮 mapped_model 写入 WebSearchLoopSuccess"
+        );
+        // 结构体字段本体。
+        assert!(
+            prod.contains(&["pub mapped_model", ": Option<String>"].concat()),
+            "WebSearchLoopSuccess 必须声明 mapped_model 字段"
+        );
+    }
+
+    /// 失败出口必须包装成带用量字段的错误结构（裸 Response 无法把 credential/credits/rounds
+    /// 交给 handlers 埋点）。三条出口：run_round / MCP / 循环异常退出。
+    #[test]
+    fn run_web_search_loop_error_surfaces_usage_fields() {
+        let full = include_str!("websearch.rs");
+        let prod = full
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(full);
+        let sig_and_body = prod
+            .split("pub(super) async fn run_web_search_loop")
+            .nth(1)
+            .expect("run_web_search_loop 不应被改名")
+            .split("\npub(super) fn ")
+            .next()
+            .expect("split 至少一段");
+        let ret = [
+            "Result<WebSearchLoopSuccess, ",
+            "WebSearchLoopError>",
+        ]
+        .concat();
+        assert!(
+            sig_and_body.contains(&ret),
+            "失败必须返回带用量字段的错误结构，不能只回裸 Response"
+        );
+        let wrap = ["WebSearchLoopError", "::from_parts"].concat();
+        assert!(
+            sig_and_body.matches(&wrap).count() >= 3,
+            "run_round / MCP / 异常退出 三条失败出口都必须包装错误结构"
+        );
+    }
+
+    fn dummy_fail_response() -> Response {
+        Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[test]
+    fn loop_error_credits_none_when_zero() {
+        let err = WebSearchLoopError::from_parts(dummy_fail_response(), None, None, 0.0, 0, 10);
+        assert!(err.credits.is_none(), "没有计量不得写成 Some(0)");
+        assert!(err.credential_id.is_none());
+        assert_eq!(err.rounds, 0);
+        assert_eq!(err.input_tokens, 10);
+    }
+
+    #[test]
+    fn loop_error_keeps_measured_credits() {
+        let err = WebSearchLoopError::from_parts(
+            dummy_fail_response(),
+            Some(7),
+            Some("mapped".to_string()),
+            0.25,
+            2,
+            100,
+        );
+        assert_eq!(err.credits, Some(0.25));
+        assert_eq!(err.credential_id, Some(7));
+        assert_eq!(err.mapped_model.as_deref(), Some("mapped"));
+        assert_eq!(err.rounds, 2);
     }
 
     /// 源码级守卫：MCP 搜索失败不得静默降级成「没搜到」再继续回灌。
@@ -2572,6 +3152,306 @@ mod tests {
         assert!(
             fn_body.contains("outcome.upstream_error"),
             "上游 in-band 错误的轮次必须报错返回，不能当成功回灌"
+        );
+    }
+
+    /// 快路径非流式响应体：content 与 SSE 流逐块对应（决策文本 → server_tool_use →
+    /// web_search_tool_result → 摘要），usage 携带估算 token 数。
+    #[test]
+    fn fast_path_json_body_carries_full_content_and_usage() {
+        let results = WebSearchResults {
+            results: vec![WebSearchResult {
+                title: "Rust 1.97 发布<br>公告".to_string(),
+                url: "https://blog.rust-lang.org/1.97".to_string(),
+                snippet: Some("Rust&nbsp;1.97 已发布".to_string()),
+                published_date: Some(1_700_000_000_000),
+                id: None,
+                domain: None,
+                max_verbatim_word_limit: None,
+                public_domain: None,
+            }],
+            total_results: Some(1),
+            query: Some("test query".to_string()),
+            error: None,
+        };
+        let body = build_fast_path_json_body(
+            "claude-sonnet-5",
+            "test query",
+            "srvtoolu_1",
+            &Some(results),
+            100,
+        );
+        assert_eq!(body["type"], "message");
+        assert_eq!(body["role"], "assistant");
+        assert_eq!(body["model"], "claude-sonnet-5");
+        assert_eq!(body["stop_reason"], "end_turn");
+        assert_eq!(body["usage"]["input_tokens"], json!(100));
+        assert!(body["usage"]["output_tokens"].as_i64().unwrap() > 0);
+        // usage 与 SSE message_start 同构：cache 两键恒带 0（旧 JSON 体缺这两键，
+        // 两条路径对同一请求报出不同 usage 形状）。
+        assert_eq!(body["usage"]["cache_creation_input_tokens"], json!(0));
+        assert_eq!(body["usage"]["cache_read_input_tokens"], json!(0));
+        // 块顺序与 SSE 事件流一致
+        assert_eq!(body["content"][0]["type"], "text");
+        assert_eq!(body["content"][0]["text"], "I'll search for \"test query\".");
+        assert_eq!(body["content"][1]["type"], "server_tool_use");
+        assert_eq!(body["content"][1]["id"], "srvtoolu_1");
+        assert_eq!(body["content"][1]["input"]["query"], "test query");
+        assert_eq!(body["content"][2]["type"], "web_search_tool_result");
+        assert_eq!(body["content"][2]["tool_use_id"], "srvtoolu_1");
+        // title/snippet 已清洗（清单 9 同款对齐）
+        assert_eq!(
+            body["content"][2]["content"][0]["title"],
+            "Rust 1.97 发布\n公告",
+            "JSON 路径的 title 也必须过 normalize_html_text"
+        );
+        assert_eq!(body["content"][3]["type"], "text");
+        assert!(body["content"][3]["text"].as_str().unwrap().contains("Rust 1.97 已发布"));
+    }
+
+    /// 快路径 SSE 事件里的 title 同样已清洗（清单 9：旧代码只有 encrypted_content
+    /// 过 normalize_html_text，title 裸透传 —— 与回灌路径 build_result_block 口径分叉）。
+    #[test]
+    fn fast_path_events_clean_html_in_title() {
+        let results = WebSearchResults {
+            results: vec![WebSearchResult {
+                title: "Title<br>With Break".to_string(),
+                url: "https://example.com".to_string(),
+                snippet: None,
+                published_date: None,
+                id: None,
+                domain: None,
+                max_verbatim_word_limit: None,
+                public_domain: None,
+            }],
+            total_results: Some(1),
+            query: Some("q".to_string()),
+            error: None,
+        };
+        let events = generate_websearch_events(
+            "claude-sonnet-5",
+            "q",
+            "srvtoolu_1",
+            Some(results),
+            10,
+        );
+        let block = events
+            .iter()
+            .find(|e| {
+                e.event == "content_block_start"
+                    && e.data["content_block"]["type"] == "web_search_tool_result"
+            })
+            .expect("必须有 web_search_tool_result 块");
+        assert_eq!(
+            block.data["content_block"]["content"][0]["title"],
+            "Title\nWith Break",
+            "快路径 SSE 的 title 必须清洗 <br>（旧代码裸透传）"
+        );
+    }
+
+    /// M1/M2 源码守卫：快路径必须按 payload.stream 分支（非流式返回 JSON，旧实现
+    /// 恒返回 SSE = 协议违规），且成功路径必须埋用量（旧实现零埋点）。
+    ///
+    /// 单测覆盖不到该分支（需真实 KiroProvider + MCP），用源码断言钉死：
+    /// 回归成「恒 SSE / 无埋点」时本条 FAIL。
+    #[test]
+    fn fast_path_respects_stream_flag_and_emits_usage() {
+        let full = include_str!("websearch.rs");
+        let prod = full
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(full);
+        let fn_body = prod
+            .split("async fn handle_websearch_request")
+            .nth(1)
+            .expect("handle_websearch_request 不应被改名");
+        let fn_body = fn_body
+            .split("\nasync fn ")
+            .next()
+            .expect("split 至少一段");
+        assert!(
+            fn_body.contains("payload.stream"),
+            "快路径必须按 payload.stream 分支：非流式返回 JSON，流式返回 SSE \
+             （旧实现忽略 stream 恒返回 SSE，非流式客户端解析必失败）"
+        );
+        assert!(
+            fn_body.contains(&["build_fast_path_json_body", "("].concat()),
+            "非流式分支必须走 JSON body 构造（与 build_loop_json_body 同构）"
+        );
+        assert!(
+            fn_body.contains(&["emit_websearch_fast_path_usage", "("].concat()),
+            "快路径成功收尾必须埋用量（M2：旧实现零埋点，面板看不到纯 web_search 流量）"
+        );
+    }
+
+    /// 清单 7 源码守卫：回灌路径的工具参数非法 JSON 必须复用主路径修复层，
+    /// 修复补不回时必须置 stream_error 整轮报错 —— 不得静默降级成空对象
+    /// （那会让搜索 query 凭空丢失，客户端拿「没搜到」当成功）。
+    #[test]
+    fn replay_tool_input_repairs_json_or_fails_round() {
+        let full = include_str!("websearch.rs");
+        let prod = full
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(full);
+        let fn_body = prod
+            .split("async fn decode_round")
+            .nth(1)
+            .expect("decode_round 不应被改名");
+        let fn_body = fn_body
+            .split("\nasync fn ")
+            .next()
+            .expect("split 至少一段");
+        assert!(
+            fn_body.contains(&["repair_tool_json", "("].concat()),
+            "回灌路径必须复用主路径修复层（stream::repair_tool_json），不得另写一份拼接逻辑"
+        );
+        assert!(
+            fn_body.contains("out.stream_error = true"),
+            "修复补不回时必须置 stream_error 整轮报错（run_round 据此返 502），\
+             不得静默降级成空对象"
+        );
+        let meta_arm = format!("{}::{}", "Event", "Metadata");
+        let mapper = ["map_metadata", "_stop_reason"].concat();
+        assert!(
+            fn_body.contains(&meta_arm),
+            "decode_round 必须消费 Metadata 帧（不能再 _ => 丢掉 stopReason）"
+        );
+        assert!(
+            fn_body.contains(&mapper),
+            "必须复用 map_metadata_stop_reason，禁止第二张映射表"
+        );
+    }
+
+    /// 旧实现把 metadataEvent 丢进 `_ => {}`，stopReason 被丢掉。
+    /// 本条 FAIL 条件：decode_round 函数体不再含 Metadata 臂或不再调用映射函数。
+    #[test]
+    fn decode_round_consumes_metadata_event() {
+        let full = include_str!("websearch.rs");
+        let prod = full
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(full);
+        let fn_body = prod
+            .split("async fn decode_round")
+            .nth(1)
+            .expect("decode_round 不应被改名");
+        let fn_body = fn_body
+            .split("\nasync fn ")
+            .next()
+            .expect("split 至少一段");
+        let meta_arm = format!("{}::{}", "Event", "Metadata");
+        let mapper = ["map_metadata", "_stop_reason"].concat();
+        assert!(
+            fn_body.contains(&meta_arm),
+            "decode_round 必须消费 Metadata 帧（不能再 _ => 丢掉 stopReason）"
+        );
+        assert!(
+            fn_body.contains(&mapper),
+            "必须复用 map_metadata_stop_reason，禁止第二张映射表"
+        );
+    }
+
+    #[test]
+    fn apply_metadata_stop_override_empty_stays_none() {
+        let mut current = None;
+        apply_metadata_stop_override(&mut current, None);
+        assert!(current.is_none());
+        apply_metadata_stop_override(
+            &mut current,
+            crate::kiro::model::events::map_metadata_stop_reason(Some("  ")),
+        );
+        assert!(current.is_none());
+        apply_metadata_stop_override(
+            &mut current,
+            crate::kiro::model::events::map_metadata_stop_reason(None),
+        );
+        assert!(current.is_none());
+    }
+
+    #[test]
+    fn apply_metadata_stop_override_sets_mapped_reason() {
+        let mut current = None;
+        apply_metadata_stop_override(
+            &mut current,
+            crate::kiro::model::events::map_metadata_stop_reason(Some("end_turn")),
+        );
+        assert_eq!(current.as_deref(), Some("end_turn"));
+        apply_metadata_stop_override(
+            &mut current,
+            crate::kiro::model::events::map_metadata_stop_reason(Some("pause_turn")),
+        );
+        assert_eq!(current.as_deref(), Some("pause_turn"));
+    }
+
+    #[test]
+    fn apply_metadata_stop_override_does_not_clobber_specific() {
+        let mut current = Some("max_tokens".to_string());
+        apply_metadata_stop_override(
+            &mut current,
+            crate::kiro::model::events::map_metadata_stop_reason(Some("end_turn")),
+        );
+        assert_eq!(current.as_deref(), Some("max_tokens"));
+
+        let mut current = Some("model_context_window_exceeded".to_string());
+        apply_metadata_stop_override(
+            &mut current,
+            crate::kiro::model::events::map_metadata_stop_reason(Some("end_turn")),
+        );
+        assert_eq!(
+            current.as_deref(),
+            Some("model_context_window_exceeded")
+        );
+    }
+
+    /// F3 矛盾修复（设计 §五 3）：预算耗尽的 Retry-After 默认 8（与 A1 同源值），
+    /// 且配置 `mcp_failed` 的 retryAfterSecs 可覆盖（不再硬编码字面量 "8"）。
+    #[test]
+    fn f3_budget_exhausted_retry_after_defaults_and_overridable() {
+        // 🔴 全仓唯一「改 ERROR_MESSAGES 镜像没拿锁」实证修复（2026-08-15 并发审计）：
+        // 镜像表是进程级全局，handlers 的锁内测试与此处无锁 set 双向污染——
+        // 本测试整表替换（只含 mcp_failed）会覆盖 handlers 锁内测试的表，反向
+        // 本测试的「默认 Retry-After: 8」依赖空表，handlers 临时改表期间误红。
+        // 锁（pub(crate) 共享）必须持有到函数结束（guard 晚于所有断言 drop）。
+        let _error_messages_guard = crate::anthropic::handlers::error_translation_tests::
+            ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // 默认（未配置）：503 + Retry-After: 8。
+        let resp = budget_exhausted_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("8"),
+            "F3 默认 Retry-After 必须仍为 8（与 A1 同源，不再硬编码字面量）"
+        );
+
+        // 配置 mcp_failed.retryAfterSecs=15 → 覆盖默认。
+        let mut table = crate::anthropic::handlers::ErrorMessagesTable::new();
+        table.insert(
+            "mcp_failed".to_string(),
+            crate::model::config::ErrorMessageOverride {
+                status: None,
+                r#type: None,
+                message: None,
+                retry_after_secs: Some(15),
+            },
+        );
+        crate::anthropic::handlers::set_error_messages(table);
+        let resp = budget_exhausted_response();
+        assert_eq!(
+            resp.headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("15"),
+            "配置的 retryAfterSecs 必须覆盖默认 8"
+        );
+        // 复位（防污染其它测试的全局镜像）。
+        crate::anthropic::handlers::set_error_messages(
+            crate::anthropic::handlers::ErrorMessagesTable::new(),
         );
     }
 }

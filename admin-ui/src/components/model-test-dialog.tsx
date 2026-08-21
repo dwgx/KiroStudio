@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useTranslation } from 'react-i18next'
+import { Trans, useTranslation } from 'react-i18next'
 import i18n from '@/i18n'
 import {
   Dialog,
@@ -145,7 +145,7 @@ export function ModelTestDialog({ open, onOpenChange, credentialIds, credentials
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-2xl">
+      <DialogContent className="sm:max-w-2xl" aria-describedby={undefined}>
         <DialogHeader>
           <DialogTitle>{t('modeltestdialog.title', { count: credentialIds.length })}</DialogTitle>
         </DialogHeader>
@@ -321,7 +321,7 @@ export function ModelTestDialog({ open, onOpenChange, credentialIds, credentials
 
           <p className="flex items-start gap-1.5 text-xs text-muted-foreground">
             <Lightbulb className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-            <span>每个勾选模型发一个<b>{t('modeltestdialog.footer.realRequestBold')}</b>并消耗真实积分（能用的才计费）。结果保留在此页，可改勾选后再测一次。</span>
+            <Trans i18nKey="modeltestdialog.footer.realRequestNote">每个勾选模型发一个<b>无提示词真实请求</b>并消耗真实积分（能用的才计费）。结果保留在此页，可改勾选后再测一次。</Trans>
           </p>
         </div>
 

@@ -4,6 +4,11 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+// ErrorMessageOverride 定义在 `crate::model::error_messages`（本模块已大，独立成表文件）；
+// re-export 到 `crate::model::config::ErrorMessageOverride` 兼容既有引用路径
+// （如 anthropic::handlers 的 ErrorMessagesTable 类型别名）。
+pub use super::error_messages::ErrorMessageOverride;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum TlsBackend {
@@ -74,6 +79,84 @@ impl Default for ThrottleProfile {
     }
 }
 
+/// **调度模式**（三按钮，2026-08-16 新增）。面板把 30+ 调度旋钮收敛成三个按钮，
+/// 后台逻辑由预设矩阵承载（方案见 `docs/scheduling-config-simplify.md` §3.2/§3.3）。
+///
+/// # 与 [`ThrottleProfile`] 的关系
+/// `SchedulingMode` 是**面向用户的档位名**，矩阵写入复用既有 `ThrottleProfile`
+/// 机制（preset 展开成字段值，消费点零改动）：
+///
+/// | 按钮 | SchedulingMode | ThrottleProfile 矩阵 |
+/// |---|---|---|
+/// | 智能调度（默认） | `Smart` | `Direct` 扩展矩阵（吸收全开合理值 + 冷却开 + RPM 头寸 + 选号加权） |
+/// | 稳定优先 | `Stable` | `Shielded` 扩展矩阵（更保守：真限流返 429、冷却 scale 150、吸收关） |
+/// | 高级手动 | `Manual` | `Manual`（一个字段都不覆盖，全部旋钮归用户） |
+///
+/// # 兼容语义（重点）
+/// **默认 `Smart` 但首启不重写任何旋钮**：`scheduling_mode` 只是标记，矩阵只在
+/// **用户从面板显式切换**时写入（`Config::apply_throttle_profile_for_explicit_switch`
+/// 路径）。旧配置（无 `schedulingMode` 键）反序列化为 `Smart`，但文件加载路径
+/// （`Config::load` → `apply_throttle_profile`）只受 `throttle_profile` 驱动、
+/// 且「只填空不覆盖」—— 老配置旋钮值保持原样，行为零变化。
+///
+/// ⚠️ `cooldownEnabled` 矩阵值 **true** ≠ 线上现状（false）：线上 false 是语义陷阱
+/// （429 后坏号不退避 = 原地打转），智能档写 true 是刻意修正；按钮确认框必须
+/// 向用户说明这一点（见 settings-page 的切换确认）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "kebab-case")]
+pub enum SchedulingMode {
+    /// 智能调度（默认标记）：全自动参数全家桶，客户端直连场景。
+    Smart,
+    /// 稳定优先：更保守的矩阵（整形真限流返 429、冷却更长、吸收层关），
+    /// 适合网关前有重试外挂、号少怕封的场景。
+    Stable,
+    /// 高级手动：不做任何矩阵覆盖，全部读 config.json 原值。
+    Manual,
+}
+
+impl Default for SchedulingMode {
+    fn default() -> Self {
+        Self::Smart
+    }
+}
+
+impl SchedulingMode {
+    /// 映射到承载矩阵展开的 [`ThrottleProfile`]。
+    ///
+    /// 面板切换 `scheduling_mode` 时由 `apply_throttle_profile_for_explicit_switch`
+    /// 真正把矩阵写进各旋钮字段（`src/admin/service.rs` 的 update_config 分支）。
+    pub fn to_throttle_profile(self) -> ThrottleProfile {
+        match self {
+            Self::Smart => ThrottleProfile::Direct,
+            Self::Stable => ThrottleProfile::Shielded,
+            Self::Manual => ThrottleProfile::Manual,
+        }
+    }
+}
+
+/// 单个模型的单价（元/百万 token），成本估算用。
+///
+/// 四档对齐 Anthropic 计费口径：输入（不含缓存命中部分）/ 输出 / 缓存读取 / 缓存新建。
+/// `cache_read` + `cache_creation` 是 gross input 的**子集**，估算 input 时必须按
+/// billed 口径（gross 减去两项 cache），否则缓存部分被计两次（与
+/// [`crate::usage::record::RequestRecord::billed_input_tokens`] 同口径）。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelPrice {
+    /// 输入单价（元/百万 token；不含缓存命中部分）
+    #[serde(default)]
+    pub input_per_mtok: f64,
+    /// 输出单价（元/百万 token）
+    #[serde(default)]
+    pub output_per_mtok: f64,
+    /// 缓存读取单价（元/百万 token）
+    #[serde(default)]
+    pub cache_read_per_mtok: f64,
+    /// 缓存新建单价（元/百万 token）
+    #[serde(default)]
+    pub cache_creation_per_mtok: f64,
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -99,6 +182,15 @@ pub struct Config {
 
     #[serde(default = "default_kiro_version")]
     pub kiro_version: String,
+
+    /// 是否自动拉取官方稳定版 Kiro IDE 版本号用于 UA 版本伪装（默认 **true**）。
+    ///
+    /// 伪装成官方 IDE 最新版是防上游按版本做风控差异（老版本号可能被降级待遇/拒绝）。
+    /// 开启后后台每 12h 拉一次官方元数据：成功则 UA 用拉到的版本号，失败静默降级回
+    /// `kiro_version`（本地常量），绝不阻塞启动；关闭则缓存恒空，UA 行为与未开此功能
+    /// 时完全一致（零回归）。热更不生效（main.rs 启动期读取后 spawn）。
+    #[serde(default = "default_ua_version_fetch")]
+    pub ua_version_fetch: bool,
 
     #[serde(default)]
     pub machine_id: Option<String>,
@@ -376,6 +468,22 @@ pub struct Config {
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
 
+    /// 是否在上游瞬态错误（408/429/500/502/503/504/524）时做**端点级链式回退**（默认 true）
+    ///
+    /// 上游 429 常是端点容量问题而非凭据额度问题：同一凭据换到另一个上游端点往往
+    /// 立刻成功（kiro-go 的 `endpointFallback` 即此机制）。单凭据下
+    /// `compute_max_retries` 退化为 1、一次 429 就直接透传给客户端；链式回退在
+    /// **不额外消耗凭据重试预算**（max_retries）、**不设凭据冷却**、**不扣健康分**的
+    /// 前提下，在同一凭据上立即换下一端点重试，整条链都失败才交给凭据级分类逻辑。
+    ///
+    /// ⚠️ 链内每跳仍是**真实上游调用**：消耗「每请求 ≤ `ABSOLUTE_MAX_TOTAL_RETRIES`
+    /// 次」的**共享预算**（对抗审查 M1，链循环顶部有预算闸）——「不消耗」只对
+    /// max_retries 成立，不适用于共享预算；预算耗尽时链式回退停止，错误透传给客户端。
+    ///
+    /// 关闭时回退链退化为单元素链，行为与改动前逐字节一致（热更即时生效）。
+    #[serde(default = "default_endpoint_fallback")]
+    pub endpoint_fallback: bool,
+
     /// 端点特定的配置
     ///
     /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
@@ -490,6 +598,13 @@ pub struct Config {
     /// 完整语义与向前兼容论证见 [`ThrottleProfile`]。
     #[serde(default)]
     pub throttle_profile: ThrottleProfile,
+    /// **调度模式**（三按钮：`smart` / `stable` / `manual`）。默认 `Smart`。
+    ///
+    /// ⚠️ 默认 Smart 但**首启不重写旋钮**：本字段只是标记，矩阵只在用户从面板
+    /// 显式切换时写入（见 [`SchedulingMode`] 的兼容语义）。旧配置（无本键）读进来
+    /// 反序列化为 `Smart`，旋钮值全部保持原样 —— 行为零变化。
+    #[serde(default = "default_scheduling_mode")]
+    pub scheduling_mode: SchedulingMode,
     /// 入站整形总开关（默认 true）。开=请求进上游前先过全局令牌桶,突发被排队削平成受控 RPM。
     #[serde(default = "default_true")]
     pub inbound_throttle_enabled: bool,
@@ -556,12 +671,6 @@ pub struct Config {
     #[serde(default = "default_upstream_per_credential_limit")]
     pub upstream_per_credential_limit: usize,
 
-    /// deepseek 归一化的**全局默认**配置（custom_api 代挂 `deepseekNormalize=true` 时生效）。
-    /// per-凭据 `deepseek_normalize_config` 可覆盖 fallback_model/min_max_tokens；
-    /// bool 开关一律取这里（全局唯一）。TIER1 热重载，改 config.json 立即生效。
-    #[serde(default)]
-    pub deepseek_normalize: crate::kiro::deepseek_normalize::DeepseekNormalizeConfig,
-
     /// **全局模型映射**：`{"客户端请求的模型名": "实际发给上游的模型名"}`（默认空 = 不映射）。
     ///
     /// 语义（见 [`crate::kiro::model_mapping`] 的完整设计说明）：
@@ -577,6 +686,22 @@ pub struct Config {
     /// 规则表（见 `provider.rs` 的 `mapping_rules`），避免同一请求跨跳用不同规则。
     #[serde(default)]
     pub model_mapping: std::collections::HashMap<String, String>,
+
+    /// **错误码/提示词覆盖表**（默认空表 = 全用内置默认，零行为变化）。
+    ///
+    /// key = 错误形态标识（61 个，见 [`crate::model::error_messages::default_error_messages`]；
+    /// 设计文档 `docs/error-codes-config-design.md` §一）。条目内字段全可选：
+    /// `None` = 用内置默认（只改 message 时 status/type 不必填）。
+    ///
+    /// TIER1 热重载：消费点（错误翻译处）每请求从 config ArcSwap 快照查表
+    /// （model_mapping 同款范式，见 `docs/error-codes-config-mechanism.md` §4.1），
+    /// 配置表命中 > 内置默认。校验失败整表拒绝（`validate_error_messages`），保持旧表。
+    #[serde(
+        rename = "errorMessages",
+        default,
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub error_messages: HashMap<String, ErrorMessageOverride>,
 
     /// 是否启用会话亲和性（同一会话尽量复用同一凭据，默认 true）
     ///
@@ -710,6 +835,27 @@ pub struct Config {
     #[serde(default = "default_strip_env_noise")]
     pub strip_env_noise: bool,
 
+    /// 透传路径**模拟缓存**注入开关（默认关，热更即时生效）。
+    ///
+    /// custom_api 透传路径的响应是上游原样字节，`cache_read_input_tokens` 来自上游
+    /// （DeepSeek 恒 0）→ 下游（sub2api 等）看不到缓存分支。开启后透传 filter 把
+    /// `usage.cache_read_input_tokens` 注入为 `round(input_tokens × mock_cache_read_ratio)`、
+    /// `cache_creation_input_tokens` 置 0（模拟"全部命中不写缓存"，避免 read + creation >
+    /// input 矛盾），5m/1h 拆分键若存在也置 0。**伪造值，仅供下游展示，不是真实计费依据**
+    /// （与 [`Self::prompt_cache_enabled`] 的估算下发同性质）。
+    ///
+    /// 只作用于透传路径（`passthrough.rs` 调用的 filter）；Kiro 池四层缓存链不动。
+    /// 关闭时零改动（原样透传）。
+    #[serde(rename = "mockCacheEnabled", default)]
+    pub mock_cache_enabled: bool,
+
+    /// 模拟缓存命中比例 [0.0, 1.0]，默认 0.7；1.0 = 100% 全命中。
+    ///
+    /// 读取处（handlers 镜像 setter）clamp 到 [0.0, 1.0]：非法值（>1 / <0 / NaN 等
+    /// 非有限值）归位到边界/默认。仅 [`Self::mock_cache_enabled`] 开启时生效。
+    #[serde(rename = "mockCacheReadRatio", default = "default_mock_cache_read_ratio")]
+    pub mock_cache_read_ratio: f64,
+
     /// 工具错误缓解 ①：清洗模型泄漏的控制 token（course/課/count/care 之类）。默认关，热更生效。
     ///
     /// 模型偶发把内部控制/规划 token 泄漏进输出文本、甚至混进 tool_use.input 导致 JSON 非法
@@ -729,6 +875,16 @@ pub struct Config {
     /// 超阈值(32)截断本轮文本,治 Opus 退化刷屏耗尽 max_tokens + 污染历史。
     #[serde(default = "default_tool_stray_repeat_guard")]
     pub tool_stray_repeat_guard: bool,
+
+    /// CC↔Kiro 工具名/参数双向映射开关（默认 **true**，热更即时生效）。
+    ///
+    /// Claude Code 的 8 个内置工具（Write/Edit/Bash/Read/Glob/Grep/LS/WebSearch）在入站
+    /// 时映射成 Kiro 原生名+参数（fs_write/str_replace/execute_bash/read_file/...），
+    /// 出站时还原，根治 `Invalid tool parameters`（Claude Code 发 file_path 而上游只认
+    /// path 那类参数错配）。关闭后内置工具原样透传（仅超长缩短），适配非 Claude Code
+    /// 客户端或恰好使用同名自定义工具的场景。
+    #[serde(rename = "toolCompatMapping", default = "default_tool_compat_mapping")]
+    pub tool_compat_mapping: bool,
 
     /// 工具错误缓解 ②：流式路径工具拼装非法 JSON 时，对齐成失败态。默认开，热更生效。
     ///
@@ -795,6 +951,15 @@ pub struct Config {
     #[serde(default = "default_usage_retention_days")]
     pub usage_retention_days: i64,
 
+    /// 模型单价表（成本估算用，元/百万 token）。
+    ///
+    /// 空表（默认）= **不估算成本**。key 为模型名，与用量统计「按模型」榜单的 key
+    /// （上游实际服务名口径）对齐；命中表的模型其成本按
+    /// [`ModelPrice`] 四档单价推算。只做估算展示，不影响任何真实计费。
+    /// 查询时每次现读配置快照，改 config.json 立即生效（TIER1 热重载）。
+    #[serde(default)]
+    pub model_pricing: HashMap<String, ModelPrice>,
+
     /// 是否采集下游客户端指纹（设备类型 / IP / OS / 浏览器，默认 true）
     ///
     /// 隐私开关：关闭后热路径不再从入站请求头/连接对端解析这些字段，
@@ -837,6 +1002,16 @@ pub struct Config {
     /// 可伪造该头绕过 IP 白名单与限流。取最右段防伪造，见 `security::client_ip`。
     #[serde(default)]
     pub trust_forwarded_header: bool,
+
+    /// 是否把私网/环回 TCP 对端自动当成可信反代并采信 XFF 最右段（默认 **true**）。
+    ///
+    /// A2 修复：本机 nginx/openresty 反代到 8990 时对端恒为 127.0.0.1/RFC1918，
+    /// 即便 `trust_forwarded_header=false` 也采信 XFF。LAN 直连部署下这会让任意
+    /// 内网客户端伪造 `X-Forwarded-For` 绕过每-IP 限流/黑名单。置 false 后
+    /// `is_trusted_proxy_peer` 恒否，只认对端 IP；真反代请改开 `trust_forwarded_header`。
+    /// 启动期读取（与 `trust_forwarded_header` 同款），改值需重启。
+    #[serde(default = "default_true")]
+    pub trust_private_peer_as_proxy: bool,
 
     /// 入口每-IP 限流：每分钟最大请求数。0 = 不限流（默认 0）。
     /// 固定窗口计数，超限返回 429。与凭据级 `rate_limit_*` 相互独立。
@@ -962,9 +1137,50 @@ pub struct Config {
     #[serde(default = "default_upstream_trace_max_bytes")]
     pub upstream_trace_max_bytes: u64,
 
+    // ============ Webhook 告警（自愈事件通知）============
+    /// Webhook 告警地址（可选，默认 None = 关闭）。
+    ///
+    /// 配置后，关键自愈事件（吸收预算耗尽 / failover 号全灭 / 重试配额耗尽 /
+    /// 429 风暴吸收轮等）会 POST 一条 JSON（{key, value, window_secs, host}）
+    /// 到该地址；同 key 在冷却窗口内只发一次。热更不生效（provider 构造时注入，
+    /// 改配置需重启）。
+    ///
+    /// ⚠️ 安全：URL 是管理员配置，网关会向它发起请求 —— SSRF 风险自负。
+    /// 建议填内网不可达、只能外联的告警服务；绝不要填内网管理面地址。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alert_webhook_url: Option<String>,
+
+    /// 告警去重冷却秒数（默认 600 = 10 分钟）。同 key 事件在此窗口内只发一次，
+    /// 窗口内的重复事件只累计计数（webhook 的 value 字段携带窗口内增量）。
+    #[serde(default = "default_alert_cooldown_secs")]
+    pub alert_cooldown_secs: u32,
+
+    // ============ OTA 自动检查（仅检查 + 打日志，不自动应用）============
+    /// 是否后台定时检查 OTA 新版本（默认 **false**）。
+    ///
+    /// 开启后每 `ota_auto_check_interval_hours` 小时调一次与面板「检查更新」相同的
+    /// 检查；发现新版本**只打日志**，绝不自动下载替换——OTA 是「下载二进制 + 校验 +
+    /// 原子覆盖运行中的自己」的高危路径，无人值守自动应用等于把镜像投毒升级成无人
+    /// 确认的 RCE；参考仓的「定时自动应用」模式本仓明确不立项（见 update.rs 的
+    /// `spawn_auto_check` 注释）。默认关：检查本身是 GitHub API 出站往返，多数部署
+    /// 走面板手动升级，默认开等于无谓的周期性出站请求。热更不生效（main.rs 启动期
+    /// 读取后 spawn）。
+    #[serde(default = "default_ota_auto_check")]
+    pub ota_auto_check: bool,
+
+    /// OTA 自动检查间隔（小时，默认 24）。0 会被按 1 处理（tokio interval 不接受
+    /// 零时长，且零小时空转只会徒增出站请求）。
+    #[serde(default = "default_ota_auto_check_interval_hours")]
+    pub ota_auto_check_interval_hours: u32,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
+}
+
+fn default_alert_cooldown_secs() -> u32 {
+    600
 }
 
 fn default_upstream_trace_path() -> String {
@@ -980,9 +1196,12 @@ fn default_upstream_trace_max_bytes() -> u64 {
 /// 控制请求体在协议转换完成后、发送到上游前的多层压缩策略。
 /// 所有阈值均可通过配置文件调整。
 ///
-/// 当前实现两层（收益最大、风险最小）：
+/// 当前实现 4 层（编号沿用 `compressor.rs` 的分层编号，② 尚未实现）：
 /// 1. 空白压缩：折叠连续空行、移除行尾空格（近乎无损）。
 /// 3. tool_result 智能截断：超长工具结果保留头 N 行 + 尾 M 行，中间以占位符省略。
+/// 4. 超长消息内容截断（`compress_long_messages_pass`）：单条消息本身大到移除历史
+///    也救不回来时的最后手段，仅自适应二次压缩循环调用。
+/// （另有压缩后空 content 修复为占位符的兜底，见 `compressor.rs::repair_non_empty_content_pass`。）
 ///
 /// TODO(后续批次)：thinking 块丢弃/截断、tool_use input 截断、历史轮次截断，
 /// 以及截断后 tool_use/tool_result 跨消息配对修复（参考 Fox compressor.rs 的
@@ -1053,7 +1272,7 @@ fn default_host() -> String {
 }
 
 fn default_port() -> u16 {
-    8080
+    8990
 }
 
 fn default_region() -> String {
@@ -1062,6 +1281,20 @@ fn default_region() -> String {
 
 fn default_kiro_version() -> String {
     "0.11.107".to_string()
+}
+
+/// UA 版本伪装默认开：防上游版本风控差异；拉不到官方版本时静默降级回
+/// `kiro_version`，不存在"拉到坏值"的路径（拉取失败即降级）。
+fn default_ua_version_fetch() -> bool {
+    true
+}
+
+fn default_ota_auto_check() -> bool {
+    false
+}
+
+fn default_ota_auto_check_interval_hours() -> u32 {
+    24
 }
 
 fn default_system_version() -> String {
@@ -1202,6 +1435,10 @@ fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
 
+fn default_endpoint_fallback() -> bool {
+    true
+}
+
 /// RPM headroom 系数默认 85(预留 15% 缓冲)。
 fn default_rate_limit_jitter_pct() -> u32 {
     20
@@ -1237,6 +1474,11 @@ fn default_cooldown_scale_pct() -> u32 {
 }
 fn default_rpm_headroom_factor() -> u32 {
     85
+}
+
+/// 调度模式默认 `Smart`（新装即智能档标记；矩阵不随默认值写入，见 [`SchedulingMode`]）。
+fn default_scheduling_mode() -> SchedulingMode {
+    SchedulingMode::Smart
 }
 
 /// 余额加权默认开(动态化出厂即用,dwgx 真机观察拉平)。
@@ -1290,6 +1532,16 @@ fn default_prompt_cache_ttl_seconds() -> u64 {
 }
 
 fn default_strip_env_noise() -> bool {
+    true
+}
+
+/// 模拟缓存命中比例默认 0.7（70% 命中）。仅 mock_cache_enabled 开启时生效。
+fn default_mock_cache_read_ratio() -> f64 {
+    0.7
+}
+
+/// CC↔Kiro 工具名/参数映射默认 **true**：目标客户端是 Claude Code，映射生效 = 现状行为。
+fn default_tool_compat_mapping() -> bool {
     true
 }
 
@@ -1383,6 +1635,9 @@ impl Default for Config {
             auth_region: None,
             api_region: None,
             kiro_version: default_kiro_version(),
+            // UA 版本伪装默认开：**必须调 default_ua_version_fetch()，不得另写字面量**
+            // （默认值散落多处正是本仓历史教训，见 default_ua_version_fetch 注释）。
+            ua_version_fetch: default_ua_version_fetch(),
             machine_id: None,
             encrypt_credentials_at_rest: false,
             api_key: None,
@@ -1418,6 +1673,7 @@ impl Default for Config {
             upstream_retry_absorb_swap_budget_secs: 0,
             upstream_retry_absorb_exhausted_status: default_absorb_exhausted_status(),
             default_endpoint: default_endpoint(),
+            endpoint_fallback: default_endpoint_fallback(),
             endpoints: HashMap::new(),
             // CLI body 对齐 kiro-rs 默认关（线上号池正在服务，未验证的协议形状不全池直切）。
             cli_origin_kiro_cli: false,
@@ -1431,6 +1687,7 @@ impl Default for Config {
             // 默认 Manual：不覆盖任何字段，保证既有配置行为零变化
             // （守卫 `throttle_profile_defaults_to_manual_and_changes_nothing` 钉住这点）。
             throttle_profile: ThrottleProfile::default(),
+            scheduling_mode: default_scheduling_mode(),
             inbound_throttle_enabled: default_true(),
             inbound_rpm_auto: default_true(),
             inbound_target_rpm: default_inbound_target_rpm(),
@@ -1441,8 +1698,9 @@ impl Default for Config {
             inbound_queue_timeout_passthrough: default_inbound_queue_timeout_passthrough(),
             upstream_concurrency_limit: default_upstream_concurrency_limit(),
             upstream_per_credential_limit: default_upstream_per_credential_limit(),
-            deepseek_normalize: Default::default(),
             model_mapping: Default::default(),
+            // 错误码/提示词覆盖表：默认空表（全用内置默认，零行为变化）。
+            error_messages: HashMap::new(),
             rate_limit_enabled: false,
             rate_limit_daily_max: default_rate_limit_daily(),
             rate_limit_min_interval_ms: default_rate_limit_min_interval_ms(),
@@ -1462,9 +1720,12 @@ impl Default for Config {
             prompt_cache_enabled: default_prompt_cache_enabled(),
             prompt_cache_ttl_seconds: default_prompt_cache_ttl_seconds(),
             strip_env_noise: default_strip_env_noise(),
+            mock_cache_enabled: false,
+            mock_cache_read_ratio: default_mock_cache_read_ratio(),
             tool_clean_leaked_tokens: default_tool_clean_leaked_tokens(),
             tool_reclaim_textified_invoke: default_tool_reclaim_textified_invoke(),
             tool_stray_repeat_guard: default_tool_stray_repeat_guard(),
+            tool_compat_mapping: default_tool_compat_mapping(),
             tool_stream_align_failure: default_tool_stream_align_failure(),
             tool_expose_error_to_client: default_tool_expose_error_to_client(),
             tool_repair_json: default_tool_repair_json(),
@@ -1474,12 +1735,14 @@ impl Default for Config {
             usage_enabled: default_usage_enabled(),
             usage_data_dir: default_usage_data_dir(),
             usage_retention_days: default_usage_retention_days(),
+            model_pricing: HashMap::new(),
             collect_client_fingerprint: default_collect_client_fingerprint(),
             cors_allowed_origins: Vec::new(),
             ip_allowlist: Vec::new(),
             ip_blocklist: Vec::new(),
             machine_code_blocklist: Vec::new(),
             trust_forwarded_header: false,
+            trust_private_peer_as_proxy: default_true(),
             ingress_rate_limit_per_min: 0,
             max_body_bytes: default_max_body_bytes(),
             proactive_token_refresh: default_true(),
@@ -1498,6 +1761,11 @@ impl Default for Config {
             upstream_trace_enabled: false,
             upstream_trace_path: default_upstream_trace_path(),
             upstream_trace_max_bytes: default_upstream_trace_max_bytes(),
+            // 告警默认关（None = bump 零开销 no-op）+ 10 分钟去重冷却。
+            alert_webhook_url: None,
+            alert_cooldown_secs: default_alert_cooldown_secs(),
+            ota_auto_check: default_ota_auto_check(),
+            ota_auto_check_interval_hours: default_ota_auto_check_interval_hours(),
             config_path: None,
         }
     }
@@ -1598,42 +1866,124 @@ impl Config {
 
         match profile {
             P::Shielded => {
+                // ── 三按钮方案（docs/scheduling-config-simplify.md §3.3）──
+                // 稳定优先（= 面板「稳定优先」按钮）：保守矩阵。矩阵只填空不覆盖，
+                // 「只填空」契约对所有新增字段同样生效（fill! 宏，见上）。
+                //
                 // 整形层做真限流：排队超时返 429，而不是放行。
                 // 对 shield 而言"放行"等于"重试成功"（它会立刻发下一个）；返 429 才能让它
                 // 走 cool 分支听我们的 Retry-After，把 60 次重打压成按真值退避。
-                fill!(explicit, 
+                fill!(explicit,
                     "inboundQueueTimeoutPassthrough",
                     inbound_queue_timeout_passthrough,
                     false
                 );
                 // 冷却开：让 429 过的号真正退避。关掉时坏号会被立刻重选 = 原地打转，
-                // 这是放大链里最便宜的一刀。
+                // 这是放大链里最便宜的一刀。⚠️ 线上 false 是语义陷阱（见 ThrottleProfile 文档）。
                 fill!(explicit, "cooldownEnabled", cooldown_enabled, true);
                 fill!(explicit, "inboundThrottleEnabled", inbound_throttle_enabled, true);
+                // 冷却 scale 150：号少慎防封号，短时冷却统一加长 50%（docs §3.3 冷却行）。
+                fill!(explicit, "cooldownScalePct", cooldown_scale_pct, 150);
                 // 吸收层：Shielded 档刻意**不开** —— 外层 shield 已经在吸收，
                 // 网关内再吸收会叠乘（shield 60 次 × 网关吸收轮数）。
-                fill!(explicit, 
+                fill!(explicit,
                     "upstreamRetryAbsorbEnabled",
                     upstream_retry_absorb_enabled,
                     false
                 );
+                // 吸收层其余参数：档位间取值一致（数值等于出厂默认），显式写在这里
+                // 是为了「切档落盘后这些键成为显式值」，与矩阵自洽。
+                fill!(explicit, "upstreamRetryAbsorbBudgetSecs", upstream_retry_absorb_budget_secs, 45);
+                fill!(explicit, "upstreamRetryAbsorbMaxRounds", upstream_retry_absorb_max_rounds, 3);
+                fill!(explicit, "upstreamRetryAbsorbMinDelayMs", upstream_retry_absorb_min_delay_ms, 150);
+                fill!(explicit, "upstreamRetryAbsorbMaxDelaySecs", upstream_retry_absorb_max_delay_secs, 15);
+                fill!(explicit, "upstreamRetryAbsorbSuspended", upstream_retry_absorb_suspended, false);
+                fill!(explicit, "upstreamRetryAbsorbServerError", upstream_retry_absorb_server_error, false);
+                fill!(explicit, "upstreamRetryAbsorbCapacity400", upstream_retry_absorb_capacity_400, false);
+                fill!(explicit, "upstreamRetryAbsorbSwapBudgetSecs", upstream_retry_absorb_swap_budget_secs, 0);
+                fill!(explicit, "upstreamRetryAbsorbExhaustedStatus", upstream_retry_absorb_exhausted_status, 503);
+                // 入站整形：AIMD 自动挡（默认 true，线上已 true；棘轮缺陷记录在
+                // throttle_semantic_traps_defaults_are_documented 的注释里）。
+                fill!(explicit, "inboundRpmAuto", inbound_rpm_auto, true);
+                fill!(explicit, "inboundTargetRpm", inbound_target_rpm, 100);
+                fill!(explicit, "inboundRpmMin", inbound_rpm_min, 20);
+                fill!(explicit, "inboundRpmMax", inbound_rpm_max, 300);
+                fill!(explicit, "inboundBurstSecs", inbound_burst_secs, 2);
+                fill!(explicit, "inboundQueueMaxWaitSecs", inbound_queue_max_wait_secs, 30);
+                // RPM 头寸：全局软上限 0（兜底 30）+ headroom 85 + 无预留 + 软门不阻塞。
+                fill!(explicit, "credentialRpmLimit", credential_rpm_limit, 0);
+                fill!(explicit, "rpmHeadroomFactor", rpm_headroom_factor, 85);
+                fill!(explicit, "rpmReserveSlots", rpm_reserve_slots, 0);
+                fill!(explicit, "rpmHardGateOverloadWait", rpm_hard_gate_overload_wait, false);
+                // 选号加权：余额拉平 + 429 EWMA 降权 + 会话亲和（dwgx 真机观察，docs §3.3）。
+                fill!(explicit, "balanceWeightEnabled", balance_weight_enabled, true);
+                fill!(explicit, "balanceWeightFloor", balance_weight_floor, 50);
+                fill!(explicit, "health429WeightEnabled", health_429_weight_enabled, true);
+                fill!(explicit, "affinityEnabled", affinity_enabled, true);
+                // 失败反应：全池冷却快失败 + 风控自动禁用 + 自愈退避 60/900/4。
+                fill!(explicit, "allCoolingFastFail", all_cooling_fast_fail, true);
+                fill!(explicit, "autoDisableSuspicious", auto_disable_suspicious, true);
+                fill!(explicit, "selfHealBaseBackoffSecs", self_heal_base_backoff_secs, 60);
+                fill!(explicit, "selfHealMaxBackoffSecs", self_heal_max_backoff_secs, 900);
+                fill!(explicit, "selfHealMaxShift", self_heal_max_shift, 4);
             }
             P::Direct => {
+                // ── 三按钮方案（docs/scheduling-config-simplify.md §3.3）──
+                // 智能调度（= 面板「智能调度」按钮，默认）：吸收全开合理值 + 冷却开 +
+                // RPM 头寸 + 选号加权全家桶。矩阵只填空不覆盖。
+                //
                 // 无外挂：宁可慢也不要拒，排队超时放行。
-                fill!(explicit, 
+                fill!(explicit,
                     "inboundQueueTimeoutPassthrough",
                     inbound_queue_timeout_passthrough,
                     true
                 );
+                // 冷却开：429 后坏号真退避。⚠️ 线上 false 是语义陷阱，智能档写 true 是刻意修正
+                //（按钮确认框已向用户说明）。
                 fill!(explicit, "cooldownEnabled", cooldown_enabled, true);
                 fill!(explicit, "inboundThrottleEnabled", inbound_throttle_enabled, true);
+                fill!(explicit, "cooldownScalePct", cooldown_scale_pct, 100);
                 // 吸收层开：网关内部多承担，少让客户端看见错误。
-                // ⚠️ 已知边界：吸收层**不覆盖透传路径**，纯代挂号池下开了也不生效。
-                fill!(explicit, 
+                // ⚠️ 已知边界：吸收层**不覆盖透传路径**，纯代挂号池下开了也不生效
+                //（面板有 noEffect 警告）。
+                fill!(explicit,
                     "upstreamRetryAbsorbEnabled",
                     upstream_retry_absorb_enabled,
                     true
                 );
+                fill!(explicit, "upstreamRetryAbsorbBudgetSecs", upstream_retry_absorb_budget_secs, 45);
+                fill!(explicit, "upstreamRetryAbsorbMaxRounds", upstream_retry_absorb_max_rounds, 3);
+                fill!(explicit, "upstreamRetryAbsorbMinDelayMs", upstream_retry_absorb_min_delay_ms, 150);
+                fill!(explicit, "upstreamRetryAbsorbMaxDelaySecs", upstream_retry_absorb_max_delay_secs, 15);
+                fill!(explicit, "upstreamRetryAbsorbSuspended", upstream_retry_absorb_suspended, false);
+                fill!(explicit, "upstreamRetryAbsorbServerError", upstream_retry_absorb_server_error, false);
+                fill!(explicit, "upstreamRetryAbsorbCapacity400", upstream_retry_absorb_capacity_400, false);
+                fill!(explicit, "upstreamRetryAbsorbSwapBudgetSecs", upstream_retry_absorb_swap_budget_secs, 0);
+                fill!(explicit, "upstreamRetryAbsorbExhaustedStatus", upstream_retry_absorb_exhausted_status, 503);
+                // 入站整形：AIMD 自动挡（默认 true，线上已 true；棘轮缺陷记录在
+                // throttle_semantic_traps_defaults_are_documented 的注释里）。
+                fill!(explicit, "inboundRpmAuto", inbound_rpm_auto, true);
+                fill!(explicit, "inboundTargetRpm", inbound_target_rpm, 100);
+                fill!(explicit, "inboundRpmMin", inbound_rpm_min, 20);
+                fill!(explicit, "inboundRpmMax", inbound_rpm_max, 300);
+                fill!(explicit, "inboundBurstSecs", inbound_burst_secs, 2);
+                fill!(explicit, "inboundQueueMaxWaitSecs", inbound_queue_max_wait_secs, 30);
+                // RPM 头寸：全局软上限 0（兜底 30）+ headroom 85 + 无预留 + 软门不阻塞。
+                fill!(explicit, "credentialRpmLimit", credential_rpm_limit, 0);
+                fill!(explicit, "rpmHeadroomFactor", rpm_headroom_factor, 85);
+                fill!(explicit, "rpmReserveSlots", rpm_reserve_slots, 0);
+                fill!(explicit, "rpmHardGateOverloadWait", rpm_hard_gate_overload_wait, false);
+                // 选号加权：余额拉平 + 429 EWMA 降权 + 会话亲和（dwgx 真机观察，docs §3.3）。
+                fill!(explicit, "balanceWeightEnabled", balance_weight_enabled, true);
+                fill!(explicit, "balanceWeightFloor", balance_weight_floor, 50);
+                fill!(explicit, "health429WeightEnabled", health_429_weight_enabled, true);
+                fill!(explicit, "affinityEnabled", affinity_enabled, true);
+                // 失败反应：全池冷却快失败 + 风控自动禁用 + 自愈退避 60/900/4。
+                fill!(explicit, "allCoolingFastFail", all_cooling_fast_fail, true);
+                fill!(explicit, "autoDisableSuspicious", auto_disable_suspicious, true);
+                fill!(explicit, "selfHealBaseBackoffSecs", self_heal_base_backoff_secs, 60);
+                fill!(explicit, "selfHealMaxBackoffSecs", self_heal_max_backoff_secs, 900);
+                fill!(explicit, "selfHealMaxShift", self_heal_max_shift, 4);
             }
             P::Manual => unreachable!("上面已提前返回"),
         }
@@ -1642,6 +1992,11 @@ impl Config {
     /// 获取配置文件路径（如果有）
     pub fn config_path(&self) -> Option<&Path> {
         self.config_path.as_deref()
+    }
+
+    /// 运行时回填路径。字段 `#[serde(skip)]`，反序列化恒为 None。
+    pub(crate) fn set_config_path(&mut self, path: PathBuf) {
+        self.config_path = Some(path);
     }
 
     /// 将当前配置写回原始配置文件
@@ -1686,7 +2041,7 @@ mod tests {
     /// |---|---|---|
     /// | `cooldown_enabled=false` | 「不用冷却功能」 | 429 过的号**不被跳过、立刻可重选** ⇒ 换号=原地打转 |
     /// | `inbound_queue_timeout_passthrough=true` | 「排队超时别拒绝」 | 整形层退化成**延迟器**；前面有重试外挂时"放行"=鼓励它立刻重发 |
-    /// | `inbound_rpm_auto`（默认 **true**，线上刻意 **false**） | 「自动调 RPM 挺好」 | 内置 AIMD 是**单向棘轮**：429 乘性减半、回升要 20s 静默 ×N，而实测每 6.4s 一次 429 ⇒ 锁死在下限（曾卡 30 RPM 而池能跑 216）。线上关掉是对的，代价是目标 RPM 完全交给外部脚本 |
+    /// | `inbound_rpm_auto`（默认 **true**；线上曾刻意 **false**，2026-08-16 blockers-config.md §2 实锤线上已是 **true**） | 「自动调 RPM 挺好」 | 内置 AIMD 是**单向棘轮**：429 乘性减半、回升要 20s 静默 ×N，而实测每 6.4s 一次 429 ⇒ 锁死在下限（曾卡 30 RPM 而池能跑 216）。线上关掉是对当时链路的判断；现线上已 true（棘轮缺陷本身未修，属另一波次，见 docs/scheduling-config-simplify.md §6.3） |
     ///
     /// 改这三个默认值前请读 [`ThrottleProfile`] 的档位定义，并想清楚
     /// 「网关前面有没有会自动重试的组件」——这是决定取值的唯一关键问题。
@@ -1707,19 +2062,17 @@ mod tests {
              ⚠️ 但网关前面有重试外挂时这个值应当是 false —— 选 ThrottleProfile::Shielded 档，\
              而不是改这里的默认值（默认值要服务于最常见的直连场景）"
         );
-        // ⚠️ `inbound_rpm_auto` 的代码默认是 **true**，而线上刻意设成 **false** ——
-        // 这是已知且有依据的分歧，不是配置漂移：
-        //   内置 AIMD 是**单向棘轮**（429 就乘性减半，回升要 20s 静默 ×N），
-        //   而线上实测每 6.4s 就有一次 429 ⇒ 单调下滑锁死在下限
+        // ⚠️ `inbound_rpm_auto` 的代码默认是 **true**，与线上一致（2026-08-16
+        // blockers-config.md §2 实锤线上已是 true；曾刻意设 false 的历史语境已过期）。
+        // 内置 AIMD 是**单向棘轮**（429 就乘性减半，回升要 20s 静默 ×N），
+        // 实测每 6.4s 就有一次 429 ⇒ 单调下滑锁死在下限
         //   （曾卡在 30 RPM 而号池能跑 216）。
         // 所以这里断言的是"默认仍是 true"，用途是：若有人把默认改成 false，
-        // 必须同时来更新这段说明（否则线上那个 false 就失去了"刻意偏离默认"的语境，
-        // 下一个人会以为它只是没设）。
+        // 必须同时来更新这段说明（否则线上那个 true 就失去了"与默认一致"的语境）。
         assert!(
             c.inbound_rpm_auto,
             "inbound_rpm_auto 的代码默认变了（原为 true）。\
-             若这是有意为之，请更新本测试上方关于「线上刻意设 false」的说明 —— \
-             那条记录依赖'代码默认是 true'这个语境才成立"
+             若这是有意为之，请更新本测试上方关于「线上已 true」的说明"
         );
     }
 
@@ -1764,6 +2117,153 @@ mod tests {
             before,
             "Manual 档必须一个字段都不改"
         );
+    }
+
+    /// 🔴 **调度模式兼容硬保证**（2026-08-16，三按钮方案）：
+    /// `scheduling_mode` 默认 `Smart`（新装即智能档标记），但**首启不重写任何旋钮**——
+    /// 旧配置读进来只是标记上 Smart，矩阵只在用户从面板显式切换时写入。
+    #[test]
+    fn scheduling_mode_defaults_to_smart_without_rewriting_knobs() {
+        // ① 新装（空配置）→ Smart
+        let bare: Config =
+            serde_json::from_str("{}").expect("缺字段的 config 必须能反序列化");
+        assert_eq!(
+            bare.scheduling_mode,
+            SchedulingMode::Smart,
+            "调度模式默认必须是 Smart（新装即智能档标记）"
+        );
+
+        // ② 旧配置（模拟线上：throttleProfile=direct + 显式 cooldownEnabled=false）走
+        //    文件加载路径（只填空不覆盖）→ scheduling_mode 标记 Smart，但显式键不被重写。
+        let mut legacy: Config = serde_json::from_str(
+            r#"{"throttleProfile": "direct", "cooldownEnabled": false}"#,
+        )
+        .expect("应能反序列化");
+        assert_eq!(
+            legacy.scheduling_mode,
+            SchedulingMode::Smart,
+            "旧配置（无 schedulingMode 键）必须落到 Smart"
+        );
+        let explicit: std::collections::HashSet<String> =
+            ["throttleProfile", "cooldownEnabled"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        legacy.apply_throttle_profile(&explicit);
+        assert!(
+            !legacy.cooldown_enabled,
+            "旧配置首启不得改写旋钮：cooldownEnabled 显式 false 必须保持（矩阵只填空不覆盖）"
+        );
+
+        // ③ 面板显式切换才会写矩阵：Smart 映射到 Direct，空 explicit 全量生效。
+        let mut c: Config =
+            serde_json::from_str("{}").expect("应能反序列化");
+        c.scheduling_mode = SchedulingMode::Smart;
+        c.throttle_profile = c.scheduling_mode.to_throttle_profile();
+        c.apply_throttle_profile_for_explicit_switch();
+        assert!(
+            c.upstream_retry_absorb_enabled,
+            "Smart 档切换后 absorb 必须开（智能默认：网关内多承担）"
+        );
+        assert!(
+            c.cooldown_enabled,
+            "Smart 档切换后 cooldownEnabled 必须 true（线上 false 是语义陷阱，智能档刻意修正）"
+        );
+    }
+
+    /// 智能调度（Direct 扩展矩阵）取值钉死 —— docs/scheduling-config-simplify.md §3.3。
+    ///
+    /// 任何一处偏离矩阵即 FAIL。改矩阵值必须先改文档、再改这里（两处同源）。
+    #[test]
+    fn smart_profile_matrix_matches_spec() {
+        let mut c: Config =
+            serde_json::from_str("{}").expect("应能反序列化");
+        c.throttle_profile = ThrottleProfile::Direct;
+        c.apply_throttle_profile_for_explicit_switch();
+
+        // 吸收层：全开合理值
+        assert!(c.upstream_retry_absorb_enabled, "智能档吸收层总开关必须开");
+        assert_eq!(c.upstream_retry_absorb_budget_secs, 45, "吸收总预算 45s（与 provider 墙钟同源）");
+        assert_eq!(c.upstream_retry_absorb_max_rounds, 3, "吸收最大轮次 3");
+        assert_eq!(c.upstream_retry_absorb_min_delay_ms, 150, "吸收退避下限 150ms");
+        assert_eq!(c.upstream_retry_absorb_max_delay_secs, 15, "吸收退避上限 15s");
+        assert!(!c.upstream_retry_absorb_suspended, "403 风控吸收必须关（与自愈退避冲突）");
+        assert!(!c.upstream_retry_absorb_server_error, "5xx 吸收必须关（实测 11.6:1 吸收比）");
+        assert!(!c.upstream_retry_absorb_capacity_400, "容量 400 吸收必须关（误认真限流）");
+        assert_eq!(c.upstream_retry_absorb_swap_budget_secs, 0, "换号空窗预算 0（部署侧决定）");
+        assert_eq!(c.upstream_retry_absorb_exhausted_status, 503, "耗尽终态码 503（Cursor 见 429 掐会话）");
+        // 冷却：开 + 原时长
+        assert!(c.cooldown_enabled, "冷却必须开（线上 false 是语义陷阱）");
+        assert_eq!(c.cooldown_scale_pct, 100, "智能档冷却 scale 100（原时长）");
+        assert!(c.all_cooling_fast_fail, "全池冷却快速失败必须开");
+        assert!(c.auto_disable_suspicious, "风控自动禁用必须开");
+        assert_eq!(c.self_heal_base_backoff_secs, 60, "自愈退避基值 60s");
+        assert_eq!(c.self_heal_max_backoff_secs, 900, "自愈退避上限 900s");
+        assert_eq!(c.self_heal_max_shift, 4, "自愈指数位移上限 4");
+        // 入站整形：开 + AIMD 自动挡 + 出厂 RPM 边界
+        assert!(c.inbound_throttle_enabled, "入站整形必须开（削峰保护号）");
+        assert!(c.inbound_queue_timeout_passthrough, "智能档排队超时放行（宁可慢不要拒）");
+        assert!(c.inbound_rpm_auto, "AIMD 自动挡必须开（后台逻辑智能）");
+        assert_eq!(c.inbound_target_rpm, 100);
+        assert_eq!(c.inbound_rpm_min, 20);
+        assert_eq!(c.inbound_rpm_max, 300);
+        assert_eq!(c.inbound_burst_secs, 2);
+        assert_eq!(c.inbound_queue_max_wait_secs, 30);
+        // RPM 头寸
+        assert_eq!(c.credential_rpm_limit, 0, "全局软上限 0（兜底 30，per-cred 才是真旋钮）");
+        assert_eq!(c.rpm_headroom_factor, 85, "headroom 85（预留 15% 缓冲）");
+        assert_eq!(c.rpm_reserve_slots, 0, "无预留名额");
+        assert!(!c.rpm_hard_gate_overload_wait, "整池饱和回退软门不阻塞");
+        // 选号加权
+        assert!(c.balance_weight_enabled, "余额加权开（长期拉平额度）");
+        assert_eq!(c.balance_weight_floor, 50, "余额加权下限 50%");
+        assert!(c.health_429_weight_enabled, "429 EWMA 降权开");
+        assert!(c.affinity_enabled, "会话亲和开（粘账号防关联）");
+    }
+
+    /// 稳定优先（Shielded 扩展矩阵）取值钉死 —— docs/scheduling-config-simplify.md §3.3。
+    #[test]
+    fn stable_profile_matrix_matches_spec() {
+        let mut c: Config =
+            serde_json::from_str("{}").expect("应能反序列化");
+        c.throttle_profile = ThrottleProfile::Shielded;
+        c.apply_throttle_profile_for_explicit_switch();
+
+        // 与智能档的差异点：真限流返 429、冷却加长、吸收层关
+        assert!(!c.inbound_queue_timeout_passthrough, "稳定档排队超时返 429（让外挂走 cool 分支）");
+        assert_eq!(c.cooldown_scale_pct, 150, "稳定档冷却 scale 150（号少慎防封号）");
+        assert!(!c.upstream_retry_absorb_enabled, "稳定档吸收层关（防与外挂叠乘）");
+        // 与智能档同值部分
+        assert!(c.cooldown_enabled, "稳定档冷却必须开");
+        assert!(c.inbound_throttle_enabled, "入站整形必须开");
+        assert!(c.inbound_rpm_auto, "AIMD 自动挡必须开");
+        assert_eq!(c.inbound_target_rpm, 100);
+        assert_eq!(c.inbound_rpm_min, 20);
+        assert_eq!(c.inbound_rpm_max, 300);
+        assert_eq!(c.inbound_burst_secs, 2);
+        assert_eq!(c.inbound_queue_max_wait_secs, 30);
+        assert_eq!(c.credential_rpm_limit, 0);
+        assert_eq!(c.rpm_headroom_factor, 85);
+        assert_eq!(c.rpm_reserve_slots, 0);
+        assert!(!c.rpm_hard_gate_overload_wait);
+        assert!(c.balance_weight_enabled);
+        assert_eq!(c.balance_weight_floor, 50);
+        assert!(c.health_429_weight_enabled);
+        assert!(c.affinity_enabled);
+        assert!(c.all_cooling_fast_fail);
+        assert!(c.auto_disable_suspicious);
+        assert_eq!(c.self_heal_base_backoff_secs, 60);
+        assert_eq!(c.self_heal_max_backoff_secs, 900);
+        assert_eq!(c.self_heal_max_shift, 4);
+        assert_eq!(c.upstream_retry_absorb_budget_secs, 45);
+        assert_eq!(c.upstream_retry_absorb_max_rounds, 3);
+        assert_eq!(c.upstream_retry_absorb_min_delay_ms, 150);
+        assert_eq!(c.upstream_retry_absorb_max_delay_secs, 15);
+        assert!(!c.upstream_retry_absorb_suspended);
+        assert!(!c.upstream_retry_absorb_server_error);
+        assert!(!c.upstream_retry_absorb_capacity_400);
+        assert_eq!(c.upstream_retry_absorb_swap_budget_secs, 0);
+        assert_eq!(c.upstream_retry_absorb_exhausted_status, 503);
     }
 
     /// 档位的**只填空不覆盖**契约：显式写过的键，档位一律不碰。
@@ -2007,6 +2507,58 @@ mod tests {
         assert!(on.native_thinking_effort_enabled);
     }
 
+    /// UA 版本伪装与 OTA 自动检查的默认值守卫。
+    ///
+    /// - 版本伪装**默认开**（防上游按版本做风控差异），但失败静默降级回
+    ///   `kiro_version`，不存在"拉到坏值"路径 —— 拉不到就用本地常量；
+    /// - OTA 自动检查**默认关**（默认开等于给每个部署加周期性 GitHub 出站往返），
+    ///   间隔默认 24h；
+    /// - 三者 serde 缺字段路径（存量 config.json 没有这些键）必须与
+    ///   `Config::default()` 同源。
+    ///
+    /// 回退即 FAIL：把任一默认值改掉、或 serde 缺字段路径与 Config::default() 分叉。
+    #[test]
+    fn version_mask_and_ota_auto_check_defaults_are_consistent() {
+        assert!(
+            Config::default().ua_version_fetch,
+            "版本伪装默认必须开：它是防上游版本风控差异的常开手段，且失败只会静默降级"
+        );
+        assert!(
+            !Config::default().ota_auto_check,
+            "OTA 自动检查默认必须关：默认开等于给每个部署加周期性 GitHub 出站往返"
+        );
+        assert_eq!(
+            Config::default().ota_auto_check_interval_hours,
+            24,
+            "OTA 自动检查间隔默认 24 小时"
+        );
+        // serde 缺字段路径与 Config::default() 同源：存量 config.json 没有这三个键。
+        let from_json: Config = serde_json::from_str("{}").expect("缺字段的 config 必须能反序列化");
+        assert_eq!(
+            from_json.ua_version_fetch,
+            Config::default().ua_version_fetch,
+            "serde default 与 Config::default() 必须一致"
+        );
+        assert_eq!(
+            from_json.ota_auto_check,
+            Config::default().ota_auto_check,
+            "serde default 与 Config::default() 必须一致"
+        );
+        assert_eq!(
+            from_json.ota_auto_check_interval_hours,
+            Config::default().ota_auto_check_interval_hours,
+            "serde default 与 Config::default() 必须一致"
+        );
+        // 显式配置必须仍被尊重，否则开关等于不存在。
+        let on: Config = serde_json::from_str(
+            r#"{"uaVersionFetch":false,"otaAutoCheck":true,"otaAutoCheckIntervalHours":6}"#,
+        )
+        .expect("显式值必须能反序列化");
+        assert!(!on.ua_version_fetch);
+        assert!(on.ota_auto_check);
+        assert_eq!(on.ota_auto_check_interval_hours, 6);
+    }
+
     /// 吸收层与 403 风控吸收**都默认关**。
     ///
     /// 「默认开」在 2026-08-04 试过并当天回退：支撑它的「38% 可吸收」是错的
@@ -2116,6 +2668,19 @@ mod tests {
         assert!(cfg.login_background_enabled);
     }
 
+    /// 手写最小配置漏 `port` 必须落到 8990（与 main.rs 首启引导 / Docker / 文档对齐）。
+    /// 回退即 FAIL：`default_port()` 再写成 8080。
+    #[test]
+    fn missing_port_deserializes_to_8990() {
+        let cfg: Config =
+            serde_json::from_str(r#"{"host":"127.0.0.1"}"#).expect("缺 port 必须能反序列化");
+        assert_eq!(cfg.port, 8990);
+        assert_eq!(Config::default().port, 8990);
+        let explicit: Config =
+            serde_json::from_str(r#"{"port":8080}"#).expect("显式 port 必须能反序列化");
+        assert_eq!(explicit.port, 8080, "显式 8080 仍须被尊重");
+    }
+
     #[test]
     fn login_background_r18_roundtrip() {
         // camelCase 序列化 + 反序列化保真：关闭 R18 应被正确保留。
@@ -2125,5 +2690,96 @@ mod tests {
         assert!(s.contains("\"loginBackgroundR18\":false"));
         let back: Config = serde_json::from_str(&s).expect("反序列化应成功");
         assert!(!back.login_background_r18);
+    }
+
+    /// 模拟缓存配置：缺字段时默认关 + ratio 默认 0.7；camelCase 显式值必须被尊重。
+    #[test]
+    fn mock_cache_defaults_off_with_ratio_0_7_and_roundtrip() {
+        let cfg = Config::default();
+        assert!(
+            !cfg.mock_cache_enabled,
+            "mockCacheEnabled 默认必须关（伪造 cache 值不应默认注入）"
+        );
+        assert_eq!(
+            cfg.mock_cache_read_ratio,
+            default_mock_cache_read_ratio(),
+            "mockCacheReadRatio 默认必须走 default_mock_cache_read_ratio()，不得另写字面量"
+        );
+
+        let bare: Config = serde_json::from_str("{}").expect("缺字段必须能反序列化");
+        assert!(!bare.mock_cache_enabled);
+        assert_eq!(bare.mock_cache_read_ratio, 0.7);
+
+        let explicit: Config = serde_json::from_str(
+            r#"{"mockCacheEnabled":true,"mockCacheReadRatio":1.0}"#,
+        )
+        .expect("camelCase 显式值必须能反序列化");
+        assert!(explicit.mock_cache_enabled);
+        assert_eq!(explicit.mock_cache_read_ratio, 1.0);
+    }
+
+    /// 工具映射开关：缺字段时默认**开**（与既有原子默认 true 一致，保持现状行为零变化）；
+    /// camelCase 显式 false 必须被尊重并 roundtrip 保持。
+    #[test]
+    fn tool_compat_mapping_defaults_on_and_roundtrip() {
+        let cfg = Config::default();
+        assert!(
+            cfg.tool_compat_mapping,
+            "toolCompatMapping 默认必须开（保持现状映射行为）"
+        );
+        assert_eq!(
+            cfg.tool_compat_mapping,
+            default_tool_compat_mapping(),
+            "默认必须走 default_tool_compat_mapping()，不得另写字面量"
+        );
+
+        let bare: Config = serde_json::from_str("{}").expect("缺字段必须能反序列化");
+        assert!(bare.tool_compat_mapping);
+
+        let explicit: Config =
+            serde_json::from_str(r#"{"toolCompatMapping":false}"#).expect("camelCase 必须能反序列化");
+        assert!(
+            !explicit.tool_compat_mapping,
+            "显式关闭必须被尊重，否则用户关不掉"
+        );
+
+        let re: Config = serde_json::from_str(&serde_json::to_string(&explicit).expect("序列化应成功"))
+            .expect("roundtrip 必须能反序列化");
+        assert!(!re.tool_compat_mapping, "roundtrip 后必须保持 false");
+    }
+
+    /// P1-5：`trustPrivatePeerAsProxy` 默认 true（A2 零回归），camelCase 显式 false 可关。
+    #[test]
+    fn trust_private_peer_as_proxy_defaults_true_and_roundtrip_false() {
+        let cfg = Config::default();
+        assert!(
+            cfg.trust_private_peer_as_proxy,
+            "默认必须 true（LAN 直连才关；关默认会打破本机反代 A2）"
+        );
+
+        let bare: Config = serde_json::from_str("{}").expect("缺字段必须能反序列化");
+        assert!(
+            bare.trust_private_peer_as_proxy,
+            "配置文件不含该键时必须落到 true"
+        );
+
+        let explicit: Config = serde_json::from_str(r#"{"trustPrivatePeerAsProxy":false}"#)
+            .expect("camelCase 必须能反序列化");
+        assert!(
+            !explicit.trust_private_peer_as_proxy,
+            "显式关闭必须被尊重，否则 LAN 直连关不掉"
+        );
+
+        let value = serde_json::to_value(&explicit).expect("序列化应成功");
+        assert_eq!(
+            value.get("trustPrivatePeerAsProxy"),
+            Some(&serde_json::json!(false)),
+            "必须按 camelCase 写出"
+        );
+
+        let re: Config =
+            serde_json::from_str(&serde_json::to_string(&explicit).expect("序列化应成功"))
+                .expect("roundtrip 必须能反序列化");
+        assert!(!re.trust_private_peer_as_proxy, "roundtrip 后必须保持 false");
     }
 }

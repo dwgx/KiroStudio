@@ -64,6 +64,30 @@ pub fn restrict_permissions(path: &Path) {
     }
 }
 
+/// rename 成功后 fsync 父目录，让 dirent 本身落盘。文件内容已在 tmp 上
+/// `sync_all`；不 fsync 目录的话崩溃窗口里 rename 可能丢（旧文件还在，新内容只在 tmp）。
+/// Unix: 打开目录 fd 再 `sync_all`。失败只告警，不回退裸写。
+/// Windows: `std::fs::File` 打不开目录；同卷 NTFS rename 已是元数据原子。跳过。
+fn fsync_parent_dir(dir: &Path) {
+    #[cfg(unix)]
+    {
+        match std::fs::File::open(dir) {
+            Ok(f) => {
+                if let Err(e) = f.sync_all() {
+                    tracing::warn!("原子写后 fsync 父目录失败 {:?}: {}", dir, e);
+                }
+            }
+            Err(e) => tracing::warn!("原子写后打开父目录失败 {:?}: {}", dir, e),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows: cannot open a directory with std::fs::File; NTFS same-volume
+        // rename of a flushed file is already metadata-atomic. Skip.
+        let _ = dir;
+    }
+}
+
 /// 原子写:temp → fsync → rename,创建即 0600,rename 失败重试后回退裸写。
 ///
 /// 关键点:
@@ -125,6 +149,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     match rename_with_retry(&tmp, &target) {
         Ok(()) => {
             restrict_permissions(&target);
+            fsync_parent_dir(dir);
             Ok(())
         }
         Err(e) => {
@@ -142,6 +167,69 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             result
         }
     }
+}
+
+/// `write_atomic` 临时名：`.{stem}.{pid}.{seq}.tmp`，`pid`/`seq` 均为十进制数字。
+/// `stem` 可含点（如 `config.json`）。不匹配 `foo.tmp`、`.env`、`.foo.tmp`。
+fn is_write_atomic_tmp_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('.') else {
+        return false;
+    };
+    let Some(inner) = rest.strip_suffix(".tmp") else {
+        return false;
+    };
+    let mut parts = inner.rsplitn(3, '.');
+    let seq = parts.next().unwrap_or("");
+    let pid = parts.next().unwrap_or("");
+    let stem = parts.next().unwrap_or("");
+    !stem.is_empty()
+        && !pid.is_empty()
+        && !seq.is_empty()
+        && pid.bytes().all(|b| b.is_ascii_digit())
+        && seq.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// 扫掉目录里 `write_atomic` 崩溃残留的隐藏 tmp（非递归，仅本层）。
+///
+/// 只删匹配 `.{stem}.{pid}.{seq}.tmp` 的普通文件。单文件失败 warn 后继续。
+/// 目录不存在 → `Ok(0)`。返回成功删除的个数。
+pub fn sweep_stale_tmp(dir: &Path) -> std::io::Result<usize> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(it) => it,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut deleted = 0usize;
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("扫残留 tmp 读目录项失败 {:?}: {}", dir, e);
+                continue;
+            }
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_write_atomic_tmp_name(name) {
+            continue;
+        }
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(ft) if ft.is_file() => {}
+            Ok(_) => continue,
+            Err(e) => {
+                tracing::warn!("扫残留 tmp 取类型失败 {:?}: {}", path, e);
+                continue;
+            }
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => deleted += 1,
+            Err(e) => tracing::warn!("扫残留 tmp 删除失败 {:?}: {}", path, e),
+        }
+    }
+    Ok(deleted)
 }
 
 #[cfg(test)]
@@ -182,5 +270,75 @@ mod tests {
         assert!(is_retryable_rename_error(&perm));
         let nf = std::io::Error::from(std::io::ErrorKind::NotFound);
         assert!(!is_retryable_rename_error(&nf));
+    }
+
+    #[test]
+    fn sweep_stale_tmp_removes_only_write_atomic_leftovers() {
+        let dir = std::env::temp_dir().join(format!(
+            "ks_fsatomic_sweep_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let leftover = dir.join(".data.json.123.0.tmp");
+        std::fs::write(&leftover, b"stale").unwrap();
+        let notes = dir.join("notes.tmp");
+        std::fs::write(&notes, b"notes").unwrap();
+        let env = dir.join(".env");
+        std::fs::write(&env, b"SECRET=1").unwrap();
+        let short = dir.join(".foo.tmp");
+        std::fs::write(&short, b"nope").unwrap();
+        let nested = dir.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let nested_tmp = nested.join(".data.json.123.0.tmp");
+        std::fs::write(&nested_tmp, b"nested").unwrap();
+
+        let n = sweep_stale_tmp(&dir).unwrap();
+        assert_eq!(n, 1, "只删匹配 write_atomic 模式的本层文件");
+        assert!(!leftover.exists());
+        assert!(notes.exists(), "notes.tmp 不得删");
+        assert!(env.exists(), ".env 不得删");
+        assert!(short.exists(), ".foo.tmp 缺 pid.seq 不得删");
+        assert!(nested_tmp.exists(), "不得递归进子目录");
+
+        write_atomic(&dir.join("data.json"), b"hello-atomic").unwrap();
+        assert_eq!(std::fs::read(dir.join("data.json")).unwrap(), b"hello-atomic");
+        let leftover_now: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(is_write_atomic_tmp_name)
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(leftover_now.is_empty(), "write_atomic 成功后不得残留自身 tmp");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sweep_stale_tmp_missing_dir_returns_zero() {
+        let dir = std::env::temp_dir().join(format!(
+            "ks_fsatomic_sweep_missing_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!dir.exists());
+        assert_eq!(sweep_stale_tmp(&dir).unwrap(), 0);
+    }
+
+    /// 父目录 fsync 是尽力而为：临时目录上不得 panic，write_atomic 仍成功。
+    #[test]
+    fn fsync_parent_dir_does_not_panic_on_temp_dir() {
+        let dir = std::env::temp_dir().join(format!("ks_fsatomic_fsync_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        fsync_parent_dir(&dir);
+        let path = dir.join("data.json");
+        write_atomic(&path, b"after-dir-fsync").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"after-dir-fsync");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

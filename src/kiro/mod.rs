@@ -3,8 +3,6 @@
 pub mod affinity;
 pub mod auth;
 pub mod cooldown;
-pub mod deepseek_normalize;
-pub mod deepseek_schema;
 pub mod diagnosis;
 pub mod endpoint;
 pub mod endpoint_health;
@@ -24,4 +22,7 @@ pub mod regions;
 pub mod scheduling;
 pub mod throttle;
 pub mod token_manager;
+pub mod upstream_trace;
+pub mod user_id;
+pub mod version_mask;
 pub mod web_portal;

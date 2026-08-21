@@ -10,9 +10,11 @@ use serde::Deserialize;
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, BatchDeleteRequest, BatchDeleteResponse, CleanupDisabledRequest,
+        AddCredentialRequest, BatchDeleteRequest, BatchDeleteResponse, BatchIdsRequest,
+        BatchOpResponse, BatchSetAllowedModelsRequest, BatchSetDisabledRequest,
+        CleanupDisabledRequest,
         CloneCredentialRequest, SetAllowedModelsRequest, SetApiRegionRequest,
-        SetCustomApiConfigRequest, SetDeepseekNormalizeRequest, SetDisabledRequest,
+        SetCustomApiConfigRequest, SetDisabledRequest,
         SetEndpointRequest, SetLoadBalancingModeRequest, SetModelMappingExemptRequest,
         SetPriorityRequest, SetRpmLimitRequest, RefreshTokenRequest,
         SuccessResponse, parse_import_keys_request,
@@ -24,6 +26,63 @@ use super::{
 pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoResponse {
     let response = state.service.get_all_credentials();
     Json(response)
+}
+
+/// GET /api/admin/credentials/export-kam
+/// 导出凭据为 KAM 兼容 JSON（含 refreshToken 等**明文敏感字段**）
+///
+/// ⚠️ 敏感操作：响应体含明文 token，前端拿到后应直接触发浏览器下载，
+/// 不要落库/进日志。可选 query 参数 `ids`（逗号分隔）限定导出范围，
+/// 省略则导出全部。鉴权沿用 admin 路由统一鉴权（本路由在 authed 树内）。
+pub async fn export_kam_credentials(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let id_filter: Option<std::collections::HashSet<u64>> = match params
+        .get("ids")
+        .map(|raw| {
+            // ⚠️ 2026-08-14 对抗审查 MAJOR-1：`ids` 出现但解析结果为空（全非法段/空串）
+            // 必须报 400，绝不静默退化为**全量明文导出**——本端点响应含明文 token，
+            // 一个笔误（?ids=abc / ?ids=）让全池 token 出站是最坏的失败模式。
+            // 解析出的集合为空即视为格式错误（合法空串本身无意义：导出全量请省略
+            // 该参数，这是显式契约，与 BatchDelete 的严格解析惯例一致）。
+            let parsed: std::collections::HashSet<u64> = raw
+                .split(',')
+                .filter_map(|s| {
+                    let t = s.trim();
+                    if t.is_empty() {
+                        None
+                    } else {
+                        t.parse::<u64>().ok()
+                    }
+                })
+                .collect();
+            if parsed.is_empty() {
+                return Err(());
+            }
+            Ok(parsed)
+        })
+        .transpose()
+    {
+        Ok(v) => v,
+        Err(()) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(super::types::AdminErrorResponse::invalid_request(
+                    "ids 参数格式错误：需要逗号分隔的数字 ID",
+                )),
+            )
+                .into_response();
+        }
+    };
+
+let response = state.service.export_kam_credentials(id_filter.as_ref());
+    // MINOR-4（2026-08-14）：明文 token 响应禁止缓存（共享代理/浏览器不留副本）。
+    (
+        [("Cache-Control", "no-store")],
+        Json(response),
+    )
+        .into_response()
 }
 
 /// POST /api/admin/credentials/:id/disabled
@@ -162,31 +221,6 @@ pub async fn probe_models_standalone(
         .await
     {
         Ok(models) => Json(serde_json::json!({ "models": models })).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
-    }
-}
-
-/// POST /api/admin/credentials/:id/deepseek-normalize  body: `{ "deepseekNormalize": true }`
-///
-/// 设置代挂凭据的 deepseek 协议归一化开关（仅 custom_api 有意义；非 custom_api 后端 gate 拒绝）。
-pub async fn set_credential_deepseek_normalize(
-    State(state): State<AdminState>,
-    Path(id): Path<u64>,
-    Json(payload): Json<SetDeepseekNormalizeRequest>,
-) -> impl IntoResponse {
-    let enabled = payload.deepseek_normalize.unwrap_or(false);
-    match state
-        .service
-        .set_credential_deepseek_normalize(id, payload.deepseek_normalize)
-    {
-        Ok(_) => {
-            let msg = if enabled {
-                format!("凭据 #{} deepseek 归一化已开启", id)
-            } else {
-                format!("凭据 #{} deepseek 归一化已关闭", id)
-            };
-            Json(SuccessResponse::new(msg)).into_response()
-        }
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -398,7 +432,11 @@ pub struct ProxyTestResponse {
 ///
 /// SSRF 铁律：目标 URL 永远固定在此，绝不接受请求方传入——用户只能控制「用哪个代理」，
 /// 不能控制「访问哪个 URL」，杜绝把本网关当跳板打内网/元数据端点。
-const PROXY_TEST_PROBE_URL: &str = "https://api.ipify.org?format=json";
+///
+/// `pub(super)` 而非私有：后台代理池健康调度（`service.rs::probe_socks_node`）复用
+/// 同一个常量，保证「手动测活」与「自动调度」访问的是同一个目标——各写一份必然漂移，
+/// 而漂移的那一份就是可被指使的出站。
+pub(super) const PROXY_TEST_PROBE_URL: &str = "https://api.ipify.org?format=json";
 
 /// POST /api/admin/proxy/test
 /// 通过指定代理（或直连）访问固定探针 URL，测连通性 + 出口 IP。
@@ -858,7 +896,8 @@ pub async fn delete_credential(
 /// 批量删除的 ids 上限。
 ///
 /// 200 是线上号池量级（曾达 43）的数倍余量，同时防止一个请求把整池清空
-/// —— adminKey 明文存 localStorage 且全仓无 CSP，无上限的批量删除会放大 XSS 的破坏面。
+/// —— adminKey 在 sessionStorage（读取时清 localStorage 残留）且文档带 CSP，
+/// 无上限的批量删除仍会放大 XSS 的破坏面。
 const MAX_BATCH_DELETE_IDS: usize = 200;
 
 /// POST /api/admin/credentials/batch-delete
@@ -914,6 +953,101 @@ pub async fn delete_credentials_batch(
         failed,
         results,
     })
+    .into_response()
+}
+
+fn prepare_batch_ids(ids: Vec<u64>) -> Result<Vec<u64>, axum::response::Response> {
+    if ids.is_empty() {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(super::types::AdminErrorResponse::invalid_request(
+                "ids 不能为空".to_string(),
+            )),
+        )
+            .into_response());
+    }
+    if ids.len() > MAX_BATCH_DELETE_IDS {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(super::types::AdminErrorResponse::invalid_request(format!(
+                "一次最多操作 {} 个凭据（本次 {}）",
+                MAX_BATCH_DELETE_IDS,
+                ids.len()
+            ))),
+        )
+            .into_response());
+    }
+    let mut seen = std::collections::HashSet::new();
+    Ok(ids.into_iter().filter(|id| seen.insert(*id)).collect())
+}
+
+/// POST /api/admin/credentials/batch-reset
+///
+/// 批量重置失败计数并重新启用。**部分失败仍返 200**，逐条标 ok/error。
+pub async fn reset_credentials_batch(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchIdsRequest>,
+) -> impl IntoResponse {
+    let ids = match prepare_batch_ids(payload.ids) {
+        Ok(ids) => ids,
+        Err(resp) => return resp,
+    };
+    Json(BatchOpResponse::from_results(
+        state.service.reset_credentials_batch(&ids),
+    ))
+    .into_response()
+}
+
+/// POST /api/admin/credentials/batch-disabled
+///
+/// 批量启用/禁用。**部分失败仍返 200**，逐条标 ok/error。
+pub async fn set_credentials_disabled_batch(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchSetDisabledRequest>,
+) -> impl IntoResponse {
+    let ids = match prepare_batch_ids(payload.ids) {
+        Ok(ids) => ids,
+        Err(resp) => return resp,
+    };
+    Json(BatchOpResponse::from_results(
+        state.service.set_disabled_batch(&ids, payload.disabled),
+    ))
+    .into_response()
+}
+
+/// POST /api/admin/credentials/batch-allowed-models
+///
+/// 批量设置允许模型白名单（空/null = 不限制）。**部分失败仍返 200**，逐条标 ok/error。
+pub async fn set_credentials_allowed_models_batch(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchSetAllowedModelsRequest>,
+) -> impl IntoResponse {
+    let ids = match prepare_batch_ids(payload.ids) {
+        Ok(ids) => ids,
+        Err(resp) => return resp,
+    };
+    Json(BatchOpResponse::from_results(
+        state
+            .service
+            .set_allowed_models_batch(&ids, payload.allowed_models.clone()),
+    ))
+    .into_response()
+}
+
+/// POST /api/admin/credentials/batch-refresh
+///
+/// 批量强制刷新 Token。**部分失败仍返 200**，逐条标 ok/error。
+pub async fn force_refresh_tokens_batch(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchIdsRequest>,
+) -> impl IntoResponse {
+    let ids = match prepare_batch_ids(payload.ids) {
+        Ok(ids) => ids,
+        Err(resp) => return resp,
+    };
+    Json(BatchOpResponse::from_results(
+        state.service.force_refresh_tokens_batch(&ids).await,
+    ))
     .into_response()
 }
 
@@ -1100,6 +1234,41 @@ pub async fn probe_available_models(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelsTestRequest {
+    pub credential_id: u64,
+    pub models: Option<Vec<String>>,
+}
+
+/// POST /api/admin/models/test —— 对指定凭据做模型实测（复用 `probe_models` 极小请求）。
+pub async fn test_models(
+    State(state): State<AdminState>,
+    Json(payload): Json<ModelsTestRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .probe_models(payload.credential_id, payload.models)
+        .await
+    {
+        Ok((detail, total_credits)) => {
+            let items: Vec<serde_json::Value> = detail
+                .into_iter()
+                .map(|(model, status, credits)| {
+                    serde_json::json!({ "model": model, "status": status, "credits": credits })
+                })
+                .collect();
+            Json(serde_json::json!({
+                "id": payload.credential_id,
+                "models": items,
+                "totalCredits": total_credits,
+            }))
+            .into_response()
+        }
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// GET /api/admin/credentials/:id/export
 /// 导出指定凭据的原始 JSON（令牌下载，含敏感字段）
 pub async fn export_credential(
@@ -1107,7 +1276,9 @@ pub async fn export_credential(
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     match state.service.export_credential(id) {
-        Ok(cred) => Json(cred).into_response(),
+        // 明文 token 响应禁止缓存（共享代理/浏览器不留副本）——与
+        // export_kam_credentials 的 MINOR-4 同款（2026-08-14）。
+        Ok(cred) => ([("Cache-Control", "no-store")], Json(cred)).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -1332,13 +1503,13 @@ pub async fn start_idc_login(
         )
         .await
     {
-        Ok(result) => Json(serde_json::json!({
-            "session_id": result.session_id,
-            "verification_uri": result.verification_uri,
-            "verification_uri_complete": result.verification_uri_complete,
-            "user_code": result.user_code,
-            "expires_in": result.expires_in,
-        }))
+        Ok(result) => Json(StartIdcLoginResponse {
+            session_id: result.session_id,
+            verification_uri: result.verification_uri,
+            verification_uri_complete: result.verification_uri_complete,
+            user_code: result.user_code,
+            expires_in: result.expires_in,
+        })
         .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
@@ -1351,32 +1522,69 @@ pub async fn poll_idc_login(
     Path(session_id): Path<String>,
 ) -> impl IntoResponse {
     let resp = match state.service.poll_idc_login(&session_id).await {
-        IdcPollResult::Pending => serde_json::json!({
-            "status": "pending",
-        }),
-        IdcPollResult::Done { credential_id } => serde_json::json!({
-            "status": "done",
-            "credential_id": credential_id,
-        }),
-        IdcPollResult::Expired => serde_json::json!({
-            "status": "expired",
-            "message": "授权已超时，请重新发起",
-        }),
-        IdcPollResult::Error(msg) => serde_json::json!({
-            "status": "error",
-            "message": msg,
-        }),
+        IdcPollResult::Pending => PollIdcLoginResponse {
+            status: "pending".to_string(),
+            credential_id: None,
+            message: None,
+        },
+        IdcPollResult::Done { credential_id } => PollIdcLoginResponse {
+            status: "done".to_string(),
+            credential_id: Some(credential_id),
+            message: None,
+        },
+        IdcPollResult::Expired => PollIdcLoginResponse {
+            status: "expired".to_string(),
+            credential_id: None,
+            message: Some("授权已超时，请重新发起".to_string()),
+        },
+        IdcPollResult::Error(msg) => PollIdcLoginResponse {
+            status: "error".to_string(),
+            credential_id: None,
+            message: Some(msg),
+        },
     };
     Json(resp)
 }
 
-#[derive(Deserialize)]
+/// IDC 上号请求。`rename_all=camelCase` 与其它 admin 端点对齐；
+/// `alias` 接受旧 snake_case（admin-ui 仍 post `start_url` / `proxy_url`）。
+#[derive(Debug, Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StartIdcLoginRequest {
+    #[serde(alias = "start_url")]
     pub start_url: String,
     pub region: Option<String>,
     #[serde(default = "default_priority")]
     pub priority: u32,
+    #[serde(alias = "proxy_url")]
     pub proxy_url: Option<String>,
+}
+
+/// IDC 上号响应。线协议 camelCase；alias 让旧 snake_case JSON 仍能反序列化。
+#[derive(Debug, Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartIdcLoginResponse {
+    #[serde(alias = "session_id")]
+    pub session_id: String,
+    #[serde(alias = "verification_uri")]
+    pub verification_uri: String,
+    #[serde(skip_serializing_if = "Option::is_none", alias = "verification_uri_complete")]
+    pub verification_uri_complete: Option<String>,
+    #[serde(alias = "user_code")]
+    pub user_code: String,
+    #[serde(alias = "expires_in")]
+    pub expires_in: u64,
+}
+
+/// IDC 轮询响应。线协议 camelCase；alias 接受旧 `credential_id`。
+#[derive(Debug, Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PollIdcLoginResponse {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none", alias = "credential_id")]
+    pub credential_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 /// POST /api/admin/auth/external-idp/start
@@ -1460,6 +1668,10 @@ pub async fn external_idp_leg2_select(
     {
         Ok(result) => Json(serde_json::json!({
             "credentialId": result.credential_id,
+            // 回显实际建号用的 arn/region（用户选的 profile 可能被替换为同账号
+            // 可用 profile，前端需要展示最终落点，见 ExternalIdpSelectResult 文档）。
+            "arn": result.arn,
+            "region": result.region,
         }))
         .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
@@ -1498,6 +1710,48 @@ fn default_priority() -> u32 {
     0
 }
 
+// ============ SSO Token 导入（粘贴 AWS portal Bearer Token 静默换号）============
+
+/// POST /api/admin/credentials/import-sso
+/// 粘贴 AWS portal 的 Bearer Token（x-amz-sso_authn），服务端走完整设备授权流程
+/// 换取标准 IdC 凭据入池（免浏览器授权的人工步骤，移植自 Kiro-Go）。
+///
+/// body: `{ token, region?, priority?, proxyUrl? }`
+/// 返回: `{ credentialId, email }`
+///
+/// ⚠️ 安全：token 全程不落日志、不落盘（单次用途，仅本流程内使用）；region 必须
+/// 在 Kiro region 白名单内（service 层校验，防污染值拼坏出站 host）。
+pub async fn import_sso_token(
+    State(state): State<AdminState>,
+    Json(payload): Json<ImportSsoTokenRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .import_sso_token(payload.token, payload.region, payload.priority, payload.proxy_url)
+        .await
+    {
+        Ok(result) => Json(serde_json::json!({
+            "credentialId": result.credential_id,
+            "email": result.email,
+        }))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSsoTokenRequest {
+    /// AWS portal 的 Bearer Token（x-amz-sso_authn）。
+    pub token: String,
+    /// 导入 region（缺省 us-east-1；必须命中 Kiro region 白名单）。
+    pub region: Option<String>,
+    #[serde(default = "default_priority")]
+    pub priority: u32,
+    /// 上号时显式填的代理（仅此项持久化到新凭据）。
+    pub proxy_url: Option<String>,
+}
+
 // ============ 运维：一键重启 / 存储统计与清理 ============
 
 /// POST /api/admin/service/restart
@@ -1518,6 +1772,13 @@ pub async fn restart_service(State(state): State<AdminState>) -> impl IntoRespon
 /// 分区磁盘/内存占用统计（trace.db / usage jsonl / trash / 背景图内存池）
 pub async fn storage_stats(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.service.storage_stats(state.trace_db.as_ref()))
+}
+
+/// GET /api/admin/diagnostics/snapshot
+/// 运维诊断一键聚合：版本 / 逐号状态（禁用/冷却/健康分/余额）/ 代理池健康 /
+/// 关键配置摘要（脱敏）/ uptime / RSS。纯观测端点，前端不强制接。
+pub async fn diagnostics_snapshot(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.diagnostics_snapshot().await)
 }
 
 /// POST /api/admin/storage/cleanup
@@ -1541,6 +1802,32 @@ pub async fn storage_cleanup(
 
 // ============ 服务端配置 ============
 
+/// GET /api/admin/error-messages/defaults
+/// 返回错误码/提示词**内置默认表**全量：key → {status, type, message, retryAfterSecs}。
+///
+/// 数据源 = `crate::model::error_messages::default_error_messages()`（**运行期读取**，
+/// key 集随默认表演进自动同步，不硬编码）。只读，供前端「默认值预览」：
+/// 弹窗把默认表与 `GET /config` 的 `errorMessages`（配置覆盖）合并渲染全量 key。
+/// 响应契约 camelCase（retryAfterSecs；无 Retry-After 的条目为 null）。
+pub async fn get_error_message_defaults() -> impl IntoResponse {
+    let table = crate::model::error_messages::default_error_messages();
+    let obj = table
+        .iter()
+        .map(|(key, status, ty, message, retry_after)| {
+            (
+                key.to_string(),
+                serde_json::json!({
+                    "status": status,
+                    "type": ty,
+                    "message": message,
+                    "retryAfterSecs": retry_after,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<String, serde_json::Value>>();
+    Json(serde_json::Value::Object(obj))
+}
+
 /// GET /api/admin/config
 /// 返回服务端配置快照（敏感字段已脱敏）
 pub async fn get_config(State(state): State<AdminState>) -> impl IntoResponse {
@@ -1554,6 +1841,27 @@ pub async fn update_config(
     Json(payload): Json<super::types::UpdateConfigRequest>,
 ) -> impl IntoResponse {
     match state.service.update_config(payload) {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/export
+/// 导出当前配置（整份 JSON，敏感字段省略——脱敏清单见 AdminService::export_config）。
+pub async fn export_config(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.export_config() {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/config/import
+/// 导入整份配置（先校验后写盘，失败不破坏现有配置；敏感字段省略时继承现值）。
+pub async fn import_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    match state.service.import_config(payload) {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
@@ -1590,8 +1898,11 @@ pub async fn perform_update(
             }
             Json(result).into_response()
         }
+        // 分类错误码（对齐 AdminServiceError::status_code 模式）：400 入参非法 /
+        // 409 环境或版本冲突 / 422 数据无效 / 502 上游不可达 / 500 内部。
+        // body 形状保持既有契约（success=false + message），仅状态码分类。
         Err(e) => (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            e.status_code(),
             Json(serde_json::json!({ "success": false, "message": format!("升级失败: {e}") })),
         )
             .into_response(),
@@ -1602,6 +1913,330 @@ pub async fn perform_update(
 pub struct UpdatePerformRequest {
     #[serde(default)]
     pub version: Option<String>,
+}
+
+// ============ 帮助页联网搜索（DuckDuckGo + Bing RSS 兜底）============
+
+/// 单次搜索最多返回的条目数（DDG 与 Bing 兜底共用上限）。
+const MAX_WEB_SEARCH_RESULTS: usize = 10;
+/// Bing RSS 兜底最多取前 8 条（Bing 条目质量参差，够用即止）。
+const BING_FALLBACK_MAX_ITEMS: usize = 8;
+/// 结果标题截断长度（按字符截，`chars()` 避免切坏多字节字符）。
+const WEB_SEARCH_TITLE_MAX_CHARS: usize = 100;
+/// 查询词长度上限（字符数）。
+const WEB_SEARCH_Q_MAX_CHARS: usize = 200;
+
+/// GET /api/admin/help/web-search?q=<查询>
+/// 帮助页「联网搜索」代理：调 DuckDuckGo Instant Answer（免 key、JSON 稳定），
+/// 空结果时兜底 Bing RSS 搜索（见 `parse_bing_rss`）。前端经它绕开 CORS 并复用
+/// 服务器出网。
+///
+/// 鉴权：本端点注册在 authed 路由树内，走统一 admin 鉴权。
+/// 无额外频控：面板内使用、量小，只有持有 admin key 的请求能到达这里。
+///
+/// 失败语义：参数非法（q 空/超长）→ 400；出站请求失败（超时/非 2xx）→ 502。
+pub async fn help_web_search(
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    // 参数校验：q 必填、trim 后非空、长度 ≤ 200。
+    let q = match params
+        .get("q")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        Some(q) if q.chars().count() <= WEB_SEARCH_Q_MAX_CHARS => q.to_string(),
+        _ => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(super::types::AdminErrorResponse::invalid_request(
+                    "q 参数必填，且长度不超过 200 个字符",
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    // 查询词进 query，host 固定；仍用 SSRF 守卫（禁 302 跳内网）。
+    let ddg_url = format!(
+        "https://api.duckduckgo.com/?q={}&format=json&no_html=1&skip_disambig=1",
+        urlencoding::encode(&q)
+    );
+    let client = match crate::common::ssrf::build_guarded_client(
+        &ddg_url,
+        std::time::Duration::from_secs(8),
+        &["https"],
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(_) => return web_search_unavailable(),
+    };
+    let resp = match client.get(&ddg_url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return web_search_unavailable(),
+    };
+    let raw = match resp.text().await {
+        Ok(t) => t,
+        Err(_) => return web_search_unavailable(),
+    };
+    let mut items = parse_ddg_response(&raw, &q);
+
+    // 兜底：DDG Instant Answer 覆盖有限、空结果常见——此时**不返回空**，
+    // 改调 Bing RSS（服务器在美国可达，format=rss 返回 XML）。
+    if items.is_empty() {
+        let bing_url = format!(
+            "https://www.bing.com/search?q={}&format=rss",
+            urlencoding::encode(&q)
+        );
+        let bing_client = match crate::common::ssrf::build_guarded_client(
+            &bing_url,
+            std::time::Duration::from_secs(8),
+            &["https"],
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(_) => return web_search_unavailable(),
+        };
+        let resp = match bing_client.get(&bing_url).send().await {
+            Ok(r) if r.status().is_success() => r,
+            _ => return web_search_unavailable(),
+        };
+        let raw = match resp.text().await {
+            Ok(t) => t,
+            Err(_) => return web_search_unavailable(),
+        };
+        items = parse_bing_rss(&raw);
+    }
+
+    Json(items).into_response()
+}
+
+/// 502 响应：搜索服务不可用（上游超时/失败，前端提示稍后再试）。
+fn web_search_unavailable() -> axum::response::Response {
+    (
+        axum::http::StatusCode::BAD_GATEWAY,
+        Json(super::types::AdminErrorResponse::api_error(
+            "搜索服务暂时不可用",
+        )),
+    )
+        .into_response()
+}
+
+/// 纯函数：DDG Instant Answer JSON → 条目。
+///
+/// 展平规则：
+/// - `AbstractText` 非空 → 第一条（title=查询词、url=AbstractURL 或空、snippet=摘要）
+/// - `RelatedTopics[]` 逐项展平：有 `FirstURL` 的取 Text/FirstURL；带嵌套
+///   `Topics[]` 的递归展平；无 `FirstURL` 的条目跳过
+///
+/// 与网络调用解耦（mock 输入串可单测），见 `web_search_tests`。
+fn parse_ddg_response(raw: &str, query: &str) -> Vec<super::types::WebSearchItem> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+
+    if let Some(abstract_text) = v
+        .get("AbstractText")
+        .and_then(|t| t.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        out.push(super::types::WebSearchItem {
+            title: truncate_search_title(query),
+            url: v
+                .get("AbstractURL")
+                .and_then(|u| u.as_str())
+                .filter(|u| !u.is_empty())
+                .map(str::to_string),
+            snippet: abstract_text.to_string(),
+        });
+    }
+
+    if let Some(topics) = v.get("RelatedTopics").and_then(|t| t.as_array()) {
+        for topic in topics {
+            collect_ddg_topic(topic, &mut out);
+        }
+    }
+
+    out.truncate(MAX_WEB_SEARCH_RESULTS);
+    out
+}
+
+/// 递归展平单条 DDG topic（含嵌套 `Topics` 数组）。
+fn collect_ddg_topic(topic: &serde_json::Value, out: &mut Vec<super::types::WebSearchItem>) {
+    if let Some(nested) = topic.get("Topics").and_then(|t| t.as_array()) {
+        for t in nested {
+            collect_ddg_topic(t, out);
+        }
+        return;
+    }
+    let Some(text) = topic
+        .get("Text")
+        .and_then(|t| t.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return;
+    };
+    let Some(url) = topic
+        .get("FirstURL")
+        .and_then(|u| u.as_str())
+        .filter(|u| !u.is_empty())
+    else {
+        return;
+    };
+    out.push(super::types::WebSearchItem {
+        title: truncate_search_title(text),
+        url: Some(url.to_string()),
+        snippet: text.to_string(),
+    });
+}
+
+/// 标题截断：按字符截（`chars()` 而非 bytes，避免切坏多字节字符）。
+fn truncate_search_title(s: &str) -> String {
+    s.chars().take(WEB_SEARCH_TITLE_MAX_CHARS).collect()
+}
+
+/// 纯函数：Bing RSS（`format=rss` 的 XML）→ 条目。
+///
+/// 项目无 XML 解析依赖，选最简可靠的正则式粗解析：手写 find 扫描
+/// `<item>..</item>` 块（Bing 的 title/link/description 均为无属性标签），
+/// 再做基础 HTML 实体解码。条目取前 `BING_FALLBACK_MAX_ITEMS` 条。
+fn parse_bing_rss(xml: &str) -> Vec<super::types::WebSearchItem> {
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while out.len() < BING_FALLBACK_MAX_ITEMS {
+        let Some(open_at) = rest.find("<item>") else {
+            break;
+        };
+        let block_start = open_at + "<item>".len();
+        let Some(rel_end) = rest[block_start..].find("</item>") else {
+            break;
+        };
+        let block = &rest[block_start..block_start + rel_end];
+
+        let title = extract_xml_tag(block, "title").unwrap_or_default();
+        let url = extract_xml_tag(block, "link");
+        // 无标题或链接的条目没有点击价值，跳过。
+        if !title.is_empty() && url.as_deref().is_some_and(|u| !u.is_empty()) {
+            out.push(super::types::WebSearchItem {
+                title: truncate_search_title(&title),
+                url,
+                snippet: extract_xml_tag(block, "description")
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string(),
+            });
+        }
+
+        rest = &rest[block_start + rel_end + "</item>".len()..];
+    }
+    out
+}
+
+/// 取块内 `<tag>..</tag>` 首段内容并做基础 HTML 实体解码。
+fn extract_xml_tag(block: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = block.find(&open)? + open.len();
+    let end = block[start..].find(&close)? + start;
+    Some(html_unescape(&block[start..end]))
+}
+
+/// 基础 HTML 实体解码（Bing RSS 标题/描述含 `&amp;` 一类实体）。
+fn html_unescape(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+}
+
+#[cfg(test)]
+mod web_search_tests {
+    use super::*;
+
+    /// DDG 解析：AbstractText 打头 + RelatedTopics 展平（含嵌套、无链接跳过）。
+    #[test]
+    fn ddg_response_flattens_topics() {
+        let json = r#"{
+            "AbstractText": "Rust 是一门系统编程语言",
+            "AbstractURL": "https://www.rust-lang.org/",
+            "RelatedTopics": [
+                {"Text": "Rust Programming Language", "FirstURL": "https://www.rust-lang.org/"},
+                {"Topics": [
+                    {"Text": "Nested 条目 A", "FirstURL": "https://example.com/a"},
+                    {"Text": "无链接条目被跳过"}
+                ]},
+                {"Text": "只有文本没有链接"}
+            ]
+        }"#;
+        let items = parse_ddg_response(json, "rust");
+        assert_eq!(items.len(), 3);
+        // 第一条 = AbstractText（title 用查询词）
+        assert_eq!(items[0].title, "rust");
+        assert_eq!(items[0].url.as_deref(), Some("https://www.rust-lang.org/"));
+        assert!(items[0].snippet.contains("系统编程"));
+        // 第二条 = 顶层条目
+        assert_eq!(items[1].title, "Rust Programming Language");
+        assert_eq!(items[1].url.as_deref(), Some("https://www.rust-lang.org/"));
+        // 第三条 = 嵌套展开（无链接的条目被跳过）
+        assert_eq!(items[2].title, "Nested 条目 A");
+        assert_eq!(items[2].url.as_deref(), Some("https://example.com/a"));
+    }
+
+    /// DDG 解析：标题截断 100 字符（按字符截，多字节不切坏）。
+    #[test]
+    fn ddg_title_truncated_to_100_chars() {
+        let long = "长".repeat(120);
+        let json = format!(
+            r#"{{"RelatedTopics":[{{"Text":"{text}","FirstURL":"https://example.com/x"}}]}}"#,
+            text = long
+        );
+        let items = parse_ddg_response(&json, "q");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title.chars().count(), WEB_SEARCH_TITLE_MAX_CHARS);
+    }
+
+    /// DDG 解析：空结果 / 非法 JSON → 空数组（空数组触发 Bing 兜底）。
+    #[test]
+    fn ddg_empty_or_invalid_yields_empty() {
+        assert!(parse_ddg_response(r#"{"RelatedTopics":[]}"#, "q").is_empty());
+        assert!(parse_ddg_response("not json", "q").is_empty());
+    }
+
+    /// Bing RSS 解析：条目提取 + 实体解码 + 缺 description 容错 + 无链接跳过。
+    #[test]
+    fn bing_rss_parses_items() {
+        let xml = r#"<?xml version="1.0"?>
+        <rss version="2.0"><channel>
+        <item><title>Rust &amp; Cargo</title><link>https://example.com/rust</link><description>工具链介绍</description></item>
+        <item><title>No Desc</title><link>https://example.com/nodesc</link></item>
+        <item><title>No Link</title><description>只有描述</description></item>
+        </channel></rss>"#;
+        let items = parse_bing_rss(xml);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].title, "Rust & Cargo");
+        assert_eq!(items[0].url.as_deref(), Some("https://example.com/rust"));
+        assert_eq!(items[0].snippet, "工具链介绍");
+        assert_eq!(items[1].title, "No Desc");
+        assert_eq!(items[1].snippet, "");
+    }
+
+    /// Bing RSS 解析：最多取前 8 条。
+    #[test]
+    fn bing_rss_caps_at_8_items() {
+        let mut xml = String::new();
+        for i in 0..12 {
+            xml.push_str(&format!(
+                "<item><title>t{i}</title><link>https://example.com/{i}</link><description>d</description></item>"
+            ));
+        }
+        let items = parse_bing_rss(&xml);
+        assert_eq!(items.len(), BING_FALLBACK_MAX_ITEMS);
+    }
 }
 
 #[cfg(test)]
@@ -1631,5 +2266,104 @@ mod guard_tests {
             gate_at < parse_at,
             "开关闸门必须在解析请求体之前，否则关掉入口后仍会为对接方解析并校验一批 key"
         );
+    }
+
+    /// ⭐ 源码守卫（MINOR-4）：`export_credential` 必须带 `Cache-Control: no-store`。
+    ///
+    /// 该端点的响应体含**明文 token**；浏览器/共享代理若缓存它，等于把凭据留在
+    /// 本不该留的地方（export_kam_credentials 已带同款头，这条锁的是本端点本身）。
+    ///
+    /// 回退即 FAIL：把响应改回裸 `Json(cred)`（去掉 no-store 头）——断言不命中。
+    #[test]
+    fn export_credential_must_be_no_store() {
+        let src = include_str!("handlers.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        let fname = format!("pub async fn export_credential{}", "(");
+        let start = prod.find(&fname).expect("export_credential 不应被改名");
+        // 切片到下一个函数的文档注释（或测试模块），避免把其它函数的
+        // no-store 也算进本函数的判定。
+        let tail = &prod[start..];
+        let end = tail
+            .find("\n/// ")
+            .or_else(|| tail.find("\n#[cfg(test)]"))
+            .unwrap_or(tail.len());
+        let body = &tail[..end];
+        let header = format!("[({}, {})]", "\"Cache-Control\"", "\"no-store\"");
+        assert!(
+            body.contains(header.as_str()),
+            "export_credential 必须带 Cache-Control: no-store（响应体含明文 token，\
+             缓存会让共享代理/浏览器留下凭据副本）"
+        );
+    }
+}
+
+#[cfg(test)]
+mod idc_serde_tests {
+    use super::*;
+
+    #[test]
+    fn start_idc_login_request_accepts_camel_and_snake() {
+        let camel: StartIdcLoginRequest = serde_json::from_str(
+            r#"{"startUrl":"https://view.awsapps.com/start","proxyUrl":"socks5://127.0.0.1:1080"}"#,
+        )
+        .unwrap();
+        let snake: StartIdcLoginRequest = serde_json::from_str(
+            r#"{"start_url":"https://view.awsapps.com/start","proxy_url":"socks5://127.0.0.1:1080"}"#,
+        )
+        .unwrap();
+        assert_eq!(camel.start_url, snake.start_url);
+        assert_eq!(camel.proxy_url, snake.proxy_url);
+        assert_eq!(camel.priority, 0);
+        assert_eq!(snake.priority, 0);
+    }
+
+    #[test]
+    fn start_idc_login_response_wire_is_camel_case() {
+        let resp = StartIdcLoginResponse {
+            session_id: "sess-1".into(),
+            verification_uri: "https://example.invalid/device".into(),
+            verification_uri_complete: Some("https://example.invalid/device?code=ABCD".into()),
+            user_code: "ABCD-EFGH".into(),
+            expires_in: 600,
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert!(v.get("sessionId").is_some());
+        assert!(v.get("session_id").is_none());
+        assert!(v.get("verificationUri").is_some());
+        assert!(v.get("verificationUriComplete").is_some());
+        assert!(v.get("userCode").is_some());
+        assert!(v.get("expiresIn").is_some());
+
+        let from_snake: StartIdcLoginResponse = serde_json::from_value(serde_json::json!({
+            "session_id": "sess-2",
+            "verification_uri": "https://example.invalid/device",
+            "user_code": "WXYZ",
+            "expires_in": 30
+        }))
+        .unwrap();
+        assert_eq!(from_snake.session_id, "sess-2");
+        assert_eq!(from_snake.user_code, "WXYZ");
+        assert_eq!(from_snake.expires_in, 30);
+    }
+
+    #[test]
+    fn poll_idc_login_response_accepts_credential_id_alias() {
+        let from_snake: PollIdcLoginResponse = serde_json::from_value(serde_json::json!({
+            "status": "done",
+            "credential_id": 7
+        }))
+        .unwrap();
+        assert_eq!(from_snake.credential_id, Some(7));
+
+        let v = serde_json::to_value(&PollIdcLoginResponse {
+            status: "done".into(),
+            credential_id: Some(7),
+            message: None,
+        })
+        .unwrap();
+        assert_eq!(v.get("credentialId").and_then(|x| x.as_u64()), Some(7));
+        assert!(v.get("credential_id").is_none());
+        assert!(v.get("message").is_none());
     }
 }

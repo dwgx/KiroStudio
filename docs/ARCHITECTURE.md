@@ -29,7 +29,7 @@
 │ 2. 认证层       constant_time_eq 验证 x-api-key / Bearer        │ ← anthropic/middleware.rs
 │ 3. 转换层       Anthropic → Kiro 格式转换（状态机）             │ ← anthropic/converter.rs
 │ 4. 压缩层       ConversationState 多层压缩（规避上游~5MiB上限） │ ← anthropic/compressor.rs
-│ 5. 调度层       亲和 · balanced 8键选号 · 重试/故障转移         │ ← kiro/provider.rs + token_manager.rs
+│ 5. 调度层       亲和 · 12键升序选号 · 重试/故障转移         │ ← kiro/provider.rs + token_manager.rs
 │ 6. 健康/限流    熔断器(AIMD) · 冷却 · per-cred RPM · 族级连坐   │ ← kiro/{health,cooldown,rate_limiter,scheduling}.rs
 │ 7. Token管理    多凭据池 · Social/IDC/ExternalIdP 刷新 · 预刷新 │ ← kiro/token_manager.rs
 │ 8. 协议层       AWS event-stream 二进制帧解码（双CRC）          │ ← kiro/parser/*
@@ -94,13 +94,13 @@ main()
  │   ├─ normalize_tools(): 修复 MCP 工具 JSON Schema
  │   ├─ convert_messages_to_state(): 平铺消息 → Kiro 分层 ConversationState（三态状态机）
  │   └─ (strip_env_noise) 剥离 <env>/gitStatus 等每请求漂移噪音（省 token + 提缓存命中 + 降关联）
- ├─ [压缩] compressor: 空白折叠 + tool_result 头尾截断（规避上游 ~5MiB 400）
+ ├─ [压缩] compressor: 空白折叠 + tool_result 截断 + 压空修复 + 超长截断（规避上游 ~5MiB 400）
  ├─ [调度] provider.call_once_streaming / 重试循环:
  │   ├─ token_manager.acquire_context(model, user_id) —— 选号 + 占在途名额 + 确保 token
  │   │   ├─ 会话亲和：session_id 已绑定且未 RPM 饱和 → 复用；饱和则临时解绑走 balanced
  │   │   ├─ is_entry_selectable 硬门：!disabled && !cooldown && !rate_limited && opus订阅
  │   │   │   （⚠️ inflight 不做硬门槛，只进排序键，避免假性排队）
- │   │   ├─ balanced 8 键升序选号（见 §四）；priority 模式则取 priority 最小
+  │   │   ├─ 12 键升序选号（见 §四）；priority 模式同一套键、prio_first 恒 true
  │   │   └─ commit_selection：同一 entries 锁内 inflight+1 + rpm.record（根治惊群）
  │   ├─ endpoint.decorate_api：Authorization Bearer + tokentype(API_KEY/EXTERNAL_IDP) + UA/host/machineId
  │   ├─ transform_api_body：注入 effective_profile_arn（external_idp 用动态解析的真实租户 ARN）
@@ -133,25 +133,40 @@ main()
 
 ## 四、调度：balanced 选号算法（token_manager::select_next_credential）
 
-历史文档写的 `(priority, consecutive_failures)` 双键**已过时**。当前 balanced 模式是 **8 键升序** `min_by_key`，
+历史文档写的 `(priority, consecutive_failures)` 双键**已过时**。当前是 **12 键升序** `min_by_key`（权威定义在 `token_manager.rs` 排序键闭包注释，改元组必须同步那里）：
 在同一把 `entries` 锁临界区内完成"读候选(含 inflight/rpm) → 选中 → inflight+1 → rpm.record"，
 保证并发选号原子性（根治惊群/Top5 热点）：
 
 ```
 排序键（升序，越小越先选）：
- ① unusable        —— 真不可用(熔断 Open→p_avail=0 或 RPM 已饱和)沉底，优雅溢出到下一层
- ② prio_key        —— priorityInBalanced 开关开：按 priority 分层；关：恒 0（纯健康均衡）
- ③ neg_p_bucket    —— ⭐核心：-(p_avail×100)，p_avail 高排前（健康分档首要键）
- ④ saturated       —— RPM 软/硬上限饱和兜底
- ⑤ inflight        —— 当前在飞请求数（少者优先，分摊并发）
- ⑥ rpm(近60s)      —— 滚动窗口 RPM
- ⑦ success_count   —— 终身成功数
- ⑧ priority        —— 末位兜底（开关关时唯一 priority 参与点）
+ ① unusable            —— 真不可用(p_avail=0 或 RPM 饱和)沉底 —— 优雅溢出
+ ② starved             —— ⭐反饥饿强制探测(0=已饥饿排最前)；排在①后故不绕硬门
+ ③ prio_key            —— priorityInBalanced 开关开：按 priority 分层；关：恒 0
+ ④ health_tier         —— 健康 3 档粗门（p_avail = 熔断门×健康×(1-RPM压力)×(1-负载)）
+ ⑤ ramp_tier           —— ⭐爬坡压力档（治 slew-rate 429）
+ ⑥ whitelist_hit       —— 该模型在该号白名单里显式列出 → 0（首选）；通吃号 → 1
+ ⑦ inflight_now        —— ⭐同档内在途最少优先（抗惊群核心）
+ ⑧ model_calls_now     —— ⭐该号近窗内被当前模型调用次数（低先，爆款模型摊整池）
+ ⑨ slot_pressure_permille —— ⭐在途/自身容量千分比（大池高基数区分）
+ ⑩ rpm_usage_permille  —— RPM 已用率低的先选（按容量比例分流）
+ ⑪ neg_p_fine          —— p_avail 精细兜底（含余额加权）
+ ⑫ success_count       —— 终身成功数
 ```
 
+> 注：⑬ `priority_tiebreaker` 曾是第 13 键，与 ③ `prio_key` 同表达式，属死键，已删
+> （2026-08-14 全面 review，元组 13→12 位；末位锚点 = 唯一出现的 `e.success_count`）。
+
+- **⑥ whitelist_hit 语义**：白名单路由是「首选凭据组」的软因子——同健康同爬坡档内，
+  白名单号（`allowed_models` 显式列出该模型）优先；白名单号整档饱和时优雅溢出到通吃号。
+  全池无白名单时恒 1（均匀分流）→ 零回归。
+  **N=1 边界**：池内只有 1 个白名单号 + 通吃号时，白名单号未饱和期间通吃号恒排后，
+  实际零流量——这是刻意的「显式路由优先」语义，不是 bug；只有白名单号饱和/不可用
+  时通吃号才接流量。
+- ⚠️ 健康分档**不是**首要键（历史注释曾如此描述，已不成立）：①② 先于它。
+  真不可用的号必须沉底，饥饿号必须能拿到探测机会，二者都优先于"谁更健康"。
 - `p_avail ∈ [0,1] = 熔断门 × 健康分 × (1 - RPM压力) × (1 - 负载)`（health.rs::p_avail）。
 - **per-cred RPM 容量**：号有自己的 `rpm_limit`（>0）则用它，否则回退全局 `rpm_limit`。
-- **priority 模式**（默认 load_balancing_mode）：直接 `min_by_key(priority)`，固定主号。
+- **priority 模式**（默认 load_balancing_mode）：归一化后走**同一套排序键**，仅 `prio_first` 恒 true（= 按优先级分层，层内均衡，**整层打爆才溢出**到下一优先级层，不死磕单个坏号）。旧「直接 min_by_key(priority) 固定主号」的描述已不成立（见 `effective_scheduling`）。
 
 ### 4.1 健康熔断器（health.rs）
 
@@ -177,6 +192,7 @@ main()
 |------|------|---------|------|
 | RateLimitExceeded | 15s | ✓ | 上游 429 + 普通 throttle |
 | SuspiciousActivity | 20s | ✓ | 可疑活动软风控（族级连坐地基） |
+| AuthTransient | 20s | ✓ | 瞬态认证失败（账户级抖动，几十秒自愈；基线与 SuspiciousActivity 同档，见 cooldown.rs `default_duration`） |
 | ServerError | 30s | ✓ | 上游 5xx |
 | TokenRefreshFailed | 60s | ✓ | 刷新失败 |
 | ModelUnavailable | 300s | ✓ | 模型不可用 |

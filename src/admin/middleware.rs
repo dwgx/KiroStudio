@@ -18,8 +18,6 @@ use crate::usage::{TraceDb, UsageStats};
 /// Admin API 共享状态
 #[derive(Clone)]
 pub struct AdminState {
-    /// Admin API 密钥
-    pub admin_api_key: String,
     /// Admin 服务
     pub service: Arc<AdminService>,
     /// 用量统计（内存预聚合 + JSONL），未启用统计时为 None
@@ -29,9 +27,14 @@ pub struct AdminState {
 }
 
 impl AdminState {
-    pub fn new(admin_api_key: impl Into<String>, service: AdminService) -> Self {
+    /// 创建 Admin 状态。
+    ///
+    /// adminApiKey 已迁入 `common::auth_keys` 进程级热更单元（main.rs 启动播种，
+    /// admin 改配置调 setter 即时生效、无需重启——重启会掐断在途流式请求）。
+    /// 这里不再存、也不播——避免测试里随意构造 `AdminState` 污染进程级全局 cell。
+    /// 空值由 `set_admin_key` 拒绝写入，判定侧 fail-closed（见 auth_keys 模块级安全说明）。
+    pub fn new(_admin_api_key: impl Into<String>, service: AdminService) -> Self {
         Self {
-            admin_api_key: admin_api_key.into(),
             service: Arc::new(service),
             usage_stats: None,
             trace_db: None,
@@ -48,14 +51,17 @@ impl AdminState {
 
 /// Admin API 认证中间件
 pub async fn admin_auth_middleware(
-    State(state): State<AdminState>,
+    // State 仍需保留（`from_fn_with_state` 的签名要求），但鉴权已不读它。
+    State(_state): State<AdminState>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
     let api_key = auth::extract_api_key(&request);
 
+    // 活读进程级热更单元而非 State 里的固化副本：admin 改 adminApiKey 后即时生效。
+    // 空存储恒 false（fail-closed），见 auth_keys 模块级安全说明。
     match api_key {
-        Some(key) if auth::constant_time_eq(&key, &state.admin_api_key) => next.run(request).await,
+        Some(key) if crate::common::auth_keys::admin_key_matches(&key) => next.run(request).await,
         _ => {
             let error = AdminErrorResponse::authentication_error();
             (StatusCode::UNAUTHORIZED, Json(error)).into_response()

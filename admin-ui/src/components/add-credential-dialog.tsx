@@ -4,6 +4,7 @@ import { toast } from 'sonner'
 import { CheckCircle2, XCircle, AlertCircle, AlertTriangle, Loader2, Check, RefreshCw } from 'lucide-react'
 import { Checkbox } from '@/components/ui/checkbox'
 import { useQueryClient, useQuery } from '@tanstack/react-query'
+import i18n from '@/i18n'
 import {
   Dialog,
   DialogContent,
@@ -149,7 +150,7 @@ function tolerantJsonParse(raw: string): unknown {
       lastErr = e
     }
   }
-  throw lastErr instanceof Error ? lastErr : new Error('无法解析 JSON')
+  throw lastErr instanceof Error ? lastErr : new Error(i18n.t('addcredentialdialog.error.jsonParseFail'))
 }
 
 // 把任意识别到的原始对象拉平成一个统一的凭据请求。兼容 camelCase / snake_case /
@@ -254,11 +255,30 @@ function extractCredentials(parsed: unknown): AddCredentialRequest[] {
       // keys[] 是纯字符串数组（后端格式 2），直接包成 api_key 请求
       reqs.push({ authMethod: 'api_key', kiroApiKey: item.trim() })
     } else if (item && typeof item === 'object') {
-      const req = toAddRequest(item as Record<string, unknown>)
+      const rec = item as Record<string, unknown>
+      // CLIProxy 混合导出：type 非空且不是 kiro → OpenAI/Gemini 等，不当 Kiro 号导入。
+      const vendor = pickString(rec.type)
+      if (vendor && vendor.toLowerCase() !== 'kiro') continue
+      const req = toAddRequest(rec)
       if (req) reqs.push(req)
     }
   }
   return reqs
+}
+
+/** 非 JSON 纯行：每行一把 `ksk_`（空行 / `#` 注释忽略）。对齐 Foxfishc / Kiro-Go apikeys-batch。 */
+function extractPlainKskLines(raw: string): AddCredentialRequest[] {
+  const keys: string[] = []
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.startsWith('#')) continue
+    const at = trimmed.indexOf('ksk_')
+    if (at < 0) return []
+    const key = trimmed.slice(at).trim()
+    if (!key.startsWith('ksk_')) return []
+    keys.push(key)
+  }
+  return keys.map((kiroApiKey) => ({ authMethod: 'api_key', kiroApiKey }))
 }
 
 interface PasteResult {
@@ -547,8 +567,11 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       const parsed = tolerantJsonParse(pasteInput)
       reqs = extractCredentials(parsed)
     } catch (error) {
-      toast.error(t('addcredentialdialog.toast.jsonUnrecognized') + extractErrorMessage(error))
-      return
+      reqs = extractPlainKskLines(pasteInput)
+      if (reqs.length === 0) {
+        toast.error(t('addcredentialdialog.toast.jsonUnrecognized') + extractErrorMessage(error))
+        return
+      }
     }
 
     if (reqs.length === 0) {
@@ -662,7 +685,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
           onOpenChange(o)
         }}
       >
-        <DialogContent className="sm:max-w-lg max-h-[85vh] flex flex-col">
+        <DialogContent className="sm:max-w-lg max-h-[85vh] flex flex-col" aria-describedby={undefined}>
           <DialogHeader>
             <DialogTitle>{t('addcredentialdialog.title')}</DialogTitle>
           </DialogHeader>
@@ -902,7 +925,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               {/* Region 配置(Kiro 专属:Token 刷新/API 请求 region)。自定义 API 代挂透传不适用,不显示 */}
               {authMethod !== 'custom_api' && (
               <div className="space-y-2">
-                <label className="text-sm font-medium">{t('addcredentialdialog.field.region.label')}</label>
+                <label htmlFor="authRegion" className="text-sm font-medium">{t('addcredentialdialog.field.region.label')}</label>
                 <div className="grid grid-cols-2 gap-2">
                   <div>
                     <Input
@@ -1245,7 +1268,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
               {/* 代理配置（手填） */}
               <div className={exitMode === 'manual' ? 'space-y-2' : 'hidden'}>
-                <label className="text-sm font-medium">{t('addcredentialdialog.field.proxy.label')}</label>
+                <label htmlFor="proxyUrl" className="text-sm font-medium">{t('addcredentialdialog.field.proxy.label')}</label>
                 <div className="flex items-center gap-2">
                   <Input
                     id="proxyUrl"
@@ -1261,6 +1284,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   <Input
                     id="proxyUsername"
                     placeholder={t('addcredentialdialog.field.proxyUsername.placeholder')}
+                    aria-label={t('addcredentialdialog.field.proxyUsername.label')}
                     value={proxyUsername}
                     onChange={(e) => setProxyUsername(e.target.value)}
                     disabled={isPending}
@@ -1269,6 +1293,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     id="proxyPassword"
                     type="password"
                     placeholder={t('addcredentialdialog.field.proxyPassword.placeholder')}
+                    aria-label={t('addcredentialdialog.field.proxyPassword.label')}
                     value={proxyPassword}
                     onChange={(e) => setProxyPassword(e.target.value)}
                     disabled={isPending}
@@ -1300,8 +1325,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
             <div className="flex flex-col min-h-0 flex-1">
               <div className="space-y-4 py-4 overflow-y-auto flex-1 pr-1">
                 <div className="space-y-2">
-                  <label className="text-sm font-medium">{t('addcredentialdialog.paste.label')}</label>
+                  <label htmlFor="paste-input" className="text-sm font-medium">{t('addcredentialdialog.paste.label')}</label>
                   <textarea
+                    id="paste-input"
                     value={pasteInput}
                     onChange={(e) => setPasteInput(e.target.value)}
                     disabled={importing}

@@ -36,9 +36,15 @@ pub struct LogEntry {
     pub message: String,
 }
 
+struct LogRing {
+    entries: VecDeque<LogEntry>,
+    /// 下一枚序号。必须与 `entries` 同锁：锁外 `fetch_add` 再入队会让 snapshot
+    /// 顺序与 seq 错位（并发下出现空洞 / 逆序）。
+    next_seq: u64,
+}
+
 struct LogBuffer {
-    ring: Mutex<VecDeque<LogEntry>>,
-    seq: std::sync::atomic::AtomicU64,
+    ring: Mutex<LogRing>,
     tx: tokio::sync::broadcast::Sender<LogEntry>,
 }
 
@@ -47,8 +53,10 @@ fn buffer() -> &'static LogBuffer {
     BUF.get_or_init(|| {
         let (tx, _rx) = tokio::sync::broadcast::channel(BROADCAST_CAPACITY);
         LogBuffer {
-            ring: Mutex::new(VecDeque::with_capacity(RING_CAPACITY)),
-            seq: std::sync::atomic::AtomicU64::new(0),
+            ring: Mutex::new(LogRing {
+                entries: VecDeque::with_capacity(RING_CAPACITY),
+                next_seq: 0,
+            }),
             tx,
         }
     })
@@ -57,21 +65,24 @@ fn buffer() -> &'static LogBuffer {
 /// 追加一条日志:写环形缓冲(满则弹最旧)+ 尽力广播(无订阅者/满则忽略)。
 fn push(level: String, target: String, message: String) {
     let buf = buffer();
-    let seq = buf.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let entry = LogEntry {
-        seq,
-        ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        level,
-        target,
-        message,
-    };
-    {
+    let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let entry = {
         let mut ring = buf.ring.lock();
-        if ring.len() >= RING_CAPACITY {
-            ring.pop_front();
+        let seq = ring.next_seq;
+        ring.next_seq = ring.next_seq.saturating_add(1);
+        let entry = LogEntry {
+            seq,
+            ts,
+            level,
+            target,
+            message,
+        };
+        if ring.entries.len() >= RING_CAPACITY {
+            ring.entries.pop_front();
         }
-        ring.push_back(entry.clone());
-    }
+        ring.entries.push_back(entry.clone());
+        entry
+    };
     // 广播失败(无订阅者)是正常态,忽略。
     let _ = buf.tx.send(entry);
 }
@@ -81,7 +92,8 @@ fn push(level: String, target: String, message: String) {
 pub fn snapshot(since: Option<u64>, min_level: Option<&str>) -> Vec<LogEntry> {
     let min_rank = min_level.map(level_rank);
     let ring = buffer().ring.lock();
-    ring.iter()
+    ring.entries
+        .iter()
         .filter(|e| since.map(|s| e.seq > s).unwrap_or(true))
         .filter(|e| min_rank.map(|m| level_rank(&e.level) >= m).unwrap_or(true))
         .cloned()
@@ -193,5 +205,55 @@ mod tests {
         assert!(level_rank("ERROR") > level_rank("WARN"));
         assert!(level_rank("WARN") > level_rank("INFO"));
         assert!(level_rank("INFO") > level_rank("DEBUG"));
+    }
+
+    /// 两线程并发 push：snapshot 的 ring 顺序必须与 seq 单调一致，
+    /// 且本次发出的 seq 闭区间在快照里没有空洞。
+    #[test]
+    fn concurrent_pushes_snapshot_seq_is_monotonic_and_contiguous() {
+        const N: usize = 128;
+        let marker = format!(
+            "p2-12-logbuf-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        let since = snapshot(None, None).last().map(|e| e.seq);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for i in 0..N {
+                    push("INFO".into(), format!("{marker}-a"), format!("a-{i}"));
+                }
+            });
+            s.spawn(|| {
+                for i in 0..N {
+                    push("INFO".into(), format!("{marker}-b"), format!("b-{i}"));
+                }
+            });
+        });
+        let snap = snapshot(since, None);
+        assert!(
+            snap.windows(2).all(|w| w[0].seq < w[1].seq),
+            "ring 顺序必须与锁内分配的 seq 单调一致"
+        );
+        let ours: Vec<&LogEntry> = snap
+            .iter()
+            .filter(|e| e.target.starts_with(&marker))
+            .collect();
+        assert_eq!(ours.len(), N * 2, "并发写入不得丢条");
+        let min = ours.iter().map(|e| e.seq).min().expect("ours");
+        let max = ours.iter().map(|e| e.seq).max().expect("ours");
+        let present: std::collections::HashSet<u64> = snap
+            .iter()
+            .filter(|e| e.seq >= min && e.seq <= max)
+            .map(|e| e.seq)
+            .collect();
+        for seq in min..=max {
+            assert!(
+                present.contains(&seq),
+                "issued seq 范围 [{min},{max}] 在 snapshot 出现空洞 seq={seq}"
+            );
+        }
     }
 }

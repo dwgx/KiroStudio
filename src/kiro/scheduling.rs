@@ -18,6 +18,55 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+/// RPM 滑窗长度（秒）。**单一真相源**：`RpmTracker::new()` 的窗口时长与
+/// 爬坡折算（`RAMP_RECENT_SECS` 除它）都从这里取，改窗口只动这一处。
+/// `RAMP_RECENT_SECS` 必须能整除它（折算要求）。
+pub(crate) const RPM_WINDOW_SECS: u64 = 60;
+
+/// 爬坡压力判定的「近期」窗口（秒）。必须能整除 [`RPM_WINDOW_SECS`]（用于折算分钟值）。
+///
+/// 取 10s：足够短到能在一分钟内**及早**看出跃升（不必等整分钟过完），
+/// 又足够长到不被三五个请求的抖动主导。
+pub(crate) const RAMP_RECENT_SECS: u32 = 10;
+
+/// 爬坡判定所需的最小窗口样本数。低于此值不判（返回档位 0）。
+///
+/// 新入池的号与低负载时段窗口内本来就只有几个请求，比值会剧烈抖动
+/// （1 → 3 就是 3x）。对这些情形判爬坡只会误伤：它们**应该**被逐步加量，
+/// 而不是被排序键压住不给流量。取 20 ≈ 实测健康号一分钟的下限量级。
+pub(crate) const RAMP_MIN_SAMPLES: u32 = 20;
+
+/// 爬坡压力档（slew-rate 分档）：近 [`RAMP_RECENT_SECS`] 的速率折算成分钟值，
+/// 与整 `RPM_WINDOW_SECS` 窗口均值（即 `total` 本身）比。比值越大 = 正在被猛灌
+/// → 档位越高 → 同健康档内让路给「已经平稳在跑」的号。
+///
+/// 实测依据（24h 全量，控制「前一分钟无 429」以排除 429 放大的计数虚高）：
+/// ≥5x 跃升 → 48.3% 429 ／ 2~5x → 5.4% ／ 平稳 → 0.7%，**69 倍**；
+/// 且与绝对速率交叉后每一档内跃升都是主因（100+ req/min 平缓只有 2.9%，
+/// <50 req/min 突然跃升有 36.4%）。
+///
+/// 返回值：0 = 平稳（或样本不足 `RAMP_MIN_SAMPLES` 不判），1 = 2~5x，2 = ≥5x。
+///
+/// 消费点：Kiro 主路径排序键第⑤位与透传池排序键第 2 键（token_manager.rs），
+/// 两处共用本函数，改档位/改窗口折算只动这里，防两池分叉。
+pub(crate) fn ramp_tier_of(recent: u32, total: u32) -> u8 {
+    // 窗口内样本太少时不判（新号/低负载，判了只会误伤）。
+    if total < RAMP_MIN_SAMPLES {
+        0u8
+    } else {
+        // 近 RAMP_RECENT_SECS 秒折算分钟值 vs 窗口均值（即 total 本身，窗口正是 RPM_WINDOW_SECS）。
+        let projected = recent as u64 * (RPM_WINDOW_SECS / RAMP_RECENT_SECS as u64);
+        let base = total.max(1) as u64;
+        if projected >= base * 5 {
+            2 // ≥5x：实测 48.3% 429
+        } else if projected >= base * 2 {
+            1 // 2~5x：实测 5.4%
+        } else {
+            0 // 平稳：实测 0.7%
+        }
+    }
+}
+
 /// 在途请求计数守卫（RAII）
 ///
 /// 构造（[`InflightGuard::acquire`]）时对目标计数器 +1，Drop 时 -1。
@@ -59,9 +108,17 @@ impl Drop for InflightGuard {
 /// 记录每个凭据在最近 60 秒内被分发请求的时间戳，用于 balanced 选号时判断
 /// 某号是否"接近 RPM 上限"。达到软上限的号在排序中被降权（而非硬跳过），
 /// 避免全部凭据饱和时清空可用池导致请求直接失败。
+///
+/// ## 模型维度（2026-08-14 新增）
+/// `model_hits` 是 `hits` 的同构细分：每 (凭据, 模型) 的近期分发计数，供选号排序
+/// 把「正在被同一爆款模型猛灌的号」与「该模型最近没打过的号」区分开，把热点模型
+/// 摊到整池。键名用**选号时的原始模型名**（模型映射发生在选号之后，选号侧只有
+/// 原始名）——与白名单/模型黑名单同源同口径，同一请求的两种计数落在同一模型名下。
+/// 阈值/上限刻意不新增：模型级只是分流计数，饱和判定仍复用每凭据 rpm_limit。
 pub struct RpmTracker {
     window: Duration,
     hits: Mutex<HashMap<u64, VecDeque<Instant>>>,
+    model_hits: Mutex<HashMap<(u64, String), VecDeque<Instant>>>,
 }
 
 impl Default for RpmTracker {
@@ -71,11 +128,12 @@ impl Default for RpmTracker {
 }
 
 impl RpmTracker {
-    /// 创建 60 秒滚动窗口追踪器
+    /// 创建 RPM 滚动窗口追踪器（窗口长度见 [`RPM_WINDOW_SECS`]）
     pub fn new() -> Self {
         Self {
-            window: Duration::from_secs(60),
+            window: Duration::from_secs(RPM_WINDOW_SECS),
             hits: Mutex::new(HashMap::new()),
+            model_hits: Mutex::new(HashMap::new()),
         }
     }
 
@@ -84,6 +142,18 @@ impl RpmTracker {
         let now = Instant::now();
         let mut map = self.hits.lock();
         let v = map.entry(id).or_default();
+        Self::prune(v, now, self.window);
+        v.push_back(now);
+    }
+
+    /// 记录一次「该凭据 × 该模型」的分发（与 [`Self::record`] 同点调用，模型级分流计数）。
+    ///
+    /// `model` 为选号时的原始模型名（映射发生在选号之后，见模块级说明）；
+    /// 调用方对空模型名负责（无模型语义的调用不调本方法，避免空键条目堆积）。
+    pub fn record_model(&self, id: u64, model: &str) {
+        let now = Instant::now();
+        let mut map = self.model_hits.lock();
+        let v = map.entry((id, model.to_string())).or_default();
         Self::prune(v, now, self.window);
         v.push_back(now);
     }
@@ -118,6 +188,35 @@ impl RpmTracker {
         let mut out = std::collections::HashMap::with_capacity(ids.len());
         for &id in ids {
             let n = match map.get_mut(&id) {
+                Some(v) => {
+                    Self::prune(v, now, window);
+                    v.len() as u32
+                }
+                None => 0,
+            };
+            out.insert(id, n);
+        }
+        out
+    }
+
+    /// 一次加锁批量读取「近窗内该凭据 × 该模型」的请求数（选号热路径专用，与
+    /// [`Self::counts_for`] 同款理由：排序键对每个候选都要读，逐个加锁会放大竞争）。
+    ///
+    /// 候选们的模型名相同（同一请求同一次选号），故对每个候选按 `(id, model)` 键
+    /// 做一次哈希查找即可覆盖全部候选——与 `counts_for` 的 `get_mut(&id)` 同构，
+    /// n 次哈希查找替代此前的全表扫描（遍历**全部** (凭据, 模型) 条目做字符串
+    /// 比较；M 通常远大于 n，43 号 × 20 模型 ≈ 860 条目）。未出现的
+    /// (凭据, 模型) 组合返回 0（与 `counts_for` 的缺键语义一致）。
+    pub fn model_counts_for(&self, ids: &[u64], model: &str) -> std::collections::HashMap<u64, u32> {
+        let now = Instant::now();
+        let window = self.window;
+        let mut map = self.model_hits.lock();
+        // 键是 (u64, String)，而查询键只有 &str——(u64, String) 没有 Borrow 到
+        // (u64, &str) 的桥，必须按候选构造临时键（一次 hash + 短字符串分配，
+        // 仍远优于 M 次长模型名比较）。
+        let mut out = std::collections::HashMap::with_capacity(ids.len());
+        for &id in ids {
+            let n = match map.get_mut(&(id, model.to_string())) {
                 Some(v) => {
                     Self::prune(v, now, window);
                     v.len() as u32
@@ -211,15 +310,40 @@ impl RpmTracker {
         v.front().map(|t| now.duration_since(*t))
     }
 
+    /// 该号窗口内**第 `k` 老**（k=1 即最老）命中距今的时长；窗口内不足 `k` 条时返 None。
+    ///
+    /// 与 [`Self::oldest_age`] 的区别：`oldest_age` 只答「第一个名额何时释放」，本方法答
+    /// 「第 k 个名额何时释放」——L4 背压在 limit 被**热调低**（窗口内计数 fresh_count >
+    /// limit）时需要等到第 `fresh_count - limit + 1` 条过期，窗口内才回落到限值内，
+    /// 用 `oldest_age` 会低估恢复时间、回给客户端的 Retry-After 偏小。
+    ///
+    /// 实现：per-id `VecDeque` 时间戳单调递增（`record` 只 push 队尾），`VecDeque::get`
+    /// 按索引直接取，O(1) 无需队尾扫描。
+    pub fn kth_oldest_age(&self, id: u64, k: u32) -> Option<Duration> {
+        if k == 0 {
+            return None;
+        }
+        let now = Instant::now();
+        let mut map = self.hits.lock();
+        let v = map.get_mut(&id)?;
+        Self::prune(v, now, self.window);
+        v.get(k as usize - 1).map(|t| now.duration_since(*t))
+    }
+
     /// 该号窗口长度(60s),供恢复窗口计算。
     pub fn window(&self) -> Duration {
         self.window
     }
 
     /// 移除指定凭据的窗口条目（删号时调用，避免其 RPM 记录残留被复用 id 的新号继承）。
+    /// 模型维度同款清理：该凭据的全部 (id, 模型) 条目一并移除。
     /// 返回是否确有条目被移除。
     pub fn remove(&self, id: u64) -> bool {
-        self.hits.lock().remove(&id).is_some()
+        let had_hit = self.hits.lock().remove(&id).is_some();
+        let mut mh = self.model_hits.lock();
+        let had_model = mh.keys().any(|(cid, _)| *cid == id);
+        mh.retain(|(cid, _), _| *cid != id);
+        had_hit || had_model
     }
 
     /// 清理空闲条目（由后台定时任务周期调用，防止不再出现的凭据 id 无界堆积）
@@ -231,6 +355,12 @@ impl RpmTracker {
             Self::prune(v, now, window);
         }
         map.retain(|_, v| !v.is_empty());
+        // 模型维度同款清理：过期条目剔除后空 (id, 模型) 组合一并移除，防无界堆积。
+        let mut mh = self.model_hits.lock();
+        for v in mh.values_mut() {
+            Self::prune(v, now, window);
+        }
+        mh.retain(|_, v| !v.is_empty());
     }
 }
 
@@ -283,6 +413,7 @@ mod tests {
         let tracker = RpmTracker {
             window: Duration::from_millis(30),
             hits: Mutex::new(HashMap::new()),
+            model_hits: Mutex::new(HashMap::new()),
         };
         tracker.record(1);
         assert_eq!(tracker.count(1), 1);
@@ -296,6 +427,7 @@ mod tests {
         let tracker = RpmTracker {
             window: Duration::from_millis(30),
             hits: Mutex::new(HashMap::new()),
+            model_hits: Mutex::new(HashMap::new()),
         };
         tracker.record(1);
         tracker.record(2);
@@ -330,6 +462,7 @@ mod tests {
         let tracker = RpmTracker {
             window: Duration::from_millis(30),
             hits: Mutex::new(HashMap::new()),
+            model_hits: Mutex::new(HashMap::new()),
         };
         tracker.record(1);
         tracker.record(2);
@@ -338,6 +471,72 @@ mod tests {
         let batch = tracker.counts_for(&[1, 2]);
         assert_eq!(batch.get(&1).copied(), Some(0), "过期项应被剔除");
         assert_eq!(batch.get(&2).copied(), Some(0));
+    }
+
+    /// 模型维度：每 (凭据 × 模型) 独立计数，且与每凭据计数互不干扰。
+    #[test]
+    fn test_rpm_tracker_model_dimension_counts_per_cred_model() {
+        let tracker = RpmTracker::new();
+        tracker.record_model(1, "claude-sonnet-4-5");
+        tracker.record_model(1, "claude-sonnet-4-5");
+        tracker.record_model(1, "claude-opus-4-8");
+        tracker.record_model(2, "claude-sonnet-4-5");
+        let batch = tracker.model_counts_for(&[1, 2], "claude-sonnet-4-5");
+        assert_eq!(batch.get(&1).copied(), Some(2), "#1 的 sonnet 计数");
+        assert_eq!(batch.get(&2).copied(), Some(1), "#2 的 sonnet 计数");
+        let other = tracker.model_counts_for(&[1, 2], "claude-opus-4-8");
+        assert_eq!(other.get(&1).copied(), Some(1), "#1 的 opus 计数独立");
+        assert_eq!(
+            other.get(&2).copied(),
+            Some(0),
+            "未出现过的 (凭据, 模型) 组合必须返回 0 而不是缺键"
+        );
+        assert_eq!(tracker.count(1), 0, "模型级计数不污染每凭据计数");
+        assert_eq!(tracker.count(2), 0);
+    }
+
+    /// 模型维度：滑窗过期剔除与 cleanup 清空同样生效（与每凭据维度同款语义）。
+    #[test]
+    fn test_rpm_tracker_model_dimension_prunes_and_cleanup() {
+        let tracker = RpmTracker {
+            window: Duration::from_millis(30),
+            hits: Mutex::new(HashMap::new()),
+            model_hits: Mutex::new(HashMap::new()),
+        };
+        tracker.record_model(1, "m");
+        assert_eq!(tracker.model_counts_for(&[1], "m").get(&1).copied(), Some(1));
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            tracker.model_counts_for(&[1], "m").get(&1).copied(),
+            Some(0),
+            "过期项应被剔除"
+        );
+        tracker.record_model(1, "m");
+        tracker.record_model(2, "m");
+        std::thread::sleep(Duration::from_millis(50));
+        tracker.cleanup();
+        assert_eq!(
+            tracker.model_counts_for(&[1, 2], "m").values().sum::<u32>(),
+            0,
+            "cleanup 后全部过期空条目应被清空"
+        );
+    }
+
+    /// 模型维度：remove 删号时该凭据的模型级条目一并移除（防复用 id 的新号继承计数）。
+    #[test]
+    fn test_rpm_tracker_remove_clears_model_dimension() {
+        let tracker = RpmTracker::new();
+        tracker.record_model(1, "m");
+        tracker.record_model(1, "m");
+        assert!(tracker.remove(1), "remove 应报告确有条目被移除");
+        assert_eq!(
+            tracker.model_counts_for(&[1], "m").get(&1).copied(),
+            Some(0),
+            "删号后该号的模型级计数必须清零"
+        );
+        // 其它号的条目不受影响
+        tracker.record_model(2, "m");
+        assert_eq!(tracker.model_counts_for(&[1, 2], "m").get(&2).copied(), Some(1));
     }
 
     /// 回归（滑窗剔除必须是摊还 O(1) 而非每次全扫）：大量命中下 prune 只处理过期前缀。
@@ -367,6 +566,72 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "{N} 次 record 耗时 {elapsed:?}：prune 应是摊还 O(1) 的队首弹出，\
              而非每次 O(w) 全量 retain"
+        );
+    }
+
+    /// kth_oldest_age 的序关系：第 k 老按 k 升序递减（k=1 最老），且 k=1 与
+    /// oldest_age 完全一致（L4 背压新旧口径的兼容锚点）。
+    #[test]
+    fn test_kth_oldest_age_orders_consistent_with_oldest() {
+        let tracker = RpmTracker::new();
+        tracker.record(1);
+        std::thread::sleep(Duration::from_millis(20));
+        tracker.record(1);
+        std::thread::sleep(Duration::from_millis(20));
+        tracker.record(1);
+        std::thread::sleep(Duration::from_millis(20));
+        tracker.record(1);
+
+        let oldest = tracker.oldest_age(1).expect("有命中必有最老年龄");
+        let k1 = tracker.kth_oldest_age(1, 1).expect("k=1 即最老");
+        let k2 = tracker.kth_oldest_age(1, 2).expect("窗口内 4 条，k=2 存在");
+        let k3 = tracker.kth_oldest_age(1, 3).expect("窗口内 4 条，k=3 存在");
+        let k4 = tracker.kth_oldest_age(1, 4).expect("窗口内 4 条，k=4 存在");
+
+        // 两次独立调用间有微秒级流逝，用容差而非严格相等（实测 0.04ms 级抖动）。
+        assert!(
+            oldest.abs_diff(k1) <= Duration::from_millis(2),
+            "k=1 必须约等于 oldest_age（等价时与旧行为一致），实际 {oldest:?} vs {k1:?}"
+        );
+        // 时间戳越老 age 越大：k 升序 → age 降序（每条间隔 ~20ms，容忍 5ms 抖动）。
+        assert!(
+            k1 >= k2 && k2 >= k3 && k3 >= k4,
+            "序必须 k1(最老) >= k2 >= k3 >= k4，实际 {k1:?} >= {k2:?} >= {k3:?} >= {k4:?}"
+        );
+        assert!(
+            k1 - k4 >= Duration::from_millis(30),
+            "首尾年龄差应体现 3 次 sleep 间隔（约 60ms），实际 {k1:?} vs {k4:?}"
+        );
+
+        // 越界与非法 k 必须返 None：k=0 无意义；k=5 超出窗口内条数。
+        assert_eq!(tracker.kth_oldest_age(1, 0), None, "k=0 无意义");
+        assert_eq!(tracker.kth_oldest_age(1, 5), None, "k 超出窗口内条数");
+        assert_eq!(tracker.kth_oldest_age(99, 1), None, "无命中号返 None");
+    }
+
+    /// 限流热调低（fresh_count > limit）时，第 k 老（k=fresh-limit+1）的恢复点
+    /// 必须比最老一条更晚——这就是 Retry-After 精确化的依据。
+    #[test]
+    fn test_kth_oldest_age_release_index_later_than_oldest() {
+        let tracker = RpmTracker::new();
+        for _ in 0..5 {
+            tracker.record(1);
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        let fresh = tracker.count(1);
+        let limit = 2;
+        let release_index = fresh - limit + 1; // = 4：等第 4 老过期，窗口内只剩 limit-1 条
+        let release_wait = tracker
+            .kth_oldest_age(1, release_index)
+            .map(|age| tracker.window().saturating_sub(age))
+            .expect("窗口内 5 条，k=4 必存在");
+        let old_wait = tracker
+            .oldest_age(1)
+            .map(|age| tracker.window().saturating_sub(age))
+            .expect("必有最老");
+        assert!(
+            release_wait > old_wait,
+            "limit 热调低后恢复点必须更晚：release_wait={release_wait:?} 应 > old_wait={old_wait:?}"
         );
     }
 }

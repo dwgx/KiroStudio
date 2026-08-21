@@ -49,7 +49,7 @@ jobs:
           pnpm build
 
       - name: 安装 Rust (musl 目标)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.1
         with:
           targets: x86_64-unknown-linux-musl
 
