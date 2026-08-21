@@ -42,6 +42,7 @@ import {
   usePerformUpdate,
   useUpdateStatus,
 } from '@/hooks/use-ops'
+import { storagePartitionLabel } from '@/lib/i18n-labels'
 import type {
   RateLimitInsight,
   CredentialStatusItem,
@@ -303,7 +304,7 @@ function RecoveryMetricsCard() {
             </span>
           )}
         </CardTitle>
-        <Button variant="ghost" size="sm" onClick={() => refetch()} className="h-7 px-2">
+        <Button variant="ghost" size="sm" onClick={() => refetch()} className="h-7 px-2" title={t('opspage.common.refresh')} aria-label={t('opspage.common.refresh')}>
           <RefreshCw className="h-3.5 w-3.5" />
         </Button>
       </CardHeader>
@@ -961,10 +962,12 @@ function CredOpsDialog({
         <OpsSection title={t('opspage.credops.proxyTitle')} hint={t('opspage.credops.proxyHint')}>
           <div className="flex items-center gap-2">
             <Input
+              id="ops-proxy-url"
               value={proxyUrl}
               onChange={(e) => setProxyUrl(e.target.value)}
               placeholder={t('opspage.credops.proxyPlaceholder')}
               className="h-8 flex-1 text-xs"
+              aria-label={t('opspage.credops.proxyTitle')}
             />
             <ProxyTestButton proxyUrl={proxyUrl} className="h-8" />
             <Button
@@ -987,10 +990,12 @@ function CredOpsDialog({
         <OpsSection title={t('opspage.credops.nameTitle')} hint={t('opspage.credops.nameHint')}>
           <div className="flex items-center gap-2">
             <Input
+              id="ops-cred-name"
               value={name}
               onChange={(e) => setNameVal(e.target.value)}
               placeholder={t('opspage.credops.namePlaceholder')}
               className="h-8 flex-1 text-xs"
+              aria-label={t('opspage.credops.nameTitle')}
             />
             <Button
               size="sm"
@@ -1145,14 +1150,51 @@ const OpsAggregationCard = memo(function OpsAggregationCard({ onFocusLog }: { on
   const restart = useRestartService()
   const checkUpd = useCheckUpdate()
   const performUpd = usePerformUpdate()
-  const { data: updStatus } = useUpdateStatus()
+  const { data: updStatus, refetch: refetchUpdStatus } = useUpdateStatus()
   const { data: storage, isLoading: storageLoading, refetch: refetchStorage } = useStorageStats()
   const cleanup = useCleanupStorage()
 
   const [confirm, setConfirm] = useState<null | 'restart' | 'upgrade' | { kind: 'cleanup'; p: StoragePartition }>(null)
+  // OTA 升级过程状态机：applying(下载/校验中) → restarting(服务重启中) → null(服务恢复)。
+  // 后端 /update/status 只有健康标记（无阶段字段），阶段由本状态机近似。
+  const [upgradePhase, setUpgradePhase] = useState<'applying' | 'restarting' | null>(null)
   // 存储分区详情弹框:按分区 key 打开对应高保真明细(traces/usage_jsonl/trash/bg_cache)。
   const [detail, setDetail] = useState<null | 'traces' | 'usage_jsonl' | 'trash' | 'bg_cache'>(null)
   const updInfo = checkUpd.data
+  // 容器部署标记：check 响应 container_deployment=true 时，OTA 自更新不可用（升级按钮禁用 +
+  // 提示条），「检查更新」仍可用（只看远端版本信息无害）。
+  const isContainer = updInfo?.container_deployment === true
+
+  // 重启阶段轮询 /update/status：前 8s 只轮询不判成功（留足进程退出/拉起时间），
+  // 之后 refetch 成功即视为服务恢复，120s 超时兜底防永久卡在「重启中」。
+  useEffect(() => {
+    if (upgradePhase !== 'restarting') return
+    const start = Date.now()
+    const deadline = start + 120000
+    let done = false
+    const iv = window.setInterval(async () => {
+      if (done) return
+      const elapsed = Date.now() - start
+      if (elapsed > deadline) {
+        done = true
+        setUpgradePhase(null)
+        window.clearInterval(iv)
+        return
+      }
+      // MINOR-7（2026-08-14 审查修正）：服务重启断连窗口内 refetch 必然 reject
+      // （ECONNREFUSED），不 catch 会每个 tick 一个 unhandled rejection。
+      const res = await refetchUpdStatus().catch(() => null)
+      if (elapsed >= 8000 && res?.data) {
+        done = true
+        setUpgradePhase(null)
+        window.clearInterval(iv)
+      }
+    }, 3000)
+    return () => {
+      done = true
+      window.clearInterval(iv)
+    }
+  }, [upgradePhase, refetchUpdStatus])
 
   // bg_cache 分区张数(供背景图缓存弹框渲染 idx 网格)。
   const bgCount = storage?.partitions.find((p) => p.key === 'bg_cache')?.items ?? 0
@@ -1200,12 +1242,28 @@ const OpsAggregationCard = memo(function OpsAggregationCard({ onFocusLog }: { on
               </span>
             )}
             {updInfo?.has_update && (
-              <Button size="sm" disabled={performUpd.isPending} onClick={() => setConfirm('upgrade')}>
+              <Button size="sm" disabled={performUpd.isPending || isContainer} onClick={() => setConfirm('upgrade')}>
                 {performUpd.isPending ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <RotateCcw className="mr-1.5 h-4 w-4" />}
                 {t('opspage.agg.upgradeTo', { latest: updInfo.latest_version })}
               </Button>
             )}
           </div>
+          {/* 容器部署提示条：check 已确认是容器部署时，OTA 自更新不可用（升级按钮已禁用），
+              须走 deploy 流程重建镜像。与升级按钮同区展示，禁用的原因就地可读。 */}
+          {isContainer && (
+            <Callout variant="warning" className="w-full">
+              {t('opspage.agg.containerDeploy')}
+            </Callout>
+          )}
+          {/* OTA 升级过程进度区：下载/校验中 → 重启中。服务恢复后自动消失，下方状态区接手展示。 */}
+          {upgradePhase && (
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              {upgradePhase === 'applying'
+                ? t('opspage.agg.upgradeApplying')
+                : t('opspage.agg.upgradeRestarting')}
+            </div>
+          )}
           {/* OTA 升级/回滚观测(后端 .health/.bak/*.failed 标记) */}
           {updStatus && (
             <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
@@ -1236,7 +1294,7 @@ const OpsAggregationCard = memo(function OpsAggregationCard({ onFocusLog }: { on
               {t('opspage.storage.title')}
               {storage && <span className="text-xs font-normal text-muted-foreground">{t('opspage.storage.diskTotal', { bytes: formatBytes(storage.totalDiskBytes) })}</span>}
             </div>
-            <Button variant="ghost" size="sm" className="h-7 px-2" onClick={() => refetchStorage()} disabled={storageLoading}>
+            <Button variant="ghost" size="sm" className="h-7 px-2" onClick={() => refetchStorage()} disabled={storageLoading} title={t('opspage.common.refresh')} aria-label={t('opspage.common.refresh')}>
               <RefreshCw className="h-3.5 w-3.5" />
             </Button>
           </div>
@@ -1255,7 +1313,7 @@ const OpsAggregationCard = memo(function OpsAggregationCard({ onFocusLog }: { on
                 return (
                   <div key={p.key} className="flex items-center justify-between gap-3 rounded-md border border-[#2e2e2e] bg-[#111] px-3 py-1.5">
                     <div className="flex min-w-0 items-center gap-2">
-                      <span className="truncate text-xs">{p.label}</span>
+                      <span className="truncate text-xs">{storagePartitionLabel(p.key, p.label)}</span>
                       {p.inMemory && <Badge variant="outline" className="text-[10px]">{t('opspage.storage.inMemory')}</Badge>}
                     </div>
                     <div className="flex shrink-0 items-center gap-3">
@@ -1333,22 +1391,56 @@ const OpsAggregationCard = memo(function OpsAggregationCard({ onFocusLog }: { on
         onConfirm={() => {
           // 聚焦实时日志到升级流程:perform_update 每步发 [Update] 日志(下载/校验/写入/替换)在此流动显示。
           onFocusLog?.('[Update]')
+          setUpgradePhase('applying')
           performUpd.mutate(undefined, {
             onSuccess: (r) => {
               toast.success(r.message || t('opspage.toast.upgrading'))
               setConfirm(null)
+              // 请求已返回 = 替换成功，服务随即自动重启（可能立刻断连）→ 进入重启观察。
+              setUpgradePhase('restarting')
             },
-            onError: () => {
-              toast.warning(t('opspage.toast.upgradingWarn'))
+            onError: (err) => {
+              // 有 HTTP 响应 = 真失败（下载/校验出错）；无响应 = 服务已重启断连，按「已发起」处理。
+              // 真失败时按后端错误码分类提示（400 tag 非法 / 409 旧版本冲突 / 422 校验失败 /
+              // 502 下载失败），未知状态码回退通用文案。
+              const resp = (err as { response?: { status?: number } }).response
+              if (resp) {
+                setUpgradePhase(null)
+                const msg =
+                  resp.status === 400
+                    ? t('opspage.toast.updErr400')
+                    : resp.status === 409
+                      ? t('opspage.toast.updErr409')
+                      : resp.status === 422
+                        ? t('opspage.toast.updErr422')
+                        : resp.status === 502
+                          ? t('opspage.toast.updErr502')
+                          : t('opspage.toast.upgradingWarn')
+                toast.warning(msg)
+              } else {
+                setUpgradePhase('restarting')
+                toast.warning(t('opspage.toast.upgradingWarn'))
+              }
               setConfirm(null)
             },
           })
+          // MINOR-7（2026-08-14 审查修正）：请求挂起（网络黑洞）时 applying 会永久
+          // 转圈——60s 兜底：无任何响应则提示并复位，用户可手动重试。
+          window.setTimeout(() => {
+            setUpgradePhase((phase) => {
+              if (phase === 'applying') {
+                toast.warning(t('opspage.toast.upgradingWarn'))
+                return null
+              }
+              return phase
+            })
+          }, 60000)
         }}
       />
       <ConfirmDialog
         open={!!cleanupTarget}
         onOpenChange={(v) => !v && setConfirm(null)}
-        title={t('opspage.confirm.cleanupTitle', { label: cleanupTarget?.label ?? '' })}
+        title={t('opspage.confirm.cleanupTitle', { label: cleanupTarget ? storagePartitionLabel(cleanupTarget.key, cleanupTarget.label) : '' })}
         description={
           <span>
             {t('opspage.confirm.cleanupIrreversible')}
@@ -1736,6 +1828,7 @@ const LogViewer = memo(function LogViewer({ focusToken = 0, focusTerm = '' }: { 
             className="h-7 w-7 px-0"
             aria-expanded={!collapsed}
             title={collapsed ? t('opspage.log.expand') : t('opspage.log.collapse')}
+            aria-label={collapsed ? t('opspage.log.expand') : t('opspage.log.collapse')}
           >
             {collapsed ? <ChevronDown className="h-4 w-4" /> : <ChevronUp className="h-4 w-4" />}
           </Button>
@@ -1750,17 +1843,20 @@ const LogViewer = memo(function LogViewer({ focusToken = 0, focusTerm = '' }: { 
        <div className="flex flex-row items-center gap-2 px-6 pb-2">
          <div className="relative flex-1">
            <Search className="pointer-events-none absolute left-2 top-1/2 z-10 h-3.5 w-3.5 -translate-y-1/2 text-[#666]" />
-           <Input
-             value={search}
+            <Input
+              id="ops-log-search"
+              value={search}
              onChange={(e) => setSearch(e.target.value)}
              placeholder={t('opspage.log.searchPlaceholder')}
              className="h-7 pl-7 pr-7 text-xs"
+             aria-label={t('opspage.log.searchPlaceholder')}
            />
            {search && (
              <button
                onClick={() => setSearch('')}
                className="absolute right-1.5 top-1/2 z-10 -translate-y-1/2 text-[#666] hover:text-[#ededed]"
                title={t('opspage.log.clearSearch')}
+               aria-label={t('opspage.log.clearSearch')}
              >
                <X className="h-3.5 w-3.5" />
              </button>
@@ -1870,6 +1966,7 @@ function LogRow({
           onClick={handleCopy}
           className="shrink-0 self-start text-[#666] hover:text-[#ededed]"
           title={t('opspage.log.copyWhole')}
+          aria-label={t('opspage.log.copyWhole')}
         >
           <Copy className="h-3.5 w-3.5" />
         </button>

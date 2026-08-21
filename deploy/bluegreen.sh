@@ -1,7 +1,7 @@
 #!/bin/bash
 # 蓝绿验证部署 —— 主服务(8990)要稳，新二进制先在临时端口充分验证，人工确认才换主服务
 # 用法：在服务器上跑。阶段1=验证(默认)，阶段2=切换(需显式 promote 参数)
-set -u
+set -euo pipefail
 STAGE="${1:-verify}"
 TMP_PORT=8995
 LIVE_BIN="/home/dwgx_user/KiroStudio/kirostudio"
@@ -20,7 +20,7 @@ if [ "$STAGE" = "verify" ]; then
   node -e 'const fs=require("fs");const c=JSON.parse(fs.readFileSync("/tmp/bg-config.json"));c.port='$TMP_PORT';fs.writeFileSync("/tmp/bg-config.json",JSON.stringify(c,null,2))'
   chmod +x "$NEW_BIN"
   # 后台起临时实例
-  pkill -f "kirostudio-new -c /tmp/bg-config.json" 2>/dev/null; sleep 1
+  pkill -f "kirostudio-new -c /tmp/bg-config.json" 2>/dev/null || true; sleep 1
   nohup "$NEW_BIN" -c /tmp/bg-config.json --credentials /tmp/bg-creds.json > /tmp/bg-verify.log 2>&1 &
   BGPID=$!
   echo "临时实例 pid=$BGPID，等待启动..."
@@ -35,9 +35,9 @@ if [ "$STAGE" = "verify" ]; then
     "trash:GET:/api/admin/credentials/trash:x-api-key:$ADMIN_KEY"; do
     IFS=: read name method path hk hv <<< "$probe"
     if [ -n "$hk" ]; then
-      code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 -H "$hk: $hv" "http://localhost:$TMP_PORT$path")
+      code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 -H "$hk: $hv" "http://localhost:$TMP_PORT$path" || true)
     else
-      code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://localhost:$TMP_PORT$path")
+      code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://localhost:$TMP_PORT$path" || true)
     fi
     if [ "$code" = "200" ] || [ "$code" = "401" ]; then echo "  ✓ $name = $code"; else echo "  ✗ $name = $code"; fail=1; fi
   done
@@ -45,7 +45,7 @@ if [ "$STAGE" = "verify" ]; then
   if kill -0 $BGPID 2>/dev/null; then echo "  ✓ 进程存活(无 panic)"; else echo "  ✗ 进程已死，见 /tmp/bg-verify.log"; fail=1; fi
   echo "--- 启动日志尾 ---"; tail -5 /tmp/bg-verify.log
   # 收尾：停临时实例
-  kill $BGPID 2>/dev/null
+  kill $BGPID 2>/dev/null || true
   if [ "$fail" = "0" ]; then
     echo "=== 验证通过 ✓ 新二进制健康。确认无误后用 'bash $0 promote' 切换主服务 ==="
     exit 0
@@ -64,7 +64,7 @@ elif [ "$STAGE" = "promote" ]; then
   sudo systemctl start kirostudio && sleep 3
   if sudo systemctl is-active --quiet kirostudio; then
     echo "=== 主服务已切换并存活 ✓ ==="
-    curl -s -o /dev/null -w "8990 models=%{http_code}\n" -H "x-api-key: sk-test" http://localhost:8990/v1/models
+    curl -s -o /dev/null -w "8990 models=%{http_code}\n" -H "x-api-key: sk-test" http://localhost:8990/v1/models || true
   else
     echo "=== 主服务启动失败！回滚：sudo cp /tmp/kirostudio.bak.$ts $LIVE_BIN && sudo systemctl start kirostudio ==="
     exit 1

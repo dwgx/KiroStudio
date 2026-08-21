@@ -5,5 +5,10 @@
   "adminApiKey": "sk-admin-CHANGE-ME-to-a-strong-random-key",
   "tlsBackend": "rustls",
   "region": "us-east-1",
-  "defaultEndpoint": "ide"
+  "defaultEndpoint": "ide",
+
+  // 透传模拟缓存（默认关；热更即时生效）。开=透传响应注入 cacheReadInputTokens
+  // = round(inputTokens × mockCacheReadRatio) 的伪造值，仅供下游展示。
+  "mockCacheEnabled": false,
+  "mockCacheReadRatio": 0.7
 }

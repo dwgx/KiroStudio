@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// 对齐 provider 的失败处置分类（见 [`crate::kiro::cooldown::CooldownReason`]），
 /// 便于统计侧按结果聚合健康度。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestOutcome {
     /// 成功
@@ -34,9 +34,34 @@ pub enum RequestOutcome {
     ///
     /// 全局容量问题，非凭据问题。不影响凭据健康分，独立于 ServerError 便于可观测。
     ModelUnavailable,
+    /// 上游空/近空响应：客户端收到 error（400/429 SSE），面板计失败。
+    ///
+    /// 不是凭据故障——`is_success` 为 false（计入失败率），但不得走
+    /// `report_failure` / 熔断 / absorb。completion 层保持 Ok，仅 usage 记账改写。
+    EmptyResponse,
+    /// 客户端在流完成前断开（CC Esc / hyper 丢 Body）。
+    ///
+    /// 上游可能已消耗 token/credit；Drop 兜底补记。同样不计入凭据健康。
+    Interrupted,
 }
 
 impl RequestOutcome {
+    /// 封闭枚举全部变体（统计有界测试 / SQLite roundtrip 共用，避免漏列）。
+    pub const ALL: [RequestOutcome; 12] = [
+        RequestOutcome::Success,
+        RequestOutcome::RateLimited,
+        RequestOutcome::AuthFailed,
+        RequestOutcome::QuotaExhausted,
+        RequestOutcome::AccountSuspended,
+        RequestOutcome::ServerError,
+        RequestOutcome::BadRequest,
+        RequestOutcome::NetworkError,
+        RequestOutcome::OtherError,
+        RequestOutcome::ModelUnavailable,
+        RequestOutcome::EmptyResponse,
+        RequestOutcome::Interrupted,
+    ];
+
     /// 是否为成功结果
     pub fn is_success(&self) -> bool {
         matches!(self, RequestOutcome::Success)
@@ -54,6 +79,8 @@ impl RequestOutcome {
             RequestOutcome::NetworkError => "network_error",
             RequestOutcome::OtherError => "other_error",
             RequestOutcome::ModelUnavailable => "model_unavailable",
+            RequestOutcome::EmptyResponse => "empty_response",
+            RequestOutcome::Interrupted => "interrupted",
         }
     }
 }
@@ -67,6 +94,18 @@ pub struct RequestRecord {
     pub ts_ms: i64,
     /// 实际服务该请求的凭据 ID（失败到无凭据可用时为 None）
     pub credential_id: Option<u64>,
+    /// **本条请求链最先尝试的凭据 ID**（failover 首选号；`None` = 无 failover 或首选号不可考）。
+    ///
+    /// 与 [`Self::credential_id`]（最终服务号）成对构成「换号链」：两者不同 = 首选号
+    /// 失败后换号成功。面板据此发现「死号恒选」——`first_attempted_credential_id` 恒为
+    /// 某号而 `credential_id` 恒为另一号时，说明该号每次都排最前却被换掉（上游持续
+    /// 502/429），需要运维处理其上游。透传 failover 链在 `provider.rs` 的
+    /// `try_custom_api_passthrough` 记录首选号，经透传元数据（成功链）与跨层共享预算
+    /// （Kiro 主路径失败记录）分别落到两类 usage 埋点。
+    ///
+    /// serde default，兼容早于本字段的历史 JSONL（缺字段视为 None）。
+    #[serde(default)]
+    pub first_attempted_credential_id: Option<u64>,
     /// 请求模型名
     pub model: String,
     /// **客户端请求的原始模型名**（映射前；`None` = 无映射或不可得时回落 `model`）。
@@ -123,6 +162,13 @@ pub struct RequestRecord {
     pub latency_ms: u64,
     /// 首字节/首事件延迟（毫秒，流式有意义）
     pub first_token_ms: Option<u64>,
+    /// SSE 流中途断流（传输错误/解码器停止/in-band 错误）时已从上游收到的字节数。
+    ///
+    /// `None` = 本次未中断（正常收尾）；`Some(n)` = 断流时点已收字节（0 表示
+    /// 一个字节都没收到就断了）。埋点见 `StreamContext::note_received_bytes` /
+    /// `interrupted_bytes`。serde default，兼容早于本字段的历史 JSONL（缺字段视为 None）。
+    #[serde(default)]
+    pub interrupted_bytes: Option<u64>,
     /// 结果分类
     pub outcome: RequestOutcome,
     /// 本次经历的重试次数（0 表示首次即成功）
@@ -148,6 +194,7 @@ impl RequestRecord {
             request_id: request_id.into(),
             ts_ms: chrono::Utc::now().timestamp_millis(),
             credential_id: None,
+            first_attempted_credential_id: None,
             model: model.into(),
             requested_model: None,
             upstream_model: None,
@@ -159,6 +206,7 @@ impl RequestRecord {
             credits_used: None,
             latency_ms: 0,
             first_token_ms: None,
+            interrupted_bytes: None,
             outcome: RequestOutcome::Success,
             retries: 0,
             error_message: None,
@@ -503,6 +551,48 @@ mod tests {
     fn test_outcome_success() {
         assert!(RequestOutcome::Success.is_success());
         assert!(!RequestOutcome::RateLimited.is_success());
+        assert!(
+            !RequestOutcome::EmptyResponse.is_success(),
+            "空响应必须计入面板失败率"
+        );
+        assert!(
+            !RequestOutcome::Interrupted.is_success(),
+            "客户端断连必须计入面板失败率"
+        );
+    }
+
+    /// 封闭枚举：as_str / serde snake_case / ALL 三者一一对应；漏列新变体会红。
+    #[test]
+    fn all_outcomes_serde_snake_case_and_all_list() {
+        assert_eq!(RequestOutcome::ALL.len(), 12);
+        for o in RequestOutcome::ALL {
+            match o {
+                RequestOutcome::Success => assert!(o.is_success()),
+                RequestOutcome::RateLimited
+                | RequestOutcome::AuthFailed
+                | RequestOutcome::QuotaExhausted
+                | RequestOutcome::AccountSuspended
+                | RequestOutcome::ServerError
+                | RequestOutcome::BadRequest
+                | RequestOutcome::NetworkError
+                | RequestOutcome::OtherError
+                | RequestOutcome::ModelUnavailable
+                | RequestOutcome::EmptyResponse
+                | RequestOutcome::Interrupted => assert!(!o.is_success()),
+            }
+            let json = serde_json::to_string(&o).unwrap();
+            assert_eq!(json, format!("\"{}\"", o.as_str()));
+            let back: RequestOutcome = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, o);
+        }
+        assert_eq!(
+            serde_json::to_string(&RequestOutcome::EmptyResponse).unwrap(),
+            "\"empty_response\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RequestOutcome::Interrupted).unwrap(),
+            "\"interrupted\""
+        );
     }
 
     #[test]
@@ -521,6 +611,25 @@ mod tests {
         assert_eq!(back.credential_id, Some(3));
         assert_eq!(back.credits_used, Some(1.5));
         assert_eq!(back.outcome, RequestOutcome::Success);
+    }
+
+    /// failover 首选号：序列化 roundtrip 保留，旧 JSONL（缺字段）反序列化为 None。
+    #[test]
+    fn test_first_attempted_credential_roundtrip_and_legacy() {
+        let mut rec = RequestRecord::new("req-failover", "claude-sonnet-4");
+        rec.credential_id = Some(2);
+        rec.first_attempted_credential_id = Some(3);
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: RequestRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.credential_id, Some(2), "最终服务号必须保留");
+        assert_eq!(back.first_attempted_credential_id, Some(3), "首选号必须保留");
+
+        let legacy = r#"{"request_id":"req-old","ts_ms":1,"credential_id":null,"model":"claude-opus-4-8","is_streaming":false,"input_tokens":1,"output_tokens":1,"credits_used":null,"latency_ms":1,"first_token_ms":null,"outcome":"success","retries":0,"error_message":null,"session_id":null}"#;
+        let old: RequestRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            old.first_attempted_credential_id, None,
+            "历史 JSONL 缺字段必须回落 None，不炸反序列化"
+        );
     }
 
     /// 映射双口径：序列化 roundtrip 保留两个字段，且旧 JSONL（缺字段）反序列化不炸。

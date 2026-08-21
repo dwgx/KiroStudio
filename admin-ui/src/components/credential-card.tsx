@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { Settings, RefreshCw, Wallet, Trash2, Loader2, ClipboardCopy, ShieldAlert, Gauge, Check, Ban, Power } from 'lucide-react'
+import { Settings, RefreshCw, Wallet, Trash2, Loader2, ClipboardCopy, ShieldAlert, Gauge, Check, Ban, Power, KeyRound } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -24,6 +24,7 @@ import {
 } from '@/components/ui/dialog'
 import type { CredentialStatusItem, BalanceResponse, OnboardingDiagnosis } from '@/types/api'
 import { cn, copyToClipboard, extractErrorMessage, extractDiagnosis } from '@/lib/utils'
+import { cooldownReasonLabel, isRateLimitCooldown } from '@/lib/cooldown'
 import {
   formatCredits,
   formatLastUsed,
@@ -41,6 +42,7 @@ import {
   setCredentialAllowedModels,
   probeUpstreamModels,
   reprobeRegion,
+  exportCredential,
 } from '@/api/credentials'
 import { authShortLabel, disabledReasonLabel, subscriptionLabel } from '@/lib/i18n-labels'
 import {
@@ -50,11 +52,11 @@ import {
   useSetCustomApiConfig,
   useSetCredentialEndpoint,
   useSetCredentialApiRegion,
-  useSetCredentialDeepseekNormalize,
   useSetCredentialModelMappingExempt,
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
+  useUpdateRefreshToken,
   useCachedBalances,
   useConfigSnapshot,
 } from '@/hooks/use-credentials'
@@ -134,6 +136,16 @@ export function CredentialCard({
   const [showSettings, setShowSettings] = useState(false)
   const [priorityValue, setPriorityValue] = useState(credential.priority)
   const [rpmLimitValue, setRpmLimitValue] = useState(credential.rpmLimit ?? 0)
+  // 打开弹框瞬间把本地编辑值同步到最新 prop：上次打开改了值未保存就关闭的遗留值
+  // 不得留在输入框（否则用户没动输入框点保存 = 提交遗留旧值覆盖远端新值）。
+  // 依赖数组刻意只留 showSettings：打开期间轮询刷新的新值不得改写正在编辑的输入框。
+  useEffect(() => {
+    if (showSettings) {
+      setPriorityValue(credential.priority)
+      setRpmLimitValue(credential.rpmLimit ?? 0)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showSettings])
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
   // 超额（Overage）开关：真开关接线状态
   const [overageBusy, setOverageBusy] = useState(false)
@@ -141,6 +153,8 @@ export function CredentialCard({
   // 别名/备注编辑：设置弹框内输入框的本地值 + 保存中状态
   const [nameValue, setNameValue] = useState(credential.name ?? '')
   const [savingName, setSavingName] = useState(false)
+  // 点击掩码复制完整 Key：防重复点击（敏感导出端点，与设置页 copyOne 同模式）。
+  const [copyKeyBusy, setCopyKeyBusy] = useState(false)
 
   // 单凭证代理编辑：URL(留空回退全局,"direct"不走代理) + 账密(留空不改)。立即生效无需重启。
   const [proxyValue, setProxyValue] = useState(credential.proxyUrl ?? '')
@@ -153,7 +167,6 @@ export function CredentialCard({
   const [customApiKeyInput, setCustomApiKeyInput] = useState('')
   const [customRequestLimit, setCustomRequestLimit] = useState(credential.requestLimit ?? 0)
   const [customResetCount, setCustomResetCount] = useState(false)
-  const [customDeepseek, setCustomDeepseek] = useState(credential.deepseekNormalize ?? false)
   const [customMappingExempt, setCustomMappingExempt] = useState(credential.modelMappingExempt ?? false)
   // 上游模型探测：模型只能从上游获取（不硬编码）。探测结果 + 勾选（写 allowed_models）。
   const [upstreamModels, setUpstreamModels] = useState<string[] | null>(null)
@@ -164,6 +177,9 @@ export function CredentialCard({
 
   // 刷新 Token 失败诊断（结构化，如 client 过期引导重新上号）。
   const [refreshDiagnosis, setRefreshDiagnosis] = useState<OnboardingDiagnosis | null>(null)
+  // 「更新 Token」弹框：粘贴新的 refreshToken（InvalidRefreshToken 禁用后的自助恢复通道）。
+  const [showUpdateTokenDialog, setShowUpdateTokenDialog] = useState(false)
+  const [updateTokenValue, setUpdateTokenValue] = useState('')
   // 「重新探测 region」在途状态（探测会打真实上游往返，期间按钮转圈 + 禁用其它 region 操作）。
   const [reprobeBusy, setReprobeBusy] = useState(false)
 
@@ -177,7 +193,6 @@ export function CredentialCard({
   const setCustomApiConfig = useSetCustomApiConfig()
   const setEndpoint = useSetCredentialEndpoint()
   const setApiRegion = useSetCredentialApiRegion()
-  const setDeepseekNormalize = useSetCredentialDeepseekNormalize()
   const setMappingExempt = useSetCredentialModelMappingExempt()
   // 可选端点由后端注册表给出（config.endpointNames），不在前端硬编码 ide/cli——
   // 后端加了新端点，面板自动多一个按钮。
@@ -186,6 +201,7 @@ export function CredentialCard({
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
+  const updateRefreshTokenMut = useUpdateRefreshToken()
 
   // 冷却倒计时：以 query 返回的 cooldownRemainingMs 为基准，本地每秒递减（到 0 后靠下次 query 刷新自然消失）。
   const [cooldownMs, setCooldownMs] = useState(credential.cooldownRemainingMs ?? 0)
@@ -207,7 +223,31 @@ export function CredentialCard({
   // 冷却剩余秒数（向上取整，避免刚进入就显示 0）。
   const cooldownSeconds = Math.ceil(cooldownMs / 1000)
   // 速率限制（429）用琥珀，其它原因（服务错误 / Token 刷新失败等）用红。
-  const cooldownIsRateLimit = credential.cooldownReason === '速率限制'
+  // 判据走稳定枚举码 cooldownCode（缺失时返回 false 走红色分支，无害降级）。
+  const cooldownIsRateLimit = isRateLimitCooldown(credential.cooldownCode)
+  // 冷却原因展示文案：已知 code 走 i18n，未知/老后端 fallback 后端中文原串。
+  const cooldownReasonText = cooldownReasonLabel(credential.cooldownCode, credential.cooldownReason, t)
+
+  // 点击掩码复制完整 Key：exportCredential 拿真值（与设置页 copyOne 同模式），
+  // 取 kiroApiKey 字段（后端 export 返回 camelCase KiroCredentials，只有 api_key 号有掩码）。
+  const handleCopyFullKey = async () => {
+    if (copyKeyBusy) return
+    setCopyKeyBusy(true)
+    try {
+      const obj = await exportCredential(credential.id)
+      const key = typeof obj.kiroApiKey === 'string' ? obj.kiroApiKey : ''
+      if (!key) {
+        toast.error(t('credentialcard.toast.apiKeyMissing'))
+        return
+      }
+      const ok = await copyToClipboard(key)
+      ok ? toast.success(t('credentialcard.toast.apiKeyCopied')) : toast.error(t('credentialcard.toast.apiKeyCopyFailed'))
+    } catch (err) {
+      toast.error(extractErrorMessage(err))
+    } finally {
+      setCopyKeyBusy(false)
+    }
+  }
 
   // 保存别名/备注：空字符串视为清除（传 null）。成功后刷新凭据列表 + toast。
   const handleSaveName = async () => {
@@ -368,6 +408,10 @@ export function CredentialCard({
   }
 
   const handlePriorityChange = () => {
+    // 与最新 prop 比对：无净变化不提交。改回「打开时的快照值」而远端已在弹框期间
+    // 变化 → 视为有净变化照常提交（所见即所存，用户明确按了保存）；打开瞬间本地
+    // state 已同步为最新 prop，没动输入框时两者恒等，不会拿旧值覆盖远端新值。
+    if (priorityValue === credential.priority) return
     const newPriority = priorityValue
     if (isNaN(newPriority) || newPriority < 0) {
       toast.error(t('credentialcard.toast.priorityInvalid'))
@@ -383,6 +427,8 @@ export function CredentialCard({
   }
 
   const handleRpmLimitChange = () => {
+    // 同上：与最新 prop 比对，无净变化不提交。
+    if (rpmLimitValue === (credential.rpmLimit ?? 0)) return
     const v = rpmLimitValue
     if (isNaN(v) || v < 0) {
       toast.error(t('credentialcard.toast.rpmInvalid'))
@@ -482,6 +528,34 @@ export function CredentialCard({
     })
   }
 
+  /**
+   * 手动更新 refreshToken：号被 InvalidRefreshToken 禁用后（或需要轮换 token 时），
+   * 从 Kiro IDE 拷贝新 token 粘贴提交。成功 toast 后端 message + 关弹框 + 清输入，
+   * 失败 extractErrorMessage 原样提示（错误体字段名与刷新/诊断路径一致）。
+   */
+  const handleUpdateToken = () => {
+    const token = updateTokenValue.trim()
+    if (!token) {
+      toast.error(t('credentialcard.updateToken.emptyError'))
+      return
+    }
+    updateRefreshTokenMut.mutate(
+      { id: credential.id, refreshToken: token },
+      {
+        onSuccess: (res) => {
+          setShowUpdateTokenDialog(false)
+          setUpdateTokenValue('')
+          // 后端更新后不清 disabled：新 token 是否有效要等下次刷新才验证，
+          // 必须提示用户手动重新启用该凭据，否则会一直停在禁用态。
+          toast.success(res.message + t('credentialcard.updateToken.successHint'))
+        },
+        onError: (err) => {
+          toast.error(t('credentialcard.toast.operationFailed') + extractErrorMessage(err))
+        },
+      }
+    )
+  }
+
 
   const handleDelete = () => {
     if (!credential.disabled) {
@@ -573,7 +647,6 @@ export function CredentialCard({
   const handleCardContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
     if ((e.target as HTMLElement).closest(INTERACTIVE_SELECTOR)) return
     e.preventDefault()
-    setPriorityValue(credential.priority)
     setNameValue(credential.name ?? '')
     setShowSettings(true)
   }
@@ -655,9 +728,8 @@ export function CredentialCard({
   }
 
   // 打开本卡设置弹框（齿轮 / 右键 / 行视图「编辑…」三处共用同一份初始化）。
+  // priority/rpmLimit 本地编辑值统一由 showSettings effect 在打开瞬间同步到最新 prop。
   const openSettings = () => {
-    setPriorityValue(credential.priority)
-    setRpmLimitValue(credential.rpmLimit ?? 0)
     setNameValue(credential.name ?? '')
     setShowSettings(true)
   }
@@ -770,10 +842,30 @@ export function CredentialCard({
               <Gauge className="h-4 w-4 shrink-0 animate-pulse" />
               <span className="min-w-0 truncate">
                 {t('credentialcard.cooldown.label')}
-                {credential.cooldownReason ? ` · ${credential.cooldownReason}` : ''}
+                {cooldownReasonText ? ` · ${cooldownReasonText}` : ''}
                 {' · '}{t('credentialcard.cooldown.remaining')}
                 <span className="tabular-nums">{cooldownSeconds}</span>s
               </span>
+            </div>
+          )}
+
+          {/* InvalidRefreshToken 禁用引导：自助恢复通道入口（用户不用再删号重加）。
+              醒目琥珀横幅 + 提示去 Kiro IDE 拷新 token，点按钮直达「更新 Token」弹框。 */}
+          {credential.disabled && credential.disabledReason === 'InvalidRefreshToken' && (
+            <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-300">
+              <ShieldAlert className="h-4 w-4 shrink-0 mt-0.5" />
+              <div className="min-w-0 flex-1 space-y-1.5">
+                <p className="font-medium">{t('credentialcard.updateToken.invalidHint')}</p>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 border-amber-500/40 bg-transparent text-amber-300 hover:bg-amber-500/20 hover:text-amber-200"
+                  onClick={() => { setUpdateTokenValue(''); setShowUpdateTokenDialog(true) }}
+                >
+                  <KeyRound className="h-3.5 w-3.5 mr-1" />
+                  {t('credentialcard.updateToken.action')}
+                </Button>
+              </div>
             </div>
           )}
 
@@ -922,7 +1014,23 @@ export function CredentialCard({
             {credential.maskedApiKey && (
               <div className="col-span-2">
                 <span className="text-muted-foreground">{t('credentialcard.info.apiKey')}</span>
-                <span className="font-mono font-medium">{credential.maskedApiKey}</span>
+                {/* 点击掩码复制完整 Key（exportCredential 拿真值，与设置页 copyOne 同模式）。 */}
+                <span
+                  className={cn('font-mono font-medium', copyKeyBusy ? 'cursor-wait opacity-60' : 'cursor-pointer')}
+                  title={copyKeyBusy ? t('credentialcard.info.copyKeyBusy') : t('credentialcard.info.copyKeyTitle')}
+                  aria-label={copyKeyBusy ? t('credentialcard.info.copyKeyBusy') : t('credentialcard.info.copyKeyTitle')}
+                  role="button"
+                  tabIndex={0}
+                  onClick={handleCopyFullKey}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault()
+                      handleCopyFullKey()
+                    }
+                  }}
+                >
+                  {credential.maskedApiKey}
+                </span>
               </div>
             )}
             {/* 超额（Overage）开关已移入「设置」弹框（齿轮），保持卡片主体信息网格干净。 */}
@@ -942,6 +1050,7 @@ export function CredentialCard({
                       variant="ghost"
                       className="h-6 w-6 shrink-0 p-0"
                       title={t('credentialcard.info.copyProxyTitle')}
+                      aria-label={t('credentialcard.info.copyProxyTitle')}
                       onClick={async (e) => {
                         e.stopPropagation()
                         const ok = await copyToClipboard(credential.proxyUrl!)
@@ -979,6 +1088,20 @@ export function CredentialCard({
             >
               <RefreshCw className={`h-4 w-4 mr-1 ${forceRefresh.isPending ? 'animate-spin' : ''}`} />
               {t('credentialcard.action.refreshToken')}
+            </Button>
+            )}
+            {!isCustomApi && (
+            /* 更新 Token：手动粘贴新 refreshToken（InvalidRefreshToken 禁用后的自助恢复通道，
+               与上方「强制刷新」不同——那是让后端用旧 token 向上游换新，这直接写入新 token）。 */
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => { setUpdateTokenValue(''); setShowUpdateTokenDialog(true) }}
+              disabled={updateRefreshTokenMut.isPending || credential.authMethod === 'api_key'}
+              title={credential.authMethod === 'api_key' ? t('credentialcard.action.refreshTokenApiKeyTitle') : t('credentialcard.updateToken.actionTitle')}
+            >
+              <KeyRound className={`h-4 w-4 mr-1 ${updateRefreshTokenMut.isPending ? 'animate-spin' : ''}`} />
+              {t('credentialcard.updateToken.action')}
             </Button>
             )}
             {!isCustomApi && (
@@ -1022,6 +1145,39 @@ export function CredentialCard({
         </CardContent>
       </Card>
       )}
+      {/* 更新 Token 对话框：粘贴新 refreshToken（InvalidRefreshToken 禁用后的自助恢复通道）。
+          粘贴样式复用 add-credential-dialog 的 textarea 惯例（font-mono + 等宽大输入区）。 */}
+      <Dialog open={showUpdateTokenDialog} onOpenChange={setShowUpdateTokenDialog}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>{t('credentialcard.updateToken.dialogTitle', { id: credential.id })}</DialogTitle>
+            <DialogDescription>{t('credentialcard.updateToken.description')}</DialogDescription>
+          </DialogHeader>
+          <textarea
+            value={updateTokenValue}
+            onChange={(e) => setUpdateTokenValue(e.target.value)}
+            disabled={updateRefreshTokenMut.isPending}
+            placeholder={t('credentialcard.updateToken.placeholder')}
+            aria-label={t('credentialcard.updateToken.aria')}
+            className="flex min-h-[160px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
+          />
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setShowUpdateTokenDialog(false)}
+              disabled={updateRefreshTokenMut.isPending}
+            >
+              {t('credentialcard.updateToken.cancel')}
+            </Button>
+            <Button onClick={handleUpdateToken} disabled={updateRefreshTokenMut.isPending}>
+              {updateRefreshTokenMut.isPending
+                ? t('credentialcard.updateToken.submitting')
+                : t('credentialcard.updateToken.submit')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       {/* 设置对话框：集中别名/代理/超额/优先级/RPM/启用/删除。
           紧凑化：调度参数与开关双列并排、次要项(删除)收进底部危险区、
           弹框限高 max-h 内部滚动而非整页滚。 */}
@@ -1043,6 +1199,7 @@ export function CredentialCard({
               <label className="text-sm font-medium">{t('credentialcard.settings.aliasLabel')}</label>
               <div className="flex items-center gap-2">
                 <Input
+                  id="cred-alias"
                   value={nameValue}
                   onChange={(e) => setNameValue(e.target.value)}
                   placeholder={t('credentialcard.settings.aliasPlaceholder')}
@@ -1077,6 +1234,7 @@ export function CredentialCard({
               </p>
               <div className="flex items-center gap-2">
                 <Input
+                  id="cred-proxy-url"
                   value={proxyValue}
                   onChange={(e) => setProxyValue(e.target.value)}
                   placeholder={t('credentialcard.settings.proxyPlaceholder')}
@@ -1102,6 +1260,7 @@ export function CredentialCard({
               {/* 代理账号 + 密码并排一行 */}
               <div className="grid grid-cols-2 gap-2">
                 <Input
+                  id="cred-proxy-user"
                   value={proxyUser}
                   onChange={(e) => setProxyUser(e.target.value)}
                   placeholder={t('credentialcard.settings.proxyUserPlaceholder')}
@@ -1110,6 +1269,7 @@ export function CredentialCard({
                   aria-label={t('credentialcard.settings.proxyUserAria')}
                 />
                 <Input
+                  id="cred-proxy-pass"
                   type="password"
                   value={proxyPass}
                   onChange={(e) => setProxyPass(e.target.value)}
@@ -1131,6 +1291,7 @@ export function CredentialCard({
                 <div className="space-y-1.5">
                   <label className="text-xs text-muted-foreground">{t('credentialcard.settings.baseUrlLabel')}</label>
                   <Input
+                    id="cred-base-url"
                     value={customBaseUrl}
                     onChange={(e) => {
                       setCustomBaseUrl(e.target.value)
@@ -1150,6 +1311,7 @@ export function CredentialCard({
                 <div className="space-y-1.5">
                   <label className="text-xs text-muted-foreground">{t('credentialcard.settings.upstreamKeyLabel')}</label>
                   <Input
+                    id="cred-upstream-key"
                     type="password"
                     value={customApiKeyInput}
                     onChange={(e) => setCustomApiKeyInput(e.target.value)}
@@ -1170,30 +1332,6 @@ export function CredentialCard({
                     aria-label={t('credentialcard.settings.requestLimitAria')}
                   />
                 </div>
-                {/* deepseek 协议归一化：开启后透传前修复请求体（模型名→deepseek-v4-flash、
-                    thinking/effort 归一化、多轮 thinking 注入等），兼容 opencodezen 类上游。
-                    即时保存（开关变化即调后端，不并入「保存自定义 API」按钮）。 */}
-                <label className="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
-                  <Checkbox
-                    checked={customDeepseek}
-                    onCheckedChange={(v) => {
-                      const next = v === true
-                      setCustomDeepseek(next)
-                      setDeepseekNormalize.mutate(
-                        { id: credential.id, enabled: next },
-                        {
-                          onSuccess: () => toast.success(t('credentialcard.toast.deepseekSaved')),
-                          onError: (err) =>
-                            toast.error(t('credentialcard.toast.operationFailed') + (err as Error).message),
-                        }
-                      )
-                    }}
-                    className="h-3.5 w-3.5"
-                    aria-label={t('credentialcard.settings.deepseekNormalizeAria')}
-                  />
-                  {t('credentialcard.settings.deepseekNormalizeLabel')}
-                </label>
-
                 {/* 上游模型探测：模型只能从上游获取（不硬编码）。探测结果勾选 = allowed_models 白名单。 */}
                 <div className="space-y-1.5 border-t pt-3">
                   <div className="flex items-center justify-between gap-2">
@@ -1323,6 +1461,7 @@ export function CredentialCard({
                     onClick={handlePriorityChange}
                     disabled={setPriority.isPending || priorityValue === credential.priority}
                     title={t('credentialcard.settings.savePriorityTitle')}
+                    aria-label={t('credentialcard.settings.savePriorityTitle')}
                   >
                     {setPriority.isPending ? (
                       <Loader2 className="h-4 w-4 animate-spin" />
@@ -1351,6 +1490,7 @@ export function CredentialCard({
                     onClick={handleRpmLimitChange}
                     disabled={setRpmLimit.isPending || rpmLimitValue === (credential.rpmLimit ?? 0)}
                     title={t('credentialcard.settings.saveRpmTitle')}
+                    aria-label={t('credentialcard.settings.saveRpmTitle')}
                   >
                     {setRpmLimit.isPending ? (
                       <Loader2 className="h-4 w-4 animate-spin" />

@@ -18,6 +18,8 @@ export function LoginPage({ onLogin }: LoginPageProps) {
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
+    // adminKey 存 sessionStorage(见 lib/storage.ts):关闭浏览器标签即退出,
+    // 新开标签/重启浏览器后这里读不到,需要重新登录——这是刻意的安全取舍。
     const savedKey = storage.getApiKey()
     if (savedKey) {
       setApiKey(savedKey)
@@ -138,12 +140,14 @@ export function LoginPage({ onLogin }: LoginPageProps) {
           <div className="mb-4">
             <div className="flex items-center gap-2 mb-2">
               <KeyRound style={{ width: '14px', height: '14px', color: '#666' }} />
-              <label style={{ fontSize: '12px', color: '#888', fontWeight: 500 }}>
+              <label htmlFor="admin-api-key" style={{ fontSize: '12px', color: '#888', fontWeight: 500 }}>
                 Admin API Key
               </label>
             </div>
             <input
+              id="admin-api-key"
               type="password"
+              autoComplete="current-password"
               placeholder={t('loginpage.input.apiKeyPlaceholder')}
               value={apiKey}
               onChange={(e) => { setApiKey(e.target.value); if (error) setError(null) }}
@@ -200,7 +204,7 @@ export function LoginPage({ onLogin }: LoginPageProps) {
             }}
           >
             {verifying && <Loader2 style={{ width: '15px', height: '15px' }} className="animate-spin" />}
-            {verifying ? t('loginpage.button.verifying') : '登录'}
+            {verifying ? t('loginpage.button.verifying') : t('loginpage.button.login')}
           </button>
         </form>
 

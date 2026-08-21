@@ -615,7 +615,10 @@ function GroupRankList({
             <div className="flex justify-between text-[10px] text-muted-foreground tabular-nums">
               <span>{compact(r.input_tokens + r.output_tokens)} tokens</span>
               <span>
-                {r.credits_used.toFixed(2)} credits · {Math.round(r.avg_latency_ms)}ms
+                {r.credits_used.toFixed(2)} credits
+                {/* 估算成本列：后端按 config 单价表推算；0/缺省（无单价表）不显示 */}
+                {r.cost !== undefined && r.cost > 0 ? ` · ¥${r.cost.toFixed(2)}` : ''} ·{' '}
+                {Math.round(r.avg_latency_ms)}ms
               </span>
             </div>
             {/* 缓存列：缓存读总量 + 命中占比（估算值）。写入恒 0 时只在 tooltip 交代，不占版面。 */}
@@ -875,13 +878,15 @@ const OUTCOME_LABEL_KEYS: Record<RequestOutcome, string> = {
   bad_request: 'usagepage.outcome.badRequest',
   network_error: 'usagepage.outcome.networkError',
   model_unavailable: 'usagepage.outcome.modelUnavailable',
+  empty_response: 'usagepage.outcome.emptyResponse',
+  interrupted: 'usagepage.outcome.interrupted',
   other_error: 'usagepage.outcome.otherError',
 }
 
 // 结果分类 → tinted badge 语义色：成功绿 / 限流·额度黄 / 其余红
 function outcomeVariant(o: RequestOutcome): 'success' | 'warning' | 'destructive' {
   if (o === 'success') return 'success'
-  if (o === 'rate_limited' || o === 'quota_exhausted') return 'warning'
+  if (o === 'rate_limited' || o === 'quota_exhausted' || o === 'interrupted') return 'warning'
   return 'destructive'
 }
 
@@ -927,6 +932,8 @@ function RequestDetail({ record: r }: { record: RequestRecord }) {
   const dev = deviceMeta(r.client_device, t)
   // 设备三维拼一行：主类 + OS + 浏览器，各自有值才拼。
   const deviceLine = [dev.label, r.client_os, r.client_browser].filter(Boolean).join(' · ')
+  // 断流字节：后端已落库（interrupted_bytes，仅断流时 Some），前端类型未补——此处断言访问。
+  const interrupted = (r as RequestRecord & { interrupted_bytes?: number }).interrupted_bytes
   return (
     <div className="w-[280px] max-w-[80vw] space-y-1.5 text-[11px] leading-relaxed">
       <div className="mb-1 flex items-center justify-between gap-3 border-b border-border/60 pb-1.5">
@@ -975,6 +982,11 @@ function RequestDetail({ record: r }: { record: RequestRecord }) {
         label={t('usagepage.detail.retryStream')}
         value={`${r.retries} ${t('usagepage.detail.timesUnit')} · ${r.is_streaming ? t('usagepage.detail.yes') : t('usagepage.detail.no')}`}
       />
+      {/* 断流字节：仅当有值且 >0 才显示（None=正常收尾，0=一个字节没收到就断了）。
+          i18n: usagepage.detail.interrupted（主会话补三语） */}
+      {interrupted != null && interrupted > 0 && (
+        <DetailRow label={t('usagepage.detail.interrupted')} value={`${Math.round(interrupted / 1024)} KB`} />
+      )}
       {r.session_id && <DetailRow label={t('usagepage.detail.sessionWindow')} value={r.session_id} />}
       <DetailRow label={t('usagepage.detail.requestId')} value={r.request_id} />
       {r.error_message && (
@@ -995,6 +1007,8 @@ function RequestDetailSpread({ record: r }: { record: RequestRecord }) {
   const deviceLine = [dev.label, r.client_os, r.client_browser].filter(Boolean).join(' · ')
   const cacheR = r.cache_read_tokens ?? 0
   const cacheW = r.cache_creation_tokens ?? 0
+  // 断流字节：后端已落库（interrupted_bytes，仅断流时 Some），前端类型未补——此处断言访问。
+  const interrupted = (r as RequestRecord & { interrupted_bytes?: number }).interrupted_bytes
   // 字段项:label + value,自动流式排布(auto-fill 网格,窄屏少列宽屏多列,自然铺成几行)。
   const items: { label: string; value: React.ReactNode; mono?: boolean }[] = [
     { label: t('usagepage.detail.time'), value: new Date(r.ts_ms).toLocaleString() },
@@ -1012,6 +1026,9 @@ function RequestDetailSpread({ record: r }: { record: RequestRecord }) {
     ...(r.credits_used != null ? [{ label: 'Credits', value: r.credits_used.toFixed(2) }] : []),
     { label: t('usagepage.detail.latency'), value: `${r.latency_ms.toLocaleString()}ms${r.first_token_ms != null ? ` · ${t('usagepage.detail.firstToken')} ${r.first_token_ms.toLocaleString()}ms` : ''}` },
     { label: t('usagepage.detail.retryStream'), value: `${r.retries} ${t('usagepage.detail.timesUnit')} · ${r.is_streaming ? t('usagepage.detail.yes') : t('usagepage.detail.no')}` },
+    // 断流字节：仅当有值且 >0 才显示（None=正常收尾，0=一个字节没收到就断了）。
+    // i18n: usagepage.detail.interrupted（主会话补三语）
+    ...(interrupted != null && interrupted > 0 ? [{ label: t('usagepage.detail.interrupted'), value: `${Math.round(interrupted / 1024)} KB`, mono: false }] : []),
     ...(r.session_id ? [{ label: t('usagepage.detail.sessionWindow'), value: r.session_id }] : []),
     { label: t('usagepage.detail.requestId'), value: r.request_id },
   ]
@@ -1261,9 +1278,11 @@ function RecentRequestsPanel({
         <div className="relative flex-1 min-w-[180px]">
           <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           <input
+            id="usage-search"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder={t('usagepage.recent.searchPlaceholder')}
+            aria-label={t('usagepage.recent.searchAria')}
             className="h-8 w-full rounded-md border border-border bg-secondary/40 pl-8 pr-7 text-xs outline-none focus:border-border-hover"
           />
           {query && (

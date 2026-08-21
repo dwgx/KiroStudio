@@ -5,6 +5,11 @@
 //! 到 `base_url`、换用该凭据的 api_key,响应流**原样回**给客户端。入口=出口=Anthropic,
 //! 零协议转换——效果等同用户直接拿那个 key 打上游。
 //!
+//! 请求体契约（P1-11）：**字节级**转发 `raw_body`，除非全局 `model_mapping` **实际改写**
+//! 了顶层 `model`。凭据豁免 / 规则表空 / `map_target` 未命中 / 非 JSON → 不 parse+serialize
+//! （避免 serde_json 默认 BTreeMap 把 key 按字典序重排，破坏上游字节前缀缓存）。
+//! 响应侧 thinking 过滤见 `passthrough_think_filter`：未改写的 SSE 事件同样回原字节。
+//!
 //! ⚠️ 与 Kiro 主路径完全隔离:透传响应**绝不进** Kiro 的 event-stream 解码器 / StreamContext,
 //! 而是把上游的字节流原样 [`Body::from_stream`] 回去。Kiro 转发路径一行不改。
 
@@ -16,7 +21,6 @@ use bytes::Bytes;
 use futures::TryStreamExt;
 
 use crate::common::http_read::read_body_capped;
-use crate::http_client::{ProxyConfig, build_streaming_client_no_redirect};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::passthrough_think_filter::{
     filter_json_bytes_with, filter_sse_stream_with, guard_empty_stream,
@@ -33,50 +37,19 @@ const PASSTHROUGH_JSON_CAP_BYTES: u64 = 32 * 1024 * 1024;
 /// 4 MiB 对模型列表绰绰有余（几百个模型也只有几十 KB）。
 const PASSTHROUGH_MODELS_CAP_BYTES: u64 = 4 * 1024 * 1024;
 
-/// 透传出站 client 缓存：key = `(effective_proxy, tls_backend)`。
-///
-/// # 🔴 这是 `error sending request for url` 的结构性根因修复
-///
-/// 改前 `forward` **每次请求**都调 `build_streaming_client_no_redirect` 新建一个
-/// `reqwest::Client`。每个 Client 自带独立连接池，用完即弃 ⇒ 每请求重开 TCP +
-/// 重做 TLS 握手（1-2 RTT）+ 重新解析系统代理（crate 开了 system-proxy feature）。
-/// 高并发下 ephemeral 端口与 TIME_WAIT 堆积，握手延迟白加在 connect_timeout 里，
-/// 表现为**间歇性** `error sending request`（线上 10:35/10:46/11:00 三次，
-/// 而 `api.skiapi.dev` 实测是活的 —— 不是上游挂了）。
-///
-/// 主路径 `provider.rs::client_for` 早就做对了（`client_cache: Mutex<HashMap>`），
-/// **只有透传路径漏了这层**。这里同构复用那个范式，不新造缓存机制。
-///
-/// 用 `OnceLock` 而非 provider 字段：透传是自由函数（`forward` / `fetch_upstream_models`），
-/// 没有 `&self` 可挂；且 Client 内部本就是 `Arc`，进程级共享一份连接池正是我们要的。
-static PASSTHROUGH_CLIENTS: std::sync::OnceLock<
-    parking_lot::Mutex<std::collections::HashMap<(Option<ProxyConfig>, TlsBackend), reqwest::Client>>,
-> = std::sync::OnceLock::new();
-
-/// 取（或懒建并缓存）透传出站 client。
-///
-/// `idle_secs` 只在**首次**建该 key 的 client 时生效 —— 这是刻意的：同一个
-/// (proxy, tls) 组合复用同一个连接池才有意义，为不同 idle 超时各建一份会把池打散、
-/// 退化回改前的行为。`forward`(720s 长流) 与 `fetch_upstream_models`(30s) 因此共享
-/// 同一个 client，用 720s 的宽松 read_timeout —— 对模型列表这种短请求无害
-/// （它有自己的整体超时由调用方控制），而反过来（用 30s）会把长流式响应掐断。
-fn passthrough_client(
-    proxy: Option<&ProxyConfig>,
-    tls_backend: TlsBackend,
-) -> anyhow::Result<reqwest::Client> {
-    let cache = PASSTHROUGH_CLIENTS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
-    let key = (proxy.cloned(), tls_backend);
-    // 临界区只做 HashMap 查找与 Arc clone（Client 是 Arc 包装），无 IO、无 await。
-    if let Some(c) = cache.lock().get(&key) {
-        return Ok(c.clone());
-    }
-    // 建 client 放在锁**外**：build 会解析代理 URL / 初始化 TLS，不该持锁做。
-    // 竞态下可能有两个线程各建一份，用 entry().or_insert_with 收敛成一份，
-    // 多建的那个直接被丢弃（无副作用，只浪费一次构造）。
-    let built = build_streaming_client_no_redirect(proxy, 720, tls_backend)?;
-    let mut guard = cache.lock();
-    Ok(guard.entry(key).or_insert(built).clone())
-}
+// 🔴 M8：透传出站 client 统一走 `http_client::pinned_streaming_client` ——
+// 每次出站前**运行时 SSRF 复验 + DNS 固化**（见该函数文档）。
+//
+// 背景：`forward` / `fetch_upstream_models` 原先用 `build_streaming_client_no_redirect`
+// （普通 client），base_url 只在**写入配置时**校验一次，之后域名由 reqwest 每请求
+// 重新解析 —— DNS rebinding（写入时公网、运行时内网）可绕过写入时校验。pinned
+// client 用与写入时**相同策略**（`AdminConfigured`：本机代挂 127.0.0.1 / fake-IP
+// 段放行，私网/元数据拒绝）复验，并把解析结果 `resolve_to_addrs` 固化 —— 校验与
+// 连接共用同一份解析结果，无 TOCTOU 窗口；合法显式内网配置不受影响。
+//
+// 连接池按 (host, proxy, tls) 缓存（缓存实现在 http_client.rs）：解析结果未变化时
+// 复用 client，保留旧 `PASSTHROUGH_CLIENTS` 的「不每请求新建、避免 `error sending
+// request`」语义；变化时才重建。
 
 /// 🔴 P4：按白名单把上游响应头透传给客户端。
 ///
@@ -116,6 +89,49 @@ fn apply_upstream_response_headers(
     builder
 }
 
+/// 被动配额观测（sub2api 借鉴；**纯观测，不参与选号/调度**）。
+///
+/// 现状核查（2026-08-14）：P4 白名单已把配额头**透传给客户端**（让客户端能主动
+/// 限速），但网关自身从不读取它们 —— 上游的配额余量只进客户端、不落日志，运维侧
+/// 看不到「哪个号快被限流了」。这里在成功路径上把配额头摘出来落一条 debug 日志。
+///
+/// 刻意不升级 info：成功路径每请求都走，info 会刷爆日志；失败路径已有上游错误
+/// 原文日志（含 `Retry-After` 语义，见 `upstream_trace`）。
+///
+/// ⚠️ 范围声明：完整目标（写进凭据余额缓存、面板展示）需要 `admin::service` 的
+/// 余额缓存写入口，超出本模块边界；此处只做日志观测，先把数据留下来。
+/// 从上游响应头摘配额头（x-ratelimit-* 优先，anthropic-ratelimit-* 兜底）。
+///
+/// 2026-08-15 补 anthropic-ratelimit-* 三键：P4 白名单已透传这两族配额头给客户端，
+/// 观测侧只读 x-ratelimit-* 会让 Anthropic 兼容上游（deepseek 等）的配额余量
+/// 完全不落日志。Anthropic 的 requests 维度键名与 OpenAI 的 x-ratelimit-* 对等。
+fn quota_headers(
+    headers: &axum::http::HeaderMap,
+) -> (Option<&str>, Option<&str>, Option<&str>) {
+    let get = |n: &str| headers.get(n).and_then(|v| v.to_str().ok());
+    let limit = get("x-ratelimit-limit")
+        .or_else(|| get("anthropic-ratelimit-requests-limit"));
+    let remaining = get("x-ratelimit-remaining")
+        .or_else(|| get("anthropic-ratelimit-requests-remaining"));
+    let reset = get("x-ratelimit-reset")
+        .or_else(|| get("anthropic-ratelimit-requests-reset"));
+    (limit, remaining, reset)
+}
+
+fn observe_upstream_quota_headers(upstream_headers: &axum::http::HeaderMap, base_url: &str) {
+    let (limit, remaining, reset) = quota_headers(upstream_headers);
+    if limit.is_none() && remaining.is_none() && reset.is_none() {
+        return;
+    }
+    tracing::debug!(
+        base_url = %base_url,
+        limit = limit.unwrap_or("-"),
+        remaining = remaining.unwrap_or("-"),
+        reset = reset.unwrap_or("-"),
+        "[透传] 上游配额头（被动观测，仅记录不参与调度）"
+    );
+}
+
 /// 把一次 Anthropic 请求原样透传到自定义 API 上游,响应流式原样返回。
 ///
 /// - `cred`:命中的自定义 API 凭据(提供 base_url / api_key / 代理)。
@@ -128,7 +144,7 @@ fn apply_upstream_response_headers(
 // 🔴 **首字节（响应头）超时**（2026-08-10 补，实测缺口）。
 //
 // 为什么不能只靠 client 的 720s `read_timeout`：那个值是**流式空闲间隔**，
-// 刻意放宽到 720s 以防长回复被中途掐断（见 `passthrough_client` 的注释），
+// 刻意放宽到 720s 以防长回复被中途掐断（见 `pinned_streaming_client` 的取值），
 // 但它同时也成了"等响应头"的上限 —— 上游若接受连接却永不回响应头，单跳就能挂 720s。
 //
 // 实测（2026-08-10 真打线上上游）：`claude-nonexistent-zzz` 这类不存在的模型，
@@ -164,15 +180,44 @@ fn apply_upstream_response_headers(
 //   多号池下墙钟仍会在下一轮循环顶部生效，不会无限拖。
 pub const FIRST_BYTE_TIMEOUT_SECS: u64 = 90;
 
+/// 透传请求体的模型映射。
+///
+/// 仅在非豁免且 `map_target` **真正改写**了顶层 `model` 时才 re-serialize。
+/// 豁免 / 规则表空 / 未命中 / 非 JSON → 原样返回 `raw_body`（字节级，不重排 key）。
+fn apply_passthrough_model_mapping(
+    raw_body: Bytes,
+    exempt: bool,
+    model_mapping: &std::collections::HashMap<String, String>,
+) -> Bytes {
+    if exempt || model_mapping.is_empty() {
+        return raw_body;
+    }
+    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&raw_body) else {
+        return raw_body;
+    };
+    let target = {
+        let Some(model) = v.get("model").and_then(|m| m.as_str()) else {
+            return raw_body;
+        };
+        match crate::kiro::model_mapping::map_target(model, model_mapping) {
+            Some(t) => t,
+            None => return raw_body,
+        }
+    };
+    v["model"] = serde_json::json!(target);
+    serde_json::to_vec(&v)
+        .map(Bytes::from)
+        .unwrap_or(raw_body)
+}
+
 pub async fn forward(
     cred: &KiroCredentials,
     raw_body: Bytes,
     global_proxy: Option<&crate::http_client::ProxyConfig>,
     tls_backend: TlsBackend,
-    global_deepseek_cfg: &crate::kiro::deepseek_normalize::DeepseekNormalizeConfig,
     // 全局模型映射规则（`config.model_mapping`，调用方每次请求快照一次）。
-    // 在 `forward` **内部**应用：与 deepseek 归一化同处，可保证「先映射 → 再归一化」
-    // 的顺序，且 `select_custom_api` 选号（映射前）与改写（映射后）自然分层。
+    // 在 `forward` **内部**应用，`select_custom_api` 选号（映射前）与改写（映射后）
+    // 自然分层。deepseek 归一化已移除（2026-08-16），映射是唯一的模型改写。
     model_mapping: &std::collections::HashMap<String, String>,
     // 客户端原始请求头（P3：按白名单转发 `anthropic-beta` 等；`None` = 不转发任何客户端头）。
     client_headers: Option<&header::HeaderMap>,
@@ -189,90 +234,52 @@ pub async fn forward(
         }
     };
     // Anthropic messages 端点:base 已含 /v1 则不重复拼;否则补 /v1/messages。
-    let url = if base.ends_with("/v1") || base.contains("/v1/") {
-        format!("{base}/messages")
-    } else {
-        format!("{base}/v1/messages")
-    };
+    // ⚠️ 只认 `ends_with("/v1")`（2026-08-15）：`contains("/v1/")` 过宽 —— base 中间
+    // 含 `/v1/`（如 `https://x.com/v1/gateway`）时旧判定误认「已含挂载点」，拼出
+    // `/v1/gateway/messages`，而正确形态是补 `/v1/messages`。
+    let url = messages_endpoint(&base);
 
     // 透传用流式 client:read_timeout(空闲间隔)而非总超时,防长回复被中途掐断
     // (与 Kiro 对话路径同款,根因见 build_streaming_client 注释)。
-    // **禁重定向**(SSRF 纵深):写入 base_url 时已校验目标非内网,但公网中转站若返回
-    // 302→内网/元数据仍能绕过,禁重定向堵死这条链。base_url 的 IP 层校验在写入时做。
+    // **禁重定向 + 运行时 SSRF 复验 + DNS 固化**(M8):写入 base_url 时已校验目标非内网,
+    // 但公网中转站若返回 302→内网/元数据仍能绕过,禁重定向堵死这条链;域名在运行时
+    // 重新解析、DNS rebinding 可绕过写入时校验,`pinned_streaming_client` 每次出站前
+    // 用与写入时相同策略复验并固化解析结果(本机代挂 127.0.0.1 等合法配置不受影响)。
     let proxy = cred.effective_proxy(global_proxy);
-    // 🔴 复用缓存 client（见 `passthrough_client` 的文档）：改前这里每请求新建，
-    // 是线上间歇性 `error sending request` 的结构性根因。
-    let client = match passthrough_client(proxy.as_ref(), tls_backend) {
+    let client = match crate::http_client::pinned_streaming_client(&base, proxy.as_ref(), tls_backend)
+        .await
+    {
         Ok(c) => c,
         Err(e) => {
+            // 归入 `connect_error:` 前缀族:SSRF 复验拒绝是本地判定失败(非上游语义错误),
+            // 调用侧据此不重试、直接换号(该号当前出站目标不可信,重试无意义)。
             return (
                 err_response(
                     StatusCode::BAD_GATEWAY,
-                    &format!("构建透传 client 失败: {e}"),
+                    &format!("透传出站目标校验失败: {e}"),
                 ),
                 StatusCode::BAD_GATEWAY,
-                String::new(),
+                format!("connect_error: 透传出站目标校验失败: {e}"),
             );
         }
     };
 
-    // deepseek 归一化:opencodezen 代挂凭据(deepseekNormalize=true)时,转发前按 fuckopencode
-    // 的 deepseek 协议修复改写请求体(模型名→deepseek-v4-flash、thinking adaptive→enabled、
-    // reasoning_effort→output_config、多轮 tool_use 注入 thinking、剥 context_management 等),
-    // 再原样转发;其余 custom_api 凭据保持零转换透传。
-    // ⚠️ 响应侧 thinking 过滤(thinking disabled 时 deepseek 仍吐 thinking,客户端会报
-    // "Tool result missing")在下方按 content-type 分流处理,仅 deepseek_normalize=true 启用。
+    // 🔴 2026-08-16：deepseek 归一化已完全移除，请求体模型名**原样透传**
+    // （不再有 claude-* → fallback 改写、thinking/effort/tool 字段归一化）。
+    // 唯一的模型改写是下面的全局 `model_mapping` 表（独立功能，保留）。
     //
-    // 配置提前到作用域（body 处理 + 响应过滤共用）：per-凭据覆盖全局标量，bool 取全局。
-    let ds_cfg: Option<crate::kiro::deepseek_normalize::DeepseekNormalizeConfig> =
-        if cred.deepseek_normalize == Some(true) {
-            Some(
-                cred
-                    .deepseek_normalize_config
-                    .as_ref()
-                    .map(|c| c.merge_over(global_deepseek_cfg))
-                    .unwrap_or_else(|| global_deepseek_cfg.clone()),
-            )
-        } else {
-            None
-        };
-    // body 处理链：**先映射 → 再 deepseek 归一化**（顺序承重，反序会让 deepseek 先
-    // 把名压成 fallback、映射规则再也匹配不到原始名）。模型映射只对 custom_api 号在
-    // 非豁免时生效；`select_custom_api` 选号用**映射前**名（决定 3：白名单管原始名）。
+    // body 处理链：全局映射（非豁免时）。模型映射只对 custom_api 号在非豁免时生效；
+    // `select_custom_api` 选号用**映射前**名（白名单判定原始模型名）。
     //
     // ⚠️ 一个**设计明确接受的不对称**（非 bug，见 `model_mapping` 模块文档）：选号侧
-    // 预判的是 deepseek 改写后的名（`token_manager.rs` select_custom_api），映射不进
-    // 预判 ⇒ 「映射后名该号上游不认」时仍可能选中该号 → 上游 400，由凭据豁免覆盖。
+    // 预判的是映射后的名（`token_manager.rs` select_custom_api 的 support_rank），映射
+    // 不进预判 ⇒ 「映射后名该号上游不认」时仍可能选中该号 → 上游 400，由凭据豁免覆盖。
     let exempt = cred.model_mapping_exempt == Some(true);
-    let body_bytes: Bytes = {
-        let parsed = serde_json::from_slice::<serde_json::Value>(&raw_body);
-        match parsed {
-            Ok(mut v) => {
-                // ① 全局模型映射（非豁免时）。透传请求体的模型名在顶层 `model` 字段
-                // （Anthropic 格式），与 Kiro 主路径的
-                // `/conversationState/currentMessage/userInputMessage/modelId` 不同。
-                if !exempt {
-                    if let Some(model) = v.get("model").and_then(|m| m.as_str()) {
-                        if let Some(target) =
-                            crate::kiro::model_mapping::map_target(model, model_mapping)
-                        {
-                            v["model"] = serde_json::json!(target);
-                        }
-                    }
-                }
-                // ② deepseek 归一化（仅该号开启时）。
-                if let Some(cfg) = &ds_cfg {
-                    crate::kiro::deepseek_normalize::normalize_request(
-                        &mut v,
-                        cfg,
-                        cred.allowed_models.as_deref(),
-                    );
-                }
-                serde_json::to_vec(&v).map(Bytes::from).unwrap_or_else(|_| raw_body.clone())
-            }
-            Err(_) => raw_body.clone(), // 非 JSON(理论不该出现),回落原样透传
-        }
-    };
+    // ① 全局模型映射（非豁免时）。透传请求体的模型名在顶层 `model` 字段
+    // （Anthropic 格式），与 Kiro 主路径的
+    // `/conversationState/currentMessage/userInputMessage/modelId` 不同。
+    // 未改写则转发 `raw_body` 原字节（P1-11：禁止无条件 parse+serialize 重排 key）。
+    let body_bytes = apply_passthrough_model_mapping(raw_body, exempt, model_mapping);
 
     // 组装转发请求:换上该凭据的 api_key(Anthropic 双头兼容:x-api-key + Authorization),
     // 带上 anthropic-version(上游中转站通常要求),content-type json。发送处理后的 body。
@@ -400,11 +407,17 @@ pub async fn forward(
         // ⚠️ 必须在 read_body_capped **之前**克隆响应头 —— 它会消费 `upstream`。
         // P4 的关键场景就在这条路径上：429 的 `Retry-After` 只有这里能拿到。
         let upstream_headers = upstream.headers().clone();
-        let err_body = read_body_capped(upstream, "透传上游错误体", UPSTREAM_ERR_PEEK_CAP)
+        // 🔴 M7：错误体保留**原始字节**回给客户端。`read_body_capped` 不解压，
+        // 而白名单已透传 `content-encoding`（见 apply_upstream_response_headers）——
+        // 上游若回 gzip 错误体，客户端必须拿到**压缩字节**才能正确解压；改前
+        // `String::from_utf8_lossy(&b)` 把压缩字节破坏成 UTF-8 替换字符，客户端按
+        // content-encoding 解压必失败。诊断串另用 lossy 副本：日志与调用侧 failover
+        // 分类（子串匹配）读的是文本语义，与透传字节无关。
+        let err_body_raw = read_body_capped(upstream, "透传上游错误体", UPSTREAM_ERR_PEEK_CAP)
             .await
             .ok()
-            .map(|b| String::from_utf8_lossy(&b).trim().to_string())
             .unwrap_or_default();
+        let err_body = err_diag_string(&err_body_raw);
         // 日志按长度截断，避免超长 body 刷爆日志（诊断只需要开头那段 message/reason）。
         let peek: String = err_body.chars().take(400).collect();
         tracing::warn!(
@@ -414,14 +427,7 @@ pub async fn forward(
             "[透传] 上游返回非 2xx —— 上游错误原文（供分类：额度/模型/请求体）"
         );
         // body 已被消费，只能重新构造响应回给客户端（内容逐字节保持上游原文）。
-        let resp = apply_upstream_response_headers(
-            Response::builder()
-                .status(status)
-                .header(header::CONTENT_TYPE, content_type),
-            &upstream_headers,
-        )
-            .body(Body::from(err_body.clone()))
-            .unwrap_or_else(|_| err_response(status, "构造上游错误响应失败"));
+        let resp = build_error_passthrough_response(status, &content_type, &upstream_headers, err_body_raw);
         return (resp, status, err_body);
     }
 
@@ -448,36 +454,37 @@ pub async fn forward(
     // 注:这里**不会**因为返回 Err 而形成自旋——实测 reqwest 的 `bytes_stream` 出错后
     // 下一次 poll 返回 `None`,不重复吐同一个 Err;且 `map`/`map_err` 都不改变终止时机。
     //
-    // ⚠️ 响应侧过滤分两层，门控不同（2026-08-10 拆开，理由见下方 `strip_dsml_only_ok`）：
-    // - **thinking 块过滤**（滤 thinking/redacted_thinking 块 + index 重编号 + usage 扣减）：
-    //   改协议结构，仅 `deepseek_normalize=true` 启用，其余号保零转换（隔离铁律 3）。
+    // ⚠️ 响应侧过滤（2026-08-16 起仅剩一层）：
     // - **DSML 标记剥离**：所有 custom_api 号无条件启用 —— 上游就是 DeepSeek 系，
     //   标记泄漏与凭据配置无关。
+    // - thinking 块过滤（滤 thinking/redacted_thinking 块 + index 重编号 + usage 扣减）与
+    //   内联 `<thinking>` 剥离随 deepseek 归一化一并移除（2026-08-16）：没有凭据能开启，
+    //   恒 false，filter 只剥 text 里的 DSML 标记，thinking 块与 index 一律不动。
     // 流式逐事件处理仍流式回传;非流式读完整 body 处理。解析失败 fail-open 原样透传。
     // 成功路径同样透传 P4 白名单头（x-ratelimit-* 让客户端能主动限速）。
     // 同样必须在消费 upstream 之前克隆。
     let upstream_headers = upstream.headers().clone();
-    // thinking 块过滤（含重编号、usage 扣减）仍只对 deepseek_normalize 凭据开启 ——
-    // 它改协议结构，是「零转换透传」的刻意例外，不能推给所有 custom_api 号。
-    let filter_thinking = ds_cfg.is_some();
-    // 🔴 但**响应 filter 入口本身不能再由 `filter_thinking` 门控**。
-    //
-    // 改前入口条件是 `filter_thinking && ...`：没开 deepseek_normalize 的 custom_api 号
-    // 走纯字节透传分支 ⇒ DSML 标记剥离**根本不执行**，`<｜DSML｜function_calls｜>` 原样
-    // 泄漏给客户端（用户走代挂号拉 OpenZ 时看到的裸标记就是这条路径）。
-    //
-    // 而 DSML 泄漏与「客户端要不要 thinking」、「凭据有没有开归一化」都无关：
-    // custom_api 的上游就是 DeepSeek 系中转站，会吐这个标记的是上游模型本身。
-    // 所以 filter 一律接上，只把 thinking 块过滤按 `filter_thinking` 传下去 ——
-    // 关闭时 filter 只剥 text 里的 DSML 标记，thinking 块与 index 一律不动。
+    // 被动配额观测：成功响应里摘上游配额头落日志（纯观测，见该函数文档）。
+    // 放在消费 `upstream` 之前（与下方 P4 白名单克隆同一时机）。
+    observe_upstream_quota_headers(&upstream_headers, &base);
+    // 🔴 响应 filter 入口**不受 thinking 门控**：DSML 泄漏与凭据配置无关，
+    // custom_api 的上游就是 DeepSeek 系中转站，会吐标记的是上游模型本身。
+    // filter 一律接上（thinking 块过滤恒 false，只剥 text 里的 DSML 标记）。
     let strip_dsml_only_ok = content_type.contains("text/event-stream")
         || content_type.contains("application/json");
-    // 内联 `<thinking>` 剥离开关取配置（流式 + 非流式共用，cfg 已提到作用域）。
-    // ⚠️ 未开归一化的号取 `false`：内联 `<thinking>` 剥离属于 thinking 语义处理，
-    // 不该跟着 DSML 一起对所有 custom_api 号生效（DSML 是标记泄漏，两码事）。
-    let strip_inline = ds_cfg
-        .as_ref()
-        .map_or(false, |c| c.strip_inline_thinking);
+    // 内联 `<thinking>` 剥离随 deepseek 归一化移除 → 恒 false（流式 + 非流式共用）。
+    let strip_inline = false;
+    // thinking 块过滤随 deepseek 归一化移除 → 恒 false（零协议转换透传语义）。
+    let filter_thinking = false;
+
+    // 模拟缓存注入（mockCacheEnabled，仅透传路径）：上游 DeepSeek 的
+    // cache_read_input_tokens 恒 0，下游（sub2api 等）看不到缓存分支 —— 开启后
+    // filter 把 usage 注入 round(input × ratio) 的伪造 cache_read、creation 置 0。
+    // 读取处从 handlers 的 TIER3 进程镜像取（main 启动接线 / admin 热更即时改写），
+    // ratio 已在 setter 清洗到 [0,1]；关闭时 mock_cache=None，filter 零改动原样透传。
+    // Kiro 池四层缓存链（handlers.rs resolve_cache_chain）不经过这里，不受影响。
+    let (mock_cache_enabled, mock_ratio) = crate::anthropic::handlers::mock_cache_config();
+    let mock_cache = mock_cache_enabled.then_some((true, mock_ratio));
 
     let resp = if strip_dsml_only_ok && content_type.contains("text/event-stream") {
         let byte_stream = upstream.bytes_stream().map_err(|e| {
@@ -492,8 +499,11 @@ pub async fn forward(
         )
             // ⚠️ 空流兜底：thinking 被滤光/上游真空响应时补发 error 事件，
             // 防客户端 "Stream ended without receiving any events" 卡死 agentic 循环。
+            // message 保持静态：guard_empty_stream 签名要求 `&'static str`（结构持引用、
+            // 流 `'static`），配置表返回 String 无法传（本文件边界内无解，见 err_response
+            // 的接入说明——E7 是唯一未接表的 E 表本地构造点）。
             .body(Body::from_stream(guard_empty_stream(
-                filter_sse_stream_with(byte_stream, strip_inline, filter_thinking),
+                filter_sse_stream_with(byte_stream, strip_inline, filter_thinking, mock_cache),
                 "上游返回空响应（未收到任何正文内容），请重试",
             )))
             .unwrap_or_else(|_| err_response(StatusCode::BAD_GATEWAY, "构建透传响应失败"))
@@ -502,8 +512,7 @@ pub async fn forward(
         // 用 read_body_capped 给 body 加 32MiB 上限,防恶意上游吐超大 JSON 顶爆内存。
         match read_body_capped(upstream, "透传非流式响应", PASSTHROUGH_JSON_CAP_BYTES).await {
             Ok(body) => {
-                // ⚠️ 非流式也要接 strip_inline_thinking 配置（与流式一致，否则配置 false 仍剥）。
-                let filtered = filter_json_bytes_with(&body, strip_inline, filter_thinking);
+                let filtered = filter_json_bytes_with(&body, strip_inline, filter_thinking, mock_cache);
                 apply_upstream_response_headers(
                     Response::builder()
                         .status(status)
@@ -549,7 +558,8 @@ pub async fn forward(
 /// 纯数组 `[string]`。排序去重后返回。
 ///
 /// base_url 与 [`forward`] 同源（含 `/v1` 则不重复拼），SSRF 防护走
-/// `build_streaming_client_no_redirect`（禁重定向），写入 base_url 时的 IP 校验在 admin 层已做。
+/// `pinned_streaming_client`（M8：运行时复验 + DNS 固化 + 禁重定向，与写入时
+/// 校验同策略）。
 pub async fn fetch_upstream_models(
     cred: &KiroCredentials,
     global_proxy: Option<&crate::http_client::ProxyConfig>,
@@ -599,9 +609,10 @@ pub async fn fetch_upstream_models(
     }
 
     let proxy = cred.effective_proxy(global_proxy);
-    // 同样复用缓存 client（与 `forward` 共享连接池 —— 打的是同一个上游 host，
-    // 分开建会把池打散，等于没修）。
-    let client = passthrough_client(proxy.as_ref(), tls_backend)?;
+    // 同样走「运行时 SSRF 复验 + DNS 固化」的 pinned client（M8，与 `forward` 同源，
+    // 打的是同一个上游 host，连接池按 (host, proxy, tls) 复用）。
+    let client = crate::http_client::pinned_streaming_client(&base, proxy.as_ref(), tls_backend)
+        .await?;
     let mut last_err: Option<anyhow::Error> = None;
     for url in &candidates {
         let mut req = client.get(url);
@@ -674,13 +685,72 @@ pub async fn fetch_upstream_models(
     // 旧解析尾部已并入上面的候选循环（含纯数组形态）。
 }
 
+/// 拼 Anthropic messages 端点：base 以 `/v1` 结尾（挂载点已含）则不重复拼，否则补。
+///
+/// ⚠️ 只认 `ends_with("/v1")`（2026-08-15）：`contains("/v1/")` 过宽 —— base 中间含
+/// `/v1/` 时（如 `https://x.com/v1/gateway`）旧逻辑误判「已含挂载点」，把 messages
+/// 拼成 `/v1/gateway/messages`，而正确形态是补 `/v1/messages`。调用方保证 base
+/// 已 trim 尾部斜杠。
+fn messages_endpoint(base: &str) -> String {
+    if base.ends_with("/v1") {
+        format!("{base}/messages")
+    } else {
+        format!("{base}/v1/messages")
+    }
+}
+
+/// 上游错误体的诊断串（lossy 副本 + trim）：供日志与调用侧 failover 分类。
+/// 与透传回客户端的**原始字节**（`err_body_raw`）分离 —— 压缩字节绝不进这个串，
+/// 客户端按白名单透传的 `content-encoding` 解压时不受诊断串影响。
+fn err_diag_string(raw: &[u8]) -> String {
+    String::from_utf8_lossy(raw).trim().to_string()
+}
+
+/// 构造「透传上游错误体」的响应：body 用**原始字节**（配合白名单透传的
+/// `content-encoding`，客户端能正确解压），状态码与白名单头保持上游。
+fn build_error_passthrough_response(
+    status: StatusCode,
+    content_type: &str,
+    upstream_headers: &header::HeaderMap,
+    raw_body: Vec<u8>,
+) -> Response {
+    apply_upstream_response_headers(
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, content_type),
+        upstream_headers,
+    )
+    .body(Body::from(raw_body))
+    .unwrap_or_else(|_| err_response(status, "构造上游错误响应失败"))
+}
+
 /// 构建一个 Anthropic 风格的错误响应(供透传失败时返回)。
+///
+/// 错误消息可配置化接入：所有本地构造错误（E1 缺 base_url / E2 出站校验失败 /
+/// E3 首字节超时 / E4 连接层失败 / E8 非流式读取失败 / E9 构建失败）统一读
+/// `passthrough_failed` key —— status/type/message/retryAfterSecs 均可配，
+/// 默认值 = 各调用点的现状文案（未配置零行为变化）。
+/// ⚠️ **上游错误原文透传（E5，build_error_passthrough_response）不经过本函数**：
+/// 那是上游 status + 原始字节 + 白名单头，网关零构造，配置对其无效。
 fn err_response(status: StatusCode, msg: &str) -> Response {
+    let (status_cfg, error_type, message, retry_after) =
+        crate::anthropic::handlers::resolve_msg(
+            &crate::anthropic::handlers::current_error_messages(),
+            "passthrough_failed",
+            (status, "api_error", msg, None),
+        );
     let body = serde_json::json!({
         "type": "error",
-        "error": { "type": "api_error", "message": msg }
+        "error": { "type": error_type, "message": message }
     });
-    (status, axum::Json(body)).into_response()
+    let mut resp = (status_cfg, axum::Json(body)).into_response();
+    // 配置给了 retryAfterSecs 才带 Retry-After 头（默认 None 与现状一致——502 本地
+    // 错误不带退避提示；管理员显式配置后，客户端可据此退避而非原样重发）。
+    if let Some(ra) = retry_after {
+        resp.headers_mut()
+            .insert(header::RETRY_AFTER, ra.clamp(1, 300).to_string().parse().expect("u64 to_string 恒为合法 HeaderValue"));
+    }
+    resp
 }
 
 #[cfg(test)]
@@ -725,5 +795,168 @@ mod tests {
             !matches!(&items[2], Ok(b) if b.is_empty()),
             "空 chunk 在 HTTP 层不可见，等于静默截断"
         );
+    }
+
+    // ===== M7：错误体原始字节透传（2026-08-15）=====
+
+    /// M7 守卫：非 2xx 错误体必须**逐字节**回给客户端（`content-encoding` 已由
+    /// 白名单透传 —— 上游若回 gzip，客户端要拿到压缩字节才能解压）。
+    ///
+    /// 回退即 FAIL：把 body 换成 `String::from_utf8_lossy(&b)` 的字符串 ——
+    /// 二进制字节被替换成 U+FFFD，body 与 `content-encoding: gzip` 矛盾，
+    /// 客户端解压必失败。
+    #[tokio::test]
+    async fn error_response_body_preserves_raw_bytes() {
+        // 合法的 gzip 流头（1f 8b ...）—— 非 UTF-8 字节，lossy 会破坏它。
+        let raw: Vec<u8> = vec![0x1f, 0x8b, 0x08, 0x00, 0xde, 0xad, 0xbe, 0xef, 0x01, 0x00];
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("content-encoding", axum::http::HeaderValue::from_static("gzip"));
+        let resp = build_error_passthrough_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "application/json",
+            &headers,
+            raw.clone(),
+        );
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers().get("content-encoding").map(|v| v.to_str().unwrap()),
+            Some("gzip"),
+            "content-encoding 必须透传（白名单契约）"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        assert_eq!(
+            body.as_ref(),
+            raw.as_slice(),
+            "错误体必须逐字节透传（gzip 场景客户端靠它解压）"
+        );
+    }
+
+    /// M7：诊断串是 lossy + trim 的副本 —— 压缩/二进制字节进诊断串必须被替换
+    /// （不能 panic、不能悄悄丢字节改变透传行为），文本错误体则无损保留。
+    #[test]
+    fn err_diag_string_is_lossy_trimmed_copy() {
+        assert_eq!(err_diag_string(b"{\"a\":1}\n\n"), "{\"a\":1}");
+        // 全非法 UTF-8 起始字节（压缩流的典型内容）：每个字节替换为 U+FFFD。
+        let gzipish = [0xff, 0xfe, 0x80];
+        let s = err_diag_string(&gzipish);
+        assert_eq!(
+            s,
+            "\u{FFFD}\u{FFFD}\u{FFFD}",
+            "lossy 是逐字节替换副本（合法 ASCII 如 gzip 魔数 0x1f 不替换）"
+        );
+    }
+
+    // ===== MINOR 3：URL 拼接只认 ends_with(\"/v1\")（2026-08-15）=====
+
+    /// 回退即 FAIL：改回 `contains("/v1/")` —— 中间含 `/v1/` 的 base 会被误判
+    /// 「已含挂载点」，拼出错误端点。
+    #[test]
+    fn messages_endpoint_only_checks_trailing_v1() {
+        assert_eq!(
+            messages_endpoint("https://api.example.com/v1"),
+            "https://api.example.com/v1/messages"
+        );
+        assert_eq!(
+            messages_endpoint("https://api.example.com"),
+            "https://api.example.com/v1/messages"
+        );
+        // 修复点：中间含 /v1/ 但非 /v1 结尾 —— 必须补 /v1/messages。
+        assert_eq!(
+            messages_endpoint("https://api.example.com/v1/gateway"),
+            "https://api.example.com/v1/gateway/v1/messages"
+        );
+        assert_eq!(
+            messages_endpoint("https://api.example.com"),
+            "https://api.example.com/v1/messages"
+        );
+    }
+
+    // ===== MINOR 4：配额头观测补 anthropic-ratelimit-*（2026-08-15）=====
+
+    /// anthropic-ratelimit-requests-* 三键必须被观测到（Anthropic 兼容上游的配额
+    /// 余量只发这一族，缺它则观测恒空）；x-ratelimit-* 优先。
+    #[test]
+    fn quota_headers_observes_both_namespaces() {
+        use axum::http::HeaderMap;
+        let mut h = HeaderMap::new();
+        h.insert(
+            "anthropic-ratelimit-requests-limit",
+            "40".parse().unwrap(),
+        );
+        h.insert(
+            "anthropic-ratelimit-requests-remaining",
+            "32".parse().unwrap(),
+        );
+        h.insert(
+            "anthropic-ratelimit-requests-reset",
+            "2026-01-01T00:00:00Z".parse().unwrap(),
+        );
+        let (l, r, rs) = quota_headers(&h);
+        assert_eq!(l, Some("40"), "anthropic-ratelimit-requests-limit 必须被观测");
+        assert_eq!(r, Some("32"), "anthropic-ratelimit-requests-remaining 必须被观测");
+        assert_eq!(
+            rs,
+            Some("2026-01-01T00:00:00Z"),
+            "anthropic-ratelimit-requests-reset 必须被观测"
+        );
+
+        // 两族同发时 x-ratelimit-* 优先。
+        let mut h2 = HeaderMap::new();
+        h2.insert("x-ratelimit-limit", "10".parse().unwrap());
+        h2.insert("anthropic-ratelimit-requests-limit", "40".parse().unwrap());
+        let (l, _, _) = quota_headers(&h2);
+        assert_eq!(l, Some("10"), "x-ratelimit-* 应优先于 anthropic-ratelimit-*");
+
+        // 全缺 → 全 None（observe 据此静默返回）。
+        let h3 = HeaderMap::new();
+        let (l, r, rs) = quota_headers(&h3);
+        assert!(l.is_none() && r.is_none() && rs.is_none());
+    }
+
+    /// P1-11：未命中映射 / 豁免 / 空表 → 请求体字节级原样（含非字典序 key 与空格）。
+    #[test]
+    fn unmapped_json_body_forwards_raw_bytes() {
+        let raw = Bytes::from_static(
+            br#"{ "z": 1, "model": "keep-me", "a": true }"#,
+        );
+        let empty = std::collections::HashMap::new();
+        assert_eq!(
+            apply_passthrough_model_mapping(raw.clone(), false, &empty),
+            raw,
+            "空规则表必须原样转发，不得 parse+serialize 重排 key"
+        );
+
+        let mut miss = std::collections::HashMap::new();
+        miss.insert("other*".to_string(), "mapped".to_string());
+        assert_eq!(
+            apply_passthrough_model_mapping(raw.clone(), false, &miss),
+            raw,
+            "map_target 未命中必须原样转发"
+        );
+
+        let mut hit = std::collections::HashMap::new();
+        hit.insert("keep-me".to_string(), "mapped-me".to_string());
+        assert_eq!(
+            apply_passthrough_model_mapping(raw.clone(), true, &hit),
+            raw,
+            "凭据豁免必须原样转发，即使规则会命中"
+        );
+    }
+
+    /// P1-11：映射命中时 body 的 model 字段被改写。
+    #[test]
+    fn mapped_json_body_rewrites_model_field() {
+        let raw = Bytes::from_static(
+            br#"{"stream":true,"model":"claude-sonnet","max_tokens":1}"#,
+        );
+        let mut rules = std::collections::HashMap::new();
+        rules.insert("claude-sonnet".to_string(), "mapped-sonnet".to_string());
+        let out = apply_passthrough_model_mapping(raw.clone(), false, &rules);
+        assert_ne!(out, raw, "命中映射不得回原字节");
+        let v: serde_json::Value =
+            serde_json::from_slice(&out).expect("映射后仍是 JSON");
+        assert_eq!(v["model"], "mapped-sonnet", "model 必须改成目标名");
+        assert_eq!(v["stream"], true);
+        assert_eq!(v["max_tokens"], 1);
     }
 }

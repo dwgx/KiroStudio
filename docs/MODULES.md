@@ -7,6 +7,7 @@
 > 而非 1990、`main.rs` **1139** 而非 481）。**别引用这些数**，现读：
 > `python3 tools/codegraph/cg.py stat`。符号是否还存在同样要现查：
 > `cg.py sym '<名字>'` / `cg.py file <文件>`（工具与边界见 `tools/codegraph/README.md`）。
+> 默认监听端口是 **8990**（`model/config.rs` `default_port()`，serde 缺省与 `Config::default()` 共用；显式 `8080` 仍按 8080 反序列化）。
 > 本文件也缺 `src/openai/`（convert/handlers/types/mod 四个文件）一节。
 > 结构性描述（谁调谁、职责划分）大体仍成立，被证否的个别条目已就地标注。
 > 架构总览与请求链路见 `docs/ARCHITECTURE.md`；变更史见 `CHANGELOG.md`。
@@ -29,7 +30,7 @@ affinity/rpm/compression/login_background/collect_fingerprint/trust_forwarded �
 **函数**
 - `Config::load(path) → Result<Self>` / `Config::save()` — JSON 加载/回写
 - `effective_auth_region()` / `effective_api_region()` — region 回退链
-- 默认值：`default_port()=8080` · `default_region()="us-east-1"` · `default_endpoint()="ide"`
+- 默认值：`default_port()=8990` · `default_region()="us-east-1"` · `default_endpoint()="ide"`
   · `default_max_body_bytes()=256MiB`
 
 ### model/arg.rs (14)

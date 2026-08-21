@@ -56,7 +56,9 @@ pub fn create_router_with_provider(
     }
 
     // TIER3 配置热重载：把热路径开关/压缩配置播种进进程级镜像（handler 读镜像而非固化 state）。
-    // 之后 admin 改配置调对应 setter 即时生效、无需重启（extract_thinking / compression 两项）。
+    // 热更通道：extract_thinking / cc_auto_buffer 等由 admin 保存时直接调对应 setter 即时生效；
+    // compression 无面板字段（UpdateConfigRequest 不含），手改 config.json 后由
+    // reload_config（token_manager.rs）播 set_compression，同批保存任何热字段即生效。
     super::handlers::set_extract_thinking(extract_thinking);
     super::handlers::set_cc_auto_buffer(cc_auto_buffer);
     super::handlers::set_compression(compression);

@@ -1,5 +1,6 @@
 import * as React from 'react'
 import { ChevronUp, ChevronDown } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 import { cn } from '@/lib/utils'
 
 export interface NumberStepperProps {
@@ -29,6 +30,9 @@ export function NumberStepper({
   disabled = false,
   'aria-label': ariaLabel,
 }: NumberStepperProps) {
+  const { t } = useTranslation()
+  // a11y：输入框需要 id/name（DevTools「form field 缺 id/name」告警），useId 保证实例间唯一。
+  const inputId = React.useId()
   // 输入框显示为字符串，允许中间态（空串、负号）不立刻回写
   const [text, setText] = React.useState(String(value))
 
@@ -48,7 +52,9 @@ export function NumberStepper({
       setText(String(value)) // 非法输入回退
       return
     }
-    const next = clamp(n)
+    // 小数输入（如 70.5）取整：步进器语义是整数步进，且保存端（settings-page 等）
+    // 提交时也 Math.round，这里取整保证显示值与提交值一致，避免 70.5 显示但存 71。
+    const next = clamp(Math.round(n))
     setText(String(next))
     if (next !== value) onChange(next)
   }
@@ -102,6 +108,7 @@ export function NumberStepper({
       )}
     >
       <input
+        id={inputId}
         type="text"
         inputMode="numeric"
         aria-label={ariaLabel}
@@ -129,7 +136,7 @@ export function NumberStepper({
           disabled={disabled || atMax}
           onStart={() => startHold(1)}
           onStop={stopHold}
-          label="增加"
+          label={t('numberstepper.increase')}
         />
         <div className="h-px bg-input" />
         <StepBtn
@@ -137,7 +144,7 @@ export function NumberStepper({
           disabled={disabled || atMin}
           onStart={() => startHold(-1)}
           onStop={stopHold}
-          label="减少"
+          label={t('numberstepper.decrease')}
         />
       </div>
     </div>

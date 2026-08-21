@@ -22,6 +22,69 @@ pub const KIRO_PORTAL_URL: &str = "https://app.kiro.dev";
 /// Kiro auth service 默认端点
 pub const KIRO_AUTH_ENDPOINT: &str = "https://prod.us-east-1.auth.desktop.kiro.dev";
 
+/// 按 region 拼 Kiro auth service 端点（2026-08-15 用户调试移植）。
+///
+/// 🔴 Kiro auth 服务按 region 分布（`prod.{region}.auth.desktop.kiro.dev`）：
+/// 硬编码 us-east-1 的部署，配了非默认 region（`effective_auth_region()`）会出现
+/// 「上号成功、之后刷不动」或换 token 500。region 为空时回落 us-east-1。
+pub fn auth_endpoint_for_region(region: &str) -> String {
+    let region = region.trim();
+    if region.is_empty() {
+        return KIRO_AUTH_ENDPOINT.to_string();
+    }
+    format!("https://prod.{}.auth.desktop.kiro.dev", region)
+}
+
+/// 提取端点 URL 的 authority（host[:port]），用于 host 头。
+///
+/// 原写法 `trim_start_matches("https://")` 对带尾斜杠/路径的端点会拼出非法 host
+/// （如 `...kiro.dev/`）；这里同时剥 scheme 与路径段。
+fn auth_host(endpoint: &str) -> String {
+    let after_scheme = endpoint
+        .find("://")
+        .map(|i| &endpoint[i + 3..])
+        .unwrap_or(endpoint);
+    after_scheme
+        .split('/')
+        .next()
+        .unwrap_or(after_scheme)
+        .to_string()
+}
+
+/// 还原**授权请求时浏览器实际落到的** redirect_uri，供 token 交换复用。
+///
+/// 🔴 OAuth2（RFC 6749 §4.1.3）要求换 token 时的 `redirect_uri` 与授权请求里的
+/// **逐字节一致**。本地回调模式下 `session.redirect_uri` 只是 `http://127.0.0.1:{port}`
+/// （无路径），而浏览器真正落到的是 `http://127.0.0.1:{port}/oauth/callback`
+/// （或 `/signin/callback` —— portal 按 login_option 决定挂哪个路径）。拿无路径的
+/// base 去换 token 就与授权请求不匹配，Cognito 侧 redirect_uri mismatch，Kiro 的
+/// 包装层未捕获 → **500「Oops, something went wrong」**（2026-08-15 用户调试定位，
+/// github 登录必现）。
+///
+/// [`OAuthCallbackData::path`] 记的正是浏览器实际命中的路径，之前**被解析出来却
+/// 从未使用** —— 本函数就是它的消费点。
+///
+/// 远程回调模式下 base 已含路径（`{callbackBaseUrl}/api/admin/auth/callback`），
+/// 此时原样返回，避免拼成 `.../callback/api/admin/auth/callback`。
+pub fn full_redirect_uri(base: &str, callback_path: &str) -> String {
+    let base_trimmed = base.trim_end_matches('/');
+
+    // base 在 scheme 之后是否已经带了路径段
+    let after_scheme = base_trimmed
+        .find("://")
+        .map(|i| &base_trimmed[i + 3..])
+        .unwrap_or(base_trimmed);
+    if after_scheme.contains('/') {
+        return base_trimmed.to_string();
+    }
+
+    if callback_path.is_empty() || !callback_path.starts_with('/') {
+        return base_trimmed.to_string();
+    }
+
+    format!("{}{}", base_trimmed, callback_path)
+}
+
 /// 与 IDE 一致的本地回调端口候选列表
 const CALLBACK_PORTS: &[u16] = &[
     3128, 4649, 6588, 8008, 9091, 49153, 50153, 51153, 52153, 53153,
@@ -121,14 +184,32 @@ async fn run_callback_server(
             }
         };
 
-        let mut buf = vec![0u8; 4096];
-        let n = match stream.read(&mut buf).await {
-            Ok(n) => n,
-            Err(_) => continue,
+        // 🔴 必须读到**完整请求行**才解析（2026-08-15 用户调试移植）：单次 read 只保证
+        // 「至少 1 字节」，不保证一个 TCP 段装得下整行。OAuth 回调的 query 里
+        // code + state 本就长，叠加浏览器给 127.0.0.1 带的 Cookie 后整个请求头轻易超过
+        // 一次读取的量；若请求行被切断，解析出的 code 是**截断的**，拿去换 token
+        // 必然失败（上游 500），而现场只看到「Token 交换失败」，根因完全不可见。
+        // 读到 CRLF（或 LF）为止，上限 MAX_CALLBACK_REQUEST_BYTES 防 slowloris/内存放大。
+        const MAX_CALLBACK_REQUEST_BYTES: usize = 64 * 1024;
+        let mut acc: Vec<u8> = Vec::with_capacity(4096);
+        let mut chunk = [0u8; 4096];
+        let first_line: String = loop {
+            if let Some(pos) = acc.iter().position(|&b| b == b'\n') {
+                let line = &acc[..pos];
+                let line = line.strip_suffix(b"\r").unwrap_or(line);
+                break String::from_utf8_lossy(line).into_owned();
+            }
+            if acc.len() >= MAX_CALLBACK_REQUEST_BYTES {
+                // 超限仍无换行：当作畸形请求，用已读部分兜底（后续解析会失败并回 404）
+                break String::from_utf8_lossy(&acc).into_owned();
+            }
+            match stream.read(&mut chunk).await {
+                Ok(0) => break String::from_utf8_lossy(&acc).into_owned(), // 对端关闭
+                Ok(n) => acc.extend_from_slice(&chunk[..n]),
+                Err(_) => break String::new(),
+            }
         };
-
-        let request = String::from_utf8_lossy(&buf[..n]);
-        let first_line = request.lines().next().unwrap_or("");
+        let first_line = first_line.as_str();
 
         // GET /oauth/callback?... HTTP/1.1
         if let Some(path_and_query) = first_line.strip_prefix("GET ").and_then(|s| {
@@ -346,6 +427,34 @@ pub async fn wait_for_callback(
         .map_err(|_| anyhow::anyhow!("OAuth 回调 channel 已关闭（服务器提前退出）"))
 }
 
+/// 上游 5xx 是否值得短暂重试（500/502/503/504）。4xx 是参数问题，重试无益。
+fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 500 | 502 | 503 | 504)
+}
+
+/// 交换失败的用户可读消息：区分 4xx（参数被拒，用户侧问题）与 5xx（上游服务异常）。
+fn exchange_error_message(status: u16, body: &str) -> String {
+    match status {
+        400..=499 => format!("Social token 交换失败（参数被上游拒绝）{}: {}", status, body),
+        500..=599 => format!("Social token 交换失败（上游服务异常，请稍后重试）{}: {}", status, body),
+        _ => format!("Social token 交换失败 {}: {}", status, body),
+    }
+}
+
+/// 日志用文本截断：只留前 `max_chars` 字符（body 可能很长或含多余细节）。
+fn truncate_log_text(s: &str, max_chars: usize) -> String {
+    let truncated: String = s.chars().take(max_chars).collect();
+    if s.chars().count() > max_chars {
+        format!("{}...(truncated)", truncated)
+    } else {
+        truncated
+    }
+}
+
+/// 5xx 短暂重试上限：最多重试 1 次。上游偶发故障 500ms 内可自愈，一次足够，不放大上游压力。
+const MAX_TOKEN_EXCHANGE_RETRIES: usize = 1;
+const TOKEN_EXCHANGE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// 用 authorization code 换取 access_token + refresh_token
 pub async fn exchange_code_for_token(
     auth_endpoint: &str,
@@ -355,6 +464,8 @@ pub async fn exchange_code_for_token(
     config: &Config,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<SocialCreateTokenResponse> {
+    // 端点可能带尾斜杠/路径（部署配置）——trim 后拼 /oauth/token 才正确。
+    let auth_endpoint = auth_endpoint.trim_end_matches('/');
     let url = format!("{}/oauth/token", auth_endpoint);
     let client = build_client(proxy, 30, config.tls_backend)?;
 
@@ -368,22 +479,263 @@ pub async fn exchange_code_for_token(
     let kiro_version = &config.kiro_version;
     let user_agent = format!("KiroIDE-{}", kiro_version);
 
-    let resp = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("User-Agent", &user_agent)
-        .header("host", auth_endpoint.trim_start_matches("https://"))
-        .json(&body)
-        .send()
-        .await?;
+    // host 头只能是 authority（host[:port]）：原写法只剥 `https://`，端点带尾斜杠
+    // 或路径时会拼出 `...kiro.dev/` 这种非法值（2026-08-15 用户调试移植）。
+    let host_header = auth_host(auth_endpoint);
 
-    let status = resp.status();
-    if !status.is_success() {
+    let mut retries: usize = 0;
+    loop {
+        let resp = client
+            .post(&url)
+            .header("Accept", "application/json, text/plain, */*")
+            .header("Content-Type", "application/json")
+            .header("User-Agent", &user_agent)
+            .header("host", &host_header)
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if status.is_success() {
+            return resp
+                .json::<SocialCreateTokenResponse>()
+                .await
+                .map_err(|e| anyhow::anyhow!("解析 Social token 响应失败: {}", e));
+        }
+
         let body_text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Social token 交换失败 {}: {}", status, body_text);
+        // 日志脱敏：code 是敏感值，只记长度 + 前 4 字符，绝不记完整 code。
+        let code_prefix: String = code.chars().take(4).collect();
+        tracing::warn!(
+            "Social token 交换失败: auth_endpoint={}, code_len={}, code_prefix={:?}, status={}, body={:?}",
+            auth_endpoint,
+            code.len(),
+            code_prefix,
+            status,
+            truncate_log_text(&body_text, 500),
+        );
+
+        // 5xx（500/502/503/504）短暂重试 1 次；4xx 是参数问题，重试无益，直接失败。
+        if is_retryable_status(status.as_u16()) && retries < MAX_TOKEN_EXCHANGE_RETRIES {
+            retries += 1;
+            tokio::time::sleep(TOKEN_EXCHANGE_RETRY_DELAY).await;
+            continue;
+        }
+
+        anyhow::bail!("{}", exchange_error_message(status.as_u16(), &body_text));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// 2026-08-15 用户调试移植：redirect_uri 必须还原浏览器实际落到的完整 URI。
+    #[test]
+    fn full_redirect_uri_reconstructs_browser_path() {
+        // 本地回调：base 无路径 + 回调路径 → 拼出浏览器实际命中的完整 URI。
+        assert_eq!(
+            full_redirect_uri("http://127.0.0.1:3128", "/oauth/callback"),
+            "http://127.0.0.1:3128/oauth/callback"
+        );
+        assert_eq!(
+            full_redirect_uri("http://127.0.0.1:3128/", "/signin/callback"),
+            "http://127.0.0.1:3128/signin/callback"
+        );
+        // 远程回调：base 已含路径 → 原样返回，不重复拼接。
+        assert_eq!(
+            full_redirect_uri("https://api.dwgx.top/api/admin/auth/callback", "/signin/callback"),
+            "https://api.dwgx.top/api/admin/auth/callback"
+        );
+        // 无回调路径 → base 原样。
+        assert_eq!(full_redirect_uri("http://127.0.0.1:3128", ""), "http://127.0.0.1:3128");
     }
 
-    resp.json::<SocialCreateTokenResponse>()
+    /// 2026-08-15 用户调试移植：auth 端点按 region 拼，空 region 回落 us-east-1。
+    #[test]
+    fn auth_endpoint_for_region_switches_region() {
+        assert_eq!(
+            auth_endpoint_for_region("us-east-1"),
+            "https://prod.us-east-1.auth.desktop.kiro.dev"
+        );
+        assert_eq!(
+            auth_endpoint_for_region("eu-west-1"),
+            "https://prod.eu-west-1.auth.desktop.kiro.dev"
+        );
+        assert_eq!(auth_endpoint_for_region(""), KIRO_AUTH_ENDPOINT);
+        assert_eq!(auth_endpoint_for_region("  "), KIRO_AUTH_ENDPOINT);
+    }
+
+    /// host 头必须是纯 authority：剥 scheme 与路径段。
+    #[test]
+    fn auth_host_strips_scheme_and_path() {
+        assert_eq!(auth_host("https://prod.us-east-1.auth.desktop.kiro.dev"), "prod.us-east-1.auth.desktop.kiro.dev");
+        assert_eq!(auth_host("https://prod.us-east-1.auth.desktop.kiro.dev/"), "prod.us-east-1.auth.desktop.kiro.dev");
+        assert_eq!(auth_host("http://127.0.0.1:8787/v1"), "127.0.0.1:8787");
+        assert_eq!(auth_host("prod.us-east-1.auth.desktop.kiro.dev"), "prod.us-east-1.auth.desktop.kiro.dev");
+    }
+
+    /// Config 所有字段都有 serde default，空 JSON 即可构造。
+    fn test_config() -> Config {
+        serde_json::from_str("{}").unwrap()
+    }
+
+    /// 本地 TCP mock：按顺序对每次连接返回 (status, body)，并统计收到请求次数。
+    async fn spawn_mock_server(
+        responses: Vec<(u16, &'static str)>,
+        hits: Arc<AtomicUsize>,
+    ) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            for (status, body) in responses {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                hits.fetch_add(1, Ordering::SeqCst);
+                let reason = match status {
+                    500 => "Internal Server Error",
+                    502 => "Bad Gateway",
+                    400 => "Bad Request",
+                    _ => "OK",
+                };
+                let resp = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    reason,
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn test_is_retryable_status() {
+        for s in [500u16, 502, 503, 504] {
+            assert!(is_retryable_status(s), "{s} 应可重试");
+        }
+        for s in [400u16, 401, 403, 404, 409, 429, 499, 501, 505, 600] {
+            assert!(!is_retryable_status(s), "{s} 不应重试");
+        }
+    }
+
+    #[test]
+    fn test_exchange_error_message_4xx_vs_5xx() {
+        assert_eq!(
+            exchange_error_message(400, "bad params"),
+            "Social token 交换失败（参数被上游拒绝）400: bad params"
+        );
+        assert_eq!(
+            exchange_error_message(503, "overloaded"),
+            "Social token 交换失败（上游服务异常，请稍后重试）503: overloaded"
+        );
+        // 非 4xx/5xx（如 3xx）保持原通用文案
+        assert_eq!(
+            exchange_error_message(301, "moved"),
+            "Social token 交换失败 301: moved"
+        );
+    }
+
+    #[test]
+    fn test_truncate_log_text() {
+        assert_eq!(truncate_log_text("短文本", 500), "短文本");
+        let long = "x".repeat(600);
+        assert_eq!(
+            truncate_log_text(&long, 500),
+            format!("{}...(truncated)", "x".repeat(500))
+        );
+        // 多字节字符按字符截断，不截出非法 UTF-8、不 panic
+        let wide = "界".repeat(600);
+        let t = truncate_log_text(&wide, 500);
+        assert_eq!(t.chars().count(), 514);
+        assert!(t.starts_with("界"));
+    }
+
+    #[tokio::test]
+    async fn test_retry_5xx_then_success() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let port = spawn_mock_server(
+            vec![
+                (500, r#"{"error":"boom"}"#),
+                (200, r#"{"accessToken":"tok","refreshToken":"rt","profileArn":"arn"}"#),
+            ],
+            hits.clone(),
+        )
+        .await;
+        let config = test_config();
+        let resp = exchange_code_for_token(
+            &format!("http://127.0.0.1:{}", port),
+            "secret-code-1234",
+            "verifier",
+            "http://127.0.0.1:9999/callback",
+            &config,
+            None,
+        )
         .await
-        .map_err(|e| anyhow::anyhow!("解析 Social token 响应失败: {}", e))
+        .expect("500 后重试应成功");
+        assert_eq!(resp.access_token, "tok");
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "5xx 应重试 1 次（共 2 次请求）");
+    }
+
+    #[tokio::test]
+    async fn test_retry_5xx_still_fails_with_5xx_message() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let port = spawn_mock_server(
+            vec![(500, r#"{"error":"boom"}"#), (500, r#"{"error":"boom2"}"#)],
+            hits.clone(),
+        )
+        .await;
+        let config = test_config();
+        let err = exchange_code_for_token(
+            &format!("http://127.0.0.1:{}", port),
+            "secret-code-1234",
+            "verifier",
+            "http://127.0.0.1:9999/callback",
+            &config,
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("上游服务异常，请稍后重试"),
+            "重试仍失败应保持 5xx 文案: {err}"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "5xx 应重试 1 次");
+        assert!(
+            !err.contains("secret-code-1234"),
+            "错误消息不得含完整 code（脱敏）: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_4xx_no_retry_and_message() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let port =
+            spawn_mock_server(vec![(400, r#"{"error":"bad params"}"#)], hits.clone()).await;
+        let config = test_config();
+        let err = exchange_code_for_token(
+            &format!("http://127.0.0.1:{}", port),
+            "secret-code-1234",
+            "verifier",
+            "http://127.0.0.1:9999/callback",
+            &config,
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("参数被上游拒绝"), "4xx 文案: {err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "4xx 不得重试");
+        assert!(!err.contains("secret-code-1234"), "错误消息不得含完整 code: {err}");
+    }
 }

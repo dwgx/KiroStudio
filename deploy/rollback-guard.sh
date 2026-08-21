@@ -14,7 +14,7 @@
 #
 # 安全：只在 WORKDIR 内做 cp/mv/rm，不调 systemctl（NoNewPrivileges=true 禁提权）。
 # 幂等 + fail-safe：任何异常（缺 .bak / 首次部署 / 读计数失败）一律放行启动，绝不因守卫本身挡住服务。
-set -uo pipefail
+set -euo pipefail
 
 WORKDIR="${KIRO_WORKDIR:-/home/dwgx_user/KiroStudio}"
 BIN="$WORKDIR/kirostudio"
@@ -53,7 +53,7 @@ if [ -f "$BAK" ] && [ "$attempts" -ge "$THRESHOLD" ]; then
     # 用 .bak 覆盖回旧版
     if cp -f "$BAK" "$BIN" 2>/dev/null && chmod 755 "$BIN" 2>/dev/null; then
         rm -f "$BAK" 2>/dev/null          # 删回滚点，防 ping-pong
-        echo "0" > "$COUNTER" 2>/dev/null # 清零，给回滚后旧版干净起点
+        echo "0" > "$COUNTER" 2>/dev/null || true # 清零失败不挡 ExecStart（fail-safe）
         log "回滚完成：已用 .bak 覆盖 kirostudio，本次 ExecStart 将拉起旧版"
     else
         # 回滚失败：把留证的坏版还原回去（至少让服务能按原样起，别两头空）

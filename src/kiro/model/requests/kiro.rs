@@ -50,16 +50,25 @@ pub struct KiroRequest {
 /// [`KiroRequest`] 的 `rename_all`），**内层 `output_config` 保持 snake_case**，
 /// 与真实 Kiro CLI 流量一致（见本文件测试 `test_additional_model_request_fields_wire_format`）。
 /// 所以本结构体**不能**继承 `rename_all = "camelCase"`。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct AdditionalModelRequestFields {
-    /// 输出配置（含推理 effort）
+    /// Claude 族：`output_config.effort`（Kiro 原生 reasoning 通道）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_config: Option<KiroOutputConfig>,
+    /// GPT 族：`reasoning.effort`（与 Claude `output_config` 并列，互斥使用）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<KiroReasoningConfig>,
 }
 
 /// effort 控制字段（上游认五档：`low / medium / high / xhigh / max`）
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KiroOutputConfig {
+    pub effort: String,
+}
+
+/// GPT 族 reasoning 通道（`additionalModelRequestFields.reasoning.effort`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KiroReasoningConfig {
     pub effort: String,
 }
 #[cfg(test)]
@@ -132,6 +141,7 @@ mod tests {
             output_config: Some(KiroOutputConfig {
                 effort: "max".to_string(),
             }),
+            reasoning: None,
         };
         let v = serde_json::to_value(&fields).unwrap();
         assert_eq!(v["output_config"]["effort"], "max");
@@ -139,6 +149,17 @@ mod tests {
             v.get("outputConfig").is_none(),
             "内层键必须保持 snake_case output_config，实际: {v}"
         );
+        assert!(v.get("reasoning").is_none(), "未设 GPT reasoning 时不得出键");
+
+        let gpt = AdditionalModelRequestFields {
+            output_config: None,
+            reasoning: Some(KiroReasoningConfig {
+                effort: "high".to_string(),
+            }),
+        };
+        let v = serde_json::to_value(&gpt).unwrap();
+        assert_eq!(v["reasoning"]["effort"], "high");
+        assert!(v.get("output_config").is_none());
 
         // KiroRequest 顶层：camelCase 键 + None 时整键缺席。
         let request = KiroRequest {

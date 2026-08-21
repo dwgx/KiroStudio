@@ -21,12 +21,20 @@ COPY admin-ui ./
 RUN pnpm build
 
 # ---- 阶段 2：Rust 静态编译 ----
-FROM rust:1.96-alpine AS builder
+# rust:1.97.1-alpine exists on Docker Hub (aligned with rust-toolchain.toml / release.yml).
+FROM rust:1.97.1-alpine AS builder
 
 RUN apk add --no-cache musl-dev
 
 WORKDIR /app
+# B11：注入快照 commit 短 sha（部署时 docker build --build-arg KIRO_BUILD_SHA=<sha>；
+# git archive 解包环境无 .git，build.rs 的 git 兜底拿不到值，只能靠这里传）。
+# 不传 → 空串 → build.rs 降级 "unknown"（绝不导致构建失败）。
+ARG KIRO_BUILD_SHA
+ENV KIRO_BUILD_SHA=$KIRO_BUILD_SHA
 COPY Cargo.toml Cargo.lock ./
+# build.rs 注入 KIRO_BUILD_SHA（main.rs 编译期 env! 读取，缺了编不过）
+COPY build.rs ./
 COPY src ./src
 # 内嵌前端产物（router.rs 里 #[folder = "admin-ui/dist"]）
 COPY --from=frontend-builder /app/admin-ui/dist /app/admin-ui/dist
@@ -52,8 +60,11 @@ EXPOSE 8990
 
 # 容器内固定监听 8990（宿主端口由 docker-compose 的 ${KIROSTUDIO_PORT} 映射）
 # /admin 是 Admin UI 首页，返回 200 即视为存活
+# MINOR-9（2026-08-14 审查修正）：与 docker-compose.yml 的 healthcheck 统一探
+# /v1/models（200/401 均健康——鉴权端点未带 key 也返回 401，且不带任何敏感负载），
+# 避免裸 docker run（不经 compose）时健康判定与文档/compose 不一致。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8990/admin >/dev/null || exit 1
+    CMD curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8990/v1/models | grep -Eq '^(200|401)$' || exit 1
 
 USER app
 

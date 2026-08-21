@@ -20,9 +20,10 @@
 //! 下错平台/架构的二进制即便 sha256 自洽也无法运行（覆盖后服务当场死亡），故必须精确匹配；
 //! 未适配的组合在编译期直接 `compile_error!`，绝不静默回退到某个默认资产名。
 
+use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 上游仓库（owner/repo）。发布产物见 .github/workflows/release.yml，每个平台一份二进制 + 同名 .sha256：
 /// `kirostudio-linux-x86_64` / `kirostudio-macos-x86_64` /
@@ -256,6 +257,11 @@ pub struct UpdateCheckResult {
     /// 最新版相对本地版的 commit 快照（"这版改了啥"，最多 30 条）。拉不到则空。
     pub commits: Vec<CommitSnapshot>,
     pub error: Option<String>,
+    /// 当前是否容器部署。容器里 OTA 替换二进制不生效（/app 下是镜像层文件，
+    /// 重启/重建即还原），前端据此隐藏/禁用「升级」按钮，提示改用 deploy 流程重建镜像。
+    /// 检查本身无害（只读展示），故**不拒绝**，仅下发状态供前端提示。
+    #[serde(default)]
+    pub container_deployment: bool,
 }
 
 /// 更新执行结果（回前端）。
@@ -265,6 +271,63 @@ pub struct UpdatePerformResult {
     pub message: String,
     pub updated: bool,
     pub target_version: Option<String>,
+}
+
+/// OTA 更新错误（分类错误码：handler 按 [`Self::status_code`] 映射 HTTP 状态，
+/// 替代原先一律 500 —— 前端据此区分「输入错了(400)/环境冲突(409)/数据坏了(422)/
+/// 上游挂了(502)/内部(500)」并给出对应提示）。
+#[derive(Debug)]
+pub enum UpdateError {
+    /// 容器部署下执行 OTA：容器内替换二进制不生效（镜像层文件，重启即还原，
+    /// 用户以为升级成功实际回滚）。必须走 deploy 流程重建镜像。HTTP 409。
+    ContainerDeployment,
+    /// 显式传入的版本 tag 格式非法（用户输入问题）。HTTP 400。
+    BadTag(String),
+    /// 显式指定的目标版本不高于当前版本（用户以为能降级/回滚）。HTTP 409。
+    /// 与自动检查（target=None）场景区分：后者免更新是**正常结果**（Ok「已最新」），
+    /// 只有**显式**指定了一个不可达的方向才叫冲突。
+    VersionConflict(String),
+    /// 下载内容校验失败：sha256 校验文件格式异常 / 校验不匹配（数据无效，重试无益）。
+    /// HTTP 422。
+    HashMismatch(String),
+    /// 下载失败：全部镜像不可达 / 上游返回错误（上游问题，可稍后重试）。HTTP 502。
+    DownloadFailed(String),
+    /// 本进程侧内部错误：文件系统 IO、备份/替换失败等。HTTP 500。
+    Internal(String),
+}
+
+impl std::fmt::Display for UpdateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UpdateError::ContainerDeployment => write!(
+                f,
+                "容器部署请用 deploy 流程重建镜像，OTA 自更新仅适用于裸进程部署"
+            ),
+            UpdateError::BadTag(tag) => write!(f, "版本 tag 格式非法: {tag}"),
+            UpdateError::VersionConflict(tag) => {
+                write!(f, "目标版本 {tag} 不高于当前版本 {LOCAL_VERSION}，拒绝降级")
+            }
+            UpdateError::HashMismatch(msg) | UpdateError::DownloadFailed(msg) => write!(f, "{msg}"),
+            UpdateError::Internal(msg) => write!(f, "内部错误: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for UpdateError {}
+
+impl UpdateError {
+    /// 映射 HTTP 状态码：400 入参非法 / 409 状态冲突 / 422 数据无效 / 502 上游不可达 / 500 内部。
+    pub fn status_code(&self) -> StatusCode {
+        match self {
+            UpdateError::ContainerDeployment | UpdateError::VersionConflict(_) => {
+                StatusCode::CONFLICT
+            }
+            UpdateError::BadTag(_) => StatusCode::BAD_REQUEST,
+            UpdateError::HashMismatch(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            UpdateError::DownloadFailed(_) => StatusCode::BAD_GATEWAY,
+            UpdateError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
 }
 
 /// OTA 下载二进制的最大允许字节数（200 MiB）。
@@ -296,8 +359,51 @@ fn http_client() -> reqwest::Client {
         })
 }
 
+/// 版本列表缓存 TTL（60 秒）：check/perform 连续点击在 TTL 内命中，不重复全量拉镜像。
+///
+/// 只缓存 `fetch_versions` 的原始结果（版本列表）；`fetch_commits` 的 commit 快照
+/// **不缓存**（每次新鲜拉取——它是展示数据，且只在"有更新"时才拉，频率天然受限）。
+const VERSIONS_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// 进程级版本列表缓存（进程内全局；60s 过期后自然失效，无需清理）。
+static VERSIONS_CACHE: std::sync::Mutex<Option<(Instant, Vec<String>)>> =
+    std::sync::Mutex::new(None);
+
+/// 读版本缓存：TTL 内命中返回副本，未命中/过期返回 None。
+///
+/// `now`/`ttl` 由调用方注入以便测试（生产用 `Instant::now()` + `VERSIONS_CACHE_TTL`）。
+fn cached_versions_get(
+    cache: &std::sync::Mutex<Option<(Instant, Vec<String>)>>,
+    ttl: Duration,
+    now: Instant,
+) -> Option<Vec<String>> {
+    let guard = cache.lock().ok()?;
+    let (at, versions) = guard.as_ref()?;
+    if now.duration_since(*at) > ttl {
+        return None;
+    }
+    Some(versions.clone())
+}
+
+/// 写版本缓存（覆盖旧值）。
+fn cached_versions_put(
+    cache: &std::sync::Mutex<Option<(Instant, Vec<String>)>>,
+    versions: Vec<String>,
+    now: Instant,
+) {
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((now, versions));
+    }
+}
+
 /// 从 GitHub 拉最近的 tag 列表（按 semver 降序），多镜像回退，全失败返回空。
+/// 结果带 60s TTL 缓存（见 [`VERSIONS_CACHE`]）；**只缓存成功结果**——
+/// 镜像全挂时不缓存空列表，下次点击立即重试而不是干等一个 TTL 周期。
 async fn fetch_versions(limit: usize) -> Vec<String> {
+    if let Some(cached) = cached_versions_get(&VERSIONS_CACHE, VERSIONS_CACHE_TTL, Instant::now())
+    {
+        return cached.into_iter().take(limit).collect();
+    }
     let client = http_client();
     for (name, url) in github_api_candidates() {
         match with_update_auth(
@@ -322,6 +428,7 @@ async fn fetch_versions(limit: usize) -> Vec<String> {
                     versions.sort_by(|a, b| compare_versions(b, a).cmp(&0));
                     versions.truncate(limit);
                     tracing::info!("[Update] 经 {name} 取到 {} 个版本", versions.len());
+                    cached_versions_put(&VERSIONS_CACHE, versions.clone(), Instant::now());
                     return versions;
                 }
                 Err(e) => tracing::warn!("[Update] {name} 解析 tags 失败: {e}"),
@@ -400,6 +507,7 @@ pub async fn check_for_updates() -> UpdateCheckResult {
             available_versions: vec![],
             commits: vec![],
             error: Some("无法获取远端版本信息（所有镜像失败）".into()),
+            container_deployment: in_container(),
         },
         Some(latest_tag) => {
             let has_update = compare_versions(latest_tag, LOCAL_VERSION) > 0;
@@ -419,9 +527,55 @@ pub async fn check_for_updates() -> UpdateCheckResult {
                 available_versions: available,
                 commits,
                 error: None,
+                container_deployment: in_container(),
             }
         }
     }
+}
+
+/// 后台定时自动检查新版本（由 main.rs 按 `ota_auto_check` 门控接线）。
+///
+/// 语义与面板「检查更新」按钮完全一致（同一个 `check_for_updates`），只是定时触发；
+/// 发现新版**只打日志**（`[Update]` 前缀），**绝不自动下载/替换**——
+/// OTA 是「下载二进制 + sha256 校验 + 原子覆盖运行中的自己」的高危路径，无人值守
+/// 自动应用等于把"镜像投毒/中间人"升级成无人确认的 RCE；参考仓有「定时自动应用」
+/// 的先例（对应其配置里的自动应用时间字段），本仓明确不立项：要做自动应用，先做
+/// 独立可信信道的签名验签 + 人工确认窗口，另开会话设计。
+///
+/// 间隔 0 会被按 1 小时处理（tokio interval 不接受零时长，且零小时空转只会徒增
+/// GitHub API 出站往返）。
+pub(crate) fn spawn_auto_check(interval_hours: u32) {
+    let interval = Duration::from_secs(u64::from(interval_hours.max(1)) * 3600);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            let result = check_for_updates().await;
+            match (&result.latest_version, result.has_update) {
+                (Some(latest), true) => {
+                    tracing::info!(
+                        "[Update] 后台自动检查：有可用新版本 {latest}（本地 {local}）——仅通知不自动更新，可在面板手动升级",
+                        latest = latest.as_str(),
+                        local = result.local_version.as_str(),
+                    );
+                }
+                (Some(latest), false) => {
+                    tracing::debug!(
+                        "[Update] 后台自动检查：已是最新（本地 {local} / 远端 {latest}）",
+                        latest = latest.as_str(),
+                        local = result.local_version.as_str(),
+                    );
+                }
+                (None, _) => {
+                    tracing::warn!(
+                        "[Update] 后台自动检查失败：{}（{interval_hours} 小时后再试）",
+                        result.error.as_deref().unwrap_or("未知错误"),
+                    );
+                }
+            }
+        }
+    });
 }
 
 /// 多镜像回退下载一个资产，返回字节。全失败返回 Err。
@@ -486,31 +640,81 @@ async fn download_from_github_direct(tag: &str, asset: &str) -> anyhow::Result<V
     read_body_capped(resp, &format!("直连 GitHub {asset}"), MAX_DOWNLOAD_BYTES).await
 }
 
+/// 容器判定的纯逻辑（探测结果注入，便于测试；[`in_container`] 是它的薄接线）。
+///
+/// 判据：`/.dockerenv` 存在（Docker/OrbStack 等标准标记），或 `/proc/1/cgroup`
+/// 内容含 docker/kubepods（Kubernetes 的 cgroup 命名，含 K8s 场景）。
+/// cgroup 探测读失败（无 /proc 的机器等）按非容器处理——探测失败不误伤裸进程部署。
+fn container_detect(dockerenv_exists: bool, cgroup_content: Option<String>) -> bool {
+    dockerenv_exists
+        || cgroup_content
+            .map(|c| c.contains("docker") || c.contains("kubepods"))
+            .unwrap_or(false)
+}
+
+/// 检测是否运行在容器里（裸进程部署 vs 容器部署的语义分流）。
+fn in_container() -> bool {
+    container_detect(
+        std::path::Path::new("/.dockerenv").exists(),
+        std::fs::read_to_string("/proc/1/cgroup").ok(),
+    )
+}
+
+/// 容器部署下的 OTA 拒绝理由。非容器返回 None。
+///
+/// 独立成纯函数而非在 `perform_update` 里内联：容器检测是环境探测，与版本判定解耦——
+/// 检查接口（`check_for_updates`）**不拒绝**（只读展示，前端按
+/// `container_deployment` 字段提示），只有执行路径（`perform_update`）拒绝。
+fn container_rejection_reason() -> Option<String> {
+    if in_container() {
+        Some("容器部署请用 deploy 流程重建镜像，OTA 自更新仅适用于裸进程部署".to_string())
+    } else {
+        None
+    }
+}
+
 /// 执行 OTA 更新：下载新二进制 + sha256 校验 + 备份 + 原子替换。
 ///
 /// **不在此函数里重启**——替换成功后由 handler 调用 `restart_service` 触发 systemd 拉起新二进制，
 /// 与"一键重启"复用同一条路径。返回结果供前端提示（success 后前端提示"数秒后自动升级完成"）。
-pub async fn perform_update(target: Option<String>) -> anyhow::Result<UpdatePerformResult> {
-    // 1) 定目标版本
-    let check = check_for_updates().await;
-    if let Some(err) = &check.error {
-        anyhow::bail!("{err}");
+pub async fn perform_update(target: Option<String>) -> Result<UpdatePerformResult, UpdateError> {
+    // 0) 容器部署拒绝（目标版本判定**之前**）：容器内 /app 下的可执行文件是镜像层文件，
+    //    rename 后容器重启/镜像重建即还原——用户以为升级成功实际回滚。绝不静默换二进制。
+    if container_rejection_reason().is_some() {
+        return Err(UpdateError::ContainerDeployment);
     }
+    // 1) 定目标版本
+    let explicit = target.is_some();
     let tag = match target {
         Some(t) => {
             if !is_valid_version_tag(&t) {
-                anyhow::bail!("版本 tag 格式非法: {t}");
+                return Err(UpdateError::BadTag(t));
             }
             t
         }
-        None => check
-            .latest_version
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("无最新版本"))?,
+        // 显式指定 tag 时**不拉 GitHub tags**（MINOR-8）：直接走下载+校验。
+        // 原来无条件先拉一次 tags —— 显式 tag 场景下那次
+        // 往返纯属浪费（还可能因 GitHub 抖动误报「下载失败」而阻断本来可用的
+        // 指定版本安装）。
+        None => {
+            let check = check_for_updates().await;
+            if let Some(err) = &check.error {
+                return Err(UpdateError::DownloadFailed(err.clone()));
+            }
+            check
+                .latest_version
+                .clone()
+                .ok_or_else(|| UpdateError::DownloadFailed("无最新版本".into()))?
+        }
     };
 
-    // 已是目标版本或目标版本更旧 → 免更新（防降级）
+    // 已是目标版本或目标版本更旧 → 免更新（防降级）。
+    // 语义分流：**显式**指定了旧/等版本 → 409（用户以为能降级/回滚，必须明确拒绝）；
+    // 自动（target=None=升级到最新）→ 正常 Ok「已是最新」，不是错误，前端照常展示。
     if !target_is_newer(&tag) {
+        if explicit {
+            return Err(UpdateError::VersionConflict(tag));
+        }
         return Ok(UpdatePerformResult {
             success: true,
             message: format!("当前版本 {LOCAL_VERSION} 已是 {tag} 或更新，无需更新"),
@@ -522,7 +726,9 @@ pub async fn perform_update(target: Option<String>) -> anyhow::Result<UpdatePerf
     tracing::info!("[Update] 开始升级到 {tag}：下载二进制 + sha256 校验 + 替换（完成后自动重启）");
 
     // 2) 下载二进制（可走镜像加速）+ sha256 文件（强制 github.com 直连,独立可信信道）
-    let bin = download_asset(&tag, ASSET_BIN).await?;
+    let bin = download_asset(&tag, ASSET_BIN)
+        .await
+        .map_err(|e| UpdateError::DownloadFailed(e.to_string()))?;
     tracing::info!(
         "[Update] 二进制下载完成（{} 字节），开始取 sha256 校验文件",
         bin.len()
@@ -530,7 +736,9 @@ pub async fn perform_update(target: Option<String>) -> anyhow::Result<UpdatePerf
     // 安全(H1):sha256 只从 github 直连取,不走 asset_candidates 的第三方镜像——
     // 否则二进制与哈希同源,恶意镜像给"后门二进制+匹配哈希"即绕过校验=RCE。
     // 直连失败宁可中止升级,也不退回镜像取哈希(那等于没校验)。
-    let sha_txt = download_from_github_direct(&tag, &format!("{ASSET_BIN}.sha256")).await?;
+    let sha_txt = download_from_github_direct(&tag, &format!("{ASSET_BIN}.sha256"))
+        .await
+        .map_err(|e| UpdateError::DownloadFailed(e.to_string()))?;
 
     // 3) ⭐sha256 校验（安全红线：哈希来自 github 直连、与二进制下载源解耦,镜像投毒改不了哈希）
     let expected = String::from_utf8_lossy(&sha_txt)
@@ -539,30 +747,43 @@ pub async fn perform_update(target: Option<String>) -> anyhow::Result<UpdatePerf
         .unwrap_or("")
         .to_lowercase();
     if expected.len() != 64 {
-        anyhow::bail!("下载的 sha256 文件格式异常，拒绝更新");
+        return Err(UpdateError::HashMismatch(
+            "下载的 sha256 文件格式异常，拒绝更新".into(),
+        ));
     }
     let mut hasher = Sha256::new();
     hasher.update(&bin);
     let actual = hex::encode(hasher.finalize());
     if actual != expected {
-        anyhow::bail!("sha256 校验失败（期望 {expected}，实得 {actual}），拒绝替换二进制");
+        return Err(UpdateError::HashMismatch(format!(
+            "sha256 校验失败（期望 {expected}，实得 {actual}），拒绝替换二进制"
+        )));
     }
     tracing::info!("[Update] sha256 校验通过");
 
     // 4) 备份当前 exe + 替换。平台差异（运行中 exe 的替换方式不同）：
-    let exe = std::env::current_exe()?;
+    let exe = std::env::current_exe().map_err(|e| {
+        UpdateError::Internal(format!("获取当前可执行文件路径失败: {e}"))
+    })?;
     let bak = exe.with_extension("bak");
     let new = exe.with_extension("new");
     // 先写 .new（同目录，保证后续 rename 是同一文件系统的原子操作）
     tracing::info!("[Update] 写入新二进制到 {new:?} 并备份现役版本，准备原子替换");
-    tokio::fs::write(&new, &bin).await?;
+    tokio::fs::write(&new, &bin)
+        .await
+        .map_err(|e| UpdateError::Internal(format!("写入新二进制 {new:?} 失败: {e}")))?;
     // 赋可执行权限（Unix）
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perm = tokio::fs::metadata(&new).await?.permissions();
+        let mut perm = tokio::fs::metadata(&new)
+            .await
+            .map_err(|e| UpdateError::Internal(format!("读取新二进制元数据失败: {e}")))?
+            .permissions();
         perm.set_mode(0o755);
-        tokio::fs::set_permissions(&new, perm).await?;
+        tokio::fs::set_permissions(&new, perm)
+            .await
+            .map_err(|e| UpdateError::Internal(format!("设置可执行权限失败: {e}")))?;
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -571,10 +792,16 @@ pub async fn perform_update(target: Option<String>) -> anyhow::Result<UpdatePerf
         // 备份现役 exe（供启动自检失败时 systemd ExecStartPre 回滚兜底）。
         // ⚠️ 备份失败必须 abort：若无 .bak 就 rename 替换，回滚网彻底失效（崩了没得回滚）。
         // fail-safe 优于 fail-open——宁可本次不升级，也不留一个无回滚点的替换。
-        tokio::fs::copy(&exe, &bak).await.map_err(|e| {
-            anyhow::anyhow!("备份现役二进制到 {bak:?} 失败，已中止升级（不留无回滚点的替换）: {e}")
-        })?;
-        tokio::fs::rename(&new, &exe).await?;
+        tokio::fs::copy(&exe, &bak)
+            .await
+            .map_err(|e| {
+                UpdateError::Internal(format!(
+                    "备份现役二进制到 {bak:?} 失败，已中止升级（不留无回滚点的替换）: {e}"
+                ))
+            })?;
+        tokio::fs::rename(&new, &exe)
+            .await
+            .map_err(|e| UpdateError::Internal(format!("替换二进制失败: {e}")))?;
     }
 
     #[cfg(target_os = "windows")]
@@ -587,16 +814,20 @@ pub async fn perform_update(target: Option<String>) -> anyhow::Result<UpdatePerf
         // 拉起的就是新二进制。若第 2 步失败，尽力回滚（把 .bak 改回来），不留下缺失的 exe。
         // 先清理可能残留的旧 .bak（上次升级留下的），否则 rename 到已存在路径在 Windows 会失败。
         let _ = tokio::fs::remove_file(&bak).await;
-        tokio::fs::rename(&exe, &bak).await.map_err(|e| {
-            anyhow::anyhow!("移走现役二进制到 {bak:?} 失败，已中止升级（未改动运行中的 exe）: {e}")
-        })?;
+        tokio::fs::rename(&exe, &bak)
+            .await
+            .map_err(|e| {
+                UpdateError::Internal(format!(
+                    "移走现役二进制到 {bak:?} 失败，已中止升级（未改动运行中的 exe）: {e}"
+                ))
+            })?;
         if let Err(e) = tokio::fs::rename(&new, &exe).await {
             // 新二进制没顶上：尽力把旧的改名回来，避免原路径缺失导致重启后无 exe 可拉。
             let _ = tokio::fs::rename(&bak, &exe).await;
             let _ = tokio::fs::remove_file(&new).await;
-            return Err(anyhow::anyhow!(
+            return Err(UpdateError::Internal(format!(
                 "替换二进制失败，已回滚到原版本（未升级）: {e}"
-            ));
+            )));
         }
     }
     tracing::warn!("[Update] 二进制已替换为 {tag}（备份在 {bak:?}），待重启生效");
@@ -743,8 +974,8 @@ mod tests {
         unsafe { std::env::remove_var("KIROSTUDIO_UPDATE_REPO") };
         assert_eq!(github_repo(), DEFAULT_GITHUB_REPO);
 
-        let _g = EnvGuard::set("KIROSTUDIO_UPDATE_REPO", "dwgx/KiroStudio-skiapi");
-        assert_eq!(github_repo(), "dwgx/KiroStudio-skiapi");
+        let _g = EnvGuard::set("KIROSTUDIO_UPDATE_REPO", "example/override-repo");
+        assert_eq!(github_repo(), "example/override-repo");
     }
 
     #[test]
@@ -790,5 +1021,137 @@ mod tests {
         let assets = asset_candidates("v1.2.3", "kirostudio-linux-x86_64");
         assert!(assets.len() > 1);
         assert_eq!(assets.last().unwrap().0, "github-direct");
+    }
+
+    /// UpdateError → HTTP 状态码映射（前端按状态码分类展示/重试，逐变体钉死）。
+    #[test]
+    fn update_error_status_codes() {
+        assert_eq!(
+            UpdateError::ContainerDeployment.status_code(),
+            StatusCode::CONFLICT,
+            "容器部署拒绝 = 409（环境状态冲突）"
+        );
+        assert_eq!(
+            UpdateError::BadTag("1.2".into()).status_code(),
+            StatusCode::BAD_REQUEST,
+            "tag 格式非法 = 400（输入问题）"
+        );
+        assert_eq!(
+            UpdateError::VersionConflict("v0.9.0".into()).status_code(),
+            StatusCode::CONFLICT,
+            "显式降级 = 409（版本状态冲突）"
+        );
+        assert_eq!(
+            UpdateError::HashMismatch("x".into()).status_code(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "sha256 校验失败 = 422（数据无效）"
+        );
+        assert_eq!(
+            UpdateError::DownloadFailed("x".into()).status_code(),
+            StatusCode::BAD_GATEWAY,
+            "下载失败 = 502（上游不可达）"
+        );
+        assert_eq!(
+            UpdateError::Internal("x".into()).status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "内部错误 = 500"
+        );
+    }
+
+    /// 容器判定的纯逻辑：四个输入组合全覆盖。
+    ///
+    /// 刻意不写 `in_container()`/`container_rejection_reason()` 的环境断言——
+    /// 本仓库验证循环本身跑在容器里，那种断言在 CI 必红。
+    #[test]
+    fn container_detect_logic() {
+        assert!(
+            container_detect(true, None),
+            ".dockerenv 存在即容器（cgroup 探测失败也不影响）"
+        );
+        assert!(
+            container_detect(false, Some("1:name=systemd:/docker/abc123".into())),
+            "cgroup 含 docker 标记"
+        );
+        assert!(
+            container_detect(false, Some("0::/kubepods/besteffort/pod123".into())),
+            "cgroup 含 kubepods 标记（K8s）"
+        );
+        assert!(
+            !container_detect(false, None),
+            "cgroup 读失败 + 无 .dockerenv = 非容器（探测失败不误伤裸进程部署）"
+        );
+        assert!(
+            !container_detect(false, Some("1:name=systemd:/".into())),
+            "cgroup 无容器标记 = 非容器"
+        );
+    }
+
+    /// 版本缓存命中/过期/覆盖：用局部 Mutex + 注入时间，不碰全局缓存、不碰网络。
+    #[test]
+    fn versions_cache_hit_and_expiry() {
+        let cache = std::sync::Mutex::new(None);
+        let t0 = Instant::now();
+
+        assert_eq!(
+            cached_versions_get(&cache, VERSIONS_CACHE_TTL, t0),
+            None,
+            "空缓存必不命中"
+        );
+
+        let versions = vec!["v1.2.3".to_string(), "v1.2.2".to_string()];
+        cached_versions_put(&cache, versions.clone(), t0);
+        assert_eq!(
+            cached_versions_get(&cache, VERSIONS_CACHE_TTL, t0 + Duration::from_secs(30)),
+            Some(versions.clone()),
+            "TTL 内命中"
+        );
+        assert_eq!(
+            cached_versions_get(&cache, VERSIONS_CACHE_TTL, t0 + Duration::from_secs(61)),
+            None,
+            "超过 TTL 视为过期"
+        );
+
+        // 过期后可重新写入并立即命中（下次 fetch 的落盘路径）。
+        cached_versions_put(&cache, vec!["v2.0.0".into()], t0 + Duration::from_secs(61));
+        assert_eq!(
+            cached_versions_get(&cache, VERSIONS_CACHE_TTL, t0 + Duration::from_secs(61)),
+            Some(vec!["v2.0.0".to_string()])
+        );
+    }
+
+    /// ⭐ 源码守卫（MINOR-8）：显式指定 tag 的升级**不得**拉 GitHub tags。
+    ///
+    /// 原实现无条件先 `check_for_updates()` 拉一次 tags —— 显式 tag 场景下那次
+    /// 往返纯属浪费，且 GitHub 抖动会误报「下载失败」阻断本来可用的指定版本安装。
+    /// 修复后 `check_for_updates` 只存在于自动升级（`None`）分支内。
+    ///
+    /// 回退即 FAIL：把 tags 拉取挪回 match 之外（无条件执行）——`None => {`
+    /// 出现在 `check_for_updates` **之前**，位置断言红。
+    #[test]
+    fn explicit_tag_skips_tags_fetch() {
+        let src = include_str!("update.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        let fname = format!("pub async fn perform_update{}", "(");
+        let start = prod
+            .find(&fname)
+            .expect("perform_update 不应被改名");
+        let body_end = prod[start..]
+            .find("\nfn ")
+            .map(|i| i + start)
+            .unwrap_or(prod.len());
+        let body = &prod[start..body_end];
+
+        let check_at = body
+            .find("check_for_updates")
+            .expect("自动升级分支必须保留 tags 拉取");
+        let none_at = body
+            .find("None => {")
+            .expect("目标版本判定（None 分支）不应被改名");
+        assert!(
+            none_at < check_at,
+            "check_for_updates 必须只在 None（自动升级）分支内调用——\
+             显式 tag 场景不该拉 GitHub tags（浪费一次往返 + 可能误报下载失败）"
+        );
     }
 }

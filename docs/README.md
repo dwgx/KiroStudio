@@ -1,33 +1,35 @@
-# KiroStudio 文档索引
+# KiroStudio 文档索引（2026-08-21 收口）
 
-> 本目录只保留**活跃**文档。历史/陈旧文档已归档到 `docs/archive/`(本地保留,不进公开 repo)。
+**新窗读序：** 仓根 `STATUS.md` → 本目录 `TAKEOVER.md` → `.agent/HANDOFF.md` → `.agent/NEXT-PROMPT.md` → `.agent/BACKLOG-NEXT.md`。
 
-## 活跃文档（当前有效，随代码演进维护）
+发版在公开仓 `dwgx/KiroStudio`（v1.1.2）。旧私有 `KiroStudio-skiapi` 不要再推。
 
-### 核心技术参考
-- **ARCHITECTURE.md** — 系统架构:Rust 网关 + React 运维台的整体设计
-- **MODULES.md** — 模块划分与职责(src/ 各子系统)
-- **PROTOCOL.md** — 协议转换链路(Anthropic/OpenAI 入站 → Kiro 上游)
-- **INVALID-TOOL-PARAMETERS.md** — Invalid tool params 问题的分析与缓解方案
+过期过程稿在 `docs/archive/`（gitignore，仅本地）。不要用仓根旧 `HANDOFF-*`、`.opencode/state.md` 当现状。
 
-### 运维 / 部署
-- **DEPLOY-WINDOWS.md** — Windows 部署说明
-- **UI-COMPONENTS.md** — 运维台 UI 组件规范
+## 状态 / 接手
 
-### 进行中的专项
-- **I18N-TASK-FOR-GROK.md** / **I18N-RESIDUAL-FOR-GROK.md** — I18N 三语覆盖任务与残留清单
+- `TAKEOVER.md` — 执行层
+- `IMPROVEMENT-PLAN-2026-08-21.md` — 08-21 审查基线（完成态看 HANDOFF / BACKLOG-NEXT，不要把本文当待办总表）
+- `P2-7-ECOSYSTEM-SLICES.md` — 生态四点设计（切片 1 已落地）
+- `RELEASE-CHECKLIST.md` — 下一 tag 闸门（未授权打 tag）
+- `PERFORMANCE.md` — 性能实测（数字用前现读）
 
-### 交接
-- **PROMPT-NEXT-AI-0717.md** — 最新交接文档(**新窗口/换 AI 先读这份**)
+## 核心技术
 
-## 归档 (`docs/archive/`)
+- `ARCHITECTURE.md` / `MODULES.md` / `PROTOCOL.md` / `INVALID-TOOL-PARAMETERS.md`
+- `UI-COMPONENTS.md`
 
-历史交接链、已落地的规划/研究/设计文档、早期草案,均移至 `docs/archive/`。
-该目录整体被 `.gitignore` 忽略(含敏感运营信息:账户/租户/密钥线索,仅本地保留)。
-按需查阅:
+行号与「唯一端点」类断言会过期，以代码为准。
 
-- **交接链** `PROMPT-NEXT-AI-07xx.md` / `HANDOFF-*.md` — 逐日交接历史(最新一份 0717 在上层活跃区)
-- **规划** `PLAN-*.md` / `TODO-MASTER-*.md` / `PLAN.md` — 已落地的实施计划
-- **研究** `RESEARCH-*.md` / `DESIGN-M365-*.md` — 限流/热重载/M365 族级等专项研究
-- **早期草案** `OUTLINE.md` / `FEATURES.md` / `ENGINE.md` / `LOGIN.md` / `RESILIENCE.md` / `DISCUSSION.md` — 项目初期(7/1 前后)的设计草案,已被代码现状取代
-- **其他** `ATTACK-REPORT-*` / `VERIFY-*` / `BACKLOG.md` / `PROJECT-SELF.md` / `WINDOWS-BOOTSTRAP-PLAN.md` / `PROMPT-FIX-KAM-*`
+## 运维
+
+- `DEPLOY-WINDOWS.md` / `DEPLOYMENT.md` / `SECURITY-BACKUP.md` / `CRASHLOOP-ROLLBACK.md`
+
+## 参考（教训，不照搬）
+
+- `ref-ZyphrZero-kiro.rs.md` / `ref-kiro2cc-proxy.md`
+- `error-codes-inventory.md` / `model-compat-plan.md`
+
+## 归档
+
+`docs/archive/`：blockers、scheduling 研究、旧 spec、设计草稿。推导材料，不承载当前结论。

@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { toast } from 'sonner'
 import i18n from '@/i18n'
+import { isSuspiciousCooldown } from '@/lib/cooldown'
 import { useCredentials } from '@/hooks/use-credentials'
 import { useRatelimitInsights } from '@/hooks/use-usage'
 import { disabledReasonLabel } from '@/lib/i18n-labels'
@@ -202,10 +203,11 @@ export function usePoolNotifications() {
       }
     }
 
-    // 3. 可疑活动风控：从 insights 的冷却原因判定（账户级软风控，最痛点）
+    // 3. 可疑活动风控：从 insights 的冷却原因判定（账户级软风控，最痛点）。
+    // 判据走稳定枚举码 code（与 overview-page 共用 helper，防第二次遗漏）。
     if (insights) {
       for (const it of insights as RateLimitInsight[]) {
-        if ((it.cooldown?.reason ?? '').includes('可疑活动')) {
+        if (isSuspiciousCooldown(it.cooldown?.code)) {
           const c = list.find((x) => x.id === it.id)
           track(`suspicious:${it.id}`, 'suspicious', c ? credLabel(c) : `#${it.id}`)
         }

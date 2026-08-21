@@ -15,7 +15,7 @@
 # 用法（在服务器上跑）：
 #   hotswap.sh /tmp/kirostudio.new      # 完整交接
 #   hotswap.sh /tmp/kirostudio.new check  # 只做健康检查，不交接
-set -uo pipefail
+set -euo pipefail
 
 NEW_BIN="${1:?用法: $0 <新二进制路径> [check]}"
 MODE="${2:-swap}"
@@ -104,13 +104,13 @@ cleanup_bare_instance() {
   [[ -n $pid ]] || return 0
   kill -0 "$pid" 2>/dev/null || return 0
   log "异常退出：回收临时裸实例 PID=$pid（避免孤儿常驻 ${HOST}:${PORT} 分流真实流量）"
-  kill "$pid" 2>/dev/null
+  kill "$pid" 2>/dev/null || true
   for _ in $(seq 1 10); do
     kill -0 "$pid" 2>/dev/null || return 0
     sleep 1
   done
   log "裸实例 10s 未退出，SIGKILL"
-  kill -9 "$pid" 2>/dev/null
+  kill -9 "$pid" 2>/dev/null || true
 }
 trap cleanup_bare_instance EXIT
 trap 'die "收到中断信号"' INT TERM
@@ -144,12 +144,12 @@ done
 # ⚠️ 这里刻意**不**设 GRACEFUL_KILL_ISSUED：本实例从未通过健康检查，没有值得保全的
 # 在途请求，而它已绑上端口（SO_REUSEPORT 会给它派发真实流量）→ 保证不留孤儿优先于
 # 优雅 drain，故让 EXIT trap 接手并在 10s 后升级为 SIGKILL。别"顺手补上"这个 flag。
-[[ $ok == 1 ]] || { kill "$NEW_PID" 2>/dev/null; die "健康检查未通过（最后状态 $code），已杀新实例，旧实例继续服务"; }
+[[ $ok == 1 ]] || { kill "$NEW_PID" 2>/dev/null || true; die "健康检查未通过（最后状态 $code），已杀新实例，旧实例继续服务"; }
 log "新实例健康（PID=$NEW_PID）"
 
 if [[ $MODE == check ]]; then
   log "check 模式：不交接，杀掉新实例"
-  kill "$NEW_PID" 2>/dev/null
+  kill "$NEW_PID" 2>/dev/null || true
   GRACEFUL_KILL_ISSUED=1   # 已优雅收掉，EXIT trap 不再升级为 SIGKILL
   log "完成（旧实例未受任何影响）"
   exit 0
@@ -191,7 +191,7 @@ if [[ $ok != 1 ]]; then
   install -o kirostudio -g kirostudio -m 755 "${BIN}.prev" "$BIN" \
     || log "⚠️ 回滚换入失败，${BIN}.prev 仍完好，需人工处理"
   systemctl restart "$UNIT"
-  kill "$NEW_PID" 2>/dev/null
+  kill "$NEW_PID" 2>/dev/null || true
   GRACEFUL_KILL_ISSUED=1
   die "交接失败，已回滚到旧二进制（回滚点 ${BIN}.prev 仍保留）"
 fi
@@ -200,7 +200,7 @@ log "systemd 新实例已就绪（MainPID=$(systemctl show "$UNIT" -p MainPID --
 
 # ---- 阶段 4：撤掉临时裸实例 ----
 log "SIGTERM 临时裸实例（它会把自己的在途请求 drain 完再退出）"
-kill "$NEW_PID" 2>/dev/null
+kill "$NEW_PID" 2>/dev/null || true
 GRACEFUL_KILL_ISSUED=1   # 已优雅收掉，EXIT trap 不再升级为 SIGKILL
 # 不 wait：它可能还在 drain SSE 长流，这是预期行为，不该阻塞脚本。
 

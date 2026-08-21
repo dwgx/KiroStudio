@@ -30,6 +30,8 @@ export interface UiLayoutPrefs {
   poolSort: PoolSortMode
   /** 号池状态是否展示已禁用号 */
   poolShowDisabled: boolean
+  /** 概览页是否显示性能仪表盘（延迟分位/错误分布/池健康）。纯前端偏好，默认显示。 */
+  showPerfDashboard: boolean
   /** 凭据管理卡片尺寸档位 */
   cardSize: CardSize
   /** 凭据管理视图形态(卡片 / 紧凑行)。刻意复用本键而非新开 localStorage 键:
@@ -41,6 +43,7 @@ const STORAGE_KEY = 'uiLayoutPrefs'
 const DEFAULTS: UiLayoutPrefs = {
   poolSort: 'health',
   poolShowDisabled: true,
+  showPerfDashboard: true,
   cardSize: 'standard',
   credentialView: 'card',
 }

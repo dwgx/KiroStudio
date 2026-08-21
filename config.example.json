@@ -27,5 +27,83 @@
 
   // 网页上号回调基地址（可选）。服务器/Docker 部署且需网页 OAuth 上号时，
   // 填公网可达地址如 "https://kiro.example.com"；本机部署留空即可。
-  "callbackBaseUrl": ""
+  "callbackBaseUrl": "",
+
+  // UA 版本伪装：自动拉取官方稳定版 Kiro IDE 版本号（后台每 12h 一次），
+  // 成功则伪装成该版本（防上游按版本风控差异化），失败静默降级回内置版本。
+  // 默认 true。热更不生效（启动期读取），改后需重启。
+  "uaVersionFetch": true,
+
+  // 模型单价表（成本估算用，元/百万 token）。key 为模型名，与用量统计
+  // 「按模型」榜单的 key 对齐。空表 = 不估算成本。
+  // 每模型四档对齐 Anthropic 计费口径（camelCase）：
+  //   inputPerMtok         输入（不含缓存命中部分）
+  //   outputPerMtok        输出
+  //   cacheReadPerMtok     缓存读取
+  //   cacheCreationPerMtok 缓存新建
+  // 注意：cacheRead + cacheCreation 是 gross input 的子集，估算按 billed 口径
+  // （gross 减去两项 cache），避免缓存部分被计两次。只做展示估算，不影响真实计费。
+  "modelPricing": {
+    "claude-3-7-sonnet-20250219": {
+      "inputPerMtok": 3.0,
+      "outputPerMtok": 15.0,
+      "cacheReadPerMtok": 0.3,
+      "cacheCreationPerMtok": 3.75
+    }
+  },
+
+  // Webhook 告警地址（可选，默认不配置 = 关闭）。配置后关键自愈事件
+  // （吸收预算耗尽 / failover 号全灭 / 重试配额耗尽 / 429 风暴吸收轮等）
+  // 会 POST 一条 JSON（{key, value, window_secs, host}）到该地址；
+  // 同 key 在冷却窗口内只发一次，重复事件只累计计数（value 带窗口内增量）。
+  // ⚠️ 热更不生效（provider 构造时注入），改后需重启。
+  // ⚠️ 安全：网关会向该 URL 发起请求（SSRF 风险自负），
+  //    建议填内网不可达、只能外联的告警服务，绝不要填内网管理面地址。
+  "alertWebhookUrl": "",
+
+  // 告警去重冷却秒数（默认 600 = 10 分钟）。同 key 事件在此窗口内只发一次。
+  "alertCooldownSecs": 600,
+
+  // OTA 自动检查（仅检查 + 打日志，绝不自动下载替换；默认 false）。
+  // 开启后每 otaAutoCheckIntervalHours 小时调一次与面板「检查更新」相同的检查，
+  // 发现新版本只打日志。默认关：检查本身是 GitHub API 出站往返。
+  // 热更不生效（启动期读取），改后需重启。
+  "otaAutoCheck": false,
+
+  // OTA 自动检查间隔（小时，默认 24）。0 会被按 1 处理。
+  "otaAutoCheckIntervalHours": 24,
+
+  // 透传路径模拟缓存注入（默认关；热更即时生效）。
+  // 线上 4 个号全是 custom_api（透传池），透传路径零转换，响应的 cacheReadInputTokens
+  // 是上游原样（DeepSeek 恒 0）→ 下游（sub2api 等）看不到缓存分支。开启后透传响应
+  // usage 注入伪造值：cacheReadInputTokens = round(inputTokens × 比例)、
+  // cacheCreationInputTokens 置 0（模拟全命中不写缓存）。仅供下游展示，不是真实计费依据。
+  "mockCacheEnabled": false,
+
+  // 模拟缓存命中比例 [0,1]，默认 0.7；1.0 = 100% 全命中。非法值（>1 / <0 / NaN）会被 clamp。
+  "mockCacheReadRatio": 0.7,
+
+  // 错误码/提示词覆盖表（可配，热更即时生效；不配置或传 {} = 全部用内置默认 = 现状文案）。
+  // key = 错误形态标识（完整 key 集见内置默认表，共 61 个，如 quota_exhausted /
+  //   overloaded_capacity / model_unsupported / auth_invalid / upstream_5xx 等，
+  //   文档 docs/error-codes-inventory.md + docs/error-codes-config-design.md）。
+  // 条目内字段全可选（camelCase）：省略 = 用内置默认（只改 message 时 status/type 不必填）。
+  // 校验规则（任一非法 → 整表拒绝，保持旧表，返回 400 具体错误）：
+  //   - status 白名单 [400,401,403,404,413,429,500,502,503]
+  //   - type 白名单（Anthropic 官方 9 类 + quota_exceeded_error）
+  //   - 组合约束：429→rate_limit_error/overloaded_error；401→authentication_error；
+  //     403→permission_error；404→not_found_error；400/413→invalid_request_error/request_too_large
+  //   - retryAfterSecs 0-3600；message ≤500 字符；key 命名小写字母/数字/下划线
+  // ⚠️ 承重字符串（等容量 / prompt is too long / 英文背压哨兵）建议保留——外挂与客户端
+  //   拿它们当判据，改掉会静默失效（仅告警不硬拒，清单见 docs/error-codes-inventory.md §3.1）。
+  "errorMessages": {
+    "quota_exhausted": {
+      "status": 429,
+      "type": "rate_limit_error",
+      "message": "月度请求配额已耗尽（号池内所有凭据）。排障：①面板查看各凭据用量；②等待配额周期重置；③为号池补充新凭据。"
+    },
+    "overloaded_capacity": {
+      "retryAfterSecs": 3
+    }
+  }
 }

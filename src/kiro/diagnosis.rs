@@ -278,25 +278,6 @@ pub fn diagnose_no_profile_in_region(
     )
 }
 
-/// 诊断 getUsageLimits 403 FEATURE_NOT_SUPPORTED（该 region profile 未开通/未激活）。
-pub fn diagnose_feature_not_supported(region: &str) -> OnboardingDiagnosis {
-    OnboardingDiagnosis::new(
-        Stage::Verify,
-        Fault::AccountState,
-        "FEATURE_NOT_SUPPORTED",
-        format!(
-            "{} 的 profile 未开通该功能（FEATURE_NOT_SUPPORTED）。",
-            region
-        ),
-        &[
-            "网关会在刷新时自动重探并纠正到可用 region。",
-            "或在凭据设置里手动切换到已开通的 region。",
-        ],
-        None,
-        true,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

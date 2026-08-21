@@ -1,5 +1,6 @@
 import * as React from 'react'
 import { AlertTriangle } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -20,7 +21,7 @@ export function ConfirmDialog({
   onOpenChange,
   title,
   description,
-  confirmLabel = '确定',
+  confirmLabel,
   destructive = false,
   loading = false,
   onConfirm,
@@ -36,6 +37,7 @@ export function ConfirmDialog({
   onConfirm: () => void
   children?: React.ReactNode
 }) {
+  const { t } = useTranslation()
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-md">
@@ -49,14 +51,14 @@ export function ConfirmDialog({
         {children}
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={loading}>
-            取消
+            {t('confirmdialog.cancel')}
           </Button>
           <Button
             variant={destructive ? 'destructive' : 'default'}
             onClick={onConfirm}
             disabled={loading}
           >
-            {loading ? '处理中…' : confirmLabel}
+            {loading ? t('confirmdialog.processing') : (confirmLabel ?? t('confirmdialog.confirm'))}
           </Button>
         </DialogFooter>
       </DialogContent>

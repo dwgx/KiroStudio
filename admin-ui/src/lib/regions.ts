@@ -41,11 +41,9 @@ export const AWS_REGIONS: AwsRegion[] = [
 
 const REGION_MAP = new Map<string, AwsRegion>(AWS_REGIONS.map((r) => [r.code, r]))
 
-/** 展示名：中文界面用中文名，其它语言用城市英文名；未知 code 原样返回。 */
+/** 展示名：本地化 region 名（region.<code> 键组）；未知 code 原样返回。 */
 function regionDisplayName(r: AwsRegion): string {
-  const lng = (i18n.language || 'zh').toLowerCase()
-  if (lng.startsWith('zh')) return r.label
-  return r.city
+  return i18n.t(`region.${r.code}`, { defaultValue: r.label })
 }
 
 /** code -> 本地化名；未知 code 原样返回，便于兼容 AWS 新区。 */

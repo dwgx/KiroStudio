@@ -28,6 +28,8 @@ import {
   LayoutGrid,
   Users,
   X,
+  HelpCircle,
+  MessageSquareWarning,
 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -45,7 +47,8 @@ import { StatCard } from '@/components/ui/stat-card'
 import { useConfigSnapshot, useUpdateConfig, useCredentials } from '@/hooks/use-credentials'
 import { useRestartService, useStorageStats, useCleanupStorage, useCheckUpdate, usePerformUpdate, useUpdateStatus } from '@/hooks/use-ops'
 import { useUsageClients } from '@/hooks/use-usage'
-import { useUiLayoutPrefs, type PoolSortMode, type CardSize, type UiLayoutPrefs } from '@/hooks/use-ui-layout-prefs'
+import { useUiLayoutPrefs, type PoolSortMode, type CardSize } from '@/hooks/use-ui-layout-prefs'
+import { toForm, diffForm, type FormState } from '@/lib/settings-form'
 import {
   exportCredential,
   listTrash,
@@ -53,7 +56,7 @@ import {
   purgeCredential,
   purgeTrashBatch,
 } from '@/api/credentials'
-import { extractErrorMessage, copyToClipboard } from '@/lib/utils'
+import { extractErrorMessage, parseError, copyToClipboard } from '@/lib/utils'
 import { RegionSelect } from '@/components/ui/region-select'
 import { NumberStepper } from '@/components/ui/number-stepper'
 import { ComboInput } from '@/components/ui/combo-input'
@@ -65,7 +68,8 @@ import {
   BgCacheDetailDialog,
 } from '@/components/ops-detail-dialogs'
 import { Eye } from 'lucide-react'
-import { disabledReasonLabel } from '@/lib/i18n-labels'
+import { disabledReasonLabel, storagePartitionLabel } from '@/lib/i18n-labels'
+import { ErrorMessagesDialog } from '@/components/error-messages-dialog'
 
 // 版本字段的常见预设（可点选，也可自定义输入）。与 Kiro IDE 实际发行的标识对齐，
 // 便于伪装成主流客户端指纹；不在列表里的值直接手敲即可。
@@ -73,13 +77,11 @@ const KIRO_VERSION_PRESETS = ['0.3.16', '0.3.15', '0.3.14', '0.3.13', '0.2.28', 
 const SYSTEM_VERSION_PRESETS = ['win32', 'darwin', 'linux', '10.0.22631', '10.0.19045', '14.5', '13.6']
 const NODE_VERSION_PRESETS = ['20.11.1', '20.18.1', '18.20.4', '22.11.0', '18.18.2']
 import type {
-  ConfigSnapshotResponse,
-  UpdateConfigRequest,
   StoragePartition,
   StorageCleanupTarget,
   ClientRpm,
   TrashItem,
-  ThrottleProfile,
+  SchedulingMode,
 } from '@/types/api'
 import type { TFunction } from 'i18next'
 
@@ -156,6 +158,7 @@ const CARD_INDEX_DEFS: { section: SectionId; titleKey: string; kwKey: string }[]
   { section: 'advanced', titleKey: 'settingspage.card.cliAlign', kwKey: 'settingspage.card.cliAlign.kw' },
   { section: 'advanced', titleKey: 'settingspage.card.advAbsorb', kwKey: 'settingspage.card.advAbsorb.kw' },
   { section: 'advanced', titleKey: 'settingspage.card.advCache', kwKey: 'settingspage.card.advCache.kw' },
+  { section: 'advanced', titleKey: 'settingspage.card.errorMessages', kwKey: 'settingspage.card.errorMessages.kw' },
   { section: 'basic', titleKey: 'settingspage.card.loginBg', kwKey: 'settingspage.card.loginBg.kw' },
   { section: 'security', titleKey: 'settingspage.card.security', kwKey: 'settingspage.card.security.kw' },
   { section: 'scheduling', titleKey: 'settingspage.card.loadBalance', kwKey: 'settingspage.card.loadBalance.kw' },
@@ -228,233 +231,6 @@ function SectionGate({
   return section === active ? <>{children}</> : null
 }
 
-// 可编辑表单的本地状态（字符串化便于受控输入）
-interface FormState {
-  host: string
-  port: string
-  region: string
-  kiroVersion: string
-  systemVersion: string
-  nodeVersion: string
-  tlsBackend: string
-  loadBalancingMode: string
-  defaultEndpoint: string
-  extractThinking: boolean
-  ccAutoBuffer: boolean
-  importKeysEnabled: boolean
-  // 上游 429 吸收层（数值字段同样字符串化，与其余受控数字输入一致）
-  upstreamRetryAbsorbEnabled: boolean
-  upstreamRetryAbsorbBudgetSecs: string
-  upstreamRetryAbsorbMaxRounds: string
-  upstreamRetryAbsorbMinDelayMs: string
-  upstreamRetryAbsorbMaxDelaySecs: string
-  upstreamRetryAbsorbSuspended: boolean
-  upstreamRetryAbsorbServerError: boolean
-  upstreamRetryAbsorbCapacity400: boolean
-  upstreamRetryAbsorbSwapBudgetSecs: string
-  /** 勾选 = 耗尽时返回 429（默认 503）；变量名保留 exhausted503 历史命名 */
-  upstreamRetryAbsorbExhausted503: boolean
-  stripEnvNoise: boolean
-  toolCleanLeakedTokens: boolean
-  toolReclaimTextifiedInvoke: boolean
-  toolStrayRepeatGuard: boolean
-  toolStreamAlignFailure: boolean
-  toolExposeErrorToClient: boolean
-  toolRepairJson: boolean
-  toolTruncationRecovery: boolean
-  toolDescriptionMaxChars: string
-  // CLI 端点协议/指纹三开关（详见各自 hint 与后端 config 字段注释）
-  cliOriginKiroCli: boolean
-  cliCodewhispererOptoutFalse: boolean
-  cliUaAlignRealClient: boolean
-  // prompt cache 记账下发开关（估算值，非上游真值）
-  promptCacheEnabled: boolean
-  selfHealBaseBackoffSecs: string
-  selfHealMaxBackoffSecs: string
-  selfHealMaxShift: string
-  nativeThinkingEffortEnabled: boolean
-  encryptCredentialsAtRest: boolean
-  cooldownEnabled: boolean
-  autoDisableSuspicious: boolean
-  allCoolingFastFail: boolean
-  rateLimitEnabled: boolean
-  rateLimitDailyMax: string
-  rateLimitMinIntervalMs: string
-  affinityEnabled: boolean
-  priorityInBalanced: boolean
-  // 智能调度（0.7.23/0.7.24，均热更即时生效）
-  credentialRpmLimit: string
-  rpmHeadroomFactor: string
-  rpmReserveSlots: string
-  rpmHardGateOverloadWait: boolean
-  cooldownScalePct: string
-  rateLimitJitterPct: string
-  throttleProfile: ThrottleProfile
-  inboundThrottleEnabled: boolean
-  inboundRpmAuto: boolean
-  inboundTargetRpm: string
-  inboundRpmMin: string
-  inboundRpmMax: string
-  inboundBurstSecs: string
-  inboundQueueMaxWaitSecs: string
-  inboundQueueTimeoutPassthrough: boolean
-  balanceWeightEnabled: boolean
-  balanceWeightFloor: string
-  health429WeightEnabled: boolean
-  proxyUrl: string
-  proxyUsername: string
-  proxyPassword: string
-  apiKey: string
-  callbackBaseUrl: string
-  // 反代安全（批次3）：列表用换行分隔的多行文本承载
-  corsAllowedOrigins: string
-  ipAllowlist: string
-  ipBlocklist: string
-  machineCodeBlocklist: string
-  trustForwardedHeader: boolean
-  ingressRateLimitPerMin: string
-  maxBodyBytes: string
-  // 主动 token 预刷新（批次4.4）
-  proactiveTokenRefresh: boolean
-  tokenRefreshLeadMinutes: string
-  tokenRefreshIntervalSecs: string
-  // Admin UI 登录页背景（立即生效）
-  loginBackgroundEnabled: boolean
-  loginBackgroundR18: boolean
-  // UI 排版自定义（纯前端 localStorage，纳入统一保存流程：切换改 form，保存时才落地）
-  poolSort: PoolSortMode
-  poolShowDisabled: boolean
-  cardSize: CardSize
-  // 全局模型映射（JSON 文本，双口径用量的 requested→upstream；空对象 = 不映射）
-  modelMapping: string
-}
-
-/* ============ promptCacheEnabled 的本地类型补丁 ============ */
-// 后端两侧都已有该字段（`src/admin/types.rs:898` 响应 / `:1031` 请求，serde camelCase），
-// 但 `src/types/api.ts` 的两个接口里还没有它。api.ts 此刻正被其他会话改，
-// 不在本次可改文件内，故在本文件内做最小补丁；等 api.ts 补上字段后删掉这两个别名即可。
-type ConfigWithCache = ConfigSnapshotResponse & { promptCacheEnabled?: boolean }
-type UpdateWithCache = UpdateConfigRequest & { promptCacheEnabled?: boolean }
-
-// 后端 `default_prompt_cache_enabled()`（`src/model/config.rs:885`）返回 true，
-// 字段缺失时按 true 兜底，避免面板把"未下发"显示成"已关闭"。
-const PROMPT_CACHE_DEFAULT = true
-
-// 多行文本 <-> 字符串列表（去空白、去空行）
-function linesToList(s: string): string[] {
-  return s
-    .split('\n')
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0)
-}
-
-function listToLines(list: string[]): string {
-  return list.join('\n')
-}
-
-// 比较两个字符串列表是否等价（顺序敏感）
-function sameList(a: string[], b: string[]): boolean {
-  return a.length === b.length && a.every((v, i) => v === b[i])
-}
-
-function toForm(c: ConfigSnapshotResponse, ui: UiLayoutPrefs): FormState {
-  return {
-    host: c.host,
-    port: String(c.port),
-    region: c.region,
-    kiroVersion: c.kiroVersion,
-    systemVersion: c.systemVersion,
-    nodeVersion: c.nodeVersion,
-    tlsBackend: c.tlsBackend,
-    loadBalancingMode: c.loadBalancingMode,
-    defaultEndpoint: c.defaultEndpoint,
-    extractThinking: c.extractThinking,
-    ccAutoBuffer: c.ccAutoBuffer,
-    importKeysEnabled: c.importKeysEnabled,
-    upstreamRetryAbsorbEnabled: c.upstreamRetryAbsorbEnabled ?? false,
-    upstreamRetryAbsorbBudgetSecs: String(c.upstreamRetryAbsorbBudgetSecs ?? 45),
-    upstreamRetryAbsorbMaxRounds: String(c.upstreamRetryAbsorbMaxRounds ?? 3),
-    upstreamRetryAbsorbMinDelayMs: String(c.upstreamRetryAbsorbMinDelayMs ?? 150),
-    upstreamRetryAbsorbMaxDelaySecs: String(c.upstreamRetryAbsorbMaxDelaySecs ?? 15),
-    upstreamRetryAbsorbSuspended: c.upstreamRetryAbsorbSuspended ?? false,
-    upstreamRetryAbsorbServerError: c.upstreamRetryAbsorbServerError ?? false,
-    upstreamRetryAbsorbCapacity400: c.upstreamRetryAbsorbCapacity400 ?? false,
-    upstreamRetryAbsorbSwapBudgetSecs: String(c.upstreamRetryAbsorbSwapBudgetSecs ?? 0),
-    upstreamRetryAbsorbExhausted503: c.upstreamRetryAbsorbExhaustedStatus === 429,
-    stripEnvNoise: c.stripEnvNoise,
-    toolCleanLeakedTokens: c.toolCleanLeakedTokens ?? true,
-    toolReclaimTextifiedInvoke: c.toolReclaimTextifiedInvoke ?? true,
-    toolStrayRepeatGuard: c.toolStrayRepeatGuard ?? true,
-    toolStreamAlignFailure: c.toolStreamAlignFailure ?? true,
-    toolExposeErrorToClient: c.toolExposeErrorToClient ?? true,
-    toolRepairJson: c.toolRepairJson ?? true,
-    toolTruncationRecovery: c.toolTruncationRecovery ?? false,
-    toolDescriptionMaxChars: String(c.toolDescriptionMaxChars ?? 10000),
-    // 三项默认 false：与后端 serde default 一致，保证「未配置」在前后端读到同一值。
-    cliOriginKiroCli: c.cliOriginKiroCli ?? false,
-    cliCodewhispererOptoutFalse: c.cliCodewhispererOptoutFalse ?? false,
-    cliUaAlignRealClient: c.cliUaAlignRealClient ?? false,
-    promptCacheEnabled: (c as ConfigWithCache).promptCacheEnabled ?? PROMPT_CACHE_DEFAULT,
-    selfHealBaseBackoffSecs: String(c.selfHealBaseBackoffSecs ?? 60),
-    selfHealMaxBackoffSecs: String(c.selfHealMaxBackoffSecs ?? 900),
-    selfHealMaxShift: String(c.selfHealMaxShift ?? 4),
-    nativeThinkingEffortEnabled: c.nativeThinkingEffortEnabled ?? false,
-    encryptCredentialsAtRest: c.encryptCredentialsAtRest ?? false,
-    cooldownEnabled: c.cooldownEnabled,
-    autoDisableSuspicious: c.autoDisableSuspicious ?? true,
-    allCoolingFastFail: c.allCoolingFastFail ?? true,
-    rateLimitEnabled: c.rateLimitEnabled,
-    rateLimitDailyMax: String(c.rateLimitDailyMax),
-    rateLimitMinIntervalMs: String(c.rateLimitMinIntervalMs),
-    affinityEnabled: c.affinityEnabled,
-    priorityInBalanced: c.priorityInBalanced,
-    credentialRpmLimit: String(c.credentialRpmLimit ?? 0),
-    rpmHeadroomFactor: String(c.rpmHeadroomFactor ?? 85),
-    rpmReserveSlots: String(c.rpmReserveSlots ?? 0),
-    rpmHardGateOverloadWait: c.rpmHardGateOverloadWait ?? false,
-    cooldownScalePct: String(c.cooldownScalePct ?? 100),
-    rateLimitJitterPct: String(c.rateLimitJitterPct ?? 20),
-    throttleProfile: c.throttleProfile ?? 'manual',
-    inboundThrottleEnabled: c.inboundThrottleEnabled ?? true,
-    inboundRpmAuto: c.inboundRpmAuto ?? true,
-    inboundTargetRpm: String(c.inboundTargetRpm ?? 100),
-    inboundRpmMin: String(c.inboundRpmMin ?? 20),
-    inboundRpmMax: String(c.inboundRpmMax ?? 300),
-    inboundBurstSecs: String(c.inboundBurstSecs ?? 2),
-    inboundQueueMaxWaitSecs: String(c.inboundQueueMaxWaitSecs ?? 30),
-    inboundQueueTimeoutPassthrough: c.inboundQueueTimeoutPassthrough ?? true,
-    balanceWeightEnabled: c.balanceWeightEnabled ?? true,
-    balanceWeightFloor: String(c.balanceWeightFloor ?? 50),
-    health429WeightEnabled: c.health429WeightEnabled ?? true,
-    proxyUrl: c.proxyUrl ?? '',
-    // 代理账密出于安全后端不下发,UI 留空占位:留空=不改,填了=更新。
-    proxyUsername: '',
-    proxyPassword: '',
-    // userKey(对话 api_key)后端不下发明文,留空=不改,填了=更新(需重启生效)。
-    apiKey: '',
-    callbackBaseUrl: c.callbackBaseUrl ?? '',
-    corsAllowedOrigins: listToLines(c.corsAllowedOrigins ?? []),
-    ipAllowlist: listToLines(c.ipAllowlist ?? []),
-    ipBlocklist: listToLines(c.ipBlocklist ?? []),
-    machineCodeBlocklist: listToLines(c.machineCodeBlocklist ?? []),
-    trustForwardedHeader: c.trustForwardedHeader,
-    ingressRateLimitPerMin: String(c.ingressRateLimitPerMin),
-    maxBodyBytes: String(c.maxBodyBytes),
-    proactiveTokenRefresh: c.proactiveTokenRefresh,
-    tokenRefreshLeadMinutes: String(c.tokenRefreshLeadMinutes),
-    tokenRefreshIntervalSecs: String(c.tokenRefreshIntervalSecs),
-    // 缺省视为开启（后端字段可能尚未下发时不误显示为关闭）
-    loginBackgroundEnabled: c.loginBackgroundEnabled ?? true,
-    loginBackgroundR18: c.loginBackgroundR18 ?? false,
-    // UI 排版偏好（纯前端 localStorage，作为 form 基线纳入统一保存）
-    poolSort: ui.poolSort,
-    poolShowDisabled: ui.poolShowDisabled,
-    cardSize: ui.cardSize,
-    // 全局模型映射：对象序列化成 JSON 文本（空对象 = 不映射）。非法 JSON 后端会拒绝保存。
-    modelMapping: JSON.stringify(c.modelMapping ?? {}, null, 2),
-  }
-}
-
 // 搜索命中判定：query 为空恒真；否则 label/hint 任一包含 query 才算命中（用于逐项过滤）。
 function rowMatches(query: string, label: string, hint?: string): boolean {
   if (!query) return true
@@ -462,17 +238,20 @@ function rowMatches(query: string, label: string, hint?: string): boolean {
 }
 
 // 一行可编辑/只读项布局。搜索态下若本项不命中则隐藏，命中则高亮 label。
+// a11y：外层用 <label> 而非 <div>——行内控件（Switch/Input/textarea/select 等）以
+// 隐式关联获得可访问名称（无 htmlFor 时 label 关联其第一个可标注后代），消除
+// 「表单字段缺 label 关联」的 console 告警。布局类名不变，视觉零改动。
 function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
   const { query } = useContext(SearchContext)
   if (!rowMatches(query, label, hint)) return null
   return (
-    <div className="flex items-start justify-between gap-4 py-3 border-b last:border-0">
+    <label className="flex items-start justify-between gap-4 py-3 border-b last:border-0">
       <div className="min-w-0 flex-1">
         <div className="text-sm"><Highlight text={label} /></div>
         {hint && <div className="text-xs text-muted-foreground mt-0.5 leading-relaxed">{hint}</div>}
       </div>
       <div className="shrink-0 flex justify-end pt-0.5">{children}</div>
-    </div>
+    </label>
   )
 }
 
@@ -633,7 +412,8 @@ function ReadonlyRow({ label, value, mono }: { label: string; value: React.React
 // 子卡片后台刷新失败但仍有上次成功数据时，挂在标题旁的小角标。
 // 为什么不复用整块"加载失败"文案：那会把仍然有效的旧值整段抹掉；
 // 网关 502 期间数据本身没坏，只是停更了，让用户看到旧值 + 一个明确的"已过期"标记信息量更大。
-function StaleBadge({ updatedAt }: { updatedAt?: number }) {
+// export 供 overview-page 的余额展示复用（余额数据旧 >1h 时同款角标）。
+export function StaleBadge({ updatedAt }: { updatedAt?: number }) {
   const { t } = useTranslation()
   return (
     <span
@@ -829,7 +609,7 @@ function StoragePartitionRow({
     <div className="flex items-center justify-between gap-4 border-b border-border/40 py-3 last:border-0">
       <div className="min-w-0">
         <div className="flex items-center gap-2 text-sm">
-          <span className="truncate">{p.label}</span>
+          <span className="truncate">{storagePartitionLabel(p.key, p.label)}</span>
           {p.inMemory && (
             <Badge variant="outline" className="text-[10px]">
               {t('settingspage.storage.inMemory')}
@@ -971,7 +751,7 @@ function StorageStatsCard() {
       <ConfirmDialog
         open={target !== null}
         onOpenChange={(v) => !v && setTarget(null)}
-        title={t('settingspage.storage.confirmTitle', { label: target?.label ?? '' })}
+        title={t('settingspage.storage.confirmTitle', { label: target ? storagePartitionLabel(target.key, target.label) : '' })}
         description={
           <span>
             {t('settingspage.storage.confirmDescBase')}
@@ -992,12 +772,14 @@ function StorageStatsCard() {
             <span className="text-sm">{t('settingspage.storage.keepDays')}</span>
             <div className="flex items-center gap-2">
               <Input
+                id="storage-keep-days"
                 className="w-24 text-right"
                 type="number"
                 min={0}
                 value={keepDays}
                 onChange={(e) => setKeepDays(e.target.value)}
                 placeholder={t('settingspage.common.default')}
+                aria-label={t('settingspage.storage.keepDays')}
               />
               <span className="text-xs text-muted-foreground">{t('settingspage.common.days')}</span>
             </div>
@@ -1521,11 +1303,13 @@ function TrashCard() {
       toast.success(t('settingspage.trash.toast.restored', { id: item.id }))
       invalidate()
     } catch (err) {
-      const msg = extractErrorMessage(err)
+      const parsed = parseError(err)
+      const msg = parsed.title
       // 多开分身与主凭据**必然同 key**，默认路径会被 key 去重挡住。
       // 这里自动重试一次强制恢复：恢复后仍是禁用态，不会跳过运维确认直接投入调度，
       // 故这个自动重试是安全的。仍失败才把错误抛给用户。
-      if (msg.includes('重复')) {
+      // 判据走后端稳定 error.type（duplicate_credential），与「重复」字样的中文文案脱钩。
+      if (parsed.type === 'duplicate_credential') {
         try {
           await restoreCredential(item.id, true)
           toast.success(t('settingspage.trash.toast.restoredForced', { id: item.id }))
@@ -1661,6 +1445,7 @@ function TrashCard() {
               <div className="relative w-full max-w-xs">
                 <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
                 <Input
+                  id="trash-search"
                   value={trashSearch}
                   onChange={(e) => {
                     setTrashSearch(e.target.value)
@@ -1672,8 +1457,9 @@ function TrashCard() {
                 />
               </div>
               <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                <span>{t('settingspage.trash.perPage')}</span>
+                <label htmlFor="trash-page-size">{t('settingspage.trash.perPage')}</label>
                 <select
+                  id="trash-page-size"
                   value={pageSize}
                   onChange={(e) => {
                     const n = Number(e.target.value)
@@ -1766,6 +1552,35 @@ function TrashCard() {
   )
 }
 
+/* ============ 错误提示词：入口卡（点击打开独立配置弹窗） ============ */
+
+// 高级设置区的「错误提示词」入口卡。弹窗本体是独立组件 ErrorMessagesDialog
+// （参照 ops-detail-dialogs 的 TraceDetailDialog 页面化模式），入口卡只管开关。
+function ErrorMessagesEntryCard() {
+  const { t } = useTranslation()
+  const [open, setOpen] = useState(false)
+  return (
+    <>
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="text-base"><Highlight text={t('settingspage.card.errorMessages')} /></CardTitle>
+          <p className="text-xs text-muted-foreground">{t('settingspage.errorMessages.cardSubtitle')}</p>
+        </CardHeader>
+        <CardContent className="py-0">
+          <div className="flex items-center justify-between gap-3 py-3">
+            <span className="text-sm text-muted-foreground">{t('settingspage.errorMessages.entryHint')}</span>
+            <Button variant="outline" size="sm" onClick={() => setOpen(true)}>
+              <MessageSquareWarning className="mr-1.5 h-4 w-4" />
+              {t('settingspage.errorMessages.open')}
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+      <ErrorMessagesDialog open={open} onOpenChange={(v) => !v && setOpen(false)} />
+    </>
+  )
+}
+
 export function SettingsPage() {
   const { t, i18n } = useTranslation()
   const { data: config, isLoading, error, refetch } = useConfigSnapshot()
@@ -1786,6 +1601,10 @@ export function SettingsPage() {
   }, [credentialsForHints])
 
   const [form, setForm] = useState<FormState | null>(null)
+
+  // 调度模式（三按钮）切换确认：切智能/稳定会覆盖高级参数手动值 + 写 cooldownEnabled=true，
+  // 必须让用户知情确认（方案 docs/scheduling-config-simplify.md §3.2）。
+  const [modeConfirm, setModeConfirm] = useState<SchedulingMode | null>(null)
 
   // 分区导航当前 tab + 搜索关键词（纯前端）。
   const [activeSection, setActiveSection] = useState<SectionId>('basic')
@@ -1821,171 +1640,14 @@ export function SettingsPage() {
     setForm((prev) => (prev ? { ...prev, [key]: value } : prev))
 
   // 计算与基线的差异，只提交改动的字段
-  const diff = useMemo<UpdateWithCache>(() => {
-    if (!config || !form) return {}
-    const d: UpdateWithCache = {}
-    if (form.host.trim() !== config.host) d.host = form.host.trim()
-    const port = Number(form.port)
-    if (Number.isFinite(port) && port !== config.port) d.port = port
-    if (form.region.trim() !== config.region) d.region = form.region.trim()
-    if (form.kiroVersion.trim() !== config.kiroVersion) d.kiroVersion = form.kiroVersion.trim()
-    if (form.systemVersion.trim() !== config.systemVersion) d.systemVersion = form.systemVersion.trim()
-    if (form.nodeVersion.trim() !== config.nodeVersion) d.nodeVersion = form.nodeVersion.trim()
-    if (form.tlsBackend !== config.tlsBackend) d.tlsBackend = form.tlsBackend
-    if (form.loadBalancingMode !== config.loadBalancingMode) d.loadBalancingMode = form.loadBalancingMode
-    if (form.defaultEndpoint.trim() !== config.defaultEndpoint) d.defaultEndpoint = form.defaultEndpoint.trim()
-    if (form.extractThinking !== config.extractThinking) d.extractThinking = form.extractThinking
-    if (form.ccAutoBuffer !== config.ccAutoBuffer) d.ccAutoBuffer = form.ccAutoBuffer
-    if (form.importKeysEnabled !== config.importKeysEnabled) d.importKeysEnabled = form.importKeysEnabled
-    // 上游 429 吸收层：布尔直比，整数解析后比对（空/非法不发）
-    if (form.upstreamRetryAbsorbEnabled !== (config.upstreamRetryAbsorbEnabled ?? false)) d.upstreamRetryAbsorbEnabled = form.upstreamRetryAbsorbEnabled
-    const nAbsorbBudget = parseInt(form.upstreamRetryAbsorbBudgetSecs, 10)
-    if (Number.isFinite(nAbsorbBudget) && nAbsorbBudget !== (config.upstreamRetryAbsorbBudgetSecs ?? 45)) d.upstreamRetryAbsorbBudgetSecs = nAbsorbBudget
-    const nAbsorbRounds = parseInt(form.upstreamRetryAbsorbMaxRounds, 10)
-    if (Number.isFinite(nAbsorbRounds) && nAbsorbRounds !== (config.upstreamRetryAbsorbMaxRounds ?? 3)) d.upstreamRetryAbsorbMaxRounds = nAbsorbRounds
-    const nAbsorbMinDelay = parseInt(form.upstreamRetryAbsorbMinDelayMs, 10)
-    if (Number.isFinite(nAbsorbMinDelay) && nAbsorbMinDelay !== (config.upstreamRetryAbsorbMinDelayMs ?? 150)) d.upstreamRetryAbsorbMinDelayMs = nAbsorbMinDelay
-    const nAbsorbMaxDelay = parseInt(form.upstreamRetryAbsorbMaxDelaySecs, 10)
-    if (Number.isFinite(nAbsorbMaxDelay) && nAbsorbMaxDelay !== (config.upstreamRetryAbsorbMaxDelaySecs ?? 15)) d.upstreamRetryAbsorbMaxDelaySecs = nAbsorbMaxDelay
-    if (form.upstreamRetryAbsorbSuspended !== (config.upstreamRetryAbsorbSuspended ?? false)) d.upstreamRetryAbsorbSuspended = form.upstreamRetryAbsorbSuspended
-    if (form.upstreamRetryAbsorbServerError !== (config.upstreamRetryAbsorbServerError ?? false)) d.upstreamRetryAbsorbServerError = form.upstreamRetryAbsorbServerError
-    if (form.upstreamRetryAbsorbCapacity400 !== (config.upstreamRetryAbsorbCapacity400 ?? false)) d.upstreamRetryAbsorbCapacity400 = form.upstreamRetryAbsorbCapacity400
-    const nAbsorbSwapBudget = parseInt(form.upstreamRetryAbsorbSwapBudgetSecs, 10)
-    if (Number.isFinite(nAbsorbSwapBudget) && nAbsorbSwapBudget !== (config.upstreamRetryAbsorbSwapBudgetSecs ?? 0)) d.upstreamRetryAbsorbSwapBudgetSecs = nAbsorbSwapBudget
-    if (form.upstreamRetryAbsorbExhausted503 !== (config.upstreamRetryAbsorbExhaustedStatus === 429)) d.upstreamRetryAbsorbExhaustedStatus = form.upstreamRetryAbsorbExhausted503 ? 429 : 503
-    if (form.stripEnvNoise !== config.stripEnvNoise) d.stripEnvNoise = form.stripEnvNoise
-    if (form.toolCleanLeakedTokens !== (config.toolCleanLeakedTokens ?? true)) d.toolCleanLeakedTokens = form.toolCleanLeakedTokens
-    if (form.toolReclaimTextifiedInvoke !== (config.toolReclaimTextifiedInvoke ?? true)) d.toolReclaimTextifiedInvoke = form.toolReclaimTextifiedInvoke
-    if (form.toolStrayRepeatGuard !== (config.toolStrayRepeatGuard ?? true)) d.toolStrayRepeatGuard = form.toolStrayRepeatGuard
-    if (form.toolStreamAlignFailure !== (config.toolStreamAlignFailure ?? true)) d.toolStreamAlignFailure = form.toolStreamAlignFailure
-    if (form.toolExposeErrorToClient !== (config.toolExposeErrorToClient ?? true)) d.toolExposeErrorToClient = form.toolExposeErrorToClient
-    if (form.toolRepairJson !== (config.toolRepairJson ?? true)) d.toolRepairJson = form.toolRepairJson
-    if (form.toolTruncationRecovery !== (config.toolTruncationRecovery ?? false)) d.toolTruncationRecovery = form.toolTruncationRecovery
-    const descMax = Number(form.toolDescriptionMaxChars)
-    if (Number.isFinite(descMax) && descMax >= 0 && descMax !== (config.toolDescriptionMaxChars ?? 10000)) d.toolDescriptionMaxChars = descMax
-    // CLI 三开关：只在与当前值不同时才进 diff（与本文件既有范式一致，避免无谓写盘）。
-    if (form.cliOriginKiroCli !== (config.cliOriginKiroCli ?? false)) d.cliOriginKiroCli = form.cliOriginKiroCli
-    if (form.cliCodewhispererOptoutFalse !== (config.cliCodewhispererOptoutFalse ?? false))
-      d.cliCodewhispererOptoutFalse = form.cliCodewhispererOptoutFalse
-    if (form.cliUaAlignRealClient !== (config.cliUaAlignRealClient ?? false)) d.cliUaAlignRealClient = form.cliUaAlignRealClient
-    if (form.promptCacheEnabled !== ((config as ConfigWithCache).promptCacheEnabled ?? PROMPT_CACHE_DEFAULT))
-      d.promptCacheEnabled = form.promptCacheEnabled
-    const nSelfHealBase = parseInt(form.selfHealBaseBackoffSecs, 10)
-    if (Number.isFinite(nSelfHealBase) && nSelfHealBase !== (config.selfHealBaseBackoffSecs ?? 60)) d.selfHealBaseBackoffSecs = nSelfHealBase
-    const nSelfHealMax = parseInt(form.selfHealMaxBackoffSecs, 10)
-    if (Number.isFinite(nSelfHealMax) && nSelfHealMax !== (config.selfHealMaxBackoffSecs ?? 900)) d.selfHealMaxBackoffSecs = nSelfHealMax
-    const nSelfHealShift = parseInt(form.selfHealMaxShift, 10)
-    if (Number.isFinite(nSelfHealShift) && nSelfHealShift !== (config.selfHealMaxShift ?? 4)) d.selfHealMaxShift = nSelfHealShift
-    if (form.nativeThinkingEffortEnabled !== (config.nativeThinkingEffortEnabled ?? false))
-      d.nativeThinkingEffortEnabled = form.nativeThinkingEffortEnabled
-    if (form.encryptCredentialsAtRest !== (config.encryptCredentialsAtRest ?? false)) d.encryptCredentialsAtRest = form.encryptCredentialsAtRest
-    if (form.cooldownEnabled !== config.cooldownEnabled) d.cooldownEnabled = form.cooldownEnabled
-    if (form.autoDisableSuspicious !== config.autoDisableSuspicious)
-      d.autoDisableSuspicious = form.autoDisableSuspicious
-    if (form.allCoolingFastFail !== (config.allCoolingFastFail ?? true)) d.allCoolingFastFail = form.allCoolingFastFail
-    if (form.rateLimitEnabled !== config.rateLimitEnabled) d.rateLimitEnabled = form.rateLimitEnabled
-    const daily = Number(form.rateLimitDailyMax)
-    if (Number.isFinite(daily) && daily !== config.rateLimitDailyMax) d.rateLimitDailyMax = daily
-    const interval = Number(form.rateLimitMinIntervalMs)
-    if (Number.isFinite(interval) && interval !== config.rateLimitMinIntervalMs) d.rateLimitMinIntervalMs = interval
-    if (form.affinityEnabled !== config.affinityEnabled) d.affinityEnabled = form.affinityEnabled
-    if (form.priorityInBalanced !== config.priorityInBalanced) d.priorityInBalanced = form.priorityInBalanced
-    // 智能调度:整数字段解析后比对(空/非法回退当前值不发)。
-    const nCredRpm = parseInt(form.credentialRpmLimit, 10)
-    if (Number.isFinite(nCredRpm) && nCredRpm !== (config.credentialRpmLimit ?? 0)) d.credentialRpmLimit = nCredRpm
-    const nHeadroom = parseInt(form.rpmHeadroomFactor, 10)
-    if (Number.isFinite(nHeadroom) && nHeadroom !== config.rpmHeadroomFactor) d.rpmHeadroomFactor = nHeadroom
-    const nReserve = parseInt(form.rpmReserveSlots, 10)
-    if (Number.isFinite(nReserve) && nReserve !== config.rpmReserveSlots) d.rpmReserveSlots = nReserve
-    if (form.rpmHardGateOverloadWait !== config.rpmHardGateOverloadWait) d.rpmHardGateOverloadWait = form.rpmHardGateOverloadWait
-    const nCooldownScale = parseInt(form.cooldownScalePct, 10)
-    if (Number.isFinite(nCooldownScale) && nCooldownScale !== (config.cooldownScalePct ?? 100)) d.cooldownScalePct = nCooldownScale
-    const nJitter = parseInt(form.rateLimitJitterPct, 10)
-    if (Number.isFinite(nJitter) && nJitter !== (config.rateLimitJitterPct ?? 20)) d.rateLimitJitterPct = nJitter
-    // 入站整形
-    if (form.throttleProfile !== (config.throttleProfile ?? 'manual')) d.throttleProfile = form.throttleProfile
-    if (form.inboundThrottleEnabled !== (config.inboundThrottleEnabled ?? true)) d.inboundThrottleEnabled = form.inboundThrottleEnabled
-    if (form.inboundRpmAuto !== (config.inboundRpmAuto ?? true)) d.inboundRpmAuto = form.inboundRpmAuto
-    const nTarget = parseInt(form.inboundTargetRpm, 10)
-    if (Number.isFinite(nTarget) && nTarget !== (config.inboundTargetRpm ?? 100)) d.inboundTargetRpm = nTarget
-    const nRmin = parseInt(form.inboundRpmMin, 10)
-    if (Number.isFinite(nRmin) && nRmin !== (config.inboundRpmMin ?? 20)) d.inboundRpmMin = nRmin
-    const nRmax = parseInt(form.inboundRpmMax, 10)
-    if (Number.isFinite(nRmax) && nRmax !== (config.inboundRpmMax ?? 300)) d.inboundRpmMax = nRmax
-    const nBurst = parseInt(form.inboundBurstSecs, 10)
-    if (Number.isFinite(nBurst) && nBurst !== (config.inboundBurstSecs ?? 2)) d.inboundBurstSecs = nBurst
-    const nQwait = parseInt(form.inboundQueueMaxWaitSecs, 10)
-    if (Number.isFinite(nQwait) && nQwait !== (config.inboundQueueMaxWaitSecs ?? 30)) d.inboundQueueMaxWaitSecs = nQwait
-    if (form.inboundQueueTimeoutPassthrough !== (config.inboundQueueTimeoutPassthrough ?? true)) d.inboundQueueTimeoutPassthrough = form.inboundQueueTimeoutPassthrough
-    if (form.balanceWeightEnabled !== config.balanceWeightEnabled) d.balanceWeightEnabled = form.balanceWeightEnabled
-    const nFloor = parseInt(form.balanceWeightFloor, 10)
-    if (Number.isFinite(nFloor) && nFloor !== config.balanceWeightFloor) d.balanceWeightFloor = nFloor
-    if (form.health429WeightEnabled !== config.health429WeightEnabled) d.health429WeightEnabled = form.health429WeightEnabled
-    if (form.proxyUrl.trim() !== (config.proxyUrl ?? '')) d.proxyUrl = form.proxyUrl.trim()
-    // 代理账密:后端不下发(安全),故只在用户填了内容时才发送(留空=保持不变)。
-    if (form.proxyUsername.trim() !== '') d.proxyUsername = form.proxyUsername.trim()
-    if (form.proxyPassword !== '') d.proxyPassword = form.proxyPassword
-    if (form.apiKey.trim() !== '') d.apiKey = form.apiKey.trim()
-    if (form.callbackBaseUrl.trim() !== (config.callbackBaseUrl ?? '')) d.callbackBaseUrl = form.callbackBaseUrl.trim()
-    // 反代安全
-    const origins = linesToList(form.corsAllowedOrigins)
-    if (!sameList(origins, config.corsAllowedOrigins ?? [])) d.corsAllowedOrigins = origins
-    const allowlist = linesToList(form.ipAllowlist)
-    if (!sameList(allowlist, config.ipAllowlist ?? [])) d.ipAllowlist = allowlist
-    const blocklist = linesToList(form.ipBlocklist)
-    if (!sameList(blocklist, config.ipBlocklist ?? [])) d.ipBlocklist = blocklist
-    const mcBlocklist = linesToList(form.machineCodeBlocklist)
-    if (!sameList(mcBlocklist, config.machineCodeBlocklist ?? [])) d.machineCodeBlocklist = mcBlocklist
-    if (form.trustForwardedHeader !== config.trustForwardedHeader) d.trustForwardedHeader = form.trustForwardedHeader
-    const ingress = Number(form.ingressRateLimitPerMin)
-    if (Number.isFinite(ingress) && ingress !== config.ingressRateLimitPerMin) d.ingressRateLimitPerMin = ingress
-    const maxBody = Number(form.maxBodyBytes)
-    if (Number.isFinite(maxBody) && maxBody !== config.maxBodyBytes) d.maxBodyBytes = maxBody
-    // 主动 token 预刷新
-    if (form.proactiveTokenRefresh !== config.proactiveTokenRefresh) d.proactiveTokenRefresh = form.proactiveTokenRefresh
-    const lead = Number(form.tokenRefreshLeadMinutes)
-    if (Number.isFinite(lead) && lead !== config.tokenRefreshLeadMinutes) d.tokenRefreshLeadMinutes = lead
-    const interval2 = Number(form.tokenRefreshIntervalSecs)
-    if (Number.isFinite(interval2) && interval2 !== config.tokenRefreshIntervalSecs) d.tokenRefreshIntervalSecs = interval2
-    // Admin UI 登录页背景（缺省视为开启，与 toForm 基线一致）
-    if (form.loginBackgroundEnabled !== (config.loginBackgroundEnabled ?? true)) d.loginBackgroundEnabled = form.loginBackgroundEnabled
-    if (form.loginBackgroundR18 !== (config.loginBackgroundR18 ?? false)) d.loginBackgroundR18 = form.loginBackgroundR18
-    // 全局模型映射：JSON 文本 → 对象；合法且非空时才提交（非法 JSON 不提交，保存时静默忽略，
-    // 前端已在输入区给出即时校验提示）。与基线 deep 比较，避免「空对象 ↔ 未配置」误报差异。
-    // 校验与输入区 `modelMappingParsed` 同口径：**纯对象**（数组/null 不收 —— `typeof []==='object'`
-    // 会放行 `["a"]`）且**值全为 string**（`{"a":123}` 同类问题）。判据不一致会让界面提示
-    // 「非法、不提交」却仍把脏值发后端吃 400（只剩通用错误 toast），提示与行为对不上。
-    const mmTrim = form.modelMapping.trim()
-    if (mmTrim !== '') {
-      try {
-        const mm = JSON.parse(mmTrim) as unknown
-        if (
-          mm !== null &&
-          typeof mm === 'object' &&
-          !Array.isArray(mm) &&
-          Object.values(mm).every((v) => typeof v === 'string')
-        ) {
-          const base = config.modelMapping ?? {}
-          const changed =
-            Object.keys(mm).length !== Object.keys(base).length ||
-            Object.entries(mm).some(([k, v]) => base[k] !== v)
-          if (changed) d.modelMapping = mm as Record<string, string>
-        }
-      } catch {
-        // 非法 JSON：不提交。输入区已有红色校验提示。
-      }
-    } else if ((config.modelMapping ?? {}) && Object.keys(config.modelMapping ?? {}).length > 0) {
-      // 用户清空了整个编辑区 → 视为清空映射（提交空对象删除全部规则）。
-      d.modelMapping = {}
-    }
-    return d
-  }, [config, form])
+  const diff = useMemo(() => diffForm(config, form), [config, form])
 
   // UI 排版偏好(纯前端 localStorage)是否与当前已落地值有差异。它不进后端 diff,
   // 但纳入统一 dirty/保存流程:点亮保存按钮、保存时才写 localStorage。
   const uiPrefsDirty = !!form && (
     form.poolSort !== uiPrefs.poolSort ||
     form.poolShowDisabled !== uiPrefs.poolShowDisabled ||
+    form.showPerfDashboard !== uiPrefs.showPerfDashboard ||
     form.cardSize !== uiPrefs.cardSize
   )
 
@@ -2020,6 +1682,7 @@ export function SettingsPage() {
       setUiPrefs({
         poolSort: form.poolSort,
         poolShowDisabled: form.poolShowDisabled,
+        showPerfDashboard: form.showPerfDashboard,
         cardSize: form.cardSize,
       })
     }
@@ -2093,6 +1756,8 @@ export function SettingsPage() {
   const restart = t('settingspage.hint.restartRequired')
   const presetRestart = t('settingspage.hint.presetOrCustomRestart')
   const emDash = t('settingspage.common.emDash')
+  // 号池全代挂时吸收层无效：主开关与调参旋钮一起禁用（警告文案仍显示）。
+  const absorbTuningDisabled = absorbHasNoEffect || !form.upstreamRetryAbsorbEnabled
 
   return (
     <SearchContext.Provider value={{ query }}>
@@ -2105,6 +1770,7 @@ export function SettingsPage() {
           <div className="relative">
             <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
             <Input
+              id="settings-search"
               className="w-56 pl-8 pr-8"
               value={searchRaw}
               onChange={(e) => setSearchRaw(e.target.value)}
@@ -2124,6 +1790,18 @@ export function SettingsPage() {
           </div>
           <Button variant="outline" size="sm" onClick={() => refetch()} disabled={isSaving}>
             {t('settingspage.common.refresh')}
+          </Button>
+          {/* 帮助中心跳转：hash 驱动，app-shell 监听 #/help 后全页渲染帮助页 */}
+          {/* i18n: settingspage.help.open（主会话补三语） */}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              window.location.hash = '#/help'
+            }}
+          >
+            <HelpCircle className="mr-1.5 h-4 w-4" />
+            {t('settingspage.help.open')}
           </Button>
         </div>
       </div>
@@ -2164,6 +1842,24 @@ export function SettingsPage() {
       {/* 服务管理分区：一键重启 */}
       <SectionGate section="service" titleKey="settingspage.card.service" kwKey="settingspage.card.service.kw">
         <ServiceManagementCard />
+        {/* 内存态开关：OTA 自动检查。config.json 可改，补开关更完整（内存态，重启回默认）。 */}
+        {/* i18n: settingspage.service.otaAutoCheck.label/.hint（主会话补三语） */}
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-base"><Highlight text={t('settingspage.service.otaAutoCheck.title')} /></CardTitle>
+          </CardHeader>
+          <CardContent className="py-0">
+            <Field
+              label={t('settingspage.service.otaAutoCheck.label')}
+              hint={t('settingspage.service.otaAutoCheck.hint')}
+            >
+              <Switch
+                checked={form.otaAutoCheck}
+                onCheckedChange={(v) => set('otaAutoCheck', v)}
+              />
+            </Field>
+          </CardContent>
+        </Card>
       </SectionGate>
       {/* 存储分区：占用统计 + 清理 */}
       <SectionGate section="storage" titleKey="settingspage.card.storage" kwKey="settingspage.card.storage.kw">
@@ -2197,6 +1893,12 @@ export function SettingsPage() {
           <Switch
             checked={form.poolShowDisabled}
             onCheckedChange={(v) => set('poolShowDisabled', v)}
+          />
+        </Field>
+        <Field label={t('settingspage.appearance.perfDashboard.label')} hint={t('settingspage.appearance.perfDashboard.hint')}>
+          <Switch
+            checked={form.showPerfDashboard}
+            onCheckedChange={(v) => set('showPerfDashboard', v)}
           />
         </Field>
         <Field label={t('settingspage.appearance.cardSize.label')} hint={t('settingspage.appearance.cardSize.hint')}>
@@ -2276,6 +1978,49 @@ export function SettingsPage() {
         <CardContent className="py-0">
           <p className="mb-3 mt-1 text-sm text-muted-foreground">
             {t('settingspage.smart.desc')}
+          </p>
+          {/* 调度档三按钮：智能=个人/直连，稳定=中转/shield，手动=专家。
+              切智能/稳定写预设矩阵；确认文案含 cooldownEnabled 语义陷阱。
+              非手动档不藏已有专家旋钮。 */}
+          <Field
+            label={t('settingspage.schedulingMode.title')}
+            hint={t('settingspage.schedulingMode.desc')}
+          >
+            <div className="flex gap-2">
+              <Button
+                variant={form.schedulingMode === 'smart' ? 'default' : 'outline'}
+                size="sm"
+                onClick={() => {
+                  if (form.schedulingMode === 'smart') return
+                  setModeConfirm('smart')
+                }}
+              >
+                {t('settingspage.schedulingMode.smart')}
+              </Button>
+              <Button
+                variant={form.schedulingMode === 'stable' ? 'default' : 'outline'}
+                size="sm"
+                onClick={() => {
+                  if (form.schedulingMode === 'stable') return
+                  setModeConfirm('stable')
+                }}
+              >
+                {t('settingspage.schedulingMode.stable')}
+              </Button>
+              <Button
+                variant={form.schedulingMode === 'manual' ? 'default' : 'outline'}
+                size="sm"
+                onClick={() => set('schedulingMode', 'manual')}
+              >
+                {t('settingspage.schedulingMode.manual')}
+              </Button>
+            </div>
+          </Field>
+          <p className="text-xs text-muted-foreground -mt-2 mb-1">
+            {t('settingspage.schedulingMode.dailyOnly')}
+          </p>
+          <p className="text-xs text-muted-foreground mb-2">
+            {t(`settingspage.schedulingMode.${form.schedulingMode}Hint`)}
           </p>
           <Field
             label={t('settingspage.smart.balanceWeight.label')}
@@ -2389,28 +2134,8 @@ export function SettingsPage() {
                 description={t('settingspage.smart.gear.inboundDesc')}
               >
                 <SearchContext.Provider value={{ query: '' }}>
-                  {/* 档位放在整形区最上方：它是这一段的总纲，先选档再看细项。
-                      档位只填未手动配过的项，已配置的值不会被覆盖（后端 apply_throttle_profile）。 */}
-                  <Field
-                    label={t('settingspage.throttleProfile.title')}
-                    hint={t('settingspage.throttleProfile.desc')}
-                  >
-                    <select
-                      className="h-9 rounded-md border border-input bg-background px-3 text-sm"
-                      value={form.throttleProfile}
-                      onChange={(e) => set('throttleProfile', e.target.value as ThrottleProfile)}
-                      aria-label={t('settingspage.throttleProfile.title')}
-                    >
-                      <option value="manual">{t('settingspage.throttleProfile.manual')}</option>
-                      <option value="shielded">{t('settingspage.throttleProfile.shielded')}</option>
-                      <option value="direct">{t('settingspage.throttleProfile.direct')}</option>
-                    </select>
-                  </Field>
-                  {form.throttleProfile !== 'manual' && (
-                    <p className="text-xs text-muted-foreground -mt-2 mb-2">
-                      {t(`settingspage.throttleProfile.${form.throttleProfile}Hint`)}
-                    </p>
-                  )}
+                  {/* 档位已收敛为上方「调度模式」三按钮（2026-08-16），细项旋钮全部归
+                      高级参数：在智能/稳定档下切档写预设矩阵，手动档下这些旋钮完全归用户。 */}
                   <Field label={t('settingspage.smart.inboundEnabled.label')} hint={t('settingspage.smart.inboundEnabled.hint')}>
                     <Switch checked={form.inboundThrottleEnabled} onCheckedChange={(v) => set('inboundThrottleEnabled', v)} />
                   </Field>
@@ -2468,6 +2193,23 @@ export function SettingsPage() {
       </Card>
       </SectionGate>
 
+      {/* 调度模式切换确认：切智能/稳定档会写入预设矩阵（覆盖高级参数未显式配置的值），
+          且 cooldownEnabled 会写成 true（线上 false 是语义陷阱，智能档刻意修正）。
+          manual 档不覆盖任何值，无需确认。 */}
+      <ConfirmDialog
+        open={modeConfirm !== null}
+        onOpenChange={(v) => {
+          if (!v) setModeConfirm(null)
+        }}
+        title={t('settingspage.schedulingMode.confirmTitle')}
+        description={t('settingspage.schedulingMode.confirmDesc')}
+        confirmLabel={t('settingspage.schedulingMode.confirmApply')}
+        onConfirm={() => {
+          if (modeConfirm) set('schedulingMode', modeConfirm)
+          setModeConfirm(null)
+        }}
+      />
+
       {/* 基础分区：服务信息（需重启） */}
       <SectionGate section="basic" titleKey="settingspage.card.serviceInfo" kwKey="settingspage.card.serviceInfo.kw">
       <Card>
@@ -2476,7 +2218,7 @@ export function SettingsPage() {
         </CardHeader>
         <CardContent className="py-0">
           <Field label={t('settingspage.basic.host.label')} hint={restart}>
-            <Input className={inputCls} value={form.host} onChange={(e) => set('host', e.target.value)} />
+            <Input id="settings-host" className={inputCls} value={form.host} onChange={(e) => set('host', e.target.value)} />
           </Field>
           <Field label={t('settingspage.basic.port.label')} hint={restart}>
             <NumberStepper value={Number(form.port) || 0} onChange={(v) => set('port', String(v))} min={1} max={65535} className="w-28" aria-label={t('settingspage.basic.port.aria')} />
@@ -2490,7 +2232,7 @@ export function SettingsPage() {
               native-tls 已废弃（曾误导用户切换后废网关）。仅作只读展示，不再可切换。 */}
           <ReadonlyRow label={t('settingspage.basic.tlsBackend')} value={t('settingspage.basic.tlsBackendValue')} />
           <Field label={t('settingspage.basic.defaultEndpoint.label')} hint={t('settingspage.basic.defaultEndpoint.hint', { names: config.endpointNames.join(', ') || emDash })}>
-            <Input className={inputCls} value={form.defaultEndpoint} onChange={(e) => set('defaultEndpoint', e.target.value)} />
+            <Input id="settings-default-endpoint" className={inputCls} value={form.defaultEndpoint} onChange={(e) => set('defaultEndpoint', e.target.value)} />
           </Field>
           {config.configPath && <ReadonlyRow label={t('settingspage.basic.configPath')} value={config.configPath} mono />}
         </CardContent>
@@ -2604,6 +2346,10 @@ export function SettingsPage() {
           <Field label={t('settingspage.tool.descMax.label')} hint={t('settingspage.tool.descMax.hint')}>
             <NumberStepper value={Number(form.toolDescriptionMaxChars) || 0} onChange={(v) => set('toolDescriptionMaxChars', String(v))} min={0} step={1000} className="w-32" aria-label={t('settingspage.tool.descMax.aria')} />
           </Field>
+          {/* CC↔Kiro 工具名/参数映射：不入容错七项计数（不同性质：协议映射层而非错误缓解）。 */}
+          <Field label={t('settingspage.advanced.toolCompat.label')} hint={t('settingspage.advanced.toolCompat.hint')}>
+            <Switch checked={form.toolCompatMapping} onCheckedChange={(v) => set('toolCompatMapping', v)} />
+          </Field>
         </CardContent>
       </Card>
       </SectionGate>
@@ -2676,38 +2422,42 @@ export function SettingsPage() {
             </Callout>
           )}
           <Field label={t('settings.absorb.enabled')} hint={`${t('settings.absorb.enabledHint')}${hotParen}`}>
-            <Switch checked={form.upstreamRetryAbsorbEnabled} onCheckedChange={(v) => set('upstreamRetryAbsorbEnabled', v)} />
+            <Switch
+              checked={form.upstreamRetryAbsorbEnabled}
+              onCheckedChange={(v) => set('upstreamRetryAbsorbEnabled', v)}
+              disabled={absorbHasNoEffect}
+            />
           </Field>
           <GroupHeading label={t('settingspage.advanced.absorb.tuningGroup')} />
           {/* min=45 与后端 from_config 的 budget 下限一致：低于 45 会反向砍掉既有的
               failover 墙钟（round_budget 是 min(45s, 剩余预算)），后端已强制抬回，
               这里同步 min 是为了让面板不给出一个「填了不生效」的值。 */}
           <Field label={t('settings.absorb.budgetSecs')} hint={t('settings.absorb.budgetSecsHint')}>
-            <NumberStepper value={Number(form.upstreamRetryAbsorbBudgetSecs) || 0} onChange={(v) => set('upstreamRetryAbsorbBudgetSecs', String(v))} min={45} max={600} step={5} className="w-28" disabled={!form.upstreamRetryAbsorbEnabled} aria-label={t('settings.absorb.budgetSecs')} />
+            <NumberStepper value={Number(form.upstreamRetryAbsorbBudgetSecs) || 0} onChange={(v) => set('upstreamRetryAbsorbBudgetSecs', String(v))} min={45} max={600} step={5} className="w-28" disabled={absorbTuningDisabled} aria-label={t('settings.absorb.budgetSecs')} />
           </Field>
           <Field label={t('settings.absorb.maxRounds')} hint={t('settings.absorb.maxRoundsHint')}>
-            <NumberStepper value={Number(form.upstreamRetryAbsorbMaxRounds) || 0} onChange={(v) => set('upstreamRetryAbsorbMaxRounds', String(v))} min={1} max={64} className="w-28" disabled={!form.upstreamRetryAbsorbEnabled} aria-label={t('settings.absorb.maxRounds')} />
+            <NumberStepper value={Number(form.upstreamRetryAbsorbMaxRounds) || 0} onChange={(v) => set('upstreamRetryAbsorbMaxRounds', String(v))} min={1} max={64} className="w-28" disabled={absorbTuningDisabled} aria-label={t('settings.absorb.maxRounds')} />
           </Field>
           <Field label={t('settings.absorb.minDelayMs')} hint={t('settingspage.advanced.absorb.minDelayHint')}>
-            <NumberStepper value={Number(form.upstreamRetryAbsorbMinDelayMs) || 0} onChange={(v) => set('upstreamRetryAbsorbMinDelayMs', String(v))} min={0} max={60000} step={50} className="w-28" disabled={!form.upstreamRetryAbsorbEnabled} aria-label={t('settings.absorb.minDelayMs')} />
+            <NumberStepper value={Number(form.upstreamRetryAbsorbMinDelayMs) || 0} onChange={(v) => set('upstreamRetryAbsorbMinDelayMs', String(v))} min={0} max={60000} step={50} className="w-28" disabled={absorbTuningDisabled} aria-label={t('settings.absorb.minDelayMs')} />
           </Field>
           <Field label={t('settings.absorb.maxDelaySecs')} hint={t('settingspage.advanced.absorb.maxDelayHint')}>
-            <NumberStepper value={Number(form.upstreamRetryAbsorbMaxDelaySecs) || 0} onChange={(v) => set('upstreamRetryAbsorbMaxDelaySecs', String(v))} min={1} max={600} className="w-28" disabled={!form.upstreamRetryAbsorbEnabled} aria-label={t('settings.absorb.maxDelaySecs')} />
+            <NumberStepper value={Number(form.upstreamRetryAbsorbMaxDelaySecs) || 0} onChange={(v) => set('upstreamRetryAbsorbMaxDelaySecs', String(v))} min={1} max={600} className="w-28" disabled={absorbTuningDisabled} aria-label={t('settings.absorb.maxDelaySecs')} />
           </Field>
           <Field label={t('settings.absorb.suspended')} hint={t('settingspage.advanced.absorb.suspendedHint')}>
-            <Switch checked={form.upstreamRetryAbsorbSuspended} onCheckedChange={(v) => set('upstreamRetryAbsorbSuspended', v)} disabled={!form.upstreamRetryAbsorbEnabled} />
+            <Switch checked={form.upstreamRetryAbsorbSuspended} onCheckedChange={(v) => set('upstreamRetryAbsorbSuspended', v)} disabled={absorbTuningDisabled} />
           </Field>
           <Field label={t('settings.absorb.serverError')} hint={t('settings.absorb.serverErrorHint')}>
-            <Switch checked={form.upstreamRetryAbsorbServerError} onCheckedChange={(v) => set('upstreamRetryAbsorbServerError', v)} disabled={!form.upstreamRetryAbsorbEnabled} />
+            <Switch checked={form.upstreamRetryAbsorbServerError} onCheckedChange={(v) => set('upstreamRetryAbsorbServerError', v)} disabled={absorbTuningDisabled} />
           </Field>
           <Field label={t('settings.absorb.capacity400')} hint={t('settings.absorb.capacity400Hint')}>
-            <Switch checked={form.upstreamRetryAbsorbCapacity400} onCheckedChange={(v) => set('upstreamRetryAbsorbCapacity400', v)} disabled={!form.upstreamRetryAbsorbEnabled} />
+            <Switch checked={form.upstreamRetryAbsorbCapacity400} onCheckedChange={(v) => set('upstreamRetryAbsorbCapacity400', v)} disabled={absorbTuningDisabled} />
           </Field>
           <Field label={t('settings.absorb.swapBudgetSecs')} hint={t('settings.absorb.swapBudgetSecsHint')}>
-            <NumberStepper value={Number(form.upstreamRetryAbsorbSwapBudgetSecs) || 0} onChange={(v) => set('upstreamRetryAbsorbSwapBudgetSecs', String(v))} min={0} max={600} step={5} className="w-28" disabled={!form.upstreamRetryAbsorbEnabled} aria-label={t('settings.absorb.swapBudgetSecs')} />
+            <NumberStepper value={Number(form.upstreamRetryAbsorbSwapBudgetSecs) || 0} onChange={(v) => set('upstreamRetryAbsorbSwapBudgetSecs', String(v))} min={0} max={600} step={5} className="w-28" disabled={absorbTuningDisabled} aria-label={t('settings.absorb.swapBudgetSecs')} />
           </Field>
           <Field label={t('settings.absorb.exhausted503')} hint={t('settings.absorb.exhausted503Hint')}>
-            <Switch checked={form.upstreamRetryAbsorbExhausted503} onCheckedChange={(v) => set('upstreamRetryAbsorbExhausted503', v)} disabled={!form.upstreamRetryAbsorbEnabled} />
+            <Switch checked={form.upstreamRetryAbsorbExhausted503} onCheckedChange={(v) => set('upstreamRetryAbsorbExhausted503', v)} disabled={absorbTuningDisabled} />
           </Field>
         </CardContent>
       </Card>
@@ -2740,6 +2490,26 @@ export function SettingsPage() {
             <NumberStepper value={Number(form.selfHealMaxShift) || 4} onChange={(v) => set('selfHealMaxShift', String(v))} min={0} max={31} step={1} className="w-28" aria-label={t('settingspage.advanced.selfHeal.shift.label')} />
           </Field>
           <ReadonlyRow label={t('settingspage.advanced.cache.ttl.label')} value={t('settingspage.advanced.cache.ttl.value')} />
+          {/* 模拟缓存：透传池注入伪造 cache_read。仅对透传路径生效，与上方 prompt 缓存记账互不影响。 */}
+          <GroupHeading label={t('settingspage.advanced.cache.mockGroup')} />
+          <Field label={t('settingspage.advanced.cache.mock.enabled.label')} hint={t('settingspage.advanced.cache.mock.enabled.hint')}>
+            <Switch checked={form.mockCacheEnabled} onCheckedChange={(v) => set('mockCacheEnabled', v)} />
+          </Field>
+          <Field label={t('settingspage.advanced.cache.mock.ratio.label')} hint={t('settingspage.advanced.cache.mock.ratio.hint')}>
+            <div className="flex items-center gap-2">
+              <NumberStepper
+                value={Number(form.mockCacheReadRatioPct) || 0}
+                onChange={(v) => set('mockCacheReadRatioPct', String(v))}
+                min={0}
+                max={100}
+                step={5}
+                className="w-24"
+                disabled={!form.mockCacheEnabled}
+                aria-label={t('settingspage.advanced.cache.mock.ratio.label')}
+              />
+              <span className="text-xs text-muted-foreground">%</span>
+            </div>
+          </Field>
         </CardContent>
       </Card>
       </SectionGate>
@@ -2761,6 +2531,7 @@ export function SettingsPage() {
             hint={t('settingspage.advanced.modelMapping.editorHint')}
           >
             <textarea
+              id="model-mapping-editor"
               className="flex min-h-[140px] w-full max-w-[360px] rounded-md border border-input bg-background px-3 py-2 font-mono text-xs ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               value={form.modelMapping}
               onChange={(e) => set('modelMapping', e.target.value)}
@@ -2778,6 +2549,11 @@ export function SettingsPage() {
           </Field>
         </CardContent>
       </Card>
+      </SectionGate>
+
+      {/* 高级选项：错误提示词配置（错误码/提示文案可配置化，点击打开独立弹窗） */}
+      <SectionGate section="advanced" titleKey="settingspage.card.errorMessages" kwKey="settingspage.card.errorMessages.kw">
+        <ErrorMessagesEntryCard />
       </SectionGate>
       </AdvancedDisclosure>
       )}
@@ -2838,6 +2614,29 @@ export function SettingsPage() {
           >
             <Switch checked={form.allCoolingFastFail} onCheckedChange={(v) => set('allCoolingFastFail', v)} />
           </Field>
+          {/* 内存态开关：余额超额自动禁用整组。不进 config.json、重启回默认，
+              只能经 PUT /config 改——默认开，温和余额刷新发现超额即自动禁用（误禁无逃生门，故补此开关）。 */}
+          {/* i18n: settingspage.anti.autoDisableQuotaExceeded.label/.hint（主会话补三语） */}
+          <Field
+            label={t('settingspage.anti.autoDisableQuotaExceeded.label')}
+            hint={`${t('settingspage.anti.autoDisableQuotaExceeded.hint')}${hotParen}`}
+          >
+            <Switch
+              checked={form.autoDisableQuotaExceeded}
+              onCheckedChange={(v) => set('autoDisableQuotaExceeded', v)}
+            />
+          </Field>
+          {/* 内存态开关：socks 代理池自动健康探测。每 5 分钟探测一次，连续 3 次失败自动禁用该代理。 */}
+          {/* i18n: settingspage.anti.socksAutoHealth.label/.hint（主会话补三语） */}
+          <Field
+            label={t('settingspage.anti.socksAutoHealth.label')}
+            hint={`${t('settingspage.anti.socksAutoHealth.hint')}${hotParen}`}
+          >
+            <Switch
+              checked={form.socksAutoHealth}
+              onCheckedChange={(v) => set('socksAutoHealth', v)}
+            />
+          </Field>
           {/* 速率限制：行尾齿轮点开「速率卡」做细粒度设置 */}
           <Field label={t('settingspage.anti.rateLimit.label')} hint={`${t('settingspage.anti.rateLimit.hint')}${hotParen}`}>
             <div className="flex items-center gap-1.5">
@@ -2897,21 +2696,21 @@ export function SettingsPage() {
         <CardContent className="py-0">
           <Field label={t('settingspage.network.proxy.label')} hint={t('settingspage.network.proxy.hint')}>
             <div className="flex items-center gap-2">
-              <Input className="max-w-[260px] font-mono text-xs" value={form.proxyUrl} onChange={(e) => set('proxyUrl', e.target.value)} placeholder={t('settingspage.network.proxy.ph')} />
+              <Input id="settings-proxy-url" className="max-w-[260px] font-mono text-xs" value={form.proxyUrl} onChange={(e) => set('proxyUrl', e.target.value)} placeholder={t('settingspage.network.proxy.ph')} />
               <ProxyTestButton proxyUrl={form.proxyUrl} proxyUsername={form.proxyUsername} proxyPassword={form.proxyPassword} />
             </div>
           </Field>
           <Field label={t('settingspage.network.proxyUser.label')} hint={t('settingspage.network.proxyUser.hint')}>
-            <Input className="max-w-[260px] font-mono text-xs" value={form.proxyUsername} onChange={(e) => set('proxyUsername', e.target.value)} placeholder={t('settingspage.network.proxyUser.ph')} autoComplete="off" />
+            <Input id="settings-proxy-username" className="max-w-[260px] font-mono text-xs" value={form.proxyUsername} onChange={(e) => set('proxyUsername', e.target.value)} placeholder={t('settingspage.network.proxyUser.ph')} autoComplete="off" />
           </Field>
           <Field label={t('settingspage.network.proxyPass.label')} hint={t('settingspage.network.proxyPass.hint')}>
-            <Input type="password" className="max-w-[260px] font-mono text-xs" value={form.proxyPassword} onChange={(e) => set('proxyPassword', e.target.value)} placeholder={t('settingspage.network.proxyPass.ph')} autoComplete="new-password" />
+            <Input id="settings-proxy-password" type="password" className="max-w-[260px] font-mono text-xs" value={form.proxyPassword} onChange={(e) => set('proxyPassword', e.target.value)} placeholder={t('settingspage.network.proxyPass.ph')} autoComplete="new-password" />
           </Field>
           <Field
             label={t('settingspage.network.callback.label')}
             hint={t('settingspage.network.callback.hint')}
           >
-            <Input className="max-w-[260px] font-mono text-xs" value={form.callbackBaseUrl} onChange={(e) => set('callbackBaseUrl', e.target.value)} placeholder="http://host:port" />
+            <Input id="settings-callback-base-url" className="max-w-[260px] font-mono text-xs" value={form.callbackBaseUrl} onChange={(e) => set('callbackBaseUrl', e.target.value)} placeholder="http://host:port" />
           </Field>
           <ReadonlyRow
             label={t('settingspage.network.callbackMode')}
@@ -2928,6 +2727,7 @@ export function SettingsPage() {
           >
             <div className="flex items-center gap-2">
               <Input
+                id="settings-api-key"
                 type="password"
                 className="flex-1 min-w-0 max-w-[260px] font-mono text-xs"
                 value={form.apiKey}
@@ -3006,6 +2806,7 @@ export function SettingsPage() {
             hint={t('settingspage.security.cors.hint')}
           >
             <textarea
+              id="cors-allowed-origins"
               className="flex min-h-[72px] w-full max-w-[260px] rounded-md border border-input bg-background px-3 py-2 font-mono text-xs ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               value={form.corsAllowedOrigins}
               onChange={(e) => set('corsAllowedOrigins', e.target.value)}
@@ -3018,6 +2819,7 @@ export function SettingsPage() {
             hint={t('settingspage.security.ip.hint')}
           >
             <textarea
+              id="ip-allowlist"
               className="flex min-h-[72px] w-full max-w-[260px] rounded-md border border-input bg-background px-3 py-2 font-mono text-xs ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               value={form.ipAllowlist}
               onChange={(e) => set('ipAllowlist', e.target.value)}
@@ -3030,6 +2832,7 @@ export function SettingsPage() {
             hint={t('settingspage.security.ipBlock.hint')}
           >
             <textarea
+              id="ip-blocklist"
               className="flex min-h-[72px] w-full max-w-[260px] rounded-md border border-input bg-background px-3 py-2 font-mono text-xs ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               value={form.ipBlocklist}
               onChange={(e) => set('ipBlocklist', e.target.value)}
@@ -3042,6 +2845,7 @@ export function SettingsPage() {
             hint={t('settingspage.security.mcBlock.hint')}
           >
             <textarea
+              id="machine-code-blocklist"
               className="flex min-h-[72px] w-full max-w-[260px] rounded-md border border-input bg-background px-3 py-2 font-mono text-xs ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               value={form.machineCodeBlocklist}
               onChange={(e) => set('machineCodeBlocklist', e.target.value)}

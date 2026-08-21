@@ -50,6 +50,34 @@ pub const ENDPOINT_NAMES: &[&str] = &[
     amazonq::AMAZONQ_ENDPOINT_NAME,
 ];
 
+/// 端点回退链的**通用补齐顺序**（`ide` 优先，其后为备用端点）。
+///
+/// 上游 429 / 5xx 往往是**端点级**容量问题，而非凭据额度问题：同一个凭据换到另一个
+/// 上游端点常常立刻成功（kiro-go 的 `endpointFallback` 正靠这三个端点轮转吃掉 429）。
+///
+/// 与 [`KiroCredentials::effective_endpoint_order`] 是**两个不同层面**，不冲突：
+/// 那个按凭据类型给**候选链**（ksk_ 号 = CLI 族 4 端点，供 `select_endpoint` 桶机制用），
+/// 本表是全类型通用的**补齐顺序**（OAuth 号只有 `[ide]` 单候选，回退链靠本表补出
+/// `codewhisperer` / `amazonq`）。`endpoint_chain_for` 以「select 选中的端点」为链首，
+/// 先用凭据候选顺序补齐（ksk_ 号 → CLI 族内部轮内回退），再用本表补齐（跨族兜底）。
+///
+/// ⚠️ **跨族兼容性边界**（与参考仓 jsjm 的结构差异）：参考仓的 codewhisperer / amazonq
+/// 是 IDE 协议变体（`/generateAssistantResponse` 路径 + 条件 tokentype，实测 200 可迁移）；
+/// 本仓的 codewhisperer / amazonq 是 **CLI 协议族**（服务根 `/` + `X-Amz-Target` +
+/// `tokentype: API_KEY` 硬编码 + 绝不注入 profileArn），`tokentype=API_KEY` 的请求只对
+/// `ksk_` 号实测过 200。OAuth 号回退到它们属于**未实测路径**（🔴 待上线实测——
+/// 失败无害（非瞬态错误会立即断链、交既有分类逻辑）但可能**多烧一跳**：OAuth
+/// 请求打 CLI 协议端点大概率得到确定性错误，链内白试一跳后才断链）。
+///
+/// 另注：ksk_（API_KEY）号的链在 `endpoint_chain_for` 里**整体剔除 ide**（对抗审查
+/// M2）——ksk_ 打 ide 必 403 是确定性错误，链尾兜底铁律会让「挪到链尾」的 ide 在
+/// 容量风暴时被真打、从从未成功号累计 report_failure 误禁用（历史事故 #481 同型）。
+pub const ENDPOINT_FALLBACK_ORDER: &[&str] = &[
+    ide::IDE_ENDPOINT_NAME,
+    codewhisperer::CODEWHISPERER_ENDPOINT_NAME,
+    amazonq::AMAZONQ_ENDPOINT_NAME,
+];
+
 /// 全部已知端点的注册表（供 `main.rs` 启动时装配 provider）。
 ///
 /// 键取实现自报的 [`KiroEndpoint::name`]，而非 [`ENDPOINT_NAMES`] 里的字符串：两者若
@@ -411,7 +439,21 @@ pub fn default_is_account_suspended(body: &str) -> bool {
         "permanently banned",
         "has been banned",
     ];
-    SUSPEND_KEYWORDS.iter().any(|kw| lower.contains(kw))
+    // 裸封禁信号（2026-08-14，对齐参考仓 ref-zyphr 的「双短语立即禁用且不参与
+    // 自愈」语义）：不带临时词族的「suspended」裸词视为永久封禁，走 provider 侧
+    // report_account_suspended 收口（立即禁用 + 落盘 + 排除出自愈）。
+    //
+    // ⚠️ 2026-08-14 对抗审查 M2 修正（两处）：
+    //   1. **删掉 `locked` 裸词** —— IdC/AD 的「多次登录失败锁号」标准文案
+    //      （"Account locked due to too many sign-in attempts"）不含 temporarily，
+    //      是自动解锁的临时态，裸词命中 = 真号被永久误禁并落盘（重启不恢复）。
+    //      SUSPEND_KEYWORDS 表里的限定短语才是保守口径，裸词不应比表更宽。
+    //   2. 临时词族排除从 `temporarily` 扩到 `temporar` 前缀族 —— 上游 reason
+    //      字段的词形是 TEMPORARY_SUSPENSION（temporarily 匹配不到），裸词判据
+    //      必须覆盖临时词族才能兜住「temporar* + suspended」的临时态。
+    let has_bare_signal = !lower.contains("temporar")
+        && lower.contains("suspended");
+    SUSPEND_KEYWORDS.iter().any(|kw| lower.contains(kw)) || has_bare_signal
 }
 
 /// 默认的"账户级临时风控限速"判断逻辑（v4-2.1）
@@ -984,6 +1026,23 @@ mod registry_tests {
             "application/json"
         );
     }
+
+    /// ⭐ 回退链顺序守卫：`ide` 必须占链首，且顺序内无重复名字（重复会让链式回退
+    /// 在同一端点上白转一圈）。
+    #[test]
+    fn fallback_order_starts_with_ide_and_has_no_dupes() {
+        assert_eq!(ENDPOINT_FALLBACK_ORDER[0], ide::IDE_ENDPOINT_NAME);
+        assert!(
+            ENDPOINT_FALLBACK_ORDER
+                .iter()
+                .all(|name| ENDPOINT_NAMES.contains(name)),
+            "回退链只能引用已注册的端点名"
+        );
+        let mut seen = ENDPOINT_FALLBACK_ORDER.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), ENDPOINT_FALLBACK_ORDER.len(), "回退链不得有重复");
+    }
 }
 
 /// 端点桶标识（deepseek review 修复）守卫。
@@ -1240,6 +1299,61 @@ mod tests {
             assert!(
                 !default_is_temporary_rate_limit(body),
                 "无临时信号，不应误判为临时: {body}"
+            );
+        }
+    }
+
+    /// 裸封禁信号（2026-08-14 新增，对齐 ref-zyphr 的「双短语立即禁用且不参与
+    /// 自愈」语义）：不带临时词族的「suspended」裸词视为永久封禁。
+    ///
+    /// 回退即 FAIL：删掉新增判据里的临时词族排除 —— 上游临时风控的生产原文
+    /// 会命中新增判据，与下方的临时态回归测试冲突（那是 12h 88 次误禁事故的锁）。
+    /// ⚠️ 2026-08-14 对抗审查 M2：`locked` 裸词**不**判永久 —— IdC/AD 的
+    /// 「多次登录失败锁号」标准文案（"Account locked due to too many sign-in
+    /// attempts"）是自动解锁的临时态，裸词命中 = 真号被永久误禁并落盘。
+    #[test]
+    fn bare_suspend_signals_without_temporary_prefix_count_as_permanent() {
+        for body in [
+            "Your account is suspended. Please contact support.",
+            r#"{"message":"Account has been suspended"}"#,
+            "This account was suspended due to a policy violation",
+            "SUSPENDED: account under review",
+        ] {
+            assert!(
+                default_is_account_suspended(body),
+                "不带临时词族的 suspended 裸词必须判永久封禁: {body}"
+            );
+            assert!(
+                !default_is_temporary_rate_limit(body),
+                "无临时信号，不应判为临时: {body}"
+            );
+        }
+        // M2 修正的回归锚：locked 裸词（无 suspended）不判永久（临时锁号文案）。
+        for body in [
+            r#"{"message":"Account locked"}"#,
+            "Account locked due to too many sign-in attempts. Please try again later.",
+            "This account was locked due to a policy violation",
+        ] {
+            assert!(
+                !default_is_account_suspended(body),
+                "locked 裸词不得判永久封禁（临时锁号/策略锁定）: {body}"
+            );
+        }
+    }
+
+    /// 带临时前缀的变体必须仍被排除在永久封禁之外（与上面那条互锁）：
+    /// 上游临时风控原文同时带「临时悬置」与「安全锁定」两个信号。
+    #[test]
+    fn temporary_prefixed_bodies_never_count_as_permanent() {
+        for body in [
+            "Your User ID is temporarily suspended.",
+            "Your User ID (1) temporarily is suspended.",
+            "The account was locked temporarily for security review",
+            r#"{"reason":"TEMPORARILY_SUSPENDED"}"#,
+        ] {
+            assert!(
+                !default_is_account_suspended(body),
+                "带临时前缀的变体绝不能判永久封禁: {body}"
             );
         }
     }

@@ -8,11 +8,11 @@ import {
   setCredentialCustomApi,
   setCredentialEndpoint,
   setCredentialApiRegion,
-  setCredentialDeepseekNormalize,
   setCredentialModelMappingExempt,
   type SetCustomApiConfigInput,
   resetCredentialFailure,
   forceRefreshToken,
+  updateRefreshToken,
   getCredentialBalance,
   getCachedBalances,
   addCredential,
@@ -22,6 +22,7 @@ import {
   setLoadBalancingMode,
   getConfigSnapshot,
   updateConfig,
+  getErrorMessagesDefaults,
 } from '@/api/credentials'
 import type { AddCredentialRequest, UpdateConfigRequest } from '@/types/api'
 
@@ -39,6 +40,16 @@ export function useConfigSnapshot() {
   return useQuery({
     queryKey: ['config-snapshot'],
     queryFn: getConfigSnapshot,
+  })
+}
+
+// 查询错误码/提示词内置默认表（只读；默认值预览数据源）。
+// 默认表只随版本变化，缓存 5 分钟足够（弹窗内编辑的是草稿，不依赖实时性）。
+export function useErrorMessagesDefaults() {
+  return useQuery({
+    queryKey: ['error-messages-defaults'],
+    queryFn: getErrorMessagesDefaults,
+    staleTime: 5 * 60 * 1000,
   })
 }
 
@@ -148,18 +159,6 @@ export function useSetCredentialApiRegion() {
   })
 }
 
-// 设置代挂凭据的 deepseek 协议归一化开关（custom_api 专属）。
-export function useSetCredentialDeepseekNormalize() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) =>
-      setCredentialDeepseekNormalize(id, enabled),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['credentials'] })
-    },
-  })
-}
-
 // 设置凭据的模型映射豁免开关（跳过全局 model_mapping；Kiro 号与 custom_api 号都可用）。
 export function useSetCredentialModelMappingExempt() {
   const queryClient = useQueryClient()
@@ -200,6 +199,18 @@ export function useForceRefreshToken() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (id: number) => forceRefreshToken(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 手动更新 refreshToken（InvalidRefreshToken 禁用后的自助恢复通道）
+export function useUpdateRefreshToken() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, refreshToken }: { id: number; refreshToken: string }) =>
+      updateRefreshToken(id, refreshToken),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },

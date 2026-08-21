@@ -46,7 +46,7 @@ struct CsrfSession {
     user_id: String,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetUserUsageAndLimitsRequest {
     pub is_email_required: bool,
@@ -97,6 +97,16 @@ struct CborErrorResponse {
     #[serde(rename = "__type")]
     pub type_name: Option<String>,
     pub message: Option<String>,
+}
+
+fn encode_cbor<T: serde::Serialize>(value: &T) -> anyhow::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(value, &mut buf).context("CBOR 编码失败")?;
+    Ok(buf)
+}
+
+fn decode_cbor<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> anyhow::Result<T> {
+    ciborium::de::from_reader(bytes).context("CBOR 解码失败")
 }
 
 fn header_value(s: &str, name: &'static str) -> anyhow::Result<HeaderValue> {
@@ -219,7 +229,7 @@ where
 {
     let url = format!("{}/{}", KIRO_API_BASE, operation);
 
-    let body = serde_cbor::to_vec(req).context("CBOR 编码失败")?;
+    let body = encode_cbor(req)?;
 
     let client = build_client(proxy, 60, tls_backend)?;
 
@@ -237,7 +247,7 @@ where
 
     if !status.is_success() {
         // 尽力解析 CBOR 错误体
-        if let Ok(err) = serde_cbor::from_slice::<CborErrorResponse>(&bytes) {
+        if let Ok(err) = decode_cbor::<CborErrorResponse>(&bytes) {
             let type_name = err
                 .type_name
                 .as_deref()
@@ -251,7 +261,7 @@ where
         anyhow::bail!("HTTP {}: {}", status, raw);
     }
 
-    let out = serde_cbor::from_slice::<TResp>(&bytes).context("CBOR 解码失败")?;
+    let out = decode_cbor(&bytes)?;
     Ok(out)
 }
 
@@ -397,5 +407,70 @@ mod tests {
         ));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("profileArn"));
+    }
+
+    /// serde_cbor 0.11 `to_vec` of the live GetUserUsageAndLimits body
+    /// (`isEmailRequired=true`, `origin=KIRO_IDE`). Captured before the ciborium swap.
+    const LEGACY_GET_USAGE_CBOR: &[u8] = &[
+        0xa2, 0x6f, 0x69, 0x73, 0x45, 0x6d, 0x61, 0x69, 0x6c, 0x52, 0x65, 0x71, 0x75, 0x69, 0x72,
+        0x65, 0x64, 0xf5, 0x66, 0x6f, 0x72, 0x69, 0x67, 0x69, 0x6e, 0x68, 0x4b, 0x49, 0x52, 0x4f,
+        0x5f, 0x49, 0x44, 0x45,
+    ];
+
+    /// serde_cbor 0.11 `to_vec` of UpdateBillingPreferences
+    /// (`overageEnabled=true`, `profileArn=arn:aws:codewhisperer:us-east-1:1:profile/p`).
+    const LEGACY_UPDATE_BILLING_CBOR: &[u8] = &[
+        0xa2, 0x74, 0x6f, 0x76, 0x65, 0x72, 0x61, 0x67, 0x65, 0x43, 0x6f, 0x6e, 0x66, 0x69, 0x67,
+        0x75, 0x72, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0xa1, 0x6e, 0x6f, 0x76, 0x65, 0x72, 0x61, 0x67,
+        0x65, 0x45, 0x6e, 0x61, 0x62, 0x6c, 0x65, 0x64, 0xf5, 0x6a, 0x70, 0x72, 0x6f, 0x66, 0x69,
+        0x6c, 0x65, 0x41, 0x72, 0x6e, 0x78, 0x2b, 0x61, 0x72, 0x6e, 0x3a, 0x61, 0x77, 0x73, 0x3a,
+        0x63, 0x6f, 0x64, 0x65, 0x77, 0x68, 0x69, 0x73, 0x70, 0x65, 0x72, 0x65, 0x72, 0x3a, 0x75,
+        0x73, 0x2d, 0x65, 0x61, 0x73, 0x74, 0x2d, 0x31, 0x3a, 0x31, 0x3a, 0x70, 0x72, 0x6f, 0x66,
+        0x69, 0x6c, 0x65, 0x2f, 0x70,
+    ];
+
+    #[test]
+    fn cbor_get_user_usage_request_roundtrip_matches_legacy_wire() {
+        let req = GetUserUsageAndLimitsRequest {
+            is_email_required: true,
+            origin: "KIRO_IDE".to_string(),
+        };
+        let encoded = encode_cbor(&req).unwrap();
+        assert_eq!(
+            encoded, LEGACY_GET_USAGE_CBOR,
+            "ciborium must emit the same rpc-v2-cbor bytes as serde_cbor 0.11"
+        );
+        let decoded: GetUserUsageAndLimitsRequest = decode_cbor(&encoded).unwrap();
+        assert_eq!(decoded, req);
+        let from_legacy: GetUserUsageAndLimitsRequest = decode_cbor(LEGACY_GET_USAGE_CBOR).unwrap();
+        assert_eq!(from_legacy, req);
+    }
+
+    #[test]
+    fn cbor_update_billing_preferences_request_matches_legacy_wire() {
+        let req = UpdateBillingPreferencesRequest {
+            overage_configuration: UpdateOverageConfiguration {
+                overage_enabled: true,
+            },
+            profile_arn: "arn:aws:codewhisperer:us-east-1:1:profile/p".to_string(),
+        };
+        let encoded = encode_cbor(&req).unwrap();
+        assert_eq!(
+            encoded, LEGACY_UPDATE_BILLING_CBOR,
+            "ciborium must emit the same rpc-v2-cbor bytes as serde_cbor 0.11"
+        );
+    }
+
+    #[test]
+    fn cbor_error_response_from_reader() {
+        // `{ "__type": "ValidationException", "message": "bad" }` as definite CBOR map.
+        const ERR: &[u8] = &[
+            0xa2, 0x66, 0x5f, 0x5f, 0x74, 0x79, 0x70, 0x65, 0x73, 0x56, 0x61, 0x6c, 0x69, 0x64,
+            0x61, 0x74, 0x69, 0x6f, 0x6e, 0x45, 0x78, 0x63, 0x65, 0x70, 0x74, 0x69, 0x6f, 0x6e,
+            0x67, 0x6d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x63, 0x62, 0x61, 0x64,
+        ];
+        let err: CborErrorResponse = decode_cbor(ERR).unwrap();
+        assert_eq!(err.type_name.as_deref(), Some("ValidationException"));
+        assert_eq!(err.message.as_deref(), Some("bad"));
     }
 }

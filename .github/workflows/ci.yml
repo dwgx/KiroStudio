@@ -1,0 +1,51 @@
+# 日常 CI 门禁：push / PR 用出厂特性跑测试。
+#
+# 与 release.yml 的区别：release 只在 tag v* / 手动触发时跑，且带版本闸门与发资产；
+# 本 workflow 覆盖日常提交，避免回归全靠本地自觉（P1-10）。
+# 与 deploy-build.yml 同用 `cargo test --no-default-features --locked`；
+# rust-cache 写法对齐那两个文件。不改 release 的 tag 闸门，不启 skiapi Docker。
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # 前端产物 admin-ui/dist 必须在 cargo 之前存在 —— rust-embed(#[derive(Embed)]) 是
+      # 编译期嵌入，dist 缺失时 Asset::get 无法生成，测试也编不过。与 release/deploy-build 一致。
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: admin-ui/pnpm-lock.yaml
+
+      - name: 构建前端 (admin-ui/dist)
+        working-directory: admin-ui
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+      - name: Rust 编译缓存
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-test-no-default
+      - name: 运行测试（出厂特性：纯 rustls + --locked）
+        run: cargo test --no-default-features --locked

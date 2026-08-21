@@ -21,7 +21,7 @@
 # 例(部署本次回退,断言那个害人的补丁已消失):
 #   deploy/verified-deploy.sh target/x86_64-unknown-linux-musl/release/kirostudio \
 #       --must-not '命中账号级限流' --must 'SO_REUSEPORT'
-set -uo pipefail
+set -euo pipefail
 
 REMOTE=${REMOTE:-ws-vps}
 REMOTE_BIN=/opt/kirostudio/bin/kirostudio
@@ -89,11 +89,10 @@ assert_file() {
   for pat in ${MUST[@]+"${MUST[@]}"}; do
     b64=$(printf '%s' "$pat" | base64 | tr -d '\n')
     if (( remote )); then
-      ssh -o ConnectTimeout=10 "$REMOTE" "python3 $REMOTE_HAS_LITERAL $(printf '%q' "$path") $b64"
+      ssh -o ConnectTimeout=10 "$REMOTE" "python3 $REMOTE_HAS_LITERAL $(printf '%q' "$path") $b64" && rc=0 || rc=$?
     else
-      python3 "$LOCAL_HAS_LITERAL" "$path" "$b64"
+      python3 "$LOCAL_HAS_LITERAL" "$path" "$b64" && rc=0 || rc=$?
     fi
-    rc=$?
     (( rc == 0 )) || die "$where 缺少必须存在的字面量: $pat
      ⇒ 这次改动**没有**进到该二进制。若是本地文件,极可能是增量构建复用了旧产物:
         cargo clean -p kirostudio 后重新构建。"

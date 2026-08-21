@@ -22,8 +22,8 @@ import {
   DialogDescription,
   DialogFooter,
 } from '@/components/ui/dialog'
-import { useCredentials, useDeleteCredentialsBatch, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useSetDisabled } from '@/hooks/use-credentials'
-import { getCredentialBalance, getCachedBalances, forceRefreshToken, deepVerifyCredential, probeAvailableModels, setCredentialAllowedModels, PROBE_MODEL_CATALOG, exportCredential, cleanupDisabled } from '@/api/credentials'
+import { useCredentials, useDeleteCredentialsBatch, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
+import { getCredentialBalance, getCachedBalances, deepVerifyCredential, probeAvailableModels, setCredentialAllowedModels, resetCredentialsBatch, setDisabledBatch, setAllowedModelsBatch, forceRefreshTokensBatch, PROBE_MODEL_CATALOG, exportCredential, exportKam, cleanupDisabled } from '@/api/credentials'
 import { extractErrorMessage, downloadJson, fileStamp } from '@/lib/utils'
 import { PageSkeleton } from '@/components/ui/page-skeleton'
 import { useUiLayoutPrefs } from '@/hooks/use-ui-layout-prefs'
@@ -218,8 +218,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   // dataUpdatedAt = 最近一次**成功**拉取的时刻，用于过期提示条告诉用户手里这份数据有多旧。
   const { data, isLoading, error, refetch, dataUpdatedAt } = useCredentials()
   const { mutateAsync: deleteCredentialsBatch } = useDeleteCredentialsBatch()
-  const { mutate: resetFailure } = useResetFailure()
-  const { mutateAsync: setDisabledAsync } = useSetDisabled()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
 
@@ -386,38 +384,22 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       return
     }
 
-    let successCount = 0
-    let failCount = 0
-
-    for (const id of failedIds) {
-      try {
-        await new Promise<void>((resolve, reject) => {
-          resetFailure(id, {
-            onSuccess: () => {
-              successCount++
-              resolve()
-            },
-            onError: (err) => {
-              failCount++
-              reject(err)
-            }
-          })
-        })
-      } catch (error) {
-        // 错误已在 onError 中处理
+    try {
+      const res = await resetCredentialsBatch(failedIds)
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      if (res.failed === 0) {
+        toast.success(t('dashboard.batchReset.successToast', { count: res.succeeded }))
+      } else {
+        toast.warning(t('dashboard.batchReset.warnToast', { ok: res.succeeded, fail: res.failed }))
       }
-    }
-
-    if (failCount === 0) {
-      toast.success(t('dashboard.batchReset.successToast', { count: successCount }))
-    } else {
-      toast.warning(t('dashboard.batchReset.warnToast', { ok: successCount, fail: failCount }))
+    } catch {
+      toast.error(t('dashboard.batchDelete.requestFailed'))
     }
 
     deselectAll()
   }
 
-  // 批量启用 / 禁用：对选中项统一设为目标状态（逐个调用，跳过已是目标态的）
+  // 批量启用 / 禁用：对选中项统一设为目标状态（一次请求，跳过已是目标态的）
   const handleBatchSetDisabled = async (disabled: boolean) => {
     if (selectedIds.size === 0) {
       toast.error(disabled ? t('dashboard.batchDisable.noSelectionDisable') : t('dashboard.batchDisable.noSelectionEnable'))
@@ -432,22 +414,17 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       return
     }
 
-    let successCount = 0
-    let failCount = 0
-    for (const id of targetIds) {
-      try {
-        await setDisabledAsync({ id, disabled })
-        successCount++
-      } catch {
-        failCount++
-      }
-    }
-
     const action = disabled ? t('dashboard.batchDisable.actionDisable') : t('dashboard.batchDisable.actionEnable')
-    if (failCount === 0) {
-      toast.success(t('dashboard.batchDisable.successToast', { action, count: successCount }))
-    } else {
-      toast.warning(t('dashboard.batchDisable.warnToast', { action, ok: successCount, fail: failCount }))
+    try {
+      const res = await setDisabledBatch(targetIds, disabled)
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      if (res.failed === 0) {
+        toast.success(t('dashboard.batchDisable.successToast', { action, count: res.succeeded }))
+      } else {
+        toast.warning(t('dashboard.batchDisable.warnToast', { action, ok: res.succeeded, fail: res.failed }))
+      }
+    } catch {
+      toast.error(t('dashboard.batchDelete.requestFailed'))
     }
     deselectAll()
   }
@@ -462,7 +439,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   }
 
   // 批量设"允许模型白名单"(成本安全硬门)。破坏性整体覆盖 → 走 confirmState 二次确认。
-  // custom_api 号无 Kiro 白名单概念,循环跳过并计入 skipped。空集=清空(设为不限制)。
+  // custom_api 号无 Kiro 白名单概念,客户端跳过并计入 skipped。空集=清空(设为不限制)。
   const handleBatchSetAllowedModels = () => {
     if (selectedIds.size === 0) {
       toast.error(t('dashboard.batchWhitelist.noSelection'))
@@ -479,14 +456,20 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       confirmText: setEmpty ? t('dashboard.batchWhitelist.clearBtn') : t('dashboard.batchWhitelist.overwriteBtn'),
       onConfirm: async () => {
         setBatchWhitelistBusy(true)
-        let ok = 0, fail = 0, skipped = 0
-        for (const id of targetIds) {
+        const applyIds = targetIds.filter((id) => {
           const cred = data?.credentials.find(c => c.id === id)
-          if (cred && (cred.authMethod === 'custom_api' || cred.baseUrl)) { skipped++; continue }
-          try {
-            await setCredentialAllowedModels(id, setEmpty ? null : list)
-            ok++
-          } catch { fail++ }
+          return !(cred && (cred.authMethod === 'custom_api' || cred.baseUrl))
+        })
+        const skipped = targetIds.length - applyIds.length
+        let ok = 0, fail = 0
+        try {
+          if (applyIds.length > 0) {
+            const res = await setAllowedModelsBatch(applyIds, setEmpty ? null : list)
+            ok = res.succeeded
+            fail = res.failed
+          }
+        } catch {
+          fail = applyIds.length
         }
         queryClient.invalidateQueries({ queryKey: ['credentials'] })
         setBatchWhitelistBusy(false)
@@ -517,28 +500,20 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     setBatchRefreshing(true)
     setBatchRefreshProgress({ current: 0, total: enabledIds.length })
 
-    let successCount = 0
-    let failCount = 0
-
-    for (let i = 0; i < enabledIds.length; i++) {
-      try {
-        await forceRefreshToken(enabledIds[i])
-        successCount++
-      } catch {
-        failCount++
+    try {
+      const res = await forceRefreshTokensBatch(enabledIds)
+      setBatchRefreshProgress({ current: enabledIds.length, total: enabledIds.length })
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      if (res.failed === 0) {
+        toast.success(t('dashboard.batchRefresh.successToast', { count: res.succeeded }))
+      } else {
+        toast.warning(t('dashboard.batchRefresh.warnToast', { ok: res.succeeded, fail: res.failed }))
       }
-      setBatchRefreshProgress({ current: i + 1, total: enabledIds.length })
+    } catch {
+      toast.error(t('dashboard.batchDelete.requestFailed'))
     }
 
     setBatchRefreshing(false)
-    queryClient.invalidateQueries({ queryKey: ['credentials'] })
-
-    if (failCount === 0) {
-      toast.success(t('dashboard.batchRefresh.successToast', { count: successCount }))
-    } else {
-      toast.warning(t('dashboard.batchRefresh.warnToast', { ok: successCount, fail: failCount }))
-    }
-
     deselectAll()
   }
 
@@ -641,14 +616,47 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           if (res.skipped.length > 0) {
             // 跳过的（含自愈中、代挂、透传）逐条可见——用户才知道为什么没清掉。
             const reasons = res.skipped.slice(0, 5).map((x) => `#${x.id}: ${x.reason}`).join('\n')
-            toast.info(reasons + (res.skipped.length > 5 ? `\n…共 ${res.skipped.length} 条跳过` : ''))
+            toast.info(reasons + (res.skipped.length > 5 ? '\n' + t('dashboard.clearAll.skippedMore', { count: res.skipped.length }) : ''))
           }
         } catch (err) {
-          toast.error(t('dashboard.clearAll.onlyPassthrough', { count: 0 }) + extractErrorMessage(err))
+          toast.error(t('dashboard.batchDelete.requestFailed') + extractErrorMessage(err))
         }
         deselectAll()
       },
     })
+  }
+
+  // 导出 KAM 号池（Blob 下载为 kam.json）。后端接线中：端点未合入时 404，提示稍后再试。
+  const handleExportKam = async () => {
+    try {
+      const blob = await exportKam()
+      // MINOR-5（2026-08-14 审查修正）：后端错误可能以 200 + JSON 错误页形式回来
+      // （反代/中间层），按 blob.type 判型，避免把错误页下载成垃圾 kam.json。
+      if (blob.type === 'application/json') {
+        const text = await blob.text()
+        let msg = t('dashboard.toolbar.exportKamFailed')
+        try {
+          const parsed = JSON.parse(text)
+          msg = parsed.error?.message || parsed.message || msg
+        } catch {
+          /* 非 JSON 错误体，用默认文案 */
+        }
+        toast.error(msg)
+        return
+      }
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = 'kam.json'
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+      toast.success(t('dashboard.toolbar.exportKamOk'))
+    } catch (err) {
+      // MINOR-6（2026-08-14）：后端已合入（404 是兼容旧后端路径）
+      toast.error(extractErrorMessage(err))
+    }
   }
 
   // 查询当前页凭据信息（只读已缓存余额快照，一次拉取、绝不触发上游调用）。
@@ -876,13 +884,13 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
             >
               {isLoadingMode ? t('dashboard.loadBalancing.loading') : (loadBalancingData?.mode === 'priority' ? t('dashboard.loadBalancing.priorityMode') : t('dashboard.loadBalancing.balancedShort'))}
             </Button>
-            <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
+            <Button variant="ghost" size="icon" onClick={toggleDarkMode} aria-label={t('dashboard.toolbar.darkMode')}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
             </Button>
-            <Button variant="ghost" size="icon" onClick={handleRefresh}>
+            <Button variant="ghost" size="icon" onClick={handleRefresh} aria-label={t('dashboard.toolbar.refreshList')}>
               <RefreshCw className="h-5 w-5" />
             </Button>
-            <Button variant="ghost" size="icon" onClick={handleLogout}>
+            <Button variant="ghost" size="icon" onClick={handleLogout} aria-label={t('appshell.action.logout')}>
               <LogOut className="h-5 w-5" />
             </Button>
           </div>
@@ -976,6 +984,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                       key={v}
                       type="button"
                       aria-pressed={on}
+                      aria-label={label}
                       title={label}
                       onClick={() => setUiPrefs({ credentialView: v })}
                       className={`inline-flex h-8 items-center gap-1.5 rounded px-2 text-xs font-medium transition-colors ${
@@ -999,7 +1008,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   >
                     {isLoadingMode ? t('dashboard.loadBalancing.loading') : (loadBalancingData?.mode === 'priority' ? t('dashboard.loadBalancing.priorityMode') : t('dashboard.loadBalancing.balancedShort'))}
                   </Button>
-                  <Button variant="outline" size="sm" onClick={handleRefresh} title={t('dashboard.toolbar.refreshList')}>
+                  <Button variant="outline" size="sm" onClick={handleRefresh} title={t('dashboard.toolbar.refreshList')} aria-label={t('dashboard.toolbar.refreshList')}>
                     <RefreshCw className="h-4 w-4" />
                   </Button>
                 </>
@@ -1012,7 +1021,9 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   </Button>
                   <Button onClick={handleExportSelected} size="sm" variant="outline" disabled={exportingSelected}>
                     <Download className={`h-4 w-4 mr-2 ${exportingSelected ? 'animate-spin' : ''}`} />
-                    {exportingSelected ? `导出中... ${exportProgress.current}/${exportProgress.total}` : '导出选中'}
+                    {exportingSelected
+                      ? t('dashboard.toolbar.exportingSelected', { current: exportProgress.current, total: exportProgress.total })
+                      : t('dashboard.toolbar.exportSelected')}
                   </Button>
                   <Button onClick={handleTestModels} size="sm" variant="outline">
                     <FlaskConical className="h-4 w-4 mr-2" />
@@ -1116,6 +1127,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 <Plus className="h-4 w-4 mr-2" />
                 {t('dashboard.toolbar.addCredential')}
               </Button>
+              <Button onClick={handleExportKam} size="sm" variant="outline" title={t('dashboard.toolbar.exportKam')}>
+                <Download className="h-4 w-4 mr-2" />
+                {t('dashboard.toolbar.exportKam')}
+              </Button>
             </div>
           </div>
 
@@ -1130,9 +1145,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                刻意**不分页** —— 分页会让「第 1 页框选 5 个 → 翻页 → 批量删除」删掉当前看不见的号，
                而画布本身可滚动。故这里喂 `data.credentials` 全集而非 `currentCredentials`。
                卡片/行两档的分页行为一个字节没动。 */
-            // ⚠️ 右键菜单暂未接：卡片视图的右键在 `credential-card.tsx` 内部自处理
-            // （不走 dashboard 的 state），画布要复用需先把那套菜单抽成共享组件。
-            // 本轮只交付框选/拖动/改大小三件，右键留待抽组件后再接。
             <CredentialCanvas credentials={data?.credentials ?? []} />
           ) : (
             <>

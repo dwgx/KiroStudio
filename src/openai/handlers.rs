@@ -18,6 +18,7 @@ use crate::anthropic::middleware::AppState;
 use crate::anthropic::model_catalog;
 use crate::openai::convert;
 use crate::openai::types::ChatCompletionsPeek;
+use uuid::Uuid;
 
 /// 读取上游响应体的硬上限(纵深防护):正常响应远小于此(受 max_tokens + 256MiB body 限约束),
 /// 但显式封顶避免异常/恶意超大响应把整个响应体读进内存打爆(不用 usize::MAX)。
@@ -59,8 +60,10 @@ pub async fn post_chat_completions(
     // 出站给客户端的 model 名回显客户端请求的原名(OpenAI 惯例)。
     let echo_model = peek.model.clone();
 
-    // 翻译成 Anthropic 请求体。
-    let anthropic_req = convert::openai_chat_to_anthropic(&resolved_model, &raw, peek.stream);
+    // 翻译成 Anthropic 请求体。会话 UUID 写入 metadata.user_id（converter 已认
+    // `session_<uuid>`），未命中则不下发，conversationId 走现有派生/随机。
+    let mut anthropic_req = convert::openai_chat_to_anthropic(&resolved_model, &raw, peek.stream);
+    apply_session_metadata(&mut anthropic_req, &raw, &headers);
     let anthropic_bytes = match serde_json::to_vec(&anthropic_req) {
         Ok(b) => Bytes::from(b),
         Err(e) => {
@@ -95,7 +98,8 @@ pub async fn post_chat_completions(
     }
 
     if peek.stream {
-        stream_openai_from_anthropic(anthropic_resp, echo_model).await
+        let include_usage = convert::stream_include_usage(&raw);
+        stream_openai_from_anthropic(anthropic_resp, echo_model, include_usage).await
     } else {
         nonstream_openai_from_anthropic(anthropic_resp, echo_model).await
     }
@@ -137,7 +141,8 @@ pub async fn post_responses(
         .unwrap_or_else(|| model.clone());
     let echo_model = model.clone();
 
-    let anthropic_req = convert::openai_responses_to_anthropic(&resolved_model, &raw, stream);
+    let mut anthropic_req = convert::openai_responses_to_anthropic(&resolved_model, &raw, stream);
+    apply_session_metadata(&mut anthropic_req, &raw, &headers);
     let anthropic_bytes = match serde_json::to_vec(&anthropic_req) {
         Ok(b) => Bytes::from(b),
         Err(e) => {
@@ -168,6 +173,38 @@ pub async fn post_responses(
     } else {
         nonstream_responses_from_anthropic(anthropic_resp, echo_model).await
     }
+}
+
+/// OpenAI 会话键 → Anthropic `metadata.user_id`（`session_<uuid>`）。
+///
+/// 顺序：JSON `prompt_cache_key` → 头 `x-session-affinity` →
+/// `x-client-request-id` → JSON `session_id`。非法值跳过；全未命中则不下发
+/// （Kiro conversationId 保持 converter 派生/随机）。不改 converter 哈希。
+fn apply_session_metadata(anthropic_req: &mut Value, raw: &Value, headers: &HeaderMap) {
+    if let Some(user_id) = resolve_session_user_id(raw, headers) {
+        anthropic_req["metadata"] = json!({"user_id": user_id});
+    }
+}
+
+fn resolve_session_user_id(raw: &Value, headers: &HeaderMap) -> Option<String> {
+    let json_str = |key: &str| raw.get(key).and_then(Value::as_str);
+    let header_str = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    [
+        json_str("prompt_cache_key"),
+        header_str("x-session-affinity"),
+        header_str("x-client-request-id"),
+        json_str("session_id"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(parse_session_uuid)
+}
+
+fn parse_session_uuid(candidate: &str) -> Option<String> {
+    let candidate = candidate.trim();
+    let raw_uuid = candidate.strip_prefix("session_").unwrap_or(candidate);
+    let uuid = Uuid::parse_str(raw_uuid.trim()).ok()?;
+    Some(format!("session_{uuid}"))
 }
 
 /// 流式:Anthropic SSE → Responses SSE 事件序列(每事件 `event: T\ndata: {..}\n\n`)。
@@ -226,11 +263,15 @@ async fn nonstream_responses_from_anthropic(resp: Response, model: String) -> Re
 }
 
 /// 流式:把 Anthropic SSE body 逐帧翻成 OpenAI chat.completion.chunk SSE。
-async fn stream_openai_from_anthropic(resp: Response, model: String) -> Response {
+async fn stream_openai_from_anthropic(
+    resp: Response,
+    model: String,
+    include_usage: Option<bool>,
+) -> Response {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     let body = resp.into_body();
-    let mut conv = convert::ChatStreamConverter::new(model);
+    let mut conv = convert::ChatStreamConverter::new(model).with_include_usage(include_usage);
     // in-band 错误标志:转换器吐出 {"error":...} chunk 时置位,让流末尾**不发 [DONE]**
     // (上游中途 error 事件是正常 transport 读,stream_errored 抓不到,但同样不能当成功收尾)。
     let error_seen = Arc::new(AtomicBool::new(false));
@@ -670,6 +711,155 @@ mod tests {
                 .last()
                 .and_then(|e| e["delta"]["stop_reason"].as_str()),
             Some("end_turn")
+        );
+    }
+
+    const UUID_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const UUID_B: &str = "67e55044-10b1-426f-9247-bb680e5fe0c8";
+    const UUID_C: &str = "123e4567-e89b-12d3-a456-426614174000";
+    const UUID_D: &str = "123e4567-e89b-12d3-a456-426614174001";
+
+    fn session_raw(cache: Option<&str>, session: Option<&str>) -> Value {
+        let mut raw = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        if let Some(c) = cache {
+            raw["prompt_cache_key"] = json!(c);
+        }
+        if let Some(s) = session {
+            raw["session_id"] = json!(s);
+        }
+        raw
+    }
+
+    fn session_headers(affinity: Option<&str>, client_req: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(v) = affinity {
+            headers.insert("x-session-affinity", v.parse().unwrap());
+        }
+        if let Some(v) = client_req {
+            headers.insert("x-client-request-id", v.parse().unwrap());
+        }
+        headers
+    }
+
+    fn user_id(raw: &Value, headers: &HeaderMap) -> Option<String> {
+        resolve_session_user_id(raw, headers)
+    }
+
+    /// P2-7: JSON `prompt_cache_key` 优先于头与 JSON `session_id`。
+    #[test]
+    fn session_affinity_prompt_cache_key_wins() {
+        let raw = session_raw(Some(UUID_A), Some(UUID_D));
+        let headers = session_headers(Some(UUID_B), Some(UUID_C));
+        assert_eq!(
+            user_id(&raw, &headers).as_deref(),
+            Some("session_550e8400-e29b-41d4-a716-446655440000")
+        );
+    }
+
+    /// P2-7: `prompt_cache_key` 非法时头 `x-session-affinity` 胜出。
+    #[test]
+    fn session_affinity_x_session_affinity_wins() {
+        let raw = session_raw(Some("not-a-uuid"), Some(UUID_D));
+        let headers = session_headers(Some(UUID_B), Some(UUID_C));
+        assert_eq!(
+            user_id(&raw, &headers).as_deref(),
+            Some("session_67e55044-10b1-426f-9247-bb680e5fe0c8")
+        );
+    }
+
+    /// P2-7: 亲和头非法时 `x-client-request-id` 胜出。
+    #[test]
+    fn session_affinity_x_client_request_id_wins() {
+        let raw = session_raw(Some("garbage"), Some(UUID_D));
+        let headers = session_headers(Some("also-garbage"), Some(UUID_C));
+        assert_eq!(
+            user_id(&raw, &headers).as_deref(),
+            Some("session_123e4567-e89b-12d3-a456-426614174000")
+        );
+    }
+
+    /// P2-7: 头全非法/缺失时 JSON `session_id` 胜出。
+    #[test]
+    fn session_affinity_json_session_id_wins() {
+        let raw = session_raw(Some("nope"), Some(UUID_D));
+        let headers = session_headers(Some("nope"), Some("nope"));
+        assert_eq!(
+            user_id(&raw, &headers).as_deref(),
+            Some("session_123e4567-e89b-12d3-a456-426614174001")
+        );
+    }
+
+    /// P2-7: 非法值跳过；四来源全空或全垃圾 → 不下发（现有派生/随机）。
+    #[test]
+    fn session_affinity_garbage_ignored() {
+        let raw = session_raw(Some("not-a-uuid"), Some("session_not-a-uuid"));
+        let mut headers = session_headers(Some("also-bad"), Some("still-bad"));
+        headers.insert(
+            "x-session-affinity",
+            axum::http::HeaderValue::from_bytes(&[0xff]).unwrap(),
+        );
+        assert!(user_id(&raw, &headers).is_none());
+        assert!(user_id(&session_raw(None, None), &HeaderMap::new()).is_none());
+    }
+
+    /// `session_<uuid>` 与大写 UUID 归一成 converter 已认的 `session_<小写 uuid>`。
+    #[test]
+    fn session_affinity_normalizes_session_prefix_and_case() {
+        let raw = session_raw(Some("session_550E8400-E29B-41D4-A716-446655440000"), None);
+        assert_eq!(
+            user_id(&raw, &HeaderMap::new()).as_deref(),
+            Some("session_550e8400-e29b-41d4-a716-446655440000")
+        );
+    }
+
+    /// 命中时写入翻译后 Anthropic body 的 `metadata.user_id`；未命中不造 metadata。
+    #[test]
+    fn session_affinity_sets_metadata_on_translated_body() {
+        let raw = session_raw(Some(UUID_A), None);
+        let mut anth = convert::openai_chat_to_anthropic("m", &raw, false);
+        assert!(
+            anth.get("metadata").is_none(),
+            "convert 本身不得写 metadata（亲和只在 handler 注入）"
+        );
+        apply_session_metadata(&mut anth, &raw, &HeaderMap::new());
+        assert_eq!(
+            anth["metadata"]["user_id"].as_str(),
+            Some("session_550e8400-e29b-41d4-a716-446655440000")
+        );
+
+        let raw2 = session_raw(None, None);
+        let mut anth2 = convert::openai_chat_to_anthropic("m", &raw2, false);
+        apply_session_metadata(&mut anth2, &raw2, &HeaderMap::new());
+        assert!(
+            anth2.get("metadata").is_none(),
+            "无会话键不得下发 metadata，conversationId 走派生/随机"
+        );
+
+        let raw3 = json!({
+            "model": "m",
+            "input": "hi",
+            "prompt_cache_key": UUID_B
+        });
+        let mut anth3 = convert::openai_responses_to_anthropic("m", &raw3, false);
+        apply_session_metadata(&mut anth3, &raw3, &HeaderMap::new());
+        assert_eq!(
+            anth3["metadata"]["user_id"].as_str(),
+            Some("session_67e55044-10b1-426f-9247-bb680e5fe0c8")
+        );
+    }
+
+    /// chat 与 responses 两个入口都必须注入会话 metadata（防一侧漏接）。
+    #[test]
+    fn session_affinity_both_openai_handlers_apply() {
+        let src = include_str!("handlers.rs");
+        let tests_start = src.find("mod tests").unwrap_or(src.len());
+        let impl_region = &src[..tests_start];
+        let needle = format!("apply_session{}", "_metadata(");
+        assert_eq!(
+            impl_region.matches(&needle).count(),
+            3,
+            "定义 1 次 + post_chat_completions / post_responses 各调 1 次；当前 {} 次",
+            impl_region.matches(&needle).count()
         );
     }
 }

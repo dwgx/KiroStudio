@@ -134,9 +134,16 @@ pub struct ExternalIdpLeg2Result {
     pub profiles: Vec<ProfileOption>,
 }
 
-/// `submit_leg2_select` 结果:选定 profile 后入池的新凭据 ID。
+/// `submit_leg2_select` 结果：选定 profile 后入池的新凭据 ID + **实际使用**的
+/// arn / region。
+///
+/// ⚠️ `arn` / `region` 必须回显实际生效值而非用户传入值：用户选的 profile 可能
+/// 不可用（FEATURE_NOT_SUPPORTED）而被自动替换为同账号可用的另一个（见
+/// `resolve_chosen_profile`），前端与用户需要知道最终建号用的是什么。
 pub struct ExternalIdpSelectResult {
     pub credential_id: u64,
+    pub arn: String,
+    pub region: String,
 }
 
 impl ExternalIdpLoginManager {
@@ -247,12 +254,11 @@ impl ExternalIdpLoginManager {
 
         let params = parse_query_from_pasted(pasted_url);
 
-        // portal 段可能带 state（CSRF）；带了就校验，避免粘错 URL。
-        if params
-            .get("state")
-            .filter(|v| !v.is_empty())
-            .is_some_and(|cb_state| *cb_state != leg1_state)
-        {
+        // portal 段必须带 state（CSRF），**缺失 / 为空 / 不匹配一律拒绝**（fail-closed，
+        // 对齐 submit_leg2 的校验）：粘错 URL、粘旧 session 的 URL 都不该继续。
+        // 历史形态是 fail-open（state 缺失或为空就跳过校验）——那是「不校验」的另一种
+        // 写法，删掉那道 `.filter(|v| !v.is_empty())` 正是本修复。
+        if callback_state_mismatch(params.get("state").map(|v| v.as_str()), &leg1_state) {
             bail!("回调 state 不匹配，请确认粘贴的是本次登录跳转后的地址栏 URL");
         }
         if let Some(err) = params.get("error").filter(|v| !v.is_empty()) {
@@ -358,8 +364,7 @@ impl ExternalIdpLoginManager {
             let desc = params.get("error_description").cloned().unwrap_or_default();
             bail!("外部 IdP 授权返回错误: {} {}", err, desc);
         }
-        let cb_state = params.get("state").map(|s| s.trim()).unwrap_or("");
-        if cb_state.is_empty() || cb_state != leg2.state {
+        if callback_state_mismatch(params.get("state").map(|v| v.as_str()), &leg2.state) {
             bail!("回调 state 不匹配，请确认粘贴的是授权后跳转的地址栏 URL");
         }
         let code = params
@@ -433,7 +438,7 @@ impl ExternalIdpLoginManager {
                 .expect("usable_count==1 保证存在")
                 .arn
                 .clone();
-            let cred_id = self.build_and_add_credential(session_id, &chosen).await?;
+            let (cred_id, _, _) = self.build_and_add_credential(session_id, &chosen).await?;
             return Ok(ExternalIdpLeg2Result {
                 credential_id: Some(cred_id),
                 profiles,
@@ -461,15 +466,25 @@ impl ExternalIdpLoginManager {
         session_id: &str,
         arn: &str,
     ) -> anyhow::Result<ExternalIdpSelectResult> {
-        let cred_id = self.build_and_add_credential(session_id, arn).await?;
+        let (cred_id, used_arn, region) = self.build_and_add_credential(session_id, arn).await?;
         Ok(ExternalIdpSelectResult {
             credential_id: cred_id,
+            // 回显**实际使用**的 arn/region：选中的不可用 profile 可能被自动替换
+            // （静默替换的透明化，见 build_and_add_credential 的 resolve_chosen_profile）。
+            arn: used_arn,
+            region,
         })
     }
 
     /// 用 session 暂存的 token + 指定 arn 构建凭据并入池。arn 必须在暂存 profiles 内。
     /// region/auth_region 全部取 **arn 内的 region**(防呆铁律:region 与 ARN 物理绑定)。
-    async fn build_and_add_credential(&self, session_id: &str, arn: &str) -> anyhow::Result<u64> {
+    /// 返回 `(credential_id, 实际使用的 arn, region)`——arn 可能与入参不同
+    /// （选中的不可用 profile 会被自动替换为可用的）。
+    async fn build_and_add_credential(
+        &self,
+        session_id: &str,
+        arn: &str,
+    ) -> anyhow::Result<(u64, String, String)> {
         let (pending, priority, custom_proxy) = {
             let sessions = self.sessions.lock();
             let s = sessions
@@ -487,30 +502,11 @@ impl ExternalIdpLoginManager {
         };
 
         // 防呆+防伪:选的 arn 必须确在本账号探测到的 profiles 列表里。
-        let mut chosen = pending
-            .profiles
-            .iter()
-            .find(|p| p.arn == arn.trim())
-            .ok_or_else(|| anyhow!("选中的 profile 不在该账号可用列表内（arn 不匹配）"))?
-            .clone();
-
-        // 自动纠正（J）：若选中的 profile 验活不可用（FEATURE_NOT_SUPPORTED 等），但同账号存在
-        // 其它已验活可用的 region profile，则自动改用可用的那个——绝不建一个必 403 的死号。
-        // （单 usable 时 submit_leg2 已自动选好；此处兜住「多 profile 弹窗里误选了不可用项」。）
-        if !chosen.usable {
-            if let Some(usable) = pending.profiles.iter().find(|p| p.usable) {
-                tracing::info!(
-                    "选中的 region profile {} 未开通（FEATURE_NOT_SUPPORTED）,自动改用可用的 {}",
-                    chosen.arn,
-                    usable.arn
-                );
-                chosen = usable.clone();
-            } else {
-                bail!(
-                    "该账号所有 region profile 目前均未开通（FEATURE_NOT_SUPPORTED）,暂无法建号——请确认账号已开通 Kiro 订阅"
-                );
-            }
-        }
+        // 自动纠正（J）：选中的 profile 验活不可用（FEATURE_NOT_SUPPORTED 等）时，
+        // 若同账号存在其它已验活可用的 region profile，则自动改用可用的那个 ——
+        // 绝不建一个必 403 的死号（单 usable 时 submit_leg2 已自动选好；此处兜住
+        // 「多 profile 弹窗里误选了不可用项」）。
+        let chosen = resolve_chosen_profile(&pending.profiles, arn.trim())?;
         // region 以 arn 内解析为准(chosen.region 已是白名单校验过的 arn region)。
         let region = chosen.region.clone();
 
@@ -561,13 +557,50 @@ impl ExternalIdpLoginManager {
             credential_id,
             region
         );
-        Ok(credential_id)
+        Ok((credential_id, chosen.arn, region))
     }
 
     fn cleanup_expired(&self) {
         self.sessions
             .lock()
             .retain(|_, s| s.created_at.elapsed().as_secs() < SESSION_TTL_SECS);
+    }
+}
+
+/// 解析用户选中的 profile（防呆+防伪），并对「选中项不可用」做自动纠正。
+///
+/// 返回**实际将使用**的 profile：
+/// - arn 不在暂存列表 → Err（防伪：绝不建列表外的号）
+/// - 选中项可用 → 原样返回
+/// - 选中项不可用（FEATURE_NOT_SUPPORTED 等）→ 自动改用同账号首个可用的，
+///   并打日志（静默替换必须可见——调用方把返回的 arn 回显给前端）
+/// - 全部不可用 → Err（绝不建一个必 403 的死号）
+///
+/// 抽成纯函数只为可测（session/网络都测不了），行为在 [`ExternalIdpSelectResult`]
+/// 回显里透明化。
+fn resolve_chosen_profile(
+    profiles: &[ProfileOption],
+    arn: &str,
+) -> anyhow::Result<ProfileOption> {
+    let chosen = profiles
+        .iter()
+        .find(|p| p.arn == arn)
+        .ok_or_else(|| anyhow!("选中的 profile 不在该账号可用列表内（arn 不匹配）"))?
+        .clone();
+    if chosen.usable {
+        return Ok(chosen);
+    }
+    if let Some(usable) = profiles.iter().find(|p| p.usable) {
+        tracing::info!(
+            "选中的 region profile {} 未开通（FEATURE_NOT_SUPPORTED）,自动改用可用的 {}",
+            chosen.arn,
+            usable.arn
+        );
+        Ok(usable.clone())
+    } else {
+        bail!(
+            "该账号所有 region profile 目前均未开通（FEATURE_NOT_SUPPORTED）,暂无法建号——请确认账号已开通 Kiro 订阅"
+        )
     }
 }
 
@@ -590,6 +623,16 @@ fn random_state() -> String {
         out.push_str(&format!("{:02x}", b));
     }
     out
+}
+
+/// 回调 state 校验（**fail-closed**）：缺失 / 为空 / 与期望值不匹配一律判不匹配。
+///
+/// leg1（portal 回调）与 leg2（IdP 授权回调）共用同一判据 —— 两处若各自写一遍，
+/// 将来改一处漏一处（本仓主导缺陷形态）。fail-open（缺失即放行）是 CSRF 校验的
+/// 空洞：state 的唯一职责是证明「回调来自本次会话发起的流程」，缺失时无从证明。
+fn callback_state_mismatch(cb_state: Option<&str>, expected: &str) -> bool {
+    let s = cb_state.map(str::trim).unwrap_or("");
+    s.is_empty() || s != expected
 }
 
 /// 从用户粘贴的整串 URL / query / 片段里解析出 query 参数（容错：
@@ -1091,5 +1134,125 @@ mod tests {
         let b = random_state();
         assert_ne!(a, b);
         assert!(!a.contains('+') && !a.contains('/') && !a.contains('='));
+    }
+
+    // ---------------- MINOR 3：回调 state 校验必须 fail-closed ----------------
+
+    /// leg1/leg2 共用的 state 判据矩阵：缺失 / 为空 / 不匹配 → 拒绝（fail-closed）。
+    ///
+    /// 回退即 FAIL：把 `callback_state_mismatch` 改回 leg1 旧形态（缺失或为空就跳过
+    /// 校验）——「state 缺失」这一行会从 `true` 变成 `false`，本条红。
+    #[test]
+    fn callback_state_mismatch_is_fail_closed() {
+        // 缺失 → 必须判不匹配（leg1 旧实现是跳过校验 = fail-open，正是本修复）。
+        assert!(callback_state_mismatch(None, "leg1-state"));
+        // 空串 / 纯空白 → 判不匹配。
+        assert!(callback_state_mismatch(Some(""), "leg1-state"));
+        assert!(callback_state_mismatch(Some("   "), "leg1-state"));
+        // 不匹配 → 判不匹配。
+        assert!(callback_state_mismatch(Some("other"), "leg1-state"));
+        // 匹配（含首尾空白容忍）→ 放行。
+        assert!(!callback_state_mismatch(Some("leg1-state"), "leg1-state"));
+        assert!(!callback_state_mismatch(Some("  leg1-state  "), "leg1-state"));
+        // leg2 语义相同（同一函数，双段共用）。
+        assert!(callback_state_mismatch(None, "leg2-state"));
+        assert!(!callback_state_mismatch(Some("leg2-state"), "leg2-state"));
+    }
+
+    /// leg1 / leg2 两处校验点必须都走 fail-closed 判据（共用同一函数，防一处漂回）。
+    ///
+    /// 回退即 FAIL：把某一处的 `callback_state_mismatch` 改回内联的
+    /// `.filter(|v| !v.is_empty()).is_some_and(...)`（fail-open 形态）——计数从 2 变 1。
+    #[test]
+    fn both_legs_use_fail_closed_state_check() {
+        let src = include_str!("external_idp_login.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        // 带 `if ` 前缀排除函数定义行（`fn callback_state_mismatch(`）自身。
+        let needle = format!("if callback_state_mismatch{}", "(");
+        assert_eq!(
+            prod.matches(needle.as_str()).count(),
+            2,
+            "leg1 与 leg2 的 state 校验必须都调用 fail-closed 判据（当前 {} 处）——\
+             任一处退回 fail-open 形态都会静默放行缺失的 state",
+            prod.matches(needle.as_str()).count()
+        );
+    }
+
+    // ---------------- MINOR 7：leg2_select 回显实际使用的 profile ----------------
+
+    /// profile 解析矩阵：选中可用 → 原样；选中不可用 → 自动替换为可用的
+    /// （返回的是**实际将使用**的 arn，前端据此回显）；全不可用 / arn 不在列表 → Err。
+    #[test]
+    fn resolve_chosen_profile_returns_actually_used_profile() {
+        fn p(arn: &str, usable: bool) -> ProfileOption {
+            ProfileOption {
+                arn: arn.to_string(),
+                region: arn.rsplit(':').nth(2).unwrap_or("").to_string(),
+                account: String::new(),
+                usable,
+                subscription_title: None,
+            }
+        }
+        let profiles = vec![
+            p("arn:aws:codewhisperer:us-east-1:1:profile/A", false),
+            p("arn:aws:codewhisperer:eu-central-1:1:profile/B", true),
+            p("arn:aws:codewhisperer:ap-northeast-1:1:profile/C", false),
+        ];
+
+        // 选中的正好可用 → 原样（无替换）。
+        let ok = resolve_chosen_profile(&profiles, "arn:aws:codewhisperer:eu-central-1:1:profile/B")
+            .expect("可用的选中项应放行");
+        assert_eq!(ok.arn, "arn:aws:codewhisperer:eu-central-1:1:profile/B");
+
+        // 选中的不可用（误选）→ 自动替换为可用项，**返回的是替换后的 arn**。
+        let replaced = resolve_chosen_profile(&profiles, "arn:aws:codewhisperer:us-east-1:1:profile/A")
+            .expect("存在可用项时不可用的选中项应被替换而非报错");
+        assert_eq!(replaced.arn, "arn:aws:codewhisperer:eu-central-1:1:profile/B");
+
+        // arn 不在列表 → 拒绝（防伪：绝不建列表外的号）。
+        assert!(resolve_chosen_profile(&profiles, "arn:aws:codewhisperer:eu-central-1:9:profile/FAKE").is_err());
+
+        // 全部不可用 → 拒绝（绝不建必 403 的死号）。
+        let all_dead = vec![p("arn:aws:codewhisperer:us-east-1:1:profile/A", false)];
+        assert!(resolve_chosen_profile(&all_dead, "arn:aws:codewhisperer:us-east-1:1:profile/A").is_err());
+    }
+
+    /// ⭐ 源码守卫（MINOR 7 承重）：`ExternalIdpSelectResult` 必须回显实际使用的
+    /// arn/region（`resolve_chosen_profile` 会替换选中项，静默替换必须在响应里透明化）。
+    ///
+    /// 回退即 FAIL：把响应字段删掉 / 把回显改成用户传入的 arn —— 用户看到自己选的
+    /// profile 但实际建号用的是另一个，前端无从知晓。
+    #[test]
+    fn select_result_must_echo_actually_used_arn_and_region() {
+        let src = include_str!("external_idp_login.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        for needle in [
+            format!("pub struct ExternalIdpSelectResult{}", " {"),
+            format!("pub arn: {},", "String"),
+            format!("pub region: {},", "String"),
+        ] {
+            assert!(
+                prod.contains(needle.as_str()),
+                "ExternalIdpSelectResult 必须携带实际使用的 arn/region 字段（{}）",
+                needle
+            );
+        }
+        // submit_leg2_select 必须把 build_and_add_credential 返回的 arn 填进响应
+        // （而不是用户入参的 arn）。
+        let fname = format!("pub async fn submit_leg2_select{}", "(");
+        let start = prod.find(&fname).expect("submit_leg2_select 不应被改名");
+        let body_end = prod[start..]
+            .find("\n    pub async fn ")
+            .map(|i| i + start)
+            .unwrap_or(prod.len());
+        let body = &prod[start..body_end];
+        assert!(
+            body.contains("used_arn"),
+            "submit_leg2_select 必须把实际使用的 arn 回显进响应（当前只用入参 arn 的话\
+             静默替换不可见）"
+        );
+        assert!(body.contains("region"), "响应必须携带 region（回显实际生效区）");
     }
 }

@@ -173,8 +173,6 @@ impl IdcLoginManager {
                     tested_models: None,
                     base_url: None,
                     api_key: None,
-                    deepseek_normalize: None,
-                    deepseek_normalize_config: None,
                     model_mapping_exempt: None,
                     request_limit: None,
                     // IdC 上号产出的是 Kiro 号（非 custom_api 代挂号），该开关对它无意义 → 跟随全局。
@@ -197,6 +195,7 @@ impl IdcLoginManager {
                     disabled: false,
                     disabled_reason: None,
                     disabled_at: None,
+                    quota_exhausted_at: None,
                     kiro_api_key: None,
                     endpoint: None,
                     // IdC 上号产出的是 Kiro 号，非 CLI(ksk_)号，该开关对它无意义 → 跟随全局。

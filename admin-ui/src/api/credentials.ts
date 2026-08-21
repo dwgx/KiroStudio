@@ -1,5 +1,6 @@
 import axios from 'axios'
 import { storage } from '@/lib/storage'
+import { shouldClearAdminSession } from './should-clear-admin-session'
 import type {
   CredentialsStatusResponse,
   BalanceResponse,
@@ -7,6 +8,7 @@ import type {
   TrashListResponse,
   SuccessResponse,
   BatchDeleteResponse,
+  BatchOpResponse,
   CleanupDisabledResponse,
   SetDisabledRequest,
   SetPriorityRequest,
@@ -23,9 +25,12 @@ import type {
   ExternalIdpLeg1Response,
   ExternalIdpLeg2Response,
   ExternalIdpSelectResponse,
+  ImportSsoTokenRequest,
+  ImportSsoTokenResponse,
   ConfigSnapshotResponse,
   UpdateConfigRequest,
   UpdateConfigResponse,
+  ErrorMessagesDefaultsResponse,
   CredentialRegionsResponse,
   SocksNodeTest,
   SocksNodesResponse,
@@ -59,14 +64,17 @@ export function setSuppressAuthReload(v: boolean) {
   suppressAuthReload = v
 }
 
-// 响应拦截器：鉴权失败(401/403)=密钥失效，清掉本地 key 并回登录页，避免带着废 key 反复 401 死转圈。
-// 已登录会话中途 key 失效(如管理员改了 adminkey)→ 干净地 reload 回登录页；
-// 登录页的主动校验请求由调用方 setSuppressAuthReload(true) 抑制本处 reload，改为就地报错。
+// 响应拦截器：仅鉴权失败才清 sessionStorage 里的 key 并 reload。
+// 401 = 密钥失效。403 还用于业务拒绝（import_keys 关闭、IP 黑白名单），
+// 只有 error.type === 'authentication_error' 才当鉴权失败；其余交给页面 toast。
+// 登录页主动校验由 setSuppressAuthReload(true) 抑制 reload。
 api.interceptors.response.use(
   (res) => res,
   (err) => {
-    const status = err?.response?.status
-    if ((status === 401 || status === 403) && !suppressAuthReload) {
+    const status = err?.response?.status as number | undefined
+    const rawType = err?.response?.data?.error?.type
+    const errorType = typeof rawType === 'string' ? rawType : undefined
+    if (shouldClearAdminSession(status, errorType) && !suppressAuthReload) {
       storage.removeApiKey()
       if (typeof window !== 'undefined') {
         window.location.reload()
@@ -174,10 +182,9 @@ export async function setCredentialEndpoint(
  * eu-central-1 98.9% 成功、在 us-east-1 100% 403）。自动探测可能探错，所以必须
  * 有手工兜底入口。
  *
- * ⚠️ 此前后端 `POST /credentials/{id}/api-region` 已存在，但前端**零调用** ——
- * 面板上没有任何能改 ksk_ 号 region 的入口（`switchProfileRegion` 对 api_key 号
- * 直接报「仅 External IdP / IdC 凭据支持」）。于是探错的号只能改 credentials.json
- * 手工救。
+ * 前端入口：凭证卡片（credential-card.tsx 的 handleApiRegionChange）设置弹框
+ * 「上游 region」区 —— 通过 useSetCredentialApiRegion 调用本端点。历史注释
+ * 声称「前端零调用」已过期，探错号可直接在面板改，无需手工改 credentials.json。
  */
 export async function setCredentialApiRegion(
   id: number,
@@ -185,17 +192,6 @@ export async function setCredentialApiRegion(
 ): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>(`/credentials/${id}/api-region`, {
     apiRegion: apiRegion && apiRegion.trim() ? apiRegion.trim() : null,
-  })
-  return data
-}
-
-// 设置代挂凭据的 deepseek 协议归一化开关（仅 custom_api 有意义，后端 gate 拒绝其它类型）。
-export async function setCredentialDeepseekNormalize(
-  id: number,
-  deepseekNormalize: boolean
-): Promise<SuccessResponse> {
-  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/deepseek-normalize`, {
-    deepseekNormalize,
   })
   return data
 }
@@ -309,6 +305,19 @@ export async function forceRefreshToken(
   id: number
 ): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>(`/credentials/${id}/refresh`)
+  return data
+}
+
+// 手动更新 OAuth 号的 refreshToken（号被 InvalidRefreshToken 禁用后自助恢复通道）。
+// 请求体字段 snake_case `refresh_token` 对齐后端 RefreshTokenRequest（types.rs，无 serde rename）。
+export async function updateRefreshToken(
+  id: number,
+  refreshToken: string
+): Promise<SuccessResponse> {
+  const { data } = await api.put<SuccessResponse>(
+    `/credentials/${id}/refresh-token`,
+    { refresh_token: refreshToken }
+  )
   return data
 }
 
@@ -512,10 +521,50 @@ export async function deleteCredentialsBatch(
   return data
 }
 
+/** 批量重置失败计数。部分失败仍 200，逐条看 results[].ok。 */
+export async function resetCredentialsBatch(ids: number[]): Promise<BatchOpResponse> {
+  const { data } = await api.post<BatchOpResponse>('/credentials/batch-reset', { ids })
+  return data
+}
+
+/** 批量启用/禁用。部分失败仍 200，逐条看 results[].ok。 */
+export async function setDisabledBatch(
+  ids: number[],
+  disabled: boolean,
+): Promise<BatchOpResponse> {
+  const { data } = await api.post<BatchOpResponse>('/credentials/batch-disabled', { ids, disabled })
+  return data
+}
+
+/** 批量设置允许模型白名单。部分失败仍 200，逐条看 results[].ok。 */
+export async function setAllowedModelsBatch(
+  ids: number[],
+  allowedModels: string[] | null,
+): Promise<BatchOpResponse> {
+  const { data } = await api.post<BatchOpResponse>('/credentials/batch-allowed-models', {
+    ids,
+    allowedModels: allowedModels && allowedModels.length ? allowedModels : null,
+  })
+  return data
+}
+
+/** 批量强制刷新 Token。部分失败仍 200，逐条看 results[].ok。 */
+export async function forceRefreshTokensBatch(ids: number[]): Promise<BatchOpResponse> {
+  const { data } = await api.post<BatchOpResponse>('/credentials/batch-refresh', { ids })
+  return data
+}
+
 // 导出凭据完整对象（原始 KiroCredentials，camelCase，含 refreshToken/kiroApiKey 等）
 // 字段随认证方式不同而不同，前端按拿到的对象处理，不假设某字段一定存在。
 export async function exportCredential(id: number): Promise<Record<string, unknown>> {
   const { data } = await api.get<Record<string, unknown>>(`/credentials/${id}/export`)
+  return data
+}
+
+// 导出 KAM 号池 JSON（Blob，下载为 kam.json）。
+// 后端接线中（W16 同步做）；端点未合入时返回 404，调用方提示「稍后再试」。
+export async function exportKam(): Promise<Blob> {
+  const { data } = await api.get<Blob>('/credentials/export-kam', { responseType: 'blob' })
   return data
 }
 
@@ -632,9 +681,37 @@ export async function submitExternalIdpLeg2Select(
   return data
 }
 
+// ============ SSO Token 导入（粘贴 AWS portal Bearer Token 静默换号）============
+// 用户已在 AWS portal 登录，粘贴 portal 的 Bearer Token，服务端自动走完整
+// 设备授权流程换取标准 IdC 凭据入池（免浏览器授权的人工步骤）。
+
+export async function importSsoToken(
+  req: ImportSsoTokenRequest
+): Promise<ImportSsoTokenResponse> {
+  // 服务端 CreateToken 轮询最长 120s（sso_token.rs POLL_TIMEOUT_SECS）。
+  // 默认 axios 15s 会先于服务端超时，略加余量覆盖响应落盘。
+  const { data } = await api.post<ImportSsoTokenResponse>(
+    '/credentials/import-sso',
+    {
+      token: req.token,
+      region: req.region,
+      priority: req.priority,
+      proxyUrl: req.proxyUrl,
+    },
+    { timeout: 130000 },
+  )
+  return data
+}
+
 // 获取服务端配置快照（敏感字段脱敏）
 export async function getConfigSnapshot(): Promise<ConfigSnapshotResponse> {
   const { data } = await api.get<ConfigSnapshotResponse>('/config')
+  return data
+}
+
+// 获取错误码/提示词**内置默认表**（只读，默认值预览数据源；key 集由后端运行期给出）
+export async function getErrorMessagesDefaults(): Promise<ErrorMessagesDefaultsResponse> {
+  const { data } = await api.get<ErrorMessagesDefaultsResponse>('/error-messages/defaults')
   return data
 }
 

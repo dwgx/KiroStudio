@@ -1,3 +1,4 @@
+/// <reference types="vitest/config" />
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react-swc'
 import path from 'path'
@@ -24,5 +25,10 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     emptyOutDir: true,
+  },
+  test: {
+    environment: 'jsdom',
+    // node:test files stay in tests/*.test.ts (tsx-loader). Do not let vitest pick them up.
+    include: ['tests/vitest/**/*.test.{ts,tsx}'],
   },
 })

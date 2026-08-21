@@ -1,10 +1,12 @@
 [package]
 name = "kirostudio"
-version = "1.0.1"
+version = "1.2.0"
 edition = "2024"
 
 [features]
-default = ["native-tls"]
+# Factory is rustls (`cargo --no-default-features` / release.yml / Docker).
+# native-tls stays an explicit opt-in; default is empty so `cargo test` matches the factory binary.
+default = []
 native-tls = ["reqwest/native-tls-vendored"]
 
 [profile.release]
@@ -21,7 +23,7 @@ socket2 = "0.6.4"
 reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "socks", "rustls-tls-webpki-roots", "rustls-tls-native-roots", "http2", "system-proxy", "charset"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde_cbor = "0.11"  # Kiro Web Portal (app.kiro.dev) 走 rpc-v2-cbor 协议，overage 开关需要
+ciborium = "0.2"  # Kiro Web Portal (app.kiro.dev) rpc-v2-cbor（overage 开关）；替换停维护的 serde_cbor 0.11
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"

@@ -1,5 +1,11 @@
 mod admin;
 mod admin_ui;
+
+/// /help 帮助中心入口（2026-08-14）：对齐 index_handler 的 async + IntoResponse 包装
+/// （axum 0.8 对返回裸 Response<Body> 的 fn item 不直接实现 Handler）。
+async fn help_page_handler() -> impl axum::response::IntoResponse {
+    admin_ui::serve_help_page()
+}
 mod anthropic;
 mod common;
 mod http_client;
@@ -209,22 +215,123 @@ fn bootstrap_config_if_missing(config_path: &str) -> (String, bool) {
     (resolved_str, true)
 }
 
+/// config / credentials 路径的父目录；无父路径时用 `.`（不扫 cwd 盲扫：调用方只传这两个路径）。
+fn sweep_startup_tmp_parent(p: &str) -> &std::path::Path {
+    match std::path::Path::new(p).parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => std::path::Path::new("."),
+    }
+}
+
+/// 启动时扫 config / credentials 父目录里原子写崩溃留下的隐藏 tmp。
+/// 同一目录只扫一次。失败只告警，绝不因此 exit(1)。不扫 cwd、不递归。
+fn sweep_startup_tmp(config_path: &str, credentials_path: &str) {
+    let sweep_one = |dir: &std::path::Path| match crate::common::fs_atomic::sweep_stale_tmp(dir) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("启动清理崩溃残留 tmp: 目录 {:?} 删除 {} 个", dir, n),
+        Err(e) => tracing::warn!("启动清理崩溃残留 tmp 失败 {:?}: {}（忽略）", dir, e),
+    };
+    let cfg_dir = sweep_startup_tmp_parent(config_path);
+    sweep_one(cfg_dir);
+    let cred_dir = sweep_startup_tmp_parent(credentials_path);
+    if cred_dir != cfg_dir {
+        sweep_one(cred_dir);
+    }
+}
+
+// ==================== B7 启动播种集中校验 ====================
+// 校验语义：断言「播种执行过」而非「值非空」——error_messages 空表合法、mock_cache
+// 默认关合法，用值无法区分「配置没设」与「setter 没被调」。handlers.rs 侧 17 个
+// 镜像由 setter 内部置位（unwired_mirrors 汇总）；本表覆盖 main 直接播种、setter
+// 在别的模块的 4 个镜像（converter/upstream_trace/token/admin_ui），播种点后显式置位。
+
+/// main 侧播种点位图：第 i 位 = [`MAIN_SEEDED_NAMES`][i] 对应镜像已播种。
+static MAIN_SEEDED_BITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// main 侧播种点名字表：新增 main 直接播种的镜像时必须在此登记（漏登记 mark 时 panic 暴露）。
+const MAIN_SEEDED_NAMES: [&str; 5] = [
+    "login_background_r18",
+    "upstream_trace",
+    "count_tokens",
+    "native_thinking_effort",
+    "tool_compat_mapping",
+];
+const _: () = assert!(MAIN_SEEDED_NAMES.len() <= 64);
+
+/// main 直播种点调用后登记（setter 在其他模块、无法在 setter 内部置位的镜像）。
+fn mark_main_seeded(name: &str) {
+    let Some(idx) = MAIN_SEEDED_NAMES.iter().position(|n| *n == name) else {
+        panic!("main 播种点 {name} 未登记进 MAIN_SEEDED_NAMES");
+    };
+    MAIN_SEEDED_BITS.fetch_or(1u64 << idx, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 依据播种位图计算缺失的 main 侧镜像名（纯函数，供 B7 告警联动测试）。
+fn main_mirrors_missing(bits: u64) -> Vec<&'static str> {
+    MAIN_SEEDED_NAMES
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| bits & (1u64 << i) == 0)
+        .map(|(_, n)| *n)
+        .collect()
+}
+
+/// B7 启动播种集中校验：必须在**全部播种点之后**、serve 之前调用。
+///
+/// 汇总 handlers 侧（setter 内部置位）+ main 侧（调用方置位）两路标记，缺失即
+/// warn 醒目告警——**只告警不阻塞**：配置静默不生效比启动失败好诊断，但必须一眼看见。
+///
+/// 边界（诚实披露）：token_manager 内部镜像（cooldown/rate_limit/affinity/rpm 等）
+/// 由 `MultiTokenManager::new` 无条件从 config 播种、失败即 exit(1)，天然保证执行过，
+/// 不在本校验范围（setter 在 token_manager.rs，不在本次改动权限内）。
+fn verify_runtime_mirrors_wired() {
+    let mut missing: Vec<&'static str> = crate::anthropic::handlers::unwired_mirrors();
+    let bits = MAIN_SEEDED_BITS.load(std::sync::atomic::Ordering::Relaxed);
+    missing.extend(main_mirrors_missing(bits));
+    if missing.is_empty() {
+        let total = crate::anthropic::handlers::mirror_wired_count() + MAIN_SEEDED_NAMES.len();
+        tracing::info!("启动播种自检通过：{} 个进程镜像全部接线", total);
+        return;
+    }
+    // F6/D3-2（scheduling-audit-research）：接线缺失只 warn 的话 webhook 无感知——
+    // 「面板改了没反应」要等运维翻日志才发现。直报 bump，reason 携带缺失清单摘要
+    // （详细逐条仍在下方日志）；冷却窗口内幂等，未配置 webhook 时零开销 no-op。
+    crate::common::alerting::bump_with_dynamic_reason(
+        "wiring_incomplete",
+        missing.join(", "),
+    );
+    for m in &missing {
+        tracing::warn!(
+            "【启动播种缺失】镜像 [{m}] 未被播种：相关配置将静默不生效（面板改了没反应），\
+             请检查 main.rs / handlers.rs 的启动接线（B7）"
+        );
+    }
+    tracing::warn!(
+        "【启动播种自检】{} 个镜像缺失，服务仍启动；修复前不要依赖这些配置项",
+        missing.len()
+    );
+}
+
 #[tokio::main]
 async fn main() {
     // 解析命令行参数
     let args = Args::parse();
 
-    // 初始化日志:fmt 层(终端/文件)+ 内存环形缓冲层(面板实时日志流/一键导出,见 common::log_buffer)。
-    // 两层共享同一 EnvFilter,故内存 ring 与终端看到的是同一批日志。
+    // 初始化日志。两层 filter 独立:
+    // - fmt 层(终端/文件):由 RUST_LOG 环境变量控制(默认 info)——生产 unit 写 RUST_LOG=warn,
+    //   终端保持精简不刷屏;
+    // - LogBufferLayer(面板实时日志流/一键导出,见 common::log_buffer):固定 INFO——
+    //   面板排障永远可见 info+ 进度(选号/转发/恢复),不随控制台 filter 一起被压掉。
     {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
-        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        use tracing_subscriber::Layer as _;
+        let console_filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        let panel_filter = tracing_subscriber::EnvFilter::new("info");
         tracing_subscriber::registry()
-            .with(filter)
-            .with(tracing_subscriber::fmt::layer())
-            .with(crate::common::log_buffer::LogBufferLayer)
+            .with(tracing_subscriber::fmt::layer().with_filter(console_filter))
+            .with(crate::common::log_buffer::LogBufferLayer.with_filter(panel_filter))
             .init();
     }
 
@@ -240,18 +347,21 @@ async fn main() {
     // freshly_generated 供启动后「仅首次自动开浏览器」判断。
     let (config_path, freshly_generated) = bootstrap_config_if_missing(&config_path);
 
+    // 默认名场景走数据隔离解析（Windows→KiroStudio-data/，兼容旧位置）；显式 --credentials 原样尊重。
+    // 路径在 load 之前算好，以便先扫崩溃残留 tmp（残留不是真正的 json，扫完再 load 安全）。
+    let credentials_path = args.credentials.unwrap_or_else(|| {
+        resolve_default_data_path(KiroCredentials::default_credentials_path())
+            .to_string_lossy()
+            .to_string()
+    });
+    sweep_startup_tmp(&config_path, &credentials_path);
+
     let config = Config::load(&config_path).unwrap_or_else(|e| {
         tracing::error!("加载配置失败: {}", e);
         std::process::exit(1);
     });
 
     // 加载凭证（支持单对象或数组格式）
-    // 默认名场景走数据隔离解析（Windows→KiroStudio-data/，兼容旧位置）；显式 --credentials 原样尊重。
-    let credentials_path = args.credentials.unwrap_or_else(|| {
-        resolve_default_data_path(KiroCredentials::default_credentials_path())
-            .to_string_lossy()
-            .to_string()
-    });
     let credentials_config = CredentialsConfig::load(&credentials_path).unwrap_or_else(|e| {
         // 加载失败即 fail-safe 退出(而非空池启动)——**故意如此**:若是 at-rest 密文解不开
         // (密钥文件丢失/来自别机),空池启动后一旦 persist 就会用空池覆盖掉那份仍可恢复的密文
@@ -314,6 +424,12 @@ async fn main() {
         tracing::error!("配置文件中 apiKey 为空，拒绝以无鉴权方式启动");
         std::process::exit(1);
     }
+
+    // 播种进鉴权热更单元（common::auth_keys）：后续 admin 改 apiKey 走 setter 即时生效，
+    // 无需重启（重启会掐断在途流式请求）。此处已判非空，播种不会失败；若真失败，
+    // expect panic（fail-closed）——继续跑会让 /v1 匿名可达。
+    crate::common::auth_keys::set_user_key(&api_key)
+        .expect("apiKey 为空——拒绝以无鉴权方式提供 /v1（空值会导致鉴权 fail-open）");
 
     // 构建代理配置
     let proxy_config = config.proxy_url.as_ref().map(|url| {
@@ -488,7 +604,35 @@ async fn main() {
     // 请求命中内存字节秒回，不再在登录页热路径实时打图源。关闭时不 spawn。
     // R18 开关先写入运行时镜像（默认 true），预取轮次按此取 r18 参数。
     admin_ui::set_login_background_r18(config.login_background_r18);
+    mark_main_seeded("login_background_r18");
     admin_ui::spawn_bg_prefetch(config.login_background_enabled);
+
+    // Kiro IDE 版本伪装：后台每 12h 拉官方稳定版元数据，成功后 UA 版本段用拉到的
+    // 版本号，失败静默降级回 config.kiro_version（不阻塞启动）。关闭时不 spawn
+    // （缓存恒空，UA 行为零变化）。热更不生效：启动期一次性读取。
+    if config.ua_version_fetch {
+        kiro::version_mask::spawn_refresher(proxy_config.clone(), config.tls_backend);
+    }
+
+    // OTA 自动检查（仅检查 + 打日志，不自动下载替换——见 admin::update::spawn_auto_check）。
+    // 默认关：检查本身是 GitHub API 出站往返，多数部署走面板手动升级按钮。
+    // 热更不生效：启动期一次性读取。
+    if config.ota_auto_check {
+        admin::update::spawn_auto_check(config.ota_auto_check_interval_hours);
+    }
+
+    // 上游 trace 埋点（P0-A 排障，kiro::upstream_trace）：默认关，关闭时只付一次
+    // 原子读（零分配零 IO）。开启后把「上游原始响应 + 网关分支判断」写进 JSONL，
+    // 用于回答日志答不了的四个问题（Retry-After 原值 / 两 region 响应差异 / 429 body
+    // 配额字段 / reasoningContentEvent 形状）。热更不生效：配置字段不进
+    // UpdateConfigRequest，改 config.json 后重启生效（与 trust_forwarded_header 同款
+    // 启动期一次性读取的范式，见 515-521 行）。
+    kiro::upstream_trace::sync_from_config(
+        config.upstream_trace_enabled,
+        &config.upstream_trace_path,
+        config.upstream_trace_max_bytes,
+    );
+    mark_main_seeded("upstream_trace");
 
     // 指纹采集开关：把配置写入热路径运行时镜像（默认 true）。关闭后不采集
     // 下游客户端 device/ip/os/browser。admin 改开关时会立即改写此镜像。
@@ -499,6 +643,9 @@ async fn main() {
     // 与 `SecurityState` 同为启动期读取（改该值仍需重启，见 admin 的 restart_fields），
     // 所以这里一次写入即可，不需要 admin 侧的热改钩子。
     anthropic::set_trust_forwarded_header(config.trust_forwarded_header);
+    // P1-5：私网对端是否自动当反代。默认 true（A2 现状）；LAN 直连部署置 false。
+    // 与 trust_forwarded_header 同为启动期读取，改值需重启。
+    common::security::set_trust_private_peer_as_proxy(config.trust_private_peer_as_proxy);
 
     // IP 黑名单业务层镜像(按真实客户端 IP 封禁,反代后也生效;admin 改配置时热更):
     anthropic::handlers::set_ip_blocklist(&config.ip_blocklist);
@@ -529,6 +676,7 @@ async fn main() {
         proxy: proxy_config,
         tls_backend: config.tls_backend,
     });
+    mark_main_seeded("count_tokens");
 
     // 文本化 invoke 重组 + stray 熔断两开关:启动播种进程级镜像(handlers 热路径读),admin 改后即时生效。
     anthropic::handlers::set_tool_reclaim_textified_invoke(config.tool_reclaim_textified_invoke);
@@ -545,6 +693,51 @@ async fn main() {
     // Kiro 原生 effort 开关：播种进 converter 的 TIER3 进程镜像（默认关 = 行为逐字节
     // 不变；开 = 白名单模型 + thinking 走 output_config.effort 原生通道而非 XML 标签）。
     anthropic::set_native_thinking_effort_enabled(config.native_thinking_effort_enabled);
+    mark_main_seeded("native_thinking_effort");
+
+    // 透传模拟缓存（mockCacheEnabled）：播种进 handlers 的 TIER3 进程镜像（默认关）。
+    // 开启后透传响应 usage 注入 cache_read = round(input × ratio) 的伪造值、creation 置 0，
+    // 仅供下游（sub2api 等）展示缓存分支；admin 改配置时热更即时改写同一镜像。
+    anthropic::handlers::set_mock_cache_config(
+        config.mock_cache_enabled,
+        config.mock_cache_read_ratio,
+    );
+
+    // CC↔Kiro 工具名/参数映射开关（默认 true）：播种进 converter 的进程级原子镜像
+    // （默认 true = 现状行为零变化）。关闭后 8 个内置工具（Write→fs_write 等）原样
+    // 透传（仅超长缩短），适配非 Claude Code 客户端/同名自定义工具；admin 改配置时
+    // 热更改写同一镜像（service.rs update_config 调同一个 setter）。
+    anthropic::set_tool_compat_mapping(config.tool_compat_mapping);
+    mark_main_seeded("tool_compat_mapping");
+
+    // 模型感知正向路由巡检（2026-08-16 W16 接线）：30min 周期拉取透传池各号模型目录，
+    // 三态缓存（Confirmed/Unknown/Unsupported）+ support_rank 排序——混池请求不再
+    // 首次打错号（黑名单负向兜底不变）。
+    {
+        let tm3 = kiro_provider.token_manager_arc();
+        tokio::spawn(async move {
+            tm3.spawn_model_catalog_probe();
+        });
+    }
+
+    // stats_stale watchdog（2026-08-16 收尾接线，blockers 17e）：usage JSONL 数据
+    // 断更 10 分钟即告警（bump "stats_stale"）。report_if_stale 是幂等的（告警后复位）。
+    {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                crate::common::alerting::report_if_stale("usage_jsonl", 600);
+            }
+        });
+    }
+
+    // 错误码/提示词覆盖表：播种进 handlers 的进程镜像（默认空表 = 全部走内置默认，
+    // 零行为变化）。⚠️ 播种前校验：管理员手改 config.json 出错时告警 + 降级为空表
+    // （不阻塞启动但配置不生效）；admin 热更（update_config）与 reload_config 会改写
+    // 同一镜像，错误翻译处每请求读镜像快照（见 handlers::resolve_msg）。
+    anthropic::handlers::set_error_messages(sanitize_error_messages_table(
+        config.error_messages.clone(),
+    ));
 
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
@@ -576,6 +769,10 @@ async fn main() {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
             anthropic_app
         } else {
+            // 播种进鉴权热更单元：admin 改 adminApiKey 走 setter 即时生效，无需重启。
+            // 挂载前已判非空；播种失败属「校验被绕过」，expect panic（fail-closed）。
+            crate::common::auth_keys::set_admin_key(admin_key)
+                .expect("adminApiKey 为空——拒绝挂载无鉴权 Admin API");
             let admin_service =
                 admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
             let mut admin_state = admin::AdminState::new(admin_key, admin_service);
@@ -624,14 +821,62 @@ async fn main() {
                 // 等价于 /api/admin/import/keys。
                 .nest("/api", import_alias_app)
                 .nest("/admin", admin_ui_app)
+                // 帮助中心直达 URL（2026-08-14）：/help 与 /admin 并列挂载，
+                // 同一份 index.html，前端按路径渲染帮助页。
+                .route("/help", axum::routing::get(help_page_handler))
         }
     } else {
         anthropic_app
     };
 
+    // 健康探针 /healthz：**未鉴权**端点（auth 中间件只挂在 /v1、/cc/v1 子路由上，
+    // 根路由不受影响），供 Docker HEALTHCHECK / 反代主动探测使用。
+    //
+    // 刻意不返回任何敏感信息（只报 ok/version/号池数/库可写性）；号池数量是运维
+    // 观测量，不属密钥级敏感数据。判定口径：
+    // - config_loaded：进程能走到 serve 必然 config/凭据加载成功（失败在启动期直接
+    //   exit(1)），此处没有更早的信号可读，恒为 true。
+    // - sqlite_writable：用量统计未启用（usage_enabled=false 或 SQLite 打开失败 →
+    //   usage_handles=None）时 false；启用时以一次 count 探测库可读性。
+    // - recent_success_rate **刻意不返回**：recovery_metrics 是单调计数器、无时间
+    //   窗口；usage_stats 只有 24h/逐小时聚合窗口，均非「近 N 秒」成功率。为避免
+    //   语义欺骗不发明新计数器（需要时应在 recovery_metrics 侧加环形窗口）。
+    let healthz_app = {
+        let tm = token_manager.clone();
+        let handles = usage_handles.clone();
+        axum::Router::new().route(
+            "/healthz",
+            axum::routing::get(move || async move {
+                let snapshot = tm.snapshot();
+                let sqlite_writable = handles
+                    .as_ref()
+                    .map(|h| h.trace_db.count().is_ok())
+                    .unwrap_or(false);
+                axum::Json(serde_json::json!({
+                    "ok": true,
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "build_sha": env!("KIRO_BUILD_SHA"),
+                    "config_loaded": true,
+                    "pool_count": snapshot.total,
+                    "sqlite_writable": sqlite_writable,
+                }))
+            }),
+        )
+    };
+    let app = healthz_app.merge(app);
+
+    // B7 启动播种集中校验：所有播种点（含 create_router_with_provider 间接播种）之后、
+    // serve 之前。缺失只告警不阻塞——日志醒目列出未接线的镜像。
+    verify_runtime_mirrors_wired();
+
     // 启动服务器
     let addr = format!("{}:{}", config.host, config.port);
     tracing::info!("启动 Anthropic API 端点: {}", addr);
+    tracing::info!(
+        "build: {} (sha {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("KIRO_BUILD_SHA")
+    );
     // 只打印固定短前缀 + 长度指纹，不按比例暴露密钥（半个密钥会显著降低爆破熵）
     {
         let masked = if api_key.len() > 8 {
@@ -717,6 +962,8 @@ async fn main() {
         let tray_host = config.host.clone();
         let tray_port = config.port;
         let (relaunch_config_path, relaunch_credentials_path) = tray_relaunch_paths;
+        let relaunch_host = tray_host.clone();
+        let relaunch_port = tray_port;
         // 托盘「重启服务」trigger：spawn detached 重启脚本（用启动时的 config/credentials 路径拉起
         // 新进程）后，通知主线程优雅关闭（drain 在途请求、关 SQLite），主线程随后以退出码 3 退出。
         // run.bat 监督循环见退出码 3 = 用户主动退出、不重拉；由重启脚本单独拉起新进程 → 无双拉。
@@ -726,6 +973,8 @@ async fn main() {
             admin::spawn_windows_relaunch_process(
                 Some(relaunch_config_path.clone()),
                 Some(relaunch_credentials_path.clone()),
+                &relaunch_host,
+                relaunch_port,
             );
             tray::quit_notify().notify_one();
         });
@@ -883,6 +1132,13 @@ async fn shutdown_with_drain_cap(
     // 的唯一判据。debounce 窗口内的成功增量被硬杀丢掉 ⇒ 重启后新号变成"从未成功过"
     // ⇒ 瞬态 403 三次即禁用。实测 20:20:30 启动、20:20:32 就把健康号 #483 打死。
     token_manager.flush_stats_now();
+    // usage 管道（usage::pipeline）的停机 drain：**无 flush/drain 接口可调**。
+    // 它是有界 mpsc（容量 10_000）+ 独立 OS 线程 worker，worker 随进程退出而终止，
+    // 通道内残余记录（至多 CHANNEL_CAPACITY 条）会丢失——这是该管道的既定设计
+    // （统计数据可容忍丢失，热路径绝不阻塞）。丢失量已被 usagePipelineDropped /
+    // usagePipelineWritten 计数覆盖（/api/admin/recovery-metrics），停机那一刻的
+    // 丢失还可从这两个数的差值读出。若要严格不丢，应在 pipeline 侧加
+    // flush 接口（drop(tx) + join worker），此处不加接口、不改语义。
     tracing::info!(
         "收到停机信号，已强制落盘凭据统计，开始 drain（最多 {}s，超时则断开残余连接以尽快让位给新进程）",
         SHUTDOWN_DRAIN_CAP_SECS
@@ -995,6 +1251,23 @@ fn bind_listener(addr: &str) -> anyhow::Result<tokio::net::TcpListener> {
 static TRAY_QUIT_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// 启动播种前的错误码表校验（M1）：任一 key 非法 → 告警 + 降级为空表（全部走
+/// 内置默认，配置不生效但不阻塞启动）；合法表原样返回。
+///
+/// 管理员手改 config.json 出错时不阻断服务，但必须告警让用户知道配置没生效
+/// （admin 热更路径用同一校验，失败 400 回显——两条路径语义一致）。
+fn sanitize_error_messages_table(
+    table: std::collections::HashMap<String, model::error_messages::ErrorMessageOverride>,
+) -> std::collections::HashMap<String, model::error_messages::ErrorMessageOverride> {
+    if let Err(e) = admin::validate_error_messages(&table) {
+        tracing::warn!(
+            "errorMessages 配置校验失败，已降级为空表（全部走内置默认，配置未生效）: {e}"
+        );
+        return std::collections::HashMap::new();
+    }
+    table
+}
+
 /// 用量明细保留天数下限钳到 0。
 ///
 /// 负值会让 `trace_db::retention_cleanup` 的 cutoff 落到未来
@@ -1041,9 +1314,12 @@ fn init_usage_pipeline(config: &Config) -> Option<UsageHandles> {
         stats.clone() as Arc<dyn usage::UsageSink>,
     ]);
 
-    // 保留清理任务：启动清理一次 + 每 6 小时清理一次过期明细
+    // 保留清理任务：启动清理一次 + 每 6 小时清理一次过期明细（SQLite + JSONL）。
+    // JSONL 复用 `usage_retention_days`，不另开旋钮。
     let retention_days = clamp_retention_days(config.usage_retention_days);
+    let jsonl_retain_days = u32::try_from(retention_days).unwrap_or(u32::MAX);
     let cleanup_db = trace_db.clone();
+    let cleanup_jsonl = stats.clone();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
         loop {
@@ -1052,6 +1328,10 @@ fn init_usage_pipeline(config: &Config) -> Option<UsageHandles> {
                 Ok(n) if n > 0 => tracing::info!("用量明细保留清理：删除 {} 条过期记录", n),
                 Ok(_) => {}
                 Err(e) => tracing::warn!("用量明细保留清理失败: {:#}", e),
+            }
+            let n = cleanup_jsonl.cleanup_old_jsonl(jsonl_retain_days);
+            if n > 0 {
+                tracing::info!("用量 JSONL 保留清理：删除 {} 个过期日文件", n);
             }
         }
     });
@@ -1099,6 +1379,19 @@ mod shutdown_tests {
         assert_eq!(clamp_retention_days(0), 0);
         assert_eq!(clamp_retention_days(30), 30, "正常保留天数不得被改动");
         assert_eq!(clamp_retention_days(1), 1);
+    }
+
+    /// P1-3：6h 清理必须顺带删过期 usage JSONL。回退即 FAIL：删掉调用。
+    #[test]
+    fn usage_pipeline_cleans_jsonl_alongside_sqlite_retention() {
+        let src = include_str!("main.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        let needle = format!("cleanup_old_{}", "jsonl");
+        assert!(
+            prod.contains(&needle),
+            "6h 清理任务必须调用 UsageStats JSONL 保留清理（删掉接线 = 日文件又无界增长）"
+        );
     }
 
     /// 测试用宽限期：毫秒级，走真实时钟（避免为一个测试引入 tokio `test-util` feature）。
@@ -1170,5 +1463,201 @@ mod shutdown_tests {
             matches!(out, DrainOutcome::Drained(Ok(()))),
             "无停机信号时宽限期不得起算，否则服务会在启动 {SHUTDOWN_DRAIN_CAP_SECS}s 后自杀"
         );
+    }
+}
+
+#[cfg(test)]
+mod error_messages_boot_tests {
+    use super::*;
+
+    /// M1：启动播种校验——非法表必须降级为空表（不阻塞启动但配置不生效）。
+    /// 用例① status 白名单外（不依赖默认表形态，最稳）；② 渲染值组合违例
+    /// （B1 同款 status-only 绕过，动态取默认表 key，抗并行重写）。
+    #[test]
+    fn boot_sanitize_drops_invalid_table_to_empty() {
+        let mut bad = std::collections::HashMap::new();
+        bad.insert(
+            "quota_exhausted".to_string(),
+            model::error_messages::ErrorMessageOverride {
+                status: Some(418),
+                r#type: None,
+                message: None,
+                retry_after_secs: None,
+            },
+        );
+        let out = sanitize_error_messages_table(bad);
+        assert!(out.is_empty(), "白名单外 status 必须降级为空表");
+
+        let base = model::error_messages::default_error_messages()
+            .iter()
+            .find(|(_, s, t, ..)| *s == 429 && *t == "rate_limit_error")
+            .map(|(k, ..)| k.to_string())
+            .expect("默认表必须保留至少一个 429+rate_limit_error 的 key（启动校验基线）");
+        let mut bad2 = std::collections::HashMap::new();
+        bad2.insert(
+            base,
+            model::error_messages::ErrorMessageOverride {
+                status: Some(401),
+                r#type: None,
+                message: None,
+                retry_after_secs: None,
+            },
+        );
+        let out2 = sanitize_error_messages_table(bad2);
+        assert!(out2.is_empty(), "渲染值组合违例必须降级为空表");
+    }
+
+    /// M1：合法表必须原样保留（只改 message 等合法姿势不误伤）。
+    #[test]
+    fn boot_sanitize_keeps_valid_table() {
+        let mut good = std::collections::HashMap::new();
+        good.insert(
+            "quota_exhausted".to_string(),
+            model::error_messages::ErrorMessageOverride {
+                status: Some(429),
+                r#type: Some("rate_limit_error".to_string()),
+                message: Some("配额已耗尽，请稍后重试。".to_string()),
+                retry_after_secs: None,
+            },
+        );
+        let out = sanitize_error_messages_table(good.clone());
+        assert_eq!(out, good, "合法表必须原样保留");
+    }
+}
+
+// ==================== B7 main 侧播种点：源码守卫 ====================
+#[cfg(test)]
+mod main_seeding_guard {
+    // 守卫纪律（CLAUDE.md 教训 #9）：本模块注释里不得出现带引号括号的完整调用字面量。
+
+    /// 每个 main 直播种点（setter 在别的模块）必须在调用后登记接线标记。
+    /// 删掉任一登记行 / 名字不同步 → 红。
+    #[test]
+    fn main_seeding_source_guard() {
+        let full = include_str!("main.rs");
+        let prod = full.split("\n#[cfg(test)]").next().unwrap_or(full);
+        for name in super::MAIN_SEEDED_NAMES {
+            let needle = format!("mark_main_seeded(\"{}\"{}", name, ")");
+            assert!(
+                prod.contains(&needle),
+                "main 播种点登记缺失: {needle} 不存在于生产代码（MAIN_SEEDED_NAMES 与播种点必须同步）"
+            );
+        }
+        let mut sorted: Vec<&str> = super::MAIN_SEEDED_NAMES.to_vec();
+        sorted.sort_unstable();
+        let deduped = sorted.clone();
+        sorted.dedup();
+        assert_eq!(sorted.len(), deduped.len(), "MAIN_SEEDED_NAMES 含重复名字");
+    }
+
+    /// 校验函数必须真的被 main 调用（删调用即红）。带缩进 + 分号的调用形态，
+    /// 避免与函数定义行（fn 前缀无分号）误匹配。
+    #[test]
+    fn verify_called_in_main() {
+        let full = include_str!("main.rs");
+        let prod = full.split("\n#[cfg(test)]").next().unwrap_or(full);
+        assert!(
+            prod.contains("    verify_runtime_mirrors_wired();"),
+            "main 必须调用启动播种自检"
+        );
+    }
+}
+
+#[cfg(test)]
+mod startup_tmp_sweep_guard {
+    /// 生产 main 必须在启动路径调用残留 tmp 扫描（失败只告警）。
+    /// needle 运行时拼接，避免 include_str 扫到本测试自身。
+    #[test]
+    fn main_calls_sweep_stale_tmp() {
+        let full = include_str!("main.rs");
+        let prod = full.split("\n#[cfg(test)]").next().unwrap_or(full);
+        let needle = format!("{}{}", "sweep_stale_", "tmp");
+        assert!(
+            prod.contains(&needle),
+            "production main 必须调用残留 tmp 扫描（失败只告警，不得 exit(1)）"
+        );
+    }
+}
+
+// ==================== F6/D3-2 接线缺失告警联动 ====================
+#[cfg(test)]
+mod mirror_wiring_alert_tests {
+    use super::*;
+
+    /// 纯函数判定：播种位图与缺失清单一一对应。
+    #[test]
+    fn main_mirrors_missing_matches_bits() {
+        assert_eq!(
+            main_mirrors_missing(0),
+            MAIN_SEEDED_NAMES.to_vec(),
+            "位图全 0 时 4 个 main 镜像全部缺失"
+        );
+        assert!(
+            main_mirrors_missing(u64::MAX).is_empty(),
+            "位图全 1 时无缺失"
+        );
+        // 只播第 0 个：其余全部缺失、且已播的不在缺失清单里
+        let got = main_mirrors_missing(1u64 << 0);
+        assert_eq!(got.len(), MAIN_SEEDED_NAMES.len() - 1);
+        assert!(
+            !got.contains(&MAIN_SEEDED_NAMES[0]),
+            "已播种的镜像不得出现在缺失清单"
+        );
+    }
+
+    /// 端到端：启动自检发现接线缺失必须 bump `wiring_incomplete`，且 reason
+    /// 携带缺失清单摘要。本地 HTTP server 收 payload 断言（同 alerting 测试模式）。
+    ///
+    /// 确定性依据：测试进程里 `main()` 不跑 → MAIN_SEEDED_BITS 恒 0 → 4 个 main
+    /// 镜像恒缺失 → 必走缺失分支 → 必 bump（与 handlers 侧镜像的测试间状态无关）。
+    ///
+    /// 防自弱化：删掉 verify 缺失分支的 bump 行 → 本测试收不到投递 → 超时红。
+    #[tokio::test]
+    async fn verify_missing_mirrors_bumps_wiring_incomplete() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let _guard = crate::common::alerting::test_lock();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (body_tx, mut body_rx) = tokio::sync::mpsc::channel::<String>(4);
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 8192];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                if let Some(pos) = text.find("\r\n\r\n") {
+                    let _ = body_tx.send(text[pos + 4..].to_string()).await;
+                }
+                let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        crate::common::alerting::init(
+            Some(format!("http://{addr}/hook")),
+            3600,
+            "test".to_string(),
+        );
+
+        verify_runtime_mirrors_wired();
+
+        let body = tokio::time::timeout(std::time::Duration::from_secs(5), body_rx.recv())
+            .await
+            .expect("应收到告警投递")
+            .expect("channel 不应关闭");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("payload 应为 JSON");
+        assert_eq!(
+            v["key"], "wiring_incomplete",
+            "接线缺失必须 bump wiring_incomplete"
+        );
+        let reason = v["reason"].as_str().expect("reason 必须携带缺失清单摘要");
+        for name in MAIN_SEEDED_NAMES {
+            assert!(
+                reason.contains(name),
+                "reason 摘要必须包含缺失镜像名 {name}"
+            );
+        }
     }
 }

@@ -431,6 +431,7 @@ function SocksNodesPanel() {
         <p className="text-xs text-muted-foreground">{t('clones.node.urlHint')}</p>
         <div className="flex items-center gap-2">
           <Input
+            id="clone-url"
             className="h-9 font-mono text-xs"
             placeholder={t('clones.node.urlPlaceholder')}
             value={draftUrl}
@@ -455,7 +456,11 @@ function SocksNodesPanel() {
           <span className="text-sm font-medium">{t('clones.node.bulkTitle')}</span>
           <div className="ml-auto flex items-center gap-2">
             <span className="text-xs text-muted-foreground">{t('clones.node.bulkEnabled')}</span>
-            <Switch checked={bulkEnabled} onCheckedChange={setBulkEnabled} />
+            <Switch
+              checked={bulkEnabled}
+              onCheckedChange={setBulkEnabled}
+              aria-label={t('clones.node.bulkEnabled')}
+            />
             <Button
               onClick={runBulkImport}
               disabled={bulkBusy || (bulkText.trim().length > 0 && bulkSelected.length === 0)}
@@ -619,6 +624,7 @@ function SocksNodesPanel() {
               <div key={n.id} className="space-y-1.5 rounded-md border p-2">
                 <div className="flex items-center gap-2">
                   <Input
+                    id="clone-url-edit"
                     className="h-9 font-mono text-xs"
                     value={editForm.url}
                     onChange={(e) => patchEdit({ url: e.target.value })}
@@ -645,12 +651,15 @@ function SocksNodesPanel() {
                     className="h-9 shrink-0"
                     onClick={cancelEdit}
                     disabled={savingEdit}
+                    title={t('clones.node.cancel')}
+                    aria-label={t('clones.node.cancel')}
                   >
                     <X className="h-4 w-4" />
                   </Button>
                 </div>
                 <div className="grid gap-1.5 sm:grid-cols-3">
                   <Input
+                    id="clone-name"
                     className="h-9 text-xs"
                     value={editForm.name}
                     onChange={(e) => patchEdit({ name: e.target.value })}
@@ -659,6 +668,7 @@ function SocksNodesPanel() {
                     disabled={savingEdit}
                   />
                   <Input
+                    id="clone-user"
                     className="h-9 font-mono text-xs"
                     value={editForm.username}
                     onChange={(e) => patchEdit({ username: e.target.value })}
@@ -669,6 +679,7 @@ function SocksNodesPanel() {
                   {/* 密码框**永远从空开始**：后端不外传密码，留空 = 不改。
                       要清空得显式勾下面那个框（空串才是"清空"，见 socks-node-edit）。 */}
                   <Input
+                    id="clone-pass"
                     type="password"
                     className="h-9 font-mono text-xs"
                     value={editForm.password}
@@ -712,7 +723,11 @@ function SocksNodesPanel() {
                   {fmtAgo(n.lastTest?.testedAt ?? 0, t)}
                 </span>
                 <div className="ml-auto flex items-center gap-2">
-                  <Switch checked={n.enabled} onCheckedChange={(v) => toggleEnabled(n, v)} />
+                  <Switch
+                    checked={n.enabled}
+                    onCheckedChange={(v) => toggleEnabled(n, v)}
+                    aria-label={t('clones.node.enableNode', { label: n.label })}
+                  />
                   <Button
                     variant="outline"
                     size="sm"
@@ -1058,6 +1073,7 @@ function CloneGroupsPanel() {
               {g.primary.authMethod === 'api_key' && (
                 <>
                   <Input
+                    id={`clone-copies-${g.primary.id}`}
                     className="h-8 w-16"
                     type="number"
                     min={1}
@@ -1162,11 +1178,13 @@ function CloneGroupsPanel() {
                 )}
                 <div className="ml-auto flex items-center gap-1">
                   <Input
+                    id={`clone-tag-${m.id}`}
                     className="h-7 w-40"
                     placeholder={t('clones.group.tagPlaceholder')}
                     maxLength={64}
                     value={tagDraft[m.id] ?? m.tag ?? ''}
                     onChange={(e) => setTagDraft((p) => ({ ...p, [m.id]: e.target.value }))}
+                    aria-label={t('clones.group.tagAria', { id: m.id })}
                   />
                   {tagDraft[m.id] !== undefined && (
                     <Button size="sm" variant="outline" onClick={() => saveTag(m.id)}>
@@ -1335,6 +1353,7 @@ function CloneGroupsPanel() {
           <div className="flex items-center gap-2">
             <span className="text-sm">{t('clones.picker.copiesLabel')}</span>
             <Input
+              id="clone-copies-picker"
               className="h-8 w-20"
               type="number"
               min={1}

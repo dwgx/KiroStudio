@@ -303,13 +303,6 @@ impl RateLimiter {
         states.remove(&credential_id);
     }
 
-    /// 重置所有凭据的速率限制状态
-    #[allow(dead_code)]
-    pub fn reset_all(&self) {
-        let mut states = self.states.lock();
-        states.clear();
-    }
-
     /// 计算请求间隔（带抖动）
     fn calculate_interval(&self) -> Duration {
         let config = self.config.read();

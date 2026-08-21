@@ -4,37 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 // === 错误响应 ===
-
-/// API 错误响应
-#[derive(Debug, Serialize)]
-pub struct ErrorResponse {
-    pub error: ErrorDetail,
-}
-
-/// 错误详情
-#[derive(Debug, Serialize)]
-pub struct ErrorDetail {
-    #[serde(rename = "type")]
-    pub error_type: String,
-    pub message: String,
-}
-
-impl ErrorResponse {
-    /// 创建新的错误响应
-    pub fn new(error_type: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
-            error: ErrorDetail {
-                error_type: error_type.into(),
-                message: message.into(),
-            },
-        }
-    }
-
-    /// 创建认证错误响应
-    pub fn authentication_error() -> Self {
-        Self::new("authentication_error", "Invalid API key")
-    }
-}
+// 信封定义在 `common::error_response`，本模块 re-export 以保持既有 `types::ErrorResponse` 路径。
+pub use crate::common::error_response::ErrorResponse;
 
 // === Models 端点类型 ===
 
@@ -218,6 +189,10 @@ pub struct CacheControl {
 /// 系统消息
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SystemMessage {
+    /// Claude Code 2.1.215+ 的 ToolSearch 延迟加载会在 system 数组里混入
+    /// `type=tool_reference` 块（只有 tool_name，没有 text）。text 容忍缺失，
+    /// 否则整请求反序列化 400；空文本块由 converter 拼接侧过滤，不转发上游。
+    #[serde(default)]
     pub text: String,
     /// 块类型（如 "text"），Anthropic 数组格式 system 块携带
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
@@ -269,6 +244,8 @@ pub struct ContentBlock {
     pub content: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]

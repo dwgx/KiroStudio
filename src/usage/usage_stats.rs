@@ -18,7 +18,8 @@ use parking_lot::Mutex;
 use serde::Serialize;
 
 use super::pipeline::UsageSink;
-use super::record::RequestRecord;
+use super::record::{RequestOutcome, RequestRecord};
+use crate::model::config::ModelPrice;
 
 /// 小时环形桶数量：24×31，覆盖最近 31 天的逐小时数据
 const HOUR_BUCKETS: usize = 24 * 31; // 744
@@ -657,6 +658,12 @@ struct Inner {
     by_requested_model: HashMap<String, Aggregate>,
     /// 按凭据全量累计
     by_credential: HashMap<u64, Aggregate>,
+    /// 按结果分类（outcome）全量累计（key = [`RequestOutcome`]，**封闭枚举** 12 变体，
+    /// 非外部可控字符串 → 天然有界，无需 by_model 的截断/OTHER 归并，见 `Inner::apply`）。
+    ///
+    /// 解决 F1/A2：`Aggregate` 只存 success/failure 二值，429/配额/auth 分布画不出，
+    /// 只能 `traces/search?outcome=` 逐条过滤。
+    by_outcome: HashMap<RequestOutcome, Aggregate>,
     /// per-credential 速率环
     rate: RateRing,
     /// 下游客户端 / 窗口维度的滚动速率聚合（Task5）
@@ -705,6 +712,7 @@ impl Inner {
             by_model: HashMap::new(),
             by_requested_model: HashMap::new(),
             by_credential: HashMap::new(),
+            by_outcome: HashMap::new(),
             rate: RateRing::default(),
             client_agg: ClientAgg::default(),
             throughput: GlobalThroughputRing::default(),
@@ -791,6 +799,13 @@ impl Inner {
             self.by_credential.entry(cid).or_default().add(r);
             self.rate.bump(cid, rate_slot);
         }
+
+        // 按结果分类累计（F1/A2：outcome 细分 —— 429/配额/auth 分布不再靠逐条过滤）。
+        // key 是**封闭枚举**（`RequestOutcome` 12 变体，非外部可控字符串）：无需
+        // by_model 那套截断/OTHER 归并（`MODEL_KEY_CAP` 是为外部可控 key 封无界增长），
+        // 本表条目数恒 ≤ 变体数，有测试钉死守恒与有界。历史 JSONL 重放走同一 apply，
+        // 未知 outcome 反序列化即失败（serde 枚举），不会产生表外 key。
+        self.by_outcome.entry(r.outcome).or_default().add(r);
 
         // 下游客户端 / 窗口维度速率（与 credential 速率共用同一 30 秒桶编号）
         self.client_agg.bump(r, rate_slot);
@@ -933,6 +948,13 @@ pub struct GroupStat {
     pub cache_creation_tokens: i64,
     /// credits 累计
     pub credits_used: f64,
+    /// 估算成本（元）：按模型单价表（[`crate::model::config::Config::model_pricing`]）
+    /// 推算，见 [`estimate_cost`]。
+    ///
+    /// 无单价表 / 模型不在表中 = 0.0（不估算）。与 [`Self::credits_used`]（上游真实
+    /// 计费）是**两个独立口径**：credits 是上游 metering 返回的真值，cost 是本机按
+    /// 单价表对 token 用量的推算，仅作「哪个模型最花钱」的排序参考。
+    pub cost: f64,
     /// 平均延迟（毫秒）
     pub avg_latency_ms: f64,
     /// 该分组的换号次数累计：看**哪个模型 / 哪个号**在烧重试预算。
@@ -943,8 +965,34 @@ pub struct GroupStat {
     pub avg_retries_per_request: f64,
 }
 
+/// 按单价表估算成本（元）：`tokens / 1_000_000 × 单价`，四档分别计价后求和。
+///
+/// - `input_tokens` 传 **gross** 口径（[`Aggregate::input_tokens`] 已含 cache 两项）：
+///   input 部分内部按 billed 口径折算（减去 cache 读+建，饱和非负），避免缓存被计两次
+///   （与 [`crate::usage::record::RequestRecord::billed_input_tokens`] 同口径）。
+/// - `price` 为 None（模型无单价）时返回 0.0（不估算）。
+///
+/// 纯函数、无状态，可独立单测。
+fn estimate_cost(
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_creation_tokens: i64,
+    price: Option<&ModelPrice>,
+) -> f64 {
+    let Some(p) = price else {
+        return 0.0;
+    };
+    let billed_input = (input_tokens - cache_read_tokens - cache_creation_tokens).max(0);
+    let per_mtok = |tokens: i64, unit: f64| tokens as f64 / 1_000_000.0 * unit;
+    per_mtok(billed_input, p.input_per_mtok)
+        + per_mtok(output_tokens, p.output_per_mtok)
+        + per_mtok(cache_read_tokens, p.cache_read_per_mtok)
+        + per_mtok(cache_creation_tokens, p.cache_creation_per_mtok)
+}
+
 impl GroupStat {
-    fn from(key: String, a: &Aggregate) -> Self {
+    fn from(key: String, a: &Aggregate, price: Option<&ModelPrice>) -> Self {
         GroupStat {
             key,
             requests: a.requests,
@@ -954,6 +1002,13 @@ impl GroupStat {
             cache_read_tokens: a.cache_read_tokens,
             cache_creation_tokens: a.cache_creation_tokens,
             credits_used: a.credits_used,
+            cost: estimate_cost(
+                a.input_tokens,
+                a.output_tokens,
+                a.cache_read_tokens,
+                a.cache_creation_tokens,
+                price,
+            ),
             avg_latency_ms: a.avg_latency_ms(),
             retries_sum: a.retries_sum,
             retried_requests: a.retried_requests,
@@ -1133,13 +1188,36 @@ impl UsageStats {
         if let Some((_, f)) = guard.as_mut() {
             if let Err(e) = writeln!(f, "{line}") {
                 tracing::warn!("用量统计：写入 JSONL 失败：{e}");
+                return;
             }
         }
+        // B8：数据在产信号——每笔 JSONL 落盘成功都刷新活动时刻，供
+        // alerting::report_if_stale 的「数据断更」watchdog 判定（进程活着 ≠
+        // 数据在产，CLAUDE.md minutely.jsonl 教训）。
+        crate::common::alerting::note_data_activity("usage_jsonl");
     }
 
-    /// 冷启动重放：读取目录下所有 `usage-*.jsonl`，逐行反序列化累加进内存聚合。
-    /// 解析失败的行跳过并计数（累计到 [`parse_error_count`]）。
+    /// `usage-YYYY-MM-DD.jsonl` → 该日 UTC 日期。其它名字（含 `usage-foo.jsonl`）一律 None。
+    fn parse_usage_jsonl_date(name: &str) -> Option<chrono::NaiveDate> {
+        const PREFIX: &str = "usage-";
+        const SUFFIX: &str = ".jsonl";
+        if !name.starts_with(PREFIX) || !name.ends_with(SUFFIX) {
+            return None;
+        }
+        let date_part = &name[PREFIX.len()..name.len() - SUFFIX.len()];
+        chrono::NaiveDate::parse_from_str(date_part, "%Y-%m-%d").ok()
+    }
+
+    /// 冷启动重放：读取目录下最近 31 天内的 `usage-YYYY-MM-DD.jsonl`，
+    /// 逐行反序列化累加进内存聚合。解析失败的行跳过并计数（累计到 [`parse_error_count`]）。
+    ///
+    /// 文件名日期早于环形桶窗口（31 天）的跳过——超期记录 apply 后即被覆盖，
+    /// 纯属白算。无法解析日期的文件名忽略。
     pub fn rebuild_from_logs(&self) {
+        self.rebuild_from_logs_at(chrono::Utc::now().date_naive());
+    }
+
+    fn rebuild_from_logs_at(&self, today: chrono::NaiveDate) {
         let entries = match fs::read_dir(&self.dir) {
             Ok(e) => e,
             Err(_) => {
@@ -1148,20 +1226,32 @@ impl UsageStats {
             }
         };
 
+        // 环形桶 31 天；文件名日期 < today-31 的不读。
+        let cutoff = today - chrono::Duration::days(DAY_BUCKETS as i64);
+
         // 收集并排序文件名，保证按日期顺序重放（对聚合结果无影响，仅利于可读性）
         let mut files: Vec<PathBuf> = Vec::new();
+        let mut skipped_old = 0u64;
         for entry in entries.flatten() {
             let path = entry.path();
-            let is_usage_jsonl = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.starts_with("usage-") && n.ends_with(".jsonl"))
-                .unwrap_or(false);
-            if is_usage_jsonl {
-                files.push(path);
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(file_date) = Self::parse_usage_jsonl_date(name) else {
+                continue;
+            };
+            if file_date < cutoff {
+                skipped_old += 1;
+                continue;
             }
+            files.push(path);
         }
         files.sort();
+        if skipped_old > 0 {
+            tracing::debug!(
+                "用量统计：跳过 {skipped_old} 个早于 {cutoff} 的 JSONL 日文件（环形桶 {DAY_BUCKETS} 天）"
+            );
+        }
 
         let mut errors = 0u64;
         let mut inner = self.inner.lock();
@@ -1188,6 +1278,55 @@ impl UsageStats {
         if errors > 0 {
             tracing::warn!("用量统计：重放跳过 {errors} 条无法解析的记录");
         }
+    }
+
+    /// 删除文件名日期早于 `retain_days` 的 `usage-YYYY-MM-DD.jsonl`。
+    ///
+    /// 当天文件永不删除。无法解析日期的名字忽略。返回成功删掉的文件数。
+    pub fn cleanup_old_jsonl(&self, retain_days: u32) -> u64 {
+        self.cleanup_old_jsonl_at(retain_days, chrono::Utc::now().date_naive())
+    }
+
+    fn cleanup_old_jsonl_at(&self, retain_days: u32, today: chrono::NaiveDate) -> u64 {
+        // UTC 跨日后句柄可能仍占着昨天的文件；先放开，否则 Windows 删不掉。
+        {
+            let mut guard = self.file.lock();
+            if let Some((date, _)) = guard.as_ref() {
+                if chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                    .is_ok_and(|d| d < today)
+                {
+                    *guard = None;
+                }
+            }
+        }
+
+        let cutoff = today - chrono::Duration::days(i64::from(retain_days));
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(e) => e,
+            Err(_) => return 0,
+        };
+
+        let mut removed = 0u64;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(file_date) = Self::parse_usage_jsonl_date(name) else {
+                continue;
+            };
+            if file_date >= today {
+                continue;
+            }
+            if file_date >= cutoff {
+                continue;
+            }
+            match fs::remove_file(&path) {
+                Ok(()) => removed += 1,
+                Err(e) => tracing::warn!("用量统计：删除过期 JSONL {:?} 失败：{e}", path),
+            }
+        }
+        removed
     }
 
     /// 重放累计的解析失败行数
@@ -1363,12 +1502,15 @@ impl UsageStats {
     /// key = `r.upstream_model`（映射后/上游实际服务名），`None`（未映射/失败记录）
     /// 回落 `r.model`。与 [`Self::by_requested_model`]（客户端原始名）是同一批记录的
     /// 两个口径，请求总数恒等，只是分组键不同。
-    pub fn by_model(&self) -> Vec<GroupStat> {
+    ///
+    /// `pricing` 为模型单价表（空表 = 不估算成本）：key 按本表口径（上游实际服务名）
+    /// 命中，命中行 [`GroupStat::cost`] 按 [`estimate_cost`] 推算，未命中为 0.0。
+    pub fn by_model(&self, pricing: &HashMap<String, ModelPrice>) -> Vec<GroupStat> {
         let inner = self.inner.lock();
         let mut out: Vec<GroupStat> = inner
             .by_model
             .iter()
-            .map(|(k, a)| GroupStat::from(k.clone(), a))
+            .map(|(k, a)| GroupStat::from(k.clone(), a, pricing.get(k)))
             .collect();
         out.sort_by(|a, b| b.requests.cmp(&a.requests).then(a.key.cmp(&b.key)));
         out
@@ -1380,24 +1522,50 @@ impl UsageStats {
     /// 模型（`upstream_model`，映射命中时是映射后名；未映射回落 `r.model`），本方法记
     /// **客户端点名**的模型（`requested_model`，`None` 回落 `r.model`）。两维度的请求
     /// 总数恒等（同一批 `apply`），只是分组键不同。
-    pub fn by_requested_model(&self) -> Vec<GroupStat> {
+    ///
+    /// `pricing` 同 [`Self::by_model`]；注意单价表按**上游实际服务名**配置，
+    /// 客户端原始名通常不在表中（未映射时两表 key 相同才会命中），cost 多为 0.0。
+    pub fn by_requested_model(&self, pricing: &HashMap<String, ModelPrice>) -> Vec<GroupStat> {
         let inner = self.inner.lock();
         let mut out: Vec<GroupStat> = inner
             .by_requested_model
             .iter()
-            .map(|(k, a)| GroupStat::from(k.clone(), a))
+            .map(|(k, a)| GroupStat::from(k.clone(), a, pricing.get(k)))
             .collect();
         out.sort_by(|a, b| b.requests.cmp(&a.requests).then(a.key.cmp(&b.key)));
         out
     }
 
-    /// 按凭据全量聚合（按请求数降序，key 为凭据 ID 字符串）
+    /// 按凭据全量聚合（按请求数降序，key 为凭据 ID 字符串）。
+    ///
+    /// 成本不按凭据估算（单价表按模型配置，聚合层丢掉了模型维度）——
+    /// 但 `cost` 字段随行下发恒为 0.0，前端统一按「有值且 >0 才显示」处理。
     pub fn by_credential(&self) -> Vec<GroupStat> {
         let inner = self.inner.lock();
         let mut out: Vec<GroupStat> = inner
             .by_credential
             .iter()
-            .map(|(k, a)| GroupStat::from(k.to_string(), a))
+            .map(|(k, a)| GroupStat::from(k.to_string(), a, None))
+            .collect();
+        out.sort_by(|a, b| b.requests.cmp(&a.requests).then(a.key.cmp(&b.key)));
+        out
+    }
+
+    /// 按结果分类（outcome）全量聚合（按请求数降序，key = `RequestOutcome::as_str()`
+    /// 的 snake_case 名：`success` / `rate_limited` / `auth_failed` / ...）。
+    ///
+    /// 解决 F1/A2：`Aggregate` 只存 success/failure 二值，429/配额/auth 分布画不出，
+    /// 面板只能 `traces/search?outcome=` 逐条过滤。本表给出**全量累计**的分布，
+    /// 各 key 的 `requests` 之和恒等于总请求数（守恒）。
+    ///
+    /// 成本不按 outcome 估算（单价表按模型配置）——与 [`Self::by_credential`] 同先例，
+    /// `cost` 随行下发恒 0.0。
+    pub fn by_outcome(&self) -> Vec<GroupStat> {
+        let inner = self.inner.lock();
+        let mut out: Vec<GroupStat> = inner
+            .by_outcome
+            .iter()
+            .map(|(k, a)| GroupStat::from(k.as_str().to_string(), a, None))
             .collect();
         out.sort_by(|a, b| b.requests.cmp(&a.requests).then(a.key.cmp(&b.key)));
         out
@@ -1632,6 +1800,11 @@ mod tests {
     use super::*;
     use crate::usage::record::RequestOutcome;
 
+    /// 空单价表（= 不估算成本），供既有用例传参
+    fn no_pricing() -> HashMap<String, ModelPrice> {
+        HashMap::new()
+    }
+
     /// UTC 基准时间：2026-07-03T00:00:00Z 的 Unix 毫秒
     const BASE_MS: i64 = 1_783_036_800_000;
 
@@ -1844,7 +2017,7 @@ mod tests {
             0,
         ));
 
-        let models = s.by_model();
+        let models = s.by_model(&no_pricing());
         // sonnet 请求最多，排第一
         assert_eq!(models[0].key, "sonnet");
         assert_eq!(models[0].requests, 2);
@@ -1858,6 +2031,155 @@ mod tests {
         assert_eq!(c1.input_tokens, 20);
         let c2 = creds.iter().find(|c| c.key == "2").unwrap();
         assert_eq!(c2.requests, 1);
+    }
+
+    /// ⭐ 回归（F1/A2）：outcome 细分聚合 —— 不同 outcome 的记录按变体计数。
+    ///
+    /// `Aggregate` 只有 success/failure 二值，429/配额/auth 分布画不出，只能
+    /// `traces/search?outcome=` 逐条过滤。本表把每个变体累计成一行。
+    #[test]
+    fn by_outcome_counts_each_variant() {
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        // 同一小时：success ×2、rate_limited ×1、auth_failed ×1、server_error ×1
+        s.on_record(&rec(0, Some(1), "m", RequestOutcome::Success, 10, 5));
+        s.on_record(&rec(1_000, Some(1), "m", RequestOutcome::Success, 20, 10));
+        s.on_record(&rec(
+            2_000,
+            Some(2),
+            "m",
+            RequestOutcome::RateLimited,
+            0,
+            0,
+        ));
+        s.on_record(&rec(
+            3_000,
+            Some(2),
+            "m",
+            RequestOutcome::AuthFailed,
+            0,
+            0,
+        ));
+        s.on_record(&rec(
+            4_000,
+            Some(2),
+            "m",
+            RequestOutcome::ServerError,
+            0,
+            0,
+        ));
+
+        let rows = s.by_outcome();
+        let row = |k: &str| rows.iter().find(|r| r.key == k).unwrap();
+        // 未出现的变体不得凭空出现一行（表按命中变体累计）
+        assert_eq!(rows.len(), 4, "只应有命中的 4 个变体: {:?}", rows);
+        assert_eq!(row("success").requests, 2);
+        assert_eq!(row("success").input_tokens, 30);
+        assert_eq!(row("rate_limited").requests, 1);
+        assert_eq!(row("auth_failed").requests, 1);
+        assert_eq!(row("server_error").requests, 1);
+
+        // 总量守恒：各变体请求数之和 = 总请求数（与 by_model 的守恒口径一致）
+        let total: u64 = rows.iter().map(|r| r.requests).sum();
+        assert_eq!(total, 5, "outcome 分布必须守恒");
+
+        // 序列化出口：key 是 snake_case（前端按 outcome 字符串对接）
+        let json = serde_json::to_string(&rows).unwrap();
+        assert!(json.contains("\"key\":\"rate_limited\""), "{json}");
+        assert!(json.contains("\"key\":\"auth_failed\""), "{json}");
+        // 成本不按 outcome 估算（与 by_credential 同先例，恒 0）
+        assert!(rows.iter().all(|r| r.cost == 0.0));
+    }
+
+    /// by_outcome 的 key 是**封闭枚举**（12 变体），天然有界：
+    /// 条目数恒 ≤ 变体数，任意灌入不会增长（对比 by_model 需 MODEL_KEY_CAP/OTHER）。
+    #[test]
+    fn by_outcome_is_bounded_by_enum_variants() {
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        let variants = RequestOutcome::ALL;
+        for (i, o) in variants.iter().enumerate() {
+            s.on_record(&rec(i as i64 * 1_000, Some(1), "m", *o, 1, 0));
+        }
+        let n = variants.len();
+        let rows = s.by_outcome();
+        assert!(
+            rows.len() <= n,
+            "by_outcome 应有界（{n} 变体）：{} 条",
+            rows.len()
+        );
+        let total: u64 = rows.iter().map(|r| r.requests).sum();
+        assert_eq!(total, n as u64, "outcome 分布必须守恒");
+        assert_eq!(rows.len(), n);
+        let model_total: u64 = s.by_model(&no_pricing()).iter().map(|m| m.requests).sum();
+        assert_eq!(model_total, n as u64);
+    }
+
+    /// ⭐ 成本估算纯函数：输入 tokens（gross 口径）+ 单价 → 元。
+    ///
+    /// 关键口径：`input_tokens` 是 gross（已含 cache 两项），input 部分必须按 billed
+    /// （gross 减 cache 读+建）计价 —— 否则缓存被计两次，成本系统性偏高。
+    #[test]
+    fn estimate_cost_pure_function() {
+        let price = ModelPrice {
+            input_per_mtok: 2.5,
+            output_per_mtok: 12.5,
+            cache_read_per_mtok: 0.3,
+            cache_creation_per_mtok: 3.125,
+        };
+        // 100 万 input（其中 60 万 cache_read + 20 万 cache_creation）+ 40 万 output：
+        // billed input = 1_000_000 - 600_000 - 200_000 = 200_000
+        // 0.2M × 2.5 + 0.4M × 12.5 + 0.6M × 0.3 + 0.2M × 3.125
+        // = 0.5 + 5.0 + 0.18 + 0.625 = 6.305
+        let cost = estimate_cost(1_000_000, 400_000, 600_000, 200_000, Some(&price));
+        assert!((cost - 6.305).abs() < 1e-9, "cost={cost}");
+
+        // cache 超过 gross 的反常数据：billed input 饱和减为 0，input 部分零计价，
+        // 但 cache 读/建仍按各自单价计（它们是真实发生的用量）。
+        let cost2 = estimate_cost(100, 0, 80, 40, Some(&price));
+        let expected2 = 80.0 / 1e6 * 0.3 + 40.0 / 1e6 * 3.125;
+        assert!((cost2 - expected2).abs() < 1e-12, "cost2={cost2}");
+
+        // 无单价（None）→ 0.0（不估算）
+        assert_eq!(estimate_cost(1_000_000, 1, 0, 0, None), 0.0);
+    }
+
+    /// ⭐ 成本只按「上游实际服务名」命中单价表：命中行有 cost，未命中行与空表恒 0。
+    #[test]
+    fn by_model_estimates_cost_from_pricing_table() {
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        s.on_record(&rec_cache(0, Some(1), "sonnet", 1_000_000, 400_000, 600_000, 200_000));
+        s.on_record(&rec_cache(1_000, Some(1), "opus", 100, 50, 0, 0));
+
+        // 空表（不估算）→ 全部 cost=0
+        let models = s.by_model(&no_pricing());
+        assert!(models.iter().all(|m| m.cost == 0.0), "空表不得估算成本");
+
+        // 命中表：sonnet 有价，opus 不在表中 → 0
+        let mut pricing = HashMap::new();
+        pricing.insert(
+            "sonnet".to_string(),
+            ModelPrice {
+                input_per_mtok: 2.5,
+                output_per_mtok: 12.5,
+                cache_read_per_mtok: 0.3,
+                cache_creation_per_mtok: 3.125,
+            },
+        );
+        let models = s.by_model(&pricing);
+        let sonnet = models.iter().find(|m| m.key == "sonnet").unwrap();
+        assert!(
+            (sonnet.cost - 6.305).abs() < 1e-9,
+            "sonnet 应命中单价表：cost={}",
+            sonnet.cost
+        );
+        let opus = models.iter().find(|m| m.key == "opus").unwrap();
+        assert_eq!(opus.cost, 0.0, "opus 不在单价表，不得估算");
+
+        // 序列化出口：cost 字段真的下发（字段在但没下发 = 前端白改）
+        let json = serde_json::to_string(&models).unwrap();
+        assert!(json.contains("\"cost\":6.305"), "{json}");
+
+        // 按凭据恒 0（单价表按模型配置，聚合层无模型维度）
+        assert!(s.by_credential().iter().all(|c| c.cost == 0.0));
     }
 
     /// 映射双口径：`by_model`（上游实际服务名）与 `by_requested_model`（客户端原始名）
@@ -1884,12 +2206,12 @@ mod tests {
         // 未映射的记录：requested_model / upstream_model 缺省（None）→ 都回落 model。
         s.on_record(&rec(1000, Some(1), "claude-opus-4-8", RequestOutcome::Success, 20, 10));
 
-        let upstream = s.by_model();
+        let upstream = s.by_model(&no_pricing());
         assert_eq!(upstream.len(), 2, "上游维度应有 sonnet + opus 两条");
         let sonnet = upstream.iter().find(|m| m.key == "claude-sonnet-4-5").unwrap();
         assert_eq!(sonnet.requests, 1);
 
-        let requested = s.by_requested_model();
+        let requested = s.by_requested_model(&no_pricing());
         assert_eq!(requested.len(), 2, "请求维度应有 haiku + opus 两条");
         let haiku = requested.iter().find(|m| m.key == "claude-haiku-4-5").unwrap();
         assert_eq!(haiku.requests, 1);
@@ -1939,7 +2261,7 @@ mod tests {
         // ③ upstream_model = None（未映射/失败记录）→ by_model 回落 r.model。
         s.on_record(&rec(2_000, Some(1), "claude-opus-4-8", RequestOutcome::Success, 5, 5));
 
-        let upstream = s.by_model();
+        let upstream = s.by_model(&no_pricing());
         let sonnet = upstream
             .iter()
             .find(|m| m.key == "claude-sonnet-4-5")
@@ -1951,7 +2273,7 @@ mod tests {
             .unwrap_or_else(|| panic!("None 应回落 r.model: {:?}", upstream));
         assert_eq!(opus.requests, 2, "② 与 ③ 都归 opus");
 
-        let requested = s.by_requested_model();
+        let requested = s.by_requested_model(&no_pricing());
         let haiku = requested
             .iter()
             .find(|m| m.key == "claude-haiku-4-5")
@@ -1999,7 +2321,7 @@ mod tests {
             r.requested_model = Some(format!("client-model-{i}"));
             s.on_record(&r);
         }
-        let requested = s.by_requested_model();
+        let requested = s.by_requested_model(&no_pricing());
         // 表满后新名归入 OTHER 桶：条目数 ≤ CAP + 1（含 OTHER）。
         assert!(
             requested.len() <= Inner::MODEL_KEY_CAP + 1,
@@ -2127,7 +2449,7 @@ mod tests {
         assert!(daily_json.contains("\"retries_sum\":6"), "{daily_json}");
 
         // ③ GroupStat：按模型 / 按凭据两条路径都走 GroupStat::from，各断言一次
-        let models = s.by_model();
+        let models = s.by_model(&no_pricing());
         let m = models.iter().find(|g| g.key == "sonnet").unwrap();
         assert_eq!(m.retries_sum, 6);
         assert_eq!(m.retried_requests, 2);
@@ -2627,7 +2949,7 @@ mod tests {
         s.on_record(&rec_cache(1_000, Some(1), "sonnet", 1_000, 10, 600, 0));
         s.on_record(&rec_cache(2_000, Some(2), "opus", 500, 5, 400, 20));
 
-        let models = s.by_model();
+        let models = s.by_model(&no_pricing());
         let sonnet = models.iter().find(|m| m.key == "sonnet").unwrap();
         assert_eq!(sonnet.cache_read_tokens, 1_500);
         assert_eq!(sonnet.cache_creation_tokens, 50);
@@ -2660,7 +2982,7 @@ mod tests {
         let point = s.timeseries_hourly_at(BASE_MS, 1);
         assert_eq!(point[0].cache_read_tokens, 0);
         assert_eq!(point[0].cache_creation_tokens, 0);
-        assert_eq!(s.by_model()[0].cache_read_tokens, 0);
+        assert_eq!(s.by_model(&no_pricing())[0].cache_read_tokens, 0);
         assert_eq!(s.by_credential()[0].cache_creation_tokens, 0);
     }
 
@@ -2691,7 +3013,7 @@ mod tests {
             s.on_record(&rec_cache(1_000, Some(1), "m1", 2_000, 20, 1_200, 0));
         }
         let s2 = UsageStats::new(dir.clone());
-        s2.rebuild_from_logs();
+        s2.rebuild_from_logs_at(chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap());
         let ov = s2.overview_at(BASE_MS + 1_000);
         assert_eq!(ov.last_24h.cache_read_tokens, 2_000);
         assert_eq!(ov.last_24h.cache_creation_tokens, 100);
@@ -2708,7 +3030,7 @@ mod tests {
         assert!(ov.contains("\"cache_creation_tokens\":100"), "{ov}");
         let series = serde_json::to_string(&s.timeseries_hourly_at(BASE_MS, 1)).unwrap();
         assert!(series.contains("\"cache_read_tokens\":800"), "{series}");
-        let models = serde_json::to_string(&s.by_model()).unwrap();
+        let models = serde_json::to_string(&s.by_model(&no_pricing())).unwrap();
         assert!(models.contains("\"cache_creation_tokens\":100"), "{models}");
         let creds = serde_json::to_string(&s.by_credential()).unwrap();
         assert!(creds.contains("\"cache_read_tokens\":800"), "{creds}");
@@ -2738,13 +3060,13 @@ mod tests {
         assert!(f1.exists(), "第一天文件应存在");
         assert!(f2.exists(), "第二天文件应存在");
 
-        // 新实例重放
+        // 新实例重放（注入文件所在日，避免墙钟距 BASE_MS 超过 31 天时被窗口跳过）
         let s2 = UsageStats::new(dir.clone());
-        s2.rebuild_from_logs();
+        s2.rebuild_from_logs_at(chrono::NaiveDate::from_ymd_opt(2026, 7, 4).unwrap());
         let ov = s2.overview_at(BASE_MS + DAY_MS);
         assert_eq!(ov.last_7d.requests, 3, "重放后应恢复全部 3 条");
         assert_eq!(ov.last_7d.success, 2);
-        let models = s2.by_model();
+        let models = s2.by_model(&no_pricing());
         let m1 = models.iter().find(|m| m.key == "m1").unwrap();
         assert_eq!(m1.requests, 2);
         assert_eq!(m1.input_tokens, 17);
@@ -2769,7 +3091,7 @@ mod tests {
         fs::write(&path, format!("{good}\nNOT JSON\n\n")).unwrap();
 
         let s = UsageStats::new(dir.clone());
-        s.rebuild_from_logs();
+        s.rebuild_from_logs_at(chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap());
         assert_eq!(s.parse_error_count(), 1, "应跳过 1 条无法解析的行");
         let ov = s.overview_at(BASE_MS);
         assert_eq!(ov.last_24h.requests, 1);
@@ -2787,6 +3109,141 @@ mod tests {
         assert_eq!(s.overview_at(BASE_MS).last_24h.requests, 0);
     }
 
+    /// P1-3：冷启动不重放超期 JSONL；6h 清理删过期日文件、当天与非法名保留。
+    #[test]
+    fn rebuild_skips_old_jsonl_and_cleanup_deletes_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro_us_jsonl_retain_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let today = chrono::Utc::now().date_naive();
+        let old_path = dir.join("usage-2010-01-01.jsonl");
+        let recent_path = dir.join(format!("usage-{}.jsonl", today.format("%Y-%m-%d")));
+        let junk_path = dir.join("usage-not-a-date.jsonl");
+        let other_path = dir.join("notes.txt");
+
+        let old_line =
+            serde_json::to_string(&rec(0, Some(1), "from-old", RequestOutcome::Success, 9, 9))
+                .unwrap();
+        let recent_line = serde_json::to_string(&rec(
+            0,
+            Some(1),
+            "from-recent",
+            RequestOutcome::Success,
+            3,
+            3,
+        ))
+        .unwrap();
+        fs::write(&old_path, format!("{old_line}\n")).unwrap();
+        fs::write(&recent_path, format!("{recent_line}\n")).unwrap();
+        fs::write(&junk_path, "not jsonl usage\n").unwrap();
+        fs::write(&other_path, "keep me\n").unwrap();
+
+        let s = UsageStats::new(dir.clone());
+        s.rebuild_from_logs();
+        let models = s.by_model(&no_pricing());
+        assert!(
+            models.iter().all(|m| m.key != "from-old"),
+            "2010 日文件必须跳过，不得进入聚合：{models:?}"
+        );
+        let recent = models
+            .iter()
+            .find(|m| m.key == "from-recent")
+            .expect("当天 JSONL 应被重放");
+        assert_eq!(recent.requests, 1);
+        assert_eq!(
+            s.parse_error_count(),
+            0,
+            "非法文件名不得当 JSONL 重放（否则 parse_errors 会涨）"
+        );
+
+        let removed = s.cleanup_old_jsonl(31);
+        assert_eq!(removed, 1, "只删 2010 那个日文件，实际 {removed}");
+        assert!(!old_path.exists(), "过期 JSONL 应被删除");
+        assert!(recent_path.exists(), "当天文件必须保留");
+        assert!(junk_path.exists(), "非 YYYY-MM-DD 文件名不得删");
+        assert!(other_path.exists(), "非 usage-*.jsonl 不得删");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cleanup_old_jsonl_never_deletes_today_even_when_retain_zero() {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro_us_jsonl_retain0_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let today = chrono::Utc::now().date_naive();
+        let yesterday = today - chrono::Duration::days(1);
+        let today_path = dir.join(format!("usage-{}.jsonl", today.format("%Y-%m-%d")));
+        let yesterday_path = dir.join(format!("usage-{}.jsonl", yesterday.format("%Y-%m-%d")));
+        fs::write(&today_path, "{}\n").unwrap();
+        fs::write(&yesterday_path, "{}\n").unwrap();
+
+        let s = UsageStats::new(dir.clone());
+        let removed = s.cleanup_old_jsonl(0);
+        assert_eq!(removed, 1, "retain=0 只删今天之前的日文件");
+        assert!(today_path.exists(), "当天文件即使 retain=0 也不得删");
+        assert!(!yesterday_path.exists(), "昨天的文件在 retain=0 时应删");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 环形窗口边界：today-31 仍重放，today-32 跳过。
+    #[test]
+    fn rebuild_from_logs_jsonl_cutoff_matches_ring_window() {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro_us_jsonl_ring_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 21).unwrap();
+        let keep_date = today - chrono::Duration::days(DAY_BUCKETS as i64);
+        let skip_date = today - chrono::Duration::days(DAY_BUCKETS as i64 + 1);
+        let keep_line =
+            serde_json::to_string(&rec(0, Some(1), "keep-edge", RequestOutcome::Success, 1, 1))
+                .unwrap();
+        let skip_line =
+            serde_json::to_string(&rec(0, Some(1), "skip-edge", RequestOutcome::Success, 1, 1))
+                .unwrap();
+        fs::write(
+            dir.join(format!("usage-{}.jsonl", keep_date.format("%Y-%m-%d"))),
+            format!("{keep_line}\n"),
+        )
+        .unwrap();
+        fs::write(
+            dir.join(format!("usage-{}.jsonl", skip_date.format("%Y-%m-%d"))),
+            format!("{skip_line}\n"),
+        )
+        .unwrap();
+
+        let s = UsageStats::new(dir.clone());
+        s.rebuild_from_logs_at(today);
+        let models = s.by_model(&no_pricing());
+        assert!(
+            models.iter().any(|m| m.key == "keep-edge"),
+            "today-{DAY_BUCKETS} 的日文件必须重放：{models:?}"
+        );
+        assert!(
+            models.iter().all(|m| m.key != "skip-edge"),
+            "today-{} 的日文件必须跳过：{models:?}",
+            DAY_BUCKETS + 1
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_query_structs_serialize() {
         let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
@@ -2795,8 +3252,9 @@ mod tests {
         assert!(serde_json::to_string(&s.overview_at(BASE_MS)).is_ok());
         assert!(serde_json::to_string(&s.timeseries_hourly_at(BASE_MS, 5)).is_ok());
         assert!(serde_json::to_string(&s.timeseries_daily_at(BASE_MS, 5)).is_ok());
-        assert!(serde_json::to_string(&s.by_model()).is_ok());
+        assert!(serde_json::to_string(&s.by_model(&no_pricing())).is_ok());
         assert!(serde_json::to_string(&s.by_credential()).is_ok());
+        assert!(serde_json::to_string(&s.by_outcome()).is_ok());
         assert!(serde_json::to_string(&s.throughput_at(BASE_MS)).is_ok());
         assert!(serde_json::to_string(&s.clients_at(BASE_MS)).is_ok());
         assert!(serde_json::to_string(&s.machines_at(BASE_MS)).is_ok());
@@ -3023,7 +3481,7 @@ mod tests {
                 1,
             ));
         }
-        let models = s.by_model();
+        let models = s.by_model(&no_pricing());
         assert!(
             models.len() <= Inner::MODEL_KEY_CAP + 1,
             "by_model 无界增长：{} 个条目（上限 {} + OTHER 桶）",
@@ -3050,12 +3508,37 @@ mod tests {
         let s = UsageStats::new(std::env::temp_dir().join("kiro_bymodel_trunc"));
         let huge = "x".repeat(10_000);
         s.on_record(&rec(0, Some(1), &huge, RequestOutcome::Success, 1, 1));
-        let models = s.by_model();
+        let models = s.by_model(&no_pricing());
         assert_eq!(models.len(), 1);
         assert!(
             models[0].key.chars().count() <= Inner::MODEL_KEY_MAX_LEN,
             "模型名未截断：{} 字符",
             models[0].key.chars().count()
+        );
+    }
+
+    /// 源码守卫（F1/A2）：by_outcome 聚合必须接线在 `Inner::apply` 里。
+    ///
+    /// 删掉 apply() 里的累计行 → **编译不报错**（by_outcome 只是少累计），
+    /// `/usage/by-outcome` 静默返回空表 —— 本守卫靠 needle 钉死接线存在。
+    ///
+    /// 回退即 FAIL：apply() 里对 by_outcome 的累计入口消失。
+    #[test]
+    fn apply_must_wire_by_outcome_aggregation() {
+        let src = include_str!("usage_stats.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        // needle 运行时拼接（守卫纪律）：字面量只出现在被守卫的代码里
+        let needle = format!("self.by_outcome.entry(r.outcome){}", "");
+        assert!(
+            prod.contains(&needle),
+            "apply() 必须按 outcome 累计进 by_outcome（删掉接线 = 细分视图静默归零）"
+        );
+        // 查询出口同样不能丢：by_outcome() 方法必须存在
+        let needle2 = format!("pub fn by_outcome({})", "&self");
+        assert!(
+            prod.contains(&needle2),
+            "by_outcome() 查询方法必须存在（删掉 = /usage/by-outcome 无法返回）"
         );
     }
 }

@@ -1,7 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import { useQueryClient } from '@tanstack/react-query'
+import { toast } from 'sonner'
+import { Copy, Pencil, Trash2, Loader2 } from 'lucide-react'
 import type { CredentialStatusItem } from '@/types/api'
 import { healthOf, HEALTH_RGB, statusText } from '@/components/overview/credViz'
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
+import { Button } from '@/components/ui/button'
+import { deleteCredential, setCredentialName } from '@/api/credentials'
+import { copyToClipboard, extractErrorMessage } from '@/lib/utils'
 import {
   useCanvasLayout,
   resolveLayout,
@@ -64,6 +72,93 @@ export function CredentialCanvas({ credentials, onContextMenu, className }: Cred
   const hostRef = useRef<HTMLDivElement>(null)
   const [mode, setMode] = useState<Mode>({ kind: 'idle' })
   const [cols, setCols] = useState(6)
+
+  // ── 右键菜单（自绘）：定位在鼠标处，backdrop 点击即「点外部关闭」。 ─────────
+  const [menu, setMenu] = useState<{ c: CredentialStatusItem; x: number; y: number } | null>(null)
+  const [renaming, setRenaming] = useState<CredentialStatusItem | null>(null)
+  const [renameValue, setRenameValue] = useState('')
+  const [renameBusy, setRenameBusy] = useState(false)
+  const [deleting, setDeleting] = useState<CredentialStatusItem | null>(null)
+  const [deleteBusy, setDeleteBusy] = useState(false)
+  const queryClient = useQueryClient()
+
+  // 格子右键：外部传了 onContextMenu 就交给外部（保持 prop 契约）；否则内置最小菜单。
+  // Ctrl/Cmd 让路（macOS 辅助点击会同时派发 contextmenu，与行视图同契约）。
+  const handleCellContextMenu = useCallback(
+    (c: CredentialStatusItem, e: React.MouseEvent) => {
+      if (onContextMenu) {
+        onContextMenu(c, e)
+        return
+      }
+      if (e.ctrlKey || e.metaKey) {
+        e.preventDefault()
+        return
+      }
+      e.preventDefault()
+      setMenu({ c, x: e.clientX, y: e.clientY })
+    },
+    [onContextMenu],
+  )
+
+  const copyName = async () => {
+    const c = menu?.c
+    if (!c) return
+    const ok = await copyToClipboard(c.name || c.email || String(c.id))
+    ok ? toast.success(t('dashboard.canvas.toast.nameCopied')) : toast.error(t('credentialcard.toast.copyFailed'))
+    setMenu(null)
+  }
+
+  const openRename = () => {
+    const c = menu?.c
+    if (!c) return
+    setRenameValue(c.name ?? '')
+    setRenaming(c)
+    setMenu(null)
+  }
+
+  const submitRename = async () => {
+    if (!renaming) return
+    setRenameBusy(true)
+    try {
+      // 与行/卡同名契约：空串 = 清除别名。
+      const trimmed = renameValue.trim()
+      await setCredentialName(renaming.id, trimmed === '' ? null : trimmed)
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      toast.success(t('dashboard.canvas.toast.renamed'))
+      setRenaming(null)
+    } catch (err) {
+      toast.error(extractErrorMessage(err))
+    } finally {
+      setRenameBusy(false)
+    }
+  }
+
+  const openDelete = () => {
+    const c = menu?.c
+    if (!c) return
+    setMenu(null)
+    // 与卡片/行同一道门：未禁用不允许删（后端也有此门，前端先给可读提示）。
+    if (!c.disabled) {
+      toast.error(t('credentialcard.toast.disableBeforeDelete'))
+      return
+    }
+    setDeleting(c)
+  }
+
+  const confirmDelete = async () => {
+    if (!deleting) return
+    setDeleteBusy(true)
+    try {
+      const res = await deleteCredential(deleting.id)
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      toast.success(res.message)
+      setDeleting(null)
+    } catch (err) {
+      toast.error(t('credentialcard.toast.deleteFailed') + extractErrorMessage(err))
+    } finally {
+      setDeleteBusy(false)
+    }
+  }
 
   // 自动排布的下标顺序必须**稳定**：按 id 升序，不受健康度/轮询影响。
   // 用动态顺序会让没摆放过的号在每次轮询后换位。
@@ -334,7 +429,7 @@ export function CredentialCanvas({ credentials, onContextMenu, className }: Cred
               <div
                 key={id}
                 onPointerDown={(e) => onCellPointerDown(e, id)}
-                onContextMenu={(e) => onContextMenu?.(c, e)}
+                onContextMenu={(e) => handleCellContextMenu(c, e)}
                 className={`absolute overflow-hidden rounded-md border p-2 transition-shadow ${
                   sel ? 'ring-2 ring-primary' : ''
                 } ${dragging || resizing ? 'z-20 cursor-grabbing shadow-lg' : 'cursor-grab'}`}
@@ -386,6 +481,103 @@ export function CredentialCanvas({ credentials, onContextMenu, className }: Cred
           )}
         </div>
       </div>
+
+      {/* 右键菜单：fixed 全屏 backdrop 承接「点外部关闭」，内层 stopPropagation 保住菜单自身。
+          位置 clamp 到视口内，避免右键贴近右/下边缘时菜单溢出。 */}
+      {menu && (
+        <div
+          className="fixed inset-0 z-50"
+          onPointerDown={() => setMenu(null)}
+          onContextMenu={(e) => {
+            e.preventDefault()
+            setMenu(null)
+          }}
+        >
+          <div
+            className="absolute min-w-36 rounded-md border border-border/60 bg-popover p-1 shadow-lg"
+            style={{
+              left: Math.min(menu.x, window.innerWidth - 160),
+              top: Math.min(menu.y, window.innerHeight - 132),
+            }}
+            onPointerDown={(e) => e.stopPropagation()}
+          >
+            <button
+              type="button"
+              onClick={copyName}
+              className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs transition-colors hover:bg-muted/60"
+            >
+              <Copy className="h-3.5 w-3.5" />
+              {t('dashboard.canvas.menu.copyName')}
+            </button>
+            <button
+              type="button"
+              onClick={openRename}
+              className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs transition-colors hover:bg-muted/60"
+            >
+              <Pencil className="h-3.5 w-3.5" />
+              {t('dashboard.canvas.menu.rename')}
+            </button>
+            <button
+              type="button"
+              onClick={openDelete}
+              disabled={!menu.c.disabled}
+              title={!menu.c.disabled ? t('credentialcard.settings.deleteDisabledTitle') : undefined}
+              className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-destructive transition-colors hover:bg-muted/60 disabled:opacity-50"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+              {t('dashboard.canvas.menu.delete')}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* 重命名弹框（与行/卡的 name 编辑同契约：传空 = 清除别名） */}
+      <Dialog open={!!renaming} onOpenChange={(v) => !v && setRenaming(null)}>
+        <DialogContent className="max-w-sm" aria-describedby={undefined}>
+          <DialogHeader>
+            <DialogTitle>{t('dashboard.canvas.rename.title', { id: renaming?.id ?? '' })}</DialogTitle>
+          </DialogHeader>
+          <Input
+            id="canvas-rename"
+            value={renameValue}
+            onChange={(e) => setRenameValue(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') submitRename()
+            }}
+            placeholder={t('dashboard.canvas.rename.label')}
+            aria-label={t('dashboard.canvas.rename.title', { id: renaming?.id ?? '' })}
+            autoFocus
+          />
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setRenaming(null)} disabled={renameBusy}>
+              {t('dashboard.canvas.rename.cancel')}
+            </Button>
+            <Button onClick={submitRename} disabled={renameBusy}>
+              {renameBusy && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />}
+              {t('dashboard.canvas.rename.save')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 删除二次确认（与卡片/行同一道门：需先禁用） */}
+      <Dialog open={!!deleting} onOpenChange={(v) => !v && setDeleting(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t('credentialcard.deleteDialog.title', { id: deleting?.id ?? '' })}</DialogTitle>
+            <DialogDescription>{t('credentialcard.deleteDialog.description')}</DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDeleting(null)} disabled={deleteBusy}>
+              {t('credentialcard.deleteDialog.cancel')}
+            </Button>
+            <Button variant="destructive" onClick={confirmDelete} disabled={deleteBusy}>
+              {deleteBusy && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />}
+              {t('credentialcard.deleteDialog.confirm')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

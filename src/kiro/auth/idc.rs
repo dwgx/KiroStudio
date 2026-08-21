@@ -66,7 +66,8 @@ fn oidc_base_url(region: &str) -> String {
     format!("https://oidc.{}.amazonaws.com", region)
 }
 
-fn build_user_agent(config: &Config) -> (String, String) {
+/// 构造与 Kiro IDE 一致的 SSO-OIDC 请求 UA（idc 上号与 sso_token 导入共用）。
+pub(crate) fn build_user_agent(config: &Config) -> (String, String) {
     let os_name = &config.system_version;
     let node_version = &config.node_version;
     let x_amz = "aws-sdk-js/3.980.0 KiroIDE".to_string();
