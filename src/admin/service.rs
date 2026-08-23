@@ -794,11 +794,16 @@ impl AdminService {
     }
 
     /// 发起网页上号，返回 portal_url + session_id
-    pub fn start_social_login(
+    pub async fn start_social_login(
         &self,
         priority: u32,
         proxy_url: Option<String>,
     ) -> Result<StartResult, AdminServiceError> {
+        if let Some(ref u) = proxy_url {
+            crate::common::ssrf::gate_admin_proxy_url(u)
+                .await
+                .map_err(AdminServiceError::InvalidCredential)?;
+        }
         self.social_login
             .start(priority, proxy_url)
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))
@@ -822,6 +827,11 @@ impl AdminService {
         priority: u32,
         proxy_url: Option<String>,
     ) -> Result<IdcStartResult, AdminServiceError> {
+        if let Some(ref u) = proxy_url {
+            crate::common::ssrf::gate_admin_proxy_url(u)
+                .await
+                .map_err(AdminServiceError::InvalidCredential)?;
+        }
         self.idc_login
             .start(start_url, region, priority, proxy_url)
             .await
@@ -841,12 +851,17 @@ impl AdminService {
     }
 
     /// 外部 IdP（Microsoft）上号 · 第 1 步：生成 signin URL。
-    pub fn start_external_idp_login(
+    pub async fn start_external_idp_login(
         &self,
         priority: u32,
         proxy_url: Option<String>,
         preferred_region: Option<String>,
     ) -> Result<ExternalIdpStartResult, AdminServiceError> {
+        if let Some(ref u) = proxy_url {
+            crate::common::ssrf::gate_admin_proxy_url(u)
+                .await
+                .map_err(AdminServiceError::InvalidCredential)?;
+        }
         self.external_idp_login
             .start(priority, proxy_url, preferred_region)
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))
@@ -1689,7 +1704,7 @@ impl AdminService {
             .map_err(|e| self.classify_error(e, id))
     }
 
-    pub fn set_credential_proxy(
+    pub async fn set_credential_proxy(
         &self,
         id: u64,
         proxy_url: Option<String>,
@@ -1698,7 +1713,21 @@ impl AdminService {
     ) -> Result<(), AdminServiceError> {
         self.token_manager
             .set_credential_proxy(id, proxy_url, proxy_username, proxy_password)
-            .map_err(|e| self.classify_error(e, id))
+            .await
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("不存在") {
+                    AdminServiceError::NotFound { id }
+                } else if msg.contains(crate::common::ssrf::PROXY_ADDRESS_REJECTED_PREFIX)
+                    || msg.contains("scheme")
+                    || msg.contains("非公网")
+                    || msg.contains("目标解析")
+                {
+                    AdminServiceError::InvalidCredential(msg)
+                } else {
+                    self.classify_error(e, id)
+                }
+            })
     }
 
     /// 修改自定义 API(代挂透传)凭据的 base_url / api_key / 请求上限(仅 custom_api 号,后端 gate)。
@@ -2092,6 +2121,12 @@ impl AdminService {
             }
             None => (None, None, None),
         };
+
+        if let Some(ref url) = proxy_url {
+            crate::common::ssrf::gate_admin_proxy_url(url)
+                .await
+                .map_err(AdminServiceError::InvalidCredential)?;
+        }
 
         // 份数（多开）：字段缺失 = 普通上号（默认，行为完全不变）。
         // 显式给值时同一账号导入多份，每份自动获得独立 machineId，之后可各自配代理。
@@ -3531,10 +3566,18 @@ impl AdminService {
     /// 校验全部通过后才写盘：先轮换 .bak 再原子写盘（同 `update_config`），随后
     /// `reload_config` 热应用 + 幂等重挂 TIER2 后台任务。host/port/adminKey 等
     /// 固化字段不热更，响应统一提示「需重启后生效」。
-    pub fn import_config(
+    pub async fn import_config(
         self: &Arc<Self>,
         payload: serde_json::Value,
     ) -> Result<ImportConfigResponse, AdminServiceError> {
+        if let Some(url) = payload
+            .get("proxyUrl")
+            .and_then(|v| v.as_str())
+        {
+            crate::common::ssrf::gate_admin_proxy_url(url)
+                .await
+                .map_err(AdminServiceError::InvalidCredential)?;
+        }
         // 与 update_config 共用写锁：导入期间的并发更新/导入同样串行化
         let _guard = self.config_write_lock.lock();
 

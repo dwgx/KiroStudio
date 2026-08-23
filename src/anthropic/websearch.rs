@@ -288,7 +288,9 @@ fn tool_is_web_search(t: &Tool) -> bool {
 /// 与入站 `tool_is_web_search` 不同：上游 tool_use 只携带 name（无 type），历史
 /// 回灌消息同样只有 name 形态，故此处只能按 name 判定（与参考仓 zyphr 一致）。
 fn tool_use_name_is_web_search(name: &str) -> bool {
-    name == "web_search"
+    // 默认 toolCompatMapping：上游名 `web_search`，还原后是客户端 `WebSearch`。
+    // 只认小写会让跳过分支永死，内部 MCP 不搜、工具被当成客户端 tool_use。
+    name == "web_search" || name == "WebSearch"
 }
 
 /// 检查请求的 tools 是否包含原生 WebSearch 工具。
@@ -1250,6 +1252,8 @@ struct RoundOutcome {
     stop_reason_override: Option<String>,
     /// 上游流中途读失败：本轮内容是**半截**的，不能当成功回灌
     stream_error: bool,
+    /// Bug C：非 web_search 工具缺 required。与截断流分开，run_round 映射 INVALID_TOOL_INPUT。
+    invalid_tool_input: Option<String>,
     /// in-band 错误/异常
     upstream_error: Option<String>,
 }
@@ -1280,6 +1284,7 @@ async fn decode_round(
     response: reqwest::Response,
     model: &str,
     tool_name_map: &std::collections::HashMap<String, String>,
+    tool_required_fields: &std::collections::HashMap<String, Vec<String>>,
 ) -> RoundOutcome {
     use crate::kiro::model::events::Event;
     use crate::kiro::parser::decoder::EventStreamDecoder;
@@ -1297,6 +1302,7 @@ async fn decode_round(
         credits: 0.0,
         stop_reason_override: None,
         stream_error: false,
+        invalid_tool_input: None,
         upstream_error: None,
     };
     // tool_use_id → (还原后的工具名, 累积的 input JSON)
@@ -1390,17 +1396,43 @@ async fn decode_round(
                                 }
                             }
                         };
-                        if tool_use_name_is_web_search(&name) {
+                        // 用上游/Kiro 名分类（还原前），并同时认客户端 WebSearch。
+                        if tool_use_name_is_web_search(&tu.name)
+                            || tool_use_name_is_web_search(&name)
+                        {
                             let query = input
                                 .get("query")
                                 .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string);
+                            let Some(query) = query else {
+                                tracing::warn!("WebSearch 回灌 web_search 缺 query，整轮失败");
+                                out.stream_error = true;
+                                continue;
+                            };
                             out.web_search.push(DecodedWebSearch {
                                 id: tu.tool_use_id.clone(),
                                 query,
                             });
                         } else {
+                            // Bug C：出站还原前对 **Kiro 形态** 判缺（与 stream/非流式同口径）。
+                            if super::handlers::tool_stream_align_failure_enabled()
+                                && !tool_required_fields.is_empty()
+                            {
+                                if let Some(required) = tool_required_fields.get(&tu.name) {
+                                    if let Some(missing) =
+                                        super::stream::missing_required_keys(&input, required)
+                                    {
+                                        tracing::warn!(
+                                            missing = %missing.join(","),
+                                            "WebSearch 回灌 tool_use 缺必需字段（Bug C）"
+                                        );
+                                        out.invalid_tool_input = Some(missing.join("、"));
+                                        continue;
+                                    }
+                                }
+                            }
                             // 出站参数还原（Kiro 形态 → CC 形态），仅当入站映射过；
                             // 与 stream.rs 的 stop 分支同口径，避免把不认识的参数清空。
                             let client_input = if tool_name_map.contains_key(&tu.name) {
@@ -1556,6 +1588,7 @@ async fn run_round(
             .into_response()
     })?;
     let tool_name_map = conversion.tool_name_map;
+    let tool_required_fields = conversion.tool_required_fields;
 
     // 保留压缩前的原始状态克隆：请求体超限重试时从它重建（与两条主路径同款——
     // 已压缩过的体再压没收益，必须回到压缩前的状态）。
@@ -1660,7 +1693,8 @@ async fn run_round(
         }
     };
 
-    let outcome = decode_round(response, &payload.model, &tool_name_map).await;
+    let outcome =
+        decode_round(response, &payload.model, &tool_name_map, &tool_required_fields).await;
 
     // 上游 in-band 错误 / 流截断：不能把半截内容当成功回灌下一轮（回灌了等于把
     // 截断的假事实写进历史，模型后续全部基于错误前提推理）。
@@ -1680,6 +1714,16 @@ async fn run_round(
             Json(ErrorResponse::new(
                 error_type,
                 format!("{message}: {err}"),
+            )),
+        )
+            .into_response());
+    }
+    if let Some(missing) = outcome.invalid_tool_input {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse::new(
+                "INVALID_TOOL_INPUT",
+                format!("工具调用缺少必需参数：{missing}（模型侧生成异常），请重试。"),
             )),
         )
             .into_response());
@@ -2791,6 +2835,14 @@ mod tests {
     }
 
     #[test]
+    fn web_search_name_matches_kiro_and_client_forms() {
+        assert!(tool_use_name_is_web_search("web_search"));
+        assert!(tool_use_name_is_web_search("WebSearch"));
+        assert!(!tool_use_name_is_web_search("Write"));
+        assert!(!tool_use_name_is_web_search("fs_write"));
+    }
+
+    #[test]
     fn should_replay_only_when_round_is_pure_web_search() {
         let ws = vec![DecodedWebSearch {
             id: "t1".to_string(),
@@ -3310,6 +3362,26 @@ mod tests {
             fn_body.contains("out.stream_error = true"),
             "修复补不回时必须置 stream_error 整轮报错（run_round 据此返 502），\
              不得静默降级成空对象"
+        );
+        let bug_c = format!("{}{}", "missing_required", "_keys(");
+        let map_fn = format!("{}{}", "map_tool_input_from", "_kiro(");
+        let bug_c_at = fn_body
+            .find(&bug_c)
+            .expect("decode_round 必须对非 web_search 工具做 Bug C");
+        let map_at = fn_body
+            .find(&map_fn)
+            .expect("decode_round 仍须出站 map_tool_input_from_kiro");
+        assert!(
+            bug_c_at < map_at,
+            "Bug C 必须在出站还原之前"
+        );
+        assert!(
+            fn_body.contains("tool_use_name_is_web_search(&tu.name)"),
+            "web_search 分类必须用上游/Kiro 名 tu.name，不得只拿还原后的客户端名"
+        );
+        assert!(
+            fn_body.contains("invalid_tool_input"),
+            "非 web_search Bug C 必须置 invalid_tool_input，不得只走泛化 stream_error"
         );
         let meta_arm = format!("{}::{}", "Event", "Metadata");
         let mapper = ["map_metadata", "_stop_reason"].concat();

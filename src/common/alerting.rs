@@ -359,8 +359,10 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // 先关启用位：同模块其它测试可能已 init(Some(url)) 并释放锁，ENABLED 仍为 true。
         init(None, 1, "test-host".to_string());
-        // 未配置：所有 bump 零开销 no-op（差值断言——别的告警测试可能已 bump
-        // 过进程级 SENT_TOTAL，绝对 0 会被并发测试污染，2026-08-16 实测）。
+        // init 不清 SENT_TOTAL；其它模块 bump 会把计数抬离 0。绝对断言前归零。
+        SENT_TOTAL.store(0, Ordering::Relaxed);
+        // TEST_LOCK 内刚归零，`before` 恒为 0。未配置 bump 必须保持 0（不是「差值」——
+        // 归零后 load 再 bump，旧注释里的并发污染口径已经不成立）。
         let before = SENT_TOTAL.load(Ordering::Relaxed);
         bump("a");
         bump("a");

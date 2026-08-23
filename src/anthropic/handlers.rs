@@ -883,6 +883,7 @@ async fn dispatch_kiro_attempt(
             input_tokens,
             extract_thinking,
             tool_name_map,
+            tool_required_fields,
             cache_breakdown,
             fingerprint_usage,
             budget,
@@ -3786,6 +3787,7 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    tool_required_fields: std::collections::HashMap<String, Vec<String>>,
     cache_breakdown: Option<CacheUsageBreakdown>,
     fingerprint_usage: Option<super::cache::PromptCacheUsage>,
     budget: &crate::kiro::provider::SharedRetryBudget,
@@ -3952,6 +3954,34 @@ async fn handle_non_stream_request(
                                                 tool_use.tool_use_id
                                             );
                                             input = reparsed;
+                                        }
+                                    }
+                                }
+
+                                // Bug C：在出站还原之前对 **Kiro 形态** 判缺（与流式 stop 同口径）。
+                                // 旧路径只修 JSON 非法，缺 required 仍 200 下发空/残参。
+                                if tool_stream_align_failure_enabled()
+                                    && completion.is_ok()
+                                    && !tool_required_fields.is_empty()
+                                {
+                                    if let Some(required) =
+                                        tool_required_fields.get(&tool_use.name)
+                                    {
+                                        if let Some(missing) =
+                                            super::stream::missing_required_keys(&input, required)
+                                        {
+                                            tracing::warn!(
+                                                missing = %missing.join(","),
+                                                "非流式 tool_use 缺必需字段（Bug C）：置失败态，不下发残参"
+                                            );
+                                            completion = CompletionStatus::UpstreamError {
+                                                code: "INVALID_TOOL_INPUT".to_string(),
+                                                message: format!(
+                                                    "工具调用缺少必需参数：{}（模型侧生成异常），请重试。",
+                                                    missing.join("、")
+                                                ),
+                                            };
+                                            continue;
                                         }
                                     }
                                 }
@@ -7245,6 +7275,36 @@ pub(crate) mod error_translation_tests {
         assert!(
             sibling.contains(def.as_str()),
             "共享 decode helper 必须定义在 handlers_dispatch.rs"
+        );
+    }
+
+    #[test]
+    fn nonstream_must_run_bug_c_before_outbound_map() {
+        let handlers = include_str!("handlers.rs");
+        let cut = handlers.find("#[cfg(test)]").unwrap_or(handlers.len());
+        let prod = &handlers[..cut];
+        fn slice_fn<'a>(src: &'a str, sig: &str) -> &'a str {
+            let start = src.find(sig).unwrap_or_else(|| panic!("{sig} 必须存在"));
+            let rest = &src[start..];
+            let end = rest.find("\n}\n").unwrap_or(rest.len());
+            &rest[..end]
+        }
+        let nonstream = slice_fn(prod, "fn handle_non_stream_request(");
+        let bug_c = format!("{}{}", "missing_required", "_keys(");
+        let map_fn = format!("{}{}", "map_tool_input_from", "_kiro(");
+        let bug_c_at = nonstream
+            .find(&bug_c)
+            .expect("非流式必须调用 missing_required_keys（Bug C）");
+        let map_at = nonstream
+            .find(&map_fn)
+            .expect("非流式仍须出站 map_tool_input_from_kiro");
+        assert!(
+            bug_c_at < map_at,
+            "Bug C 必须在出站还原之前，否则 Write 的 file_path 会对 path/text 假阳性"
+        );
+        assert!(
+            nonstream.contains("tool_required_fields"),
+            "非流式签名必须接收 converter 抽出的 required 表，不得再丢弃"
         );
     }
 

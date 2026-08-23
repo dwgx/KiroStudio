@@ -19,11 +19,16 @@ impl super::AdminService {
     /// 本方法包住「load → 逐字段改 → save → reload_config」整段（见
     /// `update_config_locked`）。并发两个 PUT /config 时，若各自 load 后交错 save，
     /// 后完成者会把先完成者的改动整体覆盖（lost update）。持锁串行后互不覆盖。
-    /// 锁内无任何 await（本函数与内部全部是同步调用），`parking_lot::Mutex` 足够。
-    pub fn update_config(
+    /// 锁内无任何 await（校验代理在锁外完成），`parking_lot::Mutex` 足够。
+    pub async fn update_config(
         self: &Arc<Self>,
         req: UpdateConfigRequest,
     ) -> Result<UpdateConfigResponse, AdminServiceError> {
+        if let Some(ref v) = req.proxy_url {
+            crate::common::ssrf::gate_admin_proxy_url(v)
+                .await
+                .map_err(AdminServiceError::InvalidCredential)?;
+        }
         let _guard = self.config_write_lock.lock();
         self.update_config_locked(req)
     }

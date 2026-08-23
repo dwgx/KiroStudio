@@ -359,12 +359,16 @@ pub async fn set_credential_proxy(
     Path(id): Path<u64>,
     Json(payload): Json<SetProxyRequest>,
 ) -> impl IntoResponse {
-    match state.service.set_credential_proxy(
-        id,
-        payload.proxy_url.clone(),
-        payload.proxy_username.clone(),
-        payload.proxy_password.clone(),
-    ) {
+    match state
+        .service
+        .set_credential_proxy(
+            id,
+            payload.proxy_url.clone(),
+            payload.proxy_username.clone(),
+            payload.proxy_password.clone(),
+        )
+        .await
+    {
         Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 代理已更新", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
@@ -478,6 +482,20 @@ pub(super) async fn run_proxy_probe(
     // 拆出干净 URL 与内嵌账密；显式字段优先覆盖内嵌账密。
     let (clean_url, embedded_user, embedded_pass) = split_proxy_credentials(proxy_url);
     let is_direct = clean_url.is_empty() || clean_url.eq_ignore_ascii_case("direct");
+
+    if !is_direct {
+        if let Err(e) = crate::common::ssrf::validate_proxy_address(&clean_url).await {
+            return ProxyTestResponse {
+                ok: false,
+                latency_ms: started.elapsed().as_millis() as u64,
+                exit_ip: None,
+                error: Some(format!(
+                    "{}: {e}",
+                    crate::common::ssrf::PROXY_ADDRESS_REJECTED_PREFIX
+                )),
+            };
+        }
+    }
 
     let proxy_config = if is_direct {
         None
@@ -1370,6 +1388,7 @@ pub async fn start_social_login(
     match state
         .service
         .start_social_login(payload.priority, payload.proxy_url)
+        .await
     {
         Ok(result) => Json(StartSocialLoginResponse {
             session_id: result.session_id,
@@ -1593,11 +1612,15 @@ pub async fn start_external_idp_login(
     State(state): State<AdminState>,
     Json(payload): Json<StartExternalIdpLoginRequest>,
 ) -> impl IntoResponse {
-    match state.service.start_external_idp_login(
-        payload.priority,
-        payload.proxy_url,
-        payload.region,
-    ) {
+    match state
+        .service
+        .start_external_idp_login(
+            payload.priority,
+            payload.proxy_url,
+            payload.region,
+        )
+        .await
+    {
         Ok(result) => Json(serde_json::json!({
             "sessionId": result.session_id,
             "signinUrl": result.signin_url,
@@ -1840,7 +1863,7 @@ pub async fn update_config(
     State(state): State<AdminState>,
     Json(payload): Json<super::types::UpdateConfigRequest>,
 ) -> impl IntoResponse {
-    match state.service.update_config(payload) {
+    match state.service.update_config(payload).await {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
@@ -1861,7 +1884,7 @@ pub async fn import_config(
     State(state): State<AdminState>,
     Json(payload): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    match state.service.import_config(payload) {
+    match state.service.import_config(payload).await {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
