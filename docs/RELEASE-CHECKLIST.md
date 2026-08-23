@@ -3,9 +3,9 @@
 > 2026-08-21. 本文件是「可以打下一个 tag」的标准，不是授权去打。
 > 打 tag / 推 origin / 动 Homecloud 必须 Owner 点名。
 
-当前产品树：脏 `59744cb` + quality-up 抽取 + 2026-08-21 P0/P1/P2。
-公开 Latest 仍是 **v1.1.2**（`5f20596`）。下一版号未定。
-本机闸门计数以 HANDOFF 为准（曾核 2247 passed）。
+公开 Latest：本窗口目标 **v1.2.1**。v1.2.0（`f6aaf88`）与 v1.1.2（`5f20596`）不要改、不要覆盖。
+本机 master 仍是 `3ae4f03` 脏树（含控制面）；公开 master 是产品 squash。不要 pull origin 进本机 master。
+本机闸门：下一 tag 必须**本窗口**实跑 `cargo test --no-default-features --locked`，禁止用历史计数顶替。脏树最近一次（2026-08-22 窗 3，未发版）**2288 passed**。公开 v1.2.0 发版窗当时是 2275。
 
 ## 硬闸（缺一不可）
 

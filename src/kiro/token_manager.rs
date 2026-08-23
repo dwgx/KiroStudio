@@ -2567,7 +2567,7 @@ impl MultiTokenManager {
     /// * `credentials` - 凭据列表
     /// * `proxy` - 可选的代理配置
     /// * `credentials_path` - 凭据文件路径（用于回写）
-    /// * `is_multiple_format` - 是否为多凭据格式（数组格式才回写）
+    /// * `is_multiple_format` - 历史参数，保留仅为 `new()` 签名兼容；`persist_credentials` 总写数组，本字段不参与落盘判定
     pub fn new(
         config: Config,
         credentials: Vec<KiroCredentials>,
@@ -3749,6 +3749,11 @@ impl MultiTokenManager {
                 }
                 WaitOutcome::Available if race_reselect < MAX_RACE_RESELECT => {
                     race_reselect += 1;
+                    // 有界自旋：第二次起让出调度，避免 custom_api 竞态把当前 worker 打满。
+                    // 不改选号键 / 不等 12-key；只是 Available 空转时的让步。
+                    if race_reselect >= 2 {
+                        tokio::task::yield_now().await;
+                    }
                 }
                 _ => return None,
             }
@@ -6137,7 +6142,7 @@ impl MultiTokenManager {
     /// 返回 `Ok(true)`=真的重写了;`Ok(false)`=单对象(Single)格式,persist 是 no-op(加密对该格式
     /// 不生效)——调用方据此提示用户"当前为单凭据格式,加密未生效"。
     pub fn repersist_secrets(&self) -> anyhow::Result<bool> {
-        // is_multiple_format=false 时 persist_credentials 直接 return Ok(false),加密对其无效。
+        // persist_credentials 总写数组；`is_multiple_format` 是死字段，不再短路加密。
         let wrote = self.persist_credentials()?;
         self.persist_trash()?;
         Ok(wrote)
@@ -8130,13 +8135,31 @@ impl MultiTokenManager {
     ///
     /// 代理**立即生效、无需重启**：provider 每次 acquire 都按 `effective_proxy` 现取现建 client
     /// （见 provider.rs），改到 entry 上即下次请求生效。
-    pub fn set_credential_proxy(
+    ///
+    /// SSRF：新地址在锁外走 `validate_proxy_address`（与 socks 节点 / custom_api base_url
+    /// 同口径）。`direct` / 空 / None 不校验。DNS 失败 fail-open 是该函数既有契约。
+    pub async fn set_credential_proxy(
         &self,
         id: u64,
         proxy_url: Option<String>,
         proxy_username: Option<String>,
         proxy_password: Option<String>,
     ) -> anyhow::Result<()> {
+        if let Some(raw) = proxy_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if !raw.eq_ignore_ascii_case("direct") {
+                let (clean, _, _) = crate::http_client::split_proxy_credentials(raw);
+                if !clean.is_empty() && !clean.eq_ignore_ascii_case("direct") {
+                    crate::common::ssrf::validate_proxy_address(&clean)
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "{}: {e}",
+                                crate::common::ssrf::PROXY_ADDRESS_REJECTED_PREFIX
+                            )
+                        })?;
+                }
+            }
+        }
         {
             let mut entries = self.entries.lock();
             let entry = entries

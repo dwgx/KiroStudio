@@ -2,6 +2,17 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [1.2.1] - 2026-08-23 - Bug C 空块 / 空 assembled / websearch 名 / 代理写入闸
+
+相对 tag v1.2.0 / `f6aaf88`。`cargo test --no-default-features --locked`：**2288 passed; 0 failed**。未改 12 键、absorb 顺序、AIMD、sticky。未做真实 Write 上号烟测（缺可用号）。
+
+- Bug C 重组缺参：不再下发空 `tool_use` start/stop；判缺在 SSE 之前。
+- 流式空 `assembled` 收成 `{}` 再判缺，会置 `INVALID_TOOL_INPUT`。
+- websearch 跳过认 `web_search` 或 `WebSearch`；非搜索缺参走 `INVALID_TOOL_INPUT`。
+- `gate_admin_proxy_url`：上号 / Social·IdC·ExternalIdP start / 全局 `proxyUrl` / 配置导入；后台 `probe_socks_node` 复验。凭据卡与 `/proxy/test` 仍走同一套校验。
+- `provider.rs` 测试 `#[path]` 外提到 `provider_tests.rs`；丢弃内联 thinking 后计 `output_tokens`。
+- 不覆盖 tag v1.2.0 / v1.1.2。
+
 ## [1.2.0] - 2026-08-21 - quality-up 抽取 + P0–P2 + D/E/F/G
 
 相对 tag v1.1.2 / `5f20596`。`cargo test --no-default-features`：**2275 passed; 0 failed**。选号 12 键语义未改。absorb 循环顺序未改。

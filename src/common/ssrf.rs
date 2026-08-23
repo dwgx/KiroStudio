@@ -419,15 +419,16 @@ pub async fn validate_outbound_url_with(
 ///    但那个函数的 fail-open 有「出站禁重定向」兜底，代理隧道**没有**对应兜底。
 /// 2. **不在使用时复验**。入表时解析到公网、之后 DNS 重指到内网（短 TTL / DNS 重绑定），
 ///    reqwest 每次连接自行解析，没有 `resolve_to_addrs` 固定，于是照走内网。
-/// 3. **旁路存在**：`set_credential_proxy` 与 `/proxy/test` 都不做任何地址校验，
-///    同一个内网地址从那两条路进来不受本函数管辖。
+/// 3. **管理员写入与测活同校验**：`set_credential_proxy`、`/proxy/test`、上号
+///    `proxyUrl`、登录自定义代理、全局 `proxyUrl`、配置导入、后台节点探测
+///    都调用本函数（`direct`/空跳过）。DNS 失败仍 fail-open；使用时仍不复验。
 ///
-/// 所以本函数的定位是**降低误配概率**（管理员手滑填了 `127.0.0.1`），
-/// 不是安全边界。要真正封住需要：使用时复验 + 固定解析结果 + 覆盖另两条入口。
+/// 所以本函数的定位是**降低误配概率**（管理员手滑填了内网字面量），
+/// 不是安全边界。要真正封住需要：使用时复验 + 固定解析结果。
 ///
 /// 之所以仍然拦：节点地址会被写进凭据并在请求热路径上使用，
-/// 允许 `socks5://127.0.0.1:x` 等于把网关变成一个可被指使的内网探测器
-/// （逐个试 `socks5://10.0.0.x:port`，靠测速的成功/失败与延迟当信号）。
+/// 允许 `socks5://192.168.x.x` 等于把网关变成一个可被指使的内网探测器
+/// （逐个试端口，靠测速的成功/失败与延迟当信号）。字面量环回按 AdminConfigured 放行。
 ///
 /// # 策略：[`SsrfPolicy::AdminConfigured`]（与 custom_api base_url 同口径）
 ///
@@ -466,6 +467,27 @@ pub async fn validate_proxy_address(url: &str) -> Result<(), String> {
         }
         Err(_) => Ok(()),
     }
+}
+
+/// 管理员写入路径拒绝代理时的稳定前缀。AdminService 用它把 SSRF 映射成 400，
+/// 不要改成不含该字面量的句子（改了 `set_credential_proxy` 会落到 500）。
+pub const PROXY_ADDRESS_REJECTED_PREFIX: &str = "代理地址被拒绝";
+
+/// 管理员写入路径：空 / `direct`（ASCII 大小写不敏感）跳过；否则拆账密后校验干净 URL。
+///
+/// 错误串前缀固定 [`PROXY_ADDRESS_REJECTED_PREFIX`]，供 AdminService 映射 400 `InvalidCredential`。
+pub async fn gate_admin_proxy_url(raw: &str) -> Result<(), String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("direct") {
+        return Ok(());
+    }
+    let (clean, _, _) = crate::http_client::split_proxy_credentials(trimmed);
+    if clean.is_empty() || clean.eq_ignore_ascii_case("direct") {
+        return Ok(());
+    }
+    validate_proxy_address(&clean)
+        .await
+        .map_err(|e| format!("{}: {e}", PROXY_ADDRESS_REJECTED_PREFIX))
 }
 
 /// 校验一个出站 URL 并构造「已固定 DNS + 禁重定向」的安全 reqwest 客户端。
@@ -552,6 +574,8 @@ mod tests {
             "https://node.invalid:443",
             // fake-IP 池段：AdminConfigured 下唯一被豁免的禁止段。
             "socks5://198.18.0.46:40002",
+            // 字面量环回：本机 v2rayN / ssh -D。AdminConfigured 放行；RFC1918 仍拒。
+            "socks5://127.0.0.1:1080",
         ] {
             assert!(
                 validate_proxy_address(ok).await.is_ok(),
@@ -571,8 +595,9 @@ mod tests {
     ///
     /// 这条同时是策略豁免范围的边界断言：`AdminConfigured` 只放开
     /// 198.18.0.0/15（见上一条测试），**其余禁止段一个都没放开**。
-    /// 逐条按 `is_forbidden_ip_with` 的实际判据挑：环回 / RFC1918 两段 / CGNAT /
-    /// 链路本地(含云元数据) / 文档段 / IPv6 环回 / ULA / 6to4 内嵌元数据地址。
+    /// 逐条按 `is_forbidden_ip_with` 的实际判据挑：RFC1918 两段 / CGNAT /
+    /// 链路本地(含云元数据) / 文档段 / ULA / 6to4 内嵌元数据地址。
+    /// **不含**字面量环回：`AdminConfigured` 放行 `127.0.0.0/8` 与 `::1`（见接受测）。
     ///
     /// ⚠️ 这条只覆盖字面量。域名走 DNS 失败分支时是**放行**的，
     /// 且没有使用时复验 —— 见 `validate_proxy_address` 的「这不是 fail-closed」一节。
@@ -597,7 +622,7 @@ mod tests {
         ] {
             assert!(
                 validate_proxy_address(bad).await.is_err(),
-                "{bad} 指向内网/环回/保留段，AdminConfigured 下必须仍然拒绝"
+                "{bad} 指向内网/保留段，AdminConfigured 下必须仍然拒绝（字面量环回另测放行）"
             );
         }
     }

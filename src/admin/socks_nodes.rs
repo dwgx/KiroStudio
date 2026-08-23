@@ -141,6 +141,12 @@ impl super::AdminService {
         if clean_url.is_empty() || clean_url.eq_ignore_ascii_case("direct") {
             return fail("节点地址无效（直连形态，后台调度拒绝探测）".into());
         }
+        if let Err(e) = crate::common::ssrf::validate_proxy_address(&clean_url).await {
+            return fail(format!(
+                "{}: {e}",
+                crate::common::ssrf::PROXY_ADDRESS_REJECTED_PREFIX
+            ));
+        }
         let username = username.filter(|s| !s.trim().is_empty()).or(embedded_user);
         let password = password.filter(|s| !s.is_empty()).or(embedded_pass);
         let mut cfg = ProxyConfig::new(clean_url);
@@ -583,14 +589,10 @@ impl super::AdminService {
                 }
             };
 
-        // 拦内网/环回：节点地址会被写进凭据并在热路径上使用。
+        // 拦内网：节点地址会被写进凭据并在热路径上使用。
         // 策略是 SsrfPolicy::AdminConfigured（与 custom_api base_url 同口径）：管理员亲手填的
-        // 目标，只放开 198.18.0.0/15 那一段 —— 那是 Clash/Mihomo 的 fake-IP 池默认段，
-        // 用 Strict 会让开了 fake-IP 的机器一个域名形式的节点都加不进来。
-        // ⚠️ 环回与 RFC1918 **仍然被拒**（本机 ssh -D 隧道 / 局域网旁车加不进来），
-        // 这是当前的已知限制，不是 AdminConfigured 能解决的 —— 见 validate_proxy_address 文档。
-        // ⚠️ 这**不是**安全边界（DNS 失败放行、不在使用时复验、且 set_credential_proxy
-        // 与 /proxy/test 两条旁路完全不校验）—— 见 validate_proxy_address 的文档。
+        // 目标，放开 198.18.0.0/15（Clash/Mihomo fake-IP 池）与**字面量环回**（本机 ssh -D）。
+        // RFC1918 / 元数据仍然被拒。这不是绝对安全边界（DNS 失败放行、不在使用时复验）。
         crate::common::ssrf::validate_proxy_address(&clean_url)
             .await
             .map_err(AdminServiceError::InvalidCredential)?;

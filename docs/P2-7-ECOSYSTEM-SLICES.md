@@ -1,5 +1,7 @@
 # P2-7 生态四点 — 切片设计（2026-08-21）
 
+> **2026-08-22：** §1 OpenAI 会话头、§2 透传池 `support_rank`、§4 GPT `reasoning.effort` 已在公开 **v1.2.0**（Wave F / P2-7）落地。§3 客户端 Key **仍冻结**。下文「另波 / 本波可做」是当时设计稿，不要把 1/2/4 当未做。
+
 对照 ZyphrZero/kiro.rs v0.7.6 / ISSUES (d)。本页是设计，不是发版授权。
 12 键选号元组、absorb 循环顺序、AIMD、sticky 语义本切片不改。
 

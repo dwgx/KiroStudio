@@ -34,7 +34,7 @@ export function ProxyTestButton({
     // 说明：阻止冒泡/默认提交在 onClick 里完成（见下），此处只负责测活逻辑。
     const url = proxyUrl.trim()
     const pendingToast = toast.loading(
-      url && url !== 'direct'
+      url && url.toLowerCase() !== 'direct'
         ? t('proxytestbutton.toast.testingProxy')
         : t('proxytestbutton.toast.testingDirect'),
     )
