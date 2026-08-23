@@ -1,7 +1,7 @@
-# QUOTA_EXHAUSTED_ALL → 402 改造设计（研究结论，未改代码）
+# QUOTA_EXHAUSTED_ALL → 402 改造设计（研究结论）
 
-> 状态：**研究完成（2026-08-15），结论 = 条件做（推荐做，小改）**。本文档只研究 + 产方案。
-> **实施状态：未实施**（跨月恢复已做 W5；402 配套随 ISSUES (d) 排序，待 owner 排期）。
+> **2026-08-22：已做（波次 G / 公开 v1.2.0）。** 402 + `billing_error` 全池配额出口已在活代码。
+> 下文「实施状态：未实施」是 2026-08-15 研究稿，不要当未做。关联 `.opencode/ISSUES.md (d)` 已 supersede。
 > 关联：`.opencode/ISSUES.md (d)`「QUOTA_EXHAUSTED_ALL→402（k2cc）」条目——该条目原登记「绑定跨月恢复决策」，
 > 跨月恢复已做（W5，token_manager.rs:6445-6500），本文件评估 402 配套改造。
 > 判据体系同构声明（ISSUES 原话）：我们 `quota_exhausted_all=1` 与 k2cc `QUOTA_EXHAUSTED_ALL_MARKER` 语义同构

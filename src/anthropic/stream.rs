@@ -803,19 +803,17 @@ pub struct StreamContext {
     /// 值是**还原后**的客户端名，且只在工具名被缩短时才记录（未缩短的不入表）。
     /// 本表无条件记录、口径与 [`Self::tool_required_fields`] 一致，故单独一张。
     tool_block_names: HashMap<i32, String>,
-    /// 每个工具的**必需参数名**（来自客户端请求里 `tools[].input_schema.required`）。
+    /// 每个工具的**必需参数名**（来自 `convert_tools` **之后**的 schema `required`）。
     ///
     /// 用于 **Bug C** 校验：`tool_use` 的参数 JSON **完全合法但缺必需字段**
-    /// （典型：`Bash` 只给了 `description` 却没有 `command`）。这一类既不是 Bug A
+    /// （典型：`execute_bash` 只给了 `description` 却没有 `command`）。这一类既不是 Bug A
     /// （JSON 语法坏，`tool_repair_json` 能修）也不是 Bug B（连 tool_use 块都没吐，
     /// 网关碰不到），此前一直落在两者之间的盲区 —— 客户端拿到合法 JSON 后按 schema
     /// 校验失败，报 `The required parameter 'X' is missing`。
     ///
-    /// 网关**手里就有 schema**（客户端请求里带的 `tools[].input_schema`），此前它只被
-    /// 用来数 token（`token.rs`）与 OpenAI 层归一化，从未用于校验模型吐出的参数。
-    ///
-    /// 空表 = 不校验（未设置 / 无工具 / WebSearch 类工具无 `input_schema`）。
-    /// key 用**模型看到的名字**（即可能被 `map_tool_name` 缩短过的短名），与
+    /// 内置工具走 Kiro schema（`fs_write` → `path`/`text`，不是客户端 `file_path`/`content`）。
+    /// 空表 = 不校验（未设置 / 无工具 / required 为空）。
+    /// key 用**发给模型的名字**（含 `map_tool_name` 缩短后的短名），与
     /// `known_tool_names` 同口径，这样校验时无需再做名字还原。
     tool_required_fields: HashMap<String, Vec<String>>,
     /// invoke 嗅探缓冲:文本先进这里,决策安全(完整块过四道门 / 确认非泄漏)后才释放。跨 chunk 累积。
@@ -1709,16 +1707,15 @@ impl StreamContext {
         }
         let content = content.as_str();
 
-        // 估算 tokens。⚠️ 这是嗅探路径（thinking_enabled）**唯一的** output_tokens 累计点：
-        // 所有进 thinking_buffer 的内容（含内联 `<thinking>` 块）都来自本函数入参，
-        // 在 `process_content_with_thinking` 等提取/下发处**不重复累计** —— 否则 thinking
-        // 文本被计两次（整块 + 提取处），output_tokens 虚高、`is_empty_response` 的近空
-        // 判定随之失效。结构化 reasoning 流（`process_reasoning_content`）不经过本函数，
-        // 在它自己的下发点计一次（互不重复）。
-        self.output_tokens += estimate_tokens(content);
-
         // 如果启用了thinking，需要处理thinking块
         if self.thinking_enabled {
+            // 估算 tokens。⚠️ 这是嗅探路径（thinking_enabled）**唯一的** output_tokens 累计点：
+            // 所有进 thinking_buffer 的内容（含内联 `<thinking>` 块）都来自本函数入参，
+            // 在 `process_content_with_thinking` 等提取/下发处**不重复累计** —— 否则 thinking
+            // 文本被计两次（整块 + 提取处），output_tokens 虚高、`is_empty_response` 的近空
+            // 判定随之失效。结构化 reasoning 流（`process_reasoning_content`）不经过本函数，
+            // 在它自己的下发点计一次（互不重复）。
+            self.output_tokens += estimate_tokens(content);
             // ⭐ E1 关键约束：**结构化 reasoning 流与文本嗅探必须互斥**。
             //
             // 结构化 reasoning 无终止帧，真实形态是「N 帧 reasoning → 普通正文（无标签）」。
@@ -1746,6 +1743,9 @@ impl StreamContext {
         if stripped.is_empty() {
             return Vec::new();
         }
+        // !thinking_enabled：只计剥掉 thinking 之后真下发的正文。入口整块累计会把丢弃的
+        // 内联思考算进 output_tokens，近空判定漂移；结构化帧丢弃路径不计，两形态必须同口径。
+        self.output_tokens += estimate_tokens(&stripped);
         let content = stripped.as_str();
 
         // 文本化 invoke 重组(开关开且本次请求带了工具):文本先进 sniff 缓冲,决策安全后才释放
@@ -2118,7 +2118,44 @@ impl StreamContext {
     /// (content_block_start type:tool_use → input_json_delta → content_block_stop)。
     /// set_has_tool_use(true) → get_stop_reason 自然返回 tool_use(不用 borrow-retry,就地修复)。
     /// 工具名经 tool_name_map 还原(超长名缩短过的还原回客户端原名)。
+    ///
+    /// 与 `process_tool_use` stop **同口径**：Bug C 在出站还原之前对 **Kiro 形态**
+    /// 校验；映射过的工具再 `map_tool_input_from_kiro`。旧实现只还原名字、参数原文
+    /// 下发，默认 mapping 下 `fs_write`+`path/text` 会以 Write 名 + Kiro 键交给客户端。
     fn synthesize_tool_use(&mut self, parsed_name: String, input_json: String) -> Vec<SseEvent> {
+        // 空串当 `{}`：与非流式 / websearch 同口径。否则 from_str 失败，Bug C 空操作。
+        let kiro_assembled = if input_json.trim().is_empty() {
+            "{}".to_string()
+        } else {
+            input_json
+        };
+
+        // Bug C 必须在任何 SSE / has_tool_use / 重组计数之前。miss 时整块不发，
+        // 避免客户端把 start 里的空 input 当成功 Write 执行。
+        if super::handlers::tool_stream_align_failure_enabled()
+            && self.completion.is_ok()
+            && !self.tool_required_fields.is_empty()
+        {
+            if let Some(required) = self.tool_required_fields.get(&parsed_name) {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&kiro_assembled) {
+                    if let Some(missing) = missing_required_keys(&value, required) {
+                        tracing::warn!(
+                            missing = %missing.join(","),
+                            "重组 tool_use 缺必需字段（Bug C）：置失败态，不下发空块"
+                        );
+                        self.completion = CompletionStatus::UpstreamError {
+                            code: "INVALID_TOOL_INPUT".to_string(),
+                            message: format!(
+                                "工具调用缺少必需参数：{}（模型侧生成异常），请重试。",
+                                missing.join("、")
+                            ),
+                        };
+                        return Vec::new();
+                    }
+                }
+            }
+        }
+
         let mut events = Vec::new();
         self.state_manager.set_has_tool_use(true);
         self.saw_tool_stop = true;
@@ -2128,11 +2165,19 @@ impl StreamContext {
         let tool_use_id = format!("toolu_{}", Uuid::new_v4().to_string().replace('-', ""));
         self.tool_block_indices
             .insert(tool_use_id.clone(), block_index);
+        // Bug C 表 key = 发给模型的名字（与 known_tool_names / tool_required_fields 同口径）。
+        self.tool_block_names
+            .insert(block_index, parsed_name.clone());
+        let mapped = self.tool_name_map.contains_key(&parsed_name);
         let name = self
             .tool_name_map
             .get(&parsed_name)
             .cloned()
             .unwrap_or(parsed_name);
+        if mapped {
+            self.tool_use_names
+                .insert(tool_use_id.clone(), name.clone());
+        }
         events.extend(self.state_manager.handle_content_block_start(
             block_index,
             "tool_use",
@@ -2142,12 +2187,19 @@ impl StreamContext {
                 "content_block": { "type": "tool_use", "id": tool_use_id, "name": name, "input": {} }
             }),
         ));
+        let mut assembled = kiro_assembled;
+        if mapped {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&assembled) {
+                assembled = crate::anthropic::converter::map_tool_input_from_kiro(&name, value)
+                    .to_string();
+            }
+        }
         if let Some(d) = self.state_manager.handle_content_block_delta(
             block_index,
             json!({
                 "type": "content_block_delta",
                 "index": block_index,
-                "delta": { "type": "input_json_delta", "partial_json": input_json }
+                "delta": { "type": "input_json_delta", "partial_json": assembled }
             }),
         ) {
             events.push(d);
@@ -2926,7 +2978,7 @@ impl StreamContext {
     /// 1. 这个 block 不是工具块（`tool_block_names` 无记录）—— 文本块无参数可校验；
     /// 2. 该工具没有必需参数（`tool_required_fields` 无记录）—— 包括 WebSearch 类
     ///    （它们没有 `input_schema`）与 `required` 为空的工具；
-    /// 3. `assembled` 不是合法 JSON —— 那是 Bug A 的地盘，已由上游 repair 层处理过；
+    /// 3. `assembled` 不是合法 JSON（空串除外，空串当 `{}`）—— 那是 Bug A 的地盘；
     /// 4. 顶层不是 object —— `required` 描述顶层属性，数组/标量形态不在本判据范围；
     /// 5. 所有必需字段都在 —— 正常路径。
     ///
@@ -2940,18 +2992,16 @@ impl StreamContext {
     ) -> Option<Vec<String>> {
         let tool_name = self.tool_block_names.get(&block_index)?;
         let required = self.tool_required_fields.get(tool_name)?;
-        let value: serde_json::Value = serde_json::from_str(assembled).ok()?;
-        let obj = value.as_object()?;
-        let missing: Vec<String> = required
-            .iter()
-            .filter(|k| !obj.contains_key(k.as_str()))
-            .cloned()
-            .collect();
-        if missing.is_empty() {
-            None
+        // 空串不是合法 JSON，但语义是「没给任何键」= 空对象。非流式 / websearch
+        // 已经先收成 `{}`；这里对齐，否则 stop 无 input 帧时 Bug C 空操作，客户端
+        // 保住 start 里的 `{}` 且不置 INVALID_TOOL_INPUT。
+        let json = if assembled.trim().is_empty() {
+            "{}"
         } else {
-            Some(missing)
-        }
+            assembled
+        };
+        let value: serde_json::Value = serde_json::from_str(json).ok()?;
+        missing_required_keys(&value, required)
     }
 
     /// Bug C 闸门：对 **Kiro 形态** assembled 判缺。
@@ -4028,6 +4078,27 @@ fn repair_json_glued(s: &str) -> Option<String> {
         return serde_json::to_string(&v).ok();
     }
     None
+}
+
+/// Bug C 键存在性：顶层 object 缺 `required` 中的键则返回缺失列表。
+///
+/// 非法 JSON 由调用方先 `from_str`；本函数对非 object / 无缺失返回 `None`。
+/// 显式 `null` 算存在。流式 stop / 重组 / 非流式共用，禁止再抄一份过滤循环。
+pub(crate) fn missing_required_keys(
+    value: &serde_json::Value,
+    required: &[String],
+) -> Option<Vec<String>> {
+    let obj = value.as_object()?;
+    let missing: Vec<String> = required
+        .iter()
+        .filter(|k| !obj.contains_key(k.as_str()))
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        None
+    } else {
+        Some(missing)
+    }
 }
 
 /// JSON 字符级修复：状态机扫描，**只修字符串字面量内部**的非法字符，结构字符（`{}[]:,` 等）原样保留。

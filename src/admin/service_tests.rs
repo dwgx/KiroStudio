@@ -511,7 +511,7 @@ mod multi_open_copies_tests {
         let src = concat!(include_str!("config_update.rs"), include_str!("service.rs"));
         // 显式截断测试段：否则本测试自身的字面量会让 split 命中测试代码
         // （本文件已因这类原因出过一次「守卫静默变绿」）。
-        let needle_fn = format!("pub fn update{}", "_config");
+        let needle_fn = format!("pub async fn update{}", "_config");
         let update_fn = src
             .split(needle_fn.as_str())
             .nth(1)
@@ -576,7 +576,7 @@ mod absorb_hot_reload_tests {
         // 截断 —— 绿是**巧合**（依赖测试段里存在该字面量），删掉那个字面量 update_fn
         // 会延伸到文件末尾、把本测试断言行的 `absorb_changed = true` 字面量数进去 →
         // 计数 11 ≠ 10 误红。显式截断 + needle 运行时拼接后语义与位置无关。
-        let needle_fn = format!("pub fn update{}", "_config");
+        let needle_fn = format!("pub async fn update{}", "_config");
         let update_fn = src
             .split(needle_fn.as_str())
             .nth(1)
@@ -1996,6 +1996,122 @@ mod balance_cache_tests {
         assert_eq!(svc.list_socks_nodes().len(), 1);
     }
 
+    /// 凭据卡上填代理必须过 `validate_proxy_address`（与节点表同口径）。
+    /// RFC1918 字面量拒绝；`.invalid` DNS 失败 fail-open（既有契约）；`direct` 不校验。
+    #[tokio::test]
+    async fn set_credential_proxy_rejects_rfc1918_and_allows_direct() {
+        let svc = mk_service_with_one_credential();
+        let err = svc
+            .set_credential_proxy(1, Some("socks5://192.168.1.1:1080".into()), None, None)
+            .await
+            .expect_err("RFC1918 代理必须拒绝");
+        assert!(
+            matches!(err, AdminServiceError::InvalidCredential(_)),
+            "SSRF 必须是 400 InvalidCredential，不得 500，got {err:?}"
+        );
+
+        svc.set_credential_proxy(1, Some("socks5://127.0.0.1:1080".into()), None, None)
+            .await
+            .expect("字面量环回在 AdminConfigured 下必须放行");
+        svc.set_credential_proxy(1, Some("direct".into()), None, None)
+            .await
+            .expect("direct 哨兵不得走 DNS 校验");
+        svc.set_credential_proxy(1, Some("socks5://node.invalid:40002".into()), None, None)
+            .await
+            .expect(".invalid DNS 失败应 fail-open");
+        svc.set_credential_proxy(1, None, None, None)
+            .await
+            .expect("清除代理不得校验");
+    }
+
+    #[tokio::test]
+    async fn add_credential_rejects_rfc1918_proxy() {
+        let svc = mk_service_with_one_credential();
+        let err = svc
+            .add_credential(AddCredentialRequest {
+                auth_method: "api_key".into(),
+                kiro_api_key: Some("ksk_ssrf_rfc1918_unique".into()),
+                proxy_url: Some("socks5://192.168.1.1:1080".into()),
+                ..Default::default()
+            })
+            .await
+            .expect_err("上号 RFC1918 代理必须拒绝");
+        assert!(
+            matches!(err, AdminServiceError::InvalidCredential(_)),
+            "SSRF 必须是 400 InvalidCredential，got {err:?}"
+        );
+        assert_eq!(svc.token_manager.total_count(), 1, "拒代理不得入池");
+    }
+
+    /// 源码守卫：AdminService 与 token_manager 的 set_credential_proxy 必须调用校验。
+    #[test]
+    fn set_credential_proxy_must_call_validate_proxy_address() {
+        let svc = include_str!("service.rs");
+        let tm = include_str!("../kiro/token_manager.rs");
+        let handlers = include_str!("handlers.rs");
+        let cut_svc = svc.find("#[cfg(test)]").unwrap_or(svc.len());
+        let needle = format!("{}{}", "validate_proxy", "_address");
+        fn slice_fn<'a>(src: &'a str, sig: &str) -> &'a str {
+            let start = src.find(sig).unwrap_or_else(|| panic!("{sig} 必须存在"));
+            let rest = &src[start..];
+            let end = rest.find("\n    pub async fn ").or_else(|| rest.find("\n    pub fn ")).unwrap_or(rest.len());
+            let mut cut = end.min(8000);
+            while cut > 0 && !rest.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            &rest[..cut]
+        }
+        let tm_cut = tm.find("#[cfg(test)]").unwrap_or(tm.len());
+        let tm_fn = slice_fn(&tm[..tm_cut], "pub async fn set_credential_proxy(");
+        let probe = slice_fn(handlers, "pub(super) async fn run_proxy_probe(");
+        assert!(
+            tm_fn.contains(&needle),
+            "token_manager::set_credential_proxy 必须调用 validate_proxy_address"
+        );
+        assert!(
+            probe.contains(&needle),
+            "/proxy/test run_proxy_probe 必须调用 validate_proxy_address"
+        );
+        let svc_fn = slice_fn(&svc[..cut_svc], "async fn add_credential_with_intent(");
+        let social = slice_fn(&svc[..cut_svc], "pub async fn start_social_login(");
+        let idc = slice_fn(&svc[..cut_svc], "pub async fn start_idc_login(");
+        let eidp = slice_fn(&svc[..cut_svc], "pub async fn start_external_idp_login(");
+        let import = slice_fn(&svc[..cut_svc], "pub async fn import_config(");
+        let cfg_upd = include_str!("config_update.rs");
+        let update = slice_fn(cfg_upd, "pub async fn update_config(");
+        let gate = format!("{}{}", "gate_admin_proxy", "_url");
+        assert!(
+            svc_fn.contains(&gate),
+            "add_credential_with_intent 必须 gate_admin_proxy_url"
+        );
+        assert!(
+            social.contains(&gate),
+            "start_social_login 必须 gate_admin_proxy_url"
+        );
+        assert!(
+            idc.contains(&gate),
+            "start_idc_login 必须 gate_admin_proxy_url"
+        );
+        assert!(
+            eidp.contains(&gate),
+            "start_external_idp_login 必须 gate_admin_proxy_url"
+        );
+        assert!(
+            import.contains(&gate),
+            "import_config 必须 gate_admin_proxy_url"
+        );
+        assert!(
+            update.contains(&gate),
+            "update_config 必须 gate_admin_proxy_url"
+        );
+        let socks = include_str!("socks_nodes.rs");
+        let probe_bg = slice_fn(socks, "async fn probe_socks_node(");
+        assert!(
+            probe_bg.contains(&needle),
+            "probe_socks_node 必须调用 validate_proxy_address"
+        );
+    }
+
     /// 删节点**不动**已绑该节点的凭据（删一个节点不该让一批分身掉线）。
     #[tokio::test]
     async fn deleting_node_leaves_credential_proxy_untouched() {
@@ -2012,6 +2128,7 @@ mod balance_cache_tests {
                 Some("u".into()),
                 Some("p".into()),
             )
+            .await
             .expect("绑定代理");
 
         assert!(svc.delete_socks_node(id).unwrap());
@@ -3553,6 +3670,7 @@ mod balance_cache_tests {
         // 父号 #1 绑上 n1 → n1 的「已绑数」= 1（启发式按 proxy_url 字符串比对）。
         svc.token_manager
             .set_credential_proxy(1, Some(node_url(1)), None, None)
+            .await
             .expect("给父号绑节点应成功");
 
         let mk_test = |ok: bool, latency: u64| crate::kiro::model::socks_node::SocksNodeTest {
@@ -3604,6 +3722,7 @@ mod balance_cache_tests {
         let nodes = seed_nodes(&svc, 2).await;
         svc.token_manager
             .set_credential_proxy(1, Some(node_url(1)), None, None)
+            .await
             .expect("绑节点应成功");
 
         let listed = svc.list_socks_nodes();
@@ -3946,6 +4065,7 @@ mod balance_cache_tests {
         // 父号自己先绑一个节点（面板上"给这一份配个出口"的等价操作）。
         svc.token_manager
             .set_credential_proxy(1, Some(node_url(0)), None, None)
+            .await
             .expect("给父号绑节点应成功");
         assert_eq!(nodes.len(), 3);
 
@@ -5238,7 +5358,7 @@ mod config_write_tests {
         );
 
         // update_config 包装函数：持锁在委托调用之前
-        let update_fn = format!("pub fn update_config{}", "(");
+        let update_fn = format!("pub async fn update_config{}", "(");
         let uf = prod
             .find(&update_fn)
             .expect("update_config 包装函数不该被改名");
@@ -5257,7 +5377,7 @@ mod config_write_tests {
         assert!(li < ci, "持锁必须在委托调用之前，否则保护不到临界区");
 
         // import_config：持锁在写盘之前
-        let import_fn = format!("pub fn import_config{}", "(");
+        let import_fn = format!("pub async fn import_config{}", "(");
         let ii = prod
             .find(&import_fn)
             .expect("import_config 不该被改名");
@@ -5433,6 +5553,7 @@ mod config_write_tests {
                 "host": "imported.example.com",
                 "port": 8080,
             }))
+            .await
             .expect("合法导入必须成功（config_path 从 token_manager 继承）");
         assert!(resp.success);
 
@@ -5453,8 +5574,8 @@ mod config_write_tests {
     }
 
     /// 非法 payload / 缺路径失败时不得轮换 .bak（rotate 只在校验全过且路径已回填之后）。
-    #[test]
-    fn import_config_invalid_payload_does_not_rotate_backup() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn import_config_invalid_payload_does_not_rotate_backup() {
         let dir = TempDir(std::env::temp_dir().join(format!(
             "ks_imp_norot_{}",
             uuid::Uuid::new_v4()
@@ -5482,6 +5603,7 @@ mod config_write_tests {
         for payload in cases {
             let err = svc
                 .import_config(payload)
+                .await
                 .expect_err("非法 payload 必须拒绝");
             assert!(
                 matches!(err, AdminServiceError::InvalidCredential(_)),
@@ -5513,6 +5635,7 @@ mod config_write_tests {
         let no_path = Arc::new(AdminService::new(tm, Vec::<String>::new()));
         let err = no_path
             .import_config(serde_json::json!({ "host": "h1", "port": 8080 }))
+            .await
             .expect_err("缺路径必须拒绝");
         assert!(
             matches!(err, AdminServiceError::InternalError(_)),
@@ -5562,8 +5685,8 @@ mod config_write_tests {
     }
 
     /// P1-8：`update_config` 写入时拆内嵌账密（与凭据上号同口径）。
-    #[test]
-    fn update_config_splits_proxy_url_embedded_credentials() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_config_splits_proxy_url_embedded_credentials() {
         let password = format!("pxy-Pw-{}", "9f3e7a1c");
         let dir = TempDir(std::env::temp_dir().join(format!(
             "ks_upd_proxy_{}",
@@ -5576,6 +5699,7 @@ mod config_write_tests {
                 proxy_url: Some(format!("socks5://alice:{password}@127.0.0.1:1080")),
                 ..Default::default()
             })
+            .await
             .expect("写入带 userinfo 的 proxyUrl 必须成功");
         assert!(resp.restart_required);
         for field in ["proxyUrl", "proxyUsername", "proxyPassword"] {
@@ -5644,8 +5768,8 @@ mod config_write_tests {
     ///
     /// 回退即 FAIL：把任一字段的写盘漏掉（「存了盘但读旧值」那类接线缺陷），
     /// 或 restart_fields 不按提交顺序 push（面板展示顺序错乱）。
-    #[test]
-    fn update_config_restart_fields_accumulate_and_unsubmitted_fields_preserved() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_config_restart_fields_accumulate_and_unsubmitted_fields_preserved() {
         let dir = TempDir(std::env::temp_dir().join(format!(
             "ks_upd_restart_{}",
             uuid::Uuid::new_v4()
@@ -5662,6 +5786,7 @@ mod config_write_tests {
                 port: Some(9090),
                 ..Default::default()
             })
+            .await
             .expect("改 host+port 应成功");
 
         assert!(resp.restart_required, "host/port 都是重启字段");
@@ -5693,8 +5818,8 @@ mod config_write_tests {
     ///
     /// 回退即 FAIL：把任一校验挪到 save 之后（拒绝但已落盘），或删掉任一校验，
     /// 对应断言失败。
-    #[test]
-    fn update_config_rejects_invalid_values_without_touching_disk() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_config_rejects_invalid_values_without_touching_disk() {
         let dir = TempDir(std::env::temp_dir().join(format!(
             "ks_upd_reject_{}",
             uuid::Uuid::new_v4()
@@ -5726,6 +5851,7 @@ mod config_write_tests {
         for req in cases {
             let err = svc
                 .update_config(req)
+                .await
                 .expect_err("非法值必须整单拒绝");
             assert!(
                 matches!(err, AdminServiceError::InvalidCredential(_)),
@@ -5744,8 +5870,8 @@ mod config_write_tests {
     /// 用透传模拟缓存（TIER3 + setter 镜像）与吸收层开关（无 setter、只靠 reload_config
     /// 的 OR 链）各代表一类：两类都必须回「立即生效」——回「需重启」就是把热更字段
     /// 误分类的接线缺陷。
-    #[test]
-    fn update_config_hot_fields_report_immediate_effect_without_restart() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_config_hot_fields_report_immediate_effect_without_restart() {
         let dir = TempDir(std::env::temp_dir().join(format!(
             "ks_upd_hot_{}",
             uuid::Uuid::new_v4()
@@ -5761,6 +5887,7 @@ mod config_write_tests {
                 upstream_retry_absorb_enabled: Some(true),
                 ..Default::default()
             })
+            .await
             .expect("热更字段应成功");
         assert!(!resp.restart_required, "热更字段不得要求重启");
         assert!(resp.restart_fields.is_empty());
@@ -5783,8 +5910,8 @@ mod config_write_tests {
     /// ⚠️ auth_keys 是进程级全局 cell：本用例必须持 `auth_keys::test_serial()` 全程，
     /// 否则并行的其他用例（构造 AppState/AdminState 或改 key）会覆写同一份全局状态。
     /// 先播旧 key 模拟 main.rs 启动播种，再经 update_config 轮换 → 断言旧失效/新生效。
-    #[test]
-    fn update_config_user_key_hot_swaps_without_restart() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_config_user_key_hot_swaps_without_restart() {
         let _g = crate::common::auth_keys::test_serial();
         crate::common::auth_keys::set_user_key("sk-old")
             .expect("启动播种（模拟 main.rs）不应失败");
@@ -5805,6 +5932,7 @@ mod config_write_tests {
                 api_key: Some("sk-new".to_string()),
                 ..Default::default()
             })
+            .await
             .expect("轮换 apiKey 应成功");
         assert!(!resp.restart_required, "apiKey 轮换不得要求重启");
         assert!(resp.restart_fields.is_empty(), "apiKey 不再进 restart_fields");
@@ -5832,8 +5960,8 @@ mod config_write_tests {
     ///
     /// 语义上 admin key 是**新字段**（此前 UpdateConfigRequest 根本没有它，只能手改
     /// config.json + 重启）；现在走与 userKey 同款 setter 热更。自锁风险见字段注释。
-    #[test]
-    fn update_config_admin_key_hot_swaps_without_restart() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_config_admin_key_hot_swaps_without_restart() {
         let _g = crate::common::auth_keys::test_serial();
         crate::common::auth_keys::set_admin_key("adm-old")
             .expect("启动播种（模拟 main.rs）不应失败");
@@ -5854,6 +5982,7 @@ mod config_write_tests {
                 admin_api_key: Some("adm-new".to_string()),
                 ..Default::default()
             })
+            .await
             .expect("轮换 adminApiKey 应成功");
         assert!(!resp.restart_required, "adminApiKey 轮换不得要求重启");
         assert!(resp.restart_fields.is_empty());
@@ -5877,8 +6006,8 @@ mod config_write_tests {
     ///
     /// 只提交空白 apiKey/adminApiKey 时：不报错、不落盘、鉴权仍走旧 key（绝不清成空串，
     /// 清空 = fail-open 敞口；真正关闭通道的意图在 auth_keys 层由 setter 拒空兜底）。
-    #[test]
-    fn update_config_blank_key_is_ignored_not_wiped() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_config_blank_key_is_ignored_not_wiped() {
         let _g = crate::common::auth_keys::test_serial();
         crate::common::auth_keys::set_user_key("sk-keep")
             .expect("启动播种（模拟 main.rs）不应失败");
@@ -5899,6 +6028,7 @@ mod config_write_tests {
                 admin_api_key: Some("".to_string()),
                 ..Default::default()
             })
+            .await
             .expect("空白 key 应被忽略而非报错");
         assert!(
             resp.message.contains("无改动"),
@@ -5926,8 +6056,8 @@ mod config_write_tests {
     /// mock_cache_enabled（TIER3 热字段 → 触发 reload_config）同批改 apiKey，
     /// 断言 reload 后 auth_keys 仍是新值：若有人把 setter 挪到 reload 之前或删了接线，
     /// 这里会当场红。
-    #[test]
-    fn update_config_key_survives_batched_hot_reload() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_config_key_survives_batched_hot_reload() {
         let _g = crate::common::auth_keys::test_serial();
         crate::common::auth_keys::set_user_key("sk-old")
             .expect("启动播种（模拟 main.rs）不应失败");
@@ -5947,6 +6077,7 @@ mod config_write_tests {
                 mock_cache_enabled: Some(true),
                 ..Default::default()
             })
+            .await
             .expect("key + 热字段同批应成功");
         assert!(!resp.restart_required);
         assert!(
@@ -5999,8 +6130,8 @@ mod config_write_tests {
     }
 
     /// 提交与磁盘相同的值 → 「无改动。」（不误报立即生效/需重启）。
-    #[test]
-    fn update_config_no_change_reports_no_change() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_config_no_change_reports_no_change() {
         let dir = TempDir(std::env::temp_dir().join(format!(
             "ks_upd_none_{}",
             uuid::Uuid::new_v4()
@@ -6014,10 +6145,35 @@ mod config_write_tests {
                 host: Some("h1".to_string()),
                 ..Default::default()
             })
+            .await
             .expect("同值提交应成功");
         assert_eq!(resp.message, "无改动。", "同值提交必须回「无改动。」");
         assert!(!resp.restart_required);
         assert_eq!(disk_config_json(&path)["host"], "h1", "同值提交磁盘不变");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_config_rejects_rfc1918_proxy_url() {
+        let dir = TempDir(std::env::temp_dir().join(format!(
+            "ks_upd_ssrf_{}",
+            uuid::Uuid::new_v4()
+        )));
+        let (svc, path) = svc_with_disk_config(&dir, |c| {
+            c.host = "h1".to_string();
+        });
+        let before = std::fs::read(&path).unwrap();
+        let err = svc
+            .update_config(UpdateConfigRequest {
+                proxy_url: Some("socks5://10.0.0.1:1080".into()),
+                ..Default::default()
+            })
+            .await
+            .expect_err("全局 proxyUrl RFC1918 必须拒绝");
+        assert!(
+            matches!(err, AdminServiceError::InvalidCredential(_)),
+            "got {err:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before, "拒绝必须零写盘");
     }
 
     /// 🔴 承重：error_messages 是 **per-key merge**——提交只更新提交的 key，
@@ -6025,8 +6181,8 @@ mod config_write_tests {
     ///
     /// 回退即 FAIL：把 merge 改成整表替换（`config.error_messages = em`），
     /// 未提交的 k2 会消失，断言失败。
-    #[test]
-    fn update_config_error_messages_merge_keeps_unsubmitted_keys() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_config_error_messages_merge_keeps_unsubmitted_keys() {
         use crate::model::error_messages::ErrorMessageOverride;
         let dir = TempDir(std::env::temp_dir().join(format!(
             "ks_upd_errmsg_{}",
@@ -6069,6 +6225,7 @@ mod config_write_tests {
             error_messages: Some(submitted),
             ..Default::default()
         })
+        .await
         .expect("合法 per-key 更新应成功");
 
         let disk = disk_config_json(&path);
@@ -6096,6 +6253,7 @@ mod config_write_tests {
             error_messages: Some(bad),
             ..Default::default()
         })
+        .await
         .expect_err("非法错误码表必须整表拒绝");
         assert_eq!(
             disk_config_json(&path)["errorMessages"]["k1"]["message"], "新文案",

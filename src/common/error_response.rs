@@ -29,9 +29,4 @@ impl ErrorResponse {
             },
         }
     }
-
-    /// 创建认证错误响应
-    pub fn authentication_error() -> Self {
-        Self::new("authentication_error", "Invalid API key")
-    }
 }
