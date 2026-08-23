@@ -4036,16 +4036,17 @@
     /// 都碰不到它，此前落在 Bug A/B 之间的盲区。
     ///
     /// 本测试直接测判据函数（`find_missing_required_fields`），覆盖「该判缺」与
-    /// 四类「不该干预」的边界。
+    /// 四类「不该干预」的边界。生产表 key 是 `convert_tools` **之后**发给模型的名字
+    ///（`execute_bash`），不是客户端 `Bash`。
     #[test]
     fn bug_c_detects_missing_required_tool_fields() {
         let mut ctx =
             StreamContext::new_with_thinking("claude-sonnet-4-5", 10, false, HashMap::new());
-        // 模拟：Bash 工具的 required = ["command"]，block 3 是它。
+        // 生产口径：execute_bash required = ["command"]，block 3 是它。
         let mut req = HashMap::new();
-        req.insert("Bash".to_string(), vec!["command".to_string()]);
+        req.insert("execute_bash".to_string(), vec!["command".to_string()]);
         ctx.set_tool_required_fields(req);
-        ctx.tool_block_names.insert(3, "Bash".to_string());
+        ctx.tool_block_names.insert(3, "execute_bash".to_string());
 
         // ① 缺 command → 判缺（这是真实故障形态）
         assert_eq!(
@@ -4234,6 +4235,170 @@
                 e.event == "content_block_delta" && e.data["delta"]["type"] == "input_json_delta"
             }),
             "缺必需字段不得下发 input_json_delta"
+        );
+    }
+
+    /// P0-1 缺口：文本化 invoke 重组必须走与 `process_tool_use` 相同的 Bug C + 出站还原。
+    /// 生产形态是模型按发给它的 Kiro 名吐 `<invoke name="fs_write">` + path/text。
+    #[test]
+    fn bug_c_reclaim_mapped_fs_write_complete_kiro_params_restores_client_keys() {
+        crate::anthropic::set_tool_stream_align_failure(true);
+        let mut map = HashMap::new();
+        map.insert("fs_write".to_string(), "Write".to_string());
+        let mut known = std::collections::HashSet::new();
+        known.insert("fs_write".to_string());
+        let mut ctx = StreamContext::new_full("m", 1, false, map, known);
+        ctx.reclaim_enabled = true;
+        let mut req = HashMap::new();
+        req.insert(
+            "fs_write".to_string(),
+            vec!["path".to_string(), "text".to_string()],
+        );
+        ctx.set_tool_required_fields(req);
+        let lt = "<";
+        let block = format!(
+            "{lt}invoke name=\"fs_write\">{lt}parameter name=\"path\">/tmp/a.txt{lt}/parameter>\
+             {lt}parameter name=\"text\">hello{lt}/parameter>{lt}/invoke>"
+        );
+        let mut events = ctx.process_assistant_response(&block);
+        events.extend(ctx.flush_invoke_sniff_buffer());
+        assert!(
+            ctx.completion().is_ok(),
+            "完整 Kiro 参数的重组不得置失败态，got {:?}",
+            ctx.completion()
+        );
+        let partial = events
+            .iter()
+            .find(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "input_json_delta"
+            })
+            .expect("重组应发出 input_json_delta")
+            .data["delta"]["partial_json"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            partial.contains("file_path"),
+            "重组出站必须还原 file_path，实际={partial}"
+        );
+        assert!(
+            partial.contains("content"),
+            "重组出站必须还原 content，实际={partial}"
+        );
+        let start = events
+            .iter()
+            .find(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
+            })
+            .expect("应有 tool_use start");
+        assert_eq!(
+            start.data["content_block"]["name"].as_str(),
+            Some("Write"),
+            "工具名应还原为客户端 Write"
+        );
+    }
+
+    /// P0-1 缺口：重组路径缺 required 必须 INVALID_TOOL_INPUT，且不得下发残参。
+    #[test]
+    fn bug_c_reclaim_fs_write_missing_text_still_fails() {
+        crate::anthropic::set_tool_stream_align_failure(true);
+        let mut map = HashMap::new();
+        map.insert("fs_write".to_string(), "Write".to_string());
+        let mut known = std::collections::HashSet::new();
+        known.insert("fs_write".to_string());
+        let mut ctx = StreamContext::new_full("m", 1, false, map, known);
+        ctx.reclaim_enabled = true;
+        let mut req = HashMap::new();
+        req.insert(
+            "fs_write".to_string(),
+            vec!["path".to_string(), "text".to_string()],
+        );
+        ctx.set_tool_required_fields(req);
+        let lt = "<";
+        let block = format!(
+            "{lt}invoke name=\"fs_write\">{lt}parameter name=\"path\">/tmp/a.txt{lt}/parameter>{lt}/invoke>"
+        );
+        let mut events = ctx.process_assistant_response(&block);
+        events.extend(ctx.flush_invoke_sniff_buffer());
+        match ctx.completion() {
+            CompletionStatus::UpstreamError { code, .. } => {
+                assert_eq!(code, "INVALID_TOOL_INPUT");
+            }
+            other => panic!("expected INVALID_TOOL_INPUT, got {other:?}"),
+        }
+        assert!(
+            !events.iter().any(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "input_json_delta"
+            }),
+            "重组缺必需字段不得下发 input_json_delta"
+        );
+        assert!(
+            !events.iter().any(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
+            }),
+            "重组缺必需字段不得下发空 tool_use 块（start/stop）"
+        );
+    }
+
+    /// 流式 stop 无 input 帧：空 assembled 必须当 `{}` 走 Bug C，不得空操作。
+    #[test]
+    fn bug_c_stream_empty_assembled_is_missing_required() {
+        crate::anthropic::set_tool_stream_align_failure(true);
+        let mut map = HashMap::new();
+        map.insert("execute_bash".to_string(), "Bash".to_string());
+        let mut ctx = StreamContext::new_with_thinking("m", 1, false, map);
+        let mut req = HashMap::new();
+        req.insert("execute_bash".to_string(), vec!["command".to_string()]);
+        ctx.set_tool_required_fields(req);
+        let _ = ctx.generate_initial_events();
+        let events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "execute_bash".to_string(),
+            tool_use_id: "toolu_empty".to_string(),
+            input: String::new(),
+            stop: true,
+        });
+        match ctx.completion() {
+            CompletionStatus::UpstreamError { code, .. } => {
+                assert_eq!(code, "INVALID_TOOL_INPUT");
+            }
+            other => panic!("empty assembled must INVALID_TOOL_INPUT, got {other:?}"),
+        }
+        assert!(
+            !events.iter().any(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "input_json_delta"
+            }),
+            "空 assembled 缺必需字段不得下发 input_json_delta"
+        );
+    }
+
+    /// P0-1 缺口：截断兜底（stop=false 后 generate_final_events）也必须先 Bug C 再 map。
+    #[test]
+    fn bug_c_truncated_flush_bash_missing_command_still_fails() {
+        crate::anthropic::set_tool_stream_align_failure(true);
+        let mut map = HashMap::new();
+        map.insert("execute_bash".to_string(), "Bash".to_string());
+        let mut ctx = StreamContext::new_with_thinking("m", 1, false, map);
+        let mut req = HashMap::new();
+        req.insert("execute_bash".to_string(), vec!["command".to_string()]);
+        ctx.set_tool_required_fields(req);
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "execute_bash".to_string(),
+            tool_use_id: "toolu_trunc".to_string(),
+            input: r#"{"description":"list files"}"#.to_string(),
+            stop: false,
+        });
+        let events = ctx.generate_final_events();
+        match ctx.completion() {
+            CompletionStatus::UpstreamError { code, .. } => {
+                assert_eq!(code, "INVALID_TOOL_INPUT");
+            }
+            other => panic!("expected INVALID_TOOL_INPUT on truncated flush, got {other:?}"),
+        }
+        assert!(
+            !events.iter().any(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "input_json_delta"
+            }),
+            "截断兜底缺必需字段不得下发 input_json_delta"
         );
     }
 

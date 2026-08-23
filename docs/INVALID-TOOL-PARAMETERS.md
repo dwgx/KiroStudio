@@ -46,6 +46,9 @@ Claude Code 在调用工具时经常报 **`Invalid tool parameters`** 或把工�
 具名回归：`bug_c_mapped_builtin_tools_complete_kiro_params_do_not_fail`、
 `bug_c_bash_missing_command_still_fails`。
 
+> 2026-08-23 **v1.2.1**：重组 miss 不下发空 `tool_use`；空 `assembled` 当 `{}`；
+> websearch 认 `web_search` 或 `WebSearch`。v1.2.0 仍是 P0-1 stop 口径。
+
 ---
 
 ## Bug A：为什么客户端一坏就报错，而不自我修复

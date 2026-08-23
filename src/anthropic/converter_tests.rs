@@ -1346,6 +1346,17 @@
             props.get("file_path").is_none(),
             "合成 schema 不应残留客户端 file_path"
         );
+        let required = schema["required"]
+            .as_array()
+            .expect("内置 fs_write schema 必须带 required");
+        assert_eq!(
+            required
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>(),
+            vec!["path", "text"],
+            "Bug C 表从 convert_tools 之后的 required 抽；key 是 fs_write，不是客户端 Write"
+        );
         // 反向映射已记录
         assert_eq!(map.get("fs_write").map(|s| s.as_str()), Some("Write"));
     }

@@ -36,6 +36,45 @@
         assert_eq!(c.output_tokens, 0, "丢弃的 thinking 不得计 output_tokens");
     }
 
+    #[test]
+    fn discarded_inline_thinking_when_disabled_does_not_count() {
+        // 与结构化帧同口径：客户端没要 thinking 时，内联 `<thinking>` 剥掉且不计
+        // output_tokens。入口整块累计会让 thinking-only 响应看起来非空（近空失效）。
+        let mut c = StreamContext::new_with_thinking("claude-sonnet-5", 100, false, HashMap::new());
+        let events = c.process_assistant_response(
+            "<thinking>内部推理不该外泄也不该记账</thinking>\n\n",
+        );
+        assert!(
+            events.is_empty(),
+            "thinking-only 且未声明 thinking 时不得下发正文，实际 {events:?}"
+        );
+        assert_eq!(
+            c.output_tokens, 0,
+            "丢弃的内联 thinking 不得计 output_tokens"
+        );
+    }
+
+    #[test]
+    fn discarded_inline_thinking_counts_only_visible_text() {
+        let mut c = StreamContext::new_with_thinking("claude-sonnet-5", 100, false, HashMap::new());
+        let events =
+            c.process_assistant_response("前言<thinking>内部推理不该外泄</thinking>\n\n正文");
+        let text: String = events
+            .iter()
+            .filter(|e| e.event == "content_block_delta")
+            .filter_map(|e| e.data["delta"]["text"].as_str())
+            .collect();
+        assert!(
+            text.contains("前言") && text.contains("正文") && !text.contains("内部推理"),
+            "只应下发可见正文，实际 {text:?}"
+        );
+        assert_eq!(
+            c.output_tokens,
+            estimate_tokens(&text),
+            "output_tokens 必须等于真下发正文，不得含已剥 thinking"
+        );
+    }
+
     fn start_tool_block(c: &mut StreamContext) -> i32 {
         let idx = c.state_manager.next_block_index();
         c.state_manager.handle_content_block_start(

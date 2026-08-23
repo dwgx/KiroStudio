@@ -1928,6 +1928,34 @@
         );
     }
 
+    /// 源码守卫：custom_api `Available` 竞态不得空转把当前 worker 打满。
+    /// 回退即 FAIL：删掉 `yield_now` 或把门槛改回「永不让出」。
+    #[test]
+    fn select_custom_api_or_wait_available_race_must_yield() {
+        let src = include_str!("token_manager.rs");
+        let prod = src
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(src);
+        let fn_body = prod
+            .split("pub async fn select_custom_api_or_wait")
+            .nth(1)
+            .expect("select_custom_api_or_wait 不应被改名");
+        let fn_body = fn_body
+            .split("\n    pub fn ")
+            .next()
+            .expect("函数体应在下一 pub fn 之前结束");
+        let yield_n = format!("{}{}", "tokio::task::yield_now", "().await");
+        assert!(
+            fn_body.contains(&yield_n),
+            "Available 竞态第二次起必须 yield_now，不得空转"
+        );
+        assert!(
+            fn_body.contains("race_reselect >= 2"),
+            "yield 必须从第二次 Available 起，第一次仍立即重选"
+        );
+    }
+
     /// 造一个代挂号管理器（单号，供透传惩罚策略测试用）。
     fn mk_passthrough_mgr() -> MultiTokenManager {
         let mut c = KiroCredentials::default();
