@@ -119,8 +119,16 @@ pub(super) fn map_tool_input_to_kiro(
         }
         ("Edit", "str_replace") => {
             maybe_insert(&mut out, "path", take_first(&obj, &["file_path", "path"]));
-            maybe_insert(&mut out, "oldStr", take_first(&obj, &["old_string", "oldStr"]));
-            maybe_insert(&mut out, "newStr", take_first(&obj, &["new_string", "newStr"]));
+            maybe_insert(
+                &mut out,
+                "oldStr",
+                take_first(&obj, &["old_string", "oldStr"]),
+            );
+            maybe_insert(
+                &mut out,
+                "newStr",
+                take_first(&obj, &["new_string", "newStr"]),
+            );
         }
         ("Bash", "execute_bash") => {
             maybe_insert(&mut out, "command", take_first(&obj, &["command"]));
@@ -195,43 +203,71 @@ pub(super) fn map_tool_input_to_kiro(
                 );
             }
         }
+        // 🔴 2026-08-26 v3：Glob/Grep 入站基本是**恒等透传** —— 广告给上游的 schema
+        // 已经就是 CC 的真实 schema（见 `kiro_builtin_tool_schema`），客户端形态与
+        // 上游形态重合，没什么可翻译的。这里只保留两件事：
+        //  1. 旧 Kiro 形态键名的**兼容别名**（query/includePattern/…）：非 CC 客户端、
+        //     或跨版本会话里残留的历史 tool_use 仍可能是老形态，认一下不亏；
+        //  2. `-i` 的极性归一（老形态 caseSensitive 与 `-i` 语义相反）。
+        // 未知键原样带过（`additionalProperties: false` 已在 schema 层约束模型）。
         ("Glob", "file_search") => {
-            maybe_insert(&mut out, "query", take_first(&obj, &["pattern", "query"]));
-            maybe_insert(
-                &mut out,
-                "excludePattern",
-                take_first(&obj, &["excludePattern", "exclude"]),
-            );
-            if let Some(v) = take_first(&obj, &["includeIgnoredFiles", "include_ignored"]) {
-                let mapped = match v {
-                    serde_json::Value::Bool(true) => serde_json::json!("yes"),
-                    serde_json::Value::Bool(false) => serde_json::json!("no"),
-                    other => other,
-                };
-                out.insert("includeIgnoredFiles".to_string(), mapped);
-            }
-            maybe_insert(&mut out, "explanation", take_first(&obj, &["explanation"]));
-            out.entry("explanation".to_string())
-                .or_insert_with(|| default_explanation(client_name));
+            let mut o = obj.clone();
+            remap_tool_keys(&mut o, &["pattern", "query"], "pattern");
+            // 老形态的排除/gitignore 键在 CC schema 里不存在，入站就丢掉，
+            // 免得原样带到上游又变成模型学样生成的幻影参数。
+            o.remove("excludePattern");
+            o.remove("exclude");
+            o.remove("includeIgnoredFiles");
+            o.remove("include_ignored");
+            o.remove("explanation");
+            out = o;
         }
         ("Grep", "grep_search") => {
-            maybe_insert(&mut out, "query", take_first(&obj, &["pattern", "query"]));
-            maybe_insert(
-                &mut out,
-                "includePattern",
-                take_first(&obj, &["glob", "includePattern"]),
-            );
-            maybe_insert(
-                &mut out,
-                "excludePattern",
-                take_first(&obj, &["excludePattern", "exclude"]),
-            );
-            maybe_insert(
-                &mut out,
-                "caseSensitive",
-                take_first(&obj, &["caseSensitive", "case_sensitive"]),
-            );
-            maybe_insert(&mut out, "explanation", take_first(&obj, &["explanation"]));
+            let mut o = obj.clone();
+            remap_tool_keys(&mut o, &["pattern", "query"], "pattern");
+            remap_tool_keys(&mut o, &["glob", "includePattern"], "glob");
+            // 老形态 caseSensitive（敏感=true）→ CC 的 `-i`（**不**敏感=true），取反。
+            // 只在客户端没直接给 `-i` 时才推导，避免覆盖真值。
+            if !o.contains_key("-i") {
+                if let Some(sensitive) = o
+                    .remove("caseSensitive")
+                    .or_else(|| o.remove("case_sensitive"))
+                    .and_then(|v| v.as_bool())
+                {
+                    o.insert("-i".to_string(), serde_json::json!(!sensitive));
+                }
+            } else {
+                o.remove("caseSensitive");
+                o.remove("case_sensitive");
+            }
+            // 老形态 excludePattern：CC 侧没有专门的排除参数，但 `glob` 就是 `rg --glob`，
+            // ripgrep 支持 `!` 前缀取反 ⇒ 只有排除时折成取反 glob；已有 include 时
+            // `-g` 槽位被占（schema 声明 glob 为 string，非数组），只能丢并留痕。
+            if let Some(pat) = o
+                .remove("excludePattern")
+                .or_else(|| o.remove("exclude"))
+                .as_ref()
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+            {
+                if o.contains_key("glob") {
+                    tracing::debug!(
+                        exclude = %pat,
+                        "Grep 同时有 include 与 exclude，但 CC 的 glob 只有一个 -g 槽位；保留 include"
+                    );
+                } else {
+                    let negated = if pat.starts_with('!') {
+                        pat
+                    } else {
+                        format!("!{pat}")
+                    };
+                    o.insert("glob".to_string(), serde_json::json!(negated));
+                }
+            }
+            o.remove("explanation");
+            out = o;
         }
         ("LS", "list_directory") => {
             maybe_insert(&mut out, "path", take_first(&obj, &["path"]));
@@ -254,7 +290,10 @@ pub(super) fn map_tool_input_to_kiro(
 /// `pub(crate)`：stream.rs / handlers.rs 在 tool_use 下发前用它把 Kiro 参数（path/oldStr/start_line…）
 /// 还原成 Claude Code 参数（file_path/old_string/offset…），保证客户端看到的工具调用与它发出的
 /// 参数形态一致（否则多轮 tool_result 上下文与当前轮 schema 错配）。
-pub(crate) fn map_tool_input_from_kiro(client_name: &str, input: serde_json::Value) -> serde_json::Value {
+pub(crate) fn map_tool_input_from_kiro(
+    client_name: &str,
+    input: serde_json::Value,
+) -> serde_json::Value {
     if claude_code_tool_name_to_kiro(client_name).is_none() {
         return input;
     }
@@ -300,33 +339,59 @@ pub(crate) fn map_tool_input_from_kiro(client_name: &str, input: serde_json::Val
             out.remove("explanation");
         }
         "Glob" => {
-            remap_tool_keys(&mut out, &["query", "pattern"], "pattern");
-            // ⚠️ 入站把 includeIgnoredFiles 的 bool 转成了 "yes"/"no" 字符串（Kiro 接受），
-            // 出站必须还原回 bool，否则客户端收到字符串与其 boolean schema 类型不符。
-            if let Some(v) = out.get("includeIgnoredFiles").cloned() {
-                let mapped = match v.as_str() {
-                    Some("yes") => serde_json::json!(true),
-                    Some("no") => serde_json::json!(false),
-                    _ => v,
-                };
-                out.insert("includeIgnoredFiles".to_string(), mapped);
-            }
-            out.remove("explanation");
+            // 🔴 2026-08-26 v3：广告的 schema 已是 CC 真实形态 ⇒ 出站几乎无需还原。
+            // 只留兼容与兜底：老形态键名 + 白名单。
+            remap_tool_keys(&mut out, &["pattern", "query"], "pattern");
+            retain_allowed_keys(&mut out, "Glob");
         }
         "Grep" => {
-            remap_tool_keys(&mut out, &["query", "pattern"], "pattern");
-            remap_tool_keys(&mut out, &["includePattern", "glob"], "glob");
-            // ⚠️ 入站把 exclude 映射到 excludePattern，出站必须还原回 exclude，
-            // 否则客户端 Grep 用错参数名、exclude 丢失。
-            remap_tool_keys(&mut out, &["excludePattern", "exclude"], "exclude");
-            remap_tool_keys(
-                &mut out,
-                &["caseSensitive", "case_sensitive"],
-                "case_sensitive",
-            );
-            // ⚠️ Grep 入站只 `maybe_insert`（客户端发才保留）**不注入默认**，
-            // 模型真实生成的 explanation 应保留（Claude Code Grep schema 的 explanation
-            // 是 required），不能像 Read/Glob/LS 那样无条件剥除。
+            remap_tool_keys(&mut out, &["pattern", "query"], "pattern");
+            remap_tool_keys(&mut out, &["glob", "includePattern"], "glob");
+            // 🔴 实测坑（probe F）：声明的键是 `-i`/`-n`，模型回来的是**去掉横杠**的
+            // `i`/`n`（横杠在上游或模型侧被吃掉，本仓 `normalize_json_schema` 不改属性名，
+            // 已排除）。不补回横杠的话，客户端收到 `i` 又是一个幻影参数 ——
+            // 与 `explanation`/`includeIgnoredFiles` 同一类事故的第三次复现。
+            for flag in ["i", "n", "A", "B", "C"] {
+                if let Some(v) = out.remove(flag)
+                    && !v.is_null()
+                {
+                    out.insert(format!("-{flag}"), v);
+                }
+            }
+            // 老形态 caseSensitive（敏感=true）→ `-i`（不敏感=true），取反。
+            if !out.contains_key("-i")
+                && let Some(sensitive) = out
+                    .remove("caseSensitive")
+                    .or_else(|| out.remove("case_sensitive"))
+                    .and_then(|v| v.as_bool())
+            {
+                out.insert("-i".to_string(), serde_json::json!(!sensitive));
+            }
+            // 老形态 excludePattern → 取反 glob（ripgrep `!` 语义）；`-g` 槽位已占则丢。
+            if let Some(pat) = out
+                .remove("excludePattern")
+                .or_else(|| out.remove("exclude"))
+                .as_ref()
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+            {
+                if out.contains_key("glob") {
+                    tracing::debug!(
+                        exclude = %pat,
+                        "Grep 出站：include 已占住唯一的 -g 槽位，丢弃 exclude"
+                    );
+                } else {
+                    let negated = if pat.starts_with('!') {
+                        pat
+                    } else {
+                        format!("!{pat}")
+                    };
+                    out.insert("glob".to_string(), serde_json::json!(negated));
+                }
+            }
+            retain_allowed_keys(&mut out, "Grep");
         }
         "LS" => {
             remap_tool_keys(&mut out, &["path"], "path");
@@ -338,6 +403,54 @@ pub(crate) fn map_tool_input_from_kiro(client_name: &str, input: serde_json::Val
         _ => return serde_json::Value::Object(obj),
     }
     serde_json::Value::Object(out)
+}
+
+/// Claude Code 两个搜索工具的**真实**入参白名单（2026-08-26 核对官方
+/// `code.claude.com/docs/en/tools-reference` 的 Glob/Grep 小节）。
+///
+/// # 为什么需要白名单而不是逐个 `remove`
+/// `kiro_builtin_tool_schema` 给上游广告的 `file_search`/`grep_search` 带着一批
+/// **CC 侧不存在**的属性（`explanation`、`excludePattern`、`includeIgnoredFiles`、
+/// `caseSensitive`）。模型看着那份 schema 生成参数，出站若只逐个 `remove` 已知的几个，
+/// 每次上游 schema 一变就又漏一个 —— 本仓已经为 `explanation`（Grep）和
+/// `includeIgnoredFiles`（Glob）各踩了一次，形态完全相同：
+/// `InputValidationError: … An unexpected parameter \`X\` was provided`，
+/// 且**整个工具调用被客户端拒绝**（不是降级，是这一轮工具直接失败）。
+/// 白名单把「允许什么」而不是「禁止什么」写死，新增幻影键自动被挡住。
+///
+/// ⚠️ 只覆盖 Glob/Grep 两个已确证的工具。其余 6 个内置工具保持「保留未映射键」的
+/// 既有契约（`Write.write_mode` 等由现存测试钉住），不在本次改动范围。
+fn claude_code_allowed_keys(client_name: &str) -> Option<&'static [&'static str]> {
+    match client_name {
+        // Glob: 只有 pattern（必填）+ path。gitignore 行为走环境变量
+        // CLAUDE_CODE_GLOB_NO_IGNORE，**不是**工具参数。
+        "Glob" => Some(&["pattern", "path"]),
+        // Grep: ripgrep 风格。`-i`/`-n`/`-A`/`-B`/`-C` 是字面 JSON 键名。
+        "Grep" => Some(&[
+            "pattern",
+            "path",
+            "glob",
+            "type",
+            "output_mode",
+            "-i",
+            "-n",
+            "-A",
+            "-B",
+            "-C",
+            "head_limit",
+            "offset",
+            "multiline",
+        ]),
+        _ => None,
+    }
+}
+
+/// 出站白名单过滤：只保留 [`claude_code_allowed_keys`] 列出的键。无白名单的工具 no-op。
+fn retain_allowed_keys(out: &mut serde_json::Map<String, serde_json::Value>, client_name: &str) {
+    let Some(allowed) = claude_code_allowed_keys(client_name) else {
+        return;
+    };
+    out.retain(|k, _| allowed.contains(&k.as_str()));
 }
 
 /// 出站还原辅助：把 `out` 里第一个命中的候选键移除并改插到目标键下，其余键原样保留。
@@ -390,8 +503,17 @@ fn kiro_builtin_tool_description(name: &str, fallback: &str) -> String {
             BASH_TOOL_DESCRIPTION_SUFFIX
         ),
         "read_file" => "Read a single file with optional line range specification.".to_string(),
-        "file_search" => "Search for files by fuzzy file path query.".to_string(),
-        "grep_search" => "Search file contents using a regex pattern.".to_string(),
+        "file_search" => {
+            "Find files by glob pattern. Supports ** for recursive matching and brace \
+             expansion. Results are sorted by modification time. Does not respect .gitignore, so \
+             gitignored files are included."
+                .to_string()
+        }
+        "grep_search" => "Search file contents with a regular expression. Built on ripgrep, so it \
+             uses ripgrep regex syntax (literal braces need escaping: use `interface\\{\\}`). \
+             Filter files with `glob` (prefix a glob with ! to exclude it) or `type`. Respects \
+             .gitignore — to search inside an ignored path, pass that path via `path`."
+            .to_string(),
         "list_directory" => "List directory contents.".to_string(),
         "web_search" => "Search the web for up-to-date information.".to_string(),
         _ if fallback.trim().is_empty() => name.to_string(),
@@ -442,27 +564,57 @@ fn kiro_builtin_tool_schema(name: &str) -> Option<serde_json::Value> {
             "required": ["path", "explanation"],
             "additionalProperties": false
         }),
+        // 🔴 2026-08-26 v3：同 grep_search，改为直接广告 CC 的真实 Glob schema。
+        // CC 的 Glob 只有 {pattern, path}；`.gitignore` 行为由启动期环境变量
+        // `CLAUDE_CODE_GLOB_NO_IGNORE` 控制，**不是**工具参数 —— 所以旧广告里的
+        // `includeIgnoredFiles`/`excludePattern` 是纯幻影（出站漏一个就整轮被拒），
+        // 而真正有用的 `path` 反而没广告。
         "file_search" => serde_json::json!({
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Fuzzy filename query."},
-                "explanation": {"type": "string", "description": "Why this search is being performed."},
-                "excludePattern": optional_schema(serde_json::json!({"type": "string", "description": "Glob pattern for files to exclude."})),
-                "includeIgnoredFiles": optional_schema(serde_json::json!({"type": "string", "description": "Whether to include ignored files, yes or no."}))
+                "pattern": {"type": "string", "minLength": 1, "description": "The glob pattern to match files against (e.g. \"**/*.js\", \"src/**/*.ts\", \"*.{json,yaml}\")."},
+                "path": optional_schema(serde_json::json!({"type": "string", "description": "The directory to search in. Defaults to the current working directory."}))
             },
-            "required": ["query", "explanation"],
+            "required": ["pattern"],
             "additionalProperties": false
         }),
+        // 🔴 2026-08-26 v3：改为**直接广告 Claude Code 的真实 schema**。
+        //
+        // 为什么翻天覆地改：这两个工具**由客户端执行**，Kiro 只是「看着 schema 生成参数」
+        // 的一方。实测（probe：自建 client 打本地 /v1/messages）证明 Kiro **完全接受并遵守
+        // 任意声明的 schema** —— 声明 CC 形态，模型就直出 CC 形态
+        // （`{"pattern":"license","path":"admin-ui/node_modules","glob":"package.json"}`）。
+        //
+        // 于是「Kiro 形态 ⇄ CC 形态」这层翻译从**必要**变成**净损失**：
+        //  1. 幻影参数的根源就是它（`explanation`/`includeIgnoredFiles`/`excludePattern`
+        //     /`caseSensitive` 在 CC 侧都不存在，出站漏一个客户端就整轮拒绝，本仓已踩两次）；
+        //  2. 它**砍掉了客户端的真实能力**：`path`（目录限定 + 官方文档给的
+        //     「搜 gitignored 文件就直接传路径」逃生门）、`type`、`output_mode`、
+        //     `head_limit`、`multiline`、`-n`、`-A/-B/-C` 全都没广告 ⇒ 模型压根不知道能用。
+        //     实测里模型只能把目录硬塞进 glob（`glob:"admin-ui/node_modules/**/package.json"`），
+        //     而 Grep 默认遵守 .gitignore ⇒ node_modules 永远搜不到，还以为文件不存在。
+        //  3. 排除语义本来就不用翻译：广告 CC schema 后模型**自发**写 ripgrep 取反
+        //     （`glob:"!*.rs"`），因为 CC 的 glob 就是 `rg --glob`。
+        //
+        // 参数名与官方 `code.claude.com/docs/en/tools-reference` 的 Grep 小节逐条对齐。
+        // ⚠️ `-i`/`-n`/`-A`/`-B`/`-C` 是**字面** JSON 键名（ripgrep 风格），不是笔误。
         "grep_search" => serde_json::json!({
             "type": "object",
             "properties": {
-                "query": {"type": "string", "minLength": 1, "description": "Regex pattern to search for."},
-                "caseSensitive": optional_schema(serde_json::json!({"type": "boolean", "description": "Whether the search should be case sensitive."})),
-                "includePattern": optional_schema(serde_json::json!({"type": "string", "description": "Glob pattern for files to include."})),
-                "excludePattern": optional_schema(serde_json::json!({"type": "string", "description": "Glob pattern for files to exclude."})),
-                "explanation": optional_schema(serde_json::json!({"type": "string", "description": "Why this search is being performed."}))
+                "pattern": {"type": "string", "minLength": 1, "description": "The regular expression pattern to search for in file contents."},
+                "path": optional_schema(serde_json::json!({"type": "string", "description": "File or directory to search in (rg PATH). Defaults to the current working directory. Pass a gitignored path directly to search inside it."})),
+                "glob": optional_schema(serde_json::json!({"type": "string", "description": "Glob pattern to filter files (e.g. \"*.js\", \"**/*.tsx\") - maps to rg --glob. Prefix with ! to exclude (e.g. \"!**/*.rs\")."})),
+                "type": optional_schema(serde_json::json!({"type": "string", "description": "File type to search (rg --type), e.g. js, py, rust, go."})),
+                "output_mode": optional_schema(serde_json::json!({"type": "string", "enum": ["content", "files_with_matches", "count"], "description": "\"content\" shows matching lines, \"files_with_matches\" shows file paths (default), \"count\" shows match counts."})),
+                "-i": optional_schema(serde_json::json!({"type": "boolean", "description": "Case insensitive search (rg -i)."})),
+                "-n": optional_schema(serde_json::json!({"type": "boolean", "description": "Show line numbers. Requires output_mode \"content\"."})),
+                "-A": optional_schema(serde_json::json!({"type": "number", "description": "Lines of context after each match. Requires output_mode \"content\"."})),
+                "-B": optional_schema(serde_json::json!({"type": "number", "description": "Lines of context before each match. Requires output_mode \"content\"."})),
+                "-C": optional_schema(serde_json::json!({"type": "number", "description": "Lines of context around each match. Requires output_mode \"content\"."})),
+                "head_limit": optional_schema(serde_json::json!({"type": "number", "description": "Limit output to the first N entries."})),
+                "multiline": optional_schema(serde_json::json!({"type": "boolean", "description": "Allow patterns to match across line boundaries."}))
             },
-            "required": ["query"],
+            "required": ["pattern"],
             "additionalProperties": false
         }),
         "list_directory" => serde_json::json!({
@@ -632,9 +784,8 @@ pub(super) fn convert_tools(
             // schema：内置工具用合成 schema（参数名已是 Kiro 原生形态，与 map_tool_input_to_kiro
             // 的输出一致）；非内置工具用客户端 schema 规范化（剥 $ref/null/anyOf 等）。
             let schema = if is_builtin {
-                kiro_builtin_tool_schema(&mapped_name).unwrap_or_else(|| {
-                    normalize_json_schema(serde_json::json!(t.input_schema))
-                })
+                kiro_builtin_tool_schema(&mapped_name)
+                    .unwrap_or_else(|| normalize_json_schema(serde_json::json!(t.input_schema)))
             } else {
                 normalize_json_schema(serde_json::json!(t.input_schema))
             };

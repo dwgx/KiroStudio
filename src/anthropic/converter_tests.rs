@@ -1478,8 +1478,8 @@
         );
     }
 
-    /// 🔴 回归：Write write_mode 透传、Glob includeIgnoredFiles 出站还原 bool、
-    /// Grep excludePattern→exclude 出站还原、注入的 explanation 出站剥离。
+    /// 🔴 回归：Write write_mode 透传；Glob/Grep 与 **Claude Code 真实 schema** 双向一致
+    /// （幻影参数不得外泄、`-i` 极性、裸 `i`/`n` 补横杠、`path` 不得丢失）。
     #[test]
     fn test_tool_mapping_write_mode_and_glob_grep_roundtrip() {
         // Write write_mode 入站透传 + 出站保留（之前被静默丢弃 → 覆盖写数据丢失）
@@ -1490,27 +1490,142 @@
         assert_eq!(restored["write_mode"], "append", "write_mode 出站保留");
         assert_eq!(restored["file_path"], "/a.txt");
 
-        // Glob includeIgnoredFiles：入站 bool→"yes"/"no"，出站必须还原回 bool
-        let glob_in = serde_json::json!({"pattern": "*.ts", "includeIgnoredFiles": true});
-        let glob_out = map_tool_input_to_kiro("Glob", glob_in).unwrap();
-        assert_eq!(glob_out["includeIgnoredFiles"], "yes");
-        let glob_restored = map_tool_input_from_kiro("Glob", glob_out);
-        assert_eq!(glob_restored["includeIgnoredFiles"], true, "includeIgnoredFiles 必须还原回 bool");
-        assert!(
-            !glob_restored.as_object().unwrap().contains_key("explanation"),
-            "入站注入的 explanation 出站必须剥离（幻影参数）"
+        // ── Glob ─────────────────────────────────────────────────────────────
+        // v3：广告的 schema 就是 CC 的真实 Glob schema {pattern, path} ⇒ 入站恒等透传。
+        let glob_out =
+            map_tool_input_to_kiro("Glob", serde_json::json!({"pattern": "**/*.ts", "path": "src"}))
+                .unwrap();
+        assert_eq!(glob_out["pattern"], "**/*.ts");
+        assert_eq!(
+            glob_out["path"], "src",
+            "path 必须透传到上游（旧实现折进 explanation 后被出站剥离 ⇒ 能力凭空消失）"
         );
 
-        // Grep excludePattern→exclude 出站还原
-        let grep_in = serde_json::json!({"pattern": "foo", "exclude": "vendor"});
-        let grep_out = map_tool_input_to_kiro("Grep", grep_in).unwrap();
-        assert_eq!(grep_out["excludePattern"], "vendor");
-        let grep_restored = map_tool_input_from_kiro("Grep", grep_out);
-        assert_eq!(grep_restored["exclude"], "vendor", "excludePattern 必须还原成 exclude");
-        assert!(
-            !grep_restored.as_object().unwrap().contains_key("excludePattern"),
-            "还原后不应残留 excludePattern"
+        // 老形态键名的兼容：query→pattern；幻影键入站就丢。
+        let glob_legacy = map_tool_input_to_kiro(
+            "Glob",
+            serde_json::json!({"query": "*.ts", "includeIgnoredFiles": true, "excludePattern": "x", "explanation": "y"}),
+        )
+        .unwrap();
+        assert_eq!(glob_legacy["pattern"], "*.ts");
+        for phantom in ["query", "includeIgnoredFiles", "excludePattern", "explanation"] {
+            assert!(
+                !glob_legacy.as_object().unwrap().contains_key(phantom),
+                "Glob 入站不得把 {phantom} 带到上游（模型会学样生成幻影参数）"
+            );
+        }
+
+        // 出站白名单：CC 的 Glob 只认 {pattern, path}
+        let glob_restored = map_tool_input_from_kiro(
+            "Glob",
+            serde_json::json!({"query": "*.ts", "path": "src", "includeIgnoredFiles": "yes", "explanation": "z"}),
         );
+        assert_eq!(glob_restored["pattern"], "*.ts");
+        assert_eq!(glob_restored["path"], "src");
+        for phantom in ["includeIgnoredFiles", "excludePattern", "exclude", "explanation", "query"] {
+            assert!(
+                !glob_restored.as_object().unwrap().contains_key(phantom),
+                "Glob 出站不得残留幻影参数 {phantom}（CC schema 只有 pattern/path）"
+            );
+        }
+
+        // ── Grep ─────────────────────────────────────────────────────────────
+        // v3：CC 真实形态入站恒等透传，含旧实现整套丢弃的 path/type/output_mode/head_limit。
+        let grep_out = map_tool_input_to_kiro(
+            "Grep",
+            serde_json::json!({
+                "pattern": "license", "path": "admin-ui/node_modules", "glob": "package.json",
+                "output_mode": "content", "-n": true, "-i": true, "head_limit": 20,
+                "type": "rust", "multiline": true, "-C": 3
+            }),
+        )
+        .unwrap();
+        for (k, v) in [
+            ("pattern", serde_json::json!("license")),
+            ("path", serde_json::json!("admin-ui/node_modules")),
+            ("glob", serde_json::json!("package.json")),
+            ("output_mode", serde_json::json!("content")),
+            ("-n", serde_json::json!(true)),
+            ("-i", serde_json::json!(true)),
+            ("head_limit", serde_json::json!(20)),
+            ("type", serde_json::json!("rust")),
+            ("multiline", serde_json::json!(true)),
+            ("-C", serde_json::json!(3)),
+        ] {
+            assert_eq!(grep_out[k], v, "Grep 入站必须透传 {k}");
+        }
+
+        // 🔴 实测坑（probe F）：声明 `-i`/`-n`，模型回来的是去掉横杠的 `i`/`n`。
+        // 不补回横杠，客户端就把 `i` 当幻影参数拒绝整轮调用。
+        let dashed = map_tool_input_from_kiro(
+            "Grep",
+            serde_json::json!({"pattern": "x", "i": true, "n": true, "A": 2, "B": 1, "C": 3}),
+        );
+        for flag in ["-i", "-n", "-A", "-B", "-C"] {
+            assert!(
+                dashed.as_object().unwrap().contains_key(flag),
+                "出站必须把裸 {} 补回 {flag}",
+                flag.trim_start_matches('-')
+            );
+        }
+        for bare in ["i", "n", "A", "B", "C"] {
+            assert!(
+                !dashed.as_object().unwrap().contains_key(bare),
+                "出站不得残留无横杠的 {bare}（CC schema 没有这个键）"
+            );
+        }
+
+        // 老形态 caseSensitive（敏感=true）↔ CC 的 `-i`（**不**敏感=true）：极性相反
+        let ci = map_tool_input_to_kiro(
+            "Grep",
+            serde_json::json!({"pattern": "foo", "caseSensitive": false}),
+        )
+        .unwrap();
+        assert_eq!(ci["-i"], true, "caseSensitive:false ⇒ -i:true");
+        let cs = map_tool_input_to_kiro(
+            "Grep",
+            serde_json::json!({"pattern": "foo", "caseSensitive": true}),
+        )
+        .unwrap();
+        assert_eq!(cs["-i"], false, "caseSensitive:true ⇒ -i:false");
+        // 客户端直接给了 `-i` 时不得被老形态覆盖
+        let both_ci = map_tool_input_to_kiro(
+            "Grep",
+            serde_json::json!({"pattern": "foo", "-i": true, "caseSensitive": true}),
+        )
+        .unwrap();
+        assert_eq!(both_ci["-i"], true, "显式 -i 优先于老形态 caseSensitive");
+
+        // 老形态 excludePattern → 取反 glob（ripgrep `!` 语义），只有排除时才生效
+        let excl = map_tool_input_from_kiro(
+            "Grep",
+            serde_json::json!({"pattern": "foo", "excludePattern": "vendor"}),
+        );
+        assert_eq!(excl["glob"], "!vendor", "只有 exclude 时必须变成取反 glob");
+        let already_neg = map_tool_input_from_kiro(
+            "Grep",
+            serde_json::json!({"pattern": "foo", "excludePattern": "!dist/**"}),
+        );
+        assert_eq!(already_neg["glob"], "!dist/**", "已带 ! 的不得变成 !!");
+        let both_g = map_tool_input_from_kiro(
+            "Grep",
+            serde_json::json!({"pattern": "foo", "includePattern": "**/*.rs", "excludePattern": "vendor"}),
+        );
+        assert_eq!(both_g["glob"], "**/*.rs", "include 占住唯一的 -g 槽位");
+
+        // 出站白名单：幻影参数一律不得出现
+        let grep_restored = map_tool_input_from_kiro(
+            "Grep",
+            serde_json::json!({"query": "foo", "includePattern": "*.rs", "explanation": "why"}),
+        );
+        assert_eq!(grep_restored["pattern"], "foo");
+        assert_eq!(grep_restored["glob"], "*.rs");
+        for phantom in ["query", "includePattern", "excludePattern", "exclude", "explanation", "caseSensitive", "case_sensitive"] {
+            assert!(
+                !grep_restored.as_object().unwrap().contains_key(phantom),
+                "Grep 出站不得残留幻影参数 {phantom}"
+            );
+        }
 
         // Read 出站剥离注入的 explanation
         let read_restored = map_tool_input_from_kiro(
