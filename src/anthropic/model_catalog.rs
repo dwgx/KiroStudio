@@ -400,8 +400,9 @@ pub static CATALOG: &[ModelSpec] = &[
         advertised: true,
     },
     // ===== GPT 系(Kiro 2026-07 新增;sol/luna/terra 三并列变体,无语义版本号) =====
-    // ⚠️ credit_mult / context_window 暂用保守默认(200K / 1.0x),待 dwgx 给 Kiro 官方权威值后校正。
-    //    这两个字段只影响计费展示与 /v1/models 的 max_tokens 广告,不影响映射是否生效。
+    // credit_mult / context_window 已按 Kiro 官方模型表校正(2026-08-24,用户实读官方 Quick
+    // comparison 表):三者窗口同为 272K;倍率 sol 2.4x / terra 1.0x / luna 0.1x(非统一 1.0x)。
+    // 这两个字段只影响计费展示与 /v1/models 的 max_tokens 广告,不影响映射是否生效。
     ModelSpec {
         kiro_id: "gpt-5.6-sol",
         family: Family::Gpt,
@@ -409,9 +410,9 @@ pub static CATALOG: &[ModelSpec] = &[
         aliases: &["gpt-5.6-sol", "gpt-5-6-sol", "gpt5.6-sol"],
         owned_by: "openai",
         display_name: "GPT-5.6 Sol",
-        context_window: 200_000,
+        context_window: 272_000,
         max_output: 64_000,
-        credit_mult: 1.00,
+        credit_mult: 2.40,
         supports_thinking: false,
         supports_1m: false,
         advertised: true,
@@ -423,9 +424,9 @@ pub static CATALOG: &[ModelSpec] = &[
         aliases: &["gpt-5.6-luna", "gpt-5-6-luna", "gpt5.6-luna"],
         owned_by: "openai",
         display_name: "GPT-5.6 Luna",
-        context_window: 200_000,
+        context_window: 272_000,
         max_output: 64_000,
-        credit_mult: 1.00,
+        credit_mult: 0.10,
         supports_thinking: false,
         supports_1m: false,
         advertised: true,
@@ -437,7 +438,7 @@ pub static CATALOG: &[ModelSpec] = &[
         aliases: &["gpt-5.6-terra", "gpt-5-6-terra", "gpt5.6-terra"],
         owned_by: "openai",
         display_name: "GPT-5.6 Terra",
-        context_window: 200_000,
+        context_window: 272_000,
         max_output: 64_000,
         credit_mult: 1.00,
         supports_thinking: false,
