@@ -3,7 +3,21 @@
         extract_schema_defs, resolve_schema_refs, SchemaRefBudget, MAX_SCHEMA_NODES,
         normalize_json_schema_with_node_budget,
     };
-    use super::tool_compat::{shorten_tool_name, TOOL_NAME_MAX_LEN};
+    use super::tool_compat::{
+        map_tool_name, replace_mapped_tool_names_in_text, shorten_tool_name, TOOL_NAME_MAX_LEN,
+    };
+
+    #[test]
+    fn test_replace_mapped_tool_names_in_text_longest_first() {
+        let mut map = HashMap::new();
+        let long = "a".repeat(80);
+        let short = map_tool_name(&long, &mut map);
+        assert_ne!(short, long);
+        let text = format!("please call {long} then ok");
+        let out = replace_mapped_tool_names_in_text(&text, &map);
+        assert!(out.contains(&short), "{out}");
+        assert!(!out.contains(&long), "{out}");
+    }
 
     #[test]
     fn test_map_model_sonnet() {
@@ -105,6 +119,42 @@
         assert!(sys_a.starts_with(BILLING_HEADER_PLACEHOLDER));
         assert!(!sys_a.contains("cc_version"));
         assert!(sys_a.contains("You are a helpful assistant."));
+    }
+
+    #[test]
+    fn test_build_history_promotes_messages_role_system() {
+        use crate::anthropic::types::Message as ClientMessage;
+        let req = MessagesRequest {
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                ClientMessage {
+                    role: "system".to_string(),
+                    content: serde_json::json!("Always use rustfmt."),
+                },
+                ClientMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("hi"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let history =
+            build_history(&req, &req.messages, "claude-sonnet-4.5", &mut HashMap::new()).unwrap();
+        let Message::User(u) = &history[0] else {
+            panic!("首条应为 system 注入的 user");
+        };
+        assert!(
+            u.user_input_message.content.contains("Always use rustfmt."),
+            "messages[].role=system 必须并进系统块: {}",
+            u.user_input_message.content
+        );
     }
 
     #[test]

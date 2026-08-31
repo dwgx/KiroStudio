@@ -650,6 +650,7 @@ impl KiroCredentials {
     /// 特殊值 "direct" 表示显式不使用代理（即使全局配置了代理）
     pub fn effective_proxy(&self, global_proxy: Option<&ProxyConfig>) -> Option<ProxyConfig> {
         match self.proxy_url.as_deref() {
+            Some(url) if url.trim().is_empty() => global_proxy.cloned(),
             Some(url) if url.eq_ignore_ascii_case(Self::PROXY_DIRECT) => None,
             Some(url) => {
                 // URL 里可能内嵌账密（socks5://user:pass@host:port）——拆出干净 URL 与内嵌账密。
@@ -794,6 +795,21 @@ impl KiroCredentials {
         }
         // idc/social 缺 arn → 回退默认 BuilderId 占位 ARN（上游接受）。
         Some(crate::kiro::token_manager::DEFAULT_BUILDER_ID_PROFILE_ARN.to_string())
+    }
+
+    /// 用量 REST（`getUsageLimits` query）只用**已解析的真实 ARN**，不发 BuilderId 占位。
+    ///
+    /// 对话 body 仍走 [`Self::effective_profile_arn`]。2026-08-25 起用量 GET 带占位 ARN
+    /// 会 403；ZyphrZero 0.8.0 过滤占位后再试「不带 ARN」。
+    pub fn usage_profile_arn(&self) -> Option<String> {
+        let arn = self.profile_arn.as_deref()?.trim();
+        if arn.is_empty() {
+            return None;
+        }
+        if crate::kiro::token_manager::is_placeholder_profile_arn(arn) {
+            return None;
+        }
+        Some(arn.to_string())
     }
 
     /// 该凭据实际应走的端点名：**显式 `endpoint` 字段优先，其次按凭据类型自动路由**。
@@ -1206,6 +1222,26 @@ mod tests {
             "idc 缺 profileArn 应回退默认 BuilderId ARN(否则对话 400 profileArn is required)"
         );
         assert!(idc.should_send_profile_arn(), "idc 应发送 profileArn");
+        assert_eq!(
+            idc.usage_profile_arn(),
+            None,
+            "用量 REST 不得把 BuilderId 占位当真实 ARN 发出"
+        );
+    }
+
+    #[test]
+    fn test_usage_profile_arn_skips_stored_placeholder() {
+        let mut idc = KiroCredentials::default();
+        idc.auth_method = Some("idc".to_string());
+        idc.profile_arn = Some(
+            crate::kiro::token_manager::DEFAULT_BUILDER_ID_PROFILE_ARN.to_string(),
+        );
+        assert_eq!(idc.usage_profile_arn(), None);
+        assert_eq!(
+            idc.effective_profile_arn().as_deref(),
+            Some(crate::kiro::token_manager::DEFAULT_BUILDER_ID_PROFILE_ARN),
+            "对话 body 仍可用占位"
+        );
     }
 
     #[test]
@@ -2277,6 +2313,24 @@ mod tests {
 
         let result = creds.effective_proxy(Some(&global));
         assert_eq!(result, Some(ProxyConfig::new("http://global:8080")));
+    }
+
+    #[test]
+    fn test_effective_proxy_empty_string_is_unset() {
+        let global = ProxyConfig::new("http://global:8080");
+        let mut creds = KiroCredentials::default();
+        creds.proxy_url = Some("".to_string());
+        assert_eq!(
+            creds.effective_proxy(Some(&global)),
+            Some(ProxyConfig::new("http://global:8080")),
+            "空串 proxyUrl 视为未配置，回退全局"
+        );
+        creds.proxy_url = Some("   ".to_string());
+        assert_eq!(
+            creds.effective_proxy(None),
+            None,
+            "空白 proxyUrl 且无全局 → 直连"
+        );
     }
 
     #[test]

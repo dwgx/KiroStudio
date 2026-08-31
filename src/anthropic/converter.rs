@@ -31,7 +31,7 @@ pub(crate) use tool_compat::{map_tool_input_from_kiro, set_tool_compat_mapping};
 pub use tool_compat::restore_tool_use_for_client;
 use tool_compat::{
     convert_tools, map_client_tool_name_to_kiro, map_tool_input_to_kiro, map_tool_name,
-    tool_compat_mapping_enabled,
+    replace_mapped_tool_names_in_text, tool_compat_mapping_enabled,
 };
 
 #[path = "history_overflow.rs"]
@@ -864,7 +864,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     // 12. 构建当前消息
     // 保留文本内容，即使有工具结果也不丢弃用户文本
-    let content = text_content;
+    let content = replace_mapped_tool_names_in_text(&text_content, &tool_name_map);
 
     let mut user_input = UserInputMessage::new(content, &model_id)
         .with_context(context)
@@ -1541,6 +1541,18 @@ fn has_thinking_tags(content: &str) -> bool {
     content.contains("<thinking_mode>") || content.contains("<max_thinking_length>")
 }
 
+fn message_plain_text(msg: &super::types::Message) -> String {
+    match &msg.content {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
 /// 构建历史消息
 ///
 /// # Arguments
@@ -1571,7 +1583,7 @@ fn build_history(
     // `system` 存在但归一化后为空（如 `"system": ""` 被 types.rs 的 visit_str 变成
     // `Some(vec![{text:""}])`，或整块被环境噪音剥空）时，外层分支已匹配，控制流永远到不了
     // else 分支 → thinking 前缀被静默丢弃，扩展思考不生效且无任何日志。
-    let system_content: Option<String> = req.system.as_ref().and_then(|system| {
+    let mut system_content: Option<String> = req.system.as_ref().and_then(|system| {
         // 归一化每一块 system 文本：折叠 CC 归因头（第一块，每请求漂移）+ 剥离环境噪音
         // （<env> 块 / gitStatus / Recent commits / 模型名行等，每请求漂移）。
         // 稳定住转发给上游的 prompt 前缀，避免 Bedrock prefix cache 因这些漂移而 0 命中，
@@ -1588,6 +1600,22 @@ fn build_history(
             Some(joined)
         }
     });
+
+    // Claude Code / 部分客户端把 system 放在 messages[].role=system，旧循环静默丢。
+    // 对齐 jwadow/kiro-gateway #271：并进系统块，不当作用户轮次。
+    let history_end_index_for_system = messages.len().saturating_sub(1);
+    let extra_system: String = (0..history_end_index_for_system)
+        .filter(|&i| messages[i].role == "system")
+        .map(|i| message_plain_text(&messages[i]))
+        .filter(|s| !s.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !extra_system.is_empty() {
+        system_content = Some(match system_content {
+            Some(existing) => format!("{existing}\n{extra_system}"),
+            None => extra_system,
+        });
+    }
 
     // 最终要写入首条 user 消息的内容：三种情形共用一个出口
     //   ① 有 system 有效文本 → [thinking 前缀 +] system + 分块策略
@@ -1644,7 +1672,8 @@ fn build_history(
         } else if msg.role == "assistant" {
             // 先处理累积的 user 消息
             if !user_buffer.is_empty() {
-                let merged_user = merge_user_messages(&user_buffer, model_id, &mut image_dedup)?;
+                let merged_user =
+                    merge_user_messages(&user_buffer, model_id, &mut image_dedup, tool_name_map)?;
                 history.push(Message::User(merged_user));
                 user_buffer.clear();
             }
@@ -1661,7 +1690,8 @@ fn build_history(
 
     // 处理结尾的孤立 user 消息
     if !user_buffer.is_empty() {
-        let merged_user = merge_user_messages(&user_buffer, model_id, &mut image_dedup)?;
+        let merged_user =
+            merge_user_messages(&user_buffer, model_id, &mut image_dedup, tool_name_map)?;
         history.push(Message::User(merged_user));
 
         // 自动配对一个 "OK" 的 assistant 响应
@@ -1677,6 +1707,7 @@ fn merge_user_messages(
     messages: &[&super::types::Message],
     model_id: &str,
     dedup: &mut std::collections::HashSet<String>,
+    tool_name_map: &HashMap<String, String>,
 ) -> Result<HistoryUserMessage, ConversionError> {
     let mut content_parts = Vec::new();
     let mut all_images = Vec::new();
@@ -1692,7 +1723,7 @@ fn merge_user_messages(
         all_tool_results.extend(tool_results);
     }
 
-    let content = content_parts.join("\n");
+    let content = replace_mapped_tool_names_in_text(&content_parts.join("\n"), tool_name_map);
     // 保留文本内容，即使有工具结果也不丢弃用户文本
     let mut user_msg = UserMessage::new(&content, model_id);
 
@@ -1735,7 +1766,10 @@ fn convert_assistant_message(
                         }
                         "text" => {
                             if let Some(text) = block.text {
-                                text_content.push_str(&text);
+                                text_content.push_str(&replace_mapped_tool_names_in_text(
+                                    &text,
+                                    tool_name_map,
+                                ));
                             }
                         }
                         "tool_use" => {

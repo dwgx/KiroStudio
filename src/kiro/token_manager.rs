@@ -729,8 +729,14 @@ fn apply_refresh_result_fields(entry_credentials: &mut KiroCredentials, new_cred
 }
 
 /// BuilderId / IdC 账号无自带 profileArn 时的默认回退值（与 Kiro IDE 一致）。
+/// 只给**对话 body**（[`KiroCredentials::effective_profile_arn`]）。用量 REST 不得带它
+/// （2026-08-25 上游 403 `User is not authorized`；对齐 ZyphrZero kiro.rs 0.8.0 PR #74）。
 pub(crate) const DEFAULT_BUILDER_ID_PROFILE_ARN: &str =
     "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
+
+pub(crate) fn is_placeholder_profile_arn(arn: &str) -> bool {
+    arn.trim() == DEFAULT_BUILDER_ID_PROFILE_ARN
+}
 
 /// 获取使用额度信息
 pub(crate) async fn get_usage_limits(
@@ -752,35 +758,51 @@ pub(crate) async fn get_usage_limits(
     let client = build_client(proxy, 60, config.tls_backend)
         .map_err(|e| RefreshValidationError::new(format!("构建刷新客户端失败: {}", e)))?;
 
+    // 每个区先带真实 ARN 再退回不带（ZyphrZero 0.8.0 PR #74）。占位 ARN 不算真实。
+    let real_arn = credentials.usage_profile_arn();
+    let arn_attempts: Vec<Option<&str>> = match real_arn.as_deref() {
+        Some(arn) => vec![Some(arn), None],
+        None => vec![None],
+    };
+
     let mut last_error: Option<String> = None;
-    for (idx, cand_region) in candidates.iter().enumerate() {
-        match fetch_usage_limits_once(&client, credentials, config, token, cand_region).await {
-            Ok(data) => {
-                if idx > 0 {
-                    tracing::info!(
-                        "getUsageLimits 在主端点失败后由备用端点 {} 成功（该号 SSO region 与 REST 端点不同区）",
-                        cand_region
-                    );
+    let mut attempt_idx = 0usize;
+    let total_attempts = candidates.len() * arn_attempts.len();
+    for cand_region in candidates.iter() {
+        for arn in &arn_attempts {
+            match fetch_usage_limits_once(&client, credentials, config, token, cand_region, *arn)
+                .await
+            {
+                Ok(data) => {
+                    if attempt_idx > 0 {
+                        tracing::info!(
+                            "getUsageLimits 在备用尝试成功 region={} arn={}",
+                            cand_region,
+                            arn.map(|_| "real").unwrap_or("omit")
+                        );
+                    }
+                    return Ok(data);
                 }
-                return Ok(data);
-            }
-            Err((status, msg)) => {
-                // ⭐ 403 且还有备用端点 → 试另一个区。
-                //
-                // 这是 REST 端点只在 us-east-1 / eu-central-1 存在导致的：SSO region 是
-                // 别的区（Enterprise/IdC 常见）时，按 SSO region 拼出的 host 根本不是这两个
-                // 之一，或者是这两个里"错的那个"，上游一律回 403 `Invalid token`。
-                // 只对 403 回退：401 是 token 真废、429 是限流，换端点都没有意义。
-                if status == Some(403) && idx + 1 < candidates.len() {
-                    tracing::debug!(
-                        "getUsageLimits 在 {} 返回 403，尝试备用端点 {}",
-                        cand_region,
-                        candidates[idx + 1]
-                    );
-                    last_error = Some(msg);
-                    continue;
+                Err((status, msg)) => {
+                    // 403 换「区 × ARN 形态」。带真实 ARN 的 400
+                    // Improperly formed / Invalid profileArn 也退回不带 ARN
+                    //（ZyphrZero 未合 PR #78；部分租户带 ARN 反 400）。
+                    // 401/429 换形态没有意义。
+                    attempt_idx += 1;
+                    if should_retry_usage_api_attempt(status, &msg, arn.is_some())
+                        && attempt_idx < total_attempts
+                    {
+                        tracing::debug!(
+                            "getUsageLimits 在 {} arn={} 返回 {:?}，试下一候选",
+                            cand_region,
+                            arn.map(|_| "real").unwrap_or("omit"),
+                            status
+                        );
+                        last_error = Some(msg);
+                        continue;
+                    }
+                    bail!("{}", msg);
                 }
-                bail!("{}", msg);
             }
         }
     }
@@ -815,9 +837,17 @@ async fn fetch_usage_limits_once(
     config: &Config,
     token: &str,
     region: &str,
+    profile_arn: Option<&str>,
 ) -> Result<UsageLimitsResponse, (Option<u16>, String)> {
     {
-        let response = build_usage_limits_request(client, credentials, config, token, region)
+        let response = build_usage_limits_request_with_arn(
+            client,
+            credentials,
+            config,
+            token,
+            region,
+            profile_arn,
+        )
             .send()
             .await
             .map_err(|e| (None, format!("获取使用额度失败: {}", e)))?;
@@ -849,21 +879,43 @@ async fn fetch_usage_limits_once(
 ///
 /// 抽出来的理由是本仓踩过的那类事故：同一个 URL 各写一份，改了一处漏另一处，
 /// 于是「探测打的」与「业务打的」静默分叉。探测的结论只有在两者同形时才有意义。
+/// 用量 GET 是否还应试下一「区 × ARN」候选。
+///
+/// 仅当本尝试**带了 ARN** 且 400 文案是 ARN 形态错误时，才把 400 当可回退
+///（否则 400 是真坏请求）。403 不论带不带 ARN 都可以换候选。
+pub(crate) fn should_retry_usage_api_attempt(
+    status: Option<u16>,
+    body: &str,
+    this_attempt_had_arn: bool,
+) -> bool {
+    match status {
+        Some(403) => true,
+        Some(400) if this_attempt_had_arn
+            && (body.contains("Improperly formed") || body.contains("Invalid profileArn")) =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
 fn usage_limits_endpoint(credentials: &KiroCredentials, region: &str) -> (String, String) {
+    usage_limits_endpoint_with_arn(
+        region,
+        credentials.usage_profile_arn().as_deref(),
+    )
+}
+
+fn usage_limits_endpoint_with_arn(region: &str, profile_arn: Option<&str>) -> (String, String) {
     // Kiro management API（已迁移，旧 q.{region}.amazonaws.com 不再提供本 REST 接口）
     let host = format!("management.{}.kiro.dev", region);
-    // 构建 URL（含 isEmailRequired=true，与 Kiro IDE 一致）
     let mut url = format!(
         "https://{}/getUsageLimits?isEmailRequired=true&origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
         host
     );
-    // profileArn：统一走 effective_profile_arn（与对话/端点路径同口径）——
-    // idc/social/api_key 缺 arn 回退默认 BuilderId,external_idp 用它自己租户的真实 arn。
-    // 关键修复：原先此处直接读 credentials.profile_arn 并对**所有**类型回退默认 BuilderId ARN,
-    // 导致 external_idp 号(带的是别的租户占位 arn)余额查询 403 Invalid token → 余额恒 null。
-    // effective_profile_arn 对 external_idp 缺真实 arn 时返回 None,此时不附带 profileArn 参数。
-    if let Some(arn) = credentials.effective_profile_arn() {
-        url.push_str(&format!("&profileArn={}", urlencoding::encode(&arn)));
+    // 用量 GET 只带真实 ARN。BuilderId 占位会 403 User is not authorized（2026-08-25）。
+    if let Some(arn) = profile_arn.filter(|a| !is_placeholder_profile_arn(a)) {
+        url.push_str(&format!("&profileArn={}", urlencoding::encode(arn)));
     }
     (host, url)
 }
@@ -888,6 +940,25 @@ pub(crate) fn build_usage_limits_request(
     token: &str,
     region: &str,
 ) -> reqwest::RequestBuilder {
+    let arn = credentials.usage_profile_arn();
+    build_usage_limits_request_with_arn(
+        client,
+        credentials,
+        config,
+        token,
+        region,
+        arn.as_deref(),
+    )
+}
+
+fn build_usage_limits_request_with_arn(
+    client: &reqwest::Client,
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    region: &str,
+    profile_arn: Option<&str>,
+) -> reqwest::RequestBuilder {
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     let user_agent = format!(
         "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
@@ -897,7 +968,7 @@ pub(crate) fn build_usage_limits_request(
         "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
         config.kiro_version, machine_id
     );
-    let (host, url) = usage_limits_endpoint(credentials, region);
+    let (host, url) = usage_limits_endpoint_with_arn(region, profile_arn);
 
     let mut request = client
         .get(&url)
@@ -8330,7 +8401,46 @@ impl MultiTokenManager {
     pub async fn get_usage_limits_for(&self, id: u64) -> anyhow::Result<UsageLimitsResponse> {
         // 双检刷新收敛到 ensure_valid_token：返回的 credentials 已是刷新后的最新快照，
         // 无需再单独重读一次凭据。
-        let (credentials, token) = self.ensure_valid_token(id).await?;
+        let (mut credentials, token) = self.ensure_valid_token(id).await?;
+
+        // 用量 GET 必须先有真实 ARN（8 月 25 日上游规则）。token 仍有效时刷新路径
+        // 不会跑 ListAvailableProfiles，新 IdC 号会带着占位去打 getUsageLimits → 403。
+        if credentials.usage_profile_arn().is_none() && !credentials.is_api_key_credential() {
+            let cfg = self.config.load_full();
+            let proxy = credentials.effective_proxy(self.proxy.as_ref());
+            let preferred = credentials.effective_upstream_region(&cfg).to_string();
+            match resolve_profile_arn_multi_region(
+                &credentials,
+                &cfg,
+                &token,
+                proxy.as_ref(),
+                &preferred,
+            )
+            .await
+            {
+                Ok(Some(arn)) => {
+                    {
+                        let mut entries = self.entries.lock();
+                        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                            entry.credentials.profile_arn = Some(arn.clone());
+                            entry.family_key = None;
+                            let _ = entry.credentials.sync_region_from_arn();
+                            credentials = entry.credentials.clone();
+                        }
+                    }
+                    if let Err(e) = self.persist_credentials() {
+                        tracing::warn!("凭据 #{} 回填 profileArn 后持久化失败: {}", id, e);
+                    }
+                    tracing::info!("凭据 #{} 用量查询前已解析并回填真实 profileArn", id);
+                }
+                Ok(None) => {
+                    tracing::debug!("凭据 #{} ListAvailableProfiles 无 profile，用量 GET 不带 ARN", id);
+                }
+                Err(e) => {
+                    tracing::debug!("凭据 #{} 用量查询前解析 profileArn 失败（继续不带 ARN）: {}", id, e);
+                }
+            }
+        }
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
         let cfg = self.config.load_full();

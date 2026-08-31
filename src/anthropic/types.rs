@@ -20,6 +20,8 @@ pub struct Model {
     #[serde(rename = "type")]
     pub model_type: String,
     pub max_tokens: i32,
+    /// 输入上下文窗口。对齐 ZyphrZero 未合 PR #83：客户端不能只看见输出 max_tokens。
+    pub context_window: i32,
 }
 
 /// 模型列表响应

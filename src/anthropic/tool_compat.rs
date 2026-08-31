@@ -689,6 +689,30 @@ pub(super) fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, Stri
     short
 }
 
+/// 把 prompt/历史正文里的超长原名换成已发给上游的短名（hank9999/kiro.rs #197）。
+/// `tool_name_map` 是 short → original；按 original 长度降序替换，避免短前缀误伤。
+pub(super) fn replace_mapped_tool_names_in_text(
+    text: &str,
+    tool_name_map: &HashMap<String, String>,
+) -> String {
+    if tool_name_map.is_empty() || text.is_empty() {
+        return text.to_string();
+    }
+    let mut pairs: Vec<(&str, &str)> = tool_name_map
+        .iter()
+        .map(|(short, orig)| (orig.as_str(), short.as_str()))
+        .filter(|(orig, short)| orig != short)
+        .collect();
+    pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    let mut out = text.to_string();
+    for (orig, short) in pairs {
+        if out.contains(orig) {
+            out = out.replace(orig, short);
+        }
+    }
+    out
+}
+
 /// 转换工具定义
 pub(super) fn convert_tools(
     tools: &Option<Vec<crate::anthropic::types::Tool>>,

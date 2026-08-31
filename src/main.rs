@@ -432,12 +432,16 @@ async fn main() {
         .expect("apiKey 为空——拒绝以无鉴权方式提供 /v1（空值会导致鉴权 fail-open）");
 
     // 构建代理配置
-    let proxy_config = config.proxy_url.as_ref().map(|url| {
+    let proxy_config = config.proxy_url.as_ref().and_then(|url| {
+        let url = url.trim();
+        if url.is_empty() {
+            return None;
+        }
         let mut proxy = http_client::ProxyConfig::new(url);
         if let (Some(username), Some(password)) = (&config.proxy_username, &config.proxy_password) {
             proxy = proxy.with_auth(username, password);
         }
-        proxy
+        Some(proxy)
     });
 
     if proxy_config.is_some() {
