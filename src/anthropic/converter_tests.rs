@@ -17,6 +17,14 @@
         let out = replace_mapped_tool_names_in_text(&text, &map);
         assert!(out.contains(&short), "{out}");
         assert!(!out.contains(&long), "{out}");
+        let mut builtins = HashMap::new();
+        builtins.insert("fs_write".into(), "Write".into());
+        builtins.insert("list_directory".into(), "LS".into());
+        assert_eq!(
+            replace_mapped_tool_names_in_text("Write a function then LS", &builtins),
+            "Write a function then LS",
+            "内置短名不得当子串替换"
+        );
     }
 
     #[test]

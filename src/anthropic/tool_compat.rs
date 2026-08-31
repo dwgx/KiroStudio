@@ -701,7 +701,7 @@ pub(super) fn replace_mapped_tool_names_in_text(
     let mut pairs: Vec<(&str, &str)> = tool_name_map
         .iter()
         .map(|(short, orig)| (orig.as_str(), short.as_str()))
-        .filter(|(orig, short)| orig != short)
+        .filter(|(orig, short)| orig.len() > TOOL_NAME_MAX_LEN && orig != short)
         .collect();
     pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
     let mut out = text.to_string();

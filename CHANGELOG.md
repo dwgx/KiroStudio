@@ -2,6 +2,14 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [1.2.3] - 2026-09-01 - 直播 SSE hop 抽干 / 直连 MCP ARN
+
+相对 tag v1.2.2 / `be59a33`。本窗 `cargo test --no-default-features --locked`：**2297 passed; 0 failed**。未改 12 键、absorb、AIMD、sticky、客户端 Key。不改已推的 v1.2.2 对象。
+
+- 直播 SSE：`select!` biased + hop 优先；task 完成后 `try_recv` 抽干已入队 hop；断开时若已完成仍 emit。
+- hank 写回：`replace_mapped_tool_names_in_text` 只替换 `orig.len() > 63`，不再误伤 `Write`/`LS`。
+- MCP 无号直连：OAuth / 有真实 ARN 的 external_idp 发 `x-amzn-kiro-profile-arn`（runtime 主机要求）；ksk_ 永不发。
+
 ## [1.2.2] - 2026-09-01 - 用量 ARN / 混合搜索直播 SSE / 八月黄金
 
 相对 tag v1.2.1 / `3d7ed6c`。含公开已合 [#3](https://github.com/dwgx/KiroStudio/pull/3)/[#4](https://github.com/dwgx/KiroStudio/pull/4)。本机 `cargo test --no-default-features --locked`：**2296 passed; 0 failed**。未改 12 键、absorb、AIMD、sticky、客户端 Key。

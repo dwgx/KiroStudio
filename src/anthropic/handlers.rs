@@ -8525,7 +8525,16 @@ mod websearch_usage_accounting_tests {
         .concat();
         assert!(
             prod.contains(&needle),
-            "dispatch_web_search_loop 必须把 wants_stream 传入埋点（旧代码恒 false）"
+            "非流式回灌必须把 wants_stream 传入埋点（旧代码恒 false）"
+        );
+        let live = [
+            "emit_websearch_loop_usage(&p_ok, success, &c_ok, ",
+            "true)",
+        ]
+        .concat();
+        assert!(
+            prod.contains(&live),
+            "直播 SSE 成功臂必须 emit_websearch_loop_usage(..., true)"
         );
     }
 

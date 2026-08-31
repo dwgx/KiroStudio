@@ -5259,10 +5259,8 @@ impl MultiTokenManager {
     /// `acquire_context` 的选号要过 `is_entry_selectable` 全部门槛（禁用 / 冷却 /
     /// custom_api 结构性排除等）——纯 custom_api 透传池或全池禁用时它**选不到号**，
     /// WebSearch 快路径的 MCP 调用因此失败（502）。而 MCP（web_search）调用本质只
-    /// 依赖一个有效的 Kiro Bearer token（kiro-gateway 的 mcp_tools.py 证明：只带
-    /// `Authorization: Bearer` + `x-amzn-codewhisperer-optout` + `Content-Type` 即可
-    /// 调通 `runtime.{region}.kiro.dev/mcp`，**不依赖 profileArn**），不该被对话
-    /// 路径的选号门槛绑架。
+    /// 依赖一个有效的 Kiro Bearer token，不该被对话路径的选号门槛绑架。ARN 头由
+    /// `call_mcp_direct` 按凭据类型决定（OAuth 带、ksk_ 不带），不在本方法里组。
     ///
     /// 本方法刻意**绕过选号门槛**：只要凭据带 Kiro token 就直接可用——
     /// - `access_token` 非空（OAuth 号优先：直连 URL 是 `runtime.*.kiro.dev/mcp`，
