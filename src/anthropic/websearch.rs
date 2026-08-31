@@ -2064,40 +2064,24 @@ pub(super) fn mixed_websearch_stream_response(
         let ping_bytes = Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n");
         loop {
             tokio::select! {
-                _ = byte_tx.closed() => {
-                    task.abort();
-                    break;
-                }
-                _ = ping.tick() => {
-                    if byte_tx.send(Ok(ping_bytes.clone())).await.is_err() {
-                        task.abort();
-                        break;
-                    }
-                }
+                biased;
                 hop = hop_rx.recv(), if hops_open => {
                     match hop {
-                        Some(WebSearchLiveEvent::Begin { query, srv_id }) => {
-                            for ev in live_search_begin_events(index, &query, &srv_id) {
-                                if byte_tx.send(Ok(Bytes::from(ev.to_sse_string()))).await.is_err() {
+                        Some(ev) => {
+                            if send_live_hop(&byte_tx, &mut index, ev).await.is_err() {
+                                if !task.is_finished() {
                                     task.abort();
-                                    return;
                                 }
+                                return;
                             }
-                            index += 1;
-                        }
-                        Some(WebSearchLiveEvent::Done { srv_id, query: _, results }) => {
-                            for ev in live_search_done_events(index, &srv_id, &results) {
-                                if byte_tx.send(Ok(Bytes::from(ev.to_sse_string()))).await.is_err() {
-                                    task.abort();
-                                    return;
-                                }
-                            }
-                            index += 1;
                         }
                         None => hops_open = false,
                     }
                 }
                 res = &mut task => {
+                    while let Ok(ev) = hop_rx.try_recv() {
+                        let _ = send_live_hop(&byte_tx, &mut index, ev).await;
+                    }
                     match res {
                         Ok(Ok(success)) => {
                             on_ok(&success);
@@ -2118,6 +2102,27 @@ pub(super) fn mixed_websearch_stream_response(
                         }
                     }
                     break;
+                }
+                _ = byte_tx.closed() => {
+                    if task.is_finished() {
+                        if let Ok(res) = (&mut task).await {
+                            match res {
+                                Ok(success) => on_ok(&success),
+                                Err(fail) => on_err(&fail),
+                            }
+                        }
+                    } else {
+                        task.abort();
+                    }
+                    break;
+                }
+                _ = ping.tick() => {
+                    if byte_tx.send(Ok(ping_bytes.clone())).await.is_err() {
+                        if !task.is_finished() {
+                            task.abort();
+                        }
+                        break;
+                    }
                 }
             }
         }
@@ -2156,6 +2161,29 @@ fn loop_message_start_bytes(model: &str, input_tokens: i32) -> Bytes {
         }),
     );
     Bytes::from(ev.to_sse_string())
+}
+
+async fn send_live_hop(
+    byte_tx: &tokio::sync::mpsc::Sender<Result<Bytes, Infallible>>,
+    index: &mut i32,
+    hop: WebSearchLiveEvent,
+) -> Result<(), ()> {
+    let events = match hop {
+        WebSearchLiveEvent::Begin { query, srv_id } => live_search_begin_events(*index, &query, &srv_id),
+        WebSearchLiveEvent::Done {
+            srv_id,
+            query: _,
+            results,
+        } => live_search_done_events(*index, &srv_id, &results),
+    };
+    for ev in events {
+        byte_tx
+            .send(Ok(Bytes::from(ev.to_sse_string())))
+            .await
+            .map_err(|_| ())?;
+    }
+    *index += 1;
+    Ok(())
 }
 
 fn live_search_begin_events(index: i32, query: &str, srv_id: &str) -> Vec<SseEvent> {

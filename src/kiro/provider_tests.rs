@@ -80,19 +80,19 @@
         assert_eq!(KiroProvider::passthrough_cooldown_for(600), (0, None));
     }
 
-    // ===== MCP 无号直连（P0：web_search 快路径去 profileArn 依赖）=====
+    // ===== MCP 无号直连（OAuth 带头 / ksk_ 永不带）=====
 
-    /// 直连头契约：**绝不注入 profileArn**（kiro-gateway 证明上游不依赖它），
-    /// 只带 gateway 同款的最小三件套 + 按凭据类型的 tokentype。
+    /// social 有真实 ARN：直连头必须带 `x-amzn-kiro-profile-arn`（runtime 主机要求）。
     #[test]
-    fn mcp_direct_headers_never_inject_profile_arn() {
+    fn mcp_direct_headers_oauth_sends_profile_arn() {
         let mut social = KiroCredentials::default();
         social.auth_method = Some("social".to_string());
         social.profile_arn = Some("arn:aws:codewhisperer:us-east-1:1:profile/OWN".to_string());
         let headers = KiroProvider::mcp_direct_headers(&social, "tok");
         assert!(
-            !headers.iter().any(|(k, _)| *k == "x-amzn-kiro-profile-arn"),
-            "直连头绝不允许出现 profileArn（social 号自带 ARN 也一样不带）"
+            headers.iter().any(|(k, v)| *k == "x-amzn-kiro-profile-arn"
+                && v == "arn:aws:codewhisperer:us-east-1:1:profile/OWN"),
+            "OAuth 直连必须带头，且值为 effective_profile_arn"
         );
         assert!(
             headers.iter().any(|(k, v)| *k == "Authorization" && v == "Bearer tok"),
@@ -102,11 +102,32 @@
             headers
                 .iter()
                 .any(|(k, v)| *k == "x-amzn-codewhisperer-optout" && v == "false"),
-            "必须带 x-amzn-codewhisperer-optout（gateway 同款）"
+            "必须带 x-amzn-codewhisperer-optout"
         );
         assert!(
             !headers.iter().any(|(k, _)| *k == "tokentype"),
             "social 号不带 tokentype"
+        );
+    }
+
+    /// ksk_ 即使库里有 profile_arn 也绝不带头（IDE 主机 + CLI 令牌）。
+    #[test]
+    fn mcp_direct_headers_api_key_never_sends_profile_arn() {
+        let mut api_key = KiroCredentials::default();
+        api_key.auth_method = Some("api_key".to_string());
+        api_key.kiro_api_key = Some("ksk_x".to_string());
+        api_key.profile_arn =
+            Some("arn:aws:codewhisperer:us-east-1:1:profile/OWN".to_string());
+        let headers = KiroProvider::mcp_direct_headers(&api_key, "ksk_x");
+        assert!(
+            !headers.iter().any(|(k, _)| *k == "x-amzn-kiro-profile-arn"),
+            "ksk_ 直连永不带 profileArn"
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| *k == "tokentype" && v == "API_KEY"),
+            "ksk_ 号直连必须带 tokentype: API_KEY"
         );
     }
 
@@ -123,9 +144,13 @@
                 .any(|(k, v)| *k == "tokentype" && v == "API_KEY"),
             "ksk_ 号直连必须带 tokentype: API_KEY"
         );
+        assert!(
+            !headers.iter().any(|(k, _)| *k == "x-amzn-kiro-profile-arn"),
+            "缺 ARN 的 ksk_ 也不带头"
+        );
     }
 
-    /// external_idp 号直连带 `tokentype: EXTERNAL_IDP`。
+    /// external_idp 号直连带 `tokentype: EXTERNAL_IDP`；有真实 ARN 才带头。
     #[test]
     fn mcp_direct_headers_external_idp_gets_tokentype() {
         let mut ext = KiroCredentials::default();
@@ -136,6 +161,19 @@
                 .iter()
                 .any(|(k, v)| *k == "tokentype" && v == "EXTERNAL_IDP"),
             "external_idp 号直连必须带 tokentype: EXTERNAL_IDP"
+        );
+        assert!(
+            !headers.iter().any(|(k, _)| *k == "x-amzn-kiro-profile-arn"),
+            "external_idp 缺真实 ARN 不得套占位"
+        );
+
+        ext.profile_arn =
+            Some("arn:aws:codewhisperer:us-east-1:9:profile/TENANT".to_string());
+        let headers = KiroProvider::mcp_direct_headers(&ext, "t");
+        assert!(
+            headers.iter().any(|(k, v)| *k == "x-amzn-kiro-profile-arn"
+                && v == "arn:aws:codewhisperer:us-east-1:9:profile/TENANT"),
+            "external_idp 有真实 ARN 必须带头"
         );
     }
 

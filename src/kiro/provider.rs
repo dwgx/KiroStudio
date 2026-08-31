@@ -1255,7 +1255,8 @@ impl KiroProvider {
     /// `call_mcp_with_retry` 因「池子选不到号」失败时（错误带
     /// [`MCP_POOL_UNAVAILABLE_MARKER`] 标记 —— 纯 custom_api 透传池 / 全池禁用的
     /// 结构信号），改走 [`Self::call_mcp_direct`]：用池里**任意**带 Kiro Bearer
-    /// token 的凭据直连 MCP 端点（不注入 profileArn，kiro-gateway 证明的形态）。
+    /// token 的凭据直连 MCP 端点。OAuth 与有号路径同口径带
+    /// `x-amzn-kiro-profile-arn`（runtime 主机 2026-08 起要求）；ksk_ 永不带。
     /// 直连失败 → 降级返回原错误（客户端行为与现状逐字节一致）。
     ///
     /// **有号路径零变化**：直连只在 `acquire_context` 彻底失败后触发，成功路径
@@ -1298,12 +1299,13 @@ impl KiroProvider {
     /// 快路径 MCP 调用此前**硬依赖 Kiro 池号**：`acquire_context` 的选号要求凭据
     /// 过 `is_entry_selectable`（禁用 / 冷却 / custom_api 结构性排除），纯 custom_api
     /// 透传池（线上现状：4 个代挂号）**一个号都选不到** → WebSearch 快路径恒 502。
-    /// 而 MCP（web_search）调用本质只依赖一个有效的 Kiro Bearer token ——
-    /// kiro-gateway 的 mcp_tools.py 证明 `Authorization: Bearer` +
-    /// `x-amzn-codewhisperer-optout` + `Content-Type` 即可调通
-    /// `runtime.{region}.kiro.dev/mcp`，**不依赖 profileArn**。本方法实现同一形态：
+    /// 而 MCP（web_search）调用本质只依赖一个有效的 Kiro Bearer token。
     /// token 从凭据池现取（`token_manager.acquire_mcp_direct_token`，绕过选号门槛），
-    /// 请求头按 gateway 同款构造，**不注入 `x-amzn-kiro-profile-arn`**。
+    /// URL 固定 `runtime.{region}.kiro.dev/mcp`。该主机 2026-08 起要求
+    /// `x-amzn-kiro-profile-arn`（无头 → 400 `profileArn is required`；
+    /// `q.*.amazonaws.com/mcp` 有无 ARN 都 200）。OAuth 与
+    /// [`crate::kiro::endpoint::ide::IdeEndpoint::decorate_mcp`] 同口径带头；
+    /// ksk_ **永不**带头（IDE 主机 + CLI 令牌套 ARN 会 403 Invalid token）。
     ///
     /// # 边界
     ///
@@ -1406,18 +1408,24 @@ impl KiroProvider {
         }
     }
 
-    /// MCP 无号直连的请求头（纯函数，便于单测钉死「无 profileArn」契约）。
+    /// MCP 无号直连的请求头（纯函数，单测定死 OAuth 带头 / ksk_ 永不带）。
     ///
-    /// 对齐 kiro-gateway mcp_tools.py 的已证可实现形态：`Authorization` +
-    /// `x-amzn-codewhisperer-optout`，**刻意不注入 `x-amzn-kiro-profile-arn`**
-    /// （gateway 证明上游 MCP 端点不依赖 profileArn）。另按凭据类型补 tokentype
-    /// （与 decorate_mcp 同口径：api_key → API_KEY / external_idp → EXTERNAL_IDP），
-    /// 保住 ksk_ 号的既有认证语义。
+    /// runtime MCP 要 `x-amzn-kiro-profile-arn`。OAuth 用
+    /// [`KiroCredentials::effective_profile_arn`]（与 `decorate_mcp` 同口径，
+    /// 含 idc/social 缺 ARN 时的 BuilderId 占位）。ksk_ 即使库里有 `profile_arn`
+    /// 也不发：直连固定 IDE 主机，CLI 令牌套 ARN 会 403。
+    /// tokentype 与 decorate_mcp 同口径：api_key → API_KEY / external_idp → EXTERNAL_IDP。
     fn mcp_direct_headers(cred: &KiroCredentials, token: &str) -> Vec<(&'static str, String)> {
         let mut headers = vec![
             ("x-amzn-codewhisperer-optout", "false".to_string()),
             ("Authorization", format!("Bearer {}", token)),
         ];
+        // ksk_ 必须先于 effective_profile_arn：后者在库里已有 ARN 时会原样返回。
+        if !cred.is_api_key_credential() {
+            if let Some(arn) = cred.effective_profile_arn() {
+                headers.push(("x-amzn-kiro-profile-arn", arn));
+            }
+        }
         if cred.is_api_key_credential() {
             headers.push(("tokentype", "API_KEY".to_string()));
         } else if cred.is_external_idp_credential() {
