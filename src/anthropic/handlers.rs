@@ -640,32 +640,51 @@ async fn dispatch_web_search_loop(
     // `stream` 必须在 payload 被 move 进循环之前取（循环内会追加回灌消息、消费 payload）。
     let wants_stream = payload.stream;
 
+    if wants_stream {
+        let p_ok = provider.clone();
+        let c_ok = client.clone();
+        let p_err = provider.clone();
+        let c_err = client.clone();
+        let payload_err = (*payload).clone();
+        return Some(
+            sse_event_stream_builder()
+                .body(websearch::mixed_websearch_stream_response(
+                    provider.clone(),
+                    (*payload).clone(),
+                    fallback_input_tokens,
+                    budget.clone(),
+                    Box::new(move |success| {
+                        tracing::info!(
+                            hops = success.hops.len(),
+                            rounds = success.rounds,
+                            "WebSearch 回灌直播结束"
+                        );
+                        emit_websearch_loop_usage(&p_ok, success, &c_ok, true);
+                    }),
+                    Box::new(move |fail| {
+                        emit_websearch_loop_error_usage(&p_err, &payload_err, fail, &c_err, true);
+                    }),
+                ))
+                .unwrap(),
+        );
+    }
+
     let resp = match websearch::run_web_search_loop(
         provider.clone(),
         (*payload).clone(),
         fallback_input_tokens,
         budget,
+        None,
     )
     .await
     {
         Ok(success) => {
             emit_websearch_loop_usage(provider, &success, client, wants_stream);
-            if wants_stream {
-                let bytes: Vec<Result<Bytes, Infallible>> =
-                    websearch::build_loop_sse_events(&success)
-                        .into_iter()
-                        .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                        .collect();
-                sse_event_stream_builder()
-                    .body(Body::from_stream(stream::iter(bytes)))
-                    .unwrap()
-            } else {
-                (
-                    StatusCode::OK,
-                    Json(websearch::build_loop_json_body(&success)),
-                )
-                    .into_response()
-            }
+            (
+                StatusCode::OK,
+                Json(websearch::build_loop_json_body(&success)),
+            )
+                .into_response()
         }
         Err(mut fail) => {
             // 回灌失败响应可能带 x-kirostudio-compress-retry 内部标记（上游 400
@@ -2696,6 +2715,7 @@ pub async fn get_models() -> impl IntoResponse {
             display_name: s.display_name.to_string(),
             model_type: "chat".to_string(),
             max_tokens: s.max_output,
+            context_window: s.context_window,
         });
         if s.supports_1m {
             models.push(Model {
@@ -2706,6 +2726,7 @@ pub async fn get_models() -> impl IntoResponse {
                 display_name: format!("{} (1M)", s.display_name),
                 model_type: "chat".to_string(),
                 max_tokens: s.max_output,
+                context_window: 1_000_000,
             });
         }
     }
@@ -8549,13 +8570,11 @@ mod websearch_usage_accounting_tests {
             .expect("dispatch 体应在 render_provider_not_configured 之前结束");
         let call = [
             "emit_websearch_loop_error_usage(",
-            "provider, payload, &fail, client, ",
-            "wants_stream)",
         ]
         .concat();
         assert!(
             dispatch.contains(&call),
-            "回灌 Err 臂必须调用失败埋点（旧代码只回 Response，面板上看不到失败混合搜索）"
+            "回灌失败必须埋点（直播 SSE 走 on_err，非流式走 Err 臂）"
         );
         let emit_fn = prod
             .split("fn emit_websearch_loop_error_usage")

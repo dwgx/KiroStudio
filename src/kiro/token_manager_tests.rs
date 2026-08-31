@@ -1,5 +1,32 @@
     use super::*;
 
+    #[test]
+    fn test_usage_limits_url_omits_placeholder_and_encodes_real_arn() {
+        let mut idc = KiroCredentials::default();
+        idc.auth_method = Some("idc".to_string());
+        idc.profile_arn = None;
+        let url = usage_limits_probe_url(&idc, "us-east-1");
+        assert!(
+            !url.contains("profileArn="),
+            "缺真实 ARN 时用量 URL 不得带占位: {url}"
+        );
+
+        idc.profile_arn = Some(DEFAULT_BUILDER_ID_PROFILE_ARN.to_string());
+        let url = usage_limits_probe_url(&idc, "us-east-1");
+        assert!(
+            !url.contains("profileArn="),
+            "存着的占位 ARN 也不得进用量 query: {url}"
+        );
+
+        idc.profile_arn =
+            Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL".to_string());
+        let url = usage_limits_probe_url(&idc, "us-east-1");
+        assert!(
+            url.contains("profileArn=arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A123456789012%3Aprofile%2FREAL"),
+            "真实 ARN 必须 URL 编码进 query: {url}"
+        );
+    }
+
     // ===== MCP 无号直连：acquire_mcp_direct_token（纯逻辑）=====
 
     /// 造一个 custom_api 代挂号（只有 base_url + api_key，无 Kiro token）。
@@ -6634,22 +6661,39 @@
         // 状态码现由 fetch_usage_limits_once 以 Err((Option<u16>, String)) 回传，
         // 故门控写成 `status == Some(403)`（原字面量 `status.as_u16() == 403` 已不存在）。
         // 语义未变：仍是「403 且仍有候选」才回退。
-        let guard = format!("status == Some(403) && idx + 1 <{}", " candidates.len()");
+        let guard = format!("should_retry_usage_api_attempt{}", "(");
         assert!(
             body.contains(&guard),
-            "回退必须门控在 403 且仍有候选：401(token 真废)/429(限流)换端点都没意义，\
-             对它们回退只会把失败的上游往返翻倍"
+            "回退必须走 should_retry_usage_api_attempt：403 换候选；带 ARN 的 400 Improperly formed/Invalid profileArn 也换；401/429 不换"
         );
         // 单区查询必须存在：本函数的回退循环就靠它做「一次一个区」。
-        // ⚠️ 它**不再**服务 region 探测（2026-08-06 起探测改打 q.* 真实对话端点，
-        // 见本文件 get_usage_limits 上方那段注释），所以别再把「探测依赖它」
-        // 当作保留理由 —— 现在的理由只是本函数的回退循环需要它。
         let single = format!("async fn fetch_usage_limits_once{}", "(");
         assert!(
             prod.contains(&single),
             "get_usage_limits 的 403 换区回退依赖单区查询 fetch_usage_limits_once，\
              把它内联回去就没法「一次一个区」了"
         );
+    }
+
+    #[test]
+    fn test_should_retry_usage_api_attempt_400_only_with_arn() {
+        assert!(should_retry_usage_api_attempt(Some(403), "nope", false));
+        assert!(should_retry_usage_api_attempt(
+            Some(400),
+            "Invalid profileArn.",
+            true
+        ));
+        assert!(should_retry_usage_api_attempt(
+            Some(400),
+            "Improperly formed request",
+            true
+        ));
+        assert!(
+            !should_retry_usage_api_attempt(Some(400), "Invalid profileArn.", false),
+            "不带 ARN 的 400 不是 ARN 形态问题"
+        );
+        assert!(!should_retry_usage_api_attempt(Some(401), "nope", true));
+        assert!(!should_retry_usage_api_attempt(Some(429), "nope", true));
     }
 
     /// `ids_needing_region_probe` 的判据表：只挑「api_key 且完全无 region 字段」的。

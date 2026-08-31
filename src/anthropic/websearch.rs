@@ -242,7 +242,7 @@ pub struct McpContent {
 }
 
 /// WebSearch 搜索结果
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[allow(dead_code)]
 pub struct WebSearchResults {
     pub results: Vec<WebSearchResult>,
@@ -488,6 +488,39 @@ pub fn extract_search_query(req: &MessagesRequest) -> Option<String> {
         .unwrap_or_else(|| trimmed.to_string());
 
     if query.is_empty() { None } else { Some(query) }
+}
+
+/// 从 web_search tool_use input 取查询词。模型常吐 `search_query` / `q` / `queries`
+/// 而不是 `query`（ZyphrZero 0.7.5 PR #57）。缺参才整轮失败。
+fn web_search_query_from_input(input: &Value) -> Option<String> {
+    fn nonempty_str(v: &Value) -> Option<String> {
+        v.as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+    for key in ["query", "search_query", "q", "text"] {
+        if let Some(s) = input.get(key).and_then(nonempty_str) {
+            return Some(s);
+        }
+    }
+    if let Some(arr) = input.get("queries").and_then(|v| v.as_array()) {
+        let joined: Vec<String> = arr.iter().filter_map(nonempty_str).collect();
+        if !joined.is_empty() {
+            return Some(joined.join(" "));
+        }
+    }
+    if let Some(obj) = input.as_object() {
+        for v in obj.values() {
+            if let Some(s) = v.get("text").and_then(nonempty_str) {
+                return Some(s);
+            }
+            if let Some(s) = v.get("query").and_then(nonempty_str) {
+                return Some(s);
+            }
+        }
+    }
+    None
 }
 
 /// 生成22位大小写字母和数字的随机字符串
@@ -1400,12 +1433,7 @@ async fn decode_round(
                         if tool_use_name_is_web_search(&tu.name)
                             || tool_use_name_is_web_search(&name)
                         {
-                            let query = input
-                                .get("query")
-                                .and_then(|v| v.as_str())
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty())
-                                .map(str::to_string);
+                            let query = web_search_query_from_input(&input);
                             let Some(query) = query else {
                                 tracing::warn!("WebSearch 回灌 web_search 缺 query，整轮失败");
                                 out.stream_error = true;
@@ -1520,6 +1548,25 @@ pub(super) struct WebSearchLoopSuccess {
     pub credits: f64,
     /// 累计上游往返次数（含首轮），供埋点看放大倍数
     pub rounds: u32,
+    /// 本请求实际完成的 MCP 搜索次数（hop 追踪）。
+    pub hops: Vec<WebSearchHop>,
+}
+
+/// 一次网关内部 MCP 搜索。
+#[derive(Debug, Clone)]
+pub(super) struct WebSearchHop {
+    pub query: String,
+    pub n_results: usize,
+}
+
+/// 直播 SSE：搜索开始 / 搜索结束（带结果块）。
+pub(super) enum WebSearchLiveEvent {
+    Begin { query: String, srv_id: String },
+    Done {
+        srv_id: String,
+        query: String,
+        results: Option<WebSearchResults>,
+    },
 }
 
 /// 回灌循环失败：HTTP 响应给客户端；用量字段给埋点（拿不到的保持 None，不编造成功）。
@@ -1760,6 +1807,7 @@ pub(super) async fn run_web_search_loop(
     mut payload: MessagesRequest,
     fallback_input_tokens: i32,
     budget: &crate::kiro::provider::SharedRetryBudget,
+    hops_tx: Option<tokio::sync::mpsc::UnboundedSender<WebSearchLiveEvent>>,
 ) -> Result<WebSearchLoopSuccess, WebSearchLoopError> {
     let mut presentation: Vec<Value> = Vec::new();
     let mut last_credential_id: Option<u64> = None;
@@ -1768,6 +1816,7 @@ pub(super) async fn run_web_search_loop(
     let mut last_mapped_model: Option<String> = None;
     let mut last_context_input: Option<i32> = None;
     let mut total_credits = 0.0;
+    let mut hops: Vec<WebSearchHop> = Vec::new();
     // 客户端是否声明 thinking（决定收尾是否下发 thinking 块）。必须在循环外取：
     // 循环内 payload 会被追加回灌消息，但 thinking 声明本身不变。
     let thinking_enabled = payload.thinking.as_ref().is_some_and(|t| t.is_enabled());
@@ -1803,13 +1852,39 @@ pub(super) async fn run_web_search_loop(
             let mut budget_exhausted = false;
             for ws in &round.web_search {
                 let (srv_id, mcp_request) = create_mcp_request(&ws.query);
-                match call_mcp_api(&provider, &mcp_request, budget).await {
-                    Ok((resp, _credential_id)) => searched.push(SearchedWebSearch {
-                        upstream_id: ws.id.clone(),
+                if let Some(tx) = hops_tx.as_ref() {
+                    let _ = tx.send(WebSearchLiveEvent::Begin {
                         query: ws.query.clone(),
-                        srv_id,
-                        results: parse_search_results(&resp),
-                    }),
+                        srv_id: srv_id.clone(),
+                    });
+                }
+                match call_mcp_api(&provider, &mcp_request, budget).await {
+                    Ok((resp, _credential_id)) => {
+                        let results = parse_search_results(&resp);
+                        let n_results = results.as_ref().map(|r| r.results.len()).unwrap_or(0);
+                        hops.push(WebSearchHop {
+                            query: ws.query.clone(),
+                            n_results,
+                        });
+                        tracing::info!(
+                            query = %ws.query,
+                            n_results,
+                            "WebSearch hop 完成"
+                        );
+                        if let Some(tx) = hops_tx.as_ref() {
+                            let _ = tx.send(WebSearchLiveEvent::Done {
+                                srv_id: srv_id.clone(),
+                                query: ws.query.clone(),
+                                results: results.clone(),
+                            });
+                        }
+                        searched.push(SearchedWebSearch {
+                            upstream_id: ws.id.clone(),
+                            query: ws.query.clone(),
+                            srv_id,
+                            results,
+                        });
+                    }
                     Err(e) => {
                         tracing::warn!("WebSearch 回灌 MCP 调用失败: {}", e);
                         // ⭐ 共享预算耗尽（同快路径判据）：部分结果收尾 —— 已搜索
@@ -1924,6 +1999,7 @@ pub(super) async fn run_web_search_loop(
             credential_id: last_credential_id.unwrap_or(0),
             credits: total_credits,
             rounds: round_idx as u32 + 1,
+            hops,
         });
     }
 
@@ -1953,6 +2029,180 @@ pub(super) async fn run_web_search_loop(
         (MAX_WEB_SEARCH_ROUNDS as u32).saturating_add(1),
         last_context_input.unwrap_or(fallback_input_tokens),
     ))
+}
+
+/// 混合搜索流式：立刻 `message_start` + 25s ping + 每 hop 下发搜索块；
+/// 客户端断开则 abort 回灌。对齐 ZyphrZero 0.8.0 PR #67 Anthropic 半边。
+pub(super) fn mixed_websearch_stream_response(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    payload: MessagesRequest,
+    fallback_input_tokens: i32,
+    budget: crate::kiro::provider::SharedRetryBudget,
+    on_ok: Box<dyn FnOnce(&WebSearchLoopSuccess) + Send>,
+    on_err: Box<dyn FnOnce(&WebSearchLoopError) + Send>,
+) -> Body {
+    let (hop_tx, mut hop_rx) = tokio::sync::mpsc::unbounded_channel::<WebSearchLiveEvent>();
+    let (byte_tx, byte_rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(32);
+    let model = payload.model.clone();
+    let mut task = tokio::spawn(async move {
+        run_web_search_loop(provider, payload, fallback_input_tokens, &budget, Some(hop_tx)).await
+    });
+
+    tokio::spawn(async move {
+        let start = loop_message_start_bytes(&model, fallback_input_tokens);
+        if byte_tx.send(Ok(start)).await.is_err() {
+            task.abort();
+            return;
+        }
+        let mut ping = tokio::time::interval_at(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(25),
+            std::time::Duration::from_secs(25),
+        );
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut index = 0i32;
+        let mut hops_open = true;
+        let ping_bytes = Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n");
+        loop {
+            tokio::select! {
+                _ = byte_tx.closed() => {
+                    task.abort();
+                    break;
+                }
+                _ = ping.tick() => {
+                    if byte_tx.send(Ok(ping_bytes.clone())).await.is_err() {
+                        task.abort();
+                        break;
+                    }
+                }
+                hop = hop_rx.recv(), if hops_open => {
+                    match hop {
+                        Some(WebSearchLiveEvent::Begin { query, srv_id }) => {
+                            for ev in live_search_begin_events(index, &query, &srv_id) {
+                                if byte_tx.send(Ok(Bytes::from(ev.to_sse_string()))).await.is_err() {
+                                    task.abort();
+                                    return;
+                                }
+                            }
+                            index += 1;
+                        }
+                        Some(WebSearchLiveEvent::Done { srv_id, query: _, results }) => {
+                            for ev in live_search_done_events(index, &srv_id, &results) {
+                                if byte_tx.send(Ok(Bytes::from(ev.to_sse_string()))).await.is_err() {
+                                    task.abort();
+                                    return;
+                                }
+                            }
+                            index += 1;
+                        }
+                        None => hops_open = false,
+                    }
+                }
+                res = &mut task => {
+                    match res {
+                        Ok(Ok(success)) => {
+                            on_ok(&success);
+                            for ev in build_loop_sse_tail(&success, index, true) {
+                                if byte_tx.send(Ok(Bytes::from(ev.to_sse_string()))).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(Err(fail)) => {
+                            on_err(&fail);
+                            let ev = SseEvent::error_event("api_error", "WebSearch 回灌失败");
+                            let _ = byte_tx.send(Ok(Bytes::from(ev.to_sse_string()))).await;
+                        }
+                        Err(_) => {
+                            let ev = SseEvent::error_event("api_error", "WebSearch 回灌被中断");
+                            let _ = byte_tx.send(Ok(Bytes::from(ev.to_sse_string()))).await;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    });
+
+    let stream = futures::stream::unfold(byte_rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
+    Body::from_stream(stream)
+}
+
+fn loop_message_start_bytes(model: &str, input_tokens: i32) -> Bytes {
+    let message_id = format!(
+        "msg_{}",
+        Uuid::new_v4().to_string().replace('-', "")[..24].to_string()
+    );
+    let ev = SseEvent::new(
+        "message_start",
+        json!({
+            "type": "message_start",
+            "message": {
+                "id": message_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0
+                }
+            }
+        }),
+    );
+    Bytes::from(ev.to_sse_string())
+}
+
+fn live_search_begin_events(index: i32, query: &str, srv_id: &str) -> Vec<SseEvent> {
+    vec![
+        SseEvent::new(
+            "content_block_start",
+            json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {
+                    "id": srv_id,
+                    "type": "server_tool_use",
+                    "name": "web_search",
+                    "input": {"query": query}
+                }
+            }),
+        ),
+        SseEvent::new(
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": index}),
+        ),
+    ]
+}
+
+fn live_search_done_events(
+    index: i32,
+    srv_id: &str,
+    results: &Option<WebSearchResults>,
+) -> Vec<SseEvent> {
+    vec![
+        SseEvent::new(
+            "content_block_start",
+            json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {
+                    "type": "web_search_tool_result",
+                    "tool_use_id": srv_id,
+                    "content": build_result_block(results)
+                }
+            }),
+        ),
+        SseEvent::new(
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": index}),
+        ),
+    ]
 }
 
 /// 把回灌循环的最终 content 渲染成一串 SSE 事件（客户端要 stream 时用）。
@@ -1986,9 +2236,21 @@ pub(super) fn build_loop_sse_events(success: &WebSearchLoopSuccess) -> Vec<SseEv
         }),
     ));
 
-    for (index, block) in success.content.iter().enumerate() {
-        let index = index as i32;
+    events.extend(build_loop_sse_tail(success, 0, false));
+    events
+}
+
+fn build_loop_sse_tail(
+    success: &WebSearchLoopSuccess,
+    mut index: i32,
+    skip_search: bool,
+) -> Vec<SseEvent> {
+    let mut events = Vec::new();
+    for block in success.content.iter() {
         let btype = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if skip_search && (btype == "server_tool_use" || btype == "web_search_tool_result") {
+            continue;
+        }
         match btype {
             "thinking" => {
                 let thinking = block.get("thinking").and_then(|v| v.as_str()).unwrap_or("");
@@ -2092,6 +2354,7 @@ pub(super) fn build_loop_sse_events(success: &WebSearchLoopSuccess) -> Vec<SseEv
             }
             _ => {}
         }
+        index += 1;
     }
 
     events.push(SseEvent::new(
@@ -2416,6 +2679,32 @@ mod tests {
 
         let query = extract_search_query(&req);
         assert_eq!(query, Some("What is the weather today?".to_string()));
+    }
+
+    #[test]
+    fn test_web_search_query_from_input_aliases() {
+        assert_eq!(
+            web_search_query_from_input(&json!({"query": " rust "})).as_deref(),
+            Some("rust")
+        );
+        assert_eq!(
+            web_search_query_from_input(&json!({"search_query": "foo"})).as_deref(),
+            Some("foo")
+        );
+        assert_eq!(
+            web_search_query_from_input(&json!({"q": "bar"})).as_deref(),
+            Some("bar")
+        );
+        assert_eq!(
+            web_search_query_from_input(&json!({"queries": ["a", "b"]})).as_deref(),
+            Some("a b")
+        );
+        assert_eq!(
+            web_search_query_from_input(&json!({"nested": {"text": "nested-q"}})).as_deref(),
+            Some("nested-q")
+        );
+        assert_eq!(web_search_query_from_input(&json!({"query": "  "})), None);
+        assert_eq!(web_search_query_from_input(&json!({})), None);
     }
 
     #[test]
@@ -2906,6 +3195,7 @@ mod tests {
             credential_id: 7,
             credits: 0.25,
             rounds: 3,
+            hops: vec![],
         };
 
         let events = build_loop_sse_events(&success);
@@ -2978,6 +3268,7 @@ mod tests {
             credential_id: 0,
             credits: 0.0,
             rounds: 1,
+            hops: vec![],
         };
         let events = build_loop_sse_events(&success);
         assert!(events.iter().any(|e| {
@@ -3017,6 +3308,7 @@ mod tests {
             credential_id: 1,
             credits: 0.0,
             rounds: 1,
+            hops: vec![],
         };
         let body = build_loop_json_body(&success);
         assert_eq!(body["type"], "message");
@@ -3026,6 +3318,50 @@ mod tests {
         assert_eq!(body["content"][0]["text"], "done");
         assert_eq!(body["usage"]["input_tokens"], json!(100));
         assert_eq!(body["usage"]["output_tokens"], json!(20));
+    }
+
+    #[test]
+    fn live_search_events_and_tail_skip_already_streamed_hops() {
+        let begin = live_search_begin_events(0, "rust async", "srvtoolu_x");
+        assert_eq!(begin[0].event, "content_block_start");
+        assert_eq!(begin[0].data["content_block"]["type"], "server_tool_use");
+        assert_eq!(begin[1].event, "content_block_stop");
+
+        let done = live_search_done_events(1, "srvtoolu_x", &None);
+        assert_eq!(done[0].data["content_block"]["type"], "web_search_tool_result");
+        assert_eq!(done[0].data["content_block"]["tool_use_id"], "srvtoolu_x");
+
+        let success = WebSearchLoopSuccess {
+            model: "claude-sonnet-5".to_string(),
+            mapped_model: None,
+            content: vec![
+                json!({"type": "server_tool_use", "id": "srvtoolu_x", "name": "web_search",
+                       "input": {"query": "rust async"}}),
+                json!({"type": "web_search_tool_result", "tool_use_id": "srvtoolu_x",
+                       "content": []}),
+                json!({"type": "text", "text": "ok"}),
+            ],
+            stop_reason: "end_turn".to_string(),
+            input_tokens: 1,
+            output_tokens: 1,
+            credential_id: 0,
+            credits: 0.0,
+            rounds: 1,
+            hops: vec![WebSearchHop {
+                query: "rust async".into(),
+                n_results: 0,
+            }],
+        };
+        let tail = build_loop_sse_tail(&success, 2, true);
+        assert!(
+            !tail.iter().any(|e| e.data["content_block"]["type"] == "server_tool_use"),
+            "直播已下发的 hop 不得再倒一次"
+        );
+        assert!(
+            tail.iter().any(|e| e.data["content_block"]["type"] == "text"),
+            "正文仍要从 start_index 继续"
+        );
+        assert_eq!(tail.last().unwrap().event, "message_stop");
     }
 
     /// 缺口 C 守卫：回灌路径的 `upstream_model` 口径必须全程接线——
