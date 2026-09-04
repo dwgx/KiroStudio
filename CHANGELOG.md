@@ -2,6 +2,18 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [1.2.4] - 2026-09-04 - catalog ads / Grep offset / Responses additional_tools
+
+Relative to tag v1.2.3 / `cf070bd`. This window `cargo test --no-default-features --locked`:**2300 passed; 0 failed**. No 12-key / absorb / AIMD / sticky / client-key changes. Do not retag v1.2.3. Homecloud not in this cycle.
+
+- `/v1/models` `max_tokens` ads: `claude-sonnet-5` and `gpt-5.6-{sol,luna,terra}` 64k → 128k (Kiro effort table).
+- Grep advertised schema includes `offset` (already on the outbound allowlist).
+- OpenAI module docs: `/v1/responses` is on the Anthropic pipeline (comment was stale).
+- Responses: merge `additional_tools`; flatten `namespace`+`name` for Kiro; restore unique bare names and `custom_tool_call` on the way back.
+- Edit `replace_all` and Bash `description` pass through the Claude Code map.
+- `handlers.rs` tests extracted to a `#[path]` sibling (parent stays a file).
+- Quota-recovery tests re-disable after `new()` so fixture "current month" is not revived by wall-clock September.
+
 ## [1.2.3] - 2026-09-01 - 直播 SSE hop 抽干 / 直连 MCP ARN
 
 相对 tag v1.2.2 / `be59a33`。本窗 `cargo test --no-default-features --locked`：**2297 passed; 0 failed**。未改 12 键、absorb、AIMD、sticky、客户端 Key。不改已推的 v1.2.2 对象。
