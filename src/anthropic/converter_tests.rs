@@ -1491,12 +1491,14 @@
             serde_json::json!({"path": "/a.txt", "text": "hi"})
         );
 
-        // Edit：old_string→oldStr, new_string→newStr
-        let edit_in = serde_json::json!({"file_path": "/a.txt", "old_string": "x", "new_string": "y"});
+        // Edit：old_string→oldStr, new_string→newStr, replace_all passthrough
+        let edit_in = serde_json::json!({
+            "file_path": "/a.txt", "old_string": "x", "new_string": "y", "replace_all": true
+        });
         let edit_out = map_tool_input_to_kiro("Edit", edit_in).unwrap();
         assert_eq!(
             edit_out,
-            serde_json::json!({"path": "/a.txt", "oldStr": "x", "newStr": "y"})
+            serde_json::json!({"path": "/a.txt", "oldStr": "x", "newStr": "y", "replace_all": true})
         );
 
         // Read：offset/limit→start_line/end_line
@@ -1523,10 +1525,14 @@
             serde_json::json!({"file_path": "/a.txt", "content": "hi"})
         );
 
-        let kiro_edit = serde_json::json!({"path": "/a.txt", "oldStr": "x", "newStr": "y"});
+        let kiro_edit = serde_json::json!({
+            "path": "/a.txt", "oldStr": "x", "newStr": "y", "replace_all": true
+        });
         assert_eq!(
             map_tool_input_from_kiro("Edit", kiro_edit),
-            serde_json::json!({"file_path": "/a.txt", "old_string": "x", "new_string": "y"})
+            serde_json::json!({
+                "file_path": "/a.txt", "old_string": "x", "new_string": "y", "replace_all": true
+            })
         );
 
         let kiro_read = serde_json::json!({"path": "/a.txt", "start_line": 10, "end_line": 14});
@@ -1594,7 +1600,7 @@
             serde_json::json!({
                 "pattern": "license", "path": "admin-ui/node_modules", "glob": "package.json",
                 "output_mode": "content", "-n": true, "-i": true, "head_limit": 20,
-                "type": "rust", "multiline": true, "-C": 3
+                "offset": 5, "type": "rust", "multiline": true, "-C": 3
             }),
         )
         .unwrap();
@@ -1606,6 +1612,7 @@
             ("-n", serde_json::json!(true)),
             ("-i", serde_json::json!(true)),
             ("head_limit", serde_json::json!(20)),
+            ("offset", serde_json::json!(5)),
             ("type", serde_json::json!("rust")),
             ("multiline", serde_json::json!(true)),
             ("-C", serde_json::json!(3)),

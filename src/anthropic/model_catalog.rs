@@ -220,7 +220,7 @@ pub static CATALOG: &[ModelSpec] = &[
         owned_by: "anthropic",
         display_name: "Claude Sonnet 5",
         context_window: 1_000_000,
-        max_output: 64_000,
+        max_output: 128_000,
         credit_mult: 1.30,
         supports_thinking: true,
         supports_1m: true,
@@ -411,7 +411,7 @@ pub static CATALOG: &[ModelSpec] = &[
         owned_by: "openai",
         display_name: "GPT-5.6 Sol",
         context_window: 272_000,
-        max_output: 64_000,
+        max_output: 128_000,
         credit_mult: 2.40,
         supports_thinking: false,
         supports_1m: false,
@@ -425,7 +425,7 @@ pub static CATALOG: &[ModelSpec] = &[
         owned_by: "openai",
         display_name: "GPT-5.6 Luna",
         context_window: 272_000,
-        max_output: 64_000,
+        max_output: 128_000,
         credit_mult: 0.10,
         supports_thinking: false,
         supports_1m: false,
@@ -439,7 +439,7 @@ pub static CATALOG: &[ModelSpec] = &[
         owned_by: "openai",
         display_name: "GPT-5.6 Terra",
         context_window: 272_000,
-        max_output: 64_000,
+        max_output: 128_000,
         credit_mult: 1.00,
         supports_thinking: false,
         supports_1m: false,
@@ -859,6 +859,25 @@ mod tests {
 
     fn kid(m: &str) -> Option<&'static str> {
         resolve_kiro_id(m)
+    }
+
+    #[test]
+    fn sonnet5_and_gpt56_advertise_128k_max_output() {
+        // kiro.dev/docs/models/effort/ (2026-09-04): these ids max 128000.
+        for id in [
+            "claude-sonnet-5",
+            "gpt-5.6-sol",
+            "gpt-5.6-luna",
+            "gpt-5.6-terra",
+        ] {
+            let spec = resolve(id).unwrap().spec;
+            assert_eq!(spec.max_output, 128_000, "{id} /v1/models max_tokens ad");
+        }
+        assert_eq!(
+            resolve("claude-sonnet-4.6").unwrap().spec.max_output,
+            64_000,
+            "sonnet-4.6 stays 64k"
+        );
     }
 
     #[test]

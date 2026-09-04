@@ -141,6 +141,7 @@ pub async fn post_responses(
         .unwrap_or_else(|| model.clone());
     let echo_model = model.clone();
 
+    let tool_index = convert::collect_responses_tool_index(&raw);
     let mut anthropic_req = convert::openai_responses_to_anthropic(&resolved_model, &raw, stream);
     apply_session_metadata(&mut anthropic_req, &raw, &headers);
     let anthropic_bytes = match serde_json::to_vec(&anthropic_req) {
@@ -169,9 +170,9 @@ pub async fn post_responses(
     }
 
     if stream {
-        stream_responses_from_anthropic(anthropic_resp, echo_model).await
+        stream_responses_from_anthropic(anthropic_resp, echo_model, tool_index).await
     } else {
-        nonstream_responses_from_anthropic(anthropic_resp, echo_model).await
+        nonstream_responses_from_anthropic(anthropic_resp, echo_model, tool_index).await
     }
 }
 
@@ -208,11 +209,15 @@ fn parse_session_uuid(candidate: &str) -> Option<String> {
 }
 
 /// 流式:Anthropic SSE → Responses SSE 事件序列(每事件 `event: T\ndata: {..}\n\n`)。
-async fn stream_responses_from_anthropic(resp: Response, model: String) -> Response {
+async fn stream_responses_from_anthropic(
+    resp: Response,
+    model: String,
+    tool_index: convert::ResponsesToolIndex,
+) -> Response {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     let body = resp.into_body();
-    let mut conv = convert::ResponsesStreamConverter::new(model);
+    let mut conv = convert::ResponsesStreamConverter::new(model).with_tool_index(tool_index);
     let error_seen = Arc::new(AtomicBool::new(false));
     let error_seen_cb = error_seen.clone();
 
@@ -245,7 +250,11 @@ async fn stream_responses_from_anthropic(resp: Response, model: String) -> Respo
 }
 
 /// 非流式:收齐 Anthropic body → 聚合成单个 Responses response JSON。
-async fn nonstream_responses_from_anthropic(resp: Response, model: String) -> Response {
+async fn nonstream_responses_from_anthropic(
+    resp: Response,
+    model: String,
+    tool_index: convert::ResponsesToolIndex,
+) -> Response {
     let bytes = match axum::body::to_bytes(resp.into_body(), MAX_RESP_BYTES).await {
         Ok(b) => b,
         Err(e) => {
@@ -258,7 +267,7 @@ async fn nonstream_responses_from_anthropic(resp: Response, model: String) -> Re
     };
     let text = String::from_utf8_lossy(&bytes);
     let events = parse_sse_or_message(&text);
-    let response = convert::aggregate_responses(&model, &events);
+    let response = convert::aggregate_responses_with_tools(&model, &events, &tool_index);
     (StatusCode::OK, Json(response)).into_response()
 }
 

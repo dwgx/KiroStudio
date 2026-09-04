@@ -4474,6 +4474,8 @@
             false,
         )
         .unwrap();
+        // new() 用墙上时钟做启动恢复；fixture 的「当月」相对 2026-08-15，墙上已跨月会被复活。
+        re_set_quota_disabled(&manager, 1, Some(&now_ts));
 
         assert_eq!(manager.recover_expired_quota_disables(Some(now)), 0, "当月不得恢复");
 
@@ -4537,8 +4539,9 @@
             false,
         )
         .unwrap();
-        // new() 内的启动恢复已把跨月的 #1 复活，显式重置回禁用态再测。
+        // new() 内的启动恢复已把跨月的 #1 复活；墙上时钟若也跨过 fixture 当月，#4 同样会被复活。
         re_set_quota_disabled(&manager, 1, Some(&prev_month));
+        re_set_quota_disabled(&manager, 4, Some(&now_ts));
 
         assert_eq!(manager.recover_expired_quota_disables(Some(now)), 1, "只有跨月的 #1 可恢复");
         // 幂等：恢复后 #1 已不再是 disabled+QuotaExceeded，重复调用天然跳过。
