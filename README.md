@@ -2,6 +2,21 @@
 
 # KiroStudio
 
+<!-- dwgx-banner:BEGIN -->
+<div align="center">
+
+<img src="docs/assets/banner.svg?t=b6df86e41b28" width="100%" alt="KiroStudio — Kiro / AWS Q 网关 · Anthropic Messages 兼容 · 多账号池 · 管理面板" />
+
+<br/>
+
+Rust · NOASSERTION · ★15
+
+[releases](https://github.com/dwgx/KiroStudio/releases) · [issues](https://github.com/dwgx/KiroStudio/issues)
+
+</div>
+<!-- dwgx-banner:END -->
+
+
 **高性能 Anthropic 协议网关 —— 把 Anthropic Messages 请求转发到 Kiro / AWS Q，并附带一套现代化管理面板。**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
