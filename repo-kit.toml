@@ -1,0 +1,14 @@
+# repo-kit · 本仓库的 banner 规格
+# 改这个文件，workflow 会重新渲染 docs/assets/banner*.svg 与 README 区块
+# 生成器：https://github.com/dwgx/DWGX/tree/main/repo-kit
+owner = "dwgx"
+
+[[repo]]
+name = "KiroStudio"
+style = "scope"
+tagline = "Kiro / AWS Q 网关 · Anthropic Messages 兼容 · 多账号池 · 管理面板"
+install = "git clone https://github.com/dwgx/KiroStudio.git && cd KiroStudio && bash install.sh"
+lang = "Rust"
+license = "NOASSERTION"
+topics = ["ai-gateway", "anthropic", "kiro"]
+links = [{ label = "releases", url = "https://github.com/dwgx/KiroStudio/releases" }, { label = "issues", url = "https://github.com/dwgx/KiroStudio/issues" }]
