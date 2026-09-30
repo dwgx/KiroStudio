@@ -5,7 +5,7 @@
 <!-- dwgx-banner:BEGIN -->
 <div align="center">
 
-<img src="docs/assets/banner.svg?t=b6df86e41b28" width="100%" alt="KiroStudio — Kiro / AWS Q 网关 · Anthropic Messages 兼容 · 多账号池 · 管理面板" />
+<img src="docs/assets/banner.svg?t=a429521ac02a" width="100%" alt="KiroStudio — Kiro / AWS Q 网关 · Anthropic Messages 兼容 · 多账号池 · 管理面板" />
 
 <br/>
 
