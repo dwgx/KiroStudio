@@ -9541,11 +9541,38 @@ impl MultiTokenManager {
         // 双文件一致性：先落盘回收站，成功后再回写凭据池。
         // 若回收站落盘失败则立刻回滚（把凭据放回 entries），避免真丢号。
         if let Err(e) = self.persist_trash() {
+            // ⚠️ 按 **id** 定位取回**自己**那条（2026-10-14 并发审计发现：旧代码用
+            // `trash.pop()` 假定自己是最后一个 push —— 若此刻另一线程也删了号（面板两个
+            // 操作 / 自动清理与手工删除并发），弹掉的是**别人**的条目，于是池里出现
+            // 「挂着 X 的凭据却占着 #id」的错配条目（统计/冷却/inflight 全挂错号），
+            // 且 X 的删除从回收站消失。与 `restore_credential` 同款按 id 定位。
             let restored = {
                 let mut trash = self.trash.lock();
-                trash.pop().map(|t| t.credentials)
+                trash
+                    .iter()
+                    .position(|t| t.credentials.id == Some(id))
+                    .map(|idx| trash.remove(idx))
             };
-            if let Some(cred) = restored {
+            if let Some(restored_entry) = restored {
+                let TrashEntry {
+                    credentials: mut cred,
+                    success_count,
+                    total_credits_used,
+                    last_used_at,
+                    ..
+                } = restored_entry;
+                // ⚠️ 回滚必须**原样**带回删除前的状态：旧代码重建时把 success_count /
+                // total_credits_used / last_used_at 全清零并强制 `disabled=true` + `Manual`
+                // —— 一次磁盘抖动就让**启用中**的号以「禁用 + 零统计」复活，下次任意
+                // persist 会把这份清零状态写进 credentials.json（终身统计永久丢失，
+                // 面板显示"号坏了"）。三元组由删除路径同步进 TrashEntry（见其上的
+                // 「同步禁用状态三元组」块），此处原样取回；与 `restore_credential`
+                // 同源信息保留策略。
+                cred.id = Some(id);
+                let restored_disabled = cred.disabled;
+                let restored_reason = cred.disabled_reason.clone();
+                let restored_at = cred.disabled_at.clone();
+                let restored_quota_at = cred.quota_exhausted_at.clone();
                 // 族键缓存：构造前先算（cred 随即被 move 进 entry）。
                 let entry_family_key = cred.family_key(id);
                 let mut entries = self.entries.lock();
@@ -9554,18 +9581,23 @@ impl MultiTokenManager {
                     credentials: cred,
                     failure_count: 0,
                     refresh_failure_count: 0,
-                    disabled_at: None,
-                    quota_exhausted_at: None,
+                    disabled_at: restored_at,
+                    quota_exhausted_at: restored_quota_at,
                     consecutive_suspicious: 0,
                     consecutive_passthrough_failures: 0,
                     last_selected_at: std::cell::Cell::new(Instant::now()),
-                last_failure_at: std::cell::Cell::new(None),
-                    disabled: true,
-                    disabled_reason: Some(DisabledReason::Manual),
-                    success_count: 0,
+                    last_failure_at: std::cell::Cell::new(None),
+                    disabled: restored_disabled,
+                    // 启用态回滚不得凭空留下禁用原因（与 set_disabled 的启用收口同口径）。
+                    disabled_reason: if restored_disabled {
+                        restored_reason
+                    } else {
+                        None
+                    },
+                    success_count,
                     request_count: 0,
-                    total_credits_used: 0.0,
-                    last_used_at: None,
+                    total_credits_used,
+                    last_used_at,
                     inflight: Arc::new(AtomicU32::new(0)),
                     last_usage_403_feature_not_supported: AtomicBool::new(false),
                     last_full_reprobe_at: Mutex::new(None),

@@ -11021,3 +11021,91 @@ fn save_stats_must_serialize_and_clear_dirty_conditionally() {
         .expect("标脏路径必须置 stats_dirty");
     assert!(bi < di, "stats_version 必须在标脏之前自增");
 }
+
+/// 🔴 删号回滚必须按 **id** 取回**自己**的条目（不是 pop 别人的），并原样带回删除前状态。
+///
+/// 2026-10-14 并发审计发现：旧代码 `trash.pop()` 假定自己是最后一个 push —— 并发删号时
+/// 弹掉别人的条目（池里出现「挂着 X 的凭据却占着 #id」的错配，且别人的删除从回收站消失），
+/// 且重建 entry 时把 success_count / total_credits_used / last_used_at 清零、强制
+/// disabled+Manual（一次磁盘抖动即永久丢终身统计）。
+///
+/// 触发方式（跨平台）：把 `trash.json` 做成**目录** ⇒ `persist_trash` 的原子写必然失败
+/// （rename 到目录上失败，fs_atomic 返回 Err 而非截断写）⇒ 走回滚分支。回收站里那条
+/// 「别人的」条目在内存里直接塞入（不经文件，避免与目录构造冲突）。
+#[test]
+fn delete_rollback_restores_own_entry_and_keeps_others() {
+    let dir = std::env::temp_dir().join(format!(
+        "ks_del_rollback_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cred_path = dir.join("credentials.json");
+    std::fs::write(&cred_path, "[]").unwrap();
+    // trash.json 是目录 ⇒ 原子写的 rename 必失败；再把回退用的备份路径 `.trash.json.bak`
+    // 也做成**非空目录** ⇒ 回退的「先备份后写」同样失败 ⇒ fs_atomic 返回 Err（这是它设计上
+    // 唯一会失败的分支：既写不进去、又不敢原地截断）。load_trash 读它只是失败 → 空回收站。
+    std::fs::create_dir(dir.join("trash.json")).unwrap();
+    std::fs::create_dir(dir.join(".trash.json.bak")).unwrap();
+    std::fs::write(dir.join(".trash.json.bak").join("occupied"), b"x").unwrap();
+
+    // 池里两个号：id=1（启用态，待删）、id=2。
+    let mut c1 = KiroCredentials::default();
+    c1.id = Some(1);
+    c1.access_token = Some("t1".into());
+    let mut c2 = KiroCredentials::default();
+    c2.id = Some(2);
+    c2.access_token = Some("t2".into());
+    let mgr = MultiTokenManager::new(
+        Config::default(),
+        vec![c1, c2],
+        None,
+        Some(cred_path),
+        false,
+    )
+    .expect("构造 token manager");
+
+    // 回收站里预置**别人**的条目（id=9，带统计）：回滚若用 pop 就会弹掉它。
+    let mut c9 = KiroCredentials::default();
+    c9.id = Some(9);
+    c9.access_token = Some("t9".into());
+    mgr.trash.lock().push(TrashEntry {
+        credentials: c9,
+        deleted_at: "2026-10-13T00:00:00Z".to_string(),
+        success_count: 7,
+        total_credits_used: 12.5,
+        last_used_at: None,
+    });
+
+    let r = mgr.delete_credential_forced(1, true);
+    assert!(r.is_err(), "回收站写不进去必须报错并回滚");
+
+    // ① 被删的号回到池里，且带回删除前的**启用态**（旧代码强制 disabled=true + Manual）。
+    {
+        let entries = mgr.entries.lock();
+        let e1 = entries
+            .iter()
+            .find(|e| e.id == 1)
+            .expect("回滚后 #1 必须回到池里");
+        assert!(
+            !e1.disabled,
+            "回滚必须带回删除前的启用态（旧代码强制 disabled+Manual 并清零统计）"
+        );
+        assert!(e1.disabled_reason.is_none(), "启用态不得残留禁用原因");
+    }
+
+    // ② 别人的回收站条目没被弹掉，统计也没被清零。
+    let tr = mgr.list_trash();
+    let ids: Vec<u64> = tr.iter().map(|t| t.id).collect();
+    assert_eq!(
+        ids,
+        vec![9],
+        "回收站里必须仍只有别人的那条（旧代码 pop 会弹掉它）"
+    );
+    assert_eq!(tr[0].success_count, 7, "别人的统计不得被动过");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
