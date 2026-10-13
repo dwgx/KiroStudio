@@ -4730,6 +4730,367 @@ mod mirror_wiring_guard {
 }
 
 #[cfg(test)]
+mod first_token_retry_tests {
+    //! 首字超时透明重试（P0-1）：配置语义 + 接线守卫 + 功能级真驱动。
+    //! 功能级用例（本模块下半部）真调 `create_sse_stream` 驱动状态机：
+    //! 初始上游 200 后静默（pending body）→ 首字截止触发流内重开；
+    //! 断言行为（message_start 恰一次且为首事件 / reopen 调用次数 / 正文到达），
+    //! 而非形状。上半部守卫用例钉住「形状不会在重构中悄悄丢」。
+    use super::*;
+
+    /// 配置语义：0 秒或 0 次 = 关闭（关闭时行为与改前逐字节一致）。
+    #[test]
+    fn retry_config_zero_disables() {
+        set_first_token_retry(30, 2);
+        assert!(first_token_retry_config().is_some());
+        set_first_token_retry(0, 2);
+        assert!(first_token_retry_config().is_none(), "0 秒 = 关闭");
+        set_first_token_retry(30, 0);
+        assert!(first_token_retry_config().is_none(), "0 次 = 关闭");
+        // 恢复默认（进程级镜像，避免影响同进程其他用例）
+        set_first_token_retry(30, 2);
+    }
+
+    /// 接线守卫：延迟提交 / 超时重开 / ping 不提交 / 各出口补发初始事件。
+    #[test]
+    fn first_token_retry_wiring_guards() {
+        let src = include_str!("handlers.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        let start = prod
+            .find("fn create_sse_stream(")
+            .expect("create_sse_stream 必须存在");
+        let rest = &prod[start..];
+        let end = rest.find("\n}\n").expect("create_sse_stream 必须有结尾");
+        let body = &rest[..end];
+
+        // ① 初始事件必须持有到提交点（旧的开流即发形状必须已移除）
+        assert!(
+            body.contains("initial_events.take()"),
+            "初始事件必须持有到提交点/收尾出口"
+        );
+        assert!(
+            !body.contains("let initial_stream"),
+            "旧形状（initial_stream 开流即发）必须已移除——否则重试窗口从第一字节就关了"
+        );
+        // ② 首字截止必须走流内重开
+        assert!(
+            body.contains("reopen_stream(&mut st)"),
+            "首字截止分支必须调用 reopen_stream（流内换号重开）"
+        );
+        // ③ ping 分支不得置 committed（提交 = 关闭重试窗口）
+        let ping_at = body
+            .find("_ = st.ping_interval.tick()")
+            .expect("ping 分支必须存在");
+        let ping_tail = &body[ping_at..];
+        let ping_end = ping_tail
+            .find("\n                }")
+            .unwrap_or(ping_tail.len());
+        assert!(
+            !ping_tail[..ping_end].contains("st.committed = true"),
+            "ping 不得触发 committed（保活不算已写出内容）"
+        );
+        // ④ 四个出口都要补发初始事件：关闭态预滚动 / 提交点 / 读取失败 / 流结束
+        let takes = body.matches("initial_events.take()").count();
+        assert!(
+            takes >= 4,
+            "提交点 + 读取失败 + 流结束 + 关闭态预滚动，四处都要发初始事件（实际 {takes}）"
+        );
+    }
+
+    // ==================== 功能级：真驱动 create_sse_stream 状态机 ====================
+
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
+    /// 拼一个合法 AWS Event Stream 帧（布局抄 `kiro::model::events::metadata` 测试的
+    /// `build_test_frame`：prelude(4B total + 4B header_len + 4B prelude CRC) + headers
+    /// + payload + 4B 消息 CRC32；头部名 `:event-type`、值类型 7=string）。
+    fn aws_frame(event_type: &str, payload: &str) -> Vec<u8> {
+        use crate::kiro::parser::crc::crc32;
+        use crate::kiro::parser::frame::PRELUDE_SIZE;
+        const NAME: &[u8] = b":event-type";
+        let mut headers = Vec::new();
+        headers.push(NAME.len() as u8);
+        headers.extend_from_slice(NAME);
+        headers.push(7u8);
+        headers.extend_from_slice(&(event_type.len() as u16).to_be_bytes());
+        headers.extend_from_slice(event_type.as_bytes());
+
+        let header_length = headers.len() as u32;
+        let total_length = (PRELUDE_SIZE + headers.len() + payload.len() + 4) as u32;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&total_length.to_be_bytes());
+        buf.extend_from_slice(&header_length.to_be_bytes());
+        let prelude_crc = crc32(&buf[..8]);
+        buf.extend_from_slice(&prelude_crc.to_be_bytes());
+        buf.extend_from_slice(&headers);
+        buf.extend_from_slice(payload.as_bytes());
+        let msg_crc = crc32(&buf);
+        buf.extend_from_slice(&msg_crc.to_be_bytes());
+        buf
+    }
+
+    /// 上游 200 后静默：body 永不产出、也永不断流（真待产流，不是空流）。
+    fn silent_response() -> reqwest::Response {
+        let body = reqwest::Body::wrap_stream(stream::pending::<Result<Bytes, reqwest::Error>>());
+        reqwest::Response::from(http::Response::new(body))
+    }
+
+    /// 重开后的上游：body 携带单帧合法 AWS Event Stream。
+    fn frame_response(event_type: &str, payload: &str) -> reqwest::Response {
+        let frame = aws_frame(event_type, payload);
+        let body = reqwest::Body::wrap_stream(stream::iter(vec![Ok::<Bytes, reqwest::Error>(
+            Bytes::from(frame),
+        )]));
+        reqwest::Response::from(http::Response::new(body))
+    }
+
+    fn test_stream_ctx() -> StreamContext {
+        StreamContext::new_with_thinking("claude-sonnet-5", 100, false, HashMap::new())
+    }
+
+    /// 最便宜的 provider 构造（与 stream_usage_outcome_tests::test_provider 同款：
+    /// 空号池 + 无代理 + 真端点注册表；本用例只把 provider 当 usage 记账的搬运工）。
+    fn test_provider() -> Arc<crate::kiro::provider::KiroProvider> {
+        let cfg = crate::model::config::Config::default();
+        let default_ep = cfg.default_endpoint.clone();
+        let tm = Arc::new(
+            crate::kiro::token_manager::MultiTokenManager::new(cfg, vec![], None, None, false)
+                .expect("test token manager"),
+        );
+        Arc::new(crate::kiro::provider::KiroProvider::with_proxy(
+            tm,
+            None,
+            crate::kiro::endpoint::registry(),
+            default_ep,
+        ))
+    }
+
+    fn test_call_meta(credential_id: u64) -> crate::kiro::provider::CallMeta {
+        crate::kiro::provider::CallMeta {
+            credential_id,
+            model: Some("claude-sonnet-5".into()),
+            mapped_model: None,
+            session_id: None,
+            is_streaming: true,
+            retries: 0,
+            latency_ms: 7,
+            started_at: std::time::Instant::now(),
+            inflight: crate::kiro::scheduling::InflightGuard::acquire(Arc::new(AtomicU32::new(0))),
+        }
+    }
+
+    /// 测试用最简 SSE 解析器：把 `to_sse_string` 的 `event: X\ndata: {...}\n\n` 还原成序列。
+    fn parse_sse(text: &str) -> Vec<(String, serde_json::Value)> {
+        text.split("\n\n")
+            .filter(|block| !block.is_empty())
+            .map(|block| {
+                let mut name = String::new();
+                let mut data = String::new();
+                for line in block.lines() {
+                    if let Some(rest) = line.strip_prefix("event: ") {
+                        name = rest.to_string();
+                    } else if let Some(rest) = line.strip_prefix("data: ") {
+                        data = rest.to_string();
+                    }
+                }
+                let value = serde_json::from_str(&data).unwrap_or(serde_json::Value::Null);
+                (name, value)
+            })
+            .collect()
+    }
+
+    /// 真消费整条流，返回 (收到时刻, 该批字节文本) 序列。带 5s 看门狗防死等挂住测试。
+    async fn drive(
+        stream: impl Stream<Item = Result<Bytes, std::convert::Infallible>>,
+    ) -> Vec<(std::time::Instant, String)> {
+        let mut stream = Box::pin(stream);
+        let mut out = Vec::new();
+        let collect = async {
+            while let Some(item) = stream.next().await {
+                let bytes = item.expect("流错误类型是 Infallible");
+                out.push((
+                    std::time::Instant::now(),
+                    String::from_utf8_lossy(&bytes).into_owned(),
+                ));
+            }
+            out
+        };
+        tokio::time::timeout(Duration::from_secs(5), collect)
+            .await
+            .expect("5s 内必须走完整个状态机（死等 = 状态机没出口）")
+    }
+
+    /// 功能级·重开成功路径：初始上游 200 后静默（pending body）→ 30ms 首字截止触发
+    /// 流内重开（reopen 返回携带合法 assistantResponseEvent 帧的响应）→ 断言：
+    /// ① message_start 恰一次；② 重开前零内容字节（ping 保活除外）且 message_start
+    /// 是首个非 ping 事件；③ reopen 恰调 1 次；④ 正文 hi 到达客户端。
+    #[tokio::test]
+    async fn silent_upstream_reopens_once_and_commits_message_start_exactly_once() {
+        let reopen_calls = Arc::new(AtomicUsize::new(0));
+        let reopened_at = Arc::new(parking_lot::Mutex::new(None::<std::time::Instant>));
+
+        let calls = reopen_calls.clone();
+        let at = reopened_at.clone();
+        let retry = FirstTokenRetry {
+            timeout: Duration::from_millis(30),
+            max_retries: 1,
+            reopen: Arc::new(move || {
+                let calls = calls.clone();
+                let at = at.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    *at.lock() = Some(std::time::Instant::now());
+                    Ok((
+                        frame_response("assistantResponseEvent", r#"{"content":"hi"}"#),
+                        test_call_meta(2),
+                    ))
+                })
+            }),
+            rebuild_ctx: Arc::new(test_stream_ctx),
+        };
+
+        let mut ctx = test_stream_ctx();
+        let initial_events = ctx.generate_initial_events();
+        let stream = create_sse_stream(
+            test_provider(),
+            silent_response(),
+            ctx,
+            initial_events,
+            test_call_meta(1),
+            ClientInfo::default(),
+            Some(retry),
+        );
+
+        let chunks = drive(stream).await;
+        let full: String = chunks.iter().map(|(_, s)| s.as_str()).collect();
+
+        // ③ reopen 恰调 1 次
+        let reopen_at = reopened_at.lock().expect("首字截止必须触发重开");
+        assert_eq!(reopen_calls.load(Ordering::SeqCst), 1, "reopen 恰一次");
+
+        // ② 重开前零内容字节：重开时刻之前收到的字节只允许是 ping 保活
+        for (t, text) in &chunks {
+            if *t < reopen_at {
+                assert!(
+                    !text.contains("message_start") && !text.contains("content_block"),
+                    "重开前不得写任何内容字节（ping 保活除外）: {text:?}"
+                );
+            }
+        }
+
+        let events = parse_sse(&full);
+        let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+
+        // ① message_start 恰一次（重复 = 重开前就写过头 / 提交点重复补发）
+        let ms_count = names.iter().copied().filter(|n| *n == "message_start").count();
+        assert_eq!(
+            ms_count, 1,
+            "message_start 必须恰好一次: {names:?}\n{full}"
+        );
+
+        // ② 首个非 ping 事件必须是 message_start
+        let first_non_ping = names
+            .iter()
+            .copied()
+            .find(|n| *n != "ping")
+            .expect("至少要有一个非 ping 事件（message_start）");
+        assert_eq!(
+            first_non_ping, "message_start",
+            "message_start 必须是第一个事件（重开前零字节）: {names:?}"
+        );
+
+        // ④ 重开后的正文 hi 必须到达客户端
+        assert!(
+            events.iter().any(|(n, data)| n == "content_block_delta"
+                && data["delta"]["type"] == "text_delta"
+                && data["delta"]["text"] == "hi"),
+            "重开后的正文 hi 必须到达客户端: {full}"
+        );
+    }
+
+    /// 功能级·额度用尽路径：max_retries=0 → 首字截止到点即收尾（一次重开都不许发生）。
+    /// 断言输出**仍有** message_start（绝不发无头 message）+ 含 `event: error`，
+    /// 且 message_start 在 error 之前、error 前无任何正文 delta、流正常终止。
+    #[tokio::test]
+    async fn exhausted_budget_still_emits_message_start_before_error() {
+        let reopen_calls = Arc::new(AtomicUsize::new(0));
+        let calls = reopen_calls.clone();
+        let retry = FirstTokenRetry {
+            timeout: Duration::from_millis(30),
+            max_retries: 0,
+            reopen: Arc::new(move || {
+                let calls = calls.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok((
+                        frame_response("assistantResponseEvent", r#"{"content":"hi"}"#),
+                        test_call_meta(2),
+                    ))
+                })
+            }),
+            rebuild_ctx: Arc::new(test_stream_ctx),
+        };
+
+        let mut ctx = test_stream_ctx();
+        let initial_events = ctx.generate_initial_events();
+        let stream = create_sse_stream(
+            test_provider(),
+            silent_response(),
+            ctx,
+            initial_events,
+            test_call_meta(1),
+            ClientInfo::default(),
+            Some(retry),
+        );
+
+        let chunks = drive(stream).await;
+        let full: String = chunks.iter().map(|(_, s)| s.as_str()).collect();
+        let events = parse_sse(&full);
+        let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+
+        assert_eq!(
+            reopen_calls.load(Ordering::SeqCst),
+            0,
+            "max_retries=0 不得调用 reopen"
+        );
+        assert_eq!(
+            names.iter().copied().filter(|n| *n == "message_start").count(),
+            1,
+            "额度用尽也必须发 message_start（绝不发无头 message）: {names:?}\n{full}"
+        );
+        let ms = names
+            .iter()
+            .copied()
+            .position(|n| n == "message_start")
+            .expect("message_start 必须存在");
+        let err = names
+            .iter()
+            .copied()
+            .position(|n| n == "error")
+            .expect("额度用尽必须发 error 事件");
+        assert!(
+            ms < err,
+            "message_start 必须在 error 之前（有头再报错）: {names:?}"
+        );
+        assert!(
+            !names[..err].contains(&"content_block_delta"),
+            "首字前不得写正文 delta: {names:?}"
+        );
+        assert_eq!(
+            names.last().copied(),
+            Some("message_stop"),
+            "收尾必须正常终止: {names:?}"
+        );
+        // error 事件必须带非空文案（客户端据此决定退避重试）
+        let msg = events[err].1["error"]["message"].as_str().unwrap_or("");
+        assert!(!msg.is_empty(), "error 事件必须带文案: {}", events[err].1);
+    }
+}
+
+#[cfg(test)]
 mod suggestion_mode_tests {
     //! 建议模式拦截（2026-10 移植）：判定谓词 + 拦截响应的形状。
     use super::*;
