@@ -786,6 +786,54 @@ pub async fn perform_update(target: Option<String>) -> Result<UpdatePerformResul
             .map_err(|e| UpdateError::Internal(format!("设置可执行权限失败: {e}")))?;
     }
 
+    // 4.5) 候选二进制冒烟：sha256 只证明「下载字节没坏」，不证明「这份产物在本机能执行」
+    //      （架构/libc 不匹配的产物 sha 完全正确、exec 却直接失败）。替换前先跑一次
+    //      `--version`：5s 内以 0 退出（且输出含目标版本号，若 tag 可比对）才允许进入
+    //      备份/替换；任何一步不过都清掉 .new 并中止，现役二进制分毫未动。
+    //      （kiro-lb 2026-10 自更新加固同款：候选先冒烟再换。）
+    #[cfg(unix)]
+    {
+        let mut cmd = tokio::process::Command::new(&new);
+        cmd.arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let smoke = tokio::time::timeout(std::time::Duration::from_secs(5), cmd.output()).await;
+        match smoke {
+            Ok(Ok(out)) if out.status.success() => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if !smoke_version_ok(tag, &stdout) {
+                    let _ = tokio::fs::remove_file(&new).await;
+                    return Err(UpdateError::Internal(format!(
+                        "候选二进制 --version 输出不含目标版本 {tag}（实得 {:?}），已中止升级",
+                        stdout.trim()
+                    )));
+                }
+                tracing::info!("[Update] 候选二进制冒烟通过：{}", stdout.trim());
+            }
+            Ok(Ok(out)) => {
+                let _ = tokio::fs::remove_file(&new).await;
+                return Err(UpdateError::Internal(format!(
+                    "候选二进制 --version 非零退出（code={:?}），已中止升级（现役未动）",
+                    out.status.code()
+                )));
+            }
+            Ok(Err(e)) => {
+                let _ = tokio::fs::remove_file(&new).await;
+                return Err(UpdateError::Internal(format!(
+                    "候选二进制无法执行（架构/解释器不匹配？）：{e}；已中止升级（现役未动）"
+                )));
+            }
+            Err(_) => {
+                let _ = tokio::fs::remove_file(&new).await;
+                return Err(UpdateError::Internal(
+                    "候选二进制 --version 5s 超时，已中止升级（现役未动）".to_string(),
+                ));
+            }
+        }
+    }
+
     #[cfg(not(target_os = "windows"))]
     {
         // Linux/macOS：允许 rename 覆盖运行中的 exe（inode 语义）。
@@ -846,6 +894,26 @@ pub async fn perform_update(target: Option<String>) -> Result<UpdatePerformResul
 /// 持 admin key 的攻击者可把服务降到含已知漏洞的旧版本。
 fn target_is_newer(tag: &str) -> bool {
     compare_versions(tag, LOCAL_VERSION) > 0
+}
+
+/// 候选二进制 `--version` 输出是否满足目标 tag 的版本断言。
+///
+/// 只在 tag 是 `vX.Y.Z`（或 `X.Y.Z`）形态时断言输出含该版本号；`dev-*` / 自定义
+/// tag 无法比对，仅要求进程能跑起来（调用方已保证 `--version` 成功退出）。
+/// 生产侧只在 unix 冒烟块里调用（Windows 的 .new 无 .exe 后缀不可执行）；
+/// 测试两平台都跑，故非 unix 下显式放行 dead_code。
+#[cfg_attr(not(unix), allow(dead_code))]
+fn smoke_version_ok(tag: &str, stdout: &str) -> bool {
+    let want = tag
+        .trim_start_matches('v')
+        .split(['-', '+'])
+        .next()
+        .unwrap_or("");
+    let numeric = !want.is_empty()
+        && want
+            .split('.')
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+    !numeric || stdout.contains(want)
 }
 
 #[cfg(test)]
@@ -1152,6 +1220,44 @@ mod tests {
             none_at < check_at,
             "check_for_updates 必须只在 None（自动升级）分支内调用——\
              显式 tag 场景不该拉 GitHub tags（浪费一次往返 + 可能误报下载失败）"
+        );
+    }
+
+    /// 冒烟断言的纯函数语义：语义化 tag 必须比对版本号；dev/自定义 tag 只要求能跑。
+    #[test]
+    fn smoke_version_predicate() {
+        assert!(smoke_version_ok("v1.2.4", "kirostudio 1.2.4\n"));
+        assert!(!smoke_version_ok("v1.2.4", "kirostudio 1.2.3\n"));
+        assert!(smoke_version_ok("1.2.4", "kirostudio 1.2.4"));
+        // 非语义化 tag（dev-* / beta-*）无法比对，只要求进程能跑
+        assert!(smoke_version_ok("dev-d74f216", "whatever"));
+        assert!(smoke_version_ok("beta-x", ""));
+        // 带后缀的语义化 tag：只比数字部分
+        assert!(smoke_version_ok("v1.2.4-hotfix", "kirostudio 1.2.4\n"));
+    }
+
+    /// 源码级守卫：候选二进制冒烟必须排在备份/替换**之前**（回归防御——
+    /// 少了这道，架构/libc 不匹配的产物会直接顶掉能跑的现役二进制）。
+    #[test]
+    fn candidate_smoke_precedes_swap() {
+        let src = include_str!("update.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        let fname = format!("pub async fn perform_update{}", "(");
+        let start = prod.find(&fname).expect("perform_update 不应被改名");
+        let body_end = prod[start..]
+            .find("\nfn ")
+            .map(|i| i + start)
+            .unwrap_or(prod.len());
+        let body = &prod[start..body_end];
+
+        let smoke_at = body
+            .find("smoke_version_ok")
+            .expect("perform_update 必须调用候选二进制冒烟（smoke_version_ok）");
+        let backup_at = body.find("备份现役 exe").expect("备份步骤不应被改名");
+        assert!(
+            smoke_at < backup_at,
+            "冒烟必须排在备份/替换之前——否则坏产物已经顶掉现役二进制，冒烟失去意义"
         );
     }
 }
