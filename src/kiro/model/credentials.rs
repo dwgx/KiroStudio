@@ -824,6 +824,12 @@ impl KiroCredentials {
     /// - idc/social 缺 profile_arn → 回退默认 BuilderId profileArn（Kiro IDE 公共
     ///   占位 ARN，上游接受）。**根治**:idc 号入池时常没 profileArn(登录未拉),
     ///   而对话/余额端点要求必带,缺了就 400/403。
+    ///   ⚠️ **待验冲突**：hj01857655/kiro-account-manager v1.9.2 #132（2026-09）报告
+    ///   社交号被赋 BuilderId 占位 ARN 后**所有模型请求 403 `User is not authorized to
+    ///   make this call`**（其修法是社交号不带该占位）。本仓该分支的「上游接受」结论
+    ///   **无日期、未在社交号上单独复现**，两条证据直接冲突 ⇒ 有真社交号（Google/GitHub）
+    ///   入池时**优先实测这一条**；若复现 403，social 应与 external_idp/api_key 同处置
+    ///   （返回 `None`，不发 ARN）。
     ///
     /// ## api_key 为何也必须返回 `None`（实测修正）
     /// 默认 BuilderId 占位 ARN 属于 AWS account `638616132270`。`ksk_` 令牌自身已绑定
