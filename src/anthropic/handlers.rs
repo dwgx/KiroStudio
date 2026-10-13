@@ -4439,7 +4439,11 @@ async fn handle_non_stream_request(
         tool_name_map: &std::collections::HashMap<String, String>,
         tool_required_fields: &std::collections::HashMap<String, Vec<String>>,
     ) -> Option<serde_json::Value> {
-        let mut input: serde_json::Value = if buffer.is_empty() {
+        let mut input: serde_json::Value = if buffer.trim().is_empty() {
+            // 判据用 `trim()`：只有空白字符的缓冲**不是**合法 JSON，若按 `is_empty()` 走
+            // 解析分支会落 repair → INVALID_TOOL_INPUT 整轮失败，而拆分器
+            // `split_unstopped_tool_buffers` 已按 `trim()` 把它判成「无参形态」——
+            // 两处判据必须同口径，否则同一条残留会先被判无参、再被这条判失败。
             serde_json::json!({})
         } else {
             match serde_json::from_str(buffer) {
@@ -4718,6 +4722,13 @@ async fn handle_non_stream_request(
         split_unstopped_tool_buffers(&mut tool_json_buffers);
     let no_param_tool_resolved = !no_param_calls.is_empty();
     for (tool_use_id, kiro_name, buffer) in no_param_calls {
+        // 幂等：stop 分支已下发过的 id 不得再发一次。stop 之后若上游又来一个**非 stop** 帧
+        // （同 id），`or_insert_with` 会把条目重建出来、兜底就会再发一条 —— 同一 id 两条
+        // tool_use 会让客户端解析报错（与 stop 分支的重复 stop 幂等守卫同一目的，此处补上
+        // 另一半）。独立验证 2026-10-14 发现。
+        if stopped_tool_ids.contains(&tool_use_id) {
+            continue;
+        }
         if let Some(tool_use_json) = build_tool_use(
             &mut completion,
             &tool_use_id,
@@ -5600,6 +5611,21 @@ mod no_param_tool_nonstream_tests {
         assert!(
             body.contains(&fold),
             "两种形态并存时必须截断优先（无参形态不得把真截断洗成成功）"
+        );
+        // 2026-10-14 独立验证发现的两条窄缝，一并钉住：
+        // ① 幂等：stop 之后同 id 又来非 stop 帧会把条目重建出来，兜底必须查已 stop 集合
+        //    （否则同一 id 下发两条 tool_use，客户端解析报错）；
+        // ② 空白口径：build_tool_use 的空判必须用 trim，与 split_unstopped_tool_buffers
+        //    同口径（否则纯空白残留先被判无参、再在这条判失败，整轮 INVALID_TOOL_INPUT）。
+        let idempotent = format!("{}", "stopped_tool_ids.contains(&tool_use_id)");
+        assert!(
+            body.contains(&idempotent),
+            "收尾兜底必须跳过已 stop 的 id（防同一 id 两条 tool_use）"
+        );
+        let trim_check = format!("{}{}", "buffer", ".trim().is_empty()");
+        assert!(
+            body.contains(&trim_check),
+            "build_tool_use 的空判必须与拆分器同口径（trim 后为空 = 无参），否则纯空白残留整轮失败"
         );
     }
 }
