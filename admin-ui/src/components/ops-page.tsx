@@ -826,7 +826,7 @@ function CredOpsDialog({
   const deleteCred = useDeleteCredential()
   const setDisabled = useSetDisabled()
 
-  // 本地编辑态(初值取当前值;open 变化时重置)。region 切换逻辑已抽到共享 RegionSwitcher(自持探测态)。
+  // 本地编辑态(初值取当前值;打开弹框/换目标号时重置,见下方 effect)。region 切换逻辑已抽到共享 RegionSwitcher(自持探测态)。
   const [priority, setPriorityVal] = useState(cred.priority)
   const [rpmLimit, setRpmLimitVal] = useState(cred.rpmLimit ?? 0)
   const [name, setNameVal] = useState(cred.name ?? '')
@@ -836,14 +836,26 @@ function CredOpsDialog({
   // 破坏性二次确认目标。
   const [confirm, setConfirm] = useState<null | 'overage' | 'disable' | 'delete'>(null)
 
+  // 本地编辑态只在**打开弹框**或**换了目标号**时用最新 prop 初始化一次。
+  //
+  // 依赖里必须带 cred（它被读取），但**不能**因 cred 变化就重置：useCredentials 每 30s
+  // 轮询一次，凭据对象上的 successCount / lastUsedAt / rpm 等易变字段一变，对象引用就变
+  // —— 无脑重置会把用户正在输入的名字 / 代理 URL / 优先级当场抹掉（每半分钟清空一次）。
+  // 与 credential-card 的设置弹框同一条理由（那边用 `[showSettings]` 单依赖达成）。
+  const editTargetRef = useRef<number | null>(null)
   useEffect(() => {
-    if (open) {
-      setPriorityVal(cred.priority)
-      setRpmLimitVal(cred.rpmLimit ?? 0)
-      setNameVal(cred.name ?? '')
-      setProxyUrl(cred.proxyUrl ?? '')
-      setAllowed_(cred.allowedModels ?? [])
+    if (!open) {
+      // 关窗即失忆：下次打开（哪怕还是同一个号）重新取最新值。
+      editTargetRef.current = null
+      return
     }
+    if (editTargetRef.current === cred.id) return
+    editTargetRef.current = cred.id
+    setPriorityVal(cred.priority)
+    setRpmLimitVal(cred.rpmLimit ?? 0)
+    setNameVal(cred.name ?? '')
+    setProxyUrl(cred.proxyUrl ?? '')
+    setAllowed_(cred.allowedModels ?? [])
   }, [open, cred])
 
   const toggleModel = (m: string) =>
@@ -1670,14 +1682,25 @@ const LogViewer = memo(function LogViewer({ focusToken = 0, focusTerm = '' }: { 
   // 非实时模式：手动拉一次快照。
   useEffect(() => {
     if (live) return
+    // 快速连点级别（INFO→WARN→ERROR）会并发多个快照请求，先到的未必是最后点的那个：
+    // 旧响应晚到会把新级别的结果覆盖成旧级别的行（过滤器显示 ERROR、内容却是 INFO）。
+    // cancelled 标志让被取代的那次响应自尽（与上方 SSE effect 的 cancelled 同套路）。
+    let cancelled = false
     getLogs({ level: levelParam })
       .then((entries) => {
+        if (cancelled) return
         lastSeq.current = entries.length > 0 ? Math.max(...entries.map((e) => e.seq)) : -1
         setLogs(entries)
         // 同上:快照重载后复位贴底标志,避免过期 false 卡住后续自动跟随。
         atBottomRef.current = true
       })
-      .catch(() => toast.error(t('opspage.toast.fetchLogsFail')))
+      .catch(() => {
+        // 已自尽的旧请求不再弹错（它的失败对新级别的结果没有意义）。
+        if (!cancelled) toast.error(t('opspage.toast.fetchLogsFail'))
+      })
+    return () => {
+      cancelled = true
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [live, level])
 

@@ -18,7 +18,7 @@ import { EmptyState } from '@/components/ui/empty-state'
 import { Skeleton } from '@/components/ui/skeleton'
 import { StatCard } from '@/components/ui/stat-card'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
-import { cn } from '@/lib/utils'
+import { cn, extractErrorMessage, parseError } from '@/lib/utils'
 import { searchTraces, type TraceRecord, type TraceSearchFilter } from '@/api/ops'
 import {
   useUsageOverview,
@@ -1078,15 +1078,21 @@ export function TrashDetailDialog({
       await restoreCredential(item.id)
       toast.success(t('opsdetaildialogs.trash.restoreSuccess', { id: item.id }))
       invalidate()
-    } catch {
+    } catch (err) {
       // 多开分身与主凭据必然同 key → 默认路径被 key 去重挡住。
-      // 自动重试一次强制恢复（恢复后仍是禁用态，不会直接投入调度，故安全）。
+      // 判据走后端**稳定 error.type**（`duplicate_credential`，见 admin/error.rs）：
+      // 不能无条件重试 force —— 网络/鉴权/凭据不存在时那只是多打一次写请求，
+      // 还会把真实失败原因换成一句笼统文案。与设置页回收站的同款判据对齐。
+      if (parseError(err).type !== 'duplicate_credential') {
+        toast.error(extractErrorMessage(err))
+        return
+      }
       try {
         await restoreCredential(item.id, true)
         toast.success(t('opsdetaildialogs.trash.restoreSuccess', { id: item.id }))
         invalidate()
-      } catch {
-        toast.error(t('opsdetaildialogs.trash.restoreFailed', { id: item.id }))
+      } catch (err2) {
+        toast.error(extractErrorMessage(err2))
       }
     } finally {
       setBusyId(null)

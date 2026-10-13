@@ -20,8 +20,8 @@ export function AnimatedHeight({
   duration?: number
 }) {
   const innerRef = useRef<HTMLDivElement | null>(null)
+  // 初值 'auto'：首帧直接用内容自然高度（不从 0 过渡），挂载后立刻实测并切成 px 才能有后续过渡。
   const [height, setHeight] = useState<number | 'auto'>('auto')
-  const firstRef = useRef(true)
 
   useEffect(() => {
     const el = innerRef.current
@@ -31,7 +31,6 @@ export function AnimatedHeight({
       setHeight(h)
     }
     measure()
-    firstRef.current = false
     const ro = new ResizeObserver(measure)
     ro.observe(el)
     return () => ro.disconnect()

@@ -56,7 +56,9 @@ export function BatchVerifyDialog({
               <div className="w-full bg-secondary rounded-full h-2">
                 <div
                   className="bg-primary h-2 rounded-full transition-all"
-                  style={{ width: `${(progress.current / progress.total) * 100}%` }}
+                  // total 为 0 时 0/0=NaN，width:NaN% 是非法值（进度条静默不显示）。
+                  // 与 model-test-dialog 同款兜底。
+                  style={{ width: `${progress.total ? (progress.current / progress.total) * 100 : 0}%` }}
                 />
               </div>
             </div>

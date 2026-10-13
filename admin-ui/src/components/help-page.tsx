@@ -57,6 +57,25 @@ interface WebSearchResult {
   snippet: string
 }
 
+/**
+ * 搜索结果链接只放行 http/https。
+ *
+ * url 是**上游搜索结果原样透传**（后端 parse_ddg_response / parse_bing_rss 只做
+ * 字符串搬运，不校验 scheme），最终直接进 `href`。`javascript:` 一类伪协议在点击时
+ * 于面板同源执行 —— 而管理面 Key 就在 sessionStorage 里，等于接管链最后一段。
+ * 当前 CSP（default-src 'self'）能拦住 javascript: 导航，但那不该是唯一防线。
+ * 非法 scheme 返回 null，调用方降级为非链接展示（不丢结果，只是不可点）。
+ */
+function safeExternalHref(url: string): string | null {
+  try {
+    const u = new URL(url)
+    return u.protocol === 'http:' || u.protocol === 'https:' ? u.href : null
+  } catch {
+    // 相对路径 / 空串 / 无法解析：一律当不可点处理。
+    return null
+  }
+}
+
 type View = 'kb' | 'map' | 'web' | 'conn'
 
 function LocalCodePath({ path }: { path: string }) {
@@ -366,22 +385,31 @@ function WebSearchView() {
             {t('helppage.web.resultCount').replace('{n}', String(results.length))}
           </p>
           <div className="space-y-2">
-            {results.map((r, i) => (
-              <a
-                key={`${r.url}-${i}`}
-                href={r.url}
-                target="_blank"
-                rel="noreferrer"
-                className="block rounded-lg border border-border/60 bg-white/5 p-3 transition-colors hover:border-primary/40 hover:bg-primary/5"
-              >
-                <div className="flex items-center gap-1.5 text-sm font-medium">
-                  {r.title}
-                  <ExternalLink className="h-3 w-3 shrink-0 text-muted-foreground" />
+            {results.map((r, i) => {
+              const href = safeExternalHref(r.url)
+              const body = (
+                <>
+                  <div className="flex items-center gap-1.5 text-sm font-medium">
+                    {r.title}
+                    {href && <ExternalLink className="h-3 w-3 shrink-0 text-muted-foreground" />}
+                  </div>
+                  <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-muted-foreground">{r.snippet}</p>
+                  <code className="mt-1 block truncate font-mono text-[10px] text-[#888]">{r.url}</code>
+                </>
+              )
+              const cls =
+                'block rounded-lg border border-border/60 bg-white/5 p-3 transition-colors'
+              // scheme 非法（上游脏数据）时降级为静态块：结果照常可见，只是不可点。
+              return href ? (
+                <a key={`${r.url}-${i}`} href={href} target="_blank" rel="noreferrer noopener" className={`${cls} hover:border-primary/40 hover:bg-primary/5`}>
+                  {body}
+                </a>
+              ) : (
+                <div key={`${r.url}-${i}`} className={cls}>
+                  {body}
                 </div>
-                <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-muted-foreground">{r.snippet}</p>
-                <code className="mt-1 block truncate font-mono text-[10px] text-[#888]">{r.url}</code>
-              </a>
-            ))}
+              )
+            })}
           </div>
         </>
       )}

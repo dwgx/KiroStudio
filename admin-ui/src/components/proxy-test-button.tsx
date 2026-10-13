@@ -4,6 +4,7 @@ import { toast } from 'sonner'
 import { Loader2, Wifi } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { testProxy } from '@/api/ops'
+import { extractErrorMessage } from '@/lib/utils'
 
 interface ProxyTestButtonProps {
   /** 待测代理 URL；留空/"direct" 表示测直连。 */
@@ -61,8 +62,10 @@ export function ProxyTestButton({
         )
       }
     } catch (err) {
+      // 后端错误形状是 {"error":{"message"}}；裸 (err as Error).message 只剩 axios 的
+      // "Request failed with status code 502"，把真因埋掉。
       toast.error(
-        t('proxytestbutton.toast.failed', { message: (err as Error).message }),
+        t('proxytestbutton.toast.failed', { message: extractErrorMessage(err) }),
         { id: pendingToast },
       )
     } finally {

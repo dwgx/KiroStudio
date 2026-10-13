@@ -202,6 +202,20 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [exportingSelected, setExportingSelected] = useState(false)
   const [exportProgress, setExportProgress] = useState({ current: 0, total: 0 })
   const cancelVerifyRef = useRef(false)
+  // 卸载标志（离开凭据页）。验活循环每轮都在打**真实上游请求**（deepVerify 会真发 API 调用），
+  // 页面没了还继续打是纯浪费：用户看不到进度、也点不到取消按钮。
+  // 复用 cancelVerifyRef 这条既有通道（卸载即置取消），只用本标志区分「卸载」与
+  // 「用户主动取消」—— 后者才该弹"已取消"提示。
+  const unmountedRef = useRef(false)
+  useEffect(() => {
+    // StrictMode 下 effect 会 mount→unmount→mount 跑两遍，故挂载时显式复位，
+    // 否则开发环境里那次假卸载会把标志永久留成 true（验活一开就自尽）。
+    unmountedRef.current = false
+    return () => {
+      unmountedRef.current = true
+      cancelVerifyRef.current = true
+    }
+  }, [])
   // 模型测试：勾选凭据后打开独立弹窗（弹窗内自选模型、可反复测、保留上次结果）
   const [modelTestOpen, setModelTestOpen] = useState(false)
   const [modelTestIds, setModelTestIds] = useState<number[]>([])
@@ -741,9 +755,9 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
 
     // 开始验活
     for (let i = 0; i < ids.length; i++) {
-      // 检查是否取消
+      // 检查是否取消（用户点取消 / 组件已卸载——卸载不弹提示，那是给用户看的）
       if (cancelVerifyRef.current) {
-        toast.info(t('dashboard.verify.canceled'))
+        if (!unmountedRef.current) toast.info(t('dashboard.verify.canceled'))
         break
       }
 
@@ -759,9 +773,9 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       try {
         // 深度验活：发真实 API 请求检测 suspend 状态(custom_api 走透传上游探测,后端已分流)
         await deepVerifyCredential(id)
-        // await 期间用户可能点了取消:复检,取消则不再记成功/不再多发余额请求。
+        // await 期间用户可能点了取消(或页面已卸载):复检,取消则不再记成功/不再多发余额请求。
         if (cancelVerifyRef.current) {
-          toast.info(t('dashboard.verify.canceled'))
+          if (!unmountedRef.current) toast.info(t('dashboard.verify.canceled'))
           break
         }
         const cred = data?.credentials.find(c => c.id === id)

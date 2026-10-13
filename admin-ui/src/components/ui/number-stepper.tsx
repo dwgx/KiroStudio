@@ -59,15 +59,23 @@ export function NumberStepper({
     if (next !== value) onChange(next)
   }
 
+  // 最新值放 ref：长按的 setInterval 捕获的是**首次**创建的那个 bump 闭包。若 bump 直接闭包
+  // text/value，之后每个 tick 都拿同一份旧基准算出同一个 next —— 「长按加速连续步进」会退化成
+  // 「只动一步 + 反复重发同一个值」（setInterval 不会因为重渲染而换成新的闭包）。
+  // 让 bump 保持稳定身份、每 tick 读 ref 里的最新值，才能真的连续推进。
+  const latestRef = React.useRef({ text, value })
+  latestRef.current = { text, value }
+
   const bump = React.useCallback(
     (dir: 1 | -1) => {
-      const base = Number(text)
-      const start = Number.isNaN(base) ? value : base
+      const { text: curText, value: curValue } = latestRef.current
+      const base = Number(curText)
+      const start = Number.isNaN(base) ? curValue : base
       const next = clamp(start + dir * step)
       setText(String(next))
-      if (next !== value) onChange(next)
+      if (next !== curValue) onChange(next)
     },
-    [text, value, step, clamp, onChange]
+    [step, clamp, onChange]
   )
 
   // 长按加速：先单步，200ms 后开始每 60ms 连续步进

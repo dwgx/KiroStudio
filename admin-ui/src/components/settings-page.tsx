@@ -127,8 +127,33 @@ function timeAgo(iso: string | null | undefined, t: TFunction): string {
   return t('settingspage.time.yearsAgo', { n: Math.floor(month / 12) })
 }
 
-/* ============ 分区导航 + 搜索 基础设施 ============ */
+/**
+ * OTA 升级失败的两种情形判别。
+ *
+ * `POST /update/perform` 的错误体是 `{success:false, message:"升级失败: …"}` —— 不是全站
+ * 通用的 `{error:{type,message}}` 形状，所以走不了 `extractErrorMessage`（那只会拿到 axios 的
+ * "Request failed with status code 409"）。
+ *
+ * `err` 在类型上是 unknown（axios 的 reject 值），故逐层用 `in`/`typeof` 收窄读取，
+ * 不用 `as` 断言 —— 断言会在形状不符时把"读不到"变成静默的 undefined。
+ *
+ * 返回 `rejected=false` 表示**没有** HTTP 响应：二进制已替换、进程重启把连接掐断，
+ * 属预期中断（与真失败要给出完全不同的提示）。
+ */
+function classifyOtaFailure(err: unknown): { rejected: boolean; message?: string } {
+  if (!err || typeof err !== 'object' || !('response' in err) || !err.response) {
+    return { rejected: false }
+  }
+  const resp = err.response
+  if (!resp || typeof resp !== 'object' || !('data' in resp)) return { rejected: true }
+  const data = resp.data
+  if (!data || typeof data !== 'object' || !('message' in data) || typeof data.message !== 'string') {
+    return { rejected: true }
+  }
+  return { rejected: true, message: data.message }
+}
 
+/* ============ 分区导航 + 搜索 基础设施 ============ */
 // 设置分区（顶部 tab）。id 用于 tab 切换与卡片归属；label 经 i18n 在渲染时解析。
 type SectionId = 'basic' | 'security' | 'scheduling' | 'advanced' | 'clones' | 'storage' | 'service' | 'privacy' | 'appearance' | 'export' | 'trash'
 
@@ -158,6 +183,7 @@ const CARD_INDEX_DEFS: { section: SectionId; titleKey: string; kwKey: string }[]
   { section: 'advanced', titleKey: 'settingspage.card.cliAlign', kwKey: 'settingspage.card.cliAlign.kw' },
   { section: 'advanced', titleKey: 'settingspage.card.advAbsorb', kwKey: 'settingspage.card.advAbsorb.kw' },
   { section: 'advanced', titleKey: 'settingspage.card.advCache', kwKey: 'settingspage.card.advCache.kw' },
+  { section: 'advanced', titleKey: 'settingspage.card.modelMapping', kwKey: 'settingspage.card.modelMapping.kw' },
   { section: 'advanced', titleKey: 'settingspage.card.errorMessages', kwKey: 'settingspage.card.errorMessages.kw' },
   { section: 'basic', titleKey: 'settingspage.card.loginBg', kwKey: 'settingspage.card.loginBg.kw' },
   { section: 'security', titleKey: 'settingspage.card.security', kwKey: 'settingspage.card.security.kw' },
@@ -476,9 +502,17 @@ function ServiceManagementCard() {
         toast.success(r.message || t('settingspage.service.toastUpgrading'))
         setUpgradeConfirm(false)
       },
-      onError: () => {
-        // 升级成功后会自动重启导致本次连接中断，抛错也当"已发起"
-        toast.warning(t('settingspage.service.toastUpgradingDisconnected'))
+      onError: (err) => {
+        // 有 HTTP 响应 = 后端**明确拒绝**（409 容器部署 / 400 tag 非法 / 422 校验失败 /
+        // 502 下载失败），必须如实显示原因；只有**无响应**才是"已替换二进制 + 进程重启
+        // 掐断连接"这种预期中断。此前一律当"已发起"，于是容器里点升级会提示
+        // "升级已发起"而实际什么都没发生（后端 409 拒绝了）。
+        const fail = classifyOtaFailure(err)
+        if (fail.rejected) {
+          toast.error(fail.message || t('opspage.toast.updateFail'))
+        } else {
+          toast.warning(t('settingspage.service.toastUpgradingDisconnected'))
+        }
         setUpgradeConfirm(false)
       },
     })
@@ -520,7 +554,19 @@ function ServiceManagementCard() {
               </span>
             )}
             {updInfo?.has_update && (
-              <Button size="sm" onClick={() => setUpgradeConfirm(true)} disabled={upgrading}>
+              <Button
+                size="sm"
+                onClick={() => setUpgradeConfirm(true)}
+                // 容器部署里 OTA 替换的是镜像层文件，重启即还原 —— 后端 perform_update 会
+                // 直接 409 拒绝（container_rejection_reason），故这里先禁用，不让用户点一个
+                // 必然失败的按钮。check 本身仍可用（只读展示远端版本，无害）。
+                disabled={upgrading || updInfo.container_deployment === true}
+                title={
+                  updInfo.container_deployment === true
+                    ? t('opspage.agg.containerDeploy')
+                    : undefined
+                }
+              >
                 {upgrading ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <RotateCcw className="mr-1.5 h-4 w-4" />}
                 {t('settingspage.service.btnUpgrade', { version: updInfo.latest_version })}
               </Button>

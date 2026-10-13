@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Trans, useTranslation } from 'react-i18next'
 import i18n from '@/i18n'
 import {
@@ -12,6 +12,7 @@ import { Badge } from '@/components/ui/badge'
 import { CheckCircle2, XCircle, Loader2, MoreHorizontal, FlaskConical, Lightbulb, ShieldCheck, History } from 'lucide-react'
 import { PROBE_MODEL_CATALOG, type ProbedModel, type ProbeModelsResponse } from '@/api/credentials'
 import type { CredentialStatusItem } from '@/types/api'
+import { extractErrorMessage } from '@/lib/utils'
 import { toast } from 'sonner'
 
 /** 模型勾选模板：一键切换常测组合。 */
@@ -42,8 +43,13 @@ interface ModelTestDialogProps {
   onSetWhitelist: (id: number, models: string[]) => Promise<void>
 }
 
-/** 单模型状态 → 短标签 */
-function modelChip(m: ProbedModel) {
+/**
+ * 单模型状态 → 短标签。
+ *
+ * credits 缺省表示**来源没有花费数据**（如持久化历史 testedModels，只存 model+status）：
+ * 此时不能按 0 展示，否则 tooltip 会谎报「本次 0.0000 credits」。
+ */
+function modelChip(m: { model: string; status: ProbedModel['status']; credits?: number }) {
   const cls =
     m.status === 'supported'
       ? 'bg-emerald-500/10 text-emerald-300 border border-emerald-500/30'
@@ -52,7 +58,9 @@ function modelChip(m: ProbedModel) {
         : 'bg-amber-500/10 text-amber-300 border border-amber-500/30'
   const tip =
     m.status === 'supported'
-      ? i18n.t('modeltestdialog.chip.availableCredits', { credits: m.credits.toFixed(4) })
+      ? m.credits != null
+        ? i18n.t('modeltestdialog.chip.availableCredits', { credits: m.credits.toFixed(4) })
+        : i18n.t('modeltestdialog.chip.available')
       : m.status === 'unsupported'
         ? i18n.t('modeltestdialog.chip.unsupported')
         : i18n.t('modeltestdialog.chip.unknown')
@@ -85,7 +93,9 @@ export function ModelTestDialog({ open, onOpenChange, credentialIds, credentials
       await onSetWhitelist(id, supported)
       toast.success(t('modeltestdialog.toast.whitelistSaved', { id, count: supported.length }))
     } catch (e) {
-      toast.error(t('modeltestdialog.toast.whitelistFailed', { message: (e as Error).message }))
+      // 用 extractErrorMessage 取后端 {"error":{"message"}} 的原文；裸 (e as Error).message
+      // 只会得到 axios 的 "Request failed with status code 502"，把真因埋掉。
+      toast.error(t('modeltestdialog.toast.whitelistFailed', { message: extractErrorMessage(e) }))
     } finally {
       setSavingWhitelist(null)
     }
@@ -100,6 +110,15 @@ export function ModelTestDialog({ open, onOpenChange, credentialIds, credentials
   const [results, setResults] = useState<Map<number, ModelTestResult>>(new Map())
   const [grandTotal, setGrandTotal] = useState(0)
   const cancelRef = useState(() => ({ v: false }))[0]
+
+  // 关窗即取消在跑的测试：runTest 的循环在每次 await 之间检查 cancelRef.v。
+  // 不置位的话，关闭弹窗（X / Esc / 遮罩）后剩下的号仍会被逐个真实探测 ——
+  // 每个模型都烧真积分（见页脚说明），而 setResults/setProgress 打在已卸载组件上，
+  // 重开弹窗还会看到一个「没人看着但仍在继续」的半截进度。
+  // 只能阻止**下一次**探测，已在途的那次 HTTP 无法中止（后端也有自己的上游超时兜底）。
+  useEffect(() => {
+    if (!open) cancelRef.v = true
+  }, [open, cancelRef])
 
   const toggleModel = (id: string) => {
     setSelectedModels((prev) => {
@@ -132,7 +151,8 @@ export function ModelTestDialog({ open, onOpenChange, credentialIds, credentials
         setResults((prev) => new Map(prev).set(id, { id, status: 'done', models: res.models, totalCredits: res.totalCredits }))
         setGrandTotal(grand)
       } catch (e) {
-        setResults((prev) => new Map(prev).set(id, { id, status: 'failed', error: (e as Error).message }))
+        // 同上：保留后端错误原文，避免只剩 axios 的状态码文案。
+        setResults((prev) => new Map(prev).set(id, { id, status: 'failed', error: extractErrorMessage(e) }))
       }
       setProgress({ current: i + 1, total: credentialIds.length })
     }
@@ -234,7 +254,7 @@ export function ModelTestDialog({ open, onOpenChange, credentialIds, credentials
                       )}
                     </div>
                     <div className="flex flex-wrap gap-1.5 mt-1.5">
-                      {hist.map((h) => modelChip({ model: h.model, status: h.status, credits: 0 }))}
+                      {hist.map((h) => modelChip({ model: h.model, status: h.status }))}
                     </div>
                   </div>
                 )
@@ -308,7 +328,7 @@ export function ModelTestDialog({ open, onOpenChange, credentialIds, credentials
                           <History className="h-3 w-3" /> {t('modeltestdialog.history.resultLabel')}
                         </div>
                         <div className="flex flex-wrap gap-1.5">
-                          {hist.map((h) => modelChip({ model: h.model, status: h.status, credits: 0 }))}
+                          {hist.map((h) => modelChip({ model: h.model, status: h.status }))}
                         </div>
                       </div>
                     )

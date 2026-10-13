@@ -1430,8 +1430,13 @@ export function CredentialCard({
                     { id: credential.id, enabled: next },
                     {
                       onSuccess: () => toast.success(t('credentialcard.toast.mappingExemptSaved')),
-                      onError: (err) =>
-                        toast.error(t('credentialcard.toast.operationFailed') + (err as Error).message),
+                      onError: (err) => {
+                        // 乐观更新必须回滚：写失败时后端仍是旧值，勾选停在"已开启"
+                        // 会一直骗到下次 30s 轮询（这期间用户以为豁免已生效）。
+                        // 回滚取服务端最后下发的值，而不是简单地取反（本地值可能已漂）。
+                        setCustomMappingExempt(credential.modelMappingExempt ?? false)
+                        toast.error(t('credentialcard.toast.operationFailed') + (err as Error).message)
+                      },
                     }
                   )
                 }}

@@ -22,7 +22,14 @@ export function ConnPage() {
   // 生产环境直接用 window.location.origin 即客户端需要的 Base URL。
   const origin = window.location.origin
   const loginKey = storage.getApiKey() ?? ''
-  const apiKey = loginKey || '<API_KEY>'
+  // ⚠️ 登录密钥（adminApiKey）**不是**网关密钥（config.json 的 apiKey），两者不通用：
+  // 后端对话鉴权只认 user key（common::auth_keys::user_key_matches），admin key 打
+  // /v1/messages 必 401。把它拼进下面这些「一键复制」片段有两个后果：
+  //   ① 客户端拿去直接用必然失败，与「一键复制即可使用」的承诺相反；
+  //   ② adminApiKey 能调 /api/admin/* 全量管理面 —— 被复制进 shell 历史 / ~/.zshrc /
+  //      issue 就是管理面凭证外泄，比泄露网关密钥严重得多。
+  // 故片段一律用占位符，真值按上方 Callout 指引自取（面板刻意不回显网关密钥原文）。
+  const apiKey = '<API_KEY>'
   const maskedKey = loginKey
     ? loginKey.length <= 8
       ? '••••'

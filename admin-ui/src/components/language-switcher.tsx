@@ -10,9 +10,14 @@ const SEG_LANGS = [
   { code: 'ja', short: '日' },
 ] as const
 
+// 语言主标签：i18n.language 可能带区域后缀（'zh-CN'/'en-US'/'ja-JP'，来自 navigator.language
+// 检测，supportedLngs 里只有 'zh'/'en'/'ja' 三支且 nonExplicitSupportedLngs=true 会原样保留
+// 区域码）。直接用 === 比较的后果是三个按钮全不亮、而滑动高亮块被 Math.max(0,-1) 顶到第一格
+// —— 高亮指着「中」但没有任何按钮是选中态。故两边都按主标签比较（裸码时是恒等变换）。
 export function LanguageSwitcher({ className }: { className?: string }) {
   const { i18n } = useTranslation()
-  const idx = Math.max(0, SEG_LANGS.findIndex((l) => l.code === i18n.language))
+  const current = i18n.language.toLowerCase().split('-')[0]
+  const idx = Math.max(0, SEG_LANGS.findIndex((l) => l.code === current))
   return (
     <div
       className={cn(
@@ -35,7 +40,7 @@ export function LanguageSwitcher({ className }: { className?: string }) {
         }}
       />
       {SEG_LANGS.map((l) => {
-        const active = l.code === i18n.language
+        const active = l.code === current
         return (
           <button
             key={l.code}
