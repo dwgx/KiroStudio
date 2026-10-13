@@ -1433,6 +1433,53 @@ mod balance_cache_tests {
         AdminService::new(tm, Vec::<String>::new())
     }
 
+    /// P1-1 接线：空库（auth_kv 在但无 token）→ found=0/imported=0，路径原样回显。
+    ///
+    /// 刻意不放真 token：那条路径会触发 `add_credential` 的上游探测（真网络往返），
+    /// 让单测依赖外网既慢又 flaky。真 token 的端到端冒烟在部署后对服务做（见板）。
+    #[tokio::test]
+    async fn import_from_kiro_cli_empty_db_reports_zero() {
+        let svc = Arc::new(mk_service_with_one_credential());
+        let dir = std::env::temp_dir().join(format!(
+            "kiro-cli-import-e2e-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("data.sqlite3");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute("CREATE TABLE auth_kv (key TEXT PRIMARY KEY, value TEXT)", [])
+                .unwrap();
+        }
+        let resp = svc
+            .import_from_kiro_cli(Some(path.display().to_string()), 0)
+            .await
+            .unwrap();
+        assert_eq!(resp.found, 0);
+        assert_eq!(resp.imported, 0);
+        assert!(resp.results.is_empty());
+        assert_eq!(resp.db_path, path.display().to_string());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1-1 错误路径：库不存在 → `InvalidCredential`（HTTP 400，而非 500），文案可读。
+    #[tokio::test]
+    async fn import_from_kiro_cli_missing_db_is_invalid_credential() {
+        let svc = Arc::new(mk_service_with_one_credential());
+        let dir = std::env::temp_dir().join(format!(
+            "kiro-cli-import-e2e-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = svc
+            .import_from_kiro_cli(Some(dir.join("nope.sqlite3").display().to_string()), 0)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status_code(), axum::http::StatusCode::BAD_REQUEST);
+        assert!(err.to_string().contains("不存在"), "错误文案要可读: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 造一条余额缓存条目（remaining=90 / limit=100 / used=10）。
     fn mk_cached_balance(id: u64, cached_at: f64) -> CachedBalance {
         CachedBalance {

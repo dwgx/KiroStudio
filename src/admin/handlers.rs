@@ -899,6 +899,41 @@ pub async fn import_keys(
     Json(state.service.import_keys(req).await).into_response()
 }
 
+/// POST /api/admin/import/kiro-cli
+///
+/// 从**官方 kiro-cli** 的 `data.sqlite3` 导入已登录会话（P1-1，免登复用）。
+///
+/// 请求体：`{ "dbPath": "…", "priority": 0 }`（两字段均可省略，`{}` 合法）。`dbPath`
+/// 缺省按 OS 约定推断（Windows `%LOCALAPPDATA%\kiro-cli\data.sqlite3`、macOS
+/// `~/Library/Application Support/kiro-cli/data.sqlite3`、Linux
+/// `~/.local/share/kiro-cli/data.sqlite3`）。库**只读打开**，不写不改 CLI 状态。
+///
+/// 部分失败仍 200，逐条看 `results[].ok`；响应只含脱敏 token，绝不回原文。
+pub async fn import_kiro_cli(
+    State(state): State<AdminState>,
+    Json(payload): Json<ImportKiroCliRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .import_from_kiro_cli(payload.db_path, payload.priority)
+        .await
+    {
+        Ok(r) => Json(r).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportKiroCliRequest {
+    /// kiro-cli 数据库路径（缺省按 OS 约定推断）。
+    #[serde(default)]
+    pub db_path: Option<String>,
+    /// 导入凭据的优先级（缺省 0）。
+    #[serde(default = "default_priority")]
+    pub priority: u32,
+}
+
 /// DELETE /api/admin/credentials/:id
 /// 删除凭据
 pub async fn delete_credential(

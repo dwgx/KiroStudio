@@ -31,7 +31,8 @@ use super::types::{
     DiagnosticsPoolHealth, DiagnosticsSnapshotResponse, DiagnosticsVersion,
     DisableQuotaExceededResponse, ImportConfigResponse, ImportKeyItem,
     ImportKeyResult, ImportKeysRequest, ImportKeysResponse, KamExportAccount,
-    KamExportResponse, LoadBalancingModeResponse, ReprobeRegionResponse,
+    KamExportResponse, KiroCliImportItem, KiroCliImportResponse,
+    LoadBalancingModeResponse, ReprobeRegionResponse,
     SetLoadBalancingModeRequest, StorageCleanupItem, StorageCleanupResponse,
     StoragePartition, StorageStatsResponse, TrashItemResponse, TrashListResponse,
     build_import_response, mask_import_key,
@@ -46,6 +47,9 @@ pub use insight::InsightParams;
 #[path = "ksk_import.rs"]
 mod ksk_import;
 use ksk_import::{apply_ksk_region_suffix, clean_ksk_api_key};
+#[path = "kiro_cli_import.rs"]
+mod kiro_cli_import;
+use kiro_cli_import::{default_db_path, read_tokens as read_kiro_cli_tokens};
 #[path = "balance_cache.rs"]
 mod balance_cache;
 use balance_cache::CachedBalance;
@@ -2916,6 +2920,90 @@ impl AdminService {
                 None
             },
             email,
+        })
+    }
+
+    /// 从官方 kiro-cli 的 `data.sqlite3` 导入登录（P1-1）。
+    ///
+    /// 读取逻辑与键名/字段拼写的确证来源见 [`kiro_cli_import`] 模块文档。每条 token 都走
+    /// 既有的 [`Self::add_credential`]（去重 / 校验 / 节点分配 / 份数逻辑全复用，不存在
+    /// 第二条上号路径），逐条回报结果；**部分失败不回滚**（与 `import/keys` 同款约定）。
+    ///
+    /// 串行而非并发：库里通常只有个位数条登录，串行足够，也避免与 `import/keys` 的
+    /// 上游压力叠加（单条 `add_credential` 含一次 `get_usage_limits_for` 网络往返）。
+    pub async fn import_from_kiro_cli(
+        self: &std::sync::Arc<Self>,
+        db_path: Option<String>,
+        priority: u32,
+    ) -> Result<KiroCliImportResponse, AdminServiceError> {
+        let path = match db_path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(p) => PathBuf::from(p),
+            None => default_db_path().ok_or_else(|| {
+                AdminServiceError::InvalidCredential(
+                    "无法推断 kiro-cli 数据库路径（缺 HOME/LOCALAPPDATA），请显式传 dbPath"
+                        .to_string(),
+                )
+            })?,
+        };
+        let tokens = read_kiro_cli_tokens(&path).map_err(AdminServiceError::InvalidCredential)?;
+        let found = tokens.len();
+        let mut results = Vec::with_capacity(found);
+        let mut imported = 0usize;
+        for t in tokens {
+            let masked_token = mask_import_key(&t.access_token);
+            // IdC 缺 device 注册 → 仍导入（access token 有效期内可用），但显式标注，
+            // 不装作成功（`refresh_idc_token` 要求 clientId + clientSecret）。
+            let warning = if t.auth_method == "idc"
+                && (t.client_id.is_none() || t.client_secret.is_none())
+            {
+                Some(
+                    "缺 kirocli:odic:device 注册（clientId/clientSecret）——\
+                     access token 过期后无法刷新"
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            let req = AddCredentialRequest {
+                access_token: Some(t.access_token),
+                refresh_token: t.refresh_token,
+                auth_method: t.auth_method.clone(),
+                profile_arn: t.profile_arn,
+                expires_at: t.expires_at,
+                client_id: t.client_id,
+                client_secret: t.client_secret,
+                priority,
+                ..Default::default()
+            };
+            match self.add_credential(req).await {
+                Ok(resp) => {
+                    imported += 1;
+                    results.push(KiroCliImportItem {
+                        key: t.key,
+                        auth_method: t.auth_method,
+                        masked_token,
+                        ok: true,
+                        credential_id: Some(resp.credential_id),
+                        error: None,
+                        warning,
+                    });
+                }
+                Err(e) => results.push(KiroCliImportItem {
+                    key: t.key,
+                    auth_method: t.auth_method,
+                    masked_token,
+                    ok: false,
+                    credential_id: None,
+                    error: Some(e.to_string()),
+                    warning,
+                }),
+            }
+        }
+        Ok(KiroCliImportResponse {
+            db_path: path.display().to_string(),
+            found,
+            imported,
+            results,
         })
     }
 

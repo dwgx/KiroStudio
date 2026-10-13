@@ -23,7 +23,8 @@ use super::{
         get_all_credentials, get_cached_balances,
         get_config, get_credential_balance, get_error_message_defaults, get_load_balancing_mode,
         get_overage_status,
-        help_web_search, import_config, import_keys, import_sso_token, list_socks_nodes, list_trash,
+        help_web_search, import_config, import_keys, import_kiro_cli, import_sso_token,
+        list_socks_nodes, list_trash,
         perform_update,
         poll_idc_login, poll_social_login, probe_available_models, probe_models_standalone, test_models,
         probe_regions, proxy_test, probe_upstream_models, purge_credential, purge_trash_batch,
@@ -113,6 +114,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
         )
         // 批量导入 Kiro API Key（ksk_ 号）：兼容 items[] / keys[] / apiKey / kiroApiKey 四种体
         .route("/import/keys", post(import_keys))
+        // 从官方 kiro-cli 的 data.sqlite3 导入已登录会话（只读打开，免登复用）
+        .route("/import/kiro-cli", post(import_kiro_cli))
         // SSO Token 导入（粘贴 AWS portal Bearer Token 静默换号，产物为标准 IdC 凭据）。
         // 静态段 import-sso 与 {id} 同层共存，matchit 静态段优先（同 /credentials/trash 先例）。
         .route("/credentials/import-sso", post(import_sso_token))

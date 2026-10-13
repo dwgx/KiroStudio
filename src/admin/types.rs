@@ -1994,6 +1994,42 @@ impl ImportKeysResponse {
     }
 }
 
+/// 从官方 kiro-cli 库导入的结果（P1-1）。
+///
+/// 与 `import/keys` 同款约定：部分失败仍 HTTP 200，逐条看 `results[].ok`。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KiroCliImportResponse {
+    /// 实际读取的库路径（回显，便于排障：路径推断错时一眼能看出）。
+    pub db_path: String,
+    /// 库里读到的登录条数（按 token 去重后）。
+    pub found: usize,
+    /// 成功入池条数。
+    pub imported: usize,
+    pub results: Vec<KiroCliImportItem>,
+}
+
+/// 单条 kiro-cli 登录的导入结果。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KiroCliImportItem {
+    /// 来源 `auth_kv` key（排障用：哪条 key 读出来的）。
+    pub key: String,
+    /// `social` / `idc`。
+    pub auth_method: String,
+    /// 脱敏后的 access token（绝不回原文）。
+    pub masked_token: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<u64>,
+    /// 失败原因（成功为 None）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// 非致命警告（如 IdC 缺 device 注册 → access token 过期后无法刷新）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
 /// Key 脱敏：前 8 字符 + `…` + 后 4 字符；长度 ≤ 16 一律 `***`。
 ///
 /// 阈值取 16：len=13 时 head8+tail4 会泄漏 12/13 字符。响应体与日志只允许出现
