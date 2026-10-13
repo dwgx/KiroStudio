@@ -1,0 +1,5 @@
+# 源码扫描测试用 include_str! + "\n}\n" 切片读 .rs 文件，要求工作树是 LF。
+# 没有本规则时，core.autocrlf=true 的 Windows 检出会把 .rs 变 CRLF：
+# 本机 `cargo test` 会有 8 个守卫测试全红（CI 在 Linux 上恒绿，问题被掩盖）。
+*.rs text eol=lf
+.gitattributes text eol=lf
