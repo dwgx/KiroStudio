@@ -128,6 +128,39 @@ pub async fn register_client(
     })
 }
 
+/// 解析 Device Authorization 的 200 响应体（纯函数，供确定性测试）。
+///
+/// 三个承重字段（`deviceCode` / `userCode` / `verificationUri`）缺失或空白 = 上游契约
+/// 违约：宁可当场报错，也不把**空设备码**交给用户 —— 旧实现 `unwrap_or_default()` 会
+/// 静默产出空码，前端显示空白、用户无从授权，直到 `expires_in` 到期才报「已过期」
+/// （根因被吞掉，排障只能看到表象）。`expiresIn`/`interval` 保留保守默认值。
+fn parse_device_auth(data: &serde_json::Value) -> anyhow::Result<DeviceAuth> {
+    let non_empty = |name: &str| -> Option<String> {
+        data.get(name)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    };
+    let device_code = non_empty("deviceCode").ok_or_else(|| {
+        anyhow::anyhow!("Device authorization 响应缺少 deviceCode（上游契约违约）")
+    })?;
+    let user_code = non_empty("userCode").ok_or_else(|| {
+        anyhow::anyhow!("Device authorization 响应缺少 userCode（上游契约违约）")
+    })?;
+    let verification_uri = non_empty("verificationUri").ok_or_else(|| {
+        anyhow::anyhow!("Device authorization 响应缺少 verificationUri（上游契约违约）")
+    })?;
+    Ok(DeviceAuth {
+        device_code,
+        user_code,
+        verification_uri,
+        verification_uri_complete: non_empty("verificationUriComplete"),
+        expires_in: data.get("expiresIn").and_then(|v| v.as_u64()).unwrap_or(600),
+        interval: data.get("interval").and_then(|v| v.as_u64()).unwrap_or(5),
+    })
+}
+
 /// Step 2: 发起 device authorization
 pub async fn start_device_authorization(
     region: &str,
@@ -165,19 +198,7 @@ pub async fn start_device_authorization(
     }
 
     let data: serde_json::Value = resp.json().await?;
-    Ok(DeviceAuth {
-        device_code: data["deviceCode"].as_str().unwrap_or_default().to_string(),
-        user_code: data["userCode"].as_str().unwrap_or_default().to_string(),
-        verification_uri: data["verificationUri"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string(),
-        verification_uri_complete: data["verificationUriComplete"]
-            .as_str()
-            .map(|s| s.to_string()),
-        expires_in: data["expiresIn"].as_u64().unwrap_or(600),
-        interval: data["interval"].as_u64().unwrap_or(5),
-    })
+    parse_device_auth(&data)
 }
 
 /// 构造探测顺序:用户填的 region 打头,再补候选表(去重)。抽成纯函数便于单测。
@@ -257,6 +278,36 @@ pub async fn register_and_authorize_probing(
     Err(crate::kiro::token_manager::DiagnosedError { diagnosis }.into())
 }
 
+/// 解析 CreateToken 的 200 响应体（纯函数，供确定性测试）。
+///
+/// `accessToken` 缺失/空白 = 上游契约违约：**绝不返回 `Done`** —— 调用方会拿它建号
+/// 入池并持久化进 `credentials.json`，空 token 的号每次对话必然 401/403，只能人工删。
+/// 旧实现 `unwrap_or_default()` 正好会产出这种号。`refreshToken` 空白同样归 None
+/// （宁可不带，也不存一个假 refresh token）；`expiresIn` 缺失用 8h 保守默认。
+fn parse_create_token_success(text: &str) -> PollTokenResult {
+    let data: serde_json::Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(e) => return PollTokenResult::Error(format!("解析 JSON 失败: {}", e)),
+    };
+    let non_empty = |name: &str| -> Option<String> {
+        data.get(name)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    };
+    let Some(access_token) = non_empty("accessToken") else {
+        return PollTokenResult::Error(
+            "CreateToken 200 响应缺少 accessToken（上游契约违约，拒绝以空 token 建号）".to_string(),
+        );
+    };
+    PollTokenResult::Done(IdcTokenResult {
+        access_token,
+        refresh_token: non_empty("refreshToken"),
+        expires_in: data.get("expiresIn").and_then(|v| v.as_u64()).unwrap_or(28800),
+    })
+}
+
 /// Step 4: 轮询 CreateToken（一次调用，由上层循环驱动）
 pub async fn poll_create_token(
     region: &str,
@@ -302,15 +353,7 @@ pub async fn poll_create_token(
     };
 
     if status.is_success() {
-        let data: serde_json::Value = match serde_json::from_str(&text) {
-            Ok(v) => v,
-            Err(e) => return PollTokenResult::Error(format!("解析 JSON 失败: {}", e)),
-        };
-        return PollTokenResult::Done(IdcTokenResult {
-            access_token: data["accessToken"].as_str().unwrap_or_default().to_string(),
-            refresh_token: data["refreshToken"].as_str().map(|s| s.to_string()),
-            expires_in: data["expiresIn"].as_u64().unwrap_or(28800),
-        });
+        return parse_create_token_success(&text);
     }
 
     // 400 系列：检查具体错误码
@@ -366,5 +409,76 @@ mod tests {
         let order = probe_region_order("   ");
         assert_eq!(order.len(), IDC_OIDC_PROBE_REGIONS.len());
         assert_eq!(order.first().map(|s| s.as_str()), Some("us-east-1"));
+    }
+
+    /// 设备授权响应：三个承重字段缺失/空白必须报错（旧实现 `unwrap_or_default()`
+    /// 静默产出空设备码 —— 前端显示空白、轮询到超时才报「已过期」，根因被吞）。
+    #[test]
+    fn parse_device_auth_rejects_missing_core_fields() {
+        for bad in [
+            r#"{}"#,
+            r#"{"deviceCode":"d"}"#,
+            r#"{"deviceCode":"d","userCode":"u"}"#,
+            r#"{"deviceCode":" ","userCode":"u","verificationUri":"https://x"}"#,
+            r#"{"deviceCode":"d","userCode":"","verificationUri":"https://x"}"#,
+            r#"{"deviceCode":"d","userCode":"u","verificationUri":"  "}"#,
+        ] {
+            let v: serde_json::Value = serde_json::from_str(bad).unwrap();
+            assert!(
+                parse_device_auth(&v).is_err(),
+                "缺承重字段必须报错而不是产出空设备码: {bad}"
+            );
+        }
+        // 正常形态：字段带 trim、可选字段缺省为 None、数值字段保留保守默认。
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"deviceCode":" dc-1 ","userCode":" UC-1 ","verificationUri":"https://x/y"}"#,
+        )
+        .unwrap();
+        let d = parse_device_auth(&v).expect("完整响应必须解析成功");
+        assert_eq!(d.device_code, "dc-1");
+        assert_eq!(d.user_code, "UC-1");
+        assert_eq!(d.verification_uri, "https://x/y");
+        assert_eq!(d.verification_uri_complete, None);
+        assert_eq!(d.expires_in, 600, "expiresIn 缺省 600s");
+        assert_eq!(d.interval, 5, "interval 缺省 5s");
+    }
+
+    /// CreateToken 200：`accessToken` 缺失/空白必须报错（旧实现会返回 `Done`，
+    /// 调用方拿空 token 建号入池并落盘 —— 那个号之后每次对话必然 401/403）。
+    #[test]
+    fn parse_create_token_success_rejects_missing_access_token() {
+        for bad in [
+            r#"{}"#,
+            r#"{"accessToken":""}"#,
+            r#"{"accessToken":"   "}"#,
+            r#"{"accessToken":null}"#,
+            r#"{"accessToken":123}"#,
+        ] {
+            assert!(
+                matches!(parse_create_token_success(bad), PollTokenResult::Error(_)),
+                "缺 accessToken 必须报错（不得 Done 让空号入池）: {bad}"
+            );
+        }
+        // 正常形态：token 两侧空白被 trim；refreshToken 空白归 None；expiresIn 默认 28800。
+        match parse_create_token_success(r#"{"accessToken":" at-1 ","refreshToken":"  "}"#) {
+            PollTokenResult::Done(t) => {
+                assert_eq!(t.access_token, "at-1");
+                assert_eq!(t.refresh_token, None, "空白 refreshToken 不得存成假值");
+                assert_eq!(t.expires_in, 28800);
+            }
+            _ => panic!("完整响应必须 Done"),
+        }
+        match parse_create_token_success(r#"{"accessToken":"at-2","refreshToken":"rt-2"}"#) {
+            PollTokenResult::Done(t) => {
+                assert_eq!(t.access_token, "at-2");
+                assert_eq!(t.refresh_token.as_deref(), Some("rt-2"));
+            }
+            _ => panic!("完整响应必须 Done"),
+        }
+        // 非法 JSON：必须 Error 而非 panic。
+        assert!(matches!(
+            parse_create_token_success("not-json"),
+            PollTokenResult::Error(_)
+        ));
     }
 }

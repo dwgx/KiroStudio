@@ -338,6 +338,14 @@ struct SseFilterState {
     dsml_pending: DsmlPending,
     /// 滤掉的 thinking 文本累计**字符数**（估算 token = 字符数 / 4）。
     thinking_chars: u64,
+    /// 最后一条已下发的 `content_block_delta` 的**生效 index**（重编号后的值）。
+    ///
+    /// 用途：`finish()` 把 DSML 待拼接尾巴补发成 text_delta 时要知道挂到哪个块上。
+    /// 不能只看 `next_index`：`next_index` 只在 thinking 块过滤开启时随保留块自增，
+    /// **门控关闭（透传常态：`filter_thinking_blocks=false`）时恒为 0** ⇒ 若文本块
+    /// 不在 index 0（前面还有 thinking/工具块），尾巴会被补发到错误的块上（客户端把
+    /// 一个尾字符挂进 thinking 块或直接丢弃）。记录真实生效 index 后两种门控都对。
+    last_delta_index: Option<usize>,
     /// 模拟缓存注入配置：`Some((true, ratio))` = 开启，带 usage 的事件注入
     /// `cache_read_input_tokens = round(input_tokens × ratio)`、creation 置 0。
     /// 仅透传路径传入；关闭时零改动（原样透传）。
@@ -361,6 +369,7 @@ impl SseFilterState {
             in_inline_thinking: false,
             dsml_pending: DsmlPending::default(),
             thinking_chars: 0,
+            last_delta_index: None,
             mock_cache,
         }
     }
@@ -399,11 +408,15 @@ impl SseFilterState {
     /// 上游结束：flush 未闭合尾部（fail-open 原样透传）+ DSML 待拼接尾巴收尾。
     fn finish(&mut self) -> Bytes {
         // DSML 尾巴收尾：确认标记残留丢弃；被 hold 的正文按 text_delta 补发（不吞字）。
-        // 挂到最后一个已保留 text 块的 index（`next_index - 1`；无则补发到 index 0）。
+        // 目标 index：优先最后一条已下发 delta 的生效 index（两种门控都正确）；
+        // 没有任何 delta 时退回 `next_index - 1`（thinking 过滤开启时的保留块计数；
+        // 门控关闭时 next_index 恒 0，退回值即 0，与旧行为一致）。
         if !self.dsml_pending.is_empty() {
             let leftover = self.dsml_pending.flush();
             if !leftover.is_empty() {
-                let idx = self.next_index.saturating_sub(1);
+                let idx = self
+                    .last_delta_index
+                    .unwrap_or_else(|| self.next_index.saturating_sub(1));
                 let ev = Self::rewrite_event(
                     "content_block_delta",
                     &serde_json::json!({
@@ -416,6 +429,14 @@ impl SseFilterState {
                     ev
                 } else {
                     let mut b = std::mem::take(&mut self.buf);
+                    // ⚠️ 必须在两段之间补事件分隔符（空行）：`buf` 是**未闭合**的尾部
+                    // （上游最后一帧省略了结尾空行），直接拼接会把合成事件贴成上一事件的
+                    // 续行 —— 上一事件的 data 行尾粘连 `event: …`，两个事件一起报废、
+                    // 补发的尾巴也丢。补空行后合成事件自成一条（2026-10-14 审计）。
+                    if !b.ends_with(b"\n") {
+                        b.push(b'\n');
+                    }
+                    b.push(b'\n');
                     b.extend_from_slice(&ev);
                     b
                 };
@@ -560,6 +581,9 @@ impl SseFilterState {
                         }
                     }
                 }
+                // 记录本次下发的**生效** index（重编号后），供 finish() 补发 DSML 尾巴时定位。
+                self.last_delta_index =
+                    Some(self.index_map.get(&old_idx).copied().unwrap_or(old_idx));
                 self.rewrite_index_or_passthrough(
                     &mut v,
                     event_type,
@@ -1216,10 +1240,13 @@ mod tests {
         );
     }
 
-    /// 🔴 回归：多个 message_delta（累计 usage，客户端读最后一条）时，thinking 扣减只扣一次，
-    /// 且落在最后一条上。旧代码每条都扣（重复）；错误实现只扣第一条会丢扣减（客户端读最后）。
+    /// 🔴 回归：多个 message_delta（usage 是**累计值**，客户端读最后一条）时，**每条都扣**
+    /// 同一份 thinking 估算值（不是只扣第一条）。
+    ///
+    /// 旧 `deducted_chars` 实现假设"增量 usage"、只扣第一条 ⇒ 客户端读最后一条时扣减
+    /// 整个丢失（最后那条没扣）。判据：第一条 300-10=290、最后一条 500-10=490。
     #[tokio::test]
-    async fn test_filter_sse_stream_deducts_thinking_once_across_multiple_deltas() {
+    async fn test_filter_sse_stream_deducts_thinking_on_every_message_delta() {
         let input = format!(
             "{}{}{}{}{}{}",
             event(
@@ -1541,6 +1568,90 @@ mod tests {
             "命令正文与后续保留,实际: {filtered}"
         );
         assert!(!filtered.contains("DSML") && !filtered.contains("parameter"), "闭合标签不得泄漏,实际: {filtered:?}");
+    }
+
+    /// 🔴 回归：DSML 尾巴补发必须挂在**真实生效的块 index** 上（2026-10-14 审计）。
+    ///
+    /// 透传生产路径门控是 `filter_thinking_blocks=false`（零协议转换），此时 `next_index`
+    /// 恒为 0 —— 旧实现把 hold 住的尾巴一律补发到 index 0：文本块在 index 1（前面是透传的
+    /// thinking 块）时，尾字符会被挂进 thinking 块，客户端要么丢字要么报协议错。
+    /// 判据：补发的 `content_block_delta` 必须带 index=1。
+    ///
+    /// 回退即 FAIL：把 `finish()` 的 `last_delta_index` 换回 `next_index.saturating_sub(1)`。
+    #[tokio::test]
+    async fn test_dsml_flush_uses_last_delta_index_when_filter_gate_off() {
+        let input = format!(
+            "{}{}{}{}",
+            event(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#
+            ),
+            event(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#
+            ),
+            // 末字符是孤立 `<`（可能被上游切成 DSML 标记的一半）→ 被 hold 到流结束补发。
+            event(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"if a <"}}"#
+            ),
+            event("content_block_stop", r#"{"type":"content_block_stop","index":1}"#),
+        );
+        let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(input))]);
+        // 门控与 passthrough.rs 生产路径一致：strip_inline=false, filter_thinking=false。
+        let filtered = collect_filtered(filter_sse_stream_with(stream, false, false, None)).await;
+        let flush_line = filtered
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .find(|d| d.contains("\"text\":\"<\""))
+            .unwrap_or_else(|| panic!("未找到补发的尾巴事件: {filtered}"));
+        let v: serde_json::Value = serde_json::from_str(flush_line).expect("补发事件应为合法 JSON");
+        assert_eq!(
+            v["index"], 1,
+            "DSML 尾巴必须挂在文本块 index=1 上（旧实现恒为 0，会挂进 thinking 块）: {flush_line}"
+        );
+    }
+
+    /// 🔴 回归：流以**未闭合尾部**结束（上游最后一帧省略了结尾空行）+ DSML 尾巴待补发时，
+    /// 合成事件前必须补事件分隔符（空行）。
+    ///
+    /// 旧实现把合成事件直接贴在未闭合尾部后面：上一事件的 `data:` 行尾粘连
+    /// `event: content_block_delta`，两段合成一条事件 ⇒ 上一事件与补发的尾字符一起报废。
+    /// 判据：输出按空行切分后，最后一段的 `data:` 必须能独立解析成 JSON。
+    ///
+    /// 回退即 FAIL：删掉 `finish()` 里补 `\n\n` 的那几行。
+    #[tokio::test]
+    async fn test_dsml_flush_separates_unterminated_tail() {
+        // 末尾事件刻意**不带** "\n\n"（真实上游收尾可能省略空行）。
+        let input = format!(
+            "{}{}",
+            event(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#
+            ),
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"if a <\"}}",
+        );
+        let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(input))]);
+        let filtered = collect_filtered(filter_sse_stream_with(stream, false, false, None)).await;
+        let last = filtered
+            .split("\n\n")
+            .filter(|s| !s.is_empty())
+            .last()
+            .unwrap_or_else(|| panic!("应有输出: {filtered:?}"));
+        let data_line = last
+            .lines()
+            .find_map(|l| l.strip_prefix("data: "))
+            .unwrap_or_else(|| panic!("最后一段应为补发事件: {filtered:?}"));
+        let v: serde_json::Value = serde_json::from_str(data_line)
+            .unwrap_or_else(|e| panic!("补发事件必须自成一条、data 可独立解析（{e}）: {filtered:?}"));
+        // 文本断言只要求「补发的尾巴落在独立事件里且带着被扣下的 `<`」：未闭合的
+        // 尾部整段都在 leftover 里（事件从未被解析下发），故 text 允许是 "if a <"
+        // 这种整段形态——本测试的判据是**分隔**，不是 leftover 的截断位置。
+        let text = v["delta"]["text"].as_str().unwrap_or_default();
+        assert!(
+            text.ends_with('<'),
+            "补发的尾巴必须落在独立事件里并保留被扣下的 `<`: {filtered:?}"
+        );
     }
 
     /// 非流式:JSON text 块里的 DSML 标记被剥,正文保留。

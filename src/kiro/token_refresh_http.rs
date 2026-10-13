@@ -277,12 +277,14 @@ impl super::MultiTokenManager {
                                     entry.credentials.region.as_deref().unwrap_or("?")
                                 );
                             }
+                            // 日志放在**真正写回**的分支里：解析成功但被陈旧守卫拦下时
+                            // 不得报「已解析到 profileArn」（否则运维据此以为值已更新）。
+                            tracing::info!(
+                                "凭据 #{} 动态解析到 profileArn（ListAvailableProfiles）",
+                                id
+                            );
                         }
                     }
-                    tracing::info!(
-                        "凭据 #{} 动态解析到 profileArn（ListAvailableProfiles）",
-                        id
-                    );
                 }
                 Ok(None) => tracing::warn!("凭据 #{} ListAvailableProfiles 无可用 profile", id),
                 Err(e) => tracing::warn!("凭据 #{} 动态解析 profileArn 失败（不阻断）: {}", id, e),

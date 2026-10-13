@@ -195,6 +195,12 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
                     if had_old {
                         // 尽力放回备份；失败也只是留下 .bak（人工可恢复），不会更糟。
                         let _ = std::fs::rename(&bak, &target);
+                    } else {
+                        // 原本没有目标文件：`fs::copy` 是「先建/截断目标再拷」，中途失败
+                        // （ENOSPC/EIO）会留下**半截**新文件，而这条路径没有 .bak 可恢复。
+                        // 删掉它，把状态还原成「目标不存在」——与本次写入前一致，也避免
+                        // 下次启动把半截 JSON 当损坏文件（首次引导/config 生成场景）。
+                        let _ = std::fs::remove_file(&target);
                     }
                 }
             }
