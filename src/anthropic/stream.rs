@@ -1269,6 +1269,17 @@ impl StreamContext {
                 )]
             }
             Event::Metadata(meta) => {
+                // 探针：EXP-0 结论是本链路不下发 tokenUsage；若某路径真的下发，
+                // 记一条 info 供抓包统计非空率（消费口径待 C-2 定案，暂不用）。
+                if let Some(usage) = meta.token_usage.as_ref() {
+                    tracing::info!(
+                        uncached = ?usage.uncached_input_tokens,
+                        cache_read = ?usage.cache_read_input_tokens,
+                        cache_write = ?usage.cache_write_input_tokens,
+                        output = ?usage.output_tokens,
+                        "metadataEvent 携带 tokenUsage（EXP-0 反例，请抓包定案）"
+                    );
+                }
                 if let Some(mapped) =
                     crate::kiro::model::events::map_metadata_stop_reason(meta.stop_reason.as_deref())
                 {

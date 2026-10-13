@@ -1411,6 +1411,14 @@ pub(crate) mod error_translation_tests {
         assert!(is_upstream_rate_limited(
             r#"{"reason":"INSUFFICIENT_THROUGHPUT"}"#
         ));
+        // 5 分钟窗口的信用/服务速率限流（zyphr 报告收录，同属速率类）
+        assert!(is_upstream_rate_limited(
+            r#"{"reason":"CREDIT_CONSUMPTION_RATE_EXCEEDED"}"#
+        ));
+        assert!(is_upstream_rate_limited(
+            r#"{"reason":"SERVICE_REQUEST_RATE_EXCEEDED"}"#
+        ));
+        assert!(is_upstream_rate_limited("5-minute credit limit exceeded"));
         assert!(is_upstream_rate_limited("429 Too many requests"));
         assert!(!is_upstream_rate_limited(
             "upstream: MONTHLY_REQUEST_COUNT limit reached"

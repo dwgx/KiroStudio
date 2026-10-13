@@ -3,6 +3,11 @@
 //! EXP-0 实测：本链路 payload **只有** `stopReason`，从不带 `tokenUsage` /
 //! cache 真值（见 `docs/CACHE-EXP0-RESULT.md`）。此前落 Unknown，终止信号被丢掉，
 //! 干净 EOF 只能靠本地推断出 `end_turn`。
+//!
+//! 2026-10-13：`tokenUsage` 改为**防御性解析**（解而不消费）——官方客户端 wire 常量
+//! 确有此字段（`cacheReadInputTokens` / `cacheWriteInputTokens` / `uncachedInputTokens`，
+//! 见 re-kirodesktop 报告），zyphr 也按真值优先解析。若上游某路径真的下发，我们
+//! 至少先看得见（出现即 `tracing::info!`，供抓包统计非空率），消费口径待 C-2 定案。
 
 use serde::{Deserialize, Serialize};
 
@@ -11,11 +16,31 @@ use crate::kiro::parser::frame::Frame;
 
 use super::base::EventPayload;
 
+/// `metadataEvent` 里可选的 token 真值（字段名对齐官方 wire 常量）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MetadataTokenUsage {
+    #[serde(default, rename = "uncachedInputTokens", alias = "uncached_input_tokens")]
+    pub uncached_input_tokens: Option<i64>,
+    #[serde(default, rename = "cacheReadInputTokens", alias = "cache_read_input_tokens")]
+    pub cache_read_input_tokens: Option<i64>,
+    #[serde(
+        default,
+        rename = "cacheWriteInputTokens",
+        alias = "cache_write_input_tokens"
+    )]
+    pub cache_write_input_tokens: Option<i64>,
+    #[serde(default, rename = "outputTokens", alias = "output_tokens")]
+    pub output_tokens: Option<i64>,
+}
+
 /// 流末元数据。`stop_reason` 缺省 / 空串视为「未给出终止信号」。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MetadataEvent {
     #[serde(default, rename = "stopReason", alias = "stop_reason")]
     pub stop_reason: Option<String>,
+    /// 可选的 token 真值（EXP-0 结论：本链路当前不下发；防御性解析，见模块注释）。
+    #[serde(default, rename = "tokenUsage", alias = "token_usage")]
+    pub token_usage: Option<MetadataTokenUsage>,
 }
 
 impl EventPayload for MetadataEvent {
@@ -147,5 +172,25 @@ mod tests {
             }
             other => panic!("expected Metadata, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_defensive_token_usage_when_present() {
+        let e: MetadataEvent = serde_json::from_str(
+            r#"{"stopReason":"end_turn","tokenUsage":{"uncachedInputTokens":100,"cacheReadInputTokens":900,"cacheWriteInputTokens":50,"outputTokens":7}}"#,
+        )
+        .expect("tokenUsage 应可解析（防御性）");
+        let u = e.token_usage.expect("应有 tokenUsage");
+        assert_eq!(u.uncached_input_tokens, Some(100));
+        assert_eq!(u.cache_read_input_tokens, Some(900));
+        assert_eq!(u.cache_write_input_tokens, Some(50));
+        assert_eq!(u.output_tokens, Some(7));
+    }
+
+    #[test]
+    fn token_usage_absent_is_none() {
+        let e: MetadataEvent =
+            serde_json::from_str(r#"{"stopReason":"end_turn"}"#).expect("无 tokenUsage 也应解析");
+        assert!(e.token_usage.is_none());
     }
 }

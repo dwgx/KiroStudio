@@ -1496,6 +1496,9 @@ const UPSTREAM_RATE_LIMIT_RETRY_AFTER_SECS: u64 = 8;
 /// 判据（只匹配速率类，绝不吞配额类）：
 /// - `USER_REQUEST_RATE_EXCEEDED`：Kiro 账户级速率限流的 reason 码（实测当天 595 条）
 /// - `INSUFFICIENT_THROUGHPUT`：上游吞吐不足（`I am experiencing high traffic...`，实测 8 条）
+/// - `CREDIT_CONSUMPTION_RATE_EXCEEDED` / `SERVICE_REQUEST_RATE_EXCEEDED`：信用/服务请求
+///   速率限流（5 分钟窗口类，zyphr 报告收录；同属速率类而非配额类）
+/// - `5-minute credit limit exceeded`：5 分钟信用窗口超限文案
 /// - `Too many requests`：兜底文案匹配，覆盖未来新增/变更的 reason 码
 ///
 /// 刻意**不匹配** `MONTHLY_REQUEST_COUNT` / `QUOTA`：那是不可重试的月度配额耗尽，
@@ -1503,6 +1506,9 @@ const UPSTREAM_RATE_LIMIT_RETRY_AFTER_SECS: u64 = 8;
 pub(crate) fn is_upstream_rate_limited(err_str: &str) -> bool {
     err_str.contains("USER_REQUEST_RATE_EXCEEDED")
         || err_str.contains("INSUFFICIENT_THROUGHPUT")
+        || err_str.contains("CREDIT_CONSUMPTION_RATE_EXCEEDED")
+        || err_str.contains("SERVICE_REQUEST_RATE_EXCEEDED")
+        || err_str.contains("5-minute credit limit exceeded")
         || err_str.contains("Too many requests")
 }
 

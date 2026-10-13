@@ -668,6 +668,7 @@
     fn meta_end_turn() -> Event {
         Event::Metadata(crate::kiro::model::events::MetadataEvent {
             stop_reason: Some("end_turn".into()),
+            token_usage: None,
         })
     }
 
@@ -3635,6 +3636,7 @@
         all_events.extend(ctx.process_kiro_event(&Event::Metadata(
             crate::kiro::model::events::MetadataEvent {
                 stop_reason: Some("end_turn".into()),
+                token_usage: None,
             },
         )));
         all_events.extend(ctx.generate_final_events());
@@ -3663,6 +3665,7 @@
         ctx.process_kiro_event(&Event::Metadata(
             crate::kiro::model::events::MetadataEvent {
                 stop_reason: Some("max_tokens".into()),
+                token_usage: None,
             },
         ));
         let finals = ctx.generate_final_events();
