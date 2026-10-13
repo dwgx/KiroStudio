@@ -1617,40 +1617,48 @@ mod tests {
     ///
     /// 旧实现把合成事件直接贴在未闭合尾部后面：上一事件的 `data:` 行尾粘连
     /// `event: content_block_delta`，两段合成一条事件 ⇒ 上一事件与补发的尾字符一起报废。
-    /// 判据：输出按空行切分后，最后一段的 `data:` 必须能独立解析成 JSON。
+    /// 判据：输出按空行切分后**每一段**的 `data:` 都能独立解析，且存在一条独立事件携带
+    /// 被扣下的 `<`。
     ///
-    /// 回退即 FAIL：删掉 `finish()` 里补 `\n\n` 的那几行。
+    /// ⚠️ 输入必须同时具备「一个**完整**（带空行）的 delta 让 `<` 进 hold」与「末尾一个
+    /// **未闭合**的 delta 让 `buf` 非空」——只有这种组合才会走到「buf 非空 + leftover 非空」
+    /// 的合成分支。早先版本只用单个未闭合 delta：那种输入里事件从未被解析、`dsml_pending`
+    /// 恒空，`finish()` 走的是原样透传分支，**把补分隔符的代码删掉测试照样绿**
+    /// （2026-10-14 verifier 用变异体实测指出，随后按此重写）。
     #[tokio::test]
     async fn test_dsml_flush_separates_unterminated_tail() {
-        // 末尾事件刻意**不带** "\n\n"（真实上游收尾可能省略空行）。
         let input = format!(
-            "{}{}",
+            "{}{}{}",
             event(
                 "content_block_start",
                 r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#
             ),
-            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"if a <\"}}",
+            event(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"if a <"}}"#
+            ),
+            // ⚠️ 刻意不带结尾空行：上游最后一帧可能省略它（这一段的文本留在 buf 里原样透传）。
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"bc\"}}",
         );
         let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(input))]);
         let filtered = collect_filtered(filter_sse_stream_with(stream, false, false, None)).await;
-        let last = filtered
-            .split("\n\n")
-            .filter(|s| !s.is_empty())
-            .last()
-            .unwrap_or_else(|| panic!("应有输出: {filtered:?}"));
-        let data_line = last
-            .lines()
-            .find_map(|l| l.strip_prefix("data: "))
-            .unwrap_or_else(|| panic!("最后一段应为补发事件: {filtered:?}"));
-        let v: serde_json::Value = serde_json::from_str(data_line)
-            .unwrap_or_else(|e| panic!("补发事件必须自成一条、data 可独立解析（{e}）: {filtered:?}"));
-        // 文本断言只要求「补发的尾巴落在独立事件里且带着被扣下的 `<`」：未闭合的
-        // 尾部整段都在 leftover 里（事件从未被解析下发），故 text 允许是 "if a <"
-        // 这种整段形态——本测试的判据是**分隔**，不是 leftover 的截断位置。
-        let text = v["delta"]["text"].as_str().unwrap_or_default();
+        let mut saw_tail = false;
+        for (i, seg) in filtered.split("\n\n").filter(|s| !s.is_empty()).enumerate() {
+            let Some(d) = seg.lines().find_map(|l| l.strip_prefix("data: ")) else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(d).unwrap_or_else(|e| {
+                panic!(
+                    "第 {i} 段 data 必须独立可解析（粘连即整段报废）: {e} / 段={seg:?} / 全量={filtered:?}"
+                )
+            });
+            if v["delta"]["text"].as_str() == Some("<") {
+                saw_tail = true;
+            }
+        }
         assert!(
-            text.ends_with('<'),
-            "补发的尾巴必须落在独立事件里并保留被扣下的 `<`: {filtered:?}"
+            saw_tail,
+            "必须有一条独立事件携带被扣下的 `<`（且与上一段不粘连）: {filtered:?}"
         );
     }
 
