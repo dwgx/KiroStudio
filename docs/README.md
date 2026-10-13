@@ -1,35 +1,37 @@
-# KiroStudio 文档索引（2026-08-21 收口）
+# KiroStudio 文档索引（2026-10-13 复活线改写）
 
-**新窗读序：** 仓根 `STATUS.md` → 本目录 `TAKEOVER.md` → `.agent/HANDOFF.md` → `.agent/NEXT-PROMPT.md` → `.agent/BACKLOG-NEXT.md`。
+**新窗读序：** 仓根 `STATUS.md`（当下状态）→ `CLAUDE.md`（长期约束）→ 本索引 → 按需开文档。
 
-发版在公开仓 `dwgx/KiroStudio`（v1.1.2）。旧私有 `KiroStudio-skiapi` 不要再推。
-
-过期过程稿在 `docs/archive/`（gitignore，仅本地）。不要用仓根旧 `HANDOFF-*`、`.opencode/state.md` 当现状。
+机器级板（hmc 服务、未决清单、核对命令）：`C:\Users\dwgx1\.dwgx\ops\boards\KiroStudio.md`。
+旧纪元的 `.agent/HANDOFF.md` / `.agent/NEXT-PROMPT.md` 等**不在公开克隆里**，不要再引用。
 
 ## 状态 / 接手
 
-- `TAKEOVER.md` — 执行层
-- `IMPROVEMENT-PLAN-2026-08-21.md` — 08-21 审查基线（完成态看 HANDOFF / BACKLOG-NEXT，不要把本文当待办总表）
-- `P2-7-ECOSYSTEM-SLICES.md` — 生态四点设计（切片 1 已落地）
-- `RELEASE-CHECKLIST.md` — 下一 tag 闸门（未授权打 tag）
+- `TAKEOVER.md` — 执行层接手（v1.2.4 时代，简短）
+- `RELEASE-CHECKLIST.md` — 下一个 tag 的闸门（打 tag 要 Owner 点名）
+- `IMPROVEMENT-PLAN-2026-08-21.md` — 08-21 审查基线（历史推导材料，不当待办总表）
 - `PERFORMANCE.md` — 性能实测（数字用前现读）
 
 ## 核心技术
 
 - `ARCHITECTURE.md` / `MODULES.md` / `PROTOCOL.md` / `INVALID-TOOL-PARAMETERS.md`
 - `UI-COMPONENTS.md`
+- `model-compat-plan.md` / `error-codes-inventory.md` / `quota-402-design.md`
 
-行号与「唯一端点」类断言会过期，以代码为准。
+> ⚠️ 行号、「唯一端点」、行数类断言会过期，以代码为准（历史实测：行数差 2.5 倍、ide/cli 两个端点都注册）。
 
 ## 运维
 
-- `DEPLOY-WINDOWS.md` / `DEPLOYMENT.md` / `SECURITY-BACKUP.md` / `CRASHLOOP-ROLLBACK.md`
+- `DEPLOYMENT.md` — 部署总览（部分内容为旧 VPS 纪元，以 `STATUS.md` + `E:\dwgxhomecloud\ops\kirostudio\` 为准）
+- `DEPLOY-WINDOWS.md` — Windows 本地部署
+- `SECURITY-BACKUP.md` / `CRASHLOOP-ROLLBACK.md`
 
-## 参考（教训，不照搬）
+## 参考（教训与对照，不照搬）
 
 - `ref-ZyphrZero-kiro.rs.md` / `ref-kiro2cc-proxy.md`
-- `error-codes-inventory.md` / `model-compat-plan.md`
+- `p2-family-rl-response-model.md`
 
 ## 归档
 
-`docs/archive/`：blockers、scheduling 研究、旧 spec、设计草稿。推导材料，不承载当前结论。
+历史过程稿（`HANDOFF-*` / `PLAN-*` / `TRACKING-*` / 旧 spec）是推导材料，不承载当前结论；
+新结论一律进 `STATUS.md` 或对应主题文档。

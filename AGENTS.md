@@ -1,15 +1,16 @@
 # AGENTS.md（kirostudio）
 
-本项目完整指引在 **`CLAUDE.md`**（opencode 与 Claude Code 共用同一套约定）。
+本项目完整指引在 **`CLAUDE.md`**（opencode / Claude Code / omp 共用同一套约定）。
 每次开始任务前：
 
 1. 读 `STATUS.md`（仓根，当前状态快照入口）
-2. 读 `.claude/state/CURRENT.md`（最近会话状态与源码级守卫清单）
-3. 读 `CLAUDE.md`（长期约束：推哪里、构建、部署、踩坑）
+2. 读 `CLAUDE.md`（长期约束：构建、验证、部署、踩坑）
+3. 机器级板（hmc 服务与未决清单）：`C:\Users\dwgx1\.dwgx\ops\boards\KiroStudio.md`
 
 **硬约束（摘录，详见 CLAUDE.md）**：
-- 本机 8GB 编不过 Rust —— 验证必须走 `skiapi` 服务器 Docker「验证循环」（CLAUDE.md 有完整命令）
-- 禁止 `git add/commit/checkout/stash/reset/fmt`（多会话并发工作树）；提交用临时 index 快照
-- 所有 `cargo` 命令一律 `--no-default-features`
-- 涉及凭证先读 `~/.claude/SECRETS.md`，值绝不输出/写文件/进 commit
-- 改代码前先看 `.claude/state/CURRENT.md` 的「源码级守卫」清单（改文案/挪位置会故意红）
+
+- 所有 `cargo` 命令一律 `--no-default-features`；构建前先 `cd admin-ui && pnpm install --frozen-lockfile && pnpm build`（dist 是编译期嵌入，缺了 cargo 直接 E0599）
+- 验证走 **HMC（Docker）** 或 **GitHub CI**（push 任意分支即跑 `ci.yml`）；本机 Windows 构建后置
+- 仓库 = 公开仓 `dwgx/KiroStudio`（唯一 remote `origin`）；提交遵循 `CONTRIBUTING.md`（Conventional Commits，不写 AI 署名）
+- 凭据值只进 `E:\dwgxhomecloud-vault`；值绝不输出/写文件/进 commit
+- 部署：HMC 工作区 `kirostudio`，工具在 `E:\dwgxhomecloud\ops\kirostudio\`（deploy.sh 幂等）；机器规矩见 `E:\dwgxhomecloud\AGENTS.md`

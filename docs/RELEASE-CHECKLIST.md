@@ -1,43 +1,27 @@
-# 发版闸门（v1.1.2 之后）
+# 发版闸门（v1.2.4 之后）
 
-> 2026-08-21. 本文件是「可以打下一个 tag」的标准，不是授权去打。
-> 打 tag / 推 origin / 动 Homecloud 必须 Owner 点名。
+> 2026-10-13 复活线改写。本文件是「可以打下一个 tag」的标准，**不是授权**——打 tag / 推 tag 要 Owner 点名。
 
-公开 Latest：本窗口目标 **v1.2.1**。v1.2.0（`f6aaf88`）与 v1.1.2（`5f20596`）不要改、不要覆盖。
-本机 master 仍是 `3ae4f03` 脏树（含控制面）；公开 master 是产品 squash。不要 pull origin 进本机 master。
-本机闸门：下一 tag 必须**本窗口**实跑 `cargo test --no-default-features --locked`，禁止用历史计数顶替。脏树最近一次（2026-08-22 窗 3，未发版）**2288 passed**。公开 v1.2.0 发版窗当时是 2275。
+公开 Latest：**v1.2.4**（`d9dd93f`）。已发 tag 不要重打、不要 retarget（OTA 比较 tag 与 `CARGO_PKG_VERSION`）。
 
 ## 硬闸（缺一不可）
 
-1. `cargo test --no-default-features` 本窗口实跑：`NNNN passed; 0 failed`。
-   禁止用历史 2171 顶替。
-2. 每个本窗口声称修复的项有**具名测试**且命令输出在 HANDOFF / SDD 报告里。
-3. 脏树快照若要发：临时 `GIT_INDEX_FILE`，必须包含未跟踪 `src/` + `admin-ui/`。
-4. `Cargo.toml` `version` == 将打的 tag（OTA 否则死循环）。见 `release.yml`。
-5. 不把 `origin/master`（另一条历史）并进来。发版走 **tag**，不推本机脏 master，除非 Owner 点名。
-6. 不推 skiapi。origin = 公开 `dwgx/KiroStudio`。
-7. 不进包：凭据、`config.json`、`.agent/`、`.claude/`、`.opencode/`、`AGENTS.md`、`CLAUDE.md`。
-8. `cargo --no-default-features` 出厂。不要用 default `native-tls` 当发布构建。
+1. `cargo test --no-default-features` **本窗口实跑**：`NNNN passed; 0 failed`（HMC Docker 或 GitHub CI；禁止用历史计数顶替）。
+2. 每个声称修复的项有**具名测试**，命令输出留档。
+3. `Cargo.toml` `version` == 将打的 tag（否则 OTA 死循环；`release.yml` 有门禁）。
+4. 出厂构建一律 `--no-default-features`（纯 rustls）；前端 `admin-ui/dist` 必须先构建（编译期嵌入）。
+5. 不进包：凭据、`config.json`、`.claude/`、`AGENTS.md`、`CLAUDE.md`。
+6. `release.yml` 产物与 v1.2.4 同形：linux-x86_64 / macos-aarch64 / macos-x86_64 / windows-x86_64 + 各自 `.sha256`。
 
-## 正确性清单（本窗口目标）
+## 发版动作
 
-| ID | 必须在发版前 | 证据落点 |
-|---|---|---|
-| P0-1 Bug C | 映射工具流式不再 INVALID_TOOL_INPUT | named `bug_c_*` |
-| P0-3 config/import | 不再恒 500 | named `import_config_*` |
-| P0-4 quota 告警 | bump 在 `report_quota_exhausted` | named guard |
-| P0-5 persist 串行 | persist_lock | named persist lock test |
-| P0-6 thinking 块序 | sniff 路径先 stop | named sniff test |
-| P1-7 / P1-9 | 403 不清 key；CSP frame-ancestors | named helper + CSP test |
-
-P0-1/3–6 与 P1 代码已在脏树。P0-2 已观测：Homecloud **在燃**（1.1.2 + 默认 align）。发版前还要：本窗全量测试、未跟踪 src 进快照、Owner 点名 tag。部署 Homecloud 是另一句话。
-
-## Actions
-
-- 新增 push/PR `ci.yml` 后：公开仓 Actions 对这次快照分支可见红绿（仅当该 yml 已推）。
-- 打 tag 后：linux musl / mac 双 / windows 四端 + sha256，与 v1.1.2 同形。
-- OTA 默认仓已是 `dwgx/KiroStudio`。不要改回 skiapi。
+1. 全量测试绿（本窗口实跑）。
+2. `Cargo.toml` 版本 = tag 名；提交。
+3. 打 annotated tag 并 push（`release.yml` 自动出四端产物）。
+4. 更新 `STATUS.md` 的 Latest 行 + `CHANGELOG.md`。
+5. 部署侧跟进：改 `E:\dwgxhomecloud\ops\kirostudio\` 的 image tag + VERSION → 重跑 deploy.sh（见 `STATUS.md`）。
 
 ## 冻结核
 
-选号 12 键、absorb 循环结构、AIMD / `inboundRpmAuto`、sticky：发版波次不得改。
+选号 12 键、absorb 循环结构、AIMD / `inboundRpmAuto`、sticky、`model_catalog.rs` 的单一真相源地位：
+发版波次不得顺手改。
