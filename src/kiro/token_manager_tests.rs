@@ -11022,6 +11022,34 @@ fn save_stats_must_serialize_and_clear_dirty_conditionally() {
     assert!(bi < di, "stats_version 必须在标脏之前自增");
 }
 
+/// 🔴 profileArn 写回必须带陈旧守卫（2026-10-14 并发审计发现）。
+///
+/// 形态：写回发生在跨 await 的 profile 解析之后，期间管理员可能刚做完「切换 region」
+/// （`switch_profile_region_for` 先验活再写 profileArn + region）。无守卫时，用**旧快照**
+/// 解析出的 arn 会静默覆盖管理员已验活的那个 —— 可能回退到「ARN 的 region 与 credentials
+/// 的 region 不一致」的错配组合（400 Improperly formed）。token 字段那条路早有守卫
+/// （比对 refresh_token 快照），profileArn 这条路此前漏了。
+#[test]
+fn profile_arn_writeback_must_guard_against_stale_snapshot() {
+    let src = include_str!("token_refresh_http.rs");
+    let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+    let prod = &src[..cut];
+    let at = prod
+        .find("fn refresh_token_locked")
+        .expect("refresh_token_locked 不该被改名");
+    let body = &prod[at..];
+    let end = body.find("\n    }\n").unwrap_or(body.len());
+    let body = &body[..end];
+    // needle 运行时拼接：include_str! 会把本测试自己的字面量也读进来。
+    let guard = format!("entry.credentials.profile_arn != arn{}", "_creds.profile_arn");
+    let write = format!("entry.credentials.profile_arn = Some(arn{}", ".clone())");
+    let g = body
+        .find(&guard)
+        .expect("profileArn 写回前必须比对 await 前的快照（否则覆盖已验活值）");
+    let w = body.find(&write).expect("profileArn 写回点不该被删");
+    assert!(g < w, "陈旧守卫必须在写回之前");
+}
+
 /// 🔴 删号回滚必须按 **id** 取回**自己**的条目（不是 pop 别人的），并原样带回删除前状态。
 ///
 /// 2026-10-14 并发审计发现：旧代码 `trash.pop()` 假定自己是最后一个 push —— 并发删号时

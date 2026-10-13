@@ -252,17 +252,31 @@ impl super::MultiTokenManager {
                 Ok(Some(arn)) => {
                     let mut entries = self.entries.lock();
                     if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                        entry.credentials.profile_arn = Some(arn.clone());
-                        // 族键在 issuer_url 解析失败时退化为 profileArn 兜底，变更后须失效缓存。
-                        entry.family_key = None;
-                        // 防呆铁律:profile_arn 一变,region/auth_region 立即同步成 ARN 内 region,
-                        // 杜绝「解析到 X region 的 ARN 却留着 Y region」错配 → 400 Improperly formed。
-                        if entry.credentials.sync_region_from_arn() {
-                            tracing::info!(
-                                "凭据 #{} region 已随 profileArn 同步为 {}",
-                                id,
-                                entry.credentials.region.as_deref().unwrap_or("?")
+                        // ⚠️ 陈旧守卫（2026-10-14 并发审计发现）：本写回发生在一次跨 await 的
+                        // 网络往返之后，而期间管理员可能刚做完「切换 region」——`switch_profile_region_for`
+                        // 先**验活**再写 profileArn + region。旧代码无条件改写 ⇒ 用我们基于旧快照
+                        // 解析出的 arn 静默覆盖管理员已验活的那个（可能回退到 400 Improperly formed
+                        // 的错配组合）。`arn_creds` 正是 await 之前的快照，故直接比对：
+                        // 只要 profileArn 已被别人改过，就整体放弃本次写回（下次刷新自会重解析）。
+                        if entry.credentials.profile_arn != arn_creds.profile_arn {
+                            tracing::warn!(
+                                "凭据 #{} 的 profileArn 在解析期间被其它操作改写（如管理员切换 region），\
+                                 放弃本次写回以免覆盖已验活值",
+                                id
                             );
+                        } else {
+                            entry.credentials.profile_arn = Some(arn.clone());
+                            // 族键在 issuer_url 解析失败时退化为 profileArn 兜底，变更后须失效缓存。
+                            entry.family_key = None;
+                            // 防呆铁律:profile_arn 一变,region/auth_region 立即同步成 ARN 内 region,
+                            // 杜绝「解析到 X region 的 ARN 却留着 Y region」错配 → 400 Improperly formed。
+                            if entry.credentials.sync_region_from_arn() {
+                                tracing::info!(
+                                    "凭据 #{} region 已随 profileArn 同步为 {}",
+                                    id,
+                                    entry.credentials.region.as_deref().unwrap_or("?")
+                                );
+                            }
                         }
                     }
                     tracing::info!(
