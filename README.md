@@ -211,7 +211,7 @@ kirostudio -c <config.json 路径> --credentials <credentials.json 路径>
 | `usageDataDir` | `data/usage` | 用量数据目录 |
 | `usageRetentionDays` | `30` | 用量明细保留天数 |
 | `firstTokenTimeoutSecs` | `30` | 上游静默（迟迟不给首字节）的等待上限；超时换凭据重开流。**`0` = 关闭** |
-| `firstTokenMaxRetries` | `2` | 首字超时的透明重试次数（换号重开，客户端无感）；与上者同时为 `0` 才真正关闭 |
+| `firstTokenMaxRetries` | `2` | 首字超时的透明重试次数（换号重开，客户端无感）；**本项或上项任一为 `0` 即整组关闭**（`handlers.rs` 的 `secs == 0 \|\| retries == 0` 判据，有单测钉住） |
 
 > 完整字段与默认值以 `src/model/config.rs` 为准；未列出的字段均有安全的内置默认值。
 

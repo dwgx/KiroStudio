@@ -22,6 +22,12 @@ export interface FormState {
   defaultEndpoint: string
   extractThinking: boolean
   ccAutoBuffer: boolean
+  // 上游流式行为（TIER3 热更即时生效）：建议模式转发 / 大写入分块上限 / 首字超时透明重试。
+  // 数值字段同样字符串化，与其余受控数字输入一致。
+  forwardSuggestionMode: boolean
+  writeChunkingMaxLines: string
+  firstTokenTimeoutSecs: string
+  firstTokenMaxRetries: string
   importKeysEnabled: boolean
   // 上游 429 吸收层（数值字段同样字符串化，与其余受控数字输入一致）
   upstreamRetryAbsorbEnabled: boolean
@@ -182,6 +188,12 @@ export function toForm(c: ConfigSnapshotResponse, ui: UiLayoutPrefs): FormState 
     defaultEndpoint: c.defaultEndpoint,
     extractThinking: c.extractThinking,
     ccAutoBuffer: c.ccAutoBuffer,
+    // 上游流式行为：默认值与后端 serde default 对齐（false / 300 / 30 / 2），
+    // 字段缺失时按此兜底，避免面板把"未下发"显示成 0/关闭。
+    forwardSuggestionMode: c.forwardSuggestionMode ?? false,
+    writeChunkingMaxLines: String(c.writeChunkingMaxLines ?? 300),
+    firstTokenTimeoutSecs: String(c.firstTokenTimeoutSecs ?? 30),
+    firstTokenMaxRetries: String(c.firstTokenMaxRetries ?? 2),
     importKeysEnabled: c.importKeysEnabled,
     upstreamRetryAbsorbEnabled: c.upstreamRetryAbsorbEnabled ?? false,
     upstreamRetryAbsorbBudgetSecs: String(c.upstreamRetryAbsorbBudgetSecs ?? 45),
@@ -298,6 +310,18 @@ export function diffForm(
   if (form.defaultEndpoint.trim() !== config.defaultEndpoint) d.defaultEndpoint = form.defaultEndpoint.trim()
   if (form.extractThinking !== config.extractThinking) d.extractThinking = form.extractThinking
   if (form.ccAutoBuffer !== config.ccAutoBuffer) d.ccAutoBuffer = form.ccAutoBuffer
+  // 上游流式行为：布尔直比；整数解析后比对（空/非法不发），与既有数字字段同款。
+  if (form.forwardSuggestionMode !== (config.forwardSuggestionMode ?? false))
+    d.forwardSuggestionMode = form.forwardSuggestionMode
+  const nChunkLines = parseInt(form.writeChunkingMaxLines, 10)
+  if (Number.isFinite(nChunkLines) && nChunkLines !== (config.writeChunkingMaxLines ?? 300))
+    d.writeChunkingMaxLines = nChunkLines
+  const nFtTimeout = parseInt(form.firstTokenTimeoutSecs, 10)
+  if (Number.isFinite(nFtTimeout) && nFtTimeout !== (config.firstTokenTimeoutSecs ?? 30))
+    d.firstTokenTimeoutSecs = nFtTimeout
+  const nFtRetries = parseInt(form.firstTokenMaxRetries, 10)
+  if (Number.isFinite(nFtRetries) && nFtRetries !== (config.firstTokenMaxRetries ?? 2))
+    d.firstTokenMaxRetries = nFtRetries
   if (form.importKeysEnabled !== config.importKeysEnabled) d.importKeysEnabled = form.importKeysEnabled
   // 上游 429 吸收层：布尔直比，整数解析后比对（空/非法不发）
   if (form.upstreamRetryAbsorbEnabled !== (config.upstreamRetryAbsorbEnabled ?? false)) d.upstreamRetryAbsorbEnabled = form.upstreamRetryAbsorbEnabled

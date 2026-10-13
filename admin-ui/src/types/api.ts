@@ -554,6 +554,15 @@ export interface ConfigSnapshotResponse {
   endpointNames: string[]
   extractThinking: boolean
   ccAutoBuffer: boolean
+  /** 建议模式（CC「预测下一句」请求）是否转发上游（默认 false=拦截：零计费、不污染缓存前缀；开=每轮多一次满上下文计费）。 */
+  forwardSuggestionMode: boolean
+  /** 大写入分块上限（行；0=关闭；默认 300）。请求带 Write/Edit/MultiEdit 时在系统提示末尾追加「单次调用参数不超过 N 行」约束，
+      缓解上游对大 tool_use 参数约 4 分钟 RST_STREAM(INTERNAL_ERROR) 重置。 */
+  writeChunkingMaxLines: number
+  /** 首字超时（秒；0=关闭；默认 30）。上游 200 后静默超时即在流内换号重开；与首字重试次数任一为 0 即整体关闭。 */
+  firstTokenTimeoutSecs: number
+  /** 首字重试次数上限（0=不重试；默认 2）；与首字超时任一为 0 即整体关闭。 */
+  firstTokenMaxRetries: number
   /** 全池自愈退避基础秒数（默认 60；2026-08-11 配置化）。 */
   selfHealBaseBackoffSecs: number
   /** 全池自愈退避上限秒数（默认 900 = 15 分钟）。 */
@@ -741,6 +750,14 @@ export interface UpdateConfigRequest {
   defaultEndpoint?: string
   extractThinking?: boolean
   ccAutoBuffer?: boolean
+  /** 建议模式转发开关（默认 false=拦截；热更即时生效）。 */
+  forwardSuggestionMode?: boolean
+  /** 大写入分块上限（行；0=关闭；热更即时生效）。 */
+  writeChunkingMaxLines?: number
+  /** 首字超时秒数（0=关闭；热更即时生效；与首字重试上限任一为 0 即整体关闭）。 */
+  firstTokenTimeoutSecs?: number
+  /** 首字重试上限（0=不重试；热更即时生效；与首字超时任一为 0 即整体关闭）。 */
+  firstTokenMaxRetries?: number
   importKeysEnabled?: boolean
   selfHealBaseBackoffSecs?: number
   selfHealMaxBackoffSecs?: number

@@ -183,6 +183,7 @@ const CARD_INDEX_DEFS: { section: SectionId; titleKey: string; kwKey: string }[]
   { section: 'advanced', titleKey: 'settingspage.card.cliAlign', kwKey: 'settingspage.card.cliAlign.kw' },
   { section: 'advanced', titleKey: 'settingspage.card.advAbsorb', kwKey: 'settingspage.card.advAbsorb.kw' },
   { section: 'advanced', titleKey: 'settingspage.card.advCache', kwKey: 'settingspage.card.advCache.kw' },
+  { section: 'advanced', titleKey: 'settingspage.card.streamBehavior', kwKey: 'settingspage.card.streamBehavior.kw' },
   { section: 'advanced', titleKey: 'settingspage.card.modelMapping', kwKey: 'settingspage.card.modelMapping.kw' },
   { section: 'advanced', titleKey: 'settingspage.card.errorMessages', kwKey: 'settingspage.card.errorMessages.kw' },
   { section: 'basic', titleKey: 'settingspage.card.loginBg', kwKey: 'settingspage.card.loginBg.kw' },
@@ -2555,6 +2556,33 @@ export function SettingsPage() {
               />
               <span className="text-xs text-muted-foreground">%</span>
             </div>
+          </Field>
+        </CardContent>
+      </Card>
+      </SectionGate>
+
+      {/* 上游流式行为：首字超时透明重试 / 大写入分块约束 / 建议模式转发。四项均 TIER3 热更即时生效。
+          放 advanced 而非 basic 是刻意的（同吸收层的迁移理由）：改错会造成真实后果——首字超时取值
+          过小会误杀慢 thinking 的正常响应、转发建议模式请求每轮多一次满上下文计费、分块上限设 0
+          会撤掉对上游 RST_STREAM 的缓解。 */}
+      <SectionGate section="advanced" titleKey="settingspage.card.streamBehavior" kwKey="settingspage.card.streamBehavior.kw">
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="text-base"><Highlight text={t('settingspage.card.streamBehavior')} /></CardTitle>
+        </CardHeader>
+        <CardContent className="py-0">
+          <Field label={t('settingspage.stream.suggestion.label')} hint={`${t('settingspage.stream.suggestion.hint')}${hotParen}`}>
+            <Switch checked={form.forwardSuggestionMode} onCheckedChange={(v) => set('forwardSuggestionMode', v)} />
+          </Field>
+          <Field label={t('settingspage.stream.writeChunk.label')} hint={`${t('settingspage.stream.writeChunk.hint')}${hotParen}`}>
+            <NumberStepper value={Number(form.writeChunkingMaxLines) || 0} onChange={(v) => set('writeChunkingMaxLines', String(v))} min={0} max={10000} step={50} className="w-28" aria-label={t('settingspage.stream.writeChunk.label')} />
+          </Field>
+          <GroupHeading label={t('settingspage.stream.firstTokenGroup')} />
+          <Field label={t('settingspage.stream.firstTokenTimeout.label')} hint={`${t('settingspage.stream.firstTokenTimeout.hint')}${hotParen}`}>
+            <NumberStepper value={Number(form.firstTokenTimeoutSecs) || 0} onChange={(v) => set('firstTokenTimeoutSecs', String(v))} min={0} max={600} step={5} className="w-28" aria-label={t('settingspage.stream.firstTokenTimeout.label')} />
+          </Field>
+          <Field label={t('settingspage.stream.firstTokenRetries.label')} hint={`${t('settingspage.stream.firstTokenRetries.hint')}${hotParen}`}>
+            <NumberStepper value={Number(form.firstTokenMaxRetries) || 0} onChange={(v) => set('firstTokenMaxRetries', String(v))} min={0} max={10} className="w-28" aria-label={t('settingspage.stream.firstTokenRetries.label')} />
           </Field>
         </CardContent>
       </Card>
