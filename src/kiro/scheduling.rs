@@ -36,6 +36,15 @@ pub(crate) const RAMP_RECENT_SECS: u32 = 10;
 /// 而不是被排序键压住不给流量。取 20 ≈ 实测健康号一分钟的下限量级。
 pub(crate) const RAMP_MIN_SAMPLES: u32 = 20;
 
+/// 编译期守卫：上面文档写的那条「`RAMP_RECENT_SECS` 必须整除 `RPM_WINDOW_SECS`」是
+/// **折算公式的硬前提**（`ramp_tier_of` 用整数除法算折算系数）。除不尽时不会报错、
+/// 也不会 panic，只会把折算系数悄悄取整（如 60/7 → 8 而非 8.57），使爬坡判据整体变钝
+/// —— 属于「无任何运行期症状的静默失真」。故把不变式变成编译错误。
+const _: () = assert!(
+    RPM_WINDOW_SECS % RAMP_RECENT_SECS as u64 == 0,
+    "RAMP_RECENT_SECS 必须整除 RPM_WINDOW_SECS（ramp_tier_of 的折算公式要求）"
+);
+
 /// 爬坡压力档（slew-rate 分档）：近 [`RAMP_RECENT_SECS`] 的速率折算成分钟值，
 /// 与整 `RPM_WINDOW_SECS` 窗口均值（即 `total` 本身）比。比值越大 = 正在被猛灌
 /// → 档位越高 → 同健康档内让路给「已经平稳在跑」的号。
@@ -433,7 +442,15 @@ mod tests {
         tracker.record(2);
         std::thread::sleep(Duration::from_millis(50));
         tracker.cleanup();
-        // 全部过期且空 → map 应被清空
+        // ⚠️ 承重断言必须直接看**内部 map**：`count()` 自己也会 prune，于是
+        // 「cleanup 是空操作」的实现同样会让 count 返 0 —— 只断言 count 的话这条
+        // 测试恒真、根本测不到 cleanup（守卫失效，正是 CLAUDE.md 记的那类坑）。
+        // 直接断言 map 被清空才是可证伪的：删掉 `map.retain(...)` 本行立刻红。
+        assert!(
+            tracker.hits.lock().is_empty(),
+            "cleanup 必须把过期空条目从 map 中移除，否则 id 不复用时条目永久堆积"
+        );
+        // 读路径不受影响（保留原断言，兼防 cleanup 误删未过期条目时 count 读到脏值）。
         assert_eq!(tracker.count(1), 0);
         assert_eq!(tracker.count(2), 0);
     }
@@ -515,6 +532,12 @@ mod tests {
         tracker.record_model(2, "m");
         std::thread::sleep(Duration::from_millis(50));
         tracker.cleanup();
+        // ⚠️ 同 `test_rpm_tracker_cleanup_removes_idle`：只断言 `model_counts_for` 返 0
+        // 是恒真的（它自己也会 prune），必须直接看内部 map 才能证明 cleanup 真的删了条目。
+        assert!(
+            tracker.model_hits.lock().is_empty(),
+            "cleanup 必须把过期空 (id, 模型) 条目从 map 中移除，否则无界堆积"
+        );
         assert_eq!(
             tracker.model_counts_for(&[1, 2], "m").values().sum::<u32>(),
             0,

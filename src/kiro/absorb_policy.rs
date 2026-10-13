@@ -56,7 +56,16 @@ pub(super) struct AbsorbPolicy {
     /// （逐字节等于本字段引入前的行为）。非零时该类换成 20/40/60s 长阶梯 + 独立 deadline。
     pub(super) swap_budget: Duration,
     /// 预算耗尽时是否给错误串打 `absorb_budget_exhausted=1`（让 handlers 渲染成 503）。
-    /// 默认 false（状态码保持透传 429）。
+    ///
+    /// ⚠️ **默认是 `true`**，不是 false：本字段 = `config.upstream_retry_absorb_exhausted_status == 503`，
+    /// 而该配置项的 serde 默认与 `Config::default()` **都是 503**（`default_absorb_exhausted_status()`，
+    /// 2026-08-11 由「透传 429」改成 503 —— 理由是 Cursor 见 429 会掐会话、见 503 才会自己退避重试）。
+    /// 只有显式填 429（或其它值）才是 false。
+    ///
+    /// 旧注释写「默认 false（状态码保持透传 429）」是 503 改默认之前的残留，会把读者带偏：
+    /// 默认配置下真正让这段不执行的是**吸收层总开关 `upstream_retry_absorb_enabled` 默认关**
+    /// （`effective_max_rounds()` 恒 0 ⇒ `absorb_round` 恒 0 ⇒ `absorb_gave_up_after_rounds` 恒 false），
+    /// 而不是本标志为假。
     pub(super) exhausted_as_503: bool,
 }
 
@@ -68,12 +77,37 @@ pub(super) struct AbsorbPolicy {
 /// 会问上百次。超出表长的轮次取最后一档（60s）。
 const SWAP_WINDOW_BACKOFF_SECS: [u64; 3] = [20, 40, 60];
 
+/// 吸收层两个**时间预算**旋钮（总预算 / 换号空窗预算）的上限。
+///
+/// # 为什么必须有上限（不是锦上添花）
+///
+/// `class_deadline()` 与 `provider.rs` 的 `absorb_deadline` 都要算
+/// `call_started + budget`，而 `Instant + Duration` 在 std 里是**会 panic 的**
+/// （`checked_add` 返回 None 的那一支：「may panic if the resulting point in time
+/// cannot be represented」）。这两个预算值直接来自 config：面板字段
+/// `upstreamRetryAbsorbBudgetSecs` / `upstreamRetryAbsorbSwapBudgetSecs` 在
+/// `admin/config_update.rs` 里**无任何 clamp**（原值直存），导入配置同理
+/// ⇒ 一个 19 位数字的手滑/导入就能让此后**每个** 429 都在请求热路径上 panic
+/// （与 `min_delay > max_delay` 那条 clamp panic 是同一类输入、同一类后果）。
+///
+/// # 为什么取 24h
+///
+/// 触发溢出的量级是 ≥ 2^63 秒（约 2920 亿年），任何 ≤ 1e9 秒的上限都远离它；
+/// 而 24h 比真实用量大两个数量级以上（实测换号空窗约 10 分钟、总预算默认 45s，
+/// 配置文档把「占用客户端连接十分钟」就称作极端），故对任何可信配置都是**不可观测**的。
+/// 取归一化而非拒绝保存：与 `min_delay` / `max_delay` 同款理由（拒绝保存会把一个
+/// 能自愈的配置错误变成运维事故）。
+const ABSORB_BUDGET_CEILING: Duration = Duration::from_secs(24 * 60 * 60);
+
 impl AbsorbPolicy {
     pub(super) fn from_config(cfg: &crate::model::config::Config) -> Self {
         // 403 临时风控的额外轮次**硬钉为 1**（不是沿用 max_rounds）：`config.self_heal_base_backoff_secs（默认 60s）`
         // 存在的意义就是停止向刚 403 的账号试探，而 403 是**账号级**的 —— 换号只是把同一个
         // 被惩罚账号走多遍，扩大受害面而非提高成功率。UI 文案也标注了「与自愈退避冲突」。
-        let swap_budget = Duration::from_secs(cfg.upstream_retry_absorb_swap_budget_secs);
+        // 上限见 `ABSORB_BUDGET_CEILING`：面板/导入对这两个字段无 clamp，而
+        // `call_started + 预算` 会 panic（`Instant + Duration` 的溢出分支）。
+        let swap_budget = Duration::from_secs(cfg.upstream_retry_absorb_swap_budget_secs)
+            .min(ABSORB_BUDGET_CEILING);
         // ⭐ 「钉 1」的**前提**是短退避：15s 内重打同一个刚被风控的账号会抵消
         // `config.self_heal_base_backoff_secs（默认 60s）=60s`（那条退避存在的意义就是停止试探）。
         // 设了 swap 预算后该类走 20/40/60s 长阶梯 —— 最短一档就是 20s，前提不再成立，
@@ -125,8 +159,14 @@ impl AbsorbPolicy {
             //
             // 抬到 45s 后语义变干净：这个旋钮只能决定**多给几轮**，
             // 永远不会让单轮比关掉吸收层时更短。
+            //
+            // ⭐ 上限 `ABSORB_BUDGET_CEILING`（见其说明）：`provider.rs` 的
+            // `absorb_deadline = call_started + absorb.budget` 与 `class_deadline()` 都要做
+            // `Instant + Duration`，而这两个字段在面板/导入侧**无 clamp** ⇒ 超大值会在
+            // 请求热路径上 panic。45s 下限与 24h 上限之间对任何可信配置都无观测差异。
             budget: Duration::from_secs(cfg.upstream_retry_absorb_budget_secs)
-                .max(Duration::from_secs(MAX_REQUEST_RETRY_BUDGET_SECS)),
+                .max(Duration::from_secs(MAX_REQUEST_RETRY_BUDGET_SECS))
+                .min(ABSORB_BUDGET_CEILING),
             max_rounds,
             min_delay,
             max_delay,
@@ -309,4 +349,59 @@ pub(super) fn should_start_another_round(
 ) -> bool {
     deadline.saturating_duration_since(now)
         > delay + Duration::from_secs(ABSORB_MIN_USEFUL_ROUND_SECS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::config::Config;
+
+    /// ⭐ 预算上限守卫：两个预算旋钮在面板/导入侧**无 clamp**，而
+    /// `call_started + 预算`（`class_deadline` 与 provider 的 `absorb_deadline`）会因
+    /// `Instant + Duration` 溢出而 **panic** —— 一个 19 位数字即可让此后每个 429 都 panic。
+    ///
+    /// 回退即 FAIL：删掉 `from_config` 里的两处 `.min(ABSORB_BUDGET_CEILING)` →
+    /// 第一条断言失败；若只删断言不管实现，`class_deadline` 那两行会直接 panic。
+    #[test]
+    fn budget_knobs_are_capped_so_instant_add_cannot_panic() {
+        let mut cfg = Config::default();
+        cfg.upstream_retry_absorb_budget_secs = u64::MAX;
+        cfg.upstream_retry_absorb_swap_budget_secs = u64::MAX;
+        let p = AbsorbPolicy::from_config(&cfg);
+        assert_eq!(p.budget, ABSORB_BUDGET_CEILING, "总预算必须被上限夹住");
+        assert_eq!(p.swap_budget, ABSORB_BUDGET_CEILING, "空窗预算必须被上限夹住");
+        // 承重：这两个值必须真的能加到 Instant 上（未夹住的值会在 std 里 panic）。
+        let start = std::time::Instant::now();
+        assert_eq!(
+            p.class_deadline(start, AbsorbClass::SwapWindow),
+            start + ABSORB_BUDGET_CEILING
+        );
+        assert_eq!(
+            p.class_deadline(start, AbsorbClass::UpstreamRateLimit),
+            start + ABSORB_BUDGET_CEILING
+        );
+    }
+
+    /// 上限只掐极端值：任何可信配置（45s~24h）逐字节保留，归一化不改变语义。
+    #[test]
+    fn budget_ceiling_leaves_normal_values_untouched() {
+        let mut cfg = Config::default();
+        cfg.upstream_retry_absorb_budget_secs = 600;
+        cfg.upstream_retry_absorb_swap_budget_secs = 3600;
+        let p = AbsorbPolicy::from_config(&cfg);
+        assert_eq!(p.budget, Duration::from_secs(600), "600s 在上下限之间，不得被改");
+        assert_eq!(
+            p.swap_budget,
+            Duration::from_secs(3600),
+            "3600s 在上下限之间，不得被改"
+        );
+        // 下限方向同样保留：填 5s 抬到 45s（既有行为，防被本次改动带偏）。
+        cfg.upstream_retry_absorb_budget_secs = 5;
+        let p = AbsorbPolicy::from_config(&cfg);
+        assert_eq!(
+            p.budget,
+            Duration::from_secs(MAX_REQUEST_RETRY_BUDGET_SECS),
+            "低于 45s 的总预算仍应抬到 45s"
+        );
+    }
 }

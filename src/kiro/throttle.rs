@@ -404,7 +404,15 @@ impl GlobalThrottle {
             return;
         }
         let cur = b.target_rpm;
-        let next = ((cur * MD_FACTOR_PCT) / 100).max(floor).max(1);
+        // ⚠️ 乘法必须走 u64：`cur * MD_FACTOR_PCT` 在 u32 下会溢出（debug 构建 panic、
+        //   release 构建回绕成错值），而 `cur` 的上界由 config.json 的 `inboundRpmMax`
+        //   决定 —— 面板路径 clamp 到 100_000，**手改 config.json 不受此限**（与本文件
+        //   `new()` 里 `.max(lo)` 防的是同一类输入，那里也是「手改可绕过面板校验」）。
+        //   溢出阈值仅 85_899_345 RPM，一个手滑多写几位即可越过。u64 后语义不变：
+        //   仍严格等于 `cur / 2`（MD_FACTOR_PCT=50）。
+        let next = (((cur as u64) * MD_FACTOR_PCT as u64) / 100)
+            .max(floor as u64)
+            .max(1) as u32;
         // ⚠️ 关键修复(升档饿死死锁·第二处):`last_md_nanos` 的语义严格是"上次**真正降档**的时刻",
         //   因此只有 next != cur（确实降了档）才允许刷新它。
         //   历史 bug：这里曾无条件 `b.last_md_nanos = now`，于是当 target_rpm **已经在 rpm_min 下限**
@@ -443,7 +451,10 @@ impl GlobalThrottle {
         if cur >= ceil {
             return;
         }
-        let next = (cur + DEFAULT_STEP_UP).min(ceil);
+        // saturating_add：`ceil` 来自 config.json 的 `inboundRpmMax`（面板 clamp 到 100_000，
+        // 手改不受限）。`cur + 10` 在 cur 逼近 u32::MAX 时会溢出 —— debug panic，
+        // release 回绕成**极小值**，那会让一次「升档」实际把 RPM 打到地板。
+        let next = cur.saturating_add(DEFAULT_STEP_UP).min(ceil);
         b.target_rpm = next;
         drop(b);
         self.ai_total.fetch_add(1, Ordering::Relaxed);
@@ -877,6 +888,49 @@ mod tests {
         let t = mk(true, false, 200);
         t.report_upstream_429();
         assert_eq!(t.current_target_rpm(), 200, "手动挡不受 429 影响");
+    }
+
+    /// ⭐ 溢出回归：`inboundRpmMax` 被手改成 u32 级极值时，乘性减档不得 panic / 回绕。
+    ///
+    /// 旧实现是 `(cur * MD_FACTOR_PCT) / 100`（u32），溢出阈值仅 85_899_345 RPM：
+    /// debug 构建直接 panic（测试正是 debug 跑），release 构建回绕成错值。
+    /// `cur` 的上界来自 config.json 的 `inboundRpmMax`（面板 clamp 到 100_000，
+    /// 手改 config.json 不受限），与本文件 `new()` 防 `.max(lo)` 是同一类输入。
+    ///
+    /// 回退即 FAIL：把实现改回 u32 乘法 → 本测试 panic（而非断言失败）。
+    #[test]
+    fn test_aimd_md_no_overflow_at_extreme_rpm() {
+        let t = GlobalThrottle::new(true, true, 200_000_000, 1, 200_000_000, 2, 30, false);
+        assert_eq!(t.current_target_rpm(), 200_000_000, "前提：target 未被 clamp");
+        t.report_upstream_429();
+        assert_eq!(
+            t.current_target_rpm(),
+            100_000_000,
+            "极值下乘性减仍必须精确砍半（溢出会 panic 或给出错值）"
+        );
+    }
+
+    /// ⭐ 溢出回归（第二条路径）：升档的 `cur + DEFAULT_STEP_UP` 在 cur 逼近 u32::MAX 时溢出。
+    ///
+    /// 与上面那条是同一类输入（手改 config.json 的 `inboundRpmMax` 到 u32 极值），
+    /// 但触发点不同：必须 cur < ceil 且 cur 距 u32::MAX 不足 step，才会走到加法。
+    ///
+    /// 回退即 FAIL：把 `saturating_add` 改回 `+` → 本测试 panic（debug）或断言失败
+    /// （release 回绕成极小值 → 升档实际把 RPM 打到地板）。
+    #[test]
+    fn test_aimd_step_up_no_overflow_at_extreme_ceil() {
+        let mut t = GlobalThrottle::new(true, true, u32::MAX - 5, 1, u32::MAX, 2, 30, false);
+        assert_eq!(t.current_target_rpm(), u32::MAX - 5, "前提：target 逼近 u32::MAX");
+        // 升档有两道静默期（since_md / since_probe 都 ≥ AIMD_PROBE_SECS），而两者初值都是
+        // 0（相对时钟起点）⇒ 必须把 `start` 推回 ≥ AIMD_PROBE_SECS，否则 maybe_step_up
+        // 直接早退、根本走不到加法那行，本测试会因「升档没发生」而失败（与溢出无关）。
+        t.start = Instant::now() - Duration::from_secs(AIMD_PROBE_SECS + 1);
+        t.maybe_step_up();
+        assert_eq!(
+            t.current_target_rpm(),
+            u32::MAX,
+            "升档必须饱和到 ceil，绝不能回绕成极小值"
+        );
     }
 
     /// 🔴 启动 slow-start：进程刚起来时有效 RPM 必须被折算，窗口后必须完全恢复。

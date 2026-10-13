@@ -404,7 +404,14 @@ mod tests {
             h.record(1, RT, true);
         }
         // 连续大量单候选调用。
-        for _ in 0..(EXPLORE_EVERY * 3) {
+        //
+        // ⚠️ 次数必须 ≡ `EXPLORE_EVERY - 1`（mod `EXPLORE_EVERY`），即 23 而不是 24：
+        // 若实现**错误地**推进了节拍，tick 会停在 23，于是下面第一次多候选调用落在
+        // tick 24 —— 恰好是探测拍 ⇒ 返回非最优的 CLI ⇒ 断言失败。取 24（旧值）时
+        // tick 停在 8 的倍数上，下一次多候选调用是 tick 25、后续 25..31 全不是探测拍，
+        // 断言**恒真**（守卫失效：把 `candidates.len() == 1` 的提前返回删掉本测试照样绿）。
+        const SINGLE_CANDIDATE_PICKS: u32 = EXPLORE_EVERY * 3 - 1;
+        for _ in 0..SINGLE_CANDIDATE_PICKS {
             assert_eq!(h.pick(1, &[RT]), Some(RT));
         }
         // 节拍未被推进 ⇒ 接下来 EXPLORE_EVERY-1 次多候选调用都应是最优解。
