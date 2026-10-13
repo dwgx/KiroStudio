@@ -94,6 +94,22 @@ pub fn parse_frame(buffer: &[u8]) -> ParseResult<Option<(Frame, usize)>> {
     let header_length = u32::from_be_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]);
     let prelude_crc = u32::from_be_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]);
 
+    // ⚠️ Prelude CRC 必须在**任何依赖 total_length 的动作之前**校验（长度范围判断、
+    // 「等整帧到齐」的提前返回都依赖它）。
+    //
+    // 顺序为什么重要：缓冲区失步时 `total_length` 是垃圾值。旧顺序先信这个垃圾长度 ——
+    // 若它恰好落在 `MIN..=MAX` 区间，`buffer.len() < total_length` 会让解码器**一直等**，
+    // 直到凑满这个根本不存在的长度才回头发现 CRC 不匹配：白白缓冲最多 16MiB，期间 `feed`
+    // 还会因缓冲区上限拒绝新 chunk（真实数据被丢）。prelude 只有 12 字节，CRC 随时可校验，
+    // 失步帧应当**立刻**失败并走 1 字节重同步。
+    let actual_prelude_crc = crc32(&buffer[..8]);
+    if actual_prelude_crc != prelude_crc {
+        return Err(ParseError::PreludeCrcMismatch {
+            expected: prelude_crc,
+            actual: actual_prelude_crc,
+        });
+    }
+
     // 验证消息长度范围
     if total_length < MIN_MESSAGE_SIZE as u32 {
         return Err(ParseError::MessageTooSmall {
@@ -115,15 +131,6 @@ pub fn parse_frame(buffer: &[u8]) -> ParseResult<Option<(Frame, usize)>> {
     // 检查是否有完整的消息
     if buffer.len() < total_length {
         return Ok(None);
-    }
-
-    // 验证 Prelude CRC
-    let actual_prelude_crc = crc32(&buffer[..8]);
-    if actual_prelude_crc != prelude_crc {
-        return Err(ParseError::PreludeCrcMismatch {
-            expected: prelude_crc,
-            actual: actual_prelude_crc,
-        });
     }
 
     // 读取 Message CRC
@@ -206,5 +213,104 @@ mod tests {
         assert_eq!(out.chars().count(), 2, "3 字节字符被截在中间应得 U+FFFD: {out:?}");
         assert!(out.starts_with('中'));
         assert!(out.ends_with('\u{FFFD}'));
+    }
+
+    /// 构造一个**两个 CRC 都算对**的合法帧。
+    fn build_frame(headers: &[(&str, &str)], payload: &[u8]) -> Vec<u8> {
+        let mut hdr = Vec::new();
+        for (name, value) in headers {
+            hdr.push(name.len() as u8);
+            hdr.extend_from_slice(name.as_bytes());
+            hdr.push(7u8); // HeaderValueType::String
+            hdr.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            hdr.extend_from_slice(value.as_bytes());
+        }
+        let total_length = (PRELUDE_SIZE + hdr.len() + payload.len() + 4) as u32;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&total_length.to_be_bytes());
+        buf.extend_from_slice(&(hdr.len() as u32).to_be_bytes());
+        let prelude_crc = crc32(&buf[..8]);
+        buf.extend_from_slice(&prelude_crc.to_be_bytes());
+        buf.extend_from_slice(&hdr);
+        buf.extend_from_slice(payload);
+        let msg_crc = crc32(&buf);
+        buf.extend_from_slice(&msg_crc.to_be_bytes());
+        buf
+    }
+
+    /// 正常往返：头部、payload、消费字节数都对。
+    #[test]
+    fn test_frame_round_trip() {
+        let buf = build_frame(
+            &[(":message-type", "event"), (":event-type", "x")],
+            b"{\"a\":1}",
+        );
+        let (frame, consumed) = parse_frame(&buf).expect("应可解析").expect("应有整帧");
+        assert_eq!(consumed, buf.len(), "消费长度应等于整帧长度");
+        assert_eq!(frame.message_type(), Some("event"));
+        assert_eq!(frame.event_type(), Some("x"));
+        assert_eq!(frame.payload, b"{\"a\":1}".to_vec());
+    }
+
+    /// Prelude CRC 不匹配：即使 `total_length` 是垃圾值也必须**先**报 CRC 错。
+    ///
+    /// 锁的是校验顺序（2026-10-14 审计）：旧顺序先信垃圾长度并「等整帧到齐」，失步帧会让
+    /// 解码器白白缓冲最多 16MiB 才回头发现 CRC 不匹配（期间 `feed` 还会因缓冲区上限丢数据）。
+    /// 回退即 FAIL：把 CRC 校验挪回长度判断之后，本用例会得到 `Ok(None)`。
+    #[test]
+    fn test_frame_prelude_crc_mismatch_detected_before_length_wait() {
+        let mut buf = vec![0u8; PRELUDE_SIZE];
+        buf[0..4].copy_from_slice(&1024u32.to_be_bytes()); // 远大于当前缓冲区
+        buf[4..8].copy_from_slice(&0u32.to_be_bytes());
+        // 保证与真实 CRC 不同（不用硬编码值，免得撞上真值让测试变脆）。
+        let bad_crc = crc32(&buf[..8]).wrapping_add(1);
+        buf[8..12].copy_from_slice(&bad_crc.to_be_bytes());
+        assert!(matches!(
+            parse_frame(&buf),
+            Err(ParseError::PreludeCrcMismatch { .. })
+        ));
+    }
+
+    /// Message CRC 不匹配（prelude 合法）。
+    #[test]
+    fn test_frame_message_crc_mismatch() {
+        let mut buf = build_frame(&[(":message-type", "event")], b"body");
+        let last = buf.len() - 1;
+        buf[last] ^= 0xFF;
+        assert!(matches!(
+            parse_frame(&buf),
+            Err(ParseError::MessageCrcMismatch { .. })
+        ));
+    }
+
+    /// 长度超上限 / 头部越界都必须报类型化错误，不得 panic。
+    #[test]
+    fn test_frame_message_too_large_and_header_overflow() {
+        // total_length 超过 16MiB 上限（prelude CRC 合法，才能走到长度判断）。
+        let mut buf = vec![0u8; PRELUDE_SIZE];
+        buf[0..4].copy_from_slice(&(MAX_MESSAGE_SIZE + 1).to_be_bytes());
+        buf[4..8].copy_from_slice(&0u32.to_be_bytes());
+        let crc = crc32(&buf[..8]);
+        buf[8..12].copy_from_slice(&crc.to_be_bytes());
+        assert!(matches!(
+            parse_frame(&buf),
+            Err(ParseError::MessageTooLarge { .. })
+        ));
+
+        // header_length 越过消息边界 → HeaderParseFailed（而不是切片 panic）。
+        let payload = b"x";
+        let total = (PRELUDE_SIZE + payload.len() + 4) as u32;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&total.to_be_bytes());
+        buf.extend_from_slice(&(total + 100).to_be_bytes()); // 头部长度越界
+        let crc = crc32(&buf[..8]);
+        buf.extend_from_slice(&crc.to_be_bytes());
+        buf.extend_from_slice(payload);
+        let msg_crc = crc32(&buf);
+        buf.extend_from_slice(&msg_crc.to_be_bytes());
+        assert!(matches!(
+            parse_frame(&buf),
+            Err(ParseError::HeaderParseFailed(_))
+        ));
     }
 }

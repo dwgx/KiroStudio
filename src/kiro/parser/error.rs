@@ -23,7 +23,12 @@ pub enum ParseError {
     InvalidMessageType(String),
     /// Payload 反序列化失败
     PayloadDeserialize(serde_json::Error),
-    /// IO 错误
+    /// IO 错误。
+    ///
+    /// ⚠️ 本变体只由 [`From<std::io::Error>`] 产生：帧解析本身**不做 IO**（字节由
+    /// `EventStreamDecoder::feed(&[u8])` 送进来，`parse_frame` 是纯函数），所以短读
+    /// （`UnexpectedEof`）不会被归到这里、也不会与 [`Self::Incomplete`] 抢语义 ——
+    /// `Incomplete` 只表示「缓冲区里还没有完整的一帧」，由长度/边界检查产生。
     Io(std::io::Error),
     /// 连续错误过多，解码器已停止
     TooManyErrors { count: usize, last_error: String },
@@ -31,7 +36,19 @@ pub enum ParseError {
     BufferOverflow { size: usize, max: usize },
 }
 
-impl std::error::Error for ParseError {}
+impl std::error::Error for ParseError {
+    /// 暴露内层错误：`anyhow` 的 `{:#}` 原因链、`source()` 遍历与 `downcast` 全靠它。
+    ///
+    /// 这两个变体存在的意义就是**保留原始错误**（`io::Error` / `serde_json::Error`，
+    /// 前者带 `ErrorKind`、后者带行列号），用默认实现（恒 `None`）等于把原因又丢一次。
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::PayloadDeserialize(e) => Some(e),
+            Self::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -92,3 +109,32 @@ impl From<serde_json::Error> for ParseError {
 
 /// 解析结果类型
 pub type ParseResult<T> = Result<T, ParseError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `source()` 必须能取到内层错误（否则 anyhow 原因链与 downcast 都拿不到原因）。
+    ///
+    /// 回退即 FAIL：改回 `impl std::error::Error for ParseError {}`（默认 `source()` 恒
+    /// `None`）后，前两个断言立刻变红。
+    #[test]
+    fn wrapped_errors_expose_source() {
+        let io = ParseError::from(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "eof",
+        ));
+        assert!(std::error::Error::source(&io).is_some(), "Io 必须暴露内层错误");
+
+        let json: ParseError = serde_json::from_str::<serde_json::Value>("{")
+            .unwrap_err()
+            .into();
+        assert!(
+            std::error::Error::source(&json).is_some(),
+            "PayloadDeserialize 必须暴露内层错误"
+        );
+
+        // 无内层错误的变体不得假装有 source。
+        assert!(std::error::Error::source(&ParseError::InvalidHeaderType(99)).is_none());
+    }
+}

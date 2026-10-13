@@ -313,6 +313,33 @@ fn mask_proxy_url(url: &str) -> String {
     crate::http_client::split_proxy_credentials(url).0
 }
 
+/// 任意 URL 脱敏（Debug 用）：剥掉 `user:pass@`（userinfo）与 `?query` / `#fragment`，
+/// 只留 `scheme://host[:port]/path`。
+///
+/// 为什么连 query 一起砍：`token_endpoint` / `issuer_url` / `base_url` 都来自**导入的凭据
+/// JSON**（本工具核心用途就是导入第三方号），可能内嵌账密或 `?token=…`；而这些字段随后正是
+/// 请求目标本身（refresh_token / client_secret / api_key 就 POST 到它），被 `{:?}` 打进日志
+/// 等于把「收件地址 + 门钥匙」一并写出去。与 [`mask_proxy_url`] 同口径，但这里不一定是代理
+/// URL，故不用代理专用拆分器。
+fn mask_url_for_debug(url: &str) -> String {
+    // 先砍 query/fragment（可能带 secret），再砍 userinfo。
+    let head = url.split(['?', '#']).next().unwrap_or(url);
+    let (prefix, rest) = match head.split_once("://") {
+        Some((scheme, rest)) => (format!("{scheme}://"), rest),
+        // 无 scheme 的裸串（`user:pass@host:1080`）：仍按 authority 处理，不能原样漏出去。
+        None => (String::new(), head),
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    match authority.rsplit_once('@') {
+        // 有 userinfo：只留 host[:port]（IPv6 的 `[..]` 里没有 '@'，不受影响）。
+        Some((_, host)) => format!("{prefix}<redacted>@{host}{path}"),
+        None => format!("{prefix}{authority}{path}"),
+    }
+}
+
 /// 手写脱敏 Debug：可识别字段（id/auth/email/endpoint 等）正常显示，
 /// 敏感凭证字段一律打码为 `<set:N>`，绝不输出明文。
 impl std::fmt::Debug for KiroCredentials {
@@ -338,12 +365,20 @@ impl std::fmt::Debug for KiroCredentials {
             .field("refresh_token", &mask_secret(&self.refresh_token))
             .field("client_id", &mask_secret(&self.client_id))
             .field("client_secret", &mask_secret(&self.client_secret))
-            .field("token_endpoint", &self.token_endpoint)
-            .field("issuer_url", &self.issuer_url)
+            // 这三个 URL 会被当作请求目标（刷新/透传直接 POST 过去），且来自导入 JSON：
+            // 内嵌 userinfo / query 里的 token 一律不得随 `{:?}` 外泄。
+            .field(
+                "token_endpoint",
+                &self.token_endpoint.as_deref().map(mask_url_for_debug),
+            )
+            .field(
+                "issuer_url",
+                &self.issuer_url.as_deref().map(mask_url_for_debug),
+            )
             .field("scopes", &self.scopes)
             .field("kiro_api_key", &mask_secret(&self.kiro_api_key))
             .field("api_key", &mask_secret(&self.api_key))
-            .field("base_url", &self.base_url)
+            .field("base_url", &self.base_url.as_deref().map(mask_url_for_debug))
             .field("proxy_username", &mask_secret(&self.proxy_username))
             .field("proxy_password", &mask_secret(&self.proxy_password))
             .finish()
@@ -670,8 +705,20 @@ impl KiroCredentials {
                 let (clean_url, inline_user, inline_pass) =
                     crate::http_client::split_proxy_credentials(url);
                 let mut proxy = ProxyConfig::new(clean_url);
-                let username = self.proxy_username.clone().or(inline_user);
-                let password = self.proxy_password.clone().or(inline_pass);
+                // ⚠️ 空白串按**未设置**处理（filter）：`Option::or` 只认 None，`Some("")` 会顶掉
+                // URL 内嵌账密 → 变成空用户名/空密码的错配认证（面板字段留空 + URL 带账密是最
+                // 常见形态），只剩一个字段时更是整对认证都不发出。与
+                // admin/socks_nodes.rs::probe_socks_node 同款。
+                let username = self
+                    .proxy_username
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .or(inline_user);
+                let password = self
+                    .proxy_password
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .or(inline_pass);
                 if let (Some(username), Some(password)) = (username, password) {
                     proxy = proxy.with_auth(username, password);
                 }
@@ -783,8 +830,10 @@ impl KiroCredentials {
     /// 此处先用默认回退保证可用,动态解析作为后续增强。
     pub fn effective_profile_arn(&self) -> Option<String> {
         // 有自带/动态解析到的真实 profileArn → 一律用它（含 external_idp）。
-        if let Some(arn) = self.profile_arn.as_deref() {
-            if !arn.trim().is_empty() {
+        // 取出即 trim：该值来自导入 JSON/手改，带前后空白的 ARN 直接进 query/body 会被上游
+        // 判成不匹配（400）；trim 后与 usage_profile_arn 同口径。
+        if let Some(arn) = self.profile_arn.as_deref().map(str::trim) {
+            if !arn.is_empty() {
                 return Some(arn.to_string());
             }
         }
@@ -936,6 +985,24 @@ impl KiroCredentials {
         }
     }
 
+    /// 从 OIDC issuer URL 里取 Microsoft 租户段（取不到返回 `None`）。
+    ///
+    /// 只认 `scheme://login.microsoftonline.com/{tenant}[/...]`：host 必须**恰好**是
+    /// `login.microsoftonline.com`（大小写不敏感、允许显式端口），不认子域/前后缀伪装，
+    /// 也不认只出现在 query / path 里的同名字符串。理由见 `family_key` ① 的注释。
+    fn microsoft_tenant_from_issuer(issuer: &str) -> Option<&str> {
+        let (_, rest) = issuer.split_once("://")?;
+        // 无 scheme 的裸串（`login.microsoftonline.com/...`）在上面已返回 None。
+        let (host, path) = rest.split_once('/')?;
+        // 去掉显式端口；host 段不含 '@'（userinfo 会让 host 不等于目标域名 ⇒ 自然被拒）。
+        let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+        if !host.eq_ignore_ascii_case("login.microsoftonline.com") {
+            return None;
+        }
+        let tenant = path.split('/').next().unwrap_or("").trim();
+        if tenant.is_empty() { None } else { Some(tenant) }
+    }
+
     /// 账户族键（family_key）—— 限流/健康的分组单位（见 docs/DESIGN-M365-FAMILY-RATELIMIT-0708.md）。
     ///
     /// M365 external_idp 号的上游限速是**租户/账户族级连坐**：同一 M365 租户的多个号，
@@ -962,12 +1029,16 @@ impl KiroCredentials {
     pub fn family_key(&self, id: u64) -> String {
         if self.is_external_idp_credential() {
             // ① issuer_url: https://login.microsoftonline.com/{tenant}/v2.0 → m365:{tenant}
+            //
+            // ⚠️ 必须按 **host 段**判定，不能用 `split("login.microsoftonline.com/")` 找子串：
+            // issuer_url 来自导入的凭据 JSON（本工具的核心用途就是导入第三方号），而
+            // family_key 是**冷却/健康连坐的分组单位** —— 形如
+            // `https://evil.example/?login.microsoftonline.com/{受害者租户}/v2.0` 或
+            // `https://login.microsoftonline.com.attacker.tld/{租户}/v2.0` 的字符串会把
+            // 不相干的号并进别人的族：一次 429 就按族把整族退避/禁用。
             if let Some(issuer) = self.issuer_url.as_deref() {
-                if let Some(rest) = issuer.split("login.microsoftonline.com/").nth(1) {
-                    let tenant = rest.split('/').next().unwrap_or("").trim();
-                    if !tenant.is_empty() {
-                        return format!("m365:{tenant}");
-                    }
+                if let Some(tenant) = Self::microsoft_tenant_from_issuer(issuer) {
+                    return format!("m365:{tenant}");
                 }
             }
             // ② 兜底: profileArn arn:aws:codewhisperer:region:{account}:profile/xxx → aws:{account}
@@ -1283,6 +1354,27 @@ mod tests {
         assert_eq!(
             idc.effective_profile_arn().as_deref(),
             Some("arn:aws:codewhisperer:us-east-1:111:profile/REAL")
+        );
+    }
+
+    /// 导入/手改带来的前后空白必须 trim 掉再发出（原样进 query/body 会被上游判不匹配 → 400）；
+    /// 纯空白等于「没有 ARN」，走类型默认，不得当真实 ARN 发出。
+    #[test]
+    fn test_effective_profile_arn_trims_whitespace() {
+        let mut idc = KiroCredentials::default();
+        idc.auth_method = Some("idc".to_string());
+        idc.profile_arn =
+            Some("  arn:aws:codewhisperer:us-east-1:111:profile/REAL \n".to_string());
+        assert_eq!(
+            idc.effective_profile_arn().as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:111:profile/REAL")
+        );
+
+        idc.profile_arn = Some("   ".to_string());
+        assert_eq!(
+            idc.effective_profile_arn().as_deref(),
+            Some(crate::kiro::token_manager::DEFAULT_BUILDER_ID_PROFILE_ARN),
+            "纯空白不得当真实 ARN 发出（idc 回退默认 BuilderId 占位）"
         );
     }
 
@@ -1622,6 +1714,38 @@ mod tests {
         assert!(dbg.contains("id: Some(7)"), "id 应可见");
         // 敏感字段以脱敏形式标注（<set:N>）
         assert!(dbg.contains("<set:"), "敏感字段应以 <set:N> 脱敏标注");
+    }
+
+    /// 安全回归：Debug 里的请求目标 URL 不得带 userinfo / query（都可能藏账密）。
+    ///
+    /// 回退即 FAIL：这三个字段来自导入 JSON，且随后就是请求目标本身（refresh_token /
+    /// client_secret / api_key POST 到它），明文进日志等于泄露「收件地址 + 门钥匙」。
+    #[test]
+    fn test_debug_masks_url_fields() {
+        let mut c = KiroCredentials::default();
+        c.token_endpoint = Some(
+            "https://user:URL_USERINFO_SECRET@login.example/token?client_secret=Q_SECRET"
+                .to_string(),
+        );
+        c.issuer_url = Some("https://login.microsoftonline.com/tenant/v2.0".to_string());
+        c.base_url = Some("https://relay.example/v1?key=RELAY_SECRET".to_string());
+
+        let dbg = format!("{:?}", c);
+
+        for leaked in [
+            "URL_USERINFO_SECRET",
+            "user:URL_USERINFO_SECRET",
+            "Q_SECRET",
+            "RELAY_SECRET",
+        ] {
+            assert!(
+                !dbg.contains(leaked),
+                "Debug 输出泄露了 URL 里的凭据 {leaked}: {dbg}"
+            );
+        }
+        // host/path 仍可见：排障时要能看出请求打向哪
+        assert!(dbg.contains("login.example"), "host 应保留: {dbg}");
+        assert!(dbg.contains("relay.example/v1"), "host+path 应保留: {dbg}");
     }
 
     #[test]
@@ -2255,6 +2379,56 @@ mod tests {
         assert_eq!(c.family_key(53), "aws:000000000000");
     }
 
+    /// 伪装/污染的 issuer_url 不得把不相干的号并进别人的 m365 族。
+    ///
+    /// `family_key` 是冷却/健康**连坐**的分组单位：字符串里只要「出现」租户段，攻击者就能
+    /// 把受害租户拉进自己的族（或反之），一次 429 就按族整片退避。故只认 host 恰好是
+    /// `login.microsoftonline.com` 的 URL。
+    ///
+    /// 回退即 FAIL：改回子串匹配后这些用例会返回 `m365:victim-tenant`。
+    #[test]
+    fn test_family_key_rejects_spoofed_issuer_host() {
+        let mut c = KiroCredentials::default();
+        c.auth_method = Some("external_idp".to_string());
+        // 兜底：无合法 issuer 时用 profileArn 的 AWS account（占位假值，脱敏）。
+        c.profile_arn =
+            Some("arn:aws:codewhisperer:us-east-1:000000000000:profile/EXAMPLE".to_string());
+
+        for spoofed in [
+            // 租户段只出现在 query 里
+            "https://evil.example/?login.microsoftonline.com/victim-tenant/v2.0",
+            // 同名字符串只出现在 path 里（host 是 evil.example）
+            "https://evil.example/login.microsoftonline.com/victim-tenant/v2.0",
+            // 攻击者注册的前缀域名
+            "https://login.microsoftonline.com.attacker.tld/victim-tenant/v2.0",
+            // 伪装成 userinfo
+            "https://login.microsoftonline.com@evil.example/victim-tenant/v2.0",
+            // 无 scheme 的裸串
+            "login.microsoftonline.com/victim-tenant/v2.0",
+        ] {
+            c.issuer_url = Some(spoofed.to_string());
+            assert_eq!(
+                c.family_key(53),
+                "aws:000000000000",
+                "伪装 issuer（{spoofed}）必须落到兜底，不得并进 m365 族"
+            );
+        }
+
+        // 合法形态（大小写 / 显式端口）仍要能取到租户，否则 M365 族连坐会失效。
+        for ok in [
+            "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000001/v2.0",
+            "https://Login.MicrosoftOnline.com/00000000-0000-0000-0000-000000000001/v2.0",
+            "https://login.microsoftonline.com:443/00000000-0000-0000-0000-000000000001/v2.0",
+        ] {
+            c.issuer_url = Some(ok.to_string());
+            assert_eq!(
+                c.family_key(53),
+                "m365:00000000-0000-0000-0000-000000000001",
+                "合法 issuer（{ok}）必须取到租户"
+            );
+        }
+    }
+
     #[test]
     fn test_family_key_idc_independent() {
         // IdC 号无 issuer → cred:{id} 独立成族（坚强兜底,不并入 m365 连坐）
@@ -2302,6 +2476,23 @@ mod tests {
         assert_eq!(result.url, "socks5://host:1080");
         assert_eq!(result.username, Some("explicit".to_string()));
         assert_eq!(result.password, Some("explicitpass".to_string()));
+    }
+
+    /// 空白账密字段按「未设置」处理：不得经 `Option::or` 把 URL 内嵌账密顶掉。
+    ///
+    /// 改前形态（真 bug）：字段留空串 + URL 带账密 → `Some("")` 胜出 → with_auth("", "")，
+    /// 内嵌账密被丢弃 ⇒ 认证错配/直连无认证。
+    #[test]
+    fn test_effective_proxy_blank_fields_do_not_shadow_inline() {
+        let mut creds = KiroCredentials::default();
+        creds.proxy_url = Some("socks5://inlineuser:inlinepass@host:1080".to_string());
+        creds.proxy_username = Some(String::new());
+        creds.proxy_password = Some("   ".to_string());
+
+        let result = creds.effective_proxy(None).unwrap();
+        assert_eq!(result.url, "socks5://host:1080");
+        assert_eq!(result.username, Some("inlineuser".to_string()));
+        assert_eq!(result.password, Some("inlinepass".to_string()));
     }
 
     #[test]

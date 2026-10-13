@@ -31,11 +31,25 @@
 //! ```
 
 use super::error::{ParseError, ParseResult};
-use super::frame::{Frame, PRELUDE_SIZE, parse_frame};
+use super::frame::{Frame, MAX_MESSAGE_SIZE, PRELUDE_SIZE, parse_frame};
 use bytes::{Buf, BytesMut};
 
-/// 默认最大缓冲区大小 (16 MB)
-pub const DEFAULT_MAX_BUFFER_SIZE: usize = 16 * 1024 * 1024;
+/// 默认最大缓冲区大小。
+///
+/// = 单帧上限（`MAX_MESSAGE_SIZE`，16MiB）+ 一个 chunk 的余量 `BUFFER_CHUNK_SLACK`。
+///
+/// 为什么要余量：缓冲区在「整帧已到齐」之前一直持有**未完成**的帧，而 chunk 是整块进出的。
+/// 若上限与单帧上限相等，一帧长度逼近 16MiB 时，最后一个 chunk 会让
+/// `buffer.len() + data.len() > 上限` 成立 → **整个 chunk 被拒绝**（调用方只记一条 warn 就
+/// 继续 drain）→ 该帧永远凑不齐 → 流卡死。留出一个 chunk 的余量后，`total_length <= 16MiB`
+/// 的帧只要 chunk 不超过该余量就一定能收全（2026-10-14 审计条目）。
+pub const DEFAULT_MAX_BUFFER_SIZE: usize = MAX_MESSAGE_SIZE as usize + BUFFER_CHUNK_SLACK;
+
+/// 缓冲区上限里留给「最后一个 chunk」的余量。
+///
+/// reqwest/hyper 的 chunk 通常 ≤ 64KiB，故取 64KiB：既够覆盖正常分块，又不放大内存占用
+/// （缓冲区只在真有未完成帧时才长到这个量级）。
+const BUFFER_CHUNK_SLACK: usize = 64 * 1024;
 
 /// 默认最大连续错误数
 pub const DEFAULT_MAX_ERRORS: usize = 5;
@@ -129,11 +143,29 @@ impl EventStreamDecoder {
     /// 向解码器提供数据
     ///
     /// # Returns
-    /// - `Ok(())` - 数据已添加到缓冲区
+    /// - `Ok(())` - 数据已添加到缓冲区（**或解码器已处于终止态、数据被丢弃**）
     /// - `Err(BufferOverflow)` - 缓冲区已满
+    ///
+    /// ⚠️ 边界：上限 = 单帧上限 + `BUFFER_CHUNK_SLACK`（见 `DEFAULT_MAX_BUFFER_SIZE`），
+    /// 故「长度 ≤ 16MiB 的帧 + 一个 ≤64KiB 的 chunk」一定收得下。但比该余量更大的单个 chunk
+    /// 仍会被**整体拒绝**（调用方 `decode_frames_into` 只记一条 warn 就继续 drain）——
+    /// 那意味着丢字节、这一帧再也凑不齐。要改得先定策略（超限即判流截断，还是按需扩容）。
     pub fn feed(&mut self, data: &[u8]) -> ParseResult<()> {
-        // 检查缓冲区大小限制
-        let new_size = self.buffer.len() + data.len();
+        // 终止态：解码器再也不会产出任何帧（`decode()` 只返回 `TooManyErrors`，迭代器直接
+        // 结束），继续缓存只会有害 —— 缓冲区会一路涨到 `max_buffer_size`(≈16MiB)，之后每次
+        // `feed` 都返回 `BufferOverflow`（调用方只记一条 warn），即「16MiB 死缓冲区 +
+        // 每 chunk 一条噪音日志」。数据直接丢弃：它本来就不可能被解析出来。
+        if self.state == DecoderState::Stopped {
+            return Ok(());
+        }
+
+        // 检查缓冲区大小限制。用 checked_add：`len + len` 理论可回绕（32 位 usize + 巨块），
+        // 回绕后会绕过上限判断直接进 `extend_from_slice`。回绕即视为溢出。
+        let new_size = self
+            .buffer
+            .len()
+            .checked_add(data.len())
+            .unwrap_or(usize::MAX);
         if new_size > self.max_buffer_size {
             return Err(ParseError::BufferOverflow {
                 size: new_size,
@@ -196,6 +228,10 @@ impl EventStreamDecoder {
                 // 检查是否超过最大错误数
                 if self.error_count >= self.max_errors {
                     self.state = DecoderState::Stopped;
+                    // 终止态不可逆，缓冲区里剩下的字节永远不会再被解析 —— 就地释放
+                    // （最多 `max_buffer_size`）。不清的话调用方继续 feed 只会把它撑到上限后开始报
+                    // BufferOverflow（见 `feed` 的终止态分支）。
+                    self.buffer.clear();
                     tracing::error!(
                         "解码器停止: 连续 {} 次错误，最后错误: {}",
                         self.error_count,
@@ -241,6 +277,12 @@ impl EventStreamDecoder {
 
         match error {
             // Prelude 阶段错误：可能是帧边界错位，逐字节扫描找下一个有效边界
+            //
+            // `MessageTooLarge` 也归这一类：长度前缀只由 prelude CRC 背书，而「>16MiB 的巨帧」
+            // 在本上游从未出现过，超限更可能是失步（垃圾字节凑巧 CRC 对上）⇒ 逐字节重同步的
+            // 收益大于代价。已知取舍：若真是一帧超限数据，5 次连错预算会耗尽并转入 Stopped
+            // （后续帧全丢）—— 需要时按此验：喂一帧 total_length > MAX_MESSAGE_SIZE、prelude
+            // CRC 正确的数据，再喂一帧合法数据，观察第二帧是否被解析出来。
             ParseError::PreludeCrcMismatch { .. }
             | ParseError::MessageTooSmall { .. }
             | ParseError::MessageTooLarge { .. } => {
@@ -254,8 +296,23 @@ impl EventStreamDecoder {
                 );
             }
 
-            // Data 阶段错误：帧边界正确但数据损坏，跳过整个帧
-            ParseError::MessageCrcMismatch { .. } | ParseError::HeaderParseFailed(_) => {
+            // Data 阶段错误：帧边界可信 ⇒ 跳过整帧。
+            //
+            // 为什么可信：这些错误只在 **prelude CRC 已通过**之后才可能返回，而 prelude CRC
+            // 正好覆盖 `total_length`（前 8 字节）—— 长度前缀是被校验过的，不是待验证的原始值。
+            // （`MessageCrcMismatch` 时 message CRC 自然是失败的，但它管的是帧内数据，不管边界。）
+            //
+            // 为什么 `InvalidHeaderType` / `Incomplete` 也走这条：它们只可能由 `parse_headers`
+            // 返回，而 `parse_frame` 走到那里时 prelude CRC 与 message CRC **都已通过**
+            // （长度与「整帧已在缓冲区」也校验过）。这里的 `Incomplete` **不表示「等更多数据」**：
+            // 整帧已在缓冲区里，它只表示头部编码与 `header_length` 自相矛盾。
+            //
+            // 逐字节重同步在这里只有坏处：5 次连错预算会被一帧内部的垃圾耗尽（到顶即永久
+            // `Stopped`，后续所有合法帧被丢）。
+            ParseError::MessageCrcMismatch { .. }
+            | ParseError::HeaderParseFailed(_)
+            | ParseError::InvalidHeaderType(_)
+            | ParseError::Incomplete { .. } => {
                 // 尝试读取 total_length 来跳过整帧
                 if self.buffer.len() >= PRELUDE_SIZE {
                     let total_length = u32::from_be_bytes([
@@ -520,5 +577,94 @@ mod tests {
                 let _ = result;
             }
         }
+    }
+
+    /// 头部失败（`InvalidHeaderType`）必须**整帧跳过**：帧边界已被两个 CRC 确认，
+    /// 逐字节重同步会白耗连错预算（到顶即永久 `Stopped`，后续合法帧全丢）。
+    ///
+    /// 回退即 FAIL：把 `InvalidHeaderType` 移出整帧跳过分支后，坏帧之后的合法帧解析不出来
+    /// （`ok` 会是 0 —— 逐字节跳过让缓冲区头部落到垃圾长度上，解码器改成「等更多数据」）。
+    #[test]
+    fn test_recover_skips_whole_frame_on_invalid_header_type() {
+        use super::super::crc::crc32;
+
+        // 坏帧：头部 = name_len(1) + name("x") + 非法类型(99)，两个 CRC 都算对。
+        let mut hdr = Vec::new();
+        hdr.push(1u8);
+        hdr.push(b'x');
+        hdr.push(99u8); // 非法 HeaderValueType
+        let payload = b"p";
+        let total = (PRELUDE_SIZE + hdr.len() + payload.len() + 4) as u32;
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&total.to_be_bytes());
+        bad.extend_from_slice(&(hdr.len() as u32).to_be_bytes());
+        let crc = crc32(&bad[..8]);
+        bad.extend_from_slice(&crc.to_be_bytes());
+        bad.extend_from_slice(&hdr);
+        bad.extend_from_slice(payload);
+        let msg_crc = crc32(&bad);
+        bad.extend_from_slice(&msg_crc.to_be_bytes());
+
+        // 后面跟一个合法帧：整帧跳过之后它必须还能被解析出来。
+        let mut data = bad.clone();
+        data.extend_from_slice(&build_minimal_frame());
+
+        let mut decoder = EventStreamDecoder::new();
+        decoder.feed(&data).unwrap();
+        let mut ok = 0usize;
+        let mut err = 0usize;
+        for result in decoder.decode_iter() {
+            match result {
+                Ok(_) => ok += 1,
+                Err(_) => err += 1,
+            }
+        }
+        assert_eq!(err, 1, "坏头部帧应恰好抛一次错误");
+        assert_eq!(
+            ok, 1,
+            "坏帧之后的合法帧必须被解析出来（回退即 FAIL：逐字节跳过会把它一起吃掉）"
+        );
+        assert!(!decoder.is_stopped(), "单帧一次错误不该打进终止态");
+    }
+
+    /// 终止态后 `feed` 不得继续囤数据。
+    ///
+    /// 回退即 FAIL：去掉 `feed` 的终止态分支后，缓冲区会涨到 16MiB 上限，
+    /// 第 5 次 `feed` 就会返回 `BufferOverflow`（调用方只记一条噪音日志）。
+    #[test]
+    fn test_feed_after_stopped_does_not_accumulate() {
+        let mut decoder = EventStreamDecoder::new();
+        // 全 0 字节：total_length=0 触发 Prelude CRC 不匹配，逐字节跳过直到连错上限。
+        decoder.feed(&[0u8; 64]).unwrap();
+        for result in decoder.decode_iter() {
+            let _ = result;
+        }
+        assert!(decoder.is_stopped(), "连续错误应把解码器打进终止态");
+
+        // 终止态后继续喂远超缓冲区上限的数据：既不该报错，也不该缓存。
+        let big = vec![0xABu8; 4 * 1024 * 1024];
+        for i in 0..8 {
+            assert!(
+                decoder.feed(&big).is_ok(),
+                "终止态下第 {i} 次 feed 应为无操作而不是 BufferOverflow"
+            );
+        }
+        assert!(
+            decoder.decode_iter().next().is_none(),
+            "终止态不应再产出帧"
+        );
+    }
+
+    /// 缓冲区上限必须比单帧上限**多出一个 chunk 的余量**。
+    ///
+    /// 回退即 FAIL：把 `DEFAULT_MAX_BUFFER_SIZE` 改回 `16 * 1024 * 1024`（与单帧上限相等）后，
+    /// 一帧 `total_length` 逼近上限时最后一个 chunk 会把 `buffer + chunk` 顶过上限 → 整块被拒
+    /// （调用方只记 warn 就 drain）→ 该帧永远凑不齐 → 流卡死。
+    #[test]
+    fn buffer_cap_leaves_room_for_one_chunk() {
+        assert!(
+            DEFAULT_MAX_BUFFER_SIZE >= MAX_MESSAGE_SIZE as usize + 64 * 1024,
+            "上限 {DEFAULT_MAX_BUFFER_SIZE} 必须 ≥ 单帧上限 {MAX_MESSAGE_SIZE} + 一个 chunk"
+        );
     }
 }

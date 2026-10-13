@@ -136,13 +136,25 @@ pub fn parse_headers(data: &[u8], header_length: usize) -> ParseResult<Headers> 
         });
     }
 
+    // 头部段之外的字节（payload）不得被读到：值是变长字段（长度前缀 + N 字节），只按
+    // `data.len()` 设界时，一个被污染的「值长度」就能把 payload 读进头部并**照常返回 Ok**。
+    // 调用点 frame.rs 传的已是切好的窗口（data.len() == header_length），但本函数是 pub
+    // API，不能靠调用方自觉。
+    let data = &data[..header_length];
+
     let mut headers = Headers::new();
     let mut offset = 0;
 
     while offset < header_length {
         // 读取头部名称长度 (1 byte)
+        //
+        // 切片后此处不可达（offset < header_length == data.len()）；保留为**错误**而非
+        // `break`：截断的头部必须报错，绝不能静默当成「解析成功，字段就这些」。
         if offset >= data.len() {
-            break;
+            return Err(ParseError::Incomplete {
+                needed: header_length,
+                available: data.len(),
+            });
         }
         let name_len = data[offset] as usize;
         offset += 1;
@@ -161,7 +173,14 @@ pub fn parse_headers(data: &[u8], header_length: usize) -> ParseResult<Headers> 
                 available: data.len() - offset,
             });
         }
-        let name = String::from_utf8_lossy(&data[offset..offset + name_len]).to_string();
+        let name = std::str::from_utf8(&data[offset..offset + name_len])
+            .map_err(|_| {
+                // 头部名必须是合法 UTF-8（协议规定）。`from_utf8_lossy` 会把非法字节换成
+                // U+FFFD 并**照常成功**：不同的坏字节序列因此塌缩成同一个名字，可能顶替
+                // `:message-type` / `:event-type` 这类路由头。畸形帧就该报错。
+                ParseError::HeaderParseFailed("头部名称不是合法 UTF-8".to_string())
+            })?
+            .to_string();
         offset += name_len;
 
         // 读取值类型 (1 byte)
@@ -176,6 +195,16 @@ pub fn parse_headers(data: &[u8], header_length: usize) -> ParseResult<Headers> 
 
         // 根据类型解析值
         let value = parse_header_value(&data[offset..], value_type, &mut offset)?;
+        // 头部名必须唯一（AWS Event Stream 规定）。重复名在 `HashMap::insert` 下是**后写
+        // 覆盖先写**，而 `:message-type` / `:event-type` / `:exception-type` / `:error-code`
+        // 正是决定本帧如何分类的路由头 —— 一条重复头就能改写分类结果（先 `event` 再
+        // `error` 即可把错误帧伪装成正常事件）。重复即畸形帧：报错，交给解码器的
+        // 「整帧跳过」恢复路径，而不是悄悄接受。
+        if headers.get(&name).is_some() {
+            return Err(ParseError::HeaderParseFailed(format!(
+                "重复的头部名称: {name}"
+            )));
+        }
         headers.insert(name, value);
     }
 
@@ -239,7 +268,14 @@ fn parse_header_value(
             ensure_bytes(data, 2)?;
             let len = u16::from_be_bytes([data[0], data[1]]) as usize;
             ensure_bytes(data, 2 + len)?;
-            let v = String::from_utf8_lossy(&data[2..2 + len]).to_string();
+            // 同头部名：字符串值也必须是合法 UTF-8。非法字节不得被 U+FFFD 静默替换 ——
+            // 那会让两个不同的字节串在下游比较时相等（`:error-code` / `:exception-type`
+            // 的分类与日志因此失真）。
+            let v = std::str::from_utf8(&data[2..2 + len])
+                .map_err(|_| {
+                    ParseError::HeaderParseFailed("头部字符串值不是合法 UTF-8".to_string())
+                })?
+                .to_string();
             local_offset = 2 + len;
             Ok(HeaderValue::String(v))
         }
@@ -312,6 +348,67 @@ mod tests {
         // 值: "ab" (长度 2)
         let data = [1u8, b'x', 7, 0, 2, b'a', b'b'];
         let headers = parse_headers(&data, data.len()).unwrap();
+        assert_eq!(headers.get_string("x"), Some("ab"));
+    }
+
+    /// 头部名必须是合法 UTF-8：非法字节不得被 lossy 替换成 U+FFFD 后照常成功
+    /// （不同的坏字节会塌缩成同一个名字，可能顶替 `:message-type` 这类路由头）。
+    #[test]
+    fn test_parse_headers_rejects_invalid_utf8_name() {
+        // name_len(2) + 非法字节 0xFF 0xFE + type(7) + len(0)
+        let data = [2u8, 0xFF, 0xFE, 7, 0, 0];
+        assert!(matches!(
+            parse_headers(&data, data.len()),
+            Err(ParseError::HeaderParseFailed(_))
+        ));
+    }
+
+    /// 字符串值同口径：非法 UTF-8 必须报错，而不是静默变成 U+FFFD。
+    #[test]
+    fn test_parse_headers_rejects_invalid_utf8_value() {
+        // name("x") + type(7) + len(1) + 非法字节 0xFF
+        let data = [1u8, b'x', 7, 0, 1, 0xFF];
+        assert!(matches!(
+            parse_headers(&data, data.len()),
+            Err(ParseError::HeaderParseFailed(_))
+        ));
+    }
+
+    /// 重复头部名必须报错：`HashMap::insert` 是后写覆盖先写，而路由头决定帧分类
+    /// （先 `event` 再 `error` 就能把错误帧伪装成正常事件）。
+    #[test]
+    fn test_parse_headers_rejects_duplicate_names() {
+        let data = [
+            1u8, b'x', 7, 0, 1, b'a', // x = "a"
+            1u8, b'x', 7, 0, 1, b'b', // x = "b"（重复）
+        ];
+        assert!(matches!(
+            parse_headers(&data, data.len()),
+            Err(ParseError::HeaderParseFailed(_))
+        ));
+    }
+
+    /// 头部段之外的字节（payload）不得被读进头部。
+    ///
+    /// 值长度是变长字段：只按 `data.len()` 设界时，一个「恰好跨到 payload 里」的长度会被
+    /// 整段读走并**照常返回 Ok**（本用例改前就会这样），等于让被污染的头部把 payload 吃掉。
+    /// 回退即 FAIL：去掉 `&data[..header_length]` 切片后，下面第一个断言会变成 Ok。
+    #[test]
+    fn test_parse_headers_does_not_read_payload_bytes() {
+        // 头部段只声明 4 字节：name_len(1)="x" + type(7=String) + value_len(2)=16。
+        // 值长度谎报 16 字节，后面紧跟的正是 payload。
+        let mut data = vec![1u8, b'x', 7, 0, 16];
+        data.extend_from_slice(b"0123456789ABCDEF"); // 16 字节 payload
+        let err = parse_headers(&data, 4).unwrap_err();
+        assert!(
+            matches!(err, ParseError::Incomplete { .. }),
+            "越界读 payload 必须报 Incomplete: {err:?}"
+        );
+
+        // 反过来：窗口切对了，尾部 payload 再长也不影响解析。
+        let mut ok = vec![1u8, b'x', 7, 0, 2, b'a', b'b'];
+        ok.extend_from_slice(b"PAYLOAD");
+        let headers = parse_headers(&ok, 7).unwrap();
         assert_eq!(headers.get_string("x"), Some("ab"));
     }
 }

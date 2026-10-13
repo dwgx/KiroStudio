@@ -10,7 +10,7 @@
 pub const MAX_SOCKS_NODES: usize = 64;
 
 /// 一个可复用的 SOCKS/HTTP 代理节点。
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SocksNode {
     /// 节点 id（自增，持久化后保持稳定；删除**不复用**——复用会让已绑该 id 的
@@ -62,6 +62,32 @@ fn default_true() -> bool {
     true
 }
 
+/// 手写脱敏 Debug：`password`（代理密码）与 `url` 里可能残留的 userinfo 都不进 `{:?}`。
+///
+/// 为什么不能派生：本类型既落盘（`Serialize` 必须保留 `password`，**绝不能**
+/// `skip_serializing`，否则下一次保存就把密码抹掉）又会被诊断路径碰到 —— 派生 Debug 会让
+/// 任何一条 `{:?}`（日志 / 错误链 / panic 消息）把代理密码原文写出去。与 `credentials.rs`
+/// 的 `KiroCredentials` 同款约定：在类型层面脱敏，杜绝调用点意外泄密。
+impl std::fmt::Debug for SocksNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SocksNode")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            // 剥 userinfo 再打：`normalize` 已保证入表 URL 干净，这里是第二道保险
+            // （直接 `from_str` 构造出的节点不经过 normalize）。
+            .field(
+                "url",
+                &crate::http_client::split_proxy_credentials(&self.url).0,
+            )
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<set>"))
+            .field("enabled", &self.enabled)
+            .field("last_test", &self.last_test)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
+}
+
 /// 节点表的**落盘形态**：节点数组 + 已发放 id 的高水位。
 ///
 /// # 为什么不能只存数组
@@ -96,11 +122,19 @@ pub enum SocksNodeFileCompat {
 
 impl SocksNodeFileCompat {
     /// 归一化成 `(nodes, next_id)`。`next_id` 至少是 `max(id) + 1`。
+    ///
+    /// 顺带把每个节点的 `url` 里可能内嵌的账密拆到 `username`/`password`（见
+    /// [`SocksNode::normalized_url`]）—— 这是**加载边界**，也是唯一能覆盖「手改文件 /
+    /// 旧版本数据」的时机。
     pub fn normalize(self) -> (Vec<SocksNode>, u64) {
         let (nodes, stored_next) = match self {
             Self::Structured(f) => (f.nodes, f.next_id),
             Self::BareArray(v) => (v, 0),
         };
+        let nodes: Vec<SocksNode> = nodes
+            .into_iter()
+            .map(SocksNode::normalized_url)
+            .collect();
         let floor = nodes.iter().map(|n| n.id).max().unwrap_or(0) + 1;
         let next = stored_next.max(floor);
         (nodes, next)
@@ -115,6 +149,33 @@ impl SocksNode {
         } else {
             &self.name
         }
+    }
+
+    /// 把 `url` 里可能内嵌的账密拆到 `username` / `password`，返回规范化后的节点。
+    ///
+    /// 为什么必须在**加载边界**做：`url` 字段的契约是「内嵌账密在入表时已被拆到下面两字段
+    /// （避免密码明文留在 URL 里）」，面板视图（`admin::types::SocksNodeView`）据此把 `url`
+    /// 原样外传、同时只给 `has_password` —— 若磁盘上残留 `socks5://user:pass@host:port`
+    /// （手改文件 / 旧版本数据），密码就会从 `url` 字段漏到面板，`has_password` 的脱敏
+    /// 形同虚设。
+    ///
+    /// 优先级与写入路径（`set_credential_proxy` / `upsert_socks_node`）**逐字一致**：
+    /// 显式字段优先，缺失（或空白）的一侧才用 URL 内嵌值补。
+    fn normalized_url(mut self) -> Self {
+        let (clean, inline_user, inline_pass) =
+            crate::http_client::split_proxy_credentials(&self.url);
+        if clean == self.url {
+            // 绝大多数节点：URL 本就没有 userinfo，零改动（含 `direct` / 空串）。
+            return self;
+        }
+        self.url = clean;
+        if self.username.as_deref().unwrap_or("").is_empty() {
+            self.username = inline_user;
+        }
+        if self.password.as_deref().unwrap_or("").is_empty() {
+            self.password = inline_pass;
+        }
+        self
     }
 }
 
@@ -183,5 +244,44 @@ mod tests {
         assert!(s.contains("\"exitIp\""));
         assert!(s.contains("\"testedAt\""));
         assert!(s.contains("\"createdAt\""));
+    }
+
+    /// 加载边界必须把 URL 里的账密拆出来：`url` 字段的契约是「内嵌账密已被拆到
+    /// username/password」，而面板视图（`SocksNodeView`）原样外传 `url`、只给
+    /// `has_password` —— 不拆就等于把代理密码从 `url` 漏到面板。
+    ///
+    /// 回退即 FAIL：去掉 `normalize` 里的 `normalized_url`，`nodes[0].url` 会带着明文账密。
+    #[test]
+    fn normalize_splits_inline_credentials_out_of_url() {
+        let raw = r#"{"nodes":[
+            {"id":1,"url":"socks5://inlineuser:inlinepass@h:1080"},
+            {"id":2,"url":"socks5://inlineuser:inlinepass@h:1080","username":"explicit","password":"explicitpass"}
+        ],"nextId":9}"#;
+        let file: SocksNodeFile = serde_json::from_str(raw).expect("解析应成功");
+        let (nodes, next) = SocksNodeFileCompat::Structured(file).normalize();
+        assert_eq!(next, 9, "高水位不受影响");
+        assert_eq!(nodes[0].url, "socks5://h:1080", "userinfo 必须从 url 拆走");
+        assert_eq!(nodes[0].username.as_deref(), Some("inlineuser"));
+        assert_eq!(nodes[0].password.as_deref(), Some("inlinepass"));
+        // 显式字段优先：URL 内嵌值不得覆盖已有账密（与写入路径同口径）。
+        assert_eq!(nodes[1].url, "socks5://h:1080");
+        assert_eq!(nodes[1].username.as_deref(), Some("explicit"));
+        assert_eq!(nodes[1].password.as_deref(), Some("explicitpass"));
+    }
+
+    /// Debug 不得泄露代理密码（`url` 里残留的 userinfo 同样不得输出）。
+    ///
+    /// 回退即 FAIL：把 `impl Debug` 换回 `#[derive(Debug)]`，两个断言立刻变红。
+    #[test]
+    fn debug_masks_password_and_url_userinfo() {
+        let n: SocksNode = serde_json::from_str(
+            r#"{"id":3,"url":"socks5://u:SECRETPASS@h:1080","password":"SECRETPASS2"}"#,
+        )
+        .unwrap();
+        let dbg = format!("{n:?}");
+        assert!(!dbg.contains("SECRETPASS"), "url 内嵌账密不得进 Debug: {dbg}");
+        assert!(!dbg.contains("SECRETPASS2"), "password 不得进 Debug: {dbg}");
+        assert!(dbg.contains("socks5://h:1080"), "干净 URL 仍应可见: {dbg}");
+        assert!(dbg.contains("id: 3"), "id 仍应可见: {dbg}");
     }
 }

@@ -10,6 +10,20 @@ use serde::Deserialize;
 /// 避免把"已开超额"的号仍按 base 耗尽显示。
 pub const DEFAULT_OVERAGE_CAP: f64 = 10_000.0;
 
+/// 精度字段缺失时回退整数兄弟字段。
+///
+/// `usageLimit` / `currentUsage` 与 `*WithPrecision` 都是 `#[serde(default)]`：上游若只给
+/// 整数（`usageLimit` / `currentUsage`），精度字段会静默反序列化成 `0.0`，直接相加就把真实
+/// 额度报成 0（面板显示 0 限额、`balance_factor` 跟着失真）。故只在「精度值为 0 且整数非 0」
+/// 时回退 —— 真值本来就是 0 的情形（两边都是 0）不受影响。
+fn precise_or_int(precise: f64, int_value: i64) -> f64 {
+    if precise == 0.0 && int_value != 0 {
+        int_value as f64
+    } else {
+        precise
+    }
+}
+
 /// 使用额度查询响应
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -148,6 +162,11 @@ pub struct FreeTrialInfo {
     pub current_usage_with_precision: f64,
 
     /// 免费试用过期时间 (Unix 时间戳)
+    ///
+    /// ⚠️ 当前**只反序列化、不参与判定**（`is_active()` 只看状态字符串）。刻意如此：上游是否
+    /// 会在试用到期后仍返回 `ACTIVE` 没有实证，而这个字段出现 `0`/异常值时按时间判定会**反向**
+    /// 丢掉有效的试用额度（比多算更糟，2026-10-14 审计条目）。要改成时间感知，先抓一份
+    /// 「状态仍为 ACTIVE 但已过 freeTrialExpiry」的真实响应，再定「过期即不计」的规则。
     #[serde(default)]
     pub free_trial_expiry: Option<f64>,
 
@@ -167,11 +186,16 @@ pub struct FreeTrialInfo {
 // ============ 便捷方法实现 ============
 
 impl FreeTrialInfo {
-    /// 检查免费试用是否处于激活状态
+    /// 检查免费试用是否处于激活状态（**大小写不敏感**）。
+    ///
+    /// 与 [`Bonus::is_active`] 同口径：上游的状态字符串大小写不定（`ACTIVE` / `Active` /
+    /// `active`），严格 `==` 会把 `"Active"` 判成未激活 → free trial 的额度与用量**都不计入**
+    /// → 面板额度偏低。bonus 那处已因同款 bug 修过一次（见 `Bonus::is_active` 的注释），
+    /// 这里漏改过，属同一类。
     pub fn is_active(&self) -> bool {
         self.free_trial_status
             .as_deref()
-            .map(|s| s == "ACTIVE")
+            .map(|s| s.eq_ignore_ascii_case("ACTIVE"))
             .unwrap_or(false)
     }
 }
@@ -185,24 +209,36 @@ impl UsageLimitsResponse {
     }
 
     /// 获取第一个使用量明细
+    ///
+    /// ⚠️ **已知假设**：上游 `usageBreakdownList` 目前只返回一项（该账号的唯一计费资源），
+    /// 故 `usage_limit()` / `current_usage()` / overage cap 都只看这一项，多出来的明细被
+    /// 丢弃。若将来出现多项（不同资源类型各带独立配额），这里的取舍需要先定规则再改：
+    /// 「求和」与「按类型过滤」会给出完全不同的额度，而这两个数字直接进面板余额与
+    /// `balance_factor` 选号权重，猜错会把额度放大（比丢弃更糟）。
+    /// 验证方法：抓一次多明细的 `getUsageLimits` 响应（config `upstreamTracePath` 落盘的
+    /// 上游报文），确认各项是「同一配额的不同维度」还是「各自独立的配额」。
     fn primary_breakdown(&self) -> Option<&UsageBreakdown> {
         self.usage_breakdown_list.first()
     }
 
-    /// 获取总使用限额（精确值）
+    /// 获取总使用限额
     ///
-    /// 累加基础额度、激活的免费试用额度和激活的奖励额度
+    /// 累加基础额度、激活的免费试用额度和激活的奖励额度。取 `*WithPrecision`（缺失时回退
+    /// 整数字段，见 `precise_or_int`）。
     pub fn usage_limit(&self) -> f64 {
         let Some(breakdown) = self.primary_breakdown() else {
             return 0.0;
         };
 
-        let mut total = breakdown.usage_limit_with_precision;
+        let mut total = precise_or_int(
+            breakdown.usage_limit_with_precision,
+            breakdown.usage_limit,
+        );
 
         // 累加激活的 free trial 额度
         if let Some(trial) = &breakdown.free_trial_info {
             if trial.is_active() {
-                total += trial.usage_limit_with_precision;
+                total += precise_or_int(trial.usage_limit_with_precision, trial.usage_limit);
             }
         }
 
@@ -216,20 +252,27 @@ impl UsageLimitsResponse {
         total
     }
 
-    /// 获取总当前使用量（精确值）
+    /// 获取总当前使用量
     ///
-    /// 累加基础使用量、激活的免费试用使用量和激活的奖励使用量
+    /// 累加基础使用量、激活的免费试用使用量和激活的奖励使用量。同 [`Self::usage_limit`]：
+    /// 取 `*WithPrecision`，缺失时回退整数字段。
     pub fn current_usage(&self) -> f64 {
         let Some(breakdown) = self.primary_breakdown() else {
             return 0.0;
         };
 
-        let mut total = breakdown.current_usage_with_precision;
+        let mut total = precise_or_int(
+            breakdown.current_usage_with_precision,
+            breakdown.current_usage,
+        );
 
         // 累加激活的 free trial 使用量
         if let Some(trial) = &breakdown.free_trial_info {
             if trial.is_active() {
-                total += trial.current_usage_with_precision;
+                total += precise_or_int(
+                    trial.current_usage_with_precision,
+                    trial.current_usage,
+                );
             }
         }
 
@@ -345,6 +388,44 @@ mod tests {
         assert_eq!(resp.effective_remaining_for(true), 5000.0);
     }
 
+    /// 🔴 上游只给整数（缺 `*WithPrecision`）时不得把额度报成 0。
+    ///
+    /// 回退即 FAIL：去掉 `precise_or_int`，两个断言立刻变 0.0（面板 0 限额 +
+    /// `balance_factor` 失真）。free trial 的整数对同样要回退。
+    #[test]
+    fn integer_only_payload_falls_back_from_precision_fields() {
+        let raw = r#"{
+            "usageBreakdownList": [{
+                "currentUsage": 100,
+                "usageLimit": 10000,
+                "freeTrialInfo": {
+                    "freeTrialStatus": "ACTIVE",
+                    "currentUsage": 20,
+                    "usageLimit": 500
+                }
+            }]
+        }"#;
+        let resp: UsageLimitsResponse = serde_json::from_str(raw).expect("解析应成功");
+        assert_eq!(
+            resp.usage_limit(),
+            10500.0,
+            "base 10000 + trial 500（都只有整数字段）"
+        );
+        assert_eq!(resp.current_usage(), 120.0, "base 100 + trial 20");
+
+        // 真值本来就是 0（两边都是 0）不得被改写；精度字段有值时以精度为准。
+        let zero: UsageLimitsResponse = serde_json::from_str(
+            r#"{"usageBreakdownList":[{"currentUsage":0,"usageLimit":0}]}"#,
+        )
+        .unwrap();
+        assert_eq!(zero.usage_limit(), 0.0);
+        let precise: UsageLimitsResponse = serde_json::from_str(
+            r#"{"usageBreakdownList":[{"usageLimit":10000,"usageLimitWithPrecision":9999.5}]}"#,
+        )
+        .unwrap();
+        assert_eq!(precise.usage_limit(), 9999.5);
+    }
+
     /// 🔴 `"bonuses": null` 必须能解析（改前 `Vec<Bonus>` 遇显式 null 直接反序列化失败，
     /// 整条余额查询挂掉 → 面板显示 0/回退）。用真实 JSON 走 serde 而不是手构结构体，
     /// 否则测不到反序列化这一层。
@@ -400,6 +481,64 @@ mod tests {
         }"#;
         let resp: UsageLimitsResponse = serde_json::from_str(raw).expect("解析应成功");
         assert_eq!(resp.usage_limit(), 10000.0, "EXPIRED bonus 不得计入");
+    }
+
+    /// 🔴 free trial 的状态大小写同样不定：`"Active"` / `"active"` 必须计入额度与用量。
+    ///
+    /// 回退即 FAIL：改回严格 `== "ACTIVE"` 后，`Active` / `active` 两轮会少算 trial 的
+    /// 500 额度与 20 用量（面板额度偏低，与修过的 bonus 同款）。
+    #[test]
+    fn free_trial_status_case_insensitive_counts_toward_limit() {
+        for status in ["ACTIVE", "Active", "active"] {
+            let raw = format!(
+                r#"{{
+                    "usageBreakdownList": [{{
+                        "currentUsage": 100,
+                        "currentUsageWithPrecision": 100.0,
+                        "usageLimit": 10000,
+                        "usageLimitWithPrecision": 10000.0,
+                        "freeTrialInfo": {{
+                            "currentUsage": 20,
+                            "currentUsageWithPrecision": 20.0,
+                            "usageLimit": 500,
+                            "usageLimitWithPrecision": 500.0,
+                            "freeTrialStatus": "{status}"
+                        }}
+                    }}]
+                }}"#
+            );
+            let resp: UsageLimitsResponse = serde_json::from_str(&raw).expect("解析应成功");
+            assert_eq!(
+                resp.usage_limit(),
+                10500.0,
+                "status={status} 时 free trial 额度应计入（base 10000 + trial 500）"
+            );
+            assert_eq!(
+                resp.current_usage(),
+                120.0,
+                "status={status} 时 free trial 用量应计入（base 100 + trial 20）"
+            );
+        }
+
+        // 对照组：非 ACTIVE 的 trial 不计入。
+        let raw = r#"{
+            "usageBreakdownList": [{
+                "currentUsage": 100,
+                "currentUsageWithPrecision": 100.0,
+                "usageLimit": 10000,
+                "usageLimitWithPrecision": 10000.0,
+                "freeTrialInfo": {
+                    "currentUsage": 20,
+                    "currentUsageWithPrecision": 20.0,
+                    "usageLimit": 500,
+                    "usageLimitWithPrecision": 500.0,
+                    "freeTrialStatus": "EXPIRED"
+                }
+            }]
+        }"#;
+        let resp: UsageLimitsResponse = serde_json::from_str(raw).expect("解析应成功");
+        assert_eq!(resp.usage_limit(), 10000.0, "EXPIRED trial 不得计入");
+        assert_eq!(resp.current_usage(), 100.0);
     }
 
     /// 🔴 上游只给字符串 `overageStatus=ENABLED`（不给布尔 overageEnabled）时也要
