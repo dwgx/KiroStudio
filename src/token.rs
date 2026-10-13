@@ -6,6 +6,8 @@
 //! - 非西文字符：每个计 4.5 个字符单位（与 fuckopencode 4.5 口径对齐）
 //! - 西文字符：每个计 1 个字符单位
 //! - 4 个字符单位 = 1 token（四舍五入）
+//! - 短文本再乘分段系数（<100→1.5 / <200→1.3 / <300→1.25 / <800→1.2 / 其余 1.0，
+//!   随基线项目继承而来，见 [`count_tokens`] 的说明）
 
 use crate::anthropic::types::{
     CountTokensRequest, CountTokensResponse, Message, SystemMessage, Tool,
@@ -113,6 +115,13 @@ fn is_non_western_char(c: char) -> bool {
 /// - 非西文字符：每个计 4.5 个字符单位（与 fuckopencode 对齐）
 /// - 西文字符：每个计 1 个字符单位
 /// - 4 个字符单位 = 1 token（四舍五入）
+/// - 短文本再乘分段系数（1.5 / 1.3 / 1.25 / 1.2 / 1.0，见下）
+///
+/// ⚠️ 分段系数（随基线项目继承而来，本仓未重新校准）使本估算**非单调**：跨档时更长的
+/// 文本反而报得更少 —— 399 个 ASCII 字符 = 99.75 → ×1.5 = 150 token，而 400 个字符
+/// = 100 → ×1.3 = 130 token。这不是笔误，但也不是能随手删的东西：本函数同时喂落库用量
+/// 与客户端可见的 cache 前缀估算（[`count_prefix_tokens`]），改系数是一次**全局口径变更**
+/// （历史统计会断层），要改先单独评估，别只按「单调性」单点修。
 /// ```
 pub fn count_tokens(text: &str) -> u64 {
     // println!("text: {}", text);
@@ -423,9 +432,7 @@ fn count_all_tokens_local_unfloored(
             total += count_tokens(s.as_str());
         } else if let serde_json::Value::Array(arr) = &msg.content {
             for item in arr {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    total += count_tokens(text);
-                }
+                total += count_content_block_tokens(item);
             }
         }
     }
@@ -440,6 +447,50 @@ fn count_all_tokens_local_unfloored(
         }
     }
 
+    total
+}
+
+/// 单个 content 块 → token 估算。
+///
+/// 为什么不能只数 `text`：`tool_use.input`（apply_patch 的 patch、大 JSON 参数）与
+/// `tool_result.content`（文件读取 / 命令输出，agentic 会话里常是整轮最大的一块）都是
+/// **真实发给上游的正文**（converter 把 tool_result 放进 `UserInputMessageContext.tool_results`、
+/// tool_use 放进历史工具调用），只数 text 会让输入与缓存前缀估算系统性少算，历史越长偏得越远
+/// —— [`count_prefix_tokens`] 走的也是本函数。`thinking` 同理：converter 把历史里的
+/// thinking 包进 `<thinking>` 文本转发给上游。
+///
+/// 图片 / 文档块刻意**不数**：其 token 由像素尺寸决定，按 base64 字符数会高估几个数量级，
+/// 宁可少算也不制造一个数量级错误。
+fn count_content_block_tokens(item: &serde_json::Value) -> u64 {
+    let mut total = 0;
+    if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+        total += count_tokens(text);
+    }
+    match item.get("type").and_then(|v| v.as_str()) {
+        Some("thinking") => {
+            if let Some(t) = item.get("thinking").and_then(|v| v.as_str()) {
+                total += count_tokens(t);
+            }
+        }
+        Some("tool_use") => {
+            if let Some(input) = item.get("input") {
+                total += count_tokens(&serde_json::to_string(input).unwrap_or_default());
+            }
+        }
+        Some("tool_result") => match item.get("content") {
+            // 字符串形态与数组形态都出现过（Anthropic 两者都收）。
+            Some(serde_json::Value::String(s)) => total += count_tokens(s),
+            Some(serde_json::Value::Array(blocks)) => {
+                for b in blocks {
+                    if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
+                        total += count_tokens(t);
+                    }
+                }
+            }
+            _ => {}
+        },
+        _ => {}
+    }
     total
 }
 
@@ -958,6 +1009,77 @@ pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 回归：本地输入估算必须数 `tool_use.input` / `tool_result.content` / `thinking`。
+    ///
+    /// 旧实现只取块里的 `text` 字段 ⇒ agentic 载荷（历史里全是工具调用与文件读取，
+    /// 单块动辄几千字符）的输入与 cache 前缀估算**系统性少算**，历史越长偏得越远
+    /// （`count_prefix_tokens` 走同一个函数）。
+    #[test]
+    fn local_estimate_counts_tool_and_thinking_blocks() {
+        let mk = |role: &str, content: serde_json::Value| Message {
+            role: role.to_string(),
+            content,
+        };
+        let base = count_all_tokens_local(
+            None,
+            &[mk("user", serde_json::json!([{"type": "text", "text": "hi"}]))],
+            None,
+        );
+        let cases: [(&str, Message); 3] = [
+            (
+                "tool_result.content",
+                mk(
+                    "user",
+                    serde_json::json!([{
+                        "type": "tool_result", "tool_use_id": "toolu_1",
+                        "content": "x".repeat(4000)
+                    }]),
+                ),
+            ),
+            (
+                "tool_use.input",
+                mk(
+                    "assistant",
+                    serde_json::json!([{
+                        "type": "tool_use", "id": "toolu_1", "name": "apply_patch",
+                        "input": {"patch": "y".repeat(4000)}
+                    }]),
+                ),
+            ),
+            (
+                "thinking",
+                mk(
+                    "assistant",
+                    serde_json::json!([{
+                        "type": "thinking", "thinking": "z".repeat(4000), "signature": "sig"
+                    }]),
+                ),
+            ),
+        ];
+        for (name, msg) in cases {
+            let got = count_all_tokens_local(None, &[msg], None);
+            assert!(
+                got > base + 500,
+                "{name} 必须计入本地估算（base={base}, got={got}）"
+            );
+        }
+
+        // 图片块按像素口径，不按 base64 字符数：宁可少算，也不能把 base64 当正文
+        // （那会高估几个数量级）。只有 `.max(1)` 的下限在。
+        let image = mk(
+            "user",
+            serde_json::json!([{
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": "A".repeat(4000)}
+            }]),
+        );
+        assert_eq!(
+            count_all_tokens_local(None, &[image], None),
+            1,
+            "图片块不得按 base64 字符数计入"
+        );
+    }
 
     #[test]
     fn estimate_output_tokens_counts_thinking_blocks() {

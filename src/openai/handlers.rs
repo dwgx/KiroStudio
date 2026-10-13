@@ -17,7 +17,6 @@ use std::net::SocketAddr;
 use crate::anthropic::middleware::AppState;
 use crate::anthropic::model_catalog;
 use crate::openai::convert;
-use crate::openai::types::ChatCompletionsPeek;
 use uuid::Uuid;
 
 /// 读取上游响应体的硬上限(纵深防护):正常响应远小于此(受 max_tokens + 256MiB body 限约束),
@@ -42,27 +41,35 @@ pub async fn post_chat_completions(
             );
         }
     };
-    let peek: ChatCompletionsPeek = match serde_json::from_value(raw.clone()) {
-        Ok(p) => p,
-        Err(e) => {
+    // 直读 model/stream（与 post_responses 同款），不再 `from_value(raw.clone())`：
+    // 为取两个字段深拷贝整份请求体，会让带 base64 图片 / 大工具声明的载荷在翻译前翻一倍。
+    //
+    // 顺带修掉「可选字段宽松处理」名不副实的一处：`"stream": null`（JS/Java 客户端把
+    // 可选字段序列化成 null 很常见）在 `bool` 反序列化下必 400，而 `/v1/responses`
+    // 一直按 false 处理 —— 两条入口对同一输入给出相反结果，这里统一成宽松读法。
+    // `model` 仍必填（OpenAI 契约如此），缺失/非字符串照旧 400。
+    let model = match raw.get("model").and_then(|v| v.as_str()) {
+        Some(m) => m.to_string(),
+        None => {
             return openai_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                &format!("缺少必填字段: {e}"),
+                "缺少必填字段 model",
             );
         }
     };
+    let stream = raw.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
     // model 经 catalog 归一(GPT-5.6 三变体已在表);未识别则原样透传给上游(由上游决定认不认)。
-    let resolved_model = model_catalog::resolve_kiro_id(&peek.model)
+    let resolved_model = model_catalog::resolve_kiro_id(&model)
         .map(|s| s.to_string())
-        .unwrap_or_else(|| peek.model.clone());
+        .unwrap_or_else(|| model.clone());
     // 出站给客户端的 model 名回显客户端请求的原名(OpenAI 惯例)。
-    let echo_model = peek.model.clone();
+    let echo_model = model.clone();
 
     // 翻译成 Anthropic 请求体。会话 UUID 写入 metadata.user_id（converter 已认
     // `session_<uuid>`），未命中则不下发，conversationId 走现有派生/随机。
-    let mut anthropic_req = convert::openai_chat_to_anthropic(&resolved_model, &raw, peek.stream);
+    let mut anthropic_req = convert::openai_chat_to_anthropic(&resolved_model, &raw, stream);
     apply_session_metadata(&mut anthropic_req, &raw, &headers);
     let anthropic_bytes = match serde_json::to_vec(&anthropic_req) {
         Ok(b) => Bytes::from(b),
@@ -76,9 +83,9 @@ pub async fn post_chat_completions(
     };
 
     tracing::info!(
-        model = %peek.model,
+        model = %model,
         resolved = %resolved_model,
-        stream = %peek.stream,
+        stream = %stream,
         "Received POST /v1/chat/completions request"
     );
 
@@ -97,7 +104,7 @@ pub async fn post_chat_completions(
         return translate_error_response(anthropic_resp).await;
     }
 
-    if peek.stream {
+    if stream {
         let include_usage = convert::stream_include_usage(&raw);
         stream_openai_from_anthropic(anthropic_resp, echo_model, include_usage).await
     } else {
@@ -269,6 +276,9 @@ async fn nonstream_responses_from_anthropic(
     };
     let text = String::from_utf8_lossy(&bytes);
     let events = parse_sse_or_message(&text);
+    if let Some((typ, msg)) = find_inband_error(&events) {
+        return openai_error(StatusCode::BAD_GATEWAY, &typ, &msg);
+    }
     let response = convert::aggregate_responses_with_tools(&model, &events, &tool_index);
     (StatusCode::OK, Json(response)).into_response()
 }
@@ -335,6 +345,9 @@ async fn nonstream_openai_from_anthropic(resp: Response, model: String) -> Respo
     // 先尝试当 SSE 行解析事件;若整体是一个 JSON 对象(message),转成单事件序列。
     let text = String::from_utf8_lossy(&bytes);
     let events = parse_sse_or_message(&text);
+    if let Some((typ, msg)) = find_inband_error(&events) {
+        return openai_error(StatusCode::BAD_GATEWAY, &typ, &msg);
+    }
     let completion = convert::aggregate_chat_completion(&model, &events);
     (StatusCode::OK, Json(completion)).into_response()
 }
@@ -392,6 +405,11 @@ fn synthesize_events_from_message(msg: &Value) -> Vec<Value> {
                     events.push(json!({"type": "content_block_delta", "index": idx, "delta": {"type": "input_json_delta", "partial_json": input.to_string()}}));
                     events.push(json!({"type": "content_block_stop", "index": idx}));
                 }
+                // 其余块（image / document / redacted_thinking）**刻意丢弃**：OpenAI
+                // chat.completions 的 assistant 消息没有承载它们的字段（image/document 只
+                // 出现在**入站**的用户消息里，Anthropic 的 assistant 回复本身也不产它们；
+                // redacted_thinking 是不透明元数据，没有可映射的语义）。丢掉的是无法表达的
+                // 块，text / thinking / tool_use 都在上面逐类处理，不会把有内容的回复变空。
                 _ => {}
             }
         }
@@ -406,6 +424,42 @@ fn synthesize_events_from_message(msg: &Value) -> Vec<Value> {
     }
     events.push(delta);
     events
+}
+
+/// 从聚合事件里找出 in-band 错误，返回 `(错误类型, 文案)`。
+///
+/// 为什么非流式必须判它：`aggregate_chat_completion` / `aggregate_responses_with_tools`
+/// 只认 message_start / content_block_* / message_delta，`type:"error"` 事件落进 `_ => {}`
+/// 被静默跳过 ⇒ 客户端拿到 **200 + 空 content + finish_reason:stop** 的「成功空回复」，
+/// 把上游故障当成模型什么都没说。流式路径对同一事件会吐 `{"error":...}` 并抑制 `[DONE]`
+/// （`ChatStreamConverter::push_event` 的 `"error"` 分支 + `error_seen`）—— 两条协议路径
+/// 对同一输入必须同判，这正是本仓反复收口的缺陷形态。
+///
+/// 内层非流式管线遇到 in-band 错误本就会回非 2xx（`emit_nonstream_completion_failure`），
+/// 所以这条是**纵深防护**：透传池/异常中转站仍可能给 200 + 错误体（整体是错误 JSON 时，
+/// `synthesize_events_from_message` 会把它包进 `message_start.message`，故两处都要看）。
+fn find_inband_error(events: &[Value]) -> Option<(String, String)> {
+    for ev in events {
+        let ev_type = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let nested = ev.get("message").filter(|m| {
+            m.get("type").and_then(|v| v.as_str()) == Some("error")
+        });
+        if ev_type != "error" && nested.is_none() {
+            continue;
+        }
+        let e = ev.get("error").or_else(|| nested.and_then(|m| m.get("error")));
+        let msg = e
+            .and_then(|e| e.get("message"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("上游返回 in-band 错误");
+        // 类型原样透出（与流式路径同口径：那边也是把上游 type 塞进 error.type）。
+        let typ = e
+            .and_then(|e| e.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("api_error");
+        return Some((typ.to_string(), msg.to_string()));
+    }
+    None
 }
 
 /// 把 Anthropic 错误响应翻成 OpenAI 错误结构。
@@ -431,16 +485,35 @@ async fn translate_error_response(resp: Response) -> Response {
         .unwrap_or_default();
     let text = String::from_utf8_lossy(&bytes);
     // Anthropic 错误体形如 {"type":"error","error":{"type":..,"message":..}} 或 {"error":{...}}。
+    // ⚠️ 两条分支都必须**截断**再回显：这里读到的是整个响应体（上限 MAX_RESP_BYTES = 64MiB），
+    // 原样塞进 `error.message` 等于把它再复制一份（JSON 转义还会放大），并把上游的
+    // HTML/代理错误页原文泄漏给客户端 —— 客户端只要让上游吐一个超大错误体就能逼本网关
+    // 回一个超大响应。诊断只需要开头几 KiB，故统一走 `truncate_error_message`。
     let (msg, typ) = serde_json::from_str::<Value>(text.trim())
         .ok()
         .and_then(|v| {
             let e = v.get("error").cloned().unwrap_or(v);
-            let m = e.get("message").and_then(|x| x.as_str()).map(String::from);
+            let m = e
+                .get("message")
+                .and_then(|x| x.as_str())
+                .map(truncate_error_message);
             let t = e.get("type").and_then(|x| x.as_str()).map(String::from);
             m.map(|m| (m, t.unwrap_or_else(|| "api_error".into())))
         })
-        .unwrap_or_else(|| (text.trim().to_string(), "api_error".to_string()));
+        .unwrap_or_else(|| (truncate_error_message(text.trim()), "api_error".to_string()));
     openai_error_with_retry_after(status, &typ, &msg, retry_after.as_deref())
+}
+
+/// 回显给客户端的错误文案上限（字符）：够看清状态码行与错误对象，不足以放大响应体。
+const ERROR_MESSAGE_MAX_CHARS: usize = 2048;
+
+/// 把上游错误原文截断成可安全回显的诊断串（截断时留一个显式标记，别让客户端以为原文就这么短）。
+fn truncate_error_message(text: &str) -> String {
+    match text.char_indices().nth(ERROR_MESSAGE_MAX_CHARS) {
+        // `nth` 只走到第 N 个字符，不会为超大 body 付整段扫描。
+        Some((idx, _)) => format!("{}…(截断)", &text[..idx]),
+        None => text.to_string(),
+    }
 }
 
 /// 构造 OpenAI 错误响应。
@@ -526,6 +599,13 @@ fn async_stream_from_body(
             // 避免把整段响应堆进内存(与非流式 MAX_RESP_BYTES 同口径)。
             if buf.len() > MAX_RESP_BYTES {
                 tracing::warn!("OpenAI 流式:未切帧缓冲超上限 {} 字节,终止", MAX_RESP_BYTES);
+                // ⚠️ 必须把缓冲区**丢掉**再 break:下面的 tail flush 会把 buf 整段
+                // `from_utf8_lossy` 解码、再逐行喂 on_line(chat 路径每行一次
+                // `serde_json::from_str`)。只 break 不清 buf,等于上限只挡住了「继续堆」,
+                // 却仍要为这 64MiB+ 付一次解码 + 解析 —— 正是本上限要防的 CPU/内存爆点。
+                // 丢弃是安全的:这条尾巴按定义没有完整事件分隔符,且随后必发失败终结帧,
+                // 客户端不会把它当成功收尾。
+                buf.clear();
                 stream_errored = true;
                 break;
             }
@@ -649,6 +729,52 @@ mod tests {
             out.headers().get(header::RETRY_AFTER).is_none(),
             "内层未给 Retry-After 时绝不能自造（会把永久态伪装成可重试）"
         );
+    }
+
+    /// 🔴 回归：非流式路径不得把 in-band 错误聚合出一个「成功的空回复」。
+    ///
+    /// **旧代码为何 FAIL**：两个 aggregate 只认 message_start / content_block_* /
+    /// message_delta，`type:"error"` 事件被静默跳过 ⇒ HTTP 200 + 空 content +
+    /// `finish_reason:"stop"`，客户端把上游故障当成模型「什么都没说」；而流式路径
+    /// 对同一事件会吐 `{"error":...}` 且不发 `[DONE]`。两条协议路径必须同判。
+    #[tokio::test]
+    async fn nonstream_inband_error_must_not_become_blank_success() {
+        let ok = |body: &str| {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        // ① SSE 形态（HTTP 200 + event: error）。
+        let sse = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+        let out = nonstream_openai_from_anthropic(ok(sse), "m".into()).await;
+        assert_eq!(
+            out.status(),
+            StatusCode::BAD_GATEWAY,
+            "in-band 错误绝不能回 200 空回复"
+        );
+
+        // ② 整体是错误对象（非 SSE）—— 会被合成进 `message_start.message`，同样要判出来。
+        let body = r#"{"type":"error","error":{"type":"api_error","message":"boom"}}"#;
+        let out = nonstream_responses_from_anthropic(
+            ok(body),
+            "m".into(),
+            convert::ResponsesToolIndex::default(),
+        )
+        .await;
+        assert_eq!(out.status(), StatusCode::BAD_GATEWAY);
+
+        // ③ 对照组：正常响应仍必须是 200（别把成功路径也判成错误）。
+        let normal = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+        );
+        let out = nonstream_openai_from_anthropic(ok(normal), "m".into()).await;
+        assert_eq!(out.status(), StatusCode::OK, "正常响应必须仍走 200");
     }
 
     /// 本地构造的错误（请求体解析失败等）不带 `Retry-After`。
