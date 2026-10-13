@@ -67,7 +67,9 @@ export function useLiveStream(enabled = true): LiveStreamState {
     // 泄漏会成倍放大后端负载。generation 让"过期的那轮"在恢复执行时直接自尽。
     let activeCtrl: AbortController | null = null
     let generation = 0
-    let retryTimer: ReturnType<typeof setTimeout> | null = null
+    // 计时器句柄用 `| undefined`（不是 `| null`）：这样收尾处的 `clearTimeout(句柄)`
+    // 不需要 `if (句柄)` 包一层 —— 类型上就允许 undefined，运行期按规范也是空操作。
+    let retryTimer: ReturnType<typeof setTimeout> | undefined
     // 连续失败次数，用于指数退避；收到第一帧真数据即归零（说明链路真的通了）。
     let attempt = 0
 
@@ -80,8 +82,8 @@ export function useLiveStream(enabled = true): LiveStreamState {
       const ctrl = new AbortController()
       activeCtrl = ctrl
       // 空闲检测定时器（半开死连接）：收到帧重置，超时 abort 走重连。声明在 try 外，
-      // 供 catch/收尾访问。
-      let idleTimer: ReturnType<typeof setTimeout> | null = null
+      // 供 catch/收尾访问。`| undefined` 同 retryTimer：收尾处无需 `if` 包一层。
+      let idleTimer: ReturnType<typeof setTimeout> | undefined
       // 连接建立超时：网络卡顿时 15s 拿不到响应就 abort 这次连接（否则 fetch 无限挂起，
       // connected 停 true、退避的 attempt 也不自增 → 整体冻结）。
       const connectTimer = setTimeout(() => ctrl.abort(), CONNECT_TIMEOUT_MS)
@@ -100,7 +102,7 @@ export function useLiveStream(enabled = true): LiveStreamState {
         const decoder = new TextDecoder()
         let buf = ''
         const kickIdle = () => {
-          if (idleTimer) clearTimeout(idleTimer)
+          clearTimeout(idleTimer)
           idleTimer = setTimeout(() => ctrl.abort(), IDLE_TIMEOUT_MS)
         }
         kickIdle()
@@ -125,7 +127,11 @@ export function useLiveStream(enabled = true): LiveStreamState {
       } catch {
         /* abort（超时/卸载/隐藏/被新一轮顶掉）或断连：落到下方重连 */
       }
-      if (idleTimer) clearTimeout(idleTimer)
+      clearTimeout(idleTimer)
+      // 失败路径上也要清连接建立计时器（成功路径已在 fetch resolve 后清过——那一句必须留着，
+      // 否则长连接会在 15s 被自己掐断）。不清的话每轮失败都会留一个 15s 后触发的定时器：
+      // 它 abort 的是**本轮的** ctrl（那一轮早已结束，是空操作），但每轮失败都攒一个。
+      clearTimeout(connectTimer)
       // 已被更新的一轮取代：不碰 connected、不排计时器，否则两轮互相踩。
       if (myGen !== generation) return
       if (!cancelled) {
@@ -147,7 +153,7 @@ export function useLiveStream(enabled = true): LiveStreamState {
         // 已有存活连接时直接返回：可见性事件可能在连接还好着时触发（如切窗口回来），
         // 无条件 connect() 等于主动废掉一条正常连接再重建。
         if (activeCtrl && !activeCtrl.signal.aborted) return
-        if (retryTimer) clearTimeout(retryTimer)
+        clearTimeout(retryTimer)
         attempt = 0 // 用户主动回到页面：立即重试一次，不背着历史退避
         connect()
       }
@@ -158,7 +164,7 @@ export function useLiveStream(enabled = true): LiveStreamState {
     return () => {
       cancelled = true
       generation++ // 让所有在飞的 connect() 轮次作废
-      if (retryTimer) clearTimeout(retryTimer)
+      clearTimeout(retryTimer)
       document.removeEventListener('visibilitychange', onVisibility)
       activeCtrl?.abort()
     }

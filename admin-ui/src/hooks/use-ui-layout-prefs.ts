@@ -89,7 +89,14 @@ export function useUiLayoutPrefs() {
   const prefs = useSyncExternalStore(subscribe, getSnapshot)
   const set = useCallback((patch: Partial<UiLayoutPrefs>) => {
     const next = { ...read(), ...patch }
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(next))
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(next))
+    } catch {
+      // 隐私模式 / 存储配额满 / 禁用 cookie(SecurityError)时 setItem 会抛。
+      // 不接住的话异常会冒泡到调用方:设置页 handleSave 先 setUiPrefs 再 save(diff),
+      // 抛在这里 = 后端字段的保存**整个不执行**(点保存像没反应)。
+      // 与 use-canvas-layout 的 write() 同款降级:偏好丢失可接受,不该让操作抛错。
+    }
     window.dispatchEvent(new Event(EVENT))
   }, [])
   return { prefs, set }

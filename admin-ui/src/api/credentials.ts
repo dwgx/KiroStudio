@@ -1,6 +1,4 @@
-import axios from 'axios'
-import { storage } from '@/lib/storage'
-import { shouldClearAdminSession } from './should-clear-admin-session'
+import { createAdminApi } from './client'
 import type {
   CredentialsStatusResponse,
   BalanceResponse,
@@ -39,50 +37,10 @@ import type {
   CloneCredentialRequest,
 } from '@/types/api'
 
-// 创建 axios 实例
-const api = axios.create({
-  baseURL: '/api/admin',
-  // 超时兜底：避免网络/后端异常时请求无限挂起（登录卡顿的成因之一）。
-  timeout: 15000,
-  headers: {
-    'Content-Type': 'application/json',
-  },
-})
-
-// 请求拦截器添加 API Key
-api.interceptors.request.use((config) => {
-  const apiKey = storage.getApiKey()
-  if (apiKey) {
-    config.headers['x-api-key'] = apiKey
-  }
-  return config
-})
-
-// 登录页校验期间抑制"自动 reload 回登录"：登录校验自己 catch 并就地报错，不能被拦截器抢先 reload。
-let suppressAuthReload = false
-export function setSuppressAuthReload(v: boolean) {
-  suppressAuthReload = v
-}
-
-// 响应拦截器：仅鉴权失败才清 sessionStorage 里的 key 并 reload。
-// 401 = 密钥失效。403 还用于业务拒绝（import_keys 关闭、IP 黑白名单），
-// 只有 error.type === 'authentication_error' 才当鉴权失败；其余交给页面 toast。
-// 登录页主动校验由 setSuppressAuthReload(true) 抑制 reload。
-api.interceptors.response.use(
-  (res) => res,
-  (err) => {
-    const status = err?.response?.status as number | undefined
-    const rawType = err?.response?.data?.error?.type
-    const errorType = typeof rawType === 'string' ? rawType : undefined
-    if (shouldClearAdminSession(status, errorType) && !suppressAuthReload) {
-      storage.removeApiKey()
-      if (typeof window !== 'undefined') {
-        window.location.reload()
-      }
-    }
-    return Promise.reject(err)
-  },
-)
+// admin API 实例（baseURL + x-api-key + 鉴权失败清会话）统一由 ./client 提供。
+// 这里再导出 setSuppressAuthReload：登录页从 '@/api/credentials' 引它，保持该模块的对外面不变。
+const api = createAdminApi()
+export { setSuppressAuthReload } from './client'
 
 // 获取所有凭据状态
 export async function getCredentials(): Promise<CredentialsStatusResponse> {
@@ -309,14 +267,17 @@ export async function forceRefreshToken(
 }
 
 // 手动更新 OAuth 号的 refreshToken（号被 InvalidRefreshToken 禁用后自助恢复通道）。
-// 请求体字段 snake_case `refresh_token` 对齐后端 RefreshTokenRequest（types.rs，无 serde rename）。
+// 请求体字段 **camelCase `refreshToken`**：后端 `RefreshTokenRequest`（types.rs）带
+// `#[serde(rename_all = "camelCase")]`，线协议键名即 `refreshToken`，且该字段无 default/alias
+// ——发 `refresh_token` 会被 serde 判为缺字段（422），自助恢复通道整体失效。
+// 对照：`SetProxyRequest`（handlers.rs）**没有** rename，那两个才是 snake_case。
 export async function updateRefreshToken(
   id: number,
   refreshToken: string
 ): Promise<SuccessResponse> {
   const { data } = await api.put<SuccessResponse>(
     `/credentials/${id}/refresh-token`,
-    { refresh_token: refreshToken }
+    { refreshToken }
   )
   return data
 }
@@ -374,28 +335,41 @@ export interface ProbeModelsResponse {
  * 全部可探测的候选模型（真实 Kiro modelId，从便宜到贵；供 UI 勾选）。
  * ⚠️ 须与后端声明式模型目录 src/anthropic/model_catalog.rs::CATALOG 保持一致
  * （id=kiro_id，mult=credit_mult）。补齐 opus-4.5/4.7 消除「广告了却无法探测/加白名单」漂移。
+ *
+ * 2026-10-14 再对账一次（逐条比 CATALOG 的 kiro_id/credit_mult/advertised）：
+ * - 修正 GPT 系倍率：后端 2026-08-24 已按 Kiro 官方模型表校正为 sol 2.4x / terra 1.0x /
+ *   luna 0.1x（CATALOG 注释原话「非统一 1.0x」），本清单当时还是 1.00x 占位 ——
+ *   倍率是用户挑白名单时的成本依据，三个都写 1.00x 会让「锁便宜模型」的意图看不出差别。
+ * - 补 claude-opus-5.5 / claude-sonnet-5.5 / claude-fable-5.1（都在 CATALOG 里且
+ *   advertised=true）—— 缺了它们就没法在面板上探测/加白名单。
+ * - **刻意不收**两类：`claude-haiku-5.5`（CATALOG 里 advertised=false，即刻意不对外广告，
+ *   放进探测清单等于让用户在未确认的 SKU 上烧真积分）与 `deepseek-v4-flash`
+ *   （credit_mult=0 的 custom_api 透传专用 SKU，Kiro 号探测必失败；而白名单选择器
+ *   对 custom_api 号本就不显示）。
  */
 export const PROBE_MODEL_CATALOG: { id: string; mult: string }[] = [
   { id: 'qwen3-coder-next', mult: '0.05x' },
+  { id: 'gpt-5.6-luna', mult: '0.10x' },
   { id: 'minimax-m2.1', mult: '0.15x' },
   { id: 'deepseek-3.2', mult: '0.25x' },
   { id: 'minimax-m2.5', mult: '0.25x' },
   { id: 'claude-haiku-4.5', mult: '0.40x' },
   { id: 'glm-5', mult: '0.50x' },
   { id: 'auto', mult: '1.00x' },
-  // GPT 系(Kiro 2026-07 新增,sol/luna/terra 三并列变体)。倍率暂用 1.00x 占位,待官方权威值校正。
-  { id: 'gpt-5.6-sol', mult: '1.00x' },
-  { id: 'gpt-5.6-luna', mult: '1.00x' },
   { id: 'gpt-5.6-terra', mult: '1.00x' },
+  { id: 'claude-fable-5.1', mult: '1.30x' },
   { id: 'claude-sonnet-4.0', mult: '1.30x' },
   { id: 'claude-sonnet-4.5', mult: '1.30x' },
   { id: 'claude-sonnet-4.6', mult: '1.30x' },
   { id: 'claude-sonnet-5', mult: '1.30x' },
+  { id: 'claude-sonnet-5.5', mult: '1.30x' },
   { id: 'claude-opus-4.5', mult: '2.20x' },
   { id: 'claude-opus-4.6', mult: '2.20x' },
   { id: 'claude-opus-4.7', mult: '2.20x' },
   { id: 'claude-opus-4.8', mult: '2.20x' },
   { id: 'claude-opus-5', mult: '2.20x' },
+  { id: 'claude-opus-5.5', mult: '2.20x' },
+  { id: 'gpt-5.6-sol', mult: '2.40x' },
 ]
 
 export async function probeAvailableModels(id: number, models?: string[]): Promise<ProbeModelsResponse> {
@@ -562,7 +536,8 @@ export async function exportCredential(id: number): Promise<Record<string, unkno
 }
 
 // 导出 KAM 号池 JSON（Blob，下载为 kam.json）。
-// 后端接线中（W16 同步做）；端点未合入时返回 404，调用方提示「稍后再试」。
+// 端点已合入（router.rs `GET /credentials/export-kam`）；调用方按 blob.type 判错误页，
+// 不靠 404 判"未接线"（那只是兼容旧后端的路径，见 dashboard 的 handleExportKam）。
 export async function exportKam(): Promise<Blob> {
   const { data } = await api.get<Blob>('/credentials/export-kam', { responseType: 'blob' })
   return data
@@ -597,6 +572,8 @@ export async function pollSocialLogin(
 }
 
 // 发起 IDC 上号（AWS SSO device code flow）
+// 请求体发 snake_case：后端 `StartIdcLoginRequest` 对 start_url/proxy_url 挂了
+// `#[serde(alias)]`，两种都收（见 handlers.rs 的 start_idc_login_request_accepts_camel_and_snake）。
 export async function startIdcLogin(
   req: StartIdcLoginRequest
 ): Promise<StartIdcLoginResponse> {
@@ -606,27 +583,19 @@ export async function startIdcLogin(
     priority: req.priority,
     proxy_url: req.proxyUrl,
   })
-  // 后端返回 snake_case，前端用 camelCase
-  return {
-    sessionId: (data as any).session_id ?? data.sessionId,
-    verificationUri: (data as any).verification_uri ?? data.verificationUri,
-    verificationUriComplete: (data as any).verification_uri_complete ?? data.verificationUriComplete,
-    userCode: (data as any).user_code ?? data.userCode,
-    expiresIn: (data as any).expires_in ?? data.expiresIn,
-  }
+  // 响应是 camelCase：后端 `StartIdcLoginResponse` 带 `#[serde(rename_all = "camelCase")]`
+  // 且 handlers.rs 的 `start_idc_login_response_wire_is_camel_case` 钉住了线上键名。
+  // 这里原先有 `(data as any).session_id ?? data.sessionId` 这类 snake_case 兜底 —— 是死分支，
+  // 而 `as any` 会把真正读错字段的失误也一起吞掉（类型检查失效），故删掉直接返回。
+  return data
 }
 
 // 轮询 IDC 上号状态
 export async function pollIdcLogin(
   sessionId: string
 ): Promise<PollIdcLoginResponse> {
-  const { data } = await api.post<PollIdcLoginResponse>(`/auth/idc/poll/${sessionId}`)
-  // 后端返回 snake_case
-  return {
-    status: data.status,
-    credentialId: (data as any).credential_id ?? data.credentialId,
-    message: data.message,
-  }
+  // 同上：`PollIdcLoginResponse` 也是 rename_all="camelCase"（credentialId 是线协议键名）。
+  return (await api.post<PollIdcLoginResponse>(`/auth/idc/poll/${sessionId}`)).data
 }
 
 // ============ 微软 SSO 上号（External IdP · 三步引导）============

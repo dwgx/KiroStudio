@@ -1,6 +1,7 @@
 import { clsx, type ClassValue } from 'clsx'
 import { twMerge } from 'tailwind-merge'
 import i18n from '@/i18n'
+import type { OnboardingDiagnosis } from '@/types/api'
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
@@ -70,20 +71,29 @@ export function extractErrorMessage(error: unknown): string {
  * 从错误响应里提取结构化上号诊断（后端 error.diagnosis）。无则 null。
  * 用于上号/刷新/探测失败时渲染诊断卡片（归因+引导）而非裸报错。
  */
-export function extractDiagnosis(error: unknown): import('@/types/api').OnboardingDiagnosis | null {
+export function extractDiagnosis(error: unknown): OnboardingDiagnosis | null {
   if (!error || typeof error !== 'object') return null
   const axiosError = error as Record<string, unknown>
   const response = axiosError.response as Record<string, unknown> | undefined
   const data = response?.data as Record<string, unknown> | undefined
   const errorObj = data?.error as Record<string, unknown> | undefined
   const diag = errorObj?.diagnosis as Record<string, unknown> | undefined
+  // 判据必须覆盖 OnboardingDiagnosis 的**全部必填字段**（stage/fault/code/summary/guidance/retriable）：
+  // 只查 code/summary/guidance 时，残缺 payload 会被当成"合法诊断"送进渲染，
+  // 而卡片按 `fault` 选色/按 `retriable` 决定是否给重试按钮 —— 拿到 undefined 只会静默走错分支。
+  // 后端 `OnboardingDiagnosis` 这六项恒定序列化（只有 raw 是 skip_serializing_if=None），故不会误杀。
   if (
     diag &&
+    typeof diag.stage === 'string' &&
+    typeof diag.fault === 'string' &&
     typeof diag.code === 'string' &&
     typeof diag.summary === 'string' &&
-    Array.isArray(diag.guidance)
+    Array.isArray(diag.guidance) &&
+    typeof diag.retriable === 'boolean'
   ) {
-    return diag as unknown as import('@/types/api').OnboardingDiagnosis
+    // 已逐字段运行时校验，仅剩 `guidance: unknown[]` 需要收窄；不构造新对象是为了
+    // 保留后端原样下发的 `raw`（排障详情）。
+    return diag as unknown as OnboardingDiagnosis
   }
   return null
 }

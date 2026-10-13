@@ -1,5 +1,4 @@
-import axios from 'axios'
-import { storage } from '@/lib/storage'
+import { createAdminApi } from './client'
 import type {
   UsageOverview,
   SeriesPoint,
@@ -11,23 +10,10 @@ import type {
   RateLimitInsight,
 } from '@/types/api'
 
-// 复用与 credentials 相同的 baseURL 与鉴权拦截
-const api = axios.create({
-  baseURL: '/api/admin',
-  // 超时兜底（与 credentials.ts 同值）：axios 默认 timeout=0 即"永远等"。
-  // 请求挂在反代那一跳时会一直挂到上游超时（实测 p90 71s / max 1077s），
-  // 而 React Query 在上一次 fetch 未 settle 前不会发下一轮轮询 → 整块面板静默冻结。
-  timeout: 15000,
-  headers: { 'Content-Type': 'application/json' },
-})
-
-api.interceptors.request.use((config) => {
-  const apiKey = storage.getApiKey()
-  if (apiKey) {
-    config.headers['x-api-key'] = apiKey
-  }
-  return config
-})
+// 与 credentials/ops 同一个实例工厂：baseURL + x-api-key + 鉴权失败清会话。
+// 走工厂而非各写一份 axios.create —— 拦截器是每个实例各自一份，漏抄响应拦截器会让
+// 本页的 401 静默失败（既不清 sessionStorage 也不回登录页，旧数据看起来"还活着"）。
+const api = createAdminApi()
 
 // 概览：24h / 7d / 30d
 export async function getUsageOverview(): Promise<UsageOverview> {
