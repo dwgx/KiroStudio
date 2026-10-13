@@ -56,18 +56,20 @@ pub(super) const ABSOLUTE_MAX_TOTAL_RETRIES: usize = 4;
 /// 选号信息 —— 而「透传先试了哪几个号」在透传全败返回 `None` 时随返回值一起丢失。
 /// 预算沿整条链传递（handler 每请求创建一份），是最小的跨层携带通道：
 /// 透传首跳先写（首写生效），Kiro 主路径首个选中的号兜底，`fail_record` 读同一份。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SharedRetryBudget {
-    remaining: std::sync::Mutex<u32>,
+    remaining: std::sync::Arc<std::sync::Mutex<u32>>,
     /// 整条请求链最先尝试的凭据 ID（首写生效；None = 链内尚未选中任何凭据）。
-    first_attempted_credential_id: std::sync::Mutex<Option<u64>>,
+    first_attempted_credential_id: std::sync::Arc<std::sync::Mutex<Option<u64>>>,
 }
 
 impl SharedRetryBudget {
     pub fn new() -> Self {
         Self {
-            remaining: std::sync::Mutex::new(ABSOLUTE_MAX_TOTAL_RETRIES as u32),
-            first_attempted_credential_id: std::sync::Mutex::new(None),
+            remaining: std::sync::Arc::new(std::sync::Mutex::new(
+                ABSOLUTE_MAX_TOTAL_RETRIES as u32,
+            )),
+            first_attempted_credential_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 

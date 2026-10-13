@@ -2,6 +2,37 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [1.2.4] - 2026-09-04 - catalog ads / Grep offset / Responses additional_tools
+
+Relative to tag v1.2.3 / `cf070bd`. This window `cargo test --no-default-features --locked`:**2300 passed; 0 failed**. No 12-key / absorb / AIMD / sticky / client-key changes. Do not retag v1.2.3. Homecloud not in this cycle.
+
+- `/v1/models` `max_tokens` ads: `claude-sonnet-5` and `gpt-5.6-{sol,luna,terra}` 64k → 128k (Kiro effort table).
+- Grep advertised schema includes `offset` (already on the outbound allowlist).
+- OpenAI module docs: `/v1/responses` is on the Anthropic pipeline (comment was stale).
+- Responses: merge `additional_tools`; flatten `namespace`+`name` for Kiro; restore unique bare names and `custom_tool_call` on the way back.
+- Edit `replace_all` and Bash `description` pass through the Claude Code map.
+- `handlers.rs` tests extracted to a `#[path]` sibling (parent stays a file).
+- Quota-recovery tests re-disable after `new()` so fixture "current month" is not revived by wall-clock September.
+
+## [1.2.3] - 2026-09-01 - 直播 SSE hop 抽干 / 直连 MCP ARN
+
+相对 tag v1.2.2 / `be59a33`。本窗 `cargo test --no-default-features --locked`：**2297 passed; 0 failed**。未改 12 键、absorb、AIMD、sticky、客户端 Key。不改已推的 v1.2.2 对象。
+
+- 直播 SSE：`select!` biased + hop 优先；task 完成后 `try_recv` 抽干已入队 hop；断开时若已完成仍 emit。
+- hank 写回：`replace_mapped_tool_names_in_text` 只替换 `orig.len() > 63`，不再误伤 `Write`/`LS`。
+- MCP 无号直连：OAuth / 有真实 ARN 的 external_idp 发 `x-amzn-kiro-profile-arn`（runtime 主机要求）；ksk_ 永不发。
+
+## [1.2.2] - 2026-09-01 - 用量 ARN / 混合搜索直播 SSE / 八月黄金
+
+相对 tag v1.2.1 / `3d7ed6c`。含公开已合 [#3](https://github.com/dwgx/KiroStudio/pull/3)/[#4](https://github.com/dwgx/KiroStudio/pull/4)。本机 `cargo test --no-default-features --locked`：**2296 passed; 0 failed**。未改 12 键、absorb、AIMD、sticky、客户端 Key。
+
+- 混合 WebSearch **直播 SSE**：立刻 `message_start`、25s ping、每 hop 下发搜索块；客户端断开 abort。对齐 ZyphrZero #67 Anthropic 半边。
+- hop 追踪：每轮 MCP 搜索记 `WebSearchHop` 并打日志。
+- hank #197：超长工具名缩短后写回 prompt/历史正文。
+- 用量 REST 只带真实 `profileArn`；403/400 ARN 形态按区×带/不带回退。
+- web_search query 别名、`/v1/models.context_window`、空 `proxyUrl`、`messages[].role=system`。
+- #3 catalog 272K / sol 2.40 / luna 0.10；#4 Glob/Grep Claude Code schema。
+
 ## [1.2.1] - 2026-08-23 - Bug C 空块 / 空 assembled / websearch 名 / 代理写入闸
 
 相对 tag v1.2.0 / `f6aaf88`。`cargo test --no-default-features --locked`：**2288 passed; 0 failed**。未改 12 键、absorb 顺序、AIMD、sticky。未做真实 Write 上号烟测（缺可用号）。

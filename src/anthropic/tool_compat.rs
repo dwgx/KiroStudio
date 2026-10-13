@@ -129,10 +129,20 @@ pub(super) fn map_tool_input_to_kiro(
                 "newStr",
                 take_first(&obj, &["new_string", "newStr"]),
             );
+            maybe_insert(
+                &mut out,
+                "replace_all",
+                take_first(&obj, &["replace_all", "replaceAll"]),
+            );
         }
         ("Bash", "execute_bash") => {
             maybe_insert(&mut out, "command", take_first(&obj, &["command"]));
             maybe_insert(&mut out, "timeout", take_first(&obj, &["timeout"]));
+            maybe_insert(
+                &mut out,
+                "description",
+                take_first(&obj, &["description"]),
+            );
         }
         ("Read", "read_file") => {
             // 🔴 `Read.pages`（读 PDF 页范围）在 Kiro `read_file` 侧无等价参数。
@@ -314,10 +324,12 @@ pub(crate) fn map_tool_input_from_kiro(
             remap_tool_keys(&mut out, &["path", "file_path"], "file_path");
             remap_tool_keys(&mut out, &["oldStr", "old_string"], "old_string");
             remap_tool_keys(&mut out, &["newStr", "new_string"], "new_string");
+            remap_tool_keys(&mut out, &["replace_all", "replaceAll"], "replace_all");
         }
         "Bash" => {
             remap_tool_keys(&mut out, &["command"], "command");
             remap_tool_keys(&mut out, &["timeout"], "timeout");
+            remap_tool_keys(&mut out, &["description"], "description");
         }
         "Read" => {
             remap_tool_keys(&mut out, &["path", "file_path"], "file_path");
@@ -539,7 +551,8 @@ fn kiro_builtin_tool_schema(name: &str) -> Option<serde_json::Value> {
             "properties": {
                 "path": {"type": "string", "description": "Absolute path to file."},
                 "oldStr": {"type": "string", "description": "Exact string to replace."},
-                "newStr": {"type": "string", "description": "Replacement string."}
+                "newStr": {"type": "string", "description": "Replacement string."},
+                "replace_all": optional_schema(serde_json::json!({"type": "boolean", "description": "Replace every occurrence, not just the first."}))
             },
             "required": ["path", "oldStr", "newStr"],
             "additionalProperties": false
@@ -548,7 +561,8 @@ fn kiro_builtin_tool_schema(name: &str) -> Option<serde_json::Value> {
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "Bash command to execute."},
-                "timeout": optional_schema(serde_json::json!({"type": "number", "description": "Optional timeout in milliseconds."}))
+                "timeout": optional_schema(serde_json::json!({"type": "number", "description": "Optional timeout in milliseconds."})),
+                "description": optional_schema(serde_json::json!({"type": "string", "description": "Short description of why this command runs."}))
             },
             "required": ["command"],
             "additionalProperties": false
@@ -612,6 +626,7 @@ fn kiro_builtin_tool_schema(name: &str) -> Option<serde_json::Value> {
                 "-B": optional_schema(serde_json::json!({"type": "number", "description": "Lines of context before each match. Requires output_mode \"content\"."})),
                 "-C": optional_schema(serde_json::json!({"type": "number", "description": "Lines of context around each match. Requires output_mode \"content\"."})),
                 "head_limit": optional_schema(serde_json::json!({"type": "number", "description": "Limit output to the first N entries."})),
+                "offset": optional_schema(serde_json::json!({"type": "number", "description": "Skip the first N matches (rg --PATH offset)."})),
                 "multiline": optional_schema(serde_json::json!({"type": "boolean", "description": "Allow patterns to match across line boundaries."}))
             },
             "required": ["pattern"],
@@ -687,6 +702,30 @@ pub(super) fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, Stri
     );
     tool_name_map.insert(short.clone(), name.to_string());
     short
+}
+
+/// 把 prompt/历史正文里的超长原名换成已发给上游的短名（hank9999/kiro.rs #197）。
+/// `tool_name_map` 是 short → original；按 original 长度降序替换，避免短前缀误伤。
+pub(super) fn replace_mapped_tool_names_in_text(
+    text: &str,
+    tool_name_map: &HashMap<String, String>,
+) -> String {
+    if tool_name_map.is_empty() || text.is_empty() {
+        return text.to_string();
+    }
+    let mut pairs: Vec<(&str, &str)> = tool_name_map
+        .iter()
+        .map(|(short, orig)| (orig.as_str(), short.as_str()))
+        .filter(|(orig, short)| orig.len() > TOOL_NAME_MAX_LEN && orig != short)
+        .collect();
+    pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    let mut out = text.to_string();
+    for (orig, short) in pairs {
+        if out.contains(orig) {
+            out = out.replace(orig, short);
+        }
+    }
+    out
 }
 
 /// 转换工具定义

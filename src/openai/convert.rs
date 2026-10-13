@@ -766,6 +766,156 @@ fn normalize_tool_pairing_and_merge(messages: Vec<Value>) -> Vec<Value> {
 
 // ============ /v1/responses 请求 → Anthropic ============
 
+/// Codex may declare tools under `tools` and/or `additional_tools`, optionally
+/// with `namespace`. Kiro only sees a flat Anthropic tool name, so we flatten
+/// `namespace__name` on the way in and restore on the way out.
+#[derive(Clone, Debug, Default)]
+pub struct ResponsesToolIndex {
+    decls: Vec<ResponsesToolDecl>,
+}
+
+#[derive(Clone, Debug)]
+struct ResponsesToolDecl {
+    name: String,
+    namespace: Option<String>,
+    custom: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedResponsesTool {
+    name: String,
+    namespace: Option<String>,
+    custom: bool,
+}
+
+fn flatten_responses_tool_name(namespace: Option<&str>, name: &str) -> String {
+    match namespace.filter(|s| !s.is_empty()) {
+        Some(ns) => format!("{ns}__{name}"),
+        None => name.to_string(),
+    }
+}
+
+impl ResponsesToolDecl {
+    fn flattened(&self) -> String {
+        flatten_responses_tool_name(self.namespace.as_deref(), &self.name)
+    }
+}
+
+fn iter_responses_tool_decls(raw: &Value) -> impl Iterator<Item = &Value> {
+    let tools = raw
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    let extra = raw
+        .get("additional_tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    tools.chain(extra)
+}
+
+/// Build the restore table from a Responses request (tools + additional_tools).
+pub fn collect_responses_tool_index(raw: &Value) -> ResponsesToolIndex {
+    let mut decls = Vec::new();
+    for t in iter_responses_tool_decls(raw) {
+        let ttype = t.get("type").and_then(Value::as_str).unwrap_or("");
+        if ttype != "function" && ttype != "custom" {
+            continue;
+        }
+        let name = t
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        decls.push(ResponsesToolDecl {
+            name,
+            namespace: t
+                .get("namespace")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            custom: ttype == "custom",
+        });
+    }
+    ResponsesToolIndex { decls }
+}
+
+impl ResponsesToolIndex {
+    fn resolve(&self, upstream: &str) -> ResolvedResponsesTool {
+        if let Some(d) = self.decls.iter().find(|d| d.flattened() == upstream) {
+            return ResolvedResponsesTool {
+                name: d.name.clone(),
+                namespace: d.namespace.clone(),
+                custom: d.custom,
+            };
+        }
+        let bare: Vec<&ResponsesToolDecl> =
+            self.decls.iter().filter(|d| d.name == upstream).collect();
+        if bare.len() == 1 {
+            let d = bare[0];
+            return ResolvedResponsesTool {
+                name: d.name.clone(),
+                namespace: d.namespace.clone(),
+                custom: d.custom,
+            };
+        }
+        ResolvedResponsesTool {
+            name: upstream.to_string(),
+            namespace: None,
+            custom: false,
+        }
+    }
+}
+
+fn custom_input_from_args(args: &str) -> String {
+    if let Ok(Value::Object(m)) = serde_json::from_str::<Value>(args) {
+        if let Some(Value::String(s)) = m.get("input") {
+            return s.clone();
+        }
+    }
+    args.to_string()
+}
+
+fn responses_tool_item_json(
+    item_id: &str,
+    call_id: &str,
+    resolved: &ResolvedResponsesTool,
+    args: &str,
+    status: &str,
+) -> Value {
+    if resolved.custom {
+        let mut item = json!({
+            "id": item_id,
+            "type": "custom_tool_call",
+            "status": status,
+            "call_id": call_id,
+            "name": resolved.name,
+            "input": custom_input_from_args(args),
+        });
+        if let Some(ns) = &resolved.namespace {
+            item["namespace"] = json!(ns);
+        }
+        item
+    } else {
+        let mut item = json!({
+            "id": item_id,
+            "type": "function_call",
+            "status": status,
+            "call_id": call_id,
+            "name": resolved.name,
+            "arguments": args,
+        });
+        if let Some(ns) = &resolved.namespace {
+            item["namespace"] = json!(ns);
+        }
+        item
+    }
+}
+
 /// 把 OpenAI Responses 请求 JSON 翻译成 Anthropic MessagesRequest JSON。
 ///
 /// Responses 与 chat/completions 的差异:
@@ -857,7 +1007,9 @@ pub fn openai_responses_to_anthropic(model: &str, raw: &Value, stream: bool) -> 
                             .and_then(|v| v.as_str())
                             .map(sanitize_tool_id)
                             .unwrap_or_else(gen_tool_call_id);
-                        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let raw_name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let ns = item.get("namespace").and_then(|v| v.as_str());
+                        let name = flatten_responses_tool_name(ns, raw_name);
                         // function_call 用 arguments、custom_tool_call 用 input。
                         let raw_args = item
                             .get("arguments")
@@ -899,13 +1051,15 @@ pub fn openai_responses_to_anthropic(model: &str, raw: &Value, stream: bool) -> 
         _ => {}
     }
 
-    // tools(Responses 的 function tool:顶层 name/parameters,非 chat 的 function 嵌套)。
-    if let Some(Value::Array(tools)) = raw.get("tools") {
+    // tools + additional_tools (Codex). Function tool: top-level name/parameters.
+    {
         let mut anth_tools: Vec<Value> = Vec::new();
-        for t in tools {
+        for t in iter_responses_tool_decls(raw) {
             let ttype = t.get("type").and_then(|v| v.as_str());
             if ttype == Some("function") {
-                let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let raw_name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let ns = t.get("namespace").and_then(|v| v.as_str());
+                let name = flatten_responses_tool_name(ns, raw_name);
                 let desc = t.get("description").and_then(|v| v.as_str()).unwrap_or("");
                 let schema = t.get("parameters").cloned();
                 anth_tools.push(json!({
@@ -922,7 +1076,9 @@ pub fn openai_responses_to_anthropic(model: &str, raw: &Value, stream: bool) -> 
                 // 包成 {"input": <原文>} 才塞进 Anthropic tool_use.input。这里把 schema 声明为
                 // {input: string},使模型看到的"该传什么形状"与入站实际收到的"包壳后长什么样"一致,
                 // 往返自洽。若 input 恰是合法 JSON object 则入站侧原样使用不套壳,不受此 schema 约束。
-                let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let raw_name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let ns = t.get("namespace").and_then(|v| v.as_str());
+                let name = flatten_responses_tool_name(ns, raw_name);
                 let desc = t.get("description").and_then(|v| v.as_str()).unwrap_or("");
                 anth_tools.push(json!({
                     "name": name,
@@ -1562,6 +1718,7 @@ pub struct ResponsesStreamConverter {
     stop_reason: String,
     /// 已闭合块的快照(按 output_index 顺序),供 message_stop 重建 response.completed.output。
     finished: Vec<FinishedItem>,
+    tool_index: ResponsesToolIndex,
 }
 
 struct BlockState {
@@ -1600,7 +1757,13 @@ impl ResponsesStreamConverter {
             next_output_index: 0,
             stop_reason: "end_turn".to_string(),
             finished: Vec::new(),
+            tool_index: ResponsesToolIndex::default(),
         }
+    }
+
+    pub fn with_tool_index(mut self, tool_index: ResponsesToolIndex) -> Self {
+        self.tool_index = tool_index;
+        self
     }
 
     fn next_seq(&mut self) -> i64 {
@@ -1676,9 +1839,22 @@ impl ResponsesStreamConverter {
                             },
                         );
                         let s = self.next_seq();
+                        let resolved = self.tool_index.resolve(&name);
+                        let mut item_body = responses_tool_item_json(
+                            &item_id,
+                            &call_id,
+                            &resolved,
+                            "",
+                            "in_progress",
+                        );
+                        if !resolved.custom {
+                            item_body["arguments"] = json!("");
+                        } else {
+                            item_body["input"] = json!("");
+                        }
                         let item = json!({
                             "type": "response.output_item.added", "sequence_number": s, "output_index": output_index,
-                            "item": {"id": item_id, "type": "function_call", "status": "in_progress", "arguments": "", "call_id": call_id, "name": name}
+                            "item": item_body
                         });
                         vec![("response.output_item.added".into(), item)]
                     }
@@ -1894,10 +2070,10 @@ impl ResponsesStreamConverter {
                     }),
                 ));
                 let s2 = self.next_seq();
+                let resolved = self.tool_index.resolve(&bs.name);
                 out.push(("response.output_item.done".into(), json!({
                     "type": "response.output_item.done", "sequence_number": s2, "output_index": bs.output_index,
-                    "item": {"id": bs.item_id, "type": "function_call", "status": "completed",
-                        "call_id": bs.call_id, "name": bs.name, "arguments": args}
+                    "item": responses_tool_item_json(&bs.item_id, &bs.call_id, &resolved, &args, "completed")
                 })));
                 self.finished.push(FinishedItem {
                     kind: "tool",
@@ -1979,8 +2155,10 @@ impl ResponsesStreamConverter {
     /// 用已闭合块快照重建 response.completed 的 output 数组(严格客户端把它当最终权威内容)。
     fn build_output(&self) -> Vec<Value> {
         self.finished.iter().map(|f| match f.kind {
-            "tool" => json!({"id": f.item_id, "type": "function_call", "status": "completed",
-                "call_id": f.call_id, "name": f.name, "arguments": f.text}),
+            "tool" => {
+                let resolved = self.tool_index.resolve(&f.name);
+                responses_tool_item_json(&f.item_id, &f.call_id, &resolved, &f.text, "completed")
+            }
             "reasoning" => json!({"id": f.item_id, "type": "reasoning", "status": "completed",
                 "summary": [{"type": "summary_text", "text": f.text}]}),
             _ => json!({"id": f.item_id, "type": "message", "status": "completed", "role": "assistant",
@@ -1991,6 +2169,14 @@ impl ResponsesStreamConverter {
 
 /// 非流式:内部 Anthropic 事件序列 → 单个 Responses response 对象。
 pub fn aggregate_responses(model: &str, events: &[Value]) -> Value {
+    aggregate_responses_with_tools(model, events, &ResponsesToolIndex::default())
+}
+
+pub fn aggregate_responses_with_tools(
+    model: &str,
+    events: &[Value],
+    tool_index: &ResponsesToolIndex,
+) -> Value {
     let mut created = now_unix();
     let mut usage = UsageTokens::default();
     let mut stop_reason = String::from("end_turn");
@@ -2092,10 +2278,14 @@ pub fn aggregate_responses(model: &str, events: &[Value]) -> Value {
     }
     for (call_id, name, args) in &tools {
         let a = if args.is_empty() { "{}" } else { args.as_str() };
-        output.push(
-            json!({"id": gen_responses_id("fc"), "type": "function_call", "status": "completed",
-            "call_id": call_id, "name": name, "arguments": a}),
-        );
+        let resolved = tool_index.resolve(name);
+        output.push(responses_tool_item_json(
+            &gen_responses_id("fc"),
+            call_id,
+            &resolved,
+            a,
+            "completed",
+        ));
     }
 
     let (p, c, t, cached) = usage.openai();
@@ -2920,6 +3110,56 @@ mod tests {
             .find(|b| b["type"] == "tool_use")
             .unwrap();
         assert_eq!(tu2["input"]["k"], 1, "合法 JSON object input 原样用");
+    }
+
+    #[test]
+    fn test_responses_additional_tools_are_merged() {
+        let raw = json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [
+                {"type": "function", "name": "a", "parameters": {"type": "object", "properties": {}}}
+            ],
+            "additional_tools": [
+                {"type": "custom", "name": "exec", "namespace": "functions", "description": "run"}
+            ]
+        });
+        let a = openai_responses_to_anthropic("m", &raw, false);
+        let tools = a["tools"].as_array().expect("tools");
+        assert!(tools.iter().any(|t| t["name"] == "a"), "base tools kept");
+        assert!(
+            tools.iter().any(|t| t["name"] == "functions__exec"),
+            "namespaced additional_tools flattened, tools={tools:?}"
+        );
+    }
+
+    #[test]
+    fn test_responses_bare_namespaced_custom_restore() {
+        let raw = json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [
+                {"type": "custom", "name": "exec", "namespace": "functions", "description": "run"}
+            ]
+        });
+        let index = collect_responses_tool_index(&raw);
+        let events = vec![
+            json!({"type": "message_start", "message": {"id": "m1", "usage": {"input_tokens": 1, "output_tokens": 1}}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "c1", "name": "exec"}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"input\":\"pwd\"}"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}}),
+        ];
+        let out = aggregate_responses_with_tools("m", &events, &index);
+        let tool = out["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["type"] == "custom_tool_call")
+            .expect("custom_tool_call restored");
+        assert_eq!(tool["name"], "exec");
+        assert_eq!(tool["namespace"], "functions");
+        assert_eq!(tool["input"], "pwd");
     }
 
     #[test]
