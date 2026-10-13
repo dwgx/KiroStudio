@@ -1604,6 +1604,24 @@ pub(super) enum WebSearchLiveEvent {
     },
 }
 
+/// 直播路径的**增量账目**：循环每完成一轮就发布一次，供客户端断连时按已发生的量记账。
+///
+/// `task.abort()` 会把循环内的累计状态一起丢掉——直播客户端断连（CC Esc / hyper 丢 Body）
+/// 时若只 abort，已经发生的上游往返与 credit 就既不落 usage 也不 `report_credits`
+/// （面板少一条记录、凭据额度少记）。故账目必须由循环主动外发。
+#[derive(Clone, Default)]
+pub(super) struct WebSearchProgress {
+    pub credential_id: Option<u64>,
+    pub mapped_model: Option<String>,
+    pub credits: f64,
+    pub rounds: u32,
+    pub input_tokens: i32,
+}
+
+/// 进度发布口：循环写、直播包装在断连分支读（一把低争用锁，一轮一次写）。
+pub(super) type WebSearchProgressCell =
+    std::sync::Arc<std::sync::Mutex<WebSearchProgress>>;
+
 /// 回灌循环失败：HTTP 响应给客户端；用量字段给埋点（拿不到的保持 None，不编造成功）。
 pub(super) struct WebSearchLoopError {
     pub response: Response,
@@ -1843,6 +1861,8 @@ pub(super) async fn run_web_search_loop(
     fallback_input_tokens: i32,
     budget: &crate::kiro::provider::SharedRetryBudget,
     hops_tx: Option<tokio::sync::mpsc::UnboundedSender<WebSearchLiveEvent>>,
+    // 直播包装传 Some：循环每轮把增量账目发布到共享单元，断连 abort 前据此补记。
+    progress: Option<&WebSearchProgressCell>,
 ) -> Result<WebSearchLoopSuccess, WebSearchLoopError> {
     let mut presentation: Vec<Value> = Vec::new();
     let mut last_credential_id: Option<u64> = None;
@@ -1878,6 +1898,19 @@ pub(super) async fn run_web_search_loop(
         last_mapped_model = mapped_model;
         last_context_input = round.context_input_tokens.or(last_context_input);
         total_credits += round.credits;
+        // 增量账目外发（断连兜底，见 WebSearchProgress 注释）：此刻本轮凭据/映射名/
+        // context input 均已就位、credit 已累加，是最早的完整口径点。
+        if let Some(cell) = progress {
+            if let Ok(mut guard) = cell.lock() {
+                *guard = WebSearchProgress {
+                    credential_id: last_credential_id,
+                    mapped_model: last_mapped_model.clone(),
+                    credits: total_credits,
+                    rounds: round_idx as u32 + 1,
+                    input_tokens: last_context_input.unwrap_or(fallback_input_tokens),
+                };
+            }
+        }
 
         if should_replay_round(
             round_idx,
@@ -2073,6 +2106,12 @@ pub(super) async fn run_web_search_loop(
     ))
 }
 
+/// 读一份进度快照：锁中毒 / 循环还没发布过 → 全默认值（不编造账目，与
+/// `WebSearchLoopError`「拿不到的保持 None」同口径）。
+fn snapshot_progress(cell: &WebSearchProgressCell) -> WebSearchProgress {
+    cell.lock().map(|g| g.clone()).unwrap_or_default()
+}
+
 /// 混合搜索流式：立刻 `message_start` + 25s ping + 每 hop 下发搜索块；
 /// 客户端断开则 abort 回灌。对齐 ZyphrZero 0.8.0 PR #67 Anthropic 半边。
 pub(super) fn mixed_websearch_stream_response(
@@ -2082,17 +2121,32 @@ pub(super) fn mixed_websearch_stream_response(
     budget: crate::kiro::provider::SharedRetryBudget,
     on_ok: Box<dyn FnOnce(&WebSearchLoopSuccess) + Send>,
     on_err: Box<dyn FnOnce(&WebSearchLoopError) + Send>,
+    // 客户端在直播途中断开（CC Esc / hyper 丢 Body）：循环被 abort，任务内的累计账目
+    // 一并丢失，故按循环已发布的增量账目补记一条 Interrupted（与主路径 Drop 兜底同口径）。
+    on_interrupted: Box<dyn FnOnce(&WebSearchProgress) + Send>,
 ) -> Body {
     let (hop_tx, mut hop_rx) = tokio::sync::mpsc::unbounded_channel::<WebSearchLiveEvent>();
     let (byte_tx, byte_rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(32);
     let model = payload.model.clone();
+    let progress: WebSearchProgressCell = Default::default();
+    let progress_loop = progress.clone();
     let mut task = tokio::spawn(async move {
-        run_web_search_loop(provider, payload, fallback_input_tokens, &budget, Some(hop_tx)).await
+        run_web_search_loop(
+            provider,
+            payload,
+            fallback_input_tokens,
+            &budget,
+            Some(hop_tx),
+            Some(&progress_loop),
+        )
+        .await
     });
 
     tokio::spawn(async move {
         let start = loop_message_start_bytes(&model, fallback_input_tokens);
         if byte_tx.send(Ok(start)).await.is_err() {
+            // 起始帧都没送出去 = 客户端已断：同样按已发生量补记，再停任务。
+            on_interrupted(&snapshot_progress(&progress));
             task.abort();
             return;
         }
@@ -2111,10 +2165,7 @@ pub(super) fn mixed_websearch_stream_response(
                     match hop {
                         Some(ev) => {
                             if send_live_hop(&byte_tx, &mut index, ev).await.is_err() {
-                                if !task.is_finished() {
-                                    task.abort();
-                                }
-                                return;
+                                break; // 断连 → 统一收尾（下方按已发布账目补记后 abort）
                             }
                         }
                         None => hops_open = false,
@@ -2153,20 +2204,24 @@ pub(super) fn mixed_websearch_stream_response(
                                 Err(fail) => on_err(&fail),
                             }
                         }
-                    } else {
-                        task.abort();
                     }
+                    // 任务仍在跑 → 交给下方统一断连收尾（补记 Interrupted 后 abort）。
                     break;
                 }
                 _ = ping.tick() => {
                     if byte_tx.send(Ok(ping_bytes.clone())).await.is_err() {
-                        if !task.is_finished() {
-                            task.abort();
-                        }
-                        break;
+                        break; // 断连 → 统一收尾（下方按已发布账目补记后 abort）
                     }
                 }
             }
+        }
+
+        // 统一断连收尾：任务仍在跑 = 客户端已断（或被 abort），任务内的 rounds/credits
+        // 随 abort 丢失，故按循环已发布的增量账目补记一条 Interrupted 再停。
+        // 正常收尾分支（result / closed 且任务已结束）已各自记账，这里不会重复。
+        if !task.is_finished() {
+            on_interrupted(&snapshot_progress(&progress));
+            task.abort();
         }
     });
 
@@ -3583,6 +3638,52 @@ mod tests {
         assert!(
             prod.contains(&["pub mapped_model", ": Option<String>"].concat()),
             "WebSearchLoopSuccess 必须声明 mapped_model 字段"
+        );
+    }
+
+    /// 缺口 H 守卫（2026-10-14 流式审计）：直播断连必须**先按已发生量补记，再 abort**。
+    ///
+    /// 历史缺陷：`byte_tx.closed()` → `task.abort()` 直接停任务，循环内已累计的
+    /// rounds/credits 随任务一起丢——面板少一条记录、凭据额度少记（客户端 CC Esc 常见）。
+    /// 修法：循环每完成一轮发布一次增量账目（WebSearchProgress），直播包装在统一断连
+    /// 收尾里读快照补记 Interrupted 后再 abort。
+    /// 回退即 FAIL：删发布点 / 删 on_interrupted 调用 / 把补记挪到 abort 之后。
+    #[test]
+    fn live_disconnect_accounts_before_abort() {
+        let full = include_str!("websearch.rs");
+        let prod = full
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(full);
+        // 循环每轮发布增量账目（断连时任务内状态已随 abort 丢失，必须外发）。
+        let loop_fn = prod
+            .split("pub(super) async fn run_web_search_loop")
+            .nth(1)
+            .expect("run_web_search_loop 不应被改名")
+            .split("\npub(super) fn ")
+            .next()
+            .expect("split 至少一段");
+        assert!(
+            loop_fn.contains("*guard = WebSearchProgress {"),
+            "run_web_search_loop 每轮必须把增量账目发布到共享单元"
+        );
+        // 统一断连收尾块：补记先于 abort（abort 之后再读快照会丢最后一轮）。
+        let cleanup = prod
+            .split("if !task.is_finished() {")
+            .nth(1)
+            .expect("直播包装必须有统一断连收尾块")
+            .split("\n    });")
+            .next()
+            .expect("split 至少一段");
+        let account_at = cleanup
+            .find("on_interrupted(&snapshot_progress(&progress))")
+            .expect("收尾块必须先补记 Interrupted 账目");
+        let abort_at = cleanup
+            .find("task.abort();")
+            .expect("收尾块必须 abort 回灌任务");
+        assert!(
+            account_at < abort_at,
+            "补记必须发生在 abort 之前"
         );
     }
 

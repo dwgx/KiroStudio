@@ -797,6 +797,9 @@ async fn dispatch_web_search_loop(
         let p_err = provider.clone();
         let c_err = client.clone();
         let payload_err = (*payload).clone();
+        let p_int = provider.clone();
+        let c_int = client.clone();
+        let payload_int = (*payload).clone();
         return Some(
             sse_event_stream_builder()
                 .body(websearch::mixed_websearch_stream_response(
@@ -815,6 +818,15 @@ async fn dispatch_web_search_loop(
                     Box::new(move |fail| {
                         emit_websearch_loop_error_usage(&p_err, &payload_err, fail, &c_err, true);
                     }),
+                    Box::new(move |progress| {
+                        emit_websearch_loop_interrupted_usage(
+                            &p_int,
+                            &payload_int,
+                            progress,
+                            &c_int,
+                            true,
+                        );
+                    }),
                 ))
                 .unwrap(),
         );
@@ -825,6 +837,7 @@ async fn dispatch_web_search_loop(
         (*payload).clone(),
         fallback_input_tokens,
         budget,
+        None,
         None,
     )
     .await
@@ -1129,6 +1142,41 @@ fn emit_websearch_loop_error_usage(
         "web_search loop failed (status {})",
         status.as_u16()
     ));
+    if let (Some(c), Some(id)) = (record.credits_used, record.credential_id) {
+        provider.report_credits(id, c);
+    }
+    client.apply(&mut record);
+    crate::usage::emit_record(record);
+}
+
+/// 回灌**直播**断连（客户端 CC Esc / hyper 丢 Body）时的用量补记。
+///
+/// 循环被 abort，任务内的 rounds/credits 一并丢失，故按循环已发布的增量账目记账：
+/// outcome = [`RequestOutcome::Interrupted`]（与主路径 Drop 兜底同口径，不计入凭据健康），
+/// credits 有则 `report_credits`（凭据额度不能因为客户端掐断就漏记）。
+fn emit_websearch_loop_interrupted_usage(
+    provider: &crate::kiro::provider::KiroProvider,
+    payload: &MessagesRequest,
+    progress: &websearch::WebSearchProgress,
+    client: &ClientInfo,
+    wants_stream: bool,
+) {
+    let mut record =
+        crate::usage::RequestRecord::new(Uuid::new_v4().to_string(), payload.model.clone());
+    record.requested_model = Some(payload.model.clone());
+    record.upstream_model = progress.mapped_model.clone();
+    record.credential_id = progress.credential_id;
+    record.is_streaming = wants_stream;
+    record.input_tokens = progress.input_tokens;
+    // 断连时没有客户端可见输出，不编造 output_tokens。
+    record.output_tokens = 0;
+    record.credits_used = if progress.credits > 0.0 {
+        Some(progress.credits)
+    } else {
+        None
+    };
+    record.retries = progress.rounds.saturating_sub(1);
+    record.outcome = crate::usage::RequestOutcome::Interrupted;
     if let (Some(c), Some(id)) = (record.credits_used, record.credential_id) {
         provider.report_credits(id, c);
     }
