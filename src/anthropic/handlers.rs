@@ -3623,7 +3623,13 @@ async fn reopen_stream(st: &mut SseStreamState) -> bool {
     match (reopen_fn)().await {
         Ok((resp, new_meta)) => {
             st.retries_used += 1;
-            st.guard.rearm((rebuild_ctx)(), new_meta);
+            // 新 ctx 必须先「消化」一遍初始事件（丢弃返回值）：客户端在提交点已收到
+            // message_start + content_block_start(0)，只有让新状态机走过同一序列，它的
+            // 块状态才与客户端所见一致；否则首个 delta 会因 text_block_index=None 再发
+            // 一次同 index 的 content_block_start（协议违规，实测客户端收到两个块头）。
+            let mut fresh = (rebuild_ctx)();
+            let _ = fresh.generate_initial_events();
+            st.guard.rearm(fresh, new_meta);
             st.body = Box::pin(resp.bytes_stream());
             st.decoder = EventStreamDecoder::new();
             st.deadline = Some(tokio::time::Instant::now() + timeout);

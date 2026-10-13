@@ -4991,6 +4991,24 @@ mod first_token_retry_tests {
             "message_start 必须恰好一次: {names:?}\n{full}"
         );
 
+        // ⑤ content_block_start 恰一次、index 0 不得重复（重开的新 ctx 必须知道
+        //    客户端已收到块头，否则首个 delta 会再发一次 content_block_start(0)）
+        let cbs_count = names
+            .iter()
+            .copied()
+            .filter(|n| *n == "content_block_start")
+            .count();
+        assert_eq!(
+            cbs_count, 1,
+            "content_block_start 必须恰一次（重开不得重复块头）: {names:?}\n{full}"
+        );
+        let starts: Vec<i64> = events
+            .iter()
+            .filter(|(n, _)| n == "content_block_start")
+            .filter_map(|(_, d)| d["index"].as_i64())
+            .collect();
+        assert_eq!(starts, vec![0], "块头 index 必须唯一为 0: {starts:?}");
+
         // ② 首个非 ping 事件必须是 message_start
         let first_non_ping = names
             .iter()
