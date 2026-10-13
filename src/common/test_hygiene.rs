@@ -55,13 +55,12 @@ pub fn find_orphan_tests(file: &str, src: &str) -> Vec<OrphanTest> {
     let mut out = Vec::new();
     for (idx, raw) in lines.iter().enumerate().skip(start) {
         let line = raw.trim();
-        // 判据 2：`fn 名字()` 无参无返回。允许 `async fn`。
+        // 判据 2：`fn 名字()` 无参无返回。
+        // 先剥修饰符（可见性 / async / const / unsafe）再认 `fn `：只列
+        // `fn `/`async fn `/`pub fn ` 会把 `pub(crate) fn` / `pub async fn` 整类漏掉，
+        // 而它们照样能是丢了 `#[test]` 的测试函数——漏报是无声的（见模块文档）。
         // 不匹配 `fn f(x: T)`（有参）、`fn f() -> T`（有返回）。
-        let after_fn = match line
-            .strip_prefix("fn ")
-            .or_else(|| line.strip_prefix("async fn "))
-            .or_else(|| line.strip_prefix("pub fn "))
-        {
+        let after_fn = match strip_fn_modifiers(line).strip_prefix("fn ") {
             Some(rest) => rest,
             None => continue,
         };
@@ -78,6 +77,8 @@ pub fn find_orphan_tests(file: &str, src: &str) -> Vec<OrphanTest> {
         }
 
         // 判据 4：紧邻上方是否有 test / 豁免属性。向上跳过空行、注释、其它属性。
+        // 只认属性**名**（见 [`attr_marks_test_or_exempt`]）：搜属性体里的 `test` 字样会把
+        // `#[cfg(test)]` / `#[doc = "…test…"]` 也当成测试标记，静默放过真孤立测试。
         let mut has_attr = false;
         let mut k = idx;
         while k > 0 {
@@ -87,10 +88,7 @@ pub fn find_orphan_tests(file: &str, src: &str) -> Vec<OrphanTest> {
                 continue;
             }
             if prev.starts_with("#[") || prev.starts_with("#!") {
-                if prev.contains("test")
-                    || prev.contains("allow(dead_code)")
-                    || prev.contains("ignore")
-                {
+                if attr_marks_test_or_exempt(prev) {
                     has_attr = true;
                     break;
                 }
@@ -128,6 +126,57 @@ pub fn find_orphan_tests(file: &str, src: &str) -> Vec<OrphanTest> {
         });
     }
     out
+}
+
+/// 剥掉 `fn` 之前的修饰符（可见性 / `async` / `const` / `unsafe`），只留 `fn …` 开头的部分。
+///
+/// 只认这几种「整词 + 空格」前缀：`let f = fn() {}` 这类形状不该被当成函数定义
+/// （判据宁可漏报不误报，见模块文档）。
+fn strip_fn_modifiers(line: &str) -> &str {
+    let mut rest = line;
+    loop {
+        let next = [
+            "pub(crate) ",
+            "pub(super) ",
+            "pub ",
+            "async ",
+            "const ",
+            "unsafe ",
+        ]
+        .iter()
+        .find_map(|p| rest.strip_prefix(*p));
+        match next {
+            Some(r) => rest = r,
+            None => return rest,
+        }
+    }
+}
+
+/// 判据 4 的属性识别：这个属性是否「测试标记」或「显式豁免」。
+///
+/// 只认属性**名**，不搜属性体。搜属性体会把 `#[cfg(test)]`（只是编译开关，不产生测试入口）、
+/// `#[doc = "…test…"]`、`#[should_panic(expected = "…test…")]` 全当成「已有测试属性」——
+/// 于是「测试段里丢了 `#[test]` 的孤立函数」被静默放过，而漏报的失效形态只是编译警告，
+/// 没人会注意到（见模块文档「失效形态」段）。
+///
+/// 认的名字：`test` / `test_case` / `test_log::test` / `tokio::test` / `rstest`（前缀或后缀为
+/// `test`）、`ignore`、`allow(dead_code)`。多行属性不在覆盖范围（旧实现同样不覆盖）。
+fn attr_marks_test_or_exempt(attr: &str) -> bool {
+    let body = match attr.strip_prefix("#![").or_else(|| attr.strip_prefix("#[")) {
+        // 取到第一个 `]`：容忍 `#[test] // 行尾说明` 这种写法
+        Some(rest) => rest.split(']').next().unwrap_or(rest),
+        None => attr,
+    };
+    // 名字 = 到第一个 `(` / `=` / 空白为止（`#[tokio::test(flavor = "…")]` → `tokio::test`）
+    let name = body
+        .split(['(', '=', ' ', '\t'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    name == "ignore"
+        || name.starts_with("test")
+        || name.ends_with("test")
+        || (name == "allow" && body.contains("dead_code"))
 }
 
 #[cfg(test)]
@@ -355,5 +404,63 @@ fn prod_fn() {
 }
 ";
         assert!(find_orphan_tests("fixture.rs", src).is_empty());
+    }
+
+    /// 判据 4 的正例（review 回归）：属性体里的 `test` 字样**不是**测试标记。
+    /// `#[cfg(test)]` 只是编译开关（不产生测试入口），盖在裸函数上时那个函数照样从未运行过
+    /// —— 必须报出来，否则「文件级 cfg(test) + 无属性 fn」形态下守卫静默失效。
+    #[test]
+    fn cfg_test_attribute_alone_does_not_exempt() {
+        let src = "\
+#[cfg(test)]
+fn orphan_gated_by_cfg_only() {
+    assert!(true);
+}
+";
+        let hits = find_orphan_tests("fixture.rs", src);
+        assert_eq!(hits.len(), 1, "只有 #[cfg(test)] 不算测试属性：{hits:?}");
+        assert_eq!(hits[0].name, "orphan_gated_by_cfg_only");
+    }
+
+    /// 判据 2 的正例（review 回归）：带修饰符的函数形状照样进候选。
+    /// 旧实现只认 `fn `/`async fn `/`pub fn `，`pub(crate) fn` / `pub async fn` 整类漏掉。
+    #[test]
+    fn modifier_prefixed_fns_are_candidates() {
+        let src = "\
+#[cfg(test)]
+mod tests {
+    pub(crate) fn orphan_pub_crate() {
+        assert!(true);
+    }
+
+    pub async fn orphan_pub_async() {
+        assert!(true);
+    }
+}
+";
+        let hits = find_orphan_tests("fixture.rs", src);
+        assert_eq!(hits.len(), 2, "带修饰符的孤立测试必须命中：{hits:?}");
+    }
+
+    /// 判据 4 的反例（review 回归）：真正的测试属性/豁免属性仍要认出来 ——
+    /// 收紧属性识别不能把 `#[tokio::test]` 这类常见写法误判成「无属性」而误报。
+    #[test]
+    fn test_attributes_still_exempt() {
+        let src = "\
+#[cfg(test)]
+mod tests {
+    #[tokio::test(flavor = \"multi_thread\")]
+    async fn real_async_test() {
+        assert!(true);
+    }
+
+    #[ignore]
+    fn ignored_test() {
+        assert!(true);
+    }
+}
+";
+        let hits = find_orphan_tests("fixture.rs", src);
+        assert!(hits.is_empty(), "这些属性必须仍算测试标记：{hits:?}");
     }
 }

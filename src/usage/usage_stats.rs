@@ -556,8 +556,11 @@ impl ClientAgg {
         //    早先无 IP 粘到 unknown 的 session,拿到真实 IP 后归位,不再把真实 IP 灌进 unknown)。
         // 3. 粘到不稳定 key 且本条也无 IP → 沿用(没有更好的)。
         // 4. 无粘滞 → 按本条派生。
-        let sticky = r
-            .session_id
+        // ⚠️ 粘滞查表必须用**归一化后**的会话键：写入侧（下面 `session_machine.insert`）
+        // 存的就是 `session_key`。用原始 `r.session_id` 查，超长 id（> SESSION_KEY_MAX_LEN）
+        // 永远查不到自己刚写下的粘滞 ⇒ DHCP/漫游合并对这类 session 静默失效，
+        // 且粘滞表只写不读（2026-10-14 审计的会话键有界化遗留的读写口径分叉）。
+        let sticky = session_key
             .as_ref()
             .and_then(|sid| self.session_machine.get(sid))
             .cloned();
@@ -714,16 +717,24 @@ impl Inner {
     /// 把模型名收敛成**有界**的模型表 key（两表共用）。
     ///
     /// 两道：① 超长截断（UTF-8 安全，按字符边界）；② 表满则归入 OTHER 桶。
-    /// 已存在的 key 永远直接命中（调用方先查 entry），所以真实模型一旦入表不会被挤进 OTHER。
-    fn normalize_model_key(model: &str, current_len: usize) -> String {
+    ///
+    /// **已入表的 key 永远直接命中**（先查表再判表满）：否则表一满，连存量模型的计数
+    /// 也被一起改道到 OTHER —— 面板的模型分布与成本估计**永久冻结**在 `(other)` 上，
+    /// 直到重启才恢复（2026-10-14 审计指出的失效形态；第 CAP+1 个模型名即可触发，
+    /// 而模型名在 custom_api 透传路径上是客户端可控字符串）。
+    fn normalize_model_key(model: &str, existing: &HashMap<String, Aggregate>) -> String {
         // 按**字符**截断而非字节，避免切裂多字节序列。
         let truncated: String = if model.len() > Self::MODEL_KEY_MAX_LEN {
             model.chars().take(Self::MODEL_KEY_MAX_LEN).collect()
         } else {
             model.to_string()
         };
-        // current_len 是插入**前**的长度，故用 >= 判定。
-        if current_len >= Self::MODEL_KEY_CAP {
+        // 存量 key 直接命中：表满只影响**新** key，存量模型照旧各归各桶。
+        if existing.contains_key(&truncated) {
+            return truncated;
+        }
+        // existing 是插入**前**的长度，故用 >= 判定。
+        if existing.len() >= Self::MODEL_KEY_CAP {
             return Self::MODEL_KEY_OTHER.to_string();
         }
         truncated
@@ -793,13 +804,11 @@ impl Inner {
         // 映射后名虽是受控集，仍走同一套有界策略（MODEL_KEY_CAP/MAX_LEN/OTHER 对两表
         // 分别生效）——历史 JSONL 重放可能带旧实现的脏 key/预判值，不能假设受控。
         // 未映射/失败记录（None）回落 `r.model`，保证「上游维度请求总数 = 总请求数」。
-        self.by_model
-            .entry(Self::normalize_model_key(
-                r.upstream_model.as_deref().unwrap_or(&r.model),
-                self.by_model.len(),
-            ))
-            .or_default()
-            .add(r);
+        let model_key = Self::normalize_model_key(
+            r.upstream_model.as_deref().unwrap_or(&r.model),
+            &self.by_model,
+        );
+        self.by_model.entry(model_key).or_default().add(r);
 
         // 双口径的第二张表：**客户端请求的原始模型名**（`requested_model`；`None` 回落
         // `r.model`）。与 `by_model` 各自独立有界（MODEL_KEY_CAP/MAX_LEN/OTHER 对两表
@@ -809,11 +818,12 @@ impl Inner {
         // 两表语义（2026-08-11 审计修复后）：`by_model` 收 `upstream_model`（映射后名），
         // 本表收 `requested_model`（客户端原始名）——映射命中且改写时两表 key 不同；
         // 未映射/失败记录（None）各自回落 `r.model`，两维度请求总数恒等。
+        let requested_key = Self::normalize_model_key(
+            r.requested_model.as_deref().unwrap_or(&r.model),
+            &self.by_requested_model,
+        );
         self.by_requested_model
-            .entry(Self::normalize_model_key(
-                r.requested_model.as_deref().unwrap_or(&r.model),
-                self.by_requested_model.len(),
-            ))
+            .entry(requested_key)
             .or_default()
             .add(r);
 
@@ -1279,16 +1289,33 @@ impl UsageStats {
 
         let mut errors = 0u64;
         let mut inner = self.inner.lock();
+        // 逐行流式读，不整份 `read_to_string`：繁忙网关的单日 JSONL 可达数百 MB，
+        // 整份读会一次性吃掉等量内存（冷启动 + 管理面 rebuild 都在进程内跑，
+        // 小内存 VPS 上就是一次可避免的峰值）。复用同一个行缓冲，逐行零额外分配。
+        let mut line_buf = String::new();
         for path in files {
-            let content = match fs::read_to_string(&path) {
-                Ok(c) => c,
+            let file = match fs::File::open(&path) {
+                Ok(f) => f,
                 Err(e) => {
                     tracing::warn!("用量统计：读取 {:?} 失败：{e}", path);
                     continue;
                 }
             };
-            for line in content.lines() {
-                if line.trim().is_empty() {
+            let mut reader = std::io::BufReader::new(file);
+            loop {
+                line_buf.clear();
+                match std::io::BufRead::read_line(&mut reader, &mut line_buf) {
+                    Ok(0) => break, // EOF
+                    Ok(_) => {}
+                    Err(e) => {
+                        // 中途读失败（IO 错 / 非法 UTF-8）：与"整份读取失败"同语义——
+                        // 放弃该文件剩余部分并告警，绝不把它当成"已经读完了"。
+                        tracing::warn!("用量统计：读取 {:?} 中断：{e}", path);
+                        break;
+                    }
+                }
+                let line = line_buf.trim();
+                if line.is_empty() {
                     continue;
                 }
                 match serde_json::from_str::<RequestRecord>(line) {
@@ -3556,6 +3583,99 @@ mod tests {
             models[0].key.chars().count() <= Inner::MODEL_KEY_MAX_LEN,
             "模型名未截断：{} 字符",
             models[0].key.chars().count()
+        );
+    }
+
+    /// 回归（2026-10-14 审计）：表满之后**存量**模型名仍必须各归各桶。
+    ///
+    /// 旧 `normalize_model_key` 只看 `current_len >= CAP` 就返回 OTHER：第 CAP+1 个模型名
+    /// 之后，连早已入表的真实模型的计数也一并改道 `(other)` ⇒ 面板的模型分布/成本估计
+    /// **永久冻结**到重启为止。模型名在 custom_api 透传路径上是客户端可控字符串
+    /// （见 `by_model_is_bounded_against_arbitrary_model_names` 的可控性链路），
+    /// 塞满 256 个脏名即可触发。回退即 FAIL：本条断言会看到 sonnet 桶停在 1 条。
+    #[test]
+    fn by_model_keeps_existing_keys_after_cap_is_hit() {
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_bymodel_cap_idem"));
+        // 真实模型先入表（占 1 个 key），再用脏名把表塞满。
+        s.on_record(&rec(
+            0,
+            Some(1),
+            "claude-sonnet-4-5",
+            RequestOutcome::Success,
+            1,
+            1,
+        ));
+        for i in 0..Inner::MODEL_KEY_CAP {
+            s.on_record(&rec(
+                1 + i as i64,
+                Some(1),
+                &format!("junk-cap-{i}"),
+                RequestOutcome::Success,
+                1,
+                1,
+            ));
+        }
+        // 表已满（含 OTHER 桶），再来一条**存量**模型名：必须仍落在自己的桶里。
+        s.on_record(&rec(
+            10_000,
+            Some(1),
+            "claude-sonnet-4-5",
+            RequestOutcome::Success,
+            1,
+            1,
+        ));
+
+        let models = s.by_model(&no_pricing());
+        let sonnet = models
+            .iter()
+            .find(|m| m.key == "claude-sonnet-4-5")
+            .expect("存量模型名的桶不得被表满改道到 (other)");
+        assert_eq!(sonnet.requests, 2, "存量模型的计数必须继续累加");
+        let total: u64 = models.iter().map(|m| m.requests).sum();
+        assert_eq!(
+            total,
+            (Inner::MODEL_KEY_CAP + 2) as u64,
+            "每条记录仍只落一个桶：总量守恒"
+        );
+    }
+
+    /// 回归（2026-10-14 审计遗留）：**超长 session_id** 的粘滞必须与常规 id 同口径可用。
+    ///
+    /// 会话键有界化只改了写入侧（`session_machine.insert(normalized_sid, ..)`），查表侧仍用
+    /// 原始 `r.session_id`：超过 `SESSION_KEY_MAX_LEN` 的 id 永远查不到自己刚写下的粘滞
+    /// ⇒ 同一 session 换 IP 不再合并成一台机器（DHCP/漫游合并静默失效，粘滞表只写不读）。
+    /// 回退即 FAIL：本条会看到第二台机器，而不是第一个 IP 名下的两台机器。
+    #[test]
+    fn overlong_session_id_still_merges_roaming_ips() {
+        let long_sid = "s".repeat(ClientAgg::SESSION_KEY_MAX_LEN + 32);
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_long_sid_sticky"));
+        // 同一 session 先后用两个 IP（DHCP/VPN 漫游）→ 应合并为一台机器。
+        s.on_record(&rec_machine(
+            0,
+            Some(long_sid.as_str()),
+            Some("203.0.113.13"),
+            Some("claude-code"),
+            None,
+            None,
+        ));
+        s.on_record(&rec_machine(
+            1_000,
+            Some(long_sid.as_str()),
+            Some("203.0.113.99"),
+            Some("claude-code"),
+            None,
+            None,
+        ));
+
+        let machines = s.machines_at(BASE_MS + 1_000);
+        let m = machines
+            .iter()
+            .find(|m| m.machine_key == "203.0.113.13")
+            .expect("超长 session_id 也应粘滞到首台机器");
+        assert!(
+            m.ips.contains(&"203.0.113.99".to_string()),
+            "第二个漫游 IP 应被收录到同一台机器: {:?}",
+            m.ips
         );
     }
 
