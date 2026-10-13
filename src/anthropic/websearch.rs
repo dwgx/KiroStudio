@@ -61,12 +61,38 @@ struct SearchedWebSearch {
 /// 判断一轮上游 tool_use 是否「纯 web_search」：非空且全部是 web_search。
 ///
 /// 与参考仓 should_search_round（websearch_loop.rs:177）同语义：一旦混入 exec 等
-/// 客户端工具，就不再回灌（exec 原样回给客户端，绝不吞掉）。`round_idx` 超限时
-/// 即便纯 web_search 也不再继续回灌（见 MAX_WEB_SEARCH_ROUNDS）。
-fn should_replay_round(round_idx: usize, web_search: &[DecodedWebSearch], has_client_tool_use: bool) -> bool {
+/// 客户端工具，就不再回灌（exec 原样回给客户端，绝不吞掉）。`round_idx` 达到
+/// `max_rounds`（客户端 `max_uses` 与网关硬顶的较小值）时即便纯 web_search 也不再回灌。
+fn should_replay_round(
+    round_idx: usize,
+    web_search: &[DecodedWebSearch],
+    has_client_tool_use: bool,
+    max_rounds: usize,
+) -> bool {
     !web_search.is_empty()
         && !has_client_tool_use
-        && round_idx < MAX_WEB_SEARCH_ROUNDS
+        && round_idx < max_rounds
+}
+
+/// 客户端声明的 web_search 轮数上限：`max_uses` 缺省 = [`MAX_WEB_SEARCH_ROUNDS`]，
+/// 并 clamp 到 `0..=MAX_WEB_SEARCH_ROUNDS`。
+///
+/// 为什么缺省等于硬顶而不是另一个数：Anthropic 契约里 `max_uses` 未声明时官方默认 5，
+/// 与本仓历史行为一致 ⇒ 缺省不改变任何现有请求的轮数。上限**不能**被客户端放大到超过
+/// 硬顶（那是网关防无限循环的兜底）。声明 0 = 明确不要检索：仍发一轮拿回答，只是不回灌。
+///
+/// 判据复用 [`tool_is_web_search`]（与快路径闸门同一口径）：否则「name 恰好叫 web_search
+/// 的自定义普通工具」的 max_uses 会误改网关的回灌轮数。
+fn effective_web_search_rounds(payload: &MessagesRequest) -> usize {
+    let declared = payload
+        .tools
+        .as_ref()
+        .and_then(|tools| tools.iter().find(|t| tool_is_web_search(t)))
+        .and_then(|t| t.max_uses);
+    match declared {
+        Some(n) => (n.max(0) as usize).min(MAX_WEB_SEARCH_ROUNDS),
+        None => MAX_WEB_SEARCH_ROUNDS,
+    }
 }
 
 /// 回灌辅助：把上一轮上游返回的 assistant 内容（文本 + web_search tool_use）追加进
@@ -1821,8 +1847,10 @@ pub(super) async fn run_web_search_loop(
     // 循环内 payload 会被追加回灌消息，但 thinking 声明本身不变。
     let thinking_enabled = payload.thinking.as_ref().is_some_and(|t| t.is_enabled());
 
-    // 0..=MAX 而不是 0..MAX：上限那一轮仍要**发出去**（拿到最终回答），只是不再回灌。
-    for round_idx in 0..=MAX_WEB_SEARCH_ROUNDS {
+    // 0..=max 而不是 0..max：上限那一轮仍要**发出去**（拿到最终回答），只是不再回灌。
+    // max 由客户端 `max_uses` 决定（缺省 = 硬顶，见 effective_web_search_rounds）。
+    let max_rounds = effective_web_search_rounds(&payload);
+    for round_idx in 0..=max_rounds {
         let (mut round, credential_id, mapped_model) =
             match run_round(&provider, &payload, budget).await {
                 Ok(v) => v,
@@ -1842,7 +1870,12 @@ pub(super) async fn run_web_search_loop(
         last_context_input = round.context_input_tokens.or(last_context_input);
         total_credits += round.credits;
 
-        if should_replay_round(round_idx, &round.web_search, !round.client_tool_use.is_empty()) {
+        if should_replay_round(
+            round_idx,
+            &round.web_search,
+            !round.client_tool_use.is_empty(),
+            max_rounds,
+        ) {
             // 真搜索：任一条失败就整体报错，绝不把失败静默降级成「没搜到」——
             // 客户端会把空结果当"真的没搜到"，掩盖网关/上游故障（与快路径同一条铁律）。
             // 唯一例外：共享预算耗尽不整包报错 —— 已累积的搜索结果是有价值的部分
@@ -3167,23 +3200,101 @@ mod tests {
         }];
 
         // 纯 web_search 且未超上限 → 回灌
-        assert!(should_replay_round(0, &ws, false));
-        assert!(should_replay_round(MAX_WEB_SEARCH_ROUNDS - 1, &ws, false));
+        assert!(should_replay_round(0, &ws, false, MAX_WEB_SEARCH_ROUNDS));
+        assert!(should_replay_round(
+            MAX_WEB_SEARCH_ROUNDS - 1,
+            &ws,
+            false,
+            MAX_WEB_SEARCH_ROUNDS
+        ));
 
         // 🔴 混入客户端工具（Bash/Edit 等）→ 绝不回灌，整轮回给客户端。
         // 回灌会把客户端工具**吞掉**，用户看到的现象是"CC 说要跑命令但什么都没发生"。
         assert!(
-            !should_replay_round(0, &ws, true),
+            !should_replay_round(0, &ws, true, MAX_WEB_SEARCH_ROUNDS),
             "混入非 web_search 工具时必须收尾，不能吞掉客户端工具"
         );
 
         // 没有 web_search tool_use → 正常回答，收尾
-        assert!(!should_replay_round(0, &[], false));
+        assert!(!should_replay_round(0, &[], false, MAX_WEB_SEARCH_ROUNDS));
 
         // 达到轮数上限 → 停止回灌（防上游持续要搜索导致无限循环）
         assert!(
-            !should_replay_round(MAX_WEB_SEARCH_ROUNDS, &ws, false),
+            !should_replay_round(MAX_WEB_SEARCH_ROUNDS, &ws, false, MAX_WEB_SEARCH_ROUNDS),
             "到达 MAX_WEB_SEARCH_ROUNDS 必须停止回灌"
+        );
+
+        // 客户端声明更小的上限（max_uses=1）→ 第 1 轮之后就不回灌
+        assert!(
+            !should_replay_round(1, &ws, false, 1),
+            "客户端 max_uses=1 时第 1 轮必须收尾"
+        );
+        // 客户端声明 0 → 一轮都不回灌
+        assert!(!should_replay_round(0, &ws, false, 0), "max_uses=0 不得回灌");
+    }
+
+    /// P2-4：`max_uses` 语义 —— 缺省 5、clamp 0..=5、只认原生 web_search 工具。
+    #[test]
+    fn effective_rounds_follow_client_max_uses() {
+        use crate::anthropic::types::{Message, Tool};
+
+        let mk_req = |tools: Option<Vec<Tool>>| MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!("hi"),
+            }],
+            stream: true,
+            system: None,
+            tools,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let mut ws = mk_web_search_tool();
+        ws.max_uses = Some(8); // helper 默认就是 8（大于硬顶）
+
+        // 未声明 max_uses → 硬顶（= 官方默认 5，行为与改前一致）
+        ws.max_uses = None;
+        assert_eq!(
+            effective_web_search_rounds(&mk_req(Some(vec![ws.clone()]))),
+            MAX_WEB_SEARCH_ROUNDS
+        );
+        // 声明 8 → clamp 到硬顶
+        ws.max_uses = Some(8);
+        assert_eq!(
+            effective_web_search_rounds(&mk_req(Some(vec![ws.clone()]))),
+            MAX_WEB_SEARCH_ROUNDS
+        );
+        // 声明 1 → 1
+        ws.max_uses = Some(1);
+        assert_eq!(effective_web_search_rounds(&mk_req(Some(vec![ws.clone()]))), 1);
+        // 声明 0 → 0（明确不要检索）
+        ws.max_uses = Some(0);
+        assert_eq!(effective_web_search_rounds(&mk_req(Some(vec![ws.clone()]))), 0);
+        // 负数（非法输入）→ 0，不 panic
+        ws.max_uses = Some(-3);
+        assert_eq!(effective_web_search_rounds(&mk_req(Some(vec![ws]))), 0);
+        // 无 tools → 硬顶
+        assert_eq!(
+            effective_web_search_rounds(&mk_req(None)),
+            MAX_WEB_SEARCH_ROUNDS
+        );
+        // 普通工具恰好叫 web_search（无 web_search type）→ 不算原生工具，忽略其 max_uses
+        let fake = Tool {
+            tool_type: None,
+            name: "web_search".to_string(),
+            description: "自定义工具".to_string(),
+            input_schema: Default::default(),
+            max_uses: Some(1),
+            cache_control: None,
+        };
+        assert_eq!(
+            effective_web_search_rounds(&mk_req(Some(vec![fake]))),
+            MAX_WEB_SEARCH_ROUNDS,
+            "自定义同名工具不得改网关回灌轮数"
         );
     }
 
