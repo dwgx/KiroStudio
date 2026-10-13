@@ -432,8 +432,8 @@ pub enum CredentialsConfig {
 impl CredentialsConfig {
     /// 从文件加载凭据配置
     ///
-    /// - 如果文件不存在，返回空数组
-    /// - 如果文件内容为空，返回空数组
+    /// - 文件不存在 ⇒ 返回空数组（合法的空池）
+    /// - 文件存在但为空/全空白 ⇒ **Err**（写盘失败或截断的残骸，当空池会静默丢整池）
     /// - 支持单对象或数组格式
     pub fn load<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let path = path.as_ref();
@@ -448,17 +448,28 @@ impl CredentialsConfig {
         // 被当明文解析报一堆看不懂的 JSON 错(且此路径失败会 exit(1))。
         let bytes = fs::read(path)?;
 
-        // 文件为空时返回空数组
+        // ⚠️ 文件**存在但为空**（零字节或全空白）= 写盘中途失败/被截断的残骸，**不是**「空池」：
+        // 合法的空池由 save 写成 `[]`（非空字节，密文态则是一个非空信封）。把它当空池会
+        // 静默丢掉整池凭据且无任何报错 —— 本仓的 fail-safe（解析失败 ⇒ 启动 exit(1)）在此处
+        // 有唯一漏口（2026-10-14 审计发现，与 fs_atomic 的截断回退是同一条数据丢失链）。
+        // 想表达「没有凭据」：删掉该文件（不存在 ⇒ 空池，见上）或写入 `[]`。
         if bytes.iter().all(|b| b.is_ascii_whitespace()) {
-            return Ok(CredentialsConfig::Multiple(vec![]));
+            anyhow::bail!(
+                "凭据文件存在但为空（疑似写盘失败/被截断）: {:?}；\
+                 请删除该文件（不存在 = 空池）或写入 [] 以表示空池",
+                path
+            );
         }
 
         let key_path = crate::common::secret_store::key_path_for(path);
         let content = crate::common::secret_store::maybe_decrypt_to_string(&bytes, &key_path)?;
 
-        // 解密/直通后再判空(密文解出来也可能是空数组的 JSON)。
+        // 解密/直通后再判空：密文信封解出来为空同样只可能来自「明文本来就是空的」⇒ 损坏。
         if content.trim().is_empty() {
-            return Ok(CredentialsConfig::Multiple(vec![]));
+            anyhow::bail!(
+                "凭据文件解密后为空（疑似损坏）: {:?}；请删除该文件或写入 [] 以表示空池",
+                path
+            );
         }
 
         let config = serde_json::from_str(&content)?;
@@ -2358,5 +2369,56 @@ mod tests {
         let creds = KiroCredentials::default();
         let result = creds.effective_proxy(None);
         assert_eq!(result, None);
+    }
+
+    /// 文件**不存在** = 合法空池（首次启动）；存在但为空 = 损坏，必须 Err。
+    ///
+    /// 后者是 2026-10-14 审计发现的 fail-safe 漏口：旧实现把零字节/全空白文件当空池，
+    /// 于是「写盘中途失败留下空文件」会静默丢掉整池凭据且无任何报错。
+    #[test]
+    fn test_load_empty_or_missing_file_semantics() {
+        let dir = std::env::temp_dir().join(format!(
+            "ks_cred_empty_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // ① 不存在 → Ok(空池)
+        let missing = dir.join("nope.json");
+        let loaded = CredentialsConfig::load(&missing).expect("文件不存在必须是合法空池");
+        assert!(loaded.into_sorted_credentials().is_empty());
+
+        // ② 零字节 → Err（不是空池）
+        let empty = dir.join("empty.json");
+        std::fs::write(&empty, b"").unwrap();
+        let err = CredentialsConfig::load(&empty).expect_err("零字节文件必须 Err");
+        assert!(
+            err.to_string().contains("为空"),
+            "错误文案要点明「为空」: {err}"
+        );
+
+        // ③ 全空白 → Err
+        let blank = dir.join("blank.json");
+        std::fs::write(&blank, b"  \n\t  ").unwrap();
+        assert!(
+            CredentialsConfig::load(&blank).is_err(),
+            "全空白文件必须 Err"
+        );
+
+        // ④ 显式空池 `[]` → Ok(空池)（合法写法，别误伤）
+        let explicit = dir.join("explicit.json");
+        std::fs::write(&explicit, b"[]").unwrap();
+        assert!(
+            CredentialsConfig::load(&explicit)
+                .expect("[] 必须可加载")
+                .into_sorted_credentials()
+                .is_empty()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

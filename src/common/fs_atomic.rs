@@ -140,10 +140,19 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
     if let Err(e) = write_tmp() {
         let _ = std::fs::remove_file(&tmp);
-        tracing::warn!("原子写临时文件失败,回退直接写: {:?}: {}", tmp, e);
-        std::fs::write(&target, bytes)?;
-        restrict_permissions(&target);
-        return Ok(());
+        // ⚠️ **绝不回退成「原地截断写」**：`std::fs::write` 先 `File::create`（truncate）再写，
+        // 而临时文件写失败几乎总是磁盘级原因（ENOSPC/EIO/权限），同一条件下再写目标极可能
+        // 再失败一次 —— 留下空文件或半截 JSON，正好推翻本模块的承诺。目标又往往是
+        // `credentials.json`（空文件下游会被静默当空池 ⇒ 号池全丢）/ `config.json`
+        // （半截 ⇒ 启动直接 exit(1)）。宁可这次不写、保留最后一份完好文件：调用方会记
+        // warning，内存态领先磁盘一版，下次 persist 自然重试。
+        // 2026-10-14 审计（持久化面）发现的形态，旧代码此处是 `std::fs::write(&target, bytes)?`。
+        tracing::warn!(
+            "原子写临时文件失败，保留原文件不写（拒绝原地截断）: {:?}: {}",
+            tmp,
+            e
+        );
+        return Err(e);
     }
 
     match rename_with_retry(&tmp, &target) {
@@ -154,14 +163,40 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         }
         Err(e) => {
             tracing::warn!(
-                "原子 rename 重试耗尽,回退直接写: {:?} -> {:?}: {}",
+                "原子 rename 重试耗尽，改用「先备份后原地写」回退: {:?} -> {:?}: {}",
                 tmp,
                 target,
                 e
             );
-            let result = std::fs::write(&target, bytes);
-            if result.is_ok() {
-                restrict_permissions(&target);
+            // 为什么不能直接 `std::fs::write(&target, bytes)`：它先截断目标再写，一旦写失败
+            // 或进程在窗口内被杀，目标就变成空/半截 JSON（本模块承诺消灭的形态）。改为：
+            // 先把旧目标 rename 成同目录 `.bak`（旧内容仍在），再原地写；写失败则把 .bak
+            // 放回。最坏情况（写失败 + 放回也失败）仍留一份完好的 `.bak`，绝不出现「旧内容
+            // 被截掉且新内容没写进去」。2026-10-14 审计（持久化面）发现的形态。
+            let bak = dir.join(format!(".{}.bak", file_name));
+            let had_old = target.exists();
+            if had_old {
+                let _ = std::fs::remove_file(&bak);
+                if let Err(be) = std::fs::rename(&target, &bak) {
+                    // 备份都失败（多半与 rename 同因：句柄占用/只读）→ 不动目标，保留旧文件。
+                    tracing::warn!("回退备份失败，保留原文件不写: {:?}: {}", bak, be);
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e);
+                }
+            }
+            let result = std::fs::copy(&tmp, &target).map(|_| ());
+            match &result {
+                Ok(()) => {
+                    restrict_permissions(&target);
+                    let _ = std::fs::remove_file(&bak);
+                }
+                Err(ce) => {
+                    tracing::warn!("回退原地写失败: {:?}: {}", target, ce);
+                    if had_old {
+                        // 尽力放回备份；失败也只是留下 .bak（人工可恢复），不会更糟。
+                        let _ = std::fs::rename(&bak, &target);
+                    }
+                }
             }
             let _ = std::fs::remove_file(&tmp);
             result
@@ -261,6 +296,51 @@ mod tests {
         std::fs::write(&path, b"old-content-longer").unwrap();
         write_atomic(&path, b"new").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 临时文件写不出来时必须 **Err 且不动目标**（旧代码回退成原地截断写）。
+    #[test]
+    fn test_write_atomic_tmp_failure_returns_err_without_touching_target() {
+        // 父目录不存在 ⇒ 建临时文件必然失败（ENOENT）。跨平台可复现。
+        let dir = std::env::temp_dir().join(format!(
+            "ks_fsatomic_missing_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let path = dir.join("data.json");
+        let err = write_atomic(&path, b"new").expect_err("父目录缺失必须 Err");
+        assert!(
+            !path.exists(),
+            "失败路径不得凭空造出目标文件: {:?}",
+            err
+        );
+    }
+
+    /// 临时文件写失败（只读目录）时，已存在的目标文件必须**逐字节保持原样**。
+    /// Unix-only：Windows 的只读目录不拦文件创建，该场景在 Windows 上无法构造。
+    #[cfg(unix)]
+    #[test]
+    fn test_write_atomic_tmp_failure_keeps_existing_content() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ks_fsatomic_ro_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("credentials.json");
+        std::fs::write(&path, b"{\"old\":true}").unwrap();
+        // 目录改只读 ⇒ 无法在其中创建 .tmp ⇒ 走失败分支。
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let r = write_atomic(&path, b"{\"new\":true}");
+        // 恢复权限以便清理（即使断言失败也不留只读目录）。
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+        assert!(r.is_err(), "只读目录必须 Err");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"{\"old\":true}",
+            "失败时旧内容必须逐字节保持（绝不原地截断）"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
