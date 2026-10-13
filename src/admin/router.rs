@@ -334,11 +334,13 @@ async fn admin_audit_middleware(
         method = %request.method(),
         path = %request.uri().path(),
         client_ip = %ip,
-        "管理操作: {} {} {} client_ip={}",
-        chrono::Utc::now().to_rfc3339(),
-        request.method(),
-        request.uri().path(),
-        ip
+        // 时间戳走**命名字段**而不是塞进 message：`log_buffer` 的访问器会把 message
+        // 之外的字段按 `key=value` 追加到同一条日志里（见 `FieldCollector`），
+        // 于是先前「message 里再写一遍 method/path/ip」的写法在面板上把同一份信息
+        // 打了两遍（`管理操作: 2026-… GET /api/admin/x client_ip=1.2.3.4 [method=GET
+        // path=/api/admin/x client_ip=1.2.3.4]`），既难读也难 grep。
+        time = %chrono::Utc::now().to_rfc3339(),
+        "管理操作"
     );
     next.run(request).await
 }

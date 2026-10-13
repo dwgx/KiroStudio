@@ -175,24 +175,30 @@ pub fn run(cfg: TrayConfig) {
     }
 }
 
-/// host 为 0.0.0.0 时用 127.0.0.1 打开本机面板。
+/// host 为**通配绑定**（`0.0.0.0` / `::` / `[::]` / 空）时改用 `127.0.0.1` 打开本机面板；
+/// 裸 IPv6 字面量补方括号（`http://::1:8990/admin` 不是合法 URL，host 与端口无法切分，
+/// 浏览器/系统会打开失败或解析到别处）。
 ///
 /// 另外**只放行 host 字符集**（字母/数字/`.`/`-`/`:`/`[`/`]`）：该值会拼进
 /// `cmd /C start "" <url>` 交给 shell 解析，含 `&`/`|`/`"` 的 host 可注入命令
 /// （2026-10-14 审计指出；虽只影响本机管理员自己的配置，仍按防御纵深收口）。
-fn browse_host(host: &str) -> &str {
-    if host == "0.0.0.0" {
-        return "127.0.0.1";
+pub(crate) fn browse_host(host: &str) -> String {
+    let h = host.trim();
+    if h.is_empty() || h == "0.0.0.0" || h == "::" || h == "[::]" {
+        return "127.0.0.1".to_string();
     }
-    let safe = !host.is_empty()
-        && host
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'));
-    if safe {
-        host
-    } else {
-        "127.0.0.1"
+    let safe = h
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'));
+    if !safe {
+        return "127.0.0.1".to_string();
     }
+    // 裸 IPv6（有冒号但没方括号）必须补括号，否则 `http://{host}:{port}` 里
+    // 最后一个冒号会被当成 host/port 分隔符（`::1:8990` 解析不出 host）。
+    if h.contains(':') && !h.starts_with('[') {
+        return format!("[{h}]");
+    }
+    h.to_string()
 }
 
 /// 打开默认浏览器（detached cmd start，不阻塞、不弹窗）。
@@ -239,5 +245,10 @@ mod tests {
         assert_eq!(browse_host("a|b"), "127.0.0.1");
         assert_eq!(browse_host("\"quoted\""), "127.0.0.1");
         assert_eq!(browse_host(""), "127.0.0.1");
+        // IPv6：通配绑定回本机；裸字面量补方括号（否则 URL 里 host:port 切不开）。
+        assert_eq!(browse_host("::"), "127.0.0.1");
+        assert_eq!(browse_host("[::]"), "127.0.0.1");
+        assert_eq!(browse_host("::1"), "[::1]");
+        assert_eq!(browse_host("fe80::1"), "[fe80::1]");
     }
 }

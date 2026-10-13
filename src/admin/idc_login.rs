@@ -150,6 +150,28 @@ impl IdcLoginManager {
                 IdcPollResult::Error(e)
             }
             idc::PollTokenResult::Done(token) => {
+                // ⭐ 原子认领：**从表里真的移掉了本会话的那一次调用**才继续建号。
+                //
+                // 轮询不是单飞的——前端是「响应回来再排下一次」，但两个标签页、或客户端
+                // 超时重试都会让同一 session 同时有两次 poll 在飞；两次都拿到 Done 就会
+                // 各自 add_credential，同一份设备码授权在池里建出**两个号**（同 refresh_token
+                // 的重复项，面板上无法区分、删一个另一个还在）。
+                // 认领失败的第二次直接报错返回，不再建号。
+                //
+                // 用 `remove` 的返回值判据而不是先查后删：查与删之间又开了个窗口。
+                // 会话对象是 `Arc`，按指针判等确保移掉的是**本次**克隆的那个会话。
+                let claimed = matches!(
+                    self.sessions.lock().remove(session_id),
+                    Some(s) if Arc::ptr_eq(&s, &session)
+                );
+                if !claimed {
+                    tracing::warn!(
+                        "IDC 上号:同一会话的轮询已被另一次调用认领，本次不重复建号（session={session_id}）"
+                    );
+                    return IdcPollResult::Error(
+                        "该登录会话已由另一次轮询完成，请回面板确认号池".to_string(),
+                    );
+                }
                 let new_cred = KiroCredentials {
                     id: None,
                     access_token: Some(token.access_token),
@@ -204,8 +226,9 @@ impl IdcLoginManager {
 
                 let credential_id = match self.token_manager.add_credential(new_cred).await {
                     Ok(id) => id,
+                    // 会话已在认领时移出（见上方 claim），此处不再 remove：设备码那一次授权
+                    // 已经被消费掉，会话留着只会让人以为还能再点一次。
                     Err(e) => {
-                        self.sessions.lock().remove(session_id);
                         return IdcPollResult::Error(format!("凭据加入失败: {}", e));
                     }
                 };
@@ -221,7 +244,7 @@ impl IdcLoginManager {
                 // 新号自动初始化(异步):刷 token + 解析 profileArn(#89 那种 idc 号必需)。
                 self.token_manager.spawn_initial_refresh(credential_id);
 
-                self.sessions.lock().remove(session_id);
+                // 会话已在认领时移出（见上方 claim），此处不再重复 remove。
                 tracing::info!("IDC 上号成功，新凭据 #{}", credential_id);
                 IdcPollResult::Done { credential_id }
             }

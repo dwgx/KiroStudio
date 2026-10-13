@@ -309,7 +309,6 @@ impl super::AdminService {
         //   （余额加权分流已经在用这个基线，见 token_manager 的 balance_factor）
         let used_now = self.token_manager.credits_used_snapshot();
         let baselines = self.token_manager.balance_baselines();
-        let mut balances = balances;
         for (id, item) in balances.iter_mut() {
             let (Some(&now_used), Some(&base)) = (used_now.get(id), baselines.get(id)) else {
                 continue;
@@ -570,10 +569,12 @@ impl super::AdminService {
             None => return,
         };
 
-        // 持有锁期间完成序列化和写入，防止并发损坏
+        // 持有锁期间完成序列化和写入，防止并发损坏。
+        // 键借 `&str` 而不是 `to_string()` 克隆：这里只是把内存表喂给 serde 一次，
+        // 没必要为每个账号键复制一遍字符串（serde_json 接受 `&str` 键）。
         let cache = self.balance_cache.lock();
-        let map: HashMap<String, &CachedBalance> =
-            cache.iter().map(|(k, v)| (k.to_string(), v)).collect();
+        let map: HashMap<&str, &CachedBalance> =
+            cache.iter().map(|(k, v)| (k.as_str(), v)).collect();
 
         match serde_json::to_string_pretty(&map) {
             Ok(json) => {

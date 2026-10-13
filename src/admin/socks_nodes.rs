@@ -26,6 +26,14 @@ use super::AdminServiceError;
 /// 与 `balance_refresh_interval_secs`（面板可调）定位不同。改这里 + 重启即生效。
 const SOCKS_HEALTH_CHECK_INTERVAL_SECS: u64 = 300;
 
+/// 「只读降级」拒绝写入的统一文案。
+///
+/// 两处（`ensure_socks_writable` 的改内存前拦截、`persist_socks_nodes` 的落盘前拦截）
+/// 必须给出**同一句话**：它们是同一个失效场景的两次拦截，文案漂移会让用户以为遇到了
+/// 两种不同的问题（历史形态是各写一份字面量，改一处漏一处）。
+const SOCKS_READONLY_DEGRADED_ERR: &str = "代理节点表处于只读降级（启动时该文件解密/解析失败）：\
+     为避免覆盖原文件，本次修改未落盘。请修复 at-rest 密钥后重启。";
+
 /// 连续失败多少次后自动禁用该节点（对齐「连续失败 N 次」的调度语义）。
 ///
 /// 判定在 `run_socks_health_round` 内按**连续**失败计数（成功即清零），
@@ -240,13 +248,12 @@ impl super::AdminService {
         }
     }
 
-    /// 从磁盘加载代理节点表。
+    /// 从磁盘加载代理节点表。返回 `(节点表, 下一个可发放的 id, 是否可安全回写)`。
     ///
-    /// **fail-soft**：解密/解析失败一律 `warn!` + 空表，绝不 bail。
+    /// **fail-soft**：解密/解析失败一律 `warn!`/`error!` + 空表，绝不 bail。
     /// 理由：at-rest 密钥是机器绑定的，换机/重建 VPS 时 credentials 那条路径是
     /// `exit(1)`（凭据没了服务本来就没意义），但节点表只是候选池 ——
     /// 不该因为它解不开就让整个网关起不来。
-    /// 从磁盘加载代理节点表。返回 `(节点表, 是否可安全回写)`。
     ///
     /// **「文件缺失」与「文件在但读不出来」必须分开处理**，这是本函数唯一的要点：
     ///
@@ -319,9 +326,7 @@ impl super::AdminService {
         // path 为 None 是纯内存态（单凭据格式），此时 writable 恒 true，与 persist 同口径。
         if self.socks_nodes_path.is_some() && !self.socks_nodes_writable {
             return Err(AdminServiceError::InternalError(
-                "代理节点表处于只读降级（启动时该文件解密/解析失败）：\
-                 为避免覆盖原文件，本次修改未落盘。请修复 at-rest 密钥后重启。"
-                    .into(),
+                SOCKS_READONLY_DEGRADED_ERR.into(),
             ));
         }
         Ok(())
@@ -342,9 +347,7 @@ impl super::AdminService {
         };
         if !self.socks_nodes_writable {
             return Err(AdminServiceError::InternalError(
-                "代理节点表处于只读降级（启动时该文件解密/解析失败）：\
-                 为避免覆盖原文件，本次修改未落盘。请修复 at-rest 密钥后重启。"
-                    .into(),
+                SOCKS_READONLY_DEGRADED_ERR.into(),
             ));
         }
         let enc = self.token_manager.config().encrypt_credentials_at_rest;

@@ -114,12 +114,13 @@ fn maybe_open_browser_on_first_run(freshly_generated: bool, host: &str, port: u1
         return;
     }
     let is_loopback = matches!(host, "127.0.0.1" | "localhost" | "::1" | "0.0.0.0");
-    // host 为 0.0.0.0（监听所有网卡）时用 127.0.0.1 打开本机面板。
-    let browse_host = if host == "0.0.0.0" { "127.0.0.1" } else { host };
     if !is_loopback {
         return;
     }
-    let url = format!("http://{}:{}/admin", browse_host, port);
+    // host 为 0.0.0.0（监听所有网卡）时用 127.0.0.1 打开本机面板；IPv6 字面量补方括号。
+    // 复用托盘那套（`tray::browse_host`）：同一个 host 拼 URL 的规则只留一份，
+    // 免得两处各自演进（`::1` 会拼出 `http://::1:8990` 这种打不开的 URL）。
+    let url = format!("http://{}:{}/admin", tray::browse_host(host), port);
     use std::os::windows::process::CommandExt;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -169,10 +170,31 @@ fn bootstrap_config_if_missing(config_path: &str) -> (String, bool) {
         Path::new(config_path).to_path_buf()
     };
     let resolved_str = resolved.to_string_lossy().to_string();
-    if resolved.exists() {
-        return (resolved_str, false); // 已有配置，尊重用户，不碰；非首次
-    }
     let target = resolved;
+
+    // ⭐ 用**独占创建**当认领（不是 `exists()` 判存）：先前是「判存 → 生成 → fs::write」，
+    // 双击两次/两个进程同时起时两边都能通过判存，各自生成一套密钥并各自打印，
+    // 后写的那份把先写的覆盖掉 ⇒ **控制台上那套密钥当场作废**（用户照着敲必然 401）。
+    // 独占创建让只有一个进程能赢，输家直接按「已有配置」返回，绝不打印、绝不覆盖。
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // 含密钥的文件必须**创建那一刻**就只对属主开放：先前是写完再 chmod，
+        // 中间那段窗口里 umask 决定的可读位会把两把密钥暴露给本机其它用户。
+        opts.mode(0o600);
+    }
+    // 认领句柄在 `if let` 结束时就关掉：内容随后由 `write_atomic` 以「临时文件 → rename」
+    // 覆盖写入，句柄留着只会让 Windows 上的 rename 多一层共享冲突风险。
+    if let Err(e) = opts.open(&target) {
+        // 另一个进程先认领了（或用户本来就有配置）⇒ 尊重已有文件，什么都不做。
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            return (resolved_str, false);
+        }
+        tracing::error!("[引导] 自动生成配置失败({}): {e}；请手动创建 config.json 或用 start.bat", target.display());
+        return (resolved_str, false);
+    }
 
     let api_key = generate_strong_key("sk-kiro");
     let admin_key = generate_strong_key("sk-admin");
@@ -187,16 +209,16 @@ fn bootstrap_config_if_missing(config_path: &str) -> (String, bool) {
         "defaultEndpoint": "ide",
     });
     let body = serde_json::to_string_pretty(&cfg).unwrap_or_default();
-    if let Err(e) = std::fs::write(&target, body) {
+    // 内容走原子写（temp→fsync→rename，创建即 0600）：裸 `fs::write` 先截断再写，
+    // 进程在截断与写完之间被杀就留下**空/半截 config.json**，而下次启动看见文件存在
+    // 就跳过生成 ⇒ 用户被一个损坏的配置永久挡住（密钥也没打印过，无从恢复）。
+    if let Err(e) = common::fs_atomic::write_atomic(&target, body.as_bytes()) {
+        // 写失败要**撤销认领**：留一个空文件在那里，下次启动会以为「已有配置」而不重试，
+        // 于是首次引导彻底失效。删掉后重跑即可重新生成。
+        let _ = std::fs::remove_file(&target);
         // 写失败不阻断：继续走原流程（大概率随后因缺 apiKey 退出并报错），但先告知原因。
         tracing::error!("[引导] 自动生成配置失败({}): {e}；请手动创建 config.json 或用 start.bat", target.display());
         return (resolved_str, false);
-    }
-    // Unix 收紧权限（含密钥，仅属主可读写）；Windows 依赖 NTFS ACL，此调用 no-op。
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600));
     }
 
     // 大字横幅打印密钥 + 面板地址（用户据此登录 /admin 上号）。用 println! 确保裸双击也能看到。
@@ -445,7 +467,14 @@ async fn main() {
     });
 
     if proxy_config.is_some() {
-        tracing::info!("已配置 HTTP 代理: {}", config.proxy_url.as_ref().unwrap());
+        // 脱敏再打：手改/旧版 config.json 可能把账密内嵌在 URL 里（`socks5://user:pass@host:port`），
+        // 而这条日志会进面板的日志环形缓冲、并随 bug 报告导出 —— 与
+        // `credentials.rs::mask_proxy_url` 同口径，只留 scheme+host+port。
+        let raw = config.proxy_url.as_deref().unwrap_or("");
+        tracing::info!(
+            "已配置 HTTP 代理: {}",
+            crate::http_client::split_proxy_credentials(raw).0
+        );
     }
 
     // 构建端点注册表（收口在 endpoint::registry，避免此处与旁路各自维护一份端点清单）：
@@ -931,8 +960,14 @@ async fn main() {
     );
     // 只打印固定短前缀 + 长度指纹，不按比例暴露密钥（半个密钥会显著降低爆破熵）
     {
-        let masked = if api_key.len() > 8 {
-            format!("{}…{}", &api_key[..4], &api_key[api_key.len() - 2..])
+        // 按**字符**切前后缀：apiKey 来自用户配置，非 ASCII（手填中文/全角）时按字节切片
+        // 会落在 char 边界外 → `byte index is not a char boundary` 启动即 panic，
+        // 而报错与真实原因（密钥不是 ASCII）毫无关系，排障会被带偏。
+        let n = api_key.chars().count();
+        let masked = if n > 8 {
+            let head: String = api_key.chars().take(4).collect();
+            let tail: String = api_key.chars().skip(n - 2).collect();
+            format!("{head}…{tail}")
         } else {
             "***".to_string()
         };
@@ -1020,15 +1055,23 @@ async fn main() {
         // 新进程）后，通知主线程优雅关闭（drain 在途请求、关 SQLite），主线程随后以退出码 3 退出。
         // run.bat 监督循环见退出码 3 = 用户主动退出、不重拉；由重启脚本单独拉起新进程 → 无双拉。
         // 与面板一键重启同源（复用 admin::service::spawn_windows_relaunch_process）。
+        //
+        // ⚠️ 助手没拉起来时**绝不通知退出**：退出码 3 的含义是「用户主动退出、监督脚本别重拉」，
+        // 若此时没有重启脚本，进程一退就再也没人拉起它（托盘这一支恰恰是裸跑双击场景，没有
+        // 监督脚本兜底）。宁可这次"重启没反应"并留下错误日志，也不把服务弄没。
         let relaunch_trigger: Box<dyn Fn() + Send> = Box::new(move || {
             tracing::info!("[托盘] 用户点击重启服务，spawn 重启脚本并优雅关闭…");
-            admin::spawn_windows_relaunch_process(
+            match admin::spawn_windows_relaunch_process(
                 Some(relaunch_config_path.clone()),
                 Some(relaunch_credentials_path.clone()),
                 &relaunch_host,
                 relaunch_port,
-            );
-            tray::quit_notify().notify_one();
+            ) {
+                Ok(()) => tray::quit_notify().notify_one(),
+                Err(e) => tracing::error!(
+                    "[托盘] 重启脚本未能拉起，已取消本次重启（服务继续运行，请改用面板「一键重启」或手动重启）: {e}"
+                ),
+            }
         });
         std::thread::Builder::new()
             .name("kiro-tray".into())

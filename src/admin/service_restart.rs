@@ -32,7 +32,11 @@ impl super::AdminService {
         // 加相同的 --config/--credentials 参数、相同 cwd 重新拉起,再由本进程 exit(0)。
         #[cfg(target_os = "windows")]
         {
-            self.spawn_windows_relaunch();
+            // ⭐ 助手没拉起来就**绝不退出**：先前不管 spawn 成败都返回 Ok 并照常 exit(0)，
+            // 于是「spawn 失败 + 本进程已退」= 服务当场消失、没有任何人拉起它（正是本模块
+            // 反复担心的「服务就此消失」形态，而日志只留在被杀掉的进程里）。现在失败直接
+            // 冒泡成 500，进程继续跑，用户看得到错、可以重试。
+            self.spawn_windows_relaunch()?;
             tokio::spawn(async {
                 // 睡 1 秒让本次 HTTP 200 flush 给前端,再退出让出端口,helper 会拉起新进程。
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -44,9 +48,10 @@ impl super::AdminService {
 
         // macOS：和 Windows 一样没有监督者会在 exit(0) 后自动拉起，且不像 Linux 有 systemd
         // 兜底——同样 spawn 一个 detached 助手，等端口释放后拉起新二进制，再自行退出。
+        // 助手失败同样**不退出**（理由见上）。
         #[cfg(target_os = "macos")]
         {
-            self.spawn_macos_relaunch();
+            self.spawn_macos_relaunch()?;
             tokio::spawn(async {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 tracing::warn!("一键重启(macOS):进程退出,已交给 detached 助手拉起新二进制");
@@ -80,13 +85,18 @@ impl super::AdminService {
     /// 为什么要中间脚本而非当前进程直接 spawn 新 exe：新旧进程抢同一监听端口,当前进程还没退出、
     /// 端口没释放,新 exe 会 bind 失败。脚本先 sleep 等旧进程退出+端口释放,再启动新 exe。
     #[cfg(target_os = "windows")]
-    fn spawn_windows_relaunch(&self) {
+    fn spawn_windows_relaunch(&self) -> Result<(), AdminServiceError> {
         // 复用模块级自由函数（托盘「重启服务」项亦共用同一逻辑），传入启动时的
         // config/credentials 路径，让新进程用同一套路径重启。
         let config = self.token_manager.config();
         let config_path = config.config_path().map(|p| p.to_path_buf());
         let credentials_path = self.token_manager.credentials_path();
-        spawn_windows_relaunch_process(config_path, credentials_path, &config.host, config.port);
+        spawn_windows_relaunch_process(config_path, credentials_path, &config.host, config.port)
+            .map_err(|e| {
+                AdminServiceError::InternalError(format!(
+                    "自重启脚本未能拉起，已**取消本次退出**（服务继续运行）：{e}。请手动重启，或用 start.bat/run.bat 的监督循环重启"
+                ))
+            })
     }
 
     /// macOS 专用：spawn 一个 detached shell 助手，sleep 后 exec 拉起新二进制。
@@ -99,15 +109,16 @@ impl super::AdminService {
     /// 不重定向 stdio：助手与 exec 出的新进程沿用当前的 stdout/stderr（终端或已重定向的日志
     /// 文件），保持和重启前一致的日志去向。
     #[cfg(target_os = "macos")]
-    fn spawn_macos_relaunch(&self) {
+    fn spawn_macos_relaunch(&self) -> Result<(), AdminServiceError> {
         use std::process::Command;
 
         // OTA 已把新二进制放到原 exe 路径（rename 旧→.bak、new→原路径）。current_exe 即目标。
         let exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => {
-                tracing::error!("macOS 自重启:取 current_exe 失败,无法拉起新进程: {e}");
-                return;
+                return Err(AdminServiceError::InternalError(format!(
+                    "macOS 自重启:取 current_exe 失败,无法拉起新进程（已取消本次退出）: {e}"
+                )));
             }
         };
         // 新进程的工作目录：沿用当前 cwd（config/credentials 相对路径解析依赖它）。
@@ -140,12 +151,15 @@ impl super::AdminService {
         }
 
         match cmd.spawn() {
-            Ok(_) => tracing::warn!(
-                "macOS 自重启:已 spawn 重启助手(sleep 3s 后拉起 {exe:?}),本进程退出后由它接管端口"
-            ),
-            Err(e) => tracing::error!(
-                "macOS 自重启:spawn 重启助手失败,OTA/一键重启后服务可能不会自动恢复,请手动重启: {e}"
-            ),
+            Ok(_) => {
+                tracing::warn!(
+                    "macOS 自重启:已 spawn 重启助手(sleep 3s 后拉起 {exe:?}),本进程退出后由它接管端口"
+                );
+                Ok(())
+            }
+            Err(e) => Err(AdminServiceError::InternalError(format!(
+                "macOS 自重启:spawn 重启助手失败,已取消本次退出（服务继续运行）,请手动重启: {e}"
+            ))),
         }
     }
 }
@@ -239,13 +253,17 @@ pub(crate) fn windows_relaunch_bat(cwd_line: &str, launch: &str, exe: &str, heal
 /// 托盘线程也能调）。`config_path` / `credentials_path` 由调用方传入（启动参数），让新进程
 /// 用同一套路径。`listen_host` / `listen_port` 用于启动后探 `/healthz`；失败且存在 OTA
 /// `.bak` 时回滚旧二进制。为何用 .bat + 中间脚本 + `CREATE_BREAKAWAY_FROM_JOB` 的完整原因见函数体注释。
+///
+/// 返回 `Err` = **重启助手没有拉起来**。调用方据此**取消本次退出**：先前这里失败只打日志、
+/// 调用方照常 `exit(0)`，于是进程退掉而没人拉起它 ⇒ 服务静默消失（用户看到的是"点了重启
+/// 就再也没起来"，而解释这件事的日志随进程一起没了）。
 #[cfg(target_os = "windows")]
 pub(crate) fn spawn_windows_relaunch_process(
     config_path: Option<PathBuf>,
     credentials_path: Option<PathBuf>,
     listen_host: &str,
     listen_port: u16,
-) {
+) -> Result<(), String> {
     {
         use std::io::Write;
         use std::os::windows::process::CommandExt;
@@ -256,7 +274,7 @@ pub(crate) fn spawn_windows_relaunch_process(
             Ok(p) => p,
             Err(e) => {
                 tracing::error!("Windows 自重启:取 current_exe 失败,无法拉起新进程: {e}");
-                return;
+                return Err(format!("取 current_exe 失败: {e}"));
             }
         };
         // 新进程的工作目录：沿用当前 cwd（config/credentials 相对路径解析依赖它）。
@@ -290,12 +308,15 @@ pub(crate) fn spawn_windows_relaunch_process(
                 Ok(f) => f,
                 Err(e) => {
                     tracing::error!("Windows 自重启:创建重启脚本失败,请手动重启: {e}");
-                    return;
+                    return Err(format!("创建重启脚本失败: {e}"));
                 }
             };
             if let Err(e) = f.write_all(bat.as_bytes()) {
+                // 半截脚本比没有脚本更坏（cmd 会照着执行一半），且它留在 %TEMP% 里
+                // 直到用户手动清 —— 删掉再报错。
+                let _ = std::fs::remove_file(&bat_path);
                 tracing::error!("Windows 自重启:写重启脚本失败,请手动重启: {e}");
-                return;
+                return Err(format!("写重启脚本失败: {e}"));
             }
         }
 
@@ -325,13 +346,22 @@ pub(crate) fn spawn_windows_relaunch_process(
         let result = spawn_with(base_flags | CREATE_BREAKAWAY_FROM_JOB)
             .or_else(|_| spawn_with(base_flags));
         match result {
-            Ok(_) => tracing::warn!(
-                "Windows 自重启:已 spawn 重启脚本({:?}),将在本进程退出后拉起 {exe:?}",
-                bat_path
-            ),
-            Err(e) => tracing::error!(
-                "Windows 自重启:spawn 重启脚本失败,OTA 后服务可能不会自动恢复,请手动重启: {e}"
-            ),
+            Ok(_) => {
+                tracing::warn!(
+                    "Windows 自重启:已 spawn 重启脚本({:?}),将在本进程退出后拉起 {exe:?}",
+                    bat_path
+                );
+                Ok(())
+            }
+            Err(e) => {
+                // spawn 失败 ⇒ 这个脚本永远不会被执行、也永远不会自删（它只在自己跑完后
+                // `del "%~f0"`），留在 %TEMP% 里纯属垃圾 —— 删掉再报错。
+                let _ = std::fs::remove_file(&bat_path);
+                tracing::error!(
+                    "Windows 自重启:spawn 重启脚本失败,OTA 后服务可能不会自动恢复,请手动重启: {e}"
+                );
+                Err(format!("spawn 重启脚本失败: {e}"))
+            }
         }
     }
 }
