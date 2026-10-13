@@ -510,6 +510,13 @@ impl ClientAgg {
     /// 累加一条记录到客户端/窗口速率环。
     fn bump(&mut self, r: &RequestRecord, slot: i64) {
         let client_key = Self::client_key_of(r);
+        // 会话键**有界化**（session_id 来自客户端元数据，未受信）：与模型名同款两道中的
+        // 第一道（超长截断）。此前只有模型名做了这件事，session_id 可被超长字符串放大单条
+        // 内存（2026-10-14 审计指出）。
+        let session_key = r
+            .session_id
+            .as_deref()
+            .and_then(Self::normalize_session_key);
 
         // 客户端维度速率环
         self.by_client
@@ -518,7 +525,7 @@ impl ClientAgg {
             .bump(slot);
 
         // 窗口维度：仅在有 session_id 时统计（无窗口标识的请求不计入窗口拆分）
-        if let Some(sid) = r.session_id.clone() {
+        if let Some(sid) = session_key.clone() {
             self.by_session
                 .entry(sid.clone())
                 .or_insert_with(CredRateRing::new)
@@ -588,7 +595,7 @@ impl ClientAgg {
         //   - 已有粘滞但本条是真实 IP 且与旧值不同 → 覆盖(把早先误粘到 "unknown"/device 的
         //     session 升级到真实机器,并把它从旧组移除,根治 unknown 黑洞越滚越大)。
         // 缺 IP 的请求绝不建立粘滞(否则不同真实机器的缺 IP 请求会互相并入同一 "unknown")。
-        if let Some(sid) = r.session_id.clone() {
+        if let Some(sid) = session_key.clone() {
             // 单一归属不变量:一个 session 任一时刻只能属于一台机器。归到 machine_key 前,
             // 先把它从**其它所有**机器组移除——否则会重复出现在两台机器下(如先无 IP 落
             // "unknown"/device 组、后来真实 IP 落 IP 组,旧组残留没清 → RPM 双计、两处都列)。
@@ -607,6 +614,23 @@ impl ClientAgg {
                 self.session_machine.insert(sid, machine_key);
             }
         }
+    }
+
+    /// 会话键（`by_session` / `session_meta` / `machine_sessions` 共用）的最大保留长度。
+    ///
+    /// 与 `Inner::MODEL_KEY_MAX_LEN` 同款理由：`session_id` 来自客户端元数据（未受信），
+    /// 不设上限就能用超长字符串放大单条内存。按**字符**截断，避免切裂多字节序列。
+    const SESSION_KEY_MAX_LEN: usize = 128;
+
+    /// 把客户端给的 `session_id` 收敛成有界 key；空/纯空白归 `None`（不计入窗口拆分）。
+    fn normalize_session_key(raw: &str) -> Option<String> {
+        if raw.trim().is_empty() {
+            return None;
+        }
+        if raw.chars().count() > Self::SESSION_KEY_MAX_LEN {
+            return Some(raw.chars().take(Self::SESSION_KEY_MAX_LEN).collect());
+        }
+        Some(raw.to_string())
     }
 
     /// 惰性剔除窗口外（max_slot < now_slot-(RATE_BUCKETS-1)）不再活跃的条目。
@@ -2517,6 +2541,24 @@ mod tests {
         // 时间前进到窗口之外，旧数据不再出现
         let later = s.recent_rate_at(7, BASE_MS + 60 * 60 * 1000);
         assert_eq!(later, vec![0u32; RATE_BUCKETS]);
+    }
+
+    /// 审计 2026-10-14：会话键必须有界（此前只有模型名有界，超长 session_id 可放大单条内存）。
+    #[test]
+    fn session_key_is_bounded_and_blank_maps_to_none() {
+        let long: String = "会".repeat(300);
+        let key = ClientAgg::normalize_session_key(&long).expect("非空应得 Some");
+        assert_eq!(key.chars().count(), ClientAgg::SESSION_KEY_MAX_LEN);
+        assert!(key.chars().all(|c| c == '会'), "不得切裂多字节字符");
+        assert!(ClientAgg::normalize_session_key("").is_none(), "空串=无窗口标识");
+        assert!(
+            ClientAgg::normalize_session_key("   ").is_none(),
+            "纯空白=无窗口标识"
+        );
+        assert_eq!(
+            ClientAgg::normalize_session_key("sess-abc").as_deref(),
+            Some("sess-abc")
+        );
     }
 
     /// 构造一条带客户端画像的记录（含 session_id / client_ip / device）
