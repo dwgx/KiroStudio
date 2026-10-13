@@ -3378,8 +3378,32 @@ impl KiroProvider {
                     None => candidate.transform_api_body(request_body, &rctx),
                 };
 
-                let base = self
-                    .client_for(&ctx.credentials)?
+                // ⚠️ client 构造失败（该号的代理 URL 非法 / TLS 后端初始化失败）只代表**这个号**
+                // 的代理配置有问题，不该让整条 failover 链一起死。此前这里是 `?`：一个坏代理号
+                // 的失败直接穿透 `call_api_with_retry`，既丢掉已经分类好的 `last_error`（429 等）、
+                // 吞掉失败样本，又让池里的健康号一次机会都没有 —— 与 MCP 路径同一类出口
+                // （那边已按「已知问题 #11 的 7 个失败出口」改成记错不裸传）。
+                // 处置取**换号**（continue 'attempt）而不是换端点：client 只由凭据的
+                // effective_proxy 决定、与端点无关，链内顺延必然同错。本号在本跳开头已记入
+                // `tried_this_call`，下一轮 `acquire_context_excluding` 会结构性避开它，不会空转。
+                // 不递增 `upstream_calls`：请求根本没发出去，不该占「每请求 ≤N 次上游」的额度。
+                let client = match self.client_for(&ctx.credentials) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(
+                            credential_id = ctx.id,
+                            error = %e,
+                            "构造上游 client 失败（代理/TLS 配置），换号重试"
+                        );
+                        // 只在还没有更具体错误时覆盖：链内先有可吸收的 429 时保留它，
+                        // 否则会把这轮错误判成不可吸收而旁路吸收层（同全局闸满处的处置）。
+                        if last_error.is_none() {
+                            last_error = Some(e);
+                        }
+                        continue 'attempt;
+                    }
+                };
+                let base = client
                     .post(&url)
                     .body(body)
                     .header("content-type", candidate.content_type());
@@ -4115,6 +4139,14 @@ impl KiroProvider {
                                 status,
                                 body
                             ));
+                            // ⚠️ 必须把它从「本请求已试过」里摘掉，否则下一跳
+                            // `acquire_context_excluding` 会**结构性避开它** ⇒ 这次「同号重试」打的
+                            // 是别人的号，本地纠正对**本请求**等于没生效（日志那句「同号重试一次」
+                            // 也就成了假的）。摘掉只是让它恢复**可被选中**（仍要过冷却/RPM 等既有
+                            // 硬门），不是强行指定 —— 与 bearer-invalid 403 换区、429 换桶两处的
+                            // 处置逐字同款。下一跳若选了别的号并成功，纠正结果仍随凭据落库，
+                            // 下一条客户端请求自然用上。
+                            tried_this_call.remove(&ctx.id);
                             // continue → 下一轮 acquire_context 重克隆已改好 region 的 creds(不复用旧 ctx/url)。
                             continue 'attempt;
                         }
@@ -4162,6 +4194,14 @@ impl KiroProvider {
                             .is_ok()
                         {
                             tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
+                            // 同 region 纠正处：刷新成功意味着这个号刚被修好，把它留在
+                            // 「本请求已试过」集合里会让下一跳 `acquire_context_excluding`
+                            // 结构性避开它 ⇒ 本次刷新对本请求零收益（日志那句「重试请求」
+                            // 实际变成「换个号重试」）。摘掉只是恢复**可被选中**
+                            // （仍要过冷却/RPM 等既有硬门），不是强行指定；
+                            // `force_refreshed` 已含该 id ⇒ 它再吃一次 401/403 时不会二次刷新，
+                            // 直接落下方 report_failure + failover，不会形成循环。
+                            tried_this_call.remove(&ctx.id);
                             continue 'attempt;
                         }
                         tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
@@ -4770,7 +4810,23 @@ impl KiroProvider {
                     let machine_id =
                         machine_id::generate_from_credentials(&ctx.credentials, &config);
                     // overload fallback：降级模型重试走单端点（首选），不参与换桶——罕见路径。
-                    if let Ok(endpoint) = self.endpoint_for(&ctx.credentials) {
+                    //
+                    // client_for 失败（代理/TLS 配置错误）与 endpoint_for 失败**同语义：跳过兜底**，
+                    // 落回下方的终态构造（fail_record + assemble_final_error）。此处不能用 `?`：
+                    // 那会丢掉已经分类好的 `last_error`、也不记失败样本（与链循环里的同款修复同因）。
+                    let fallback_client = match self.client_for(&ctx.credentials) {
+                        Ok(c) => Some(c),
+                        Err(e) => {
+                            tracing::warn!(
+                                "overload_fallback 构造上游 client 失败（代理/TLS 配置），跳过兜底: {}",
+                                e
+                            );
+                            None
+                        }
+                    };
+                    if let (Some(client), Ok(endpoint)) =
+                        (fallback_client, self.endpoint_for(&ctx.credentials))
+                    {
                         let rctx = RequestContext {
                             credentials: &ctx.credentials,
                             token: &ctx.token,
@@ -4780,8 +4836,7 @@ impl KiroProvider {
                         };
                         let url = endpoint.api_url(&rctx);
                         let body = endpoint.transform_api_body(&fallback_body, &rctx);
-                        let base = self
-                            .client_for(&ctx.credentials)?
+                        let base = client
                             .post(&url)
                             .body(body)
                             .header("content-type", endpoint.content_type());

@@ -130,14 +130,53 @@ impl OnboardingDiagnosis {
     }
 }
 
+/// 在**已小写化**的 body 里找一个 OIDC 错误码，要求其后是词边界。
+///
+/// 为什么不用裸 `contains`：`invalid_grant` 是 `invalid_grant_type` 的前缀、
+/// `invalid_client` 是 `invalid_client_metadata` 的前缀 —— 裸子串会把「另一种错误」
+/// 判成前者（错归因）。判据必须落在**完整码**上。
+fn body_has_code(lower_body: &str, code: &str) -> bool {
+    let mut from = 0usize;
+    while let Some(rel) = lower_body[from..].find(code) {
+        let end = from + rel + code.len();
+        // 码后一个字符必须是「非标识符字符」（`"`、`,`、`}`、空白、串尾皆可）。
+        let boundary_ok = lower_body[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
+        if boundary_ok {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
 /// 诊断 token 刷新（oidc /token）的非 2xx 响应。收录本轮实测坐实的模式。
 ///
 /// `status` = 上游 HTTP 状态码；`body` = 上游响应体原文。
 pub fn diagnose_refresh(status: u16, body: &str) -> OnboardingDiagnosis {
-    let raw = Some(format!("{} {}", status, body));
-    // ① refresh_token 永久失效：invalid_grant + Invalid refresh token provided。
-    if status == 400 && body.contains("\"invalid_grant\"") && body.contains("Invalid refresh token")
-    {
+    // 折叠给用户看的 `raw` 走**与 trace 落盘同一条管道**（先截断到 2KiB 再脱敏）：
+    // OIDC 错误体可能回显 refreshToken / clientSecret（`error_description` 里带请求片段），
+    // 而本结构体既 `Serialize`（随 AdminErrorResponse 进面板）又 `Debug`，
+    // 原文直存等于把凭据放进客户端可见面 + 日志面，且没有长度上界。
+    // ⚠️ 判据一律读**原文** `body`，脱敏只作用于展示字段。
+    let raw = Some(format!(
+        "{} {}",
+        status,
+        crate::kiro::upstream_trace::sanitize_body(body)
+    ));
+    // 匹配一律大小写不敏感：错误码/描述的大小写不在上游契约里（`INVALID_GRANT` 同样合法），
+    // 按原样区分大小写会把标准错误甩进兜底的 UNKNOWN 分支（错归因 + 引导失真）。
+    let lower = body.to_ascii_lowercase();
+    // ① refresh_token 永久失效：invalid_grant。
+    //    `/token` 端点上的 grant 就是 refresh_token（本仓只发 refresh_token 授权），
+    //    故标准码 invalid_grant 即「这个 refresh_token 不能再用」。
+    //    此前额外要求描述里出现 "Invalid refresh token" 那句英文 ⇒ 标准形态
+    //    `{"error":"invalid_grant","error_description":"The provided authorization grant is invalid"}`
+    //    匹配不上，落到兜底 UNKNOWN_REFRESH_ERROR（Gateway、不可重试），
+    //    用户失去「重新上号」这条唯一有效引导。
+    if status == 400 && body_has_code(&lower, "invalid_grant") {
         return OnboardingDiagnosis::new(
             Stage::Refresh,
             Fault::AccountState,
@@ -151,13 +190,19 @@ pub fn diagnose_refresh(status: u16, body: &str) -> OnboardingDiagnosis {
             false,
         );
     }
-    // ② client 凭证与 token 不匹配 / client 注册过期（#98 实测：invalid_request + Invalid token provided）。
+    // ② client 凭证与 token 不匹配 / client 注册过期。
     //    SSO-OIDC 的 client 注册有有效期（~90 天）；或 clientId/secret 与发 refresh_token 的 client 不是同一个。
+    //    两支判据：
+    //      - 标准码 `invalid_client`（OIDC 用它表示 client 认证失败）。此前它被写在
+    //        「先出现 invalid_request」的条件里 ⇒ `{"error":"invalid_client"}` 这种标准体
+    //        结构上永远匹配不到（那种体里没有 invalid_request），直接落兜底。
+    //      - #98 实测：invalid_request + "Invalid token provided"。
+    //    ⚠️ 裸子串 `client` 已删除：它会把「缺 client_id / 参数校验」这类**网关侧请求构造
+    //    问题**也判成账号态（Fault::AccountState + 引导重新上号），与本模块铁律
+    //    「只有能确证归因才归因」冲突。宁可落 UNKNOWN（Gateway + 提示反馈）也不假归因。
     if status == 400
-        && body.contains("\"invalid_request\"")
-        && (body.contains("Invalid token")
-            || body.contains("invalid_client")
-            || body.contains("client"))
+        && (body_has_code(&lower, "invalid_client")
+            || (body_has_code(&lower, "invalid_request") && lower.contains("invalid token")))
     {
         return OnboardingDiagnosis::new(
             Stage::Refresh,
@@ -224,10 +269,64 @@ pub fn diagnose_refresh(status: u16, body: &str) -> OnboardingDiagnosis {
 }
 
 /// 诊断 IdC device flow 全 region 探测失败（start URL 在所有候选 region 都无对应实例）。
+///
+/// `last_err` = 最后一个 region 的上游错误串（`register_client@<region>: ...` /
+/// `device_authorization@<region>: ...`，见 `auth/idc.rs` 的探测循环）。
+///
+/// ⚠️ **必须先看 `last_err` 再归因**：全 region 失败**不等于** start URL 错 ——
+/// 网络不通 / 代理配错 / AWS 5xx 会让每个 region 同样失败（探测循环对这类错误是
+/// 「记 last_err 继续试下一个」）。把它们说成「你的 start URL 拼错了」会让用户去改一个
+/// 没问题的旋钮，正是本模块铁律（只有能确证归因才归因）要拦的形态。
+/// 只有确认「上游按实例判否」（400/404，探测主判据）时才归 [`Fault::UserInput`]。
 pub fn diagnose_device_auth_all_failed(
     tried_regions: usize,
     last_err: Option<&str>,
 ) -> OnboardingDiagnosis {
+    let raw = last_err.map(|s| s.to_string());
+    if let Some(err) = last_err {
+        // 5xx：`reqwest::StatusCode` 的 Display 带短语（`503 Service Unavailable`），
+        // 故按「空格 + 5 + 两位数字」找状态码，而不是匹配裸 "503"。
+        if has_http_5xx_status(err) {
+            return OnboardingDiagnosis::new(
+                Stage::DeviceAuth,
+                Fault::Upstream,
+                "UPSTREAM_5XX",
+                format!(
+                    "所试的 {} 个 region 的 IdC 端点均返回上游 5xx（AWS 侧故障），与 start URL 无关。",
+                    tried_regions
+                ),
+                &[
+                    "稍后重试；这是 AWS 侧临时故障，不是账号或网关问题。",
+                    "若持续多小时，可在 AWS Health Dashboard 确认区域故障。",
+                ],
+                raw,
+                true,
+            );
+        }
+        // 传输层失败（DNS/TCP/TLS/代理）：请求根本没到 AWS，归因给网络。
+        // 判据取**具体**形态而非裸 `connect`（后者会命中任意描述里的同词）——
+        // 见 [`has_transport_marker`]。
+        if has_transport_marker(err) {
+            return OnboardingDiagnosis::new(
+                Stage::DeviceAuth,
+                Fault::Transient,
+                "NETWORK_ERROR",
+                format!(
+                    "所试的 {} 个 region 都因网络/代理问题失败（请求未到达 AWS），与 start URL 无关。",
+                    tried_regions
+                ),
+                &[
+                    "检查本机网络与代理配置（网关的 proxy 设置 / 容器出网）。",
+                    "确认 oidc.<region>.amazonaws.com 可解析、可连通后重试。",
+                ],
+                raw,
+                true,
+            );
+        }
+    }
+    // 其余（含 400/404「该 region 无此实例」与无法识别的形态）：维持原有归因。
+    // 未识别形态**不**改判 Gateway：本探测的失败主判据就是 400 invalid_request，
+    // 而用户侧引导（查 IAM Identity Center 的实例 region）在那条路径上是唯一可操作项。
     OnboardingDiagnosis::new(
         Stage::DeviceAuth,
         Fault::UserInput,
@@ -241,9 +340,49 @@ pub fn diagnose_device_auth_all_failed(
             "到 AWS IAM Identity Center 控制台 → 设置，查看实例所在 region，在上号时手动填该 region。",
             "IdC 实例绑定单一 region，start URL 本身不含 region 信息，故需确认后手填。",
         ],
-        last_err.map(|s| s.to_string()),
+        raw,
         false,
     )
+}
+
+/// 错误串里是否出现 HTTP 5xx 状态码（形如 ` 503` / ` 502 Service Unavailable`）。
+///
+/// 要求前导空格（上游错误串的固定形态是 `<动作> 失败 <code> <phrase>`）且后一位不再是
+/// 数字，免得把别的数字（端口、耗时、耗时毫秒数）当成状态码。
+fn has_http_5xx_status(err: &str) -> bool {
+    let b = err.as_bytes();
+    (0..b.len().saturating_sub(3)).any(|i| {
+        b[i] == b' '
+            && b[i + 1] == b'5'
+            && b[i + 2].is_ascii_digit()
+            && b[i + 3].is_ascii_digit()
+            && !b.get(i + 4).is_some_and(|c| c.is_ascii_digit())
+    })
+}
+
+/// 传输层失败标记（reqwest `Display` 的实测形态 + 本仓自造前缀）。
+///
+/// 只收**具体**串：`connect` 这类裸词会命中任意描述里的同词，把真正的上游业务错误
+/// 误判成网络问题（反方向的错归因，同样是错）。
+fn has_transport_marker(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    [
+        "error sending request", // reqwest 连接层包装（DNS/TCP/TLS/代理皆走它）
+        "error trying to connect",
+        "connection refused",
+        "connection reset",
+        "connection aborted",
+        "connection closed",
+        "timed out",
+        "timeout",
+        "dns error",
+        "failed to lookup address",
+        "no such host",
+        "certificate", // 证书链/时间/主机名不符
+        "proxy",
+    ]
+    .iter()
+    .any(|m| lower.contains(m))
 }
 
 /// 诊断 ListAvailableProfiles 在某 region 返回空 profile 列表（该 region 未开通）。
@@ -260,6 +399,19 @@ pub fn diagnose_no_profile_in_region(
             found_regions.join("、")
         )
     };
+    // 引导**按事实构造**：`found_regions` 为空时根本不存在「上面列出的已开通 region」，
+    // 无条件的第三句会把用户指到一个不存在的列表（引导自相矛盾 = 比没有引导更糟）。
+    let mut guidance: Vec<&str> = vec![
+        "若刚加入订阅组，profile 传播最多需 24 小时，请稍后再探测。",
+        "确认该账号确实在此 region 开通了 Kiro/CodeWhisperer 订阅。",
+    ];
+    if found_regions.is_empty() {
+        guidance.push(
+            "若已确认该账号从未开通任何 Kiro/CodeWhisperer 订阅，需先在 AWS 侧开通该订阅后再探测。",
+        );
+    } else {
+        guidance.push("可切换到上面列出的已开通 region 使用。");
+    }
     OnboardingDiagnosis::new(
         Stage::ProbeRegion,
         Fault::AccountState,
@@ -268,11 +420,7 @@ pub fn diagnose_no_profile_in_region(
             "该账号在 {} 未开通 Kiro profile。{}",
             probed_region, found_hint
         ),
-        &[
-            "若刚加入订阅组，profile 传播最多需 24 小时，请稍后再探测。",
-            "确认该账号确实在此 region 开通了 Kiro/CodeWhisperer 订阅。",
-            "可切换到上面列出的已开通 region 使用。",
-        ],
+        &guidance,
         None,
         true,
     )
@@ -361,6 +509,150 @@ mod tests {
     fn test_diagnose_no_profile_empty_found() {
         let d = diagnose_no_profile_in_region("ap-south-1", &[]);
         assert!(d.summary.contains("所有已探测 region"));
+        // 引导不得指向不存在的「上面列出的 region」列表
+        assert!(
+            !d.guidance.iter().any(|g| g.contains("上面列出")),
+            "found_regions 为空时不能出现指向空列表的引导: {:?}",
+            d.guidance
+        );
+        // 非空时该引导必须在（否则用户不知道可以换区）
+        let d2 = diagnose_no_profile_in_region("ap-south-1", &["us-east-1".to_string()]);
+        assert!(d2.guidance.iter().any(|g| g.contains("上面列出")));
+    }
+
+    /// 标准 OIDC 形态：invalid_grant 且描述**不含** "Invalid refresh token" 那句英文。
+    /// 旧判据要求两者同时出现 ⇒ 该体落兜底 UNKNOWN（错归因 + 丢「重新上号」引导）。
+    #[test]
+    fn test_diagnose_refresh_invalid_grant_without_phrase() {
+        let d = diagnose_refresh(
+            400,
+            r#"{"error":"invalid_grant","error_description":"The provided authorization grant is invalid"}"#,
+        );
+        assert_eq!(d.code, "REFRESH_TOKEN_INVALID");
+        assert_eq!(d.fault, Fault::AccountState);
+        assert!(!d.retriable);
+    }
+
+    /// 标准 `invalid_client` 体：旧判据要求先有 "invalid_request" ⇒ 该支结构性不可达。
+    #[test]
+    fn test_diagnose_refresh_invalid_client_is_reachable() {
+        let d = diagnose_refresh(
+            400,
+            r#"{"error":"invalid_client","error_description":"Invalid client credentials"}"#,
+        );
+        assert_eq!(d.code, "CLIENT_OR_TOKEN_MISMATCH");
+        assert_eq!(d.fault, Fault::AccountState);
+    }
+
+    /// 大小写变体不得改变归因（上游错误码大小写不在契约里）。
+    #[test]
+    fn test_diagnose_refresh_matching_is_case_insensitive() {
+        let d = diagnose_refresh(400, r#"{"ERROR":"INVALID_GRANT"}"#);
+        assert_eq!(d.code, "REFRESH_TOKEN_INVALID");
+    }
+
+    /// 裸子串 `client` 已删：`invalid_request` 里只是**提到** client（缺参数等网关侧
+    /// 构造问题）不得被判成账号态 + 引导重新上号（假归因）。
+    #[test]
+    fn test_diagnose_refresh_invalid_request_mentioning_client_is_not_account_state() {
+        let d = diagnose_refresh(
+            400,
+            r#"{"error":"invalid_request","error_description":"Missing client_id parameter"}"#,
+        );
+        assert_eq!(d.code, "UNKNOWN_REFRESH_ERROR");
+        assert_eq!(d.fault, Fault::Gateway, "拿不准必须诚实标 Gateway");
+        assert!(!d.retriable);
+    }
+
+    /// 词边界：`invalid_grant_type` 不是 `invalid_grant`（前缀误命中 = 错归因）。
+    #[test]
+    fn test_diagnose_refresh_code_prefix_does_not_match() {
+        let d = diagnose_refresh(
+            400,
+            r#"{"error":"invalid_grant_type","error_description":"unsupported"}"#,
+        );
+        assert_eq!(d.code, "UNKNOWN_REFRESH_ERROR");
+    }
+
+    /// `raw` 是客户端可见（AdminErrorResponse）且 `Debug` 可打印的字段：
+    /// 必须已脱敏且有界（OIDC 错误体可能回显 refreshToken / clientSecret）。
+    #[test]
+    fn test_diagnose_refresh_raw_is_redacted_and_bounded() {
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.signature";
+        let body = format!(
+            r#"{{"error":"invalid_request","error_description":"Invalid token provided","echo":"Bearer {jwt}"}}"#
+        );
+        let d = diagnose_refresh(400, &body);
+        let raw = d.raw.as_deref().unwrap();
+        assert!(!raw.contains(jwt), "token 不得原文进 raw: {raw}");
+        assert!(raw.contains("[REDACTED]"), "应打码而不是整段丢弃: {raw}");
+
+        // 超大 body 必须有界（旧实现原样存下整个上游响应体）
+        let huge = format!(
+            "{}<html>{}</html>",
+            "x".repeat(crate::kiro::upstream_trace::BODY_MAX_BYTES + 4096),
+            "y".repeat(1024)
+        );
+        let d = diagnose_refresh(502, &huge);
+        let raw = d.raw.as_deref().unwrap();
+        assert!(
+            raw.len() <= crate::kiro::upstream_trace::BODY_MAX_BYTES + 64,
+            "raw 必须被截断（{} 字节）",
+            raw.len()
+        );
+    }
+
+    /// 全 region 失败但根因是上游 5xx / 传输层：不得说成「start URL 拼错了」。
+    #[test]
+    fn test_diagnose_device_auth_5xx_is_upstream_not_user_input() {
+        let d = diagnose_device_auth_all_failed(
+            6,
+            Some("device_authorization@us-east-1: Device authorization 失败 503 Service Unavailable: <html>oops</html>"),
+        );
+        assert_eq!(d.code, "UPSTREAM_5XX");
+        assert_eq!(d.fault, Fault::Upstream);
+        assert!(d.retriable, "上游 5xx 可重试");
+    }
+
+    #[test]
+    fn test_diagnose_device_auth_transport_is_transient_not_user_input() {
+        let d = diagnose_device_auth_all_failed(
+            6,
+            Some(
+                "register_client@us-east-1: error sending request for url (https://oidc.us-east-1.amazonaws.com/client/register): error trying to connect: Connection refused (os error 111)",
+            ),
+        );
+        assert_eq!(d.code, "NETWORK_ERROR");
+        assert_eq!(d.fault, Fault::Transient);
+        assert!(d.retriable);
+    }
+
+    /// 主判据（每区 400 = 该区无此实例）仍归 UserInput —— 这是本探测的常态结局，
+    /// 上面两条分支不得把它吃掉。
+    #[test]
+    fn test_diagnose_device_auth_400_keeps_region_mismatch() {
+        let d = diagnose_device_auth_all_failed(
+            6,
+            Some(
+                "device_authorization@eu-west-1: Device authorization 失败 400 Bad Request: {\"error\":\"invalid_request\"}",
+            ),
+        );
+        assert_eq!(d.code, "REGION_MISMATCH");
+        assert_eq!(d.fault, Fault::UserInput);
+        // 无法识别的形态同样保持原归因（见函数文档的取舍说明）
+        let d2 = diagnose_device_auth_all_failed(6, None);
+        assert_eq!(d2.code, "REGION_MISMATCH");
+    }
+
+    /// 5xx 状态码判据不得被别的数字（端口/耗时）误触发。
+    #[test]
+    fn test_has_http_5xx_status_boundaries() {
+        assert!(has_http_5xx_status("x 失败 500 Internal Server Error"));
+        assert!(has_http_5xx_status("x 失败 599: something"));
+        assert!(!has_http_5xx_status("x 失败 400 Bad Request"));
+        assert!(!has_http_5xx_status("took 5123 ms to connect"));
+        assert!(!has_http_5xx_status("端口 5000 被占用"));
+        assert!(!has_http_5xx_status(""));
     }
 
     #[test]

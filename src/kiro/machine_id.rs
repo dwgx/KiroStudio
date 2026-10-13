@@ -2,7 +2,7 @@
 //!
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
@@ -14,7 +14,8 @@ use crate::model::config::Config;
 /// 兜底 machineId 缓存（按凭据 id 分桶，进程生命周期内稳定）
 ///
 /// key 为 `credentials.id`；无 id 的凭据共享同一个兜底值（正常流程不会出现）。
-static FALLBACK_MACHINE_IDS: OnceLock<Mutex<HashMap<Option<u64>, String>>> = OnceLock::new();
+static FALLBACK_MACHINE_IDS: LazyLock<Mutex<HashMap<Option<u64>, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// 派生 machineId 缓存（缓存 SHA256 派生结果，进程内复用）
 ///
@@ -23,7 +24,14 @@ static FALLBACK_MACHINE_IDS: OnceLock<Mutex<HashMap<Option<u64>, String>>> = Onc
 /// 缓存条目连同派生材料一起存下，查询时比对 `prefix + material`，任一不同即视为
 /// 未命中并重算覆盖。这样即便 refreshToken 轮换（派生材料变化），也绝不会返回旧值。
 /// 热路径（同一请求的多次重试 attempt）材料不变，用一次 memcmp 替代 SHA256+分配。
-static DERIVED_MACHINE_IDS: OnceLock<Mutex<HashMap<Option<u64>, DerivedEntry>>> = OnceLock::new();
+///
+/// ⚠️ 已知缺口（2026-10-14 审计记录，未修）：本表与 [`FALLBACK_MACHINE_IDS`] 都
+/// **只增不减**（删号/换号后条目留在进程里，含 `material` 原文）。量级极小
+/// （每号一条、id 永不复用，与 provider 的 `forget_credential_runtime_state` 判断同源），
+/// 但「条目里存着已删凭据的 refreshToken 原文」是真实的残留面：要清就得在删号入口
+/// 接线（跨层改动），故留待单独拍板。
+static DERIVED_MACHINE_IDS: LazyLock<Mutex<HashMap<Option<u64>, DerivedEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// 派生缓存条目：记录派生材料以保证缓存 key 覆盖全部输入
 struct DerivedEntry {
@@ -38,8 +46,18 @@ struct DerivedEntry {
 /// 标准化 machineId 格式
 ///
 /// 支持以下格式：
-/// - 64 字符十六进制字符串（直接返回）
-/// - UUID 格式（如 "2582956e-cc88-4669-b546-07adbffcb894"，移除连字符后补齐到 64 字符）
+/// - 64 字符十六进制字符串（**原样返回**，不改大小写 —— 见下）
+/// - UUID 格式（如 `"2582956e-cc88-4669-b546-07adbffcb894"`）：移除连字符后按 32 位
+///   十六进制**文本**做 SHA256，得到 64 字符十六进制（不是「补齐到 64 字符」——
+///   旧文档那么写，与代码不符）
+///
+/// ⚠️ 两条**刻意不做的**「规范化」，改之前先读：
+/// 1. 不把 64 位十六进制转小写。返回值会原样发给上游，而上游按 machineId 做设备绑定/去重
+///    ⇒ 悄悄转小写等于给已配置大写形态的部署换一次设备指纹，属没人要求的行为回退。
+/// 2. 不按 UUID 的 16 字节哈希（而是哈希去连字符的文本）：同上，形态一旦发出去过就不能改。
+/// 需要「大小写不同的等价配置折叠成同一指纹」时，由运营者自己写小写形态。
+///
+/// 本函数只做**格式识别**：不认识的形态返回 `None`，调用方据此回落到派生/兜底路径。
 fn normalize_machine_id(machine_id: &str) -> Option<String> {
     let trimmed = machine_id.trim();
 
@@ -81,6 +99,11 @@ pub fn random_machine_id() -> String {
 }
 
 pub fn generate_from_credentials(credentials: &KiroCredentials, config: &Config) -> String {
+    // ⚠️ 已知缺口（2026-10-14 审计记录，未修）：配置了但 `normalize_machine_id` 不认的
+    // machineId 在这里被**静默忽略**，回落到派生/兜底指纹 —— 运营者设了个格式不对的值
+    // 会以为生效了。没就地补 warn 是因为本函数在**请求热路径**上（每个上游请求一次），
+    // 逐次 warn 会变成日志风暴；要修得配 per-id 去重（一次性的 warn 表）或改成显式报错，
+    // 两条都属行为/状态面改动，需单独拍板。
     // 如果配置了凭据级 machineId，优先使用
     if let Some(ref machine_id) = credentials.machine_id {
         if let Some(normalized) = normalize_machine_id(machine_id) {
@@ -120,8 +143,7 @@ pub fn generate_from_credentials(credentials: &KiroCredentials, config: &Config)
 /// 只要派生材料（api_key / refresh_token）或路径变化就重算并覆盖，因此缓存
 /// key 实质覆盖了派生的全部输入，绝不会返回过期值。
 fn cached_derive(id: Option<u64>, prefix: &'static str, material: &str) -> String {
-    let cache = DERIVED_MACHINE_IDS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut map = cache.lock();
+    let mut map = DERIVED_MACHINE_IDS.lock();
     if let Some(entry) = map.get(&id) {
         if entry.prefix == prefix && entry.material == material {
             return entry.value.clone();
@@ -147,19 +169,23 @@ fn cached_derive(id: Option<u64>, prefix: &'static str, material: &str) -> Strin
 /// - 进程重启会重新随机；不持久化
 /// - 每个凭据首次生成时 warn 一次
 fn fallback_machine_id(credentials: &KiroCredentials) -> String {
-    let cache = FALLBACK_MACHINE_IDS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut map = cache.lock();
-    if let Some(existing) = map.get(&credentials.id) {
-        return existing.clone();
-    }
-
-    let seed = Uuid::new_v4();
-    let derived = sha256_hex(&format!("KiroFallback/{}", seed));
+    // ⚠️ 先算出值、**释放锁之后**再打日志：`tracing` 的订阅者在本仓是可插拔的
+    // （任何 subscriber 里再回到本模块取 machineId 都会撞上这把非重入锁 → 死锁），
+    // 且持锁写日志会让所有其它凭据的派生一起排队。
+    let derived = {
+        let mut map = FALLBACK_MACHINE_IDS.lock();
+        if let Some(existing) = map.get(&credentials.id) {
+            return existing.clone();
+        }
+        let seed = Uuid::new_v4();
+        let derived = sha256_hex(&format!("KiroFallback/{}", seed));
+        map.insert(credentials.id, derived.clone());
+        derived
+    };
     tracing::warn!(
         credential_id = ?credentials.id,
         "凭据缺少派生材料（kiroApiKey/refreshToken 均不可用），使用随机兜底 machineId（进程内稳定）"
     );
-    map.insert(credentials.id, derived.clone());
     derived
 }
 

@@ -181,7 +181,12 @@ pub(super) fn round_retry_quota(base_quota: usize, attempts_before: u32) -> usiz
 /// **小号池降重试**：号池很小（`total <= SMALL_POOL_THRESHOLD`）时，每号重试次数降为 1。
 /// 因为小池下重试循环只会反复选到同几个号——被限流时多打几次纯属反复砸、加重冷却，
 /// 不如让每个号各摸一次就把上游错误透传给客户端（客户端自身有退避重试，比网关内反复砸温和）。
-/// 号多时行为完全不变（仍 `MAX_RETRIES_PER_CREDENTIAL`）。
+///
+/// ⚠️ 号多时（`total > SMALL_POOL_THRESHOLD`）的**实际**行为：`total × MAX_RETRIES_PER_CREDENTIAL`
+/// 恒被 `.min(ABSOLUTE_MAX_TOTAL_RETRIES)` 夹到硬上限（`total >= 4` ⇒ `total × 3 >= 12` ⇒ 恒为 4）。
+/// 即当前参数下 **per-cred 系数不构成实际约束**，返回值的形状是
+/// `if total <= 3 { total.max(1) } else { 4 }`。该分支刻意保留：它是「硬上限一旦抬高就重新生效」
+/// 的潜变量（删掉会让将来的硬上限失去 per-cred 保护），**不是**死代码。
 pub(super) fn compute_max_retries(total: usize, _available: usize) -> usize {
     // `_available` 保留在签名里但**不再参与计算**：见下方 `.min()` 处的说明。
     // 保留参数是为了不改动调用点与既有测试；将来若确认永不需要，再一并删除。

@@ -63,13 +63,16 @@ impl super::MultiTokenManager {
         // 可观测:开了加密但实际没加密成(密钥文件读写失败等)→ 记健康标志,消除安全预期偏差。
         crate::common::recovery_metrics::set_at_rest_healthy(!enc || encrypted);
 
-        // 原子写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| write_atomic(path, &bytes))
-                .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
-        } else {
-            write_atomic(path, &bytes).with_context(|| format!("回写凭据文件失败: {:?}", path))?;
-        }
+        // 原子写入文件。⚠️ 2026-10-14：**不用** `block_in_place` —— 判据不能是
+        // `Handle::try_current().is_ok()`：`spawn_blocking` 线程与普通 OS 线程上它也返回
+        // Ok，而 `block_in_place` 在那些线程上直接 panic（「can call blocking only when
+        // running on the multi-threaded runtime」），current_thread runtime 同样 panic。
+        // 本函数是凭据落盘路径，panic 发生在快照取完之后 ⇒ 内存里刚做的禁用/加号**没落盘**
+        // 且调用方拿到的是 panic 而不是可处理的 Err。
+        // 与 `cooldown.rs` 的 save（2026-08-13 对抗审查 M5）同一处置：文件小（KB 级）、
+        // `write_atomic` 的 rename 重试上界 6 次 × 10~50ms（≈150ms 最坏），同步写阻塞 worker
+        // 可接受，换来的是「任何 runtime 形态下都不会 panic」。
+        write_atomic(path, &bytes).with_context(|| format!("回写凭据文件失败: {:?}", path))?;
 
         tracing::debug!(
             "已回写凭据到文件: {:?}(加密开关={} 实际加密={})",
@@ -115,15 +118,18 @@ impl super::MultiTokenManager {
         let key_path = crate::common::secret_store::key_path_for(&path);
         let (bytes, encrypted) =
             crate::common::secret_store::encode_for_disk(json.as_bytes(), enc, &key_path);
+        // 可观测：与 `persist_credentials` **同口径**置健康标志。trash 里同样是完整凭据
+        // （refreshToken / apiKey / 代理口令），而 `encode_for_disk` 在密钥文件或 AEAD 失败时
+        // 会**静默回退明文**、只返回 `encrypted=false` —— 少了这一句，trash.json 明文落盘
+        // 时面板的 at-rest 健康标志仍显示正常（那一侧只被 credentials 的写入更新）。
+        // 反方向（credentials 成功覆盖 trash 的失败）无解：标志是单一全局量，取「任一文件回退
+        // 过即不健康」是更保守的一侧，宁可多报不可漏报。
+        crate::common::recovery_metrics::set_at_rest_healthy(!enc || encrypted);
 
-        // 原子写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| write_atomic(&path, &bytes))
-                .with_context(|| format!("回写回收站文件失败: {:?}", path))?;
-        } else {
-            write_atomic(&path, &bytes)
-                .with_context(|| format!("回写回收站文件失败: {:?}", path))?;
-        }
+        // 原子写入文件。⚠️ 理由与 `persist_credentials` 同处逐字一致：不用 `block_in_place`
+        // （`Handle::try_current()` 不是安全判据，见该处注释）。
+        write_atomic(&path, &bytes)
+            .with_context(|| format!("回写回收站文件失败: {:?}", path))?;
 
         tracing::debug!(
             "已回写回收站到文件: {:?}(加密开关={} 实际加密={})",

@@ -58,6 +58,10 @@ const MAX_USER_ID_DIGITS: usize = 24;
 /// 那个无关括号里的数字会被当成账号身份记进 trace ⇒ 映射表被污染 ⇒
 /// 「几个账号」这个唯一判据失真。回归测试 `should_not_capture_far_away_parenthesis`
 /// 钉住这条。
+///
+/// 与之配套的第二道约束在 [`extract_parenthesized_digits`] 里：窗口内**只允许**跨过
+/// ASCII 空白与 ASCII 单词字符（`.` / `)` / `=` 这类标点一律作废本次锚点）——
+/// 窗口宽度管「多远」，字符集管「能不能跨」。
 const ANCHOR_TO_PAREN_WINDOW: usize = 8;
 
 /// 解析结果的三态分类。
@@ -87,7 +91,8 @@ pub fn parse_upstream_user_id(body: &str) -> Option<String> {
 
 /// [`parse_upstream_user_id`] 的三态版本，供离线分析区分「无锚点」与「有锚点无 ID」。
 ///
-/// 扫描策略：找到每一个 `user id` 锚点（大小写不敏感、允许中间是空白/`-`/`_`/无分隔），
+/// 扫描策略：找到每一个 `user id` 锚点（大小写不敏感、允许中间是空白/`-`/`_`/无分隔，
+/// 但**两侧必须是标识符边界** —— 见 [`match_anchor`]），
 /// 在其后 [`ANCHOR_TO_PAREN_WINDOW`] 字节内找 `(`，括号内必须是纯数字。
 /// 第一个满足全部条件的即返回；有锚点但无一满足 ⇒ [`UserIdSignal::AnchorWithoutId`]。
 pub fn classify_upstream_user_id(body: &str) -> UserIdSignal {
@@ -118,14 +123,38 @@ pub fn classify_upstream_user_id(body: &str) -> UserIdSignal {
 ///
 /// 命中返回锚点**结束后**的字节下标。全 ASCII 比较 ⇒ 不会切断多字节字符
 /// （UTF-8 续字节均 >= 0x80，永远不会等于任何 ASCII 字面量）。
+///
+/// ⚠️ 两侧都要求**标识符边界**（相邻字节不得是 ASCII 字母数字或 `_`）。
+/// 这是「拿不准返回 None，绝不猜」那条契约在锚点这一层的落点：
+/// - 缺右侧边界：`user identity (186648603162)` 会在 `identity` 里命中 `id`，而其后的
+///   `(` 距锚点仅 7 字节（落在 [`ANCHOR_TO_PAREN_WINDOW`] 内）⇒ 一个**不是账号身份**的
+///   括号数字被当成 User ID 记进映射表，且扫描就此提前结束（同一条 body 后面真正的
+///   `Your User ID (898…)` 再也读不到）；
+/// - 缺左侧边界：`foo_user_id` 这类**别的字段名**同样会被当成锚点。
+///
+/// 边界判据把 `_` 当标识符字符（`user_id_extra` / `foo_user_id` 因此不命中），
+/// 而 `user_id` / `user-id` / `userid` / `"User ID"` 这些真实形态全部保留。
 fn match_anchor(bytes: &[u8], at: usize) -> Option<usize> {
+    // 左侧边界：`at` 是串首（无前驱字节）或前一字节不是标识符字符。
+    if at > 0 && is_ident_byte(bytes[at - 1]) {
+        return None;
+    }
     let mut i = eat_ascii_ci(bytes, at, b"user")?;
     // 分隔符：空白 / `-` / `_` 任意个（含 0 个，覆盖 `userid`）
     while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r' | b'-' | b'_') {
         i += 1;
     }
     let i = eat_ascii_ci(bytes, i, b"id")?;
+    // 右侧边界：`id` 不得是更长标识符的前缀（`identity` / `identifier` / `ids`）。
+    if bytes.get(i).is_some_and(|b| is_ident_byte(*b)) {
+        return None;
+    }
     Some(i)
+}
+
+/// ASCII 标识符字节（字母数字或 `_`）。锚点两侧的词边界判据用它。
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 /// 大小写不敏感地吃掉一个 ASCII 字面量，成功则返回其后的下标。
@@ -146,12 +175,25 @@ fn eat_ascii_ci(bytes: &[u8], at: usize, lit: &[u8]) -> Option<usize> {
 ///
 /// 严格要求闭括号：`(1866...)` 这种被省略号截断的形态在遇到 `.` 时即失败 ⇒ 返回 None。
 /// 这正是「拿不准不猜」那条契约的落点 —— 截断前缀相同的两个账号会被并成一个。
+///
+/// ⚠️ 窗口内**只允许跨过 ASCII 空白与 ASCII 单词字符**（线上真实形态是
+/// `Your User ID (898055051935)`，锚点与 `(` 之间只有一个空格；多留的 `is` / 换行 / 缩进
+/// 是给上游改书写用的余量）。此前这条约束只写在注释里、代码却是「一路找到 `(` 为止」，
+/// 于是下面这些**与锚点无关**的括号数字全被记成账号身份（错 id 比 `None` 更糟：
+/// 它会把不同账号并成一个，让「几个账号」这个唯一判据自我实现）：
+///   - `Your User ID. (186648603162)` —— `.` 被跨过
+///   - `Your User ID) (1)` / `Your User ID!(1)` —— 一个计数器被当成身份
+///   - `userid=(123456789012)` —— `=` 被跨过
+/// 现在遇到任何其它字节（标点 / 多字节字符首字节）即**放弃本次锚点**，
+/// 由 [`classify_upstream_user_id`] 继续扫下一个锚点。
 fn extract_parenthesized_digits(bytes: &[u8], from: usize) -> Option<String> {
     let window_end = from.saturating_add(ANCHOR_TO_PAREN_WINDOW).min(bytes.len());
     let mut i = from;
-    // 窗口内找 `(`；只允许跨过空白与 ASCII 单词字符（`is` / `：` 之类的 ASCII 部分），
-    // 遇到 `(` 即停。窗口本身是硬上界。
+    // 窗口内找 `(`；只允许跨过空白与 ASCII 单词字符，遇到 `(` 即停。窗口本身是硬上界。
     while i < window_end && bytes[i] != b'(' {
+        if !(bytes[i].is_ascii_whitespace() || bytes[i].is_ascii_alphanumeric()) {
+            return None;
+        }
         i += 1;
     }
     if i >= window_end || bytes[i] != b'(' {
@@ -292,6 +334,74 @@ mod tests {
                 "书写变体必须命中: {body}"
             );
         }
+    }
+
+    /// ⭐ 回归（2026-10-14 审计）：锚点必须是**独立词**，不是长词的一部分。
+    ///
+    /// `user identity (186648603162)` 曾在 `identity` 里命中 `id`，且其后的括号距锚点仅
+    /// 7 字节（落在窗口内）⇒ 一个**不是账号身份**的电话号被记成 User ID，且扫描提前结束，
+    /// 同一条 body 后面真正的锚点再也读不到。错 id 比 `None` 更糟：它把不同账号并成一个。
+    #[test]
+    fn should_not_match_id_inside_longer_word() {
+        let body = "user identity (186648603162) verified. Your User ID (898055051935) temporarily is suspended.";
+        assert_eq!(
+            parse_upstream_user_id(body),
+            Some("898055051935".to_string()),
+            "identity 里的 id 不是锚点，必须继续扫到真正的锚点"
+        );
+        assert_eq!(
+            parse_upstream_user_id("user identity (186648603162) verified."),
+            None,
+            "不得把 identity 后面的括号数字当身份"
+        );
+        assert_eq!(
+            classify_upstream_user_id("user identity (186648603162) verified."),
+            UserIdSignal::Absent,
+            "identity 不是锚点 ⇒ 无锚点，而不是「有锚点无 ID」"
+        );
+    }
+
+    /// ⭐ 回归：左侧标识符边界 —— 别的字段名里含 `user_id` 不算锚点。
+    #[test]
+    fn should_require_left_identifier_boundary() {
+        assert_eq!(
+            classify_upstream_user_id("foo_user_id (123456789012) suspended"),
+            UserIdSignal::Absent
+        );
+        // 正常 JSON 键（前面是引号）仍是锚点；键的 `:` 不满足窗口规则 ⇒ 继续扫到真锚点。
+        assert_eq!(
+            parse_upstream_user_id(
+                r#"{"user_id": "x", "message": "User ID (123456789012) suspended"}"#
+            ),
+            Some("123456789012".to_string())
+        );
+    }
+
+    /// ⭐ 回归：锚点与 `(` 之间**只能**是空白/单词字符 —— 这三个形态此前都会把与锚点
+    /// 无关的括号数字（电话号 / 计数器 / 查询参数值）记成账号身份。
+    #[test]
+    fn should_reject_punctuation_between_anchor_and_paren() {
+        for body in [
+            "Your User ID. (186648603162) temporarily is suspended.",
+            "Your User ID) (1) temporarily is suspended.",
+            "userid=(123456789012) temporarily is suspended",
+        ] {
+            assert_eq!(
+                parse_upstream_user_id(body),
+                None,
+                "标点间隔的括号数字不是身份: {body}"
+            );
+            assert_eq!(
+                classify_upstream_user_id(body),
+                UserIdSignal::AnchorWithoutId,
+                "锚点在但形状不合法（三态不得塌成 Absent）: {body}"
+            );
+        }
+        // 反例守卫：单词字符间隔（`is`）仍必须接受 —— 否则上面这条就把判据改过头了。
+        assert_eq!(
+            parse_upstream_user_id("Your User ID is (123456789012) temporarily is suspended."),
+            Some("123456789012".to_string())
+        );
     }
 
     /// ⭐ 窗口守卫：锚点后面很远处的括号**绝不能**被当成身份。
