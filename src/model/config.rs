@@ -701,6 +701,36 @@ pub struct Config {
     #[serde(default = "default_upstream_per_credential_limit")]
     pub upstream_per_credential_limit: usize,
 
+    /// 上游 **connect 超时**（秒，默认 30 = 旧写死的 `connect_timeout(30)`）。
+    ///
+    /// 2026-10-14 接线：此前 `http_client::build_streaming_client` 把 30s 硬编码，
+    /// 现在由 `http_client::set_upstream_timeouts` 注入进程镜像、client 构造时读取
+    /// （**不是**每请求读 config；已构造缓存的 client 保持构造时的值，见 setter 文档）。
+    ///
+    /// 读取处 clamp 到 [1, 120]：下限防 0（`connect_timeout(0)` 会让所有连接立即超时）；
+    /// 上限防"连不上"的失败被拖到分钟级（链式回退每跳都吃这个值）。
+    /// 默认 30 与旧行为逐字节一致。
+    #[serde(default = "default_upstream_connect_timeout_secs")]
+    pub upstream_connect_timeout_secs: u64,
+
+    /// 上游 **read（空闲间隔）超时**（秒，默认 720 = 旧写死的 `read_timeout(720)`）。
+    ///
+    /// 语义是**两次数据之间的空闲上限**（不是整请求总时长，根因见
+    /// `build_streaming_client` 的 `Connection closed mid-response` 注释）：只要上游持续
+    /// 吐数据（token/ping）就不超时，真正卡死才中断。
+    ///
+    /// 2026-10-14 接线：此前 provider 的 `client_for` / 预热 client 硬编码 720，
+    /// 现在由 `http_client::set_upstream_timeouts` 注入进程镜像、client 构造时读取。
+    /// ⚠️ 本值同时是「等响应头阶段超时」的等待窗口 —— 该超时被处置为**不可重试的 504**
+    /// （见 `http_client::is_headers_phase_timeout` 与 provider 的对应分支），调大它等于
+    /// 调大「一个静默上游单跳能拖住客户端多久」的上限。
+    ///
+    /// 读取处 clamp 到 [10, 3600]：下限只防荒谬值（本仓实测合法的慢响应头可超 30s，
+    /// 见 provider 墙钟推导注释，调小前先读那段）；上限防误填超大值把单请求等待拖到小时级。
+    /// 默认 720 与旧行为逐字节一致。
+    #[serde(default = "default_upstream_read_timeout_secs")]
+    pub upstream_read_timeout_secs: u64,
+
     /// **全局模型映射**：`{"客户端请求的模型名": "实际发给上游的模型名"}`（默认空 = 不映射）。
     ///
     /// 语义（见 [`crate::kiro::model_mapping`] 的完整设计说明）：
@@ -1539,6 +1569,17 @@ fn default_upstream_concurrency_limit() -> usize {
 fn default_upstream_per_credential_limit() -> usize {
     8
 }
+/// 上游 connect 超时默认 30s = `build_streaming_client` 旧写死值（不配置时行为不变）。
+/// 与 `http_client::DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECS` 同值，由 http_client 的
+/// 跨文件一致性测试钉住（同 cache_fingerprint 对 DEFAULT_CAPACITY 的做法）。
+fn default_upstream_connect_timeout_secs() -> u64 {
+    30
+}
+/// 上游 read（空闲间隔）超时默认 720s = `client_for` / 预热 client 旧写死值
+/// （不配置时行为不变；同 `http_client::DEFAULT_UPSTREAM_READ_TIMEOUT_SECS`）。
+fn default_upstream_read_timeout_secs() -> u64 {
+    720
+}
 fn default_cooldown_scale_pct() -> u32 {
     100
 }
@@ -1778,6 +1819,8 @@ impl Default for Config {
             inbound_queue_timeout_passthrough: default_inbound_queue_timeout_passthrough(),
             upstream_concurrency_limit: default_upstream_concurrency_limit(),
             upstream_per_credential_limit: default_upstream_per_credential_limit(),
+            upstream_connect_timeout_secs: default_upstream_connect_timeout_secs(),
+            upstream_read_timeout_secs: default_upstream_read_timeout_secs(),
             model_mapping: Default::default(),
             // 错误码/提示词覆盖表：默认空表（全用内置默认，零行为变化）。
             error_messages: HashMap::new(),
@@ -2826,6 +2869,53 @@ mod tests {
         assert_eq!(
             value.get("cacheMeteringCapacity"),
             Some(&serde_json::json!(8192)),
+            "必须按 camelCase 写出"
+        );
+    }
+
+    /// 上游超时（upstreamConnectTimeoutSecs / upstreamReadTimeoutSecs，2026-10-14 新增）：
+    /// 默认 30 / 720（= 旧写死值）、缺字段回退同值、显式值被尊重、camelCase roundtrip 保真。
+    ///
+    /// 回退即 FAIL：① `#[serde(default = ...)]` 换成裸 `#[serde(default)]`（u64 裸默认是 0，
+    /// 那是非法超时——0 会让 read_timeout 立即到期、所有上游请求必失败）；② 默认值改成
+    /// 别的数（现网等待窗口被静默改变——本字段上线的前提就是「不配置时行为逐字节不变」）。
+    #[test]
+    fn upstream_timeout_fields_default_30_720_and_roundtrip() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.upstream_connect_timeout_secs,
+            default_upstream_connect_timeout_secs(),
+            "默认必须走 default_upstream_connect_timeout_secs()，不得另写字面量"
+        );
+        assert_eq!(
+            cfg.upstream_read_timeout_secs,
+            default_upstream_read_timeout_secs(),
+            "默认必须走 default_upstream_read_timeout_secs()，不得另写字面量"
+        );
+        let bare: Config = serde_json::from_str("{}").expect("缺字段的 config 必须能反序列化");
+        assert_eq!(
+            bare.upstream_connect_timeout_secs, 30,
+            "缺字段时必须落到 30（裸 u64 的 serde default 是 0，那会让所有连接立即超时）"
+        );
+        assert_eq!(
+            bare.upstream_read_timeout_secs, 720,
+            "缺字段时必须落到 720（裸 u64 的 serde default 是 0，那会让所有请求立即超时）"
+        );
+        let explicit: Config = serde_json::from_str(
+            r#"{"upstreamConnectTimeoutSecs":15,"upstreamReadTimeoutSecs":120}"#,
+        )
+        .expect("camelCase 显式值必须能反序列化");
+        assert_eq!(explicit.upstream_connect_timeout_secs, 15, "显式值必须被尊重");
+        assert_eq!(explicit.upstream_read_timeout_secs, 120, "显式值必须被尊重");
+        let value = serde_json::to_value(&explicit).expect("序列化应成功");
+        assert_eq!(
+            value.get("upstreamConnectTimeoutSecs"),
+            Some(&serde_json::json!(15)),
+            "必须按 camelCase 写出"
+        );
+        assert_eq!(
+            value.get("upstreamReadTimeoutSecs"),
+            Some(&serde_json::json!(120)),
             "必须按 camelCase 写出"
         );
     }

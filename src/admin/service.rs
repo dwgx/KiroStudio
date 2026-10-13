@@ -3478,6 +3478,8 @@ impl AdminService {
             prompt_cache_enabled: config.prompt_cache_enabled,
             cache_metering_capacity: config.cache_metering_capacity,
             prompt_cache_ttl_seconds: config.prompt_cache_ttl_seconds,
+            upstream_connect_timeout_secs: config.upstream_connect_timeout_secs,
+            upstream_read_timeout_secs: config.upstream_read_timeout_secs,
             mock_cache_enabled: config.mock_cache_enabled,
             mock_cache_read_ratio: config.mock_cache_read_ratio,
             strip_env_noise: config.strip_env_noise,

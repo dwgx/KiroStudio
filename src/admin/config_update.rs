@@ -90,6 +90,8 @@ impl super::AdminService {
         // 指纹表容量 / TTL 上限（2026-10-14 对手对照接线）：两者共用同一 setter
         // （`set_cache_metering_config`），故共用一个变更位。
         let mut cache_metering_changed = false;
+        // 上游空闲超时（connect/read，2026-10-14 对手对照接线）：同样共用一个 setter。
+        let mut upstream_timeouts_changed = false;
         // 透传模拟缓存（TIER3）：enabled/ratio 任一变更都调 handlers setter 即时生效。
         let mut mock_cache_changed = false;
         // 错误码/提示词覆盖表（TIER1）：无 TIER3 setter——消费点每请求读 config
@@ -365,6 +367,20 @@ impl super::AdminService {
             if v != config.prompt_cache_ttl_seconds {
                 config.prompt_cache_ttl_seconds = v;
                 cache_metering_changed = true;
+            }
+        }
+
+        // —— 上游空闲超时（TIER3 热更；默认 30/720 = 旧硬编码值，不配置时行为不变）——
+        if let Some(v) = req.upstream_connect_timeout_secs {
+            if v != config.upstream_connect_timeout_secs {
+                config.upstream_connect_timeout_secs = v;
+                upstream_timeouts_changed = true;
+            }
+        }
+        if let Some(v) = req.upstream_read_timeout_secs {
+            if v != config.upstream_read_timeout_secs {
+                config.upstream_read_timeout_secs = v;
+                upstream_timeouts_changed = true;
             }
         }
         // —— 透传模拟缓存（TIER3 热更：改后调 handlers setter 即时生效不重启）——
@@ -1134,6 +1150,8 @@ impl super::AdminService {
             || prompt_cache_enabled_changed.is_some()
             // 指纹表容量/TTL：有 TIER3 setter，漏掉这行只改本项时面板会回「无改动」。
             || cache_metering_changed
+            // 上游空闲超时：同上。
+            || upstream_timeouts_changed
             // 透传模拟缓存有 TIER3 setter（handlers 镜像），但要 `hot_changed` 之外仍进
             // OR 链才会调它：漏掉这行只改本项时面板会回「无改动」、镜像不刷新。
             || mock_cache_changed
@@ -1256,6 +1274,15 @@ impl super::AdminService {
             );
         }
 
+        // TIER3：上游空闲超时热更（2026-10-14 对手对照接线）。注意 setter 的文档已说明：
+        // 已缓存的 reqwest::Client 保持构造时值，新配置在下一个新建 client 生效。
+        if upstream_timeouts_changed {
+            crate::http_client::set_upstream_timeouts(
+                config.upstream_connect_timeout_secs,
+                config.upstream_read_timeout_secs,
+            );
+        }
+
         // TIER3：透传模拟缓存配置立即应用到热路径进程级镜像（下一个透传请求即生效）。
         // 用 `config`（已更新）而非 req 原值：两个字段可能只改一个，setter 要拿完整组。
         if mock_cache_changed {
@@ -1335,6 +1362,7 @@ impl super::AdminService {
             || clone_default_enabled_changed
             || prompt_cache_enabled_changed.is_some()
             || cache_metering_changed
+            || upstream_timeouts_changed
             || mock_cache_changed
             || strip_env_noise_changed.is_some()
             || native_thinking_effort_enabled_changed.is_some()

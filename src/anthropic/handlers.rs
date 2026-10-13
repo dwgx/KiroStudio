@@ -51,7 +51,7 @@ static MIRROR_WIRED_BITS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 
 /// 名字表：新增进程镜像 setter 时必须在此登记（漏登记会在 setter 内 mark 时 panic 暴露）。
 /// 与「删校验必红」守卫同纪律（见本文件测试模块 mirror_wiring_source_guard）。
-const MIRROR_WIRED_NAMES: [&str; 20] = [
+const MIRROR_WIRED_NAMES: [&str; 21] = [
     "collect_client_fingerprint",
     "trust_forwarded_header",
     "ip_blocklist",
@@ -62,6 +62,7 @@ const MIRROR_WIRED_NAMES: [&str; 20] = [
     "first_token_retry",
     "prompt_cache_enabled",
     "cache_metering_config",
+    "upstream_timeouts",
     "mock_cache_config",
     "tool_clean_leaked_tokens",
     "tool_reclaim_textified_invoke",
@@ -699,6 +700,10 @@ pub(crate) fn replay_all_mirrors(cfg: &crate::model::config::Config) {
     super::cache_fingerprint::set_cache_metering_config(
         cfg.cache_metering_capacity,
         cfg.prompt_cache_ttl_seconds,
+    );
+    crate::http_client::set_upstream_timeouts(
+        cfg.upstream_connect_timeout_secs,
+        cfg.upstream_read_timeout_secs,
     );
     set_mock_cache_config(cfg.mock_cache_enabled, cfg.mock_cache_read_ratio);
     set_tool_clean_leaked_tokens(cfg.tool_clean_leaked_tokens);

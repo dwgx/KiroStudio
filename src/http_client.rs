@@ -6,6 +6,7 @@ use reqwest::{Client, Proxy};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::model::config::TlsBackend;
@@ -756,6 +757,148 @@ pub fn parse_proxy_links_bulk(text: &str) -> (Vec<ParsedProxyLink>, usize) {
     (nodes, report.skipped + invalid)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 上游超时（`upstreamConnectTimeoutSecs` / `upstreamReadTimeoutSecs`）的进程级镜像
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 上游 connect 超时默认值（秒）＝ `build_streaming_client` 旧写死的 30。
+/// 不配置时行为逐字节不变；与 `model::config::default_upstream_connect_timeout_secs`
+/// 同值（跨文件一致性由本模块测试 `config_defaults_match_mirror_defaults` 钉住）。
+pub const DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECS: u64 = 30;
+/// 上游 read（空闲间隔）超时默认值（秒）＝ provider 的 `client_for` / 预热 client
+/// 旧写死的 720（同 `MCP_CLIENT_READ_TIMEOUT_SECS`）。
+pub const DEFAULT_UPSTREAM_READ_TIMEOUT_SECS: u64 = 720;
+
+/// `upstreamConnectTimeoutSecs` 合法区间下限（秒）：0 会让 `connect_timeout(0)` 立即
+/// 超时（所有上游连接必失败）——下限 1 就是防这个荒谬值。
+const MIN_UPSTREAM_CONNECT_TIMEOUT_SECS: u64 = 1;
+/// 上限 120s：正常连接实测同机房 <1s（见 `build_streaming_client_no_redirect` 注释），
+/// 120s 已覆盖 DNS/TCP/TLS 三类慢连接 + 跨境代理抖动；再大只是让"连不上"的失败更晚
+/// 暴露（链式回退每跳都吃这个值）。
+const MAX_UPSTREAM_CONNECT_TIMEOUT_SECS: u64 = 120;
+/// `upstreamReadTimeoutSecs` 合法区间下限（秒）：下限只防荒谬值（0/个位数会让每个请求
+/// 必超时）。⚠️ 本仓实测合法的慢响应头可超过 30s（见 provider 墙钟推导注释：44 条请求
+/// 30.7s 后才出响应头且最终 200）——把本值调到数十秒级会开始切掉这类正常慢请求。
+const MIN_UPSTREAM_READ_TIMEOUT_SECS: u64 = 10;
+/// 上限 3600s：read_timeout 是**单跳**的合法等待窗口（等响应头 / 流中途空闲），链内
+/// 每跳都可能吃满（墙钟只在 attempt>0 判，见 provider 注释）；超过 1 小时的单请求等待
+/// 对交互式客户端已无意义，上限同时钳住误填的超大值（如 86400）。
+const MAX_UPSTREAM_READ_TIMEOUT_SECS: u64 = 3600;
+
+/// 上游超时的**进程级镜像**（与 `anthropic::cache_fingerprint` 的
+/// `CACHE_METERING_CAPACITY` 同款 TIER3 惯例：main 启动接线、admin 热更调 setter，
+/// 消费点读镜像而**不是**每请求读 Config）。
+///
+/// 为什么需要镜像：client 构造点（provider 的 `client_for` / 预热）按凭据的
+/// effective_proxy 维度懒建并缓存，拿不到 Config 引用；镜像是一次原子读，廉价且无锁。
+static UPSTREAM_CONNECT_TIMEOUT_SECS: AtomicU64 =
+    AtomicU64::new(DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECS);
+static UPSTREAM_READ_TIMEOUT_SECS: AtomicU64 =
+    AtomicU64::new(DEFAULT_UPSTREAM_READ_TIMEOUT_SECS);
+
+/// 容量钳制（纯函数便于测试；越界 warn 由 [`set_upstream_timeouts`] 打，
+/// 同 `cache_fingerprint::clamp_capacity` 惯例）。
+fn clamp_upstream_connect_timeout(secs: u64) -> u64 {
+    secs.clamp(
+        MIN_UPSTREAM_CONNECT_TIMEOUT_SECS,
+        MAX_UPSTREAM_CONNECT_TIMEOUT_SECS,
+    )
+}
+fn clamp_upstream_read_timeout(secs: u64) -> u64 {
+    secs.clamp(MIN_UPSTREAM_READ_TIMEOUT_SECS, MAX_UPSTREAM_READ_TIMEOUT_SECS)
+}
+
+/// 注入上游超时（`upstreamConnectTimeoutSecs` / `upstreamReadTimeoutSecs`）。
+///
+/// 越界值钳到区间端点并告警（同 `set_cache_metering_config` 惯例），绝不拒绝——
+/// 配置错误不该让网关起不来，但静默使用越界值更不可接受。
+///
+/// ⚠️ 热更边界（诚实说明）：已构造并缓存的 `reqwest::Client`（provider 的
+/// `client_cache`）保持**构造时**的超时值，新配置在下一个新建 client 生效。
+/// 不逐请求重建 client——那会丢掉连接池收益。改这两个值后要立即全量生效需重启。
+///
+/// ⚠️ 接线（2026-10-14 完成）：`main.rs` 启动播种 + admin `config_update.rs` 热更 +
+/// `handlers::replay_all_mirrors` 重播三处均调用本 setter；本 setter 内登记
+/// `mark_mirror_wired("upstream_timeouts")`，名字同时进了 `handlers.rs` 的
+/// `MIRROR_WIRED_NAMES`（两条源码守卫按名字表驱动：漏 setter / 漏登记即红）。
+pub fn set_upstream_timeouts(connect_secs: u64, read_secs: u64) {
+    crate::anthropic::handlers::mark_mirror_wired("upstream_timeouts");
+    let clamped_connect = clamp_upstream_connect_timeout(connect_secs);
+    if clamped_connect != connect_secs {
+        tracing::warn!(
+            "upstreamConnectTimeoutSecs={connect_secs} 越界，已钳制为 {clamped_connect}\
+             （合法区间 [{MIN_UPSTREAM_CONNECT_TIMEOUT_SECS}, {MAX_UPSTREAM_CONNECT_TIMEOUT_SECS}]）"
+        );
+    }
+    let clamped_read = clamp_upstream_read_timeout(read_secs);
+    if clamped_read != read_secs {
+        tracing::warn!(
+            "upstreamReadTimeoutSecs={read_secs} 越界，已钳制为 {clamped_read}\
+             （合法区间 [{MIN_UPSTREAM_READ_TIMEOUT_SECS}, {MAX_UPSTREAM_READ_TIMEOUT_SECS}]）"
+        );
+    }
+    UPSTREAM_CONNECT_TIMEOUT_SECS.store(clamped_connect, Ordering::Relaxed);
+    UPSTREAM_READ_TIMEOUT_SECS.store(clamped_read, Ordering::Relaxed);
+}
+
+/// 当前生效的上游 connect 超时（秒）。消费点：[`build_streaming_client`]。
+pub fn upstream_connect_timeout_secs() -> u64 {
+    UPSTREAM_CONNECT_TIMEOUT_SECS.load(Ordering::Relaxed)
+}
+
+/// 当前生效的上游 read（空闲间隔）超时（秒）。消费点：`kiro::provider` 的
+/// `client_for` 与预热 client（client 构造时读取；MCP 墙钟的推导见 provider 侧注释）。
+pub fn upstream_read_timeout_secs() -> u64 {
+    UPSTREAM_READ_TIMEOUT_SECS.load(Ordering::Relaxed)
+}
+
+/// 「等响应头阶段超时」判定：`read_timeout` 在 `send()` 等待响应头时到期
+/// （TCP 已建立、窗口内零字节）。
+///
+/// 判据来自 reqwest 0.12 的错误构造（`error.rs` / `async_impl/client.rs` 逐行核对）：
+/// - 等响应头超时 = `PendingRequest::poll` 的 read_timeout 分支 → `error::request(TimedOut)`
+///   ⇒ `is_timeout()==true` 且 **`is_connect()==false`**（source 链里没有 connect 错误）；
+/// - connect 超时 = hyper-util 连接器 `ErrorKind::Connect`（`connect_timeout` 触发的
+///   `io::ErrorKind::TimedOut` 被包在 connect 错误里）⇒ `is_connect()==true`，仍走既有
+///   「记负缓存 + 链式回退/换号」路径，**不受本判定影响**；
+/// - 读**响应体**阶段的超时在 body 消费层产生（`error::body(TimedOut)`），不经 `send()`，
+///   维持现状。
+///
+/// ⚠️ 边界（诚实披露）：reqwest 的 read 计时器从 `send()` 起算、**覆盖连接阶段**
+/// （`PendingRequest::poll` 先轮询 read_timeout_fut 再轮询整个请求 future）。默认配置
+/// （connect 30 < read 720）下连接卡死由 connect_timeout 先兜住（is_connect=true），
+/// 判定不受影响；只有把 read 调到 ≤ connect 时，连接阶段卡住会由 read 计时器先到期、
+/// 同样呈现为本判定（此时"提前 504 止损"与调小 read 的意图一致，方向不坏）。
+///
+/// 消费点：`kiro::provider` 的 send 失败分支——命中即 bail 整个重试循环，
+/// 以 [`upstream_headers_timeout_error`] 作终态（不可重试）。
+pub fn is_headers_phase_timeout(e: &reqwest::Error) -> bool {
+    e.is_timeout() && !e.is_connect()
+}
+
+/// 等响应头超时的**类型化终态错误**。
+///
+/// 串契约（改文案必须保住；handlers 侧判据见 `anthropic::handlers`）：
+/// 1. 含 `operation timed out` 且**不含** `api 请求失败` —— 命中 `handlers::is_transport_error`
+///    的「纯超时错误」条款（传输层闸门）；
+/// 2. 不含 dns/resolve/tls/ssl/proxy 等词 —— 防 `translate_network` 的其它分支先接走；
+/// 3. 含 `upstream_headers_timeout=1` 机器可读 marker（日志/测试锚定，同
+///    `upstream_gate_full=1` 范式）；
+/// 4. 不含 `retry_after_secs=` / `upstream_retry_after=` —— 防被 `map_provider_error` 的
+///    429 分支接走（那会让客户端按可重试退避重发，正是本处置要消除的语义）。
+///
+/// 渲染终态：`translate_network` 的 `upstream_timeout` 分支 → **504 GATEWAY_TIMEOUT**、
+/// 无 Retry-After（复用"网关等上游超时"的既有渲染路径，不新造分类）。
+///
+/// 为什么不带 URL：URL 里可能含 `dns` / `proxy` 等子串，会把 `translate_network` 的
+/// 裸 contains 路由带偏；排障用的 URL 在 trace / 日志里已有。
+pub fn upstream_headers_timeout_error() -> anyhow::Error {
+    anyhow::anyhow!(
+        "等待上游响应头超时（TCP 已建立、read_timeout 窗口内零字节：operation timed out）——\
+         不可重试：换号/换端点只是重开同长的空窗，按 504 透传止损 upstream_headers_timeout=1"
+    )
+}
+
 /// 构建 HTTP Client
 ///
 /// # Arguments
@@ -804,7 +947,10 @@ pub fn build_streaming_client(
 ) -> anyhow::Result<Client> {
     let mut builder = Client::builder()
         .read_timeout(Duration::from_secs(idle_secs))
-        .connect_timeout(Duration::from_secs(30));
+        // connect 超时取 `upstreamConnectTimeoutSecs` 进程镜像（默认 30 = 旧写死值，
+        // 不配置时行为不变）；read 超时仍由调用方给 `idle_secs`——各调用方语义不同
+        // （对话/MCP 用 upstreamReadTimeoutSecs，token 刷新用更短的 60s 止损）。
+        .connect_timeout(Duration::from_secs(upstream_connect_timeout_secs()));
     builder = apply_pool_tuning(builder);
     builder = apply_tls_and_proxy(builder, proxy, tls_backend)?;
     Ok(builder.build()?)
@@ -1709,6 +1855,204 @@ curl:\n\
         assert!(
             has(8788) && has(9999),
             "同 host 不同端口必须各自成键（键缺 port 时后写覆盖前写，缓存失效）"
+        );
+    }
+
+    // ===== 上游超时可配（upstreamConnectTimeoutSecs / upstreamReadTimeoutSecs，2026-10-14）=====
+
+    /// 跨文件一致性：`Config::default()` 的两个超时字段必须与本模块镜像默认值同值
+    /// （同 `cache_fingerprint` 对 `DEFAULT_CAPACITY` 的钉法）。
+    ///
+    /// 回退即 FAIL：把任一侧默认改成别的数 —— 「不配置时行为逐字节不变」的前提被
+    /// 静默破坏（现网等待窗口变化，且没有任何测试会发现）。
+    #[test]
+    fn config_defaults_match_mirror_defaults() {
+        let cfg = crate::model::config::Config::default();
+        assert_eq!(
+            cfg.upstream_connect_timeout_secs, DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECS,
+            "config 默认与 http_client 镜像默认必须同值（30 = 旧写死值）"
+        );
+        assert_eq!(
+            cfg.upstream_read_timeout_secs, DEFAULT_UPSTREAM_READ_TIMEOUT_SECS,
+            "config 默认与 http_client 镜像默认必须同值（720 = 旧写死值）"
+        );
+        assert_eq!(DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECS, 30);
+        assert_eq!(DEFAULT_UPSTREAM_READ_TIMEOUT_SECS, 720);
+    }
+
+    /// setter 钳制 + 就地改写：合法值原样注入；越界值钳到区间端点；恢复即还原全局态
+    /// （setter 是唯一写入点，同 `cache_fingerprint` 的 setter 测试惯例）。
+    ///
+    /// 回退即 FAIL：钳制被删（0 会让所有连接/请求立即超时；u64::MAX 会把单请求等待
+    /// 拖到不可控），或 setter 只写一半（两个值互相串台）。
+    #[test]
+    fn set_upstream_timeouts_clamps_and_roundtrips() {
+        let (orig_connect, orig_read) = (
+            upstream_connect_timeout_secs(),
+            upstream_read_timeout_secs(),
+        );
+        assert_eq!(orig_connect, DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECS);
+        assert_eq!(orig_read, DEFAULT_UPSTREAM_READ_TIMEOUT_SECS);
+
+        // 合法值：原样注入。
+        set_upstream_timeouts(15, 120);
+        assert_eq!(upstream_connect_timeout_secs(), 15, "合法 connect 值必须原样注入");
+        assert_eq!(upstream_read_timeout_secs(), 120, "合法 read 值必须原样注入");
+
+        // 下界越界：钳到 [1, 10] 端点（0 是荒谬值：connect_timeout(0)/read_timeout(0)
+        // 会让所有上游请求立即失败）。
+        set_upstream_timeouts(0, 1);
+        assert_eq!(upstream_connect_timeout_secs(), 1, "0 必须钳到 connect 下限 1");
+        assert_eq!(upstream_read_timeout_secs(), 10, "1 必须钳到 read 下限 10");
+
+        // 上界越界：钳到 [120, 3600] 端点（防误填超大值把单请求等待拖到小时级）。
+        set_upstream_timeouts(u64::MAX, u64::MAX);
+        assert_eq!(upstream_connect_timeout_secs(), 120, "超大值必须钳到 connect 上限 120");
+        assert_eq!(upstream_read_timeout_secs(), 3600, "超大值必须钳到 read 上限 3600");
+
+        // 恢复原值：setter 是唯一写入点，恢复即还原全局态（防污染并行测试）。
+        set_upstream_timeouts(orig_connect, orig_read);
+        assert_eq!(upstream_connect_timeout_secs(), orig_connect);
+        assert_eq!(upstream_read_timeout_secs(), orig_read);
+    }
+
+    /// `is_headers_phase_timeout` 判据（真超时行为，非纸面断言）：
+    /// ① 静默上游（TCP accept 后零字节）触发 read_timeout ⇒ 必须判定为「等响应头超时」；
+    /// ② 连接被拒（connect 层失败）⇒ 不得判定（仍走既有「记负缓存 + 链式回退/换号」）。
+    ///
+    /// 回退即 FAIL：判据改成裸 `is_timeout()`（连接拒绝/connect 超时也会带 timeout 标记，
+    /// 会被错误地当"不可重试 504"处置 → 连接层换号重试能力被静默废掉）；或改成
+    /// `is_timeout() && is_connect()`（等响应头超时恒 false → 修复失效、回到挂十几分钟）。
+    #[tokio::test]
+    async fn headers_phase_timeout_predicate_matches_silent_upstream_only() {
+        // 静默上游：accept 一条连接后既不写响应也不关闭（模拟「上游接受 TCP 后静默」）。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定静默 mock 上游");
+        let port = listener.local_addr().expect("mock 端口").port();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            if let Ok((_stream, _)) = listener.accept() {
+                // 持有连接直到测试结束（_stream 在块尾才 drop）。
+                let _ = rx.recv_timeout(Duration::from_secs(30));
+            }
+        });
+
+        let client = build_streaming_client(None, 1, TlsBackend::Rustls).expect("建 client");
+        let err = client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .expect_err("静默上游必须在 read_timeout(1s) 后报错");
+        assert!(err.is_timeout(), "应为超时错误: {err:?}");
+        assert!(!err.is_connect(), "等响应头超时不带 connect 标记: {err:?}");
+        assert!(
+            is_headers_phase_timeout(&err),
+            "TCP 已建立但窗口内零字节 ⇒ 必须判定为等响应头阶段超时: {err:?}"
+        );
+
+        // 连接被拒（临时绑定拿到空闲端口后立刻 drop ⇒ 无监听者）。
+        //
+        // ⚠️ 必须用**不设 read_timeout** 的 client：本仓 read 计时器从 `send()` 起算、
+        // **覆盖连接阶段**（见 `is_headers_phase_timeout` 文档的边界披露）。上面那个
+        // `build_streaming_client(None, 1, …)` 带 1s 读超时 ⇒ 连接阶段任何拖延都会先被它
+        // 截获，拿到的是 `TimedOut`（is_connect=false）——那测的是「read ≤ connect 的
+        // 边界」，不是本用例要断言的「连接层失败不误判」。实测（Windows）连接被拒也可能
+        // 不立即返回（对端静默 drop），所以这里连 connect 超时都要给足。
+        let refused_port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("取空闲端口");
+            l.local_addr().expect("端口").port()
+        };
+        let raw = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .expect("建裸 client");
+        let err = raw
+            .get(format!("http://127.0.0.1:{refused_port}/"))
+            .send()
+            .await
+            .expect_err("无监听端口必须连接失败");
+        assert!(
+            err.is_connect(),
+            "连接被拒/连接超时必须带 connect 标记: {err:?}"
+        );
+        assert!(
+            !is_headers_phase_timeout(&err),
+            "连接层失败不得被判定为等响应头超时（否则会错误地放弃链式回退/换号）: {err:?}"
+        );
+
+        let _ = tx.send(());
+        let _ = handle.join();
+    }
+
+    /// 类型化终态串的路由契约（与 handlers 的既有判据配套，不新造分类）：
+    /// ① 命中传输层闸门（`operation timed out` 且不含 `api 请求失败`）⇒
+    ///    `translate_network` 的 `upstream_timeout` 分支 → **504**；
+    /// ② 不含 `retry_after_secs=` / `upstream_retry_after=` ⇒ 不被 429 分支接走
+    ///    （那会让客户端按可重试退避重发，正是本处置要消除的语义）；
+    /// ③ 真分类器 `absorb_class_of` 必须判**不可吸收**（传输层被显式减掉）。
+    ///
+    /// 回退即 FAIL：文案里出现 `retry_after_secs=`（终态变 429+退避、可重试语义复活）、
+    /// 或丢掉 `operation timed out`（落 `is_upstream_transient_5xx` → 503+Retry-After，
+    /// 客户端 3 秒后重打一个静默上游）。
+    #[test]
+    fn headers_timeout_error_string_routes_to_504_and_is_not_absorbable() {
+        let s = upstream_headers_timeout_error().to_string();
+        // ① 传输层闸门 + timeout 词（handlers::is_transport_error → translate_network）。
+        assert!(
+            s.contains("operation timed out"),
+            "必须含 'operation timed out' 才能命中 handlers 的纯超时判据: {s}"
+        );
+        assert!(
+            !s.contains("api 请求失败"),
+            "不得含 'api 请求失败'（is_transport_error 的纯超时条款会因此失效）: {s}"
+        );
+        // ② 防被 429/吸收分支接走。
+        assert!(!s.contains("retry_after_secs="), "不得带号池冷却标记: {s}");
+        assert!(!s.contains("upstream_retry_after="), "不得带上游 RA 标记: {s}");
+        assert!(!s.contains("absorb_budget_exhausted=1"), "不得带吸收耗尽标记: {s}");
+        // ③ 机器可读 marker（日志/测试锚定）。
+        assert!(s.contains("upstream_headers_timeout=1"), "必须带类型化 marker: {s}");
+        // ④ 真分类器判定：传输层错误不可吸收（与 provider 的终态路径同口径）。
+        assert!(
+            crate::anthropic::absorb_class_of(&s).is_none(),
+            "等响应头超时不得被判为可吸收（吸收层重试只是重开同长空窗）: {s}"
+        );
+    }
+
+    /// 源码守卫：provider 的 send 失败分支必须把「等响应头超时」接到 **bail** 路径
+    /// （分类 → 不走链式回退 → 终态标志传给 break），而不是旧行为（链式回退 + 换号重试）。
+    ///
+    /// 为什么用源码守卫：该分支需要真实静默上游 + 完整 provider 装置才能行为验证，
+    /// 而 provider_tests.rs 不在本次改动范围（守卫放不进那边）——本仓对这类接线
+    /// 一律用源码断言钉住（同 provider_tests 的既有范式）。
+    ///
+    /// 回退即 FAIL：三处任一处被删/改回旧行为（去掉分类调用、去掉 `!headers_timeout`
+    /// 链式回退门、把 break 第 4 位改回 `false`）→ 对应断言红。
+    #[test]
+    fn provider_send_timeout_bails_instead_of_retrying() {
+        let full = include_str!("kiro/provider.rs");
+        let prod = full.split("\n#[cfg(test)]").next().unwrap_or(full);
+        // ① 分类调用必须存在且唯一（命中即进入不可重试处置）。
+        let classify = "crate::http_client::is_headers_phase_timeout(&e)";
+        assert_eq!(
+            prod.matches(classify).count(),
+            1,
+            "send 失败分支必须恰好一处调用 is_headers_phase_timeout（判据唯一入口）"
+        );
+        // ② 等响应头超时不得走链式回退（否则每个候选端点白等一整窗 = 挂十几分钟）。
+        let skip_chain = "if !headers_timeout && chain_idx + 1 < chain.len()";
+        assert_eq!(
+            prod.matches(skip_chain).count(),
+            1,
+            "链式回退条件必须带 !headers_timeout 门（超时静默是上游整体形态，换端点只是重开空窗）"
+        );
+        // ③ bail 标志必须传进 break：第 4 位为 headers_timeout ⇒ 外层 break 'attempt
+        //    （不再 sleep 换号重试）；若被改回 false 则本串消失、断言红。
+        let bail = "break 'endpoint_chain (candidate.clone(), None, url, headers_timeout)";
+        assert_eq!(
+            prod.matches(bail).count(),
+            1,
+            "等响应头超时必须经 bail_attempt_loop 退出重试循环（第 4 位传 headers_timeout），\
+             否则又回到 sleep 后换号重试"
         );
     }
 }

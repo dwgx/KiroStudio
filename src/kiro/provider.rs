@@ -89,11 +89,16 @@ pub(crate) fn parse_retry_after_header_value(s: &str) -> Option<u64> {
     Some(secs.max(0) as u64)
 }
 
-/// MCP 路径（WebSearch 等工具调用）流式 client 的 read_timeout（空闲间隔秒）。
+/// MCP 路径（WebSearch 等工具调用）流式 client 的 read_timeout **历史默认值**（空闲间隔秒）。
 ///
-/// 单一源头：`client_for` 构造 MCP client 与 MCP 墙钟推导都从这里取，
-/// 改任一个另一个自动跟随（透传墙钟同款范式，见 `try_custom_api_passthrough`
-/// 里 `FIRST_BYTE_TIMEOUT_SECS` 的取舍注释 —— 「改了一个忘了另一个」已踩过）。
+/// 2026-10-14 起，client 的 read_timeout 由配置 `upstreamReadTimeoutSecs` 的进程镜像提供
+/// （`http_client::upstream_read_timeout_secs()`，默认即本常量 = 720，不配置时行为不变；
+/// connect 超时同理由 `build_streaming_client` 读 `upstreamConnectTimeoutSecs` 镜像）。
+/// 本常量仅剩两个用途：① [`MCP_WALL_SECS`] 的编译期推导锚点（provider_tests 的源码守卫
+/// 钉住 `Duration::from_secs(MCP_WALL_SECS)` 字面量，改成运行时推导需同步那个测试——
+/// 本次改动范围外，见 deferred）；② 「默认 720 = 旧行为」的文档锚。
+/// ⚠️ 漂移边界：若把 upstreamReadTimeoutSecs 调大到 >735s，单跳合法耗时可能超过墙钟
+/// 的一半 ⇒ 「一次完整尝试 + 一次换号」的推导前提不再成立（墙钟会掐掉第二次尝试）。
 const MCP_CLIENT_READ_TIMEOUT_SECS: u64 = 720;
 
 /// MCP 单请求重试的墙钟预算（秒），**不能复用主路径 45s**。
@@ -107,6 +112,8 @@ const MCP_CLIENT_READ_TIMEOUT_SECS: u64 = 720;
 ///
 /// ⚠️ 墙钟这么宽不会失控：本循环的实际约束是次数闸 —— max_retries 被共享预算
 /// 剩余（`budget.remaining()`）夹住，墙钟只是「次数闸失效时」的兜底。
+/// （read_timeout 自 2026-10-14 起可配，但本墙钟仍锚定编译期默认 720 —— 见
+/// [`MCP_CLIENT_READ_TIMEOUT_SECS`] 的漂移边界说明。）
 const MCP_WALL_SECS: u64 = MCP_CLIENT_READ_TIMEOUT_SECS * 2 + 30;
 
 /// `call_mcp_with_retry` 因「选不到号」失败时给错误打的标记（`context` 前缀）。
@@ -643,8 +650,14 @@ impl KiroProvider {
         // 预热：构建全局代理对应的 Client
         // 对话路径用流式 client：read_timeout(空闲间隔) 而非总时长，防长流被中途掐断
         // （根因见 build_streaming_client 注释：修 `Connection closed mid-response`）。
-        let initial_client =
-            build_streaming_client(proxy.as_ref(), 720, tls_backend).expect("创建 HTTP 客户端失败");
+        // read_timeout 取 upstreamReadTimeoutSecs 进程镜像（默认 720 = 旧写死值，
+        // 2026-10-14 起可配）；connect 超时同理由 build_streaming_client 读镜像。
+        let initial_client = build_streaming_client(
+            proxy.as_ref(),
+            crate::http_client::upstream_read_timeout_secs(),
+            tls_backend,
+        )
+        .expect("创建 HTTP 客户端失败");
         let mut cache = HashMap::new();
         cache.insert(proxy.clone(), initial_client);
 
@@ -728,9 +741,13 @@ impl KiroProvider {
         if let Some(client) = cache.get(&effective) {
             return Ok(client.clone());
         }
+        // read_timeout 取 upstreamReadTimeoutSecs 进程镜像（默认 720 = 旧写死值，
+        // 不配置时行为不变）。⚠️ 这里同时服务对话路径与 MCP 路径（client 按代理键
+        // 共用），配置对两条路径同时生效；client 构造后缓存，改配置要等新建 client
+        // （或重启）才全量生效——热更边界见 http_client::set_upstream_timeouts 文档。
         let client = build_streaming_client(
             effective.as_ref(),
-            MCP_CLIENT_READ_TIMEOUT_SECS,
+            crate::http_client::upstream_read_timeout_secs(),
             self.tls_backend,
         )?;
         cache.insert(effective, client.clone());
@@ -3572,10 +3589,24 @@ impl KiroProvider {
                         break 'endpoint_chain (candidate.clone(), Some(resp), url, false);
                     }
                     Err(e) => {
+                        // 🔴 等响应头阶段超时（read_timeout 在 send() 等待响应头时到期：TCP
+                        // 已建立、窗口内零字节）＝**不可重试的类型化错误**，直接 bail 到 504。
+                        //
+                        // 为什么不能按瞬态重试（旧行为：is_timeout() 落下面的链式回退 + 换号
+                        // continue 'attempt）：墙钟闸门只在 attempt>0 判（见循环顶注释），链内
+                        // 每跳、每轮换号都重开一个完整的 read_timeout 空窗 ⇒ 一个静默上游能把
+                        // 客户端挂十几分钟且零字节（对手对照 ZyphrZero/kiro.rs 的既定语义：
+                        // 等响应头超时直接 504、不重试）。读**响应体**阶段的超时不经此处
+                        // （body 在流消费层读），维持现状。
+                        //
+                        // 与连接层失败的区分见 `is_headers_phase_timeout` 判据注释：connect
+                        // 超时 is_connect()==true，仍走既有「记负缓存 + 链式回退/换号」。
+                        let headers_timeout = crate::http_client::is_headers_phase_timeout(&e);
                         // 连接层失败：记负缓存（下次自动跳过此 (端点, region)）。
                         // reqwest::Error 的 `.is_connect()` 仅含 TCP connect 失败，DNS 归
                         // `.is_request()`，故综合判断 request/connect/timeout（避免漏掉
-                        // DNS 不存在的场景）。
+                        // DNS 不存在的场景）。等响应头超时同样落此块（is_timeout 为真）：
+                        // 静默整个窗口的端点记入负缓存，防其它请求再撞同一个静默端点。
                         if e.is_connect() || e.is_timeout() || e.is_request() {
                             self.mark_endpoint_dead(candidate.name(), &upstream_region);
                             // ⭐ 连接层失败也要进端点健康样本：此前只记负缓存（TTL 300s），
@@ -3591,7 +3622,10 @@ impl KiroProvider {
                                 e
                             );
                         }
-                        if chain_idx + 1 < chain.len() {
+                        // 等响应头超时**不走链式回退**：静默是上游整体形态（TCP 已被收下），
+                        // 换端点只是重开一个同长的空窗（每个候选白等一整窗）——直接 bail
+                        // 到 504。连接层失败（is_connect）等其它网络错误维持原链式回退。
+                        if !headers_timeout && chain_idx + 1 < chain.len() {
                             tracing::warn!(
                                 "端点 {} 发送失败，链式回退到下一端点: {}",
                                 candidate.name(),
@@ -3640,9 +3674,28 @@ impl KiroProvider {
                         }
                         // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
                         // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
-                        last_error = Some(e.into());
+                        if headers_timeout {
+                            // 等响应头超时 ⇒ 类型化终态（handlers 渲染 504）；bail 整个
+                            // attempt 循环（下面的 break 第 4 位为 true），不再 sleep 换号。
+                            tracing::warn!(
+                                "端点 {} 等响应头超时（read_timeout 窗口内零字节），\
+                                 按不可重试 504 止损（尝试 {}/{}，upstream_headers_timeout=1）",
+                                candidate.name(),
+                                attempt + 1,
+                                max_retries
+                            );
+                        }
+                        last_error = Some(if headers_timeout {
+                            // 串契约（含 "operation timed out"、不带 429/吸收标记）见
+                            // `http_client::upstream_headers_timeout_error` 文档。
+                            crate::http_client::upstream_headers_timeout_error()
+                        } else {
+                            e.into()
+                        });
                         last_outcome = crate::usage::RequestOutcome::NetworkError;
-                        break 'endpoint_chain (candidate.clone(), None, url, false);
+                        // headers_timeout=true ⇒ bail_attempt_loop ⇒ 外层 break 'attempt
+                        // （不再 sleep 换号重试）；否则维持原样（continue 'attempt 换号）。
+                        break 'endpoint_chain (candidate.clone(), None, url, headers_timeout);
                     }
                 }
                 };
@@ -3651,7 +3704,10 @@ impl KiroProvider {
                     Some(resp) => resp,
                     None => {
                         if bail_attempt_loop {
-                            // 全局并发闸已满：停止本轮重试并透传错误（原 break 语义）。
+                            // 停止本轮重试并透传错误（原 break 语义）。两个来源：
+                            // ① 全局并发闸已满（系统已饱和，换号只是继续灌）；
+                            // ② 等响应头超时（不可重试的类型化 504，见 send 失败分支）——
+                            //    重试只是重开一个同长的 read_timeout 空窗。
                             break 'attempt;
                         }
                         // 整条端点链都发送失败（网络层）或凭据级闸满：错误已在链内记录。

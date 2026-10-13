@@ -773,6 +773,12 @@ async fn main() {
         config.cache_metering_capacity,
         config.prompt_cache_ttl_seconds,
     );
+    // 上游空闲超时（2026-10-14 对手对照接线）：connect/read 两个值此前硬编码 30/720；
+    // 默认保持原值 ⇒ 不配置时行为逐字节不变，Owner 可自行调（改后需重启或等 client 重建）。
+    http_client::set_upstream_timeouts(
+        config.upstream_connect_timeout_secs,
+        config.upstream_read_timeout_secs,
+    );
 
     // Kiro 原生 effort 开关：播种进 converter 的 TIER3 进程镜像（默认关 = 行为逐字节
     // 不变；开 = 白名单模型 + thinking 走 output_config.effort 原生通道而非 XML 标签）。
