@@ -1177,6 +1177,16 @@ pub struct ConfigSnapshotResponse {
     /// 全池自愈退避指数上限（2026-08-11 配置化；消费点另有 31 的硬 clamp 兜底）。
     pub self_heal_max_shift: u32,
     pub prompt_cache_enabled: bool,
+    /// 指纹表条目上限（`cacheMeteringCapacity`，钳 [1024, 8388608]，默认 4096）。
+    ///
+    /// 存在的理由：本仓单请求写入段数 ≈ 消息条数（不是对手假设的 ≤4 段），容量饱和时
+    /// 命中率由容量而非 TTL 决定 ⇒ 必须可调，否则只能改代码重编译。
+    pub cache_metering_capacity: usize,
+    /// 指纹 TTL 上限（秒，`promptCacheTtlSeconds`，钳 [60, 3600]，默认 3600）。
+    ///
+    /// 此前是**哑字段**：config 里有、全仓零消费点，TTL 写死在代码里（2026-10-14 对手
+    /// 对照发现并接线）。改它现在真的生效（热更即时）。
+    pub prompt_cache_ttl_seconds: u64,
     /// 透传路径模拟缓存注入开关（伪造 cache_read 值仅供下游展示，默认关）
     pub mock_cache_enabled: bool,
     /// 模拟缓存命中比例 [0,1]（默认 0.7）
@@ -1414,6 +1424,12 @@ pub struct UpdateConfigRequest {
     pub self_heal_max_backoff_secs: Option<u64>,
     pub self_heal_max_shift: Option<u32>,
     pub prompt_cache_enabled: Option<bool>,
+    /// 指纹表条目上限（钳 [1024, 8388608]；None=不改）。
+    #[serde(default)]
+    pub cache_metering_capacity: Option<usize>,
+    /// 指纹 TTL 上限秒数（钳 [60, 3600]；None=不改）。
+    #[serde(default)]
+    pub prompt_cache_ttl_seconds: Option<u64>,
     /// 透传路径**模拟缓存**注入开关（见 config 同名字段；TIER3 热更，改后调 handlers
     /// setter 即时生效不重启）。开启后透传响应 usage 注入伪造 cache_read 值，仅供下游展示。
     pub mock_cache_enabled: Option<bool>,
@@ -2623,6 +2639,8 @@ mod tests {
             self_heal_max_backoff_secs: 900,
             self_heal_max_shift: 4,
             prompt_cache_enabled: false,
+            cache_metering_capacity: 4096,
+            prompt_cache_ttl_seconds: 3600,
             mock_cache_enabled: false,
             mock_cache_read_ratio: 0.7,
             strip_env_noise: false,
@@ -2898,6 +2916,8 @@ mod tests {
             self_heal_max_backoff_secs: 900,
             self_heal_max_shift: 4,
             prompt_cache_enabled: true,
+            cache_metering_capacity: 4096,
+            prompt_cache_ttl_seconds: 3600,
             mock_cache_enabled: false,
             mock_cache_read_ratio: 0.7,
             cooldown_enabled: true,

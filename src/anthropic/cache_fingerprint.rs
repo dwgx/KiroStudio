@@ -144,13 +144,12 @@ fn clamp_ttl_secs(ttl_secs: u64) -> i64 {
 /// 并就地改写字段 —— 热更不重建表、不丢已缓存前缀（容量调小由下一次超限插入的抽样
 /// 淘汰自然收敛）。
 ///
-/// ⚠️ 调用点接线（main 启动 + admin 热更 + handlers 的 replay_all_mirrors）不在本次
-/// 授权的两个文件内，故暂标 `allow(dead_code)`（同 `invoke_xml.rs` 的待接线惯例）：
-/// 主 agent 在 `main.rs` / `config_update.rs` / `replay_all_mirrors` 补
-/// `set_cache_metering_config(cfg.cache_metering_capacity, cfg.prompt_cache_ttl_seconds)`
-/// 后即可删除本属性。
-#[allow(dead_code)]
+/// ⚠️ 调用点接线：main 启动（`main.rs`）+ admin 热更（`config_update.rs`）+
+/// `handlers::replay_all_mirrors` 三处均已补 `set_cache_metering_config(...)`；
+/// 本 setter 同时登记进 `MIRROR_WIRED_NAMES`（名字 `cache_metering_config`），
+/// 漏接线会被 `replay_all_mirrors_covers_every_registered_name` 守卫抓红。
 pub fn set_cache_metering_config(capacity: usize, ttl_secs: u64) {
+    crate::anthropic::handlers::mark_mirror_wired("cache_metering_config");
     let clamped_capacity = clamp_capacity(capacity);
     if clamped_capacity != capacity {
         tracing::warn!(

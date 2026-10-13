@@ -7187,9 +7187,23 @@
             .expect("函数体窗口锚不应被删改");
         // 元组窗口：起止锚在透传键内各只出现一次（该函数没有第二个 min_by_key）。
         // `support_rank,`（带逗号）在窗口内只出现在元组里（let 绑定是等号形态）。
+        //
+        // ⚠️ 2026-10-14 修正（独立验证发现守卫已失效）：此前直接用 `support_rank,` 当
+        // 起点锚，而 `find` 是**位置不敏感**的子串匹配——同日透传池前插 `starved` 首键后
+        // support_rank 退到第②位，守卫照样绿，但它声称的「support_rank 在最前」已不再被
+        // 断言：若有人把 starved 移回 support_rank 之后，这条守卫不会报警。
+        // 现改为**按序断言**（starved 在 support_rank 之前），把真正的不变量钉住。
+        let starved_at = zone.find("starved,").expect(
+            "透传排序键首键必须是 starved（反饥饿强制探测；2026-10-14 对手对照修复）",
+        );
         let start = zone
             .find("support_rank,")
-            .expect("透传排序键首键必须是 support_rank（模型感知正向路由 S2）");
+            .expect("透传排序键必须含 support_rank（模型感知正向路由 S2）");
+        assert!(
+            starved_at < start,
+            "starved 必须排在 support_rank **之前**：排在支持档之后时饥饿号仍永远排在 \
+             任何 Confirmed 号之后，该键完全不起作用（本次修复的全部价值即在此）"
+        );
         let end = zone
             .find("e.inflight.load(Ordering::Acquire)")
             .expect("透传排序键必须含 inflight 键");

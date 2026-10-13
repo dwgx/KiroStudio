@@ -767,6 +767,12 @@ async fn main() {
     // #[allow(clippy::too_many_arguments)]，再加只会更难读。这里与下方 respawn_balance_task
     // 同风格：启动即接线，admin 改配置后调同一个 setter 即时生效。
     anthropic::set_prompt_cache_enabled(config.prompt_cache_enabled);
+    // 指纹表容量 / TTL 上限（2026-10-14 对手对照接线）：此前一个是哑字段、一个写死
+    // 4096；启动即接线，admin 改配置后走 config_update 的同一 setter 即时生效。
+    anthropic::cache_fingerprint::set_cache_metering_config(
+        config.cache_metering_capacity,
+        config.prompt_cache_ttl_seconds,
+    );
 
     // Kiro 原生 effort 开关：播种进 converter 的 TIER3 进程镜像（默认关 = 行为逐字节
     // 不变；开 = 白名单模型 + thinking 走 output_config.effort 原生通道而非 XML 标签）。

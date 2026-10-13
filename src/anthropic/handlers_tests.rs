@@ -4951,10 +4951,17 @@ mod mirror_wiring_guard {
     fn mirror_wiring_source_guard() {
         let full = include_str!("handlers.rs");
         let prod = full.split("\n#[cfg(test)]").next().unwrap_or(full);
+        // 指纹表镜像的 setter 住在 cache_fingerprint.rs（不在 handlers.rs）：守卫必须一并扫描，
+        // 否则「登记行确实存在但守卫看不见」会变成假红（2026-10-14 接线 cache_metering_config 时发现）。
+        let sibling_full = include_str!("cache_fingerprint.rs");
+        let sibling = sibling_full
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap_or(sibling_full);
         for name in super::MIRROR_WIRED_NAMES {
             let needle = format!("mark_mirror_wired(\"{}\"{}", name, ")");
             assert!(
-                prod.contains(&needle),
+                prod.contains(&needle) || sibling.contains(&needle),
                 "setter 登记缺失: {needle} 不存在于生产代码（MIRROR_WIRED_NAMES 与 setter 必须同步）"
             );
         }

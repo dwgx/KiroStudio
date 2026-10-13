@@ -3476,6 +3476,8 @@ impl AdminService {
             self_heal_max_backoff_secs: config.self_heal_max_backoff_secs,
             self_heal_max_shift: config.self_heal_max_shift,
             prompt_cache_enabled: config.prompt_cache_enabled,
+            cache_metering_capacity: config.cache_metering_capacity,
+            prompt_cache_ttl_seconds: config.prompt_cache_ttl_seconds,
             mock_cache_enabled: config.mock_cache_enabled,
             mock_cache_read_ratio: config.mock_cache_read_ratio,
             strip_env_noise: config.strip_env_noise,
