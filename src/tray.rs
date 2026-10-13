@@ -176,8 +176,23 @@ pub fn run(cfg: TrayConfig) {
 }
 
 /// host 为 0.0.0.0 时用 127.0.0.1 打开本机面板。
+///
+/// 另外**只放行 host 字符集**（字母/数字/`.`/`-`/`:`/`[`/`]`）：该值会拼进
+/// `cmd /C start "" <url>` 交给 shell 解析，含 `&`/`|`/`"` 的 host 可注入命令
+/// （2026-10-14 审计指出；虽只影响本机管理员自己的配置，仍按防御纵深收口）。
 fn browse_host(host: &str) -> &str {
-    if host == "0.0.0.0" { "127.0.0.1" } else { host }
+    if host == "0.0.0.0" {
+        return "127.0.0.1";
+    }
+    let safe = !host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'));
+    if safe {
+        host
+    } else {
+        "127.0.0.1"
+    }
 }
 
 /// 打开默认浏览器（detached cmd start，不阻塞、不弹窗）。
@@ -205,5 +220,24 @@ fn copy_to_clipboard(text: &str) {
             }
         }
         Err(e) => tracing::warn!("[托盘] 打开剪贴板失败: {}", e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 审计 2026-10-14：host 会被拼进 `cmd /C start "" <url>` 交给 shell，
+    /// 只放行 host 字符集，其余（含注入面）一律回退本机。
+    #[test]
+    fn browse_host_sanitizes_shell_metacharacters() {
+        assert_eq!(browse_host("0.0.0.0"), "127.0.0.1");
+        assert_eq!(browse_host("192.168.1.5"), "192.168.1.5");
+        assert_eq!(browse_host("kiro.example.com"), "kiro.example.com");
+        assert_eq!(browse_host("[::1]"), "[::1]");
+        assert_eq!(browse_host("evil.com & calc"), "127.0.0.1");
+        assert_eq!(browse_host("a|b"), "127.0.0.1");
+        assert_eq!(browse_host("\"quoted\""), "127.0.0.1");
+        assert_eq!(browse_host(""), "127.0.0.1");
     }
 }
