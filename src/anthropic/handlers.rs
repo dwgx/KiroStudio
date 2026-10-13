@@ -4240,6 +4240,31 @@ fn nonstream_clean_eof_without_terminal(
     has_visible_body || has_tool_use
 }
 
+/// 收尾二分（非流式）：把「**从未收到 stop 帧**的工具缓冲」分成两类。
+///
+/// 上游对**无参工具**只发一条 `toolUseEvent`（`input:""`、**永不补 `stop=true`**）——
+/// 那是无参调用的正常形态，不是截断；而「非空且未 stop」是真截断。收尾必须二分，
+/// 与流式 `StreamContext::generate_final_events` 的收尾二分同口径：
+/// - 缓冲 `trim()` 后为空 ⇒ 无参形态：调用方按 `{}` 收成完整 tool_use（成功）；
+/// - 缓冲非空 ⇒ 真截断：调用方保持失败语义，且**截断优先**（两种形态并存时整轮报错）。
+///
+/// 返回值：`(无参形态列表 (tool_use_id, Kiro 名, 原始缓冲), 是否存在真截断残留)`。
+/// 纯函数（只读 `drain`，不碰 completion / 映射表），便于直接测二分判据。
+fn split_unstopped_tool_buffers(
+    pending: &mut std::collections::HashMap<String, (String, String)>,
+) -> (Vec<(String, String, String)>, bool) {
+    let mut no_param = Vec::new();
+    let mut truncated = false;
+    for (tool_use_id, (kiro_name, buffer)) in pending.drain() {
+        if buffer.trim().is_empty() {
+            no_param.push((tool_use_id, kiro_name, buffer));
+        } else {
+            truncated = true;
+        }
+    }
+    (no_param, truncated)
+}
+
 /// 与流式 `SseStateManager::get_stop_reason` 同口径。
 fn resolve_nonstream_stop_reason(explicit: Option<String>, has_tool_use: bool) -> String {
     match explicit {
@@ -4364,9 +4389,15 @@ async fn handle_non_stream_request(
     // 收尾据此决定 HTTP 码与用量记账 outcome，避免截断输出被当成 200 成功。
     let mut completion = CompletionStatus::Ok;
 
-    // 收集工具调用的增量 JSON
-    let mut tool_json_buffers: std::collections::HashMap<String, String> =
+    // 收集工具调用的增量 JSON：tool_use_id → (Kiro 工具名, 累积 input 原文)。
+    // 名字随缓冲一起存 —— 收尾兜底（0 字节未 stop 的无参形态）没有 ToolUseEvent 可取名字，
+    // 而 Bug C 校验（required 表按 Kiro 名）与出站参数还原都要用它。
+    let mut tool_json_buffers: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
+    // 已下发过 stop 的 tool_use_id：重复 stop 帧幂等跳过（与流式 `process_tool_use` 的
+    // remove + `handle_content_block_stop` 重复跳过同口径），避免同一 id 下发两条 tool_use。
+    let mut stopped_tool_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     let mut decoded_events = Vec::new();
     {
@@ -4377,6 +4408,128 @@ async fn handle_non_stream_request(
         };
         let _ = decode_frames_into(&mut decoder, &body_bytes, &mut sink);
     }
+
+    /// 非流式：把一个**已收全**的工具调用（Kiro 形态缓冲原文）构建成下发用的 tool_use 块。
+    ///
+    /// 返回 `None` = 已置失败态（Bug C 缺必需参数），调用方不得下发。
+    /// 空缓冲 = 无参调用（`input: {}`）—— stop 帧无 input 与收尾兜底的无参形态共用本条。
+    ///
+    /// ⚠️ 这是非流式**两个**调用点（stop 帧 / 收尾兜底）的唯一实现：名字与参数还原
+    /// （`map_tool_input_from_kiro`）与 Bug C 校验（`missing_required_keys`）必须与流式
+    /// `process_tool_use` 的 stop 分支同口径 —— 禁止在任一调用点另抄一份（本仓多次踩
+    /// 「同一逻辑两份实现、只修一份」的形态）。
+    ///
+    /// 放在函数体内（而非模块级）是刻意的：非流式的 stop 分支与收尾兜底在同一个函数里，
+    /// 就近复用比跨函数共享更不容易被后来者「顺手再抄一份」。
+    fn build_tool_use(
+        completion: &mut CompletionStatus,
+        tool_use_id: &str,
+        kiro_name: &str,
+        buffer: &str,
+        tool_name_map: &std::collections::HashMap<String, String>,
+        tool_required_fields: &std::collections::HashMap<String, Vec<String>>,
+    ) -> Option<serde_json::Value> {
+        let mut input: serde_json::Value = if buffer.is_empty() {
+            serde_json::json!({})
+        } else {
+            match serde_json::from_str(buffer) {
+                Ok(v) => v,
+                Err(e) => {
+                    // 与流式路径同源修复(洞3 对齐):非流式此前**从不**调修复层,
+                    // 流式已 repair 的坏 JSON(非法转义/裸控制符/截断)在非流式白瞎。
+                    // 先尝试 repair_tool_json,复验通过则用修复结果、不置失败态。
+                    if super::handlers::tool_repair_json_enabled() {
+                        if let Some(fixed) = super::stream::repair_tool_json(buffer) {
+                            if let Ok(v) = serde_json::from_str(&fixed) {
+                                tracing::info!(
+                                    "非流式工具 JSON 已修复为合法(tool_use_id={})",
+                                    tool_use_id
+                                );
+                                v
+                            } else {
+                                // 理论不可达(repair 内部已复验),兜底走失败态。
+                                mark_invalid_tool_input(completion, tool_use_id, &e);
+                                serde_json::json!({})
+                            }
+                        } else {
+                            // 修不好：置失败态，收尾(下方 `if !completion.is_ok()`)
+                            // 返回非 200，绝不静默吞成空参数——空参会让客户端把失败的
+                            // 工具调用当成"无参数成功调用"执行，比报错更危险。
+                            mark_invalid_tool_input(completion, tool_use_id, &e);
+                            serde_json::json!({})
+                        }
+                    } else {
+                        mark_invalid_tool_input(completion, tool_use_id, &e);
+                        serde_json::json!({})
+                    }
+                }
+            }
+        };
+
+        // 洞1:整包双重编码解包(非流式,与流式 flush_tool_input 同源)。
+        // input 若是被再套一层字符串编码的 object/array(顶层解出 String,
+        // 内层可 parse 成 object/array),解一层还原;只解一层、标量不动。
+        // 【P2-1 解耦】移出 tool_repair_json 开关:解包不改语义、对非 String 顶层
+        // 是 no-op,与流式路径一致独立恒开(关 repair 不应连带关它)。
+        if let Some(inner) = input.as_str() {
+            if let Ok(reparsed) = serde_json::from_str::<serde_json::Value>(inner) {
+                if reparsed.is_object() || reparsed.is_array() {
+                    tracing::info!(
+                        "非流式工具参数双重编码,已解一层(tool_use_id={})",
+                        tool_use_id
+                    );
+                    input = reparsed;
+                }
+            }
+        }
+
+        // Bug C：在出站还原之前对 **Kiro 形态** 判缺（与流式 stop 同口径）。
+        // 旧路径只修 JSON 非法，缺 required 仍 200 下发空/残参。
+        if tool_stream_align_failure_enabled()
+            && completion.is_ok()
+            && !tool_required_fields.is_empty()
+        {
+            if let Some(required) = tool_required_fields.get(kiro_name) {
+                if let Some(missing) = super::stream::missing_required_keys(&input, required) {
+                    tracing::warn!(
+                        missing = %missing.join(","),
+                        "非流式 tool_use 缺必需字段（Bug C）：置失败态，不下发残参"
+                    );
+                    *completion = CompletionStatus::UpstreamError {
+                        code: "INVALID_TOOL_INPUT".to_string(),
+                        message: format!(
+                            "工具调用缺少必需参数：{}（模型侧生成异常），请重试。",
+                            missing.join("、")
+                        ),
+                    };
+                    return None;
+                }
+            }
+        }
+
+        let original_name = tool_name_map
+            .get(kiro_name)
+            .cloned()
+            .unwrap_or_else(|| kiro_name.to_string());
+
+        // 出站参数还原：Kiro 参数形态 → Claude Code 参数形态
+        // （fs_write 的 path/text → Write 的 file_path/content）。
+        // ⚠️ 仅当入站映射过（tool_name_map 有该 Kiro 名）才还原，否则
+        // 原样透传（避免把不认识的参数清空）。与流式 stop 分支同口径。
+        let client_input = if tool_name_map.contains_key(kiro_name) {
+            crate::anthropic::converter::map_tool_input_from_kiro(&original_name, input)
+        } else {
+            input
+        };
+
+        Some(json!({
+            "type": "tool_use",
+            "id": tool_use_id,
+            "name": original_name,
+            "input": client_input
+        }))
+    }
+
     for event in decoded_events {
         match event {
                         Event::AssistantResponse(resp) => {
@@ -4391,138 +4544,42 @@ async fn handle_non_stream_request(
                             // 累积工具的 JSON 输入（自适应累积快照 vs 纯增量，与流式路径同源修复）：
                             // Kiro 同一 tool_use_id 的 input 可能是"到目前为止的完整 JSON"（累积）
                             // 而非片段。若原样 push_str，累积模式会把 JSON 重复拼接 → 解析失败。
-                            let buffer = tool_json_buffers
+                            let entry = tool_json_buffers
                                 .entry(tool_use.tool_use_id.clone())
-                                .or_insert_with(String::new);
+                                .or_insert_with(|| (tool_use.name.clone(), String::new()));
                             // 与流式路径同源修复：复用 stream::merge_tool_input 完备决策表
                             // （累积快照 / 纯增量 / 重复终帧 / 迟到旧短快照 / 非前缀重写），
                             // 消灭非前缀双完整对象被 append 成 `}{` 粘连非法 JSON 的漂移。
-                            *buffer = super::stream::merge_tool_input(buffer, &tool_use.input);
+                            let merged = super::stream::merge_tool_input(&entry.1, &tool_use.input);
+                            entry.1 = merged;
 
                             // 如果是完整的工具调用，添加到列表
                             if tool_use.stop {
-                                let mut input: serde_json::Value = if buffer.is_empty() {
-                                    serde_json::json!({})
-                                } else {
-                                    match serde_json::from_str(buffer) {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            // 与流式路径同源修复(洞3 对齐):非流式此前**从不**调修复层,
-                                            // 流式已 repair 的坏 JSON(非法转义/裸控制符/截断)在非流式白瞎。
-                                            // 先尝试 repair_tool_json,复验通过则用修复结果、不置失败态。
-                                            if super::handlers::tool_repair_json_enabled() {
-                                                if let Some(fixed) =
-                                                    super::stream::repair_tool_json(buffer)
-                                                {
-                                                    if let Ok(v) = serde_json::from_str(&fixed) {
-                                                        tracing::info!(
-                                                            "非流式工具 JSON 已修复为合法(tool_use_id={})",
-                                                            tool_use.tool_use_id
-                                                        );
-                                                        v
-                                                    } else {
-                                                        // 理论不可达(repair 内部已复验),兜底走失败态。
-                                                        mark_invalid_tool_input(
-                                                            &mut completion,
-                                                            &tool_use.tool_use_id,
-                                                            &e,
-                                                        );
-                                                        serde_json::json!({})
-                                                    }
-                                                } else {
-                                                    // 修不好：置失败态，收尾(下方 `if !completion.is_ok()`)
-                                                    // 返回非 200，绝不静默吞成空参数——空参会让客户端把失败的
-                                                    // 工具调用当成"无参数成功调用"执行，比报错更危险。
-                                                    mark_invalid_tool_input(
-                                                        &mut completion,
-                                                        &tool_use.tool_use_id,
-                                                        &e,
-                                                    );
-                                                    serde_json::json!({})
-                                                }
-                                            } else {
-                                                mark_invalid_tool_input(
-                                                    &mut completion,
-                                                    &tool_use.tool_use_id,
-                                                    &e,
-                                                );
-                                                serde_json::json!({})
-                                            }
-                                        }
-                                    }
-                                };
-
-                                // 洞1:整包双重编码解包(非流式,与流式 flush_tool_input 同源)。
-                                // input 若是被再套一层字符串编码的 object/array(顶层解出 String,
-                                // 内层可 parse 成 object/array),解一层还原;只解一层、标量不动。
-                                // 【P2-1 解耦】移出 tool_repair_json 开关:解包不改语义、对非 String 顶层
-                                // 是 no-op,与流式路径一致独立恒开(关 repair 不应连带关它)。
-                                if let Some(inner) = input.as_str() {
-                                    if let Ok(reparsed) =
-                                        serde_json::from_str::<serde_json::Value>(inner)
-                                    {
-                                        if reparsed.is_object() || reparsed.is_array() {
-                                            tracing::info!(
-                                                "非流式工具参数双重编码,已解一层(tool_use_id={})",
-                                                tool_use.tool_use_id
-                                            );
-                                            input = reparsed;
-                                        }
-                                    }
+                                // 重复 stop 帧幂等跳过（与流式 `handle_content_block_stop` 的
+                                // 「已停止，跳过重复」同口径）：同一 id 下发两条 tool_use
+                                // 会让客户端解析报错。
+                                if !stopped_tool_ids.insert(tool_use.tool_use_id.clone()) {
+                                    continue;
                                 }
-
-                                // Bug C：在出站还原之前对 **Kiro 形态** 判缺（与流式 stop 同口径）。
-                                // 旧路径只修 JSON 非法，缺 required 仍 200 下发空/残参。
-                                if tool_stream_align_failure_enabled()
-                                    && completion.is_ok()
-                                    && !tool_required_fields.is_empty()
-                                {
-                                    if let Some(required) =
-                                        tool_required_fields.get(&tool_use.name)
-                                    {
-                                        if let Some(missing) =
-                                            super::stream::missing_required_keys(&input, required)
-                                        {
-                                            tracing::warn!(
-                                                missing = %missing.join(","),
-                                                "非流式 tool_use 缺必需字段（Bug C）：置失败态，不下发残参"
-                                            );
-                                            completion = CompletionStatus::UpstreamError {
-                                                code: "INVALID_TOOL_INPUT".to_string(),
-                                                message: format!(
-                                                    "工具调用缺少必需参数：{}（模型侧生成异常），请重试。",
-                                                    missing.join("、")
-                                                ),
-                                            };
-                                            continue;
-                                        }
-                                    }
+                                // stop 帧把条目从表里**移除**：收尾兜底只处理「从未 stop」的
+                                // 残留，据此区分无参形态（0 字节）/ 真截断（非空）。条目不存在
+                                // = 该 id 从未带过 input 帧（stop=true 的无参形态，与流式
+                                // `process_tool_use` 对空缓冲的处理同口径）→ 按 `{}` 下发。
+                                let stopped_entry = tool_json_buffers.remove(&tool_use.tool_use_id);
+                                let (kiro_name, buffer) = stopped_entry
+                                    .unwrap_or_else(|| (tool_use.name.clone(), String::new()));
+                                // 构建（JSON 修复 / 双重编码解包 / Bug C / 名字与参数还原）
+                                // 统一走 build_tool_use —— 与收尾兜底同一实现，禁止另写一条路。
+                                if let Some(tool_use_json) = build_tool_use(
+                                    &mut completion,
+                                    &tool_use.tool_use_id,
+                                    &kiro_name,
+                                    &buffer,
+                                    &tool_name_map,
+                                    &tool_required_fields,
+                                ) {
+                                    tool_uses.push(tool_use_json);
                                 }
-
-                                let original_name = tool_name_map
-                                    .get(&tool_use.name)
-                                    .cloned()
-                                    .unwrap_or_else(|| tool_use.name.clone());
-
-                                // 出站参数还原：Kiro 参数形态 → Claude Code 参数形态
-                                // （fs_write 的 path/text → Write 的 file_path/content）。
-                                // ⚠️ 仅当入站映射过（tool_name_map 有该 Kiro 名）才还原，否则
-                                // 原样透传（避免把不认识的参数清空）。与流式 stop 分支同口径。
-                                let client_input = if tool_name_map.contains_key(&tool_use.name) {
-                                    crate::anthropic::converter::map_tool_input_from_kiro(
-                                        &original_name,
-                                        input,
-                                    )
-                                } else {
-                                    input
-                                };
-
-                                tool_uses.push(json!({
-                                    "type": "tool_use",
-                                    "id": tool_use.tool_use_id,
-                                    "name": original_name,
-                                    "input": client_input
-                                }));
                             }
                         }
                         Event::ContextUsage(context_usage) => {
@@ -4636,6 +4693,33 @@ async fn handle_non_stream_request(
         }
     }
 
+    // 收尾兜底：处理**从未收到 stop 帧**的工具缓冲。上游对无参工具只发一条
+    // `input:""` 的 toolUseEvent 且**永不补 stop=true** —— 那是无参调用的正常形态，
+    // 不是截断。旧实现只在 `tool_use.stop` 分支 push tool_use，循环后对残留缓冲零消费：
+    // 有 metadata 时干净 EOF 判据被 saw_upstream_stop 短路 ⇒ 200 + content:[] +
+    // stop_reason:"tool_use"（声称调了工具却零个 tool_use 块，客户端连错误都收不到，
+    // agentic 循环卡死）；无 metadata 时靠 has_tool_use 判 Incomplete ⇒ 502。
+    // 同一形态两副面孔。现在与流式收尾二分（stream.rs `generate_final_events`）同口径：
+    //   · 缓冲 trim 后为空 ⇒ 无参形态：按 `{}` 收成完整调用（走 build_tool_use 同一套
+    //     名字/参数还原与 Bug C 校验，不另写一条路）；
+    //   · 缓冲非空 ⇒ 真截断：保持现有失败语义（不合成、不算工具终止信号）。
+    // 两种形态并存时截断优先（见下方 saw_tool_terminal）。
+    let (no_param_calls, truncated_tool_residual) =
+        split_unstopped_tool_buffers(&mut tool_json_buffers);
+    let no_param_tool_resolved = !no_param_calls.is_empty();
+    for (tool_use_id, kiro_name, buffer) in no_param_calls {
+        if let Some(tool_use_json) = build_tool_use(
+            &mut completion,
+            &tool_use_id,
+            &kiro_name,
+            &buffer,
+            &tool_name_map,
+            &tool_required_fields,
+        ) {
+            tool_uses.push(tool_use_json);
+        }
+    }
+
     // 完成状态为失败：直接返回非 200 错误响应 + 埋点真实 outcome，绝不把截断输出当 200 成功。
     // （ContentLengthExceededException 走的是 max_tokens，completion 仍为 Ok，不进此分支。）
     if !completion.is_ok() {
@@ -4718,11 +4802,17 @@ async fn handle_non_stream_request(
     // 干净 EOF：有部分正文/未 stop 的 tool，却没有任何终止信号。不得 200 + end_turn。
     // 空响应当下方 near_empty_response 处理（completion 保持 Ok）。
     // thinking-only 已在上面显式置 max_tokens，不会进本分支。
+    //
+    // 无参工具形态（0 字节且从未 stop）已在上面的收尾兜底里按 `{}` 收成完整调用 ——
+    // 上游对无参工具**不发** stop 帧，拿「无 stop 信号」判缺失会把一次正常调用误判成截断；
+    // 它等价于收到工具终止信号（见 `saw_tool_stop` 参数）。两种形态并存（同轮还有非空
+    // 未 stop 的残留）时**截断优先**：不算终止，仍按缺终止信号处理（整轮报错）。
+    let saw_tool_terminal = saw_tool_stop || (no_param_tool_resolved && !truncated_tool_residual);
     if nonstream_clean_eof_without_terminal(
         completion.is_ok(),
         stop_reason.as_deref(),
         saw_upstream_stop,
-        saw_tool_stop,
+        saw_tool_terminal,
         nonstream_content_has_visible_body(&content),
         has_tool_use,
     ) {
@@ -5391,3 +5481,115 @@ mod handlers_tests;
 
 #[cfg(test)]
 pub(crate) use handlers_tests::error_translation_tests;
+
+/// 无参工具（0 字节且从未 stop）非流式收尾二分的回归测试（2026-10-14 对手对照修复）。
+///
+/// 上游对无参工具只发一条 `toolUseEvent`（`input:""`、**永不补 `stop=true`**）：
+/// 收尾必须按「缓冲 trim 后为空」二分 —— 空 ⇒ 无参形态（调用方按 `{}` 收成完整
+/// tool_use，成功收尾）；非空 ⇒ 真截断（保持失败语义，且两种形态并存时截断优先）。
+///
+/// 端到端（真实响应字节 → 解码 → 收尾）不可在此直接构造：`handle_non_stream_request`
+/// 依赖网络 provider。这里覆盖到**纯函数判据层**（[`split_unstopped_tool_buffers`]）
+/// 与**生产源码守卫层**（收尾必须消费残留、必须复用 `build_tool_use` 单一路径）。
+#[cfg(test)]
+mod no_param_tool_nonstream_tests {
+    use super::*;
+
+    fn pending(
+        entries: &[(&str, &str, &str)],
+    ) -> std::collections::HashMap<String, (String, String)> {
+        entries
+            .iter()
+            .map(|(id, name, buf)| (id.to_string(), (name.to_string(), buf.to_string())))
+            .collect()
+    }
+
+    /// 0 字节未 stop = 无参形态：判进「要合成」列表，且不算截断。
+    #[test]
+    fn empty_buffer_is_no_param_form_not_truncation() {
+        let mut buffers = pending(&[("toolu_np", "ListAll", "")]);
+        let (no_param, truncated) = split_unstopped_tool_buffers(&mut buffers);
+        assert!(!truncated, "0 字节未 stop = 无参形态，不是截断");
+        assert_eq!(
+            no_param,
+            vec![(
+                "toolu_np".to_string(),
+                "ListAll".to_string(),
+                String::new()
+            )],
+            "无参形态必须带上 (id, Kiro 名, 空缓冲) 交给构建路径"
+        );
+        assert!(buffers.is_empty(), "drain 后不留条目（防重复合成）");
+    }
+
+    /// 纯空白缓冲按 0 字节形态处理（trim 后为空 = 无参）。
+    #[test]
+    fn whitespace_only_buffer_is_still_no_param_form() {
+        let mut buffers = pending(&[("toolu_ws", "ListAll", "  \n")]);
+        let (no_param, truncated) = split_unstopped_tool_buffers(&mut buffers);
+        assert!(!truncated, "trim 后为空仍是无参形态");
+        assert_eq!(no_param.len(), 1);
+    }
+
+    /// 非空未 stop = 真截断；两种形态并存时截断优先（`truncated` 置位，整轮报错）。
+    #[test]
+    fn nonempty_buffer_is_truncation_and_wins() {
+        let mut buffers = pending(&[
+            ("toolu_np", "ListAll", ""),
+            ("toolu_trunc", "Write", r#"{"path":"/a"}"#),
+        ]);
+        let (no_param, truncated) = split_unstopped_tool_buffers(&mut buffers);
+        assert!(truncated, "非空未 stop = 真截断");
+        assert_eq!(
+            no_param.len(),
+            1,
+            "无参条目仍被识别，但截断优先让整轮按失败处理"
+        );
+    }
+
+    /// 源码守卫：收尾必须（a）消费从未 stop 的残留缓冲、（b）复用 `build_tool_use`
+    /// 单一路径、（c）stop 帧把条目从残留表移除、（d）并存时截断优先。
+    /// 回退到「循环后零消费」或「非空也合成」都会 FAIL。
+    #[test]
+    fn nonstream_drain_reuses_single_build_path() {
+        let src = include_str!("handlers.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        let start = prod
+            .find("async fn handle_non_stream_request(")
+            .expect("handle_non_stream_request 必须存在");
+        let rest = &prod[start..];
+        let end = rest
+            .find("\nfn override_thinking_from_model_name")
+            .expect("下一函数定位不应被改名");
+        // 剔注释行：避免本守卫被注释里的说明文字满足（纸面测试形态）。
+        let body: String = rest[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let split_call = format!("split_unstopped_tool{}", "_buffers(");
+        assert!(
+            body.contains(&split_call),
+            "收尾兜底必须消费从未 stop 的残留缓冲（否则无参工具被静默吞掉）"
+        );
+        let build_call = format!("build_tool{}", "_use(");
+        assert!(
+            body.contains(&build_call),
+            "合成必须复用 build_tool_use（与 stop 分支同一实现，不得另写一条路）"
+        );
+        let remove = format!("tool_json_buffers{}", ".remove(");
+        assert!(
+            body.contains(&remove),
+            "stop 帧必须把条目从残留表移除（否则正常 stop 会被当残留重复处理）"
+        );
+        let fold = format!(
+            "{}{}",
+            "no_param_tool_resolved && !", "truncated_tool_residual"
+        );
+        assert!(
+            body.contains(&fold),
+            "两种形态并存时必须截断优先（无参形态不得把真截断洗成成功）"
+        );
+    }
+}

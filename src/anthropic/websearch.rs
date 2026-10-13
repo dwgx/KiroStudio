@@ -1364,9 +1364,109 @@ async fn decode_round(
         invalid_tool_input: None,
         upstream_error: None,
     };
-    // tool_use_id → (还原后的工具名, 累积的 input JSON)
-    let mut tool_buffers: std::collections::HashMap<String, (String, String)> =
+    // tool_use_id → (Kiro 名, 还原后的客户端名, 累积的 input JSON)。
+    // 名字随缓冲一起存：收尾兜底（0 字节且从未 stop 的无参形态）没有 ToolUseEvent
+    // 可取名字，而 web_search 分类与 Bug C（required 表按 Kiro 名）都要用。
+    let mut tool_buffers: std::collections::HashMap<String, (String, String, String)> =
         std::collections::HashMap::new();
+
+    /// 把一条**已收全**的 tool_use（Kiro 形态缓冲原文）收进本轮结果。
+    ///
+    /// 这是回灌轮里「工具调用收口」的**唯一**实现，两个调用点共用：
+    /// stop 帧（正常路径）与收尾兜底（0 字节且从未 stop 的无参形态，按 `{}` 收）。
+    /// 收口顺序与主路径同口径：
+    /// 1. web_search（`is_web_search` 由调用点按 Kiro 名与客户端名分类）→ 提取 query
+    ///    （缺 query 整轮报错）；
+    /// 2. 其它工具：Bug C 缺 required → `invalid_tool_input`（**出站还原之前**，对 Kiro 形态判）；
+    /// 3. 出站参数还原（仅入站映射过的）→ push `client_tool_use`。
+    ///
+    /// `assembled` 为空 = 无参调用（`{}`），与 stop 分支对空缓冲的处理同一条路。
+    /// 放在 decode_round 函数体内是刻意的：两个调用点都在本函数里，就近复用比跨函数
+    /// 共享更不容易被后来者「顺手再抄一份」。
+    fn finish_tool_call(
+        out: &mut RoundOutcome,
+        tool_name_map: &std::collections::HashMap<String, String>,
+        tool_required_fields: &std::collections::HashMap<String, Vec<String>>,
+        tool_use_id: &str,
+        kiro_name: &str,
+        client_name: &str,
+        is_web_search: bool,
+        assembled: &str,
+    ) {
+        let input: Value = if assembled.is_empty() {
+            json!({})
+        } else {
+            match serde_json::from_str::<Value>(assembled) {
+                Ok(v) => v,
+                Err(e) => {
+                    // 复用主路径修复层（stream::repair_tool_json，与
+                    // flush_tool_input 同源）：能修好就用修好的，避免
+                    // query 静默丢失；修不好则置 stream_error 整轮报错
+                    // （run_round 对 stream_error 返回 502，绝不把半截
+                    // 参数当「没参数」回灌 —— 那会让搜索 query 凭空消失）。
+                    if let Some(repaired) = super::stream::repair_tool_json(assembled) {
+                        tracing::warn!(
+                            "WebSearch 回灌工具参数非法 JSON 已修复(tool_use_id={}): {}",
+                            tool_use_id,
+                            e
+                        );
+                        serde_json::from_str::<Value>(&repaired).unwrap_or_else(|_| {
+                            out.stream_error = true;
+                            json!({})
+                        })
+                    } else {
+                        tracing::error!(
+                            "WebSearch 回灌工具参数非法 JSON 且修复层补不回(tool_use_id={}): {}",
+                            tool_use_id,
+                            e
+                        );
+                        out.stream_error = true;
+                        json!({})
+                    }
+                }
+            }
+        };
+        if is_web_search {
+            let Some(query) = web_search_query_from_input(&input) else {
+                tracing::warn!("WebSearch 回灌 web_search 缺 query，整轮失败");
+                out.stream_error = true;
+                return;
+            };
+            out.web_search.push(DecodedWebSearch {
+                id: tool_use_id.to_string(),
+                query,
+            });
+        } else {
+            // Bug C：出站还原前对 **Kiro 形态** 判缺（与 stream/非流式同口径）。
+            if super::handlers::tool_stream_align_failure_enabled()
+                && !tool_required_fields.is_empty()
+            {
+                if let Some(required) = tool_required_fields.get(kiro_name) {
+                    if let Some(missing) = super::stream::missing_required_keys(&input, required) {
+                        tracing::warn!(
+                            missing = %missing.join(","),
+                            "WebSearch 回灌 tool_use 缺必需字段（Bug C）"
+                        );
+                        out.invalid_tool_input = Some(missing.join("、"));
+                        return;
+                    }
+                }
+            }
+            // 出站参数还原（Kiro 形态 → CC 形态），仅当入站映射过；
+            // 与 stream.rs 的 stop 分支同口径，避免把不认识的参数清空。
+            let client_input = if tool_name_map.contains_key(kiro_name) {
+                super::converter::map_tool_input_from_kiro(client_name, input)
+            } else {
+                input
+            };
+            out.client_tool_use.push(json!({
+                "type": "tool_use",
+                "id": tool_use_id,
+                "name": client_name,
+                "input": client_input
+            }));
+        }
+    }
 
     while let Some(chunk) = body_stream.next().await {
         let chunk = match chunk {
@@ -1408,99 +1508,36 @@ async fn decode_round(
                         .get(&tu.name)
                         .cloned()
                         .unwrap_or_else(|| tu.name.clone());
+                    // 缓冲带上 Kiro 名（Bug C 表按 Kiro 名）与还原后的客户端名（下发用）：
+                    // 收尾兜底没有 ToolUseEvent 可取名字。
                     let entry = tool_buffers
                         .entry(tu.tool_use_id.clone())
-                        .or_insert_with(|| (original_name.clone(), String::new()));
+                        .or_insert_with(|| {
+                            (tu.name.clone(), original_name.clone(), String::new())
+                        });
                     if !tu.input.is_empty() {
-                        entry.1 = super::stream::merge_tool_input(&entry.1, &tu.input);
+                        let merged = super::stream::merge_tool_input(&entry.2, &tu.input);
+                        entry.2 = merged;
                     }
                     if tu.stop {
-                        let (name, assembled) = tool_buffers
+                        let (kiro_name, client_name, assembled) = tool_buffers
                             .remove(&tu.tool_use_id)
-                            .unwrap_or((original_name, String::new()));
-                        let input: Value = if assembled.is_empty() {
-                            json!({})
-                        } else {
-                            match serde_json::from_str::<Value>(&assembled) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    // 复用主路径修复层（stream::repair_tool_json，与
-                                    // flush_tool_input 同源）：能修好就用修好的，避免
-                                    // query 静默丢失；修不好则置 stream_error 整轮报错
-                                    // （run_round 对 stream_error 返回 502，绝不把半截
-                                    // 参数当「没参数」回灌 —— 那会让搜索 query 凭空消失）。
-                                    if let Some(repaired) =
-                                        super::stream::repair_tool_json(&assembled)
-                                    {
-                                        tracing::warn!(
-                                            "WebSearch 回灌工具参数非法 JSON 已修复(tool_use_id={}): {}",
-                                            tu.tool_use_id,
-                                            e
-                                        );
-                                        serde_json::from_str::<Value>(&repaired).unwrap_or_else(
-                                            |_| {
-                                                out.stream_error = true;
-                                                json!({})
-                                            },
-                                        )
-                                    } else {
-                                        tracing::error!(
-                                            "WebSearch 回灌工具参数非法 JSON 且修复层补不回(tool_use_id={}): {}",
-                                            tu.tool_use_id,
-                                            e
-                                        );
-                                        out.stream_error = true;
-                                        json!({})
-                                    }
-                                }
-                            }
-                        };
-                        // 用上游/Kiro 名分类（还原前），并同时认客户端 WebSearch。
-                        if tool_use_name_is_web_search(&tu.name)
-                            || tool_use_name_is_web_search(&name)
-                        {
-                            let query = web_search_query_from_input(&input);
-                            let Some(query) = query else {
-                                tracing::warn!("WebSearch 回灌 web_search 缺 query，整轮失败");
-                                out.stream_error = true;
-                                continue;
-                            };
-                            out.web_search.push(DecodedWebSearch {
-                                id: tu.tool_use_id.clone(),
-                                query,
-                            });
-                        } else {
-                            // Bug C：出站还原前对 **Kiro 形态** 判缺（与 stream/非流式同口径）。
-                            if super::handlers::tool_stream_align_failure_enabled()
-                                && !tool_required_fields.is_empty()
-                            {
-                                if let Some(required) = tool_required_fields.get(&tu.name) {
-                                    if let Some(missing) =
-                                        super::stream::missing_required_keys(&input, required)
-                                    {
-                                        tracing::warn!(
-                                            missing = %missing.join(","),
-                                            "WebSearch 回灌 tool_use 缺必需字段（Bug C）"
-                                        );
-                                        out.invalid_tool_input = Some(missing.join("、"));
-                                        continue;
-                                    }
-                                }
-                            }
-                            // 出站参数还原（Kiro 形态 → CC 形态），仅当入站映射过；
-                            // 与 stream.rs 的 stop 分支同口径，避免把不认识的参数清空。
-                            let client_input = if tool_name_map.contains_key(&tu.name) {
-                                super::converter::map_tool_input_from_kiro(&name, input)
-                            } else {
-                                input
-                            };
-                            out.client_tool_use.push(json!({
-                                "type": "tool_use",
-                                "id": tu.tool_use_id,
-                                "name": name,
-                                "input": client_input
-                            }));
-                        }
+                            .unwrap_or((tu.name.clone(), original_name, String::new()));
+                        // web_search 分类用上游/Kiro 名（还原前），并同时认客户端 WebSearch。
+                        let is_web_search = tool_use_name_is_web_search(&tu.name)
+                            || tool_use_name_is_web_search(&client_name);
+                        // 收口（分类 / Bug C / 参数还原）走 finish_tool_call ——
+                        // 与收尾兜底同一实现，禁止另写一条路。
+                        finish_tool_call(
+                            &mut out,
+                            tool_name_map,
+                            tool_required_fields,
+                            &tu.tool_use_id,
+                            &kiro_name,
+                            &client_name,
+                            is_web_search,
+                            &assembled,
+                        );
                     }
                 }
                 Event::ContextUsage(cu) => {
@@ -1554,14 +1591,34 @@ async fn decode_round(
     if decoder.is_stopped() {
         out.stream_error = true;
     }
-    // ⚠️ 残留 tool 缓冲同款（2026-10-14 流式审计发现）：干净 EOF 但 `toolUseEvent` 的
-    // stop 帧没到 ⇒ 那条 tool_use 凭空消失 —— `round.web_search` 与 `round.client_tool_use`
-    // 都为空 → `should_replay_round` 判假 → 本轮被当正常 end_turn 渲染给客户端：工具不执行、
-    // 搜索不发生，客户端连一个错误都收不到（agentic 循环静默卡住）。
-    // 主路径对同一形态有明确兜底（stream.rs 的残留 input 先 flush 再关块 + Incomplete），
-    // 两条路径口径必须一致：**宁可整轮报错，也不静默吞工具**。
-    if !tool_buffers.is_empty() {
-        out.stream_error = true;
+    // 残留 tool 缓冲（2026-10-14 流式审计 + 对手对照修复）：干净 EOF 但 `toolUseEvent`
+    // 的 stop 帧没到。旧判据 `!tool_buffers.is_empty()` 把两种形态一锅端成 stream_error：
+    //   · **0 字节**且从未 stop = 上游对**无参工具**的正常形态（只发一条 `input:""`、
+    //     永不补 stop）⇒ 按 `{}` 收成完成调用（走 stop 分支同一套 finish_tool_call，
+    //     不另写一条路）。旧判据在这里是**误报**：模型调用无参客户端工具时整条回灌请求
+    //     502，搜索与工具一起失败。
+    //   · **非空**且从未 stop = 真截断 ⇒ 保持 stream_error 整轮报错：残留半截参数不能
+    //     当「没参数」回灌（会让搜索 query / 工具参数凭空消失），也不可静默吞工具
+    //     ——`round.web_search` 与 `round.client_tool_use` 一起为空会让本轮被当正常
+    //     end_turn 渲染（工具不执行、客户端连错误都收不到，agentic 循环静默卡住）。
+    // 与 stream.rs / 非流式两条路径的收尾二分同口径。
+    for (tool_use_id, (kiro_name, client_name, assembled)) in tool_buffers.drain() {
+        if !assembled.trim().is_empty() {
+            out.stream_error = true;
+            continue;
+        }
+        let is_web_search = tool_use_name_is_web_search(&kiro_name)
+            || tool_use_name_is_web_search(&client_name);
+        finish_tool_call(
+            &mut out,
+            tool_name_map,
+            tool_required_fields,
+            &tool_use_id,
+            &kiro_name,
+            &client_name,
+            is_web_search,
+            &assembled,
+        );
     }
     out
 }
@@ -4309,6 +4366,118 @@ mod tests {
             loop_fn.contains(&thinking),
             "客户端未声明 thinking 时，正文里的内联 <thinking> 标签必须剥离\
              （与非流式分支同口径）"
+        );
+    }
+
+    // ===== 无参工具（0 字节且从未 stop）收尾二分（2026-10-14 对手对照修复）=====
+
+    /// 无参形态（0 字节 + 从未 stop）必须按 `{}` 收成**完成调用**，不得误报 stream_error。
+    /// 回退即 FAIL：旧判据 `!tool_buffers.is_empty()` 在这里置 stream_error，整条回灌请求 502。
+    #[tokio::test]
+    async fn decode_round_completes_no_param_tool_on_clean_eof() {
+        let frame = ws_aws_frame(
+            "toolUseEvent",
+            r#"{"name":"ListAll","toolUseId":"t1","input":""}"#,
+        );
+        let out = decode_round(
+            ws_frame_response(vec![frame]),
+            "claude-sonnet-4",
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .await;
+        assert!(
+            !out.stream_error,
+            "0 字节且从未 stop = 无参调用的正常形态，不得误报 stream_error"
+        );
+        assert!(
+            out.invalid_tool_input.is_none(),
+            "无 required 声明的工具不得判 Bug C"
+        );
+        assert_eq!(
+            out.client_tool_use.len(),
+            1,
+            "无参调用必须收成一条 tool_use（不得静默消失）"
+        );
+        assert_eq!(out.client_tool_use[0]["name"], "ListAll");
+        assert_eq!(
+            out.client_tool_use[0]["input"],
+            json!({}),
+            "0 字节按 {{}} 收成完整调用（与 stop 分支同一条路）"
+        );
+    }
+
+    /// 声明了 required 却 0 字节 ⇒ Bug C 同源判据：置 invalid_tool_input（整轮失败），
+    /// 不得当无参调用下发。
+    #[tokio::test]
+    async fn decode_round_no_param_with_required_fields_fails() {
+        crate::anthropic::set_tool_stream_align_failure(true);
+        let frame = ws_aws_frame(
+            "toolUseEvent",
+            r#"{"name":"execute_bash","toolUseId":"t1","input":""}"#,
+        );
+        let mut req = std::collections::HashMap::new();
+        req.insert("execute_bash".to_string(), vec!["command".to_string()]);
+        let out = decode_round(
+            ws_frame_response(vec![frame]),
+            "claude-sonnet-4",
+            &std::collections::HashMap::new(),
+            &req,
+        )
+        .await;
+        assert_eq!(
+            out.invalid_tool_input.as_deref(),
+            Some("command"),
+            "0 字节 + required 声明必须判缺（Bug C 同源判据）"
+        );
+        assert!(
+            out.client_tool_use.is_empty(),
+            "缺必需参数不得下发残参"
+        );
+    }
+
+    /// 0 字节的 web_search（缺 query）仍整轮报错：query 不是可省略的参数。
+    #[tokio::test]
+    async fn decode_round_no_param_web_search_without_query_fails_round() {
+        let frame = ws_aws_frame(
+            "toolUseEvent",
+            r#"{"name":"web_search","toolUseId":"t1","input":""}"#,
+        );
+        let out = decode_round(
+            ws_frame_response(vec![frame]),
+            "claude-sonnet-4",
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .await;
+        assert!(
+            out.stream_error,
+            "web_search 无 query 必须整轮报错（不得静默消失）"
+        );
+        assert!(out.web_search.is_empty());
+    }
+
+    /// 两种形态并存时截断优先：同轮既有 0 字节无参调用、又有非空残留 ⇒ 仍报错。
+    #[tokio::test]
+    async fn decode_round_mixed_no_param_and_truncated_keeps_stream_error() {
+        let no_param = ws_aws_frame(
+            "toolUseEvent",
+            r#"{"name":"ListAll","toolUseId":"t_np","input":""}"#,
+        );
+        let truncated = ws_aws_frame(
+            "toolUseEvent",
+            r#"{"name":"Bash","toolUseId":"t_trunc","input":"{\"command\":\"ls\"}"}"#,
+        );
+        let out = decode_round(
+            ws_frame_response(vec![no_param, truncated]),
+            "claude-sonnet-4",
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .await;
+        assert!(
+            out.stream_error,
+            "非空残留 = 真截断，不得因同轮有无参调用就被洗成成功（截断优先）"
         );
     }
 }

@@ -543,6 +543,16 @@ impl SseStateManager {
         None
     }
 
+    /// 指定块是否仍打开（已 start、未 stop）。
+    ///
+    /// 收尾判定「0 字节且从未 stop 的工具块」（上游无参工具的正常形态）用 ——
+    /// 见 `StreamContext::generate_final_events` 的收尾二分。
+    fn is_block_open(&self, index: i32) -> bool {
+        self.active_blocks
+            .get(&index)
+            .is_some_and(|b| b.started && !b.stopped)
+    }
+
     /// 生成最终事件序列
     ///
     /// `input_tokens` 已是 billed 口径（剔除 cache 读写）；`cache_usage` 存在时
@@ -872,6 +882,17 @@ pub struct StreamContext {
     saw_upstream_stop: bool,
     /// 收到过 `toolUseEvent.stop=true`（或 XML 重组出的完整 tool_use）。未 stop 的残留不算。
     saw_tool_stop: bool,
+    /// 收尾二分标记：本轮存在「**0 字节**且从未 stop」的工具块。
+    ///
+    /// 上游对**无参工具**只发一条 `toolUseEvent`（`input:""`、永不补 `stop=true`）——
+    /// 这是无参调用的正常形态，不是「缺终止信号」。收尾据此按正常路径关闭该块、以 `{}`
+    /// 完成调用（见 `generate_final_events` 的收尾二分），不让整轮误判 Incomplete。
+    no_param_tool_resolved: bool,
+    /// 收尾二分标记：本轮存在「**非空**且从未 stop」的工具缓冲（真截断）。
+    ///
+    /// 两种形态并存时**截断优先**：整轮仍按缺终止信号（Incomplete）处理，绝不因
+    /// 同轮还有一条无参调用就把截断洗成成功。
+    unresolved_truncated_tool_input: bool,
     /// `!thinking_enabled` 时被丢弃的结构化 reasoning 原文（截断累积，上限
     /// [`Self::MAX_DISCARDED_REASONING_BYTES`]）。
     ///
@@ -995,6 +1016,10 @@ impl StreamContext {
             body_content_seen: false,
             saw_upstream_stop: false,
             saw_tool_stop: false,
+            // 收尾二分标记：0 字节未 stop = 无参形态（正常）/ 非空未 stop = 真截断。
+            // 两者都由 `generate_final_events` 的收尾二分置位。
+            no_param_tool_resolved: false,
+            unresolved_truncated_tool_input: false,
             discarded_reasoning: String::new(),
         }
     }
@@ -1349,6 +1374,13 @@ impl StreamContext {
             || self.saw_upstream_stop
             || self.saw_tool_stop
         {
+            return false;
+        }
+        // 无参工具形态（0 字节且从未 stop）已按正常路径收成完整调用（`{}`）——
+        // 上游对无参工具**不发** stop 帧，拿「无 stop 信号」判缺失会把一次正常调用
+        // 误判成截断（整轮 Incomplete + SSE error）。它等价于工具终止信号。
+        // 两种形态并存时截断优先：仍有非空未 stop 的残留 ⇒ 不算终止，整轮按失败处理。
+        if self.no_param_tool_resolved && !self.unresolved_truncated_tool_input {
             return false;
         }
         self.body_content_seen || self.state_manager.has_tool_use
@@ -3236,7 +3268,12 @@ impl StreamContext {
         // 截断兜底：若某 tool_use 累积了 input 但流在 stop 之前就结束（上游截断/客户端断开），
         // 缓冲会残留、块未关闭。这里把残留 input 尽力发出并关闭块，避免客户端卡在未闭合的
         // tool_use 块上。（正常路径 stop 时已 flush + remove，此处只处理未收到 stop 的残留。）
+        //
+        // ⚠️ 残留缓冲 = **非空**且从未 stop ⇒ 真截断。标记后让收尾判据仍按缺终止信号
+        // （Incomplete）处理 —— 绝不因同轮还有一条「0 字节未 stop」的无参调用就被洗成成功
+        // （两种形态并存时截断优先，见 `is_clean_eof_without_terminal`）。
         if !self.tool_input_sent.is_empty() {
+            self.unresolved_truncated_tool_input = true;
             let pending: Vec<(String, String)> = self.tool_input_sent.drain().collect();
             for (tool_use_id, mut assembled) in pending {
                 if let Some(&idx) = self.tool_block_indices.get(&tool_use_id) {
@@ -3263,6 +3300,49 @@ impl StreamContext {
                     }
                 }
             }
+        }
+
+        // 收尾二分（2026-10-14 对手对照修复）：上游对**无参工具**只发一条 `toolUseEvent`
+        // （`input:""`、**永不补 `stop=true`**）—— 旧收尾只看「有无 stop 信号」，
+        // `has_tool_use` 且从未 stop ⇒ 整轮判 Incomplete + 补 SSE error（有 metadataEvent
+        // 时又因 saw_upstream_stop 走成功分支，同一形态两副面孔）。
+        // 现在显式二分，与「对手修复」的语义对齐：
+        //   · 0 字节（无任何 input 帧）→ 无参调用的正常形态：按正常路径关闭该块，
+        //     客户端按 start 里的 `input:{}` 得到完整 tool_use 调用；
+        //     但该工具**声明了 required 字段**时 0 字节必然是坏调用（Bug C 同源判据，
+        //     `fail_bug_c_if_missing` 把空缓冲当 `{}`）→ 仍失败（INVALID_TOOL_INPUT）。
+        //   · 非空未 stop → 真截断：已在上面的兜底里尽力 flush + 关块，整轮仍按失败。
+        // 两种形态并存时截断优先（`unresolved_truncated_tool_input` 已在上面置位）。
+        //
+        // 判据必须落在**状态机**上（块仍打开）：`tool_input_sent` 的残留非空时上面已 drain，
+        // 此处只剩「从未收到任何 input 字节」的开放工具块。
+        let open_tool_blocks: Vec<(i32, String)> = {
+            let mut v: Vec<(i32, String)> = self
+                .tool_block_indices
+                .iter()
+                .filter(|(_, idx)| self.state_manager.is_block_open(**idx))
+                .map(|(id, idx)| (*idx, id.clone()))
+                .collect();
+            // 按 block index 升序（与 close_open_blocks 的关闭顺序同序），日志/事件顺序稳定。
+            v.sort_by_key(|(idx, _)| *idx);
+            v
+        };
+        for (idx, tool_use_id) in open_tool_blocks {
+            // 防御：有残留缓冲的已在上面按截断处理（drain 后恒空，此分支不可达）。
+            if self.tool_input_sent.contains_key(&tool_use_id) {
+                continue;
+            }
+            // Bug C 同源判据：声明了 required 却 0 字节 ⇒ 坏调用，置 INVALID_TOOL_INPUT
+            // （块交给收尾的 close_open_blocks 统一关闭）。空表/无 required 声明（含
+            // WebSearch 类无 input_schema 的工具）= 无参工具，放行。
+            if self.fail_bug_c_if_missing(idx, "") {
+                continue;
+            }
+            tracing::debug!(
+                block_index = idx,
+                "工具块 0 字节且从未 stop：按无参调用正常收尾（上游对无参工具不发 stop 帧）"
+            );
+            self.no_param_tool_resolved = true;
         }
 
         // Flush thinking_buffer 中的剩余内容。
@@ -4573,3 +4653,129 @@ mod ported_k2cc_empty_response_tests;
 #[cfg(test)]
 #[path = "stream_output_tokens_accounting_tests.rs"]
 mod output_tokens_accounting_tests;
+
+/// 无参工具收尾二分（2026-10-14 对手对照修复）的回归测试。
+///
+/// 上游对**无参工具**只发一条 `toolUseEvent`（`input:""`、**永不补 `stop=true`**）：
+/// - 0 字节且从未 stop = 无参调用的正常形态 ⇒ 按 `{}` 收成完整 tool_use（成功收尾）；
+/// - 非空且从未 stop = 真截断 ⇒ 整轮仍按 Incomplete（失败）处理；
+/// - 两种形态并存时截断优先。
+///
+/// 本模块直接构造「0 字节未 stop」的输入（无需网络），钉住 `generate_final_events`
+/// 的收尾二分与 `is_clean_eof_without_terminal`，防回退到「有工具块却从未 stop 一律
+/// 判 Incomplete」的旧行为。
+#[cfg(test)]
+mod no_param_tool_tests {
+    use super::*;
+
+    fn tool_ev(name: &str, id: &str, input: &str, stop: bool) -> Event {
+        Event::ToolUse(crate::kiro::model::events::ToolUseEvent {
+            name: name.to_string(),
+            tool_use_id: id.to_string(),
+            input: input.to_string(),
+            stop,
+        })
+    }
+
+    /// 无参形态（0 字节 + 从未 stop，无 metadata）：必须按完整 tool_use 成功收尾。
+    /// 回退即 FAIL：旧代码在这里判 Incomplete + 补 SSE error（整轮失败）。
+    #[test]
+    fn empty_never_stop_tool_is_complete_tool_use_not_incomplete() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        ctx.process_kiro_event(&tool_ev("ListAll", "toolu_np", "", false));
+        let finals = ctx.generate_final_events();
+
+        assert!(
+            ctx.completion().is_ok(),
+            "0 字节且从未 stop = 无参调用的正常形态，不得判 Incomplete：{:?}",
+            ctx.completion()
+        );
+        assert!(
+            !finals.iter().any(|e| e.event == "error"),
+            "无参形态不得补 SSE error（否则客户端退避重试一次正常调用）"
+        );
+        let message_delta = finals
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("应有 message_delta");
+        assert_eq!(
+            message_delta.data["delta"]["stop_reason"], "tool_use",
+            "无参调用仍是工具轮，stop_reason 必须是 tool_use"
+        );
+        let idx = *ctx
+            .tool_block_indices
+            .get("toolu_np")
+            .expect("工具块索引应已分配");
+        assert!(
+            finals.iter().any(|e| {
+                e.event == "content_block_stop" && e.data["index"].as_i64() == Some(idx as i64)
+            }),
+            "无参工具块必须按正常路径关闭（客户端据此完成 content_block）"
+        );
+        assert!(
+            !finals.iter().any(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "input_json_delta"
+            }),
+            "无参调用没有 input 帧可发：客户端按 start 里的 input:{{}} 得到 {{}}"
+        );
+    }
+
+    /// 声明了 required 字段的工具 0 字节且从未 stop ⇒ 坏调用（Bug C 同源判据），仍失败。
+    #[test]
+    fn empty_never_stop_with_required_fields_still_fails() {
+        crate::anthropic::set_tool_stream_align_failure(true);
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let mut req = HashMap::new();
+        req.insert("execute_bash".to_string(), vec!["command".to_string()]);
+        ctx.set_tool_required_fields(req);
+        let _ = ctx.generate_initial_events();
+        ctx.process_kiro_event(&tool_ev("execute_bash", "toolu_req", "", false));
+        let _ = ctx.generate_final_events();
+
+        match ctx.completion() {
+            CompletionStatus::UpstreamError { code, .. } => {
+                assert_eq!(
+                    code, "INVALID_TOOL_INPUT",
+                    "0 字节 + required 声明必须按 Bug C 置 INVALID_TOOL_INPUT"
+                );
+            }
+            other => panic!("0 字节 + required 声明必须判失败，实际 {other:?}"),
+        }
+    }
+
+    /// 非空且从未 stop = 真截断：整轮仍按 Incomplete（失败）处理。
+    #[test]
+    fn nonempty_never_stop_tool_is_still_incomplete() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        ctx.process_kiro_event(&tool_ev("Write", "toolu_trunc", r#"{"path":"/a"}"#, false));
+        let finals = ctx.generate_final_events();
+
+        assert!(
+            matches!(ctx.completion(), CompletionStatus::Incomplete { .. }),
+            "非空未 stop 必须仍判 Incomplete，实际 {:?}",
+            ctx.completion()
+        );
+        assert!(
+            finals.iter().any(|e| e.event == "error"),
+            "缺终止信号必须补 SSE error 让客户端重试整轮"
+        );
+    }
+
+    /// 两种形态并存时截断优先：同轮既有 0 字节无参调用、又有非空残留 ⇒ 整轮仍失败。
+    #[test]
+    fn mixed_no_param_and_truncated_keeps_truncation_failure() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        ctx.process_kiro_event(&tool_ev("ListAll", "toolu_np", "", false));
+        ctx.process_kiro_event(&tool_ev("Write", "toolu_trunc", r#"{"path":"/a"}"#, false));
+        let _ = ctx.generate_final_events();
+
+        assert!(
+            matches!(ctx.completion(), CompletionStatus::Incomplete { .. }),
+            "无参形态不得把同轮的真截断洗成成功（截断优先），实际 {:?}",
+            ctx.completion()
+        );
+    }
+}
