@@ -5786,3 +5786,31 @@
             "豁免只跳过映射，无其它改写 → None"
         );
     }
+
+/// ⭐ 换号链路守卫（2026-10-14 审计）：`tried_this_call` 必须从**预算的排除集**起步。
+///
+/// 为什么必须有这条守卫：本函数内新建局部集合时若写成空集，跨调用跳（首字重开 /
+/// websearch 回灌轮 / 压缩重试轮）会立刻回头选刚失败的那个号——默认会话亲和恒开，
+/// 必然粘回原号，「透明换号重试」名存实亡。这不是形状洁癖：去掉本行后功能静默失效，
+/// 且只有真跑一次静默上游才能观察到，故用源码切片把它钉住。
+#[test]
+fn tried_set_must_seed_from_shared_budget_exclusion() {
+    let src = include_str!("provider.rs");
+    let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+    let prod = &src[..cut];
+    let at = prod
+        .find("fn call_api_with_retry(")
+        .expect("call_api_with_retry 必须存在");
+    let body = &prod[at..];
+    let end = body.find("\n    }\n").unwrap_or(body.len());
+    let body = &body[..end];
+
+    assert!(
+        body.contains("let mut tried_this_call: HashSet<u64> = budget.excluded();"),
+        "tried_this_call 必须用 budget.excluded() 播种（空集 ⇒ 重开不换号，见函数文档）"
+    );
+    assert!(
+        !body.contains("let mut tried_this_call: HashSet<u64> = HashSet::new();"),
+        "旧的空集初始化必须已移除（它让跨调用跳各自从零开始）"
+    );
+}

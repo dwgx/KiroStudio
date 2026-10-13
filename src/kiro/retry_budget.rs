@@ -61,6 +61,14 @@ pub struct SharedRetryBudget {
     remaining: std::sync::Arc<std::sync::Mutex<u32>>,
     /// 整条请求链最先尝试的凭据 ID（首写生效；None = 链内尚未选中任何凭据）。
     first_attempted_credential_id: std::sync::Arc<std::sync::Mutex<Option<u64>>>,
+    /// 本请求链**已试过**的凭据（排除集）。
+    ///
+    /// ⭐ 为什么必须挂在预算上：`call_api_with_retry` 的 `tried_this_call` 是**每次调用内**
+    /// 的局部集合，而「首字重开」是一次全新的 `call_api_stream` 调用 —— 没有这条跨调用通道，
+    /// 重开就从空排除集开始选号，会话亲和（默认恒开）随即把刚静默的同一个号原样粘回来：
+    /// 30s×3 全空等在同一个号上，「透明换号重试」退化成「同一号空等三次」。
+    /// 透传 failover / websearch 回灌轮 / 压缩重试轮同理会各自从空集开始，一并受益。
+    excluded_credentials: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
 }
 
 impl SharedRetryBudget {
@@ -70,7 +78,31 @@ impl SharedRetryBudget {
                 ABSOLUTE_MAX_TOTAL_RETRIES as u32,
             )),
             first_attempted_credential_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            excluded_credentials: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
         }
+    }
+
+    /// 把某凭据加入本请求的排除集（幂等）。
+    ///
+    /// 语义是「本请求内不要再选它」，**不**影响会话亲和表本身（会话结束后仍粘同一个号，
+    /// 保住 prompt cache）——与 `acquire_context_excluding` 的排除语义一致。
+    pub fn exclude(&self, id: u64) {
+        self.excluded_credentials
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id);
+    }
+
+    /// 排除集快照（供 `call_api_with_retry` 初始化本跳的 `tried_this_call`）。
+    ///
+    /// 返回快照而非借用：选号路径在 await 之间持有它，不能跨锁。
+    pub fn excluded(&self) -> std::collections::HashSet<u64> {
+        self.excluded_credentials
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// 当前剩余额度（配额计算输入：每轮 `min(base, remaining)`）。
@@ -184,4 +216,45 @@ pub(super) fn compute_max_retries(total: usize, _available: usize) -> usize {
         // 取 1 而非 0 的语义：至少走一遍 acquire_context，让它的等待逻辑有机会等到号
         // 出冷却；等不到再由墙钟预算（MAX_REQUEST_RETRY_BUDGET_SECS）兜底透传错误。
         .max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 排除集：加入后可见、幂等、`Clone` 共享同一份（预算沿链克隆传递，各层看到同一集）。
+    #[test]
+    fn excluded_set_is_shared_across_clones() {
+        let b = SharedRetryBudget::new();
+        assert!(b.excluded().is_empty(), "初值必须为空（否则会误排除号）");
+
+        let b2 = b.clone();
+        b.exclude(7);
+        assert!(b2.excluded().contains(&7), "Clone 必须共享同一份排除集");
+        assert_eq!(b2.excluded().len(), 1);
+
+        // 幂等
+        b.exclude(7);
+        b.exclude(7);
+        assert_eq!(b.excluded().len(), 1);
+
+        // 多号累积（首字重开可能连续失败两次 → 两个号都在集里）
+        b2.exclude(9);
+        let mut got: Vec<u64> = b.excluded().into_iter().collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![7, 9]);
+    }
+
+    /// 排除集与 remaining / first_attempted 互不干扰（三者同挂一份预算，语义各自独立）。
+    #[test]
+    fn excluded_set_is_independent_of_other_budget_state() {
+        let b = SharedRetryBudget::new();
+        b.exclude(3);
+        b.note_first_attempt(5);
+        b.consume(2);
+        assert_eq!(b.first_attempted(), Some(5));
+        assert_eq!(b.used(), 2);
+        assert!(b.excluded().contains(&3));
+        assert_eq!(b.excluded().len(), 1, "note_first_attempt 不得写进排除集");
+    }
 }

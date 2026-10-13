@@ -3251,7 +3251,10 @@ async fn handle_stream_request(
         FirstTokenRetry {
             timeout,
             max_retries,
-            reopen: std::sync::Arc::new(move || {
+            reopen: std::sync::Arc::new(move |failed_credential_id: u64| {
+                // ⭐ 先把刚静默的号挂上预算排除集：重开是一次全新的 call_api_stream，
+                // 本跳的 tried_this_call 从预算快照起步；不挂就被会话亲和原样粘回来。
+                budget_owned.exclude(failed_credential_id);
                 let p = provider_owned.clone();
                 let b = body_owned.clone();
                 let g = budget_owned.clone();
@@ -3557,9 +3560,14 @@ impl<C> Drop for UsageEmitGuard<C> {
     }
 }
 
-/// 首字重试的重开闭包：重发同一请求体（预算携带排除集 → 自动换号）。
+/// 首字重试的重开闭包：重发同一请求体。
+///
+/// 入参是**刚静默的那个凭据 ID** —— 闭包负责把它挂上预算排除集（`SharedRetryBudget::exclude`）
+/// 再重发，这样选号链结构性避开它，`message_start` 才可能来自另一个号。
+/// 早先的实现注释写着「预算携带排除集 → 自动换号」但预算里根本没有排除集，
+/// 重开实测选回同一个号（默认会话亲和恒开）——「透明换号」名存实亡，见 2026-10-14 审计。
 type ReopenFn = std::sync::Arc<
-    dyn Fn() -> std::pin::Pin<
+    dyn Fn(u64) -> std::pin::Pin<
             Box<
                 dyn Future<
                         Output = anyhow::Result<(
@@ -3620,7 +3628,9 @@ async fn reopen_stream(st: &mut SseStreamState) -> bool {
     else {
         return false;
     };
-    match (reopen_fn)().await {
+    // 把「刚静默/读失败的那个号」交给闭包挂排除集再重开（换号的关键，见 ReopenFn 文档）。
+    let failed_credential_id = st.guard.meta.credential_id;
+    match (reopen_fn)(failed_credential_id).await {
         Ok((resp, new_meta)) => {
             st.retries_used += 1;
             // 新 ctx 必须先「消化」一遍初始事件（丢弃返回值）：客户端在提交点已收到

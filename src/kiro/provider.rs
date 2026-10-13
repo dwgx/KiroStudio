@@ -2921,7 +2921,11 @@ impl KiroProvider {
         // 一个真实 429 被放大成连环 429)。与其它去重集同样声明在 'absorb 循环之外 ⇒
         // 跨吸收轮共享 ⇒ 一条客户端请求内不会反复回头打同一个号。
         // 全池都试过时排除集自动退化成"允许重选"(见 acquire_context_excluding 不变量 1)。
-        let mut tried_this_call: HashSet<u64> = HashSet::new();
+        // ⭐ 初值取**预算**里的排除集（本请求链此前各跳已试过的号）：本函数是每次调用
+        // 新建的局部集合，若从空集起步，跨调用跳（首字重开 / 回灌轮 / 压缩轮）会立刻
+        // 回头选刚失败的那个号（会话亲和默认恒开 ⇒ 必然粘回）。见 SharedRetryBudget
+        // 的 `excluded_credentials` 文档。
+        let mut tried_this_call: HashSet<u64> = budget.excluded();
         // MODEL_TEMPORARILY_UNAVAILABLE 全局容量问题专用计数：只允许 1 次慢速退避重试，
         // 耗尽后立即 break（而非继续烧光 max_retries 切换凭据——所有凭据受同一模型过载影响）。
         let mut model_unavailable_attempts: usize = 0;

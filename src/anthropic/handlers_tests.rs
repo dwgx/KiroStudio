@@ -5116,17 +5116,23 @@ mod first_token_retry_tests {
     async fn silent_upstream_reopens_once_and_commits_message_start_exactly_once() {
         let reopen_calls = Arc::new(AtomicUsize::new(0));
         let reopened_at = Arc::new(parking_lot::Mutex::new(None::<std::time::Instant>));
+        // 记录重开闭包收到的「刚静默的凭据 ID」：换号的关键是把失败号挂上预算排除集，
+        // 所以必须证明 reopen_stream 真把失败号传进来了（早先版本传的是 ()，换号无从谈起）。
+        let failed_ids = Arc::new(parking_lot::Mutex::new(Vec::<u64>::new()));
 
         let calls = reopen_calls.clone();
         let at = reopened_at.clone();
+        let ids = failed_ids.clone();
         let retry = FirstTokenRetry {
             timeout: Duration::from_millis(30),
             max_retries: 1,
-            reopen: Arc::new(move || {
+            reopen: Arc::new(move |failed_credential_id: u64| {
                 let calls = calls.clone();
                 let at = at.clone();
+                let ids = ids.clone();
                 Box::pin(async move {
                     calls.fetch_add(1, Ordering::SeqCst);
+                    ids.lock().push(failed_credential_id);
                     *at.lock() = Some(std::time::Instant::now());
                     Ok((
                         frame_response("assistantResponseEvent", r#"{"content":"hi"}"#),
@@ -5155,6 +5161,13 @@ mod first_token_retry_tests {
         // ③ reopen 恰调 1 次
         let reopen_at = reopened_at.lock().expect("首字截止必须触发重开");
         assert_eq!(reopen_calls.load(Ordering::SeqCst), 1, "reopen 恰一次");
+        // ③b 重开闭包必须收到「刚静默的那个号」（= 初始 meta 的 credential_id）。
+        //     这是换号的前提：闭包据此把它挂上预算排除集，选号才会换人。
+        assert_eq!(
+            *failed_ids.lock(),
+            vec![1u64],
+            "reopen 必须收到刚失败的凭据 ID（否则排除集为空 → 会话亲和把同号粘回来）"
+        );
 
         // ② 重开前零内容字节：重开时刻之前收到的字节只允许是 ping 保活
         for (t, text) in &chunks {
@@ -5224,7 +5237,7 @@ mod first_token_retry_tests {
         let retry = FirstTokenRetry {
             timeout: Duration::from_millis(30),
             max_retries: 0,
-            reopen: Arc::new(move || {
+            reopen: Arc::new(move |_failed_credential_id: u64| {
                 let calls = calls.clone();
                 Box::pin(async move {
                     calls.fetch_add(1, Ordering::SeqCst);
