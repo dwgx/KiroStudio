@@ -2432,7 +2432,16 @@ fn build_loop_sse_tail(
         json!({
             "type": "message_delta",
             "delta": {"stop_reason": success.stop_reason, "stop_sequence": null},
-            "usage": {"output_tokens": success.output_tokens}
+            // ⚠️ 必须带 input_tokens（2026-10-14 流式审计发现）：message_start 只能立刻发、
+            // 用的是本地估算（fallback_input_tokens），收尾若不带真值，客户端拿到的最终
+            // usage 里 input_tokens 就恒是估算值 —— 而同请求的非流式路径
+            //（build_loop_json_body）与 build_loop_sse_events 都发 success.input_tokens
+            //（contextUsageEvent 反推的真值），客户端上下文展示 / 自动 compact 判据按最终
+            // usage 决策，两条路径给两个数就是行为分叉。此处与那两个入口取同一字段。
+            "usage": {
+                "input_tokens": success.input_tokens,
+                "output_tokens": success.output_tokens
+            }
         }),
     ));
     events.push(SseEvent::new(
@@ -3490,7 +3499,7 @@ mod tests {
                 json!({"type": "text", "text": "ok"}),
             ],
             stop_reason: "end_turn".to_string(),
-            input_tokens: 1,
+            input_tokens: 4242,
             output_tokens: 1,
             credential_id: 0,
             credits: 0.0,
@@ -3508,6 +3517,18 @@ mod tests {
         assert!(
             tail.iter().any(|e| e.data["content_block"]["type"] == "text"),
             "正文仍要从 start_index 继续"
+        );
+        // ⚠️ 收尾 message_delta 必须带**真值** input_tokens（2026-10-14 流式审计）：
+        // message_start 只能立刻发、用本地估算，收尾不带真值则客户端最终 usage 里
+        // input_tokens 恒为估算值，与同请求的非流式/非直播 SSE 两条入口分叉。
+        let md = tail
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("收尾必须发 message_delta");
+        assert_eq!(
+            md.data["usage"]["input_tokens"], 4242,
+            "message_delta 必须带真值 input_tokens: {}",
+            md.data
         );
         assert_eq!(tail.last().unwrap().event, "message_stop");
     }
