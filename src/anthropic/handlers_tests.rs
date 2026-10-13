@@ -609,6 +609,11 @@ pub(crate) mod error_translation_tests {
     /// 删掉那条 → 本测试必 FAILED（实得 502）。
     #[test]
     fn insufficient_model_capacity_maps_to_503_not_bad_gateway() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let raw = r#"流式 API 请求失败: 400 Bad Request {"__type":"com.amazon.aws.codewhisperer#ThrottlingException","message":"I am experiencing high traffic, please try again shortly.","reason":"INSUFFICIENT_MODEL_CAPACITY"}"#;
         let resp = map_provider_error(anyhow::Error::msg(raw));
         assert_eq!(
@@ -627,6 +632,11 @@ pub(crate) mod error_translation_tests {
 
     #[test]
     fn test_upstream_429_maps_to_429_with_retry_after() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // provider 实际组装的错误串原文（含 HTTP 状态码 + 上游 body）。
         let raw = r#"流式 API 请求失败: 429 Too Many Requests {"message":"Too many requests, please wait before trying again.","reason":"USER_REQUEST_RATE_EXCEEDED"}"#;
         let err = anyhow::Error::msg(raw);
@@ -671,6 +681,11 @@ pub(crate) mod error_translation_tests {
     /// 但至少要让客户端知道该退避。
     #[test]
     fn upstream_5xx_and_transport_errors_map_to_503_with_retry_after() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for err_str in [
             // 线上原文（provider 格式化后的形态）
             r#"非流式 API 请求失败: 500 Internal Server Error {"__type":"com.amazon.aws.codewhisperer#InternalServerException","message":"Encountered an unexpected error when processing the request, please try again."}"#,
@@ -699,6 +714,11 @@ pub(crate) mod error_translation_tests {
     /// 会被当成 5xx 返 503，客户端的退避语义整体错位。
     #[test]
     fn transient_5xx_branch_must_not_shadow_more_specific_ones() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // 429 仍必须是 429
         // 线上真实 429 原文（19855/19855 条都含小写 "Too many requests" 这句 message；
         // 判据故意不认 HTTP reason phrase 的大写 "Too Many Requests"，实测零漏判）。
@@ -740,6 +760,11 @@ pub(crate) mod error_translation_tests {
     /// 503 + Retry-After，而不是 502 兜底（客户端不退避、原样重发）。
     #[test]
     fn upstream_524_is_recognized_as_transient_5xx() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for err_str in [
             // Cloudflare 错误页形态：状态行只有裸 "524"，正文 HTML 含 "A timeout occurred"。
             r#"流式 API 请求失败: 524 <html><title>Error 524</title><body>A timeout occurred</body></html>"#,
@@ -785,6 +810,11 @@ pub(crate) mod error_translation_tests {
     /// requests blocked"），客户端对永久错误无限退避重试。
     #[test]
     fn gateway_interference_words_with_524_are_not_5xx() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for s in [
             r#"403 Forbidden {"message":"gateway abuse detected, 524 requests blocked"}"#,
             r#"400 Bad Request {"message":"524 tokens too long for this request, timeout after 30s"}"#,
@@ -807,6 +837,11 @@ pub(crate) mod error_translation_tests {
     /// 不依赖正文里的 timeout/gateway 特征词 —— 换号全灭后终态仍落 503 + Retry-After。
     #[test]
     fn bare_524_status_line_is_recognized_as_transient_5xx() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for err_str in [
             "流式 API 请求失败: 524",
             r#"流式 API 请求失败: 524 <html><title>Error 524</title></html>"#,
@@ -831,6 +866,11 @@ pub(crate) mod error_translation_tests {
 
     #[test]
     fn test_pool_truly_exhausted_maps_to_429_with_retry_after_not_502() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // token_manager 的两个 bail 点实际组装的错误串原文。
         let err = anyhow::Error::msg("所有凭据均已禁用（0/0）retry_after_secs=10");
         let resp = map_provider_error(err);
@@ -857,6 +897,11 @@ pub(crate) mod error_translation_tests {
     /// → 客户端把限时风控当服务端故障、不退避、原样重发 → 加深上游风控判定。
     #[test]
     fn test_upstream_temporarily_suspended_maps_to_429_with_retry_after() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // provider 实际组装的错误串原文（线上 traces.db 取出，账号 id 已改）。
         let raw = r#"流式 API 请求失败: 403 Forbidden {"__type":"com.amazon.aws.codewhisperer#AccessDeniedException","message":"Your User ID (450334904897) temporarily is suspended. We've locked your account as a security precaution. To restore access, please contact our support team to verify your identity: https://aws.amazon.com/contact-us/"}"#;
         let resp = map_provider_error(anyhow::Error::msg(raw));
@@ -880,6 +925,11 @@ pub(crate) mod error_translation_tests {
     /// 同时把真实故障藏起来。与 `translate_quota_subscription` 刻意不吞配额类同理。
     #[test]
     fn test_permanent_access_denied_is_not_absorbed_as_retryable() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let raw = r#"流式 API 请求失败: 403 Forbidden {"__type":"com.amazon.aws.codewhisperer#AccessDeniedException","message":"Your account has been permanently disabled for violating the terms of service."}"#;
         let resp = map_provider_error(anyhow::Error::msg(raw));
         assert_ne!(
@@ -903,6 +953,11 @@ pub(crate) mod error_translation_tests {
     /// 而 `ksk_` token 按 region 授权、打错区恒 403，重打多少次都不会变。
     #[test]
     fn test_region_mismatch_403_maps_to_permission_error_not_502() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // provider 实际组装的错误串原文（`{api_type} API 请求失败: {status} {body}`）。
         for raw in [
             r#"流式 API 请求失败: 403 Forbidden {"__type":"com.amazon.aws.codewhisperer#AccessDeniedException","message":"The bearer token included in the request is invalid."}"#,
@@ -1100,6 +1155,11 @@ pub(crate) mod error_translation_tests {
     /// 已冷却换号）bearer_invalid_transient=1: {status} {body}`），不是编的。
     #[test]
     fn provider_marked_transient_bearer_invalid_is_not_region_mismatch() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // provider 真串：流式与非流式两种 api_type 都要覆盖（只有前缀不同）。
         for raw in [
             r#"流式 API 请求失败（token 瞬态失效，已冷却换号）bearer_invalid_transient=1: 403 Forbidden {"__type":"com.amazon.aws.codewhisperer#AccessDeniedException","message":"The bearer token included in the request is invalid."}"#,
@@ -1198,6 +1258,11 @@ pub(crate) mod error_translation_tests {
     /// 那两个 bail 串上，而不在本函数里。
     #[test]
     fn test_pool_exhausted_without_marker_still_falls_through_to_502() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let err = anyhow::Error::msg("所有凭据均已禁用（0/0）");
         let resp = map_provider_error(err);
         assert_eq!(
@@ -1224,6 +1289,11 @@ pub(crate) mod error_translation_tests {
     /// 这条判据是那条修复唯一的效果度量。
     #[test]
     fn image_mime_mismatch_maps_to_400_invalid_request_not_502() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // 判据本身（收口在 endpoint 侧，与 `default_is_*` 系列同处）。
         assert!(
             crate::kiro::endpoint::default_is_image_mime_mismatch(REAL_IMAGE_MIME_MISMATCH),
@@ -1258,6 +1328,11 @@ pub(crate) mod error_translation_tests {
     /// （本仓已因此让一条"三处都改对、四测全绿"的修复无效上线过）。
     #[test]
     fn image_mime_mismatch_must_not_shadow_capacity_400() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // 真容量串（线上原文）单独出现：必须仍是 503。
         let real_capacity = r#"流式 API 请求失败: 400 Bad Request {"__type":"com.amazon.aws.codewhisperer#ThrottlingException","message":"I am experiencing high traffic, please try again shortly.","reason":"INSUFFICIENT_MODEL_CAPACITY"}"#;
         assert_eq!(
@@ -1294,6 +1369,11 @@ pub(crate) mod error_translation_tests {
 
     #[test]
     fn request_body_invalid_maps_to_400_invalid_request_not_502() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use axum::body::to_bytes;
         // 判据本身（收口在 endpoint 侧，与 `default_is_*` 系列同处）。
         assert!(
@@ -1323,6 +1403,11 @@ pub(crate) mod error_translation_tests {
     /// 泛匹配会把处置不同的错误混成一类 —— 判据只认两个专用信号，不得泛认。
     #[test]
     fn request_body_invalid_predicate_never_matches_bare_validation_exception() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let bare = r#"非流式 API 请求失败: 400 Bad Request {"__type":"com.amazon.aws.codewhisperer#ValidationException","message":"anything","reason":"SOME_UNMAPPED_REASON"}"#;
         assert!(
             !crate::kiro::endpoint::default_is_request_body_invalid(bare),
@@ -1341,6 +1426,11 @@ pub(crate) mod error_translation_tests {
     /// 截胡成 502「上游拒绝凭据」——排障方向全错。必须 400 invalid_request_error。
     #[test]
     fn improperly_formed_body_invalid_maps_to_400_not_502_credential_rejection() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let raw = r#"流式 API 请求失败: 400 Bad Request {"__type":"com.amazon.aws.codewhisperer#ValidationException","message":"Improperly formed request.","reason":"REQUEST_BODY_INVALID"}"#;
         assert!(
             crate::kiro::endpoint::default_is_request_body_invalid(raw),
@@ -1360,6 +1450,11 @@ pub(crate) mod error_translation_tests {
     /// （quota 链先执行），回退即 FAIL。
     #[test]
     fn request_body_invalid_must_not_steal_capacity_400_503() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let capacity = r#"400 Bad Request {"__type":"com.amazon.aws.codewhisperer#ThrottlingException","message":"I am experiencing high traffic, please try again shortly.","reason":"INSUFFICIENT_MODEL_CAPACITY"}"#;
         assert_eq!(
             map_provider_error(anyhow::Error::msg(capacity)).status(),
@@ -1380,6 +1475,11 @@ pub(crate) mod error_translation_tests {
 
     #[test]
     fn test_insufficient_throughput_also_maps_to_429() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // 另一种上游限流文案（实测 8 条）：high traffic / INSUFFICIENT_THROUGHPUT。
         let raw = r#"流式 API 请求失败: 429 Too Many Requests {"message":"I am experiencing high traffic, please try again shortly.","reason":"INSUFFICIENT_THROUGHPUT"}"#;
         let err = anyhow::Error::msg(raw);
@@ -1390,6 +1490,11 @@ pub(crate) mod error_translation_tests {
 
     #[test]
     fn test_quota_exhausted_stays_429_without_retry_after() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // 边界：配额耗尽同为 429 但**不可重试**（要等下个计费周期）→ 绝不能带 Retry-After，
         // 否则客户端会做无意义的 8s 退避后反复砸一个本月已无额度的号。
         // 同时验证限流判据没有误吞它（is_upstream_rate_limited 不匹配 MONTHLY_REQUEST_COUNT）。
@@ -1617,6 +1722,11 @@ pub(crate) mod error_translation_tests {
     /// 所以客户端该退避重试；不可吸收针对的只是**同一条请求内**的重试。
     #[test]
     fn permanently_exhausted_pool_still_renders_429_to_client() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let resp = map_provider_error(anyhow::anyhow!(
             "所有凭据均已禁用（0/2）pool_permanently_exhausted=1 retry_after_secs=10"
         ));
@@ -1870,6 +1980,11 @@ pub(crate) mod error_translation_tests {
     /// 全池冷却分支返回 429 —— 即这个开关静默失效。
     #[test]
     fn absorb_exhausted_marker_renders_503_with_retry_after() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // provider 在 `absorb_gave_up_after_rounds && exhausted_as_503` 时组装的串形态：
         // 原错误 + 空格 + 标记。
         let raw = format!(
@@ -1926,6 +2041,11 @@ pub(crate) mod error_translation_tests {
     /// 因为运行时断言只能证明「当前夹具通过」，证明不了顺序本身。
     #[test]
     fn absorb_exhausted_branch_is_first_in_map_provider_error() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let full = include_str!("handlers.rs");
         let start = full
             .find("fn map_provider_error(err: Error) -> Response {")
@@ -1954,6 +2074,11 @@ pub(crate) mod error_translation_tests {
     /// （形态 b 串同时带 retry_after_secs，顺序反了会被 429 抢走）。
     #[test]
     fn quota_exhausted_all_branch_precedes_retry_after_and_rate_limit() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let full = include_str!("handlers.rs");
         let start = full
             .find("fn map_provider_error(err: Error) -> Response {")
@@ -1980,6 +2105,11 @@ pub(crate) mod error_translation_tests {
 
     #[test]
     fn map_provider_error_quota_marker_returns_402_without_retry_after() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let err = anyhow::Error::msg(
             "流式 API 请求失败（所有凭据已用尽）quota_exhausted_all=1: 400 MONTHLY_REQUEST_COUNT",
         );
@@ -1993,6 +2123,11 @@ pub(crate) mod error_translation_tests {
 
     #[test]
     fn map_provider_error_mixed_429_and_quota_marker_prefers_402() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let err = anyhow::Error::msg(
             "429 Too Many Requests quota_exhausted_all=1 pool_permanently_exhausted=1 retry_after_secs=10",
         );
@@ -2003,6 +2138,11 @@ pub(crate) mod error_translation_tests {
 
     #[test]
     fn map_provider_error_bare_monthly_request_count_stays_429() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let err = anyhow::Error::msg("upstream: MONTHLY_REQUEST_COUNT limit reached");
         let resp = map_provider_error(err);
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -2098,6 +2238,11 @@ pub(crate) mod error_translation_tests {
     /// 映射回 429+RA——否则客户端拿上游真值做短退避白打）。
     #[test]
     fn upstream_retry_after_noise_not_at_tail_never_maps_to_429() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let marker = UPSTREAM_RETRY_AFTER_MARKER_PREFIX;
         // 网关真实形态是追加在末尾；这里 marker 在串中间（body 噪声形态）。
         let noise = format!(
@@ -2178,6 +2323,11 @@ pub(crate) mod error_translation_tests {
     /// 必须把它映射回 429 + 上游 RA（而不是 503+3s 或 502）。
     #[test]
     fn upstream_retry_after_marker_maps_5xx_final_to_429() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // provider 的 assemble_final_error 并入 marker 后的 5xx 终态形态。
         let preserved = format!(
             "流式 API 请求失败: 502 Bad Gateway {{\"message\":\"upstream\"}} {}30",
@@ -2199,6 +2349,11 @@ pub(crate) mod error_translation_tests {
     /// 计费周期，给秒数会诱导客户端做无意义的短退避反复砸死号）。
     #[test]
     fn upstream_retry_after_marker_never_breaks_quota_semantics() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let quota_with_marker = format!(
             "流式 API 请求失败: 429 Too Many Requests {{\"reason\":\"MONTHLY_REQUEST_COUNT\"}} {}30",
             UPSTREAM_RETRY_AFTER_MARKER_PREFIX
@@ -2213,6 +2368,11 @@ pub(crate) mod error_translation_tests {
 
     #[test]
     fn test_inbound_admission_timeout_is_distinguishable_from_pool_cooling() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // ⭐ 回归（把 `inbound_admission_timeout=1` 那条分支删掉即必失败）：
         // 准入超时（网关自己的背压）与全池冷却（上游没准备好）**语义相反**，
         // 但两者都带 `retry_after_secs=`。若响应体上不可区分，任何按 body 判定的
@@ -2277,6 +2437,11 @@ pub(crate) mod error_translation_tests {
     /// 抢成 PoolCooldown 睡 2s 重打整链 +6s 延迟）。
     #[test]
     fn upstream_gate_full_is_429_not_absorbable() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // 吸收层分类：带 retry_after_secs=2 但必须返 None（网关自己的背压）。
         assert!(
             absorb_class_of("上游并发闸已满，停止本轮重试以免放大 upstream_gate_full=1 retry_after_secs=2")
@@ -2896,6 +3061,11 @@ pub(crate) mod error_translation_tests {
     /// 将来若改成大写，契约仍然成立，测试不该因此误红。
     #[test]
     fn overflow_errors_must_match_claude_code_compact_retry_predicate() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use axum::body::to_bytes;
 
         // Claude Code 侧的两个判据字面量（小写形态）。任一命中即触发 compact-and-retry。
@@ -2981,6 +3151,11 @@ pub(crate) mod error_translation_tests {
     /// (profileArn / AWS 账号号 / region / 内部 URL)。只给通用提示 + 引导查日志。
     #[test]
     fn test_unknown_error_response_body_no_sensitive_leak() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use axum::body::to_bytes;
         // 构造一个含敏感信息的未知错误(模拟上游响应体泄露 ARN/账号)。
         let leaky = anyhow::anyhow!(
@@ -3034,6 +3209,11 @@ pub(crate) mod error_translation_tests {
     /// 排障文案还让管理员去「刷新 Token」——订阅档位缺失刷新多少次都没用。
     #[test]
     fn subscription_unsupported_maps_to_404_not_found_not_502() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // provider.rs:3094 那条 bail 的原文形态（上游 body 原样拼接）。
         let permanent = "Kiro API 请求失败（订阅不支持该应用/模型，换区与重试均无效）: 403 {\"message\":\"profile does not support this model\"} subscription_unsupported=1";
         let translated = translate_upstream_error(permanent)
@@ -3341,6 +3521,11 @@ pub(crate) mod error_translation_tests {
     /// 补默认 3s（key `overloaded_capacity` 的 retryAfterSecs 默认值）。
     #[test]
     fn b4_capacity_503_carries_default_retry_after() {
+        // 读侧也取锁：写侧在锁内改全局镜像，不取锁会读到中间态（2026-10-14 flake 实证：
+        // 与写侧并发时本模块映射断言随机红）。
+        let _em_guard = ERROR_MESSAGES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // 400 形态（INSUFFICIENT_MODEL_CAPACITY）与 503 形态（MODEL_TEMPORARILY_UNAVAILABLE）
         // 都必须带默认 Retry-After: 3。
         for raw in [
