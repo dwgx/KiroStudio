@@ -33,6 +33,10 @@ pub enum Family {
     Opus,
     Sonnet,
     Haiku,
+    /// Claude Fable 系（2026-09 起生态出现；Fable 5.1 与 Mythos 5 同底座）。
+    /// 上游 SKU 用点号形态（`claude-fable-5.1`）——生态实测 `claude-fable-5` / `-5-1`
+    /// 连字符形态被上游拒（hank9999 注释实测）。
+    Fable,
     DeepSeek,
     Glm,
     Qwen,
@@ -144,6 +148,29 @@ pub static CATALOG: &[ModelSpec] = &[
         supports_1m: true,
         advertised: true,
     },
+    // 2026-10 生态新增（四仓一致：kiro2cc v3.4.25 / hank9999 master / ZyphrZero v0.9.1 / kirocc v0.15.0
+    // 的 upstream kiro_id 均为点号形态 `claude-opus-5.5`；窗口 1M、max_output 128k 亦一致）。
+    // credit_mult 取家族默认 2.20：四仓都不静态携带倍率（上游 metering 动态给）；
+    // kiro2cc 的定价表折算 k_ref=2.36、社区观测「5.5 积分消耗比 5 更低」——均为旁证，实测后校正。
+    ModelSpec {
+        kiro_id: "claude-opus-5.5",
+        family: Family::Opus,
+        version: Some((5, 5)),
+        aliases: &[
+            "claude-opus-5-5",
+            "claude-opus-5.5",
+            "opus-5.5",
+            "opus-5-5",
+        ],
+        owned_by: "anthropic",
+        display_name: "Claude Opus 5.5",
+        context_window: 1_000_000,
+        max_output: 128_000,
+        credit_mult: 2.20,
+        supports_thinking: true,
+        supports_1m: true,
+        advertised: true,
+    },
     ModelSpec {
         kiro_id: "claude-opus-4.8",
         family: Family::Opus,
@@ -219,6 +246,28 @@ pub static CATALOG: &[ModelSpec] = &[
         ],
         owned_by: "anthropic",
         display_name: "Claude Sonnet 5",
+        context_window: 1_000_000,
+        max_output: 128_000,
+        credit_mult: 1.30,
+        supports_thinking: true,
+        supports_1m: true,
+        advertised: true,
+    },
+    // 2026-10 生态新增（kiro2cc/zyphr/kirocc 三家一致；hank9999 缺该档会把 5.5 静默映射回
+    // sonnet-5——我们收进来，不跟这个静默降级）。窗口 1M（kiro2cc/kirocc）vs 200k（zyphr 默认档，
+    // 非其 1M 名单）→ 取 1M；max_output kiro2cc 64k vs kirocc 128k → 取 128k（与 sonnet-5 一致）。
+    ModelSpec {
+        kiro_id: "claude-sonnet-5.5",
+        family: Family::Sonnet,
+        version: Some((5, 5)),
+        aliases: &[
+            "claude-sonnet-5-5",
+            "claude-sonnet-5.5",
+            "sonnet-5.5",
+            "sonnet-5-5",
+        ],
+        owned_by: "anthropic",
+        display_name: "Claude Sonnet 5.5",
         context_window: 1_000_000,
         max_output: 128_000,
         credit_mult: 1.30,
@@ -306,6 +355,56 @@ pub static CATALOG: &[ModelSpec] = &[
         credit_mult: 0.40,
         supports_thinking: true,
         supports_1m: false,
+        advertised: true,
+    },
+    // 2026-10 生态新增：仅 kiro2cc 有真实内建档（`claude-haiku-5.5`；窗口按其全局规则 1M、
+    // max_output 128k、定价 $0.10/$0.50）；zyphr/kirocc 只是把该名透传给上游（默认 200k）；
+    // hank9999 无该档（会把 5.5 映射回 haiku-4.5）。窗口保守取 200k（与 haiku 家族一致——
+    // kiro2cc 的 1M 是「全模型全局规则」，非逐模型实测）。advertised=false：kiro2cc 有意不把
+    // 它放进 /v1/models，且该 SKU 的存在性没有任何一仓独立验证——按名可用、不上广告位。
+    ModelSpec {
+        kiro_id: "claude-haiku-5.5",
+        family: Family::Haiku,
+        version: Some((5, 5)),
+        aliases: &[
+            "claude-haiku-5-5",
+            "claude-haiku-5.5",
+            "haiku-5.5",
+            "haiku-5-5",
+        ],
+        owned_by: "anthropic",
+        display_name: "Claude Haiku 5.5",
+        context_window: 200_000,
+        max_output: 128_000,
+        credit_mult: 0.40,
+        supports_thinking: true,
+        supports_1m: false,
+        advertised: false,
+    },
+    // ===== Fable 系(2026-09 起生态新增；上游 SKU 点号形态) =====
+    // 上游 SKU 有争议：kiro2cc 把一切 fable 名折叠到 `claude-fable-5`；hank9999 注释实测
+    // 「`claude-fable-5` / `claude-fable-5-1` 均被上游拒，真身是点号 `claude-fable-5.1`」；
+    // kirocc 内建 `claude-fable-5.1`（含 [1m] 一等公民）；zyphr 两档都保留。取 hank+kirocc
+    // 的实测/内建结论：kiro_id = `claude-fable-5.1`。裸 `claude-fable-5` 无显式版本号 →
+    // 走 family-default 回退到本档（带告警），不另设一个上游会拒的 SKU。倍率按 sonnet 档 1.30
+    // （kiro2cc 定价落 sonnet 分支）。Mythos 5（仅 zyphr 单源、上游未验证）不收。
+    ModelSpec {
+        kiro_id: "claude-fable-5.1",
+        family: Family::Fable,
+        version: Some((5, 1)),
+        aliases: &[
+            "claude-fable-5-1",
+            "claude-fable-5.1",
+            "fable-5.1",
+            "fable-5-1",
+        ],
+        owned_by: "anthropic",
+        display_name: "Claude Fable 5.1",
+        context_window: 1_000_000,
+        max_output: 128_000,
+        credit_mult: 1.30,
+        supports_thinking: true,
+        supports_1m: true,
         advertised: true,
     },
     // ===== 国产模型(Kiro 直收原生 modelId，倍率远低) =====
@@ -542,6 +641,8 @@ fn parse_family_version(model_lower: &str) -> Option<(Family, Option<(u16, u16)>
         Family::Sonnet
     } else if model_lower.contains("haiku") {
         Family::Haiku
+    } else if model_lower.contains("fable") {
+        Family::Fable
     } else if model_lower.contains("deepseek") {
         Family::DeepSeek
     } else if model_lower.contains("glm") {
@@ -571,6 +672,7 @@ fn parse_family_version(model_lower: &str) -> Option<(Family, Option<(u16, u16)>
         Family::Opus => "opus",
         Family::Sonnet => "sonnet",
         Family::Haiku => "haiku",
+        Family::Fable => "fable",
         Family::Minimax => "minimax",
         _ => return Some((family, None)),
     };
@@ -1027,10 +1129,10 @@ mod tests {
         assert_eq!(kid("opus-5-0"), Some("claude-opus-5"));
         // 1M 变体
         assert!(resolve("claude-opus-5[1m]").unwrap().is_1m);
-        // 无版本 opus 回退应指向最新 = Opus 5
+        // 无版本 opus 回退应指向最新 = Opus 5.5（2026-10 起；此前为 Opus 5）
         assert_eq!(
             resolve("claude-opus").unwrap().spec.kiro_id,
-            "claude-opus-5"
+            "claude-opus-5.5"
         );
         // 参数正确
         let r = resolve("claude-opus-5").unwrap();
@@ -1074,11 +1176,48 @@ mod tests {
 
     #[test]
     fn test_sonnet_newest_is_5() {
-        // 无版本 sonnet 回退应指向族内最新=Sonnet 5。
+        // 无版本 sonnet 回退应指向族内最新 = Sonnet 5.5（2026-10 起；此前为 Sonnet 5）。
         assert_eq!(
             resolve("claude-sonnet").unwrap().spec.kiro_id,
-            "claude-sonnet-5"
+            "claude-sonnet-5.5"
         );
+    }
+
+    #[test]
+    fn test_55_generation_and_fable() {
+        // 2026-10 生态新增档（四仓对照结论见 CATALOG 内注释）。
+        // 5.5 代：点号/连字符两种拼法都命中，kiro_id 为上游点号形态。
+        assert_eq!(kid("claude-opus-5.5"), Some("claude-opus-5.5"));
+        assert_eq!(kid("claude-opus-5-5"), Some("claude-opus-5.5"));
+        assert_eq!(kid("opus-5.5"), Some("claude-opus-5.5"));
+        assert_eq!(kid("claude-sonnet-5.5"), Some("claude-sonnet-5.5"));
+        assert_eq!(kid("claude-sonnet-5-5"), Some("claude-sonnet-5.5"));
+        assert_eq!(kid("claude-haiku-5.5"), Some("claude-haiku-5.5"));
+        assert_eq!(kid("claude-haiku-5-5"), Some("claude-haiku-5.5"));
+        // 带日期后缀走结构化解析（(5,5) 提取，无需显式别名）。
+        assert_eq!(kid("claude-opus-5.5-20260922"), Some("claude-opus-5.5"));
+        assert_eq!(kid("claude-opus-5-5-20260301"), Some("claude-opus-5.5"));
+        // thinking 后缀剥离后仍命中。
+        assert_eq!(kid("claude-sonnet-5-5-thinking"), Some("claude-sonnet-5.5"));
+        // [1m]：opus/sonnet 5.5 支持；haiku-5.5 不支持（后缀被忽略，不拒绝）。
+        assert!(resolve("claude-opus-5-5[1m]").unwrap().is_1m);
+        assert!(resolve("claude-sonnet-5-5[1m]").unwrap().is_1m);
+        assert!(!resolve("claude-haiku-5-5[1m]").unwrap().is_1m);
+        // Fable：点号形态是上游真身（hank9999 实测）；裸 fable-5 无版本号 → 族默认回退到 5.1。
+        assert_eq!(kid("claude-fable-5.1"), Some("claude-fable-5.1"));
+        assert_eq!(kid("claude-fable-5-1"), Some("claude-fable-5.1"));
+        assert_eq!(kid("fable-5.1"), Some("claude-fable-5.1"));
+        assert_eq!(
+            resolve("claude-fable-5").unwrap().spec.kiro_id,
+            "claude-fable-5.1"
+        );
+        assert!(resolve("claude-fable-5-1[1m]").unwrap().is_1m);
+        // 窗口与广告位：haiku-5.5 保守 200k 且有意不上广告位（kiro2cc 同款）。
+        assert_eq!(context_window("claude-opus-5.5"), 1_000_000);
+        assert_eq!(context_window("claude-haiku-5.5"), 200_000);
+        assert_eq!(context_window("claude-fable-5.1"), 1_000_000);
+        assert!(resolve("claude-opus-5.5").unwrap().spec.advertised);
+        assert!(!resolve("claude-haiku-5.5").unwrap().spec.advertised);
     }
 
     #[test]
