@@ -3751,6 +3751,8 @@
             remaining_at_cache: remaining,
             effective_limit,
             credits_used_at_cache: used_at_cache,
+            next_reset_at: None,
+            fetched_at: 0.0,
         }
     }
 
@@ -4506,6 +4508,159 @@
         let e = entries.iter().find(|e| e.id == 1).unwrap();
         assert!(!e.disabled);
         assert_eq!(e.disabled_reason, None);
+    }
+
+    // ===== P1-6：恢复判定吃上游 nextResetAt 真值（月界启发式只兜无真值的号）=====
+
+    /// 造一个带上游重置时刻的余额快照。
+    fn mk_snap_with_reset(next_reset_at: f64, fetched_at: f64, remaining: f64) -> BalanceSnapshot {
+        BalanceSnapshot {
+            remaining_at_cache: remaining,
+            effective_limit: 100.0,
+            credits_used_at_cache: 0.0,
+            next_reset_at: Some(next_reset_at),
+            fetched_at,
+        }
+    }
+
+    /// 上游说重置点还没到 → 即使已跨自然月也不恢复
+    /// （旧月界启发式会提前最多 12h 复活 → 白撞 402 → 重禁用盖当月时间戳）。
+    #[test]
+    fn quota_recovery_waits_for_upstream_reset_time() {
+        let now = fixed_recovery_now();
+        let prev_month = (now - Duration::days(40)).to_rfc3339();
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![mk_quota_exhausted_cred(1, Some(&prev_month))],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        re_set_quota_disabled(&manager, 1, Some(&prev_month));
+        // 上游真值：重置点在 now 之后 1 小时；快照取自 now（重置点之前）。
+        manager.set_balance_snapshots(HashMap::from([(
+            1u64,
+            mk_snap_with_reset(now.timestamp() as f64 + 3600.0, now.timestamp() as f64, 0.0),
+        )]));
+
+        assert_eq!(
+            manager.recover_expired_quota_disables(Some(now)),
+            0,
+            "上游重置点未到不得恢复（真值优先于月界启发式）"
+        );
+        let entries = manager.entries.lock();
+        assert!(entries.iter().find(|e| e.id == 1).unwrap().disabled);
+    }
+
+    /// 上游重置点已过 + 重置点之后复核到 remaining>0 → 恢复，**不等自然月**。
+    /// fixture 刻意用当月时间戳：启发式路径必拒绝，只有真值路径能放行。
+    #[test]
+    fn quota_recovery_fires_after_upstream_reset_time() {
+        let now = fixed_recovery_now();
+        let same_month = now.to_rfc3339();
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![mk_quota_exhausted_cred(1, Some(&same_month))],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        re_set_quota_disabled(&manager, 1, Some(&same_month));
+        // 重置点在 1 小时前，且快照就是在那之后取的（fetched_at >= ts），余额已回。
+        manager.set_balance_snapshots(HashMap::from([(
+            1u64,
+            mk_snap_with_reset(now.timestamp() as f64 - 3600.0, now.timestamp() as f64, 42.0),
+        )]));
+
+        assert_eq!(
+            manager.recover_expired_quota_disables(Some(now)),
+            1,
+            "上游重置点已到且余额已回 → 必须恢复（同月也恢复：真值优先）"
+        );
+        let entries = manager.entries.lock();
+        let e = entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(!e.disabled);
+        assert_eq!(e.disabled_reason, None);
+        assert_eq!(e.quota_exhausted_at, None);
+    }
+
+    /// 重置点已过，但重置点**之后**复核过真值且仍为 0 → 不恢复（上游复核后仍无额度，
+    /// 复活只会白撞 402 再被禁用）。
+    #[test]
+    fn quota_recovery_skips_when_fresh_snapshot_still_zero() {
+        let now = fixed_recovery_now();
+        let prev_month = (now - Duration::days(40)).to_rfc3339();
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![mk_quota_exhausted_cred(1, Some(&prev_month))],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        re_set_quota_disabled(&manager, 1, Some(&prev_month));
+        manager.set_balance_snapshots(HashMap::from([(
+            1u64,
+            mk_snap_with_reset(now.timestamp() as f64 - 3600.0, now.timestamp() as f64, 0.0),
+        )]));
+
+        assert_eq!(
+            manager.recover_expired_quota_disables(Some(now)),
+            0,
+            "重置点后复核仍为 0 的号不得恢复"
+        );
+    }
+
+    /// 无快照（上游从未刷新过余额）→ 回落月界启发式，旧行为不变。
+    #[test]
+    fn quota_recovery_falls_back_to_month_heuristic_without_snapshot() {
+        let now = fixed_recovery_now();
+        let prev_month = (now - Duration::days(40)).to_rfc3339();
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![mk_quota_exhausted_cred(1, Some(&prev_month))],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        re_set_quota_disabled(&manager, 1, Some(&prev_month));
+        manager.set_balance_snapshots(HashMap::new());
+
+        assert_eq!(
+            manager.recover_expired_quota_disables(Some(now)),
+            1,
+            "无真值时跨月启发式必须照旧恢复"
+        );
+    }
+
+    /// 快照存在但上游未下发 nextResetAt（`None`）→ 同样回落启发式（不能因为
+    /// 「有快照」就既不按真值也不按月界，把号钉死）。
+    #[test]
+    fn quota_recovery_falls_back_when_reset_time_absent() {
+        let now = fixed_recovery_now();
+        let prev_month = (now - Duration::days(40)).to_rfc3339();
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![mk_quota_exhausted_cred(1, Some(&prev_month))],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        re_set_quota_disabled(&manager, 1, Some(&prev_month));
+        manager.set_balance_snapshots(HashMap::from([(
+            1u64,
+            mk_bal_snap(0.0, 100.0, 0.0), // next_reset_at: None
+        )]));
+
+        assert_eq!(
+            manager.recover_expired_quota_disables(Some(now)),
+            1,
+            "快照无 nextResetAt 时必须回落月界启发式"
+        );
     }
 
     /// 幂等 + 作用域：恢复后重复调用天然跳过；Manual 禁用、AccountSuspended、

@@ -1853,6 +1853,9 @@ impl AdminService {
                             } else {
                                 prev_baselines.get(&id).copied().unwrap_or(used_now)
                             },
+                            // 上游重置时刻 + 本快照取真值时刻：额度恢复判定用（P1-6）。
+                            next_reset_at: cb.data.next_reset_at,
+                            fetched_at: cb.cached_at,
                         },
                     );
                 }

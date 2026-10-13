@@ -1649,6 +1649,8 @@ mod balance_cache_tests {
                 remaining_at_cache: 90.0,
                 effective_limit: 100.0,
                 credits_used_at_cache: 0.0,
+                next_reset_at: None,
+                fetched_at: 0.0,
             },
         )]));
 
@@ -1690,6 +1692,8 @@ mod balance_cache_tests {
                 remaining_at_cache: 90.0,
                 effective_limit: 100.0,
                 credits_used_at_cache: 999.0,
+                next_reset_at: None,
+                fetched_at: 0.0,
             },
         )]));
         let r = svc.get_cached_balances();
@@ -1704,6 +1708,8 @@ mod balance_cache_tests {
                 remaining_at_cache: 90.0,
                 effective_limit: 100.0,
                 credits_used_at_cache: 0.0,
+                next_reset_at: None,
+                fetched_at: 0.0,
             },
         )]));
         svc.token_manager.add_credits(1, 500.0);

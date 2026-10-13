@@ -2312,7 +2312,23 @@ pub struct BalanceSnapshot {
     pub effective_limit: f64,
     /// 快照时刻该号的 total_credits_used(本地累加修正基线:当前用量 - 此基线 = 快照后新增花费)。
     pub credits_used_at_cache: f64,
+    /// 上游 `GetUsageLimits.nextResetAt`(unix 秒);`None` = 上游未下发。
+    ///
+    /// 额度恢复(`recover_expired_quota_disables`)用它替代「UTC 自然月 + 12h」启发式:
+    /// 上游真值说重置点还没到就绝不恢复(月界启发式会提前最多 12h 复活→白撞 402)。
+    pub next_reset_at: Option<f64>,
+    /// 本快照取到上游真值的时刻(unix 秒)。判定「重置点之后是否已复核过余额」:
+    /// `fetched_at >= next_reset_at` 且 `remaining_at_cache <= 0` ⇒ 上游复核后仍无额度。
+    pub fetched_at: f64,
 }
+
+/// 额度重置点后的恢复缓冲（秒）：上游 `nextResetAt` 到达后仍等这么久才恢复。
+///
+/// 覆盖三件事：①上游重置动作与时间戳之间的边界抖动；②本机与上游的时钟偏差；
+/// ③余额刷新周期（AdminService 默认 30 分钟）内真值可见性的延迟。
+/// 代价：恢复最多晚 5 分钟；收益：不会在重置点刚过就撞 402 又被重新禁用
+/// （那条路径会把 `quota_exhausted_at` 盖成新月份，让启发式路径整月失效）。
+const QUOTA_RESET_GRACE_SECS: f64 = 300.0;
 
 /// 反饥饿强制探测窗口（秒）：任何**可选**凭据超过这么久没被选中，
 /// 下一轮选号无条件排到最前，强制给它一次探测机会。
@@ -7148,46 +7164,47 @@ impl MultiTokenManager {
     /// 判定耗尽时的月份（`quota_exhausted_at`），就应重新放回可用池；若下个月
     /// 仍无额度，上游会再次返回 402 并重新禁用，代价仅一次请求。
     ///
-    /// ## 月初缓冲（时区安全网）
+    /// ## 判定顺序（P1-6：上游真值优先）
     ///
-    /// 恢复判定按 **UTC 自然月 + 12h 缓冲**：`now` 距当月 1 日不足 12h 时整批跳过
-    /// （不进 recovered 列表）。理由：上游（AWS/Kiro `MONTHLY_REQUEST_COUNT`）的
-    /// 重置时区未验证，若按偏西时区（UTC-8~UTC-12）重置，UTC 月初 0 点恢复会在
-    /// 上游还没重置时白撞一次 402 → 被重新禁用并盖上**当月** `quota_exhausted_at`
-    /// → 整个月永不恢复。12h 覆盖最坏时区差；上游非 UTC 时区下恢复至多延迟 12h
-    /// （代价可控，不会整月失效）。
+    /// ① **上游 `nextResetAt` 已就位**（`BalanceSnapshot.next_reset_at`，AdminService 每
+    ///    30 分钟余额刷新时随快照回推）→ 按真值判：`now < nextResetAt + 5min 缓冲`
+    ///    不恢复；重置点之后若快照**已复核过真值**（`fetched_at >= nextResetAt`）且
+    ///    `remaining <= 0`，说明上游复核后仍无额度，同样不恢复。真值路径不参与月初
+    ///    缓冲——那是启发式才需要的安全网。
+    /// ② **无真值**（上游未下发该字段 / 从未刷新过余额）→ 回落「UTC 自然月 + 12h 缓冲」
+    ///    启发式（`now` 距当月 1 日不足 12h 整批跳过）。理由：上游
+    ///    （AWS/Kiro `MONTHLY_REQUEST_COUNT`）的重置时区未验证，若按偏西时区
+    ///    （UTC-8~UTC-12）重置，UTC 月初 0 点恢复会在上游还没重置时白撞一次 402 →
+    ///    被重新禁用并盖上**当月** `quota_exhausted_at` → 整个月永不恢复。12h 覆盖
+    ///    最坏时区差；代价是启发式路径恢复至多延迟 12h。
     ///
     /// ## 幂等
     ///
     /// 只处理 `disabled && reason == QuotaExceeded` 的号，恢复后 `disabled_reason`
     /// 清空，重复调用天然跳过（`Manual` / `AccountSuspended` 等一律不碰）。
     ///
-    /// ## 探针抑制取舍（评审要求，已评估后放弃）
+    /// ## 探针抑制（P1-6 已实现，取代旧的「放弃」结论）
     ///
-    /// 评审提出：恢复前若余额缓存存在、新鲜且 remaining<=0，说明配额**还没**重置，
-    /// 应跳过恢复以免白撞一次 402 探针。但余额缓存在 `AdminService.balance_cache`
-    /// （`src/admin/service.rs`，私有字段）里，持有方向是 AdminService → token_manager，
-    /// 反向无引用，结构上够不着；token_manager 自己的 `balance_snapshots` 只有
-    /// `remaining_at_cache`（无缓存时刻），无法判「新鲜」。为它加回调/反向引用属于
-    /// 跨层结构改动，超出本修复范围。退化为保守方案：**不查缓存直接恢复**，
-    /// 靠幂等 + 下次 402 再禁用兜住（配额未重置时至多多撞一次请求，与 k2cc 参考
-    /// 实现同语义）。
+    /// 旧结论说余额缓存在 `AdminService.balance_cache`（私有字段）里结构上够不着，
+    /// 于是退化为「不查缓存直接恢复」。现改为：把上游 `nextResetAt` 与取真值时刻
+    /// 随 `BalanceSnapshot` 一起回推（`set_balance_snapshots`），本函数直接吃真值，
+    /// 无需反向引用、也无需在这里发起上游调用。30 分钟余额刷新周期本身就是探针：
+    /// 重置点刚过的下一轮刷新会把 `remaining` 更新为真值，据此在**同一周期内**恢复
+    /// （最坏晚一轮刷新）。
     ///
     /// `now`：判定的参考时刻，`None` = `Utc::now()`（测试传固定时刻避开月初缓冲窗口）。
     ///
     /// 返回被恢复的凭据数量。
     fn recover_expired_quota_disables(&self, now: Option<DateTime<Utc>>) -> usize {
         let now = now.unwrap_or_else(Utc::now);
-        // 月初缓冲：距当月 1 日 ≥ 12h 才允许恢复。上游（AWS/Kiro MONTHLY_REQUEST_COUNT）
-        // 重置时区未验证——若按偏西时区（最坏 UTC-12）重置，UTC 月初 0 点恢复会早于上游
-        // 重置 → 402 → 重禁用盖当月时间戳 → 当月永不恢复。12h 缓冲覆盖最坏时区差，
-        // 代价是恢复最多延迟 12h。
+        // 月初缓冲：距当月 1 日 ≥ 12h 才允许恢复（**只护无上游真值的启发式路径**）。
         // 用 day0()*24+hour() 手算（不依赖 chrono TimeZone trait / Duration 方法，版本兼容）。
-        let hour_of_month = now.day0() as i64 * 24 + now.hour() as i64;
-        if hour_of_month < 12 {
-            return 0;
-        }
+        let in_month_start_buffer = (now.day0() as i64 * 24 + now.hour() as i64) < 12;
         let now_year_month = (now.year(), now.month());
+        let now_epoch = now.timestamp() as f64;
+        // 余额快照先读后放：绝不与 entries 锁嵌套。快照只读、克隆成本 = 号池大小，
+        // 且本函数每请求至多跑一次（select 内 recovery_attempted 门）。
+        let snaps = self.balance_snapshots.read().clone();
         let recovered: Vec<u64> = {
             let mut entries = self.entries.lock();
             let mut ids = Vec::new();
@@ -7195,15 +7212,36 @@ impl MultiTokenManager {
                 if !e.disabled || e.disabled_reason != Some(DisabledReason::QuotaExceeded) {
                     continue;
                 }
-                // 缺失时间戳（旧版本数据，未持久化 quota_exhausted_at）视为可恢复，
-                // 避免旧数据被永久钉死（评审要求）。
-                let same_month = e.quota_exhausted_at.as_deref().and_then(|t| {
-                    DateTime::parse_from_rfc3339(t)
-                        .ok()
-                        .map(|t| (t.year(), t.month()) == now_year_month)
-                });
-                if same_month.unwrap_or(false) {
-                    continue;
+                match snaps
+                    .get(&e.id)
+                    .and_then(|s| s.next_reset_at.map(|ts| (ts, *s)))
+                {
+                    // ① 上游真值路径：重置点未到不恢复；重置点之后已复核过真值且仍为 0
+                    //    （remaining<=0）也不恢复——上游复核后仍无额度，复活只会白撞 402。
+                    Some((ts, s)) => {
+                        if now_epoch < ts + QUOTA_RESET_GRACE_SECS {
+                            continue;
+                        }
+                        if s.fetched_at >= ts && s.remaining_at_cache <= 0.0 {
+                            continue;
+                        }
+                    }
+                    // ② 无真值（上游未下发 / 从未刷新过余额）→ 回落启发式：月初缓冲内
+                    //    不恢复；同月不恢复。缺失时间戳（旧版本数据，未持久化
+                    //    quota_exhausted_at）视为可恢复，避免旧数据被永久钉死（评审要求）。
+                    None => {
+                        if in_month_start_buffer {
+                            continue;
+                        }
+                        let same_month = e.quota_exhausted_at.as_deref().and_then(|t| {
+                            DateTime::parse_from_rfc3339(t)
+                                .ok()
+                                .map(|t| (t.year(), t.month()) == now_year_month)
+                        });
+                        if same_month.unwrap_or(false) {
+                            continue;
+                        }
+                    }
                 }
                 e.disabled = false;
                 e.disabled_reason = None;
@@ -7221,7 +7259,7 @@ impl MultiTokenManager {
 
         if !recovered.is_empty() {
             tracing::info!(
-                "已跨自然月，自动恢复 {} 个额度耗尽的凭据: {:?}",
+                "额度耗尽凭据自动恢复 {} 个（上游重置时刻已到 / 已跨自然月）: {:?}",
                 recovered.len(),
                 recovered
             );
