@@ -80,17 +80,20 @@ fn compress_whitespace(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut consecutive_empty = 0u32;
 
-    for line in text.split('\n') {
+    // 补分隔换行用「行号 > 0」判定，而不是「result 非空」：后者会把**开头**的空行
+    // 整段吃掉（首行空 → result 仍空 → 不 push），而结尾空行却保留 2 个，
+    // 同一份正文从首行还是尾行空起不该有两种口径。
+    for (idx, line) in text.split('\n').enumerate() {
         let trimmed_end = line.trim_end();
 
         if trimmed_end.is_empty() {
             consecutive_empty += 1;
-            if consecutive_empty <= 2 && !result.is_empty() {
+            if consecutive_empty <= 2 && idx > 0 {
                 result.push('\n');
             }
         } else {
             consecutive_empty = 0;
-            if !result.is_empty() {
+            if idx > 0 {
                 result.push('\n');
             }
             result.push_str(trimmed_end);
@@ -160,18 +163,30 @@ fn smart_truncate_by_lines(
 
     // 行数不足以“头 + 尾”留白时，退化为按字符各留一半的硬截断
     if total_lines <= head_lines + tail_lines {
-        let half = max_chars / 2;
+        // 🔴 省略标记**先占预算**再截正文（同 `truncate_long_content` 的写法）：若先按
+        // max_chars 截头尾、再拼标记，最终长度 = max_chars + 标记长度 > max_chars，
+        // 违反本模块「截断后 ≤ max_chars」的契约（大文本分支末尾那条硬截断兜底即为此设）。
+        // 标记形如 `\n...[N字符已省略]...\n`，N 最多 20 位十进制 ⇒ 40 字符预留足够。
+        const MARKER_RESERVE: usize = 40;
+        let budget = max_chars.saturating_sub(MARKER_RESERVE);
+        let half = budget / 2;
         let head = safe_char_truncate(text, half);
-        let tail_chars = max_chars.saturating_sub(head.chars().count());
-        let tail_start = text
-            .char_indices()
-            .rev()
-            .nth(tail_chars.saturating_sub(1))
-            .map(|(i, _)| i)
-            .unwrap_or(0);
+        let tail_chars = budget.saturating_sub(head.chars().count());
+        // tail_chars == 0（max_chars 很小、预算被标记吃光）时显式取空尾：`.rev().nth(0)`
+        // 是**最后一个**字符的起点而不是「空尾」，沿用旧写法会把整段文本当尾巴拼回去。
+        let tail_start = if tail_chars == 0 {
+            text.len()
+        } else {
+            text.char_indices()
+                .rev()
+                .nth(tail_chars - 1)
+                .map(|(i, _)| i)
+                .unwrap_or(0)
+        };
         let tail = &text[tail_start..];
         let omitted = char_count.saturating_sub(head.chars().count() + tail.chars().count());
-        let result = format!("{}\n...[{}行已省略]...\n{}", head, omitted, tail);
+        // 文案必须是「字符」：这里按**字符数**各留一半，省略量也是字符数，写「行」会误导。
+        let result = format!("{}\n...[{}字符已省略]...\n{}", head, omitted, tail);
         let saved = text.len().saturating_sub(result.len());
         return (result, saved);
     }
@@ -307,6 +322,14 @@ fn repair_non_empty_content_pass(state: &mut ConversationState) -> usize {
 
 /// 若字段去除首尾空白后为空，替换为占位符 "."，返回是否修复
 fn repair_content_field(field: &mut String) -> bool {
+    // " " 是 converter 给「仅 tool_use」消息的占位符（`converter.rs` 的
+    // `text_content.is_empty() && !tool_uses.is_empty()` 分支），它本身已满足上游
+    // 「content 非空」的要求：`compress_string_field` / `truncate_long_content` 都
+    // 特意跳过它，本 pass 若不跳过，`compress()` 末尾这一趟就会把占位符改写成 "."
+    // ——assistant 侧现在只是被「有 tool_uses 就跳过本 pass」间接挡住（巧合，非契约）。
+    if field == " " {
+        return false;
+    }
     if field.trim().is_empty() {
         *field = ".".to_string();
         return true;
@@ -335,7 +358,10 @@ fn safe_char_truncate(text: &str, max_chars: usize) -> &str {
 /// **只动 content 正文，不动 tool_results / tool_uses / images**，因此不会破坏
 /// tool_use↔tool_result 的 id 配对（那是上游 400 的高频来源）。丢的是用户/助手正文的
 /// 尾部文字——这一层本来就在「宁可丢部分上下文，也别整轮失败」的档位上。
-pub fn compress_long_messages_pass(state: &mut ConversationState, max_chars: usize) -> usize {
+///
+/// `pub(crate)`：唯一调用方是同 crate 的 `handlers.rs::adaptive_compress_loop`，
+/// 不是对外的 API 面。
+pub(crate) fn compress_long_messages_pass(state: &mut ConversationState, max_chars: usize) -> usize {
     if max_chars == 0 {
         return 0;
     }
@@ -429,6 +455,20 @@ mod tests {
         assert_eq!(result, "    indented\n        more indented");
     }
 
+    /// 首尾对称：开头 ≤2 个空行与结尾一样保留。
+    ///
+    /// 旧实现用「result 非空」当分隔判定，首行空时 result 仍空 → 不 push，
+    /// 开头空行被整段吃掉；结尾却保留 2 个 —— 同一份正文从首行还是尾行空起
+    /// 不该有两种口径（首行缩进本来就由 `trim_end` 单独保护，与此无关）。
+    #[test]
+    fn test_compress_whitespace_keeps_leading_empty_lines() {
+        assert_eq!(compress_whitespace("\n\ncode"), "\n\ncode");
+        // 开头 3 个空行同样折叠到 2 个（与中间/结尾同口径）
+        assert_eq!(compress_whitespace("\n\n\ncode"), "\n\ncode");
+        // 首尾同时为空：各留 2 个
+        assert_eq!(compress_whitespace("\n\na\n\n\n\n"), "\n\na\n\n");
+    }
+
     #[test]
     fn test_safe_char_truncate_utf8() {
         let input = "你好世界abcd";
@@ -452,6 +492,37 @@ mod tests {
         assert!(result.starts_with("line 0\nline 1\nline 2\n"));
         assert!(result.ends_with("line 198\nline 199"));
         assert!(result.contains("行已省略"));
+    }
+
+    /// 行数不足（≤ head + tail）分支：走按字符各留一半的硬截断，结果仍必须 ≤ max_chars。
+    ///
+    /// 旧实现先按 max_chars 截头尾、再把省略标记拼在外面 → 最终长度恒为
+    /// max_chars + 标记长度（约 20 字符），违反「截断后 ≤ max_chars」契约；且标记
+    /// 写的是「{}行已省略」而实际传的是**字符数**，文案与语义不符。
+    #[test]
+    fn test_smart_truncate_few_lines_respects_max_chars() {
+        let text = "a".repeat(500); // 单行、500 字符 → 落入行数不足分支
+        let (result, saved) = smart_truncate_by_lines(&text, 100, 3, 3);
+        assert!(
+            result.chars().count() <= 100,
+            "行数不足分支也必须 ≤ max_chars，实际 {}",
+            result.chars().count()
+        );
+        assert!(
+            result.contains("字符已省略"),
+            "省略量是字符数，文案不得写「行」: {result}"
+        );
+        assert!(saved > 0, "截断应省下字节");
+        assert!(result.starts_with("aaa") && result.ends_with("aaa"), "头尾都要保留");
+
+        // 极小 max_chars（比标记还短）：只保留标记、正文全丢 —— 与大文本分支同约定
+        // （不保证 ≤ max_chars，因为标记本身已超）。
+        let (tiny, _) = smart_truncate_by_lines(&text, 1, 3, 3);
+        assert!(
+            tiny.starts_with("\n...[500字符已省略]..."),
+            "正文应全丢、只留标记: {tiny}"
+        );
+        assert!(!tiny.contains("aaa"));
     }
 
     #[test]
@@ -753,5 +824,35 @@ mod tests {
             assert_eq!(u.user_input_message.content, ".");
             assert!(!u.user_input_message.user_input_message_context.tool_results.is_empty());
         }
+    }
+
+    /// " " 是 converter 的「仅 tool_use」占位符，**不是**本 pass 要修的「压空」情形：
+    /// 修空 content 的兜底不得把它改写成 "."（否则 compress_string_field /
+    /// truncate_long_content 特意跳过它的写法就白做了）。
+    #[test]
+    fn repair_non_empty_content_keeps_space_placeholder() {
+        let mut placeholder = " ".to_string();
+        assert!(!repair_content_field(&mut placeholder));
+        assert_eq!(placeholder, " ");
+
+        // 对照：真正空 / 纯空白的字段仍要补 "."
+        let mut empty = String::new();
+        assert!(repair_content_field(&mut empty));
+        assert_eq!(empty, ".");
+        let mut blanks = "  \n ".to_string();
+        assert!(repair_content_field(&mut blanks));
+        assert_eq!(blanks, ".");
+    }
+
+    /// 同上的整趟回归：历史 user + current 都带 " " 占位符时，本 pass 一个都不许动。
+    #[test]
+    fn repair_non_empty_content_skips_space_placeholder_via_pass() {
+        let mut state = make_simple_state(vec![(" ", "a")], " ");
+        let repaired = repair_non_empty_content_pass(&mut state);
+        assert_eq!(repaired, 0, "占位符 \" \" 不该被当成空 content 修掉");
+        if let Message::User(u) = &state.history[0] {
+            assert_eq!(u.user_input_message.content, " ");
+        }
+        assert_eq!(state.current_message.user_input_message.content, " ");
     }
 }

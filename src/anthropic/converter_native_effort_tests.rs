@@ -83,19 +83,29 @@
         assert_eq!(normalize_thinking_effort("enabled"), "high");
     }
 
+    /// 白名单的**测试侧**真相源：已实测、可走 native effort 的 Kiro modelId 与档位表。
+    ///
+    /// `converter.rs::native_reasoning_efforts` 是 `match` 而非可枚举的表，本文件没法
+    /// 「动态」把它读出来，所以「加白名单必须同步这里」只能靠人；但把它收成**一处**
+    /// 常量，至少消掉「命中测试」与「目录校准测试」各硬编码一份、彼此漂移的空隙
+    /// （原先两处各写一遍 4 个 id）。
+    const VERIFIED_NATIVE_EFFORT_MODELS: &[(&str, &[&str])] = &[
+        ("claude-opus-4.8", EFFORTS_WITH_XHIGH),
+        ("claude-opus-4.7", EFFORTS_WITH_XHIGH),
+        ("claude-opus-4.6", EFFORTS_WITHOUT_XHIGH),
+        ("claude-sonnet-4.6", EFFORTS_WITHOUT_XHIGH),
+    ];
+
     /// 白名单：实测过的 4 个模型命中，其余一律不命中（保守）。
     #[test]
     fn whitelist_hits_verified_models_only() {
-        assert_eq!(native_reasoning_efforts("claude-opus-4.8"), Some(EFFORTS_WITH_XHIGH));
-        assert_eq!(native_reasoning_efforts("claude-opus-4.7"), Some(EFFORTS_WITH_XHIGH));
-        assert_eq!(
-            native_reasoning_efforts("claude-opus-4.6"),
-            Some(EFFORTS_WITHOUT_XHIGH)
-        );
-        assert_eq!(
-            native_reasoning_efforts("claude-sonnet-4.6"),
-            Some(EFFORTS_WITHOUT_XHIGH)
-        );
+        for &(model, efforts) in VERIFIED_NATIVE_EFFORT_MODELS {
+            assert_eq!(
+                native_reasoning_efforts(model),
+                Some(efforts),
+                "实测过的 {model} 必须命中白名单，且档位表与 converter 一致"
+            );
+        }
         for miss in [
             "claude-opus-5",
             "claude-sonnet-5",
@@ -121,10 +131,22 @@
     fn native_effort_whitelist_models_exist_in_catalog() {
         let catalog = super::super::model_catalog::CATALOG;
         let ids: Vec<&str> = catalog.iter().map(|s| s.kiro_id).collect();
-        for model in ["claude-opus-4.8", "claude-opus-4.7", "claude-opus-4.6", "claude-sonnet-4.6"] {
+        for &(model, _) in VERIFIED_NATIVE_EFFORT_MODELS {
             assert!(
                 ids.contains(&model),
                 "白名单模型 {model} 不在 model_catalog.CATALOG 中 —— 白名单与目录已漂移"
+            );
+        }
+        // 反方向（上面那条单向检查抓不到的漂移）：目录里已有的 Claude 型号，只要没写进
+        // 实测清单，就不许进白名单 —— 否则「顺手把一个目录里存在、但没实测过的型号加进
+        // `native_reasoning_efforts`」会静默生效，而白名单的保守策略正是靠本测试守着。
+        for &id in ids.iter().filter(|id| id.starts_with("claude")) {
+            if VERIFIED_NATIVE_EFFORT_MODELS.iter().any(|&(m, _)| m == id) {
+                continue;
+            }
+            assert!(
+                native_reasoning_efforts(id).is_none(),
+                "目录里的 {id} 没在实测清单里，不得进 native effort 白名单（保守回退 XML 注入）"
             );
         }
     }
@@ -264,6 +286,21 @@
             native_thinking_effort(&req, "claude-opus-4.8"),
             Some("xhigh"),
             "空 effort 不应覆盖 budget 映射出的档位"
+        );
+
+        // 纯空白 effort 同理：`select_native_reasoning_effort` 用 `effort.trim().is_empty()`
+        // 过滤（trim 在前、normalize 在后），否则空白串会被归一化成 "high" 覆盖 budget 档。
+        // 这里钉住该顺序，防未来把判空挪到 trim 之前。
+        let req_ws = mk_req(
+            Some(enabled_thinking(100_000)),
+            Some(super::super::types::OutputConfig {
+                effort: "   ".to_string(),
+            }),
+        );
+        assert_eq!(
+            native_thinking_effort(&req_ws, "claude-opus-4.8"),
+            Some("xhigh"),
+            "纯空白 effort 视同未给，不得覆盖 budget 映射"
         );
     }
 

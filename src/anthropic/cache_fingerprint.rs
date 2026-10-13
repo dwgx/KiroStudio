@@ -83,14 +83,13 @@ pub(crate) fn meter() -> &'static CacheFingerprintMeter {
     METER.get_or_init(CacheFingerprintMeter::default)
 }
 
-impl CacheFingerprintMeter {
+impl Inner {
     /// 查询一组前缀段哈希，返回每段是否命中（命中刷新 last_hit_at）。
     /// `now` 由调用方传入：生产走系统时钟，测试可注入时间。
-    fn lookup_at(&self, hashes: &[u64], now: i64) -> Vec<bool> {
-        let mut inner = self.inner.lock();
+    fn lookup(&mut self, hashes: &[u64], now: i64) -> Vec<bool> {
         hashes
             .iter()
-            .map(|h| match inner.entries.get_mut(h) {
+            .map(|h| match self.entries.get_mut(h) {
                 Some(e) if e.expires_at > now => {
                     e.last_hit_at = now;
                     true
@@ -100,19 +99,13 @@ impl CacheFingerprintMeter {
             .collect()
     }
 
-    /// 查询（生产路径，now = 系统时钟）。
-    fn lookup(&self, hashes: &[u64]) -> Vec<bool> {
-        self.lookup_at(hashes, now_secs())
-    }
-
     /// 把一组前缀段写入缓存。`ttl_secs` clip 到 [60, MAX_TTL_SECS]；容量超限按
     /// last_hit_at（LRU）淘汰最旧条目（抽样淘汰，见 [`EVICT_INTERVAL`]）。
-    fn record_at(&self, hashes: &[u64], tokens: &[u32], ttl_secs: i64, now: i64) {
+    fn record(&mut self, hashes: &[u64], tokens: &[u32], ttl_secs: i64, now: i64) {
         debug_assert_eq!(hashes.len(), tokens.len());
         let ttl = ttl_secs.clamp(60, MAX_TTL_SECS);
-        let mut inner = self.inner.lock();
         for (h, t) in hashes.iter().zip(tokens.iter()) {
-            inner.entries.insert(
+            self.entries.insert(
                 *h,
                 CacheEntry {
                     tokens: *t,
@@ -125,27 +118,54 @@ impl CacheFingerprintMeter {
         // 容量打满后每次 record 都付一次全表排序成本，纯估算层不值得。改为每
         // EVICT_INTERVAL 条「超限插入」才淘汰一次：表长上界 = cap + EVICT_INTERVAL − 1
         // + 单次 record 段数（有界不泄漏），LRU 语义（最旧 last_hit_at 先淘汰）不变。
-        if inner.entries.len() > DEFAULT_CAPACITY {
-            inner.inserts_since_evict += 1;
-            if inner.inserts_since_evict >= EVICT_INTERVAL {
-                inner.inserts_since_evict = 0;
-                let drop_n = inner.entries.len() - DEFAULT_CAPACITY;
-                let mut victims: Vec<(u64, i64)> = inner
+        if self.entries.len() > DEFAULT_CAPACITY {
+            self.inserts_since_evict += 1;
+            if self.inserts_since_evict >= EVICT_INTERVAL {
+                self.inserts_since_evict = 0;
+                let drop_n = self.entries.len() - DEFAULT_CAPACITY;
+                let mut victims: Vec<(u64, i64)> = self
                     .entries
                     .iter()
                     .map(|(k, v)| (*k, v.last_hit_at))
                     .collect();
                 victims.sort_by_key(|x| x.1);
                 for (k, _) in victims.into_iter().take(drop_n) {
-                    inner.entries.remove(&k);
+                    self.entries.remove(&k);
                 }
             }
         }
     }
+}
 
-    /// 记录（生产路径）。
-    fn record(&self, hashes: &[u64], tokens: &[u32], ttl_secs: i64) {
-        self.record_at(hashes, tokens, ttl_secs, now_secs());
+impl CacheFingerprintMeter {
+    /// 生产入口：**查询 + 记录在同一次持锁内**完成，返回每段是否命中。
+    ///
+    /// 为什么必须是一对原子操作：`compute_fingerprint_usage` 原本先 `lookup` 再
+    /// `record`（两次取锁）。两次取锁之间是敞口 —— 并发同会话请求 B 的 lookup 可以插在
+    /// A 的 record 之前，于是 B 把 A 刚算出的前缀整段判 miss：read=0、creation=覆盖前缀
+    /// 全量。合并后 A 的「查+记」对外不可分割，B 要么整段看到 A 的记录、要么整段看不到，
+    /// 不会看到「A 查过但没记」的中间态。
+    ///
+    /// 注意顺序仍是**先查后记**：先记会让本请求自己的段全部命中，read 恒等于覆盖前缀。
+    fn lookup_and_record(&self, hashes: &[u64], tokens: &[u32], ttl_secs: i64) -> Vec<bool> {
+        let now = now_secs();
+        let mut inner = self.inner.lock();
+        let results = inner.lookup(hashes, now);
+        inner.record(hashes, tokens, ttl_secs, now);
+        results
+    }
+
+    /// 只查（注入时间）。生产路径不用它（会与 record 拆成两次取锁，见
+    /// [`Self::lookup_and_record`]），仅供测试钉 TTL 边界。
+    #[cfg(test)]
+    fn lookup_at(&self, hashes: &[u64], now: i64) -> Vec<bool> {
+        self.inner.lock().lookup(hashes, now)
+    }
+
+    /// 只记（注入时间）。同 [`Self::lookup_at`]，仅供测试钉容量/TTL 边界。
+    #[cfg(test)]
+    fn record_at(&self, hashes: &[u64], tokens: &[u32], ttl_secs: i64, now: i64) {
+        self.inner.lock().record(hashes, tokens, ttl_secs, now);
     }
 
     #[cfg(test)]
@@ -227,9 +247,10 @@ pub(crate) fn compute_fingerprint_usage(req: &MessagesRequest) -> Option<PromptC
     }
     let hashes: Vec<u64> = segments.iter().map(|s| s.hash).collect();
     let cum: Vec<u32> = segments.iter().map(|s| s.cumulative_tokens).collect();
-    let results = meter().lookup(&hashes);
+    // 查 + 记在**同一次持锁**内完成（见 `lookup_and_record`）：拆成两次取锁时，并发
+    // 同会话请求能看到「已查、未记」的中间态，把可命中的前缀整段判成 creation。
     // 计算即记录（范围裁剪之一，见模块注释）：失败请求的前缀同样已到达上游内容缓存。
-    meter().record(&hashes, &cum, ttl);
+    let results = meter().lookup_and_record(&hashes, &cum, ttl);
 
     let deepest_hit = results.iter().rposition(|h| *h);
     let covered = *cum.last().unwrap();

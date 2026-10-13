@@ -231,6 +231,14 @@ fn normalize_json_schema_inner(schema: serde_json::Value, root: bool) -> serde_j
             .next(),
         _ => None,
     };
+    // items 合法性预判（下面的 items 块用）：`items` 只对 array 有意义。类型**缺失**时保留
+    // （`{"items": …}` 本身合法，丢了会让模型看不到元素结构）；显式声明非 array 类型时丢弃，
+    // 与上面 properties/required「非 object 就丢」同一判据。
+    //
+    // ⚠️ 必须在类型被写回 obj **之前**按**声明**类型算：根 schema 会被强制成 object
+    // （见 is_object_schema），若按写回后的有效类型判断，根级 array schema 的元素结构
+    // 会被一并丢掉。
+    let items_type_ok = normalized_type.as_deref().is_none_or(|t| t == "array");
     let is_object_schema = root
         || normalized_type.as_deref() == Some("object")
         || (normalized_type.is_none() && obj.contains_key("properties"));
@@ -278,7 +286,12 @@ fn normalize_json_schema_inner(schema: serde_json::Value, root: bool) -> serde_j
     }
 
     // items（对象或数组形式取第一个 schema）
-    if let Some(items) = obj.remove("items") {
+    if !items_type_ok {
+        // 显式声明了非 array 类型：items 是无效关键字（JSON Schema 只允许 array 带 items），
+        // 直接丢弃 —— 与上面 properties/required 对非 object 的处置同一判据，避免产出
+        // 结构非法（上游可能判 malformed）的 schema。
+        obj.remove("items");
+    } else if let Some(items) = obj.remove("items") {
         let normalized_items = match items {
             serde_json::Value::Array(arr) => arr
                 .into_iter()
@@ -362,11 +375,64 @@ fn normalize_json_schema_inner(schema: serde_json::Value, root: bool) -> serde_j
 }
 
 /// 规范化 type 字符串：只认 JSON Schema 的 6 种基础类型，其余返回 None。
+///
+/// 大小写**敏感**（JSON Schema 规范即如此，`type` 的值域是小写字面量）：刻意不做
+/// `to_lowercase()` 容错 —— `"Object"` / `"ARRAY"` 是非法 schema，静默纠正会把客户端
+/// 生成器的 bug 藏起来，而且归一化后的值会进上游请求体、与客户端本地校验口径不一致。
 fn normalize_schema_type(raw: &str) -> Option<String> {
     match raw.trim() {
         "object" | "array" | "string" | "number" | "integer" | "boolean" => {
             Some(raw.trim().to_string())
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `items` 只对 array 有意义：显式非 array 类型上的 items 必须丢弃（与 properties/required
+    /// 对非 object 的处置同一判据，避免产出上游可能判 malformed 的 schema）；类型**缺失**时
+    /// 保留（`{"items": …}` 本身合法，丢了会让模型看不到元素结构）。
+    #[test]
+    fn test_items_kept_only_for_array_or_typeless() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "list": { "type": "array", "items": { "type": "string" } },
+                "bad": { "type": "string", "items": { "type": "string" } },
+                "untyped": { "items": { "type": "string" } }
+            }
+        });
+        let out = normalize_json_schema(schema);
+        assert_eq!(
+            out["properties"]["list"]["items"]["type"], "string",
+            "array 类型的 items 必须保留"
+        );
+        assert!(
+            out["properties"]["bad"].get("items").is_none(),
+            "非 array 类型上的 items 是无效组合，必须丢弃: {}",
+            out["properties"]["bad"]
+        );
+        assert_eq!(
+            out["properties"]["untyped"]["items"]["type"], "string",
+            "类型缺失时 items 合法（任意类型 + 元素约束），不得丢弃"
+        );
+    }
+
+    /// 根级 array schema：类型会被强制成 object（既有行为），但 items 的合法性按**声明**
+    /// 类型判定 —— 元素结构不得被连带丢掉（若按写回后的有效类型判断就会丢）。
+    #[test]
+    fn test_root_array_items_survives_object_forcing() {
+        let out = normalize_json_schema(serde_json::json!({
+            "type": "array",
+            "items": { "type": "string" }
+        }));
+        assert_eq!(out["type"], "object", "根 schema 强制 object 是既有行为");
+        assert_eq!(
+            out["items"]["type"], "string",
+            "items 不得因根 schema 被强制 object 而丢掉"
+        );
     }
 }

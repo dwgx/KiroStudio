@@ -29,17 +29,41 @@ pub(crate) const MIN_RECENT_HISTORY_TURNS: usize = 4;
 pub(crate) const TRUNCATION_PLACEHOLDER: &str = "[Earlier conversation history was truncated to fit the model's input limit. Older messages and tool activity have been omitted.]";
 
 /// 估算单条历史的序列化字节数。
+///
+/// 序列化失败按 0 计（**不是** `usize::MAX`）：`running += sizes[i]` 与
+/// `base = state_size(..) + …` 都没有饱和，塞 MAX 进去会立刻溢出（debug 构建直接
+/// panic）。本结构全为 String/Vec/Option/`serde_json::Value`，事实上不可失败；
+/// 真失败时至少留一条 warn，别让「量不出来」静默退化成「不用截断」。
 fn entry_size(entry: &Message) -> usize {
-    serde_json::to_string(entry).map(|s| s.len()).unwrap_or(0)
+    match serde_json::to_string(entry) {
+        Ok(s) => s.len(),
+        Err(err) => {
+            tracing::warn!(error = %err, "历史条目序列化失败，按 0 字节估算（截断判据偏乐观）");
+            0
+        }
+    }
 }
 
 /// 估算整个 `ConversationState` 的序列化字节数。
+///
+/// 失败按 0 计的理由同 [`entry_size`]：0 会让 [`truncate_history_if_needed`] 直接
+/// 判定「未超限」而不截断，故同样必须留 warn。
 pub(super) fn state_size(state: &ConversationState) -> usize {
-    serde_json::to_string(state).map(|s| s.len()).unwrap_or(0)
+    match serde_json::to_string(state) {
+        Ok(s) => s.len(),
+        Err(err) => {
+            tracing::warn!(error = %err, "请求体序列化失败，按 0 字节估算（字节兜底本轮不截断）");
+            0
+        }
+    }
 }
 
 /// 丢掉开头连续的 assistant 消息，保证历史以 user 开头。
-fn drop_leading_assistant(mut tail: Vec<Message>) -> Vec<Message> {
+///
+/// `pub(super)`：让 `converter_byte_overflow_tests` 能**直接**钉这条分支——截断测试里
+/// 它是靠 130KB×20 的尺寸算术凑出来的覆盖，尺寸一变（或 state_size 口径变）就会静默
+/// 不再执行该分支而测试仍绿（见 `test_history_starts_with_user_after_truncation` 的注释）。
+pub(super) fn drop_leading_assistant(mut tail: Vec<Message>) -> Vec<Message> {
     while matches!(tail.first(), Some(Message::Assistant(_))) {
         tail.remove(0);
     }
@@ -115,6 +139,17 @@ const PLACEHOLDER_ACK: &str = "Understood.";
 ///   （占位与 tail 之间必须补 assistant，否则 user+user 破坏交替）；
 /// - 历史必须以 user 开头，截断后若首条是 assistant 则一并丢弃；
 /// - 切口可能切断 toolUse/toolResult 配对，剥掉引用了已丢 toolUse 的孤立 toolResults。
+///
+/// ⚠️ [`MAX_PAYLOAD_BYTES`] 是**触发阈值**，不是「重建后必 ≤ 此值」的硬保证：
+/// `running` 累加的是各条目自身的序列化长度，不含 `PLACEHOLDER_ACK`、JSON 数组的
+/// 逗号/方括号，也不含历史为空时被 `skip_serializing_if` 省掉的 `"history":` 键——
+/// 贴线时重建体可比估算多几十字节（≈ ack + 条数 + 3）。900KB 距上游实测拒绝线
+/// （~5MiB）有数倍余量，这点偏差不会让 CONTENT_LENGTH 重试再失败；若要收紧成硬保证，
+/// 需在重建后再实测一次并继续丢弃——那会移动
+/// `test_history_starts_with_user_after_truncation` 明确钉住的 keep_from 断点，
+/// 须连同尺寸敏感的测试一起改。
+/// 另外 tail 至少留 [`MIN_RECENT_HISTORY_TURNS`]+1 条，这些轮次（或 current_message）
+/// 自身超限时本函数无能为力，见上文「当前消息本身超限」。
 pub(crate) fn truncate_history_if_needed(state: &mut ConversationState, model_id: &str) -> usize {
     if state_size(state) <= MAX_PAYLOAD_BYTES {
         return 0;

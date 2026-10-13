@@ -35,6 +35,24 @@
         c.output_tokens = 5;
         assert!(c.is_empty_response());
         assert!(c.empty_response_is_oversized_context());
+
+        // 判据是 `output_tokens < NEAR_EMPTY_OUTPUT_THRESHOLD(30)` 且
+        // `input_tokens >= 阈值`。两侧都钉住，防 `<` / `>=` 被改成 `<=` / `>` 后无人发现
+        // （原用例只用 output=5 + input 恰好等于阈值，两个方向的越界都测不到）。
+        c.output_tokens = 29;
+        assert!(c.is_empty_response(), "output 29 仍属近空");
+        c.output_tokens = 30;
+        assert!(
+            !c.is_empty_response(),
+            "output == 30 已达上限（判据是 < 30），即使输入刚达阈值也不得判空"
+        );
+
+        let mut below = ctx(model, threshold - 1);
+        below.output_tokens = 29;
+        assert!(
+            !below.is_empty_response(),
+            "输入比阈值少 1 个 token 不得走近空路径（判据是 >= 阈值）"
+        );
     }
 
     #[test]
@@ -53,6 +71,13 @@
         c.output_tokens = 5;
         c.state_manager.set_has_tool_use(true);
         assert!(!c.is_empty_response());
+
+        // 路径 1 的另一半：`output_tokens == 0` **且有**工具调用 → 同样不是空响应
+        // （判据要求 `output == 0 && no_tool_use` 同时成立；原用例只覆盖了 output>0 那侧）。
+        let mut c0 = ctx("claude-sonnet-5", 10_000);
+        c0.output_tokens = 0;
+        c0.state_manager.set_has_tool_use(true);
+        assert!(!c0.is_empty_response());
     }
 
     #[test]
@@ -95,15 +120,42 @@
             "handlers.rs 不得出现共用判据的独立实现（只能调用，不能定义）"
         );
         let self_prod = prod(self_src);
-        let cut = self_prod
-            .find("pub fn is_empty_response")
-            .expect("is_empty_response 定义不应被删改");
-        let body = &self_prod[cut..];
-        let body = &body[..body
-            .find("pub fn empty_response_is_oversized_context")
-            .expect("is_empty_response 应后随 empty_response_is_oversized_context")];
+        // 只切 `is_empty_response` **自身**的函数体（花括号配平到闭合处），而不是
+        // 「到下一个 marker 为止的文本区间」：旧版切到下一个
+        // `pub fn empty_response_is_oversized_context`，而两者之间还夹着私有的
+        // `is_clean_eof_without_terminal` —— 在那个方法里留一个 `near_empty_response(`
+        // 残留，本方法即使改回自实现也照样变绿。守卫钉的必须是本方法本身。
+        // （注释行已在 prod() 里剔除，函数体内不会出现花括号字面量。）
+        let sig = "pub fn is_empty_response";
+        let cut = self_prod.find(sig).expect("is_empty_response 定义不应被删改");
+        let after_sig = &self_prod[cut + sig.len()..];
+        let brace = after_sig.find('{').expect("is_empty_response 应有函数体");
+        let mut depth = 0usize;
+        let mut end = None;
+        for (i, ch) in after_sig[brace..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(brace + i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &after_sig[..end.expect("is_empty_response 函数体应闭合")];
+        // 契约：**返回值就是共用判据本身**（先喂本上下文的量，再返回它的结果），不是
+        // 「先调一次、再自己算一份」。只查 substring 会放过后者，故补一条结构判据：
+        // 最后一次调用之后只允许函数体的收尾大括号 —— 即它就是 return 表达式。
+        let call = body
+            .rfind("near_empty_response(")
+            .expect("流式 is_empty_response 必须收敛到共用判据（残留自实现即分界漂移）");
+        let tail = body[call..].trim_end();
+        let tail = tail.strip_suffix('}').unwrap_or(tail).trim_end();
         assert!(
-            body.contains("near_empty_response("),
-            "流式 is_empty_response 必须收敛到共用判据（残留自实现即分界漂移）"
+            tail.ends_with(')'),
+            "is_empty_response 必须直接返回 near_empty_response(...) 的结果（调用之后再自算一份即分界漂移）: {body}"
         );
     }

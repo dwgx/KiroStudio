@@ -1,5 +1,5 @@
     use super::*;
-    use super::history_overflow::{drop_orphan_tool_results, state_size};
+    use super::history_overflow::{drop_leading_assistant, drop_orphan_tool_results, state_size};
     use crate::kiro::model::requests::conversation::{
         HistoryAssistantMessage, HistoryUserMessage, UserInputMessageContext,
     };
@@ -43,29 +43,36 @@
         Message::User(m)
     }
 
-    /// 收集保留历史里出现的所有 toolResult，断言每个都有对应的 toolUse。
-    fn assert_no_orphan_tool_results(state: &ConversationState) {
-        let known: std::collections::HashSet<String> = state
-            .history
-            .iter()
-            .filter_map(|m| match m {
-                Message::Assistant(a) => a.assistant_response_message.tool_uses.as_ref(),
-                _ => None,
-            })
-            .flatten()
-            .map(|t| t.tool_use_id.clone())
-            .collect();
-        for m in &state.history {
-            if let Message::User(u) = m {
-                for r in &u.user_input_message.user_input_message_context.tool_results {
-                    assert!(
-                        known.contains(&r.tool_use_id),
-                        "孤立 toolResult {} 无对应 toolUse，会触发上游 400",
-                        r.tool_use_id
-                    );
+    /// 收集保留历史里出现的所有 toolResult，断言每个都有**在前**的对应 toolUse。
+    ///
+    /// 只查 id 集合（旧实现）会放过「result 在前、toolUse 在后」这类同样触发上游 400
+    /// 的形态——上游要求 toolResult 出现在其 toolUse **之后**的 user 轮里，故这里按顺序
+    /// 累积已见 toolUse id。注意不能反向要求「每个 toolUse 都有 result」：活跃轮次的
+    /// toolUses 在历史末条，其 result 在**当前消息**里，历史内本就查不到。
+    fn assert_no_orphan_tool_results_in(history: &[Message]) {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for m in history {
+            match m {
+                Message::Assistant(a) => {
+                    if let Some(uses) = a.assistant_response_message.tool_uses.as_ref() {
+                        seen.extend(uses.iter().map(|t| t.tool_use_id.as_str()));
+                    }
+                }
+                Message::User(u) => {
+                    for r in &u.user_input_message.user_input_message_context.tool_results {
+                        assert!(
+                            seen.contains(r.tool_use_id.as_str()),
+                            "孤立 toolResult {} 无在前对应的 toolUse，会触发上游 400",
+                            r.tool_use_id
+                        );
+                    }
                 }
             }
         }
+    }
+
+    fn assert_no_orphan_tool_results(state: &ConversationState) {
+        assert_no_orphan_tool_results_in(&state.history);
     }
 
     /// 断言 user/assistant 严格交替（上游要求，否则 400 REQUEST_BODY_INVALID）。
@@ -133,7 +140,18 @@
             hist.push(user(&big));
         }
         let mut s = state_with(hist);
-        truncate_history_if_needed(&mut s, "auto");
+        let dropped = truncate_history_if_needed(&mut s, "auto");
+
+        // 前提自检（把上面那段尺寸核算变成**会红的断言**，而不是靠注释维持）：
+        // dropped == keep_from，本夹具偶数位是 assistant —— 断点落在 assistant 上，
+        // tail 才会以 assistant 开头、drop_leading_assistant 才真的被执行。
+        // 若将来尺寸/口径变化让断点落到奇数位，本用例先红，而不是静默地测不到目标分支
+        // （旧值 150KB 时就是那种「恒绿但什么都没测」的状态）。
+        assert_eq!(
+            dropped % 2,
+            0,
+            "断点须落在 assistant（偶数位）上，否则本用例测不到 drop_leading 分支（dropped={dropped}）"
+        );
 
         // 占位(user) 之后紧跟应答(assistant)，再往后才是保留的 tail(user 开头)，
         // 这样才满足上游的严格交替要求。
@@ -160,6 +178,27 @@
     fn test_empty_history_is_noop() {
         let mut s = state_with(vec![]);
         assert_eq!(truncate_history_if_needed(&mut s, "auto"), 0);
+    }
+
+    /// `drop_leading_assistant` 的直接用例：截断流程里这条分支是靠 130KB×20 的字节
+    /// 算术凑出来的覆盖（见上一个测试的尺寸核算注释），尺寸/口径一变就会静默不再执行
+    /// 而测试仍绿；这里直接钉函数本身，与尺寸解耦。
+    #[test]
+    fn test_drop_leading_assistant_direct() {
+        let out = drop_leading_assistant(vec![
+            assistant("a"),
+            assistant("b"),
+            user("u"),
+            assistant("c"),
+        ]);
+        assert!(
+            matches!(out.first(), Some(Message::User(_))),
+            "开头的连续 assistant 必须被删掉，首条为 user"
+        );
+        assert_eq!(out.len(), 2, "只应删掉开头的连续 assistant");
+        assert!(drop_leading_assistant(Vec::new()).is_empty());
+        // 已经以 user 开头 → 一条都不动
+        assert_eq!(drop_leading_assistant(vec![user("u"), assistant("a")]).len(), 2);
     }
 
     #[test]
@@ -215,13 +254,20 @@
             Message::User(HistoryUserMessage::new("next", "auto")),
         ];
         let out = drop_orphan_tool_results(tail);
-        if let Some(Message::User(u)) = out.first() {
-            let rs = &u.user_input_message.user_input_message_context.tool_results;
-            assert!(
-                rs.is_empty() || rs.iter().all(|r| r.tool_use_id != "tu_gone"),
+        // 必须**无条件**断言（旧写法 `if let Some(Message::User(..))` 在形状不符时
+        // 整条跳过断言，清理失效也能绿）：孤立 user + 其后的 assistant 应被删掉，
+        // 保留段首条是那条无工具结果的普通 user。
+        match out.first() {
+            Some(Message::User(u)) => assert!(
+                u.user_input_message
+                    .user_input_message_context
+                    .tool_results
+                    .is_empty(),
                 "孤立 toolResult 未被清理"
-            );
+            ),
+            other => panic!("孤立 user 及其后的 assistant 应被删除，实际首条: {other:?}"),
         }
+        assert_eq!(out.len(), 1, "只应保留那条普通 user");
     }
 
     /// 配对完整时不得误删。
@@ -256,27 +302,9 @@
         ];
         let out = drop_orphan_tool_results(tail);
         assert_alternation(&out);
-        // 无孤立 toolResult：保留段出现的每个 result 都必须在保留段内有对应 toolUse。
-        let known: std::collections::HashSet<String> = out
-            .iter()
-            .filter_map(|m| match m {
-                Message::Assistant(a) => a.assistant_response_message.tool_uses.as_ref(),
-                _ => None,
-            })
-            .flatten()
-            .map(|t| t.tool_use_id.clone())
-            .collect();
-        for m in &out {
-            if let Message::User(u) = m {
-                for r in &u.user_input_message.user_input_message_context.tool_results {
-                    assert!(
-                        known.contains(&r.tool_use_id),
-                        "连锁删除后仍不得残留孤立 toolResult {}",
-                        r.tool_use_id
-                    );
-                }
-            }
-        }
+        // 无孤立 toolResult：保留段出现的每个 result 都必须在保留段内**之前**有对应 toolUse
+        // （共用守卫按顺序累积，比原来那份「id 只要在段内出现过就行」的局部检查更严）。
+        assert_no_orphan_tool_results_in(&out);
     }
 
     // ============ sanitize_history（旧工具轮次扁平化） ============
@@ -358,6 +386,25 @@
             }
             _ => panic!("shape"),
         }
+        // 非活跃轮次（h[0] 的 toolResults 指向旧 toolUse）必须被扁平化：结构化字段清空、
+        // 结果文本并入正文 —— 只查 h[1] 会让「sanitize 整体没跑」也绿。
+        match &h[0] {
+            Message::User(u) => {
+                assert!(
+                    u.user_input_message
+                        .user_input_message_context
+                        .tool_results
+                        .is_empty(),
+                    "非活跃轮次的 toolResults 必须被清空"
+                );
+                assert!(
+                    u.user_input_message.content.contains("old result"),
+                    "结果文本须并入正文: {}",
+                    u.user_input_message.content
+                );
+            }
+            _ => panic!("shape"),
+        }
     }
 
     /// 反模式守卫：扁平化后 assistant 正文不得出现工具调用叙述，
@@ -366,14 +413,23 @@
     fn test_no_tool_call_narration_in_assistant() {
         let mut h = vec![a_with_use("tu_1", "read_file"), u_with_result_content("tu_1", "x")];
         sanitize_history(&mut h, &HashSet::new());
-        if let Message::Assistant(a) = &h[0] {
-            let c = &a.assistant_response_message.content;
-            for bad in ["[Called", "read_file", "tool_use", "invoke"] {
+        match &h[0] {
+            Message::Assistant(a) => {
+                // 先证明 sanitize **确实跑了**：否则「正文里恰好没有违禁子串」会让本测试
+                // 恒绿（原实现就是这种纸面形态）。
                 assert!(
-                    !c.contains(bad),
-                    "assistant 正文不得叙述工具调用，命中 {bad}: {c}"
+                    a.assistant_response_message.tool_uses.is_none(),
+                    "非活跃轮次的 toolUses 必须被清空（否则本测试没测到 sanitize）"
                 );
+                let c = &a.assistant_response_message.content;
+                for bad in ["[Called", "read_file", "tool_use", "invoke"] {
+                    assert!(
+                        !c.contains(bad),
+                        "assistant 正文不得叙述工具调用，命中 {bad}: {c}"
+                    );
+                }
             }
+            _ => panic!("shape"),
         }
     }
 
@@ -419,6 +475,24 @@
         }
         assert_alternation(&s.history);
         assert_no_orphan_tool_results(&s);
+        // 扁平化必须真的发生（sanitize 先行是字节截断的前置约束）：本夹具的当前消息只
+        // 携带 tu_active，历史里没有任何 toolUse 被它应答 → 无活跃轮次 → 兜底后历史里
+        // 不得残留任何结构化 toolUses / toolResults（只查体积会让「sanitize 没跑」也绿）。
+        for m in &s.history {
+            match m {
+                Message::Assistant(a) => assert!(
+                    a.assistant_response_message.tool_uses.is_none(),
+                    "兜底后历史 assistant 不得残留 toolUses"
+                ),
+                Message::User(u) => assert!(
+                    u.user_input_message
+                        .user_input_message_context
+                        .tool_results
+                        .is_empty(),
+                    "兜底后历史 user 不得残留 toolResults"
+                ),
+            }
+        }
     }
 
     /// 幂等：二次调用不得再改动（截断后 size ≤ 上限 → no-op）。
@@ -434,10 +508,16 @@
         let mut s = state_with(hist);
         apply_byte_overflow_guard(&mut s);
         let first_pass = s.history.clone();
+        let first_json = serde_json::to_string(&first_pass).expect("历史应可序列化");
         let first_size = state_size(&s);
 
         apply_byte_overflow_guard(&mut s);
         assert_eq!(s.history.len(), first_pass.len(), "二次兜底不得再删历史");
+        assert_eq!(
+            serde_json::to_string(&s.history).expect("历史应可序列化"),
+            first_json,
+            "二次兜底不得再改动历史内容（只比 len/size 会放过「改正文但不改体积」的改动）"
+        );
         assert_eq!(state_size(&s), first_size, "二次兜底不得再改动体积");
     }
 

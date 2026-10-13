@@ -63,7 +63,10 @@ where
     D: serde::Deserializer<'de>,
 {
     let value = i32::deserialize(deserializer)?;
-    Ok(value.min(MAX_BUDGET_TOKENS))
+    // 下界也要夹：负数是畸形输入（budget_tokens 语义上不可能为负），而它会经
+    // `converter::generate_thinking_prefix` 原样插进 `<max_thinking_length>-5</…>`
+    // 注入提示词。夹到 0 不改变档位映射（`effort_from_budget_tokens` 对负数本就落 low）。
+    Ok(value.max(0).min(MAX_BUDGET_TOKENS))
 }
 
 /// OutputConfig 配置
@@ -122,9 +125,13 @@ where
         where
             E: serde::de::Error,
         {
+            // `type` 显式给 "text"：远程 count_tokens 路径会把 `CountTokensRequest`
+            // （含 system）**原样序列化发出去**，而缺 `type` 的块不是合法的 Anthropic
+            // 数组形态（只有字符串形态才允许省略）。指纹侧 `cache_fingerprint::
+            // system_signature` 把 None 也当 "text"，故本改动不移动任何前缀哈希。
             Ok(Some(vec![SystemMessage {
                 text: value.to_string(),
-                block_type: None,
+                block_type: Some("text".to_string()),
                 cache_control: None,
             }]))
         }
@@ -288,4 +295,81 @@ pub struct CountTokensRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CountTokensResponse {
     pub input_tokens: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 字符串形态 system → 显式 `type: "text"` 块。远程 count_tokens 路径会把
+    /// `CountTokensRequest` 原样序列化发出去（token.rs 的 `call_remote_count_tokens`），
+    /// 而缺 `type` 的块在数组形态里不是合法 Anthropic 报文，故字符串路径也要补上。
+    #[test]
+    fn string_system_becomes_explicit_text_block() {
+        let req: CountTokensRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "m",
+                "messages": [],
+                "system": "hi"
+            }))
+            .expect("字符串 system 必须可反序列化");
+        let sys = req.system.expect("system 应被解析成数组");
+        assert_eq!(sys.len(), 1);
+        assert_eq!(sys[0].text, "hi");
+        assert_eq!(sys[0].block_type.as_deref(), Some("text"));
+        let v = serde_json::to_value(&sys[0]).expect("可序列化");
+        assert_eq!(v["type"], "text", "数组形态缺 type 非法: {v}");
+    }
+
+    /// 数组形态 system 原样保留 `type`（与字符串路径同形，两条路径不得漂移）。
+    #[test]
+    fn array_system_keeps_its_block_type() {
+        let req: CountTokensRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [],
+            "system": [{"type": "text", "text": "hi"}]
+        }))
+        .expect("数组 system 必须可反序列化");
+        assert_eq!(req.system.unwrap()[0].block_type.as_deref(), Some("text"));
+    }
+
+    /// budget_tokens 双向夹取：负数（畸形输入）夹到 0，超上限夹到 MAX_BUDGET_TOKENS。
+    #[test]
+    fn budget_tokens_clamped_both_ends() {
+        let mk = |b: serde_json::Value| -> i32 {
+            let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model": "m",
+                "max_tokens": 1,
+                "messages": [],
+                "thinking": {"type": "enabled", "budget_tokens": b}
+            }))
+            .expect("thinking 应可反序列化");
+            req.thinking.expect("thinking 存在").budget_tokens
+        };
+        assert_eq!(
+            mk(serde_json::json!(-5)),
+            0,
+            "负数夹到 0（负值会被注入 <max_thinking_length>）"
+        );
+        assert_eq!(mk(serde_json::json!(0)), 0);
+        assert_eq!(mk(serde_json::json!(8192)), 8192);
+        assert_eq!(
+            mk(serde_json::json!(i32::MAX)),
+            MAX_BUDGET_TOKENS,
+            "超上限仍夹到 MAX_BUDGET_TOKENS（既有行为）"
+        );
+    }
+
+    /// 未给 budget_tokens 仍走默认值，不受夹取改动影响。
+    #[test]
+    fn budget_tokens_default_unchanged() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "max_tokens": 1,
+            "messages": [],
+            "thinking": {"type": "enabled"}
+        }))
+        .expect("thinking 应可反序列化");
+        assert_eq!(req.thinking.unwrap().budget_tokens, 20000);
+    }
 }

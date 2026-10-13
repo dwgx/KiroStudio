@@ -3,6 +3,27 @@
 //! 由 `stream.rs` 以 `#[path]` 子模块接入。跨 chunk 的
 //! `StreamContext::strip_dsml_markers` 仍留在 `stream.rs`。
 
+/// 判断 `<｜` / `</｜` 之后（跳过空白）的关键字是否为 dsml / tool / function 三者之一。
+///
+/// 只比较关键字本身的少数几个字符，**不**把剩余文本整段 collect 成 String：
+/// 旧写法在每个 `<｜` 出现处都复制一遍剩余全文、再 `to_ascii_lowercase` 复制一次，
+/// CJK 排版里 `<｜` 并不罕见，多次出现时就是 O(k·n) 的分配 + 扫描（本函数在
+/// 非流式正文路径上，长文本只调用一次，但文本本身可能很大）。
+fn looks_like_dsml_marker(chars: &[char], from: usize) -> bool {
+    let mut k = from;
+    while k < chars.len() && chars[k].is_whitespace() {
+        k += 1;
+    }
+    const KEYS: [&str; 3] = ["dsml", "tool", "function"];
+    KEYS.iter().any(|kw| {
+        chars[k..]
+            .iter()
+            .take(kw.len())
+            .map(|c| c.to_ascii_lowercase())
+            .eq(kw.chars())
+    })
+}
+
 /// 从**完整文本**里剥掉 DeepSeek DSML 工具协议标记（非流式路径用）。
 ///
 /// 流式有 [`StreamContext::strip_dsml_markers`]（带跨 chunk 尾巴缓冲），非流式此前
@@ -31,13 +52,13 @@ pub(crate) fn strip_dsml_from_complete_text(text: &str) -> String {
             && chars[i + 2] == '\u{FF5C}';
         if (chars[i] == '<' && i + 1 < chars.len() && chars[i + 1] == '\u{FF5C}') || is_close_tag {
             let kw_start = if is_close_tag { i + 3 } else { i + 2 };
-            let rest: String = chars[kw_start..].iter().collect();
-            let r = rest.trim_start().to_ascii_lowercase();
-            let looks_marker =
-                r.starts_with("dsml") || r.starts_with("tool") || r.starts_with("function");
-            // 闭合查找限行，同流式：正文里的 `>` 不能被当标记闭合导致跨行吞正文。
-            let closed = chars[i..].iter().position(|&c| c == '>' || c == '\n');
+            // 只比关键字，不整段 collect（见 looks_like_dsml_marker 的性能说明）。
+            let looks_marker = looks_like_dsml_marker(&chars, kw_start);
             if looks_marker {
+                // 闭合查找限行，同流式：正文里的 `>` 不能被当标记闭合导致跨行吞正文。
+                // ⚠️ 只在**确认是标记**后才扫：非标记的 `<｜` 走下面原样放行，扫了也没人用
+                // （旧写法无条件先扫，CJK 正文里多个 `<｜` 就是多次 O(n)）。
+                let closed = chars[i..].iter().position(|&c| c == '>' || c == '\n');
                 match closed {
                     Some(rel) if chars[i + rel] == '>' => {
                         i += rel + 1; // 完整标记整段丢弃（含 `>`）

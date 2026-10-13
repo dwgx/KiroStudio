@@ -750,7 +750,10 @@ fn parse_family_version(model_lower: &str) -> Option<(Family, Option<(u16, u16)>
                 let mut k = sep + 1;
                 if k < bytes.len() && bytes[k].is_ascii_digit() {
                     let mut minor = 0u16;
-                    let mut minor_digits = 0u8;
+                    // usize 计数：客户端可以发任意长的数字串（模型名是请求体里的自由文本），
+                    // u8 在第 256 位数字上 debug 直接 panic（整条请求任务 abort）、release
+                    // 回绕后可能让下面的 `<= 2` 判真而把饱和值当版本号。
+                    let mut minor_digits = 0usize;
                     while k < bytes.len() && bytes[k].is_ascii_digit() {
                         minor = minor
                             .saturating_mul(10)
@@ -781,11 +784,17 @@ fn find_family_version(family: Family, ver: (u16, u16)) -> Option<&'static Model
         .find(|s| s.family == family && s.version == Some(ver))
 }
 
-/// 某族「最新」档(version 最大者；无版本族取第一个)。用于未知版本回退。
+/// 某族「最新」档(version 最大者)。用于未知版本回退与无版本号回退。
+///
+/// 只认**对外广告**的行(`advertised: true`)，理由见函数内注释。
 fn newest_in_family(family: Family) -> Option<&'static ModelSpec> {
     CATALOG
         .iter()
-        .filter(|s| s.family == family)
+        // 只从**对外广告**的行里挑：`advertised: false` 的行（目前仅 `claude-haiku-5.5`，
+        // 其存在性没有任何一仓独立验证）按名可用，但不该成为「无版本号 / Claude 3 老名」
+        // 这类**推断**请求的目标——那等于让客户端吃一个连广告位都不敢放、上游可能不认的
+        // SKU（不认就是 400）。显式点名 `claude-haiku-5.5` 走精确别名（步骤 1/2），不受影响。
+        .filter(|s| s.family == family && s.advertised)
         .max_by_key(|s| s.version.unwrap_or((0, 0)))
 }
 
@@ -801,10 +810,19 @@ fn is_legacy_claude(model_lower: &str) -> bool {
 
 /// 是否允许「已知 family 但未知(更新)版本」回退到同族最新档。默认关(strict)。
 /// 环境变量 `KIRO_ALLOW_UNKNOWN_VERSION=1` 开启(类比 LiteLLM 的 pass_through_all_models)。
+///
+/// 进程内**只读一次**（进程级快照，同 `invoke_xml::invoke_trace_enabled` 的写法）：
+/// ① 读 env 要拿全局锁并分配 String，而本函数在「结构化解析命中未知版本」的冷路径上
+/// 每请求都可能走到；② 更要紧的是同一进程内不能出现「这次请求 strict 拒绝、下次请求
+/// 按同族最新档计费」——环境变量本就不该中途改（本仓唯一的 `set_var` 在测试里）。
+/// 副作用：测试若要开这个开关，必须在**任何** `resolve` 之前设好（进程级一次性快照）。
 fn allow_unknown_version() -> bool {
-    std::env::var("KIRO_ALLOW_UNKNOWN_VERSION")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    static ALLOW: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("KIRO_ALLOW_UNKNOWN_VERSION")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    });
+    *ALLOW
 }
 
 /// 解析客户端模型名 → CATALOG spec + 命中方式。这是**唯一**的模型识别入口。
@@ -940,6 +958,18 @@ fn resolve_inner(model: &str) -> Option<Resolved> {
         match family {
             Family::DeepSeek | Family::Glm | Family::Qwen | Family::Auto => {
                 if let Some(spec) = default_in_family(family) {
+                    // ⚠️ 走到这里的一定**不是**精确别名（精确命中在步骤 1/2 已返回），
+                    // 即客户端给的名字只是「包含族名」的未知名（如 `deepseek-r1` /
+                    // `glm-4.6` / `qwen2.5-72b`），却被映射到族内首个档位。
+                    // 文件头承诺「所有非精确命中打 warn」——这里补上，否则这类
+                    // 「名字没对上但静默换模型」在日志里完全不可观测（计费/代际可能不同）。
+                    tracing::warn!(
+                        request_model = %model,
+                        resolved_kiro_id = %spec.kiro_id,
+                        family = ?family,
+                        match_kind = "family-default",
+                        "模型识别:无版本族名未精确命中，按族内默认档映射——建议客户端改用目录中的确切 id"
+                    );
                     return Some(Resolved {
                         spec,
                         kind: MatchKind::Structured,
@@ -1223,6 +1253,21 @@ mod tests {
         assert_eq!(kid("claude-opus-5-0"), Some("claude-opus-5"));
     }
 
+    /// 超长数字串（客户端可控的模型名）不得 panic：`minor_digits` 旧实现是 u8，
+    /// 第 256 位数字上 debug 构建直接 panic（整条请求任务 abort）。计数改 usize 后
+    /// 走「数字串不是版本」的正常分支 —— 落 family-default（与 `4-20250514` 同处置）。
+    #[test]
+    fn test_overlong_digit_run_does_not_panic() {
+        let long_minor = format!("claude-opus-4-{}", "1".repeat(300));
+        assert_eq!(
+            kid(&long_minor),
+            Some("claude-opus-5.5"),
+            "300 位数字不是版本 → 族默认档；旧 u8 计数会在此 panic（debug 构建）"
+        );
+        let long_major = format!("claude-opus-{}-1", "2".repeat(300));
+        assert!(kid(&long_major).is_some(), "超长 major 同样不得 panic");
+    }
+
     #[test]
     fn test_unknown_model_rejected() {
         assert_eq!(kid("gpt-4"), None);
@@ -1298,6 +1343,21 @@ mod tests {
         assert_eq!(context_window("qwen3-coder-next"), 256_000);
         assert_eq!(context_window("claude-sonnet-5"), 1_000_000);
         assert_eq!(context_window("claude-sonnet-4.0"), 200_000);
+    }
+
+    /// 族默认档只从**对外广告**的行里挑：`claude-haiku-5.5` 的 `advertised=false`
+    /// （存在性无任何一仓独立验证、上游可能不认），不得成为「无版本号 / Claude 3 老名」
+    /// 这类**推断**请求的目标 —— 否则客户端吃一个连广告位都没有的 SKU，上游不认就是 400。
+    #[test]
+    fn family_default_skips_unadvertised_rows() {
+        // 无版本号 haiku → 广告中的最新 haiku(4.5)，而不是未广告的 5.5。
+        assert_eq!(kid("claude-haiku"), Some("claude-haiku-4.5"));
+        // Claude 3 老名近似同理：目标避开未广告档，但命中方式仍是 Claude3Approx（可观测）。
+        let legacy = resolve("claude-3-haiku-20240307").expect("Claude 3 老名应走近似路径");
+        assert_eq!(legacy.spec.kiro_id, "claude-haiku-4.5");
+        assert_eq!(legacy.kind, MatchKind::Claude3Approx);
+        // 显式点名 5.5（精确别名）不受影响 —— 目录注释的「按名可用」语义保留。
+        assert_eq!(kid("claude-haiku-5.5"), Some("claude-haiku-5.5"));
     }
 
     #[test]

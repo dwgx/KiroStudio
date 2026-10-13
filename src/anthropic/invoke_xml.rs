@@ -89,6 +89,18 @@ pub(crate) fn find_invoke_start(buffer: &str) -> Option<usize> {
 ///
 /// 兼容裸 `</invoke>` 与带前缀 `</prefix:invoke>`。找不到返回 `None`（块还没到齐）。
 pub(crate) fn find_invoke_block_end(buffer: &str, start: usize) -> Option<usize> {
+    // 自闭合 `<invoke name="Bash"/>`（模型发出无参调用时的退化形态）没有 `</invoke>`：
+    // 若不在这里就地收口，`find_last_invoke_close` 永远找不到闭合 → `drain_invoke_sniff_buffer`
+    // 的「行首未闭合块」分支会把这条标签**之后的全部正文** hold 在 sniff 缓冲里，
+    // 直到累计 256KB 或流结束才吐 —— 一个空参调用标签就停摆整条响应（客户端无增量输出）。
+    // 判定：开标签的 `>` 紧跟在 `/` 之后。属性值里即便含 `>`，其前一字节是引号/字母，
+    // 不会误判为自闭合。
+    if let Some(rel) = buffer[start..].find('>') {
+        let gt = start + rel;
+        if gt > start && buffer.as_bytes()[gt - 1] == b'/' {
+            return Some(gt + 1);
+        }
+    }
     // 块 A 的边界 = 下一个 `<invoke` 开标签（即下一个块 B 的起点），没有则到 buffer 结尾。
     // 这样连发 burst（A 紧跟 B）时，A 的搜索区间被 B 的开标签卡住，绝不会吃进 B。
     let boundary = match find_next_invoke_open(buffer, start) {
@@ -143,8 +155,12 @@ pub(crate) fn find_last_invoke_close(buffer: &str, from: usize, boundary: usize)
     let mut last: Option<usize> = None;
     while let Some(rel) = region[search..].find("invoke>") {
         let name_pos = search + rel;
-        // '</invoke>' 形式
-        if name_pos >= 2 && &region[name_pos - 2..name_pos] == "</" {
+        // '</invoke>' 形式。
+        // ⚠️ 用**字节**比较而非 `&region[name_pos - 2..name_pos] == "</"`：`name_pos` 是
+        // `find` 给出的字符边界，但 `name_pos - 2` 可能落在多字节字符内部（正文里 CJK
+        // 紧邻字面 `invoke>` 时，如 `<parameter name="c">中文invoke>`）——`&str` 切片在
+        // 非字符边界上直接 panic，会把整条流打断。字节比较无此约束。
+        if name_pos >= 2 && bytes[name_pos - 2] == b'<' && bytes[name_pos - 1] == b'/' {
             last = Some(from + name_pos + "invoke>".len());
         } else if name_pos >= 1 && bytes[name_pos - 1] == b':' {
             // '</prefix:invoke>' 形式
@@ -155,7 +171,8 @@ pub(crate) fn find_last_invoke_close(buffer: &str, from: usize, boundary: usize)
             } {
                 j -= 1;
             }
-            if j >= 2 && &region[j - 2..j] == "</" {
+            // 同上：`j` 也可能紧跟在多字节字符之后，只做字节比较。
+            if j >= 2 && bytes[j - 2] == b'<' && bytes[j - 1] == b'/' {
                 last = Some(from + name_pos + "invoke>".len());
             }
         }
@@ -256,8 +273,10 @@ pub(crate) fn find_param_close(body: &str, from: usize) -> Option<(usize, usize)
     let bytes = region.as_bytes();
     while let Some(rel) = region[search..].find(kw) {
         let name_pos = search + rel;
-        // '</parameter>' 形式
-        if name_pos >= 2 && &region[name_pos - 2..name_pos] == "</" {
+        // '</parameter>' 形式。
+        // ⚠️ 字节比较（同 `find_last_invoke_close`）：`name_pos - 2` 可能落在多字节
+        // 字符内部，`&str` 切片会 panic，而本函数对每个参数值都会跑一遍。
+        if name_pos >= 2 && bytes[name_pos - 2] == b'<' && bytes[name_pos - 1] == b'/' {
             last = Some((from + name_pos - 2, from + name_pos + kw.len()));
         } else if name_pos >= 1 && bytes[name_pos - 1] == b':' {
             // '</prefix:parameter>' 形式
@@ -268,7 +287,7 @@ pub(crate) fn find_param_close(body: &str, from: usize) -> Option<(usize, usize)
             } {
                 j -= 1;
             }
-            if j >= 2 && &region[j - 2..j] == "</" {
+            if j >= 2 && bytes[j - 2] == b'<' && bytes[j - 1] == b'/' {
                 last = Some((from + j - 2, from + name_pos + kw.len()));
             }
         }
@@ -420,14 +439,16 @@ pub(crate) fn detect_structural_flood(text: &str) -> Option<usize> {
                 i += 1;
                 continue;
             }
-            let tok: Vec<char> = chars[i..i + tok_len].iter().map(|(_, c)| *c).collect();
+            // 直接按下标比较 `chars` 切片，不每个候选窗口 collect 一个 `Vec<char>`：
+            // 本函数在**默认开启**的正文路径上对每个 chunk 都跑，候选窗口是 O(n) 量级，
+            // 逐窗口堆分配纯属浪费（原实现每次 `tok_len` 都要为每个起点分配一次）。
             let mut reps = 1usize;
             let mut k = i + tok_len;
             while k + tok_len <= n
                 && chars[k..k + tok_len]
                     .iter()
                     .map(|(_, c)| *c)
-                    .eq(tok.iter().copied())
+                    .eq(chars[i..i + tok_len].iter().map(|(_, c)| *c))
             {
                 reps += 1;
                 k += tok_len;
@@ -659,4 +680,78 @@ pub(crate) fn contains_textified_tool_call(text: &str) -> bool {
         || text.contains("<parameter name=")
         || text.contains("function_calls>")
         || text.contains("antml:")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 闭合查找的字符边界回归：区间里 CJK 紧邻字面 `invoke>` / `parameter>` 时，
+    /// `name_pos - 2` 会落在多字节字符内部 —— 旧实现用 `&region[name_pos - 2..name_pos]`
+    /// 切片，直接 `byte index N is not a char boundary` panic，把整条流打断
+    /// （本函数在流式 reclaim 路径上按 chunk 调用，退化输出里中文紧贴字面标记是常态）。
+    #[test]
+    fn test_close_finders_survive_multibyte_before_literal() {
+        // 3 字节 CJK 字符（`文` = E6 96 87）后紧跟字面 `invoke>`：name_pos - 2 落在字符内部。
+        let s = "<invoke name=\"x\"><parameter name=\"c\">中文invoke>";
+        assert_eq!(
+            find_invoke_block_end(s, 0),
+            None,
+            "无真闭合应返回 None（旧实现在这里 panic）"
+        );
+        assert_eq!(find_last_invoke_close(s, 0, s.len()), None);
+
+        // find_param_close 同样：值里 CJK 紧贴字面 `parameter>`。
+        let body = "<parameter name=\"c\">文parameter>";
+        let val_start = body.find('>').expect("开标签应有 '>'") + 1;
+        assert_eq!(
+            find_param_close(body, val_start),
+            None,
+            "多字节前缀不得 panic，且无闭标签时返回 None"
+        );
+    }
+
+    /// 自闭合 `<invoke name="Bash"/>`（无参调用的退化形态）必须就地判定为**完整块**：
+    /// 否则 `find_invoke_block_end` 返回 None → `drain_invoke_sniff_buffer` 把这条标签
+    /// 之后的全部正文 hold 在 sniff 缓冲里（直到 256KB / 流结束才吐），一个空参标签
+    /// 停摆整条响应。
+    #[test]
+    fn test_self_closing_invoke_is_complete_block() {
+        let s = "<invoke name=\"Bash\"/>\n后面还有正文";
+        let start = find_invoke_start(s).expect("自闭合标签也是 invoke 开标签");
+        let end = find_invoke_block_end(s, start).expect("自闭合块必须就地闭合");
+        assert_eq!(&s[..end], "<invoke name=\"Bash\"/>");
+        let (name, input) = parse_invoke_block(&s[start..end]).expect("自闭合块应可解析");
+        assert_eq!(name, "Bash");
+        assert_eq!(input, "{}", "无参调用 → 空 input 对象");
+
+        // 带空格的写法同理（` />`）。
+        let s2 = "<invoke name=\"Bash\" />";
+        let start2 = find_invoke_start(s2).unwrap();
+        assert_eq!(find_invoke_block_end(s2, start2), Some(s2.len()));
+
+        // 对照：非自闭合的开标签仍需等闭合，行为不变。
+        let open = "<invoke name=\"Bash\"><parameter name=\"c\">ls";
+        assert!(
+            find_invoke_block_end(open, 0).is_none(),
+            "未闭合块仍返回 None（不得被自闭合判定误收口）"
+        );
+    }
+
+    /// 复读熔断：同一短 token 连续重复达阈值 → 命中；未达阈值 → None（下标比较与
+    /// 原 `Vec<char>` 逐窗口比较语义等价，这里钉住行为不变）。
+    #[test]
+    fn test_detect_structural_flood_threshold() {
+        let flood = "课".repeat(REPEAT_GUARD_TRIP_THRESHOLD as usize);
+        assert_eq!(detect_structural_flood(&flood), Some(0));
+        let below = "课".repeat(REPEAT_GUARD_TRIP_THRESHOLD as usize - 1);
+        assert_eq!(detect_structural_flood(&below), None);
+        // 多字符 token 连写（`coursecoursecourse…`）：命中点 = 游程起点。
+        // 需要 ≥ 阈值份完整重复块（游程计数含首个块），故用 阈值+1 份。
+        let multi = "course".repeat(REPEAT_GUARD_TRIP_THRESHOLD as usize + 1);
+        assert_eq!(detect_structural_flood(&multi), Some(0));
+        // 正常正文（含重复标点/长短词）不误判：标点不参与 floodable，词内无长游程。
+        let prose = "the quick brown fox jumps over the lazy dog. ".repeat(4);
+        assert_eq!(detect_structural_flood(&prose), None);
+    }
 }

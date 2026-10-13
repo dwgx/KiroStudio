@@ -14,11 +14,23 @@
 //! - `POST /cc/v1/messages/count_tokens` - 计算 token 数量（与 /v1 相同）
 //!
 //! # 使用示例
-//! ```rust,ignore
-//! use kirostudio::anthropic;
 //!
-//! let app = anthropic::create_router("your-api-key");
-//! let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+//! 路由入口是 [`create_router_with_provider`]（本模块只再导出它）。它带十来个
+//! 热更开关/限额参数，完整签名见 `router::create_router_with_provider`；本仓是
+//! **单二进制**（无 lib 目标），下列示例只示意装配方式，故标 `ignore`：
+//! ```rust,ignore
+//! // 生产装配在 main.rs：从 Config 读出各开关后一次性传入。
+//! let app = anthropic::create_router_with_provider(
+//!     api_key,               // 用户侧 API Key（`/v1` 鉴权）
+//!     Some(kiro_provider),   // 上游 provider；None = 只装配路由（测试用）
+//!     extract_thinking,
+//!     cc_auto_buffer,
+//!     &cors_allowed_origins,
+//!     max_body_bytes,
+//!     compression,
+//!     // …其余工具/文本处理开关与限额见函数签名
+//! );
+//! let listener = tokio::net::TcpListener::bind("0.0.0.0:8990").await?;
 //! axum::serve(listener, app).await?;
 //! ```
 

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, StatusCode},
+    http::{Request, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Json, Response},
 };
@@ -63,7 +63,7 @@ pub async fn auth_middleware(
         _ => {
             // D1 接入（M2 补充）：API key 不匹配走配置 key `api_key_invalid`
             // （status/type/message 可配，默认 = 现状 401 + "Invalid API key"）。
-            let (status, error_type, message, _) = super::handlers::resolve_msg(
+            let (status, error_type, message, cfg_ra) = super::handlers::resolve_msg(
                 &super::handlers::current_error_messages(),
                 "api_key_invalid",
                 (
@@ -73,7 +73,19 @@ pub async fn auth_middleware(
                     None,
                 ),
             );
-            (status, Json(ErrorResponse::new(error_type, message))).into_response()
+            let mut resp = (status, Json(ErrorResponse::new(error_type, message))).into_response();
+            // 第四元（配置的 retryAfterSecs）此前被 `_` 丢掉 ⇒ `api_key_invalid` 配了
+            // retryAfterSecs 也发不出去，是个「配了没用」的死字段，且与主路径
+            // `handlers::map_provider_error`（配置 RA 一律 clamp 后挂头）口径不一致。
+            // clamp(1,300) 与主路径同源。
+            if let Some(ra) = cfg_ra {
+                let ra = ra.clamp(1, 300);
+                resp.headers_mut().insert(
+                    header::RETRY_AFTER,
+                    ra.to_string().parse().expect("u64 to_string 恒为合法 HeaderValue"),
+                );
+            }
+            resp
         }
     }
 }
