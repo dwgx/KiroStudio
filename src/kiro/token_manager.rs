@@ -8537,10 +8537,17 @@ impl MultiTokenManager {
                     tracing::info!("凭据 #{} 用量查询前已解析并回填真实 profileArn", id);
                 }
                 Ok(None) => {
-                    tracing::debug!("凭据 #{} ListAvailableProfiles 无 profile，用量 GET 不带 ARN", id);
+                    tracing::debug!(
+                        "凭据 #{} ListAvailableProfiles 无 profile，用量 GET 回退该号型可用形态（idc/social 用占位 ARN）",
+                        id
+                    );
                 }
                 Err(e) => {
-                    tracing::debug!("凭据 #{} 用量查询前解析 profileArn 失败（继续不带 ARN）: {}", id, e);
+                    tracing::debug!(
+                        "凭据 #{} 用量查询前解析 profileArn 失败（继续用该号型可用形态）: {}",
+                        id,
+                        e
+                    );
                 }
             }
         }
