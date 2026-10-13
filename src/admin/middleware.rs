@@ -33,7 +33,12 @@ impl AdminState {
     /// admin 改配置调 setter 即时生效、无需重启——重启会掐断在途流式请求）。
     /// 这里不再存、也不播——避免测试里随意构造 `AdminState` 污染进程级全局 cell。
     /// 空值由 `set_admin_key` 拒绝写入，判定侧 fail-closed（见 auth_keys 模块级安全说明）。
-    pub fn new(_admin_api_key: impl Into<String>, service: AdminService) -> Self {
+    ///
+    /// 此前还留着一个 `_admin_api_key` 形参：它既不存也不播，纯粹是迁移后的遗留 ——
+    /// 但调用点（`main.rs`、各处测试）会把 key 传进来，读代码的人会以为「传进去就生效」，
+    /// 实际鉴权只认 `auth_keys` 那个全局 cell。故删掉形参，让签名与真实语义一致：
+    /// **key 不从这里进**，只从 `auth_keys::set_admin_key` 进。
+    pub fn new(service: AdminService) -> Self {
         Self {
             service: Arc::new(service),
             usage_stats: None,
@@ -66,5 +71,25 @@ pub async fn admin_auth_middleware(
             let error = AdminErrorResponse::authentication_error();
             (StatusCode::UNAUTHORIZED, Json(error)).into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// E-2 守卫：`AdminState::new` 只收 service。
+    ///
+    /// 回退即 FAIL：把那个既不存也不播的 `_admin_api_key` 形参加回来（迁移遗留）——
+    /// 调用点会把 key 传进来，读代码的人便以为「传进去就生效」，而实际鉴权只认
+    /// `auth_keys` 那个进程级 cell。签名必须与真实语义一致：key 只从
+    /// `auth_keys::set_admin_key` 进。
+    #[test]
+    fn admin_state_new_takes_service_only() {
+        let src = include_str!("middleware.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        assert!(
+            prod.contains("pub fn new(service: AdminService) -> Self {"),
+            "AdminState::new 必须只收 service（key 只从 auth_keys::set_admin_key 进）"
+        );
     }
 }

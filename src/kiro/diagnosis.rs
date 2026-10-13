@@ -285,7 +285,8 @@ pub fn diagnose_device_auth_all_failed(
     let raw = last_err.map(|s| s.to_string());
     if let Some(err) = last_err {
         // 5xx：`reqwest::StatusCode` 的 Display 带短语（`503 Service Unavailable`），
-        // 故按「空格 + 5 + 两位数字」找状态码，而不是匹配裸 "503"。
+        // 故按「空格 + 5 + 两位数字 + 词边界」找状态码，而不是匹配裸 "503"
+        // （词边界这条挡的是 `took 500ms` 那类耗时量纲，见 [`has_http_5xx_status`]）。
         if has_http_5xx_status(err) {
             return OnboardingDiagnosis::new(
                 Stage::DeviceAuth,
@@ -347,8 +348,14 @@ pub fn diagnose_device_auth_all_failed(
 
 /// 错误串里是否出现 HTTP 5xx 状态码（形如 ` 503` / ` 502 Service Unavailable`）。
 ///
-/// 要求前导空格（上游错误串的固定形态是 `<动作> 失败 <code> <phrase>`）且后一位不再是
-/// 数字，免得把别的数字（端口、耗时、耗时毫秒数）当成状态码。
+/// 判据：前导空格（上游错误串的固定形态是 `<动作> 失败 <code> <phrase>`）+ `5` + 两位数字
+/// + **词边界**（后一位不是 ASCII 字母/数字；串尾视为边界）。
+///
+/// 后一位为什么连**字母**也要排除：三位数后面紧跟字母，说明它是更长的词/量纲的一部分，
+/// 不是状态码 —— `took 500ms`（reqwest 的超时文案）正是这种形态。它一旦被当成 503，
+/// 「网络超时」就被误归成「上游 5xx」：判成可重试、告诉用户与 start URL 无关、
+/// 引他去看 AWS 健康状态，而真正要查的是本机网络/代理。数字同理：`5123 ms`、端口 `5000`
+/// 都不是三位状态码。
 fn has_http_5xx_status(err: &str) -> bool {
     let b = err.as_bytes();
     (0..b.len().saturating_sub(3)).any(|i| {
@@ -356,7 +363,8 @@ fn has_http_5xx_status(err: &str) -> bool {
             && b[i + 1] == b'5'
             && b[i + 2].is_ascii_digit()
             && b[i + 3].is_ascii_digit()
-            && !b.get(i + 4).is_some_and(|c| c.is_ascii_digit())
+            // 词边界：后一位不得是数字或 ASCII 字母（`is_ascii_alphanumeric` = 二者之和）。
+            && !b.get(i + 4).is_some_and(|c| c.is_ascii_alphanumeric())
     })
 }
 
@@ -653,6 +661,33 @@ mod tests {
         assert!(!has_http_5xx_status("took 5123 ms to connect"));
         assert!(!has_http_5xx_status("端口 5000 被占用"));
         assert!(!has_http_5xx_status(""));
+        // 后一位是**字母**：`500ms` 是耗时量纲，不是三位状态码（词边界必须含字母）。
+        // 旧判据只看「后一位不是数字」⇒ 这里会被判成 5xx ⇒ 网络超时误归成上游故障。
+        assert!(!has_http_5xx_status("took 500ms to connect"));
+        assert!(!has_http_5xx_status("took 502ms"));
+        // 串尾与非字母数字分隔符仍是合法词边界：`500` 后无字符、`502` 后是空格/冒号/括号。
+        assert!(has_http_5xx_status("x 失败 500"));
+        assert!(has_http_5xx_status("x 失败 502 (Bad Gateway)"));
+    }
+
+    /// ⭐ 回归（Ver2 细节）：`took 500ms` 不得被判成 503 —— 网络超时不能归因给上游。
+    ///
+    /// 旧判据「前导空格 + 5 + 两位数字 + 后一位非数字」会让 `500ms` 里的 `500` 命中 5xx，
+    /// 于是 reqwest 的超时文案被归成 [`Fault::Upstream`]：用户被告知「与 start URL 无关，
+    /// 等 AWS 恢复」，而真正该查的是本机网络/代理（本模块铁律：只有能确证归因才归因）。
+    ///
+    /// 回退即 FAIL：把 `is_ascii_alphanumeric` 改回 `is_ascii_digit`。
+    #[test]
+    fn test_diagnose_device_auth_500ms_is_not_upstream_5xx() {
+        let d = diagnose_device_auth_all_failed(
+            6,
+            Some(
+                "register_client@us-east-1: error sending request for url (https://oidc.us-east-1.amazonaws.com/client/register): operation timed out after took 500ms to connect",
+            ),
+        );
+        assert_eq!(d.code, "NETWORK_ERROR", "500ms 是耗时量纲，不是 503");
+        assert_eq!(d.fault, Fault::Transient);
+        assert!(d.retriable, "网络问题可重试（但不该说成 AWS 侧故障）");
     }
 
     #[test]

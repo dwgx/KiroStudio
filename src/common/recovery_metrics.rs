@@ -15,12 +15,22 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
-/// at-rest 加密健康标志:true=最近一次凭据落盘符合加密开关预期(关→明文 / 开→真加密成功);
-/// false=开了加密但上次落盘因密钥文件读写失败等回退了明文(安全预期与现实不符,UI 应告警)。
+/// at-rest 加密健康标志:true=**最近一次**落盘符合加密开关预期(关→明文 / 开→真加密成功);
+/// false=开了加密但那次落盘因密钥文件读写失败等回退了明文(安全预期与现实不符,UI 应告警)。
 /// 初值 true(未落盘/未开加密时视为健康)。
+///
+/// ⚠️ 语义是 **last-writer-wins**:三个写点(凭据 / 回收站 / SOCKS 节点表)各写各的最近结果,
+/// 后一次成功写会把 false 翻回 true。**这不是缺陷而是有意取舍**——每次落盘都是整文件原子
+/// 替换,一次成功写之后磁盘上那份文件确实已是密文,此时继续报红即谎报;反过来做成
+/// 「任一文件回退过就永久置脏」的粘性标志,密钥文件修好、后续写全成功之后面板仍永远告警,
+/// 而清不掉的告警会被无视,真正的新故障反而漏掉。「历史上回退过几次」要问的是独立的
+/// 计数/时间戳——回退本身也不是无痕的:`encode_for_disk` 回退明文时会 `tracing::error!`
+/// 打出密钥文件/加密失败的原因,日志里查得到;这个布尔量不必兼职记历史。
 static AT_REST_HEALTHY: AtomicBool = AtomicBool::new(true);
 
 /// 设置 at-rest 加密健康标志(persist 时调:!enabled || 真加密成功 = true)。
+///
+/// 覆盖式写:只反映**本次**落盘的结果,后一次成功写会恢复健康(理由见上,last-writer-wins)。
 pub fn set_at_rest_healthy(healthy: bool) {
     AT_REST_HEALTHY.store(healthy, Ordering::Relaxed);
 }
@@ -71,7 +81,8 @@ macro_rules! counters {
         pub struct RecoveryMetricsSnapshot {
             /// 自进程启动以来的毫秒数(抓取端据此算速率)。
             pub uptime_ms: u64,
-            /// at-rest 加密健康:false=开了加密但上次落盘回退了明文(UI 告警用)。
+            /// at-rest 加密健康:false=开了加密但**最近一次**落盘回退了明文(UI 告警用)。
+            /// last-writer-wins:后一次成功写会恢复 true(见 `AT_REST_HEALTHY` 文档)。
             pub at_rest_healthy: bool,
             $(pub $field: u64,)*
         }
@@ -208,5 +219,31 @@ mod tests {
         assert!(json.contains("refreshOk"));
         assert!(json.contains("failoverHops"));
         assert!(json.contains("deadTokensDisabled"));
+    }
+
+    /// ⭐ 语义钉死（Ver2 R1）：本标志是 **last-writer-wins**（「最近一次落盘」），
+    /// 不是「曾经回退过」的粘性标志 —— 后一次成功写必须把 false 翻回 true。
+    ///
+    /// 为什么钉它：实现与注释曾经不一致（注释写「任一文件回退过即不健康」= 粘性，
+    /// 实现是覆盖式）。选了「实现为准」，故这里把语义固定下来，免得下次有人照着
+    /// 那句旧注释把实现改成粘性 —— 粘性标志会让密钥文件修好之后的告警永远清不掉。
+    ///
+    /// 回退即 FAIL：把 `set_at_rest_healthy` 改成只在 `healthy == false` 时写入
+    /// （粘性置脏）—— 本测试最后一条断言失败。
+    #[test]
+    fn at_rest_health_is_last_writer_wins() {
+        // 进程级全局量：本测试自取自还，不假设初值（其它用例可能已写过）。
+        let before = at_rest_healthy();
+        set_at_rest_healthy(false);
+        assert!(
+            !at_rest_healthy(),
+            "回退明文必须能被读到 —— 那是 UI 告警的唯一依据"
+        );
+        set_at_rest_healthy(true);
+        assert!(
+            at_rest_healthy(),
+            "后一次成功写必须恢复健康（last-writer-wins）；粘性标志会留下清不掉的告警"
+        );
+        set_at_rest_healthy(before);
     }
 }

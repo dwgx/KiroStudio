@@ -856,7 +856,7 @@ async fn main() {
                 .expect("adminApiKey 为空——拒绝挂载无鉴权 Admin API");
             let admin_service =
                 admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
-            let mut admin_state = admin::AdminState::new(admin_key, admin_service);
+            let mut admin_state = admin::AdminState::new(admin_service);
             // 注入用量查询句柄（未启用统计时为 None，端点返回 503）
             if let Some(handles) = &usage_handles {
                 admin_state =

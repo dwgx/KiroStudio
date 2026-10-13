@@ -485,20 +485,11 @@ impl ExternalIdpLoginManager {
         session_id: &str,
         arn: &str,
     ) -> anyhow::Result<(u64, String, String)> {
+        // ⭐ 原子认领：pending 是 **take** 出来而不是 clone 出来（理由与竞态形态见
+        // [`claim_pending`]）。认领失败的第二次调用直接报错返回，绝不再建一个号。
         let (pending, priority, custom_proxy) = {
-            let sessions = self.sessions.lock();
-            let s = sessions
-                .get(session_id)
-                .ok_or_else(|| anyhow!("外部 IdP 上号会话不存在或已过期"))?;
-            // 与 submit_leg1/submit_leg2 一致：会话超过 TTL 视为过期，禁止再建号。
-            if s.created_at.elapsed().as_secs() > SESSION_TTL_SECS {
-                bail!("外部 IdP 上号会话已超时，请重新发起");
-            }
-            let pending = s
-                .pending
-                .clone()
-                .ok_or_else(|| anyhow!("请先完成第 3 步（换取 token 并列出 profile）"))?;
-            (pending, s.priority, s.custom_proxy.clone())
+            let mut sessions = self.sessions.lock();
+            claim_pending(&mut sessions, session_id)?
         };
 
         // 防呆+防伪:选的 arn 必须确在本账号探测到的 profiles 列表里。
@@ -506,7 +497,16 @@ impl ExternalIdpLoginManager {
         // 若同账号存在其它已验活可用的 region profile，则自动改用可用的那个 ——
         // 绝不建一个必 403 的死号（单 usable 时 submit_leg2 已自动选好；此处兜住
         // 「多 profile 弹窗里误选了不可用项」）。
-        let chosen = resolve_chosen_profile(&pending.profiles, arn.trim())?;
+        let chosen = match resolve_chosen_profile(&pending.profiles, arn.trim()) {
+            Ok(c) => c,
+            Err(e) => {
+                // 回填暂存 token：本次一个号都没建，而授权码换 token 只能换一次 ——
+                // 丢掉这份 pending 就等于逼用户把两段浏览器登录整个重走一遍（他并没做错什么）。
+                let mut sessions = self.sessions.lock();
+                restore_pending(&mut sessions, session_id, pending);
+                return Err(e);
+            }
+        };
         // region 以 arn 内解析为准(chosen.region 已是白名单校验过的 arn region)。
         let region = chosen.region.clone();
 
@@ -537,11 +537,17 @@ impl ExternalIdpLoginManager {
             ..Default::default()
         };
 
-        let credential_id = self
-            .token_manager
-            .add_credential(new_cred)
-            .await
-            .context("外部 IdP 凭据加入池失败")?;
+        let credential_id = match self.token_manager.add_credential(new_cred).await {
+            Ok(id) => id,
+            Err(e) => {
+                // 回填暂存 token：入池失败是可重试的（`add_credential` 内部还要先真刷一次
+                // token，网络/代理抖动就会让它失败），回填后用户重选/重试即可，
+                // 不必重走两段登录（授权码已消费，重走是唯一出路）。
+                let mut sessions = self.sessions.lock();
+                restore_pending(&mut sessions, session_id, pending);
+                return Err(e).context("外部 IdP 凭据加入池失败");
+            }
+        };
 
         // 顺带拉一次订阅等级（失败不阻断，仅告警）。
         if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
@@ -564,6 +570,79 @@ impl ExternalIdpLoginManager {
         self.sessions
             .lock()
             .retain(|_, s| s.created_at.elapsed().as_secs() < SESSION_TTL_SECS);
+    }
+}
+
+/// ⭐ 原子认领：把会话里暂存的 leg2 产物（token + profiles + priority + 代理）**取出**。
+///
+/// # 为什么必须 take 而不是 clone（并发建号竞态）
+///
+/// 建号入口有两个，它们可能同时进来：`submit_leg2`（恰 1 个 usable 时后端自动建号）与
+/// `submit_leg2_select`（多 profile 弹窗选定）。触发条件很日常——用户双击「选定」、
+/// 前端超时重试、两个标签页各点一次。此前 `build_and_add_credential` 是 clone 一份
+/// pending 出来用，于是两次调用各持同一份 token，各自走到 `add_credential`
+/// ⇒ 同一份授权码在池里建出**两个号**。
+///
+/// 池侧的 `refreshToken` 去重**兜不住**这条竞态：`add_credential` 插池前会先真刷一次
+/// token（`refresh_token(&new_cred, …)`），而 OAuth 号每次刷新上游都**轮换**
+/// refreshToken（见 `token_manager::refresh_external_idp_token` 与写回处
+/// `apply_refresh_result_fields`）⇒ 第二份手里那份旧 token 与池中已落库的新 token
+/// 不同哈希，去重判据永远不命中。两个号还各自在 `spawn_initial_refresh` 里再轮换一次，
+/// 最终各持一份互不相同的 token，面板上无法区分，删一个另一个还在。
+///
+/// take 把「谁拿到这份 pending」压成**一次持锁内的原子判定**：第二次调用拿到 None，
+/// 直接报错返回，一个号都不会多出来。（同型竞态在 `admin/idc_login.rs` 的轮询认领里
+/// 用 `sessions.remove` + `Arc::ptr_eq` 修过，这里因为失败要能重试而用 take + 回填。）
+///
+/// 判据顺序有意为之：**先查 TTL 再 take** —— 被 TTL 拒绝的调用不该顺手把 pending 吃掉
+/// （一次**拒绝**不是一次**认领**；吃掉它，之后任何路径都再也拿不到这份 token，
+/// 而拒绝本身并不消耗任何上游资源）。
+fn claim_pending(
+    sessions: &mut HashMap<String, ExternalIdpSession>,
+    session_id: &str,
+) -> anyhow::Result<(PendingLeg2, u32, Option<ProxyConfig>)> {
+    let s = sessions
+        .get_mut(session_id)
+        .ok_or_else(|| anyhow!("外部 IdP 上号会话不存在或已过期"))?;
+    // 与 submit_leg1/submit_leg2 一致：会话超过 TTL 视为过期，禁止再建号。
+    if s.created_at.elapsed().as_secs() > SESSION_TTL_SECS {
+        bail!("外部 IdP 上号会话已超时，请重新发起");
+    }
+    let pending = s.pending.take().ok_or_else(|| {
+        // 两种读法都要说清：①用户还没走完第 3 步；②这份授权码已被另一次调用认领
+        // （并发提交 / 双击 / 重试）。只写「请先完成第 3 步」会把 ② 的用户引回一个
+        // 他明明已经做完的步骤。
+        anyhow!(
+            "该上号会话没有待建号的 token：可能尚未完成第 3 步（粘贴回调 URL），\
+             也可能这份授权码已被另一次提交认领（并发提交 / 已建号）。\
+             请在号池确认是否已建好；若要再建一个号，请重新发起上号"
+        )
+    })?;
+    Ok((pending, s.priority, s.custom_proxy.clone()))
+}
+
+/// 认领后建号失败时，把暂存的 leg2 产物**还回**会话（保住「授权码一次性、失败可重试」语义）。
+///
+/// 授权码换 token 只能换一次：pending 里的 token 是本次会话**唯一**还能建号的东西。
+/// 失败时不回填，用户就得为一次网络抖动把两段浏览器登录整个重走一遍。
+///
+/// 只在**会话仍在**且**当前没有更新的 pending** 时回填：
+/// - 会话已被成功路径移除（并发里另一次调用赢了）→ 无处可还，丢弃（不 panic）。
+/// - `submit_leg2` 并发写进了新一份 pending（用户又粘了一次新回调）→ 不覆盖更新的那份，
+///   那份带着新的授权码换来的 token，比手里这份新。
+fn restore_pending(
+    sessions: &mut HashMap<String, ExternalIdpSession>,
+    session_id: &str,
+    pending: PendingLeg2,
+) {
+    if let Some(s) = sessions.get_mut(session_id) {
+        if s.pending.is_none() {
+            s.pending = Some(pending);
+        } else {
+            tracing::debug!(
+                "上号会话已有更新的 pending，本次失败回填被丢弃（session={session_id}）"
+            );
+        }
     }
 }
 
@@ -1254,5 +1333,185 @@ mod tests {
              静默替换不可见）"
         );
         assert!(body.contains("region"), "响应必须携带 region（回显实际生效区）");
+    }
+
+    // ---------------- E-1：建号入口的原子认领（并发不得建出两个号） ----------------
+
+    /// 造一份 leg2 暂存产物（token 字段用来辨识是哪一份，其余填最小合法值）。
+    fn test_pending(token: &str) -> PendingLeg2 {
+        PendingLeg2 {
+            access_token: token.to_string(),
+            refresh_token: "rt".to_string(),
+            expires_in: 3600,
+            client_id: "cid".to_string(),
+            token_endpoint: "https://login.microsoftonline.com/tid/oauth2/v2.0/token".to_string(),
+            issuer_url: "https://login.microsoftonline.com/tid/v2.0".to_string(),
+            scopes: "openid profile offline_access".to_string(),
+            profiles: vec![ProfileOption {
+                arn: "arn:aws:codewhisperer:us-east-1:1:profile/A".to_string(),
+                region: "us-east-1".to_string(),
+                account: "1".to_string(),
+                usable: true,
+                subscription_title: None,
+            }],
+        }
+    }
+
+    /// 造一个上号会话；`age_secs` 把 created_at 拨旧（TTL 判据用）。
+    fn test_session(pending: Option<PendingLeg2>, age_secs: u64) -> ExternalIdpSession {
+        ExternalIdpSession {
+            leg1_state: "st".to_string(),
+            priority: 7,
+            proxy: None,
+            custom_proxy: Some(ProxyConfig::new("http://127.0.0.1:8080").with_auth("u", "p")),
+            leg2: None,
+            pending,
+            preferred_region: None,
+            created_at: Instant::now() - std::time::Duration::from_secs(age_secs),
+        }
+    }
+
+    /// ⭐ 承重（E-1）：同一份 pending 只能被认领**一次**，且失败后回填能让重试再认领。
+    ///
+    /// 回退即 FAIL：把 `claim_pending` 里的 `s.pending.take()` 改回 `.clone()`（本次修复
+    /// 前的形态）—— 「第二次认领必须失败」那行会拿到 Ok，两个号就建出来了；
+    /// 把回填去掉则最后一段「回填后重试应能再认领」失败（用户被迫重走两段浏览器登录）。
+    #[test]
+    fn claim_pending_is_atomic_and_restorable() {
+        let mut sessions = HashMap::new();
+        sessions.insert("s1".to_string(), test_session(Some(test_pending("tok-1")), 0));
+
+        // 第一次认领：拿到 token + priority + 显式代理，且会话里 pending 已被取走。
+        let (p1, priority, proxy) = claim_pending(&mut sessions, "s1").expect("首次认领应成功");
+        assert_eq!(p1.access_token, "tok-1");
+        assert_eq!(priority, 7);
+        assert_eq!(
+            proxy.as_ref().map(|p| p.url.as_str()),
+            Some("http://127.0.0.1:8080"),
+            "认领必须把「显式填的代理」一起带出来（它要持久化到新凭据）"
+        );
+        assert!(
+            sessions
+                .get("s1")
+                .expect("会话本身仍在")
+                .pending
+                .is_none(),
+            "认领后会话里不得再有 pending —— 否则并发第二次调用还能再建一个号"
+        );
+
+        // 第二次认领（并发提交的第二次调用走这里）：必须失败，且错误要说清是「已被认领」。
+        // （不用 `expect_err`：`PendingLeg2` 有意不 derive Debug —— 它装着 token，
+        //   与 KiroCredentials 的脱敏口径一致。）
+        let err = match claim_pending(&mut sessions, "s1") {
+            Ok(_) => panic!("pending 已被认领，第二次必须失败（否则同一份 token 会建出两个号）"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("没有待建号的 token"),
+            "错误必须说清「这份授权码已被认领」，而不是把用户引回已做完的第 3 步: {msg}"
+        );
+
+        // 建号失败 → 回填 → 重试能再认领（授权码一次性，失败必须可重试）。
+        restore_pending(&mut sessions, "s1", p1);
+        let (p2, _, _) = claim_pending(&mut sessions, "s1").expect("回填后重试应能再认领");
+        assert_eq!(p2.access_token, "tok-1", "回填的必须是同一份 token");
+    }
+
+    /// 回填的两个边界：会话已被成功路径移除 → 无处可还（不 panic）；
+    /// 会话里已有更新的 pending → 不覆盖更新的那份。
+    #[test]
+    fn restore_pending_is_conservative() {
+        // ① 会话不存在（并发里另一次调用已建号成功并 remove）→ 静默丢弃。
+        let mut empty = HashMap::new();
+        restore_pending(&mut empty, "gone", test_pending("tok-old"));
+        assert!(empty.is_empty());
+
+        // ② 会话里有更新的 pending（用户又粘了一次新回调换来的新 token）→ 保留更新的那份。
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "s1".to_string(),
+            test_session(Some(test_pending("tok-new")), 0),
+        );
+        restore_pending(&mut sessions, "s1", test_pending("tok-old"));
+        assert_eq!(
+            sessions
+                .get("s1")
+                .unwrap()
+                .pending
+                .as_ref()
+                .unwrap()
+                .access_token,
+            "tok-new",
+            "回填不得覆盖更新的 pending（那份带着新授权码换来的 token）"
+        );
+
+        // ③ 会话在且 pending 为空（本次认领取走的那份）→ 回填成功。
+        let mut sessions = HashMap::new();
+        sessions.insert("s1".to_string(), test_session(None, 0));
+        restore_pending(&mut sessions, "s1", test_pending("tok-back"));
+        assert_eq!(
+            sessions
+                .get("s1")
+                .unwrap()
+                .pending
+                .as_ref()
+                .unwrap()
+                .access_token,
+            "tok-back"
+        );
+    }
+
+    /// TTL 判据必须在 **take 之前**：过期会话即便有 pending 也不许建号，且不许把 pending 吃掉。
+    ///
+    /// 回退即 FAIL：把 `claim_pending` 里的 TTL 检查挪到 take 之后（或删掉）——
+    /// 「pending 必须原样保留」那行失败（超时提示之后用户重发会连 token 都没了）。
+    #[test]
+    fn claim_pending_rejects_expired_session_without_consuming_pending() {
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "s1".to_string(),
+            test_session(Some(test_pending("tok-1")), SESSION_TTL_SECS + 1),
+        );
+        assert!(
+            claim_pending(&mut sessions, "s1").is_err(),
+            "超时会话不得建号（与 submit_leg1/leg2 同判据）"
+        );
+        assert!(
+            sessions.get("s1").unwrap().pending.is_some(),
+            "TTL 拒绝发生在 take 之前，pending 必须原样保留"
+        );
+
+        // 未知会话：同样报错，不 panic。
+        assert!(claim_pending(&mut sessions, "nope").is_err());
+    }
+
+    /// ⭐ 源码守卫（E-1 承重）：`build_and_add_credential` 必须**认领** pending，
+    /// 且不得再出现 `pending.clone()` —— 克隆一份出来用就是「两个并发调用各持同一份
+    /// token 各自建号」的形态（行为测试覆盖不到它，因为它要网络 + 并发）。
+    ///
+    /// 回退即 FAIL：把 `claim_pending(&mut sessions, session_id)?` 换回
+    /// `s.pending.clone()`（本次修复前的原样）。
+    #[test]
+    fn build_and_add_credential_must_claim_pending_not_clone() {
+        let src = include_str!("external_idp_login.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        let fname = format!("async fn build_and_add_credential{}", "(");
+        let start = prod.find(&fname).expect("build_and_add_credential 不应被改名");
+        let rest = &prod[start..];
+        let end = rest.find("\n    fn ").unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("claim_pending("),
+            "建号必须走原子认领（claim_pending）：clone 一份 pending 出来用会让并发第二次\
+             调用用同一份 token 再建一个号"
+        );
+        // 去空白后比对，免得格式化差异（换行/缩进）绕过守卫。
+        let squashed: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            !squashed.contains(".pending.clone()"),
+            "不得 clone pending —— 那是「同一份授权码建出两个号」的竞态源头"
+        );
     }
 }

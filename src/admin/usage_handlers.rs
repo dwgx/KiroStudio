@@ -723,7 +723,7 @@ mod tests {
             r.retries = retries;
             stats.on_record(&r);
         }
-        let mut st = AdminState::new("k", mk_service());
+        let mut st = AdminState::new(mk_service());
         st.usage_stats = Some(stats);
         st
     }
@@ -828,7 +828,7 @@ mod tests {
             r.retries = retries;
             stats.on_record(&r);
         }
-        let mut st = AdminState::new("k", mk_service());
+        let mut st = AdminState::new(mk_service());
         st.usage_stats = Some(stats);
 
         let body = body_text(usage_by_outcome(State(st)).await.into_response()).await;
@@ -872,7 +872,7 @@ mod tests {
         stats.rebuild_from_logs();
         assert_eq!(stats.parse_error_count(), 1);
 
-        let mut st = AdminState::new("k", mk_service());
+        let mut st = AdminState::new(mk_service());
         st.usage_stats = Some(stats);
         let body = body_text(usage_overview(State(st)).await.into_response()).await;
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();

@@ -122,8 +122,19 @@ impl super::MultiTokenManager {
         // （refreshToken / apiKey / 代理口令），而 `encode_for_disk` 在密钥文件或 AEAD 失败时
         // 会**静默回退明文**、只返回 `encrypted=false` —— 少了这一句，trash.json 明文落盘
         // 时面板的 at-rest 健康标志仍显示正常（那一侧只被 credentials 的写入更新）。
-        // 反方向（credentials 成功覆盖 trash 的失败）无解：标志是单一全局量，取「任一文件回退
-        // 过即不健康」是更保守的一侧，宁可多报不可漏报。
+        //
+        // ⚠️ 语义是 **last-writer-wins**：本标志表达「**最近一次**落盘是否符合加密预期」，
+        // 不是「历史上有没有回退过」。后一次成功写会把标志翻回健康 —— 这是**有意**的，
+        // 不是漏掉的粘性：每次落盘都是整文件原子替换（`write_atomic`），一次成功写之后
+        // 磁盘上那份文件确实已是密文，此时继续报红就是谎报；而粘性标志一旦置脏便永不
+        // 自愈，运维修好密钥文件、后续写全部成功之后面板仍永远告警 —— 清不掉的告警会被
+        // 无视，真正的新故障反而漏掉。「曾经回退过几次」要问的是独立的计数/时间戳 ——
+        // 回退也不是无痕的（`encode_for_disk` 会 `tracing::error!` 打出失败原因），
+        // 详见 `recovery_metrics::AT_REST_HEALTHY` 文档。
+        //
+        // 残留缺口（已知且接受）：trash 回退明文、随后 credentials 成功写，会把标志翻回
+        // 健康，而 trash.json 那份明文要等它自己下一次写盘才被重新加密 —— 单一全局布尔量
+        // 表达不了逐文件的健康，故这里只承诺「最近一次落盘」这个口径。
         crate::common::recovery_metrics::set_at_rest_healthy(!enc || encrypted);
 
         // 原子写入文件。⚠️ 理由与 `persist_credentials` 同处逐字一致：不用 `block_in_place`
