@@ -189,13 +189,15 @@ impl Event {
                 // 需要看每一帧时开 debug：
                 //   RUST_LOG=info,kirostudio::kiro::model::events=debug
                 const MAX_UNKNOWN_PAYLOAD_LOG: usize = 512;
-                let payload = frame.payload_as_str();
+                // 只解码样本需要的字节（512 字符 × 最多 4 字节/字符），不为一行日志
+                // 分配整帧（上限 16MiB）。
+                let payload = frame.payload_as_str_truncated(MAX_UNKNOWN_PAYLOAD_LOG * 4);
                 let truncated: String = payload.chars().take(MAX_UNKNOWN_PAYLOAD_LOG).collect();
 
                 if first_sighting_of_unknown_event(event_type_str) {
                     tracing::warn!(
                         event_type = %event_type_str,
-                        payload_bytes = payload.len(),
+                        payload_bytes = frame.payload.len(),
                         payload_sample = %truncated,
                         "上游返回了未识别的事件类型（已忽略，不影响本次响应；\
                          同类型后续帧只记 debug，不再重复告警）"

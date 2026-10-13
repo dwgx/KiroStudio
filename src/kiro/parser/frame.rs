@@ -58,6 +58,17 @@ impl Frame {
     pub fn payload_as_str(&self) -> String {
         String::from_utf8_lossy(&self.payload).to_string()
     }
+
+    /// 只解析 payload 的**前 `max_bytes` 字节**（日志采样用）。
+    ///
+    /// 与 [`Self::payload_as_str`] 的区别是**不按整帧分配**：未知事件类型只取 512 字符样本，
+    /// 但旧写法先 `to_string()` 整帧（上限 16MiB）再 `chars().take(512)`，等于每帧未知事件
+    /// 都白分配一次整帧 String（2026-10-14 审计指出）。截断点落在 UTF-8 中间字符时
+    /// `from_utf8_lossy` 会以 U+FFFD 收尾，对日志样本无害。
+    pub fn payload_as_str_truncated(&self, max_bytes: usize) -> String {
+        let end = self.payload.len().min(max_bytes);
+        String::from_utf8_lossy(&self.payload[..end]).to_string()
+    }
 }
 
 /// 尝试从缓冲区解析一个完整的帧
@@ -174,5 +185,26 @@ mod tests {
 
         let result = parse_frame(&buffer);
         assert!(matches!(result, Err(ParseError::MessageTooSmall { .. })));
+    }
+
+    /// 审计 2026-10-14：日志采样只解码前缀，不为 512 字符样本分配整帧。
+    #[test]
+    fn payload_as_str_truncated_stops_at_cap_and_survives_split_utf8() {
+        let frame = Frame {
+            headers: Headers::new(),
+            payload: b"abcdefghij".to_vec(),
+        };
+        assert_eq!(frame.payload_as_str_truncated(4), "abcd");
+        // 上限大于实际长度 = 全量，不 panic。
+        assert_eq!(frame.payload_as_str_truncated(999), "abcdefghij");
+        // 截断点落在多字节字符中间：lossy 以 U+FFFD 收尾，不 panic、不返回半个字符。
+        let frame = Frame {
+            headers: Headers::new(),
+            payload: "中文".as_bytes().to_vec(),
+        };
+        let out = frame.payload_as_str_truncated(4);
+        assert_eq!(out.chars().count(), 2, "3 字节字符被截在中间应得 U+FFFD: {out:?}");
+        assert!(out.starts_with('中'));
+        assert!(out.ends_with('\u{FFFD}'));
     }
 }

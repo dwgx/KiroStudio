@@ -218,10 +218,10 @@ async fn run_callback_server(
         }) {
             if let Some(callback) = parse_callback(path_and_query) {
                 // Fix 1: Validate OAuth state nonce to prevent CSRF attacks.
-                // Compare using == which is constant-time for equal-length strings in Rust
-                // (different lengths short-circuit, but a forged state would need to match
-                // the exact nonce value regardless).
-                if callback.state != expected_state {
+                // ⚠️ 必须走**常量时间比较**：`!=` 在首个不同字节处短路，理论上可逐字节试出
+                // nonce（本函数文档声明的「常量时间比较」此前与实现不符，2026-10-14 审计指出）。
+                // 用全仓既有 helper：两侧先 SHA-256 成定长再 `ct_eq`，不泄漏长度。
+                if !crate::common::auth::constant_time_eq(&callback.state, &expected_state) {
                     tracing::warn!(
                         "OAuth state mismatch — possible CSRF attack (received: {:?})",
                         callback.state
