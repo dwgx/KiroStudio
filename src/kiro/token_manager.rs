@@ -1689,6 +1689,30 @@ impl CredentialEntry {
         // 账户级风控计数：漏清它会让复活的号一次风控即秒禁（见方法文档）。
         self.consecutive_suspicious = 0;
     }
+
+    /// 反饥饿时间基准刷新（单一收口）：任何池**真正选中**一个号时都必须调用一次。
+    ///
+    /// Kiro 主路径在 `commit_selection` 调用、透传池在 `select_custom_api_inner`
+    /// 的占位分支调用——两池共用本方法与 [`Self::starvation_key`]，防「一套判据
+    /// 两处各写一份」的漂移（透传池此前**完全没有**这个时间基准，见
+    /// STARVATION_PROBE_SECS：它的排序键里连键都没有）。
+    ///
+    /// ⚠️ peek 探测（`has_other_custom_api_candidate`，只问"有没有候选"、不占位）
+    /// **不**调用它：没被服务的号不该被算作"刚被选中"，否则饥饿探测会被探测本身
+    /// 喂饱、永不再触发（探测目的正是给拿不到请求的号一次机会）。
+    fn mark_selected(&self) {
+        self.last_selected_at.set(Instant::now());
+    }
+
+    /// 反饥饿排序键（单一收口，Kiro 主路径与透传池共用）：
+    /// 0 = 已饥饿（超过 [`STARVATION_PROBE_SECS`] 未被任何池真正选中）→ 强制排前
+    /// 探测一次；1 = 正常。判据用 `Instant::elapsed`（单调钟）而非墙钟——墙钟
+    /// 回拨/校时会让饥饿判定抖动，单调钟不会。
+    fn starvation_key(&self) -> u8 {
+        u8::from(
+            self.last_selected_at.get().elapsed().as_secs() < STARVATION_PROBE_SECS,
+        )
+    }
 }
 
 /// 禁用原因。
@@ -2362,6 +2386,22 @@ pub struct BalanceSnapshot {
 /// 代价：恢复最多晚 5 分钟；收益：不会在重置点刚过就撞 402 又被重新禁用
 /// （那条路径会把 `quota_exhausted_at` 盖成新月份，让启发式路径整月失效）。
 const QUOTA_RESET_GRACE_SECS: f64 = 300.0;
+
+/// 额度恢复**真值路径**的放行判定（单一收口）：上游 `nextResetAt` 已到
+/// （+[`QUOTA_RESET_GRACE_SECS`] 缓冲），且**尚未**在重置点之后复核出
+/// `remaining <= 0`（复核出 0 = 上游确认仍无额度，复活只会白撞 402）。
+///
+/// 由两处共用，防判据漂移（各写一份是历史缺陷的常见成因）：
+/// - `recover_expired_quota_disables` 的真值路径放行门；
+/// - `ids_due_for_quota_recovery_probe`（回池巡检探针名单）——本判定为 true
+///   的号只要余额复核到 `remaining > 0`，下一次恢复调用必然放行；复核到 0
+///   则被新鲜快照的守卫拦住（见 BalanceSnapshot 的 `fetched_at` 文档）。
+fn quota_truth_path_due(ts: f64, s: &BalanceSnapshot, now_epoch: f64) -> bool {
+    if now_epoch < ts + QUOTA_RESET_GRACE_SECS {
+        return false;
+    }
+    !(s.fetched_at >= ts && s.remaining_at_cache <= 0.0)
+}
 
 /// 反饥饿强制探测窗口（秒）：任何**可选**凭据超过这么久没被选中，
 /// 下一轮选号无条件排到最前，强制给它一次探测机会。
@@ -3597,11 +3637,13 @@ impl MultiTokenManager {
         let model_calls_of = |id: u64| model_calls.get(&id).copied().unwrap_or(0);
         candidates
             .into_iter()
-            // 均衡分流键(升序):⭐support_rank(正向路由) → 优先级 → 爬坡压力档 →
-            // 近 60s RPM → 模型级近期调用 → 在途 → ⭐失败余温(近 60s 上游失败过的号
-            // 降权) → ⭐显式 tie-break(id=创建序=下标序)。
-            // 8 位结构：support_rank 只进透传池，Kiro 主路径 12 位键（health_tier 起）
-            // 不碰——两池隔离铁律（设计文档 §6，守卫对齐）。
+            // 均衡分流键(升序):⭐starved(反饥饿强制探测，与 Kiro 主路径同源) →
+            // ⭐support_rank(正向路由) → 优先级 → 爬坡压力档 → 近 60s RPM →
+            // 模型级近期调用 → 在途 → ⭐失败余温(近 60s 上游失败过的号降权) →
+            // ⭐显式 tie-break(id=创建序=下标序)。
+            // 9 位结构：support_rank/starved 只进透传池，Kiro 主路径 12 位键
+            // （health_tier 起）不碰——两池隔离铁律（设计文档 §6，守卫对齐）；
+            // 但 starved 的**判据实现**与 Kiro 路径共用（CredentialEntry 方法收口）。
             // rpm/爬坡/模型级均来自上方批量预取。
             .min_by_key(|e| {
                 // ⭐ 模型支持档（2026-08-16 模型感知正向路由 S2，设计文档 §3）：
@@ -3615,6 +3657,9 @@ impl MultiTokenManager {
                 // 放**首位**（priority 之前）是有意行为变化：目录确认的号优先于配置
                 // 优先级（正向证据比静态配置更接近「该号能服务该模型」的事实）。
                 // 若线上观察到 priority 语义被过度稀释，可一行降位（设计文档 §3 兜底）。
+                // ⚠️ 2026-10-14：starved 键插到它之前（见下方 starved 注释）——
+                // 支持档仍是**软分档里的首位**，但不再压得住饥饿探测（那是结构兜底，
+                // 与 Kiro 路径「starved 在 health_tier 之前」同序）。
                 let support_rank = match model {
                     None => 1u8,
                     Some(m) => {
@@ -3644,20 +3689,41 @@ impl MultiTokenManager {
                     let (recent, total) = ramp_of(e.id);
                     crate::kiro::scheduling::ramp_tier_of(recent, total)
                 };
+                // ⭐ 反饥饿强制探测（与 Kiro 主路径**同源同判据**：共用
+                // `CredentialEntry::starvation_key` / `mark_selected`，见
+                // STARVATION_PROBE_SECS）。0 = 已饥饿 → 排到最前强制探测一次；1 = 正常。
+                //
+                // 为什么透传池必须补这条键（2026-10-14）：本池此前只有
+                // 支持档/优先级/爬坡/RPM/模型级/在途/余温/id 八位，**没有任何时间维度**。
+                // 某代挂号上游没有 `/v1/models` 端点时巡检恒失败（退避上限 30min），
+                // 该号对该模型**永久 Unknown**，排在任何 Confirmed 号之后；只要池里
+                // 有一个 Confirmed 号可选，它就永远拿不到请求 ⇒ 面板看着可用、实际
+                // 零流量，且无任何自愈路径（与 Kiro 路径历史上两次「单向状态锁死」
+                // 同型，见 STARVATION_PROBE_SECS 的说明）。
+                //
+                // 为什么排在 support_rank **之前**（首键）：若排在支持档之后，饥饿号
+                // 仍永远排在任何 Confirmed 号之后——这条键就完全不起作用（与 Kiro
+                // 路径把 starved 排在 health_tier 之前的次序同构：探测优先于软分档）。
+                // 代价是「每 STARVATION_PROBE_SECS 让一个饥饿号插队一次」，且它拿到
+                // 的是**一次探测机会**：失败会立刻被失败余温（过滤级）与冷却接住，
+                // 不会形成持续误路由；成功后 `mark_selected` 刷新基准，下一个窗口
+                // 前不再插队。
+                let starved = e.starvation_key();
                 (
-                    support_rank,                    // ① NEW 模型支持档（正向路由）
-                    e.credentials.priority,          // ② 优先级（池内首选）
-                    ramp_tier,                       // ③ 爬坡压力档
-                    rpm_of(e.id),                    // ④ 近 60s RPM
-                    model_calls_of(e.id),            // ⑤ 该模型近期调用数
-                    e.inflight.load(Ordering::Acquire), // ⑥ 在途
+                    starved,                         // ① ⭐反饥饿强制探测(0=饥饿排前)
+                    support_rank,                    // ② 模型支持档（正向路由）
+                    e.credentials.priority,          // ③ 优先级（池内首选）
+                    ramp_tier,                       // ④ 爬坡压力档
+                    rpm_of(e.id),                    // ⑤ 近 60s RPM
+                    model_calls_of(e.id),            // ⑥ 该模型近期调用数
+                    e.inflight.load(Ordering::Acquire), // ⑦ 在途
                     // ⭐ 失败余温降权位（2026-08-16 N1 根治）：近 PASSTHROUGH_FAILURE_DECAY_SECS
                     // 内上游失败（5xx/429/401/403）的号 → 1 排后，健康号优先。
                     //
                     // 为什么放倒数第二（仅 e.id tie-break 在它之后）：它是**软降权**——
-                    // 只在其余均衡维度（支持档/优先级/RPM/爬坡/在途）全平局时生效
+                    // 只在其余均衡维度（饥饿/支持档/优先级/RPM/爬坡/在途）全平局时生效
                     // （线上低负载形态正是如此：请求间隔 >60s，RPM 滑窗归零，
-                    // support_rank 同档时前 6 键全平）。RPM 有数据时仍以
+                    // support_rank 同档时它之前的键全平）。RPM 有数据时仍以
                     // 真实负载分流，避免用失败记忆压住正在真实工作的号。
                     //
                     // 为什么独立于冷却体系：`cooldown_custom_api` 被 `cooldown_enabled`
@@ -3688,6 +3754,11 @@ impl MultiTokenManager {
                     // 占位交给真正选号的那次调用；这里只回报"有候选"。
                     return (e.id, e.credentials.clone(), None);
                 }
+                // ⭐ 反饥饿时间基准刷新（与 Kiro 路径 commit_selection 同一收口，
+                // 见 CredentialEntry::mark_selected）。⚠️ 必须在**真正占位**的分支里：
+                // 漏调 → 饥饿号恒判饥饿、每轮都插队（探测变成霸占）；放进 peek 分支
+                // → 探测本身把饥饿判定喂饱，真正的探测机会永不出现。
+                e.mark_selected();
                 (
                     e.id,
                     e.credentials.clone(),
@@ -4547,9 +4618,9 @@ impl MultiTokenManager {
                     // 排在 unusable 之后：真不可用的号仍沉底，探测不绕过硬门。
                     // 排在 prio_key 之前：代价是"偶尔一个低优先级饥饿号插队一次"，
                     // 换来的是任何单向状态缺陷都不会让号被永久排除 —— 这个交换是刻意的。
-                    let starved = u8::from(
-                        e.last_selected_at.get().elapsed().as_secs() < STARVATION_PROBE_SECS,
-                    );
+                    // 判据收口在 `CredentialEntry::starvation_key`（2026-10-14 透传池
+                    // 补同源键时抽出）：两池共用同一份判据，避免各写一份后悄悄分叉。
+                    let starved = e.starvation_key();
                     // ⭐ 爬坡压力档（slew-rate）：上游惩罚**速率的跃升**，不是绝对吞吐。
                     // 判据与分档共用 `scheduling::ramp_tier_of`（与透传池同一函数，
                     // 2026-08-16 收敛防分叉）——近 `RAMP_RECENT_SECS` 折算分钟值 vs
@@ -5049,9 +5120,11 @@ impl MultiTokenManager {
         // 终态升级阈值，误判「永久故障」。
         self.consecutive_pool_unavailable
             .store(0, Ordering::Relaxed);
-        // 反饥饿探测的时间基准（见 STARVATION_PROBE_SECS）。用 Cell 而非 &mut：
-        // 本函数按既有约定收 &CredentialEntry（选号闭包里持的是不可变引用）。
-        entry.last_selected_at.set(Instant::now());
+        // 反饥饿探测的时间基准（见 STARVATION_PROBE_SECS）：收口到 `mark_selected`
+        // ——与透传池的占位分支共用同一份实现（两池各写一份正是漂移源）。
+        // 用 Cell 而非 &mut：本函数按既有约定收 &CredentialEntry
+        // （选号闭包里持的是不可变引用）。
+        entry.mark_selected();
         (entry.id, entry.credentials.clone(), guard)
     }
 
@@ -7211,8 +7284,13 @@ impl MultiTokenManager {
         result
     }
 
-    /// 懒恢复因额度耗尽（`QuotaExceeded`）被禁用的凭据：**仅启动期与「全池无候选」**
-    /// （`acquire_context` 循环内首次无号可选）两个触发点，不设后台定时任务。
+    /// 懒恢复因额度耗尽（`QuotaExceeded`）被禁用的凭据。三个触发点：
+    /// ① 启动期（`MultiTokenManager::new` 内，此时快照表尚空 ⇒ 只走启发式）；
+    /// ② 「全池无候选」（`acquire_context` 循环内首次无号可选）；
+    /// ③ **AdminService 余额刷新环里的回池巡检**（`balance_cache.rs` 的
+    ///    `sweep_quota_reset_recovery`，默认每 30 分钟一轮，对「重置点已过」的号
+    ///    **先探一次余额**再调本函数——2026-10-14 补，此前多号池只要还有健康号
+    ///    可选，被额度禁用的号在重置后不会回池、额度整月闲置）。
     ///
     /// Kiro 的 `MONTHLY_REQUEST_COUNT` 按自然月重置，因此只要当前月份不同于
     /// 判定耗尽时的月份（`quota_exhausted_at`），就应重新放回可用池；若下个月
@@ -7237,19 +7315,30 @@ impl MultiTokenManager {
     /// 只处理 `disabled && reason == QuotaExceeded` 的号，恢复后 `disabled_reason`
     /// 清空，重复调用天然跳过（`Manual` / `AccountSuspended` 等一律不碰）。
     ///
-    /// ## 探针抑制（P1-6 已实现，取代旧的「放弃」结论）
+    /// ## 探针抑制（P1-6 已实现；2026-10-14 补齐探针来源）
     ///
     /// 旧结论说余额缓存在 `AdminService.balance_cache`（私有字段）里结构上够不着，
     /// 于是退化为「不查缓存直接恢复」。现改为：把上游 `nextResetAt` 与取真值时刻
     /// 随 `BalanceSnapshot` 一起回推（`set_balance_snapshots`），本函数直接吃真值，
-    /// 无需反向引用、也无需在这里发起上游调用。30 分钟余额刷新周期本身就是探针：
-    /// 重置点刚过的下一轮刷新会把 `remaining` 更新为真值，据此在**同一周期内**恢复
-    /// （最坏晚一轮刷新）。
+    /// 无需反向引用、也无需在这里发起上游调用。
+    ///
+    /// ⚠️ 修正（2026-10-14）：此前这里写着「30 分钟余额刷新周期本身就是探针」——
+    /// 对**禁用号不成立**：温和刷新只刷未禁用号（`!e.disabled` 过滤），被额度禁用的
+    /// 号根本不会被刷 ⇒ 它的快照 `fetched_at` 恒早于重置点，下面真值路径的
+    /// 「重置点后已复核过真值且仍为 0」守卫**永远不触发**（白撞 402 拦不住）。
+    /// 现在由回池巡检（`sweep_quota_reset_recovery`）对「重置点已过」的禁用号
+    /// **主动探一次余额**（复用 get_balance 收口，探成功即把 `fetched_at` 推新），
+    /// 守卫才真正生效。
     ///
     /// `now`：判定的参考时刻，`None` = `Utc::now()`（测试传固定时刻避开月初缓冲窗口）。
     ///
     /// 返回被恢复的凭据数量。
-    fn recover_expired_quota_disables(&self, now: Option<DateTime<Utc>>) -> usize {
+    ///
+    /// `pub(crate)`（2026-10-14）：回池巡检挂在 AdminService 的余额刷新环
+    /// （`balance_cache.rs::sweep_quota_reset_recovery`）——它必须先探余额再调本函数，
+    /// 是本函数的**第三个触发点**（见上方文档）。可见性只放宽到 crate 内，
+    /// 判据/收口仍全在本模块，不放宽任何外部语义。
+    pub(crate) fn recover_expired_quota_disables(&self, now: Option<DateTime<Utc>>) -> usize {
         let now = now.unwrap_or_else(Utc::now);
         // 月初缓冲：距当月 1 日 ≥ 12h 才允许恢复（**只护无上游真值的启发式路径**）。
         // 用 day0()*24+hour() 手算（不依赖 chrono TimeZone trait / Duration 方法，版本兼容）。
@@ -7272,11 +7361,10 @@ impl MultiTokenManager {
                 {
                     // ① 上游真值路径：重置点未到不恢复；重置点之后已复核过真值且仍为 0
                     //    （remaining<=0）也不恢复——上游复核后仍无额度，复活只会白撞 402。
+                    //    判定收口在 `quota_truth_path_due`（回池巡检探针名单共用同一份，
+                    //    两处各写一份正是判据漂移的常见成因）。
                     Some((ts, s)) => {
-                        if now_epoch < ts + QUOTA_RESET_GRACE_SECS {
-                            continue;
-                        }
-                        if s.fetched_at >= ts && s.remaining_at_cache <= 0.0 {
+                        if !quota_truth_path_due(ts, &s, now_epoch) {
                             continue;
                         }
                     }
@@ -7329,6 +7417,55 @@ impl MultiTokenManager {
             }
         }
         recovered.len()
+    }
+
+    /// 「上游重置点已过、只差一次重置点后余额复核」的额度禁用号（回池巡检的探针
+    /// 名单，2026-10-14 补）。返回 id 列表（顺序 = entries 序，稳定可测）。
+    ///
+    /// # 判据（与 `recover_expired_quota_disables` 真值路径**同源**）
+    ///
+    /// - `disabled && reason == QuotaExceeded`（严格只碰额度禁用，Manual /
+    ///   AccountSuspended 等一律不进名单）；
+    /// - **非 custom_api 代挂号**（它们没有 Kiro 账号，余额探测必然失败——
+    ///   与温和刷新的排除同理由，见实现内注释）；
+    /// - 快照带 `next_reset_at`（无真值的号**不进名单**——启发式路径不需要余额
+    ///   复核，由既有恢复调用直接处理）；
+    /// - `quota_truth_path_due(...)` 为 true：本方法返回的号，只要余额复核到
+    ///   `remaining > 0`，下一次 `recover_expired_quota_disables` 必然放行；
+    ///   复核到 0 则被新鲜快照的守卫拦住（这是守卫唯一能生效的路径，见该方法文档）。
+    ///
+    /// # 为什么要单独列名单（而不是让巡检直接跑恢复函数）
+    ///
+    /// 恢复函数只吃快照、不发上游调用（设计如此：它被每请求的 `acquire_context`
+    /// 调用，绝不能带网络往返）。而禁用号的快照在禁用那一刻就冻结了（温和刷新只刷
+    /// 未禁用号）⇒ 必须由巡检层先探一次余额、把 `fetched_at` 推新，恢复函数才
+    /// 看得见「重置点之后」的读数。名单把「该探谁」的判定留在本模块，
+    /// 与恢复判据共用 `quota_truth_path_due`，两层不会各自漂移。
+    pub fn ids_due_for_quota_recovery_probe(&self, now: Option<DateTime<Utc>>) -> Vec<u64> {
+        let now = now.unwrap_or_else(Utc::now);
+        let now_epoch = now.timestamp() as f64;
+        // 快照先读后放：绝不与 entries 锁嵌套（与 recover_expired_quota_disables 同序，
+        // 避免两把锁的获取顺序反转成死锁面）。克隆成本 = 号池大小，巡检每轮至多一次。
+        let snaps = self.balance_snapshots.read().clone();
+        self.entries
+            .lock()
+            .iter()
+            .filter(|e| e.disabled && e.disabled_reason == Some(DisabledReason::QuotaExceeded))
+            // 🔴 custom_api 代挂号排除（与温和刷新 `refresh_all_balances_gently` 的
+            // 排除同理由）：它们没有 Kiro 账号，`get_usage_limits` / `web_portal` 对
+            // 它们**必然失败**——探针每轮白打一次注定失败的上游请求，正是本仓
+            // 2026-08-10 已修过的反模式。它们的额度是上游中转站的（充值即可用），
+            // 不由本仓的余额探测判定；恢复函数本身的既有行为不变（只认
+            // disabled+QuotaExceeded，代挂号沿用启动/池空触发点的原语义）。
+            .filter(|e| !e.credentials.is_custom_api_credential())
+            .filter(|e| {
+                snaps
+                    .get(&e.id)
+                    .and_then(|s| s.next_reset_at.map(|ts| (ts, *s)))
+                    .is_some_and(|(ts, s)| quota_truth_path_due(ts, &s, now_epoch))
+            })
+            .map(|e| e.id)
+            .collect()
     }
 
     /// 报告指定凭据被上游暂停/封禁。
@@ -10382,3 +10519,348 @@ mod endpoint_bypass_guard_tests;
 #[cfg(test)]
 #[path = "token_manager_tests.rs"]
 mod tests;
+
+// ===== 2026-10-14：配额重置回池探针名单 + 透传池反饥饿（本轮改动回归） =====
+//
+// ⚠️ 为什么内联在本文件尾而不是 token_manager_tests.rs：本轮改动被限定只动
+// token_manager.rs / balance_cache.rs 两个文件，故用例内联在文件尾。
+// 对既有源码守卫无影响——守卫按**第一个** `#[cfg(test)]` 截断生产段
+// （本模块在 `mod tests;` 之后，截断点不变）。
+#[cfg(test)]
+mod quota_recovery_and_starvation_tests {
+    use super::*;
+
+    /// 固定参考时刻（2026-08-15，距 8 月 1 日 ≥ 12h，避开月初缓冲窗口）——
+    /// 与 token_manager_tests.rs 的 fixed_recovery_now 同款，测试不依赖真实日期。
+    fn fixed_now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-08-15T12:00:00Z")
+            .expect("固定测试时刻恒合法")
+            .with_timezone(&Utc)
+    }
+
+    /// 造一个「已禁用 + QuotaExceeded」的凭据。
+    fn mk_quota_cred(id: u64) -> KiroCredentials {
+        let mut c = KiroCredentials::default();
+        c.id = Some(id);
+        c.access_token = Some(format!("tok-{id}"));
+        c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        c.disabled = true;
+        c.disabled_reason = Some(DisabledReason::QuotaExceeded);
+        c
+    }
+
+    /// `MultiTokenManager::new` 会跑启动期恢复（缺失时间戳的额度禁用号当场复活），
+    /// 所以要在 new 之后显式重置回禁用态再做断言（与 token_manager_tests.rs 同款）。
+    fn re_set_quota_disabled(manager: &MultiTokenManager, id: u64) {
+        let mut entries = manager.entries.lock();
+        let e = entries.iter_mut().find(|e| e.id == id).unwrap();
+        e.disabled = true;
+        e.disabled_reason = Some(DisabledReason::QuotaExceeded);
+        e.quota_exhausted_at = None;
+        e.failure_count = 0;
+    }
+
+    fn snap(next_reset_at: Option<f64>, fetched_at: f64, remaining: f64) -> BalanceSnapshot {
+        BalanceSnapshot {
+            remaining_at_cache: remaining,
+            effective_limit: 100.0,
+            credits_used_at_cache: 0.0,
+            next_reset_at,
+            fetched_at,
+        }
+    }
+
+    fn mk_custom(id: u64) -> KiroCredentials {
+        let mut c = KiroCredentials::default();
+        c.id = Some(id);
+        c.auth_method = Some("custom_api".to_string());
+        c.base_url = Some(format!("https://relay{id}.example.invalid"));
+        c.api_key = Some(format!("sk-relay-{id}"));
+        c
+    }
+
+    /// 探针名单判据（回池巡检 P0 的核心）：逐条钉住「谁该被探一次余额」。
+    ///
+    /// 判据必须与 `recover_expired_quota_disables` 真值路径放行门同源——
+    /// 名单里的号只要复核到 remaining > 0，下一次恢复调用必然放行（下一条测试钉这半句）；
+    /// 不在名单里的号各有理由，逐条对照防「名单放宽/收窄」的静默回归。
+    #[test]
+    fn quota_probe_list_gating_matches_recovery_gate() {
+        let now = fixed_now();
+        let now_epoch = now.timestamp() as f64;
+        let past = now_epoch - 3600.0; // 重置点：1 小时前（+GRACE 已过）
+        let stale = now_epoch - 7200.0; // 快照早于重置点（禁用时冻结的读数）
+        let fresh = now_epoch; // 快照取自重置点之后
+
+        let mut manual = mk_quota_cred(3);
+        manual.disabled_reason = Some(DisabledReason::Manual);
+        // #6 代挂号（custom_api）+ QuotaExceeded 禁用 + 同样到期的快照 → 不进名单：
+        // 探针会对它白打一次必然失败的上游请求（见名单实现的排除注释）。
+        let mut relay = mk_custom(6);
+        relay.disabled = true;
+        relay.disabled_reason = Some(DisabledReason::QuotaExceeded);
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                mk_quota_cred(1),
+                mk_quota_cred(2),
+                manual,
+                mk_quota_cred(4),
+                mk_quota_cred(5),
+                relay,
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        // #3 保持 Manual；其余五个重置回「QuotaExceeded 禁用」态。
+        for id in [1u64, 2, 4, 5, 6] {
+            re_set_quota_disabled(&manager, id);
+        }
+        manager.set_balance_snapshots(HashMap::from([
+            // #1 重置点已过、快照停在重置点之前 → 待复核，必须进名单。
+            (1u64, snap(Some(past), stale, 0.0)),
+            // #2 重置点之后已复核过真值且仍为 0 → 不进（免得每轮白探；恢复守卫会拦）。
+            (2u64, snap(Some(past), fresh, 0.0)),
+            // #3 Manual 禁用 → 不进（严格只碰 QuotaExceeded）。
+            (3u64, snap(Some(past), stale, 0.0)),
+            // #4 重置点还没到 → 不进（提前复活只会白撞 402）。
+            (4u64, snap(Some(now_epoch + 3600.0), fresh, 0.0)),
+            // #5 上游未下发 nextResetAt → 不进（启发式路径不需要余额复核）。
+            (5u64, snap(None, fresh, 0.0)),
+            // #6 代挂号 → 不进（余额探测对它必然失败）。
+            (6u64, snap(Some(past), stale, 0.0)),
+        ]));
+
+        assert_eq!(
+            manager.ids_due_for_quota_recovery_probe(Some(now)),
+            vec![1u64],
+            "只有「重置点已过且尚未在重置点后复核出 0」的非代挂 QuotaExceeded 号进探针名单"
+        );
+    }
+
+    /// 回池巡检的承重语义（与 `balance_cache.rs::sweep_quota_reset_recovery` 的
+    /// 实际顺序逐条对齐）：
+    ///
+    /// ① 正例：待复核号（快照停在重置点之前）+ 时间门已过 → **不落盘任何新读数**、
+    ///    直接调恢复路径就必须放行（探到的正读数只用于判定——先落盘会把
+    ///    `nextResetAt` 推进到下一周期、把号永久钉死，见 ③）；
+    /// ② 反例：复核到 0 → 零读数落盘（证据）→ 恢复函数必须拦住它，且它退出探针名单；
+    /// ③ 顺序守卫：若把探到的新读数先落盘（新读数 `nextResetAt` = 下一周期），
+    ///    恢复必须**不**放行——这正是巡检「先探不落」的原因。
+    #[test]
+    fn quota_probe_then_recovery_recovers_only_fresh_positive() {
+        let now = fixed_now();
+        let now_epoch = now.timestamp() as f64;
+        let past = now_epoch - 3600.0;
+        let stale = now_epoch - 7200.0;
+
+        // 场景 A：正例（sweep 的真实顺序：先探不落 → 直接调恢复）。
+        {
+            let manager = MultiTokenManager::new(
+                Config::default(),
+                vec![mk_quota_cred(1)],
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+            re_set_quota_disabled(&manager, 1);
+            manager.set_balance_snapshots(HashMap::from([(
+                1u64,
+                snap(Some(past), stale, 0.0),
+            )]));
+            assert_eq!(
+                manager.ids_due_for_quota_recovery_probe(Some(now)),
+                vec![1u64],
+                "前置：重置点已过、快照未复核 → 必须在探针名单里"
+            );
+            // 探测只判定、不落盘：快照保持原样 → 时间门放行 → 回池。
+            assert_eq!(
+                manager.recover_expired_quota_disables(Some(now)),
+                1,
+                "探到余额后调既有恢复路径必须放行（快照未落盘，时间门按旧重置点判）"
+            );
+            assert!(
+                !manager.entries.lock().iter().find(|e| e.id == 1).unwrap().disabled
+            );
+        }
+
+        // 场景 B：反例（sweep 对零读数的处理 = 落盘成新鲜零读数 → 拦住 + 退出名单）。
+        {
+            let manager = MultiTokenManager::new(
+                Config::default(),
+                vec![mk_quota_cred(1)],
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+            re_set_quota_disabled(&manager, 1);
+            manager.set_balance_snapshots(HashMap::from([(
+                1u64,
+                snap(Some(past), now_epoch, 0.0),
+            )]));
+            assert!(
+                manager.ids_due_for_quota_recovery_probe(Some(now)).is_empty(),
+                "重置点后已复核出 0 的号不得再进探针名单"
+            );
+            assert_eq!(
+                manager.recover_expired_quota_disables(Some(now)),
+                0,
+                "重置点后复核仍为 0 的号不得恢复（守卫生效）"
+            );
+            assert!(
+                manager.entries.lock().iter().find(|e| e.id == 1).unwrap().disabled
+            );
+        }
+
+        // 场景 C：顺序守卫——先把探到的正读数落盘（nextResetAt 已是下一周期）→
+        // 时间门会判「重置点未到」而拒绝恢复。把巡检改回 get_balance（先落盘）即
+        // 回到这条死锁；本测试钉住「先探不落」的顺序契约。
+        {
+            let manager = MultiTokenManager::new(
+                Config::default(),
+                vec![mk_quota_cred(1)],
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+            re_set_quota_disabled(&manager, 1);
+            manager.set_balance_snapshots(HashMap::from([(
+                1u64,
+                snap(Some(now_epoch + 86400.0), now_epoch, 42.0),
+            )]));
+            assert_eq!(
+                manager.recover_expired_quota_disables(Some(now)),
+                0,
+                "新读数把重置点推进到下一周期后，恢复必须被时间门挡住——\
+                 所以巡检探测绝不能先落盘（这正是「先探不落」的原因）"
+            );
+        }
+    }
+
+    /// 反饥饿键本身：新鲜 = 正常(1)，超窗 = 饥饿(0)，`mark_selected` 把它翻回来。
+    #[test]
+    fn starvation_key_flips_after_probe_window_and_mark_resets_it() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![mk_custom(1)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let entries = manager.entries.lock();
+        let e = entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(e.starvation_key(), 1, "刚构造的号视为刚被选中（乐观），不得判饥饿");
+        e.last_selected_at
+            .set(Instant::now() - StdDuration::from_secs(STARVATION_PROBE_SECS + 60));
+        assert_eq!(e.starvation_key(), 0, "超过探测窗口未被选中 → 必须判饥饿");
+        e.mark_selected();
+        assert_eq!(e.starvation_key(), 1, "mark_selected 必须把时间基准翻新");
+    }
+
+    /// 透传池反饥饿（本轮修复的承重行为）：饥饿的 Unknown 号必须能反超 Confirmed 号
+    /// 拿到一次探测机会；且选中后时间基准被刷新（不刷新 = 探测变霸占）。
+    ///
+    /// 旧代码为何失败：透传键没有任何时间维度，Unknown 号永远排在任何 Confirmed
+    /// 号之后——只要有一个 Confirmed 号可选，它就永远拿不到请求（容量零流量）。
+    /// 把 `starved` 键从元组删掉（模拟旧代码），第二条断言必 FAILED。
+    #[test]
+    fn passthrough_starved_unknown_beats_confirmed() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![mk_custom(1), mk_custom(2)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        // #1 目录确认支持该模型（Confirmed）；#2 无目录数据（Unknown，模拟
+        // 上游没有 /v1/models 端点、巡检恒失败的中转站）。
+        manager.model_catalog_cache.lock().insert(
+            1,
+            ModelCatalogEntry {
+                models: vec!["gpt-5.6-sol".to_string()],
+                refreshed_at: Instant::now(),
+            },
+        );
+        let empty = HashSet::new();
+
+        // 对照：都不饥饿 → Confirmed 的 #1 胜出（支持档仍是软分档首位）。
+        let sel = manager
+            .select_custom_api(&empty, Some("gpt-5.6-sol"))
+            .expect("池内必有候选");
+        assert_eq!(sel.0, 1, "无饥饿时 Confirmed 号必须优先于 Unknown 号");
+        drop(sel.2);
+
+        // #2 打成已饥饿 → 必须反超 Confirmed 的 #1（一次强制探测机会）。
+        {
+            let entries = manager.entries.lock();
+            let e2 = entries.iter().find(|e| e.id == 2).unwrap();
+            e2.last_selected_at
+                .set(Instant::now() - StdDuration::from_secs(STARVATION_PROBE_SECS + 60));
+        }
+        let sel2 = manager
+            .select_custom_api(&empty, Some("gpt-5.6-sol"))
+            .expect("池内必有候选");
+        assert_eq!(
+            sel2.0, 2,
+            "饥饿的 Unknown 号必须拿到一次探测机会（旧代码永远排在 Confirmed 之后）"
+        );
+        drop(sel2.2);
+
+        // 选中即刷新时间基准：漏调 → 饥饿号恒判饥饿、每轮都插队（探测变霸占）。
+        {
+            let entries = manager.entries.lock();
+            let e2 = entries.iter().find(|e| e.id == 2).unwrap();
+            assert_eq!(
+                e2.starvation_key(),
+                1,
+                "透传池选中后必须刷新 last_selected_at（与 Kiro 路径 mark_selected 同一收口）"
+            );
+        }
+
+        // 下一轮：不再饥饿 → 回到 Confirmed 优先（#2 不得连续霸占）。
+        let sel3 = manager
+            .select_custom_api(&empty, Some("gpt-5.6-sol"))
+            .expect("池内必有候选");
+        assert_eq!(sel3.0, 1, "探测窗口内饥饿号不得连续霸占（mark_selected 必须生效）");
+    }
+
+    /// 透传池 peek（`has_other_custom_api_candidate`）**不得**刷新饥饿基准：
+    /// 探测本身不代表有请求被服务，否则饥饿判定被探测喂饱、真探测机会永不出现。
+    #[test]
+    fn passthrough_peek_does_not_refresh_starvation_baseline() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![mk_custom(1)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        {
+            let entries = manager.entries.lock();
+            let e = entries.iter().find(|e| e.id == 1).unwrap();
+            e.last_selected_at
+                .set(Instant::now() - StdDuration::from_secs(STARVATION_PROBE_SECS + 60));
+            assert_eq!(e.starvation_key(), 0, "前置：先打成饥饿");
+        }
+        let empty = HashSet::new();
+        assert!(
+            manager.has_other_custom_api_candidate(&empty, Some("gpt-5.6-sol")),
+            "前置：peek 应看到候选"
+        );
+        let entries = manager.entries.lock();
+        let e = entries.iter().find(|e| e.id == 1).unwrap();
+        assert_eq!(
+            e.starvation_key(),
+            0,
+            "peek 不占位、不代表请求被服务，绝不能刷新饥饿基准"
+        );
+    }
+}

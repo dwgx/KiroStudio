@@ -50,6 +50,40 @@ pub(super) struct CachedBalance {
     pub(super) data: BalanceResponse,
 }
 
+/// 回池巡检（`sweep_quota_reset_recovery`）单次探测读数的分类。
+///
+/// 判据只有一条轴：**是否拿到「重置点之后」的新读数**，以及新读数里还有没有余额。
+/// 单独成枚举 + 纯函数是为了可测（探测本身要打上游，判据不必跟着打）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum QuotaProbeReading {
+    /// 重置点后的新鲜真值且 `remaining > 0` → 该号可回池（由既有恢复路径放行）。
+    FreshPositive,
+    /// 重置点后的新鲜真值但 `remaining <= 0` → 保持禁用（新鲜快照让恢复守卫拦住）。
+    FreshZero,
+    /// 超时降级（`stale=true` 的旧缓存）或探测失败 → **没拿到新读数**。
+    ///
+    /// 与 `FreshZero` 必须分开：旧缓存可能早于重置点，拿它当「重置后仍无余额」
+    /// 会误杀；拿它当「仍有余额」更糟（方向反了）。它只意味着「本轮无结论」。
+    Unresolved,
+}
+
+/// 单次探测读数分类（纯函数，判据见 [`QuotaProbeReading`] 的文档）。
+///
+/// 巡检用 `AdminService::fetch_balance` 探测（不落盘版取数），所以生产
+/// 形态是 `Ok(stale=false)` / `Err` 两种；`Ok(stale=true)` 是 `get_balance` 的
+/// 超时降级形态，保留在判据里做**防御**（将来若有人把探测换回 `get_balance`，
+/// 旧缓存不会被误当新读数——有测试钉住这条）。
+fn classify_quota_probe_reading(
+    result: &Result<BalanceResponse, AdminServiceError>,
+) -> QuotaProbeReading {
+    match result {
+        Ok(b) if !b.stale && b.remaining > 0.0 => QuotaProbeReading::FreshPositive,
+        Ok(b) if !b.stale => QuotaProbeReading::FreshZero,
+        // 超时降级（stale=true 的旧缓存）与硬错误：都没拿到新读数。
+        Ok(_) | Err(_) => QuotaProbeReading::Unresolved,
+    }
+}
+
 impl super::AdminService {
     /// 获取凭据余额（带缓存 + 上游超时降级）
     ///
@@ -383,6 +417,12 @@ impl super::AdminService {
                 .collect()
         };
 
+        // ⭐ 配额重置回池巡检（P0，2026-10-14）：放在温和刷新**之前**、空列表早退
+        // **之前**——全池都因额度禁用时 `ids` 为空，那正是最需要回池巡检的形态。
+        // 放在 `ids` 快照之后：本轮刚复活的号不进本轮温和刷新名单——避免同一周期内
+        // 对同一个号连打两次上游（巡检已经探过它一次）；它的余额下一轮正常刷新落盘。
+        self.sweep_quota_reset_recovery(spacing_secs).await;
+
         if ids.is_empty() {
             return;
         }
@@ -480,6 +520,165 @@ impl super::AdminService {
         let mut fresh = HashSet::new();
         fresh.insert(cache_key);
         self.push_balance_snapshots_to_scheduler(&fresh);
+    }
+
+    // ============ 配额重置回池巡检（P0，2026-10-14） ============
+
+    /// 配额重置后的**自动回池**巡检：对「禁用原因=QuotaExceeded 且上游重置点
+    /// + token_manager 的 GRACE 缓冲已过」的号主动探一次余额，仅当复核到
+    /// `remaining > 0` 才调既有恢复路径（`recover_expired_quota_disables`，
+    /// 严格只碰 QuotaExceeded）。
+    ///
+    /// # 修的是什么（对照）
+    ///
+    /// 既有恢复函数只在①启动期、②全池无候选时被调——多号池里只要还有健康号可选，
+    /// 被额度禁用的号在下个账期重置后**不会自动回池**（额度整月闲置、面板一直显示
+    /// 已禁用，直到手动启用或池子被打空）。而它的真值路径守卫
+    /// （「重置点后已复核仍为 0 则不恢复」）也永远触发不了：温和刷新只刷未禁用号
+    /// （`!e.disabled` 过滤），禁用号的快照在禁用那刻就冻结了。
+    ///
+    /// # 为什么挂在这里（照抄既有周期机制的挂法）
+    ///
+    /// 本方法由 [`Self::refresh_all_balances_gently`] 调用，而后者由 `service.rs` 的
+    /// **受管后台任务**（`respawn_balance_task`，间隔 = `balance_refresh_interval_secs`，
+    /// 默认 30 分钟）驱动——不新起裸线程，频率与展示刷新同源、可热调、进程退出即停。
+    /// 探测复用既有余额链路（[`Self::fetch_balance`] = `get_balance` 的取数内核 +
+    /// 同一个 6s 超时闸门），**不另写上游调用**。
+    ///
+    /// # 🔴 为什么探测**不**走 `get_balance`（顺序是承重的）
+    ///
+    /// `get_balance` 成功即落缓存 + 回推快照（`commit_fresh_balance`）。而恢复函数
+    /// 的时间门吃的是快照里的 `nextResetAt`——那是**禁用时冻结**的「本周期重置点」。
+    /// 一旦把探到的新读数先推回，新读数的 `nextResetAt` 已经推进到**下一**个周期
+    /// （如 11-01 探到 12-01），时间门会误判「重置点还没到」而把号**永久钉死**
+    /// （due 名单也会把它排除）——恰好是本修复要防的死锁。所以顺序固定为：
+    ///
+    /// 1. **先探不落**：拿到新读数只用于判定，不写缓存/快照；
+    /// 2. 复核到 `remaining <= 0`（新鲜零读数）→ 落盘留**证据**（走
+    ///    `commit_fresh_balance` 收口）：此后恢复函数的守卫（`fetched_at >=
+    ///    nextResetAt && remaining <= 0`）与 due 名单都会拦住它，不再每轮白探；
+    /// 3. 复核到 `remaining > 0` → 调既有恢复路径（此时快照仍是旧值，时间门放行）；
+    ///    恢复成功回池后，新读数由下一轮温和刷新正常落盘（≤30 分钟，与本仓既有
+    ///    「恢复后不立即重探」的节奏一致）。
+    ///
+    /// 超时/失败**不给旧值降级**：旧读数早于重置点，拿它当复核结论方向反了——
+    /// 一律算「本轮没拿到新读数」，下轮重试。
+    ///
+    /// # 频率与成本（为什么不会变成探测风暴）
+    ///
+    /// - 待复核名单（`ids_due_for_quota_recovery_probe`）把「重置点未到」与
+    ///   「重置点后已复核出 0」的号都排除——**同一个号一个重置周期最多被多探一次**：
+    ///   复核到 > 0 → 恢复回池；复核到 0 → 零读数落盘、退出名单；探测失败 → 下轮重试。
+    /// - 逐个探测、每个之间 sleep `spacing_secs`（与温和刷新同款打散节奏），
+    ///   绝不并发打上游；上限 = 池内待复核号数（正常运维下是个位数）。
+    /// - 一轮周期（默认 30 分钟）才跑一次，探测次数远低于展示刷新本身的调用量。
+    ///
+    /// # 返回
+    ///
+    /// 本轮复核到「重置点后仍有余额」的号数（供调用方按需记录；恢复数另在日志里）。
+    ///
+    /// # 已知边界（残余风险，报告同款）
+    ///
+    /// ① 本轮若存在探测失败的号且至少一个号复核到余额，恢复收口是全表扫描，那些
+    ///    未复核号会被时间门一并放行（见上方收口处的注释）；
+    /// ② `fresh_positive == 0` 时本轮不调收口 ⇒ **无真值的启发式号**在本轮也不恢复
+    ///    （它们不需要余额复核）。实际影响很小：due 只在「重置点刚过的复核窗口」
+    ///    非空，其余周期 due 为空、走上面那条分支正常处理；最坏晚一个周期。
+    pub(super) async fn sweep_quota_reset_recovery(&self, spacing_secs: u64) -> usize {
+        // 待复核名单的判据收口在 token_manager（与恢复函数共用同一份放行门，
+        // 见 `ids_due_for_quota_recovery_probe` 的文档）——这里不做任何判据复制。
+        let due = self.token_manager.ids_due_for_quota_recovery_probe(None);
+        if due.is_empty() {
+            // 没有待复核号（只剩「无真值」的启发式号，或所有真值号都已复核过）：
+            // 直接跑一次既有恢复检查——零上游调用、纯内存扫描，让启发式路径也拿到
+            // 周期触发（此前它同样只在启动/池空时跑，多号池里整月不回池）。
+            let recovered = self.token_manager.recover_expired_quota_disables(None);
+            if recovered > 0 {
+                tracing::info!(
+                    "回池巡检：额度耗尽凭据恢复 {} 个（无待复核号，走既有判据）",
+                    recovered
+                );
+            }
+            return 0;
+        }
+
+        let spacing = std::time::Duration::from_secs(spacing_secs.max(1));
+        let mut fresh_positive = 0usize;
+        let mut unresolved = 0usize;
+        for (idx, id) in due.iter().copied().enumerate() {
+            // 打散节奏：从第二个开始，每个之间先 sleep（与温和刷新同款）。
+            if idx > 0 {
+                tokio::time::sleep(spacing).await;
+            }
+            // 超时闸门与面板同源（BALANCE_UPSTREAM_TIMEOUT_SECS）：后台任务绝不
+            // 无限等上游；超时归一成与 `get_balance` 无缓存降级时同一个错误。
+            let reading = match tokio::time::timeout(
+                std::time::Duration::from_secs(BALANCE_UPSTREAM_TIMEOUT_SECS),
+                self.fetch_balance(id),
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(_elapsed) => Err(AdminServiceError::UpstreamTimeout(id)),
+            };
+            match classify_quota_probe_reading(&reading) {
+                QuotaProbeReading::FreshPositive => {
+                    fresh_positive += 1;
+                    tracing::info!(
+                        credential_id = id,
+                        "回池巡检：重置点后复核到余额，交既有恢复路径放行（读数不先落盘，见方法文档）"
+                    );
+                }
+                QuotaProbeReading::FreshZero => {
+                    // 新鲜零读数是**证据**：落盘（走既有收口，顺带更新面板展示）后，
+                    // 恢复函数的守卫与 due 名单都会拦住该号——不落盘会让它每轮都被
+                    // 白探一次，也失去了「上游复核后仍无额度」这个判据。
+                    if let Ok(balance) = reading {
+                        self.commit_fresh_balance(self.balance_cache_key(id), balance);
+                    }
+                    tracing::info!(
+                        credential_id = id,
+                        "回池巡检：重置点后复核仍无余额（remaining<=0），零读数已落盘留证，保持禁用"
+                    );
+                }
+                QuotaProbeReading::Unresolved => {
+                    unresolved += 1;
+                    tracing::warn!(
+                        credential_id = id,
+                        "回池巡检：余额探测未取得新读数（超时/失败，不给旧值降级），本轮不算复核过"
+                    );
+                }
+            }
+        }
+
+        if fresh_positive == 0 {
+            // 严格门：一个「重置点后仍有余额」的读数都没拿到 → 本轮不调恢复收口。
+            // 复核到 0 的号本就该保持禁用（零读数已落盘为证）；未取得新读数的号
+            // 保留旧读数、下轮重试——绝不能借时间门复活（旧读数早于重置点，
+            // 那正是「白撞 402」的成因，也是本巡检相对「时间到就恢复」的增量价值）。
+            tracing::info!(
+                due = due.len(),
+                unresolved = unresolved,
+                "回池巡检：本轮未复核到余额，保持现状（探测失败的下轮重试）"
+            );
+            return 0;
+        }
+
+        // 收口调既有恢复路径：此时正例号的快照仍是旧值（时间门放行）→ 这一步真正
+        // 回池；复核到 0 的号已被新鲜零读数拦住（有测试钉住）。⚠️ 已知边界：本调用
+        // 是全表扫描，若本轮另有探测失败的号（unresolved>0），它的旧读数同样早于
+        // 重置点、守卫不拦，会被时间门一并放行——这是既有恢复函数在启动/池空触发点
+        // 同款的语义（nextResetAt 是上游真值，探测失败不应把号钉死），代价至多一次
+        // 白撞 402 后被重新禁用；要彻底关掉这条口子需改恢复函数签名，本轮不做
+        // （保持单一收口）。
+        let recovered = self.token_manager.recover_expired_quota_disables(None);
+        tracing::info!(
+            "回池巡检：复核 {} 个待复核号、命中 {} 个有余额，恢复 {} 个额度耗尽凭据",
+            due.len(),
+            fresh_positive,
+            recovered
+        );
+        fresh_positive
     }
 
     // ============ 余额缓存持久化 ============
@@ -584,5 +783,145 @@ impl super::AdminService {
             }
             Err(e) => tracing::warn!("序列化余额缓存失败: {}", e),
         }
+    }
+}
+
+// ===== 2026-10-14：配额重置回池巡检（本轮改动回归） =====
+//
+// ⚠️ 内联在本文件尾的理由见 token_manager.rs 同款模块的说明（本轮改动被限定
+// 只动 token_manager.rs / balance_cache.rs 两个文件）。源码守卫按**第一个**
+// `#[cfg(test)]` 截断生产段——本模块在文件尾，生产段截断点不变。
+#[cfg(test)]
+mod quota_recovery_sweep_tests {
+    use super::*;
+
+    fn mk_balance(remaining: f64, stale: bool) -> BalanceResponse {
+        BalanceResponse {
+            id: 1,
+            subscription_title: None,
+            current_usage: 0.0,
+            usage_limit: 100.0,
+            remaining,
+            usage_percentage: 0.0,
+            next_reset_at: None,
+            overage_enabled: false,
+            overage_cap: 0.0,
+            effective_limit: 100.0,
+            stale,
+            optimistic: false,
+        }
+    }
+
+    /// 读数分类（纯函数）：只有「新鲜且 remaining>0」才允许触发恢复收口；
+    /// 新鲜零余额与超时降级（stale=true 的旧缓存）/硬错误都不允许。
+    ///
+    /// stale 那条是承重的：超时降级返回的旧缓存可能带着禁用前的旧余额数字，
+    /// 若把它当「复核到余额」，就会用重置点**之前**的读数放行恢复——方向反了。
+    #[test]
+    fn classify_quota_probe_reading_gates_on_fresh_positive() {
+        assert_eq!(
+            classify_quota_probe_reading(&Ok(mk_balance(42.0, false))),
+            QuotaProbeReading::FreshPositive,
+            "重置点后的新鲜正余额 → 可恢复"
+        );
+        assert_eq!(
+            classify_quota_probe_reading(&Ok(mk_balance(0.0, false))),
+            QuotaProbeReading::FreshZero,
+            "重置点后复核仍为 0 → 保持禁用（恢复守卫会拦）"
+        );
+        assert_eq!(
+            classify_quota_probe_reading(&Ok(mk_balance(42.0, true))),
+            QuotaProbeReading::Unresolved,
+            "超时降级（stale=true 的旧缓存）不算新读数——哪怕数字看着有余额"
+        );
+        assert_eq!(
+            classify_quota_probe_reading(&Err(AdminServiceError::UpstreamTimeout(1))),
+            QuotaProbeReading::Unresolved,
+            "硬错误 → 没拿到新读数，本轮不得据此恢复"
+        );
+    }
+
+    /// 源码守卫（接线）：温和刷新必须调用回池巡检，且调用点必须在
+    /// `if ids.is_empty()` 早退**之前**——全池都因额度禁用时 ids 为空，
+    /// 巡检若排在早退之后，恰好会漏掉最需要回池的形态。
+    ///
+    /// needle 运行时拼接（本仓守卫纪律：守卫测试不写被守卫代码字面量，
+    /// 否则 include_str! 会把测试自己的文本也读进来）。
+    #[test]
+    fn quota_sweep_is_wired_before_early_return_in_gentle_refresh() {
+        let src = include_str!("balance_cache.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        let body = prod
+            .split("pub async fn refresh_all_balances_gently")
+            .nth(1)
+            .expect("refresh_all_balances_gently 不应被改名")
+            .split("fn commit_fresh_balance")
+            .next()
+            .expect("commit_fresh_balance 应紧随其后");
+        let sweep_call = format!("self.sweep_{}_reset_recovery(", "quota");
+        let early_return = format!("if ids.{}() {{", "is_empty");
+        let sweep_at = body.find(sweep_call.as_str()).expect(
+            "温和刷新必须调用回池巡检（sweep_quota_reset_recovery）——删掉它等于回池修复整体失效",
+        );
+        let return_at = body
+            .find(early_return.as_str())
+            .expect("空列表早退不应被改名（本守卫锚点）");
+        assert!(
+            sweep_at < return_at,
+            "回池巡检必须排在空列表早退之前：全池因额度禁用时 ids 为空，\
+             那正是最需要回池巡检的形态（排在早退后 = 恰好漏掉它）"
+        );
+    }
+
+    /// 源码守卫：巡检必须复用既有链路——探测走 `get_balance(force=true)` 收口、
+    /// 恢复走既有 `recover_expired_quota_disables`、名单走 token_manager 的同一
+    /// 判据收口，不得另写上游调用或第二套判据（那正是判据漂移的源头）。
+    #[test]
+    fn quota_sweep_reuses_existing_balance_and_recovery_paths() {
+        let src = include_str!("balance_cache.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        let body = prod
+            .split("pub(super) async fn sweep_quota_reset_recovery")
+            .nth(1)
+            .expect("sweep_quota_reset_recovery 不应被改名")
+            .split("fn load_balance_cache_from")
+            .next()
+            .expect("load_balance_cache_from 应紧随其后");
+        // 探针必须走既有取数内核（fetch_balance）+ 同源超时闸门；且**不**得把
+        // 读数先落盘（顺序是承重的：见方法文档的「为什么探测不走 get_balance」）。
+        let probe = format!("self.fetch_{}(id)", "balance");
+        assert!(
+            body.contains(&probe),
+            "巡检必须复用既有余额取数链路（fetch_balance），不得另写上游调用"
+        );
+        let timeout = format!("BALANCE_UPSTREAM_{}_SECS", "TIMEOUT");
+        assert!(
+            body.contains(&timeout),
+            "巡检必须带与面板同源的超时闸门（后台任务绝不无限等上游）"
+        );
+        let forbid_commit_first = format!("self.get_{}(id, true)", "balance");
+        assert!(
+            !body.contains(&forbid_commit_first),
+            "巡检不得走 get_balance（它成功即推新快照，会把恢复时间门的 nextResetAt \
+             推进到下一周期 → 号被永久钉死；顺序必须「先探不落」）"
+        );
+        let recover = format!(
+            "self.token_manager.{}",
+            "recover_expired_quota_disables(None)"
+        );
+        assert!(
+            body.contains(&recover),
+            "巡检必须调既有恢复路径（不得复制一份恢复逻辑）"
+        );
+        let due = format!(
+            "self.token_manager.{}",
+            "ids_due_for_quota_recovery_probe(None)"
+        );
+        assert!(
+            body.contains(&due),
+            "待复核名单必须来自 token_manager 的同一判据收口（防两层判据漂移）"
+        );
     }
 }
