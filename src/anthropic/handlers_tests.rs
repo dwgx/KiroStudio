@@ -135,7 +135,7 @@ mod non_stream_cache_accounting_tests {
         assert_eq!(v.to_str().unwrap(), "0.6657");
     }
 
-    /// 三条 SSE 路径必须走 `sse_event_stream_builder`；生产段 helper 外不得再手写
+    /// 四条 SSE 路径必须走 `sse_event_stream_builder`；生产段 helper 外不得再手写
     /// `text/event-stream` Content-Type。
     #[test]
     fn input_token_scale_sse_sites_must_use_shared_builder() {
@@ -168,8 +168,8 @@ mod non_stream_cache_accounting_tests {
         let helper_call = format!("{}{}", "sse_event_stream_builder", "()");
         assert_eq!(
             prod.matches(helper_call.as_str()).count(),
-            4,
-            "helper 定义 1 处 + 三条 SSE 路径各 1 处调用"
+            5,
+            "helper 定义 1 处 + 四条 SSE 路径各 1 处调用（第四条=建议模式拦截的合成流）"
         );
     }
 
@@ -4718,5 +4718,101 @@ mod mirror_wiring_guard {
         assert_eq!(super::unwired_mirrors().len(), 0);
         // 位图没有溢出
         assert!(total <= 64);
+    }
+}
+
+#[cfg(test)]
+mod suggestion_mode_tests {
+    //! 建议模式拦截（2026-10 移植）：判定谓词 + 拦截响应的形状。
+    use super::*;
+    use crate::anthropic::types::Message;
+
+    fn req_with_last(content: serde_json::Value, role: &str) -> MessagesRequest {
+        MessagesRequest {
+            model: "claude-sonnet-5".to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: role.to_string(),
+                content,
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn detects_string_and_first_block_forms() {
+        // 字符串形态
+        let r = req_with_last(serde_json::json!("[SUGGESTION MODE]\ncontinue..."), "user");
+        assert!(is_suggestion_mode_request(&r));
+        // 数组第一块 text 形态
+        let r = req_with_last(
+            serde_json::json!([
+                {"type": "text", "text": "[SUGGESTION MODE: predict]"},
+                {"type": "text", "text": "rest"}
+            ]),
+            "user",
+        );
+        assert!(is_suggestion_mode_request(&r));
+    }
+
+    #[test]
+    fn rejects_lookalikes() {
+        // 标记不在头部
+        let r = req_with_last(serde_json::json!("hello [SUGGESTION MODE]"), "user");
+        assert!(!is_suggestion_mode_request(&r));
+        // 标记在第二块
+        let r = req_with_last(
+            serde_json::json!([
+                {"type": "text", "text": "prefix"},
+                {"type": "text", "text": "[SUGGESTION MODE]"}
+            ]),
+            "user",
+        );
+        assert!(!is_suggestion_mode_request(&r));
+        // 最后一条是 assistant
+        let r = req_with_last(serde_json::json!("[SUGGESTION MODE]"), "assistant");
+        assert!(!is_suggestion_mode_request(&r));
+        // 第一块不是 text
+        let r = req_with_last(
+            serde_json::json!([{"type": "tool_result", "content": "[SUGGESTION MODE]"}]),
+            "user",
+        );
+        assert!(!is_suggestion_mode_request(&r));
+        // 普通对话
+        let r = req_with_last(serde_json::json!("normal question"), "user");
+        assert!(!is_suggestion_mode_request(&r));
+        // 空消息列表
+        let mut r = req_with_last(serde_json::json!("x"), "user");
+        r.messages.clear();
+        assert!(!is_suggestion_mode_request(&r));
+    }
+
+    #[test]
+    fn response_shapes_are_complete() {
+        // 非流式：200 正常响应（不是错误——避免客户端把建议失败当主对话失败重试）。
+        let resp = suggestion_mode_response(false);
+        assert_eq!(resp.status(), StatusCode::OK);
+        // 流式：200 + SSE 头（含 x-accel-buffering: no）。
+        let resp = suggestion_mode_response(true);
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("x-accel-buffering")
+                .map(|v| v.to_str().unwrap()),
+            Some("no"),
+            "SSE 响应应带 x-accel-buffering: no"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .map(|v| v.to_str().unwrap()),
+            Some("text/event-stream")
+        );
     }
 }

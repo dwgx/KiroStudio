@@ -916,10 +916,13 @@ impl KiroCredentials {
     /// IdC 号的**认证 region(SSO-OIDC 实例)与对话/余额 region(profileArn)物理不同**,故
     /// [`sync_region_from_arn`](Self::sync_region_from_arn) 对它豁免 auth_region 改写(见该方法)。
     pub fn is_idc_credential(&self) -> bool {
-        self.auth_method
-            .as_deref()
-            .map(|m| canonicalize_auth_method_value(m) == "idc")
-            .unwrap_or(false)
+        match self.auth_method.as_deref() {
+            Some(m) => canonicalize_auth_method_value(m) == "idc",
+            // 显式 authMethod 缺失时按 OIDC 字段推断（生态对齐 kiro2cc `c3050de`）：
+            // clientId + clientSecret 齐备 → idc。否则自愈链/上号预发现会静默跳过这些号，
+            // 且 profileArn 回写会被拒（dirty-write 漏洞）。
+            None => self.client_id.is_some() && self.client_secret.is_some(),
+        }
     }
 
     /// 账户族键（family_key）—— 限流/健康的分组单位（见 docs/DESIGN-M365-FAMILY-RATELIMIT-0708.md）。
@@ -1177,6 +1180,23 @@ mod tests {
             Some("us-west-2"),
             "builder-id 也豁免 auth_region"
         );
+    }
+
+    #[test]
+    fn is_idc_inferred_from_oidc_fields_when_auth_method_missing() {
+        // 显式 authMethod 优先；缺失时 clientId+clientSecret 齐备 → idc
+        // （生态对齐 kiro2cc `c3050de`：否则自愈链/上号预发现会静默跳过这些号）。
+        let mut c = KiroCredentials::default();
+        c.auth_method = Some("idc".to_string());
+        assert!(c.is_idc_credential());
+        c.auth_method = Some("social".to_string());
+        assert!(!c.is_idc_credential());
+        c.auth_method = None;
+        assert!(!c.is_idc_credential(), "缺 authMethod 且无 OIDC 字段 → 非 idc");
+        c.client_id = Some("cid".to_string());
+        assert!(!c.is_idc_credential(), "只有 clientId 不够");
+        c.client_secret = Some("cs".to_string());
+        assert!(c.is_idc_credential(), "clientId+clientSecret 齐备 → idc");
     }
 
     #[test]

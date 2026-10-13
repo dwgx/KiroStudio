@@ -146,21 +146,65 @@ fn parse_pdf_literal_string(pdf: &str, start: usize) -> Option<(String, usize)> 
     None
 }
 
-/// 追加到 Write 工具 description 末尾的内容
-const WRITE_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the content to write exceeds 150 lines, you MUST only write the first 50 lines using this tool, then use `Edit` tool to append the remaining content in chunks of no more than 50 lines each. If needed, leave a unique placeholder to help append content. Do NOT attempt to write all content at once.";
+/// 大写入分块上限（行；进程级镜像，TIER3 热更；0 = 关闭追加）。
+///
+/// 依据（生态实测，kiro2cc issue #46）：上游对大 tool_use 参数**不增量流式**——
+/// 模型生成大参数期间该流静默，约 4 分钟后上游以 `RST_STREAM(INTERNAL_ERROR)` 重置；
+/// 重试同样失败（HTTP/2 PING 保活无效）。代理无法让上游提前吐字节，只能把「拆小写入」
+/// 约束进系统提示（见 [`write_chunking_system_note`]）。默认 300 行：上游约 40 tok/s，
+/// 300 行 ≈ 75-115s，对约 240s 的线留 >2× 余量（曾用 150 行，因「拆多轮 × adaptive
+/// thinking 每轮计费」的代价放宽到 300）。
+static WRITE_CHUNKING_MAX_LINES: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(300);
 
-/// 追加到 Edit 工具 description 末尾的内容
-const EDIT_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the `new_string` content exceeds 50 lines, you MUST split it into multiple Edit calls, each replacing no more than 50 lines at a time. If used to append content, leave a unique placeholder to help append content. On the final chunk, do NOT include the placeholder.";
+/// 设置大写入分块上限（main 启动接线 / admin 热更调用，立即生效）。
+pub fn set_write_chunking_max_lines(n: u32) {
+    WRITE_CHUNKING_MAX_LINES.store(n, std::sync::atomic::Ordering::Relaxed);
+}
 
-/// 追加到 Bash 工具 description 末尾的内容（对齐 kiro 生态：防大命令触发上游参数截断）。
-const BASH_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: Do not send very large commands, inline scripts, or heredocs through Bash. If a command would exceed 100 lines, 8,000 characters, or roughly 4,000 tokens, create or modify a script/file with chunked Write/Edit calls first, then run a short Bash command that executes it. If a Bash attempt fails due to argument size or truncation, do not retry the same large command; split it smaller.";
+/// 当前大写入分块上限（请求装配时读取；0 = 不追加约束）。
+fn write_chunking_max_lines() -> u32 {
+    WRITE_CHUNKING_MAX_LINES.load(std::sync::atomic::Ordering::Relaxed)
+}
 
-/// 追加到系统提示词的分块写入策略
-const SYSTEM_CHUNKED_POLICY: &str = "\
-When the Write or Edit tool has content size limits, always comply silently. \
-Never suggest bypassing these limits via alternative tools. \
-Never ask the user whether to switch approaches. \
-Complete all chunked operations without commentary.";
+/// 大写入分块约束的确定性系统注记（内容固定、只随上限变化——保持上游前缀稳定）。
+///
+/// 只经系统提示下发（2026-10 起）：不再改写客户端工具 description——生态实测
+/// 「给工具描述追加后缀」会破坏客户端规则语义、扰动工具块指纹，上游项目已撤下
+/// （kiro2cc `4ef12db`，理由「preserve client rules, keep stable system history」），
+/// 本仓同步撤下旧的后缀策略（WRITE/EDIT/BASH_TOOL_DESCRIPTION_SUFFIX + SYSTEM_CHUNKED_POLICY）。
+fn write_chunking_system_note(max_lines: u32) -> String {
+    format!(
+        "IMPORTANT: The service aborts any single tool call whose arguments take longer than \
+         about 4 minutes to generate. Never put more than about {max_lines} lines of content in \
+         the arguments of one tool call. This limit applies to the Write content, to the Edit \
+         new_string, and to the combined size of all edits inside one MultiEdit call. For \
+         anything larger, write the first part with Write (or one Edit) and then append each \
+         further part with separate Edit or Bash calls, splitting a large MultiEdit into several \
+         smaller calls. Follow this silently without mentioning this limit."
+    )
+}
+
+/// 请求（客户端原始工具名）是否携带内容写入类工具（Write/Edit/MultiEdit，ASCII 大小写不敏感）。
+/// Bash 不触发：大命令截断由参数修复/截断恢复链路兜底，与本注记（针对上游流重置）无关。
+fn has_content_writing_tool(client_tools: &[super::types::Tool]) -> bool {
+    client_tools.iter().any(|t| {
+        let n = t.name.to_ascii_lowercase();
+        n == "write" || n == "edit" || n == "multiedit"
+    })
+}
+
+/// 计算本次请求要追加的分块注记（纯函数，便于单测；调用点传进程镜像的当前上限）。
+/// `0` = 关闭；无写入类工具 = 不追加。
+fn write_chunking_note_for(
+    max_lines: u32,
+    client_tools: &[super::types::Tool],
+) -> Option<String> {
+    if max_lines == 0 || !has_content_writing_tool(client_tools) {
+        return None;
+    }
+    Some(write_chunking_system_note(max_lines))
+}
 
 /// Claude Code 归因头前缀。
 ///
@@ -1617,14 +1661,25 @@ fn build_history(
         });
     }
 
+    // 大写入分块约束（只在请求携带 Write/Edit/MultiEdit 时追加；0 = 关闭）。
+    // 注记进系统提示末尾——不改写客户端工具描述，保持工具块与缓存前缀稳定
+    // （2026-10 生态结论，见 write_chunking_system_note）。
+    let chunk_note = write_chunking_note_for(
+        write_chunking_max_lines(),
+        req.tools.as_deref().unwrap_or(&[]),
+    );
+
     // 最终要写入首条 user 消息的内容：三种情形共用一个出口
-    //   ① 有 system 有效文本 → [thinking 前缀 +] system + 分块策略
-    //   ② 无 system 有效文本但有 thinking → 仅 thinking 前缀
-    //   ③ 两者都无 → 不插入 system 配对
+    //   ① 有 system 有效文本 → [thinking 前缀 +] system [+ 分块注记]
+    //   ② 无 system 有效文本但有 thinking → thinking 前缀 [+ 分块注记]
+    //   ③ 三者都无 → 不插入 system 配对
     let system_injection: Option<String> = match (system_content, thinking_prefix.as_ref()) {
         (Some(content), prefix) => {
-            // 追加分块写入策略到系统消息
-            let content = format!("{}\n{}", content, SYSTEM_CHUNKED_POLICY);
+            // 追加分块写入注记（有写入类工具时）
+            let content = match &chunk_note {
+                Some(note) => format!("{content}\n{note}"),
+                None => content,
+            };
             // 注入thinking标签到系统消息最前面（如果需要且不存在）
             Some(match prefix {
                 Some(p) if !has_thinking_tags(&content) => format!("{}\n{}", p, content),
@@ -1632,10 +1687,13 @@ fn build_history(
             })
         }
         (None, Some(prefix)) => {
-            // 没有可用系统文本但有 thinking 配置，仅以 thinking 前缀插入系统消息
-            Some(prefix.clone())
+            // 没有可用系统文本但有 thinking 配置，以 thinking 前缀（+分块注记）插入系统消息
+            Some(match &chunk_note {
+                Some(note) => format!("{prefix}\n{note}"),
+                None => prefix.clone(),
+            })
         }
-        (None, None) => None,
+        (None, None) => chunk_note,
     };
 
     if let Some(final_content) = system_injection {

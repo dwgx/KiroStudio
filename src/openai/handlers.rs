@@ -245,6 +245,8 @@ async fn stream_responses_from_anthropic(
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
         .header(header::CONNECTION, "keep-alive")
+        // 前置 nginx 开了 proxy_buffering 时不缓冲 SSE 增量（逐响应生效，不改全局配置）。
+        .header("x-accel-buffering", "no")
         .body(Body::from_stream(out_stream))
         .unwrap()
 }
@@ -311,6 +313,8 @@ async fn stream_openai_from_anthropic(
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
         .header(header::CONNECTION, "keep-alive")
+        // 前置 nginx 开了 proxy_buffering 时不缓冲 SSE 增量（逐响应生效，不改全局配置）。
+        .header("x-accel-buffering", "no")
         .body(Body::from_stream(out_stream))
         .unwrap()
 }

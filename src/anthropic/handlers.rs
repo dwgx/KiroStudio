@@ -51,13 +51,14 @@ static MIRROR_WIRED_BITS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 
 /// 名字表：新增进程镜像 setter 时必须在此登记（漏登记会在 setter 内 mark 时 panic 暴露）。
 /// 与「删校验必红」守卫同纪律（见本文件测试模块 mirror_wiring_source_guard）。
-const MIRROR_WIRED_NAMES: [&str; 17] = [
+const MIRROR_WIRED_NAMES: [&str; 18] = [
     "collect_client_fingerprint",
     "trust_forwarded_header",
     "ip_blocklist",
     "machine_code_blocklist",
     "extract_thinking",
     "cc_auto_buffer",
+    "forward_suggestion_mode",
     "prompt_cache_enabled",
     "mock_cache_config",
     "tool_clean_leaked_tokens",
@@ -318,6 +319,91 @@ pub fn set_cc_auto_buffer(enabled: bool) {
 
 fn cc_auto_buffer_enabled() -> bool {
     CC_AUTO_BUFFER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 建议模式（CC 的「预测下一句」请求）是否转发上游（进程级镜像，admin 热更即时生效）。
+///
+/// 默认 false = 拦截并返回结构完整的空回答。详见 `config.rs` 的 `forward_suggestion_mode`：
+/// 该请求带满上下文却只产出几个候选词，转发=满价计费一轮，且其最后一条消息会漂移
+/// `history[0]` 前缀指纹、污染主对话的 prompt 缓存。
+static FORWARD_SUGGESTION_MODE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 设置建议模式转发开关（main 启动接线 / admin 热更调用，立即生效）。
+pub fn set_forward_suggestion_mode(enabled: bool) {
+    mark_mirror_wired("forward_suggestion_mode");
+    FORWARD_SUGGESTION_MODE.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn forward_suggestion_mode_enabled() -> bool {
+    FORWARD_SUGGESTION_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 建议模式标记：CC 的「预测下一句」请求在最后一条 user 消息头部的固定前缀。
+const SUGGESTION_MODE_MARKER: &str = "[SUGGESTION MODE";
+
+/// 判定「建议模式」请求（Claude Code 每轮主对话结束后自动发起的下一句预测）。
+///
+/// 判据（对齐生态 kiro2cc v3.4.25 的检测）：
+/// - 最后一条消息 `role == "user"`；
+/// - 其 content 为字符串且以 `[SUGGESTION MODE` 开头，或为内容数组且**第一块**是
+///   `type:"text"` 且其 text 以该标记开头。
+/// 用 `starts_with` 而非 `contains`：标记在消息头部，降低把普通对话误判的概率。
+fn is_suggestion_mode_request(payload: &MessagesRequest) -> bool {
+    let Some(last) = payload.messages.last() else {
+        return false;
+    };
+    if last.role != "user" {
+        return false;
+    }
+    match &last.content {
+        serde_json::Value::String(s) => s.starts_with(SUGGESTION_MODE_MARKER),
+        serde_json::Value::Array(blocks) => blocks
+            .first()
+            .map(|b| {
+                b.get("type").and_then(|t| t.as_str()) == Some("text")
+                    && b.get("text")
+                        .and_then(|t| t.as_str())
+                        .map(|t| t.starts_with(SUGGESTION_MODE_MARKER))
+                        .unwrap_or(false)
+            })
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// 建议模式拦截响应：结构完整的空回答（CC 只读候选文本，空文本 = 无建议）。
+///
+/// 返回**正常**响应而非错误：避免客户端把「建议失败」当成主对话失败而重试
+/// （生态结论，kiro2cc v3.4.25 同类实现）。流式给完整 SSE 序列，非流式给完整 message 对象。
+fn suggestion_mode_response(stream: bool) -> Response {
+    if stream {
+        let body = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_suggestion\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"suggestion\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":1}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":1}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+        sse_event_stream_builder()
+            .body(axum::body::Body::from(body))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+    } else {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "id": "msg_suggestion",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": ""}],
+                "model": "suggestion",
+                "stop_reason": "end_turn",
+                "stop_sequence": null,
+                "usage": {"input_tokens": 0, "output_tokens": 1}
+            })),
+        )
+            .into_response()
+    }
 }
 
 /// 是否把**估算的** prompt cache 记账下发给客户端（`promptCacheEnabled` 的进程镜像）。
@@ -2863,6 +2949,14 @@ pub async fn post_messages(
 
     // 从入站请求头 + TCP 对端地址识别来源画像（设备/IP/OS/浏览器，用于「最近请求」展示）
     let client = ClientInfo::from_headers_with_peer(&headers, Some(peer));
+
+    // 建议模式拦截（默认开）：CC 每轮结束后的「预测下一句」请求不转发上游，
+    // 直接回结构完整的空回答（零计费、不污染 prompt 缓存）。见 config 同名字段。
+    if !forward_suggestion_mode_enabled() && is_suggestion_mode_request(&payload) {
+        tracing::info!(model = %payload.model, "suggestion-mode 请求已拦截（不转发上游）");
+        return suggestion_mode_response(payload.stream);
+    }
+
     // 检查 KiroProvider 是否可用（未配置渲染双入口共享，key `provider_not_configured`）。
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
@@ -3573,12 +3667,15 @@ fn cache_estimated_header_value() -> axum::http::HeaderValue {
 }
 
 /// 三条 `text/event-stream` 路径共用：websearch 回灌 / 直播 / buffered（线上默认）。
+/// `x-accel-buffering: no`：让前置 nginx（开了 `proxy_buffering` 时）不缓冲 SSE 增量——
+/// 不改全局配置、逐响应生效（生态对齐 ZyphrZero/kiro.rs 4f1dd58）。
 fn sse_event_stream_builder() -> axum::http::response::Builder {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
         .header(header::CONNECTION, "keep-alive")
+        .header("x-accel-buffering", "no")
         .header(INPUT_TOKEN_SCALE_HEADER, CLIENT_TOKEN_DISPLAY_SCALE_HEADER)
 }
 
@@ -4485,6 +4582,12 @@ pub async fn post_messages_cc(
 
     // 从入站请求头 + TCP 对端地址识别来源画像（设备/IP/OS/浏览器，用于「最近请求」展示）
     let client = ClientInfo::from_headers_with_peer(&headers, Some(peer));
+
+    // 建议模式拦截（默认开，同 /v1）：CC 的「预测下一句」请求不转发上游。
+    if !forward_suggestion_mode_enabled() && is_suggestion_mode_request(&payload) {
+        tracing::info!(model = %payload.model, "suggestion-mode 请求已拦截（不转发上游，/cc/v1）");
+        return suggestion_mode_response(payload.stream);
+    }
 
     // 检查 KiroProvider 是否可用（未配置渲染双入口共享，key `provider_not_configured`）。
     let provider = match &state.kiro_provider {

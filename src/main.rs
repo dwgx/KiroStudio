@@ -758,6 +758,8 @@ async fn main() {
         config.tool_repair_json,
         config.tool_truncation_recovery,
         config.tool_description_max_chars,
+        config.forward_suggestion_mode,
+        config.write_chunking_max_lines,
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）

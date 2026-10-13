@@ -443,8 +443,8 @@
             "thinking 前缀必须注入，实际内容：{content}"
         );
         assert!(content.contains("<max_thinking_length>8192</max_thinking_length>"));
-        // 无有效 system 文本时不应附带分块策略（保持与 system=None 路径一致）
-        assert!(!content.contains(SYSTEM_CHUNKED_POLICY));
+        // 无有效 system 文本时不应附带分块注记（保持与 system=None 路径一致）
+        assert!(!content.contains("Never put more than about"));
     }
 
     /// 回归：system 整块是环境噪音，剥离后为空 —— 同一条控制流缺陷的第二条触发路径。
@@ -732,7 +732,73 @@
         let content = first_history_user_content(&req).expect("首条历史应为 system 对应的 user");
         assert!(content.starts_with("<thinking_mode>enabled</thinking_mode>"));
         assert!(content.contains("You are a helpful assistant."));
-        assert!(content.contains(SYSTEM_CHUNKED_POLICY));
+        // 无写入类工具 → 不追加分块注记（新机制：注记只随 Write/Edit/MultiEdit 出现）
+        assert!(!content.contains("Never put more than about"));
+    }
+
+    /// 新机制（2026-10）：分块约束只走系统注记，且只在请求携带 Write/Edit/MultiEdit 时追加；
+    /// 旧的「工具描述后缀 + SYSTEM_CHUNKED_POLICY」策略已撤下（生态实测会破坏客户端规则语义）。
+    #[test]
+    fn chunking_note_appended_only_with_write_tools() {
+        use super::super::types::SystemMessage;
+        use super::super::types::Tool as ClientTool;
+
+        let tool = |name: &str| ClientTool {
+            tool_type: None,
+            name: name.to_string(),
+            description: "d".to_string(),
+            input_schema: Default::default(),
+            max_uses: None,
+            cache_control: None,
+        };
+        let with_tools = |tools: Option<Vec<ClientTool>>| {
+            let mut req = mk_thinking_req(
+                Some(vec![SystemMessage {
+                    text: "You are a helpful assistant.".to_string(),
+                    block_type: Some("text".to_string()),
+                    cache_control: None,
+                }]),
+                None,
+            );
+            req.tools = tools;
+            req
+        };
+
+        // 无工具 → 无注记
+        let c = first_history_user_content(&with_tools(None)).unwrap();
+        assert!(!c.contains("Never put more than about"));
+        // 只有 Bash → 无注记（Bash 不触发）
+        let c = first_history_user_content(&with_tools(Some(vec![tool("Bash")]))).unwrap();
+        assert!(!c.contains("Never put more than about"));
+        // Write / Edit / MultiEdit（含大小写变体）→ 注记出现，含当前上限 300
+        for name in ["Write", "edit", "MultiEdit"] {
+            let c = first_history_user_content(&with_tools(Some(vec![tool(name)]))).unwrap();
+            assert!(
+                c.contains("Never put more than about 300 lines"),
+                "{name} 应触发分块注记"
+            );
+        }
+    }
+
+    /// 纯函数口径：0 = 关闭；自定义上限进入注记文本；无写入工具 = 不追加。
+    #[test]
+    fn write_chunking_note_for_pure_semantics() {
+        use super::super::types::Tool as ClientTool;
+        let tool = |name: &str| ClientTool {
+            tool_type: None,
+            name: name.to_string(),
+            description: "d".to_string(),
+            input_schema: Default::default(),
+            max_uses: None,
+            cache_control: None,
+        };
+        let writes = vec![tool("Write")];
+        assert!(write_chunking_note_for(0, &writes).is_none(), "0 = 关闭");
+        assert!(write_chunking_note_for(300, &[]).is_none(), "无工具不追加");
+        let note = write_chunking_note_for(150, &writes).expect("150 行应出注记");
+        assert!(note.contains("about 150 lines"));
+        assert!(note.contains("about 4 minutes"));
+        assert!(note.contains("silently without mentioning this limit"));
     }
 
     /// 两者都无时不插入 system 配对（首条历史不再是 system 伪装的 user）。

@@ -1118,6 +1118,10 @@ pub struct ConfigSnapshotResponse {
     pub extract_thinking: bool,
     /// Claude Code 自动切缓冲协议（识别到 CC 请求时 /v1 流式自动走 buffered，准确 input_tokens）
     pub cc_auto_buffer: bool,
+    /// 建议模式（CC「预测下一句」请求）是否转发上游（默认 false=拦截；热更即时生效）。
+    pub forward_suggestion_mode: bool,
+    /// 大写入分块上限（行；0=关闭；热更即时生效，converter 进程级镜像）。
+    pub write_chunking_max_lines: u32,
     /// Kiro 原生 extended thinking（请求级 `output_config.effort` 通道，默认关；
     /// 开=白名单模型 + thinking 走原生 reasoningContentEvent 并抑制 XML 标签注入）。
     /// 热更即时生效（converter 进程级镜像）。
@@ -1368,6 +1372,10 @@ pub struct UpdateConfigRequest {
     pub default_endpoint: Option<String>,
     pub extract_thinking: Option<bool>,
     pub cc_auto_buffer: Option<bool>,
+    /// 建议模式转发开关（默认 false=拦截；热更即时生效）。
+    pub forward_suggestion_mode: Option<bool>,
+    /// 大写入分块上限（行；0=关闭；热更即时生效）。
+    pub write_chunking_max_lines: Option<u32>,
     /// Kiro 原生 extended thinking 开关（默认关；热更即时生效，converter 镜像）。
     pub native_thinking_effort_enabled: Option<bool>,
     /// CC↔Kiro 工具名/参数映射开关（默认开；热更即时生效，converter 镜像）。
@@ -2549,6 +2557,8 @@ mod tests {
             endpoint_names: vec![],
             extract_thinking: false,
             cc_auto_buffer: false,
+            forward_suggestion_mode: false,
+            write_chunking_max_lines: 300,
             native_thinking_effort_enabled: false,
             tool_compat_mapping: true,
             import_keys_enabled: true,
@@ -2816,6 +2826,8 @@ mod tests {
             endpoint_names: vec![],
             extract_thinking: true,
             cc_auto_buffer: true,
+            forward_suggestion_mode: false,
+            write_chunking_max_lines: 300,
             native_thinking_effort_enabled: false,
             tool_compat_mapping: true,
             import_keys_enabled: true,

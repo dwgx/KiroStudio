@@ -263,6 +263,24 @@ pub struct Config {
     #[serde(default = "default_cc_auto_buffer")]
     pub cc_auto_buffer: bool,
 
+    /// Claude Code 建议模式（suggestion mode）请求是否**转发**上游（默认 false = 拦截）。
+    ///
+    /// CC 每轮主对话结束后会发一条「预测用户下一句」的请求（最后一条 user 消息以
+    /// `[SUGGESTION MODE` 开头）。默认拦截并返回结构完整的空响应（零 token 计费、
+    /// 不污染 prompt 缓存前缀）；置 true 则原样转发（每轮多一次满上下文计费请求）。
+    /// 热更即时生效（admin 改配置调 `anthropic::set_forward_suggestion_mode`）。
+    #[serde(default = "default_forward_suggestion_mode")]
+    pub forward_suggestion_mode: bool,
+
+    /// 大写入分块上限（行数；默认 300，0 = 关闭）。
+    ///
+    /// 上游对大 tool_use 参数不增量流式：单次工具调用参数生成超过约 4 分钟会被
+    /// `RST_STREAM(INTERNAL_ERROR)` 重置。请求携带 Write/Edit/MultiEdit 工具时，
+    /// 在系统提示末尾追加确定性约束（单次调用参数不超过 N 行），降低触发概率。
+    /// 热更即时生效（admin 改配置调 `anthropic::set_write_chunking_max_lines`）。
+    #[serde(default = "default_write_chunking_max_lines")]
+    pub write_chunking_max_lines: u32,
+
     /// Kiro **原生** extended thinking：是否走请求级
     /// `additionalModelRequestFields.output_config.effort` 触发上游原生
     /// `reasoningContentEvent`（**默认 false**）。
@@ -1378,6 +1396,21 @@ fn default_clone_default_enabled() -> bool {
     false
 }
 
+/// 建议模式默认**拦截**（false）：CC 的「预测下一句」请求默认不转发上游。
+/// 依据：该请求带满上下文（50k+）却只产出几个候选词，转发=满价计费一轮，
+/// 且其最后一条消息会漂移 `history[0]` 前缀指纹、污染主对话的 prompt 缓存。
+fn default_forward_suggestion_mode() -> bool {
+    false
+}
+
+/// 大写入分块上限默认 300 行（0 = 关闭）。
+/// 依据（生态实测，issue 引证）：上游输出约 40 tok/s，300 行 ≈ 3000-4500 token
+/// ≈ 75-115s，对约 240s 的上游 RST_STREAM 重置线留 >2× 余量；曾用 150 行，
+/// 因「拆多轮 + adaptive thinking 每轮计费」的代价放宽到 300。
+fn default_write_chunking_max_lines() -> u32 {
+    300
+}
+
 fn default_cc_auto_buffer() -> bool {
     // 默认 **true** = 识别到 Claude Code 的请求走 buffered 分发。
     //
@@ -1654,6 +1687,8 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
             cc_auto_buffer: default_cc_auto_buffer(),
+            forward_suggestion_mode: default_forward_suggestion_mode(),
+            write_chunking_max_lines: default_write_chunking_max_lines(),
             // native effort 默认关：开关开=白名单模型走 output_config.effort 原生通道
             // （未验证的协议形状不全池直切，与 cli_origin_kiro_cli 同款保守理由）。
             native_thinking_effort_enabled: false,

@@ -49,6 +49,8 @@ pub fn create_router_with_provider(
     tool_repair_json: bool,
     tool_truncation_recovery: bool,
     tool_description_max_chars: usize,
+    forward_suggestion_mode: bool,
+    write_chunking_max_lines: u32,
 ) -> Router {
     let mut state = AppState::new(api_key);
     if let Some(provider) = kiro_provider {
@@ -72,6 +74,9 @@ pub fn create_router_with_provider(
     super::handlers::set_tool_truncation_recovery(tool_truncation_recovery);
     // 工具描述上限：播种进 converter 进程级镜像（convert_tools 读镜像），admin 改后即时生效。
     super::converter::set_tool_description_max_chars(tool_description_max_chars);
+    // 建议模式开关 / 大写入分块上限：播种进进程级镜像（handlers/converter 热路径读），admin 改后即时生效。
+    super::handlers::set_forward_suggestion_mode(forward_suggestion_mode);
+    super::converter::set_write_chunking_max_lines(write_chunking_max_lines);
 
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()

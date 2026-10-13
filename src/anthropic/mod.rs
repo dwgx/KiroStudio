@@ -37,11 +37,13 @@ mod websearch;
 
 pub use converter::{
     set_native_thinking_effort_enabled, set_strip_env_noise, set_tool_description_max_chars,
+    set_write_chunking_max_lines,
 };
 pub(crate) use converter::set_tool_compat_mapping;
 pub use handlers::set_cc_auto_buffer;
 pub use handlers::set_collect_client_fingerprint;
 pub use handlers::set_extract_thinking;
+pub use handlers::set_forward_suggestion_mode;
 pub use handlers::set_prompt_cache_enabled;
 pub use handlers::set_trust_forwarded_header;
 /// 吸收层分类器：供 `kiro::provider` 的 absorb 循环判定「这个错误值不值得就地重试」。

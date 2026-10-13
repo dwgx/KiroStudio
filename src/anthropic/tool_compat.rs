@@ -9,10 +9,7 @@ use sha2::{Digest, Sha256};
 use crate::kiro::model::requests::tool::{InputSchema, Tool, ToolSpecification};
 
 use super::ConversionError;
-use super::{
-    BASH_TOOL_DESCRIPTION_SUFFIX, EDIT_TOOL_DESCRIPTION_SUFFIX, WRITE_TOOL_DESCRIPTION_SUFFIX,
-    normalize_json_schema, tool_description_max_chars, truncate_chars,
-};
+use super::{normalize_json_schema, tool_description_max_chars, truncate_chars};
 
 /// Kiro API 工具名称最大长度限制（字节）
 pub(super) const TOOL_NAME_MAX_LEN: usize = 63;
@@ -502,18 +499,11 @@ fn optional_schema(schema: serde_json::Value) -> serde_json::Value {
 /// Kiro 内置工具的描述：命中内置名用固定描述（拼接大文件分块提示），否则回退调用方描述。
 fn kiro_builtin_tool_description(name: &str, fallback: &str) -> String {
     match name {
-        "fs_write" => format!(
-            "Write text content to a file.\n{}",
-            WRITE_TOOL_DESCRIPTION_SUFFIX
-        ),
-        "str_replace" => format!(
-            "Replace an exact string in a file.\n{}",
-            EDIT_TOOL_DESCRIPTION_SUFFIX
-        ),
-        "execute_bash" => format!(
-            "Execute the specified bash command.\n{}",
-            BASH_TOOL_DESCRIPTION_SUFFIX
-        ),
+        // 2026-10 起内置工具描述不再拼接分块后缀：分块约束只走系统注记
+        // （converter::write_chunking_system_note），保持工具块字节稳定。
+        "fs_write" => "Write text content to a file.".to_string(),
+        "str_replace" => "Replace an exact string in a file.".to_string(),
+        "execute_bash" => "Execute the specified bash command.".to_string(),
         "read_file" => "Read a single file with optional line range specification.".to_string(),
         "file_search" => {
             "Find files by glob pattern. Supports ** for recursive matching and brace \
@@ -799,23 +789,12 @@ pub(super) fn convert_tools(
             };
             let is_builtin = map_enabled && claude_code_tool_name_to_kiro(&t.name).is_some();
 
-            // 描述：内置工具用 Kiro 固定描述（已拼大文件分块提示，见 kiro_builtin_tool_description）；
-            // 非内置工具保留原描述 + Write/Edit/Bash 分块后缀。
+            // 描述：内置工具用 Kiro 固定描述；非内置工具保留原描述（2026-10 起不再追加
+            // Write/Edit/Bash 分块后缀——分块约束只走系统注记，见 converter::write_chunking_system_note）。
             let description = if is_builtin {
                 kiro_builtin_tool_description(&mapped_name, &t.description)
             } else {
-                let mut description = t.description.clone();
-                let suffix = match t.name.as_str() {
-                    "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
-                    "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
-                    "Bash" => BASH_TOOL_DESCRIPTION_SUFFIX,
-                    _ => "",
-                };
-                if !suffix.is_empty() {
-                    description.push('\n');
-                    description.push_str(suffix);
-                }
-                description
+                t.description.clone()
             };
             // 限制顶层描述长度（默认 10000 字符，可配置；安全截断 UTF-8，单次遍历）
             let description = truncate_chars(&description, tool_description_max_chars());

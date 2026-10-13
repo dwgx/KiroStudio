@@ -65,6 +65,10 @@ impl super::AdminService {
         let mut extract_thinking_changed: Option<bool> = None;
         // CC 自动切缓冲开关：改后调 handlers setter 即时生效（进程级镜像，不重启）。
         let mut cc_auto_buffer_changed: Option<bool> = None;
+        // 建议模式转发开关：改后调 handlers setter 即时生效（进程级镜像，不重启）。
+        let mut forward_suggestion_mode_changed: Option<bool> = None;
+        // 大写入分块上限：改后调 converter setter 即时生效（进程级镜像，不重启）。
+        let mut write_chunking_max_lines_changed: Option<u32> = None;
         // 推号开关无 TIER3 镜像，只需让 reload_config 跑一次即可生效，故用 bool 而非 Option<bool>。
         let mut import_keys_enabled_changed = false;
         // 分身默认启用同款：`clone_default_enabled()` 每次直接读 config ArcSwap，
@@ -216,6 +220,20 @@ impl super::AdminService {
             if v != config.cc_auto_buffer {
                 config.cc_auto_buffer = v;
                 cc_auto_buffer_changed = Some(v);
+            }
+        }
+        // —— 建议模式转发开关（TIER3 热更：改后调 handlers setter 即时生效不重启）——
+        if let Some(v) = req.forward_suggestion_mode {
+            if v != config.forward_suggestion_mode {
+                config.forward_suggestion_mode = v;
+                forward_suggestion_mode_changed = Some(v);
+            }
+        }
+        // —— 大写入分块上限（TIER3 热更：改后调 converter setter 即时生效不重启）——
+        if let Some(v) = req.write_chunking_max_lines {
+            if v != config.write_chunking_max_lines {
+                config.write_chunking_max_lines = v;
+                write_chunking_max_lines_changed = Some(v);
             }
         }
         // —— 批量推号入口开关（无 TIER3 setter：handler 每次直接读 config()，
@@ -1064,6 +1082,8 @@ impl super::AdminService {
             || fingerprint_changed.is_some()
             || extract_thinking_changed.is_some()
             || cc_auto_buffer_changed.is_some()
+            || forward_suggestion_mode_changed.is_some()
+            || write_chunking_max_lines_changed.is_some()
             || import_keys_enabled_changed
             // 分身默认启用同样没有 TIER3 setter，**只**靠这一行触发 reload_config。
             // 删掉它 → 面板改了、存了盘，但 clone_default_enabled() 读到的仍是旧值。
@@ -1159,6 +1179,16 @@ impl super::AdminService {
             crate::anthropic::set_cc_auto_buffer(v);
         }
 
+        // TIER3：建议模式开关立即应用到热路径进程级镜像（下一个请求即生效）
+        if let Some(v) = forward_suggestion_mode_changed {
+            crate::anthropic::set_forward_suggestion_mode(v);
+        }
+
+        // TIER3：大写入分块上限立即应用到 converter 进程级镜像（下一个请求即生效）
+        if let Some(v) = write_chunking_max_lines_changed {
+            crate::anthropic::set_write_chunking_max_lines(v);
+        }
+
         // TIER3：prompt cache 记账下发开关立即应用到热路径进程级镜像（下一个请求即生效）
         if let Some(v) = prompt_cache_enabled_changed {
             crate::anthropic::set_prompt_cache_enabled(v);
@@ -1233,6 +1263,8 @@ impl super::AdminService {
             || fingerprint_changed.is_some()
             || extract_thinking_changed.is_some()
             || cc_auto_buffer_changed.is_some()
+            || forward_suggestion_mode_changed.is_some()
+            || write_chunking_max_lines_changed.is_some()
             || import_keys_enabled_changed
             // 立即生效项（reload_config 换 ArcSwap），漏掉这行只改本项时面板会回
             // 「无改动」，与实际不符。
