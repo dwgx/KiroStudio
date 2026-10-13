@@ -103,6 +103,8 @@ export interface FormState {
   proxyUsername: string
   proxyPassword: string
   apiKey: string
+  // 管理面 key（adminApiKey）：后端与 userKey 一样不回显现值，空串初值；留空=不改，填了=更新。
+  adminApiKey: string
   callbackBaseUrl: string
   // 反代安全（批次3）：列表用换行分隔的多行文本承载
   corsAllowedOrigins: string
@@ -262,8 +264,10 @@ export function toForm(c: ConfigSnapshotResponse, ui: UiLayoutPrefs): FormState 
     // 代理账密出于安全后端不下发,UI 留空占位:留空=不改,填了=更新。
     proxyUsername: '',
     proxyPassword: '',
-    // userKey(对话 api_key)后端不下发明文,留空=不改,填了=更新(需重启生效)。
+    // userKey(对话 api_key)后端不下发明文,留空=不改,填了=更新(存盘即热更)。
     apiKey: '',
+    // adminApiKey 同样不回显现值,留空=不改,填了=更新(即时生效;轮换后当前会话失效,需用新 key 重登)。
+    adminApiKey: '',
     callbackBaseUrl: c.callbackBaseUrl ?? '',
     corsAllowedOrigins: listToLines(c.corsAllowedOrigins ?? []),
     ipAllowlist: listToLines(c.ipAllowlist ?? []),
@@ -439,6 +443,8 @@ export function diffForm(
   if (form.proxyUsername.trim() !== '') d.proxyUsername = form.proxyUsername.trim()
   if (form.proxyPassword !== '') d.proxyPassword = form.proxyPassword
   if (form.apiKey.trim() !== '') d.apiKey = form.apiKey.trim()
+  // 管理面 key:同 userKey,后端不回显,只在用户填了内容时才发送(留空=保持不变)。
+  if (form.adminApiKey.trim() !== '') d.adminApiKey = form.adminApiKey.trim()
   if (form.callbackBaseUrl.trim() !== (config.callbackBaseUrl ?? '')) d.callbackBaseUrl = form.callbackBaseUrl.trim()
   // 反代安全
   const origins = linesToList(form.corsAllowedOrigins)

@@ -2794,7 +2794,28 @@ export function SettingsPage() {
               </Badge>
             }
           />
-          <ReadonlyRow label={t('settingspage.network.adminKey')} value={<Badge variant={config.hasAdminKey ? 'default' : 'secondary'}>{config.hasAdminKey ? t('settingspage.common.set') : t('settingspage.common.unset')}</Badge>} />
+          {/* 管理面 key 轮换：与 userKey 同款（password 输入 + 已设置 Badge，留空=不改）。
+              轮换后旧 key 立即失效（后端热更语义），当前会话下一次请求即 401，
+              由 axios 拦截器清 sessionStorage 并回登录页，须用新 key 重新登录。 */}
+          <Field
+            label={t('settingspage.network.adminApiKey.label')}
+            hint={t('settingspage.network.adminApiKey.hint')}
+          >
+            <div className="flex items-center gap-2">
+              <Input
+                id="settings-admin-api-key"
+                type="password"
+                className="flex-1 min-w-0 max-w-[260px] font-mono text-xs"
+                value={form.adminApiKey}
+                onChange={(e) => set('adminApiKey', e.target.value)}
+                placeholder={config.hasAdminKey ? t('settingspage.network.adminApiKey.phSet') : t('settingspage.network.adminApiKey.phUnset')}
+                autoComplete="new-password"
+              />
+              <Badge variant={config.hasAdminKey ? 'default' : 'secondary'} className="shrink-0 whitespace-nowrap">
+                {config.hasAdminKey ? t('settingspage.common.set') : t('settingspage.common.unset')}
+              </Badge>
+            </div>
+          </Field>
           <Field
             label={t('settingspage.network.apiKey.label')}
             hint={t('settingspage.network.apiKey.hint')}

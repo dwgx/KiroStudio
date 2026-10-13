@@ -835,8 +835,11 @@ export interface UpdateConfigRequest {
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
-  /** userKey（对话 api_key）：留空不改，填了更新，需重启生效 */
+  /** userKey（对话 api_key）：留空不改，填了更新。存盘后经 auth_keys 热更即时生效、无需重启 */
   apiKey?: string
+  /** 管理面 API Key（adminApiKey，面板登录用）：留空不改，填了更新，即时生效、无需重启。
+      轮换后当前面板会话立即失效（下一个请求就按新 key 判定），需用新 key 重新登录。 */
+  adminApiKey?: string
   callbackBaseUrl?: string
   // 反代安全（批次3，整表替换语义）
   corsAllowedOrigins?: string[]
