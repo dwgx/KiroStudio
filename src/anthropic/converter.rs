@@ -1714,13 +1714,23 @@ fn message_plain_text(msg: &super::types::Message) -> String {
 /// 与 `src/openai/convert.rs` 的 `log_once` 同一理由（那边有完整注释）：这些日志在
 /// **每请求热路径**上，某个客户端固定发一种未知 role 时逐请求记一行会把面板读的
 /// 内存日志环刷爆，反而盖掉它本该暴露的信息；而它的用途只是**拿样本**。
-/// key 空间 = 客户端可能发的 role 名集合（极小），不做淘汰。
+///
+/// ⚠️ 与 openai 那侧的 key 空间不同：那边的 key 是目录内 model 名（有限），这里的
+/// role 是**客户端任意字符串**（`messages[].role` 无长度/取值约束）。不设上限就是
+/// 一条**只增不减的常驻内存**路径：客户端发 N 个互不相同的 role 就常驻 N 条字符串，
+/// 且进程重启前不释放。故设样本上限，到顶后只放行已见过的 role（不插入、不告警）。
 fn log_unknown_role_once(role: &str) -> bool {
     use std::collections::HashSet;
     use std::sync::{LazyLock, Mutex};
+    /// 样本上限：够定位「客户端到底发了什么 role」，又不给客户端留增长面。
+    const MAX_TRACKED_ROLES: usize = 64;
     static SEEN: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
     // 锁中毒（某测试线程 panic）不该让可观测性连带失效 → 取回内层集合继续用。
     let mut guard = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.len() >= MAX_TRACKED_ROLES {
+        // 已够样本：不再插入（无界增长），也不再逐请求告警（刷日志环）。
+        return false;
+    }
     guard.insert(role.to_string())
 }
 
@@ -2109,3 +2119,35 @@ mod native_effort_tests;
 #[cfg(test)]
 #[path = "converter_byte_overflow_tests.rs"]
 mod byte_overflow_tests;
+
+/// 审计波（2026-10-14）：日志去重集合的有界性。就地放本文件——该集合是私有实现
+/// 细节（进程级 static），不适合跨文件测试模块（那边的测试与它无耦合）。
+#[cfg(test)]
+mod audit_bounded_dedup_tests {
+    use super::*;
+
+    /// 🔴 有界性守卫：`messages[].role` 是**客户端任意字符串**，去重集合不设上限就是
+    /// 只增不减的常驻内存。改前 `guard.insert(role)` 无条件插入 → 到顶后本断言
+    /// 拿到 `true`（说明仍在增长）即 FAIL。
+    #[test]
+    fn unknown_role_dedup_set_is_bounded() {
+        // 上限内行为：首次出现放行（拿样本）。集合若已被别的测试填满，这里会返回
+        // false —— 那种情况下本条无意义，跳过（断言只在放行时才有判别力）。
+        let fresh = "audit-role-fresh-unique";
+        if log_unknown_role_once(fresh) {
+            assert!(
+                !log_unknown_role_once(fresh),
+                "同一 role 只应放行一次（重复告警会刷爆日志环）"
+            );
+        }
+
+        // 填满样本上限（其它测试若已插入过几条，这里只是提前到顶）。
+        for i in 0..64 {
+            log_unknown_role_once(&format!("audit-fill-{i}"));
+        }
+        assert!(
+            !log_unknown_role_once("audit-role-beyond-cap"),
+            "样本上限到顶后不得再插入新 role（否则客户端可用互不相同的 role 无限撑内存）"
+        );
+    }
+}

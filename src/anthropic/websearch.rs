@@ -2047,7 +2047,27 @@ pub(super) async fn run_web_search_loop(
             }));
         }
         if !round.text.is_empty() {
-            content.push(json!({"type": "text", "text": round.text}));
+            // 与主路径的**完整文本**口径对齐（handlers.rs 非流式分支 4655-4663，
+            // 剥离顺序也一致：先 thinking 后 DSML）：
+            // ① 客户端未声明 thinking 时，模型内联的 `<thinking>…</thinking>` 剥掉
+            //    （声明了 thinking 的场景由上面的结构化 thinking 块承载）；
+            // ② DSML 协议标记剥离——DeepSeek 把 `<｜DSML｜function_calls>` 当正文吐，
+            //    流式（StreamContext::strip_dsml_markers）与非流式（strip_dsml_from_complete_text）
+            //    都剥，回灌路径此前**零处理** ⇒ 标记逐字泄漏给客户端（同型事故第 N 次）。
+            // 回灌给上游的历史正文（append_search_round 的 assistant_text）刻意不动——
+            // 那里是「模型自己说过的话」，不是面向客户端的渲染。
+            let stripped = if thinking_enabled {
+                // 声明了 thinking：正文原样过（结构化思考块已在上方下发），零拷贝。
+                std::borrow::Cow::Borrowed(round.text.as_str())
+            } else {
+                std::borrow::Cow::Owned(super::stream::strip_thinking_from_complete_text(
+                    &round.text,
+                ))
+            };
+            let text = super::stream::strip_dsml_from_complete_text(&stripped);
+            if !text.is_empty() {
+                content.push(json!({"type": "text", "text": text}));
+            }
         }
         // 客户端工具原样回（含混合轮里与 web_search 并列的那些）。
         content.extend(round.client_tool_use);
@@ -2157,6 +2177,10 @@ pub(super) fn mixed_websearch_stream_response(
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut index = 0i32;
         let mut hops_open = true;
+        // 是否已给这次请求落过账（成功/失败）。未落账的退出路径由下方统一收尾补记——
+        // 「报没报过」必须显式跟踪：只靠 `task.is_finished()` 判会漏掉
+        // 「断连时任务还在跑、收尾瞬间它正好结束」这个窗口（见下方注释）。
+        let mut reported = false;
         let ping_bytes = Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n");
         loop {
             tokio::select! {
@@ -2178,6 +2202,7 @@ pub(super) fn mixed_websearch_stream_response(
                     match res {
                         Ok(Ok(success)) => {
                             on_ok(&success);
+                            reported = true;
                             for ev in build_loop_sse_tail(&success, index, true) {
                                 if byte_tx.send(Ok(Bytes::from(ev.to_sse_string()))).await.is_err() {
                                     break;
@@ -2186,10 +2211,13 @@ pub(super) fn mixed_websearch_stream_response(
                         }
                         Ok(Err(fail)) => {
                             on_err(&fail);
+                            reported = true;
                             let ev = SseEvent::error_event("api_error", "WebSearch 回灌失败");
                             let _ = byte_tx.send(Ok(Bytes::from(ev.to_sse_string()))).await;
                         }
                         Err(_) => {
+                            // 任务 panic/被 abort：拿不到结果，账目交下方统一收尾补记
+                            // （不置 reported，否则这条请求在面板上完全不可见）。
                             let ev = SseEvent::error_event("api_error", "WebSearch 回灌被中断");
                             let _ = byte_tx.send(Ok(Bytes::from(ev.to_sse_string()))).await;
                         }
@@ -2203,6 +2231,7 @@ pub(super) fn mixed_websearch_stream_response(
                                 Ok(success) => on_ok(&success),
                                 Err(fail) => on_err(&fail),
                             }
+                            reported = true;
                         }
                     }
                     // 任务仍在跑 → 交给下方统一断连收尾（补记 Interrupted 后 abort）。
@@ -2216,12 +2245,19 @@ pub(super) fn mixed_websearch_stream_response(
             }
         }
 
-        // 统一断连收尾：任务仍在跑 = 客户端已断（或被 abort），任务内的 rounds/credits
-        // 随 abort 丢失，故按循环已发布的增量账目补记一条 Interrupted 再停。
-        // 正常收尾分支（result / closed 且任务已结束）已各自记账，这里不会重复。
-        if !task.is_finished() {
+        // 统一收尾：**任何没落过账的退出路径**都要补一条，不能整条丢。
+        // - 任务仍在跑 = 客户端已断（或被 abort）：任务内的 rounds/credits 随 abort 丢失，
+        //   故按循环已发布的增量账目补记 Interrupted 再停；
+        // - 任务在收尾窗口内恰好结束（`byte_tx.closed()` 里判 is_finished 时为假、此处为真）：
+        //   结果已送不到客户端，但**账不能丢** —— 同样按已发布账目补记。改前这里只判
+        //   `!task.is_finished()`，这一支既不补记也不 abort ⇒ 该请求在面板上完全消失
+        //   （断连记账修复 f94c9f7 遗留的窗口）。
+        // 正常收尾分支（result / closed 且任务已结束）已各自记账并置 reported，不会重复。
+        if !reported {
             on_interrupted(&snapshot_progress(&progress));
-            task.abort();
+            if !task.is_finished() {
+                task.abort();
+            }
         }
     });
 
@@ -3667,11 +3703,12 @@ mod tests {
             loop_fn.contains("*guard = WebSearchProgress {"),
             "run_web_search_loop 每轮必须把增量账目发布到共享单元"
         );
-        // 统一断连收尾块：补记先于 abort（abort 之后再读快照会丢最后一轮）。
+        // 统一收尾块（2026-10-14 审计后形状）：`if !reported { 补记; if !task.is_finished() { abort } }`
+        // —— 补记必须无条件先于 abort（abort 之后再读快照会丢最后一轮）。
         let cleanup = prod
-            .split("if !task.is_finished() {")
+            .split("if !reported {")
             .nth(1)
-            .expect("直播包装必须有统一断连收尾块")
+            .expect("直播包装必须有统一收尾块（未落账则补记）")
             .split("\n    });")
             .next()
             .expect("split 至少一段");
@@ -3680,10 +3717,29 @@ mod tests {
             .expect("收尾块必须先补记 Interrupted 账目");
         let abort_at = cleanup
             .find("task.abort();")
-            .expect("收尾块必须 abort 回灌任务");
+            .expect("收尾块必须 abort 仍在跑的回灌任务");
         assert!(
             account_at < abort_at,
             "补记必须发生在 abort 之前"
+        );
+        assert!(
+            cleanup.contains("if !task.is_finished() {"),
+            "abort 必须仍以「任务未结束」为条件：已结束的任务不能补 abort"
+        );
+        // 🔴 收尾窗口守卫：改前这里只判 `!task.is_finished()`，于是「断连时任务还在跑、
+        // 收尾瞬间它正好结束」这一支既不补记也不 abort ⇒ 该请求在面板上完全消失。
+        // 修法 = 显式跟踪「是否已落账」：三条落账分支各自置位，收尾只处理未落账的。
+        let wrapper = prod
+            .split("pub(super) fn mixed_websearch_stream_response")
+            .nth(1)
+            .expect("mixed_websearch_stream_response 不应被改名")
+            .split("\nfn loop_message_start_bytes")
+            .next()
+            .expect("split 至少一段");
+        assert!(
+            wrapper.matches("reported = true;").count() >= 3,
+            "成功 / 失败 / closed-且已结束 三条落账分支都必须置 reported\
+             （漏一处 → 统一收尾会对已落账的请求重复记账）"
         );
     }
 
@@ -4217,6 +4273,42 @@ mod tests {
         assert!(
             !out.stream_error,
             "stop 帧已到达时不得误报错（残留判据必须只在真残留时成立）"
+        );
+    }
+
+    /// 回灌收尾正文必须与主路径**同口径**处理完整文本（2026-10-14 审计）：
+    /// 流式 `StreamContext::strip_dsml_markers`、非流式
+    /// `strip_dsml_from_complete_text` 都剥 DSML 协议标记，回灌路径改前**零处理**
+    /// ⇒ DeepSeek 的 `<｜DSML｜function_calls>` 当正文逐字泄漏给客户端
+    /// （同型事故第 N 次）。客户端未声明 thinking 时还要剥内联 `<thinking>` 标签
+    /// （与非流式分支 4655-4663 逐条对齐）。
+    ///
+    /// 回退即 FAIL：删掉收尾处的两次剥离调用。
+    #[test]
+    fn loop_tail_strips_dsml_and_inline_thinking() {
+        let full = include_str!("websearch.rs");
+        let prod = full
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(full);
+        let loop_fn = prod
+            .split("pub(super) async fn run_web_search_loop")
+            .nth(1)
+            .expect("run_web_search_loop 不应被改名")
+            .split("\npub(super) fn ")
+            .next()
+            .expect("split 至少一段");
+        let dsml = ["strip_dsml_from", "_complete_text("].concat();
+        assert!(
+            loop_fn.contains(&dsml),
+            "回灌收尾正文必须过 stream::strip_dsml_from_complete_text\
+             （否则 DSML 协议标记泄漏给客户端）"
+        );
+        let thinking = ["strip_thinking_from", "_complete_text("].concat();
+        assert!(
+            loop_fn.contains(&thinking),
+            "客户端未声明 thinking 时，正文里的内联 <thinking> 标签必须剥离\
+             （与非流式分支同口径）"
         );
     }
 }

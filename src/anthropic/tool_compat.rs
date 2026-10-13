@@ -36,7 +36,11 @@ pub(super) fn tool_compat_mapping_enabled() -> bool {
 // 根治 `Invalid tool parameters`（Claude Code 发 file_path 而上游只认 path 那类参数错配）。
 
 fn optional_number(value: &serde_json::Value) -> Option<i64> {
-    value.as_i64().or_else(|| value.as_u64().map(|v| v as i64))
+    // ⚠️ `as i64` 对 > i64::MAX 的 u64 是**回绕**（`18446744073709551615` → -1），
+    // 会把一个「极大行号」变成负行号透传给上游。夹到 i64::MAX 保持「极大值」语义。
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().map(|v| v.min(i64::MAX as u64) as i64))
 }
 
 fn take_first(
@@ -188,7 +192,14 @@ pub(super) fn map_tool_input_to_kiro(
                 out.insert("start_line".to_string(), serde_json::json!(start));
             }
             if let Some(limit) = limit {
-                let end = offset.map(|start| start + limit - 1).unwrap_or(limit);
+                // ⚠️ 客户端可控的 i64 不能裸加：`offset = i64::MAX, limit = 2` 时
+                // `start + limit - 1` 在 debug 构建直接 panic（整数溢出），release 下
+                // 回绕成负行号下发上游。`start + (limit - 1)` 的写法在非溢出区间与
+                // 原式逐值等价（10 + (5-1) = 14），溢出时饱和到 i64::MAX
+                //（上游按「读到文件末尾」处理）。
+                let end = offset
+                    .map(|start| start.saturating_add(limit.saturating_sub(1)))
+                    .unwrap_or(limit);
                 out.insert("end_line".to_string(), serde_json::json!(end));
             }
             maybe_insert(&mut out, "explanation", take_first(&obj, &["explanation"]));
@@ -338,7 +349,11 @@ pub(crate) fn map_tool_input_from_kiro(
                 out.insert("offset".to_string(), serde_json::json!(start));
             }
             if let Some(end) = end {
-                let limit = start.map(|s| end - s + 1).unwrap_or(end);
+                // 同上：`end - start + 1` 在两端点都是客户端/上游可控 i64 时会溢出
+                // （debug panic / release 回绕成负 limit），saturating 保语义。
+                let limit = start
+                    .map(|s| end.saturating_sub(s).saturating_add(1))
+                    .unwrap_or(end);
                 if limit > 0 {
                     out.insert("limit".to_string(), serde_json::json!(limit));
                 }
@@ -817,4 +832,63 @@ pub(super) fn convert_tools(
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 🔴 溢出守卫（2026-10-14 审计）：`Read` 的行范围映射两端都是**客户端可控 i64**，
+    /// 裸加减会崩：改前 `start + limit - 1` 在 `offset = i64::MAX, limit = 2` 时
+    /// debug 构建整数溢出 panic、release 回绕成负行号下发上游。
+    #[test]
+    fn read_line_range_mapping_saturates_instead_of_overflowing() {
+        let out = map_tool_input_to_kiro(
+            "Read",
+            serde_json::json!({"file_path": "/a.txt", "offset": i64::MAX, "limit": 2}),
+        )
+        .expect("Read 映射不应失败");
+        assert_eq!(out["start_line"], serde_json::json!(i64::MAX));
+        assert_eq!(
+            out["end_line"],
+            serde_json::json!(i64::MAX),
+            "越界端点必须夹到 i64::MAX，不能回绕成负数"
+        );
+
+        // u64 > i64::MAX 不得经 `as i64` 回绕成负行号（改前 u64::MAX → -1）
+        let out = map_tool_input_to_kiro(
+            "Read",
+            serde_json::json!({"file_path": "/a.txt", "offset": u64::MAX}),
+        )
+        .expect("Read 映射不应失败");
+        assert_eq!(out["start_line"], serde_json::json!(i64::MAX));
+
+        // 正常范围语义逐字不变（10/5 → start 10 / end 14，converter_tests 同款断言）
+        let out = map_tool_input_to_kiro(
+            "Read",
+            serde_json::json!({"file_path": "/a.txt", "offset": 10, "limit": 5}),
+        )
+        .expect("Read 映射不应失败");
+        assert_eq!(out["start_line"], serde_json::json!(10));
+        assert_eq!(out["end_line"], serde_json::json!(14));
+    }
+
+    /// 出站方向同款：`end - start + 1` 在极端端点值下不得溢出（debug panic / 负 limit）。
+    #[test]
+    fn read_outbound_limit_mapping_saturates_instead_of_overflowing() {
+        let out = map_tool_input_from_kiro(
+            "Read",
+            serde_json::json!({"path": "/a.txt", "start_line": i64::MIN, "end_line": i64::MAX}),
+        );
+        assert_eq!(out["offset"], serde_json::json!(i64::MIN));
+        assert_eq!(out["limit"], serde_json::json!(i64::MAX));
+
+        // 正常范围语义逐字不变（10..14 → offset 10 / limit 5）
+        let out = map_tool_input_from_kiro(
+            "Read",
+            serde_json::json!({"path": "/a.txt", "start_line": 10, "end_line": 14}),
+        );
+        assert_eq!(out["offset"], serde_json::json!(10));
+        assert_eq!(out["limit"], serde_json::json!(5));
+    }
 }
