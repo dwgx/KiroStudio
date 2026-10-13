@@ -671,6 +671,42 @@ pub(crate) fn current_error_messages() -> std::sync::Arc<ErrorMessagesTable> {
     error_messages_cell().load_full()
 }
 
+/// 把一份配置**整批重播**进全部进程镜像（热重载入口，`token_manager::reload_config` 调用）。
+///
+/// ## 为什么需要这个入口（2026-10-14 多路审计 · 持久化面发现）
+///
+/// 镜像 setter 此前只有两个入口：① `main.rs` 启动播种；② admin 逐字段热更（只调
+/// 「本次请求里改动的字段」的 setter）。于是 `POST /config/import`（整份替换后只走
+/// `reload_config`）与「手改 config.json + 任意面板保存」之后，除 error_messages /
+/// compression 外的镜像仍是**启动值**，而面板快照读的是 ArcSwap 里的新值 —— 热路径
+/// 行为与面板长期不一致，直到重启。含安全开关：导入带 `ipBlocklist` /
+/// `machineCodeBlocklist` 的配置后封禁不生效，面板却显示已启用。
+///
+/// 幂等：全部 setter 都是「整份替换镜像」，重复调用无副作用（B7 位图只是重复置位）。
+/// 与 [`MIRROR_WIRED_NAMES`] 同步：**新增镜像 setter 时必须在本函数里补一行**
+/// （漏补的形态正是本条审计发现的：清单登记了，但没有整批重播入口）。
+pub(crate) fn replay_all_mirrors(cfg: &crate::model::config::Config) {
+    set_collect_client_fingerprint(cfg.collect_client_fingerprint);
+    set_trust_forwarded_header(cfg.trust_forwarded_header);
+    set_ip_blocklist(&cfg.ip_blocklist);
+    set_machine_code_blocklist(&cfg.machine_code_blocklist);
+    set_extract_thinking(cfg.extract_thinking);
+    set_cc_auto_buffer(cfg.cc_auto_buffer);
+    set_forward_suggestion_mode(cfg.forward_suggestion_mode);
+    set_first_token_retry(cfg.first_token_timeout_secs, cfg.first_token_max_retries);
+    set_prompt_cache_enabled(cfg.prompt_cache_enabled);
+    set_mock_cache_config(cfg.mock_cache_enabled, cfg.mock_cache_read_ratio);
+    set_tool_clean_leaked_tokens(cfg.tool_clean_leaked_tokens);
+    set_tool_reclaim_textified_invoke(cfg.tool_reclaim_textified_invoke);
+    set_tool_stray_repeat_guard(cfg.tool_stray_repeat_guard);
+    set_tool_stream_align_failure(cfg.tool_stream_align_failure);
+    set_tool_expose_error_to_client(cfg.tool_expose_error_to_client);
+    set_tool_repair_json(cfg.tool_repair_json);
+    set_tool_truncation_recovery(cfg.tool_truncation_recovery);
+    set_compression(cfg.compression.clone());
+    set_error_messages(cfg.error_messages.clone());
+}
+
 /// 从错误消息配置表解析一个 key 的渲染值。
 ///
 /// 未配置该 key（或字段为 None）→ 用调用点内置默认（= 现状文案/码/退避秒数，零行为变化）。

@@ -10770,12 +10770,19 @@
         );
     }
 
-    /// 配套源码守卫（blockers #1）：`reload_config` 必须调 `set_compression` 播压缩镜像。
+    /// 配套源码守卫（blockers #1；2026-10-14 整批重播改造后改钉新链路）：`reload_config`
+    /// 必须把**全部进程镜像**重播一遍（经 `replay_all_mirrors`），压缩镜像在其中。
     ///
     /// 与上面的行为测试互补：行为测试证明「当前语义对」，这条锁住「调用还在 reload_config
     /// 里、且没有被注释掉」——将来有人删掉/注释掉这行，热路径会退回启动旧镜像而测试
     /// （行为测试）不一定红（可能没有 compression 相关的其它测试）。needle 运行时拼接 +
     /// 剔注释行：注释掉调用后守卫必须 FAIL（防 include_str 自证绿，守卫纪律见 CURRENT.md）。
+    ///
+    /// 历史：本守卫原先直接钉 `reload_config` 里的 `set_compression(...)` 一行。2026-10-14
+    /// 多路审计发现「只重播 error_messages/compression」是漏口（其余 17 个镜像含
+    /// ipBlocklist/machineCodeBlocklist 停在启动值），改为整批重播入口；**守卫意图不变**
+    /// （reload 之后压缩镜像必须是新值），故改钉新链路。「整批入口覆盖 compression」
+    /// 这一半由 handlers 侧的 `replay_all_mirrors_covers_every_registered_name` 守卫锁住。
     #[test]
     fn reload_config_must_broadcast_compression_setter() {
         let src = include_str!("token_manager.rs");
@@ -10798,10 +10805,10 @@
             .collect::<Vec<_>>()
             .join("\n");
         // needle 运行时拼接：include_str! 会把本测试自己的字面量也读进来。
-        let needle = format!("set_compression(new.compression{}", ".clone())");
+        let needle = format!("replay_all_mirrors(&new{}", ")");
         assert!(
             block.contains(&needle),
-            "reload_config 必须调 set_compression 把新 compression 播进 handlers 镜像：\
+            "reload_config 必须调整批重播入口把新配置播进 handlers 镜像（含 compression）：\
              压缩消费点全部读镜像（handlers.rs current_compression）不读 config，\
              漏播 ⇒ 手改 config.json + 面板保存触发 reload 后热路径仍读启动旧镜像"
         );

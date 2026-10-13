@@ -3045,24 +3045,21 @@ impl MultiTokenManager {
             .store(new.credential_rpm_limit, Ordering::Relaxed);
         self.rpm_headroom_factor
             .store(new.rpm_headroom_factor, Ordering::Relaxed);
-        // 错误码/提示词覆盖表（TIER1 表 + handlers 进程镜像）：reload 后用新表改写
-        // 镜像，错误翻译处下个请求即读到（main 启动播种 + 此处热更 = 两个入口都齐）。
+        // ⭐ 整批重播**全部**进程镜像（19 个，含原先的 error_messages / compression 两个）：
+        // 此前只重播那两个是 2026-10-14 多路审计发现的漏口 —— `POST /config/import`
+        // （整份替换）与「手改 config.json + 面板保存」都只走到这里，其余 17 个镜像
+        // （含 ipBlocklist / machineCodeBlocklist 这类安全开关）仍停在启动值，面板读
+        // ArcSwap 显示新值 ⇒ 行为与显示长期不一致直到重启。见 `replay_all_mirrors` 文档。
         //
         // ⚠️ 调用环标注（结构绊脚石 #16）：本行是 kiro 层 → anthropic 层的**反向引用**。
         // 环的另一半（anthropic → kiro）大量存在（handlers → provider 主方向 + provider
         // 对 AbsorbClass 的类型引用），故本环无法归零；依赖方向纪律 = 本仓 kiro 层对
-        // anthropic 层的镜像类反向引用**仅限这 2 处**（此处 + set_compression 下方），
-        // 新增 kiro → anthropic 引用必须在 review 时显式说明理由。正解是把镜像存储搬到
-        // 中性模块（如 common/runtime_state.rs，set/current 签名不动 + anthropic 层
-        // re-export），届时本行与 set_compression 两处改指新模块即可（消费点零改动）。
-        crate::anthropic::handlers::set_error_messages(new.error_messages.clone());
-        // 输入压缩配置（handlers 进程镜像，同 error_messages 同款）：消费点全部读
-        // `current_compression()` 镜像而非 config（handlers.rs 压缩热路径 5 处），
-        // reload 后用新配置改写镜像，下个请求即读到（main/router 启动播种 + 此处
-        // 热更 = 两个入口都齐；此前只有启动播种 ⇒ 手改 config.json 压缩配置 +
-        // 面板保存触发 reload 后热路径仍读启动旧镜像，2026-08-15 清单 #1）。
-        // 调用环标注同上方 set_error_messages（#16 仅此 2 处反向引用之一）。
-        crate::anthropic::handlers::set_compression(new.compression.clone());
+        // anthropic 层的镜像类反向引用**仅限这 1 处**（原先分散在 set_error_messages +
+        // set_compression 两行，整批重播入口把两处收敛为一处），新增 kiro → anthropic
+        // 引用必须在 review 时显式说明理由。正解是把镜像存储搬到中性模块（如
+        // common/runtime_state.rs，set/current 签名不动 + anthropic 层 re-export），
+        // 届时本行改指新模块即可（消费点零改动）。
+        crate::anthropic::handlers::replay_all_mirrors(&new);
         self.rpm_reserve_slots
             .store(new.rpm_reserve_slots, Ordering::Relaxed);
         self.rpm_hard_gate_overload_wait

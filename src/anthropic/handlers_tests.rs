@@ -4896,6 +4896,32 @@ mod mirror_wiring_guard {
         assert_eq!(sorted.len(), deduped.len(), "MIRROR_WIRED_NAMES 含重复名字");
     }
 
+    /// 整批重播入口必须覆盖名字表里的**每一个**镜像。
+    ///
+    /// 为什么必须守卫：`replay_all_mirrors` 是 `reload_config`（`POST /config/import`
+    /// 与「手改 config.json + 面板保存」的共同路径）唯一的镜像重播点。少一行 ⇒ 那个
+    /// 镜像停在启动值，面板显示新值、热路径用旧值，直到重启（2026-10-14 审计发现）。
+    /// 判据由名字表驱动（与 setter 登记守卫同一张表）：新增镜像漏补重播 → 本用例红。
+    #[test]
+    fn replay_all_mirrors_covers_every_registered_name() {
+        let full = include_str!("handlers.rs");
+        let prod = full.split("\n#[cfg(test)]").next().unwrap_or(full);
+        let at = prod
+            .find("fn replay_all_mirrors(")
+            .expect("整批重播入口必须存在");
+        let body = &prod[at..];
+        let end = body.find("\n}\n").unwrap_or(body.len());
+        let body = &body[..end];
+        for name in super::MIRROR_WIRED_NAMES {
+            // setter 命名纪律：名字表项即 setter 名去掉 set_ 前缀（两者必须同步）
+            let needle = format!("set_{}(", name);
+            assert!(
+                body.contains(&needle),
+                "整批重播漏了镜像 {name}（缺 {needle}）—— reload_config 之后它会停在启动值"
+            );
+        }
+    }
+
     /// 位图框架自检：全部置位后 unwired 为空；mark 未登记名字必须 panic。
     #[test]
     fn bitmap_unwired_and_unknown_name() {
