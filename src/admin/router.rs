@@ -56,6 +56,7 @@ use super::{
 /// - `POST /credentials` - 添加新凭据
 /// - `POST /credentials/:id/clone` - 给已有号再加 N 份分身（key 不经前端）
 /// - `POST /import/keys` - 批量导入 Kiro API Key
+/// - `POST /import/kiro-cli` - 从官方 kiro-cli 的 data.sqlite3 只读导入登录
 /// - `DELETE /credentials/:id` - 删除凭据
 /// - `POST /credentials/batch-delete` - 批量删除（收 ids）
 /// - `POST /credentials/batch-reset` - 批量重置失败计数
