@@ -1700,11 +1700,18 @@ impl StreamContext {
         // 治 Opus 退化刷屏(课/course/任意短词连写或独占行)。脱离 reclaim 路径独立生效——
         // 这修了审计发现的两个 HIGH 盲区:①thinking 提前 return 绕过 ②无工具请求绕过。
         // 熔断已 tripped → 返回空丢弃剩余;截断 → 只保留阈值前文本。
-        let guarded = self.stray_guard_filter(&cleaned).into_owned();
+        //
+        // ⚠️ 不要 `.into_owned()`：未命中熔断时它返回 `Cow::Borrowed(text)`，而本处只用到
+        // `is_empty()` 与取 `&str` —— into_owned 会把**每个 chunk**都整份复制一遍
+        // （无 DSML / 无泄漏的常态路径 100% 走到这里）。`cleaned` 是本地 String，
+        // `content` 借它即可，与后续 `&mut self` 调用无借用冲突。
+        // 取 `&str` 用 `as_ref()`：`Cow<str>::as_str()` 在稳定版是 `str::as_str`
+        // （unstable `str_as_str`，E0658），`AsRef` 才是稳定路径。
+        let guarded = self.stray_guard_filter(&cleaned);
         if guarded.is_empty() {
             return Vec::new();
         }
-        let content = guarded.as_str();
+        let content: &str = guarded.as_ref();
 
         // tool_use XML 泄漏过滤（跨 chunk 状态机）：上游把工具调用当**正文文本**吐时，
         // `<tool_use …></tool_use>` 会被客户端当普通文本渲染。这里在 token 估算与后续
@@ -1827,6 +1834,10 @@ impl StreamContext {
                         }
                         // 结束标签未到：整段都还是思考内容（全部丢弃），只保留**真的可能是**
                         // 半个 `</thinking>` 的尾巴等下一个 chunk。
+                        //
+                        // 先压缩超长「标签 + 纯空白」尾巴：不压缩时 `keep` 会等于整个缓冲
+                        // （safe_len == 0 ⇒ 既不丢也不收缩）⇒ 上游持续吐无换行空白即无界增长。
+                        compact_oversized_hold_tail(&mut self.thinking_buffer);
                         let keep = partial_thinking_tag_suffix_len(&self.thinking_buffer);
                         let cut = self.thinking_buffer.len() - keep;
                         self.thinking_buffer = self.thinking_buffer[cut..].to_string();
@@ -2016,6 +2027,11 @@ impl StreamContext {
                     //
                     // 长度**不能写死** `"</thinking>\n\n".len()`=13：带属性/带空白的闭标签
                     // （`</thinking >`）比它长，扣不住就漏；改为按标签语法判定。
+                    //
+                    // 先压缩超长「标签 + 纯空白」尾巴（无界增长防线，见
+                    // `compact_oversized_hold_tail`）：不压缩时 keep 等于整个缓冲 ⇒
+                    // safe_len == 0 ⇒ 既不 emit 也不收缩 ⇒ 上游持续吐无换行空白即无界增长。
+                    compact_oversized_hold_tail(&mut self.thinking_buffer);
                     let keep = partial_thinking_tag_suffix_len(&self.thinking_buffer);
                     let safe_len = self.thinking_buffer.len() - keep;
                     if safe_len > 0 {
@@ -2923,23 +2939,29 @@ impl StreamContext {
         //   累积快照 / 纯增量碎片 / 重复终帧 / 迟到旧短快照 / 非前缀重写 均被正确处理。
         //   关键：非前缀双完整对象不再被无脑 append 成 `}{` 粘连非法 JSON（Invalid tool parameters 类型 C）。
         if !tool_use.input.is_empty() {
-            let model = self.model.clone();
+            // ⚠️ 探针关闭时**不做任何克隆**：本块对每帧 toolUseEvent 都跑，而 input 可能是
+            // 已累积数百 KB 的完整 JSON 快照 —— 无条件 `model.clone()` + `buf.clone()`
+            // 会在热路径上产生与累积长度成正比的纯浪费复制（帧数 × 缓冲长度 = O(n²)）。
+            // 探针（KIRO_TOOL_TRACE）开启时行为与旧实现逐字节一致（同样的三个入参）。
+            let trace = tool_trace_enabled();
+            let model = if trace { self.model.clone() } else { String::new() };
             let buf = self
                 .tool_input_sent
                 .entry(tool_use.tool_use_id.clone())
                 .or_default();
-            // 帧探针（KIRO_TOOL_TRACE）：抓上游逐帧原文 + 合并轨迹，定性 Invalid tool parameters 真因。
-            let buf_before = buf.clone();
+            let buf_before = if trace { buf.clone() } else { String::new() };
             *buf = merge_tool_input(buf, &tool_use.input);
-            trace_tool_frame(
-                &model,
-                &tool_use.tool_use_id,
-                &tool_use.name,
-                tool_use.stop,
-                &tool_use.input,
-                &buf_before,
-                buf,
-            );
+            if trace {
+                trace_tool_frame(
+                    &model,
+                    &tool_use.tool_use_id,
+                    &tool_use.name,
+                    tool_use.stop,
+                    &tool_use.input,
+                    &buf_before,
+                    buf,
+                );
+            }
         }
 
         // 仅在 stop 时把完整缓冲一次性发出 + 关闭块（此前只累积、不发 partial_json）。
@@ -3379,12 +3401,20 @@ impl StreamContext {
         // 收尾 flush invoke 嗅探缓冲:流结束时残留的半块(未等到 </invoke>)当普通文本吐,绝不静默吞。
         events.extend(self.flush_invoke_sniff_buffer());
         // 收尾 flush tool_use XML 泄漏过滤:已确认在标签内的残留丢弃(泄漏);被误判为半前缀的
-        // 正文残留补发(不吞字)。残留要按普通文本走统一出口 `emit_non_thinking_text` —— 直接
-        // create_text_delta_events 会绕开 invoke 重组层(与上面 :2595 记的是同一型缺陷)。
+        // 正文残留补发(不吞字)。
+        //
+        // ⚠️ 这里**不能**走 `emit_non_thinking_text`（reclaim 统一出口）：上面
+        // `flush_invoke_sniff_buffer` 已经跑过，此刻再往 `invoke_sniff_buffer` 里塞东西
+        // **没有人再 drain**。而本残留恒是 `partial_tool_use_xml_prefix_suffix` 扣下的
+        // 「半个 `<tool_use` 前缀」（≤8 字节，`finish_tool_use_xml_filter` 只可能返回
+        // 这段 carry 或空串），以 `<` 开头、无 `>` ⇒ `drain_invoke_sniff_buffer(false)`
+        // 会把它当「可能的半标签」原样留在缓冲里 ⇒ **静默吞掉**（面板记成功、客户端少几个字节）。
+        // 且它永远不可能是完整 invoke 块（长度不够），走 reclaim 层没有任何收益。
+        // 故与下方 reasoning 降级同一处置：直接发 text_delta。
         let tool_use_xml_residue = self.finish_tool_use_xml_filter();
         if !tool_use_xml_residue.is_empty() {
             self.output_tokens += estimate_tokens(&tool_use_xml_residue);
-            events.extend(self.emit_non_thinking_text(&tool_use_xml_residue));
+            events.extend(self.create_text_delta_events(&tool_use_xml_residue));
         }
 
         // ⭐ 空响应兜底（`!thinking_enabled`）：本轮**只有** reasoning、正文为空时，
@@ -3587,6 +3617,24 @@ pub struct BufferedStreamContext {
     buffer_overflowed: bool,
 }
 
+/// 只数字节、不留数据的 `io::Write`：给 [`BufferedStreamContext::estimate_events_bytes`]
+/// 做序列化体积记账用。
+///
+/// 计数与 `serde_json::to_string(..).len()` **逐字节一致**（后者就是同一个 serializer
+/// 写进 Vec），唯一差别是不分配那个 Vec/String。
+struct CountingWriter(usize);
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl BufferedStreamContext {
     /// 创建缓冲流上下文
     pub fn new(
@@ -3614,10 +3662,20 @@ impl BufferedStreamContext {
     }
 
     /// 估算一批事件的字节占用（event 名 + 序列化 data），用于缓冲上限累计。
+    ///
+    /// 用**计数 writer** 代替 `serde_json::to_string(..).len()`：序列化字节数逐字节相同
+    /// （`to_string` 内部就是把同一个 serializer 写进 Vec），但不再为每个事件分配一个
+    /// 临时 String 再立刻丢弃 —— 本函数在缓冲路径上对**每个**上游事件批次都跑一遍，
+    /// 一次大响应就是成百上千次「序列化 + 分配 + 丢」。
     fn estimate_events_bytes(events: &[SseEvent]) -> usize {
         events
             .iter()
-            .map(|e| e.event.len() + serde_json::to_string(&e.data).map(|s| s.len()).unwrap_or(0))
+            .map(|e| {
+                let mut counter = CountingWriter(0);
+                let serialized = serde_json::to_writer(&mut counter, &e.data).is_ok();
+                let data_bytes = if serialized { counter.0 } else { 0 };
+                e.event.len() + data_bytes
+            })
             .sum()
     }
 

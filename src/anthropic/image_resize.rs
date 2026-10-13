@@ -424,17 +424,20 @@ fn shrink_static_image(
     let mut out;
     let mut quality;
     loop {
-        let resized = if w.max(h) > cur_long {
+        // 不再 `img.clone()` 成中间 `DynamicImage` 再 `to_rgb8()`：那会为每次外层迭代
+        // 多复制一份整图（`to_rgb8` 对 RGB8 输入本身就要复制一次）。直接把两条分支各自的
+        // 结果转 RGB8 —— 输出逐字节相同，少一次全图分配+拷贝（本函数在同步阻塞池里跑，
+        // 大图下这次拷贝是实打实的 CPU 与内存带宽）。
+        let rgb = if w.max(h) > cur_long {
             let scale = cur_long as f32 / w.max(h) as f32;
             let new_w = ((w as f32) * scale).round().max(1.0) as u32;
             let new_h = ((h as f32) * scale).round().max(1.0) as u32;
             // FilterType::Lanczos3 gives good visual quality; ~80ms for 1206x2622 -> 1024x~470 on one core.
-            img.resize_exact(new_w, new_h, FilterType::Lanczos3)
+            img.resize_exact(new_w, new_h, FilterType::Lanczos3).to_rgb8()
         } else {
-            img.clone()
+            // Force RGB8 (JPEG has no alpha; dropping alpha is harmless for screenshots).
+            img.to_rgb8()
         };
-        // Force RGB8 (JPEG has no alpha; dropping alpha is harmless for screenshots).
-        let rgb = resized.to_rgb8();
         quality = cfg.jpeg_quality;
         loop {
             out = Vec::with_capacity(64 * 1024);

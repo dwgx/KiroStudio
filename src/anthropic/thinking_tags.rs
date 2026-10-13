@@ -295,12 +295,26 @@ pub(crate) fn find_real_thinking_end_tag_at_buffer_end(buffer: &str) -> Option<T
 /// | 含换行的空白 / `<` | 严格判据本就会命中，不该走到这里 |
 /// | 普通字符（非空白非 `<`） | **永久不可满足 ⇒ 就地判定结束** |
 ///
+/// ⚠️ **引用包裹的标签必须先跳过**（与 [`find_real_thinking_end_tag`] 同一判据）：
+/// 引用包裹的 `</thinking>` 按全套 `find_real_*` 的语义**根本不是标签**（模型在思考里
+/// 引用/讨论它，见 [`find_real_thinking_end_tag`] 的文档），严格判据对它**永不**放行。
+/// 若这里不跳过，剥离路径会把思考正文里的 `` `</thinking>` `` 当成真结束 ⇒ 块提前关闭
+/// （`in_thinking_block = false`）⇒ 其后**仍是模型推理**的文本被当作可见正文下发
+/// —— 客户端明确表示不要 thinking，却收到了推理尾巴（泄漏）；同时标签本身被剥掉，
+/// 与本仓「引用包裹的是正文，不得剥」的既有口径相反。跳过它，判据就仍落在
+/// 「该位置是否**永久**无法满足」上，与其它三个 finder 一致。
+///
 /// 只在 `!thinking_enabled` 的剥离路径用。thinking 开启时残留会进 thinking 面板、
 /// 不算泄漏也不算吞字，无需放宽（放宽反而可能把正文里顺口提到的标签当成真结束）。
 pub(crate) fn find_permanently_unsatisfiable_end_tag(buffer: &str) -> Option<ThinkingTagMatch> {
     let mut search_start = 0;
     while let Some(m) = scan_thinking_tag(buffer, search_start, true) {
         let absolute_pos = m.start;
+        // 引用包裹 → 严格判据根本不把它当候选标签，这里也不得拿它当结束（否则泄漏推理尾巴）。
+        if thinking_tag_is_quoted(buffer, &m) {
+            search_start = absolute_pos + 1;
+            continue;
+        }
         let after = &buffer[m.end()..];
         match after.chars().next() {
             // 标签后还什么都没到 → 等
@@ -463,7 +477,9 @@ pub(crate) fn could_grow_into_thinking_tag(tail: &str) -> bool {
 /// | 已是完整标签、其后已有实质内容 | 0 —— 该由 finder 判定，不是"等更多"的形态 |
 ///
 /// 上界由 [`MAX_THINKING_TAG_INNER_BYTES`] 保证（带属性后标签不再定长，无上限会
-/// 复刻已知问题 #14 的流停摆）。
+/// 复刻已知问题 #14 的流停摆）。「标签 + 纯空白」这一格的**空白无界增长**另由
+/// [`compact_oversized_hold_tail`] 在调用方收口（本函数保持"返回整段尾巴"的语义，
+/// 因为它同时服务 in-block 与 not-in-block 两族调用点，压缩是调用点的责任）。
 pub(crate) fn partial_thinking_tag_suffix_len(buffer: &str) -> usize {
     // 标签必以 `<` 开头；只有最后一个 `<` 之后的部分才可能是"还没到齐的标签"。
     let Some(p) = buffer.rfind('<') else {
@@ -480,6 +496,64 @@ pub(crate) fn partial_thinking_tag_suffix_len(buffer: &str) -> usize {
         tail_len
     } else {
         0
+    }
+}
+
+/// in-block 扣留尾巴的熔断线（字节）。
+///
+/// 正常跨 chunk 的 `\n\n` 段落分隔最多只差 **2 字节**；256 KiB 纯空白不可能是"还没到齐"。
+/// 与 `stream.rs` 的 `MAX_THINKING_BUFFER_BYTES` / `MAX_INVOKE_HOLD_BYTES` 同量级。
+pub(crate) const MAX_TAG_WHITESPACE_HOLD_BYTES: usize = 256 * 1024;
+
+/// 压缩「完整标签 + 超长纯空白」的扣留尾巴，防 `thinking_buffer` 无界持有（远程 DoS）。
+///
+/// # 形态与后果
+///
+/// 缓冲末尾是「完整标签 + 不含换行的空白」时，[`partial_thinking_tag_suffix_len`]
+/// 返回**整段尾巴**（空白仍可能长成含换行的段落分隔）。若上游在标签后**持续吐不含换行的
+/// 空白**（退化模型 / 恶意上游），扣留长度就等于整个缓冲 ⇒ 调用方
+/// `safe_len = len - keep == 0` ⇒ 既不 emit 也不收缩 ⇒ `thinking_buffer` 随流无界增长
+/// （1:1 放大上游字节；同型教训：`invoke_sniff_buffer` 无界持有 = 已知问题 #14；
+/// 另一分支（not-in-block）的纯空白同型洞已由 review Finding 5 修掉）。
+///
+/// # 为什么可以丢中间那段空白（语义等价，非启发式）
+///
+/// 严格判据对「标签 + 空白」只看两件事：① 空白串里**有没有换行**；② 空白串是否
+/// **顶到缓冲末尾且不足 2 字节**（`\n\n` 可能跨 chunk）。两者都只依赖**末尾 ≤2 字节**
+/// 与后续 chunk 的拼接 —— 中间那段空白不参与任何判定。故这里把缓冲压成
+/// 「[标签及之前全部] + [末尾 ≤2 字节空白]」，丢掉中间**不含换行**的空白
+/// （含换行的形态根本走不到本函数：严格判据早已命中并消费标签）。判定结果逐字节不变；
+/// 被丢掉的空白无论按哪条路径处理都还是空白（thinking 面板 / 正文里的空格），
+/// 没有可见语义。空白可能是多字节字符（U+3000 等），截窗必须回退到字符边界。
+///
+/// 只在超 [`MAX_TAG_WHITESPACE_HOLD_BYTES`] 时动手；正常流一律不进入。
+pub(crate) fn compact_oversized_hold_tail(buffer: &mut String) {
+    if buffer.len() <= MAX_TAG_WHITESPACE_HOLD_BYTES {
+        return;
+    }
+    let Some(p) = buffer.rfind('<') else {
+        return;
+    };
+    for closing in [true, false] {
+        let Some(len) = thinking_tag_len_at(buffer, p, closing) else {
+            continue;
+        };
+        let ws_start = p + len;
+        let ws = &buffer[ws_start..];
+        // 只处理「纯空白且不含换行」的尾巴：含换行说明判据早已命中（走不到这里），
+        // 放进来会让「丢空白不影响判定」的证明失效。
+        if ws.is_empty() || !ws.trim().is_empty() || ws.contains('\n') {
+            return;
+        }
+        // 保留 [0, ws_start) + 末尾 ≤2 字节空白（回退到字符边界，多留不多切）。
+        let mut cut = buffer.len().saturating_sub(PARAGRAPH_BREAK_LEN).max(ws_start);
+        while cut > ws_start && !buffer.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let tail = buffer[cut..].to_string();
+        buffer.truncate(ws_start);
+        buffer.push_str(&tail);
+        return;
     }
 }
 
@@ -601,4 +675,158 @@ pub(crate) fn strip_thinking_from_complete_text(text: &str) -> String {
     }
     out.push_str(text_after);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 扣留尾巴必须**有界**：标签后跟超长纯空白（无换行）时，压缩必须收口。
+    ///
+    /// 回归：不压缩 ⇒ `partial_thinking_tag_suffix_len` 返回整段尾巴 ⇒ 调用方
+    /// `safe_len = len - keep == 0` ⇒ 既不 emit 也不收缩 ⇒ `thinking_buffer` 随流无界
+    /// 增长（远程 DoS；同型教训见已知问题 #14 的 `invoke_sniff_buffer` 无界持有）。
+    #[test]
+    fn oversized_tag_plus_whitespace_tail_is_compacted() {
+        let tag = "</thinking>";
+        let mut buffer = format!("{tag}{}", " ".repeat(MAX_TAG_WHITESPACE_HOLD_BYTES + 4096));
+        let original_len = buffer.len();
+        compact_oversized_hold_tail(&mut buffer);
+        assert!(
+            buffer.len() <= tag.len() + PARAGRAPH_BREAK_LEN,
+            "压缩后只应剩「标签 + ≤2 字节空白」，实际 {} 字节（原 {}）",
+            buffer.len(),
+            original_len
+        );
+        assert!(
+            buffer.starts_with(tag),
+            "标签必须保留（它还要参与后续结束判定），实际: {:?}",
+            &buffer[..buffer.len().min(32)]
+        );
+        // 判定语义不变：段落分隔在后续 chunk 到达时，严格判据仍必须命中该标签。
+        buffer.push_str("\n\n答案");
+        assert!(
+            find_real_thinking_end_tag(&buffer).is_some(),
+            "压缩后，跨 chunk 到达的段落分隔仍必须让严格判据命中"
+        );
+        // 未超上限不动（正常流零影响）。
+        let mut small = format!("{tag}  ");
+        compact_oversized_hold_tail(&mut small);
+        assert_eq!(small, "</thinking>  ");
+        // 多字节空白（U+3000）不得切在字符中间 panic。
+        let mut multi = format!("{tag}{}", "\u{3000}".repeat(MAX_TAG_WHITESPACE_HOLD_BYTES / 3 + 64));
+        compact_oversized_hold_tail(&mut multi);
+        assert!(
+            multi.len() <= tag.len() + 3 * PARAGRAPH_BREAK_LEN,
+            "多字节空白压缩后仍应有界（且不 panic），实际 {} 字节",
+            multi.len()
+        );
+        assert!(multi.starts_with(tag));
+    }
+
+    /// 引用包裹的 `</thinking>` **不是**候选结束标签，不得被「永久不可满足」判据当成结束。
+    ///
+    /// 回归场景（`!thinking_enabled` 的剥离路径）：模型在思考里引用标签
+    /// （`` 盘算…`</thinking>`继续盘算 ``），严格判据按语义跳过引用包裹的标签（永不认它），
+    /// 而本判据此前不看引用包裹 ⇒ 直接判「永久不可满足 ⇒ 就地结束」⇒ 剥离器提前关块，
+    /// 其后**仍是推理**的文本被当可见正文下发（客户端没要 thinking 却收到推理尾巴），
+    /// 同时标签本身被剥掉（与「引用包裹的是正文，不得剥」的既有口径相反）。
+    ///
+    /// 删掉本函数里的 `thinking_tag_is_quoted` 分支 → 本测试必 FAILED。
+    #[test]
+    fn quoted_end_tag_is_never_a_candidate() {
+        // 反引号包裹 + 紧跟普通字符：旧实现返回 Some（⇒ 提前关块 + 泄漏推理尾巴）。
+        assert_eq!(
+            find_permanently_unsatisfiable_end_tag("盘算`</thinking>`继续盘算"),
+            None,
+            "引用包裹的标签不是候选，不得当作永久不可满足的结束点"
+        );
+        // 双引号 / 单引号同理。
+        assert_eq!(
+            find_permanently_unsatisfiable_end_tag("盘算\"</thinking>\"继续"),
+            None
+        );
+        assert_eq!(
+            find_permanently_unsatisfiable_end_tag("盘算'</thinking>'继续"),
+            None
+        );
+        // 对照：真结束标签（未被引用包裹）+ 紧跟普通字符，仍然要就地判定结束，
+        // 否则 `</thinking>Answer` 形态的答案会被永久丢弃（既有修复不得回退）。
+        assert_eq!(
+            find_permanently_unsatisfiable_end_tag("盘算</thinking>答案在此"),
+            Some(ThinkingTagMatch {
+                start: "盘算".len(),
+                len: "</thinking>".len(),
+            })
+        );
+        // 引用包裹的标签在前、真结束标签在后：跳过前者，命中后者。
+        assert_eq!(
+            find_permanently_unsatisfiable_end_tag("`</thinking>`盘算</thinking>答案"),
+            Some(ThinkingTagMatch {
+                start: "`</thinking>`盘算".len(),
+                len: "</thinking>".len(),
+            })
+        );
+    }
+
+    /// 引用包裹的标签在剥离路径里不得造成「提前关块」（推理尾巴泄漏）。
+    ///
+    /// 走**真实**剥离路径（`StreamContext::process_assistant_response` +
+    /// `generate_final_events`），不在测试里复刻状态机 —— 复刻会与实现漂移，
+    /// 漂移的测试就是假绿。
+    #[test]
+    fn quoted_end_tag_must_not_end_the_block_early() {
+        use std::collections::HashMap;
+        let mut ctx = super::super::StreamContext::new_with_thinking(
+            "claude-sonnet-5",
+            1,
+            false,
+            HashMap::new(),
+        );
+        let mut ev = ctx.generate_initial_events();
+        ev.extend(ctx.process_assistant_response("<thinking>盘算`</thinking>`继续盘算"));
+        ev.extend(ctx.generate_final_events());
+        let text: String = ev
+            .iter()
+            .filter(|e| e.event == "content_block_delta")
+            .filter_map(|e| e.data["delta"]["text"].as_str())
+            .collect();
+        // 旧行为：剥离器在引用标签处提前关块 ⇒ 其后的推理（`继续盘算`）被当可见正文下发。
+        assert!(
+            !text.contains("继续盘算") && !text.contains("盘算"),
+            "引用包裹的结束标签不得让剥离器提前关块（推理尾巴会泄漏成正文），实际: {text:?}"
+        );
+    }
+
+    /// 对照：引用包裹的标签**在前**、真结束标签在后时，真标签仍必须关块并放行其后正文。
+    ///
+    /// 防「一律不认引用标签」的过度修复：跳过引用标签是跳过**那一个候选**，不是放弃整个块。
+    #[test]
+    fn quoted_end_tag_before_real_one_still_closes_block() {
+        use std::collections::HashMap;
+        let mut ctx = super::super::StreamContext::new_with_thinking(
+            "claude-sonnet-5",
+            1,
+            false,
+            HashMap::new(),
+        );
+        let mut ev = ctx.generate_initial_events();
+        ev.extend(
+            ctx.process_assistant_response("<thinking>盘算`</thinking>`继续</thinking>答案在此"),
+        );
+        ev.extend(ctx.generate_final_events());
+        let text: String = ev
+            .iter()
+            .filter(|e| e.event == "content_block_delta")
+            .filter_map(|e| e.data["delta"]["text"].as_str())
+            .collect();
+        assert!(
+            text.contains("答案在此"),
+            "真结束标签之后的正文必须下发，实际: {text:?}"
+        );
+        assert!(
+            !text.contains("继续"),
+            "真标签之前的推理（含引用标签）不得进正文，实际: {text:?}"
+        );
+    }
 }
