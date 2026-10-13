@@ -1554,6 +1554,15 @@ async fn decode_round(
     if decoder.is_stopped() {
         out.stream_error = true;
     }
+    // ⚠️ 残留 tool 缓冲同款（2026-10-14 流式审计发现）：干净 EOF 但 `toolUseEvent` 的
+    // stop 帧没到 ⇒ 那条 tool_use 凭空消失 —— `round.web_search` 与 `round.client_tool_use`
+    // 都为空 → `should_replay_round` 判假 → 本轮被当正常 end_turn 渲染给客户端：工具不执行、
+    // 搜索不发生，客户端连一个错误都收不到（agentic 循环静默卡住）。
+    // 主路径对同一形态有明确兜底（stream.rs 的残留 input 先 flush 再关块 + Incomplete），
+    // 两条路径口径必须一致：**宁可整轮报错，也不静默吞工具**。
+    if !tool_buffers.is_empty() {
+        out.stream_error = true;
+    }
     out
 }
 
@@ -3999,6 +4008,93 @@ mod tests {
         // 复位（防污染其它测试的全局镜像）。
         crate::anthropic::handlers::set_error_messages(
             crate::anthropic::handlers::ErrorMessagesTable::new(),
+        );
+    }
+
+    // ===== 回灌轮解码：残留 tool 缓冲的收口（2026-10-14 流式审计）=====
+
+    /// 拼一个合法 AWS Event Stream 帧（与 `handlers_tests` 的 aws_frame 同款布局：
+    /// prelude(4B total + 4B header_len + 4B prelude CRC) + headers + payload + 4B 消息 CRC32）。
+    fn ws_aws_frame(event_type: &str, payload: &str) -> Vec<u8> {
+        use crate::kiro::parser::crc::crc32;
+        use crate::kiro::parser::frame::PRELUDE_SIZE;
+        const NAME: &[u8] = b":event-type";
+        let mut headers = Vec::new();
+        headers.push(NAME.len() as u8);
+        headers.extend_from_slice(NAME);
+        headers.push(7u8);
+        headers.extend_from_slice(&(event_type.len() as u16).to_be_bytes());
+        headers.extend_from_slice(event_type.as_bytes());
+        let header_length = headers.len() as u32;
+        let total_length = (PRELUDE_SIZE + headers.len() + payload.len() + 4) as u32;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&total_length.to_be_bytes());
+        buf.extend_from_slice(&header_length.to_be_bytes());
+        let prelude_crc = crc32(&buf[..8]);
+        buf.extend_from_slice(&prelude_crc.to_be_bytes());
+        buf.extend_from_slice(&headers);
+        buf.extend_from_slice(payload.as_bytes());
+        let msg_crc = crc32(&buf);
+        buf.extend_from_slice(&msg_crc.to_be_bytes());
+        buf
+    }
+
+    /// 由帧列表造一个「干净 EOF」的 reqwest 响应（流自然结束，无读错误）。
+    fn ws_frame_response(frames: Vec<Vec<u8>>) -> reqwest::Response {
+        let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> = frames
+            .into_iter()
+            .map(|f| Ok(bytes::Bytes::from(f)))
+            .collect();
+        let body = reqwest::Body::wrap_stream(stream::iter(chunks));
+        reqwest::Response::from(http::Response::new(body))
+    }
+
+    /// 🔴 干净 EOF + 残留 tool 缓冲（toolUseEvent 的 stop 帧没到）⇒ 本轮必须报错。
+    ///
+    /// 不报错的后果：`round.web_search` / `round.client_tool_use` 都为空 →
+    /// `should_replay_round` 判假 → 本轮被当**正常 end_turn** 渲染：工具不执行、搜索不发生，
+    /// 客户端连一个错误都收不到（agentic 循环静默卡住）。与主路径「宁可整轮报错也不静默
+    /// 吞工具」同策略（2026-10-14 流式审计发现的形态）。
+    #[tokio::test]
+    async fn decode_round_flags_residual_tool_buffer_on_clean_eof() {
+        let frame = ws_aws_frame(
+            "toolUseEvent",
+            r#"{"name":"Bash","toolUseId":"t1","input":"{\"command\":\"ls\"}"}"#,
+        );
+        let out = decode_round(
+            ws_frame_response(vec![frame]),
+            "claude-sonnet-4",
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .await;
+        assert!(
+            out.stream_error,
+            "残留 tool 缓冲必须置 stream_error（否则整轮被当正常回答，工具静默消失）"
+        );
+    }
+
+    /// 对照：stop 帧到达（无残留）时不得误报错。
+    #[tokio::test]
+    async fn decode_round_does_not_flag_when_tool_buffer_is_drained() {
+        let start = ws_aws_frame(
+            "toolUseEvent",
+            r#"{"name":"Bash","toolUseId":"t1","input":"{\"command\":\"ls\"}"}"#,
+        );
+        let stop = ws_aws_frame(
+            "toolUseEvent",
+            r#"{"name":"Bash","toolUseId":"t1","input":"","stop":true}"#,
+        );
+        let out = decode_round(
+            ws_frame_response(vec![start, stop]),
+            "claude-sonnet-4",
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .await;
+        assert!(
+            !out.stream_error,
+            "stop 帧已到达时不得误报错（残留判据必须只在真残留时成立）"
         );
     }
 }
