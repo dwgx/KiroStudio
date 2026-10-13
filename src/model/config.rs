@@ -281,6 +281,18 @@ pub struct Config {
     #[serde(default = "default_write_chunking_max_lines")]
     pub write_chunking_max_lines: u32,
 
+    /// 首字超时（秒）：上游 HTTP 200 后静默不推内容时，等这么久就在**流内重开上游**
+    /// （预算携带排除集 → 自动换号），客户端只看到「稍慢的正常响应」。`0` = 关闭
+    /// （行为与改前逐字节一致）。默认 30 —— thinking 模型首字前思考十几秒属正常，
+    /// 取值过小会误杀（kiro-rs-plus 同款取值）。
+    #[serde(default = "default_first_token_timeout_secs")]
+    pub first_token_timeout_secs: u64,
+
+    /// 首字重试次数上限（`0` = 不重试）。默认 2。重开前不向客户端写任何字节，
+    /// 一旦写出过内容事件（committed）就永久放弃重试。
+    #[serde(default = "default_first_token_max_retries")]
+    pub first_token_max_retries: u32,
+
     /// Kiro **原生** extended thinking：是否走请求级
     /// `additionalModelRequestFields.output_config.effort` 触发上游原生
     /// `reasoningContentEvent`（**默认 false**）。
@@ -1411,6 +1423,14 @@ fn default_write_chunking_max_lines() -> u32 {
     300
 }
 
+fn default_first_token_timeout_secs() -> u64 {
+    30
+}
+
+fn default_first_token_max_retries() -> u32 {
+    2
+}
+
 fn default_cc_auto_buffer() -> bool {
     // 默认 **true** = 识别到 Claude Code 的请求走 buffered 分发。
     //
@@ -1689,6 +1709,8 @@ impl Default for Config {
             cc_auto_buffer: default_cc_auto_buffer(),
             forward_suggestion_mode: default_forward_suggestion_mode(),
             write_chunking_max_lines: default_write_chunking_max_lines(),
+            first_token_timeout_secs: default_first_token_timeout_secs(),
+            first_token_max_retries: default_first_token_max_retries(),
             // native effort 默认关：开关开=白名单模型走 output_config.effort 原生通道
             // （未验证的协议形状不全池直切，与 cli_origin_kiro_cli 同款保守理由）。
             native_thinking_effort_enabled: false,

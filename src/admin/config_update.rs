@@ -69,6 +69,9 @@ impl super::AdminService {
         let mut forward_suggestion_mode_changed: Option<bool> = None;
         // 大写入分块上限：改后调 converter setter 即时生效（进程级镜像，不重启）。
         let mut write_chunking_max_lines_changed: Option<u32> = None;
+        // 首字重试参数：改后调 handlers setter 即时生效（进程级镜像，不重启）。
+        let mut first_token_timeout_changed: Option<u64> = None;
+        let mut first_token_max_retries_changed: Option<u32> = None;
         // 推号开关无 TIER3 镜像，只需让 reload_config 跑一次即可生效，故用 bool 而非 Option<bool>。
         let mut import_keys_enabled_changed = false;
         // 分身默认启用同款：`clone_default_enabled()` 每次直接读 config ArcSwap，
@@ -234,6 +237,19 @@ impl super::AdminService {
             if v != config.write_chunking_max_lines {
                 config.write_chunking_max_lines = v;
                 write_chunking_max_lines_changed = Some(v);
+            }
+        }
+        // —— 首字重试参数（TIER3 热更：改后调 handlers setter 即时生效不重启）——
+        if let Some(v) = req.first_token_timeout_secs {
+            if v != config.first_token_timeout_secs {
+                config.first_token_timeout_secs = v;
+                first_token_timeout_changed = Some(v);
+            }
+        }
+        if let Some(v) = req.first_token_max_retries {
+            if v != config.first_token_max_retries {
+                config.first_token_max_retries = v;
+                first_token_max_retries_changed = Some(v);
             }
         }
         // —— 批量推号入口开关（无 TIER3 setter：handler 每次直接读 config()，
@@ -1084,6 +1100,8 @@ impl super::AdminService {
             || cc_auto_buffer_changed.is_some()
             || forward_suggestion_mode_changed.is_some()
             || write_chunking_max_lines_changed.is_some()
+            || first_token_timeout_changed.is_some()
+            || first_token_max_retries_changed.is_some()
             || import_keys_enabled_changed
             // 分身默认启用同样没有 TIER3 setter，**只**靠这一行触发 reload_config。
             // 删掉它 → 面板改了、存了盘，但 clone_default_enabled() 读到的仍是旧值。
@@ -1189,6 +1207,14 @@ impl super::AdminService {
             crate::anthropic::set_write_chunking_max_lines(v);
         }
 
+        // TIER3：首字重试参数立即应用到热路径进程级镜像（任一子项变更即重播两值）
+        if first_token_timeout_changed.is_some() || first_token_max_retries_changed.is_some() {
+            crate::anthropic::set_first_token_retry(
+                config.first_token_timeout_secs,
+                config.first_token_max_retries,
+            );
+        }
+
         // TIER3：prompt cache 记账下发开关立即应用到热路径进程级镜像（下一个请求即生效）
         if let Some(v) = prompt_cache_enabled_changed {
             crate::anthropic::set_prompt_cache_enabled(v);
@@ -1265,6 +1291,8 @@ impl super::AdminService {
             || cc_auto_buffer_changed.is_some()
             || forward_suggestion_mode_changed.is_some()
             || write_chunking_max_lines_changed.is_some()
+            || first_token_timeout_changed.is_some()
+            || first_token_max_retries_changed.is_some()
             || import_keys_enabled_changed
             // 立即生效项（reload_config 换 ArcSwap），漏掉这行只改本项时面板会回
             // 「无改动」，与实际不符。

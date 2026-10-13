@@ -51,7 +51,7 @@ static MIRROR_WIRED_BITS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 
 /// 名字表：新增进程镜像 setter 时必须在此登记（漏登记会在 setter 内 mark 时 panic 暴露）。
 /// 与「删校验必红」守卫同纪律（见本文件测试模块 mirror_wiring_source_guard）。
-const MIRROR_WIRED_NAMES: [&str; 18] = [
+const MIRROR_WIRED_NAMES: [&str; 19] = [
     "collect_client_fingerprint",
     "trust_forwarded_header",
     "ip_blocklist",
@@ -59,6 +59,7 @@ const MIRROR_WIRED_NAMES: [&str; 18] = [
     "extract_thinking",
     "cc_auto_buffer",
     "forward_suggestion_mode",
+    "first_token_retry",
     "prompt_cache_enabled",
     "mock_cache_config",
     "tool_clean_leaked_tokens",
@@ -337,6 +338,34 @@ pub fn set_forward_suggestion_mode(enabled: bool) {
 
 fn forward_suggestion_mode_enabled() -> bool {
     FORWARD_SUGGESTION_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 首字重试（超时秒数 + 重试上限；进程级镜像，admin 热更即时生效）。
+///
+/// 默认 30s / 2 次。上游 HTTP 200 后静默不推内容时，在**流内重开**上游（预算携带
+/// 排除集 → 自动换号），重开前不向客户端写任何字节；一旦写出过内容事件（committed）
+/// 就永久放弃重试。`0` 秒或 `0` 次 = 关闭（行为与改前逐字节一致）。
+static FIRST_TOKEN_TIMEOUT_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(30);
+static FIRST_TOKEN_MAX_RETRIES: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(2);
+
+/// 设置首字重试参数（main 启动接线 / admin 热更调用，立即生效）。
+pub fn set_first_token_retry(timeout_secs: u64, max_retries: u32) {
+    mark_mirror_wired("first_token_retry");
+    FIRST_TOKEN_TIMEOUT_SECS.store(timeout_secs, std::sync::atomic::Ordering::Relaxed);
+    FIRST_TOKEN_MAX_RETRIES.store(max_retries, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 首字重试生效参数；关闭时返回 `None`。
+fn first_token_retry_config() -> Option<(std::time::Duration, u32)> {
+    let secs = FIRST_TOKEN_TIMEOUT_SECS.load(std::sync::atomic::Ordering::Relaxed);
+    let retries = FIRST_TOKEN_MAX_RETRIES.load(std::sync::atomic::Ordering::Relaxed);
+    if secs == 0 || retries == 0 {
+        None
+    } else {
+        Some((std::time::Duration::from_secs(secs), retries))
+    }
 }
 
 /// 建议模式标记：CC 的「预测下一句」请求在最后一条 user 消息头部的固定前缀。
@@ -3207,6 +3236,43 @@ async fn handle_stream_request(
     };
     record_request_span_credential_id(meta.credential_id);
 
+    // 首字重试：上游 200 后静默 → 流内重开（预算携带排除集 → 自动换号），
+    // 重开前不向客户端写任何字节。关闭（0 秒或 0 次）时 None = 行为与改前逐字节一致。
+    // 必须在 ctx 构造（消费各参数）之前构造，参数按需克隆。
+    let retry = first_token_retry_config().map(|(timeout, max_retries)| {
+        let body_owned = request_body.to_string();
+        let budget_owned = budget.clone();
+        let provider_owned = provider.clone();
+        let model_owned = model.to_string();
+        let tnm = tool_name_map.clone();
+        let ktn = known_tool_names.clone();
+        let trf = tool_required_fields.clone();
+        let model_for_reopen = model_owned.clone();
+        FirstTokenRetry {
+            timeout,
+            max_retries,
+            reopen: std::sync::Arc::new(move || {
+                let p = provider_owned.clone();
+                let b = body_owned.clone();
+                let g = budget_owned.clone();
+                let m = model_for_reopen.clone();
+                Box::pin(async move { p.call_api_stream(&b, is_1m, &g, Some(&m)).await })
+            }),
+            rebuild_ctx: std::sync::Arc::new(move || {
+                let mut c = StreamContext::new_full(
+                    &model_owned,
+                    input_tokens,
+                    thinking_enabled,
+                    tnm.clone(),
+                    ktn.clone(),
+                );
+                c.set_cache_usage(cache_breakdown);
+                c.set_tool_required_fields(trf.clone());
+                c
+            }),
+        }
+    });
+
     // 创建流处理上下文
     let mut ctx = StreamContext::new_full(
         model,
@@ -3229,7 +3295,7 @@ async fn handle_stream_request(
     let cache_estimated = ctx.cache_usage.is_some();
 
     // 创建 SSE 流（流结束时用 meta + 最终 usage 埋点一条成功记录）
-    let stream = create_sse_stream(provider, response, ctx, initial_events, meta, client);
+    let stream = create_sse_stream(provider, response, ctx, initial_events, meta, client, retry);
 
     // 返回 SSE 响应
     let mut builder = sse_event_stream_builder();
@@ -3446,6 +3512,15 @@ impl<C> UsageEmitGuard<C> {
         }
     }
 
+    /// 重开上游后重新武装：换入新流的 ctx / meta，并把「已埋点」复位。
+    ///
+    /// 旧尝试在提交前被放弃（零内容产出），不值得单独落一条记录；由新尝试的收尾统一埋点。
+    fn rearm(&mut self, ctx: C, meta: crate::kiro::provider::CallMeta) {
+        self.ctx = ctx;
+        self.meta = meta;
+        self.emitted = false;
+    }
+
     fn emit(&mut self) {
         if self.emitted {
             return;
@@ -3482,6 +3557,108 @@ impl<C> Drop for UsageEmitGuard<C> {
     }
 }
 
+/// 首字重试的重开闭包：重发同一请求体（预算携带排除集 → 自动换号）。
+type ReopenFn = std::sync::Arc<
+    dyn Fn() -> std::pin::Pin<
+            Box<
+                dyn Future<
+                        Output = anyhow::Result<(
+                            reqwest::Response,
+                            crate::kiro::provider::CallMeta,
+                        )>,
+                    > + Send,
+            >,
+        > + Send
+        + Sync,
+>;
+
+/// 首字超时透明重试的运行态（仅流式路径；`None` = 关闭）。
+///
+/// 设计（对齐 kiro-rs-plus 的唯一完整实现，见 new-batch 研究报告）：
+/// - 上游 HTTP 200 后静默不推内容时，把 `message_start` 延后到**首个非空内容事件**，
+///   在流内重开上游（换号）；重开前不向客户端写任何字节，客户端只看到「稍慢的正常响应」。
+/// - `committed`（已写出过内容事件）是唯一不可逆判据；ping 与元数据帧永不提交。
+/// - 重开可能落到别的号 → cache 记账按号统计，必须重建流上下文。
+pub(crate) struct FirstTokenRetry {
+    timeout: std::time::Duration,
+    max_retries: u32,
+    reopen: ReopenFn,
+    rebuild_ctx: std::sync::Arc<dyn Fn() -> StreamContext + Send + Sync>,
+}
+
+/// SSE 处理流的状态（原先是 5 元组；加首字重试后改具名结构）。
+struct SseStreamState {
+    body: std::pin::Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>,
+    decoder: EventStreamDecoder,
+    finished: bool,
+    ping_interval: tokio::time::Interval,
+    guard: UsageEmitGuard<StreamContext>,
+    /// 被延后的初始事件（message_start 等）；提交或收尾时一次性发出。
+    initial_events: Option<Vec<SseEvent>>,
+    /// ⭐ 唯一可重试判据：已向客户端写出过内容事件。
+    committed: bool,
+    /// 首字截止；`None` = 已提交或功能关闭。
+    deadline: Option<tokio::time::Instant>,
+    retries_used: u32,
+    retry: Option<FirstTokenRetry>,
+}
+
+/// SSE 事件 → 字节批（多处共用）。
+fn sse_bytes(events: Vec<SseEvent>) -> Vec<Result<Bytes, Infallible>> {
+    events
+        .into_iter()
+        .map(|e| Ok(Bytes::from(e.to_sse_string())))
+        .collect()
+}
+
+/// 流内重开上游：成功则换 body/decoder/ctx（按新号重建记账）并重置截止；失败返回 false。
+async fn reopen_stream(st: &mut SseStreamState) -> bool {
+    let Some((reopen_fn, rebuild_ctx, timeout)) = st
+        .retry
+        .as_ref()
+        .map(|r| (r.reopen.clone(), r.rebuild_ctx.clone(), r.timeout))
+    else {
+        return false;
+    };
+    match (reopen_fn)().await {
+        Ok((resp, new_meta)) => {
+            st.retries_used += 1;
+            st.guard.rearm((rebuild_ctx)(), new_meta);
+            st.body = Box::pin(resp.bytes_stream());
+            st.decoder = EventStreamDecoder::new();
+            st.deadline = Some(tokio::time::Instant::now() + timeout);
+            tracing::info!(
+                retry = st.retries_used,
+                "首字超时/读取失败，已流内重开上游（未向客户端写字节）"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "首字重开上游失败，按 error 收尾");
+            false
+        }
+    }
+}
+
+/// 首字重试额度用尽 / 重开失败：补发初始事件（绝不发无头 message）+ error 收尾。
+fn finish_with_first_token_error(st: &mut SseStreamState) -> Vec<Result<Bytes, Infallible>> {
+    st.guard
+        .ctx
+        .mark_transport_error("first token timeout (upstream silent after 200)".to_string());
+    let mut events = st.initial_events.take().unwrap_or_default();
+    if !st.guard.ctx.error_event_emitted() {
+        events.push(SseEvent::error_event(
+            st.guard.ctx.completion().sse_error_type(),
+            st.guard.ctx.completion().client_message(),
+        ));
+        st.guard.ctx.mark_error_event_emitted();
+    }
+    events.extend(st.guard.ctx.generate_final_events());
+    st.guard.emit();
+    st.finished = true;
+    sse_bytes(events)
+}
+
 /// 创建 SSE 事件流
 fn create_sse_stream(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
@@ -3490,75 +3667,134 @@ fn create_sse_stream(
     initial_events: Vec<SseEvent>,
     meta: crate::kiro::provider::CallMeta,
     client: ClientInfo,
+    retry: Option<FirstTokenRetry>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    // 先发送初始事件
-    let initial_stream = stream::iter(
-        initial_events
-            .into_iter()
-            .map(|e| Ok(Bytes::from(e.to_sse_string()))),
-    );
-
-    // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
-    let body_stream = response.bytes_stream();
+    // 处理 Kiro 响应流，同时每 25 秒发送 ping 保活。
+    // 首字重试开启时初始事件被延后到「首个非空内容事件」；关闭时首轮直接发出（旧行为）。
+    let body_stream: std::pin::Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> =
+        Box::pin(response.bytes_stream());
     let guard = UsageEmitGuard::new(ctx, meta, client, provider, emit_stream_usage);
+    let deadline = retry
+        .as_ref()
+        .map(|r| tokio::time::Instant::now() + r.timeout);
 
-    let processing_stream = stream::unfold(
-        (body_stream, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), guard),
-        |(mut body_stream, mut decoder, finished, mut ping_interval, mut guard)| async move {
-            if finished {
+    stream::unfold(
+        SseStreamState {
+            body: body_stream,
+            decoder: EventStreamDecoder::new(),
+            finished: false,
+            ping_interval: interval(Duration::from_secs(PING_INTERVAL_SECS)),
+            guard,
+            initial_events: Some(initial_events),
+            committed: false,
+            deadline,
+            retries_used: 0,
+            retry,
+        },
+        |mut st| async move {
+            if st.finished {
                 return None;
             }
 
-            // 使用 select! 同时等待数据和 ping 定时器
+            // 重试关闭：首轮直接把初始事件发出去（与旧形状逐字节一致），随后进 select 主循环。
+            if !st.committed && st.retry.is_none() {
+                st.committed = true;
+                let events = st.initial_events.take().unwrap_or_default();
+                return Some((stream::iter(sse_bytes(events)), st));
+            }
+
+            // 首字截止（按值捕获，避免与 select 其他分支的可变借用冲突）
+            let deadline = st.deadline;
+            let timeout_fut = async move {
+                match deadline {
+                    Some(d) => tokio::time::sleep_until(d).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+
+            // 使用 select! 同时等待数据、首字截止与 ping 定时器
             tokio::select! {
+                // 首字截止：只可能在「未提交 + 重试开启」时到点（提交即清 deadline）
+                _ = timeout_fut => {
+                    let max_retries = st.retry.as_ref().map(|r| r.max_retries).unwrap_or(0);
+                    if st.retries_used < max_retries && reopen_stream(&mut st).await {
+                        return Some((stream::iter(Vec::new()), st));
+                    }
+                    tracing::warn!(
+                        retries_used = st.retries_used,
+                        max_retries,
+                        "首字重试额度用尽，按 error 收尾"
+                    );
+                    Some((stream::iter(finish_with_first_token_error(&mut st)), st))
+                }
                 // 处理数据流
-                chunk_result = body_stream.next() => {
+                chunk_result = st.body.next() => {
                     match chunk_result {
                         Some(Ok(chunk)) => {
                             // 累计上游传输字节（断流收尾时经 interrupted_bytes 落库）
-                            guard.ctx.note_received_bytes(chunk.len());
+                            st.guard.ctx.note_received_bytes(chunk.len());
                             let mut events =
-                                decode_frames_into(&mut decoder, &chunk, &mut guard.ctx);
+                                decode_frames_into(&mut st.decoder, &chunk, &mut st.guard.ctx);
                             // 解码器连续错误超限：helper 已 mark_decoder_stopped；流式路径
                             // 还要内联补发 SSE error（buffered 等到流结束再发）。
-                            if decoder.is_stopped() && !guard.ctx.error_event_emitted() {
+                            if st.decoder.is_stopped() && !st.guard.ctx.error_event_emitted() {
                                 events.push(SseEvent::error_event(
-                                    guard.ctx.completion().sse_error_type(),
-                                    guard.ctx.completion().client_message(),
+                                    st.guard.ctx.completion().sse_error_type(),
+                                    st.guard.ctx.completion().client_message(),
                                 ));
-                                guard.ctx.mark_error_event_emitted();
+                                st.guard.ctx.mark_error_event_emitted();
                             }
 
-                            // 转换为 SSE 字节流
-                            let bytes: Vec<Result<Bytes, Infallible>> = events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
+                            // 提交点：首个非空事件批 = 已向客户端写出内容 → 关闭重试窗口，
+                            // 并补发被延后的初始事件（message_start 恰一次）。
+                            if !st.committed && !events.is_empty() {
+                                st.committed = true;
+                                st.deadline = None;
+                                if let Some(init) = st.initial_events.take() {
+                                    let mut all = init;
+                                    all.extend(events);
+                                    events = all;
+                                }
+                            }
 
-                            Some((stream::iter(bytes), (body_stream, decoder, false, ping_interval, guard)))
+                            Some((stream::iter(sse_bytes(events)), st))
                         }
                         Some(Err(e)) => {
+                            // 首字前的读取失败也走重试窗口（与超时共享同一份配额）。
+                            if !st.committed {
+                                let max_retries =
+                                    st.retry.as_ref().map(|r| r.max_retries).unwrap_or(0);
+                                if st.retries_used < max_retries {
+                                    tracing::warn!(error = %e, "首字前读取失败，尝试流内重开");
+                                    if reopen_stream(&mut st).await {
+                                        return Some((stream::iter(Vec::new()), st));
+                                    }
+                                }
+                            }
                             tracing::error!("读取响应流失败: {}", e);
                             // 上游流中途失败：置传输失败态（供收尾按 NetworkError 记账），
                             // 先发一个 SSE error 事件显式告知客户端"本次未正常完成"，再补最终事件收尾。
                             // 否则 Claude Code 会把截断输出当作正常 message_stop=成功，不重试。
                             // 幂等：若 in-band 错误已置过失败态，mark_transport_error 会保留首因。
-                            guard.ctx.mark_transport_error(e.to_string());
+                            st.guard.ctx.mark_transport_error(e.to_string());
                             let mut events = Vec::new();
-                            if !guard.ctx.error_event_emitted() {
-                                events.push(SseEvent::error_event(
-                                    guard.ctx.completion().sse_error_type(),
-                                    guard.ctx.completion().client_message(),
-                                ));
-                                guard.ctx.mark_error_event_emitted();
+                            // 未提交过内容（首字前就断了）：先补发初始事件，绝不发无头 message。
+                            if !st.committed {
+                                st.committed = true;
+                                st.deadline = None;
+                                events.extend(st.initial_events.take().unwrap_or_default());
                             }
-                            events.extend(guard.ctx.generate_final_events());
-                            let bytes: Vec<Result<Bytes, Infallible>> = events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
-                            guard.emit();
-                            Some((stream::iter(bytes), (body_stream, decoder, true, ping_interval, guard)))
+                            if !st.guard.ctx.error_event_emitted() {
+                                events.push(SseEvent::error_event(
+                                    st.guard.ctx.completion().sse_error_type(),
+                                    st.guard.ctx.completion().client_message(),
+                                ));
+                                st.guard.ctx.mark_error_event_emitted();
+                            }
+                            events.extend(st.guard.ctx.generate_final_events());
+                            st.guard.emit();
+                            st.finished = true;
+                            Some((stream::iter(sse_bytes(events)), st))
                         }
                         None => {
                             // 流结束，发送最终事件。
@@ -3568,53 +3804,55 @@ fn create_sse_stream(
                             // input:{} 的 tool 块 + 正常 message_stop 误判成功(服务端却记失败)。默认②③开也中。
                             // 现在残留 flush 的 ③ 逻辑在置失败态时已返回空(不发坏 JSON),故 final 里无坏 delta,
                             // 把 error 事件**插到最前**(在收尾 message_delta/message_stop 之前)符合 SSE 语义。
-                            let tail = guard.ctx.generate_final_events();
+                            let tail = st.guard.ctx.generate_final_events();
                             let mut final_events = Vec::new();
-                            if !guard.ctx.completion().is_ok() && !guard.ctx.error_event_emitted() {
+                            // 从未提交过内容（空响应 / 只有元数据帧）：先补发初始事件，绝不发无头 message。
+                            if !st.committed {
+                                st.committed = true;
+                                st.deadline = None;
+                                final_events.extend(st.initial_events.take().unwrap_or_default());
+                            }
+                            if !st.guard.ctx.completion().is_ok()
+                                && !st.guard.ctx.error_event_emitted()
+                            {
                                 final_events.push(SseEvent::error_event(
-                                    guard.ctx.completion().sse_error_type(),
-                                    guard.ctx.completion().client_message(),
+                                    st.guard.ctx.completion().sse_error_type(),
+                                    st.guard.ctx.completion().client_message(),
                                 ));
-                                guard.ctx.mark_error_event_emitted();
+                                st.guard.ctx.mark_error_event_emitted();
                             }
                             // 空响应检测：正常完成但收尾兜底后模型仍什么都没产出（或上下文压力下的
                             // 退化短响应）时，用显式 error 事件替代空 end_turn，避免客户端 agentic
                             // 循环卡住。上下文过大 → invalid_request_error 提示 /compact；偶发 → 可重试。
-                            if guard.ctx.completion().is_ok()
-                                && !guard.ctx.error_event_emitted()
-                                && guard.ctx.is_empty_response()
+                            if st.guard.ctx.completion().is_ok()
+                                && !st.guard.ctx.error_event_emitted()
+                                && st.guard.ctx.is_empty_response()
                             {
-                                let oversized = guard.ctx.empty_response_is_oversized_context();
+                                let oversized = st.guard.ctx.empty_response_is_oversized_context();
                                 tracing::warn!(
                                     oversized_context = oversized,
                                     "上游返回空响应（收尾兜底后仍无内容），补发 error 事件替代空 end_turn"
                                 );
                                 final_events.push(empty_response_error_event(oversized));
-                                guard.ctx.mark_error_event_emitted();
+                                st.guard.ctx.mark_error_event_emitted();
                             } else {
                                 final_events.extend(tail);
                             }
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
-                            guard.emit();
-                            Some((stream::iter(bytes), (body_stream, decoder, true, ping_interval, guard)))
+                            st.guard.emit();
+                            st.finished = true;
+                            Some((stream::iter(sse_bytes(final_events)), st))
                         }
                     }
                 }
-                // 发送 ping 保活
-                _ = ping_interval.tick() => {
+                // 发送 ping 保活（永不触发 committed）
+                _ = st.ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
-                    let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, decoder, false, ping_interval, guard)))
+                    Some((stream::iter(vec![Ok(create_ping_sse())]), st))
                 }
             }
         },
     )
-    .flatten();
-
-    initial_stream.chain(processing_stream)
+    .flatten()
 }
 
 use super::converter::get_context_window_size;

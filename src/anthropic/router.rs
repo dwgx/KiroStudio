@@ -51,6 +51,7 @@ pub fn create_router_with_provider(
     tool_description_max_chars: usize,
     forward_suggestion_mode: bool,
     write_chunking_max_lines: u32,
+    first_token_retry: (u64, u32),
 ) -> Router {
     let mut state = AppState::new(api_key);
     if let Some(provider) = kiro_provider {
@@ -77,6 +78,7 @@ pub fn create_router_with_provider(
     // 建议模式开关 / 大写入分块上限：播种进进程级镜像（handlers/converter 热路径读），admin 改后即时生效。
     super::handlers::set_forward_suggestion_mode(forward_suggestion_mode);
     super::converter::set_write_chunking_max_lines(write_chunking_max_lines);
+    super::handlers::set_first_token_retry(first_token_retry.0, first_token_retry.1);
 
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()

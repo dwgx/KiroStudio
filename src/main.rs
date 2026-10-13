@@ -760,6 +760,7 @@ async fn main() {
         config.tool_description_max_chars,
         config.forward_suggestion_mode,
         config.write_chunking_max_lines,
+        (config.first_token_timeout_secs, config.first_token_max_retries),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）

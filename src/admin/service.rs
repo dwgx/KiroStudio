@@ -3365,6 +3365,8 @@ impl AdminService {
             cc_auto_buffer: config.cc_auto_buffer,
             forward_suggestion_mode: config.forward_suggestion_mode,
             write_chunking_max_lines: config.write_chunking_max_lines,
+            first_token_timeout_secs: config.first_token_timeout_secs,
+            first_token_max_retries: config.first_token_max_retries,
             native_thinking_effort_enabled: config.native_thinking_effort_enabled,
             tool_compat_mapping: config.tool_compat_mapping,
             import_keys_enabled: config.import_keys_enabled,

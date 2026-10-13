@@ -1122,6 +1122,10 @@ pub struct ConfigSnapshotResponse {
     pub forward_suggestion_mode: bool,
     /// 大写入分块上限（行；0=关闭；热更即时生效，converter 进程级镜像）。
     pub write_chunking_max_lines: u32,
+    /// 首字超时（秒；0=关闭；热更即时生效）。
+    pub first_token_timeout_secs: u64,
+    /// 首字重试次数上限（0=不重试；热更即时生效）。
+    pub first_token_max_retries: u32,
     /// Kiro 原生 extended thinking（请求级 `output_config.effort` 通道，默认关；
     /// 开=白名单模型 + thinking 走原生 reasoningContentEvent 并抑制 XML 标签注入）。
     /// 热更即时生效（converter 进程级镜像）。
@@ -1376,6 +1380,10 @@ pub struct UpdateConfigRequest {
     pub forward_suggestion_mode: Option<bool>,
     /// 大写入分块上限（行；0=关闭；热更即时生效）。
     pub write_chunking_max_lines: Option<u32>,
+    /// 首字超时秒数（0=关闭；热更即时生效）。
+    pub first_token_timeout_secs: Option<u64>,
+    /// 首字重试上限（0=不重试；热更即时生效）。
+    pub first_token_max_retries: Option<u32>,
     /// Kiro 原生 extended thinking 开关（默认关；热更即时生效，converter 镜像）。
     pub native_thinking_effort_enabled: Option<bool>,
     /// CC↔Kiro 工具名/参数映射开关（默认开；热更即时生效，converter 镜像）。
@@ -2559,6 +2567,8 @@ mod tests {
             cc_auto_buffer: false,
             forward_suggestion_mode: false,
             write_chunking_max_lines: 300,
+            first_token_timeout_secs: 30,
+            first_token_max_retries: 2,
             native_thinking_effort_enabled: false,
             tool_compat_mapping: true,
             import_keys_enabled: true,
@@ -2828,6 +2838,8 @@ mod tests {
             cc_auto_buffer: true,
             forward_suggestion_mode: false,
             write_chunking_max_lines: 300,
+            first_token_timeout_secs: 30,
+            first_token_max_retries: 2,
             native_thinking_effort_enabled: false,
             tool_compat_mapping: true,
             import_keys_enabled: true,
