@@ -14,7 +14,7 @@ use super::conversation::ConversationState;
 ///
 /// ```rust
 /// use kirostudio::kiro::model::requests::{
-///     KiroRequest, ConversationState, CurrentMessage, UserInputMessage, Tool
+///     KiroRequest, ConversationState, CurrentMessage, UserInputMessage
 /// };
 ///
 /// // 创建简单请求
@@ -24,8 +24,13 @@ use super::conversation::ConversationState;
 ///         UserInputMessage::new("Hello", "claude-3-5-sonnet")
 ///     ));
 ///
-/// let request = KiroRequest::new(state);
-/// let json = request.to_json().unwrap();
+/// // 本结构体**没有** `new()` / `to_json()`：字段全是 `pub`，直接构造后用 serde 序列化。
+/// let request = KiroRequest {
+///     conversation_state: state,
+///     profile_arn: None,
+///     additional_model_request_fields: None,
+/// };
+/// let json = serde_json::to_string(&request).unwrap();
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

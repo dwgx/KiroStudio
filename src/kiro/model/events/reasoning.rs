@@ -38,14 +38,15 @@ use super::base::EventPayload;
 /// 生态实测结论（Kiro-Go 的注释，针对真实上游流量验证过）：
 /// `assistantResponseEvent` 与 `reasoningContentEvent` 都是**纯增量**，
 /// 绝不是累积快照 —— 所以直接把每帧的 `text` 追加下发即可，不要做差分。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReasoningContentEvent {
     /// 本帧的思考内容增量。
     ///
     /// `#[serde(default)]`：上游偶发空帧（只有其它元字段）时不应让整条流解析失败 ——
-    /// 与 `AssistantResponseEvent::content` 同款容错策略。
-    #[serde(default)]
+    /// 与 `AssistantResponseEvent::content` 同款容错策略。显式 `"text":null` 由
+    /// [`lenient_text`] 兜住（`default` 只管键缺失）。
+    #[serde(default, deserialize_with = "lenient_text")]
     pub text: String,
     /// 思考块签名（上游若下发则带上）。
     ///
@@ -65,14 +66,65 @@ pub struct ReasoningContentEvent {
     ///
     /// 所以这里只做**解析**，不改下发逻辑：解析是零风险的（`Option` + `default`，
     /// 缺失即 `None`），而它把「上游是否发真签名」从推测变成可观测。
-    #[serde(default)]
+    ///
+    /// 类型不符（对象/数组/数字）由 [`lenient_optional_string`] 降级为 `None`：
+    /// 观测字段不该让本帧的 `text` 一起被丢掉（见该函数注释）。
+    #[serde(default, deserialize_with = "lenient_optional_string")]
     pub signature: Option<String>,
     /// 上游返回的加密思考内容（若有）。
     ///
     /// 同 `signature`：先解析、先能观测，暂不接入下发。真要下发需先确认上游确实发它、
     /// 以及它的编码形态，那需要真实样本 —— 而拿到样本的前提就是先解析它。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_optional_string")]
     pub redacted_content: Option<String>,
+}
+
+/// 思考增量文本的**容错**反序列化：显式 `null` / 类型不符 → 空串。
+///
+/// `#[serde(default)]` 只在**键缺失**时生效，显式 `"text":null` 仍会让 `String` 解析失败；
+/// 而本事件在流中间，`Event::parse_event` 的 `?` 会把这一帧的失败升级成整条流报错 ——
+/// 一个「上游偶发空帧」不该有这种权力（与字段注释里的同款容错理由一致）。
+fn lenient_text<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::String(s) => s,
+        _ => String::new(),
+    })
+}
+
+/// 观测字段的**容错**反序列化：只有字符串才取值，其余形态（`null` / 对象 / 数组 / 数字）
+/// 一律 `None`。
+///
+/// 这两个字段是「先解析、先能观测、暂不消费」（见字段文档），而上游形态未经证实。
+/// 若类型不符就让整个 struct 解析失败，代价是**丢掉本帧的 `text` 增量** ——
+/// 观测字段反客为主，把真正要转发的数据一起带走。
+fn lenient_optional_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::String(s) => Some(s),
+        _ => None,
+    })
+}
+
+/// 手写脱敏 Debug：`signature` 是「客户端必须回显才能命中缓存」的**类凭证 token**，
+/// `redacted_content` 是加密思考正文 —— 两者都属于「一旦被 `{:?}` 打进日志即等于泄露」。
+/// 与本仓 `credentials.rs` 同款约定：敏感字段在**类型层面**脱敏，杜绝调用点意外泄密。
+/// `text` 保留原文：它是本事件唯一被消费的字段，诊断时正是要看它。
+impl std::fmt::Debug for ReasoningContentEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReasoningContentEvent")
+            .field("text", &self.text)
+            .field("signature", &self.signature.as_ref().map(|_| "<set>"))
+            .field(
+                "redacted_content",
+                &self.redacted_content.as_ref().map(|_| "<set>"),
+            )
+            .finish()
+    }
 }
 
 impl EventPayload for ReasoningContentEvent {
@@ -153,6 +205,69 @@ mod tests {
         assert!(
             snake.redacted_content.is_none(),
             "snake_case 键不该命中 —— 上游用的是 camelCase"
+        );
+    }
+
+    /// 显式 `null` 不得让整条流失败：`#[serde(default)]` 只管**键缺失**。
+    ///
+    /// 回退即 FAIL：`{"text":null}` 会让 `String` 解析失败 → 经 `Event::parse_event` 的 `?`
+    /// 传播成整条流报错（本事件在流中间，等于把一个完整响应打断）。
+    #[test]
+    fn explicit_null_text_and_observational_fields_are_tolerated() {
+        let e: ReasoningContentEvent = serde_json::from_str(r#"{"text":null}"#)
+            .expect("显式 null 必须容错（default 只在键缺失时生效）");
+        assert!(e.text.is_empty());
+        assert!(e.signature.is_none());
+
+        let e: ReasoningContentEvent =
+            serde_json::from_str(r#"{"text":"ok","signature":null,"redactedContent":null}"#)
+                .expect("null 观测字段必须容错");
+        assert_eq!(e.text, "ok");
+        assert!(e.signature.is_none());
+        assert!(e.redacted_content.is_none());
+    }
+
+    /// 观测字段类型不符（对象/数组/数字）只降级为 `None`，**不得**连 `text` 一起丢掉。
+    #[test]
+    fn wrong_shaped_observational_fields_keep_text() {
+        let e: ReasoningContentEvent = serde_json::from_str(
+            r#"{"text":"keep-me","signature":{"k":"v"},"redactedContent":[1,2,3]}"#,
+        )
+        .expect("观测字段类型不符不应让整帧失败");
+        assert_eq!(
+            e.text, "keep-me",
+            "text 必须保住 —— 它才是本帧要转发的数据"
+        );
+        assert!(e.signature.is_none());
+        assert!(e.redacted_content.is_none());
+
+        // 数字形态同样降级（上游若把签名当数字下发）。
+        let e: ReasoningContentEvent =
+            serde_json::from_str(r#"{"text":"t","signature":7}"#).expect("数字签名应降级");
+        assert_eq!(e.text, "t");
+        assert!(e.signature.is_none());
+    }
+
+    /// Debug 不得泄露签名 / 加密思考正文（二者都是类凭证）。
+    ///
+    /// 回退即 FAIL：改回 `#[derive(Debug)]` 后两者会原样出现在 `{:?}` 输出里，
+    /// 任何一条日志/错误链上的 `{:?}` 都等于把它们写进日志文件。
+    #[test]
+    fn debug_masks_signature_and_redacted_content() {
+        let e = ReasoningContentEvent {
+            text: "thinking".to_string(),
+            signature: Some("SECRET-SIG".to_string()),
+            redacted_content: Some("SECRET-BLOB".to_string()),
+        };
+        let dbg = format!("{e:?}");
+        assert!(dbg.contains("thinking"), "text 仍应可见（诊断需要）: {dbg}");
+        assert!(
+            !dbg.contains("SECRET-SIG"),
+            "signature 不得出现在 Debug: {dbg}"
+        );
+        assert!(
+            !dbg.contains("SECRET-BLOB"),
+            "redacted_content 不得出现在 Debug: {dbg}"
         );
     }
 }

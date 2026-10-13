@@ -36,6 +36,12 @@ pub struct MetadataTokenUsage {
 /// 流末元数据。`stop_reason` 缺省 / 空串视为「未给出终止信号」。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MetadataEvent {
+    /// 上游给出的终止原因（原样保存，未归一）。
+    ///
+    /// ⚠️ 消费必须走 [`map_metadata_stop_reason`]：空白 / 大小写 / 别名（`MAX_TOKENS`、
+    /// `model-context-window-exceeded`）的归一都在那里。直接读本字段会把 `Some("")`
+    /// 当成「上游给了终止信号」，从而跳过本类型存在理由要保留的那条本地 `end_turn` 推断
+    /// （`raw` 保留原值是为了诊断；归一不是本字段的职责）。
     #[serde(default, rename = "stopReason", alias = "stop_reason")]
     pub stop_reason: Option<String>,
     /// 可选的 token 真值（EXP-0 结论：本链路当前不下发；防御性解析，见模块注释）。
@@ -45,15 +51,31 @@ pub struct MetadataEvent {
 
 impl EventPayload for MetadataEvent {
     fn from_frame(frame: &Frame) -> ParseResult<Self> {
-        if frame.payload.is_empty() {
+        // 空 / 全空白帧 = 「未给出终止信号」，与缺字段同义（本事件只带 stopReason）。
+        // 只判 `is_empty()` 会漏掉上游/中间层塞进来的纯空白 payload。
+        if frame.payload.iter().all(|b| b.is_ascii_whitespace()) {
             return Ok(Self::default());
         }
-        frame.payload_as_json()
+        match frame.payload_as_json() {
+            Ok(event) => Ok(event),
+            Err(err) => {
+                // 坏 payload（字面 `null` / 类型不符 / 截断）**不得让整条流失败**：
+                // 本事件只是可选的终止信号，而 `Event::parse_event` 用 `?` 传播 —— 解析失败
+                // 会把一个本来完整的响应变成错误。丢掉它只退化为「未给出信号 ⇒ 走既有本地
+                // 推断 end_turn」，与本模块存在的理由（别再丢终止信号）方向一致。
+                tracing::warn!(
+                    error = %err,
+                    payload_bytes = frame.payload.len(),
+                    "metadataEvent payload 不可解析，按未给出终止信号处理（走本地推断）"
+                );
+                Ok(Self::default())
+            }
+        }
     }
 }
 
 /// 映射为 Anthropic `stop_reason`。空 / 缺字段 → `None`（未给出终止信号，走既有推断）。
-/// 未知非空值 → `end_turn`（已经收到真实 metadata 帧，流是完整的）。
+/// 未知非空值 → `end_turn`（已经收到真实 metadata 帧，流是完整的），并打一条 warn。
 pub(crate) fn map_metadata_stop_reason(raw: Option<&str>) -> Option<String> {
     let trimmed = raw.map(str::trim).filter(|s| !s.is_empty())?;
     let key = trimmed.to_ascii_lowercase().replace('-', "_");
@@ -67,7 +89,17 @@ pub(crate) fn map_metadata_stop_reason(raw: Option<&str>) -> Option<String> {
         "model_context_window_exceeded" | "modelcontextwindowexceeded" => {
             "model_context_window_exceeded".into()
         }
-        _ => "end_turn".into(),
+        _ => {
+            // 折叠成 end_turn 是**刻意保留**的（收到真实 metadata 帧 = 流完整；缺终止信号
+            // 那条路走本地推断，见模块注释），但折叠本身必须可见：否则上游新出现的终止原因
+            // （content_filtered / malformed_tool_use 之类）与正常结束在面板上完全同形，
+            // 只能等有人去翻 wire 才发现。本函数每次响应至多调用一次，warn 不会刷屏。
+            tracing::warn!(
+                raw = %trimmed,
+                "metadataEvent stopReason 未识别，按 end_turn 收尾（流已完整）；若上游确有此值，请补映射表"
+            );
+            "end_turn".into()
+        }
     })
 }
 
@@ -192,5 +224,34 @@ mod tests {
         let e: MetadataEvent =
             serde_json::from_str(r#"{"stopReason":"end_turn"}"#).expect("无 tokenUsage 也应解析");
         assert!(e.token_usage.is_none());
+    }
+
+    /// 空 / 全空白 / 字面 `null` 等「无终止信号」形态必须容错。
+    ///
+    /// 改前只判 `payload.is_empty()`：`"  "` 与 `"null"` 会走 `payload_as_json()?` 失败，
+    /// 经 `Event::parse_event` 的 `?` 传播成整条流报错 —— 一个本可完整收尾的响应被拖成错误。
+    #[test]
+    fn blank_or_null_payload_is_absent_not_error() {
+        for payload in ["", "   ", "\n\t", "null", "[]", r#"{"stopReason":null}"#] {
+            let frame = build_test_frame("metadataEvent", payload);
+            let m = MetadataEvent::from_frame(&frame)
+                .unwrap_or_else(|e| panic!("payload {payload:?} 应容错，而不是 {e}"));
+            assert!(
+                map_metadata_stop_reason(m.stop_reason.as_deref()).is_none(),
+                "payload {payload:?} 应视作未给出终止信号"
+            );
+        }
+    }
+
+    /// 类型不符同样只降级为「无信号」，不得打断整条流。
+    #[test]
+    fn malformed_payload_does_not_fail_the_frame() {
+        let frame = build_test_frame(
+            "metadataEvent",
+            r#"{"stopReason":{"unexpected":"object"},"tokenUsage":7}"#,
+        );
+        let m = MetadataEvent::from_frame(&frame).expect("坏 payload 不应 Err");
+        assert!(m.stop_reason.is_none());
+        assert!(m.token_usage.is_none());
     }
 }

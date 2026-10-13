@@ -190,7 +190,7 @@ impl UserInputMessageContext {
 /// Kiro 图片
 ///
 /// API 中使用的图片格式
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KiroImage {
     /// 图片格式（"jpeg", "png", "gif", "webp"）
@@ -209,11 +209,36 @@ impl KiroImage {
     }
 }
 
+/// 手写 Debug：`source.bytes` 是最多 8MiB 的 base64 图片正文（用户截图），
+/// 派生 Debug 会让任何 `{:?}` 诊断把它整段写进日志。
+///
+/// 本仓对敏感载荷的既定做法是**在类型层面脱敏**，而不是靠调用点自觉
+/// （同款见 `events/reasoning.rs` 的 Debug、`events/tool_use.rs` 的 Display）——
+/// 这里尤其需要，因为外层 `ConversationState` / `UserInputMessage` 都派生 Debug，
+/// 一条 `{:?}` 就能把整张图带出去。
+impl std::fmt::Debug for KiroImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KiroImage")
+            .field("format", &self.format)
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
 /// Kiro 图片数据源
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct KiroImageSource {
     /// base64 编码的图片数据
     pub bytes: String,
+}
+
+/// 手写 Debug：只留长度（见 [`KiroImage`] 的 Debug 说明）。
+impl std::fmt::Debug for KiroImageSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KiroImageSource")
+            .field("bytes_len", &self.bytes.len())
+            .finish()
+    }
 }
 
 /// 历史消息
@@ -386,5 +411,25 @@ mod tests {
         assert!(json.contains("\"conversationId\":\"conv-123\""));
         assert!(json.contains("\"agentTaskType\":\"vibe\""));
         assert!(json.contains("\"content\":\"Hello\""));
+    }
+
+    /// Debug 不得输出 base64 图片正文（用户截图，单图上限 8MiB）。
+    ///
+    /// 回退即 FAIL：把 `#[derive(Debug)]` 加回 `KiroImage` / `KiroImageSource`，`{:?}` 就会把
+    /// 整张图写进日志 —— 外层 `ConversationState` 同样派生 Debug，等于给任何诊断日志开后门。
+    #[test]
+    fn kiro_image_debug_masks_bytes() {
+        let img = KiroImage::from_base64("png", "SECRET-BASE64-PAYLOAD");
+        let dbg = format!("{img:?}");
+        assert!(dbg.contains("png"), "格式仍应可见（诊断需要）: {dbg}");
+        assert!(dbg.contains("bytes_len"), "长度仍应可见: {dbg}");
+        assert!(
+            !dbg.contains("SECRET-BASE64-PAYLOAD"),
+            "Debug 不得输出图片正文: {dbg}"
+        );
+
+        // 序列化通道不受影响（上游要的就是 base64 原文）。
+        let json = serde_json::to_string(&img).unwrap();
+        assert!(json.contains("SECRET-BASE64-PAYLOAD"));
     }
 }
