@@ -538,11 +538,18 @@ async fn refresh_external_idp_token(
     let status = response.status();
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+        // ⚠️ 2026-10-14：嵌进错误消息/日志的 body 走 `upstream_trace::sanitize_body`
+        // （先截断到 2KiB 再脱敏）——与 social 刷新路径 2026-08-11 横切审查的纪律、
+        // 以及 diagnosis 的 raw 字段（triage C）同一条管道。此前本路径是三个刷新
+        // 兄弟里唯一两处都没做的：上游 auth 端点错误体无法离线验证回显内容，
+        // 原文既进日志又随错误上抛面板，属「凭据进日志」面的敞口。
+        // 判据（contains("invalid_grant")）仍读**原文**，脱敏只作用于展示字段。
+        let safe_body = crate::kiro::upstream_trace::sanitize_body(&body_text);
         if status.as_u16() == 400 && body_text.contains("invalid_grant") {
             return Err(RefreshTokenInvalidError {
                 message: format!(
                     "External IdP refreshToken 已失效 (invalid_grant): {}",
-                    body_text
+                    safe_body
                 ),
             }
             .into());
@@ -553,7 +560,7 @@ async fn refresh_external_idp_token(
                 return Err(RefreshTokenInvalidError {
                     message: format!(
                         "External IdP refreshToken 已失效 (401 Unauthorized): {}",
-                        body_text
+                        safe_body
                     ),
                 }
                 .into());
@@ -565,7 +572,7 @@ async fn refresh_external_idp_token(
         };
         return Err(RefreshHttpError {
             status: status.as_u16(),
-            message: format!("{}: {} {}", error_msg, status, body_text),
+            message: format!("{}: {} {}", error_msg, status, safe_body),
         }
         .into());
     }
@@ -642,12 +649,17 @@ async fn refresh_idc_token(
     let status = response.status();
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+        // ⚠️ 2026-10-14：与 external_idp / social 两条刷新路径同一纪律 —— 嵌进
+        // 错误消息的 body 先经 `upstream_trace::sanitize_body`（截断 2KiB + 脱敏），
+        // 否则上游原文随错误进日志/面板（OIDC 错误体可能回显请求片段，无法离线验证）。
+        // 判据仍读原文；下方 `diagnose_refresh` 也按设计吃原文（其 raw 字段内部再脱敏）。
+        let safe_body = crate::kiro::upstream_trace::sanitize_body(&body_text);
 
         // 400 + invalid_grant → refreshToken 永久失效
         // （保留 RefreshTokenInvalidError:调度层据它禁用/标记该号,语义强于通用诊断）。
         if status.as_u16() == 400 && body_text.contains("invalid_grant") {
             return Err(RefreshTokenInvalidError {
-                message: format!("IdC refreshToken 已失效 (invalid_grant): {}", body_text),
+                message: format!("IdC refreshToken 已失效 (invalid_grant): {}", safe_body),
             }
             .into());
         }
@@ -655,7 +667,7 @@ async fn refresh_idc_token(
         // 401 = token 被吊销或已永久过期，不应再重试 → 立即禁用凭据（与 invalid_grant 同语义）。
         if status.as_u16() == 401 {
             return Err(RefreshTokenInvalidError {
-                message: format!("IdC refreshToken 已失效 (401 Unauthorized): {}", body_text),
+                message: format!("IdC refreshToken 已失效 (401 Unauthorized): {}", safe_body),
             }
             .into());
         }
@@ -6371,14 +6383,20 @@ impl MultiTokenManager {
         };
         match serde_json::to_string_pretty(&stats) {
             Ok(json) => {
-                // 原子写(在 Tokio runtime 内用 block_in_place 避免 rename 重试 sleep 阻塞 worker,
-                // 与 persist_credentials 同一惯例)。save_stats 常从 report_success/failure 的异步计费路径调。
-                let write_result = if tokio::runtime::Handle::try_current().is_ok() {
-                    tokio::task::block_in_place(|| write_atomic(&path, json.as_bytes()))
-                } else {
-                    write_atomic(&path, json.as_bytes())
-                };
-                if let Err(e) = write_result {
+                // 原子写。⚠️ 2026-10-14：**不用** `block_in_place` —— 与
+                // `credential_persist.rs` / `cooldown.rs` 两处同款裁定，理由逐字相同：
+                // 判据不能是 `Handle::try_current().is_ok()`（`spawn_blocking` 线程与
+                // 普通 OS 线程上它也返回 Ok，而 `block_in_place` 在那些线程上直接 panic
+                // 「can call blocking only when running on the multi-threaded runtime」，
+                // current_thread runtime 同样 panic）。本函数恰有两条非常规调用点：
+                // ① `Drop for MultiTokenManager`（Drop 可能落在任意线程，且 panic 发生在
+                //    Drop 里 —— 若正逢栈展开会直接 abort）；
+                // ② 停机路径 `flush_stats_now`。文件 KB 级、`write_atomic` 的 rename
+                //    重试上界 6 次 × 10~50ms（≈150ms 最坏），同步写阻塞 worker 可接受，
+                //    换来的是「任何 runtime 形态下都不会 panic」。
+                // （历史注释写「与 persist_credentials 同一惯例」—— 那处惯例已在
+                // 2026-10-14 改成同步写，本处跟随，否则两边又不一致。）
+                if let Err(e) = write_atomic(&path, json.as_bytes()) {
                     tracing::warn!("保存统计缓存失败: {}", e);
                 } else {
                     *self.last_stats_save_at.lock() = Some(Instant::now());
@@ -8448,11 +8466,21 @@ impl MultiTokenManager {
             entry.disabled_reason = None;
             // 手动「重置并启用」同样回到干净起点（对齐 set_disabled 启用分支）。
             entry.quota_exhausted_at = None;
+            // ⭐ 禁用时刻一并清空（2026-10-14 审计发现：此前只清 reason/quota，漏了
+            // disabled_at —— 与本函数自述的「对齐 set_disabled 启用分支」不符）。
+            // 残留后果与 set_disabled 处注释逐字同型：该字段随 persist 落盘（#10 四件套
+            // 同步契约），面板与 credentials.json 上出现「已启用但带着旧禁用时刻」的
+            // 自相矛盾状态，运维判断「这号坏了多久」被误导；重启后由 load 回填继续保留。
+            entry.disabled_at = None;
         }
         // 重置并启用时一并清 per-id 冷却/退避残留,让「重置」名副其实(否则刚启用又被残留退避跳过)。
         // 在 entries 锁外调用(rate_limiter/cooldown 各有独立锁)。
         self.cooldown.clear_cooldown(id);
         self.rate_limiter.reset(id);
+        // 模型目录缓存同款失效（对齐 set_disabled 启用分支的 Review3 m5）：禁用期残留的
+        // Confirmed 不会自愈（TTL ≤30min 且巡检跳过禁用号），重启用后死号仍被当
+        // 「模型 Confirmed」白打一跳。invalidate 有独立锁，故在 entries 锁外调用。
+        self.invalidate_model_catalog(id);
         // 持久化更改
         self.persist_credentials()?;
         Ok(())
@@ -9901,6 +9929,18 @@ impl MultiTokenManager {
     pub fn cleanup_scheduling(&self) {
         self.rpm.cleanup();
         self.health.cleanup();
+        // 模型级黑名单（键 = 号 × 模型）同款：`is_model_blocked` 的惰性清理只在该
+        // 组合**再次被查询**时触发，而查询键是「本次请求的模型名」——客户端试过、
+        // 之后不再使用的模型名，其条目会永久驻留（模型名是客户端可控串，逐个进
+        // HashMap，属无界增长面）。这里按 TTL 全量剔除过期项。
+        //
+        // 语义等价性：TTL 到期的条目在 `is_model_blocked` 里本就判「未拉黑」并被顺手
+        // 删除，提前剔除不改变任何选号判定；未到期条目原样保留。空串模型键
+        // （无模型语义调用可能写入）在 `is_model_blocked` 里被短路、永不惰性清理，
+        // 也由这一遍兜住。
+        self.model_blocklist
+            .lock()
+            .retain(|_, t| t.elapsed() < MODEL_BLOCK_TTL);
     }
 
     /// 强制刷新指定凭据的 Token（Admin API）
@@ -10060,12 +10100,30 @@ impl MultiTokenManager {
     ) -> bool {
         let cfg = self.config.load_full();
         let proxy = creds.effective_proxy(self.proxy.as_ref());
+        // 陈旧守卫快照：本函数在锁外跑一整轮网络探测（逐个候选 region 的 getUsageLimits，
+        // 秒级），期间 profileArn 可能被其它路径改过。写回处用它与「当前值」比对。
+        let snapshot_arn = creds.profile_arn.clone();
         let candidates = probe_all_usable_profiles(creds, &cfg, token, proxy.as_ref()).await;
         if let Some(best) = candidates.iter().find(|c| c.usable) {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                 let old = entry.credentials.profile_arn.clone();
-                if old.as_deref() != Some(best.arn.as_str()) {
+                // 🔴 陈旧守卫（2026-10-14 并发审计，与 `token_refresh_http.rs` 的
+                // profileArn 写回守卫同型、同理由）：写回发生在跨 await 的一整轮探测之后，
+                // 期间管理员可能刚做完「切换 region」（`switch_profile_region_for` 先验活
+                // 再写 profileArn），或刷新路径刚回填了新解析的 arn。无守卫时，本轮基于
+                // **旧快照**的探测结果会把那个更新的值静默覆盖（管理员的选择被无声回退）。
+                // 两者都是可用 arn，故不是数据损坏，而是「新值被旧值覆盖」的一致性缺陷 ——
+                // 与 token 字段那条守卫同一处置：不覆盖，只记日志；坏标记/冷却仍照常清
+                // （见下方，保持恢复灵敏）。
+                if old != snapshot_arn {
+                    tracing::info!(
+                        "凭据 #{} 探测期间 profileArn 已被其它路径更新（{:?} → {:?}），跳过本轮写回（保留更新值）",
+                        id,
+                        snapshot_arn,
+                        old
+                    );
+                } else if old.as_deref() != Some(best.arn.as_str()) {
                     entry.credentials.profile_arn = Some(best.arn.clone());
                     entry.credentials.sync_region_from_arn();
                     // 族键在 issuer_url 解析失败时退化为 profileArn 兜底，变更后须失效缓存。

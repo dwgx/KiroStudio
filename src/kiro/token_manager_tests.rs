@@ -11137,3 +11137,242 @@ fn delete_rollback_restores_own_entry_and_keeps_others() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ============================================================================
+// 2026-10-14 全仓审计（Gap1 片）修复的守卫
+// ============================================================================
+
+/// 统计落盘**不得**用 `block_in_place`：`Handle::try_current().is_ok()` 不是安全判据。
+///
+/// 形态：`save_stats` 若写「runtime 内 → block_in_place，否则同步写」，则两类线程上
+/// 直接 panic：① current_thread runtime（block_in_place 只允许多线程 runtime）；
+/// ② `spawn_blocking` 线程（阻塞池线程进了 runtime 上下文 ⇒ `Handle::try_current()`
+/// 返 Ok，而 block_in_place 在其上 panic）。而 `save_stats` 恰有两条非常规调用点：
+/// `Drop for MultiTokenManager`（Drop 里 panic 若逢栈展开 = abort）与停机路径
+/// `flush_stats_now`。与 `credential_persist.rs` / `cooldown.rs` 两处同款裁定
+/// （同一 2026-10-14 波），本处是第三个漏网的实例。
+///
+/// 回退即 FAIL：把 save_stats 改回 `if Handle::try_current().is_ok() { block_in_place(..) }`
+/// → 本条在 ①/② 两条路径上 panic（本测试默认 current_thread flavor）。
+#[tokio::test]
+async fn save_stats_must_not_block_in_place_on_current_thread_runtime() {
+    let dir = std::env::temp_dir().join(format!(
+        "ks_save_stats_bi_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cred_path = dir.join("credentials.json");
+
+    let mut c1 = KiroCredentials::default();
+    c1.id = Some(1);
+    c1.access_token = Some("tok-1".to_string());
+    let mut c2 = KiroCredentials::default();
+    c2.id = Some(2);
+    c2.access_token = Some("tok-2".to_string());
+    std::fs::write(
+        &cred_path,
+        serde_json::to_string(&vec![c1.clone(), c2.clone()]).unwrap(),
+    )
+    .unwrap();
+
+    let mgr = MultiTokenManager::new(
+        Config::default(),
+        vec![c1, c2],
+        None,
+        Some(cred_path),
+        false,
+    )
+    .unwrap();
+
+    // ① current_thread runtime（本测试默认 flavor）上落盘一次：每号首次成功会
+    // 绕过 debounce 直调 save_stats。
+    mgr.report_success(1);
+    let stats_path = dir.join("kiro_stats.json");
+    let raw = std::fs::read_to_string(&stats_path)
+        .expect("首次成功必须已落盘（save_stats 在 current_thread runtime 上不得 panic）");
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        v["1"]["success_count"].as_u64(),
+        Some(1),
+        "首次成功必须写进统计文件: {raw}"
+    );
+
+    // ② spawn_blocking 线程上再落一次（另一号的首次成功，同样直调 save_stats）。
+    let mgr = std::sync::Arc::new(mgr);
+    let m2 = mgr.clone();
+    tokio::task::spawn_blocking(move || {
+        m2.report_success(2);
+    })
+    .await
+    .expect("spawn_blocking 任务不得 panic（旧实现 block_in_place 在此 panic）");
+    let raw = std::fs::read_to_string(&stats_path).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        v["2"]["success_count"].as_u64(),
+        Some(1),
+        "阻塞池线程上的落盘也必须成功: {raw}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `cleanup_scheduling` 必须按 TTL 全量剔除模型黑名单的过期条目（无界增长面）。
+///
+/// 形态：`is_model_blocked` 的惰性清理只在该 (号,模型) 组合**再次被查询**时触发，
+/// 而查询键是本次请求的模型名 —— 客户端试过、之后不再使用的模型名（客户端可控串）
+/// 会永久驻留 `model_blocklist`；空串键（无模型语义调用可能写入）更被
+/// `is_model_blocked` 的 `is_empty` 短路、永不惰性清理。后台 5 分钟 tick 的
+/// `cleanup_scheduling` 必须兜住它们。
+///
+/// 回退即 FAIL：删掉 `cleanup_scheduling` 里的 retain → 过期条目留在表里。
+#[test]
+fn cleanup_scheduling_sweeps_expired_model_blocklist_entries() {
+    let mgr = MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap();
+    // 过期项（TTL 外 1s）与未过期项各一条，直接塞进表（不经 report_model_invalid：
+    // 那需要真实上游往返；这里测的是清理语义本身）。
+    let expired_at = Instant::now()
+        .checked_sub(MODEL_BLOCK_TTL + StdDuration::from_secs(1))
+        .expect("Instant 回拨应可用");
+    {
+        let mut bl = mgr.model_blocklist.lock();
+        bl.insert((1u64, "stale-model".to_string()), expired_at);
+        bl.insert((1u64, "live-model".to_string()), Instant::now());
+        // 空串键：无模型语义调用（model=None）路径可能写入，is_model_blocked 对它短路。
+        bl.insert((2u64, String::new()), expired_at);
+    }
+    assert!(
+        mgr.is_model_blacklisted(1, "live-model"),
+        "前提：未过期项应仍在拦截"
+    );
+
+    mgr.cleanup_scheduling();
+
+    let bl = mgr.model_blocklist.lock();
+    assert!(
+        bl.get(&(1u64, "stale-model".to_string())).is_none(),
+        "过期条目必须被全量清理（否则客户端可控模型名把表顶成无界增长）"
+    );
+    assert!(
+        bl.get(&(2u64, String::new())).is_none(),
+        "空串键也必须被 TTL 清理兜住（它永不走惰性清理）"
+    );
+    assert!(
+        bl.contains_key(&(1u64, "live-model".to_string())),
+        "未过期条目不得被误删（语义：TTL 内仍拦截）"
+    );
+}
+
+/// `reset_and_enable` 必须与 `set_disabled(false)` 的启用分支同口径：
+/// 清 `disabled_at` + 失效模型目录缓存。
+///
+/// 形态（2026-10-14 审计）：此前只清 reason / quota_exhausted_at —— 残留的
+/// `disabled_at` 会随 persist 落盘（#10 四件套同步契约），面板与 credentials.json
+/// 出现「已启用却带着旧禁用时刻」的自相矛盾（运维判断「这号坏了多久」被误导）；
+/// 禁用期残留的模型目录 `Confirmed` 也不会自愈（TTL ≤30min 且巡检跳过禁用号），
+/// 重启用后死号仍被当「模型 Confirmed」白打一跳（set_disabled 处 Review3 m5 已修，
+/// 本函数漏改）。
+///
+/// 回退即 FAIL：删掉 `reset_and_enable` 里的 disabled_at 清理 / invalidate 调用。
+#[test]
+fn reset_and_enable_clears_disabled_at_and_invalidates_catalog() {
+    let mut c = KiroCredentials::default();
+    c.id = Some(1);
+    c.access_token = Some("tok".to_string());
+    c.disabled = true;
+    c.disabled_reason = Some(DisabledReason::Manual);
+    c.disabled_at = Some("2026-07-29T10:00:00+00:00".to_string());
+    let mgr = MultiTokenManager::new(Config::default(), vec![c], None, None, false).unwrap();
+
+    // 预置一份模型目录缓存（模拟禁用期残留的 Confirmed）。
+    mgr.store_model_catalog(1, vec!["claude-opus-4.8".to_string()]);
+    assert_eq!(
+        mgr.model_support(1, "claude-opus-4.8"),
+        ModelSupport::Confirmed,
+        "前提：目录已缓存"
+    );
+
+    mgr.reset_and_enable(1).unwrap();
+
+    let snap = mgr.snapshot();
+    let e = snap.entries.iter().find(|e| e.id == 1).unwrap();
+    assert!(!e.disabled, "重置并启用后必须回池");
+    assert!(e.disabled_reason.is_none(), "启用态不得残留禁用原因");
+    assert!(
+        e.disabled_at.is_none(),
+        "启用态不得残留禁用时刻（旧代码漏清：随 persist 落盘、面板自相矛盾）"
+    );
+    assert_eq!(
+        mgr.model_support(1, "claude-opus-4.8"),
+        ModelSupport::Unknown,
+        "重启用必须失效禁用期残留的目录缓存（否则白打一跳）"
+    );
+}
+
+/// 🔴 后台重探的 profileArn 写回必须带陈旧守卫（2026-10-14 并发审计，
+/// 与 `token_refresh_http.rs` 的同类守卫同型）。
+///
+/// 形态：写回发生在跨 await 的一整轮 region 探测之后，期间管理员可能刚做完
+/// 「切换 region」（`switch_profile_region_for` 先验活再写 profileArn），或刷新路径
+/// 刚回填了新解析的 arn —— 无守卫时，用旧快照得出的探测结果会静默覆盖那个更新的值。
+/// 判据用源码切片（探测需真实网络，无法确定性复现竞态；同款先例见
+/// `profile_arn_writeback_must_guard_against_stale_snapshot`）。
+#[test]
+fn reprobe_writeback_must_guard_against_stale_snapshot() {
+    let src = include_str!("token_manager.rs");
+    let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+    let prod = &src[..cut];
+    let at = prod
+        .find("fn reprobe_and_correct_region_with")
+        .expect("reprobe_and_correct_region_with 不该被改名");
+    let body = &prod[at..];
+    let end = body.find("\n    }\n").unwrap_or(body.len());
+    let body = &body[..end];
+    // needle 运行时拼接：include_str! 会把本测试自己的字面量也读进来。
+    let guard = format!("old != snapshot{}", "_arn");
+    let write = format!(
+        "entry.credentials.profile_arn = Some(best.arn{}",
+        ".clone())"
+    );
+    let g = body
+        .find(&guard)
+        .expect("探测结果写回前必须比对探测前的快照（否则覆盖管理员已验活的值）");
+    let w = body.find(&write).expect("写回点不该被删");
+    assert!(g < w, "陈旧守卫必须在写回之前");
+}
+
+/// 上游错误体嵌进刷新错误消息/日志前必须走 `upstream_trace::sanitize_body`
+/// （截断 2KiB + 脱敏），三条刷新路径一视同仁。
+///
+/// 形态（2026-10-14 审计）：social 路径 2026-08-11 横切审查已截断，而 external_idp /
+/// idc 两条兄弟路径把上游 body **原文**拼进 `RefreshTokenInvalidError` /
+/// `RefreshHttpError` 的消息（进日志、随错误上抛面板）。OIDC/Microsoft 错误体可能
+/// 回显请求片段，无法离线验证，属「凭据进日志」面的敞口。
+///
+/// 回退即 FAIL：把两处 `safe_body` 换回 `body_text`。
+#[test]
+fn refresh_error_messages_must_sanitize_upstream_body() {
+    let src = include_str!("token_manager.rs");
+    let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+    let prod = &src[..cut];
+    // needle 运行时拼接：include_str! 会把本测试自己的字面量也读进来。
+    let needle = format!(
+        "crate::kiro::upstream_trace::sanitize{}",
+        "_body(&body_text)"
+    );
+    for fname in ["fn refresh_external_idp_token", "fn refresh_idc_token"] {
+        let at = prod
+            .find(fname)
+            .unwrap_or_else(|| panic!("{fname} 不该被改名"));
+        let body = &prod[at..];
+        let end = body.find("\n}\n").unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains(&needle),
+            "{fname} 的错误消息必须经 sanitize_body 处理（上游原文进日志/面板是敞口）"
+        );
+    }
+}
