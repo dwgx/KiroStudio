@@ -803,7 +803,7 @@ pub async fn perform_update(target: Option<String>) -> Result<UpdatePerformResul
         match smoke {
             Ok(Ok(out)) if out.status.success() => {
                 let stdout = String::from_utf8_lossy(&out.stdout);
-                if !smoke_version_ok(tag, &stdout) {
+                if !smoke_version_ok(&tag, &stdout) {
                     let _ = tokio::fs::remove_file(&new).await;
                     return Err(UpdateError::Internal(format!(
                         "候选二进制 --version 输出不含目标版本 {tag}（实得 {:?}），已中止升级",
