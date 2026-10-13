@@ -841,15 +841,32 @@ pub struct Config {
     #[serde(default = "default_prompt_cache_enabled")]
     pub prompt_cache_enabled: bool,
 
-    /// prompt 缓存估算的有效期上限（秒）。
+    /// prompt 缓存估算的有效期上限（秒，默认 3600）。
     ///
-    /// ⚠️ 当前**无实际读取点**：现行估算是无状态的（每请求按 `count_prefix_tokens`
-    /// 重算前缀 token），没有需要按时间过期的缓存表，所以这个值改成什么都不影响行为。
-    /// 保留该字段是为兼容既有 config.json 不因未知键报错。
-    /// 若将来实现 `docs/CACHE-RFC.md` 的 L2 度量层（带过期的影子缓存表），
-    /// 应对齐上游 5 分钟窗口（即 300），而不是沿用这里的 3600。
+    /// 2026-10-14 接线：此前是哑字段（全仓零消费点），实际 TTL 写死在
+    /// `anthropic::cache_fingerprint` 的 `MAX_TTL_SECS`。现在由
+    /// `anthropic::cache_fingerprint::set_cache_metering_config` 消费，作为指纹表条目
+    /// 过期时间的**上限**（钳制到 [60, 3600]）：请求声明的 cache_control.ttl（5m/1h）
+    /// 仍决定基础 TTL 与 5m/1h 归档，本值只封顶。
+    ///
+    /// 默认 3600 与旧写死的 `MAX_TTL_SECS` 一致 ⇒ 不配置时行为逐字节不变；
+    /// 要对齐上游 5 分钟窗口（`docs/CACHE-RFC.md` 的 L2 建议）请显式配 300。
+    /// 热更语义：admin 改配置即时生效（表已构造就地改写；见 setter 文档）。
     #[serde(default = "default_prompt_cache_ttl_seconds")]
     pub prompt_cache_ttl_seconds: u64,
+
+    /// 指纹表（L3 影子缓存计量）条目上限（默认 4096）。
+    ///
+    /// 背景：本仓单请求写入段数 ≈ 消息条数 M（`extract_segments` 在每个消息边界
+    /// commit 一个递增前缀段），远高于「4 段/请求」的粗略假设 —— 固定 4096 在长会话下
+    /// 会周期性打满并淘汰，命中率随负载无声衰减且无法调。本字段提供旋钮。
+    ///
+    /// 读取处（`anthropic::cache_fingerprint::set_cache_metering_config`）clamp 到
+    /// [1024, 8388608]：越界告警并使用钳后值（同 `mockCacheReadRatio` 的清洗惯例）。
+    /// 热更语义：admin 改配置即时生效（表已构造就地改写；容量调小由下一次超限插入的
+    /// 抽样淘汰自然收敛，不重建表、不丢已缓存前缀）。
+    #[serde(default = "default_cache_metering_capacity")]
+    pub cache_metering_capacity: usize,
 
     /// 是否剥离转发给上游的 system 环境噪音（默认 true，立即生效 / 无需重启）
     ///
@@ -1584,6 +1601,12 @@ fn default_prompt_cache_ttl_seconds() -> u64 {
     3600
 }
 
+/// 指纹表容量默认 4096（与 `anthropic::cache_fingerprint::DEFAULT_CAPACITY` 同值；
+/// 跨文件一致性由 cache_fingerprint 的 `default_capacity_matches_config_default` 钉住）。
+fn default_cache_metering_capacity() -> usize {
+    4096
+}
+
 fn default_strip_env_noise() -> bool {
     true
 }
@@ -1776,6 +1799,7 @@ impl Default for Config {
             custom_api_first: false,
             prompt_cache_enabled: default_prompt_cache_enabled(),
             prompt_cache_ttl_seconds: default_prompt_cache_ttl_seconds(),
+            cache_metering_capacity: default_cache_metering_capacity(),
             strip_env_noise: default_strip_env_noise(),
             mock_cache_enabled: false,
             mock_cache_read_ratio: default_mock_cache_read_ratio(),
@@ -2776,6 +2800,34 @@ mod tests {
         .expect("camelCase 显式值必须能反序列化");
         assert!(explicit.mock_cache_enabled);
         assert_eq!(explicit.mock_cache_read_ratio, 1.0);
+    }
+
+    /// 指纹表容量（cacheMeteringCapacity，2026-10-14 新增）：默认 4096、缺字段回退
+    /// 4096、显式值被尊重、camelCase roundtrip 保真。
+    ///
+    /// 回退即 FAIL：`#[serde(default = ...)]` 换成裸 `#[serde(default)]`（usize 裸默认是
+    /// 0 → 非法容量，每次超限插入都会把表清空），或默认值改成别的数（影子缓存容量静默变化）。
+    #[test]
+    fn cache_metering_capacity_defaults_4096_and_roundtrips() {
+        assert_eq!(
+            Config::default().cache_metering_capacity,
+            default_cache_metering_capacity(),
+            "默认必须走 default_cache_metering_capacity()，不得另写字面量"
+        );
+        let bare: Config = serde_json::from_str("{}").expect("缺字段的 config 必须能反序列化");
+        assert_eq!(
+            bare.cache_metering_capacity, 4096,
+            "缺字段时必须落到 4096（裸 usize 的 serde default 是 0，那是非法容量）"
+        );
+        let explicit: Config = serde_json::from_str(r#"{"cacheMeteringCapacity":8192}"#)
+            .expect("camelCase 显式值必须能反序列化");
+        assert_eq!(explicit.cache_metering_capacity, 8192, "显式值必须被尊重");
+        let value = serde_json::to_value(&explicit).expect("序列化应成功");
+        assert_eq!(
+            value.get("cacheMeteringCapacity"),
+            Some(&serde_json::json!(8192)),
+            "必须按 camelCase 写出"
+        );
     }
 
     /// 工具映射开关：缺字段时默认**开**（与既有原子默认 true 一致，保持现状行为零变化）；

@@ -18,6 +18,13 @@
 //! `estimate_cache_breakdown`（指纹含 creation，严格更完整；无指纹时回退 Layer 2）。
 //! 输出仍带 `x-kirostudio-cache-estimated` 标注（估算，不冒充真值）。
 //!
+//! # 运行配置与可观测性（2026-10-14）
+//!
+//! 表容量（`cacheMeteringCapacity`，默认 4096）与 TTL 上限（`promptCacheTtlSeconds`，
+//! 默认 3600 = 旧写死 `MAX_TTL_SECS`）经 [`set_cache_metering_config`] 注入进程镜像：
+//! main 启动接线、admin 热更即时生效。命中/淘汰/过期/无种子 miss 计数器见
+//! [`cache_metering_metrics`]（60s 周期日志未接线，理由见该函数文档）。
+//!
 //! # 范围裁剪与已知偏差（对比参考仓，刻意声明）
 //!
 //! - **无持久化 / 无后台线程**：纯内存 HashMap + 惰性淘汰。参考仓每分钟落盘 JSON 并
@@ -37,22 +44,31 @@
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 use super::cache::PromptCacheUsage;
 use super::types::{MessagesRequest, SystemMessage, Tool};
 
-/// 默认条目上限（防内存无限增长，参考仓同值）。
+/// 默认条目上限（防内存无限增长，参考仓同值；可经 `cacheMeteringCapacity` 覆盖）。
 const DEFAULT_CAPACITY: usize = 4096;
+/// 容量可配区间下限（2026-10-14）：再小省不出内存还容易被长会话打满。
+const MIN_CAPACITY: usize = 1024;
+/// 容量可配区间上限（2026-10-14）：防手滑写天文数字（越界由 setter warn + 钳后用值）。
+const MAX_CAPACITY: usize = 8 * 1024 * 1024; // 8388608
 /// 默认 TTL（5 分钟，Anthropic ephemeral 默认值）。
 const DEFAULT_TTL_SECS: i64 = 5 * 60;
-/// TTL 上限（1 小时，Anthropic ttl="1h"）。
+/// TTL 上限（1 小时，Anthropic ttl="1h"；也是 `promptCacheTtlSeconds` 的钳制上界）。
 const MAX_TTL_SECS: i64 = 3600;
+/// TTL 下限（秒）：低于此值的过期表对多轮对话毫无意义，钳到 1 分钟起步。
+const MIN_TTL_SECS: i64 = 60;
 /// 图片块 token 近似（Anthropic 默认 ~1105 token/图，此处取整估算，见模块注释）。
 const IMAGE_BLOCK_TOKENS: u32 = 1000;
 /// LRU 淘汰的抽样间隔（2026-08-15）：每累计 [`EVICT_INTERVAL`] 条「超限插入」才
 /// 全表排序一次。排序是 O(n log n)，改前每次超限插入都排序会拖慢热路径；抽样后
-/// 表长上界 = cap + EVICT_INTERVAL − 1 + 单次 record 插入段数，内存可控。
+/// 表长上界 = cap + (EVICT_INTERVAL − 1) × 单次 record 段数（2026-10-14 修正：
+/// 计数器按 record **调用**加一，而单次调用可插入 N 段，旧公式漏了 ×N —— 见
+/// [`Inner::record`] 的推导与 `capacity_bound_holds_with_multi_segment_records`）。
 const EVICT_INTERVAL: usize = 128;
 
 /// 单个缓存条目。
@@ -63,24 +79,141 @@ struct CacheEntry {
     last_hit_at: i64,
 }
 
-#[derive(Default)]
 struct Inner {
     entries: HashMap<u64, CacheEntry>,
     /// 距上次 LRU 淘汰的「超限插入」条数（抽样淘汰计数，见 [`EVICT_INTERVAL`]）。
     inserts_since_evict: usize,
+    /// 条目数上限（构造时注入 / 热更就地改写，见 [`set_cache_metering_config`]）。
+    capacity: usize,
+    /// 条目过期时间上限秒数（同上；`ttl_secs` 在 record 里钳到 [MIN_TTL_SECS, 本值]）。
+    max_ttl_secs: i64,
+}
+
+impl Inner {
+    /// 显式构造（**不**派生 Default：容量 0 会让每次超限插入都清空表，必须由调用方给出）。
+    fn new(capacity: usize, max_ttl_secs: i64) -> Self {
+        Self {
+            entries: HashMap::new(),
+            inserts_since_evict: 0,
+            capacity,
+            max_ttl_secs,
+        }
+    }
 }
 
 /// 进程内提示词前缀指纹缓存（纯内存、惰性淘汰）。
-#[derive(Default)]
 pub(crate) struct CacheFingerprintMeter {
     inner: Mutex<Inner>,
 }
 
-static METER: OnceLock<CacheFingerprintMeter> = OnceLock::new();
+/// 全局唯一的指纹缓存（首次访问时按当前镜像值构造，见 [`set_cache_metering_config`]）。
+static METER: LazyLock<CacheFingerprintMeter> = LazyLock::new(|| {
+    CacheFingerprintMeter::new(
+        CACHE_METERING_CAPACITY.load(Ordering::Relaxed),
+        CACHE_METERING_TTL_SECS.load(Ordering::Relaxed),
+    )
+});
 
-/// 全局唯一的指纹缓存（估算层，无配置项，开关由调用方按 `prompt_cache_enabled` 门控）。
+/// 指纹表容量的进程级镜像（`cacheMeteringCapacity`，默认 [`DEFAULT_CAPACITY`]）。
+///
+/// 为什么是原子镜像而不是把 Config 传进热路径：`compute_fingerprint_usage` 的调用点
+/// （handlers_dispatch）拿不到 Config —— 与 handlers 的 `PROMPT_CACHE_ENABLED` /
+/// `MOCK_CACHE_READ_RATIO` 同款 TIER3 惯例（main 启动接线、admin 热更调 setter）。
+/// 表未构造时本值作构造种子；已构造则 setter 就地改写（见 [`set_cache_metering_config`]）。
+static CACHE_METERING_CAPACITY: AtomicUsize = AtomicUsize::new(DEFAULT_CAPACITY);
+/// 指纹表 TTL 上限的进程级镜像（`promptCacheTtlSeconds`，默认 [`MAX_TTL_SECS`] = 旧写死值）。
+static CACHE_METERING_TTL_SECS: AtomicI64 = AtomicI64::new(MAX_TTL_SECS);
+
+/// 容量钳制（纯函数便于测试；越界 warn 由 [`set_cache_metering_config`] 打）。
+fn clamp_capacity(capacity: usize) -> usize {
+    capacity.clamp(MIN_CAPACITY, MAX_CAPACITY)
+}
+
+/// TTL 上限钳制（纯函数；在 u64 域先钳再转 i64，避免超大值转出负数）。
+fn clamp_ttl_secs(ttl_secs: u64) -> i64 {
+    ttl_secs.clamp(MIN_TTL_SECS as u64, MAX_TTL_SECS as u64) as i64
+}
+
+/// 注入指纹表运行配置（main 启动接线 / admin 热更调用，立即生效）。
+///
+/// 越界清洗在**入口**完成（同 handlers 的 `set_mock_cache_config` 惯例）：容量钳到
+/// [MIN_CAPACITY, MAX_CAPACITY]、TTL 钳到 [MIN_TTL_SECS, MAX_TTL_SECS]，越界打 warn
+/// 并用钳后值 —— 热路径拿到的恒是合法值，无需再防御。
+///
+/// 时序：先写镜像静态，再 `force` 取表引用（未构造则此刻构造、构造闭包读到新镜像值）
+/// 并就地改写字段 —— 热更不重建表、不丢已缓存前缀（容量调小由下一次超限插入的抽样
+/// 淘汰自然收敛）。
+///
+/// ⚠️ 调用点接线（main 启动 + admin 热更 + handlers 的 replay_all_mirrors）不在本次
+/// 授权的两个文件内，故暂标 `allow(dead_code)`（同 `invoke_xml.rs` 的待接线惯例）：
+/// 主 agent 在 `main.rs` / `config_update.rs` / `replay_all_mirrors` 补
+/// `set_cache_metering_config(cfg.cache_metering_capacity, cfg.prompt_cache_ttl_seconds)`
+/// 后即可删除本属性。
+#[allow(dead_code)]
+pub fn set_cache_metering_config(capacity: usize, ttl_secs: u64) {
+    let clamped_capacity = clamp_capacity(capacity);
+    if clamped_capacity != capacity {
+        tracing::warn!(
+            "cacheMeteringCapacity={capacity} 越界，已钳制为 {clamped_capacity}（合法区间 [{MIN_CAPACITY}, {MAX_CAPACITY}]）"
+        );
+    }
+    let clamped_ttl = clamp_ttl_secs(ttl_secs);
+    if clamped_ttl as u64 != ttl_secs {
+        tracing::warn!(
+            "promptCacheTtlSeconds={ttl_secs} 越界，已钳制为 {clamped_ttl}（合法区间 [{MIN_TTL_SECS}, {MAX_TTL_SECS}]）"
+        );
+    }
+    CACHE_METERING_CAPACITY.store(clamped_capacity, Ordering::Relaxed);
+    CACHE_METERING_TTL_SECS.store(clamped_ttl, Ordering::Relaxed);
+    // LazyLock 没有「是否已初始化」查询：force 即取引用（未初始化则此刻构造，构造闭包
+    // 读到的正是刚写入的镜像值），随后就地改写字段 —— 未构造/已构造两条路殊途同归。
+    let mut inner = LazyLock::force(&METER).inner.lock();
+    inner.capacity = clamped_capacity;
+    inner.max_ttl_secs = clamped_ttl;
+}
+
+/// 全局唯一的指纹缓存（估算层；开关由调用方按 `prompt_cache_enabled` 门控，
+/// 容量/TTL 上限由 [`set_cache_metering_config`] 注入）。
 pub(crate) fn meter() -> &'static CacheFingerprintMeter {
-    METER.get_or_init(CacheFingerprintMeter::default)
+    &METER
+}
+
+// ==================== 进程级计数器（2026-10-14，最小可观测性） ====================
+// 纯 AtomicU64 + Relaxed（同 `common::recovery_metrics` 的零成本惯例）：只增不清、
+// 不持久化（重启归零），热路径可无脑调；段级与请求级口径分开（见各计数器文档）。
+
+/// 段级命中数（lookup 每命中一段 +1；一段 = 前缀链的一个断点，非「一次请求」）。
+static METRIC_HITS: AtomicU64 = AtomicU64::new(0);
+/// 被 LRU 淘汰的条目数（每轮抽样淘汰实际移除的条数，非淘汰轮次）。
+static METRIC_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+/// 查询时观测到「存在但已过期」的段数（惰性过期只在查询处观测，不做主动清理）。
+static METRIC_EXPIRED: AtomicU64 = AtomicU64::new(0);
+/// 无会话种子的请求数（isolation_seed 为 None → 无缓存资格、全入 input，与段级 miss 不同）。
+static METRIC_NO_SEED_MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// 指纹表进程级计数器快照（自进程启动累计，不持久化；字段语义见各计数器文档）。
+#[derive(Debug, Clone, Copy)]
+pub struct CacheMeteringMetrics {
+    pub hits: u64,
+    pub evictions: u64,
+    pub expired: u64,
+    pub no_seed_misses: u64,
+}
+
+/// 读计数器快照。
+///
+/// ⚠️ 60s 周期 `tracing::info!` **未接线**（deferred，2026-10-14）：本仓周期日志机制是
+/// `tokio::spawn` 的 interval 任务（admin 的 `respawn_balance_task`、main 的 stats_stale
+/// watchdog 等），而本模块按设计不起后台线程、spawn 点也不在模块内 —— 接线需要动模块外
+/// 调用点（读本函数打一行即可），留给主 agent / 后续波次。接线前标 `allow(dead_code)`。
+#[allow(dead_code)]
+pub fn cache_metering_metrics() -> CacheMeteringMetrics {
+    CacheMeteringMetrics {
+        hits: METRIC_HITS.load(Ordering::Relaxed),
+        evictions: METRIC_EVICTIONS.load(Ordering::Relaxed),
+        expired: METRIC_EXPIRED.load(Ordering::Relaxed),
+        no_seed_misses: METRIC_NO_SEED_MISSES.load(Ordering::Relaxed),
+    }
 }
 
 impl Inner {
@@ -92,18 +225,27 @@ impl Inner {
             .map(|h| match self.entries.get_mut(h) {
                 Some(e) if e.expires_at > now => {
                     e.last_hit_at = now;
+                    METRIC_HITS.fetch_add(1, Ordering::Relaxed);
                     true
                 }
-                _ => false,
+                Some(_) => {
+                    // 存在但已过期：惰性过期只在查询处观测（不主动清理，与「无后台线程」
+                    // 的范围裁剪一致）—— 计数用于判断「TTL 是否设得太短」。
+                    METRIC_EXPIRED.fetch_add(1, Ordering::Relaxed);
+                    false
+                }
+                None => false,
             })
             .collect()
     }
 
-    /// 把一组前缀段写入缓存。`ttl_secs` clip 到 [60, MAX_TTL_SECS]；容量超限按
-    /// last_hit_at（LRU）淘汰最旧条目（抽样淘汰，见 [`EVICT_INTERVAL`]）。
+    /// 把一组前缀段写入缓存。`ttl_secs` 钳到 [MIN_TTL_SECS, 表注入的 TTL 上限]；容量
+    /// 超限按 last_hit_at（LRU）淘汰最旧条目（抽样淘汰，见 [`EVICT_INTERVAL`]）。
     fn record(&mut self, hashes: &[u64], tokens: &[u32], ttl_secs: i64, now: i64) {
         debug_assert_eq!(hashes.len(), tokens.len());
-        let ttl = ttl_secs.clamp(60, MAX_TTL_SECS);
+        // 上限再取一次 max(MIN_TTL_SECS)：构造入口（setter）已钳制，这里防「未来调用方
+        // 传 < MIN 的上限」把 clamp 的 min>max 断言打成 panic —— 估算层不值得 panic 风险。
+        let ttl = ttl_secs.clamp(MIN_TTL_SECS, self.max_ttl_secs.max(MIN_TTL_SECS));
         for (h, t) in hashes.iter().zip(tokens.iter()) {
             self.entries.insert(
                 *h,
@@ -116,13 +258,19 @@ impl Inner {
         }
         // 🔴 抽样淘汰（2026-08-15）：改前每次超限插入都全表排序（O(n log n)）——
         // 容量打满后每次 record 都付一次全表排序成本，纯估算层不值得。改为每
-        // EVICT_INTERVAL 条「超限插入」才淘汰一次：表长上界 = cap + EVICT_INTERVAL − 1
-        // + 单次 record 段数（有界不泄漏），LRU 语义（最旧 last_hit_at 先淘汰）不变。
-        if self.entries.len() > DEFAULT_CAPACITY {
+        // EVICT_INTERVAL 条「超限插入」才淘汰一次。
+        //
+        // 上界修正（2026-10-14）：计数器按 **record() 调用** 加一（每次 +1，不按插入条数），
+        // 而单次 record 会插入整条前缀链的 N 段（N ≈ 消息条数，见 extract_segments 在每个
+        // 消息边界 commit）⇒ 真实上界 = cap + (EVICT_INTERVAL − 1) × N：每轮淘汰把表压回
+        // cap，其后最多 EVICT_INTERVAL−1 次超限调用各加 ≤N 条；旧注释的
+        // cap + EVICT_INTERVAL − 1 + N 只在 N=1 时巧合成立（钉住测试见
+        // capacity_bound_holds_with_multi_segment_records）。有界不泄漏，LRU 语义不变。
+        if self.entries.len() > self.capacity {
             self.inserts_since_evict += 1;
             if self.inserts_since_evict >= EVICT_INTERVAL {
                 self.inserts_since_evict = 0;
-                let drop_n = self.entries.len() - DEFAULT_CAPACITY;
+                let drop_n = self.entries.len() - self.capacity;
                 let mut victims: Vec<(u64, i64)> = self
                     .entries
                     .iter()
@@ -132,12 +280,22 @@ impl Inner {
                 for (k, _) in victims.into_iter().take(drop_n) {
                     self.entries.remove(&k);
                 }
+                METRIC_EVICTIONS.fetch_add(drop_n as u64, Ordering::Relaxed);
             }
         }
     }
 }
 
 impl CacheFingerprintMeter {
+    /// 显式构造（容量 + TTL 上限注入）：生产走 [`meter()`]（从进程镜像取，见
+    /// [`set_cache_metering_config`]）；测试直接构造独立实例（不碰全局 METER，
+    /// 避免并行测试互相污染）。
+    fn new(capacity: usize, max_ttl_secs: i64) -> Self {
+        Self {
+            inner: Mutex::new(Inner::new(capacity, max_ttl_secs)),
+        }
+    }
+
     /// 生产入口：**查询 + 记录在同一次持锁内**完成，返回每段是否命中。
     ///
     /// 为什么必须是一对原子操作：`compute_fingerprint_usage` 原本先 `lookup` 再
@@ -171,6 +329,14 @@ impl CacheFingerprintMeter {
     #[cfg(test)]
     fn len(&self) -> usize {
         self.inner.lock().entries.len()
+    }
+
+    /// 读表当前注入的（容量, TTL 上限）。仅供测试钉 `set_cache_metering_config`
+    /// 的就地改写；生产不读它（热路径用 record 内的字段，不走本函数）。
+    #[cfg(test)]
+    fn config(&self) -> (usize, i64) {
+        let inner = self.inner.lock();
+        (inner.capacity, inner.max_ttl_secs)
     }
 }
 
@@ -240,7 +406,12 @@ struct Segment {
 /// `Some` 时 cache_read = 最深命中段累计、cache_creation = 覆盖前缀 − read。
 /// 结果**未 clamp**，由调用方走 `clamp_to_total`（与链上其它层同语义）。
 pub(crate) fn compute_fingerprint_usage(req: &MessagesRequest) -> Option<PromptCacheUsage> {
-    let cache_seed = isolation_seed(req)?;
+    let Some(cache_seed) = isolation_seed(req) else {
+        // 无会话种子 = 无缓存资格（不是「没命中」，是「无法参与」）：单独计数，
+        // 与段级 miss 区分 —— 观测上能分辨「客户端没带 metadata」与「缓存真没命中」。
+        METRIC_NO_SEED_MISSES.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
     let (segments, ttl) = extract_segments(req, Some(cache_seed.as_str()));
     if segments.is_empty() {
         return None;
@@ -561,7 +732,7 @@ mod tests {
     use crate::anthropic::types::{CacheControl, Message, SystemMessage, Tool};
 
     // ⚠️ 会话种子约定（2026-08-11 deep 审计）：
-    // 走 compute_fingerprint_usage 的测试共享全局静态 METER（OnceLock）+ 真实时钟，
+    // 走 compute_fingerprint_usage 的测试共享全局静态 METER（LazyLock）+ 真实时钟，
     // **新增测试必须用全仓唯一的 user_id 种子**（形如 `user_a__session-<测试名>`），
     // 且不要复用其它测试的消息内容 —— 否则并行执行时「首轮 read==0」类断言会被
     // 别的测试先写入的段污染而 flaky。
@@ -758,7 +929,7 @@ mod tests {
     /// TTL 过期：记录后过 TTL 再查询，不得命中。
     #[test]
     fn expired_entries_do_not_hit() {
-        let m = CacheFingerprintMeter::default();
+        let m = CacheFingerprintMeter::new(DEFAULT_CAPACITY, MAX_TTL_SECS);
         let now = 1_000_000;
         m.record_at(&[0xAAAA], &[100], DEFAULT_TTL_SECS, now);
         assert_eq!(m.lookup_at(&[0xAAAA], now + DEFAULT_TTL_SECS + 1), vec![false], "过期不命中");
@@ -769,11 +940,13 @@ mod tests {
     /// （last_hit_at）语义不变 —— 最旧条目最终被淘汰、最新条目保留。
     ///
     /// ⚠️ 2026-08-15 语义微调：改前每次超限都淘汰、表长严格回到 cap；抽样后
-    /// 每 EVICT_INTERVAL 条超限插入才淘汰一次，表长上界 = cap + EVICT_INTERVAL − 1。
+    /// 每 EVICT_INTERVAL 条超限插入才淘汰一次，表长上界 = cap + (EVICT_INTERVAL − 1) × N
+    /// （N = 单次 record 段数；本测试 N=1，N>1 由
+    /// `capacity_bound_holds_with_multi_segment_records` 钉住）。
     /// 断言改测上界 + LRU 方向，而非「严格等于 cap」。
     #[test]
     fn capacity_evicts_least_recently_hit() {
-        let m = CacheFingerprintMeter::default();
+        let m = CacheFingerprintMeter::new(DEFAULT_CAPACITY, MAX_TTL_SECS);
         let now = 1_000_000;
         // 塞 DEFAULT_CAPACITY + EVICT_INTERVAL + 10 条（ttl 用上限，查询时刻所有
         // 条目都未过期）：至少触发一轮淘汰，最早写入的条目（last_hit_at 最小）
@@ -790,6 +963,164 @@ mod tests {
         // 查询时刻取 now + total：最早写入的 1、2 已被淘汰，最新的 total 仍在。
         let hits = m.lookup_at(&[1, 2, total as u64], now + total as i64);
         assert_eq!(hits, vec![false, false, true], "LRU 语义：最旧被淘汰，最新保留");
+    }
+
+    /// 表长上界（N>1 修正，2026-10-14）：计数器按 record() **调用**加一（每次 +1），
+    /// 而单次 record 会插入整条前缀链的 N 段 ⇒ 真实上界 = cap + (EVICT_INTERVAL−1)×N。
+    /// 旧注释公式 cap + EVICT_INTERVAL − 1 + N 只在 N=1 时巧合成立（见
+    /// `capacity_evicts_least_recently_hit`），本测试用 N=100 钉住真实公式。
+    ///
+    /// 用小容量独立表（cap=128）：两轮淘汰周期内即可跑满，不碰全局 METER。
+    #[test]
+    fn capacity_bound_holds_with_multi_segment_records() {
+        let cap = 128;
+        let n = 100; // 每次 record 的段数（生产 N ≈ 消息条数 M）
+        let m = CacheFingerprintMeter::new(cap, MAX_TTL_SECS);
+        let now = 1_000_000;
+        let mut key = 0u64;
+        // 跑满两轮淘汰周期（每轮 EVICT_INTERVAL 次超限插入），逐步断言上界。
+        for step in 0..(EVICT_INTERVAL * 2) {
+            let hashes: Vec<u64> = (0..n)
+                .map(|_| {
+                    key += 1;
+                    key
+                })
+                .collect();
+            let tokens = vec![10u32; n];
+            m.record_at(&hashes, &tokens, MAX_TTL_SECS, now + step as i64);
+            assert!(
+                m.len() <= cap + (EVICT_INTERVAL - 1) * n,
+                "N>1 时上界必须是 cap + (EVICT_INTERVAL−1)×N = {}，实际 {}（step={step}）",
+                cap + (EVICT_INTERVAL - 1) * n,
+                m.len()
+            );
+        }
+        // 旧公式（cap + EVICT_INTERVAL − 1 + N = 355）早已被超越 —— 额外证明最终表长
+        // 确实大于旧公式，防「新旧公式恰好都通过」的假阴性（回退即 FAIL）。
+        assert!(
+            m.len() > cap + EVICT_INTERVAL - 1 + n,
+            "最终表长 {} 必须超过旧公式上界 {}（证明旧注释在 N>1 时是假的）",
+            m.len(),
+            cap + EVICT_INTERVAL - 1 + n
+        );
+    }
+
+    /// 配置 TTL 上限真正生效（2026-10-14 接线）：注入 120s 上限后，请求即使声明 1h
+    /// （MAX_TTL_SECS），条目也在 120s 到达即过期 —— 旧实现写死 [60, 3600]，配置字段
+    /// 是哑的（改什么都不影响行为）。
+    #[test]
+    fn configured_ttl_caps_entry_expiry() {
+        let m = CacheFingerprintMeter::new(DEFAULT_CAPACITY, 120);
+        let now = 1_000_000;
+        m.record_at(&[0xBEEF], &[10], MAX_TTL_SECS, now);
+        assert_eq!(m.lookup_at(&[0xBEEF], now + 119), vec![true], "TTL 内必须命中");
+        assert_eq!(
+            m.lookup_at(&[0xBEEF], now + 120),
+            vec![false],
+            "到达配置上限 120s 即过期（若 TTL 接线失效回退到 3600，这里会是 true）"
+        );
+    }
+
+    /// 默认行为逐字节不变（回归钉）：TTL 上限 = MAX_TTL_SECS（= 配置默认 3600）时，
+    /// 请求声明 1h 的条目必须活过 5 分钟 —— 与 TTL 接线前的写死行为一致。
+    #[test]
+    fn default_ttl_upper_bound_keeps_1h_entries_alive() {
+        let m = CacheFingerprintMeter::new(DEFAULT_CAPACITY, MAX_TTL_SECS);
+        let now = 1_000_000;
+        m.record_at(&[0xCAFE], &[10], MAX_TTL_SECS, now);
+        assert_eq!(m.lookup_at(&[0xCAFE], now + 300), vec![true], "1h 档条目必须活过 5m");
+        assert_eq!(m.lookup_at(&[0xCAFE], now + 3600), vec![false], "到达 1h 过期");
+    }
+
+    /// 配置钳制（纯函数）：容量 [1024, 8388608]、TTL [60, 3600]；默认值必须原样通过
+    /// （4096 / 3600 = 现行为逐字节不变）。
+    #[test]
+    fn config_clamps_capacity_and_ttl_to_safe_ranges() {
+        assert_eq!(clamp_capacity(0), MIN_CAPACITY);
+        assert_eq!(clamp_capacity(usize::MAX), MAX_CAPACITY);
+        assert_eq!(clamp_capacity(1024), 1024, "下界本身合法");
+        assert_eq!(clamp_capacity(8388608), 8388608, "上界本身合法");
+        assert_eq!(clamp_capacity(4096), 4096, "默认容量必须原样通过");
+
+        assert_eq!(clamp_ttl_secs(0), MIN_TTL_SECS);
+        assert_eq!(clamp_ttl_secs(u64::MAX), MAX_TTL_SECS, "u64 极值不得回绕成负数");
+        assert_eq!(clamp_ttl_secs(60), 60, "下界本身合法");
+        assert_eq!(clamp_ttl_secs(3600), 3600, "默认 3600 必须原样通过");
+        assert_eq!(clamp_ttl_secs(300), 300, "请求级 5m 不受影响");
+    }
+
+    /// setter 注入链路（main 启动 / admin 热更的接线端）：越界值钳后写入全局表，
+    /// 合法值原样注入；测完恢复原值（全局 METER 被并行测试共享，只能短暂借用）。
+    ///
+    /// ⚠️ 借用窗口内其他测试看到 (MAX_CAPACITY, MAX_TTL_SECS) 或 (orig, orig)：两者
+    /// 对它们都是「容量远超其数据量、TTL 上限 ≥ 其条目 TTL」的行为等价态，不改变断言。
+    #[test]
+    fn setter_injects_clamped_values_into_live_meter() {
+        let (orig_cap, orig_ttl) = meter().config();
+        // 越界值：钳到区间端点后注入（warn 由 setter 打，这里钉值）。
+        set_cache_metering_config(usize::MAX, u64::MAX);
+        assert_eq!(
+            meter().config(),
+            (MAX_CAPACITY, MAX_TTL_SECS),
+            "越界值必须钳后注入（容量上限 8388608 / TTL 上限 3600）"
+        );
+        // 合法值：原样注入，表已构造也要就地改写（热更语义）。
+        set_cache_metering_config(2048, 600);
+        assert_eq!(meter().config(), (2048, 600), "合法值必须原样就地改写");
+        // 恢复原值：setter 是唯一写入点，恢复即还原全局态。
+        set_cache_metering_config(orig_cap, orig_ttl as u64);
+        assert_eq!(meter().config(), (orig_cap, orig_ttl), "恢复原值");
+    }
+
+    /// 跨文件默认值一致性守卫（同 `cc_auto_buffer` 跨镜像守卫的形态）：
+    /// `Config::default()` 的默认容量/TTL 必须与本模块常量同值，否则「默认行为逐字节
+    /// 不变」在两侧分叉（config.rs 的 4096/3600 与这里的 DEFAULT_CAPACITY/MAX_TTL_SECS）。
+    #[test]
+    fn default_capacity_matches_config_default() {
+        let cfg = crate::model::config::Config::default();
+        assert_eq!(
+            cfg.cache_metering_capacity, DEFAULT_CAPACITY,
+            "Config::default 的 cacheMeteringCapacity 必须与 DEFAULT_CAPACITY 同值"
+        );
+        assert_eq!(
+            cfg.prompt_cache_ttl_seconds, MAX_TTL_SECS as u64,
+            "promptCacheTtlSeconds 默认必须等于 MAX_TTL_SECS（默认 TTL 行为零变化）"
+        );
+    }
+
+    /// 计数器可读且随事件增长。只做**单调**断言：全局计数器被并行测试共享
+    /// （同模块顶部的测试种子约定），不能断言精确值 —— 只断言「本次动作后 > 动作前」。
+    #[test]
+    fn metering_counters_bump_on_events() {
+        let before = cache_metering_metrics();
+
+        // 无种子 miss：无 metadata 的请求在进入指纹表前就计数（不碰全局 METER）。
+        let r = req_with(None, None, None, vec![msg("user", "hello")]);
+        assert!(compute_fingerprint_usage(&r).is_none());
+
+        // 命中 / 过期 / 淘汰：独立小表实例（不碰全局 METER）。
+        let m = CacheFingerprintMeter::new(64, MAX_TTL_SECS);
+        let now = 1_000_000;
+        m.record_at(&[0xE1], &[10], MIN_TTL_SECS, now);
+        assert_eq!(m.lookup_at(&[0xE1], now + 1), vec![true], "命中（同时计入 hits）");
+        assert_eq!(
+            m.lookup_at(&[0xE1], now + 10_000),
+            vec![false],
+            "存在但过期（同时计入 expired）"
+        );
+        // 塞满 cap=64 后跑满一轮抽样淘汰（EVICT_INTERVAL 次超限插入）。
+        for i in 0..(64 + EVICT_INTERVAL + 1) {
+            m.record_at(&[0x1000 + i as u64], &[1], MIN_TTL_SECS, now + i as i64);
+        }
+
+        let after = cache_metering_metrics();
+        assert!(after.hits > before.hits, "命中计数必须增长");
+        assert!(after.expired > before.expired, "过期观测计数必须增长");
+        assert!(after.evictions > before.evictions, "淘汰计数必须增长");
+        assert!(
+            after.no_seed_misses > before.no_seed_misses,
+            "无种子 miss 计数必须增长"
+        );
     }
 
     /// 工具对话的 id 漂移（对抗审查 MAJOR 2）：Claude Code 每轮回传工具块时重新生成
