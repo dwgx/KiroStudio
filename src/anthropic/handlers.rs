@@ -3467,7 +3467,7 @@ fn create_ping_sse() -> Bytes {
 /// D9（大输入 400，重试无效）用 `empty_response_large_input`，D10（小输入 429，
 /// 可重试）用 `empty_response`。status 恒按判据 400/429（`oversized_context`
 /// 判据承重，**不读配置**——一个 key 无法同时表达两个形态的 status，
-/// 配置校验层同样约束）；type/message 各自可配。
+/// 配置校验层同样约束）；映射函数见 [`empty_response_status`]（单一真相源）；type/message 各自可配。
 /// D10 的 Retry-After 由调用方据第三元决定是否挂头。
 /// D10 空响应 429 的默认退避秒数（设计 §五 2 修复：现状无 Retry-After）。
 /// 取值与 A11 的 5xx 退避（3s）同档：「稍后重试」级瞬态。
@@ -3504,6 +3504,22 @@ fn empty_response_error_shape(oversized_context: bool) -> (String, String, Optio
         (t, m, ra)
     };
     (err_type, message, cfg_ra)
+}
+
+/// 空响应的 HTTP 状态码映射（**单一真相源**，生产与测试同调）。
+///
+/// 大输入 400（重试原请求无意义）、偶发 429（可重试）——判据 `oversized_context` 承重、
+/// 不读配置，与 [`empty_response_error_shape`] 的 type/message 分界一致。
+///
+/// 【为什么抽成函数】原先生产在非流式收尾处内联 `if oversized { 400 } else { 429 }`，
+/// 而回归测试又自算一遍同样分支再断言自己（恒真、无信息量）——映射一旦改错，两侧会
+/// 同时「自洽」地错。抽出来后测试断言的就是生产实际调用的函数（D1-1）。
+fn empty_response_status(oversized: bool) -> StatusCode {
+    if oversized {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::TOO_MANY_REQUESTS
+    }
 }
 
 /// 为上游空响应构造合适的 SSE error 事件。
@@ -4769,11 +4785,7 @@ async fn handle_non_stream_request(
     if empty_resp {
         let oversized = empty_oversized;
         let (err_type, message, retry_after) = empty_response_error_shape(oversized);
-        let status = if oversized {
-            StatusCode::BAD_REQUEST
-        } else {
-            StatusCode::TOO_MANY_REQUESTS
-        };
+        let status = empty_response_status(oversized);
         tracing::warn!(
             oversized_context = oversized,
             "上游返回空/近空响应（非流式收尾兜底后 content 仍空或仅数 token），返回显式错误替代 200 content:[]"

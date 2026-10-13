@@ -58,9 +58,10 @@ pub fn extract_api_key(request: &Request<Body>) -> Option<String> {
 /// 摘要相等 ⟺ 原文相等(抗碰撞),安全等价。
 ///
 /// **残留（诚实标注，别再当成"完全没有长度侧信道"）**：`Sha256::digest` 自身耗时正比于
-/// 输入长度，而其中一侧是存储密钥（apiKey/adminApiKey）⇒ 高精度远端计时理论上仍能测出
-/// **密钥长度**（不是内容，且需亚微秒级计时精度）。要彻底消除得把存储密钥的摘要**预计算**
-/// 一次（改 `common::auth_keys` 的 set/matches 签名），不在本模块范围内——见 2026-10-14 审计。
+/// 输入长度，两侧长度差仍体现在耗时里。对「一侧是存储密钥」的场景（apiKey/adminApiKey），
+/// 已由 [`crate::common::auth_keys`] 在 `set` 时预计算摘要、比对只哈希候选消除
+/// （F-2，2026-10-14）；其余调用点（如 OAuth state）两侧长度都不是秘密，不构成该侧信道。
+/// 本函数自身的比较路径不变。
 pub fn constant_time_eq(a: &str, b: &str) -> bool {
     use sha2::{Digest, Sha256};
     let ha = Sha256::digest(a.as_bytes());

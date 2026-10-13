@@ -1,7 +1,7 @@
 //! 设备指纹生成器
 //!
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use parking_lot::Mutex;
@@ -42,6 +42,15 @@ struct DerivedEntry {
     /// 派生结果（64 字符十六进制）
     value: String,
 }
+
+/// 非法 machineId 告警去重表：key 为 `(凭据 id, 配置来源)`（来源："凭据级" / "全局"）。
+///
+/// 【为什么需要】[`generate_from_credentials`] 在请求热路径上（每个上游请求一次）：
+/// 配置了但格式非法的 machineId 若逐次 warn 会变成日志风暴，故每个凭据的每个来源
+/// 只提示一次；改配置重启后再次可见。无 id 的凭据（正常流程不会出现）共享一个键，
+/// 与 [`FALLBACK_MACHINE_IDS`] 同款。
+static INVALID_MACHINE_ID_WARNED: LazyLock<Mutex<HashSet<(Option<u64>, &'static str)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// 标准化 machineId 格式
 ///
@@ -99,23 +108,24 @@ pub fn random_machine_id() -> String {
 }
 
 pub fn generate_from_credentials(credentials: &KiroCredentials, config: &Config) -> String {
-    // ⚠️ 已知缺口（2026-10-14 审计记录，未修）：配置了但 `normalize_machine_id` 不认的
-    // machineId 在这里被**静默忽略**，回落到派生/兜底指纹 —— 运营者设了个格式不对的值
-    // 会以为生效了。没就地补 warn 是因为本函数在**请求热路径**上（每个上游请求一次），
-    // 逐次 warn 会变成日志风暴；要修得配 per-id 去重（一次性的 warn 表）或改成显式报错，
-    // 两条都属行为/状态面改动，需单独拍板。
+    // 配置了但 `normalize_machine_id` 不认的 machineId 在这里**忽略并回落**（返回指纹不变），
+    // 但每个凭据的每个来源（凭据级/全局）各 warn 一次（C-3）：静默忽略会让运营者
+    // 以为配置生效了。本函数在**请求热路径**上（每个上游请求一次），逐次 warn 会变成
+    // 日志风暴，故走 [`INVALID_MACHINE_ID_WARNED`] 去重表（先例见 [`fallback_machine_id`]）。
     // 如果配置了凭据级 machineId，优先使用
-    if let Some(ref machine_id) = credentials.machine_id {
+    if let Some(machine_id) = &credentials.machine_id {
         if let Some(normalized) = normalize_machine_id(machine_id) {
             return normalized;
         }
+        warn_invalid_machine_id_once(credentials.id, "凭据级", machine_id);
     }
 
     // 如果配置了全局 machineId，作为默认值
-    if let Some(ref machine_id) = config.machine_id {
+    if let Some(machine_id) = &config.machine_id {
         if let Some(normalized) = normalize_machine_id(machine_id) {
             return normalized;
         }
+        warn_invalid_machine_id_once(credentials.id, "全局", machine_id);
     }
 
     // 按凭据类型派生（API Key 与 refreshToken 两条路径互斥，不回落）
@@ -187,6 +197,26 @@ fn fallback_machine_id(credentials: &KiroCredentials) -> String {
         "凭据缺少派生材料（kiroApiKey/refreshToken 均不可用），使用随机兜底 machineId（进程内稳定）"
     );
     derived
+}
+
+/// 配置了 machineId 但格式非法时的告警，按 `(凭据 id, 来源)` 去重 —— 每个凭据的每个来源只 warn 一次。
+///
+/// 返回 `true` 表示本次真的发出了告警（生产只关心副作用；测试用它钉住去重语义）。
+///
+/// ⚠️ 锁纪律与 [`fallback_machine_id`] 同款：`insert` 的临时守卫在语句结束即释放，
+/// **打日志发生在锁外**——`tracing` 的订阅者在本仓是可插拔的（任何 subscriber 里再回到
+/// 本模块生成 machineId 都会撞上这把非重入锁 → 死锁），持锁写日志也会让其它凭据排队。
+fn warn_invalid_machine_id_once(id: Option<u64>, source: &'static str, value: &str) -> bool {
+    let first = INVALID_MACHINE_ID_WARNED.lock().insert((id, source));
+    if first {
+        tracing::warn!(
+            credential_id = ?id,
+            source = %source,
+            value = %value,
+            "配置的 machineId 格式非法（合法形态：64 位十六进制或 UUID），已忽略并回落到派生/兜底指纹"
+        );
+    }
+    first
 }
 
 /// SHA256 哈希实现（返回十六进制字符串）
@@ -360,5 +390,71 @@ mod tests {
 
         let result = generate_from_credentials(&credentials, &config);
         assert_eq!(result.len(), 64);
+    }
+
+    /// C-3：配置了但格式非法的凭据级 machineId 被忽略并回落派生 —— 返回指纹不变。
+    #[test]
+    fn test_invalid_credential_machine_id_is_ignored_and_falls_back_to_derive() {
+        let mut credentials = KiroCredentials::default();
+        credentials.id = Some(u64::MAX - 30);
+        credentials.machine_id = Some("invalid".to_string());
+        credentials.refresh_token = Some("rt-c3-cred".to_string());
+
+        let result = generate_from_credentials(&credentials, &Config::default());
+        assert_eq!(
+            result,
+            sha256_hex("KotlinNativeAPI/rt-c3-cred"),
+            "非法 machineId 必须被忽略：回落 refreshToken 派生（返回值不得变化）"
+        );
+    }
+
+    /// C-3：全局 machineId 非法同理 —— 忽略并回落派生（长度对但不是十六进制也算非法）。
+    #[test]
+    fn test_invalid_global_machine_id_is_ignored_and_falls_back_to_derive() {
+        let mut credentials = KiroCredentials::default();
+        credentials.id = Some(u64::MAX - 31);
+        credentials.kiro_api_key = Some("ksk-c3-global".to_string());
+        let mut config = Config::default();
+        config.machine_id = Some("g".repeat(64)); // 64 字符但不是十六进制 → 非法
+
+        let result = generate_from_credentials(&credentials, &config);
+        assert_eq!(result, sha256_hex("KiroAPIKey/ksk-c3-global"));
+    }
+
+    /// C-3：合法凭据级值仍压过非法全局值（全局值根本不会被读到，也就不会为其告警）。
+    #[test]
+    fn test_valid_credential_machine_id_wins_over_invalid_global() {
+        let mut credentials = KiroCredentials::default();
+        credentials.id = Some(u64::MAX - 34);
+        credentials.machine_id = Some("c".repeat(64));
+        let mut config = Config::default();
+        config.machine_id = Some("not-a-uuid".to_string());
+
+        assert_eq!(
+            generate_from_credentials(&credentials, &config),
+            "c".repeat(64)
+        );
+    }
+
+    /// C-3 去重语义：同一凭据同一来源只告警一次；来源或凭据不同则各自独立计数。
+    #[test]
+    fn test_invalid_machine_id_warns_once_per_credential_and_source() {
+        let id = Some(u64::MAX - 32);
+        assert!(
+            warn_invalid_machine_id_once(id, "凭据级", "bad"),
+            "首次必须告警"
+        );
+        assert!(
+            !warn_invalid_machine_id_once(id, "凭据级", "bad"),
+            "同一凭据同一来源第二次不得重复告警（热路径去重）"
+        );
+        assert!(
+            warn_invalid_machine_id_once(id, "全局", "bad"),
+            "凭据级/全局是独立来源，各自提示一次"
+        );
+        assert!(
+            warn_invalid_machine_id_once(Some(u64::MAX - 33), "凭据级", "bad"),
+            "不同凭据独立计数（每凭据一次）"
+        );
     }
 }

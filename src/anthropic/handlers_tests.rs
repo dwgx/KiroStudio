@@ -3333,9 +3333,13 @@ pub(crate) mod error_translation_tests {
 
     /// M4 回归：非流式空响应的 HTTP 码 —— 大输入 400（重试还是同样的大请求）、
     /// 偶发 429（客户端可重试）。该判据与流式共用同一阈值函数。
+    ///
+    /// 【D1-1 修复】原测试在这里复制了生产的 `if oversized { 400 } else { 429 }` 再断言
+    /// 自己 —— 恒真、无信息量（生产映射改错也不会红）。现改为调用生产同一函数
+    /// [`empty_response_status`]：这里红了就是生产收尾会返回错状态码。
     #[test]
     fn non_stream_empty_response_status_codes() {
-        // 直接断言收尾用的状态码映射逻辑（handle_non_stream_request 需真实上游，
+        // 直接断言收尾用的状态码映射（handle_non_stream_request 需真实上游，
         // 这里把「阈值判定 → 状态码」的对应关系钉住）。
         let model = "claude-sonnet-5";
         let threshold = crate::anthropic::stream::empty_response_oversized_threshold(model);
@@ -3345,12 +3349,7 @@ pub(crate) mod error_translation_tests {
             assert!(oversized);
             let (err_type, _, _) = empty_response_error_shape(oversized);
             assert_eq!(err_type, "invalid_request_error");
-            let status = if oversized {
-                StatusCode::BAD_REQUEST
-            } else {
-                StatusCode::TOO_MANY_REQUESTS
-            };
-            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(empty_response_status(oversized), StatusCode::BAD_REQUEST);
         }
         // 小输入（< 阈值）→ 429 overloaded_error
         {
@@ -3358,12 +3357,10 @@ pub(crate) mod error_translation_tests {
             assert!(!oversized);
             let (err_type, _, _) = empty_response_error_shape(oversized);
             assert_eq!(err_type, "overloaded_error");
-            let status = if oversized {
-                StatusCode::BAD_REQUEST
-            } else {
+            assert_eq!(
+                empty_response_status(oversized),
                 StatusCode::TOO_MANY_REQUESTS
-            };
-            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+            );
         }
     }
 
