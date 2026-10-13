@@ -167,6 +167,19 @@ pub(crate) fn windows_healthz_probe_url(host: &str, port: u16) -> String {
     format!("http://{h}:{port}/healthz")
 }
 
+/// 批处理字面量拒绝式清洗（见 `windows_relaunch_bat` 的调用点注释）。
+///
+/// 命中 `"`/`%`/`&`/`|`/`<`/`>`/`^`/换行 → 退化为空串。**不做转义**（cmd 的转义规则
+/// 因上下文而异，转义错了比清空更危险；这三个值空掉的后果只是健康探测失败 → 回滚旧二进制）。
+fn bat_safe_value(v: &str) -> String {
+    if v.chars()
+        .any(|c| matches!(c, '"' | '%' | '&' | '|' | '<' | '>' | '^' | '\r' | '\n'))
+    {
+        return String::new();
+    }
+    v.to_string()
+}
+
 /// Windows 自重启 `.bat` 正文：等旧进程退出后拉起新二进制，循环探 `/healthz`，
 /// 失败且存在 OTA `.bak` 时回滚旧版再拉起。全平台编译，供单测钉死文案。
 pub(crate) fn windows_relaunch_bat(cwd_line: &str, launch: &str, exe: &str, healthz_url: &str) -> String {
@@ -174,6 +187,13 @@ pub(crate) fn windows_relaunch_bat(cwd_line: &str, launch: &str, exe: &str, heal
         .with_extension("bak")
         .to_string_lossy()
         .into_owned();
+    // ⚠️ 纵深防御（2026-10-14 安全审计发现）：下面三个值嵌进 `set "K=V"`，值里的 `"` 会提前
+    // 闭合引号、`&`/`|`/`%` 等是 cmd 元字符 ⇒ 理论上可拼出命令注入。审计结论是**当前不可达**
+    // （host 属 restart-only 字段且启动期必须过 SocketAddr 解析），但既然这层数据来自配置，
+    // 就按「拒绝式清洗」处理：命中任一危险字符即退化为空串（宁可探测失败，也不执行注入命令）。
+    let healthz_url = bat_safe_value(healthz_url);
+    let exe = bat_safe_value(exe);
+    let bak = bat_safe_value(&bak);
     format!(
         "@echo off\r\n\
          chcp 65001 >nul\r\n\

@@ -5822,6 +5822,28 @@ mod config_write_tests {
         );
     }
 
+    /// 🔴 纵深防御（2026-10-14 安全审计）：bat 里嵌的三个值必须做拒绝式清洗 ——
+    /// 带 `"`/`&`/`%` 的值会让 `set "K=V"` 提前闭合引号并执行注入命令。
+    /// 审计结论是「当前不可达」（host 属 restart-only 字段，且启动期必须过 SocketAddr
+    /// 解析），但既然数据来自配置，就按纵深防御处理：危险值退化为空串。
+    #[test]
+    fn windows_relaunch_bat_rejects_injected_values() {
+        let bat = windows_relaunch_bat(
+            "",
+            r#"start "KiroStudio" "C:\ks\kirostudio.exe""#,
+            r"C:\ks\kirostudio.exe",
+            r#"http://127.0.0.1:8990/healthz" & calc.exe & ""#,
+        );
+        assert!(
+            !bat.contains("calc"),
+            "注入的命令不得出现在批处理里: {bat}"
+        );
+        assert!(
+            bat.contains("set \"KS_HEALTH=\"\r\n"),
+            "危险值必须退化为空串（宁可探测失败回滚，也不执行注入）: {bat}"
+        );
+    }
+
     /// P1-6：Windows OTA 自重启 bat 必须探 `/healthz`，失败时 `move` `.bak` 回原路径。
     #[test]
     fn windows_ota_relaunch_bat_contains_healthz_and_bak_rollback() {
