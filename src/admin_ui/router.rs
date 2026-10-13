@@ -23,6 +23,31 @@ use crate::common::security::IngressRateLimiter;
 #[folder = "admin-ui/dist"]
 struct Asset;
 
+/// 请求路径是否可以安全地 join 到 UI 目录（拒绝一切绝对/可逃逸形态）。
+///
+/// `PathBuf::join` 的语义陷阱：右侧带**盘符前缀**（`C:/…`）或 **UNC**（`\\server\share`）
+/// 时右侧整体胜出 —— `join` 返回的就是那个绝对路径。于是 `GET /admin/C:/Windows/win.ini`
+/// 能匿名读走进程可读的任意文件（`config.json` 里的 adminApiKey 明文、`credentials.json`、
+/// `.at_rest.key`）。调用方虽已拒绝 `..`，但那只挡相对逃逸，挡不住这条
+/// （2026-10-14 安全审计发现的形态；本函数是它的收口）。
+///
+/// 判据取**白名单**而非黑名单：路径必须全部由普通组件（`Component::Normal`）组成，
+/// 出现 RootDir / Prefix（盘符、UNC）/ CurDir / ParentDir 一律拒。空路径也拒。
+fn is_safe_ui_rel_path(path: &str) -> bool {
+    use std::path::Component;
+    if path.is_empty() {
+        return false;
+    }
+    let mut has_normal = false;
+    for c in std::path::Path::new(path).components() {
+        match c {
+            Component::Normal(_) => has_normal = true,
+            _ => return false,
+        }
+    }
+    has_normal
+}
+
 /// 加载前端资源：优先从运行时 `KIROSTUDIO_UI_DIR` 磁盘读，fallback 到 rust-embed。
 ///
 /// 为什么加磁盘优先：前端是编译期 rust-embed 嵌入，改一行前端要重编译整个 Rust 二进制
@@ -30,9 +55,15 @@ struct Asset;
 /// `KIROSTUDIO_UI_DIR` 后，替换 dist 文件**秒级生效**（每次请求实时读文件，无需重启）。
 /// 未配置该变量时行为与纯 embed 逐字节一致（零回归）。
 ///
-/// 安全：`path` 由调用方先剔除前导 `/` 且拒绝含 `..`；`join` 相对路径不会逃逸出 base。
+/// 安全：`path` 由调用方先剔除前导 `/` 且拒绝含 `..`；本函数再以
+/// [`is_safe_ui_rel_path`] 收口**绝对路径/盘符/UNC** 形态（`join` 会被它们整体顶替）。
 fn load_asset(path: &str) -> Option<std::borrow::Cow<'static, [u8]>> {
     if let Some(dir) = std::env::var_os("KIROSTUDIO_UI_DIR") {
+        if !is_safe_ui_rel_path(path) {
+            // 形态非法 → 既不读盘也不查 embed（embed 的 key 都是正常相对路径，这种串本就不会命中）。
+            tracing::warn!(path = %path, "静态资源路径形态非法，已拒绝（防绝对路径/盘符逃逸）");
+            return None;
+        }
         let full = std::path::PathBuf::from(dir).join(path);
         if full.is_file() {
             if let Ok(bytes) = std::fs::read(&full) {
@@ -1271,5 +1302,29 @@ mod tests {
             pre_at < fetch_at,
             "同源/限流必须在出站 fetch 之前，否则匿名端点可先打外网再被拒"
         );
+    }
+
+    /// 🔴 匿名静态端点的路径逃逸收口（2026-10-14 安全审计发现）：
+    /// `PathBuf::join` 会被右侧的绝对路径/盘符/UNC 整体顶替 ⇒ `GET /admin/C:/Windows/win.ini`
+    /// 能读走进程可读的任意文件（config.json 的 adminApiKey 明文、credentials.json、.at_rest.key）。
+    #[test]
+    fn ui_static_path_escape_is_rejected() {
+        // 跨平台可判：根路径 / 上跳 / 空
+        assert!(!is_safe_ui_rel_path("/etc/passwd"), "根路径必须拒");
+        assert!(!is_safe_ui_rel_path("../secret"), "上跳必须拒");
+        assert!(!is_safe_ui_rel_path("a/../../b"), "中间上跳必须拒");
+        assert!(!is_safe_ui_rel_path("./index.html"), "CurDir 必须拒（白名单式判据）");
+        assert!(!is_safe_ui_rel_path(""), "空路径必须拒");
+        // Windows 专有形态：盘符 / UNC / 反斜杠盘符（Linux 上它们只是普通相对名，不适用该断言）
+        #[cfg(windows)]
+        {
+            assert!(!is_safe_ui_rel_path("C:/Windows/win.ini"), "盘符绝对路径必须拒");
+            assert!(!is_safe_ui_rel_path("C:\\Windows\\win.ini"), "反斜杠盘符必须拒");
+            assert!(!is_safe_ui_rel_path("//server/share/x"), "UNC 必须拒");
+        }
+        // 正常资源放行
+        assert!(is_safe_ui_rel_path("index.html"));
+        assert!(is_safe_ui_rel_path("assets/index-abc123.js"));
+        assert!(is_safe_ui_rel_path("a/b/c.css"));
     }
 }
