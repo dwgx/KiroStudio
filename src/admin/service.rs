@@ -2957,7 +2957,7 @@ impl AdminService {
                 && (t.client_id.is_none() || t.client_secret.is_none())
             {
                 Some(
-                    "缺 kirocli:odic:device 注册（clientId/clientSecret）——\
+                    "缺 kirocli:odic:device(-registration) 注册（clientId/clientSecret）——\
                      access token 过期后无法刷新"
                         .to_string(),
                 )

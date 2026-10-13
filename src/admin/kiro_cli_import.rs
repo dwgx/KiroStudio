@@ -37,7 +37,17 @@ pub(super) const TOKEN_KEYS: [&str; 5] = [
 /// 为什么需要它：本仓 `refresh_idc_token` 要求 clientId + clientSecret（AWS SSO OIDC 的
 /// `register_client` 产物），而 token JSON 里没有这两项。取不到时仍导入（access token 有效
 /// 期内可用），但在响应里显式标注「刷新会失败」，不装作成功。
-const DEVICE_KEY: &str = "kirocli:odic:device";
+///
+/// **键名实测修正（2026-10-14，真库取证）**：ACFarm 线上 kiro-cli 写的键是
+/// `kirocli:odic:device-registration`（3805 字节，字段 `client_id`/`client_secret`/
+/// `client_secret_expires_at`/`oauth_flow`/`region`/`scopes`，全 snake_case）。
+/// 原实现只认 `kirocli:odic:device` —— 那来自二进制 strings 的截断（新键名正是它的前缀），
+/// 后果是**真库导入一律报「缺 clientId」而拒收**，而单测用同一个错键名自证，长期全绿。
+/// 现按「新名 → 旧名 → 前缀兜底」三级取，容忍未来再改名。
+const DEVICE_KEYS: [&str; 2] = [
+    "kirocli:odic:device-registration",
+    "kirocli:odic:device",
+];
 
 /// 官方 CLI 的 per-OS 默认库路径（`internal/config/config.go` 的约定）。
 pub(super) fn default_db_path() -> Option<PathBuf> {
@@ -250,10 +260,44 @@ pub(super) fn read_tokens(db_path: &Path) -> Result<Vec<KiroCliToken>, String> {
     Ok(out)
 }
 
-/// 读 `kirocli:odic:device` 的 (clientId, clientSecret)（best-effort）。
+/// 读 device 注册的 (clientId, clientSecret)（best-effort）。
+///
+/// 取值顺序：`DEVICE_KEYS`（新名 → 旧名）；都未命中时按 `kirocli:odic:device%` 前缀兜底
+/// —— 官方再改键名时仍能捞到，且只接受能解析出 clientId 的行（前缀上的别的 JSON 不会
+/// 被误当注册）。
 fn read_device(conn: &rusqlite::Connection) -> Option<(Option<String>, Option<String>)> {
+    for key in DEVICE_KEYS {
+        if let Some(v) = read_device_at(conn, key) {
+            return Some(v);
+        }
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT value FROM auth_kv WHERE key LIKE 'kirocli:odic:device%' \
+             ORDER BY length(key), key",
+        )
+        .ok()?;
+    let mut rows = stmt.query([]).ok()?;
+    while let Ok(Some(row)) = rows.next() {
+        let Ok(raw) = row.get::<_, String>(0) else {
+            continue;
+        };
+        if let Ok(d) = serde_json::from_str::<RawDevice>(&raw) {
+            if d.client_id.is_some() || d.client_id_s.is_some() {
+                return Some((d.client_id.or(d.client_id_s), d.client_secret.or(d.client_secret_s)));
+            }
+        }
+    }
+    None
+}
+
+/// 单个键取值 + 解析；解析失败返回 `None`，让调用方继续试下一级。
+fn read_device_at(
+    conn: &rusqlite::Connection,
+    key: &str,
+) -> Option<(Option<String>, Option<String>)> {
     let mut stmt = conn.prepare("SELECT value FROM auth_kv WHERE key = ?").ok()?;
-    let raw: String = stmt.query_row([DEVICE_KEY], |r| r.get(0)).ok()?;
+    let raw: String = stmt.query_row([key], |r| r.get(0)).ok()?;
     let d: RawDevice = serde_json::from_str(&raw).ok()?;
     Some((d.client_id.or(d.client_id_s), d.client_secret.or(d.client_secret_s)))
 }
@@ -348,6 +392,48 @@ mod tests {
         let toks = read_tokens(&db.path).unwrap();
         assert_eq!(toks[0].client_id.as_deref(), Some("cid"));
         assert_eq!(toks[0].client_secret.as_deref(), Some("csec"));
+    }
+
+    /// **真库形状**（2026-10-14 从 ACFarm 线上 kiro-cli 的 `data.sqlite3` 抄回）：
+    /// 键名是 `kirocli:odic:device-registration`、字段全 snake_case、带 extra 字段。
+    /// 此前的单测用 `kirocli:odic:device` + camelCase 自证，与真实契约不符 ——
+    /// 线上表现为「导入一律报缺 clientId 而拒收」。本测试钉住真实形状。
+    #[test]
+    fn idc_token_gets_device_registration_real_world_shape() {
+        let db = make_db(&[
+            (
+                "kirocli:odic:token",
+                r#"{"access_token":"a","refresh_token":"r","expires_at":1800000000,"region":"us-east-1","scopes":["sso:account:access"],"start_url":"https://view.awsapps.com/start"}"#,
+            ),
+            (
+                "kirocli:odic:device-registration",
+                r#"{"client_id":"cid-real","client_secret":"csec-real","client_secret_expires_at":1900000000,"oauth_flow":"device_code","region":"us-east-1","scopes":["sso:account:access"]}"#,
+            ),
+        ]);
+        let toks = read_tokens(&db.path).unwrap();
+        assert_eq!(toks.len(), 1);
+        assert_eq!(toks[0].access_token, "a");
+        assert_eq!(toks[0].refresh_token.as_deref(), Some("r"));
+        assert_eq!(toks[0].region.as_deref(), Some("us-east-1"));
+        assert_eq!(toks[0].client_id.as_deref(), Some("cid-real"));
+        assert_eq!(toks[0].client_secret.as_deref(), Some("csec-real"));
+    }
+
+    /// 官方再改键名时，前缀兜底仍能捞到注册（且只认能解析出 clientId 的行）。
+    #[test]
+    fn device_registration_prefix_fallback() {
+        let db = make_db(&[
+            ("kirocli:odic:token", r#"{"accessToken":"a","refreshToken":"r"}"#),
+            // 同前缀但无 clientId 的行：不应被误当注册。
+            ("kirocli:odic:device-code", r#"{"userCode":"u","deviceCode":"d"}"#),
+            (
+                "kirocli:odic:device-registration-v2",
+                r#"{"client_id":"cid-v2","client_secret":"csec-v2"}"#,
+            ),
+        ]);
+        let toks = read_tokens(&db.path).unwrap();
+        assert_eq!(toks[0].client_id.as_deref(), Some("cid-v2"));
+        assert_eq!(toks[0].client_secret.as_deref(), Some("csec-v2"));
     }
 
     #[test]
