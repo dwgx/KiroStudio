@@ -358,7 +358,12 @@ pub(crate) fn find_permanently_unsatisfiable_end_tag(buffer: &str) -> Option<Thi
 /// （`用 \`</thinking>\` 结束` 是正文在引用标签，不是标签）。
 ///
 /// 只在「不在思考块内」时调用 —— 块内必须走严格判据，否则正文里顺口提到的标签
-/// 会把思考块提前掐断。
+/// 会把思考块提前掐断。**唯一例外是 EOF 残留拆分**
+/// （[`split_unclosed_thinking_residue_at_eof`]）：那里「后续 chunk」已不存在，
+/// 没有「提前掐断」可言，而它要回答的正是同一个问题 ——
+/// 「这段残留里第一个**不是引用**的字面量闭标签在哪」。两处共用同一判据，
+/// 不得各写一份（本仓的教训：两套判据必然漂移，漂移的后果是「某形态在一条路径被剥、
+/// 在另一条泄漏」）。
 pub(crate) fn find_stray_thinking_end_tag(buffer: &str) -> Option<ThinkingTagMatch> {
     let mut search_start = 0;
     while let Some(m) = scan_thinking_tag(buffer, search_start, true) {
@@ -404,17 +409,36 @@ pub(crate) fn strip_stray_thinking_end_tags(text: &str) -> Cow<'_, str> {
 /// `in_thinking_block` 永远回不到 false ⇒ 整个 `Answer` 连同标签一起蒸发，
 /// 客户端收到空回答，而面板上这是一次「成功」——**完全无痕**。
 ///
-/// EOF 时缓冲里就是全部剩余内容，不再有歧义，因此可以放宽到「字面量 `</thinking>`」。
+/// EOF 时缓冲里就是全部剩余内容，不再有歧义，因此可以放宽到「字面量 `</thinking>`」
+/// —— 放宽的是**标签形态**（大小写 / 容属性，由 [`scan_thinking_tag`] 统一处理），
+/// 不是**引用判据**（见下）。
+///
+/// # 引用包裹的标签在这里也必须跳过（R1 回归）
+///
+/// 「引用包裹的 `</thinking>` 根本不是标签」是**全套** `find_real_*` 的共同语义
+/// （模型在思考里引用/讨论标签时用反引号或引号包裹）。流式热路径的
+/// [`find_permanently_unsatisfiable_end_tag`] 已按此跳过引用包裹的标签 —— 不跳就会提前关块，
+/// 把其后的推理当可见正文下发（泄漏）。
+///
+/// 本函数此前**唯独**不判引用，于是同一输入两条路径分叉：
+/// `<thinking>a`</thinking>`answer`（引用闭标签、无真闭标签）
+/// 流式整段丢弃（可见正文为空），非流式却返回 `` `answer `` ——
+/// 分叉方向恰好是泄漏：客户端明确没要 thinking，却收到引用标签之后的**推理**。
+///
+/// 丢弃后整轮可见产出为空并不等于「静默空回答」：两条路径都由既有空响应判据收口
+/// （流式 `is_empty_response()` ⇒ 补发 SSE error 事件；非流式 content 为空 ⇒
+/// `near_empty_response` ⇒ 400/429），与「宁给显式错误，不给 200 + 空 content」的既有口径一致。
 ///
 /// # 返回值
 ///
-/// 标签后的内容（`trim_start` 后）作为可见文本返回；找不到标签时返回空串
-/// （整段都还在未闭合的思考块里 ⇒ 全部丢弃，与流式期间「客户端没要就不给」的口径一致，
-/// 也与 [`StreamContext::process_reasoning_content`] 在 `!thinking_enabled` 时直接丢帧一致）。
+/// 第一个**未被引用包裹**的字面量闭标签之后的内容（`trim_start` 后）作为可见文本返回；
+/// 找不到这样的标签时返回空串（整段都还在未闭合的思考块里 ⇒ 全部丢弃，与流式期间
+/// 「客户端没要就不给」的口径一致，也与 [`StreamContext::process_reasoning_content`]
+/// 在 `!thinking_enabled` 时直接丢帧一致）。
 pub(crate) fn split_unclosed_thinking_residue_at_eof(buffer: &str) -> &str {
-    // 不做引用包裹判定（保持「EOF 最宽松」的既有语义），但标签形态仍走统一匹配，
-    // 否则大写/带属性的闭标签在这里认不出来 ⇒ 标签后的正文被整段丢弃。
-    match scan_thinking_tag(buffer, 0, true) {
+    // 判据复用 `find_stray_thinking_end_tag`（引用跳过 + 最宽松形态），**不新写一套匹配**：
+    // 它要回答的就是「第一个不是引用的字面量闭标签在哪」，与 EOF 残留拆分是同一个问题。
+    match find_stray_thinking_end_tag(buffer) {
         Some(m) => buffer[m.end()..].trim_start(),
         None => "",
     }
@@ -828,5 +852,52 @@ mod tests {
             !text.contains("继续"),
             "真标签之前的推理（含引用标签）不得进正文，实际: {text:?}"
         );
+    }
+
+    /// ⭐ 回归 R1：EOF 兜底必须与全套 `find_real_*` 用**同一引用判据**。
+    ///
+    /// 引用包裹的 `</thinking>` 按全套判据**根本不是标签**（模型在思考里引用它）。
+    /// 流式热路径（`find_permanently_unsatisfiable_end_tag`）已跳过引用包裹的标签 ——
+    /// 不跳就会提前关块、把推理尾巴当正文下发（见 `quoted_end_tag_must_not_end_the_block_early`）。
+    /// 而本函数（EOF 兜底）此前**唯独不判引用** ⇒ 同一输入两条路径分叉：
+    /// `<thinking>a`</thinking>`answer` 流式整段丢弃、非流式返回 `` `answer `` ——
+    /// 分叉的方向恰好是**泄漏**（把引用标签之后的推理当可见正文发给明确没要 thinking 的客户端）。
+    ///
+    /// 判据复用 `find_stray_thinking_end_tag`（引用跳过 + 最宽松形态），不新写一套匹配。
+    ///
+    /// 删掉本函数对 `find_stray_thinking_end_tag` 的调用（换回 `scan_thinking_tag`）
+    /// → 本测试必 FAILED。
+    #[test]
+    fn eof_residue_split_skips_quoted_end_tags() {
+        for (name, input) in [
+            ("反引号", "思考`</thinking>`继续"),
+            ("双引号", "思考\"</thinking>\"继续"),
+            ("单引号", "思考'</thinking>'继续"),
+            // 单侧引用也算引用（`thinking_tag_is_quoted` 的既有定义：任一侧是引用字符即可）
+            ("仅左侧反引号", "思考`</thinking>继续"),
+            ("仅右侧反引号", "思考</thinking>`继续"),
+        ] {
+            assert_eq!(
+                split_unclosed_thinking_residue_at_eof(input),
+                "",
+                "形态「{name}」：引用包裹的闭标签不是标签，其后的内容仍属未闭合思考块 ⇒ 整段丢弃"
+            );
+        }
+        // 对照（既有语义不得回退）：**字面量**闭标签在 EOF 仍放行其后内容。
+        assert_eq!(
+            split_unclosed_thinking_residue_at_eof("思考</thinking>ANSWER"),
+            "ANSWER"
+        );
+        assert_eq!(
+            split_unclosed_thinking_residue_at_eof("思考</thinking>\n\nANSWER"),
+            "ANSWER"
+        );
+        // 引用标签在前、真标签在后 → 跳过前者、命中后者（跳过的是候选，不是放弃整段）。
+        assert_eq!(
+            split_unclosed_thinking_residue_at_eof("`</thinking>`思考</thinking>ANSWER"),
+            "ANSWER"
+        );
+        // 无标签 → 整段丢弃（既有口径，与 `process_reasoning_content` 丢帧一致）。
+        assert_eq!(split_unclosed_thinking_residue_at_eof("思考到一半就断了"), "");
     }
 }

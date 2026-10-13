@@ -4416,6 +4416,79 @@ mod truncation_completion_tests {
         })]));
     }
 
+    /// ⭐ 回归 R2：非流式收尾必须把「content 一个块都没有」判成空响应（显式错误），
+    /// 不得因 `estimate_output_tokens` 的 `.max(1)` 下限而放行 200 + `content: []`。
+    ///
+    /// 现场：**小输入**（远低于窗口 28% 阈值）+ 可见正文全空 —— 内联 `<thinking>…` 未闭合、
+    /// 或思考块之后没有正文（`strip_thinking_from_complete_text` 返回空串 ⇒ 不 push text 块）。
+    /// 共用判据路径 1 是 `output_tokens == 0`，而本调用点拿到的是 `estimate_output_tokens(&content)`
+    /// —— 空 content 也被抬到 1 ⇒ 路径 1 永远到不了；路径 2 又要求输入超阈值
+    /// ⇒ 此前返回 200 + `content: []`（与 `if empty_resp` 处注释声称的行为相反）。
+    ///
+    /// 删掉 `nonstream_judges_empty_response` 里的 `content.is_empty()` → 本测试必 FAILED。
+    #[test]
+    fn nonstream_empty_content_is_empty_response_even_for_small_input() {
+        use serde_json::json;
+        let model = "claude-sonnet-5";
+        let small_input = 1_000;
+        assert!(
+            small_input < crate::anthropic::stream::empty_response_oversized_threshold(model),
+            "前提：本用例必须落在「小输入」侧（否则走路径 2，测不到 R2）"
+        );
+        let empty: Vec<serde_json::Value> = Vec::new();
+        assert_eq!(
+            crate::token::estimate_output_tokens(&empty),
+            1,
+            "前提：调用点的 output_tokens 被 .max(1) 抬到 1（故判据路径 1 到不了）"
+        );
+        assert!(
+            nonstream_judges_empty_response(
+                &empty,
+                crate::token::estimate_output_tokens(&empty),
+                false,
+                small_input,
+                model
+            ),
+            "空 content 必须判空响应 ⇒ 收尾返回 400/429，而不是 200 + content:[]"
+        );
+
+        // 对照组（Main 指定的边界）：只有一个极短 text 块 ⇒ 真实短回答，必须仍是正常 200。
+        let tiny = vec![json!({"type": "text", "text": "ok"})];
+        assert!(
+            !nonstream_judges_empty_response(
+                &tiny,
+                crate::token::estimate_output_tokens(&tiny),
+                false,
+                small_input,
+                model
+            ),
+            "极短 text 块（\"ok\"）是真实短回答，判空会把 200 的正常回答错改成错误"
+        );
+        // 边界：有 tool_use（客户端要去执行工具）/ 有 thinking 块，都不得判空。
+        let tool = vec![json!({"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {}})];
+        assert!(
+            !nonstream_judges_empty_response(
+                &tool,
+                crate::token::estimate_output_tokens(&tool),
+                true,
+                small_input,
+                model
+            ),
+            "工具调用轮次不得判空"
+        );
+        let thinking = vec![json!({"type": "thinking", "thinking": "推理", "signature": "s"})];
+        assert!(
+            !nonstream_judges_empty_response(
+                &thinking,
+                crate::token::estimate_output_tokens(&thinking),
+                false,
+                small_input,
+                model
+            ),
+            "有 thinking 块的轮次不得判空（thinking 计入 output_tokens）"
+        );
+    }
+
     #[test]
     fn nonstream_must_consume_metadata_event_and_reject_clean_eof() {
         let src = include_str!("handlers.rs");

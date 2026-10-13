@@ -2094,6 +2094,114 @@
         assert_eq!(split_unclosed_thinking_residue_at_eof("中文思考"), "");
     }
 
+    /// ⭐ 回归 R1：同一输入下**流式与非流式必须同口径**（引用闭标签 + 无真闭标签）。
+    ///
+    /// 现场输入 `<thinking>a`</thinking>`answer`：引用包裹的闭标签**不是**块结束
+    /// （全套 `find_real_*` 的既有语义），所以整段都还在未闭合的思考块里。
+    ///
+    /// 修复前的分叉：
+    /// - 流式：`find_permanently_unsatisfiable_end_tag` 跳过引用标签 ⇒ 整段丢弃 ⇒ 可见正文为空；
+    /// - 非流式：`strip_thinking_from_complete_text` 的 EOF 兜底不判引用 ⇒ 返回 `` `answer ``
+    ///   —— 把**引用标签之后的推理**当正文下发（客户端明确没要 thinking，这是泄漏）。
+    ///
+    /// 本仓口径：判据只有一份、两条路径同结果。故统一到「引用标签不是标签 ⇒ 整段丢弃」，
+    /// 丢弃后整轮可见产出为空 ⇒ 由既有空响应判据转成显式 error（不是静默空回答，见下一条测试）。
+    ///
+    /// 把 `split_unclosed_thinking_residue_at_eof` 的引用判定去掉 → 本测试必 FAILED。
+    #[test]
+    fn quoted_end_tag_without_real_one_matches_on_both_paths() {
+        for (name, input, want) in [
+            ("R1 现场", "<thinking>a`</thinking>`answer", ""),
+            ("中文推理", "<thinking>盘算`</thinking>`继续盘算", ""),
+            ("引用标签后只剩引号", "<thinking>a`</thinking>`", ""),
+            ("前言保留", "前言<thinking>a`</thinking>`answer", "前言"),
+            ("双引号", "<thinking>a\"</thinking>\"answer", ""),
+        ] {
+            let stream = visible_text_through_stream(false, &[input]);
+            let non_stream = strip_thinking_from_complete_text(input);
+            assert_eq!(
+                stream, non_stream,
+                "形态「{name}」：同一输入两条路径必须同口径（流式 vs 非流式）"
+            );
+            assert_eq!(
+                stream, want,
+                "形态「{name}」：引用包裹的闭标签不是块结束 ⇒ 其后内容仍属未闭合思考块，\
+                 不得当可见正文下发（泄漏），实际: {stream:?}"
+            );
+        }
+        // 跨 chunk 到达（半标签扣留窗口介入）不得改变结论。
+        assert_eq!(
+            visible_text_through_stream(false, &["<thinking>a`</thinking>", "`answer"]),
+            "",
+            "跨 chunk 分片不得让引用标签之后的推理漏进正文"
+        );
+        // 对照：**字面量**闭标签紧跟正文的既有修复不得回退（答案仍必须下发）。
+        assert_eq!(
+            visible_text_through_stream(false, &["<thinking>盘算</thinking>ANSWER"]),
+            "ANSWER"
+        );
+        assert_eq!(
+            strip_thinking_from_complete_text("<thinking>盘算</thinking>ANSWER"),
+            "ANSWER"
+        );
+    }
+
+    /// ⭐ R1 附带守卫：该形态整轮可见产出为空 ⇒ 必须落进**空响应**判据，转成显式 error，
+    /// 而不是「200 + 空 content + end_turn」的静默空回答。
+    ///
+    /// 流式侧（本仓已有兜底，无需新代码）：`is_empty_response()` 为真 ⇒ `handlers.rs` 收尾
+    /// 补发 error 事件替代 tail，用量记 `EmptyResponse`（不是成功）。本测试钉的是
+    /// 「R1 形态确实落进判空」这条链路：若有人让剥离器把丢弃的内容也计入 `output_tokens`
+    /// （记账漂移）→ 本测试必 FAILED，该形态就会静默变成「成功但空回答」。
+    ///
+    /// 非流式侧**存在一处已知缺口（R2）**，见下方断言与交付说明：判据本身在非流式调用点上
+    /// 判不出小输入的空 content —— 修复点在 `handlers.rs` 的调用点（不在本修复的文件范围内），
+    /// 这里只钉住「判据不得被改成调用方专用 hack」这一约束。
+    #[test]
+    fn empty_round_from_quoted_end_tag_is_flagged_not_silent() {
+        let input = "<thinking>a`</thinking>`answer";
+        let mut ctx = StreamContext::new_with_thinking("claude-sonnet-5", 1, false, HashMap::new());
+        let mut ev = ctx.generate_initial_events();
+        ev.extend(ctx.process_assistant_response(input));
+        ev.extend(ctx.generate_final_events());
+        let visible: String = ev
+            .iter()
+            .filter(|e| e.event == "content_block_delta")
+            .filter_map(|e| e.data["delta"]["text"].as_str())
+            .collect();
+        assert!(visible.is_empty(), "前提：该形态整轮可见产出为空");
+        assert_eq!(
+            ctx.output_tokens, 0,
+            "被丢弃的推理不得计入 output_tokens（记账口径 = 实际下发的内容）"
+        );
+        assert!(
+            ctx.is_empty_response(),
+            "整轮可见产出为空必须判空响应 ⇒ 收尾补发 error 事件（否则客户端收到空回答且不重试）"
+        );
+        // 非流式：剥离结果为空串 ⇒ `handlers.rs` 不会 push text 块（不会把引用标签之后的
+        // 推理当正文下发）。
+        assert!(
+            strip_thinking_from_complete_text(input).is_empty(),
+            "非流式剥离结果必须为空串（非空即泄漏：引用标签之后的内容仍属未闭合思考块）"
+        );
+        // ⚠️ R2（已知缺口，修复点不在本修复的文件范围内）：非流式收尾把
+        // `estimate_output_tokens(&content)` 交给共用判据，而该函数有 `.max(1)` 下限
+        // ⇒ 空 content 也被算成 1 token ⇒ 判据路径 1（`output_tokens == 0`）到不了；
+        // 路径 2 又要求输入超窗口 28% ⇒ **小输入下非流式返回 200 + `content: []`**。
+        // 修法是在 handlers.rs 的调用点补 `|| content.is_empty()`，**不是**把路径 1 放宽成
+        // `<= 1`：流式侧 `output_tokens == 1` 是真实存在的短回答（`estimate_tokens("ok") == 1`），
+        // 放宽会把它的 tail 丢掉、换成 error。下面两条断言钉住这个约束。
+        assert_eq!(
+            crate::token::estimate_output_tokens(&[]),
+            1,
+            "非流式调用方的 output_tokens 有 .max(1) 下限（空 content 也返回 1）"
+        );
+        assert!(
+            !near_empty_response(1, false, 1, "claude-sonnet-5"),
+            "判据不得把 1 token 一律判成空响应（流式侧 1 token 是真实短回答）"
+        );
+    }
+
     /// ⭐ 回归：「等也没用」判据必须只对**永久不可满足**的位置放行。
     ///
     /// 放宽过头会把「该等」的形态提前判定，把段落分隔的后半个换行漏进正文

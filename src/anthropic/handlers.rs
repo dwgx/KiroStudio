@@ -4187,6 +4187,41 @@ fn nonstream_content_has_visible_body(content: &[serde_json::Value]) -> bool {
     })
 }
 
+/// 非流式收尾的「空响应」最终判据 = 共用判据 [`super::stream::near_empty_response`]
+/// **或** content 一个块都没有。
+///
+/// # 为什么必须补 `content.is_empty()`（R2）
+///
+/// 共用判据的路径 1 是 `output_tokens == 0`，而本调用点的 `output_tokens` 来自
+/// [`crate::token::estimate_output_tokens`] —— 该函数有 `.max(1)` 下限，**空 content 也被算成
+/// 1 token** ⇒ 路径 1 在非流式调用点上**永远到不了**；路径 2（近空 + 上下文过大）又要求输入
+/// 超过窗口 28%。于是「模型只思考、没吐正文」这类轮次（内联 `<thinking>…` 未闭合、或思考块后
+/// 没有正文）在**小输入**下此前返回 200 + `content: []` —— 与下方 `if empty_resp` 处注释声称的
+/// 「返回显式错误而非 200 `content: []`」相反：客户端把空 content 当 `end_turn` 正常结束并继续
+/// 对话，agentic 循环反复卡住（同型先例：openai 非流式遇 in-band error 改回 502，而不是
+/// 「200 + 空 content + finish_reason:stop」）。
+///
+/// # 判据边界（不得放宽）
+///
+/// 只拦「**一个内容块都没有**」：
+/// - 有 tool_use（客户端要去执行工具）、有 thinking 块、或有一个极短 text 块（如 `"ok"`）
+///   **都不是**空响应 —— 最后一种正是 `estimate_output_tokens` 那个下限想表达的「真实短回答」，
+///   绝不能连坐判空（判空会让工具调用轮次/短回答被错误地回错）。
+/// - **不得**改共用判据本身（把路径 1 放宽成 `output_tokens <= 1`）：流式侧 `output_tokens == 1`
+///   是真实存在的短回答（`estimate_tokens("ok") == 1`），放宽会把它的 tail 丢掉、换成 error。
+///   流式调用点没有这个洞 —— 它的累计值来自 `estimate_tokens` 且空文本直接 early return，
+///   能取到真 0（`stream_tests.rs::empty_round_from_quoted_end_tag_is_flagged_not_silent` 钉住）。
+fn nonstream_judges_empty_response(
+    content: &[serde_json::Value],
+    output_tokens: i32,
+    has_tool_use: bool,
+    input_tokens: i32,
+    model: &str,
+) -> bool {
+    content.is_empty()
+        || super::stream::near_empty_response(output_tokens, has_tool_use, input_tokens, model)
+}
+
 /// 与流式 `is_clean_eof_without_terminal` 同口径：传输干净、有部分产出、无任何终止信号。
 fn nonstream_clean_eof_without_terminal(
     completion_ok: bool,
@@ -4725,7 +4760,12 @@ async fn handle_non_stream_request(
     );
 
     // 空响应判据先算：埋点要写成 EmptyResponse，HTTP 再返回 400/429。
-    let empty_resp = super::stream::near_empty_response(
+    // ⚠️ 必须走 `nonstream_judges_empty_response`（= 共用判据 **或** content 一个块都没有），
+    // 不能只调共用判据：本调用点的 output_tokens 经 `estimate_output_tokens` 的 `.max(1)` 下限
+    // 抬过，空 content 也是 1 ⇒ 判据路径 1（`== 0`）到不了，小输入下会放行 200 + `content: []`
+    // （R2，详见该函数文档）。
+    let empty_resp = nonstream_judges_empty_response(
+        &content,
         output_tokens,
         has_tool_use,
         final_input_tokens,
