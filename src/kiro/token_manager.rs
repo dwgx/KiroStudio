@@ -772,9 +772,11 @@ pub(crate) async fn get_usage_limits(
     let client = build_client(proxy, 60, config.tls_backend)
         .map_err(|e| RefreshValidationError::new(format!("构建刷新客户端失败: {}", e)))?;
 
-    // 每个区先带真实 ARN 再退回不带（ZyphrZero 0.8.0 PR #74）。占位 ARN 不算真实。
-    let real_arn = credentials.usage_profile_arn();
-    let arn_attempts: Vec<Option<&str>> = match real_arn.as_deref() {
+    // 每个区先带 ARN 再退回不带（ZyphrZero 0.8.0 PR #74 的「带回退」结构保留）。
+    // 带的那个由 `usage_profile_arn` 按号型决定：idc/social 给真实 ARN 或占位
+    // （2026-10-14 实测占位在用量端点得 200），api_key/external_idp 给 None（只剩不带这一档）。
+    let primary_arn = credentials.usage_profile_arn();
+    let arn_attempts: Vec<Option<&str>> = match primary_arn.as_deref() {
         Some(arn) => vec![Some(arn), None],
         None => vec![None],
     };
@@ -927,8 +929,11 @@ fn usage_limits_endpoint_with_arn(region: &str, profile_arn: Option<&str>) -> (S
         "https://{}/getUsageLimits?isEmailRequired=true&origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
         host
     );
-    // 用量 GET 只带真实 ARN。BuilderId 占位会 403 User is not authorized（2026-08-25）。
-    if let Some(arn) = profile_arn.filter(|a| !is_placeholder_profile_arn(a)) {
+    // 只发调用方给的 ARN，**不再二次过滤占位**：该不该带占位由 `usage_profile_arn` 按号型
+    // 决定（idc/social 必须带——2026-10-14 实测不带得 400 Invalid profileArn、带占位得 200；
+    // api_key/external_idp 那边返回 None 即不带）。此处再滤一次会把 idc 的占位悄悄丢掉，
+    // 结果就是「函数改对了、URL 里还是没有 ARN」。
+    if let Some(arn) = profile_arn {
         url.push_str(&format!("&profileArn={}", urlencoding::encode(arn)));
     }
     (host, url)

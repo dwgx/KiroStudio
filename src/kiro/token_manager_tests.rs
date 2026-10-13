@@ -1,21 +1,27 @@
     use super::*;
 
+    /// 用量 URL 的 ARN 形态（2026-10-14 真号实测后重写）。
+    ///
+    /// 实测：免费档 idc 号打 `management.us-east-1.kiro.dev/getUsageLimits`
+    /// —— 不带 `profileArn` 得 `400 Invalid profileArn`，带 BuilderId 占位得 `200`
+    /// （`subscriptionTitle:"KIRO FREE"`）。故 **idc/social 缺真实 ARN 时必须带占位**；
+    /// 占位对 api_key/external_idp 是错租户，它们不带。
     #[test]
-    fn test_usage_limits_url_omits_placeholder_and_encodes_real_arn() {
+    fn test_usage_limits_url_arn_by_credential_type() {
         let mut idc = KiroCredentials::default();
         idc.auth_method = Some("idc".to_string());
         idc.profile_arn = None;
         let url = usage_limits_probe_url(&idc, "us-east-1");
         assert!(
-            !url.contains("profileArn="),
-            "缺真实 ARN 时用量 URL 不得带占位: {url}"
+            url.contains("profileArn=arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A638616132270%3Aprofile%2FAAAACCCCXXXX"),
+            "idc 缺真实 ARN 时必须带占位（不带会 400 Invalid profileArn）: {url}"
         );
 
         idc.profile_arn = Some(DEFAULT_BUILDER_ID_PROFILE_ARN.to_string());
         let url = usage_limits_probe_url(&idc, "us-east-1");
         assert!(
-            !url.contains("profileArn="),
-            "存着的占位 ARN 也不得进用量 query: {url}"
+            url.contains("profileArn="),
+            "库里存着占位值同样照带（实测 200）: {url}"
         );
 
         idc.profile_arn =
@@ -24,6 +30,20 @@
         assert!(
             url.contains("profileArn=arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A123456789012%3Aprofile%2FREAL"),
             "真实 ARN 必须 URL 编码进 query: {url}"
+        );
+        assert!(
+            !url.contains("AAAACCCCXXXX"),
+            "有真实 ARN 时不得再出现占位: {url}"
+        );
+
+        // api_key：占位是错租户（403 Invalid token），一律不带。
+        let mut api_key = KiroCredentials::default();
+        api_key.auth_method = Some("api_key".to_string());
+        api_key.profile_arn = None;
+        let url = usage_limits_probe_url(&api_key, "us-east-1");
+        assert!(
+            !url.contains("profileArn="),
+            "api_key 号不得带 ARN: {url}"
         );
     }
 
