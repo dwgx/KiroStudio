@@ -20,17 +20,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # 前端产物 admin-ui/dist 必须在 cargo 之前存在 —— rust-embed(#[derive(Embed)]) 是
       # 编译期嵌入，dist 缺失时 Asset::get 无法生成，测试也编不过。故与 build 任务一致先构建前端。
       - name: 安装 pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
           version: 9
 
       - name: 安装 Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 20
           cache: pnpm
@@ -43,9 +43,11 @@ jobs:
           pnpm build
 
       - name: 安装 Rust
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master（官方指引：SHA 必须落在 master 历史内）
+        with:
+          toolchain: 1.97.1
       - name: Rust 编译缓存
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: test-no-default
       - name: 运行测试（出厂特性：纯 rustls + --locked）
@@ -80,16 +82,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # 前端必须在 cargo build 之前产出 admin-ui/dist —— rust-embed 是编译期嵌入
       - name: 安装 pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
           version: 9
 
       - name: 安装 Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 20
           cache: pnpm
@@ -102,8 +104,9 @@ jobs:
           pnpm build
 
       - name: 安装 Rust (musl 目标)
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master（官方指引：SHA 必须落在 master 历史内）
         with:
+          toolchain: 1.97.1
           targets: x86_64-unknown-linux-musl
 
       - name: 安装 musl 工具链
@@ -112,7 +115,7 @@ jobs:
           sudo apt-get install -y musl-tools
 
       - name: Rust 编译缓存
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: musl-release
 
@@ -132,11 +135,27 @@ jobs:
           cat kirostudio-linux-x86_64.sha256
 
       - name: 上传到 Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: |
             kirostudio-linux-x86_64
             kirostudio-linux-x86_64.sha256
+
+      # 发布后回验（P1-4）：把刚发布的资产重新下载回来，与本地构建产物逐字节比对。
+      # 为什么不做 draft→verify→publish：无 tag 时无法演练，且发布 job 失败会留下草稿
+      # （OTA 拉不到 release = 静默断更）。这里用「检测 + 响亮失败」替代，失败模式与
+      # 今天相同（需人工处置），但多了「发布出去的不是我们构建的那份」的发现能力。
+      - name: 发布后回验（重新下载并与本地比对）
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+            --pattern 'kirostudio-linux-x86_64*' --dir verify --clobber
+          cmp kirostudio-linux-x86_64 verify/kirostudio-linux-x86_64
+          (cd verify && sha256sum -c kirostudio-linux-x86_64.sha256)
+          echo "✅ 发布后回验通过（Release 资产 == 本地构建产物）"
 
   # macOS 原生二进制：Apple Silicon(aarch64) 与 Intel(x86_64) 各一份。
   #
@@ -163,16 +182,16 @@ jobs:
             asset: kirostudio-macos-x86_64
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # 前端必须在 cargo build 之前产出 admin-ui/dist —— rust-embed 是编译期嵌入
       - name: 安装 pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
           version: 9
 
       - name: 安装 Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 20
           cache: pnpm
@@ -185,12 +204,13 @@ jobs:
           pnpm build
 
       - name: 安装 Rust (${{ matrix.target }})
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master（官方指引：SHA 必须落在 master 历史内）
         with:
+          toolchain: 1.97.1
           targets: ${{ matrix.target }}
 
       - name: Rust 编译缓存
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: macos-release-${{ matrix.target }}
 
@@ -210,11 +230,25 @@ jobs:
           file ${{ matrix.asset }}
 
       - name: 上传到 Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: |
             ${{ matrix.asset }}
             ${{ matrix.asset }}.sha256
+
+      # 发布后回验（P1-4）：见 Linux job 同名步骤的取舍说明。
+      # macOS 无 GNU coreutils，用自带 shasum（`-c` 语义与 sha256sum -c 一致）。
+      - name: 发布后回验（重新下载并与本地比对）
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+            --pattern '${{ matrix.asset }}*' --dir verify --clobber
+          cmp ${{ matrix.asset }} verify/${{ matrix.asset }}
+          (cd verify && shasum -a 256 -c ${{ matrix.asset }}.sha256)
+          echo "✅ 发布后回验通过（Release 资产 == 本地构建产物）"
 
   # Windows 原生 exe：任意 Win10+ x64 双击即跑（crt-static 静态链接 C 运行时，
   # 无 VCRUNTIME140.dll 依赖，见 .cargo/config.toml）。纯 rustls（--no-default-features），
@@ -226,16 +260,16 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # 前端必须在 cargo build 之前产出 admin-ui/dist —— rust-embed 是编译期嵌入
       - name: 安装 pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
           version: 9
 
       - name: 安装 Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 20
           cache: pnpm
@@ -248,12 +282,13 @@ jobs:
           pnpm build
 
       - name: 安装 Rust (msvc 目标)
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master（官方指引：SHA 必须落在 master 历史内）
         with:
+          toolchain: 1.97.1
           targets: x86_64-pc-windows-msvc
 
       - name: Rust 编译缓存
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: msvc-release
 
@@ -275,8 +310,25 @@ jobs:
           Get-Content kirostudio-windows-x86_64.exe.sha256
 
       - name: 上传到 Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: |
             kirostudio-windows-x86_64.exe
             kirostudio-windows-x86_64.exe.sha256
+
+      # 发布后回验（P1-4）：见 Linux job 同名步骤的取舍说明。
+      - name: 发布后回验（重新下载并与本地比对）
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$env:GITHUB_REF_NAME" --repo "$env:GITHUB_REPOSITORY" `
+            --pattern 'kirostudio-windows-x86_64.exe*' --dir verify --clobber
+          $local = (Get-FileHash kirostudio-windows-x86_64.exe -Algorithm SHA256).Hash.ToLower()
+          $remote = (Get-FileHash verify/kirostudio-windows-x86_64.exe -Algorithm SHA256).Hash.ToLower()
+          if ($local -ne $remote) {
+            Write-Error "发布后回验失败：Release 资产($remote) != 本地构建产物($local)"
+            exit 1
+          }
+          Write-Host "✅ 发布后回验通过（Release 资产 == 本地构建产物）$remote"
