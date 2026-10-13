@@ -9522,6 +9522,7 @@ impl MultiTokenManager {
                 credentials: cred,
                 deleted_at: Utc::now().to_rfc3339(),
                 success_count: removed.success_count,
+                request_count: removed.request_count,
                 total_credits_used: removed.total_credits_used,
                 last_used_at: removed.last_used_at,
             });
@@ -9585,6 +9586,7 @@ impl MultiTokenManager {
                 let TrashEntry {
                     credentials: mut cred,
                     success_count,
+                    request_count,
                     total_credits_used,
                     last_used_at,
                     ..
@@ -9623,7 +9625,7 @@ impl MultiTokenManager {
                         None
                     },
                     success_count,
-                    request_count: 0,
+                    request_count,
                     total_credits_used,
                     last_used_at,
                     inflight: Arc::new(AtomicU32::new(0)),
@@ -9818,7 +9820,7 @@ impl MultiTokenManager {
                 disabled: true,
                 disabled_reason: restored_reason,
                 success_count: restored_entry.success_count,
-                request_count: 0,
+                request_count: restored_entry.request_count,
                 total_credits_used: restored_entry.total_credits_used,
                 last_used_at: restored_entry.last_used_at,
                 inflight: Arc::new(AtomicU32::new(0)),

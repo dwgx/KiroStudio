@@ -3578,6 +3578,11 @@ impl KiroProvider {
                         // DNS 不存在的场景）。
                         if e.is_connect() || e.is_timeout() || e.is_request() {
                             self.mark_endpoint_dead(candidate.name(), &upstream_region);
+                            // ⭐ 连接层失败也要进端点健康样本：此前只记负缓存（TTL 300s），
+                            // 于是 DNS 黑洞/路由不可达的候选端点**永远 samples==0**，而
+                            // `pick()` 的冷启动规则（样本 0 恒优先）会**持续**把它选成链首
+                            // ——每个 TTL 每个号白吃一次 connect timeout（2026-10-14 审计）。
+                            self.report_endpoint_outcome(ctx.id, candidate.name(), false);
                             tracing::debug!(
                                 "端点 {} 在 region {} 连接层失败，记入负缓存 (TTL {}s): {}",
                                 candidate.name(),

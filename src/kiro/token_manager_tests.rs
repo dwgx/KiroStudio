@@ -4360,6 +4360,7 @@
                 credentials: cred,
                 deleted_at: "2026-08-21T00:00:00+00:00".to_string(),
                 success_count: 0,
+                request_count: 0,
                 total_credits_used: 0.0,
                 last_used_at: None,
             });
@@ -9261,6 +9262,14 @@
         let manager = MultiTokenManager::new(config, vec![c1, c2], None, None, false).unwrap();
 
         manager.set_disabled(2, true).unwrap();
+        // 预置非零统计（请求数 > 成功数），验证删除→恢复链路原样带回：
+        // 只还原成功数会让面板出现「成功数 > 请求数」的自相矛盾（2026-10-14 审计）。
+        {
+            let mut entries = manager.entries.lock();
+            let e = entries.iter_mut().find(|e| e.id == 2).unwrap();
+            e.success_count = 3;
+            e.request_count = 5;
+        }
         manager.delete_credential(2).unwrap();
         assert_eq!(manager.list_trash().len(), 1);
 
@@ -9274,6 +9283,13 @@
         assert!(restored.is_some(), "id=2 应回到 entries");
         // 恢复为禁用态
         assert!(restored.unwrap().disabled);
+        // 统计三元组 + 请求数原样带回（旧实现把 request_count 清零）
+        {
+            let entries = manager.entries.lock();
+            let e = entries.iter().find(|e| e.id == 2).expect("恢复后条目仍在");
+            assert_eq!(e.success_count, 3, "成功数必须原样还原");
+            assert_eq!(e.request_count, 5, "请求数必须原样还原（不得清零）");
+        }
         // 回收站已清空该条目
         assert_eq!(manager.list_trash().len(), 0);
     }
@@ -11104,6 +11120,7 @@ fn delete_rollback_restores_own_entry_and_keeps_others() {
         credentials: c9,
         deleted_at: "2026-10-13T00:00:00Z".to_string(),
         success_count: 7,
+        request_count: 9,
         total_credits_used: 12.5,
         last_used_at: None,
     });

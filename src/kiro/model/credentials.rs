@@ -404,6 +404,13 @@ pub struct TrashEntry {
     /// 删除前累计的 API 调用成功次数（恢复时一并还原）
     #[serde(default)]
     pub success_count: u64,
+    /// 删除前的**请求**累计次数（恢复时一并还原）。
+    ///
+    /// 与 `success_count` 必须同进同出：只还原成功数会把请求数清零，面板随即出现
+    /// 「成功数 > 请求数」的自相矛盾（2026-08-16 N5 修过的同型问题，线上实测过
+    /// 669/495、477/396）。老回收站数据无此字段，`#[serde(default)]` 落 0。
+    #[serde(default)]
+    pub request_count: u64,
     /// 删除前的生命周期累计 credit 花费（恢复时一并还原；老回收站数据无此字段默认 0）
     #[serde(default)]
     pub total_credits_used: f64,
