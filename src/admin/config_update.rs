@@ -1016,8 +1016,14 @@ impl super::AdminService {
                     "loadBalancingMode 必须是 'priority' 或 'balanced'".to_string(),
                 ));
             }
-            config.load_balancing_mode = mode;
-            hot_changed = true;
+            // ⚠️ 必须先比再写：本分支此前无条件赋值 + 置 hot_changed，于是「提交同一个模式」
+            // 也会回「已保存并立即生效」并多跑一次 reload_config，与全函数其余分支
+            // （以及 token_manager::set_load_balancing_mode 的同值早返回）口径不一致——
+            // 面板据此把"无改动"显示成"已生效"，排查时会被带偏。
+            if mode != config.load_balancing_mode {
+                config.load_balancing_mode = mode;
+                hot_changed = true;
+            }
         }
 
         // —— 立即生效的字段：全局模型映射（整表替换）——

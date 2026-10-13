@@ -2067,16 +2067,17 @@ impl Config {
         // 原子写:config.json 明文含 adminApiKey / proxyPassword,裸 fs::write 崩溃会截断
         // → 面板密钥丢失锁死管理入口。走 temp→fsync→rename(创建即 0600,无 rename 后设权的短
         // world-readable 窗口)+ Windows 句柄占用 rename 重试。见 common::fs_atomic。
-        // 在 Tokio runtime 内(save 从 update_config 异步 handler 调)用 block_in_place,
-        // 避免 rename 重试的同步 sleep 阻塞 worker(与 persist_credentials 同一惯例)。
+        //
+        // ⚠️ **不用** `block_in_place`（2026-10-14，与 `credential_persist::persist_credentials`
+        // 和 `cooldown::save` 同一处置）：判据不能是 `Handle::try_current().is_ok()` ——
+        // `spawn_blocking` 线程与普通 OS 线程上它也返回 Ok，而 `block_in_place` 在那些线程上
+        // 直接 panic（current_thread runtime 同样 panic）。本函数是「改完配置的落盘终点」：
+        // panic 发生在内存已改、盘未写之后 ⇒ 面板显示已保存而磁盘仍是旧配置，且调用方拿到的是
+        // panic 而不是可处理的 Err。配置文件 KB 级、`write_atomic` 的 rename 重试上界
+        // ≈150ms（6 次 × 10~50ms），同步写阻塞 worker 可接受，换来的是任何 runtime 形态下都不 panic。
         let bytes = content.as_bytes();
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| crate::common::fs_atomic::write_atomic(path, bytes))
-                .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
-        } else {
-            crate::common::fs_atomic::write_atomic(path, bytes)
-                .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
-        }
+        crate::common::fs_atomic::write_atomic(path, bytes)
+            .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
     }
 }

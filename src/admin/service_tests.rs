@@ -2590,9 +2590,10 @@ mod balance_cache_tests {
     /// `nodes` 而不带 `next_id`，见下一条）—— 重启后节点表整张消失，
     /// 用户配好的一池代理与密码全部丢失，而面板只会显示「暂无节点」。
     ///
-    /// ⚠️ 必须 `multi_thread`：`MultiTokenManager::new` 带真实 credentials_path 时会
-    /// 回写凭据文件，而 `persist_credentials` 在 runtime 内走 `block_in_place`
-    /// （current_thread runtime 上直接 panic）。本组其余落盘测试同理。
+    /// ⚠️ 保留 `multi_thread`：本组落盘测试涉及后台任务 spawn 与同步原子写。
+    /// （原注释称 `persist_credentials` 在 runtime 内走 `block_in_place`、current_thread
+    /// 会 panic —— 该实现已于 2026-10-14 改为同步 `write_atomic`，这条理由已不成立；
+    /// flavor 保持不变，避免在无法跑测试的场合改动测试运行时形态。）
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn nodes_round_trip_plaintext_preserves_every_field() {
         let dir = tmp_dir("plain");
@@ -5629,8 +5630,9 @@ mod config_write_tests {
 
     /// 合法导入写盘后重读字段（config_path 从 token_manager 继承，serde skip 不进 JSON）。
     ///
-    /// 必须 multi_thread：成功路径 `save` 在 runtime 内走 `block_in_place`，且
-    /// `respawn_balance_task` 无条件 `tokio::spawn` socks 健康任务。
+    /// 必须 multi_thread：`respawn_balance_task` 无条件 `tokio::spawn` socks 健康任务。
+    /// （`Config::save` 此前在 runtime 内走 `block_in_place`，2026-10-14 已改为同步原子写，
+    /// 不再是本测试需要 multi_thread 的理由。）
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn import_config_writes_disk_and_rereads_field() {
         let dir = TempDir(std::env::temp_dir().join(format!(
@@ -6270,6 +6272,27 @@ mod config_write_tests {
         assert_eq!(resp.message, "无改动。", "同值提交必须回「无改动。」");
         assert!(!resp.restart_required);
         assert_eq!(disk_config_json(&path)["host"], "h1", "同值提交磁盘不变");
+
+        // loadBalancingMode 的同值提交走**另一个分支**（枚举校验 + 字符串比较），
+        // 此前那条分支无条件赋值 + 置 hot_changed ⇒ 同一个模式提交两次也回「已保存并立即生效」，
+        // 与全函数其余分支（以及 token_manager::set_load_balancing_mode 的同值早返回）口径不一致。
+        // 这里钉住：同值必须仍回「无改动。」。
+        let resp = svc
+            .update_config(UpdateConfigRequest {
+                load_balancing_mode: Some("priority".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("同值提交应成功");
+        assert_eq!(
+            resp.message, "无改动。",
+            "同值的 loadBalancingMode 提交必须回「无改动。」（不得误报已生效）"
+        );
+        assert!(!resp.restart_required);
+        assert_eq!(
+            disk_config_json(&path)["loadBalancingMode"], "priority",
+            "同值提交磁盘不变"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
