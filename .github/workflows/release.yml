@@ -7,8 +7,10 @@ on:
       - "v*"
   workflow_dispatch: {}
 
+# 顶层只给读：写权限按 job 最小化下发（供应链教训——kiro-lb 2026-10 事件里，
+# 顶层 contents: write 让每个 job 都拿到可推代码的 token，被注入的 workflow 一步得手）。
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # 测试门禁：出厂二进制一律 --no-default-features（纯 rustls）。历史上 cargo test 只跑默认
@@ -73,6 +75,8 @@ jobs:
 
   build-release:
     needs: test
+    permissions:
+      contents: write   # 上传 Release 资产（仅此 job 需要写）
     runs-on: ubuntu-latest
     steps:
       - name: 检出代码
@@ -146,6 +150,8 @@ jobs:
   # 不需要额外 C 工具链（纯 rustls，无 vendored OpenSSL；--no-default-features 与其它平台一致）。
   build-release-macos:
     needs: test
+    permissions:
+      contents: write   # 上传 Release 资产（仅此 job 需要写）
     runs-on: macos-14
     strategy:
       fail-fast: false
@@ -215,6 +221,8 @@ jobs:
   # 与 Linux 产物一致，避开 Windows 上 vendored OpenSSL 的工具链依赖。
   build-release-windows:
     needs: test
+    permissions:
+      contents: write   # 上传 Release 资产（仅此 job 需要写）
     runs-on: windows-latest
     steps:
       - name: 检出代码

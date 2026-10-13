@@ -12,8 +12,9 @@ on:
     paths:
       - "repo-kit.toml"
 
+# 顶层只给读：写权限按 job 最小化下发（供应链教训，同 release.yml）。
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: banner
@@ -21,6 +22,8 @@ concurrency:
 
 jobs:
   build:
+    permissions:
+      contents: write   # banner 渲染后自动提交 + push（仅此 job 需要写）
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
