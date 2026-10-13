@@ -177,6 +177,27 @@ def main():
             else:
                 check("工具结果回程 → 200 且有文本", False, "上一步没拿到 tool_use，跳过回程")
 
+            # 扩展思考：thinking 块必须成形（上游用 <thinking> 标签表达，网关负责转块）。
+            # 这条覆盖审计改动最重的 thinking_tags 解析路径（引用包裹的闭标签、未闭合残留等）。
+            think = {"model": a.model, "max_tokens": 2048,
+                     "thinking": {"type": "enabled", "budget_tokens": 1024},
+                     "messages": [{"role": "user", "content": "笼子里鸡兔共35头94脚，各几只？一步步算。"}]}
+            st, body, _ = http("POST", base + "/v1/messages", key=a.api_key, body=think, timeout=240)
+            try:
+                thj = json.loads(body)
+            except Exception:
+                thj = {}
+            types = [b.get("type") for b in thj.get("content", [])]
+            check("扩展思考返回 thinking 块",
+                  st == 200 and "thinking" in types,
+                  "status=%s blocks=%s" % (st, types))
+            think["stream"] = True
+            st, body, _ = http("POST", base + "/v1/messages", key=a.api_key, body=think, timeout=240)
+            check("扩展思考流式含 thinking_delta 且正常收尾",
+                  st == 200 and b"thinking_delta" in body and b"event: message_stop" in body,
+                  "status=%s has_thinking_delta=%s has_stop=%s"
+                  % (st, b"thinking_delta" in body, b"message_stop" in body))
+
     failed = [n for n, ok, _ in RESULTS if not ok]
     print("=== 汇总：%d 通过 / %d 失败 ===" % (len(RESULTS) - len(failed), len(failed)))
     for n in failed:
