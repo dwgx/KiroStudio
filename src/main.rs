@@ -650,6 +650,20 @@ async fn main() {
     // P1-5：私网对端是否自动当反代。默认 true（A2 现状）；LAN 直连部署置 false。
     // 与 trust_forwarded_header 同为启动期读取，改值需重启。
     common::security::set_trust_private_peer_as_proxy(config.trust_private_peer_as_proxy);
+    // 危险组合显式提示（**只记录，不改变行为**）：私网对端被当反代时，同网段任意主机
+    // 都能伪造 `X-Forwarded-For`，于是 ipAllowlist/ipBlocklist 对这些主机形同虚设
+    // （审计 2026-10-14 标为可绕过）。默认值刻意保留 LAN 兼容（见 `common/security.rs`
+    // 注释），故不改默认、只把风险说出来，避免"配了白名单就以为安全"。
+    if config.trust_private_peer_as_proxy
+        && (!config.ip_allowlist.is_empty() || !config.ip_blocklist.is_empty())
+    {
+        tracing::warn!(
+            allowlist = config.ip_allowlist.len(),
+            blocklist = config.ip_blocklist.len(),
+            "trustPrivatePeerAsProxy=true（默认）时同网段主机可伪造 X-Forwarded-For，\
+             ipAllowlist/ipBlocklist 拦不住它们；LAN 直连部署请置 false"
+        );
+    }
 
     // IP 黑名单业务层镜像(按真实客户端 IP 封禁,反代后也生效;admin 改配置时热更):
     anthropic::handlers::set_ip_blocklist(&config.ip_blocklist);
