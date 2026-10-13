@@ -554,13 +554,13 @@ export interface ConfigSnapshotResponse {
   endpointNames: string[]
   extractThinking: boolean
   ccAutoBuffer: boolean
-  /** 影子缓存记账：是否把估算的 prompt cache 命中下发给客户端（默认 true）。 */
   /** 全池自愈退避基础秒数（默认 60；2026-08-11 配置化）。 */
   selfHealBaseBackoffSecs: number
   /** 全池自愈退避上限秒数（默认 900 = 15 分钟）。 */
   selfHealMaxBackoffSecs: number
   /** 全池自愈退避指数上限（默认 4）。 */
   selfHealMaxShift: number
+  /** 影子缓存记账：是否把估算的 prompt cache 命中下发给客户端（默认 true）。 */
   promptCacheEnabled: boolean
   /** 模拟缓存：透传池响应是否注入模拟 cache_read（默认关，配合 mockCacheReadRatio 使用）。 */
   mockCacheEnabled: boolean

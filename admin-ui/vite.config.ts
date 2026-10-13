@@ -16,8 +16,11 @@ export default defineConfig({
   },
   server: {
     proxy: {
+      // 代理到本机后端。端口对齐后端默认 8990（src/model/config.rs default_port，
+      // 也是 README / docs 里本地运行的端口）；此前写死 8080 是 hank9999/kiro.rs
+      // 基线的遗留值——按文档在 8990 起后端时，pnpm dev 的 /api 请求会全部连不上。
       '/api': {
-        target: 'http://localhost:8080',
+        target: 'http://localhost:8990',
         changeOrigin: true,
       },
     },

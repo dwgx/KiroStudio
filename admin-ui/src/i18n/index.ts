@@ -51,4 +51,15 @@ i18n
     react: { useSuspense: false }, // 资源同步内联,无需 Suspense
   })
 
+// <html lang> 跟随界面语言。index.html 里静态写死 zh-CN，切到 en/ja 后若不更新，
+// 屏幕阅读器、字体回退与浏览器翻译提示仍按中文处理。
+// 初始化与后续切换两个入口都要覆盖：init 若已同步完成则 languageChanged 不再触发，
+// 故先按当前语言设一次，再订阅后续切换。
+const applyHtmlLang = (lng?: string) => {
+  const base = (lng || 'zh').toLowerCase().split('-')[0]
+  document.documentElement.lang = base === 'zh' ? 'zh-CN' : base
+}
+applyHtmlLang(i18n.language)
+i18n.on('languageChanged', applyHtmlLang)
+
 export default i18n
