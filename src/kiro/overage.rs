@@ -109,6 +109,8 @@ pub async fn set_overage(
     // 注：这仍是显式单号操作触发的按需回查（非周期主动巡检），不会增加上游限流风险。
     let started = std::time::Instant::now();
     let mut attempt: u32 = 0;
+    // 回查失败的错误（有则并入超时 note；下一次成功回查即清空）。
+    let mut last_read_err: Option<String> = None;
     loop {
         attempt += 1;
         // 首次立即查（很多情况上游是同步写入），之后每次 sleep 再查
@@ -116,14 +118,33 @@ pub async fn set_overage(
             tokio::time::sleep(POLL_INTERVAL).await;
         }
 
-        let usage = web_portal::get_user_usage_and_limits(
+        // ⚠️ 回查失败**不再整包报错**：`update_billing_preferences` 已经成功返回，
+        // 这里只是确认步骤。瞬时网络错误若走 `?` 会把一次**已写入**的开关报成失败，
+        // 调用方以为没生效而重试（2026-10-14 审计指出）。改为记错继续轮询，到点按
+        // 「已提交未确认」返回。
+        let usage = match web_portal::get_user_usage_and_limits(
             &ctx.token,
             &ctx.idp,
             ctx.proxy.as_ref(),
             ctx.tls_backend,
         )
-        .await?;
-        let last_enabled = usage.overage_enabled();
+        .await
+        {
+            Ok(u) => {
+                last_read_err = None;
+                Some(u)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    credential_id = id,
+                    error = %e,
+                    "Overage 回查失败（提交已成功，继续轮询确认）"
+                );
+                last_read_err = Some(e.to_string());
+                None
+            }
+        };
+        let last_enabled = usage.as_ref().and_then(|u| u.overage_enabled());
 
         // 命中目标状态：确认生效，返回
         if last_enabled == Some(target_enabled) {
@@ -146,12 +167,15 @@ pub async fn set_overage(
 
         // 超时：不再等待，返回当前值并标注未确认（提交已成功，可能稍后才生效）
         if started.elapsed() >= POLL_TIMEOUT {
-            let note = format!(
+            let mut note = format!(
                 "已提交 UpdateBillingPreferences，但 {}s 内未观察到上游 overageEnabled={} 生效（当前上游值 {:?}），稍后可刷新确认",
                 POLL_TIMEOUT.as_secs(),
                 target_enabled,
                 last_enabled
             );
+            if let Some(err) = last_read_err.as_deref() {
+                note.push_str(&format!("；期间回查失败：{err}"));
+            }
             tracing::warn!(
                 credential_id = id,
                 target_enabled,
