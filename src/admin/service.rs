@@ -3673,6 +3673,31 @@ impl AdminService {
                 .await
                 .map_err(AdminServiceError::InvalidCredential)?;
         }
+        // ⭐ `countTokensApiUrl` 与 proxyUrl 同级：都是**出站**目标，必须过同一道 SSRF 闸。
+        // 漏这道闸的后果（2026-10-14 安全审计发现）：导入（或手改 config.json 后重启）一个
+        // 内网/云元数据地址，此后**每个对话请求**都会把完整对话原文 POST 过去 —— 既是盲 SSRF，
+        // 也是把用户原文外送到任意端点的数据外流通道。校验在写盘之前，失败零落盘。
+        // 与其它管理员配置出站 URL 同策略（`SsrfPolicy::AdminConfigured`：放宽字面量环回，
+        // 仍拦私网/链路本地/元数据）；允许 http（本机自建 tokenizer 是常见用法）。
+        if let Some(url) = payload
+            .get("countTokensApiUrl")
+            .and_then(|v| v.as_str())
+        {
+            let url = url.trim();
+            if !url.is_empty() {
+                crate::common::ssrf::validate_outbound_url_with(
+                    url,
+                    true,
+                    crate::common::ssrf::SsrfPolicy::AdminConfigured,
+                )
+                .await
+                .map_err(|e| {
+                    AdminServiceError::InvalidCredential(format!(
+                        "countTokensApiUrl 不被允许: {e}"
+                    ))
+                })?;
+            }
+        }
         // 与 update_config 共用写锁：导入期间的并发更新/导入同样串行化
         let _guard = self.config_write_lock.lock();
 

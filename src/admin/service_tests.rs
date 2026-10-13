@@ -2153,6 +2153,17 @@ mod balance_cache_tests {
             import.contains(&gate),
             "import_config 必须 gate_admin_proxy_url"
         );
+        // countTokensApiUrl 是同级出站目标：导入路径必须过 SSRF 闸（2026-10-14 安全审计
+        // 发现的漏口——漏了它，导入一个内网/元数据地址后每个对话请求都会把原文 POST 过去）。
+        let ct_needle = format!("validate_outbound_url{}", "_with");
+        assert!(
+            import.contains(&ct_needle),
+            "import_config 必须对 countTokensApiUrl 调 validate_outbound_url_with（同级出站目标同闸）"
+        );
+        assert!(
+            import.contains("countTokensApiUrl"),
+            "import_config 的 SSRF 闸必须点名 countTokensApiUrl 字段"
+        );
         assert!(
             update.contains(&gate),
             "update_config 必须 gate_admin_proxy_url"
@@ -5386,6 +5397,40 @@ mod config_write_tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// `countTokensApiUrl` 与 `proxyUrl` 同级过 SSRF 闸：内网/元数据地址导入即拒（400）。
+    ///
+    /// 2026-10-14 安全审计发现：漏这道闸时，导入（或手改 config.json 后重启）一个
+    /// `http://169.254.169.254/...` 后，**每个对话请求**都会把完整对话原文 POST 过去
+    /// —— 既是盲 SSRF，也是把用户原文外送到任意端点的数据外流通道。
+    #[tokio::test]
+    async fn import_config_rejects_metadata_count_tokens_url() {
+        let svc = std::sync::Arc::new(super::balance_cache_tests::mk_service_with_one_credential());
+        let mut payload =
+            serde_json::to_value(crate::model::config::Config::default()).expect("默认配置可序列化");
+        payload["countTokensApiUrl"] =
+            serde_json::json!("http://169.254.169.254/latest/meta-data/");
+        let err = svc
+            .import_config(payload)
+            .await
+            .expect_err("云元数据地址必须被拒（写盘前校验）");
+        assert_eq!(err.status_code(), axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            err.to_string().contains("countTokensApiUrl"),
+            "错误文案必须点名字段，便于面板排障: {err}"
+        );
+
+        // 对照：清空该字段（或合法 https 公网地址）时闸门不该误伤 —— 这里用空串验证
+        // 「空值放行」这条分支（默认配置本身就是 None，等价）。
+        let mut ok_payload =
+            serde_json::to_value(crate::model::config::Config::default()).expect("默认配置可序列化");
+        ok_payload["countTokensApiUrl"] = serde_json::json!("");
+        let r = svc.import_config(ok_payload).await;
+        assert!(
+            r.is_ok() || r.as_ref().err().map(|e| !e.to_string().contains("countTokensApiUrl")).unwrap_or(false),
+            "空串不得被 SSRF 闸拦（应走「未配置」语义）: {r:?}"
+        );
     }
 
     /// 🔴 承重：两个配置写路径必须持同一把写锁，且持锁先于临界区起点。

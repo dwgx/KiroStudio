@@ -673,8 +673,39 @@ async fn main() {
     };
 
     // 初始化 count_tokens 配置
+    //
+    // ⭐ 出站目标先过 SSRF 闸（与 `POST /config/import` 同一道判据）：手改 config.json 是
+    // 该闸的唯一旁路 —— 这个值只在启动期读一次（OnceLock），非法地址若放行，此后**每个
+    // 对话请求**都会把完整对话原文 POST 过去（盲 SSRF + 数据外流，2026-10-14 安全审计发现）。
+    // 失败则禁用远程 count_tokens（回退本地估算，见 token.rs 的 count_all_tokens 回退分支），
+    // 绝不带着非法目标运行。顺带把空/空白归一成 None（旧值会让 count_all_tokens 以为配了远程）。
+    let count_tokens_api_url = match config
+        .count_tokens_api_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+    {
+        Some(u) => match common::ssrf::validate_outbound_url_with(
+            u,
+            true,
+            common::ssrf::SsrfPolicy::AdminConfigured,
+        )
+        .await
+        {
+            Ok(()) => Some(u.to_string()),
+            Err(e) => {
+                tracing::error!(
+                    url = %u,
+                    error = %e,
+                    "countTokensApiUrl 未通过 SSRF 校验，已禁用远程 count_tokens（回退本地估算）"
+                );
+                None
+            }
+        },
+        None => None,
+    };
     token::init_config(token::CountTokensConfig {
-        api_url: config.count_tokens_api_url.clone(),
+        api_url: count_tokens_api_url,
         api_key: config.count_tokens_api_key.clone(),
         auth_type: config.count_tokens_auth_type.clone(),
         proxy: proxy_config,
