@@ -2070,8 +2070,10 @@ impl Config {
         //
         // ⚠️ **不用** `block_in_place`（2026-10-14，与 `credential_persist::persist_credentials`
         // 和 `cooldown::save` 同一处置）：判据不能是 `Handle::try_current().is_ok()` ——
-        // `spawn_blocking` 线程与普通 OS 线程上它也返回 Ok，而 `block_in_place` 在那些线程上
-        // 直接 panic（current_thread runtime 同样 panic）。本函数是「改完配置的落盘终点」：
+        // **current_thread runtime 的 executor 线程**上 `block_in_place` 会 panic；`spawn_blocking`
+        // 线程上它是 **no-op**（`try_current()` 返 Ok 但不 panic），普通 OS 线程上 `try_current()`
+        // 为 Err。即该判据既漏掉会 panic 的 current_thread 情形，又在不 panic 的线程上做了无意义的
+        // 判断（2026-10-14 用本仓 tokio rlib 实测澄清）。本函数是「改完配置的落盘终点」：
         // panic 发生在内存已改、盘未写之后 ⇒ 面板显示已保存而磁盘仍是旧配置，且调用方拿到的是
         // panic 而不是可处理的 Err。配置文件 KB 级、`write_atomic` 的 rename 重试上界
         // ≈150ms（6 次 × 10~50ms），同步写阻塞 worker 可接受，换来的是任何 runtime 形态下都不 panic。

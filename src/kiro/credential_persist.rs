@@ -64,9 +64,12 @@ impl super::MultiTokenManager {
         crate::common::recovery_metrics::set_at_rest_healthy(!enc || encrypted);
 
         // 原子写入文件。⚠️ 2026-10-14：**不用** `block_in_place` —— 判据不能是
-        // `Handle::try_current().is_ok()`：`spawn_blocking` 线程与普通 OS 线程上它也返回
-        // Ok，而 `block_in_place` 在那些线程上直接 panic（「can call blocking only when
-        // running on the multi-threaded runtime」），current_thread runtime 同样 panic。
+        // `Handle::try_current().is_ok()`：**current_thread runtime 的 executor 线程**上
+        // `block_in_place` 会 panic（「can call blocking only when running on the
+        // multi-threaded runtime」）；`spawn_blocking` 线程上它是 **no-op**（`try_current()`
+        // 返 Ok 但不 panic），普通 OS 线程上 `try_current()` 为 Err —— 即该判据既漏掉会 panic
+        // 的 current_thread 情形，又在不 panic 的线程上做了无意义的判断（2026-10-14 用本仓
+        // tokio rlib 实测澄清；此前本处注释把 spawn_blocking 也说成 panic，是错的）。
         // 本函数是凭据落盘路径，panic 发生在快照取完之后 ⇒ 内存里刚做的禁用/加号**没落盘**
         // 且调用方拿到的是 panic 而不是可处理的 Err。
         // 与 `cooldown.rs` 的 save（2026-08-13 对抗审查 M5）同一处置：文件小（KB 级）、

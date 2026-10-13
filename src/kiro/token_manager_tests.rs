@@ -11112,6 +11112,16 @@ fn delete_rollback_restores_own_entry_and_keeps_others() {
     )
     .expect("构造 token manager");
 
+    // 给待删的 #1 预置非零统计：回滚必须原样带回（旧代码重建时清零）。
+    // request_count > success_count 是有意选的形态——只还原成功数就会出现
+    // 「成功数 > 请求数」的自相矛盾（2026-08-16 N5 同型）。
+    {
+        let mut entries = mgr.entries.lock();
+        let e1 = entries.iter_mut().find(|e| e.id == 1).expect("#1 在池里");
+        e1.success_count = 4;
+        e1.request_count = 6;
+    }
+
     // 回收站里预置**别人**的条目（id=9，带统计）：回滚若用 pop 就会弹掉它。
     let mut c9 = KiroCredentials::default();
     c9.id = Some(9);
@@ -11140,6 +11150,11 @@ fn delete_rollback_restores_own_entry_and_keeps_others() {
             "回滚必须带回删除前的启用态（旧代码强制 disabled+Manual 并清零统计）"
         );
         assert!(e1.disabled_reason.is_none(), "启用态不得残留禁用原因");
+        assert_eq!(e1.success_count, 4, "回滚必须原样带回成功数（旧代码清零）");
+        assert_eq!(
+            e1.request_count, 6,
+            "回滚必须原样带回请求数（只还原成功数会出现「成功数 > 请求数」）"
+        );
     }
 
     // ② 别人的回收站条目没被弹掉，统计也没被清零。
@@ -11219,13 +11234,18 @@ async fn save_stats_must_not_block_in_place_on_current_thread_runtime() {
     );
 
     // ② spawn_blocking 线程上再落一次（另一号的首次成功，同样直调 save_stats）。
+    //
+    // ⚠️ 这一步**不是守卫**：实测（本仓 tokio rlib）表明 `block_in_place` 在 spawn_blocking
+    // 线程上是 no-op 而非 panic（`try_current()` 返 Ok 但不 panic），旧实现下这一步同样会绿。
+    // 真正的守卫是 ①（current_thread 的 executor 线程上旧实现必 panic）。保留 ② 是为了覆盖
+    // 「落盘入口可能落在阻塞池线程」这条非常规调用点，别把它当可证伪性来源。
     let mgr = std::sync::Arc::new(mgr);
     let m2 = mgr.clone();
     tokio::task::spawn_blocking(move || {
         m2.report_success(2);
     })
     .await
-    .expect("spawn_blocking 任务不得 panic（旧实现 block_in_place 在此 panic）");
+    .expect("spawn_blocking 任务不得 panic（覆盖非常规调用点，非守卫）");
     let raw = std::fs::read_to_string(&stats_path).unwrap();
     let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(

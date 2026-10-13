@@ -649,9 +649,11 @@ async fn refresh_idc_token(
     let status = response.status();
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
-        // ⚠️ 2026-10-14：与 external_idp / social 两条刷新路径同一纪律 —— 嵌进
-        // 错误消息的 body 先经 `upstream_trace::sanitize_body`（截断 2KiB + 脱敏），
-        // 否则上游原文随错误进日志/面板（OIDC 错误体可能回显请求片段，无法离线验证）。
+        // ⚠️ 2026-10-14：嵌进错误消息的 body 先经 `upstream_trace::sanitize_body`
+        // （截断 2KiB + 脱敏），否则上游原文随错误进日志/面板（OIDC 错误体可能回显请求
+        // 片段，无法离线验证）。
+        // 注：external_idp 路径（本文件上方）同款处置；**social 路径只做 200 字符截断、
+        // 不脱敏**（social.rs），此前本条注释把它也算进同一纪律，与实现不符，已改正。
         // 判据仍读原文；下方 `diagnose_refresh` 也按设计吃原文（其 raw 字段内部再脱敏）。
         let safe_body = crate::kiro::upstream_trace::sanitize_body(&body_text);
 
@@ -6384,11 +6386,15 @@ impl MultiTokenManager {
         match serde_json::to_string_pretty(&stats) {
             Ok(json) => {
                 // 原子写。⚠️ 2026-10-14：**不用** `block_in_place` —— 与
-                // `credential_persist.rs` / `cooldown.rs` 两处同款裁定，理由逐字相同：
-                // 判据不能是 `Handle::try_current().is_ok()`（`spawn_blocking` 线程与
-                // 普通 OS 线程上它也返回 Ok，而 `block_in_place` 在那些线程上直接 panic
-                // 「can call blocking only when running on the multi-threaded runtime」，
-                // current_thread runtime 同样 panic）。本函数恰有两条非常规调用点：
+                // `credential_persist.rs` / `cooldown.rs` 两处同款裁定：
+                // 判据不能是 `Handle::try_current().is_ok()` —— **current_thread runtime 的
+                // executor 线程**上 `block_in_place` 会 panic「can call blocking only when
+                // running on the multi-threaded runtime」；`spawn_blocking` 线程上它其实是
+                // **no-op**（`try_current()` 返 Ok 但不 panic），普通 OS 线程上 `try_current()`
+                // 为 Err。即该判据既漏掉会 panic 的 current_thread 情形，又在不 panic 的线程上
+                // 做了无意义的判断。（2026-10-14 用本仓 tokio rlib 实测澄清——此前几处注释把
+                // spawn_blocking 也说成 panic，是错的。）
+                // 本函数恰有两条非常规调用点：
                 // ① `Drop for MultiTokenManager`（Drop 可能落在任意线程，且 panic 发生在
                 //    Drop 里 —— 若正逢栈展开会直接 abort）；
                 // ② 停机路径 `flush_stats_now`。文件 KB 级、`write_atomic` 的 rename

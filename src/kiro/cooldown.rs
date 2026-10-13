@@ -823,9 +823,12 @@ impl CooldownManager {
                 return;
             }
         };
-        // 原子写。⚠️ 2026-08-13 对抗审查 M5：不用 block_in_place——`Handle::try_current()`
-        // 在 spawn_blocking 线程/普通 OS 线程也返回 Ok，block_in_place 在那些线程上直接
-        // panic（「can call blocking only when running on the multi-threaded runtime」）。
+        // 原子写。⚠️ 2026-08-13 对抗审查 M5 / 2026-10-14 实测澄清：不用 block_in_place——
+        // 判据不能是 `Handle::try_current().is_ok()`：**current_thread runtime 的 executor
+        // 线程**上 block_in_place 会 panic（「can call blocking only when running on the
+        // multi-threaded runtime」）；spawn_blocking 线程上它是 **no-op**（try_current 返 Ok
+        // 但不 panic），普通 OS 线程上 try_current 为 Err。即该判据既漏掉会 panic 的
+        // current_thread 情形，又在不 panic 的线程上做了无意义的判断。
         // 冷却状态文件小（几十 KB 级），同步原子写毫秒级，阻塞 worker 可接受。
         let path = &state.path;
         let result = crate::common::fs_atomic::write_atomic(path, json.as_bytes());
