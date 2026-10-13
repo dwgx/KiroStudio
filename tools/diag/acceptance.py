@@ -177,6 +177,33 @@ def main():
             else:
                 check("工具结果回程 → 200 且有文本", False, "上一步没拿到 tool_use，跳过回程")
 
+            # 无参工具（对手对照 #2/#8/#9 修复的回归钉）：上游对无参调用只发一条
+            # `toolUseEvent`（input:""、永不补 stop）——旧代码把它当「缺终止信号」，
+            # 非流式会静默吞掉（返回 stop_reason:tool_use + content:[] 的畸形成功）或 502。
+            # 这里构造一个无参数工具让模型真调，断言客户端拿到**完整** tool_use（input 为 {}）。
+            noarg = {"name": "get_current_time", "description": "获取服务器当前时间，不需要任何参数",
+                     "input_schema": {"type": "object", "properties": {}}}
+            npayload = {"model": a.model, "max_tokens": 256, "tools": [noarg],
+                        "messages": [{"role": "user", "content": "现在几点了？请调用工具查询。"}]}
+            st, body, _ = http("POST", base + "/v1/messages", key=a.api_key, body=npayload, timeout=180)
+            try:
+                nj = json.loads(body)
+            except Exception:
+                nj = {}
+            nblocks = [b for b in nj.get("content", []) if b.get("type") == "tool_use"]
+            check("无参工具返回完整 tool_use（input={}）",
+                  st == 200 and bool(nblocks) and nblocks[0].get("input") == {}
+                  and bool(nblocks[0].get("id")),
+                  "status=%s stop=%s blocks=%s" % (st, nj.get("stop_reason"), [b.get("type") for b in nj.get("content", [])]))
+            # 流式同款：事件序列必须完整且**无 error 事件**（修前该形态整轮 Incomplete + SSE error）。
+            npayload["stream"] = True
+            st, body, _ = http("POST", base + "/v1/messages", key=a.api_key, body=npayload, timeout=180)
+            check("无参工具流式无 error 事件且正常收尾",
+                  st == 200 and b"message_stop" in body and b"event: error" not in body
+                  and b"tool_use" in body,
+                  "status=%s has_stop=%s has_error=%s has_tool_use=%s"
+                  % (st, b"message_stop" in body, b"event: error" in body, b"tool_use" in body))
+
             # 扩展思考：thinking 块必须成形（上游用 <thinking> 标签表达，网关负责转块）。
             # 这条覆盖审计改动最重的 thinking_tags 解析路径（引用包裹的闭标签、未闭合残留等）。
             think = {"model": a.model, "max_tokens": 2048,
