@@ -110,7 +110,7 @@
         // build_history 的第一条 user 消息即拼接后的 system 内容
         let extract_system = |req: &MessagesRequest| -> String {
             let history =
-                build_history(req, &req.messages, "claude-sonnet-4.5", &mut HashMap::new())
+                build_history(req, &req.messages, "claude-sonnet-4.5", &mut HashMap::new(), &mut Vec::new())
                     .unwrap();
             match &history[0] {
                 Message::User(u) => u.user_input_message.content.clone(),
@@ -154,7 +154,7 @@
             metadata: None,
         };
         let history =
-            build_history(&req, &req.messages, "claude-sonnet-4.5", &mut HashMap::new()).unwrap();
+            build_history(&req, &req.messages, "claude-sonnet-4.5", &mut HashMap::new(), &mut Vec::new()).unwrap();
         let Message::User(u) = &history[0] else {
             panic!("首条应为 system 注入的 user");
         };
@@ -323,7 +323,7 @@
 
         let extract = |req: &MessagesRequest| -> String {
             let history =
-                build_history(req, &req.messages, "claude-sonnet-4.5", &mut HashMap::new())
+                build_history(req, &req.messages, "claude-sonnet-4.5", &mut HashMap::new(), &mut Vec::new())
                     .unwrap();
             match &history[0] {
                 Message::User(u) => u.user_input_message.content.clone(),
@@ -410,7 +410,7 @@
 
     fn first_history_user_content(req: &MessagesRequest) -> Option<String> {
         let history =
-            build_history(req, &req.messages, "claude-sonnet-4.5", &mut HashMap::new()).unwrap();
+            build_history(req, &req.messages, "claude-sonnet-4.5", &mut HashMap::new(), &mut Vec::new()).unwrap();
         match history.first() {
             Some(Message::User(u)) => Some(u.user_input_message.content.clone()),
             _ => None,
@@ -820,6 +820,7 @@
             &req.messages,
             "claude-sonnet-4.5",
             &mut HashMap::new(),
+            &mut Vec::new(),
         )
         .unwrap();
         // 只有一条 user 消息 → 作为 currentMessage 不入历史，历史应为空
@@ -3153,4 +3154,146 @@
             saw_kept_assistant,
             "截断只丢末尾 prefill，中间 assistant 仍应在 history"
         );
+    }
+
+    // ── 动态系统块分流（token 预算提醒 + hook/工具通知，k2cc issue #47 同款）──
+
+    #[test]
+    fn dynamic_system_block_predicates() {
+        // token 预算提醒：整段恰为单块（允许前后空白）
+        assert!(is_token_budget_reminder(
+            "<total_tokens>15000000 tokens left</total_tokens>"
+        ));
+        assert!(is_token_budget_reminder(
+            "  <total_tokens>42 tokens left</total_tokens>\n"
+        ));
+        // 带其他内容 / 内部有标签 / 只是提到 → 不算
+        assert!(!is_token_budget_reminder(
+            "<total_tokens>42</total_tokens> extra"
+        ));
+        assert!(!is_token_budget_reminder(
+            "<total_tokens><b>x</b></total_tokens>"
+        ));
+        assert!(!is_token_budget_reminder("total_tokens left: 42"));
+
+        // hook 通知与工具/MCP 状态通知
+        assert!(is_dynamic_hook_injection(
+            "UserPromptSubmit hook success: ok"
+        ));
+        assert!(is_dynamic_hook_injection(
+            "PostToolUse:Write hook feedback: nope"
+        ));
+        assert!(is_dynamic_hook_injection("  Stop hook blocked: reason"));
+        assert!(is_dynamic_hook_injection(
+            "The following deferred tools are now available: X"
+        ));
+        assert!(is_dynamic_hook_injection(
+            "The following MCP servers are still connecting: Y"
+        ));
+        // 不在名单 / SessionStart（一次性、可缓存）/ 近似串 → 不算
+        assert!(!is_dynamic_hook_injection("SessionStart hook output: stable"));
+        assert!(!is_dynamic_hook_injection("UserPromptSubmit hooks are great"));
+        assert!(!is_dynamic_hook_injection("random text"));
+
+        // 统一判据
+        assert!(is_dynamic_system_block(
+            "<total_tokens>1 tokens left</total_tokens>"
+        ));
+        assert!(is_dynamic_system_block("PreToolUse hook denied: reason"));
+        assert!(!is_dynamic_system_block("You are a helpful assistant."));
+    }
+
+    #[test]
+    fn dynamic_blocks_leave_history_and_land_in_current_message() {
+        use super::super::types::Message as AnthropicMessage;
+        let mut req = mk_thinking_req(None, None);
+        req.messages = vec![
+            AnthropicMessage {
+                role: "user".into(),
+                content: serde_json::json!("hi"),
+            },
+            AnthropicMessage {
+                role: "system".into(),
+                content: serde_json::json!("<total_tokens>100 tokens left</total_tokens>"),
+            },
+            AnthropicMessage {
+                role: "system".into(),
+                content: serde_json::json!("UserPromptSubmit hook success: first"),
+            },
+            AnthropicMessage {
+                role: "assistant".into(),
+                content: serde_json::json!("hello"),
+            },
+            AnthropicMessage {
+                role: "user".into(),
+                content: serde_json::json!("next question"),
+            },
+            // 末尾提醒：既是动态块、又绝不能触发 assistant-prefill 截断
+            AnthropicMessage {
+                role: "system".into(),
+                content: serde_json::json!("<total_tokens>50 tokens left</total_tokens>"),
+            },
+        ];
+        let result = convert_request(&req).unwrap();
+
+        // history[0]（system 注入的 user 消息）不得含任何动态块
+        let h0 = match result.conversation_state.history.first() {
+            Some(Message::User(u)) => u.user_input_message.content.clone(),
+            _ => panic!("首条历史应为 system 注入的 user"),
+        };
+        assert!(!h0.contains("total_tokens"), "提醒不得留在 history[0]：{h0}");
+        assert!(
+            !h0.contains("hook success"),
+            "hook 通知不得留在 history[0]：{h0}"
+        );
+
+        // 当前消息：动态块放开头、正文在后、末尾提醒不得被 prefill 丢弃
+        let cur = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content;
+        assert!(
+            cur.starts_with("<system-reminder>"),
+            "动态块应在当前消息开头：{cur}"
+        );
+        assert!(cur.contains("100 tokens left"), "{cur}");
+        assert!(cur.contains("50 tokens left"), "末尾提醒不得被丢弃：{cur}");
+        assert!(cur.contains("hook success: first"), "{cur}");
+        assert!(cur.contains("next question"), "原正文必须保留：{cur}");
+    }
+
+    #[test]
+    fn top_level_system_token_reminder_is_diverted() {
+        use super::super::types::SystemMessage;
+        let req = mk_thinking_req(
+            Some(vec![
+                SystemMessage {
+                    text: "You are helpful.".to_string(),
+                    block_type: Some("text".to_string()),
+                    cache_control: None,
+                },
+                SystemMessage {
+                    text: "<total_tokens>9 tokens left</total_tokens>".to_string(),
+                    block_type: Some("text".to_string()),
+                    cache_control: None,
+                },
+            ]),
+            None,
+        );
+        let result = convert_request(&req).unwrap();
+
+        let h0 = match result.conversation_state.history.first() {
+            Some(Message::User(u)) => u.user_input_message.content.clone(),
+            _ => panic!("首条历史应为 system 注入的 user"),
+        };
+        assert!(h0.contains("You are helpful."), "{h0}");
+        assert!(!h0.contains("total_tokens"), "{h0}");
+
+        let cur = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content;
+        assert!(cur.contains("9 tokens left"), "{cur}");
     }

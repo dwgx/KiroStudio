@@ -338,6 +338,73 @@ pub(super) fn canonicalize_system_text(text: &str) -> std::borrow::Cow<'_, str> 
     std::borrow::Cow::Borrowed(text)
 }
 
+/// 判断文本块是否为 Claude Code 逐轮追加的「剩余 token 预算」提示，
+/// 形如 `<total_tokens>15000000 tokens left</total_tokens>`。
+///
+/// 该消息由 CC 自己每轮以 `role:"system"` 追加（并随会话累积，旧版本客户端数值还逐轮递减），
+/// 并非本代理生成。留在 history[0] 会让转发前缀每轮增长、上游 prefix 缓存持续 miss
+/// （对齐 k2cc issue #47 的残留漂移源）；留在末尾又会被 prefill 截断逻辑误当
+/// assistant prefill 丢弃。统一归为动态块：从 history[0] 剔除、改放当前消息开头的
+/// `<system-reminder>`（模型仍可见，当前消息不进缓存前缀）。
+///
+/// 只认「整段恰为单个 `<total_tokens>…</total_tokens>`、内部不含其他标签」的文本，
+/// 避免误分流恰好以该标签开头、但还带其他内容的真实系统提示。
+/// 参考 TsinHzl/kiro2cc-proxy `is_token_budget_reminder`（MIT）。
+fn is_token_budget_reminder(s: &str) -> bool {
+    let Some(inner) = s
+        .trim()
+        .strip_prefix("<total_tokens>")
+        .and_then(|rest| rest.strip_suffix("</total_tokens>"))
+    else {
+        return false;
+    };
+    !inner.contains('<') && !inner.contains('>')
+}
+
+/// 判断文本块是否为 Claude Code 中途注入的「动态块」（逐轮新增/变化）。
+///
+/// CC 会以 `role:"system"` 的中途消息追加 hook 输出与工具/MCP 状态通知；这些块
+/// 归并进系统区后每轮累积，会让 history[0] 逐轮漂移、上游前缀缓存持续 miss。
+/// 识别范围（前缀匹配，忽略前导空白）：
+/// - `<Event> hook …` 与 `<Event>:<matcher> hook …`，Event ∈ UserPromptSubmit /
+///   PreToolUse / PostToolUse / Stop
+/// - `The following deferred tools are now available…`
+/// - `The following MCP servers are still connecting…`
+///
+/// 刻意不含 SessionStart：它只在会话开头注入一次（可达数 KB 的稳定内容），
+/// 留在 history[0] 可被缓存；移到尾部反而每轮都要按未缓存计费。
+/// 参考 TsinHzl/kiro2cc-proxy `is_dynamic_hook_injection`（MIT）。
+fn is_dynamic_hook_injection(s: &str) -> bool {
+    const HOOK_EVENTS: [&str; 4] = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"];
+    const NOTICE_PREFIXES: [&str; 2] = [
+        "The following deferred tools are now available",
+        "The following MCP servers are still connecting",
+    ];
+
+    let t = s.trim_start();
+    if NOTICE_PREFIXES.iter().any(|p| t.starts_with(p)) {
+        return true;
+    }
+    HOOK_EVENTS.iter().any(|event| {
+        let Some(rest) = t.strip_prefix(event) else {
+            return false;
+        };
+        let after_name = if let Some(with_matcher) = rest.strip_prefix(':') {
+            // "<Event>:<matcher> hook …"：matcher 不含空格
+            with_matcher.split_once(' ').map(|(_, after)| after)
+        } else {
+            rest.strip_prefix(' ')
+        };
+        after_name.is_some_and(|a| a.starts_with("hook "))
+    })
+}
+
+/// 动态系统块统一判据：token 预算提醒 + hook/工具/MCP 通知。
+/// 命中的块从 history[0] 分流、改放当前消息开头（见 [`build_history`]）。
+fn is_dynamic_system_block(s: &str) -> bool {
+    is_token_budget_reminder(s) || is_dynamic_hook_injection(s)
+}
+
 /// 剥离 system 文本里每请求漂移的环境噪音行 / 整段。
 ///
 /// 参照 kiro-account-manager `prompt_filter::filter_env_noise`（MIT），并补齐现代
@@ -782,23 +849,41 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         return Err(ConversionError::EmptyMessages);
     }
 
+    // 2.4. 先摘掉末尾的「token 预算提醒」system 消息（CC 每轮追加，见 is_token_budget_reminder）：
+    // 它不是 assistant prefill，直接进下面的截断逻辑会被静默丢弃并刷 WARN；
+    // 收集起来改放当前消息开头（与 history 里的动态块同一出口）。
+    let mut trailing_system: Vec<String> = Vec::new();
+    let mut messages_end = req.messages.len();
+    while messages_end > 0 && req.messages[messages_end - 1].role == "system" {
+        let text = message_plain_text(&req.messages[messages_end - 1]);
+        if !is_token_budget_reminder(&text) {
+            break;
+        }
+        trailing_system.push(text);
+        messages_end -= 1;
+    }
+    trailing_system.reverse();
+    if messages_end == 0 {
+        return Err(ConversionError::EmptyMessages);
+    }
+    let req_messages = &req.messages[..messages_end];
+
     // 2.5. 预处理 prefill：末尾非 user（典型是 assistant prefill）截断到最后一条 user。
     // Claude 4.x 已弃用 assistant prefill，Kiro API 也不支持。
     // 响应头 `x-kirostudio-prefill-dropped` 未接：要把它送到 `/v1/messages`
     // 出口必须改 `handlers_dispatch` / 双端点 builder，本 MINOR 不碰那条路径。
-    let messages: &[_] = if req.messages.last().is_some_and(|m| m.role != "user") {
+    let messages: &[_] = if req_messages.last().is_some_and(|m| m.role != "user") {
         tracing::warn!(
-            dropped_role = req.messages.last().map(|m| m.role.as_str()).unwrap_or(""),
+            dropped_role = req_messages.last().map(|m| m.role.as_str()).unwrap_or(""),
             "末尾非 user 消息（assistant prefill）已丢弃，截断到最后一条 user"
         );
-        let last_user_idx = req
-            .messages
+        let last_user_idx = req_messages
             .iter()
             .rposition(|m| m.role == "user")
             .ok_or(ConversionError::EmptyMessages)?;
-        &req.messages[..=last_user_idx]
+        &req_messages[..=last_user_idx]
     } else {
-        &req.messages
+        req_messages
     };
 
     // 3. 生成会话 ID 和代理 ID
@@ -835,7 +920,16 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let mut tools = convert_tools(&req.tools, &mut tool_name_map);
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
-    let mut history = build_history(req, messages, &model_id, &mut tool_name_map)?;
+    // dynamic_system：被分流出 history[0] 的动态块（token 预算提醒），
+    // 由第 12 步放当前消息开头（模型仍可见，不进缓存前缀）。
+    let mut dynamic_system: Vec<String> = Vec::new();
+    let mut history = build_history(
+        req,
+        messages,
+        &model_id,
+        &mut tool_name_map,
+        &mut dynamic_system,
+    )?;
 
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
@@ -909,6 +1003,24 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     // 12. 构建当前消息
     // 保留文本内容，即使有工具结果也不丢弃用户文本
     let content = replace_mapped_tool_names_in_text(&text_content, &tool_name_map);
+    // 动态块（token 预算提醒）放当前消息**开头**：模型仍可见，而当前消息不进缓存前缀
+    // （cache_fingerprint 亦剥除 <system-reminder>），不引入新的指纹漂移。
+    // 放开头而非末尾：末尾通常是本轮指令正文，追加通知会抢走模型注意力（k2cc 同款取舍）。
+    let content = if dynamic_system.is_empty() && trailing_system.is_empty() {
+        content
+    } else {
+        let joined = dynamic_system
+            .iter()
+            .chain(trailing_system.iter())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        if content.is_empty() {
+            format!("<system-reminder>\n{joined}\n</system-reminder>")
+        } else {
+            format!("<system-reminder>\n{joined}\n</system-reminder>\n\n{content}")
+        }
+    };
 
     let mut user_input = UserInputMessage::new(content, &model_id)
         .with_context(context)
@@ -1610,6 +1722,7 @@ fn build_history(
     messages: &[super::types::Message],
     model_id: &str,
     tool_name_map: &mut HashMap<String, String>,
+    dynamic_system: &mut Vec<String>,
 ) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
@@ -1632,12 +1745,21 @@ fn build_history(
         // （<env> 块 / gitStatus / Recent commits / 模型名行等，每请求漂移）。
         // 稳定住转发给上游的 prompt 前缀，避免 Bedrock prefix cache 因这些漂移而 0 命中，
         // 同时省 token、降 CC 身份被关联风险。空块（整块被剥空）直接丢弃不参与拼接。
-        let joined: String = system
-            .iter()
-            .map(|s| canonicalize_system_text(&s.text).into_owned())
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
+        // token 预算提醒（CC 逐轮追加、随会话累积）单独分流为动态块：留在 history[0]
+        // 会让前缀每轮增长、上游 prefix 缓存持续 miss（见 is_token_budget_reminder）。
+        let mut kept: Vec<String> = Vec::new();
+        for s in system.iter() {
+            let text = canonicalize_system_text(&s.text).into_owned();
+            if text.is_empty() {
+                continue;
+            }
+            if is_dynamic_system_block(&text) {
+                dynamic_system.push(text);
+            } else {
+                kept.push(text);
+            }
+        }
+        let joined = kept.join("\n");
         if joined.is_empty() {
             None
         } else {
@@ -1648,12 +1770,24 @@ fn build_history(
     // Claude Code / 部分客户端把 system 放在 messages[].role=system，旧循环静默丢。
     // 对齐 jwadow/kiro-gateway #271：并进系统块，不当作用户轮次。
     let history_end_index_for_system = messages.len().saturating_sub(1);
-    let extra_system: String = (0..history_end_index_for_system)
-        .filter(|&i| messages[i].role == "system")
-        .map(|i| message_plain_text(&messages[i]))
-        .filter(|s| !s.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
+    // 同款分流：历史里累积的 token 预算提醒不进 history[0]（每轮 +1 块的漂移源），
+    // 收进 dynamic_system 由调用方放当前消息开头。
+    let mut extra_kept: Vec<String> = Vec::new();
+    for i in 0..history_end_index_for_system {
+        if messages[i].role != "system" {
+            continue;
+        }
+        let text = message_plain_text(&messages[i]);
+        if text.trim().is_empty() {
+            continue;
+        }
+        if is_dynamic_system_block(&text) {
+            dynamic_system.push(text);
+        } else {
+            extra_kept.push(text);
+        }
+    }
+    let extra_system: String = extra_kept.join("\n");
     if !extra_system.is_empty() {
         system_content = Some(match system_content {
             Some(existing) => format!("{existing}\n{extra_system}"),
