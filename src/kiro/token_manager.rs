@@ -2181,6 +2181,20 @@ pub struct MultiTokenManager {
     self_heal_revived: Mutex<std::collections::HashSet<u64>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// 统计落盘的串行化锁（与 `cooldown.rs` 同款纪律）：快照→序列化→落盘全在锁内，
+    /// 后到者排队取到的是**最新**快照 —— 从根上消除「两个并发 `save_stats`，旧快照
+    /// 最后落盘」。
+    ///
+    /// 为什么必须有（2026-10-14 审计发现的竞态）：`save_stats` 此前既无串行化、又在
+    /// 写盘成功后**无条件**清 `stats_dirty`。高并发下（`report_success`/`report_failure`/
+    /// `add_credits` 都调它）先取快照的线程后完成写盘 ⇒ 文件回退到旧快照且 dirty=false
+    /// ⇒ 停机补写（`flush_stats_now`）判定无需补写 ⇒ 新号的 `success_count` 丢盘 ⇒
+    /// `has_ever_succeeded()` 返 false ⇒ provider 把瞬态 bearer-invalid 403 判成真 region
+    /// 错配 ⇒ 3 次即 `TooManyFailures` **禁用其实健康的号**。
+    stats_save_lock: Mutex<()>,
+    /// 统计变更版本号：每次标脏自增；落盘成功后**只有版本未变**才清 dirty
+    /// （否则落盘期间的新变更会随 dirty 被清而滞留内存，直到下次事件才可能补写）。
+    stats_version: std::sync::atomic::AtomicU64,
     /// 失败冷却管理器（反应式：凭据出错后短暂跳过）
     cooldown: CooldownManager,
     /// 是否启用冷却（原子镜像,reload 热更）
@@ -2882,6 +2896,8 @@ impl MultiTokenManager {
             self_heal_revived: Mutex::new(std::collections::HashSet::new()),
             self_heal_streak: AtomicU32::new(0),
             stats_dirty: AtomicBool::new(false),
+            stats_save_lock: Mutex::new(()),
+            stats_version: std::sync::atomic::AtomicU64::new(0),
             // 2026-08-13：冷却状态持久化（风控退避档位重启清零 = 烧号反向放大器）。
             // 数据目录 = 凭据文件所在目录（cache_dir 同源）；无路径时纯内存（与旧行为一致）。
             cooldown: match &cooldown_dir {
@@ -6330,24 +6346,29 @@ impl MultiTokenManager {
             None => return,
         };
 
-        let stats: HashMap<String, StatsEntry> = {
+        // 串行化 + 版本纪律（2026-10-14 审计发现的竞态，详见字段文档）：快照在锁内取
+        // ⇒ 排队者拿到的是最新状态；dirty 只在「本快照之后没有新变更」时才清。
+        let _guard = self.stats_save_lock.lock();
+        let (stats, snap_version): (HashMap<String, StatsEntry>, u64) = {
             let entries = self.entries.lock();
-            entries
-                .iter()
-                .map(|e| {
-                    (
-                        e.id.to_string(),
-                        StatsEntry {
-                            success_count: e.success_count,
-                            total_credits_used: e.total_credits_used,
-                            request_count: e.request_count,
-                            last_used_at: e.last_used_at.clone(),
-                        },
-                    )
-                })
-                .collect()
+            (
+                entries
+                    .iter()
+                    .map(|e| {
+                        (
+                            e.id.to_string(),
+                            StatsEntry {
+                                success_count: e.success_count,
+                                total_credits_used: e.total_credits_used,
+                                request_count: e.request_count,
+                                last_used_at: e.last_used_at.clone(),
+                            },
+                        )
+                    })
+                    .collect(),
+                self.stats_version.load(Ordering::Relaxed),
+            )
         };
-
         match serde_json::to_string_pretty(&stats) {
             Ok(json) => {
                 // 原子写(在 Tokio runtime 内用 block_in_place 避免 rename 重试 sleep 阻塞 worker,
@@ -6361,7 +6382,11 @@ impl MultiTokenManager {
                     tracing::warn!("保存统计缓存失败: {}", e);
                 } else {
                     *self.last_stats_save_at.lock() = Some(Instant::now());
-                    self.stats_dirty.store(false, Ordering::Relaxed);
+                    // 条件清 dirty：本快照之后又有变更（version 已变）时**不清**，
+                    // 留给下一次 save/flush_now 补写（否则那批变更会滞留内存直到下次事件）。
+                    if self.stats_version.load(Ordering::Relaxed) == snap_version {
+                        self.stats_dirty.store(false, Ordering::Relaxed);
+                    }
                 }
             }
             Err(e) => tracing::warn!("序列化统计数据失败: {}", e),
@@ -6395,6 +6420,9 @@ impl MultiTokenManager {
 
     /// 标记统计数据已更新，并按 debounce 策略决定是否立即落盘
     fn save_stats_debounced(&self) {
+        // 先自增版本再标脏：`save_stats` 用它判「本快照之后有没有新变更」——
+        // 顺序反了会让「标脏后、落盘前」的变更被误判成已落盘（条件清 dirty 失效）。
+        self.stats_version.fetch_add(1, Ordering::Relaxed);
         self.stats_dirty.store(true, Ordering::Relaxed);
 
         let should_flush = {

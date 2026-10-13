@@ -10968,3 +10968,56 @@
             "真占号后下一个可用号应前进"
         );
     }
+
+/// 统计落盘必须**串行化 + 条件清 dirty**（2026-10-14 审计发现的竞态）。
+///
+/// 形态：`save_stats` 若既无串行化、又在写盘成功后无条件清 dirty，高并发下（report_success/
+/// report_failure/add_credits 都调它）先取快照的线程可能后完成写盘 ⇒ 文件回退到旧快照且
+/// dirty=false ⇒ 停机补写（`flush_stats_now`）判定无需补写 ⇒ 新号 success_count 丢盘 ⇒
+/// `has_ever_succeeded()` 返 false ⇒ provider 把瞬态 bearer-invalid 403 判成真 region 错配
+/// ⇒ 3 次即 `TooManyFailures` **禁用其实健康的号**。
+///
+/// 判据用源码切片：该交错无法确定性复现（需要真并发 + 写盘耗时），而三条纪律缺一即失效。
+#[test]
+fn save_stats_must_serialize_and_clear_dirty_conditionally() {
+    let src = include_str!("token_manager.rs");
+    let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+    let prod = &src[..cut];
+    let at = prod
+        .find("fn save_stats(&self) {")
+        .expect("save_stats 不该被改名");
+    let body = &prod[at..];
+    let end = body.find("\n    }\n").unwrap_or(body.len());
+    let body = &body[..end];
+
+    // needle 运行时拼接：include_str! 会把本测试自己的字面量也读进来。
+    let lock = format!("stats_save{}", "_lock.lock()");
+    assert!(
+        body.contains(&lock),
+        "save_stats 必须持 stats_save_lock 串行化（否则两个并发 save 可能让旧快照最后落盘）"
+    );
+    let ver = format!("stats_version.load(Ordering::Relaxed) == snap{}", "_version");
+    assert!(
+        body.contains(&ver),
+        "dirty 必须按版本条件清除（否则落盘期间的新变更会随 dirty 被清而滞留内存）"
+    );
+    let clear = format!("self.stats_dirty.store(false{}", ", Ordering::Relaxed);");
+    assert_eq!(
+        body.matches(&clear).count(),
+        1,
+        "save_stats 里对 stats_dirty 的清除必须恰一处（在条件分支内）"
+    );
+    // 版本自增必须发生在标脏**之前**（顺序反了条件清 dirty 会失效）。
+    let debounced = prod
+        .find("fn save_stats_debounced(&self) {")
+        .expect("save_stats_debounced 不该被改名");
+    let dbody = &prod[debounced..];
+    let dend = dbody.find("\n    }\n").unwrap_or(dbody.len());
+    let dbody = &dbody[..dend];
+    let bump = format!("stats_version.fetch_add{}", "(1, Ordering::Relaxed);");
+    let bi = dbody.find(&bump).expect("标脏路径必须自增 stats_version");
+    let di = dbody
+        .find(&format!("stats_dirty.store(true{}", ", Ordering::Relaxed);"))
+        .expect("标脏路径必须置 stats_dirty");
+    assert!(bi < di, "stats_version 必须在标脏之前自增");
+}
