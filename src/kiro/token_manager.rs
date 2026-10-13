@@ -8498,9 +8498,12 @@ impl MultiTokenManager {
         // 无需再单独重读一次凭据。
         let (mut credentials, token) = self.ensure_valid_token(id).await?;
 
-        // 用量 GET 必须先有真实 ARN（8 月 25 日上游规则）。token 仍有效时刷新路径
-        // 不会跑 ListAvailableProfiles，新 IdC 号会带着占位去打 getUsageLimits → 403。
-        if credentials.usage_profile_arn().is_none() && !credentials.is_api_key_credential() {
+        // 用量 GET 想要**真实** ARN（付费/企业号靠它区分租户）。缺真实 ARN 时先解析一次：
+        // 判据必须是 `has_real_profile_arn`（原始字段），不能是 `usage_profile_arn().is_none()`
+        // —— 后者对 idc/social 会回退占位（Some），解析被跳过、付费号本来能拿到的真实 ARN
+        // 就永远拿不到。解析失败也不阻断：`usage_profile_arn` 会给出该号型可用的值
+        // （idc/social 用占位，2026-10-14 实测 200；api_key/external_idp 则不带）。
+        if !credentials.has_real_profile_arn() && !credentials.is_api_key_credential() {
             let cfg = self.config.load_full();
             let proxy = credentials.effective_proxy(self.proxy.as_ref());
             let preferred = credentials.effective_upstream_region(&cfg).to_string();

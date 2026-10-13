@@ -870,19 +870,51 @@ impl KiroCredentials {
         Some(crate::kiro::token_manager::DEFAULT_BUILDER_ID_PROFILE_ARN.to_string())
     }
 
-    /// 用量 REST（`getUsageLimits` query）只用**已解析的真实 ARN**，不发 BuilderId 占位。
+    /// 用量 REST（`getUsageLimits` query）该带的 ARN —— 与 [`Self::effective_profile_arn`]
+    /// 同判据（对话 body 与用量 query 对同一号型应给同一个 ARN）。
     ///
-    /// 对话 body 仍走 [`Self::effective_profile_arn`]。2026-08-25 起用量 GET 带占位 ARN
-    /// 会 403；ZyphrZero 0.8.0 过滤占位后再试「不带 ARN」。
+    /// **2026-10-14 真号对照实验**（免费档 idc/BuilderID 号 `ren.suzuki@skiapi.dev`，
+    /// 同一把 token 三组，直打 `management.us-east-1.kiro.dev`）：
+    ///
+    /// | 变体 | 结果 |
+    /// |---|---|
+    /// | 不带 `profileArn` | `400 {"message":"Invalid profileArn."}` |
+    /// | **带 BuilderId 占位 ARN** | **`200`**（`subscriptionTitle:"KIRO FREE"`、`type:Q_DEVELOPER_STANDALONE_FREE`） |
+    /// | 同号 `ListAvailableProfiles` | `400 AccessDeniedException`（免费号**无权列 profile**） |
+    ///
+    /// 第三行解释了为什么必须回退占位：这类号**根本解析不出真实 ARN**，占位就是它在用量端点
+    /// 唯一可用的值。旧注释「2026-08-25 起用量 GET 带占位 ARN 会 403」是**别的号型**的结论
+    /// （`ksk_`/企业号套别人账户的占位被判凭据不匹配，见 [`Self::effective_profile_arn`]
+    /// 的实测段），被误推广到 idc/免费号 ⇒ 面板余额恒空、上号时拉订阅等级必失败
+    /// （实测报错 `获取使用额度失败: 400 Bad Request {"message":"Invalid profileArn."}`）。
+    ///
+    /// 故：api_key / external_idp → `None`（占位对它们是错租户）；其余（idc/social）→
+    /// 有真实 ARN 用真实的，没有则占位。
     pub fn usage_profile_arn(&self) -> Option<String> {
-        let arn = self.profile_arn.as_deref()?.trim();
-        if arn.is_empty() {
+        // 真实 ARN（含动态解析出来的）一律优先；占位值不算真实值，落到下面按号型判。
+        if let Some(arn) = self.profile_arn.as_deref().map(str::trim) {
+            if !arn.is_empty() && !crate::kiro::token_manager::is_placeholder_profile_arn(arn) {
+                return Some(arn.to_string());
+            }
+        }
+        if self.is_api_key_credential() || self.is_external_idp_credential() {
             return None;
         }
-        if crate::kiro::token_manager::is_placeholder_profile_arn(arn) {
-            return None;
-        }
-        Some(arn.to_string())
+        Some(crate::kiro::token_manager::DEFAULT_BUILDER_ID_PROFILE_ARN.to_string())
+    }
+
+    /// 是否已持有**真实**（非占位）profileArn。
+    ///
+    /// 用量路径在发请求前用它决定「要不要先跑一次 ListAvailableProfiles 解析」——
+    /// 不能拿 `usage_profile_arn().is_none()` 当判据：idc/social 缺 ARN 时那个函数会回退
+    /// 占位（`Some`），于是解析被跳过，付费号本来能拿到的真实 ARN 就永远拿不到。
+    pub fn has_real_profile_arn(&self) -> bool {
+        self.profile_arn
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|arn| {
+                !arn.is_empty() && !crate::kiro::token_manager::is_placeholder_profile_arn(arn)
+            })
     }
 
     /// 该凭据实际应走的端点名：**显式 `endpoint` 字段优先，其次按凭据类型自动路由**。
@@ -1338,9 +1370,11 @@ mod tests {
         );
         assert!(idc.should_send_profile_arn(), "idc 应发送 profileArn");
         assert_eq!(
-            idc.usage_profile_arn(),
-            None,
-            "用量 REST 不得把 BuilderId 占位当真实 ARN 发出"
+            idc.usage_profile_arn().as_deref(),
+            Some(crate::kiro::token_manager::DEFAULT_BUILDER_ID_PROFILE_ARN),
+            "用量 REST 对 idc 缺 ARN 必须回退占位：2026-10-14 真号对照实验——不带 ARN 得 \
+             400 Invalid profileArn，带占位得 200（KIRO FREE）；同号 ListAvailableProfiles \
+             是 400 AccessDenied（免费号无权列 profile），即解析不出真实 ARN"
         );
     }
 
@@ -1351,12 +1385,44 @@ mod tests {
         idc.profile_arn = Some(
             crate::kiro::token_manager::DEFAULT_BUILDER_ID_PROFILE_ARN.to_string(),
         );
-        assert_eq!(idc.usage_profile_arn(), None);
+        assert_eq!(
+            idc.usage_profile_arn().as_deref(),
+            Some(crate::kiro::token_manager::DEFAULT_BUILDER_ID_PROFILE_ARN),
+            "库里存的占位值对 idc 同样照发（实测 200）"
+        );
+        assert!(!idc.has_real_profile_arn(), "占位不算真实 ARN（解析守卫据此决定是否解析）");
         assert_eq!(
             idc.effective_profile_arn().as_deref(),
             Some(crate::kiro::token_manager::DEFAULT_BUILDER_ID_PROFILE_ARN),
             "对话 body 仍可用占位"
         );
+    }
+
+    /// 占位 ARN 对**别的号型**是错租户，用量端点绝不许发（这是旧注释那条 403 的适用范围）。
+    #[test]
+    fn test_usage_profile_arn_never_placeholder_for_api_key_or_external_idp() {
+        let mut api_key = KiroCredentials::default();
+        api_key.auth_method = Some("api_key".to_string());
+        api_key.profile_arn = None;
+        assert_eq!(api_key.usage_profile_arn(), None, "ksk_ 不带 ARN");
+
+        let mut ent = KiroCredentials::default();
+        ent.auth_method = Some("external_idp".to_string());
+        ent.profile_arn = None;
+        assert_eq!(ent.usage_profile_arn(), None, "企业号缺真实 ARN 时不带（占位是错租户）");
+    }
+
+    /// 有真实 ARN 时一律优先（占位只在缺真实值时才用）。
+    #[test]
+    fn test_usage_profile_arn_prefers_real_arn() {
+        let mut idc = KiroCredentials::default();
+        idc.auth_method = Some("idc".to_string());
+        idc.profile_arn = Some("arn:aws:codewhisperer:us-east-1:1:profile/REAL".to_string());
+        assert_eq!(
+            idc.usage_profile_arn().as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:1:profile/REAL")
+        );
+        assert!(idc.has_real_profile_arn());
     }
 
     #[test]
