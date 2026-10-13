@@ -130,11 +130,52 @@ def main():
             st, body, _ = http("POST", base + "/v1/messages", key=a.api_key, body=payload, timeout=120)
             ok = st == 200 and b'"text"' in body
             check("非流式 /v1/messages → 200 且有文本", ok, "status=%s body=%s" % (st, body[:160]))
+
+            # 流式：不只看首事件，要看**整条序列**收尾（审计波动过 message_stop/收尾路径）。
             payload["stream"] = True
             st, body, _ = http("POST", base + "/v1/messages", key=a.api_key, body=payload, timeout=120)
             check("流式 /v1/messages 首事件 message_start",
                   st == 200 and b"event: message_start" in body,
                   "status=%s body=%s" % (st, body[:160]))
+            check("流式序列完整（content_block_delta + message_stop）",
+                  st == 200 and b"event: content_block_delta" in body and b"event: message_stop" in body,
+                  "status=%s has_delta=%s has_stop=%s"
+                  % (st, b"content_block_delta" in body, b"message_stop" in body))
+
+            # 工具调用：tool_use 块必须成形（name/id/input 齐全，stop_reason=tool_use）。
+            tool = {"name": "get_weather", "description": "查询指定城市的当前天气",
+                    "input_schema": {"type": "object",
+                                     "properties": {"city": {"type": "string"}},
+                                     "required": ["city"]}}
+            tpayload = {"model": a.model, "max_tokens": 256, "tools": [tool],
+                        "messages": [{"role": "user", "content": "北京现在天气如何？请调用工具查询。"}]}
+            st, body, _ = http("POST", base + "/v1/messages", key=a.api_key, body=tpayload, timeout=180)
+            try:
+                tj = json.loads(body)
+            except Exception:
+                tj = {}
+            tblocks = [b for b in tj.get("content", []) if b.get("type") == "tool_use"]
+            check("工具调用返回 tool_use 块",
+                  st == 200 and bool(tblocks) and tblocks[0].get("name") == "get_weather"
+                  and bool(tblocks[0].get("id")),
+                  "status=%s stop=%s blocks=%s" % (st, tj.get("stop_reason"), [b.get("type") for b in tj.get("content", [])]))
+
+            # 工具结果回程：把 tool_use 原样喂回（含 tool_result），必须拿到文本收尾。
+            if tblocks:
+                tb = tblocks[0]
+                rpayload = {"model": a.model, "max_tokens": 128, "tools": [tool],
+                            "messages": [
+                                {"role": "user", "content": "北京现在天气如何？请调用工具查询。"},
+                                {"role": "assistant", "content": [tb]},
+                                {"role": "user", "content": [
+                                    {"type": "tool_result", "tool_use_id": tb.get("id"),
+                                     "content": "晴，25℃，湿度 40%"}]},
+                            ]}
+                st, body, _ = http("POST", base + "/v1/messages", key=a.api_key, body=rpayload, timeout=180)
+                ok = st == 200 and b'"text"' in body
+                check("工具结果回程 → 200 且有文本", ok, "status=%s body=%s" % (st, body[:200]))
+            else:
+                check("工具结果回程 → 200 且有文本", False, "上一步没拿到 tool_use，跳过回程")
 
     failed = [n for n, ok, _ in RESULTS if not ok]
     print("=== 汇总：%d 通过 / %d 失败 ===" % (len(RESULTS) - len(failed), len(failed)))
