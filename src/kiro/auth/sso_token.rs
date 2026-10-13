@@ -83,12 +83,20 @@ pub(crate) fn require_sso_refresh_token(refresh: &str) -> anyhow::Result<&str> {
 ///   静默只取第一行会在用户不知情时导入**错误的账号**。
 /// - 超过长度上限 → 拒绝（疑似粘了整页内容，截断会让 whoAmI 返回无法归因的 401）。
 fn sanitize_sso_token(token: &str) -> anyhow::Result<String> {
-    if token.contains('\n') {
+    // 换行两种都拒：\n 与裸 \r（老 Mac / 某些剪贴板路径）同样意味着「粘了多个 token」。
+    // 只查 \n 时带 \r 的串会被当合法值送进 Authorization 头 —— HeaderValue 在**发请求时**
+    // 才构造失败，报错点离根因很远，排障会绕大圈。fail-closed 拒在这里。
+    if token.contains('\n') || token.contains('\r') {
         bail!("SSO Token 含换行——疑似粘贴了多个 Token 或多余内容，请只粘贴一个 Token");
     }
     let t = token.trim();
     if t.is_empty() {
         bail!("SSO Token 不能为空");
+    }
+    // trim 后仍含空白（如「tok1 tok2」中间夹了空格/Tab）：同样 fail-closed —— 带空白的串
+    // 换不出 token，whoAmI 只会回一个无法归因的 401。
+    if t.chars().any(char::is_whitespace) {
+        bail!("SSO Token 含空白字符，请只粘贴一个 Token");
     }
     if t.len() > SSO_TOKEN_MAX_LEN {
         bail!("SSO Token 过长（疑似粘贴了整页内容），请只粘贴 Token 本身");
@@ -351,6 +359,14 @@ async fn poll_for_token(
 
     let interval = interval_secs.max(1);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(POLL_TIMEOUT_SECS);
+    // 单次等待不超过剩余预算：`interval` 直接来自上游 device_authorization 响应、无上限，
+    // 每次请求本身还有 30s 客户端超时 —— 裸 sleep(interval) 会让「总超时
+    // POLL_TIMEOUT_SECS」只是名义值（一次 sleep 就能远远超过它）。取 min 后最坏
+    // 只多出一个在飞请求的时长；正常路径（首轮 200）根本不进这些分支，零影响。
+    let wait = |secs: u64| {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        tokio::time::sleep(Duration::from_secs(secs).min(remaining))
+    };
     loop {
         if tokio::time::Instant::now() >= deadline {
             bail!("SSO Token 导入授权超时（{}s）", POLL_TIMEOUT_SECS);
@@ -377,7 +393,7 @@ async fn poll_for_token(
             Err(e) => {
                 // 网络瞬时错误：等一个间隔重试（与 Kiro-Go 的 continue 同语义）。
                 tracing::debug!("SSO poll token 网络错误(重试): {}", e);
-                tokio::time::sleep(Duration::from_secs(interval)).await;
+                wait(interval).await;
                 continue;
             }
         };
@@ -391,18 +407,24 @@ async fn poll_for_token(
                 .to_string();
             let refresh = require_sso_refresh_token(data["refreshToken"].as_str().unwrap_or(""))?
                 .to_string();
-            let expires_in = data["expiresIn"].as_i64().unwrap_or(0);
+            // expiresIn 上游一般发整数，但个别形态是浮点：只认 as_i64 时浮点静默变 0，
+            // 下游（build_idc_credential_from_sso）按「无过期时间」落盘 → 号一入池就被
+            // 判过期强制刷新一次。整数优先、浮点兜底，仍解析不到才留 0。
+            let expires_in = data["expiresIn"]
+                .as_i64()
+                .or_else(|| data["expiresIn"].as_f64().map(|f| f as i64))
+                .unwrap_or(0);
             return Ok((access, refresh, expires_in));
         }
 
         if status.as_u16() == 400 {
             if text.contains("authorization_pending") || text.contains("AuthorizationPendingException")
             {
-                tokio::time::sleep(Duration::from_secs(interval)).await;
+                wait(interval).await;
                 continue;
             }
             if text.contains("slow_down") || text.contains("SlowDownException") {
-                tokio::time::sleep(Duration::from_secs(interval + 5)).await;
+                wait(interval + 5).await;
                 continue;
             }
             bail!("SSO 授权错误: {}", text);
@@ -417,39 +439,60 @@ async fn poll_for_token(
 /// 响应 `userInfo.email` 取邮箱。请求与业务路径**同构**（复用
 /// `build_usage_limits_request` 的 UA / host / profileArn 规则），失败不阻断导入
 /// ——email 只是展示与幂等判重用，换号本身不依赖它。
+///
+/// ⚠️ region 不能用 SSO region 直接拼 `management.{region}.kiro.dev`：该 host 只有
+/// `us-east-1` / `eu-central-1` 解析得到（其余 region DNS 不通，见
+/// [`crate::kiro::token_manager`] 的 `rest_api_region_candidates` 完整说明）。
+/// 而 email 是 [`find_duplicate_idc_email`] 的唯一判据——解析失败会让同一 portal 账号
+/// 重复导入静默落盘成第二个号（SSO 每次导入换出不同 refreshToken，哈希判重抓不住）。
+/// 故按同一前缀策略探两个可用区，命中其一即返回。
 async fn fetch_account_email(
     access_token: &str,
     region: &str,
     config: &Config,
     proxy: Option<&ProxyConfig>,
 ) -> Option<String> {
-    let base = KiroCredentials {
-        access_token: Some(access_token.to_string()),
-        auth_method: Some("idc".to_string()),
-        region: Some(region.to_string()),
-        auth_region: Some(region.to_string()),
-        ..Default::default()
+    // 前缀策略与 rest_api_region_candidates 一致（eu-* 先试 eu-central-1）。
+    let candidates: [&str; 2] = if region == "eu-central-1" || region.starts_with("eu-") {
+        ["eu-central-1", "us-east-1"]
+    } else {
+        ["us-east-1", "eu-central-1"]
     };
     let client = match build_client(proxy, 30, config.tls_backend) {
         Ok(c) => c,
         Err(_) => return None,
     };
-    let req = crate::kiro::token_manager::build_usage_limits_request(
-        &client, &base, config, access_token, region,
-    );
-    match req.send().await {
-        Ok(resp) if resp.status().is_success() => {
-            let v: serde_json::Value = match resp.json().await {
-                Ok(v) => v,
-                Err(_) => return None,
-            };
-            v["userInfo"]["email"]
-                .as_str()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
+    for cand_region in candidates {
+        let base = KiroCredentials {
+            access_token: Some(access_token.to_string()),
+            auth_method: Some("idc".to_string()),
+            // region 决定 host；auth_region 保留真实 SSO region（仅记录语义）。
+            region: Some(cand_region.to_string()),
+            auth_region: Some(region.to_string()),
+            ..Default::default()
+        };
+        let req = crate::kiro::token_manager::build_usage_limits_request(
+            &client, &base, config, access_token, cand_region,
+        );
+        match req.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                let v: serde_json::Value = match resp.json().await {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let email = v["userInfo"]["email"]
+                    .as_str()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                if email.is_some() {
+                    return email;
+                }
+                // 2xx 但无 email（该区端点可能返回空 userInfo）→ 换另一个区再试。
+            }
+            _ => continue,
         }
-        _ => None,
     }
+    None
 }
 
 /// 完整的 SSO Token 导入流程（7 步）。
@@ -615,6 +658,16 @@ mod tests {
     fn sanitize_accepts_single_line_token() {
         let t = sanitize_sso_token("  eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.abc  ").unwrap();
         assert_eq!(t, "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.abc");
+    }
+
+    #[test]
+    fn sanitize_rejects_cr_and_inner_whitespace() {
+        // 裸 \r（老 Mac 换行）与中间夹空白同样是 fail-closed 目标：这两种形态若放行，
+        // 换 token 请求会在构造 Authorization 头时才失败（或换出无法归因的 401）。
+        assert!(sanitize_sso_token("tok1\rtok2").is_err());
+        assert!(sanitize_sso_token("tok1\r").is_err());
+        assert!(sanitize_sso_token("tok1 tok2").is_err());
+        assert!(sanitize_sso_token("tok\t1").is_err());
     }
 
     #[test]

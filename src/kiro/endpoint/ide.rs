@@ -38,8 +38,12 @@
 //! 在这个对打实验做出来之前，「哪个 host 更抗限流」是**未知**，不是已知。
 //!
 //! region 优先从凭据 `profileArn` 的第 4 段提取（与 Kiro IDE 一致），回退到凭据/config region。
-//! 请求头使用 aws-sdk-js User-Agent 标识。请求体按凭据类型条件注入 `profileArn`
-//! （Enterprise/external_idp 不注入，见 `should_send_profile_arn`）。
+//! 请求头使用 aws-sdk-js User-Agent 标识。请求体的 `profileArn` 注入以
+//! `KiroCredentials::effective_profile_arn` 为**唯一判据**（类型规则集中在该函数，
+//! 本文件不二次判定，防两处漂移）：external_idp 带真实租户 ARN 时**必须注入**
+//! （kiro.dev 迁移后缺了会 400 `profileArn is required`）；api_key 无 ARN 不注入；
+//! idc/social 缺 ARN 走该函数的占位规则。旧注释引用的 `should_send_profile_arn`
+//! 是 Web Portal 专用判据，不是本端点的注入契约（2026-10-14 审计修正）。
 
 use reqwest::RequestBuilder;
 use uuid::Uuid;
@@ -186,12 +190,14 @@ fn inject_profile_arn(request_body: &str, profile_arn: &Option<String>) -> Strin
         if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(request_body) {
             // 用 as_object_mut 而非 `json["profileArn"] = …`：后者是 serde_json 的 IndexMut，
             // 对非对象 JSON（数组/标量）会 panic（"cannot access key ... in JSON"）。
-            // 与 cli.rs 的 inject_cli_agent_fields 同款安全模式：非对象原样透传。
+            // 与 cli.rs 的 inject_cli_agent_fields 同款安全模式：**只有真的插进去了**才
+            // 重序列化返回 —— 非对象 JSON 必须字节级原样透传，绝不因一次无注入的
+            // parse→to_string 往返把 body 压成紧凑形态（空白丢失，破坏透传契约）。
             if let Some(obj) = json.as_object_mut() {
                 obj.insert("profileArn".to_string(), serde_json::Value::String(arn.clone()));
-            }
-            if let Ok(body) = serde_json::to_string(&json) {
-                return body;
+                if let Ok(body) = serde_json::to_string(&json) {
+                    return body;
+                }
             }
         }
     }
@@ -221,6 +227,18 @@ mod tests {
             "arn:aws:codewhisperer:us-east-1:123:profile/ABC"
         );
         assert_eq!(json["conversationState"]["conversationId"], "c1");
+    }
+
+    #[test]
+    fn test_inject_profile_arn_non_object_json_is_byte_identical() {
+        // 非对象 JSON（数组/标量）无处可插 profileArn → 必须**字节级**原样返回。
+        // 旧实现只要 parse 成功就无条件 to_string 重序列化：带空白的输入会被压成紧凑
+        // 形态（下断言即 FAIL），与「非对象原样透传」的契约注释不符。
+        let arn = Some("arn:aws:codewhisperer:us-east-1:1:profile/OWN".to_string());
+        let arr = "[ 1 ,  2 ]";
+        assert_eq!(inject_profile_arn(arr, &arn), arr);
+        let scalar = "  \"x\"  ";
+        assert_eq!(inject_profile_arn(scalar, &arn), scalar);
     }
 
     #[test]

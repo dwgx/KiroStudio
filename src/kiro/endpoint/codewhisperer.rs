@@ -16,7 +16,7 @@
 use reqwest::RequestBuilder;
 
 use super::cli::{
-    cli_user_agent, decorate_cli_mcp, decorate_cli_protocol, inject_cli_agent_fields,
+    cli_user_agent_with, decorate_cli_mcp, decorate_cli_protocol, inject_cli_agent_fields,
     set_origin_kiro_cli,
 };
 use super::{KiroEndpoint, RequestContext};
@@ -49,6 +49,15 @@ impl CodewhispererEndpoint {
         } else {
             format!("q.{region}.amazonaws.com")
         }
+    }
+
+    /// aws-sdk-rust 版 UA（与 `cli` 端点同形状）。
+    ///
+    /// ⚠️ 必须走 `cli_user_agent_with(..., ctx.config.cli_ua_align_real_client)`：
+    /// `decorate_cli_protocol` / `decorate_cli_mcp` 内部按同一开关拆 `x-amz-user-agent`，
+    /// 本端点若恒喂历史形状的串，开开关后两个头会互相矛盾（结构性指纹）。
+    fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
+        cli_user_agent_with(ctx.machine_id, ctx.config.cli_ua_align_real_client)
     }
 }
 
@@ -88,12 +97,12 @@ impl KiroEndpoint for CodewhispererEndpoint {
             ctx,
             self.host(ctx),
             AMZ_TARGET,
-            cli_user_agent(ctx.machine_id),
+            self.user_agent(ctx),
         )
     }
 
     fn decorate_mcp(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
-        decorate_cli_mcp(req, ctx, self.host(ctx), cli_user_agent(ctx.machine_id))
+        decorate_cli_mcp(req, ctx, self.host(ctx), self.user_agent(ctx))
     }
 
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {

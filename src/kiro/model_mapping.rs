@@ -52,15 +52,20 @@ pub(crate) fn wildcard_matches(pattern: &str, model: &str) -> bool {
 ///   不再把 B 递归改写为 C）。理由：链式依赖 HashMap 迭代顺序产生不确定行为，
 ///   且与 deepseek 归一化、overload_fallback_model 叠加后行为不可预测。
 ///   `map_target` 只匹配一次，天然单跳。
+/// - **空目标视为无效规则**：目标为空串/纯空白（配置层不校验空值）时该规则不参与匹配
+///   —— 命中它会把模型名改写成空串（Kiro 路径 `modelId=""`、透传路径顶层 `model=""`），
+///   上游必然 400，比「未命中」更糟。
 /// - 空规则表返回 `None`（零开销，调用方可短路）。
 pub fn map_target(model: &str, rules: &HashMap<String, String>) -> Option<String> {
     if rules.is_empty() {
         return None;
     }
     // 收集所有命中（精确 + 通配），按上述排序规则取最优者。
+    // ⚠️ 空目标在**筛选阶段**剔除（不是选完再判）：否则一个"更长"的空目标规则会遮蔽
+    // 更短的有效规则（如 `claude-opus-5*→""` 挡掉 `claude-*→有效名`）。
     let target = rules
         .iter()
-        .filter(|(k, _)| wildcard_matches(k, model))
+        .filter(|(k, v)| !v.trim().is_empty() && wildcard_matches(k, model))
         .max_by(|(ka, _), (kb, _)| {
             ka.len()
                 .cmp(&kb.len())
@@ -110,6 +115,22 @@ mod tests {
         // 命中但目标与原始名相同（大小写不敏感）→ None，不触发无意义改写。
         let r = rules(&[("claude-haiku-4-5", "CLAUDE-HAIKU-4-5")]);
         assert_eq!(map_target("claude-haiku-4-5", &r), None);
+    }
+
+    #[test]
+    fn test_map_target_blank_target_is_ignored() {
+        // 空/纯空白目标 = 无效规则（配置层不校验空值）：视为未命中，
+        // 绝不把模型名改写成空串（上游必然 400）。
+        let r = rules(&[("claude-opus-5", "")]);
+        assert_eq!(map_target("claude-opus-5", &r), None);
+        let r2 = rules(&[("claude-*", "   ")]);
+        assert_eq!(map_target("claude-opus-5", &r2), None);
+        // 空目标不得遮蔽更短的有效规则（筛选阶段剔除，而非选完再判）。
+        let r3 = rules(&[("claude-opus-5*", ""), ("claude-*", "claude-sonnet-4.5")]);
+        assert_eq!(
+            map_target("claude-opus-5", &r3),
+            Some("claude-sonnet-4.5".to_string())
+        );
     }
 
     #[test]

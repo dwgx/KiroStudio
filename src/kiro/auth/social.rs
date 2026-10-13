@@ -172,7 +172,7 @@ async fn run_callback_server(
 
     // 只等待一次成功的回调，或关闭信号
     let mut tx = Some(tx);
-    loop {
+    'serve: loop {
         let (mut stream, _addr) = tokio::select! {
             result = listener.accept() => match result {
                 Ok(s) => s,
@@ -203,10 +203,20 @@ async fn run_callback_server(
                 // 超限仍无换行：当作畸形请求，用已读部分兜底（后续解析会失败并回 404）
                 break String::from_utf8_lossy(&acc).into_owned();
             }
-            match stream.read(&mut chunk).await {
-                Ok(0) => break String::from_utf8_lossy(&acc).into_owned(), // 对端关闭
-                Ok(n) => acc.extend_from_slice(&chunk[..n]),
-                Err(_) => break String::new(),
+            // 读等待期间也必须能被关闭信号打断：否则一个连上却不发请求行的对端
+            // （slowloris / 浏览器预连接）会让本任务卡在 read 里，`ServerHandle` drop
+            // 之后端口迟迟不释放 —— 回调端口是固定候选表，泄漏几次上号就无端口可用。
+            // tokio 的 read 是取消安全（cancel-safe）的：select 丢掉这个分支不丢已读字节。
+            tokio::select! {
+                r = stream.read(&mut chunk) => match r {
+                    Ok(0) => break String::from_utf8_lossy(&acc).into_owned(), // 对端关闭
+                    Ok(n) => acc.extend_from_slice(&chunk[..n]),
+                    Err(_) => break String::new(),
+                },
+                _ = &mut shutdown_rx => {
+                    tracing::info!("Social 回调服务器收到关闭信号，端口 {} 已释放", port);
+                    break 'serve;
+                }
             }
         };
         let first_line = first_line.as_str();

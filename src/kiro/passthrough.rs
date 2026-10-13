@@ -420,11 +420,18 @@ pub async fn forward(
         let err_body = err_diag_string(&err_body_raw);
         // 日志按长度截断，避免超长 body 刷爆日志（诊断只需要开头那段 message/reason）。
         let peek: String = err_body.chars().take(400).collect();
+        // 日志脱敏：上游错误体可能回显我们刚附上的 api_key（少数中转站/网关把请求头
+        // 写进错误页）—— 那是**存储凭据**，绝不能进网关日志。只脱日志这一份；
+        // 返回给调用侧的 `err_body` 保持原文（failover 分类靠它做子串匹配）。
+        let peek = match cred.api_key.as_deref().filter(|k| !k.is_empty()) {
+            Some(key) => peek.replace(key, "<redacted-api-key>"),
+            None => peek,
+        };
         tracing::warn!(
             status = status.as_u16(),
             base_url = %base,
             upstream_error = %peek,
-            "[透传] 上游返回非 2xx —— 上游错误原文（供分类：额度/模型/请求体）"
+            "[透传] 上游返回非 2xx —— 上游错误原文（供分类：额度/模型/请求体；api_key 已脱敏）"
         );
         // body 已被消费，只能重新构造响应回给客户端（内容逐字节保持上游原文）。
         let resp = build_error_passthrough_response(status, &content_type, &upstream_headers, err_body_raw);
@@ -582,16 +589,27 @@ pub async fn fetch_upstream_models(
     let mut candidates: Vec<String> = Vec::new();
     {
         let mut roots: Vec<String> = vec![base.to_string()];
+        // 剥离的守卫 `contains("://")`：剥完必须仍是合法 `scheme://…` 形态。base 是
+        // `https://anthropic` / `https://v1` 这种畸形值时，朴素剥离会把 authority 当路径
+        // 剥成 `https:/`，再拼出无法解析的候选 URL 去请求（白打一轮，错误信息也难读）。
         // 剥 /anthropic（DeepSeek 类：anthropic 兼容层无模型列表，OpenAI 层有）
         if let Some(stripped) = base.strip_suffix("/anthropic") {
-            roots.push(stripped.to_string());
+            if stripped.contains("://") {
+                roots.push(stripped.to_string());
+            }
         }
-        // 剥 /v1（OpenAI 兼容层常见挂载点：/v1 下只有 chat/completions，models 在根）
-        if base.ends_with("/v1") {
-            roots.push(base.trim_end_matches("/v1").to_string());
+        // 剥 /v1（OpenAI 兼容层常见挂载点：/v1 下只有 chat/completions，models 在根）。
+        // 用 strip_suffix 而非 trim_end_matches：后者把结尾**连续重复**的 /v1 全部剥掉
+        //（`…/v1/v1` → 直接剥到根，而不是剥一层），strip_suffix 只剥一层。
+        if let Some(stripped) = base.strip_suffix("/v1") {
+            if stripped.contains("://") {
+                roots.push(stripped.to_string());
+            }
         }
         if let Some(stripped) = base.strip_suffix("/anthropic/v1") {
-            roots.push(stripped.to_string());
+            if stripped.contains("://") {
+                roots.push(stripped.to_string());
+            }
         }
         // 每个根生成两种形态；先根路径（多数 OpenAI 上游 /models 就在根），再 /v1/models。
         for root in roots {

@@ -22,7 +22,7 @@
 use reqwest::RequestBuilder;
 
 use super::cli::{
-    cli_user_agent, decorate_cli_mcp, decorate_cli_protocol, inject_cli_agent_fields,
+    cli_user_agent_with, decorate_cli_mcp, decorate_cli_protocol, inject_cli_agent_fields,
     set_origin_kiro_cli,
 };
 use super::{KiroEndpoint, RequestContext};
@@ -49,6 +49,15 @@ impl AmazonqEndpoint {
 
     fn host(&self, ctx: &RequestContext<'_>) -> String {
         format!("q.{}.amazonaws.com", self.api_region(ctx))
+    }
+
+    /// aws-sdk-rust 版 UA（与 `cli` 端点同形状）。
+    ///
+    /// ⚠️ 必须走 `cli_user_agent_with(..., ctx.config.cli_ua_align_real_client)`：
+    /// `decorate_cli_protocol` / `decorate_cli_mcp` 内部按同一开关拆 `x-amz-user-agent`，
+    /// 本端点若恒喂历史形状的串，开开关后两个头会互相矛盾（结构性指纹）。
+    fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
+        cli_user_agent_with(ctx.machine_id, ctx.config.cli_ua_align_real_client)
     }
 }
 
@@ -88,12 +97,12 @@ impl KiroEndpoint for AmazonqEndpoint {
             ctx,
             self.host(ctx),
             AMZ_TARGET,
-            cli_user_agent(ctx.machine_id),
+            self.user_agent(ctx),
         )
     }
 
     fn decorate_mcp(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
-        decorate_cli_mcp(req, ctx, self.host(ctx), cli_user_agent(ctx.machine_id))
+        decorate_cli_mcp(req, ctx, self.host(ctx), self.user_agent(ctx))
     }
 
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
@@ -214,5 +223,39 @@ mod tests {
             .find(gate.as_str())
             .expect("origin 改写必须由 config 开关把门");
         assert!(g < o, "开关判定必须排在 set_origin_kiro_cli 调用之前");
+    }
+
+    /// 行为测试（补齐审计缺口）：上面的顺序守卫只做**源码字符串搜索**，从未真正执行过
+    /// origin 改写分支 —— 开关开着时改写到底发生没发生、删字段是否跟着删，没有一条断言
+    /// 覆盖。这里真调 `transform_api_body`：origin 全量改写成 KIRO_CLI +
+    /// `agentContinuationId` / history `modelId` 被删除（半套变更的形状是"只删不换"，
+    /// 必须能 FAILED）。
+    #[test]
+    fn origin_rewrite_runs_when_enabled() {
+        use super::super::{KiroEndpoint, RequestContext};
+        use crate::kiro::model::credentials::KiroCredentials;
+        use crate::model::config::Config;
+
+        let mut cred = KiroCredentials::default();
+        cred.kiro_api_key = Some("ksk_test".to_string());
+        cred.cli_origin_kiro_cli = Some(true);
+        let config = Config::default();
+        let ctx = RequestContext {
+            credentials: &cred,
+            token: "ksk_test",
+            machine_id: "mid",
+            config: &config,
+            is_1m: false,
+        };
+
+        let body = r#"{"conversationState":{"agentContinuationId":"x","history":[{"userInputMessage":{"origin":"AI_EDITOR","modelId":"m"}}]},"origin":"AI_EDITOR"}"#;
+        let out = AmazonqEndpoint::new().transform_api_body(body, &ctx);
+        assert!(out.contains("KIRO_CLI"), "origin 应改写为 KIRO_CLI: {out}");
+        assert!(!out.contains("AI_EDITOR"), "不得残留 AI_EDITOR: {out}");
+        assert!(
+            !out.contains("agentContinuationId"),
+            "agentContinuationId 应被删除: {out}"
+        );
+        assert!(!out.contains("modelId"), "history modelId 应被删除: {out}");
     }
 }

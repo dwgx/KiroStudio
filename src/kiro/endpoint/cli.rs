@@ -59,7 +59,7 @@ impl CliEndpoint {
 ///
 /// 取值来源（五方实读）：GreyGunG `0.1.16551`（最新）、ZyphrZero / Foxfishc / M-JYuan
 /// `0.1.14474`（Foxfishc 标注抓包日期 2026-05-12 / `kiro-cli 2.3.0`）。取最新那个。
-/// 注意真实客户端用 `/` 分隔，而本仓历史形状用 `#1.28.3` —— 见 `cli_user_agent`。
+/// 注意真实客户端用 `/` 分隔，而本仓历史形状用 `#1.28.3` —— 见 `cli_user_agent_with`。
 const REAL_CLI_STREAMING_API_VER: &str = "0.1.16551";
 
 /// CLI 协议 UA（`app/AmazonQ-For-CLI` 标识），`cli` / `cli-runtime` / `codewhisperer` /
@@ -82,11 +82,6 @@ pub(crate) fn cli_user_agent_with(machine_id: &str, align_real_client: bool) -> 
             "aws-sdk-rust/1.0.0 ua/2.1 os/other lang/rust api/codewhispererstreaming#1.28.3 m/E app/AmazonQ-For-CLI md/appVersion-1.28.3-{machine_id}"
         )
     }
-}
-
-/// 兼容旧调用点：等价于 `cli_user_agent_with(machine_id, false)`（历史形状）。
-pub(crate) fn cli_user_agent(machine_id: &str) -> String {
-    cli_user_agent_with(machine_id, false)
 }
 
 /// `x-amz-user-agent` 头的值。
@@ -161,14 +156,24 @@ pub(crate) fn decorate_cli_protocol(
 }
 
 /// CLI 协议 MCP 请求装饰（与 [`decorate_cli_protocol`] 同款复用；MCP 不走 X-Amz-Target 路由）。
+///
+/// UA 拆串与 [`decorate_cli_protocol`] 同判据（`cli_ua_align_real_client`）：同一凭据的
+/// MCP 与 API 两条路径必须同指纹 —— 否则开了对齐开关后，MCP 一侧仍是「两个头同串」的
+/// 历史形态，与 API 侧（已拆）结构性不一致，而这个差异恰好是四家参考实现都指出的
+/// 「比版本号更容易被识别」的那类。MCP 路径刻意**不发** optout / agent-mode
+/// （与 IDE 端点 decorate_mcp 同口径：那两个头是对话语义，MCP 不适用）。
 pub(crate) fn decorate_cli_mcp(
     req: RequestBuilder,
     ctx: &RequestContext<'_>,
     host: String,
     ua: String,
 ) -> RequestBuilder {
+    let x_amz_ua = cli_x_amz_user_agent(ctx.config.cli_ua_align_real_client);
     req.header("tokentype", "API_KEY")
-        .header("x-amz-user-agent", &ua)
+        .header(
+            "x-amz-user-agent",
+            x_amz_ua.as_deref().unwrap_or(ua.as_str()),
+        )
         .header("user-agent", &ua)
         .header("host", host)
         .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
@@ -350,8 +355,8 @@ pub(crate) fn set_origin_kiro_cli(request_body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CliEndpoint, REAL_CLI_STREAMING_API_VER, cli_user_agent, cli_user_agent_with,
-        cli_x_amz_user_agent, inject_cli_agent_fields, set_origin_kiro_cli,
+        CliEndpoint, REAL_CLI_STREAMING_API_VER, cli_user_agent_with, cli_x_amz_user_agent,
+        inject_cli_agent_fields, set_origin_kiro_cli,
     };
     use serde_json::Value;
 
@@ -359,11 +364,11 @@ mod tests {
     ///
     /// 这条是承重的：默认关意味着线上行为一个比特都不能变，否则「加开关」本身就成了
     /// 一次未经 A/B 的全池切换 —— 那正是这个开关要避免的事。
+    /// （旧的 `cli_user_agent` 包装已随兄弟端点迁移删除，历史形状直接断言字面量。）
     #[test]
     fn ua_switch_off_is_byte_identical_to_legacy() {
         let mid = "test-machine-id";
-        assert_eq!(cli_user_agent_with(mid, false), cli_user_agent(mid));
-        let legacy = cli_user_agent(mid);
+        let legacy = cli_user_agent_with(mid, false);
         assert!(legacy.contains("api/codewhispererstreaming#1.28.3"), "{legacy}");
         assert!(legacy.contains(" m/E "), "历史形状用 m/E：{legacy}");
         // 关闭时 x-amz-user-agent 不拆串（返回 None ⇒ 调用方沿用 user-agent 那一串）。
@@ -401,6 +406,92 @@ mod tests {
             aligned.contains("md/appVersion"),
             "user-agent 带 appVersion：{aligned}"
         );
+    }
+
+    /// ⭐ 守卫：`cli_ua_align_real_client` 开启时，**四个** CLI 协议端点（API 与 MCP 两条
+    /// 路径）的两个 UA 头必须同时是对齐后的形状。
+    ///
+    /// 曾有的缺口：只有 `cli` 端点把开关传进 UA，cli-runtime / codewhisperer / amazonq 恒喂
+    /// 历史形状 → 开开关后 user-agent（`#1.28.3`/`m/E`）与 x-amz-user-agent（真实拆串）
+    /// 互相矛盾；MCP 侧 decorate_cli_mcp 也不拆串。两者都是结构性指纹，而彼时测试只覆盖
+    /// `CliEndpoint::user_agent`，完全看不出来。删掉任一端点的
+    /// `ctx.config.cli_ua_align_real_client` 传参 / 把 decorate_cli_mcp 的拆串改回同一串
+    /// → 本测试必须 FAILED。
+    #[test]
+    fn all_cli_protocol_endpoints_share_aligned_ua_pairing() {
+        use super::super::{
+            KiroEndpoint, RequestContext, amazonq::AmazonqEndpoint, cli_runtime::CliRuntimeEndpoint,
+            codewhisperer::CodewhispererEndpoint,
+        };
+        use crate::kiro::model::credentials::KiroCredentials;
+        use crate::model::config::Config;
+
+        let mut cred = KiroCredentials::default();
+        cred.kiro_api_key = Some("ksk_test".to_string());
+        cred.region = Some("us-east-1".to_string());
+        let mut config = Config::default();
+        config.cli_ua_align_real_client = true;
+        let ctx = RequestContext {
+            credentials: &cred,
+            token: "ksk_test",
+            machine_id: "mid",
+            config: &config,
+            is_1m: false,
+        };
+
+        let endpoints: Vec<std::sync::Arc<dyn KiroEndpoint>> = vec![
+            std::sync::Arc::new(CliEndpoint::new()),
+            std::sync::Arc::new(CliRuntimeEndpoint::new()),
+            std::sync::Arc::new(CodewhispererEndpoint::new()),
+            std::sync::Arc::new(AmazonqEndpoint::new()),
+        ];
+        let client = reqwest::Client::new();
+        let expected_ua = cli_user_agent_with("mid", true);
+        let expected_x = cli_x_amz_user_agent(true).expect("开启时必须给出拆分后的串");
+
+        let header_of = |req: &reqwest::Request, name: &str| -> String {
+            req.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string()
+        };
+        for ep in endpoints {
+            // API 路径
+            let req = ep
+                .decorate_api(client.post("http://127.0.0.1/"), &ctx)
+                .build()
+                .expect("请求应能构建");
+            assert_eq!(
+                header_of(&req, "user-agent"),
+                expected_ua,
+                "{} 的 user-agent 未对齐真实形状",
+                ep.name()
+            );
+            assert_eq!(
+                header_of(&req, "x-amz-user-agent"),
+                expected_x,
+                "{} 的 x-amz-user-agent 未拆串",
+                ep.name()
+            );
+            // MCP 路径：同判据（decorate_cli_mcp），不得与 API 侧漂移。
+            let req_mcp = ep
+                .decorate_mcp(client.post("http://127.0.0.1/"), &ctx)
+                .build()
+                .expect("请求应能构建");
+            assert_eq!(
+                header_of(&req_mcp, "user-agent"),
+                expected_ua,
+                "{} 的 MCP user-agent 未对齐真实形状",
+                ep.name()
+            );
+            assert_eq!(
+                header_of(&req_mcp, "x-amz-user-agent"),
+                expected_x,
+                "{} 的 MCP x-amz-user-agent 未拆串",
+                ep.name()
+            );
+        }
     }
 
     /// ⭐ 守卫：CLI 协议两条路径（API/MCP）的 `amz-sdk-request` 头必须声明 max 为 3，
