@@ -4046,8 +4046,14 @@ impl KiroProvider {
                         .token_manager
                         .report_model_invalid(ctx.id, model.as_deref());
                     if !has_available_for_model {
+                        // 机器可读标记 `model_unsupported_by_pool=1`：本 bail 正是
+                        // `anthropic::handlers` 的 `model_unsupported` 分支（404 not_found_error，
+                        // 永久态、不带 Retry-After）等待的生产者。**此前缺这个标记** ⇒ 落
+                        // 502「未识别错误」兜底，客户端（Claude Code）把 502 当服务端故障原样重发。
+                        // 实测 2026-10-14：免费档号池请求 claude-opus-5 即此路径（3 号全
+                        // INVALID_MODEL_ID，客户端只看到不透明 502）。
                         last_error = Some(anyhow::anyhow!(
-                            "{} API 请求失败（模型 {:?} 对所有号均 INVALID_MODEL_ID，判定模型无效）: {} {}",
+                            "{} API 请求失败（模型 {:?} 对所有号均 INVALID_MODEL_ID，判定模型无效） model_unsupported_by_pool=1: {} {}",
                             api_type,
                             model.as_deref().unwrap_or(""),
                             status,
