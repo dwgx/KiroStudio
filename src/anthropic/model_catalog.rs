@@ -620,6 +620,61 @@ fn strip_1m_suffix(model_lower: &str) -> (String, bool) {
     }
 }
 
+/// 剥掉非 `[1m]` 的窗口后缀（`[\d+[mk]]$`，如 `[200k]`/`[2m]`）与 `-latest` 别名。
+///
+/// 为什么需要：生态里客户端会带窗口后缀（kiro-lb 的 `reContextSuffix = (?i)\[\d+[mk]\]$`
+/// 同时剥 `[1m]` 与 `[200k]`），也会用 `-latest` 指代当前版本；本仓此前只认 `[1m]`
+/// （它带「请求 1M 变体」语义，故由 [`strip_1m_suffix`] 单独处理），其余形态落到「未识别」
+/// 分支，客户端只能吃 400。
+///
+/// 保守边界：只剥**行尾**且形态严格匹配的后缀（`[` + 至少 1 位数字 + `m`/`k` + `]`），
+/// 非 ASCII 一律不动（防字节切片误伤多字节字符）。不做其它改写——"归一过宽误吞"是本表
+/// 已知风险（见文件头 §3）。
+fn strip_extra_suffixes(model_lower: &str) -> String {
+    let mut out = model_lower.trim().to_string();
+    if out.ends_with(']') {
+        if let Some(open) = out.rfind('[') {
+            let inner = &out[open + 1..out.len() - 1];
+            if inner.len() >= 2 && inner.is_ascii() {
+                let (num, unit) = inner.split_at(inner.len() - 1);
+                if num.chars().all(|c| c.is_ascii_digit())
+                    && matches!(unit, "m" | "k" | "M" | "K")
+                {
+                    out.truncate(open);
+                }
+            }
+        }
+    }
+    if let Some(base) = out.strip_suffix("-latest") {
+        out = base.to_string();
+    }
+    out
+}
+
+/// `claude-4.5-opus`（版本在前、家族在后）→ `claude-opus-4.5`。
+///
+/// 生态里确有这种写法（kiro-lb resolver 的 inverted 分支，见 new-batch.md §2.4#3）。
+///
+/// ## 只认**点形态**版本，横线形态一律不碰
+///
+/// `claude-3-5-sonnet-20241022` 是**官方 3.x 的合法名**（版本在前、家族在后，与"反转"
+/// 同形）——本仓靠 legacy 近似路径解析它。若把横线形态也当反转改写（`claude-3-5-sonnet`
+/// → `claude-sonnet-3.5`）会当场打碎这条合法名（本实现的第一版就踩了这个坑，全量测试
+/// 三个用例红）。故只认 `claude-<major>.<minor>-<family>` 这一种**官方不产出**的形态。
+fn fix_inverted_family(model_lower: &str) -> Option<String> {
+    const FAMILIES: [&str; 3] = ["opus", "sonnet", "haiku"];
+    let rest = model_lower.strip_prefix("claude-")?;
+    let (ver, tail) = match rest.split_once('-')? {
+        (v, t) if v.contains('.') => (v.to_string(), t),
+        _ => return None,
+    };
+    let family = FAMILIES
+        .iter()
+        .find(|f| tail == **f || tail.starts_with(&format!("{f}-")))?;
+    let suffix = &tail[family.len()..];
+    Some(format!("claude-{family}-{ver}{suffix}"))
+}
+
 /// 从原始模型名剥离受控的 `-thinking` 后缀，返回 (去后缀名, 是否带 thinking)。
 fn strip_thinking(model_lower: &str) -> (String, bool) {
     if let Some(base) = model_lower.strip_suffix("-thinking") {
@@ -764,7 +819,10 @@ pub fn resolve(model: &str) -> Option<Resolved> {
     let model = strip_path_segments(model);
     let lower = model.to_ascii_lowercase();
     let (base_name, requested_1m) = strip_1m_suffix(&lower);
-    // 用剥掉 [1m] 的名字走既有全流程(精确/thinking/结构化)。
+    // 其余窗口后缀（`[200k]`/`[2m]`）与 `-latest` 别名：生态客户端常用，剥掉再走全流程
+    // （`[1m]` 已在上一行单独处理 —— 它带「请求 1M 变体」语义，不能混在一起剥）。
+    let base_name = strip_extra_suffixes(&base_name);
+    // 用剥掉后缀的名字走既有全流程(精确/thinking/结构化)。
     let mut resolved = resolve_inner(&base_name)?;
     if requested_1m {
         if resolved.spec.supports_1m {
@@ -798,6 +856,9 @@ fn strip_path_segments(model: &str) -> &str {
 /// 由外层 [`resolve`] 据 supports_1m 回填。
 fn resolve_inner(model: &str) -> Option<Resolved> {
     let raw_lower = model.to_ascii_lowercase();
+    // 0) 反转形态（`claude-4.5-opus` → `claude-opus-4.5`）：先改写回标准形态再走全流程。
+    //    只改严格匹配的整串，其余原样（见 fix_inverted_family 的边界说明）。
+    let raw_lower = fix_inverted_family(&raw_lower).unwrap_or(raw_lower);
     let idx = alias_index();
 
     // 1) 原名精确匹配(主路径，无告警)。
@@ -1009,6 +1070,71 @@ mod tests {
         assert_eq!(kid(""), None);
         // models/ 前缀但不是路径（模型名恰以 models/ 开头）——按路径剥除处理是宽容而非拒绝。
         assert_eq!(kid("models/"), None, "空段不 panic 且不命中");
+    }
+
+    /// P2-11：非 `[1m]` 的窗口后缀与 `-latest` 别名（生态客户端常用写法）。
+    #[test]
+    fn test_resolve_strips_extra_window_suffix_and_latest() {
+        // `[200k]` / `[2m]` 与 `[1m]` 同款剥除（`[1m]` 仍走自己的语义分支）。
+        assert_eq!(kid("claude-opus-4.6[200k]"), Some("claude-opus-4.6"));
+        assert_eq!(kid("claude-sonnet-4.5[2m]"), Some("claude-sonnet-4.5"));
+        assert_eq!(kid("claude-opus-4.6[1m]"), Some("claude-opus-4.6"));
+        assert_eq!(kid("models/claude-opus-4.6[200k]"), Some("claude-opus-4.6"));
+        // `-latest` 别名
+        assert_eq!(kid("claude-opus-4.6-latest"), Some("claude-opus-4.6"));
+        // 非 ASCII / 形态不符：**本函数**一律不动（防误吞；此处直测剥离函数本身，
+        // 因为上层结构化回退对这些串仍能解析出正确模型，掩盖剥离是否越界）。
+        assert_eq!(
+            strip_extra_suffixes("claude-opus-4.6[宽]"),
+            "claude-opus-4.6[宽]",
+            "非 ASCII 后缀不得剥（防字节切片误伤）"
+        );
+        assert_eq!(
+            strip_extra_suffixes("claude-opus-4.6[k]"),
+            "claude-opus-4.6[k]",
+            "只有单位没数字不剥"
+        );
+        assert_eq!(
+            strip_extra_suffixes("claude-opus-4.6[latest]"),
+            "claude-opus-4.6[latest]",
+            "非数字不剥"
+        );
+        assert_eq!(
+            strip_extra_suffixes("claude-opus-4.6[200k]"),
+            "claude-opus-4.6"
+        );
+        assert_eq!(
+            strip_extra_suffixes("claude-opus-4.6-latest"),
+            "claude-opus-4.6"
+        );
+    }
+
+    /// P2-11：反转形态 `claude-<major>.<minor>-<family>` → 标准形态。
+    #[test]
+    fn test_resolve_fixes_inverted_family() {
+        assert_eq!(kid("claude-4.5-opus"), Some("claude-opus-4.5"));
+        assert_eq!(kid("claude-4.5-haiku"), Some("claude-haiku-4.5"));
+        // 标准形态不受影响（改写只在整串匹配反转形态时发生）
+        assert_eq!(kid("claude-opus-4.5"), Some("claude-opus-4.5"));
+        // 家族名后面还有别的段（`claude-4.5-opus-thinking`）→ 后缀保留，仍能命中
+        assert_eq!(kid("claude-4.5-opus-thinking"), Some("claude-opus-4.5"));
+        // 🔴 官方 3.x 合法名（`claude-3-5-sonnet-*` / `claude-3-7-sonnet-*`）与反转同形，
+        // 绝不能被改写——本实现第一版就是在这里打碎了三条例可用例。
+        assert_eq!(
+            fix_inverted_family("claude-3-5-sonnet-20241022"),
+            None,
+            "官方 3.x 名不得被当反转改写"
+        );
+        assert_eq!(fix_inverted_family("claude-3-7-sonnet"), None);
+        assert!(
+            kid("claude-3-5-sonnet-20241022").is_some(),
+            "官方 3.x 名必须仍能解析"
+        );
+        // 其余不匹配形态原样
+        assert_eq!(fix_inverted_family("claude-opus-4.5"), None);
+        assert_eq!(fix_inverted_family("claude-4.5"), None);
+        assert_eq!(fix_inverted_family("gpt-4.5-opus"), None);
+        assert_eq!(fix_inverted_family("claude-x-opus"), None);
     }
 
     #[test]
