@@ -165,6 +165,99 @@
         );
     }
 
+    /// `developer`（OpenAI 的 system 等价角色）同样并进系统块，不降级成 user 轮次。
+    /// 对齐 kiro-lb 的 NormalizeRoles（new-batch.md §2.4#4）。
+    #[test]
+    fn test_build_history_promotes_developer_role() {
+        use crate::anthropic::types::Message as ClientMessage;
+        let req = MessagesRequest {
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                ClientMessage {
+                    role: "developer".to_string(),
+                    content: serde_json::json!("Always use rustfmt."),
+                },
+                ClientMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("hi"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let history = build_history(
+            &req,
+            &req.messages,
+            "claude-sonnet-4.5",
+            &mut HashMap::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let Message::User(u) = &history[0] else {
+            panic!("首条应为 system 注入的 user");
+        };
+        assert!(
+            u.user_input_message.content.contains("Always use rustfmt."),
+            "messages[].role=developer 必须并进系统块: {}",
+            u.user_input_message.content
+        );
+    }
+
+    /// 未知 role 降级为 user：内容保留（不再静默丢），也不报错。
+    #[test]
+    fn test_build_history_degrades_unknown_role_to_user() {
+        use crate::anthropic::types::Message as ClientMessage;
+        let req = MessagesRequest {
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                ClientMessage {
+                    role: "weird-role".to_string(),
+                    content: serde_json::json!("keep me"),
+                },
+                ClientMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("hi"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let history = build_history(
+            &req,
+            &req.messages,
+            "claude-sonnet-4.5",
+            &mut HashMap::new(),
+            &mut Vec::new(),
+        )
+        .expect("未知 role 不得报错（对齐生态实现：降级而非 422）");
+        let Message::User(u) = &history[0] else {
+            panic!("未知 role 应降级成 user 轮次");
+        };
+        assert!(
+            u.user_input_message.content.contains("keep me"),
+            "未知 role 的内容不得被静默丢弃: {}",
+            u.user_input_message.content
+        );
+        // 末条 user 消息是**当前轮**（不进 history），故只断言它没把未知 role 的内容挤掉。
+        assert!(
+            !u.user_input_message.content.contains("hi"),
+            "当前轮不应被并进历史首条: {}",
+            u.user_input_message.content
+        );
+    }
+
     #[test]
     fn test_billing_header_non_matching_untouched() {
         // 保守性：非归因头开头的 system 内容不应被改动

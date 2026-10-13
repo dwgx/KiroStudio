@@ -1709,6 +1709,21 @@ fn message_plain_text(msg: &super::types::Message) -> String {
     }
 }
 
+/// 未知 role 的告警去重门：同一 role 只告警一次。
+///
+/// 与 `src/openai/convert.rs` 的 `log_once` 同一理由（那边有完整注释）：这些日志在
+/// **每请求热路径**上，某个客户端固定发一种未知 role 时逐请求记一行会把面板读的
+/// 内存日志环刷爆，反而盖掉它本该暴露的信息；而它的用途只是**拿样本**。
+/// key 空间 = 客户端可能发的 role 名集合（极小），不做淘汰。
+fn log_unknown_role_once(role: &str) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{LazyLock, Mutex};
+    static SEEN: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+    // 锁中毒（某测试线程 panic）不该让可观测性连带失效 → 取回内层集合继续用。
+    let mut guard = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    guard.insert(role.to_string())
+}
+
 /// 构建历史消息
 ///
 /// # Arguments
@@ -1769,12 +1784,14 @@ fn build_history(
 
     // Claude Code / 部分客户端把 system 放在 messages[].role=system，旧循环静默丢。
     // 对齐 jwadow/kiro-gateway #271：并进系统块，不当作用户轮次。
+    // `developer` 是 OpenAI 的 system 等价角色（kiro-lb 的 NormalizeRoles 同样两者并收，
+    // 见 new-batch.md §2.4#4）—— 同一路径并入，否则它的内容会被下面降级成 user 轮次。
     let history_end_index_for_system = messages.len().saturating_sub(1);
     // 同款分流：历史里累积的 token 预算提醒不进 history[0]（每轮 +1 块的漂移源），
     // 收进 dynamic_system 由调用方放当前消息开头。
     let mut extra_kept: Vec<String> = Vec::new();
     for i in 0..history_end_index_for_system {
-        if messages[i].role != "system" {
+        if messages[i].role != "system" && messages[i].role != "developer" {
             continue;
         }
         let text = message_plain_text(&messages[i]);
@@ -1871,6 +1888,25 @@ fn build_history(
             }
             // 累积 assistant 消息（支持连续多条）
             assistant_buffer.push(msg);
+        } else if msg.role != "system" && msg.role != "developer" {
+            // 未知 role 降级为 user（对齐 kiro-lb 的 NormalizeRoles，见 new-batch.md §2.4#4）：
+            // 既不 422，也不静默丢内容 —— 静默丢会让客户端的指令凭空消失，线上只能看到
+            // 「模型没听话」，无法归因。
+            //
+            // system/developer 必须排除：它们已在上方并进系统块，走这里会让同一段文本
+            // 既进系统提示、又当用户轮次，重复出现。
+            if log_unknown_role_once(&msg.role) {
+                tracing::warn!(
+                    role = %msg.role,
+                    "消息 role 未知，按 user 处理（仅首次告警：热路径逐请求记会刷爆日志环）"
+                );
+            }
+            if !assistant_buffer.is_empty() {
+                let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
+                history.push(Message::Assistant(merged));
+                assistant_buffer.clear();
+            }
+            user_buffer.push(msg);
         }
     }
 
