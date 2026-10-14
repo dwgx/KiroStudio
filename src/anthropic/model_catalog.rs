@@ -629,7 +629,9 @@ fn strip_1m_suffix(model_lower: &str) -> (String, bool) {
 ///
 /// 保守边界：只剥**行尾**且形态严格匹配的后缀（`[` + 至少 1 位数字 + `m`/`k` + `]`），
 /// 非 ASCII 一律不动（防字节切片误伤多字节字符）。不做其它改写——"归一过宽误吞"是本表
-/// 已知风险（见文件头 §3）。
+/// 已知风险（形态严格是刻意的：宁可漏剥，不可误吞）。
+/// 本函数不做迭代（一次调用最多剥一个窗口后缀 + 一个 `-latest`）；后缀可叠加
+/// （`[200k]-latest`），由调用方 [`resolve`] 迭代到不动点。
 fn strip_extra_suffixes(model_lower: &str) -> String {
     let mut out = model_lower.trim().to_string();
     if out.ends_with(']') {
@@ -665,7 +667,12 @@ fn fix_inverted_family(model_lower: &str) -> Option<String> {
     const FAMILIES: [&str; 3] = ["opus", "sonnet", "haiku"];
     let rest = model_lower.strip_prefix("claude-")?;
     let (ver, tail) = match rest.split_once('-')? {
-        (v, t) if v.contains('.') => (v.to_string(), t),
+        // 版本段必须是「ASCII 数字 + 点」形态（`4.5`）——`4.宽`/`x.y` 这类垃圾段不得被
+        // 改写成假名（改了也查不到，只会把 family-default 告警里的请求名带偏；
+        // "非 ASCII / 非数字段不得改写"是本表负例清单）。
+        (v, t) if v.contains('.') && v.bytes().all(|b| b.is_ascii_digit() || b == b'.') => {
+            (v.to_string(), t)
+        }
         _ => return None,
     };
     let family = FAMILIES
@@ -827,7 +834,8 @@ fn allow_unknown_version() -> bool {
 
 /// 解析客户端模型名 → CATALOG spec + 命中方式。这是**唯一**的模型识别入口。
 ///
-/// 先剥 `[1m]` 后缀(若有),用剥后名走完整解析,再据 spec.supports_1m 决定最终 is_1m:
+/// 先剥后缀链（`[1m]` 与窗口后缀/`-latest`，迭代到不动点），用剥后名走完整解析，
+/// 再据 spec.supports_1m 决定最终 is_1m:
 /// spec 支持 → is_1m=true(触发 beta 头);spec 不支持 → 忽略后缀 + 告警(不拒绝,更宽容)。
 pub fn resolve(model: &str) -> Option<Resolved> {
     // 路径段归一（sub2api 移植，2026-08-15）：OpenRouter/Claude Code 类客户端会发
@@ -836,10 +844,27 @@ pub fn resolve(model: &str) -> Option<Resolved> {
     // ⚠️ 放在 `[1m]` 剥除之前（路径段可能带 `[1m]`：`models/claude-opus-5[1m]`）。
     let model = strip_path_segments(model);
     let lower = model.to_ascii_lowercase();
-    let (base_name, requested_1m) = strip_1m_suffix(&lower);
-    // 其余窗口后缀（`[200k]`/`[2m]`）与 `-latest` 别名：生态客户端常用，剥掉再走全流程
-    // （`[1m]` 已在上一行单独处理 —— 它带「请求 1M 变体」语义，不能混在一起剥）。
-    let base_name = strip_extra_suffixes(&base_name);
+    let mut base_name = lower;
+    let mut requested_1m = false;
+    // 后缀链剥到不动点：`[1m]`（带「请求 1M 变体」语义，单独捕获）、其它窗口后缀
+    // （`[200k]`/`[2m]`）与 `-latest` 可叠加、顺序不定（`claude-opus-4-6[1m]-latest`、
+    // `claude-sonnet-4.5[200k]-latest`）。单次剥除只覆盖一种顺序：残留窗口后缀会让
+    // 「非家族名」的精确别名落进 family-default 静默映射到别的档（实测
+    // `deepseek-v4-flash[200k]-latest` → deepseek-3.2），`[1m]` 落在 `-latest` 之后时
+    // 还会丢掉 1M 语义。每轮先认 `[1m]` 再剥其它；每轮必净缩短或退出，不会死循环。
+    loop {
+        let (stripped, is_1m) = strip_1m_suffix(&base_name);
+        if is_1m {
+            requested_1m = true;
+            base_name = stripped;
+            continue;
+        }
+        let stripped = strip_extra_suffixes(&base_name);
+        if stripped == base_name {
+            break;
+        }
+        base_name = stripped;
+    }
     // 用剥掉后缀的名字走既有全流程(精确/thinking/结构化)。
     let mut resolved = resolve_inner(&base_name)?;
     if requested_1m {
@@ -1165,6 +1190,109 @@ mod tests {
         assert_eq!(fix_inverted_family("claude-4.5"), None);
         assert_eq!(fix_inverted_family("gpt-4.5-opus"), None);
         assert_eq!(fix_inverted_family("claude-x-opus"), None);
+    }
+
+    /// P2-11：归一表逐条断言。形态抄 kiro-proxy 的 `internal/model/resolver_test.go`
+    /// （`TestNormalizeModelName` 的 `{in, want}` 表），目标名按本仓 CATALOG 的 kiro_id 口径适配：
+    /// 本仓无 `claude-sonnet-4` 裸档（无次版本名走 family-default，见 `test_sonnet_newest_is_5`）、
+    /// Claude 3.x 老名走 Claude3Approx 近似（本仓不服务 3.x SKU，不做 `claude-3.7-sonnet` 改名）。
+    /// 每行一条可证伪断言：把对应归一分支改坏（去掉 `-latest` 剥除 / 关掉反转改写 /
+    /// 只剥 `[1m]` 不剥 `[200k]` / 后缀链不迭代到不动点），对应行必须变红。
+    #[test]
+    fn test_normalization_table_resolver_test_shape() {
+        let cases: &[(&str, &str)] = &[
+            // —— 日期戳 / 连字符版本 → 点号规范名（精确别名与结构化解析两条路）——
+            ("claude-haiku-4-5-20251001", "claude-haiku-4.5"),
+            ("claude-sonnet-4-5", "claude-sonnet-4.5"),
+            ("claude-opus-4-5", "claude-opus-4.5"),
+            ("claude-sonnet-4-20250514", "claude-sonnet-4.0"),
+            // —— inverted：版本在前、家族在后（只认点形态）——
+            ("claude-4.5-opus", "claude-opus-4.5"),
+            ("claude-4.5-sonnet", "claude-sonnet-4.5"),
+            // 反转名带 effort 后缀（kiro-proxy 归一表同款 `-high`/`-low`）：后缀保留进
+            // 中间名，由结构化版本解析回收（不额外维护 effort 词表）。
+            ("claude-4.5-opus-high", "claude-opus-4.5"),
+            ("claude-4.5-sonnet-low", "claude-sonnet-4.5"),
+            // —— 窗口后缀：`[1m]`（带 1M 语义）与 `[200k]`/`[2m]`（纯噪声，剥除但不触发 1M）——
+            ("claude-opus-4-8[1m]", "claude-opus-4.8"),
+            ("claude-opus-4-8-20251215[1m]", "claude-opus-4.8"),
+            ("claude-sonnet-4-6[200k]", "claude-sonnet-4.6"),
+            ("claude-sonnet-4.5[200k]", "claude-sonnet-4.5"),
+            ("claude-sonnet-4.5[2m]", "claude-sonnet-4.5"),
+            // —— `-latest`：剥到目录规范名；裸家族名 → 族内最新（family-default 告警路径）——
+            ("claude-haiku-4-5-latest", "claude-haiku-4.5"),
+            ("claude-opus-4.6-latest", "claude-opus-4.6"),
+            ("claude-sonnet-latest", "claude-sonnet-5.5"),
+            // —— 堆叠后缀（顺序不定）：后缀链迭代到不动点 ——
+            // `[1m]` 落在 `-latest` 之后仍须被识别（单次剥除会丢掉 1M 语义）。
+            ("claude-opus-4-6[1m]-latest", "claude-opus-4.6"),
+            ("claude-sonnet-4.5[200k]-latest", "claude-sonnet-4.5"),
+            // 精确别名（非家族名）带堆叠后缀：不迭代会被 family-default 吞成 deepseek-3.2。
+            ("deepseek-v4-flash[200k]-latest", "deepseek-v4-flash"),
+            // —— 透传型 / 原生名不受影响 ——
+            ("auto", "auto"),
+            ("claude-opus-4-8", "claude-opus-4.8"),
+            ("glm-5", "glm-5"),
+            ("qwen3-coder-next", "qwen3-coder-next"),
+        ];
+        for &(input, want) in cases {
+            assert_eq!(kid(input), Some(want), "归一表：{input} → {want}");
+        }
+        // 表内与 1M 语义相关的行单独钉：剥除 ≠ 请求 1M；`[2m]` 是噪声、不得触发 1M。
+        assert!(resolve("claude-opus-4-8[1m]").unwrap().is_1m);
+        assert!(resolve("claude-opus-4-8-20251215[1m]").unwrap().is_1m);
+        assert!(
+            resolve("claude-opus-4-6[1m]-latest").unwrap().is_1m,
+            "[1m] 在 -latest 之后仍须被识别（后缀链迭代到不动点）"
+        );
+        assert!(
+            !resolve("claude-sonnet-4.5[2m]").unwrap().is_1m,
+            "`[2m]` 是窗口噪声：剥除但不得当 1M 请求"
+        );
+        // 大小写不敏感（唯一入口统一小写化）。
+        assert_eq!(kid("CLAUDE-4.5-OPUS"), Some("claude-opus-4.5"));
+        // Claude 3.x 老名：本仓不服务 3.x SKU，走 Claude3Approx 近似（断言 kind 防其变静默）。
+        let legacy = resolve("claude-3-7-sonnet").unwrap();
+        assert_eq!(legacy.kind, MatchKind::Claude3Approx);
+        assert_eq!(legacy.spec.kiro_id, "claude-sonnet-5.5");
+    }
+
+    /// P2-11 负例：不匹配形态的名字**不得被改写**（"归一过宽误吞"是本表已知风险；
+    /// 没有负例的归一等于过宽）。剥离/改写函数是私有 fn，直接测函数本身——上层结构化
+    /// 版本解析对多数垃圾后缀仍能解析出正确模型，会掩盖剥离是否越界（沿用既有测试的分层测法）。
+    #[test]
+    fn test_normalization_negatives_not_over_normalized() {
+        // ① `latest` 不在行尾 / 无连字符：不得当 `-latest` 剥。
+        for keep in ["claude-latest-opus", "latest", "xlatest", "claude-opus-4.6-latestx"] {
+            assert_eq!(strip_extra_suffixes(keep), keep, "不得剥：{keep}");
+        }
+        // ② 窗口后缀形态不符：未知单位 `[2x]`、只有单位没数字 `[m]`、纯数字没单位 `[200]`、
+        //    非 ASCII `[宽]`、非数字 `[latest]` —— 一律不动。
+        for keep in [
+            "claude-opus-4.6[2x]",
+            "claude-opus-4.6[m]",
+            "claude-opus-4.6[200]",
+            "claude-opus-4.6[宽]",
+            "claude-opus-4.6[latest]",
+        ] {
+            assert_eq!(strip_extra_suffixes(keep), keep, "不得剥：{keep}");
+        }
+        // ③ 只有后缀/单位、没有模型名：不得被归一成任何模型。
+        assert_eq!(kid("[200k]"), None);
+        assert_eq!(kid("200k"), None);
+        assert_eq!(kid("[1m]"), None);
+        assert_eq!(kid("[k]"), None);
+        assert_eq!(kid("-latest"), None);
+        // ④ 反转改写负例：版本段必须是「ASCII 数字 + 点」；其余不得产生假名。
+        assert_eq!(fix_inverted_family("claude-4.宽-opus"), None, "非 ASCII 版本不得改写");
+        assert_eq!(fix_inverted_family("claude-x.y-opus"), None, "非数字版本不得改写");
+        assert_eq!(fix_inverted_family("claude-4.5-123456"), None, "纯数字段不是家族名");
+        assert_eq!(fix_inverted_family("claude-4.5-opusx"), None, "家族名必须是完整段");
+        assert_eq!(fix_inverted_family("claude-4.5"), None, "缺家族段");
+        assert_eq!(fix_inverted_family("gpt-4.5-opus"), None, "非 claude- 前缀");
+        // ⑤ 整链：无模型名/无家族名的串不得因剥后缀假命中。
+        assert_eq!(kid("gpt-4[200k]"), None, "剥后缀不得制造假命中");
+        assert_eq!(kid("mystery-latest"), None);
     }
 
     #[test]
