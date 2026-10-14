@@ -13,6 +13,7 @@ use axum::{
 };
 
 use super::{
+    client_setup::client_setup,
     handlers::{
         add_credential, bulk_import_socks_nodes, check_update, cleanup_disabled_credentials,
         clone_credential, deep_verify_credential, delete_credential, delete_credentials_batch,
@@ -70,6 +71,7 @@ use super::{
 /// - `POST /credentials/:id/reset` - 重置失败计数
 /// - `POST /credentials/:id/refresh` - 强制刷新 Token
 /// - `GET /credentials/:id/balance` - 获取凭据余额
+/// - `GET /client-setup/cc-switch` - 客户端一键导入（cc-switch 深链接，只读探测 + 计划）
 /// - `GET /config/load-balancing` - 获取负载均衡模式
 /// - `PUT /config/load-balancing` - 设置负载均衡模式
 ///
@@ -272,6 +274,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         // 服务器出网（前端绕开 CORS）；无额外频控 —— 面板内使用、量小，
         // 且本路由在 authed 树内，鉴权层照常拦截。
         .route("/help/web-search", get(help_web_search))
+        // 客户端一键导入（cc-switch 深链接）：只读探测 + 计划，服务端零写入。
+        // 响应含密钥明文（链接必须带 key）⇒ 只在 authed 树内 + 响应带 no-store，
+        // 见 admin::client_setup 模块头。
+        .route("/client-setup/cc-switch", get(client_setup))
         // ⚠️ 层序（tower）：**后挂的先执行**。审计必须先挂、鉴权后挂 ⇒ 鉴权最外层先跑，
         // 未鉴权请求在鉴权层就被拦下，**不会**进审计日志（防无 key 攻击者刷审计）。
         // 顺序颠倒 = 审计在鉴权之前跑，未经鉴权的请求也会被记录。

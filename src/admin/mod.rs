@@ -16,6 +16,7 @@
 //! let admin_router = create_admin_router(admin_state);
 //! ```
 
+mod client_setup;
 mod error;
 mod external_idp_login;
 mod handlers;

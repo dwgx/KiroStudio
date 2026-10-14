@@ -1132,6 +1132,27 @@ impl AdminService {
         }
     }
 
+    /// 客户端一键导入（cc-switch 深链接）的只读输入：号池规模 + 网关对话密钥。
+    ///
+    /// 为什么收口在这里而不是让 handler 自己取：`token_manager` 是私有字段，handler 拿不到；
+    /// 且「可用号数」必须与面板列表 / `/healthz` **同源**（同一个 `snapshot()` 的 `available`），
+    /// 各算一份必然漂移成「面板说有号、一键导入说没号」。
+    ///
+    /// 为什么返回密钥**明文**：cc-switch 深链接必须带真 key（官方文档 Rejected links 表首行
+    /// 就是 `API key is required`），而 `common::auth_keys` 里只存 SHA-256 摘要、取不出原文；
+    /// 这里读的是同一份 config（启动与热更都从它播种）。出站约束见 `admin::client_setup`
+    /// 模块头：admin 鉴权树内 + `Cache-Control: no-store` + 不进日志。
+    ///
+    /// 只读：不碰状态、不发上游请求。返回 `(pool_total, pool_available, api_key)`。
+    pub fn client_setup_inputs(&self) -> (usize, usize, Option<String>) {
+        let snapshot = self.token_manager.snapshot();
+        (
+            snapshot.total,
+            snapshot.available,
+            self.token_manager.config().api_key.clone(),
+        )
+    }
+
     /// 限流 insights（BE-A2）：每号一条只读快照，供前端限流健康抽屉展示。
     ///
     /// 数据全部取自内存：token_manager 快照（rpm/inflight）、cooldown 快照（冷却明细/

@@ -351,6 +351,8 @@ main()
   `{id}/disabled|priority|rpm-limit|name|proxy|reset|refresh|verify|balance|export`、
   `{id}/overage`(status/enable/disable)、`balances/cached`
 - 配置：`GET/PUT /config`、`GET/PUT /config/load-balancing`
+- 客户端接入：`client-setup/cc-switch`（cc-switch 一键导入深链接：只读探测 + 计划；
+  未就绪回 409 且不产出链接。响应含网关密钥明文，禁缓存——见 `admin/client_setup.rs` 模块头）
 - 上号：`auth/social/{start,poll}`、`auth/idc/{start,poll}`、`auth/external-idp/{start,leg1,leg2}`
 - 用量：`usage/{overview,timeseries,by-model,by-credential,recent,rate,clients,machines,throughput}`、
   `ratelimit/insights`、`stream/live`(SSE)
