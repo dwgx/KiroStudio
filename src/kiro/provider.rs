@@ -89,6 +89,42 @@ pub(crate) fn parse_retry_after_header_value(s: &str) -> Option<u64> {
     Some(secs.max(0) as u64)
 }
 
+/// Kiro 服务端 429 限流窗口头（值为**毫秒**整数）。
+///
+/// 对照实现 hj01857655/kiro-account-manager@4f0a069 同读该头（429 时服务端用它指定重试
+/// 窗口）。本仓既有链只认标准 `Retry-After`（秒/HTTP-date），故这里是**并存**而非替换：
+/// 两头顶上取更保守者，见 [`conservative_retry_after_secs`]。
+/// 头名大小写交给 `HeaderMap::get` 按 HTTP 惯例匹配（不敏感），勿手写大小写变体。
+const AMZN_KIRO_RATELIMIT_RETRY_AFTER_HEADER: &str = "x-amzn-kiro-ratelimit-retry-after";
+
+/// 解析上游 `x-amzn-kiro-ratelimit-retry-after` 头：**毫秒**整数 → 秒。
+///
+/// 与 [`parse_retry_after_header_value`] 同返回结构（秒），毫秒**向上取整**（1500ms → 2s）：
+/// 向下取整会在上游指定的窗口结束前重打、白吃一次 429 —— 与 `.max()` 合并同属保守口径。
+/// 头缺失/非法值 → None（由调用方回退标准头与既有基线，容错口径照抄邻居）。
+/// `0` 保留为 Some(0)：下游（token_manager）对 Some(0) 与无 RA 同走固定基线冷却，与标准头
+/// `"0"` 的既有口径一致（对照实现在消费侧过滤 0 值回退固定退避，落到本仓链上效果等价）。
+pub(crate) fn parse_amzn_ratelimit_retry_after_header_value(s: &str) -> Option<u64> {
+    let ms = s.trim().parse::<u64>().ok()?;
+    Some(ms.div_ceil(1000))
+}
+
+/// 429 冷却窗口的保守决议：标准 `Retry-After`（秒/HTTP-date）与
+/// `x-amzn-kiro-ratelimit-retry-after`（毫秒）并存时取**更大窗口**者。
+///
+/// 口径与 [`merge_upstream_429_retry_after`] 的 `.max()` 一致：上游给了两个数字时按更长
+/// 的那个等，提前重打只会在同一个限流窗口里再吃一次 429；一边缺失/非法时
+/// `None.max(Some(x)) == Some(x)`，照用另一边（新头缺席不改变既有行为）。
+fn conservative_retry_after_secs(
+    retry_after_raw: Option<&str>,
+    amzn_ratelimit_retry_after_raw: Option<&str>,
+) -> Option<u64> {
+    let standard_secs = retry_after_raw.and_then(parse_retry_after_header_value);
+    let amzn_secs =
+        amzn_ratelimit_retry_after_raw.and_then(parse_amzn_ratelimit_retry_after_header_value);
+    standard_secs.max(amzn_secs)
+}
+
 /// MCP 路径（WebSearch 等工具调用）流式 client 的 read_timeout **历史默认值**（空闲间隔秒）。
 ///
 /// 2026-10-14 起，client 的 read_timeout 由配置 `upstreamReadTimeoutSecs` 的进程镜像提供
@@ -2489,9 +2525,17 @@ impl KiroProvider {
                 .get(reqwest::header::RETRY_AFTER)
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.trim().to_string());
-            let retry_after_secs = retry_after_raw
-                .as_deref()
-                .and_then(parse_retry_after_header_value);
+            // Kiro 服务端 429 另有毫秒窗口头（见 [`AMZN_KIRO_RATELIMIT_RETRY_AFTER_HEADER`]）：
+            // 与标准头取更保守者；与对话路径共用同一决议函数，防两条路径口径漂移。
+            let amzn_ratelimit_retry_after_raw = response
+                .headers()
+                .get(AMZN_KIRO_RATELIMIT_RETRY_AFTER_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim().to_string());
+            let retry_after_secs = conservative_retry_after_secs(
+                retry_after_raw.as_deref(),
+                amzn_ratelimit_retry_after_raw.as_deref(),
+            );
             let body = response.text().await.unwrap_or_default();
 
             // ── 上游 trace 失败守卫（P0-A）────────────────────────────────────
@@ -3827,9 +3871,18 @@ impl KiroProvider {
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.trim().to_string());
-                let retry_after_header = retry_after_raw
-                    .as_deref()
-                    .and_then(parse_retry_after_header_value);
+                // Kiro 服务端 429 另有毫秒窗口头（见 [`AMZN_KIRO_RATELIMIT_RETRY_AFTER_HEADER`]）：
+                // 与标准头取更保守者（`.max()` 口径）；本决议值随既有链同时进凭据冷却、
+                // 客户端错误串 marker 与 trace 的 retry_after_secs。
+                let amzn_ratelimit_retry_after_raw = response
+                    .headers()
+                    .get(AMZN_KIRO_RATELIMIT_RETRY_AFTER_HEADER)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.trim().to_string());
+                let retry_after_header = conservative_retry_after_secs(
+                    retry_after_raw.as_deref(),
+                    amzn_ratelimit_retry_after_raw.as_deref(),
+                );
                 let body = response.text().await.unwrap_or_default();
 
                 // ── 上游 trace 失败守卫（P0-A）────────────────────────────────
@@ -5267,3 +5320,78 @@ fn assemble_final_error(
 #[cfg(test)]
 #[path = "provider_tests.rs"]
 mod tests;
+
+/// 429 限流头的解析与保守决议纯函数用例（2026-10-14 对手对照：
+/// `x-amzn-kiro-ratelimit-retry-after`）。
+///
+/// ⚠️ 本模块必须留在文件**最末**：provider_tests.rs 的一批源码守卫按「首个测试门」
+/// 切生产段（`split_once` / `split`），把本模块插到前面会让生产段被截断、
+/// 那些守卫集体失效（找不到函数直接 panic）。
+#[cfg(test)]
+mod amzn_ratelimit_retry_after_tests {
+    use super::*;
+
+    /// 毫秒值 → 秒：向上取整（1500ms → 2s），亚秒值不因取整归 0。
+    #[test]
+    fn amzn_ratelimit_retry_after_parses_millis_to_secs() {
+        assert_eq!(
+            parse_amzn_ratelimit_retry_after_header_value("45000"),
+            Some(45)
+        );
+        assert_eq!(
+            parse_amzn_ratelimit_retry_after_header_value(" 1500 "),
+            Some(2),
+            "1500ms 向上取整到 2s：向下取整会在上游窗口结束前重打"
+        );
+        assert_eq!(
+            parse_amzn_ratelimit_retry_after_header_value("1"),
+            Some(1),
+            "亚秒值向上取整到 1s，不得归 0（归 0 会落进「无有效 RA」的固定基线路径）"
+        );
+        assert_eq!(
+            parse_amzn_ratelimit_retry_after_header_value("0"),
+            Some(0),
+            "0 保留原值：与标准头 \"0\" 的 Some(0) 口径一致（下游对 Some(0) 走固定基线冷却）"
+        );
+    }
+
+    /// 头缺失（调用方给 None）/ 空串 / 非法值 → None：由调用方回退标准头与既有基线。
+    #[test]
+    fn amzn_ratelimit_retry_after_tolerates_missing_and_invalid() {
+        assert_eq!(parse_amzn_ratelimit_retry_after_header_value(""), None);
+        assert_eq!(parse_amzn_ratelimit_retry_after_header_value("abc"), None);
+        assert_eq!(parse_amzn_ratelimit_retry_after_header_value("-5"), None);
+        assert_eq!(parse_amzn_ratelimit_retry_after_header_value("1.5"), None);
+        assert_eq!(parse_amzn_ratelimit_retry_after_header_value("30s"), None);
+    }
+
+    /// 两头顶上取更保守（更大窗口）者；一边缺失/非法时照用另一边，新头缺席不改变既有行为。
+    #[test]
+    fn conservative_retry_after_picks_larger_window() {
+        // 标准头单独（新头缺席）：与改动前同值。
+        assert_eq!(conservative_retry_after_secs(Some("12"), None), Some(12));
+        // 毫秒头单独：15000ms → 15s。
+        assert_eq!(conservative_retry_after_secs(None, Some("15000")), Some(15));
+        // 并存取更保守者：标准 10s vs 毫秒 120000ms（120s）→ 120。
+        assert_eq!(
+            conservative_retry_after_secs(Some("10"), Some("120000")),
+            Some(120)
+        );
+        // 反向：标准 300s vs 毫秒 5000ms（5s）→ 300（短的一边不得稀释长窗口）。
+        assert_eq!(
+            conservative_retry_after_secs(Some("300"), Some("5000")),
+            Some(300)
+        );
+        // 两边都缺失/非法 → None（回退错误 body 的 resets_in_seconds 与基线冷却）。
+        assert_eq!(conservative_retry_after_secs(None, None), None);
+        assert_eq!(
+            conservative_retry_after_secs(Some("junk"), Some("junk")),
+            None
+        );
+        // 一边非法 → 用另一边（9000ms → 9s）。
+        assert_eq!(
+            conservative_retry_after_secs(Some("junk"), Some("9000")),
+            Some(9)
+        );
+    }
+}
