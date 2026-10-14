@@ -2,6 +2,26 @@
 
 本项目版本变更记录。遵循语义化版本(SemVer)。
 
+## [1.2.5] - 2026-10-14 - 复活线追赶合流 / ocr 审计 347 条 / 对手对照 / 首字超时重试
+
+Relative to tag v1.2.4 / `d9dd93f`。本窗 `cargo test --no-default-features`：**2639 passed; 0 failed**（CI 链为同命令 + `--locked`）。未改 Kiro 主路径 12 键选号、absorb 循环结构、AIMD/`inboundRpmAuto`、客户端 Key；透传池排序键**有意**前插 `starved`（对手对照 #10），sticky **有意**改为晚解绑（P2-6）。不改已推的 v1.2.4 对象。HMC 已部署 `a6a1ba8`，验收 26/26（池 11 号 / 8 可用）。
+
+- **合流**：`3300f81` 把 v1.2.2–v1.2.4 发布线并入 mainline（保留 repo-kit banner / regeneration workflow，`7c33b30`…`cec6f99`）；`.rs` 强制 LF 检出，修 Windows 上源码扫描守卫全红（`d18b835`）。
+- **追赶波**：建议模式拦截 / 大写入分块注记 / SSE 防缓冲 / idc 推断（`c61b296`）；动态系统块分流——token 预算提醒与 hook 通知移出 `history[0]`（`ab7465c`）；模型档补 5.5 代与 Fable 5.1（`9377b0a`）。
+- **首字超时透明重试**（`46948e5`，默认 30s×2，任一为 `0` 即关）：延后 `message_start` + 流内换号重开；新 ctx 先消化初始事件防重复 `content_block_start`（`bdfc0ab`）；失败号挂预算排除集、不再回头选它（`6d24c61`）；README + 面板「上游流式行为」四项配置、关闭语义改正（`c062449`/`3c3efb3`）。
+- **ocr 全仓审计**：`src/` 347 条分诊（A1–G：112 修 / 41 deferred / 124 误报 / 70 设计）+ 验证阶段收口（`696185d`/`76f177b`）+ 覆盖缺口波六片与跨片 deferred（`612cfb2`…`445b565`、`950c4c9`）+ 独立验证收口（`f00a280`/`4d696ce`/`5716936`）；`admin-ui/` 首次覆盖三片 27 修（`43d6d6f`/`3fa3a89`/`0dff32d`）。
+- **对手对照**（`ZyphrZero/kiro.rs` 12 条 + `hj01857655/kiro-account-manager` 7 条 fix 级，另 146 仓更新扫描）：429 毫秒级限流头接入冷却链（`014ef42`）；无参工具三处收口 + 根级 union 扁平化合并（`1f01c30`/`17533fc`/`81126c4`）；指纹表容量/TTL 接线并补生产调用点（`3811fec`/`ada8b37`）；配额重置自动回池 + 透传池反饥饿（`89d53ed`）；上游空闲/等头超时可配、等头超时改不可重试 504（`15eeec6`）；非 web_search 服务端工具剥离 + 搜索 query 按 char 截断（`38a75ac`）。
+- **复活/启用路径收口**：四条运行时路径 + 第五条旧版迁移路径统一清三层惩罚（`4ede072`/`b0d140c`）；启用路径统一清熔断、刷新写回补陈旧守卫（`963137d`/`70833c2`）；sticky 晚解绑——同会话连续 429≥3 才解绑（`9a71fc7`，P2-6）。
+- **活体测试三修**（单测原本自证为绿）：kiro-cli 导入认真实 device 注册键名（`adb3f12`）；全池不支持模型补 `model_unsupported_by_pool` 标记走 404 可读文案（`eb4d873`）；idc/免费号用量端点回退 BuilderId 占位 ARN 并去掉二次过滤（`2383c6f`/`a0f1d61`/`4ccbe5c`）。
+- **P2 与导入**：P2-5 模型「首次出现」日期自检（`a806c88`）、P2-8 cc-switch 一键导入后端 + 守卫加固（`2adbbbf`/`d5764a2`）；官方 kiro-cli `data.sqlite3` 只读导入（`f53d07f`/`11b8f0f`）；面板管理密钥轮换入口（`b14e591`）。
+- **记账/观测面**：用量加端点维度（`997e813`/`1896d4f`/`0426587`）；隐藏上下文计量——只观测不做减法（`522926f`）；cache 真值可观测面 + 风控盲区修复（`f137222`）；`messageMetadataEvent` 别名 + 4 个事件名级错误走错误路径（`3ccb334`）；非流式补 `x-kirostudio-input-token-scale` 头（`c47b2fd`/`a6a1ba8`）。
+- **websearch 直播**：断连按已发布增量补记 Interrupted（`f94c9f7`）；收尾 `message_delta` 带真值 `input_tokens`（`b2b5764`）；回灌轮残留 tool 缓冲判整轮失败（`4fb49bf`）；回灌轮数遵循客户端 `max_uses`（`1a700c0`）。
+- **安全**：静态资源路径白名单化（`e61e714`）；`countTokensApiUrl` 过 SSRF 闸（`60e1b6c`）；Windows 自重启 bat 嵌入值清洗（`c68c4dc`）；OAuth state 真常量时间比较（`96845f5`）；tray `host` 字符集白名单（`e50d6b1`）；`trustPrivatePeerAsProxy` 启动期风险提示（`89d0fa7`，仅记录）；存储密钥长度侧信道 + 恒真自证测试收口（`696185d`/`76f177b`）；原子写回退不再原地截断（`f807c4f`）。
+- **发布链/更新**：候选二进制替换前 `--version` 冒烟（`0cc6f8b`/`cd56156`）；第三方 action 全 SHA pin + 发布后回验资产（`2c9ecb3`）；写权限按 job 最小化（`61ac8bd`）。
+- **调度/配额/持久化/杂项**：额度恢复吃上游 `nextResetAt` 真值（`97337f8`）；5 分钟信用限流 reason + `metadataEvent.tokenUsage` 防御解析（`3e92764`）；统计落盘串行化（`470944c`）；删号回滚按 id 取回自己的条目（`28c99b0`）；会话键有界化（`c51b63e`）；overage 回查失败不再整包报错（`4bab5d6`）；config reload 整批重播全部进程镜像（`f108add`，现 21 个）；developer 角色并入系统块（`f68fdb1`）；catalog 归一补 `[200k]` 后缀 / `-latest` / 反转名（`61fe449`/`c32b522`）；缓存参数 smoke 补强（`aff00f8`）；错误翻译用例并发 flake 消除（`6a87cb5`）。
+- **文档矫正**：状态/约束文档去掉 Mac/VPS 旧纪元、快照矫正（`e77bf0c`/`d74f216`/`2662ea9`）；措辞与实现对齐五处（`dd74827`/`c95ebc6`/`f8c007e`）。
+- **验收/诊断**：新增 `tools/diag/acceptance.py`（只走 HTTP，Docker/ws 与旧 systemd 都成立）并扩到 26/26（含无参工具、扩展思考两条真活体，`f795d93`/`4ab865e`/`9c00780`/`a5982f5`）；新增 `soak.py` 号池浸泡（首跑 44/44，p50 3.15s，`6777b81`）。
+
 ## [1.2.4] - 2026-09-04 - catalog ads / Grep offset / Responses additional_tools
 
 Relative to tag v1.2.3 / `cf070bd`. This window `cargo test --no-default-features --locked`:**2300 passed; 0 failed**. No 12-key / absorb / AIMD / sticky / client-key changes. Do not retag v1.2.3. Homecloud not in this cycle.
