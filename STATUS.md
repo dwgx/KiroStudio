@@ -1,12 +1,12 @@
 # KiroStudio status
 
-Public Latest: **v1.2.5**（`v1.2.5` tag，2026-10-14）· [Release](https://github.com/dwgx/KiroStudio/releases/tag/v1.2.5) · [CHANGELOG](./CHANGELOG.md)
+Public Latest: **v1.2.5**（`4dee202`，2026-10-14；四端产物齐 + OTA 闭环 `has_update=false`）· [Release](https://github.com/dwgx/KiroStudio/releases/tag/v1.2.5) · [CHANGELOG](./CHANGELOG.md)
 
 **2026-10-13 复活线（当前纪元）**：
 
 - **master 已合流**：`3300f81` = repo-kit 工具（banner / regeneration workflow）+ v1.2.2–4 产品线。
   此前两条线自 `510e0dd` 分叉（master 只含 repo-kit 4 个提交；发布线 v1.2.2–4 只有 tag 无分支）。
-- **HMC 活服务**：工作区 `kirostudio`（容器 8990 → `127.0.0.1:18001`），当前 **`dev-a6a1ba8`**
+- **HMC 活服务**：工作区 `kirostudio`（容器 8990 → `127.0.0.1:18001`），当前 **`v1.2.5`**（官方发布版，`4dee202`；此前 dev 版 `dev-a6a1ba8`）
   （`/healthz` `ok:true` · 模型表 32 · `pool_count=11`，其中 **8 个可用、3 个因上游账户级风控本地停用**）；
   回滚 = `KIROSTUDIO_VERSION=v1.2.4 bash ops/kirostudio/deploy.sh`。部署/升级 = `deploy.sh`（幂等）。
 - **本轮已交付（2026-10-14，v1.2.5 窗口，109 笔提交）**：① **合流**（`3300f81`，repo-kit + v1.2.2–4
