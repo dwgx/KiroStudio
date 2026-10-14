@@ -36,6 +36,7 @@ use crate::kiro::model::token_refresh::{
     RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
+use crate::kiro::model_release::{ModelReleaseTracker, SEEN_FILE_NAME};
 use crate::kiro::rate_limiter::{FailureKind, RateLimitConfig, RateLimiter};
 use crate::kiro::scheduling::{InflightGuard, RpmTracker, RAMP_RECENT_SECS};
 use crate::model::config::Config;
@@ -2314,6 +2315,10 @@ pub struct MultiTokenManager {
     model_catalog_locks: Mutex<HashMap<u64, Arc<TokioMutex<()>>>>,
     /// 巡检失败退避：key = credential id，值见 [`CatalogBackoff`]。
     model_catalog_backoff: Mutex<HashMap<u64, CatalogBackoff>>,
+    /// 模型「首次出现」日期自检（P2-5）：池级巡检成功拉到模型列表时，把新 ID 连同
+    /// 当天日期记进 `kiro_model_seen.json`（与凭据同目录）；首次运行只建基线
+    /// （日期 null，防升级当天整表亮 NEW）。无凭据路径时纯内存（测试不落盘）。
+    model_release: ModelReleaseTracker,
     /// 号池/族级健康评分 + 熔断半开渐进放回（balanced 选号 p_avail 权重 + 429 后逐步试探放回）。
     health: HealthTracker,
     /// 每凭据 RPM 软上限（0 = 不限制）（原子镜像,reload 热更）
@@ -3024,6 +3029,11 @@ impl MultiTokenManager {
             model_catalog_cache: Mutex::new(HashMap::new()),
             model_catalog_locks: Mutex::new(HashMap::new()),
             model_catalog_backoff: Mutex::new(HashMap::new()),
+            // 模型「首次出现」自检：与冷却状态同目录（凭据文件所在目录）；无路径时纯内存
+            // （与 cooldown 同款取舍：测试全为 None，不落盘也就不会互相污染）。
+            model_release: ModelReleaseTracker::load(
+                cooldown_dir.as_ref().map(|d| d.join(SEEN_FILE_NAME)),
+            ),
             affinity_enabled: AtomicBool::new(affinity_enabled),
             rpm: RpmTracker::new(),
             health: {
@@ -8389,6 +8399,9 @@ impl MultiTokenManager {
             };
             match fetch(cred).await {
                 Ok(models) if !models.is_empty() => {
+                    // P2-5 自检：池级成功拉列表 → 登记新 ID。空列表已被本分支 guard 排除，
+                    // 恰好满足「空响应不建基线」；登记与写缓存相互独立，先登记再写缓存。
+                    self.model_release.observe(&models);
                     self.store_model_catalog(id, models);
                     written += 1;
                 }

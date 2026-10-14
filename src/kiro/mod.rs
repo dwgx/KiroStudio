@@ -10,6 +10,7 @@ pub mod health;
 pub mod machine_id;
 pub mod model;
 pub mod model_mapping;
+pub mod model_release;
 pub mod overage;
 pub mod parser;
 pub mod passthrough;

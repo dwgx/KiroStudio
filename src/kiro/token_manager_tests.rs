@@ -7760,6 +7760,69 @@
         );
     }
 
+    /// P2-5：池级巡检成功必须喂「首次出现」自检——首次成功 = 基线（日期 null，防升级
+    /// 当天整表亮 NEW）；基线之后新出现的 ID 记当天；已登记的不改写。
+    ///
+    /// 覆盖的是**接线**（observe 落在 probe_model_catalog_round 成功分支）与日期语义的
+    /// 端到端一致性；纯语义由 `model_release.rs` 的单测用固定日期穷举。
+    #[tokio::test]
+    async fn probe_round_feeds_model_release_baseline_then_dates_new_ids() {
+        let mgr = MultiTokenManager::new(
+            Config::default(),
+            vec![mk_custom(1, 0, None)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let written = mgr
+            .probe_model_catalog_round(|_cred| async {
+                Ok(vec!["a".to_string(), "b".to_string()])
+            })
+            .await;
+        assert_eq!(written, 1);
+        // 首次成功拉列表 = 建立基线：已有模型全部 null（不算新增）。
+        assert_eq!(
+            mgr.model_release.release_date("a"),
+            None,
+            "首次同步是基线，不得算新增"
+        );
+        assert_eq!(mgr.model_release.release_date("b"), None);
+
+        // 拨旧目录条目 = 下一轮 TTL 到期（否则 double-check 会跳过重探），第二轮真正重探。
+        let stale = Instant::now() - StdDuration::from_secs(MODEL_CATALOG_TTL_SECS + 1);
+        mgr.model_catalog_cache.lock().insert(
+            1,
+            ModelCatalogEntry {
+                models: vec!["a".to_string(), "b".to_string()],
+                refreshed_at: stale,
+            },
+        );
+        let before = chrono::Utc::now().date_naive();
+        let written = mgr
+            .probe_model_catalog_round(|_cred| async {
+                Ok(vec!["a".to_string(), "b".to_string(), "c".to_string()])
+            })
+            .await;
+        let after = chrono::Utc::now().date_naive();
+        assert_eq!(written, 1);
+        let c_date = mgr
+            .model_release
+            .release_date("c")
+            .expect("基线之后新出现的 ID 必须记当天日期");
+        let expect_before = before.format("%Y-%m-%d").to_string();
+        let expect_after = after.format("%Y-%m-%d").to_string();
+        assert!(
+            c_date == expect_before || c_date == expect_after,
+            "新 ID 的首次出现日期应为当天（{expect_before}/{expect_after}），实际 {c_date}"
+        );
+        assert_eq!(
+            mgr.model_release.release_date("a"),
+            None,
+            "已登记模型不得被后续巡检改写"
+        );
+    }
+
     /// S3：mock fetch 失败 → 退避增长 + 缓存维持 Unknown。
     #[tokio::test]
     async fn probe_round_failure_bumps_backoff_and_keeps_unknown() {
