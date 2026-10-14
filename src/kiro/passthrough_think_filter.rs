@@ -113,7 +113,8 @@ pub fn filter_json_bytes_with(
     // JSON 缺 content 字段时也必须注入，否则 mock 注入静默失效（旧实现注入代码在
     // content 早退之后，content 缺失时永远执行不到，且无任何日志）。流式路径按事件
     // 处理不依赖 content，两路径不对称即源于此。仅顶层 usage 有 input_tokens 时注入，
-    // 缺失则整体跳过（零改动）。
+    // 缺失则整体跳过（零改动）。注入只改写 cache_read/creation 两族键，input_tokens
+    // 保持上游原值（不同步减成 billed；理由与断言见 inject_mock_cache_usage 文档）。
     if let Some((true, ratio)) = mock_cache {
         if let Some(usage) = v.get_mut("usage").and_then(|u| u.as_object_mut()) {
             if let Some(input_tokens) = usage.get("input_tokens").and_then(|x| x.as_u64()) {
@@ -715,11 +716,25 @@ impl SseFilterState {
 /// 向 usage 对象注入模拟 cache 值（透传路径 mockCacheEnabled，流式/非流式共用）。
 ///
 /// - `cache_read_input_tokens = round(input_tokens × ratio)`（ratio 已由镜像 setter
-///   清洗到 [0.0, 1.0]，read ≤ input 恒成立）；
+///   清洗到 [0.0, 1.0]）。`round` 是**半值远离零**（1×0.5 → 1，非 banker's 舍入）；
+///   因 ratio ≤ 1 ⇒ 乘积 ≤ input ⇒ round(乘积) ≤ input，read ≤ input 恒成立（token
+///   计数远小于 2^53，u64→f64 转换无损）⇒ billed 口径 `input − read − creation`
+///   恒 ≥ 0（实算锚点：1000×0.99 = 990.0 精确；101×0.99 = 99.99 → 进位 100，
+///   仍 ≤ 101）；
 /// - `cache_creation_input_tokens = 0`（模拟"全部命中不写缓存"，避免 read + creation
 ///   > input 的矛盾）；
 /// - 上游自带的 `cache_creation_5m_input_tokens` / `cache_creation_1h_input_tokens`
 ///   若存在也置 0（与 creation 同语义）。
+///
+/// **`input_tokens` 保持上游原值，不同步减成 billed**（测试有断言钉死）。理由：
+/// ① 上游报的 input_tokens 不在 mock 改写范围——mock 只接管 cache 展示字段（与
+/// creation 仅覆盖已存在键同源的保守策略）；② 下游若按 `input − read − creation`
+/// 再算 billed，保留原值恒非负；若注入时顺手 `input −= read`，下游再减一次会双扣、
+/// ratio > 0.5 时直接变负；③ 本仓 record/统计口径把 cache_read 定义为 input_tokens
+/// 的**子集**（gross 已包含它，不是额外增量，见 usage/record.rs、usage_stats.rs）。
+///
+/// **幂等**：insert 覆盖语义——同一 usage 连续注入两次结果不变；mock 开启时
+/// cache_read / creation 由本函数全权接管（覆盖上游自带值，不是累加）。
 ///
 /// **伪造值，仅供下游展示，不是真实计费依据**（与主路径 prompt_cache 估算下发同性质）。
 /// 调用方必须先确认 usage 含 `input_tokens`（缺 input_tokens 不注入，整体零改动）。
@@ -1806,6 +1821,20 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["usage"]["cache_read_input_tokens"], 10);
         assert_eq!(v["usage"]["cache_creation_input_tokens"], 0);
+        // ⚠️ input_tokens 保持上游原值、**不**同步减成 billed —— 现状钉死（理由见
+        // inject_mock_cache_usage 文档：本仓口径 cache_read 是 input_tokens 的子集；
+        // 同步扣减会让下游按 `input − read − creation` 再算时双扣、ratio > 0.5 时变负）。
+        // 若注入实现顺手 `input -= read`（100% 命中时 input 会变 0），本断言红。
+        assert_eq!(v["usage"]["input_tokens"], 10, "input_tokens 不得被同步改写");
+        // billed 口径非负：input − read − creation == 0（全命中），不得为负。
+        let input = v["usage"]["input_tokens"].as_u64().unwrap();
+        let read = v["usage"]["cache_read_input_tokens"].as_u64().unwrap();
+        let creation = v["usage"]["cache_creation_input_tokens"].as_u64().unwrap();
+        assert!(
+            read + creation <= input,
+            "read+creation 不得超过 input：{read}+{creation} vs {input}"
+        );
+        assert_eq!(input - read - creation, 0, "ratio=1.0 全命中时 billed 恰为 0");
     }
 
     /// 非流式：关闭（None）→ 原样透传（解析等价，键顺序可能被 serde_json 重排不算改动）。
@@ -1959,10 +1988,22 @@ mod tests {
         let stream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(input))]);
         let filtered = collect_filtered(filter_sse_stream_with(stream, true, true, Some((true, 1.0))))
             .await;
-        assert!(
-            filtered.contains("\"cache_read_input_tokens\":10"),
-            "message_delta usage 带 input_tokens 时必须注入，实际: {filtered}"
+        // 断言强度：解析后逐字段断言（不只子串）——注入的 read/creation 与**未被动**的
+        // input/output/delta 全部钉死，防「改写事件时顺带丢字段」类回归。
+        let data_line = filtered
+            .lines()
+            .find(|l| l.starts_with("data: "))
+            .unwrap_or_else(|| panic!("过滤结果应有 data 行，实际: {filtered}"));
+        let v: serde_json::Value =
+            serde_json::from_str(data_line.strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(
+            v["usage"]["cache_read_input_tokens"], 10,
+            "message_delta usage 带 input_tokens 时必须注入 read=10，实际: {filtered}"
         );
+        assert_eq!(v["usage"]["cache_creation_input_tokens"], 0, "creation 同置 0");
+        assert_eq!(v["usage"]["input_tokens"], 10, "input_tokens 不得被同步改写");
+        assert_eq!(v["usage"]["output_tokens"], 9, "output_tokens 不得被误改");
+        assert_eq!(v["delta"]["stop_reason"], "end_turn", "delta 其余字段保持");
     }
 
     /// 流式：无 input_tokens 的事件（真实 message_delta 只有 output_tokens）不注入。
@@ -2009,6 +2050,241 @@ mod tests {
             futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(input.clone()))]);
         let filtered = collect_filtered(filter_sse_stream_with(stream, true, true, None)).await;
         assert_eq!(filtered, input, "关闭时必须原样透传");
+    }
+
+    /// 非流式：ratio=0.99（Owner 点名的 99% 档）——read = round(input × 0.99)。
+    ///
+    /// round 语义钉死：`f64::round` 半值远离零（0.5 → 1，非 banker's 舍入）。实算锚点
+    /// （IEEE double，与线上同一条 FP 指令）：1000×0.99 = 990.0 精确；101×0.99 = 99.99
+    /// → 进位到 100（不是 floor 99）；1×0.5 = 0.5 → 1。进位不破坏 read ≤ input：
+    /// ratio ≤ 1 ⇒ 乘积 ≤ input ⇒ round(乘积) ≤ input。
+    #[test]
+    fn test_mock_cache_json_ratio_099_rounds_and_never_exceeds_input() {
+        let out = filter_json_bytes_with(
+            mock_json(1000, "").as_bytes(),
+            true,
+            true,
+            Some((true, 0.99)),
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            v["usage"]["cache_read_input_tokens"], 990,
+            "1000×0.99=990.0 精确"
+        );
+        assert_eq!(v["usage"]["cache_creation_input_tokens"], 0);
+        assert_eq!(v["usage"]["input_tokens"], 1000, "input_tokens 不得被同步改写");
+
+        // 101×0.99 = 99.99：≥ .5 进位 → 100（若实现改成 floor/截断，本断言红）。
+        let out2 = filter_json_bytes_with(
+            mock_json(101, "").as_bytes(),
+            true,
+            true,
+            Some((true, 0.99)),
+        );
+        let v2: serde_json::Value = serde_json::from_slice(&out2).unwrap();
+        assert_eq!(
+            v2["usage"]["cache_read_input_tokens"], 100,
+            "101×0.99=99.99 必须 round 进位到 100（不是 99）"
+        );
+        let input = v2["usage"]["input_tokens"].as_u64().unwrap();
+        let read = v2["usage"]["cache_read_input_tokens"].as_u64().unwrap();
+        assert!(read <= input, "read 不得超过 input：{read} vs {input}");
+        assert_eq!(input - read, 1, "billed = input − read − creation = 1（非负）");
+
+        // 半值钉死：1×0.5 = 0.5 → 1（半值远离零；若实现用 banker's rounding 会得 0）。
+        let out3 = filter_json_bytes_with(
+            mock_json(1, "").as_bytes(),
+            true,
+            true,
+            Some((true, 0.5)),
+        );
+        let v3: serde_json::Value = serde_json::from_slice(&out3).unwrap();
+        assert_eq!(
+            v3["usage"]["cache_read_input_tokens"], 1,
+            "0.5 必须按半值远离零进位到 1"
+        );
+    }
+
+    /// 非流式：ratio=0.0 与极小值（1e-9）——read=0，但字段**仍存在**（=0 表示"确实
+    /// 没命中"；字段缺失表示"本网关不做该记账"，语义不同，见 config.rs 同款注释）。
+    #[test]
+    fn test_mock_cache_json_zero_and_tiny_ratio_keep_zero_field() {
+        let out = filter_json_bytes_with(
+            mock_json(1000, "").as_bytes(),
+            true,
+            true,
+            Some((true, 0.0)),
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            v["usage"]
+                .get("cache_read_input_tokens")
+                .and_then(|x| x.as_u64()),
+            Some(0),
+            "ratio=0 时字段必须存在且为 0（缺失即语义错误）"
+        );
+        assert_eq!(
+            v["usage"]
+                .get("cache_creation_input_tokens")
+                .and_then(|x| x.as_u64()),
+            Some(0)
+        );
+
+        // 1e-9：1000×1e-9 = 1.0000000000000002e-06 → round = 0，字段同样存在。
+        let out2 = filter_json_bytes_with(
+            mock_json(1000, "").as_bytes(),
+            true,
+            true,
+            Some((true, 1e-9)),
+        );
+        let v2: serde_json::Value = serde_json::from_slice(&out2).unwrap();
+        assert_eq!(
+            v2["usage"]
+                .get("cache_read_input_tokens")
+                .and_then(|x| x.as_u64()),
+            Some(0),
+            "极小 ratio 下 round 归 0，字段必须仍存在（若实现改成 read>0 才插入，本断言红）"
+        );
+        assert_eq!(v2["usage"]["input_tokens"], 1000, "input_tokens 不动");
+    }
+
+    /// 注入幂等：同一 usage 连续注入两次结果不变（insert 覆盖语义，非累加）。
+    /// 链路级（对已注入输出重复过滤）同样收敛，且重新注入按新 ratio **接管**旧值。
+    #[test]
+    fn test_mock_cache_injection_idempotent() {
+        // ① 单元级：同一 map 连续注入两次，第二次不得再变
+        //    （若实现误写为 `read += …` 累加，第二次 read 翻倍 → 红）。
+        let mut usage: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"input_tokens":101,"output_tokens":9}"#).unwrap();
+        inject_mock_cache_usage(&mut usage, 101, 0.99);
+        let after_first = usage.clone();
+        inject_mock_cache_usage(&mut usage, 101, 0.99);
+        assert_eq!(usage, after_first, "第二次注入不得改变任何字段");
+        assert_eq!(usage["cache_read_input_tokens"], 100);
+
+        // ② 链路级：对已注入输出再跑一遍过滤器（重放场景），解析等价且 read 不翻倍。
+        let input = mock_json(101, "");
+        let out1 = filter_json_bytes_with(input.as_bytes(), true, true, Some((true, 0.99)));
+        let out2 = filter_json_bytes_with(&out1, true, true, Some((true, 0.99)));
+        let v1: serde_json::Value = serde_json::from_slice(&out1).unwrap();
+        let v2: serde_json::Value = serde_json::from_slice(&out2).unwrap();
+        assert_eq!(v1, v2, "重复过滤必须收敛（JSON 语义等价）");
+        assert_eq!(v2["usage"]["cache_read_input_tokens"], 100, "read 不得翻倍");
+
+        // ③ 覆盖语义：换 ratio 再注入必须接管旧值（101×0.5=50.5 → 51），不得因
+        //    「已存在 cache 字段」跳过——否则 ratio 热更对已注入响应静默失效。
+        let out3 = filter_json_bytes_with(&out1, true, true, Some((true, 0.5)));
+        let v3: serde_json::Value = serde_json::from_slice(&out3).unwrap();
+        assert_eq!(
+            v3["usage"]["cache_read_input_tokens"], 51,
+            "重新注入必须覆盖旧值 100（101×0.5=50.5 半值进位 51）"
+        );
+    }
+
+    /// sanitize → 注入的组合链路（纯函数，不触全局镜像）：无论 sanitize 给出什么，
+    /// 注入的 read 都 ≤ input（下游 billed = input − read − creation 恒非负）。
+    ///
+    /// 全局 setter→reader 链路（`set_mock_cache_config(true, 1.5)` → 读到 1.0、
+    /// `set_mock_cache_config(true, f64::NAN)` → 读到 0.7）已由 handlers_tests.rs 的
+    /// `mock_cache_mirror_seed_roundtrip_and_clamp` /
+    /// `sanitize_mock_ratio_clamps_and_recovers_non_finite` 覆盖；本用例**刻意不触
+    /// 全局**（该镜像全局只有一份，另一文件已有改全局的用例——再开一条会在并行执行
+    /// 下互相覆盖状态），只钉本文件消费侧的组合结果。
+    #[test]
+    fn test_mock_cache_sanitized_ratio_never_breaks_read_le_input() {
+        use crate::anthropic::handlers::sanitize_mock_cache_ratio;
+        // 越界 1.5 → 1.0 → read == input（不是 1500）。
+        let ratio = sanitize_mock_cache_ratio(1.5);
+        assert_eq!(ratio, 1.0, "夹具前提：sanitize 必须把 1.5 clamp 到 1.0");
+        let out = filter_json_bytes_with(
+            mock_json(1000, "").as_bytes(),
+            true,
+            true,
+            Some((true, ratio)),
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            v["usage"]["cache_read_input_tokens"], 1000,
+            "clamp 后 read=input（若 sanitize 失效成 1.5，这里会得 1500 → 红）"
+        );
+
+        // NaN → 0.7 → read = round(1000×0.7) = 700。若 sanitize 把 NaN 原样透出，
+        // 注入端 `(input×NaN) as u64` 饱和转换吞成 0 → 静默失注入（本断言红）。
+        let ratio = sanitize_mock_cache_ratio(f64::NAN);
+        assert_eq!(ratio, 0.7, "夹具前提：NaN 必须归默认 0.7");
+        let out2 = filter_json_bytes_with(
+            mock_json(1000, "").as_bytes(),
+            true,
+            true,
+            Some((true, ratio)),
+        );
+        let v2: serde_json::Value = serde_json::from_slice(&out2).unwrap();
+        assert_eq!(
+            v2["usage"]["cache_read_input_tokens"], 700,
+            "NaN 兜底 0.7 必须到达消费侧（read=700）"
+        );
+    }
+
+    /// 流式：message_start 事件**跨 chunk 切开**（第一段无事件分隔符）→ 事件在后续
+    /// chunk 拼齐后才注入；注入值与同参数非流式路径逐字段一致（两路径同一套语义）。
+    #[tokio::test]
+    async fn test_mock_cache_sse_message_start_split_across_chunks_injected() {
+        let full = event(
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"m1","usage":{"input_tokens":1000,"output_tokens":0}}}"#,
+        );
+        // 在 data JSON 中途切开（"output_tokens" 前）：第一段不含 `\n\n`，事件未闭合，
+        // filter 必须缓冲到第二段拼齐再处理。
+        let split_at = full
+            .find("output_tokens")
+            .expect("夹具必须含 output_tokens");
+        let (first, second) = full.split_at(split_at);
+        assert!(!first.contains("\n\n"), "夹具前提：第一段不得含事件分隔符");
+        let stream = futures::stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from(first.to_string())),
+            Ok::<Bytes, std::io::Error>(Bytes::from(second.to_string())),
+        ]);
+        let filtered =
+            collect_filtered(filter_sse_stream_with(stream, true, true, Some((true, 0.99)))).await;
+        let data_line = filtered
+            .lines()
+            .find(|l| l.starts_with("data: "))
+            .unwrap_or_else(|| panic!("过滤结果应有 data 行，实际: {filtered}"));
+        let v: serde_json::Value =
+            serde_json::from_str(data_line.strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(
+            v["message"]["usage"]["cache_read_input_tokens"], 990,
+            "跨 chunk 拼齐后必须注入 read=990（1000×0.99），实际: {filtered}"
+        );
+        assert_eq!(v["message"]["usage"]["cache_creation_input_tokens"], 0);
+        assert_eq!(
+            v["message"]["usage"]["input_tokens"], 1000,
+            "input_tokens 不得被同步改写"
+        );
+        assert_eq!(
+            filtered.matches("cache_read_input_tokens").count(),
+            1,
+            "注入必须恰好一次（跨 chunk 不得重复注入），实际: {filtered}"
+        );
+
+        // 与非流式同参数（input=1000、ratio=0.99）逐字段对齐 —— 两路径同一套语义。
+        let json_out = filter_json_bytes_with(
+            mock_json(1000, "").as_bytes(),
+            true,
+            true,
+            Some((true, 0.99)),
+        );
+        let jv: serde_json::Value = serde_json::from_slice(&json_out).unwrap();
+        assert_eq!(
+            jv["usage"]["cache_read_input_tokens"],
+            v["message"]["usage"]["cache_read_input_tokens"],
+            "流式与非流式的 read 必须一致"
+        );
+        assert_eq!(
+            jv["usage"]["cache_creation_input_tokens"],
+            v["message"]["usage"]["cache_creation_input_tokens"],
+            "流式与非流式的 creation 必须一致"
+        );
     }
 
     /// P1-11：filter 未改写的 `content_block_delta` / `message_delta` 回原字节
