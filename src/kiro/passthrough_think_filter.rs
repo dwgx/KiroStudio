@@ -729,8 +729,9 @@ impl SseFilterState {
 /// **`input_tokens` 保持上游原值，不同步减成 billed**（测试有断言钉死）。理由：
 /// ① 上游报的 input_tokens 不在 mock 改写范围——mock 只接管 cache 展示字段（与
 /// creation 仅覆盖已存在键同源的保守策略）；② 下游若按 `input − read − creation`
-/// 再算 billed，保留原值恒非负；若注入时顺手 `input −= read`，下游再减一次会双扣、
-/// ratio > 0.5 时直接变负；③ 本仓 record/统计口径把 cache_read 定义为 input_tokens
+/// 再算 billed，保留原值恒非负；若注入时顺手 `input −= read`，下游再减一次会**双扣**
+/// （本仓三处 billed 计算都带 `saturating_sub`/`max(0)`，可观测形态是**被钳成 0**；对不设钳的
+/// 外部下游才会出现负值）；③ 本仓 record/统计口径把 cache_read 定义为 input_tokens
 /// 的**子集**（gross 已包含它，不是额外增量，见 usage/record.rs、usage_stats.rs）。
 ///
 /// **幂等**：insert 覆盖语义——同一 usage 连续注入两次结果不变；mock 开启时
@@ -1823,7 +1824,8 @@ mod tests {
         assert_eq!(v["usage"]["cache_creation_input_tokens"], 0);
         // ⚠️ input_tokens 保持上游原值、**不**同步减成 billed —— 现状钉死（理由见
         // inject_mock_cache_usage 文档：本仓口径 cache_read 是 input_tokens 的子集；
-        // 同步扣减会让下游按 `input − read − creation` 再算时双扣、ratio > 0.5 时变负）。
+        // 同步扣减会让下游按 `input − read − creation` 再算时双扣（仓内三处 billed 都带
+        // saturating/max(0)，可观测形态是被钳成 0；不设钳的外部下游才会出现负值）。
         // 若注入实现顺手 `input -= read`（100% 命中时 input 会变 0），本断言红。
         assert_eq!(v["usage"]["input_tokens"], 10, "input_tokens 不得被同步改写");
         // billed 口径非负：input − read − creation == 0（全命中），不得为负。

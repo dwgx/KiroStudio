@@ -4629,6 +4629,11 @@ pub(crate) fn context_input_tokens_from_pct(pct: f64, window_size: i32) -> Optio
 // 其构成与局限（估算器误差、我方转换差异、上游口径未知项）逐条写在
 // `observe_hidden_context_sample` 的文档里。
 //
+// ⚠️ 措辞精确性（验证者指出）：`count_all_tokens` 在**配置了远程 count_tokens API** 时
+// 返回的是远程结果、不是本地估算 —— 文档里"本地估算"是对该减数的简称。两条路径读的是
+// 同一个值（同一函数、同一变量源），故"同口径"结论不受影响；但解读漂移数值时要知道
+// 减数本身也可能带远程误差。
+//
 // 覆盖范围：流式（`StreamContext`，`/cc/v1` 的 buffered 路径复用同一个 StreamContext）
 // 与非流式（handlers.rs 聚合循环）两条主路径。WebSearch 回灌循环（websearch.rs 自带
 // 事件解析）**刻意不接**：它每跳复用首跳的本地估算，而上游上下文逐跳增长 → 差值被
