@@ -5146,9 +5146,10 @@ async fn handle_non_stream_request(
     }
     // 与 SSE 路径对齐：非流式同样对 input/cache 字段做了 ×0.6657 展示缩放，故必须带同一个
     // 缩放声明头，否则下游无法判断这些数字是否已被缩放（此前只有 SSE 侧有，两条路径不一致）。
+    // 两个常量是 &str，这里要 HeaderName/HeaderValue（SSE 侧用 builder 的 .header() 自动转换）。
     resp.headers_mut().insert(
-        INPUT_TOKEN_SCALE_HEADER,
-        CLIENT_TOKEN_DISPLAY_SCALE_HEADER,
+        axum::http::HeaderName::from_static(INPUT_TOKEN_SCALE_HEADER),
+        axum::http::HeaderValue::from_static(CLIENT_TOKEN_DISPLAY_SCALE_HEADER),
     );
     resp
 }
