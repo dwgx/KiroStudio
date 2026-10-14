@@ -144,8 +144,12 @@ impl RequestEndpoint {
 
     /// 入站路径 → 端点（**精确匹配**；未知路径兜底 [`RequestEndpoint::Other`]）。
     ///
-    /// 供写入链接线用：handler 从 `MatchedPath` / `Uri::path()` 取到路径后一行完成
-    /// 分类。未知路径不报错——新增路由忘配变体时记录仍完整，只是落进 `other` 桶。
+    /// ⚠️ **当前生产写入链不走本函数**（2026-10-14 独立验证核实）：路由处理器是共享的
+    /// （`post_messages` 被 `/v1/messages` 与两条 OpenAI 兼容路由复用、`count_tokens` 被
+    /// `/v1` 与 `/cc` 两条复用），拿不到 `MatchedPath`/`Uri`，故实际由路由入口**静态标注**
+    /// （`ClientInfo::with_endpoint` + 跨路由复用时的 task-local 覆盖）。
+    /// 本函数保留给**拿得到路径**的调用方与测试；也是「新增路由要同步补变体」的清单本体。
+    /// 未接线不报错——记录仍完整，只是落进 `other` 桶（诚实信号，不猜）。
     /// 不做前缀匹配：`/v1/messages/count_tokens` 与 `/v1/messages` 是两条不同路由。
     pub fn from_path(path: &str) -> Self {
         match path {
