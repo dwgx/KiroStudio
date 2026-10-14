@@ -2870,6 +2870,14 @@ impl MultiTokenManager {
         //
         // `Manual` 必须原样保留；旧文件缺原因时加载阶段也已回落成 Manual。`Unknown` 保守不动，
         // 避免擅自改写来自更新版本、当前无法理解的管理员状态。其余当前可识别原因都是自动写入。
+        //
+        // 被复活的 (id, 族键) 先收集：旁挂惩罚层的统一收口 `clear_revive_side_penalties`
+        // 只能在 `Self` 构造**之后**调 —— 冷却的持久化文件（`kiro_cooldown.json`）是
+        // `cooldown` 字段的构造表达式（`CooldownManager::with_data_dir` → `load()`）里
+        // 才读回内存的，构造前清 = 清了空表、随后 load 又把条目读回来（清了也白清）。
+        // 「先收集、后收口」与既有四个调用方「锁内收集 (id, 族键) → 锁外收口」同构
+        // （此处 entries 还是本地 Vec，无锁；分离只因 &self 尚不存在）。
+        let mut revived_legacy_custom_api: Vec<(u64, String)> = Vec::new();
         for entry in &mut entries {
             let legacy_auto_disabled = entry.credentials.is_custom_api_credential()
                 && entry.disabled
@@ -2886,7 +2894,17 @@ impl MultiTokenManager {
                 entry.credentials.disabled = false;
                 entry.credentials.disabled_reason = None;
                 entry.credentials.disabled_at = None;
+                // `quota_exhausted_at` **刻意不清**（四件套里唯一的例外）：它只被
+                // `recover_expired_quota_disables` 读取，而该函数第一道门就要求
+                // `disabled && reason == QuotaExceeded` —— 本迁移刚把 disabled 置 false，
+                // 恒不满足；custom_api 号此后唯一能写 disabled 的路径是管理员手动
+                // （`set_disabled` → Manual；report_* 自动禁用全被 `preserve_custom_api_state`
+                // 对代挂号提前返回挡住），也永远不会再满足该门。即残留值无任何消费点
+                // （trash/restore 只是原样搬运），清它属于超出迁移语义的多余写 ——
+                // 多动一个持久化字段就多担一份「改写旧版本数据」的风险。
                 has_reenabled_custom_api = true;
+                // 族键在收集期即取好（`family_key_cached` 是既有取键惯例，构造时已预计算）。
+                revived_legacy_custom_api.push((entry.id, entry.family_key_cached().to_string()));
                 tracing::warn!(
                     credential_id = entry.id,
                     ?old_reason,
@@ -3035,6 +3053,32 @@ impl MultiTokenManager {
         };
         // 播种冷却时长缩放(启动即用 config 值)。
         manager.cooldown.set_cooldown_scale_pct(cooldown_scale_pct);
+
+        // ⭐ 迁移复活的旧版 custom_api 号走统一收口清三层旁挂惩罚（cooldown + rate_limiter + health）。
+        //
+        // 为什么必须清：cooldown 是**持久化**的（`kiro_cooldown.json`，由上方 `Self` 构造里
+        // 的 `CooldownManager::with_data_dir` → `load()` 读回内存）—— 旧二进制在 401/402/403
+        // 上给代挂号写过的 180s~86400s 级冷却条目跨重启存活。迁移只解除 disabled 的话，
+        // 号仍会被 `select_custom_api_inner` 的 cooldown 硬门**静默跳过**：面板已启用、
+        // 调度零流量，与 `set_disabled(false)` 刚修完的同型缺陷（本条是第五条复活路径）。
+        // rate_limiter / health 是进程内结构、构造期恒为空，此处 clear 为 no-op；本路径
+        // 唯一可能非空的就是 cooldown，故不清会真的咬人。
+        //
+        // 为什么必须在 `Self` 构造**之后**：冷却文件是在 `cooldown` 字段的构造表达式里
+        // 读入的（`with_data_dir` 构造即 load）；构造前清 = 清了空表、load 随后又把条目
+        // 读回来（清了也白清）。收集在迁移循环里、清在这里，见那里的注释。
+        // 禁止手写清零列表：三层收口唯一（`clear_revive_side_penalties`），本仓已因此踩过两次。
+        for (id, key) in &revived_legacy_custom_api {
+            manager.clear_revive_side_penalties(*id, key);
+        }
+        // ⭐ 迁移的清除**立即落盘**（这里与四个运行时调用方刻意不对称）：那些路径清完靠
+        // 30s debounce 落盘即可 —— 它们可重触发（人工再点启用 / 自愈环 / 下月恢复）；
+        // 本迁移是**一次性**的：下方 `persist_credentials` 一旦把 disabled=false 写回磁盘，
+        // 下次重启该号已不是「旧版自动禁用」、迁移不再触发。若进程在 debounce 窗口内被
+        // 硬杀（本仓线上实测：41 次停机 39 次走到 SIGKILL），残留冷却条目就会在之后每次
+        // 重启都把号静默跳过（且再无自动清除路径），直到冷却到期 —— 正是本条修复要消除
+        // 的形态。故先于凭据落盘强制 flush（仅 dirty 才写盘：没有冷却被清时零副作用）。
+        manager.cooldown.flush_now();
 
         // 补全字段或迁移旧版 custom_api 自动禁用后，立即写回配置文件。
         if has_new_ids || has_new_machine_ids || has_reenabled_custom_api {
@@ -4058,7 +4102,8 @@ impl MultiTokenManager {
     /// `clear_transient_counters` 收口），这一轮是两条**自动**路径漏了 `health`
     /// （2026-10-14 独立验证标出）——同一种失败形态，故这次把「三层旁挂惩罚」的清除
     /// 收口到本函数（当前调用方：`reset_and_enable` / `set_disabled(false)` 启用分支 /
-    /// 全池自愈块 / 跨月额度恢复 —— 四条复活路径**全部**走同一收口，不再有手写清零列表）。
+    /// 全池自愈块 / 跨月额度恢复 / `new()` 的旧版 custom_api 自动禁用迁移 —— 五条复活
+    /// 路径**全部**走同一收口，不再有手写清零列表）。
     ///
     /// # 为什么 health 必须一起清（不清则「复活」是假的）
     ///
@@ -11367,5 +11412,159 @@ mod revive_clears_health_and_stale_arn_tests {
             "回退即 FAIL：额度恢复后熔断仍 Open —— 恢复的号被 p_avail=0 沉底（unusable）+\
              亲和硬拒，最长 30min 不出活（与人工「重置并启用」同一缺陷形态）"
         );
+    }
+}
+
+// ===== 2026-10-14：第五条复活路径 —— 旧版 custom_api 自动禁用迁移的清惩罚层回归 =====
+//
+// 本轮改动被限定只动 token_manager.rs，用例内联在文件尾（与上方两个内联模块同款）。
+// 对既有源码守卫无影响——守卫按**第一个** `#[cfg(test)]` 截断生产段
+// （本模块在 `mod tests;` 之后，截断点不变）。
+#[cfg(test)]
+mod legacy_custom_api_migration_clears_cooldown_tests {
+    use super::*;
+
+    /// 代挂号夹具（与 `quota_recovery_and_starvation_tests::mk_custom` 同款；
+    /// 该模块私有，本模块自备一份）。
+    fn mk_custom(id: u64) -> KiroCredentials {
+        let mut c = KiroCredentials::default();
+        c.id = Some(id);
+        c.auth_method = Some("custom_api".to_string());
+        c.base_url = Some(format!("https://relay{id}.example.invalid"));
+        c.api_key = Some(format!("sk-relay-{id}"));
+        c
+    }
+
+    /// 该代挂号此刻能否被 `select_custom_api` 选中——直接复用真实选号的
+    /// `select_custom_api_inner`（peek 模式：不占位、不记账），与生产同一判据、
+    /// 同一过滤链，杜绝「测试自检」与「真实选号」各写一份而漂移
+    /// （与 `revive_clears_health_and_stale_arn_tests::selectable` 同款形态）。
+    ///
+    /// ⚠️ 不能用 `is_entry_selectable`：它第一道自定义门就 `return false` 掉全部
+    /// custom_api（Kiro 路径永不碰代挂号，两池隔离铁律），对代挂号恒假、测不到冷却。
+    /// 返回「选中者就是 id」：本夹具池内至多一个可选候选，等价于逐 id 判定。
+    fn custom_api_selectable(mgr: &MultiTokenManager, id: u64) -> bool {
+        mgr.select_custom_api_inner(&std::collections::HashSet::new(), None, true)
+            .map(|(hit, _, _)| hit == id)
+            .unwrap_or(false)
+    }
+
+    /// 🔴 第五条复活路径：`new()` 里旧版 custom_api 自动禁用的迁移，必须对复活号
+    /// 走**统一收口**清三层旁挂惩罚（cooldown + rate_limiter + health）——2026-10-14
+    /// 独立验证（VerClosure）标出前四条收口后仍漏掉的一条。
+    ///
+    /// **旧代码为何失败**：cooldown 是**持久化**的（`kiro_cooldown.json`，`with_data_dir`
+    /// 构造即 load）。旧二进制在 401/402/403 上给代挂号写过的长冷却跨重启存活；迁移只把
+    /// disabled 解除、不清冷却 ⇒ 号被 `select_custom_api_inner` 的 cooldown 硬门**静默
+    /// 跳过**：面板已启用、调度零流量，与 `set_disabled(false)` 刚修完的同型缺陷。
+    /// rate_limiter / health 是进程内构造期为空，唯一可能非空的就是这条持久化 cooldown。
+    ///
+    /// 时序承重：冷却文件在 `Self` 构造表达式里才 load，故收口必须**构造之后**调
+    /// （构造前清 = 清了空表，load 又把条目读回来）。把收口循环删掉（或挪到构造前），
+    /// 本测试即红。
+    #[test]
+    fn legacy_custom_api_migration_clears_persisted_cooldown_so_cred_is_selectable_immediately() {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro-legacy-custom-api-revive-cooldown-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cred_path = dir.join("kiro_credentials.json");
+        // cooldown.rs 的 COOLDOWN_STATE_FILE（常量未导出，此处按字面量断言）。
+        let cooldown_file = dir.join("kiro_cooldown.json");
+        // 清掉上次运行可能残留的冷却文件，保证阶段 1 的落盘是本次唯一来源。
+        std::fs::remove_file(&cooldown_file).ok();
+
+        let mut config = Config::default();
+        config.cooldown_enabled = true;
+
+        // ── 阶段 1（旧二进制的现场）：给两个代挂号留下**未过期**的持久化冷却。
+        {
+            let mgr = MultiTokenManager::new(
+                config.clone(),
+                vec![mk_custom(1), mk_custom(2)],
+                None,
+                Some(cred_path.clone()),
+                false,
+            )
+            .unwrap();
+            assert!(
+                mgr.cooldown_custom_api(1, 86400, CooldownReason::AuthenticationFailed),
+                "夹具自检：cooldown_enabled=true 时冷却必须真的写上（否则本测试测不到迁移）"
+            );
+            assert!(mgr.cooldown_custom_api(2, 86400, CooldownReason::AuthenticationFailed));
+            assert!(
+                mgr.cooldown.check_cooldown(1).is_some()
+                    && mgr.cooldown.check_cooldown(2).is_some(),
+                "夹具自检：冷却未过期，必须在内存中生效"
+            );
+            mgr.cooldown.flush_now();
+            assert!(
+                cooldown_file.exists(),
+                "夹具自检：冷却状态必须已落盘（阶段 2 的重启才可能把它读回）"
+            );
+        }
+
+        // ── 阶段 2（升级后首次重启）：#1 带旧版自动禁用（迁移会复活它），#2 保持启用
+        //（对照组：它没有任何内存冷却写入点，冷却只可能来自阶段 1 的持久化文件）。
+        let mut legacy = mk_custom(1);
+        legacy.disabled = true;
+        legacy.disabled_reason = Some(DisabledReason::PassthroughFailed);
+        legacy.disabled_at = Some("2026-07-01T00:00:00+00:00".to_string());
+        let mgr = MultiTokenManager::new(
+            config,
+            vec![legacy, mk_custom(2)],
+            None,
+            Some(cred_path),
+            false,
+        )
+        .unwrap();
+
+        // 夹具自检 ①：迁移已解除 #1 的旧版自动禁用（否则后面的断言与迁移无关）。
+        {
+            let entries = mgr.entries.lock();
+            let e = entries.iter().find(|e| e.id == 1).expect("号应在池中");
+            assert!(
+                !e.disabled && e.disabled_reason.is_none(),
+                "夹具自检：旧版自动禁用必须先被迁移解除"
+            );
+        }
+        // 夹具自检 ②：持久化冷却确实被 load 回内存，且冷却硬门真的会挡住选号——
+        // 未被迁移触碰的对照号 #2 冷却仍在、且选不出来。
+        assert!(
+            mgr.cooldown.check_cooldown(2).is_some(),
+            "夹具自检：持久化冷却必须被 load 回内存（对照号 #2 无任何内存写入点）"
+        );
+        assert!(
+            !custom_api_selectable(&mgr, 2),
+            "夹具自检：冷却硬门必须真的挡住选号（对照号 #2）"
+        );
+
+        // ── 被测行为：迁移复活的 #1 必须立刻可选——冷却被统一收口清掉。
+        assert!(
+            mgr.cooldown.check_cooldown(1).is_none(),
+            "回退即 FAIL：迁移复活后持久化冷却残留——#1 会被 select_custom_api_inner \
+             的 cooldown 硬门静默跳过（面板已启用、调度零流量）"
+        );
+        assert!(
+            custom_api_selectable(&mgr, 1),
+            "回退即 FAIL：迁移复活后 #1 仍不可选——「解除自动禁用」在调度上无效"
+        );
+
+        // ── 清除必须**当场落盘**：迁移是一次性的（凭据已启用写回磁盘，下次重启不再触发），
+        // 若靠 debounce 落盘，窗口内被硬杀 → 残留冷却跨重启存活且再无自动清除路径。
+        let raw = std::fs::read_to_string(&cooldown_file).unwrap();
+        let parsed: std::collections::HashMap<String, serde_json::Value> =
+            serde_json::from_str(&raw).unwrap();
+        assert!(
+            !parsed.contains_key("1"),
+            "迁移的清除必须立即落盘：#1 不得仍留在 kiro_cooldown.json（否则硬杀重启后残留冷却把号静默跳过）"
+        );
+        assert!(
+            parsed.contains_key("2"),
+            "对照号 #2 的冷却必须原样保留（flush 只写清除后的全量快照，不得误删他人条目）"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
