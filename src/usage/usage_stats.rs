@@ -18,7 +18,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 
 use super::pipeline::UsageSink;
-use super::record::{RequestOutcome, RequestRecord};
+use super::record::{RequestEndpoint, RequestOutcome, RequestRecord};
 use crate::model::config::ModelPrice;
 
 /// 小时环形桶数量：24×31，覆盖最近 31 天的逐小时数据
@@ -691,6 +691,13 @@ struct Inner {
     /// 解决 F1/A2：`Aggregate` 只存 success/failure 二值，429/配额/auth 分布画不出，
     /// 只能 `traces/search?outcome=` 逐条过滤。
     by_outcome: HashMap<RequestOutcome, Aggregate>,
+    /// 按**入站端点**全量累计（key = [`RequestEndpoint`]，**封闭枚举** 6 变体；
+    /// `None` = 记录时无端点信息，独立成桶，见 [`Self::ENDPOINT_KEY_UNKNOWN`]）。
+    ///
+    /// 与 `by_outcome` 同款：key 非外部可控字符串 → 天然有界（≤ 变体数 + None 桶），
+    /// 无需 by_model 的截断/OTHER 归并。旧数据（无该列）与写入链接线前的记录全部
+    /// 归入 `(unknown)` 桶，与「已知的其它路径」（`other`）刻意分开。
+    by_endpoint: HashMap<Option<RequestEndpoint>, Aggregate>,
     /// per-credential 速率环
     rate: RateRing,
     /// 下游客户端 / 窗口维度的滚动速率聚合（Task5）
@@ -713,6 +720,15 @@ impl Inner {
     const MODEL_KEY_CAP: usize = 256;
     /// 超出 [`Self::MODEL_KEY_CAP`] 后的归并桶名。
     const MODEL_KEY_OTHER: &'static str = "(other)";
+    /// `by_endpoint` 中「记录时无端点信息」（`None`）的归并桶名。
+    ///
+    /// 覆盖两类记录：旧数据（该列晚于历史行引入）+ 写入链接线前的全部记录
+    /// （见 `RequestRecord::endpoint` 的接线状态说明）。带括号的命名与
+    /// [`Self::MODEL_KEY_OTHER`] 同风格：真实存储码都是纯 snake_case，括号串不可能
+    /// 与它们撞名。刻意与 `other`（[`RequestEndpoint::Other`]，已知集合之外的路径）
+    /// 分开 —— 「没记录端点」和「记录了但不在已知集合里」是两种事实，
+    /// 混成一个桶会把接线缺口藏起来。
+    const ENDPOINT_KEY_UNKNOWN: &'static str = "(unknown)";
 
     /// 把模型名收敛成**有界**的模型表 key（两表共用）。
     ///
@@ -748,6 +764,7 @@ impl Inner {
             by_requested_model: HashMap::new(),
             by_credential: HashMap::new(),
             by_outcome: HashMap::new(),
+            by_endpoint: HashMap::new(),
             rate: RateRing::default(),
             client_agg: ClientAgg::default(),
             throughput: GlobalThroughputRing::default(),
@@ -840,6 +857,13 @@ impl Inner {
         // 本表条目数恒 ≤ 变体数，有测试钉死守恒与有界。历史 JSONL 重放走同一 apply，
         // 未知 outcome 反序列化即失败（serde 枚举），不会产生表外 key。
         self.by_outcome.entry(r.outcome).or_default().add(r);
+
+        // 按入站端点累计（key = Option<RequestEndpoint>：Some(变体) + None 桶）。
+        // key 是封闭枚举 + Option → 天然有界（≤ 变体数 + 1），无需 by_model 那套
+        // 截断/OTHER 归并；None（旧数据缺列 / 写入链尚未接线）独立成桶，见
+        // ENDPOINT_KEY_UNKNOWN —— 与 Some(Other)（已知集合之外的路径）刻意分开。
+        // 每条记录必进且只进一个桶 → 各 key 的 requests 之和恒等于总请求数（守恒）。
+        self.by_endpoint.entry(r.endpoint).or_default().add(r);
 
         // 下游客户端 / 窗口维度速率（与 credential 速率共用同一 30 秒桶编号）
         self.client_agg.bump(r, rate_slot);
@@ -1622,6 +1646,34 @@ impl UsageStats {
         out
     }
 
+    /// 按**入站端点**全量聚合（按请求数降序，key = [`RequestEndpoint::as_str`] 的
+    /// snake_case 存储码：`messages` / `count_tokens` / `chat_completions` /
+    /// `responses` / `messages_cc` / `other`；`None` → `(unknown)`，见
+    /// [`Inner::ENDPOINT_KEY_UNKNOWN`]）。
+    ///
+    /// 补齐「流量与失败率按端点怎么分布」这一维（对手面板的 by model/endpoint 对照
+    /// 缺口）：OpenAI SDK / Codex 客户端出问题时不再只能翻原始日志逐条 grep。
+    /// 各 key 的 `requests` 之和恒等于总请求数（每条记录必进且只进一个桶）。
+    ///
+    /// 成本不按端点估算（单价表按模型配置）——与 [`Self::by_credential`] /
+    /// [`Self::by_outcome`] 同先例，`cost` 随行下发恒 0.0。
+    pub fn by_endpoint(&self) -> Vec<GroupStat> {
+        let inner = self.inner.lock();
+        let mut out: Vec<GroupStat> = inner
+            .by_endpoint
+            .iter()
+            .map(|(k, a)| {
+                let key = match k {
+                    Some(ep) => ep.as_str().to_string(),
+                    None => Inner::ENDPOINT_KEY_UNKNOWN.to_string(),
+                };
+                GroupStat::from(key, a, None)
+            })
+            .collect();
+        out.sort_by(|a, b| b.requests.cmp(&a.requests).then(a.key.cmp(&b.key)));
+        out
+    }
+
     /// 某凭据最近 10 分钟每 30 秒的请求数（20 个点，从旧到新），供前端画 sparkline。
     pub fn recent_rate(&self, credential_id: u64) -> Vec<u32> {
         self.recent_rate_at(credential_id, chrono::Utc::now().timestamp_millis())
@@ -2162,6 +2214,87 @@ mod tests {
         assert_eq!(rows.len(), n);
         let model_total: u64 = s.by_model(&no_pricing()).iter().map(|m| m.requests).sum();
         assert_eq!(model_total, n as u64);
+    }
+
+    /// by_endpoint 聚合口径：分桶 / 守恒 / 排序 / 成本恒 0；None（旧数据缺列）与
+    /// Other（已知集合之外的路径）必须分开成桶。
+    #[test]
+    fn by_endpoint_groups_conserves_and_separates_unknown_from_other() {
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        // messages ×2（1 成功 1 限流）、responses ×1、other ×1、None（旧数据）×1
+        let mut ok = rec(0, Some(1), "m", RequestOutcome::Success, 10, 5);
+        ok.endpoint = Some(RequestEndpoint::Messages);
+        s.on_record(&ok);
+        let mut limited = rec(1_000, Some(1), "m", RequestOutcome::RateLimited, 1, 0);
+        limited.endpoint = Some(RequestEndpoint::Messages);
+        s.on_record(&limited);
+        let mut resp = rec(2_000, Some(1), "m", RequestOutcome::Success, 2, 1);
+        resp.endpoint = Some(RequestEndpoint::Responses);
+        s.on_record(&resp);
+        let mut other = rec(3_000, Some(1), "m", RequestOutcome::Success, 3, 1);
+        other.endpoint = Some(RequestEndpoint::Other);
+        s.on_record(&other);
+        // 旧数据：缺 endpoint 列 → None（`rec` 用 ::new，默认 None）
+        s.on_record(&rec(4_000, Some(1), "m", RequestOutcome::Success, 4, 2));
+
+        let rows = s.by_endpoint();
+        let row = |k: &str| rows.iter().find(|r| r.key == k).unwrap();
+
+        let messages = row("messages");
+        assert_eq!(messages.requests, 2);
+        assert_eq!(messages.success_rate, 0.5, "1 成功 / 2 请求");
+        assert_eq!(messages.input_tokens, 11, "10 + 1");
+
+        // 请求数降序；同请求数按 key 升序（"(" < "o" < "r"）
+        assert_eq!(rows[0].key, "messages");
+        let one_rows: Vec<&str> = rows[1..].iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(one_rows, vec!["(unknown)", "other", "responses"]);
+
+        // None 与 Some(Other) 分开成桶（「没记录端点」≠「已知集合之外的路径」）
+        assert_eq!(row("(unknown)").requests, 1);
+        assert_eq!(row("other").requests, 1);
+
+        // 守恒：各桶请求数之和 = 总请求数
+        let total: u64 = rows.iter().map(|r| r.requests).sum();
+        assert_eq!(total, 5, "端点分布必须守恒");
+
+        // 成本不按端点估算（与 by_credential / by_outcome 同先例，恒 0）
+        assert!(rows.iter().all(|r| r.cost == 0.0));
+    }
+
+    /// by_endpoint 的 key 是封闭枚举 + None 桶：任意灌入有界（≤ 6 变体 + 1），
+    /// 且 JSON 出口用 snake_case 存储码（前端按码查 i18n，不得出现 camelCase）。
+    #[test]
+    fn by_endpoint_is_bounded_and_serializes_snake_case_codes() {
+        let s = UsageStats::new(std::env::temp_dir().join("kiro_us_test_ignore"));
+        for (i, ep) in RequestEndpoint::ALL.iter().enumerate() {
+            let mut r = rec(i as i64 * 1_000, Some(1), "m", RequestOutcome::Success, 1, 1);
+            r.endpoint = Some(*ep);
+            s.on_record(&r);
+        }
+        // None 桶（旧数据形态）
+        s.on_record(&rec(9_000, Some(1), "m", RequestOutcome::Success, 1, 1));
+
+        let rows = s.by_endpoint();
+        assert_eq!(
+            rows.len(),
+            RequestEndpoint::ALL.len() + 1,
+            "6 变体 + (unknown) 桶"
+        );
+        assert!(
+            rows.len() <= RequestEndpoint::ALL.len() + 1,
+            "by_endpoint 必须有界"
+        );
+
+        let json = serde_json::to_string(&rows).unwrap();
+        for ep in RequestEndpoint::ALL {
+            assert!(
+                json.contains(&format!("\"key\":\"{}\"", ep.as_str())),
+                "存储码必须原样下发（{ep:?}）：{json}"
+            );
+        }
+        assert!(json.contains("\"key\":\"(unknown)\""), "{json}");
+        assert!(!json.contains("messagesCc"), "出口不得 camelCase：{json}");
     }
 
     /// ⭐ 成本估算纯函数：输入 tokens（gross 口径）+ 单价 → 元。
@@ -3168,6 +3301,42 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// 旧数据兼容（JSONL 侧）：历史行没有 endpoint 键 → 重放归入 `(unknown)` 桶，
+    /// 新行按存储码归桶；两者混在同一份 JSONL 里必须都进聚合、都不计 parse_error。
+    #[test]
+    fn rebuild_replays_legacy_jsonl_without_endpoint_into_unknown_bucket() {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro_us_ep_legacy_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // 手工拼一条「旧版」行：没有任何 endpoint 键（历史 JSONL 的真实形态）
+        let legacy = r#"{"request_id":"old-1","ts_ms":1783036800000,"credential_id":1,"model":"m","is_streaming":false,"input_tokens":1,"output_tokens":1,"credits_used":null,"latency_ms":1,"first_token_ms":null,"outcome":"success","retries":0,"error_message":null,"session_id":null}"#;
+        // 新版行：带 endpoint 存储码
+        let mut fresh = rec(1_000, Some(1), "m", RequestOutcome::Success, 1, 1);
+        fresh.endpoint = Some(RequestEndpoint::ChatCompletions);
+        let fresh_line = serde_json::to_string(&fresh).unwrap();
+
+        let path = dir.join("usage-2026-07-03.jsonl");
+        fs::write(&path, format!("{legacy}\n{fresh_line}\n")).unwrap();
+
+        let s = UsageStats::new(dir.clone());
+        s.rebuild_from_logs_at(chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap());
+        assert_eq!(s.parse_error_count(), 0, "旧行缺列不得算解析失败");
+
+        let rows = s.by_endpoint();
+        let row = |k: &str| rows.iter().find(|r| r.key == k).unwrap();
+        assert_eq!(row("(unknown)").requests, 1, "旧行必须归入 (unknown) 桶");
+        assert_eq!(row("chat_completions").requests, 1);
+        let total: u64 = rows.iter().map(|r| r.requests).sum();
+        assert_eq!(total, 2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_rebuild_missing_dir_is_noop() {
         let dir = std::env::temp_dir().join(format!("kiro_us_absent_{}", std::process::id()));
@@ -3701,6 +3870,31 @@ mod tests {
         assert!(
             prod.contains(&needle2),
             "by_outcome() 查询方法必须存在（删掉 = /usage/by-outcome 无法返回）"
+        );
+    }
+
+    /// 源码守卫（对手对照缺口）：by_endpoint 聚合必须接线在 `Inner::apply` 里。
+    ///
+    /// 删掉 apply() 里的累计行 → **编译不报错**（by_endpoint 只是少累计），
+    /// `/usage/by-endpoint` 静默返回空表 —— 本守卫靠 needle 钉死接线存在。
+    ///
+    /// 回退即 FAIL：apply() 里对 by_endpoint 的累计入口消失。
+    #[test]
+    fn apply_must_wire_by_endpoint_aggregation() {
+        let src = include_str!("usage_stats.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        // needle 运行时拼接（守卫纪律）：字面量只出现在被守卫的代码里
+        let needle = format!("self.by_endpoint.entry(r.endpoint){}", "");
+        assert!(
+            prod.contains(&needle),
+            "apply() 必须按入站端点累计进 by_endpoint（删掉接线 = 端点视图静默归零）"
+        );
+        // 查询出口同样不能丢：by_endpoint() 方法必须存在
+        let needle2 = format!("pub fn by_endpoint({})", "&self");
+        assert!(
+            prod.contains(&needle2),
+            "by_endpoint() 查询方法必须存在（删掉 = /usage/by-endpoint 无法返回）"
         );
     }
 }

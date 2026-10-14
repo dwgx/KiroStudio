@@ -91,7 +91,12 @@ pub async fn post_chat_completions(
 
     // 复用现有 Anthropic 管线(custom_api 透传 / failover / 工具修复 / 泄漏清洗 / 用量埋点)。
     // 传入合成的 Anthropic 请求体 + 原始 headers(用于 CC 识别/client 画像/鉴权已在中间件过)。
-    let anthropic_resp = crate::anthropic::handlers::post_messages(
+    //
+    // ⚠ 必须走 `post_messages_for_endpoint`（而不是直调 `post_messages`）：用量记录按
+    // **真实入站路由**分类，直调四参会把本端点的记录错记成 messages（端点分类是入站
+    // 封闭集合的一部分，客户端无法自定义，故只能由这里显式标注）。
+    let anthropic_resp = crate::anthropic::handlers::post_messages_for_endpoint(
+        crate::usage::record::RequestEndpoint::ChatCompletions,
         State(state),
         ConnectInfo(peer),
         headers,
@@ -164,7 +169,10 @@ pub async fn post_responses(
 
     tracing::info!(model = %model, resolved = %resolved_model, stream = %stream, "Received POST /v1/responses request");
 
-    let anthropic_resp = crate::anthropic::handlers::post_messages(
+    // 同 chat/completions：端点必须显式标注为 Responses（直调 post_messages 会被记成
+    // messages，面板上 OpenAI 流量凭空消失且没有任何运行时信号）。
+    let anthropic_resp = crate::anthropic::handlers::post_messages_for_endpoint(
+        crate::usage::record::RequestEndpoint::Responses,
         State(state),
         ConnectInfo(peer),
         headers,
@@ -999,6 +1007,57 @@ mod tests {
             3,
             "定义 1 次 + post_chat_completions / post_responses 各调 1 次；当前 {} 次",
             impl_region.matches(&needle).count()
+        );
+    }
+
+    /// 入站端点标注：两条 OpenAI 兼容路由都必须经 `post_messages_for_endpoint` 调用共享
+    /// Anthropic 管线，且各传自己的 `RequestEndpoint` 变体。
+    ///
+    /// 回退即 FAIL：直调四参 `handlers::post_messages`（无端点信息）会把本端点的用量记录
+    /// 错记成 `messages` —— 记录照样落库、面板照样显示，只是分类错，没有任何运行时信号
+    /// （`endpoint` 恒 None 时面板至少还能显示 `(unknown)`，错分类连这点线索都没有），
+    /// 故只能靠本守卫拦。
+    #[test]
+    fn inbound_endpoint_is_tagged_per_openai_route() {
+        let src = include_str!("handlers.rs");
+        let tests_start = src.find("mod tests").unwrap_or(src.len());
+        let prod = &src[..tests_start];
+
+        fn slice_fn<'a>(src: &'a str, sig: &str) -> &'a str {
+            let start = src.find(sig).unwrap_or_else(|| panic!("{sig} 必须存在"));
+            let rest = &src[start..];
+            let end = rest.find("\n}\n").unwrap_or(rest.len());
+            &rest[..end]
+        }
+
+        let tagged = format!("{}::post_messages{}", "handlers", "_for_endpoint(");
+        let chat = slice_fn(prod, "pub async fn post_chat_completions(");
+        assert!(
+            chat.contains(tagged.as_str()),
+            "chat/completions 必须经 post_messages_for_endpoint 调用共享管线（端点分类）"
+        );
+        let chat_ep = format!("{}{}", "RequestEndpoint::", "ChatCompletions");
+        assert!(
+            chat.contains(chat_ep.as_str()),
+            "chat/completions 必须标注 ChatCompletions"
+        );
+
+        let resp = slice_fn(prod, "pub async fn post_responses(");
+        assert!(
+            resp.contains(tagged.as_str()),
+            "responses 必须经 post_messages_for_endpoint 调用共享管线（端点分类）"
+        );
+        let resp_ep = format!("{}{}", "RequestEndpoint::", "Responses");
+        assert!(
+            resp.contains(resp_ep.as_str()),
+            "responses 必须标注 Responses"
+        );
+
+        // 直连共享管线（绕过标注）= 端点分类必错，生产段零容忍。
+        let direct = format!("{}::post_messages(", "handlers");
+        assert!(
+            !prod.contains(direct.as_str()),
+            "不得绕过 post_messages_for_endpoint 直调共享管线（会丢掉入站端点分类）"
         );
     }
 }

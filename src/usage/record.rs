@@ -85,6 +85,95 @@ impl RequestOutcome {
     }
 }
 
+/// **入站端点**分类：本服务对外暴露、会产出用量记录的请求路径。
+///
+/// 为什么用**枚举**而不是裸字符串：
+/// - 入站路径是**封闭集合**（`src/anthropic/router.rs` 注册的路由，客户端无法自定义）
+///   —— 与 [`RequestOutcome`] 同款：天然有界，聚合表条目数恒 ≤ 变体数 + 1（None 桶），
+///   无需 `by_model` 那套「超长截断 + 表满归并」防无界增长；
+/// - 存储码（[`Self::as_str`]）稳定，JSONL / SQLite / admin API 三个出口共用同一码，
+///   前端按码查 i18n 译文（与 outcome 的 snake_case 同约定）；
+/// - 漏列新路径时 match 穷尽性由编译器兜底，扩展点收口在本文件。
+///
+/// ⚠ 概念区分：这里的「端点」是**入站**请求路径；凭据级 `endpoint`（ide / cli，
+/// 见 admin 的 `/endpoint-health` 与 `/credentials/{id}/endpoint`）指的是**上游**
+/// 协议风格，两者不是一回事。
+///
+/// 扩展方式：新增入站路径时 —— ① 在此加一个变体，并同步 [`Self::ALL`]、
+/// [`Self::as_str`]、[`Self::from_path`]、[`Self::from_code`]（编译器会把漏掉的
+/// match 全部标红）；②（可选）前端补该存储码的译文，缺省直接显示码。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestEndpoint {
+    /// `POST /v1/messages`（Anthropic Messages API 主路径）
+    Messages,
+    /// `POST /v1/messages/count_tokens`（token 计数，不转发上游对话）
+    CountTokens,
+    /// `POST /v1/chat/completions`（OpenAI 兼容入站，翻译后复用同一管线）
+    ChatCompletions,
+    /// `POST /v1/responses`（OpenAI Responses API 兼容入站）
+    Responses,
+    /// `POST /cc/v1/messages`（Claude Code 兼容端点：流式等 contextUsageEvent）
+    MessagesCc,
+    /// 已知集合之外的其它入站路径（兜底：新增路由漏配变体时不炸、不丢记录）
+    Other,
+}
+
+impl RequestEndpoint {
+    /// 封闭枚举全部变体（统计有界测试 / SQLite roundtrip 共用，避免漏列）。
+    pub const ALL: [RequestEndpoint; 6] = [
+        RequestEndpoint::Messages,
+        RequestEndpoint::CountTokens,
+        RequestEndpoint::ChatCompletions,
+        RequestEndpoint::Responses,
+        RequestEndpoint::MessagesCc,
+        RequestEndpoint::Other,
+    ];
+
+    /// 存储码（JSONL / SQLite / admin API 下发值；与 serde snake_case 一致）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RequestEndpoint::Messages => "messages",
+            RequestEndpoint::CountTokens => "count_tokens",
+            RequestEndpoint::ChatCompletions => "chat_completions",
+            RequestEndpoint::Responses => "responses",
+            RequestEndpoint::MessagesCc => "messages_cc",
+            RequestEndpoint::Other => "other",
+        }
+    }
+
+    /// 入站路径 → 端点（**精确匹配**；未知路径兜底 [`RequestEndpoint::Other`]）。
+    ///
+    /// 供写入链接线用：handler 从 `MatchedPath` / `Uri::path()` 取到路径后一行完成
+    /// 分类。未知路径不报错——新增路由忘配变体时记录仍完整，只是落进 `other` 桶。
+    /// 不做前缀匹配：`/v1/messages/count_tokens` 与 `/v1/messages` 是两条不同路由。
+    pub fn from_path(path: &str) -> Self {
+        match path {
+            "/v1/messages" => RequestEndpoint::Messages,
+            "/v1/messages/count_tokens" => RequestEndpoint::CountTokens,
+            "/v1/chat/completions" => RequestEndpoint::ChatCompletions,
+            "/v1/responses" => RequestEndpoint::Responses,
+            "/cc/v1/messages" => RequestEndpoint::MessagesCc,
+            _ => RequestEndpoint::Other,
+        }
+    }
+
+    /// 存储码 → 端点（[`Self::as_str`] 的逆；未知码兜底 [`RequestEndpoint::Other`]）。
+    ///
+    /// 与 trace_db 的 `parse_outcome` 同策略：**宽松兜底、不炸整行** —— 未来版本写入的
+    /// 新码在旧版本读库时落进 `other` 桶，而不是让「最近请求」整条查询报错。
+    pub fn from_code(code: &str) -> Self {
+        match code {
+            "messages" => RequestEndpoint::Messages,
+            "count_tokens" => RequestEndpoint::CountTokens,
+            "chat_completions" => RequestEndpoint::ChatCompletions,
+            "responses" => RequestEndpoint::Responses,
+            "messages_cc" => RequestEndpoint::MessagesCc,
+            _ => RequestEndpoint::Other,
+        }
+    }
+}
+
 /// 单次请求的最终结算记录
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestRecord {
@@ -124,6 +213,27 @@ pub struct RequestRecord {
     /// 与 [`Self::requested_model`] 同一批埋点写入，见 `provider.rs` 的 `mapped_model` 快照。
     #[serde(default)]
     pub upstream_model: Option<String>,
+    /// **入站端点**（本服务对外路径分类，见 [`RequestEndpoint`]）；`None` = 记录时无端点信息。
+    ///
+    /// 为什么是 `Option`：该列晚于历史数据引入 —— 旧 JSONL 行 / 旧 `traces` 行没有它，
+    /// `#[serde(default)]` 让旧数据反序列化为 None 而不报错（与 [`Self::requested_model`]
+    /// 等同款兼容策略）。聚合层把 None 归入 `(unknown)` 桶，与「已知的其它路径」
+    /// （[`RequestEndpoint::Other`]）刻意分开：一个是「没记录」，一个是「记录了但不在
+    /// 已知集合里」，混桶会掩盖接线缺口。
+    ///
+    /// 未知存储码（未来版本新增端点后降级回放）分两个读路径、按各自既有先例处理：
+    /// JSONL 重放与 [`RequestOutcome`] 同款 —— serde 枚举反序列化失败，该行计入
+    /// `parse_errors` 跳过；`traces` 表读路径经 [`RequestEndpoint::from_code`] 宽松
+    /// 兜底 `Other`（与 trace_db 的 `parse_outcome` 同策略）。
+    ///
+    /// ⚠ 接线状态（诚实边界）：现有写入链（`anthropic/handlers.rs` 的各 handler 与共享
+    /// 埋点辅助、`kiro/provider.rs` 的失败记录）**尚未**填本字段 —— 这些记录构造点当前
+    /// 拿不到入站路径（handler 未提取 `Uri` / `MatchedPath`），补这一环需要改
+    /// handlers / provider（不在本次可改文件范围，见任务 deferred）。故本字段当前恒为
+    /// None（聚合表现为单行 `(unknown)`）；数据契约、聚合、admin 路由与旧数据兼容已就绪，
+    /// 接线后即生效。
+    #[serde(default)]
+    pub endpoint: Option<RequestEndpoint>,
     /// 是否流式
     pub is_streaming: bool,
     /// 输入 tokens —— **gross 口径**（含 `cache_read_tokens` + `cache_creation_tokens`）。
@@ -198,6 +308,8 @@ impl RequestRecord {
             model: model.into(),
             requested_model: None,
             upstream_model: None,
+            // 写入链尚未接线（见字段注释）：构造时一律 None，由 handler 层在接线后回填。
+            endpoint: None,
             is_streaming: false,
             input_tokens: 0,
             output_tokens: 0,
@@ -593,6 +705,98 @@ mod tests {
             serde_json::to_string(&RequestOutcome::Interrupted).unwrap(),
             "\"interrupted\""
         );
+    }
+
+    /// 入站端点：5 条真实路径精确映射；近似路径不得误判（前缀相同 ≠ 同一端点）。
+    #[test]
+    fn endpoint_from_path_maps_five_inbound_routes() {
+        assert_eq!(
+            RequestEndpoint::from_path("/v1/messages"),
+            RequestEndpoint::Messages
+        );
+        assert_eq!(
+            RequestEndpoint::from_path("/v1/messages/count_tokens"),
+            RequestEndpoint::CountTokens
+        );
+        assert_eq!(
+            RequestEndpoint::from_path("/v1/chat/completions"),
+            RequestEndpoint::ChatCompletions
+        );
+        assert_eq!(
+            RequestEndpoint::from_path("/v1/responses"),
+            RequestEndpoint::Responses
+        );
+        assert_eq!(
+            RequestEndpoint::from_path("/cc/v1/messages"),
+            RequestEndpoint::MessagesCc
+        );
+        // 近似但非同一路由：精确匹配，全部兜底 Other（不得被前缀规则误吞）
+        for near in [
+            "/v1/messages/",
+            "/v1/messages/count_tokens/extra",
+            "/v1/models",
+            "/cc/v1/messages/count_tokens",
+            "",
+        ] {
+            assert_eq!(
+                RequestEndpoint::from_path(near),
+                RequestEndpoint::Other,
+                "{near:?} 不得被判为已知端点"
+            );
+        }
+    }
+
+    /// 封闭枚举：as_str / serde snake_case / ALL / from_code 四者一一对应；漏列新变体会红。
+    #[test]
+    fn endpoint_all_list_codes_and_serde_agree() {
+        assert_eq!(RequestEndpoint::ALL.len(), 6);
+        let mut codes = std::collections::HashSet::new();
+        for ep in RequestEndpoint::ALL {
+            let code = ep.as_str();
+            assert!(codes.insert(code), "存储码不得重复: {code}");
+            // from_code 与 as_str 互逆（SQLite 读回路径依赖这条）
+            assert_eq!(
+                RequestEndpoint::from_code(code),
+                ep,
+                "from_code 必须还原 {code}"
+            );
+            // serde 与 as_str 一致（JSONL / admin API 两个出口共用同一码）
+            let json = serde_json::to_string(&ep).unwrap();
+            assert_eq!(json, format!("\"{code}\""));
+            let back: RequestEndpoint = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, ep);
+        }
+        // 未知码兜底 Other、绝不报错（旧版本读未来版本写入的码）
+        assert_eq!(
+            RequestEndpoint::from_code("future_ep"),
+            RequestEndpoint::Other
+        );
+        assert_eq!(RequestEndpoint::from_code(""), RequestEndpoint::Other);
+    }
+
+    /// 端点字段：序列化 roundtrip 保留；旧 JSONL（缺字段）反序列化为 None 不报错。
+    #[test]
+    fn endpoint_record_roundtrip_and_legacy_missing() {
+        let mut rec = RequestRecord::new("req-ep", "claude-sonnet-4");
+        rec.endpoint = Some(RequestEndpoint::ChatCompletions);
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(
+            json.contains("\"endpoint\":\"chat_completions\""),
+            "序列化沿用 snake_case 存储码：{json}"
+        );
+        let back: RequestRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.endpoint, Some(RequestEndpoint::ChatCompletions));
+
+        // 旧 JSONL（早于本字段）：缺 endpoint 键 → serde default 补 None，反序列化成功
+        let legacy = r#"{"request_id":"req-old","ts_ms":1,"credential_id":null,"model":"claude-opus-4-8","is_streaming":false,"input_tokens":1,"output_tokens":1,"credits_used":null,"latency_ms":1,"first_token_ms":null,"outcome":"success","retries":0,"error_message":null,"session_id":null}"#;
+        let old: RequestRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            old.endpoint, None,
+            "历史 JSONL 缺字段必须回落 None，不炸反序列化"
+        );
+
+        // 构造默认 None（写入链尚未接线，见字段注释）
+        assert_eq!(RequestRecord::new("req-new", "m").endpoint, None);
     }
 
     #[test]

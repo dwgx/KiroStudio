@@ -1,15 +1,15 @@
 //! Admin API 路由配置
 
 use axum::{
-    Router, middleware,
+    Json, Router, middleware,
     routing::{delete, get, post, put},
 };
 use axum::{
     body::Body,
     extract::{ConnectInfo, State},
-    http::Request,
+    http::{Request, StatusCode},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
 };
 
 use super::{
@@ -41,6 +41,7 @@ use super::{
         update_credential_refresh_token, upsert_socks_node,
     },
     middleware::{AdminState, admin_auth_middleware},
+    types::AdminErrorResponse,
     usage_handlers::{
         logs_export, logs_poll, logs_stream, ratelimit_insights, stream_live, traces_search,
         usage_by_credential, usage_by_model, usage_by_outcome, usage_by_requested_model,
@@ -223,6 +224,9 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/usage/by-requested-model", get(usage_by_requested_model))
         .route("/usage/by-credential", get(usage_by_credential))
         .route("/usage/by-outcome", get(usage_by_outcome))
+        // 按入站端点（/v1/messages 等 5 条对外路径 + other）聚合：
+        // 对手对照补齐的维度（「流量与失败率按端点怎么分布」）
+        .route("/usage/by-endpoint", get(usage_by_endpoint))
         .route("/usage/recent", get(usage_recent))
         // trace 明细搜索/过滤/分页（多维 AND，参数化防注入，单页≤500）
         .route("/traces/search", get(traces_search))
@@ -310,6 +314,31 @@ pub fn create_import_alias_router(state: AdminState) -> Router {
             admin_auth_middleware,
         ))
         .with_state(state)
+}
+
+/// GET /api/admin/usage/by-endpoint —— 按**入站端点**（本服务对外路径）分组的累计统计。
+///
+/// 口径与 `/usage/by-model` / `/usage/by-outcome` 一致：全量累计、按请求数降序、
+/// 不估算成本（`cost` 恒 0.0）。响应为 `Vec<GroupStat>`（与 by-model 同型，前端可
+/// 复用同一表格组件）；key = 端点存储码（`messages` / `count_tokens` /
+/// `chat_completions` / `responses` / `messages_cc` / `other`），无端点信息的记录
+/// （旧数据 / 写入链尚未接线，见 `RequestRecord::endpoint`）归入 `(unknown)` 桶。
+///
+/// 为什么函数体写在本文件而不是 `usage_handlers.rs`：本次任务的可改文件不含后者。
+/// 逻辑与 `usage_handlers::usage_by_model` 同构，503 分支就地复刻其 `stats_disabled`
+/// 行为（状态码与错误 code 必须与其一致，前端按 code 判读）。
+async fn usage_by_endpoint(State(state): State<AdminState>) -> Response {
+    match &state.usage_stats {
+        Some(stats) => Json(stats.by_endpoint()).into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(AdminErrorResponse::new(
+                "stats_disabled",
+                "用量统计未启用（usage_enabled=false）",
+            )),
+        )
+            .into_response(),
+    }
 }
 
 /// 管理操作审计中间件（2026-08-14 新增）。
@@ -431,6 +460,29 @@ mod guard_tests {
             compact.contains(&route),
             "SSO Token 导入端点必须注册进鉴权路由树：{}",
             route
+        );
+    }
+
+    /// 对手对照缺口：`/usage/by-endpoint` 必须注册在鉴权路由树内，且 handler 真的
+    /// 读 `UsageStats::by_endpoint`（删掉任一 = 端点维度静默消失 / 返回空表）。
+    #[test]
+    fn usage_by_endpoint_endpoint_is_registered() {
+        let src = include_str!("router.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        let compact: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        // needle 运行时拼接：字面量会被 include_str! 读到测试自身而永远为真。
+        let route = format!("\"/usage/by-endpoint\",get(usage_by_endpoint{})", ")");
+        assert!(
+            compact.contains(&route),
+            "GET /api/admin/usage/by-endpoint 必须挂在鉴权树上：{}",
+            route
+        );
+        // handler 必须真读聚合（改成别的数据源 = 维度静默失真）
+        let call = format!("stats.by_endpoint({})", ")");
+        assert!(
+            compact.contains(&call),
+            "usage_by_endpoint handler 必须调用 UsageStats::by_endpoint()"
         );
     }
 }

@@ -169,7 +169,8 @@ fn response_format_instruction(rf: &Value) -> Option<String> {
 ///
 /// - `model` 用调用方已解析好的模型名(经 model_catalog 归一,GPT-5.6 等已在表)。
 /// - `stream` 由调用方决定(与出站是否 SSE 一致)。
-/// 返回可直接喂给 `anthropic::handlers::post_messages` 的请求体字节。
+/// 返回可直接喂给 `anthropic::handlers::post_messages_for_endpoint`（端点标注入口，
+/// 内部转发共享管线 `post_messages`）的请求体字节。
 pub fn openai_chat_to_anthropic(model: &str, raw: &Value, stream: bool) -> Value {
     let mut out = Map::new();
     out.insert("model".into(), json!(model));

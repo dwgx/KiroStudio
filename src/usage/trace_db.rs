@@ -40,7 +40,7 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, Row, ToSql, params, params_from_iter};
 
 use super::pipeline::UsageSink;
-use super::record::{RequestOutcome, RequestRecord};
+use super::record::{RequestEndpoint, RequestOutcome, RequestRecord};
 
 /// 追踪明细查询的最大单页条数（保护内存/带宽：单次 search 最多取这么多行）。
 pub const MAX_SEARCH_LIMIT: usize = 500;
@@ -321,6 +321,9 @@ impl TraceDb {
             "ALTER TABLE traces ADD COLUMN interrupted_bytes INTEGER",
             // 链内首选号（历史库补列，默认 NULL = 无 failover 信息，兼容旧数据）
             "ALTER TABLE traces ADD COLUMN first_attempted_credential_id INTEGER",
+            // 入站端点（历史库补列，默认 NULL = 记录时无端点信息，兼容旧数据；
+            // 聚合层把 NULL 归入 `(unknown)` 桶，见 usage_stats 的 by_endpoint）
+            "ALTER TABLE traces ADD COLUMN endpoint TEXT",
         ];
         for sql in add_columns {
             if let Err(e) = conn.execute(sql, []) {
@@ -372,7 +375,8 @@ impl TraceDb {
                 requested_model       TEXT,
                 upstream_model        TEXT,
                 interrupted_bytes     INTEGER,
-                first_attempted_credential_id INTEGER
+                first_attempted_credential_id INTEGER,
+                endpoint              TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_traces_ts_ms ON traces(ts_ms);
             CREATE INDEX IF NOT EXISTS idx_traces_credential_id ON traces(credential_id);
@@ -400,8 +404,9 @@ impl TraceDb {
                         input_tokens, output_tokens, credits_used, latency_ms, first_token_ms,
                         outcome, retries, error_message, session_id, client_device,
                         client_ip, client_os, client_browser, cache_read_tokens, cache_creation_tokens,
-                        requested_model, upstream_model, interrupted_bytes, first_attempted_credential_id
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                        requested_model, upstream_model, interrupted_bytes, first_attempted_credential_id,
+                        endpoint
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
                 )
                 .context("预编译 traces 插入语句失败")?;
             for record in records {
@@ -430,6 +435,8 @@ impl TraceDb {
                     record.upstream_model,
                     record.interrupted_bytes.map(|v| v as i64),
                     record.first_attempted_credential_id.map(|v| v as i64),
+                    // 入站端点以存储码落库（NULL = 无端点信息，读回为 None）
+                    record.endpoint.map(|e| e.as_str()),
                 ])
                 .context("INSERT traces 失败")?;
             }
@@ -477,7 +484,8 @@ impl TraceDb {
                     input_tokens, output_tokens, credits_used, latency_ms, first_token_ms,
                     outcome, retries, error_message, session_id, client_device,
                     client_ip, client_os, client_browser, cache_read_tokens, cache_creation_tokens,
-                    requested_model, upstream_model, interrupted_bytes, first_attempted_credential_id
+                    requested_model, upstream_model, interrupted_bytes, first_attempted_credential_id,
+                    endpoint
              FROM traces
              ORDER BY ts_ms DESC
              LIMIT ?1",
@@ -511,7 +519,8 @@ impl TraceDb {
                     input_tokens, output_tokens, credits_used, latency_ms, first_token_ms,
                     outcome, retries, error_message, session_id, client_device,
                     client_ip, client_os, client_browser, cache_read_tokens, cache_creation_tokens,
-                    requested_model, upstream_model, interrupted_bytes, first_attempted_credential_id
+                    requested_model, upstream_model, interrupted_bytes, first_attempted_credential_id,
+                    endpoint
              FROM traces{where_sql}
              ORDER BY ts_ms DESC
              LIMIT ? OFFSET ?"
@@ -776,6 +785,12 @@ fn row_to_record(row: &Row<'_>) -> rusqlite::Result<RequestRecord> {
             .get::<_, Option<i64>>(23)
             .unwrap_or(None)
             .map(|v| v as u64),
+        // 入站端点（历史库缺列时兜底 None；未知码经 from_code 宽松兜底 Other，
+        // 与 parse_outcome 同策略 —— 绝不因单个未知值让整条查询报错）
+        endpoint: row
+            .get::<_, Option<String>>(24)
+            .unwrap_or(None)
+            .map(|s| RequestEndpoint::from_code(&s)),
     })
 }
 
@@ -861,6 +876,8 @@ mod tests {
         // trace_db_roundtrip_mapping_dimensions 中显式断言。
         rec.requested_model = Some("claude-sonnet-4".to_string());
         rec.upstream_model = Some("deepseek-v4-flash".to_string());
+        // 入站端点列（insert→recent 往返在 roundtrip 测试与 endpoint 专测中显式断言）
+        rec.endpoint = Some(RequestEndpoint::Messages);
         rec.session_id = Some("conv-1".to_string());
         rec.client_device = Some("claude-code".to_string());
         rec.client_ip = Some("203.0.113.7".to_string());
@@ -907,6 +924,11 @@ mod tests {
             back.upstream_model.as_deref(),
             Some("deepseek-v4-flash"),
             "upstream_model（改写后名）往返必须保留"
+        );
+        assert_eq!(
+            back.endpoint,
+            Some(RequestEndpoint::Messages),
+            "入站端点（SQLite 列）往返必须保留"
         );
         assert_eq!(back.session_id, Some("conv-1".to_string()));
         assert_eq!(back.client_device, Some("claude-code".to_string()));
@@ -983,6 +1005,53 @@ mod tests {
         }
     }
 
+    /// 入站端点列：全部变体 insert→recent 往返；NULL（旧行）读回 None；未知码
+    /// （未来版本写入后降级）宽松兜底 Other —— 旧/新数据都不让查询报错。
+    #[test]
+    fn endpoint_column_roundtrip_null_and_unknown_code() {
+        let tmp = TempDbPath::new("endpoint");
+        let db = TraceDb::open(tmp.path()).unwrap();
+
+        // 每个变体一条 + 一条无端点信息（None → NULL）
+        for (i, ep) in RequestEndpoint::ALL.iter().enumerate() {
+            let mut rec = sample_record(&format!("ep-{i}"), 1_000 + i as i64);
+            rec.endpoint = Some(*ep);
+            db.on_record(&rec);
+        }
+        let mut null_rec = sample_record("ep-null", 9_000);
+        null_rec.endpoint = None;
+        db.on_record(&null_rec);
+
+        let got = db.recent(100).unwrap();
+        for (i, ep) in RequestEndpoint::ALL.iter().enumerate() {
+            let id = format!("ep-{i}");
+            let rec = got.iter().find(|r| r.request_id == id).unwrap();
+            assert_eq!(rec.endpoint, Some(*ep), "端点变体 {} 往返不一致", ep.as_str());
+        }
+        let null_back = got.iter().find(|r| r.request_id == "ep-null").unwrap();
+        assert_eq!(
+            null_back.endpoint, None,
+            "无端点信息必须读回 None（旧数据兼容）"
+        );
+
+        // 未来版本写入的未知码：宽松兜底 Other，查询不报错（与 parse_outcome 同策略）
+        {
+            let conn = Connection::open(tmp.path()).unwrap();
+            conn.execute(
+                "UPDATE traces SET endpoint = 'future_ep' WHERE request_id = 'ep-0'",
+                [],
+            )
+            .unwrap();
+        }
+        let got2 = db.recent(100).unwrap();
+        let rec0 = got2.iter().find(|r| r.request_id == "ep-0").unwrap();
+        assert_eq!(
+            rec0.endpoint,
+            Some(RequestEndpoint::Other),
+            "未知码必须兜底 Other 而不是读失败"
+        );
+    }
+
     #[test]
     fn test_retention_cleanup_deletes_old_keeps_new() {
         let tmp = TempDbPath::new("retention");
@@ -1035,6 +1104,7 @@ mod tests {
         rec.interrupted_bytes = None;
         rec.error_message = None;
         rec.session_id = None;
+        rec.endpoint = None;
         db.on_record(&rec);
 
         let got = db.recent(1).unwrap();
@@ -1046,6 +1116,7 @@ mod tests {
         assert_eq!(back.interrupted_bytes, None);
         assert_eq!(back.error_message, None);
         assert_eq!(back.session_id, None);
+        assert_eq!(back.endpoint, None, "无端点信息必须读回 None（NULL 往返）");
         assert_eq!(back.client_device, None);
         assert_eq!(back.client_ip, None);
         assert_eq!(back.client_os, None);
@@ -1411,6 +1482,10 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].request_id, "legacy");
         assert_eq!(got[0].client_device, None);
+        assert_eq!(
+            got[0].endpoint, None,
+            "旧行没有端点信息，迁移补列后必须读回 None（不得报错）"
+        );
 
         // 3) 迁移后可正常写入带 device 的新记录并读回
         db.on_record(&sample_record("new-with-device", 100));
@@ -1420,6 +1495,11 @@ mod tests {
             .find(|r| r.request_id == "new-with-device")
             .unwrap();
         assert_eq!(rec.client_device, Some("claude-code".to_string()));
+        assert_eq!(
+            rec.endpoint,
+            Some(RequestEndpoint::Messages),
+            "迁移后可写入带端点的记录并读回（sample_record 带 Messages）"
+        );
 
         // 4) 再次 open 同一库，迁移应幂等（不因列已存在而报错）
         drop(db);

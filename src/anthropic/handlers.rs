@@ -1234,7 +1234,7 @@ pub(super) fn emit_websearch_fast_path_usage(
     crate::usage::emit_record(record);
 }
 
-/// 请求来源的客户端画像（设备类型 + IP + 细分 OS + 浏览器），
+/// 请求来源的客户端画像（设备类型 + IP + 细分 OS + 浏览器）+ **入站端点**，
 /// 一并沿用量埋点路径传递，避免多参数散落。
 ///
 /// `pub(super)`：websearch.rs 的快路径埋点（emit_websearch_fast_path_usage）也要
@@ -1245,6 +1245,14 @@ pub(super) struct ClientInfo {
     ip: Option<String>,
     os: Option<String>,
     browser: Option<String>,
+    /// **入站端点**（见 `usage::record::RequestEndpoint`）：与画像同属「每请求一份、
+    /// 沿埋点路径传递」的上下文，故挂在同一载体上 —— 本文件十个生产埋点构造点已经
+    /// 全部 `client.apply(&mut record)`，加在这里等于一次覆盖全部构造点；若逐点加
+    /// 参数，还要牵动 websearch.rs 等不在本次可改文件范围内的调用方。
+    ///
+    /// `None` = 调用方未标注（测试夹具 / 未来新入口）：**刻意不猜默认值** —— 记录
+    /// 保持 None，聚合层显示成 `(unknown)`，接线缺口可见，而不是被伪装成某个已知端点。
+    endpoint: Option<crate::usage::record::RequestEndpoint>,
 }
 
 impl ClientInfo {
@@ -1272,15 +1280,33 @@ impl ClientInfo {
             ip,
             os: crate::usage::parse_client_os(ua),
             browser: crate::usage::parse_client_browser(ua),
+            // 端点由路由入口显式标注（`with_endpoint`）：构造点拿不到路由信息，
+            // 缺省 None 会在聚合里落 `(unknown)` 桶 —— 那是「没标注」的诚实信号，
+            // 绝不猜一个已知端点（伪造比缺失更难发现）。
+            endpoint: None,
         }
     }
 
+    /// 标注本次请求的入站端点（见字段注释）。两个路由入口在构造画像时链式调用：
+    /// `post_messages`（/v1/messages；OpenAI 兼容层复用同一管线时经
+    /// `post_messages_for_endpoint` 在任务局部作用域里覆盖）、
+    /// `post_messages_cc`（/cc/v1/messages）。
+    fn with_endpoint(mut self, endpoint: crate::usage::record::RequestEndpoint) -> Self {
+        self.endpoint = Some(endpoint);
+        self
+    }
+
     /// 把画像字段写入一条用量记录
+    ///
+    /// 端点与四个画像字段共用这里（**唯一写入点**）：十个生产构造点因此一次性全部接线，
+    /// 漏接线的形态是记录 `endpoint` 恒为 None（聚合落 `(unknown)`），不会被误判成
+    /// 某个已知端点。
     fn apply(&self, record: &mut crate::usage::RequestRecord) {
         record.client_device = self.device.clone();
         record.client_ip = self.ip.clone();
         record.client_os = self.os.clone();
         record.client_browser = self.browser.clone();
+        record.endpoint = self.endpoint;
     }
 }
 
@@ -3021,6 +3047,20 @@ fn record_request_span_credential_id(id: u64) {
     tracing::Span::current().record("credential_id", id);
 }
 
+// 入站端点覆盖（task-local）：OpenAI 兼容层两条路由（/v1/chat/completions、/v1/responses）
+// 把请求翻译成 Anthropic 请求体后复用 `post_messages`（同一份 failover / 工具修复 / 用量
+// 埋点管线），但它们的**入站端点不是 messages** —— 用量记录必须按真实入站路径分类，
+// 否则面板把 OpenAI 流量错记成 /v1/messages。
+//
+// 为什么用 task-local 而不是加参数：`post_messages` 是 /v1/messages 的路由处理器，四参
+// 签名与函数体被测试（handlers_tests.rs 直接四参调用）和源码守卫（切片其函数体断言闸门
+// 顺序）钉死，加参数会连带改动不在本次可改文件范围内的调用方。作用域只覆盖**本次调用**
+// （不跨 spawn、并发请求互不影响），且不走请求头 —— 客户端无法伪造端点（`RequestEndpoint`
+// 的前提就是「入站路径是封闭集合」）。
+tokio::task_local! {
+    static INBOUND_ENDPOINT: crate::usage::record::RequestEndpoint;
+}
+
 /// POST /v1/messages
 ///
 /// 创建消息（对话）
@@ -3076,8 +3116,16 @@ pub async fn post_messages(
         return resp;
     }
 
+    // 入站端点：本函数就是 `/v1/messages` 的路由处理器（缺省真值 = Messages）；
+    // OpenAI 兼容层两条路由复用本管线时，由 `post_messages_for_endpoint` 在任务局部
+    // 作用域里覆盖成 chat_completions / responses（见 `INBOUND_ENDPOINT`）。
+    // 作用域内读一次即写进画像，随后所有埋点（含 websearch 回灌 / 流式 / 非流式）都带上它。
+    let endpoint = INBOUND_ENDPOINT
+        .try_with(|e| *e)
+        .unwrap_or(crate::usage::record::RequestEndpoint::Messages);
+
     // 从入站请求头 + TCP 对端地址识别来源画像（设备/IP/OS/浏览器，用于「最近请求」展示）
-    let client = ClientInfo::from_headers_with_peer(&headers, Some(peer));
+    let client = ClientInfo::from_headers_with_peer(&headers, Some(peer)).with_endpoint(endpoint);
 
     // 建议模式拦截（默认开）：CC 每轮结束后的「预测下一句」请求不转发上游，
     // 直接回结构完整的空回答（零计费、不污染 prompt 缓存）。见 config 同名字段。
@@ -3304,6 +3352,27 @@ pub async fn post_messages(
             .remove("x-kirostudio-compress-retry");
         return final_response;
     }
+}
+
+/// OpenAI 兼容层（`/v1/chat/completions`、`/v1/responses`）调用共享 Anthropic 管线的入口。
+///
+/// 两条 OpenAI 路由翻译完请求后复用 [`post_messages`]，记录必须按**真实入站路由**分类
+/// （chat_completions / responses），否则用量面板把 OpenAI 流量错记成 messages。
+/// 端点经 [`INBOUND_ENDPOINT`] 作用域传进去，`post_messages` 读一次写进 [`ClientInfo`]，
+/// 随后的全部埋点（真流式 / buffered / 非流式 / websearch 回灌）都带上它。
+///
+/// ⚠ 新增跨路由复用者必须走本函数：直连四参 `post_messages` 的调用会被记为 `messages`
+/// （作用域缺省值 = 本函数所属路由的真值）。openai/handlers.rs 有源码守卫钉住这一点。
+pub async fn post_messages_for_endpoint(
+    endpoint: crate::usage::record::RequestEndpoint,
+    state: State<AppState>,
+    peer: axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+    raw_body: Bytes,
+) -> Response {
+    INBOUND_ENDPOINT
+        .scope(endpoint, post_messages(state, peer, headers, raw_body))
+        .await
 }
 
 /// 处理流式请求
@@ -5088,7 +5157,9 @@ pub async fn post_messages_cc(
     }
 
     // 从入站请求头 + TCP 对端地址识别来源画像（设备/IP/OS/浏览器，用于「最近请求」展示）
-    let client = ClientInfo::from_headers_with_peer(&headers, Some(peer));
+    // 端点恒为 MessagesCc：本函数只注册在 /cc/v1/messages（router.rs），无第二路由复用。
+    let client = ClientInfo::from_headers_with_peer(&headers, Some(peer))
+        .with_endpoint(crate::usage::record::RequestEndpoint::MessagesCc);
 
     // 建议模式拦截（默认开，同 /v1）：CC 的「预测下一句」请求不转发上游。
     if !forward_suggestion_mode_enabled() && is_suggestion_mode_request(&payload) {
@@ -5626,6 +5697,310 @@ mod no_param_tool_nonstream_tests {
         assert!(
             body.contains(&trim_check),
             "build_tool_use 的空判必须与拆分器同口径（trim 后为空 = 无参），否则纯空白残留整轮失败"
+        );
+    }
+}
+
+/// 入站端点接线守卫（`RequestRecord::endpoint`）。
+///
+/// 背景：该字段此前只有枚举 / 存储列 / 聚合 / admin 路由，**生产写入链一个构造点都没填**
+/// —— 面板上全部记录落进 `(unknown)` 桶（本仓近期反复踩「接了线但没接上」）。
+/// 本模块钉住下列几条：
+/// ① 每个生产构造点都经 `ClientInfo::apply` 把端点写进记录（清单漂移即红）；
+/// ② 端点标注真的走通了 `usage::pipeline`（行为测试，不只是结构体赋值）；
+/// ③ 两个路由入口各标自己的端点，OpenAI 兼容层两条路由必须走带标注的入口；
+/// ④ 任务局部覆盖的语义（作用域内覆盖 / 作用域外回落 Messages）；
+/// ⑤ router.rs 注册的每条入站路径都有对应变体；
+/// ⑥ 零埋点路由（count_tokens）保持零构造点（将来补埋点会被拦下并要求同步标注）。
+#[cfg(test)]
+mod inbound_endpoint_wiring_tests {
+    use super::*;
+    use crate::usage::record::RequestEndpoint;
+
+    /// 生产段源码（`#[cfg(test)]` 之前；本仓守卫惯例的切法）。
+    fn prod_src() -> &'static str {
+        let src = include_str!("handlers.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        &src[..cut]
+    }
+
+    /// 去掉整行注释后的生产段：本守卫数的是**真实代码**，注释里提到构造点/apply
+    /// 不得算数（否则文档措辞一变就红/绿，正是本仓「纸面测试」踩过的坑）。
+    fn prod_code() -> String {
+        prod_src()
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !(t.starts_with("//") || t.starts_with("///"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 本仓惯例的函数体切片：从函数签名到列 0 的 `\n}\n`。
+    fn slice_fn<'a>(src: &'a str, sig: &str) -> &'a str {
+        let start = src.find(sig).unwrap_or_else(|| panic!("{sig} 必须存在"));
+        let rest = &src[start..];
+        let end = rest.find("\n}\n").unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// `at` 偏移所属的顶层函数：返回 (定义行起始偏移, 函数名)。
+    ///
+    /// 只认列 0 起始的定义行（本文件生产函数都顶格写），故 impl 块方法、缩进闭包与
+    /// 嵌套 fn 都不会被误判成所属函数。
+    fn enclosing_fn(src: &str, at: usize) -> (usize, String) {
+        let mut start = 0usize;
+        let mut name = String::new();
+        let mut offset = 0usize;
+        for line in src[..at].split_inclusive('\n') {
+            let t = line.trim_end_matches('\n');
+            for pat in [
+                "pub async fn ",
+                "pub(super) fn ",
+                "pub fn ",
+                "async fn ",
+                "fn ",
+            ] {
+                if let Some(rest) = t.strip_prefix(pat) {
+                    if let Some(paren) = rest.find('(') {
+                        start = offset;
+                        name = rest[..paren].to_string();
+                    }
+                    break;
+                }
+            }
+            offset += line.len();
+        }
+        (start, name)
+    }
+
+    /// 生产构造点清单（所属函数名）。**刻意的钉子**：新增/删除 `RequestRecord` 构造点
+    /// 时必须同步本清单 —— 否则「构造点没接端点」这种缺口没有任何运行时信号
+    /// （记录照落库，只是分类落 `(unknown)`），只能靠源码守卫拦住。
+    const EXPECTED_SITES: [&str; 10] = [
+        "emit_websearch_loop_usage",
+        "emit_websearch_loop_error_usage",
+        "emit_websearch_loop_interrupted_usage",
+        "emit_websearch_fast_path_usage",
+        "try_inbound_admission_gate",
+        "post_messages",
+        "emit_stream_usage",
+        "emit_nonstream_completion_failure",
+        "handle_non_stream_request",
+        "emit_buffered_usage",
+    ];
+
+    /// ① 每个生产构造点都必须把画像（含端点）写进记录。
+    #[test]
+    fn every_production_record_construction_applies_client_profile() {
+        let prod = prod_code();
+        let ctor = format!("{}{}", "RequestRecord::", "new(");
+        let apply = format!("{}{}", "client.apply(&mut ", "record)");
+
+        let mut sites: Vec<String> = Vec::new();
+        let mut from = 0usize;
+        while let Some(i) = prod[from..].find(ctor.as_str()).map(|i| i + from) {
+            let (fn_start, fn_name) = enclosing_fn(&prod, i);
+            let body = slice_fn(&prod[fn_start..], &format!("{fn_name}("));
+            assert!(
+                body.contains(apply.as_str()),
+                "{fn_name} 构造 RequestRecord 后必须 client.apply(...)：\
+                 端点与客户端画像共用这一个写入点，漏了记录就落 (unknown) 桶"
+            );
+            sites.push(fn_name);
+            from = i + ctor.len();
+        }
+
+        sites.sort();
+        let mut expected: Vec<String> = EXPECTED_SITES.iter().map(|s| (*s).to_string()).collect();
+        expected.sort();
+        assert_eq!(
+            sites, expected,
+            "生产构造点清单漂移：新增/删除 RequestRecord 构造点时必须同步 EXPECTED_SITES，\
+             并确认新构造点也走 client.apply 带出端点"
+        );
+        // 一一对应：apply 少 = 有构造点漏接线；apply 多 = 有写入点没被上面的循环覆盖。
+        assert_eq!(
+            prod.matches(apply.as_str()).count(),
+            sites.len(),
+            "client.apply 调用数必须等于构造点数"
+        );
+    }
+
+    /// ② 端点随画像落进记录；未标注的画像不得凭空造端点。
+    #[test]
+    fn client_profile_carries_endpoint_into_record() {
+        let client = ClientInfo::from_headers_with_peer(&axum::http::HeaderMap::new(), None)
+            .with_endpoint(RequestEndpoint::Responses);
+        let mut rec = crate::usage::RequestRecord::new("req-ep", "claude-sonnet-5");
+        client.apply(&mut rec);
+        assert_eq!(
+            rec.endpoint,
+            Some(RequestEndpoint::Responses),
+            "标注过的画像必须把端点写进记录"
+        );
+
+        let mut bare = crate::usage::RequestRecord::new("req-bare", "claude-sonnet-5");
+        ClientInfo::default().apply(&mut bare);
+        assert_eq!(
+            bare.endpoint, None,
+            "未标注的画像不得凭空填端点（保持 None → 聚合落 (unknown)，缺口可见）"
+        );
+    }
+
+    /// ③ 端到端到 emit 为止：带标注的画像 → 经 `usage::pipeline` 的记录带端点。
+    ///
+    /// 用 `emit_websearch_fast_path_usage`（十个构造点里唯一不依赖 provider 的一个）
+    /// 走真实 `crate::usage::emit_record` 通道 + 测试捕获器，证明接线不只是结构体赋值。
+    #[test]
+    fn tagged_profile_reaches_emitted_record() {
+        let client = ClientInfo::from_headers_with_peer(&axum::http::HeaderMap::new(), None)
+            .with_endpoint(RequestEndpoint::ChatCompletions);
+        let ((), recs) = crate::usage::pipeline::with_captured_records(|| {
+            emit_websearch_fast_path_usage("claude-sonnet-5", Some(7), 11, 22, true, &client);
+        });
+        assert_eq!(recs.len(), 1, "快路径埋点应落一条记录: {recs:?}");
+        assert_eq!(
+            recs[0].endpoint,
+            Some(RequestEndpoint::ChatCompletions),
+            "画像里的端点必须随记录落库（否则面板落 (unknown) 桶）"
+        );
+    }
+
+    /// ④ 两个路由入口各标自己的端点；跨路由复用必须走带标注的入口。
+    #[test]
+    fn route_entry_points_tag_their_endpoint() {
+        let prod = prod_src();
+        let tagged = format!("{}{}", "with_endpoint", "(");
+
+        let pm = slice_fn(prod, "pub async fn post_messages(");
+        assert!(
+            pm.contains(tagged.as_str()),
+            "post_messages 必须给画像标注端点（它是 /v1/messages 的路由处理器）"
+        );
+        let override_read = format!("{}{}", "INBOUND_", "ENDPOINT");
+        assert!(
+            pm.contains(override_read.as_str()),
+            "post_messages 必须读任务局部覆盖 —— OpenAI 兼容层两条路由靠它区分端点"
+        );
+        let fallback = format!("{}{}", "RequestEndpoint::", "Messages");
+        assert!(
+            pm.contains(fallback.as_str()),
+            "post_messages 的缺省端点必须是 Messages（本函数所属路由的真值）"
+        );
+
+        let cc = slice_fn(prod, "pub async fn post_messages_cc(");
+        assert!(
+            cc.contains(tagged.as_str()),
+            "post_messages_cc 必须给画像标注端点"
+        );
+        let cc_ep = format!("{}{}", "RequestEndpoint::", "MessagesCc");
+        assert!(
+            cc.contains(cc_ep.as_str()),
+            "/cc/v1/messages 必须标注 MessagesCc（它只注册在该路由）"
+        );
+
+        let wrap = slice_fn(prod, "pub async fn post_messages_for_endpoint(");
+        let scope_read = format!("{}{}", "INBOUND_", "ENDPOINT");
+        let scope_call = format!("{}{}", ".scope", "(");
+        assert!(
+            wrap.contains(scope_read.as_str()) && wrap.contains(scope_call.as_str()),
+            "post_messages_for_endpoint 必须把端点 scope 进共享管线（否则覆盖不生效）"
+        );
+        assert!(
+            wrap.contains("post_messages("),
+            "post_messages_for_endpoint 必须真正调用共享管线"
+        );
+    }
+
+    /// 任务局部覆盖的语义：作用域内读到标注值，作用域外回落 Messages。
+    #[tokio::test]
+    async fn inbound_endpoint_scope_overrides_and_defaults_to_messages() {
+        let outside = INBOUND_ENDPOINT
+            .try_with(|e| *e)
+            .unwrap_or(RequestEndpoint::Messages);
+        assert_eq!(
+            outside,
+            RequestEndpoint::Messages,
+            "作用域外（/v1/messages 自身路由）必须回落 Messages"
+        );
+
+        let inside = INBOUND_ENDPOINT
+            .scope(RequestEndpoint::Responses, async {
+                INBOUND_ENDPOINT
+                    .try_with(|e| *e)
+                    .unwrap_or(RequestEndpoint::Messages)
+            })
+            .await;
+        assert_eq!(
+            inside,
+            RequestEndpoint::Responses,
+            "作用域内必须读到覆盖值（OpenAI 兼容层两条路由的端点由此带进共享管线）"
+        );
+    }
+
+    /// ⑤ 路由清单 ↔ 端点变体清单：router.rs 注册的每条入站路径都必须映射到已知变体
+    /// （`from_path` 精确匹配，兜底 Other）。新增路由忘加变体 → 该路由的记录落 `other`
+    /// 桶（不是 `(unknown)`，同样是分类缺口），本守卫会红。
+    #[test]
+    fn router_registered_paths_all_have_an_endpoint_variant() {
+        let router = include_str!("router.rs");
+        assert!(
+            router.contains("nest(\"/v1\""),
+            "router.rs 的 /v1 前缀必须存在（下面的全路径依赖它）"
+        );
+        assert!(
+            router.contains("nest(\"/cc/v1\""),
+            "router.rs 的 /cc/v1 前缀必须存在"
+        );
+
+        for (route_literal, handler_literal, full_path) in [
+            ("\"/messages\"", "post(post_messages)", "/v1/messages"),
+            (
+                "\"/messages/count_tokens\"",
+                "post(count_tokens)",
+                "/v1/messages/count_tokens",
+            ),
+            (
+                "\"/chat/completions\"",
+                "post(crate::openai::handlers::post_chat_completions)",
+                "/v1/chat/completions",
+            ),
+            (
+                "\"/responses\"",
+                "post(crate::openai::handlers::post_responses)",
+                "/v1/responses",
+            ),
+            ("\"/messages\"", "post(post_messages_cc)", "/cc/v1/messages"),
+        ] {
+            assert!(
+                router.contains(route_literal),
+                "router.rs 必须注册路由 {full_path}（路径字面量 {route_literal}）"
+            );
+            assert!(
+                router.contains(handler_literal),
+                "router.rs 必须把 {full_path} 挂到 {handler_literal}"
+            );
+            assert_ne!(
+                RequestEndpoint::from_path(full_path),
+                RequestEndpoint::Other,
+                "{full_path} 必须有对应变体（新增路由忘加变体 = 该路由记录落 other 桶）"
+            );
+        }
+    }
+
+    /// ⑥ `/v1/messages/count_tokens` 目前零埋点（纯本地计数、零上游调用）⇒ `CountTokens`
+    /// 变体**无生产构造点**。将来给该路由补埋点时本守卫会红：提醒同时标注 CountTokens，
+    /// 别让它落进 `(unknown)`。
+    #[test]
+    fn count_tokens_route_has_no_usage_construction_site() {
+        let prod = prod_src();
+        let body = slice_fn(prod, "pub async fn count_tokens(");
+        let ctor = format!("{}{}", "RequestRecord::", "new(");
+        assert!(
+            !body.contains(ctor.as_str()),
+            "count_tokens 目前零埋点；若新增记录，必须同时用 with_endpoint(CountTokens) 标注"
         );
     }
 }
