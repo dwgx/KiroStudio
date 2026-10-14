@@ -441,6 +441,9 @@ const MCP_USAGE_MODEL: &str = "mcp";
 /// - `is_streaming` = false（MCP 上游是一次性 JSON POST；WebSearch 对客户端的 SSE
 ///   是网关本地合成的，不属于这次上游调用的性质）
 /// - `session_id` / 客户端画像 = None（provider 层拿不到入站 headers 与 conversationId）
+/// - `endpoint` = 经 handlers 导出的 `INBOUND_ENDPOINT` task-local 读取（路由入口与两个
+///   分发漏斗已 scope，见 handlers 的 `in_endpoint_scope`）；读不到（spawn 边界 /
+///   画像未标注）保持 None → 聚合落 `(unknown)`，绝不猜一个已知端点
 fn build_mcp_record(
     credential_id: u64,
     outcome: crate::usage::RequestOutcome,
@@ -459,6 +462,11 @@ fn build_mcp_record(
     record.latency_ms = latency_ms;
     record.retries = retries;
     record.outcome = outcome;
+    // 入站端点（8 个 MCP 构造点共用本读取点）：作用域内 → 与画像同源的端点；
+    // 作用域外（流式混合 websearch 回灌的 spawn 边界 / 测试夹具）→ None（诚实缺口）。
+    record.endpoint = crate::anthropic::handlers::INBOUND_ENDPOINT
+        .try_with(|e| *e)
+        .ok();
     record
 }
 
@@ -5085,6 +5093,13 @@ impl KiroProvider {
         // 使「烧掉 12 次换号才失败」与「第一次就失败」在面板上不可区分。
         // 与成功分支 `retries: attempt as u32`（本文件下方）同口径。
         fail_record.retries = attempts_used;
+        // 入站端点：与 `build_mcp_record` 同口径（同一 task-local、同一组作用域边界：
+        // 主路径在 `dispatch_kiro_attempt` 内、websearch 回灌在 `dispatch_websearch_paths`
+        // 内、首字重试 reopen 按值捕获后重进）。作用域外（spawn 边界 / 未标注画像）→
+        // None，聚合落 (unknown)，绝不猜。
+        fail_record.endpoint = crate::anthropic::handlers::INBOUND_ENDPOINT
+            .try_with(|e| *e)
+            .ok();
         fail_record.error_message = Some(final_error.to_string());
         crate::usage::emit_record(fail_record);
 
@@ -5320,6 +5335,103 @@ fn assemble_final_error(
 #[cfg(test)]
 #[path = "provider_tests.rs"]
 mod tests;
+
+/// provider 层用量记录的**入站端点接线**守卫（2026-10-14：原 deferred 钉子转正）。
+///
+/// 现状：provider 层 9 个 `emit_record` 构造点（8×MCP `build_mcp_record`：7 个失败出口
+/// + 1 个成功埋点；1×`call_api_with_retry` 的 failover 失败记录）全部经 handlers 导出的
+/// `pub(crate) INBOUND_ENDPOINT` task-local 读取端点（两处读取点：`build_mcp_record`
+/// 收口 8 个 MCP 构造点 + failover 失败记录 1 处），`try_with` 读不到保持 None。
+///
+/// **能读到的路径**（调用链在请求任务内、且路由入口/分发漏斗已 scope）：
+/// - Kiro 主路径（`handle_stream_request` / `handle_non_stream_request` /
+///   `handle_stream_request_buffered` 的 provider 调用）：在 handlers 的
+///   `dispatch_kiro_attempt` 作用域内（作用域值从画像 `ClientInfo.endpoint` 派生）；
+/// - 首字重试 reopen（`handle_stream_request` 内）：在 SSE body 轮询里执行（作用域已
+///   结束），按值捕获画像端点后经 `in_endpoint_scope` 重进作用域；
+/// - websearch 快路径（`handle_websearch_request`）与**非流式**回灌循环
+///   （`run_web_search_loop` 在 `dispatch_web_search_loop` 里本任务 await）：在
+///   `dispatch_websearch_paths` 作用域内。
+///
+/// **读不到的路径**（保持 None，聚合落 `(unknown)`，绝不猜一个已知端点）：
+/// - 流式混合 websearch 回灌：`mixed_websearch_stream_response` 里
+///   `tokio::spawn(run_web_search_loop)` —— spawn 不继承 task-local，且 websearch.rs
+///   不在本次可改文件范围内（接线需在 spawn 点按值捕获并传入），deferred；
+/// - 画像未标注的入口（测试夹具 / 未来新入口）：作用域不进入。
+///
+/// 本守卫钉三件事，任一为红都要求同步（构造点没接端点没有运行时信号，只能靠守卫拦）：
+/// ① 构造点数量漂移；② 两处读取点仍经 `try_with` 读取并写 `endpoint`（读不到 = None，
+/// 不得 `unwrap_or` 猜端点）；③ handlers 侧仍导出 task-local（撤销导出 = provider 编译错）。
+#[cfg(test)]
+mod endpoint_wiring_tests {
+    /// 生产段 = 首个测试门之前（与 provider_tests.rs 的守卫同一切法）。
+    fn prod() -> &'static str {
+        let full = include_str!("provider.rs");
+        full.split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(full)
+    }
+
+    /// ①+②：9 个构造点、两处读取点都经 try_with 读取并写 endpoint（读不到 = None）。
+    #[test]
+    fn record_sites_read_endpoint_from_task_local_via_try_with() {
+        let prod = prod();
+        assert_eq!(
+            prod.matches("crate::usage::emit_record(").count(),
+            9,
+            "provider 层 emit_record 构造点应为 9（8×MCP build_mcp_record + 1×\
+             call_api_with_retry 失败记录）；数量漂移时必须同步核对端点接线清单（见模块文档）"
+        );
+        // 两处读取点（含 `build_mcp_record` 收口的 8 个 MCP 构造点）都走同一 task-local。
+        let read = format!("{}::handlers::{}", "crate::anthropic", "INBOUND_ENDPOINT");
+        assert_eq!(
+            prod.matches(read.as_str()).count(),
+            2,
+            "端点读取点应恰为 2 处（build_mcp_record + call_api_with_retry 失败记录）——\
+             新增读取点或漏接新构造点都必须同步本守卫与模块文档清单"
+        );
+        // 读不到必须保持 None：读取表达式逐字锁死（空白不敏感，缩进/换行随 rustfmt）。
+        let compact: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        let read_expr = format!("{read}.try_with(|e|*e).ok()");
+        assert_eq!(
+            compact.matches(read_expr.as_str()).count(),
+            2,
+            "两处读取点都必须 `try_with(|e| *e).ok()`（作用域外 = None → 落 (unknown)，\
+             绝不 unwrap_or 猜一个已知端点）"
+        );
+        // 写入点分别落在两个函数体内（按函数切片，避免 `record.endpoint=` 作为子串
+        // 命中 `fail_record.endpoint=` 的假绿）。
+        let mcp = {
+            let start = prod
+                .find("fn build_mcp_record(")
+                .expect("build_mcp_record 必须存在");
+            let rest = &prod[start..];
+            let end = rest.find("\n}\n").expect("build_mcp_record 必须有结尾");
+            &rest[..end]
+        };
+        let mcp_compact: String = mcp.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            mcp_compact.contains(format!("record.endpoint={read_expr}").as_str()),
+            "build_mcp_record 必须把读到的端点写进记录（8 个 MCP 构造点由此统一接线）"
+        );
+        assert!(
+            compact.contains(format!("fail_record.endpoint={read_expr}").as_str()),
+            "call_api_with_retry 的 failover 失败记录必须把读到的端点写进记录"
+        );
+    }
+
+    /// ③：handlers 侧 task-local 仍导出（provider 两处读取点的编译前提）。
+    #[test]
+    fn handlers_task_local_exported_for_provider_reads() {
+        let handlers = include_str!("../anthropic/handlers.rs");
+        let exported = format!("pub(crate) static {}", "INBOUND_ENDPOINT");
+        assert!(
+            handlers.contains(exported.as_str()),
+            "handlers 必须导出 pub(crate) INBOUND_ENDPOINT —— provider 层两处读取点依赖它；\
+             撤销导出 = 编译错（E0603），本守卫给出可读原因"
+        );
+    }
+}
 
 /// 429 限流头的解析与保守决议纯函数用例（2026-10-14 对手对照：
 /// `x-amzn-kiro-ratelimit-retry-after`）。

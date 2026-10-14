@@ -993,13 +993,18 @@ async fn dispatch_websearch_paths(
                 &payload.messages,
                 payload.tools.as_deref(),
             ) as i32;
+            // 入站端点作用域：作用域值从画像派生（单一来源），provider 层构造点
+            // （MCP 成功/失败记录）经同一 task-local 读到与画像同值（见 `in_endpoint_scope`）。
             return Some(
-                websearch::handle_websearch_request(
-                    provider.clone(),
-                    payload,
-                    input_tokens,
-                    budget,
-                    client,
+                in_endpoint_scope(
+                    client.endpoint,
+                    websearch::handle_websearch_request(
+                        provider.clone(),
+                        payload,
+                        input_tokens,
+                        budget,
+                        client,
+                    ),
                 )
                 .await,
             );
@@ -1009,7 +1014,15 @@ async fn dispatch_websearch_paths(
         );
     }
     if kiro_mcp_ok {
-        if let Some(resp) = dispatch_web_search_loop(provider, payload, budget, client).await {
+        // 非流式回灌循环在**本任务内** await（provider 调用在其内部），故同样进作用域；
+        // 流式回灌（`mixed_websearch_stream_response` 的 spawn）不继承 task-local，见
+        // `INBOUND_ENDPOINT` 声明处的读不到清单（deferred）。
+        if let Some(resp) = in_endpoint_scope(
+            client.endpoint,
+            dispatch_web_search_loop(provider, payload, budget, client),
+        )
+        .await
+        {
             return Some(resp);
         }
     }
@@ -1034,56 +1047,64 @@ async fn dispatch_kiro_attempt(
     client: ClientInfo,
     use_buffered: bool,
 ) -> Response {
-    if payload.stream {
-        if use_buffered {
-            handle_stream_request_buffered(
-                provider,
-                body_ref,
-                &payload.model,
-                input_tokens,
-                thinking_enabled,
-                tool_name_map,
-                known_tool_names,
-                tool_required_fields,
-                cache_breakdown,
-                budget,
-                client,
-            )
-            .await
+    // 入站端点作用域：作用域值从画像（`client.endpoint`）派生 —— 画像是单一来源，
+    // provider 层构造点（`call_api_with_retry` 的 failover 失败记录等）经同一
+    // task-local 读到的与画像同值，两处标注不可能分叉；画像未标注（None）时不进
+    // 作用域，provider 读不到 → 记录保持 None 落 (unknown)，绝不猜（见 `in_endpoint_scope`）。
+    let endpoint = client.endpoint;
+    in_endpoint_scope(endpoint, async move {
+        if payload.stream {
+            if use_buffered {
+                handle_stream_request_buffered(
+                    provider,
+                    body_ref,
+                    &payload.model,
+                    input_tokens,
+                    thinking_enabled,
+                    tool_name_map,
+                    known_tool_names,
+                    tool_required_fields,
+                    cache_breakdown,
+                    budget,
+                    client,
+                )
+                .await
+            } else {
+                handle_stream_request(
+                    provider,
+                    body_ref,
+                    &payload.model,
+                    input_tokens,
+                    thinking_enabled,
+                    tool_name_map,
+                    known_tool_names,
+                    tool_required_fields,
+                    cache_breakdown,
+                    budget,
+                    client,
+                )
+                .await
+            }
         } else {
-            handle_stream_request(
+            // 非流式响应：仅在配置开启时提取 thinking 块
+            let extract_thinking = extract_thinking_enabled() && thinking_enabled;
+            handle_non_stream_request(
                 provider,
                 body_ref,
                 &payload.model,
                 input_tokens,
-                thinking_enabled,
+                extract_thinking,
                 tool_name_map,
-                known_tool_names,
                 tool_required_fields,
                 cache_breakdown,
+                fingerprint_usage,
                 budget,
                 client,
             )
             .await
         }
-    } else {
-        // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = extract_thinking_enabled() && thinking_enabled;
-        handle_non_stream_request(
-            provider,
-            body_ref,
-            &payload.model,
-            input_tokens,
-            extract_thinking,
-            tool_name_map,
-            tool_required_fields,
-            cache_breakdown,
-            fingerprint_usage,
-            budget,
-            client,
-        )
-        .await
-    }
+    })
+    .await
 }
 
 /// WebSearch 回灌成功收尾时埋一条用量记录。
@@ -3057,8 +3078,41 @@ fn record_request_span_credential_id(id: u64) {
 // 顺序）钉死，加参数会连带改动不在本次可改文件范围内的调用方。作用域只覆盖**本次调用**
 // （不跨 spawn、并发请求互不影响），且不走请求头 —— 客户端无法伪造端点（`RequestEndpoint`
 // 的前提就是「入站路径是封闭集合」）。
+//
+// 🔴 `pub(crate)`（2026-10-14 接线）：provider 层 9 个用量记录构造点
+// （`build_mcp_record` 8 处 + `call_api_with_retry` 失败记录 1 处）经 `try_with` 读同一
+// task-local，让 provider 层记录与画像（`ClientInfo.endpoint`）带**同一个**入站端点。
+// 导出前该 static 模块私有 ⇒ provider 引用即编译错（E0603），记录恒 None 落 `(unknown)`。
+// 先例：同文件 `ABSORB_BUDGET_EXHAUSTED_MARKER` 就是 `pub(crate)` 供 provider 全路径引用。
+//
+// 作用域进入点（单一来源 = 画像，作用域值全部从 `ClientInfo.endpoint` 派生，两处标注
+// 不可能分叉；画像未标注时不进作用域 —— provider 读不到保持 None，绝不猜端点）：
+// - `post_messages_for_endpoint`：OpenAI 兼容层两条路由（scope 覆盖整个共享管线调用）；
+// - `in_endpoint_scope`（本文件）：`dispatch_kiro_attempt` 与 `dispatch_websearch_paths`
+//   两个分发漏斗（Kiro 主路径 / websearch 快路径 + 非流式回灌），以及首字重试 reopen
+//   （在 SSE body 轮询里执行、作用域已结束，故按值捕获后重进）。
+//
+// **读不到的路径**（保持 None，deferred）：流式混合 websearch 回灌 ——
+// `mixed_websearch_stream_response` 里 `tokio::spawn(run_web_search_loop)`，spawn 不继承
+// task-local，且 websearch.rs 不在本次可改文件范围内（接线需在 spawn 点按值捕获并传入）。
 tokio::task_local! {
-    static INBOUND_ENDPOINT: crate::usage::record::RequestEndpoint;
+    pub(crate) static INBOUND_ENDPOINT: crate::usage::record::RequestEndpoint;
+}
+
+/// 在入站端点作用域内执行一段 provider 调用链。
+///
+/// `endpoint` 必须来自画像（`ClientInfo.endpoint`）—— 画像是该值的**单一来源**，
+/// provider 层构造点经同一 task-local 读到的因此与画像写进记录的值恒等（不分叉）。
+/// `None`（画像未标注：测试夹具 / 未来新入口）时不进作用域：provider 层 `try_with`
+/// 读不到 → 记录保持 None 落 `(unknown)`，**绝不猜一个已知端点**（伪造比缺失更难发现）。
+async fn in_endpoint_scope<F: Future>(
+    endpoint: Option<crate::usage::record::RequestEndpoint>,
+    fut: F,
+) -> F::Output {
+    match endpoint {
+        Some(ep) => INBOUND_ENDPOINT.scope(ep, fut).await,
+        None => fut.await,
+    }
 }
 
 /// POST /v1/messages
@@ -3402,6 +3456,12 @@ async fn handle_stream_request(
     // 首字重试：上游 200 后静默 → 流内重开（预算携带排除集 → 自动换号），
     // 重开前不向客户端写任何字节。关闭（0 秒或 0 次）时 None = 行为与改前逐字节一致。
     // 必须在 ctx 构造（消费各参数）之前构造，参数按需克隆。
+    //
+    // 端点按值捕获：reopen 在 SSE body 轮询里执行（`post_messages` 已返回 ⇒ 入站端点
+    // 作用域已结束），不能靠 `try_with` 读 —— 捕获创建时的画像端点，重开调用重进同一
+    // 作用域（provider 层失败记录读到与画像同源的真值）；捕获为 None（画像未标注）时
+    // 不进作用域（读不到保持 None，绝不猜，见 `in_endpoint_scope`）。
+    let endpoint_for_reopen = client.endpoint;
     let retry = first_token_retry_config().map(|(timeout, max_retries)| {
         let body_owned = request_body.to_string();
         let budget_owned = budget.clone();
@@ -3422,7 +3482,13 @@ async fn handle_stream_request(
                 let b = body_owned.clone();
                 let g = budget_owned.clone();
                 let m = model_for_reopen.clone();
-                Box::pin(async move { p.call_api_stream(&b, is_1m, &g, Some(&m)).await })
+                Box::pin(async move {
+                    in_endpoint_scope(
+                        endpoint_for_reopen,
+                        p.call_api_stream(&b, is_1m, &g, Some(&m)),
+                    )
+                    .await
+                })
             }),
             rebuild_ctx: std::sync::Arc::new(move || {
                 let mut c = StreamContext::new_full(
@@ -5711,7 +5777,11 @@ mod no_param_tool_nonstream_tests {
 /// ③ 两个路由入口各标自己的端点，OpenAI 兼容层两条路由必须走带标注的入口；
 /// ④ 任务局部覆盖的语义（作用域内覆盖 / 作用域外回落 Messages）；
 /// ⑤ router.rs 注册的每条入站路径都有对应变体；
-/// ⑥ 零埋点路由（count_tokens）保持零构造点（将来补埋点会被拦下并要求同步标注）。
+/// ⑥ 零埋点路由（count_tokens）保持零构造点（将来补埋点会被拦下并要求同步标注）；
+/// ⑦ provider 调用链的两个分发漏斗（`dispatch_kiro_attempt` / `dispatch_websearch_paths`）
+///    与首字重试 reopen 必须经 `in_endpoint_scope` 从画像派生端点进作用域（provider 层
+///    9 个构造点靠它读同一真值；守卫在 provider.rs 的 `endpoint_wiring_tests`）；
+/// ⑧ 两端不分叉（行为）：作用域值恒等于画像端点，画像未标注时不进作用域。
 #[cfg(test)]
 mod inbound_endpoint_wiring_tests {
     use super::*;
@@ -5937,6 +6007,71 @@ mod inbound_endpoint_wiring_tests {
             inside,
             RequestEndpoint::Responses,
             "作用域内必须读到覆盖值（OpenAI 兼容层两条路由的端点由此带进共享管线）"
+        );
+    }
+
+    /// ⑦ 接线点守卫：provider 调用链的两个分发漏斗与首字重试 reopen 必须经
+    /// `in_endpoint_scope` 把**画像端点**带进作用域（provider 层 9 个构造点靠同一
+    /// task-local 读到它）。
+    ///
+    /// 回退即 FAIL：删掉任一处 scope，该路径的 provider 记录恒 None（聚合落
+    /// `(unknown)`，没有运行时信号），只能靠本守卫拦。
+    #[test]
+    fn provider_call_boundaries_scope_endpoint_from_profile() {
+        let prod = prod_code();
+        let helper = format!("in_endpoint_{}", "scope(");
+        let from_profile = format!("client.{}", "endpoint");
+        for sig in [
+            "async fn dispatch_kiro_attempt(",
+            "async fn dispatch_websearch_paths(",
+        ] {
+            let body = slice_fn(&prod, sig);
+            assert!(
+                body.contains(helper.as_str()),
+                "{sig} 必须经 in_endpoint_scope 进端点作用域\
+                 （provider 层靠它读到与画像同源的真值）"
+            );
+            assert!(
+                body.contains(from_profile.as_str()),
+                "{sig} 的作用域值必须从画像派生（client.endpoint）——\
+                 不得硬编码变体、不得猜默认端点"
+            );
+        }
+        let hs = slice_fn(&prod, "async fn handle_stream_request(");
+        assert!(
+            hs.contains(helper.as_str()) && hs.contains(from_profile.as_str()),
+            "首字重试 reopen 必须按值捕获画像端点（client.endpoint）后经 in_endpoint_scope \
+             重进作用域 —— reopen 在 SSE body 轮询里执行，此时作用域已随请求分发结束"
+        );
+    }
+
+    /// ⑧ 两端不分叉（行为）：作用域值从画像派生 —— `in_endpoint_scope` 把
+    /// `client.endpoint` 原值带进作用域，provider 层 `try_with` 读到的因此与画像
+    /// 写进记录的值恒为同一个；画像未标注时不进作用域（读不到 = None，绝不猜）。
+    #[tokio::test]
+    async fn endpoint_scope_value_derives_from_client_profile() {
+        // 已标注画像（四个生产入口都经 `with_endpoint`）：作用域内读到 == 画像端点。
+        let client = ClientInfo::from_headers_with_peer(&axum::http::HeaderMap::new(), None)
+            .with_endpoint(RequestEndpoint::MessagesCc);
+        let inside = in_endpoint_scope(client.endpoint, async {
+            INBOUND_ENDPOINT.try_with(|e| *e).ok()
+        })
+        .await;
+        assert_eq!(
+            inside,
+            Some(RequestEndpoint::MessagesCc),
+            "作用域值必须等于画像端点（provider 层记录与画像由此带同一个值，不分叉）"
+        );
+
+        // 未标注画像（测试夹具 / 未来新入口）：不进入作用域 —— provider 读不到 → None。
+        let bare = ClientInfo::default();
+        let inside = in_endpoint_scope(bare.endpoint, async {
+            INBOUND_ENDPOINT.try_with(|e| *e).ok()
+        })
+        .await;
+        assert_eq!(
+            inside, None,
+            "画像未标注时不得进作用域（读不到保持 None 落 (unknown)，绝不猜一个已知端点）"
         );
     }
 
