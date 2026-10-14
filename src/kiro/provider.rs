@@ -442,8 +442,9 @@ const MCP_USAGE_MODEL: &str = "mcp";
 ///   是网关本地合成的，不属于这次上游调用的性质）
 /// - `session_id` / 客户端画像 = None（provider 层拿不到入站 headers 与 conversationId）
 /// - `endpoint` = 经 handlers 导出的 `INBOUND_ENDPOINT` task-local 读取（路由入口与两个
-///   分发漏斗已 scope，见 handlers 的 `in_endpoint_scope`）；读不到（spawn 边界 /
-///   画像未标注）保持 None → 聚合落 `(unknown)`，绝不猜一个已知端点
+///   分发漏斗已 scope，见 handlers 的 `in_endpoint_scope`；流式 websearch 回灌的 spawn
+///   边界在 spawn 前按值捕获端点、任务内重进作用域）；读不到（画像未标注 / 调用链不在
+///   请求任务的作用域内）保持 None → 聚合落 `(unknown)`，绝不猜一个已知端点
 fn build_mcp_record(
     credential_id: u64,
     outcome: crate::usage::RequestOutcome,
@@ -463,7 +464,8 @@ fn build_mcp_record(
     record.retries = retries;
     record.outcome = outcome;
     // 入站端点（8 个 MCP 构造点共用本读取点）：作用域内 → 与画像同源的端点；
-    // 作用域外（流式混合 websearch 回灌的 spawn 边界 / 测试夹具）→ None（诚实缺口）。
+    // 作用域外（画像未标注 / 测试夹具）→ None（诚实缺口）。流式混合 websearch 回灌的
+    // spawn 边界已不再属于缺口：spawn 前按值捕获端点、任务内重进作用域（websearch.rs，守卫④）。
     record.endpoint = crate::anthropic::handlers::INBOUND_ENDPOINT
         .try_with(|e| *e)
         .ok();
@@ -5095,7 +5097,8 @@ impl KiroProvider {
         fail_record.retries = attempts_used;
         // 入站端点：与 `build_mcp_record` 同口径（同一 task-local、同一组作用域边界：
         // 主路径在 `dispatch_kiro_attempt` 内、websearch 回灌在 `dispatch_websearch_paths`
-        // 内、首字重试 reopen 按值捕获后重进）。作用域外（spawn 边界 / 未标注画像）→
+        // 内（流式直播由 `mixed_websearch_stream_response` 在 spawn 前按值捕获、任务内重进）、
+        // 首字重试 reopen 按值捕获后重进）。作用域外（画像未标注 / 非请求任务）→
         // None，聚合落 (unknown)，绝不猜。
         fail_record.endpoint = crate::anthropic::handlers::INBOUND_ENDPOINT
             .try_with(|e| *e)
@@ -5351,17 +5354,22 @@ mod tests;
 ///   结束），按值捕获画像端点后经 `in_endpoint_scope` 重进作用域；
 /// - websearch 快路径（`handle_websearch_request`）与**非流式**回灌循环
 ///   （`run_web_search_loop` 在 `dispatch_web_search_loop` 里本任务 await）：在
-///   `dispatch_websearch_paths` 作用域内。
+///   `dispatch_websearch_paths` 作用域内；
+/// - **流式**混合 websearch 回灌（2026-10-14 接线，原 deferred 转正）：
+///   `mixed_websearch_stream_response` 里 `tokio::spawn(run_web_search_loop)` —— spawn
+///   不继承 task-local，故在 spawn **之前**（仍在 `dispatch_websearch_paths` 作用域内）
+///   按值捕获同一端点，任务内 `INBOUND_ENDPOINT.scope` 重进；画像未标注时捕获到 None →
+///   任务内不进作用域（语义同 `in_endpoint_scope` 的 None 分支）。守卫 ④ 钉住。
 ///
 /// **读不到的路径**（保持 None，聚合落 `(unknown)`，绝不猜一个已知端点）：
-/// - 流式混合 websearch 回灌：`mixed_websearch_stream_response` 里
-///   `tokio::spawn(run_web_search_loop)` —— spawn 不继承 task-local，且 websearch.rs
-///   不在本次可改文件范围内（接线需在 spawn 点按值捕获并传入），deferred；
-/// - 画像未标注的入口（测试夹具 / 未来新入口）：作用域不进入。
+/// - 画像未标注的入口（测试夹具 / 未来新入口）：作用域不进入；
+/// - 未来新增的 spawn 边界：`tokio::spawn` 一律不继承 task-local，新任务必须照 ④ 的
+///   做法（spawn 前按值捕获 + 任务内重进），否则该路径的记录恒 None 且无运行时信号。
 ///
-/// 本守卫钉三件事，任一为红都要求同步（构造点没接端点没有运行时信号，只能靠守卫拦）：
+/// 本守卫钉四件事，任一为红都要求同步（构造点没接端点没有运行时信号，只能靠守卫拦）：
 /// ① 构造点数量漂移；② 两处读取点仍经 `try_with` 读取并写 `endpoint`（读不到 = None，
-/// 不得 `unwrap_or` 猜端点）；③ handlers 侧仍导出 task-local（撤销导出 = provider 编译错）。
+/// 不得 `unwrap_or` 猜端点）；③ handlers 侧仍导出 task-local（撤销导出 = provider 编译错）；
+/// ④ 流式 websearch 回灌的 spawn 边界仍按值搬运端点（spawn 前捕获、任务内重进作用域）。
 #[cfg(test)]
 mod endpoint_wiring_tests {
     /// 生产段 = 首个测试门之前（与 provider_tests.rs 的守卫同一切法）。
@@ -5429,6 +5437,52 @@ mod endpoint_wiring_tests {
             handlers.contains(exported.as_str()),
             "handlers 必须导出 pub(crate) INBOUND_ENDPOINT —— provider 层两处读取点依赖它；\
              撤销导出 = 编译错（E0603），本守卫给出可读原因"
+        );
+    }
+
+    /// ④：流式混合 websearch 回灌的 spawn 边界必须把端点搬进新任务（2026-10-14 接线，
+    /// 原 deferred 转正）。`tokio::spawn` 不继承 task-local：`mixed_websearch_stream_response`
+    /// 在 `dispatch_websearch_paths` 的 `in_endpoint_scope` 作用域内执行，spawn **之前**按值
+    /// 捕获端点、任务内 `scope` 重进 —— 漏任一步，该路径 provider 的 9 个构造点都恒读 None
+    /// （聚合落 `(unknown)`，没有运行时信号，只能靠本守卫拦）。
+    #[test]
+    fn websearch_stream_spawn_carries_endpoint_into_task() {
+        let ws = include_str!("../anthropic/websearch.rs");
+        let prod = ws
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(ws);
+        let body = prod
+            .split("pub(super) fn mixed_websearch_stream_response")
+            .nth(1)
+            .expect("mixed_websearch_stream_response 不应被改名")
+            .split("\nfn loop_message_start_bytes")
+            .next()
+            .expect("split 至少一段");
+        let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        let read = "super::handlers::INBOUND_ENDPOINT";
+        let capture = format!("letendpoint={}.try_with(|e|*e).ok();", read);
+        let capture_at = compact.find(capture.as_str()).expect(
+            "spawn 前必须按值捕获端点（作用域值 = 画像端点，单一来源）——\
+             否则 spawn 出的回灌任务里 provider 的 9 个构造点读不到端点（落 (unknown)）",
+        );
+        let spawn_at = compact
+            .find("tokio::spawn(asyncmove{")
+            .expect("回灌循环必须仍由 tokio::spawn 启动");
+        assert!(
+            capture_at < spawn_at,
+            "捕获必须发生在 spawn **之前**：spawn 之后新任务里 task-local 不可见（tokio 语义）"
+        );
+        let after_spawn = &compact[spawn_at..];
+        assert!(
+            after_spawn.contains(format!("{}.scope(", read).as_str()),
+            "任务内必须用 `INBOUND_ENDPOINT.scope(...)` 重进作用域 —— 只捕获不重进等于没接\
+             （provider 仍读不到，与 handler 层同请求的记录分叉）"
+        );
+        assert!(
+            after_spawn.contains("matchendpoint{"),
+            "必须按 `endpoint` 分两臂：Some 进作用域、None 不进（同 `in_endpoint_scope` 的\
+             None 分支 —— 读不到保持 None，绝不猜一个已知端点）"
         );
     }
 }

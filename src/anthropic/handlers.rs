@@ -1015,8 +1015,8 @@ async fn dispatch_websearch_paths(
     }
     if kiro_mcp_ok {
         // 非流式回灌循环在**本任务内** await（provider 调用在其内部），故同样进作用域；
-        // 流式回灌（`mixed_websearch_stream_response` 的 spawn）不继承 task-local，见
-        // `INBOUND_ENDPOINT` 声明处的读不到清单（deferred）。
+        // 流式回灌走 `mixed_websearch_stream_response` 里的 spawn，不继承 task-local，
+        // 由该函数在 spawn **之前**按值捕获同一真值、任务内重进作用域（见其注释与守卫）。
         if let Some(resp) = in_endpoint_scope(
             client.endpoint,
             dispatch_web_search_loop(provider, payload, budget, client),
@@ -3092,9 +3092,12 @@ fn record_request_span_credential_id(id: u64) {
 //   两个分发漏斗（Kiro 主路径 / websearch 快路径 + 非流式回灌），以及首字重试 reopen
 //   （在 SSE body 轮询里执行、作用域已结束，故按值捕获后重进）。
 //
-// **读不到的路径**（保持 None，deferred）：流式混合 websearch 回灌 ——
-// `mixed_websearch_stream_response` 里 `tokio::spawn(run_web_search_loop)`，spawn 不继承
-// task-local，且 websearch.rs 不在本次可改文件范围内（接线需在 spawn 点按值捕获并传入）。
+// **spawn 边界的搬运**：`websearch.rs` 的流式混合回灌任务不继承 task-local，由该函数在
+// spawn **之前**读一次本 task-local（此时仍在 `dispatch_websearch_paths` 的作用域内）并按值
+// 捕获，任务内重进作用域；画像未标注时读到 None ⇒ 任务内也不进作用域（绝不猜端点）。
+// 该约定由 provider.rs 的守卫 `websearch_stream_spawn_carries_endpoint_into_task` 钉住。
+//
+// **读不到的路径**（保持 None）：画像未标注的入口，以及未来新增而未照上述搬运的 spawn 边界。
 tokio::task_local! {
     pub(crate) static INBOUND_ENDPOINT: crate::usage::record::RequestEndpoint;
 }

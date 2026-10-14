@@ -2250,16 +2250,31 @@ pub(super) fn mixed_websearch_stream_response(
     let model = payload.model.clone();
     let progress: WebSearchProgressCell = Default::default();
     let progress_loop = progress.clone();
+    // spawn 出的任务**不继承** task-local（tokio 语义），而 provider 层 9 个记录构造点
+    // 靠 handlers 导出的 `INBOUND_ENDPOINT` 读入站端点：不搬的话这条路径恒读到 None，
+    // 与 handler 层同请求的记录（带 Some(endpoint)）分叉落 `(unknown)`。
+    // 本函数体执行在 `dispatch_websearch_paths` 的 `in_endpoint_scope(client.endpoint, …)`
+    // 作用域内（唯一调用点 = handlers 的 `dispatch_web_search_loop`），故在 spawn **之前**
+    // 按值捕获同一真值 —— 作用域值 = 画像端点（单一来源，见 handlers 的 `in_endpoint_scope`）；
+    // 本函数签名不带 ClientInfo、唯一调用点在本次不可改的 handlers，故从作用域读回而非改签名。
+    // 画像未标注 → 作用域未进 → 这里读到 None → 任务内同样不进作用域（与 `in_endpoint_scope`
+    // 的 None 分支逐字同义：读不到保持 None，绝不猜端点）。该助手对 handlers 私有、无法复用，
+    // 故这里内联同一分支。
+    let endpoint = super::handlers::INBOUND_ENDPOINT.try_with(|e| *e).ok();
     let mut task = tokio::spawn(async move {
-        run_web_search_loop(
+        // 先建 future 再进作用域：两个分支共用同一份调用（`scope` 只包住循环本身）。
+        let loop_fut = run_web_search_loop(
             provider,
             payload,
             fallback_input_tokens,
             &budget,
             Some(hop_tx),
             Some(&progress_loop),
-        )
-        .await
+        );
+        match endpoint {
+            Some(ep) => super::handlers::INBOUND_ENDPOINT.scope(ep, loop_fut).await,
+            None => loop_fut.await,
+        }
     });
 
     tokio::spawn(async move {
