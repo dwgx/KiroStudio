@@ -735,11 +735,45 @@ async fn refresh_idc_token(
 /// `refresh_token`"，这与"逐字段合并 vs 整体替换"是两个独立问题，缺一不可。逐字段合并后，
 /// 守卫的语义反而更准确：它只需要担保这 4 个 token 字段的新鲜度，不再被迫替其它无关字段
 /// （如 `subscription_title`）的新鲜度背书。
+///
+/// `profile_arn` 在这条守卫之外还有**自己的**陈旧守卫（[`skip_stale_profile_arn_writeback`]，
+/// 写回临界区里先于本函数调用）：它可能被用量解析 / 管理员切换 region 在 await 期间改写，
+/// 快照被改过时该字段整体放弃本次写回。refresh_token 守卫只担保 token 三字段的新鲜度，
+/// 替不了这一条。
 fn apply_refresh_result_fields(entry_credentials: &mut KiroCredentials, new_creds: &KiroCredentials) {
     entry_credentials.access_token = new_creds.access_token.clone();
     entry_credentials.refresh_token = new_creds.refresh_token.clone();
     entry_credentials.expires_at = new_creds.expires_at.clone();
     entry_credentials.profile_arn = new_creds.profile_arn.clone();
+}
+
+/// 刷新写回临界区的 **profileArn 陈旧守卫**（2026-10-14 对手对照发现；与
+/// `token_refresh_http.rs` 的 profileArn 解析写回 / reprobe 写回两处守卫同型——那两处
+/// 比对各自的 await 前快照，这里比对刷新发起前的 `credentials` 快照）。
+///
+/// 写回发生在跨 await 的刷新往返之后（含重试退避最坏约 183s），期间「用量解析」
+/// （`get_usage_limits_for` 回填真实 ARN）或管理员「切换 region」
+/// （`switch_profile_region_for` 先验活再写）可能已写入**更新**的 arn。`new_creds`
+/// 派生自 await 前的快照：响应未携带 arn 时它就是旧值，无条件搬运会把并发写入的新 arn
+/// 静默回退，随后 `persist_credentials` 把回退结果落盘。
+///
+/// 判据：entry 当前值 != await 前快照 ⇒ 快照已陈旧，**放弃本次 arn 写回**——把合并源
+/// `new_creds` 的 arn 校正为 entry 当前值，随后 `apply_refresh_result_fields` 搬运的
+/// 是并发写入的新值。token 三字段不受影响（刷新产物与 arn 正交，不随 arn 一起丢弃）。
+///
+/// 返回 `true` = 本次 arn 写回被放弃（调用方据此打日志；与另两处守卫同约定：日志只在
+/// 真正拦截的分支打，避免运维据此以为值已更新）。
+fn skip_stale_profile_arn_writeback(
+    entry_credentials: &KiroCredentials,
+    new_creds: &mut KiroCredentials,
+    snapshot: &KiroCredentials,
+) -> bool {
+    if entry_credentials.profile_arn != snapshot.profile_arn {
+        new_creds.profile_arn = entry_credentials.profile_arn.clone();
+        true
+    } else {
+        false
+    }
 }
 
 /// BuilderId / IdC 账号无自带 profileArn 时的默认回退值（与 Kiro IDE 一致）。
@@ -7877,7 +7911,9 @@ impl MultiTokenManager {
     /// `persist_disabled_state`（= persist_credentials）同样落盘。另两处同步：
     /// load 回填（`MultiTokenManager::new`）与 persist 全量写盘。
     pub fn set_disabled(&self, id: u64, disabled: bool) -> anyhow::Result<()> {
-        {
+        // 启用分支的熔断/健康清除键（family_key）在锁内取值、锁外清（health 独立锁，
+        // 禁止与 entries 锁嵌套）；禁用分支保持 None（惩罚态留到启用那一刻再清）。
+        let health_key = {
             let mut entries = self.entries.lock();
             let entry = entries
                 .iter_mut()
@@ -7894,11 +7930,13 @@ impl MultiTokenManager {
                 // 禁用时刻一并清掉：残留会随 persist 落盘，重启后运维看到的是旧禁用
                 // 时刻，判断"这号坏了多久"被误导（#10 四件套同步契约，与 reason 同清）。
                 entry.disabled_at = None;
+                Some(entry.credentials.family_key(id))
             } else {
                 entry.disabled_reason = Some(DisabledReason::Manual);
                 entry.disabled_at = Some(Utc::now().to_rfc3339());
+                None
             }
-        }
+        };
         // 禁用凭据时清除其会话亲和性绑定，避免后续请求重选时反复尝试已禁用凭据
         if disabled {
             self.affinity.remove_by_credential(id);
@@ -7907,6 +7945,15 @@ impl MultiTokenManager {
             // （TTL ≤30min 且巡检循环跳过禁用号 → 残留不会自己失效），重启用后
             // 死号仍被当「模型 Confirmed」白打一跳。启用即失效缓存，让巡检重抓。
             self.invalidate_model_catalog(id);
+            // ⭐ 启用即清熔断/健康状态（2026-10-14 对手对照发现）：与 reset_and_enable 是同一
+            // 缺陷形态——health 的 Circuit::Open 是独立一层惩罚（sticky 硬拒 + p_avail 沉底，
+            // 退避最长 30min），不清它则「启用」后号仍不出活、被误判为启用无效。键=family_key
+            // （同族共担）。本函数唯一的非 Admin 调用方是上号路径的探测窗口恢复：新号的
+            // cred:{id} 键尚无记录 ⇒ clear 为 no-op；clone:{group} 族键的清与「该号正在被
+            // 启用」语义一致，且自动防护会在下一次风控报告时重新武装。
+            if let Some(key) = health_key {
+                self.health.clear(&key);
+            }
         }
         // 持久化更改
         self.persist_credentials()?;
@@ -8588,7 +8635,9 @@ impl MultiTokenManager {
 
     /// 重置凭据失败计数并重新启用（Admin API）
     pub fn reset_and_enable(&self, id: u64) -> anyhow::Result<()> {
-        {
+        // health 清除键（family_key，HealthTracker 唯一合法键）随 entries 锁内一并取出；
+        // health 有独立 Mutex，clear 必须放在锁外（与 cooldown/rate_limiter 同约定，禁止锁嵌套）。
+        let health_key = {
             let mut entries = self.entries.lock();
             let entry = entries
                 .iter_mut()
@@ -8620,11 +8669,20 @@ impl MultiTokenManager {
             // 同步契约），面板与 credentials.json 上出现「已启用但带着旧禁用时刻」的
             // 自相矛盾状态，运维判断「这号坏了多久」被误导；重启后由 load 回填继续保留。
             entry.disabled_at = None;
-        }
+            // 熔断/健康键随同带出：clear 在 entries 锁外调用（见上方注释）。
+            entry.credentials.family_key(id)
+        };
         // 重置并启用时一并清 per-id 冷却/退避残留,让「重置」名副其实(否则刚启用又被残留退避跳过)。
         // 在 entries 锁外调用(rate_limiter/cooldown 各有独立锁)。
         self.cooldown.clear_cooldown(id);
         self.rate_limiter.reset(id);
+        // ⭐ 熔断/健康状态一并清零（2026-10-14 对手对照发现）：health 的 Circuit::Open 是与
+        // cooldown/rate_limiter **并列的一层独立惩罚**——sticky 复用被硬拒
+        // （is_sticky_reuse_healthy）+ 选号 p_avail 排序沉底，Open 退避 8s×1.6^n 最长 30min。
+        // 不清它则「重置并启用」后面板显示已启用、号却最长 30min 不出活，被误判为重置无效。
+        // 键必须用 family_key（与 report_success / is_sticky_reuse_healthy / health_snapshots
+        // 同口径）：同族分身共担该状态，清一个键即解除整族熔断（连坐语义的另一面）。
+        self.health.clear(&health_key);
         // 模型目录缓存同款失效（对齐 set_disabled 启用分支的 Review3 m5）：禁用期残留的
         // Confirmed 不会自愈（TTL ≤30min 且巡检跳过禁用号），重启用后死号仍被当
         // 「模型 Confirmed」白打一跳。invalidate 有独立锁，故在 entries 锁外调用。
@@ -10861,6 +10919,199 @@ mod quota_recovery_and_starvation_tests {
             e.starvation_key(),
             0,
             "peek 不占位、不代表请求被服务，绝不能刷新饥饿基准"
+        );
+    }
+}
+
+// ===== 2026-10-14：复活路径统一清熔断/健康 + 刷新写回 profileArn 陈旧守卫（本轮改动回归） =====
+//
+// 改动跨 token_manager.rs / token_refresh_http.rs / admin/service.rs 三个文件，用例内联在文件尾。
+// 对既有源码守卫无影响——守卫按**第一个** `#[cfg(test)]` 截断生产段
+// （本模块在 `mod tests;` 之后，截断点不变）。
+#[cfg(test)]
+mod revive_clears_health_and_stale_arn_tests {
+    use super::*;
+
+    /// 把 `id` 打成熔断 Open（连续裸 429 超 TRIP_THRESHOLD=3 即跳闸）。
+    /// 调用方负责「夹具自检」断言（先证前置真的成立，再测被测行为）。
+    fn trip_circuit(mgr: &MultiTokenManager, id: u64) {
+        for _ in 0..5 {
+            mgr.report_rate_limited_with_retry_after(id, None);
+        }
+    }
+
+    /// 🔴 复活路径一：`reset_and_enable` 必须清熔断/健康（2026-10-14 对手对照发现）。
+    ///
+    /// **旧代码为何失败**：`reset_and_enable` 只清 cooldown + rate_limiter，
+    /// health 的 Circuit::Open 是与它们并列的一层独立惩罚——sticky 复用被硬拒
+    /// （is_sticky_reuse_healthy）+ 选号 p_avail 排序沉底，Open 退避最长 30min
+    /// ⇒ 运维点「重置并启用」后号最长 30 分钟不出活，被误判为重置无效。
+    #[test]
+    fn reset_and_enable_clears_health_circuit_so_revived_cred_serves_immediately() {
+        let mut config = Config::default();
+        config.cooldown_enabled = true;
+        let mut c = KiroCredentials::default();
+        c.refresh_token = Some("r-revive-health".to_string());
+        let mgr = MultiTokenManager::new(config, vec![c], None, None, false).unwrap();
+
+        trip_circuit(&mgr, 1);
+        assert!(
+            mgr.health_snapshots()
+                .get(&1)
+                .expect("跳闸后应有健康记录")
+                .circuit_open,
+            "夹具自检：连续 429 必须先跳成 Circuit::Open"
+        );
+
+        mgr.set_disabled(1, true).unwrap();
+        mgr.reset_and_enable(1).unwrap();
+
+        assert!(
+            mgr.health_snapshots().get(&1).is_none(),
+            "回退即 FAIL：reset_and_enable 后熔断记录仍在——号被 sticky 硬拒 + p_avail 沉底，\
+             最长 30min 不出活，运维会误判重置无效"
+        );
+    }
+
+    /// 🔴 复活路径二：`set_disabled(false)`（面板「启用」）同样必须清熔断/健康。
+    ///
+    /// 与 `reset_and_enable` 是同一缺陷形态、同一后果；同时钉住**禁用分支不得动
+    /// health**（惩罚态要留到启用那一刻才清，否则「禁用一下再启用」变成隐式解熔断）。
+    #[test]
+    fn set_disabled_false_clears_health_circuit() {
+        let mut config = Config::default();
+        config.cooldown_enabled = true;
+        let mut c = KiroCredentials::default();
+        c.refresh_token = Some("r-enable-health".to_string());
+        let mgr = MultiTokenManager::new(config, vec![c], None, None, false).unwrap();
+
+        trip_circuit(&mgr, 1);
+        assert!(
+            mgr.health_snapshots()
+                .get(&1)
+                .expect("跳闸后应有健康记录")
+                .circuit_open,
+            "夹具自检：连续 429 必须先跳成 Circuit::Open"
+        );
+
+        mgr.set_disabled(1, true).unwrap();
+        assert!(
+            mgr.health_snapshots()
+                .get(&1)
+                .expect("禁用不应清健康记录")
+                .circuit_open,
+            "禁用分支不得动 health（惩罚态留到启用时清）"
+        );
+
+        mgr.set_disabled(1, false).unwrap();
+        assert!(
+            mgr.health_snapshots().get(&1).is_none(),
+            "回退即 FAIL：set_disabled(false) 后熔断记录仍在，号最长 30min 不出活"
+        );
+    }
+
+    /// 🔴 清 health 的键必须是 family_key：同族分身共担一条健康记录，
+    /// 复活其中一份必须让整族解除熔断。
+    ///
+    /// 形态：若实现误用 `cred:{id}`（本仓历史上 429 上报就踩过同款影子键，
+    /// 见 report_rate_limited_with_retry_after 的注释），这里会清一个**从不被读**的
+    /// 影子条目，真正门控调度的 `clone:{group}` 键纹丝不动——本测试即红。
+    #[test]
+    fn revive_clears_health_under_family_key_not_per_credential() {
+        const KEY: &str = "ksk_revive_family_key";
+        const GROUP: &str = "00000000-0000-0000-0000-0000000000ee";
+        let mk = |id: u64, mid: &str| {
+            let mut c = KiroCredentials::default();
+            c.id = Some(id);
+            c.auth_method = Some("api_key".to_string());
+            c.kiro_api_key = Some(KEY.to_string());
+            c.clone_group = Some(GROUP.to_string());
+            c.machine_id = Some(mid.to_string());
+            c
+        };
+        let mut config = Config::default();
+        config.cooldown_enabled = true;
+        let mgr = MultiTokenManager::new(
+            config,
+            vec![mk(1306, &"a".repeat(64)), mk(1307, &"b".repeat(64))],
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+
+        // #1306 触发 429 → 族键 clone:{GROUP} 熔断；同族 #1307 拿到同一份快照。
+        trip_circuit(&mgr, 1306);
+        let snaps = mgr.health_snapshots();
+        assert!(snaps.get(&1306).expect("跳闸后应有记录").circuit_open);
+        assert!(
+            snaps.get(&1307).expect("同族应共担同一条记录").circuit_open,
+            "夹具自检：同 clone_group 必须共担一个 health 键"
+        );
+
+        mgr.set_disabled(1306, true).unwrap();
+        mgr.reset_and_enable(1306).unwrap();
+
+        let snaps = mgr.health_snapshots();
+        assert!(
+            snaps.get(&1306).is_none() && snaps.get(&1307).is_none(),
+            "清 health 必须命中 family_key（clone:{{group}}）——清 cred:{{id}} 只留影子键，\
+             真正门控调度的族键纹丝不动（复活的号仍被熔断硬拒）"
+        );
+    }
+
+    /// 🔴 刷新写回的 profileArn 陈旧守卫（2026-10-14 对手对照发现）——模拟 await 期间被改。
+    ///
+    /// 时序：await 前快照 → 并发写（用量解析 / 管理员切换 region 在 await 期间落库）→ 写回。
+    /// 场景 A（被改过）：放弃本次 arn 写回，保留并发写入的新值；token 三字段照常搬运
+    /// （刷新产物与 arn 正交，不随 arn 一起丢弃）。
+    /// 场景 B（未被改过）：不拦截，刷新响应携带的新 arn 正常写回。
+    #[test]
+    fn refresh_writeback_skips_stale_profile_arn_simulation() {
+        // ── 场景 A：await 期间 entry 的 arn 被并发改写 ──
+        let mut snapshot = KiroCredentials::default();
+        snapshot.access_token = Some("old_access".to_string());
+        snapshot.refresh_token = Some("old_refresh".to_string());
+        snapshot.profile_arn =
+            Some("arn:aws:codewhisperer:us-east-1:111111111111:profile/OLD".to_string());
+
+        // 刷新产物：响应未携带 arn（external_idp 从不写；idc/social 也可能不带）⇒ 仍是旧值。
+        let mut new_creds = snapshot.clone();
+        new_creds.access_token = Some("new_access".to_string());
+
+        // 并发写入：管理员「切换 region」先验活再写，entry 已是新 arn（快照看不到）。
+        let mut entry = snapshot.clone();
+        entry.profile_arn =
+            Some("arn:aws:codewhisperer:eu-central-1:222222222222:profile/NEW".to_string());
+
+        let skipped = skip_stale_profile_arn_writeback(&entry, &mut new_creds, &snapshot);
+        assert!(skipped, "快照被改过必须判定陈旧（否则旧值会静默覆盖新值）");
+        apply_refresh_result_fields(&mut entry, &new_creds);
+        assert_eq!(
+            entry.profile_arn.as_deref(),
+            Some("arn:aws:codewhisperer:eu-central-1:222222222222:profile/NEW"),
+            "回退即 FAIL：await 前快照的 arn 覆盖了并发写入的新值（随后会 persist 落盘）"
+        );
+        assert_eq!(
+            entry.access_token.as_deref(),
+            Some("new_access"),
+            "token 三字段必须照常搬运（刷新产物与 arn 正交）"
+        );
+
+        // ── 场景 B：未被并发改过 ⇒ 不拦截，响应携带的新 arn 正常写回 ──
+        let snapshot2 = snapshot.clone();
+        let mut new_creds2 = snapshot2.clone();
+        new_creds2.profile_arn =
+            Some("arn:aws:codewhisperer:us-west-2:333333333333:profile/FRESH".to_string());
+        let mut entry2 = snapshot2.clone();
+
+        let skipped2 = skip_stale_profile_arn_writeback(&entry2, &mut new_creds2, &snapshot2);
+        assert!(!skipped2, "快照未被改过不得误拦（刷新响应的新 arn 必须能写回）");
+        apply_refresh_result_fields(&mut entry2, &new_creds2);
+        assert_eq!(
+            entry2.profile_arn.as_deref(),
+            Some("arn:aws:codewhisperer:us-west-2:333333333333:profile/FRESH"),
+            "响应携带的新 arn 必须正常写回"
         );
     }
 }

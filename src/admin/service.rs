@@ -1553,7 +1553,13 @@ impl AdminService {
     /// 对齐参考仓 `do_relogin_update` 的节奏（禁用 → 更新 → 重置启用），但本仓
     /// token_manager **没有写 refresh_token 的 setter**（token 只由内部刷新路径轮换），
     /// 故这里不做 token 替换，做的是清掉全部进程内惩罚状态并重新启用：
-    /// `reset_and_enable` 内部已收口 `clear_transient_counters` + 冷却 + 限流器。
+    /// `reset_and_enable` 内部已收口 `clear_transient_counters` + 冷却 + 限流器 +
+    /// 熔断/健康（health，按 family_key 清）。
+    ///
+    /// ⚠️ 注释核实（2026-10-14 对手对照）：此前 health 漏清，「清掉全部进程内惩罚状态」
+    /// 与事实不符——被熔断的号复活后仍最长 30min 不出活（sticky 硬拒 + p_avail 沉底），
+    /// 面板显示已启用、运维误判复活无效。现已在 `reset_and_enable` 补齐 health 清除，
+    /// 本条描述随之为真。
     ///
     /// 用途：号被 `SuspiciousActivityAuto` / 瞬时误禁 / 想强制解除冷却时的人工复活。
     /// 若 token 真的已废（`InvalidRefreshToken`），复活后首次刷新仍会失败并再次被禁 ——
@@ -4658,3 +4664,59 @@ impl AdminService {
 #[cfg(test)]
 #[path = "service_tests.rs"]
 mod tests;
+
+// ===== 2026-10-14：relogin 复活必须清熔断/健康（本轮改动回归） =====
+//
+// `relogin_oauth` 的复活链（set_disabled(true) → reset_and_enable）此前不清 health，
+// 其自述「清掉全部进程内惩罚状态」与事实不符（注释已随 reset_and_enable 的补齐一并核实修正）。
+// 用例内联在文件尾：既有源码守卫按**第一个** `#[cfg(test)]` 截断生产段
+// （service_tests.rs 的挂载点更靠前），截断点不变。
+#[cfg(test)]
+mod relogin_clears_health_tests {
+    use super::*;
+
+    /// 🔴 `relogin_oauth` 复活后熔断/健康必须清零（2026-10-14 对手对照发现）。
+    ///
+    /// 旧代码后果：号被 `SuspiciousActivityAuto` / 429 熔断后点「复活」，面板显示已启用，
+    /// 但 Circuit::Open 最长 30min 继续硬拒 sticky 复用 + p_avail 沉底 ⇒ 号不出活，
+    /// 运维误判复活无效。
+    #[test]
+    fn relogin_oauth_clears_health_circuit() {
+        let mut c = KiroCredentials::default();
+        c.id = Some(1);
+        c.auth_method = Some("idc".to_string());
+        c.refresh_token = Some("rt-relogin-health".to_string());
+        let mut config = crate::model::config::Config::default();
+        config.cooldown_enabled = true;
+        let tm = Arc::new(
+            MultiTokenManager::new(config, vec![c], None, None, false).expect("构造 token manager"),
+        );
+        let svc = AdminService::new(tm, Vec::<String>::new());
+
+        // 造熔断：连续 429 跳闸（TRIP_THRESHOLD=3，取 5 次留余量）。
+        for _ in 0..5 {
+            svc.token_manager
+                .report_rate_limited_with_retry_after(1, None);
+        }
+        assert!(
+            svc.token_manager
+                .health_snapshots()
+                .get(&1)
+                .expect("跳闸后应有健康记录")
+                .circuit_open,
+            "夹具自检：连续 429 必须先跳成 Circuit::Open"
+        );
+
+        svc.relogin_oauth(1).expect("idc 号复活应成功");
+
+        assert!(
+            svc.token_manager.health_snapshots().get(&1).is_none(),
+            "回退即 FAIL：relogin 后熔断记录仍在，号最长 30min 不出活——\
+             与 relogin_oauth 自述的「清掉全部进程内惩罚状态」不符"
+        );
+        // 号确实回到启用态（relogin 的核心语义不被本改动破坏）。
+        let snap = svc.token_manager.snapshot();
+        let e = snap.entries.iter().find(|e| e.id == 1).expect("号应在池中");
+        assert!(!e.disabled, "复活后必须重新启用");
+    }
+}

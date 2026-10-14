@@ -10,8 +10,8 @@ use crate::kiro::model::credentials::KiroCredentials;
 
 use super::{
     apply_refresh_result_fields, is_token_expiring_within, refresh_error_retryable,
-    refresh_token, resolve_profile_arn_multi_region, DiagnosedError,
-    RefreshNotSupportedError, RefreshOutcome, RefreshTokenInvalidError,
+    refresh_token, resolve_profile_arn_multi_region, skip_stale_profile_arn_writeback,
+    DiagnosedError, RefreshNotSupportedError, RefreshOutcome, RefreshTokenInvalidError,
     REPROBE_ALL_BAD_COOLDOWN, REFRESH_LOCK_TIMEOUT_SECS,
 };
 
@@ -94,7 +94,9 @@ impl super::MultiTokenManager {
         // Change 2: 瞬态错误重试退避（3 次，1s/2s/4s）。
         // 仅对 5xx 状态码和网络/连接错误重试；400/401/403/429/invalid_grant/DiagnosedError
         // 属永久性或策略性失败，直接透传给上层（保留 RefreshTokenInvalidError 语义不变）。
-        let new_creds = {
+        // `mut`：写回临界区的 profileArn 陈旧守卫会按需校正 `new_creds.profile_arn`
+        // （见 skip_stale_profile_arn_writeback 文档），token 三字段不受影响。
+        let mut new_creds = {
             const MAX_ATTEMPTS: u32 = 3;
             let mut last_err: anyhow::Error = anyhow::anyhow!("unreachable");
             let mut succeeded = false;
@@ -163,6 +165,25 @@ impl super::MultiTokenManager {
                         id
                     );
                     return Ok(RefreshOutcome::Skipped);
+                }
+                // 🔴 profileArn 陈旧守卫（2026-10-14 对手对照发现；与本函数下方 profileArn
+                // 解析写回 / reprobe 写回两处守卫同型，判据与理由见
+                // skip_stale_profile_arn_writeback 文档）：本写回跨过一次刷新网络往返
+                // （含退避最坏约 183s），期间用量解析（get_usage_limits_for 回填真实 ARN）
+                // 或管理员「切换 region」（switch_profile_region_for 先验活再写）可能已写入
+                // **更新**的 arn。`new_creds` 派生自 await 前的快照，响应未携带 arn 时它就是
+                // 旧值 ⇒ 无条件搬运会把并发写入的新 arn 静默回退（随后 persist 落盘）。
+                // 被改过就放弃本次 arn 写回——token 三字段照常搬运（刷新产物与 arn 正交）。
+                if skip_stale_profile_arn_writeback(
+                    &entry.credentials,
+                    &mut new_creds,
+                    &credentials,
+                ) {
+                    tracing::warn!(
+                        "凭据 #{} 的 profileArn 在刷新期间被其它操作改写（如管理员切换 region / \
+                         用量解析），本次刷新快照已陈旧，放弃本次 arn 写回以免回退新值",
+                        id
+                    );
                 }
                 // 逐字段合并（白名单，见 apply_refresh_result_fields 文档）：只搬运刷新链路
                 // 真正拥有的 4 个 token 字段，其余字段（如 subscription_title）原地保留，
@@ -298,5 +319,50 @@ impl super::MultiTokenManager {
 
         tracing::info!("凭据 #{} Token 已刷新", id);
         Ok(RefreshOutcome::Refreshed)
+    }
+}
+
+// ===== 2026-10-14：刷新写回 profileArn 陈旧守卫（本轮改动回归） =====
+//
+// 行为面（模拟 await 期间被改的两种时序）在 token_manager.rs 的
+// `revive_clears_health_and_stale_arn_tests::refresh_writeback_skips_stale_profile_arn_simulation`；
+// 本模块只钉**接线**：写回临界区必须在逐字段合并之前调用守卫函数，否则守卫函数
+// 无人调用时行为测试照样全绿（纸面测试：测了函数，没测是否真被接线）。
+//
+// 对既有源码守卫无影响：本文件此前没有测试段，既有守卫按第一个测试模块属性截断生产段
+// —— 本模块在文件尾，生产段内容不变。
+// ⚠️ 本行注释刻意不写该属性字面量：守卫用「文件中第一次出现它」定位截断点，
+// 若在属性之前先出现一次，截断点会落进注释而不是属性。
+#[cfg(test)]
+mod stale_arn_writeback_wiring_tests {
+    /// 🔴 刷新写回的 profileArn 陈旧守卫必须接在写回临界区（2026-10-14 对手对照发现）。
+    ///
+    /// 回退即 FAIL：删掉守卫调用 / 把守卫挪到 apply_refresh_result_fields 之后
+    /// （先写回再判定 = 没有守卫）。
+    #[test]
+    fn refresh_writeback_must_call_stale_profile_arn_guard_before_merge() {
+        let src = include_str!("token_refresh_http.rs");
+        let cut = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..cut];
+        let at = prod
+            .find("// 更新 entries 中对应凭据")
+            .expect("写回临界区的定位注释不应被删改");
+        let section = &prod[at..];
+        let end = section
+            .find("drop(_guard)")
+            .expect("drop(_guard) 标记不应被删改");
+        let section = &section[..end];
+        // 折叠空白再比：rustfmt 会把长调用拆成多行（与 router 守卫同款写法）。
+        let compact: String = section.chars().filter(|c| !c.is_whitespace()).collect();
+        // needle 运行时拼接：include_str! 会把本测试自己的字面量也读进来。
+        let guard = format!("skip_stale_profile_arn_writeback{}", "(&entry.credentials,");
+        let merge = format!("apply_refresh_result_fields{}", "(&mutentry.credentials,");
+        let g = compact.find(&guard).expect(
+            "写回临界区必须调用 profileArn 陈旧守卫（否则旧快照会静默回退并发写入的新 arn）",
+        );
+        let m = compact
+            .find(&merge)
+            .expect("写回临界区必须调用 apply_refresh_result_fields 做逐字段合并");
+        assert!(g < m, "陈旧守卫必须在逐字段合并之前（先判定再写回）");
     }
 }
