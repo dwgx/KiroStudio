@@ -103,6 +103,15 @@ impl EventType {
             "contextUsageEvent" => Self::ContextUsage,
             "reasoningContentEvent" => Self::ReasoningContent,
             "metadataEvent" => Self::Metadata,
+            // 别名：上游历史版本用过长名字 `messageMetadataEvent`。
+            // 为什么可以当同一个变体：对手实现（wnddd839/kiro.cache 的
+            // `internal/kiro/stream.go`，`frame()` 里）写的是
+            // `case "metadataEvent", "messageMetadataEvent":` —— 两个名字进**同一个分支**，
+            // 取的是同一组字段（stopReason / tokenUsage），语义无差别，只是 wire 版本差异。
+            // 不认它就会落 `Unknown` 被静默丢弃：`stopReason` 丢掉后干净 EOF 只能靠本地推断
+            // （见 `metadata.rs` 模块注释），与「别再丢终止信号」的方向相反。
+            // 别名命中会打一条 debug（见 `parse_event`），便于事后统计上游在用哪个名字。
+            "messageMetadataEvent" => Self::Metadata,
             _ => Self::Unknown,
         }
     }
@@ -200,7 +209,27 @@ impl Event {
         };
 
         match message_type {
-            "event" => Self::parse_event(frame),
+            "event" => {
+                // 事件名级错误：上游也可以**不用** `:message-type: error`，而把错误类型名
+                // 直接写进 `:event-type`（对手实现 wnddd839/kiro.cache 的 `frame()` 里
+                // `case "error", "throttlingError", "validationError", ...` 就是这一形态，
+                // 名单见 [`is_event_name_error`]）。这些帧的 `:message-type` 仍是 `event`；
+                // 不在此分流就会落 `EventType::Unknown` 被静默丢弃（进程内仅一条 warn）——
+                // 一次限流 / 校验失败在上游眼里是错误，我们却照常收尾成 200，客户端把半截
+                // 响应当成正常结束。
+                //
+                // 产出复用 `Event::Error`（即 `:message-type: error` 的产出）：下游
+                // `stream.rs` / `handlers.rs` 的错误链（失败态 + 内联 SSE error + 429/502
+                // 分类）原样生效，不新造平行链路。
+                let named_error = match frame.event_type() {
+                    Some(et) if is_event_name_error(et) => Some(et.to_string()),
+                    _ => None,
+                };
+                match named_error {
+                    Some(error_code) => Self::parse_named_error(frame, error_code),
+                    None => Self::parse_event(frame),
+                }
+            }
             "error" => Self::parse_error(frame),
             "exception" => Self::parse_exception(frame),
             other => Err(ParseError::InvalidMessageType(other.to_string())),
@@ -211,6 +240,17 @@ impl Event {
     fn parse_event(frame: Frame) -> ParseResult<Self> {
         let event_type_str = frame.event_type().unwrap_or("unknown");
         let event_type = EventType::from_str(event_type_str);
+
+        // 别名命中必须**可观测**：否则「上游到底用哪个名字」只能靠抓包才知道，事后统计
+        // （`messageMetadataEvent` 的出现率 / 何时可淘汰别名）无从谈起。
+        // debug 级——正常流量不落盘，需要时开
+        // `RUST_LOG=info,kirostudio::kiro::model::events=debug`。
+        if event_type == EventType::Metadata && event_type_str != "metadataEvent" {
+            tracing::debug!(
+                event_type = %event_type_str,
+                "metadataEvent 别名命中（上游使用了非标准事件名）"
+            );
+        }
 
         match event_type {
             EventType::AssistantResponse => {
@@ -311,6 +351,104 @@ impl Event {
             exception_type,
             message,
         })
+    }
+
+    /// 解析「事件名级错误」消息（错误类型名写在 `:event-type` 里，见 [`is_event_name_error`]）。
+    ///
+    /// 产出与 [`Self::parse_error`] **同一个 `Event::Error` 变体**：下游只认这一个变体，
+    /// 失败态、内联 SSE error、429/502 分类（`is_rate_limit_signal` 认 `throttlingError`
+    /// 里的 `throttl`）全部沿用既有链路，本函数只负责把代码与文本填对。
+    ///
+    /// `error_code` 取事件名本身（对手实现 `exception()` 同样用事件名当 kind），
+    /// 文本的回退顺序见 [`extract_error_text`]。
+    fn parse_named_error(frame: Frame, error_code: String) -> ParseResult<Self> {
+        let error_message = extract_error_text(&frame, &error_code);
+        Ok(Self::Error {
+            error_code,
+            error_message,
+        })
+    }
+}
+
+/// 判定 `:event-type` 是否是**事件名级错误**（错误类型名直接写在事件名里，而不是
+/// `:message-type: error` + `:error-code`）。
+///
+/// 名单对齐对手实现 wnddd839/kiro.cache 的 `frame()`：
+/// `case "error", "throttlingError", "validationError", "serviceUnavailableError",
+/// "internalServerException":` —— 这里取其中四个「名字自带语义」的。
+///
+/// 裸 `error` **刻意未收**（real-deferred）：它在 AWS wire 上与 `:message-type: error`
+/// 同形，真会以 `:event-type` 形态出现与否尚无实测样本；本仓也没有「事件名恰好叫 error」
+/// 的正常事件。等抓到样本再收，避免为一个猜测增加一条正常帧被当错误的路径。
+///
+/// **精确匹配**：不做大小写归一、不做前缀/子串模糊。容忍上游别名不能变成模糊匹配——
+/// 真的出现 `throttlingErrors` 这类新名字时，落 `Unknown` + 一次 warn 才是正确的信号
+/// （它可能根本不是错误，猜错会把一次正常响应变成 502/429）。
+fn is_event_name_error(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "throttlingError"
+            | "validationError"
+            | "serviceUnavailableError"
+            | "internalServerException"
+    )
+}
+
+/// 错误事件 payload 里的可读文本字段。
+///
+/// 字段名对齐上游 wire：`message` 是 Kiro 错误体的标准字段（实测样本见
+/// `handlers_tests.rs` 的 `__type`/`message`/`reason` 三元组），`Message` 是 AWS 风格
+/// 首字母大写变体，`reason` 常与 message 同时出现（如 `USER_REQUEST_RATE_EXCEEDED`）。
+/// 取字段口径与对手实现 `exception()`（message → Message → 原始 payload，再拼 reason）一致。
+///
+/// 未知键（如 `__type`）一律忽略：`__type` 是 `:error-code` 的重复信息，不是文本。
+#[derive(Debug, Default, serde::Deserialize)]
+struct ErrorPayloadText {
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default, rename = "Message")]
+    message_upper: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// 从错误帧提取可读文本：`message` → `Message`（+ 可选 `(reason)` 后缀）→ 原始 payload
+/// → `fallback`（调用方传事件名）。
+///
+/// 为什么不报错：这条路径存在的理由就是「别把错误丢掉」，为一个畸形 payload 把整帧变成
+/// `Err` 只会把可观测的错误变成不可观测的整帧跳过（`decode_frames_into` 对 Err 的处理）。
+/// 为什么逐级回退而不是只取 `message`：拿不到字段时至少要留下「上游说了什么」或
+/// 「是哪种错误」——空文本会让客户端错误体退化成 `上游返回错误: throttlingError - `。
+fn extract_error_text(frame: &Frame, fallback: &str) -> String {
+    if let Ok(fields) = frame.payload_as_json::<ErrorPayloadText>() {
+        let base = fields
+            .message
+            .filter(|s| !s.trim().is_empty())
+            .or(fields.message_upper.filter(|s| !s.trim().is_empty()));
+        let reason = fields.reason.filter(|s| !s.trim().is_empty());
+        return match (base, reason) {
+            (Some(base), Some(reason)) => format!("{base} ({reason})"),
+            (Some(base), None) => base,
+            // 只有 reason：直接用它，不拼成 " (REASON)" 这种前导空格残句。
+            (None, Some(reason)) => reason,
+            (None, None) => raw_payload_text(frame, fallback),
+        };
+    }
+    // 非 JSON（或类型不符）：回退到原始 payload。
+    raw_payload_text(frame, fallback)
+}
+
+/// 原始 payload 文本（trim 后）；拿不到可读内容时回退 `fallback`。
+///
+/// 「可读」判据是**至少含一个字母/数字**（Unicode 口径，中文也算）：空 payload、纯空白、
+/// 纯标点、以及坏帧里那种 `\u{FFFD}` 残片都不算文本，此时用事件名更有信息量。
+fn raw_payload_text(frame: &Frame, fallback: &str) -> String {
+    let raw = frame.payload_as_str();
+    let trimmed = raw.trim();
+    if trimmed.chars().any(char::is_alphanumeric) {
+        trimmed.to_string()
+    } else {
+        fallback.to_string()
     }
 }
 
@@ -450,6 +588,265 @@ mod tests {
             prod.contains(&parse_arm),
             "parse_event 必须有 Metadata 分支（变体加了但没接线会把 payload 丢掉）"
         );
+    }
+
+    /// 别名 `messageMetadataEvent` 必须与 `metadataEvent` 解析成同一形态。
+    ///
+    /// 为什么容忍：对手实现（wnddd839/kiro.cache 的 `frame()`）里
+    /// `case "metadataEvent", "messageMetadataEvent":` 是同一个分支（同取 stopReason /
+    /// tokenUsage），两个名字语义无差别，只是上游版本差异。
+    ///
+    /// FAIL 条件（两条都要能红）：别名落 Unknown → 第一个断言红；别名接上了但 payload
+    /// 没被真解析 → 后两个断言红（只断言「不是 Unknown」不足以发现 payload 被丢）。
+    #[test]
+    fn message_metadata_alias_parses_like_metadata_event() {
+        assert_eq!(
+            EventType::from_str("messageMetadataEvent"),
+            EventType::Metadata,
+            "别名必须解析成 Metadata（落 Unknown 会丢掉 stopReason）"
+        );
+        assert_eq!(
+            EventType::Metadata.as_str(),
+            "metadataEvent",
+            "别名不得改变规范名（as_str 是日志/统计口径）"
+        );
+
+        let raw = build_frame(
+            &[
+                (":message-type", "event"),
+                (":event-type", "messageMetadataEvent"),
+            ],
+            br#"{"stopReason":"max_tokens","tokenUsage":{"cacheReadInputTokens":1234,"uncachedInputTokens":7}}"#,
+        );
+        let (frame, _) = parse_frame(&raw).expect("parse_frame").expect("整帧");
+        match Event::from_frame(frame).expect("别名帧不该失败") {
+            Event::Metadata(m) => {
+                assert_eq!(
+                    m.stop_reason.as_deref(),
+                    Some("max_tokens"),
+                    "别名帧的 stopReason 必须真的解析出来（只判变体类型不够）"
+                );
+                let usage = m.token_usage.expect("tokenUsage 必须被解析出来");
+                assert_eq!(usage.cache_read_input_tokens, Some(1234));
+                assert_eq!(usage.uncached_input_tokens, Some(7));
+            }
+            other => panic!("messageMetadataEvent 应解析为 Metadata，实际 {other:?}"),
+        }
+    }
+
+    /// 4 个「事件名级错误」必须进入错误路径（`Event::Error`），且文本可读。
+    ///
+    /// 为什么是错误路径而不是 Unknown：这些名字自带「这是错误」的语义，落 Unknown 会被
+    /// 静默丢弃（仅一条 warn），一次限流 / 校验失败就被照常收尾成 200。
+    ///
+    /// FAIL 条件：任一名字落 Unknown → 对应断言红；错误代码没取事件名、或文本没从
+    /// `message` / `Message` / `reason` 取出来 → 对应断言红。
+    #[test]
+    fn event_name_level_errors_take_error_path() {
+        // (事件名, payload, 期望错误文本)
+        let cases: [(&str, &str, &str); 4] = [
+            (
+                "throttlingError",
+                r#"{"message":"Too many requests, please wait before trying again.","reason":"USER_REQUEST_RATE_EXCEEDED"}"#,
+                "Too many requests, please wait before trying again. (USER_REQUEST_RATE_EXCEEDED)",
+            ),
+            (
+                "validationError",
+                r#"{"message":"The provided input is not valid."}"#,
+                "The provided input is not valid.",
+            ),
+            (
+                // AWS 风格首字母大写变体字段
+                "serviceUnavailableError",
+                r#"{"Message":"Service is temporarily unavailable."}"#,
+                "Service is temporarily unavailable.",
+            ),
+            (
+                // 真实错误体形态（与 handlers_tests 里的样本同形，多一个 __type 未知键）
+                "internalServerException",
+                r#"{"__type":"com.amazon.aws.codewhisperer#InternalServerException","message":"Encountered an unexpected error."}"#,
+                "Encountered an unexpected error.",
+            ),
+        ];
+
+        for (event_name, payload, expected_text) in cases {
+            let raw = build_frame(
+                &[(":message-type", "event"), (":event-type", event_name)],
+                payload.as_bytes(),
+            );
+            let (frame, _) = parse_frame(&raw).expect("parse_frame").expect("整帧");
+            match Event::from_frame(frame).expect("事件名级错误帧不该失败") {
+                Event::Error {
+                    error_code,
+                    error_message,
+                } => {
+                    assert_eq!(error_code, event_name, "错误代码应取事件名本身");
+                    assert_eq!(
+                        error_message, expected_text,
+                        "{event_name} 的错误文本必须可读且取自 payload 字段"
+                    );
+                }
+                other => panic!("{event_name} 应进入错误路径，实际 {other:?}"),
+            }
+        }
+    }
+
+    /// 事件名级错误的文本回退链：`message`/`Message` → 原始 payload → 事件名本身；
+    /// 缺 `:message-type` 时也按事件名路由（宽松默认与既有行为一致）。
+    ///
+    /// FAIL 条件：拿不到字段时返回空串（客户端错误体退化成
+    /// `上游返回错误: throttlingError - `，等于没信息）或返回 Err（整帧被跳过 = 错误不可观测）。
+    #[test]
+    fn event_name_level_error_text_falls_back() {
+        // (事件名, payload, 期望错误文本)
+        let cases: [(&str, &str, &str); 3] = [
+            // ① 非 JSON：回退到原始 payload（trim 后）
+            ("throttlingError", "slow down\n", "slow down"),
+            // ② 空 payload：回退到事件名本身
+            ("serviceUnavailableError", "", "serviceUnavailableError"),
+            // ③ 只有 reason：单独成文，不拼成带前导空格的 " (REASON)"
+            (
+                "validationError",
+                r#"{"reason":"INVALID_MODEL_ID"}"#,
+                "INVALID_MODEL_ID",
+            ),
+        ];
+
+        for (event_name, payload, expected_text) in cases {
+            let raw = build_frame(
+                &[(":message-type", "event"), (":event-type", event_name)],
+                payload.as_bytes(),
+            );
+            let (frame, _) = parse_frame(&raw).expect("parse_frame").expect("整帧");
+            match Event::from_frame(frame).expect("事件名级错误帧不该失败") {
+                Event::Error {
+                    error_code,
+                    error_message,
+                } => {
+                    assert_eq!(error_code, event_name);
+                    assert_eq!(error_message, expected_text);
+                }
+                other => panic!("{event_name} 应进入错误路径，实际 {other:?}"),
+            }
+        }
+
+        // ④ 缺 :message-type 的帧：仍按事件名进入错误路径
+        let raw = build_frame(
+            &[(":event-type", "internalServerException")],
+            br#"{"message":"boom"}"#,
+        );
+        let (frame, _) = parse_frame(&raw).expect("parse_frame").expect("整帧");
+        match Event::from_frame(frame).expect("事件名级错误帧不该失败") {
+            Event::Error {
+                error_code,
+                error_message,
+            } => {
+                assert_eq!(error_code, "internalServerException");
+                assert_eq!(error_message, "boom");
+            }
+            other => panic!("缺 :message-type 时也应进入错误路径，实际 {other:?}"),
+        }
+    }
+
+    /// 负例：拼写相近的假名字**仍落 Unknown** —— 容忍不能变成模糊匹配。
+    ///
+    /// FAIL 条件：任何一条被「宽松」识别成 Metadata / 错误路径（例如改成前缀匹配、
+    /// 大小写不敏感、或把 Unknown 兜底改成 error），对应断言立刻红。走错方向比漏认更贵：
+    /// 把正常帧当错误会把一次 200 变成 502/429。
+    #[test]
+    fn near_miss_event_names_still_fall_to_unknown() {
+        for name in [
+            "metadataEvents",        // 复数
+            "messageMetadata",       // 缺 Event 后缀
+            "messageMetadataEvents", // 复数
+            "MetadataEvent",         // 大小写不同
+            "metadataevent",
+            "throttlingErrors", // 复数
+            "ThrottlingError",  // 大小写不同
+            "throttling",       // 前缀
+            "validationErrors",
+            "ValidationError",
+            "serviceUnavailableException", // 换了后缀的近似名
+            "serviceUnavailableErrors",
+            "internalServerExceptions",
+            "InternalServerException",
+            "internal_server_exception",
+        ] {
+            assert_eq!(
+                EventType::from_str(name),
+                EventType::Unknown,
+                "{name} 是拼写相近的假名字，必须仍落 Unknown（容忍不得变成模糊匹配）"
+            );
+        }
+
+        // 整链路断言：假错误名不得进入错误路径
+        let raw = build_frame(
+            &[
+                (":message-type", "event"),
+                (":event-type", "throttlingErrors"),
+            ],
+            br#"{"message":"not an error"}"#,
+        );
+        let (frame, _) = parse_frame(&raw).expect("parse_frame").expect("整帧");
+        assert!(
+            matches!(
+                Event::from_frame(frame).expect("未知事件仍按 Unknown 返回"),
+                Event::Unknown {}
+            ),
+            "假名字 throttlingErrors 不得进入错误路径"
+        );
+
+        // 假别名同样不得被当成 metadata（stopReason 会被静默丢）
+        let raw = build_frame(
+            &[
+                (":message-type", "event"),
+                (":event-type", "metadataEvents"),
+            ],
+            br#"{"stopReason":"max_tokens"}"#,
+        );
+        let (frame, _) = parse_frame(&raw).expect("parse_frame").expect("整帧");
+        assert!(
+            matches!(
+                Event::from_frame(frame).expect("未知事件仍按 Unknown 返回"),
+                Event::Unknown {}
+            ),
+            "假名字 metadataEvents 不得被当成 metadata"
+        );
+    }
+
+    /// 回归守卫：`message-type: error` 老路径原样不动（`:error-code` 优先、原始 payload
+    /// 当文本、不解析 JSON 字段）。同时钉住路由优先级：`:message-type` 先判。
+    ///
+    /// FAIL 条件：新分支挪动了这条路径的取值口径（丢掉 `:error-code`、开始解析 payload
+    /// 字段）→ 断言红；帧同时带 `:event-type: throttlingError` 时若被新分支截走 → 也红。
+    #[test]
+    fn message_type_error_path_unchanged() {
+        let raw = build_frame(
+            &[
+                (":message-type", "error"),
+                (":error-code", "InternalServerException"),
+                // 同时带事件名级错误名：不得改变取值来源（`:message-type` 优先）
+                (":event-type", "throttlingError"),
+            ],
+            b"upstream exploded",
+        );
+        let (frame, _) = parse_frame(&raw).expect("parse_frame").expect("整帧");
+        match Event::from_frame(frame).expect("error 帧不该失败") {
+            Event::Error {
+                error_code,
+                error_message,
+            } => {
+                assert_eq!(
+                    error_code, "InternalServerException",
+                    ":message-type: error 路径仍以 :error-code 为准"
+                );
+                assert_eq!(
+                    error_message, "upstream exploded",
+                    "该路径的错误文本仍是原始 payload（不做 JSON 字段解析）"
+                );
+            }
+            other => panic!(":message-type: error 应产出 Event::Error，实际 {other:?}"),
+        }
     }
 
     /// 构造一个只带指定 headers 的 event-stream 帧。
