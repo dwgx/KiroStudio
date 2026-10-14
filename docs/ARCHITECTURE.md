@@ -352,7 +352,11 @@ main()
   `{id}/overage`(status/enable/disable)、`balances/cached`
 - 配置：`GET/PUT /config`、`GET/PUT /config/load-balancing`
 - 客户端接入：`client-setup/cc-switch`（cc-switch 一键导入深链接：只读探测 + 计划；
-  未就绪回 409 且不产出链接。响应含网关密钥明文，禁缓存——见 `admin/client_setup.rs` 模块头）
+  未就绪回 409 且不产出链接）
+  - ⚠️ 安全取舍：这是**全仓唯一**把下游对话密钥明文交响应之处——持 admin key 者可直取
+    该 key 并打 `/v1`（此前只能改写它、拿不到原文；改写会被审计记录且打断下游客户端）。
+    边界：只挂 authed 树 + 全部响应 `no-store` + 不落日志（链接原文不进日志）。
+    见 `admin/client_setup.rs` 模块头
 - 上号：`auth/social/{start,poll}`、`auth/idc/{start,poll}`、`auth/external-idp/{start,leg1,leg2}`
 - 用量：`usage/{overview,timeseries,by-model,by-credential,recent,rate,clients,machines,throughput}`、
   `ratelimit/insights`、`stream/live`(SSE)

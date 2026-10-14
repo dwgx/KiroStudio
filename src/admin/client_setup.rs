@@ -38,7 +38,8 @@
 //!
 //! - 端点只挂在 admin 鉴权树内（`admin_auth_middleware` 统一鉴权）；
 //! - 响应带 `Cache-Control: no-store`（同 `export_kam_credentials` 的 MINOR-4：
-//!   共享代理/浏览器不留副本）；
+//!   共享代理/浏览器不留副本；**含 400/409 早退**——缓存策略不随状态码分叉，
+//!   否则每条早退分支都要重新判断「这个体里有没有密钥」，那是会漂移的隐性契约）；
 //! - 本模块**不打印链接原文**（访问本身由 admin 审计中间件按方法/路径/IP 记录，
 //!   不需要在日志里再留一份含密钥的链接）。
 //!
@@ -320,9 +321,11 @@ fn authority_of(base_url: &str) -> &str {
 
 /// 密钥脱敏展示（前 4 + `...` + 后 4；非 ASCII 或长度 ≤16 时退化为 `***`）。
 ///
-/// 与 `kiro::token_manager::mask_api_key` 同语义：那个函数是文件私有、且本波由另一
-/// 子代理持有该文件，故在此保留一份**逐字节等价**的实现（同长度阈值、同 ASCII 判据）。
-/// 两份若漂移，面板上同一个 key 会在两处显示成不同掩码。
+/// 与 `kiro::token_manager::mask_api_key` 同语义：两份实现分属不同模块的既有 API
+/// （一份服务深链接回显、一份服务凭据列表），各自保留，不做二合一（把其中一份改成
+/// 引用另一份会牵动各自的调用面）。等价性由本文件测试
+/// `mask_key_matches_token_manager_mask_api_key` 逐项对拍钉住——两份若漂移，
+/// 面板上同一个 key 会在两处显示成不同掩码。
 pub fn mask_key(key: &str) -> String {
     if key.is_ascii() && key.len() > 16 {
         format!("{}...{}", &key[..4], &key[key.len() - 4..])
@@ -443,7 +446,7 @@ fn normalize_base_url(raw: &str) -> Result<String, String> {
 /// blockers 逐条说明差什么）。刻意用 409 而不是 200+ready:false：这是「拒绝提交」，
 /// 用成功码会让把状态码当唯一判据的调用方以为拿到了可用链接。
 ///
-/// 响应带 `Cache-Control: no-store`（体含密钥明文，见模块头）。
+/// 所有响应（含 400/409 早退）统一带 `Cache-Control: no-store`（体含密钥明文，见模块头）。
 pub async fn client_setup(
     State(state): State<AdminState>,
     Query(params): Query<HashMap<String, String>>,
@@ -476,11 +479,16 @@ pub async fn client_setup(
         Ok(v) => v,
         Err(msg) => {
             // 连对外地址都定不下来 ⇒ 一条链接也产不出来，直接 400 让调用方补参数。
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(AdminErrorResponse::invalid_request(msg)),
-            )
-                .into_response();
+            // 400 的体里没有密钥，但照样补 `no-store`：本端点的缓存策略**不随状态码
+            // 分叉**——分叉就得在每条早退分支上重新判断「这个体里有没有密钥」，
+            // 那是会漂移的隐性契约（模块头「响应带 no-store」的表述也因此改准）。
+            let mut response = Json(AdminErrorResponse::invalid_request(msg)).into_response();
+            *response.status_mut() = StatusCode::BAD_REQUEST;
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            return response;
         }
     };
 
@@ -668,6 +676,41 @@ mod tests {
         assert_eq!(mask_key("密钥密钥密钥密钥密钥密钥密钥密钥"), "***");
     }
 
+    /// 跨模块对照：`mask_key` 与 `kiro::token_manager::mask_api_key` 必须逐字节同语义。
+    ///
+    /// 两份实现服务两个展示面（深链接回显 / 凭据列表），此前全仓没有一处同时调用
+    /// 两者 ⇒ 任一份漂移都不会红。本用例把同一批输入喂给两边逐项比对：正常 key、
+    /// 非 ASCII、长度 16/17 边界、空串、混合字符。边界再钉两处绝对值——只对拍
+    /// 「两边相等」的话，两边被改成同一种错误实现仍会绿。
+    /// 回退即 FAIL：任一份的阈值（>16）、ASCII 判据或首尾切片（4/4）被改动，红。
+    #[test]
+    fn mask_key_matches_token_manager_mask_api_key() {
+        use crate::kiro::token_manager::mask_api_key;
+
+        let cases: [(&str, &str); 7] = [
+            ("正常 key", "sk-kiro-0123456789abcdef0123456789abcdef"),
+            ("长度恰 16（不掩码）", "0123456789abcdef"),
+            ("长度 17（掩码下界）", "0123456789abcdefg"),
+            ("非 ASCII（整体回退）", "密钥密钥密钥密钥密钥密钥密钥密钥"),
+            ("ASCII 混非 ASCII", "sk-密钥-0123456789abcdef"),
+            ("空串", ""),
+            ("短串", "short"),
+        ];
+        for (label, key) in cases {
+            assert_eq!(
+                mask_key(key),
+                mask_api_key(key),
+                "两份掩码实现漂移（{label}）：mask_key={:?}，mask_api_key={:?}",
+                mask_key(key),
+                mask_api_key(key)
+            );
+        }
+
+        // 边界绝对值：16 及以下不掩码；17 起前 4 + ... + 后 4。
+        assert_eq!(mask_key("0123456789abcdef"), "***");
+        assert_eq!(mask_key("0123456789abcdefg"), "0123...defg");
+    }
+
     /// 深链接的每个参数值都必须过百分号编码——用**反解**证明往返一致。
     /// 回退即 FAIL：去掉 `urlencoding::encode`（或只编码一部分），反解结果与原文不符，本用例红。
     #[test]
@@ -757,6 +800,58 @@ mod tests {
         assert!(resolve_base_url(None, Some("   "), None).is_err());
     }
 
+    /// 伪造 `Host` / `X-Forwarded-Proto` 的形态表：Host 是**有意信任**的来源
+    /// （反代/隧道场景只有请求自己知道用户从哪个地址进来），本用例不改信任模型，
+    /// 只钉住白名单行为的两条不变量：
+    /// ① 产物 scheme 只可能是 http/https（伪造 proto 为 javascript/gopher 等一律回落 http）；
+    /// ② 产物里不可能出现 `@`（userinfo）或空白——`normalize_base_url` 的字符集
+    ///    只收 ASCII 字母数字与 `. - _ : [ ]`，`@`/空白/非 ASCII 在 authority 段直接拒绝。
+    /// 回退即 FAIL：放宽 normalize 的字符集（放行 `@` 或空白）⇒ 下面 Err 断言红；
+    /// 把 scheme 回落改成直接采用 forwarded_proto 原值 ⇒ `javascript` 用例红。
+    #[test]
+    fn forged_host_and_forwarded_proto_cannot_smuggle_scheme_or_userinfo() {
+        // 可解析的伪造形态：产物必须是指向该 host 的干净 http(s) origin。
+        for (host, proto, expected) in [
+            ("evil.com", None, "http://evil.com"),
+            ("evil.com", Some("https"), "https://evil.com"),
+            ("evil.com:8080", Some("http"), "http://evil.com:8080"),
+            ("evil.com", Some("javascript"), "http://evil.com"),
+            ("evil.com", Some("http://"), "http://evil.com"),
+            ("evil.com", Some("  HTTPS  "), "https://evil.com"),
+        ] {
+            let (url, src) = resolve_base_url(None, Some(host), proto)
+                .unwrap_or_else(|e| panic!("Host={host:?} proto={proto:?} 应可解析：{e}"));
+            assert_eq!(src, "requestHost");
+            assert_eq!(url, expected, "Host={host:?} proto={proto:?}");
+            assert!(
+                url.starts_with("http://") || url.starts_with("https://"),
+                "scheme 只可能是 http(s)：{url}"
+            );
+            assert!(!url.contains('@'), "endpoint 不得含 userinfo 的 `@`：{url}");
+            assert!(
+                !url.contains(char::is_whitespace),
+                "endpoint 不得含空白：{url}"
+            );
+        }
+
+        // 必须整体拒绝的伪造形态：任何一条被「解析收下」都会让 `@`/空白/非 ASCII
+        // 进入产物（产物会写进用户客户端配置），所以这里断言的是拒绝而不是清洗。
+        for (host, proto) in [
+            ("user@evil.com", None),          // userinfo 形态（Host 头里带 @）
+            ("user:pass@evil.com", Some("https")), // 完整 userinfo
+            ("evil .com", None),              // 内部空白
+            ("evil.com\r\nX-Forwarded-Host: evil2.com", None), // CRLF 注入形态
+            ("evil.com\nevil2.com", None),    // 内部换行
+            ("例子.com", None),               // 非 ASCII
+            ("evil.com\u{200b}", None),       // 零宽空格（trim 不吞、非 ASCII 字节）
+        ] {
+            assert!(
+                resolve_base_url(None, Some(host), proto).is_err(),
+                "伪造形态必须被拒绝（host={host:?}，proto={proto:?}）"
+            );
+        }
+    }
+
     // ------------------------------------------------------------------
     // 常量与接线守卫
     // ------------------------------------------------------------------
@@ -789,14 +884,66 @@ mod tests {
         );
     }
 
-    /// 路由接线守卫：端点在 authed 树内（不是又挂出一条匿名入口）。
+    /// 路由接线守卫：端点必须挂在 authed 树内（不是又挂出一条匿名入口）。
+    ///
+    /// 只断言「源码里出现过这段接线」不够：把接线**复制**一份进 public 树、
+    /// 或整个**挪**进 public 树，`contains` 仍然绿（验证者实测）。本守卫改成三条：
+    /// ① 接线在 `let authed = Router::new()` 之后、authed 树的 `admin_auth_middleware`
+    ///    层之前（位置断言——挪进 public 树 ⇒ 越过鉴权层 ⇒ 红）；
+    /// ② 生产代码里**只允许出现一次**（复制一份进 public 树 ⇒ 计数 2 ⇒ 红）；
+    /// ③ public 树段（`let public =` 起、到下一个 `pub fn` 前）不含该路径名
+    ///    （换写法绕过 needle 比对也要命中，例如限定路径 `axum::routing::get`）。
+    ///
+    /// 锚点字符串取自 router.rs 现文（去空白比对）：接线写法变了守卫会红并提示同步。
     #[test]
     fn client_setup_route_is_wired_in_authed_tree() {
         let router = include_str!("router.rs");
-        let compact: String = router.chars().filter(|c| !c.is_whitespace()).collect();
+        // 只比生产代码：router.rs 自己的测试模块里若出现同名字面量不该算进接线计数
+        // （本仓既有教训——守卫读到的源码含测试文本会多算/假绿；router.rs 既有守卫同款裁切）。
+        let cut = router.find("#[cfg(test)]").unwrap_or(router.len());
+        let compact: String = router[..cut].chars().filter(|c| !c.is_whitespace()).collect();
+
+        let needle = "\"/client-setup/cc-switch\",get(client_setup)";
+        let needle_pos = compact.find(needle).expect(
+            "router.rs 里缺少 /client-setup/cc-switch 的接线（或写法变了，请同步本守卫）",
+        );
+
+        // ② 只允许一处接线：多出来的一份无论挂到哪都是绕过鉴权层的第二入口。
+        assert_eq!(
+            compact.matches(needle).count(),
+            1,
+            "该接线必须全文件唯一——复制一份到 public 树 / merge 之后再加 .route，都会在这里红"
+        );
+
+        // ① 位置必须落在 authed 树内：起点之后、其鉴权层之前（取起点之后第一次出现
+        // `admin_auth_middleware`，即 authed 树自己挂的那层；顶部 import 在起点之前，不计）。
+        let authed_start = compact.find("letauthed=Router::new()").expect(
+            "router.rs 的 authed 树起点（`let authed = Router::new()`）不见了，请同步本守卫",
+        );
+        let auth_layer = authed_start
+            + compact[authed_start..]
+                .find("admin_auth_middleware")
+                .expect("authed 树的 `admin_auth_middleware` 层不见了，请同步本守卫");
         assert!(
-            compact.contains("\"/client-setup/cc-switch\",get(client_setup)"),
-            "router.rs 里缺少 /client-setup/cc-switch 的接线（或写法变了，请同步本守卫）"
+            needle_pos > authed_start,
+            "接线出现在 authed 树起点之前——它不在鉴权树内"
+        );
+        assert!(
+            needle_pos < auth_layer,
+            "接线出现在 authed 树的鉴权层之后（例如被挪进 public 树）——它不在鉴权树内"
+        );
+
+        // ③ public 树段不得出现该路径（扫路径名而不是扫 needle：换写法也要命中）。
+        let public_start = compact.find("letpublic=Router::new()").expect(
+            "router.rs 的 public 树起点（`let public = Router::new()`）不见了，请同步本守卫",
+        );
+        let public_end = public_start
+            + compact[public_start..]
+                .find("pubfn")
+                .expect("public 树之后找不到函数边界（`pub fn`），请同步本守卫");
+        assert!(
+            !compact[public_start..public_end].contains("/client-setup"),
+            "public 树段里出现了 /client-setup——本端点会带密钥明文，绝不允许匿名入口"
         );
     }
 
@@ -976,5 +1123,64 @@ mod handler_tests {
         let state = state_with(vec![one_credential()], Some(KEY));
         let resp = client_setup(State(state), Query(HashMap::new()), HeaderMap::new()).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// 伪造 Host（userinfo 形态）在 HTTP 层即被拒：400、响应体不含密钥，
+    /// 且 400 早退同样带 `no-store`（缓存策略不随状态码分叉，见模块头）。
+    #[tokio::test]
+    async fn handler_rejects_forged_host_with_userinfo() {
+        let state = state_with(vec![one_credential()], Some(KEY));
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "user@evil.com".parse().expect("合法头值"));
+        let resp = client_setup(State(state), Query(HashMap::new()), headers).await;
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "userinfo 形态的 Host 必须拒绝"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "400 早退也必须 no-store（不随状态码分叉）"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("读响应体");
+        let raw = String::from_utf8_lossy(&bytes);
+        assert!(!raw.contains(KEY), "400 体里不得出现密钥：{raw}");
+        assert!(!raw.contains("ccswitch://"), "400 体里不得出现深链接：{raw}");
+    }
+
+    /// 伪造 `X-Forwarded-Proto`（非 http(s)）：scheme 只可能回落 http，
+    /// 产出的 baseUrl / endpoint 绝不含 `@` 或非 http(s) scheme。
+    #[tokio::test]
+    async fn handler_ignores_forged_forwarded_proto() {
+        let state = state_with(vec![one_credential()], Some(KEY));
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "lan.example:8990".parse().unwrap());
+        headers.insert("x-forwarded-proto", "javascript".parse().unwrap());
+        let resp = client_setup(State(state), Query(HashMap::new()), headers).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("读响应体");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("响应必须是 JSON");
+        assert_eq!(
+            body["baseUrl"],
+            serde_json::json!("http://lan.example:8990"),
+            "伪造的 proto 不得进产物（回落 http）"
+        );
+        for plan in body["plans"].as_array().expect("plans 必须是数组") {
+            let endpoint = plan["endpoint"].as_str().expect("endpoint 必须是字符串");
+            assert!(
+                endpoint.starts_with("http://") || endpoint.starts_with("https://"),
+                "endpoint scheme 只可能是 http(s)：{endpoint}"
+            );
+            assert!(!endpoint.contains('@'), "endpoint 不得含 `@`：{endpoint}");
+        }
     }
 }

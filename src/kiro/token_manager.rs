@@ -122,7 +122,12 @@ pub(crate) fn sha256_hex(input: &str) -> String {
 }
 
 /// 生成 API Key 脱敏展示(前 4 + ... + 后 4,长度不足或非 ASCII 回退 ***)
-fn mask_api_key(key: &str) -> String {
+///
+/// `pub(crate)`：`admin::client_setup::mask_key` 是同语义的另一份实现（两份分属不同
+/// 模块的既有 API，各自保留）。`admin::client_setup` 的测试
+/// `mask_key_matches_token_manager_mask_api_key` 逐项对拍两函数防止漂移——
+/// 改这里的阈值/判据/切片会让那条对照测试红。
+pub(crate) fn mask_api_key(key: &str) -> String {
     if key.is_ascii() && key.len() > 16 {
         format!("{}...{}", &key[..4], &key[key.len() - 4..])
     } else {

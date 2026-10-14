@@ -273,13 +273,24 @@ mod tests {
     }
 
     /// 覆盖优先于自检记录（含基线登记的 null）。
+    ///
+    /// 必须让覆盖 ID **在基线建立之后**才首次出现 —— 否则它只会被记成 `null`，
+    /// 此时「先查覆盖、后查自检记录」与相反顺序都会返回覆盖值，测试恒绿、钉不住顺序。
     #[test]
     fn override_takes_priority_over_recorded_baseline() {
         let t = ModelReleaseTracker::load(None);
-        t.observe_on(&ids(&["claude-opus-5.5"]), day("2026-10-13"));
+        // 先让一个非覆盖 ID 建立基线（首调 ⇒ baseline，不产生任何日期）。
+        t.observe_on(&ids(&["baseline-only"]), day("2026-10-13"));
+        // 覆盖 ID 之后才首次出现 ⇒ 自检记录会是非空的 2026-10-20，与覆盖值不同。
+        t.observe_on(&ids(&["claude-opus-5.5"]), day("2026-10-20"));
         assert_eq!(
             t.release_date("claude-opus-5.5").as_deref(),
             Some("2026-10-13")
+        );
+        assert_ne!(
+            t.release_date("claude-opus-5.5").as_deref(),
+            Some("2026-10-20"),
+            "查表顺序颠倒（先自检记录、后覆盖）会让这里返回自检日期"
         );
     }
 
