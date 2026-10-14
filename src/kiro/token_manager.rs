@@ -4045,6 +4045,63 @@ impl MultiTokenManager {
         self.model_catalog_locks.lock().remove(&id);
     }
 
+    /// 复活/启用路径必须清除的**旁挂惩罚结构**单一收口：冷却 + 限速退避 + 熔断/健康。
+    ///
+    /// 与 [`CredentialEntry::clear_transient_counters`]（entry 本地惩罚计数收口）配对：
+    /// 两者合起来才是「复活即回干净起点」的完整清单。
+    ///
+    /// # 为什么必须收口
+    ///
+    /// 复活路径有多条（`reset_and_enable` / `set_disabled(false)` / 全池自愈块 /
+    /// 跨月额度恢复），此前**各自手写清零列表**，于是反复集体漏项：
+    /// `consecutive_suspicious` 那轮是各路径漏同一个 entry 字段（已由
+    /// `clear_transient_counters` 收口），这一轮是两条**自动**路径漏了 `health`
+    /// （2026-10-14 独立验证标出）——同一种失败形态，故这次把「三层旁挂惩罚」的清除
+    /// 收口到本函数（当前调用方：`reset_and_enable` / `set_disabled(false)` 启用分支 /
+    /// 全池自愈块 / 跨月额度恢复 —— 四条复活路径**全部**走同一收口，不再有手写清零列表）。
+    ///
+    /// # 为什么 health 必须一起清（不清则「复活」是假的）
+    ///
+    /// `health` 的 `Circuit::Open` 与 cooldown / rate_limiter 是**并列的三层惩罚**：
+    /// p_avail=0 ⇒ 选号排序键第①位 `unusable` 沉底，且 `is_sticky_reuse_healthy`
+    /// 对亲和复用**硬拒**。更关键的是它的解除路径与另两层不同：`on_success` 只在
+    /// `HalfOpen` 内推进（连续成功才回 Closed），**Open 期即使成功也不解熔断**，
+    /// 只能等 `tick_circuit` 到期（退避 8s×1.6^n，最长 30min）。
+    /// 于是「已复活、甚至正在成功」的号在面板上仍是熔断 Open、最长半小时不出活
+    /// —— 与自动路径清 cooldown 的理由（「残留冷却/退避会让刚复活的号立刻又被选号硬门
+    /// 跳过，自愈等于没做」）逐字同型，只是这一层当年被漏了。
+    ///
+    /// # 为什么清它**不**削弱自动保护
+    ///
+    /// 1. **限频不靠这一层**：全池自愈的 60s→900s 退避（`last_self_heal_at` /
+    ///    `self_heal_streak`）决定「多久才允许复活一次」；本函数只决定「复活时清掉哪些
+    ///    残留」，既不提高复活频率，也不增加上游请求量（流量由客户端需求决定，本函数
+    ///    只影响「分给谁」）。故对自动路径是「复活的内容」补齐，不是「复活的门槛」放宽。
+    /// 2. **保护立刻重新武装，且更谨慎**：下一次风控/429 报告即重新跳闸 ——
+    ///    `report_family_suspicious` 无条件 `open_count += 1`（退避升级）并把
+    ///    `admit_prob_seed` 减半（半开更谨慎）；`consecutive_suspicious` 亦从 0 重新计数。
+    ///    与 `set_disabled` 启用分支自述的「自动防护会在下一次风控报告时重新武装」同一依据。
+    /// 3. **人工「启用」清三层同理**（2026-10-14 补齐：`set_disabled(false)` 此前只清 health）：
+    ///    号在长冷却期间被禁用（如 `AuthenticationFailed` 走 `long_cooldown_secs` = 86400s），
+    ///    点「启用」后 cooldown / rate_limiter 残留仍让 `is_entry_selectable_inner` 静默跳过
+    ///    它 —— 面板显示「已启用」、调度上零流量，与「启用后号被熔断硬拒」同型。清掉后若号
+    ///    真的坏，下一次失败即重新武装（与第 2 点同一依据，`report_rate_limited_with_retry_after`
+    ///    / `report_suspicious_activity` 无条件 `record_failure`）；「启用」是人工显式动作，
+    ///    语义 = 「让它回到参与调度」，与 `reset_and_enable` 同一后果面。
+    ///
+    /// # 调用约定
+    ///
+    /// 必须在 `entries` 锁**外**调用（三者各有独立锁，禁止与 entries 锁嵌套）；
+    /// `health_key` 必须用 `family_key`（`HealthTracker` 唯一合法键，与 `report_success` /
+    /// `is_sticky_reuse_healthy` / `health_snapshots` 同口径），键在 entries 锁内取好
+    /// （`CredentialEntry::family_key_cached`）：同族分身共担一条记录，清一个键即解除
+    /// 整族熔断（连坐语义的另一面）。
+    fn clear_revive_side_penalties(&self, id: u64, health_key: &str) {
+        self.cooldown.clear_cooldown(id);
+        self.rate_limiter.reset(id);
+        self.health.clear(health_key);
+    }
+
     /// 写模型目录缓存（唯一写入源：巡检成功且列表非空，设计文档 §2）。与旧目录
     /// 对比记 diff 日志（设计文档 §5）；成功即重置退避。空列表**不**走本函数。
     fn store_model_catalog(&self, id: u64, models: Vec<String>) {
@@ -5676,8 +5733,11 @@ impl MultiTokenManager {
                                 "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（连续第 {} 次，下次需退避）",
                                 streak
                             );
-                            // 被自愈复活的号 id，供放锁后清旁挂结构 + 落盘。
-                            let mut healed_ids: Vec<u64> = Vec::new();
+                            // 被自愈复活的号（id + 族键），供放锁后清旁挂结构 + 落盘。
+                            // 族键必须**在 entries 锁内**取好：`clear_revive_side_penalties`
+                            // 只能在锁外调（health 是独立锁，禁止锁嵌套），而键要与选号 /
+                            // 风控 / 健康快照同口径（family_key_cached 需 &mut，只能在锁内）。
+                            let mut healed: Vec<(u64, String)> = Vec::new();
                             for e in entries.iter_mut() {
                                 if is_self_healable_reason(e.disabled_reason) {
                                     e.disabled = false;
@@ -5687,7 +5747,7 @@ impl MultiTokenManager {
                                     // refresh_failure_count 与 consecutive_suspicious
                                     // → 复活的号一次风控/刷新失败即再次禁用。
                                     e.clear_transient_counters();
-                                    healed_ids.push(e.id);
+                                    healed.push((e.id, e.family_key_cached().to_string()));
                                 }
                             }
                             drop(entries);
@@ -5701,14 +5761,16 @@ impl MultiTokenManager {
                             {
                                 let mut revived = self.self_heal_revived.lock();
                                 revived.clear();
-                                revived.extend(healed_ids.iter().copied());
+                                revived.extend(healed.iter().map(|(id, _)| *id));
                             }
 
-                            // 清旁挂结构（各有独立锁，必须在 entries 锁外）：残留冷却/退避
-                            // 会让刚复活的号立刻又被选号硬门跳过，自愈等于没做。
-                            for id in &healed_ids {
-                                self.cooldown.clear_cooldown(*id);
-                                self.rate_limiter.reset(*id);
+                            // 清旁挂惩罚结构（各有独立锁，必须在 entries 锁外）：残留冷却/退避
+                            // 会让刚复活的号立刻又被选号硬门跳过，自愈等于没做。**熔断/健康同属
+                            // 这一层**且解除条件更苛刻（Open 期连成功都不解闸，最长 30min），
+                            // 原先只清前两层 → 复活的号仍被 p_avail=0 沉底 + 亲和硬拒。
+                            // 三层一起走单一收口，理由见其文档。
+                            for (id, key) in &healed {
+                                self.clear_revive_side_penalties(*id, key);
                             }
 
                             // 落盘：自愈此前**只改内存**，磁盘仍是 disabled=true。
@@ -7382,7 +7444,7 @@ impl MultiTokenManager {
         // 余额快照先读后放：绝不与 entries 锁嵌套。快照只读、克隆成本 = 号池大小，
         // 且本函数每请求至多跑一次（select 内 recovery_attempted 门）。
         let snaps = self.balance_snapshots.read().clone();
-        let recovered: Vec<u64> = {
+        let recovered: Vec<(u64, String)> = {
             let mut entries = self.entries.lock();
             let mut ids = Vec::new();
             for e in entries.iter_mut() {
@@ -7428,7 +7490,9 @@ impl MultiTokenManager {
                 // 走单一收口：failure_count 连同 refresh_failure_count /
                 // consecutive_suspicious 一并清零（对齐 set_disabled 启用时的清法）。
                 e.clear_transient_counters();
-                ids.push(e.id);
+                // 族键在锁内取好：`clear_revive_side_penalties` 只能在 entries 锁外调
+                // （health 是独立锁），且键必须与选号/风控/健康快照同口径。
+                ids.push((e.id, e.family_key_cached().to_string()));
             }
             ids
         };
@@ -7437,13 +7501,14 @@ impl MultiTokenManager {
             tracing::info!(
                 "额度耗尽凭据自动恢复 {} 个（上游重置时刻已到 / 已跨自然月）: {:?}",
                 recovered.len(),
-                recovered
+                recovered.iter().map(|(id, _)| *id).collect::<Vec<u64>>()
             );
-            // 清旁挂结构（各自独立锁，必须在 entries 锁外）：残留冷却/退避会让刚复活的
-            // 号立刻又被选号硬门跳过，恢复等于没做（对齐全池自愈复活路径 :4746-4749 的做法）。
-            for id in &recovered {
-                self.cooldown.clear_cooldown(*id);
-                self.rate_limiter.reset(*id);
+            // 清旁挂惩罚结构（各自独立锁，必须在 entries 锁外）：残留冷却/退避会让刚恢复的
+            // 号立刻又被选号硬门跳过，恢复等于没做；熔断/健康同属这一层，且解除条件更苛刻
+            // （Open 期连成功都不解闸，最长 30min）——三层一起走单一收口，与全池自愈复活
+            // 路径同一收口，理由见其文档。
+            for (id, key) in &recovered {
+                self.clear_revive_side_penalties(*id, key);
             }
             // 落盘：内存复活后磁盘仍是 disabled=true，重启会回死态。
             if let Err(e) = self.persist_credentials() {
@@ -7911,8 +7976,9 @@ impl MultiTokenManager {
     /// `persist_disabled_state`（= persist_credentials）同样落盘。另两处同步：
     /// load 回填（`MultiTokenManager::new`）与 persist 全量写盘。
     pub fn set_disabled(&self, id: u64, disabled: bool) -> anyhow::Result<()> {
-        // 启用分支的熔断/健康清除键（family_key）在锁内取值、锁外清（health 独立锁，
-        // 禁止与 entries 锁嵌套）；禁用分支保持 None（惩罚态留到启用那一刻再清）。
+        // 启用分支的旁挂惩罚清除键（family_key）在锁内取值、锁外清（cooldown /
+        // rate_limiter / health 各有独立锁，禁止与 entries 锁嵌套）；禁用分支保持
+        // None —— 惩罚态**刻意**留到启用那一刻再清（理由见下方禁用分支注释）。
         let health_key = {
             let mut entries = self.entries.lock();
             let entry = entries
@@ -7939,20 +8005,36 @@ impl MultiTokenManager {
         };
         // 禁用凭据时清除其会话亲和性绑定，避免后续请求重选时反复尝试已禁用凭据
         if disabled {
+            // ⚠️ 禁用分支**刻意不清任何一层惩罚**（cooldown / rate_limiter / health）——
+            // 惩罚态留到「启用」那一刻由统一收口（`clear_revive_side_penalties`）一并清。
+            // 后来者勿「顺手补齐」禁用分支的清零，那是破坏语义：
+            // ① 清零点必须唯一且绑定「恢复参与调度」这个显式动作；若禁用也清，「禁用一下
+            //    再启用」就有两个清零点，且启用分支的回归测试会全部失去「回退即 FAIL」
+            //    性质——本文件的测试正是靠「禁用保留惩罚、启用清掉」钉住启用分支
+            //    （禁用已把惩罚清掉的话，启用清不清都绿）；
+            // ② 禁用号本就不参与调度（`is_entry_selectable_inner` 第一道门），此刻清与
+            //    不清对路由零影响；保留则面板/排查还能看到「它为什么坏、还要退避多久」。
+            // 禁用只做一件事：解绑会话亲和（那不是惩罚层，是路由绑定——留着会让后续请求
+            // 重选时反复尝试一个不参与调度的号）。
             self.affinity.remove_by_credential(id);
         } else {
             // Review3 m5：重新启用后模型目录缓存里可能残留禁用前的 Confirmed
             // （TTL ≤30min 且巡检循环跳过禁用号 → 残留不会自己失效），重启用后
             // 死号仍被当「模型 Confirmed」白打一跳。启用即失效缓存，让巡检重抓。
             self.invalidate_model_catalog(id);
-            // ⭐ 启用即清熔断/健康状态（2026-10-14 对手对照发现）：与 reset_and_enable 是同一
-            // 缺陷形态——health 的 Circuit::Open 是独立一层惩罚（sticky 硬拒 + p_avail 沉底，
-            // 退避最长 30min），不清它则「启用」后号仍不出活、被误判为启用无效。键=family_key
-            // （同族共担）。本函数唯一的非 Admin 调用方是上号路径的探测窗口恢复：新号的
-            // cred:{id} 键尚无记录 ⇒ clear 为 no-op；clone:{group} 族键的清与「该号正在被
-            // 启用」语义一致，且自动防护会在下一次风控报告时重新武装。
+            // ⭐ 启用即走统一收口清**三层**旁挂惩罚（cooldown + rate_limiter + health）。
+            // 2026-10-14 补齐（同日先补 health，再补这处同形态残留）：此前只清 health，
+            // 号在长冷却期间被禁用（如 AuthenticationFailed 走 long_cooldown_secs = 86400s），
+            // 点「启用」后仍被 is_entry_selectable_inner 的 cooldown / rate_limiter 硬门
+            // **静默跳过** —— 面板显示已启用、调度上零流量，与「启用后号被熔断硬拒」同型。
+            // 清掉后若号真的坏，下一次失败会立刻重新武装冷却/退避（自纠正），不会持续误路由；
+            // 键=family_key（同族共担）。禁止再手写清零列表 —— 本仓已因此踩过两次。
+            // 本函数唯一的非 Admin 调用方是上号路径的探测窗口恢复：那是**全新 id**（单调
+            // 计数器，不复用），per-id 的 cooldown / rate_limiter / cred:{id} 键尚无记录
+            // ⇒ 这三层 clear 为 no-op；clone:{group} 族键的清与「该号正在被启用」语义
+            // 一致，且自动防护会在下一次风控报告时重新武装。
             if let Some(key) = health_key {
-                self.health.clear(&key);
+                self.clear_revive_side_penalties(id, &key);
             }
         }
         // 持久化更改
@@ -8672,17 +8754,10 @@ impl MultiTokenManager {
             // 熔断/健康键随同带出：clear 在 entries 锁外调用（见上方注释）。
             entry.credentials.family_key(id)
         };
-        // 重置并启用时一并清 per-id 冷却/退避残留,让「重置」名副其实(否则刚启用又被残留退避跳过)。
-        // 在 entries 锁外调用(rate_limiter/cooldown 各有独立锁)。
-        self.cooldown.clear_cooldown(id);
-        self.rate_limiter.reset(id);
-        // ⭐ 熔断/健康状态一并清零（2026-10-14 对手对照发现）：health 的 Circuit::Open 是与
-        // cooldown/rate_limiter **并列的一层独立惩罚**——sticky 复用被硬拒
-        // （is_sticky_reuse_healthy）+ 选号 p_avail 排序沉底，Open 退避 8s×1.6^n 最长 30min。
-        // 不清它则「重置并启用」后面板显示已启用、号却最长 30min 不出活，被误判为重置无效。
-        // 键必须用 family_key（与 report_success / is_sticky_reuse_healthy / health_snapshots
-        // 同口径）：同族分身共担该状态，清一个键即解除整族熔断（连坐语义的另一面）。
-        self.health.clear(&health_key);
+        // 重置并启用时一并清**三层**旁挂惩罚残留（冷却 / 限速退避 / 熔断健康），让「重置」
+        // 名副其实 —— 少清任一层，刚启用的号都会立刻被残留退避或熔断 Open 跳过。
+        // 单一收口，理由与调用约定见其文档；必须在 entries 锁外调用（三者各有独立锁）。
+        self.clear_revive_side_penalties(id, &health_key);
         // 模型目录缓存同款失效（对齐 set_disabled 启用分支的 Review3 m5）：禁用期残留的
         // Confirmed 不会自愈（TTL ≤30min 且巡检跳过禁用号），重启用后死号仍被当
         // 「模型 Confirmed」白打一跳。invalidate 有独立锁，故在 entries 锁外调用。
@@ -10940,6 +11015,15 @@ mod revive_clears_health_and_stale_arn_tests {
         }
     }
 
+    /// 该号此刻能否通过选号硬门（`is_entry_selectable`）——与真实选号同一判据、同一调用
+    /// 形态（entries 锁内逐条判，cooldown / rate_limiter 各自独立锁）。夹具自检与断言共用
+    /// 同一判据，避免「自检」和「断言」各写一份而漂移。
+    fn selectable(mgr: &MultiTokenManager, id: u64) -> bool {
+        let entries = mgr.entries.lock();
+        let e = entries.iter().find(|e| e.id == id).expect("号应在池中");
+        mgr.is_entry_selectable(e, false, "")
+    }
+
     /// 🔴 复活路径一：`reset_and_enable` 必须清熔断/健康（2026-10-14 对手对照发现）。
     ///
     /// **旧代码为何失败**：`reset_and_enable` 只清 cooldown + rate_limiter，
@@ -11007,6 +11091,68 @@ mod revive_clears_health_and_stale_arn_tests {
         assert!(
             mgr.health_snapshots().get(&1).is_none(),
             "回退即 FAIL：set_disabled(false) 后熔断记录仍在，号最长 30min 不出活"
+        );
+    }
+
+    /// 🔴 复活路径二（补全）：`set_disabled(false)` 的启用分支必须走**统一收口**清齐三层
+    /// （cooldown + rate_limiter + health），不能只清 health —— 2026-10-14 独立验证标出的
+    /// 同形态第二处。
+    ///
+    /// **旧代码为何失败**：号在长冷却期间被禁用（如 `AuthenticationFailed` 走
+    /// `long_cooldown_secs` = 86400s），点「启用」只清 health ⇒ 该号仍被
+    /// `is_entry_selectable_inner` 的 cooldown / rate_limiter 两道硬门**静默跳过**：
+    /// 面板显示「已启用」、调度上零流量，与今天修的「启用无效」同型。
+    /// 顺带钉住**禁用分支不得动这两层**（惩罚态留到启用那一刻才清）。
+    ///
+    /// 回退即 FAIL：把启用分支改回只清 health（不走 `clear_revive_side_penalties`）——
+    /// 冷却/退避残留 ⇒ `selectable` 仍为 false，本测试即红。
+    #[test]
+    fn set_disabled_false_clears_cooldown_and_rate_limiter_so_enabled_cred_is_selectable() {
+        let mut config = Config::default();
+        config.cooldown_enabled = true;
+        config.rate_limit_enabled = true;
+        let mut c = KiroCredentials::default();
+        c.refresh_token = Some("r-enable-cooldown".to_string());
+        let mgr = MultiTokenManager::new(config, vec![c], None, None, false).unwrap();
+
+        // 429（带 Retry-After）同时武装 cooldown 硬门与 rate_limiter 退避。
+        mgr.report_rate_limited_with_retry_after(1, Some(600));
+        assert!(
+            mgr.cooldown.check_cooldown(1).is_some(),
+            "夹具自检：冷却记录必须在"
+        );
+        assert!(
+            mgr.rate_limiter.check_rate_limit(1).is_err(),
+            "夹具自检：限速退避必须在生效"
+        );
+        assert!(
+            !selectable(&mgr, 1),
+            "夹具自检：冷却/退避生效时号必须被选号硬门跳过"
+        );
+
+        // 禁用：惩罚态**刻意**留到启用那一刻（顺带钉住禁用分支不清这两层）。
+        mgr.set_disabled(1, true).unwrap();
+        assert!(
+            mgr.cooldown.check_cooldown(1).is_some()
+                && mgr.rate_limiter.check_rate_limit(1).is_err(),
+            "禁用分支不得动 cooldown / rate_limiter（惩罚态留到启用那一刻再清）"
+        );
+
+        // 启用：三层一起走统一收口，号必须立刻可选。
+        mgr.set_disabled(1, false).unwrap();
+        assert!(
+            mgr.cooldown.check_cooldown(1).is_none(),
+            "回退即 FAIL：set_disabled(false) 后冷却残留——长冷却期的号点「启用」后仍被 \
+             cooldown 硬门静默跳过（面板已启用、调度零流量）"
+        );
+        assert!(
+            mgr.rate_limiter.check_rate_limit(1).is_ok(),
+            "回退即 FAIL：set_disabled(false) 后限速退避残留——同上，rate_limiter 硬门"
+        );
+        assert!(
+            selectable(&mgr, 1),
+            "回退即 FAIL：set_disabled(false) 后号仍不可选——「启用」在调度上无效\
+             （与「启用后号被熔断硬拒」同型）"
         );
     }
 
@@ -11112,6 +11258,114 @@ mod revive_clears_health_and_stale_arn_tests {
             entry2.profile_arn.as_deref(),
             Some("arn:aws:codewhisperer:us-west-2:333333333333:profile/FRESH"),
             "响应携带的新 arn 必须正常写回"
+        );
+    }
+
+    /// 🔴 复活路径三：**全池自愈**（自动路径）同样必须清熔断/健康（2026-10-14 独立验证标出）。
+    ///
+    /// **旧代码为何失败**：自愈块清 counters + cooldown + rate_limiter，**不清 health** ——
+    /// 而 `SuspiciousActivityAuto` 恰恰是「同一次 403 既禁用号、又把族级熔断打成 Open」
+    /// （`report_family_suspicious(fam, dur)`，`until` = 同一次冷却的硬窗）。于是自愈把号放回
+    /// 池子、还清掉了与熔断**同源同时刻**的 cooldown，却把熔断留着：p_avail=0 ⇒ 排序键第①位
+    /// `unusable` 沉底 + `is_sticky_reuse_healthy` 亲和硬拒，且 Open 期**连成功都不解闸**
+    /// （`on_success` 只在 HalfOpen 内推进），最长 30min。
+    /// 「自愈等于没做」在这里只是从硬门变成了软沉底，症状与自动路径清 cooldown 的理由同型。
+    ///
+    /// 回退即 FAIL：把自愈块改回只清 cooldown/rate_limiter（漏掉 health）。
+    #[tokio::test]
+    async fn full_pool_self_heal_clears_health_circuit_so_revived_cred_is_not_unusable() {
+        let mut config = Config::default();
+        config.cooldown_enabled = true;
+        let mut c = KiroCredentials::default();
+        // 有效 token：自愈后取上下文无需刷新（纯内存，不打上游）。
+        c.access_token = Some("tok-self-heal-health".to_string());
+        c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mgr = MultiTokenManager::new(config, vec![c], None, None, false).unwrap();
+
+        // 403 风控打满阈值：号被自动禁用（SuspiciousActivityAuto），同一次事件把族级熔断打成 Open。
+        for _ in 0..MAX_CONSECUTIVE_SUSPICIOUS_BEFORE_DISABLE {
+            mgr.report_suspicious_activity(1);
+        }
+        assert_eq!(mgr.available_count(), 0, "夹具自检：全池应已被自动禁用");
+        assert!(
+            mgr.health_snapshots()
+                .get(&1)
+                .expect("风控后应有健康记录")
+                .circuit_open,
+            "夹具自检：403 风控必须先把族级熔断打成 Open"
+        );
+
+        // 触发全池自愈（首次自愈无退避闸门）：复活 → 清三层旁挂惩罚 → 重选 → 取 token。
+        let ctx = mgr
+            .acquire_context(None, None)
+            .await
+            .expect("自愈后应能取到上下文（token 未过期，无需刷新）");
+        assert_eq!(ctx.id, 1, "自愈后应选中被复活的号");
+
+        assert!(
+            mgr.health_snapshots()
+                .get(&1)
+                .is_none_or(|s| !s.circuit_open),
+            "回退即 FAIL：全池自愈复活后熔断仍 Open —— 号被 p_avail=0 沉底（unusable）+\
+             亲和硬拒，且 Open 期连成功都不解闸（最长 30min），与「残留冷却让自愈等于没做」同型"
+        );
+    }
+
+    /// 🔴 复活路径四：**跨月额度恢复**（自动路径）同样必须清熔断/健康（2026-10-14 独立验证标出）。
+    ///
+    /// 形态：402 额度耗尽本身不碰 health，但被禁用的号可能**在禁用前**就带着族级熔断 Open
+    /// （连续 429 跳闸，或同族分身正在被限流——族键共担），恢复时刻也可能刚好落在熔断到期前
+    /// （池空触发 / 回池巡检触发）。恢复后若不清，号同样 p_avail=0 沉底 + 亲和硬拒，
+    /// 最长 30min 不出活 —— 与人工「重置并启用」是同一缺陷形态。
+    ///
+    /// 回退即 FAIL：把恢复块改回只清 cooldown/rate_limiter（漏掉 health）。
+    #[test]
+    fn quota_recovery_clears_health_circuit_so_recovered_cred_is_not_unusable() {
+        let mut config = Config::default();
+        config.cooldown_enabled = true;
+        let mut c = KiroCredentials::default();
+        c.id = Some(1);
+        c.refresh_token = Some("r-quota-revive-health".to_string());
+        let mgr = MultiTokenManager::new(config, vec![c], None, None, false).unwrap();
+
+        // 前置：连续裸 429 → 族级熔断 Open（此时号仍在池中，尚未被禁用）。
+        trip_circuit(&mgr, 1);
+        assert!(
+            mgr.health_snapshots()
+                .get(&1)
+                .expect("跳闸后应有健康记录")
+                .circuit_open,
+            "夹具自检：连续 429 必须先跳成 Circuit::Open"
+        );
+
+        // 402 额度耗尽 → 自动禁用（这条禁用路径不碰 health：熔断是禁用前的残留）。
+        mgr.report_quota_exhausted(1);
+        // 恢复判据：`quota_exhausted_at` 缺失（旧版本数据）视为可恢复；同月时间戳会拦住恢复。
+        {
+            let mut entries = mgr.entries.lock();
+            entries
+                .iter_mut()
+                .find(|e| e.id == 1)
+                .expect("号应仍在池中")
+                .quota_exhausted_at = None;
+        }
+
+        // 固定参考时刻（2026-08-15，距当月 1 日 ≥ 12h，避开月初缓冲窗口）。
+        let now = DateTime::parse_from_rfc3339("2026-08-15T12:00:00Z")
+            .expect("固定测试时刻恒合法")
+            .with_timezone(&Utc);
+        assert_eq!(
+            mgr.recover_expired_quota_disables(Some(now)),
+            1,
+            "夹具自检：额度禁用号应被恢复"
+        );
+
+        assert!(
+            mgr.health_snapshots()
+                .get(&1)
+                .is_none_or(|s| !s.circuit_open),
+            "回退即 FAIL：额度恢复后熔断仍 Open —— 恢复的号被 p_avail=0 沉底（unusable）+\
+             亲和硬拒，最长 30min 不出活（与人工「重置并启用」同一缺陷形态）"
         );
     }
 }
