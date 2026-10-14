@@ -15,6 +15,11 @@ use super::{schema_description_max_chars, truncate_chars};
 /// 约束（属性用 `$ref` 指向 `$defs`）静默退化为无约束空对象，模型看不到真实参数
 /// 结构。展开后再逐层规范化 type/properties/required/items/additionalProperties，
 /// 丢弃 Kiro 兼容性差的 anyOf/oneOf/allOf，只保留白名单字段。
+///
+/// **根级 union 是剥除的例外**（2026-10-14）：Kiro 顶层直接拒绝 union
+/// （"does not support oneOf, allOf, or anyOf at the top level"），而整体剥掉会把分支里的
+/// `properties` 一起丢、工具退化成**零参工具**。所以根级 `oneOf`/`anyOf`/`allOf` 先由
+/// `flatten_root_union` 扁平化合并进根对象；非根层维持原有剥除（Kiro 只拒顶层）。
 pub(crate) fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     normalize_json_schema_with_node_budget(schema, MAX_SCHEMA_NODES)
 }
@@ -208,6 +213,141 @@ pub(super) fn resolve_schema_refs(
     }
 }
 
+/// 根级 union（`oneOf`/`anyOf`/`allOf`）扁平化合并成一个 object schema。
+///
+/// 为什么必须合并（2026-10-14，独立扫描 + 代码核对）：Kiro 上游**顶层**直接拒绝 union。
+/// 此前的处置是逐层 `obj.remove(...)` 整体剥掉，但根级 union 的 `properties` 全在分支里
+/// —— 剥掉后根 schema 只剩强制补出的 `properties: {}` / `required: []`，工具退化成
+/// **零参工具**：模型完全不知道有哪些参数可传（比"约束变宽松"严重得多，参数直接消失）。
+/// 参考实现（diegosouzapw/OmniRoute）的做法是把根级 union **扁平化合并**进根对象，本函数
+/// 对齐该做法。非根层维持原有剥除（Kiro 只拒顶层，子层剥除是既有策略，不在本次范围）。
+///
+/// 合并语义（每一条都取保守方向：宁可约束偏松，不误杀合法调用、不产非法 schema）：
+/// - `properties`：根自身 → oneOf/anyOf 分支 → allOf 分支依次取并集，属性**名字不丢**；
+///   同名冲突保留**先出现**的定义并记 debug —— 分支间对同名属性的定义可能互斥
+///   （string vs number），合并子 schema 需要再引一层 union，而那正是 Kiro 顶层拒绝的
+///   东西；保留第一个是可预测、可解释的取舍。
+/// - `required`：oneOf/anyOf 取各分支**交集**（不强制"只有部分分支才需要"的字段，否则
+///   模型可能因无从填写的必填项而编造/放弃参数）；allOf 取**并集**（所有分支同时成立，
+///   任一分支要求的字段对整体就是必填，取交集会漏掉真正的必填项）。根自身已有的
+///   required 无条件保留（根层约束恒成立）。
+/// - `additionalProperties`：仅当**所有**分支都显式 `false` 时才收紧为 `false`。理由：
+///   合并后的 properties 是各分支属性的并集，只要有一个分支没声明 false，实例就可能
+///   合法携带合并集之外的属性，此时设 false 会误杀合法输入；全 false 时收紧是安全的
+///   （每个分支允许的属性都在合并集内，实例无论走哪个分支都满足合并 schema）。根自身
+///   声明过则一律以根为准（不覆盖）。
+/// - `type`：不动 —— 根 schema 随后会被强制成 object（既有行为）。
+///
+/// 只合并**一层**：分支自身再嵌套的 union 按非根层既有行为剥除（与改动前一致）。
+fn flatten_root_union(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    // 摘除并收集分支。remove 无条件执行：值不是数组（畸形 schema）时也要把键摘掉 ——
+    // 顶层残留 union 键会被 Kiro 拒绝。
+    let mut one_of_any_of_branches: Vec<serde_json::Value> = Vec::new();
+    let mut all_of_branches: Vec<serde_json::Value> = Vec::new();
+    for key in ["oneOf", "anyOf", "allOf"] {
+        let Some(serde_json::Value::Array(arr)) = obj.remove(key) else {
+            continue;
+        };
+        if key == "allOf" {
+            all_of_branches = arr;
+        } else {
+            one_of_any_of_branches.extend(arr);
+        }
+    }
+    if one_of_any_of_branches.is_empty() && all_of_branches.is_empty() {
+        // 无根级 union：什么都不动（无 union 的 schema 逐字节不变）。
+        return;
+    }
+
+    // properties：并集，同名保留第一个（根自身 > oneOf/anyOf 分支 > allOf 分支）。
+    let mut merged_properties = match obj.remove("properties") {
+        Some(serde_json::Value::Object(props)) => props,
+        _ => serde_json::Map::new(),
+    };
+    for branch in one_of_any_of_branches.iter().chain(all_of_branches.iter()) {
+        let Some(serde_json::Value::Object(props)) = branch.get("properties") else {
+            continue;
+        };
+        for (name, prop_schema) in props {
+            if merged_properties.contains_key(name) {
+                tracing::debug!(
+                    property = %name,
+                    "根级 union 扁平化：属性在多个分支重复声明，保留先出现的定义（丢弃后出现的）"
+                );
+                continue;
+            }
+            merged_properties.insert(name.clone(), prop_schema.clone());
+        }
+    }
+    obj.insert(
+        "properties".to_string(),
+        serde_json::Value::Object(merged_properties),
+    );
+
+    // required：根自身先入；oneOf/anyOf 取交集、allOf 取并集（理由见函数文档）。
+    let mut required = required_field_names(obj.get("required"));
+    let mut common: Option<Vec<String>> = None;
+    for branch in &one_of_any_of_branches {
+        let names = required_field_names(branch.get("required"));
+        common = Some(match common {
+            None => names,
+            Some(prev) => prev.into_iter().filter(|n| names.contains(n)).collect(),
+        });
+    }
+    if let Some(common) = common {
+        for name in common {
+            if !required.contains(&name) {
+                required.push(name);
+            }
+        }
+    }
+    for branch in &all_of_branches {
+        for name in required_field_names(branch.get("required")) {
+            if !required.contains(&name) {
+                required.push(name);
+            }
+        }
+    }
+    obj.insert(
+        "required".to_string(),
+        serde_json::Value::Array(
+            required
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    );
+
+    // additionalProperties：所有分支都显式 false 才收紧；根自身声明过则以根为准。
+    if !obj.contains_key("additionalProperties")
+        && one_of_any_of_branches
+            .iter()
+            .chain(all_of_branches.iter())
+            .all(|branch| {
+                branch.get("additionalProperties") == Some(&serde_json::Value::Bool(false))
+            })
+    {
+        obj.insert(
+            "additionalProperties".to_string(),
+            serde_json::Value::Bool(false),
+        );
+    }
+}
+
+/// 从 schema 的 `required` 读字段名列表：只取数组里的字符串项，缺失/非数组 → 空。
+/// 供 `flatten_root_union` 做交集/并集 —— 那里的输入都是**未归一化**的分支 schema，
+/// 不能假设形状规范（非字符串项、非数组值都要能吞掉）。
+fn required_field_names(value: Option<&serde_json::Value>) -> Vec<String> {
+    value
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// 递归规范化（`$ref` 已展开后调用）。`root=true` 时强制视为 object schema。
 fn normalize_json_schema_inner(schema: serde_json::Value, root: bool) -> serde_json::Value {
     let serde_json::Value::Object(mut obj) = schema else {
@@ -221,6 +361,12 @@ fn normalize_json_schema_inner(schema: serde_json::Value, root: bool) -> serde_j
 
     // 去掉 null 字段；Kiro 侧对 null 容忍度很低。
     obj.retain(|_, v| !v.is_null());
+
+    // 根级 union 先扁平化合并（Kiro 顶层拒绝 union；整体剥掉会让工具退化成零参工具，
+    // 见 flatten_root_union 的注释）。非根层维持原有剥除行为，不动。
+    if root {
+        flatten_root_union(&mut obj);
+    }
 
     // type（字符串；数组类型如 ["string","null"] 取第一个基础类型）
     let normalized_type = match obj.remove("type") {
@@ -253,32 +399,34 @@ fn normalize_json_schema_inner(schema: serde_json::Value, root: bool) -> serde_j
     }
 
     if is_object_schema {
-        match obj.remove("properties") {
-            Some(serde_json::Value::Object(props)) => {
-                let mut normalized = serde_json::Map::new();
-                for (name, prop_schema) in props {
-                    normalized.insert(name, normalize_json_schema_inner(prop_schema, false));
-                }
-                obj.insert(
-                    "properties".to_string(),
-                    serde_json::Value::Object(normalized),
-                );
-            }
-            _ => {
-                obj.insert(
-                    "properties".to_string(),
-                    serde_json::Value::Object(serde_json::Map::new()),
-                );
+        // 先把归一化后的 properties 算出来（下面的 required 过滤要用它当判据）。
+        let mut declared_properties = serde_json::Map::new();
+        if let Some(serde_json::Value::Object(props)) = obj.remove("properties") {
+            for (name, prop_schema) in props {
+                declared_properties.insert(name, normalize_json_schema_inner(prop_schema, false));
             }
         }
+        // required：只保留字符串、且**确实声明在 properties 里**的名字。
+        //
+        // 为什么过滤（对齐参考实现 diegosouzapw/OmniRoute）：悬空 required（指向不存在的
+        // 属性）在本管线里只可能是加工残留（union 剥除后分支独有的字段、$ref 降级子树等），
+        // 代价却不对称 —— 上游侧按 degraded_object_schema 注释的说法直接 400（整个工具
+        // 列表连坐失效），本仓 Bug C 又会把「模型永远看不到的字段」判成缺参、整轮
+        // INVALID_TOOL_INPUT；反过来，丢掉悬空名字只让 schema 变宽松，不会误杀合法调用。
         let required = match obj.remove("required") {
             Some(serde_json::Value::Array(arr)) => serde_json::Value::Array(
                 arr.into_iter()
-                    .filter_map(|v| v.as_str().map(|s| serde_json::Value::String(s.to_string())))
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .filter(|name| declared_properties.contains_key(name))
+                    .map(serde_json::Value::String)
                     .collect(),
             ),
             _ => serde_json::Value::Array(Vec::new()),
         };
+        obj.insert(
+            "properties".to_string(),
+            serde_json::Value::Object(declared_properties),
+        );
         obj.insert("required".to_string(), required);
     } else {
         obj.remove("properties");
@@ -306,6 +454,9 @@ fn normalize_json_schema_inner(schema: serde_json::Value, root: bool) -> serde_j
     }
 
     // Kiro 对组合 schema 兼容差：anyOf/oneOf/allOf 直接丢弃，避免整个工具列表被判 malformed。
+    // ⚠️ 能走到这里的 union 只剩**非根层**与畸形值：根级 union 在函数入口已被
+    // `flatten_root_union` 合并（顶层直接剥掉会把分支里的 properties 一起丢、工具退化成
+    // 零参工具）；这里的 remove 兼作兜底，不得删。
     obj.remove("anyOf");
     obj.remove("oneOf");
     obj.remove("allOf");
@@ -433,6 +584,254 @@ mod tests {
         assert_eq!(
             out["items"]["type"], "string",
             "items 不得因根 schema 被强制 object 而丢掉"
+        );
+    }
+
+    /// 🔴 根级 `oneOf` 的工具 schema 曾被整体剥成**零参工具**（`properties: {}`）：
+    /// Kiro 顶层拒绝 union，而旧处置是逐层 `obj.remove("oneOf")` ⇒ 分支里的 properties
+    /// 一起丢、根上只剩强制补出的空 properties/required。本测试锁定扁平化后的合并语义：
+    /// 属性逐字段保留、union 键消失、required 取交集。
+    ///
+    /// 回退即 FAILED：删掉 `flatten_root_union` 的调用（或改回只 remove 不合并），
+    /// path/text/old_text 三个断言全部拿到 Null（改动前实际输出：
+    /// `{"type":"object","properties":{},"required":[]}`）。
+    #[test]
+    fn test_root_oneof_flattens_to_merged_object_not_zero_param() {
+        let out = normalize_json_schema(serde_json::json!({
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "text": { "type": "string" }
+                    },
+                    "required": ["path", "text"]
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "old_text": { "type": "string" }
+                    },
+                    "required": ["path", "old_text"]
+                }
+            ]
+        }));
+        assert!(
+            out.get("oneOf").is_none(),
+            "根级 oneOf 必须消失（Kiro 顶层拒绝）: {out}"
+        );
+        assert_eq!(out["type"], "object");
+        // 逐字段断言：两个分支的属性都要在（修复前这里全是 Null —— 零参工具）。
+        assert_eq!(out["properties"]["path"]["type"], "string");
+        assert_eq!(out["properties"]["text"]["type"], "string");
+        assert_eq!(out["properties"]["old_text"]["type"], "string");
+        // required 取交集：path 两分支都要；text/old_text 各只属一个分支，不得强制。
+        assert_eq!(
+            out["required"],
+            serde_json::json!(["path"]),
+            "required 必须是交集（并集会把分支独有字段强加给所有调用）"
+        );
+    }
+
+    /// 根级 `anyOf`：同样扁平化；只要有一个分支没声明 `required`，交集就是空 ——
+    /// 不得把"部分分支才需要"的字段当必填（那是并集语义）。
+    #[test]
+    fn test_root_anyof_flattens_with_required_intersection() {
+        let out = normalize_json_schema(serde_json::json!({
+            "anyOf": [
+                {
+                    "type": "object",
+                    "properties": { "a": { "type": "string" } },
+                    "required": ["a"]
+                },
+                { "type": "object", "properties": { "b": { "type": "integer" } } }
+            ]
+        }));
+        assert!(out.get("anyOf").is_none(), "根级 anyOf 必须消失: {out}");
+        assert_eq!(out["properties"]["a"]["type"], "string");
+        assert_eq!(out["properties"]["b"]["type"], "integer");
+        assert_eq!(
+            out["required"],
+            serde_json::json!([]),
+            "一个分支没声明 required ⇒ 交集为空，不得把 a 当必填"
+        );
+    }
+
+    /// 根级 `allOf`：属性取并集；required 取**并集**（所有分支同时成立，任一分支要求的
+    /// 字段对整体都是必填）—— 刻意与 oneOf/anyOf 的交集语义相反，锁住两者的差异。
+    #[test]
+    fn test_root_allof_flattens_with_required_union() {
+        let out = normalize_json_schema(serde_json::json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "properties": { "name": { "type": "string" } },
+                    "required": ["name"]
+                },
+                {
+                    "type": "object",
+                    "properties": { "count": { "type": "integer" } },
+                    "required": ["count"]
+                }
+            ]
+        }));
+        assert!(out.get("allOf").is_none(), "根级 allOf 必须消失: {out}");
+        assert_eq!(out["properties"]["name"]["type"], "string");
+        assert_eq!(out["properties"]["count"]["type"], "integer");
+        assert_eq!(
+            out["required"],
+            serde_json::json!(["name", "count"]),
+            "allOf 各分支同时成立 ⇒ required 是并集；取交集会漏掉真正的必填项"
+        );
+    }
+
+    /// 合并进来的分支属性仍要过常规递归归一化：子层 union 按非根行为剥除、子层 required
+    /// 过滤照常 —— 不得把分支 schema 原样塞进去。
+    #[test]
+    fn test_root_union_merged_branch_properties_still_normalized() {
+        let out = normalize_json_schema(serde_json::json!({
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "filter": {
+                            "type": "object",
+                            "properties": {
+                                "field": { "type": "string" },
+                                "opts": { "anyOf": [{ "type": "object" }, { "type": "null" }] }
+                            },
+                            "required": ["field"]
+                        }
+                    }
+                },
+                { "type": "object", "properties": { "limit": { "type": "integer" } } }
+            ]
+        }));
+        let filter = &out["properties"]["filter"];
+        assert_eq!(filter["type"], "object", "分支里的子 object 必须保留");
+        assert_eq!(
+            filter["properties"]["field"]["type"], "string",
+            "子层类型归一化照常"
+        );
+        assert_eq!(
+            filter["properties"]["opts"],
+            serde_json::json!({}),
+            "子层 union 按非根行为剥除（剥完只剩空壳；Kiro 只拒顶层）: {filter}"
+        );
+        assert_eq!(
+            filter["required"],
+            serde_json::json!(["field"]),
+            "子层 required 过滤（field 已声明）照常"
+        );
+        assert_eq!(out["properties"]["limit"]["type"], "integer");
+    }
+
+    /// 负例：本来就没有 union 的工具 schema 必须**逐字节不变**（防止扁平化误伤正常路径）。
+    /// 期望值按改动前的既有行为逐字段手写；改动若在无 union 时多插/少插任何一个键，
+    /// 整值相等断言即红。
+    #[test]
+    fn test_schema_without_root_union_is_unchanged() {
+        let out = normalize_json_schema(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "目标路径" },
+                "nested": {
+                    "type": "object",
+                    "properties": { "flag": { "type": "boolean" } },
+                    "required": ["flag"],
+                    "additionalProperties": false
+                }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }));
+        assert_eq!(
+            out,
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "目标路径" },
+                    "nested": {
+                        "type": "object",
+                        "properties": { "flag": { "type": "boolean" } },
+                        "required": ["flag"],
+                        "additionalProperties": false
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            })
+        );
+    }
+
+    /// 合并后 `additionalProperties` 的收紧判据：**所有**分支都显式 false 才收紧；
+    /// 只要有一个分支没声明 false 就保持开放（不写该键）—— 否则会误杀"在宽松分支下
+    /// 合法、但带合并集之外属性"的调用。
+    #[test]
+    fn test_root_union_additional_properties_tightens_only_when_all_branches_false() {
+        let all_false = normalize_json_schema(serde_json::json!({
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": { "a": { "type": "string" } },
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": { "b": { "type": "string" } },
+                    "additionalProperties": false
+                }
+            ]
+        }));
+        assert_eq!(
+            all_false["additionalProperties"],
+            serde_json::json!(false),
+            "所有分支都 false ⇒ 收紧是安全的（属性都在合并集内）"
+        );
+
+        let mixed = normalize_json_schema(serde_json::json!({
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": { "a": { "type": "string" } },
+                    "additionalProperties": false
+                },
+                { "type": "object", "properties": { "b": { "type": "string" } } }
+            ]
+        }));
+        assert!(
+            mixed.get("additionalProperties").is_none(),
+            "有分支未声明 false ⇒ 必须保持开放，不得收紧: {mixed}"
+        );
+    }
+
+    /// `required` 过滤为「已声明属性」：悬空名字（union 剥除/降级残留）必须去掉。
+    /// 上游对悬空 required 直接 400（见 degraded_object_schema 注释），本仓 Bug C 又会把
+    /// "模型永远看不到的字段"判成缺参；丢掉悬空名字只让 schema 变宽松。嵌套层同判据。
+    #[test]
+    fn test_required_filtered_to_declared_properties() {
+        let out = normalize_json_schema(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "a": { "type": "string" },
+                "inner": {
+                    "type": "object",
+                    "properties": { "x": { "type": "string" } },
+                    "required": ["x", "ghost"]
+                }
+            },
+            "required": ["a", "ghost_root"]
+        }));
+        assert_eq!(
+            out["required"],
+            serde_json::json!(["a"]),
+            "根层悬空 required 必须过滤"
+        );
+        assert_eq!(
+            out["properties"]["inner"]["required"],
+            serde_json::json!(["x"]),
+            "嵌套层同判据"
         );
     }
 }
