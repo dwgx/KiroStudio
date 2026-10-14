@@ -728,10 +728,14 @@ impl SseFilterState {
 ///
 /// **`input_tokens` 保持上游原值，不同步减成 billed**（测试有断言钉死）。理由：
 /// ① 上游报的 input_tokens 不在 mock 改写范围——mock 只接管 cache 展示字段（与
-/// creation 仅覆盖已存在键同源的保守策略）；② 下游若按 `input − read − creation`
-/// 再算 billed，保留原值恒非负；若注入时顺手 `input −= read`，下游再减一次会**双扣**
-/// （本仓三处 billed 计算都带 `saturating_sub`/`max(0)`，可观测形态是**被钳成 0**；对不设钳的
-/// 外部下游才会出现负值）；③ 本仓 record/统计口径把 cache_read 定义为 input_tokens
+/// creation 仅覆盖已存在键同源的保守策略）；② 本仓对外下发的是 **billed** 口径
+/// （`input − read − creation`，见 `stream::billed_input_tokens`），故若注入时顺手
+/// `input -= read`，本仓自己的 billed 计算会**双扣**（三处实现都带 `saturating_sub`/`max(0)`，
+/// 可观测形态是**被钳成 0**；对不设钳的外部下游才会出现负值）。⚠️ 注意「下游再减一次」这条
+/// 只对 **OpenAI 语义**的消费方成立（如 sub2api 的 OpenAI 路径）；**Anthropic 语义**的消费方
+/// （sub2api/newapi 的 Anthropic 路径）**不求和也不扣减**，而是按 input×全价 + read×0.1× +
+/// creation×1.25×/2× 分别计价（2026-10-15 审计核对）；③ 本仓 record/统计口径把 cache_read
+/// 定义为 input_tokens
 /// 的**子集**（gross 已包含它，不是额外增量，见 usage/record.rs、usage_stats.rs）。
 ///
 /// **幂等**：insert 覆盖语义——同一 usage 连续注入两次结果不变；mock 开启时
