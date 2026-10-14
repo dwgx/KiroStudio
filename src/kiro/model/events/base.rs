@@ -283,7 +283,8 @@ impl Event {
                 // Smithy 客户端里有 `MetadataEvent.tokenUsage`，含
                 // uncachedInputTokens / cacheReadInputTokens / cacheWriteInputTokens。
                 // metadata 帧已单独分类（payload 只有 stopReason，见 metadata.rs /
-                // docs/CACHE-EXP0-RESULT.md）。本分支只剩真正未识别的类型。
+                // docs/CACHE-EXP0-RESULT.md，已删；全文可用 git show f6aaf88^ 取回；结论现由
+                // cache_truth.rs 的 C-2 观测面持续背书）。本分支只剩真正未识别的类型。
                 //
                 // ⚠️ **每种类型只 warn 一次**（进程内按类型去重）。
                 // 原实现对**每一帧**都 warn，而 `reasoningContentEvent` 是上游的结构化
@@ -753,65 +754,96 @@ mod tests {
     /// FAIL 条件：任何一条被「宽松」识别成 Metadata / 错误路径（例如改成前缀匹配、
     /// 大小写不敏感、或把 Unknown 兜底改成 error），对应断言立刻红。走错方向比漏认更贵：
     /// 把正常帧当错误会把一次 200 变成 502/429。
+    ///
+    /// 15 条**全部**走 `build_frame` → `Event::from_frame` 整链路（此前只有 2 条走，
+    /// 其余 13 条只钉分类函数）：`from_str` 不是唯一入口 —— `Event::from_frame` 先按
+    /// `:message-type` 分流、再过 `is_event_name_error` 名单，只钉 `from_str` 的话
+    /// 「在 from_frame 里另加宽松分支」这类改动不会被发现。载荷按「若名字被宽松接受、
+    /// 会走哪条错路」选：metadata 系假名带 `stopReason`（被当 metadata 就会真解析出
+    /// stop_reason），错误系假名带 `message`（被当事件名级错误就会产出 Event::Error）。
     #[test]
     fn near_miss_event_names_still_fall_to_unknown() {
-        for name in [
-            "metadataEvents",        // 复数
-            "messageMetadata",       // 缺 Event 后缀
-            "messageMetadataEvents", // 复数
-            "MetadataEvent",         // 大小写不同
-            "metadataevent",
-            "throttlingErrors", // 复数
-            "ThrottlingError",  // 大小写不同
-            "throttling",       // 前缀
-            "validationErrors",
-            "ValidationError",
-            "serviceUnavailableException", // 换了后缀的近似名
-            "serviceUnavailableErrors",
-            "internalServerExceptions",
-            "InternalServerException",
-            "internal_server_exception",
-        ] {
+        // (假名字, 载荷, 近似方向)
+        let cases: [(&str, &str, &str); 15] = [
+            ("metadataEvents", r#"{"stopReason":"max_tokens"}"#, "复数"),
+            (
+                "messageMetadata",
+                r#"{"stopReason":"max_tokens"}"#,
+                "缺 Event 后缀",
+            ),
+            (
+                "messageMetadataEvents",
+                r#"{"stopReason":"max_tokens"}"#,
+                "复数",
+            ),
+            (
+                "MetadataEvent",
+                r#"{"stopReason":"max_tokens"}"#,
+                "大小写不同",
+            ),
+            ("metadataevent", r#"{"stopReason":"max_tokens"}"#, "全小写"),
+            ("throttlingErrors", r#"{"message":"not an error"}"#, "复数"),
+            (
+                "ThrottlingError",
+                r#"{"message":"not an error"}"#,
+                "大小写不同",
+            ),
+            ("throttling", r#"{"message":"not an error"}"#, "前缀"),
+            ("validationErrors", r#"{"message":"not an error"}"#, "复数"),
+            (
+                "ValidationError",
+                r#"{"message":"not an error"}"#,
+                "大小写不同",
+            ),
+            (
+                "serviceUnavailableException",
+                r#"{"message":"not an error"}"#,
+                "换了后缀的近似名",
+            ),
+            (
+                "serviceUnavailableErrors",
+                r#"{"message":"not an error"}"#,
+                "复数+后缀",
+            ),
+            (
+                "internalServerExceptions",
+                r#"{"message":"not an error"}"#,
+                "复数",
+            ),
+            (
+                "InternalServerException",
+                r#"{"message":"not an error"}"#,
+                "大小写不同",
+            ),
+            (
+                "internal_server_exception",
+                r#"{"message":"not an error"}"#,
+                "下划线分隔",
+            ),
+        ];
+
+        for (name, payload, direction) in cases {
+            // ① 分类函数：假名字必须落 Unknown（容忍不得变成模糊匹配）。
             assert_eq!(
                 EventType::from_str(name),
                 EventType::Unknown,
-                "{name} 是拼写相近的假名字，必须仍落 Unknown（容忍不得变成模糊匹配）"
+                "{name}（{direction}）是拼写相近的假名字，必须仍落 Unknown"
+            );
+
+            // ② 整链路：build_frame → Event::from_frame 同样必须落 Unknown。
+            let raw = build_frame(
+                &[(":message-type", "event"), (":event-type", name)],
+                payload.as_bytes(),
+            );
+            let (frame, _) = parse_frame(&raw).expect("parse_frame").expect("整帧");
+            assert!(
+                matches!(
+                    Event::from_frame(frame).expect("未知事件名必须按 Unknown 返回，而不是 Err"),
+                    Event::Unknown {}
+                ),
+                "{name}（{direction}）不得被整链路识别成 Metadata/错误路径（走错方向比漏认更贵）"
             );
         }
-
-        // 整链路断言：假错误名不得进入错误路径
-        let raw = build_frame(
-            &[
-                (":message-type", "event"),
-                (":event-type", "throttlingErrors"),
-            ],
-            br#"{"message":"not an error"}"#,
-        );
-        let (frame, _) = parse_frame(&raw).expect("parse_frame").expect("整帧");
-        assert!(
-            matches!(
-                Event::from_frame(frame).expect("未知事件仍按 Unknown 返回"),
-                Event::Unknown {}
-            ),
-            "假名字 throttlingErrors 不得进入错误路径"
-        );
-
-        // 假别名同样不得被当成 metadata（stopReason 会被静默丢）
-        let raw = build_frame(
-            &[
-                (":message-type", "event"),
-                (":event-type", "metadataEvents"),
-            ],
-            br#"{"stopReason":"max_tokens"}"#,
-        );
-        let (frame, _) = parse_frame(&raw).expect("parse_frame").expect("整帧");
-        assert!(
-            matches!(
-                Event::from_frame(frame).expect("未知事件仍按 Unknown 返回"),
-                Event::Unknown {}
-            ),
-            "假名字 metadataEvents 不得被当成 metadata"
-        );
     }
 
     /// 回归守卫：`message-type: error` 老路径原样不动（`:error-code` 优先、原始 payload

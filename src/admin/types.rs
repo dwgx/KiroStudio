@@ -85,6 +85,14 @@ pub struct CredentialStatusItem {
     pub proxy_url: Option<String>,
     /// Token 刷新连续失败次数
     pub refresh_failure_count: u32,
+    /// 账户级风控（403 `TEMPORARILY_SUSPENDED` 等）**连续无成功**次数（族级：同 `clone_group`
+    /// 的分身共享一个上游账号，故共享该计数；任意一次成功即归零）。
+    ///
+    /// 为什么必须有出口：账号被选中但被**上游拒绝**（风控）时，`request_count`/`success_count`/
+    /// `failure_count` 按各自既定口径**都不动**（见 `token_manager::report_suspicious_activity`
+    /// 的逐类口径表），本字段是该路径唯一的可见出口（也是 `SuspiciousActivityAuto` 自动禁用的判据）。
+    /// 进程内计数、不持久化（重启归零属已知取舍）。
+    pub consecutive_suspicious: u32,
     /// 禁用原因
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,

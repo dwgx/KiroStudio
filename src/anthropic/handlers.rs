@@ -4145,7 +4145,7 @@ fn mark_invalid_tool_input(
 /// 而非上游真值的响应头。
 ///
 /// 为什么需要：EXP-0 已实测确证上游 `metadataEvent` 只有 `stopReason`，从不回传
-/// `tokenUsage` / `cacheReadInputTokens`（见 `docs/CACHE-EXP0-RESULT.md`）。因此我们下发的
+/// `tokenUsage` / `cacheReadInputTokens`（见 `docs/CACHE-EXP0-RESULT.md`（已删；全文可用 git show f6aaf88^ 取回；结论现由 cache_truth.rs 的 C-2 观测面持续背书））。因此我们下发的
 /// 数字来自 `token::count_prefix_tokens` 的本地前缀估算 —— Claude Code 显示的
 /// 「缓存命中 N tokens」是我们算的，不是上游说的。
 ///
@@ -4189,7 +4189,7 @@ fn sse_event_stream_builder() -> axum::http::response::Builder {
 
 /// 估算本次请求的 prompt cache 记账（供下发给客户端的 usage 字段）。
 ///
-/// **这是本地估算，不是上游真值**：`docs/CACHE-EXP0-RESULT.md` 的 EXP-0 已实测确证上游
+/// **这是本地估算，不是上游真值**：`docs/CACHE-EXP0-RESULT.md`（已删；全文可用 git show f6aaf88^ 取回；结论现由 cache_truth.rs 的 C-2 观测面持续背书） 的 EXP-0 已实测确证上游
 /// `metadataEvent` 只有 `stopReason`，从不回传 `tokenUsage` / `cacheReadInputTokens`。
 /// 这里的 `cache_read_input_tokens` 就是 `count_prefix_tokens` 的前缀 token 估算值。
 ///

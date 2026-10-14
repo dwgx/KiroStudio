@@ -1,7 +1,7 @@
 //! 账号级前缀指纹缓存计量（cache 链 Layer 3，2026-08-11 移植）。
 //!
 //! 移植自 GreyGunG/Kiro-RS-Tool 的 `cache_metering.rs`（@795b9ca），适配本仓结构。
-//! 上游 Kiro 不下发 cache_read/cache_creation 真值（`docs/CACHE-EXP0-RESULT.md` 已确证），
+//! 上游 Kiro 不下发 cache_read/cache_creation 真值（`docs/CACHE-EXP0-RESULT.md`（已删；全文可用 git show f6aaf88^ 取回；结论现由 cache_truth.rs 的 C-2 观测面持续背书） 已确证），
 //! 故在中转层模拟 Anthropic 滑动窗口缓存的「最长公共前缀命中」语义，给 cache 链
 //! 的 Layer 3 提供比 Layer 2（只估 read、creation=0）更完整的估算：
 //!

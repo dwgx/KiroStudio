@@ -1,13 +1,26 @@
 //! 上游 `metadataEvent`
 //!
-//! EXP-0 实测：本链路 payload **只有** `stopReason`，从不带 `tokenUsage` /
-//! cache 真值（见 `docs/CACHE-EXP0-RESULT.md`）。此前落 Unknown，终止信号被丢掉，
-//! 干净 EOF 只能靠本地推断出 `end_turn`。
+//! EXP-0 实测结论：本链路 payload **只有** `stopReason`，从不带 `tokenUsage` /
+//! cache 真值。原证据文档 `docs/CACHE-EXP0-RESULT.md` 已于 f6aaf88 删除（需要全文可
+//! 从删除提交的父提交取回：`git show f6aaf88^:docs/CACHE-EXP0-RESULT.md`）；结论不再
+//! 依赖那份快照，改由**线上可复现的观测面**持续背书（`cache_truth.rs`，本模块的
+//! `from_frame` 是其埋点之一）：
+//!
+//! - 逐事件（debug 级，默认不落盘）：payload 真带 `uncached` / `cacheRead` /
+//!   `cacheWrite` 任一字段时打一条 debug（字段值 + 来源事件名）；开
+//!   `RUST_LOG=info,kirostudio::kiro::model::events=debug` 即可逐帧复验「线上是否下发」。
+//! - 周期汇总（info 级，默认可见）：每 `CACHE_TRUTH_SUMMARY_INTERVAL_SECS`（当前 30
+//!   分钟）一条「近 N 秒 X 个 metadata 事件 / Y 个 metering 事件，其中带 cache 真值
+//!   M 个」。M 长期为 0 ⇒ EXP-0 结论成立；某天 M > 0 ⇒ 上游开始下发，届时才谈得上
+//!   消费口径（C-2）。
+//!
+//! 此前该事件落 Unknown，终止信号被丢掉，干净 EOF 只能靠本地推断出 `end_turn`。
 //!
 //! 2026-10-13：`tokenUsage` 改为**防御性解析**（解而不消费）——官方客户端 wire 常量
 //! 确有此字段（`cacheReadInputTokens` / `cacheWriteInputTokens` / `uncachedInputTokens`，
-//! 见 re-kirodesktop 报告），zyphr 也按真值优先解析。若上游某路径真的下发，我们
-//! 至少先看得见（出现即 `tracing::info!`，供抓包统计非空率），消费口径待 C-2 定案。
+//! 见 re-kirodesktop 逆向报告，本仓无副本），zyphr 也按真值优先解析；对手实现
+//! wnddd839/kiro.cache 独立实测同结论（「上游目前不报」，第三家旁证）。若上游某路径
+//! 真的下发，观测面会先看得见（`cache_truth.rs` 的 debug 日志 + 周期汇总），消费口径待 C-2 定案。
 
 use serde::{Deserialize, Serialize};
 
@@ -57,7 +70,16 @@ impl EventPayload for MetadataEvent {
             return Ok(Self::default());
         }
         match frame.payload_as_json() {
-            Ok(event) => Ok(event),
+            Ok(event) => {
+                // C-2 观测（解析层唯一埋点，见 cache_truth.rs）：解析成功即计数，
+                // 带 cache 相关字段时另打 debug。上面两个早退分支（空白/坏 payload）
+                // 结构上不可能携带 tokenUsage，不观测 —— 分母口径 = 解析成功的帧。
+                super::cache_truth::observe_metadata(
+                    frame.event_type().unwrap_or("metadataEvent"),
+                    &event,
+                );
+                Ok(event)
+            }
             Err(err) => {
                 // 坏 payload（字面 `null` / 类型不符 / 截断）**不得让整条流失败**：
                 // 本事件只是可选的终止信号，而 `Event::parse_event` 用 `?` 传播 —— 解析失败
@@ -253,5 +275,64 @@ mod tests {
         let m = MetadataEvent::from_frame(&frame).expect("坏 payload 不应 Err");
         assert!(m.stop_reason.is_none());
         assert!(m.token_usage.is_none());
+    }
+
+    /// `tokenUsage` 的 snake_case 别名（历史/中间层可能改写下划线形态）必须与
+    /// camelCase 等价解析 —— 别名漏掉任一字段，该字段在观测里就静默变 None
+    /// （「带真值」判定为假，C-2 信号丢失且无任何报错）。
+    ///
+    /// 回退即 FAIL：删掉任一 `alias = "..."` 后，对应断言从 `Some(n)` 变 `None`。
+    #[test]
+    fn parses_token_usage_snake_case_aliases() {
+        let e: MetadataEvent = serde_json::from_str(
+            r#"{"token_usage":{"uncached_input_tokens":11,"cache_read_input_tokens":22,"cache_write_input_tokens":33,"output_tokens":44}}"#,
+        )
+        .expect("snake_case 别名应可解析");
+        let u = e.token_usage.expect("应有 token_usage（snake_case 键名）");
+        assert_eq!(u.uncached_input_tokens, Some(11));
+        assert_eq!(u.cache_read_input_tokens, Some(22));
+        assert_eq!(u.cache_write_input_tokens, Some(33));
+        assert_eq!(u.output_tokens, Some(44));
+    }
+
+    /// 负例（解析层）：tokenUsage 为 `null` / 空对象 / 字段全为 `null` 时，
+    /// 都不得产出任何「带真值」的字段值 —— 上层判据（cache_truth.rs）据此不计数。
+    ///
+    /// 回退即 FAIL：把字段类型从 `Option<i64>` 改成 `i64` + `#[serde(default)]` 后，
+    /// null/空对象会解成 `0`（「上游明确说 0」与「没给」被混淆），`is_none()` 断言红。
+    #[test]
+    fn token_usage_null_or_empty_never_yields_truth_values() {
+        // tokenUsage: null → 整个字段为 None（视同没给）。
+        let e: MetadataEvent =
+            serde_json::from_str(r#"{"tokenUsage":null}"#).expect("null 应可解析");
+        assert!(e.token_usage.is_none(), "null 必须等价于「没给」");
+
+        // tokenUsage: {} → 结构存在但全字段 None（不得是 0）。
+        let e: MetadataEvent =
+            serde_json::from_str(r#"{"tokenUsage":{}}"#).expect("空对象应可解析");
+        let u = e.token_usage.expect("空对象应解析成全 None 的结构");
+        assert_eq!(u.uncached_input_tokens, None);
+        assert_eq!(u.cache_read_input_tokens, None);
+        assert_eq!(u.cache_write_input_tokens, None);
+        assert_eq!(u.output_tokens, None);
+
+        // 字段显式为 null → 等价于缺失（None），不得变成 0 或别的默认值。
+        let e: MetadataEvent = serde_json::from_str(
+            r#"{"tokenUsage":{"cacheReadInputTokens":null,"uncachedInputTokens":null}}"#,
+        )
+        .expect("null 字段应可解析");
+        let u = e.token_usage.expect("应有 tokenUsage");
+        assert_eq!(u.cache_read_input_tokens, None);
+        assert_eq!(u.uncached_input_tokens, None);
+
+        // 部分字段给值：其余保持 None（不得被填成 0）。
+        let e: MetadataEvent =
+            serde_json::from_str(r#"{"tokenUsage":{"cacheReadInputTokens":900}}"#)
+                .expect("部分字段应可解析");
+        let u = e.token_usage.expect("应有 tokenUsage");
+        assert_eq!(u.cache_read_input_tokens, Some(900));
+        assert_eq!(u.uncached_input_tokens, None);
+        assert_eq!(u.cache_write_input_tokens, None);
+        assert_eq!(u.output_tokens, None);
     }
 }

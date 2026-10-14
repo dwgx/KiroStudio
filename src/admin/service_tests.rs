@@ -6721,3 +6721,33 @@ mod batch_op_tests {
         assert!(clear.allowed_models.is_none());
     }
 }
+
+#[cfg(test)]
+mod cache_truth_task_tests {
+    //! cache 真值（C-2）观测汇总任务的受管槽接线。
+    use super::super::*;
+
+    /// 启动入口：`respawn_balance_task` 必须顺带拉起 cache 真值汇总任务
+    /// （main.rs 只调 respawn_balance_task，没有第二个启动现场）。
+    ///
+    /// 回退即 FAIL：删掉 `respawn_balance_task` 里的 `respawn_cache_truth_summary_task()`
+    /// 调用后，槽保持 None —— 线上汇总任务永不启动，C-2 长期监控静默失效。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn respawn_balance_task_starts_cache_truth_summary() {
+        let svc = std::sync::Arc::new(super::balance_cache_tests::mk_service_with_one_credential());
+        assert!(
+            svc.cache_truth_summary_task.lock().is_none(),
+            "前置：构造后槽必须为空（None = 尚未启动）"
+        );
+
+        svc.respawn_balance_task();
+        assert!(
+            svc.cache_truth_summary_task.lock().is_some(),
+            "余额任务重挂必须顺带启动 cache 真值汇总（唯一启动入口）"
+        );
+
+        // 幂等：重复重挂不 panic，槽内仍恰有一个句柄（旧句柄先 abort 再替换）。
+        svc.respawn_balance_task();
+        assert!(svc.cache_truth_summary_task.lock().is_some());
+    }
+}

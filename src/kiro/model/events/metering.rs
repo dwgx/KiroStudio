@@ -92,7 +92,12 @@ where
 
 impl EventPayload for MeteringEvent {
     fn from_frame(frame: &Frame) -> ParseResult<Self> {
-        frame.payload_as_json()
+        let event: Self = frame.payload_as_json()?;
+        // C-2 观测（解析层唯一埋点，见 cache_truth.rs）：本事件的 cache 字段是四层
+        // 降级链的 Layer 1 真值来源，带字段时打 debug + 计数。解析失败（Err）时整帧
+        // 被跳过，不观测 —— 分母口径 = 解析成功的帧。
+        super::cache_truth::observe_metering(frame.event_type().unwrap_or("meteringEvent"), &event);
+        Ok(event)
     }
 }
 

@@ -8706,6 +8706,101 @@
         );
     }
 
+    /// 观测盲区回归（2026-10-14）：账号被选中但被**上游拒绝**（账户级风控 403）时，
+    /// 三个既有计数按各自口径**都不该动**（见 `report_suspicious_activity` 与
+    /// `CredentialEntrySnapshot` 各字段文档），但「这个号一直被拒」必须可见。出口有两个：
+    ///   1. `last_used_at` 更新 —— 被拒绝是一次**真实的 API 调用**。此前本路径不落时间戳，
+    ///      面板把「反复被选中并 403 的号」显示成「从未使用」（实测号 4/5/9 恒
+    ///      `请求=0 成功=0 失败=0 最近=None`，与服务端日志直接矛盾）；
+    ///   2. `consecutive_suspicious` 可从 `ManagerSnapshot` 读出（它是 Admin API 的唯一
+    ///      数据源，见 `CredentialEntrySnapshot` 字段文档）——它也是 `SuspiciousActivityAuto`
+    ///      自动禁用的判据，运维靠它看到号在走向禁用。
+    ///      ⚠️ admin 响应层（`CredentialStatusItem`）的接线当前 deferred：需要
+    ///      `admin/types.rs` 加字段 + `admin/service.rs` 加映射两行（成对，缺一不编译），
+    ///      该两文件在本工单范围外。
+    ///
+    /// 夹具自检：先断言初始态（时间戳 None、三计数 0、风控计数 0）。不先钉住初始态，
+    /// 后面「变了 / 没变」的断言在夹具被改坏时可能假绿。
+    ///
+    /// 可证伪性（把被守卫的事实改坏，本测试必须红）：
+    /// - 删掉 `report_suspicious_activity` 里的 `last_used_at` 更新 → 「最近」断言红；
+    /// - 把 `consecutive_suspicious` 从 `snapshot()` 摘掉 → 编译红（字段不存在）；
+    /// - 反过来，若有人给本路径加 `failure_count += 1`（3 次即 `TooManyFailures` 永久禁用，
+    ///   正是历史事故 12h 88 次误禁的形态）→ failure_count 断言红。
+    #[test]
+    fn test_suspicious_activity_makes_upstream_rejection_observable() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // ── 夹具自检：初始态必须全零/全空
+        {
+            let snap = manager.snapshot();
+            let e1 = snap
+                .entries
+                .iter()
+                .find(|e| e.id == 1)
+                .expect("夹具自检：号 1 应在池中");
+            assert_eq!(e1.last_used_at, None, "夹具自检：初始不应有调用时间");
+            assert_eq!(e1.success_count, 0, "夹具自检");
+            assert_eq!(e1.failure_count, 0, "夹具自检");
+            assert_eq!(e1.request_count, 0, "夹具自检");
+            assert_eq!(e1.consecutive_suspicious, 0, "夹具自检：初始风控计数应为 0");
+        }
+
+        // 模拟真实链路：号 1 被选中 → 上游返回账户级风控 403 → provider 调本入口。
+        manager.report_suspicious_activity(1);
+
+        let snap = manager.snapshot();
+        let e1 = snap.entries.iter().find(|e| e.id == 1).unwrap();
+        // ① 可见性之一：时间戳更新（旧代码恒 None，面板显示「从未使用」）
+        assert!(
+            e1.last_used_at.is_some(),
+            "被上游拒绝也是一次真实调用，「最近」必须更新，否则面板把被拒号显示成从未使用"
+        );
+        // ② 可见性之二：风控计数 +1 且可从快照读出（旧代码该字段根本不在快照里）
+        assert_eq!(
+            e1.consecutive_suspicious, 1,
+            "选中后被上游风控拒绝必须在该计数上体现（面板观测盲区修复的核心断言）"
+        );
+        // ③ 既有语义不动：三计数按各自口径都保持 0
+        assert_eq!(
+            e1.failure_count, 0,
+            "临时风控绝不能计 failure_count：3 次即 TooManyFailures 永久禁用（历史事故形态）"
+        );
+        assert_eq!(e1.success_count, 0, "success_count 只记成功，不得因失败而变");
+        assert_eq!(
+            e1.request_count, 0,
+            "request_count 是 custom_api 代挂的既定口径，不得被 Kiro 风控路径污染"
+        );
+        // ④ 只盖命中号：族内其它号没被调用过，不许伪造「最近用过」
+        let e2 = snap.entries.iter().find(|e| e.id == 2).unwrap();
+        assert_eq!(e2.last_used_at, None, "未被调用的号不得被盖时间戳");
+        assert_eq!(
+            e2.consecutive_suspicious, 0,
+            "默认号各自成族，计数不得跨号共享（收族仅限同 clone_group，见族键测试）"
+        );
+
+        // 连续第二次风控 → 计数累加：这才是「一直在被拒」的可见信号
+        manager.report_suspicious_activity(1);
+        let snap = manager.snapshot();
+        assert_eq!(
+            snap.entries
+                .iter()
+                .find(|e| e.id == 1)
+                .unwrap()
+                .consecutive_suspicious,
+            2,
+            "连续风控必须累加（运维靠它看到号在走向自动禁用阈值）"
+        );
+    }
+
     /// 多开分身的族键必须是同一个 `clone:{group}`，而不是各自的 `cred:{id}`。
     ///
     /// 上游按账号记账（403 body 的 User ID 与 cred id 实测 N:1），多开只是把同一份

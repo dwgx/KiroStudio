@@ -855,7 +855,7 @@ pub struct Config {
     ///
     /// 是否把**估算的** cache_read / cache_creation 记账字段下发给下游客户端。
     ///
-    /// Kiro 上游不回传这两个字段——`docs/CACHE-EXP0-RESULT.md` 的 EXP-0 已实测确证：
+    /// Kiro 上游不回传这两个字段——`docs/CACHE-EXP0-RESULT.md`（已删；全文可用 git show f6aaf88^ 取回；结论现由 cache_truth.rs 的 C-2 观测面持续背书） 的 EXP-0 已实测确证：
     /// `metadataEvent` 的 payload 只有 `{"stopReason":...}`，全窗口 grep
     /// `tokenUsage|cacheReadInputTokens|cacheWriteInputTokens` 零命中。
     /// 所以网关下发的 `cache_read_input_tokens` 是**本地前缀 token 估算**

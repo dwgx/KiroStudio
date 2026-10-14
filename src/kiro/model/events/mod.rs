@@ -4,6 +4,7 @@
 
 mod assistant;
 mod base;
+mod cache_truth;
 mod context_usage;
 mod metadata;
 mod metering;
@@ -19,6 +20,10 @@ pub(crate) use assistant::{
     strip_tool_use_xml_leaks, TOOL_USE_XML_CLOSE, TOOL_USE_XML_PREFIX,
 };
 pub use base::Event;
+// C-2 上游 cache 真值观测面（详见 cache_truth.rs）：逐事件埋点由 metadata/metering
+// 的 from_frame 调用（模块内直取 `cache_truth::observe_*`，不经这里）；周期汇总任务的
+// 启动入口由 admin 服务槽（`respawn_cache_truth_summary_task`）消费，故只导出这两个。
+pub(crate) use cache_truth::{CACHE_TRUTH_SUMMARY_INTERVAL_SECS, spawn_cache_truth_summary_task};
 pub use context_usage::ContextUsageEvent;
 pub use metadata::MetadataEvent;
 pub(crate) use metadata::map_metadata_stop_reason;

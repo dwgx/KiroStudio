@@ -2150,6 +2150,37 @@ mod tests {
         assert_eq!(v2["usage"]["input_tokens"], 1000, "input_tokens 不动");
     }
 
+    /// 非流式：input_tokens=0 的边界 —— mock 开启且 input_tokens **在场**（值 0）时仍注入，
+    /// 字段形态 = 存在且为 0（不是缺失）。
+    ///
+    /// 为什么单列这条：既有夹具只覆盖 ratio=0/1e-9 + input=1000（乘积归 0），没覆盖
+    /// **输入侧**为 0。若实现把注入条件改成 `input_tokens > 0`（或 `read > 0` 才插入），
+    /// 本用例红 —— 语义上「mock 开启 + input 在场」就该由本函数全权接管 cache 字段
+    /// （字段缺失 = 本网关不做该记账，=0 = 确实没命中，两者语义不同，见 config.rs 同款
+    /// 注释与 ratio=0 用例）；且与 ratio=0 的既有断言保持同一字段形态。
+    #[test]
+    fn test_mock_cache_json_zero_input_tokens_keeps_zero_fields() {
+        let out =
+            filter_json_bytes_with(mock_json(0, "").as_bytes(), true, true, Some((true, 0.7)));
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            v["usage"]
+                .get("cache_read_input_tokens")
+                .and_then(|x| x.as_u64()),
+            Some(0),
+            "input=0 时 read 字段必须存在且为 u64 0（实现跳过 input==0 或 read==0 不插入即红）"
+        );
+        assert_eq!(
+            v["usage"]
+                .get("cache_creation_input_tokens")
+                .and_then(|x| x.as_u64()),
+            Some(0),
+            "creation 同样存在且为 0"
+        );
+        assert_eq!(v["usage"]["input_tokens"], 0, "input_tokens 保持上游原值 0");
+        assert_eq!(v["usage"]["output_tokens"], 9, "其余 usage 字段不得被误改");
+    }
+
     /// 注入幂等：同一 usage 连续注入两次结果不变（insert 覆盖语义，非累加）。
     /// 链路级（对已注入输出重复过滤）同样收敛，且重新注入按新 ratio **接管**旧值。
     #[test]

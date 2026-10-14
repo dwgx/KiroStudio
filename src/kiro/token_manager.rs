@@ -2030,6 +2030,22 @@ pub struct CredentialEntrySnapshot {
     pub proxy_url: Option<String>,
     /// Token 刷新连续失败次数
     pub refresh_failure_count: u32,
+    /// 账户级风控（403 `TEMPORARILY_SUSPENDED` 等）**连续无成功**次数（族级：同
+    /// `clone_group` 的分身共享一个上游账号，故共享该计数；任意一次成功即归零）。
+    ///
+    /// # 为什么必须下发（2026-10-14 观测盲区修复）
+    ///
+    /// 账号被**选中但被上游拒绝**（账户级风控）时，`request_count` / `success_count` /
+    /// `failure_count` 按各自既定口径**都不该动**（成功数只记成功；失败数是"连续硬失败"，
+    /// 3 次即 `TooManyFailures` 永久禁用，而风控是临时态绝不能计入——历史事故形态；
+    /// 请求数是 custom_api 代挂专用）。于是此前「这个号一直被风控拒绝」与「从未被使用」
+    /// 在面板上完全同形：实测号 4/5/9 被反复选中并 403，`请求=0 成功=0 失败=0 最近=None`。
+    /// 本字段是该路径上**唯一**的计数事实源（也是自动禁用 `SuspiciousActivityAuto` 的
+    /// 判据：达 [`MAX_CONSECUTIVE_SUSPICIOUS_BEFORE_DISABLE`] 即整族退出调度），
+    /// 运维靠它看到号在走向禁用。
+    ///
+    /// ⚠️ 进程内计数、不随 stats 持久化：重启归零重新累计（禁用状态本身是持久化的）。
+    pub consecutive_suspicious: u32,
     /// 禁用原因
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
@@ -7220,6 +7236,21 @@ impl MultiTokenManager {
     /// 90~100%）也会偶发命中 403，只有真死号才**连续**命中且期间零成功。
     /// 任意一次成功即清零 → 健康号永不误禁。
     ///
+    /// ## 上游拒绝的逐类计数口径（2026-10-14 观测审计：为什么只有本类要补出口）
+    ///
+    /// | 拒绝类 | 处置入口 | 计数口径（判据） | 面板可见性 |
+    /// |---|---|---|---|
+    /// | 429 限流（含端点桶封禁） | [`Self::report_rate_limited_with_retry_after`] | **不计**三计数：瞬态，计入 `failure_count` 会 3 次禁健康号；信号走 health 族级 429 | 冷却码 + insight 连续 429 |
+    /// | 5xx | [`Self::report_server_error`] | **不计**：上游整体故障，非该号问题 | 冷却码（`cooldown_enabled` 时） |
+    /// | 401/403 认证失败（永久向/瞬态） | [`Self::report_auth_cooldown`] / [`Self::report_auth_transient_cooldown`] | **不计**：同上，误计即误禁 | 冷却码（永久向 86400s 僵尸号） |
+    /// | **账户级风控 403（本类）** | **本函数** | `consecutive_suspicious`（族级、连续无成功、一次成功归零） | **此前零出口**（唯一痕迹是日志）→ 本工单补：快照/Admin API 下发 + 命中号 `last_used_at` 更新 |
+    /// | 其它硬失败 | [`Self::report_failure`] | `failure_count`（3 次 → `TooManyFailures` 禁用） | 面板「失败次数」 |
+    /// | 402 配额耗尽 / 账户封禁 | [`Self::report_quota_exhausted`] / [`Self::report_account_suspended`] | `failure_count` 拉到阈值（禁用） | 面板「失败次数」+ 禁用原因 |
+    ///
+    /// 结论：前三类都有冷却/health 出口（且**不能**改计三计数——那是既有口径，改了就误禁），
+    /// 只有本类在 `cooldown_enabled=false` 时**完全没有出口**，这正是实测「号 4/5/9 被反复
+    /// 选中并 403 而面板恒 0」的成因。
+    ///
     /// ## 为什么计数单位是「族」而不是「号」（2026-08-07 线上实测）
     ///
     /// 上游 403 的 body 自带账户标识：
@@ -7249,8 +7280,26 @@ impl MultiTokenManager {
         let mut hit_count = 0u32;
         let mut disabled_ids: Vec<u64> = Vec::new();
         let mut family_size = 0usize;
+        // 本次是否真的更新了命中号的 `last_used_at` → 决定末尾要不要触发统计落盘（见第 4 节）。
+        let mut touched_last_used = false;
         {
             let mut entries = self.entries.lock();
+            // ⭐「被上游拒绝」也是一次真实的 API 调用：更新命中号的「最后一次调用时间」。
+            //
+            // 为什么必须在这里落（2026-10-14 观测盲区修复）：本路径此前只动
+            // `consecutive_suspicious`（进程内计数、此前不下发），三计数与时间戳全不碰 ⇒
+            // 面板把「被反复选中并 403 的号」显示成「从未使用」。实测号 4/5/9 恒
+            // `请求=0 成功=0 失败=0 最近=None`，与服务端日志「触发账户级可疑活动风控」
+            // 直接矛盾。口径与 `record_passthrough_result`（三态都更新时间戳，让状态条
+            // 反映真实活跃）及 `report_failure` / `report_quota_exhausted` /
+            // `report_account_suspended` 完全一致 —— 本路径此前是唯一的例外。
+            //
+            // 只盖**命中号**（id）：被拒绝的是它；同族分身只是共享计数（连坐），
+            // 并没有真的被调用过，替它们盖时间戳等于伪造「这号最近用过」。
+            if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
+                e.last_used_at = Some(Utc::now().to_rfc3339());
+                touched_last_used = true;
+            }
             // 目标号的族键。号已被删除 / 已禁用时不计数（与旧行为一致：只跳过本节，
             // 后面两节照常执行）。family_key 在锁内就地算，避免 family_key_of 二次取锁。
             let fam = entries
@@ -7345,6 +7394,15 @@ impl MultiTokenManager {
             // 可疑活动风控是瞬态（账户级软风控，会自愈）：限速器只需秒级退避即可，
             // 真正的分钟级退避由上面的 cooldown（SuspiciousActivity）承担；这里绝不长冻。
             self.rate_limiter.record_failure(id, FailureKind::Transient);
+        }
+
+        // ── 4. 时间戳落盘（防抖口径同 report_failure：`save_stats_debounced` 自带宽窗）
+        //
+        // 为什么必须落：`last_used_at` 的读取方（面板「最近」）在重启后走 `load_stats`
+        // 从 kiro_stats.json 恢复；只改内存不落盘 ⇒ 一次重启就把「这个号刚被上游拒绝过」
+        // 抹回 None/旧值，观测盲区部分复发。
+        if touched_last_used {
+            self.save_stats_debounced();
         }
     }
 
@@ -8083,6 +8141,8 @@ impl MultiTokenManager {
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
                     refresh_failure_count: e.refresh_failure_count,
+                    // 账户级风控连续无成功计数（风控路径唯一的可见出口，见字段文档）。
+                    consecutive_suspicious: e.consecutive_suspicious,
                     // 走单一收口 DisabledReason::as_str（回收站展示也用它，避免两份 match 漂移）。
                     disabled_reason: e.disabled_reason.map(|r| r.as_str().to_string()),
                     // 与 disabled_reason 成对下发（此前整条链都没接，面板恒 null）。

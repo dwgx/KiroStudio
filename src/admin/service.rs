@@ -417,6 +417,12 @@ pub struct AdminService {
     /// 健康探测轮次的 round-robin 起点轮转（每轮 +1，取模落到池内启用节点上，
     /// 避免每轮都从第一个节点开始——长时间运行后首个节点永远先被探测）。
     socks_health_round: std::sync::atomic::AtomicU64,
+    /// 上游 cache 真值（C-2）周期汇总任务句柄（独立受管任务槽，对齐 `socks_health_task` 模式）。
+    /// 后台每 `CACHE_TRUTH_SUMMARY_INTERVAL_SECS` 秒打一条「近 N 秒 X 个 metadata 事件 /
+    /// Y 个 metering 事件，其中带 cache 真值 M 个」的 info 汇总（窗口内零事件不打）。
+    /// 观测面实现与判据见 `kiro::model::events::cache_truth`。无配置项（观测面，间隔固定）。
+    /// None = 尚未启动。
+    cache_truth_summary_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 /// 写盘前把当前 config.json 轮换为备份（保留 3 份：`config.json.bak`、
@@ -784,6 +790,7 @@ impl AdminService {
             socks_auto_health: std::sync::atomic::AtomicBool::new(true),
             socks_fail_counts: Mutex::new(HashMap::new()),
             socks_health_round: std::sync::atomic::AtomicU64::new(0),
+            cache_truth_summary_task: Mutex::new(None),
         }
     }
 
@@ -1059,6 +1066,7 @@ impl AdminService {
                     has_proxy: entry.has_proxy,
                     proxy_url: entry.proxy_url,
                     refresh_failure_count: entry.refresh_failure_count,
+                    consecutive_suspicious: entry.consecutive_suspicious,
                     disabled_reason: entry.disabled_reason,
                     // ⭐ 此前**漏映射**：`CredentialResponse` 与 `CredentialEntrySnapshot` 两侧都有
                     // `disabled_at` 字段，但这里没接上 → 面板拿到的恒为 null，
@@ -1910,9 +1918,10 @@ impl AdminService {
     pub fn respawn_balance_task(self: &Arc<Self>) {
         // 代理池自动健康调度搭车本函数作为**启动/热重挂入口**：main.rs 只调
         // `respawn_balance_task`（main.rs 不在改动范围），而本服务没有别的
-        // `&Arc<Self>` 启动现场——故在这里顺带重挂 socks 健康任务。
-        // 两个任务各自独立：自己的字段/循环/开关，此处只是共用调用时机。
+        // `&Arc<Self>` 启动现场——故在这里顺带重挂 socks 健康任务与 cache 真值观测汇总。
+        // 各任务相互独立：自己的字段/循环/开关，此处只是共用调用时机。
         self.respawn_socks_health_task();
+        self.respawn_cache_truth_summary_task();
         let interval = self.token_manager.config().balance_refresh_interval_secs;
         let mut slot = self.balance_task.lock();
         // 先杀旧任务（若有），无论间隔如何都先停，避免旧间隔残留
@@ -1945,6 +1954,26 @@ impl AdminService {
         tracing::info!(
             "后台温和余额刷新已启用：间隔 {} 秒（逐个刷新，每个间隔 4 秒，不做主动禁用）",
             interval
+        );
+    }
+
+    /// 重挂上游 cache 真值（C-2）周期汇总任务（受管任务槽，对齐 [`Self::respawn_socks_health_task`]）。
+    ///
+    /// - 启动入口：由 `respawn_balance_task` 顺带调用（见其开头注释）；
+    /// - 无开关/无配置项（观测面，间隔固定 `CACHE_TRUTH_SUMMARY_INTERVAL_SECS`，
+    ///   理由见该常量注释）：常驻运行；respawn 只为幂等 —— 重复调用先 abort 旧句柄
+    ///   再重建，不会累积多个循环；
+    /// - 任务体在 `kiro::model::events::cache_truth` 内（读进程级全局计数器），
+    ///   不持 `Weak<Self>`：不需要服务实例，生命周期由本槽的句柄控制。
+    pub fn respawn_cache_truth_summary_task(&self) {
+        let mut slot = self.cache_truth_summary_task.lock();
+        if let Some(old) = slot.take() {
+            old.abort();
+        }
+        *slot = Some(crate::kiro::model::events::spawn_cache_truth_summary_task());
+        tracing::info!(
+            "cache 真值观测汇总已启用：每 {} 秒一条 info（窗口内零事件时不打）",
+            crate::kiro::model::events::CACHE_TRUTH_SUMMARY_INTERVAL_SECS
         );
     }
 
