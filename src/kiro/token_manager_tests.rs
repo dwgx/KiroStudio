@@ -5540,6 +5540,258 @@
         assert_ne!(ctx.id, bound, "绑定号饱和时应溢出到空闲号,不再死粘");
     }
 
+    // ==================== P2-6 sticky 晚解绑（连续 429≥3 才解绑 + 成功清零） ====================
+    //
+    // 判据/状态位置/清零时机见 `affinity.rs` 的模块文档；此处钉四条**可证伪**的行为：
+    // ① 连续 2 次 429 仍复用原号，第 3 次解绑；
+    // ② 避让路径（本请求排除绑定号）不改写绑定；成功清零后同一路径恢复改绑（零回归）；
+    // ③ 非 429 的凭据级惩罚（5xx）立刻清掉保持期 —— 且 cooldownEnabled=false 下同样生效；
+    // ④ 绑定号熔断 Open 时保持期被否决（立刻解绑，不得被 3-429 粘性钉住）。
+    //
+    // 全部用 `report_rate_limited_with_retry_after_for_session`（provider 主路径 429 的
+    // 唯一入口）注入 429，不直接摆内部计数（内部计数不可观测即不可证伪）。
+
+    /// 造「两个可用号 + balanced + 亲和开 + cooldown 关」的池（线上实际配置组合）。
+    ///
+    /// `cooldownEnabled=false` 是刻意的：429 不设冷却 ⇒ 绑定号**仍可选**，
+    /// 「仍复用原号 / 避让换人」这两类断言才测得到粘性本身（冷却开时会被冷却硬门
+    /// 抢先挡掉，测试变成在测冷却而不是测亲和）。
+    fn mk_two_cred_pool_affinity_on() -> MultiTokenManager {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.affinity_enabled = true;
+        config.cooldown_enabled = false;
+
+        let mut c1 = KiroCredentials::default();
+        c1.access_token = Some("tok1".to_string());
+        c1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut c2 = KiroCredentials::default();
+        c2.access_token = Some("tok2".to_string());
+        c2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        MultiTokenManager::new(config, vec![c1, c2], None, None, false).unwrap()
+    }
+
+    /// 建立绑定并返回 (绑定号, 另一个号)。夹具自检在调用点断言。
+    async fn bind_session(mgr: &MultiTokenManager, session: &str) -> (u64, u64) {
+        let first = mgr.acquire_context(None, Some(session)).await.unwrap();
+        let bound = first.id;
+        drop(first);
+        let other = mgr
+            .snapshot()
+            .entries
+            .iter()
+            .find(|e| e.id != bound)
+            .expect("两号池必有另一个号")
+            .id;
+        (bound, other)
+    }
+
+    /// ① 连续 2 次 429 仍复用原号，第 3 次解绑（backlog P2-6 的验收原文）。
+    ///
+    /// 回退即 FAIL：把 `STICKY_429_UNBIND_THRESHOLD` 从 3 改成 4（或删掉
+    /// `note_rate_limited` 达阈值时的 `map.remove`）→ 第 3 次 429 后
+    /// `affinity.get(session)` 仍是 `Some(bound)`，红；把 `_for_session` 里的
+    /// `note_rate_limited` 调用删掉 → 第 3 次后条目仍在，红。
+    #[tokio::test]
+    async fn sticky_late_unbind_reuses_bound_credential_until_third_429() {
+        let manager = mk_two_cred_pool_affinity_on();
+        let session = "session-late-unbind";
+        let (bound, other) = bind_session(&manager, session).await;
+        assert_eq!(
+            manager.affinity.get(session),
+            Some(bound),
+            "夹具自检：首次选号必须已建立绑定"
+        );
+
+        // 第 1、2 次 429：仍复用原号
+        for round in 1..=2 {
+            manager.report_rate_limited_with_retry_after_for_session(bound, None, Some(session));
+            let ctx = manager
+                .acquire_context(None, Some(session))
+                .await
+                .unwrap();
+            assert_eq!(
+                ctx.id, bound,
+                "第 {round} 次连续 429 后仍应复用原号（阈值=3，晚解绑）"
+            );
+            drop(ctx);
+        }
+
+        // 第 3 次 429：解绑，且下一次选号改绑到新号
+        manager.report_rate_limited_with_retry_after_for_session(bound, None, Some(session));
+        assert_eq!(
+            manager.affinity.get(session),
+            None,
+            "第 3 次连续 429 必须解绑（条目移除）"
+        );
+        let after = manager
+            .acquire_context(None, Some(session))
+            .await
+            .unwrap();
+        assert_eq!(
+            after.id, other,
+            "解绑后不得再选回原号（它已连续 3 次 429 ⇒ 熔断沉底），应换到另一个号"
+        );
+        assert_eq!(
+            manager.affinity.get(session),
+            Some(after.id),
+            "解绑后应按常规选号并改绑到新号"
+        );
+        drop(after);
+    }
+
+    /// ② 避让路径不改写绑定；成功清零后同一路径恢复改绑。
+    ///
+    /// 回退即 FAIL：把 `bind_after_selection` 的 `keep_when` 分支删掉（无条件改绑）→
+    /// 第一个 `affinity.get` 断言（仍是 `bound`）红；把 `report_success` 里的
+    /// `clear_streaks_by_credential` 删掉 → 第三个断言（成功清零后应改绑）红。
+    #[tokio::test]
+    async fn sticky_late_unbind_avoidance_keeps_binding_until_success_clears() {
+        let manager = mk_two_cred_pool_affinity_on();
+        let session = "session-avoid";
+        let (bound, other) = bind_session(&manager, session).await;
+
+        // 429 → 该会话在绑定号上进入「连续 429」保持期
+        manager.report_rate_limited_with_retry_after_for_session(bound, None, Some(session));
+
+        // 避让：本请求排除绑定号（failover 刚在它身上失败）→ 换人服务，但绑定不得被改写
+        let mut excluded: HashSet<u64> = HashSet::new();
+        excluded.insert(bound);
+        let avoided = manager
+            .acquire_context_excluding(None, Some(session), &excluded)
+            .await
+            .unwrap();
+        assert_eq!(
+            avoided.id, other,
+            "夹具自检：避让路径必须换人（排除集是承重的）"
+        );
+        drop(avoided);
+        assert_eq!(
+            manager.affinity.get(session),
+            Some(bound),
+            "避让路径不得改写绑定（P2-6：请求内限流只临时避让，保住 prompt cache 粘性）"
+        );
+
+        // 绑定号成功一次 → 粘性清零 → 同一条避让路径恢复改绑（无 429 粘性时不保持 = 零回归）
+        manager.report_success(bound);
+        let avoided2 = manager
+            .acquire_context_excluding(None, Some(session), &excluded)
+            .await
+            .unwrap();
+        assert_eq!(avoided2.id, other, "避让后仍应换人服务");
+        drop(avoided2);
+        assert_eq!(
+            manager.affinity.get(session),
+            Some(other),
+            "成功清零后避让路径必须恢复改绑（否则成了无条件死粘，比改动前更糟）"
+        );
+    }
+
+    /// ③ 非 429 的凭据级惩罚（5xx）立刻清掉保持期 ——「其它失败必须仍立刻解绑」。
+    ///
+    /// ⚠️ 刻意复用 `cooldownEnabled=false` 的池：`report_server_error` 的**冷却体**被该
+    /// 开关门控，若有人把清零写进冷却门**内**，本测试红 —— 这正是要钉的形态
+    /// （亲和计数不依赖冷却开关，与 `health.on_429` 同款口径）。
+    ///
+    /// 回退即 FAIL：把 `report_server_error` 里的 `clear_streaks_by_credential` 挪进
+    /// `if self.cooldown_enabled` 块内（或删掉）→ 避让后绑定仍是 `bound`，红。
+    #[tokio::test]
+    async fn sticky_late_unbind_releases_hold_on_non_429_penalty() {
+        let manager = mk_two_cred_pool_affinity_on();
+        let session = "session-5xx";
+        let (bound, other) = bind_session(&manager, session).await;
+
+        manager.report_rate_limited_with_retry_after_for_session(bound, None, Some(session));
+        // 5xx：非 429 的凭据级惩罚 → 必须清掉「连续 429」粘性
+        manager.report_server_error(bound);
+
+        let mut excluded: HashSet<u64> = HashSet::new();
+        excluded.insert(bound);
+        let avoided = manager
+            .acquire_context_excluding(None, Some(session), &excluded)
+            .await
+            .unwrap();
+        assert_eq!(avoided.id, other);
+        drop(avoided);
+        assert_eq!(
+            manager.affinity.get(session),
+            Some(other),
+            "非 429 惩罚必须清掉保持期（P2-6 约束①：其它失败仍立刻解绑）"
+        );
+    }
+
+    /// ④ 绑定号熔断 `Open` 时保持期被否决（立刻解绑）。
+    ///
+    /// 场景是**族级连坐**：熔断按族计数，同族别的会话把族打进 `Open` 时，本会话的
+    /// 429 计数可能还停在 1（未达阈值）—— 此时必须解绑，不能让会话被一个
+    /// 8s×1.6^n（最长 30min）不出活的号钉住。
+    ///
+    /// 回退即 FAIL：把选号末尾闭包里的 `!family_circuit_open(...)` 删掉
+    /// （保持判据只剩 `streak > 0`）→ 避让后绑定仍是 `bound`，红。
+    #[tokio::test]
+    async fn sticky_late_unbind_releases_hold_when_bound_circuit_open() {
+        let manager = mk_two_cred_pool_affinity_on();
+        let session = "session-circuit";
+        let (bound, other) = bind_session(&manager, session).await;
+
+        // 带会话 429 → 亲和计数 1；再用**不带会话**的原语补 3 次裸 429 → 族熔断跳闸
+        // （阈值 3；不带会话 ⇒ 不动亲和计数，正好复现「同族别的会话把族打 Open」）。
+        manager.report_rate_limited_with_retry_after_for_session(bound, None, Some(session));
+        for _ in 0..3 {
+            manager.report_rate_limited_with_retry_after(bound, None);
+        }
+        assert!(
+            manager
+                .health_snapshots()
+                .get(&bound)
+                .is_some_and(|s| s.circuit_open),
+            "夹具自检：绑定号必须先被熔断 Open（否则本条测不到否决）"
+        );
+
+        let mut excluded: HashSet<u64> = HashSet::new();
+        excluded.insert(bound);
+        let avoided = manager
+            .acquire_context_excluding(None, Some(session), &excluded)
+            .await
+            .unwrap();
+        assert_eq!(avoided.id, other);
+        drop(avoided);
+        assert_eq!(
+            manager.affinity.get(session),
+            Some(other),
+            "熔断 Open 时不得保持绑定（P2-6 约束①：熔断 Open 仍立刻解绑）"
+        );
+    }
+
+    /// ⑤ 接线守卫（源码级）：provider 主路径两处 429 必须走 `_for_session` 上报。
+    ///
+    /// # 为什么只能是源码守卫
+    ///
+    /// 「晚解绑」的计数**只在** provider 把会话传进来时才发生。若有人把调用改回不带
+    /// 会话的 `report_rate_limited_with_retry_after`，本文件里所有 token_manager 级
+    /// 测试**照样全绿**（它们直接调 API 注入会话），而线上计数恒 0 ⇒ 阈值永不触发
+    /// ⇒ 功能静默失效。行为级测试够不着：`MultiTokenManager::affinity` 是私有字段，
+    /// 而 provider_tests 所在的 `kiro::provider` 是 `kiro::token_manager` 的**兄弟**
+    /// 模块（读不到），mock 上游的 429 链也无法观测亲和条目。故按本仓既有先例
+    /// （`test_affinity_bypass_has_exclusion_guard_source`）如实钉住源码形态。
+    #[test]
+    fn sticky_late_unbind_provider_passes_session_to_429_report_source_guard() {
+        let full = include_str!("provider.rs");
+        // 截断口径与 provider_tests.rs 一致（`:5391`）：只查生产段，别把测试里的
+        // 字面量/其它调用点当证据。
+        let prod = full
+            .split_once("\n#[cfg(test)]")
+            .map(|(p, _)| p)
+            .unwrap_or(full);
+        let needle = "report_rate_limited_with_retry_after_for_session(";
+        let hits = prod.matches(needle).count();
+        assert!(
+            hits >= 2,
+            "provider 主路径的两处 429（单端点 / 全部端点桶已封）必须都走 `{needle}` \
+             并把 session_id 传进去，否则晚解绑计数在生产上恒 0（实际命中 {hits} 处）"
+        );
+    }
+
     #[tokio::test]
     async fn test_default_saturation_fallback_spreads_load() {
         // 默认配置(credential_rpm_limit=0 未设)也要最优:回退高水位 30 判饱和,不再恒不饱和。
@@ -8952,8 +9204,11 @@
         let manager =
             MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
 
-        // 建立会话 -> 凭据1 的亲和绑定
-        manager.affinity.set("session-abc", 1);
+        // 建立会话 -> 凭据1 的亲和绑定（走**生产唯一写入口** bind_after_selection：
+        // 晚解绑后 `set` 已删除，测试不得再用一条绕开保持判据的旁路写绑定）。
+        manager
+            .affinity
+            .bind_after_selection("session-abc", 1, |_, _| false);
         assert_eq!(manager.affinity.get("session-abc"), Some(1));
 
         // 封禁凭据1后，亲和绑定应被清除，不再指向已封的号

@@ -4480,13 +4480,16 @@ impl MultiTokenManager {
                 // 那正是排除集要消除的行为，只加在 filter 处等于没加（本请求 100% 有
                 // session_id，亲和默认开）。
                 //
-                // 排除即视为「本请求内临时解绑」：不动 affinity 表本身（会话结束后仍粘
-                // 同一个号，保住 prompt cache），只是这一跳换人。
+                // 排除即视为「本请求内临时避让」：这一跳换人。**是否改绑**不在这里决定
+                // —— 选号末尾的 `bind_after_selection`（晚解绑，P2-6）按保持判据定：
+                // 429 粘性期内保持原绑定（会话下次仍粘回同一个号，保住 prompt cache）；
+                // 无 429 粘性时照旧改绑（零回归，与改动前 `set` 无条件改绑一致）。
                 if let Some(bound_id) = self.affinity.get(uid).filter(|id| !excluded.contains(id)) {
                     if let Some(entry) = available.iter().find(|e| e.id == bound_id) {
                         // 亲和复用的前提:绑定号未 RPM 饱和。饱和仍死粘会把高频单会话钉在一个号上
                         // 打爆(retry 慢/雪崩),旁边空闲号却不接——故饱和时**不复用**,落到下方 balanced
-                        // 分流到未饱和号(临时解绑,会话下次仍可能粘回,防关联与分流兼得)。
+                        // 分流到未饱和号(临时避让,会话下次仍可能粘回,防关联与分流兼得;
+                        // 是否改绑见下方"晚解绑"说明)。
                         // 用无锁版:此处已持 entries 锁,直传 e.credentials.rpm_limit(per-cred 容量优先)。
                         // L5:饱和判定含 L3 headroom 折扣(effective_saturation_limit),即绑定号达 headroom
                         // 后阈值(如 25 而非硬限 30)就让路,防单会话高吞吐把一个号顶到贴顶再让路。
@@ -4504,18 +4507,24 @@ impl MultiTokenManager {
                         }
                         // 注：归一化后两种模式都走下方同一套排序键，所以这条"落到下方分流"
                         // 现在**真的会分流**。此前 priority 模式下下方是裸 min_by_key(priority)，
-                        // 解绑后重选常常又选回同一个饱和号并 affinity.set 重绑 → 解绑每次白做（活锁）。
+                        // 解绑后重选常常又选回同一个饱和号并重绑 → 解绑每次白做（活锁）。
+                        //
+                        // ⭐ 晚解绑（P2-6）：落到下方分流**不等于**解绑 —— 是否改绑由选号末尾
+                        // `bind_after_selection` 的保持判据决定（429 粘性期内保持原绑定）。
                         tracing::debug!(
                             user_id = %uid,
                             credential_id = %bound_id,
                             "亲和性绑定号已饱和或熔断，本次不复用，改走均衡分流到健康空闲号"
                         );
                     } else {
-                        // 绑定的凭据已不可用（禁用/冷却/限流），解绑后按常规策略重选
+                        // 绑定的凭据已不可用（禁用/冷却/限流），本次不复用、按常规策略重选。
+                        // ⭐ 晚解绑（P2-6）：**是否解绑**同样由选号末尾的保持判据决定 ——
+                        // 429 粘性期内（连续 429 < 阈值且未熔断 Open）保持原绑定不改写，
+                        // 本次只是临时避让，会话下次仍粘回原号（保住 prompt cache）。
                         tracing::debug!(
                             user_id = %uid,
                             credential_id = %bound_id,
-                            "亲和性绑定的凭据当前不可用，重新选择"
+                            "亲和性绑定的凭据当前不可用，本次改由常规策略服务"
                         );
                     }
                 }
@@ -4927,10 +4936,30 @@ impl MultiTokenManager {
 
         let selected = selected?;
 
-        // 新选中的凭据与会话建立绑定，使后续同会话请求复用
+        // 新选中的凭据与会话建立绑定，使后续同会话请求复用。
+        //
+        // ⭐ 晚解绑（P2-6）：**唯一**写入口是 `bind_after_selection`，它自带保持判据 ——
+        // 原绑定仍在「连续 429」粘性期（`consecutive_429 > 0`，达阈值时
+        // `note_rate_limited` 已把条目移除）且绑定号熔断未 Open 时**不改写**绑定：
+        // 本次选中的别的号只是本跳/本请求的**临时避让**（排除集 failover、429 冷却、
+        // 饱和、并发上限、模型黑名单），会话下次仍粘回原号，保住上游 prompt cache 粘性。
+        //
+        // 保持判据的两维分工：
+        // ① `consecutive_429 > 0` —— 由 `affinity.rs` 维护的会话级计数（只有 429 计入；
+        //    任一次成功或任一非 429 凭据级惩罚清零）；
+        // ② `!family_circuit_open` —— 熔断 Open 是 8s×1.6^n（最长 30min）的硬状态，
+        //    等同号不可用，必须**立刻解绑**（否则会话被一个半小时不出活的号钉住）。
+        //    这一维只有调度层看得到（health 是族级、entries 在锁内），故以闭包注入。
+        //
+        // 锁序：调用方已持 entries 锁；闭包内读 entries（同一把，不重入）与 health
+        // （独立 Mutex）→ 全仓无 health→affinity / entries→affinity 之外的反向边，
+        // 不构成环（本函数早已是 entries → affinity 方向）。
         if self.affinity_enabled.load(Ordering::Relaxed) {
             if let Some(uid) = user_id {
-                self.affinity.set(uid, selected.id);
+                self.affinity
+                    .bind_after_selection(uid, selected.id, |bound_id, streak| {
+                        streak > 0 && !self.family_circuit_open(entries.as_slice(), bound_id)
+                    });
             }
         }
 
@@ -5290,7 +5319,8 @@ impl MultiTokenManager {
     /// > **默认高水位兜底**。默认兜底(SATURATION_FALLBACK_RPM=30)是"默认配置也最优"的
     /// 关键:两者都没设时,不再"恒不饱和→affinity 死粘单号打爆"(retry 慢根因),而是在
     /// ~30rpm/号(正好在上游 USER_REQUEST_RATE_EXCEEDED 硬限之前)判饱和,让 affinity
-    /// 解绑 + balanced 分流到空闲号。体质好的号设 per-cred rpm_limit=100 即用 100,
+    /// 分流到空闲号（无 429 粘性时随选号改绑；有 429 粘性时只临时避让，见
+    /// `bind_after_selection` 的晚解绑）。体质好的号设 per-cred rpm_limit=100 即用 100,
     /// 弱号/默认用 30 兜底。
     fn is_rpm_saturated_with_limit(&self, id: u64, per_cred_limit: Option<u32>) -> bool {
         let lim = self.effective_saturation_limit(per_cred_limit);
@@ -5399,6 +5429,29 @@ impl MultiTokenManager {
                 true
             }
         }
+    }
+
+    /// 该号（族键口径）当前是否熔断 `Open`。**调用方已持 `entries` 锁**（只读该锁内的
+    /// 族键缓存 + health 的独立锁，不重入 entries）。
+    ///
+    /// 用途：晚解绑保持判据的第二维（见 `select_next_credential` 末尾的绑定写入处）。
+    /// 熔断 Open 是 `8s×1.6^n`（最长 30min）的**硬状态**，与「瞬态 429 冷却十几秒」不同
+    /// —— 号在 Open 期内等同不可用，会话不能被「连续 429 粘性」钉在它身上，必须立刻解绑
+    /// （P2-6 约束①：熔断 Open 仍立刻解绑）。
+    ///
+    /// 键用 `family_key_ref()`（与 `is_sticky_reuse_healthy` / `report_success` /
+    /// `report_rate_limited_with_retry_after` 同口径；族级连坐的另一面：同族分身共担
+    /// 一条记录，任一分身把族打进 Open，本号也算 Open）。选号入口已回填族键缓存，
+    /// 故这里是零分配读。
+    fn family_circuit_open(&self, entries: &[CredentialEntry], id: u64) -> bool {
+        entries
+            .iter()
+            .find(|e| e.id == id)
+            .is_some_and(|e| {
+                self.health
+                    .snapshot(e.family_key_ref().as_ref())
+                    .is_some_and(|s| s.circuit_open)
+            })
     }
 
     /// 生效的调度语义（`load_balancing_mode` 归一化的**唯一真相源**）。
@@ -6737,6 +6790,11 @@ impl MultiTokenManager {
                 self.self_heal_streak.store(0, Ordering::Relaxed);
             }
         }
+        // ⭐ 亲和「连续 429」清零（P2-6 晚解绑）：该号**任一次成功**即证明它可用 ⇒
+        // 清掉所有粘它的会话的 429 粘性，否则保持期会把会话钉在一个已经好了的号上
+        // 不回来（或让陈旧计数混进下一次连续 429 的累计）。按号广播，无会话维度要求
+        // —— 理由（为什么不需要 session_id）见 `UserAffinityManager::clear_streaks_by_credential`。
+        self.affinity.clear_streaks_by_credential(id);
         let fam = self.family_key_of(id);
         // 该号本进程内是否**首次**成功（决定要不要绕过 debounce 立刻落盘，见函数末尾）。
         let mut first_success = false;
@@ -6950,6 +7008,10 @@ impl MultiTokenManager {
         if let Some(has_enabled) = self.preserve_custom_api_state(id) {
             return has_enabled;
         }
+        // 非 429 的凭据级失败 → 清该号的亲和「连续 429」粘性（P2-6 约束①：
+        // 「其它失败（401/403/…）必须仍立刻解绑」——清计数即让下一次选号落回立刻改绑）。
+        // 理由与广播口径见 `UserAffinityManager::clear_streaks_by_credential`。
+        self.affinity.clear_streaks_by_credential(id);
         let mut disabled_now = false;
         let result = {
             let mut entries = self.entries.lock();
@@ -7074,6 +7136,35 @@ impl MultiTokenManager {
         self.health.on_429(&self.family_key_of(id));
     }
 
+    /// 上游 429 的**完整**上报（凭据级惩罚 + 会话亲和「连续 429」计数）—— Kiro 主路径入口。
+    ///
+    /// 与 [`Self::report_rate_limited_with_retry_after`] 的分工：后者是纯**凭据级惩罚原语**
+    /// （冷却 / rate_limiter / health），**不带会话维度**，供 MCP 等无 conversationId 的路径
+    /// 与测试使用；本函数是 provider 主路径两处 429 分支（带 `session_id`）的入口，在惩罚
+    /// 之外把这次 429 记到该会话的亲和条目上 —— 绑定号**连续 429 达 3 次**才解绑（P2-6
+    /// 晚解绑，语义与阈值见 `affinity.rs`）。
+    ///
+    /// 为什么计数必须走**会话**维度：backlog P2-6 的原文是「同一会话在同一账号连续 429
+    /// ≥3 次才解绑」——同一个号被别的会话打出的 429 不能算到这个会话头上（否则重会话
+    /// 会把轻会话一起赶走）。故 provider 必须把 `session_id` 传进来，不能用「按号广播」。
+    ///
+    /// 计数与惩罚**解耦**：`cooldownEnabled=false`（线上实际值）时惩罚被门控，但亲和计数
+    /// 照记 —— 它不读冷却状态（与 `health.on_429` 同款「不受冷却开关门控」的口径）。
+    /// `session_id` 为 None（无会话语义的调用）时只做惩罚，与旧行为逐字节一致。
+    pub fn report_rate_limited_with_retry_after_for_session(
+        &self,
+        id: u64,
+        retry_after_secs: Option<u64>,
+        session_id: Option<&str>,
+    ) {
+        self.report_rate_limited_with_retry_after(id, retry_after_secs);
+        if let Some(uid) = session_id {
+            // 只在该会话正绑着这个号时计数（`note_rate_limited` 内判）。
+            // 未启用亲和时 map 恒空 → 天然 no-op，故不额外读 `affinity_enabled` 原子。
+            self.affinity.note_rate_limited(uid, id);
+        }
+    }
+
     /// 报告凭据遇到上游 **5xx**，设 [`CooldownReason::ServerError`] 短冷却（30s，自动恢复）。
     ///
     /// 为什么需要它：此前非 429 的 5xx 只在 provider 里 sleep 200ms~2s 就换号，**不设任何
@@ -7086,6 +7177,10 @@ impl MultiTokenManager {
     /// 与 429 的区别：5xx 多为上游整体故障而非该号的问题，故只设短冷却、不计永久失败、
     /// 不碰 rate_limiter，也不动 health 的 429 计数（那是限流信号，不该被 5xx 污染）。
     pub fn report_server_error(&self, id: u64) {
+        // 5xx 是**非 429** 的失败 → 清该号的亲和「连续 429」粘性（P2-6 约束①）。
+        // ⚠️ 必须放在 `cooldown_enabled` 门**外**：与 `health.on_429` 同款口径 ——
+        // 亲和计数不依赖冷却开关，线上 cooldownEnabled=false 时同样要清。
+        self.affinity.clear_streaks_by_credential(id);
         if self.cooldown_enabled.load(Ordering::Relaxed) {
             let dur = self
                 .cooldown
@@ -7143,6 +7238,10 @@ impl MultiTokenManager {
         if self.preserve_custom_api_state(id).is_some() {
             return;
         }
+        // 风控（403 TEMPORARILY_SUSPENDED）是**非 429** 的凭据级惩罚 → 清亲和「连续 429」
+        // 粘性（P2-6 约束①）。放在三节（计数/冷却/限速）之前：与它们的开关各自独立，
+        // 计数不依赖 cooldownEnabled / rateLimitEnabled。
+        self.affinity.clear_streaks_by_credential(id);
         // ── 1. 计数 + 自动禁用（恒执行，不受任何冷却/限速开关影响）
         //
         // 单位是族：同 clone_group 的分身共享一个上游账号（见 family_key 函数文档的
@@ -7259,6 +7358,9 @@ impl MultiTokenManager {
     /// 401/403 里那些**瞬态**的（token 对该端点已被证明有效 / region 未开通但后台重探
     /// 已启动）请用 [`Self::report_auth_transient_cooldown`]，别用本函数。
     pub fn report_auth_cooldown(&self, id: u64) {
+        // 认证失败（401/403 永久向）是**非 429** 的凭据级惩罚 → 清亲和「连续 429」粘性
+        // （P2-6 约束①）。放在冷却门**外**：计数不依赖 cooldownEnabled 开关。
+        self.affinity.clear_streaks_by_credential(id);
         if self.cooldown_enabled.load(Ordering::Relaxed) {
             let dur = self
                 .cooldown
@@ -7286,6 +7388,9 @@ impl MultiTokenManager {
     /// 反复触发由 `calculate_cooldown_duration` 的 1.3^n 递增兜住（上限 90s），
     /// 故「判错方向」的最坏态也是自限的。
     pub fn report_auth_transient_cooldown(&self, id: u64) {
+        // 认证瞬态失败仍是**非 429** 的凭据级惩罚 → 清亲和「连续 429」粘性（P2-6 约束①）。
+        // 放在冷却门**外**：计数不依赖 cooldownEnabled 开关。
+        self.affinity.clear_streaks_by_credential(id);
         if self.cooldown_enabled.load(Ordering::Relaxed) {
             let dur = self
                 .cooldown
@@ -7713,6 +7818,9 @@ impl MultiTokenManager {
         if is_refresh_error_credential_level(err) {
             return self.report_refresh_failure(id);
         }
+        // 瞬态刷新失败同样是**非 429** 的凭据级惩罚（token 换不到，该号此刻不可用）→
+        // 清亲和「连续 429」粘性（P2-6 约束①）。放在冷却门**外**：计数不依赖开关。
+        self.affinity.clear_streaks_by_credential(id);
         // 瞬态：不计数、不禁用，只让调度暂时跳过它。
         if self.cooldown_enabled.load(Ordering::Relaxed) {
             let dur = self
@@ -7750,6 +7858,9 @@ impl MultiTokenManager {
         if let Some(has_enabled) = self.preserve_custom_api_state(id) {
             return has_enabled;
         }
+        // 刷新失败（凭据级，累计 3 次即禁用）是**非 429** 的凭据级惩罚 → 清亲和
+        // 「连续 429」粘性（P2-6 约束①）。
+        self.affinity.clear_streaks_by_credential(id);
         let disabled_now;
         let result = {
             let mut entries = self.entries.lock();

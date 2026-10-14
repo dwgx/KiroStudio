@@ -395,7 +395,7 @@ src/
 │   ├── overage.rs          (233)  超额真开关（幂等 + 审计，单号显式请求）
 │   ├── web_portal.rs       (407)  app.kiro.dev Web Portal 客户端（rpc-v2-cbor）
 │   ├── machine_id.rs       (336)  machineId 生成/派生/撞车轮换
-│   ├── affinity.rs          (94)  会话亲和（session_id → credential_id, TTL）
+│   ├── affinity.rs         (369)  会话亲和（session_id → credential_id, TTL + 连续 429 晚解绑）
 │   ├── refresh_loop.rs      (70)  受管后台预刷新
 │   ├── auth/  social.rs (349) · idc.rs (258)            OAuth PKCE / SSO 设备码
 │   ├── endpoint/  mod.rs (355) · ide.rs (181)           KiroEndpoint trait + IDE(kiro.dev)

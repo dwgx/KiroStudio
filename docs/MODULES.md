@@ -120,8 +120,11 @@ app.kiro.dev Web Portal 客户端（**rpc-v2-cbor**，非 JSON）：`get_user_us
 `generate_from_credentials(cred, config) → 64hex` · `normalize_machine_id` · `sha256_to_hex`；
 进程级缓存 `FALLBACK_MACHINE_IDS` + `DERIVED_MACHINE_IDS`；入池撞车自动轮换（防关联）。
 
-### kiro/affinity.rs (94)
-`UserAffinityManager`（HashMap + TTL）：`get`(惰性过期) / `set` / `touch`(续期) /
+### kiro/affinity.rs (369)
+`UserAffinityManager`（HashMap + TTL）：`get`(惰性过期) / `touch`(续期) / `bind_after_selection`
+（**绑定写入唯一入口**：按调用方判定保持或重绑，避免绕开保持判据的第二条写路径） /
+`note_rate_limited`（同会话连续 429 计数，达阈值即解绑 = sticky 晚解绑） /
+`clear_streaks_by_credential`（成功或非 429 惩罚时按号广播清零） /
 `remove_by_credential` / `cleanup`。
 
 ### kiro/refresh_loop.rs (70)

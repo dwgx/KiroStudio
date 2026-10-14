@@ -4628,8 +4628,15 @@ impl KiroProvider {
                                 );
                             } else if rate_limited_this_call.insert(ctx.id) {
                                 // 所有端点桶都已封禁：按原有逻辑设凭据级冷却，让调度换号。
+                                // ⭐ 走 `_for_session`：除凭据级惩罚外把这次 429 记到本会话的
+                                // 亲和条目上（P2-6 晚解绑：同会话连续 429≥3 才解绑）。
+                                // 不带会话的 MCP 路径仍用原函数（无 affinity 维度）。
                                 self.token_manager
-                                    .report_rate_limited_with_retry_after(ctx.id, retry_after);
+                                    .report_rate_limited_with_retry_after_for_session(
+                                        ctx.id,
+                                        retry_after,
+                                        session_id.as_deref(),
+                                    );
                             } else {
                                 tracing::debug!(
                                     "凭据 #{} 本请求链内已冷却过，再次 429 仅换号 failover，不重复惩罚",
@@ -4637,9 +4644,15 @@ impl KiroProvider {
                                 );
                             }
                         } else if rate_limited_this_call.insert(ctx.id) {
-                            // 单端点凭据：与改动前逐字节一致（短冷却换号，不涉及桶）。
+                            // 单端点凭据：与改动前逐字节一致（短冷却换号，不涉及桶），
+                            // 仅额外把这次 429 记到本会话的亲和条目上（P2-6 晚解绑，
+                            // 见 `_for_session` 的文档）。
                             self.token_manager
-                                .report_rate_limited_with_retry_after(ctx.id, retry_after);
+                                .report_rate_limited_with_retry_after_for_session(
+                                    ctx.id,
+                                    retry_after,
+                                    session_id.as_deref(),
+                                );
                         } else {
                             tracing::debug!(
                                 "凭据 #{} 本请求链内已冷却过，再次 429 仅换号 failover，不重复惩罚",
