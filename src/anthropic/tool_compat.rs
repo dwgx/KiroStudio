@@ -733,6 +733,23 @@ pub(super) fn replace_mapped_tool_names_in_text(
     out
 }
 
+/// 判断是否为「非 web_search 的 Anthropic 内置工具」（对手对照 4c3a8d9 补齐项）。
+///
+/// 判据（Anthropic 协议）：`type` 存在、非空、且不等于 "custom"。以 Anthropic 公开
+/// 文档的命名族为准，命中即视为 Kiro 上游无执行环境的内置工具族：
+/// - `web_fetch_*` / `code_execution_*` / `memory_*`：由 Anthropic 服务端执行；
+/// - `computer_*` / `bash_*` / `text_editor_*`：由支持该能力的客户端执行、参数 schema
+///   由 API 按 `type` 隐含（请求里不带 input_schema）。
+///
+/// **web_search 族刻意排除**（`!ty.starts_with("web_search")`）：本仓经 `convert_tools`
+/// 的归一化分支改写为 Kiro 函数工具后由网关自行执行（快路径 MCP / 回灌循环），是能力
+/// 不是负担。`type: "custom"` / 缺省 / 空串 = 普通客户端工具，照常转换。
+fn is_non_web_search_server_tool(t: &crate::anthropic::types::Tool) -> bool {
+    t.tool_type
+        .as_deref()
+        .is_some_and(|ty| !ty.is_empty() && ty != "custom" && !ty.starts_with("web_search"))
+}
+
 /// 转换工具定义
 pub(super) fn convert_tools(
     tools: &Option<Vec<crate::anthropic::types::Tool>>,
@@ -780,6 +797,38 @@ pub(super) fn convert_tools(
                 normalized
             } else {
                 t.clone()
+            }
+        })
+        // 🔴 2026-10-14（对手对照 4c3a8d9）：非 web_search 的 Anthropic 内置工具
+        // （`web_fetch_*` / `code_execution_*` / `memory_*` / `computer_*` / `bash_*` /
+        // `text_editor_*` 等，判据见 `is_non_web_search_server_tool`）从 Kiro payload 剥离。
+        //
+        // 为什么剥离：这类工具由 Anthropic 服务端执行，或由支持该能力的客户端执行而
+        // 参数 schema 由 API 按 `type` 隐含（请求里没有 input_schema）。Kiro 上游既没有
+        // 对应的执行环境、也没有 schema 来源，按通用函数工具下发只会得到一个空 schema
+        // 的普通工具定义 —— 模型可能据此发出参数不可用的 tool_use，客户端无法执行
+        //（对手 4c3a8d9 的结论）。剥离后模型看不到它们，不会再发出这类调用。
+        //
+        // 为什么不门控 tool_compat_mapping 开关：这是**协议层**声明形态（任何客户端、
+        // 任何模式下下发都是坏形态），与上方 web_search 归一化分支一样无条件执行；
+        // 对比 fs_append（特定客户端特定工具名，仅在兼容模式隐藏）。
+        //
+        // tool_choice 影响：本仓 tool_choice **从不转发上游**（converter 无引用，Kiro
+        // 协议无此语义），唯一消费点是 websearch.rs 的 web_search 快路径判定（name+type
+        // 双判据，只可能命中 web_search —— 永不在剥离之列）。故 tool_choice 指向被剥离
+        // 工具既不报错、也不需要新错误码：请求照常转发，模型看不到该工具 → 输出普通文本/
+        // 其他工具调用；「强制调用某服务端工具」的意图本来就无法被上游执行（tool_choice
+        // 对所有工具都不转发），剥离只是把「不可执行的 tool_use」提前消掉。
+        .filter(|t| {
+            if is_non_web_search_server_tool(t) {
+                tracing::debug!(
+                    tool = %t.name,
+                    tool_type = ?t.tool_type,
+                    "剥离 Anthropic 内置工具（Kiro 上游无执行环境）"
+                );
+                false
+            } else {
+                true
             }
         })
         // Claude Code 2.1.215+ 新增的 fs_append 工具，Kiro 上游不支持（400/行为异常），
@@ -890,5 +939,79 @@ mod tests {
         );
         assert_eq!(out["offset"], serde_json::json!(10));
         assert_eq!(out["limit"], serde_json::json!(5));
+    }
+
+    /// 对手对照 4c3a8d9：非 web_search 的 Anthropic 内置工具（type 非 custom）必须
+    /// 从 Kiro payload 剥离；web_search 族（网关自行执行）、custom、缺 type、空 type
+    /// 照常保留。判据表覆盖公开命名族 + 边界形态（含 type-only 无 name 形态）。
+    ///
+    /// 本测试对 `tool_compat_mapping` 开关两种状态都成立（不翻转开关，避免与
+    /// converter_tests 的 ToolCompatGuard 并行竞争）：剥离不门控开关，保留侧工具名
+    /// 在两种状态下一致（web_search 归一化名随开关为 web_search / WebSearch，断言两收）。
+    #[test]
+    fn test_convert_tools_strips_non_web_search_server_tools() {
+        let mk = |name: &str, ty: Option<&str>| crate::anthropic::types::Tool {
+            tool_type: ty.map(|s| s.to_string()),
+            name: name.to_string(),
+            description: String::new(),
+            input_schema: Default::default(),
+            max_uses: None,
+            cache_control: None,
+        };
+
+        // 剥离侧：公开命名族全族 + type-only（无 name）边界
+        let server: [(&str, &str); 7] = [
+            ("computer", "computer_20250124"),
+            ("bash", "bash_20250124"),
+            ("str_replace_based_edit_tool", "text_editor_20250728"),
+            ("code_execution", "code_execution_20250522"),
+            ("web_fetch", "web_fetch_20250910"),
+            ("memory", "memory_20250818"),
+            ("", "computer_20250124"),
+        ];
+        let mut tools: Vec<crate::anthropic::types::Tool> = server
+            .iter()
+            .map(|(name, ty)| mk(name, Some(ty)))
+            .collect();
+        // 保留侧：web_search 族（网关自行执行）、custom、缺 type、空 type
+        tools.push(mk("web_search", Some("web_search_20250305")));
+        tools.push(mk("my_custom", Some("custom")));
+        tools.push(mk("untyped_tool", None));
+        tools.push(mk("empty_type_tool", Some("")));
+
+        let mut map = HashMap::new();
+        let converted = convert_tools(&Some(tools), &mut map);
+
+        let names: Vec<&str> = converted
+            .iter()
+            .map(|t| t.tool_specification.name.as_str())
+            .collect();
+        // 7 个服务端工具全部消失，只剩 4 个保留侧
+        assert_eq!(
+            converted.len(),
+            4,
+            "非 web_search 服务端工具必须全部剥离: {names:?}"
+        );
+        for (name, ty) in server {
+            if !name.is_empty() {
+                assert!(!names.contains(&name), "{ty} 必须剥离: {names:?}");
+            }
+        }
+        // 保留侧：custom / 缺 type / 空 type 不得被误剥离
+        assert!(names.contains(&"my_custom"), "type=custom 必须保留: {names:?}");
+        assert!(names.contains(&"untyped_tool"), "缺 type 必须保留: {names:?}");
+        assert!(
+            names.contains(&"empty_type_tool"),
+            "空 type 必须保留: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| *n == "web_search" || *n == "WebSearch"),
+            "web_search 族不得剥离（网关自行执行）: {names:?}"
+        );
+        // 剥离发生在命名映射之前：被剥离的工具不得进入反向映射表（出站还原只认真正下发的工具）
+        assert!(
+            !map.contains_key("computer"),
+            "剥离工具不得进入 tool_name_map: {map:?}"
+        );
     }
 }

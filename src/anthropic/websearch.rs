@@ -475,6 +475,32 @@ pub fn strip_web_search_tools(req: &mut MessagesRequest) {
     }
 }
 
+/// MCP web_search 的 `query` 参数上限（字符数）。
+///
+/// 为什么是 200：Anthropic 服务端 web_search 工具 schema 声明 query ≤ 200 字符
+/// （对手对照 3c9f28f 同值），Kiro 远程 MCP 同源校验——超长查询在 MCP 侧参数校验
+/// 失败（-32602，见 `should_handle_websearch_request` 注释）→ 快路径/回灌路径都会
+/// 把它放大成 502 硬错，而不是「截断后仍能搜」。
+///
+/// 为什么按 char 不按字节：UTF-8 中文 1 字 3 字节、emoji 4 字节，按字节截断会把
+/// 字符切碎（乱码，且对 `&str` 切片直接 panic）。仓库既有截断（converter 的
+/// `truncate_chars`、`generate_search_summary` 的 snippet）同样按 char 边界。
+const MAX_SEARCH_QUERY_CHARS: usize = 200;
+
+/// 把查询词按 char 截断到 [`MAX_SEARCH_QUERY_CHARS`]（额度内原样返回）。
+///
+/// 截断处**不加省略号**、直接截断：query 是发给 MCP/搜索引擎的机器参数（不是给人
+/// 读的展示文本），省略号会挤占额度并可能改变检索语义；`generate_search_summary`
+/// 的 snippet 截断加 "..." 是因为它面向客户端展示，两者用途不同。
+///
+/// 实现沿用 converter `truncate_chars` 的字符边界模式（`char_indices().nth`）。
+fn truncate_search_query(query: &str) -> String {
+    match query.char_indices().nth(MAX_SEARCH_QUERY_CHARS) {
+        Some((idx, _)) => query[..idx].to_string(),
+        None => query.to_string(),
+    }
+}
+
 /// 从消息中提取搜索查询
 ///
 /// 读取 messages 中最后一条 user 消息的首个内容块（更符合多轮对话场景），
@@ -513,12 +539,29 @@ pub fn extract_search_query(req: &MessagesRequest) -> Option<String> {
         .map(|s| s.to_string())
         .unwrap_or_else(|| trimmed.to_string());
 
+    // 截断到 MCP 参数上限。放在前缀剥离**之后**：200 是 query 本体的额度，前缀不算。
+    // 纯单工具触发时整段长消息都会被当作查询词，超长直接发 MCP 会 -32602 → 502 硬错；
+    // 截断后仍走原路径（上限与截断方式的理由见 MAX_SEARCH_QUERY_CHARS /
+    // truncate_search_query 注释）。
+    let query = truncate_search_query(&query);
+
     if query.is_empty() { None } else { Some(query) }
 }
 
 /// 从 web_search tool_use input 取查询词。模型常吐 `search_query` / `q` / `queries`
 /// 而不是 `query`（ZyphrZero 0.7.5 PR #57）。缺参才整轮失败。
+///
+/// 返回前统一按 [`MAX_SEARCH_QUERY_CHARS`] 截断（与快路径 `extract_search_query`
+/// 同一上限、同一 helper）：回灌路径把模型给的 query 原样发**同一个 MCP**，超长同样
+/// -32602 → 整包 502 硬错，而不是截断后仍能搜。两条路径对齐是仓库既有约定
+///（见模块文档与各处「与快路径同一条铁律」注释）。
 fn web_search_query_from_input(input: &Value) -> Option<String> {
+    web_search_query_from_input_unclamped(input).map(|q| truncate_search_query(&q))
+}
+
+/// [`web_search_query_from_input`] 的别名提取本体（不含长度截断；截断由包装层统一
+/// 做，避免在每个 return 点各截一次）。
+fn web_search_query_from_input_unclamped(input: &Value) -> Option<String> {
     fn nonempty_str(v: &Value) -> Option<String> {
         v.as_str()
             .map(str::trim)
@@ -2908,6 +2951,66 @@ mod tests {
         assert_eq!(query, Some("What is the weather today?".to_string()));
     }
 
+    /// 对手对照 3c9f28f：query 按 char 截到 200 —— 199/200 原样、201 截为前 200。
+    /// 直接截断不加省略号（理由见 `truncate_search_query` 注释）。
+    #[test]
+    fn test_extract_search_query_truncates_to_200_chars() {
+        // 边界内（199 / 200 字符）：逐字原样，不发生任何改写
+        let q199 = "a".repeat(199);
+        assert_eq!(
+            extract_search_query(&mk_req(&q199, None)).as_deref(),
+            Some(q199.as_str())
+        );
+        let q200 = "b".repeat(200);
+        assert_eq!(
+            extract_search_query(&mk_req(&q200, None)).as_deref(),
+            Some(q200.as_str())
+        );
+
+        // 越界（201 字符）：截为前 200 字符（无省略号）
+        let out = extract_search_query(&mk_req(&"c".repeat(201), None)).expect("应有查询");
+        assert_eq!(out, "c".repeat(200));
+        assert_eq!(out.chars().count(), 200);
+    }
+
+    /// 截断发生在前缀剥离之后：CC 前缀（38 字符）不占 query 本体 200 的额度。
+    #[test]
+    fn test_extract_search_query_truncation_counts_after_prefix_strip() {
+        let text = format!("{WEB_SEARCH_PREFIX}{}", "d".repeat(201));
+        let out = extract_search_query(&mk_req(&text, None)).expect("应有查询");
+        assert_eq!(out, "d".repeat(200), "前缀不得占用 200 额度、也不得残留");
+    }
+
+    /// 多字节中文：按 char 截断得 200 个完整汉字（按字节会切碎 3 字节字符）。
+    #[test]
+    fn test_extract_search_query_truncation_multibyte_cjk() {
+        let out = extract_search_query(&mk_req(&"中".repeat(201), None)).expect("应有查询");
+        assert_eq!(out.chars().count(), 200);
+        assert!(out.chars().all(|c| c == '中'), "不得出现被切碎的乱码字符");
+    }
+
+    /// emoji（4 字节字符）：截断边界必须落在字符边界上，不得切开半个 emoji。
+    #[test]
+    fn test_extract_search_query_truncation_emoji() {
+        // "a🌐" × 150 = 300 字符；第 200 个字符是 emoji，截断后必须仍是完整 emoji
+        let out = extract_search_query(&mk_req(&"a🌐".repeat(150), None)).expect("应有查询");
+        assert_eq!(out.chars().count(), 200);
+        assert!(out.ends_with('🌐'), "第 200 个字符是 emoji，不得被截成半个");
+        assert_eq!(out.chars().filter(|&c| c == '🌐').count(), 100);
+    }
+
+    /// 恰好为空：空串 / 纯空白 / 仅前缀（剥离后为空）都不得产出查询。
+    #[test]
+    fn test_extract_search_query_empty_is_none() {
+        assert_eq!(extract_search_query(&mk_req("", None)), None);
+        assert_eq!(extract_search_query(&mk_req("   ", None)), None);
+        assert_eq!(
+            extract_search_query(&mk_req(WEB_SEARCH_PREFIX, None)),
+            None,
+            "仅前缀 → 剥离后为空 → None（不得把空串发给 MCP）"
+        );
+    }
+
     #[test]
     fn test_web_search_query_from_input_aliases() {
         assert_eq!(
@@ -2932,6 +3035,29 @@ mod tests {
         );
         assert_eq!(web_search_query_from_input(&json!({"query": "  "})), None);
         assert_eq!(web_search_query_from_input(&json!({})), None);
+    }
+
+    /// 回灌路径同款截断：模型给的超长 query 走同一个 MCP、同一个 -32602 风险，
+    /// 统一受 200 上限（与快路径同一 helper，见 `web_search_query_from_input` 注释）。
+    #[test]
+    fn test_web_search_query_from_input_truncates_long_query() {
+        let out =
+            web_search_query_from_input(&json!({"query": "x".repeat(201)})).expect("应有查询");
+        assert_eq!(out, "x".repeat(200));
+
+        // 额度内逐字原样
+        let ok200 = "y".repeat(200);
+        assert_eq!(
+            web_search_query_from_input(&json!({"query": ok200.clone()})).as_deref(),
+            Some(ok200.as_str())
+        );
+
+        // queries 数组合并后超长：合并结果同样截断
+        let out = web_search_query_from_input(&json!({
+            "queries": ["z".repeat(150), "w".repeat(150)]
+        }))
+        .expect("应有查询");
+        assert_eq!(out.chars().count(), 200, "合并后的长查询同样截断");
     }
 
     #[test]
