@@ -1208,7 +1208,19 @@ impl StreamContext {
                 // 负值与 NaN/inf 同理必须拦：负值会让 `billed_input_tokens` 拿到负数，
                 // NaN/inf 经 `as i32` 是饱和转换（NaN→0、inf→i32::MAX），后者更糟。
                 if let Some(actual_input_tokens) = context_input_tokens_from_pct(pct, window_size) {
+                    // ⭐ 隐藏上下文计量（纯观测，零行为变更）：只在**本请求首个有效信号**上
+                    // 取一次样本 —— 同一请求可能多次收到 contextUsageEvent，每次都记会把
+                    // 15 样本窗口灌成重复样本、中位数失真。返回值不参与控制流（见函数文档）。
+                    let first_valid_signal = self.context_input_tokens.is_none();
                     self.context_input_tokens = Some(actual_input_tokens);
+                    if first_valid_signal {
+                        observe_hidden_context_sample(
+                            &self.model,
+                            actual_input_tokens,
+                            self.input_tokens,
+                            Some(self.output_tokens),
+                        );
+                    }
                     tracing::debug!(
                         "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
                         pct,
@@ -4603,6 +4615,227 @@ pub(crate) fn context_input_tokens_from_pct(pct: f64, window_size: i32) -> Optio
     }
 }
 
+// =============================================================================
+// 隐藏上下文计量（2026-10-14，对手 kiro.cache 对照；**纯观测，零行为变更**）
+// =============================================================================
+//
+// 对手事实：Kiro 会把自身的 system + 对话模板塞进上游上下文（对手实测 Claude 基线
+// ≈4052 token，2026-10-07 用小请求反推）。本仓对外报的 `input_tokens` 取自
+// `contextUsageEvent` 百分比反推 ⇒ 天然包含这部分。要判断"要不要给客户端扣掉它"，
+// 先得有本仓自己的数字。本段只做**观测**：记录 `上游 gross − 本地估算` 的滚动中位数
+// 与漂移，不改任何对外数字（减法的 real-deferred 说明见 `observe_hidden_context_sample`）。
+//
+// 样本差值 = `context_input_tokens_from_pct(pct, window)` − `count_all_tokens(...)`，
+// 其构成与局限（估算器误差、我方转换差异、上游口径未知项）逐条写在
+// `observe_hidden_context_sample` 的文档里。
+//
+// 覆盖范围：流式（`StreamContext`，`/cc/v1` 的 buffered 路径复用同一个 StreamContext）
+// 与非流式（handlers.rs 聚合循环）两条主路径。WebSearch 回灌循环（websearch.rs 自带
+// 事件解析）**刻意不接**：它每跳复用首跳的本地估算，而上游上下文逐跳增长 → 差值被
+// "未计入估算的回灌内容"污染，接进来只会给中位数灌噪声。
+
+/// 滚动窗口容量：15 样本取中位数（与对手 kiro.cache 同参数）。
+///
+/// 为什么取中位数而不是均值：单请求的差值混着内容类型相关的估算误差（代码/JSON 下
+/// 本地少算、CJK 下本地多算），均值会被个别大请求拖走；中位数对少数离群样本免疫
+/// （15 个样本里 ≤7 个离群不影响中位数）。
+const HIDDEN_CTX_WINDOW: usize = 15;
+
+/// 漂移告警阈值（token）：窗口中位数偏离已建立基线超过该值即 warn（对手 ±100 同参数）。
+const HIDDEN_CTX_DRIFT_ALERT: i64 = 100;
+
+/// 同时跟踪的模型名上限。模型名来自客户端载荷、可任意伪造 —— 不设上限就是一条
+/// 「唯一模型名灌爆内存」的路径。表满后新模型不再建窗（观测是尽力而为：丢样本
+/// 不改变任何请求行为，只是该模型没有统计）。
+const HIDDEN_CTX_MAX_MODELS: usize = 16;
+
+/// 单个模型的滚动窗口 + 漂移状态机。
+#[derive(Default)]
+struct HiddenCtxWindow {
+    samples: std::collections::VecDeque<i64>,
+    /// 窗口首次填满时的中位数 = 该模型的隐藏上下文基线（token）。
+    baseline: Option<i64>,
+    /// 最近一次告警时的中位数。只在「带外进一步移动 > 阈值」时重复告警 ——
+    /// 否则一旦漂移，每个后续样本都会 warn，把日志刷成噪音、真信号被淹没。
+    last_alerted_median: Option<i64>,
+}
+
+/// 一次 `record` 的状态机结果（逻辑与日志分离：日志在全局包装层，状态机可纯单测）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HiddenCtxEvent {
+    /// 窗口未满，仅收集。
+    Collecting,
+    /// 窗口已满且无新事件（带内；或带外但未进一步移动）。
+    Quiet,
+    /// 窗口首次填满：建立基线。
+    BaselineEstablished(i64),
+    /// 中位数偏离基线超过阈值（首次出带，或带外进一步移动超过阈值）。
+    Drift { baseline: i64, median: i64 },
+    /// 从带外回到带内（清空告警状态 ⇒ 下次再出带会重新告警）。
+    Recovered { baseline: i64, median: i64 },
+}
+
+impl HiddenCtxWindow {
+    /// 推入一个样本并推进状态机。
+    fn record(&mut self, delta: i64) -> HiddenCtxEvent {
+        self.samples.push_back(delta);
+        while self.samples.len() > HIDDEN_CTX_WINDOW {
+            self.samples.pop_front();
+        }
+        if self.samples.len() < HIDDEN_CTX_WINDOW {
+            return HiddenCtxEvent::Collecting;
+        }
+        let median = self.median().expect("窗口已满时 median 恒为 Some（非空）");
+        let Some(baseline) = self.baseline else {
+            self.baseline = Some(median);
+            return HiddenCtxEvent::BaselineEstablished(median);
+        };
+        if (median - baseline).abs() <= HIDDEN_CTX_DRIFT_ALERT {
+            // 回到带内：清告警状态（重新武装），只记一次恢复日志。
+            if self.last_alerted_median.take().is_some() {
+                return HiddenCtxEvent::Recovered { baseline, median };
+            }
+            return HiddenCtxEvent::Quiet;
+        }
+        // 带外：只在首次出带 / 进一步移动超阈值时告警。
+        let further_moved = match self.last_alerted_median {
+            None => true,
+            Some(last) => (median - last).abs() > HIDDEN_CTX_DRIFT_ALERT,
+        };
+        if further_moved {
+            self.last_alerted_median = Some(median);
+            return HiddenCtxEvent::Drift { baseline, median };
+        }
+        HiddenCtxEvent::Quiet
+    }
+
+    /// 当前样本的中位数（空窗返回 None）。
+    fn median(&self) -> Option<i64> {
+        if self.samples.is_empty() {
+            return None;
+        }
+        let mut sorted: Vec<i64> = self.samples.iter().copied().collect();
+        sorted.sort_unstable();
+        Some(sorted[sorted.len() / 2])
+    }
+}
+
+/// 按模型名分桶的计量表（进程内，不落库 —— 样本本身不是计费数据）。
+#[derive(Default)]
+struct HiddenCtxRegistry {
+    windows: std::collections::HashMap<String, HiddenCtxWindow>,
+}
+
+impl HiddenCtxRegistry {
+    /// 记录一个样本；返回状态机事件。表满且是新模型 → None（丢弃，见容量常量注释）。
+    fn observe(&mut self, model: &str, delta: i64) -> Option<HiddenCtxEvent> {
+        if !self.windows.contains_key(model) {
+            if self.windows.len() >= HIDDEN_CTX_MAX_MODELS {
+                return None;
+            }
+            self.windows
+                .insert(model.to_string(), HiddenCtxWindow::default());
+        }
+        let window = self.windows.get_mut(model).expect("上方刚保证存在");
+        Some(window.record(delta))
+    }
+}
+
+static HIDDEN_CTX_REGISTRY: std::sync::LazyLock<parking_lot::Mutex<HiddenCtxRegistry>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(HiddenCtxRegistry::default()));
+
+/// 记录一个隐藏上下文样本：`上游 gross 输入 − 本地内容估算`。**纯观测，返回值不参与
+/// 任何控制流**（调用方丢弃返回值；两条生产路径都如此）。
+///
+/// # 差值的构成（为什么它不等于纯粹的"上游隐藏模板"）
+///
+/// 减法两端都带误差，中位数只能消掉其中一部分：
+/// - **上游 gross**（`contextUsageEvent` 百分比 × 模型窗口）——目标是其中的上游注入
+///   部分（对手实测 Claude ≈4052 token）。注意精度受百分比量化限制：1M 窗口下 0.01%
+///   = 100 token、200k 窗口下 0.01% = 20 token；上游给几位小数**本仓未验证**（要实验）。
+/// - **本地估算**（`token::count_all_tokens`，字符启发式 + 分段系数）——按 ~4 字符/token
+///   近似，代码/JSON 会**少算**（delta 虚高）、CJK 的 4.5 系数与真实 BPE 差异不定
+///   （delta 可正可负）。这是差值随内容类型漂移的主因。
+/// - **我方转换差异**：system 环境噪音剥离后上游看不到、本地估算却算了（delta 偏小，
+///   且该噪音"每请求漂移"）；历史 thinking 重包装成 `<thinking>` 文本等。
+/// - **上游口径未知项**：百分比是否含本轮输出（thinking/正文）未验证 —— 若含，长回答
+///   会把 delta 抬起来。`output_tokens_so_far` 进样本日志正是为了后续用「delta 与输出
+///   长度的相关性」把这一项查出来。
+///
+/// # 为什么不在这里做减法（real-deferred）
+///
+/// 「对外 `input_tokens` 减去基线」的收益是客户端上下文占用更接近其自身内容，但前提是
+/// 基线**稳定且可信**。本仓自己的基线尚未实测（对手的 4052 是他们的栈），且上表前两项
+/// 的误差随内容类型漂移，固定减法会把估算器误差当成隐藏上下文扣掉。故本档只落观测 +
+/// 漂移监控；减法需要先做实验（小请求反推定基线、按内容类型分层看 delta 稳定性、
+/// 用 delta~输出长度相关排除"含输出"口径），证据足够后再以**配置项（默认关）**接入
+/// 客户端展示层（与 `scale_for_client` 同层），且**绝不**改落库口径（`RequestRecord`）。
+///
+/// 返回 `Some(delta)` = 有效样本已计算（可能因模型表满未被跟踪，只影响统计）；
+/// `None` = 两端存在非正值，样本作废。
+pub(crate) fn observe_hidden_context_sample(
+    model: &str,
+    upstream_gross_tokens: i32,
+    local_estimate_tokens: i32,
+    output_tokens_so_far: Option<i32>,
+) -> Option<i64> {
+    // 两端都必须为正：上游侧已有 `context_input_tokens_from_pct` 的下界守卫，这里对称
+    // 防御（本地估算 `.max(1)` 理论恒 ≥1，但远程 count_tokens 结果不可控）。
+    if upstream_gross_tokens <= 0 || local_estimate_tokens <= 0 {
+        return None;
+    }
+    let delta = upstream_gross_tokens as i64 - local_estimate_tokens as i64;
+    let event = match HIDDEN_CTX_REGISTRY.lock().observe(model, delta) {
+        Some(event) => event,
+        None => {
+            tracing::debug!(
+                model = %model,
+                "隐藏上下文计量表已满（{} 个模型），本样本不跟踪",
+                HIDDEN_CTX_MAX_MODELS
+            );
+            return Some(delta);
+        }
+    };
+    tracing::debug!(
+        model = %model,
+        upstream_gross_tokens,
+        local_estimate_tokens,
+        output_tokens_so_far = output_tokens_so_far.unwrap_or(-1),
+        delta,
+        "隐藏上下文样本（上游 gross − 本地估算；output_tokens_so_far = -1 表示此刻未知）"
+    );
+    match event {
+        HiddenCtxEvent::Collecting | HiddenCtxEvent::Quiet => {}
+        HiddenCtxEvent::BaselineEstablished(median) => {
+            tracing::info!(
+                model = %model,
+                median,
+                "隐藏上下文基线建立（上游 gross − 本地估算 的 {} 样本中位数）",
+                HIDDEN_CTX_WINDOW
+            );
+        }
+        HiddenCtxEvent::Drift { baseline, median } => {
+            tracing::warn!(
+                model = %model,
+                baseline,
+                median,
+                deviation = median - baseline,
+                "隐藏上下文基线漂移：中位数偏离基线超过 {} token —— 上游模板/本地估算口径可能变了，核对后再谈对外减法",
+                HIDDEN_CTX_DRIFT_ALERT
+            );
+        }
+        HiddenCtxEvent::Recovered { baseline, median } => {
+            tracing::info!(
+                model = %model,
+                baseline,
+                median,
+                "隐藏上下文基线回到带内（漂移告警已重新武装）"
+            );
+        }
+    }
+    Some(delta)
+}
+
 pub(crate) fn merge_tool_input(buf: &str, frame: &str) -> String {
     // 1. 空帧 → 缓冲不变
     if frame.is_empty() {
@@ -4641,6 +4874,10 @@ pub(crate) fn merge_tool_input(buf: &str, frame: &str) -> String {
 #[cfg(test)]
 #[path = "stream_usage_caliber_tests.rs"]
 mod usage_caliber_tests;
+
+#[cfg(test)]
+#[path = "stream_hidden_context_tests.rs"]
+mod hidden_context_tests;
 
 #[cfg(test)]
 #[path = "stream_tests.rs"]

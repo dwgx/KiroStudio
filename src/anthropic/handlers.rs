@@ -4746,7 +4746,20 @@ async fn handle_non_stream_request(
                                 window_size,
                             ) {
                                 Some(actual_input_tokens) => {
+                                    // ⭐ 隐藏上下文计量（纯观测，零行为变更）：与流式路径共用
+                                    // 同一个函数（见 stream.rs 的 `observe_hidden_context_sample`），
+                                    // 只取本请求**首个有效信号**，避免同一请求重复样本。
+                                    // 非流式的输出 tokens 在事件循环收尾才统计，此刻未知 → None。
+                                    let first_valid_signal = context_input_tokens.is_none();
                                     context_input_tokens = Some(actual_input_tokens);
+                                    if first_valid_signal {
+                                        crate::anthropic::stream::observe_hidden_context_sample(
+                                            model,
+                                            actual_input_tokens,
+                                            input_tokens,
+                                            None,
+                                        );
+                                    }
                                     tracing::debug!(
                                         "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
                                         pct,
