@@ -97,3 +97,10 @@ replay.tmp.json
 .agent/
 .grok/
 scripts/
+
+# 本地维护件（维护者笔记/蒸馏；绝不提交，见 AGENTS.md）
+SESSION-DIGEST.md
+WORKFLOW.md
+REFLECTION.md
+NEXT-STEPS.md
+docs/DEFERRED.md

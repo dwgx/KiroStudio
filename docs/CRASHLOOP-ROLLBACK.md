@@ -78,8 +78,7 @@ docker compose build --no-cache   # 重建的是当前代码；要回旧代码�
 docker compose up -d
 ```
 
-> 本仓工作树禁止 git checkout 回退（多会话并发），回旧代码用
-> `git worktree add` 另起目录构建，或直接用上一版本镜像 tag。
+> 回旧代码用 `git worktree add` 另起目录构建，或直接用上一版本镜像 tag（就地 checkout 切来切去容易乱）。
 
 **验证恢复**：
 

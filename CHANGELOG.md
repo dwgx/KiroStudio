@@ -4,7 +4,7 @@
 
 ## [1.2.5] - 2026-10-14 - 复活线追赶合流 / ocr 审计 347 条 / 对手对照 / 首字超时重试
 
-Relative to tag v1.2.4 / `d9dd93f`。本窗 `cargo test --no-default-features`：**2639 passed; 0 failed**（CI 链为同命令 + `--locked`）。未改 Kiro 主路径 12 键选号、absorb 循环结构、AIMD/`inboundRpmAuto`、客户端 Key；透传池排序键**有意**前插 `starved`（对手对照 #10），sticky **有意**改为晚解绑（P2-6）。不改已推的 v1.2.4 对象。HMC 已部署 `a6a1ba8`，验收 26/26（池 11 号 / 8 可用）。
+Relative to tag v1.2.4 / `d9dd93f`。本窗 `cargo test --no-default-features`：**2639 passed; 0 failed**（CI 链为同命令 + `--locked`）。未改 Kiro 主路径 12 键选号、absorb 循环结构、AIMD/`inboundRpmAuto`、客户端 Key；透传池排序键**有意**前插 `starved`（对手对照 #10），sticky **有意**改为晚解绑（P2-6）。不改已推的 v1.2.4 对象。HMC 已部署 **v1.2.5**（`4dee202`），验收 26/26（池 11 号 / 8 可用）。本条目覆盖 tag v1.2.4 之后 **109 笔产品提交**（另 1 笔为 release 提交；`git log v1.2.4..v1.2.5` 合计 110 笔）。
 
 - **合流**：`3300f81` 把 v1.2.2–v1.2.4 发布线并入 mainline（保留 repo-kit banner / regeneration workflow，`7c33b30`…`cec6f99`）；`.rs` 强制 LF 检出，修 Windows 上源码扫描守卫全红（`d18b835`）。
 - **追赶波**：建议模式拦截 / 大写入分块注记 / SSE 防缓冲 / idc 推断（`c61b296`）；动态系统块分流——token 预算提醒与 hook 通知移出 `history[0]`（`ab7465c`）；模型档补 5.5 代与 Fable 5.1（`9377b0a`）。

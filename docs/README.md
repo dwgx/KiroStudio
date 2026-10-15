@@ -7,7 +7,7 @@
 
 ## 状态 / 接手
 
-- `TAKEOVER.md` — 执行层接手（v1.2.4 时代，简短）
+- `TAKEOVER.md` — 执行层接手（v1.2.5 时代，简短）
 - `RELEASE-CHECKLIST.md` — 下一个 tag 的闸门（打 tag 要 Owner 点名）
 - `IMPROVEMENT-PLAN-2026-08-21.md` — 08-21 审查基线（历史推导材料，不当待办总表）
 - `PERFORMANCE.md` — 性能实测（数字用前现读）
