@@ -74,14 +74,9 @@ PROMPT-*.md
 
 # Claude Code agent 配置/记忆
 #
-# 2026-08-10 起入库，但**只能进私有仓 origin（github dwgx/KiroStudio-skiapi）**。
-# 这些文件含生产机 IP、SSH 端口、密钥文件名、线上配置路径 —— 绝不能进
-# public（github dwgx/KiroStudio）或 gitee。
-#
-# 已做的机械保护：
-#   - master 的上游已从 public/master 切到 origin/master，`git push` 默认走私有仓
-#   - public 的 push URL 已设为 DISABLED_use_origin_instead，推它会直接报错
-# 要给 public 发版就单独 checkout 一个不含这些文件的分支，别解除上面两条。
+# 2026-10-16 复核（单公开仓纪元）：`.claude/CONTEXT.md` 已核为公开安全（无生产机 IP / SSH 端口 / 密钥值），
+# 继续入库；旧「仅私有仓」保护机制随私有仓删除一并作废。
+# 若未来要在 .claude/ 下新增入库文件：先复核不含 生产机 IP / SSH 端口 / 密钥文件名 / 线上配置路径。
 #
 # 仍然不入库的：会话级中间产物和运行时文件，换机器没意义
 .claude/state/

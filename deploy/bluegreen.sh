@@ -8,7 +8,8 @@ LIVE_BIN="/home/dwgx_user/KiroStudio/kirostudio"
 LIVE_CFG="/home/dwgx_user/KiroStudio/config/config.json"
 LIVE_CREDS="/home/dwgx_user/KiroStudio/config/credentials.json"
 NEW_BIN="/tmp/kirostudio-new"
-ADMIN_KEY="sk-dwgx-admin"
+# 旧纪元脚本（部署已由 HMC deploy.sh 取代）：探针 admin key 从环境注入，不再内置值。
+ADMIN_KEY="${ADMIN_KEY:-sk-REPLACE-ME}"
 
 if [ "$STAGE" = "verify" ]; then
   echo "=== 蓝绿阶段1：临时端口 $TMP_PORT 验证新二进制(不碰主服务 8990) ==="

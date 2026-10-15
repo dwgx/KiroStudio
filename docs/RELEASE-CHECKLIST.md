@@ -1,8 +1,8 @@
-# 发版闸门（v1.2.4 之后）
+# 发版闸门（v1.2.5 之后）
 
 > 2026-10-13 复活线改写。本文件是「可以打下一个 tag」的标准，**不是授权**——打 tag / 推 tag 要 Owner 点名。
 
-公开 Latest：**v1.2.4**（`d9dd93f`）。已发 tag 不要重打、不要 retarget（OTA 比较 tag 与 `CARGO_PKG_VERSION`）。
+公开 Latest：**v1.2.5**（`4dee202`）。已发 tag 不要重打、不要 retarget（OTA 比较 tag 与 `CARGO_PKG_VERSION`）。
 
 ## 硬闸（缺一不可）
 
@@ -11,7 +11,7 @@
 3. `Cargo.toml` `version` == 将打的 tag（否则 OTA 死循环；`release.yml` 有门禁）。
 4. 出厂构建一律 `--no-default-features`（纯 rustls）；前端 `admin-ui/dist` 必须先构建（编译期嵌入）。
 5. 不进包：凭据、`config.json`、`.claude/`、`AGENTS.md`、`CLAUDE.md`。
-6. `release.yml` 产物与 v1.2.4 同形：linux-x86_64 / macos-aarch64 / macos-x86_64 / windows-x86_64 + 各自 `.sha256`。
+6. `release.yml` 产物与 v1.2.5 同形：linux-x86_64 / macos-aarch64 / macos-x86_64 / windows-x86_64 + 各自 `.sha256`。
 
 ## 发版动作
 
