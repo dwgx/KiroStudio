@@ -5,11 +5,11 @@
 <!-- dwgx-banner:BEGIN -->
 <div align="center">
 
-<img src="docs/assets/banner.svg?t=b4cbf3dd65ce" width="100%" alt="KiroStudio — Kiro / AWS Q 网关 · Anthropic Messages 兼容 · 多账号池 · 管理面板" />
+<img src="docs/assets/banner.svg?t=457987eb662b" width="100%" alt="KiroStudio — Kiro / AWS Q 网关 · Anthropic Messages 兼容 · 多账号池 · 管理面板" />
 
 <br/>
 
-Rust · NOASSERTION · ★15
+Rust · NOASSERTION · ★16
 
 [releases](https://github.com/dwgx/KiroStudio/releases) · [issues](https://github.com/dwgx/KiroStudio/issues)
 
